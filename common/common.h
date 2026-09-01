@@ -759,6 +759,10 @@ struct common_params {
     // multimodal models (see tools/mtmd)
     struct common_params_model mmproj;
     bool mmproj_use_gpu = true;                 // use GPU for multimodal model
+    // KVarN: держать ВЕСА проектора в закреплённой хост-памяти, вычисления
+    // оставить на ускорителе. Выключено по умолчанию, включается флагом
+    // --mmproj-host-weights (или LLAMA_ARG_MMPROJ_HOST_WEIGHTS=1).
+    bool mmproj_host_weights = false;
     ggml_backend_dev_t mmproj_device = nullptr; // GPU device to use for multimodal model
     bool no_mmproj = false;                     // explicitly disable multimodal model
     std::vector<std::string> image;             // path to image file(s) ; TODO: change the name to "media"

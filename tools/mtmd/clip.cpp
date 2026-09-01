@@ -167,6 +167,9 @@ struct clip_ctx {
 
     bool debug_output_embeddings = false;
 
+    // KVarN: класть веса проектора в закреплённую хост-память (--mmproj-host-weights)
+    bool host_weights = false;
+
     // for measuring memory usage
     bool no_alloc = false;
     std::map<ggml_backend_dev_t, size_t> mem_usage;
@@ -181,6 +184,7 @@ struct clip_ctx {
     clip_ctx(clip_context_params & ctx_params) {
         flash_attn_type = ctx_params.flash_attn_type;
         no_alloc = ctx_params.no_alloc;
+        host_weights = ctx_params.host_weights;
         backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
         if (!backend_cpu) {
             throw std::runtime_error("failed to initialize CPU backend");
@@ -3710,7 +3714,45 @@ struct clip_model_loader {
 
             // alloc memory and offload data
             ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(ctx_clip.backend);
-            ctx_clip.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_clip.ctx_data.get(), buft));
+            // KVarN: положить ВЕСА проектора в закреплённую хост-память, оставив
+            // вычисления на ускорителе. Смысл — освободить видеопамять под
+            // контекст, не платя десятками секунд, как при переносе самих
+            // вычислений на процессор (26.5 с) или на встроенную графику
+            // (49.4 с) против 1.1 с на карте.
+            //
+            // Тип буфера берётся ОТДЕЛЬНЫЙ (CUDA_Host_W), а не общий host-buft:
+            // общий используют ВХОДНЫЕ тензоры языковой модели, и объявление
+            // его поддержки в CUDA убирает барьер планировщика и портит вывод.
+            // Разбор — в шапке build-native/kvarn-mmproj-hostbuf-v2.patch.
+            // Режим ВЫКЛЮЧЕН ПО УМОЛЧАНИЮ: без --mmproj-host-weights форк ведёт
+            // себя ровно как раньше, веса проектора остаются в памяти устройства.
+            if (ctx_clip.host_weights && ctx_clip.backend != ctx_clip.backend_cpu) {
+                ggml_backend_dev_t dev = ggml_backend_get_device(ctx_clip.backend);
+                ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+                typedef ggml_backend_buffer_type_t (*kvarn_host_weights_buft_t)(void);
+                auto get_host_weights_buft = reg
+                    ? (kvarn_host_weights_buft_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_get_host_weights_buffer_type")
+                    : nullptr;
+                ggml_backend_buffer_type_t host_buft = get_host_weights_buft ? get_host_weights_buft() : nullptr;
+                if (host_buft != nullptr) {
+                    ggml_backend_buffer_t host_buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx_clip.ctx_data.get(), host_buft);
+                    if (host_buf != nullptr) {
+                        buft = host_buft;
+                        ctx_clip.buf.reset(host_buf);
+                        LOG_INF("%s: --mmproj-host-weights: веса проектора в хост-памяти, буфер \"%s\"\n",
+                                __func__, ggml_backend_buft_name(buft));
+                    } else {
+                        LOG_WRN("%s: --mmproj-host-weights: закрепить хост-память не удалось, веса остаются в памяти устройства\n",
+                                __func__);
+                    }
+                } else {
+                    LOG_WRN("%s: --mmproj-host-weights задан, но устройство \"%s\" не даёт буфера под веса в хост-памяти\n",
+                            __func__, dev ? ggml_backend_dev_name(dev) : "?");
+                }
+            }
+            if (!ctx_clip.buf) {
+                ctx_clip.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_clip.ctx_data.get(), buft));
+            }
             ggml_backend_buffer_set_usage(ctx_clip.buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
             // read the weight from file
             if (!ctx_clip.no_alloc) {

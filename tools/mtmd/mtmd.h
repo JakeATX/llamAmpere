@@ -96,6 +96,9 @@ typedef bool (*mtmd_progress_callback)(float progress, void * user_data);
 
 struct mtmd_context_params {
     bool use_gpu;
+    // KVarN: разместить веса проектора в закреплённой хост-памяти, оставив
+    // вычисления на устройстве. Умолчание — false (веса на устройстве).
+    bool host_weights;
     ggml_backend_dev_t device;
     bool print_timings;
     int n_threads;

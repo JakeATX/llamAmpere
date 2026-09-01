@@ -3104,6 +3104,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples(mmproj_examples).set_env("LLAMA_ARG_MMPROJ_OFFLOAD"));
     add_opt(common_arg(
+        {"--mmproj-host-weights"},
+        {"--no-mmproj-host-weights"},
+        string_format("KVarN: keep multimodal projector WEIGHTS in pinned host RAM, run the projector on the accelerator anyway\n"
+                      "frees VRAM for the KV cache; image encoding gets slightly slower, output is unchanged (default: %s)",
+                      params.mmproj_host_weights ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.mmproj_host_weights = value;
+        }
+    ).set_examples(mmproj_examples).set_env("LLAMA_ARG_MMPROJ_HOST_WEIGHTS"));
+    add_opt(common_arg(
         // note: "-mmdev" must sort after "--rpc" in the preset map, else RPC devices are not registered yet
         {"-mmdev", "--mmproj-device"}, "DEVICE",
         "device to use for multimodal projector (none = don't offload, default: follows --device)\n"
