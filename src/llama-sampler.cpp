@@ -1,4 +1,5 @@
 #include "llama-sampler.h"
+#include "llama-ext.h"
 
 #include "llama-impl.h"
 #include "llama-vocab.h"
@@ -973,6 +974,27 @@ static void llama_sampler_greedy_apply(struct llama_sampler * /*smpl*/, llama_to
     }
 }
 
+// backend sampling on row blocks
+//
+// A sampler's backend graph works on a [n_cand, n_rows] block: one row per output row of the sequence.
+// n_rows > 1 during speculative verification, where every draft position of the sequence is sampled in the
+// same graph and only the token ids are copied back; the single-output case is the same block with n_rows = 1.
+
+// view t (a contiguous logits view or a sampler output) as [ne0, n_rows]
+static struct ggml_tensor * llama_sampler_backend_rows_2d(struct ggml_context * ctx, struct ggml_tensor * t) {
+    const int64_t n_rows = ggml_nelements(t) / t->ne[0];
+    return ggml_reshape_2d(ctx, t, t->ne[0], n_rows);
+}
+
+// gather idx [n_sel, n_rows] from a [n, n_rows] block, row by row -> [n_sel, n_rows]
+static struct ggml_tensor * llama_sampler_backend_gather_rows(struct ggml_context * ctx, struct ggml_tensor * a, struct ggml_tensor * idx) {
+    a = llama_sampler_backend_rows_2d(ctx, a);
+    GGML_ASSERT(idx->ne[1] == a->ne[1] && idx->ne[2] == 1);
+    struct ggml_tensor * a3  = ggml_reshape_3d(ctx, a, 1, a->ne[0], a->ne[1]);
+    struct ggml_tensor * res = ggml_get_rows(ctx, a3, idx); // [1, n_sel, n_rows]
+    return ggml_reshape_2d(ctx, res, idx->ne[0], idx->ne[1]);
+}
+
 static bool llama_sampler_greedy_backend_init(
         struct llama_sampler       * smpl,
         ggml_backend_buffer_type_t   buft) {
@@ -993,9 +1015,9 @@ static void llama_sampler_greedy_backend_apply(
     GGML_UNUSED(gf);
     GGML_UNUSED(smpl);
 
-    struct ggml_tensor * logits = ggml_reshape_1d(ctx, data->logits, ggml_nelements(data->logits));
+    struct ggml_tensor * logits = llama_sampler_backend_rows_2d(ctx, data->logits);
 
-    struct ggml_tensor * curl = ggml_argmax(ctx, logits);
+    struct ggml_tensor * curl = ggml_argmax(ctx, logits); // [n_rows]
     ggml_set_name(curl, "greedy_argmax");
 
     data->sampled = curl;
@@ -1039,7 +1061,8 @@ struct llama_sampler_dist : public llama_sampler_backend {
 
     std::mt19937 rng;
 
-    ggml_tensor * inp_uniform;
+    ggml_tensor * inp_uniform; // [1, n_rows]: one uniform sample per output row of the current graph
+    int64_t       n_rows = 1;
 };
 
 static const char * llama_sampler_dist_name(const struct llama_sampler * smpl) {
@@ -1164,12 +1187,13 @@ static void llama_sampler_dist_backend_apply(
 
     auto * sctx = (llama_sampler_dist *) smpl->ctx;
 
-    sctx->inp_uniform = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+    struct ggml_tensor * logits = llama_sampler_backend_rows_2d(ctx, data->logits); // [n, n_rows]
+    const int64_t n_rows = logits->ne[1];
+
+    sctx->n_rows = n_rows;
+    sctx->inp_uniform = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, n_rows);
     ggml_set_name (sctx->inp_uniform, "uniform");
     ggml_set_input(sctx->inp_uniform);
-
-    // flatten
-    struct ggml_tensor * logits = ggml_reshape_1d(ctx, data->logits, ggml_nelements(data->logits));
 
     struct ggml_tensor * probs = ggml_soft_max(ctx, logits);
     ggml_set_name(probs, "dist_probs");
@@ -1177,8 +1201,7 @@ static void llama_sampler_dist_backend_apply(
     struct ggml_tensor * cumsum = ggml_cumsum(ctx, probs);
     ggml_set_name(cumsum, "dist_cumsum");
 
-    // The uniform tensor has a random value and we subtract this tensor with
-    // the cumsum tensor (the uniform tensor will be broadcasted by ggml_sub).
+    // The uniform tensor has one random value per row and is broadcast along the row by ggml_sub.
     // Recall that each entry in cumsum is the cumulative probability up to that
     // index so values stay negative while the cumulative total is below the
     // random value, and become zero/positive once the threshold is crossed.
@@ -1192,26 +1215,24 @@ static void llama_sampler_dist_backend_apply(
     struct ggml_tensor * mask = ggml_step(ctx, diff);
     ggml_set_name(mask, "dist_mask");
 
-    // Taking the sum of the mask gives us the sum of elements after the threshold
+    // Taking the sum of the mask per row gives us the number of elements after the threshold
     // we are interested in.
-    struct ggml_tensor * idxf = ggml_sum(ctx, mask);
+    struct ggml_tensor * idxf = ggml_sum_rows(ctx, mask); // [1, n_rows]
     ggml_set_name(idxf, "dist_index_f32");
 
     // Use ggml_scale_bias to scale the index value by -1 and then add the size
     // of the mask to that value so we get the correct index ((-1 * idxf) + n).
-    struct ggml_tensor * idx = ggml_cast(ctx, ggml_scale_bias(ctx, idxf, -1.0f, mask->ne[0]), GGML_TYPE_I32);
+    struct ggml_tensor * idx = ggml_cast(ctx, ggml_scale_bias(ctx, idxf, -1.0f, mask->ne[0]), GGML_TYPE_I32); // [1, n_rows]
     ggml_set_name(idx, "dist_index_i32");
 
     // Map back to original vocab ids if a candidates tensor is available.
     struct ggml_tensor * sampled_token = idx;
     if (data->candidates != nullptr) {
-        struct ggml_tensor * candidates = ggml_reshape_2d(ctx, data->candidates, 1, ggml_nelements(data->candidates));
-
-        sampled_token = ggml_get_rows(ctx, candidates, idx);
+        sampled_token = llama_sampler_backend_gather_rows(ctx, data->candidates, idx); // [1, n_rows]
         ggml_set_name(sampled_token, "dist_sampled_token");
     }
 
-    data->sampled = sampled_token;
+    data->sampled = ggml_reshape_1d(ctx, sampled_token, n_rows);
     data->probs = probs;
 }
 
@@ -1219,16 +1240,21 @@ static void llama_sampler_dist_backend_set_input(struct llama_sampler * smpl) {
     auto * sctx = (llama_sampler_dist *) smpl->ctx;
 
     GGML_ASSERT(sctx->inp_uniform != nullptr);
+    GGML_ASSERT(ggml_nelements(sctx->inp_uniform) == sctx->n_rows);
 
     // We sample in double precision and cast to float to match rnd numbers of
     // llama_dampler_dist which uses double precision (sampling from
     // std::uniform_real_distribution<double> and
     // std::uniform_real_distribution<float> with same rng will produce
     // different sequences).
+    // One draw per output row, in row order (the CPU path draws once per sampled row as well).
     std::uniform_real_distribution<double> dist(0.0f, 1.0f);
-    const float rnd = dist(sctx->rng);
+    std::vector<float> rnd(sctx->n_rows);
+    for (int64_t i = 0; i < sctx->n_rows; ++i) {
+        rnd[i] = dist(sctx->rng);
+    }
 
-    ggml_backend_tensor_set(sctx->inp_uniform, &rnd, 0, sizeof(float));
+    ggml_backend_tensor_set(sctx->inp_uniform, rnd.data(), 0, sctx->n_rows * sizeof(float));
 }
 
 static struct llama_sampler_i llama_sampler_dist_i = {
@@ -1302,21 +1328,19 @@ static void llama_sampler_top_k_backend_apply(
         struct llama_sampler_data * data) {
     auto * sctx = (llama_sampler_top_k *) smpl->ctx;
 
-    struct ggml_tensor * logits = ggml_reshape_1d(ctx, data->logits, ggml_nelements(data->logits));
+    struct ggml_tensor * logits = llama_sampler_backend_rows_2d(ctx, data->logits); // [n, n_rows]
 
-    struct ggml_tensor * top_k = ggml_top_k(ctx, logits, sctx->k);
+    struct ggml_tensor * top_k = ggml_top_k(ctx, logits, sctx->k); // [k, n_rows]
     ggml_set_name(top_k, "top_k");
 
     if (data->candidates) {
-        struct ggml_tensor * candidates_rows = ggml_reshape_2d(ctx, data->candidates, 1, data->candidates->ne[0]);
-        data->candidates = ggml_get_rows(ctx, candidates_rows, top_k);
+        data->candidates = llama_sampler_backend_gather_rows(ctx, data->candidates, top_k);
         ggml_set_name(data->candidates, "top_k_candidates");
     } else {
         data->candidates = top_k;
     }
 
-    struct ggml_tensor * logits_rows = ggml_reshape_2d(ctx, logits, 1, logits->ne[0]);
-    data->logits = ggml_get_rows(ctx, logits_rows, top_k);
+    data->logits = llama_sampler_backend_gather_rows(ctx, logits, top_k);
     ggml_set_name(data->logits, "top_k_rows");
 
     GGML_UNUSED(gf);
@@ -1448,31 +1472,24 @@ static void llama_sampler_top_p_backend_apply(
         struct llama_sampler_data * data) {
     auto * sctx = (llama_sampler_top_p *) smpl->ctx;
 
-    // flatten
-    struct ggml_tensor * logits = ggml_reshape_1d(ctx, data->logits, ggml_nelements(data->logits));
+    struct ggml_tensor * logits = llama_sampler_backend_rows_2d(ctx, data->logits); // [n, n_rows]
+    const int64_t n      = logits->ne[0];
+    const int64_t n_rows = logits->ne[1];
 
-    auto ggml_sort = [ctx](struct ggml_tensor * a, struct ggml_tensor * b) {
-        GGML_ASSERT(ggml_nrows(a) == 1);
-        struct ggml_tensor * a_reshaped = ggml_reshape_2d(ctx, a, 1, a->ne[0]);
-        struct ggml_tensor * a_sorted   = ggml_get_rows(ctx, a_reshaped, b);
-        return a_sorted;
-    };
-
-    // Get the sorted logits in descending order.
-    struct ggml_tensor * sorted_idx = ggml_argsort(ctx, logits, GGML_SORT_ORDER_DESC);
+    // Get the sorted logits in descending order (per row).
+    struct ggml_tensor * sorted_idx = ggml_argsort(ctx, logits, GGML_SORT_ORDER_DESC); // [n, n_rows]
     ggml_set_name(sorted_idx, "top_p_sorted_idx");
 
     // Do the sorting via reshape + get_rows
-    struct ggml_tensor * sorted_logits = ggml_sort(logits, sorted_idx);
+    struct ggml_tensor * sorted_logits = llama_sampler_backend_gather_rows(ctx, logits, sorted_idx);
     ggml_set_name(sorted_logits, "top_p_sorted_logits");
 
-    sorted_logits = ggml_reshape_1d(ctx, sorted_logits, ggml_nelements(sorted_logits));
     struct ggml_tensor * softmax = ggml_soft_max(ctx, sorted_logits);
     ggml_set_name(softmax, "top_p_softmax");
 
     // If candidates are provided, sort them as well. Otherwise, set sorted indices as candidates.
     if (data->candidates) {
-        data->candidates = ggml_sort(data->candidates, sorted_idx);
+        data->candidates = llama_sampler_backend_gather_rows(ctx, data->candidates, sorted_idx);
     } else {
         data->candidates = sorted_idx;
     }
@@ -1489,23 +1506,23 @@ static void llama_sampler_top_p_backend_apply(
     struct ggml_tensor * mask = ggml_step(ctx, cdf_scaled);
     ggml_set_name(mask, "top_p_mask");
 
-    // Taking the sum of the mask gives us the sum of elements after the threshold
+    // Taking the sum of the mask per row gives us the number of elements after the threshold
     // we are interested in.
-    struct ggml_tensor * idxf = ggml_sum(ctx, mask);
+    struct ggml_tensor * idxf = ggml_sum_rows(ctx, mask); // [1, n_rows]
     ggml_set_name(idxf, "top_p_index_f32");
 
     // prevent out-of-bounds access
     idxf = ggml_clamp(ctx, idxf, 0.0f, mask->ne[0] - 1);
 
     // construct ones tensor to set the value in the mask
-    struct ggml_tensor * ones = ggml_scale_bias(ctx, idxf, 0.0f, 1.0f);
+    struct ggml_tensor * ones = ggml_scale_bias(ctx, idxf, 0.0f, 1.0f); // [1, n_rows]
     ggml_set_name(ones, "top_p_ones");
 
-    // Make top-p inclusive (i.e. return all values such that cum_sum/cdf >= p)
-    struct ggml_tensor * mask_reshaped = ggml_reshape_2d(ctx, mask, 1, mask->ne[0]);
+    // Make top-p inclusive (i.e. return all values such that cum_sum/cdf >= p): set mask[idx] = 1 per row
+    struct ggml_tensor * mask_reshaped = ggml_reshape_3d(ctx, mask, 1, n, n_rows);
 
-    mask_reshaped = ggml_set_rows(ctx, mask_reshaped, ones, ggml_cast(ctx, idxf, GGML_TYPE_I32));
-    mask = ggml_reshape_1d(ctx, mask_reshaped, mask->ne[0]);
+    mask_reshaped = ggml_set_rows(ctx, mask_reshaped, ggml_reshape_3d(ctx, ones, 1, 1, n_rows), ggml_cast(ctx, idxf, GGML_TYPE_I32));
+    mask = ggml_reshape_2d(ctx, mask_reshaped, n, n_rows);
 
     // Apply -INFINITY bias for masked-out tokens
     // log(1) = 0 (keep), log(0) = -INF (discard)
@@ -1643,22 +1660,20 @@ static void llama_sampler_min_p_backend_apply(
         struct llama_sampler_data * data) {
     auto * sctx = (llama_sampler_min_p *) smpl->ctx;
 
-    struct ggml_tensor * logits = ggml_reshape_1d(ctx, data->logits, ggml_nelements(data->logits));
+    struct ggml_tensor * logits = llama_sampler_backend_rows_2d(ctx, data->logits); // [n, n_rows]
+    const int64_t n_rows = logits->ne[1];
 
-    struct ggml_tensor * max_idx = ggml_argmax(ctx, logits);
+    struct ggml_tensor * max_idx = ggml_reshape_2d(ctx, ggml_argmax(ctx, logits), 1, n_rows); // [1, n_rows]
     ggml_set_name(max_idx, "max_idx");
 
-    struct ggml_tensor * logits_rows = ggml_reshape_2d(ctx, logits, 1, logits->ne[0]);
-    ggml_set_name(logits_rows, "logits_rows");
-
-    struct ggml_tensor * max_logit = ggml_get_rows(ctx, logits_rows, max_idx);
+    struct ggml_tensor * max_logit = llama_sampler_backend_gather_rows(ctx, logits, max_idx); // [1, n_rows]
     ggml_set_name(max_logit, "max_logit");
 
-    // Calculate the threshold value.
+    // Calculate the threshold value (per row).
     struct ggml_tensor * threshold = ggml_scale_bias(ctx, max_logit, 1.0f, logf(sctx->p));
     ggml_set_name(threshold, "min_p_threshold");
 
-    // Subtract the threshold from logits.
+    // Subtract the threshold from logits (broadcast along the row).
     struct ggml_tensor * sub = ggml_sub(ctx, logits, threshold);
 
     // Create a mask where logits below the threshold are 0 (discard),
@@ -1848,21 +1863,20 @@ static void llama_sampler_backend_temp_sampling(
         struct llama_sampler_data * data,
         float                       temp) {
     if (temp <= 0.0f) {
-        struct ggml_tensor * logits = ggml_reshape_1d(ctx, data->logits, ggml_nelements(data->logits));
+        struct ggml_tensor * logits = llama_sampler_backend_rows_2d(ctx, data->logits); // [n, n_rows]
+        const int64_t n_rows = logits->ne[1];
 
-        // Find the most probable token index.
-        struct ggml_tensor * max_idx = ggml_argmax(ctx, logits);
+        // Find the most probable token index per row.
+        struct ggml_tensor * max_idx = ggml_reshape_2d(ctx, ggml_argmax(ctx, logits), 1, n_rows); // [1, n_rows]
         ggml_set_name(max_idx, "temp_max_idx");
 
         if (data->candidates) {
-            struct ggml_tensor * candidates_rows = ggml_reshape_2d(ctx, data->candidates, 1, ggml_nelements(data->candidates));
-            data->candidates = ggml_get_rows(ctx, candidates_rows, max_idx);
+            data->candidates = llama_sampler_backend_gather_rows(ctx, data->candidates, max_idx);
         } else {
             data->candidates = max_idx;
         }
 
-        struct ggml_tensor * logits_rows = ggml_reshape_2d(ctx, logits, 1, ggml_nelements(logits));
-        data->logits = ggml_get_rows(ctx, logits_rows, max_idx);
+        data->logits = llama_sampler_backend_gather_rows(ctx, logits, max_idx); // [1, n_rows]
 
         return;
     }
@@ -2040,7 +2054,8 @@ static void llama_sampler_temp_ext_backend_apply(
         return;
     }
 
-    struct ggml_tensor * logits = ggml_reshape_1d(ctx, data->logits, ggml_nelements(data->logits));
+    struct ggml_tensor * logits = llama_sampler_backend_rows_2d(ctx, data->logits); // [n, n_rows]
+    const int64_t n_rows = logits->ne[1];
 
     // Calculate min_temp, max_temp, and max_entropy.
     const float min_temp    = std::max(0.0f, sctx->temp - sctx->delta);
@@ -2058,7 +2073,8 @@ static void llama_sampler_temp_ext_backend_apply(
     // Calculate the entropy, entropy = -Σ(p * log(p)).
     struct ggml_tensor * log_probs   = ggml_log(ctx, probs_clamped);
     struct ggml_tensor * p_log_p     = ggml_mul(ctx, probs_clamped, log_probs);
-    struct ggml_tensor * sum_p_log_p = ggml_sum(ctx, p_log_p);
+    // per-row entropy; the single-row graph keeps ggml_sum so its reduction order is unchanged
+    struct ggml_tensor * sum_p_log_p = n_rows == 1 ? ggml_sum(ctx, p_log_p) : ggml_sum_rows(ctx, p_log_p); // [1, n_rows]
     struct ggml_tensor * entropy     = ggml_scale(ctx, sum_p_log_p, -1.0f);
     ggml_set_name(log_probs,   "temp_ext_log_probs");
     ggml_set_name(p_log_p,     "temp_ext_p_log_p");
@@ -2960,6 +2976,10 @@ static void llama_sampler_penalties_backend_set_input(struct llama_sampler * smp
     ggml_backend_tensor_set(sctx->inp_counts,    sctx->host_counts.data(),    0, sctx->n_max * sizeof(int32_t));
 }
 
+static bool llama_sampler_penalties_is_disabled(const llama_sampler * smpl) {
+    return ((const llama_sampler_penalties *) smpl->ctx)->is_disabled();
+}
+
 static struct llama_sampler_i llama_sampler_penalties_i = {
     /* .name              = */ llama_sampler_penalties_name,
     /* .accept            = */ llama_sampler_penalties_accept,
@@ -3731,13 +3751,15 @@ static void llama_sampler_logit_bias_backend_apply(
     ggml_set_name(sctx->inp_logit_idxs, "logit_idxs");
     ggml_set_input(sctx->inp_logit_idxs);
 
-    ggml_tensor * cur = ggml_fill(ctx, data->logits, 0.0f);
+    // one bias row over the vocabulary, broadcast over all output rows of the block
+    ggml_tensor * logits = llama_sampler_backend_rows_2d(ctx, data->logits); // [n_vocab, n_rows]
 
-    cur = ggml_reshape_2d(ctx, cur, 1, ggml_nelements(cur));
+    ggml_tensor * cur = ggml_fill(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, logits->ne[0]), 0.0f);
+
     cur = ggml_set_rows(ctx, cur, sctx->inp_logit_bias, sctx->inp_logit_idxs);
-    cur = ggml_reshape_1d(ctx, cur, ggml_nelements(cur));
+    cur = ggml_reshape_2d(ctx, cur, logits->ne[0], 1);
 
-    data->logits = ggml_add(ctx, data->logits, cur);
+    data->logits = ggml_add(ctx, logits, cur);
 }
 
 static void llama_sampler_logit_bias_backend_set_input(struct llama_sampler * smpl) {
@@ -4107,4 +4129,65 @@ void llama_perf_sampler_reset(struct llama_sampler * chain) {
 
     ctx->t_sample_us = 0;
     ctx->n_sample    = 0;
+}
+
+// row-block backend sampling support (defined after all sampler interface tables)
+
+bool llama_sampler_backend_supports_rows(const llama_sampler * sampler) {
+    if (!sampler) {
+        return false;
+    }
+    if (sampler->iface == &llama_sampler_chain_i) {
+        const auto * chain = static_cast<const llama_sampler_chain *>(sampler->ctx);
+        for (const auto & smpl : chain->samplers) {
+            if (!llama_sampler_backend_supports_rows(smpl.ptr)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    if (sampler->iface == &llama_sampler_empty_i    ||
+        sampler->iface == &llama_sampler_greedy_i   ||
+        sampler->iface == &llama_sampler_dist_i     ||
+        sampler->iface == &llama_sampler_top_k_i    ||
+        sampler->iface == &llama_sampler_top_p_i    ||
+        sampler->iface == &llama_sampler_min_p_i    ||
+        sampler->iface == &llama_sampler_temp_i     ||
+        sampler->iface == &llama_sampler_temp_ext_i ||
+        sampler->iface == &llama_sampler_logit_bias_i) {
+        return true;
+    }
+    if (sampler->iface == &llama_sampler_penalties_i) {
+        // active penalties need the per-row token history (row r sees the draft tokens accepted before it)
+        return llama_sampler_penalties_is_disabled(sampler);
+    }
+    return false;
+}
+
+bool llama_sampler_backend_rows_ready(const llama_sampler * sampler) {
+    if (!llama_sampler_backend_supports_rows(sampler)) {
+        return false;
+    }
+    if (sampler->iface == &llama_sampler_chain_i) {
+        // every sampler of the chain must have been offloaded by backend_init (a partially offloaded chain
+        // continues on the CPU for single rows, but has no CPU path for a row block)
+        return llama_sampler_chain_is_backend(sampler);
+    }
+    return true;
+}
+
+bool llama_sampler_chain_is_backend(const llama_sampler * sampler) {
+    if (!sampler || sampler->iface != &llama_sampler_chain_i) {
+        return false;
+    }
+    const auto * chain = static_cast<const llama_sampler_chain *>(sampler->ctx);
+    if (!chain->is_init) {
+        return false;
+    }
+    for (const auto & smpl : chain->samplers) {
+        if (!smpl.is_backend) {
+            return false;
+        }
+    }
+    return true;
 }

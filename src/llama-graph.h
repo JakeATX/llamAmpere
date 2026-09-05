@@ -725,6 +725,13 @@ public:
 
     std::map<llama_seq_id, llama_sampler *> samplers;
     std::vector<llama_seq_id> output_seqs;
+
+    // row-block sampling: per sequence, the I32 input tensor holding the logit rows of that sequence
+    struct row_input {
+        ggml_tensor * t_rows;
+        std::vector<int32_t> rows;
+    };
+    std::map<llama_seq_id, row_input> row_inputs;
 };
 
 struct llm_graph_fused_node {
@@ -916,6 +923,11 @@ public:
     std::map<llama_seq_id, ggml_tensor *> t_sampled;
     ggml_tensor * t_greedy_rows = nullptr;
     std::vector<uint32_t> greedy_rows;
+
+    // row-block sampling (speculative verification): per sequence, the sampled ids of all its output rows
+    // ([n_rows] I32) and the logit row of each entry
+    std::map<llama_seq_id, ggml_tensor *> t_sampled_rows;
+    std::map<llama_seq_id, std::vector<uint32_t>> sampled_rows;
     std::vector<llm_graph_fused_node> fused_nodes;
     std::map<llama_seq_id, ggml_tensor *> t_sampled_probs;
 

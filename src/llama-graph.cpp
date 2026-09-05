@@ -1,5 +1,6 @@
 #include "llama-graph.h"
 #include "llama-sampler.h"
+#include "llama-ext.h"
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -1307,6 +1308,11 @@ void llm_graph_input_sampling::set_input(const llama_ubatch * ubatch) {
             sampler->iface->backend_set_input(sampler);
         }
     }
+
+    for (auto & [seq_id, inp] : row_inputs) {
+        GGML_ASSERT(inp.t_rows && ggml_nelements(inp.t_rows) == (int64_t) inp.rows.size());
+        ggml_backend_tensor_set(inp.t_rows, inp.rows.data(), 0, ggml_nbytes(inp.t_rows));
+    }
 }
 
 bool llm_graph_input_sampling::can_reuse(const llm_graph_params & params) {
@@ -1365,6 +1371,8 @@ void llm_graph_result::reset() {
     t_sampled.clear();
     t_greedy_rows = nullptr;
     greedy_rows.clear();
+    t_sampled_rows.clear();
+    sampled_rows.clear();
     t_sampled_probs.clear();
     t_sampled_logits.clear();
     t_candidates.clear();
@@ -3864,6 +3872,7 @@ void llm_graph_context::build_sampling() const {
     res->add_input(std::move(inp_sampling));
 
     std::map<llama_seq_id, int32_t> seq_to_logit_row;
+    std::map<llama_seq_id, std::vector<int32_t>> seq_rows; // all logit rows of each sequence, in output order
     int32_t logit_row_idx = 0;
 
     for (uint32_t i = 0; i < ubatch.n_tokens; i++) {
@@ -3875,6 +3884,7 @@ void llm_graph_context::build_sampling() const {
                 res->greedy_rows.push_back(logit_row_idx);
             }
             seq_to_logit_row[seq_id] = logit_row_idx;
+            seq_rows[seq_id].push_back(logit_row_idx);
             logit_row_idx++;
         }
     }
@@ -3904,6 +3914,44 @@ void llm_graph_context::build_sampling() const {
         if (llama_sampler_is_greedy_chain(sampler)) {
             continue;
         }
+
+        // row-block sampling: a sequence with several output rows (speculative verification) runs its
+        // chain once over the [n_vocab, n_rows] block of its rows and exports only the sampled ids
+        if (const auto it_rows = seq_rows.find(seq_id); it_rows != seq_rows.end() && it_rows->second.size() > 1) {
+            const auto & rows = it_rows->second;
+            const int64_t n_rows = (int64_t) rows.size();
+
+            GGML_ASSERT(llama_sampler_backend_supports_rows(sampler) && "sampler cannot sample several rows of one sequence");
+
+            ggml_tensor * t_rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_rows);
+            ggml_format_name(t_rows, "sampling_rows_%d", seq_id);
+            ggml_set_input(t_rows);
+            sampling_input->row_inputs[seq_id] = { t_rows, rows };
+
+            ggml_tensor * logits_rows = ggml_get_rows(ctx0, res->t_logits, t_rows); // [n_vocab, n_rows]
+            ggml_format_name(logits_rows, "logits_rows_%d", seq_id);
+
+            struct llama_sampler_data data = {
+                /*.logits      =*/ logits_rows,
+                /*.probs       =*/ nullptr,
+                /*.sampled     =*/ nullptr,
+                /*.candidates  =*/ nullptr,
+            };
+
+            assert(sampler->iface->backend_apply);
+            sampler->iface->backend_apply(sampler, ctx0, gf, &data);
+
+            GGML_ASSERT(data.sampled != nullptr && ggml_nelements(data.sampled) == n_rows && "row-block sampler chain produced no sampled ids");
+
+            ggml_format_name(data.sampled, "sampled_rows_%d", seq_id);
+            ggml_build_forward_expand(gf, data.sampled);
+
+            res->t_sampled_rows[seq_id] = data.sampled;
+            res->sampled_rows[seq_id].assign(rows.begin(), rows.end());
+
+            continue;
+        }
+
         const auto it = seq_to_logit_row.find(seq_id);
 
         // inactive samplers always work on the first row

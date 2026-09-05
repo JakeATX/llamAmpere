@@ -153,3 +153,16 @@ LLAMA_API uint32_t        llama_model_target_layer_ids_n(const struct llama_mode
 // if out is nullptr, returns the number of tokens without writing to out
 // caller must allocate enough memory for out before calling
 LLAMA_API uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out);
+
+//
+// backend sampling on row blocks (speculative verification)
+//
+
+// True if the sampler (or every member of a chain) can run its backend graph on a [n_cand, n_rows] block,
+// i.e. sample all output rows of a sequence (speculative verification) in one graph and return only ids.
+LLAMA_API bool llama_sampler_backend_supports_rows(const struct llama_sampler * sampler);
+
+// True if the chain has been initialized on a backend (llama_set_sampler) and every member runs there.
+LLAMA_API bool llama_sampler_chain_is_backend(const struct llama_sampler * sampler);
+// supports_rows, and (for a chain) every sampler was offloaded by backend_init: safe for multi-row sampling
+LLAMA_API bool llama_sampler_backend_rows_ready(const struct llama_sampler * sampler);
