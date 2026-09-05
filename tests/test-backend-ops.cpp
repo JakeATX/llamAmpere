@@ -9927,6 +9927,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 1, 1, false, 8, 16, 1));
     test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_F16, GGML_TYPE_F32, 16, 16, false, 32, 32, 32, 3));
 
+    // Indexed draft heads: one-row experts, shared activation, and partial warp groups.
+    for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS}) {
+        for (int n_used : {1, 3, 17}) {
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 17, n_used, true, 1, 1, 512));
+        }
+    }
+
     // gpt-oss issue with Vulkan mmq_id
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
@@ -10904,6 +10911,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
 
     // qwen3-30b-a3b
+    // Qwen3.8-27B draft head (248320 x 5120): full head vs draft-only vocabulary shortlist of 32K / 64K indexed rows
+    for (ggml_type type_a : {GGML_TYPE_Q6_K, GGML_TYPE_Q8_0}) {
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 248320, 1, 5120, {1, 1}, {1, 1}));
+        for (int n_used : {32768, 65536}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 248320, n_used, true, 1, 1, 5120));
+        }
+    }
+
     for (int bs : {1, 4, 8, 32, 64, 128, 256, 512}) {
         for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ2_XS}) {
             for (ggml_type type_b : {GGML_TYPE_F32}) {
