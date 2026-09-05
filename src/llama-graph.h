@@ -759,6 +759,9 @@ struct llm_graph_params {
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
+    // draft-only vocabulary shortlist: [n_sel] I32 token ids owned by the context, or nullptr
+    ggml_tensor * draft_vocab_ids = nullptr;
+
     static bool samplers_equal(
           const std::map<llama_seq_id, llama_sampler *> & lhs,
           const std::map<llama_seq_id, llama_sampler *> & rhs) {
@@ -904,6 +907,7 @@ public:
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
+    ggml_tensor * t_logits_ids  = nullptr; // [n_sel] when t_logits rows are a vocabulary shortlist: row -> token id
 
     std::vector<ggml_tensor *> t_layer_inp;
 
@@ -998,6 +1002,8 @@ struct llm_graph_context {
     const llama_cross            * cross;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
+
+    ggml_tensor * draft_vocab_ids; // see llm_graph_params
 
     const llm_graph_cb & cb_func;
 
@@ -1329,6 +1335,13 @@ struct llm_graph_context {
     //
 
     void build_sampling() const;
+
+    // draft-only vocabulary shortlist: logits over the shortlisted rows of head_w only, [n_sel, n_outputs].
+    // Returns nullptr when the shortlist does not apply to this graph (caller uses the full head).
+    ggml_tensor * build_draft_vocab_logits(
+            ggml_tensor * head_w,
+            ggml_tensor * head_s,
+            ggml_tensor * cur) const;
 
     //
     // dense (out)

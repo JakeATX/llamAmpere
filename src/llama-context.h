@@ -264,6 +264,9 @@ public:
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
+    // parse a `llama-mtp-vocab-v1` map and upload it to the head's device (throws on error)
+    void init_draft_vocab(const char * path);
+
 private:
     llm_graph_params graph_params(
                         llm_graph_result * res,
@@ -333,6 +336,17 @@ private:
     };
 
     sampling_info sampling;
+
+    // draft-only vocabulary shortlist (MTP draft contexts): persistent I32 map, compact index -> token id.
+    // Owned here so graphs reference a fixed device tensor instead of uploading an input per eval.
+    struct draft_vocab_info {
+        ggml_context_ptr        ctx;
+        ggml_backend_buffer_ptr buf;
+        ggml_tensor           * ids = nullptr; // [n_sel]
+        std::vector<int32_t>    host;          // same ids, host copy
+    };
+
+    draft_vocab_info draft_vocab;
 
     // sequence embeddings output (map of [n_embd] vectors)
     // populated only when pooling_type != LLAMA_POOLING_TYPE_NONE

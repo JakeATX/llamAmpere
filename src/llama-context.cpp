@@ -21,6 +21,7 @@
 #include "llama-kv-cache-msa.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
+#include "llama-mtp-vocab.h"
 #include "llama-ext.h"
 #include "llama.h"
 
@@ -30,6 +31,7 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
+#include <fstream>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -196,6 +198,17 @@ llama_context::llama_context(
 
                 LLAMA_LOG_INFO("%s: setting backend sampler for seq_id %d (n = %d)\n", __func__, config.seq_id, n_samplers);
             }
+        }
+    }
+
+    // draft-only vocabulary shortlist: parsed once, kept as a persistent I32 map on the head's device
+    {
+        const char * path = params.draft_vocab_map;
+        if ((path == nullptr || path[0] == '\0') && cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+            path = getenv("LLAMA_SPEC_DRAFT_VOCAB");
+        }
+        if (path != nullptr && path[0] != '\0') {
+            init_draft_vocab(path);
         }
     }
 
@@ -558,6 +571,52 @@ llama_context::~llama_context() {
         }
     }
     ggml_opt_free(opt_ctx);
+}
+
+void llama_context::init_draft_vocab(const char * path) {
+    std::ifstream file(path);
+    if (!file) {
+        throw std::runtime_error(format("cannot open draft vocabulary map '%s'", path));
+    }
+
+    const int64_t n_vocab = model.vocab.n_tokens();
+
+    llama_mtp_vocab_map map = llama_mtp_vocab_read(file, n_vocab);
+    if (map.n_vocab != n_vocab) {
+        throw std::runtime_error(format("draft vocabulary map '%s' is for a %lld-token vocabulary, model has %lld",
+                    path, (long long) map.n_vocab, (long long) n_vocab));
+    }
+
+    // the map lives next to the head it indexes
+    const ggml_tensor * head = model.output;
+    if (model.hparams.n_layer_nextn > 0 && model.hparams.n_layer() < model.layers.size()) {
+        const auto & nextn = model.layers[model.hparams.n_layer()].nextn;
+        if (nextn.shared_head_head) {
+            head = nextn.shared_head_head;
+        }
+    }
+    if (head == nullptr || head->buffer == nullptr) {
+        throw std::runtime_error("draft vocabulary map: model has no allocated output head");
+    }
+
+    const int64_t n_sel = (int64_t) map.ids.size();
+
+    ggml_init_params ip = { ggml_tensor_overhead(), nullptr, true };
+    draft_vocab.ctx.reset(ggml_init(ip));
+    draft_vocab.ids = ggml_new_tensor_1d(draft_vocab.ctx.get(), GGML_TYPE_I32, n_sel);
+    ggml_set_name(draft_vocab.ids, "draft_vocab_ids");
+
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(head->buffer);
+    draft_vocab.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(draft_vocab.ctx.get(), buft));
+    if (!draft_vocab.buf) {
+        throw std::runtime_error("draft vocabulary map: failed to allocate the id map");
+    }
+    ggml_backend_tensor_set(draft_vocab.ids, map.ids.data(), 0, (size_t) n_sel * sizeof(int32_t));
+    draft_vocab.host = std::move(map.ids);
+
+    LLAMA_LOG_INFO("%s: draft vocabulary shortlist: %lld of %lld tokens from '%s', map on %s (%.1f KiB), head %s (%s)\n",
+            __func__, (long long) n_sel, (long long) n_vocab, path, ggml_backend_buft_name(buft),
+            (double) n_sel * sizeof(int32_t) / 1024.0, ggml_get_name(head), ggml_type_name(head->type));
 }
 
 void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs) {
@@ -2805,6 +2864,7 @@ llm_graph_params llama_context::graph_params(
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.samplers    =*/ sampling.samplers,
+        /*.draft_vocab =*/ draft_vocab.ids,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
@@ -3879,6 +3939,7 @@ llama_context_params llama_context_default_params() {
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
+        /*.draft_vocab_map             =*/ nullptr,
     };
 
     return result;

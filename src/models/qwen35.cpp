@@ -832,10 +832,11 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
     GGML_ASSERT(head_w && "QWEN35 MTP: missing LM head (nextn.shared_head_head or model.output)");
-    cur = build_lora_mm(head_w, cur, head_s);
+    // draft-only vocabulary shortlist (when the context carries a map): score only the
+    // shortlisted head rows; the backend sampler maps its picks back to token ids
+    ggml_tensor * logits = build_draft_vocab_logits(head_w, head_s, cur);
+    cur = logits ? logits : build_lora_mm(head_w, cur, head_s);
     cb(cur, "result_output", -1);
-
-
 
     res->t_logits = cur;
     ggml_build_forward_expand(gf, cur);

@@ -1057,6 +1057,29 @@ static void mul_mat_vec_q_moe_launch(
         ncols_dst, ids_stride, up_min, up_max, gate_min, gate_max);
 }
 
+// Indexed vocabulary rows share one activation vector and never read padded rows.
+template <ggml_type type>
+static __global__ void mul_mat_vec_q_indexed_rows(
+        const void * vx, const block_q8_1 * y, const int32_t * ids, float * dst,
+        const int ncols, const int count, const int64_t row_bytes, const int dst_stride) {
+    constexpr int qk = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr = get_vdr_mmvq(type);
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr auto vec_dot = get_vec_dot_q_cuda(type);
+    const int row = blockIdx.x * blockDim.y + threadIdx.y;
+    ggml_cuda_pdl_sync();
+    if (row >= count) { return; }
+    const void * weights = (const char *) vx + (int64_t) ids[row] * row_bytes;
+    const int lane = threadIdx.x;
+    float sum = 0.0f;
+    for (int k = lane / (qi / vdr); k < ncols / qk; k += vdr * warp_size / qi) {
+        sum += vec_dot(weights, y + k * (qk / QK8_1), k, vdr * (lane % (qi / vdr)));
+    }
+    sum = warp_reduce_sum<warp_size>(sum);
+    if (lane == 0) { dst[row * dst_stride] = sum; }
+}
+
 template <ggml_type type>
 static void mul_mat_vec_q_switch_ncols_dst(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
@@ -1080,6 +1103,18 @@ static void mul_mat_vec_q_switch_ncols_dst(
     const mmvq_parameter_table_id table_id  = get_device_table_id(cc);
 
     const bool has_ids = ids != nullptr;
+
+    if (has_ids && nrows_x == 1 && ncols_dst == 1 && nchannels_y == 1 &&
+            nsamples_x == 1 && nsamples_dst == 1 && !fusion.gate && !fusion.x_bias &&
+            !fusion.gate_bias && !fusion.x_scale && !fusion.gate_scale) {
+        const dim3 blocks((nchannels_dst + 3) / 4);
+        const dim3 threads(warp_size, 4);
+        const ggml_cuda_kernel_launch_params launch(blocks, threads, 0, stream);
+        ggml_cuda_kernel_launch(mul_mat_vec_q_indexed_rows<type>, launch,
+                vx, (const block_q8_1 *) vy, ids, dst, ncols_x, nchannels_dst,
+                (int64_t) stride_channel_x * ggml_type_size(type), stride_channel_dst);
+        return;
+    }
 
     const auto should_use_small_k = [&](int c_ncols_dst) {
         // When K is small, increase rows_per_block to match nwarps so each warp has more work to do

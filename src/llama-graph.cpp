@@ -1357,6 +1357,7 @@ void llm_graph_result::reset() {
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
     t_h_nextn     = nullptr;
+    t_logits_ids  = nullptr;
 
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
@@ -1505,6 +1506,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     mctx             (params.mctx),
     cross            (params.cross),
     samplers         (params.samplers),
+    draft_vocab_ids  (params.draft_vocab_ids),
     cb_func          (params.cb),
     res              (params.res),
     ctx0             (res->get_ctx()),
@@ -3880,8 +3882,15 @@ void llm_graph_context::build_sampling() const {
     // res->t_logits will contain logits for all tokens that want the logits calculated (logits=1 or output=1)
     GGML_ASSERT(res->t_logits != nullptr && "missing t_logits tensor");
 
+    // shortlisted logits: sampler picks are compact row indices and must be mapped back to token ids
+    ggml_tensor * ids_map = res->t_logits_ids;
+
     if (!res->greedy_rows.empty()) {
         res->t_greedy_rows = ggml_argmax(ctx0, res->t_logits);
+        if (ids_map) {
+            ggml_tensor * rows = ggml_reshape_2d(ctx0, ids_map, 1, ids_map->ne[0]);
+            res->t_greedy_rows = ggml_reshape_1d(ctx0, ggml_get_rows(ctx0, rows, res->t_greedy_rows), res->t_greedy_rows->ne[0]);
+        }
         ggml_set_name(res->t_greedy_rows, "greedy_verify_rows");
         ggml_build_forward_expand(gf, res->t_greedy_rows);
     }
@@ -3904,11 +3913,13 @@ void llm_graph_context::build_sampling() const {
         ggml_tensor * logits_seq = ggml_view_1d(ctx0, logits_t, logits_t->ne[0], row_idx * logits_t->nb[1]);
         ggml_format_name(logits_seq, "logits_seq_%d", seq_id);
 
+        // with a shortlist the candidate list starts as the id map, so the backend
+        // samplers (top_k, temp, dist) emit real token ids
         struct llama_sampler_data data = {
             /*.logits      =*/ logits_seq,
             /*.probs       =*/ nullptr,
             /*.sampled     =*/ nullptr,
-            /*.candidates  =*/ nullptr,
+            /*.candidates  =*/ ids_map,
         };
 
         assert(sampler->iface->backend_apply);
@@ -3950,6 +3961,77 @@ void llm_graph_context::build_sampling() const {
         }
     }
     */
+}
+
+// Only these head layouts reach the CUDA MMVQ one-row-expert path (no expert sorting, no dequantization).
+static bool draft_vocab_direct(const ggml_tensor * head) {
+    if (!head->buffer || !ggml_is_contiguous(head)) {
+        return false;
+    }
+    auto * buft = ggml_backend_buffer_get_type(head->buffer);
+    auto * dev  = ggml_backend_buft_get_device(buft);
+    if (!dev || std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "CUDA") != 0 ||
+            buft != ggml_backend_dev_buffer_type(dev)) {
+        return false;
+    }
+    switch (head->type) {
+        case GGML_TYPE_Q4_0: case GGML_TYPE_Q4_1: case GGML_TYPE_Q5_0: case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q8_0: case GGML_TYPE_Q2_K: case GGML_TYPE_Q3_K: case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K: case GGML_TYPE_Q6_K: case GGML_TYPE_IQ2_XXS: case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ2_S: case GGML_TYPE_IQ3_XXS: case GGML_TYPE_IQ3_S: case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_IQ4_XS: case GGML_TYPE_IQ1_S: case GGML_TYPE_IQ1_M:
+            return true;
+        default:
+            return false;
+    }
+}
+
+ggml_tensor * llm_graph_context::build_draft_vocab_logits(
+        ggml_tensor * head_w,
+        ggml_tensor * head_s,
+        ggml_tensor * cur) const {
+    if (draft_vocab_ids == nullptr || n_outputs == 0 || head_w == nullptr) {
+        return nullptr;
+    }
+    if ((loras && !loras->empty()) || (head_s && ggml_nelements(head_s) != 1)) {
+        return nullptr;
+    }
+    if (draft_vocab_ids->ne[0] >= head_w->ne[1] || !draft_vocab_direct(head_w)) {
+        return nullptr;
+    }
+    // the compact logits never reach the host: every output row must be consumed by a backend sampler
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        if (!ubatch.output[i]) {
+            continue;
+        }
+        for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
+            if (samplers.find(ubatch.seq_id[i][j]) == samplers.end()) {
+                return nullptr;
+            }
+        }
+    }
+    GGML_ASSERT(cur->ne[1] == n_outputs);
+
+    const int64_t n_sel = draft_vocab_ids->ne[0];
+
+    // each vocabulary row is a one-row expert of the existing head: no second weight matrix
+    ggml_tensor * rows = ggml_reshape_3d(ctx0, head_w, head_w->ne[0], 1, head_w->ne[1]);
+
+    ggml_tensor * logits = nullptr;
+    for (int64_t i = 0; i < n_outputs; ++i) {
+        ggml_tensor * h_i = n_outputs == 1 ? cur : ggml_view_2d(ctx0, cur, cur->ne[0], 1, cur->nb[1], i*cur->nb[1]);
+        ggml_tensor * l_i = ggml_mul_mat_id(ctx0, rows, h_i, draft_vocab_ids); // [1, n_sel, 1]
+        l_i = ggml_reshape_2d(ctx0, l_i, n_sel, 1);
+        logits = logits ? ggml_concat(ctx0, logits, l_i, 1) : l_i;
+    }
+    if (head_s) {
+        logits = ggml_mul(ctx0, logits, head_s);
+    }
+    cb(logits, "draft_vocab_logits", -1);
+
+    res->t_logits_ids = draft_vocab_ids;
+
+    return logits;
 }
 
 int32_t llama_relative_position_bucket(llama_pos x, llama_pos y, uint64_t n_buckets, bool bidirectional) {

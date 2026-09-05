@@ -2835,6 +2835,10 @@ common_speculative_init_result::common_speculative_init_result(
 
     if (spec_mtp) {
         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        if (!params.speculative.draft.vocab_map.empty()) {
+            cparams.draft_vocab_map = params.speculative.draft.vocab_map.c_str();
+            LOG_INF("%s: MTP draft context uses the draft-only vocabulary shortlist '%s'\n", __func__, cparams.draft_vocab_map);
+        }
     }
 
     // note: for small models maybe we can set this to the maximum possible draft from all speculative types

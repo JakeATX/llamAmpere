@@ -333,6 +333,8 @@ struct common_params_speculative_draft {
     bool chain = false; // chained drafting: all n_max tokens in one GPU decode (MTP only)
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 
+    std::string vocab_map; // draft-only vocabulary shortlist map for the MTP draft head (empty = full vocabulary)
+
     common_params_model mparams;
 
     llama_context * ctx_tgt = nullptr;
