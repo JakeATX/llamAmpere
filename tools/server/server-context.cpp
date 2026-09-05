@@ -41,6 +41,19 @@ using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
+// GPU verification of MTP/draft tokens (argmax or the full sampler chain on the backend, only token ids
+// downloaded) is on by default. LLAMA_MTP_GPU_VERIFY=0 disables it; LLAMA_MTP_GPU_VERIFY=greedy keeps only the
+// greedy path (sampled requests verify on the CPU as before)
+static bool server_mtp_gpu_verify_enabled() {
+    const char * gpu_verify = std::getenv("LLAMA_MTP_GPU_VERIFY");
+    return gpu_verify == nullptr || std::strcmp(gpu_verify, "0") != 0;
+}
+
+static bool server_mtp_gpu_verify_sampled_enabled() {
+    const char * gpu_verify = std::getenv("LLAMA_MTP_GPU_VERIFY");
+    return server_mtp_gpu_verify_enabled() && !(gpu_verify && std::strcmp(gpu_verify, "greedy") == 0);
+}
+
 static uint32_t server_n_outputs_max(const common_params & params) {
     const uint32_t n_batch  = params.n_batch;
 
@@ -2149,9 +2162,13 @@ private:
             backend_sampling &= task.params.sampling.backend_sampling;
 
             llama_sampler * speculative_sampler = nullptr;
-            const char * gpu_verify = std::getenv("LLAMA_MTP_GPU_VERIFY");
-            if (slot.can_speculate() && gpu_verify && std::strcmp(gpu_verify, "1") == 0) {
+            bool speculative_sampled = false;
+            if (slot.can_speculate() && server_mtp_gpu_verify_enabled()) {
                 speculative_sampler = common_sampler_get_greedy_backend(slot.smpl.get(), model_tgt);
+                if (!speculative_sampler && server_mtp_gpu_verify_sampled_enabled()) {
+                    speculative_sampler = common_sampler_get_backend_verify(slot.smpl.get());
+                    speculative_sampled  = speculative_sampler != nullptr;
+                }
                 if (!speculative_sampler) {
                     SLT_INF(slot, "%s", "GPU verification ineligible for sampler settings; using CPU verification\n");
                 }
@@ -2164,10 +2181,18 @@ private:
 
             // TODO: tmp until backend sampling is fully implemented
             if (backend_sampling) {
-                const bool enabled = llama_set_sampler(ctx_tgt, slot.id,
+                bool enabled = llama_set_sampler(ctx_tgt, slot.id,
                         speculative_sampler ? speculative_sampler : common_sampler_get(slot.smpl.get()));
+                if (enabled && speculative_sampled && !common_sampler_backend_verify_ready(slot.smpl.get())) {
+                    // part of the chain cannot run on this backend: a verification row block would come back
+                    // unsampled, so fall back to CPU verification with a chain that was never offloaded
+                    llama_set_sampler(ctx_tgt, slot.id, nullptr);
+                    slot.smpl.reset(common_sampler_init(model_tgt, task.params.sampling));
+                    enabled = false;
+                }
                 if (speculative_sampler) {
-                    SLT_INF(slot, "GPU greedy verification %s\n", enabled ? "enabled" : "unavailable; using CPU verification");
+                    SLT_INF(slot, "GPU %s verification %s\n", speculative_sampled ? "sampled" : "greedy",
+                            enabled ? "enabled" : "unavailable; using CPU verification");
                 }
             } else {
                 llama_set_sampler(ctx_tgt, slot.id, nullptr);
@@ -4396,10 +4421,20 @@ private:
                         // The context borrows its backend sampler from slot.smpl.
                         llama_set_sampler(slot.ctx_tgt, slot.id, nullptr);
                         slot.smpl = std::move(smpl_save);
-                        const char * gpu_verify = std::getenv("LLAMA_MTP_GPU_VERIFY");
-                        if (gpu_verify && std::strcmp(gpu_verify, "1") == 0) {
-                            if (auto * sampler = common_sampler_get_greedy_backend(slot.smpl.get(), model_tgt)) {
-                                llama_set_sampler(slot.ctx_tgt, slot.id, sampler);
+                        if (server_mtp_gpu_verify_enabled()) {
+                            llama_sampler * sampler = common_sampler_get_greedy_backend(slot.smpl.get(), model_tgt);
+                            bool sampled = false;
+                            if (!sampler && server_mtp_gpu_verify_sampled_enabled()) {
+                                sampler = common_sampler_get_backend_verify(slot.smpl.get());
+                                sampled = sampler != nullptr;
+                            }
+                            if (sampler) {
+                                const bool enabled = llama_set_sampler(slot.ctx_tgt, slot.id, sampler);
+                                if (enabled && sampled && !common_sampler_backend_verify_ready(slot.smpl.get())) {
+                                    llama_set_sampler(slot.ctx_tgt, slot.id, nullptr);
+                                    // the partially offloaded chain must not be used on the CPU: continue with a fresh clone
+                                    slot.smpl.reset(common_sampler_clone(slot.smpl.get()));
+                                }
                             }
                         }
 
