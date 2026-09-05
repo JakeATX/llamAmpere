@@ -5,6 +5,8 @@
 #include "log.h"
 #include "reasoning-budget.h"
 
+#include "../src/llama-ext.h" // staging API: llama_sampler_backend_supports_rows
+
 #include "ggml.h"
 
 #include <algorithm>
@@ -586,7 +588,7 @@ bool common_sampler_supports_greedy_backend(const common_params_sampling & param
                 temperature = true;
                 break;
             case COMMON_SAMPLER_TYPE_TOP_K:
-                // Top-k can reorder tied maxima before temperature runs.
+                // Active truncation can reorder tied maxima before temperature runs.
                 if (params.top_k > 0) { return false; }
                 break;
             case COMMON_SAMPLER_TYPE_TOP_P:
@@ -634,6 +636,59 @@ struct llama_sampler * common_sampler_get_greedy_backend(struct common_sampler *
         llama_sampler_chain_add(gsmpl->greedy_backend, llama_sampler_init_greedy());
     }
     return gsmpl->greedy_backend;
+}
+
+bool common_sampler_supports_backend_verify(const common_params_sampling & params) {
+    if (params.temp <= 0.0f) {
+        return false; // greedy chains use common_sampler_get_greedy_backend
+    }
+    if (params.mirostat != 0 || params.n_probs != 0 || params.min_keep > 1 || !common_grammar_value(params.grammar).empty()) {
+        return false;
+    }
+
+    for (const auto type : params.samplers) {
+        switch (type) {
+            case COMMON_SAMPLER_TYPE_TEMPERATURE: // temp and dynamic temp run on the backend
+            case COMMON_SAMPLER_TYPE_TOP_K:       // truncations run on the backend for any value
+            case COMMON_SAMPLER_TYPE_TOP_P:
+            case COMMON_SAMPLER_TYPE_MIN_P:
+                break;
+            case COMMON_SAMPLER_TYPE_TYPICAL_P:
+                if (!(params.typ_p >= 1.0f)) { return false; }
+                break;
+            case COMMON_SAMPLER_TYPE_TOP_N_SIGMA:
+                if (!(params.top_n_sigma < 0.0f)) { return false; }
+                break;
+            case COMMON_SAMPLER_TYPE_XTC:
+                if (!(params.xtc_probability <= 0.0f)) { return false; }
+                break;
+            case COMMON_SAMPLER_TYPE_DRY:
+                if (params.dry_multiplier != 0.0f && params.dry_penalty_last_n != 0) { return false; }
+                break;
+            case COMMON_SAMPLER_TYPE_PENALTIES:
+                // active penalties need the per-row token history (row r sees the draft tokens accepted before it)
+                if (params.penalty_last_n != 0 && (params.penalty_repeat != 1.0f ||
+                        params.penalty_freq != 0.0f || params.penalty_present != 0.0f)) { return false; }
+                break;
+            default:
+                return false;
+        }
+    }
+    return true;
+}
+
+struct llama_sampler * common_sampler_get_backend_verify(struct common_sampler * gsmpl) {
+    if (!gsmpl || gsmpl->grmr || gsmpl->rbudget || !common_sampler_supports_backend_verify(gsmpl->params)) {
+        return nullptr;
+    }
+    if (!llama_sampler_backend_supports_rows(gsmpl->chain)) {
+        return nullptr;
+    }
+    return gsmpl->chain;
+}
+
+bool common_sampler_backend_verify_ready(const struct common_sampler * gsmpl) {
+    return gsmpl && llama_sampler_chain_is_backend(gsmpl->chain);
 }
 
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {

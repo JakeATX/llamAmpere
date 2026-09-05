@@ -58,6 +58,19 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl);
 bool common_sampler_supports_greedy_backend(const common_params_sampling & params);
 struct llama_sampler * common_sampler_get_greedy_backend(struct common_sampler * gsmpl, const struct llama_model * model);
 
+// sampled (temp > 0) speculative verification on the backend: true if the chain built from these params
+// runs entirely on the backend for all verification rows at once (temp, top-k, top-p, min-p, logit bias,
+// dist; penalties/DRY only while inactive; no grammar, mirostat, n_probs, typical/xtc/top-n-sigma/adaptive-p)
+bool common_sampler_supports_backend_verify(const common_params_sampling & params);
+
+// returns the sampler chain to install with llama_set_sampler for sampled backend verification, or nullptr
+// if the sampler is not eligible. The chain is owned by gsmpl.
+struct llama_sampler * common_sampler_get_backend_verify(struct common_sampler * gsmpl);
+
+// after llama_set_sampler: true if every sampler of the chain runs on the backend (a partially offloaded
+// chain cannot sample a verification row block and must fall back to CPU verification)
+bool common_sampler_backend_verify_ready(const struct common_sampler * gsmpl);
+
 // extended sampling implementation:
 //
 // - set logits
