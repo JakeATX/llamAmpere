@@ -39,3 +39,6 @@ struct llama_sampler * llama_sampler_init_dry_testing(
         int32_t dry_allowed_length,
         int32_t dry_penalty_last_n,
         const std::vector<std::vector<llama_token>> & seq_breakers);
+
+// Stateless greedy chains can sample every output row in one graph.
+bool llama_sampler_is_greedy_chain(const llama_sampler * sampler);

@@ -19,6 +19,8 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdlib>
+#include <cstring>
 #include <cinttypes>
 #include <exception>
 #include <memory>
@@ -2124,15 +2126,27 @@ private:
 
             backend_sampling &= task.params.sampling.backend_sampling;
 
-            // TODO: speculative decoding requires multiple samples per batch - not supported yet
-            backend_sampling &= !(slot.can_speculate());
+            llama_sampler * speculative_sampler = nullptr;
+            const char * gpu_verify = std::getenv("LLAMA_MTP_GPU_VERIFY");
+            if (slot.can_speculate() && gpu_verify && std::strcmp(gpu_verify, "1") == 0) {
+                speculative_sampler = common_sampler_get_greedy_backend(slot.smpl.get(), model_tgt);
+                if (!speculative_sampler) {
+                    SLT_INF(slot, "%s", "GPU verification ineligible for sampler settings; using CPU verification\n");
+                }
+            }
+            backend_sampling &= !slot.can_speculate();
+            backend_sampling |= speculative_sampler != nullptr;
 
             // TODO: getting pre sampling logits is not yet supported with backend sampling
             backend_sampling &= !need_pre_sample_logits;
 
             // TODO: tmp until backend sampling is fully implemented
             if (backend_sampling) {
-                llama_set_sampler(ctx_tgt, slot.id, common_sampler_get(slot.smpl.get()));
+                const bool enabled = llama_set_sampler(ctx_tgt, slot.id,
+                        speculative_sampler ? speculative_sampler : common_sampler_get(slot.smpl.get()));
+                if (speculative_sampler) {
+                    SLT_INF(slot, "GPU greedy verification %s\n", enabled ? "enabled" : "unavailable; using CPU verification");
+                }
             } else {
                 llama_set_sampler(ctx_tgt, slot.id, nullptr);
             }
@@ -4344,7 +4358,15 @@ private:
                         slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
 
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
+                        // The context borrows its backend sampler from slot.smpl.
+                        llama_set_sampler(slot.ctx_tgt, slot.id, nullptr);
                         slot.smpl = std::move(smpl_save);
+                        const char * gpu_verify = std::getenv("LLAMA_MTP_GPU_VERIFY");
+                        if (gpu_verify && std::strcmp(gpu_verify, "1") == 0) {
+                            if (auto * sampler = common_sampler_get_greedy_backend(slot.smpl.get(), model_tgt)) {
+                                llama_set_sampler(slot.ctx_tgt, slot.id, sampler);
+                            }
+                        }
 
                         return;
                     }

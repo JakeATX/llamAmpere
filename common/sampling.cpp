@@ -166,6 +166,7 @@ struct common_sampler {
     }
 
     mutable int64_t t_total_us = 0;
+    llama_sampler * greedy_backend = nullptr;
 };
 
 std::string common_params_sampling::print() const {
@@ -445,6 +446,7 @@ void common_sampler_free(struct common_sampler * gsmpl) {
     llama_sampler_free(gsmpl->grmr);
     llama_sampler_free(gsmpl->rbudget);
     llama_sampler_free(gsmpl->chain);
+    llama_sampler_free(gsmpl->greedy_backend);
 
     delete gsmpl;
 }
@@ -571,6 +573,69 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
     return gsmpl->chain;
 }
 
+bool common_sampler_supports_greedy_backend(const common_params_sampling & params) {
+    if (!(params.temp <= 0.0f) || params.dynatemp_range != 0.0f || params.mirostat != 0 ||
+            params.n_probs != 0 || !params.logit_bias.empty() || !common_grammar_value(params.grammar).empty()) {
+        return false;
+    }
+
+    bool temperature = false;
+    for (const auto type : params.samplers) {
+        switch (type) {
+            case COMMON_SAMPLER_TYPE_TEMPERATURE:
+                temperature = true;
+                break;
+            case COMMON_SAMPLER_TYPE_TOP_K:
+                // Top-k can reorder tied maxima before temperature runs.
+                if (params.top_k > 0) { return false; }
+                break;
+            case COMMON_SAMPLER_TYPE_TOP_P:
+                if (!(params.top_p >= 1.0f)) { return false; }
+                break;
+            case COMMON_SAMPLER_TYPE_MIN_P:
+                if (!(params.min_p <= 0.0f)) { return false; }
+                break;
+            case COMMON_SAMPLER_TYPE_TYPICAL_P:
+                if (!(params.typ_p >= 1.0f)) { return false; }
+                break;
+            case COMMON_SAMPLER_TYPE_TOP_N_SIGMA:
+                if (!(params.top_n_sigma < 0.0f)) { return false; }
+                break;
+            case COMMON_SAMPLER_TYPE_XTC:
+                if (!(params.xtc_probability <= 0.0f)) { return false; }
+                break;
+            case COMMON_SAMPLER_TYPE_DRY:
+                if (params.dry_multiplier != 0.0f && params.dry_penalty_last_n != 0) { return false; }
+                break;
+            case COMMON_SAMPLER_TYPE_PENALTIES:
+                if (params.penalty_last_n != 0 && (params.penalty_repeat != 1.0f ||
+                        params.penalty_freq != 0.0f || params.penalty_present != 0.0f)) { return false; }
+                break;
+            default:
+                return false;
+        }
+    }
+    return temperature;
+}
+
+struct llama_sampler * common_sampler_get_greedy_backend(struct common_sampler * gsmpl, const struct llama_model * model) {
+    if (!gsmpl || gsmpl->grmr || gsmpl->rbudget || !common_sampler_supports_greedy_backend(gsmpl->params)) {
+        return nullptr;
+    }
+    int32_t n_suppress = 0;
+    llama_vocab_get_suppress_tokens(llama_model_get_vocab(model), &n_suppress);
+    if (n_suppress != 0) {
+        return nullptr;
+    }
+    if (!gsmpl->greedy_backend) {
+        auto params = llama_sampler_chain_default_params();
+        params.no_perf = gsmpl->params.no_perf;
+        gsmpl->greedy_backend = llama_sampler_chain_init(params);
+        llama_sampler_chain_add(gsmpl->greedy_backend, llama_sampler_init_greedy());
+    }
+    return gsmpl->greedy_backend;
+}
+
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
     llama_synchronize(ctx);
 
@@ -584,8 +649,6 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & chain = gsmpl->chain;
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
 
-    gsmpl->set_logits(ctx, idx);
-
     // Check if a backend sampler has already sampled a token in which case we
     // return that token id directly.
     {
@@ -597,6 +660,14 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
             GGML_ASSERT(!gsmpl->grmr    && "using grammar in combination with backend sampling is not supported");
             GGML_ASSERT(!gsmpl->rbudget && "using reasoning budget in combination with backend sampling is not supported");
 
+            if (!llama_get_sampled_logits_ith(ctx, idx) && !llama_get_sampled_probs_ith(ctx, idx)) {
+                // Compact greedy output has no candidate distribution to materialize.
+                gsmpl->cur.clear();
+                cur_p = { nullptr, 0, -1, false };
+                return id;
+            }
+
+            gsmpl->set_logits(ctx, idx);
             for (size_t i = 0; i < cur_p.size; ++i) {
                 if (cur_p.data[i].id == id) {
                     cur_p.selected = i;
@@ -607,6 +678,8 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
             return id;
         }
     }
+
+    gsmpl->set_logits(ctx, idx);
 
     // apply reasoning budget first
     llama_sampler_apply(rbudget, &cur_p);

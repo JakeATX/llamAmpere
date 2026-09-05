@@ -1,5 +1,8 @@
 #include "ggml.h"
+#include "ggml-alloc.h"
+#include "ggml-backend.h"
 #include "llama.h"
+#include "sampling.h"
 
 #ifdef NDEBUG
 #undef NDEBUG
@@ -7,6 +10,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -305,7 +310,84 @@ static void test_perf() {
     BENCH(llama_sampler_init_xtc    (1.0f, 0.1f, 1, 1),       data, 32);
 }
 
+static void test_greedy_argmax_rows() {
+    constexpr int cols = 2081;
+    constexpr int rows = 7;
+    std::vector<float> logits(cols * rows, -10.0f);
+    std::fill_n(logits.data(), cols, 2.0f);
+    logits[cols + 5] = logits[cols + 32] = logits[2 * cols - 1] = 3.0f;
+    std::fill_n(logits.data() + 2 * cols, cols, -INFINITY);
+    logits[3 * cols] = std::numeric_limits<float>::quiet_NaN();
+    logits[3 * cols + 7] = 1.0f;
+    logits[4 * cols + 5] = 3.0f;
+    logits[4 * cols + 17] = std::numeric_limits<float>::quiet_NaN();
+    logits[5 * cols + 5] = logits[5 * cols + 32] = INFINITY;
+    std::fill_n(logits.data() + 6 * cols, cols, -std::numeric_limits<float>::max());
+    const std::vector<llama_token> expected = {0, 5, 0, 0, 5, 5, 0};
+
+    ggml_backend_load_all();
+    int tested = 0;
+    for (size_t d = 0; d < ggml_backend_dev_count(); ++d) {
+        auto dev = ggml_backend_dev_get(d);
+        const std::string name = ggml_backend_dev_name(dev);
+        // These backends implement the first-index tie convention used by greedy verification.
+        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU && name.find("CUDA") != 0) { continue; }
+        ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+        GGML_ASSERT(backend);
+        ggml_init_params init = { ggml_tensor_overhead() * 4 + ggml_graph_overhead(), nullptr, true };
+        ggml_context * ctx = ggml_init(init);
+        GGML_ASSERT(ctx);
+        ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, cols, rows);
+        ggml_tensor * result = ggml_argmax(ctx, input);
+        GGML_ASSERT(ggml_backend_supports_op(backend, result));
+        ggml_cgraph * graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, result);
+        ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+        GGML_ASSERT(buffer);
+        ggml_backend_tensor_set(input, logits.data(), 0, logits.size() * sizeof(float));
+        GGML_ASSERT(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
+        std::vector<llama_token> actual(rows);
+        ggml_backend_tensor_get(result, actual.data(), 0, actual.size() * sizeof(llama_token));
+        GGML_ASSERT(actual == expected);
+        printf("greedy argmax ties/nonfinite rows: %s PASSED\n", name.c_str());
+        ggml_backend_buffer_free(buffer);
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        ++tested;
+    }
+    GGML_ASSERT(tested > 0);
+}
+
+static void test_greedy_backend_eligibility() {
+    common_params_sampling params;
+    params.temp = 0.0f;
+    params.samplers = { COMMON_SAMPLER_TYPE_TEMPERATURE };
+    GGML_ASSERT(common_sampler_supports_greedy_backend(params));
+    params.temp = 0.1f;
+    GGML_ASSERT(!common_sampler_supports_greedy_backend(params));
+    params.temp = 0.0f;
+    params.n_probs = 1;
+    GGML_ASSERT(!common_sampler_supports_greedy_backend(params));
+    params.n_probs = 0;
+    params.logit_bias.push_back({0, -INFINITY});
+    GGML_ASSERT(!common_sampler_supports_greedy_backend(params));
+    params.logit_bias.clear();
+    params.samplers.push_back(COMMON_SAMPLER_TYPE_PENALTIES);
+    GGML_ASSERT(common_sampler_supports_greedy_backend(params));
+    params.penalty_repeat = 1.1f;
+    GGML_ASSERT(!common_sampler_supports_greedy_backend(params));
+    params.penalty_repeat = 1.0f;
+    params.samplers.push_back(COMMON_SAMPLER_TYPE_TOP_K);
+    GGML_ASSERT(!common_sampler_supports_greedy_backend(params));
+    params.top_k = 0;
+    GGML_ASSERT(common_sampler_supports_greedy_backend(params));
+    params.samplers.push_back(COMMON_SAMPLER_TYPE_INFILL);
+    GGML_ASSERT(!common_sampler_supports_greedy_backend(params));
+}
+
 int main(void) {
+    test_greedy_backend_eligibility();
+    test_greedy_argmax_rows();
     ggml_time_init();
 
     test_temp({0.1f, 0.2f, 0.3f, 0.4f}, {0.1f, 0.2f, 0.3f, 0.4f}, 1.0f);

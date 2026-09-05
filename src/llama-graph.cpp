@@ -1,4 +1,5 @@
 #include "llama-graph.h"
+#include "llama-sampler.h"
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -1309,6 +1310,18 @@ void llm_graph_input_sampling::set_input(const llama_ubatch * ubatch) {
 }
 
 bool llm_graph_input_sampling::can_reuse(const llm_graph_params & params) {
+    size_t output_row = 0;
+    for (uint32_t i = 0; i < params.ubatch.n_tokens; ++i) {
+        if (params.ubatch.output[i]) {
+            if (output_row >= output_seqs.size() || output_seqs[output_row++] != params.ubatch.seq_id[i][0]) {
+                return false;
+            }
+        }
+    }
+    if (output_row != output_seqs.size()) {
+        return false;
+    }
+
     if (samplers.size() != params.samplers.size()) {
         return false;
     }
@@ -1349,6 +1362,8 @@ void llm_graph_result::reset() {
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
 
     t_sampled.clear();
+    t_greedy_rows = nullptr;
+    greedy_rows.clear();
     t_sampled_probs.clear();
     t_sampled_logits.clear();
     t_candidates.clear();
@@ -3843,6 +3858,7 @@ void llm_graph_context::build_sampling() const {
     outs[0] = res->t_logits;
 
     auto inp_sampling = std::make_unique<llm_graph_input_sampling>(samplers);
+    auto * sampling_input = inp_sampling.get();
     res->add_input(std::move(inp_sampling));
 
     std::map<llama_seq_id, int32_t> seq_to_logit_row;
@@ -3851,6 +3867,11 @@ void llm_graph_context::build_sampling() const {
     for (uint32_t i = 0; i < ubatch.n_tokens; i++) {
         if (ubatch.output[i]) {
             llama_seq_id seq_id = ubatch.seq_id[i][0];
+            sampling_input->output_seqs.push_back(seq_id);
+            const auto it = samplers.find(seq_id);
+            if (it != samplers.end() && llama_sampler_is_greedy_chain(it->second)) {
+                res->greedy_rows.push_back(logit_row_idx);
+            }
             seq_to_logit_row[seq_id] = logit_row_idx;
             logit_row_idx++;
         }
@@ -3859,12 +3880,21 @@ void llm_graph_context::build_sampling() const {
     // res->t_logits will contain logits for all tokens that want the logits calculated (logits=1 or output=1)
     GGML_ASSERT(res->t_logits != nullptr && "missing t_logits tensor");
 
+    if (!res->greedy_rows.empty()) {
+        res->t_greedy_rows = ggml_argmax(ctx0, res->t_logits);
+        ggml_set_name(res->t_greedy_rows, "greedy_verify_rows");
+        ggml_build_forward_expand(gf, res->t_greedy_rows);
+    }
+
     // add a dummy row of logits
     // this trick makes the graph static, regardless of which samplers are activated
     // this is important in order to minimize graph reallocations
     ggml_tensor * logits_t = ggml_pad(ctx0, res->t_logits, 0, 1, 0, 0);
 
     for (const auto & [seq_id, sampler] : samplers) {
+        if (llama_sampler_is_greedy_chain(sampler)) {
+            continue;
+        }
         const auto it = seq_to_logit_row.find(seq_id);
 
         // inactive samplers always work on the first row

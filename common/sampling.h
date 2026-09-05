@@ -54,6 +54,10 @@ void common_perf_print(const struct llama_context * ctx, const struct common_sam
 // get the underlying llama_sampler_chain
 struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl);
 
+// Returns nullptr unless the chain is equivalent to raw-logit greedy sampling.
+bool common_sampler_supports_greedy_backend(const common_params_sampling & params);
+struct llama_sampler * common_sampler_get_greedy_backend(struct common_sampler * gsmpl, const struct llama_model * model);
+
 // extended sampling implementation:
 //
 // - set logits

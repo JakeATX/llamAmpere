@@ -1,4 +1,5 @@
 #include "llama-context.h"
+#include "llama-sampler.h"
 
 // minimum number of output rows reserved at context creation (covers MTP verification widths)
 #define LLAMA_OUTPUT_RESERVE_MIN 8
@@ -2078,7 +2079,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 const llama_seq_id seq_id = batch_inp.seq_id ? batch_inp.seq_id[i][s] : 0;
 
                 seq_output_count[seq_id]++;
-                if (seq_output_count[seq_id] > 1) {
+                const auto sampler = sampling.samplers.find(seq_id);
+                if (seq_output_count[seq_id] > 1 && sampler != sampling.samplers.end() && !llama_sampler_is_greedy_chain(sampler->second)) {
                     LLAMA_LOG_ERROR("%s: backend sampling requires at most one output token per sequence (seq_id %d had %d)\n",
                             __func__, seq_id, seq_output_count[seq_id]);
                     return -1;
@@ -2348,6 +2350,22 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
+        if (res->t_greedy_rows) {
+            ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), res->t_greedy_rows);
+            // Coalesce adjacent rows, including all rows of a single-sequence MTP verification.
+            for (size_t i = 0; i < res->greedy_rows.size();) {
+                const uint32_t first = res->greedy_rows[i];
+                uint32_t count = 1;
+                while (++i < res->greedy_rows.size() && res->greedy_rows[i] == first + count) {
+                    ++count;
+                }
+                GGML_ASSERT(n_outputs_prev + first + count <= (int64_t) sampling.sampled.size);
+                ggml_backend_tensor_get_async(backend, res->t_greedy_rows,
+                        sampling.sampled.data + n_outputs_prev + first,
+                        first * sizeof(llama_token), count * sizeof(llama_token));
+            }
+        }
+
         // Copy backend sampling output if this ubatch produced any sampling tensors.
         if (has_samplers && (!res->t_sampled.empty() || !res->t_sampled_probs.empty() || !res->t_sampled_logits.empty())) {
             const auto seq_to_output_row = build_seq_to_output_row(ubatch, n_outputs_prev);
@@ -2468,7 +2486,11 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     // Allocate backend sampling output buffers if there are backend samplers configured.
     const bool has_sampling = !sampling.samplers.empty();
-    if (has_sampling) {
+    const bool compact_sampling = has_sampling && std::all_of(sampling.samplers.begin(), sampling.samplers.end(),
+            [](const auto & entry) { return llama_sampler_is_greedy_chain(entry.second); });
+    if (compact_sampling) {
+        backend_token_count = n_outputs_max;
+    } else if (has_sampling) {
         backend_float_count = 2 * n_vocab * n_outputs_max;      // logits + probs
         backend_token_count = (1 + n_vocab) * n_outputs_max;    // sampled + candidates
     }
@@ -2542,16 +2564,16 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     }
 
     if (has_sampling) {
-        sampling.logits = {(float *) (base + offset), (size_t)(n_vocab*n_outputs_max)};
+        sampling.logits = compact_sampling ? buffer_view<float>{nullptr, 0} : buffer_view<float>{(float *) (base + offset), (size_t)(n_vocab*n_outputs_max)};
         offset += sampling.logits.size * sizeof(float);
 
-        sampling.probs = {(float *) (base + offset), (size_t)(n_vocab*n_outputs_max)};
+        sampling.probs = compact_sampling ? buffer_view<float>{nullptr, 0} : buffer_view<float>{(float *) (base + offset), (size_t)(n_vocab*n_outputs_max)};
         offset += sampling.probs.size * sizeof(float);
 
         sampling.sampled = {(llama_token *) (base + offset), (size_t)n_outputs_max};
         offset += sampling.sampled.size * sizeof(llama_token);
 
-        sampling.candidates = {(llama_token *) (base + offset), (size_t)(n_vocab*n_outputs_max)};
+        sampling.candidates = compact_sampling ? buffer_view<llama_token>{nullptr, 0} : buffer_view<llama_token>{(llama_token *) (base + offset), (size_t)(n_vocab*n_outputs_max)};
         offset += sampling.candidates.size * sizeof(llama_token);
 
         // The count vectors keep track of the actual number of logits/probs/candidates
@@ -2651,23 +2673,20 @@ void llama_context::output_reorder() {
         }
 
         if (!sampling.samplers.empty()) {
-            assert(sampling.logits.size > 0);
-            assert(sampling.probs.size > 0);
-            assert(sampling.candidates.size > 0);
             assert(sampling.sampled.size > 0);
             assert(sampling.logits_count.size() > 0);
             assert(sampling.probs_count.size() > 0);
             assert(sampling.candidates_count.size() > 0);
 
-            for (uint64_t k = 0; k < n_vocab; ++k) {
+            for (uint64_t k = 0; sampling.logits.has_data() && k < n_vocab; ++k) {
                 std::swap(sampling.logits.data[i0*n_vocab + k], sampling.logits.data[i1*n_vocab + k]);
             }
 
-            for (uint64_t k = 0; k < n_vocab; ++k) {
+            for (uint64_t k = 0; sampling.probs.has_data() && k < n_vocab; ++k) {
                 std::swap(sampling.probs.data[i0*n_vocab + k], sampling.probs.data[i1*n_vocab + k]);
             }
 
-            for (uint64_t k = 0; k < n_vocab; ++k) {
+            for (uint64_t k = 0; sampling.candidates.has_data() && k < n_vocab; ++k) {
                 std::swap(sampling.candidates.data[i0*n_vocab + k], sampling.candidates.data[i1*n_vocab + k]);
             }
 

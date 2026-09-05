@@ -724,6 +724,7 @@ public:
     bool can_reuse(const llm_graph_params & params) override;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
+    std::vector<llama_seq_id> output_seqs;
 };
 
 struct llm_graph_fused_node {
@@ -909,6 +910,8 @@ public:
     std::map<llama_seq_id, ggml_tensor *> t_sampled_logits;
     std::map<llama_seq_id, ggml_tensor *> t_candidates;
     std::map<llama_seq_id, ggml_tensor *> t_sampled;
+    ggml_tensor * t_greedy_rows = nullptr;
+    std::vector<uint32_t> greedy_rows;
     std::vector<llm_graph_fused_node> fused_nodes;
     std::map<llama_seq_id, ggml_tensor *> t_sampled_probs;
 

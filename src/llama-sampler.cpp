@@ -1014,6 +1014,14 @@ static struct llama_sampler_i llama_sampler_greedy_i = {
     /* .backend_set_input = */ nullptr,
 };
 
+bool llama_sampler_is_greedy_chain(const llama_sampler * sampler) {
+    if (!sampler || sampler->iface != &llama_sampler_chain_i) {
+        return false;
+    }
+    const auto * chain = static_cast<const llama_sampler_chain *>(sampler->ctx);
+    return chain->samplers.size() == 1 && chain->samplers[0].ptr->iface == &llama_sampler_greedy_i;
+}
+
 struct llama_sampler * llama_sampler_init_greedy() {
     return llama_sampler_init(
         /* .iface = */ &llama_sampler_greedy_i,

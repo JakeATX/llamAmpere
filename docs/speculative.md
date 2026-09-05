@@ -83,6 +83,24 @@ See:
 
 Chained MTP drafts N tokens in one GPU decode. It currently supports dense Qwen3.5-family models and requires flash attention. For recurrent models, batch and ubatch sizes below N + 2 are raised to N + 2.
 
+#### GPU greedy verification
+
+On CUDA, greedy MTP verification can keep token selection on the backend:
+
+```bash
+LLAMA_MTP_GPU_VERIFY=1 llama-server -m model.gguf \
+    --spec-type draft-mtp --spec-draft-n-max 3 \
+    --samplers temperature --temp 0
+```
+
+This still computes the target model's full output head. The optimization performs argmax on the
+GPU and transfers only the selected token IDs instead of copying full vocabulary logit rows to the
+CPU. The server logs whether GPU greedy verification was enabled.
+
+The path is restricted to sampling settings equivalent to raw-logit greedy selection. Grammar,
+logit bias, probability output, active penalties, and non-greedy sampling automatically use the
+normal CPU verification path. `LLAMA_MTP_GPU_VERIFY` must be exactly `1` to opt in.
+
 
 ### Adaptive MTP (`draft-mtp-adaptive`)
 

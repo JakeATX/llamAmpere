@@ -1556,11 +1556,13 @@ inline static void ggml_vec_norm_inv_f32(const int n, float * s, const float * x
 }
 
 inline static void ggml_vec_argmax_f32(const int n, int * s, const float * x) {
-    float max = -INFINITY;
+    float max = x[0];
     int idx = 0;
-    for (int i = 0; i < n; ++i) {
-        max = MAX(max, x[i]);
-        if (max == x[i]) { idx = i; }
+    for (int i = 1; i < n; ++i) {
+        if (x[i] > max) {
+            max = x[i];
+            idx = i;
+        }
     }
     *s = idx;
 }

@@ -2,6 +2,7 @@
 #include "llama.h"
 #include "llama-cpp.h"
 #include "common.h"
+#include "sampling.h"
 
 #ifdef NDEBUG
 #undef NDEBUG
@@ -80,7 +81,7 @@ struct test_context {
     std::unordered_map<llama_seq_id, int32_t> seq_positions;
     std::unordered_map<llama_seq_id, int32_t> last_batch_info;
 
-    test_context(const test_params & params, std::vector<llama_sampler_seq_config> & configs, int32_t n_seq_max = -1) {
+    test_context(const test_params & params, std::vector<llama_sampler_seq_config> & configs, int32_t n_seq_max = -1, uint32_t n_ubatch = 0) {
         auto * model = params.model.get();
 
         GGML_ASSERT(model);
@@ -89,6 +90,7 @@ struct test_context {
         llama_context_params cparams = llama_context_default_params();
         cparams.n_ctx = 512;
         cparams.n_batch = 512;
+        if (n_ubatch > 0) { cparams.n_ubatch = n_ubatch; }
         cparams.samplers = configs.data();
         cparams.n_samplers = configs.size();
         cparams.kv_unified = true;
@@ -1566,6 +1568,88 @@ static void test_backend_max_outputs(const test_params & params) {
     printf("backend max outputs test PASSED\n");
 }
 
+static void test_backend_greedy_multi_output(const test_params & params) {
+    llama_sampler_ptr greedy(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+    llama_sampler_chain_add(greedy.get(), llama_sampler_init_greedy());
+    std::vector<llama_sampler_seq_config> configs = {{0, greedy.get()}};
+    std::vector<llama_sampler_seq_config> no_configs;
+    test_context backend(params, configs, 2, 4);
+    test_context reference(params, no_configs, 2, 4);
+
+    common_params_sampling sampling;
+    sampling.temp = 0.0f;
+    sampling.samplers = { COMMON_SAMPLER_TYPE_TEMPERATURE };
+    common_sampler * common = common_sampler_init(params.model.get(), sampling);
+
+    for (int round = 0; round < 3; ++round) {
+        llama_batch batch = llama_batch_init(8, 0, 1);
+        std::vector<int> verify_rows;
+        for (int pos = 0; pos < 4; ++pos) {
+            for (int slot = 0; slot < 2; ++slot) {
+                const llama_seq_id seq = (slot + round) % 2;
+                const llama_token token = (pos + seq + round + 1) % backend.n_vocab;
+                if (seq == 0 && pos > 0) { verify_rows.push_back(batch.n_tokens); }
+                common_batch_add(batch, token, 4 * round + pos, { seq }, pos > 0);
+            }
+        }
+        GGML_ASSERT(llama_decode(backend.ctx.get(), batch) == 0);
+        GGML_ASSERT(llama_decode(reference.ctx.get(), batch) == 0);
+        llama_synchronize(backend.ctx.get());
+        llama_synchronize(reference.ctx.get());
+
+        llama_tokens expected;
+        for (int i = 0; i < batch.n_tokens; ++i) {
+            if (!batch.logits[i]) { continue; }
+            const float * logits = llama_get_logits_ith(reference.ctx.get(), i);
+            const llama_token token = std::max_element(logits, logits + backend.n_vocab) - logits;
+            if (batch.seq_id[i][0] == 0) {
+                GGML_ASSERT(llama_get_sampled_token_ith(backend.ctx.get(), i) == token);
+                GGML_ASSERT(llama_get_sampled_logits_ith(backend.ctx.get(), i) == nullptr);
+                GGML_ASSERT(llama_get_sampled_probs_ith(backend.ctx.get(), i) == nullptr);
+                expected.push_back(token);
+            } else {
+                GGML_ASSERT(llama_get_sampled_token_ith(backend.ctx.get(), i) == LLAMA_TOKEN_NULL);
+                GGML_ASSERT(common_sampler_sample(common, backend.ctx.get(), i) == token);
+            }
+        }
+
+        // Every rejection position and the all-accepted bonus-token path use compact rows.
+        for (size_t mismatch = 0; mismatch < expected.size(); ++mismatch) {
+            llama_tokens draft(expected.begin(), expected.end() - 1);
+            if (mismatch < draft.size()) { draft[mismatch] = (draft[mismatch] + 1) % backend.n_vocab; }
+            common_sampler_reset(common);
+            const auto accepted = common_sampler_sample_and_accept_n(common, backend.ctx.get(), verify_rows, draft);
+            const size_t count = mismatch < draft.size() ? mismatch + 1 : expected.size();
+            GGML_ASSERT(accepted.size() == count);
+            GGML_ASSERT(std::equal(accepted.begin(), accepted.end(), expected.begin()));
+        }
+        llama_batch_free(batch);
+    }
+    if (auto * original_backend = common_sampler_get_greedy_backend(common, params.model.get())) {
+        GGML_ASSERT(llama_set_sampler(backend.ctx.get(), 0, original_backend));
+        common_sampler * restored = common_sampler_clone(common);
+        // The context must release its borrowed pointer before the owner is replaced.
+        GGML_ASSERT(llama_set_sampler(backend.ctx.get(), 0, nullptr));
+        auto * restored_backend = common_sampler_get_greedy_backend(restored, params.model.get());
+        GGML_ASSERT(restored_backend && restored_backend != original_backend);
+        common_sampler_free(common);
+        common = restored;
+        GGML_ASSERT(llama_set_sampler(backend.ctx.get(), 0, restored_backend));
+        llama_batch batch = llama_batch_init(1, 0, 1);
+        common_batch_add(batch, 1, 12, {0}, true);
+        GGML_ASSERT(llama_decode(backend.ctx.get(), batch) == 0);
+        GGML_ASSERT(llama_decode(reference.ctx.get(), batch) == 0);
+        llama_synchronize(reference.ctx.get());
+        const float * logits = llama_get_logits_ith(reference.ctx.get(), 0);
+        const llama_token expected = std::max_element(logits, logits + backend.n_vocab) - logits;
+        GGML_ASSERT(common_sampler_sample(common, backend.ctx.get(), 0) == expected);
+        llama_batch_free(batch);
+        GGML_ASSERT(llama_set_sampler(backend.ctx.get(), 0, nullptr));
+    }
+    common_sampler_free(common);
+    printf("backend greedy multi-output verification test PASSED\n");
+}
+
 struct backend_test_case {
     std::string name;
     void (*fn)(const test_params &);
@@ -1574,6 +1658,7 @@ struct backend_test_case {
 
 static const backend_test_case BACKEND_TESTS[] = {
     { "greedy",          test_backend_greedy_sampling,         true  },
+    { "greedy_multi_output", test_backend_greedy_multi_output, true  },
     { "logit_bias",      test_backend_logit_bias_sampling,     true  },
     { "penalties",       test_backend_penalties_sampling,      true  },
     { "temp",            test_backend_temp_sampling,           true  },
