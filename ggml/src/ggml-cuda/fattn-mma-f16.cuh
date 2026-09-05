@@ -666,6 +666,18 @@ static __device__ __forceinline__ void flash_attn_ext_turbo3_load_tile(
     }
 }
 
+// Register-select decode of one turbo3 value: pick the centroid magnitude from the
+// 2-bit index q with selects and apply the 1-bit sign by flipping the FP32 sign bit.
+// Bit-identical to TURBO_CENTROIDS_3BIT_FATTN[(sign << 2) | q] (entries 0..3 are the
+// negative centroids with descending magnitude, 4..7 the positive ones ascending),
+// without a per-lane divergent __constant__ load that serialises through the ADU.
+static __device__ __forceinline__ float flash_attn_ext_turbo3_centroid(const uint32_t q, const uint32_t sign) {
+    const uint32_t m   = sign ? q : (3u - q);
+    const float    mag = (m & 2u) ? ((m & 1u) ? 0.190207f : 0.118786f)
+                                  : ((m & 1u) ? 0.066822f : 0.021663f);
+    return __uint_as_float(__float_as_uint(mag) | ((sign ^ 1u) << 31));
+}
+
 // Mixed Q8-K/Turbo3-V variant: distribute packed V elements across lanes so
 // global reads and shared-memory stores are contiguous within a cache row.
 template<int stride_tile, int nbatch_fa, int nthreads, int D2, bool oob_check, bool stream_loads = true>
@@ -716,11 +728,13 @@ static __device__ __forceinline__ void flash_attn_ext_turbo3_load_tile_flat(
             const uint8_t qs_byte = i < 2 ? qs_byte0 : qs_byte1;
             const int shift = (i & 1) * 4;
             const int sign_shift = 2 * i;
-            const uint8_t idx0 = ((qs_byte >> shift)       & 0x3) | (((sgn_byte >> sign_shift)       & 0x1) << 2);
-            const uint8_t idx1 = ((qs_byte >> (shift + 2)) & 0x3) | (((sgn_byte >> (sign_shift + 1)) & 0x1) << 2);
+            const uint32_t q0 = (qs_byte  >> shift)            & 0x3;
+            const uint32_t q1 = (qs_byte  >> (shift + 2))      & 0x3;
+            const uint32_t s0 = (sgn_byte >> sign_shift)       & 0x1;
+            const uint32_t s1 = (sgn_byte >> (sign_shift + 1)) & 0x1;
             values[i] = make_half2(
-                TURBO_CENTROIDS_3BIT_FATTN[idx0] * norm,
-                TURBO_CENTROIDS_3BIT_FATTN[idx1] * norm);
+                flash_attn_ext_turbo3_centroid(q0, s0) * norm,
+                flash_attn_ext_turbo3_centroid(q1, s1) * norm);
         }
         *reinterpret_cast<uint4 *>(tile_KV + row * stride_tile + col) = decoded;
     }
