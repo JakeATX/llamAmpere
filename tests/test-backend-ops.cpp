@@ -9587,6 +9587,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 }
             }
         }
+        // ATX-4-XS body shapes (all IQ4_XS): decode widths 1..5.
+        for (int64_t n : {1, 2, 3, 4, 5}) {
+            for (const auto & shape : std::array<std::pair<int64_t, int64_t>, 6>{{
+                    {17408, 5120}, {10240, 5120}, {5120, 17408}, {5120, 6144},
+                    {6144, 5120}, {12288, 5120}}}) {
+                test_cases.emplace_back(new test_mul_mat(
+                    GGML_TYPE_IQ4_XS, GGML_TYPE_F32, shape.first, n, shape.second, {1, 1}, {1, 1}));
+            }
+        }
     }
 
     // Opt-in SM86 large-N prefill coverage for aligned and ragged J=128 boundaries.
@@ -10881,6 +10890,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                     test_cases.emplace_back(new test_mul_mat(
                         type_a, GGML_TYPE_F32, shape.first, n, shape.second, {1, 1}, {1, 1}));
                 }
+            }
+        }
+        // ATX-4-XS body shapes (all IQ4_XS): decode widths 1..5.
+        for (int64_t n : {1, 2, 3, 4, 5}) {
+            for (const auto & shape : std::array<std::pair<int64_t, int64_t>, 6>{{
+                    {17408, 5120}, {10240, 5120}, {5120, 17408}, {5120, 6144},
+                    {6144, 5120}, {12288, 5120}}}) {
+                test_cases.emplace_back(new test_mul_mat(
+                    GGML_TYPE_IQ4_XS, GGML_TYPE_F32, shape.first, n, shape.second, {1, 1}, {1, 1}));
             }
         }
     }

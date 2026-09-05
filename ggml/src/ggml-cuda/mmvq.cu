@@ -102,6 +102,53 @@ static __device__ __forceinline__ void vec_dot_q5_K_q8_1_multi(
     }
 }
 
+// IQ4_XS: decode the eight nibbles of each 32-bit weight group once (interleaved 4-PRMT lookup)
+// and dp4a them into one integer accumulator per destination column. The per-column integer
+// sum, scale multiply and FP32 ops are exactly those of vec_dot_iq4_xs_q8_1, so each column's
+// dot is bit-identical to the single-column path.
+template<int ncols_dst>
+static __device__ __forceinline__ void vec_dot_iq4_xs_q8_1_multi(
+        const void * __restrict__ vbq, const block_q8_1 * __restrict__ y,
+        const int stride_col_y, const int kby, const int kbx, const int iqs,
+        float (&dots)[ncols_dst]) {
+    const block_iq4_xs * bq4 = (const block_iq4_xs *) vbq + kbx;
+
+    int sumi[ncols_dst];
+#pragma unroll
+    for (int col = 0; col < ncols_dst; ++col) {
+        sumi[col] = 0;
+    }
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int aux_q4 = get_int_b4(bq4->qs, iqs + j);
+        const int2 v = get_int_from_table_16_interleaved(aux_q4, kvalues_iq4nl);
+#pragma unroll
+        for (int col = 0; col < ncols_dst; ++col) {
+            const block_q8_1 * bq8 = y + col*stride_col_y + kby + iqs/4;
+            sumi[col] = ggml_cuda_dp4a(v.x, get_int_b4(bq8->qs, 2*j + 0), sumi[col]);
+            sumi[col] = ggml_cuda_dp4a(v.y, get_int_b4(bq8->qs, 2*j + 1), sumi[col]);
+        }
+    }
+
+    const int ls = vec_dot_iq4_xs_q8_1_scale(bq4, iqs);
+#pragma unroll
+    for (int col = 0; col < ncols_dst; ++col) {
+        int s = sumi[col];
+        s *= ls - 32;
+        const float d = __half2float(bq4->d) * __low2float((y + col*stride_col_y + kby + iqs/4)->ds);
+        dots[col] = d * s;
+    }
+}
+
+// IQ4_XS cross-column reuse is exact and on by default for SM86; GGML_CUDA_SM86_IQ4_REUSE=0 disables it.
+static bool ggml_cuda_sm86_iq4_reuse() {
+    static const bool value = [] {
+        const char * env = getenv("GGML_CUDA_SM86_IQ4_REUSE");
+        return env == nullptr || env[0] != '0';
+    }();
+    return value;
+}
+
 static bool ggml_cuda_sm86_exact_reuse() {
     static const bool value = [] {
         const char * env = getenv("GGML_CUDA_SM86_EXACT_REUSE");
@@ -700,11 +747,14 @@ static __global__ void mul_mat_vec_q(
         // x block quant index when casting the quants to int
         const int kqs = vdr * (tid % (qi/vdr));
 
-        if constexpr (reuse_weights && (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K)) {
+        if constexpr (reuse_weights && (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_IQ4_XS)) {
 #pragma unroll
             for (int i = 0; i < rows_per_cuda_block; ++i) {
                 float dots[ncols_dst];
-                if constexpr (type == GGML_TYPE_Q4_K) {
+                if constexpr (type == GGML_TYPE_IQ4_XS) {
+                    vec_dot_iq4_xs_q8_1_multi<ncols_dst>(
+                        vx, y, stride_col_y, kby, kbx_offset + i*stride_row_x + kbx, kqs, dots);
+                } else if constexpr (type == GGML_TYPE_Q4_K) {
                     vec_dot_q4_K_q8_1_multi<ncols_dst>(
                         vx, y, stride_col_y, kby, kbx_offset + i*stride_row_x + kbx, kqs, dots);
                 } else {
@@ -962,10 +1012,12 @@ static void mul_mat_vec_q_switch_fusion(
     GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-    if constexpr ((type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K) && c_ncols_dst >= 3 && c_ncols_dst <= 5) {
+    if constexpr (((type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K) && c_ncols_dst >= 3 && c_ncols_dst <= 5) ||
+                  (type == GGML_TYPE_IQ4_XS && c_ncols_dst >= 2 && c_ncols_dst <= 5)) {
         const int device = ggml_cuda_get_device();
         const int cc = ggml_cuda_info().devices[device].cc;
-        if (cc == 860 && ggml_cuda_sm86_exact_reuse()) {
+        const bool reuse = type == GGML_TYPE_IQ4_XS ? ggml_cuda_sm86_iq4_reuse() : ggml_cuda_sm86_exact_reuse();
+        if (cc == 860 && reuse) {
             ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, true>, launch_params,
                 vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
                 channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
