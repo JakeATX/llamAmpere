@@ -237,6 +237,10 @@ private:
     // Returns max number of outputs for which space was reserved.
     uint32_t output_reserve(int32_t n_outputs);
 
+    // re-run the reservation for the rows reserved so far, so that a configuration change
+    // (e.g. enabling nextn embeddings) grows the pinned buffers at setup time, not inside a request
+    void output_reserve_grow();
+
     void output_reorder();
 
     // map the output row index `i` to batch index
@@ -408,6 +412,16 @@ private:
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
+
+    // host buffer for the backend sampling outputs (sampled ids, and the optional logits/probs/candidates)
+    // kept separate from buf_output so that installing/removing a backend sampler never reallocates the
+    // (much larger) logits/embeddings block
+    ggml_backend_buffer_ptr buf_sampling;
+
+    // largest number of output rows reserved so far; output_reserve() never sizes below it, so the pinned
+    // buffers only ever grow (each growth is a cudaFreeHost/cudaMallocHost pair)
+    uint32_t n_outputs_reserved = 0;
+    bool output_buffer_reuse = true;
 
     // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;

@@ -107,6 +107,12 @@ llama_context::llama_context(
     //     may need to be backend-dependent
     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
 
+    // Research control: restore the original output allocation policy for paired measurements.
+    if (const char * value = std::getenv("LLAMA_OUTPUT_BUFFER_REUSE")) {
+        output_buffer_reuse = std::strcmp(value, "0") != 0;
+    }
+    LLAMA_LOG_INFO("%s: output buffer reuse = %d\n", __func__, (int) output_buffer_reuse);
+
     t_start_us = model.t_start_us;
     t_load_us  = model.t_load_us;
 
@@ -419,7 +425,7 @@ llama_context::llama_context(
             // reserve room for speculative verification batches up front: growing the pinned output
             // buffer later costs a cudaFreeHost/cudaMallocHost pair (~60 ms) in the middle of decoding
             const int32_t n_outputs_init = std::min<int32_t>(std::max<int32_t>(params.n_seq_max, LLAMA_OUTPUT_RESERVE_MIN), cparams.n_outputs_max);
-            if (output_reserve(n_outputs_init) < n_outputs_init) {
+            if (output_reserve(n_outputs_init) < (uint32_t) n_outputs_init) {
                 throw std::runtime_error("failed to reserve initial output buffer");
             }
 
@@ -1589,6 +1595,11 @@ void llama_context::set_embeddings_nextn(bool value, bool masked) {
 
     cparams.embeddings_nextn        = value;
     cparams.embeddings_nextn_masked = masked;
+
+    // grow the pinned output buffer now (this is called at speculative-decoding setup) instead of inside the
+    // first prefill; the unmasked nextn block is n_embd_out x n_batch floats (80 MiB at n_batch 4096).
+    // note: like any reservation this invalidates the outputs of the previous batch
+    output_reserve_grow();
 }
 
 void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
@@ -1600,6 +1611,18 @@ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
 
     // note: without this reserve, the draft acceptance drops to zero. not sure why - this is unexpected
     sched_need_reserve = true;
+
+    output_reserve_grow();
+}
+
+void llama_context::output_reserve_grow() {
+    if (!output_buffer_reuse || !buf_output) {
+        return; // constructor has not reserved yet
+    }
+
+    if (output_reserve(n_outputs_reserved) < n_outputs_reserved) {
+        throw std::runtime_error("failed to grow the output buffer");
+    }
 }
 
 void llama_context::set_nextn_layer_offset(int32_t offset) {
@@ -2182,10 +2205,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
                 seq_output_count[seq_id]++;
                 const auto sampler = sampling.samplers.find(seq_id);
-                if (seq_output_count[seq_id] > 1 && sampler != sampling.samplers.end() && !llama_sampler_is_greedy_chain(sampler->second)) {
-                    LLAMA_LOG_ERROR("%s: backend sampling requires at most one output token per sequence (seq_id %d had %d)\n",
-                            __func__, seq_id, seq_output_count[seq_id]);
-                    return -1;
+                if (seq_output_count[seq_id] > 1 && sampler != sampling.samplers.end()) {
+                    // multi-row (speculative verification) sampling needs every sampler of the chain on the backend:
+                    // a partially offloaded chain would leave rows unsampled and abort in the graph build
+                    if (!llama_sampler_backend_rows_ready(sampler->second)) {
+                        LLAMA_LOG_ERROR("%s: backend sampler '%s' requires at most one output token per sequence (seq_id %d had %d)\n",
+                                __func__, llama_sampler_name(sampler->second), seq_id, seq_output_count[seq_id]);
+                        return -1;
+                    }
                 }
             }
         }
@@ -2468,6 +2495,25 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
+        // row-block sampling: copy the sampled ids of each sequence's rows (coalescing adjacent rows)
+        for (const auto & [seq_id, t_sampled_rows] : res->t_sampled_rows) {
+            const auto & rows = res->sampled_rows.at(seq_id);
+            ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), t_sampled_rows);
+            GGML_ASSERT(sampling.sampled.has_data());
+            for (size_t i = 0; i < rows.size();) {
+                const uint32_t first = rows[i];
+                const size_t   i0    = i;
+                uint32_t count = 1;
+                while (++i < rows.size() && rows[i] == first + count) {
+                    ++count;
+                }
+                GGML_ASSERT(n_outputs_prev + first + count <= (int64_t) sampling.sampled.size);
+                ggml_backend_tensor_get_async(backend, t_sampled_rows,
+                        sampling.sampled.data + n_outputs_prev + first,
+                        i0 * sizeof(llama_token), count * sizeof(llama_token));
+            }
+        }
+
         // Copy backend sampling output if this ubatch produced any sampling tensors.
         if (has_samplers && (!res->t_sampled.empty() || !res->t_sampled_probs.empty() || !res->t_sampled_logits.empty())) {
             const auto seq_to_output_row = build_seq_to_output_row(ubatch, n_outputs_prev);
@@ -2549,7 +2595,10 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     const auto & hparams = model.hparams;
     const auto & vocab   = model.vocab;
 
-    const int64_t n_outputs_max = std::max<int64_t>(n_outputs, n_seq_max());
+    // never shrink the row reservation: the buffers are pinned and a later growth costs a
+    // cudaFreeHost/cudaMallocHost pair (15 + 44 ms at ~90 MiB) in the middle of a request
+    const int64_t n_outputs_max = std::max<int64_t>({(int64_t) n_outputs, (int64_t) n_seq_max(),
+                                                  output_buffer_reuse ? (int64_t) n_outputs_reserved : 0});
 
     const auto n_batch    = cparams.n_batch;
     const auto n_vocab    = vocab.n_tokens();
@@ -2603,18 +2652,32 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     }
 
     const size_t prev_size = buf_output ? ggml_backend_buffer_get_size(buf_output.get()) : 0;
+    const size_t sampling_size = backend_float_count * sizeof(float) + backend_token_count * sizeof(llama_token);
     const size_t new_size  =
-        (logits.size + embd.size + embd_nextn.size + embd_layer_inp_float_count + backend_float_count) * sizeof(float) +
-        (                                                                         backend_token_count) * sizeof(llama_token);
+        (logits.size + embd.size + embd_nextn.size + embd_layer_inp_float_count) * sizeof(float) +
+        (output_buffer_reuse ? 0 : sampling_size);
+
+    const size_t prev_size_sampling = buf_sampling ? ggml_backend_buffer_get_size(buf_sampling.get()) : 0;
+    const size_t new_size_sampling  = sampling_size;
+
+    auto * buft = ggml_backend_cpu_buffer_type();
+    // try to use the host buffer of the device where the output tensor is allocated for faster transfer to system memory
+    auto * output_dev = model.dev_output();
+    auto * output_dev_host_buft = output_dev ? ggml_backend_dev_host_buffer_type(output_dev) : nullptr;
+    if (output_dev_host_buft) {
+        buft = output_dev_host_buft;
+    }
 
     // alloc only when more than the current capacity is required
     // TODO: also consider shrinking the buffer
     if (!buf_output || prev_size < new_size) {
         if (buf_output) {
-#ifndef NDEBUG
-            // This doesn't happen often, but may be annoying in some cases (like the HellaSwag benchmark)
-            LLAMA_LOG_DEBUG("%s: reallocating output buffer from size %.02f MiB to %.02f MiB\n", __func__, prev_size / 1024.0 / 1024.0, new_size / 1024.0 / 1024.0);
-#endif
+            // a pinned reallocation costs a cudaFreeHost/cudaMallocHost pair (~60 ms at 90 MiB); it should
+            // only happen at context setup, never inside a request, so it is logged at info level
+            LLAMA_LOG_INFO("%s: reallocating output buffer from size %.02f MiB to %.02f MiB "
+                    "(n_outputs = %d, n_outputs_max = %" PRId64 ", logits = %zu, embd = %zu, embd_nextn = %zu, layer_inp = %zu)\n",
+                    __func__, prev_size / 1024.0 / 1024.0, new_size / 1024.0 / 1024.0,
+                    n_outputs, n_outputs_max, logits.size, embd.size, embd_nextn.size, embd_layer_inp_float_count);
             synchronize();
 
             // TODO: not needed?
@@ -2627,19 +2690,33 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
             }
         }
 
-        auto * buft = ggml_backend_cpu_buffer_type();
-        // try to use the host buffer of the device where the output tensor is allocated for faster transfer to system memory
-        auto * output_dev = model.dev_output();
-        auto * output_dev_host_buft = output_dev ? ggml_backend_dev_host_buffer_type(output_dev) : nullptr;
-        if (output_dev_host_buft) {
-            buft = output_dev_host_buft;
-        }
         buf_output.reset(ggml_backend_buft_alloc_buffer(buft, new_size));
         if (buf_output == nullptr) {
             LLAMA_LOG_ERROR("%s: failed to allocate output buffer of size %.2f MiB\n", __func__, new_size / (1024.0 * 1024.0));
             return 0;
         }
         ggml_backend_buffer_clear(buf_output.get(), 0);
+    }
+
+    // the backend sampling outputs live in their own (small) pinned buffer: samplers are installed and removed
+    // per request, and their layout (compact greedy vs full chain) must not reallocate the logits block above
+    if (output_buffer_reuse && has_sampling && (!buf_sampling || prev_size_sampling < new_size_sampling)) {
+        if (buf_sampling) {
+            LLAMA_LOG_INFO("%s: reallocating sampling buffer from size %.02f MiB to %.02f MiB "
+                    "(n_outputs = %d, n_outputs_max = %" PRId64 ", compact = %d, sampling floats = %zu, sampling tokens = %zu)\n",
+                    __func__, prev_size_sampling / 1024.0 / 1024.0, new_size_sampling / 1024.0 / 1024.0,
+                    n_outputs, n_outputs_max, (int) compact_sampling, backend_float_count, backend_token_count);
+        }
+        synchronize();
+
+        buf_sampling = nullptr;
+
+        buf_sampling.reset(ggml_backend_buft_alloc_buffer(buft, new_size_sampling));
+        if (buf_sampling == nullptr) {
+            LLAMA_LOG_ERROR("%s: failed to allocate sampling buffer of size %.2f MiB\n", __func__, new_size_sampling / (1024.0 * 1024.0));
+            return 0;
+        }
+        ggml_backend_buffer_clear(buf_sampling.get(), 0);
     }
 
     float * output_base = (float *) ggml_backend_buffer_get_base(buf_output.get());
@@ -2666,6 +2743,12 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     }
 
     if (has_sampling) {
+        // the sampling views are carved from buf_sampling, not from buf_output
+        if (output_buffer_reuse) {
+            offset = 0;
+            base   = (uint8_t *) ggml_backend_buffer_get_base(buf_sampling.get());
+        }
+
         sampling.logits = compact_sampling ? buffer_view<float>{nullptr, 0} : buffer_view<float>{(float *) (base + offset), (size_t)(n_vocab*n_outputs_max)};
         offset += sampling.logits.size * sizeof(float);
 
@@ -2706,6 +2789,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     this->n_outputs = 0;
     GGML_ASSERT(n_outputs_max <= cparams.n_outputs_max);
+    n_outputs_reserved = (uint32_t) n_outputs_max;
     return n_outputs_max;
 }
 
