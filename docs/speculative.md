@@ -85,22 +85,61 @@ Chained MTP drafts N tokens in one GPU decode. It currently supports dense Qwen3
 
 #### GPU greedy verification
 
-On CUDA, greedy MTP verification can keep token selection on the backend:
+On CUDA, greedy MTP verification keeps token selection on the backend. It is on by default and engages
+per request when the request's sampler chain is greedy-equivalent:
 
 ```bash
-LLAMA_MTP_GPU_VERIFY=1 llama-server -m model.gguf \
-    --spec-type draft-mtp --spec-draft-n-max 3 \
-    --samplers temperature --temp 0
+# default: on. Disable with LLAMA_MTP_GPU_VERIFY=0
+llama-server -m model.gguf --spec-type draft-mtp --spec-draft-n-max 3
+# a request that engages it:
+curl ... -d '{"messages": [...], "temperature": 0, "top_k": 0, "top_p": 1, "min_p": 0}'
 ```
 
 This still computes the target model's full output head. The optimization performs argmax on the
-GPU and transfers only the selected token IDs instead of copying full vocabulary logit rows to the
-CPU. The server logs whether GPU greedy verification was enabled.
+GPU over all verification rows and transfers only the selected token IDs instead of copying full
+vocabulary logit rows to the CPU. The server logs `GPU greedy verification enabled` when a request
+engages it and `GPU verification ineligible for sampler settings; using CPU verification` otherwise.
 
-The path is restricted to sampling settings equivalent to raw-logit greedy selection. Grammar,
-logit bias, probability output, active penalties, and non-greedy sampling automatically use the
-normal CPU verification path. `LLAMA_MTP_GPU_VERIFY` must be exactly `1` to opt in.
+Eligibility (checked per request from its sampling parameters): `temperature <= 0`, no dynamic
+temperature, no mirostat, `n_probs == 0`, no grammar, no logit bias, no suppressed vocabulary tokens,
+penalties/DRY inactive (`repeat_penalty 1.0`, `frequency_penalty 0`, `presence_penalty 0`, `dry_multiplier 0`),
+`typical_p >= 1`, `top_n_sigma < 0`, `xtc_probability 0`, and only the samplers
+penalties/dry/top_k/top_p/min_p/typical/top_n_sigma/xtc/temperature in the chain. When present,
+truncation samplers must be disabled (`top_k <= 0`, `top_p >= 1`, `min_p <= 0`). Active truncation can
+change the choice among tied maxima; the CPU top-k regression fixture selects token 18 where raw
+argmax selects token 0. A common maximum score does not make these paths token-equivalent.
+With `LLAMA_MTP_GPU_VERIFY=0`, or for any ineligible request, verification runs on the CPU exactly as before.
 
+#### GPU sampled verification
+
+For sampled requests (`temperature > 0`) the same idea applies to the whole sampler chain: when every
+sampler of the request's chain has a backend implementation that works on a block of rows, all
+verification rows of a draft are sampled in one graph on the GPU (top-k / top-p / min-p / temperature
+/ dist, plus logit bias, and the empty placeholders of disabled samplers) and only the sampled token
+ids are downloaded. This removes the per-round download of `(n_draft + 1)` full logit rows
+(4 x 0.99 MB at MTP-3 with the 248K vocabulary) and the CPU sampling over them. It is on by default:
+
+```bash
+LLAMA_MTP_GPU_VERIFY=0       # all verification on the CPU (greedy and sampled)
+LLAMA_MTP_GPU_VERIFY=greedy  # only the greedy path above; sampled requests verify on the CPU
+# unset or any other value: greedy and sampled GPU verification when eligible
+```
+
+Eligibility (per request): `temperature > 0`, no dynamic temperature, no mirostat, `n_probs == 0`,
+`min_keep <= 1`, no grammar, penalties/DRY inactive, `typical_p >= 1`, `top_n_sigma < 0`,
+`xtc_probability 0`. Anything else (grammar, active repetition/frequency/presence penalties, DRY, XTC,
+typical, top-n-sigma, mirostat, `n_probs`) falls back to CPU verification for that request; the server
+logs `GPU sampled verification enabled` or `GPU verification ineligible for sampler settings; using
+CPU verification`.
+
+Sampled outputs are drawn from the same truncated distribution as the CPU chain (the backend graph
+applies the identical truncations and temperature; `tests/test-backend-sampler --test sampled_multi_output`
+checks the sampled ids against the CPU candidate sets and the empirical distribution against the exact
+truncated distribution). Same-seed outputs nevertheless differ from CPU verification: the CPU path
+draws one uniform per sampled row from the request RNG as rows are consumed (and stops at the first
+rejected draft token), while the backend draws `n_rows` uniforms per verification pass up front, so
+the RNG stream is consumed in a different order. Compare acceptance statistics and throughput, not
+content hashes, between the two paths.
 
 ### Adaptive MTP (`draft-mtp-adaptive`)
 

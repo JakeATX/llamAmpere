@@ -149,6 +149,7 @@ if (LLAMA_LLGUIDANCE)
 endif ()
 
 llama_build(test-recurrent-state-rollback.cpp)
+llama_build(test-output-buffer-reuse.cpp)
 
 llama_build_and_test(test-gdn-ingredient-replay.cpp LABEL "turbo")
 

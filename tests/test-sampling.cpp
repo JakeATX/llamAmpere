@@ -1,6 +1,7 @@
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "ggml-cpu.h"
 #include "llama.h"
 #include "sampling.h"
 
@@ -310,7 +311,7 @@ static void test_perf() {
     BENCH(llama_sampler_init_xtc    (1.0f, 0.1f, 1, 1),       data, 32);
 }
 
-static void test_greedy_argmax_rows() {
+static void test_greedy_argmax_rows(bool cpu_only) {
     constexpr int cols = 2081;
     constexpr int rows = 7;
     std::vector<float> logits(cols * rows, -10.0f);
@@ -325,15 +326,23 @@ static void test_greedy_argmax_rows() {
     std::fill_n(logits.data() + 6 * cols, cols, -std::numeric_limits<float>::max());
     const std::vector<llama_token> expected = {0, 5, 0, 0, 5, 5, 0};
 
-    ggml_backend_load_all();
+    std::vector<ggml_backend_t> backends;
+    if (cpu_only) {
+        backends.push_back(ggml_backend_cpu_init());
+    } else {
+        ggml_backend_load_all();
+        for (size_t d = 0; d < ggml_backend_dev_count(); ++d) {
+            auto dev = ggml_backend_dev_get(d);
+            const std::string name = ggml_backend_dev_name(dev);
+            // These backends implement the first-index tie convention used by greedy verification.
+            if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU && name.find("CUDA") != 0) { continue; }
+            backends.push_back(ggml_backend_dev_init(dev, nullptr));
+        }
+    }
     int tested = 0;
-    for (size_t d = 0; d < ggml_backend_dev_count(); ++d) {
-        auto dev = ggml_backend_dev_get(d);
-        const std::string name = ggml_backend_dev_name(dev);
-        // These backends implement the first-index tie convention used by greedy verification.
-        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU && name.find("CUDA") != 0) { continue; }
-        ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+    for (auto backend : backends) {
         GGML_ASSERT(backend);
+        const std::string name = ggml_backend_name(backend);
         ggml_init_params init = { ggml_tensor_overhead() * 4 + ggml_graph_overhead(), nullptr, true };
         ggml_context * ctx = ggml_init(init);
         GGML_ASSERT(ctx);
@@ -358,6 +367,33 @@ static void test_greedy_argmax_rows() {
     GGML_ASSERT(tested > 0);
 }
 
+static void test_greedy_backend_truncation_ties() {
+    int divergent = 0;
+    for (int n : {32, 64, 128}) {
+        for (int k : {2, 20}) {
+            std::vector<llama_token_data> data;
+            for (int i = 0; i < n; ++i) { data.push_back({i, 2.0f, 0.0f}); }
+            llama_token_data_array row{data.data(), data.size(), -1, false};
+            auto * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
+            llama_sampler_chain_add(chain, llama_sampler_init_top_k(k));
+            llama_sampler_chain_add(chain, llama_sampler_init_temp(0.0f));
+            llama_sampler_chain_add(chain, llama_sampler_init_dist(0));
+            llama_sampler_apply(chain, &row);
+            GGML_ASSERT(row.selected >= 0);
+            const llama_token selected = row.data[row.selected].id;
+            printf("top-k tie witness: n=%d k=%d cpu=%d raw_argmax=0\n", n, k, selected);
+            divergent += selected != 0;
+            llama_sampler_free(chain);
+        }
+    }
+    printf("top-k tie witnesses: %d/6 differ on this standard library\n", divergent);
+    common_params_sampling params;
+    params.temp = 0.0f;
+    params.top_k = 20;
+    params.samplers = {COMMON_SAMPLER_TYPE_TOP_K, COMMON_SAMPLER_TYPE_TEMPERATURE};
+    GGML_ASSERT(!common_sampler_supports_greedy_backend(params));
+}
+
 static void test_greedy_backend_eligibility() {
     common_params_sampling params;
     params.temp = 0.0f;
@@ -377,17 +413,40 @@ static void test_greedy_backend_eligibility() {
     params.penalty_repeat = 1.1f;
     GGML_ASSERT(!common_sampler_supports_greedy_backend(params));
     params.penalty_repeat = 1.0f;
+    // Active truncation must not be bypassed, including its tie ordering.
     params.samplers.push_back(COMMON_SAMPLER_TYPE_TOP_K);
+    params.top_k = 40;
     GGML_ASSERT(!common_sampler_supports_greedy_backend(params));
     params.top_k = 0;
     GGML_ASSERT(common_sampler_supports_greedy_backend(params));
+    params.samplers.push_back(COMMON_SAMPLER_TYPE_TOP_P);
+    params.top_p = 0.95f;
+    GGML_ASSERT(!common_sampler_supports_greedy_backend(params));
+    params.top_p = 1.0f;
+    params.samplers.push_back(COMMON_SAMPLER_TYPE_MIN_P);
+    params.min_p = 0.05f;
+    GGML_ASSERT(!common_sampler_supports_greedy_backend(params));
+    params.min_p = 0.0f;
+    GGML_ASSERT(common_sampler_supports_greedy_backend(params));
+    params.samplers.push_back(COMMON_SAMPLER_TYPE_TYPICAL_P);
+    params.typ_p = 0.9f;
+    GGML_ASSERT(!common_sampler_supports_greedy_backend(params));
+    params.typ_p = 1.0f;
+    GGML_ASSERT(common_sampler_supports_greedy_backend(params));
+    params.samplers.pop_back();
     params.samplers.push_back(COMMON_SAMPLER_TYPE_INFILL);
     GGML_ASSERT(!common_sampler_supports_greedy_backend(params));
 }
 
-int main(void) {
+int main(int argc, char ** argv) {
+    const bool cpu_only = argc == 2 && std::strcmp(argv[1], "--cpu-only") == 0;
+    if (argc != 1 && !cpu_only) {
+        fprintf(stderr, "usage: %s [--cpu-only]\n", argv[0]);
+        return 1;
+    }
+    test_greedy_backend_truncation_ties();
     test_greedy_backend_eligibility();
-    test_greedy_argmax_rows();
+    test_greedy_argmax_rows(cpu_only);
     ggml_time_init();
 
     test_temp({0.1f, 0.2f, 0.3f, 0.4f}, {0.1f, 0.2f, 0.3f, 0.4f}, 1.0f);

@@ -76,6 +76,8 @@ the shared compute arena; the research knobs (`GGML_Q8_TURBO3_MMA_MIN_Q`,
 `GGML_CUDA_SM86_MMQ_POLICY`, `GGML_CUDA_SM86_MMVQ_WARP_ROWS`) stay off unless
 you are reproducing a rejected experiment.
 
+W2 research control: `LLAMA_OUTPUT_BUFFER_REUSE=0` restores the original combined output/sampling buffer, row reservation, and lazy allocation policy. The default keeps sampling storage separate, retains the largest row reservation, and reserves added embeddings during setup. Compare this control with GPU verification disabled on both sides to isolate allocation behavior. Avoided setup allocations do not imply a sustained tokens-per-second gain.
+
 ## Blackwell (RTX 50 series, RTX PRO 6000): what carries over
 
 This tree was tuned and validated on an RTX 3090 Ti (sm_86). Nothing in it is compiled or tested for
@@ -115,6 +117,7 @@ Kill switches if something regresses on the new card, each restoring the upstrea
 | `GGML_Q8_TURBO3_MMA_MIN_Q`, `GGML_Q8_TURBO3_MMA_NCOLS1_MIN` | 3, 1 | research knobs for routing narrow queries to the MMA path; leave at defaults |
 | `GGML_CUDA_GRAPH_NO_SHAPE_KEY=1` | unset | disables the per-shape CUDA-graph cache |
 | `GGML_CUDA_GRAPH_EVICT_S` | 300 | seconds an unused CUDA graph is kept |
+| `LLAMA_MTP_GPU_VERIFY=0` | on | disables GPU verification of MTP drafts. Greedy path: argmax on the GPU for `temperature 0`, `top_k 0`, `top_p 1`, `min_p 0` requests without grammar/logit bias/n_probs/active penalties. Active truncation must fall back because it can reorder tied logits and change the CPU-selected token. Sampled path: the whole default chain (top-k/top-p/min-p/temperature/dist) samples every verification row on the GPU and downloads only token ids; falls back to the CPU for grammar, active penalties, DRY, XTC, typical, top-n-sigma, mirostat, n_probs. `=greedy` keeps only the greedy path. Same-seed sampled outputs can differ between GPU and CPU verification (RNG consumption order); GPU distribution/correctness gates remain required. Log lines: `GPU greedy verification enabled` / `GPU sampled verification enabled` / `GPU verification ineligible for sampler settings; using CPU verification` |
 
 What needs no porting at all: the prompt cache, the recurrent checkpoints, the disk tier, the graph shape
 cache and the shared compute arena are host-side or arch-independent. What will want retuning: the GDN ILP

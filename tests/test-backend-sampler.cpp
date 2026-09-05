@@ -3,6 +3,7 @@
 #include "llama-cpp.h"
 #include "common.h"
 #include "sampling.h"
+#include "../src/llama-ext.h"
 
 #ifdef NDEBUG
 #undef NDEBUG
@@ -1535,6 +1536,8 @@ static void test_backend_max_outputs(const test_params & params) {
 
     llama_sampler_chain_params backend_chain_params = llama_sampler_chain_default_params();
     llama_sampler_ptr backend_sampler_chain(llama_sampler_chain_init(backend_chain_params));
+    // active penalties need the per-row token history, so this chain cannot sample several rows of one sequence
+    llama_sampler_chain_add(backend_sampler_chain.get(), llama_sampler_init_penalties(llama_vocab_n_tokens(llama_model_get_vocab(params.model.get())), 64, 1.1f, 0.0f, 0.0f));
     llama_sampler_chain_add(backend_sampler_chain.get(), llama_sampler_init_dist(seed));
     std::vector<llama_sampler_seq_config> backend_sampler_configs = {{ seq_id, backend_sampler_chain.get() }};
 
@@ -1568,13 +1571,13 @@ static void test_backend_max_outputs(const test_params & params) {
     printf("backend max outputs test PASSED\n");
 }
 
-static void test_backend_greedy_multi_output(const test_params & params) {
+static void run_backend_greedy_multi_output(const test_params & params, int n_positions, int n_ubatch) {
     llama_sampler_ptr greedy(llama_sampler_chain_init(llama_sampler_chain_default_params()));
     llama_sampler_chain_add(greedy.get(), llama_sampler_init_greedy());
     std::vector<llama_sampler_seq_config> configs = {{0, greedy.get()}};
     std::vector<llama_sampler_seq_config> no_configs;
-    test_context backend(params, configs, 2, 4);
-    test_context reference(params, no_configs, 2, 4);
+    test_context backend(params, configs, 2, n_ubatch);
+    test_context reference(params, no_configs, 2, n_ubatch);
 
     common_params_sampling sampling;
     sampling.temp = 0.0f;
@@ -1582,14 +1585,14 @@ static void test_backend_greedy_multi_output(const test_params & params) {
     common_sampler * common = common_sampler_init(params.model.get(), sampling);
 
     for (int round = 0; round < 3; ++round) {
-        llama_batch batch = llama_batch_init(8, 0, 1);
+        llama_batch batch = llama_batch_init(2 * n_positions, 0, 1);
         std::vector<int> verify_rows;
-        for (int pos = 0; pos < 4; ++pos) {
+        for (int pos = 0; pos < n_positions; ++pos) {
             for (int slot = 0; slot < 2; ++slot) {
                 const llama_seq_id seq = (slot + round) % 2;
                 const llama_token token = (pos + seq + round + 1) % backend.n_vocab;
                 if (seq == 0 && pos > 0) { verify_rows.push_back(batch.n_tokens); }
-                common_batch_add(batch, token, 4 * round + pos, { seq }, pos > 0);
+                common_batch_add(batch, token, n_positions * round + pos, { seq }, pos > 0);
             }
         }
         GGML_ASSERT(llama_decode(backend.ctx.get(), batch) == 0);
@@ -1636,7 +1639,7 @@ static void test_backend_greedy_multi_output(const test_params & params) {
         common = restored;
         GGML_ASSERT(llama_set_sampler(backend.ctx.get(), 0, restored_backend));
         llama_batch batch = llama_batch_init(1, 0, 1);
-        common_batch_add(batch, 1, 12, {0}, true);
+        common_batch_add(batch, 1, 3 * n_positions, {0}, true);
         GGML_ASSERT(llama_decode(backend.ctx.get(), batch) == 0);
         GGML_ASSERT(llama_decode(reference.ctx.get(), batch) == 0);
         llama_synchronize(reference.ctx.get());
@@ -1647,7 +1650,185 @@ static void test_backend_greedy_multi_output(const test_params & params) {
         GGML_ASSERT(llama_set_sampler(backend.ctx.get(), 0, nullptr));
     }
     common_sampler_free(common);
+    printf("greedy verification: %d output rows per sequence, ubatch %d PASSED\n", n_positions - 1, n_ubatch);
+}
+
+static void test_backend_greedy_multi_output(const test_params & params) {
+    run_backend_greedy_multi_output(params, 4, 4);
+    run_backend_greedy_multi_output(params, 5, 16);
+    run_backend_greedy_multi_output(params, 6, 16);
     printf("backend greedy multi-output verification test PASSED\n");
+}
+
+// Sampled (temp > 0) speculative verification: all output rows of a sequence are sampled by the full chain
+// in one graph and only the token ids come back. Checks the sampled ids against the CPU candidate sets and
+// the empirical distribution against the exact truncated distribution of the same chain.
+static void run_backend_sampled_multi_output(const test_params & params, int n_positions, int n_ubatch) {
+    const uint32_t seed = 42;
+    const int      n_draws = 384;
+
+    auto make_chain = [&](uint32_t s) {
+        llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
+        llama_sampler_chain_add(chain, llama_sampler_init_top_k(40));
+        llama_sampler_chain_add(chain, llama_sampler_init_top_p(0.9f, 0));
+        llama_sampler_chain_add(chain, llama_sampler_init_min_p(0.05f, 0));
+        llama_sampler_chain_add(chain, llama_sampler_init_temp(0.8f));
+        llama_sampler_chain_add(chain, llama_sampler_init_dist(s));
+        return chain;
+    };
+
+    llama_sampler_ptr backend_chain(make_chain(seed));
+    GGML_ASSERT(llama_sampler_backend_supports_rows(backend_chain.get()));
+    std::vector<llama_sampler_seq_config> configs = {{0, backend_chain.get()}};
+    std::vector<llama_sampler_seq_config> no_configs;
+    test_context backend(params, configs, 2, n_ubatch);
+    test_context reference(params, no_configs, 2, n_ubatch);
+
+    // Interleave two sequences to exercise non-contiguous row selection.
+    llama_batch batch = llama_batch_init(2 * n_positions, 0, 1);
+    std::vector<int> rows0;
+    for (int pos = 0; pos < n_positions; ++pos) {
+        for (int seq = 0; seq < 2; ++seq) {
+            const llama_token token = (pos + seq + 1) % backend.n_vocab;
+            if (seq == 0 && pos > 0) { rows0.push_back(batch.n_tokens); }
+            common_batch_add(batch, token, pos, { seq }, pos > 0);
+        }
+    }
+    GGML_ASSERT(rows0.size() == (size_t) n_positions - 1);
+    const auto in_row_block = [&](int i) {
+        return std::count_if(rows0.begin(), rows0.end(), [&](int j) { return j / n_ubatch == i / n_ubatch; }) > 1;
+    };
+
+    GGML_ASSERT(llama_decode(reference.ctx.get(), batch) == 0);
+    llama_synchronize(reference.ctx.get());
+
+    // exact truncated distribution of each row: the same chain without dist, applied on the CPU
+    llama_sampler_ptr cpu_trunc(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+    llama_sampler_chain_add(cpu_trunc.get(), llama_sampler_init_top_k(40));
+    llama_sampler_chain_add(cpu_trunc.get(), llama_sampler_init_top_p(0.9f, 0));
+    llama_sampler_chain_add(cpu_trunc.get(), llama_sampler_init_min_p(0.05f, 0));
+    llama_sampler_chain_add(cpu_trunc.get(), llama_sampler_init_temp(0.8f));
+
+    std::vector<std::map<llama_token, double>> p_exact(rows0.size());
+    for (size_t r = 0; r < rows0.size(); ++r) {
+        const float * logits = llama_get_logits_ith(reference.ctx.get(), rows0[r]);
+        std::vector<llama_token_data> cur(backend.n_vocab);
+        for (int i = 0; i < backend.n_vocab; ++i) { cur[i] = { i, logits[i], 0.0f }; }
+        llama_token_data_array cur_p = { cur.data(), cur.size(), -1, false };
+        llama_sampler_apply(cpu_trunc.get(), &cur_p);
+        double max_l = -INFINITY;
+        for (size_t i = 0; i < cur_p.size; ++i) { max_l = std::max<double>(max_l, cur_p.data[i].logit); }
+        double sum = 0.0;
+        for (size_t i = 0; i < cur_p.size; ++i) {
+            if (cur_p.data[i].logit == -INFINITY) { continue; }
+            const double e = exp(cur_p.data[i].logit - max_l);
+            p_exact[r][cur_p.data[i].id] = e;
+            sum += e;
+        }
+        for (auto & kv : p_exact[r]) { kv.second /= sum; }
+        GGML_ASSERT(!p_exact[r].empty() && p_exact[r].size() <= 40);
+    }
+
+    std::vector<std::map<llama_token, int>> counts(rows0.size());
+    size_t n_block_rows = 0, n_single_rows = 0;
+    for (int it = 0; it < n_draws; ++it) {
+        llama_memory_seq_rm(llama_get_memory(backend.ctx.get()), -1, -1, -1);
+        GGML_ASSERT(llama_decode(backend.ctx.get(), batch) == 0);
+        llama_synchronize(backend.ctx.get());
+        for (int i = 0; i < batch.n_tokens; ++i) {
+            if (!batch.logits[i]) { continue; }
+            const llama_token id = llama_get_sampled_token_ith(backend.ctx.get(), i);
+            if (batch.seq_id[i][0] != 0) {
+                GGML_ASSERT(id == LLAMA_TOKEN_NULL); // seq 1 has no backend sampler
+                continue;
+            }
+            const size_t r = std::find(rows0.begin(), rows0.end(), i) - rows0.begin();
+            GGML_ASSERT(r < rows0.size());
+            // A lone row in its ubatch takes the single-row path.
+            const bool in_block = in_row_block(i);
+            if (in_block) {
+                GGML_ASSERT(llama_get_sampled_logits_ith(backend.ctx.get(), i) == nullptr);
+                GGML_ASSERT(llama_get_sampled_probs_ith(backend.ctx.get(), i) == nullptr);
+                n_block_rows++;
+            } else {
+                n_single_rows++;
+            }
+            GGML_ASSERT(id >= 0 && id < backend.n_vocab);
+            if (p_exact[r].count(id) == 0) {
+                fprintf(stderr, "row %zu: sampled id %d is outside the CPU candidate set (%zu candidates)\n", r, id, p_exact[r].size());
+                GGML_ASSERT(false && "backend sampled a token outside the truncated candidate set");
+            }
+            counts[r][id]++;
+        }
+    }
+
+    printf("rows sampled via the row-block path: %zu, via the single-row path: %zu (per %d draws)\n",
+            n_block_rows / n_draws, n_single_rows / n_draws, n_draws);
+    const size_t expected_block_rows = std::count_if(rows0.begin(), rows0.end(), in_row_block);
+    GGML_ASSERT(n_block_rows == expected_block_rows * n_draws);
+    GGML_ASSERT(n_single_rows == (rows0.size() - expected_block_rows) * n_draws);
+
+    for (size_t r = 0; r < rows0.size(); ++r) {
+        double tv = 0.0;
+        llama_token argmax_exact = -1, argmax_emp = -1;
+        double p_best = -1.0; int c_best = -1;
+        for (const auto & [id, p] : p_exact[r]) {
+            const double emp = (double) counts[r][id] / n_draws;
+            tv += 0.5 * std::fabs(emp - p);
+            if (p > p_best) { p_best = p; argmax_exact = id; }
+            if (counts[r][id] > c_best) { c_best = counts[r][id]; argmax_emp = id; }
+        }
+        printf("row %zu: %zu candidates, p_max %.3f (id %d), most sampled id %d (%d/%d), total variation %.3f\n",
+                r, p_exact[r].size(), p_best, argmax_exact, argmax_emp, c_best, n_draws, tv);
+        // TV of a 384-draw empirical distribution against its own law is ~0.03-0.08 for these supports
+        GGML_ASSERT(tv < 0.15 && "backend sampled distribution differs from the CPU truncated distribution");
+        if (p_best > 0.5) {
+            GGML_ASSERT(argmax_emp == argmax_exact);
+        }
+    }
+
+    // server flow: the common sampler's own chain is installed for verification and sample_and_accept_n
+    // consumes the backend ids row by row
+    GGML_ASSERT(llama_set_sampler(backend.ctx.get(), 0, nullptr));
+    common_params_sampling sampling;
+    sampling.temp = 0.8f;
+    sampling.seed = seed;
+    common_sampler * common = common_sampler_init(params.model.get(), sampling);
+    GGML_ASSERT(common_sampler_supports_backend_verify(sampling));
+    llama_sampler * verify = common_sampler_get_backend_verify(common);
+    GGML_ASSERT(verify != nullptr);
+    GGML_ASSERT(llama_set_sampler(backend.ctx.get(), 0, verify));
+    GGML_ASSERT(common_sampler_backend_verify_ready(common));
+
+    llama_memory_seq_rm(llama_get_memory(backend.ctx.get()), -1, -1, -1);
+    GGML_ASSERT(llama_decode(backend.ctx.get(), batch) == 0);
+    llama_synchronize(backend.ctx.get());
+
+    llama_tokens sampled;
+    for (int row : rows0) {
+        sampled.push_back(llama_get_sampled_token_ith(backend.ctx.get(), row));
+        GGML_ASSERT(sampled.back() != LLAMA_TOKEN_NULL);
+    }
+    for (size_t mismatch = 0; mismatch < sampled.size(); ++mismatch) {
+        llama_tokens draft(sampled.begin(), sampled.end() - 1);
+        if (mismatch < draft.size()) { draft[mismatch] = (draft[mismatch] + 1) % backend.n_vocab; }
+        common_sampler_reset(common);
+        const auto accepted = common_sampler_sample_and_accept_n(common, backend.ctx.get(), rows0, draft);
+        const size_t count = mismatch < draft.size() ? mismatch + 1 : sampled.size();
+        GGML_ASSERT(accepted.size() == count);
+        GGML_ASSERT(std::equal(accepted.begin(), accepted.end(), sampled.begin()));
+    }
+    GGML_ASSERT(llama_set_sampler(backend.ctx.get(), 0, nullptr));
+    common_sampler_free(common);
+    llama_batch_free(batch);
+    printf("sampled verification: %d output rows per sequence, ubatch %d PASSED\n", n_positions - 1, n_ubatch);
+}
+
+static void test_backend_sampled_multi_output(const test_params & params) {
+    run_backend_sampled_multi_output(params, 4, 4);
+    run_backend_sampled_multi_output(params, 5, 16);
+    run_backend_sampled_multi_output(params, 6, 16);
+    printf("backend sampled multi-output verification test PASSED\n");
 }
 
 struct backend_test_case {
@@ -1659,6 +1840,7 @@ struct backend_test_case {
 static const backend_test_case BACKEND_TESTS[] = {
     { "greedy",          test_backend_greedy_sampling,         true  },
     { "greedy_multi_output", test_backend_greedy_multi_output, true  },
+    { "sampled_multi_output", test_backend_sampled_multi_output, true },
     { "logit_bias",      test_backend_logit_bias_sampling,     true  },
     { "penalties",       test_backend_penalties_sampling,      true  },
     { "temp",            test_backend_temp_sampling,           true  },
