@@ -745,6 +745,10 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 
     llama_sampler_apply(chain, &cur_p);
 
+    // a chain that was offloaded to a backend skips all of its samplers here, so cur_p.selected would stay
+    // unset: that means the backend returned no token for this row and there is no valid CPU fallback
+    GGML_ASSERT(cur_p.selected != -1 && "no selected token during sampling - check your sampling configuration");
+
     id = cur_p.data[cur_p.selected].id;
 
     if (grammar_first || !grammar_should_apply(gsmpl)) {
