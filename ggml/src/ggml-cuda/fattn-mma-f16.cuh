@@ -917,6 +917,23 @@ static __device__ __forceinline__ void flash_attn_ext_turbo_stage_issue(const un
     }
 }
 
+// V staging: the 100-byte turbo3 rows are only 4-byte aligned individually, but when the source rows are
+// contiguous (pitch == row_bytes, true for the KV cache) the tile is one flat byte range. If that range and
+// the shared destination are 16-byte aligned, copy it with 16-byte cp.async.ca (4x fewer copy instructions,
+// same bytes at the same shared offsets); otherwise fall back to the 4-byte row copies.
+template<int nthreads, int nrows, int row_bytes>
+static __device__ __forceinline__ void flash_attn_ext_turbo_stage_issue_flat(const unsigned int dst32, const char * src, const int stride_bytes) {
+    constexpr int nbytes = nrows * row_bytes;
+    if (nbytes % 16 == 0 && stride_bytes == row_bytes && ((uintptr_t) src & 15) == 0 && (dst32 & 15) == 0) {
+        const int tid = threadIdx.y * ggml_cuda_get_physical_warp_size() + threadIdx.x;
+        for (int off = tid * 16; off < nbytes; off += nthreads * 16) {
+            cp_async_ca_16(dst32 + off, src + off);
+        }
+    } else {
+        flash_attn_ext_turbo_stage_issue<nthreads, nrows, row_bytes, 4>(dst32, src, stride_bytes);
+    }
+}
+
 template<int DKQ, int DV, int ncols1, int ncols2, int nwarps,
     bool use_logit_softcap, bool V_is_K_view, bool needs_fixup, bool is_fixup, bool last_iter, bool oob_check,
     typename T_A_KQ, typename T_B_KQ, typename T_C_KQ, typename T_A_VKQ, typename T_B_VKQ, typename T_C_VKQ,
@@ -1421,7 +1438,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             }
             __syncthreads();
             if constexpr (turbo_stage && !last_iter) {
-                flash_attn_ext_turbo_stage_issue<nthreads_turbo, nbatch_fa, ggml_cuda_fattn_turbo_stage_v_row<DV>(), 4>
+                flash_attn_ext_turbo_stage_issue_flat<nthreads_turbo, nbatch_fa, ggml_cuda_fattn_turbo_stage_v_row<DV>()>
                     (ggml_cuda_cvta_generic_to_shared(raw_V), (const char *) V_h2 + int64_t(k_VKQ_0 + nbatch_fa) * stride_V, stride_V);
             }
         } else if constexpr (nstages <= 1) {
@@ -1754,7 +1771,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         constexpr int nthreads_turbo = nwarps * warp_size;
         flash_attn_ext_turbo_stage_issue<nthreads_turbo, nbatch_fa, ggml_cuda_fattn_turbo_stage_k_row<DKQ>(), 16>
             (ggml_cuda_cvta_generic_to_shared(raw_K), (const char *) K_h2 + int64_t(kb0) * nbatch_fa * stride_K, stride_K);
-        flash_attn_ext_turbo_stage_issue<nthreads_turbo, nbatch_fa, ggml_cuda_fattn_turbo_stage_v_row<DV>(), 4>
+        flash_attn_ext_turbo_stage_issue_flat<nthreads_turbo, nbatch_fa, ggml_cuda_fattn_turbo_stage_v_row<DV>()>
             (ggml_cuda_cvta_generic_to_shared(raw_V), (const char *) V_h2 + int64_t(kb0) * nbatch_fa * stride_V, stride_V);
     }
 

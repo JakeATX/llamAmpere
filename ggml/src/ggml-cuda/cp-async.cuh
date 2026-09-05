@@ -47,6 +47,18 @@ static __device__ __forceinline__ void cp_async_cg_16(const unsigned int dst, co
 
 
 // 4 byte copy for sources that are only 4 byte aligned (e.g. 100 byte turbo3 rows); .ca is required for sizes below 16.
+// 16-byte L1-allocating copy (same cache policy as cp_async_ca_4); src and dst must be 16-byte aligned.
+static __device__ __forceinline__ void cp_async_ca_16(const unsigned int dst, const void * src) {
+#ifdef CP_ASYNC_AVAILABLE
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 16;"
+        : : "r"(dst), "l"(src));
+#else
+    GGML_UNUSED(dst);
+    GGML_UNUSED(src);
+    NO_DEVICE_CODE;
+#endif // CP_ASYNC_AVAILABLE
+}
+
 static __device__ __forceinline__ void cp_async_ca_4(const unsigned int dst, const void * src) {
 #ifdef CP_ASYNC_AVAILABLE
     asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" : : "r"(dst), "l"(src));
