@@ -39,6 +39,39 @@ quantized type (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0, Q2_K..Q6_K, IQ*), no LoRA on the head,
 every output row of the ubatch owned by a sequence with a backend sampler (`--spec-draft-backend-sampling`,
 the default). Otherwise the graph silently uses the full head, which keeps every output correct.
 
+## Adaptive tail (`--spec-draft-vocab-hot`)
+
+`--spec-draft-vocab-hot N` (env `LLAMA_ARG_SPEC_DRAFT_VOCAB_HOT`, default 0) declares that the **last N
+entries** of the loaded map are *hot slots*: the server may repoint them at token ids seen in recent
+traffic. `0 <= N < n_sel` is required; `N = 0` (the default) leaves the map fully static. The first
+`n_sel - N` ids are the static part and can never be evicted; the initial contents of the hot slots are
+whatever the file has, so a 71,680-id map with `N = 6144` starts out as a plain 71,680-id static map.
+
+The shortlist size never changes, so the graph, the tensor and the sampler's candidate list are the same
+objects as before: a refresh is one `ggml_backend_tensor_set` over the hot region (24 KiB for 6,144
+slots). There is no per-decode-step work.
+
+Ranking (`llama_mtp_hot_vocab` in `src/llama-mtp-vocab.h`, unit tested by `test-draft-vocab-hot`):
+
+* `observe(toks)` is called once per request boundary - with the prompt just before it is decoded, and
+  with the generated tail when the request finishes. Ids that are already in the static part are ignored.
+* Each distinct id gets `score = score * 0.5^(dreq/half_life) + min(count, cap)` with `half_life = 8`
+  requests and `cap = 8`. The cap is what makes recurrence across requests beat a single long document:
+  one 5,000-token file contributes at most 8, an id seen once in each of three recent requests wins
+  after ~14 requests of decay.
+* `refresh()` keeps the `N` best-scoring ids, evicts the rest and fills the freed slots with the best
+  non-resident candidates. Ids that stay keep their slot, so churn is minimal; ties are resolved in
+  favour of what is already resident. The file-provided hot ids start at score 0 and go first, in slot
+  order. The candidate table is pruned of decayed entries above `4*N` ids.
+* The state is per context and per process. Nothing is written to disk, and nothing is shared between
+  server restarts.
+
+The server logs one line per request at INFO:
+`slot update_slots: id  0 | task 3 | draft vocab hot: 12/6144 slots replaced, 8431 candidates`.
+
+Offline coverage of the emitted-token distribution (`W3/data/adaptive_tail_coverage.json`): adding the
+current prompt's ids to the 64K shortlist lifts coding coverage from 98.5% to 99.95%.
+
 ## Probability threshold (`--spec-draft-p-min`)
 
 The production drafter samples on the backend with a `top_k(10)` chain and the host softmaxes those ten
@@ -59,6 +92,7 @@ contiguous copy of the rows (131 MiB @32K, 262 MiB @64K for Q6_K) was benchmarke
 
 ```sh
 build/bin/test-mtp-vocab
+build/bin/test-draft-vocab-hot
 build/bin/test-backend-ops test -o MUL_MAT_ID -p 'n_mats=17,n_used=.*b=1,m=1,n=1,k=512'
 build/bin/test-backend-ops test -o MUL_MAT_ID
 build/bin/test-backend-ops test -o ARGMAX
@@ -69,6 +103,13 @@ Server flags (Qwen3.8-27B example):
 ```sh
 llama-server ... --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.45 \
     --spec-draft-vocab-map /path/to/map_32768.txt
+```
+
+With the adaptive tail (65,536 static ids + 6,144 hot slots):
+
+```sh
+llama-server ... --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.45 \
+    --spec-draft-vocab-map /path/to/atx_65536_hot6144.txt --spec-draft-vocab-hot 6144
 ```
 
 Two log lines confirm the map is loaded: `common_speculative_init: MTP draft context uses the draft-only
