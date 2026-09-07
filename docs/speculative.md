@@ -85,11 +85,13 @@ Chained MTP drafts N tokens in one GPU decode. It currently supports dense Qwen3
 
 #### GPU greedy verification
 
-On CUDA, greedy MTP verification keeps token selection on the backend. It is on by default and engages
-per request when the request's sampler chain is greedy-equivalent:
+On CUDA, greedy MTP verification keeps token selection on the backend. It is opt-in
+(`LLAMA_MTP_GPU_VERIFY=greedy` or `=1`) and then engages per request when the request's sampler chain is
+greedy-equivalent:
 
 ```bash
-# default: on. Disable with LLAMA_MTP_GPU_VERIFY=0
+# off unless asked for: LLAMA_MTP_GPU_VERIFY=greedy (greedy path) or =1 (greedy and sampled)
+LLAMA_MTP_GPU_VERIFY=greedy \
 llama-server -m model.gguf --spec-type draft-mtp --spec-draft-n-max 3
 # a request that engages it:
 curl ... -d '{"messages": [...], "temperature": 0, "top_k": 0, "top_p": 1, "min_p": 0}'
@@ -108,7 +110,8 @@ penalties/dry/top_k/top_p/min_p/typical/top_n_sigma/xtc/temperature in the chain
 truncation samplers must be disabled (`top_k <= 0`, `top_p >= 1`, `min_p <= 0`). Active truncation can
 change the choice among tied maxima; the CPU top-k regression fixture selects token 18 where raw
 argmax selects token 0. A common maximum score does not make these paths token-equivalent.
-With `LLAMA_MTP_GPU_VERIFY=0`, or for any ineligible request, verification runs on the CPU exactly as before.
+When `LLAMA_MTP_GPU_VERIFY` is unset or `0`, and for any ineligible request, verification runs on the CPU
+exactly as before.
 
 #### GPU sampled verification
 
@@ -117,12 +120,17 @@ sampler of the request's chain has a backend implementation that works on a bloc
 verification rows of a draft are sampled in one graph on the GPU (top-k / top-p / min-p / temperature
 / dist, plus logit bias, and the empty placeholders of disabled samplers) and only the sampled token
 ids are downloaded. This removes the per-round download of `(n_draft + 1)` full logit rows
-(4 x 0.99 MB at MTP-3 with the 248K vocabulary) and the CPU sampling over them. It is on by default:
+(4 x 0.99 MB at MTP-3 with the 248K vocabulary) and the CPU sampling over them.
+
+The sampled path keeps a `[n_vocab, n_rows]` working set per sequence for the graph, which is more memory
+than is safe to take by default at long context (it can exhaust the device at 220K tokens), so it is behind
+its own opt-in value:
 
 ```bash
-LLAMA_MTP_GPU_VERIFY=0       # all verification on the CPU (greedy and sampled)
+# unset (or =0)         all verification on the CPU, greedy and sampled - the default
 LLAMA_MTP_GPU_VERIFY=greedy  # only the greedy path above; sampled requests verify on the CPU
-# unset or any other value: greedy and sampled GPU verification when eligible
+LLAMA_MTP_GPU_VERIFY=1       # greedy and sampled GPU verification when eligible
+# any other value is treated as unset
 ```
 
 Eligibility (per request): `temperature > 0`, no dynamic temperature, no mirostat, `n_probs == 0`,

@@ -42,16 +42,23 @@ using json = nlohmann::ordered_json;
 constexpr int HTTP_POLLING_SECONDS = 1;
 
 // GPU verification of MTP/draft tokens (argmax or the full sampler chain on the backend, only token ids
-// downloaded) is on by default. LLAMA_MTP_GPU_VERIFY=0 disables it; LLAMA_MTP_GPU_VERIFY=greedy keeps only the
-// greedy path (sampled requests verify on the CPU as before)
+// downloaded) is opt-in, via LLAMA_MTP_GPU_VERIFY:
+//
+//   unset, "0"  off - every draft is verified on the CPU, as before
+//   "greedy"    the greedy path only (one argmax over the verification rows)
+//   "1"         the greedy path and the sampled path (the whole chain over the row block)
+//
+// The sampled path holds a [n_vocab, n_rows] working set per sequence, which is too much memory to take by
+// default at long context, so it stays behind "1". Any other value is treated as off.
 static bool server_mtp_gpu_verify_enabled() {
     const char * gpu_verify = std::getenv("LLAMA_MTP_GPU_VERIFY");
-    return gpu_verify == nullptr || std::strcmp(gpu_verify, "0") != 0;
+    return gpu_verify != nullptr &&
+        (std::strcmp(gpu_verify, "greedy") == 0 || std::strcmp(gpu_verify, "1") == 0);
 }
 
 static bool server_mtp_gpu_verify_sampled_enabled() {
     const char * gpu_verify = std::getenv("LLAMA_MTP_GPU_VERIFY");
-    return server_mtp_gpu_verify_enabled() && !(gpu_verify && std::strcmp(gpu_verify, "greedy") == 0);
+    return gpu_verify != nullptr && std::strcmp(gpu_verify, "1") == 0;
 }
 
 static uint32_t server_n_outputs_max(const common_params & params) {
