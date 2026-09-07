@@ -1,6 +1,6 @@
 # Draft-only vocabulary shortlist for the MTP drafter
 
-`--spec-draft-vocab-map /path/to/map.txt` (env `LLAMA_ARG_SPEC_DRAFT_VOCAB_MAP`; quick-test env
+`--spec-draft-vocab-map /path/to/map.txt` (shipped maps for Qwen3.8-27B ATX-IQ4_XS-M: `docs/mtp-vocab/atx_65536.txt`, the production choice, and `docs/mtp-vocab/atx_32768.txt`) (env `LLAMA_ARG_SPEC_DRAFT_VOCAB_MAP`; quick-test env
 `LLAMA_SPEC_DRAFT_VOCAB` read by MTP draft contexts) restricts the **draft** context's output head to a
 shortlist of token rows. The target context, its verification batches and the final sampler are unchanged.
 Without a map the draft path is byte-for-byte the stock full-vocabulary path.

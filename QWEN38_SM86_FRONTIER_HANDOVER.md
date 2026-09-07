@@ -30,7 +30,8 @@ or the exact local Q3 unpack-reuse family. They have already been measured.
 
 ## GitHub and branch map
 
-Fork remote (renamed 2026-09-03; the old `JakeATX/llama.cpp` URL redirects):
+Fork remote for v0.2 (2026-09-07): `https://github.com/JakeATX/llamAmpere`. The v0.1 remote
+(renamed 2026-09-03; the old `JakeATX/llama.cpp` URL redirects) is kept as the historical record:
 
 `https://github.com/JakeATX/llama-cpp-qwen-ampere`
 

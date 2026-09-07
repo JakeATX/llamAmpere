@@ -1,15 +1,24 @@
-# llama-cpp-qwen-ampere
+# llamAmpere
 
 Qwen3.8-27B on one Ampere card (RTX 3090 / 3090 Ti, 24 GB): a fork of
 [TheTom/llama-cpp-turboquant](https://github.com/TheTom/llama-cpp-turboquant)
 (TurboQuant+ KV cache, native MTP speculative decoding) carrying SM86-specific
 kernel and memory work, plus the quantization recipe it was tuned with.
 
+This is v0.2 (2026-09-07), the successor of
+[llama-cpp-qwen-ampere](https://github.com/JakeATX/llama-cpp-qwen-ampere) (v0.1, 2026-09-03).
+v0.2 adds a 64K draft-vocabulary shortlist for the MTP head, an exact rewrite of the
+Turbo3 attention loaders and the IQ4_XS matrix-vector path, a pinned-buffer fix, and an
+opt-in GPU greedy verifier. The write-up with figures is
+[docs/llamampere-v0.2/ARTICLE.md](docs/llamampere-v0.2/ARTICLE.md).
+
 Measured on a 3090 Ti at 350 W with the ATX-IQ4_XS-M quant (working name ATX-4-XS, which the filenames keep; IQ4_XS base, M-pattern upgrades, 4.56 bpw):
 
 | | |
 |---|---|
-| populated 200K context | 20.9 GiB ready VRAM, 694 tok/s prefill, 65 tok/s decode |
+| 100K-token generation, temperature 1, MTP-3 (v0.2) | 75.3 tok/s cumulative over 102,400 generated tokens; v0.1 as documented 66.1, upstream TurboQuant+ of 2026-09-03 56.0 |
+| 220K prompt populated with the shortlist (v0.2) | 22,174 MiB peak, +150 MiB over v0.1, no OOM |
+| populated 200K context (v0.1 measurement) | 20.9 GiB ready VRAM, 694 tok/s prefill, 65 tok/s decode |
 | largest measured fit | 245,760-token window with a 240K prompt, 22.1 GiB ready |
 | agent session 100K -> 245K context | 120K generated tokens, 52 tok/s cumulative (60 at 110K, 47 at 245K), 76% draft acceptance |
 | per speculative round vs Q3_K_XL / Q4_K_M | +9-10% / +23% |
@@ -29,7 +38,7 @@ Q8_0.
 
 | branch | what it is |
 |---|---|
-| `main` | the product: upstream TurboQuant+ as of 2026-09-03 plus all accepted SM86 work. Build from here. |
+| `main` | the product (v0.2): upstream TurboQuant+ as of 2026-09-03 plus all accepted SM86 work through 2026-09-07. Build from here. |
 | `perf/qwen38-sm86-decode-product`, `perf/qwen38-sm86-prefill` | the same commit as `main` at the 2026-09-03 release, kept for existing links |
 | `research/qwen38-sm86-*` | experiment branches with opt-in knobs; see the handover |
 | `archive/*` | rejected or superseded experiments |
@@ -41,8 +50,8 @@ The experiment log, with hypotheses, results, and what did not work, is
 ## Build and run
 
 ```bash
-git clone -b main https://github.com/JakeATX/llama-cpp-qwen-ampere.git
-cd llama-cpp-qwen-ampere
+git clone -b main https://github.com/JakeATX/llamAmpere.git
+cd llamAmpere
 cmake -S . -B build-sm86 -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DGGML_CUDA_FA=ON \
       -DCMAKE_CUDA_ARCHITECTURES=86 -DGGML_NATIVE=ON
 cmake --build build-sm86 -j8 --target llama-server
@@ -52,8 +61,17 @@ GGML_Q8_TURBO3_MMA_FUSED=1 ./build-sm86/bin/llama-server -m Qwen3.8-27B-ATX-4-XS
   --parallel 1 --jinja --fit off \
   --cache-prompt --cache-ram 8192 --ctx-checkpoints 24 --checkpoint-min-step 10240 \
   --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.45 \
-  --spec-draft-type-k q8_0 --spec-draft-type-v turbo3
+  --spec-draft-type-k q8_0 --spec-draft-type-v turbo3 \
+  --spec-draft-vocab-map docs/mtp-vocab/atx_65536.txt
 ```
+
+`--spec-draft-vocab-map` (new in v0.2) restricts the MTP drafter's output head to a 65,536-token
+shortlist built from this model's generations (`docs/mtp-vocab/atx_65536.txt`; a 32K map is next to
+it). The target model's head is untouched, so verification and the sampled output distribution are
+the target's; only the draft proposals change. It is the largest single contributor to v0.2's decode
+gain and costs 150 MiB of VRAM at 220K. See `docs/mtp-vocabulary-shortlist.md`. The adaptive
+`--spec-draft-vocab-hot` tail that the same code supports measured 2.7-4.0% slower than the static
+map and is left off.
 
 The three cache flags are what make a long conversation usable rather than merely possible. `--cache-prompt` keeps the conversation's KV cache in the slot between turns, so a new turn on a 200K conversation pays only for the new tokens instead of a 100-second re-prefill. `--ctx-checkpoints` matters specifically for this model: 48 of its layers are recurrent, and a recurrent state cannot be rewound, so when you edit or regenerate a turn the server needs a saved state from before the edit point; it keeps up to 24 of them, at least 10,240 tokens apart (and one at every user turn regardless), in host RAM. Measured on this model, a snapshot is 150 MiB plus 1.5 KiB per token of position, because the MTP drafter's own single-layer KV cache is saved with the recurrent state: about 165 MiB at 10K, 495 MiB at 240K. 24 at 10,240 spacing covers the whole 245,760 window for about 7.8 GiB with at most ten seconds of replay after an edit; denser spacing multiplies that RAM (60 at 4,096 is about 20 GiB at the deep end). `--cache-ram` is a separate host-RAM budget for parking a whole conversation's KV (with its checkpoints) when another conversation takes the slot; a populated 200K conversation is about 7.4 GB, so 8 GiB holds one, and it only does work when you switch between chats. None of this touches VRAM. Budget about 16 GB of host RAM for it at the deep end (up to 8 GiB of snapshots plus the 8 GiB park space) on top of the model's own mapping; on a 32 GB machine keep the desktop light, or drop the count to 12 at 20,480 spacing for half the snapshot RAM.
 
@@ -77,6 +95,40 @@ the shared compute arena; the research knobs (`GGML_Q8_TURBO3_MMA_MIN_Q`,
 you are reproducing a rejected experiment.
 
 W2 research control: `LLAMA_OUTPUT_BUFFER_REUSE=0` restores the original combined output/sampling buffer, row reservation, and lazy allocation policy. The default keeps sampling storage separate, retains the largest row reservation, and reserves added embeddings during setup. Compare this control with GPU verification disabled on both sides to isolate allocation behavior. Avoided setup allocations do not imply a sustained tokens-per-second gain.
+
+## v0.2 release notes (2026-09-07)
+
+Measured on the same card and model as above, 102,400 generated tokens after a 685-token prompt
+(EOS ignored, context 112,640, seed 6100, checkpoints every 5K tokens), server-reported decode rate.
+Temperature 1, top-k 20, top-p 0.95, MTP depth 3:
+
+| build | tok/s over 100K generated | at 25K / 50K / 75K / 100K (cumulative) | draft acceptance |
+|---|---:|---|---:|
+| upstream TurboQuant+ 2026-09-03 (`1208c5956`) | 55.98 | 59.0 / 58.7 / 57.0 / 55.8 | 0.660 |
+| v0.1 as documented (`26e7bc523`, `GGML_Q8_TURBO3_MMA_FUSED=1`) | 66.09 | 64.8 / 66.2 / 65.7 / 65.8 | 0.660 |
+| v0.1 + v0.2 exact kernels only (`43651b47e`) | 66.38 | 64.2 / 65.6 / 65.4 / 66.0 | 0.660 |
+| v0.2 (kernels + 64K shortlist + runtime, `4017a1af4`) | 75.29 | 71.5 / 74.0 / 74.0 / 74.9 | 0.680 |
+
+The first three rows decoded byte-identical text. v0.2 is +13.9% over v0.1 and +34.5% over upstream;
+the exact kernel set alone is +0.4% over this run, so nearly all of the gain is the shortlist and the
+runtime fixes. Temperature 0 (greedy, MTP depth 4, exactness runs for greedy users, not the benchmark
+configuration): upstream 71.84, v0.2 98.54, v0.2 with `LLAMA_MTP_GPU_VERIFY=greedy` 99.10 with
+byte-identical text over all 102,400 tokens.
+
+What changed since v0.1, in merge order (each commit is exact unless noted):
+
+- `f2fdec42f` cuda: Turbo3 verify loader selects centroids in registers instead of a constant table.
+- `7b690c279` cuda: guard input access for source-free graphs.
+- `485961968` cuda: IQ4_XS activation layout and cross-column weight reuse in MMVQ.
+- `43651b47e` cuda: 16-byte cp.async staging for flat aligned Turbo3 V tiles.
+- `ef86f905c`, `f7da4730d` speculative: draft-only vocabulary shortlist for the draft-mtp head (`--spec-draft-vocab-map`); changes draft proposals, never target verification.
+- `e3696efb3`, `076c90eda`, `4017a1af4` llama, server: adaptive hot tail for the shortlist (`--spec-draft-vocab-hot`), measured slower, off by default.
+- `f0a913279` llama-context: pinned output buffer kept stable across sampler changes (no per-request host realloc).
+- `1ae96377c`, `82b355e86`, `13e022e0a`, `d8a35a9ad`, `0c5098b98`, `bd64685fc`, `1b9b70be1` GPU verification of MTP drafts, opt-in via `LLAMA_MTP_GPU_VERIFY` (greedy path exact; sampled path not a default, see the knob table).
+
+Depth 3 remains the default: on real prompts at temperature 1 depth 4 was 1.8% slower with the map
+(and 10.7% slower on a 140K retrieval prompt); depth 4 wins only at temperature 0. Draft KV in f16
+was not evaluated in this round.
 
 ## Blackwell (RTX 50 series, RTX PRO 6000): what carries over
 

@@ -1,4 +1,4 @@
-> **llama-cpp-qwen-ampere**: this fork runs Qwen3.8-27B at up to 245K context on one RTX 3090 / 3090 Ti with the model's own MTP head. Start with [QWEN_AMPERE.md](QWEN_AMPERE.md). The rest of this README is upstream llama.cpp's.
+> **llamAmpere** (v0.2): this fork runs Qwen3.8-27B at up to 245K context on one RTX 3090 / 3090 Ti with the model's own MTP head, 75 tok/s over a 100K-token generation at temperature 1. Start with [QWEN_AMPERE.md](QWEN_AMPERE.md) and the write-up in [docs/llamampere-v0.2/ARTICLE.md](docs/llamampere-v0.2/ARTICLE.md). Successor of [llama-cpp-qwen-ampere](https://github.com/JakeATX/llama-cpp-qwen-ampere) (v0.1). The rest of this README is upstream llama.cpp's.
 
 # llama.cpp
 
