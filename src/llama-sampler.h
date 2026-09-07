@@ -42,3 +42,8 @@ struct llama_sampler * llama_sampler_init_dry_testing(
 
 // Stateless greedy chains can sample every output row in one graph.
 bool llama_sampler_is_greedy_chain(const llama_sampler * sampler);
+
+// Chains whose backend graph produces only token ids: [greedy], or [logit-bias..., greedy].
+// A bare greedy chain shares one argmax over all output rows; a biased one needs its own row block,
+// because the bias has to be added to its rows before the argmax.
+bool llama_sampler_is_argmax_chain(const llama_sampler * sampler);

@@ -169,6 +169,9 @@ struct common_sampler {
 
     mutable int64_t t_total_us = 0;
     llama_sampler * greedy_backend = nullptr;
+    // true when greedy_backend is [logit-bias, greedy] rather than a bare [greedy]: a biased chain really
+    // runs a backend graph, so it has to have been offloaded before it can be trusted
+    bool greedy_backend_biased = false;
 };
 
 std::string common_params_sampling::print() const {
@@ -576,8 +579,11 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
 }
 
 bool common_sampler_supports_greedy_backend(const common_params_sampling & params) {
+    // logit biases (including the EOG biases that a request with ignore_eos carries) are not listed here:
+    // they are applied exactly on the backend, by the same logit-bias sampler the CPU chain uses, in front
+    // of the argmax - see common_sampler_get_greedy_backend()
     if (!(params.temp <= 0.0f) || params.dynatemp_range != 0.0f || params.mirostat != 0 ||
-            params.n_probs != 0 || !params.logit_bias.empty() || !common_grammar_value(params.grammar).empty()) {
+            params.n_probs != 0 || !common_grammar_value(params.grammar).empty()) {
         return false;
     }
 
@@ -620,22 +626,83 @@ bool common_sampler_supports_greedy_backend(const common_params_sampling & param
     return temperature;
 }
 
+// the biases the CPU chain applies before its greedy argmax: the request's logit_bias (which is where the
+// server puts the EOG biases of ignore_eos) followed by the model's suppress tokens at -INFINITY. The set
+// is exactly the one common_sampler_init() builds for the CPU chain.
+//
+// Repeated tokens are summed here. The CPU logit-bias sampler adds every entry to the candidate's logit,
+// while the backend one writes the entries into a bias row with ggml_set_rows (last write wins) and adds
+// the row once, so without folding a repeated token would silently lose all but its last bias. With it the
+// two paths apply the same total bias (a repeated finite bias can still round differently, since the CPU
+// adds it in steps). Suppressed ids stay -INFINITY under any sum with a finite bias, and a token that is
+// both biased and suppressed is suppressed on both paths.
+std::vector<llama_logit_bias> common_sampler_greedy_biases(
+        const common_params_sampling & params, const struct llama_vocab * vocab) {
+    std::vector<llama_logit_bias> merged;
+    std::unordered_map<llama_token, size_t> pos;
+
+    auto add = [&](llama_token token, float bias) {
+        const auto it = pos.find(token);
+        if (it == pos.end()) {
+            pos[token] = merged.size();
+            merged.push_back({ token, bias });
+        } else {
+            merged[it->second].bias += bias;
+        }
+    };
+
+    for (const auto & lb : params.logit_bias) {
+        add(lb.token, lb.bias);
+    }
+
+    if (vocab) {
+        int32_t n_suppress = 0;
+        const llama_token * suppress = llama_vocab_get_suppress_tokens(vocab, &n_suppress);
+        for (int32_t i = 0; i < n_suppress; ++i) {
+            add(suppress[i], -INFINITY);
+        }
+    }
+
+    return merged;
+}
+
 struct llama_sampler * common_sampler_get_greedy_backend(struct common_sampler * gsmpl, const struct llama_model * model) {
     if (!gsmpl || gsmpl->grmr || gsmpl->rbudget || !common_sampler_supports_greedy_backend(gsmpl->params)) {
         return nullptr;
     }
-    int32_t n_suppress = 0;
-    llama_vocab_get_suppress_tokens(llama_model_get_vocab(model), &n_suppress);
-    if (n_suppress != 0) {
-        return nullptr;
-    }
     if (!gsmpl->greedy_backend) {
+        const struct llama_vocab * vocab = llama_model_get_vocab(model);
+
         auto params = llama_sampler_chain_default_params();
         params.no_perf = gsmpl->params.no_perf;
         gsmpl->greedy_backend = llama_sampler_chain_init(params);
+
+        // suppressed / biased ids are forced to -INFINITY in the logit rows before the argmax, which is
+        // exactly what the CPU chain does; both sides break ties on the lowest token id (the CPU greedy
+        // sampler keeps the first maximum of a candidate list built in id order, and ggml_argmax keeps
+        // the lowest column index), so the selected token is identical
+        const auto biases = common_sampler_greedy_biases(gsmpl->params, vocab);
+        if (!biases.empty()) {
+            llama_sampler_chain_add(gsmpl->greedy_backend,
+                    llama_sampler_init_logit_bias(llama_vocab_n_tokens(vocab), biases.size(), biases.data()));
+            gsmpl->greedy_backend_biased = true;
+        }
+
         llama_sampler_chain_add(gsmpl->greedy_backend, llama_sampler_init_greedy());
     }
     return gsmpl->greedy_backend;
+}
+
+bool common_sampler_greedy_backend_ready(const struct common_sampler * gsmpl) {
+    if (!gsmpl || !gsmpl->greedy_backend) {
+        return false;
+    }
+    // a bare [greedy] chain never runs a backend graph of its own: build_sampling emits one argmax over all
+    // output rows for it, whether or not the chain was offloaded
+    if (!gsmpl->greedy_backend_biased) {
+        return true;
+    }
+    return llama_sampler_backend_rows_ready(gsmpl->greedy_backend);
 }
 
 bool common_sampler_supports_backend_verify(const common_params_sampling & params) {

@@ -103,8 +103,7 @@ vocabulary logit rows to the CPU. The server logs `GPU greedy verification enabl
 engages it and `GPU verification ineligible for sampler settings; using CPU verification` otherwise.
 
 Eligibility (checked per request from its sampling parameters): `temperature <= 0`, no dynamic
-temperature, no mirostat, `n_probs == 0`, no grammar, no logit bias, no suppressed vocabulary tokens,
-penalties/DRY inactive (`repeat_penalty 1.0`, `frequency_penalty 0`, `presence_penalty 0`, `dry_multiplier 0`),
+temperature, no mirostat, `n_probs == 0`, no grammar, penalties/DRY inactive (`repeat_penalty 1.0`, `frequency_penalty 0`, `presence_penalty 0`, `dry_multiplier 0`),
 `typical_p >= 1`, `top_n_sigma < 0`, `xtc_probability 0`, and only the samplers
 penalties/dry/top_k/top_p/min_p/typical/top_n_sigma/xtc/temperature in the chain. When present,
 truncation samplers must be disabled (`top_k <= 0`, `top_p >= 1`, `min_p <= 0`). Active truncation can
@@ -112,6 +111,26 @@ change the choice among tied maxima; the CPU top-k regression fixture selects to
 argmax selects token 0. A common maximum score does not make these paths token-equivalent.
 When `LLAMA_MTP_GPU_VERIFY` is unset or `0`, and for any ineligible request, verification runs on the CPU
 exactly as before.
+
+Logit biases and suppressed tokens do not disqualify a request. When the request carries a `logit_bias`
+(this is also how the server expresses `ignore_eos`: an `-INFINITY` bias per EOG token) or the model
+declares `tokenizer.ggml.suppress_tokens`, the greedy backend chain becomes `[logit-bias, greedy]`: the
+same merged bias set the CPU chain uses is written into a one-row `[1, n_vocab]` tensor with `ggml_set_rows`
+and broadcast-added to the `[n_vocab, n_rows]` logit block in front of the argmax. Only the bias values and
+their token ids are uploaded (two tensors of `n_biases` elements per graph); nothing else moves across the
+bus beyond the existing token-id readback. Repeated entries for one token are summed when the chain is
+built, because the CPU sampler adds each of them while `ggml_set_rows` would keep only the last. Both sides
+break argmax ties on the lowest token id (`ggml_argmax` keeps the lowest column, and the CPU greedy sampler
+keeps the first maximum of a candidate list built in token-id order), so the selected token is identical.
+
+A biased chain runs a real backend graph, unlike a bare `[greedy]` chain (for which the graph emits a single
+argmax over the output rows regardless). If any of its samplers could not be offloaded, the request falls
+back to CPU verification and the server logs `GPU greedy verification unavailable; using CPU verification`.
+
+The bias is not applied inside a draft graph that uses a vocabulary shortlist (`--spec-draft-vocab-map`,
+`--spec-draft-vocab-hot`): there the logit columns are compact shortlist positions rather than token ids,
+so a token-indexed bias would land on the wrong column. It is not needed there either, because every draft
+token is re-checked against the biased full-vocabulary argmax of the verification rows.
 
 #### GPU sampled verification
 

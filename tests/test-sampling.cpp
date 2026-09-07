@@ -5,6 +5,8 @@
 #include "llama.h"
 #include "sampling.h"
 
+#include "../src/llama-ext.h" // staging API: llama_sampler_backend_supports_rows
+
 #ifdef NDEBUG
 #undef NDEBUG
 #endif
@@ -394,6 +396,166 @@ static void test_greedy_backend_truncation_ties() {
     GGML_ASSERT(!common_sampler_supports_greedy_backend(params));
 }
 
+// Run [logit-bias, greedy] (or bare [greedy] when there is no bias) on the CPU backend over a
+// [n_vocab, n_rows] logit block, the way speculative verification does, and return the sampled ids.
+static std::vector<llama_token> run_backend_greedy_rows(
+        const std::vector<llama_logit_bias> & biases,
+        const std::vector<float>            & logits,
+        int                                   n_vocab,
+        int                                   n_rows) {
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    GGML_ASSERT(backend);
+
+    auto * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
+    if (!biases.empty()) {
+        llama_sampler_chain_add(chain, llama_sampler_init_logit_bias(n_vocab, biases.size(), biases.data()));
+    }
+    llama_sampler_chain_add(chain, llama_sampler_init_greedy());
+
+    GGML_ASSERT(llama_sampler_backend_supports_rows(chain));
+    GGML_ASSERT(chain->iface->backend_init(chain, ggml_backend_get_default_buffer_type(backend)));
+    GGML_ASSERT(llama_sampler_backend_rows_ready(chain));
+
+    ggml_init_params init = { ggml_tensor_overhead()*32 + ggml_graph_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(init);
+    GGML_ASSERT(ctx);
+
+    ggml_tensor * inp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_vocab, n_rows);
+    ggml_set_input(inp);
+
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+
+    llama_sampler_data data = { inp, nullptr, nullptr, nullptr };
+    chain->iface->backend_apply(chain, ctx, gf, &data);
+    GGML_ASSERT(data.sampled != nullptr);
+    ggml_build_forward_expand(gf, data.sampled);
+
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    GGML_ASSERT(buffer);
+
+    ggml_backend_tensor_set(inp, logits.data(), 0, logits.size()*sizeof(float));
+    chain->iface->backend_set_input(chain);
+
+    GGML_ASSERT(ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS);
+
+    std::vector<llama_token> out(n_rows);
+    GGML_ASSERT(ggml_nelements(data.sampled) == n_rows);
+    ggml_backend_tensor_get(data.sampled, out.data(), 0, out.size()*sizeof(llama_token));
+
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    llama_sampler_free(chain);
+    ggml_backend_free(backend);
+
+    return out;
+}
+
+// The CPU chain common_sampler_init() builds for a greedy request: the raw (undeduplicated) bias list
+// followed by greedy, applied one row at a time.
+static std::vector<llama_token> run_cpu_greedy_rows(
+        const std::vector<llama_logit_bias> & biases,
+        const std::vector<float>            & logits,
+        int                                   n_vocab,
+        int                                   n_rows) {
+    auto * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
+    if (!biases.empty()) {
+        llama_sampler_chain_add(chain, llama_sampler_init_logit_bias(n_vocab, biases.size(), biases.data()));
+    }
+    llama_sampler_chain_add(chain, llama_sampler_init_greedy());
+
+    std::vector<llama_token> out;
+    for (int r = 0; r < n_rows; ++r) {
+        std::vector<llama_token_data> cur;
+        cur.reserve(n_vocab);
+        for (int i = 0; i < n_vocab; ++i) {
+            cur.push_back({ i, logits[r*n_vocab + i], 0.0f });
+        }
+        llama_token_data_array cur_p = { cur.data(), cur.size(), -1, false };
+        llama_sampler_apply(chain, &cur_p);
+        GGML_ASSERT(cur_p.selected >= 0);
+        out.push_back(cur_p.data[cur_p.selected].id);
+    }
+
+    llama_sampler_free(chain);
+    return out;
+}
+
+// Suppressed tokens must not be selected by the backend greedy path.
+//
+// Model suppress tokens and request logit biases reach the greedy chain through the same list
+// (common_sampler_greedy_biases appends the suppressed ids to the request's biases at -INFINITY), so the
+// -INFINITY entries below stand for either source. The reference is the CPU chain common_sampler_init()
+// builds from the raw list, including a duplicated token, which the CPU sampler adds twice.
+static void test_greedy_backend_suppressed_argmax() {
+    constexpr int n_vocab = 257;
+    constexpr int n_rows  = 5;
+
+    const std::vector<llama_token> suppressed = { 3, 11, 250 };
+
+    std::vector<float> logits(n_vocab*n_rows);
+    for (int r = 0; r < n_rows; ++r) {
+        for (int i = 0; i < n_vocab; ++i) {
+            logits[r*n_vocab + i] = -10.0f + 0.001f*((i*37 + r*11) % 97);
+        }
+    }
+    // row 0: the argmax is a suppressed id, the runner-up is not
+    logits[0*n_vocab + 3]   =  5.0f;
+    logits[0*n_vocab + 40]  =  4.0f;
+    // row 1: the two best ids are both suppressed
+    logits[1*n_vocab + 250] =  9.0f;
+    logits[1*n_vocab + 11]  =  8.0f;
+    logits[1*n_vocab + 7]   =  7.0f;
+    // row 2: nothing suppressed is anywhere near the top
+    logits[2*n_vocab + 5]   =  3.0f;
+    // row 3: a tie between a suppressed id and two others - the lowest surviving id wins
+    logits[3*n_vocab + 3]   =  2.0f;
+    logits[3*n_vocab + 64]  =  2.0f;
+    logits[3*n_vocab + 65]  =  2.0f;
+    // row 4: only the finitely biased id 40 is on top, so the bias decides
+    logits[4*n_vocab + 40]  =  1.0f;
+    logits[4*n_vocab + 41]  =  0.5f;
+
+    const std::vector<llama_token> expected = { 40, 7, 5, 64, 41 };
+
+    // as the server builds it: a repeated user bias (summed by the CPU sampler) plus the suppressed ids
+    common_params_sampling params;
+    params.temp = 0.0f;
+    params.samplers = { COMMON_SAMPLER_TYPE_TEMPERATURE };
+    params.logit_bias.push_back({ 40, -0.4f });
+    params.logit_bias.push_back({ 40, -0.4f });
+    for (auto id : suppressed) {
+        params.logit_bias.push_back({ id, -INFINITY });
+    }
+    GGML_ASSERT(common_sampler_supports_greedy_backend(params));
+
+    const auto merged = common_sampler_greedy_biases(params, nullptr);
+    GGML_ASSERT(merged.size() == params.logit_bias.size() - 1); // the duplicate was folded
+    GGML_ASSERT(merged[0].token == 40 && merged[0].bias == -0.8f);
+
+    const auto backend = run_backend_greedy_rows(merged,             logits, n_vocab, n_rows);
+    const auto cpu     = run_cpu_greedy_rows    (params.logit_bias,  logits, n_vocab, n_rows);
+
+    for (int r = 0; r < n_rows; ++r) {
+        printf("suppressed greedy row %d: backend=%d cpu=%d expected=%d\n", r, backend[r], cpu[r], expected[r]);
+    }
+    GGML_ASSERT(backend == cpu);
+    GGML_ASSERT(backend == expected);
+
+    // and with no biases at all the path is unchanged: the raw argmax of every row
+    common_params_sampling plain;
+    plain.temp = 0.0f;
+    const auto none = common_sampler_greedy_biases(plain, nullptr);
+    GGML_ASSERT(none.empty());
+
+    const auto backend_plain = run_backend_greedy_rows(none, logits, n_vocab, n_rows);
+    const auto cpu_plain     = run_cpu_greedy_rows    (none, logits, n_vocab, n_rows);
+    const std::vector<llama_token> expected_plain = { 3, 250, 5, 3, 40 };
+    GGML_ASSERT(backend_plain == cpu_plain);
+    GGML_ASSERT(backend_plain == expected_plain);
+
+    printf("greedy backend suppress tokens: PASSED\n");
+}
+
 static void test_greedy_backend_eligibility() {
     common_params_sampling params;
     params.temp = 0.0f;
@@ -405,8 +567,9 @@ static void test_greedy_backend_eligibility() {
     params.n_probs = 1;
     GGML_ASSERT(!common_sampler_supports_greedy_backend(params));
     params.n_probs = 0;
+    // logit biases (the shape ignore_eos takes) are applied on the backend in front of the argmax
     params.logit_bias.push_back({0, -INFINITY});
-    GGML_ASSERT(!common_sampler_supports_greedy_backend(params));
+    GGML_ASSERT(common_sampler_supports_greedy_backend(params));
     params.logit_bias.clear();
     params.samplers.push_back(COMMON_SAMPLER_TYPE_PENALTIES);
     GGML_ASSERT(common_sampler_supports_greedy_backend(params));
@@ -446,6 +609,7 @@ int main(int argc, char ** argv) {
     }
     test_greedy_backend_truncation_ties();
     test_greedy_backend_eligibility();
+    test_greedy_backend_suppressed_argmax();
     test_greedy_argmax_rows(cpu_only);
     ggml_time_init();
 

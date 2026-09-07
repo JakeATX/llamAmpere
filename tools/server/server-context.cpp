@@ -2190,7 +2190,10 @@ private:
             if (backend_sampling) {
                 bool enabled = llama_set_sampler(ctx_tgt, slot.id,
                         speculative_sampler ? speculative_sampler : common_sampler_get(slot.smpl.get()));
-                if (enabled && speculative_sampled && !common_sampler_backend_verify_ready(slot.smpl.get())) {
+                const bool rows_ready = !speculative_sampler ? true : (speculative_sampled
+                        ? common_sampler_backend_verify_ready(slot.smpl.get())
+                        : common_sampler_greedy_backend_ready(slot.smpl.get()));
+                if (enabled && !rows_ready) {
                     // part of the chain cannot run on this backend: a verification row block would come back
                     // unsampled, so fall back to CPU verification with a chain that was never offloaded
                     llama_set_sampler(ctx_tgt, slot.id, nullptr);
@@ -4437,7 +4440,10 @@ private:
                             }
                             if (sampler) {
                                 const bool enabled = llama_set_sampler(slot.ctx_tgt, slot.id, sampler);
-                                if (enabled && sampled && !common_sampler_backend_verify_ready(slot.smpl.get())) {
+                                const bool rows_ready = sampled
+                                        ? common_sampler_backend_verify_ready(slot.smpl.get())
+                                        : common_sampler_greedy_backend_ready(slot.smpl.get());
+                                if (enabled && !rows_ready) {
                                     llama_set_sampler(slot.ctx_tgt, slot.id, nullptr);
                                     // the partially offloaded chain must not be used on the CPU: continue with a fresh clone
                                     slot.smpl.reset(common_sampler_clone(slot.smpl.get()));

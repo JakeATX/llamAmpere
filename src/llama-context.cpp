@@ -2637,8 +2637,9 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     // Allocate backend sampling output buffers if there are backend samplers configured.
     const bool has_sampling = !sampling.samplers.empty();
+    // argmax chains (bare greedy, or greedy behind a logit-bias) export only token ids
     const bool compact_sampling = has_sampling && std::all_of(sampling.samplers.begin(), sampling.samplers.end(),
-            [](const auto & entry) { return llama_sampler_is_greedy_chain(entry.second); });
+            [](const auto & entry) { return llama_sampler_is_argmax_chain(entry.second); });
     if (compact_sampling) {
         backend_token_count = n_outputs_max;
     } else if (has_sampling) {

@@ -4133,6 +4133,26 @@ void llama_perf_sampler_reset(struct llama_sampler * chain) {
 
 // row-block backend sampling support (defined after all sampler interface tables)
 
+// A chain that ends in greedy and is preceded only by logit-bias (or no-op) samplers: its backend graph
+// emits token ids and nothing else, so the context needs no logits/probs/candidates buffers for it.
+// The bias is folded into the logit rows before the argmax, which is exactly what the CPU chain does.
+bool llama_sampler_is_argmax_chain(const llama_sampler * sampler) {
+    if (!sampler || sampler->iface != &llama_sampler_chain_i) {
+        return false;
+    }
+    const auto * chain = static_cast<const llama_sampler_chain *>(sampler->ctx);
+    if (chain->samplers.empty() || chain->samplers.back().ptr->iface != &llama_sampler_greedy_i) {
+        return false;
+    }
+    for (size_t i = 0; i + 1 < chain->samplers.size(); ++i) {
+        const auto * iface = chain->samplers[i].ptr->iface;
+        if (iface != &llama_sampler_logit_bias_i && iface != &llama_sampler_empty_i) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool llama_sampler_backend_supports_rows(const llama_sampler * sampler) {
     if (!sampler) {
         return false;

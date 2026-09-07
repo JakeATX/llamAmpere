@@ -3875,12 +3875,28 @@ void llm_graph_context::build_sampling() const {
     std::map<llama_seq_id, std::vector<int32_t>> seq_rows; // all logit rows of each sequence, in output order
     int32_t logit_row_idx = 0;
 
+    // shortlisted logits: sampler picks are compact row indices and must be mapped back to token ids
+    ggml_tensor * ids_map = res->t_logits_ids;
+
+    // Which chains can share the single argmax over all output rows below.
+    //
+    // A bare greedy chain always can. A biased greedy chain ([logit-bias, greedy], e.g. a request with
+    // ignore_eos or a model with suppress tokens) cannot: its bias has to be added to its own rows before
+    // the argmax, so it runs a private row block further down. The exception is a draft graph with a
+    // vocabulary shortlist, whose logit columns are compact shortlist positions rather than token ids: a
+    // token-indexed bias would be misapplied there, and it is not needed either, because every draft token
+    // is re-checked against the biased full-vocabulary argmax of the verification rows.
+    auto shares_argmax = [&](const llama_sampler * sampler) {
+        return llama_sampler_is_greedy_chain(sampler) ||
+               (ids_map != nullptr && llama_sampler_is_argmax_chain(sampler));
+    };
+
     for (uint32_t i = 0; i < ubatch.n_tokens; i++) {
         if (ubatch.output[i]) {
             llama_seq_id seq_id = ubatch.seq_id[i][0];
             sampling_input->output_seqs.push_back(seq_id);
             const auto it = samplers.find(seq_id);
-            if (it != samplers.end() && llama_sampler_is_greedy_chain(it->second)) {
+            if (it != samplers.end() && shares_argmax(it->second)) {
                 res->greedy_rows.push_back(logit_row_idx);
             }
             seq_to_logit_row[seq_id] = logit_row_idx;
@@ -3891,9 +3907,6 @@ void llm_graph_context::build_sampling() const {
 
     // res->t_logits will contain logits for all tokens that want the logits calculated (logits=1 or output=1)
     GGML_ASSERT(res->t_logits != nullptr && "missing t_logits tensor");
-
-    // shortlisted logits: sampler picks are compact row indices and must be mapped back to token ids
-    ggml_tensor * ids_map = res->t_logits_ids;
 
     if (!res->greedy_rows.empty()) {
         res->t_greedy_rows = ggml_argmax(ctx0, res->t_logits);
@@ -3911,13 +3924,22 @@ void llm_graph_context::build_sampling() const {
     ggml_tensor * logits_t = ggml_pad(ctx0, res->t_logits, 0, 1, 0, 0);
 
     for (const auto & [seq_id, sampler] : samplers) {
-        if (llama_sampler_is_greedy_chain(sampler)) {
+        if (shares_argmax(sampler)) {
+            continue;
+        }
+
+        // a biased greedy chain exports token ids only, so it must never reach the single-row path below
+        // (which would also export its full logit row); with no output rows in this ubatch it has nothing
+        // to sample and is left out of the graph entirely
+        const bool argmax_only = llama_sampler_is_argmax_chain(sampler);
+        if (argmax_only && seq_rows.find(seq_id) == seq_rows.end()) {
             continue;
         }
 
         // row-block sampling: a sequence with several output rows (speculative verification) runs its
         // chain once over the [n_vocab, n_rows] block of its rows and exports only the sampled ids
-        if (const auto it_rows = seq_rows.find(seq_id); it_rows != seq_rows.end() && it_rows->second.size() > 1) {
+        if (const auto it_rows = seq_rows.find(seq_id); it_rows != seq_rows.end() &&
+                (it_rows->second.size() > 1 || argmax_only)) {
             const auto & rows = it_rows->second;
             const int64_t n_rows = (int64_t) rows.size();
 

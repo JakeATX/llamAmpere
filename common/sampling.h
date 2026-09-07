@@ -54,9 +54,23 @@ void common_perf_print(const struct llama_context * ctx, const struct common_sam
 // get the underlying llama_sampler_chain
 struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl);
 
-// Returns nullptr unless the chain is equivalent to raw-logit greedy sampling.
+// Returns nullptr unless the chain is equivalent to greedy sampling, possibly behind logit biases.
+// The returned chain is [greedy], or [logit-bias, greedy] when the request carries logit biases (this is
+// how the server expresses ignore_eos) or the model declares suppress tokens. The bias is applied to the
+// logit rows on the backend, in front of the argmax, exactly as the CPU chain does. Owned by gsmpl.
 bool common_sampler_supports_greedy_backend(const common_params_sampling & params);
+
+// the bias set that chain applies in front of its argmax: the request's logit_bias followed by the model's
+// suppress tokens at -INFINITY (vocab may be null to skip the latter), with repeated tokens summed so that
+// the single backend bias row matches the CPU sampler, which adds every entry. Exposed for tests.
+std::vector<llama_logit_bias> common_sampler_greedy_biases(
+        const common_params_sampling & params, const struct llama_vocab * vocab);
+
 struct llama_sampler * common_sampler_get_greedy_backend(struct common_sampler * gsmpl, const struct llama_model * model);
+
+// after llama_set_sampler: true if the greedy chain can verify on the backend. A bare [greedy] chain always
+// can (the graph emits one argmax over the output rows for it); a biased chain must have been offloaded.
+bool common_sampler_greedy_backend_ready(const struct common_sampler * gsmpl);
 
 // sampled (temp > 0) speculative verification on the backend: true if the chain built from these params
 // runs entirely on the backend for all verification rows at once (temp, top-k, top-p, min-p, logit bias,
