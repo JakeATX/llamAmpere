@@ -436,6 +436,11 @@ extern "C" {
         // `llama-mtp-vocab-v1` map. The draft head then scores only the listed token rows and the
         // backend draft sampler maps its picks back to real token ids. NULL = full vocabulary.
         const char * draft_vocab_map;
+
+        // [EXPERIMENTAL] number of trailing entries of `draft_vocab_map` that are adaptive "hot"
+        // slots: the runtime may repoint them at token ids seen in recent requests (see
+        // llama_draft_vocab_observe / llama_draft_vocab_refresh). 0 = the map is fully static.
+        int32_t draft_vocab_hot;
     };
 
     struct llama_model_tensor_override {
@@ -1345,6 +1350,26 @@ extern "C" {
     // attach a sampler to the context
     // note: prefer initializing the context with llama_context_params.samplers when possible
     LLAMA_API bool llama_set_sampler(struct llama_context * ctx, llama_seq_id seq_id, struct llama_sampler * smpl);
+
+    //
+    // Adaptive draft vocabulary tail [EXPERIMENTAL]
+    //
+    // The last `llama_context_params.draft_vocab_hot` entries of the loaded shortlist are slots that
+    // can be repointed at token ids seen in recent traffic. Both calls are request-granularity and
+    // must be made from the thread that decodes, with no graph in flight. The state is per context
+    // and is not persisted.
+    //
+
+    // fold one request's tokens (a prompt, or a finished response) into the hot statistics
+    // no-op when the context has no shortlist or draft_vocab_hot == 0
+    LLAMA_API void llama_draft_vocab_observe(struct llama_context * ctx, const llama_token * toks, size_t n);
+
+    // re-rank the hot slots and upload the changed ids; returns the number of replaced slots
+    LLAMA_API int32_t llama_draft_vocab_refresh(struct llama_context * ctx);
+
+    // number of hot slots (0 when the tail is disabled) and of tracked candidate ids
+    LLAMA_API int32_t llama_draft_vocab_n_hot(const struct llama_context * ctx);
+    LLAMA_API size_t  llama_draft_vocab_n_candidates(const struct llama_context * ctx);
 
     // mirror of llama_sampler_i:
     LLAMA_API struct llama_sampler * llama_sampler_init  (      struct llama_sampler_i * iface, llama_sampler_context_t ctx);

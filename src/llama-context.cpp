@@ -208,7 +208,7 @@ llama_context::llama_context(
             path = getenv("LLAMA_SPEC_DRAFT_VOCAB");
         }
         if (path != nullptr && path[0] != '\0') {
-            init_draft_vocab(path);
+            init_draft_vocab(path, params.draft_vocab_hot);
         }
     }
 
@@ -573,7 +573,7 @@ llama_context::~llama_context() {
     ggml_opt_free(opt_ctx);
 }
 
-void llama_context::init_draft_vocab(const char * path) {
+void llama_context::init_draft_vocab(const char * path, int32_t n_hot) {
     std::ifstream file(path);
     if (!file) {
         throw std::runtime_error(format("cannot open draft vocabulary map '%s'", path));
@@ -601,6 +601,11 @@ void llama_context::init_draft_vocab(const char * path) {
 
     const int64_t n_sel = (int64_t) map.ids.size();
 
+    if (n_hot < 0 || (int64_t) n_hot >= n_sel) {
+        throw std::runtime_error(format("draft vocabulary hot tail of %d slots is not in [0, %lld)",
+                    n_hot, (long long) n_sel));
+    }
+
     ggml_init_params ip = { ggml_tensor_overhead(), nullptr, true };
     draft_vocab.ctx.reset(ggml_init(ip));
     draft_vocab.ids = ggml_new_tensor_1d(draft_vocab.ctx.get(), GGML_TYPE_I32, n_sel);
@@ -614,9 +619,47 @@ void llama_context::init_draft_vocab(const char * path) {
     ggml_backend_tensor_set(draft_vocab.ids, map.ids.data(), 0, (size_t) n_sel * sizeof(int32_t));
     draft_vocab.host = std::move(map.ids);
 
+    draft_vocab.n_hot = n_hot;
+    if (n_hot > 0) {
+        draft_vocab.hot.init(draft_vocab.host, n_vocab, n_hot);
+    }
+
     LLAMA_LOG_INFO("%s: draft vocabulary shortlist: %lld of %lld tokens from '%s', map on %s (%.1f KiB), head %s (%s)\n",
             __func__, (long long) n_sel, (long long) n_vocab, path, ggml_backend_buft_name(buft),
             (double) n_sel * sizeof(int32_t) / 1024.0, ggml_get_name(head), ggml_type_name(head->type));
+    if (n_hot > 0) {
+        LLAMA_LOG_INFO("%s: draft vocabulary tail: %d of %lld entries are adaptive hot slots\n",
+                __func__, n_hot, (long long) n_sel);
+    }
+}
+
+void llama_context::draft_vocab_observe(const llama_token * toks, size_t n) {
+    if (draft_vocab.n_hot <= 0 || toks == nullptr || n == 0) {
+        return;
+    }
+    draft_vocab.hot.observe(toks, n);
+}
+
+int32_t llama_context::draft_vocab_refresh() {
+    if (draft_vocab.n_hot <= 0 || draft_vocab.ids == nullptr) {
+        return 0;
+    }
+    const auto reps = draft_vocab.hot.select();
+    if (reps.empty()) {
+        return 0;
+    }
+
+    const int64_t n_sel = draft_vocab.ids->ne[0];
+    const int64_t base  = n_sel - draft_vocab.n_hot;
+    for (const auto & rep : reps) {
+        draft_vocab.host[base + rep.slot] = rep.id;
+    }
+
+    // one upload of the whole hot region: cheap at request granularity and keeps the tensor fixed
+    ggml_backend_tensor_set(draft_vocab.ids, draft_vocab.host.data() + base,
+            (size_t) base * sizeof(int32_t), (size_t) draft_vocab.n_hot * sizeof(int32_t));
+
+    return (int32_t) reps.size();
 }
 
 void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs) {
@@ -3940,6 +3983,7 @@ llama_context_params llama_context_default_params() {
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
         /*.draft_vocab_map             =*/ nullptr,
+        /*.draft_vocab_hot             =*/ 0,
     };
 
     return result;
@@ -4253,6 +4297,22 @@ float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {
 
 bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler * smpl) {
     return ctx->set_sampler(seq_id, smpl);
+}
+
+void llama_draft_vocab_observe(llama_context * ctx, const llama_token * toks, size_t n) {
+    ctx->draft_vocab_observe(toks, n);
+}
+
+int32_t llama_draft_vocab_refresh(llama_context * ctx) {
+    return ctx->draft_vocab_refresh();
+}
+
+int32_t llama_draft_vocab_n_hot(const llama_context * ctx) {
+    return ctx->draft_vocab_n_hot();
+}
+
+size_t llama_draft_vocab_n_candidates(const llama_context * ctx) {
+    return ctx->draft_vocab_n_candidates();
 }
 
 llama_token llama_get_sampled_token_ith(llama_context * ctx, int32_t i) {

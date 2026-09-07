@@ -7,6 +7,7 @@
 #include "llama-adapter.h"
 #include "llama-impl.h"
 #include "llama-memory.h"
+#include "llama-mtp-vocab.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -265,7 +266,14 @@ public:
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
     // parse a `llama-mtp-vocab-v1` map and upload it to the head's device (throws on error)
-    void init_draft_vocab(const char * path);
+    // the last `n_hot` entries become adaptive slots, see llama_draft_vocab_observe/refresh
+    void init_draft_vocab(const char * path, int32_t n_hot);
+
+    // adaptive draft-vocabulary tail (request granularity, must not race with a graph)
+    void    draft_vocab_observe(const llama_token * toks, size_t n);
+    int32_t draft_vocab_refresh();
+    int32_t draft_vocab_n_hot()        const { return draft_vocab.n_hot; }
+    size_t  draft_vocab_n_candidates() const { return draft_vocab.hot.cands.size(); }
 
 private:
     llm_graph_params graph_params(
@@ -344,6 +352,8 @@ private:
         ggml_backend_buffer_ptr buf;
         ggml_tensor           * ids = nullptr; // [n_sel]
         std::vector<int32_t>    host;          // same ids, host copy
+        int32_t                 n_hot = 0;     // trailing adaptive slots (0 = fully static map)
+        llama_mtp_hot_vocab     hot;           // ranking policy for those slots
     };
 
     draft_vocab_info draft_vocab;
