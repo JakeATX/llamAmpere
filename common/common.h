@@ -334,6 +334,7 @@ struct common_params_speculative_draft {
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 
     std::string vocab_map; // draft-only vocabulary shortlist map for the MTP draft head (empty = full vocabulary)
+    int32_t vocab_hot = 0; // trailing entries of that map kept adaptive: repointed at ids seen in recent requests
 
     common_params_model mparams;
 

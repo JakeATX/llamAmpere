@@ -2837,7 +2837,11 @@ common_speculative_init_result::common_speculative_init_result(
         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
         if (!params.speculative.draft.vocab_map.empty()) {
             cparams.draft_vocab_map = params.speculative.draft.vocab_map.c_str();
+            cparams.draft_vocab_hot = params.speculative.draft.vocab_hot;
             LOG_INF("%s: MTP draft context uses the draft-only vocabulary shortlist '%s'\n", __func__, cparams.draft_vocab_map);
+            if (cparams.draft_vocab_hot > 0) {
+                LOG_INF("%s: the last %d entries of the shortlist are adaptive hot slots\n", __func__, cparams.draft_vocab_hot);
+            }
         }
     }
 
@@ -2889,6 +2893,24 @@ llama_model * common_speculative_init_result::model() {
 
 llama_context * common_speculative_init_result::context() {
     return pimpl->context.get();
+}
+
+void common_speculative_observe(common_speculative_init_result * spec, const llama_tokens & toks) {
+    if (spec == nullptr || toks.empty()) {
+        return;
+    }
+    llama_context * ctx = spec->context();
+    if (ctx != nullptr) {
+        llama_draft_vocab_observe(ctx, toks.data(), toks.size());
+    }
+}
+
+int32_t common_speculative_refresh(common_speculative_init_result * spec) {
+    if (spec == nullptr) {
+        return 0;
+    }
+    llama_context * ctx = spec->context();
+    return ctx == nullptr ? 0 : llama_draft_vocab_refresh(ctx);
 }
 
 common_speculative_init_result_ptr common_speculative_init_from_params(common_params & params, llama_model * model_tgt, llama_context * ctx_tgt) {

@@ -420,6 +420,9 @@ struct server_slot {
     std::string  debug_generated_text;
     llama_tokens generated_tokens;
 
+    // true once this request's output was folded into the adaptive draft-vocabulary tail
+    bool draft_vocab_observed = false;
+
     std::vector<completion_token_output> generated_token_probs;
 
     bool has_next_token = true;
@@ -539,6 +542,7 @@ struct server_slot {
         }
         generated_tokens.clear();
         generated_token_probs.clear();
+        draft_vocab_observed = false;
         json_schema = json();
 
         // clear speculative decoding stats
@@ -708,9 +712,27 @@ struct server_slot {
         prompt.tokens.insert(spec_draft);
     }
 
+    // adaptive draft-vocabulary tail: fold this request's output into the hot statistics.
+    // generated_tokens is only filled when the task asked for its tokens back, so take the generated
+    // tail of the slot's own sequence instead. The refresh happens at the next request's prompt.
+    void draft_vocab_observe_generated() {
+        if (ctx_dft == nullptr || draft_vocab_observed || n_decoded <= 0) {
+            return;
+        }
+        draft_vocab_observed = true;
+        if (llama_draft_vocab_n_hot(ctx_dft) <= 0) {
+            return;
+        }
+        const auto & toks = prompt.tokens.get_tokens();
+        const size_t n    = std::min((size_t) n_decoded, toks.size());
+        llama_draft_vocab_observe(ctx_dft, toks.data() + (toks.size() - n), n);
+    }
+
     void release() {
         if (is_processing()) {
             GGML_ASSERT(task);
+
+            draft_vocab_observe_generated();
 
             SLT_INF(*this, "stop processing: n_tokens = %d, truncated = %d\n", prompt.n_tokens(), truncated);
 
@@ -2439,6 +2461,8 @@ private:
     }
 
     void send_final_response(server_slot & slot) {
+        slot.draft_vocab_observe_generated();
+
         auto res = std::make_unique<server_task_result_cmpl_final>();
 
         res->id      = slot.task->id;
@@ -3851,6 +3875,17 @@ private:
                                 // otherwise, for streaming without progress, signal HTTP to send the headers (i.e. 200 status)
                                 send_partial_response(slot, {}, false, true);
                             }
+                        }
+                        // adaptive draft-vocabulary tail: make this prompt's own ids hot before it is
+                        // decoded, then re-rank the slots. Request granularity, no graph in flight.
+                        if (ctx_dft && llama_draft_vocab_n_hot(ctx_dft) > 0) {
+                            common_speculative_observe(spec_init.get(), input_tokens.get_tokens());
+
+                            const int32_t n_replaced = common_speculative_refresh(spec_init.get());
+
+                            SLT_INF(slot, "draft vocab hot: %d/%d slots replaced, %zu candidates\n",
+                                    n_replaced, llama_draft_vocab_n_hot(ctx_dft),
+                                    llama_draft_vocab_n_candidates(ctx_dft));
                         }
                     } // end of SLOT_STATE_STARTED
 
