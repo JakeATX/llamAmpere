@@ -177,8 +177,10 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
 template <int DKQ, int DV, ggml_type type_K, ggml_type type_V>
 static void ggml_cuda_flash_attn_ext_mma_turbo_dispatch_ncols1_8(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0]; // ncols2 == 8: (1,8),(2,8),(4,8)
-    // research knob: GGML_Q8_TURBO3_MMA_NCOLS1_MIN=2 pads single queries into the (2,8) instance, which is faster at long KV
-    static const int ncols1_min = [] { const char * e = getenv("GGML_Q8_TURBO3_MMA_NCOLS1_MIN"); const int v = e ? atoi(e) : 1; return (v == 2 || v == 4) ? v : 1; }();
+    // GGML_Q8_TURBO3_MMA_NCOLS1_MIN pads single queries into the (2,8) instance. Default 2 since P5b:
+    // the (1,8) instance runs 84 blocks at 4% occupancy (883 us at 100K under ncu) while the padded
+    // (2,8) route runs 252 blocks (390 vs 700 us/launch in test-backend-ops perf). Set =1 to disable.
+    static const int ncols1_min = [] { const char * e = getenv("GGML_Q8_TURBO3_MMA_NCOLS1_MIN"); const int v = e ? atoi(e) : 2; return (v == 1 || v == 2 || v == 4) ? v : 2; }();
     if (Q->ne[1] <= 1 && ncols1_min == 1) { ggml_cuda_flash_attn_ext_mma_turbo_case<DKQ, DV, 1, 8, type_K, type_V>(ctx, dst); return; }
     if (Q->ne[1] <= 2 && ncols1_min <= 2) { ggml_cuda_flash_attn_ext_mma_turbo_case<DKQ, DV, 2, 8, type_K, type_V>(ctx, dst); return; }
     if constexpr (DKQ == 256 && DV == 256 && type_K == GGML_TYPE_Q8_0 && type_V == GGML_TYPE_TURBO3_0) {
@@ -254,22 +256,25 @@ static bool ggml_cuda_turbo_mma_fused() {
     return v;
 }
 
-// Experimental target-specific path: keep opt-in until Q8-K/Turbo3-V output
-// tolerance, ragged masking, and end-to-end crossover tests are complete.
+// Fused Q8_0-K / TURBO3-V MMA path. Default ON since P5b (2026-09-09): D7/D7b census and the
+// P5a temp-1.0 ABBA showed it beats the vector and generic-MMA routes at every verify width
+// 1..5 for D=256. Set GGML_Q8_TURBO3_MMA_FUSED=0 to fall back to the pre-P5b routing.
 static bool ggml_cuda_q8_turbo3_mma_fused() {
     static const bool value = [] {
         const char * env = getenv("GGML_Q8_TURBO3_MMA_FUSED");
-        return env != nullptr && env[0] == '1';
+        return env == nullptr || env[0] != '0';
     }();
     return value;
 }
 
-// research knob: smallest query width routed to the q8_0/turbo3 MMA path (default 3 keeps widths 1-2 on the vector kernel)
+// smallest query width routed to the q8_0/turbo3 MMA path. Default 1 since P5b: width-1
+// fused MMA is 797 us vs 1418 us for the vector kernel at 100K (D7b), width-2 434 us vs the
+// generic MMA + f16 temporaries. GGML_Q8_TURBO3_MMA_MIN_Q=3 restores the pre-P5b routing.
 static int ggml_cuda_q8_turbo3_mma_min_q() {
     static const int value = [] {
         const char * env = getenv("GGML_Q8_TURBO3_MMA_MIN_Q");
-        const int v = env ? atoi(env) : 3;
-        return (v >= 1 && v <= 5) ? v : 3;
+        const int v = env ? atoi(env) : 1;
+        return (v >= 1 && v <= 5) ? v : 1;
     }();
     return value;
 }
