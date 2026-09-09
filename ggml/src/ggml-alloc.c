@@ -961,12 +961,23 @@ static bool ggml_gallocr_reserve_n_impl(
                 // adopt the donor's buffer when every chunk is large enough (the graphs never run concurrently)
                 struct vbuffer * db = galloc->donor->buffers[i];
                 bool fits = true;
+                size_t need_total = 0;
+                size_t cap_total  = 0;
                 for (int c = 0; c < galloc->buf_tallocs[i]->n_chunks; c++) {
-                    if (ggml_dyn_tallocr_max_size(galloc->buf_tallocs[i], c) > ggml_vbuffer_chunk_size(db, c)) {
+                    const size_t need = ggml_dyn_tallocr_max_size(galloc->buf_tallocs[i], c);
+                    const size_t cap  = ggml_vbuffer_chunk_size(db, c);
+                    need_total += need;
+                    cap_total  += cap;
+                    if (need > cap) {
                         fits = false;
-                        break;
                     }
                 }
+                // Structured donor-arena record (P1a). One line per reserve that consults the donor:
+                // capacity of the donor buffer, bytes this graph needs, and the private fallback size.
+                // Grep for "donor_arena:" to read it; the cliff seen at 220K is need > cap by one row.
+                GGML_LOG_INFO("donor_arena: buft=%s chunks=%d cap_bytes=%zu need_bytes=%zu fits=%d private_bytes=%zu cap_mib=%.2f need_mib=%.2f\n",
+                    ggml_backend_buft_name(galloc->bufts[i]), galloc->buf_tallocs[i]->n_chunks, cap_total, need_total, fits ? 1 : 0,
+                    fits ? (size_t) 0 : new_size, cap_total / 1024.0 / 1024.0, need_total / 1024.0 / 1024.0);
                 if (fits) {
                     db->refs++;
                     galloc->buffers[i] = db;

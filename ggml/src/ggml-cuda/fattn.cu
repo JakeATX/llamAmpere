@@ -6,6 +6,52 @@
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
 
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <map>
+#include <mutex>
+#include <string>
+
+// Flash-attention path census, opt-in via GGML_FATTN_PATH_STATS=1.
+// Counts every ggml_cuda_flash_attn_ext dispatch keyed by (path, K type, V type,
+// n_q = Q->ne[1], gqa_ratio, ncols2 when the MMA path packs GQA). Dumped to stderr at
+// exit. Purpose (W5): prove or kill the premise that an f16 draft K/V cache routes the
+// drafter's width-1 attention onto the GQA-packed MMA path instead of VEC.
+static bool ggml_cuda_fattn_path_stats_enabled() {
+    static const bool enabled = [] { const char * e = getenv("GGML_FATTN_PATH_STATS"); return e && e[0] == '1'; }();
+    return enabled;
+}
+
+static void ggml_cuda_fattn_path_note(const char * path, const ggml_tensor * dst, int ncols2) {
+    if (!ggml_cuda_fattn_path_stats_enabled()) {
+        return;
+    }
+    static std::mutex mtx;
+    static std::map<std::string, uint64_t> counts;
+    static const bool registered = [] {
+        atexit([] {
+            std::lock_guard<std::mutex> lock(mtx);
+            fprintf(stderr, "fattn_path_stats: begin (%zu keys)\n", counts.size());
+            for (const auto & kv : counts) {
+                fprintf(stderr, "fattn_path_stats: %s count=%llu\n", kv.first.c_str(), (unsigned long long) kv.second);
+            }
+            fprintf(stderr, "fattn_path_stats: end\n");
+        });
+        return true;
+    }();
+    GGML_UNUSED(registered);
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    char key[256];
+    snprintf(key, sizeof(key), "path=%s K=%s V=%s D=%d n_q=%d gqa=%d ncols2=%d kv_len_bucket=%dk",
+        path, ggml_type_name(K->type), ggml_type_name(V->type), (int) Q->ne[0], (int) Q->ne[1],
+        (int) (Q->ne[2] / K->ne[2]), ncols2, (int) (K->ne[1] / 1024));
+    std::lock_guard<std::mutex> lock(mtx);
+    counts[key]++;
+}
+
 template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -67,21 +113,25 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
     // On Volta the GQA optimizations aren't as impactful vs. minimizing wasted compute:
     if (cc == GGML_CUDA_CC_VOLTA) {
         if (use_gqa_opt && gqa_ratio % 8 == 0) {
+            ggml_cuda_fattn_path_note("mma_f16", dst, 8);
             ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8>(ctx, dst);
             return;
         }
 
         if (use_gqa_opt && gqa_ratio % 4 == 0) {
+            ggml_cuda_fattn_path_note("mma_f16", dst, 4);
             ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 4>(ctx, dst);
             return;
         }
 
         if constexpr (DKQ <= 256) {
             if (use_gqa_opt && gqa_ratio % 2 == 0) {
+                ggml_cuda_fattn_path_note("mma_f16", dst, 2);
                 ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 2>(ctx, dst);
                 return;
             }
 
+            ggml_cuda_fattn_path_note("mma_f16", dst, 1);
             ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 1>(ctx, dst);
             return;
         } else {
@@ -90,21 +140,25 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
     }
 
     if (use_gqa_opt && gqa_ratio > 4) {
+        ggml_cuda_fattn_path_note("mma_f16", dst, 8);
         ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8>(ctx, dst);
         return;
     }
 
     if (use_gqa_opt && gqa_ratio > 2) {
+        ggml_cuda_fattn_path_note("mma_f16", dst, 4);
         ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 4>(ctx, dst);
         return;
     }
 
     if (use_gqa_opt && gqa_ratio > 1) {
+        ggml_cuda_fattn_path_note("mma_f16", dst, 2);
         ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 2>(ctx, dst);
         return;
     }
 
     if constexpr (DKQ <= 256) {
+        ggml_cuda_fattn_path_note("mma_f16", dst, 1);
         ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 1>(ctx, dst);
     } else {
         GGML_ABORT("fatal error");
@@ -822,6 +876,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
         if (ggml_cuda_q8_turbo3_mma_fused() && K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_TURBO3_0 &&
                 Q->ne[0] == 256 && V->ne[0] == 256 && Q->ne[1] >= ggml_cuda_q8_turbo3_mma_min_q() && Q->ne[1] <= 5 && turing_mma_available(cc)) {
+            ggml_cuda_fattn_path_note("q8_turbo3_fused", dst, -1);
             ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_Q8_0, GGML_TYPE_TURBO3_0>(ctx, dst);
             return;
         }
@@ -842,6 +897,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             (K->type == GGML_TYPE_TURBO4_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO2_0));
         if (ggml_cuda_turbo_mma_fused() && turbo_matched
                 && Q->ne[1] <= 4 && V->ne[0] == Q->ne[0] && turing_mma_available(cc)) {
+            ggml_cuda_fattn_path_note("turbo_fused_gate", dst, -1);
             if (Q->ne[0] == 128) {
                 switch (K->type) {
                     case GGML_TYPE_TURBO4_0: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<128, 128, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0>(ctx, dst); return;
@@ -870,9 +926,11 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
         case BEST_FATTN_KERNEL_TILE:
+            ggml_cuda_fattn_path_note("tile", dst, 0);
             ggml_cuda_flash_attn_ext_tile(ctx, dst);
             break;
         case BEST_FATTN_KERNEL_VEC:
+            ggml_cuda_fattn_path_note("vec", dst, 0);
             ggml_cuda_flash_attn_ext_vec(ctx, dst);
             break;
         case BEST_FATTN_KERNEL_MMA_F16:
