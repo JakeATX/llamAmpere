@@ -58,10 +58,11 @@ void ggml_cuda_flash_attn_ext_mma_turbo_case(ggml_backend_cuda_context & ctx, gg
         const size_t stage_off = ggml_cuda_fattn_align16((int) (Q_in_reg ?
             std::max(nbytes_shared_Q, nbytes_shared_KV + nbytes_shared_mask) :
             nbytes_shared_Q + nbytes_shared_KV + nbytes_shared_mask));
-        // K rows are copied with 16-byte cp.async, V rows with 4-byte cp.async (100-byte turbo3 rows)
+        // K rows (and q8_0 V rows) are copied with 16-byte cp.async, turbo3 V rows with 4-byte cp.async (100-byte rows)
+        constexpr int v_align = type_V == GGML_TYPE_Q8_0 ? 16 : 4;
         GGML_ASSERT(dst->src[1]->nb[1] % 16 == 0 && dst->src[1]->nb[2] % 16 == 0 && ((uintptr_t) dst->src[1]->data) % 16 == 0);
-        GGML_ASSERT(dst->src[2]->nb[1] %  4 == 0 && dst->src[2]->nb[2] %  4 == 0 && ((uintptr_t) dst->src[2]->data) %  4 == 0);
-        nbytes_shared_total = std::max(nbytes_shared_total, stage_off + (size_t) nbatch_fa * (ggml_cuda_fattn_turbo_stage_k_row<DKQ>() + ggml_cuda_fattn_turbo_stage_v_row<DV>()));
+        GGML_ASSERT(dst->src[2]->nb[1] % v_align == 0 && dst->src[2]->nb[2] % v_align == 0 && ((uintptr_t) dst->src[2]->data) % v_align == 0);
+        nbytes_shared_total = std::max(nbytes_shared_total, stage_off + (size_t) nbatch_fa * (ggml_cuda_fattn_turbo_stage_k_row<DKQ>() + ggml_cuda_fattn_turbo_stage_v_row<DV, type_V>()));
     }
 
     float logit_softcap;
@@ -128,3 +129,5 @@ DECL_FATTN_MMA_TURBO_ALL(128, 128, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO2_0);
 DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO2_0);
 DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_Q8_0, GGML_TYPE_TURBO3_0);
 extern DECL_FATTN_MMA_TURBO_CASE(256, 256, 8, 8, GGML_TYPE_Q8_0, GGML_TYPE_TURBO3_0);
+DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0);
+extern DECL_FATTN_MMA_TURBO_CASE(256, 256, 8, 8, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0);

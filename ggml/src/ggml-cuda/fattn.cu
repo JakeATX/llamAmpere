@@ -183,7 +183,7 @@ static void ggml_cuda_flash_attn_ext_mma_turbo_dispatch_ncols1_8(ggml_backend_cu
     static const int ncols1_min = [] { const char * e = getenv("GGML_Q8_TURBO3_MMA_NCOLS1_MIN"); const int v = e ? atoi(e) : 2; return (v == 1 || v == 2 || v == 4) ? v : 2; }();
     if (Q->ne[1] <= 1 && ncols1_min == 1) { ggml_cuda_flash_attn_ext_mma_turbo_case<DKQ, DV, 1, 8, type_K, type_V>(ctx, dst); return; }
     if (Q->ne[1] <= 2 && ncols1_min <= 2) { ggml_cuda_flash_attn_ext_mma_turbo_case<DKQ, DV, 2, 8, type_K, type_V>(ctx, dst); return; }
-    if constexpr (DKQ == 256 && DV == 256 && type_K == GGML_TYPE_Q8_0 && type_V == GGML_TYPE_TURBO3_0) {
+    if constexpr (DKQ == 256 && DV == 256 && type_K == GGML_TYPE_Q8_0 && (type_V == GGML_TYPE_TURBO3_0 || type_V == GGML_TYPE_Q8_0)) {
         if (Q->ne[1] > 4) { ggml_cuda_flash_attn_ext_mma_turbo_case<DKQ, DV, 8, 8, type_K, type_V>(ctx, dst); return; }
     }
     ggml_cuda_flash_attn_ext_mma_turbo_case<DKQ, DV, 4, 8, type_K, type_V>(ctx, dst); // Q->ne[1] in {3,4}
@@ -883,6 +883,14 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                 Q->ne[0] == 256 && V->ne[0] == 256 && Q->ne[1] >= ggml_cuda_q8_turbo3_mma_min_q() && Q->ne[1] <= 5 && turing_mma_available(cc)) {
             ggml_cuda_fattn_path_note("q8_turbo3_fused", dst, -1);
             ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_Q8_0, GGML_TYPE_TURBO3_0>(ctx, dst);
+            return;
+        }
+        // Same fused path for a q8_0 K / q8_0 V cache (e.g. the MTP draft cache): identical staging and
+        // K decode, V decoded with the q8_0 tile loader instead of turbo3. Same routing knobs.
+        if (ggml_cuda_q8_turbo3_mma_fused() && K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0 &&
+                Q->ne[0] == 256 && V->ne[0] == 256 && Q->ne[1] >= ggml_cuda_q8_turbo3_mma_min_q() && Q->ne[1] <= 5 && turing_mma_available(cc)) {
+            ggml_cuda_fattn_path_note("q8_q8_fused", dst, -1);
+            ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0>(ctx, dst);
             return;
         }
     }
