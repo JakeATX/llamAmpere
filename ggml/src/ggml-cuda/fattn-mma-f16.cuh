@@ -571,9 +571,24 @@ static __constant__ float TURBO_CENTROIDS_3BIT_FATTN[8] = {
      0.021663f,  0.066822f,  0.118786f,  0.190207f
 };
 
-// Q8_0 tile loader for the fused mixed-KV MMA path. Each lane decodes eight
-// consecutive values (four half2) per iteration and writes one aligned uint4;
-// the per-value math is unchanged from the pairwise loader (d * q in half).
+// bit-cast helpers for the conversion-free loaders (P5 L1)
+static __device__ __forceinline__ half2 ggml_cuda_u32_as_half2(const uint32_t x) {
+    half2 r; memcpy(&r, &x, sizeof(r)); return r;
+}
+static __device__ __forceinline__ uint32_t ggml_cuda_half2_as_u32(const half2 x) {
+    uint32_t r; memcpy(&r, &x, sizeof(r)); return r;
+}
+static __device__ __forceinline__ half2 __ushort_as_half2_pair(const uint16_t bits) {
+    return ggml_cuda_u32_as_half2(((uint32_t) bits << 16) | bits);
+}
+
+// Q8_0 tile loader for the fused mixed-KV MMA path (P5 L1, conversion-free).
+// Each lane decodes eight consecutive values (four half2) per iteration and writes one
+// aligned uint4. int8 -> half is done without I2F: the byte is XORed with 0x80 (u = q+128,
+// 0..255) and placed in the low byte of an fp16 word whose high byte is 0x64, which is
+// exactly 1024+u in fp16 (ulp is 1 on [1024,2048)); subtracting 1152 (0x6480) is exact and
+// gives q. The final d*q multiply is the same __hmul2 as the old loader, so the result is
+// bit-identical to d2 * make_half2(q0, q1).
 template<int stride_tile, int nbatch_fa, int nthreads, int D2, bool oob_check>
 static __device__ __forceinline__ void flash_attn_ext_q8_0_load_tile(
         const char * const __restrict__ KV_raw, half2 * const __restrict__ tile_KV,
@@ -584,6 +599,8 @@ static __device__ __forceinline__ void flash_attn_ext_q8_0_load_tile(
     static_assert(D2 % half2_per_chunk == 0, "D2 must be a multiple of 4");
     constexpr int chunks_per_row = D2 / half2_per_chunk;
     constexpr int nchunks = nbatch_fa * chunks_per_row;
+
+    const half2 bias = __ushort_as_half2_pair(0x6480); // (1152, 1152)
 
     for (int linear = tid; linear < nchunks; linear += nthreads) {
         const int row = linear / chunks_per_row;
@@ -601,15 +618,14 @@ static __device__ __forceinline__ void flash_attn_ext_q8_0_load_tile(
         const half2 d2 = __half2half2(block.d);
         // block.qs + iq is 2-byte aligned (sizeof(block_q8_0) == 34, iq even)
         const uint16_t * qp = (const uint16_t *) (block.qs + iq);
+        const uint32_t w0 = __byte_perm((uint32_t) qp[0], (uint32_t) qp[1], 0x5410) ^ 0x80808080u; // q0..q3 + 128
+        const uint32_t w1 = __byte_perm((uint32_t) qp[2], (uint32_t) qp[3], 0x5410) ^ 0x80808080u; // q4..q7 + 128
         uint4 decoded;
         half2 * values = reinterpret_cast<half2 *>(&decoded);
-#pragma unroll
-        for (int i = 0; i < half2_per_chunk; ++i) {
-            const uint16_t qq = qp[i];
-            const int8_t q0 = (int8_t) (qq & 0xFF);
-            const int8_t q1 = (int8_t) (qq >> 8);
-            values[i] = d2 * make_half2(q0, q1);
-        }
+        values[0] = d2 * __hsub2(ggml_cuda_u32_as_half2(__byte_perm(w0, 0x64646464u, 0x5140)), bias);
+        values[1] = d2 * __hsub2(ggml_cuda_u32_as_half2(__byte_perm(w0, 0x64646464u, 0x7362)), bias);
+        values[2] = d2 * __hsub2(ggml_cuda_u32_as_half2(__byte_perm(w1, 0x64646464u, 0x5140)), bias);
+        values[3] = d2 * __hsub2(ggml_cuda_u32_as_half2(__byte_perm(w1, 0x64646464u, 0x7362)), bias);
         *reinterpret_cast<uint4 *>(tile_KV + row * stride_tile + col) = decoded;
     }
 }
@@ -678,8 +694,15 @@ static __device__ __forceinline__ float flash_attn_ext_turbo3_centroid(const uin
     return __uint_as_float(__float_as_uint(mag) | ((sign ^ 1u) << 31));
 }
 
-// Mixed Q8-K/Turbo3-V variant: distribute packed V elements across lanes so
-// global reads and shared-memory stores are contiguous within a cache row.
+// Mixed Q8-K/Turbo3-V variant (P5 L1, conversion-free): distribute packed V elements
+// across lanes so global reads and shared-memory stores are contiguous within a cache
+// row. Decoding is a byte-permute table lookup instead of per-value select/multiply/
+// convert chains: the eight 3-bit indices of a chunk are spread into the eight nibbles
+// of one word (idx = q | sign<<2, matching TURBO_CENTROIDS_3BIT_FATTN order), the eight
+// centroid*norm fp16 values are built once per chunk and split into a low-byte table
+// and a high-byte table (8 bytes each, i.e. two PRMT source registers), and each PRMT
+// then resolves four indices at once. The table entries are rn(centroid_f32 * norm_f32)
+// exactly as before, so the decoded tile is bit-identical to the old loader.
 template<int stride_tile, int nbatch_fa, int nthreads, int D2, bool oob_check, bool stream_loads = true>
 static __device__ __forceinline__ void flash_attn_ext_turbo3_load_tile_flat(
         const char * const __restrict__ KV_raw, half2 * const __restrict__ tile_KV,
@@ -705,37 +728,49 @@ static __device__ __forceinline__ void flash_attn_ext_turbo3_load_tile_flat(
         const char * row_ptr = KV_raw + (int64_t)row * stride_bytes;
         const int j0 = 2 * (col_offset + col);
         const block_turbo3_0 * blk = (const block_turbo3_0 *) row_ptr + j0 / QK_TURBO3;
-        const int in_blk = j0 % QK_TURBO3;
-        float norm; uint8_t qs_byte0, qs_byte1, sgn_byte;
+        const int in_blk = j0 % QK_TURBO3; // multiple of 8: qs offset in_blk/4 is even -> 16-bit aligned
+        const uint16_t * qsp = (const uint16_t *) (blk->qs + in_blk / 4);
+        float norm; uint32_t qs16, sgn;
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
         if constexpr (stream_loads) { // global source: streaming loads
-            norm     = __half2float(__ldcs((const half *)&blk->norm));
-            qs_byte0 = __ldcs(&blk->qs[in_blk / 4 + 0]);
-            qs_byte1 = __ldcs(&blk->qs[in_blk / 4 + 1]);
-            sgn_byte = __ldcs(&blk->signs[in_blk / 8]);
+            norm = __half2float(__ldcs((const half *)&blk->norm));
+            qs16 = __ldcs(qsp);
+            sgn  = __ldcs(&blk->signs[in_blk / 8]);
         } else
 #endif
         { // shared-memory source (staged tile)
-            norm     = __half2float(blk->norm);
-            qs_byte0 = blk->qs[in_blk / 4 + 0];
-            qs_byte1 = blk->qs[in_blk / 4 + 1];
-            sgn_byte = blk->signs[in_blk / 8];
+            norm = __half2float(blk->norm);
+            qs16 = *qsp;
+            sgn  = blk->signs[in_blk / 8];
         }
+
+        // spread the eight 2-bit magnitudes (bits 2j..2j+1) into nibbles j, then OR the sign bit in at bit 2
+        uint32_t x = qs16;
+        x = (x | (x << 8)) & 0x00FF00FFu;
+        x = (x | (x << 4)) & 0x0F0F0F0Fu;
+        x = (x | (x << 2)) & 0x33333333u;
+        uint32_t s = sgn;
+        s = (s | (s << 12)) & 0x000F000Fu;
+        s = (s | (s << 6))  & 0x03030303u;
+        s = (s | (s << 3))  & 0x11111111u;
+        const uint32_t idx = x | (s << 2);
+
+        // per-chunk fp16 table T[0..7] = norm * {-m3,-m2,-m1,-m0, m0,m1,m2,m3}
+        const uint32_t W0 = ggml_cuda_half2_as_u32(__floats2half2_rn(-0.190207f * norm, -0.118786f * norm));
+        const uint32_t W1 = ggml_cuda_half2_as_u32(__floats2half2_rn(-0.066822f * norm, -0.021663f * norm));
+        const uint32_t W2 = ggml_cuda_half2_as_u32(__floats2half2_rn( 0.021663f * norm,  0.066822f * norm));
+        const uint32_t W3 = ggml_cuda_half2_as_u32(__floats2half2_rn( 0.118786f * norm,  0.190207f * norm));
+        const uint32_t A_lo = __byte_perm(W0, W1, 0x6420), A_hi = __byte_perm(W0, W1, 0x7531); // T0..T3 low / high bytes
+        const uint32_t B_lo = __byte_perm(W2, W3, 0x6420), B_hi = __byte_perm(W2, W3, 0x7531); // T4..T7
+
+        const uint32_t sel0 = idx & 0xFFFFu, sel1 = idx >> 16;
+        const uint32_t lo0 = __byte_perm(A_lo, B_lo, sel0), hi0 = __byte_perm(A_hi, B_hi, sel0); // values 0..3
+        const uint32_t lo1 = __byte_perm(A_lo, B_lo, sel1), hi1 = __byte_perm(A_hi, B_hi, sel1); // values 4..7
         uint4 decoded;
-        half2 * values = reinterpret_cast<half2 *>(&decoded);
-#pragma unroll
-        for (int i = 0; i < half2_per_chunk; ++i) {
-            const uint8_t qs_byte = i < 2 ? qs_byte0 : qs_byte1;
-            const int shift = (i & 1) * 4;
-            const int sign_shift = 2 * i;
-            const uint32_t q0 = (qs_byte  >> shift)            & 0x3;
-            const uint32_t q1 = (qs_byte  >> (shift + 2))      & 0x3;
-            const uint32_t s0 = (sgn_byte >> sign_shift)       & 0x1;
-            const uint32_t s1 = (sgn_byte >> (sign_shift + 1)) & 0x1;
-            values[i] = make_half2(
-                flash_attn_ext_turbo3_centroid(q0, s0) * norm,
-                flash_attn_ext_turbo3_centroid(q1, s1) * norm);
-        }
+        decoded.x = __byte_perm(lo0, hi0, 0x5140);
+        decoded.y = __byte_perm(lo0, hi0, 0x7362);
+        decoded.z = __byte_perm(lo1, hi1, 0x5140);
+        decoded.w = __byte_perm(lo1, hi1, 0x7362);
         *reinterpret_cast<uint4 *>(tile_KV + row * stride_tile + col) = decoded;
     }
 }
