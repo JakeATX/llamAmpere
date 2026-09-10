@@ -279,6 +279,18 @@ static int ggml_cuda_q8_turbo3_mma_min_q() {
     return value;
 }
 
+// largest query width routed to the fused q8_0-K MMA paths. Default 5 (P6): MTP depth 3/4 verify widths.
+// DF3: the (8,8) instance is a full eight-row tile, so widths 6..8 (DFlash2 block_size 8 verify) can use it
+// instead of falling to the generic mma_f16 dequant path. GGML_Q8_TURBO3_MMA_MAX_Q=8 enables that.
+static int ggml_cuda_q8_turbo3_mma_max_q() {
+    static const int value = [] {
+        const char * env = getenv("GGML_Q8_TURBO3_MMA_MAX_Q");
+        const int v = env ? atoi(env) : 5;
+        return (v >= 5 && v <= 8) ? v : 5;
+    }();
+    return value;
+}
+
 static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const ggml_tensor * KQV  = dst;
@@ -880,7 +892,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         const ggml_tensor * V = dst->src[2];
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
         if (ggml_cuda_q8_turbo3_mma_fused() && K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_TURBO3_0 &&
-                Q->ne[0] == 256 && V->ne[0] == 256 && Q->ne[1] >= ggml_cuda_q8_turbo3_mma_min_q() && Q->ne[1] <= 5 && turing_mma_available(cc)) {
+                Q->ne[0] == 256 && V->ne[0] == 256 && Q->ne[1] >= ggml_cuda_q8_turbo3_mma_min_q() && Q->ne[1] <= ggml_cuda_q8_turbo3_mma_max_q() && turing_mma_available(cc)) {
             ggml_cuda_fattn_path_note("q8_turbo3_fused", dst, -1);
             ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_Q8_0, GGML_TYPE_TURBO3_0>(ctx, dst);
             return;
@@ -888,7 +900,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         // Same fused path for a q8_0 K / q8_0 V cache (e.g. the MTP draft cache): identical staging and
         // K decode, V decoded with the q8_0 tile loader instead of turbo3. Same routing knobs.
         if (ggml_cuda_q8_turbo3_mma_fused() && K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0 &&
-                Q->ne[0] == 256 && V->ne[0] == 256 && Q->ne[1] >= ggml_cuda_q8_turbo3_mma_min_q() && Q->ne[1] <= 5 && turing_mma_available(cc)) {
+                Q->ne[0] == 256 && V->ne[0] == 256 && Q->ne[1] >= ggml_cuda_q8_turbo3_mma_min_q() && Q->ne[1] <= ggml_cuda_q8_turbo3_mma_max_q() && turing_mma_available(cc)) {
             ggml_cuda_fattn_path_note("q8_q8_fused", dst, -1);
             ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0>(ctx, dst);
             return;

@@ -10540,7 +10540,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // mixed quant and Q1_0 test cases
     // Qwen3.8-27B decode attention shape (4 KV heads x GQA 6, D=256, q8_0 K / turbo3 V) at short and long KV
     for (int64_t kv : {4096, 100352}) {
-        for (int nb : {1, 2, 4}) {
+        for (int nb : {1, 2, 4, 5, 7, 8}) { // 5/7/8: DF3 width-8 fused verify (MTP-4 pad and DFlash2 block 8)
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_TURBO3_0));
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
         }
@@ -10988,7 +10988,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     // Qwen3.8-27B decode attention at 100K: 4 KV heads x GQA 6, D=256, q8_0 K / turbo3 V, widths 1 (draft) and 4 (MTP3 verify)
-    for (int nb : {1, 2, 4}) {
+    for (int nb : {1, 2, 4, 8}) {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 100352, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_TURBO3_0));
     }
     for (int nb : {1, 2, 4}) {
