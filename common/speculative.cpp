@@ -1392,6 +1392,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     std::vector<common_sampler_ptr> smpls;
 
+    // exact p/q drafting (LLAMA_SPEC_PQ=1, sequential path): per-seq sampler over the draft logits built
+    // from the target's request params (temp / top-k / top-p / min-p, an independent seed); each draft
+    // token is sampled from it and the candidate distribution is recorded for the verifier
+    bool pq_enabled = false;
+    bool pq_backend_warned = false;
+    std::vector<common_sampler_ptr>          q_smpls;
+    std::vector<common_params_sampling>      q_params; // the target params each q_smpls entry was built from
+
     // backend sampler chain per seq, attached to ctx_dft
     std::vector<llama_sampler *> backend_chains;
 
@@ -1490,6 +1498,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             sparams.top_k    = 10;
             sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
             s.reset(common_sampler_init(llama_get_model(ctx_dft), sparams));
+        }
+
+        {
+            const char * env = getenv("LLAMA_SPEC_PQ");
+            pq_enabled = env != nullptr && std::strcmp(env, "0") != 0;
+            q_smpls.resize(n_seq);
+            q_params.resize(n_seq);
+            if (pq_enabled) {
+                SPC_INF("%s", "exact p/q drafting enabled (LLAMA_SPEC_PQ): draft tokens are sampled at the request's temperature and verified by rejection sampling\n");
+            }
         }
 
         const bool chain_enabled = common_speculative_mtp_chain_enabled(this->params);
@@ -1895,6 +1913,65 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         return true;
     }
 
+    static bool pq_params_ok(const common_params_sampling & tgt) {
+        return tgt.temp > 0.0f && tgt.mirostat == 0;
+    }
+
+    // the drafter-side sampler that mirrors the target's request: rebuilt only when those params change
+    common_sampler * pq_sampler(llama_seq_id seq_id, const common_params_sampling & tgt) {
+        auto & cur  = q_params[seq_id];
+        auto & smpl = q_smpls[seq_id];
+
+        const bool same = smpl &&
+            cur.temp == tgt.temp && cur.dynatemp_range == tgt.dynatemp_range && cur.dynatemp_exponent == tgt.dynatemp_exponent &&
+            cur.top_k == tgt.top_k && cur.top_p == tgt.top_p && cur.min_p == tgt.min_p && cur.min_keep == tgt.min_keep &&
+            cur.seed == tgt.seed && cur.samplers == tgt.samplers;
+        if (same) {
+            return smpl.get();
+        }
+
+        common_params_sampling sp;
+        sp.no_perf           = false;
+        sp.temp              = tgt.temp;
+        sp.dynatemp_range    = tgt.dynatemp_range;
+        sp.dynatemp_exponent = tgt.dynatemp_exponent;
+        sp.top_k             = tgt.top_k;
+        sp.top_p             = tgt.top_p;
+        sp.min_p             = tgt.min_p;
+        sp.min_keep          = tgt.min_keep;
+        // the draft draw must be independent of the target chain's draw: a different stream
+        sp.seed              = tgt.seed == LLAMA_DEFAULT_SEED ? LLAMA_DEFAULT_SEED : (tgt.seed ^ 0x27d4eb2fu);
+        sp.backend_sampling  = false;
+        sp.samplers.clear();
+        bool has_temp = false;
+        for (const auto t : tgt.samplers) {
+            switch (t) {
+                case COMMON_SAMPLER_TYPE_TOP_K:
+                case COMMON_SAMPLER_TYPE_TOP_P:
+                case COMMON_SAMPLER_TYPE_MIN_P:
+                    sp.samplers.push_back(t);
+                    break;
+                case COMMON_SAMPLER_TYPE_TEMPERATURE:
+                    sp.samplers.push_back(t);
+                    has_temp = true;
+                    break;
+                default:
+                    break; // typical / top-n-sigma / xtc / dry / penalties: q simply differs a little from p
+            }
+        }
+        if (!has_temp) {
+            sp.samplers.push_back(COMMON_SAMPLER_TYPE_TEMPERATURE);
+        }
+
+        smpl.reset(common_sampler_init(llama_get_model(params.ctx_dft), sp));
+        cur = tgt;
+
+        SPC_INF("seq %d: p/q draft sampler rebuilt: temp=%.2f top_k=%d top_p=%.2f min_p=%.2f\n",
+                (int) seq_id, sp.temp, sp.top_k, sp.top_p, sp.min_p);
+
+        return smpl.get();
+    }
+
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
 
@@ -2086,6 +2163,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             n_drafting++;
             drafting[seq_id] = true;
             common_sampler_reset(smpls[seq_id].get());
+            if (q_smpls[seq_id]) {
+                common_sampler_reset(q_smpls[seq_id].get());
+            }
+            if (dp.result_q) {
+                dp.result_q->clear();
+            }
 
             // effective draft cap for this step: adaptive depth (or the user n_max),
             // then clamped by the per-call context bound from the server
@@ -2139,10 +2222,27 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     continue;
                 }
 
-                auto * smpl = smpls[seq_id].get();
+                auto & dp = dparams.at(seq_id);
+                auto & result = *dp.result;
 
-                common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
+                // exact p/q: sample the draft token from the request-matched distribution and keep that
+                // distribution for the verifier; otherwise the drafter's argmax under its own top-k chain
+                bool pq = pq_enabled && dp.sampling && dp.result_q && pq_params_ok(*dp.sampling);
+
+                auto * smpl = pq ? pq_sampler(seq_id, *dp.sampling) : smpls[seq_id].get();
+
+                llama_token id = common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
                 const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
+
+                if (pq && llama_get_sampled_token_ith(ctx_dft, i_last[seq_id]) != LLAMA_TOKEN_NULL) {
+                    // the backend chain selected the token itself, so the recorded distribution would not be
+                    // the one it was drawn from: this position (and the rest of the draft) is verified by id-match
+                    if (!pq_backend_warned) {
+                        SPC_WRN("%s", "draft backend sampler returns tokens; p/q drafting falls back to argmax\n");
+                        pq_backend_warned = true;
+                    }
+                    pq = false;
+                }
 
                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
 
@@ -2152,10 +2252,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                             common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
                 }
 
-                // add drafted token for each sequence
-                const llama_token id = cur_p->data[0].id;
+                if (!pq) {
+                    // add drafted token for each sequence
+                    id = cur_p->data[0].id;
+                }
 
-                // only collect very high-confidence draft tokens
+                // only collect very high-confidence draft tokens (p/q: the top candidate's probability under
+                // the request-matched distribution is the same confidence measure)
                 if (cur_p->data[0].p < params.p_min) {
                     drafting[seq_id] = false;
                     n_drafting--;
@@ -2165,8 +2268,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 common_sampler_accept(smpl, id, true);
 
-                auto & dp = dparams.at(seq_id);
-                auto & result = *dp.result;
+                if (dp.result_q) {
+                    if (pq) {
+                        dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
+                    } else {
+                        dp.result_q->emplace_back(); // id-match row, keeps result_q aligned with result
+                    }
+                }
 
                 result.push_back(id);
 

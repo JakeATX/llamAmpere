@@ -48,6 +48,12 @@ struct common_speculative_draft_params {
 
     // the generated draft from the last _draft() call
     llama_tokens * result;
+
+    // (optional) exact p/q drafting: the target's request sampling parameters, and where an implementation
+    // that samples its draft from a matching distribution records that distribution per draft position
+    // (candidate ids with normalised probabilities, aligned with *result; an empty row means id-match)
+    const common_params_sampling * sampling = nullptr;
+    std::vector<std::vector<llama_token_data>> * result_q = nullptr;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);

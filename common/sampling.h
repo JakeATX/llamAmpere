@@ -118,6 +118,29 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 // assume idxs == [ 0, 1, 2, ..., draft.size() ]
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false);
 
+// exact speculative verification: rejection sampling of each draft token against the distribution it was
+// sampled from (draft_q[i]: candidate ids with normalised probabilities), so the output distribution stays
+// exactly the target chain's. Acceptance per position is sum_x min(p(x), q(x)) instead of p(draft[i]).
+// An empty draft_q[i] (or an unsupported chain, see common_sampler_pq_supported) falls back to id-match
+// for that position and the following ones.
+struct common_sampler_pq_stats {
+    size_t n_pos   = 0; // draft positions verified with p/q
+    size_t n_match = 0; // accepted because the target sample equalled the draft token
+    size_t n_extra = 0; // accepted by the residual acceptance test (id-match would have rejected)
+    size_t n_rej   = 0; // rejected: token drawn from the residual distribution norm(max(p - q, 0))
+    double sum_p_d = 0; // sum of p(draft[i]): the id-match acceptance probability
+    double sum_min = 0; // sum of sum_x min(p(x), q(x)): the p/q acceptance probability
+};
+
+// true when the chain samples on the CPU at temperature > 0 without grammar, reasoning budget or mirostat
+bool common_sampler_pq_supported(const struct common_sampler * gsmpl);
+
+// replay: the draft is a previously verified result being re-decoded after a checkpoint restore, so a
+// rejection at its last position is the recorded outcome and the fresh token after it is still sampled
+std::vector<llama_token> common_sampler_sample_and_accept_n_pq(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q, bool grammar_first = false, bool replay = false);
+
+const common_sampler_pq_stats & common_sampler_get_pq_stats(const struct common_sampler * gsmpl);
+
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 
 // force the reasoning budget sampler (if any) to begin forcing its end sequence now.

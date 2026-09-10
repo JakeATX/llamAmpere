@@ -14,6 +14,7 @@
 #include <climits>
 #include <cmath>
 #include <cstring>
+#include <random>
 #include <unordered_map>
 #include <vector>
 
@@ -172,6 +173,11 @@ struct common_sampler {
     // true when greedy_backend is [logit-bias, greedy] rather than a bare [greedy]: a biased chain really
     // runs a backend graph, so it has to have been offloaded before it can be trusted
     bool greedy_backend_biased = false;
+
+    // exact p/q verification: its own generator (independent of the chain's dist sampler, whose draws the
+    // proof needs untouched) and per-request counters
+    std::mt19937 pq_rng{0x9e3779b9u};
+    common_sampler_pq_stats pq_stats;
 };
 
 std::string common_params_sampling::print() const {
@@ -440,6 +446,15 @@ struct common_sampler * common_sampler_init(
         /* .cur_p   = */ {},
     };
 
+    {
+        // the p/q generator must not replay the chain's dist draws: derive a different stream
+        uint32_t seed = params.seed;
+        if (seed == LLAMA_DEFAULT_SEED) {
+            seed = std::random_device{}();
+        }
+        result->pq_rng.seed(seed ^ 0x5bd1e995u);
+    }
+
     return result;
 }
 
@@ -514,7 +529,7 @@ void common_sampler_reset(struct common_sampler * gsmpl) {
 }
 
 struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
-    return new common_sampler {
+    auto * result = new common_sampler {
         /* .params  = */ gsmpl->params,
         /* .grmr    = */ llama_sampler_clone(gsmpl->grmr),
         /* .rbudget = */ llama_sampler_clone(gsmpl->rbudget),
@@ -523,6 +538,10 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .cur     = */ gsmpl->cur,
         /* .cur_p   = */ gsmpl->cur_p,
     };
+    result->t_total_us = gsmpl->t_total_us;
+    result->pq_rng     = gsmpl->pq_rng;   // a restored clone must replay the same accept decisions
+    result->pq_stats   = gsmpl->pq_stats;
+    return result;
 }
 
 void common_perf_print(const struct llama_context * ctx, const struct common_sampler * gsmpl) {
@@ -891,6 +910,145 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     }
 
     return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, grammar_first);
+}
+
+bool common_sampler_pq_supported(const struct common_sampler * gsmpl) {
+    if (!gsmpl || gsmpl->grmr || gsmpl->rbudget) {
+        return false;
+    }
+    const auto & params = gsmpl->params;
+    return params.temp > 0.0f && params.mirostat == 0;
+}
+
+const common_sampler_pq_stats & common_sampler_get_pq_stats(const struct common_sampler * gsmpl) {
+    return gsmpl->pq_stats;
+}
+
+std::vector<llama_token> common_sampler_sample_and_accept_n_pq(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q, bool grammar_first, bool replay) {
+    GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
+
+    if (!common_sampler_pq_supported(gsmpl)) {
+        return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, grammar_first);
+    }
+
+    std::vector<llama_token> result;
+    result.reserve(idxs.size());
+
+    auto & stats = gsmpl->pq_stats;
+    std::uniform_real_distribution<double> uniform(0.0, 1.0);
+
+    size_t i = 0;
+    for (; i < draft.size(); i++) {
+        // x ~ p, the target chain's own draw; it also leaves cur_p holding p over the surviving candidates
+        const llama_token x = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        const llama_token d = draft[i];
+
+        if (replay && i + 1 == draft.size()) {
+            // the last token of a replayed draft is the recorded outcome of a rejection (a residual draw, or the
+            // chain's own draw on the id-match path): the chain has advanced identically, so it stands as is
+            common_sampler_accept(gsmpl, d, true);
+            result.push_back(d);
+            continue;
+        }
+
+        const auto & cur_p = gsmpl->cur_p;
+        const bool have_q = i < draft_q.size() && !draft_q[i].empty();
+        const bool cpu_p  = cur_p.size > 0 && cur_p.selected >= 0 && llama_get_sampled_token_ith(ctx, idxs[i]) == LLAMA_TOKEN_NULL;
+
+        if (!have_q || !cpu_p) {
+            // id-match for this and the remaining positions
+            common_sampler_accept(gsmpl, x, true);
+            result.push_back(x);
+            if (d != x) {
+                break;
+            }
+            continue;
+        }
+
+        const auto & q = draft_q[i];
+
+        auto q_of = [&](llama_token id) -> double {
+            for (const auto & c : q) {
+                if (c.id == id) {
+                    return c.p;
+                }
+            }
+            return 0.0;
+        };
+
+        // p(d), q(d) and sum_x min(p(x), q(x)) in one pass over the target candidates (q is a few entries)
+        double p_d = 0.0;
+        double sum_min = 0.0;
+        for (size_t k = 0; k < cur_p.size; ++k) {
+            const auto & c = cur_p.data[k];
+            if (c.id == d) {
+                p_d = c.p;
+            }
+            const double qk = q_of(c.id);
+            if (qk > 0.0) {
+                sum_min += std::min((double) c.p, qk);
+            }
+        }
+        const double q_d = q_of(d);
+
+        stats.n_pos++;
+        stats.sum_p_d += p_d;
+        stats.sum_min += sum_min;
+
+        bool accept = x == d;
+        if (accept) {
+            stats.n_match++;
+        } else if (p_d > 0.0 && q_d > 0.0 && p_d < 1.0) {
+            // total acceptance must be min(1, p(d)/q(d)); the x == d event already contributes p(d)
+            const double a = std::min(1.0, p_d / q_d);
+            const double r = (a - p_d) / (1.0 - p_d);
+            if (r > 0.0 && uniform(gsmpl->pq_rng) < r) {
+                accept = true;
+                stats.n_extra++;
+            }
+        }
+
+        llama_token id = d;
+        if (!accept) {
+            // residual: norm(max(p - q, 0)); x is not reused (it is not residual-distributed)
+            double total = 0.0;
+            for (size_t k = 0; k < cur_p.size; ++k) {
+                const auto & c = cur_p.data[k];
+                total += std::max(0.0, (double) c.p - q_of(c.id));
+            }
+            id = x;
+            if (total > 0.0) {
+                const double target = uniform(gsmpl->pq_rng) * total;
+                double run = 0.0;
+                for (size_t k = 0; k < cur_p.size; ++k) {
+                    const auto & c = cur_p.data[k];
+                    run += std::max(0.0, (double) c.p - q_of(c.id));
+                    if (run >= target) {
+                        id = c.id;
+                        break;
+                    }
+                }
+            }
+            stats.n_rej++;
+        }
+
+        common_sampler_accept(gsmpl, id, true);
+        result.push_back(id);
+
+        if (!accept) {
+            break;
+        }
+    }
+
+    if (i == draft.size()) {
+        const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+
+        common_sampler_accept(gsmpl, id, true);
+
+        result.push_back(id);
+    }
+
+    return result;
 }
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl) {

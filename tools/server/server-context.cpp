@@ -411,6 +411,8 @@ struct server_slot {
     common_speculative * spec;
 
     llama_tokens spec_draft;
+    // per-position draft distributions for exact p/q verification (empty: id-match), aligned with spec_draft
+    std::vector<std::vector<llama_token_data>> spec_draft_q;
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
@@ -557,6 +559,7 @@ struct server_slot {
 
         if (can_speculate()) {
             spec_draft.clear();
+            spec_draft_q.clear();
             spec_i_batch.clear();
             spec_ckpt.clear();
         }
@@ -900,6 +903,15 @@ struct server_slot {
                     draft_ratio, n_draft_accepted, n_draft_total, mean_acc_len);
             SLT_TRC(*this,
                     "     acc per pos = (%s)\n", acceptance_rates_per_pos.c_str());
+
+            if (smpl) {
+                const auto & pq = common_sampler_get_pq_stats(smpl.get());
+                if (pq.n_pos > 0) {
+                    SLT_INF(*this,
+                            "spec pq: n=%zu match=%zu extra=%zu rej=%zu mean_p_d=%.4f mean_summin=%.4f\n",
+                            pq.n_pos, pq.n_match, pq.n_extra, pq.n_rej, pq.sum_p_d / pq.n_pos, pq.sum_min / pq.n_pos);
+                }
+            }
         }
 
         common_speculative_print_stats(spec);
@@ -3522,6 +3534,8 @@ private:
                             /* .id_last  = */ slot.sampled,
                             /* .prompt   = */ &slot.spec_prompt,
                             /* .result   = */ &slot.spec_draft,
+                            /* .sampling = */ &slot.task->params.sampling,
+                            /* .result_q = */ &slot.spec_draft_q,
                         };
 
                         drafting.push_back(&slot);
@@ -4393,7 +4407,9 @@ private:
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
-                auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                auto accepted = slot.spec_draft_q.empty()
+                    ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft)
+                    : common_sampler_sample_and_accept_n_pq(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, slot.spec_draft_q, false, slot.spec_is_replay);
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
@@ -4414,6 +4430,10 @@ private:
                         // partial acceptance is not supported by the context -> truncate the draft and restore the state
                         slot.spec_is_replay = true;
                         slot.spec_draft = std::move(accepted);
+                        // keep the distributions of the accepted positions: the restored sampler replays the same decisions
+                        if (slot.spec_draft_q.size() > slot.spec_draft.size() - 1) {
+                            slot.spec_draft_q.resize(slot.spec_draft.size() - 1);
+                        }
 
                         const auto & ckpt = slot.spec_ckpt;
 
@@ -4462,6 +4482,7 @@ private:
                 common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
 
                 slot.spec_draft = std::move(accepted);
+                slot.spec_draft_q.clear();
             }
 
             const int64_t t_now = ggml_time_us();
