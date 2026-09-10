@@ -1501,12 +1501,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         {
+            // default on since PQ1 shipped (2026-09-10): LLAMA_SPEC_PQ=0 restores the id-match rule
             const char * env = getenv("LLAMA_SPEC_PQ");
-            pq_enabled = env != nullptr && std::strcmp(env, "0") != 0;
+            pq_enabled = env == nullptr || std::strcmp(env, "0") != 0;
             q_smpls.resize(n_seq);
             q_params.resize(n_seq);
             if (pq_enabled) {
-                SPC_INF("%s", "exact p/q drafting enabled (LLAMA_SPEC_PQ): draft tokens are sampled at the request's temperature and verified by rejection sampling\n");
+                SPC_INF("%s", "exact p/q drafting enabled (default; LLAMA_SPEC_PQ=0 disables): draft tokens are sampled at the request's temperature and verified by rejection sampling\n");
+            } else {
+                SPC_INF("%s", "exact p/q drafting disabled (LLAMA_SPEC_PQ=0): drafts are verified by identity match\n");
             }
         }
 
