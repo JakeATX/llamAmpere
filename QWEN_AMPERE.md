@@ -60,10 +60,20 @@ GGML_Q8_TURBO3_MMA_FUSED=1 ./build-sm86/bin/llama-server -m Qwen3.8-27B-ATX-4-XS
   -c 245760 -b 4096 -ub 1024 -t 8 -tb 8 -ngl 99 -fa on -ctk q8_0 -ctv turbo3 \
   --parallel 1 --jinja --fit off \
   --cache-prompt --cache-ram 8192 --ctx-checkpoints 24 --checkpoint-min-step 10240 \
-  --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.45 \
-  --spec-draft-type-k q8_0 --spec-draft-type-v turbo3 \
+  --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0 \
+  --spec-draft-type-k q8_0 --spec-draft-type-v q8_0 \
   --spec-draft-vocab-map docs/mtp-vocab/atx_65536.txt
 ```
+
+Since 2026-09-10 the MTP drafter is verified by exact p/q rejection sampling instead of identity match
+(`common/speculative.cpp`): each draft token is sampled from the drafter's own distribution under the request's
+temperature / top-k / top-p, and the target accepts it with probability min(1, p/q), drawing from the residual on
+rejection. The output distribution is the target's exactly (chi-square against the id-match verifier p = 1.00 / 0.98
+/ 0.99 per position; greedy output byte-identical), and expected acceptance rises from p(argmax q) to Σ min(p, q).
+It is default-on; `LLAMA_SPEC_PQ=0` restores identity match. With it the draft gate goes to `--spec-draft-p-min 0`
+and the drafter cache to `--spec-draft-type-v q8_0` (the fused q8_0/q8_0 drafter kernel): +7.5% tokens/s over v0.2
+at temperature 1.0, weighted 0.4 coding / 0.4 agentic / 0.2 RAG over three seeds (per-fixture means +7.5% / +8.0%
+/ +6.3%), same 245,760 fit.
 
 `--spec-draft-vocab-map` (new in v0.2) restricts the MTP drafter's output head to a 65,536-token
 shortlist built from this model's generations (`docs/mtp-vocab/atx_65536.txt`; a 32K map is next to
