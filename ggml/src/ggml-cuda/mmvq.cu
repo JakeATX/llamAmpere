@@ -575,9 +575,9 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 #define QC4_NWARPS_3 4
 #define QC4_NWARPS_4 4
 #define QC4_ROWS_1   1
-#define QC4_ROWS_2   2
-#define QC4_ROWS_3   2
-#define QC4_ROWS_4   2
+#define QC4_ROWS_2   8
+#define QC4_ROWS_3   8
+#define QC4_ROWS_4   8
 #endif
 
 static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id) {
