@@ -1489,6 +1489,10 @@ struct test_case {
             }
 
             double err = ud->tc->err(f1.data(), f2.data(), f1.size());
+            if (getenv("GGML_TBO_DUMP_ERR")) {
+                // machine-parseable: op, shape vars, error vs the CPU reference
+                printf("TBOERR\t%s\t%s\t%.12g\n", ggml_op_desc(t1), ud->tc->vars().c_str(), err);
+            }
             if (err > ud->tc->max_err(ud->backend1)) {
                 printf("[%s] ERR = %.9f > %.9f ", ggml_op_desc(t1), err, ud->tc->max_err(ud->backend1));
                 //for (int i = 0; i < (int) f1.size(); i++) {

@@ -275,6 +275,40 @@ Consider setting `CUDA_SCALE_LAUNCH_QUEUES=4x`, which increases the CUDA command
 Override default, speed-optimized compute types for cuBLAS matrix multiplications.
 Legal values: `auto`, `f16`, `fp16`, `bf16`, `f32`, `fp32`.
 
+#### GGML_CUDA_QC4_NW1
+
+**Off by default.** Set `GGML_CUDA_QC4_NW1=1` to select a `nwarps=1` launch shape for the quantized `mul_mat_vec` kernel at destination widths 2-4 -- the widths used when verifying speculative/draft tokens. Width 1 (ordinary non-speculative decoding) is unaffected, as is the MoE path, which does not use this launch-shape selection.
+
+It is off by default because it is faster at only one of the three widths it touches, and not the one a default speculative configuration runs. Speed, measured with `llama-batched-bench` (no sampler in the process, so draft acceptance cannot contaminate the timing) on Qwen3.8-27B, IQ4_XS-dominant recipe, RTX 3090 Ti, identical `libggml-cuda.so` for both arms:
+
+| destination width | short context (8K) | long context (72K, 65K prompt) |
+|---|---|---|
+| 1 (unaffected control) | -0.00% | -0.02% |
+| 2 | -0.95% | -1.33% |
+| 3 | **+4.54%** | **+4.12%** |
+| 4 | -1.00% | -0.59% |
+
+The two context lengths agree at every width, so the effect is a property of the width rather than of cache pressure. Verify width is `n_draft + 1`, so `--spec-draft-n-max 3` runs width 4, where this flag loses, and `--spec-draft-n-max 2` runs width 3, where it wins by about 4%. If you enable this flag, match your draft depth to it.
+
+**Do not judge this flag by end-to-end tokens/sec on a speculative workload.** It is not bit-exact, so it changes which draft tokens are accepted, and that acceptance shift is far larger than the kernel effect and swings in both directions: on three fixtures the same binary measured -22.6%, +2.9% and -16.3% end-to-end while the underlying kernel moved less than 1.3% on all three. Decompose instead -- `tok/s = (predicted_n / passes) * (passes / wall)` where `passes = predicted_n - draft_n_accepted`; the second factor is kernel speed and the first is acceptance.
+
+**This is not bit-exact against builds from before this change.** Floating-point addition is not associative, and `nwarps` sets both the stride each warp takes through a row and the number of cross-warp partial sums combined at the end (three at `nwarps=4`, none at `nwarps=1`). The output is a different rounding of the same dot product over the same weights, not a lower-precision one. Leave the flag off if you need bit-identical output against an earlier build.
+
+Numerical accuracy is unchanged. Across 3,327 paired `MUL_MAT` cases in `test-backend-ops`, enabling the flag altered the error against the CPU reference in 1,632; of those it was worse in 837 and better in 795, with a total-error ratio of 1.0031. That symmetry is what a different summation order looks like, not a loss of precision.
+
+Output-quality effect on the same model, measured over 32,768 wikitext tokens at `-ub 4` so the changed path is actually exercised (at the default ubatch the work routes to MMQ and never reaches this kernel):
+
+| | flag ON vs OFF | OFF vs OFF (control) |
+|---|---|---|
+| Mean KLD | 7.25e-4 &plusmn; 5.5e-5 | ~0 |
+| 99.9% KLD | 5.86e-2 | 5.1e-5 |
+| Same top-1 token | 98.900% &plusmn; 0.082% | 100.000% |
+| PPL ratio | 1.000222 &plusmn; 0.000497 | 1.000252 &plusmn; 0.000214 |
+
+The control column is the same binary run twice with the flag off against the same stored base logits. Its numbers are the measurement floor rather than zero, because the stored base logits are uint16-quantized; anything at or below the control column is indistinguishable from that floor.
+
+Note the perplexity row in particular: the flag-ON arm's PPL ratio (1.000222) is *closer to 1* than the control's (1.000252), and both sit inside their own error bars. Perplexity cannot distinguish this change from no change at all, while the KL divergence separates them by three orders of magnitude at the 99.9th percentile and same-top-1 shows roughly 1 token in 91 selecting a different argmax. Perplexity averages over the observed token's log-probability only, so redistribution among the alternatives -- which is exactly what a different summation order produces -- is invisible to it. Use the KLD rows to judge this flag; the PPL row is reported only to document that it is uninformative here.
+
 ### Unified Memory
 
 The environment variable `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1` can be used to enable unified memory in Linux. This allows swapping to system RAM instead of crashing when the GPU VRAM is exhausted. In Windows this setting is available in the NVIDIA control panel as `System Memory Fallback`.
