@@ -140,10 +140,72 @@ static __device__ __forceinline__ void vec_dot_iq4_xs_q8_1_multi(
     }
 }
 
+// QC2 — Q5_0: the 5th bit of each weight is assembled from `qh` with four shift+mask pairs per
+// 32-bit group, ten integer ops per group that the generic path repeats for every destination column.
+// Assemble the group once and dp4a it into one integer accumulator per column. The accumulation order
+// within a column, the scale multiply and the -16 offset term are exactly those of vec_dot_q5_0_q8_1,
+// so each column's dot is bit-identical to the single-column path.
+template<int ncols_dst>
+static __device__ __forceinline__ void vec_dot_q5_0_q8_1_multi(
+        const void * __restrict__ vbq, const block_q8_1 * __restrict__ y,
+        const int stride_col_y, const int kby, const int kbx, const int iqs,
+        float (&dots)[ncols_dst]) {
+    const block_q5_0 * bq5_0 = (const block_q5_0 *) vbq + kbx;
+
+    int sumi[ncols_dst];
+#pragma unroll
+    for (int col = 0; col < ncols_dst; ++col) {
+        sumi[col] = 0;
+    }
+
+    const int qh = get_int_b2(bq5_0->qh, 0);
+#pragma unroll
+    for (int i = 0; i < VDR_Q5_0_Q8_1_MMVQ; ++i) {
+        const int vl = get_int_b2(bq5_0->qs, iqs + i);
+        const int vh = qh >> (4 * (iqs + i));
+
+        int vi0 = (vl >>  0) & 0x0F0F0F0F; // lower 4 qs bits, still need qh as 5th bits
+        vi0    |= (vh <<  4) & 0x00000010; // 0 ->  4
+        vi0    |= (vh << 11) & 0x00001000; // 1 -> 12
+        vi0    |= (vh << 18) & 0x00100000; // 2 -> 20
+        vi0    |= (vh << 25) & 0x10000000; // 3 -> 28
+
+        int vi1 = (vl >>  4) & 0x0F0F0F0F; // upper 4 qs bits, still need qh as 5th bits
+        vi1    |= (vh >> 12) & 0x00000010; // 16 ->  4
+        vi1    |= (vh >>  5) & 0x00001000; // 17 -> 12
+        vi1    |= (vh <<  2) & 0x00100000; // 18 -> 20
+        vi1    |= (vh <<  9) & 0x10000000; // 19 -> 28
+
+#pragma unroll
+        for (int col = 0; col < ncols_dst; ++col) {
+            const block_q8_1 * bq8 = y + col*stride_col_y + kby;
+            sumi[col] = ggml_cuda_dp4a(vi0, get_int_b4(bq8->qs, iqs + i),          sumi[col]);
+            sumi[col] = ggml_cuda_dp4a(vi1, get_int_b4(bq8->qs, iqs + i + QI5_0), sumi[col]);
+        }
+    }
+
+    const float d5 = bq5_0->d;
+#pragma unroll
+    for (int col = 0; col < ncols_dst; ++col) {
+        const float2 ds8f = __half22float2((y + col*stride_col_y + kby)->ds);
+        // second part effectively subtracts 16 from each quant value
+        dots[col] = d5 * (sumi[col] * ds8f.x - (16*VDR_Q5_0_Q8_1_MMVQ/QI5_0) * ds8f.y);
+    }
+}
+
 // IQ4_XS cross-column reuse is exact and on by default for SM86; GGML_CUDA_SM86_IQ4_REUSE=0 disables it.
 static bool ggml_cuda_sm86_iq4_reuse() {
     static const bool value = [] {
         const char * env = getenv("GGML_CUDA_SM86_IQ4_REUSE");
+        return env == nullptr || env[0] != '0';
+    }();
+    return value;
+}
+
+// QC2 Q5_0 cross-column reuse is exact and on by default for SM86; GGML_CUDA_SM86_Q5_0_REUSE=0 disables it.
+static bool ggml_cuda_sm86_q5_0_reuse() {
+    static const bool value = [] {
+        const char * env = getenv("GGML_CUDA_SM86_Q5_0_REUSE");
         return env == nullptr || env[0] != '0';
     }();
     return value;
@@ -501,14 +563,30 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 #endif
 }
 
+// QC4 -- MMVQ launch parameters for SM86. This build is CMAKE_CUDA_ARCHITECTURES=86 only and
+// get_device_table_id() gates MMVQ_PARAMETERS_TURING on cc < AMPERE, so SM86 falls through to
+// GENERIC: GENERIC *is* the Ampere table here. There is no tuned Ampere table in this fork or
+// upstream. These macros exist so a sweep can retune the cells the decode path actually uses
+// (ncols_dst 1..4 -- production runs --spec-draft-n-max 3, so verify width never exceeds 4)
+// by editing one file, not one compile flag that rebuilds every template instance.
+#ifndef QC4_NWARPS_1
+#define QC4_NWARPS_1 4
+#define QC4_NWARPS_2 4
+#define QC4_NWARPS_3 4
+#define QC4_NWARPS_4 4
+#define QC4_ROWS_1   1
+#define QC4_ROWS_2   2
+#define QC4_ROWS_3   2
+#define QC4_ROWS_4   2
+#endif
+
 static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id) {
     if (table_id == MMVQ_PARAMETERS_GENERIC) {
         switch (ncols_dst) {
-            case 1:
-            case 2:
-            case 3:
-            case 4:
-                return 4;
+            case 1: return QC4_NWARPS_1;
+            case 2: return QC4_NWARPS_2;
+            case 3: return QC4_NWARPS_3;
+            case 4: return QC4_NWARPS_4;
             case 5:
             case 6:
             case 7:
@@ -608,7 +686,22 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
 }
 
 static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
-    if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING) {
+    if (table_id == MMVQ_PARAMETERS_GENERIC) {
+        switch (ncols_dst) {
+            case 1: return small_k ? nwarps : QC4_ROWS_1;
+            case 2: return QC4_ROWS_2;
+            case 3: return QC4_ROWS_3;
+            case 4: return QC4_ROWS_4;
+            case 5:
+            case 6:
+            case 7:
+            case 8:
+                return 2;
+            default:
+                return 1;
+        }
+    }
+    if (table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING) {
         switch (ncols_dst) {
             case 1:
                 return small_k ? nwarps : 1;
@@ -747,12 +840,15 @@ static __global__ void mul_mat_vec_q(
         // x block quant index when casting the quants to int
         const int kqs = vdr * (tid % (qi/vdr));
 
-        if constexpr (reuse_weights && (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_IQ4_XS)) {
+        if constexpr (reuse_weights && (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_Q5_0)) {
 #pragma unroll
             for (int i = 0; i < rows_per_cuda_block; ++i) {
                 float dots[ncols_dst];
                 if constexpr (type == GGML_TYPE_IQ4_XS) {
                     vec_dot_iq4_xs_q8_1_multi<ncols_dst>(
+                        vx, y, stride_col_y, kby, kbx_offset + i*stride_row_x + kbx, kqs, dots);
+                } else if constexpr (type == GGML_TYPE_Q5_0) {
+                    vec_dot_q5_0_q8_1_multi<ncols_dst>(
                         vx, y, stride_col_y, kby, kbx_offset + i*stride_row_x + kbx, kqs, dots);
                 } else if constexpr (type == GGML_TYPE_Q4_K) {
                     vec_dot_q4_K_q8_1_multi<ncols_dst>(
@@ -1013,10 +1109,11 @@ static void mul_mat_vec_q_switch_fusion(
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
     if constexpr (((type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K) && c_ncols_dst >= 3 && c_ncols_dst <= 5) ||
-                  (type == GGML_TYPE_IQ4_XS && c_ncols_dst >= 2 && c_ncols_dst <= 5)) {
+                  ((type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_Q5_0) && c_ncols_dst >= 2 && c_ncols_dst <= 5)) {
         const int device = ggml_cuda_get_device();
         const int cc = ggml_cuda_info().devices[device].cc;
-        const bool reuse = type == GGML_TYPE_IQ4_XS ? ggml_cuda_sm86_iq4_reuse() : ggml_cuda_sm86_exact_reuse();
+        const bool reuse = type == GGML_TYPE_IQ4_XS ? ggml_cuda_sm86_iq4_reuse() :
+                           type == GGML_TYPE_Q5_0   ? ggml_cuda_sm86_q5_0_reuse() : ggml_cuda_sm86_exact_reuse();
         if (cc == 860 && reuse) {
             ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, true>, launch_params,
                 vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
