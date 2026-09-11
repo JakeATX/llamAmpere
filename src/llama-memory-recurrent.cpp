@@ -737,7 +737,18 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             // RB1b: this ubatch contributes n_seq_tokens new snapshots for the seq (the writer
             // bound from 3772c377e), so that many more slots behind the head are now real.
             // Saturates at the ring capacity; older slots survive, which is why this accumulates
-            // rather than assigns.
+            // rather than assigns. Assigning would report 1 valid slot after a 1-token ubatch and
+            // refuse the perfectly legal deep rollback that test-recurrent-state-rollback performs
+            // after replaying N tokens one at a time.
+            //
+            // The shared-cell question the first pass left open ("is n_seq_tokens really this
+            // seq's contribution when one cell carries several seq_ids?") is YES, and it is a
+            // property of the indexing right above: the ubatch is equal-split, `i` is pinned to
+            // s*n_seq_tokens -- the FIRST token slot of stream s -- and `j` walks the seq_ids
+            // attached to that one slot. Every such seq_id aliases the same token run, so each
+            // really did receive all n_seq_tokens of them. There is no over-credit. (This leans on
+            // the equal-split invariant, but so does the cell.pos update directly above it, so
+            // rs_valid assumes nothing the surrounding code did not already assume.)
             if (n_rs_seq != 0 && (size_t) seq_id < rs_valid.size()) {
                 const uint64_t grown = (uint64_t) rs_valid[seq_id] + n_seq_tokens;
                 rs_valid[seq_id] = grown > n_rs_seq ? n_rs_seq : (uint32_t) grown;
