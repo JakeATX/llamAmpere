@@ -95,6 +95,18 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
         layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", il), {n_embd,   n_ff}, flags);
         layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", il), {  n_ff, n_embd}, flags);
         layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", il), {n_embd,   n_ff}, flags);
+
+        // Agnes 3.0 runs a second, narrower SwiGLU in parallel with the main FFN. A Qwen3.5/3.8
+        // checkpoint has no such branch and does not write feed_forward_parallel_length, so it
+        // loads through this same path with the block skipped. These are deliberately REQUIRED:
+        // once the key says the branch exists, a missing tensor must fail loudly here rather than
+        // silently drop all 72 layers' worth and leave the model generating plausible garbage.
+        if (hparams.n_ff_par > 0) {
+            const int64_t n_ff_par = hparams.n_ff_par;
+            layer.ffn_gate_par = create_tensor(tn(LLM_TENSOR_FFN_GATE_PAR, "weight", il), {n_embd,   n_ff_par}, flags);
+            layer.ffn_down_par = create_tensor(tn(LLM_TENSOR_FFN_DOWN_PAR, "weight", il), {n_ff_par, n_embd}, flags);
+            layer.ffn_up_par   = create_tensor(tn(LLM_TENSOR_FFN_UP_PAR,   "weight", il), {n_embd,   n_ff_par}, flags);
+        }
     };
 
     auto load_block_mtp = [&](int il) {
@@ -477,12 +489,29 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_ffn(ggml_tensor * cur, cons
     // Qwen3.5 does not use MoE FFN
     GGML_ASSERT(model.layers[il].ffn_gate_inp == nullptr);
 
-    cur = build_ffn(cur,
+    ggml_tensor * inp = cur;
+
+    cur = build_ffn(inp,
         model.layers[il].ffn_up, NULL, model.layers[il].ffn_up_s,
         model.layers[il].ffn_gate, NULL, model.layers[il].ffn_gate_s,
         model.layers[il].ffn_down, NULL, model.layers[il].ffn_down_s,
         NULL,
         LLM_FFN_SILU, LLM_FFN_PAR, il);
+
+    // Agnes 3.0: a second SwiGLU on the SAME input, summed into the same residual.
+    // Reference modeling_agnes.py AgnesMLP.forward: y = down(act(gate(x))*up(x)); y = y + parallel_ffn(x).
+    // Note LLM_FFN_PAR above is unrelated -- it means "gate runs parallel to up" inside one SwiGLU.
+    if (model.layers[il].ffn_up_par != nullptr) {
+        ggml_tensor * par = build_ffn(inp,
+            model.layers[il].ffn_up_par, NULL, NULL,
+            model.layers[il].ffn_gate_par, NULL, NULL,
+            model.layers[il].ffn_down_par, NULL, NULL,
+            NULL,
+            LLM_FFN_SILU, LLM_FFN_PAR, il);
+        cb(par, "ffn_par_out", il);
+        cur = ggml_add(ctx0, cur, par);
+    }
+
     cb(cur, "ffn_out", il);
 
     return cur;

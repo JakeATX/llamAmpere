@@ -559,6 +559,19 @@ class TensorNameMap:
         ),
 
         # Feed-forward gate
+        # Second, narrower SwiGLU branch run in parallel with the main FFN (Agnes 3.0).
+        MODEL_TENSOR.FFN_GATE_PAR: (
+            "model.layers.{bid}.mlp.parallel_ffn.gate_proj",
+        ),
+
+        MODEL_TENSOR.FFN_DOWN_PAR: (
+            "model.layers.{bid}.mlp.parallel_ffn.down_proj",
+        ),
+
+        MODEL_TENSOR.FFN_UP_PAR: (
+            "model.layers.{bid}.mlp.parallel_ffn.up_proj",
+        ),
+
         MODEL_TENSOR.FFN_GATE: (
             "model.layers.{bid}.mlp.gate_proj",               # llama-hf refact olmo2
             "layers.{bid}.mlp.gate_proj",                     # embeddinggemma

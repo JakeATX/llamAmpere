@@ -90,6 +90,7 @@ struct llama_hparams {
     uint32_t n_lora_q           = 0;
     uint32_t n_lora_kv          = 0;
     uint32_t n_ff_exp           = 0;
+    uint32_t n_ff_par           = 0; // second, parallel FFN branch width (0 = none); Agnes 3.0
     uint32_t n_ff_shexp         = 0;
     uint32_t n_ff_chexp         = 0;
     uint32_t n_expert_shared    = 0;
