@@ -8,13 +8,17 @@
 #include <cstdio>
 #include <vector>
 
-static llama_context * make_ctx(const common_params & params, llama_model * model) {
+static llama_context * make_ctx_n(const common_params & params, llama_model * model, uint32_t n_seq_max) {
     auto cparams = common_context_params_to_llama(params);
-    cparams.n_seq_max = 1;
+    cparams.n_seq_max = n_seq_max;
     cparams.n_rs_seq  = 8;
     cparams.n_batch   = std::max(cparams.n_batch,  (uint32_t) (cparams.n_rs_seq + 1));
     cparams.n_ubatch  = std::max(cparams.n_ubatch, (uint32_t) (cparams.n_rs_seq + 1));
     return llama_init_from_model(model, cparams);
+}
+
+static llama_context * make_ctx(const common_params & params, llama_model * model) {
+    return make_ctx_n(params, model, 1);
 }
 
 static bool decode_tokens(llama_context * ctx, const std::vector<llama_token> & tokens, uint32_t count) {
@@ -33,6 +37,268 @@ static bool decode_one(llama_context * ctx, llama_token tok, llama_pos pos) {
     const bool ok = llama_decode(ctx, batch) == 0;
     llama_batch_free(batch);
     return ok;
+}
+
+// ---------------------------------------------------------------------------
+// RB1b gates. RB1 (3772c377e) bounded the snapshot WRITER; RB1b bounds the
+// READER. `set_rs_idx` clamped a rollback request to n_rs_seq -- the ring
+// CAPACITY -- which says nothing about whether those slots were ever filled for
+// this sequence, so a rollback into a fresh, recycled or restored sequence was
+// accepted and silently restored a state that never existed. rs_valid[seq]
+// tracks how many slots behind the head really hold this sequence's data.
+//
+// Note on reachability: in a clean single-sequence history rs_valid can never
+// bind, because seq_rm's own position guard (0 < p0) already caps a rollback at
+// cell.pos, and a sequence that decoded cell.pos+1 tokens has at least that many
+// valid snapshots. The bound only matters on the paths where the ring holds data
+// that is not this sequence's: after a state restore, after seq_cp, and after
+// repeated rollbacks have consumed it. Those are exactly the cases below, and
+// they are why production never tripped the old unbounded reader.
+// ---------------------------------------------------------------------------
+
+static bool decode_one_seq(llama_context * ctx, llama_token tok, llama_pos pos, llama_seq_id seq) {
+    llama_batch batch = llama_batch_init(1, 0, 1);
+    common_batch_add(batch, tok, pos, { seq }, true);
+    const bool ok = llama_decode(ctx, batch) == 0;
+    llama_batch_free(batch);
+    return ok;
+}
+
+static bool decode_tokens_seq(llama_context * ctx, const std::vector<llama_token> & tokens, uint32_t count, llama_seq_id seq) {
+    llama_batch batch = llama_batch_init(count, 0, 1);
+    for (uint32_t pos = 0; pos < count; ++pos) {
+        common_batch_add(batch, tokens[pos], pos, { seq }, pos + 1 == count);
+    }
+    const bool ok = llama_decode(ctx, batch) == 0;
+    llama_batch_free(batch);
+    return ok;
+}
+
+// Roll a sequence back by `r` tokens from its current head at `head_pos`.
+static bool rollback_by(llama_context * ctx, llama_seq_id seq, llama_pos head_pos, uint32_t r) {
+    return llama_memory_seq_rm(llama_get_memory(ctx), seq, head_pos - (llama_pos) r + 1, -1);
+}
+
+// Replay `n` tokens starting at `from` and capture the logits of each step.
+static bool replay_capture(llama_context * ctx, const std::vector<llama_token> & tokens,
+                           llama_pos from, uint32_t n, llama_seq_id seq, int n_vocab,
+                           std::vector<std::vector<float>> & out) {
+    out.assign(n, {});
+    for (uint32_t i = 0; i < n; ++i) {
+        const llama_pos pos = from + (llama_pos) i;
+        if (!decode_one_seq(ctx, tokens[pos], pos, seq)) {
+            return false;
+        }
+        const float * lg = llama_get_logits_ith(ctx, 0);
+        if (lg == nullptr) {
+            return false;
+        }
+        out[i].assign(lg, lg + n_vocab);
+    }
+    return true;
+}
+
+static bool logits_match(const std::vector<std::vector<float>> & a,
+                         const std::vector<std::vector<float>> & b, float eps, const char * what) {
+    if (a.size() != b.size()) {
+        fprintf(stderr, "rb1b : %s replay length mismatch (%zu != %zu)\n", what, a.size(), b.size());
+        return false;
+    }
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (a[i].size() != b[i].size()) {
+            fprintf(stderr, "rb1b : %s vocab mismatch at step %zu\n", what, i);
+            return false;
+        }
+        for (size_t t = 0; t < a[i].size(); ++t) {
+            if (std::fabs(a[i][t] - b[i][t]) > eps) {
+                fprintf(stderr, "rb1b : %s logits mismatch at step %zu, token %zu (%g != %g)\n",
+                        what, i, t, (double) a[i][t], (double) b[i][t]);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static int run_rb1b_gates(const common_params & params, llama_model * model,
+                          const std::vector<llama_token> & tokens, uint32_t n_rs_seq, int n_vocab) {
+    constexpr float eps = 1e-5f;
+    const uint32_t  n_tokens = tokens.size();
+    const llama_pos head     = (llama_pos) n_tokens - 1;
+    int failures = 0;
+
+    // --- Gate A: the depth boundary on a short history, and a correction to the plan.
+    // RB1b's plan phrased case (a) as "rollback on a sequence with fewer than n_rs_seq decoded
+    // tokens must be REFUSED". That is not reachable, and it is not what correct behaviour would
+    // be. A sequence that decoded k tokens has k valid snapshots and may legally roll back k-1 of
+    // them regardless of ring capacity. And a DEEPER request cannot even reach the rs_valid bound:
+    // rolling back r from head h means seq_rm(p0 = h-r+1), and the rollback branch is guarded by
+    // `0 < p0`, so r = k (p0 = 0) is not a rollback at all -- it is a full erase of the sequence,
+    // which falls through to the tail-invalidation path and correctly returns true. There is no
+    // over-deep rollback expressible through seq_rm on a clean single-sequence history.
+    //
+    // So rs_valid can only ever bind where the ring holds data that is NOT this sequence's:
+    // after a state restore (gate D), after seq_cp (gate C), or after rollbacks have consumed it
+    // (gate B). That is exactly why the unbounded reader never tripped in production. This gate
+    // pins the one thing that is checkable here -- the deepest legal rollback is still accepted,
+    // i.e. rs_valid is not under-counting and silently disabling legitimate rollbacks.
+    {
+        const uint32_t k = std::min<uint32_t>(4, n_tokens);
+        if (k < 3 || k >= n_rs_seq) {
+            fprintf(stderr, "rb1b : gate A SKIP -- need 3 <= k < n_rs_seq (k=%u n_rs_seq=%u)\n", k, n_rs_seq);
+        } else {
+            llama_context * ctx_s = make_ctx(params, model);
+            if (ctx_s == nullptr) {
+                fprintf(stderr, "rb1b : gate A context init failed\n");
+                return 1;
+            }
+            const llama_pos h = (llama_pos) k - 1;
+            if (!decode_tokens_seq(ctx_s, tokens, k, 0)) {
+                fprintf(stderr, "rb1b : gate A FAIL -- short decode failed\n");
+                failures++;
+            } else if (!rollback_by(ctx_s, 0, h, k - 1)) {
+                fprintf(stderr, "rb1b : gate A FAIL -- the deepest legal rollback (%u on a %u-token "
+                                "history) was refused; rs_valid is under-counting\n", k - 1, k);
+                failures++;
+            } else {
+                fprintf(stderr, "rb1b : gate A PASS -- %u-token history accepts its deepest legal "
+                                "rollback of %u\n", k, k - 1);
+            }
+            llama_free(ctx_s);
+        }
+    }
+
+    // --- Gate B: rollbacks COMPOSE. Two seq_rm of 1 before any decode must land
+    // exactly where one seq_rm of 2 lands. The old code assigned rs_idx instead
+    // of adding to it, so the second rollback restored a state one token too new.
+    {
+        std::vector<std::vector<float>> lg_two, lg_one;
+        bool ok = true;
+        {   // 1 + 1, then free before the second context exists
+            llama_context * ctx_two = make_ctx(params, model);
+            if (ctx_two == nullptr) { fprintf(stderr, "rb1b : gate B context init failed\n"); return 1; }
+            ok = decode_tokens_seq(ctx_two, tokens, n_tokens, 0) &&
+                 rollback_by(ctx_two, 0, head,     1) &&
+                 rollback_by(ctx_two, 0, head - 1, 1) &&
+                 replay_capture(ctx_two, tokens, head - 1, 2, 0, n_vocab, lg_two);
+            llama_free(ctx_two);
+        }
+        if (ok) {   // one shot of 2
+            llama_context * ctx_one = make_ctx(params, model);
+            if (ctx_one == nullptr) { fprintf(stderr, "rb1b : gate B context init failed\n"); return 1; }
+            ok = decode_tokens_seq(ctx_one, tokens, n_tokens, 0) &&
+                 rollback_by(ctx_one, 0, head, 2) &&
+                 replay_capture(ctx_one, tokens, head - 1, 2, 0, n_vocab, lg_one);
+            llama_free(ctx_one);
+        }
+        if (!ok) {
+            fprintf(stderr, "rb1b : gate B FAIL -- a rollback that should be legal was refused, "
+                            "or its replay failed\n");
+            failures++;
+        } else if (!logits_match(lg_two, lg_one, eps, "gate B (1+1 vs 2)")) {
+            failures++;
+        } else {
+            fprintf(stderr, "rb1b : gate B PASS -- 1+1 composes to 2\n");
+        }
+    }
+
+    // --- Gate D: a sequence restored from a state blob has NO valid snapshots of
+    // its own, so a rollback must be REFUSED, not silently served from whatever
+    // the ring happened to contain. After refilling the ring it must work again.
+    {
+        std::vector<uint8_t> blob;
+        size_t got = 0;
+        {
+            llama_context * ctx_a = make_ctx(params, model);
+            if (ctx_a == nullptr) { fprintf(stderr, "rb1b : gate D context init failed\n"); return 1; }
+            if (decode_tokens_seq(ctx_a, tokens, n_tokens, 0)) {
+                blob.resize(llama_state_seq_get_size(ctx_a, 0));
+                got = llama_state_seq_get_data(ctx_a, blob.data(), blob.size(), 0);
+            }
+            llama_free(ctx_a);
+        }
+        llama_context * ctx_b = make_ctx(params, model);
+        if (ctx_b == nullptr) {
+            fprintf(stderr, "rb1b : gate D context init failed\n");
+            return 1;
+        }
+        if (got == 0) {
+            fprintf(stderr, "rb1b : gate D FAIL -- source decode or state save failed\n");
+            failures++;
+        } else {
+            const size_t set = llama_state_seq_set_data(ctx_b, blob.data(), got, 0);
+            if (set == 0) {
+                fprintf(stderr, "rb1b : gate D SKIP -- state seq restore unavailable (got=%zu set=%zu)\n", got, set);
+            } else if (rollback_by(ctx_b, 0, head, 2)) {
+                fprintf(stderr, "rb1b : gate D FAIL -- rollback accepted on a freshly restored sequence "
+                                "with no snapshots of its own\n");
+                failures++;
+            } else {
+                // Refill the ring, then the same rollback must be accepted.
+                bool ok = true;
+                for (uint32_t i = 0; i < n_rs_seq && ok; ++i) {
+                    ok = decode_one_seq(ctx_b, tokens[i % n_tokens], head + 1 + (llama_pos) i, 0);
+                }
+                if (!ok) {
+                    fprintf(stderr, "rb1b : gate D FAIL -- refill decode failed\n");
+                    failures++;
+                } else if (!rollback_by(ctx_b, 0, head + (llama_pos) n_rs_seq, 2)) {
+                    fprintf(stderr, "rb1b : gate D FAIL -- rollback still refused after refilling the ring\n");
+                    failures++;
+                } else {
+                    fprintf(stderr, "rb1b : gate D PASS -- refused after restore, accepted after refill\n");
+                }
+            }
+        }
+        llama_free(ctx_b);
+    }
+
+    // --- Gate C: seq_cp must carry the rollback bookkeeping. A branch created by
+    // seq_cp inherits the source's tail cell and therefore its snapshot ring, so
+    // rolling the DESTINATION back must give the same thing as rolling the SOURCE
+    // back. Before RB1b the destination inherited rs_valid == 0 and could not roll
+    // back at all.
+    {
+        std::vector<std::vector<float>> lg_dst, lg_ref;
+        bool ok = true, skip = false;
+        {
+            llama_context * ctx_cp = make_ctx_n(params, model, 2);
+            if (ctx_cp == nullptr) {
+                fprintf(stderr, "rb1b : gate C SKIP -- could not init a 2-sequence context\n");
+                skip = true;
+            } else {
+                ok = decode_tokens_seq(ctx_cp, tokens, n_tokens, 0);
+                if (ok) {
+                    llama_memory_seq_cp(llama_get_memory(ctx_cp), 0, 1, -1, -1);
+                }
+                ok = ok && rollback_by(ctx_cp, 1, head, 2) &&
+                     replay_capture(ctx_cp, tokens, head - 1, 2, 1, n_vocab, lg_dst);
+                llama_free(ctx_cp);
+            }
+        }
+        if (!skip && ok) {
+            llama_context * ctx_ref = make_ctx(params, model);
+            if (ctx_ref == nullptr) { fprintf(stderr, "rb1b : gate C context init failed\n"); return 1; }
+            ok = decode_tokens_seq(ctx_ref, tokens, n_tokens, 0) &&
+                 rollback_by(ctx_ref, 0, head, 2) &&
+                 replay_capture(ctx_ref, tokens, head - 1, 2, 0, n_vocab, lg_ref);
+            llama_free(ctx_ref);
+        }
+        if (skip) {
+            // already reported
+        } else if (!ok) {
+            fprintf(stderr, "rb1b : gate C FAIL -- rollback on the seq_cp destination (or the "
+                            "reference) was refused, or its replay failed\n");
+            failures++;
+        } else if (!logits_match(lg_dst, lg_ref, eps, "gate C (seq_cp dst vs src)")) {
+            failures++;
+        } else {
+            fprintf(stderr, "rb1b : gate C PASS -- seq_cp destination rolls back like the source\n");
+        }
+    }
+
+    fprintf(stderr, "rb1b : %d gate failure(s)\n", failures);
+    return failures == 0 ? 0 : 1;
 }
 
 int main(int argc, char ** argv) {
@@ -217,8 +483,14 @@ int main(int argc, char ** argv) {
     }
 
     fprintf(stderr, "%s : recurrent rollback checkpoint restored successfully\n", __func__);
+
+    // RB1b reader-bound gates. Run after the original checkpoint test so a failure here is
+    // unambiguously the new bookkeeping and not the pre-existing path -- and only after the
+    // three contexts above are freed, because on a 27B model each rs cache is over a GiB and
+    // holding the originals alive alongside the gates' own is an out-of-memory, not a result.
     llama_free(ctx_src);
     llama_free(ctx_dst);
     llama_free(ctx_dirty);
-    return 0;
+
+    return run_rb1b_gates(params, model, tokens, n_rs_seq, n_vocab);
 }

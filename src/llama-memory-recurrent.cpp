@@ -35,6 +35,7 @@ llama_memory_recurrent::llama_memory_recurrent(
 
     this->n_rs_seq = n_rs_seq;
     rs_idx.assign(n_seq_max, 0);
+    rs_valid.assign(n_seq_max, 0);
 
     // DRC: opt-in via --gdn-replay (threaded through common_params/cparams) or, for quick
     // testing without touching CLI args, LLAMA_GDN_REPLAY=1 (mirrors the LLAMA_SPEC_CHAIN
@@ -192,6 +193,8 @@ void llama_memory_recurrent::clear(bool data) {
 
     std::fill(rs_idx.begin(), rs_idx.end(), 0);
     std::fill(replay_len.begin(), replay_len.end(), 0);
+    // the snapshot planes are stale (or zeroed, when data) for every seq -- nothing may roll back
+    std::fill(rs_valid.begin(), rs_valid.end(), 0);
 }
 
 bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -209,6 +212,9 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
     if (rm_all) {
         if (seq_id >= 0) {
             set_rs_idx(seq_id, 0);
+            if ((size_t) seq_id < rs_valid.size()) {
+                rs_valid[seq_id] = 0;
+            }
             if (gdn_replay && (size_t) seq_id < replay_len.size()) {
                 // a released/fully-cleared slot must not carry a pending replay into whatever
                 // (possibly unrelated) sequence reuses it next.
@@ -217,6 +223,7 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
         } else {
             std::fill(rs_idx.begin(), rs_idx.end(), 0);
             std::fill(replay_len.begin(), replay_len.end(), 0);
+            std::fill(rs_valid.begin(), rs_valid.end(), 0);
         }
     }
 
@@ -235,12 +242,22 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
             // via a pending replay of the last `rollback` ingredient-ring steps.
             if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
                 const llama_pos rollback = cell.pos - (p0 - 1);
-                if (rollback >= 1 && rollback <= (llama_pos) n_rs_seq) {
+                // RB1b: n_rs_seq is the ring capacity, not the number of slots this sequence has
+                // actually filled. Bound the request by what was really written, and compose with
+                // any rollback already pending -- two seq_rm calls before the next decode must add
+                // up (roll back 1, then 1 more, is a rollback of 2), where the old code overwrote
+                // the pending index and restored a state one token too new.
+                const uint32_t have = (size_t) seq_id < rs_valid.size() ? rs_valid[seq_id] : 0;
+                if (rollback >= 1 && rollback <= (llama_pos) n_rs_seq && rollback <= (llama_pos) have) {
                     if (gdn_replay) {
-                        replay_len[seq_id] = (uint32_t) rollback;
+                        replay_len[seq_id] += (uint32_t) rollback;
+                        if (replay_len[seq_id] > n_rs_seq) {
+                            replay_len[seq_id] = n_rs_seq;
+                        }
                     } else {
-                        set_rs_idx(seq_id, (uint32_t) rollback);
+                        set_rs_idx(seq_id, rs_idx[seq_id] + (uint32_t) rollback);
                     }
+                    rs_valid[seq_id] = have - (uint32_t) rollback;
                     cell.pos = p0 - 1;
                     return true;
                 }
@@ -323,6 +340,17 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
 
             cell_src.seq_id.insert(seq_id_dst);
             tail_dst.tail = tail_src.tail;
+        }
+
+        // RB1b: the destination now shares the source's tail cell, so it shares the source's
+        // snapshot history too. Carrying none of this over left the copy with rs_valid == 0 (no
+        // rollback possible on a branch that demonstrably has one) while a stale rs_idx/replay_len
+        // on the destination could still be consumed by the next s_copy.
+        const size_t nrs = rs_idx.size();
+        if ((size_t) seq_id_src < nrs && (size_t) seq_id_dst < nrs) {
+            rs_idx[seq_id_dst]     = rs_idx[seq_id_src];
+            rs_valid[seq_id_dst]   = rs_valid[seq_id_src];
+            replay_len[seq_id_dst] = replay_len[seq_id_src];
         }
     }
 }
@@ -705,6 +733,26 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             const llama_seq_id seq_id = ubatch.seq_id[i][j];
             cell.seq_id.insert(seq_id);
             cells[seq_id].tail = cell_id;
+
+            // RB1b: this ubatch contributes n_seq_tokens new snapshots for the seq (the writer
+            // bound from 3772c377e), so that many more slots behind the head are now real.
+            // Saturates at the ring capacity; older slots survive, which is why this accumulates
+            // rather than assigns. Assigning would report 1 valid slot after a 1-token ubatch and
+            // refuse the perfectly legal deep rollback that test-recurrent-state-rollback performs
+            // after replaying N tokens one at a time.
+            //
+            // The shared-cell question the first pass left open ("is n_seq_tokens really this
+            // seq's contribution when one cell carries several seq_ids?") is YES, and it is a
+            // property of the indexing right above: the ubatch is equal-split, `i` is pinned to
+            // s*n_seq_tokens -- the FIRST token slot of stream s -- and `j` walks the seq_ids
+            // attached to that one slot. Every such seq_id aliases the same token run, so each
+            // really did receive all n_seq_tokens of them. There is no over-credit. (This leans on
+            // the equal-split invariant, but so does the cell.pos update directly above it, so
+            // rs_valid assumes nothing the surrounding code did not already assume.)
+            if (n_rs_seq != 0 && (size_t) seq_id < rs_valid.size()) {
+                const uint64_t grown = (uint64_t) rs_valid[seq_id] + n_seq_tokens;
+                rs_valid[seq_id] = grown > n_rs_seq ? n_rs_seq : (uint32_t) grown;
+            }
         }
     }
 
@@ -918,10 +966,23 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
     }
 
     if (n_rs_seq != 0) {
+        // RB1b: state_write serialises only the authoritative plane, not the (1 + n_rs_seq)
+        // snapshot widening or the gdn_replay ingredient ring, so after a restore those planes
+        // hold whatever the buffer happened to contain. Resetting rs_idx alone was not enough --
+        // it stops the *pending* rollback but not a later seq_rm from selecting a plane that was
+        // never written in this session. Declaring zero valid snapshots is the honest state:
+        // rollback becomes unavailable until the sequence has decoded enough tokens to refill the
+        // ring. Serialising the full plane is the follow-up that removes that restriction.
         if (seq_id == -1) {
             std::fill(rs_idx.begin(), rs_idx.end(), 0);
+            std::fill(replay_len.begin(), replay_len.end(), 0);
+            std::fill(rs_valid.begin(), rs_valid.end(), 0);
         } else {
             set_rs_idx(seq_id, 0);
+            if ((size_t) seq_id < rs_valid.size()) {
+                rs_valid[seq_id]   = 0;
+                replay_len[seq_id] = 0;
+            }
         }
     }
 }

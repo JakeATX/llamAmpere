@@ -77,6 +77,17 @@ public:
     // per-seq rollback index
     std::vector<uint32_t> rs_idx;
 
+    // RB1b: how many rollback snapshots behind the current head actually hold data written for
+    // this sequence. rs_idx is only *clamped* to n_rs_seq, which says nothing about whether the
+    // slot it selects was ever produced: a fresh sequence, a cleared slot, or a session restored
+    // from a state file all have rs_idx == 0 but n_rs_seq slots of stale or foreign data behind
+    // them. Without this bound a seq_rm rollback of r steps silently restores a state that never
+    // existed -- the read-side twin of the writer bug fixed in 3772c377e.
+    // Grows by the number of tokens a ubatch contributes for the seq (capped at n_rs_seq),
+    // shrinks by the rollback distance when one is accepted, and is zeroed by every path that
+    // invalidates the snapshots: clear(), rm_all, and state_read.
+    std::vector<uint32_t> rs_valid;
+
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
 
     // DRC phase 2 (opt-in, env-gated by LLAMA_GDN_REPLAY): when true, `s_l` holds only the
