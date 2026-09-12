@@ -639,7 +639,7 @@ class MODEL_TENSOR(IntEnum):
     FFN_GATE             = auto()
     FFN_DOWN             = auto()
     FFN_UP               = auto()
-    FFN_GATE_PAR         = auto() # second, narrower SwiGLU branch run in parallel (Agnes 3.0)
+    FFN_GATE_PAR         = auto()
     FFN_DOWN_PAR         = auto()
     FFN_UP_PAR           = auto()
     FFN_ACT              = auto()

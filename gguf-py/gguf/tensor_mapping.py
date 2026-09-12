@@ -559,7 +559,7 @@ class TensorNameMap:
         ),
 
         # Feed-forward gate
-        # Second, narrower SwiGLU branch run in parallel with the main FFN (Agnes 3.0).
+        # Agnes 3.0 parallel FFN
         MODEL_TENSOR.FFN_GATE_PAR: (
             "model.layers.{bid}.mlp.parallel_ffn.gate_proj",
         ),

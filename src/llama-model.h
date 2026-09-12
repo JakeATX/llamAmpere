@@ -301,7 +301,6 @@ struct llama_layer {
     struct ggml_tensor * ffn_down     = nullptr; // w2
     struct ggml_tensor * ffn_up       = nullptr; // w3
 
-    // second SwiGLU branch, run in parallel with the main FFN on the same input (Agnes 3.0)
     struct ggml_tensor * ffn_gate_par = nullptr;
     struct ggml_tensor * ffn_down_par = nullptr;
     struct ggml_tensor * ffn_up_par   = nullptr;

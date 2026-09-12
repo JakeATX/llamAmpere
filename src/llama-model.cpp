@@ -1285,7 +1285,6 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     std::fill(hparams.swiglu_clamp_shexp.begin(), hparams.swiglu_clamp_shexp.end(), 0.0f);
 
     ml.get_key_or_arr(LLM_KV_FEED_FORWARD_LENGTH,  hparams.n_ff_arr,   hparams.n_layer(), false);
-    // optional: absent for every architecture except Agnes 3.0, which runs a second FFN branch
     ml.get_key(LLM_KV_FEED_FORWARD_PARALLEL_LENGTH, hparams.n_ff_par, false);
     ml.get_key_or_arr(LLM_KV_ATTENTION_HEAD_COUNT, hparams.n_head_arr, hparams.n_layer(), false);
 

@@ -13,7 +13,7 @@ rather than a new architecture:
 |---|---|
 | layers | 72 text + 1 MTP (`blk.72`) |
 | layer mix | 54 delta-rule (`agnes_delta_attention`) + 18 global (`agnes_global_attention`) |
-| global attention | every 4th layer, at indices 3, 7, 11, … 71 |
+| global attention | every 4th layer, at indices 3, 7, 11, ... 71 |
 | hidden size | 5120 |
 | FFN | 17408, **plus a second parallel SwiGLU at 2048** |
 | attention | 24 heads / 4 KV heads, head_dim 256, output gate, partial rotary 0.25 |
@@ -39,7 +39,7 @@ parameters live.
 
 Support for it is three additions:
 
-- a KV key `{arch}.feed_forward_parallel_length` → `hparams.n_ff_par`
+- a KV key `{arch}.feed_forward_parallel_length` -> `hparams.n_ff_par`
 - tensors `blk.N.ffn_{gate,down,up}_par`, created only when `n_ff_par > 0`
 - `build_layer_ffn` evaluates both branches from the same input and sums them
 
@@ -57,7 +57,7 @@ python convert_hf_to_gguf.py --outtype bf16 \
 
 A correct conversion has **1188 tensors**: 1521 in the checkpoint minus 333
 vision-tower tensors, which are not exported. Of those, **216 are `ffn_*_par`**
-(72 layers × 3) at shapes `{5120, 2048}` for gate and up and `{2048, 5120}` for
+(72 layers x 3) at shapes `{5120, 2048}` for gate and up and `{2048, 5120}` for
 down. All 15 MTP tensors land at `blk.72`.
 
 Header keys worth checking after a convert:

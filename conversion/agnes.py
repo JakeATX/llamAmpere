@@ -11,16 +11,7 @@ from .qwen import _LinearAttentionVReorderBase, _Qwen35MRopeMixin
 
 @ModelBase.register("AgnesForConditionalGeneration")
 class AgnesTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
-    """Agnes 3.0: hybrid delta-rule / global attention with a second FFN run in parallel.
-
-    The attention modules use the same math and the same norm conventions as Qwen3.5 and differ
-    only in naming (delta_attn / global_attn), so the names are rewritten and the whole Qwen3.5
-    tensor mapping is reused rather than duplicated. What is genuinely new is the second, narrower
-    SwiGLU branch, which is exported as its own ffn_{gate,down,up}_par tensors on every layer.
-
-    Exports the text model and the one-layer MTP head. The vision tower is dropped: the mmproj
-    path has no Agnes encoder, and the base filter already skips `visual.`/`vision.` tensors.
-    """
+    """Agnes 3.0 text model with hybrid attention and a second FFN branch."""
 
     model_arch = gguf.MODEL_ARCH.QWEN35
 
@@ -31,7 +22,7 @@ class AgnesTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         return super().filter_tensors((name, gen))
 
     def set_gguf_parameters(self):
-        # The shared Qwen3.5 parameter writer expects Qwen's layer-type and interval key names.
+        # Normalize Agnes names for the Qwen3.5 parameter writer.
         layer_types = self.hparams.get("layer_types")
         if layer_types is not None:
             self.hparams["layer_types"] = [
