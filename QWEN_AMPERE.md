@@ -5,17 +5,22 @@ Qwen3.8-27B on one Ampere card (RTX 3090 / 3090 Ti, 24 GB): a fork of
 (TurboQuant+ KV cache, native MTP speculative decoding) carrying SM86-specific
 kernel and memory work, plus the quantization recipe it was tuned with.
 
-This is v0.2 (2026-09-07), the successor of
+This is v0.3 (2026-09-13), the successor of v0.2 (2026-09-07) and of
 [llama-cpp-qwen-ampere](https://github.com/JakeATX/llama-cpp-qwen-ampere) (v0.1, 2026-09-03).
-v0.2 adds a 64K draft-vocabulary shortlist for the MTP head, an exact rewrite of the
-Turbo3 attention loaders and the IQ4_XS matrix-vector path, a pinned-buffer fix, and an
-opt-in GPU greedy verifier. The write-up with figures is
+v0.3 replaces the draft verification rule with exact p/q verification, defaults the fused MMA
+attention path for q8_0-K/turbo3-V and extends it to q8_0-V, and bounds recurrent rollback to the
+snapshots a ubatch actually wrote. It is 1.28x v0.2 and 1.46x stock llama.cpp on clean fixtures, and
+1.70x upstream TurboQuant at 100K KV depth. The write-up with figures is
+[docs/llamampere-v0.3/ARTICLE.md](docs/llamampere-v0.3/ARTICLE.md); v0.2's is
 [docs/llamampere-v0.2/ARTICLE.md](docs/llamampere-v0.2/ARTICLE.md).
 
 Measured on a 3090 Ti at 350 W with the ATX-IQ4_XS-M quant (working name ATX-4-XS, which the filenames keep; IQ4_XS base, M-pattern upgrades, 4.56 bpw):
 
 | | |
 |---|---|
+| clean-fixture decode, temperature 1, MTP-3 (v0.3) | 99.4 tok/s; v0.2 77.9, upstream TurboQuant 62.4, stock llama.cpp 67.9 |
+| 100K KV depth, temperature 1, MTP-3 (v0.3) | 93.16 tok/s decode; upstream TurboQuant 54.96 (1.70x) |
+| deepest context that loads with MTP-3 (v0.3) | 229,376; upstream TurboQuant on UD-Q3_K_XL 262,144, stock llama.cpp on UD-Q3_K_XL 212,992 |
 | 100K-token generation, temperature 1, MTP-3 (v0.2) | 75.3 tok/s cumulative over 102,400 generated tokens; v0.1 as documented 66.1, upstream TurboQuant+ of 2026-09-03 56.0 |
 | 220K prompt populated with the shortlist (v0.2) | 22,174 MiB peak, +150 MiB over v0.1, no OOM |
 | populated 200K context (v0.1 measurement) | 20.9 GiB ready VRAM, 694 tok/s prefill, 65 tok/s decode |
@@ -38,7 +43,8 @@ Q8_0.
 
 | branch | what it is |
 |---|---|
-| `main` | the product (v0.2): upstream TurboQuant+ as of 2026-09-03 plus all accepted SM86 work through 2026-09-07. Build from here. |
+| `main` | the product (v0.3): upstream TurboQuant+ as of 2026-09-03 plus all accepted SM86 work through 2026-09-13. Build from here. |
+| `release/v0.3` | the exact commit (`36a6bca81`) every v0.3 number in this file was measured on |
 | `perf/qwen38-sm86-decode-product`, `perf/qwen38-sm86-prefill` | the same commit as `main` at the 2026-09-03 release, kept for existing links |
 | `research/qwen38-sm86-*` | experiment branches with opt-in knobs; see the handover |
 | `archive/*` | rejected or superseded experiments |
@@ -105,6 +111,103 @@ the shared compute arena; the research knobs (`GGML_Q8_TURBO3_MMA_MIN_Q`,
 you are reproducing a rejected experiment.
 
 W2 research control: `LLAMA_OUTPUT_BUFFER_REUSE=0` restores the original combined output/sampling buffer, row reservation, and lazy allocation policy. The default keeps sampling storage separate, retains the largest row reservation, and reserves added embeddings during setup. Compare this control with GPU verification disabled on both sides to isolate allocation behavior. Avoided setup allocations do not imply a sustained tokens-per-second gain.
+
+## v0.3 release notes (2026-09-13)
+
+Same card and model as above. Four arms, one protocol: **stock llama.cpp** is upstream master
+`8ea290247`, **TurboQuant** is `1208c5956` built clean, **v0.2** is `44233f009`, **v0.3** is
+`36a6bca81`. Each arm is launched with only the flags its own tree understands. Decode tok/s at
+temperature 1, top-k 20, top-p 0.95, MTP depth 3, mean of three runs:
+
+| workload | stock llama.cpp | TurboQuant | v0.2 | **v0.3** | vs stock | vs TurboQuant | vs v0.2 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| agentic (3 fixtures) | 68.6 | 66.1 | 81.3 | 100.9 | 1.47x | 1.53x | 1.24x |
+| coding (1 fixture) | 65.7 | 51.3 | 67.8 | 94.9 | 1.45x | 1.85x | 1.40x |
+| **all clean fixtures** | 67.9 | 62.4 | 77.9 | **99.4** | **1.46x** | **1.61x** | **1.28x** |
+
+Retrieval fixtures are excluded, and so are two coding cells -- not missing, excluded. On those
+prompts every arm except v0.3 degenerates into repetition before the generation ends. Degenerate text
+is trivially draftable, so a looping arm posts an inflated tok/s. The contamination does not run in
+one direction (on one shard it understates our margin, on another it flatters us) and cannot be
+corrected arithmetically, so those cells are dropped rather than adjusted. The full argument is in
+[docs/llamampere-v0.3/ARTICLE.md](docs/llamampere-v0.3/ARTICLE.md).
+
+**The decomposition matters more than the ratio.** At a fixed draft depth every run reports
+`predicted_n` and `draft_n_accepted`, and those split a speedup exactly, with nothing estimated:
+`passes = predicted_n - draft_n_accepted`, so `tok/pass` isolates acceptance and `passes/s` isolates
+kernel speed.
+
+| v0.3 over | tok/s | = acceptance | x kernel | kernel's share of the log gain |
+|---|---:|---:|---:|---:|
+| v0.2 (`44233f009`) | 1.281 | 1.082 | 1.184 | 68% |
+| TurboQuant (`1208c5956`) | 1.608 | 1.082 | 1.483 | 83% |
+| stock llama.cpp (`8ea290247`) | 1.464 | 1.048 | 1.399 | 88% |
+
+Exact p/q verification is this release's headline change, and p/q is an acceptance mechanism -- yet
+acceptance contributes 1.048-1.082 and the kernels contribute 1.399-1.483. The ordering explains it:
+p/q measured +7.45% G against v0.2's rule on v0.2's kernels, but it ships on top of P5b, P5c and P6,
+and once the per-pass cost has fallen a faster pass is worth more than a fuller one. Writing this
+release up as "acceptance improved" would be false.
+
+**The margin widens with depth.** The same decomposition at 100K KV depth (100,000-token prompt,
+2,048 generated, three runs, temperature 1):
+
+| build at 100K depth | decode tok/s | tok/pass | passes/s | acceptance |
+|---|---:|---:|---:|---:|
+| TurboQuant (`1208c5956`) | 54.96 | 3.368 | 16.49 | 0.792 |
+| **v0.3 (`36a6bca81`)** | **93.16** | 3.568 | 27.22 | 0.858 |
+
+1.70x at depth against 1.61x on short fixtures, and the kernel's share rises from 83% to 95%: at
+100K the attention stack is almost the whole story.
+
+**Reachable depth is itself a result.** Probing each arm down a ladder to the deepest context it can
+actually allocate on a 24,564 MiB card with MTP enabled -- the draft context allocates a *second* KV
+cache, exactly 4,096 B/token (f16, one layer), on top of the main one:
+
+| arm | model | V-cache | deepest context that loads |
+|---|---|---|---:|
+| stock llama.cpp | UD-Q3_K_XL | q8_0 | 212,992 |
+| TurboQuant | UD-Q3_K_XL | turbo3 | 262,144 |
+| v0.2 | ATX-4-XS | turbo3 | 229,376 |
+| v0.3 | ATX-4-XS | turbo3 | 229,376 |
+
+The first two rows are the same weights and differ only in V-cache format, so the +49,152 tokens
+between them is what turbo3 buys on this card. The llamAmpere rows carry a larger model file
+(14.52 GiB against 12.24 GiB) and spend some of that headroom on quality.
+
+Read those ceilings with their condition attached: the probe left the drafter's own cache at its f16
+default, 4,096 B/token. The run command above sets `--spec-draft-type-k/v q8_0`, which is smaller,
+and that is the configuration the 245,760 window elsewhere in this file was measured in. The ladder
+was run at the f16 default so that all four arms sat on an identical drafter-cache footprint, which
+is what makes the four ceilings comparable to each other; it is not the configuration to deploy.
+
+What changed since v0.2 (`44233f009`), in merge order -- 17 commits, and excluding documentation and
+the vocabulary map, 36 files with 1,802 insertions and 130 deletions:
+
+- `b6d29742b` W5 instrumentation: donor-arena adoption log and fattn path census.
+- `2d41505a1` cuda: route q8_0-K/turbo3-V verify attention through the fused MMA kernel by default (P5b).
+- `05b49181d` cuda: conversion-free q8_0 K and turbo3 V tile loaders for the fused MMA verify kernel (P5c).
+- `52c723bb0` cuda: fused MMA attention for q8_0-K / q8_0-V caches (P6) -- gives the drafter's own cache the same kernel, and hands back 170-260 MiB.
+- `ca1aec06f` spec: port upstream DFlash2 support (PR #27342) onto P6.
+- `ba4c86d8e` cuda: `GGML_Q8_TURBO3_MMA_MAX_Q` routes widths 6..8 onto the fused (8,8) instance (DF3); built and measured, off by default.
+- `628b065e1`, `3207e7fd7` speculative: exact p/q draft verification, including the sequential MTP drafter (PQ1); on by default, `LLAMA_SPEC_PQ=0` restores the old identity-match rule.
+- `24aafbd9c` docs: run commands use the shipped p/q settings (`p_min 0`, q8_0/q8_0 drafter cache).
+- `3772c377e` delta-net: only write the conv snapshots a ubatch can produce (RB1).
+- `d2b16841f` cuda: SM86 cross-column reuse for Q5_0, and make the MMVQ launch table tunable.
+- `b2a5cbd0f` recurrent: bound rollback by snapshots that were actually written (RB1b).
+- `c2d647f79` cuda: raise MMVQ `rows_per_cuda_block` to 8 for the SM86 verify widths.
+- `c3421dfe0` cuda: add `GGML_CUDA_QC4_NW1` launch-shape flag for MMVQ (off by default).
+- `8feb74710` tests: reader-bound rollback gates for the recurrent state ring.
+- `1c2811776` docs: `p_min` is a target-mirrored emission gate, and it stays off by default.
+- `36a6bca81` merge RB1b into the QC kernel stack: bounded recurrent rollback + p/q docs.
+
+RB1 and RB1b buy no speed. They fix recurrent rollback writing over history it should not have
+touched -- the class of bug that surfaces as an unreproducible generation months later.
+
+Two defaults changed from v0.2's run command: `--spec-draft-p-min` is now **0** (p/q wants the full
+draft every round, where the old identity-match rule wanted a confidence gate), and
+`--spec-draft-type-v` is now **q8_0** rather than turbo3, because P6 gave the drafter's own cache a
+fused kernel. Draft depth stays at 3.
 
 ## v0.2 release notes (2026-09-07)
 
