@@ -1,5 +1,19 @@
 > **llamAmpere** (v0.3): this fork runs Qwen3.8-27B at up to 245K context on one RTX 3090 / 3090 Ti with the model's own MTP head: 99 tok/s on clean agentic and coding fixtures at temperature 1 (1.46x stock llama.cpp, 1.28x v0.2), 93 tok/s at 100K KV depth, and 1.10x tuned vLLM single-stream at 32K. Start with [QWEN_AMPERE.md](QWEN_AMPERE.md) and the write-up in [docs/llamampere-v0.3/ARTICLE.md](docs/llamampere-v0.3/ARTICLE.md) (v0.2: [docs/llamampere-v0.2/ARTICLE.md](docs/llamampere-v0.2/ARTICLE.md)). Successor of [llama-cpp-qwen-ampere](https://github.com/JakeATX/llama-cpp-qwen-ampere) (v0.1). It also loads **Agnes 3.0 Flash**, including its MTP head, which upstream llama.cpp does not; see [docs/agnes-3.0-flash.md](docs/agnes-3.0-flash.md). The rest of this README is upstream llama.cpp's.
 
+**Fastest configuration (v0.3, one RTX 3090 / 3090 Ti).** Build from `main` as in [QWEN_AMPERE.md](QWEN_AMPERE.md#build-and-run), with the GGUF from [jakeatx/Qwen3.8-27B-ATX-IQ4_XS-M-GGUF](https://huggingface.co/jakeatx/Qwen3.8-27B-ATX-IQ4_XS-M-GGUF), then:
+
+```bash
+GGML_Q8_TURBO3_MMA_FUSED=1 ./build-sm86/bin/llama-server -m Qwen3.8-27B-ATX-4-XS.gguf \
+  -c 245760 -b 4096 -ub 1024 -t 8 -tb 8 -ngl 99 -fa on -ctk q8_0 -ctv turbo3 \
+  --parallel 1 --jinja --fit off \
+  --cache-prompt --cache-ram 8192 --ctx-checkpoints 24 --checkpoint-min-step 10240 \
+  --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0 \
+  --spec-draft-type-k q8_0 --spec-draft-type-v q8_0 \
+  --spec-draft-vocab-map docs/mtp-vocab/atx_65536.txt
+```
+
+The speed comes from MTP-3 speculative decoding with exact p/q verification (on by default), `--spec-draft-p-min 0`, the 65,536-token draft vocabulary map, a q8_0 K / turbo3 V cache on the fused attention kernel, and a q8_0/q8_0 drafter cache. Lower `-c` if you need VRAM for something else; the decode flags stay the same.
+
 # llama.cpp
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
