@@ -1699,6 +1699,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // note: the server calls begin() after the prefill decode, so stale defer
         // rows are already handled by the position-rewind trim in process(). Rows
         // that remain here belong to this prompt and feed the next draft decode.
+
+        // new request: reseed the p/q draft RNG once, then it advances across draft rounds
+        if (q_smpls[seq_id]) {
+            common_sampler_reset(q_smpls[seq_id].get());
+        }
+
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
             return;
@@ -2166,9 +2172,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             n_drafting++;
             drafting[seq_id] = true;
             common_sampler_reset(smpls[seq_id].get());
-            if (q_smpls[seq_id]) {
-                common_sampler_reset(q_smpls[seq_id].get());
-            }
+            // do not reset q_smpls here: reset reseeds the RNG, so each round would reuse the same draws (reset is in begin())
             if (dp.result_q) {
                 dp.result_q->clear();
             }
