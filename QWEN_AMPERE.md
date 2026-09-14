@@ -24,7 +24,9 @@ Measured on a 3090 Ti at 350 W with the ATX-IQ4_XS-M quant (working name ATX-4-X
 | 100K-token generation, temperature 1, MTP-3 (v0.2) | 75.3 tok/s cumulative over 102,400 generated tokens; v0.1 as documented 66.1, upstream TurboQuant+ of 2026-09-03 56.0 |
 | 220K prompt populated with the shortlist (v0.2) | 22,174 MiB peak, +150 MiB over v0.1, no OOM |
 | populated 200K context (v0.1 measurement) | 20.9 GiB ready VRAM, 694 tok/s prefill, 65 tok/s decode |
-| largest measured fit | 245,760-token window with a 240K prompt, 22.1 GiB ready |
+| long session from 56K to 207K KV, temperature 1, MTP-3 (v0.3) | 95.1 tok/s at 56K, 85.2 at 207K; -9.6% first five windows to last five (TurboQuant -21.6%) |
+| single stream vs vLLM / SGLang at 32K / 64K (v0.3) | 112.4 / 100.7 tok/s; tuned vLLM MTP-4 101.7 / 90.3, tuned SGLang 68.6 / 64.4 |
+| largest measured fit | 245,760-token window with a 240K prompt, 22.1 GiB ready (measured before v0.3; P6 uses 170-260 MiB less) |
 | agent session 100K -> 245K context | 120K generated tokens, 52 tok/s cumulative (60 at 110K, 47 at 245K), 76% draft acceptance |
 | per speculative round vs Q3_K_XL / Q4_K_M | +9-10% / +23% |
 
@@ -180,6 +182,38 @@ default, 4,096 B/token. The run command above sets `--spec-draft-type-k/v q8_0`,
 and that is the configuration the 245,760 window elsewhere in this file was measured in. The ladder
 was run at the f16 default so that all four arms sat on an identical drafter-cache footprint, which
 is what makes the four ceilings comparable to each other; it is not the configuration to deploy.
+
+**The speed holds over a long session.** One server per arm, never restarted, prompt cache on,
+starting from a 51,223-token agentic prompt and taking 5,000-token turns that each inject four fresh
+SWE-bench cases, until the next turn would not fit in `-c 208,896`. Decode tok/s per window,
+temperature 1:
+
+| KV depth after window | v0.3 | v0.2 | TurboQuant | stock llama.cpp |
+|---:|---:|---:|---:|---:|
+| 56,222 | 95.09 | 75.34 | 63.87 | 68.86 |
+| 100,201 | 100.45 | 75.01 | 56.94 | 59.11 |
+| 149,743 | 87.94 | 78.35 | 54.37 | 50.09 |
+| 187,185 | 90.82 | 73.49 | 48.30 (last) | -- (last at 156,515: 49.83) |
+| 206,851 | 85.16 | -- (last at 197,174: 71.57) | -- | -- |
+
+v0.3 falls 9.6% from its first five windows to its last five, and TurboQuant 21.6%. The decay is the
+kernel, not the drafter: v0.3's passes/s falls 18.9% while its tok/pass rises 11.4%. The v0.3/v0.2
+passes/s ratio stays between 1.166 and 1.183 from 56K to 197K, so what P5b, P5c and P6 buy at 20K
+they still buy at 197K. The stock arms stop earlier because their KV costs more memory (stock at
+`-c 159,744`, TurboQuant at 188,416, both chosen to stay under the 23 GB cap). Details, including
+host-noisy and looped windows, are in the write-up.
+
+**Against serving engines.** vLLM 0.29.0 and SGLang 0.5.9, each tuned and each with its own MTP
+speculation, serving `Qwen3.8-27B-W4A16-AWQ` (neither loads our GGUF), single stream, 2,048 generated
+tokens, mean of three, all under 23,552 MiB at peak:
+
+| context | **v0.3, MTP-3** | vLLM, MTP-4 | vLLM, MTP-3 | SGLang, NEXTN | v0.3 over best other |
+|---|---:|---:|---:|---:|---:|
+| 32K | **112.4** (18,812 MiB) | 101.7 (23,295) | 90.2 (23,187) | 68.6 (23,028) | 1.10x |
+| 64K | **100.7** (19,847 MiB) | 90.3 (23,356) | 83.1 (23,365) | 64.4 (23,348) | 1.11x |
+
+Past 64K neither engine fits under the cap in any configuration we found. This is the single-user
+case only; nothing here speaks to batched throughput, which is what those engines are built for.
 
 What changed since v0.2 (`44233f009`), in merge order -- 17 commits, and excluding documentation and
 the vocabulary map, 36 files with 1,802 insertions and 130 deletions:
