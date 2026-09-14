@@ -74,13 +74,43 @@ current prompt's ids to the 64K shortlist lifts coding coverage from 98.5% to 99
 
 ## Probability threshold (`--spec-draft-p-min`)
 
-The production drafter samples on the backend with a `top_k(10)` chain and the host softmaxes those ten
-logits; `p_min` is applied to the top-1 of that renormalised distribution. With a shortlist the ten
-candidates are the top ten **of the shortlist**, so `p` is renormalised over the shortlist's top-10. When the
-shortlist contains the full-vocabulary top-10 (the common case for a well-built map) `p` is identical to the
-full-head value; when it does not, the drafter proposes the best shortlisted token with a `p` that slightly
-overstates its full-vocabulary probability. The target still verifies every draft against its own full
-head, so this only affects how eagerly the drafter continues, never the output distribution.
+**Default `0` — the gate is off, and measurement says leave it off.** It is a draft-side EMISSION
+gate: when the top candidate's probability falls below `p_min` the drafter stops extending the chain,
+so the token is never proposed. That is independent of the p/q rejection test the target applies to
+tokens that *were* proposed (`common/sampling.cpp:927`); p/q cannot rescue a token the drafter never
+emitted.
+
+**Which distribution `p` is measured against depends on the drafting path, and it changed when PQ1
+shipped.** Since `3207e7fd7` (2026-09-10) exact p/q drafting is default-on, so the live chain builds
+its candidates with `pq_sampler` (`common/speculative.cpp:1924`, selected at `:2235`) — the
+**target-mirrored** sampler, running the request's own temperature / `top_k` / `top_p`. The gate at
+`:2265` therefore reads `p` from that distribution.
+
+Only under `LLAMA_SPEC_PQ=0` does the older description apply: the drafter samples on the backend with
+a `top_k(10)` chain and the host softmaxes those ten logits, so `p` is renormalised over the
+shortlist's top-10. With a shortlist the ten candidates are the top ten **of the shortlist**; when the
+shortlist contains the full-vocabulary top-10 (the common case for a well-built map) `p` is identical
+to the full-head value, and when it does not, the drafter proposes the best shortlisted token with a
+`p` that slightly overstates its full-vocabulary probability. Either way the target verifies every
+draft against its own full head, so this affects only how eagerly the drafter continues, never the
+output distribution.
+
+**What it costs and buys (H2, 2026-09-11, seven arms on one binary, temp 1.0, all three ship
+fixtures).** `p_min 0.45` against `p_min 0` scores **G = −0.04%** on the weighted ship rule
+(0.4 coding + 0.4 agentic + 0.2 rag) against a `2·SD_G` of 0.73% — indistinguishable. But it is not
+uniform, and the per-fixture split is the useful part:
+
+| fixture | tok/s vs `p_min 0` | mechanism |
+|---|---|---|
+| coding | −0.98% | drafts are already good; the gate only suppresses proposals that would have been accepted |
+| agentic | −0.26% | as above |
+| rag | **+2.29%** | `tok/pass` +2.53% at flat kernel, acceptance 0.827 vs 0.735 — the gate suppresses bad drafts on the workload where drafts are worst |
+
+So the guidance is: **keep the shipped default at `0`**; a rag-only deployment is the one case with a
+real reason to raise it. Do not describe `p_min` as a throughput win — on the ship mix it is a wash,
+and on the two heaviest-weighted fixtures it is slightly negative.
+
+Full write-up: `kernel_cache_investigation/frontier/H2_h1_acceptance_recovery/RESULT.md`.
 
 ## Memory
 

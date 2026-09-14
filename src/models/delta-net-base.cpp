@@ -501,8 +501,20 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
 
         const int64_t K = (int64_t) cparams.n_rs_seq + 1;
 
-        for (int64_t t = 1; t <= K; ++t) {
-            const int64_t s_idx  = std::max<int64_t>(0, conv_input->ne[0] - conv_states->ne[0] - K + t);
+        // tokens of this sequence in the ubatch
+        const int64_t n_seq_tokens = conv_input->ne[0] - conv_states->ne[0];
+
+        // only the newest min(n_seq_tokens, K) snapshots can be produced from this ubatch; the older
+        // slots are caller-owned and must be left untouched -- the same convention the delta-net
+        // state snapshots follow (ggml_gated_delta_net emit_mode 0: "when n_tokens < K only slots
+        // 0..n_tokens-1 are written; older slots are caller-owned").
+        // Writing them anyway with s_idx clamped to 0 overwrites every older conv snapshot with the
+        // pre-ubatch window, which destroys the rollback history of a sequence that is decoded one
+        // token at a time and makes a later rollback restore a state that never existed.
+        const int64_t n_written = std::min<int64_t>(n_seq_tokens, K);
+
+        for (int64_t t = K - n_written + 1; t <= K; ++t) {
+            const int64_t s_idx  = n_seq_tokens - K + t; // >= 0 by construction
             const int64_t s_slot = K - t;
 
             ggml_tensor * conv_state_last =

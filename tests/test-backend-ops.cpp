@@ -1489,6 +1489,10 @@ struct test_case {
             }
 
             double err = ud->tc->err(f1.data(), f2.data(), f1.size());
+            if (getenv("GGML_TBO_DUMP_ERR")) {
+                // machine-parseable: op, shape vars, error vs the CPU reference
+                printf("TBOERR\t%s\t%s\t%.12g\n", ggml_op_desc(t1), ud->tc->vars().c_str(), err);
+            }
             if (err > ud->tc->max_err(ud->backend1)) {
                 printf("[%s] ERR = %.9f > %.9f ", ggml_op_desc(t1), err, ud->tc->max_err(ud->backend1));
                 //for (int i = 0; i < (int) f1.size(); i++) {
@@ -9598,6 +9602,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Opt-in reuse-kernel correctness (GGML_QWEN38_REUSE_TEST=1). Separate from the MMVQ_BENCH
+    // gate because those shapes are large enough that the CPU reference dominates; these are
+    // small and are the only cases in the suite that reach ncols_dst 2..5 for these types.
+    if (getenv("GGML_QWEN38_REUSE_TEST") != nullptr) {
+        // QC2/QC3 reuse-kernel correctness. The cross-column reuse kernels only run at
+        // ncols_dst 2..5, and the default MUL_MAT list never reaches that range for these
+        // types -- it tests n=1 and n=64 only, so a reuse kernel can be wrong and still show
+        // 12/12 passed. Small shapes keep the CPU reference cheap; the path is chosen by
+        // ncols_dst, not by m or k, so small is sufficient to exercise it.
+        for (ggml_type type_a : {GGML_TYPE_Q5_0, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS,
+                                 GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}) {
+            for (int64_t n : {2, 3, 4, 5}) {
+                for (int64_t k : {256, 512, 1024, 1280}) {
+                    test_cases.emplace_back(new test_mul_mat(
+                        type_a, GGML_TYPE_F32, 512, n, k, {1, 1}, {1, 1}));
+                }
+            }
+        }
+    }
+
     // Opt-in SM86 large-N prefill coverage for aligned and ragged J=128 boundaries.
     if (getenv("GGML_QWEN38_MMQ_PREFILL_TEST") != nullptr) {
         for (ggml_type type_a : {
@@ -10925,6 +10949,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                 test_cases.emplace_back(new test_mul_mat(
                     GGML_TYPE_IQ4_XS, GGML_TYPE_F32, shape.first, n, shape.second, {1, 1}, {1, 1}));
             }
+        }
+        // QC2/QC3: the two types in ATX-4-XS with no cross-column reuse kernel, at the shapes they
+        // actually occupy in the file, decode widths 1..5. Q5_0 carries ffn_down/up/gate, ssm_out,
+        // attn_output, attn_q, eh_proj and attn_gate; Q6_K carries the output head and attn_k/attn_v.
+        for (int64_t n : {1, 2, 3, 4, 5}) {
+            for (const auto & shape : std::array<std::pair<int64_t, int64_t>, 8>{{
+                    {17408, 5120}, {5120, 17408}, {6144, 5120}, {5120, 6144},
+                    {10240, 5120}, {12288, 5120}, {5120, 12288}, {1024, 5120}}}) {
+                test_cases.emplace_back(new test_mul_mat(
+                    GGML_TYPE_Q5_0, GGML_TYPE_F32, shape.first, n, shape.second, {1, 1}, {1, 1}));
+            }
+            // Q6_K: attn_k / attn_v projections, then the output head at every decode width
+            // (the ungated head case below is n=1 only, which is the drafter's read, not the verify read).
+            test_cases.emplace_back(new test_mul_mat(
+                GGML_TYPE_Q6_K, GGML_TYPE_F32, 1024, n, 5120, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(
+                GGML_TYPE_Q6_K, GGML_TYPE_F32, 248320, n, 5120, {1, 1}, {1, 1}));
         }
     }
 
