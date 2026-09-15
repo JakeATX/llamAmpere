@@ -12,7 +12,7 @@ GGML_Q8_TURBO3_MMA_FUSED=1 ./build-sm86/bin/llama-server -m Qwen3.8-27B-ATX-4-XS
   --spec-draft-vocab-map docs/mtp-vocab/atx_65536.txt
 ```
 
-The speed comes from MTP-3 speculative decoding with exact p/q verification (on by default), `--spec-draft-p-min 0`, the 65,536-token draft vocabulary map, a q8_0 K / turbo3 V cache on the fused attention kernel, and a q8_0/q8_0 drafter cache. Lower `-c` if you need VRAM for something else; the decode flags stay the same.
+The speed comes from MTP-3 speculative decoding with exact p/q verification (on by default), `--spec-draft-p-min 0`, the 65,536-token draft vocabulary map, a q8_0 K / turbo3 V cache on the fused attention kernel, and a q8_0/q8_0 drafter cache. Lower `-c` if you need VRAM for something else; the decode flags stay the same. To avoid turbo3, `-ctv q8_0` (~165K context) and `-ctv q5_1` (~190K, needs a `-DGGML_CUDA_FA_ALL_QUANTS=ON` build, no fused kernel yet) are listed with their trade-offs under [KV cache options](QWEN_AMPERE.md#kv-cache-options).
 
 # llama.cpp
 

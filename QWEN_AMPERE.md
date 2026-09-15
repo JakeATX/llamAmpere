@@ -27,6 +27,7 @@ Measured on a 3090 Ti at 350 W with the ATX-IQ4_XS-M quant (working name ATX-4-X
 | long session from 56K to 207K KV, temperature 1, MTP-3 (v0.3) | 95.1 tok/s at 56K, 85.2 at 207K; -9.6% first five windows to last five (TurboQuant -21.6%) |
 | single stream vs vLLM / SGLang at 32K / 64K (v0.3) | 112.4 / 100.7 tok/s; tuned vLLM MTP-4 101.7 / 90.3, tuned SGLang 68.6 / 64.4 |
 | largest measured fit | 245,760-token window with a 240K prompt, 22.1 GiB ready (measured before v0.3; P6 uses 170-260 MiB less) |
+| context by KV cache type under a 23 GB card budget | q8_0/turbo3 245,760 (shipped); q8_0/q8_0 ~165K and q8_0/q5_1 ~190K estimated, see [KV cache options](#kv-cache-options) |
 | agent session 100K -> 245K context | 120K generated tokens, 52 tok/s cumulative (60 at 110K, 47 at 245K), 76% draft acceptance |
 | per speculative round vs Q3_K_XL / Q4_K_M | +9-10% / +23% |
 
@@ -47,10 +48,11 @@ Q8_0.
 |---|---|
 | `main` | the product (v0.3): upstream TurboQuant+ as of 2026-09-03 plus all accepted SM86 work through 2026-09-13. Build from here. |
 | `release/v0.3` | the exact commit (`36a6bca81`) every v0.3 number in this file was measured on |
-| `perf/qwen38-sm86-decode-product`, `perf/qwen38-sm86-prefill` | the same commit as `main` at the 2026-09-03 release, kept for existing links |
-| `research/qwen38-sm86-*` | experiment branches with opt-in knobs; see the handover |
-| `archive/*` | rejected or superseded experiments |
-| everything else | inherited from the upstream llama.cpp mirror, not part of this project |
+| `ws/AGN-agnes` | the Agnes 3.0 Flash loader work before it merged into `main` |
+
+The v0.1 release branches (`perf/qwen38-sm86-decode-product`, `perf/qwen38-sm86-prefill`), the
+`research/qwen38-sm86-*` experiment branches and the `archive/*` rejected experiments live on
+[llama-cpp-qwen-ampere](https://github.com/JakeATX/llama-cpp-qwen-ampere).
 
 The experiment log, with hypotheses, results, and what did not work, is
 `QWEN38_SM86_FRONTIER_HANDOVER.md` in this tree.
@@ -90,6 +92,31 @@ the target's; only the draft proposals change. It is the largest single contribu
 gain and costs 150 MiB of VRAM at 220K. See `docs/mtp-vocabulary-shortlist.md`. The adaptive
 `--spec-draft-vocab-hot` tail that the same code supports measured 2.7-4.0% slower than the static
 map and is left off.
+
+### KV cache options
+
+`-ctk q8_0 -ctv turbo3` is the shipped cache and the one every number in this file was measured with. The attention
+layers are the only ones with a KV cache (16 of 64, 4 KV heads, head dim 256); the other 48 are recurrent and
+their state does not grow with context. Two alternatives keep the value cache at a conventional llama.cpp format for
+anyone who would rather not run turbo3. The drafter cache stays `--spec-draft-type-k/v q8_0` (2,176 B/token) in
+all three.
+
+| `-ctk` / `-ctv` | KV bytes per token, incl. drafter | largest context under a 23 GB card budget | suggested `-c` | decode speed vs shipped | build |
+|---|---:|---|---:|---|---|
+| `q8_0` / `turbo3` (shipped) | 25,984 | 245,760 measured with a 240K prompt | 245760 | reference | default |
+| `q8_0` / `q8_0` | 36,992 (+42%) | ~165-175K, estimated | 163840 | measurement pending; kernel timing suggests within ~2% | default |
+| `q8_0` / `q5_1` | 31,872 (+23%) | ~190-200K, estimated | 188416 | measurement pending; may be slower (no fused kernel) | `-DGGML_CUDA_FA_ALL_QUANTS=ON` |
+
+The estimates scale the KV cache inside the filled 245,760 measurement (22,634 MiB peak for the server) to the
+other formats and hold the rest of the memory fixed, with about 300 MiB of margin for the desktop; fit probes at full
+depth will replace them. q8_0/q8_0 runs on the same fused MMA attention kernel as the shipped cache (extended to q8_0
+V in v0.3). Its per-call cost at 100K KV depth is 321 µs against 273 µs for turbo3 V, which projects to roughly 1-2%
+slower decode at depth.
+
+**q5_1 has no fused kernel.** It runs on the generic flash-attention path, so it may be noticeably slower than
+the other two, especially at depth. The default build also does not compile flash-attention kernels for q5_1.
+Without `-DGGML_CUDA_FA_ALL_QUANTS=ON` the attention op is not supported on the GPU and falls back to the CPU. Use
+that flag in the cmake line above (the build takes much longer). A fused q8_0-K/q5_1-V kernel is on the backlog.
 
 The three cache flags are what make a long conversation usable rather than merely possible. `--cache-prompt` keeps the conversation's KV cache in the slot between turns, so a new turn on a 200K conversation pays only for the new tokens instead of a 100-second re-prefill. `--ctx-checkpoints` matters specifically for this model: 48 of its layers are recurrent, and a recurrent state cannot be rewound, so when you edit or regenerate a turn the server needs a saved state from before the edit point; it keeps up to 24 of them, at least 10,240 tokens apart (and one at every user turn regardless), in host RAM. Measured on this model, a snapshot is 150 MiB plus 1.5 KiB per token of position, because the MTP drafter's own single-layer KV cache is saved with the recurrent state: about 165 MiB at 10K, 495 MiB at 240K. 24 at 10,240 spacing covers the whole 245,760 window for about 7.8 GiB with at most ten seconds of replay after an edit; denser spacing multiplies that RAM (60 at 4,096 is about 20 GiB at the deep end). `--cache-ram` is a separate host-RAM budget for parking a whole conversation's KV (with its checkpoints) when another conversation takes the slot; a populated 200K conversation is about 7.4 GB, so 8 GiB holds one, and it only does work when you switch between chats. None of this touches VRAM. Budget about 16 GB of host RAM for it at the deep end (up to 8 GiB of snapshots plus the 8 GiB park space) on top of the model's own mapping; on a 32 GB machine keep the desktop light, or drop the count to 12 at 20,480 spacing for half the snapshot RAM.
 
