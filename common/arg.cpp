@@ -1603,7 +1603,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--lookup-cache-dynamic-save-interval"}, "N",
-        string_format("seconds between checkpoints of the dynamic lookup cache, 0 = only at shutdown (default: %d)", params.speculative.ngram_cache.save_dynamic_interval),
+        string_format("seconds between checkpoints of the dynamic lookup cache, written in the background, 0 = only at shutdown (default: %d)", params.speculative.ngram_cache.save_dynamic_interval),
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("lookup cache save interval must be >= 0");

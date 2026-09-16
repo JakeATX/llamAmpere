@@ -159,10 +159,12 @@ void common_ngram_cache_prune(common_ngram_cache & ngram_cache, size_t n_max);
 // If the file is missing or corrupt, ngram_cache (which must already contain the delta) is written instead.
 // A file that belongs to another vocab or a newer format is never overwritten: the sync fails.
 // ngram_cache and ngram_cache_delta must be distinct objects.
+// from_disk: if given, set to true when the existing file was loaded and merged, false when it was missing or
+//            unusable (the file is then recreated from ngram_cache) or when the sync failed.
 // returns: true on success, otherwise err describes the problem and nothing is modified.
 bool common_ngram_cache_sync_file(
     const std::string & filename, common_ngram_cache & ngram_cache, common_ngram_cache & ngram_cache_delta,
-    size_t n_max, const common_ngram_cache_vocab_id & vocab_id, std::string & err);
+    size_t n_max, const common_ngram_cache_vocab_id & vocab_id, std::string & err, bool * from_disk = nullptr);
 
 // Save an ngram cache to a file (vocab identity unknown). Logs on failure.
 // ngram_cache: the ngram cache to save.

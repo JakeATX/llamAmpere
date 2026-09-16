@@ -15,9 +15,12 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <condition_variable>
 #include <cstring>
 #include <iomanip>
 #include <map>
+#include <mutex>
+#include <thread>
 #include <cinttypes>
 
 #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -2678,13 +2681,54 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
     common_ngram_cache ngram_cache_dynamic;
     common_ngram_cache ngram_cache_static;
 
-    // writeback of the dynamic cache, see sync()
+    // writeback of the dynamic cache, see sync() and checkpoint_poll()
     bool               save_dynamic = false; // params.save_dynamic and a path to write to
-    common_ngram_cache ngram_cache_delta;    // what was added to ngram_cache_dynamic since the last successful sync()
+    common_ngram_cache ngram_cache_delta;    // what was added to ngram_cache_dynamic and is not in the file yet
+    bool               file_present = false; // the file has been loaded or written by this process
     int64_t            t_last_sync_ms = 0;
     size_t             n_max_dynamic = 0;    // 0 = unlimited
 
     common_ngram_cache_vocab_id vocab_id;
+
+    // Periodic checkpoints are written by a worker thread so that the thread driving inference never waits
+    // for the file lock, the disk or the prune. The inference thread hands the delta over (an O(1) swap),
+    // the worker merges it into the file, and the inference thread takes the merged result back as the
+    // new in-memory cache at a later request boundary.
+    //
+    // Locking: everything named ckpt_* is shared with the worker and only touched with mutex_ckpt held,
+    // by either side. The worker also reads params, n_max_dynamic and vocab_id, which are constant once
+    // the constructor has started it. It never touches anything else of this struct: ngram_cache_dynamic,
+    // ngram_cache_delta, sinfos etc. belong to the inference thread alone. The mutex is only ever held
+    // for the O(1) handovers, never during the write, so the inference thread never blocks on it for
+    // longer than that; it uses try_lock anyway and simply retries at the next request.
+    //
+    // Ownership of the delta: in CKPT_QUEUED and CKPT_WRITING the worker owns ckpt_delta. On success the
+    // worker returns ckpt_cache = the file's content after the write and an empty ckpt_delta; the delta
+    // is then in the file and nowhere else. On failure the worker returns ckpt_delta untouched and the
+    // inference thread merges it back into ngram_cache_delta, so the next checkpoint (or the shutdown
+    // sync) retries it. Nothing is written twice and nothing is dropped.
+    //
+    // Only one checkpoint is ever in flight: a tick that finds the worker busy does nothing, the delta
+    // keeps accumulating in ngram_cache_delta and goes out with the next checkpoint.
+    enum ckpt_status_t {
+        CKPT_IDLE,    // nothing in flight, ckpt_delta and ckpt_cache are empty
+        CKPT_QUEUED,  // ckpt_delta is handed over, the worker has not picked it up yet
+        CKPT_WRITING, // the worker holds the delta and is writing the file (outside the mutex)
+        CKPT_DONE,    // the write finished: ckpt_ok, ckpt_err, ckpt_cache, ckpt_delta hold the result
+        CKPT_RETIRE,  // ckpt_cache holds the previous in-memory cache, for the worker to free
+    };
+
+    std::thread             thread_ckpt;
+    std::mutex              mutex_ckpt;
+    std::condition_variable cv_ckpt;
+    ckpt_status_t           ckpt_status = CKPT_IDLE;
+    bool                    ckpt_stop   = false;
+    common_ngram_cache      ckpt_delta;
+    common_ngram_cache      ckpt_cache;
+    bool                    ckpt_ok        = false;
+    bool                    ckpt_from_disk = false;
+    std::string             ckpt_err;
+    int64_t                 ckpt_t_us = 0;
 
     struct seq_info {
         size_t cache_size = 0; // number of tokens of the sequence in ngram_cache_context
@@ -2733,6 +2777,7 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
             status_dynamic = common_ngram_cache_load_file(path_dynamic, ngram_cache_dynamic, vocab_id, err);
             if (status_dynamic == COMMON_NGRAM_CACHE_LOAD_OK) {
                 SPC_INF("dynamic lookup cache loaded: %s (%zu n-grams)\n", path_dynamic.c_str(), ngram_cache_dynamic.size());
+                file_present = true;
             } else {
                 SPC_WRN("dynamic lookup cache ignored, starting cold: %s\n", err.c_str());
             }
@@ -2754,8 +2799,14 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
                     SPC_INF("dynamic lookup cache pruned to %zu n-grams (max %zu)\n", ngram_cache_dynamic.size(), n_max_dynamic);
                 }
                 if (this->params.save_dynamic_interval > 0) {
-                    SPC_INF("dynamic lookup cache will be saved to %s (every %d s and at shutdown)\n",
-                            path_dynamic.c_str(), this->params.save_dynamic_interval);
+                    try {
+                        thread_ckpt = std::thread([this]() { checkpoint_worker(); });
+                        SPC_INF("dynamic lookup cache will be saved to %s (every %d s and at shutdown)\n",
+                                path_dynamic.c_str(), this->params.save_dynamic_interval);
+                    } catch (const std::exception & e) {
+                        SPC_WRN("dynamic lookup cache will be saved to %s at shutdown only, no checkpoint thread: %s\n",
+                                path_dynamic.c_str(), e.what());
+                    }
                 } else {
                     SPC_INF("dynamic lookup cache will be saved to %s (at shutdown only)\n", path_dynamic.c_str());
                 }
@@ -2771,13 +2822,18 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
 
     ~common_speculative_impl_ngram_cache() override {
         // The server destroys the speculative context on clean shutdown and when entering the sleeping state.
-        // A process killed with SIGKILL, or with a second Ctrl+C, never gets here - hence the periodic sync()
-        // from begin().
+        // A process killed with SIGKILL, or with a second Ctrl+C, never gets here - hence the periodic
+        // checkpoints from begin().
+        //
+        // Both steps block, which is fine here: a checkpoint in flight is completed by the worker (never
+        // abandoned half-written: the file is replaced atomically or not at all), its result is collected,
+        // and what is still unwritten goes out synchronously.
+        checkpoint_stop();
         sync("shutdown");
     }
 
     // Write the dynamic cache back to its file, merged with whatever another process wrote there meanwhile.
-    // Never throws: this runs from the destructor.
+    // Synchronous: only used at shutdown. Never throws: this runs from the destructor.
     void sync(const char * reason) noexcept {
         if (!save_dynamic) {
             return;
@@ -2796,6 +2852,7 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
                 SPC_INF("dynamic lookup cache saved (%s): %s, %zu n-grams, %.1f ms\n",
                         reason, params.lookup_cache_dynamic.c_str(), ngram_cache_dynamic.size(),
                         (ggml_time_us() - t_start_us) / 1000.0);
+                file_present = true;
             } else {
                 SPC_WRN("dynamic lookup cache not saved (%s), will retry later: %s\n", reason, err.c_str());
             }
@@ -2806,6 +2863,178 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
         }
 
         t_last_sync_ms = ggml_time_ms();
+    }
+
+    // Body of thread_ckpt. Waits for a delta, writes it, hands the result back, frees retired caches.
+    // Exits when ckpt_stop is set and nothing is queued, so a checkpoint in flight at shutdown completes.
+    // Never lets an exception escape (that would terminate the process).
+    void checkpoint_worker() noexcept {
+        std::unique_lock<std::mutex> lock(mutex_ckpt);
+        while (true) {
+            cv_ckpt.wait(lock, [this]() {
+                return ckpt_stop || ckpt_status == CKPT_QUEUED || ckpt_status == CKPT_RETIRE;
+            });
+
+            if (ckpt_status == CKPT_RETIRE) {
+                // free the previous in-memory cache here, not on the inference thread: with up to
+                // n_max_dynamic n-grams, each with its own map of continuations, that is millions of frees
+                common_ngram_cache retired;
+                std::swap(retired, ckpt_cache);
+                ckpt_status = CKPT_IDLE;
+
+                lock.unlock();
+                retired.clear();
+                lock.lock();
+                continue;
+            }
+
+            if (ckpt_status == CKPT_QUEUED) {
+                common_ngram_cache delta;
+                std::swap(delta, ckpt_delta);
+                ckpt_status = CKPT_WRITING;
+                lock.unlock();
+
+                // The inference thread keeps drafting from ngram_cache_dynamic meanwhile, so the worker cannot
+                // read it. The delta itself serves as the fallback content for a missing or unusable file
+                // (see common_ngram_cache_sync_file): the file is then recreated from what was learned since
+                // the last save, and the in-memory cache follows the file when the result is collected.
+                const int64_t t_start_us = ggml_time_us();
+
+                common_ngram_cache cache;
+                bool        ok        = false;
+                bool        from_disk = false;
+                std::string err;
+                try {
+                    cache = delta;
+                    ok = common_ngram_cache_sync_file(params.lookup_cache_dynamic, cache, delta,
+                            n_max_dynamic, vocab_id, err, &from_disk);
+                } catch (const std::exception & e) {
+                    ok  = false;
+                    err = e.what();
+                } catch (...) {
+                    ok  = false;
+                    err = "unknown error";
+                }
+                if (!ok) {
+                    // the delta is untouched on failure and goes back to the inference thread
+                    cache.clear();
+                }
+
+                lock.lock();
+                std::swap(ckpt_cache, cache);
+                std::swap(ckpt_delta, delta);
+                ckpt_ok        = ok;
+                ckpt_from_disk = from_disk;
+                ckpt_err       = std::move(err);
+                ckpt_t_us      = ggml_time_us() - t_start_us;
+                ckpt_status    = CKPT_DONE;
+                continue;
+            }
+
+            // ckpt_stop, nothing left to do
+            return;
+        }
+    }
+
+    // Take the result of a finished checkpoint. Called with mutex_ckpt held (or after the worker was joined).
+    // Success: the in-memory cache becomes the file's content plus what was learned since the handover,
+    // so it stays bounded by n_max_dynamic and picks up what other processes wrote to the file. The old
+    // cache is left for the worker to free.
+    // Failure: the delta is merged back into ngram_cache_delta and retried by the next sync.
+    void checkpoint_collect() noexcept {
+        if (ckpt_status != CKPT_DONE) {
+            return;
+        }
+
+        if (ckpt_ok) {
+            if (file_present && !ckpt_from_disk) {
+                SPC_WRN("dynamic lookup cache %s was missing or unusable and has been recreated with the n-grams "
+                        "learned since the last save, the earlier ones are gone\n", params.lookup_cache_dynamic.c_str());
+            }
+            file_present = true;
+
+            try {
+                // the live delta was learned after the handover, it is not in the file yet and stays a delta
+                common_ngram_cache_merge(ckpt_cache, ngram_cache_delta);
+                std::swap(ngram_cache_dynamic, ckpt_cache);
+            } catch (const std::exception & e) {
+                // out of memory during the merge: keep the current in-memory cache (it contains the delta
+                // that was just written, and the live one), and let the worker free the half-merged copy
+                SPC_WRN("dynamic lookup cache saved, but the in-memory cache was not refreshed from it: %s\n", e.what());
+            }
+
+            SPC_INF("dynamic lookup cache saved (checkpoint): %s, %zu n-grams, %.1f ms\n",
+                    params.lookup_cache_dynamic.c_str(), ngram_cache_dynamic.size(), ckpt_t_us / 1000.0);
+
+            ckpt_status = CKPT_RETIRE;
+            cv_ckpt.notify_one();
+            return;
+        }
+
+        SPC_WRN("dynamic lookup cache not saved (checkpoint), will retry later: %s\n", ckpt_err.c_str());
+
+        // ckpt_delta is the whole last interval, ngram_cache_delta only what came after the handover:
+        // add the small one to the big one and take that back
+        try {
+            common_ngram_cache_merge(ckpt_delta, ngram_cache_delta);
+        } catch (const std::exception & e) {
+            // out of memory part way through: a retry would count the merged part twice, so the rest of
+            // the live delta (a few seconds of n-grams) is dropped instead
+            SPC_WRN("dynamic lookup cache: n-grams learned since the last checkpoint dropped: %s\n", e.what());
+        }
+        std::swap(ngram_cache_delta, ckpt_delta);
+        ckpt_delta.clear();
+        ckpt_status = CKPT_IDLE;
+    }
+
+    // Called from begin(), on the inference thread. Collects a finished checkpoint and starts the next one
+    // when it is due. Never blocks: if the worker happens to hold the mutex, this request is skipped.
+    void checkpoint_poll() {
+        if (!thread_ckpt.joinable()) {
+            return;
+        }
+
+        std::unique_lock<std::mutex> lock(mutex_ckpt, std::try_to_lock);
+        if (!lock.owns_lock()) {
+            return;
+        }
+
+        if (ckpt_status == CKPT_DONE) {
+            checkpoint_collect();
+        }
+
+        if (ckpt_status == CKPT_IDLE && !ngram_cache_delta.empty() &&
+                ggml_time_ms() - t_last_sync_ms >= (int64_t) params.save_dynamic_interval * 1000) {
+            // ckpt_delta is empty in CKPT_IDLE, so this empties ngram_cache_delta
+            std::swap(ckpt_delta, ngram_cache_delta);
+            ckpt_status    = CKPT_QUEUED;
+            t_last_sync_ms = ggml_time_ms();
+            cv_ckpt.notify_one();
+        }
+    }
+
+    // Stop the worker: a checkpoint in flight is completed and collected first. Blocks, only used at shutdown.
+    void checkpoint_stop() noexcept {
+        if (!thread_ckpt.joinable()) {
+            return;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_ckpt);
+            ckpt_stop = true;
+        }
+        cv_ckpt.notify_one();
+
+        try {
+            thread_ckpt.join();
+        } catch (const std::exception & e) {
+            SPC_WRN("dynamic lookup cache checkpoint thread not joined: %s\n", e.what());
+            return;
+        }
+
+        // the worker is gone, the mutex is free; a retired cache is freed with this object
+        std::lock_guard<std::mutex> lock(mutex_ckpt);
+        checkpoint_collect();
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
@@ -2820,10 +3049,9 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
             sinfo.cache_size = 0;
         }
 
-        // checkpoint at request boundaries, so the write never lands in the middle of a generation
-        if (save_dynamic && params.save_dynamic_interval > 0 && !ngram_cache_delta.empty() &&
-                ggml_time_ms() - t_last_sync_ms >= (int64_t) params.save_dynamic_interval * 1000) {
-            sync("checkpoint");
+        // checkpoint at request boundaries, so the in-memory cache is never swapped in the middle of a draft
+        if (save_dynamic) {
+            checkpoint_poll();
         }
     }
 

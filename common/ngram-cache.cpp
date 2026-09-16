@@ -795,9 +795,12 @@ static void common_ngram_cache_remove_stale_tmp(const std::string & filename) {
 
 bool common_ngram_cache_sync_file(
         const std::string & filename, common_ngram_cache & ngram_cache, common_ngram_cache & ngram_cache_delta,
-        size_t n_max, const common_ngram_cache_vocab_id & vocab_id, std::string & err) {
+        size_t n_max, const common_ngram_cache_vocab_id & vocab_id, std::string & err, bool * from_disk) {
     GGML_ASSERT(&ngram_cache != &ngram_cache_delta);
     err.clear();
+    if (from_disk) {
+        *from_disk = false;
+    }
 
     common_ngram_cache_file_lock lock;
     const bool locked = lock.acquire(filename, /*n_tries=*/ 40); // ~2 s
@@ -811,12 +814,12 @@ bool common_ngram_cache_sync_file(
     // start from what is on disk now (another process may have written since we loaded it) and add our delta;
     // if the file is missing or unusable, our in-memory cache already contains everything we know
     common_ngram_cache merged;
-    bool from_disk = false;
+    bool loaded = false;
     {
         std::string err_load;
         switch (common_ngram_cache_load_file(filename, merged, vocab_id, err_load)) {
             case COMMON_NGRAM_CACHE_LOAD_OK:
-                from_disk = true;
+                loaded = true;
                 break;
             case COMMON_NGRAM_CACHE_LOAD_MISSING:
                 break; // first save, or the file was removed meanwhile
@@ -830,7 +833,7 @@ bool common_ngram_cache_sync_file(
         }
     }
 
-    if (from_disk) {
+    if (loaded) {
         common_ngram_cache_merge(merged, ngram_cache_delta);
     } else {
         merged = ngram_cache;
@@ -844,6 +847,9 @@ bool common_ngram_cache_sync_file(
 
     ngram_cache = std::move(merged);
     ngram_cache_delta.clear();
+    if (from_disk) {
+        *from_disk = loaded;
+    }
     return true;
 }
 
