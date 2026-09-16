@@ -12,6 +12,7 @@
 #include "fit.h"
 #include "llama.h"
 #include "log.h"
+#include "ngram-cache.h"
 #include "sampling.h"
 #include "speculative.h"
 #include "mtmd.h"
@@ -1676,6 +1677,14 @@ private:
             }
 
             if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+                if (!params_base.speculative.ngram_cache.lookup_cache_static.empty() ||
+                    !params_base.speculative.ngram_cache.lookup_cache_dynamic.empty()) {
+                    // identity of the target vocab, so that a lookup cache file built for another model is refused
+                    const auto vocab_id = common_ngram_cache_get_vocab_id(vocab);
+                    params_base.speculative.ngram_cache.vocab_n_tokens = vocab_id.n_tokens;
+                    params_base.speculative.ngram_cache.vocab_hash     = vocab_id.hash;
+                }
+
                 try {
                     spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
                 } catch (const std::exception & e) {

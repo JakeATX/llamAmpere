@@ -1595,6 +1595,33 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--lookup-cache-dynamic-save"},
+        string_format("write the dynamic lookup cache back to the file given by --lookup-cache-dynamic, so lookup decoding starts warm on the next run; the file then contains n-grams of the served conversations (default: %s)", params.speculative.ngram_cache.save_dynamic ? "true" : "false"),
+        [](common_params & params) {
+            params.speculative.ngram_cache.save_dynamic = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--lookup-cache-dynamic-save-interval"}, "N",
+        string_format("seconds between checkpoints of the dynamic lookup cache, 0 = only at shutdown (default: %d)", params.speculative.ngram_cache.save_dynamic_interval),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("lookup cache save interval must be >= 0");
+            }
+            params.speculative.ngram_cache.save_dynamic_interval = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--lookup-cache-dynamic-max-ngrams"}, "N",
+        string_format("maximum number of n-grams kept in the dynamic lookup cache when it is saved, the least useful ones are evicted, 0 = unlimited (default: %d)", params.speculative.ngram_cache.max_ngrams_dynamic),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("lookup cache max ngrams must be >= 0");
+            }
+            params.speculative.ngram_cache.max_ngrams_dynamic = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-c", "--ctx-size"}, "N",
         string_format("size of the prompt context (default: %d, 0 = loaded from model)", params.n_ctx),
         [](common_params & params, int value) {

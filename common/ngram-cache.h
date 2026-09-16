@@ -2,6 +2,7 @@
 
 #include "llama.h"
 
+#include <cstdint>
 #include <unordered_map>
 #include <string>
 #include <vector>
@@ -85,7 +86,85 @@ void common_ngram_cache_draft(
     std::vector<llama_token> & inp, std::vector<llama_token> & draft, int n_draft, int ngram_min, int ngram_max,
     common_ngram_cache & nc_context, common_ngram_cache & nc_dynamic, common_ngram_cache & nc_static);
 
-// Save an ngram cache to a file.
+// Persistence
+//
+// WHAT A CACHE FILE CONTAINS - read this before pointing --lookup-cache-dynamic-save at a shared location:
+//
+//   A cache file is a list of token n-grams (1 to LLAMA_NGRAM_MAX tokens) and, for each, the tokens that
+//   followed it together with how often they did. The tokens come verbatim from everything the model saw:
+//   system prompts, user messages, retrieved documents, tool output and the generated replies. Detokenized,
+//   fragments of that text can be reconstructed from the file. It is NOT opaque telemetry; treat it with the
+//   same care as a log of the conversations that produced it. Writing it is opt-in and only ever goes to a
+//   path given explicitly on the command line.
+//
+// File layout (all integers little-endian, native sizes):
+//
+//   magic        char[4]  "LNGC"
+//   version      u32      2
+//   n_vocab      u32      number of tokens in the vocab the cache was built with (0 = unknown)
+//   vocab_hash   u64      FNV-1a of all token texts of that vocab (0 = unknown)
+//   n_ngrams     u64      number of n-gram entries in the payload
+//   payload_size u64      size of the payload in bytes
+//   payload_hash u64      FNV-1a of the payload bytes
+//   payload:     n_ngrams entries of
+//     ngram      i32[LLAMA_NGRAM_MAX]   the n-gram, padded with LLAMA_TOKEN_NULL
+//     n_tokens   i32                    number of (token, count) pairs following (> 0)
+//     token      i32 } n_tokens times   a token that followed the n-gram
+//     count      i32 }                  how often it did (> 0)
+//
+// Files without the header (written by older versions of llama-lookup-create) hold the payload only and are
+// still accepted. Any load problem - unreadable file, bad magic/version, vocab mismatch, truncation, hash
+// mismatch, out of range value - is reported through the return value and never aborts.
+
+// Identity of the vocabulary a cache was built with. A cache is only meaningful for the tokenizer that
+// produced it, so it is stored in the file and checked at load. n_tokens = 0 / hash = 0 mean "unknown" and
+// disable the check for that side.
+struct common_ngram_cache_vocab_id {
+    uint32_t n_tokens = 0;
+    uint64_t hash     = 0;
+};
+
+// Compute the identity of a vocab (hash of all token texts).
+common_ngram_cache_vocab_id common_ngram_cache_get_vocab_id(const llama_vocab * vocab);
+
+enum common_ngram_cache_load_status {
+    COMMON_NGRAM_CACHE_LOAD_OK,
+    COMMON_NGRAM_CACHE_LOAD_MISSING, // the file cannot be opened
+    COMMON_NGRAM_CACHE_LOAD_CORRUPT, // truncated, checksum mismatch, out of range values: not a usable cache
+    COMMON_NGRAM_CACHE_LOAD_FOREIGN, // a valid cache, but for another vocab or a newer format: must not be overwritten
+};
+
+// Load an ngram cache file into ngram_cache.
+// vocab_id: identity of the current vocab; a file that records a different vocab is refused.
+// returns:  COMMON_NGRAM_CACHE_LOAD_OK on success. Otherwise ngram_cache is left empty and err describes the problem.
+common_ngram_cache_load_status common_ngram_cache_load_file(
+    const std::string & filename, common_ngram_cache & ngram_cache,
+    const common_ngram_cache_vocab_id & vocab_id, std::string & err);
+
+// Save an ngram cache to a file, written to a temporary file next to it and renamed into place, so a reader
+// or a crash never sees a partially written file.
+// returns: true on success, otherwise err describes the problem and the previous file (if any) is untouched.
+bool common_ngram_cache_save_file(
+    const common_ngram_cache & ngram_cache, const std::string & filename,
+    const common_ngram_cache_vocab_id & vocab_id, std::string & err);
+
+// Evict the lowest-utility n-grams until at most n_max remain (n_max = 0: no limit).
+// See the implementation for the ranking.
+void common_ngram_cache_prune(common_ngram_cache & ngram_cache, size_t n_max);
+
+// Read-modify-write of a cache file shared between processes:
+// merges ngram_cache_delta into the file's current content (under an advisory lock where available),
+// prunes to n_max, writes the result atomically and, on success, replaces ngram_cache with the merged
+// result and clears ngram_cache_delta.
+// If the file is missing or corrupt, ngram_cache (which must already contain the delta) is written instead.
+// A file that belongs to another vocab or a newer format is never overwritten: the sync fails.
+// ngram_cache and ngram_cache_delta must be distinct objects.
+// returns: true on success, otherwise err describes the problem and nothing is modified.
+bool common_ngram_cache_sync_file(
+    const std::string & filename, common_ngram_cache & ngram_cache, common_ngram_cache & ngram_cache_delta,
+    size_t n_max, const common_ngram_cache_vocab_id & vocab_id, std::string & err);
+
+// Save an ngram cache to a file (vocab identity unknown). Logs on failure.
 // ngram_cache: the ngram cache to save.
 // filename:    the path under which to save the ngram cache.
 void common_ngram_cache_save(common_ngram_cache & ngram_cache, const std::string & filename);
@@ -93,9 +172,10 @@ void common_ngram_cache_save(common_ngram_cache & ngram_cache, const std::string
 // Load an ngram cache saved with common_ngram_cache_save.
 // filename: the path from which to load the ngram cache.
 // returns:  an ngram cache containing the information saved to filename.
+// throws:   std::ifstream::failure if the file cannot be opened or is not a usable cache file.
 common_ngram_cache common_ngram_cache_load(const std::string & filename);
 
-// Merge two ngram caches.
+// Merge two ngram caches, counts of shared (n-gram, token) pairs are summed.
 // ngram_cache_target: the ngram cache to which to add the information from ngram_cache_add.
 // ngram_cache_add:    the ngram cache to add to ngram_cache_target.
 void common_ngram_cache_merge(common_ngram_cache & ngram_cache_target, common_ngram_cache & ngram_cache_add);

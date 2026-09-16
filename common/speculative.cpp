@@ -2664,20 +2664,32 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
     }
 };
 
+// Self-speculative decoding with the 3-level n-gram cache of common/ngram-cache.h:
+//   context: n-grams of the tokens of the current sequence, rebuilt when the sequence shrinks
+//   dynamic: n-grams accumulated over previous requests; with save_dynamic also over previous runs of the
+//            server, through the file given by --lookup-cache-dynamic
+//   static:  n-grams of a corpus prepared with llama-lookup-create, read-only
 struct common_speculative_impl_ngram_cache : public common_speculative_impl {
     common_params_speculative_ngram_cache params;
 
     uint16_t n_draft;
 
-    bool save_dynamic;
-    bool save_static;
+    // shared across all sequences
+    common_ngram_cache ngram_cache_dynamic;
+    common_ngram_cache ngram_cache_static;
+
+    // writeback of the dynamic cache, see sync()
+    bool               save_dynamic = false; // params.save_dynamic and a path to write to
+    common_ngram_cache ngram_cache_delta;    // what was added to ngram_cache_dynamic since the last successful sync()
+    int64_t            t_last_sync_ms = 0;
+    size_t             n_max_dynamic = 0;    // 0 = unlimited
+
+    common_ngram_cache_vocab_id vocab_id;
 
     struct seq_info {
-        size_t cache_size = 0; // number of tokens in n-gram cache
+        size_t cache_size = 0; // number of tokens of the sequence in ngram_cache_context
 
         common_ngram_cache ngram_cache_context;
-        common_ngram_cache ngram_cache_dynamic;
-        common_ngram_cache ngram_cache_static;
     };
 
     std::vector<seq_info> sinfos;
@@ -2685,54 +2697,134 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
     common_speculative_impl_ngram_cache(
             const common_params_speculative & params,
             uint32_t n_seq,
-            uint16_t n_draft,
-            const std::string & path_static,
-            const std::string & path_dynamic,
-            bool save_dynamic,
-            bool save_static)
+            uint16_t n_draft)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_NGRAM_CACHE, n_seq)
         , params(params.ngram_cache)
         , n_draft(n_draft)
-        , save_dynamic(save_dynamic)
-        , save_static(save_static)
     {
+        const std::string & path_static  = this->params.lookup_cache_static;
+        const std::string & path_dynamic = this->params.lookup_cache_dynamic;
+
         SPC_TRC("%s", "adding speculative implementation 'ngram-cache'\n");
-        SPC_TRC("- n_draft=%d, cache_static=%s, cache_dynamic=%s\n",
+        SPC_TRC("- n_draft=%d, cache_static=%s, cache_dynamic=%s, save_dynamic=%d\n",
                 n_draft,
                 path_static.empty() ? "none" : path_static.c_str(),
-                path_dynamic.empty() ? "none" : path_dynamic.c_str());
+                path_dynamic.empty() ? "none" : path_dynamic.c_str(),
+                this->params.save_dynamic ? 1 : 0);
 
         sinfos.resize(n_seq);
 
+        vocab_id.n_tokens = this->params.vocab_n_tokens;
+        vocab_id.hash     = this->params.vocab_hash;
+
+        // a cache file that cannot be used is skipped, never fatal: the drafter then starts cold, as without the file
         if (!path_static.empty()) {
-            try {
-                auto ngram_cache_static = common_ngram_cache_load(path_static);
-
-                for (auto & sinfo : sinfos) {
-                    sinfo.ngram_cache_static = ngram_cache_static;
-                }
-            } catch (...) {
-                SPC_ERR("failed to open static lookup cache: %s", path_static.c_str());
-                GGML_ABORT("Couldn't read static lookup cache");
+            std::string err;
+            if (common_ngram_cache_load_file(path_static, ngram_cache_static, vocab_id, err) == COMMON_NGRAM_CACHE_LOAD_OK) {
+                SPC_INF("static lookup cache loaded: %s (%zu n-grams)\n", path_static.c_str(), ngram_cache_static.size());
+            } else {
+                SPC_WRN("static lookup cache ignored: %s\n", err.c_str());
             }
         }
 
+        auto status_dynamic = COMMON_NGRAM_CACHE_LOAD_MISSING;
         if (!path_dynamic.empty()) {
-            try {
-                auto ngram_cache_dynamic = common_ngram_cache_load(path_dynamic);
-
-                for (auto & sinfo : sinfos) {
-                    sinfo.ngram_cache_dynamic = ngram_cache_dynamic;
-                }
-            } catch (...) {
-                SPC_ERR("failed to open dynamic lookup cache: %s", path_dynamic.c_str());
-                GGML_ABORT("Couldn't read dynamic lookup cache");
+            std::string err;
+            status_dynamic = common_ngram_cache_load_file(path_dynamic, ngram_cache_dynamic, vocab_id, err);
+            if (status_dynamic == COMMON_NGRAM_CACHE_LOAD_OK) {
+                SPC_INF("dynamic lookup cache loaded: %s (%zu n-grams)\n", path_dynamic.c_str(), ngram_cache_dynamic.size());
+            } else {
+                SPC_WRN("dynamic lookup cache ignored, starting cold: %s\n", err.c_str());
             }
         }
+
+        if (this->params.save_dynamic) {
+            if (path_dynamic.empty()) {
+                SPC_WRN("%s", "--lookup-cache-dynamic-save needs --lookup-cache-dynamic, the dynamic lookup cache will not be saved\n");
+            } else if (status_dynamic == COMMON_NGRAM_CACHE_LOAD_FOREIGN) {
+                // the file is a valid cache of another model: saving would overwrite it with this model's n-grams
+                SPC_WRN("dynamic lookup cache will not be saved: %s belongs to another model\n", path_dynamic.c_str());
+            } else {
+                save_dynamic  = true;
+                n_max_dynamic = this->params.max_ngrams_dynamic > 0 ? (size_t) this->params.max_ngrams_dynamic : 0;
+
+                const size_t n_loaded = ngram_cache_dynamic.size();
+                common_ngram_cache_prune(ngram_cache_dynamic, n_max_dynamic);
+                if (ngram_cache_dynamic.size() < n_loaded) {
+                    SPC_INF("dynamic lookup cache pruned to %zu n-grams (max %zu)\n", ngram_cache_dynamic.size(), n_max_dynamic);
+                }
+                if (this->params.save_dynamic_interval > 0) {
+                    SPC_INF("dynamic lookup cache will be saved to %s (every %d s and at shutdown)\n",
+                            path_dynamic.c_str(), this->params.save_dynamic_interval);
+                } else {
+                    SPC_INF("dynamic lookup cache will be saved to %s (at shutdown only)\n", path_dynamic.c_str());
+                }
+            }
+        }
+
+        t_last_sync_ms = ggml_time_ms();
     }
 
-    void begin(llama_seq_id /*seq_id*/, const llama_tokens & /*prompt*/) override {
-        // noop
+    // the destructor saves, a copy would save twice
+    common_speculative_impl_ngram_cache(const common_speculative_impl_ngram_cache &) = delete;
+    common_speculative_impl_ngram_cache & operator=(const common_speculative_impl_ngram_cache &) = delete;
+
+    ~common_speculative_impl_ngram_cache() override {
+        // The server destroys the speculative context on clean shutdown and when entering the sleeping state.
+        // A process killed with SIGKILL, or with a second Ctrl+C, never gets here - hence the periodic sync()
+        // from begin().
+        sync("shutdown");
+    }
+
+    // Write the dynamic cache back to its file, merged with whatever another process wrote there meanwhile.
+    // Never throws: this runs from the destructor.
+    void sync(const char * reason) noexcept {
+        if (!save_dynamic) {
+            return;
+        }
+        if (ngram_cache_delta.empty()) {
+            t_last_sync_ms = ggml_time_ms();
+            return;
+        }
+
+        try {
+            const int64_t t_start_us = ggml_time_us();
+
+            std::string err;
+            if (common_ngram_cache_sync_file(params.lookup_cache_dynamic, ngram_cache_dynamic, ngram_cache_delta,
+                        n_max_dynamic, vocab_id, err)) {
+                SPC_INF("dynamic lookup cache saved (%s): %s, %zu n-grams, %.1f ms\n",
+                        reason, params.lookup_cache_dynamic.c_str(), ngram_cache_dynamic.size(),
+                        (ggml_time_us() - t_start_us) / 1000.0);
+            } else {
+                SPC_WRN("dynamic lookup cache not saved (%s), will retry later: %s\n", reason, err.c_str());
+            }
+        } catch (const std::exception & e) {
+            SPC_WRN("dynamic lookup cache not saved (%s): %s\n", reason, e.what());
+        } catch (...) {
+            SPC_WRN("dynamic lookup cache not saved (%s)\n", reason);
+        }
+
+        t_last_sync_ms = ggml_time_ms();
+    }
+
+    void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+        GGML_ASSERT(seq_id < (llama_seq_id) n_seq);
+
+        auto & sinfo = sinfos[seq_id];
+        if (prompt.size() < sinfo.cache_size) {
+            // The sequence got shorter (a reasoning block was dropped, or the slot serves another conversation).
+            // The context cache can only be appended to (see common_ngram_cache_update), so it is rebuilt from
+            // scratch at the next draft.
+            sinfo.ngram_cache_context.clear();
+            sinfo.cache_size = 0;
+        }
+
+        // checkpoint at request boundaries, so the write never lands in the middle of a generation
+        if (save_dynamic && params.save_dynamic_interval > 0 && !ngram_cache_delta.empty() &&
+                ggml_time_ms() - t_last_sync_ms >= (int64_t) params.save_dynamic_interval * 1000) {
+            sync("checkpoint");
+        }
     }
 
     void draft_one(
@@ -2743,36 +2835,34 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
 
         const auto & prompt = *dparams.prompt;
 
-        if (sinfo.cache_size < prompt.size() + 1) {
-            llama_tokens tokens_new;
-            tokens_new.reserve(prompt.size() + 1 - sinfo.cache_size);
-            for (size_t j = sinfo.cache_size; j < prompt.size(); ++j) {
-                tokens_new.push_back(prompt[j]);
-            }
-            tokens_new.push_back(dparams.id_last); // add the last token
-
-            // Update context ngram cache with new dparams.prompt:
-            common_ngram_cache_update(
-                    sinfo.ngram_cache_context,
-                    LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX,
-                    tokens_new, tokens_new.size(), false);
-            sinfo.cache_size = prompt.size() + 1;
-        }
-
         llama_tokens inp;
         inp.reserve(prompt.size() + 1);
-        for (size_t j = 0; j < prompt.size(); ++j) {
-            inp.push_back(prompt[j]);
-        }
+        inp.insert(inp.end(), prompt.begin(), prompt.end());
         inp.push_back(dparams.id_last);
+
+        if (sinfo.cache_size < inp.size()) {
+            // Pass the whole sequence together with the number of new tokens, so that the n-grams spanning
+            // the boundary between the already cached tokens and the new ones are counted as well.
+            const int nnew = (int) (inp.size() - sinfo.cache_size);
+
+            common_ngram_cache_update(sinfo.ngram_cache_context, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX, inp, nnew, false);
+
+            if (save_dynamic) {
+                // the dynamic cache learns from every sequence; the delta is what sync() writes back
+                common_ngram_cache_update(ngram_cache_dynamic, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX, inp, nnew, false);
+                common_ngram_cache_update(ngram_cache_delta,   LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX, inp, nnew, false);
+            }
+
+            sinfo.cache_size = inp.size();
+        }
 
         result.push_back(dparams.id_last);
 
         common_ngram_cache_draft(
                 inp, result, n_draft, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX,
                 sinfo.ngram_cache_context,
-                sinfo.ngram_cache_dynamic,
-                sinfo.ngram_cache_static);
+                ngram_cache_dynamic,
+                ngram_cache_static);
 
         if (result.size() > 0) {
             // delete first token in result (which is the id_last token)
@@ -2826,22 +2916,6 @@ static common_ngram_map get_common_ngram_map(
     uint16_t min_hits   = config.min_hits;
 
     return common_ngram_map(size_key, size_value, key_only, min_hits);
-}
-
-static common_speculative_impl_ngram_cache create_state_ngram_cache(
-        const common_speculative_config & config,
-        uint32_t n_seq,
-        const std::string & path_static,
-        const std::string & path_dynamic) {
-    uint16_t n_draft = 8; // TODO get from config?
-
-    // TODO bool param in common/common.h to set save_static/save_dynamic?
-    bool save_static = false;
-    bool save_dynamic = false;
-
-    common_speculative_impl_ngram_cache state(config.params, n_seq, n_draft, path_static, path_dynamic, save_static, save_dynamic);
-
-    return state;
 }
 
 std::string common_speculative_type_name_str(const std::vector<common_speculative_type> & types) {
@@ -3238,11 +3312,9 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE: {
-                auto state = create_state_ngram_cache(
-                        config, n_seq,
-                        params.ngram_cache.lookup_cache_static,
-                        params.ngram_cache.lookup_cache_dynamic);
-                impls.push_back(std::make_unique<common_speculative_impl_ngram_cache>(state));
+                const uint16_t n_draft = 8; // TODO get from config?
+
+                impls.push_back(std::make_unique<common_speculative_impl_ngram_cache>(config.params, n_seq, n_draft));
                 break;
             }
             default:
