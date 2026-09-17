@@ -239,3 +239,15 @@ llm_build_eagle3_decode::llm_build_eagle3_decode(const llama_model & model, cons
 
     ggml_build_forward_expand(gf, cur);
 }
+
+std::unique_ptr<llm_graph_context> llama_model_eagle3::build_arch_graph(const llm_graph_params & params) const {
+    switch (params.gtype) {
+        case LLM_GRAPH_TYPE_ENCODER:
+            return std::make_unique<graph<true>>(*this, params);
+        case LLM_GRAPH_TYPE_DEFAULT:
+        case LLM_GRAPH_TYPE_DECODER:
+            return std::make_unique<graph<false>>(*this, params);
+        default:
+            GGML_ABORT("invalid graph type");
+    };
+}

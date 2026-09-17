@@ -102,6 +102,10 @@
 #ifndef cudaPeekAtLastError
 #define cudaPeekAtLastError hipPeekAtLastError
 #endif
+#define cudaHostAlloc hipHostMalloc
+#define cudaHostAllocPortable hipHostMallocPortable
+#define cudaHostAllocMapped hipHostMallocMapped
+#define cudaHostGetDevicePointer hipHostGetDevicePointer
 #define cudaHostRegister hipHostRegister
 #define cudaHostRegisterPortable hipHostRegisterPortable
 #define cudaHostRegisterReadOnly hipHostRegisterReadOnly
@@ -218,9 +222,9 @@
 
 #define __CUDA_ARCH__ 1300
 
-#if defined(__gfx900__) || defined(__gfx906__)
+#if defined(__gfx900__) || defined(__gfx906__) || defined(__gfx909__) || defined(__gfx90c__)
 #define GCN5
-#endif // defined(__gfx900__) || defined(__gfx906__)
+#endif // defined(__gfx900__) || defined(__gfx906__) || defined(__gfx909__) || defined(__gfx90c__)
 
 #if defined(__gfx803__)
 #define GCN4

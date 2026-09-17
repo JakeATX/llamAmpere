@@ -134,6 +134,7 @@ public:
     // per layer
     std::vector<ggml_tensor *> r_l;
     std::vector<ggml_tensor *> s_l;
+    // a second conv history that must stay replicated across devices, so it cannot share the r row
     std::vector<ggml_tensor *> p_l;
 
     // per layer, only allocated when gdn_replay is true: [n_embd_s_ingredient(), mem_size * n_rs_seq]

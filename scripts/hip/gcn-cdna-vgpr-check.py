@@ -67,6 +67,7 @@ def main():
         # TurboQuant KV vector flash-attention, D=128, ncols=2, K=turbo3, V=q8_0: 259 VGPRs (255 + 4 spilled)
         '_ZL18flash_attn_ext_vecILi128ELi2EL9ggml_type44ELS0_8ELb0EEvPKcS2_S2_S2_S2_PKiPfP15HIP_vector_typeIfLj2EEffffjfiS6_IjLj3EEiiiiiiiiiiiliiliiiiil',
         '_ZL18flash_attn_ext_vecILi128ELi2EL9ggml_type44ELS0_8ELb1EEvPKcS2_S2_S2_S2_PKiPfP15HIP_vector_typeIfLj2EEffffjfiS6_IjLj3EEiiiiiiiiiiiliiliiiiil',
+        '_ZL18flash_attn_ext_f16ILi576ELi512ELi2ELi32ELb0ELb1ELb0EEvPKcS1_S1_S1_S1_PKiPfP15HIP_vector_typeIfLj2EEffffjfiS5_IjLj3EEiiiiiiiiiiiliiliiiiil'
     }
 
     functions = parse_log_file(log_file)

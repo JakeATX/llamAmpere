@@ -112,49 +112,13 @@ if (CUDAToolkit_FOUND)
     file(GLOB   SRCS "template-instances/mmf*.cu")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
 
-    if (GGML_CUDA_FA_ALL_QUANTS)
-        file(GLOB   SRCS "template-instances/fattn-vec*.cu")
-        list(APPEND GGML_SOURCES_CUDA ${SRCS})
-        add_compile_definitions(GGML_CUDA_FA_ALL_QUANTS)
-    else()
-        list(APPEND GGML_SOURCES_CUDA
-            template-instances/fattn-vec-instance-f16-f16.cu
-            template-instances/fattn-vec-instance-q4_0-q4_0.cu
-            template-instances/fattn-vec-instance-q8_0-q8_0.cu
-            template-instances/fattn-vec-instance-f16-q8_0.cu
-            template-instances/fattn-vec-instance-q8_0-f16.cu
-            template-instances/fattn-vec-instance-bf16-q8_0.cu
-            template-instances/fattn-vec-instance-q8_0-bf16.cu
-            template-instances/fattn-vec-instance-bf16-bf16.cu
-            template-instances/fattn-vec-instance-turbo3_0-turbo3_0.cu
-            template-instances/fattn-vec-instance-turbo3_0-q8_0.cu
-            template-instances/fattn-vec-instance-q8_0-turbo3_0.cu
-            template-instances/fattn-vec-instance-f16-turbo3_0.cu
-            template-instances/fattn-vec-instance-turbo3_0-f16.cu
-            template-instances/fattn-vec-instance-turbo2_0-turbo2_0.cu
-            template-instances/fattn-vec-instance-turbo2_0-q8_0.cu
-            template-instances/fattn-vec-instance-q8_0-turbo2_0.cu
-            template-instances/fattn-vec-instance-f16-turbo2_0.cu
-            template-instances/fattn-vec-instance-turbo2_0-f16.cu
-            template-instances/fattn-vec-instance-turbo3_0-turbo2_0.cu
-            template-instances/fattn-vec-instance-turbo2_0-turbo3_0.cu
-            template-instances/fattn-vec-instance-turbo4_0-turbo4_0.cu
-            template-instances/fattn-vec-instance-turbo4_0-q8_0.cu
-            template-instances/fattn-vec-instance-q8_0-turbo4_0.cu
-            template-instances/fattn-vec-instance-f16-turbo4_0.cu
-            template-instances/fattn-vec-instance-turbo4_0-f16.cu
-            template-instances/fattn-vec-instance-turbo4_0-turbo3_0.cu
-            template-instances/fattn-vec-instance-turbo3_0-turbo4_0.cu
-            template-instances/fattn-vec-instance-turbo4_0-turbo2_0.cu
-            template-instances/fattn-vec-instance-turbo2_0-turbo4_0.cu)
-    endif()
+    ggml_cuda_fattn_vec_instances(${CMAKE_CURRENT_SOURCE_DIR} SRCS)
+    list(APPEND GGML_SOURCES_CUDA ${SRCS})
 
     ggml_add_backend_library(ggml-cuda
                              ${GGML_HEADERS_CUDA}
                              ${GGML_SOURCES_CUDA}
                             )
-
-    add_compile_definitions(GGML_CUDA_PEER_MAX_BATCH_SIZE=${GGML_CUDA_PEER_MAX_BATCH_SIZE})
 
     if (GGML_CUDA_GRAPHS)
         add_compile_definitions(GGML_CUDA_USE_GRAPHS)
@@ -232,8 +196,7 @@ if (CUDAToolkit_FOUND)
         # - speed (nvcc's default)
         # - balance
         # - size
-        # Disabled: -compress-mode causes issues with GCC 12 host compiler
-        # list(APPEND CUDA_FLAGS -compress-mode=${GGML_CUDA_COMPRESSION_MODE})
+        list(APPEND CUDA_FLAGS -compress-mode=${GGML_CUDA_COMPRESSION_MODE})
     endif()
 
     if (GGML_FATAL_WARNINGS)

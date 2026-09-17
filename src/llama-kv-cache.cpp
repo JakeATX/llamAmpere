@@ -12,6 +12,7 @@
 #include <limits>
 #include <map>
 #include <stdexcept>
+#include <unordered_map>
 
 static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
@@ -595,7 +596,8 @@ llama_kv_cache::llama_kv_cache(
         // indexer: this is a functional requirement for the model, not optional
         // tuning, so it overrides the default-off policy (still respects the hard
         // LLAMA_ATTN_ROT_DISABLE lock-out).
-        if (!attn_rot_disable && (model.arch == LLM_ARCH_DEEPSEEK32 || model.arch == LLM_ARCH_DEEPSEEK4) &&
+        if (!attn_rot_disable && (model.arch == LLM_ARCH_DEEPSEEK32 || model.arch == LLM_ARCH_DEEPSEEK4 ||
+                 model.arch == LLM_ARCH_DOTS3NOTE) &&
             hparams.n_embd_head_k_full == hparams.indexer_head_size) {
             attn_rot_k = true;
         }
@@ -662,6 +664,7 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
         return true;
     }
 
+    // TODO: fix incosistent handling of `seq_id < 0` and `seq_id == -1` in the codebase [TAG_LLAMA_SEQ_ID_NEG]
     GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()));
 
     if (p0 < 0) {
@@ -1406,11 +1409,24 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
             cells.pos_set(idx, ubatch.pos[i]);
 
-            if (ubatch.is_pos_2d()) {
-                llama_kv_cell_ext ext {
-                    /*.x =*/ ubatch.pos[i + ubatch.n_tokens*2],
-                    /*.y =*/ ubatch.pos[i + ubatch.n_tokens],
-                };
+            if (ubatch.is_pos_2d() || ubatch.token || hparams.ple_n_heads > 0) {
+                llama_kv_cell_ext ext;
+
+                if (ubatch.is_pos_2d()) {
+                    ext.x = ubatch.pos[i + ubatch.n_tokens*2];
+                    ext.y = ubatch.pos[i + ubatch.n_tokens];
+                }
+
+                if (ubatch.token) {
+                    ext.tok = ubatch.token[i];
+                } else if (hparams.ple_n_heads > 0) {
+                    // embd batch (multimodal input) has no token ids, need to pad it with the correct ID for PLE layers
+                    // TODO @ngxson : check if we can do the same as gemma 3n / gemma 4
+                    ext.tok = hparams.ple_image_token_id != 0
+                        ? (llama_token) hparams.ple_image_token_id
+                        : (llama_token) hparams.ple_eos_token_id;
+                }
+
                 cells.ext_set(idx, ext);
             }
 
@@ -2015,7 +2031,9 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
 
                 // apply SWA if any
                 if (swa) {
-                    if (llama_hparams::is_masked_swa(n_swa, swa_type, p0, p1)) {
+                    // see llama_non_causal_type
+                    const bool in_span = !causal && args.hparams.non_causal_type == LLAMA_NON_CAUSAL_TYPE_SWA_FULL && p0 >= seq_pos_min[seq_id];
+                    if (!in_span && llama_hparams::is_masked_swa(n_swa, swa_type, p0, p1)) {
                         goto skip;
                     }
                 }
@@ -2085,6 +2103,12 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
 
     // n_tps == n_tokens_per_stream
     const int64_t n_tps = n_tokens/n_stream;
+
+    // see llama_non_causal_type
+    // only the SWA cache (or the SWA layers of a single cache) become non-causal
+    if (!causal_attn && hparams.non_causal_type == LLAMA_NON_CAUSAL_TYPE_SWA_ONLY) {
+        causal_attn = swa_type == LLAMA_SWA_TYPE_NONE;
+    }
 
     //const int64_t t_start = ggml_time_us();
 
@@ -2157,6 +2181,67 @@ void llama_kv_cache::set_input_v_rot(ggml_tensor * dst) const {
     GGML_ASSERT(attn_rot_hadamard.count(dst->ne[0]));
 
     memcpy(dst->data, attn_rot_hadamard.at(n_rot).data(), ggml_nbytes(dst));
+}
+
+bool llama_kv_cache::has_cell_ext() const {
+    // M-RoPE needs the 2D position, the PLE n-gram hash needs the token id
+    return hparams.n_pos_per_embd() > 1 || hparams.ple_n_heads > 0;
+}
+
+void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
+    const uint32_t n_tokens = ubatch.n_tokens;
+
+    res.clear();
+    res.resize(n_tokens*n, LLAMA_TOKEN_NULL);
+
+    if (n == 0) {
+        return;
+    }
+
+    // note: apply_ubatch() has already stored the current ubatch, so the cells cover the tokens
+    //       of this very ubatch as well, which is what we want
+    // the nearest cell at or before a position also resolves M-RoPE gaps, where multiple tokens
+    // share the same temporal pos
+
+    // an embd (multimodal) ubatch can repeat one position for a whole image, so positions
+    // do not encode the token order; resolve its predecessors by ubatch order instead
+    std::vector<uint32_t> ord; // index among the ubatch tokens of the same seq
+    std::unordered_map<llama_seq_id, std::vector<uint32_t>> seq_idx;
+
+    if (!ubatch.token) {
+        ord.resize(n_tokens);
+        for (uint32_t i = 0; i < n_tokens; ++i) {
+            auto & v = seq_idx[ubatch.seq_id[i][0]];
+            ord[i] = v.size();
+            v.push_back(i);
+        }
+    }
+
+    for (uint32_t i = 0; i < n_tokens; ++i) {
+        // TODO: a token that belongs to more than one sequence has an ambiguous history.
+        //       the n-gram architectures have to reject such batches
+        const llama_seq_id seq_id = ubatch.seq_id[i][0];
+
+        for (uint32_t j = 0; j < n; ++j) {
+            const llama_pos d = (llama_pos) (n - j);
+
+            llama_pos p;
+            if (!ubatch.token) {
+                const auto & v = seq_idx[seq_id];
+                const int64_t k = (int64_t) ord[i] - d;
+                // k >= 0: an earlier token of this very ubatch; k < 0: before the chunk
+                p = k >= 0 ? ubatch.pos[v[k]] : ubatch.pos[v[0]] + (llama_pos) k;
+            } else {
+                p = ubatch.pos[i] - d;
+            }
+
+            if (p < 0) {
+                continue;
+            }
+
+            res[i*n + j] = v_cells[seq_to_stream[seq_id]].seq_pos_tok_le(seq_id, p);
+        }
+    }
 }
 
 size_t llama_kv_cache::total_size() const {
@@ -2294,6 +2379,10 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
     for (const auto & layer : layers) {
         const uint32_t il = layer.il;
 
+        if (!hparams.has_rope(il)) {
+            continue;
+        }
+
         const int64_t n_head_kv    = hparams.n_head_kv(il);
         const int64_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
 
@@ -2410,6 +2499,7 @@ const slot_info_vec_t *   sinfos_in) {
 
     GGML_UNUSED(flags);
 
+    // TODO: fix incosistent handling of `seq_id < 0` and `seq_id == -1` in the codebase [TAG_LLAMA_SEQ_ID_NEG]
     GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()));
 
     if (sinfos_out) {
@@ -2494,7 +2584,7 @@ void llama_kv_cache::state_write_meta(llama_io_write_i & io, const cell_ranges_t
             io.write(&pos,      sizeof(pos));
             io.write(&n_seq_id, sizeof(n_seq_id));
 
-            if (hparams.n_pos_per_embd() > 1) {
+            if (has_cell_ext()) {
                 const llama_kv_cell_ext ext = cells.ext_get(i);
                 io.write(&ext, sizeof(ext));
             }
@@ -2619,7 +2709,7 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
 
         // the ext as it was saved, to put back after apply_ubatch()
         std::vector<llama_kv_cell_ext> exts;
-        if (hparams.n_pos_per_embd() > 1) {
+        if (has_cell_ext()) {
             exts.resize(cell_count);
         }
 
@@ -2635,12 +2725,17 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
                 return false;
             }
 
-            if (hparams.n_pos_per_embd() > 1) {
+            if (has_cell_ext()) {
                 llama_kv_cell_ext ext;
                 io.read(&ext, sizeof(ext));
 
-                ubatch.pos[i + ubatch.n_tokens]   = ext.y;
-                ubatch.pos[i + ubatch.n_tokens*2] = ext.x;
+                if (hparams.n_pos_per_embd() > 1) {
+                    ubatch.pos[i + ubatch.n_tokens]   = ext.y;
+                    ubatch.pos[i + ubatch.n_tokens*2] = ext.x;
+                }
+
+                // apply_ubatch() below restores ext.tok from the ubatch tokens
+                ubatch.token[i] = ext.tok;
 
                 exts[i] = ext;
             }
@@ -2691,7 +2786,8 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
             }
         }
 
-        // TODO: we cannot yet restore llama_kv_cell_ext as the apply_ubatch() does not support it yet
+        // note: apply_ubatch() rebuilds llama_kv_cell_ext from the ubatch
+        //       only ext.tok and the M-RoPE 2D position round-trip through it
         //       see: https://github.com/ggml-org/llama.cpp/pull/16825#issuecomment-3460868350
         apply_ubatch(sinfo, ubatch);
 
@@ -2738,7 +2834,7 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
 
             cells.pos_set(i, pos);
 
-            if (hparams.n_pos_per_embd() > 1) {
+            if (has_cell_ext()) {
                 llama_kv_cell_ext ext;
                 io.read(&ext, sizeof(ext));
                 cells.ext_set(i, ext);
@@ -2775,6 +2871,24 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
 
 bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo) {
     auto & cells = v_cells[strm];
+
+    // batch the scatter reads per contiguous run of destination indices
+    // from inclusive, to exclusive - same convention as cell_ranges_t
+    // contiguous cells yield a single run covering the whole block
+    struct cell_run { uint32_t from; uint32_t to; };
+    std::vector<cell_run> runs;
+    if (cell_count > 0) {
+        const auto & idxs = sinfo.idxs[0];
+        uint32_t i0 = 0;
+        while (i0 < cell_count) {
+            uint32_t i1 = i0 + 1;
+            while (i1 < cell_count && idxs[i1] == idxs[i1 - 1] + 1) {
+                ++i1;
+            }
+            runs.push_back({idxs[i0], idxs[i1 - 1] + 1});
+            i0 = i1;
+        }
+    }
 
     uint32_t v_trans;
     uint32_t n_layer;
@@ -2824,17 +2938,8 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
             return false;
         }
 
-        if (cell_count) {
-            if (sinfo.is_contiguous()) {
-                // Fast path: contiguous cells, single memcpy
-                io.read_tensor(k, sinfo.head() * k_size_row, cell_count * k_size_row);
-            } else {
-                // Slow path: scatter to non-contiguous positions
-                for (uint32_t i = 0; i < cell_count; ++i) {
-                    const size_t dst_offset = sinfo.idxs[0][i] * k_size_row;
-                    io.read_tensor(k, dst_offset, k_size_row);
-                }
-            }
+        for (const auto & r : runs) {
+            io.read_tensor(k, (size_t) r.from * k_size_row, (size_t) (r.to - r.from) * k_size_row);
         }
     }
 
@@ -2868,17 +2973,8 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
                 return false;
             }
 
-            if (cell_count) {
-                if (sinfo.is_contiguous()) {
-                    // Fast path: contiguous cells, single memcpy
-                    io.read_tensor(v, sinfo.head() * v_size_row, cell_count * v_size_row);
-                } else {
-                    // Slow path: scatter to non-contiguous positions
-                    for (uint32_t i = 0; i < cell_count; ++i) {
-                        const size_t dst_offset = sinfo.idxs[0][i] * v_size_row;
-                        io.read_tensor(v, dst_offset, v_size_row);
-                    }
-                }
+            for (const auto & r : runs) {
+                io.read_tensor(v, (size_t) r.from * v_size_row, (size_t) (r.to - r.from) * v_size_row);
             }
         }
     } else {
@@ -2919,22 +3015,10 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
                 return false;
             }
 
-            if (cell_count) {
-                if (sinfo.is_contiguous()) {
-                    // Fast path: contiguous cells
-                    const uint32_t h = sinfo.head();
-                    for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
-                        const size_t dst_offset = (h + j * cells.size()) * v_size_el;
-                        io.read_tensor(v, dst_offset, cell_count * v_size_el);
-                    }
-                } else {
-                    // Slow path: scatter to non-contiguous positions
-                    for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
-                        for (uint32_t i = 0; i < cell_count; ++i) {
-                            const size_t dst_offset = (sinfo.idxs[0][i] + j * cells.size()) * v_size_el;
-                            io.read_tensor(v, dst_offset, v_size_el);
-                        }
-                    }
+            for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
+                for (const auto & r : runs) {
+                    const size_t dst_offset = ((size_t) r.from + j * cells.size()) * v_size_el;
+                    io.read_tensor(v, dst_offset, (size_t) (r.to - r.from) * v_size_el);
                 }
             }
         }
@@ -3119,4 +3203,8 @@ void llama_kv_cache_context::set_input_k_rot(ggml_tensor * dst) const {
 
 void llama_kv_cache_context::set_input_v_rot(ggml_tensor * dst) const {
     kv->set_input_v_rot(dst);
+}
+
+void llama_kv_cache_context::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
+    kv->get_prev_tokens(ubatch, n, res);
 }

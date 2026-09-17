@@ -65,7 +65,7 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     qwen4exp_require_nonzero(ml, LLM_KV_ATTENTION_INDEXER_TOP_K,      hparams.indexer_top_k);
     ml.get_key_or_arr(LLM_KV_ATTENTION_COMPRESS_RATIOS, hparams.dsv4_compress_ratios, hparams.n_layer_all, false);
 
-    std::fill(hparams.is_ple_impl.begin(), hparams.is_ple_impl.end(), 0);
+    hparams.is_ple_impl.reset();
     hparams.ple_n_heads = 0;
 
     uint32_t n_ple = 0;
@@ -1190,8 +1190,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
 
     const float eps_norm = hparams.f_norm_rms_eps;
 
-    q_conv = ggml_l2_norm(ctx0, q_conv, eps_norm);
-    k_conv = ggml_l2_norm(ctx0, k_conv, eps_norm);
+    q_conv = build_gdn_l2_norm(ctx0, q_conv, eps_norm);
+    k_conv = build_gdn_l2_norm(ctx0, k_conv, eps_norm);
 
 
 
