@@ -1692,7 +1692,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"-cram", "--cache-ram"}, "N",
-        string_format("set the maximum cache size in MiB (default: %d, -1 - no limit, 0 - disable)"
+        string_format("set the maximum cache size in MiB (default: %d, -1 - half of the free host memory at startup, 0 - disable)"
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)", params.cache_ram_mib),
         [](common_params & params, int value) {
             params.cache_ram_mib = value;
@@ -2552,6 +2552,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             string_format("number of parallel sequences to decode (default: %d)", params.n_parallel),
             [](common_params & params, int value) {
                 params.n_parallel = value;
+                params.n_parallel_explicit = true;
             }
         ).set_env("LLAMA_ARG_N_PARALLEL"));
     }

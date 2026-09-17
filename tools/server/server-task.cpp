@@ -1996,7 +1996,9 @@ void server_prompt_cache::update() {
         disk_update();
     }
 
-    SRV_TRC(" - cache state: %zu prompts, %.3f MiB (limits: %.3f MiB, %zu tokens, %zu est)\n",
+    // one line per update at info level: the cache is the largest host allocation the server makes,
+    // and its size has to be visible in ordinary logs
+    SRV_INF("prompt cache: %zu prompts, %.1f MiB (limit %.1f MiB, %zu tokens, %zu est)\n",
             states.size(), size() / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0), limit_tokens, limit_tokens_cur);
 
     for (const auto & state : states) {

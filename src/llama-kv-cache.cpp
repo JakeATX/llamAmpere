@@ -242,6 +242,36 @@ llama_kv_cache::llama_kv_cache(
 
     const bool is_mla = hparams.is_mla();
 
+    // Layer-adaptive: use higher precision for quality-sensitive layers.
+    // Config: TURBO_LAYER_ADAPTIVE env var controls the strategy
+    //   0 = uniform (default)
+    //   1 = q8_0 K+V for first+last 4 layers
+    //   2 = q8_0 K+V for last 8 layers
+    //   5 = Boundary V: first2+last2 V=turbo4, rest V=turbo2 (K unchanged)
+    //   6 = V-only: last 8 V=turbo4, rest V=turbo2 (K unchanged)
+    //   7 = Boundary V (recommended): first2+last2 V=q8_0, rest V=turbo2 (K unchanged)
+    //
+    // Resolved once per construction rather than as a function-local static:
+    // a process that constructs caches for more than one type_v in turn (e.g.
+    // llama-bench sweeping --cache-type-v) must not have the first
+    // construction's mode silently pin the strategy for every later one.
+    const int kv_adaptive_mode = [&]() {
+        const char * env = getenv("TURBO_LAYER_ADAPTIVE");
+        if (env) {
+            int mode = atoi(env);
+            if (mode > 0) {
+                LLAMA_LOG_INFO("llama_kv_cache: layer-adaptive mode %d enabled (env)\n", mode);
+            }
+            return mode;
+        }
+        // Auto-enable Boundary V (mode 7) when V is turbo2
+        if (type_v == GGML_TYPE_TURBO2_0 && hparams.n_layer() >= 8) {
+            LLAMA_LOG_INFO("llama_kv_cache: Boundary V auto-enabled for turbo2-V (opt-out: TURBO_LAYER_ADAPTIVE=0)\n");
+            return 7;
+        }
+        return 0;
+    }();
+
     for (uint32_t il = 0; il < n_layer; il++) {
         if (!hparams.has_kv(il)) {
             LLAMA_LOG_DEBUG("%s: layer %3d: does not have KV cache\n", __func__, il);
@@ -322,60 +352,38 @@ llama_kv_cache::llama_kv_cache(
         const bool has_k = true;
         const bool has_v = !is_mla;
 
-        // Layer-adaptive: use higher precision for quality-sensitive layers
-        // Config: TURBO_LAYER_ADAPTIVE env var controls the strategy
-        //   0 = uniform (default)
-        //   1 = q8_0 K+V for first+last 4 layers
-        //   2 = q8_0 K+V for last 8 layers
-        //   5 = Boundary V: first2+last2 V=turbo4, rest V=turbo2 (K unchanged)
-        //   6 = V-only: last 8 V=turbo4, rest V=turbo2 (K unchanged)
-        //   7 = Boundary V (recommended): first2+last2 V=q8_0, rest V=turbo2 (K unchanged)
+        // Layer-adaptive: use higher precision for quality-sensitive layers.
+        // See kv_adaptive_mode above for the mode legend and env var.
         ggml_type layer_type_k = type_k;
         ggml_type layer_type_v = type_v;
         {
-            static const int adaptive_mode = [&]() {
-                const char * env = getenv("TURBO_LAYER_ADAPTIVE");
-                if (env) {
-                    int mode = atoi(env);
-                    if (mode > 0) {
-                        LLAMA_LOG_INFO("llama_kv_cache: layer-adaptive mode %d enabled (env)\n", mode);
-                    }
-                    return mode;
-                }
-                // Auto-enable Boundary V (mode 7) when V is turbo2
-                if (type_v == GGML_TYPE_TURBO2_0 && hparams.n_layer() >= 8) {
-                    LLAMA_LOG_INFO("llama_kv_cache: Boundary V auto-enabled for turbo2-V (opt-out: TURBO_LAYER_ADAPTIVE=0)\n");
-                    return 7;
-                }
-                return 0;
-            }();
             const bool is_turbo = (type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0 || type_k == GGML_TYPE_TURBO2_0);
             const bool v_is_turbo = (type_v == GGML_TYPE_TURBO3_0 || type_v == GGML_TYPE_TURBO4_0 || type_v == GGML_TYPE_TURBO2_0);
             const uint32_t n_layer = hparams.n_layer();
-            if (adaptive_mode == 1 && is_turbo && n_layer >= 8) {
+            if (kv_adaptive_mode == 1 && is_turbo && n_layer >= 8) {
                 if (il < 4 || il >= n_layer - 4) {
                     layer_type_k = GGML_TYPE_Q8_0;
                     layer_type_v = GGML_TYPE_Q8_0;
                 }
-            } else if (adaptive_mode == 2 && is_turbo && n_layer >= 8) {
+            } else if (kv_adaptive_mode == 2 && is_turbo && n_layer >= 8) {
                 if (il >= n_layer - 8) {
                     layer_type_k = GGML_TYPE_Q8_0;
                     layer_type_v = GGML_TYPE_Q8_0;
                 }
-            } else if (adaptive_mode == 5 && v_is_turbo && n_layer >= 8) {
+            } else if (kv_adaptive_mode == 5 && v_is_turbo && n_layer >= 8) {
                 // Boundary V (turbo4 boundaries): first2+last2 V=turbo4, rest V=turbo2
                 const bool is_boundary = (il < 2 || il >= n_layer - 2);
                 layer_type_v = is_boundary ? GGML_TYPE_TURBO4_0 : GGML_TYPE_TURBO2_0;
                 if (il == 0) {
                     LLAMA_LOG_INFO("llama_kv_cache: Boundary V mode 5: first2+last2 V=turbo4, rest V=turbo2\n");
                 }
-            } else if (adaptive_mode == 6 && v_is_turbo && n_layer >= 8) {
+            } else if (kv_adaptive_mode == 6 && v_is_turbo && n_layer >= 8) {
                 // V-only: last 8 V=turbo4, rest V=turbo2
                 layer_type_v = (il >= n_layer - 8) ? GGML_TYPE_TURBO4_0 : GGML_TYPE_TURBO2_0;
                 if (il == 0) {
                     LLAMA_LOG_INFO("llama_kv_cache: V-only LA mode 6: last8 V=turbo4, rest V=turbo2\n");
                 }
-            } else if (adaptive_mode == 7 && v_is_turbo && n_layer >= 8) {
+            } else if (kv_adaptive_mode == 7 && v_is_turbo && n_layer >= 8) {
                 // Boundary V (recommended): first2+last2 V=q8_0, rest V=turbo2
                 const bool is_boundary = (il < 2 || il >= n_layer - 2);
                 layer_type_v = is_boundary ? GGML_TYPE_Q8_0 : GGML_TYPE_TURBO2_0;
@@ -2251,11 +2259,18 @@ public:
 void llm_graph_input_k_shift::set_input(const llama_ubatch * ubatch) {
     GGML_UNUSED(ubatch);
 
-    if (k_shift) {
+    // buffer check guards the graph-reserve pass, where tensors exist but backends aren't
+    // allocated yet; set_input_k_shift asserts on dst->buffer, so this must not be dropped.
+    if (k_shift && k_shift->buffer) {
         kv_self->set_input_k_shift(k_shift);
     }
 
-    if (k_rot) {
+    // k_rot is null (not just unallocated) whenever attn_rot_k is false: build_input_k_rot
+    // only allocates a real tensor for quantized K-caches with rotation enabled, or for
+    // DeepSeek32/DeepSeek4's lightning-indexer cache (see attn_rot_k's setup). So a skip
+    // here is either "this cache doesn't rotate" (k_rot == nullptr) or "graph-reserve pass"
+    // (k_rot->buffer == nullptr) -- never a case that should silently drop a real input.
+    if (k_rot && k_rot->buffer) {
         kv_self->set_input_k_rot(k_rot);
     }
 }
@@ -2602,6 +2617,12 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
 
         ubatch.seq_id_unq[0] = dest_seq_id;
 
+        // the ext as it was saved, to put back after apply_ubatch()
+        std::vector<llama_kv_cell_ext> exts;
+        if (hparams.n_pos_per_embd() > 1) {
+            exts.resize(cell_count);
+        }
+
         for (uint32_t i = 0; i < cell_count; ++i) {
             llama_pos pos;
             uint32_t n_seq_id;
@@ -2620,6 +2641,8 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
 
                 ubatch.pos[i + ubatch.n_tokens]   = ext.y;
                 ubatch.pos[i + ubatch.n_tokens*2] = ext.x;
+
+                exts[i] = ext;
             }
 
             // read the sequence id, but directly discard it - we will use dest_seq_id instead
@@ -2671,6 +2694,14 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
         // TODO: we cannot yet restore llama_kv_cell_ext as the apply_ubatch() does not support it yet
         //       see: https://github.com/ggml-org/llama.cpp/pull/16825#issuecomment-3460868350
         apply_ubatch(sinfo, ubatch);
+
+        // apply_ubatch() takes the 2D position from the ubatch, and that ubatch is built with this
+        // cache's own n_pos_per_embd. a cache that does not use M-RoPE itself but mirrors one that
+        // does (the qwen4exp QSA indexer) would drop x and y. put the saved ext back instead, which
+        // is what the whole-context path below already does.
+        for (uint32_t i = 0; i < (uint32_t) exts.size(); ++i) {
+            cells.ext_set(sinfo.idxs[0][i], exts[i]);
+        }
 
         LLAMA_LOG_DEBUG("%s: cell_count = %d, dest_seq_id = %d\n", __func__, cell_count, dest_seq_id);
 

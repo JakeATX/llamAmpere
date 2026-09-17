@@ -1929,8 +1929,17 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 // GGML_TQ_MMQ gates the native TQ MMQ prefill path. Read it once: getenv() is short-circuited
 // away on NVIDIA but is a libc call per mul_mat node on the AMD path.
 static bool ggml_cuda_tq_mmq_enabled() {
-    static const bool enabled = ggml_cuda_tq_mmq_enabled();
+    static const bool enabled = getenv("GGML_TQ_MMQ") != nullptr;
     return enabled;
+}
+
+static bool ggml_cuda_tq_mmq_supported(const ggml_tensor * src0, const int cc) {
+    if (!ggml_cuda_tq_mmq_enabled()) {
+        return false;
+    }
+
+    const int id = ggml_cuda_get_device();
+    return ggml_cuda_mmq_has_config(src0->type, src0->ne[1], cc, ggml_cuda_info().devices[id].smpbo);
 }
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0_, const ggml_tensor * src1_, ggml_tensor * dst) {
@@ -2159,7 +2168,8 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         return;
     }
     if (is_tq_weight && tq_fast_path_ok && src0->type == GGML_TYPE_TQ4_1S
-            && (amd_mfma_available(cc) || amd_wmma_available(cc) || GGML_CUDA_CC_IS_RDNA2(cc)) && ggml_cuda_tq_mmq_enabled()) {
+            && (amd_mfma_available(cc) || amd_wmma_available(cc) || GGML_CUDA_CC_IS_RDNA2(cc))
+            && ggml_cuda_tq_mmq_supported(src0, cc)) {
         // Phase 2 (gfx90a): native MFMA-i8 MMQ prefill via activation pre-rotation.
         // A/B against the cuBLAS path below (unset GGML_TQ_MMQ to fall back).
         ggml_cuda_mul_mat_tq4_1s_mmq(ctx, src0, src1, dst);
@@ -2224,7 +2234,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         // avoiding the 2x-slower dequant-to-f16 cuBLAS fallback so native (GGML_TQ_NATIVE) experts
         // keep their ~1.7x-smaller 5bpw footprint without a prefill penalty. Env-gated by GGML_TQ_MMQ.
         if (is_tq_weight_id && src0->type == GGML_TYPE_TQ4_1S && (amd_mfma_available(cc) || amd_wmma_available(cc) || GGML_CUDA_CC_IS_RDNA2(cc))
-                && ggml_is_contiguous(src1) && ggml_cuda_tq_mmq_enabled()) {
+                && ggml_is_contiguous(src1) && ggml_cuda_tq_mmq_supported(src0, cc)) {
             ggml_cuda_mul_mat_id_tq4_1s_mmq(ctx, src0, src1, ids, dst);
             return;
         }
@@ -2908,27 +2918,42 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
     return use_cuda_graph;
 }
 
-// key the cached CUDA graph by identity and shape: speculative decoding builds the same llama graph
-// with a varying token count (verify width, accepted drafts), and a single per-identity graph would be
-// re-captured or executed eagerly on every change
-static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
+// a captured graph hard-codes its shapes, so with one key per split an alternating shape
+// (a speculative verify batch) resets warmup forever. O(1) on purpose: walking nodes undoes the
+// point of a cuda graph. A shape this fails to separate re-captures as before, so it cannot regress.
+static uint64_t ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
+    // GGML_CUDA_GRAPH_NO_SHAPE_KEY=1 goes back to one key per split (see QWEN_AMPERE.md)
     static const bool shape_keys = getenv("GGML_CUDA_GRAPH_NO_SHAPE_KEY") == nullptr;
-    const ggml_tensor * t0 = cgraph->nodes[0];
+
+    // unlike the previous key this dereferences nodes[0], so an empty graph is not safe here
+    if (cgraph->n_nodes <= 0) {
+        return 0;
+    }
+
+    uint64_t key = (uint64_t) (uintptr_t) cgraph->nodes[0];
+
+    auto mix = [&key](uint64_t v) {
+        key = (key ^ v) * 0x100000001b3ull;
+    };
+
     if (!shape_keys) {
-        return t0;
+        return key;
     }
-    uint64_t h = (uint64_t) (uintptr_t) t0;
-    h ^= (uint64_t) cgraph->n_nodes * 0x9E3779B97F4A7C15ull;
-    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
-        h = (h ^ (uint64_t) t0->ne[i]) * 0x100000001B3ull;
+
+    mix(cgraph->n_nodes);
+
+    for (int d = 0; d < GGML_MAX_DIMS; d++) {
+        mix(cgraph->nodes[0]->ne[d]);
+        mix(cgraph->nodes[cgraph->n_nodes - 1]->ne[d]);
     }
-    return (const void *) (uintptr_t) h;
+
+    return key;
 }
 
 static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
     bool res = false;
 
-    const void * graph_key = ggml_cuda_graph_get_key(cgraph);
+    const uint64_t graph_key = ggml_cuda_graph_get_key(cgraph);
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
     if (cgraph->uid != 0 &&
@@ -2944,7 +2969,7 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     if ((int)graph->node_props.size() != cgraph->n_nodes) {
         static const bool dbg2 = getenv("GGML_CUDA_GRAPH_DEBUG") != nullptr;
         if (dbg2) {
-            fprintf(stderr, "cuda-graph-debug: key=%p n_nodes %zu -> %d\n", graph_key, graph->node_props.size(), cgraph->n_nodes);
+            fprintf(stderr, "cuda-graph-debug: key=%016llx n_nodes %zu -> %d\n", (unsigned long long) graph_key, graph->node_props.size(), cgraph->n_nodes);
         }
         res = true;
         graph->node_props.resize(cgraph->n_nodes);
@@ -2970,8 +2995,8 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
                 const char * what = memcmp(o.node.ne, t->ne, sizeof(t->ne)) ? "ne" : memcmp(o.node.nb, t->nb, sizeof(t->nb)) ? "nb" :
                     o.node.data != t->data ? "data" : o.node.view_offs != t->view_offs ? "view_offs" :
                     memcmp(o.node.op_params, t->op_params, sizeof(t->op_params)) ? "op_params" : "src/other";
-                fprintf(stderr, "cuda-graph-debug: key=%p n_nodes=%d first change at node %d %s op=%s (%s)\n",
-                    graph_key, cgraph->n_nodes, i, t->name, ggml_op_name(t->op), what);
+                fprintf(stderr, "cuda-graph-debug: key=%016llx n_nodes=%d first change at node %d %s op=%s (%s)\n",
+                    (unsigned long long) graph_key, cgraph->n_nodes, i, t->name, ggml_op_name(t->op), what);
             }
             graph->node_props[i] = prop;
             res = true;
@@ -2981,7 +3006,7 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     return res;
 }
 
-static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
+static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, uint64_t graph_key) {
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
 #if CUDART_VERSION >= 12000
@@ -3669,6 +3694,22 @@ static int ggml_cuda_fuse_elem_chain(ggml_backend_cuda_context & ctx, const ggml
         }
         const int out_ch[1] = { i + len - 1 };
 
+        // A run of same-op ADDs or MULs over same-layout operands, chained through src0, is what
+        // the tuned multi-ADD/MUL kernels in ggml_cuda_try_fuse() take, and they are a little
+        // faster than the chain kernel for it (MI210, four ADDs over 4096x64 f32: 3.75-3.96 us
+        // per run tuned vs 4.0 us chain). Leave that pattern to them.
+        {
+            bool pure_run = (ops_ch[0] == GGML_OP_ADD || ops_ch[0] == GGML_OP_MUL);
+            for (int k = 0; k < len && pure_run; ++k) {
+                const ggml_tensor * nd = cgraph->nodes[i + k];
+                pure_run = nd->op == ops_ch[0] && !desc.bcast[k] && (k == 0 || desc.chain_is_lhs[k]) &&
+                           ggml_are_same_layout(nd->src[1], cgraph->nodes[i]->src[1]);
+            }
+            if (pure_run) {
+                return -1;
+            }
+        }
+
         // Aliasing. ggml_cuda_check_fusion_memory_ranges() is not used here on purpose: it
         // vetoes any overlap between the output and an input, and exact in-place aliasing is
         // the common case for this pattern (galloc hands residual adds their input's buffer).
@@ -3712,6 +3753,7 @@ static int ggml_cuda_fuse_elem_chain(ggml_backend_cuda_context & ctx, const ggml
             ggml_can_fuse_subgraph(cgraph, i, len, ops_ch, out_ch, 1)) {
 
             desc.n_ops = len;
+            ctx.fusion_stats.elem_chain++;
             ggml_cuda_op_elem_chain(ctx, (const float *) head_src->data,
                                     (float *) out->data, ggml_nelements(out), desc);
             return len - 1;   // nodes consumed beyond this one
@@ -3821,7 +3863,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
-    // Elementwise chain ("midi-kernel"), see ggml_cuda_fuse_elem_chain().
+    // Elementwise chain ("midi-kernel"), see ggml_cuda_fuse_elem_chain(). It runs before the
+    // tuned fusions below (multi-ADD/MUL, unary+MUL, RELU+SQR) and covers a superset of their
+    // patterns; a pure same-layout ADD or MUL run is the one case it hands back to them, since
+    // their kernels are a little faster for it (numbers in ggml_cuda_fuse_elem_chain()).
     {
         const int n_fused = ggml_cuda_fuse_elem_chain(*cuda_ctx, cgraph, i);
         if (n_fused >= 0) {
@@ -3913,8 +3958,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             }
             fused_node.data = cgraph->nodes[i + n_fuse - 1]->data;
             if (node->op == GGML_OP_ADD) {
+                cuda_ctx->fusion_stats.fused_add++;
                 ggml_cuda_op_fused_add(*cuda_ctx, &fused_node, n_fuse);
             } else {
+                cuda_ctx->fusion_stats.fused_mul++;
                 ggml_cuda_op_fused_mul(*cuda_ctx, &fused_node, n_fuse);
             }
             return n_fuse - 1;
@@ -4455,7 +4502,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
-static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
+static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, uint64_t graph_key) {
     bool graph_evaluated_or_captured = false;
 
     // flag used to determine whether it is an integrated_gpu
@@ -4674,7 +4721,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 }
 
 #ifdef USE_CUDA_GRAPH
-static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
+static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, uint64_t graph_key) {
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
     if (graph->graph == nullptr) {
@@ -4701,7 +4748,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
-    const void * graph_key = nullptr;
+    uint64_t graph_key = 0;
 
     // [TAG_FA_F16_CUDA_GRAPHS] default: no graph will be captured for this cgraph, so HIP flash-
     // attention keeps its raw (release-after-use) f16 temp path. Set true below only when the graph
@@ -4749,7 +4796,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     {
         static const bool dbg3 = getenv("GGML_CUDA_GRAPH_DEBUG") != nullptr;
         if (dbg3) {
-            fprintf(stderr, "cuda-graph-debug: key=%p n_nodes=%d use_graph=%d update=%d\n", graph_key, cgraph->n_nodes, (int) use_cuda_graph, (int) cuda_graph_update_required);
+            fprintf(stderr, "cuda-graph-debug: key=%016llx n_nodes=%d use_graph=%d update=%d\n", (unsigned long long) graph_key, cgraph->n_nodes, (int) use_cuda_graph, (int) cuda_graph_update_required);
         }
     }
     if (use_cuda_graph && cuda_graph_update_required) {
@@ -4806,7 +4853,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
 #ifdef USE_CUDA_GRAPH
-    const void * graph_key = ggml_cuda_graph_get_key(cgraph);
+    const uint64_t graph_key = ggml_cuda_graph_get_key(cgraph);
     const bool use_cuda_graph = ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 #else
     const bool use_cuda_graph = false;
@@ -5909,6 +5956,26 @@ static ggml_backend_dev_t ggml_backend_cuda_reg_get_device(ggml_backend_reg_t re
     return ctx->devices[index];
 }
 
+int64_t ggml_backend_cuda_fusion_count(ggml_backend_t backend, const char * name) {
+    if (!ggml_backend_is_cuda(backend) || name == nullptr) {
+        return -1;
+    }
+    const ggml_backend_cuda_context * ctx = (const ggml_backend_cuda_context *) backend->context;
+    if (strcmp(name, "elem_chain") == 0) {
+        return ctx->fusion_stats.elem_chain;
+    }
+    if (strcmp(name, "q8_cache_hits") == 0) {
+        return ctx->fusion_stats.q8_cache_hits;
+    }
+    if (strcmp(name, "fused_add") == 0) {
+        return ctx->fusion_stats.fused_add;
+    }
+    if (strcmp(name, "fused_mul") == 0) {
+        return ctx->fusion_stats.fused_mul;
+    }
+    return -1;
+}
+
 static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t reg) {
     static std::vector<ggml_backend_feature> features = []() {
         std::vector<ggml_backend_feature> features;
@@ -5985,6 +6052,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    if (strcmp(name, "ggml_backend_cuda_fusion_count") == 0) {
+        return (void *)ggml_backend_cuda_fusion_count;
     }
     return nullptr;
 }
