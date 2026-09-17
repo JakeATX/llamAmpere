@@ -180,6 +180,9 @@ struct common_speculative_impl {
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
     virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
 
+    // reset per-seq state before a new prompt is processed
+    virtual void reset_seq(llama_seq_id /*seq_id*/) {}
+
     // true if this implementation requires the target context to extract post-norm embeddings
     virtual bool need_embd() const = 0;
 
@@ -1602,6 +1605,47 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             batch.token = nullptr;
         }
         llama_batch_free(batch);
+    }
+
+    void reset_seq(llama_seq_id seq_id) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+
+        std::fill(pending_h[seq_id].begin(), pending_h[seq_id].end(), 0.0f);
+        verify_h[seq_id].clear();
+        verify_h_rows[seq_id] = 0;
+        i_batch_beg[seq_id] = -1;
+        i_batch_end[seq_id] = -1;
+        i_last[seq_id] = -1;
+        n_cap[seq_id] = 0;
+        n_last[seq_id] = 0;
+        if (seq_id < (llama_seq_id) chain_h.size()) {
+            chain_h[seq_id].clear();
+        }
+        if (adaptive) {
+            adaptive_ctrl[seq_id].reset(params.n_max, params.n_min_adaptive);
+        }
+
+        const size_t row_bytes = (size_t) n_embd * sizeof(float);
+        size_t w = 0;
+        for (size_t k = 0; k < defer.tok.size(); ++k) {
+            if (defer.seq[k] == seq_id) {
+                continue;
+            }
+            if (w != k) {
+                defer.tok[w] = defer.tok[k];
+                defer.pos[w] = defer.pos[k];
+                defer.seq[w] = defer.seq[k];
+                std::memmove(defer.embd.data() + w * (size_t) n_embd,
+                             defer.embd.data() + k * (size_t) n_embd, row_bytes);
+            }
+            ++w;
+        }
+        defer.tok.resize(w);
+        defer.pos.resize(w);
+        defer.seq.resize(w);
+        defer.embd.resize(w * (size_t) n_embd);
     }
 
     // decode deferred catch-up rows standalone (no logits); used when no draft decode
@@ -3290,6 +3334,16 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
         common_time_meas tm(impl->t_begin_us, !impl->gen_perf);
         impl->begin(seq_id, prompt);
         impl->n_call_begin++;
+    }
+}
+
+void common_speculative_reset(common_speculative * spec, llama_seq_id seq_id) {
+    if (spec == nullptr) {
+        return;
+    }
+
+    for (auto & impl : spec->impls) {
+        impl->reset_seq(seq_id);
     }
 }
 
