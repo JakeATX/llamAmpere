@@ -1329,7 +1329,7 @@ static void llama_sampler_dist_backend_apply(
     // Recall that each entry in cumsum is the cumulative probability up to that
     // index so values stay negative while the cumulative total is below the
     // random value, and become zero/positive once the threshold is crossed.
-    struct ggml_tensor * diff = ggml_sub(ctx, cumsum, inp_uniform);
+    struct ggml_tensor * diff = ggml_sub(ctx, cumsum, sctx->inp_uniform);
     ggml_set_name(diff, "dist_cumsum");
 
     // The ggml_step function produces a tensor where entries are 1 if the

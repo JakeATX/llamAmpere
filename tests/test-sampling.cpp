@@ -443,7 +443,7 @@ static std::vector<llama_token> run_backend_greedy_rows(
     llama_sampler_chain_add(chain, llama_sampler_init_greedy());
 
     GGML_ASSERT(llama_sampler_backend_supports_rows(chain));
-    GGML_ASSERT(chain->iface->backend_init(chain, ggml_backend_get_default_buffer_type(backend)));
+    GGML_ASSERT(chain->iface->backend_init(chain, ggml_backend_get_default_buffer_type(backend), (uint32_t) n_rows));
     GGML_ASSERT(llama_sampler_backend_rows_ready(chain));
 
     ggml_init_params init = { ggml_tensor_overhead()*32 + ggml_graph_overhead(), nullptr, true };

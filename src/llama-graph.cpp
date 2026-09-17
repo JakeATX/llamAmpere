@@ -1467,24 +1467,24 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
             }
         }
     }
-    for (auto * tensor : t_sampled) {
-        if (tensor != nullptr) {
-            ggml_set_output(tensor);
+    for (auto & [seq_id, t] : t_sampled) {
+        if (t != nullptr) {
+            ggml_set_output(t);
         }
     }
-    for (auto * tensor : t_sampled_probs) {
-        if (tensor != nullptr) {
-            ggml_set_output(tensor);
+    for (auto & [seq_id, t] : t_sampled_probs) {
+        if (t != nullptr) {
+            ggml_set_output(t);
         }
     }
-    for (auto * tensor : t_sampled_logits) {
-        if (tensor != nullptr) {
-            ggml_set_output(tensor);
+    for (auto & [seq_id, t] : t_sampled_logits) {
+        if (t != nullptr) {
+            ggml_set_output(t);
         }
     }
-    for (auto * tensor : t_candidates) {
-        if (tensor != nullptr) {
-            ggml_set_output(tensor);
+    for (auto & [seq_id, t] : t_candidates) {
+        if (t != nullptr) {
+            ggml_set_output(t);
         }
     }
 }

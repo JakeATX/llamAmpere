@@ -268,18 +268,6 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
     }
 }
 
-        if (selector_meta) {
-            const int64_t kernel = hparams.dflash_conv_kernel_size;
-            const int64_t groups = n_embd / hparams.dflash_conv_group_size;
-            const int64_t projected = 2 * kernel * groups;
-            layer.dflash_attn_conv_base = create_tensor(tn(LLM_TENSOR_DFLASH_ATTN_CONV_BASE, i), { n_embd, kernel, 2 }, 0);
-            layer.dflash_attn_conv_proj = create_tensor(tn(LLM_TENSOR_DFLASH_ATTN_CONV_PROJ, "weight", i), { n_embd, projected }, 0);
-            layer.dflash_ffn_conv_base  = create_tensor(tn(LLM_TENSOR_DFLASH_FFN_CONV_BASE, i), { n_embd, kernel, 2 }, 0);
-            layer.dflash_ffn_conv_proj  = create_tensor(tn(LLM_TENSOR_DFLASH_FFN_CONV_PROJ,  "weight", i), { n_embd, projected }, 0);
-        }
-    }
-}
-
 template <>
 ggml_tensor * llama_model_dflash::graph<true>::build_inp_embd_enc() const {
     const int64_t n_embd_inp = hparams.n_embd_inp_enc();

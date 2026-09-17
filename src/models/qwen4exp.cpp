@@ -29,7 +29,7 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.n_layer_nextn, false);
     GGML_ASSERT(hparams.n_layer_nextn < hparams.n_layer_all && "n_layer_nextn must be < block_count");
 
-    ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp, false);
+    ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all, false);
     ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
 
@@ -106,8 +106,21 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
         qwen4exp_require_arr_len(ml, LLM_KV_PLE_HEAD_VOCAB_SIZES,  hparams.ple_n_heads);
 
         ml.get_arr(LLM_KV_PLE_LAYER_MULTIPLIERS, hparams.ple_layer_multipliers);
-        ml.get_arr(LLM_KV_PLE_HEAD_OFFSETS,      hparams.ple_head_offsets);
-        ml.get_arr(LLM_KV_PLE_HEAD_VOCAB_SIZES,  hparams.ple_head_vocab_sizes);
+        // the file stores the head ranges as uint64, so read at that width and narrow to the int32 the gather uses
+        std::array<uint64_t, LLAMA_MAX_PLE_HEADS> head_offsets     = {};
+        std::array<uint64_t, LLAMA_MAX_PLE_HEADS> head_vocab_sizes = {};
+        ml.get_arr(LLM_KV_PLE_HEAD_OFFSETS,     head_offsets);
+        ml.get_arr(LLM_KV_PLE_HEAD_VOCAB_SIZES, head_vocab_sizes);
+        for (uint32_t h = 0; h < hparams.ple_n_heads; ++h) {
+            if (head_vocab_sizes[h] == 0 ||
+                head_offsets[h]     > INT32_MAX ||
+                head_vocab_sizes[h] > INT32_MAX ||
+                head_offsets[h] + head_vocab_sizes[h] > INT32_MAX) {
+                throw std::runtime_error(format("PLE head %u range does not fit the int32 row index", h));
+            }
+            hparams.ple_head_offsets[h]     = (uint32_t) head_offsets[h];
+            hparams.ple_head_vocab_sizes[h] = (uint32_t) head_vocab_sizes[h];
+        }
     }
 
     // linear attention everywhere except every full_attention_interval-th layer
@@ -191,7 +204,7 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         // the trunk, so it takes the full-attention + MoE path below with no special casing
         const int flags = il < n_layer ? trunk_flags : mtp_flags;
 
-        const int64_t n_ff_exp   = hparams.n_ff_exp   ? hparams.n_ff_exp   : n_ff / n_expert_used;
+        const int64_t n_ff_exp   = hparams.n_ff_exp(il) ? hparams.n_ff_exp(il) : n_ff / n_expert_used;
         const int64_t n_ff_shexp = hparams.n_ff_shexp ? hparams.n_ff_shexp : n_ff;
 
         const int64_t head_k_dim = hparams.ssm_d_state;

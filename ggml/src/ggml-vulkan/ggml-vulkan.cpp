@@ -15693,6 +15693,8 @@ static const struct ggml_backend_reg_i ggml_backend_vk_reg_i = {
     /* .get_proc_address = */ NULL,
 };
 
+extern "C" void ggml_vulkan_moe_cache_register(void * reg);
+
 ggml_backend_reg_t ggml_backend_vk_reg() {
     static ggml_backend_reg reg = {
         /* .api_version = */ GGML_BACKEND_API_VERSION,
@@ -15701,6 +15703,9 @@ ggml_backend_reg_t ggml_backend_vk_reg() {
     };
     try {
         ggml_vk_instance_init();
+        // No GGML_USE_* guard: see the Metal backend; that macro is not defined
+        // for this target, so the registration was compiled out.
+        ggml_vulkan_moe_cache_register(&reg);
         return &reg;
     } catch (const vk::SystemError& e) {
         VK_LOG_DEBUG("ggml_backend_vk_reg() -> Error: System error: " << e.what());

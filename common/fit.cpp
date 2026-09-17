@@ -1369,7 +1369,7 @@ static void common_params_fit_impl(
                     pattern_strings.clear();
                     int n_overrides = 0;
                     for (int i = 0; i < mid && n_overrides < (int)ntbo - 1; i++) {
-                        pattern_strings.push_back(llm_ffn_exps_block_regex(order[i]));
+                        pattern_strings.push_back(llm_ffn_block_regex(order[i], LLM_FFN_EXPS_REGEX));
                         candidate_overrides[n_overrides++] = {pattern_strings.back().c_str(), ggml_backend_cpu_buffer_type()};
                     }
                     candidate_overrides[n_overrides] = {nullptr, nullptr};
@@ -1428,7 +1428,7 @@ static void common_params_fit_impl(
                     pattern_strings.clear();
                     int n_overrides = 0;
                     for (int i = 0; i < best_n_evict && n_overrides < (int)ntbo - 1; i++) {
-                        pattern_strings.push_back(llm_ffn_exps_block_regex(order[i]));
+                        pattern_strings.push_back(llm_ffn_block_regex(order[i], LLM_FFN_EXPS_REGEX));
                         tensor_buft_overrides[n_overrides++] = {pattern_strings.back().c_str(), ggml_backend_cpu_buffer_type()};
                     }
                     tensor_buft_overrides[n_overrides] = {nullptr, nullptr};

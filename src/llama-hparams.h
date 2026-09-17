@@ -107,7 +107,6 @@ struct llama_hparams {
     uint32_t n_layer_dense_lead = 0;
     uint32_t n_lora_q           = 0;
     uint32_t n_lora_kv          = 0;
-    uint32_t n_ff_exp           = 0;
     uint32_t n_ff_par           = 0;
     uint32_t n_ff_shexp         = 0;
     uint32_t n_ff_chexp         = 0;
@@ -520,7 +519,6 @@ struct llama_hparams {
     bool     eagle3_norm_before_residual  = false;
 
     // DFlash draft model
-    uint32_t dflash_block_size              = 16;
     uint32_t dflash_mask_token_id           = 0;
 
 

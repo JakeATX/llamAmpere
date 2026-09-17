@@ -16,7 +16,6 @@
 #include <filesystem>
 #include <fstream>
 
-using json = nlohmann::ordered_json;
 
 //
 // task_params

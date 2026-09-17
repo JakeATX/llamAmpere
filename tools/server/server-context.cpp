@@ -759,7 +759,7 @@ struct server_slot {
     // generated_tokens is only filled when the task asked for its tokens back, so take the generated
     // tail of the slot's own sequence instead. The refresh happens at the next request's prompt.
     void draft_vocab_observe_generated() {
-        if (ctx_dft == nullptr || draft_vocab_observed || n_decoded <= 0) {
+        if (ctx_dft == nullptr || draft_vocab_observed || stats.n_gen <= 0) {
             return;
         }
         draft_vocab_observed = true;
@@ -767,7 +767,7 @@ struct server_slot {
             return;
         }
         const auto & toks = prompt.tokens.get_tokens();
-        const size_t n    = std::min((size_t) n_decoded, toks.size());
+        const size_t n    = std::min((size_t) stats.n_gen, toks.size());
         llama_draft_vocab_observe(ctx_dft, toks.data() + (toks.size() - n), n);
     }
 
@@ -3088,7 +3088,7 @@ private:
                     // data"). if no sidecar exists (state saved by an older build), fall back
                     // to synthesizing a tip checkpoint from the just-restored state, which at
                     // least covers exact continuations.
-                    if (params_base.n_ctx_checkpoints > 0 && token_count > 0) {
+                    if (params_base.n_ctx_checkpoints > 0 && slot->prompt.tokens.size() > 0) {
                         if (checkpoints_load_sidecar(slot->prompt.checkpoints, filepath + ".ckpt")) {
                             SLT_INF(*slot, "restored %zu context checkpoints from sidecar\n", slot->prompt.checkpoints.size());
                         } else {

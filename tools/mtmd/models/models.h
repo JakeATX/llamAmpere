@@ -439,8 +439,3 @@ struct clip_graph_muse_glimmer : clip_graph {
     clip_graph_muse_glimmer(clip_ctx * ctx, const clip_image_f32 & img) : clip_graph(ctx, img) {}
     ggml_cgraph * build() override;
 };
-
-struct clip_graph_muse_glimmer : clip_graph {
-    clip_graph_muse_glimmer(clip_ctx * ctx, const clip_image_f32 & img) : clip_graph(ctx, img) {}
-    ggml_cgraph * build() override;
-};

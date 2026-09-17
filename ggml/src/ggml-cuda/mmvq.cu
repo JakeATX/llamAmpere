@@ -1500,7 +1500,6 @@ static void mul_mat_vec_q_switch_ncols_dst(
 
     if (has_ids && ncols_dst > 1) {
         // Multi-token MUL_MAT_ID path - dedicated MoE kernel
-        mul_mat_vec_q_moe_launch<type>(
         const bool moe_has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
                                     fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
         if (moe_has_fusion) {
