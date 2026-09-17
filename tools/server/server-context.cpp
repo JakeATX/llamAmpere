@@ -29,6 +29,7 @@
 #include <random>
 #include <utility>
 #include <fstream>
+#include <deque>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -40,6 +41,139 @@
 #endif
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+//
+// live MoE routing statistics (GET /experts, enabled with --expert-stats)
+//
+// A scheduler eval callback watches the router's top-k tensor of every MoE
+// layer ("ffn_moe_topk-<il>", i32 [n_expert_used, n_tokens]) and keeps, per
+// layer, the newest routings plus a sliding histogram of expert hits.
+//
+
+struct expert_stats_state {
+    static constexpr size_t WINDOW = 256; // tokens kept for the recent histogram
+    static constexpr size_t TAIL   = 16;  // newest routings returned verbatim
+
+    struct layer_stats {
+        std::deque<std::vector<int32_t>> ring; // last WINDOW routings, oldest first
+        std::vector<uint32_t> recent;          // hits per expert inside the ring
+        std::vector<uint64_t> total;           // lifetime hits per expert
+        uint64_t n_tokens = 0;
+    };
+
+    std::mutex mutex;
+    int32_t  n_expert      = 0;
+    int32_t  n_expert_used = 0;
+    uint64_t n_tokens      = 0; // max over layers
+    std::vector<layer_stats> layers;
+
+    void ensure_expert(int32_t e) {
+        if (e < n_expert) {
+            return;
+        }
+        n_expert = e + 1;
+        for (auto & L : layers) {
+            L.recent.resize(n_expert, 0);
+            L.total.resize(n_expert, 0);
+        }
+    }
+};
+
+static expert_stats_state g_expert_stats;
+
+static bool expert_stats_cb(struct ggml_tensor * t, bool ask, void * /*user_data*/) {
+    static const char * prefix = "ffn_moe_topk-";
+    static const size_t prefix_len = strlen(prefix);
+    const bool match = strncmp(t->name, prefix, prefix_len) == 0;
+    if (ask) {
+        return match;
+    }
+    if (!match || t->type != GGML_TYPE_I32 || ggml_n_dims(t) > 2) {
+        return true;
+    }
+    const int il = atoi(t->name + prefix_len);
+    if (il < 0 || il >= 4096) {
+        return true;
+    }
+    const int64_t n_used = t->ne[0];
+    const int64_t n_tok  = t->ne[1];
+    std::vector<uint8_t> buf(ggml_nbytes(t));
+    ggml_backend_tensor_get(t, buf.data(), 0, buf.size());
+
+    std::lock_guard<std::mutex> lock(g_expert_stats.mutex);
+    auto & st = g_expert_stats;
+    if ((size_t) il >= st.layers.size()) {
+        st.layers.resize(il + 1);
+        for (auto & L : st.layers) {
+            L.recent.resize(st.n_expert, 0);
+            L.total.resize(st.n_expert, 0);
+        }
+    }
+    if (st.n_expert_used == 0) {
+        st.n_expert_used = (int32_t) n_used;
+    }
+    auto & L = st.layers[il];
+    for (int64_t j = 0; j < n_tok; ++j) {
+        std::vector<int32_t> ids((size_t) n_used);
+        for (int64_t i = 0; i < n_used; ++i) {
+            int32_t e = 0;
+            memcpy(&e, buf.data() + j*t->nb[1] + i*t->nb[0], sizeof(e));
+            ids[(size_t) i] = e;
+            if (e >= 0) {
+                st.ensure_expert(e);
+                L.recent[e]++;
+                L.total[e]++;
+            }
+        }
+        L.ring.push_back(std::move(ids));
+        if (L.ring.size() > expert_stats_state::WINDOW) {
+            for (int32_t e : L.ring.front()) {
+                if (e >= 0 && e < st.n_expert && L.recent[e] > 0) {
+                    L.recent[e]--;
+                }
+            }
+            L.ring.pop_front();
+        }
+        L.n_tokens++;
+    }
+    st.n_tokens = std::max(st.n_tokens, L.n_tokens);
+    return true; // returning false would abort the graph
+}
+
+static json expert_stats_to_json(bool with_total) {
+    std::lock_guard<std::mutex> lock(g_expert_stats.mutex);
+    const auto & st = g_expert_stats;
+    json layers = json::array();
+    for (size_t il = 0; il < st.layers.size(); ++il) {
+        const auto & L = st.layers[il];
+        if (L.n_tokens == 0) {
+            continue;
+        }
+        json tail = json::array();
+        const size_t start = L.ring.size() > expert_stats_state::TAIL ? L.ring.size() - expert_stats_state::TAIL : 0;
+        for (size_t k = start; k < L.ring.size(); ++k) {
+            tail.push_back(L.ring[k]);
+        }
+        json j = {
+            {"il",       il},
+            {"n_tokens", L.n_tokens},
+            {"tokens",   tail},
+            {"recent",   L.recent},
+        };
+        if (with_total) {
+            j["total"] = L.total;
+        }
+        layers.push_back(std::move(j));
+    }
+    return json {
+        {"n_expert",      st.n_expert},
+        {"n_expert_used", st.n_expert_used},
+        {"n_tokens",      st.n_tokens},
+        {"window",        expert_stats_state::WINDOW},
+        {"tail",          expert_stats_state::TAIL},
+        {"layers",        layers},
+    };
+}
 
 // GPU verification of MTP/draft tokens (argmax or the full sampler chain on the backend, only token ids
 // downloaded) is opt-in, via LLAMA_MTP_GPU_VERIFY:
@@ -1361,6 +1495,12 @@ private:
             params_base.load_progress_callback_user_data = &load_progress_text;
         }
 
+        if (params_base.endpoint_experts) {
+            params_base.cb_eval           = expert_stats_cb;
+            params_base.cb_eval_user_data = nullptr;
+            SRV_INF("%s", "expert routing statistics enabled (GET /experts); MoE graphs will sync at every router\n");
+        }
+
         llama_init = common_init_from_params(params_base);
 
         model_tgt = llama_init->model();
@@ -1379,6 +1519,20 @@ private:
         vocab = llama_model_get_vocab(model_tgt);
 
         n_ctx = llama_n_ctx(ctx_tgt);
+
+        if (params_base.endpoint_experts) {
+            char arch[128] = {0};
+            if (llama_model_meta_val_str(model_tgt, "general.architecture", arch, sizeof(arch)) > 0) {
+                char val[64] = {0};
+                std::lock_guard<std::mutex> lock(g_expert_stats.mutex);
+                if (llama_model_meta_val_str(model_tgt, (std::string(arch) + ".expert_count").c_str(), val, sizeof(val)) > 0) {
+                    g_expert_stats.ensure_expert(atoi(val) - 1);
+                }
+                if (llama_model_meta_val_str(model_tgt, (std::string(arch) + ".expert_used_count").c_str(), val, sizeof(val)) > 0) {
+                    g_expert_stats.n_expert_used = atoi(val);
+                }
+            }
+        }
 
         add_bos_token = llama_vocab_get_add_bos(vocab);
 
@@ -5224,6 +5378,16 @@ void server_routes::init_routes() {
             res->data = res_task->to_metrics();
         }
 
+        return res;
+    };
+
+    this->get_experts = [this](const server_http_req & req) {
+        auto res = create_response(true);
+        if (!params.endpoint_experts) {
+            res->error(format_error_response("This server does not expose MoE routing statistics. Start it with `--expert-stats`", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+        res->ok(expert_stats_to_json(req.get_param("total") == "1"));
         return res;
     };
 
