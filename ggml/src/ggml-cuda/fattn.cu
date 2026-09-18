@@ -1066,10 +1066,17 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
         const bool turbo_matched = (K->type == V->type &&
             (K->type == GGML_TYPE_TURBO4_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO2_0 ||
-             K->type == GGML_TYPE_TQ6_0));
+             K->type == GGML_TYPE_TQ6_0)) ||
+            // asymmetric tq6 K over a turbo3 V: the pair TQ6 is meant for, K and V decoded by
+            // their own tile loaders into the same GQA-packed tile.
+            (K->type == GGML_TYPE_TQ6_0 && V->type == GGML_TYPE_TURBO3_0);
         if (ggml_cuda_turbo_mma_fused() && turbo_matched
                 && Q->ne[1] <= 4 && V->ne[0] == Q->ne[0] && turing_mma_available(cc)) {
             ggml_cuda_fattn_path_note("turbo_fused_gate", dst, -1);
+            if (K->type == GGML_TYPE_TQ6_0 && V->type == GGML_TYPE_TURBO3_0) {
+                if (Q->ne[0] == 128) { ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<128, 128, GGML_TYPE_TQ6_0, GGML_TYPE_TURBO3_0>(ctx, dst); return; }
+                if (Q->ne[0] == 256) { ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_TQ6_0, GGML_TYPE_TURBO3_0>(ctx, dst); return; }
+            }
             if (Q->ne[0] == 128) {
                 switch (K->type) {
                     case GGML_TYPE_TURBO4_0: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<128, 128, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0>(ctx, dst); return;
