@@ -204,6 +204,8 @@ static int test_vec_dot_q(bool verbose) {
                 type == GGML_TYPE_TQ1_0   ? MAX_QUANTIZATION_TOTAL_ERROR_TERNARY :
                 type == GGML_TYPE_TQ2_0   ? MAX_QUANTIZATION_TOTAL_ERROR_TERNARY :
                 type == GGML_TYPE_Q2_0    ? MAX_QUANTIZATION_TOTAL_ERROR_TERNARY :
+                type == GGML_TYPE_PQ2_0   ? MAX_QUANTIZATION_TOTAL_ERROR_TERNARY :
+                type == GGML_TYPE_PTQ1_0  ? MAX_QUANTIZATION_TOTAL_ERROR_TERNARY :
                 type == GGML_TYPE_Q2_K    ? MAX_QUANTIZATION_TOTAL_ERROR_2BITS :
                 type == GGML_TYPE_IQ2_S   ? MAX_QUANTIZATION_TOTAL_ERROR_2BITS :
                 type == GGML_TYPE_Q3_K    ? MAX_QUANTIZATION_TOTAL_ERROR_3BITS :
@@ -231,7 +233,7 @@ static int test_vec_dot_q(bool verbose) {
                 ? MAX_DOT_PRODUCT_ERROR_LOWBIT
                 : type == GGML_TYPE_Q1_0
                 ? MAX_DOT_PRODUCT_ERROR_BINARY
-                : type == GGML_TYPE_TQ1_0 || type == GGML_TYPE_TQ2_0 || type == GGML_TYPE_Q2_0
+                : type == GGML_TYPE_TQ1_0 || type == GGML_TYPE_TQ2_0 || type == GGML_TYPE_Q2_0 || type == GGML_TYPE_PQ2_0 || type == GGML_TYPE_PTQ1_0
                 ? MAX_DOT_PRODUCT_ERROR_TERNARY
                 : type == GGML_TYPE_NVFP4
                 ? MAX_DOT_PRODUCT_ERROR_FP4
@@ -257,6 +259,38 @@ static int test_vec_dot_q(bool verbose) {
     return num_failed;
 }
 
+static int test_prism_ternary(bool verbose) {
+    int num_failed = 0;
+    for (ggml_type type : {GGML_TYPE_PQ2_0, GGML_TYPE_PTQ1_0}) {
+        const auto * traits = ggml_get_type_traits(type);
+        const auto * cpu = ggml_get_type_traits_cpu(type);
+        for (int blocks : {1, 2, 3, 8}) {
+            const int64_t size = blocks * traits->blck_size;
+            std::vector<float> input(size), output(size), activation(size), activation_dequant(size);
+            std::vector<uint8_t> packed(ggml_row_size(type, size));
+            std::vector<uint8_t> packed_activation(ggml_row_size(cpu->vec_dot_type, size));
+            for (int64_t i = 0; i < size; ++i) {
+                const float scale = i / traits->blck_size % 3 == 0 ? 0.5f : i / traits->blck_size % 3 == 1 ? 0.0f : 2.0f;
+                input[i] = ((i * 17 + i / 7) % 3 - 1) * scale;
+                activation[i] = (i % 11 - 5) * 0.25f;
+            }
+            cpu->from_float(input.data(), packed.data(), size);
+            traits->to_float(packed.data(), output.data(), size);
+            ggml_get_type_traits_cpu(cpu->vec_dot_type)->from_float(activation.data(), packed_activation.data(), size);
+            ggml_get_type_traits(cpu->vec_dot_type)->to_float(packed_activation.data(), activation_dequant.data(), size);
+            float result = INFINITY;
+            cpu->vec_dot(size, &result, 0, packed.data(), 0, packed_activation.data(), 0, 1);
+            const float reference = dot_product(output.data(), activation_dequant.data(), size);
+            const bool failed = input != output || !(fabsf(result - reference) < 1e-4f * std::max(1.0f, fabsf(reference)));
+            num_failed += failed;
+            if (failed || verbose) {
+                printf("%5s exact ternary blocks=%d:        %s (ref=%f got=%f)\n", ggml_type_name(type), blocks, RESULT_STR[failed], reference, result);
+            }
+        }
+    }
+    return num_failed;
+}
+
 int main(int argc, char * argv[]) {
     bool verbose = false;
 
@@ -278,6 +312,7 @@ int main(int argc, char * argv[]) {
 
     num_failed += test_vec_dot_f32(verbose);
     num_failed += test_vec_dot_q(verbose);
+    num_failed += test_prism_ternary(verbose);
 
     if (num_failed || verbose) {
         printf("%d tests failed\n", num_failed);

@@ -1501,7 +1501,15 @@ static bool ggml_metal_supports_mul_mat_op(
         bool mm_path) {
     if (!has_simdgroup_reduction ||
         op->src[0]->type == GGML_TYPE_NVFP4 ||
-        op->src[0]->type == GGML_TYPE_TQ1_0) {
+        op->src[0]->type == GGML_TYPE_TQ1_0 ||
+        op->src[0]->type == GGML_TYPE_PQ2_0 ||
+        op->src[0]->type == GGML_TYPE_PTQ1_0) {
+        return false;
+    }
+
+    // This backend only has F32 FWHT kernels.
+    if (op->op == GGML_OP_MUL_MAT && op->src[1]->type == GGML_TYPE_F16 &&
+            ggml_get_op_params_i32(op, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
         return false;
     }
 
@@ -1905,7 +1913,9 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             }
         case GGML_OP_GET_ROWS:
             return op->src[0]->type != GGML_TYPE_NVFP4 &&
-                   op->src[0]->type != GGML_TYPE_TQ1_0;
+                   op->src[0]->type != GGML_TYPE_TQ1_0 &&
+                   op->src[0]->type != GGML_TYPE_PQ2_0 &&
+                   op->src[0]->type != GGML_TYPE_PTQ1_0;
         case GGML_OP_SET_ROWS:
             {
                 if (op->src[0]->type == GGML_TYPE_F16) {

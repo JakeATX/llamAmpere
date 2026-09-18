@@ -825,10 +825,6 @@ class MODEL_TENSOR(IntEnum):
     HC_FFN_FN            = auto()
     HC_FFN_BASE          = auto()
     HC_FFN_SCALE         = auto()
-    HC_ATTN_NORM         = auto() # qwen4exp
-    HC_ATTN_DOWN         = auto() # qwen4exp
-    HC_ATTN_UP           = auto() # qwen4exp
-    HC_ATTN_INJECT       = auto() # qwen4exp
     HC_FFN_NORM          = auto() # qwen4exp
     HC_FFN_DOWN          = auto() # qwen4exp
     HC_FFN_UP            = auto() # qwen4exp
@@ -1238,10 +1234,6 @@ class MODEL_TENSOR(IntEnum):
     A_CTC_OUT              = auto()
     A_CTC_OUT_MID          = auto()
     A_ENC_ATTN_REL_POS_EMB = auto()
-    A_ENC_SE_CONV1         = auto() # qwen3tts
-    A_ENC_SE_CONV2         = auto() # qwen3tts
-    A_ENC_ASP_ATTN         = auto() # qwen3tts
-    A_ENC_ASP_TDNN         = auto() # qwen3tts
     # audio qformer projector
     A_QF_PROJ_QUERY        = auto()
     A_QF_PROJ_NORM         = auto()
@@ -5758,6 +5750,8 @@ class GGMLQuantizationType(IntEnum):
     NVFP4   = 40
     Q1_0    = 41
     Q2_0    = 42
+    PQ2_0   = 142
+    PTQ1_0  = 143
     TQ3_1S  = 45
     TQ4_1S  = 46
     Q8_CR   = 48
@@ -5820,6 +5814,9 @@ class LlamaFileType(IntEnum):
     MOSTLY_NVFP4         = 39  # except 1d tensors
     MOSTLY_Q1_0          = 40  # except 1d tensors
     MOSTLY_Q2_0          = 41  # except 1d tensors
+    MOSTLY_PQ2_0         = 141  # except 1d tensors
+    MOSTLY_PQ2_0_LEGACY  = 142  # except 1d tensors
+    MOSTLY_PTQ1_0        = 143  # except 1d tensors
     MOSTLY_Q8_CR         = 42  # except 1d tensors, ConvRot-rotated Q8_0
     MOSTLY_TQ3_1S        = 43  # except 1d tensors
     MOSTLY_TQ4_1S        = 44  # except 1d tensors
@@ -5962,6 +5959,8 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.NVFP4:   (64, 4 + 32),
     GGMLQuantizationType.Q1_0:    (128, 2 + 16),
     GGMLQuantizationType.Q2_0:    (64, 2 + 16),
+    GGMLQuantizationType.PQ2_0:   (128, 2 + 32),
+    GGMLQuantizationType.PTQ1_0:  (128, 2 + 24 + 2),
     GGMLQuantizationType.TQ3_1S:  (32, 2 + 2 + 12),
     GGMLQuantizationType.TQ4_1S:  (32, 2 + 2 + 16),
     # same layout as Q8_0, but the rows are rotated in groups of 256 (ConvRot)

@@ -545,6 +545,7 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
         ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
 
         tok_embd = ggml_get_rows(ctx0, tok_embd_w, inp->tokens);
+        tok_embd = build_hadamard_inverse(tok_embd_w, tok_embd);
     } else {
         tok_embd = inp->embd;
     }
@@ -717,7 +718,8 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
             }();
 
             ggml_tensor * logits_j;
-            if (n_sub_env > 0 && n_sub_env < head_w2->ne[1]) {
+            if (n_sub_env > 0 && n_sub_env < head_w2->ne[1] &&
+                    !(hadamard_rotations && hadamard_rotations->count(head_w2))) {
                 ggml_tensor * head_sub = ggml_view_2d(ctx0, head_w2,
                         head_w2->ne[0], n_sub_env, head_w2->nb[1], 0);
                 logits_j = ggml_mul_mat(ctx0, head_sub, h_next_j);
@@ -741,6 +743,7 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
 
             if (j + 1 < n_chain) {
                 ggml_tensor * tok_j = ggml_get_rows(ctx0, tok_embd_w, id_j);
+                tok_j = build_hadamard_inverse(tok_embd_w, tok_j);
                 proj_cur = build_proj(tok_j, h_next_j);
             }
         }

@@ -5484,6 +5484,42 @@ struct test_mul_mat_hadamard : public test_mul_mat {
     }
 };
 
+struct test_mul_mat_hadamard_signed : public test_mul_mat_hadamard {
+    const int64_t width;
+
+    test_mul_mat_hadamard_signed(int64_t block, int64_t width, int64_t tokens, ggml_type type)
+        : test_mul_mat_hadamard(GGML_TYPE_F32, type, block, tokens, block), width(width) {}
+
+    std::string vars() override {
+        return test_mul_mat_hadamard::vars() + "," + VAR_TO_STR(width);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, k);
+        ggml_set_name(a, "a");
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, type_b, width, n);
+        ggml_set_name(x, "x");
+        ggml_tensor * signs = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, width);
+        ggml_set_name(signs, "signs");
+        ggml_tensor * cur = ggml_mul(ctx, x, signs);
+        cur = ggml_reshape_2d(ctx, cur, k, width / k * n);
+        ggml_tensor * out = ggml_mul_mat(ctx, a, cur);
+        ggml_mul_mat_set_hint(out, GGML_HINT_SRC0_IS_HADAMARD);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_mul_mat_hadamard::initialize_tensors(ctx);
+        ggml_tensor * signs = ggml_get_tensor(ctx, "signs");
+        std::vector<float> data(width);
+        for (int64_t i = 0; i < width; ++i) {
+            data[i] = i % 3 == 0 ? -1.0f : 1.0f;
+        }
+        ggml_backend_tensor_set(signs, data.data(), 0, data.size() * sizeof(float));
+    }
+};
+
 static void init_mul_mat_id_ids(ggml_context * ctx, int n_mats) {
     std::random_device rd;
     std::default_random_engine rng(rd());
@@ -9600,6 +9636,7 @@ static const ggml_type all_types[] = {
     GGML_TYPE_Q4_K, GGML_TYPE_Q5_K,
     GGML_TYPE_Q6_K,
     GGML_TYPE_Q8_CR, GGML_TYPE_Q5_CR, GGML_TYPE_Q6_CR,
+    GGML_TYPE_PQ2_0, GGML_TYPE_PTQ1_0,
     GGML_TYPE_TQ2_0,
     GGML_TYPE_TQ1_0,
     GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S,
@@ -9610,6 +9647,7 @@ static const ggml_type all_types[] = {
 
 static const ggml_type base_types[] = {
     GGML_TYPE_F32, GGML_TYPE_F16,
+    GGML_TYPE_PQ2_0, GGML_TYPE_PTQ1_0,
     GGML_TYPE_Q8_0, // for I8MM tests
     GGML_TYPE_Q1_0,
     GGML_TYPE_Q2_0,
@@ -9621,6 +9659,7 @@ static const ggml_type base_types[] = {
 };
 
 static const ggml_type other_types[] = {
+    GGML_TYPE_PQ2_0, GGML_TYPE_PTQ1_0,
     GGML_TYPE_Q4_1,
     GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,
     GGML_TYPE_Q8_0,
@@ -10626,7 +10665,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 128, 4, 128, {2, 3}));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 256, 512, 256)); // many rows
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 32, 1, 32)); // too small (N<64)
-    test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 1024, 1, 1024)); // too big (N>512)
+    for (int64_t block : {1024, 2048}) {
+        for (int64_t tokens : {1, 7, 32}) {
+            test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, block, tokens, block));
+            test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, block, tokens, block));
+            for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+                test_cases.emplace_back(new test_mul_mat_hadamard_signed(block, block * 5, tokens, type));
+            }
+        }
+    }
 
 #if 0
     // > 4GB A matrix. Too slow to be enabled by default.

@@ -1754,6 +1754,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
         for (uint32_t i = 0; i < GGML_TYPE_COUNT; ++i) {
             ggml_type t = (ggml_type)i;
+            if (ggml_type_size(t) == 0) {
+                continue;
+            }
             // Disable medium and large matrix multiplication if not enough shared memory is available
             // Check mmq warptiles as the largest configuration
             // Throw an error if not enough for any matrix multiplication is available
@@ -16109,4 +16112,3 @@ void ggml_vk_debug_label::begin(vk_context & ctx, const std::string & name) {
     subctx->debug_labels.push_back(name);
     ggml_vk_cmd_label_begin(subctx->s->buffer->buf, subctx->debug_labels.back().c_str());
 }
-
