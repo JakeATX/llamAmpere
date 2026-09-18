@@ -73,6 +73,17 @@ restructured both backends, so re-attaching them is a port rather than a merge. 
 release; Metal or Vulkan users of TurboQuant should stay on v0.3 until that port lands (the removed code
 is preserved as patches for it). The Metal and Vulkan moe-cache registrations are intact.
 
+One upstream change alters model output, and it is kept on purpose. PR 28068 (`5fdfa6282`) makes the gated
+delta net q/k normalization match the reference flash-linear-attention definition, `x * rsqrt(sum(x*x) + eps)`,
+where every GDN model in the tree had been calling `ggml_l2_norm`, which is `x / max(sqrt(sum(x*x)), eps)` and at
+these magnitudes never applies the epsilon at all. Qwen3.8 is a GDN model, so v0.3.1 normalizes those layers the way
+the model was trained and v0.3 did not. Greedy continuations therefore differ from v0.3 after the first near-tie: on the
+100K coding fixture the v0.3 build reproduces its documented hash `70d92f3ff9eac692` and v0.3.1 gives
+`02d91ab519c9ecba`, at the same decode rate and draft acceptance (94.3 versus 94.9 tok/s, 0.85 versus 0.88 on that
+run). A control build of the v0.3.1 tree with only that helper reverted reproduces `70d92f3ff9eac692` exactly, so
+nothing else in the sync or the new formats changed the ATX path bit for bit. The exact p/q speculative path is
+unaffected: on every format tested, the MTP output equals that build's single-token output.
+
 One defect came in with the merge and is fixed here: `gguf-py/gguf/constants.py` had eight `MODEL_TENSOR` members defined twice
 (`HC_ATTN_NORM/DOWN/UP/INJECT`, `A_ENC_SE_CONV1/2`, `A_ENC_ASP_ATTN/TDNN`), which made `import gguf`
 fail outright with "already defined". Each is now declared once, as upstream master has it.
