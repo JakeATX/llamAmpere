@@ -626,79 +626,82 @@ static __device__ __forceinline__ void flash_attn_ext_turbo4_load_tile(
 // tile column c.
 //
 // Unlike turbo4 this does NOT materialise a scaled[] centroid array in registers: 64
-// entries per block would blow the MMA kernel register budget (and spill). The table lives
-// in shared memory instead (see flash_attn_ext_tq6_smem_table) and the norm multiply is
-// folded into the fp16 conversion.
+// entries per block would blow the MMA kernel register budget (and spill).
 //
-// A 6-bit code is divergent across lanes, and a divergent __constant__ read is replayed
-// once per distinct address by the constant unit (~27 replays for random 6-bit indices).
-// A warp-private shared copy costs a few bank conflicts instead. The copy is warp-private,
-// so __syncwarp is enough and no block barrier is added to the tile loop.
-template<int nthreads>
-static __device__ __forceinline__ const float * flash_attn_ext_tq6_smem_table() {
-    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
-    __shared__ float tab[nthreads/warp_size][64];
-    const int tid  = threadIdx.y * warp_size + threadIdx.x;
-    const int warp = tid / warp_size;
-    const int lane = tid % warp_size;
-    for (int i = lane; i < 64; i += warp_size) {
-        tab[warp][i] = TQ6_CENTROIDS[i];
-    }
-    __syncwarp();
-    return tab[warp];
+// A 6-bit code is divergent across lanes: a divergent __constant__ read is replayed once
+// per distinct address by the constant unit (~27 replays for random 6-bit indices) and a
+// divergent shared-memory table costs bank conflicts. The TQ6 centroids are exactly
+// antisymmetric (c[63-i] == -c[i]), so the warp only needs the 32 positive magnitudes:
+// lane L keeps c[32+L] in one register and a lookup is a single __shfl_sync, which routes
+// an arbitrary per-lane source lane in one instruction. For idx < 32 the source lane is
+// mirrored (31-idx) and the sign bit is flipped.
+static __device__ __forceinline__ float flash_attn_ext_tq6_centroid(const float mag, const int idx) {
+    const int neg = ((idx >> 5) & 1) - 1; // 0 for idx >= 32, -1 (all ones) for idx < 32
+    const float v = __shfl_sync(0xFFFFFFFF, mag, (idx ^ neg) & 31, 32);
+    return __uint_as_float(__float_as_uint(v) ^ ((uint32_t) neg & 0x80000000u));
 }
 
-// One lane decodes eight consecutive values (four half2) per iteration and writes one
+// One lane decodes sixteen consecutive values (eight half2) per iteration and writes two
 // aligned uint4, like the q8_0 and turbo3 flat loaders: every thread of the block works,
-// and the packed reads of a row stay inside one cache line.
+// and the packed reads of a row stay inside one cache line. Sixteen values need only six
+// 16-bit loads (eight qs bytes, four qh bytes) plus the block norm.
 template<int stride_tile, bool swz, int nbatch_fa, int nthreads, int D2, bool oob_check>
 static __device__ __forceinline__ void flash_attn_ext_tq6_load_tile(
         const char * const __restrict__ KV_raw, half2 * const __restrict__ tile_KV,
         const int stride_bytes, const int col_offset, const int i_sup) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
-    const int tid = threadIdx.y * warp_size + threadIdx.x;
-    constexpr int half2_per_chunk = 4;
-    static_assert(D2 % half2_per_chunk == 0, "D2 must be a multiple of 4");
+    const int tid  = threadIdx.y * warp_size + threadIdx.x;
+    const int lane = threadIdx.x % warp_size;
+    constexpr int half2_per_chunk = 8;
+    static_assert(D2 % half2_per_chunk == 0, "D2 must be a multiple of 8");
     constexpr int chunks_per_row = D2 / half2_per_chunk;
     constexpr int nchunks = nbatch_fa * chunks_per_row;
+    // every lane must reach the shuffles, so no lane may leave the loop early
+    static_assert(nchunks % nthreads == 0, "nchunks must be a multiple of nthreads");
 
-    const float * const tab = flash_attn_ext_tq6_smem_table<nthreads>();
+    const float mag = TQ6_CENTROIDS[32 + lane]; // this lane's positive magnitude
 
     for (int linear = tid; linear < nchunks; linear += nthreads) {
         const int row = linear / chunks_per_row;
         const int chunk = linear - row * chunks_per_row;
         const int col = chunk * half2_per_chunk;
-        if (oob_check && row >= i_sup) {
-            turbo_store_u4<stride_tile, swz>(tile_KV, row, col, uint4{});
-            continue;
+        const bool oob = oob_check && row >= i_sup;
+
+        float norm = 0.0f;
+        uint32_t qs0 = 0, qs1 = 0, qh = 0;
+        if (!oob) {
+            const char * row_ptr = KV_raw + (int64_t) row * stride_bytes;
+            const int j0 = 2*(col_offset + col); // first of sixteen values, multiple of 16
+            const block_tq6_0 * blk = (const block_tq6_0 *) row_ptr + j0 / QK_TQ6;
+            const int in_blk = j0 % QK_TQ6;
+            // qs offset in_blk/2 is a multiple of 8 and qh offset in_blk/4 a multiple of 4 -> 16-bit aligned
+            const uint16_t * qsp = (const uint16_t *) (blk->qs + in_blk/2);
+            const uint16_t * qhp = (const uint16_t *) (blk->qh + in_blk/4);
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+            norm = __half2float(__ldcs((const half *) &blk->norm));
+            qs0  = __byte_perm((uint32_t) __ldcs(qsp + 0), (uint32_t) __ldcs(qsp + 1), 0x5410); // low nibbles, values 0..7
+            qs1  = __byte_perm((uint32_t) __ldcs(qsp + 2), (uint32_t) __ldcs(qsp + 3), 0x5410); // low nibbles, values 8..15
+            qh   = __byte_perm((uint32_t) __ldcs(qhp + 0), (uint32_t) __ldcs(qhp + 1), 0x5410); // high 2 bits, 2 per value
+#else
+            norm = __half2float(blk->norm);
+            qs0  = __byte_perm((uint32_t) qsp[0], (uint32_t) qsp[1], 0x5410);
+            qs1  = __byte_perm((uint32_t) qsp[2], (uint32_t) qsp[3], 0x5410);
+            qh   = __byte_perm((uint32_t) qhp[0], (uint32_t) qhp[1], 0x5410);
+#endif
         }
 
-        const char * row_ptr = KV_raw + (int64_t) row * stride_bytes;
-        const int j0 = 2*(col_offset + col); // first of eight values, multiple of 8
-        const block_tq6_0 * blk = (const block_tq6_0 *) row_ptr + j0 / QK_TQ6;
-        const int in_blk = j0 % QK_TQ6;
-        // qs offset in_blk/2 is a multiple of 4 and qh offset in_blk/4 a multiple of 2, both even -> 16-bit aligned
-        const uint16_t * qsp = (const uint16_t *) (blk->qs + in_blk/2);
-        const uint16_t * qhp = (const uint16_t *) (blk->qh + in_blk/4);
-        float norm; uint32_t qs, qh;
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
-        norm = __half2float(__ldcs((const half *) &blk->norm));
-        qs   = __byte_perm((uint32_t) __ldcs(qsp), (uint32_t) __ldcs(qsp + 1), 0x5410); // low nibbles of the eight values
-        qh   = __ldcs(qhp);                                                             // high 2 bits, 2 per value
-#else
-        norm = __half2float(blk->norm);
-        qs   = __byte_perm((uint32_t) qsp[0], (uint32_t) qsp[1], 0x5410);
-        qh   = qhp[0];
-#endif
-        uint4 decoded;
-        half2 * values = reinterpret_cast<half2 *>(&decoded);
+        uint4 decoded[2];
+        half2 * values = reinterpret_cast<half2 *>(decoded);
 #pragma unroll
-        for (int k = 0; k < 4; ++k) {
-            const int idx0 = ((qs >> (8*k    )) & 0xF) | (((qh >> (4*k    )) & 0x3) << 4);
-            const int idx1 = ((qs >> (8*k + 4)) & 0xF) | (((qh >> (4*k + 2)) & 0x3) << 4);
-            values[k] = __floats2half2_rn(tab[idx0] * norm, tab[idx1] * norm);
+        for (int k = 0; k < 8; ++k) {
+            const uint32_t qsw = k < 4 ? qs0 : qs1; // byte k&3 of this word holds the pair
+            const int idx0 = ((qsw >> (8*(k & 3)    )) & 0xF) | (((qh >> (4*k    )) & 0x3) << 4);
+            const int idx1 = ((qsw >> (8*(k & 3) + 4)) & 0xF) | (((qh >> (4*k + 2)) & 0x3) << 4);
+            values[k] = __floats2half2_rn(flash_attn_ext_tq6_centroid(mag, idx0) * norm,
+                                          flash_attn_ext_tq6_centroid(mag, idx1) * norm);
         }
-        turbo_store_u4<stride_tile, swz>(tile_KV, row, col, decoded);
+        turbo_store_u4<stride_tile, swz>(tile_KV, row, col,     oob ? uint4{} : decoded[0]);
+        turbo_store_u4<stride_tile, swz>(tile_KV, row, col + 4, oob ? uint4{} : decoded[1]);
     }
 }
 
