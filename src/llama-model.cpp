@@ -371,6 +371,18 @@ llama_model * llama_model_create(llama_model_loader & ml, const llama_model_para
         throw std::runtime_error("unknown model architecture: '" + ml.get_arch_name() + "'");
     }
 
+    // EXL3 weights are not row-addressable (k-tile-major trellis order) and their .suh/.svh side vectors are
+    // not sharded by the meta backend, so a tensor split would slice the wrong bytes and abort in the CUDA
+    // kernel. Refuse at load with a clear message; single GPU and LLAMA_SPLIT_MODE_LAYER are supported.
+    if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+        for (const auto & it : ml.weights_map) {
+            if (ggml_exl3_bits(it.second.tensor->type) != 0) {
+                throw std::runtime_error(std::string("LLAMA_SPLIT_MODE_TENSOR not implemented for EXL3 weights (tensor '") +
+                    it.first + "'), use --split-mode layer or a single GPU");
+            }
+        }
+    }
+
     return llama_model_create(arch, params);
 }
 
