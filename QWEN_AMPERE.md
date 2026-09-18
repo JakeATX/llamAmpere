@@ -33,8 +33,8 @@ Measured on a 3090 Ti at 350 W with the ATX-IQ4_XS-M quant (working name ATX-4-X
 | populated 200K context (v0.1 measurement) | 20.9 GiB ready VRAM, 694 tok/s prefill, 65 tok/s decode |
 | long session from 56K to 207K KV, temperature 1, MTP-3 (v0.3) | 95.1 tok/s at 56K, 85.2 at 207K; -9.6% first five windows to last five (TurboQuant -21.6%) |
 | single stream vs vLLM / SGLang at 32K / 64K (v0.3) | 112.4 / 100.7 tok/s; tuned vLLM MTP-4 101.7 / 90.3, tuned SGLang 68.6 / 64.4 |
-| largest measured fit | 245,760-token window with a 240K prompt, 22.1 GiB ready (measured before v0.3; P6 uses 170-260 MiB less) |
-| context by KV cache type under a 23 GB card budget | q8_0/turbo3 245,760 (shipped); q8_0/q8_0 ~165K and q8_0/q5_1 ~190K estimated, see [KV cache options](#kv-cache-options) |
+| largest measured fit | 245,760-token window with a 240K prompt, 22.1 GiB ready for the server (measured before v0.3; P6 uses 170-260 MiB less). Counting the whole card, a desktop leaves room for 237,568 |
+| context by KV cache type under a 23 GB card budget | measured at full depth: q8_0/turbo3 237,568 (shipped), q8_0/q5_1 204,800, q8_0/q8_0 180,224, see [KV cache options](#kv-cache-options) |
 | agent session 100K -> 245K context | 120K generated tokens, 52 tok/s cumulative (60 at 110K, 47 at 245K), 76% draft acceptance |
 | per speculative round vs Q3_K_XL / Q4_K_M | +9-10% / +23% |
 
@@ -42,12 +42,32 @@ Single-user configuration: `--parallel 1`, one request at a time.
 
 ## Model
 
-`jakeatx/Qwen3.8-27B-ATX-IQ4_XS-M-GGUF` on Hugging Face: the GGUF, the per-tensor
-type map, and the recipe. 14.5 GiB file, 13.9 GiB on the GPU. Bulk tensors
-IQ4_XS (the fastest format on SM86 at speculative verification widths), Q5_0 on
-the tensors Unsloth's tier ladder upgrades first, Q6_K on attention K/V, and
-Q8_0 on the GDN alpha/beta vectors and the attention K/V tensors Q4_K_M keeps at
-Q8_0.
+Every number in this file was measured with
+[`jakeatx/Qwen3.8-27B-ATX-IQ4_XS-M-GGUF`](https://huggingface.co/jakeatx/Qwen3.8-27B-ATX-IQ4_XS-M-GGUF),
+which carries the GGUF, the per-tensor type map, and the recipe. 14.5 GiB file,
+13.9 GiB on the GPU. Bulk tensors IQ4_XS (the fastest format on SM86 at
+speculative verification widths), Q5_0 on the tensors Unsloth's tier ladder
+upgrades first, Q6_K on attention K/V, and Q8_0 on the GDN alpha/beta vectors and
+the attention K/V tensors Q4_K_M keeps at Q8_0.
+
+### Recommended
+
+Two options for Swift-Qwen3.8-27B, both IQ4_XS-based and within 0.1 GiB of each
+other, so both fit a 24 GB card the same way:
+
+| | file | size | what it is |
+|---|---|---|---|
+| **ATX-Swift uncensored** | [`jakeatx/ATX-Swift-Qwen3.8-27B-Uncensored-IQ4_XS-M-GGUF`](https://huggingface.co/jakeatx/ATX-Swift-Qwen3.8-27B-Uncensored-IQ4_XS-M-GGUF) | 14.52 GiB (4.56 bpw) | The ATX type map above, applied to the uncensored Swift weights with the same imatrix procedure. |
+| **Swift stock** | [`ukisai/Swift-Qwen3.8-27B-GGUF`](https://huggingface.co/ukisai/Swift-Qwen3.8-27B-GGUF), file `Swift-Qwen3.8-27B-IQ4_XS.gguf` | 14.61 GiB | The Swift authors' own IQ4_XS, with their published [per-tensor layout](https://huggingface.co/ukisai/Swift-Qwen3.8-27B-GGUF/blob/main/layouts/Swift-Qwen3.8-27B-IQ4_XS.tensor-types.txt). |
+
+Both are per-tensor maps, and they upgrade the same structural tensors — attention
+K/V, attention output, `ssm_out`, `output.weight`. They differ in the ladder they
+spend on those upgrades: ATX puts 138 tensors at Q8_0 and uses Q5_0 as the middle
+rung, keeps the GDN alpha/beta vectors at Q8_0, and never drops a tensor below
+IQ4_XS. The stock map leads with Q6_K (36 at Q8_0, 31 at Q6_K), leaves the GDN
+alpha/beta vectors at F32, and puts seven tensors on Q4_K/Q5_K. The two have not
+been benchmarked head to head on this card; the numbers in this file are the
+flagship ATX quant, not either Swift build.
 
 ## Branches
 
@@ -110,18 +130,35 @@ all three.
 
 | `-ctk` / `-ctv` | KV bytes per token, incl. drafter | largest context under a 23 GB card budget | suggested `-c` | decode speed vs shipped | build |
 |---|---:|---|---:|---|---|
-| `q8_0` / `turbo3` (shipped) | 25,984 | 245,760 measured with a 240K prompt | 245760 | reference | default |
-| `q8_0` / `q8_0` | 36,992 (+42%) | ~165-175K, estimated | 163840 | measurement pending; kernel timing suggests within ~2% | default |
-| `q8_0` / `q5_1` | 31,872 (+23%) | ~190-200K, estimated | 188416 | measurement pending; may be slower (no fused kernel) | `-DGGML_CUDA_FA_ALL_QUANTS=ON` |
+| `q8_0` / `turbo3` (shipped) | 25,984 | 237,568 whole-card; 245,760 on a card with nothing else on it | 237568 | reference | default |
+| `q8_0` / `q8_0` | 36,992 (+42%) | 180,224 | 180224 | -0.3% weighted, within 1.2% at every depth | default |
+| `q8_0` / `q5_1` | 31,872 (+23%) | 204,800 | 204800 | -23% weighted, and it gets worse with depth | `-DGGML_CUDA_FA_ALL_QUANTS=ON` |
 
-The estimates scale the KV cache inside the filled 245,760 measurement (22,634 MiB peak for the server) to the
-other formats and hold the rest of the memory fixed, with about 300 MiB of margin for the desktop; fit probes at full
-depth will replace them. q8_0/q8_0 runs on the same fused MMA attention kernel as the shipped cache (extended to q8_0
-V in v0.3). Its per-call cost at 100K KV depth is 321 µs against 273 µs for turbo3 V, which projects to roughly 1-2%
-slower decode at depth.
+Those three ceilings are measured, not scaled: each was found by a ladder in 8,192-token steps that loads the server
+at `-c`, fills it with a C-2048 prompt, decodes 256 tokens, and requires the whole card (`nvidia-smi`, so the desktop
+counts) to stay at or under 23,552 MiB the whole time. The largest passing window and the first failing one were
+180,224 / 188,416 for q8_0, 204,800 / 212,992 for q5_1, and 237,568 / 245,760 for turbo3.
 
-**q5_1 has no fused kernel.** It runs on the generic flash-attention path, so it may be noticeably slower than
-the other two, especially at depth. The default build also does not compile flash-attention kernels for q5_1.
+The turbo3 row needs a word, because 245,760 is the window quoted elsewhere in this file. The two measurements do not
+disagree: 22,634 MiB at 245,760 is the server's own footprint, and the ladder measures the whole card, which on this
+machine carries about 800 MiB of desktop. Server-side the ladder agrees, at roughly 22.8 GiB for 245,760; add the
+desktop and the card peaks at 23,565 MiB, 13 MiB over the budget, so the run is killed during load. Keep 245,760 if
+the card is headless or nearly so, and use 237,568 (23,349 MiB peak with the desktop up) if anything else is drawing
+on it. Nothing regressed between the two numbers.
+
+Decode speed was measured on the same four fixtures as the rest of this file, temperature 1.0, three seeds, 256
+tokens, at 32,768 / 73,728 / 106,496 / 147,456 context. **q8_0 V costs nothing**: -0.3% weighted 0.4 coding / 0.4
+agentic / 0.2 RAG, and no fixture moves more than 1.2%, which matches the kernel timing (321 µs per call at 100K KV
+depth against 273 µs for turbo3 V). It runs on the same fused MMA attention kernel as the shipped cache (extended to
+q8_0 V in v0.3). Raw tokens/s for that arm scatters more than that (-1.3% weighted, +7.1% to -6.9% by fixture), but
+the scatter is draft acceptance drifting between arms as sampling diverges at temperature 1.0, not kernel speed: hold
+acceptance fixed by counting verify steps per second instead of tokens and the arms sit on top of each other.
+
+**q5_1 has no fused kernel, and it is expensive.** It runs on the generic flash-attention path, and the measured
+cost is -23% weighted against the shipped cache, worsening with depth: -18% at 32K, -22% at 73K, -29% at 106K and
+-36% at 147K (verify steps per second, so acceptance is held fixed; raw tokens/s gives -20% weighted). It buys
+24,576 tokens of context over turbo3 and gives up about a quarter of the decode rate to get them, which is a bad
+trade unless the extra window is the point. The default build also does not compile flash-attention kernels for q5_1.
 Without `-DGGML_CUDA_FA_ALL_QUANTS=ON` the attention op is not supported on the GPU and falls back to the CPU. Use
 that flag in the cmake line above (the build takes much longer). A fused q8_0-K/q5_1-V kernel is on the backlog.
 
