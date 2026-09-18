@@ -258,6 +258,17 @@ static bool ggml_cuda_qc4_nw1() {
     return value;
 }
 
+// IQ3_XXS / IQ3_S: stage the codebook grid (1 KB / 2 KB, a static const __device__ table in
+// global memory) into shared memory once per block. Same values, same accumulation order, so
+// bit-identical to the global-table path. OFF by default; GGML_CUDA_SM86_IQ3_SMEM_GRID=1 enables.
+static bool ggml_cuda_sm86_iq3_smem_grid() {
+    static const bool value = [] {
+        const char * env = getenv("GGML_CUDA_SM86_IQ3_SMEM_GRID");
+        return env != nullptr && env[0] == '1';
+    }();
+    return value;
+}
+
 static bool ggml_cuda_sm86_exact_reuse() {
     static const bool value = [] {
         const char * env = getenv("GGML_CUDA_SM86_EXACT_REUSE");
@@ -842,7 +853,7 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
 }
 
 template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false,
-          bool reuse_weights = false, bool nw1 = false>
+          bool reuse_weights = false, bool nw1 = false, bool smem_grid = false>
 __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters, nw1)*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
@@ -876,6 +887,29 @@ static __global__ void mul_mat_vec_q(
     uint32_t channel_x;
     uint32_t channel_y;
     uint32_t sample_dst;
+
+    // GGML_CUDA_SM86_IQ3_SMEM_GRID: cooperative copy of the IQ3 codebook into shared memory.
+    // One __syncthreads() per block, amortized over the whole K loop.
+    constexpr bool use_smem_grid = smem_grid && (type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S);
+    constexpr int  smem_grid_n   = type == GGML_TYPE_IQ3_S ? 512 : 256;
+    [[maybe_unused]] __shared__ uint32_t grid_s[use_smem_grid ? smem_grid_n : 1];
+    if constexpr (use_smem_grid) {
+        const uint32_t * grid_g = type == GGML_TYPE_IQ3_S ? iq3s_grid : iq3xxs_grid;
+#pragma unroll
+        for (int i = tid; i < smem_grid_n; i += nwarps*warp_size) {
+            grid_s[i] = grid_g[i];
+        }
+        __syncthreads();
+    }
+    auto vec_dot = [&](const void * vbq, const block_q8_1 * bq8, const int kbx_, const int iqs_) -> float {
+        if constexpr (use_smem_grid && type == GGML_TYPE_IQ3_XXS) {
+            return vec_dot_iq3_xxs_q8_1_impl(grid_s, vbq, bq8, kbx_, iqs_);
+        } else if constexpr (use_smem_grid && type == GGML_TYPE_IQ3_S) {
+            return vec_dot_iq3_s_q8_1_impl(grid_s, vbq, bq8, kbx_, iqs_);
+        } else {
+            return vec_dot_q_cuda(vbq, bq8, kbx_, iqs_);
+        }
+    };
 
     ggml_cuda_pdl_sync();
     channel_x  = ncols_dst == 1 && ids ? ids[channel_dst]                     : fastdiv(channel_dst, channel_ratio);
@@ -1011,11 +1045,11 @@ static __global__ void mul_mat_vec_q(
             for (int j = 0; j < ncols_dst; ++j) {
 #pragma unroll
                 for (int i = 0; i < rows_per_cuda_block; ++i) {
-                    tmp[j][i] += vec_dot_q_cuda(
+                    tmp[j][i] += vec_dot(
                         vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
                     if constexpr (has_fusion) {
                         if (use_gate) {
-                            tmp_gate[j][i] += vec_dot_q_cuda(
+                            tmp_gate[j][i] += vec_dot(
                                 vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
                         }
                     }
@@ -1313,9 +1347,26 @@ static void mul_mat_vec_q_switch_fusion(
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
                             fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
+
+    [[maybe_unused]] bool iq3_smem = false;
+    if constexpr (type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S) {
+        const int device = ggml_cuda_get_device();
+        const int cc = ggml_cuda_info().devices[device].cc;
+        iq3_smem = cc == 860 && ggml_cuda_sm86_iq3_smem_grid();
+    }
+
     if constexpr (c_ncols_dst == 1) {
         if (has_fusion) {
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
+            if constexpr (type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S) {
+                if (iq3_smem) {
+                    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters, false, nw1, true>, launch_params,
+                         vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
+                         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                         sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+                    return;
+                }
+            }
             ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters, false, nw1>, launch_params,
                  vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
@@ -1327,6 +1378,15 @@ static void mul_mat_vec_q_switch_fusion(
     GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
+    if constexpr (type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S) {
+        if (iq3_smem) {
+            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters, false, nw1, true>, launch_params,
+                vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
+                channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+            return;
+        }
+    }
     if constexpr (((type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K) && c_ncols_dst >= 3 && c_ncols_dst <= 5) ||
                   ((type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_Q5_0) && c_ncols_dst >= 2 && c_ncols_dst <= 5)) {
         const int device = ggml_cuda_get_device();

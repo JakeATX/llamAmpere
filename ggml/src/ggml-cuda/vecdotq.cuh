@@ -1169,7 +1169,11 @@ static __device__ __forceinline__ float vec_dot_iq2_s_q8_1(
 #define VDR_IQ3_XXS_Q8_1_MMVQ 2
 #define VDR_IQ3_XXS_Q8_1_MMQ  2
 
-static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(
+// The grid table is passed as a pointer so the caller can substitute a copy staged in shared
+// memory (mmvq.cu, GGML_CUDA_SM86_IQ3_SMEM_GRID). The values and the accumulation order are
+// identical to the global-table path, so the result is bit-identical.
+static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1_impl(
+    const uint32_t * __restrict__ grid,
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 
     const block_iq3_xxs * bq3 = (const block_iq3_xxs *) vbq + kbx;
@@ -1181,7 +1185,7 @@ static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(
     int sumi = 0;
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
-        const int2 grid_pos = make_int2(iq3xxs_grid[q3[l0 + 0]], iq3xxs_grid[q3[l0 + 1]]);
+        const int2 grid_pos = make_int2(grid[q3[l0 + 0]], grid[q3[l0 + 1]]);
         const uint32_t signs = unpack_ksigns(aux32 >> (7*l0/2));
 
         const int signs0 = __vcmpne4(signs & 0x08040201, 0);
@@ -1204,11 +1208,17 @@ static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(
     return d * sumi;
 }
 
+static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+    return vec_dot_iq3_xxs_q8_1_impl(iq3xxs_grid, vbq, bq8_1, kbx, iqs);
+}
+
 #define VDR_IQ3_S_Q8_1_MMVQ 2
 #define VDR_IQ3_S_Q8_1_MMQ  2
 
 // TODO: don't use lookup table for signs
-static __device__ __forceinline__ float vec_dot_iq3_s_q8_1(
+static __device__ __forceinline__ float vec_dot_iq3_s_q8_1_impl(
+    const uint32_t * __restrict__ grid,
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 
     const block_iq3_s * bq3 = (const block_iq3_s *) vbq + kbx;
@@ -1225,8 +1235,8 @@ static __device__ __forceinline__ float vec_dot_iq3_s_q8_1(
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const int2 grid_pos = make_int2(
-            iq3s_grid[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)],
-            iq3s_grid[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)]);
+            grid[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)],
+            grid[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)]);
 
         const int signs0 = __vcmpne4(((signs_packed_8[l0/2] & 0x03) << 7) | ((signs_packed_8[l0/2] & 0x0C) << 21), 0x00000000);
         const int signs1 = __vcmpne4(((signs_packed_8[l0/2] & 0x30) << 3) | ((signs_packed_8[l0/2] & 0xC0) << 17), 0x00000000);
@@ -1245,6 +1255,11 @@ static __device__ __forceinline__ float vec_dot_iq3_s_q8_1(
 
     const float d = __half2float(bq3->d) * __low2float(bq8_1[iqs/2].ds);
     return d * sumi;
+}
+
+static __device__ __forceinline__ float vec_dot_iq3_s_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+    return vec_dot_iq3_s_q8_1_impl(iq3s_grid, vbq, bq8_1, kbx, iqs);
 }
 
 #define VDR_IQ1_S_Q8_1_MMVQ 1
