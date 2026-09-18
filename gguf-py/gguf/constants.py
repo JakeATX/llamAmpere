@@ -825,10 +825,6 @@ class MODEL_TENSOR(IntEnum):
     HC_FFN_FN            = auto()
     HC_FFN_BASE          = auto()
     HC_FFN_SCALE         = auto()
-    HC_ATTN_NORM         = auto() # qwen4exp
-    HC_ATTN_DOWN         = auto() # qwen4exp
-    HC_ATTN_UP           = auto() # qwen4exp
-    HC_ATTN_INJECT       = auto() # qwen4exp
     HC_FFN_NORM          = auto() # qwen4exp
     HC_FFN_DOWN          = auto() # qwen4exp
     HC_FFN_UP            = auto() # qwen4exp
@@ -1238,10 +1234,6 @@ class MODEL_TENSOR(IntEnum):
     A_CTC_OUT              = auto()
     A_CTC_OUT_MID          = auto()
     A_ENC_ATTN_REL_POS_EMB = auto()
-    A_ENC_SE_CONV1         = auto() # qwen3tts
-    A_ENC_SE_CONV2         = auto() # qwen3tts
-    A_ENC_ASP_ATTN         = auto() # qwen3tts
-    A_ENC_ASP_TDNN         = auto() # qwen3tts
     # audio qformer projector
     A_QF_PROJ_QUERY        = auto()
     A_QF_PROJ_NORM         = auto()
@@ -1605,10 +1597,6 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.HC_FFN_FN:                 "blk.{bid}.hc_ffn_fn",
     MODEL_TENSOR.HC_FFN_BASE:               "blk.{bid}.hc_ffn_base",
     MODEL_TENSOR.HC_FFN_SCALE:              "blk.{bid}.hc_ffn_scale",
-    MODEL_TENSOR.HC_ATTN_NORM:              "blk.{bid}.hc_attn_norm",         # qwen4exp
-    MODEL_TENSOR.HC_ATTN_DOWN:              "blk.{bid}.hc_attn_down",         # qwen4exp
-    MODEL_TENSOR.HC_ATTN_UP:                "blk.{bid}.hc_attn_up",           # qwen4exp
-    MODEL_TENSOR.HC_ATTN_INJECT:            "blk.{bid}.hc_attn_inject",       # qwen4exp
     MODEL_TENSOR.HC_FFN_NORM:               "blk.{bid}.hc_ffn_norm",          # qwen4exp
     MODEL_TENSOR.HC_FFN_DOWN:               "blk.{bid}.hc_ffn_down",          # qwen4exp
     MODEL_TENSOR.HC_FFN_UP:                 "blk.{bid}.hc_ffn_up",            # qwen4exp
@@ -1986,10 +1974,6 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.A_CTC_OUT:                 "a.enc_ctc_out",
     MODEL_TENSOR.A_CTC_OUT_MID:             "a.enc_ctc_out_mid",
     MODEL_TENSOR.A_ENC_ATTN_REL_POS_EMB:    "a.blk.{bid}.attn_rel_pos_emb",
-    MODEL_TENSOR.A_ENC_SE_CONV1:            "a.blk.{bid}.se_conv1",
-    MODEL_TENSOR.A_ENC_SE_CONV2:            "a.blk.{bid}.se_conv2",
-    MODEL_TENSOR.A_ENC_ASP_ATTN:            "a.asp_attn",
-    MODEL_TENSOR.A_ENC_ASP_TDNN:            "a.asp_tdnn",
     # qformer projector
     MODEL_TENSOR.A_QF_PROJ_QUERY:           "a.proj_query",
     MODEL_TENSOR.A_QF_PROJ_NORM:            "a.proj_norm",
@@ -2325,10 +2309,6 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.A_CTC_OUT,
         MODEL_TENSOR.A_CTC_OUT_MID,
         MODEL_TENSOR.A_ENC_ATTN_REL_POS_EMB,
-        MODEL_TENSOR.A_ENC_SE_CONV1,
-        MODEL_TENSOR.A_ENC_SE_CONV2,
-        MODEL_TENSOR.A_ENC_ASP_ATTN,
-        MODEL_TENSOR.A_ENC_ASP_TDNN,
         # qformer projector
         MODEL_TENSOR.A_QF_PROJ_QUERY,
         MODEL_TENSOR.A_QF_PROJ_NORM,
