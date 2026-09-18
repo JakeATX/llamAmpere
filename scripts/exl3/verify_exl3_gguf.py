@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# EXL3 format and trellis layout: Turboderp, exllamav3 (https://github.com/turboderp-org/exllamav3), MIT License,
+# Copyright (c) 2025 Turboderp; see licenses/LICENSE-exllamav3. Independent reimplementation.
 """EX2 M1 converter check: for chosen tensors, reconstruct W_eff from the GGUF (EXL3 bytes + .suh + .svh) with the numpy
 reference and compare bit-exactly (as float32) against W_eff reconstructed from the original safetensors with the stock
 converter's V-head permutation applied to the reconstructed matrix. CPU only.

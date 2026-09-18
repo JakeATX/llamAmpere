@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# EXL3 format and trellis layout: Turboderp, exllamav3 (https://github.com/turboderp-org/exllamav3), MIT License,
+# Copyright (c) 2025 Turboderp; see licenses/LICENSE-exllamav3. Independent reimplementation.
 """EXL3 CPU reference dequant (M0 of EX2_exl3_port). numpy only; mirrors exllamav3 v1.5.0 kernels:
   window:   weight t of a 256-weight tile = 16-bit window at bit offset ((t+257)*bits - 16) mod (256*bits) of the little-endian
             uint32 stream (exl3_dq.cuh dq/dq2/dq4: b0 = t*bits + bits - 16 + 256*bits, ptr[i % (bits*256/32)]).

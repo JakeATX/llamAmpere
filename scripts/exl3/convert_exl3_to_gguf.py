@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# EXL3 format and trellis layout: Turboderp, exllamav3 (https://github.com/turboderp-org/exllamav3), MIT License,
+# Copyright (c) 2025 Turboderp; see licenses/LICENSE-exllamav3. Independent reimplementation.
 """EX2 M1: bit-exact repack of an exllamav3 EXL3 checkpoint (Qwen3.5/3.8 text model) into GGUF.
 
 No re-quantization: every `<P>.trellis` (int16 [K/16, N/16, 16*bits]) becomes GGUF tensor `<gguf(P)>.weight` of type

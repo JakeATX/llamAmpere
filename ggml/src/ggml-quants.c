@@ -6006,6 +6006,8 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
 }
 
 // ====================== EXL3 (exllamav3 trellis) reference decoder
+// EXL3 format and codebook: Turboderp, exllamav3 (https://github.com/turboderp-org/exllamav3), MIT License,
+// Copyright (c) 2025 Turboderp; see licenses/LICENSE-exllamav3. Independent reimplementation.
 
 static inline float ggml_exl3_mul1_decode(uint32_t code) {
     // exllamav3 "mul1" codebook (cb2): x = code * 0x83DCD12D mod 2^32; s = bytesum(x) + 0x6400 taken as an fp16 bit
