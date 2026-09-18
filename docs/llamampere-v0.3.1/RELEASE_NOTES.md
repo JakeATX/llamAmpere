@@ -52,9 +52,28 @@ of reading it from global memory per lookup. Same values, same accumulation orde
 
 ### Upstream sync
 
-This release branches from `ws/v0.3.1-upstream`, which is upstream llama.cpp and TurboQuant merged onto
-the v0.3 base: 772 commits ahead, with no fork commit left behind. One defect came in with that merge
-and is fixed here: `gguf-py/gguf/constants.py` had eight `MODEL_TENSOR` members defined twice
+This release branches from `ws/v0.3.1-upstream`: two true merge commits on top of the v0.3 base
+(`617f92f23`), no rebase, no fork commit left behind.
+
+- `96087172f` rolls TurboQuant forward to `407f3237b` (41 commits).
+- `ef9ed337f` merges ggml-org/master at `b49650adb` (728 commits; 99 conflicted files, resolved hunk by hunk).
+
+Upstream work that is now in the fork: the GDN normalization fix (PR 28068), the branchless Q4_K/Q5_K
+unpack with L2 prefetch, the f16 flash-attention divergent-barrier fix, DFlash2, draft-mtp with embeddings,
+synthetic speculative acceptance, and the per-hardware MMVQ to MMQ crossover tables.
+
+Kept ours where it matters on this card: the SM86 MMVQ crossover is unchanged (upstream's new tables
+only touch Ada, Blackwell, GB10, Orin and GCN); the exact p/q rejection loop stays the default; a slot
+context above `n_ctx_train` warns instead of being capped; the CUDA-graph shape-key cache and its kill
+switch; and the 21 turbo K/V flash-attention instances are always compiled regardless of
+`GGML_CUDA_FA_QUANTS`.
+
+Dropped: the fork's Metal TurboQuant kernels and the Vulkan TurboQuant host wiring. Upstream
+restructured both backends, so re-attaching them is a port rather than a merge. v0.3.1 is a CUDA SM86
+release; Metal or Vulkan users of TurboQuant should stay on v0.3 until that port lands (the removed code
+is preserved as patches for it). The Metal and Vulkan moe-cache registrations are intact.
+
+One defect came in with the merge and is fixed here: `gguf-py/gguf/constants.py` had eight `MODEL_TENSOR` members defined twice
 (`HC_ATTN_NORM/DOWN/UP/INJECT`, `A_ENC_SE_CONV1/2`, `A_ENC_ASP_ATTN/TDNN`), which made `import gguf`
 fail outright with "already defined". Each is now declared once, as upstream master has it.
 
@@ -122,6 +141,13 @@ every step.
 - **The n-gram speculative path.** The persistent lookup cache, the CLI options, the splice policy and
   the draft-length statistics stay out of v0.3.1. Every n-gram policy measured so far loses to MTP
   because verify widths 5 to 9 cost 2.2 to 3.1x on the current MMVQ, so this is gated on W58 landing.
+  The v0.4 target for it is narrower than "beat MTP": an option for 8, 10 and 12 GB cards to skip the
+  MTP head entirely when context is tight, where the head's weights and its draft KV do not fit.
+- **PTQ1_0 verify widths 2 to 4.** The dp4a rewrite made single-token PTQ1_0 decode faster than the
+  MTP path at 16K on this container; the width 2 to 4 kernels are the next PTQ1_0 target so the drafter
+  pays off there too.
+- **A 6-bit TurboQuant K cache (TQ6) to pair with TQ3 V.** The idea is K at roughly 8-bit quality in
+  6 bits for tight-VRAM configurations (tq6/tq3), to be explored and measured before anything ships.
 - **MTP depth 4 as a product default.** Depth 4 with `p-min 0` won the ship corpus and is the
   recommended setting, but `common_params_speculative::n_max` is still 3 in the code. Changing the
   default is a v0.4 change.
