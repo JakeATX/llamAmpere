@@ -247,6 +247,11 @@ MTP depth 4, one fresh server boot per measured request, prompts templated from 
 Acceptance is flat across depth (cell means 0.608 to 0.642, about 3.5 accepted draft tokens per pass),
 so the drop from 20K to 50K is per-step engine overhead, not drafting.
 
+Re-measured on the release build (`build-v031`, same fixture, seeds and cap): the 20,469-token row gives
+81.90 tok/s (sd 0.82, peak 17,154 MiB, acceptance 0.61 to 0.63) with MTP depth 4, and 40.56 tok/s (sd 0.15,
+peak 16,030 MiB) with no drafter, all six runs ending on EOS between 17,188 and 20,084 generated tokens.
+Per-seed files: `EX5_depth_bench/results_v031/A.20k.s*.json` and `A1.20k.s*.json`.
+
 ## How it compares to our other formats
 
 On the same card and the same binary, the ATX IQ4_XS quant is still the fast choice for this model. In

@@ -26,9 +26,10 @@ graph node. The Qwen3.5/3.8 loader and graph also understand the fused-group lay
 `ffn_up = [gate | up]`) that the converter's `--fuse` writes, which turns two or three GEMVs per block
 into one.
 
-Measured on one RTX 3090 Ti with Qwen3.8-27B EXL3 4.0 bpw: 41.3 tok/s single-token greedy decode,
-81.27 tok/s (3 seeds, sd 0.39) at a 20K prompt and 73.72 (sd 0.59) at a 50K prompt with the model's MTP
-head at depth 4, temperature 1.0, 20,480-token cap. Peak whole-card VRAM 17,080 and 17,893 MiB. KL
+Measured on one RTX 3090 Ti with Qwen3.8-27B EXL3 4.0 bpw on the release build: 40.6 tok/s single-token
+(3 seeds, sd 0.15) and 81.9 tok/s (3 seeds, sd 0.82) at a 20K prompt with the model's MTP head at depth 4,
+temperature 1.0, 20,480-token cap, every run ending on EOS; 73.72 (sd 0.59) at a 50K prompt on the
+development build. Peak whole-card VRAM 17,154 MiB at 20K with the drafter and 17,893 MiB at 50K. KL
 divergence to the reference implementation on the same weights is 0.000221 ± 0.000057 with the same top
 token on 99.6 % of positions, and the converter reconstructs its checked tensors with `max|Δ| = 0`.
 
@@ -38,8 +39,10 @@ Full documentation, including conversion, verification and the known limits: [do
 
 CPU and CUDA inference for Prism ML's Ternary Bonsai 2 27B, plus decode kernels for both containers.
 `PQ2_0` (2-bit codes) and `PTQ1_0` (5 trits per byte) hold bit-identical ternary values and scales; they
-differ only in packing. At 16K context on a 3090 Ti, `PQ2_0` decodes at 65 tok/s single-token and 100
-tok/s with the MTP drafter, `PTQ1_0` at 64 and 59 tok/s, for about 1.1 GB less peak VRAM (2K checks on one fixture; the full matrix on this build is pending). Both are
+differ only in packing. At 16K context on a 3090 Ti, `PQ2_0` decodes at 69.7 tok/s single-token and 104.8
+tok/s with the MTP drafter, `PTQ1_0` at 62.8 and 59.1 tok/s, for about 1.1 GB less peak VRAM (release
+build, one 16K rag prompt, two seeds, full runs of at least 5,000 generated tokens at temperature 1.0;
+the PTQ1_0 drafter does not pay at temperature 1.0 at any depth from 1 to 3, so run it single-token). Both are
 bit-exact against the Prism reference: the 16-token greedy hash is unchanged.
 
 Model, build, validation and credits: [docs/bonsai2.md](../bonsai2.md).
@@ -132,9 +135,10 @@ as PTQ1_0 in a 2-bit container, so it trades about 1.1 GB of VRAM for an unpack 
 permute per four weights instead of a multiply chain. That moves the kernel off the integer pipe and
 back onto bandwidth, which is where a decode kernel wants to be. It matters most under speculative
 decoding, because a width-4 verify re-reads the same weights and the byte-permute path carries almost no
-re-unpack cost: on the same 16K fixture, PQ2_0 goes from 65 tok/s single-token to 100 tok/s with the MTP
-drafter, where PTQ1_0 goes 64 to 59 after the dp4a rewrite (55 to 60 before it): on PTQ1_0 a width-4
-verify pass still costs about 2.85 single-token steps, so the drafter is roughly break-even there. The two containers were checked tensor by tensor and are a lossless
+re-unpack cost: on the same 16K fixture in full temperature-1.0 runs on the release build, PQ2_0 goes
+from 69.7 tok/s single-token to 104.8 tok/s with the MTP drafter, where PTQ1_0 goes 62.8 to 59.1 (the
+2K development checks read 64 to 59 after the dp4a rewrite and 55 to 60 before it): on PTQ1_0 a width-4
+verify pass still costs about 2.85 single-token steps, so the drafter loses slightly there. The two containers were checked tensor by tensor and are a lossless
 re-container of each other, so this is pure packing, not a quality trade.
 
 **EXL3, the trellis GEMV (new).** The first working path reconstructed each whole weight matrix to f16
@@ -209,7 +213,9 @@ Numbers that are not in this document because no measurement supports them yet:
 - A v0.3.1 ladder against stock llama.cpp and TurboQuant, in the form v0.3 reports: **TBD**. No
   ship-corpus run has been made on this branch.
 - PQ2_0 and PTQ1_0 on the production ship corpus (coding, agentic, rag, 3 seeds, 20K generated,
-  temperature 1.0): **TBD**. The ternary figures quoted above are 2K checks on one fixture and one seed.
+  temperature 1.0): the 16K rag cells are full runs on the release build (quoted above, two seeds each).
+  The coding and agentic 16K fixtures end under 5,000 generated tokens on every format, ternary and ATX
+  alike, so no ship number exists for them; the 64K and 100K rag cells are **TBD** (running).
 - PQ2_0 prefill on the v0.3.1 build: **TBD**. The 1,418 tok/s figure on record is a 2K check on the
   earlier ternary build.
 - EXL3 at bit widths other than 4.0 (and the 6-bit head): **TBD**. Types 2, 3, 5, 7 and 8 are
