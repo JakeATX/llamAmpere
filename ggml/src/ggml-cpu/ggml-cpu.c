@@ -334,6 +334,48 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .vec_dot_type             = GGML_TYPE_F32,
         .nrows                    = 1,
     },
+    [GGML_TYPE_EXL3_2] = {
+        .from_float               = NULL,
+        .vec_dot                  = NULL, // whole-tensor path: ggml_compute_forward_mul_mat_exl3
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_EXL3_3] = {
+        .from_float               = NULL,
+        .vec_dot                  = NULL, // whole-tensor path: ggml_compute_forward_mul_mat_exl3
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_EXL3_4] = {
+        .from_float               = NULL,
+        .vec_dot                  = NULL, // whole-tensor path: ggml_compute_forward_mul_mat_exl3
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_EXL3_5] = {
+        .from_float               = NULL,
+        .vec_dot                  = NULL, // whole-tensor path: ggml_compute_forward_mul_mat_exl3
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_EXL3_6] = {
+        .from_float               = NULL,
+        .vec_dot                  = NULL, // whole-tensor path: ggml_compute_forward_mul_mat_exl3
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_EXL3_7] = {
+        .from_float               = NULL,
+        .vec_dot                  = NULL, // whole-tensor path: ggml_compute_forward_mul_mat_exl3
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_EXL3_8] = {
+        .from_float               = NULL,
+        .vec_dot                  = NULL, // whole-tensor path: ggml_compute_forward_mul_mat_exl3
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
     [GGML_TYPE_MXFP4] = {
         .from_float               = quantize_row_mxfp4,
         .vec_dot                  = ggml_vec_dot_mxfp4_q8_0,
@@ -1332,6 +1374,120 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     }
 }
 
+// EXL3 (exllamav3 trellis) weights are not row-addressable (16x16 tiles, k-tile major), so the generic
+// vec_dot machinery cannot be used. Reference path: each thread decodes whole 16-row groups into a per-thread
+// f32 scratch ([16][K], sized in ggml_graph_plan) and dots them with every src1 column. With src[2] = suh [K] and
+// src[3] = svh [N] (llama build_lora_mm) the exllamav3 forward y = svh * H128(W . H128(suh * x)) is applied here
+// (x' in a shared [T][K] scratch, output Hadamard in place); without them: codebook values only.
+
+// in-place 128-point Walsh-Hadamard, Sylvester order, scaled by 1/sqrt(128)
+static void ggml_exl3_wht128(float * v) {
+    for (int h = 1; h < 128; h <<= 1) {
+        for (int i = 0; i < 128; i += 2 * h) {
+            for (int j = i; j < i + h; ++j) {
+                const float a = v[j], b = v[j + h];
+                v[j] = a + b; v[j + h] = a - b;
+            }
+        }
+    }
+    for (int i = 0; i < 128; ++i) {
+        v[i] *= 0.08838834764831845f;
+    }
+}
+
+static void ggml_compute_forward_mul_mat_exl3(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * dst) {
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+    const struct ggml_tensor * suh  = dst->src[2];
+    const struct ggml_tensor * svh  = dst->src[3];
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+    const int bits = ggml_exl3_bits(src0->type);
+
+    GGML_ASSERT(bits != 0);
+    GGML_ASSERT(ne02 == 1 && ne03 == 1);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(nb10 == sizeof(float) && nb0 == sizeof(float));
+    GGML_ASSERT(ne00 % 16 == 0 && ne01 % 16 == 0 && ne00 == ne10 && ne01 == ne0);
+
+    const int64_t K  = ne00;
+    const int64_t N  = ne01;
+    const int64_t ng = N / 16;
+    const int64_t T  = ne11 * ne12 * ne13;
+    const bool fused = suh != NULL;
+
+    float * xbuf = NULL;
+    float * wbuf = NULL;
+    if (fused) {
+        GGML_ASSERT(svh != NULL && suh->type == GGML_TYPE_F32 && svh->type == GGML_TYPE_F32);
+        GGML_ASSERT(suh->ne[0] == K && svh->ne[0] == N && K % 128 == 0 && N % 128 == 0);
+        GGML_ASSERT(params->wsize >= (size_t) (T * K + nth * 16 * K) * sizeof(float));
+        xbuf = (float *) params->wdata;
+        wbuf = xbuf + (size_t) T * K + (size_t) ith * 16 * K;
+        // x' = H128(suh * x), 128-chunks split across threads
+        const float * suh_d = (const float *) suh->data;
+        const int64_t kch = K / 128;
+        for (int64_t ch = ith; ch < T * kch; ch += nth) {
+            const int64_t col = ch / kch;
+            const int64_t kc  = (ch - col * kch) * 128;
+            const int64_t i11 = col % ne11;
+            const int64_t i12 = (col / ne11) % ne12;
+            const int64_t i13 = col / (ne11 * ne12);
+            const float * x = (const float *) ((const char *) src1->data + i11*nb11 + i12*nb12 + i13*nb13) + kc;
+            float * o = xbuf + col * K + kc;
+            for (int i = 0; i < 128; ++i) {
+                o[i] = x[i] * suh_d[kc + i];
+            }
+            ggml_exl3_wht128(o);
+        }
+        ggml_barrier(params->threadpool);
+    } else {
+        GGML_ASSERT(params->wsize >= (size_t) nth * 16 * K * sizeof(float));
+        wbuf = (float *) params->wdata + (size_t) ith * 16 * K;
+    }
+
+    for (int64_t g = ith; g < ng; g += nth) {
+        ggml_exl3_dequantize_row_group(src0->data, K, N, bits, g, wbuf);
+        for (int64_t i13 = 0; i13 < ne13; ++i13) {
+            for (int64_t i12 = 0; i12 < ne12; ++i12) {
+                for (int64_t i11 = 0; i11 < ne11; ++i11) {
+                    const float * x = fused
+                        ? xbuf + ((i13 * ne12 + i12) * ne11 + i11) * K
+                        : (const float *) ((const char *) src1->data + i11*nb11 + i12*nb12 + i13*nb13);
+                    float * d = (float *) ((char *) dst->data + i11*nb1 + i12*nb2 + i13*nb3) + g*16;
+                    for (int r = 0; r < 16; ++r) {
+                        ggml_vec_dot_f32((int) K, &d[r], 0, wbuf + (size_t) r * K, 0, x, 0, 1);
+                    }
+                }
+            }
+        }
+    }
+
+    if (fused) {
+        // y = svh * H128(y_raw), 128-chunks of the output split across threads (in place, after all rows are done)
+        ggml_barrier(params->threadpool);
+        const float * svh_d = (const float *) svh->data;
+        const int64_t nch = N / 128;
+        for (int64_t ch = ith; ch < T * nch; ch += nth) {
+            const int64_t col = ch / nch;
+            const int64_t nc  = (ch - col * nch) * 128;
+            const int64_t i11 = col % ne11;
+            const int64_t i12 = (col / ne11) % ne12;
+            const int64_t i13 = col / (ne11 * ne12);
+            float * d = (float *) ((char *) dst->data + i11*nb1 + i12*nb2 + i13*nb3) + nc;
+            ggml_exl3_wht128(d);
+            for (int i = 0; i < 128; ++i) {
+                d[i] *= svh_d[nc + i];
+            }
+        }
+    }
+}
+
 void ggml_compute_forward_mul_mat(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
@@ -1342,6 +1498,10 @@ void ggml_compute_forward_mul_mat(
     const int32_t hint = ggml_get_op_params_i32(dst, 1);
     if (hint == GGML_HINT_SRC0_IS_HADAMARD && !params->use_ref) {
         ggml_compute_forward_fwht(params, dst);
+        return;
+    }
+    if (ggml_exl3_bits(src0->type)) {
+        ggml_compute_forward_mul_mat_exl3(params, dst);
         return;
     }
 
@@ -3095,7 +3255,14 @@ struct ggml_cplan ggml_graph_plan(
                     {
                         const enum ggml_type vec_dot_type = type_traits_cpu[node->src[0]->type].vec_dot_type;
 
-                        if (node->src[1]->type != vec_dot_type) {
+                        if (ggml_exl3_bits(node->src[0]->type)) {
+                            // per-thread [16][K] f32 row-group scratch (ggml_compute_forward_mul_mat_exl3),
+                            // plus a shared [T][K] x' when the node carries the suh/svh glue (src[2])
+                            cur = (size_t) n_tasks * 16 * node->src[0]->ne[0] * sizeof(float);
+                            if (node->src[2] != NULL) {
+                                cur += (size_t) ggml_nelements(node->src[1]) * sizeof(float);
+                            }
+                        } else if (node->src[1]->type != vec_dot_type) {
                             cur = ggml_row_size(vec_dot_type, ggml_nelements(node->src[1]));
                         }
 

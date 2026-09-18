@@ -5825,3 +5825,41 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
 
     return true;
 }
+
+// ====================== EXL3 (exllamav3 trellis) reference decoder
+
+static inline float ggml_exl3_mul1_decode(uint32_t code) {
+    // exllamav3 "mul1" codebook (cb2): x = code * 0x83DCD12D mod 2^32; s = bytesum(x) + 0x6400 taken as an fp16 bit
+    // pattern; value = hfma(s, fp16(0x1eee), fp16(0xc931)) -- one rounding to fp16.
+    const uint32_t x = code * 0x83DCD12Du;
+    const uint32_t s = (x & 0xffu) + ((x >> 8) & 0xffu) + ((x >> 16) & 0xffu) + ((x >> 24) & 0xffu) + 0x6400u;
+    const float h = GGML_FP16_TO_FP32((ggml_fp16_t) s);
+    const float v = h * GGML_FP16_TO_FP32((ggml_fp16_t) 0x1eee) + GGML_FP16_TO_FP32((ggml_fp16_t) 0xc931); // exact in fp32
+    return GGML_FP16_TO_FP32(GGML_FP32_TO_FP16(v));
+}
+
+void ggml_exl3_dequantize_row_group(const void * GGML_RESTRICT data, int64_t K, int64_t N, int bits, int64_t g, float * GGML_RESTRICT y) {
+    assert(bits >= 2 && bits <= 8 && K % 16 == 0 && N % 16 == 0 && g >= 0 && 16*g < N);
+    const int64_t kt = K / 16;
+    const int64_t nt = N / 16;
+    const int nw = 8 * bits;        // uint32 words per 16x16 tile
+    const int nbits = 256 * bits;   // circular bit stream length per tile
+    const uint32_t * base = (const uint32_t *) data;
+    for (int64_t ki = 0; ki < kt; ++ki) {
+        const uint32_t * w = base + (ki * nt + g) * nw;
+        for (int t = 0; t < 256; ++t) {
+            // 16-bit window: word i holds stream bits [32i, 32i+32) MSB-first; the window starts at stream bit b0
+            const int b0 = ((t + 257) * bits - 16) % nbits;
+            const int i0 = b0 >> 5;
+            const int sh = b0 & 31;
+            const uint64_t c = ((uint64_t) w[i0] << 32) | (uint64_t) w[(i0 + 1) % nw];
+            const uint32_t code = (uint32_t) ((c >> (48 - sh)) & 0xffffu);
+            // reconstruct.cu lane layout: t = lane*8 + j
+            const int lane = t >> 3;
+            const int j = t & 7;
+            const int row = 2 * (lane & 3) + (j & 1) + 8 * ((j >> 1) & 1);      // k within the tile
+            const int col = 2 * (lane >> 3) + ((lane >> 2) & 1) + 8 * (j >> 2);  // n within the tile
+            y[(int64_t) col * K + ki * 16 + row] = ggml_exl3_mul1_decode(code);
+        }
+    }
+}

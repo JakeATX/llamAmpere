@@ -1561,6 +1561,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     draft_vocab_ids  (params.draft_vocab_ids),
     cb_func          (params.cb),
     res              (params.res),
+    model_ref        (params.model),
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
         res->set_params(params);
@@ -1580,11 +1581,52 @@ ggml_tensor * llm_graph_context::build_cvec(
     return cvec->apply_to(ctx0, cur, il);
 }
 
+// EXL3: apply the 128-block Hadamard (shared f32 [128,128] H128 = Sylvester / sqrt(128), symmetric) along ne0 of t.
+// t is [D, ...] with D % 128 == 0: reshape to [128, D/128, rest], mul_mat(H128, .), reshape back.
+static ggml_tensor * build_exl3_had128(ggml_context * ctx0, ggml_tensor * had128, ggml_tensor * t) {
+    const int64_t D = t->ne[0];
+    GGML_ASSERT(D % 128 == 0);
+    if (!ggml_is_contiguous(t)) {
+        t = ggml_cont(ctx0, t);
+    }
+    const int64_t rest = ggml_nelements(t) / D;
+    ggml_tensor * t3 = ggml_reshape_3d(ctx0, t, 128, D / 128, rest);
+    t3 = ggml_mul_mat(ctx0, had128, t3); // [128, D/128, rest]
+    return ggml_reshape_4d(ctx0, t3, t->ne[0], t->ne[1], t->ne[2], t->ne[3]);
+}
+
 ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
           ggml_tensor * w_s) const {
-    ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
+    ggml_tensor * res = nullptr;
+
+    const llama_model::exl3_side * exl3 = model_ref ? model_ref->exl3_side_of(w) : nullptr;
+    if (exl3) {
+        // y = svh * H128( W_trellis . H128( suh * x ) )   (exllamav3 exl3.py forward, Hadamard block 128)
+        // fused form: the mul_mat node carries suh/svh as src[2]/src[3] and the backend applies the scales and
+        // the 128-block Hadamards itself (ggml-cuda exl3.cu, ggml-cpu mul_mat_exl3). LLAMA_EXL3_GLUE_GRAPH=1
+        // builds the same math from generic ops (ggml_mul + mul_mat with exl3_had128.weight) for A/B checks.
+        static const bool graph_glue = getenv("LLAMA_EXL3_GLUE_GRAPH") != nullptr;
+        if (graph_glue) {
+            GGML_ASSERT(model_ref->exl3_had128 != nullptr);
+            ggml_tensor * x = ggml_mul(ctx0, cur, exl3->suh);
+            x   = build_exl3_had128(ctx0, model_ref->exl3_had128, x);
+            res = ggml_mul_mat(ctx0, w, x);
+            res = build_exl3_had128(ctx0, model_ref->exl3_had128, res);
+            res = ggml_mul(ctx0, res, exl3->svh);
+        } else {
+            GGML_ASSERT(w->ne[0] % 128 == 0 && w->ne[1] % 128 == 0);
+            if (!ggml_is_contiguous(cur)) {
+                cur = ggml_cont(ctx0, cur);
+            }
+            res = ggml_mul_mat(ctx0, w, cur);
+            res->src[2] = exl3->suh;
+            res->src[3] = exl3->svh;
+        }
+    } else {
+        res = ggml_mul_mat(ctx0, w, cur);
+    }
 
     if (w_s) {
         res = ggml_mul(ctx0, res, w_s);

@@ -438,7 +438,19 @@ extern "C" {
         GGML_TYPE_Q8_CR   = 48, // Q8_0 blocks of a ConvRot-rotated tensor
         GGML_TYPE_Q5_CR   = 49, // Q5_0 blocks of a ConvRot-rotated tensor
         GGML_TYPE_Q6_CR   = 50, // Q6_K blocks of a ConvRot-rotated tensor
-        GGML_TYPE_COUNT   = 51,
+        // EXL3 (exllamav3) trellis-coded weights, b bits/weight. Block = one 16x16 tile (256 weights, 32*b bytes).
+        // NOT row-addressable: the bytes of a [K, N] tensor are the native exllamav3 trellis order
+        // [K/16][N/16][16*b] int16 (k-tile major), so to_float/from_float are NULL and only whole-tensor
+        // mul_mat paths exist (ggml_exl3_dequantize_row_group). Side vectors .suh/.svh and the 128-block
+        // Hadamard are applied by the graph (see llama build_lora_mm).
+        GGML_TYPE_EXL3_2  = 51,
+        GGML_TYPE_EXL3_3  = 52,
+        GGML_TYPE_EXL3_4  = 53,
+        GGML_TYPE_EXL3_5  = 54,
+        GGML_TYPE_EXL3_6  = 55,
+        GGML_TYPE_EXL3_7  = 56,
+        GGML_TYPE_EXL3_8  = 57,
+        GGML_TYPE_COUNT   = 58,
     };
 
     // [TAG_GGML_PREC]
@@ -787,6 +799,7 @@ extern "C" {
     GGML_API size_t  ggml_element_size(const struct ggml_tensor * tensor);
 
     GGML_API bool    ggml_is_quantized(enum ggml_type type);
+    GGML_API int     ggml_exl3_bits   (enum ggml_type type); // bits/weight for GGML_TYPE_EXL3_*, 0 otherwise
 
     // TODO: temporary until model loading of ggml examples is refactored
     GGML_API enum ggml_type ggml_ftype_to_ggml_type(enum ggml_ftype ftype);

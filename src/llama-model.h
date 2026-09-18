@@ -656,6 +656,17 @@ struct llama_model {
 
     // NVFP4 per-tensor scale2, input_scale for LM head
     struct ggml_tensor * output_s    = nullptr;
+
+    // EXL3 (exllamav3 trellis) weights: per-weight .suh [K] / .svh [N] f32 side vectors and the shared 128-block
+    // Hadamard (exl3_had128.weight). Applied around the mul_mat in llm_graph_context::build_lora_mm:
+    //   y = svh * H128( W_trellis . H128( suh * x ) )
+    struct exl3_side {
+        struct ggml_tensor * suh = nullptr;
+        struct ggml_tensor * svh = nullptr;
+    };
+    struct ggml_tensor * exl3_had128 = nullptr;
+    std::unordered_map<const struct ggml_tensor *, exl3_side> exl3_sides;
+    const exl3_side * exl3_side_of(const struct ggml_tensor * w) const;
     struct ggml_tensor * output_in_s = nullptr;
 
     // NextN/MTP model-level projections

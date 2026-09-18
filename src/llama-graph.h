@@ -18,6 +18,7 @@ struct ggml_context;
 struct ggml_tensor;
 
 struct llama_cparams;
+struct llama_model;
 struct llama_layer;
 
 struct llama_memory_context_i;
@@ -825,6 +826,9 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
+    // owning model (EXL3 side tensors for build_lora_mm); may be null for graphs that carry no EXL3 weights
+    const llama_model * model = nullptr;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -1055,6 +1059,8 @@ struct llm_graph_context {
     const llm_graph_cb & cb_func;
 
     llm_graph_result * res;
+
+    const llama_model * model_ref; // EXL3 side tensors (llama_model::exl3_side_of); null if none
 
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;

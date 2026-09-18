@@ -47,6 +47,7 @@ const char * llama_ftype_name(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_Q8_CR:     name = LLAMA_FTYPE_PREFIX "Q8_CR (ConvRot)"; break;
         case LLAMA_FTYPE_MOSTLY_Q5_CR:     name = LLAMA_FTYPE_PREFIX "Q5_CR (ConvRot)"; break;
         case LLAMA_FTYPE_MOSTLY_Q6_CR:     name = LLAMA_FTYPE_PREFIX "Q6_CR (ConvRot)"; break;
+        case LLAMA_FTYPE_MOSTLY_EXL3:      name = LLAMA_FTYPE_PREFIX "EXL3 (exllamav3 trellis)"; break;
         case LLAMA_FTYPE_MOSTLY_MXFP4_MOE: name = LLAMA_FTYPE_PREFIX "MXFP4 MoE"; break;
         case LLAMA_FTYPE_MOSTLY_NVFP4:     name = LLAMA_FTYPE_PREFIX "NVFP4"; break;
         case LLAMA_FTYPE_MOSTLY_Q2_K:      name = LLAMA_FTYPE_PREFIX "Q2_K - Medium"; break;
@@ -769,6 +770,13 @@ llama_model_loader::llama_model_loader(
             case GGML_TYPE_Q8_CR:   ftype = LLAMA_FTYPE_MOSTLY_Q8_CR;   break;
             case GGML_TYPE_Q5_CR:   ftype = LLAMA_FTYPE_MOSTLY_Q5_CR;   break;
             case GGML_TYPE_Q6_CR:   ftype = LLAMA_FTYPE_MOSTLY_Q6_CR;   break;
+            case GGML_TYPE_EXL3_2:  ftype = LLAMA_FTYPE_MOSTLY_EXL3;    break;
+            case GGML_TYPE_EXL3_3:  ftype = LLAMA_FTYPE_MOSTLY_EXL3;    break;
+            case GGML_TYPE_EXL3_4:  ftype = LLAMA_FTYPE_MOSTLY_EXL3;    break;
+            case GGML_TYPE_EXL3_5:  ftype = LLAMA_FTYPE_MOSTLY_EXL3;    break;
+            case GGML_TYPE_EXL3_6:  ftype = LLAMA_FTYPE_MOSTLY_EXL3;    break;
+            case GGML_TYPE_EXL3_7:  ftype = LLAMA_FTYPE_MOSTLY_EXL3;    break;
+            case GGML_TYPE_EXL3_8:  ftype = LLAMA_FTYPE_MOSTLY_EXL3;    break;
             case GGML_TYPE_Q2_K:    ftype = LLAMA_FTYPE_MOSTLY_Q2_K;    break;
             case GGML_TYPE_Q3_K:    ftype = LLAMA_FTYPE_MOSTLY_Q3_K_M;  break;
             case GGML_TYPE_Q4_K:    ftype = LLAMA_FTYPE_MOSTLY_Q4_K_M;  break;

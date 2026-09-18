@@ -459,6 +459,7 @@ enum llm_tensor {
     LLM_TENSOR_OUTPUT,
     LLM_TENSOR_OUTPUT_NORM,
     LLM_TENSOR_OUTPUT_NORM_LFM2, // fix for wrong tensor name
+    LLM_TENSOR_EXL3_HAD128,      // EXL3: shared 128x128 Sylvester Hadamard / sqrt(128), f32
     LLM_TENSOR_ROPE_FREQS,
     LLM_TENSOR_ROPE_FACTORS_LONG,
     LLM_TENSOR_ROPE_FACTORS_SHORT,

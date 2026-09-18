@@ -1783,6 +1783,54 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
         }
     }
+    // EXL3 (exllamav3 trellis) side tensors: every EXL3 weight W[K, N] carries .suh (K) and .svh (N) f32 vectors,
+    // and the file carries one shared 128x128 Hadamard (exl3_had128.weight). See build_lora_mm.
+    {
+        auto exl3_side_tensors = [&](ggml_tensor * w, llm_tensor t, int bid) {
+            // decide from the FILE, not the field: a weight this context skips (e.g. the nextn layer in the main
+            // context, or the trunk in the MTP context) still has .suh/.svh in the file that must be counted
+            const ggml_tensor * meta = ml.get_tensor_meta(tn(t, "weight", bid).str().c_str());
+            if (!meta || ggml_exl3_bits(meta->type) == 0) {
+                return;
+            }
+            if (!w) {
+                const int skip = TENSOR_NOT_REQUIRED | TENSOR_SKIP;
+                create_tensor(tn(t, "suh", bid), {meta->ne[0]}, skip);
+                create_tensor(tn(t, "svh", bid), {meta->ne[1]}, skip);
+                return;
+            }
+            GGML_ASSERT(ggml_exl3_bits(w->type) != 0);
+            exl3_side side;
+            side.suh = create_tensor(tn(t, "suh", bid), {w->ne[0]}, 0);
+            side.svh = create_tensor(tn(t, "svh", bid), {w->ne[1]}, 0);
+            exl3_sides[w] = side;
+        };
+        exl3_side_tensors(output, LLM_TENSOR_OUTPUT, -1);
+        for (int i = 0; i < n_layer_all; ++i) {
+            auto & layer = layers[i];
+            exl3_side_tensors(layer.wq,        LLM_TENSOR_ATTN_Q,    i);
+            exl3_side_tensors(layer.wk,        LLM_TENSOR_ATTN_K,    i);
+            exl3_side_tensors(layer.wv,        LLM_TENSOR_ATTN_V,    i);
+            exl3_side_tensors(layer.wo,        LLM_TENSOR_ATTN_OUT,  i);
+            exl3_side_tensors(layer.wqkv,      LLM_TENSOR_ATTN_QKV,  i);
+            exl3_side_tensors(layer.wqkv_gate, LLM_TENSOR_ATTN_GATE, i);
+            exl3_side_tensors(layer.ffn_gate,  LLM_TENSOR_FFN_GATE,  i);
+            exl3_side_tensors(layer.ffn_up,    LLM_TENSOR_FFN_UP,    i);
+            exl3_side_tensors(layer.ffn_down,  LLM_TENSOR_FFN_DOWN,  i);
+            exl3_side_tensors(layer.ssm_in,    LLM_TENSOR_SSM_IN,    i);
+            exl3_side_tensors(layer.ssm_out,   LLM_TENSOR_SSM_OUT,   i);
+            exl3_side_tensors(layer.ssm_alpha, LLM_TENSOR_SSM_ALPHA, i);
+            exl3_side_tensors(layer.ssm_beta,  LLM_TENSOR_SSM_BETA,  i);
+            exl3_side_tensors(layer.nextn.eh_proj,          LLM_TENSOR_NEXTN_EH_PROJ,          i);
+            exl3_side_tensors(layer.nextn.shared_head_head, LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, i);
+        }
+        if (ml.get_tensor_meta(tn(LLM_TENSOR_EXL3_HAD128, "weight").str().c_str()) != nullptr) {
+            exl3_had128 = create_tensor(tn(LLM_TENSOR_EXL3_HAD128, "weight"), {128, 128}, exl3_sides.empty() ? (TENSOR_NOT_REQUIRED | TENSOR_SKIP) : 0);
+            LLAMA_LOG_INFO("%s: EXL3 weights: %zu tensors with .suh/.svh side vectors, shared 128-block Hadamard loaded\n",
+                    __func__, exl3_sides.size());
+        }
+    }
+
     ml.done_getting_tensors();
 
     // Tied NVFP4 output is valid when no separate LM-head scale tensors are present.
@@ -1954,6 +2002,14 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
     return ml.create_tensor(
         hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
         tn, ne, flags);
+}
+
+const llama_model::exl3_side * llama_model::exl3_side_of(const ggml_tensor * w) const {
+    if (exl3_sides.empty() || w == nullptr) {
+        return nullptr;
+    }
+    const auto it = exl3_sides.find(w);
+    return it == exl3_sides.end() ? nullptr : &it->second;
 }
 
 std::string llama_model::arch_name() const {

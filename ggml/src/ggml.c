@@ -773,6 +773,62 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_q6_cr,
         .from_float_ref           = (ggml_from_float_t) quantize_row_q6_cr_ref,
     },
+    [GGML_TYPE_EXL3_2] = {
+        .type_name                = "exl3_2",
+        .blck_size                = 256,
+        .type_size                = 32 * 2,
+        .is_quantized             = true,
+        .to_float                 = NULL, // not row-addressable: ggml_exl3_dequantize_row_group
+        .from_float_ref           = NULL,
+    },
+    [GGML_TYPE_EXL3_3] = {
+        .type_name                = "exl3_3",
+        .blck_size                = 256,
+        .type_size                = 32 * 3,
+        .is_quantized             = true,
+        .to_float                 = NULL, // not row-addressable: ggml_exl3_dequantize_row_group
+        .from_float_ref           = NULL,
+    },
+    [GGML_TYPE_EXL3_4] = {
+        .type_name                = "exl3_4",
+        .blck_size                = 256,
+        .type_size                = 32 * 4,
+        .is_quantized             = true,
+        .to_float                 = NULL, // not row-addressable: ggml_exl3_dequantize_row_group
+        .from_float_ref           = NULL,
+    },
+    [GGML_TYPE_EXL3_5] = {
+        .type_name                = "exl3_5",
+        .blck_size                = 256,
+        .type_size                = 32 * 5,
+        .is_quantized             = true,
+        .to_float                 = NULL, // not row-addressable: ggml_exl3_dequantize_row_group
+        .from_float_ref           = NULL,
+    },
+    [GGML_TYPE_EXL3_6] = {
+        .type_name                = "exl3_6",
+        .blck_size                = 256,
+        .type_size                = 32 * 6,
+        .is_quantized             = true,
+        .to_float                 = NULL, // not row-addressable: ggml_exl3_dequantize_row_group
+        .from_float_ref           = NULL,
+    },
+    [GGML_TYPE_EXL3_7] = {
+        .type_name                = "exl3_7",
+        .blck_size                = 256,
+        .type_size                = 32 * 7,
+        .is_quantized             = true,
+        .to_float                 = NULL, // not row-addressable: ggml_exl3_dequantize_row_group
+        .from_float_ref           = NULL,
+    },
+    [GGML_TYPE_EXL3_8] = {
+        .type_name                = "exl3_8",
+        .blck_size                = 256,
+        .type_size                = 32 * 8,
+        .is_quantized             = true,
+        .to_float                 = NULL, // not row-addressable: ggml_exl3_dequantize_row_group
+        .from_float_ref           = NULL,
+    },
     [GGML_TYPE_MXFP4] = {
         .type_name                = "mxfp4",
         .blck_size                = QK_MXFP4,
@@ -1425,6 +1481,10 @@ bool ggml_is_quantized(enum ggml_type type) {
     assert(type >= 0);
     assert(type < GGML_TYPE_COUNT);
     return type_traits[type].is_quantized;
+}
+
+int ggml_exl3_bits(enum ggml_type type) {
+    return (type >= GGML_TYPE_EXL3_2 && type <= GGML_TYPE_EXL3_8) ? 2 + (int) (type - GGML_TYPE_EXL3_2) : 0;
 }
 
 const char * ggml_op_name(enum ggml_op op) {

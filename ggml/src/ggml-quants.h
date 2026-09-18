@@ -58,6 +58,12 @@ GGML_API void dequantize_row_q8_cr(const block_q8_cr * GGML_RESTRICT x, float * 
 GGML_API void dequantize_row_q5_cr(const block_q5_cr * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API void dequantize_row_q6_cr(const block_q6_cr * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 
+// EXL3 (exllamav3 trellis) reference decoder. `data` is the whole [K, N] tensor (ggml ne0 = K, ne1 = N rows) in the
+// native exllamav3 layout [K/16][N/16][16*bits] int16; decodes rows [16*g, 16*g + 16) to y[16][K] f32 (row-major).
+// Mirrors exllamav3 exl3_dq.cuh (16-bit window at bit ((t+257)*bits-16) mod 256*bits of the MSB-first word stream)
+// and reconstruct.cu (mul1 codebook, tile lane layout). Codebook values only: suh/svh/Hadamard are NOT applied.
+GGML_API void ggml_exl3_dequantize_row_group(const void * GGML_RESTRICT data, int64_t K, int64_t N, int bits, int64_t g, float * GGML_RESTRICT y);
+
 GGML_API void dequantize_row_mxfp4(const block_mxfp4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API void dequantize_row_nvfp4(const block_nvfp4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 

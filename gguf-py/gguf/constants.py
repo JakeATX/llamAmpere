@@ -5763,6 +5763,13 @@ class GGMLQuantizationType(IntEnum):
     Q8_CR   = 48
     Q5_CR   = 49
     Q6_CR   = 50
+    EXL3_2  = 51
+    EXL3_3  = 52
+    EXL3_4  = 53
+    EXL3_5  = 54
+    EXL3_6  = 55
+    EXL3_7  = 56
+    EXL3_8  = 57
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -5970,6 +5977,15 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.Q5_CR:   (256, 8 * (2 + 4 + 16)),
     # same layout as Q6_K (256 elements/block), but the rows are rotated in groups of 256 (ConvRot)
     GGMLQuantizationType.Q6_CR:   (256, 2 + 128 + 64 + 16),   # block_q6_K: d(2)+ql(128)+qh(64)+scales(16)
+    # EXL3 trellis weights (exllamav3 format): 16x16 tiles, 256*bits bits per tile, 16-row tile-major, no block scales;
+    # side tensors <name>.suh / <name>.svh (f16) carry the input/output sign+scale vectors. mul_mat src0 only.
+    GGMLQuantizationType.EXL3_2:  (256, 32 * 2),
+    GGMLQuantizationType.EXL3_3:  (256, 32 * 3),
+    GGMLQuantizationType.EXL3_4:  (256, 32 * 4),
+    GGMLQuantizationType.EXL3_5:  (256, 32 * 5),
+    GGMLQuantizationType.EXL3_6:  (256, 32 * 6),
+    GGMLQuantizationType.EXL3_7:  (256, 32 * 7),
+    GGMLQuantizationType.EXL3_8:  (256, 32 * 8),
 }
 
 

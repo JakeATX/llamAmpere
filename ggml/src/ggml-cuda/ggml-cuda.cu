@@ -69,6 +69,7 @@
 #include "ggml-cuda/set-rows.cuh"
 #include "ggml-cuda/turbo-wht.cuh"
 #include "ggml-cuda/mmvq-tq.cuh"
+#include "ggml-cuda/exl3.cuh"
 #include "ggml-cuda/chain.cuh"
 #include "ggml-cuda/pad_reflect_1d.cuh"
 #include "ggml-cuda/solve_tri.cuh"
@@ -1914,6 +1915,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 
     const bool is_tq_weight = (src0->type == GGML_TYPE_TQ4_1S || src0->type == GGML_TYPE_TQ3_1S);
     bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear && !is_tq_weight &&
+                             ggml_exl3_bits(src0->type) == 0 &&
                              src0->type != GGML_TYPE_Q8_CR &&
                              src0->type != GGML_TYPE_Q5_CR &&
                              src0->type != GGML_TYPE_Q6_CR &&
@@ -2076,6 +2078,12 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 
     const int32_t hint = ggml_get_op_params_i32(dst, 1);
     if (hint == GGML_HINT_SRC0_IS_HADAMARD && ggml_cuda_op_fwht(ctx, src1, dst)) {
+        return;
+    }
+
+    // EXL3 trellis weights: whole-tensor reconstruct + cuBLAS (M1 reference path); never mmvq/mmq/mmf
+    if (ggml_exl3_bits(src0->type) != 0) {
+        ggml_cuda_mul_mat_exl3(ctx, src0, src1, dst);
         return;
     }
 
@@ -5781,6 +5789,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 }
                 if (b->type == GGML_TYPE_F16 && a->type != GGML_TYPE_F16) {
                     return false;
+                }
+                if (ggml_exl3_bits(a->type) != 0) {
+                    // EXL3: 2-D weights, f32 contiguous activations/output, no MoE
+                    return op->op == GGML_OP_MUL_MAT && b->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32
+                        && a->ne[2] == 1 && a->ne[3] == 1 && a->ne[0] % 16 == 0 && a->ne[1] % 16 == 0
+                        && ggml_is_contiguous(b) && ggml_is_contiguous(op);
                 }
                 if (a->type == GGML_TYPE_Q8_CR || a->type == GGML_TYPE_Q5_CR || a->type == GGML_TYPE_Q6_CR) {
 #ifdef GGML_USE_MUSA
