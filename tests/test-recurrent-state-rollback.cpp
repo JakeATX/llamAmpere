@@ -303,6 +303,40 @@ static int run_rb1b_gates(const common_params & params, llama_model * model,
         }
     }
 
+    // --- Gate E: the negative seq_id wildcard. seq_rm(-1, -1, -1) means "every
+    // sequence, whole range" and must succeed; a partial-range wildcard
+    // (seq_rm(-1, p0 > 0, -1)) is a rollback that cannot be applied per sequence
+    // and must be refused. Before the fix, seq_id == -1 fell through the
+    // `seq_id >= n_seq_max` guard as an unsigned compare and returned false.
+    {
+        llama_context * ctx_e = make_ctx(params, model);
+        if (ctx_e == nullptr) { fprintf(stderr, "rb1b : gate E context init failed\n"); return 1; }
+        bool ok = decode_tokens_seq(ctx_e, tokens, n_tokens, 0);
+        llama_memory_t mem = llama_get_memory(ctx_e);
+        const bool partial_refused = ok && !llama_memory_seq_rm(mem, -1, 1, -1);
+        const bool full_ok         = ok && llama_memory_seq_rm(mem, -1, -1, -1);
+        const llama_pos pos_after  = ok ? llama_memory_seq_pos_max(mem, 0) : 0;
+        // the context must be usable again afterwards
+        const bool redecode_ok = ok && decode_tokens_seq(ctx_e, tokens, n_tokens, 0);
+        llama_free(ctx_e);
+        if (!ok) {
+            fprintf(stderr, "rb1b : gate E FAIL -- decode failed\n");
+            failures++;
+        } else if (!partial_refused) {
+            fprintf(stderr, "rb1b : gate E FAIL -- partial wildcard seq_rm(-1, 1, -1) was accepted\n");
+            failures++;
+        } else if (!full_ok || pos_after != -1) {
+            fprintf(stderr, "rb1b : gate E FAIL -- seq_rm(-1, -1, -1) returned %s, pos_max after = %d\n",
+                full_ok ? "true" : "false", (int) pos_after);
+            failures++;
+        } else if (!redecode_ok) {
+            fprintf(stderr, "rb1b : gate E FAIL -- decode after seq_rm(-1, -1, -1) failed\n");
+            failures++;
+        } else {
+            fprintf(stderr, "rb1b : gate E PASS -- seq_rm(-1,-1,-1) clears, partial wildcard refused\n");
+        }
+    }
+
     fprintf(stderr, "rb1b : %d gate failure(s)\n", failures);
     return failures == 0 ? 0 : 1;
 }
@@ -432,8 +466,13 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
 
         ok = ok && llama_memory_seq_rm(llama_get_memory(ctx_roll), (llama_seq_id) s, p0, -1);
 
-        // a second partial removal while one is pending must be refused
-        ok = ok && !llama_memory_seq_rm(llama_get_memory(ctx_roll), (llama_seq_id) s, p0 - 1, -1);
+        // upstream refuses any second partial removal while one is pending (single-use rs_idx);
+        // in this tree rollbacks compose (rb1b gate B), bounded by what the ring still holds.
+        // Here 8 slots were filled and 3 are pending, so a further removal of 8 (deeper than
+        // the 5 remaining) must be refused and must leave the pending rollback untouched.
+        ok = ok && !llama_memory_seq_rm(llama_get_memory(ctx_roll), (llama_seq_id) s,
+                                        p0 - (llama_pos) llama_n_rs_seq(ctx_roll), -1);
+        ok = ok && llama_memory_seq_pos_max(llama_get_memory(ctx_roll), (llama_seq_id) s) == (llama_pos) p0 - 1;
     }
     if (!ok) {
         fprintf(stderr, "%s : multi-seq prefill/rollback failed\n", __func__);

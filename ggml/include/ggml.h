@@ -2677,13 +2677,17 @@ extern "C" {
     //
     // the output packs the attention scores [S_v, H_v, n_tokens, n_seqs] followed by K trailing
     // snapshots, most-recent first (slot 0 = final state, slot s = state s tokens back). K == 1
-    // keeps only the final state; when n_tokens < K only slots 0..n_tokens-1 are written.
+    // keeps only the final state; when n_tokens < K only slots 0..n_tokens-1 are written (the
+    // remaining slots are left untouched -- they hold whatever the output buffer contained).
     //
     // emit_mode selects what a snapshot slot holds:
     //   0 (default) - a full recurrent state [S_v, S_v, H_v] per slot, as above.
     //   1 (ingredients) - the small per-token (k, v, g, beta) that produced that step's state,
     //     each broadcast/padded to width S_v, packed as 4 rows of [S_v, H_v] per slot (k, v, g,
-    //     beta in that order), followed by ONE extra full [S_v, S_v, H_v] block (same layout as
+    //     beta in that order). Unlike emit_mode == 0 the slots are CHRONOLOGICAL and right-aligned:
+    //     slot K-1 is the newest token, slot K-1-s the token s steps before it, so when
+    //     n_tokens < K only slots K-n_tokens..K-1 are written and slots 0..K-n_tokens-1 are left
+    //     untouched. These are followed by ONE extra full [S_v, S_v, H_v] block (same layout as
     //     emit_mode == 0's slot 0) holding the true final state after all n_tokens -- a fixed
     //     once-per-call cost, not scaled by K. Replaying the K ingredients through another call to
     //     this op with K == 1, using the checkpoint state s tokens back as `state`, reconstructs
