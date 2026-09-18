@@ -11885,8 +11885,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int nb : {1, 2, 4, 5, 7, 8}) { // 5/7/8: DF3 width-8 fused verify (MTP-4 pad and DFlash2 block 8)
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_TURBO3_0));
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
-            // same shape with a tq6 K cache (6-bit) over a turbo3 V cache
+            // same shape with a tq6 K cache (6-bit) over a turbo3 V cache, at both fused head dims
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TQ6_0, GGML_TYPE_TURBO3_0));
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TQ6_0, GGML_TYPE_TURBO3_0));
         }
     }
     // odd KV lengths so the fused q8_0/q8_0 path exercises its oob (unstaged) tail tiles too
