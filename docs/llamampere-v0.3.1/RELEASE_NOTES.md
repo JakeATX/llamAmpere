@@ -119,8 +119,13 @@ block per column per row and spilled 540 to 1260 bytes per thread, which made a 
 much as 4.4 single-token steps. Rows per block at widths 2 to 4 drop from 8 to 2 to pay for the
 registers that buys. And the dp4a products now run on the unsigned digits 0 to 2, with the exact
 per-sub-block activation sum subtracted once at the end, instead of a byte-wise correction on every
-four-weight group; that alone cut the fused width-1 kernel from 3,224 to 2,520 SASS instructions and took single-token decode at 16K from 55.5 to 64.3 tok/s (2K check, same fixture and seed family). All of
-it is bit-exact: the 16-token greedy hash is unchanged and `test-backend-ops` reports zero failures.
+four-weight group; that alone cut the fused width-1 kernel from 3,224 to 2,520 SASS instructions and took single-token decode at 16K from 55.5 to 64.3 tok/s (2K check, same fixture and seed family). The
+width-1 path is bit-exact: the 16-token greedy hash is unchanged and `test-backend-ops` reports zero
+failures. The reuse kernel at widths 2 to 8 accumulates in a different order from the width-1 kernel, so a
+greedy speculative continuation can part from the single-token continuation at a near-tie; on a 256-token
+greedy check it did once, and with `GGML_CUDA_SM86_PTQ1_REUSE=0` the speculative text matched the
+single-token text again. At temperature 1.0 this is invisible; it is noted here so a greedy diff is not
+mistaken for a defect. PQ2_0 has no such path and its speculative and single-token texts agree.
 
 **PQ2_0, the byte-permute unpack (new).** PQ2_0 stores the same ternary values and the same block scales
 as PTQ1_0 in a 2-bit container, so it trades about 1.1 GB of VRAM for an unpack that is a single byte
