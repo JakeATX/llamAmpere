@@ -686,6 +686,20 @@ static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, co
     FATTN_VEC_CASES_ALL_D(TURBO4_0, TURBO2_0)
     FATTN_VEC_CASES_ALL_D(TURBO2_0, TURBO4_0)
 
+    // tq6 blocks hold 128 values: head dim 64 has no instance (see the cmake FA_TQ6_COMBINATIONS list)
+    FATTN_VEC_CASE(128, TQ6_0,    TQ6_0)
+    FATTN_VEC_CASE(256, TQ6_0,    TQ6_0)
+    FATTN_VEC_CASE(128, TQ6_0,    TURBO3_0)
+    FATTN_VEC_CASE(256, TQ6_0,    TURBO3_0)
+    FATTN_VEC_CASE(128, TQ6_0,    Q8_0)
+    FATTN_VEC_CASE(256, TQ6_0,    Q8_0)
+    FATTN_VEC_CASE(128, Q8_0,     TQ6_0)
+    FATTN_VEC_CASE(256, Q8_0,     TQ6_0)
+    FATTN_VEC_CASE(128, TQ6_0,    F16)
+    FATTN_VEC_CASE(256, TQ6_0,    F16)
+    FATTN_VEC_CASE(128, F16,      TQ6_0)
+    FATTN_VEC_CASE(256, F16,      TQ6_0)
+
     return nullptr;
 }
 
@@ -734,6 +748,9 @@ static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
         case GGML_TYPE_TURBO4_0:
             // turbo KV types; head-dim geometry is validated separately in
             // ggml_cuda_get_best_fattn_kernel (multiples of 64 only)
+            return true;
+        case GGML_TYPE_TQ6_0:
+            // tq6 KV type; head dim must be a multiple of 128 (block size), checked below
             return true;
         default:
             return false;
@@ -836,6 +853,11 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         };
         if ((is_turbo(K->type) && K->ne[0] % 64 != 0) ||
             (is_turbo(V->type) && V->ne[0] % 64 != 0)) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
+        // tq6 packs 128 values per block and is only instantiated for head dims 128 and 256
+        if ((K->type == GGML_TYPE_TQ6_0 && K->ne[0] % 128 != 0) ||
+            (V->type == GGML_TYPE_TQ6_0 && V->ne[0] % 128 != 0)) {
             return BEST_FATTN_KERNEL_NONE;
         }
     }
@@ -1043,7 +1065,8 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         const ggml_tensor * V = dst->src[2];
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
         const bool turbo_matched = (K->type == V->type &&
-            (K->type == GGML_TYPE_TURBO4_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO2_0));
+            (K->type == GGML_TYPE_TURBO4_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO2_0 ||
+             K->type == GGML_TYPE_TQ6_0));
         if (ggml_cuda_turbo_mma_fused() && turbo_matched
                 && Q->ne[1] <= 4 && V->ne[0] == Q->ne[0] && turing_mma_available(cc)) {
             ggml_cuda_fattn_path_note("turbo_fused_gate", dst, -1);
@@ -1052,6 +1075,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                     case GGML_TYPE_TURBO4_0: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<128, 128, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0>(ctx, dst); return;
                     case GGML_TYPE_TURBO3_0: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<128, 128, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0>(ctx, dst); return;
                     case GGML_TYPE_TURBO2_0: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<128, 128, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO2_0>(ctx, dst); return;
+                    case GGML_TYPE_TQ6_0:    ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<128, 128, GGML_TYPE_TQ6_0,    GGML_TYPE_TQ6_0>(ctx, dst); return;
                     default: break;
                 }
             }
@@ -1059,6 +1083,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                 switch (K->type) {
                     case GGML_TYPE_TURBO4_0: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0>(ctx, dst); return;
                     case GGML_TYPE_TURBO3_0: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0>(ctx, dst); return;
+                    case GGML_TYPE_TQ6_0:    ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_TQ6_0,    GGML_TYPE_TQ6_0>(ctx, dst); return;
                     // turbo2 + head_dim 256: intentionally NO fused case (routes to VEC via
                     // default below). At 2-bit KV the fused path's GQA-pack saving is tiny while the
                     // dequant/no-pipeline overhead is unchanged, so it is neutral on high-BW GPUs and

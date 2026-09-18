@@ -105,13 +105,18 @@ function(ggml_cuda_fattn_vec_instances DIR OUT_SRCS)
             endif()
         endforeach()
     endforeach()
+    # tq6_0 (6-bit) is kept out of the turbo cross-product on purpose: it only needs the
+    # combinations a tq6 K cache can actually be paired with, and every extra pair is three
+    # another instance file to compile.
+    set(FA_TQ6_COMBINATIONS tq6_0-tq6_0 tq6_0-turbo3_0 tq6_0-q8_0 tq6_0-f16 q8_0-tq6_0 f16-tq6_0)
+    list(APPEND FA_TURBO_COMBINATIONS ${FA_TQ6_COMBINATIONS})
     list(REMOVE_DUPLICATES FA_TURBO_COMBINATIONS)
     list(APPEND FA_COMBINATIONS ${FA_TURBO_COMBINATIONS})
     list(REMOVE_DUPLICATES FA_COMBINATIONS)
 
     string(REPLACE ";" "," FA_QUANTS_DEFINE "${FA_QUANTS}")
     add_compile_definitions(GGML_CUDA_FA_QUANTS="${FA_QUANTS_DEFINE}")
-    set(FA_ALL_TYPES ${FA_TYPES} ${FA_TURBO_TYPES})
+    set(FA_ALL_TYPES ${FA_TYPES} ${FA_TURBO_TYPES} tq6_0)
     foreach (TYPE_V IN LISTS FA_ALL_TYPES)
         foreach (TYPE_K IN LISTS FA_ALL_TYPES)
             if ("${TYPE_K}-${TYPE_V}" IN_LIST FA_COMBINATIONS)

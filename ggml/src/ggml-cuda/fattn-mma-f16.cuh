@@ -615,6 +615,68 @@ static __device__ __forceinline__ void flash_attn_ext_turbo4_load_tile(
     }
 }
 
+// tq6 (6-bit PolarQuant) tile loader for the MMA decode path. Same row / half2-col
+// layout as the turbo4 loader, block_tq6_0 = norm + qs[64] (low nibbles) + qh[32] (high
+// 2 bits, 4 codes per byte).
+//
+// Layout proof: half2 column c of a row holds elements (2c, 2c+1). Element j has its low
+// nibble in qs[j/2] nibble (j&1) and its high 2 bits in qh[j/4] at shift (j%4)*2. For
+// j = 2c and j+1 both nibbles are in qs[c] and both 2-bit fields are in qh[c/2], at
+// shifts (c%2)*4 and (c%2)*4+2. So one qs byte plus one qh byte yield the half2 for
+// tile column c.
+//
+// Unlike turbo4 this does NOT materialise a scaled[] centroid array in registers: 64
+// entries per block would blow the MMA kernel register budget (and spill). The 6-bit code
+// indexes TQ6_CENTROIDS (__constant__, from turbo-quant.cuh) directly and the norm
+// multiply is folded into the fp16 conversion.
+template<int stride_tile, bool swz, int nbatch_fa, int nthreads, bool oob_check>
+static __device__ __forceinline__ void flash_attn_ext_tq6_load_tile(
+        const char * const __restrict__ KV_raw, half2 * const __restrict__ tile_KV,
+        const int D2, const int stride_bytes, const int col_offset, const int i_sup) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    const int tid = threadIdx.y * warp_size + threadIdx.x;
+#pragma unroll
+    for (int row = tid; row < nbatch_fa; row += nthreads) {
+        if (oob_check && row >= i_sup) {
+            for (int c = 0; c < D2; ++c) {
+                turbo_store_h2<stride_tile, swz>(tile_KV, row, c, make_half2(0.0f, 0.0f));
+            }
+            continue;
+        }
+        const char * row_ptr = KV_raw + (int64_t)row * stride_bytes;
+        int c = 0;
+        while (c < D2) {
+            const int col         = col_offset + c;                // absolute half2 column
+            const int blk_idx     = col / (QK_TQ6 / 2);            // 64 half2 cols per tq6 block
+            const int blk_col_end = (blk_idx + 1) * (QK_TQ6 / 2) - col_offset;
+            const int c_end       = min(D2, blk_col_end);
+
+            const block_tq6_0 * blk = (const block_tq6_0 *)(row_ptr) + blk_idx;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+            const float norm = __half2float(__ldcs((const half *)&blk->norm));
+#else
+            const float norm = __half2float(blk->norm);
+#endif
+
+            for (; c < c_end; ++c) {
+                const int in_blk = (col_offset + c) % (QK_TQ6 / 2);
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+                const uint8_t qs_byte = __ldcs(&blk->qs[in_blk]);
+                const uint8_t qh_byte = __ldcs(&blk->qh[in_blk / 2]);
+#else
+                const uint8_t qs_byte = blk->qs[in_blk];
+                const uint8_t qh_byte = blk->qh[in_blk / 2];
+#endif
+                const int hshift = (in_blk % 2) * 4;
+                const int idx0 = ( qs_byte       & 0xF) | (((qh_byte >> (hshift + 0)) & 0x3) << 4);
+                const int idx1 = ((qs_byte >> 4) & 0xF) | (((qh_byte >> (hshift + 2)) & 0x3) << 4);
+                turbo_store_h2<stride_tile, swz>(tile_KV, row, c,
+                    make_half2(TQ6_CENTROIDS[idx0] * norm, TQ6_CENTROIDS[idx1] * norm));
+            }
+        }
+    }
+}
+
 // turbo3 (3-bit PolarQuant) tile loader for the MMA decode path. 3-bit index = 2 low
 // bits (qs, 4/byte) + 1 high bit (signs, 8/byte); reconstruction byte-identical to
 // vec_dot_fattn_vec_KQ_turbo3_0. Same row / half2-col layout as the turbo4 loader.
@@ -1124,8 +1186,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             // turbo4: stride_K is a RAW BYTE pitch (nb11). Dequantize the (sub)tile of
             // K columns [k0_start, k0_start+k0_diff) into SRAM, then a single sync.
             static_assert(type_K == GGML_TYPE_Q8_0 || type_K == GGML_TYPE_TURBO4_0 ||
-                          type_K == GGML_TYPE_TURBO3_0 || type_K == GGML_TYPE_TURBO2_0,
-                          "only q8_0 or turbo2/3/4 K supported on the compressed MMA path");
+                          type_K == GGML_TYPE_TURBO3_0 || type_K == GGML_TYPE_TURBO2_0 ||
+                          type_K == GGML_TYPE_TQ6_0,
+                          "only q8_0, turbo2/3/4 or tq6 K supported on the compressed MMA path");
             static_assert(nbatch_K2 == DKQ/2, "turbo MMA load assumes full-row K tiles (nbatch_K2==DKQ/2)");
             constexpr int nthreads_turbo = nwarps * ggml_cuda_get_physical_warp_size();
             const char * K_raw = (const char *) K_h2 + int64_t(k_VKQ_0) * stride_K;
@@ -1141,6 +1204,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                     (K_raw, tile_K, K_pitch, k0_start, k_VKQ_sup);
             } else if constexpr (type_K == GGML_TYPE_TURBO4_0) {
                 flash_attn_ext_turbo4_load_tile<stride_tile_K, swz_K, nbatch_fa, nthreads_turbo, oob_check>
+                    (K_raw, tile_K, k0_diff, stride_K, k0_start, k_VKQ_sup);
+            } else if constexpr (type_K == GGML_TYPE_TQ6_0) {
+                flash_attn_ext_tq6_load_tile<stride_tile_K, swz_K, nbatch_fa, nthreads_turbo, oob_check>
                     (K_raw, tile_K, k0_diff, stride_K, k0_start, k_VKQ_sup);
             } else if constexpr (type_K == GGML_TYPE_TURBO3_0) {
                 flash_attn_ext_turbo3_load_tile<stride_tile_K, swz_K, nbatch_fa, nthreads_turbo, oob_check>
@@ -1511,8 +1577,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             const int i0_diff = i0_stop - i0_start;
             // turbo4 V: stride_V is a RAW BYTE pitch (nb21), V_is_K_view is false.
             // Dequantize the V (sub)tile of columns [i0_start/2, ...) into SRAM, then sync.
-            static_assert(type_V == GGML_TYPE_Q8_0 || type_V == GGML_TYPE_TURBO4_0 || type_V == GGML_TYPE_TURBO3_0 || type_V == GGML_TYPE_TURBO2_0,
-                          "only q8_0 or turbo2/3/4 V supported on the MMA turbo path");
+            static_assert(type_V == GGML_TYPE_Q8_0 || type_V == GGML_TYPE_TURBO4_0 || type_V == GGML_TYPE_TURBO3_0 ||
+                          type_V == GGML_TYPE_TURBO2_0 || type_V == GGML_TYPE_TQ6_0,
+                          "only q8_0, turbo2/3/4 or tq6 V supported on the MMA turbo path");
             static_assert(!V_is_K_view, "turbo MMA path never uses V_is_K_view");
             static_assert(nbatch_V2 == DV/2, "turbo MMA load assumes full-row V tiles (nbatch_V2==DV/2)");
             constexpr int nthreads_turbo = nwarps * ggml_cuda_get_physical_warp_size();
@@ -1528,6 +1595,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                     (V_raw, tile_V, V_pitch, i0_start/2, k_VKQ_sup);
             } else if constexpr (type_V == GGML_TYPE_TURBO4_0) {
                 flash_attn_ext_turbo4_load_tile<stride_tile_V, swz_V, nbatch_fa, nthreads_turbo, oob_check>
+                    (V_raw, tile_V, i0_diff/2, stride_V, i0_start/2, k_VKQ_sup);
+            } else if constexpr (type_V == GGML_TYPE_TQ6_0) {
+                flash_attn_ext_tq6_load_tile<stride_tile_V, swz_V, nbatch_fa, nthreads_turbo, oob_check>
                     (V_raw, tile_V, i0_diff/2, stride_V, i0_start/2, k_VKQ_sup);
             } else if constexpr (type_V == GGML_TYPE_TURBO3_0) {
                 if constexpr (type_K == GGML_TYPE_Q8_0) {
