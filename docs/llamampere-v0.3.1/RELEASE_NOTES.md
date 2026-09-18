@@ -1,0 +1,177 @@
+# llamAmpere v0.3.1 release notes
+
+## Summary
+
+v0.3.1 is a format release. v0.3 made one quant fast; v0.3.1 widens the fork to three more weight
+formats and keeps the v0.3 decode stack underneath them unchanged.
+
+Three things are new. EXL3 (exllamav3 trellis) weights are now GGUF-native types with an SM86 CUDA
+decode path, so an exllamav3 checkpoint can be repacked and served by `llama-server` with no Python and
+no second runtime. Prism ML's Ternary Bonsai 2 27B runs on CPU and CUDA, with SM86 decode kernels for
+both of its ternary containers. The IQ3 MMVQ path gains an opt-in shared-memory codebook. The branch is
+also a full upstream catch-up: 772 commits of upstream llama.cpp and TurboQuant ahead of the v0.3 base.
+
+Nothing in this release changes the ATX IQ4_XS configuration from v0.3. The flags in
+[QWEN_AMPERE.md](../../QWEN_AMPERE.md#build-and-run) are the same, and all v0.3 numbers stand.
+
+## What is new
+
+### EXL3 weights as GGUF-native types
+
+Seven ggml types, `GGML_TYPE_EXL3_2` through `GGML_TYPE_EXL3_8` (ids 51 to 57), a CPU reference decode,
+a CUDA trellis-direct GEMV for up to 16 activation columns, a reconstruct-plus-cuBLAS path for prefill,
+and a converter, verifier and numpy reference decoder under `scripts/exl3/`. The `.suh`/`.svh` side
+vectors and the 128-block Hadamard glue ride on the matmul node itself, so a whole EXL3 matmul is one
+graph node. The Qwen3.5/3.8 loader and graph also understand the fused-group layout (`attn_qkv`,
+`ffn_up = [gate | up]`) that the converter's `--fuse` writes, which turns two or three GEMVs per block
+into one.
+
+Measured on one RTX 3090 Ti with Qwen3.8-27B EXL3 4.0 bpw: 41.3 tok/s single-token greedy decode,
+81.27 tok/s (3 seeds, sd 0.39) at a 20K prompt and 73.72 (sd 0.59) at a 50K prompt with the model's MTP
+head at depth 4, temperature 1.0, 20,480-token cap. Peak whole-card VRAM 17,080 and 17,893 MiB. KL
+divergence to the reference implementation on the same weights is 0.000221 ± 0.000057 with the same top
+token on 99.6 % of positions, and the converter reconstructs its checked tensors with `max|Δ| = 0`.
+
+Full documentation, including conversion, verification and the known limits: [docs/exl3.md](../exl3.md).
+
+### Ternary Bonsai 2: PTQ1_0 and PQ2_0 SM86 decode kernels
+
+CPU and CUDA inference for Prism ML's Ternary Bonsai 2 27B, plus decode kernels for both containers.
+`PQ2_0` (2-bit codes) and `PTQ1_0` (5 trits per byte) hold bit-identical ternary values and scales; they
+differ only in packing. At 16K context on a 3090 Ti, `PQ2_0` decodes at 65 tok/s single-token and 100
+tok/s with the MTP drafter, `PTQ1_0` at 64 and 59 tok/s, for about 1.1 GB less peak VRAM (2K checks on one fixture; the full matrix on this build is pending). Both are
+bit-exact against the Prism reference: the 16-token greedy hash is unchanged.
+
+Model, build, validation and credits: [docs/bonsai2.md](../bonsai2.md).
+
+### IQ3 shared-memory codebook, opt-in
+
+`GGML_CUDA_SM86_IQ3_SMEM_GRID=1` stages the IQ3_XXS/IQ3_S grid into shared memory once per block instead
+of reading it from global memory per lookup. Same values, same accumulation order, bit-identical output
+(verified byte for byte on both types). Off by default, and only taken on cc 8.6.
+
+### Upstream sync
+
+This release branches from `ws/v0.3.1-upstream`, which is upstream llama.cpp and TurboQuant merged onto
+the v0.3 base: 772 commits ahead, with no fork commit left behind. One defect came in with that merge
+and is fixed here: `gguf-py/gguf/constants.py` had eight `MODEL_TENSOR` members defined twice
+(`HC_ATTN_NORM/DOWN/UP/INJECT`, `A_ENC_SE_CONV1/2`, `A_ENC_ASP_ATTN/TDNN`), which made `import gguf`
+fail outright with "already defined". Each is now declared once, as upstream master has it.
+
+One behaviour note carried over from the merge: `common_ngram_cache_save` takes a vocabulary id. The
+parameter defaults to "unknown", so existing callers are source-compatible, but `lookup-create` and
+`lookup` now stamp a real vocabulary id into the caches they write.
+
+## Per-format speed-up blurbs
+
+**IQ4_XS, the ATX path (from v0.3, unchanged here).** IQ4_XS is the fastest format on SM86 at the widths
+speculative verification actually runs, so the ATX recipe builds on it and the kernel work targets it.
+Two changes carry the speed. The MMVQ launch table became per-width instead of one entry for all widths,
+and `rows_per_cuda_block` is now 8 at the verify widths, so eight output rows share each activation load
+rather than each reloading it. Cross-column weight reuse means a block is unpacked once and dotted
+against every column in flight instead of being re-unpacked per column. The launch geometry is worth
++8.40 % on the kernel and +4.88 % at model level, and it is bit-exact.
+
+**IQ3_XXS and IQ3_S, shared-memory codebook (new, opt-in).** These types are issue-bound rather than
+bandwidth-bound: every weight costs a lookup into a codebook table that lives in global memory, and the
+dependent load is what the kernel waits on. The grid is small enough for both types that a block can
+cooperatively copy it into shared memory once and then read it at shared-memory latency for the rest of
+its work. The values and the accumulation order are unchanged, so output is bit-identical. In an
+env-toggled A/B in one binary at m=4096, k=14336, the win concentrates exactly where MTP verifies: IQ3_S
+is +10.07 % at width 4 and +9.13 % at width 2, IQ3_XXS +5.52 % and +5.25 %, and the win is gone by width
+5 to 8. It ships off by default because there is no end-to-end model-level measurement yet.
+
+**PTQ1_0, weight reuse and dp4a on digits (new).** PTQ1_0 packs five trits into a byte, so unpacking is
+a multiply-by-three digit extraction and the GEMV is ALU-bound rather than bandwidth-bound. Three
+changes. Verify widths 2 to 8 now run a cross-column reuse kernel: a 128-weight block is split over four
+lanes, each lane unpacks its quarter once and dots every column, where the upstream path re-unpacked the
+block per column per row and spilled 540 to 1260 bytes per thread, which made a width-4 verify cost as
+much as 4.4 single-token steps. Rows per block at widths 2 to 4 drop from 8 to 2 to pay for the
+registers that buys. And the dp4a products now run on the unsigned digits 0 to 2, with the exact
+per-sub-block activation sum subtracted once at the end, instead of a byte-wise correction on every
+four-weight group; that alone cut the fused width-1 kernel from 3,224 to 2,520 SASS instructions and took single-token decode at 16K from 55.5 to 64.3 tok/s (2K check, same fixture and seed family). All of
+it is bit-exact: the 16-token greedy hash is unchanged and `test-backend-ops` reports zero failures.
+
+**PQ2_0, the byte-permute unpack (new).** PQ2_0 stores the same ternary values and the same block scales
+as PTQ1_0 in a 2-bit container, so it trades about 1.1 GB of VRAM for an unpack that is a single byte
+permute per four weights instead of a multiply chain. That moves the kernel off the integer pipe and
+back onto bandwidth, which is where a decode kernel wants to be. It matters most under speculative
+decoding, because a width-4 verify re-reads the same weights and the byte-permute path carries almost no
+re-unpack cost: on the same 16K fixture, PQ2_0 goes from 65 tok/s single-token to 100 tok/s with the MTP
+drafter, where PTQ1_0 goes 64 to 59 after the dp4a rewrite (55 to 60 before it): on PTQ1_0 a width-4
+verify pass still costs about 2.85 single-token steps, so the drafter is roughly break-even there. The two containers were checked tensor by tensor and are a lossless
+re-container of each other, so this is pure packing, not a quality trade.
+
+**EXL3, the trellis GEMV (new).** The first working path reconstructed each whole weight matrix to f16
+and called cuBLAS, which is correct and slow: 20.1 tok/s. The shipped kernel decodes straight from the
+trellis stream. At 4 bits and under, a 16x16 tile is at most 32 words, so one lane loads one word and
+the second word covering its eight bit windows arrives by shuffle, turning four scattered loads per lane
+into one coalesced 128 B request per warp per tile. The decoded pairs then feed `mma.m16n8k16` tensor-core
+instructions, because the trellis tile's lane order already is the B fragment layout, which makes the
+cost per tile independent of the verify width. Finally the scale and Hadamard glue moved into two small
+kernels attached to the matmul node instead of five graph ops, and the output glue reduces four split-K
+rows in flight rather than one serial chain, taking it from 12.9 to 2.57 microseconds at width 5. Net:
+20.1 to 41.3 tok/s single-token and 56.7 to 76.1 in an MTP smoke, with byte-identical greedy output at
+every step.
+
+## Deferred to v0.4
+
+- **W58, the width 5 to 8 MMVQ launch tables.** Measured and tuned, not on this branch. The launch
+  geometry upstream drifted (`calc_nwarps` gained parameters), so the tables have to be re-expressed
+  against the new signature rather than applied as written.
+- **The n-gram speculative path.** The persistent lookup cache, the CLI options, the splice policy and
+  the draft-length statistics stay out of v0.3.1. Every n-gram policy measured so far loses to MTP
+  because verify widths 5 to 9 cost 2.2 to 3.1x on the current MMVQ, so this is gated on W58 landing.
+- **MTP depth 4 as a product default.** Depth 4 with `p-min 0` won the ship corpus and is the
+  recommended setting, but `common_params_speculative::n_max` is still 3 in the code. Changing the
+  default is a v0.4 change.
+- **Fused norm / FWHT / quantize on the ternary decode path.** The ternary decode issues about 2,063
+  kernel launches per token; the FWHT is 3.0 % of GPU time and `quantize_q8_1` 2.2 %, so fusing them
+  caps at roughly 5 % and is only worth doing bundled with a wider launch-count pass.
+- **PTQ1_0 MMQ J=128 prefill tiles.** `mmq.cuh` has J=128 tiles for PQ2_0 but PTQ1_0 stops at J=64:
+  843.5 against 1561 tok/s on pp512, which at 100K context is roughly 125 s of time-to-first-token
+  against 65 s.
+- **EXL3 prefill.** Anything wider than 16 activation columns still reconstructs the weight and calls
+  cuBLAS, 2.8x slower than the ATX path. A trellis-direct GEMM is the fix.
+- **EXL3 `test-backend-ops` coverage, and EXL3 MoE.** No cases exist for the new types, and
+  `GGML_OP_MUL_MAT_ID` already uses `src[2]`, which is where the EXL3 side tensors live.
+- **IQ3 shared-memory codebook on by default,** and the same idea for IQ2. Both need an end-to-end
+  measurement first.
+
+## Attribution and licenses
+
+**EXL3.** The format, the "mul1" codebook arithmetic, the tile layout and the trellis GEMV design are
+Turboderp's, from [exllamav3](https://github.com/turboderp-org/exllamav3), MIT License, Copyright (c)
+2025 Turboderp. The license text is in `licenses/LICENSE-exllamav3` and the attribution is repeated in
+the header of every EXL3 source file. EXL3 is Turboderp's streamlined variant of QTIP (Tseng, Sun, Hou,
+De Sa, NeurIPS 2024, arXiv:2406.11235). The code in this fork is an independent ggml/CUDA
+reimplementation written with the exllamav3 sources open as the reference; a line-level audit found zero
+verbatim or renamed functions. No other project is credited for this format, and none has a claim on it.
+
+**Ternary Bonsai 2.** The model is Prism ML's (weights Apache 2.0). The PQ2_0 and PTQ1_0 formats, the
+folded signed-Hadamard runtime and the CPU/CUDA kernels this port builds on are adapted from Prism ML's
+llama.cpp fork (MIT, same license text as this repository) at the pinned commit listed in
+[docs/bonsai2.md](../bonsai2.md), which also carries the citation Prism ML asks for.
+
+**Upstream.** llama.cpp is ggml-org's, MIT. The KV cache and native MTP speculative decoding this fork
+was built on come from TurboQuant. Both are merged, not vendored.
+
+## Known TBDs
+
+Numbers that are not in this document because no measurement supports them yet:
+
+- End-to-end model-level gain of `GGML_CUDA_SM86_IQ3_SMEM_GRID`: **TBD**. Only kernel microbenchmark
+  deltas exist, and the sweep that produced them ran a configuration production does not.
+- Peak VRAM at 100K and 200K context, per format, on the v0.3.1 build: **TBD** for every format.
+  Existing figures are at 2K, 16K, 20K, 32K and 50K only.
+- A v0.3.1 ladder against stock llama.cpp and TurboQuant, in the form v0.3 reports: **TBD**. No
+  ship-corpus run has been made on this branch.
+- PQ2_0 and PTQ1_0 on the production ship corpus (coding, agentic, rag, 3 seeds, 20K generated,
+  temperature 1.0): **TBD**. The ternary figures quoted above are 2K checks on one fixture and one seed.
+- PQ2_0 prefill on the v0.3.1 build: **TBD**. The 1,418 tok/s figure on record is a 2K check on the
+  earlier ternary build.
+- EXL3 at bit widths other than 4.0 (and the 6-bit head): **TBD**. Types 2, 3, 5, 7 and 8 are
+  implemented and parity-checked, but no end-to-end model has been converted or timed at those widths.
+- File size and bits per weight of every shipped quant in one table: **TBD** beyond ATX-4-XS
+  (14.5 GiB, 4.56 bpw), EXL3 4.0 bpw (13.7 GiB), PTQ1_0 (5,946,648,928 B, 1.75 bpw) and PQ2_0
+  (7,206,168,928 B).

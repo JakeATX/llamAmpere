@@ -54,7 +54,7 @@ Check executed counts, not only the final backend verdict. Preserve the raw logs
 
 ## SM86 decode kernels (v0.3.1)
 
-Both containers hold the same ternary values and block scales (verified tensor by tensor); they differ only in packing. `PQ2_0` stores 2-bit codes and unpacks with one byte permute per 4 weights. `PTQ1_0` stores 5 trits per byte and needs a multiply-by-3 digit extraction, so its GEMV is ALU-bound rather than bandwidth-bound on a 3090 Ti: at 16K context `PQ2_0` decodes at 65 tok/s single-token and 100 tok/s with the MTP drafter, `PTQ1_0` at 55 and 60 tok/s, for about 2 GB more peak VRAM. Pick `PQ2_0` unless the card cannot hold it.
+Both containers hold the same ternary values and block scales (verified tensor by tensor); they differ only in packing. `PQ2_0` stores 2-bit codes and unpacks with one byte permute per 4 weights. `PTQ1_0` stores 5 trits per byte and needs a multiply-by-3 digit extraction, so its GEMV is ALU-bound rather than bandwidth-bound on a 3090 Ti: at 16K context `PQ2_0` decodes at 65 tok/s single-token and 100 tok/s with the MTP drafter, `PTQ1_0` at 64 tok/s single-token and 59 with the drafter, for about 1.1 GB more peak VRAM (2K checks on one 16K fixture; on `PTQ1_0` a width-4 verify pass still costs about 2.85 single-token steps, so the drafter is close to break-even at 16K). Pick `PQ2_0` unless the card cannot hold it.
 
 The v0.3.1 `PTQ1_0` kernels do the following, all bit-exact against the Prism reference (greedy output hash unchanged):
 
