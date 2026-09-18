@@ -205,8 +205,8 @@ Known limits:
   against the layer-split logits is 0.0012 (2 devices) and 0.0011 (3 devices), below the 0.0027 the same
   split introduces for a standard 4-bit quant, i.e. reduction-order noise. No measurement exists on real
   multi-GPU hardware, the fused converter layouts (`attn_qkv` with `in_proj_z`, `ffn_up` with `ffn_gate`)
-  have split rules but no local file to exercise them, and MTP drafting does not yet work with
-  `--split-mode tensor` for any weight type (see `docs/multi-gpu.md`).
+  have split rules but no local file to exercise them. MTP drafting under the tensor split (emulated, 2
+  devices) produced the same 64 greedy tokens and the same draft acceptance as the single-device run.
 - **`mul1` is the only codebook implemented.** exllamav3's `mcg` and the older `cb0` are not.
 
 Deferred to v0.4 with the rest of the release backlog: the prefill GEMM, `test-backend-ops` cases, and

@@ -599,8 +599,12 @@ llama_context::llama_context(
                     params.ctx_other ? (int) (&params.ctx_other->get_model() == &model) : -1, model.n_devices(),
                     params.ctx_other ? (void *) params.ctx_other->compute_peer : nullptr);
             }
+            // not with a tensor split: the meta backend keeps per-device tensor mappings in its compute buffer that
+            // the donor's graph allocation resets while the MTP context still reuses its graph (each context gets
+            // its own compute buffers instead)
             if (enabled && cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && params.ctx_other != nullptr &&
                     &params.ctx_other->get_model() == &model && model.n_devices() == 1 &&
+                    model.split_mode() != LLAMA_SPLIT_MODE_TENSOR &&
                     params.ctx_other->compute_peer == nullptr) {
                 compute_peer = params.ctx_other;
                 compute_peer->compute_peer = this;
