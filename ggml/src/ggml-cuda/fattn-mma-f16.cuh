@@ -626,54 +626,79 @@ static __device__ __forceinline__ void flash_attn_ext_turbo4_load_tile(
 // tile column c.
 //
 // Unlike turbo4 this does NOT materialise a scaled[] centroid array in registers: 64
-// entries per block would blow the MMA kernel register budget (and spill). The 6-bit code
-// indexes TQ6_CENTROIDS (__constant__, from turbo-quant.cuh) directly and the norm
-// multiply is folded into the fp16 conversion.
-template<int stride_tile, bool swz, int nbatch_fa, int nthreads, bool oob_check>
+// entries per block would blow the MMA kernel register budget (and spill). The table lives
+// in shared memory instead (see flash_attn_ext_tq6_smem_table) and the norm multiply is
+// folded into the fp16 conversion.
+//
+// A 6-bit code is divergent across lanes, and a divergent __constant__ read is replayed
+// once per distinct address by the constant unit (~27 replays for random 6-bit indices).
+// A warp-private shared copy costs a few bank conflicts instead. The copy is warp-private,
+// so __syncwarp is enough and no block barrier is added to the tile loop.
+template<int nthreads>
+static __device__ __forceinline__ const float * flash_attn_ext_tq6_smem_table() {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    __shared__ float tab[nthreads/warp_size][64];
+    const int tid  = threadIdx.y * warp_size + threadIdx.x;
+    const int warp = tid / warp_size;
+    const int lane = tid % warp_size;
+    for (int i = lane; i < 64; i += warp_size) {
+        tab[warp][i] = TQ6_CENTROIDS[i];
+    }
+    __syncwarp();
+    return tab[warp];
+}
+
+// One lane decodes eight consecutive values (four half2) per iteration and writes one
+// aligned uint4, like the q8_0 and turbo3 flat loaders: every thread of the block works,
+// and the packed reads of a row stay inside one cache line.
+template<int stride_tile, bool swz, int nbatch_fa, int nthreads, int D2, bool oob_check>
 static __device__ __forceinline__ void flash_attn_ext_tq6_load_tile(
         const char * const __restrict__ KV_raw, half2 * const __restrict__ tile_KV,
-        const int D2, const int stride_bytes, const int col_offset, const int i_sup) {
+        const int stride_bytes, const int col_offset, const int i_sup) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     const int tid = threadIdx.y * warp_size + threadIdx.x;
-#pragma unroll
-    for (int row = tid; row < nbatch_fa; row += nthreads) {
+    constexpr int half2_per_chunk = 4;
+    static_assert(D2 % half2_per_chunk == 0, "D2 must be a multiple of 4");
+    constexpr int chunks_per_row = D2 / half2_per_chunk;
+    constexpr int nchunks = nbatch_fa * chunks_per_row;
+
+    const float * const tab = flash_attn_ext_tq6_smem_table<nthreads>();
+
+    for (int linear = tid; linear < nchunks; linear += nthreads) {
+        const int row = linear / chunks_per_row;
+        const int chunk = linear - row * chunks_per_row;
+        const int col = chunk * half2_per_chunk;
         if (oob_check && row >= i_sup) {
-            for (int c = 0; c < D2; ++c) {
-                turbo_store_h2<stride_tile, swz>(tile_KV, row, c, make_half2(0.0f, 0.0f));
-            }
+            turbo_store_u4<stride_tile, swz>(tile_KV, row, col, uint4{});
             continue;
         }
-        const char * row_ptr = KV_raw + (int64_t)row * stride_bytes;
-        int c = 0;
-        while (c < D2) {
-            const int col         = col_offset + c;                // absolute half2 column
-            const int blk_idx     = col / (QK_TQ6 / 2);            // 64 half2 cols per tq6 block
-            const int blk_col_end = (blk_idx + 1) * (QK_TQ6 / 2) - col_offset;
-            const int c_end       = min(D2, blk_col_end);
 
-            const block_tq6_0 * blk = (const block_tq6_0 *)(row_ptr) + blk_idx;
+        const char * row_ptr = KV_raw + (int64_t) row * stride_bytes;
+        const int j0 = 2*(col_offset + col); // first of eight values, multiple of 8
+        const block_tq6_0 * blk = (const block_tq6_0 *) row_ptr + j0 / QK_TQ6;
+        const int in_blk = j0 % QK_TQ6;
+        // qs offset in_blk/2 is a multiple of 4 and qh offset in_blk/4 a multiple of 2, both even -> 16-bit aligned
+        const uint16_t * qsp = (const uint16_t *) (blk->qs + in_blk/2);
+        const uint16_t * qhp = (const uint16_t *) (blk->qh + in_blk/4);
+        float norm; uint32_t qs, qh;
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
-            const float norm = __half2float(__ldcs((const half *)&blk->norm));
+        norm = __half2float(__ldcs((const half *) &blk->norm));
+        qs   = __byte_perm((uint32_t) __ldcs(qsp), (uint32_t) __ldcs(qsp + 1), 0x5410); // low nibbles of the eight values
+        qh   = __ldcs(qhp);                                                             // high 2 bits, 2 per value
 #else
-            const float norm = __half2float(blk->norm);
+        norm = __half2float(blk->norm);
+        qs   = __byte_perm((uint32_t) qsp[0], (uint32_t) qsp[1], 0x5410);
+        qh   = qhp[0];
 #endif
-
-            for (; c < c_end; ++c) {
-                const int in_blk = (col_offset + c) % (QK_TQ6 / 2);
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
-                const uint8_t qs_byte = __ldcs(&blk->qs[in_blk]);
-                const uint8_t qh_byte = __ldcs(&blk->qh[in_blk / 2]);
-#else
-                const uint8_t qs_byte = blk->qs[in_blk];
-                const uint8_t qh_byte = blk->qh[in_blk / 2];
-#endif
-                const int hshift = (in_blk % 2) * 4;
-                const int idx0 = ( qs_byte       & 0xF) | (((qh_byte >> (hshift + 0)) & 0x3) << 4);
-                const int idx1 = ((qs_byte >> 4) & 0xF) | (((qh_byte >> (hshift + 2)) & 0x3) << 4);
-                turbo_store_h2<stride_tile, swz>(tile_KV, row, c,
-                    make_half2(TQ6_CENTROIDS[idx0] * norm, TQ6_CENTROIDS[idx1] * norm));
-            }
+        uint4 decoded;
+        half2 * values = reinterpret_cast<half2 *>(&decoded);
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const int idx0 = ((qs >> (8*k    )) & 0xF) | (((qh >> (4*k    )) & 0x3) << 4);
+            const int idx1 = ((qs >> (8*k + 4)) & 0xF) | (((qh >> (4*k + 2)) & 0x3) << 4);
+            values[k] = __floats2half2_rn(tab[idx0] * norm, tab[idx1] * norm);
         }
+        turbo_store_u4<stride_tile, swz>(tile_KV, row, col, decoded);
     }
 }
 
@@ -1206,8 +1231,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 flash_attn_ext_turbo4_load_tile<stride_tile_K, swz_K, nbatch_fa, nthreads_turbo, oob_check>
                     (K_raw, tile_K, k0_diff, stride_K, k0_start, k_VKQ_sup);
             } else if constexpr (type_K == GGML_TYPE_TQ6_0) {
-                flash_attn_ext_tq6_load_tile<stride_tile_K, swz_K, nbatch_fa, nthreads_turbo, oob_check>
-                    (K_raw, tile_K, k0_diff, stride_K, k0_start, k_VKQ_sup);
+                flash_attn_ext_tq6_load_tile<stride_tile_K, swz_K, nbatch_fa, nthreads_turbo, DKQ/2, oob_check>
+                    (K_raw, tile_K, stride_K, k0_start, k_VKQ_sup);
             } else if constexpr (type_K == GGML_TYPE_TURBO3_0) {
                 flash_attn_ext_turbo3_load_tile<stride_tile_K, swz_K, nbatch_fa, nthreads_turbo, oob_check>
                     (K_raw, tile_K, k0_diff, stride_K, k0_start, k_VKQ_sup);
@@ -1597,10 +1622,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 flash_attn_ext_turbo4_load_tile<stride_tile_V, swz_V, nbatch_fa, nthreads_turbo, oob_check>
                     (V_raw, tile_V, i0_diff/2, stride_V, i0_start/2, k_VKQ_sup);
             } else if constexpr (type_V == GGML_TYPE_TQ6_0) {
-                flash_attn_ext_tq6_load_tile<stride_tile_V, swz_V, nbatch_fa, nthreads_turbo, oob_check>
-                    (V_raw, tile_V, i0_diff/2, stride_V, i0_start/2, k_VKQ_sup);
+                flash_attn_ext_tq6_load_tile<stride_tile_V, swz_V, nbatch_fa, nthreads_turbo, DV/2, oob_check>
+                    (V_raw, tile_V, stride_V, i0_start/2, k_VKQ_sup);
             } else if constexpr (type_V == GGML_TYPE_TURBO3_0) {
-                if constexpr (type_K == GGML_TYPE_Q8_0) {
+                if constexpr (type_K == GGML_TYPE_Q8_0 || type_K == GGML_TYPE_TQ6_0) {
                     flash_attn_ext_turbo3_load_tile_flat<stride_tile_V, swz_V, nbatch_fa, nthreads_turbo, DV/2, oob_check, !turbo_stage>
                         (V_raw, tile_V, V_pitch, i0_start/2, k_VKQ_sup);
                 } else {
