@@ -301,10 +301,16 @@ public:
     uint32_t head;
     int32_t rs_z;
 
-    // DRC phase 2: pending-replay length baked into this graph's topology (an extra
-    // ggml_gated_delta_net(K=1) reconstruction per replay step) -- must match for valid reuse,
-    // same as head/rs_z above.
+    // DRC phase 2: pending-replay length, checkpoint span and s-staleness baked into this
+    // graph's topology (the shape of the ggml_gated_delta_net(K=1) reconstruction subtree and
+    // of the ring/checkpoint writes depends on all three) -- must match for valid reuse, same
+    // as head/rs_z above. span_new is what the ubatch leaves behind the checkpoint once this
+    // graph has run; set_input() hands it back to the memory.
     uint32_t replay_len = 0;
+    uint32_t ckpt_span  = 0;
+    bool     s_stale    = false;
+    uint32_t span_new   = 0;
+    uint32_t snap_shift = 0; // [TAG_RECURRENT_ROLLBACK_SHIFT] see llama_memory_recurrent_context::get_snap_shift
 };
 
 class llm_graph_input_cross_embd : public llm_graph_input_i {

@@ -379,7 +379,7 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
         }
     }
 
-    mctx->consume_replay_len();
+    mctx->consume_replay(span_new);
 }
 
 bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
@@ -400,6 +400,9 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
     // DRC phase 2: a nonzero (or changed) replay length needs a differently-shaped extra
     // reconstruction node in the graph, so it can't be satisfied by reusing existing topology.
     res &= replay_len == mctx->get_replay_len();
+    res &= ckpt_span  == mctx->get_ckpt_span();
+    res &= s_stale    == mctx->get_s_stale();
+    res &= snap_shift == mctx->get_snap_shift();
 
     return res;
 }
@@ -1158,7 +1161,7 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
         }
     }
 
-    mctx->get_recr()->consume_replay_len();
+    mctx->get_recr()->consume_replay(inp_rs->span_new);
 }
 
 bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
@@ -1184,6 +1187,9 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
     // DRC phase 2: same guard as llm_graph_input_rs::can_reuse -- a changed replay length means a
     // differently-shaped reconstruction subtree, which reused topology cannot express.
     res &= inp_rs->replay_len == mctx->get_recr()->get_replay_len();
+    res &= inp_rs->ckpt_span  == mctx->get_recr()->get_ckpt_span();
+    res &= inp_rs->s_stale    == mctx->get_recr()->get_s_stale();
+    res &= inp_rs->snap_shift == mctx->get_recr()->get_snap_shift();
 
     return res;
 }
@@ -1208,7 +1214,7 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
         }
     }
 
-    mctx->get_recr()->consume_replay_len();
+    mctx->get_recr()->consume_replay(inp_rs->span_new);
 }
 
 bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
@@ -1233,6 +1239,9 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
     // DRC phase 2: same guard as llm_graph_input_rs::can_reuse -- a changed replay length means a
     // differently-shaped reconstruction subtree, which reused topology cannot express.
     res &= inp_rs->replay_len == mctx->get_recr()->get_replay_len();
+    res &= inp_rs->ckpt_span  == mctx->get_recr()->get_ckpt_span();
+    res &= inp_rs->s_stale    == mctx->get_recr()->get_s_stale();
+    res &= inp_rs->snap_shift == mctx->get_recr()->get_snap_shift();
 
     return res;
 }
@@ -1288,7 +1297,7 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
         }
     }
 
-    mctx->get_recr()->consume_replay_len();
+    mctx->get_recr()->consume_replay(inp_rs->span_new);
 }
 
 bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params) {
@@ -1327,6 +1336,9 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
     // DRC phase 2: same guard as llm_graph_input_rs::can_reuse -- a changed replay length means a
     // differently-shaped reconstruction subtree, which reused topology cannot express.
     res &= inp_rs->replay_len == mctx->get_recr()->get_replay_len();
+    res &= inp_rs->ckpt_span  == mctx->get_recr()->get_ckpt_span();
+    res &= inp_rs->s_stale    == mctx->get_recr()->get_s_stale();
+    res &= inp_rs->snap_shift == mctx->get_recr()->get_snap_shift();
 
     return res;
 }
@@ -3885,6 +3897,20 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
     inp->head = mctx_cur->get_head();
     inp->rs_z = mctx_cur->get_rs_z();
     inp->replay_len = mctx_cur->get_replay_len();
+    inp->ckpt_span  = mctx_cur->get_ckpt_span();
+    inp->s_stale    = mctx_cur->get_s_stale();
+    inp->snap_shift = mctx_cur->get_snap_shift();
+
+    // DRC phase 2: the span the ring holds behind the checkpoint after this ubatch -- the
+    // accepted prefix (ckpt_span - replay_len) plus this ubatch's tokens, capped at the ring
+    // capacity (beyond it the builder re-bases the checkpoint onto the last n_rs_seq tokens).
+    // Must agree with llm_build_delta_net_base::build_recurrent_attn's bookkeeping.
+    {
+        const uint32_t n_rs_seq     = mctx_cur->get_n_rs_seq();
+        const uint32_t n_seq_tokens = n_seqs > 0 ? (uint32_t) (ubatch.n_tokens / n_seqs) : 0;
+        const uint32_t m            = inp->ckpt_span - std::min(inp->ckpt_span, inp->replay_len);
+        inp->span_new = std::min(m + n_seq_tokens, n_rs_seq);
+    }
 
     return inp;
 }

@@ -101,6 +101,21 @@ public:
     // full seq_rm/clear so a released slot can't leave a dangling replay for its next occupant.
     std::vector<uint32_t> replay_len;
 
+    // gdn_replay: how many ingredient slots behind s_ckpt_l the ring holds for this seq, i.e.
+    // the checkpoint's real span (0..n_rs_seq). The logical state of the sequence is
+    //   s_ckpt + ring[0, ckpt_span - replay_len)
+    // and s_l equals s_ckpt + ring[0, ckpt_span) unless s_stale says otherwise. A rollback may
+    // reach at most ckpt_span - replay_len steps back (and no further than the conv snapshot
+    // groups tracked by rs_valid). Maintained by the graph builder through
+    // llama_memory_recurrent_context::consume_replay(), copied by seq_cp, zeroed by every path
+    // that empties the ring.
+    std::vector<uint32_t> ckpt_span;
+
+    // gdn_replay: s_l does not hold the logical state and must be rebuilt from s_ckpt_l and the
+    // ring on the next decode. Set by state_read (the blob carries the checkpoint and the ring,
+    // not a materialized rolled-back state), cleared by consume_replay().
+    std::vector<uint8_t> s_stale;
+
     // computed before each graph build
     uint32_t n = 0;
 
@@ -137,14 +152,19 @@ public:
     // a second conv history that must stay replicated across devices, so it cannot share the r row
     std::vector<ggml_tensor *> p_l;
 
-    // per layer, only allocated when gdn_replay is true: [n_embd_s_ingredient(), mem_size * n_rs_seq]
+    // per layer, only allocated when gdn_replay is true: [n_embd_s_ingredient() * n_rs_seq, mem_size]
+    // -- one row per cell holding that cell's n_rs_seq ingredient slots back to back, slot 0 the
+    // oldest (chronological). A row per cell (rather than a slot-major plane) lets build_rs gather
+    // and relocate a sequence's whole ring with the same s_copy machinery as its state, and lets
+    // state_write serialise it as one contiguous row.
     std::vector<ggml_tensor *> ingr_l;
 
     // per layer, only allocated when gdn_replay is true: [n_embd_s(), mem_size] -- the state as of
-    // n_rs_seq tokens before the end of the last decode (the oldest edge of the retained window).
-    // Replay must start from THIS, not from s_l: by the time a rollback is discovered, s_l already
-    // holds the (now known-wrong) optimistic "everything got accepted" final state, and delta-net's
-    // rank-1 update has no inverse -- there is no way to "undo" trailing tokens from it. Replaying
+    // ckpt_span[seq] tokens before the end of the last decode (the oldest edge of the retained
+    // window). Replay must start from THIS, not from s_l: by the time a rollback is discovered, s_l
+    // already holds the (now known-wrong) optimistic "everything got accepted" final state, and the
+    // delta-net rank-1 update is not stably invertible (Sherman-Morrison exists, but its
+    // denominator 1 - beta*|k|^2 sits near zero for normalized k and beta near 1). Replaying
     // ingredients only ever moves state forward, so the checkpoint to replay from must predate the
     // whole uncertain trailing window, not follow it.
     std::vector<ggml_tensor *> s_ckpt_l;
@@ -165,10 +185,17 @@ private:
     size_t size_p_bytes() const;
 
     void state_write_meta(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, llama_seq_id seq_id = -1) const;
-    void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const;
+    // cell_ranges_r selects the r (conv) rows -- a rollback snapshot group when one is pending;
+    // cell_ranges_s selects the s rows (no widening under gdn_replay, so its own list).
+    void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges_r, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges_s) const;
+
+    // gdn_replay only: the checkpoint row, the ingredient ring row and the checkpoint's span per
+    // cell. Written after the s rows; a blob without it cannot be restored into a replay context.
+    void state_write_replay(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges_s, const std::vector<uint32_t> & cell_spans) const;
 
     bool state_read_meta(llama_io_read_i & io, uint32_t cell_count, llama_seq_id dest_seq_id = -1);
     bool state_read_data(llama_io_read_i & io, uint32_t cell_count);
+    bool state_read_replay(llama_io_read_i & io, uint32_t cell_count);
 };
 
 class llama_memory_recurrent_context : public llama_memory_context_i {
@@ -218,12 +245,30 @@ public:
     // in the current ubatch, or 0 if none. Used by can_reuse() and the graph builder.
     uint32_t get_replay_len() const;
 
-    // DRC phase 2: mark the pending replay as consumed. Called exactly once per decode, after the
-    // graph has been built (every GDN layer reads get_replay_len() during build). Mirrors
-    // s_copy_idx()'s consume-and-clear of rs_idx: without it the first partial rejection latches a
-    // rollback that is re-applied on every later decode, so the recurrent state permanently trails
-    // the token stream.
-    void consume_replay_len() const;
+    // DRC phase 2: the checkpoint's span for the sequence in the current ubatch (see
+    // llama_memory_recurrent::ckpt_span), and whether s_l is stale for it. With several lanes
+    // the maximum span / any-stale is taken, same as get_replay_len(); lanes that disagree are
+    // not supported (logged once) -- the replay subtree has one shape per graph.
+    uint32_t get_ckpt_span() const;
+    bool     get_s_stale()   const;
+    uint32_t get_n_rs_seq()  const;
+
+    // [TAG_RECURRENT_ROLLBACK_SHIFT] number of older snapshot groups (conv in both modes, the
+    // recurrent state in the non-replay mode) the builder must move back by n_seq_tokens for the
+    // current ubatch: K - max(n_seq_tokens, pending rollback) when n_seq_tokens < K = n_rs_seq + 1,
+    // else 0. The op only rewrites the newest min(n, K) groups, so without the move group g
+    // holds the state g tokens behind the PREVIOUS head after a short ubatch, and a rollback of
+    // exactly one short batch (the multi-seq test's shape) restores a state that never existed.
+    // Never nonzero on the speculative verify path (n = n_draft + 1 = K).
+    uint32_t get_snap_shift() const;
+
+    // DRC phase 2: mark the pending replay as consumed and record the span the graph just
+    // built leaves behind the checkpoint. Called exactly once per decode, after the graph has
+    // been built (every GDN layer reads get_replay_len()/get_ckpt_span() during build). Mirrors
+    // s_copy_idx()'s consume-and-clear of rs_idx: without it the first partial rejection latches
+    // a rollback that is re-applied on every later decode, so the recurrent state permanently
+    // trails the token stream.
+    void consume_replay(uint32_t new_span) const;
 
 private:
     const llama_memory_status status;
