@@ -205,7 +205,8 @@ the width 5 to 9 MMVQ tuning that the n-gram speculative path is waiting on.
 ## Measured
 
 One RTX 3090 Ti at 350 W, whole-card VRAM budget 23,552 MiB, Qwen3.8-27B EXL3 4.0 bpw
-(`output.weight` at 6 bits), CUDA build at `-DCMAKE_CUDA_ARCHITECTURES=86`.
+(`output.weight` at 6 bits), CUDA build at `-DCMAKE_CUDA_ARCHITECTURES=86`. The 3.0 and 3.5 bpw
+conversions of the same model are in the bit-width table at the end of this section.
 
 **Correctness.** Converter verify: `max|Δ| = 0` on all five default tensors. Kernel parity against the
 numpy reference (tolerance 3e-3 relative RMS): PASS at T = 1, 2, 5, 7, 8, 9, 12, 16, worst 4.9e-4. This
@@ -252,6 +253,32 @@ Re-measured on the release build (`build-v031`, same fixture, seeds and cap): th
 peak 16,030 MiB) with no drafter, all six runs ending on EOS between 17,188 and 20,084 generated tokens.
 Per-seed files: `EX5_depth_bench/results_v031/A.20k.s*.json` and `A1.20k.s*.json`.
 
+**Bit widths 3.0, 3.5 and 4.0.** The same model converted at three widths and measured on the release
+build against the same fixture, seeds and cap: three seeds (7300, 7301, 7302) per cell, temperature 1.0,
+`n_predict` 20,480 with a 5,000-generated-token floor, EOS honoured, q8_0 K / turbo3 V, MTP depth 4 with
+`p-min 0` on the drafted arm.
+
+| width | file | T=1 | MTP-4 | peak VRAM (T=1 / MTP-4) | acceptance |
+|---|---:|---:|---:|---:|---:|
+| 3.0 bpw | 11,714,920,352 B (10.91 GiB) | 38.81 tok/s (sd 0.39) | 80.67 tok/s (sd 2.17) | 13,160 / 14,403 MiB | 0.618 to 0.634 |
+| 3.5 bpw | 13,233,389,472 B (12.32 GiB) | 39.86 tok/s (sd 0.19) | 81.83 tok/s (sd 1.11) | 14,634 / 15,756 MiB | 0.612 to 0.623 |
+| 4.0 bpw | 14,755,790,624 B (13.74 GiB) | 40.56 tok/s (sd 0.15) | 81.90 tok/s (sd 0.82) | 16,030 / 17,154 MiB | 0.612 to 0.627 |
+
+The drafted arm is the same speed at all three widths within the seed spread, so a narrower conversion
+buys file size and VRAM at this depth rather than costing throughput: 3.0 bpw runs the 20K fixture in
+2,751 MiB less peak whole-card VRAM than 4.0 bpw, out of a file 2.83 GiB smaller. Four of the six
+3.0 bpw runs reached the 20,480-token cap; every other run in the table stopped on EOS.
+
+Deeper in the context, 3.0 bpw decodes a 65,531-token prompt at 36.13 tok/s single-token (2 seeds,
+sd 0.07, peak 14,454 MiB) and 74.89 tok/s at MTP depth 4 (2 seeds, sd 1.30, peak 15,688 MiB, acceptance
+0.624 and 0.642). 3.5 and 4.0 bpw have not been run at that depth.
+
+Per-seed files: `EX5_depth_bench/results_v031_exl3_3.0/` and `EX5_depth_bench/results_v031_exl3_3.5/`
+(`A1.*` no drafter, `A.*` MTP depth 4), with `EX5_depth_bench/results_v031/` for the 4.0 bpw row. Tensor
+mix, from a `GGUFReader` pass over each file: the 3.0 bpw file is 400 EXL3_3 linear tensors plus 8
+EXL3_4, the 3.5 bpw file is 270 EXL3_4, 137 EXL3_3 and one EXL3_5, and both carry the EXL3_6
+`output.weight` and the same fused layout as the 4.0 bpw file.
+
 ## How it compares to our other formats
 
 On the same card and the same binary, the ATX IQ4_XS quant is still the fast choice for this model. In
@@ -268,5 +295,6 @@ single-token and 60 and 100 tok/s with an MTP drafter. Take those as an order of
 ladder against the EXL3 figures above.
 
 Pick EXL3 when you have an exllamav3 checkpoint you want to serve with this stack, or when you want
-4.0 bpw weights at 13.7 GiB. Pick ATX for maximum tokens per second on this card. Pick a ternary
+4.0 bpw weights at 13.7 GiB, 3.5 bpw at 12.3 GiB or 3.0 bpw at 10.9 GiB, which decode at the same speed
+with the drafter. Pick ATX for maximum tokens per second on this card. Pick a ternary
 container when the card has to hold something else as well.

@@ -16,14 +16,14 @@ than filled with a guess.
 ![Decode tok/s by format at a working context depth](img/fig01_decode_16k_20k.png)
 
 At a working context depth the same build serves four very different formats at usable speed. The MTP
-drafter is worth 1.5x to 2x on PQ2_0 and EXL3, but not on PTQ1_0: at temperature 1.0 its depth-3 drafted
-run is slower than its single-token run (59.1 against 62.8 tok/s), because at 0.55 acceptance the
-1.75-bit verify step costs more than the accepted tokens buy back. Leave the drafter off for PTQ1_0 at
-temperature 1.0, or use PQ2_0 when the 1.1 GB fits. PQ2_0 reaches 104.8 tok/s from a 6.99 GiB file,
-level with ATX IQ4_XS at 99.1 tok/s within the seed spread and from a file less than half the size, and
-EXL3 4.0 bpw reaches 81.9 tok/s with three seeds behind it. The ATX and both ternary cells
-are the same 16K rag prompt, floor and seeds on the release build; both EXL3 cells were measured at 20K
-on their own fixture, three seeds each, so read each bar with the tag printed underneath it.
+drafter is worth 1.5x to 2x on PQ2_0 and EXL3: PQ2_0 reaches 104.8 tok/s from a 6.99 GiB file, level
+with ATX IQ4_XS at 99.1 tok/s within the seed spread and from a file less than half the size, and EXL3
+4.0 bpw reaches 81.9 tok/s with three seeds behind it. PTQ1_0 decodes at 62.8 tok/s single-token at this
+depth out of the smallest file in the release; its drafted bar is drawn pending because the PTQ1_0
+verify-width kernel was rewritten and is in final gating, and that cell will be filled from a run on the
+shipping kernel. The ATX and both ternary cells are the same 16K rag prompt, floor and seeds on the
+release build; both EXL3 cells were measured at 20K on their own fixture, three seeds each, so read each
+bar with the tag printed underneath it.
 
 Conditions: one RTX 3090 Ti, temperature 1.0, single stream. ATX 99.1 tok/s is the same 16,000-token rag
 prompt, floor and seeds as the ternary cells, MTP depth 3 with `p-min 0`, on the release build, sd 4.62
@@ -34,7 +34,8 @@ is a full run on the release build without the drafter: a 20,469-token prompt, s
 4 and `p-min 0`, sd 0.82, acceptance 0.61 to 0.63, so the drafter is worth 2.0x on EXL3 (the earlier
 build-exl3 run of the same cells gave 81.27). PQ2_0 is a 16,000-token rag prompt, two seeds, full runs with a 5,000-generated-token
 floor, on the release build, sd 0.37 at T=1 and 3.34 with MTP depth 3 (acceptance 0.56 to 0.59). PTQ1_0 at T=1 is the same rag prompt and floor on the
-release build, two seeds, sd 0.27; with MTP depth 3 it is 59.1 tok/s on the same cells, sd 0.96.
+release build, two seeds, sd 0.27; its drafted cell is pending re-measurement on the rewritten
+verify-width kernel.
 
 Sources: `EX8_bonsai_mtp/results_atx_ab/v031/CB.rag_analysis.c16000.s{7300,7301}.json` and
 `CM.rag_analysis.c16000.s{7300,7301}.n3.json` (ATX); `EX5_depth_bench/results_v031/A1.20k.s{7300,7301,7302}.json`
@@ -42,8 +43,7 @@ and `A.20k.s{7300,7301,7302}.json` (EXL3 single-token and MTP-4, release build; 
 `docs/exl3.md` line 244 with JSONs in `EX5_depth_bench/results/`);
 `EX8_bonsai_mtp/results/CB.rag_analysis.c16000.s{7300,7301}.json` and
 `EX8_bonsai_mtp/results_pq2/CM.rag_analysis.c16000.s{7300,7301}.n3.json` (PQ2_0);
-`EX8_bonsai_mtp/results_v031_ptq1/CB.rag_analysis.c16000.s{7300,7301}.json` and
-`CM.rag_analysis.c16000.s{7300,7301}.n3.json` (PTQ1_0).
+`EX8_bonsai_mtp/results_v031_ptq1/CB.rag_analysis.c16000.s{7300,7301}.json` (PTQ1_0 single-token).
 
 ## 2. The same four formats, deeper in the context
 
@@ -73,22 +73,55 @@ Sources: `docs/llamampere-v0.3/ARTICLE.md` line 528 and `QWEN_AMPERE.md` lines 2
 
 The four formats span 1.75 to 4.56 bits per weight, which is 5.81 to 14.52 GiB of file for the same
 class of 27B model. EXL3 at 4.0 bpw is 0.78 GiB smaller than ATX IQ4_XS at 4.56 bpw and buys quality per
-byte rather than speed. The ternary containers are less than half the size of either: PQ2_0 trades about
-1.1 GB of VRAM against PTQ1_0 for a byte-permute unpack instead of a multiply chain, and the two hold
+byte rather than speed, and its narrower conversions at 3.5 and 3.0 bpw take that down to 12.32 and
+10.91 GiB while decoding at the same drafted speed (table below). The ternary containers are less than
+half the size of either: PQ2_0 trades about 1.1 GB of VRAM against PTQ1_0 for a byte-permute unpack
+instead of a multiply chain, and the two hold
 bit-identical ternary values and scales, so choosing between them is a packing decision and not a
 quality one.
 
 Conditions: `ls -l` byte counts of the exact GGUFs that were measured, divided by 2^30. Every file here
 carries the model's native single-layer MTP head, which is why the two Bonsai files are larger than the
 official Prism checkpoints (PTQ1_0 5,946,648,928 bytes and PQ2_0 7,206,168,928 bytes without the head).
-The EXL3 file is the `--fuse` conversion, the one the measurements used. The ternary files are Ternary
-Bonsai 2 27B; the other two are Qwen3.8-27B.
+The EXL3 files are `--fuse` conversions, the ones the measurements used. The ternary files are Ternary
+Bonsai 2 27B; the other four are Qwen3.8-27B.
 
 Sources: `QWEN_AMPERE.md` line 24 (4.56 bpw); `docs/exl3.md` line 92 (EXL3_4 bulk, EXL3_6 output head);
 `docs/bonsai2.md` (official checkpoint sizes); `ls -l` on
 `models/atx4xs/Qwen3.8-27B-ATX-4-XS.gguf`, `models/exl3-4.0bpw-gguf/Qwen3.8-27B-EXL3-4.0bpw.gguf`,
 `models/bonsai2/Ternary-Bonsai-2-27B-PQ2_0-MTP.gguf` and
-`models/bonsai2/Ternary-Bonsai-2-27B-PTQ1_0-MTP.gguf`.
+`models/bonsai2/Ternary-Bonsai-2-27B-PTQ1_0-MTP.gguf`;
+`ls -l models/exl3-3.0bpw-gguf/Qwen3.8-27B-EXL3-3.0bpw.gguf` and
+`models/exl3-3.5bpw-gguf/Qwen3.8-27B-EXL3-3.5bpw.gguf`.
+
+### EXL3 at three bit widths
+
+The narrower EXL3 conversions cost file size and VRAM, not drafted speed:
+
+| EXL3 | file | T=1, 20K prompt | MTP-4, 20K prompt | peak VRAM, 20K (T=1 / MTP-4) |
+|---|---:|---:|---:|---:|
+| 3.0 bpw | 10.91 GiB | 38.8 tok/s | 80.7 tok/s | 13,160 / 14,403 MiB |
+| 3.5 bpw | 12.32 GiB | 39.9 tok/s | 81.8 tok/s | 14,634 / 15,756 MiB |
+| 4.0 bpw | 13.74 GiB | 40.6 tok/s | 81.9 tok/s | 16,030 / 17,154 MiB |
+
+At 3.5 bpw the drafted cell is level with 4.0 bpw and at 3.0 bpw it is within the seed spread, from a
+file 1.42 and 2.83 GiB smaller and with 1,398 and 2,751 MiB less peak VRAM at that depth. 3.0 bpw is
+also the only width measured deeper so far: 36.1 tok/s single-token and 74.9 tok/s with MTP depth 4 on a
+65,531-token prompt (two seeds each, sd 0.07 and 1.30, peak 14,454 and 15,688 MiB).
+
+Conditions: one RTX 3090 Ti, `build-v031`, the same 20,469-token depth fixture, ctx 45,056, temperature
+1.0, reasoning_effort medium, `n_predict` 20,480 with a 5,000-generated-token floor, EOS honoured, seeds
+7300/7301/7302 per cell, q8_0 K / turbo3 V, MTP depth 4 with `p-min 0` and the 65,536-entry vocabulary
+map on the drafted arm, acceptance 0.612 to 0.634 across the nine drafted runs. Standard deviations at
+20K: 0.39 and 2.17 (3.0 bpw), 0.19 and 1.11 (3.5 bpw), 0.15 and 0.82 (4.0 bpw). Four of the six 3.0 bpw
+runs at 20K reached the 20,480-token cap; every other run stopped on EOS. Peak VRAM is the largest
+whole-card sample of the three seeds.
+
+Sources: `EX5_depth_bench/results_v031_exl3_3.0/A1.20k.s{7300,7301,7302}.json`,
+`A.20k.s{7300,7301,7302}.json`, `A1.64k.s{7300,7301}.json` and `A.64k.s{7300,7301}.json`;
+`EX5_depth_bench/results_v031_exl3_3.5/A1.20k.s{7300,7301,7302}.json` and
+`A.20k.s{7300,7301,7302}.json`; `EX5_depth_bench/results_v031/` for the 4.0 bpw row; fields
+`decode.tok_s`, `vram.peak_mib`, `draft.acceptance`, `generated_tokens`.
 
 ## 4. Peak VRAM deep in the context
 
@@ -207,11 +240,11 @@ permute per four weights instead of a multiply chain. That moves the kernel off 
 back onto bandwidth, which is where a decode kernel wants to be. It matters most under speculative
 decoding, because a width-4 verify re-reads the same weights and the byte-permute path carries almost no
 re-unpack cost: on the same 16K fixture in full temperature-1.0 runs on the release build, PQ2_0 goes
-from 69.7 tok/s single-token to 104.8 tok/s with the MTP drafter, where PTQ1_0 goes 62.8 to 59.1 (the 2K
-development checks read 64 to 59 after the dp4a rewrite and 55 to 60 before it), because on PTQ1_0 a
-width-4 verify pass still costs about 2.85 single-token steps, so the drafter loses slightly
-there. The two containers were checked tensor
-by tensor and are a lossless re-container of each other, so this is pure packing, not a quality trade.
+from 69.7 tok/s single-token to 104.8 tok/s with the MTP drafter, a 1.5x gain the drafter keeps because
+the verify pass costs this container almost nothing to re-unpack. The PTQ1_0 side of that comparison is
+being re-measured on the rewritten verify-width kernel now in final gating. The two containers were
+checked tensor by tensor and are a lossless re-container of each other, so this is pure packing, not a
+quality trade.
 
 **EXL3, the trellis GEMV (new).** The first working path reconstructed each whole weight matrix to f16
 and called cuBLAS, which is correct and slow: 20.1 tok/s. The shipped kernel decodes straight from the

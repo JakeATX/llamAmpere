@@ -4,7 +4,7 @@
   "model": "Qwen3.8-27B (ATX and EXL3 arms) / Prism ML Ternary Bonsai 2 27B (PQ2_0 and PTQ1_0 arms)",
   "card": "one RTX 3090 Ti, whole-card VRAM budget 23,552 MiB",
   "stamp": "llamAmpere v0.3.1",
-  "how_to_read": "Every plotted number is a {value, source} cell. value = null means the measurement does not exist yet: make_figures.py draws that bar hatched and labels it 'pending'. Fill the value in and re-run the script unchanged. Nothing in this file is estimated, interpolated or rounded from a different condition than the one its label states.",
+  "how_to_read": "Every plotted number is a {value, source} cell. value = null means the measurement does not exist yet, or is being redone on a changed kernel (the cell's source says which): make_figures.py draws that bar hatched and labels it 'pending'. Fill the value in and re-run the script unchanged. Nothing in this file is estimated, interpolated or rounded from a different condition than the one its label states.",
   "conventions": {
    "T=1": "single-token decode, no speculative drafter",
    "MTP": "decode with the model's own MTP head as the drafter, at the draft depth named in the label",
@@ -15,6 +15,8 @@
  "format_order": [
   "atx_iq4xs",
   "exl3_40",
+  "exl3_35",
+  "exl3_30",
   "pq2_0",
   "ptq1_0"
  ],
@@ -38,13 +40,23 @@
    "label": "PTQ1_0 (ternary)",
    "long_label": "Ternary Bonsai 2 27B, PTQ1_0 container, with MTP head",
    "color_slot": 4
+  },
+  "exl3_35": {
+   "label": "EXL3 3.5 bpw",
+   "long_label": "Qwen3.8-27B EXL3 3.5 bpw, GGUF-native, output.weight at 6 bits",
+   "color_slot": 5
+  },
+  "exl3_30": {
+   "label": "EXL3 3.0 bpw",
+   "long_label": "Qwen3.8-27B EXL3 3.0 bpw, GGUF-native, output.weight at 6 bits",
+   "color_slot": 7
   }
  },
  "figures": {
   "fig01": {
    "title": "Four weight formats, one card, one binary",
    "message": "Decode speed at a working context depth, with and without the MTP drafter.",
-   "footer": "One RTX 3090 Ti, temperature 1.0. Depth, seed count and drafter depth are printed under every bar.\nATX, PQ2_0 and PTQ1_0 share one 16K rag prompt, floor and seeds on the release build; EXL3 is its own 20K fixture.",
+   "footer": "One RTX 3090 Ti, temperature 1.0. Depth, seed count and drafter depth are printed under every bar.\nATX, PQ2_0 and PTQ1_0 share one 16K rag prompt, floor and seeds on the release build; EXL3 is its own 20K fixture.\nThe PTQ1_0 drafted cell is pending re-measurement on the rewritten verify-width kernel.",
    "arms": [
     "single token (T=1)",
     "with the MTP drafter"
@@ -112,10 +124,10 @@
       "note": "Two seeds, one prompt domain, on the release build. The coding and agentic full runs at this depth stopped under the 5,000-token floor on every seed and are excluded."
      },
      "mtp": {
-      "value": 59.079,
-      "label": "16K, 2 seeds\nMTP-3",
-      "source": "/home/jake-k/qwen38-bench/kernel_cache_investigation/EX8_bonsai_mtp/results_v031_ptq1/CM.rag_analysis.c16000.s7300.n3.json and CM.rag_analysis.c16000.s7301.n3.json, field decode.tok_s (58.40133, 59.75601), both valid=true, generated 8701 and 9686, build-v031",
-      "conditions": "same prompt and flags as the T=1 cell, plus --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0 with the 65,536-entry vocabulary map, draft KV q8_0/q8_0, sd 0.96, acceptance 0.541 and 0.566"
+      "value": null,
+      "label": "pending",
+      "source": "pending re-measurement: the PTQ1_0 verify-width kernel (widths 2 to 8) was rewritten after this cell was run and is in final gating, so the drafted cell will be filled from a run on the shipping kernel, on the same 16K rag prompt, floor and seeds as the T=1 cell",
+      "pending_reason": "the container's drafted decode is being re-measured on the rewritten verify-width kernel; the number lands in a follow-up commit to the release notes"
      }
     }
    ],
@@ -340,7 +352,7 @@
   "fig03": {
    "title": "What each format costs on disk",
    "message": "Bits per weight, and the file you actually download, for every format v0.3.1 serves.",
-   "footer": "File sizes are ls -l byte counts of the served GGUFs divided by 2^30. Every file carries the model's\nnative single-layer MTP head. The ternary files are Ternary Bonsai 2 27B; the other two are Qwen3.8-27B.",
+   "footer": "File sizes are ls -l byte counts of the served GGUFs divided by 2^30. Every file carries the model's\nnative single-layer MTP head. The ternary files are Ternary Bonsai 2 27B; the other four are Qwen3.8-27B.",
    "axis_max_fallback": 18,
    "bars": [
     {
@@ -366,7 +378,31 @@
       "value": 13.742,
       "source": "ls -l /home/jake-k/qwen38-bench/models/exl3-4.0bpw-gguf/Qwen3.8-27B-EXL3-4.0bpw.gguf = 14,755,790,624 bytes (the --fuse conversion, which is what was measured)",
       "bytes": 14755790624,
-      "cross_check": "docs/exl3.md line 255 gives 13.7 GiB; the unfused file is 14,741,371,648 bytes per docs/exl3.md line 92"
+      "cross_check": "docs/exl3.md line 287 gives 13.7 GiB; the unfused file is 14,741,371,648 bytes per docs/exl3.md line 92"
+     }
+    },
+    {
+     "format": "exl3_35",
+     "bpw": {
+      "value": 3.5,
+      "source": "the conversion's nominal width; a GGUFReader pass over the file counts 270 EXL3_4, 137 EXL3_3 and one EXL3_5 linear tensor with output.weight at EXL3_6"
+     },
+     "file_gib": {
+      "value": 12.325,
+      "source": "ls -l /home/jake-k/qwen38-bench/models/exl3-3.5bpw-gguf/Qwen3.8-27B-EXL3-3.5bpw.gguf = 13,233,389,472 bytes (the file the 3.5 bpw cells were measured on)",
+      "bytes": 13233389472
+     }
+    },
+    {
+     "format": "exl3_30",
+     "bpw": {
+      "value": 3.0,
+      "source": "the conversion's nominal width; a GGUFReader pass over the file counts 400 EXL3_3 and 8 EXL3_4 linear tensors with output.weight at EXL3_6"
+     },
+     "file_gib": {
+      "value": 10.91,
+      "source": "ls -l /home/jake-k/qwen38-bench/models/exl3-3.0bpw-gguf/Qwen3.8-27B-EXL3-3.0bpw.gguf = 11,714,920,352 bytes (the file the 3.0 bpw cells were measured on)",
+      "bytes": 11714920352
      }
     },
     {
@@ -674,7 +710,7 @@
   },
   "fig06": {
    "title": "v0.3.1 at a glance",
-   "message": "Four formats, one build, one 24 GB card. Blank cells are measurements that do not exist yet.",
+   "message": "Four formats, one build, one 24 GB card. A pending cell has no published number yet.",
    "footer": "One RTX 3090 Ti. Speed cells carry their own depth, seed count and drafter depth in the charts above.\n16 GB and 12 GB fit are judged from the 100K peak against 15,360 and 11,264 MiB (1 GB margin); 4 bpw 12 GB from file size alone.",
    "columns": [
     "bpw",
@@ -820,8 +856,8 @@
        "source": "EX8_bonsai_mtp/results_v031_ptq1/CB.rag_analysis.c16000.s{7300,7301}.json, 2 seeds, full run, build-v031"
       },
       {
-       "value": "59.1\n(16K)",
-       "source": "EX8_bonsai_mtp/results_v031_ptq1/CM.rag_analysis.c16000.s{7300,7301}.n3.json, 2 seeds, full run, MTP-3, build-v031"
+       "value": null,
+       "source": "pending re-measurement on the rewritten PTQ1_0 verify-width kernel, in final gating; see figures.fig01 bars[ptq1_0].mtp"
       },
       {
        "value": "11,165",
@@ -846,5 +882,117 @@
     }
    ]
   }
+ },
+ "exl3_widths": {
+  "title": "EXL3 at three bit widths",
+  "message": "The same model converted at 3.0, 3.5 and 4.0 bpw, on one fixture, seeds and build.",
+  "conditions": "One RTX 3090 Ti, build-v031, the 20,469-token EX5 depth fixture, ctx 45,056, temperature 1.0, reasoning_effort medium, n_predict 20,480 with a 5,000-generated floor, EOS honoured, seeds 7300/7301/7302 per cell, q8_0 K / turbo3 V, and on the drafted arm --spec-type draft-mtp --spec-draft-n-max 4 --spec-draft-p-min 0 with the 65,536-entry vocabulary map and q8_0/q8_0 draft KV. Peak VRAM is the largest whole-card sample of the seeds in the cell. Four of the six 3.0 bpw runs at 20K reached the 20,480-token cap; every other run stopped on EOS. Not plotted: this block backs the table in HIGHLIGHTS.md section 3.",
+  "rows": [
+   {
+    "format": "exl3_30",
+    "file_gib": {
+     "value": 10.91,
+     "source": "ls -l models/exl3-3.0bpw-gguf/Qwen3.8-27B-EXL3-3.0bpw.gguf = 11,714,920,352 bytes"
+    },
+    "t1_20k": {
+     "value": 38.809,
+     "source": "/home/jake-k/qwen38-bench/kernel_cache_investigation/EX5_depth_bench/results_v031_exl3_3.0/A1.20k.s{7300,7301,7302}.json, field decode.tok_s (38.96651, 39.09297, 38.36781), all valid=true, generated 20473, 20480, 20480, sd 0.39"
+    },
+    "mtp4_20k": {
+     "value": 80.666,
+     "source": "/home/jake-k/qwen38-bench/kernel_cache_investigation/EX5_depth_bench/results_v031_exl3_3.0/A.20k.s{7300,7301,7302}.json, field decode.tok_s (78.18959, 82.25069, 81.55849), all valid=true, generated 19109, 20480, 20480, acceptance 0.625, 0.634, 0.618, sd 2.17"
+    },
+    "peak_mib_t1": {
+     "value": 13160,
+     "source": "/home/jake-k/qwen38-bench/kernel_cache_investigation/EX5_depth_bench/results_v031_exl3_3.0/A1.20k.s*.json, field vram.peak_mib (13133, 13133, 13160)"
+    },
+    "peak_mib_mtp4": {
+     "value": 14403,
+     "source": "/home/jake-k/qwen38-bench/kernel_cache_investigation/EX5_depth_bench/results_v031_exl3_3.0/A.20k.s*.json, field vram.peak_mib (14403, 14325, 14291)"
+    },
+    "t1_64k": {
+     "value": 36.13,
+     "source": "/home/jake-k/qwen38-bench/kernel_cache_investigation/EX5_depth_bench/results_v031_exl3_3.0/A1.64k.s{7300,7301}.json, field decode.tok_s (36.18198, 36.07749), both valid=true, generated 20480 and 19950, sd 0.07, 65,531-token prompt, ctx 90,112"
+    },
+    "mtp4_64k": {
+     "value": 74.887,
+     "source": "/home/jake-k/qwen38-bench/kernel_cache_investigation/EX5_depth_bench/results_v031_exl3_3.0/A.64k.s{7300,7301}.json, field decode.tok_s (75.80772, 73.96538), both valid=true, generated 18836 and 20091, acceptance 0.642 and 0.624, sd 1.30, 65,531-token prompt, ctx 90,112"
+    },
+    "peak_mib_64k": {
+     "value": 15688,
+     "source": "/home/jake-k/qwen38-bench/kernel_cache_investigation/EX5_depth_bench/results_v031_exl3_3.0/A1.64k.s*.json 14,454 MiB (T=1) and A.64k.s*.json 15,687 / 15,688 MiB (MTP-4), field vram.peak_mib"
+    }
+   },
+   {
+    "format": "exl3_35",
+    "file_gib": {
+     "value": 12.325,
+     "source": "ls -l models/exl3-3.5bpw-gguf/Qwen3.8-27B-EXL3-3.5bpw.gguf = 13,233,389,472 bytes"
+    },
+    "t1_20k": {
+     "value": 39.856,
+     "source": "/home/jake-k/qwen38-bench/kernel_cache_investigation/EX5_depth_bench/results_v031_exl3_3.5/A1.20k.s{7300,7301,7302}.json, field decode.tok_s (40.07132, 39.75524, 39.74290), all valid=true, generated 8365, 15599, 14620, sd 0.19"
+    },
+    "mtp4_20k": {
+     "value": 81.832,
+     "source": "/home/jake-k/qwen38-bench/kernel_cache_investigation/EX5_depth_bench/results_v031_exl3_3.5/A.20k.s{7300,7301,7302}.json, field decode.tok_s (80.56065, 82.37747, 82.55850), all valid=true, generated 17993, 16158, 11035, acceptance 0.612, 0.623, 0.619, sd 1.11"
+    },
+    "peak_mib_t1": {
+     "value": 14634,
+     "source": "/home/jake-k/qwen38-bench/kernel_cache_investigation/EX5_depth_bench/results_v031_exl3_3.5/A1.20k.s*.json, field vram.peak_mib (14603, 14630, 14634)"
+    },
+    "peak_mib_mtp4": {
+     "value": 15756,
+     "source": "/home/jake-k/qwen38-bench/kernel_cache_investigation/EX5_depth_bench/results_v031_exl3_3.5/A.20k.s*.json, field vram.peak_mib (15756, 15715, 15736)"
+    },
+    "t1_64k": {
+     "value": null,
+     "source": "not run at 64K"
+    },
+    "mtp4_64k": {
+     "value": null,
+     "source": "not run at 64K"
+    },
+    "peak_mib_64k": {
+     "value": null,
+     "source": "not run at 64K"
+    }
+   },
+   {
+    "format": "exl3_40",
+    "file_gib": {
+     "value": 13.742,
+     "source": "ls -l models/exl3-4.0bpw-gguf/Qwen3.8-27B-EXL3-4.0bpw.gguf = 14,755,790,624 bytes"
+    },
+    "t1_20k": {
+     "value": 40.56,
+     "source": "EX5_depth_bench/results_v031/A1.20k.s{7300,7301,7302}.json, field decode.tok_s (40.62200, 40.39063, 40.66807), sd 0.15; the same cell as figures.fig01 bars[exl3_40].t1"
+    },
+    "mtp4_20k": {
+     "value": 81.896,
+     "source": "EX5_depth_bench/results_v031/A.20k.s{7300,7301,7302}.json, field decode.tok_s (81.63042, 82.81370, 81.24457), sd 0.82; the same cell as figures.fig01 bars[exl3_40].mtp"
+    },
+    "peak_mib_t1": {
+     "value": 16030,
+     "source": "EX5_depth_bench/results_v031/A1.20k.s*.json, field vram.peak_mib (16030, 16030, 16021)"
+    },
+    "peak_mib_mtp4": {
+     "value": 17154,
+     "source": "EX5_depth_bench/results_v031/A.20k.s*.json, field vram.peak_mib (17113, 17113, 17154); docs/exl3.md quotes the same 17,154 MiB"
+    },
+    "t1_64k": {
+     "value": null,
+     "source": "not run at 64K; the 4.0 bpw depth cell on record is the 51,196-token prompt in docs/exl3.md"
+    },
+    "mtp4_64k": {
+     "value": null,
+     "source": "not run at 64K; the 4.0 bpw depth cell on record is the 51,196-token prompt in docs/exl3.md"
+    },
+    "peak_mib_64k": {
+     "value": null,
+     "source": "not run at 64K"
+    }
+   }
+  ]
  }
 }

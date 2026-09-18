@@ -154,7 +154,7 @@ def legend_formats(ax, keys, ncols=None, y=-0.16, pending=True):
     handles = [Patch(facecolor=colour(k), edgecolor=SURFACE, label=FORMATS[k]["label"])
                for k in keys]
     if pending:
-        handles.append(Patch(facecolor=PANEL, edgecolor=INK3, hatch="//", label="not measured yet"))
+        handles.append(Patch(facecolor=PANEL, edgecolor=INK3, hatch="//", label="pending"))
     ax.legend(handles=handles, ncols=ncols or len(handles), loc="upper center",
               bbox_to_anchor=(0.5, y), frameon=False, labelcolor=INK2, handlelength=1.4,
               columnspacing=1.4)
