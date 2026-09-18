@@ -1,6 +1,6 @@
 # Bonsai 2 on llamAmpere v0.3.1
 
-This port adds CPU and CUDA inference for PrismML's Ternary Bonsai 2 27B. It is based on the v0.3.1 integration commit `8b7fbd6a5`, not the older v0.3 release. Merge this branch into the v0.3.1 integration branch after review.
+llamAmpere v0.3.1 adds CPU and CUDA inference for Prism ML's Ternary Bonsai 2 27B, and an SM86 decode path for its two ternary containers.
 
 ## Model and runtime
 
@@ -52,7 +52,17 @@ build-bonsai/bin/test-backend-ops -p '(pq2_0|ptq1_0)'
 
 Check executed counts, not only the final backend verdict. Preserve the raw logs and distinguish baseline failures from port regressions. The unchanged v0.3.1 baseline has strided `GET_ROWS` failures for `tq4_1s` where both CPU and CUDA contain NaNs.
 
-## Validation and Fable handoff
+## SM86 decode kernels (v0.3.1)
+
+Both containers hold the same ternary values and block scales (verified tensor by tensor); they differ only in packing. `PQ2_0` stores 2-bit codes and unpacks with one byte permute per 4 weights. `PTQ1_0` stores 5 trits per byte and needs a multiply-by-3 digit extraction, so its GEMV is ALU-bound rather than bandwidth-bound on a 3090 Ti: at 16K context `PQ2_0` decodes at 65 tok/s single-token and 100 tok/s with the MTP drafter, `PTQ1_0` at 55 and 60 tok/s, for about 2 GB more peak VRAM. Pick `PQ2_0` unless the card cannot hold it.
+
+The v0.3.1 `PTQ1_0` kernels do the following, all bit-exact against the Prism reference (greedy output hash unchanged):
+
+- Verify widths 2-8 (speculative decoding) run a cross-column reuse kernel: each 128-weight block is split over 4 lanes, each lane unpacks its quarter once and dots every column. The upstream path re-unpacked the block per column per row and spilled 540-1260 bytes per thread at widths 2-4, which made a width-4 verify cost 4.4 single-token steps. On by default on cc 8.6; `GGML_CUDA_SM86_PTQ1_REUSE=0` restores the generic path.
+- Rows per block at widths 2-4 drop from 8 to 2 for `PTQ1_0` (register pressure).
+- The dp4a products run on the unsigned digits 0..2 and the exact per-sub-block activation sum is subtracted once at the end, instead of a byte-wise `-1` correction on every 4-weight group. Same values, same summation order.
+
+## Validation
 
 Validated on an RTX 3090 Ti (SM86), Release CUDA build:
 
@@ -76,8 +86,23 @@ build-bonsai/bin/llama-completion \
 
 Use `-ngl 0` for the CPU reference. The output is ` Paris.\nThe capital of Germany is Berlin.\nThe capital of Italy is\n\n`, SHA256 `8d38418fef11ed83fdbb7e45f4b61bbcc979905965868241cbe1039357125a2d`.
 
-This is ready for testing and review, not a claim that every release gate is green. The unchanged baseline backend sweep found two failing `GET_ROWS(type=tq4_1s,n=256,m=5,r=4,be1=7,be2=1,vs0=1)` cases (`v=0` and `v=1`) and `MUL_MAT_ID(type_a=iq4_xs,type_b=f32,n_mats=17,n_used=1,b=1,m=1,n=1,k=512,amax=1.000000)` with error 0.003060764 versus tolerance 0.0005. A completed full post-port sweep is still required before release. Long-context quality, vision, speculative drafter compatibility, and hardware other than SM86 remain unvalidated. Short greedy matches are smoke tests, not a model-quality evaluation.
+The pre-existing baseline backend sweep has two failing `GET_ROWS(type=tq4_1s,n=256,m=5,r=4,be1=7,be2=1,vs0=1)` cases (`v=0` and `v=1`) and one `MUL_MAT_ID(type_a=iq4_xs,...,n_mats=17,n_used=1,...,k=512)` case with error 0.0031 versus tolerance 0.0005; none involve the ternary types. Long-context quality, vision, and hardware other than SM86 remain unvalidated. Short greedy matches are smoke tests, not a model-quality evaluation.
 
-The baseline sweep was stopped after these failures while the extended flash-attention cases were still running; it is not a complete baseline failure inventory. Its partial log is `/tmp/bonsai-baseline-backend.log`.
+Ready-to-run files with the Qwen3.8 MTP draft head fused in (`PQ2_0` and `PTQ1_0`) are published at [jakeatx/Qwen3.8-27B-GGUF](https://huggingface.co/jakeatx/Qwen3.8-27B-GGUF).
 
-Local handoff: `/home/jake-k/llamAmpere-BONSAI2`, with binaries under `build-bonsai/bin`. Raw local logs are `/tmp/bonsai-{turbo,quant,hadamard,ternary-backend}.log`, `/tmp/bonsai-{cpu,ptq-gpu,pq-gpu,turbo}-inference.log`, and `/tmp/bonsai-turbo-bench.log`; reference artifacts are `/tmp/bonsai2-reference-*`. These temporary paths are not portable or committed. Download checkpoints separately; model files are not included in the branch.
+## Credits
+
+Bonsai 2 27B is a Prism ML model (weights Apache 2.0, https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf).
+The PQ2_0 and PTQ1_0 quantization formats, the folded signed-Hadamard runtime, and the CPU/CUDA kernels
+in this port are adapted from Prism ML's llama.cpp fork (https://github.com/PrismML-Eng/llama.cpp, MIT,
+same license text as this repository) at the commit listed above. Cite the model as Prism ML asks:
+
+```bibtex
+@techreport{bonsai2_27b,
+    title   = {Bonsai 2 27B: A 27B Ternary Reasoning Model},
+    author  = {Prism ML},
+    year    = {2026},
+    month   = {September},
+    url     = {https://prismml.com}
+}
+```

@@ -1,3 +1,5 @@
+// Signed/blockwise FWHT for Prism ML's folded-Hadamard Bonsai 2 runtime: adapted from
+// https://github.com/PrismML-Eng/llama.cpp (MIT); see docs/bonsai2.md.
 #include "common.cuh"
 #include "fwht.cuh"
 

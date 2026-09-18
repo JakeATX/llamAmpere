@@ -182,6 +182,8 @@ void ggml_vec_dot_q1_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, c
     *s = sumf;
 }
 
+// PQ2_0 / PTQ1_0 ternary formats and kernels: adapted from Prism ML's llama.cpp fork
+// (https://github.com/PrismML-Eng/llama.cpp, MIT) for Ternary Bonsai 2; see docs/bonsai2.md.
 // PQ2_0 has four Q8_0 activation blocks per weight block.
 void ggml_vec_dot_pq2_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     const int qk = QK_PQ2_0;
