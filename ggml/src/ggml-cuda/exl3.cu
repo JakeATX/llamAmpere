@@ -208,9 +208,9 @@ void ggml_cuda_mul_mat_exl3(ggml_backend_cuda_context & ctx, const ggml_tensor *
     // y[N x T] = W[N x K] . X[K x T]  (fp16 inputs, fp32 accumulate/output)
     const float alpha = 1.0f;
     const float beta  = 0.0f;
-    CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(id), stream));
+    CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(), stream));
     CUBLAS_CHECK(
-        cublasGemmEx(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
+        cublasGemmEx(ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N,
                 (int) N, (int) T, (int) K,
                 &alpha, w_f16.get(), CUDA_R_16F, (int) K,
                         x_f16.get(), CUDA_R_16F, (int) K,
