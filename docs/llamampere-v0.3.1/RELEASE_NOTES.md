@@ -208,14 +208,24 @@ Numbers that are not in this document because no measurement supports them yet:
 
 - End-to-end model-level gain of `GGML_CUDA_SM86_IQ3_SMEM_GRID`: **TBD**. Only kernel microbenchmark
   deltas exist, and the sweep that produced them ran a configuration production does not.
-- Peak VRAM at 100K and 200K context, per format, on the v0.3.1 build: **TBD** for every format.
-  Existing figures are at 2K, 16K, 20K, 32K and 50K only.
+- Peak VRAM at 100K and 200K context, per format, on the v0.3.1 build: measured (whole card, context
+  filled to the stated depth, q8_0 K / turbo3 V, MTP drafter loaded). 100K: ATX IQ4_XS 19,670 MiB,
+  EXL3 4.0 18,859, PQ2_0 12,351, PTQ1_0 11,165. 200K: ATX 22,801, EXL3 22,032, PQ2_0 15,486,
+  PTQ1_0 14,342. All four sit under the 23,552 MiB budget at 200K; see HIGHLIGHTS.md section 4.
 - A v0.3.1 ladder against stock llama.cpp and TurboQuant, in the form v0.3 reports: **TBD**. No
   ship-corpus run has been made on this branch.
 - PQ2_0 and PTQ1_0 on the production ship corpus (coding, agentic, rag, 3 seeds, 20K generated,
   temperature 1.0): the 16K rag cells are full runs on the release build (quoted above, two seeds each).
   The coding and agentic 16K fixtures end under 5,000 generated tokens on every format, ternary and ATX
-  alike, so no ship number exists for them; the 64K and 100K rag cells are **TBD** (running).
+  alike, so no ship number exists for them. At 100K the primary rag prompt ends under 5,000 tokens on
+  every seed for both containers (1,500 to 4,750 generated), and at 64K on every seed but three PQ2_0
+  ones, so those cells use whatever reached the floor: PQ2_0 64K no drafter 59.8 tok/s (two seeds), PQ2_0 64K MTP-3 88.4 (one seed of
+  five), PQ2_0 100K on the fixture set's second prompt 54.5 no drafter and 82.9 MTP-3 (two seeds
+  each, acceptance 0.53 to 0.55, peak 13,015 MiB). PTQ1_0 has no full run at 64K without the drafter
+  on either prompt (ten runs, 2,135 to 4,427 tokens, 55.1 to 56.3 tok/s); with the drafter one seed of
+  ten reached the floor (56.6 tok/s, second prompt); at 100K on the second prompt it decodes at 51.2
+  tok/s without the drafter (two seeds, sd 0.02) and 52.7 with MTP-3 (two seeds, sd 0.41, acceptance
+  0.54), so at 100K the drafter is a wash on PTQ1_0 rather than a loss.
 - PQ2_0 prefill on the v0.3.1 build: **TBD**. The 1,418 tok/s figure on record is a 2K check on the
   earlier ternary build.
 - EXL3 at bit widths other than 4.0 (and the 6-bit head): **TBD**. Types 2, 3, 5, 7 and 8 are
