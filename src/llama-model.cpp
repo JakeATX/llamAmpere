@@ -371,25 +371,31 @@ llama_model * llama_model_create(llama_model_loader & ml, const llama_model_para
         throw std::runtime_error("unknown model architecture: '" + ml.get_arch_name() + "'");
     }
 
-    // EXL3 weights are not row-addressable (k-tile-major trellis order) and their .suh/.svh side vectors are
-    // not sharded by the meta backend, so a tensor split would slice the wrong bytes and abort in the CUDA
-    // kernel. Refuse at load with a clear message; single GPU and LLAMA_SPLIT_MODE_LAYER are supported.
-    if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
-        for (const auto & it : ml.weights_map) {
-            if (ggml_exl3_bits(it.second.tensor->type) != 0) {
-                throw std::runtime_error(std::string("LLAMA_SPLIT_MODE_TENSOR not implemented for EXL3 weights (tensor '") +
-                    it.first + "'), use --split-mode layer or a single GPU");
-            }
-        }
-    }
-
     return llama_model_create(arch, params);
 }
 
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata) {
     const llama_meta_device_get_split_state_userdata * ud = (const llama_meta_device_get_split_state_userdata *) userdata;
     const llama_hparams & hparams = ud->model->hparams;
-    const std::string tensor_name = tensor->name;
+    std::string tensor_name = tensor->name;
+
+    // EXL3 side vectors: .suh [K] scales the input of the weight W[K, N], .svh [N] its output (see build_lora_mm).
+    // Every rule below is written for the weight, so a side vector takes its weight's name and reference tensor
+    // and its axis is mapped afterwards: split on its only axis where it follows the weight's split axis, mirrored
+    // otherwise.
+    enum exl3_side_kind { EXL3_SIDE_NONE, EXL3_SIDE_SUH, EXL3_SIDE_SVH };
+    exl3_side_kind exl3_side = EXL3_SIDE_NONE;
+    const ggml_tensor * self_ref = tensor; // the tensor the rules see when no reference tensor is named
+    if (tensor_name.size() > 4 && (tensor_name.compare(tensor_name.size() - 4, 4, ".suh") == 0 ||
+                                   tensor_name.compare(tensor_name.size() - 4, 4, ".svh") == 0)) {
+        const std::string weight_name = tensor_name.substr(0, tensor_name.size() - 4) + ".weight";
+        const ggml_tensor * w = ud->model->get_tensor(weight_name.c_str());
+        if (w != nullptr && ggml_exl3_bits(w->type) != 0) {
+            exl3_side   = tensor_name.compare(tensor_name.size() - 4, 4, ".suh") == 0 ? EXL3_SIDE_SUH : EXL3_SIDE_SVH;
+            tensor_name = weight_name;
+            self_ref    = w;
+        }
+    }
     const bool is_dsv4 = ud->model->arch == LLM_ARCH_DEEPSEEK4 ||
         (ud->model->arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0);
 
@@ -481,7 +487,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             il = 0;
             rotation = hparams.n_layer() % ud->n_devices;
         }
-        const ggml_tensor * tensor_axis_0 = suffix.empty() ? tensor : ud->model->get_tensor((prefix + suffix).c_str());
+        const ggml_tensor * tensor_axis_0 = suffix.empty() ? self_ref : ud->model->get_tensor((prefix + suffix).c_str());
         if (tensor_axis_0 == nullptr) {
             GGML_ASSERT(!suffix_fallback.empty());
             tensor_axis_0 = ud->model->get_tensor((prefix + suffix_fallback).c_str());
@@ -661,6 +667,10 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 }
             } else {
                 const int64_t head_ratio = n_v_heads / n_k_heads;
+                if (std::regex_match(tensor_name, pattern_qkv_weight) && tensor->ne[axis] == 2*key_dim + 2*value_dim) {
+                    // EXL3 fused GDN projection [in_proj_qkv | in_proj_z] (attn_gate absent): z is split like v
+                    return {{key_dim, 2 + 2*head_ratio}};
+                }
                 if (std::regex_match(tensor_name, pattern_qkv_weight) || std::regex_match(tensor_name, pattern_ssm_conv1d)) {
                     GGML_ASSERT(tensor->ne[axis] == 2*key_dim + value_dim);
                     return {{key_dim, 2 + head_ratio}};
@@ -685,6 +695,10 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 const int64_t n_ff_exp = hparams.n_ff_exp(il);
                 GGML_ASSERT(tensor->ne[axis] == 2*n_ff_exp);
                 return {{n_ff_exp, 2}};
+            }
+            if (std::regex_match(tensor_name, pattern_ffn_up_weight) && tensor->ne[axis] == 2*hparams.n_ff(il)) {
+                // EXL3 fused dense FFN [ffn_gate | ffn_up] (ffn_gate absent)
+                return {{hparams.n_ff(il), 2}};
             }
             return {{tensor->ne[axis], 1}};
         }
@@ -866,6 +880,11 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         tc.axis = GGML_BACKEND_SPLIT_AXIS_MIRRORED;
     }
 
+    if (exl3_side != EXL3_SIDE_NONE) {
+        const bool follows = exl3_side == EXL3_SIDE_SUH ? tc.axis == GGML_BACKEND_SPLIT_AXIS_0 : tc.axis == GGML_BACKEND_SPLIT_AXIS_1;
+        tc.axis = follows ? GGML_BACKEND_SPLIT_AXIS_0 : GGML_BACKEND_SPLIT_AXIS_MIRRORED;
+    }
+
     split_state.axis = tc.axis;
     if (split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
         const int64_t blck_size = ggml_blck_size(tc.tensor_axis_0->type);
@@ -879,7 +898,16 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             }
         }
         const std::vector<std::pair<int64_t, uint32_t>> segments = get_split_segments(split_state.axis, tc.il);
-        const std::vector<int64_t> granularity = get_split_granularity(blck_size, tc.il, segments);
+        std::vector<int64_t> granularity = get_split_granularity(blck_size, tc.il, segments);
+        if (ggml_exl3_bits(self_ref->type) != 0) {
+            // EXL3 weights are stored as 16x16 trellis tiles with a 128-wide glue Hadamard on both axes, and the meta
+            // backend slices them (and the side vectors that follow them) in whole tiles: every per-device slice must
+            // be a whole number of quant blocks on either axis
+            const int64_t g_exl3 = ggml_blck_size(self_ref->type);
+            for (int64_t & g : granularity) {
+                g = std::lcm(g, g_exl3);
+            }
+        }
         for (size_t is = 0; is < segments.size(); is++) {
             const int64_t  ne_s = segments[is].first;
             const uint32_t nr_s = segments[is].second;

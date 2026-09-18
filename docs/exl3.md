@@ -197,10 +197,16 @@ Known limits:
 - **The side tensors ride on `src[2]`/`src[3]` of a `MUL_MAT` node.** `supports_op` does not inspect
   them, and graph reuse and the allocator were not extended for the extra sources. A backend that falls
   back for some other reason would silently drop the scale and Hadamard glue.
-- **No `--split-mode tensor`.** EXL3 tiles are not row-addressable and the `.suh`/`.svh` side vectors are
-  not sharded by the meta backend, so a tensor split would slice the wrong bytes. Loading an EXL3 model with
-  `--split-mode tensor` fails at load with *"LLAMA_SPLIT_MODE_TENSOR not implemented for EXL3 weights"*.
-  Single GPU and `--split-mode layer` are supported; layer split adds VRAM, not decode speed.
+- **`--split-mode tensor` is verified on emulated devices only.** The meta backend slices EXL3 weights in
+  whole 16x16 tiles (k-tile rows for an axis-0 split, n-tile runs inside every k-tile row for an axis-1 split)
+  and the `.suh`/`.svh` side vectors follow their weight's split, with every per-device slice a whole number of
+  256-weight quant blocks so the 128-block Hadamard glue stays local to a device. Checked against
+  `--split-mode layer` with `GGML_CUDA_DEVICES=2` and `3` on one card: mean KL of the tensor-split logits
+  against the layer-split logits is 0.0012 (2 devices) and 0.0011 (3 devices), below the 0.0027 the same
+  split introduces for a standard 4-bit quant, i.e. reduction-order noise. No measurement exists on real
+  multi-GPU hardware, the fused converter layouts (`attn_qkv` with `in_proj_z`, `ffn_up` with `ffn_gate`)
+  have split rules but no local file to exercise them, and MTP drafting does not yet work with
+  `--split-mode tensor` for any weight type (see `docs/multi-gpu.md`).
 - **`mul1` is the only codebook implemented.** exllamav3's `mcg` and the older `cb0` are not.
 
 Deferred to v0.4 with the rest of the release backlog: the prefill GEMM, `test-backend-ops` cases, and

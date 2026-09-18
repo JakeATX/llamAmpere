@@ -1318,12 +1318,110 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor(ggml_backend_buffer
     return ggml_backend_meta_buffer_init_tensor_impl(buf_ctx->get_simple_tensor_container(tensor), tensor);
 }
 
+// EXL3 trellis weights are stored k-tile-major, [K/16][N/16][tile], one 16x16 tile per quant block (see ggml.h), so a
+// slice along either axis is a set of whole tiles rather than a row-major byte range: along axis 0 each device's
+// k-tile rows form one contiguous run, along axis 1 each device's n-tiles form one run inside every k-tile row.
+struct ggml_backend_meta_exl3_run {
+    size_t j;        // device
+    size_t src_unit; // first tile along the split axis in the full tensor
+    size_t dst_unit; // first tile along the split axis in the device tensor
+    size_t n_units;  // tiles along the split axis
+};
+
+static std::vector<ggml_backend_meta_exl3_run> ggml_backend_meta_exl3_runs(
+        const ggml_tensor * tensor, const ggml_backend_meta_split_state & split_state, size_t n_bufs) {
+    GGML_ASSERT(ggml_exl3_bits(tensor->type) != 0);
+    GGML_ASSERT(split_state.axis == GGML_BACKEND_SPLIT_AXIS_0 || split_state.axis == GGML_BACKEND_SPLIT_AXIS_1);
+    GGML_ASSERT(tensor->ne[2] == 1 && tensor->ne[3] == 1);
+    GGML_ASSERT(tensor->ne[0] % 16 == 0 && tensor->ne[1] % 16 == 0);
+
+    std::vector<ggml_backend_meta_exl3_run> runs;
+    std::vector<size_t> dst_units(n_bufs, 0);
+    size_t src_unit = 0;
+    for (size_t s = 0; s < split_state.n_segments; s++) {
+        for (size_t r = 0; r < split_state.nr[s]; r++) {
+            for (size_t j = 0; j < n_bufs; j++) {
+                const int64_t ne = split_state.ne[s*n_bufs + j];
+                GGML_ASSERT(ne % 16 == 0);
+                const size_t n_units = ne / 16;
+                if (n_units > 0) {
+                    runs.push_back({j, src_unit, dst_units[j], n_units});
+                }
+                src_unit     += n_units;
+                dst_units[j] += n_units;
+            }
+        }
+    }
+    GGML_ASSERT((int64_t) src_unit * 16 == tensor->ne[split_state.axis]);
+    return runs;
+}
+
+enum ggml_backend_meta_exl3_op { GGML_META_EXL3_SET, GGML_META_EXL3_GET, GGML_META_EXL3_MEMSET };
+
+// set/get/memset of the byte range [offset, offset + size) of a tensor-split EXL3 weight
+static void ggml_backend_meta_buffer_exl3_op(ggml_backend_buffer_t buffer, const ggml_tensor * tensor,
+        const ggml_backend_meta_split_state & split_state, ggml_backend_meta_exl3_op op,
+        void * data, uint8_t value, size_t offset, size_t size) {
+    const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
+    const std::vector<ggml_backend_meta_exl3_run> runs = ggml_backend_meta_exl3_runs(tensor, split_state, n_bufs);
+    const size_t tb       = ggml_type_size(tensor->type);   // one 16x16 tile
+    const size_t row_full = (tensor->ne[1] / 16) * tb;      // one k-tile row of the full tensor
+    GGML_ASSERT(offset + size <= ggml_nbytes(tensor));
+
+    if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_0) {
+        // device j holds the k-tile rows [src_unit, src_unit + n_units): one contiguous run
+        for (const ggml_backend_meta_exl3_run & run : runs) {
+            ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, run.j);
+            const size_t src_lo = std::max(offset,        run.src_unit * row_full);
+            const size_t src_hi = std::min(offset + size, (run.src_unit + run.n_units) * row_full);
+            if (src_lo >= src_hi) {
+                continue;
+            }
+            const size_t dst    = run.dst_unit * row_full + (src_lo - run.src_unit * row_full);
+            const size_t nbytes = src_hi - src_lo;
+            switch (op) {
+                case GGML_META_EXL3_SET:    ggml_backend_tensor_set   (simple_tensor, (const char *) data + (src_lo - offset), dst, nbytes); break;
+                case GGML_META_EXL3_GET:    ggml_backend_tensor_get   (simple_tensor, (char *)       data + (src_lo - offset), dst, nbytes); break;
+                case GGML_META_EXL3_MEMSET: ggml_backend_tensor_memset(simple_tensor, value,                                   dst, nbytes); break;
+            }
+        }
+        return;
+    }
+
+    // axis 1: device j holds the n-tiles [src_unit, src_unit + n_units) of every k-tile row
+    GGML_ASSERT(offset % row_full == 0 && size % row_full == 0); // whole k-tile rows (the loader sets whole tensors)
+    const size_t kt0  = offset / row_full;
+    const size_t n_kt = size   / row_full;
+    for (const ggml_backend_meta_exl3_run & run : runs) {
+        ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, run.j);
+        const size_t row_j  = (simple_tensor->ne[1] / 16) * tb;
+        const size_t dst    = kt0 * row_j + run.dst_unit * tb;
+        const size_t nbytes = run.n_units * tb;
+        char * d = (char *) data + run.src_unit * tb; // in k-tile row kt0 of the request
+        switch (op) {
+            case GGML_META_EXL3_SET: ggml_backend_tensor_set_2d(simple_tensor, d, dst, nbytes, n_kt, row_j, row_full); break;
+            case GGML_META_EXL3_GET: ggml_backend_tensor_get_2d(simple_tensor, d, dst, nbytes, n_kt, row_j, row_full); break;
+            case GGML_META_EXL3_MEMSET: {
+                for (size_t kt = 0; kt < n_kt; kt++) {
+                    ggml_backend_tensor_memset(simple_tensor, value, dst + kt * row_j, nbytes);
+                }
+            } break;
+        }
+    }
+}
+
 static void ggml_backend_meta_buffer_memset_tensor(
         ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
     const ggml_backend_meta_split_state split_state =
             ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
     GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+
+    if (ggml_exl3_bits(tensor->type) != 0 &&
+            (split_state.axis == GGML_BACKEND_SPLIT_AXIS_0 || split_state.axis == GGML_BACKEND_SPLIT_AXIS_1)) {
+        ggml_backend_meta_buffer_exl3_op(buffer, tensor, split_state, GGML_META_EXL3_MEMSET, nullptr, value, offset, size);
+        return;
+    }
 
     if (split_state.n_segments != 1 || split_state.nr[0] != 1) {
         GGML_ASSERT(split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS);
@@ -1424,6 +1522,12 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
     GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+
+    if (ggml_exl3_bits(tensor->type) != 0 &&
+            (split_state.axis == GGML_BACKEND_SPLIT_AXIS_0 || split_state.axis == GGML_BACKEND_SPLIT_AXIS_1)) {
+        ggml_backend_meta_buffer_exl3_op(buffer, tensor, split_state, GGML_META_EXL3_SET, const_cast<void *>(data), 0, offset, size);
+        return;
+    }
 
     if (split_state.n_segments != 1 || split_state.nr[0] != 1) {
         GGML_ASSERT(split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS);
@@ -1552,6 +1656,12 @@ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, co
     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
     GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+
+    if (ggml_exl3_bits(tensor->type) != 0 &&
+            (split_state.axis == GGML_BACKEND_SPLIT_AXIS_0 || split_state.axis == GGML_BACKEND_SPLIT_AXIS_1)) {
+        ggml_backend_meta_buffer_exl3_op(buffer, tensor, split_state, GGML_META_EXL3_GET, data, 0, offset, size);
+        return;
+    }
 
     if (split_state.n_segments != 1 || split_state.nr[0] != 1) {
         GGML_ASSERT(split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS);
