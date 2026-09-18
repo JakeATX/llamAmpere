@@ -5,6 +5,25 @@
 #include "mmid.cuh"
 
 #include <cstdint>
+#include <cstdlib>
+
+// Some opt-in callers bypass ggml_cuda_should_use_mmq() after doing their own
+// activation preparation. Check that the selected architecture actually has
+// a launchable table entry before entering MMQ so unsupported combinations
+// can use their existing fallback instead of reaching J_best == 0 and aborting.
+bool ggml_cuda_mmq_has_config(
+        const ggml_type type, const int64_t nrows_x, const int cc, const size_t smpbo) {
+    const bool fallback = nrows_x % 128 != 0;
+
+    for (int J = 8; J <= 128; J += 8) {
+        const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc);
+        if (config.type != GGML_TYPE_COUNT && mmq_get_nbytes_shared(config, cc) <= smpbo) {
+            return true;
+        }
+    }
+
+    return false;
+}
 
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     switch (args.type_x) {
@@ -17,6 +36,14 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
         case GGML_TYPE_Q2_0:
             mul_mat_q_case<GGML_TYPE_Q2_0>(ctx, args, stream);
             break;
+        case GGML_TYPE_PQ2_0:
+            mul_mat_q_case<GGML_TYPE_PQ2_0>(ctx, args, stream);
+            break;
+#if !defined(GGML_USE_HIP)
+        case GGML_TYPE_PTQ1_0:
+            mul_mat_q_case<GGML_TYPE_PTQ1_0>(ctx, args, stream);
+            break;
+#endif
         case GGML_TYPE_Q4_0:
             mul_mat_q_case<GGML_TYPE_Q4_0>(ctx, args, stream);
             break;
@@ -181,7 +208,7 @@ void ggml_cuda_mul_mat_q(
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
-            ne1};
+            ne1, ne1};
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
         return;
     }
@@ -254,6 +281,13 @@ void ggml_cuda_mul_mat_q(
                                          ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
     const int64_t s13 = ne12*s12;
 
+    // Each expert only sees ne12*n_expert_used/ne02 tokens on average.
+    // On RDNA3 and RDNA4 it is faster to pick the tile size against this value instead of ne12.
+    int64_t ncols_opt = ne12;
+    if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
+        ncols_opt = (ne12*n_expert_used + ne02 - 1) / ne02;
+    }
+
     // Note that ne02 is used instead of ne12 because the number of y channels determines the z dimension of the CUDA grid.
     const mmq_args args = {
         src0_d, src0->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(), dst_d,
@@ -261,7 +295,7 @@ void ggml_cuda_mul_mat_q(
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
-        ne12};
+        ne12, ncols_opt};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
 }
@@ -274,8 +308,14 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
     bool mmq_supported;
 
     switch (type) {
+#if !defined(GGML_USE_HIP)
+        case GGML_TYPE_PTQ1_0:
+            mmq_supported = turing_mma_available(cc);
+            break;
+#endif
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q2_0:
+        case GGML_TYPE_PQ2_0:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
@@ -320,14 +360,33 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
         if (smpbo < 48 * 1024) {
             return false;
         }
+        if ((type == GGML_TYPE_PQ2_0 || type == GGML_TYPE_PTQ1_0) &&
+                !ggml_cuda_mmq_has_config(type, 1, cc, smpbo)) {
+            return false;
+        }
     }
+
+#if !defined(GGML_USE_HIP)
+    if (type == GGML_TYPE_PTQ1_0) {
+        // the fp16 dequantize + cuBLAS fallback is the source of PTQ1_0's extra error on CUDA, so
+        // the MMQ tile path runs at every batch by default; the env var is the A/B knob for
+        // deployments that prefer cuBLAS's ~7% at pp512 over the accuracy
+        static const int64_t max_batch = [] {
+            const char * s = getenv("GGML_CUDA_PTQ1_0_MMQ_MAX_BATCH");
+            return s ? (int64_t) atoll(s) : (int64_t) MMQ_PTQ1_0_MAX_BATCH_SIZE;
+        }();
+        return ne11 <= max_batch;
+    }
+#endif
 
     if (turing_mma_available(cc)) {
         return true;
     }
 
     if (ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_DP4A) {
-        return false;
+        // for MoE, mmq is faster even without native dp4a
+        // TODO: check if cards older than pascal might benefit from this as well
+        return cc >= GGML_CUDA_CC_PASCAL && n_experts > 0;
     }
 
 #ifdef GGML_CUDA_FORCE_MMQ
@@ -386,10 +445,10 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
         return true;
     }
 
-    // gfx900 (Vega 10) lacks native dp4a, loses to dequant + hipBLAS
+    // gfx900 (Vega 10), gfx909, and gfx90c lack native dp4a, losing to dequant + hipBLAS
     // for dense matrices; keep MMQ only for MoE, where the
     // hipBLAS path is much slower.
-    if (cc == GGML_CUDA_CC_VEGA) {
+    if (cc == GGML_CUDA_CC_VEGA || GGML_CUDA_CC_IS_GCN_APU(cc)) {
         return n_experts > 0;
     }
 

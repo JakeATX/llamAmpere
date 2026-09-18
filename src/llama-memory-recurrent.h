@@ -134,6 +134,7 @@ public:
     // per layer
     std::vector<ggml_tensor *> r_l;
     std::vector<ggml_tensor *> s_l;
+    // a second conv history that must stay replicated across devices, so it cannot share the r row
     std::vector<ggml_tensor *> p_l;
 
     // per layer, only allocated when gdn_replay is true: [n_embd_s_ingredient(), mem_size * n_rs_seq]
@@ -216,6 +217,13 @@ public:
     // DRC phase 2: pending replay length for the (single, in the n_seq_max==1 case) sequence
     // in the current ubatch, or 0 if none. Used by can_reuse() and the graph builder.
     uint32_t get_replay_len() const;
+
+    // DRC phase 2: mark the pending replay as consumed. Called exactly once per decode, after the
+    // graph has been built (every GDN layer reads get_replay_len() during build). Mirrors
+    // s_copy_idx()'s consume-and-clear of rs_idx: without it the first partial rejection latches a
+    // rollback that is re-applied on every later decode, so the recurrent state permanently trails
+    // the token stream.
+    void consume_replay_len() const;
 
 private:
     const llama_memory_status status;

@@ -1,0 +1,998 @@
+{
+ "meta": {
+  "release": "llamAmpere v0.3.1",
+  "model": "Qwen3.8-27B (ATX and EXL3 arms) / Prism ML Ternary Bonsai 2 27B (PQ2_0 and PTQ1_0 arms)",
+  "card": "one RTX 3090 Ti, whole-card VRAM budget 23,552 MiB",
+  "stamp": "llamAmpere v0.3.1",
+  "how_to_read": "Every plotted number is a {value, source} cell. value = null means the measurement does not exist yet, or is being redone on a changed kernel (the cell's source says which): make_figures.py draws that bar hatched and labels it 'pending'. Fill the value in and re-run the script unchanged. Nothing in this file is estimated, interpolated or rounded from a different condition than the one its label states.",
+  "conventions": {
+   "T=1": "single-token decode, no speculative drafter",
+   "MTP": "decode with the model's own MTP head as the drafter, at the draft depth named in the label",
+   "2K check": "a 2,048-token smoke generation, explicitly NOT a ship measurement; never plotted as one",
+   "full run": "20,480-token cap with a 5,000-generated-token floor, temperature 1.0, EOS honoured"
+  }
+ },
+ "format_order": [
+  "atx_iq4xs",
+  "exl3_40",
+  "exl3_35",
+  "exl3_30",
+  "pq2_0",
+  "ptq1_0"
+ ],
+ "formats": {
+  "atx_iq4xs": {
+   "label": "ATX IQ4_XS",
+   "long_label": "Qwen3.8-27B ATX-IQ4_XS-M (v0.3 configuration, unchanged in v0.3.1)",
+   "color_slot": 1
+  },
+  "exl3_40": {
+   "label": "EXL3 4.0 bpw",
+   "long_label": "Qwen3.8-27B EXL3 4.0 bpw, GGUF-native, output.weight at 6 bits",
+   "color_slot": 2
+  },
+  "pq2_0": {
+   "label": "PQ2_0 (ternary)",
+   "long_label": "Ternary Bonsai 2 27B, PQ2_0 container, with MTP head",
+   "color_slot": 3
+  },
+  "ptq1_0": {
+   "label": "PTQ1_0 (ternary)",
+   "long_label": "Ternary Bonsai 2 27B, PTQ1_0 container, with MTP head",
+   "color_slot": 4
+  },
+  "exl3_35": {
+   "label": "EXL3 3.5 bpw",
+   "long_label": "Qwen3.8-27B EXL3 3.5 bpw, GGUF-native, output.weight at 6 bits",
+   "color_slot": 5
+  },
+  "exl3_30": {
+   "label": "EXL3 3.0 bpw",
+   "long_label": "Qwen3.8-27B EXL3 3.0 bpw, GGUF-native, output.weight at 6 bits",
+   "color_slot": 7
+  }
+ },
+ "figures": {
+  "fig01": {
+   "title": "Four weight formats, one card, one binary",
+   "message": "Decode speed at a working context depth, with and without the MTP drafter.",
+   "footer": "One RTX 3090 Ti, temperature 1.0. Depth, seed count and drafter depth are printed under every bar.\nATX, PQ2_0 and PTQ1_0 share one 16K rag prompt, floor and seeds on the release build; EXL3 is its own 20K fixture.\nThe PTQ1_0 drafted cell is pending re-measurement on the rewritten verify-width kernel.",
+   "arms": [
+    "single token (T=1)",
+    "with the MTP drafter"
+   ],
+   "axis_max_fallback": 130,
+   "bars": [
+    {
+     "format": "atx_iq4xs",
+     "t1": {
+      "value": 46.247,
+      "label": "16K, 2 seeds",
+      "source": "/home/jake-k/qwen38-bench/kernel_cache_investigation/EX8_bonsai_mtp/results_atx_ab/v031/CB.rag_analysis.c16000.s7300.json and CB.rag_analysis.c16000.s7301.json, field decode.tok_s (46.46508, 46.02888), both valid=true, generated 7732 and 6194, build-v031",
+      "conditions": "16,000-token rag_analysis prompt, ctx 40,960, temperature 1.0, reasoning_effort medium, n_predict 20,480 with a 5,000-generated floor, EOS honoured, 2 seeds, sd 0.31, no drafter, model Qwen3.8-27B-ATX-4-XS.gguf",
+      "note": "First single-token ATX cell at depth on this fork; same cells as the MTP-3 bar."
+     },
+     "mtp": {
+      "value": 99.109,
+      "label": "16K, 2 seeds\nMTP-3",
+      "source": "/home/jake-k/qwen38-bench/kernel_cache_investigation/EX8_bonsai_mtp/results_atx_ab/v031/CM.rag_analysis.c16000.s7300.n3.json and CM.rag_analysis.c16000.s7301.n3.json, field decode.tok_s (95.83536, 102.38328), both valid=true, generated 8456 and 9126, build-v031",
+      "conditions": "16,000-token rag_analysis prompt, ctx 40,960, temperature 1.0, reasoning_effort medium, n_predict 20,480 with a 5,000-generated floor, EOS honoured, 2 seeds, sd 4.63, --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0 with the 65,536-entry vocabulary map, draft KV q8_0/q8_0, acceptance 0.626 and 0.694, model Qwen3.8-27B-ATX-4-XS.gguf",
+      "note": "Replaces the v0.3 article's 112.4 tok/s at 32K (2,048 generated, under the 5,000-token floor this document holds every other cell to). Same prompt, floor and seeds as the PQ2_0 and PTQ1_0 cells, so the four bars are now like for like at 16K. The v0.3 build on the identical cells gave 87.41 and 100.08 tok/s."
+     }
+    },
+    {
+     "format": "exl3_40",
+     "t1": {
+      "value": 40.56,
+      "label": "20K, 3 seeds",
+      "source": "/home/jake-k/qwen38-bench/kernel_cache_investigation/EX5_depth_bench/results_v031/A1.20k.s7300.json, A1.20k.s7301.json, A1.20k.s7302.json, field decode.tok_s (40.62200, 40.39063, 40.66807), all valid=true, generated 20084, 20040, 18915, build-v031",
+      "conditions": "20,469-token depth fixture, ctx 45,056, temperature 1.0, reasoning_effort medium, n_predict 20,480 with a 5,000-generated floor, EOS honoured, 3 seeds, sd 0.15, no drafter, q8_0 K / turbo3 V, model Qwen3.8-27B-EXL3-4.0bpw.gguf",
+      "note": "Replaces the 2K greedy 128-token kernel latency figure (41.3 tok/s) with a full run on the same fixture and seeds as the MTP-4 bar."
+     },
+     "mtp": {
+      "value": 81.896,
+      "label": "20K, 3 seeds\nMTP-4",
+      "source": "/home/jake-k/qwen38-bench/kernel_cache_investigation/EX5_depth_bench/results_v031/A.20k.s7300.json, A.20k.s7301.json, A.20k.s7302.json, field decode.tok_s (81.63042, 82.81370, 81.24457), all valid=true, generated 17188, 19524, 19470, build-v031",
+      "conditions": "20,469-token depth fixture, ctx 45,056, temperature 1.0, reasoning_effort medium, n_predict 20,480 with a 5,000-generated floor, EOS honoured, 3 seeds, sd 0.82, MTP depth 4 p-min 0, acceptance 0.61, 0.63, 0.61, q8_0 K / turbo3 V, release build (build-v031)",
+      "note": "Replaces the build-exl3 cell (81.27) with the release-build run on the same fixture and seeds; both builds agree within noise."
+     }
+    },
+    {
+     "format": "pq2_0",
+     "t1": {
+      "value": 69.678,
+      "label": "16K, 2 seeds",
+      "source": "/home/jake-k/qwen38-bench/kernel_cache_investigation/EX8_bonsai_mtp/results_v031_pq2/CB.rag_analysis.c16000.s7300.json and CB.rag_analysis.c16000.s7301.json, field decode.tok_s (69.93744, 69.41802), both valid=true, generated 5836, 9579, build-v031",
+      "conditions": "16,000-token rag_analysis prompt, ctx 40,960, temperature 1.0, reasoning_effort medium, n_predict 20,480 with a 5,000-generated floor, EOS honoured, 2 seeds, sd 0.37, model Ternary-Bonsai-2-27B-PQ2_0-MTP.gguf; release build (build-v031)",
+      "note": "Replaces the earlier-build cell (63.41, same output text hash 78182005c0f8ca3a on seed 7300) with the release-build run."
+     },
+     "mtp": {
+      "value": 104.746,
+      "label": "16K, 2 seeds\nMTP-3",
+      "source": "/home/jake-k/qwen38-bench/kernel_cache_investigation/EX8_bonsai_mtp/results_v031_pq2/CM.rag_analysis.c16000.s7300.n3.json and CM.rag_analysis.c16000.s7301.n3.json, field decode.tok_s (107.11030, 102.38109), both valid=true, generated 7813, 8853, build-v031",
+      "conditions": "same prompt and flags as the T=1 cell, plus --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0, draft KV q8_0/q8_0, sd 3.34; acceptance 0.59, 0.56; release build (build-v031)",
+      "note": "Replaces the build-bonsai-w4 cell (97.18) with the release-build run on the same cells."
+     }
+    },
+    {
+     "format": "ptq1_0",
+     "t1": {
+      "value": 62.842,
+      "label": "16K, 2 seeds",
+      "source": "/home/jake-k/qwen38-bench/kernel_cache_investigation/EX8_bonsai_mtp/results_v031_ptq1/CB.rag_analysis.c16000.s7300.json and CB.rag_analysis.c16000.s7301.json, field decode.tok_s (62.65374, 63.03056), both valid=true, generated 9943 and 11221, build-v031",
+      "conditions": "16,000-token rag_analysis prompt, ctx 40,960, temperature 1.0, reasoning_effort medium, n_predict 20,480 with a 5,000-generated floor, EOS honoured, 2 seeds, sd 0.27, model Ternary-Bonsai-2-27B-PTQ1_0-MTP.gguf",
+      "note": "Two seeds, one prompt domain, on the release build. The coding and agentic full runs at this depth stopped under the 5,000-token floor on every seed and are excluded."
+     },
+     "mtp": {
+      "value": null,
+      "label": "pending",
+      "source": "pending re-measurement: the PTQ1_0 verify-width kernel (widths 2 to 8) was rewritten after this cell was run and is in final gating, so the drafted cell will be filled from a run on the shipping kernel, on the same 16K rag prompt, floor and seeds as the T=1 cell",
+      "pending_reason": "the container's drafted decode is being re-measured on the rewritten verify-width kernel; the number lands in a follow-up commit to the release notes"
+     }
+    }
+   ],
+   "replaced_cells": [
+    {
+     "cell": "atx_iq4xs.mtp",
+     "previous": {
+      "value": 112.4,
+      "label": "32K, 3 runs\nMTP-3",
+      "source": "/home/jake-k/llamAmpere-V031/docs/llamampere-v0.3/ARTICLE.md line 527 (engine table, 32K row, llamAmpere v0.3 column); repeated in /home/jake-k/llamAmpere-V031/QWEN_AMPERE.md line 35",
+      "conditions": "32,768-token context, temperature 1.0, single stream, 2,048 generated tokens, mean of three runs, MTP depth 3, peak 18,812 MiB",
+      "note": "32K is the nearest measured depth to the 16-20K band; there is no 16K ATX depth cell."
+     }
+    },
+    {
+     "cell": "ptq1_0.mtp",
+     "previous": {
+      "value": null,
+      "label": "not usable",
+      "source": "pending: /home/jake-k/qwen38-bench/kernel_cache_investigation/EX8_bonsai_mtp/results/CM.rag_analysis.c16000.s7300.n3.json (55.18778) and CM.rag_analysis.c16000.s7301.n3.json (38.14370) are both valid=true but were produced by different build configurations hours apart, so their spread is build era and not seed noise",
+      "pending_reason": "the two surviving seeds are not a comparable pair; re-run needed before this cell can be published",
+      "candidate_values_not_plotted": [
+       55.18778,
+       38.1437
+      ]
+     }
+    },
+    {
+     "cell": "atx_iq4xs.t1",
+     "previous": {
+      "value": null,
+      "label": "not run",
+      "source": "not measured: QWEN_AMPERE.md and docs/llamampere-v0.3/ARTICLE.md report ATX only with the MTP drafter; no no-speculation arm at depth exists",
+      "pending_reason": "ATX single-token decode at 16-32K depth has never been run; every published ATX cell uses MTP"
+     }
+    },
+    {
+     "cell": "exl3_40.t1",
+     "previous": {
+      "value": 41.3,
+      "label": "2K ctx\ngreedy",
+      "source": "/home/jake-k/llamAmpere-V031/docs/exl3.md line 226 (Single-token decode table, 'shipped' row)",
+      "conditions": "llama-completion -ngl 99 -fa on -c 2048 -n 128 --temp 0, prompt 'The capital of France is', 24.2 ms/token, peak 14,783 MiB",
+      "note": "This is a kernel-latency measurement at 2K context, not a measurement at 16-20K depth. The label on the bar says so."
+     }
+    },
+    {
+     "cell": "pq2_0.t1",
+     "previous": {
+      "value": 63.413,
+      "label": "16K, 2 seeds",
+      "source": "/home/jake-k/qwen38-bench/kernel_cache_investigation/EX8_bonsai_mtp/results/CB.rag_analysis.c16000.s7300.json and CB.rag_analysis.c16000.s7301.json, field decode.tok_s (63.02288, 63.80361), both valid=true",
+      "conditions": "16,000-token rag_analysis prompt, ctx 40,960, temperature 1.0, reasoning_effort medium, n_predict 20,480 with a 5,000-generated floor, EOS honoured, 2 seeds, sd 0.55, model Ternary-Bonsai-2-27B-PQ2_0-MTP.gguf",
+      "note": "Two seeds, one prompt domain. The coding and agentic full runs at this depth stopped under the 5,000-token floor and are excluded."
+     }
+    },
+    {
+     "cell": "exl3_40.mtp",
+     "previous": {
+      "value": 81.27,
+      "label": "20K, 3 seeds\nMTP-4",
+      "source": "/home/jake-k/llamAmpere-V031/docs/exl3.md line 244 (Depth benchmark table, 20,469-token row); per-seed JSONs at /home/jake-k/qwen38-bench/kernel_cache_investigation/EX5_depth_bench/results/A.20k.s{7300,7301,7302}.json, field decode.tok_s",
+      "conditions": "20,469-token prompt, seeds 7300/7301/7302, temperature 1.0, n_predict 20,480, EOS honoured, MTP depth 4 with p-min 0, sd 0.39, peak 17,080 MiB, natural EOS on all three seeds (15,283 to 19,423 generated)"
+     }
+    },
+    {
+     "cell": "pq2_0.mtp",
+     "previous": {
+      "value": 97.179,
+      "label": "16K, 2 seeds\nMTP-3",
+      "source": "/home/jake-k/qwen38-bench/kernel_cache_investigation/EX8_bonsai_mtp/results_pq2/CM.rag_analysis.c16000.s7300.n3.json and CM.rag_analysis.c16000.s7301.n3.json, field decode.tok_s (98.78673, 95.57184), both valid=true",
+      "conditions": "same prompt and flags as the T=1 cell, plus --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0, draft KV q8_0/q8_0, sd 2.27"
+     }
+    }
+   ]
+  },
+  "fig02": {
+   "title": "The same four formats, deeper in the context",
+   "message": "What survives past 64K, and what has not been run there yet.",
+   "footer": "One RTX 3090 Ti, temperature 1.0. ATX: 2,048 generated, mean of three runs, MTP depth 3. EXL3: 3 seeds, MTP depth 4, on a 51,196-token\nprompt (50K, not 64K). Ternary: single-seed full runs, PQ2_0 on a rag prompt and PTQ1_0 on a coding prompt, so those two bars are not a pair.",
+   "arms": [
+    "single token (T=1)",
+    "with the MTP drafter"
+   ],
+   "axis_max_fallback": 120,
+   "panels": [
+    {
+     "label": "around 64K depth",
+     "bars": [
+      {
+       "format": "atx_iq4xs",
+       "t1": {
+        "value": null,
+        "label": "not run",
+        "source": "not measured; no no-speculation ATX arm exists at any depth",
+        "pending_reason": "same as fig01"
+       },
+       "mtp": {
+        "value": 100.7,
+        "label": "64K, 3 runs\nMTP-3",
+        "source": "/home/jake-k/llamAmpere-V031/docs/llamampere-v0.3/ARTICLE.md line 528 (engine table, 64K row, llamAmpere v0.3 column); repeated in /home/jake-k/llamAmpere-V031/QWEN_AMPERE.md line 35",
+        "conditions": "65,536-token context, temperature 1.0, single stream, 2,048 generated tokens, mean of three, MTP depth 3, peak 19,847 MiB"
+       }
+      },
+      {
+       "format": "exl3_40",
+       "t1": {
+        "value": null,
+        "label": "not run",
+        "source": "not measured; the only EXL3 single-token figure is the 2K-context latency cell in fig01",
+        "pending_reason": "no single-token EXL3 run at 50K or 64K"
+       },
+       "mtp": {
+        "value": 73.72,
+        "label": "50K prompt",
+        "source": "/home/jake-k/llamAmpere-V031/docs/exl3.md line 245 (Depth benchmark table, 51,196-token row); per-seed JSONs at /home/jake-k/qwen38-bench/kernel_cache_investigation/EX5_depth_bench/results/A.50k.s{7300,7301,7302}.json, field decode.tok_s",
+        "conditions": "51,196-token prompt (50K, not 64K), seeds 7300/7301/7302, temperature 1.0, n_predict 20,480, MTP depth 4 with p-min 0, sd 0.59, peak 17,893 MiB, cap reached on all three seeds",
+        "show_label": true
+       }
+      },
+      {
+       "format": "pq2_0",
+       "t1": {
+        "value": 58.384,
+        "label": "64K rag\n1 seed",
+        "source": "/home/jake-k/qwen38-bench/kernel_cache_investigation/EX8_bonsai_mtp/results_pq2/CB.rag_analysis.c64000.s7301.json, field decode.tok_s (58.38361), valid=true",
+        "conditions": "64,000-token rag_analysis prompt, ctx 90,112, temperature 1.0, n_predict 20,480 with a 5,000-generated floor, single seed (7301)",
+        "note": "One seed. The other three cells at this depth stopped under the 5,000-token floor and are excluded."
+       },
+       "mtp": {
+        "value": null,
+        "label": "no valid cell",
+        "source": "pending: all three attempted cells in /home/jake-k/qwen38-bench/kernel_cache_investigation/EX8_bonsai_mtp/results_pq2/ at c64000 with n3 carry valid=false with invalid_reason 'generated N tokens < floor 5000'; a fourth slot has only a lock-wait log and no JSON",
+        "pending_reason": "no cell cleared the 5,000-generated-token floor"
+       }
+      },
+      {
+       "format": "ptq1_0",
+       "t1": {
+        "value": 50.007,
+        "label": "64K coding\n1 seed",
+        "source": "/home/jake-k/qwen38-bench/kernel_cache_investigation/EX8_bonsai_mtp/results/CB.coding.c64000.s7300.json, field decode.tok_s (50.00674), valid=true, 6,109 generated",
+        "conditions": "64,000-token coding prompt, ctx 90,112, temperature 1.0, n_predict 20,480 with a 5,000-generated floor, single seed (7300), model Ternary-Bonsai-2-27B-PTQ1_0-MTP.gguf",
+        "note": "One seed, and a coding prompt where the PQ2_0 cell beside it is a rag prompt. The two 64K T=1 ternary bars are not a like-for-like pair."
+       },
+       "mtp": {
+        "value": null,
+        "label": "not run",
+        "source": "pending: no PTQ1_0 c64000 MTP cell exists in EX8_bonsai_mtp",
+        "pending_reason": "never run"
+       }
+      }
+     ]
+    },
+    {
+     "label": "100K depth",
+     "bars": [
+      {
+       "format": "atx_iq4xs",
+       "t1": {
+        "value": null,
+        "label": "not run",
+        "source": "not measured",
+        "pending_reason": "same as fig01"
+       },
+       "mtp": {
+        "value": 93.16,
+        "label": "100K, 3 runs\nMTP-3",
+        "source": "/home/jake-k/llamAmpere-V031/QWEN_AMPERE.md line 231 (100K-depth decomposition table, v0.3 row); headline restated at QWEN_AMPERE.md line 29",
+        "conditions": "100,000-token prompt, 2,048 generated, three runs, temperature 1.0, MTP depth 3, tok/pass 3.568, passes/s 27.22, acceptance 0.858"
+       }
+      },
+      {
+       "format": "exl3_40",
+       "t1": {
+        "value": null,
+        "label": "not run",
+        "source": "pending: no EXL3 cell at 100K depth exists",
+        "pending_reason": "never run"
+       },
+       "mtp": {
+        "value": null,
+        "label": "not run",
+        "source": "pending: the EXL3 depth benchmark stops at 51,196 tokens",
+        "pending_reason": "never run"
+       }
+      },
+      {
+       "format": "pq2_0",
+       "t1": {
+        "value": null,
+        "label": "not run",
+        "source": "pending: EX8_bonsai_mtp accepts c100000 as an argument but it was never invoked; no files exist",
+        "pending_reason": "never run"
+       },
+       "mtp": {
+        "value": null,
+        "label": "not run",
+        "source": "pending: no c100000 files exist in EX8_bonsai_mtp",
+        "pending_reason": "never run"
+       }
+      },
+      {
+       "format": "ptq1_0",
+       "t1": {
+        "value": null,
+        "label": "not run",
+        "source": "pending: no c100000 files exist in EX8_bonsai_mtp",
+        "pending_reason": "never run"
+       },
+       "mtp": {
+        "value": null,
+        "label": "not run",
+        "source": "pending: no c100000 files exist in EX8_bonsai_mtp",
+        "pending_reason": "never run"
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "fig03": {
+   "title": "What each format costs on disk",
+   "message": "Bits per weight, and the file you actually download, for every format v0.3.1 serves.",
+   "footer": "File sizes are ls -l byte counts of the served GGUFs divided by 2^30. Every file carries the model's\nnative single-layer MTP head. The ternary files are Ternary Bonsai 2 27B; the other four are Qwen3.8-27B.",
+   "axis_max_fallback": 18,
+   "bars": [
+    {
+     "format": "atx_iq4xs",
+     "bpw": {
+      "value": 4.56,
+      "source": "/home/jake-k/llamAmpere-V031/QWEN_AMPERE.md line 24 ('IQ4_XS base, M-pattern upgrades, 4.56 bpw')"
+     },
+     "file_gib": {
+      "value": 14.518,
+      "source": "ls -l /home/jake-k/qwen38-bench/models/atx4xs/Qwen3.8-27B-ATX-4-XS.gguf = 15,588,551,712 bytes",
+      "bytes": 15588551712,
+      "cross_check": "/home/jake-k/qwen38-bench/hf_staging/bonsai2/README.md line 23 gives 14.52 GiB; QWEN_AMPERE.md line 47 gives 14.5 GiB"
+     }
+    },
+    {
+     "format": "exl3_40",
+     "bpw": {
+      "value": 4.0,
+      "source": "/home/jake-k/llamAmpere-V031/docs/exl3.md line 92: every linear tensor is EXL3_4, output.weight is EXL3_6"
+     },
+     "file_gib": {
+      "value": 13.742,
+      "source": "ls -l /home/jake-k/qwen38-bench/models/exl3-4.0bpw-gguf/Qwen3.8-27B-EXL3-4.0bpw.gguf = 14,755,790,624 bytes (the --fuse conversion, which is what was measured)",
+      "bytes": 14755790624,
+      "cross_check": "docs/exl3.md line 287 gives 13.7 GiB; the unfused file is 14,741,371,648 bytes per docs/exl3.md line 92"
+     }
+    },
+    {
+     "format": "exl3_35",
+     "bpw": {
+      "value": 3.5,
+      "source": "the conversion's nominal width; a GGUFReader pass over the file counts 270 EXL3_4, 137 EXL3_3 and one EXL3_5 linear tensor with output.weight at EXL3_6"
+     },
+     "file_gib": {
+      "value": 12.325,
+      "source": "ls -l /home/jake-k/qwen38-bench/models/exl3-3.5bpw-gguf/Qwen3.8-27B-EXL3-3.5bpw.gguf = 13,233,389,472 bytes (the file the 3.5 bpw cells were measured on)",
+      "bytes": 13233389472
+     }
+    },
+    {
+     "format": "exl3_30",
+     "bpw": {
+      "value": 3.0,
+      "source": "the conversion's nominal width; a GGUFReader pass over the file counts 400 EXL3_3 and 8 EXL3_4 linear tensors with output.weight at EXL3_6"
+     },
+     "file_gib": {
+      "value": 10.91,
+      "source": "ls -l /home/jake-k/qwen38-bench/models/exl3-3.0bpw-gguf/Qwen3.8-27B-EXL3-3.0bpw.gguf = 11,714,920,352 bytes (the file the 3.0 bpw cells were measured on)",
+      "bytes": 11714920352
+     }
+    },
+    {
+     "format": "pq2_0",
+     "bpw": {
+      "value": 2.125,
+      "source": "/home/jake-k/llamAmpere-V031/docs/llamampere-v0.3.1/RELEASE_NOTES.md (Known TBDs) and /home/jake-k/qwen38-bench/hf_staging/bonsai2/README.md line 22"
+     },
+     "file_gib": {
+      "value": 6.987,
+      "source": "ls -l /home/jake-k/qwen38-bench/models/bonsai2/Ternary-Bonsai-2-27B-PQ2_0-MTP.gguf = 7,502,169,376 bytes",
+      "bytes": 7502169376,
+      "cross_check": "hf_staging/bonsai2/README.md line 22 gives 6.99 GiB. Without the MTP head the official PQ2_0 checkpoint is 7,206,168,928 bytes (6.711 GiB), docs/bonsai2.md."
+     }
+    },
+    {
+     "format": "ptq1_0",
+     "bpw": {
+      "value": 1.75,
+      "source": "/home/jake-k/llamAmpere-V031/docs/llamampere-v0.3.1/RELEASE_NOTES.md (Known TBDs) and /home/jake-k/qwen38-bench/hf_staging/bonsai2/README.md line 21"
+     },
+     "file_gib": {
+      "value": 5.814,
+      "source": "ls -l /home/jake-k/qwen38-bench/models/bonsai2/Ternary-Bonsai-2-27B-PTQ1_0-MTP.gguf = 6,242,649,376 bytes",
+      "bytes": 6242649376,
+      "cross_check": "hf_staging/bonsai2/README.md line 21 gives 5.81 GiB. Without the MTP head the official PTQ1_0 checkpoint is 5,946,648,928 bytes (5.538 GiB), docs/bonsai2.md."
+     }
+    }
+   ]
+  },
+  "fig04": {
+   "title": "Peak VRAM deep in the context",
+   "message": "Whole-card peak with the KV cache allocated for the full window and the context filled to the label's depth.",
+   "footer": "Source: frontier/V031_vram_probe/vram_probe.csv on build-v031, cache q8_0 K / turbo3 V, MTP drafter loaded.\n200K bars are the 199,830-token fill; the 100K-fill run at -c 204800 is within 40 MiB of it on every format.",
+   "axis_max_fallback": 26000,
+   "ceiling_mib": {
+    "value": 23552,
+    "source": "/home/jake-k/llamAmpere-V031/docs/exl3.md line 207 and the EX5/EX8 run configs (config.cap_mib = 23552): the whole-card budget every benchmark on this fork enforces"
+   },
+   "ceiling_label": "23,552 MiB, the 24 GB card ceiling",
+   "expected_csv": {
+    "path": "/home/jake-k/qwen38-bench/kernel_cache_investigation/frontier/V031_vram_probe/vram_probe.csv",
+    "exists": true,
+    "columns": [
+     "quant",
+     "ctx",
+     "baseline_mib",
+     "ready_mib",
+     "peak_mib",
+     "fits"
+    ],
+    "note": "The directory does not exist as of 2026-09-17. A repo-wide search for vram_probe finds nothing, and no v0.3.1 VRAM data at 100K or 200K exists anywhere. The prerequisite is recorded as a queue item at frontier/WORK_LEDGER.md line 5392."
+   },
+   "panels": [
+    {
+     "label": "100K context",
+     "bars": [
+      {
+       "format": "atx_iq4xs",
+       "peak_mib": {
+        "value": 19670,
+        "source": "vram_probe.csv row model=atx4xs,ctx=102400: peak 19670 MiB whole-card (ready 19591, baseline 1231), prompt 99919 tokens + 32 generated, MTP n-max 3, cache q8_0/turbo3, build-v031"
+       }
+      },
+      {
+       "format": "exl3_40",
+       "peak_mib": {
+        "value": 18859,
+        "source": "vram_probe.csv row model=exl3_4.0,ctx=102400: peak 18859 MiB whole-card (ready 18343, baseline 1241), prompt 99919 tokens + 32 generated, MTP n-max 4, cache q8_0/turbo3, build-v031"
+       }
+      },
+      {
+       "format": "pq2_0",
+       "peak_mib": {
+        "value": 12351,
+        "source": "vram_probe.csv row model=pq2_0_mtp,ctx=102400: peak 12351 MiB whole-card (ready 12262, baseline 1218), prompt 99919 tokens + 32 generated, MTP n-max 3, cache q8_0/turbo3, build-v031"
+       }
+      },
+      {
+       "format": "ptq1_0",
+       "peak_mib": {
+        "value": 11165,
+        "source": "vram_probe.csv row model=ptq1_0_mtp,ctx=102400: peak 11165 MiB whole-card (ready 11126, baseline 1226), prompt 99919 tokens + 32 generated, MTP n-max 3, cache q8_0/turbo3, build-v031"
+       }
+      }
+     ]
+    },
+    {
+     "label": "200K context",
+     "bars": [
+      {
+       "format": "atx_iq4xs",
+       "peak_mib": {
+        "value": 22801,
+        "source": "vram_probe.csv row model=atx4xs_full200k,ctx=204800: peak 22801 MiB whole-card (ready 22715, baseline 1221), prompt 199830 tokens + 32 generated, MTP n-max 3, cache q8_0/turbo3, build-v031"
+       }
+      },
+      {
+       "format": "exl3_40",
+       "peak_mib": {
+        "value": 22032,
+        "source": "vram_probe.csv row model=exl3_4.0_full200k,ctx=204800: peak 22032 MiB whole-card (ready 21475, baseline 1227), prompt 199830 tokens + 32 generated, MTP n-max 4, cache q8_0/turbo3, build-v031"
+       }
+      },
+      {
+       "format": "pq2_0",
+       "peak_mib": {
+        "value": 15486,
+        "source": "vram_probe.csv row model=pq2_0_mtp_full200k,ctx=204800: peak 15486 MiB whole-card (ready 15407, baseline 1227), prompt 199830 tokens + 32 generated, MTP n-max 3, cache q8_0/turbo3, build-v031"
+       }
+      },
+      {
+       "format": "ptq1_0",
+       "peak_mib": {
+        "value": 14342,
+        "source": "vram_probe.csv row model=ptq1_0_mtp_full200k,ctx=204800: peak 14342 MiB whole-card (ready 14257, baseline 1221), prompt 199830 tokens + 32 generated, MTP n-max 3, cache q8_0/turbo3, build-v031"
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "fig05": {
+   "title": "Against the alternatives, on the same card",
+   "message": "Decode tok/s, ours divided by theirs, single stream on one RTX 3090 Ti.",
+   "footer": "Comparison runtimes are deliberately unnamed. Every row is single-stream decode, temperature 1.0, on one\nRTX 3090 Ti under the 23,552 MiB whole-card budget. Conditions differ per row; they are listed in the document.",
+   "axis_max_fallback": 2.0,
+   "legend_formats": [
+    "atx_iq4xs",
+    "exl3_40"
+   ],
+   "bars": [
+    {
+     "format": "exl3_40",
+     "label": "EXL3 4.0 bpw, 20K depth\nvs alternate runtime A",
+     "ratio": {
+      "value": 1.072,
+      "derived": false,
+      "source": "/home/jake-k/qwen38-bench/kernel_cache_investigation/frontier/WORK_LEDGER.md line 5219 (EX5 depth benchmark, section starting line 5201)"
+     },
+     "ours_tok_s": {
+      "value": 81.27,
+      "source": "WORK_LEDGER.md lines 5211-5216; per-seed JSONs EX5_depth_bench/results/A.20k.s{7300,7301,7302}.json field decode.tok_s, sd 0.39"
+     },
+     "theirs_tok_s": {
+      "value": 75.81,
+      "source": "WORK_LEDGER.md lines 5211-5216; per-seed JSONs EX5_depth_bench/results/B.20k.s{7300,7301,7302}.json field decode.tok_s, sd 0.45"
+     },
+     "conditions": "same client (SP3_engine_compare/engine_bench.py), same 20,469-token prompt, seeds 7300/7301/7302, temperature 1.0, n_predict 20,480, draft depth 4 on both sides, one fresh server boot per measured request, 12/12 cells valid. Peak VRAM 17,080 MiB ours, 18,299 MiB theirs.",
+     "caveat": "Ours is the only cell where all three seeds stopped on EOS short of the cap, so the two sides are not generating equally long texts. Acceptance is flat across both engines and both depths (cell means 0.608 to 0.642). The other runtime prefills faster than ours in this matrix (about 992-1050 against 782-825 tok/s at 20K)."
+    },
+    {
+     "format": "exl3_40",
+     "label": "EXL3 4.0 bpw, 50K depth\nvs alternate runtime A",
+     "ratio": {
+      "value": 1.239,
+      "derived": false,
+      "source": "/home/jake-k/qwen38-bench/kernel_cache_investigation/frontier/WORK_LEDGER.md line 5219"
+     },
+     "ours_tok_s": {
+      "value": 73.72,
+      "source": "WORK_LEDGER.md lines 5211-5216; EX5_depth_bench/results/A.50k.s{7300,7301,7302}.json, sd 0.59"
+     },
+     "theirs_tok_s": {
+      "value": 59.51,
+      "source": "WORK_LEDGER.md lines 5211-5216; EX5_depth_bench/results/B.50k.s{7300,7301,7302}.json, sd 1.33"
+     },
+     "conditions": "51,196-token prompt, otherwise identical to the 20K row. Peak VRAM 17,893 MiB ours, 20,237 MiB theirs.",
+     "caveat": "Both sides hit the 20,480-token cap except one of their seeds, which stopped naturally at 20,301."
+    },
+    {
+     "format": "atx_iq4xs",
+     "label": "ATX IQ4_XS, clean fixtures\nvs alternate runtime B",
+     "ratio": {
+      "value": 1.464,
+      "derived": false,
+      "source": "/home/jake-k/llamAmpere-V031/QWEN_AMPERE.md line 199 and /home/jake-k/llamAmpere-V031/docs/llamampere-v0.3/ARTICLE.md line 44 (mean of per-cell ratios, range 1.445 to 1.486)"
+     },
+     "ours_tok_s": {
+      "value": 99.4,
+      "source": "QWEN_AMPERE.md line 199, 'all clean fixtures' row, v0.3 column"
+     },
+     "theirs_tok_s": {
+      "value": 67.9,
+      "source": "QWEN_AMPERE.md line 199, same row, first comparison column"
+     },
+     "conditions": "four clean fixtures (three agentic, one coding), temperature 1.0, top-k 20, top-p 0.95, MTP depth 3, mean of three runs per cell, each arm built clean and launched with only the flags its own tree understands.",
+     "caveat": "The ratio is the mean of per-cell ratios, not the ratio of the column means. Retrieval fixtures and two coding cells are excluded because every arm but ours degenerates into repetition, and degenerate text inflates a drafted arm's tok/s."
+    },
+    {
+     "format": "atx_iq4xs",
+     "label": "ATX IQ4_XS, clean fixtures\nvs alternate runtime C",
+     "ratio": {
+      "value": 1.608,
+      "derived": false,
+      "source": "/home/jake-k/llamAmpere-V031/QWEN_AMPERE.md line 199 (mean of per-cell ratios, range 1.508 to 1.851)"
+     },
+     "ours_tok_s": {
+      "value": 99.4,
+      "source": "QWEN_AMPERE.md line 199, 'all clean fixtures' row, v0.3 column"
+     },
+     "theirs_tok_s": {
+      "value": 62.4,
+      "source": "QWEN_AMPERE.md line 199, same row, second comparison column"
+     },
+     "conditions": "same protocol as the row above.",
+     "caveat": "One cell in this arm splices two collection epochs because no single epoch reached three clean runs; the alternative reading moves this ratio in our favour, and the reported value is the less flattering one."
+    },
+    {
+     "format": "atx_iq4xs",
+     "label": "ATX IQ4_XS, 100K depth\nvs alternate runtime C",
+     "ratio": {
+      "value": 1.7,
+      "derived": false,
+      "source": "/home/jake-k/llamAmpere-V031/QWEN_AMPERE.md line 29 and line 196 (100K-depth decomposition table)"
+     },
+     "ours_tok_s": {
+      "value": 93.16,
+      "source": "QWEN_AMPERE.md line 231, v0.3 row"
+     },
+     "theirs_tok_s": {
+      "value": 54.96,
+      "source": "QWEN_AMPERE.md line 230, comparison row"
+     },
+     "conditions": "100,000-token prompt, 2,048 generated, three runs, temperature 1.0, MTP depth 3.",
+     "caveat": "The kernel's share of the log gain rises from 83 percent on short fixtures to 95 percent here; the margin is the attention stack, not the drafter."
+    },
+    {
+     "format": "atx_iq4xs",
+     "label": "ATX IQ4_XS, 32K context\nvs alternate runtime D",
+     "ratio": {
+      "value": 1.1,
+      "derived": false,
+      "source": "/home/jake-k/llamAmpere-V031/docs/llamampere-v0.3/ARTICLE.md line 527 ('v0.3 over best other' column, 32K row)"
+     },
+     "ours_tok_s": {
+      "value": 112.4,
+      "source": "ARTICLE.md line 527, 32K row, llamAmpere v0.3 column (peak 18,812 MiB)"
+     },
+     "theirs_tok_s": {
+      "value": 101.7,
+      "source": "ARTICLE.md line 527, 32K row, best comparison column (peak 23,295 MiB)"
+     },
+     "conditions": "temperature 1.0, single stream, 2,048 generated tokens, mean of three, all arms under the 23,552 MiB cap at peak. The comparison runtime ran its own best speculative configuration, tuned rather than defaulted.",
+     "caveat": "The comparison runtimes cannot load our GGUF, so they serve a different checkpoint of the same model, text-only, with less compressed KV. That asymmetry favours us on memory and is why they run out of card past 64K."
+    },
+    {
+     "format": "atx_iq4xs",
+     "label": "ATX IQ4_XS, 64K context\nvs alternate runtime D",
+     "ratio": {
+      "value": 1.11,
+      "derived": false,
+      "source": "/home/jake-k/llamAmpere-V031/docs/llamampere-v0.3/ARTICLE.md line 528 ('v0.3 over best other' column, 64K row)"
+     },
+     "ours_tok_s": {
+      "value": 100.7,
+      "source": "ARTICLE.md line 528, 64K row, llamAmpere v0.3 column (peak 19,847 MiB)"
+     },
+     "theirs_tok_s": {
+      "value": 90.3,
+      "source": "ARTICLE.md line 528, 64K row, best comparison column (peak 23,356 MiB)"
+     },
+     "conditions": "as the 32K row.",
+     "caveat": "Sample SD of the comparison runtime's 64K tok/s is 3.8."
+    },
+    {
+     "format": "atx_iq4xs",
+     "label": "ATX IQ4_XS, 32K context\nvs alternate runtime E",
+     "ratio": {
+      "value": 1.638,
+      "derived": true,
+      "source": "derived as 112.4 / 68.6 from /home/jake-k/llamAmpere-V031/docs/llamampere-v0.3/ARTICLE.md line 527; the source table prints no ratio for this pair"
+     },
+     "ours_tok_s": {
+      "value": 112.4,
+      "source": "ARTICLE.md line 527, 32K row, llamAmpere v0.3 column"
+     },
+     "theirs_tok_s": {
+      "value": 68.6,
+      "source": "ARTICLE.md line 527, 32K row, fourth column (peak 23,028 MiB)"
+     },
+     "conditions": "as the other 32K row; this runtime ran its own speculative path at 3 steps and 4 draft tokens, tuned.",
+     "caveat": "Ratio computed here from the two published means, not reported in the source table."
+    },
+    {
+     "format": "atx_iq4xs",
+     "label": "ATX IQ4_XS, 64K context\nvs alternate runtime E",
+     "ratio": {
+      "value": 1.564,
+      "derived": true,
+      "source": "derived as 100.7 / 64.4 from /home/jake-k/llamAmpere-V031/docs/llamampere-v0.3/ARTICLE.md line 528; the source table prints no ratio for this pair"
+     },
+     "ours_tok_s": {
+      "value": 100.7,
+      "source": "ARTICLE.md line 528, 64K row, llamAmpere v0.3 column"
+     },
+     "theirs_tok_s": {
+      "value": 64.4,
+      "source": "ARTICLE.md line 528, 64K row, fourth column (peak 23,348 MiB)"
+     },
+     "conditions": "as the row above.",
+     "caveat": "Ratio computed here from the two published means, not reported in the source table."
+    }
+   ]
+  },
+  "fig06": {
+   "title": "v0.3.1 at a glance",
+   "message": "Four formats, one build, one 24 GB card. A pending cell has no published number yet.",
+   "footer": "One RTX 3090 Ti. Speed cells carry their own depth, seed count and drafter depth in the charts above.\n16 GB and 12 GB fit are judged from the 100K peak against 15,360 and 11,264 MiB (1 GB margin); 4 bpw 12 GB from file size alone.",
+   "columns": [
+    "bpw",
+    "file size",
+    "T=1\ntok/s",
+    "MTP tok/s\n16-20K",
+    "peak VRAM\n100K",
+    "fits\n12 GB",
+    "fits\n16 GB",
+    "fits\n24 GB"
+   ],
+   "rows": [
+    {
+     "format": "atx_iq4xs",
+     "cells": [
+      {
+       "value": "4.56",
+       "source": "QWEN_AMPERE.md line 24"
+      },
+      {
+       "value": "14.52 GiB",
+       "source": "ls -l /home/jake-k/qwen38-bench/models/atx4xs/Qwen3.8-27B-ATX-4-XS.gguf"
+      },
+      {
+       "value": "46.2\n(16K)",
+       "source": "EX8_bonsai_mtp/results_atx_ab/v031/CB.rag_analysis.c16000.s{7300,7301}.json, 2 seeds, full run, build-v031"
+      },
+      {
+       "value": "99.1\n(16K)",
+       "source": "EX8_bonsai_mtp/results_atx_ab/v031/CM.rag_analysis.c16000.s{7300,7301}.n3.json, 2 seeds, full run, MTP-3, build-v031"
+      },
+      {
+       "value": "19,670",
+       "source": "vram_probe.csv row model=atx4xs,ctx=102400, column peak_mib"
+      },
+      {
+       "value": "no",
+       "source": "derived: the weight file alone is 14.52 GiB, larger than a 12 GB card",
+       "derived": true
+      },
+      {
+       "value": "no at 100K",
+       "source": "derived: 100K peak 19670 MiB vs 15,360 MiB (16 GB card minus the same 1 GB margin the 23,552 MiB cap leaves on 24 GB); shallower contexts not probed",
+       "derived": true
+      },
+      {
+       "value": "yes",
+       "source": "QWEN_AMPERE.md line 36: a 245,760-token window with a 240K prompt at 22.1 GiB ready, under the 23,552 MiB budget"
+      }
+     ]
+    },
+    {
+     "format": "exl3_40",
+     "cells": [
+      {
+       "value": "4.0",
+       "source": "docs/exl3.md line 92"
+      },
+      {
+       "value": "13.74 GiB",
+       "source": "ls -l /home/jake-k/qwen38-bench/models/exl3-4.0bpw-gguf/Qwen3.8-27B-EXL3-4.0bpw.gguf"
+      },
+      {
+       "value": "40.6\n(20K)",
+       "source": "EX5_depth_bench/results_v031/A1.20k.s{7300,7301,7302}.json, 3 seeds, full run, build-v031"
+      },
+      {
+       "value": "81.9\n(20K)",
+       "source": "EX5_depth_bench/results_v031/A.20k.s{7300,7301,7302}.json, 3 seeds, full runs, build-v031"
+      },
+      {
+       "value": "18,859",
+       "source": "vram_probe.csv row model=exl3_4.0,ctx=102400, column peak_mib"
+      },
+      {
+       "value": "no",
+       "source": "derived: the weight file alone is 13.74 GiB, larger than a 12 GB card",
+       "derived": true
+      },
+      {
+       "value": "no\n(20K)",
+       "source": "docs/exl3.md line 244: peak 17,080 MiB at a 20K prompt, above a 16 GB card"
+      },
+      {
+       "value": "yes",
+       "source": "docs/exl3.md line 245: peak 17,893 MiB at a 50K prompt, under the 23,552 MiB budget"
+      }
+     ]
+    },
+    {
+     "format": "pq2_0",
+     "cells": [
+      {
+       "value": "2.125",
+       "source": "hf_staging/bonsai2/README.md line 22"
+      },
+      {
+       "value": "6.99 GiB",
+       "source": "ls -l /home/jake-k/qwen38-bench/models/bonsai2/Ternary-Bonsai-2-27B-PQ2_0-MTP.gguf"
+      },
+      {
+       "value": "69.7\n(16K)",
+       "source": "EX8_bonsai_mtp/results_v031_pq2/CB.rag_analysis.c16000.s{7300,7301}.json, 2 seeds, full runs, build-v031"
+      },
+      {
+       "value": "104.7\n(16K)",
+       "source": "EX8_bonsai_mtp/results_v031_pq2/CM.rag_analysis.c16000.s{7300,7301}.n3.json, 2 seeds, full runs, build-v031"
+      },
+      {
+       "value": "12,351",
+       "source": "vram_probe.csv row model=pq2_0_mtp,ctx=102400, column peak_mib"
+      },
+      {
+       "value": "no at 100K",
+       "source": "derived: 100K peak 12351 MiB vs 11,264 MiB (12 GB minus a 1 GB margin); fits at a shallower depth (not probed)",
+       "derived": true
+      },
+      {
+       "value": "yes (100K)",
+       "source": "derived: 100K peak 12351 MiB vs 15,360 MiB (16 GB card minus the same 1 GB margin the 23,552 MiB cap leaves on 24 GB); shallower contexts not probed",
+       "derived": true
+      },
+      {
+       "value": "yes (200K)",
+       "source": "derived: 200K full-depth peak 15486 MiB vs the 23,552 MiB cap (vram_probe.csv row pq2_0_mtp_full200k,204800)",
+       "derived": true
+      }
+     ]
+    },
+    {
+     "format": "ptq1_0",
+     "cells": [
+      {
+       "value": "1.75",
+       "source": "hf_staging/bonsai2/README.md line 21"
+      },
+      {
+       "value": "5.81 GiB",
+       "source": "ls -l /home/jake-k/qwen38-bench/models/bonsai2/Ternary-Bonsai-2-27B-PTQ1_0-MTP.gguf"
+      },
+      {
+       "value": "62.8\n(16K)",
+       "source": "EX8_bonsai_mtp/results_v031_ptq1/CB.rag_analysis.c16000.s{7300,7301}.json, 2 seeds, full run, build-v031"
+      },
+      {
+       "value": null,
+       "source": "pending re-measurement on the rewritten PTQ1_0 verify-width kernel, in final gating; see figures.fig01 bars[ptq1_0].mtp"
+      },
+      {
+       "value": "11,165",
+       "source": "vram_probe.csv row model=ptq1_0_mtp,ctx=102400, column peak_mib"
+      },
+      {
+       "value": "yes (100K)",
+       "source": "derived: 100K peak 11165 MiB vs 11,264 MiB (12 GB card minus the same 1 GB margin the 23,552 MiB cap leaves on 24 GB); PTQ1_0 clears it by 99 MiB, so shallower context or the v0.4 small-card work is the practical answer",
+       "derived": true
+      },
+      {
+       "value": "yes (100K)",
+       "source": "derived: 100K peak 11165 MiB vs 15,360 MiB (16 GB card minus the same 1 GB margin the 23,552 MiB cap leaves on 24 GB); shallower contexts not probed",
+       "derived": true
+      },
+      {
+       "value": "yes (200K)",
+       "source": "derived: 200K full-depth peak 14342 MiB vs the 23,552 MiB cap (vram_probe.csv row ptq1_0_mtp_full200k,204800)",
+       "derived": true
+      }
+     ]
+    }
+   ]
+  }
+ },
+ "exl3_widths": {
+  "title": "EXL3 at three bit widths",
+  "message": "The same model converted at 3.0, 3.5 and 4.0 bpw, on one fixture, seeds and build.",
+  "conditions": "One RTX 3090 Ti, build-v031, the 20,469-token EX5 depth fixture, ctx 45,056, temperature 1.0, reasoning_effort medium, n_predict 20,480 with a 5,000-generated floor, EOS honoured, seeds 7300/7301/7302 per cell, q8_0 K / turbo3 V, and on the drafted arm --spec-type draft-mtp --spec-draft-n-max 4 --spec-draft-p-min 0 with the 65,536-entry vocabulary map and q8_0/q8_0 draft KV. Peak VRAM is the largest whole-card sample of the seeds in the cell. Four of the six 3.0 bpw runs at 20K reached the 20,480-token cap; every other run stopped on EOS. Not plotted: this block backs the table in HIGHLIGHTS.md section 3.",
+  "rows": [
+   {
+    "format": "exl3_30",
+    "file_gib": {
+     "value": 10.91,
+     "source": "ls -l models/exl3-3.0bpw-gguf/Qwen3.8-27B-EXL3-3.0bpw.gguf = 11,714,920,352 bytes"
+    },
+    "t1_20k": {
+     "value": 38.809,
+     "source": "/home/jake-k/qwen38-bench/kernel_cache_investigation/EX5_depth_bench/results_v031_exl3_3.0/A1.20k.s{7300,7301,7302}.json, field decode.tok_s (38.96651, 39.09297, 38.36781), all valid=true, generated 20473, 20480, 20480, sd 0.39"
+    },
+    "mtp4_20k": {
+     "value": 80.666,
+     "source": "/home/jake-k/qwen38-bench/kernel_cache_investigation/EX5_depth_bench/results_v031_exl3_3.0/A.20k.s{7300,7301,7302}.json, field decode.tok_s (78.18959, 82.25069, 81.55849), all valid=true, generated 19109, 20480, 20480, acceptance 0.625, 0.634, 0.618, sd 2.17"
+    },
+    "peak_mib_t1": {
+     "value": 13160,
+     "source": "/home/jake-k/qwen38-bench/kernel_cache_investigation/EX5_depth_bench/results_v031_exl3_3.0/A1.20k.s*.json, field vram.peak_mib (13133, 13133, 13160)"
+    },
+    "peak_mib_mtp4": {
+     "value": 14403,
+     "source": "/home/jake-k/qwen38-bench/kernel_cache_investigation/EX5_depth_bench/results_v031_exl3_3.0/A.20k.s*.json, field vram.peak_mib (14403, 14325, 14291)"
+    },
+    "t1_64k": {
+     "value": 36.13,
+     "source": "/home/jake-k/qwen38-bench/kernel_cache_investigation/EX5_depth_bench/results_v031_exl3_3.0/A1.64k.s{7300,7301}.json, field decode.tok_s (36.18198, 36.07749), both valid=true, generated 20480 and 19950, sd 0.07, 65,531-token prompt, ctx 90,112"
+    },
+    "mtp4_64k": {
+     "value": 74.887,
+     "source": "/home/jake-k/qwen38-bench/kernel_cache_investigation/EX5_depth_bench/results_v031_exl3_3.0/A.64k.s{7300,7301}.json, field decode.tok_s (75.80772, 73.96538), both valid=true, generated 18836 and 20091, acceptance 0.642 and 0.624, sd 1.30, 65,531-token prompt, ctx 90,112"
+    },
+    "peak_mib_64k": {
+     "value": 15688,
+     "source": "/home/jake-k/qwen38-bench/kernel_cache_investigation/EX5_depth_bench/results_v031_exl3_3.0/A1.64k.s*.json 14,454 MiB (T=1) and A.64k.s*.json 15,687 / 15,688 MiB (MTP-4), field vram.peak_mib"
+    }
+   },
+   {
+    "format": "exl3_35",
+    "file_gib": {
+     "value": 12.325,
+     "source": "ls -l models/exl3-3.5bpw-gguf/Qwen3.8-27B-EXL3-3.5bpw.gguf = 13,233,389,472 bytes"
+    },
+    "t1_20k": {
+     "value": 39.856,
+     "source": "/home/jake-k/qwen38-bench/kernel_cache_investigation/EX5_depth_bench/results_v031_exl3_3.5/A1.20k.s{7300,7301,7302}.json, field decode.tok_s (40.07132, 39.75524, 39.74290), all valid=true, generated 8365, 15599, 14620, sd 0.19"
+    },
+    "mtp4_20k": {
+     "value": 81.832,
+     "source": "/home/jake-k/qwen38-bench/kernel_cache_investigation/EX5_depth_bench/results_v031_exl3_3.5/A.20k.s{7300,7301,7302}.json, field decode.tok_s (80.56065, 82.37747, 82.55850), all valid=true, generated 17993, 16158, 11035, acceptance 0.612, 0.623, 0.619, sd 1.11"
+    },
+    "peak_mib_t1": {
+     "value": 14634,
+     "source": "/home/jake-k/qwen38-bench/kernel_cache_investigation/EX5_depth_bench/results_v031_exl3_3.5/A1.20k.s*.json, field vram.peak_mib (14603, 14630, 14634)"
+    },
+    "peak_mib_mtp4": {
+     "value": 15756,
+     "source": "/home/jake-k/qwen38-bench/kernel_cache_investigation/EX5_depth_bench/results_v031_exl3_3.5/A.20k.s*.json, field vram.peak_mib (15756, 15715, 15736)"
+    },
+    "t1_64k": {
+     "value": null,
+     "source": "not run at 64K"
+    },
+    "mtp4_64k": {
+     "value": null,
+     "source": "not run at 64K"
+    },
+    "peak_mib_64k": {
+     "value": null,
+     "source": "not run at 64K"
+    }
+   },
+   {
+    "format": "exl3_40",
+    "file_gib": {
+     "value": 13.742,
+     "source": "ls -l models/exl3-4.0bpw-gguf/Qwen3.8-27B-EXL3-4.0bpw.gguf = 14,755,790,624 bytes"
+    },
+    "t1_20k": {
+     "value": 40.56,
+     "source": "EX5_depth_bench/results_v031/A1.20k.s{7300,7301,7302}.json, field decode.tok_s (40.62200, 40.39063, 40.66807), sd 0.15; the same cell as figures.fig01 bars[exl3_40].t1"
+    },
+    "mtp4_20k": {
+     "value": 81.896,
+     "source": "EX5_depth_bench/results_v031/A.20k.s{7300,7301,7302}.json, field decode.tok_s (81.63042, 82.81370, 81.24457), sd 0.82; the same cell as figures.fig01 bars[exl3_40].mtp"
+    },
+    "peak_mib_t1": {
+     "value": 16030,
+     "source": "EX5_depth_bench/results_v031/A1.20k.s*.json, field vram.peak_mib (16030, 16030, 16021)"
+    },
+    "peak_mib_mtp4": {
+     "value": 17154,
+     "source": "EX5_depth_bench/results_v031/A.20k.s*.json, field vram.peak_mib (17113, 17113, 17154); docs/exl3.md quotes the same 17,154 MiB"
+    },
+    "t1_64k": {
+     "value": null,
+     "source": "not run at 64K; the 4.0 bpw depth cell on record is the 51,196-token prompt in docs/exl3.md"
+    },
+    "mtp4_64k": {
+     "value": null,
+     "source": "not run at 64K; the 4.0 bpw depth cell on record is the 51,196-token prompt in docs/exl3.md"
+    },
+    "peak_mib_64k": {
+     "value": null,
+     "source": "not run at 64K"
+    }
+   }
+  ]
+ }
+}

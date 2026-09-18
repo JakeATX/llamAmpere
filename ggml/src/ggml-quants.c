@@ -71,6 +71,41 @@ void quantize_row_q1_0_ref(const float * GGML_RESTRICT x, block_q1_0 * GGML_REST
     }
 }
 
+// Q2_0_g128: identical 2-bit codec to Q2_0, one fp16 scale per 128 weights.
+void quantize_row_pq2_0_ref(const float * GGML_RESTRICT x, block_pq2_0 * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_PQ2_0;
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        float amax = 0.0f;
+        for (int j = 0; j < qk; j++) {
+            const float a = fabsf(x[i*qk + j]);
+            if (a > amax) amax = a;
+        }
+        const float d = amax;
+        const float id = d > 0.0f ? 1.0f / d : 0.0f;
+
+        y[i].d = GGML_FP32_TO_FP16(d);
+
+        for (int j = 0; j < qk / 4; ++j) {
+            y[i].qs[j] = 0;
+        }
+
+        for (int j = 0; j < qk; ++j) {
+            const float w = x[i*qk + j];
+            int q = (int)roundf(w * id) + 1;
+            if (q < 0) q = 0;
+            if (q > 3) q = 3;
+            const int byte_index = j / 4;
+            const int bit_offset = (j % 4) * 2;
+            y[i].qs[byte_index] |= ((uint8_t)q << bit_offset);
+        }
+    }
+}
+
 void quantize_row_q2_0_ref(const float * GGML_RESTRICT x, block_q2_0 * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK2_0;
 
@@ -105,6 +140,26 @@ void quantize_row_q2_0_ref(const float * GGML_RESTRICT x, block_q2_0 * GGML_REST
             const int byte_index = j / 4;
             const int bit_offset = (j % 4) * 2;
             y[i].qs[byte_index] |= ((uint8_t)q << bit_offset);
+        }
+    }
+}
+
+void dequantize_row_pq2_0(const block_pq2_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_PQ2_0;
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+
+        for (int j = 0; j < qk; ++j) {
+            const int byte_index = j / 4;
+            const int bit_offset = (j % 4) * 2;
+            const uint8_t q = (x[i].qs[byte_index] >> bit_offset) & 0x03;
+            // 00=-1, 01=0, 10=+1, 11=+2
+            y[i*qk + j] = ((int)q - 1) * d;
         }
     }
 }
@@ -658,6 +713,21 @@ size_t quantize_q5_cr(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
     const size_t row_size = ggml_row_size(GGML_TYPE_Q5_CR, n_per_row);
     for (int64_t row = 0; row < nrow; ++row) {
         quantize_row_q5_cr_ref(src + row*n_per_row, (block_q5_cr *)((char *) dst + row*row_size), n_per_row);
+    }
+    return nrow * row_size;
+}
+
+size_t quantize_pq2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    if (!quant_weights) {
+        quantize_row_pq2_0_ref(src, dst, (int64_t)nrow*n_per_row);
+        return nrow * ggml_row_size(GGML_TYPE_PQ2_0, n_per_row);
+    }
+    size_t row_size = ggml_row_size(GGML_TYPE_PQ2_0, n_per_row);
+    char * qrow = (char *)dst;
+    for (int64_t row = 0; row < nrow; ++row) {
+        quantize_row_pq2_0_ref(src, (block_pq2_0*)qrow, n_per_row);
+        src += n_per_row;
+        qrow += row_size;
     }
     return nrow * row_size;
 }
@@ -2252,6 +2322,107 @@ size_t quantize_q2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, 
     for (int64_t row = 0; row < nrow; ++row) {
         quantize_row_q2_0_ref(src, (block_q2_0*)qrow, n_per_row);
         src += n_per_row;
+        qrow += row_size;
+    }
+    return nrow * row_size;
+}
+
+// ====================== PTQ1_0 (Prism ternary, group 128) ======================
+// Base-3 trit packing identical to upstream TQ1_0, but at block 128 so one fp16
+// scale covers 128 weights. qs is 24 bytes, which TQ1_0's fixed 32-then-16 byte
+// staging cannot cover, so the stages are generalised to 32/16/8; at TQ1_0's
+// 48-byte qs this reduces to exactly its original 32-then-16 behaviour.
+static const size_t ptq1_0_stages[3] = {32, 16, 8};
+
+void quantize_row_ptq1_0_ref(const float * GGML_RESTRICT x, block_ptq1_0 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_PTQ1_0 == 0);
+    const int64_t nb = k / QK_PTQ1_0;
+
+    for (int64_t i = 0; i < nb; i++) {
+        float amax = 0.0f;
+        for (int j = 0; j < QK_PTQ1_0; j++) {
+            amax = MAX(amax, fabsf(x[j]));
+        }
+
+        const float d  = amax;
+        const float id = d ? 1.0f/d : 0.0f;
+
+        y[i].d = GGML_FP32_TO_FP16(d);
+
+        size_t j = 0;
+        for (size_t s = 0; s < 3; ++s) {
+            const size_t c = ptq1_0_stages[s];
+            for (; j + c <= sizeof(y->qs); j += c) {
+                for (size_t m = 0; m < c; ++m) {
+                    uint8_t q = 0;
+                    for (size_t n = 0; n < 5; ++n) {
+                        int xi = lroundf(x[m + n*c] * id) + 1; // -1, 0, 1 -> 0, 1, 2
+                        q *= 3;
+                        q += xi;
+                    }
+                    // ceiling division (243 == pow(3, 5))
+                    q = ((uint16_t)q * 256 + (243 - 1)) / 243;
+                    y[i].qs[j + m] = q;
+                }
+                x += 5*c;
+            }
+        }
+        // 4 elements per byte
+        for (size_t h = 0; h < sizeof(y->qh); ++h) {
+            uint8_t q = 0;
+            for (size_t m = 0; m < 4; ++m) {
+                int xi = lroundf(x[h + m*sizeof(y->qh)] * id) + 1;
+                q *= 3;
+                q += xi;
+            }
+            // shift the first value to the most significant trit
+            q *= 3;
+            q = ((uint16_t)q * 256 + (243 - 1)) / 243;
+            y[i].qh[h] = q;
+        }
+        x += 4*sizeof(y->qh);
+    }
+}
+
+void dequantize_row_ptq1_0(const block_ptq1_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_PTQ1_0 == 0);
+    const int64_t nb = k / QK_PTQ1_0;
+
+    const uint8_t pow3[6] = {1, 3, 9, 27, 81, 243};
+
+    for (int64_t i = 0; i < nb; ++i) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+
+        size_t j = 0;
+        for (size_t s = 0; s < 3; ++s) {
+            const size_t c = ptq1_0_stages[s];
+            for (; j + c <= sizeof(x->qs); j += c) {
+                for (size_t n = 0; n < 5; ++n) {
+                    for (size_t m = 0; m < c; ++m) {
+                        uint8_t q = x[i].qs[j + m] * pow3[n];
+                        int16_t xi = ((uint16_t) q * 3) >> 8;
+                        *y++ = (float) (xi - 1) * d;
+                    }
+                }
+            }
+        }
+        for (size_t n = 0; n < 4; ++n) {
+            for (size_t h = 0; h < sizeof(x->qh); ++h) {
+                uint8_t q = x[i].qh[h] * pow3[n];
+                int16_t xi = ((uint16_t) q * 3) >> 8;
+                *y++ = (float) (xi - 1) * d;
+            }
+        }
+    }
+}
+
+size_t quantize_ptq1_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    (void)quant_weights; // ternary codes come from the weights themselves; an imatrix has no role
+    const size_t row_size = ggml_row_size(GGML_TYPE_PTQ1_0, n_per_row);
+    char * qrow = (char *)dst;
+    for (int64_t row = 0; row < nrow; ++row) {
+        quantize_row_ptq1_0_ref(src, (block_ptq1_0 *)qrow, n_per_row);
+        src  += n_per_row;
         qrow += row_size;
     }
     return nrow * row_size;
@@ -5548,7 +5719,7 @@ static bool validate_e_e8m0(uint8_t e, size_t i) {
     }
 
 bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbytes) {
-    if (type < 0 || type >= GGML_TYPE_COUNT) {
+    if (type < 0 || type >= GGML_TYPE_COUNT || ggml_type_size(type) == 0) {
         fprintf(stderr, "%s: invalid type %d\n", __func__, type);
         return false;
     }
@@ -5578,6 +5749,10 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
                     fprintf(stderr, "%s: found %d infinities in row of %zu BF16 values\n", __func__, infs, nb);
                     return false;
                 }
+            } break;
+        case GGML_TYPE_PTQ1_0:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_ptq1_0, data, nb);
             } break;
         case GGML_TYPE_F16:
             {
@@ -5677,6 +5852,10 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_Q2_0:
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_q2_0, data, nb);
+            } break;
+        case GGML_TYPE_PQ2_0:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_pq2_0, data, nb);
             } break;
         case GGML_TYPE_Q4_0:
             {
@@ -5824,4 +6003,44 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
     }
 
     return true;
+}
+
+// ====================== EXL3 (exllamav3 trellis) reference decoder
+// EXL3 format and codebook: Turboderp, exllamav3 (https://github.com/turboderp-org/exllamav3), MIT License,
+// Copyright (c) 2025 Turboderp; see licenses/LICENSE-exllamav3. Independent reimplementation.
+
+static inline float ggml_exl3_mul1_decode(uint32_t code) {
+    // exllamav3 "mul1" codebook (cb2): x = code * 0x83DCD12D mod 2^32; s = bytesum(x) + 0x6400 taken as an fp16 bit
+    // pattern; value = hfma(s, fp16(0x1eee), fp16(0xc931)) -- one rounding to fp16.
+    const uint32_t x = code * 0x83DCD12Du;
+    const uint32_t s = (x & 0xffu) + ((x >> 8) & 0xffu) + ((x >> 16) & 0xffu) + ((x >> 24) & 0xffu) + 0x6400u;
+    const float h = GGML_FP16_TO_FP32((ggml_fp16_t) s);
+    const float v = h * GGML_FP16_TO_FP32((ggml_fp16_t) 0x1eee) + GGML_FP16_TO_FP32((ggml_fp16_t) 0xc931); // exact in fp32
+    return GGML_FP16_TO_FP32(GGML_FP32_TO_FP16(v));
+}
+
+void ggml_exl3_dequantize_row_group(const void * GGML_RESTRICT data, int64_t K, int64_t N, int bits, int64_t g, float * GGML_RESTRICT y) {
+    assert(bits >= 2 && bits <= 8 && K % 16 == 0 && N % 16 == 0 && g >= 0 && 16*g < N);
+    const int64_t kt = K / 16;
+    const int64_t nt = N / 16;
+    const int nw = 8 * bits;        // uint32 words per 16x16 tile
+    const int nbits = 256 * bits;   // circular bit stream length per tile
+    const uint32_t * base = (const uint32_t *) data;
+    for (int64_t ki = 0; ki < kt; ++ki) {
+        const uint32_t * w = base + (ki * nt + g) * nw;
+        for (int t = 0; t < 256; ++t) {
+            // 16-bit window: word i holds stream bits [32i, 32i+32) MSB-first; the window starts at stream bit b0
+            const int b0 = ((t + 257) * bits - 16) % nbits;
+            const int i0 = b0 >> 5;
+            const int sh = b0 & 31;
+            const uint64_t c = ((uint64_t) w[i0] << 32) | (uint64_t) w[(i0 + 1) % nw];
+            const uint32_t code = (uint32_t) ((c >> (48 - sh)) & 0xffffu);
+            // reconstruct.cu lane layout: t = lane*8 + j
+            const int lane = t >> 3;
+            const int j = t & 7;
+            const int row = 2 * (lane & 3) + (j & 1) + 8 * ((j >> 1) & 1);      // k within the tile
+            const int col = 2 * (lane >> 3) + ((lane >> 2) & 1) + 8 * (j >> 2);  // n within the tile
+            y[(int64_t) col * K + ki * 16 + row] = ggml_exl3_mul1_decode(code);
+        }
+    }
 }

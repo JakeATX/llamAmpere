@@ -1327,9 +1327,10 @@ void ggml_cuda_mul_mat_tq4_1s_cublas(ggml_backend_cuda_context & ctx,
     const float beta  = 0.0f;
     const int64_t ldc = dst->ne[0];  // M
 
-    CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(id), stream));
+    cublasHandle_t cublas_h = ctx.cublas_handle();
+    CUBLAS_CHECK(cublasSetStream(cublas_h, stream));
     CUBLAS_CHECK(
-        cublasGemmEx(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
+        cublasGemmEx(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
                 ne01, ne11, ne00,
                 &alpha, src0_f16.get(), CUDA_R_16F, ne00,
                         src1_f16.get(), CUDA_R_16F, ne10,

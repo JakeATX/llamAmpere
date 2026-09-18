@@ -8,7 +8,6 @@ struct __builtin_align__(32) float8 {
     float x; float y; float z; float w;
     float p; float q; float r; float s;
 };
-#endif
 
 #if CUDART_VERSION >= 12080
 static __device__ __forceinline__ float nvfp4_native_scale_error(
@@ -49,6 +48,7 @@ static __device__ __forceinline__ float nvfp4_native_scale_error(
     return err;
 }
 #endif // CUDART_VERSION >= 12080
+#endif // defined(BLACKWELL_MMA_AVAILABLE)
 
 // swizzle_iq4: activation layout consumed by vec_dot_iq4_xs_q8_1 (vecdotq.cuh). Within each
 // 32-byte q8_1 block, element k is stored at byte 2*(k%16) + k/16 so that one 32-bit load

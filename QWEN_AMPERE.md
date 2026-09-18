@@ -5,6 +5,13 @@ Qwen3.8-27B on one Ampere card (RTX 3090 / 3090 Ti, 24 GB): a fork of
 (TurboQuant+ KV cache, native MTP speculative decoding) carrying SM86-specific
 kernel and memory work, plus the quantization recipe it was tuned with.
 
+v0.3.1 (2026-09-18) is a format release on top of v0.3: EXL3 (Turboderp's exllamav3 trellis
+format) as GGUF-native types with an SM86 decode kernel ([docs/exl3.md](docs/exl3.md)), Prism ML's
+Ternary Bonsai 2 27B with SM86 decode kernels for both of its ternary containers
+([docs/bonsai2.md](docs/bonsai2.md)), an opt-in shared-memory codebook for IQ3 decode, and a full upstream
+catch-up (llama.cpp master `b49650adb` and TurboQuant `407f3237b`, 772 commits ahead of the v0.3 base). The ATX IQ4_XS configuration below is unchanged; see
+[docs/llamampere-v0.3.1/RELEASE_NOTES.md](docs/llamampere-v0.3.1/RELEASE_NOTES.md).
+
 This is v0.3 (2026-09-13), the successor of v0.2 (2026-09-07) and of
 [llama-cpp-qwen-ampere](https://github.com/JakeATX/llama-cpp-qwen-ampere) (v0.1, 2026-09-03).
 v0.3 replaces the draft verification rule with exact p/q verification, defaults the fused MMA

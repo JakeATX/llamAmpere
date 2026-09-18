@@ -15,6 +15,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -68,6 +69,35 @@ private:
 
     std::vector<llama_token_data> cur;
 };
+
+static llama_token sample_dist(llama_sampler * sampler, const std::vector<float> & logits) {
+    std::vector<llama_token_data> cur;
+    for (llama_token token_id = 0; token_id < (llama_token) logits.size(); ++token_id) {
+        cur.push_back({ token_id, logits[token_id], 0.0f });
+    }
+
+    llama_token_data_array cur_p = { cur.data(), cur.size(), -1, false };
+    llama_sampler_apply(sampler, &cur_p);
+    GGML_ASSERT(cur_p.selected >= 0);
+    GGML_ASSERT((size_t) cur_p.selected < cur_p.size);
+    return cur_p.data[cur_p.selected].id;
+}
+
+static void test_dist_singleton_rng() {
+    llama_sampler * singleton = llama_sampler_init_dist(4242);
+    llama_sampler * control   = llama_sampler_init_dist(4242);
+
+    sample_dist(singleton, { 0.0f });
+    sample_dist(control,   { 0.0f, 0.0f });
+
+    const std::vector<float> logits(256, 0.0f);
+    for (int i = 0; i < 4; ++i) {
+        GGML_ASSERT(sample_dist(singleton, logits) == sample_dist(control, logits));
+    }
+
+    llama_sampler_free(singleton);
+    llama_sampler_free(control);
+}
 
 static void test_temp(const std::vector<float> & probs, const std::vector<float> & probs_expected, float temp) {
     sampler_tester tester(probs, probs_expected);
@@ -413,7 +443,7 @@ static std::vector<llama_token> run_backend_greedy_rows(
     llama_sampler_chain_add(chain, llama_sampler_init_greedy());
 
     GGML_ASSERT(llama_sampler_backend_supports_rows(chain));
-    GGML_ASSERT(chain->iface->backend_init(chain, ggml_backend_get_default_buffer_type(backend)));
+    GGML_ASSERT(chain->iface->backend_init(chain, ggml_backend_get_default_buffer_type(backend), (uint32_t) n_rows));
     GGML_ASSERT(llama_sampler_backend_rows_ready(chain));
 
     ggml_init_params init = { ggml_tensor_overhead()*32 + ggml_graph_overhead(), nullptr, true };
@@ -612,6 +642,8 @@ int main(int argc, char ** argv) {
     test_greedy_backend_suppressed_argmax();
     test_greedy_argmax_rows(cpu_only);
     ggml_time_init();
+
+    test_dist_singleton_rng();
 
     test_temp({0.1f, 0.2f, 0.3f, 0.4f}, {0.1f, 0.2f, 0.3f, 0.4f}, 1.0f);
     test_temp({0.1f, 0.2f, 0.3f, 0.4f}, {0.0f, 0.0f, 0.0f, 1.0f}, 0.0f);
