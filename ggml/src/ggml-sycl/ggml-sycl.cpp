@@ -6404,7 +6404,8 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
                     return false;
                 }
 
-                if (src0_type == GGML_TYPE_TQ2_0 || src0_type == GGML_TYPE_TQ1_0) {
+                if (src0_type == GGML_TYPE_TQ2_0 || src0_type == GGML_TYPE_TQ1_0 ||
+                    src0_type == GGML_TYPE_PQ2_0 || src0_type == GGML_TYPE_PTQ1_0) {
                     return false;
                 }
 

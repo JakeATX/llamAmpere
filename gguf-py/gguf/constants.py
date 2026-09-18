@@ -5738,6 +5738,8 @@ class GGMLQuantizationType(IntEnum):
     NVFP4   = 40
     Q1_0    = 41
     Q2_0    = 42
+    PQ2_0   = 142
+    PTQ1_0  = 143
     TQ3_1S  = 45
     TQ4_1S  = 46
     Q8_CR   = 48
@@ -5807,6 +5809,9 @@ class LlamaFileType(IntEnum):
     MOSTLY_NVFP4         = 39  # except 1d tensors
     MOSTLY_Q1_0          = 40  # except 1d tensors
     MOSTLY_Q2_0          = 41  # except 1d tensors
+    MOSTLY_PQ2_0         = 141  # except 1d tensors
+    MOSTLY_PQ2_0_LEGACY  = 142  # except 1d tensors
+    MOSTLY_PTQ1_0        = 143  # except 1d tensors
     MOSTLY_Q8_CR         = 42  # except 1d tensors, ConvRot-rotated Q8_0
     MOSTLY_TQ3_1S        = 43  # except 1d tensors
     MOSTLY_TQ4_1S        = 44  # except 1d tensors
@@ -5949,6 +5954,8 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.NVFP4:   (64, 4 + 32),
     GGMLQuantizationType.Q1_0:    (128, 2 + 16),
     GGMLQuantizationType.Q2_0:    (64, 2 + 16),
+    GGMLQuantizationType.PQ2_0:   (128, 2 + 32),
+    GGMLQuantizationType.PTQ1_0:  (128, 2 + 24 + 2),
     GGMLQuantizationType.TQ3_1S:  (32, 2 + 2 + 12),
     GGMLQuantizationType.TQ4_1S:  (32, 2 + 2 + 16),
     # same layout as Q8_0, but the rows are rotated in groups of 256 (ConvRot)

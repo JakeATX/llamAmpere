@@ -5,6 +5,7 @@
 #include "mmid.cuh"
 
 #include <cstdint>
+#include <cstdlib>
 
 // Some opt-in callers bypass ggml_cuda_should_use_mmq() after doing their own
 // activation preparation. Check that the selected architecture actually has
@@ -35,6 +36,14 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
         case GGML_TYPE_Q2_0:
             mul_mat_q_case<GGML_TYPE_Q2_0>(ctx, args, stream);
             break;
+        case GGML_TYPE_PQ2_0:
+            mul_mat_q_case<GGML_TYPE_PQ2_0>(ctx, args, stream);
+            break;
+#if !defined(GGML_USE_HIP)
+        case GGML_TYPE_PTQ1_0:
+            mul_mat_q_case<GGML_TYPE_PTQ1_0>(ctx, args, stream);
+            break;
+#endif
         case GGML_TYPE_Q4_0:
             mul_mat_q_case<GGML_TYPE_Q4_0>(ctx, args, stream);
             break;
@@ -299,8 +308,14 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
     bool mmq_supported;
 
     switch (type) {
+#if !defined(GGML_USE_HIP)
+        case GGML_TYPE_PTQ1_0:
+            mmq_supported = turing_mma_available(cc);
+            break;
+#endif
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q2_0:
+        case GGML_TYPE_PQ2_0:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
@@ -345,7 +360,24 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
         if (smpbo < 48 * 1024) {
             return false;
         }
+        if ((type == GGML_TYPE_PQ2_0 || type == GGML_TYPE_PTQ1_0) &&
+                !ggml_cuda_mmq_has_config(type, 1, cc, smpbo)) {
+            return false;
+        }
     }
+
+#if !defined(GGML_USE_HIP)
+    if (type == GGML_TYPE_PTQ1_0) {
+        // the fp16 dequantize + cuBLAS fallback is the source of PTQ1_0's extra error on CUDA, so
+        // the MMQ tile path runs at every batch by default; the env var is the A/B knob for
+        // deployments that prefer cuBLAS's ~7% at pp512 over the accuracy
+        static const int64_t max_batch = [] {
+            const char * s = getenv("GGML_CUDA_PTQ1_0_MMQ_MAX_BATCH");
+            return s ? (int64_t) atoll(s) : (int64_t) MMQ_PTQ1_0_MAX_BATCH_SIZE;
+        }();
+        return ne11 <= max_batch;
+    }
+#endif
 
     if (turing_mma_available(cc)) {
         return true;

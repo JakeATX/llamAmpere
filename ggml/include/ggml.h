@@ -450,7 +450,9 @@ extern "C" {
         GGML_TYPE_EXL3_6  = 55,
         GGML_TYPE_EXL3_7  = 56,
         GGML_TYPE_EXL3_8  = 57,
-        GGML_TYPE_COUNT   = 58,
+        GGML_TYPE_PQ2_0   = 142, // Prism group-128 ternary weights
+        GGML_TYPE_PTQ1_0  = 143, // Prism packed group-128 ternary weights
+        GGML_TYPE_COUNT   = 144,
     };
 
     // [TAG_GGML_PREC]
@@ -506,6 +508,8 @@ extern "C" {
         GGML_FTYPE_MOSTLY_NVFP4   = 26, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q1_0    = 27, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q2_0    = 28, // except 1d tensors
+        GGML_FTYPE_MOSTLY_PQ2_0  = 128, // except 1d tensors
+        GGML_FTYPE_MOSTLY_PTQ1_0 = 129, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q8_CR   = 29, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q5_CR   = 30, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q6_CR   = 31, // except 1d tensors

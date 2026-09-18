@@ -269,6 +269,17 @@ static bool ggml_cuda_sm86_iq3_smem_grid() {
     return value;
 }
 
+// PTQ1_0 cross-column reuse (widths 2-8) is exact and on by default for SM86; GGML_CUDA_SM86_PTQ1_REUSE=0 disables it.
+// Without it the generic path re-unpacks the 128-trit block once per column per row (4 cols x 8 rows unrolled) and
+// spills 540-1260 B per thread at widths 2-4 (ptxas, 2026-09-17), which made a width-4 MTP verify cost 4.4 T=1 steps.
+static bool ggml_cuda_sm86_ptq1_reuse() {
+    static const bool value = [] {
+        const char * env = getenv("GGML_CUDA_SM86_PTQ1_REUSE");
+        return env == nullptr || env[0] != '0';
+    }();
+    return value;
+}
+
 static bool ggml_cuda_sm86_exact_reuse() {
     static const bool value = [] {
         const char * env = getenv("GGML_CUDA_SM86_EXACT_REUSE");
@@ -281,6 +292,8 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) 
     switch (type) {
         case GGML_TYPE_Q1_0:    return vec_dot_q1_0_q8_1;
         case GGML_TYPE_Q2_0:    return vec_dot_q2_0_q8_1;
+        case GGML_TYPE_PQ2_0: return vec_dot_pq2_0_q8_1;
+        case GGML_TYPE_PTQ1_0: return vec_dot_ptq1_0_q8_1;
         case GGML_TYPE_Q4_0:    return vec_dot_q4_0_q8_1;
         case GGML_TYPE_Q4_1:    return vec_dot_q4_1_q8_1;
         case GGML_TYPE_Q5_0:    return vec_dot_q5_0_q8_1;
@@ -310,6 +323,8 @@ static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q1_0:    return VDR_Q1_0_Q8_1_MMVQ;
         case GGML_TYPE_Q2_0:    return VDR_Q2_0_Q8_1_MMVQ;
+        case GGML_TYPE_PQ2_0: return VDR_PQ2_0_Q8_1_MMVQ;
+        case GGML_TYPE_PTQ1_0: return VDR_PTQ1_0_Q8_1_MMVQ;
         case GGML_TYPE_Q4_0:    return VDR_Q4_0_Q8_1_MMVQ;
         case GGML_TYPE_Q4_1:    return VDR_Q4_1_Q8_1_MMVQ;
         case GGML_TYPE_Q5_0:    return VDR_Q5_0_Q8_1_MMVQ;
@@ -559,6 +574,11 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
     if (!ggml_is_quantized(type)) {
         return false;
     }
+#if !defined(GGML_USE_HIP)
+    if (type == GGML_TYPE_PTQ1_0 && GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_TURING) {
+        return ne11 <= 7;
+    }
+#endif
     // k-quants cost more to decode and mvq redoes that per column, so MMQ wins sooner.
     // Only list quant-types MMQ supports, others would fall back to cuBLAS.
     if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_ADA_LOVELACE) {
@@ -817,8 +837,11 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
     return 1;
 }
 
-static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
+static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
     if (table_id == MMVQ_PARAMETERS_GENERIC) {
+        if (type == GGML_TYPE_PTQ1_0 && ncols_dst >= 2 && ncols_dst <= 4) {
+            return 2; // ternary is ALU-bound: 8 rows x ncols unrolled dots run out of registers (widths 5-8 already use 2)
+        }
         switch (ncols_dst) {
             case 1: return small_k ? nwarps : QC4_ROWS_1;
             case 2: return QC4_ROWS_2;
@@ -869,10 +892,13 @@ static __global__ void mul_mat_vec_q(
 
     constexpr int qk  = ggml_cuda_type_traits<type>::qk;
     constexpr int qi  = ggml_cuda_type_traits<type>::qi;
-    constexpr int vdr = get_vdr_mmvq(type);
+    // PTQ1_0 verify widths (reuse path, ncols_dst >= 2) split each 128-weight block over 4 lanes
+    // (VDR 1) so a lane unpacks a quarter block once and dots every column; width 1 keeps the
+    // whole-block VDR 4 so K=5120 still takes the small-K launch shape (measured faster at T=1).
+    constexpr int vdr = (type == GGML_TYPE_PTQ1_0 && reuse_weights) ? 1 : get_vdr_mmvq(type);
     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
     constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters, nw1);
-    constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
+    constexpr int rows_per_cuda_block = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
@@ -1018,13 +1044,17 @@ static __global__ void mul_mat_vec_q(
         }
 #endif
 
-        if constexpr (reuse_weights && (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_Q5_0)) {
+        if constexpr (reuse_weights && (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_Q5_0 || type == GGML_TYPE_PTQ1_0)) {
 #pragma unroll
             for (int i = 0; i < rows_per_cuda_block; ++i) {
                 float dots[ncols_dst];
                 if constexpr (type == GGML_TYPE_IQ4_XS) {
                     vec_dot_iq4_xs_q8_1_multi<ncols_dst>(
                         vx, y, stride_col_y, kby, kbx_offset + i*stride_row_x + kbx, kqs, dots);
+                } else if constexpr (type == GGML_TYPE_PTQ1_0) {
+                    // 4 lanes per 128-weight block (kqs = lane, VDR 1): each lane unpacks its share once and dots every column.
+                    vec_dot_ptq1_0_q8_1_lane<ncols_dst>(
+                        vx, y + kby, kbx_offset + i*stride_row_x + kbx, kqs, stride_col_y, dots);
                 } else if constexpr (type == GGML_TYPE_Q5_0) {
                     vec_dot_q5_0_q8_1_multi<ncols_dst>(
                         vx, y, stride_col_y, kby, kbx_offset + i*stride_row_x + kbx, kqs, dots);
@@ -1328,7 +1358,7 @@ static std::pair<dim3, dim3> calc_launch_params(
         const int warp_size, const mmvq_parameter_table_id table_id,
         const bool small_k = false, const bool halve_iters = false, const bool nw1 = false) {
     const int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters, nw1);
-    const int rpb = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
+    const int rpb = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
     const int64_t nblocks = (nrows_x + rpb - 1) / rpb;
     const dim3 block_nums(nblocks, nchannels_dst, nsamples_or_ntokens);
     const dim3 block_dims(warp_size, nwarps, 1);
@@ -1388,10 +1418,12 @@ static void mul_mat_vec_q_switch_fusion(
         }
     }
     if constexpr (((type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K) && c_ncols_dst >= 3 && c_ncols_dst <= 5) ||
-                  ((type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_Q5_0) && c_ncols_dst >= 2 && c_ncols_dst <= 5)) {
+                  ((type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_Q5_0) && c_ncols_dst >= 2 && c_ncols_dst <= 5) ||
+                  (type == GGML_TYPE_PTQ1_0 && c_ncols_dst >= 2 && c_ncols_dst <= 8)) {
         const int device = ggml_cuda_get_device();
         const int cc = ggml_cuda_info().devices[device].cc;
-        const bool reuse = type == GGML_TYPE_IQ4_XS ? ggml_cuda_sm86_iq4_reuse() :
+        const bool reuse = type == GGML_TYPE_PTQ1_0 ? ggml_cuda_sm86_ptq1_reuse() :
+                           type == GGML_TYPE_IQ4_XS ? ggml_cuda_sm86_iq4_reuse() :
                            type == GGML_TYPE_Q5_0   ? ggml_cuda_sm86_q5_0_reuse() : ggml_cuda_sm86_exact_reuse();
         if (cc == 860 && reuse) {
             ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters, true, nw1>, launch_params,
@@ -1716,6 +1748,18 @@ static void mul_mat_vec_q_switch_type(
     switch (type_x) {
         case GGML_TYPE_Q1_0:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q1_0>
+                (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream, allow_small_k);
+            break;
+        case GGML_TYPE_PQ2_0:
+            mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_PQ2_0>
+                (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream, allow_small_k);
+            break;
+        case GGML_TYPE_PTQ1_0:
+            mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_PTQ1_0>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
                  nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream, allow_small_k);
