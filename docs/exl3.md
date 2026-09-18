@@ -197,6 +197,10 @@ Known limits:
 - **The side tensors ride on `src[2]`/`src[3]` of a `MUL_MAT` node.** `supports_op` does not inspect
   them, and graph reuse and the allocator were not extended for the extra sources. A backend that falls
   back for some other reason would silently drop the scale and Hadamard glue.
+- **No `--split-mode tensor`.** EXL3 tiles are not row-addressable and the `.suh`/`.svh` side vectors are
+  not sharded by the meta backend, so a tensor split would slice the wrong bytes. Loading an EXL3 model with
+  `--split-mode tensor` fails at load with *"LLAMA_SPLIT_MODE_TENSOR not implemented for EXL3 weights"*.
+  Single GPU and `--split-mode layer` are supported; layer split adds VRAM, not decode speed.
 - **`mul1` is the only codebook implemented.** exllamav3's `mcg` and the older `cb0` are not.
 
 Deferred to v0.4 with the rest of the release backlog: the prefill GEMM, `test-backend-ops` cases, and
