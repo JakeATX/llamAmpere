@@ -438,6 +438,128 @@ struct server_batch {
     }
 };
 
+// BL6a: expected-throughput draft depth controller (opt-in: LLAMA_SPEC_ADAPT_COST=1).
+// Keeps EWMAs of the conditional acceptance at each draft position and of the wall cost of a
+// speculative round per draft width (draft + verify + sampling), then picks the depth d that
+// maximises expected committed tokens per unit time, (1 + sum_{k<=d} prod_{i<=k} p_i) / t(d).
+// The chosen depth is applied through the per-slot draft params n_max, so the drafter's own
+// ceiling stays the upper bound. Past-round statistics only: the sampled output distribution is
+// unchanged. Tunables: LLAMA_SPEC_ADAPT_FLOOR (2), LLAMA_SPEC_ADAPT_ALPHA (0.05),
+// LLAMA_SPEC_ADAPT_EXPLORE (refresh a neighbouring width every N rounds, 64; 0 = off),
+// LLAMA_SPEC_ADAPT_HYST (relative score gain needed to switch, 0.02).
+struct spec_adapt_ctrl {
+    static bool   enabled()       { static const bool   v = [] { const char * s = getenv("LLAMA_SPEC_ADAPT_COST");    return s && s[0] == '1'; }(); return v; }
+    static int    floor_depth()   { static const int    v = [] { const char * s = getenv("LLAMA_SPEC_ADAPT_FLOOR");   return s ? std::max(1, atoi(s)) : 2; }(); return v; }
+    static double alpha()         { static const double v = [] { const char * s = getenv("LLAMA_SPEC_ADAPT_ALPHA");   return s ? atof(s) : 0.05; }(); return v; }
+    static int    explore_every() { static const int    v = [] { const char * s = getenv("LLAMA_SPEC_ADAPT_EXPLORE"); return s ? std::max(0, atoi(s)) : 64; }(); return v; }
+    static double hysteresis()    { static const double v = [] { const char * s = getenv("LLAMA_SPEC_ADAPT_HYST");    return s ? atof(s) : 0.02; }(); return v; }
+
+    std::vector<double> p;    // [n_max]     conditional acceptance EWMA at draft position k
+    std::vector<double> t_us; // [n_max + 1] round cost EWMA by draft width
+    std::vector<int>    t_n;  // [n_max + 1] samples per width
+    int cur         = 0;      // depth chosen for the next draft
+    int rounds      = 0;
+    int n_switch    = 0;
+    int explore_dir = 1;
+
+    bool active() const { return !p.empty(); }
+
+    void reset(int n_max) {
+        p.assign(n_max, 0.85);
+        t_us.assign(n_max + 1, 0.0);
+        t_n.assign(n_max + 1, 0);
+        cur = n_max; // warm start at the ceiling (BL6b); the controller descends if it pays
+        rounds = 0; n_switch = 0; explore_dir = 1;
+    }
+
+    // one verification result: n_draft drafted, n_accepted accepted, round_us wall time since the previous accept
+    void observe(int n_draft, int n_accepted, int64_t round_us) {
+        if (!active() || n_draft <= 0) {
+            return;
+        }
+        const double a = alpha();
+        for (int k = 0; k < n_accepted && k < (int) p.size(); ++k) {
+            p[k] += a * (1.0 - p[k]);
+        }
+        if (n_accepted < n_draft && n_accepted < (int) p.size()) {
+            p[n_accepted] += a * (0.0 - p[n_accepted]);
+        }
+        if (round_us > 0 && n_draft < (int) t_us.size()) {
+            t_us[n_draft] = t_n[n_draft] == 0 ? (double) round_us : t_us[n_draft] + a * ((double) round_us - t_us[n_draft]);
+            t_n[n_draft]++;
+        }
+        rounds++;
+    }
+
+    double expected_tokens(int d) const {
+        double e = 1.0, prod = 1.0;
+        for (int k = 0; k < d && k < (int) p.size(); ++k) {
+            prod *= p[k];
+            e += prod;
+        }
+        return e;
+    }
+
+    // depth for the next draft
+    int pick() {
+        const int n_max = (int) p.size();
+        if (n_max <= 0) {
+            return 0;
+        }
+        const int lo = std::min(floor_depth(), n_max);
+        cur = std::max(lo, std::min(cur, n_max));
+
+        // bootstrap: an unmeasured width next to the current one is tried before any comparison
+        for (int d : { cur - 1, cur + 1 }) {
+            if (d >= lo && d <= n_max && t_n[d] == 0 && t_n[cur] >= 4) {
+                return d;
+            }
+        }
+        // periodic refresh of a neighbouring width so a stale cost estimate cannot pin the depth
+        const int ex = explore_every();
+        if (ex > 0 && rounds > 0 && rounds % ex == 0) {
+            int cand = cur + explore_dir;
+            explore_dir = -explore_dir;
+            if (cand < lo || cand > n_max) {
+                cand = cur - (cand - cur);
+            }
+            if (cand >= lo && cand <= n_max && cand != cur) {
+                return cand;
+            }
+        }
+        const double cur_score = t_n[cur] > 0 ? expected_tokens(cur) / t_us[cur] : 0.0;
+        int    best       = cur;
+        double best_score = cur_score;
+        for (int d = lo; d <= n_max; ++d) {
+            if (d == cur || t_n[d] == 0) {
+                continue;
+            }
+            const double sc = expected_tokens(d) / t_us[d];
+            if (sc > best_score * (1.0 + hysteresis())) {
+                best = d; best_score = sc;
+            }
+        }
+        if (best != cur) {
+            n_switch++;
+            cur = best;
+        }
+        return cur;
+    }
+
+    std::string summary() const {
+        std::string out = string_format("depth=%d switches=%d rounds=%d p=(", cur, n_switch, rounds);
+        for (size_t k = 0; k < p.size(); ++k) {
+            out += string_format("%s%.3f", k ? " " : "", p[k]);
+        }
+        out += ") t_us=(";
+        for (size_t w = 1; w < t_us.size(); ++w) {
+            out += string_format("%sw%zu:%.0f/%d", w > 1 ? " " : "", w, t_us[w], t_n[w]);
+        }
+        out += ")";
+        return out;
+    }
+};
+
 struct server_slot {
     int id;
 
@@ -570,6 +692,29 @@ struct server_slot {
     // not in server_slot_stats to avoid copying to every task result
     std::vector<uint64_t> n_accepted_per_pos;
 
+    // cost of a speculative round by draft width (index = number of draft tokens verified in that round):
+    // wall time between consecutive accept events, rounds, and committed tokens (accepted + bonus).
+    // Committed tokens per ms by width is the objective an adaptive draft depth has to maximise;
+    // logged with the acceptance summary. Not in server_slot_stats for the same reason as above.
+    int64_t               t_spec_round_last = 0;
+    std::vector<uint64_t> spec_round_us_by_w;
+    std::vector<uint64_t> spec_rounds_by_w;
+    std::vector<uint64_t> spec_committed_by_w;
+    // per-round split of that wall time: the draft call and the verify decode (llama_decode + sync) of the
+    // update_slots pass that committed the round; the remainder is sampling, checkpointing and host work.
+    // Under concurrency the draft and decode are shared by every slot in the batch, so each slot is charged
+    // the full (critical-path) time.
+    int64_t               spec_draft_us_pending = 0;
+    std::vector<uint64_t> spec_draft_us_by_w;
+    std::vector<uint64_t> spec_verify_us_by_w;
+    // rounds that ended in a checkpoint restore (partial acceptance the context cannot roll back in place):
+    // their verify decode, the state load and the replay decode of the accepted tokens are not bucketed
+    // above, they land in the next bucketed round's "other". Counted here so that cost stays visible.
+    uint64_t              spec_restore_rounds   = 0;
+    uint64_t              spec_restore_us       = 0;   // state load + seq_rm + sampler copy only
+
+    spec_adapt_ctrl       spec_adapt; // BL6a controller (inactive unless LLAMA_SPEC_ADAPT_COST=1)
+
     std::function<void(int /* id_slot */)>   callback_on_release;
     std::function<void(const server_slot &)> callback_on_reset; // called before reset()
 
@@ -608,6 +753,16 @@ struct server_slot {
         // note: callback_on_reset() must have run before this, see release()
         stats = {};
         n_accepted_per_pos.clear();
+        t_spec_round_last = 0;
+        spec_round_us_by_w.clear();
+        spec_rounds_by_w.clear();
+        spec_committed_by_w.clear();
+        spec_draft_us_pending = 0;
+        spec_draft_us_by_w.clear();
+        spec_verify_us_by_w.clear();
+        spec_restore_rounds = 0;
+        spec_restore_us = 0;
+        spec_adapt = {};
 
         n_predict_max = -1;
 
@@ -910,6 +1065,36 @@ struct server_slot {
                     draft_ratio, n_draft_accepted, n_draft_total, mean_acc_len);
             SLT_TRC(*this,
                     "     acc per pos = (%s)\n", acceptance_rates_per_pos.c_str());
+
+            if (!spec_rounds_by_w.empty()) {
+                std::string per_width;
+                for (size_t w = 0; w < spec_rounds_by_w.size(); ++w) {
+                    if (spec_rounds_by_w[w] == 0) {
+                        continue;
+                    }
+                    const double rounds = (double) spec_rounds_by_w[w];
+                    const double ms     = (double) spec_round_us_by_w[w] / 1000.0;
+                    const double tok    = (double) spec_committed_by_w[w];
+                    const double ms_d   = w < spec_draft_us_by_w.size()  ? (double) spec_draft_us_by_w[w]  / 1000.0 : 0.0;
+                    const double ms_v   = w < spec_verify_us_by_w.size() ? (double) spec_verify_us_by_w[w] / 1000.0 : 0.0;
+                    if (!per_width.empty()) {
+                        per_width += "; ";
+                    }
+                    per_width += string_format("w%zu: %" PRIu64 " rounds, %.2f tok/round, %.2f ms/round (draft %.2f, verify %.2f, other %.2f), %.1f tok/s",
+                            w, spec_rounds_by_w[w], tok / rounds, ms / rounds, ms_d / rounds, ms_v / rounds, (ms - ms_d - ms_v) / rounds,
+                            ms > 0.0 ? tok * 1000.0 / ms : 0.0);
+                }
+                SLT_INF(*this,
+                        " round cost by draft width = (%s)\n", per_width.c_str());
+            }
+            if (spec_restore_rounds > 0) {
+                SLT_INF(*this,
+                        " checkpoint restores = %" PRIu64 " rounds (%.2f ms/restore state load; their verify + replay decode is folded into the next round's other)\n",
+                        spec_restore_rounds, (double) spec_restore_us / 1000.0 / (double) spec_restore_rounds);
+            }
+            if (spec_adapt.active()) {
+                SLT_INF(*this, " adaptive depth (BL6a) = %s\n", spec_adapt.summary().c_str());
+            }
 
             if (smpl) {
                 const auto & pq = common_sampler_get_pq_stats(smpl.get());
@@ -3219,6 +3404,7 @@ private:
     // @ngxson : for debugging only
     int64_t t_pre_decode  = 0;
     int64_t t_decode      = 0;
+    int64_t t_decode_pass = 0; // llama_decode + sync wall time (us) of the current update_slots pass, for the per-round split
     int64_t t_post_decode = 0;
     int64_t t_sampl       = 0;
     int64_t n_pre_decode  = 0;
@@ -3323,6 +3509,7 @@ private:
         llama_batch batch_view;
         int32_t off_next = 0;
         int32_t n_batch = llama_n_batch(ctx_tgt);
+        t_decode_pass = 0;
         for (int32_t off = 0; off < batch.size(); off = off_next) {
             const int32_t n_tokens = std::min(n_batch, batch.size() - off);
             try {
@@ -3489,9 +3676,20 @@ private:
 
                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
 
+                        int n_draft_req = n_draft_max;
+                        if (spec_adapt_ctrl::enabled()) {
+                            if (!slot.spec_adapt.active()) {
+                                slot.spec_adapt.reset(common_speculative_n_max(spec.get()));
+                            }
+                            const int d = slot.spec_adapt.pick();
+                            if (d > 0) {
+                                n_draft_req = std::min(n_draft_req, d);
+                            }
+                        }
+
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
                             /* .drafting = */ true,
-                            /* .n_max    = */ n_draft_max,
+                            /* .n_max    = */ n_draft_req,
                             /* .pos0     = */ slot.prompt.tokens.pos_next(),
                             /* .id_last  = */ slot.sampled,
                             /* .prompt   = */ &slot.spec_prompt,
@@ -3508,9 +3706,14 @@ private:
 
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
+            const int64_t t_draft_start = ggml_time_us();
             queue_tasks.yield_to_queue([&]() {
                 common_speculative_draft(spec.get());
             });
+            const int64_t t_draft = ggml_time_us() - t_draft_start;
+            for (server_slot * s : drafting) {
+                s->spec_draft_us_pending = t_draft;
+            }
         }
 
         // make checkpoints if needed
@@ -4170,12 +4373,16 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
-        queue_tasks.yield_to_queue([&]() {
-            ret = llama_decode(ctx_tgt, batch_view);
-            if (ret == 0 && has_output) {
-                llama_synchronize(ctx_tgt);
-            }
-        });
+        {
+            const int64_t t_decode_start = ggml_time_us();
+            queue_tasks.yield_to_queue([&]() {
+                ret = llama_decode(ctx_tgt, batch_view);
+                if (ret == 0 && has_output) {
+                    llama_synchronize(ctx_tgt);
+                }
+            });
+            t_decode_pass += ggml_time_us() - t_decode_start;
+        }
 
         if (ret != 0) {
             {
@@ -4355,6 +4562,11 @@ private:
             // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
             const int64_t t_now = ggml_time_us();
 
+            // a plain (undrafted) step also ends the interval the next speculative round is charged from; otherwise
+            // drafters that only draft on a match (n-gram) would have the plain steps in between folded into
+            // "round cost by draft width"
+            slot.t_spec_round_last = t_now;
+
             slot.stats.n_gen += 1;
 
             if (slot.stats.n_gen == 1) {
@@ -4440,6 +4652,8 @@ private:
 
                         SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n", ckpt.pos_min, ckpt.pos_max, ckpt.size());
 
+                        const int64_t t_restore0 = ggml_time_us();
+
                         ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
                         if (slot.ctx_dft) {
@@ -4450,6 +4664,9 @@ private:
 
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
                         common_sampler_copy(smpl_save.get(), slot.smpl.get());
+
+                        slot.spec_restore_rounds += 1;
+                        slot.spec_restore_us     += (uint64_t) (ggml_time_us() - t_restore0);
 
                         return;
                     }
@@ -4478,6 +4695,32 @@ private:
             // update how many tokens out of those tested were accepted
             slot.stats.n_draft_accepted += n_accepted;
             slot.stats.n_draft_verif_steps += 1;
+
+            {
+                // round cost by draft width: the interval between consecutive accept events on this slot covers
+                // the draft, the verify decode and the sampling of one round (the first round has no interval).
+                const int64_t t_now = ggml_time_us();
+                if (slot.t_spec_round_last > 0) {
+                    const size_t w = n_draft;
+                    if (slot.spec_rounds_by_w.size() <= w) {
+                        slot.spec_rounds_by_w.resize(w + 1, 0);
+                        slot.spec_round_us_by_w.resize(w + 1, 0);
+                        slot.spec_committed_by_w.resize(w + 1, 0);
+                        slot.spec_draft_us_by_w.resize(w + 1, 0);
+                        slot.spec_verify_us_by_w.resize(w + 1, 0);
+                    }
+                    slot.spec_rounds_by_w[w]    += 1;
+                    slot.spec_round_us_by_w[w]  += (uint64_t) (t_now - slot.t_spec_round_last);
+                    slot.spec_committed_by_w[w] += (uint64_t) ids.size();
+                    slot.spec_draft_us_by_w[w]  += (uint64_t) slot.spec_draft_us_pending;
+                    slot.spec_verify_us_by_w[w] += (uint64_t) t_decode_pass;
+                }
+                if (slot.spec_adapt.active()) {
+                    slot.spec_adapt.observe((int) n_draft, (int) n_accepted, slot.t_spec_round_last > 0 ? t_now - slot.t_spec_round_last : 0);
+                }
+                slot.t_spec_round_last = t_now;
+                slot.spec_draft_us_pending = 0;
+            }
 
             auto & n_accepted_per_pos = slot.n_accepted_per_pos;
             if (n_accepted_per_pos.empty()) {

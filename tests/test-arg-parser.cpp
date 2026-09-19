@@ -287,6 +287,32 @@ static void test(void) {
     assert(!no_chain_params.speculative.draft.chain);
     assert(no_chain_params.speculative.draft.n_max == 3);
 
+    // n-gram drafters request recurrent-state snapshots for in-place rollback (draft width, capped at 8);
+    // --spec-n-rs-seq overrides, 0 = checkpoint restore on every partial acceptance
+    argv = {"binary_name", "-m", "model_file.gguf", "--spec-type", "ngram-cache", "--spec-ngram-cache-n-max", "7"};
+    common_params ngram_rs_params;
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), ngram_rs_params, LLAMA_EXAMPLE_SPECULATIVE));
+    assert(ngram_rs_params.speculative.need_n_rs_seq() == 7);
+    ngram_rs_params.speculative.ngram_cache.n_max = 0;
+    assert(ngram_rs_params.speculative.need_n_rs_seq() == 8);   // the drafter's built-in default width
+    ngram_rs_params.speculative.ngram_cache.n_max = 32;
+    assert(ngram_rs_params.speculative.need_n_rs_seq() == 8);   // capped
+    ngram_rs_params.n_batch = 4;
+    ngram_rs_params.n_ubatch = 4;
+    const llama_context_params ngram_rs_ctx_params = common_context_params_to_llama(ngram_rs_params);
+    assert(ngram_rs_ctx_params.n_rs_seq == 8);
+    assert(ngram_rs_ctx_params.n_batch == 10);
+    assert(ngram_rs_ctx_params.n_ubatch == 10);
+
+    argv = {"binary_name", "-m", "model_file.gguf", "--spec-type", "ngram-cache", "--spec-n-rs-seq", "0"};
+    common_params ngram_rs0_params;
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), ngram_rs0_params, LLAMA_EXAMPLE_SPECULATIVE));
+    assert(ngram_rs0_params.speculative.need_n_rs_seq() == 0);
+
+    argv = {"binary_name", "-m", "model_file.gguf", "--spec-type", "draft-mtp", "--spec-n-rs-seq", "-2"};
+    common_params ngram_rs_bad_params;
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), ngram_rs_bad_params, LLAMA_EXAMPLE_SPECULATIVE));
+
     // the adaptive MTP type parses to the dedicated enum value
     argv = {"binary_name", "-m", "model_file.gguf", "--spec-type", "draft-mtp-adaptive"};
     common_params spec_params;

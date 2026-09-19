@@ -4459,6 +4459,39 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--spec-ngram-cache-n-max"}, "N",
+        "maximum number of tokens to draft for ngram-cache speculative decoding, 0 = built-in default of 8 (default: 0)",
+        [](common_params & params, int value) {
+            if (value < 0 || value > 1024) {
+                throw std::invalid_argument("ngram-cache n-max must be between 0 and 1024 inclusive");
+            }
+            params.speculative.ngram_cache.n_max = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-n-rs-seq"}, "N",
+        "recurrent-state snapshots per sequence kept by the target context for in-place rollback of partial draft "
+        "acceptances on GDN/SSM (hybrid) models, -1 = derive from the drafters: draft n-max for MTP/EAGLE3/DFlash/DSpark, "
+        "the draft width capped at 8 for the n-gram drafters; 0 = none (every partial acceptance restores a checkpoint "
+        "and replays the accepted tokens) (default: -1)",
+        [](common_params & params, int value) {
+            if (value < -1 || value > 1024) {
+                throw std::invalid_argument("spec-n-rs-seq must be between -1 and 1024 inclusive");
+            }
+            params.speculative.n_rs_seq_override = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-ngram-cache-n-min"}, "N",
+        "minimum number of draft tokens for ngram-cache speculative decoding, shorter drafts are discarded so the next --spec-type drafts instead, 0 = keep every draft (default: 0)",
+        [](common_params & params, int value) {
+            if (value < 0 || value > 1024) {
+                throw std::invalid_argument("ngram-cache n-min must be between 0 and 1024 inclusive");
+            }
+            params.speculative.ngram_cache.n_min = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
         {"--spec-ngram-mod-n-match"}, "N",
         string_format("ngram-mod lookup length (default: %d)", params.speculative.ngram_mod.n_match),
         [](common_params & params, int value) {

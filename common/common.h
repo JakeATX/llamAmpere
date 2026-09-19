@@ -378,6 +378,9 @@ struct common_params_speculative_ngram_cache {
     std::string lookup_cache_static;  // path of static ngram cache file for lookup decoding
     std::string lookup_cache_dynamic; // path of dynamic ngram cache file for lookup decoding
 
+    int32_t n_max = 0; // maximum number of tokens to draft (0 = the built-in default of the ngram-cache drafter)
+    int32_t n_min = 0; // shorter drafts are discarded, the next implementation then drafts (0 = keep every draft)
+
     bool    save_dynamic          = false;   // write the dynamic cache back to lookup_cache_dynamic (checkpoints and shutdown)
     int32_t save_dynamic_interval = 300;     // seconds between checkpoints of the dynamic cache (0 = only at shutdown)
     int32_t max_ngrams_dynamic    = 1000000; // n-grams kept in the dynamic cache when saving, lowest utility evicted (0 = unlimited)
@@ -411,14 +414,55 @@ struct common_params_speculative {
         return synth_len != -1.0 || !synth_rates.empty();
     }
 
-    uint32_t need_n_rs_seq() const {
-        bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
-            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP ||
-                   t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE ||
-                   t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
-        });
+    // recurrent-state snapshots requested per sequence (-1 = derive from the drafters, see need_n_rs_seq())
+    int32_t n_rs_seq_override = -1;
 
-        return needs_rs_seq ? draft.n_max : 0u;
+    // per-token recurrent-state snapshots the target context must keep so that a partial draft
+    // acceptance can roll the GDN/SSM state back in place (COMMON_CONTEXT_SEQ_RM_TYPE_RS).
+    // Without them a hybrid/recurrent target falls back to a full checkpoint restore + replay
+    // decode pass on every partial acceptance (COMMON_CONTEXT_SEQ_RM_TYPE_FULL), which on the
+    // n-gram drafters showed up as a fixed ~50 ms per drafted pass on Qwen3.5-27B.
+    // n-gram drafters are capped at 8 snapshots (each snapshot is a full S state, ~144 MiB on
+    // Qwen3.5-27B); a rollback deeper than the cap still works through the checkpoint path.
+    uint32_t need_n_rs_seq() const {
+        if (n_rs_seq_override >= 0) {
+            return (uint32_t) n_rs_seq_override;
+        }
+
+        constexpr uint32_t n_rs_seq_ngram_max = 8;
+
+        uint32_t n = 0;
+        for (auto t : types) {
+            switch (t) {
+                case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
+                case COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE:
+                case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:
+                case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
+                case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
+                    n = std::max(n, (uint32_t) draft.n_max);
+                    break;
+                case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:
+                    // 8 = the drafter's built-in default width (common_speculative_impl_ngram_cache::N_DRAFT_DEFAULT)
+                    n = std::max(n, std::min(n_rs_seq_ngram_max, ngram_cache.n_max > 0 ? (uint32_t) ngram_cache.n_max : 8u));
+                    break;
+                case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:
+                    n = std::max(n, std::min(n_rs_seq_ngram_max, (uint32_t) ngram_simple.size_m));
+                    break;
+                case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:
+                    n = std::max(n, std::min(n_rs_seq_ngram_max, (uint32_t) ngram_map_k.size_m));
+                    break;
+                case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V:
+                    n = std::max(n, std::min(n_rs_seq_ngram_max, (uint32_t) ngram_map_k4v.size_m));
+                    break;
+                case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:
+                    n = std::max(n, std::min(n_rs_seq_ngram_max, (uint32_t) std::max(0, ngram_mod.n_max)));
+                    break;
+                default:
+                    break;
+            }
+        }
+
+        return n;
     }
 };
 

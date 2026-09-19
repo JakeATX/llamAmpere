@@ -2654,6 +2654,15 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
 struct common_speculative_impl_ngram_cache : public common_speculative_impl {
     common_params_speculative_ngram_cache params;
 
+    // draft length used when --spec-ngram-cache-n-max is not given
+    static constexpr uint16_t N_DRAFT_DEFAULT = 8;
+
+    // the draft length the implementation will use for these params; the single place that resolves the
+    // default, so the server sizes its per-sequence buffers (common_speculative_n_max) for the same length
+    static uint16_t n_draft_for(const common_params_speculative_ngram_cache & params) {
+        return params.n_max > 0 ? (uint16_t) params.n_max : N_DRAFT_DEFAULT;
+    }
+
     uint16_t n_draft;
 
     // shared across all sequences
@@ -2729,11 +2738,18 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
         const std::string & path_dynamic = this->params.lookup_cache_dynamic;
 
         SPC_TRC("%s", "adding speculative implementation 'ngram-cache'\n");
-        SPC_TRC("- n_draft=%d, cache_static=%s, cache_dynamic=%s, save_dynamic=%d\n",
-                n_draft,
+        SPC_TRC("- n_draft=%d, n_min=%d, cache_static=%s, cache_dynamic=%s, save_dynamic=%d\n",
+                n_draft, this->params.n_min,
                 path_static.empty() ? "none" : path_static.c_str(),
                 path_dynamic.empty() ? "none" : path_dynamic.c_str(),
                 this->params.save_dynamic ? 1 : 0);
+
+        // a minimum above the draft length would discard every draft
+        if (this->params.n_min > (int32_t) n_draft) {
+            SPC_WRN("ngram-cache n_min=%d exceeds the draft length %d -- clamping to %d\n",
+                    this->params.n_min, n_draft, n_draft);
+            this->params.n_min = std::min(this->params.n_min, (int32_t) n_draft);
+        }
 
         sinfos.resize(n_seq);
 
@@ -3075,6 +3091,11 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
             // delete first token in result (which is the id_last token)
             result.erase(result.begin());
         }
+
+        // an empty result leaves the sequence drafting, so the next implementation gets its turn
+        if (result.size() < (size_t) params.n_min) {
+            result.clear();
+        }
     }
 
     bool process(const llama_batch & /*batch*/) override {
@@ -3263,7 +3284,7 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
                 n_max = std::max(n_max, std::max(0, spec->ngram_mod.n_max));
                 break;
             case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:
-                n_max = std::max(n_max, (int32_t) 8);
+                n_max = std::max(n_max, (int32_t) common_speculative_impl_ngram_cache::n_draft_for(spec->ngram_cache));
                 break;
             case COMMON_SPECULATIVE_TYPE_NONE:
             case COMMON_SPECULATIVE_TYPE_COUNT:
@@ -3695,7 +3716,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE: {
-                const uint16_t n_draft = 8; // TODO get from config?
+                const uint16_t n_draft = common_speculative_impl_ngram_cache::n_draft_for(config.params.ngram_cache);
 
                 impls.push_back(std::make_unique<common_speculative_impl_ngram_cache>(config.params, n_seq, n_draft));
                 break;
