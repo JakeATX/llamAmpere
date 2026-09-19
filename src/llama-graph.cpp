@@ -4343,8 +4343,13 @@ static bool draft_vocab_direct(const ggml_tensor * head) {
     }
     auto * buft = ggml_backend_buffer_get_type(head->buffer);
     auto * dev  = ggml_backend_buft_get_device(buft);
-    if (!dev || std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "CUDA") != 0 ||
-            buft != ggml_backend_dev_buffer_type(dev)) {
+    if (!dev) {
+        return false;
+    }
+    // a Meta device (--split-mode tensor) has no backend registry: the head is sharded across devices there,
+    // so the one-row-expert path does not apply and the full head is used instead
+    auto * reg = ggml_backend_dev_backend_reg(dev);
+    if (!reg || std::strcmp(ggml_backend_reg_name(reg), "CUDA") != 0 || buft != ggml_backend_dev_buffer_type(dev)) {
         return false;
     }
     switch (head->type) {

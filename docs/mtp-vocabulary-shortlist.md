@@ -38,6 +38,8 @@ The shortlist is only taken when the fast path exists: head on the default CUDA 
 quantized type (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0, Q2_K..Q6_K, IQ*), no LoRA on the head, no per-row output scale, and
 every output row of the ubatch owned by a sequence with a backend sampler (`--spec-draft-backend-sampling`,
 the default). Otherwise the graph silently uses the full head, which keeps every output correct.
+Under `--split-mode tensor` the head lives on the Meta device (sharded across the GPUs, no backend sampling), so
+the map is accepted but the draft always scores the full head there; use `--split-mode layer` to get the shortlist.
 
 ## Adaptive tail (`--spec-draft-vocab-hot`)
 
