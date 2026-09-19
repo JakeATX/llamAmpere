@@ -433,14 +433,15 @@ static int ggml_cuda_q8_turbo3_mma_min_q() {
     return value;
 }
 
-// largest query width routed to the fused q8_0-K MMA paths. Default 5 (P6): MTP depth 3/4 verify widths.
-// DF3: the (8,8) instance is a full eight-row tile, so widths 6..8 (DFlash2 block_size 8 verify) can use it
-// instead of falling to the generic mma_f16 dequant path. GGML_Q8_TURBO3_MMA_MAX_Q=8 enables that.
+// largest query width routed to the fused q8_0-K MMA paths. Default 8: the (8,8) instance is a full eight-row
+// tile, so widths 6..8 (MTP depth 5..7, n-gram drafts up to 7, DFlash block_size 8 verify) use it instead of
+// falling to the generic mma_f16 dequant path (kv=100352 width 8: 1434 -> 429 us per layer, widths 1..5 unchanged,
+// test-backend-ops 1158/1158). GGML_Q8_TURBO3_MMA_MAX_Q=5 restores the previous routing (valid 5..8).
 static int ggml_cuda_q8_turbo3_mma_max_q() {
     static const int value = [] {
         const char * env = getenv("GGML_Q8_TURBO3_MMA_MAX_Q");
-        const int v = env ? atoi(env) : 5;
-        return (v >= 5 && v <= 8) ? v : 5;
+        const int v = env ? atoi(env) : 8;
+        return (v >= 5 && v <= 8) ? v : 8;
     }();
     return value;
 }

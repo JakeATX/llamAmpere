@@ -5,7 +5,10 @@
 #include "vecdotq.cuh"
 
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
+#include <string>
 #include <type_traits>
 
 // only enabled on DGX Spark, where it is a gain on every type below. On the higher-bandwidth parts the kernel
@@ -579,8 +582,40 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
         return ne11 <= 7;
     }
 #endif
+    // Per-type MMVQ width ceiling override for kernel tuning sweeps, e.g.
+    // GGML_MMVQ_NMAX="q6_K=5,iq4_xs=8" (batches above the ceiling go to MMQ when it
+    // supports the type). Read once; unset = no override.
+    {
+        static const std::string spec = [] { const char * e = getenv("GGML_MMVQ_NMAX"); return std::string(e ? e : ""); }();
+        if (!spec.empty()) {
+            const char * tn = ggml_type_name(type);
+            const size_t tl = strlen(tn);
+            size_t pos = 0;
+            while (pos < spec.size()) {
+                size_t end = spec.find(',', pos); if (end == std::string::npos) end = spec.size();
+                size_t eq = spec.find('=', pos);
+                if (eq != std::string::npos && eq < end && eq - pos == tl && spec.compare(pos, tl, tn) == 0) {
+                    return ne11 <= atoll(spec.c_str() + eq + 1);
+                }
+                pos = end + 1;
+            }
+        }
+    }
     // k-quants cost more to decode and mvq redoes that per column, so MMQ wins sooner.
     // Only list quant-types MMQ supports, others would fall back to cuBLAS.
+    if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE && cc < GGML_CUDA_CC_ADA_LOVELACE) {
+        switch (type) { // tuned on RTX 3090 Ti (m=4096 k=14336 sweep, W58 width-5..8 MMVQ cells vs MMQ):
+                        // MMQ at widths 5..8 costs the same as its width-9 tile, and for the K-quants that is
+                        // already below the width-5 MMVQ cell (q5_K +8%, q6_K +7%, q4_K +2%); iq4_xs/q5_0 keep MMVQ
+                        // through width 8 (MMQ 10-20% slower there).
+            case GGML_TYPE_Q4_K:
+            case GGML_TYPE_Q5_K:
+            case GGML_TYPE_Q6_K:
+                return ne11 <= 4;
+            default:
+                return ne11 <= MMVQ_MAX_BATCH_SIZE;
+        }
+    }
     if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_ADA_LOVELACE) {
         switch (type) { // tuned on RTX 4090
             case GGML_TYPE_Q2_K:
@@ -709,6 +744,22 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 #define QC4_ROWS_3   8
 #define QC4_ROWS_4   8
 #endif
+// Verify widths 5..8 (W58, KDEV 2026-09-17, microbench m=4096 k=14336): rows 8 is the whole win, nwarps 2 beats 4
+// for iq4_xs/q5_0/q6_K (width 5 = 1.03x width 4 for iq4_xs, was 1.33x; width 8 = 1.25x, was 1.94x); the Q4_K/Q5_K
+// reuse kernel wants nwarps 4. PTQ1_0 keeps rows 2 (ALU-bound, see calc_rows_per_block).
+#ifndef QC4_NWARPS_5
+#define QC4_NWARPS_5 2
+#define QC4_NWARPS_6 2
+#define QC4_NWARPS_7 2
+#define QC4_NWARPS_8 2
+#define QC4_ROWS_5   8
+#define QC4_ROWS_6   8
+#define QC4_ROWS_7   8
+#define QC4_ROWS_8   8
+#endif
+#ifndef QC4_NWARPS_58_K
+#define QC4_NWARPS_58_K 4
+#endif
 
 static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id,
         bool small_k = false, bool halve_iters = false, bool nw1 = false) {
@@ -718,11 +769,10 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
             case 2: return nw1 ? 1 : QC4_NWARPS_2;
             case 3: return nw1 ? 1 : QC4_NWARPS_3;
             case 4: return nw1 ? 1 : QC4_NWARPS_4;
-            case 5:
-            case 6:
-            case 7:
-            case 8:
-                return 2;
+            case 5: return (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K) ? QC4_NWARPS_58_K : QC4_NWARPS_5;
+            case 6: return (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K) ? QC4_NWARPS_58_K : QC4_NWARPS_6;
+            case 7: return (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K) ? QC4_NWARPS_58_K : QC4_NWARPS_7;
+            case 8: return (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K) ? QC4_NWARPS_58_K : QC4_NWARPS_8;
             default:
                 return 1;
         }
@@ -839,19 +889,18 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
 
 static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
     if (table_id == MMVQ_PARAMETERS_GENERIC) {
-        if (type == GGML_TYPE_PTQ1_0 && ncols_dst >= 2 && ncols_dst <= 4) {
-            return 2; // ternary is ALU-bound: 8 rows x ncols unrolled dots run out of registers (widths 5-8 already use 2)
+        if (type == GGML_TYPE_PTQ1_0 && ncols_dst >= 2 && ncols_dst <= 8) {
+            return 2; // ternary is ALU-bound: 8 rows x ncols unrolled dots run out of registers
         }
         switch (ncols_dst) {
             case 1: return small_k ? nwarps : QC4_ROWS_1;
             case 2: return QC4_ROWS_2;
             case 3: return QC4_ROWS_3;
             case 4: return QC4_ROWS_4;
-            case 5:
-            case 6:
-            case 7:
-            case 8:
-                return 2;
+            case 5: return QC4_ROWS_5;
+            case 6: return QC4_ROWS_6;
+            case 7: return QC4_ROWS_7;
+            case 8: return QC4_ROWS_8;
             default:
                 return 1;
         }
