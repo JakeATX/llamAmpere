@@ -700,6 +700,20 @@ static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, co
     FATTN_VEC_CASE(128, F16,      TQ6_0)
     FATTN_VEC_CASE(256, F16,      TQ6_0)
 
+    // tq5 shares the tq6 geometry (128 values per block)
+    FATTN_VEC_CASE(128, TQ5_0,    TQ5_0)
+    FATTN_VEC_CASE(256, TQ5_0,    TQ5_0)
+    FATTN_VEC_CASE(128, TQ5_0,    TURBO3_0)
+    FATTN_VEC_CASE(256, TQ5_0,    TURBO3_0)
+    FATTN_VEC_CASE(128, TQ5_0,    Q8_0)
+    FATTN_VEC_CASE(256, TQ5_0,    Q8_0)
+    FATTN_VEC_CASE(128, Q8_0,     TQ5_0)
+    FATTN_VEC_CASE(256, Q8_0,     TQ5_0)
+    FATTN_VEC_CASE(128, TQ5_0,    F16)
+    FATTN_VEC_CASE(256, TQ5_0,    F16)
+    FATTN_VEC_CASE(128, F16,      TQ5_0)
+    FATTN_VEC_CASE(256, F16,      TQ5_0)
+
     return nullptr;
 }
 
@@ -750,7 +764,8 @@ static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
             // ggml_cuda_get_best_fattn_kernel (multiples of 64 only)
             return true;
         case GGML_TYPE_TQ6_0:
-            // tq6 KV type; head dim must be a multiple of 128 (block size), checked below
+        case GGML_TYPE_TQ5_0:
+            // tq6/tq5 KV types; head dim must be a multiple of 128 (block size), checked below
             return true;
         default:
             return false;
@@ -856,8 +871,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             return BEST_FATTN_KERNEL_NONE;
         }
         // tq6 packs 128 values per block and is only instantiated for head dims 128 and 256
-        if ((K->type == GGML_TYPE_TQ6_0 && K->ne[0] % 128 != 0) ||
-            (V->type == GGML_TYPE_TQ6_0 && V->ne[0] % 128 != 0)) {
+        if (((K->type == GGML_TYPE_TQ6_0 || K->type == GGML_TYPE_TQ5_0) && K->ne[0] % 128 != 0) ||
+            ((V->type == GGML_TYPE_TQ6_0 || V->type == GGML_TYPE_TQ5_0) && V->ne[0] % 128 != 0)) {
             return BEST_FATTN_KERNEL_NONE;
         }
     }

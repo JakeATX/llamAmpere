@@ -451,6 +451,7 @@ extern "C" {
         GGML_TYPE_EXL3_7  = 56,
         GGML_TYPE_EXL3_8  = 57,
         GGML_TYPE_TQ6_0   = 58, // TurboQuant 6-bit KV cache: WHT + 6-bit PolarQuant (runtime-only KV type)
+        GGML_TYPE_TQ5_0   = 59, // TurboQuant 5-bit KV cache: WHT + 5-bit PolarQuant (runtime-only KV type)
         GGML_TYPE_PQ2_0   = 142, // Prism group-128 ternary weights
         GGML_TYPE_PTQ1_0  = 143, // Prism packed group-128 ternary weights
         GGML_TYPE_COUNT   = 144,

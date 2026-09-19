@@ -625,6 +625,9 @@ static ggml_type ggml_type_from_name(const std::string & s) {
     if (s == "tq6_0") {
         return GGML_TYPE_TQ6_0;
     }
+    if (s == "tq5_0") {
+        return GGML_TYPE_TQ5_0;
+    }
     if (s == "tq3_1s") {
         return GGML_TYPE_TQ3_1S;
     }

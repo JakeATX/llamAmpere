@@ -399,6 +399,22 @@ static_assert(sizeof(block_tq6_0) == 98, "wrong tq6_0 block size");
 static_assert(sizeof(block_tq6_0) == sizeof(ggml_half) + QK_TQ6/2 + QK_TQ6/4, "wrong tq6_0 block size/padding");
 static_assert(QK_TQ6 == 128, "tq6 kernels assume QK_TQ6 == 128");
 
+// TurboQuant 5-bit: the tq6 layout with a 1-bit high plane. Same 128-value block, the same
+// low-nibble plane in qs[] (so every tq6 nibble reader works unchanged), and one high bit per
+// code in qh[] (8 codes per byte). 32 Lloyd-Max centroids for N(0, 1/128).
+#define QK_TQ5 128
+#define QK_TQ5_GROUP 128  // rotation group size = head_dim
+#define NL_TQ5     (QK_TQ5 / 16)   // non-vec FA iterations per block
+#define NL_TQ5_VEC (QK_TQ5 / 4)    // vec FA iterations per block
+typedef struct {
+    ggml_half  norm;                //  2 bytes: corrected L2 norm, identical semantics to tq6
+    uint8_t    qs[QK_TQ5 / 2];      // 64 bytes: low 4 bits of each 5-bit code (nibble packed)
+    uint8_t    qh[QK_TQ5 / 8];      // 16 bytes: high bit of each code (8 per byte, bit i%8)
+} block_tq5_0;                      // 82 bytes total (5.125 bpw)
+static_assert(sizeof(block_tq5_0) == 82, "wrong tq5_0 block size");
+static_assert(sizeof(block_tq5_0) == sizeof(ggml_half) + QK_TQ5/2 + QK_TQ5/8, "wrong tq5_0 block size/padding");
+static_assert(QK_TQ5 == 128, "tq5 kernels assume QK_TQ5 == 128");
+
 // TurboQuant 2-bit: 2-bit PolarQuant indices only (no QJL)
 // Per block: norm(fp16) + 2-bit indices (32 bytes) = 34 bytes per 128 values
 // = 2.125 bits/value -> 7.5x compression vs fp16

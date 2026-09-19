@@ -229,6 +229,9 @@ static void ggml_vec_dot_turbo4_0_f32(int n, float * GGML_RESTRICT s, size_t bs,
 static void ggml_vec_dot_tq6_0_f32(int n, float * GGML_RESTRICT s, size_t bs,
                                        const void * GGML_RESTRICT vx, size_t bx,
                                        const void * GGML_RESTRICT vy, size_t by, int nrc);
+static void ggml_vec_dot_tq5_0_f32(int n, float * GGML_RESTRICT s, size_t bs,
+                                       const void * GGML_RESTRICT vx, size_t bx,
+                                       const void * GGML_RESTRICT vy, size_t by, int nrc);
 
 static void ggml_vec_dot_q8_cr_f32(int n, float * GGML_RESTRICT s, size_t bs,
                                    const void * GGML_RESTRICT vx, size_t bx,
@@ -542,6 +545,12 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     [GGML_TYPE_TQ6_0] = {
         .from_float               = (ggml_from_float_t) quantize_row_tq6_0_ref,
         .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_tq6_0_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_TQ5_0] = {
+        .from_float               = (ggml_from_float_t) quantize_row_tq5_0_ref,
+        .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_tq5_0_f32,
         .vec_dot_type             = GGML_TYPE_F32,
         .nrows                    = 1,
     },
@@ -4331,6 +4340,16 @@ static void ggml_vec_dot_tq6_0_f32(int n, float * GGML_RESTRICT s, size_t bs,
     GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(nrc);
 
     ggml_vec_dot_turbo_f32_impl(GGML_TYPE_TQ6_0, n, s, vx, vy);
+}
+
+// TurboQuant5 (TQ5) vec_dot: same generic dequant-then-dot path as tq6.
+static void ggml_vec_dot_tq5_0_f32(int n, float * GGML_RESTRICT s, size_t bs,
+                                       const void * GGML_RESTRICT vx, size_t bx,
+                                       const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    GGML_ASSERT(nrc == 1);
+    GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(nrc);
+
+    ggml_vec_dot_turbo_f32_impl(GGML_TYPE_TQ5_0, n, s, vx, vy);
 }
 
 static void ggml_vec_dot_cr_f32_impl(enum ggml_type type_x, int n, float * GGML_RESTRICT s,
