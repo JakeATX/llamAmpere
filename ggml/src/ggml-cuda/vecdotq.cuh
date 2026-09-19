@@ -879,18 +879,79 @@ static __device__ __forceinline__ void vec_dot_ptq1_0_q8_1_multi(const void * __
 // (elements 80+t*8+4(l&1)..+3) at trit steps t<3 for lanes 0/1 and t>=3 for lanes 2/3, and lanes 2/3 each take one
 // of the two qh groups (elements 120..123 / 124..127). Every lane therefore issues 8 dp4a per column. Integer sums
 // per 32-element sub-block are exact; the float combine across lanes happens in the caller's warp reduction.
+//
+// V6 layout of the same work (bit-identical sums, ~2x fewer instructions per row at width 4):
+//  - the y side (the lane's 8 y ints per column, the 4 sub-block scales and the exact per-sub-block sum of y) is
+//    loaded once per k step into ptq1_lane_y and shared by every row of the block;
+//  - every lane runs one instruction stream: the tail and qh trit chains are computed by all lanes and the lane's
+//    three groups are picked with selects, so no half-warp branches;
+//  - all y addresses are one per-column base plus the lane's byte shift and an immediate.
+template <int ncols_dst>
+struct ptq1_lane_y {
+    int   u[ncols_dst][8];   // y ints in the lane's group order: 0..4 word groups (sub-blocks 0,0,1,1,2), 5,6 = a,b (sub-block 2 for lanes 0/1, 3 for lanes 2/3), 7 = c (sub-block 3)
+    float ds[ncols_dst][4];  // sub-block scales
+    int   sy[ncols_dst][4];  // exact sum of y over this lane's groups per 32-element sub-block: sum((d-1)*y) = sum(d*y) - sum(y)
+};
+
+// Byte offsets of the lane's three lane-dependent y groups inside a 128-element run of 4 q8_1 blocks.
+// lanes 0/1 (g = lane): a = sub-block 2 int 4+g, b = sub-block 2 int 6+g, c = sub-block 3 int g
+// lanes 2/3 (g = lane&1): a = sub-block 3 int 2+g, b = sub-block 3 int 4+g, c = sub-block 3 int 6+g (the qh group)
+static __device__ __forceinline__ int ptq1_0_lane_off_a(const int lane) {
+    return lane < 2 ? (2 * (int) sizeof(block_q8_1) + 4 + (4 + lane) * 4)
+                    : (3 * (int) sizeof(block_q8_1) + 4 + (2 + (lane & 1)) * 4);
+}
+static __device__ __forceinline__ int ptq1_0_lane_off_c(const int lane) {
+    return lane < 2 ? (3 * (int) sizeof(block_q8_1) + 4 + lane * 4)
+                    : (3 * (int) sizeof(block_q8_1) + 4 + (6 + (lane & 1)) * 4);
+}
+
+template <int ncols_dst>
+static __device__ __forceinline__ void ptq1_0_lane_load_y(const block_q8_1 * __restrict__ bq8_1,
+                                                          const int      lane,
+                                                          const uint32_t stride_col_y,
+                                                          ptq1_lane_y<ncols_dst> & Y) {
+    const bool lo    = lane < 2;
+    const int  off_a = ptq1_0_lane_off_a(lane);
+    const int  off_c = ptq1_0_lane_off_c(lane);
+#    pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+        const char * base = (const char *) (bq8_1 + j * stride_col_y);
+#    pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            Y.ds[j][k] = __low2float(*(const half2 *) (base + k * sizeof(block_q8_1)));
+        }
+        // word groups: elements e = t*16 + 4*lane -> sub-block t>>1, y int 4*(t&1) + lane
+#    pragma unroll
+        for (int t = 0; t < 5; ++t) {
+            Y.u[j][t] = *(const int *) (base + (t >> 1) * sizeof(block_q8_1) + 4 + (t & 1) * 16 + lane * 4);
+        }
+        Y.u[j][5] = *(const int *) (base + off_a);
+        Y.u[j][6] = *(const int *) (base + off_a + 8);
+        Y.u[j][7] = *(const int *) (base + off_c);
+
+        const int s01 = ggml_cuda_dp4a(0x01010101, Y.u[j][1], ggml_cuda_dp4a(0x01010101, Y.u[j][0], 0));
+        const int s23 = ggml_cuda_dp4a(0x01010101, Y.u[j][3], ggml_cuda_dp4a(0x01010101, Y.u[j][2], 0));
+        const int s4  = ggml_cuda_dp4a(0x01010101, Y.u[j][4], 0);
+        const int sab = ggml_cuda_dp4a(0x01010101, Y.u[j][6], ggml_cuda_dp4a(0x01010101, Y.u[j][5], 0));
+        const int sc  = ggml_cuda_dp4a(0x01010101, Y.u[j][7], 0);
+        Y.sy[j][0] = s01;
+        Y.sy[j][1] = s23;
+        Y.sy[j][2] = s4 + (lo ? sab : 0);
+        Y.sy[j][3] = sc + (lo ? 0 : sab);
+    }
+}
+
 template <int ncols_dst>
 static __device__ __forceinline__ void vec_dot_ptq1_0_q8_1_lane(const void * __restrict__ vbq,
-                                                                const block_q8_1 * __restrict__ bq8_1,
                                                                 const int      kbx,
                                                                 const int      lane,
-                                                                const uint32_t stride_col_y,
+                                                                const ptq1_lane_y<ncols_dst> & Y,
                                                                 float *        result) {
-    const block_ptq1_0 * bq                 = (const block_ptq1_0 *) vbq + kbx;
-    int                  sumi[ncols_dst][4] = {};
-    int                  sy[ncols_dst][4]   = {};   // exact sum of y per 32-element sub-block: sum((d-1)*y) = sum(d*y) - sum(y)
+    const block_ptq1_0 * bq = (const block_ptq1_0 *) vbq + kbx;
+    const bool           lo = lane < 2;
 
-    // word `lane` of qs[0..15]: elements e = t*16 + 4*lane; sub-block t>>1, y int 4*(t&1) + lane
+    // chain A: word `lane` of qs[0..15], five trit steps -> groups 0..4
+    int qa[5];
     {
         const uint32_t packed = get_int_b4(bq->qs, lane);
         uint32_t       v_lo   = __byte_perm(packed, 0, 0x4140);
@@ -901,22 +962,13 @@ static __device__ __forceinline__ void vec_dot_ptq1_0_q8_1_lane(const void * __r
             const uint32_t w_hi = v_hi * 3;
             v_lo                = w_lo & 0x00FF00FF;
             v_hi                = w_hi & 0x00FF00FF;
-            const int q  = __byte_perm(w_lo, w_hi, 0x7531);
-            const int yi = 4 * (t & 1) + lane;
-#    pragma unroll
-            for (int j = 0; j < ncols_dst; ++j) {
-                const int u      = get_int_b4(bq8_1[j * stride_col_y + (t >> 1)].qs, yi);
-                sumi[j][t >> 1]  = ggml_cuda_dp4a(q, u, sumi[j][t >> 1]);
-                sy[j][t >> 1]   = ggml_cuda_dp4a(0x01010101, u, sy[j][t >> 1]);
-            }
+            qa[t]               = __byte_perm(w_lo, w_hi, 0x7531);
         }
     }
-
-    // word (lane&1) of qs[16..23]: elements e = 80 + t*8 + 4*(lane&1); lanes 0/1 take t<3, lanes 2/3 take t>=3
+    // chain B: word (lane&1) of qs[16..23], five trit steps; lanes 0/1 keep steps 0,1,2 and lanes 2/3 steps 3,4
+    int qb[5];
     {
-        const int      g      = lane & 1;
-        const bool     lo     = lane < 2;
-        const uint32_t packed = get_int_b4(bq->qs + 16, g);
+        const uint32_t packed = get_int_b4(bq->qs + 16, lane & 1);
         uint32_t       v_lo   = __byte_perm(packed, 0, 0x4140);
         uint32_t       v_hi   = __byte_perm(packed, 0, 0x4342);
 #    pragma unroll
@@ -925,22 +977,12 @@ static __device__ __forceinline__ void vec_dot_ptq1_0_q8_1_lane(const void * __r
             const uint32_t w_hi = v_hi * 3;
             v_lo                = w_lo & 0x00FF00FF;
             v_hi                = w_hi & 0x00FF00FF;
-            if (lo == (t < 3)) {
-                const int q  = __byte_perm(w_lo, w_hi, 0x7531);
-                const int e  = 80 + t * 8;            // + 4*g at runtime
-                const int yi = ((e & 31) >> 2) + g;
-#    pragma unroll
-                for (int j = 0; j < ncols_dst; ++j) {
-                    const int u     = get_int_b4(bq8_1[j * stride_col_y + (e >> 5)].qs, yi);
-                    sumi[j][e >> 5] = ggml_cuda_dp4a(q, u, sumi[j][e >> 5]);
-                    sy[j][e >> 5]   = ggml_cuda_dp4a(0x01010101, u, sy[j][e >> 5]);
-                }
-            }
+            qb[t]               = __byte_perm(w_lo, w_hi, 0x7531);
         }
     }
-
-    // qh: two groups (elements 120..123, 124..127), lane 2 takes the first, lane 3 the second
-    if (lane >= 2) {
+    // qh: two groups (elements 120..123, 124..127); lane 2 takes the first, lane 3 the second
+    int qh_sel;
+    {
         uint32_t       v  = (uint32_t) bq->qh[0] | ((uint32_t) bq->qh[1] << 16);
         const uint32_t w0 = v * 3;
         v                 = w0 & 0x00FF00FF;
@@ -949,24 +991,27 @@ static __device__ __forceinline__ void vec_dot_ptq1_0_q8_1_lane(const void * __r
         const uint32_t w2 = v * 3;
         v                 = w2 & 0x00FF00FF;
         const uint32_t w3 = v * 3;
-        const int q  = lane == 2 ? __byte_perm(w0, w1, 0x7531)
-                                 : __byte_perm(w2, w3, 0x7531);
-        const int yi = 6 + (lane & 1);
-#    pragma unroll
-        for (int j = 0; j < ncols_dst; ++j) {
-            const int u = get_int_b4(bq8_1[j * stride_col_y + 3].qs, yi);
-            sumi[j][3]  = ggml_cuda_dp4a(q, u, sumi[j][3]);
-            sy[j][3]   = ggml_cuda_dp4a(0x01010101, u, sy[j][3]);
-        }
+        qh_sel = (lane & 1) ? __byte_perm(w2, w3, 0x7531) : __byte_perm(w0, w1, 0x7531);
     }
+    const int q5 = lo ? qb[0] : qb[3];
+    const int q6 = lo ? qb[1] : qb[4];
+    const int q7 = lo ? qb[2] : qh_sel;
 
     const float d = (float) bq->d;
 #    pragma unroll
     for (int j = 0; j < ncols_dst; ++j) {
+        int sumi[4];
+        sumi[0]       = ggml_cuda_dp4a(qa[1], Y.u[j][1], ggml_cuda_dp4a(qa[0], Y.u[j][0], 0));
+        sumi[1]       = ggml_cuda_dp4a(qa[3], Y.u[j][3], ggml_cuda_dp4a(qa[2], Y.u[j][2], 0));
+        const int s4  = ggml_cuda_dp4a(qa[4], Y.u[j][4], 0);
+        const int sab = ggml_cuda_dp4a(q6, Y.u[j][6], ggml_cuda_dp4a(q5, Y.u[j][5], 0));
+        const int sc  = ggml_cuda_dp4a(q7, Y.u[j][7], 0);
+        sumi[2]       = s4 + (lo ? sab : 0);
+        sumi[3]       = sc + (lo ? 0 : sab);
         float acc = 0.0f;
 #    pragma unroll
         for (int k = 0; k < 4; ++k) {
-            acc += __low2float(bq8_1[j * stride_col_y + k].ds) * (float) (sumi[j][k] - sy[j][k]);
+            acc += Y.ds[j][k] * (float) (sumi[k] - Y.sy[j][k]);
         }
         result[j] = d * acc;
     }
