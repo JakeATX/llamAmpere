@@ -329,10 +329,10 @@ typedef struct {
 static_assert(sizeof(block_tq2_0) == sizeof(ggml_half) + QK_K / 4, "wrong tq2_0 block size/padding");
 
 // TurboQuant 3-bit MSE-only: 3-bit PolarQuant indices (no QJL)
-// Storage block size = 32 (matches q4_0 for optimal GPU parallelism)
+// Storage block size = 128 (one block per rotation group)
 // Transform group size = 128 (head_dim, for rotation Gaussianization)
-// Per block: norm(fp16) + 2-bit indices (8 bytes) + 1-bit extra (4 bytes) = 14 bytes per 32 values
-// = 3.5 bits/value → 4.6× compression vs fp16
+// Per block: norm(fp16) + 2-bit indices (32 bytes) + 1-bit extra (16 bytes) = 50 bytes per 128 values
+// = 3.125 bits/value -> 5.1x compression vs fp16
 // The 3-bit index is split: lower 2 bits in qs[], upper 1 bit in signs[]
 #define QK_TURBO3 128   // Block size 128: one block per rotation group, eliminates redundant norms
 #define QK_TURBO3_GROUP 128  // rotation group size = head_dim
@@ -341,9 +341,9 @@ static_assert(sizeof(block_tq2_0) == sizeof(ggml_half) + QK_K / 4, "wrong tq2_0 
 #define NL_TURBO3_VEC (QK_TURBO3 / 4)    // vec FA iterations per block
 typedef struct {
     ggml_half  norm;                    //  2 bytes: vector L2 norm (for rescaling)
-    uint8_t    qs[QK_TURBO3 / 4];      //  8 bytes: lower 2-bit indices (4 per byte)
-    uint8_t    signs[QK_TURBO3 / 8];   //  4 bytes: upper 1-bit of 3-bit index (8 per byte)
-} block_turbo3_0;                       // 14 bytes total
+    uint8_t    qs[QK_TURBO3 / 4];      // 32 bytes: lower 2-bit indices (4 per byte)
+    uint8_t    signs[QK_TURBO3 / 8];   // 16 bytes: upper 1-bit of 3-bit index (8 per byte)
+} block_turbo3_0;                       // 50 bytes total (3.125 bpw)
 static_assert(sizeof(block_turbo3_0) == sizeof(ggml_half) + QK_TURBO3/4 + QK_TURBO3/8, "wrong turbo3_0 block size/padding");
 
 // TurboQuant 4-bit: 3-bit PolarQuant indices + 1-bit QJL signs
@@ -357,8 +357,8 @@ static_assert(sizeof(block_turbo3_0) == sizeof(ggml_half) + QK_TURBO3/4 + QK_TUR
 
 #if TURBO4_USE_4BIT
 // 4-bit PolarQuant: 16 optimal centroids, nibble packed, no QJL
-// Per block: norm(fp16) + rnorm(fp16, reserved) + 4-bit indices (64 bytes)
-// = 68 bytes per 128 values = 4.25 bits/value → 3.8× compression vs fp16
+// Per block: norm(fp16) + 4-bit indices (64 bytes)
+// = 66 bytes per 128 values = 4.125 bits/value -> 3.9x compression vs fp16
 typedef struct {
     ggml_half  norm;                    //  2 bytes
     uint8_t    qs[QK_TURBO4 / 2];      // 64 bytes: 4-bit PolarQuant indices (nibble packed)
@@ -379,9 +379,45 @@ static_assert(sizeof(block_turbo4_0) == 2*sizeof(ggml_half) + QK_TURBO4*3/8 + QK
 
 static_assert(QK_TURBO4 == 128, "turbo4 kernels assume QK_TURBO4 == 128");
 
+// TurboQuant 6-bit: 6-bit PolarQuant, 64 Lloyd-Max centroids for N(0, 1/128).
+// Per block: norm(fp16) + 4-bit low plane (64 bytes) + 2-bit high plane (32 bytes)
+// = 98 bytes per 128 values = 6.125 bits/value -> 2.6x compression vs fp16
+// Split planes, not dense 6-bit: qs[] keeps the exact element order of block_turbo4_0.qs, so the
+// turbo4 nibble readers and tile loaders still work. Dense 6-bit would put element boundaries at
+// bit 6/12/18 and break the half2-pair extraction that the KQ dot and tile loaders need.
+#define QK_TQ6 128
+#define QK_TQ6_GROUP 128  // rotation group size = head_dim
+// Derived: FA template nl parameters (auto-scale with block size)
+#define NL_TQ6     (QK_TQ6 / 16)   // non-vec FA iterations per block
+#define NL_TQ6_VEC (QK_TQ6 / 4)    // vec FA iterations per block
+typedef struct {
+    ggml_half  norm;                //  2 bytes: corrected L2 norm, identical semantics to turbo4
+    uint8_t    qs[QK_TQ6 / 2];      // 64 bytes: low 4 bits of each 6-bit code (nibble packed)
+    uint8_t    qh[QK_TQ6 / 4];      // 32 bytes: high 2 bits of each code (4 per byte)
+} block_tq6_0;                      // 98 bytes total (6.125 bpw)
+static_assert(sizeof(block_tq6_0) == 98, "wrong tq6_0 block size");
+static_assert(sizeof(block_tq6_0) == sizeof(ggml_half) + QK_TQ6/2 + QK_TQ6/4, "wrong tq6_0 block size/padding");
+static_assert(QK_TQ6 == 128, "tq6 kernels assume QK_TQ6 == 128");
+
+// TurboQuant 5-bit: the tq6 layout with a 1-bit high plane. Same 128-value block, the same
+// low-nibble plane in qs[] (so every tq6 nibble reader works unchanged), and one high bit per
+// code in qh[] (8 codes per byte). 32 Lloyd-Max centroids for N(0, 1/128).
+#define QK_TQ5 128
+#define QK_TQ5_GROUP 128  // rotation group size = head_dim
+#define NL_TQ5     (QK_TQ5 / 16)   // non-vec FA iterations per block
+#define NL_TQ5_VEC (QK_TQ5 / 4)    // vec FA iterations per block
+typedef struct {
+    ggml_half  norm;                //  2 bytes: corrected L2 norm, identical semantics to tq6
+    uint8_t    qs[QK_TQ5 / 2];      // 64 bytes: low 4 bits of each 5-bit code (nibble packed)
+    uint8_t    qh[QK_TQ5 / 8];      // 16 bytes: high bit of each code (8 per byte, bit i%8)
+} block_tq5_0;                      // 82 bytes total (5.125 bpw)
+static_assert(sizeof(block_tq5_0) == 82, "wrong tq5_0 block size");
+static_assert(sizeof(block_tq5_0) == sizeof(ggml_half) + QK_TQ5/2 + QK_TQ5/8, "wrong tq5_0 block size/padding");
+static_assert(QK_TQ5 == 128, "tq5 kernels assume QK_TQ5 == 128");
+
 // TurboQuant 2-bit: 2-bit PolarQuant indices only (no QJL)
-// Per block: norm(fp16) + 2-bit indices (8 bytes) = 10 bytes per 32 values
-// = 2.5 bits/value → 6.4× compression vs fp16
+// Per block: norm(fp16) + 2-bit indices (32 bytes) = 34 bytes per 128 values
+// = 2.125 bits/value -> 7.5x compression vs fp16
 // 4 centroids (Lloyd-Max for N(0, 1/128)): {-0.133462, -0.039994, 0.039994, 0.133462}
 #define QK_TURBO2 128   // Block size 128: one block per rotation group
 #define QK_TURBO2_GROUP 128  // rotation group size = head_dim
@@ -390,8 +426,8 @@ static_assert(QK_TURBO4 == 128, "turbo4 kernels assume QK_TURBO4 == 128");
 #define NL_TURBO2_VEC (QK_TURBO2 / 4)    // vec FA iterations per block
 typedef struct {
     ggml_half  norm;                    //  2 bytes: corrected L2 norm
-    uint8_t    qs[QK_TURBO2 / 4];      //  8 bytes: 2-bit indices (4 per byte)
-} block_turbo2_0;                       // 10 bytes total
+    uint8_t    qs[QK_TURBO2 / 4];      // 32 bytes: 2-bit indices (4 per byte)
+} block_turbo2_0;                       // 34 bytes total (2.125 bpw)
 static_assert(sizeof(block_turbo2_0) == sizeof(ggml_half) + QK_TURBO2/4, "wrong turbo2_0 block size/padding");
 
 // TQ3_1S: WHT-rotated 3-bit weight quantization (8-level Lloyd-Max for N(0,1))
