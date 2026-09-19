@@ -576,7 +576,7 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
     }
 #if !defined(GGML_USE_HIP)
     if (type == GGML_TYPE_PTQ1_0 && GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_TURING) {
-        return ne11 <= 7;
+        return ne11 <= 8; // the V6 reuse lane kernel beats the MMQ tile at width 8 too
     }
 #endif
     // k-quants cost more to decode and mvq redoes that per column, so MMQ wins sooner.
@@ -704,6 +704,12 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 #define QC4_NWARPS_2 4
 #define QC4_NWARPS_3 4
 #define QC4_NWARPS_4 4
+#ifndef PTQ1_REUSE_ROWS_2_4
+#define PTQ1_REUSE_ROWS_2_4 8
+#endif
+#ifndef PTQ1_REUSE_ROWS_5_8
+#define PTQ1_REUSE_ROWS_5_8 8
+#endif
 #define QC4_ROWS_1   1
 #define QC4_ROWS_2   8
 #define QC4_ROWS_3   8
@@ -840,7 +846,10 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
 static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
     if (table_id == MMVQ_PARAMETERS_GENERIC) {
         if (type == GGML_TYPE_PTQ1_0 && ncols_dst >= 2 && ncols_dst <= 4) {
-            return 2; // ternary is ALU-bound: 8 rows x ncols unrolled dots run out of registers (widths 5-8 already use 2)
+            return PTQ1_REUSE_ROWS_2_4; // y loads are shared across the rows of a block; the reuse lane kernel needs enough rows to amortize them
+        }
+        if (type == GGML_TYPE_PTQ1_0 && ncols_dst >= 5 && ncols_dst <= 8) {
+            return PTQ1_REUSE_ROWS_5_8;
         }
         switch (ncols_dst) {
             case 1: return small_k ? nwarps : QC4_ROWS_1;
@@ -1045,6 +1054,11 @@ static __global__ void mul_mat_vec_q(
 #endif
 
         if constexpr (reuse_weights && (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_Q5_0 || type == GGML_TYPE_PTQ1_0)) {
+            [[maybe_unused]] ptq1_lane_y<ncols_dst> ptq1_y;
+            if constexpr (type == GGML_TYPE_PTQ1_0) {
+                // the lane's y ints, scales and y sums are loaded once per k step and shared by every row below
+                ptq1_0_lane_load_y<ncols_dst>(y + kby, kqs, stride_col_y, ptq1_y);
+            }
 #pragma unroll
             for (int i = 0; i < rows_per_cuda_block; ++i) {
                 float dots[ncols_dst];
@@ -1054,7 +1068,7 @@ static __global__ void mul_mat_vec_q(
                 } else if constexpr (type == GGML_TYPE_PTQ1_0) {
                     // 4 lanes per 128-weight block (kqs = lane, VDR 1): each lane unpacks its share once and dots every column.
                     vec_dot_ptq1_0_q8_1_lane<ncols_dst>(
-                        vx, y + kby, kbx_offset + i*stride_row_x + kbx, kqs, stride_col_y, dots);
+                        vx, kbx_offset + i*stride_row_x + kbx, kqs, ptq1_y, dots);
                 } else if constexpr (type == GGML_TYPE_Q5_0) {
                     vec_dot_q5_0_q8_1_multi<ncols_dst>(
                         vx, y, stride_col_y, kby, kbx_offset + i*stride_row_x + kbx, kqs, dots);
