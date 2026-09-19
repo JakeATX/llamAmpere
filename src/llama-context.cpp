@@ -274,7 +274,13 @@ llama_context::llama_context(
             path = getenv("LLAMA_SPEC_DRAFT_VOCAB");
         }
         if (path != nullptr && path[0] != '\0') {
-            init_draft_vocab(path, params.draft_vocab_hot);
+            if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+                // the head is sharded across the Meta device and backend sampling is unavailable there:
+                // the draft scores the full head, so the map tensor is not created (see draft_vocab_direct)
+                LLAMA_LOG_WARN("%s: --spec-draft-vocab-map is not used with SPLIT_MODE_TENSOR, the draft scores the full head\n", __func__);
+            } else {
+                init_draft_vocab(path, params.draft_vocab_hot);
+            }
         }
     }
 
