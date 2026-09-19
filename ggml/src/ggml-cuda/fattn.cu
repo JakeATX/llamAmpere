@@ -337,7 +337,11 @@ static void ggml_cuda_flash_attn_ext_mma_turbo_dispatch_ncols1_8(ggml_backend_cu
     static const int ncols1_min = [] { const char * e = getenv("GGML_Q8_TURBO3_MMA_NCOLS1_MIN"); const int v = e ? atoi(e) : 2; return (v == 1 || v == 2 || v == 4) ? v : 2; }();
     if (Q->ne[1] <= 1 && ncols1_min == 1) { ggml_cuda_flash_attn_ext_mma_turbo_case<DKQ, DV, 1, 8, type_K, type_V>(ctx, dst); return; }
     if (Q->ne[1] <= 2 && ncols1_min <= 2) { ggml_cuda_flash_attn_ext_mma_turbo_case<DKQ, DV, 2, 8, type_K, type_V>(ctx, dst); return; }
-    if constexpr (DKQ == 256 && DV == 256 && type_K == GGML_TYPE_Q8_0 && (type_V == GGML_TYPE_TURBO3_0 || type_V == GGML_TYPE_Q8_0)) {
+    if constexpr (DKQ == 256 && DV == 256 && ((type_K == GGML_TYPE_Q8_0 && (type_V == GGML_TYPE_TURBO3_0 || type_V == GGML_TYPE_Q8_0)) ||
+                                             (type_K == GGML_TYPE_TQ6_0 && type_V == GGML_TYPE_TURBO3_0) ||
+                                             (type_K == GGML_TYPE_TQ5_0 && type_V == GGML_TYPE_TURBO3_0) ||
+                                             ((type_K == GGML_TYPE_TQ5_0 || type_K == GGML_TYPE_TQ6_0 || type_K == GGML_TYPE_Q8_0) && type_V == GGML_TYPE_TURBO4_0) ||
+                                             (type_K == GGML_TYPE_TQ6_0 && type_V == GGML_TYPE_TQ5_0))) {
         if (Q->ne[1] > 4) { ggml_cuda_flash_attn_ext_mma_turbo_case<DKQ, DV, 8, 8, type_K, type_V>(ctx, dst); return; }
     }
     ggml_cuda_flash_attn_ext_mma_turbo_case<DKQ, DV, 4, 8, type_K, type_V>(ctx, dst); // Q->ne[1] in {3,4}
@@ -1081,16 +1085,36 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
         const bool turbo_matched = (K->type == V->type &&
             (K->type == GGML_TYPE_TURBO4_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO2_0 ||
-             K->type == GGML_TYPE_TQ6_0)) ||
-            // asymmetric tq6 K over a turbo3 V: the pair TQ6 is meant for, K and V decoded by
+             K->type == GGML_TYPE_TQ6_0 || K->type == GGML_TYPE_TQ5_0)) ||
+            // asymmetric tq6/tq5 K over a turbo3 V: the pair they are meant for, K and V decoded by
             // their own tile loaders into the same GQA-packed tile.
-            (K->type == GGML_TYPE_TQ6_0 && V->type == GGML_TYPE_TURBO3_0);
+            ((K->type == GGML_TYPE_TQ6_0 || K->type == GGML_TYPE_TQ5_0) && V->type == GGML_TYPE_TURBO3_0) ||
+            // turbo4 V under a q8_0/tq6_0/tq5_0 K (D=256 only): unstaged turbo4 V tile loader, K loader as above
+            ((K->type == GGML_TYPE_TQ6_0 || K->type == GGML_TYPE_TQ5_0 || K->type == GGML_TYPE_Q8_0) && V->type == GGML_TYPE_TURBO4_0 && Q->ne[0] == 256) ||
+            // tq6_0 K over a tq5_0 V (D=256 only): both tiles staged, same loaders as the matched tq6/tq5 pairs
+            (K->type == GGML_TYPE_TQ6_0 && V->type == GGML_TYPE_TQ5_0 && Q->ne[0] == 256);
+        // the tq6_0/tq5_0 K / turbo3_0 V pairs at D=256 have an (8,8) instance, so MTP verify widths 5..8 stay fused
+        const int turbo_max_q = (((K->type == GGML_TYPE_TQ6_0 || K->type == GGML_TYPE_TQ5_0 || K->type == GGML_TYPE_Q8_0) &&
+                                  (V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0) && Q->ne[0] == 256) ||
+                                 (K->type == GGML_TYPE_TQ6_0 && V->type == GGML_TYPE_TQ5_0 && Q->ne[0] == 256)) ? 8 : 4;
         if (ggml_cuda_turbo_mma_fused() && turbo_matched
-                && Q->ne[1] <= 4 && V->ne[0] == Q->ne[0] && turing_mma_available(cc)) {
+                && Q->ne[1] <= turbo_max_q && V->ne[0] == Q->ne[0] && turing_mma_available(cc)) {
             ggml_cuda_fattn_path_note("turbo_fused_gate", dst, -1);
             if (K->type == GGML_TYPE_TQ6_0 && V->type == GGML_TYPE_TURBO3_0) {
                 if (Q->ne[0] == 128) { ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<128, 128, GGML_TYPE_TQ6_0, GGML_TYPE_TURBO3_0>(ctx, dst); return; }
                 if (Q->ne[0] == 256) { ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_TQ6_0, GGML_TYPE_TURBO3_0>(ctx, dst); return; }
+            }
+            if (V->type == GGML_TYPE_TURBO4_0 && Q->ne[0] == 256) {
+                if (K->type == GGML_TYPE_TQ5_0) { ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_TQ5_0, GGML_TYPE_TURBO4_0>(ctx, dst); return; }
+                if (K->type == GGML_TYPE_TQ6_0) { ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_TQ6_0, GGML_TYPE_TURBO4_0>(ctx, dst); return; }
+                if (K->type == GGML_TYPE_Q8_0)  { ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_Q8_0,  GGML_TYPE_TURBO4_0>(ctx, dst); return; }
+            }
+            if (K->type == GGML_TYPE_TQ6_0 && V->type == GGML_TYPE_TQ5_0 && Q->ne[0] == 256) {
+                ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_TQ6_0, GGML_TYPE_TQ5_0>(ctx, dst); return;
+            }
+            if (K->type == GGML_TYPE_TQ5_0 && V->type == GGML_TYPE_TURBO3_0) {
+                if (Q->ne[0] == 128) { ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<128, 128, GGML_TYPE_TQ5_0, GGML_TYPE_TURBO3_0>(ctx, dst); return; }
+                if (Q->ne[0] == 256) { ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_TQ5_0, GGML_TYPE_TURBO3_0>(ctx, dst); return; }
             }
             if (Q->ne[0] == 128) {
                 switch (K->type) {
@@ -1098,6 +1122,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                     case GGML_TYPE_TURBO3_0: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<128, 128, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0>(ctx, dst); return;
                     case GGML_TYPE_TURBO2_0: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<128, 128, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO2_0>(ctx, dst); return;
                     case GGML_TYPE_TQ6_0:    ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<128, 128, GGML_TYPE_TQ6_0,    GGML_TYPE_TQ6_0>(ctx, dst); return;
+                    case GGML_TYPE_TQ5_0:    ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<128, 128, GGML_TYPE_TQ5_0,    GGML_TYPE_TQ5_0>(ctx, dst); return;
                     default: break;
                 }
             }
@@ -1106,6 +1131,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                     case GGML_TYPE_TURBO4_0: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0>(ctx, dst); return;
                     case GGML_TYPE_TURBO3_0: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0>(ctx, dst); return;
                     case GGML_TYPE_TQ6_0:    ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_TQ6_0,    GGML_TYPE_TQ6_0>(ctx, dst); return;
+                    case GGML_TYPE_TQ5_0:    ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_TQ5_0,    GGML_TYPE_TQ5_0>(ctx, dst); return;
                     // turbo2 + head_dim 256: intentionally NO fused case (routes to VEC via
                     // default below). At 2-bit KV the fused path's GQA-pack saving is tiny while the
                     // dequant/no-pipeline overhead is unchanged, so it is neutral on high-BW GPUs and
