@@ -1102,22 +1102,30 @@ static __global__ void mul_mat_vec_q(
         }
 #endif
 
-        if constexpr (reuse_weights && (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_Q5_0 || type == GGML_TYPE_PTQ1_0)) {
-            [[maybe_unused]] ptq1_lane_y<ncols_dst> ptq1_y;
-            if constexpr (type == GGML_TYPE_PTQ1_0) {
-                // the lane's y ints, scales and y sums are loaded once per k step and shared by every row below
-                ptq1_0_lane_load_y<ncols_dst>(y + kby, kqs, stride_col_y, ptq1_y);
+        if constexpr (reuse_weights && type == GGML_TYPE_PTQ1_0) {
+            // 4 lanes per 128-weight block (kqs = lane, VDR 1): the lane's y ints, scales and y sums are loaded
+            // once per k step and shared by every row below; each lane unpacks its share once and dots every column.
+            // Kept in its own branch: declaring the lane struct for the other reuse types put its 160-byte y array
+            // on the stack of the iq4_xs width-5 kernel (REG 179 -> 109 + 160 B spill, 3x slower).
+            ptq1_lane_y<ncols_dst> ptq1_y;
+            ptq1_0_lane_load_y<ncols_dst>(y + kby, kqs, stride_col_y, ptq1_y);
+#pragma unroll
+            for (int i = 0; i < rows_per_cuda_block; ++i) {
+                float dots[ncols_dst];
+                vec_dot_ptq1_0_q8_1_lane<ncols_dst>(
+                    vx, kbx_offset + i*stride_row_x + kbx, kqs, ptq1_y, dots);
+#pragma unroll
+                for (int j = 0; j < ncols_dst; ++j) {
+                    tmp[j][i] += dots[j];
+                }
             }
+        } else if constexpr (reuse_weights && (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_Q5_0)) {
 #pragma unroll
             for (int i = 0; i < rows_per_cuda_block; ++i) {
                 float dots[ncols_dst];
                 if constexpr (type == GGML_TYPE_IQ4_XS) {
                     vec_dot_iq4_xs_q8_1_multi<ncols_dst>(
                         vx, y, stride_col_y, kby, kbx_offset + i*stride_row_x + kbx, kqs, dots);
-                } else if constexpr (type == GGML_TYPE_PTQ1_0) {
-                    // 4 lanes per 128-weight block (kqs = lane, VDR 1): each lane unpacks its share once and dots every column.
-                    vec_dot_ptq1_0_q8_1_lane<ncols_dst>(
-                        vx, kbx_offset + i*stride_row_x + kbx, kqs, ptq1_y, dots);
                 } else if constexpr (type == GGML_TYPE_Q5_0) {
                     vec_dot_q5_0_q8_1_multi<ncols_dst>(
                         vx, y, stride_col_y, kby, kbx_offset + i*stride_row_x + kbx, kqs, dots);
