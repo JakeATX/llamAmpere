@@ -367,19 +367,62 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
 void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
     GGML_UNUSED(ubatch);
 
-    const int64_t n_rs = mctx->get_n_rs();
-
-    if (s_copy) {
-        GGML_ASSERT(ggml_backend_buffer_is_host(s_copy->buffer));
-        int32_t * data = (int32_t *) s_copy->data;
-
-        // assuming copy destinations ALWAYS happen ONLY on the cells between head and head+n
-        for (uint32_t i = 0; i < n_rs; ++i) {
-            data[i] = mctx->s_copy(i);
-        }
-    }
+    fill_s_copy(mctx);
 
     mctx->consume_replay(span_new);
+}
+
+void llm_graph_input_rs::fill_s_copy(const llama_memory_recurrent_context * m) {
+    if (!s_copy) {
+        return;
+    }
+    GGML_ASSERT(ggml_backend_buffer_is_host(s_copy->buffer));
+    int32_t * data = (int32_t *) s_copy->data;
+
+    if (m->get_rs_ring()) {
+        auto host_data = [](ggml_tensor * t) -> int32_t * {
+            if (t == nullptr) {
+                return nullptr;
+            }
+            GGML_ASSERT(ggml_backend_buffer_is_host(t->buffer));
+            return (int32_t *) t->data;
+        };
+        GGML_ASSERT(rs_wr && rs_wr_conv.size() == n_written);
+        const int64_t n_seqs = m->get_ubatch().n_seqs;
+        std::vector<int32_t> wr_conv((size_t) n_written * n_seqs);
+        m->fill_rs_ring(data, host_data(rs_wr), wr_conv.data(), host_data(rs_old_src), host_data(rs_old_dst));
+        for (uint32_t j = 0; j < n_written; ++j) {
+            memcpy(host_data(rs_wr_conv[j]), wr_conv.data() + (size_t) j * n_seqs, n_seqs * sizeof(int32_t));
+        }
+        return;
+    }
+
+    const int64_t n_rs = m->get_n_rs();
+    // assuming copy destinations ALWAYS happen ONLY on the cells between head and head+n
+    for (int64_t i = 0; i < n_rs; ++i) {
+        data[i] = m->s_copy((int) i);
+    }
+
+    set_input_shift(m->get_size());
+}
+
+void llm_graph_input_rs::set_input_shift(uint32_t mem_size) {
+    if (!s_copy_shift) {
+        return;
+    }
+    GGML_ASSERT(s_copy && snap_shift > 0 && ggml_backend_buffer_is_host(s_copy_shift->buffer));
+    // s_copy_main[s] (the first n_seqs entries of s_copy) already carries the rollback group offset
+    // rs_idx * mem_size + src0, so group j of the shift reads plane plane0 + j + rs_idx -- exactly
+    // what the per-group form did with a view at plane0 + j indexed by s_copy_main.
+    const int32_t * main = (const int32_t *) s_copy->data;
+    int32_t *       data = (int32_t *) s_copy_shift->data;
+
+    const int64_t n_seqs = s_copy_shift->ne[0] / snap_shift;
+    for (uint32_t j = 0; j < snap_shift; ++j) {
+        for (int64_t s = 0; s < n_seqs; ++s) {
+            data[j * n_seqs + s] = (int32_t) (j * (int64_t) mem_size + main[s]);
+        }
+    }
 }
 
 bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
@@ -403,6 +446,8 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
     res &= ckpt_span  == mctx->get_ckpt_span();
     res &= s_stale    == mctx->get_s_stale();
     res &= snap_shift == mctx->get_snap_shift();
+    res &= n_written  == mctx->get_n_written();
+    res &= n_older    == mctx->get_n_older();
 
     return res;
 }
@@ -1149,17 +1194,7 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
         mctx->get_attn()->set_input_v_rot(inp_attn->self_v_rot);
     }
 
-    const int64_t n_rs = mctx->get_recr()->get_n_rs();
-
-    if (inp_rs->s_copy) {
-        GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
-        int32_t * data = (int32_t *) inp_rs->s_copy->data;
-
-        // assuming copy destinations ALWAYS happen ONLY on the cells between head and head+n
-        for (uint32_t i = 0; i < n_rs; ++i) {
-            data[i] = mctx->get_recr()->s_copy(i);
-        }
-    }
+    inp_rs->fill_s_copy(mctx->get_recr());
 
     mctx->get_recr()->consume_replay(inp_rs->span_new);
 }
@@ -1190,6 +1225,8 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
     res &= inp_rs->ckpt_span  == mctx->get_recr()->get_ckpt_span();
     res &= inp_rs->s_stale    == mctx->get_recr()->get_s_stale();
     res &= inp_rs->snap_shift == mctx->get_recr()->get_snap_shift();
+    res &= inp_rs->n_written  == mctx->get_recr()->get_n_written();
+    res &= inp_rs->n_older    == mctx->get_recr()->get_n_older();
 
     return res;
 }
@@ -1202,17 +1239,7 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
 
     mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
 
-    const int64_t n_rs = mctx->get_recr()->get_n_rs();
-
-    if (inp_rs->s_copy) {
-        GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
-        int32_t * data = (int32_t *) inp_rs->s_copy->data;
-
-        // assuming copy destinations ALWAYS happen ONLY on the cells between head and head+n
-        for (uint32_t i = 0; i < n_rs; ++i) {
-            data[i] = mctx->get_recr()->s_copy(i);
-        }
-    }
+    inp_rs->fill_s_copy(mctx->get_recr());
 
     mctx->get_recr()->consume_replay(inp_rs->span_new);
 }
@@ -1242,6 +1269,8 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
     res &= inp_rs->ckpt_span  == mctx->get_recr()->get_ckpt_span();
     res &= inp_rs->s_stale    == mctx->get_recr()->get_s_stale();
     res &= inp_rs->snap_shift == mctx->get_recr()->get_snap_shift();
+    res &= inp_rs->n_written  == mctx->get_recr()->get_n_written();
+    res &= inp_rs->n_older    == mctx->get_recr()->get_n_older();
 
     return res;
 }
@@ -1285,17 +1314,7 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
         attn_ctx->get_swa()->set_input_v_rot(inp_attn->self_v_rot_swa);
     }
 
-    const int64_t n_rs = mctx->get_recr()->get_n_rs();
-
-    if (inp_rs->s_copy) {
-        GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
-        int32_t * data = (int32_t *) inp_rs->s_copy->data;
-
-        // assuming copy destinations ALWAYS happen ONLY on the cells between head and head+n
-        for (uint32_t i = 0; i < n_rs; ++i) {
-            data[i] = mctx->get_recr()->s_copy(i);
-        }
-    }
+    inp_rs->fill_s_copy(mctx->get_recr());
 
     mctx->get_recr()->consume_replay(inp_rs->span_new);
 }
@@ -1339,6 +1358,8 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
     res &= inp_rs->ckpt_span  == mctx->get_recr()->get_ckpt_span();
     res &= inp_rs->s_stale    == mctx->get_recr()->get_s_stale();
     res &= inp_rs->snap_shift == mctx->get_recr()->get_snap_shift();
+    res &= inp_rs->n_written  == mctx->get_recr()->get_n_written();
+    res &= inp_rs->n_older    == mctx->get_recr()->get_n_older();
 
     return res;
 }
@@ -3912,6 +3933,30 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
         inp->span_new = std::min(m + n_seq_tokens, n_rs_seq);
     }
 
+    if (inp->snap_shift > 0) {
+        inp->s_copy_shift = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int64_t) inp->snap_shift * n_seqs);
+        ggml_set_input(inp->s_copy_shift);
+    }
+
+    // [TAG_RECURRENT_ROLLBACK_RING]
+    inp->n_written = mctx_cur->get_n_written();
+    inp->n_older   = mctx_cur->get_n_older();
+    if (inp->n_written > 0) {
+        inp->rs_wr = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int64_t) inp->n_written * n_seqs);
+        ggml_set_input(inp->rs_wr);
+        inp->rs_wr_conv.resize(inp->n_written);
+        for (uint32_t j = 0; j < inp->n_written; ++j) {
+            inp->rs_wr_conv[j] = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_seqs);
+            ggml_set_input(inp->rs_wr_conv[j]);
+        }
+    }
+    if (inp->n_older > 0) {
+        inp->rs_old_src = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, inp->n_older);
+        inp->rs_old_dst = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, inp->n_older);
+        ggml_set_input(inp->rs_old_src);
+        ggml_set_input(inp->rs_old_dst);
+    }
+
     return inp;
 }
 
@@ -3931,9 +3976,27 @@ ggml_tensor * llm_graph_context::build_rs(
         const llm_graph_get_rows_fn & get_state_rows) const {
     const auto * kv_state = inp->mctx;
 
-    return build_rs(s, inp->s_copy_main, inp->s_copy_extra, state_size, n_seqs,
+    // [TAG_RECURRENT_ROLLBACK_RING] a seq whose data moves cells this ubatch takes its older
+    // rollback groups along, plane for plane. Gather before build_rs's extra-state copy (an
+    // extra may be the seq that was swapped out of our destination cell, and it reads from
+    // there), scatter after it.
+    ggml_tensor * states = nullptr;
+    ggml_tensor * older  = nullptr;
+    if (inp->rs_old_src != nullptr) {
+        states = ggml_reshape_2d(ctx0, s, state_size, s->ne[1]);
+        older  = ggml_get_rows(ctx0, states, inp->rs_old_src);
+        ggml_build_forward_expand(gf, older);
+    }
+
+    ggml_tensor * out = build_rs(s, inp->s_copy_main, inp->s_copy_extra, state_size, n_seqs,
                     kv_state->get_n_rs(), kv_state->get_head(), kv_state->get_size(), kv_state->get_rs_z(),
                     get_state_rows);
+
+    if (older != nullptr) {
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx0, states, older, inp->rs_old_dst));
+    }
+
+    return out;
 }
 
 ggml_tensor * llm_graph_context::build_rwkv_token_shift_load(

@@ -90,6 +90,19 @@ public:
 
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
 
+    // [TAG_RECURRENT_ROLLBACK_RING] ring-indexed snapshot groups. When true, rollback group g of
+    // the data in cell c lives in plane (rs_base[c] + g) mod K (K = n_rs_seq + 1) of the widened
+    // r_l/s_l tensors instead of plane g. A ubatch of n < K tokens then writes its newest n groups
+    // at planes (b' + g), b' = (rs_base[src] + rollback - n) mod K, and the older groups stay where
+    // they are -- no snapshot shift (get_snap_shift() == 0 in this mode). Only the archs whose
+    // conv and state writers go through llm_build_delta_net_base opt in (see the constructor);
+    // gdn_replay keeps the shift path.
+    bool rs_ring = false;
+
+    // per data cell (index = cell whose planes hold the data, i.e. cells[i].src0): plane of
+    // rollback group 0. Set when a ubatch writes the cell, 0 for rs_z, restored or cleared cells.
+    std::vector<uint32_t> rs_base;
+
     // DRC phase 2 (opt-in, env-gated by LLAMA_GDN_REPLAY): when true, `s_l` holds only the
     // authoritative state (no (1+n_rs_seq) widening) and `ingr_l` holds a per-seq ring of
     // n_rs_seq ggml_gated_delta_net emit_mode==1 ingredient slots instead. Rollback marks
@@ -261,6 +274,18 @@ public:
     // exactly one short batch (the multi-seq test's shape) restores a state that never existed.
     // Never nonzero on the speculative verify path (n = n_draft + 1 = K).
     uint32_t get_snap_shift() const;
+
+    // [TAG_RECURRENT_ROLLBACK_RING] ring mode accessors (all 0/false when rs_ring is off)
+    bool     get_rs_ring()   const;
+    uint32_t get_n_written() const; // min(n_seq_tokens, K): snapshot groups this ubatch writes
+    uint32_t get_n_older()   const; // rows of the older-group copy for relocated cells ((K - n) per moved seq)
+    // one-shot input fill for ring mode, replacing the s_copy(i) loop: `copy` [n_rs] read rows
+    // (plane (base + rollback) of the source cell), `wr` [n_written * n_seqs] write rows for group
+    // g at [g * n_seqs + s], `wr_conv` the same rows with the groups in reverse order (oldest
+    // group first, the order build_conv_state's source view has), `old_src`/`old_dst` [n_older]
+    // the rows to copy for the older groups of seqs whose data moves cells this ubatch.
+    // Side effects (once per ubatch, like s_copy): rs_idx reset, rs_base of the written cells set.
+    void fill_rs_ring(int32_t * copy, int32_t * wr, int32_t * wr_conv, int32_t * old_src, int32_t * old_dst) const;
 
     // DRC phase 2: mark the pending replay as consumed and record the span the graph just
     // built leaves behind the checkpoint. Called exactly once per decode, after the graph has

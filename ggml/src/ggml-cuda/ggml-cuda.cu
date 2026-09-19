@@ -3214,7 +3214,7 @@ static int ggml_cuda_try_gdn_cache_fusion(
         if (ggml_cuda_is_view_or_noop(n)) {
             continue;
         }
-        if (n->op != GGML_OP_CPY || (n->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        if ((n->op != GGML_OP_CPY && n->op != GGML_OP_SET_ROWS) || (n->flags & GGML_TENSOR_FLAG_OUTPUT)) {
             return 0;
         }
         cpy  = n;
@@ -3222,6 +3222,32 @@ static int ggml_cuda_try_gdn_cache_fusion(
     }
     if (cpy == nullptr) {
         return 0;
+    }
+
+    if (cpy->op == GGML_OP_SET_ROWS) {
+        // [TAG_RECURRENT_ROLLBACK_RING] set_rows(cache2d, view of the snapshot tail as
+        // [D, n_seqs * n_written], I32 rows): slot i of seq s -> cache row rows[i * n_seqs + s]
+        const ggml_tensor * src  = cpy->src[0];
+        const ggml_tensor * rows = cpy->src[1];
+        const int64_t n_rows = n_seqs * n_written;
+        if (src->op != GGML_OP_VIEW || src->view_src != gdn || src->view_offs != tail_off ||
+            !ggml_is_contiguous(src) || src->ne[0] != D || src->ne[1] != n_rows || src->ne[2] != 1 || src->ne[3] != 1) {
+            return 0;
+        }
+        if (rows->type != GGML_TYPE_I32 || rows->data == nullptr || rows->ne[0] != n_rows ||
+            rows->ne[1] != 1 || rows->ne[2] != 1) {
+            return 0;
+        }
+        // the cache itself (set_rows is in place): F32 rows of exactly D
+        if (cpy->type != GGML_TYPE_F32 || cpy->data == nullptr || cpy->ne[0] != D ||
+            cpy->nb[0] != ggml_type_size(GGML_TYPE_F32) || cpy->nb[1] != (size_t) ggml_row_size(GGML_TYPE_F32, D) ||
+            !ggml_is_contiguous(cpy)) {
+            return 0;
+        }
+        fused_state_cpy.data        = (float *) cpy->data;
+        fused_state_cpy.slot_stride = 0;
+        fused_state_cpy.slot_rows   = (const int32_t *) rows->data;
+        return skip;
     }
 
     const ggml_tensor * src = cpy->src[0]; // view of the gdn snapshot tail
@@ -3244,6 +3270,7 @@ static int ggml_cuda_try_gdn_cache_fusion(
 
     fused_state_cpy.data        = (float *) dst->data; // rollback group 0 (newest)
     fused_state_cpy.slot_stride = K > 1 ? (int64_t) (dst->nb[2] / sizeof(float)) : 0;
+    fused_state_cpy.slot_rows   = nullptr;
     return skip;
 }
 

@@ -311,6 +311,29 @@ public:
     bool     s_stale    = false;
     uint32_t span_new   = 0;
     uint32_t snap_shift = 0; // [TAG_RECURRENT_ROLLBACK_SHIFT] see llama_memory_recurrent_context::get_snap_shift
+
+    // row indices for gathering all snap_shift older snapshot groups of the ubatch's cells in one
+    // ggml_get_rows: [j * n_seqs + s] = j * mem_size + s_copy_main[s]; nullptr when snap_shift == 0
+    ggml_tensor * s_copy_shift = nullptr; // I32 [snap_shift * n_seqs]
+
+    // fill s_copy_shift from the already-filled s_copy (call after the s_copy fill; s_copy() has a
+    // rs_idx-reset side effect, so the values are never re-read from the memory context)
+    void set_input_shift(uint32_t mem_size);
+
+    // [TAG_RECURRENT_ROLLBACK_RING] ring mode (mctx->get_rs_ring()); all nullptr/0 otherwise.
+    // Shapes are graph topology -> checked in can_reuse.
+    uint32_t n_written = 0;
+    uint32_t n_older   = 0;
+    ggml_tensor * rs_wr      = nullptr; // I32 [n_written * n_seqs]: cache row of group g of seq s at [g * n_seqs + s]
+    // I32 [n_seqs] per written slot (oldest group first): one input tensor per slot -- a per-layer view
+    // of a single input would be scheduled as a CPU node and cost a H2D copy + sync per layer
+    std::vector<ggml_tensor *> rs_wr_conv;
+    ggml_tensor * rs_old_src = nullptr; // I32 [n_older]: older-group rows to carry for seqs whose data moves cells
+    ggml_tensor * rs_old_dst = nullptr; // I32 [n_older]
+
+    // fill every rs input (s_copy and the shift or ring tensors) from the memory context; exactly
+    // once per ubatch -- both fills consume the pending rollback
+    void fill_s_copy(const llama_memory_recurrent_context * m);
 };
 
 class llm_graph_input_cross_embd : public llm_graph_input_i {

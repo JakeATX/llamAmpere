@@ -10691,6 +10691,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // Opt-in target-shape microbenchmarks for the Qwen3.8 SM86 narrow-N work.
     // Kept out of the normal suite because the large matrices make CPU
     // correctness comparison and the default performance sweep expensive.
+    if (getenv("GGML_W58_BS") != nullptr) {
+        for (int64_t n : {5, 6, 7, 8, 9, 10, 12, 16}) {
+            for (ggml_type type_a : {GGML_TYPE_IQ4_XS, GGML_TYPE_Q5_0, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4096, n, 14336, {1, 1}, {1, 1}));
+            }
+        }
+    }
+
     if (getenv("GGML_QWEN38_MMVQ_BENCH") != nullptr) {
         for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}) {
             for (int64_t n : {3, 4, 5}) {
@@ -12342,6 +12350,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (ggml_type type_a : all_types) {
             for (ggml_type type_b : {GGML_TYPE_F32}) {
                 test_cases.emplace_back(new test_mul_mat(type_a, type_b, 4096, bs, 14336, {1,  1}, {1, 1}));
+            }
+        }
+    }
+
+    if (getenv("GGML_W58_BS") != nullptr) {
+        for (int64_t n : {5, 6, 7, 8, 9, 10, 12, 16}) {
+            for (ggml_type type_a : {GGML_TYPE_IQ4_XS, GGML_TYPE_Q5_0, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4096, n, 14336, {1, 1}, {1, 1}));
             }
         }
     }

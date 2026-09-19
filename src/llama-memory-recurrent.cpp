@@ -51,6 +51,19 @@ llama_memory_recurrent::llama_memory_recurrent(
     ckpt_span.assign(n_seq_max, 0);
     s_stale.assign(n_seq_max, 0);
 
+    // [TAG_RECURRENT_ROLLBACK_RING] the ring layout needs writers that place group g at plane
+    // (base + g) mod K: llm_build_delta_net_base::build_conv_state / build_recurrent_attn. Archs
+    // with their own conv writer (kimi-k3, bailingmoe3, qwen4exp, mamba, ...) keep plane g == group g
+    // and the shift path. Opt-in per arch; LLAMA_RS_RING=0 forces the shift path for A/B checks.
+    {
+        const char * env = getenv("LLAMA_RS_RING");
+        const bool   env_off = env != nullptr && strcmp(env, "0") == 0;
+        const bool   arch_ok = model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE ||
+                               model.arch == LLM_ARCH_QWEN3NEXT;
+        this->rs_ring = n_rs_seq > 0 && !this->gdn_replay && arch_ok && !env_off;
+    }
+    rs_base.assign(mem_size, 0);
+
     cells.clear();
     cells.resize(mem_size);
 
@@ -197,6 +210,7 @@ void llama_memory_recurrent::clear(bool data) {
     std::fill(replay_len.begin(), replay_len.end(), 0);
     // the snapshot planes are stale (or zeroed, when data) for every seq -- nothing may roll back
     std::fill(rs_valid.begin(), rs_valid.end(), 0);
+    std::fill(rs_base.begin(), rs_base.end(), 0);
     std::fill(ckpt_span.begin(), ckpt_span.end(), 0);
     std::fill(s_stale.begin(), s_stale.end(), 0);
 }
@@ -816,6 +830,12 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             }
         }
 
+        // [TAG_RECURRENT_ROLLBACK_RING] the zeroed state is plane 0 of row rs_z (build_rs scales
+        // that row in place); nothing references the cell, so its ring base can be pinned to 0
+        if (rs_z >= 0 && (size_t) rs_z < rs_base.size()) {
+            rs_base[rs_z] = 0;
+        }
+
         for (int i = min; i <= max; ++i) {
             if (cells[i].src < 0) {
                 GGML_ASSERT(rs_z >= 0);
@@ -953,7 +973,10 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
             }
 
             const uint32_t cell_src = cell.src >= 0 ? cell.src : (int32_t) i;
-            const uint32_t cell_id  = rs_idx_cur * size + cell_src;
+            // [TAG_RECURRENT_ROLLBACK_RING] the logical group rs_idx_cur sits at plane
+            // (base + rs_idx_cur) mod K in ring mode
+            const uint32_t plane_cur = rs_ring ? (rs_base[cell_src] + rs_idx_cur) % (n_rs_seq + 1) : rs_idx_cur;
+            const uint32_t cell_id   = plane_cur * size + cell_src;
             if (cell_ranges_data.empty() || cell_ranges_data.back().second != cell_id) {
                 cell_ranges_data.emplace_back(cell_id, cell_id + 1);
             } else {
@@ -1058,6 +1081,11 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
                 rs_valid[seq_id]   = 0;
                 replay_len[seq_id] = 0;
             }
+        }
+        // [TAG_RECURRENT_ROLLBACK_RING] state_read_data lands the authoritative plane at plane 0
+        // of cells [head, head + cell_count)
+        for (uint32_t i = 0; i < cell_count && head + i < rs_base.size(); ++i) {
+            rs_base[head + i] = 0;
         }
     }
 }
@@ -1651,7 +1679,7 @@ uint32_t llama_memory_recurrent_context::get_n_rs_seq() const {
 }
 
 uint32_t llama_memory_recurrent_context::get_snap_shift() const {
-    if (mem->n_rs_seq == 0 || is_full) {
+    if (mem->n_rs_seq == 0 || is_full || mem->rs_ring) {
         return 0;
     }
     const llama_ubatch & ubatch = get_ubatch();
@@ -1671,6 +1699,104 @@ uint32_t llama_memory_recurrent_context::get_snap_shift() const {
         }
     }
     return K - std::max(n, r);
+}
+
+// [TAG_RECURRENT_ROLLBACK_RING]
+bool llama_memory_recurrent_context::get_rs_ring() const {
+    return mem->rs_ring && !is_full;
+}
+
+uint32_t llama_memory_recurrent_context::get_n_written() const {
+    if (!get_rs_ring()) {
+        return 0;
+    }
+    const uint32_t K = mem->n_rs_seq + 1;
+    return std::min<uint32_t>(get_ubatch().n_seq_tokens, K);
+}
+
+// a seq whose data moves cells this ubatch (relocated tail, or a seq_cp branch decoding away from
+// the shared cell) must carry its K - n older groups along; a fresh seq (source rs_z) has none
+static bool rs_ring_needs_older(const llama_memory_recurrent * mem, uint32_t cell) {
+    const int32_t src0 = mem->cells[cell].src0;
+    return src0 >= 0 && (uint32_t) src0 != cell && src0 != mem->rs_z;
+}
+
+uint32_t llama_memory_recurrent_context::get_n_older() const {
+    if (!get_rs_ring()) {
+        return 0;
+    }
+    const llama_ubatch & ubatch = get_ubatch();
+    const uint32_t K = mem->n_rs_seq + 1;
+    const uint32_t n = ubatch.n_seq_tokens;
+    if (n >= K) {
+        return 0;
+    }
+    uint32_t rows = 0;
+    for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
+        if (rs_ring_needs_older(mem, mem->head + s)) {
+            rows += K - n;
+        }
+    }
+    return rows;
+}
+
+void llama_memory_recurrent_context::fill_rs_ring(int32_t * copy, int32_t * wr, int32_t * wr_conv, int32_t * old_src, int32_t * old_dst) const {
+    GGML_ASSERT(get_rs_ring());
+    const llama_ubatch & ubatch = get_ubatch();
+    const uint32_t K         = mem->n_rs_seq + 1;
+    const uint32_t n         = ubatch.n_seq_tokens;
+    const uint32_t n_seqs    = ubatch.n_seqs;
+    const uint32_t n_rs      = get_n_rs();
+    const uint32_t size      = mem->size;
+    const uint32_t n_written = std::min(n, K);
+    const bool     older     = n < K;
+
+    uint32_t k_old = 0;
+    for (uint32_t i = 0; i < n_rs; ++i) {
+        const uint32_t cell = mem->head + i;
+        const int32_t  src0 = mem->cells[cell].src0;
+        GGML_ASSERT(src0 >= 0 && (uint32_t) src0 < size);
+
+        uint32_t r = 0;
+        if (!mem->cells[cell].seq_id.empty()) {
+            const llama_seq_id seq = *mem->cells[cell].seq_id.begin();
+            if (seq >= 0 && (size_t) seq < mem->rs_idx.size()) {
+                r = mem->rs_idx[seq];
+                mem->rs_idx[seq] = 0; // consumed, like s_copy()
+            }
+        }
+        const uint32_t b = mem->rs_base[src0];
+        copy[i] = (int32_t) (((b + r) % K) * size + src0);
+
+        if (i >= n_seqs) {
+            // extra cell: build_rs copies its logical plane to plane 0 of its new home and its
+            // older groups do not travel -- say so, instead of letting a later rollback read them
+            mem->rs_base[cell] = 0;
+            for (const llama_seq_id seq : mem->cells[cell].seq_id) {
+                if (seq >= 0 && (size_t) seq < mem->rs_valid.size()) {
+                    mem->rs_valid[seq] = 0;
+                }
+            }
+            continue;
+        }
+
+        const uint32_t b_new = n >= K ? 0 : (b + r + K - n) % K;
+        mem->rs_base[cell] = b_new;
+        for (uint32_t g = 0; g < n_written; ++g) {
+            const int32_t row = (int32_t) (((b_new + g) % K) * size + cell);
+            wr     [g * n_seqs + i]                   = row;
+            wr_conv[(n_written - 1 - g) * n_seqs + i] = row;
+        }
+        if (older && rs_ring_needs_older(mem, cell)) {
+            for (uint32_t g = n; g < K; ++g) {
+                const uint32_t plane = (b_new + g) % K;
+                old_src[k_old] = (int32_t) (plane * size + src0);
+                old_dst[k_old] = (int32_t) (plane * size + cell);
+                ++k_old;
+            }
+        }
+    }
+    GGML_ASSERT(k_old == get_n_older());
 }
 
 void llama_memory_recurrent_context::consume_replay(uint32_t new_span) const {
