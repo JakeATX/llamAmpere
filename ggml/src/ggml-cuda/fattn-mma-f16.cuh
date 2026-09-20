@@ -1230,17 +1230,18 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_mask(
 #else
 #define GGML_CUDA_TURBO_STAGE 0
 #endif
-// K staging: a q8_0 / tq6_0 / tq5_0 K tile is staged under every compressed V of the D=256 GQA-packed instances.
+// K staging: a q8_0 / tq6_0 / tq5_0 K tile is staged under turbo3 / q8_0 / turbo4 / tq5_0 V of the D=256 GQA-packed
+// instances. tq6_0 V is left out: K-only staging under it measured -0.5% at 100K in two runs (tq5_0 V: +1.8..1.9%).
 template<int DKQ, int DV, int ncols2, ggml_type type_K, ggml_type type_V>
 static constexpr __host__ __device__ bool ggml_cuda_fattn_turbo_stage() {
     return GGML_CUDA_TURBO_STAGE && (type_K == GGML_TYPE_Q8_0 || type_K == GGML_TYPE_TQ6_0 || type_K == GGML_TYPE_TQ5_0) &&
         (type_V == GGML_TYPE_TURBO3_0 || type_V == GGML_TYPE_Q8_0 || type_V == GGML_TYPE_TURBO4_0 ||
-         type_V == GGML_TYPE_TQ6_0 || type_V == GGML_TYPE_TQ5_0) &&
+         type_V == GGML_TYPE_TQ5_0) &&
         ncols2 > 1 && DKQ == 256 && DV == 256;
 }
-// V staging: only turbo3 / q8_0 / turbo4 V tiles. tq6_0 / tq5_0 V stay unstaged: their streaming tile loaders already
-// coalesce the 196/164 B rows, and staging them measured -6% (tq6 V) / neutral (tq5 V) at 100K on the 3090 Ti, so
-// those pairs get K-only staging (raw_V is not allocated).
+// V staging: only turbo3 / q8_0 / turbo4 V tiles. tq5_0 V stays unstaged: its streaming tile loader already
+// coalesces the 164 B rows, and staging it measured neutral at 100K on the 3090 Ti, so that pair gets K-only
+// staging (raw_V is not allocated). tq6_0 V: V staging -6%, K-only staging -0.5%, so neither.
 template<int DKQ, int DV, int ncols2, ggml_type type_K, ggml_type type_V>
 static constexpr __host__ __device__ bool ggml_cuda_fattn_turbo_stage_v() {
     return ggml_cuda_fattn_turbo_stage<DKQ, DV, ncols2, type_K, type_V>() &&
