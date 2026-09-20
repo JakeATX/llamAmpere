@@ -66,9 +66,10 @@ void ggml_cuda_flash_attn_ext_mma_turbo_case(ggml_backend_cuda_context & ctx, gg
         // turbo3 V rows (100 B) with 4-byte cp.async, since per-head rows are only 4-byte aligned
         constexpr int k_align = (type_K == GGML_TYPE_TQ6_0 || type_K == GGML_TYPE_TQ5_0) ? 4 : 16;
         constexpr int v_align = type_V == GGML_TYPE_Q8_0  ? 16 : 4;
+        constexpr bool stage_v = ggml_cuda_fattn_turbo_stage_v<DKQ, DV, ncols2, type_K, type_V>(); // tq6/tq5 V: K-only staging
         GGML_ASSERT(dst->src[1]->nb[1] % k_align == 0 && dst->src[1]->nb[2] % k_align == 0 && ((uintptr_t) dst->src[1]->data) % k_align == 0);
-        GGML_ASSERT(dst->src[2]->nb[1] % v_align == 0 && dst->src[2]->nb[2] % v_align == 0 && ((uintptr_t) dst->src[2]->data) % v_align == 0);
-        nbytes_shared_total = std::max(nbytes_shared_total, stage_off + (size_t) nbatch_fa * (ggml_cuda_fattn_turbo_stage_k_row<DKQ, type_K>() + ggml_cuda_fattn_turbo_stage_v_row<DV, type_V>()));
+        GGML_ASSERT(!stage_v || (dst->src[2]->nb[1] % v_align == 0 && dst->src[2]->nb[2] % v_align == 0 && ((uintptr_t) dst->src[2]->data) % v_align == 0));
+        nbytes_shared_total = std::max(nbytes_shared_total, stage_off + (size_t) ggml_cuda_fattn_turbo_stage_bytes<DKQ, DV, ncols2, type_K, type_V>(nbatch_fa));
     }
 
     float logit_softcap;
