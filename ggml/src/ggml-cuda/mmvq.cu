@@ -263,13 +263,55 @@ static bool ggml_cuda_qc4_nw1() {
 
 // IQ3_XXS / IQ3_S: stage the codebook grid (1 KB / 2 KB, a static const __device__ table in
 // global memory) into shared memory once per block. Same values, same accumulation order, so
-// bit-identical to the global-table path. OFF by default; GGML_CUDA_SM86_IQ3_SMEM_GRID=1 enables.
-static bool ggml_cuda_sm86_iq3_smem_grid() {
-    static const bool value = [] {
+// bit-identical to the global-table path. ON by default for SM86 at ncols_dst 1..4 (3090 Ti gate
+// 2026-09-16, m=4096 k=14336: iq3_s +2.3/+9.1/+6.9/+10.1%, iq3_xxs +1.2/+5.3/+14.1/+5.5% at widths
+// 1/2/3/4; at widths 5..8 rows_per_block drops 8 -> 2 and the win vanishes: iq3_xxs -4.1/-2.8%,
+// iq3_s +0.9/+0.2%). GGML_CUDA_SM86_IQ3_SMEM_GRID=0 disables it, =1 forces it at every width.
+// Returns the largest ncols_dst that uses the staged grid.
+static int ggml_cuda_sm86_iq3_smem_grid_max_ncols() {
+    static const int value = [] {
         const char * env = getenv("GGML_CUDA_SM86_IQ3_SMEM_GRID");
-        return env != nullptr && env[0] == '1';
+        if (env == nullptr) {
+            return 4;
+        }
+        return env[0] == '1' ? MMVQ_MAX_BATCH_SIZE : 0;
     }();
     return value;
+}
+
+// IQ2_XXS / IQ2_XS / IQ2_S: same staged-codebook trick (2 KB / 4 KB / 8 KB uint64 tables). 2026-09-20 gate
+// (m=4096 k=14336, us/run): iq2_xxs +1.1..+7.2% at every width 1..8, iq2_xs -0.5(noise)/+6.8/+7.5/+4.9/+9.7/+2.2%,
+// iq2_s -18.1% at width 1 and -9.3% at width 8 (the 8 KB per-block copy dominates there) but +5.4..+8.9% at 2..5.
+// SM86 default: iq2_xxs and iq2_xs at every width, iq2_s at widths 2..5. GGML_CUDA_SM86_IQ2_SMEM_GRID=0 turns it
+// off, =1 stages at every width, =N at widths 1..N (overrides the per-type default).
+static int ggml_cuda_sm86_iq2_smem_grid_env() {
+    static const int value = [] {
+        const char * env = getenv("GGML_CUDA_SM86_IQ2_SMEM_GRID");
+        if (env == nullptr) {
+            return -1;
+        }
+        const int n = atoi(env);
+        return n == 1 ? MMVQ_MAX_BATCH_SIZE : (n < 0 ? 0 : (n > MMVQ_MAX_BATCH_SIZE ? MMVQ_MAX_BATCH_SIZE : n));
+    }();
+    return value;
+}
+
+static bool ggml_cuda_sm86_iq2_smem_grid_use(ggml_type type, int ncols_dst) {
+    const int env = ggml_cuda_sm86_iq2_smem_grid_env();
+    if (env >= 0) {
+        return ncols_dst <= env;
+    }
+    switch (type) {
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_XS:  return true;
+        case GGML_TYPE_IQ2_S:   return ncols_dst >= 2 && ncols_dst <= 5;
+        default:                return false;
+    }
+}
+
+static constexpr __host__ __device__ bool ggml_cuda_mmvq_smem_grid_type(ggml_type type) {
+    return type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S ||
+           type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ2_S;
 }
 
 // PTQ1_0 cross-column reuse (widths 2-8) is exact and on by default for SM86; GGML_CUDA_SM86_PTQ1_REUSE=0 disables it.
@@ -974,11 +1016,16 @@ static __global__ void mul_mat_vec_q(
 
     // GGML_CUDA_SM86_IQ3_SMEM_GRID: cooperative copy of the IQ3 codebook into shared memory.
     // One __syncthreads() per block, amortized over the whole K loop.
-    constexpr bool use_smem_grid = smem_grid && (type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S);
-    constexpr int  smem_grid_n   = type == GGML_TYPE_IQ3_S ? 512 : 256;
+    // Table sizes in 32-bit words: iq3_xxs 256 (1 KB), iq3_s 512 (2 KB), iq2_xxs 512 (2 KB), iq2_xs 1024 (4 KB),
+    // iq2_s 2048 (8 KB). All are static const __device__ tables in global memory (ggml-common.h).
+    constexpr bool use_smem_grid = smem_grid && ggml_cuda_mmvq_smem_grid_type(type);
+    constexpr int  smem_grid_n   = type == GGML_TYPE_IQ3_XXS ? 256 : type == GGML_TYPE_IQ3_S ? 512 :
+                                   type == GGML_TYPE_IQ2_XXS ? 512 : type == GGML_TYPE_IQ2_XS ? 1024 : 2048;
     [[maybe_unused]] __shared__ uint32_t grid_s[use_smem_grid ? smem_grid_n : 1];
     if constexpr (use_smem_grid) {
-        const uint32_t * grid_g = type == GGML_TYPE_IQ3_S ? iq3s_grid : iq3xxs_grid;
+        const uint32_t * grid_g = type == GGML_TYPE_IQ3_XXS ? iq3xxs_grid : type == GGML_TYPE_IQ3_S ? iq3s_grid :
+                                  type == GGML_TYPE_IQ2_XXS ? (const uint32_t *) iq2xxs_grid :
+                                  type == GGML_TYPE_IQ2_XS  ? (const uint32_t *) iq2xs_grid : (const uint32_t *) iq2s_grid;
 #pragma unroll
         for (int i = tid; i < smem_grid_n; i += nwarps*warp_size) {
             grid_s[i] = grid_g[i];
@@ -990,6 +1037,12 @@ static __global__ void mul_mat_vec_q(
             return vec_dot_iq3_xxs_q8_1_impl(grid_s, vbq, bq8, kbx_, iqs_);
         } else if constexpr (use_smem_grid && type == GGML_TYPE_IQ3_S) {
             return vec_dot_iq3_s_q8_1_impl(grid_s, vbq, bq8, kbx_, iqs_);
+        } else if constexpr (use_smem_grid && type == GGML_TYPE_IQ2_XXS) {
+            return vec_dot_iq2_xxs_q8_1_impl((const uint2 *) grid_s, vbq, bq8, kbx_, iqs_);
+        } else if constexpr (use_smem_grid && type == GGML_TYPE_IQ2_XS) {
+            return vec_dot_iq2_xs_q8_1_impl((const uint2 *) grid_s, vbq, bq8, kbx_, iqs_);
+        } else if constexpr (use_smem_grid && type == GGML_TYPE_IQ2_S) {
+            return vec_dot_iq2_s_q8_1_impl((const uint2 *) grid_s, vbq, bq8, kbx_, iqs_);
         } else {
             return vec_dot_q_cuda(vbq, bq8, kbx_, iqs_);
         }
@@ -1449,17 +1502,19 @@ static void mul_mat_vec_q_switch_fusion(
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
                             fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
 
-    [[maybe_unused]] bool iq3_smem = false;
-    if constexpr (type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S) {
+    [[maybe_unused]] bool iq3_smem = false; // staged codebook grid (IQ3 and IQ2 types)
+    if constexpr (ggml_cuda_mmvq_smem_grid_type(type)) {
         const int device = ggml_cuda_get_device();
         const int cc = ggml_cuda_info().devices[device].cc;
-        iq3_smem = cc == 860 && ggml_cuda_sm86_iq3_smem_grid();
+        const bool use = (type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S) ?
+            c_ncols_dst <= ggml_cuda_sm86_iq3_smem_grid_max_ncols() : ggml_cuda_sm86_iq2_smem_grid_use(type, c_ncols_dst);
+        iq3_smem = cc == 860 && use;
     }
 
     if constexpr (c_ncols_dst == 1) {
         if (has_fusion) {
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-            if constexpr (type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S) {
+            if constexpr (ggml_cuda_mmvq_smem_grid_type(type)) {
                 if (iq3_smem) {
                     ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters, false, nw1, true>, launch_params,
                          vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
@@ -1479,7 +1534,7 @@ static void mul_mat_vec_q_switch_fusion(
     GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-    if constexpr (type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S) {
+    if constexpr (ggml_cuda_mmvq_smem_grid_type(type)) {
         if (iq3_smem) {
             ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters, false, nw1, true>, launch_params,
                 vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
