@@ -914,13 +914,16 @@ void quantize_row_tq5_0_ref(const float * GGML_RESTRICT x, block_tq5_0 * GGML_RE
         float corrected_norm = (recon_norm > 1e-10f) ? norm / recon_norm : norm;
         y[block].norm = GGML_FP32_TO_FP16(corrected_norm);
 
-        /* Step 5: Pack. Low nibble plane uses the same element order as block_turbo4_0.qs. */
+        /* Step 5: Pack sign-magnitude: qs nibble = magnitude index (0..15, |c| = c[16+m]), qh bit = 1 if
+         * negative. Nibble plane uses the same element order as block_turbo4_0.qs. */
         memset(y[block].qs, 0, d / 2);
         memset(y[block].qh, 0, d / 8);
         for (int i = 0; i < d; i++) {
             const uint8_t idx = indices[i] & 0x1F;
-            y[block].qs[i / 2] |= (uint8_t)(( idx       & 0xF) << ((i % 2) * 4));
-            y[block].qh[i / 8] |= (uint8_t)(((idx >> 4) & 0x1) << (i % 8));
+            const uint8_t neg = idx < 16;
+            const uint8_t mag = neg ? (uint8_t)(15 - idx) : (uint8_t)(idx - 16);
+            y[block].qs[i / 2] |= (uint8_t)(mag << ((i % 2) * 4));
+            y[block].qh[i / 8] |= (uint8_t)(neg << (i % 8));
         }
     }
 }
@@ -936,9 +939,9 @@ void dequantize_row_tq5_0(const block_tq5_0 * GGML_RESTRICT x, float * GGML_REST
         float norm = GGML_FP16_TO_FP32(x[block].norm);
         float * dst = y + block * d;
         for (int i = 0; i < d; i++) {
-            const uint8_t lo  = (x[block].qs[i / 2] >> ((i % 2) * 4)) & 0xF;
-            const uint8_t hi  = (x[block].qh[i / 8] >> (i % 8)) & 0x1;
-            const uint8_t idx = (uint8_t)(lo | (hi << 4));
+            const uint8_t mag = (x[block].qs[i / 2] >> ((i % 2) * 4)) & 0xF;
+            const uint8_t neg = (x[block].qh[i / 8] >> (i % 8)) & 0x1;
+            const uint8_t idx = neg ? (uint8_t)(15 - mag) : (uint8_t)(16 + mag);
             dst[i] = TQ5_CENTROIDS[idx] * norm;
         }
         /* No inverse WHT, dequant stays in the rotated domain, same convention as tq6:

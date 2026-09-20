@@ -495,6 +495,14 @@ static __device__ __forceinline__ uint8_t tq5_nearest_centroid(float val) {
     return (uint8_t) lo;
 }
 
+// ---- TQ5 storage is sign-magnitude (see block_tq5_0): qs nibble = magnitude index m, qh bit = 1 if negative ----
+
+static __device__ __forceinline__ uint8_t tq5_code_to_mag(uint8_t idx) { return idx >= 16 ? idx - 16 : 15 - idx; }
+static __device__ __forceinline__ uint8_t tq5_code_to_neg(uint8_t idx) { return idx < 16; }
+static __device__ __forceinline__ uint8_t tq5_sm_to_code(uint8_t mag, uint8_t neg) {
+    return (uint8_t) ((mag ^ (neg * 0xF)) | ((neg ^ 1) << 4));   // neg ? 15-m : 16+m
+}
+
 // ---- Per-block quantize for tq5 (128 elements, expects already-rotated input) ----
 
 static __device__ void quantize_f32_tq5_0_block(const float * __restrict__ src,
@@ -503,9 +511,9 @@ static __device__ void quantize_f32_tq5_0_block(const float * __restrict__ src,
     for (int j = 0; j < QK_TQ5 / 8; j++) dst->qh[j] = 0;
 
     for (int j = 0; j < QK_TQ5; j++) {
-        uint8_t idx = tq5_nearest_centroid(src[j]);
-        dst->qs[j / 2] |= ( idx       & 0xF) << ((j % 2) * 4);
-        dst->qh[j / 8] |= ((idx >> 4) & 0x1) << (j % 8);
+        const uint8_t idx = tq5_nearest_centroid(src[j]);
+        dst->qs[j / 2] |= tq5_code_to_mag(idx) << ((j % 2) * 4);
+        dst->qh[j / 8] |= tq5_code_to_neg(idx) << (j % 8);
     }
 }
 
@@ -513,9 +521,9 @@ static __device__ void quantize_f32_tq5_0_block(const float * __restrict__ src,
 
 static __device__ __forceinline__ float tq5_dequant_element(
         const block_tq5_0 * __restrict__ x, int j, float norm) {
-    uint8_t lo = (x->qs[j / 2] >> ((j % 2) * 4)) & 0xF;
-    uint8_t hi = (x->qh[j / 8] >> (j % 8)) & 0x1;
-    return TQ5_CENTROIDS[lo | (hi << 4)] * norm;
+    const uint8_t mag = (x->qs[j / 2] >> ((j % 2) * 4)) & 0xF;
+    const uint8_t neg = (x->qh[j / 8] >> (j % 8)) & 0x1;
+    return TQ5_CENTROIDS[tq5_sm_to_code(mag, neg)] * norm;
 }
 
 // ---- Nearest 3-bit centroid index ----

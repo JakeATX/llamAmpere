@@ -565,12 +565,12 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tq5_0(
             const int j0    = elem0 % QK_TQ5;              // always even
 
             const float   norm    = __half2float(K_tq5[ib].norm);
-            const uint8_t qs_byte = K_tq5[ib].qs[j0 / 2];  // low nibbles of j0 and j0+1
-            const uint8_t qh_byte = K_tq5[ib].qh[j0 / 8];  // high bits of j0 .. j0+7
+            const uint8_t qs_byte = K_tq5[ib].qs[j0 / 2];  // magnitude nibbles of j0 and j0+1
+            const uint8_t qh_byte = K_tq5[ib].qh[j0 / 8];  // sign bits of j0 .. j0+7
 
             const int     hshift = j0 % 8;                 // even, 0..6
-            const uint8_t idx0 = ((qs_byte >> 0) & 0xF) | (((qh_byte >> hshift)       & 0x1) << 4);
-            const uint8_t idx1 = ((qs_byte >> 4) & 0xF) | (((qh_byte >> (hshift + 1)) & 0x1) << 4);
+            const uint8_t idx0 = tq5_sm_to_code((qs_byte >> 0) & 0xF, (qh_byte >> hshift)       & 0x1);
+            const uint8_t idx1 = tq5_sm_to_code((qs_byte >> 4) & 0xF, (qh_byte >> (hshift + 1)) & 0x1);
 
             float2 kv;
             kv.x = TQ5_CENTROIDS[idx0] * norm;

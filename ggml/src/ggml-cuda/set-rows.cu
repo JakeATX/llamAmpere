@@ -1493,12 +1493,12 @@ static __global__ void k_set_rows_tq5(
     const float rv = x[j];
     const uint8_t idx = tq5_nearest_centroid(rv);
 
-    // ---- Step 6: Pack qs and qh (warp-cooperative) ----
-    // qs: 2 elements per byte (low nibbles). qh: 8 elements per byte (high bit, bit j%8).
-    // A warp holds 32 consecutive elements, so its ballot of high bits IS the 4 qh bytes
+    // ---- Step 6: Pack qs and qh (warp-cooperative), sign-magnitude ----
+    // qs: 2 elements per byte (magnitude index nibbles). qh: 8 elements per byte (sign bit, bit j%8).
+    // A warp holds 32 consecutive elements, so its ballot of sign bits IS the 4 qh bytes
     // qh[j/8 .. j/8+3] in element order (bit L of the ballot = element j0+L = qh byte L/8 bit L%8).
-    const uint8_t my_nibble = idx & 0xF;
-    const uint8_t my_high   = (idx >> 4) & 0x1;
+    const uint8_t my_nibble = tq5_code_to_mag(idx);
+    const uint8_t my_high   = tq5_code_to_neg(idx);
     const uint8_t partner_nibble = __shfl_sync(0xffffffff, my_nibble, lane ^ 1, WARP_SIZE);
     if (j % 2 == 0) {
         blk->qs[j / 2] = my_nibble | (partner_nibble << 4);
