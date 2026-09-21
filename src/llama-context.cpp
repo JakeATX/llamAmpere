@@ -4447,6 +4447,11 @@ llama_context * llama_init_from_model(
         return nullptr;
     }
 
+    if (params.type_k == GGML_TYPE_TURBO2_0) {
+        LLAMA_LOG_ERROR("%s: turbo2 is a V-only cache type; pick a different K cache type (q8_0, tq5_0, tq6_0, turbo4)\n", __func__);
+        return nullptr;
+    }
+
     // TurboQuant cache types require flash attention — auto-enable if disabled
     if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED &&
         (params.type_k == GGML_TYPE_TURBO2_0 || params.type_k == GGML_TYPE_TURBO3_0 || params.type_k == GGML_TYPE_TURBO4_0 || params.type_k == GGML_TYPE_TQ6_0 || params.type_k == GGML_TYPE_TQ5_0 ||

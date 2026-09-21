@@ -139,7 +139,7 @@ llama_kv_cache::llama_kv_cache(
 
     GGML_ASSERT(kv_size % n_pad == 0);
 
-    // Auto-asymmetric: when symmetric turbo K+V is requested and the model has
+    // Auto-asymmetric: when symmetric turbo3 K+V is requested and the model has
     // high GQA ratio (few KV heads serving many Q heads), upgrade K to q8_0.
     // Turbo K quantization error gets amplified by the GQA broadcast factor.
     // Qwen2.5: 4 KV heads / 28 Q heads = 7:1 → turbo3 K PPL catastrophic (2887 vs 7.4 baseline)
@@ -148,9 +148,12 @@ llama_kv_cache::llama_kv_cache(
     // MLA models (DeepSeek-V4) have no separate V cache (V = view of K),
     // so K and V types must be identical — skip auto-asymmetric for MLA.
     {
-        // TQ6 is deliberately left out: 64 levels are meant to survive the GQA broadcast, so it
-        // must not be silently rewritten to q8_0. Revisit if a ship-corpus run says otherwise.
-        const bool k_is_turbo = (type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0 || type_k == GGML_TYPE_TURBO2_0);
+        // turbo4, tq5_0 and tq6_0 K are deliberately left out: the evidence behind the rewrite is a
+        // 3-bit K, and a 4-bit turbo4 K measured 0.0027 nats mean KLD (vs 0.0014 for q8_0 K over the
+        // same turbo4 V) on a GQA-6 model at 77K tokens, i.e. a quality step, not a collapse. A requested
+        // turbo4/turbo4, tq5_0/tq5_0 or tq6_0/tq6_0 cache is the cache that runs. turbo2 is a V-only type
+        // (rejected as K in llama-context.cpp).
+        const bool k_is_turbo = (type_k == GGML_TYPE_TURBO3_0);
         if (k_is_turbo && !hparams.is_mla()) {
             const uint32_t n_head    = hparams.n_head(0);
             const uint32_t n_head_kv = hparams.n_head_kv(0);

@@ -23,8 +23,9 @@ llama-cli -m model.gguf -c 8192 -ngl 99 \
     --cache-type-k q8_0 --cache-type-v turbo3
 ```
 
-Any combination of `f16`, `q8_0`, `turbo2`, `turbo3`, `turbo4` for K and V is
-supported; mixing quantized V with unquantized K is the common configuration.
+Any combination of `f16`, `q8_0`, `turbo3`, `turbo4`, `tq5_0`, `tq6_0` for K and V is
+supported, and `turbo2` for V only (a `turbo2` K request is rejected at context
+creation); mixing a low-bit V with a higher-bit K is the common configuration.
 
 Turbo KV types require flash attention. If a turbo cache type is requested
 with flash attention disabled, it is enabled automatically (a warning is
@@ -46,7 +47,7 @@ K), so V rotation and padding are skipped for them.
 | Variable                        | Default | Effect                                                          |
 |---------------------------------|---------|-----------------------------------------------------------------|
 | `TURBO_LAYER_ADAPTIVE`          | `0`     | Layer-adaptive KV precision; `7` = Boundary V (first/last layers in `q8_0`, middle in turbo) |
-| `TURBO_AUTO_ASYMMETRIC`         | `1`     | Auto-select asymmetric K/V types for large-GQA models (`0` disables) |
+| `TURBO_AUTO_ASYMMETRIC`         | `1`     | Rewrite a symmetric turbo3 K+V request to q8_0 K on models with GQA ratio >= 6 (`0` disables); turbo4, tq5_0 and tq6_0 K are never rewritten, turbo2 is V-only |
 | `TURBO_SPARSE_V`                | `1`     | Sparse-V dequant skip in flash attention (`0` disables)        |
 | `LLAMA_ATTN_ROT_K_OVERRIDE`     | off     | Enable upstream #21038 attention rotation for K                |
 | `LLAMA_ATTN_ROT_V_OVERRIDE`     | off     | Enable upstream #21038 attention rotation for V                |
