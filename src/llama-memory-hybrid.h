@@ -40,7 +40,8 @@ public:
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn = nullptr,
-    const layer_filter_cb & filter_recr = nullptr);
+    const layer_filter_cb & filter_recr = nullptr,
+      llama_kvarn_config    kvarn = llama_kvarn_config());
 
     ~llama_memory_hybrid() = default;
 

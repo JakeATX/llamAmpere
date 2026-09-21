@@ -415,6 +415,13 @@ extern "C" {
         ggml_abort_callback abort_callback;
         void *              abort_callback_data;
 
+        // KVarN attention cache (region-aware: exact fp16 sink + tail, sealed low-bit records for the body).
+        // bits_k/bits_v > 0 enable it; type_k/type_v must be F16 and flash attention is required.
+        uint32_t kvarn_bits_k; // 0 = off
+        uint32_t kvarn_bits_v; // 0 = off
+        uint32_t kvarn_tail;   // exact fp16 tail positions kept unsealed (rounded to the 128-token group)
+        uint32_t kvarn_sink;   // exact fp16 sink positions (multiple of 64)
+
         // Keep the booleans together and at the end of the struct to avoid misalignment during copy-by-value.
         bool embeddings;  // if true, extract embeddings (together with logits)
         bool offload_kqv; // offload the KQV ops (including the KV cache) to GPU

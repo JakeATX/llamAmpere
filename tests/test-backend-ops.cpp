@@ -2670,23 +2670,24 @@ struct test_turbo_wht : public test_case {
     const int64_t head_dim;
     const int64_t n_heads;
     const int direction; // 0=forward, 1=inverse
+    const int group_size; // 0 = default (64), 256 = full-head rotation used by the KVarN cache
 
     std::string vars() override {
-        return VARS_TO_STR3(head_dim, n_heads, direction);
+        return VARS_TO_STR4(head_dim, n_heads, direction, group_size);
     }
 
     double max_nmse_err() override {
         return 1e-5; // f32 SIMD reduction order varies across GPU backends
     }
 
-    test_turbo_wht(int64_t head_dim = 128, int64_t n_heads = 4, int direction = 0)
-        : head_dim(head_dim), n_heads(n_heads), direction(direction) {}
+    test_turbo_wht(int64_t head_dim = 128, int64_t n_heads = 4, int direction = 0, int group_size = 0)
+        : head_dim(head_dim), n_heads(n_heads), direction(direction), group_size(group_size) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head_dim, n_heads);
         ggml_set_param(a);
         ggml_set_name(a, "a");
-        ggml_tensor * out = ggml_turbo_wht(ctx, a, direction, 0, nullptr);
+        ggml_tensor * out = ggml_turbo_wht(ctx, a, direction, group_size, nullptr);
         ggml_set_name(out, "out");
         return out;
     }
@@ -8510,6 +8511,240 @@ struct test_leaky_relu : public test_case {
 };
 
 // GGML_OP_FLASH_ATTN_EXT
+// GGML_OP_FLASH_ATTN_EXT over a KVarN cache: exact f16 sink [0,S) and ring (p >= B) rows plus sealed 4-bit body
+// records for [S,B). The body is filled with random codes and plausible fp16 metadata (no sealing involved), the
+// mask is the standard causal KQ mask padded to n_kv_pad with -INF for p >= N. CPU reference: ops.cpp kvarn path.
+struct test_flash_attn_ext_kvarn : public test_case {
+    const int64_t n_q;  // query rows (decode widths 1..8)
+    const int64_t nh;   // query heads
+    const int64_t hkv;  // KV heads
+    const int64_t n_groups; // sealed body records per head
+    const int64_t n_ring;   // exact positions after the body
+
+    static constexpr int64_t D = 256, S = 128, G = 128, cap = 1280;
+
+    int64_t B()        const { return S + n_groups*G; }
+    int64_t N()        const { return B() + n_ring; }
+    int64_t qpos0()    const { return N() - n_q; }
+    int64_t n_kv_pad() const { return ((N() + 255) / 256) * 256; }
+    int64_t rec_bytes() const { return (int64_t) ggml_kvarn_rec_bytes(D, G, 4, 4); }
+
+    std::string vars() override {
+        return VARS_TO_STR5(n_q, nh, hkv, n_groups, n_ring);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_flash_attn_ext_kvarn(int64_t n_q = 1, int64_t nh = 16, int64_t hkv = 2, int64_t n_groups = 3, int64_t n_ring = 300)
+        : n_q(n_q), nh(nh), hkv(hkv), n_groups(n_groups), n_ring(n_ring) {
+        GGML_ASSERT(n_ring <= cap && n_ring >= n_q);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, n_q, nh, 1);
+        ggml_set_name(q, "q");
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, D, S + cap, hkv, 1);
+        ggml_set_name(k, "k");
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, D, S + cap, hkv, 1);
+        ggml_set_name(v, "v");
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv_pad(), n_q, 1, 1);
+        ggml_set_name(m, "m");
+        ggml_tensor * body = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, rec_bytes()*hkv*n_groups);
+        ggml_set_name(body, "body");
+        ggml_tensor * desc = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, GGML_KVARN_DESC_N_ENTRIES);
+        ggml_set_name(desc, "desc");
+
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf((float) D), 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_kvarn(out, body, desc, 4, 4, (int32_t) n_kv_pad());
+        ggml_prec_set_acc(out, GGML_PREC_F32);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(1234);
+        auto uni = [&](float lo, float hi) { return lo + (hi - lo) * (float) (rng() / 4294967296.0); };
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "m") == 0) {
+                std::vector<ggml_fp16_t> mask((size_t) n_kv_pad() * n_q);
+                for (int64_t j = 0; j < n_q; ++j) {
+                    const int64_t pos = qpos0() + j;
+                    for (int64_t p = 0; p < n_kv_pad(); ++p) {
+                        mask[j*n_kv_pad() + p] = ggml_fp32_to_fp16(p <= pos && p < N() ? 0.0f : -INFINITY);
+                    }
+                }
+                ggml_backend_tensor_set(t, mask.data(), 0, mask.size()*sizeof(ggml_fp16_t));
+            } else if (strcmp(t->name, "desc") == 0) {
+                std::vector<int32_t> d(GGML_KVARN_DESC_N_ENTRIES, 0);
+                d[GGML_KVARN_DESC_S] = S; d[GGML_KVARN_DESC_CAP] = cap; d[GGML_KVARN_DESC_B] = B(); d[GGML_KVARN_DESC_N] = N();
+                d[GGML_KVARN_DESC_QPOS0] = qpos0(); d[GGML_KVARN_DESC_G] = G; d[GGML_KVARN_DESC_D] = D;
+                d[GGML_KVARN_DESC_RECBYTES] = rec_bytes(); d[GGML_KVARN_DESC_HKV] = hkv;
+                ggml_backend_tensor_set(t, d.data(), 0, d.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "body") == 0) {
+                // layout per ggml_kvarn::make_layout (D=256, G=128, 4/4): payloads then fp16 metadata
+                const size_t k_row = D/2, v_row = D/2;
+                const size_t v_payload = k_row*G, k_scale = v_payload + v_row*G, k_zero = k_scale + 2*D, k_tok = k_zero + 2*D;
+                const size_t v_ch = k_tok + 2*G, v_scale = v_ch + 2*D, v_zero = v_scale + 2*G;
+                GGML_ASSERT((int64_t) (v_zero + 2*G) == rec_bytes());
+                std::vector<uint8_t> buf((size_t) rec_bytes()*hkv*n_groups);
+                auto put = [&](uint8_t * rec, size_t off, float x) { ggml_fp16_t h = ggml_fp32_to_fp16(x); memcpy(rec + off, &h, 2); };
+                for (int64_t r = 0; r < hkv*n_groups; ++r) {
+                    uint8_t * rec = buf.data() + r*rec_bytes();
+                    for (size_t i = 0; i < k_scale; ++i) rec[i] = (uint8_t) (rng() & 0xFF);
+                    for (int64_t d = 0; d < D; ++d) {
+                        put(rec, k_scale + 2*d, uni(0.02f, 0.08f));
+                        put(rec, k_zero  + 2*d, uni(-0.6f, -0.2f));
+                        put(rec, v_ch    + 2*d, uni(0.5f, 1.5f));
+                    }
+                    for (int64_t t2 = 0; t2 < G; ++t2) {
+                        put(rec, k_tok   + 2*t2, uni(0.5f, 1.5f));
+                        put(rec, v_scale + 2*t2, uni(0.02f, 0.08f));
+                        put(rec, v_zero  + 2*t2, uni(-0.6f, -0.2f));
+                    }
+                }
+                ggml_backend_tensor_set(t, buf.data(), 0, buf.size());
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// GGML_OP_KVARN_SEAL: CUDA sealer must reproduce the CPU records byte for byte (max_nmse_err 0)
+struct test_kvarn_seal : public test_case {
+    const int64_t D, G, hkv, n_groups;
+    const int bits_k, bits_v, iters;
+    const bool strided; // K/V are row-strided views of wider tensors (like KV-cache views)
+
+    std::string vars() override {
+        return VARS_TO_STR8(D, G, hkv, n_groups, bits_k, bits_v, iters, strided);
+    }
+
+    double max_nmse_err() override {
+        return 0.0;
+    }
+
+    test_kvarn_seal(int64_t D = 256, int64_t G = 128, int64_t hkv = 4, int64_t n_groups = 2,
+                    int bits_k = 4, int bits_v = 4, int iters = 16, bool strided = false)
+        : D(D), G(G), hkv(hkv), n_groups(n_groups), bits_k(bits_k), bits_v(bits_v), iters(iters), strided(strided) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_tok = n_groups*G;
+        const int64_t ne0   = D*hkv + (strided ? 64 : 0);
+        ggml_tensor * kbig = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, ne0, n_tok);
+        ggml_set_name(kbig, "kbig");
+        ggml_tensor * vbig = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, ne0, n_tok);
+        ggml_set_name(vbig, "vbig");
+        ggml_tensor * k = strided ? ggml_view_2d(ctx, kbig, D*hkv, n_tok, kbig->nb[1], 0) : kbig;
+        ggml_tensor * v = strided ? ggml_view_2d(ctx, vbig, D*hkv, n_tok, vbig->nb[1], 0) : vbig;
+        ggml_tensor * body = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, (int64_t) ggml_kvarn_rec_bytes(D, G, bits_k, bits_v)*hkv*n_groups);
+        ggml_set_name(body, "body");
+        ggml_tensor * out = ggml_kvarn_seal(ctx, body, k, v, D, G, bits_k, bits_v, iters);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(4321);
+        std::normal_distribution<float> nrm(0.0f, 1.0f);
+        std::uniform_real_distribution<float> uni01(0.0f, 1.0f);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "kbig") == 0 || strcmp(t->name, "vbig") == 0) {
+                // channel outliers (x8 on ~5% of channels) and token outliers (x3 on ~5% of tokens) so balancing is active
+                std::vector<float> ch_scale(t->ne[0]), tok_scale(t->ne[1]);
+                for (auto & x : ch_scale)  x = uni01(rng) < 0.05f ? 8.0f : 1.0f;
+                for (auto & x : tok_scale) x = uni01(rng) < 0.05f ? 3.0f : 1.0f;
+                std::vector<ggml_fp16_t> buf((size_t) t->ne[0]*t->ne[1]);
+                for (int64_t j = 0; j < t->ne[1]; ++j) {
+                    for (int64_t i = 0; i < t->ne[0]; ++i) {
+                        buf[j*t->ne[0] + i] = ggml_fp32_to_fp16(nrm(rng)*ch_scale[i]*tok_scale[j]);
+                    }
+                }
+                ggml_backend_tensor_set(t, buf.data(), 0, buf.size()*sizeof(ggml_fp16_t));
+            } else if (strcmp(t->name, "body") == 0) {
+                std::vector<uint8_t> buf(ggml_nbytes(t), 0xAA); // unwritten bytes would show up as 0xAA
+                ggml_backend_tensor_set(t, buf.data(), 0, buf.size());
+            } else if (t->op == GGML_OP_NONE && t->view_src == nullptr) {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// descriptor-driven seal (decode graph): ring rows in, records [B_OLD, B) out, rest of the pool untouched
+struct test_kvarn_seal_dyn : public test_case {
+    const int64_t D, G, hkv, S, cap, B_old, B, n_groups_pool, n_groups_max;
+    const int bits_k, bits_v, iters;
+
+    std::string vars() override {
+        return VARS_TO_STR12(D, G, hkv, S, cap, B_old, B, n_groups_pool, n_groups_max, bits_k, bits_v, iters);
+    }
+
+    double max_nmse_err() override {
+        return 0.0;
+    }
+
+    test_kvarn_seal_dyn(int64_t D = 256, int64_t G = 128, int64_t hkv = 4, int64_t S = 128, int64_t cap = 384,
+                        int64_t B_old = 128 + 5*128, int64_t B = 128 + 7*128, int64_t n_groups_pool = 9, int64_t n_groups_max = 3,
+                        int bits_k = 4, int bits_v = 4, int iters = 16)
+        : D(D), G(G), hkv(hkv), S(S), cap(cap), B_old(B_old), B(B), n_groups_pool(n_groups_pool), n_groups_max(n_groups_max),
+          bits_k(bits_k), bits_v(bits_v), iters(iters) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * k = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, D*hkv, S + cap);
+        ggml_set_name(k, "kbig");
+        ggml_tensor * v = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, D*hkv, S + cap);
+        ggml_set_name(v, "vbig");
+        ggml_tensor * desc = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, GGML_KVARN_DESC_N_ENTRIES);
+        ggml_set_name(desc, "desc");
+        ggml_tensor * body = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, (int64_t) ggml_kvarn_rec_bytes(D, G, bits_k, bits_v)*hkv*n_groups_pool);
+        ggml_set_name(body, "body");
+        ggml_tensor * out = ggml_kvarn_seal_dyn(ctx, body, k, v, desc, D, G, bits_k, bits_v, iters, n_groups_max);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(8765);
+        std::normal_distribution<float> nrm(0.0f, 1.0f);
+        std::uniform_real_distribution<float> uni01(0.0f, 1.0f);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "kbig") == 0 || strcmp(t->name, "vbig") == 0) {
+                std::vector<float> ch_scale(t->ne[0]), tok_scale(t->ne[1]);
+                for (auto & x : ch_scale)  x = uni01(rng) < 0.05f ? 8.0f : 1.0f;
+                for (auto & x : tok_scale) x = uni01(rng) < 0.05f ? 3.0f : 1.0f;
+                std::vector<ggml_fp16_t> buf((size_t) t->ne[0]*t->ne[1]);
+                for (int64_t j = 0; j < t->ne[1]; ++j) {
+                    for (int64_t i = 0; i < t->ne[0]; ++i) {
+                        buf[j*t->ne[0] + i] = ggml_fp32_to_fp16(nrm(rng)*ch_scale[i]*tok_scale[j]);
+                    }
+                }
+                ggml_backend_tensor_set(t, buf.data(), 0, buf.size()*sizeof(ggml_fp16_t));
+            } else if (strcmp(t->name, "body") == 0) {
+                std::vector<uint8_t> buf(ggml_nbytes(t), 0xAA);
+                ggml_backend_tensor_set(t, buf.data(), 0, buf.size());
+            } else if (strcmp(t->name, "desc") == 0) {
+                int32_t d[GGML_KVARN_DESC_N_ENTRIES] = { 0 };
+                d[GGML_KVARN_DESC_S]        = (int32_t) S;
+                d[GGML_KVARN_DESC_CAP]      = (int32_t) cap;
+                d[GGML_KVARN_DESC_B]        = (int32_t) B;
+                d[GGML_KVARN_DESC_N]        = (int32_t) (B + 17);
+                d[GGML_KVARN_DESC_QPOS0]    = (int32_t) (B + 16);
+                d[GGML_KVARN_DESC_G]        = (int32_t) G;
+                d[GGML_KVARN_DESC_D]        = (int32_t) D;
+                d[GGML_KVARN_DESC_RECBYTES] = (int32_t) ggml_kvarn_rec_bytes(D, G, bits_k, bits_v);
+                d[GGML_KVARN_DESC_HKV]      = (int32_t) hkv;
+                d[GGML_KVARN_DESC_B_OLD]    = (int32_t) B_old;
+                ggml_backend_tensor_set(t, d, 0, sizeof(d));
+            } else if (t->op == GGML_OP_NONE && t->view_src == nullptr) {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 struct test_flash_attn_ext : public test_case {
     const int64_t hsk; // K head size
     const int64_t hsv; // V head size
@@ -10004,6 +10239,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int64_t hd : {128, 256, 512}) {
             for (int64_t nh : {1, 4, 8}) {
                 test_cases.emplace_back(new test_turbo_wht(hd, nh, dir));
+                if (hd == 256) {
+                    test_cases.emplace_back(new test_turbo_wht(hd, nh, dir, 256));
+                }
             }
         }
     }
@@ -12116,6 +12354,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, 4096,  8, true,  true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {2, 1}, 1024, 32, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 4, {2, 1}, 1024,  4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+
+    // KVarN region attention (sink + sealed 4-bit body + ring), decode widths 1..8 at GQA 8 and the Qwen3.8 shape (GQA 6)
+    for (int64_t n_q : {1, 2, 4, 8}) {
+        test_cases.emplace_back(new test_flash_attn_ext_kvarn(n_q, 16, 2));
+        test_cases.emplace_back(new test_flash_attn_ext_kvarn(n_q, 24, 4));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_kvarn(3, 8, 4, 5, 1000)); // GQA 2, 5 records, ring nearly full
+    // prefill ubatches: query rows tiled in ncols1 blocks (stream-k fixup across jt), all GQA classes
+    test_cases.emplace_back(new test_flash_attn_ext_kvarn(  64, 24, 4, 3,  300)); // GQA 6, (8,8) x 8 blocks
+    test_cases.emplace_back(new test_flash_attn_ext_kvarn(1000, 24, 4, 3, 1100)); // GQA 6, ragged last block
+    test_cases.emplace_back(new test_flash_attn_ext_kvarn(1024, 24, 4, 4, 1280)); // GQA 6, full ubatch, ring full
+    test_cases.emplace_back(new test_flash_attn_ext_kvarn(  64, 16, 4, 2,  200)); // GQA 4, (4,4) x 16 blocks
+    test_cases.emplace_back(new test_flash_attn_ext_kvarn(  64,  8, 4, 2,  200)); // GQA 2, (4,2)
+    test_cases.emplace_back(new test_flash_attn_ext_kvarn(  64,  4, 4, 2,  200)); // GQA 1, (8,1)
+    test_cases.emplace_back(new test_flash_attn_ext_kvarn( 256, 16, 2, 3,  300)); // GQA 8
+
+    test_cases.emplace_back(new test_kvarn_seal(256, 128, 4, 2, 4, 4, 16, false));
+    test_cases.emplace_back(new test_kvarn_seal(256, 128, 2, 1, 4, 4, 16, true));
+    test_cases.emplace_back(new test_kvarn_seal(256, 128, 2, 1, 5, 3, 16, false));
+    test_cases.emplace_back(new test_kvarn_seal(256, 128, 1, 1, 8, 8,  4, false));
+    test_cases.emplace_back(new test_kvarn_seal(128,  64, 2, 3, 4, 4, 16, true));
+    test_cases.emplace_back(new test_kvarn_seal( 64,  32, 2, 2, 3, 2, 16, false));
+    // dynamic (descriptor-driven) seal: wrap inside the ring, zero groups, one group, pool larger than the range
+    test_cases.emplace_back(new test_kvarn_seal_dyn());                                          // 2 groups, ring wraps
+    test_cases.emplace_back(new test_kvarn_seal_dyn(256, 128, 4, 128, 384, 128 + 5*128, 128 + 5*128, 9, 3)); // nothing to seal
+    test_cases.emplace_back(new test_kvarn_seal_dyn(256, 128, 2, 128, 512, 128 + 0*128, 128 + 1*128, 4, 1)); // first group
+    test_cases.emplace_back(new test_kvarn_seal_dyn(256, 128, 4, 128, 640, 128 + 2*128, 128 + 5*128, 8, 5)); // 3 of 5
 
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));

@@ -14,6 +14,18 @@ class llama_batch_allocr;
 class llama_io_write_i;
 class llama_io_read_i;
 
+// KVarN region-aware attention cache configuration (see llama_kv_cache)
+struct llama_kvarn_config {
+    uint32_t bits_k   = 0;    // 0 = off
+    uint32_t bits_v   = 0;
+    uint32_t sink     = 128;  // exact fp16 positions [0, sink)
+    uint32_t group    = 128;  // tokens per sealed record
+    uint32_t tail     = 1024; // exact fp16 positions kept unsealed behind the newest token
+    uint32_t n_ubatch = 512;  // sizes the ring: tail + group + n_ubatch rows, padded to 128
+
+    bool enabled() const { return bits_k > 0 && bits_v > 0; }
+};
+
 struct llama_memory_params {
     // kv cache
     ggml_type type_k;
@@ -25,6 +37,8 @@ struct llama_memory_params {
     llama_context_type ctx_type;
 
     llama_memory_t mem_other;
+
+    llama_kvarn_config kvarn;
 };
 
 enum llama_memory_status {

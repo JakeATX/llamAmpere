@@ -671,6 +671,12 @@ struct common_params {
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
 
+    // KVarN region-aware cache (-ctk kvarnN -ctv kvarnM): 0 = off; sink/tail positions kept exact
+    uint32_t kvarn_bits_k = 0;
+    uint32_t kvarn_bits_v = 0;
+    uint32_t kvarn_tail   = 1024;
+    uint32_t kvarn_sink   = 128;
+
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 
     // multimodal models (see tools/mtmd)

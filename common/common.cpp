@@ -1809,6 +1809,11 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
 
+    cparams.kvarn_bits_k = params.kvarn_bits_k;
+    cparams.kvarn_bits_v = params.kvarn_bits_v;
+    cparams.kvarn_tail   = params.kvarn_tail;
+    cparams.kvarn_sink   = params.kvarn_sink;
+
     if (params.moe_cache.mode_explicit) {
         switch (params.moe_cache.mode) {
             case COMMON_MOE_CACHE_MODE_OFF:

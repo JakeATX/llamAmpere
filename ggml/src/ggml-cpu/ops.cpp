@@ -1,4 +1,5 @@
 #include "ops.h"
+#include "../ggml-kvarn.h"
 
 #include "ggml-cpu.h"
 #include "ggml-impl.h"
@@ -9406,9 +9407,138 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     }
 }
 
+// KVarN region-aware attention reference: exact rows for the sink and the ring, sealed records for the
+// body, causal by position. Scalar and slow; the CUDA kernel is checked against this path.
+static void ggml_compute_forward_flash_attn_ext_kvarn(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * q     = dst->src[0];
+    const ggml_tensor * k     = dst->src[1];
+    const ggml_tensor * v     = dst->src[2];
+    const ggml_tensor * mask  = dst->src[3];
+    const ggml_tensor * sinks = dst->src[4];
+    const ggml_tensor * body  = dst->src[5];
+    const ggml_tensor * desc  = dst->src[6];
+
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16);
+    GGML_ASSERT(q->ne[3] == 1 && k->ne[3] == 1);
+
+    const int32_t * dd = (const int32_t *) desc->data;
+    const int32_t S = dd[GGML_KVARN_DESC_S], cap = dd[GGML_KVARN_DESC_CAP], B = dd[GGML_KVARN_DESC_B];
+    const int32_t N = dd[GGML_KVARN_DESC_N], qpos0 = dd[GGML_KVARN_DESC_QPOS0], G = dd[GGML_KVARN_DESC_G];
+    const int32_t D = dd[GGML_KVARN_DESC_D], hkv = dd[GGML_KVARN_DESC_HKV];
+    const size_t rec_bytes = (size_t) dd[GGML_KVARN_DESC_RECBYTES];
+    GGML_ASSERT(mask == NULL || (mask->type == GGML_TYPE_F16 && mask->ne[0] >= N));
+
+    const int32_t bits = ggml_get_op_params_i32(dst, 5);
+    const int bits_k = bits >> 8, bits_v = bits & 0xff;
+    const ggml_kvarn::layout l = ggml_kvarn::make_layout(D, G, bits_k, bits_v);
+    GGML_ASSERT(l.bytes == rec_bytes);
+    GGML_ASSERT(q->ne[0] == D && k->ne[0] == D && v->ne[0] == D);
+    GGML_ASSERT(k->ne[2] == hkv && k->ne[1] >= S + cap);
+    GGML_ASSERT(B >= S || B == 0);
+    GGML_ASSERT((B - S) % G == 0 || B == 0);
+
+    float scale = 1.0f, max_bias = 0.0f, logit_softcap = 0.0f;
+    memcpy(&scale,         (float *) dst->op_params + 0, sizeof(float));
+    memcpy(&max_bias,      (float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (float *) dst->op_params + 2, sizeof(float));
+    GGML_ASSERT(max_bias == 0.0f);
+    if (logit_softcap != 0.0f) {
+        scale /= logit_softcap;
+    }
+
+    const int64_t n_q   = q->ne[1];
+    const int64_t n_h   = q->ne[2];
+    const int64_t gqa   = n_h / hkv;
+    const int64_t nrows = n_q * n_h;
+
+    std::vector<float> krow(D), vrow(D), acc(D);
+
+    for (int64_t ir = params->ith; ir < nrows; ir += params->nth) {
+        const int64_t iq1 = ir % n_q;
+        const int64_t iq2 = ir / n_q;
+        const int64_t ikv = iq2 / gqa;
+        const int32_t qpos = qpos0 + (int32_t) iq1;
+        const float * pq = (const float *) ((const char *) q->data + iq1*q->nb[1] + iq2*q->nb[2]);
+        // mask rows follow the standard flash_attn_ext convention: [n_kv, n_q(padded), ne2 % mask->ne[2], ne3 % mask->ne[3]]
+        const ggml_fp16_t * mp = mask ? (const ggml_fp16_t *) ((const char *) mask->data + iq1*mask->nb[1]
+                                         + (iq2 % mask->ne[2])*mask->nb[2]) : NULL;
+
+        float M = -INFINITY, Ssum = 0.0f;
+        std::fill(acc.begin(), acc.end(), 0.0f);
+
+        // without a mask the reference is causal by position; with one the mask decides (llama supplies one)
+        const int32_t p_end = mask ? N : std::min(N, qpos + 1);
+        for (int32_t p = 0; p < p_end; ++p) {
+            const float mv = mp ? GGML_CPU_FP16_TO_FP32(mp[p]) : 0.0f;
+            if (mv == -INFINITY) {
+                continue;
+            }
+            if (p >= S && p < B) {
+                const int32_t g = (p - S) / G, t = (p - S) % G;
+                const uint8_t * rec = (const uint8_t *) body->data + ((size_t) g*hkv + ikv)*rec_bytes;
+                ggml_kvarn::decode_k_row(rec, l, t, krow.data());
+                ggml_kvarn::decode_v_row(rec, l, t, vrow.data());
+            } else {
+                const int32_t row = p < S ? p : S + (p - S) % cap;
+                const ggml_fp16_t * kr = (const ggml_fp16_t *) ((const char *) k->data + row*k->nb[1] + ikv*k->nb[2]);
+                const ggml_fp16_t * vr = (const ggml_fp16_t *) ((const char *) v->data + row*v->nb[1] + ikv*v->nb[2]);
+                for (int d = 0; d < D; ++d) {
+                    krow[d] = GGML_CPU_FP16_TO_FP32(kr[d]);
+                    vrow[d] = GGML_CPU_FP16_TO_FP32(vr[d]);
+                }
+            }
+            float s = 0.0f;
+            for (int d = 0; d < D; ++d) {
+                s += pq[d] * krow[d];
+            }
+            s *= scale;
+            if (logit_softcap != 0.0f) {
+                s = logit_softcap * tanhf(s);
+            }
+            s += mv;
+            const float Mold = M;
+            float ms = 1.0f, vs = 1.0f;
+            if (s > M) {
+                M = s;
+                ms = expf(Mold - M);
+                for (int d = 0; d < D; ++d) acc[d] *= ms;
+            } else {
+                vs = expf(s - M);
+            }
+            for (int d = 0; d < D; ++d) acc[d] += vrow[d] * vs;
+            Ssum = Ssum*ms + vs;
+        }
+
+        if (sinks) {
+            const float s = ((const float *) sinks->data)[iq2];
+            float ms = 1.0f, vs = 1.0f;
+            if (s > M) {
+                ms = expf(M - s);
+                M = s;
+                for (int d = 0; d < D; ++d) acc[d] *= ms;
+            } else {
+                vs = expf(s - M);
+            }
+            Ssum = Ssum*ms + vs;
+        }
+
+        const float S_inv = Ssum == 0.0f ? 0.0f : 1.0f/Ssum;
+        float * out = (float *) ((char *) dst->data + (iq2 + iq1*dst->ne[1])*dst->nb[1]);
+        for (int d = 0; d < D; ++d) {
+            out[d] = acc[d] * S_inv;
+        }
+    }
+}
+
 void ggml_compute_forward_flash_attn_ext(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
+    if (dst->src[6] != NULL) {
+        ggml_compute_forward_flash_attn_ext_kvarn(params, dst);
+        return;
+    }
     switch (dst->op_params[3]) {
         case GGML_PREC_DEFAULT:
         case GGML_PREC_F32:
@@ -11536,6 +11666,71 @@ void ggml_compute_forward_dsv4_hc_post(
     }
 }
 
+// ggml_compute_forward_kvarn_seal
+
+void ggml_compute_forward_kvarn_seal(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * k    = dst->src[0];
+    const ggml_tensor * v    = dst->src[1];
+    const ggml_tensor * desc = dst->src[2];
+    GGML_ASSERT(k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16);
+
+    const int32_t D = ggml_get_op_params_i32(dst, 0);
+    const int32_t G = ggml_get_op_params_i32(dst, 1);
+    const int32_t bits_k = ggml_get_op_params_i32(dst, 2);
+    const int32_t bits_v = ggml_get_op_params_i32(dst, 3);
+    const int32_t iters  = ggml_get_op_params_i32(dst, 4);
+    const int32_t n_groups_max = ggml_get_op_params_i32(dst, 5);
+
+    const ggml_kvarn::layout l = ggml_kvarn::make_layout(D, G, bits_k, bits_v);
+    const int64_t hkv = k->ne[0] / D;
+    GGML_ASSERT(k->nb[0] == sizeof(ggml_fp16_t) && v->nb[0] == sizeof(ggml_fp16_t));
+    GGML_ASSERT(k->nb[1] == v->nb[1]);
+
+    const size_t row_stride = k->nb[1] / sizeof(ggml_fp16_t);
+
+    if (desc == nullptr) {
+        // static: k/v rows are the group tokens in order, one record per (group, head)
+        const int64_t n_groups = k->ne[1] / G;
+        const int64_t n_rec    = hkv * n_groups;
+        GGML_ASSERT((int64_t) ggml_nelements(dst) == (int64_t) l.bytes * n_rec);
+
+        for (int64_t r = params->ith; r < n_rec; r += params->nth) {
+            const int64_t g = r / hkv, h = r % hkv;
+            const ggml_fp16_t * kp = (const ggml_fp16_t *) ((const char *) k->data + (size_t) g*G*k->nb[1]) + h*D;
+            const ggml_fp16_t * vp = (const ggml_fp16_t *) ((const char *) v->data + (size_t) g*G*v->nb[1]) + h*D;
+            ggml_kvarn::seal_group(kp, vp, row_stride, l, iters, (uint8_t *) dst->data + (size_t) r*l.bytes);
+        }
+        return;
+    }
+
+    // dynamic: seal the groups covering positions [B_OLD, B) out of the ring rows
+    GGML_ASSERT(desc->type == GGML_TYPE_I32);
+    const int32_t * d = (const int32_t *) desc->data;
+    const int32_t S     = d[GGML_KVARN_DESC_S];
+    const int32_t cap   = d[GGML_KVARN_DESC_CAP];
+    const int32_t B     = d[GGML_KVARN_DESC_B];
+    const int32_t B_old = d[GGML_KVARN_DESC_B_OLD];
+    GGML_ASSERT(d[GGML_KVARN_DESC_G] == G && d[GGML_KVARN_DESC_D] == D);
+    GGML_ASSERT(d[GGML_KVARN_DESC_HKV] == hkv && (size_t) d[GGML_KVARN_DESC_RECBYTES] == l.bytes);
+    GGML_ASSERT(cap % G == 0 && (B_old - S) % G == 0 && (B - S) % G == 0);
+    GGML_ASSERT(k->ne[1] >= S + cap);
+    const int32_t n_new = B > B_old ? (B - B_old) / G : 0;
+    GGML_ASSERT(n_new <= n_groups_max);
+    const int64_t g0    = (B_old - S) / G;
+    const int64_t n_rec = (int64_t) n_new * hkv;
+    GGML_ASSERT((int64_t) ggml_nelements(dst) >= (int64_t) l.bytes * (g0 + n_new) * hkv);
+
+    for (int64_t r = params->ith; r < n_rec; r += params->nth) {
+        const int64_t g = r / hkv, h = r % hkv;
+        const int64_t row0 = S + (B_old + g*G - S) % cap; // cap % G == 0 -> the group never wraps
+        const ggml_fp16_t * kp = (const ggml_fp16_t *) ((const char *) k->data + (size_t) row0*k->nb[1]) + h*D;
+        const ggml_fp16_t * vp = (const ggml_fp16_t *) ((const char *) v->data + (size_t) row0*v->nb[1]) + h*D;
+        ggml_kvarn::seal_group(kp, vp, row_stride, l, iters, (uint8_t *) dst->data + (size_t) ((g0 + g)*hkv + h)*l.bytes);
+    }
+}
+
 // ggml_compute_forward_turbo_wht
 
 // WHT sign arrays (must match Metal shader turbo_wht_signs1/2)
@@ -11579,7 +11774,7 @@ static void ggml_compute_forward_turbo_wht_f32(
         const int64_t grp_in_head = g % groups_per_head;
         const int64_t base        = head_idx * head_dim + grp_in_head * group_size;
 
-        float x[128];  // max group_size
+        float x[256];  // max group_size
         const float * in = src_data + base;
 
         // InnerQ forward: apply scale_inv BEFORE signs+WHT (for Q pre-rotation)
@@ -11589,8 +11784,10 @@ static void ggml_compute_forward_turbo_wht_f32(
             for (int i = 0; i < group_size; i++) x[i] = in[i];
         }
 
-        // Apply first signs
-        for (int i = 0; i < group_size; i++) x[i] *= s_first[i];
+        // Apply first signs (group 256 is the plain Sylvester Hadamard: no signs)
+        if (group_size != 256) {
+            for (int i = 0; i < group_size; i++) x[i] *= s_first[i];
+        }
 
         // WHT butterfly (log2(group_size) stages)
         for (int h = 1; h < group_size; h *= 2) {
@@ -11606,7 +11803,7 @@ static void ggml_compute_forward_turbo_wht_f32(
         // Normalize + second signs
         float * out = dst_data + base;
         for (int i = 0; i < group_size; i++) {
-            float val = x[i] * inv_sqrt * s_second[i];
+            float val = x[i] * inv_sqrt * (group_size != 256 ? s_second[i] : 1.0f);
             // InnerQ inverse: apply scale_inv AFTER WHT+signs (for V un-rotation)
             if (direction == 1 && scale_inv != NULL) {
                 val *= scale_inv[i % group_size];

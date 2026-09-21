@@ -526,6 +526,14 @@ llama_context::llama_context(
             /*.swa_full  =*/ params.swa_full,
             /*.ctx_type  =*/ cparams.ctx_type,
             /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
+            /*.kvarn     =*/ {
+                /*.bits_k   =*/ params.kvarn_bits_k,
+                /*.bits_v   =*/ params.kvarn_bits_v,
+                /*.sink     =*/ params.kvarn_sink,
+                /*.group    =*/ 128,
+                /*.tail     =*/ params.kvarn_tail,
+                /*.n_ubatch =*/ cparams.n_ubatch,
+            },
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
@@ -4389,6 +4397,10 @@ llama_context_params llama_context_default_params() {
         /*.moe_cache_budget_mib        =*/ 0,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
+        /*.kvarn_bits_k                =*/ 0,
+        /*.kvarn_bits_v                =*/ 0,
+        /*.kvarn_tail                  =*/ 1024,
+        /*.kvarn_sink                  =*/ 128,
         /*.embeddings                  =*/ false,
         /*.offload_kqv                 =*/ true,
         /*.no_perf                     =*/ true,
@@ -4450,6 +4462,48 @@ llama_context * llama_init_from_model(
     if (params.type_k == GGML_TYPE_TURBO2_0) {
         LLAMA_LOG_ERROR("%s: turbo2 is a V-only cache type; pick a different K cache type (q8_0, tq5_0, tq6_0, turbo4)\n", __func__);
         return nullptr;
+    }
+
+    // KVarN region-aware cache: exact fp16 rows for sink + tail, sealed 4-bit records for the body
+    if (params.kvarn_bits_k > 0 || params.kvarn_bits_v > 0) {
+        if (params.kvarn_bits_k != 4 || params.kvarn_bits_v != 4) {
+            LLAMA_LOG_ERROR("%s: KVarN cache: only 4-bit K and 4-bit V records are implemented (-ctk kvarn4 -ctv kvarn4)\n", __func__);
+            return nullptr;
+        }
+        if (model->hparams.is_mla() || model->arch == LLM_ARCH_DEEPSEEK4) {
+            LLAMA_LOG_ERROR("%s: KVarN cache does not support MLA models\n", __func__);
+            return nullptr;
+        }
+        if (params.type_k != GGML_TYPE_F16 || params.type_v != GGML_TYPE_F16) {
+            LLAMA_LOG_WARN("%s: KVarN cache: K/V ring rows are fp16, overriding -ctk/-ctv %s/%s\n", __func__,
+                    ggml_type_name(params.type_k), ggml_type_name(params.type_v));
+            params.type_k = GGML_TYPE_F16;
+            params.type_v = GGML_TYPE_F16;
+        }
+        if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
+            LLAMA_LOG_ERROR("%s: KVarN cache requires flash attention\n", __func__);
+            return nullptr;
+        }
+        params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        if (params.n_seq_max != 1) {
+            LLAMA_LOG_ERROR("%s: KVarN cache supports a single sequence (n_seq_max = %u)\n", __func__, params.n_seq_max);
+            return nullptr;
+        }
+        if (params.kvarn_sink == 0 || params.kvarn_sink % 64 != 0 || params.kvarn_tail % 128 != 0) {
+            LLAMA_LOG_ERROR("%s: KVarN cache: sink must be a positive multiple of 64 and tail a multiple of 128 (got %u / %u)\n",
+                    __func__, params.kvarn_sink, params.kvarn_tail);
+            return nullptr;
+        }
+        for (uint32_t il = 0; il < model->hparams.n_layer(); ++il) {
+            if (!model->hparams.has_kv(il) || model->hparams.is_recr(il)) {
+                continue;
+            }
+            if (model->hparams.n_embd_head_k(il) != 256 || model->hparams.n_embd_head_v(il) != 256) {
+                LLAMA_LOG_ERROR("%s: KVarN cache: the CUDA path supports head size 256 only (layer %u has %u/%u)\n", __func__,
+                        il, model->hparams.n_embd_head_k(il), model->hparams.n_embd_head_v(il));
+                return nullptr;
+            }
+        }
     }
 
     // TurboQuant cache types require flash attention — auto-enable if disabled

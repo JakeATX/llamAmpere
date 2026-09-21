@@ -3424,6 +3424,9 @@ common_params common_base_params_to_speculative(const common_params & params) {
 
     result.cache_type_k  = params_spec.cache_type_k;
     result.cache_type_v  = params_spec.cache_type_v;
+    // the draft/MTP context shares cells with the target (or is a separate small cache): never KVarN
+    result.kvarn_bits_k  = 0;
+    result.kvarn_bits_v  = 0;
     result.n_outputs_max = params.n_parallel;
     result.n_outputs_max_per_seq = 1;
 

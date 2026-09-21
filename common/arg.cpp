@@ -329,6 +329,15 @@ static ggml_type kv_cache_type_from_str(const std::string & s) {
     throw std::runtime_error("Unsupported cache type: " + s);
 }
 
+// "kvarnN" (N in 2..8) selects the KVarN region-aware cache: the ring/sink rows stay f16, the body is sealed at N bits
+static bool kvarn_bits_from_str(const std::string & s, uint32_t & bits) {
+    if (s.size() != 6 || s.compare(0, 5, "kvarn") != 0 || s[5] < '2' || s[5] > '8') {
+        return false;
+    }
+    bits = (uint32_t) (s[5] - '0');
+    return true;
+}
+
 static std::string get_all_kv_cache_types() {
     std::ostringstream msg;
     for (const auto & type : kv_cache_types) {
@@ -2500,12 +2509,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"-ctk", "--cache-type-k"}, "TYPE",
         string_format(
             "KV cache data type for K\n"
-            "allowed values: %s\n"
+            "allowed values: %s, kvarn4 (KVarN region-aware cache, pair with -ctv kvarn4)\n"
             "(default: %s)",
             get_all_kv_cache_types().c_str(),
             ggml_type_name(params.cache_type_k)
         ),
         [](common_params & params, const std::string & value) {
+            if (kvarn_bits_from_str(value, params.kvarn_bits_k)) {
+                params.cache_type_k = GGML_TYPE_F16;
+                return;
+            }
+            params.kvarn_bits_k = 0;
             params.cache_type_k = kv_cache_type_from_str(value);
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_K"));
@@ -2513,15 +2527,34 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"-ctv", "--cache-type-v"}, "TYPE",
         string_format(
             "KV cache data type for V\n"
-            "allowed values: %s\n"
+            "allowed values: %s, kvarn4 (KVarN region-aware cache, pair with -ctk kvarn4)\n"
             "(default: %s)",
             get_all_kv_cache_types().c_str(),
             ggml_type_name(params.cache_type_v)
         ),
         [](common_params & params, const std::string & value) {
+            if (kvarn_bits_from_str(value, params.kvarn_bits_v)) {
+                params.cache_type_v = GGML_TYPE_F16;
+                return;
+            }
+            params.kvarn_bits_v = 0;
             params.cache_type_v = kv_cache_type_from_str(value);
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
+    add_opt(common_arg(
+        {"--kvarn-tail"}, "N",
+        string_format("KVarN cache: number of most recent positions kept exact (multiple of 128, default: %u)", params.kvarn_tail),
+        [](common_params & params, int value) {
+            params.kvarn_tail = (uint32_t) value;
+        }
+    ).set_env("LLAMA_ARG_KVARN_TAIL"));
+    add_opt(common_arg(
+        {"--kvarn-sink"}, "N",
+        string_format("KVarN cache: number of leading positions kept exact (multiple of 64, default: %u)", params.kvarn_sink),
+        [](common_params & params, int value) {
+            params.kvarn_sink = (uint32_t) value;
+        }
+    ).set_env("LLAMA_ARG_KVARN_SINK"));
     add_opt(common_arg(
         {"--hellaswag"},
         "compute HellaSwag score over random tasks from datafile supplied with -f",

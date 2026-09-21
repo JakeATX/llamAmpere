@@ -152,6 +152,10 @@ llama_build(test-recurrent-state-rollback.cpp)
 llama_build(test-output-buffer-reuse.cpp)
 
 llama_build_and_test(test-gdn-ingredient-replay.cpp LABEL "turbo")
+llama_build_and_test(test-kvarn-codec.cpp LABEL "turbo")
+target_include_directories(test-kvarn-codec PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+llama_build_and_test(test-kvarn-attn.cpp LABEL "turbo")
+target_include_directories(test-kvarn-attn PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 llama_build(test-save-load-state.cpp)
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)

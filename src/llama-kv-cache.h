@@ -114,7 +114,8 @@ public:
         const  layer_reuse_cb & reuse,
         const  layer_share_cb & share,
         // a model can hold more than one cache, so the tensor names have to stay unique
-                 const char *   name_tag = "");
+                 const char *   name_tag = "",
+           llama_kvarn_config   kvarn = llama_kvarn_config());
 
     ~llama_kv_cache() = default;
 
@@ -203,6 +204,19 @@ public:
     // TurboQuant InnerQ: per-channel scale_inv for Q/V equalization
     ggml_tensor * get_turbo_innerq_scale_inv() const { return turbo_innerq_scale_inv; }
 
+    //
+    // KVarN region-aware cache (sink + ring rows exact fp16, body sealed into low-bit records)
+    //
+    bool is_kvarn() const { return kvarn.enabled(); }
+    const llama_kvarn_config & get_kvarn() const { return kvarn; }
+
+    // I32[GGML_KVARN_DESC_N_ENTRIES] graph input consumed by the seal op and the attention op
+    ggml_tensor * build_input_kvarn_desc(ggml_context * ctx) const;
+    void set_input_kvarn_desc(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+
+    // seal the groups that this ubatch pushed out of the tail: k_store/v_store are the set_rows outputs of cpy_k/cpy_v
+    ggml_tensor * build_kvarn_seal(ggml_context * ctx, ggml_tensor * k_store, ggml_tensor * v_store, ggml_tensor * desc, int32_t il) const;
+
     // store k_cur and v_cur in the cache based on the provided head location
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const;
@@ -271,9 +285,26 @@ private:
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
+
+        // KVarN: sealed record pool, I8 [rec_bytes*n_head_kv*kvarn_n_groups]
+        ggml_tensor * body = nullptr;
     };
 
     bool v_trans = true;  // the value tensor is transposed
+
+    // KVarN state (see is_kvarn()). Positions: [0, sink) exact rows 0..sink-1; [sink, B) sealed records
+    // (sink..B in groups of `group`); [B, N) exact ring rows sink + (p - sink) % cap. Cells stay one per
+    // position (cell index == position) so the mask and the sequence bookkeeping are unchanged.
+    llama_kvarn_config kvarn;
+    uint32_t kvarn_cap           = 0; // ring rows
+    uint32_t kvarn_n_groups      = 0; // records per head in the pool
+    uint32_t kvarn_n_groups_seal = 0; // static per-ubatch seal launch size
+    size_t   kvarn_rec_bytes     = 0;
+    uint32_t kvarn_B      = 0;        // sealed end
+    uint32_t kvarn_B_prev = 0;        // sealed end before the current ubatch
+    uint32_t kvarn_N      = 0;        // positions present
+
+    uint32_t kvarn_ring_row(uint32_t pos) const { return pos < kvarn.sink ? pos : kvarn.sink + (pos - kvarn.sink) % kvarn_cap; }
 
     const uint32_t n_seq_max = 1;
     const uint32_t n_stream  = 1;
@@ -429,6 +460,13 @@ public:
 
     // TurboQuant InnerQ: per-channel scale_inv for Q/V equalization
     ggml_tensor * get_turbo_innerq_scale_inv() const override;
+
+    // KVarN (see llama_kv_cache)
+    bool is_kvarn() const;
+    const llama_kvarn_config & get_kvarn() const;
+    ggml_tensor * build_input_kvarn_desc(ggml_context * ctx) const;
+    void set_input_kvarn_desc(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    ggml_tensor * build_kvarn_seal(ggml_context * ctx, ggml_tensor * k_store, ggml_tensor * v_store, ggml_tensor * desc, int32_t il) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
     // note: the heads in k_cur and v_cur should be laid out contiguously in memory

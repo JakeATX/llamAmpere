@@ -2,6 +2,7 @@
 #include "fattn-common.cuh"
 #include "fattn-mma-f16.cuh"
 #include "fattn-mma-turbo.cuh"
+#include "fattn-mma-kvarn.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
@@ -1020,7 +1021,7 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     GGML_ASSERT(K != nullptr);
     GGML_ASSERT(V != nullptr);
 
-    const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(device, dst);
+    const best_fattn_kernel kernel = dst->src[6] != nullptr ? BEST_FATTN_KERNEL_NONE : ggml_cuda_get_best_fattn_kernel(device, dst);
 
     bool need_f16_K = false;
     bool need_f16_V = false;
@@ -1048,6 +1049,13 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+
+    // KVarN region-aware attention (sink/ring f16 rows + sealed 4-bit body records): dedicated MMA path.
+    if (dst->src[6] != nullptr) {
+        ggml_cuda_fattn_path_note("kvarn", dst, -1);
+        ggml_cuda_flash_attn_ext_mma_kvarn_switch_ncols2<256, 256>(ctx, dst);
+        return;
+    }
 
     // Qwen3.8 verification fast path: Q8 K and Turbo3 V are decoded directly
     // into the Stream-K MMA tile. This removes full-cache FP16 conversion and
@@ -1163,5 +1171,10 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 }
 
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
+    if (dst->src[6] != NULL) {
+        // KVarN region attention: only the dedicated MMA path (fattn-mma-kvarn.cuh) serves it
+        const int cc = ggml_cuda_info().devices[device].cc;
+        return ggml_cuda_flash_attn_ext_kvarn_supported(cc, dst);
+    }
     return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
 }
