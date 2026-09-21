@@ -59,25 +59,59 @@ static bool noise_row(const uint8_t * rec, size_t scale_off) {
     return fabsf(GGML_FP16_TO_FP32(h)) < 6.103515625e-05f; // 2^-14
 }
 
+// The oracle writes the PRD section-3 record: token-major bit stream per payload and channel metadata in natural
+// order. The sealer's record is fragment-ordered (ggml_kvarn::code_bit / k_ch_idx / v_ch_idx); re-pack the oracle
+// record into that layout so the two can be compared code by code.
+static std::vector<uint8_t> oracle_to_layout(const uint8_t * o, const ggml_kvarn::layout & l) {
+    std::vector<uint8_t> r(o, o + l.bytes);
+    const bool fk = ggml_kvarn::frag_order(l.bits_k, l.D, l.G);
+    const bool fv = ggml_kvarn::frag_order(l.bits_v, l.D, l.G);
+    if (!fk && !fv) {
+        return r;
+    }
+    // oracle slot of value d in a row: 4-bit rows interleave each 8-value word (value j at nibble j/2 for even j,
+    // 4 + j/2 for odd j); other widths are the identity
+    auto slot = [](int d, int bits) -> uint32_t {
+        if (bits != 4) return (uint32_t) d;
+        const int j = d & 7;
+        return (uint32_t) ((d & ~7) + ((j & 1) ? 4 + (j >> 1) : (j >> 1)));
+    };
+    memset(r.data(), 0, l.k_scale);
+    for (int t = 0; t < l.G; ++t) {
+        for (int d = 0; d < l.D; ++d) {
+            const uint32_t k = ggml_kvarn::unpack_code(o + l.k_payload, (uint32_t) t*(l.D*l.bits_k) + slot(d, l.bits_k)*l.bits_k, l.bits_k);
+            const uint32_t v = ggml_kvarn::unpack_code(o + l.v_payload, (uint32_t) t*(l.D*l.bits_v) + slot(d, l.bits_v)*l.bits_v, l.bits_v);
+            ggml_kvarn::pack_code(r.data() + l.k_payload, ggml_kvarn::code_bit(t, d, false, l.D, l.G, l.bits_k), l.bits_k, k);
+            ggml_kvarn::pack_code(r.data() + l.v_payload, ggml_kvarn::code_bit(t, d, true,  l.D, l.G, l.bits_v), l.bits_v, v);
+        }
+    }
+    for (int d = 0; d < l.D; ++d) {
+        memcpy(r.data() + l.k_scale + 2*ggml_kvarn::k_ch_idx(d, l.D, l.G, l.bits_k), o + l.k_scale + 2*d, 2);
+        memcpy(r.data() + l.k_zero  + 2*ggml_kvarn::k_ch_idx(d, l.D, l.G, l.bits_k), o + l.k_zero  + 2*d, 2);
+        memcpy(r.data() + l.v_ch    + 2*ggml_kvarn::v_ch_idx(d, l.D, l.G, l.bits_v), o + l.v_ch    + 2*d, 2);
+    }
+    return r;
+}
+
 static void compare_records(const uint8_t * a, const uint8_t * b, const ggml_kvarn::layout & l, diff_stats & st) {
     bool any = false;
     for (size_t i = l.k_scale; i < l.bytes; ++i) {
         if (a[i] != b[i]) { st.meta_bytes_diff++; any = true; }
     }
     std::vector<bool> k_noise(l.D), v_noise(l.G);
-    for (int d = 0; d < l.D; ++d) { k_noise[d] = noise_row(a, l.k_scale + 2*d); st.noise_rows += k_noise[d]; }
+    for (int d = 0; d < l.D; ++d) { k_noise[d] = noise_row(a, l.k_scale + 2*ggml_kvarn::k_ch_idx(d, l.D, l.G, l.bits_k)); st.noise_rows += k_noise[d]; }
     for (int t = 0; t < l.G; ++t) { v_noise[t] = noise_row(a, l.v_scale + 2*t); st.noise_rows += v_noise[t]; }
     for (int t = 0; t < l.G; ++t) {
         for (int d = 0; d < l.D; ++d) {
-            const int qa = ggml_kvarn::unpack_value(a + l.k_payload + (size_t) t*l.k_row, d, l.bits_k);
-            const int qb = ggml_kvarn::unpack_value(b + l.k_payload + (size_t) t*l.k_row, d, l.bits_k);
+            const int qa = ggml_kvarn::k_code(a, l, t, d);
+            const int qb = ggml_kvarn::k_code(b, l, t, d);
             st.payload_vals++;
             if (qa != qb) {
                 any = true;
                 if (k_noise[d]) { st.noise_diff++; } else { st.payload_diff++; if (abs(qa - qb) > 1) st.payload_diff_gt1++; }
             }
-            const int va = ggml_kvarn::unpack_value(a + l.v_payload + (size_t) t*l.v_row, d, l.bits_v);
-            const int vb = ggml_kvarn::unpack_value(b + l.v_payload + (size_t) t*l.v_row, d, l.bits_v);
+            const int va = ggml_kvarn::v_code(a, l, t, d);
+            const int vb = ggml_kvarn::v_code(b, l, t, d);
             st.payload_vals++;
             if (va != vb) {
                 any = true;
@@ -107,12 +141,17 @@ int main(int argc, char ** argv) {
     }
 
     const std::vector<uint8_t> tiles = read_file(argv[1]);
-    const std::vector<uint8_t> recs  = read_file(argv[2]);
+    std::vector<uint8_t> recs        = read_file(argv[2]);
     const size_t tile_bytes = 2 * (size_t) G * D * sizeof(float);
     if (tiles.size() < (size_t) n * tile_bytes || recs.size() < (size_t) n * l.bytes) {
         fprintf(stderr, "files too small for n=%d (tiles %zu need %zu, records %zu need %zu)\n",
                 n, tiles.size(), (size_t) n*tile_bytes, recs.size(), (size_t) n*l.bytes);
         return 2;
+    }
+
+    for (int g = 0; g < n; ++g) {
+        const std::vector<uint8_t> r = oracle_to_layout(recs.data() + (size_t) g*l.bytes, l);
+        memcpy(recs.data() + (size_t) g*l.bytes, r.data(), l.bytes);
     }
 
     int rc = 0;

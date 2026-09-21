@@ -108,6 +108,11 @@ extern DECL_FATTN_MMA_KVARN_CASE(256, 256, 4, 4);
 extern DECL_FATTN_MMA_KVARN_CASE(256, 256, 4, 2);
 extern DECL_FATTN_MMA_KVARN_CASE(256, 256, 8, 1);
 
+// fattn-kvarn-direct.cuh (template-instances/fattn-mma-kvarn-direct-instance.cu): register-streaming decode kernel
+// for n_q <= 8 at GQA <= 8; GGML_KVARN_NO_DIRECT=1 falls back to the shared-memory tile kernel below.
+bool ggml_cuda_flash_attn_ext_kvarn_direct_supported(const ggml_tensor * dst);
+void ggml_cuda_flash_attn_ext_kvarn_direct(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
 template <int DKQ, int DV>
 static void ggml_cuda_flash_attn_ext_mma_kvarn_switch_ncols2(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * KQV  = dst;
@@ -125,6 +130,10 @@ static void ggml_cuda_flash_attn_ext_mma_kvarn_switch_ncols2(ggml_backend_cuda_c
     GGML_ASSERT(use_gqa_opt && "KVarN CUDA path needs a mask, no ALiBi and n_kv_pad % 256 == 0");
 
     GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
+    if (ggml_cuda_flash_attn_ext_kvarn_direct_supported(dst)) {
+        ggml_cuda_flash_attn_ext_kvarn_direct(ctx, dst);
+        return;
+    }
     const int gqa_ratio = Q->ne[2] / K->ne[2];
     const int n_q = Q->ne[1];
 

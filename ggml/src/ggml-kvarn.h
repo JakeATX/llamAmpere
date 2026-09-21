@@ -5,11 +5,17 @@
 // log domain, asymmetric per-row RTN, scale absorption) with one deliberate divergence: the balancing
 // runs a fixed number of iterations and keeps the FINAL scales instead of the reference's best-so-far
 // selection, which flips on float32 last bits once the imbalance reaches its fixed point and would make
-// CPU and CUDA sealers disagree. The record layout is this project's own (token-major payloads for both
-// K and V), see ggml_kvarn_seal in ggml.h.
+// CPU and CUDA sealers disagree. The record layout is this project's own, see ggml_kvarn_seal in ggml.h and
+// the layout notes above code_bit() below.
 
 #include "ggml.h"
 #include "ggml-impl.h"
+
+#ifdef __CUDACC__
+#define KVARN_HD __host__ __device__
+#else
+#define KVARN_HD
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -152,39 +158,91 @@ inline uint32_t rtn_code(float x, float lo, float step, uint32_t qmax) {
     return (uint32_t) r;
 }
 
-// Physical slot of value idx within a payload row. 4-bit rows interleave each 8-value word so that the CUDA
-// decoder pulls two adjacent values with one mask: nibble k of a word holds value 2k (k < 4) or 2(k-4)+1
-// (k >= 4), i.e. values (0,1) sit in nibbles (0,4), (2,3) in (1,5), (4,5) in (2,6), (6,7) in (3,7).
-// Other bit widths are a plain little-endian bit stream (value idx at bit idx*bits).
-inline int phys_slot(int idx, int bits) {
-    if (bits != 4) {
-        return idx;
-    }
-    const int word = idx >> 3, k = idx & 7;
-    return word*8 + ((k & 1) ? 4 + (k >> 1) : (k >> 1));
+// ---------------------------------------------------------------------------------------------------------
+// Payload and metadata order.
+//
+// 4-bit payloads (the production width) are stored in "fragment order": the order in which one warp of the
+// CUDA decode kernel consumes them as m16n8k16 tensor-core A operands, so a lane's 32-bit word is exactly its
+// fragment and no shared-memory transpose is needed. Tokens are grouped in strips of 16 and channels in
+// tiles of 16. For K (A = K rows, k = channel) word (strip s, channel tile ks, lane) holds the codes of
+// tokens 16s + lane/4 (+8) at channels 16ks + 2(lane%4) + {0,1} (+8); for V (A = V^T, rows = channels,
+// k = tokens) word (s, channel tile dt, lane) holds channels 16dt + lane/4 (+8) at tokens 16s + 2(lane%4)
+// + {0,1} (+8). Inside a word, fragment register l (0..3) is the half2 pair (nibble l, nibble l+4), i.e.
+// element e of pair l sits in nibble l + 4e (see fattn_kvarn_decode_word). The per-channel fp16 vectors
+// Kscale/Kzero/Vch are permuted the same way so that a lane finds its channels contiguous
+// (k_ch_idx / v_ch_idx); Ktok/Vscale/Vzero stay in token order.
+//
+// Any other bit width keeps the plain token-major bit stream (token row t, value d at bit d*bits).
+// ---------------------------------------------------------------------------------------------------------
+KVARN_HD inline bool frag_order(int bits, int D, int G) {
+    return bits == 4 && D % 16 == 0 && G % 16 == 0;
 }
 
-// value idx of a row at bit phys_slot(idx)*bits, little-endian across bytes
-inline void pack_value(uint8_t * row, int idx, int bits, uint32_t v) {
-    const uint32_t bit = (uint32_t) phys_slot(idx, bits) * bits;
-    uint32_t byte = bit >> 3;
+// bit offset (inside the K or V payload) of token t, channel d
+KVARN_HD inline uint32_t code_bit(int t, int d, bool is_V, int D, int G, int bits) {
+    if (!frag_order(bits, D, G)) {
+        return (uint32_t) t * (uint32_t) (D * bits) + (uint32_t) d * bits;
+    }
+    const int s = t >> 4, tt = t & 15;
+    const int c = d >> 4, dd = d & 15;
+    int lane, l, e;
+    if (!is_V) {
+        lane = 4*(tt & 7) + ((dd >> 1) & 3);
+        l    = (tt >> 3) + 2*(dd >> 3);
+        e    = dd & 1;
+    } else {
+        lane = 4*(dd & 7) + ((tt >> 1) & 3);
+        l    = (dd >> 3) + 2*(tt >> 3);
+        e    = tt & 1;
+    }
+    const uint32_t word = (uint32_t) (s*(D/16) + c)*32u + (uint32_t) lane;
+    return word*32u + (uint32_t) (l + 4*e)*4u;
+}
+
+// index of channel d inside Kscale/Kzero (K fragment order: class lane%4, then channel tile, then pair, then element)
+KVARN_HD inline int k_ch_idx(int d, int D, int G, int bits) {
+    if (!frag_order(bits, D, G)) {
+        return d;
+    }
+    const int c = d >> 4, dd = d & 15, jj = dd >> 1, e = dd & 1;
+    return (jj & 3)*(D/4) + c*4 + (jj >> 2)*2 + e;
+}
+
+// index of channel d inside Vch (V fragment order: class lane/4, then channel tile, then half)
+KVARN_HD inline int v_ch_idx(int d, int D, int G, int bits) {
+    if (!frag_order(bits, D, G)) {
+        return d;
+    }
+    const int c = d >> 4, dd = d & 15;
+    return (dd & 7)*(D/8) + c*2 + (dd >> 3);
+}
+
+// value v at bit offset `bit` of a payload (bits <= 8), little-endian across bytes
+inline void pack_code(uint8_t * payload, uint32_t bit, int bits, uint32_t v) {
+    const uint32_t byte  = bit >> 3;
     const uint32_t shift = bit & 7;
-    uint32_t w = (v & ((1u << bits) - 1)) << shift;
-    row[byte] |= (uint8_t) w;
+    const uint32_t w = (v & ((1u << bits) - 1)) << shift;
+    payload[byte] |= (uint8_t) w;
     if (shift + bits > 8) {
-        row[byte + 1] |= (uint8_t) (w >> 8);
+        payload[byte + 1] |= (uint8_t) (w >> 8);
     }
 }
 
-inline uint32_t unpack_value(const uint8_t * row, int idx, int bits) {
-    const uint32_t bit = (uint32_t) phys_slot(idx, bits) * bits;
-    const uint32_t byte = bit >> 3;
+inline uint32_t unpack_code(const uint8_t * payload, uint32_t bit, int bits) {
+    const uint32_t byte  = bit >> 3;
     const uint32_t shift = bit & 7;
-    uint32_t w = row[byte];
+    uint32_t w = payload[byte];
     if (shift + bits > 8) {
-        w |= (uint32_t) row[byte + 1] << 8;
+        w |= (uint32_t) payload[byte + 1] << 8;
     }
     return (w >> shift) & ((1u << bits) - 1);
+}
+
+inline uint32_t k_code(const uint8_t * rec, const layout & l, int t, int d) {
+    return unpack_code(rec + l.k_payload, code_bit(t, d, false, l.D, l.G, l.bits_k), l.bits_k);
+}
+inline uint32_t v_code(const uint8_t * rec, const layout & l, int t, int d) {
+    return unpack_code(rec + l.v_payload, code_bit(t, d, true, l.D, l.G, l.bits_v), l.bits_v);
 }
 
 inline void put_half(uint8_t * rec, size_t off, float v) {
@@ -218,10 +276,11 @@ inline void seal_group(const ggml_fp16_t * K, const ggml_fp16_t * V, size_t row_
             float lo = row[0], hi = row[0];
             for (int t = 1; t < G; ++t) { lo = std::min(lo, row[t]); hi = std::max(hi, row[t]); }
             const float step = std::max((hi - lo) / (float) qmax, 1e-10f);
-            put_half(rec, l.k_scale + 2*d, s_row[d] * step);
-            put_half(rec, l.k_zero  + 2*d, s_row[d] * lo);
+            const int di = k_ch_idx(d, D, G, l.bits_k);
+            put_half(rec, l.k_scale + 2*di, s_row[d] * step);
+            put_half(rec, l.k_zero  + 2*di, s_row[d] * lo);
             for (int t = 0; t < G; ++t) {
-                pack_value(rec + l.k_payload + (size_t) t*l.k_row, d, l.bits_k, rtn_code(row[t], lo, step, qmax));
+                pack_code(rec + l.k_payload, code_bit(t, d, false, D, G, l.bits_k), l.bits_k, rtn_code(row[t], lo, step, qmax));
             }
         }
         for (int t = 0; t < G; ++t) {
@@ -246,11 +305,11 @@ inline void seal_group(const ggml_fp16_t * K, const ggml_fp16_t * V, size_t row_
             put_half(rec, l.v_scale + 2*t, s_row[t] * step);
             put_half(rec, l.v_zero  + 2*t, s_row[t] * lo);
             for (int d = 0; d < D; ++d) {
-                pack_value(rec + l.v_payload + (size_t) t*l.v_row, d, l.bits_v, rtn_code(row[d], lo, step, qmax));
+                pack_code(rec + l.v_payload, code_bit(t, d, true, D, G, l.bits_v), l.bits_v, rtn_code(row[d], lo, step, qmax));
             }
         }
         for (int d = 0; d < D; ++d) {
-            put_half(rec, l.v_ch + 2*d, s_col[d]);
+            put_half(rec, l.v_ch + 2*v_ch_idx(d, D, G, l.bits_v), s_col[d]);
         }
     }
 }
@@ -258,19 +317,18 @@ inline void seal_group(const ggml_fp16_t * K, const ggml_fp16_t * V, size_t row_
 // rotated-domain reconstruction of token t of a record
 inline void decode_k_row(const uint8_t * rec, const layout & l, int t, float * out) {
     const float tok = get_half(rec, l.k_tok + 2*t);
-    const uint8_t * row = rec + l.k_payload + (size_t) t*l.k_row;
     for (int d = 0; d < l.D; ++d) {
-        const float q = (float) unpack_value(row, d, l.bits_k);
-        out[d] = (q * get_half(rec, l.k_scale + 2*d) + get_half(rec, l.k_zero + 2*d)) * tok;
+        const float q  = (float) k_code(rec, l, t, d);
+        const int   di = k_ch_idx(d, l.D, l.G, l.bits_k);
+        out[d] = (q * get_half(rec, l.k_scale + 2*di) + get_half(rec, l.k_zero + 2*di)) * tok;
     }
 }
 inline void decode_v_row(const uint8_t * rec, const layout & l, int t, float * out) {
     const float sc = get_half(rec, l.v_scale + 2*t);
     const float zp = get_half(rec, l.v_zero  + 2*t);
-    const uint8_t * row = rec + l.v_payload + (size_t) t*l.v_row;
     for (int d = 0; d < l.D; ++d) {
-        const float q = (float) unpack_value(row, d, l.bits_v);
-        out[d] = (q * sc + zp) * get_half(rec, l.v_ch + 2*d);
+        const float q = (float) v_code(rec, l, t, d);
+        out[d] = (q * sc + zp) * get_half(rec, l.v_ch + 2*v_ch_idx(d, l.D, l.G, l.bits_v));
     }
 }
 

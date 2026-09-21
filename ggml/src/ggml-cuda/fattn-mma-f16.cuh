@@ -565,15 +565,13 @@ static __device__ __forceinline__ void turbo_store_u4(half2 * const __restrict__
 }
 
 // ---------------------------------------------------------------------------
-// KVarN sealed-record tile loaders (record layout: ggml_kvarn::make_layout, context: fattn_kvarn_ctx).
+// KVarN sealed-record tile loaders (record layout: ggml_kvarn::code_bit, context: fattn_kvarn_ctx).
 //
-// A 4-bit payload row (one token, D codes, D/2 bytes) is interleaved per 32-bit word so that nibble k holds
-// value 2k (k < 4) or 2(k-4)+1 (k >= 4). Masking bits 0-3 and 16-19 of a word therefore yields the value pair
-// (v0,v1), bits 4-7 and 20-23 the pair (v2,v3), and the same masks on word>>8 give (v4,v5) and (v6,v7). Each
-// masked word is turned into a half2 with the fp16 magic number 1024 (0x6400): 0x6400|v is 1024+v exactly, and
-// for the shifted nibble (1024+16v)/16-64 = v exactly, so no rounding happens before the affine step.
-// One thread decodes one 16-byte chunk (32 codes = 16 half2 tile entries) per loop trip, consecutive threads
-// take consecutive chunks of the same 128-byte row, so the global loads coalesce.
+// A 4-bit payload word holds one tensor-core A fragment of a lane: nibbles (l, l+4) are the half2 pair of
+// fragment register l. Masking bits 0-3 and 16-19 of a word therefore yields pair 0, bits 4-7 and 20-23 pair 1,
+// and the same masks on word>>8 give pairs 2 and 3. Each masked word is turned into a half2 with the fp16 magic
+// number 1024 (0x6400): 0x6400|v is 1024+v exactly, and for the shifted nibble (1024+16v)/16-64 = v exactly, so
+// no rounding happens before the affine step.
 static __device__ __forceinline__ half2 fattn_kvarn_u32_as_half2(const uint32_t u) {
     half2 h;
     memcpy(&h, &u, sizeof(h));
@@ -592,81 +590,100 @@ static __device__ __forceinline__ void fattn_kvarn_decode_word(const uint32_t x,
 }
 
 // Decode tokens [t0, t0+nbatch_fa) of one record into a [nbatch_fa][D2] half2 tile (row = token, col = channel pair),
-// the same layout the f16 loader produces. K: (q*Kscale[d] + Kzero[d]) * Ktok[t]; V: (q*Vscale[t] + Vzero[t]) * Vch[d].
+// the same layout the f16 loader produces, from the fragment-ordered record (ggml_kvarn::code_bit: one 32-bit word per
+// (16-token strip, 16-channel tile, lane) holding a tensor-core A fragment). K: (q*Kscale[d] + Kzero[d]) * Ktok[t];
+// V: (q*Vscale[t] + Vzero[t]) * Vch[d]. Each warp owns channel tiles c = warp, warp + nwarps, ... and walks the strips
+// of the tile, so the per-channel metadata of a tile is loaded once per warp. This is the fallback (shared-memory
+// tile) path; the decode kernel in fattn-kvarn-direct.cuh consumes the same words straight into registers.
 template<int stride_tile, bool swz, int nbatch_fa, int nthreads, int D2, bool oob_check, bool is_V>
 static __device__ __forceinline__ void flash_attn_ext_kvarn_load_tile(
         const char * const __restrict__ rec, const int t0, const fattn_kvarn_ctx & kv,
         half2 * const __restrict__ tile_KV, const int i_sup) {
-    constexpr int warp_size      = ggml_cuda_get_physical_warp_size();
-    constexpr int chunks_per_row = D2 / 16;   // 16 half2 (32 codes, 16 bytes) per chunk
-    constexpr int row_bytes      = D2;        // 2*D2 codes at 4 bits
-    static_assert(D2 % 16 == 0, "KVarN tile rows must be a multiple of 32 codes");
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int D         = 2*D2;
+    constexpr int ntiles_c  = D/16;
+    constexpr int nstrips   = nbatch_fa/16;
+    constexpr int nwarps    = nthreads/warp_size;
+    static_assert(nbatch_fa % 16 == 0 && D % 16 == 0, "KVarN fragment tiles are 16 tokens x 16 channels");
 
-    const int tid = threadIdx.y*warp_size + threadIdx.x;
-    const char * payload = rec + (is_V ? kv.v_payload : 0);
+    const int lane = threadIdx.x;
+    const int wg   = threadIdx.y;
+    const int s0   = t0/16; // first strip of the record covered by this tile
+    const uint32_t * payload = (const uint32_t *) (rec + (is_V ? kv.v_payload : 0));
 
-    for (int linear = tid; linear < nbatch_fa*chunks_per_row; linear += nthreads) {
-        const int row   = linear / chunks_per_row;
-        const int chunk = linear % chunks_per_row;
-        const int col   = chunk*16; // first half2 column of this chunk
-
-        if (oob_check && row >= i_sup) {
+    for (int c = wg; c < ntiles_c; c += nwarps) {
+        if constexpr (!is_V) {
+            // Kscale/Kzero: class lane%4, 4 halves per channel tile = the 2 half2 columns of this lane
+            half2 ks[2], kz[2];
+            const int moff = 2*((lane & 3)*(D/4) + c*4);
+            const uint2 us = __ldg((const uint2 *) (rec + kv.k_scale + moff));
+            const uint2 uz = __ldg((const uint2 *) (rec + kv.k_zero  + moff));
+            memcpy(ks, &us, 8);
+            memcpy(kz, &uz, 8);
 #pragma unroll
-            for (int w = 0; w < 4; ++w) {
-                turbo_store_u4<stride_tile, swz>(tile_KV, row, col + 4*w, uint4{});
-            }
-            continue;
-        }
-
-        const int t = t0 + row;
-        const uint4 packed = __ldg((const uint4 *) (payload + t*row_bytes + chunk*16));
-        const uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
-
-        // per-column metadata (16 half2 = 32 halves = 4 uint4) and the per-row broadcast pair
-        half2 colA[16]; // K: Kscale[d]   V: Vch[d]
-        half2 colB[16]; // K: Kzero[d]    V: unused
-        half2 rowA, rowB;
-        {
-            const int col_off = col*4; // bytes: 2 halves per half2 column
-            const uint4 * a = (const uint4 *) (rec + (is_V ? kv.v_ch : kv.k_scale) + col_off);
+            for (int s = 0; s < nstrips; ++s) {
+                const uint32_t w = __ldg(payload + ((s0 + s)*ntiles_c + c)*32 + lane);
+                half2 q[4];
+                fattn_kvarn_decode_word(w, q);
+                const int tt0 = s*16 + (lane >> 2);
+                const half2 tok0 = __half2half2(__ldg((const half *) (rec + kv.k_tok) + t0 + tt0));
+                const half2 tok1 = __half2half2(__ldg((const half *) (rec + kv.k_tok) + t0 + tt0 + 8));
 #pragma unroll
-            for (int u = 0; u < 4; ++u) {
-                const uint4 au = __ldg(a + u);
-                memcpy(colA + 4*u, &au, 16);
-            }
-            if constexpr (!is_V) {
-                const uint4 * b = (const uint4 *) (rec + kv.k_zero + col_off);
-#pragma unroll
-                for (int u = 0; u < 4; ++u) {
-                    const uint4 bu = __ldg(b + u);
-                    memcpy(colB + 4*u, &bu, 16);
-                }
-                const half tok = __ldg((const half *) (rec + kv.k_tok) + t);
-                rowA = __half2half2(tok);
-                rowB = rowA;
-            } else {
-                rowA = __half2half2(__ldg((const half *) (rec + kv.v_scale) + t));
-                rowB = __half2half2(__ldg((const half *) (rec + kv.v_zero)  + t));
-            }
-        }
-
-#pragma unroll
-        for (int w = 0; w < 4; ++w) {
-            half2 q[4];
-            fattn_kvarn_decode_word(words[w], q);
-            half2 out[4];
-#pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                const int c = 4*w + j;
-                if constexpr (!is_V) {
-                    out[j] = __hmul2(__hfma2(q[j], colA[c], colB[c]), rowA);
-                } else {
-                    out[j] = __hmul2(__hfma2(q[j], rowA, rowB), colA[c]);
+                for (int l = 0; l < 4; ++l) {
+                    const int row = tt0 + (l & 1)*8;
+                    const int col = c*8 + (l >> 1)*4 + (lane & 3);
+                    half2 v = __hmul2(__hfma2(q[l], ks[l >> 1], kz[l >> 1]), (l & 1) ? tok1 : tok0);
+                    if (oob_check && row >= i_sup) {
+                        v = make_half2(0.0f, 0.0f);
+                    }
+                    turbo_store_h2<stride_tile, swz>(tile_KV, row, col, v);
                 }
             }
-            uint4 v;
-            memcpy(&v, out, 16);
-            turbo_store_u4<stride_tile, swz>(tile_KV, row, col + 4*w, v);
+        } else {
+            // Vch: class lane/4, 2 halves per channel tile = channels 16c + lane/4 and +8
+            half2 vch;
+            {
+                const uint32_t u = __ldg((const uint32_t *) (rec + kv.v_ch + 2*((lane >> 2)*(D/8) + c*2)));
+                memcpy(&vch, &u, 4);
+            }
+            const half2 vch0 = __low2half2(vch), vch1 = __high2half2(vch);
+            const int d0 = c*16 + (lane >> 2);   // channel of pairs l = 0, 2; l = 1, 3 use d0 + 8
+#pragma unroll
+            for (int s = 0; s < nstrips; ++s) {
+                const uint32_t w = __ldg(payload + ((s0 + s)*ntiles_c + c)*32 + lane);
+                half2 q[4];
+                fattn_kvarn_decode_word(w, q);
+                // token pairs p = lane%4 (l < 2) and lane%4 + 4 (l >= 2): tokens 2p, 2p+1 of the strip
+                const int tp0 = s*16 + 2*(lane & 3);
+                half2 vs[2], vz[2];
+                {
+                    const uint32_t a0 = __ldg((const uint32_t *) (rec + kv.v_scale + 2*(t0 + tp0)));
+                    const uint32_t a1 = __ldg((const uint32_t *) (rec + kv.v_scale + 2*(t0 + tp0 + 8)));
+                    const uint32_t b0 = __ldg((const uint32_t *) (rec + kv.v_zero  + 2*(t0 + tp0)));
+                    const uint32_t b1 = __ldg((const uint32_t *) (rec + kv.v_zero  + 2*(t0 + tp0 + 8)));
+                    memcpy(vs + 0, &a0, 4); memcpy(vs + 1, &a1, 4);
+                    memcpy(vz + 0, &b0, 4); memcpy(vz + 1, &b1, 4);
+                }
+#pragma unroll
+                for (int l = 0; l < 4; ++l) {
+                    const half2 v   = __hmul2(__hfma2(q[l], vs[l >> 1], vz[l >> 1]), (l & 1) ? vch1 : vch0);
+                    const int   d   = d0 + (l & 1)*8;
+                    const int   row = tp0 + (l >> 1)*8;
+                    const half  v0  = (oob_check && row     >= i_sup) ? __float2half(0.0f) : __low2half(v);
+                    const half  v1  = (oob_check && row + 1 >= i_sup) ? __float2half(0.0f) : __high2half(v);
+                    half * h0;
+                    half * h1;
+                    if constexpr (swz) {
+                        h0 = (half *) ((char *) tile_KV + ggml_cuda_fattn_smem_swizzle::bytes_rc<stride_tile>(row,     d/2)) + (d & 1);
+                        h1 = (half *) ((char *) tile_KV + ggml_cuda_fattn_smem_swizzle::bytes_rc<stride_tile>(row + 1, d/2)) + (d & 1);
+                    } else {
+                        h0 = (half *) (tile_KV + row*stride_tile + d/2) + (d & 1);
+                        h1 = (half *) (tile_KV + (row + 1)*stride_tile + d/2) + (d & 1);
+                    }
+                    *h0 = v0;
+                    *h1 = v1;
+                }
+            }
         }
     }
 }

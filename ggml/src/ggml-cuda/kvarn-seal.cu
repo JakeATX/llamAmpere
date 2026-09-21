@@ -87,12 +87,21 @@ static __device__ __forceinline__ void kvarn_std_pass_n(const half * tile, float
     }
 }
 
-static __device__ __forceinline__ int kvarn_phys_slot(const int idx, const int bits) {
-    if (bits != 4) {
-        return idx;
+// inverse of ggml_kvarn::code_bit for 4-bit fragment order: (word, nibble) -> (token, channel) of a G x D tile
+static __device__ __forceinline__ void kvarn_frag_pos(const int word, const int nib, const bool is_V, const int D,
+                                                      int & t, int & d) {
+    const int lane = word & 31;
+    const int tile = (word >> 5) % (D/16);
+    const int s    = (word >> 5) / (D/16);
+    const int l = nib & 3, e = nib >> 2;
+    // A-fragment (tile<16,8,half2>) register l of a lane: row (l%2)*8 + lane/4, half2 column (l/2)*4 + lane%4
+    const int row = (l & 1)*8 + (lane >> 2);
+    const int col = 2*((l >> 1)*4 + (lane & 3)) + e;
+    if (!is_V) {
+        t = s*16 + row; d = tile*16 + col;
+    } else {
+        d = tile*16 + row; t = s*16 + col;
     }
-    const int word = idx >> 3, k = idx & 7;
-    return word*8 + ((k & 1) ? 4 + (k >> 1) : (k >> 1));
 }
 
 static __device__ __forceinline__ uint32_t kvarn_rtn(const float x, const float lo, const float step, const float qmaxf) {
@@ -189,44 +198,49 @@ static __global__ void k_kvarn_seal(const char * __restrict__ ksrc, const char *
         if (half_ == 0) {
             q_lo[r]   = lo;
             q_step[r] = step;
-            ((half *) (out + o_scale))[r] = __float2half_rn(__fmul_rn(s_row[r], step));
-            ((half *) (out + o_zero))[r]  = __float2half_rn(__fmul_rn(s_row[r], lo));
+            // K rows are channels: Kscale/Kzero are stored in fragment order; V rows are tokens (natural order)
+            const int ri = is_V ? r : ggml_kvarn::k_ch_idx(r, D, G, bits);
+            ((half *) (out + o_scale))[ri] = __float2half_rn(__fmul_rn(s_row[r], step));
+            ((half *) (out + o_zero))[ri]  = __float2half_rn(__fmul_rn(s_row[r], lo));
         }
     }
     for (int c = tid; c < C; c += KVARN_SEAL_THREADS) {
-        ((half *) (out + o_col))[c] = __float2half_rn(s_col[c]);
+        // K columns are tokens (Ktok, natural order); V columns are channels (Vch, fragment order)
+        const int ci = is_V ? ggml_kvarn::v_ch_idx(c, D, G, bits) : c;
+        ((half *) (out + o_col))[ci] = __float2half_rn(s_col[c]);
     }
     __syncthreads();
 
-    // phase B: payload rows are tokens; value i of token t is (r, c) = (i, t) for K and (t, i) for V.
-    // 2 threads per token row, each packs D/2 values = D*bits/16 bytes (byte aligned for D >= 32).
-    for (int task = tid; task < 2*G; task += KVARN_SEAL_THREADS) {
-        const int t = task >> 1, half_ = task & 1;
-        const int i0 = half_*(D/2);
-        uint8_t * dst = out + payload + (size_t) t*row_bytes + (size_t) half_*(row_bytes/2);
-        if (bits == 4) {
-            // 8 values per 32-bit word, interleaved slots (values 2k -> nibble k, 2k+1 -> nibble k+4)
-            uint32_t * dst32 = (uint32_t *) dst;
-            for (int w = 0; w < D/16; ++w) {
-                uint32_t word = 0;
+    // phase B: 4-bit payloads in fragment order (ggml_kvarn::code_bit), one 32-bit word = 8 codes per task;
+    // other widths as a token-major bit stream, 2 threads per token row.
+    if (ggml_kvarn::frag_order(bits, D, G)) {
+        uint32_t * dst32 = (uint32_t *) (out + payload);
+        const int n_words = G*D/8;
+        for (int w = tid; w < n_words; w += KVARN_SEAL_THREADS) {
+            uint32_t word = 0;
 #pragma unroll
-                for (int k = 0; k < 8; ++k) {
-                    const int i = i0 + w*8 + k;
-                    const int r = is_V ? t : i, c = is_V ? i : t;
-                    const uint32_t q = kvarn_rtn(kvarn_cur(tile, s_row, s_col, r, c, sr, sc), q_lo[r], q_step[r], qmaxf);
-                    word |= q << (4*kvarn_phys_slot(k, 4));
-                }
-                dst32[w] = word;
+            for (int nib = 0; nib < 8; ++nib) {
+                int t, d;
+                kvarn_frag_pos(w, nib, is_V, D, t, d);
+                const int r = is_V ? t : d, c = is_V ? d : t;
+                const uint32_t q = kvarn_rtn(kvarn_cur(tile, s_row, s_col, r, c, sr, sc), q_lo[r], q_step[r], qmaxf);
+                word |= q << (4*nib);
             }
-        } else {
-            uint8_t buf[KVARN_SEAL_MAX_DIM/2]; // <= D/2 bytes at 8 bits
+            dst32[w] = word;
+        }
+    } else {
+        for (int task = tid; task < 2*G; task += KVARN_SEAL_THREADS) {
+            const int t = task >> 1, half_ = task & 1;
+            const int i0 = half_*(D/2);
+            uint8_t * dst = out + payload + (size_t) t*row_bytes + (size_t) half_*(row_bytes/2);
+            uint8_t buf[KVARN_SEAL_MAX_DIM]; // <= D/2 bytes at 8 bits
             const int nbytes = (D/2)*bits/8;
             for (int b = 0; b < nbytes; ++b) buf[b] = 0;
             for (int j = 0; j < D/2; ++j) {
                 const int i = i0 + j;
                 const int r = is_V ? t : i, c = is_V ? i : t;
                 const uint32_t q = kvarn_rtn(kvarn_cur(tile, s_row, s_col, r, c, sr, sc), q_lo[r], q_step[r], qmaxf);
-                const uint32_t bit = (uint32_t) kvarn_phys_slot(j, bits)*bits;
+                const uint32_t bit = (uint32_t) j*bits;
                 const uint32_t byte = bit >> 3, shift = bit & 7;
                 const uint32_t wv = (q & qmax) << shift;
                 buf[byte] |= (uint8_t) wv;

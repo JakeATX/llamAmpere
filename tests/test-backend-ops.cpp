@@ -12361,6 +12361,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext_kvarn(n_q, 24, 4));
     }
     test_cases.emplace_back(new test_flash_attn_ext_kvarn(3, 8, 4, 5, 1000)); // GQA 2, 5 records, ring nearly full
+    // fragment-direct decode kernel: MTP widths, long body (many 128-position units per warp, several blocks per head)
+    for (int64_t n_q : {3, 5, 6, 7}) {
+        test_cases.emplace_back(new test_flash_attn_ext_kvarn(n_q, 24, 4));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_kvarn(1, 24, 4, 24,  700)); // GQA 6, 24 records
+    test_cases.emplace_back(new test_flash_attn_ext_kvarn(4, 24, 4, 24, 1100)); // GQA 6, 24 records, 4 rows
+    test_cases.emplace_back(new test_flash_attn_ext_kvarn(1, 16, 4,  2,  200)); // GQA 4
+    test_cases.emplace_back(new test_flash_attn_ext_kvarn(2,  4, 4,  2,  200)); // GQA 1
     // prefill ubatches: query rows tiled in ncols1 blocks (stream-k fixup across jt), all GQA classes
     test_cases.emplace_back(new test_flash_attn_ext_kvarn(  64, 24, 4, 3,  300)); // GQA 6, (8,8) x 8 blocks
     test_cases.emplace_back(new test_flash_attn_ext_kvarn(1000, 24, 4, 3, 1100)); // GQA 6, ragged last block
@@ -12893,6 +12901,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     // Qwen3-VL-8B https://github.com/ggml-org/llama.cpp/issues/17012
     test_cases.emplace_back(new test_flash_attn_ext(72, 72, 16, {1, 1}, 5776, 5776, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+
+    // KVarN decode at production depth (Qwen3.8-27B: 24 heads, 4 KV heads, D 256): sink 128 + 792 records + 1024 ring
+    // = 102528 positions; n_q 1 (tg128), 4 and 5 (MTP verify rows). f16 rows of the same shape for the bandwidth reference.
+    for (int64_t n_q : {1, 4, 5}) {
+        test_cases.emplace_back(new test_flash_attn_ext_kvarn(n_q, 24, 4, 792, 1024));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 102528, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
 
     // Sparse flash attention (n_kv_max hint) decode across KV depths.
     // Shapes: 576/512 DeepSeek MLA, 512/512 DeepSeek-V4/GLM-5.2, 256/256 gqa12 Qwen QSA.

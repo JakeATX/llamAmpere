@@ -2580,7 +2580,9 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
     }
 
     if (kvarn.enabled()) {
-        GGML_ABORT("KVarN cache: session/slot state save is not supported (run llama-server with --cache-ram 0)");
+        // sealed records + ring/sink rows are not serialised yet; callers treat a 0-byte state as "not cacheable"
+        // (llama-bench re-runs the depth prefill, llama-server keeps no prompt cache: use --cache-ram 0)
+        throw std::runtime_error("KVarN cache: sequence state save is not supported yet");
     }
 
     GGML_UNUSED(flags);
@@ -2649,7 +2651,7 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
 
 void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
     if (kvarn.enabled()) {
-        GGML_ABORT("KVarN cache: session/slot state load is not supported");
+        throw std::runtime_error("KVarN cache: sequence state load is not supported yet");
     }
     state_read_sinfo(io, seq_id, flags, nullptr, nullptr);
 }
