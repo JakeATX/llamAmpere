@@ -11977,6 +11977,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TQ6_0, GGML_TYPE_TQ5_0));
         }
     }
+    // the same D=256 pairs in the KV-cache layout (heads interleaved per token: K/V row pitch = n_head_kv rows, so
+    // the tq5_0/tq6_0/turbo3/turbo4 rows of heads 1..3 are only 4-byte aligned and the staging paths take their
+    // non-contiguous branches, unlike the per-head-contiguous default layout above)
+    for (int64_t kv : {4096, 100352}) {
+        for (int nb : {1, 4, 5, 8}) {
+            for (auto kvp : std::initializer_list<std::pair<ggml_type, ggml_type>>{
+                    {GGML_TYPE_Q8_0,  GGML_TYPE_TURBO3_0}, {GGML_TYPE_Q8_0,  GGML_TYPE_Q8_0},    {GGML_TYPE_Q8_0,  GGML_TYPE_TURBO4_0},
+                    {GGML_TYPE_TQ5_0, GGML_TYPE_TURBO3_0}, {GGML_TYPE_TQ5_0, GGML_TYPE_TURBO4_0}, {GGML_TYPE_TQ5_0, GGML_TYPE_TQ5_0},
+                    {GGML_TYPE_TQ6_0, GGML_TYPE_TURBO3_0}, {GGML_TYPE_TQ6_0, GGML_TYPE_TURBO4_0}, {GGML_TYPE_TQ6_0, GGML_TYPE_TQ5_0}}) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, kvp.first, kvp.second, {0, 2, 1, 3}));
+            }
+        }
+    }
     // odd KV lengths so the fused q8_0/q8_0 path exercises its oob (unstaged) tail tiles too
     for (int64_t kv : {4103, 4127}) {
         for (int nb : {1, 4}) {
@@ -12652,6 +12665,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // both operands PolarQuant: tq5_0 K over tq5_0 V (quality step above turbo4 V) and tq6_0 K over tq5_0 V
     for (int nb : {1, 2, 4, 5, 8}) {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 100352, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TQ5_0, GGML_TYPE_TQ5_0));
+    }
+    // the decode pairs in the KV-cache layout (heads interleaved per token, permute {0,2,1,3}): this is the layout
+    // llama-server runs, and the one the compressed-tile staging paths must be timed in
+    for (int nb : {1, 2, 4, 5, 8}) {
+        for (auto kvp : std::initializer_list<std::pair<ggml_type, ggml_type>>{
+                {GGML_TYPE_Q8_0, GGML_TYPE_TURBO3_0}, {GGML_TYPE_Q8_0, GGML_TYPE_Q8_0}, {GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_0},
+                {GGML_TYPE_TQ5_0, GGML_TYPE_TURBO3_0}, {GGML_TYPE_TQ5_0, GGML_TYPE_TURBO4_0}, {GGML_TYPE_TQ5_0, GGML_TYPE_TQ5_0}}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 100352, nb, true, false, 0, 0, GGML_PREC_F32, kvp.first, kvp.second, {0, 2, 1, 3}));
+        }
     }
     for (int nb : {1, 2, 4, 5, 8}) {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 100352, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TQ6_0, GGML_TYPE_TQ5_0));
