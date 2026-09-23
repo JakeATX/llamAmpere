@@ -1826,6 +1826,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.kvarn_edge_bits_k = params.kvarn_edge_bits_k;
     cparams.kvarn_edge_bits_v = params.kvarn_edge_bits_v;
     cparams.kvarn_flush_chunk = params.kvarn_flush_chunk;
+    cparams.type_s = params.cache_type_s;
 
     if (params.moe_cache.mode_explicit) {
         switch (params.moe_cache.mode) {

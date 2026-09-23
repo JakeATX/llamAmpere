@@ -4548,6 +4548,11 @@ static bool ggml_cuda_should_fuse_rms_norm_mul_rope(const ggml_tensor * rms_norm
     return true;
 }
 
+// the recurrent cache types the gated_delta_net kernel can store to directly (--cache-type-s)
+static bool ggml_cuda_gdn_cache_type_ok(ggml_type type) {
+    return type == GGML_TYPE_F32 || type == GGML_TYPE_BF16 || type == GGML_TYPE_F16;
+}
+
 // match gated_delta_net + the strided cpy that scatters its state snapshots into the cache
 // (slot i -> rollback group i, slot 0 newest), so the kernel can write them and skip the cpy.
 static int ggml_cuda_try_gdn_cache_fusion(
@@ -4610,13 +4615,14 @@ static int ggml_cuda_try_gdn_cache_fusion(
             rows->ne[1] != 1 || rows->ne[2] != 1) {
             return 0;
         }
-        // the cache itself (set_rows is in place): F32 rows of exactly D
-        if (cpy->type != GGML_TYPE_F32 || cpy->data == nullptr || cpy->ne[0] != D ||
-            cpy->nb[0] != ggml_type_size(GGML_TYPE_F32) || cpy->nb[1] != (size_t) ggml_row_size(GGML_TYPE_F32, D) ||
+        // the cache itself (set_rows is in place): F32 (or 16-bit, --cache-type-s) rows of exactly D
+        if (!ggml_cuda_gdn_cache_type_ok(cpy->type) || cpy->data == nullptr || cpy->ne[0] != D ||
+            cpy->nb[0] != ggml_type_size(cpy->type) || cpy->nb[1] != (size_t) ggml_row_size(cpy->type, D) ||
             !ggml_is_contiguous(cpy)) {
             return 0;
         }
-        fused_state_cpy.data        = (float *) cpy->data;
+        fused_state_cpy.data        = cpy->data;
+        fused_state_cpy.type        = cpy->type;
         fused_state_cpy.slot_stride = 0;
         fused_state_cpy.slot_rows   = (const int32_t *) rows->data;
         return skip;
@@ -4634,14 +4640,16 @@ static int ggml_cuda_try_gdn_cache_fusion(
     // dst is the [D, n_seqs, n_written] cache view; require nb[1] == D (the per-seq stride the kernel
     // assumes). ggml_cpy pins src to the same element count.
     const std::array<int64_t, GGML_MAX_DIMS> expected_ne = { D, n_seqs, n_written, 1 };
-    if (dst->op != GGML_OP_VIEW || dst->type != GGML_TYPE_F32 || dst->data == nullptr ||
+    if (dst->op != GGML_OP_VIEW || !ggml_cuda_gdn_cache_type_ok(dst->type) || dst->data == nullptr ||
         !std::equal(expected_ne.begin(), expected_ne.end(), dst->ne) ||
-        dst->nb[0] != ggml_type_size(GGML_TYPE_F32) || dst->nb[1] != (size_t) ggml_row_size(GGML_TYPE_F32, D)) {
+        dst->nb[0] != ggml_type_size(dst->type) || dst->nb[1] != (size_t) ggml_row_size(dst->type, D) ||
+        dst->nb[2] % ggml_type_size(dst->type) != 0) {
         return 0;
     }
 
-    fused_state_cpy.data        = (float *) dst->data; // rollback group 0 (newest)
-    fused_state_cpy.slot_stride = K > 1 ? (int64_t) (dst->nb[2] / sizeof(float)) : 0;
+    fused_state_cpy.data        = dst->data; // rollback group 0 (newest)
+    fused_state_cpy.type        = dst->type;
+    fused_state_cpy.slot_stride = K > 1 ? (int64_t) (dst->nb[2] / ggml_type_size(dst->type)) : 0;
     fused_state_cpy.slot_rows   = nullptr;
     return skip;
 }
@@ -8977,12 +8985,13 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
         case GGML_OP_OPT_STEP_ADAMW:
         case GGML_OP_OPT_STEP_SGD:
-        case GGML_OP_FILL:
         case GGML_OP_CUMSUM:
         case GGML_OP_TRI:
         case GGML_OP_DIAG:
         case GGML_OP_SOLVE_TRI:
             return true;
+        case GGML_OP_FILL:
+            return op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16;
         case GGML_OP_LIGHTNING_INDEXER:
             return ggml_cuda_lightning_indexer_supported(dev_ctx->device, op);
 

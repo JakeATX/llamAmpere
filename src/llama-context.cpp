@@ -827,6 +827,7 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
             /*.kv_stream_stage_bytes =*/kv_stream_stage_bytes,
             /*.kv_stream_phase_arena =*/kv_stream_phase_arena.arena,
             /*.kv_stream_maximum_pool_bytes =*/kv_stream_arena_bytes,
+            /*.type_s                =*/params.type_s,
             /*.swa_full              =*/params.swa_full,
             /*.ctx_type              =*/cparams.ctx_type,
             /*.mem_other             =*/llama_get_memory(cparams.ctx_other),
@@ -5395,6 +5396,7 @@ llama_context_params llama_context_default_params() {
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
+        /*.type_s                      =*/ GGML_TYPE_F32,
         /*.moe_cache_mode              =*/ LLAMA_MOE_CACHE_MODE_UNSPECIFIED,
         /*.moe_cache_budget_mib        =*/ 0,
         /*.abort_callback              =*/ nullptr,
@@ -5464,6 +5466,11 @@ llama_context * llama_init_from_model(llama_model * model, llama_context_params 
         if (model->get_split_state_ud.n_devices == 1) {
             LLAMA_LOG_WARN("%s: SPLIT_MODE_TENSOR being used for a single device is not recommended\n", __func__);
         }
+    }
+
+    if (params.type_s != GGML_TYPE_F32 && params.type_s != GGML_TYPE_BF16 && params.type_s != GGML_TYPE_F16) {
+        LLAMA_LOG_ERROR("%s: recurrent state cache type %s is not supported (f32, bf16, f16)\n", __func__, ggml_type_name(params.type_s));
+        return nullptr;
     }
 
     if ((model->hparams.is_mla() || model->arch == LLM_ARCH_DEEPSEEK4) && params.type_k != params.type_v) {

@@ -712,6 +712,7 @@ struct common_params {
     uint32_t kvarn_edge_bits_k = 4;
     uint32_t kvarn_edge_bits_v = 4;
     uint32_t kvarn_flush_chunk = 0; // groups per decode step while an adaptive-tail flush drains (0 = one flush)
+    ggml_type cache_type_s = GGML_TYPE_F32; // recurrent (gated delta-net) state cache data type
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 

@@ -156,8 +156,10 @@ llama_memory_recurrent::llama_memory_recurrent(
         s_l[i] = s;
 
         if (gdn_replay) {
-            // one row per cell, n_rs_seq ingredient slots back to back (see the header)
-            ggml_tensor * ingr = ggml_new_tensor_2d(ctx, type_s, (int64_t) hparams.n_embd_s_ingredient() * n_rs_seq, mem_size);
+            // one row per cell, n_rs_seq ingredient slots back to back (see the header). Always F32,
+            // whatever type_s is: the replay reads the gathered ring with this tensor's element size
+            // (llm_build_delta_net_base::build_recurrent_attn), and k/v/g/beta are op inputs, not state.
+            ggml_tensor * ingr = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (int64_t) hparams.n_embd_s_ingredient() * n_rs_seq, mem_size);
             ggml_format_name(ingr, "cache_ingr_l%d", i);
             ingr_l[i] = ingr;
 

@@ -64,6 +64,9 @@ struct llama_memory_params {
     void *    kv_stream_phase_arena;
     uint64_t  kv_stream_maximum_pool_bytes;
 
+    // recurrent (gated delta-net) state cache; conv state and replay ingredients stay F32
+    ggml_type type_s;
+
     // use full-size SWA cache
     bool swa_full;
 

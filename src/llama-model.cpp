@@ -3163,6 +3163,29 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             cparams.gdn_replay,
                             nullptr);
                 } else if (llm_arch_is_hybrid(arch) && !mtp_on_hybrid_qwen && !mtp_on_hybrid_nemotron) {
+                    // --cache-type-s: a 16-bit recurrent state is stored by the gated delta-net writers
+                    // (llm_build_delta_net_base::build_recurrent_attn, kimi-linear's state cpy), which
+                    // convert on store, and read back as F32 through build_rs's get_rows. The other
+                    // recurrent ops (ssm_scan, rwkv_wkv*, lightning attention) keep an F32 state.
+                    ggml_type recr_type_s = GGML_TYPE_F32;
+                    if (params.type_s != GGML_TYPE_F32) {
+                        switch (arch) {
+                            case LLM_ARCH_QWEN3NEXT:
+                            case LLM_ARCH_QWEN35:
+                            case LLM_ARCH_QWEN35MOE:
+                            case LLM_ARCH_QWEN4EXP:
+                            case LLM_ARCH_BAILINGMOE3:
+                            case LLM_ARCH_KIMI_LINEAR:
+                            case LLM_ARCH_KIMI_K3:
+                                recr_type_s = params.type_s;
+                                break;
+                            default:
+                                LLAMA_LOG_WARN("%s: recurrent state type %s is not supported for %s, using f32\n",
+                                        __func__, ggml_type_name(params.type_s), llm_arch_name(arch));
+                                break;
+                        }
+                    }
+
                     // The main difference between hybrid architectures is the
                     // layer filters, so pick the right one here
                     llama_memory_hybrid::layer_filter_cb filter_attn = nullptr;
@@ -3218,7 +3241,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* attn_n_ubatch     */ cparams.n_ubatch,
                             /* attn_n_pad        */ 1,
                             /* recurrent_type_r  */ GGML_TYPE_F32,
-                            /* recurrent_type_s  */ GGML_TYPE_F32,
+                            /* recurrent_type_s  */ recr_type_s,
                             /* recurrent_rs_size */ std::max((uint32_t) 1, cparams.n_seq_max),
                             /* n_seq_max         */ cparams.n_seq_max,
                             /* n_rs_seq          */ cparams.n_rs_seq,
@@ -3242,7 +3265,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* attn_n_swa        */ hparams.n_swa,
                             /* attn_swa_type     */ hparams.swa_type,
                             /* recurrent_type_k  */ GGML_TYPE_F32,
-                            /* recurrent_type_v  */ GGML_TYPE_F32,
+                            /* recurrent_type_v  */ recr_type_s,
                             /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
                             /* n_seq_max         */ cparams.n_seq_max,
                             /* n_rs_seq          */ cparams.n_rs_seq,
@@ -3263,7 +3286,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* attn_n_swa        */ hparams.n_swa,
                             /* attn_swa_type     */ hparams.swa_type,
                             /* recurrent_type_k  */ GGML_TYPE_F32,
-                            /* recurrent_type_v  */ GGML_TYPE_F32,
+                            /* recurrent_type_v  */ recr_type_s,
                             /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
                             /* n_seq_max         */ cparams.n_seq_max,
                             /* n_rs_seq          */ cparams.n_rs_seq,

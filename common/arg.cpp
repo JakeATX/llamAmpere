@@ -2621,6 +2621,28 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
     add_opt(common_arg(
+        {"-cts", "--cache-type-s"}, "TYPE",
+        string_format(
+            "recurrent state cache data type for gated delta-net layers (Qwen3.5/3.6, Qwen3-Next, Qwen3.8-Flash-Next, Kimi Linear);\n"
+            "bf16 and f16 halve the state memory, the recurrence itself still runs in f32;\n"
+            "f16 keeps 3 more mantissa bits than bf16 but becomes inf/nan if a state value exceeds 65504\n"
+            "allowed values: f32, bf16, f16\n"
+            "(default: %s)",
+            ggml_type_name(params.cache_type_s)
+        ),
+        [](common_params & params, const std::string & value) {
+            if (value == "f32") {
+                params.cache_type_s = GGML_TYPE_F32;
+            } else if (value == "bf16") {
+                params.cache_type_s = GGML_TYPE_BF16;
+            } else if (value == "f16") {
+                params.cache_type_s = GGML_TYPE_F16;
+            } else {
+                throw std::runtime_error("Unsupported recurrent state cache type: " + value + " (f32, bf16, f16)");
+            }
+        }
+    ).set_env("LLAMA_ARG_CACHE_TYPE_S"));
+    add_opt(common_arg(
         {"--kvarn-staging-type"}, "TYPE",
         "KVarN tail (and sink) storage: tq6_0, q8_0 or f16 (default: tq6_0 with a separate f16 sink; q8_0 stores the sink in q8_0 too)",
         [](common_params & params, const std::string & value) {
