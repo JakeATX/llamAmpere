@@ -515,20 +515,22 @@ static void ggml_compute_forward_dup_from_q(
               ggml_tensor * dst) {
 
     const ggml_tensor * src0 = dst->src[0];
-    const ggml_tensor * src1 = dst->src[1];
 
-    GGML_TENSOR_BINARY_OP_LOCALS
+    // address the destination through dst itself, not src[1]: for a cpy node src[1] has dst's shape
+    // and strides, but ggml_cast's src[1] self-reference comes back NULL from ggml_backend_graph_copy
+    // (a node's copy is registered only after its sources are duplicated)
+    GGML_TENSOR_UNARY_OP_LOCALS
 
     const ggml_type type = src0->type;
     ggml_to_float_t const dequantize_row_q = ggml_get_type_traits(type)->to_float;
 
     size_t qk = ggml_blck_size(type);
-    const int64_t nr = ggml_nelements(src1) / qk;
+    const int64_t nr = ggml_nelements(dst) / qk;
 
     // destination must be contiguous in the first dimension
-    GGML_ASSERT(nb10 == ggml_type_size(dst->type));
+    GGML_ASSERT(nb0 == ggml_type_size(dst->type));
     // must either have first dimension large enough to hold a row, or fully contiguous
-    GGML_ASSERT((ne10 % qk) == 0 || ggml_is_contiguous(dst));
+    GGML_ASSERT((ne0 % qk) == 0 || ggml_is_contiguous(dst));
 
     const int ith = params->ith;
     const int nth = params->nth;
@@ -549,11 +551,11 @@ static void ggml_compute_forward_dup_from_q(
         const int64_t i00 = i - i03*ne00*ne01*ne02 - i02*ne01*ne00 - i01*ne00;
         const int64_t x_offset = (i00/qk)*nb00 + i01*nb01 + i02*nb02 + i03 * nb03;
 
-        const int64_t i13 = i/(ne10 * ne11 * ne12);
-        const int64_t i12 = (i - i13*ne10*ne11*ne12) / (ne10*ne11);
-        const int64_t i11 = (i - i13*ne10*ne11*ne12 - i12*ne10*ne11) / ne10;
-        const int64_t i10 = i - i13*ne10*ne11*ne12 - i12*ne10*ne11 - i11*ne10;
-        const int64_t dst_offset = i10*nb10 + i11*nb11 + i12*nb12 + i13*nb13;
+        const int64_t i13 = i/(ne0 * ne1 * ne2);
+        const int64_t i12 = (i - i13*ne0*ne1*ne2) / (ne0*ne1);
+        const int64_t i11 = (i - i13*ne0*ne1*ne2 - i12*ne0*ne1) / ne0;
+        const int64_t i10 = i - i13*ne0*ne1*ne2 - i12*ne0*ne1 - i11*ne0;
+        const int64_t dst_offset = i10*nb0 + i11*nb1 + i12*nb2 + i13*nb3;
 
         dequantize_row_q(
                 (const void *) ((char *) src0->data + x_offset),
