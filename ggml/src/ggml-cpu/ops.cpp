@@ -329,6 +329,31 @@ static void ggml_compute_forward_dup_to_q(
                 id += rs * (ne01 - ir1);
             }
         }
+    } else if (ggml_are_same_shape(src0, dst) &&
+            nb0 == ggml_type_size(dst->type) && ne00 % ggml_blck_size(dst->type) == 0 &&
+            ggml_get_type_traits_cpu(dst->type)->from_float) {
+        // same shape, strided destination rows (e.g. a view of a quantized recurrent state cache
+        // with a plane stride): quantize row by row into each destination row
+        ggml_from_float_t const quantize_row_q = ggml_get_type_traits_cpu(dst->type)->from_float;
+        float * src0_f32 = (float *) params->wdata + (ne00 + CACHE_LINE_SIZE_F32) * ith;
+
+        const int64_t nr_all = ne01*ne02*ne03;
+        const int64_t dr_all = (nr_all + nth - 1) / nth;
+        const int64_t jr0    = dr_all * ith;
+        const int64_t jr1    = MIN(jr0 + dr_all, nr_all);
+
+        for (int64_t ir = jr0; ir < jr1; ++ir) {
+            const int64_t i03 = ir/(ne02*ne01);
+            const int64_t i02 = (ir - i03*ne02*ne01)/ne01;
+            const int64_t i01 = ir - i03*ne02*ne01 - i02*ne01;
+
+            const char * src0_row = (const char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03;
+            for (int64_t i00 = 0; i00 < ne00; i00++) {
+                src0_f32[i00] = type_conversion_table<src_t>::to_f32(*(const src_t *) (src0_row + i00*nb00));
+            }
+
+            quantize_row_q(src0_f32, (char *) dst->data + i01*nb1 + i02*nb2 + i03*nb3, ne00);
+        }
     } else {
         // printf("%s %s\n", ggml_type_name(src0->type), ggml_type_name(dst->type));
         GGML_ABORT("not implemented");
@@ -2365,6 +2390,37 @@ static void ggml_compute_forward_fill_bf16(const ggml_compute_params * params, g
     }
 }
 
+// quantized fill: every block holds the same values, so quantize one block and replicate its bytes
+static void ggml_compute_forward_fill_quant(const ggml_compute_params * params, ggml_tensor * dst) {
+    const float c = ggml_get_op_params_f32(dst, 0);
+
+    GGML_TENSOR_LOCALS(int64_t, ne, dst, ne);
+    GGML_TENSOR_LOCALS(size_t,  nb, dst, nb);
+
+    const int64_t blck = ggml_blck_size(dst->type);
+    const size_t  bsz  = ggml_type_size(dst->type);
+    GGML_ASSERT(ne0 % blck == 0 && blck <= 256 && bsz <= 512);
+
+    float   vals[256];
+    uint8_t block[512];
+    std::fill(vals, vals + blck, c);
+    ggml_get_type_traits_cpu(dst->type)->from_float(vals, block, blck);
+
+    const auto [ir0, ir1] = get_thread_range(params, dst);
+
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t i03 = ir/(ne2*ne1);
+        const int64_t i02 = (ir - i03*ne2*ne1)/ne1;
+        const int64_t i01 = (ir - i03*ne2*ne1 - i02*ne1);
+
+        char * dst_ptr = (char *) dst->data + i03*nb3 + i02*nb2 + i01*nb1;
+
+        for (int64_t ib = 0; ib < ne0/blck; ++ib) {
+            memcpy(dst_ptr + ib*bsz, block, bsz);
+        }
+    }
+}
+
 void ggml_compute_forward_fill(const ggml_compute_params * params, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
 
@@ -2380,6 +2436,10 @@ void ggml_compute_forward_fill(const ggml_compute_params * params, ggml_tensor *
         case GGML_TYPE_BF16:
             {
                 ggml_compute_forward_fill_bf16(params, dst);
+            } break;
+        case GGML_TYPE_Q8_0:
+            {
+                ggml_compute_forward_fill_quant(params, dst);
             } break;
         default:
             {

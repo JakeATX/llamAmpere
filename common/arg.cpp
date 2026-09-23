@@ -2624,9 +2624,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"-cts", "--cache-type-s"}, "TYPE",
         string_format(
             "recurrent state cache data type for gated delta-net layers (Qwen3.5/3.6, Qwen3-Next, Qwen3.8-Flash-Next, Kimi Linear);\n"
-            "bf16 and f16 halve the state memory, the recurrence itself still runs in f32;\n"
+            "bf16 and f16 halve the state memory, q8_0 cuts it to 8.5 bits per value (0.27x);\n"
+            "the recurrence itself still runs in f32, only the stored state is rounded;\n"
             "f16 keeps 3 more mantissa bits than bf16 but becomes inf/nan if a state value exceeds 65504\n"
-            "allowed values: f32, bf16, f16\n"
+            "allowed values: f32, bf16, f16, q8_0\n"
             "(default: %s)",
             ggml_type_name(params.cache_type_s)
         ),
@@ -2637,8 +2638,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 params.cache_type_s = GGML_TYPE_BF16;
             } else if (value == "f16") {
                 params.cache_type_s = GGML_TYPE_F16;
+            } else if (value == "q8_0") {
+                params.cache_type_s = GGML_TYPE_Q8_0;
             } else {
-                throw std::runtime_error("Unsupported recurrent state cache type: " + value + " (f32, bf16, f16)");
+                throw std::runtime_error("Unsupported recurrent state cache type: " + value + " (f32, bf16, f16, q8_0)");
             }
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_S"));

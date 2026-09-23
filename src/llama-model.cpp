@@ -3163,7 +3163,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             cparams.gdn_replay,
                             nullptr);
                 } else if (llm_arch_is_hybrid(arch) && !mtp_on_hybrid_qwen && !mtp_on_hybrid_nemotron) {
-                    // --cache-type-s: a 16-bit recurrent state is stored by the gated delta-net writers
+                    // --cache-type-s: a bf16/f16/q8_0 recurrent state is stored by the gated delta-net writers
                     // (llm_build_delta_net_base::build_recurrent_attn, kimi-linear's state cpy), which
                     // convert on store, and read back as F32 through build_rs's get_rows. The other
                     // recurrent ops (ssm_scan, rwkv_wkv*, lightning attention) keep an F32 state.

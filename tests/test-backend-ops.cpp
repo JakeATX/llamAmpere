@@ -5424,7 +5424,7 @@ struct test_gated_delta_net_cache_fusion : public test_case {
     const int64_t n_seq_tokens;
     const int64_t n_seqs;
     const int64_t K; // snapshot slot count (>1)
-    const ggml_type cache_type; // recurrent cache: F32, or BF16/F16 (--cache-type-s)
+    const ggml_type cache_type; // recurrent cache: F32, or BF16/F16/Q8_0 (--cache-type-s)
     const bool ring;            // set_rows into scattered cache rows ([TAG_RECURRENT_ROLLBACK_RING]) instead of a strided cpy
 
     ggml_tensor * cpy_node = nullptr;
@@ -13857,6 +13857,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_fill(0.0f, GGML_TYPE_BF16, { 303, 207, 11, 3 }));
     test_cases.emplace_back(new test_fill(-2.5f, GGML_TYPE_BF16));
     test_cases.emplace_back(new test_fill(1.5f, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_fill(0.0f, GGML_TYPE_Q8_0, { 64, 10, 4, 3 }));
+    test_cases.emplace_back(new test_fill(-2.5f, GGML_TYPE_Q8_0, { 256, 7, 2, 1 }));
     test_cases.emplace_back(new test_fill(2.0f, GGML_TYPE_F32, { 303, 207, 11, 3 }));
     test_cases.emplace_back(new test_fill(-152.0f, GGML_TYPE_F32, { 800, 600, 4, 4 }));
     test_cases.emplace_back(new test_fill(3.5f, GGML_TYPE_F32, { 2048, 512, 2, 2 }));
@@ -14580,8 +14582,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   4, 1, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 8, 32,   4, 2, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   8, 1, 4));
-    // --cache-type-s: the fused kernel stores 16-bit states directly; ring = set_rows form
-    for (ggml_type cache_type : { GGML_TYPE_F32, GGML_TYPE_BF16, GGML_TYPE_F16 }) {
+    // --cache-type-s: the fused kernel stores 16-bit/Q8_0 states directly; ring = set_rows form
+    for (ggml_type cache_type : { GGML_TYPE_F32, GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
         if (cache_type != GGML_TYPE_F32) {
             test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   4, 1, 4, cache_type));
             test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 8, 32,   4, 2, 4, cache_type));

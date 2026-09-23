@@ -4098,7 +4098,7 @@ ggml_tensor * llm_graph_context::build_rs(
     if (s->type == GGML_TYPE_F32) {
         ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0, state_zero, 0));
     } else {
-        // 16-bit recurrent state (--cache-type-s): scale is F32-only on the backends
+        // bf16/f16/q8_0 recurrent state (--cache-type-s): scale is F32-only on the backends
         ggml_build_forward_expand(gf, ggml_fill_inplace(ctx0, state_zero, 0.0f));
     }
 

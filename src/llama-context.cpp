@@ -4432,6 +4432,12 @@ class llama_io_read_file : public llama_io_read_i {
     std::vector<uint8_t> temp_buffer;
 };
 
+// element count of a byte range of t: block types (q8_0 KV/state caches) hold blck_size elements per type_size bytes
+static int64_t llama_io_n_elements(const ggml_tensor * t, size_t size) {
+    GGML_ASSERT(size % ggml_type_size(t->type) == 0);
+    return (int64_t) (size / ggml_type_size(t->type)) * ggml_blck_size(t->type);
+}
+
 class llama_io_write_device : public llama_io_write_i {
   public:
     llama_io_write_device(uint8_t * p, size_t len, llama_memory_buffers & mbufs) :
@@ -4465,7 +4471,7 @@ class llama_io_write_device : public llama_io_write_i {
         for (const auto & winfo : winfos) {
             auto * buft = ggml_backend_buffer_get_type(winfo.tensor->buffer);
 
-            const int64_t n = winfo.size / ggml_element_size(winfo.tensor);
+            const int64_t n = llama_io_n_elements(winfo.tensor, winfo.size);
 
             auto & mbuf = mbufs_new[buft];
 
@@ -4598,7 +4604,7 @@ class llama_io_read_device : public llama_io_read_i {
         for (const auto & rinfo : rinfos) {
             auto * buft = ggml_backend_buffer_get_type(rinfo.tensor->buffer);
 
-            const int64_t n = rinfo.size / ggml_element_size(rinfo.tensor);
+            const int64_t n = llama_io_n_elements(rinfo.tensor, rinfo.size);
 
             auto & mbuf = mbufs_new[buft];
 
@@ -4665,8 +4671,7 @@ class llama_io_read_device : public llama_io_read_i {
 
                 const size_t n_copy = std::min(src_size - src_off, dst_size - dst_off);
 
-                const size_t   el   = ggml_element_size(src_t);
-                const int64_t n_el = (int64_t) (n_copy / el);
+                const int64_t n_el = llama_io_n_elements(src_t, n_copy);
 
                 auto * src_v = ggml_view_1d(ctx_scratch, src_t, n_el, src_off);
                 ggml_backend_view_init(src_v);
@@ -5468,8 +5473,9 @@ llama_context * llama_init_from_model(llama_model * model, llama_context_params 
         }
     }
 
-    if (params.type_s != GGML_TYPE_F32 && params.type_s != GGML_TYPE_BF16 && params.type_s != GGML_TYPE_F16) {
-        LLAMA_LOG_ERROR("%s: recurrent state cache type %s is not supported (f32, bf16, f16)\n", __func__, ggml_type_name(params.type_s));
+    if (params.type_s != GGML_TYPE_F32 && params.type_s != GGML_TYPE_BF16 && params.type_s != GGML_TYPE_F16 &&
+        params.type_s != GGML_TYPE_Q8_0) {
+        LLAMA_LOG_ERROR("%s: recurrent state cache type %s is not supported (f32, bf16, f16, q8_0)\n", __func__, ggml_type_name(params.type_s));
         return nullptr;
     }
 
