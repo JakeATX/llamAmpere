@@ -191,6 +191,30 @@ llama_kv_cache::llama_kv_cache(
     };
     std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
 
+    // The cache is written with SET_ROWS on the device that holds it; a backend without a
+    // SET_ROWS kernel for the type (e.g. tq5_0/tq6_0 on Metal, Vulkan or SYCL) would otherwise
+    // abort later during graph scheduling.
+    auto check_set_rows_support = [](ggml_backend_dev_t dev, ggml_type type, int64_t ne0, int64_t ne1, const char * kv) {
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            return;
+        }
+        ggml_init_params params = {
+            /*.mem_size   =*/ 4*ggml_tensor_overhead(),
+            /*.mem_buffer =*/ NULL,
+            /*.no_alloc   =*/ true,
+        };
+        ggml_context_ptr ctx { ggml_init(params) };
+        ggml_tensor * dst = ggml_new_tensor_2d(ctx.get(), type, ne0, ne1);
+        ggml_tensor * src = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, ne0, 1);
+        ggml_tensor * idx = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I64, 1);
+        ggml_tensor * op  = ggml_set_rows(ctx.get(), dst, src, idx);
+        if (!ggml_backend_dev_supports_op(dev, op)) {
+            throw std::runtime_error(format("%s cache type %s is not supported on device %s (no SET_ROWS kernel for it); "
+                                            "use a different cache type or keep the KV cache in host memory (-nkvo)",
+                                            kv, ggml_type_name(type), ggml_backend_dev_name(dev)));
+        }
+    };
+
     // create a context for each buffer type
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
         auto it = ctx_map.find(buft);
@@ -422,6 +446,16 @@ llama_kv_cache::llama_kv_cache(
             if (il == 0) {
                 LLAMA_LOG_INFO("%s: turbo zero-padding V head_dim %u -> %u (cache %u -> %u)\n",
                                __func__, n_embd_head_v, padded_head_v, n_embd_v_gqa, n_embd_v_gqa_eff);
+            }
+        }
+
+        if (offload) {
+            ggml_backend_dev_t dev = model.dev_layer(il);
+            if (has_k) {
+                check_set_rows_support(dev, layer_type_k, n_embd_k_gqa_eff, kv_size, "K");
+            }
+            if (has_v) {
+                check_set_rows_support(dev, layer_type_v, n_embd_v_gqa_eff, kv_size, "V");
             }
         }
 

@@ -429,20 +429,6 @@ static __device__ __forceinline__ uint8_t tq6_nearest_centroid(float val) {
     return (uint8_t) lo;
 }
 
-// ---- Per-block quantize for tq6 (128 elements, expects already-rotated input) ----
-
-static __device__ void quantize_f32_tq6_0_block(const float * __restrict__ src,
-                                                block_tq6_0 * __restrict__ dst) {
-    for (int j = 0; j < QK_TQ6 / 2; j++) dst->qs[j] = 0;
-    for (int j = 0; j < QK_TQ6 / 4; j++) dst->qh[j] = 0;
-
-    for (int j = 0; j < QK_TQ6; j++) {
-        uint8_t idx = tq6_nearest_centroid(src[j]);
-        dst->qs[j / 2] |= ( idx       & 0xF) << ((j % 2) * 4);
-        dst->qh[j / 4] |= ((idx >> 4) & 0x3) << ((j % 4) * 2);
-    }
-}
-
 // ---- Inline dequant helper: extract one float from tq6 block ----
 
 static __device__ __forceinline__ float tq6_dequant_element(
@@ -501,20 +487,6 @@ static __device__ __forceinline__ uint8_t tq5_code_to_mag(uint8_t idx) { return 
 static __device__ __forceinline__ uint8_t tq5_code_to_neg(uint8_t idx) { return idx < 16; }
 static __device__ __forceinline__ uint8_t tq5_sm_to_code(uint8_t mag, uint8_t neg) {
     return (uint8_t) ((mag ^ (neg * 0xF)) | ((neg ^ 1) << 4));   // neg ? 15-m : 16+m
-}
-
-// ---- Per-block quantize for tq5 (128 elements, expects already-rotated input) ----
-
-static __device__ void quantize_f32_tq5_0_block(const float * __restrict__ src,
-                                                block_tq5_0 * __restrict__ dst) {
-    for (int j = 0; j < QK_TQ5 / 2; j++) dst->qs[j] = 0;
-    for (int j = 0; j < QK_TQ5 / 8; j++) dst->qh[j] = 0;
-
-    for (int j = 0; j < QK_TQ5; j++) {
-        const uint8_t idx = tq5_nearest_centroid(src[j]);
-        dst->qs[j / 2] |= tq5_code_to_mag(idx) << ((j % 2) * 4);
-        dst->qh[j / 8] |= tq5_code_to_neg(idx) << (j % 8);
-    }
 }
 
 // ---- Inline dequant helper: extract one float from tq5 block ----

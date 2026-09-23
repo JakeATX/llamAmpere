@@ -386,10 +386,6 @@ static_assert(QK_TURBO4 == 128, "turbo4 kernels assume QK_TURBO4 == 128");
 // turbo4 nibble readers and tile loaders still work. Dense 6-bit would put element boundaries at
 // bit 6/12/18 and break the half2-pair extraction that the KQ dot and tile loaders need.
 #define QK_TQ6 128
-#define QK_TQ6_GROUP 128  // rotation group size = head_dim
-// Derived: FA template nl parameters (auto-scale with block size)
-#define NL_TQ6     (QK_TQ6 / 16)   // non-vec FA iterations per block
-#define NL_TQ6_VEC (QK_TQ6 / 4)    // vec FA iterations per block
 typedef struct {
     ggml_half  norm;                //  2 bytes: corrected L2 norm, identical semantics to turbo4
     uint8_t    qs[QK_TQ6 / 2];      // 64 bytes: low 4 bits of each 6-bit code (nibble packed)
@@ -404,9 +400,6 @@ static_assert(QK_TQ6 == 128, "tq6 kernels assume QK_TQ6 == 128");
 // (|value| = c[16+m] * norm, nibble packed) and qh[] its sign bit (1 = negative, 8 per byte, bit i%8),
 // so a decoder needs only a 16-entry magnitude table and a sign flip. Centroid code = neg ? 15-m : 16+m.
 #define QK_TQ5 128
-#define QK_TQ5_GROUP 128  // rotation group size = head_dim
-#define NL_TQ5     (QK_TQ5 / 16)   // non-vec FA iterations per block
-#define NL_TQ5_VEC (QK_TQ5 / 4)    // vec FA iterations per block
 typedef struct {
     ggml_half  norm;                //  2 bytes: corrected L2 norm, identical semantics to tq6
     uint8_t    qs[QK_TQ5 / 2];      // 64 bytes: 4-bit magnitude index of each value (nibble packed)

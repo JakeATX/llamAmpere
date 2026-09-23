@@ -1504,10 +1504,24 @@ static __global__ void k_set_rows_tq5(
         blk->qs[j / 2] = my_nibble | (partner_nibble << 4);
     }
 
+#if defined(GGML_USE_HIP)
+    // wave64: __ballot_sync truncates the 64-bit mask to uint32_t, so lanes 32-63 would
+    // write copies of lanes 0-31. Each 8-lane group gathers its sign bits via a width-32
+    // shuffle instead, which is self-contained on any wave size.
+    uint8_t qh_byte = 0;
+#pragma unroll
+    for (int sb = 0; sb < 8; sb++) {
+        qh_byte |= (uint8_t)(__shfl_sync(0xffffffff, my_high, (lane & ~7) + sb, WARP_SIZE) << sb);
+    }
+    if (lane % 8 == 0) {
+        blk->qh[j / 8] = qh_byte;
+    }
+#else
     const uint32_t highs = __ballot_sync(0xffffffff, my_high);
     if (lane < 4) {
         blk->qh[(j & ~31) / 8 + lane] = (uint8_t)(highs >> (8 * lane));
     }
+#endif // defined(GGML_USE_HIP)
 
     // ---- Step 7: Reconstruction norm (parallel) ----
     const float c = TQ5_CENTROIDS[idx];
