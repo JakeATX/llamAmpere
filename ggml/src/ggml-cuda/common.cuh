@@ -1349,6 +1349,7 @@ struct ggml_cuda_graph {
         void *   node_src_data_ptrs[GGML_MAX_SRC];
         int64_t  node_src_ne[GGML_MAX_SRC][GGML_MAX_DIMS];
         size_t   node_src_nb[GGML_MAX_SRC][GGML_MAX_DIMS];
+        uint64_t kv_stream_generation;
     };
     std::vector<node_properties> node_props;
 
@@ -1522,14 +1523,6 @@ struct ggml_backend_cuda_context {
 
     int curr_stream_no = 0;
 
-    // [TAG_FA_F16_CUDA_GRAPHS] Set once per compute call in ggml_backend_cuda_graph_compute: true
-    // when the current cgraph is graph-enabled AND graph-compatible (i.e. it will be captured).
-    // On HIP the flash-attention launcher reads this to place its f16 KV-dequant temp buffers in the
-    // capture-safe memory pool instead of raw cudaMalloc/cudaFree, which are illegal while a CUDA
-    // graph is being captured. Left false for graph-incompatible graphs so those keep the raw
-    // release-after-use path (avoids the legacy pool retaining the temp; ref llama.cpp #22107).
-    bool fa_f16_use_pool = false;
-
     // Per-graph-eval shared-quantize cache for the mmvq path. Several matvecs in one decode
     // layer consume the same normed activation (Q/V/K read attn_norm; the router, fused
     // gate/up and shared-expert gate read attn_post_norm), and each used to re-quantize it to
@@ -1570,6 +1563,24 @@ struct ggml_backend_cuda_context {
         std::vector<retired_buf> retired;        // outgrown buffers, freed at teardown (captured graphs may still use them)
     } tq_rot_cache;
 
+    // Per-expert address tables for the MoE weight indirection (see tq_build_expert_table). One
+    // entry per expert tensor, built on first use and kept for the life of the context: a captured
+    // graph replays kernels that read this exact address, so it cannot be pool memory and cannot be
+    // freed early. Same discipline as the caches above.
+    struct moe_expert_table {
+        const void *  base      = nullptr;   // src0->data the table was built from
+        int64_t       nb_expert = 0;
+        int           n_expert  = 0;
+        int           dev       = -1;
+        const void ** ptr       = nullptr;   // device array of n_expert addresses
+    };
+    std::vector<moe_expert_table> moe_tables;
+    std::vector<retired_buf>      moe_tables_retired;
+
+    // The cached table for this expert tensor, built on first use. Stable across calls so a
+    // captured graph can keep referencing it.
+    const void ** moe_expert_table_get(const ggml_tensor * src0, int64_t nb_expert, cudaStream_t stream);
+
     uint64_t graph_epoch = 1;
 
     // Fusion hit counters. Read through ggml_backend_cuda_fusion_count(); test-backend-ops uses
@@ -1579,7 +1590,33 @@ struct ggml_backend_cuda_context {
         int64_t q8_cache_hits = 0;   // mmvq shared-quantize cache hits
         int64_t fused_add     = 0;   // tuned multi-ADD runs (ggml_cuda_op_fused_add)
         int64_t fused_mul     = 0;   // tuned multi-MUL runs (ggml_cuda_op_fused_mul)
+        int64_t mul_mat_bias  = 0;   // ADD epilogues folded into mul_mat_vec (bias or a full
+                                     // same-shape residual: both arrive as fusion x_bias)
+        int64_t mul_mat_glu   = 0;   // GLU epilogues folded into mul_mat_vec
     } fusion_stats;
+    // Landing slots for paged-in experts. One slab per expert tensor, n_slots experts wide; the
+    // address table is pointed at a slot instead of at the expert's home address once it is copied.
+    struct moe_expert_slab {
+        const void * base = nullptr;
+        int64_t      nb_expert = 0;
+        int          n_slots = 0;
+        int          n_expert = 0;
+        int          n_routed = 0;
+        int          dev = -1;
+        void *       slab = nullptr;
+        // residency bookkeeping, all device-resident so the policy stays inside the graph
+        int32_t *    slot_expert = nullptr;   // n_slots,  expert in this slot or -1
+        int32_t *    claim       = nullptr;   // n_slots,  lowest routed index claiming it this call
+        int32_t *    hit         = nullptr;   // n_routed, already resident
+        int32_t *    won         = nullptr;   // n_routed, will read from a slot rather than in place
+        int32_t *    miss_expert = nullptr;   // n_routed
+        int32_t *    miss_slot   = nullptr;   // n_routed
+        int32_t *    n_miss      = nullptr;   // 1
+    };
+    std::vector<moe_expert_slab> moe_slabs;
+
+    moe_expert_slab * moe_expert_slab_get(const ggml_tensor * src0, int64_t nb_expert,
+                                          int n_expert, int n_routed, cudaStream_t stream);
 
 #ifdef USE_CUDA_GRAPH
     std::unordered_map<uint64_t, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;

@@ -34,6 +34,12 @@ error, matching upstream behavior for all quantized V types.
 
 The same flags work in `llama-server`, `llama-bench`, and `llama-perplexity`.
 
+## Model-specific quality
+
+Models with attention sinks can be unusually sensitive to K-cache quantization. GPT-OSS is a known case: even `q8_0` K changes the output distribution substantially, and lower-bit K types degrade it further despite normal codec and kernel accuracy. Use `f16` K for GPT-OSS and other sink-heavy models. Validate a quantized V cache separately against an `f16` K/V baseline before deploying it.
+
+Short output samples are not a sufficient quality check for this class of model because the text can remain fluent while token probabilities move significantly. Use `llama-perplexity --kl-divergence` or an equivalent logit comparison when selecting cache types.
+
 ## Rotation
 
 K and V vectors are rotated by a fixed 128x128 orthonormal Walsh-Hadamard

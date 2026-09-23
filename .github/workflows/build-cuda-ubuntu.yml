@@ -92,6 +92,45 @@ jobs:
           hf_bucket: ggml-org/cache
           save: true
 
+  # Same build on a CUDA 13 toolkit, for the pre-Blackwell arches users still run.
+  # nvcc 13.x enforces limits that 12.6 lets through: the D=512 VEC instances from
+  # bef37276b built here with 12.6 but failed ptxas on 13.x for sm_75/sm_89 (#380).
+  # GGML_CUDA_CUB_3DOT2 is left off on purpose: CUDA 13 already bundles CCCL 3.2+,
+  # and users building against CUDA 13 compile with the bundled copy.
+  cuda-13:
+    runs-on: ubuntu-24.04
+    container: nvidia/cuda:13.4.1-devel-ubuntu24.04
+
+    steps:
+      - name: Clone
+        id: checkout
+        uses: actions/checkout@v6
+
+      - name: Install dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt update
+          apt install -y cmake build-essential ninja-build libgomp1 git libssl-dev
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: cuda-ubuntu-24.04-cuda13
+          evict-old-files: 1d
+          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+
+      - name: Build with CMake
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DLLAMA_FATAL_WARNINGS=ON \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CUDA_ARCHITECTURES="75-real;89-real" \
+            -DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CUDA=ON
+          cmake --build build
+
   hip:
     runs-on: ubuntu-22.04
     container: rocm/dev-ubuntu-22.04:6.1.2

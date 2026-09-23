@@ -7509,6 +7509,18 @@ struct test_mul_mat_residual_fusion : public test_case {
 
     bool run_whole_graph() override { return true; }
 
+    // The fusion under test is the ADD epilogue itself. Watch its counter, not a side effect of
+    // the path taken to reach it, so that losing the fusion fails the test rather than passing
+    // on correct unfused arithmetic.
+    //
+    // Measured on CDNA2: the epilogue folds in only on the single-column vector path, and never
+    // when the residual aliases the product, which the dispatch declines rather than read back
+    // what it has written. The remaining cases run unfused and stay numeric-only here, so that a
+    // correct build is not reported as a missing fusion.
+    const char * required_fusion() override {
+        return (n == 1 && !self_add) ? "mul_mat_bias" : nullptr;
+    }
+
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor_2d(ctx, type, k, m);
         ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
@@ -7851,6 +7863,11 @@ struct test_mul_mat_vec_fusion : public test_case {
         s = ggml_repeat_4d(ctx, s, 1, n_mats, m, 1);
         s = ggml_get_rows(ctx, s, ids);
         return ggml_mul(ctx, out, s);
+    }
+
+    // Each case builds exactly one epilogue; require the counter for the one it built.
+    const char * required_fusion() override {
+        return with_gate ? "mul_mat_glu" : (with_bias ? "mul_mat_bias" : nullptr);
     }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
@@ -13310,6 +13327,10 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
         output_printer->print_summary(test_summary_info(n_ok, tests_run, false));
         output_printer->print_failed_tests(failed_tests);
 
+        if (tests_run == 0) {
+            return false;
+        }
+
         const bool slice_ok = run_fa_vec_slice(backend, backend_cpu.get(), op_names_filter);
 
         return n_ok == tests_run && slice_ok;
@@ -13330,6 +13351,10 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
             }
         }
         output_printer->print_summary(test_summary_info(n_ok, test_cases.size(), false));
+
+        if (test_cases.empty()) {
+            return false;
+        }
 
         return n_ok == test_cases.size();
     }

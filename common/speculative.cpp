@@ -1035,6 +1035,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             batch_inject.pos = (llama_pos *) malloc(sizeof(llama_pos) * 4 * llama_n_batch(ctx_dft));
         }
 
+        // embd batches on an M-RoPE draft need 4 position rows per token
+        is_mrope = llama_model_rope_type(model_dft) == LLAMA_ROPE_TYPE_MROPE;
+        if (is_mrope) {
+            free(batch_inject.pos);
+            batch_inject.pos = (llama_pos *) malloc(sizeof(llama_pos) * 4 * llama_n_batch(ctx_dft));
+        }
+
         smpls.resize(n_seq);
         for (auto & s : smpls) {
             common_params_sampling sparams;
@@ -1083,7 +1090,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         {
             bool causal = causal_attn;
             char buf[32] = {};
-            if (!causal && llama_model_meta_val_str(model_dft, "dflash.decoder_arch", buf, sizeof(buf)) >= 0) {
+            // DFlash2 (lattice selector) drafters are always non-causal: the
+            // decoder_arch metadata only applies to the plain DFlash decoder.
+            if (!causal && !is_dflash2 && llama_model_meta_val_str(model_dft, "dflash.decoder_arch", buf, sizeof(buf)) >= 0) {
                 causal = strcmp(buf, "laguna") == 0;
             }
             llama_set_causal_attn(ctx_dft, causal);
@@ -3424,6 +3433,9 @@ common_params common_base_params_to_speculative(const common_params & params) {
 
     result.cache_type_k  = params_spec.cache_type_k;
     result.cache_type_v  = params_spec.cache_type_v;
+    // The first block-streaming implementation owns only the target cache.
+    // MTP keeps its ordinary cache until both contexts can share one pool.
+    result.kv_stream_arena_mib = 0;
     result.n_outputs_max = params.n_parallel;
     result.n_outputs_max_per_seq = 1;
 

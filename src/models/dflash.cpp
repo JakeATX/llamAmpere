@@ -647,6 +647,20 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
                     ext_factor, attn_factor, beta_fast, beta_slow);
     };
 
+    // drafts for M-RoPE targets use degenerate sections (temporal dim only)
+    int sections[4];
+    std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
+
+    auto build_rope = [&](ggml_tensor * cur, ggml_tensor * pos) {
+        return rope_type == GGML_ROPE_TYPE_MROPE
+            ? ggml_rope_multi(ctx0, cur, pos, nullptr,
+                    n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+                    ext_factor, attn_factor, beta_fast, beta_slow)
+            : ggml_rope_ext(ctx0, cur, pos, nullptr,
+                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                    ext_factor, attn_factor, beta_fast, beta_slow);
+    };
+
     // KV cache injection
     if (ubatch.embd) {
         auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp);
@@ -828,6 +842,11 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         if (layer.attn_post_norm) {
             cur = build_norm(cur, layer.attn_post_norm, NULL, LLM_NORM_RMS, il);
             cb(cur, "attn_post_norm", il);
+        }
+
+        if (attn_dynamic) {
+            cur = build_dflash2_conv(*this, cur, attn_dynamic, layer.dflash_attn_conv_base, 1);
+            cb(cur, "attn_conv_out", il);
         }
 
         ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpL);

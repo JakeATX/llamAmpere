@@ -1547,7 +1547,8 @@ template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
     const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const bool use_sparse,
-    const int warp_size = WARP_SIZE
+    const int warp_size = WARP_SIZE,
+    float * partial_dst = nullptr, float2 * partial_meta = nullptr
 ) {
     constexpr int ncols = ncols1 * ncols2;
 
@@ -1561,6 +1562,9 @@ void launch_fattn(
     const ggml_tensor * sinks = dst->src[4];
 
     ggml_tensor * KQV = dst;
+    const bool output_partial = partial_dst != nullptr;
+    GGML_ASSERT(output_partial == (partial_meta != nullptr));
+    GGML_ASSERT(!output_partial || !stream_k);
 
     GGML_ASSERT(Q->type == GGML_TYPE_F32);
     GGML_ASSERT(KQV->type == GGML_TYPE_F32);
@@ -1577,56 +1581,16 @@ void launch_fattn(
     const int cc  = ggml_cuda_info().devices[id].cc;
     const int nsm = ggml_cuda_info().devices[id].nsm;
 
-#ifdef GGML_USE_HIP
-    // HIP/ROCm: allocate the f16 KV-dequant temp buffers in a CUDA-graph-capture-aware way.
-    //
-    // Default (no graph capture): bypass the memory pool and use raw cudaMalloc/cudaFree so the
-    // temp buffer (up to ~2x the quantized KV size) is released the moment the kernel completes.
-    // The legacy pool (ggml_cuda_pool_leg) retains peak-sized allocations permanently on HIP
-    // without VMM support (RDNA 3/4) because free() stores buffers for reuse rather than releasing
-    // them; pooling this temp would negate the KV compression and OOM at long context.
-    // Ref: https://github.com/ggml-org/llama.cpp/issues/22107
-    //
-    // While a CUDA graph is being captured, cudaMalloc/cudaFree/cudaStreamSynchronize are all
-    // illegal. When the current graph will be captured (ctx.fa_f16_use_pool, set for graph-enabled
-    // and graph-compatible cgraphs), use the pool instead: capture only begins once the shape is
-    // stable (see ggml_cuda_graph_update_required), so this temp is a single fixed-size buffer that
-    // the pool allocates during the eager warmup passes and then reuses across every graph replay
-    // — exactly the capture-safe path the non-HIP build always takes. Holding it is required anyway
-    // for replay to reference a stable buffer address.
-    const bool fa_f16_use_pool = ctx.fa_f16_use_pool;
-    struct hip_f16_alloc {
-        half * ptr = nullptr;
-        cudaStream_t stream;
-        bool use_pool;
-        ggml_cuda_pool_alloc<half> pool_alloc;
-        hip_f16_alloc(cudaStream_t s, ggml_cuda_pool & p, bool use_pool)
-            : stream(s), use_pool(use_pool), pool_alloc(p) {}
-        hip_f16_alloc(const hip_f16_alloc &) = delete;
-        hip_f16_alloc & operator=(const hip_f16_alloc &) = delete;
-        ~hip_f16_alloc() {
-            if (use_pool || ptr == nullptr) {
-                return;  // pool_alloc releases back to the pool; nothing to do if unused
-            }
-            // Destructor: cannot propagate errors, and under HIP both calls are
-            // [[nodiscard]], which is fatal under -Werror. Discard explicitly.
-            (void) cudaStreamSynchronize(stream);
-            (void) cudaFree(ptr);
-        }
-        void alloc(size_t nelements) {
-            if (use_pool) {
-                ptr = pool_alloc.alloc(nelements);
-            } else {
-                CUDA_CHECK(cudaMalloc(&ptr, nelements * sizeof(half)));
-            }
-        }
-    };
-    hip_f16_alloc K_f16(main_stream, pool, fa_f16_use_pool);
-    hip_f16_alloc V_f16(main_stream, pool, fa_f16_use_pool);
-#else
-    ggml_cuda_pool_alloc<half>   K_f16(pool);
-    ggml_cuda_pool_alloc<half>   V_f16(pool);
-#endif
+    // The f16 KV-dequant temps live inside the FA op's compute buffer (reserved by
+    // ggml_cuda_flash_attn_ext_get_f16_extra_data and sized via get_alloc_size). That buffer is
+    // allocated once at graph build time (raw cudaMalloc via ggml_cuda_device_malloc - no pool),
+    // reused across evals, and its address is stable, so it is capture-safe by construction and
+    // never touches the memory pool. This is upstream's design and avoids both the per-launch
+    // cudaMalloc/cudaFree churn and the pool's monotonic physical growth on repeated graph
+    // re-capture, which OOMed long growing-context sessions. Ref llama.cpp #22107.
+    const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
+        ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, need_f16_K, need_f16_V);
+
     ggml_cuda_pool_alloc<int>    KV_max(pool);
     ggml_cuda_pool_alloc<float>  dst_tmp(pool);
     ggml_cuda_pool_alloc<float2> dst_tmp_meta(pool);
@@ -1813,14 +1777,15 @@ void launch_fattn(
         }
     } else {
         // parallel_blocks must not be larger than what the tensor size allows:
-        parallel_blocks = std::min(parallel_blocks, ntiles_KV);
+        parallel_blocks = output_partial ? 1 : std::min(parallel_blocks, ntiles_KV);
 
         // If ntiles_total % blocks_per_wave != 0 then some efficiency is lost due to tail effects.
         // Test whether parallel_blocks can be set to a higher value for better efficiency.
         const int blocks_per_wave = nsm * max_blocks_per_sm;
         int nwaves_best = 0;
         int efficiency_percent_best = 0;
-        for (int parallel_blocks_test = parallel_blocks; parallel_blocks_test <= ntiles_KV; ++parallel_blocks_test) {
+        for (int parallel_blocks_test = parallel_blocks;
+                !output_partial && parallel_blocks_test <= ntiles_KV; ++parallel_blocks_test) {
             const int nblocks_total = ntiles_dst * parallel_blocks_test;
             const int nwaves = (nblocks_total + blocks_per_wave - 1) / blocks_per_wave;
             const int efficiency_percent = 100 * nblocks_total / (nwaves*blocks_per_wave);
@@ -1837,9 +1802,19 @@ void launch_fattn(
             }
         }
 
-        blocks_num.x = ntiles_x;
-        blocks_num.y = parallel_blocks;
-        blocks_num.z = ntiles_z_gqa*K->ne[2]*Q->ne[3];
+        if (output_partial) {
+            // MMA kernels flatten Q tiles, GQA groups, KV heads, and sequences
+            // into blockIdx.x. A multidimensional grid would duplicate every
+            // tile once per KV head. One block per complete tile also avoids
+            // fixups while preserving exact partial numerator/meta output.
+            blocks_num.x = ntiles_dst;
+            blocks_num.y = 1;
+            blocks_num.z = 1;
+        } else {
+            blocks_num.x = ntiles_x;
+            blocks_num.y = parallel_blocks;
+            blocks_num.z = ntiles_z_gqa*K->ne[2]*Q->ne[3];
+        }
 
         if (parallel_blocks > 1) {
             dst_tmp.alloc(parallel_blocks*ggml_nelements(KQV));
@@ -1878,7 +1853,8 @@ void launch_fattn(
         mask ? ((const char *) mask->data) : nullptr,
         sinks ? ((const char *) sinks->data) : nullptr,
         KV_max.ptr,
-        !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
+        output_partial ? partial_dst : (!stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data),
+        output_partial ? partial_meta : dst_tmp_meta.ptr,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,
         Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
         K->ne[0], n_kv, K->ne[2], K->ne[3], nb11, nb12, nb13,

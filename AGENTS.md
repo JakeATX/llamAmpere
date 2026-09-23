@@ -55,7 +55,7 @@ Any combination of `f16`/`q8_0`/`turbo2`/`turbo3`/`turbo4` for K and V is suppor
 
 - `test-turbo-quant` - turbo3 basis MSE=0/Cosine=1.0, turbo4 Cosine=0.9956
 - `test-quantize-fns` - includes TQ3_1S/TQ4_1S and rotated-domain buffer sizing
-- `test-backend-ops` - full sweep on CPU + CUDA0 (23k+ cases on the RTX 5090 dev box)
+- `test-backend-ops` - full sweep on CPU + CUDA0 (23k+ cases on the RTX 5090 dev box); rejects 0/0 as FAIL
 - `llama-bench` with `-ctk/-ctv turboN`; type parser accepts `tq3_1s`/`tq4_1s`
 
 ### What the test gates do and do not cover
@@ -69,7 +69,7 @@ What each suite does:
 
 Coverage limits (each caused a real miss):
 
-- `test-backend-ops` reports `Backend ...: OK` even when every case was skipped: the backend verdict is `n_ok == tests_run`, and 0/0 passes. See issue #242 (open). This is how the turbo3 wave64 ballot bug in `copy_to_quant.comp` shipped: FLASH_ATTN_EXT (read path) passed, SET_ROWS (write path) was silently skipped on GCN4, and the corrupted V cache was released (#241, fixed in #243).
+- `test-backend-ops` used to report `Backend ...: OK` when every case was skipped because the backend verdict was `n_ok == tests_run`, and 0/0 passed. It now fails the backend when no test ran. Issue #242 remains open for reporting which graph node caused a case to be unsupported.
 - The generic SET_ROWS sweep has a view variant with `r/2` rows. At r=1 that is 0 rows: the case writes nothing and passes for every type in `all_types`, including TQ4_1S.
 - The MUL_MAT_ID sweep used n=16 only, and the mat-vec decode path is selected only when `src2->ne[1] <= 8` (`ggml_vk_use_mul_mat_vec_id`). n=16 exercises mul_mm_id only; MoE decode was never touched. The n=1 cases and the DSv4-shaped sweep (commit 637300387, PR #269) now cover both sides of that threshold.
 - The harness initializer wrote quantized tensors with one packed `ggml_backend_tensor_set`, which copies `size` bytes contiguously and never strides by `nb[1]`. For a strided view (the `k_v > k` MUL_MAT cases view `k` rows of a `k_v`-row base) the data landed at `i*row_size` instead of `i*nb[1]` and the last rows were never written; the CPU reference read the stale tail and produced NaN, which presented as the CUDA backend failing because CPU is the reference and is skipped as a backend under test. Fixed by row-by-row init for non-contiguous tensors (issue #268, PR #276). The TQ4_1S `k_v=1600` case now passes: the CUDA NaN #276 observed no longer occurs because PR #277 gates the fused TQ mul_mat paths on contiguous `src1`/`dst`, routing this view to the stride-aware fallback.
