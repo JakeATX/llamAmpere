@@ -322,6 +322,7 @@ private:
     uint32_t kvarn_n_layers_edge = 0;      // cache layers on tier 1 (first + last edge_layers)
     uint32_t kvarn_B      = 0;        // sealed end
     uint32_t kvarn_B_pending = 0;     // proposed end, published after all layers complete
+    bool     kvarn_draining  = false; // an adaptive-tail flush is being sealed in flush_chunk steps
     uint64_t kvarn_maintenance_count = 0;
     uint64_t kvarn_maintenance_groups = 0;
     uint32_t kvarn_B_prev = 0;        // sealed end before the current ubatch

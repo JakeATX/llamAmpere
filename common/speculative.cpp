@@ -3429,6 +3429,7 @@ common_params common_base_params_to_speculative(const common_params & params) {
     result.kvarn_bits_v  = 0;
     result.kvarn_tail_max = 0;
     result.kvarn_edge_layers = 0;
+    result.kvarn_flush_chunk = 0;
     result.n_outputs_max = params.n_parallel;
     result.n_outputs_max_per_seq = 1;
 

@@ -2626,6 +2626,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KVARN_EDGE_BITS"));
     add_opt(common_arg(
+        {"--kvarn-flush-chunk"}, "N",
+        "KVarN adaptive tail: when the tail reaches --kvarn-tail-max, seal at most N groups (128 positions each) per "
+        "decode step and drain the rest over the following steps instead of in one pause; prefill-sized ubatches "
+        "still flush at once; 0 = one flush (default: 0)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("KVarN flush chunk must be nonnegative");
+            }
+            params.kvarn_flush_chunk = (uint32_t) value;
+        }
+    ).set_env("LLAMA_ARG_KVARN_FLUSH_CHUNK"));
+    add_opt(common_arg(
         {"--kvarn-sink"}, "N",
         string_format("KVarN cache: number of leading positions kept unsealed (multiple of 64, default: %u)", params.kvarn_sink),
         [](common_params & params, int value) {

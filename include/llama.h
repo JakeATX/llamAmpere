@@ -429,6 +429,7 @@ extern "C" {
         uint32_t kvarn_edge_bits_k; // edge-tier body bits (default 4/4)
         uint32_t kvarn_edge_bits_v;
         enum ggml_type kvarn_edge_body_type; // edge-tier codec: COUNT = auto (trellis only for a trellis pair when kvarn_body_type is trellis/auto), F32 scalar, I16 trellis
+        uint32_t kvarn_flush_chunk; // adaptive tail: max groups sealed per small (decode) ubatch; 0 = whole flush at once
 
         // Keep the booleans together and at the end of the struct to avoid misalignment during copy-by-value.
         bool embeddings;  // if true, extract embeddings (together with logits)

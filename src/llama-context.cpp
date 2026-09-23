@@ -540,6 +540,7 @@ llama_context::llama_context(
                 /*.edge_bits_k =*/ params.kvarn_edge_bits_k,
                 /*.edge_bits_v =*/ params.kvarn_edge_bits_v,
                 /*.edge_body_type =*/ params.kvarn_edge_body_type,
+                /*.flush_chunk =*/ params.kvarn_flush_chunk,
             },
         };
 
@@ -4466,6 +4467,7 @@ llama_context_params llama_context_default_params() {
         /*.kvarn_edge_bits_k           =*/ 4,
         /*.kvarn_edge_bits_v           =*/ 4,
         /*.kvarn_edge_body_type        =*/ GGML_TYPE_COUNT,
+        /*.kvarn_flush_chunk           =*/ 0,
         /*.embeddings                  =*/ false,
         /*.offload_kqv                 =*/ true,
         /*.no_perf                     =*/ true,

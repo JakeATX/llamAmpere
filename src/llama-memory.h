@@ -30,6 +30,7 @@ struct llama_kvarn_config {
     uint32_t edge_bits_k = 4;
     uint32_t edge_bits_v = 4;
     ggml_type edge_body_type = GGML_TYPE_F32;
+    uint32_t flush_chunk = 0; // tail_max > 0: groups sealed per decode-sized ubatch while draining; 0 = all at once
 
     bool enabled() const { return bits_k > 0 && bits_v > 0; }
 };

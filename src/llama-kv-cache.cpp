@@ -154,6 +154,7 @@ llama_kv_cache::llama_kv_cache(
             kvarn_n_groups_seal += (kvarn.tail_max - kvarn.tail)/kvarn.group;
         }
         kvarn_B = kvarn_B_prev = kvarn_B_pending = kvarn.sink;
+        kvarn_draining = false;
         kvarn_N = 0;
         LLAMA_LOG_INFO("%s: %s cache: K%u/V%u records, sink %u (%s), tail %u, group %u, ring %u rows (%s), pool %u groups/head\n",
                 __func__, kvarn.body_type == GGML_TYPE_TURBO4_0 ? "Tiered TQ" : kvarn.body_type == GGML_TYPE_I16 ? "KVarN (trellis body)" : "KVarN", kvarn.bits_k, kvarn.bits_v, kvarn.sink, ggml_type_name(kvarn.sink_type == GGML_TYPE_COUNT ? type_k : kvarn.sink_type), kvarn.tail, kvarn.group, kvarn_cap, ggml_type_name(type_k), kvarn_n_groups);
@@ -742,6 +743,7 @@ void llama_kv_cache::clear(bool data) {
     }
 
     kvarn_B = kvarn_B_prev = kvarn_B_pending = kvarn.sink;
+    kvarn_draining = false;
     kvarn_N = 0;
 
     if (data) {
@@ -786,6 +788,7 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
         // sealed records cannot be reopened: only a full clear or a removal behind the sealed end is possible
         if (p0 == 0 && p1 == std::numeric_limits<llama_pos>::max()) {
             kvarn_B = kvarn_B_prev = kvarn_B_pending = kvarn.sink;
+            kvarn_draining = false;
             kvarn_N = 0;
         } else if ((uint32_t) p0 < kvarn_B && (uint32_t) p0 < kvarn_N) {
             LLAMA_LOG_WARN("%s: KVarN cache: cannot remove positions [%d, %d): positions below %u are sealed\n",
@@ -1162,6 +1165,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
 
     // KVarN: apply_ubatch advances the sealed-end bookkeeping; the dry run below must not keep it
     const uint32_t kvarn_B_old = kvarn_B, kvarn_B_prev_old = kvarn_B_prev, kvarn_N_old = kvarn_N, kvarn_pending_old = kvarn_B_pending;
+    const bool     kvarn_draining_old = kvarn_draining;
 
     bool success = true;
 
@@ -1210,6 +1214,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
     }
 
     kvarn_B = kvarn_B_old; kvarn_B_prev = kvarn_B_prev_old; kvarn_N = kvarn_N_old; kvarn_B_pending = kvarn_pending_old;
+    kvarn_draining = kvarn_draining_old;
 
     if (!success) {
         return {};
@@ -1602,9 +1607,24 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
         // ubatch with no exact tail at all). The ring is sized for that: tail + group + 2*n_ubatch rows.
         kvarn_B_prev = kvarn_B;
         kvarn_B_pending = kvarn_B;
-        const bool due = kvarn.tail_max == 0 || (pos0 > kvarn_B && pos0 - kvarn_B >= kvarn.tail_max);
+        // adaptive tail: a flush becomes due when the tail reaches tail_max and runs down to `tail`. With
+        // flush_chunk set, a decode-sized ubatch seals at most flush_chunk groups and leaves the rest draining
+        // for the next ubatches, so the flush is spread over steps instead of stalling one token. Each step
+        // seals at least one group (group positions) while adding fewer than group, so the backlog shrinks
+        // every step and N - B_prev stays within tail_max + n_tokens, inside the ring. Prefill-sized
+        // ubatches take the whole remaining flush at once.
+        const bool due = kvarn.tail_max == 0 || kvarn_draining || (pos0 > kvarn_B && pos0 - kvarn_B >= kvarn.tail_max);
+        kvarn_draining = false;
         if (due && pos0 > kvarn.sink + kvarn.tail) {
-            kvarn_B_pending = std::max(kvarn_B, kvarn.sink + kvarn.group*((pos0 - kvarn.tail - kvarn.sink)/kvarn.group));
+            uint32_t target = std::max(kvarn_B, kvarn.sink + kvarn.group*((pos0 - kvarn.tail - kvarn.sink)/kvarn.group));
+            if (kvarn.tail_max > 0 && kvarn.flush_chunk > 0 && ubatch.n_tokens < kvarn.group) {
+                const uint32_t limit = kvarn_B + kvarn.group*kvarn.flush_chunk;
+                if (target > limit) {
+                    target         = limit;
+                    kvarn_draining = true;
+                }
+            }
+            kvarn_B_pending = target;
         }
         // ring rows hold [max(B_prev, sink), N); sink positions live in their own exact rows
         GGML_ASSERT(N <= kvarn_B_prev + kvarn_cap && "KVarN cache: ring overflow (ubatch larger than n_ubatch?)");
@@ -2225,9 +2245,11 @@ int32_t llama_kv_cache::compress_kvarn_idle(llama_context * lctx, llama_seq_id s
     const uint32_t end = accepted_end;
     if (end <= kvarn.sink + kvarn.tail) { return 0; }
     const uint32_t target = kvarn.sink + kvarn.group*((end - kvarn.tail - kvarn.sink)/kvarn.group);
-    if (target <= kvarn_B) { return 0; }
+    if (target <= kvarn_B) { kvarn_draining = false; return 0; }
     kvarn_B_pending = target;
-    return maintain_kvarn(lctx) ? 1 : -1;
+    if (!maintain_kvarn(lctx)) { return -1; }
+    kvarn_draining = false; // the idle seal reached the full flush target
+    return 1;
 }
 
 void llama_kv_cache::set_input_k_shift(ggml_tensor * dst) const {
