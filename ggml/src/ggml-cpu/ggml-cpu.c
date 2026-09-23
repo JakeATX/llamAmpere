@@ -1600,9 +1600,9 @@ UseGgmlGemm1:;
         const size_t nbw3 = nbw2*ne12;
 
         assert(params->wsize >= ne13*nbw3);
-        // F16 src1 converts straight to float, so wdata rows must be floats; a quantized vec_dot_type would overrun the buffer
-        GGML_ASSERT(src1->type == GGML_TYPE_F32 ||
-                    (src1->type == GGML_TYPE_F16 && vec_dot_type == GGML_TYPE_F32));
+        GGML_ASSERT(src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16);
+        // the F16 path below writes plain floats into wdata, so it needs an F32 vec_dot_type
+        GGML_ASSERT(src1->type == GGML_TYPE_F32 || vec_dot_type == GGML_TYPE_F32);
 
     #if 0
         for (int64_t i13 = 0; i13 < ne13; ++i13) {

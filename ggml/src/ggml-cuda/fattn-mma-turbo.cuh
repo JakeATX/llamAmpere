@@ -44,9 +44,10 @@ void ggml_cuda_flash_attn_ext_mma_turbo_case(ggml_backend_cuda_context & ctx, gg
     constexpr bool V_is_K_view = false;
 
     // must match the swizzled tile stride flash_attn_ext_turbo{2,3,4}_load_tile write through
-    // (fattn-mma-f16.cuh's turbo_store_h2 / bytes_rc), same helper as fattn-mma-f16.cuh:2287.
-    const int stride_tile_K = ggml_cuda_fattn_smem_swizzle::tile_stride(nbatch_K2, cc);
-    const int stride_tile_V = ggml_cuda_fattn_smem_swizzle::tile_stride(nbatch_V2, cc);
+    // (fattn-mma-f16.cuh's turbo_store_h2 / swizzle_bytes), same helpers as the f16 host launcher.
+    const bool swizzled     = ggml_cuda_fattn_mma_get_swizzled(DKQ, DV, ncols1, ncols2, cc);
+    const int stride_tile_K = ggml_cuda_fattn_mma_get_stride_tile(nbatch_K2, swizzled);
+    const int stride_tile_V = ggml_cuda_fattn_mma_get_stride_tile(nbatch_V2, swizzled);
     const size_t nbytes_shared_KV_1stage = nbatch_fa            * std::max(stride_tile_K, stride_tile_V) * sizeof(half2);
     const size_t nbytes_shared_Q         = ncols                * (DKQ/2 + 4)                             * sizeof(half2);
     const size_t nbytes_shared_mask      = ncols1               * (nbatch_fa/2 + 4)                       * sizeof(half2);
