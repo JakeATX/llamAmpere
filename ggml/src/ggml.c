@@ -6536,7 +6536,7 @@ struct ggml_tensor * ggml_gated_delta_net(
         struct ggml_tensor  * state,
         int64_t               K,
         int32_t               emit_mode) {
-    GGML_ASSERT(emit_mode == 0 || emit_mode == 1);
+    GGML_ASSERT(emit_mode >= 0 && emit_mode <= 2);
     GGML_ASSERT(ggml_is_contiguous_rows(q));
     GGML_ASSERT(ggml_is_contiguous_rows(k));
     GGML_ASSERT(ggml_is_contiguous_rows(v));
@@ -6573,10 +6573,12 @@ struct ggml_tensor * ggml_gated_delta_net(
     //                 when n_tokens > K) one further such block: the state immediately before the
     //                 K-token retained window starts, free to capture since the recurrence already
     //                 passes through it en route to the final state.
-    const bool    needs_ckpt  = emit_mode == 1 && n_tokens > K;
+    // emit_mode == 2: compact slots (g and beta stored once per head), padded to whole rows.
+    const bool    needs_ckpt  = emit_mode != 0 && n_tokens > K;
     const int64_t state_rows  = emit_mode == 0
         ? K * S_v * n_seqs
-        : K * 4 * n_seqs + S_v * n_seqs + (needs_ckpt ? S_v * n_seqs : 0);
+        : ggml_gated_delta_net_ingr_region(S_v, g->ne[0], H, n_seqs, K, emit_mode) / (S_v * H) +
+          S_v * n_seqs + (needs_ckpt ? S_v * n_seqs : 0);
     const int64_t ne[4] = { S_v * H, n_tokens * n_seqs + state_rows, 1, 1 };
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
 
@@ -6592,6 +6594,17 @@ struct ggml_tensor * ggml_gated_delta_net(
     result->src[5] = state;
 
     return result;
+}
+
+int64_t ggml_gated_delta_net_ingr_width(int64_t S_v, int64_t g_width, int32_t emit_mode) {
+    GGML_ASSERT(emit_mode == 1 || emit_mode == 2);
+    return emit_mode == 1 ? 4 * S_v : 2 * S_v + g_width + 1;
+}
+
+int64_t ggml_gated_delta_net_ingr_region(int64_t S_v, int64_t g_width, int64_t H, int64_t n_seqs, int64_t K, int32_t emit_mode) {
+    const int64_t n   = K * ggml_gated_delta_net_ingr_width(S_v, g_width, emit_mode) * H * n_seqs;
+    const int64_t row = S_v * H; // the op's output row
+    return (n + row - 1) / row * row;
 }
 
 // ggml_turbo_wht
