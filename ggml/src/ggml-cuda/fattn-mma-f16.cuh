@@ -318,6 +318,47 @@ static constexpr __device__ int ggml_cuda_fattn_mma_get_nbatch_fa(const int DKQ,
     return ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols).nbatch_fa;
 }
 
+// [#39] nbatch_fa seam for the fused packed-KV decode: KV rows per tile for tq5_0 / tq6_0 K at head size 256 and
+// ncols 8 / 16 on Ampere, set at build time (-DGGML_CUDA_FATTN_TQ_NBFA_C8=32|64, -DGGML_CUDA_FATTN_TQ_NBFA_C16=32|64;
+// 0 = the config table: 64 at ncols 8, 32 at ncols 16). Other K types and head sizes keep the table. The online
+// softmax rescales once per tile, so another value changes the rounding order: not bit-exact, check KLD with speed.
+#ifndef GGML_CUDA_FATTN_TQ_NBFA_C8
+#define GGML_CUDA_FATTN_TQ_NBFA_C8 0
+#endif
+#ifndef GGML_CUDA_FATTN_TQ_NBFA_C16
+#define GGML_CUDA_FATTN_TQ_NBFA_C16 0
+#endif
+static_assert(GGML_CUDA_FATTN_TQ_NBFA_C8  == 0 || GGML_CUDA_FATTN_TQ_NBFA_C8  == 32 || GGML_CUDA_FATTN_TQ_NBFA_C8  == 64, "bad GGML_CUDA_FATTN_TQ_NBFA_C8");
+static_assert(GGML_CUDA_FATTN_TQ_NBFA_C16 == 0 || GGML_CUDA_FATTN_TQ_NBFA_C16 == 32 || GGML_CUDA_FATTN_TQ_NBFA_C16 == 64, "bad GGML_CUDA_FATTN_TQ_NBFA_C16");
+
+static constexpr __host__ __device__ int ggml_cuda_fattn_tq_nbatch_fa(
+        const int DKQ, const int DV, const int ncols, const ggml_type type_K, const bool ampere, const int nbatch_fa) {
+    if (!ampere || DKQ != 256 || DV != 256 || (type_K != GGML_TYPE_TQ5_0 && type_K != GGML_TYPE_TQ6_0)) {
+        return nbatch_fa;
+    }
+    if (ncols == 8 && GGML_CUDA_FATTN_TQ_NBFA_C8 != 0) {
+        return GGML_CUDA_FATTN_TQ_NBFA_C8;
+    }
+    if (ncols == 16 && GGML_CUDA_FATTN_TQ_NBFA_C16 != 0) {
+        return GGML_CUDA_FATTN_TQ_NBFA_C16;
+    }
+    return nbatch_fa;
+}
+
+// nbatch_fa for a K type: the host launcher and the kernel must agree (tile count, mask and KV smem, staging)
+static __host__ int ggml_cuda_fattn_mma_get_nbatch_fa(const int DKQ, const int DV, const int ncols, const ggml_type type_K, const int cc) {
+    return ggml_cuda_fattn_tq_nbatch_fa(DKQ, DV, ncols, type_K, ampere_mma_available(cc), ggml_cuda_fattn_mma_get_nbatch_fa(DKQ, DV, ncols, cc));
+}
+
+template <ggml_type type_K>
+static constexpr __device__ int ggml_cuda_fattn_mma_get_nbatch_fa_t(const int DKQ, const int DV, const int ncols) {
+#if defined(AMPERE_MMA_AVAILABLE)
+    return ggml_cuda_fattn_tq_nbatch_fa(DKQ, DV, ncols, type_K, true, ggml_cuda_fattn_mma_get_nbatch_fa(DKQ, DV, ncols));
+#else
+    return ggml_cuda_fattn_mma_get_nbatch_fa(DKQ, DV, ncols);
+#endif // defined(AMPERE_MMA_AVAILABLE)
+}
+
 static __host__ int ggml_cuda_fattn_mma_get_nbatch_K2(const int DKQ, const int DV, const int ncols, const int cc) {
     return ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols, cc).nbatch_K2;
 }
@@ -1463,7 +1504,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     constexpr bool turbo_stage_v   = ggml_cuda_fattn_turbo_stage_v<DKQ, DV, ncols2, type_K, type_V>() && !oob_check;
     constexpr int  cols_per_thread = get_cols_per_thread();
     constexpr int  np              = cols_per_warp > ncols ? nwarps : nwarps * cols_per_warp/ncols; // Number of parallel CUDA warps per Q column.
-    constexpr int  nbatch_fa       = ggml_cuda_fattn_mma_get_nbatch_fa(DKQ, DV, ncols);
+    constexpr int  nbatch_fa       = ggml_cuda_fattn_mma_get_nbatch_fa_t<type_K>(DKQ, DV, ncols);
     constexpr int  nbatch_K2       = ggml_cuda_fattn_mma_get_nbatch_K2(DKQ, DV, ncols);
     constexpr int  nbatch_V2       = ggml_cuda_fattn_mma_get_nbatch_V2(DKQ, DV, ncols);
     constexpr bool Q_in_reg        = ggml_cuda_fattn_mma_get_Q_in_reg (DKQ, DV, ncols);
@@ -2167,7 +2208,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     constexpr int  cols_per_warp   = T_B_KQ::I;
     constexpr int  cols_per_thread = get_cols_per_thread();
     constexpr int  np              = cols_per_warp > ncols ? nwarps : nwarps * cols_per_warp/ncols; // Number of parallel CUDA warps per Q column.
-    constexpr int  nbatch_fa       = ggml_cuda_fattn_mma_get_nbatch_fa     (DKQ, DV, ncols);
+    constexpr int  nbatch_fa       = ggml_cuda_fattn_mma_get_nbatch_fa_t<type_K>(DKQ, DV, ncols);
     constexpr int  nbatch_K2       = ggml_cuda_fattn_mma_get_nbatch_K2     (DKQ, DV, ncols);
     constexpr int  nbatch_V2       = ggml_cuda_fattn_mma_get_nbatch_V2     (DKQ, DV, ncols);
     constexpr int  nbatch_combine  = ggml_cuda_fattn_mma_get_nbatch_combine(DKQ, DV, ncols);
@@ -2840,7 +2881,7 @@ static __global__ void flash_attn_ext_f16(
 
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int ncols     = ncols1 * ncols2;
-    constexpr int nbatch_fa = ggml_cuda_fattn_mma_get_nbatch_fa(DKQ, DV, ncols);
+    constexpr int nbatch_fa = ggml_cuda_fattn_mma_get_nbatch_fa_t<type_K>(DKQ, DV, ncols);
     constexpr int nthreads  = ggml_cuda_fattn_mma_get_nthreads(DKQ, DV, ncols);
     constexpr int nwarps    = nthreads / warp_size;
 
