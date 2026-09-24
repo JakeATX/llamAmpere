@@ -1612,6 +1612,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     hadamard_inverses (params.hadamard_inverses),
     samplers         (params.samplers),
     draft_vocab_ids  (params.draft_vocab_ids),
+    draft_vocab_compact    (params.draft_vocab_compact),
+    draft_vocab_compact_src(params.draft_vocab_compact_src),
     draft_vocab_warned(params.draft_vocab_warned),
     mtp_chain_samp   (params.mtp_chain_samp),
     cb_func          (params.cb),
@@ -4484,6 +4486,30 @@ ggml_tensor * llm_graph_context::draft_vocab_fallback(int reason, const char * d
     return nullptr;
 }
 
+ggml_tensor * llm_graph_context::build_draft_vocab_compact(
+        ggml_tensor * head_w,
+        ggml_tensor * head_s,
+        ggml_tensor * cur) const {
+    const int64_t n_sel = draft_vocab_compact->ne[1];
+    GGML_ASSERT(n_sel == draft_vocab_ids->ne[0] && draft_vocab_compact->ne[0] == head_w->ne[0]);
+    ggml_ledger_addf("llama.draft_vocab", 1, "compact type=%s n_sel=%lld", ggml_type_name(draft_vocab_compact->type), (long long) n_sel);
+
+    ggml_tensor * x = cur;
+    if (ggml_exl3_bits(head_w->type) != 0) {
+        // the compact rows live in the rotated input domain of the EXL3 head (llama-draft-vocab-compact.h): feed them
+        // x_rot = H128(suh * x), the same input glue build_lora_mm builds with LLAMA_EXL3_GLUE_GRAPH=1
+        const llama_model::exl3_side * exl3 = model_ref ? model_ref->exl3_side_of(head_w) : nullptr;
+        GGML_ASSERT(exl3 != nullptr && model_ref->exl3_had128 != nullptr);
+        x = ggml_mul(ctx0, x, exl3->suh);
+        x = build_exl3_had128(ctx0, model_ref->exl3_had128, x);
+    }
+    ggml_tensor * logits = ggml_mul_mat(ctx0, draft_vocab_compact, x); // [n_sel, n]
+    if (head_s) {
+        logits = ggml_mul(ctx0, logits, head_s);
+    }
+    return logits;
+}
+
 ggml_tensor * llm_graph_context::build_draft_vocab_logits(
         ggml_tensor * head_w,
         ggml_tensor * head_s,
@@ -4491,7 +4517,9 @@ ggml_tensor * llm_graph_context::build_draft_vocab_logits(
     if (draft_vocab_ids == nullptr || n_outputs == 0 || head_w == nullptr) {
         return nullptr;
     }
-    if (hadamard_rotations && hadamard_rotations->count(head_w)) {
+    // [#81] a compact head built from this head replaces the hadamard_head / head_layout outcomes
+    const bool compact = draft_vocab_compact != nullptr && draft_vocab_compact_src == head_w;
+    if (!compact && hadamard_rotations && hadamard_rotations->count(head_w)) {
         return draft_vocab_fallback(DRAFT_VOCAB_FALLBACK_HADAMARD, "the output head is Hadamard-rotated");
     }
     if (loras && !loras->empty()) {
@@ -4503,8 +4531,10 @@ ggml_tensor * llm_graph_context::build_draft_vocab_logits(
     if (draft_vocab_ids->ne[0] >= head_w->ne[1]) {
         return draft_vocab_fallback(DRAFT_VOCAB_FALLBACK_NOT_SMALLER, "the map has as many rows as the head");
     }
-    if (const char * why = draft_vocab_direct(head_w)) {
-        return draft_vocab_fallback(DRAFT_VOCAB_FALLBACK_HEAD_LAYOUT, why);
+    if (!compact) {
+        if (const char * why = draft_vocab_direct(head_w)) {
+            return draft_vocab_fallback(DRAFT_VOCAB_FALLBACK_HEAD_LAYOUT, why);
+        }
     }
     // the compact logits never reach the host: every output row must be consumed by a backend sampler
     for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
@@ -4518,6 +4548,13 @@ ggml_tensor * llm_graph_context::build_draft_vocab_logits(
         }
     }
     GGML_ASSERT(cur->ne[1] == n_outputs);
+
+    if (compact) {
+        ggml_tensor * logits = build_draft_vocab_compact(head_w, head_s, cur); // [n_sel, n_outputs]
+        cb(logits, "draft_vocab_logits", -1);
+        res->t_logits_ids = draft_vocab_ids;
+        return logits;
+    }
 
     const int64_t n_sel = draft_vocab_ids->ne[0];
     ggml_ledger_addf("llama.draft_vocab", 1, "shortlist n_sel=%lld", (long long) n_sel);
@@ -4549,7 +4586,8 @@ ggml_tensor * llm_graph_context::build_draft_vocab_logits_chain(
     if (draft_vocab_ids == nullptr || head_w == nullptr) {
         return nullptr;
     }
-    if (hadamard_rotations && hadamard_rotations->count(head_w)) {
+    const bool compact = draft_vocab_compact != nullptr && draft_vocab_compact_src == head_w;
+    if (!compact && hadamard_rotations && hadamard_rotations->count(head_w)) {
         return draft_vocab_fallback(DRAFT_VOCAB_FALLBACK_HADAMARD, "the output head is Hadamard-rotated");
     }
     if (loras && !loras->empty()) {
@@ -4561,10 +4599,15 @@ ggml_tensor * llm_graph_context::build_draft_vocab_logits_chain(
     if (draft_vocab_ids->ne[0] >= head_w->ne[1]) {
         return draft_vocab_fallback(DRAFT_VOCAB_FALLBACK_NOT_SMALLER, "the map has as many rows as the head");
     }
-    if (const char * why = draft_vocab_direct(head_w)) {
-        return draft_vocab_fallback(DRAFT_VOCAB_FALLBACK_HEAD_LAYOUT, why);
+    if (!compact) {
+        if (const char * why = draft_vocab_direct(head_w)) {
+            return draft_vocab_fallback(DRAFT_VOCAB_FALLBACK_HEAD_LAYOUT, why);
+        }
     }
     GGML_ASSERT(cur->ne[1] == 1);
+    if (compact) {
+        return build_draft_vocab_compact(head_w, head_s, cur);
+    }
 
     const int64_t n_sel = draft_vocab_ids->ne[0];
     ggml_ledger_addf("llama.draft_vocab", 1, "chain_shortlist n_sel=%lld", (long long) n_sel);
