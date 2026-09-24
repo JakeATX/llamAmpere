@@ -1291,7 +1291,12 @@ bool llama_context::kv_stream_switch_phase(bool decode, uint32_t active_tokens) 
 
     // Releasing the scheduler returns the only borrowed compute lease.
     sched.reset();
-    gf_res_prev->reset();
+    for (auto & res : gf_res_prev) {
+        if (res) {
+            res->reset();
+        }
+    }
+    gf_res_prev_active = nullptr;
 
     const size_t   old_kv_bytes       = arena.current_kv_bytes;
     const size_t   old_compute_offset = arena.current_compute_offset;

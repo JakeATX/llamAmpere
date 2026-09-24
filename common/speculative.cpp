@@ -1028,20 +1028,6 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             batch_inject.pos = (llama_pos *) malloc(sizeof(llama_pos) * 4 * llama_n_batch(ctx_dft));
         }
 
-        // embd batches on an M-RoPE draft need 4 position rows per token
-        is_mrope = llama_model_rope_type(model_dft) == LLAMA_ROPE_TYPE_MROPE;
-        if (is_mrope) {
-            free(batch_inject.pos);
-            batch_inject.pos = (llama_pos *) malloc(sizeof(llama_pos) * 4 * llama_n_batch(ctx_dft));
-        }
-
-        // embd batches on an M-RoPE draft need 4 position rows per token
-        is_mrope = llama_model_rope_type(model_dft) == LLAMA_ROPE_TYPE_MROPE;
-        if (is_mrope) {
-            free(batch_inject.pos);
-            batch_inject.pos = (llama_pos *) malloc(sizeof(llama_pos) * 4 * llama_n_batch(ctx_dft));
-        }
-
         smpls.resize(n_seq);
         for (auto & s : smpls) {
             common_params_sampling sparams;
