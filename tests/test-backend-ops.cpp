@@ -7504,6 +7504,69 @@ struct test_mul_mat_shared_src1 : public test_case {
     }
 };
 
+// [#46] Pre-norm residual block: s = a + b, y = rms_norm(s) * gamma, then two quantized matvecs on y (weight types
+// type1, type2) and the residual s. With GGML_CUDA_ADD_RMS_Q8=1 the CUDA backend runs ADD + RMS_NORM + MUL as one
+// kernel that also prefills the q8_1 cache for the first matvec; a wrong prefill layout breaks the matvec result.
+// k == m so the residual can join the output. The fusion counter is only required when the env var is set.
+struct test_add_rms_norm_mul_mm : public test_case {
+    const ggml_type type1;
+    const ggml_type type2;
+    const int64_t k;
+    const int64_t n;
+
+    test_add_rms_norm_mul_mm(ggml_type type1, ggml_type type2, int64_t k, int64_t n)
+        : type1(type1), type2(type2), k(k), n(n) {}
+
+    // n <= 4 routes to mmvq for every type tested here (see test_mul_mat_shared_src1)
+    const char * required_fusion() override {
+        static const bool on = [] {
+            const char * e = getenv("GGML_CUDA_ADD_RMS_Q8");
+            return e != nullptr && atoi(e) != 0;
+        }();
+        if (!on) {
+            return nullptr;
+        }
+        return n <= 4 ? "add_rms_q8" : "add_rms";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR4(type1, type2, k, n);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "ADD_RMS_NORM_MUL_MM";
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_tensor * b     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_tensor * gamma = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k);
+        ggml_tensor * w1    = ggml_new_tensor_2d(ctx, type1, k, k);
+        ggml_tensor * w2    = ggml_new_tensor_2d(ctx, type2, k, k);
+        ggml_set_name(a, "a");
+        ggml_set_name(b, "b");
+        ggml_set_name(gamma, "gamma");
+        ggml_set_name(w1, "w1");
+        ggml_set_name(w2, "w2");
+
+        ggml_tensor * s = ggml_add(ctx, a, b);
+        ggml_set_name(s, "residual");
+        ggml_tensor * y = ggml_mul(ctx, ggml_rms_norm(ctx, s, 1e-6f), gamma);
+        ggml_set_name(y, "normed");
+
+        ggml_tensor * out = ggml_add(ctx, ggml_add(ctx, ggml_mul_mat(ctx, w1, y), ggml_mul_mat(ctx, w2, y)), s);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // A run of elementwise ops with same-shape and single-value operands, including the two
 // activations whose fused forms must round exactly like the unary kernels (GELU, SOFTPLUS).
 struct test_elem_chain_fusion : public test_case {
@@ -9807,6 +9870,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         for (int ntok : {1, 4}) {
             test_cases.emplace_back(new test_moe_reduce_fusion(type, 64, 256, 8, 4, ntok));
+        }
+    }
+    // [#46] k 256: 256-thread blocks; 1536: 1024-thread blocks, no q8_1 padding; 2304: padded to 2560
+    for (int64_t k : {256, 1536, 2304}) {
+        for (int n : {1, 3, 8}) {
+            test_cases.emplace_back(new test_add_rms_norm_mul_mm(GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_XS, k, n));
+            test_cases.emplace_back(new test_add_rms_norm_mul_mm(GGML_TYPE_Q4_K,   GGML_TYPE_IQ4_XS, k, n));
+            test_cases.emplace_back(new test_add_rms_norm_mul_mm(GGML_TYPE_Q8_0,   GGML_TYPE_Q8_0,   k, n));
         }
     }
     test_cases.emplace_back(new test_elem_chain_fusion({256, 4, 2, 1}, false));

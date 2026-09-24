@@ -4161,6 +4161,105 @@ static void ggml_cuda_ledger_fusion(const ggml_cgraph * cgraph, int i, int nodes
     });
 }
 
+// [#46] Weight type of the first MUL_MAT that consumes act, when that MUL_MAT will quantize act through the MMVQ
+// shared-quantize cache (ggml_cuda_mul_mat -> ggml_cuda_mul_mat_vec_q with the plain activation), else GGML_TYPE_COUNT.
+// This mirrors the ggml_cuda_mul_mat routing up to the MMVQ branch. A wrong answer only wastes the prefill: the
+// consumer checks the full cache key (tensor, data, epoch, size, layout, weight type) itself.
+static ggml_type ggml_cuda_add_rms_q8_consumer_type(const ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph,
+                                                    const int i_act) {
+    const ggml_tensor * act = cgraph->nodes[i_act];
+    const int cc        = ggml_cuda_info().devices[ctx.device].cc;
+    const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
+    const int64_t ne11  = act->ne[1];
+
+    for (int j = i_act + 1; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * node = cgraph->nodes[j];
+        if (node->op != GGML_OP_MUL_MAT || node->src[1] != act) {
+            continue;
+        }
+        const ggml_tensor * w = node->src[0];
+        const bool rotated = w->type == GGML_TYPE_Q8_CR || w->type == GGML_TYPE_Q5_CR || w->type == GGML_TYPE_Q6_CR ||
+                             w->type == GGML_TYPE_TQ4_1S || w->type == GGML_TYPE_TQ3_1S || ggml_exl3_bits(w->type) != 0;
+        if (rotated || node->type != GGML_TYPE_F32 || w->buffer == nullptr ||
+                ggml_backend_buffer_get_usage(w->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE ||
+                ggml_get_op_params_i32(node, 1) == GGML_HINT_SRC0_IS_HADAMARD ||
+                ggml_cuda_should_use_mmvf(w->type, cc, w->ne, w->nb, ne11) ||
+                ggml_cuda_should_use_mmf(w->type, cc, warp_size, w->ne, w->nb, ne11, /*mul_mat_id =*/ false) ||
+                !ggml_cuda_should_use_mmvq(w->type, cc, ne11)) {
+            return GGML_TYPE_COUNT;
+        }
+        return w->type;
+    }
+    return GGML_TYPE_COUNT;
+}
+
+// [#46] ADD -> RMS_NORM -> MUL(gamma) at nodes i..i+2 (the pre-norm residual of every layer): one kernel writes the
+// residual sum and the normed activation, and prefills the MMVQ q8_1 cache for the first consumer. Opt-in with
+// GGML_CUDA_ADD_RMS_Q8=1 (bit-identical to the unfused path, see tests/test-add-rms-q8.cpp). Returns nodes to skip.
+static int ggml_cuda_try_add_rms_norm_mul(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, const int i) {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_CUDA_ADD_RMS_Q8");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    if (!enabled || i + 2 >= cgraph->n_nodes) {
+        return 0;
+    }
+    ggml_tensor * add = cgraph->nodes[i];
+    ggml_tensor * rms = cgraph->nodes[i + 1];
+    ggml_tensor * mul = cgraph->nodes[i + 2];
+    if (add->op != GGML_OP_ADD || rms->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL || rms->src[0] != add) {
+        return 0;
+    }
+    const ggml_tensor * gamma = mul->src[0] == rms ? mul->src[1] : mul->src[1] == rms ? mul->src[0] : nullptr;
+    const ggml_tensor * a     = add->src[0];
+    const ggml_tensor * b     = add->src[1];
+    if (gamma == nullptr || a == nullptr || b == nullptr) {
+        return 0;
+    }
+    for (const ggml_tensor * t : { a, b, (const ggml_tensor *) add, (const ggml_tensor *) rms, (const ggml_tensor *) mul, gamma }) {
+        if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t)) {
+            return 0;
+        }
+    }
+    if (!ggml_are_same_shape(a, add) || !ggml_are_same_shape(b, add) || !ggml_are_same_shape(mul, add) ||
+            gamma->ne[0] != add->ne[0] || ggml_nrows(gamma) != 1 || add->ne[0] > std::numeric_limits<int>::max()) {
+        return 0;
+    }
+    // the add output is the residual (a second use), the rms_norm output is elided
+    if (!ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL }, { i, i + 2 })) {
+        return 0;
+    }
+    // outputs may alias an input only exactly (see add_rms_norm_mul_f32), and never each other
+    const auto disjoint_or_same = [](const ggml_tensor * x, const ggml_tensor * y, const bool same_ok) {
+        const char * x0 = (const char *) x->data;
+        const char * y0 = (const char *) y->data;
+        const char * x1 = x0 + ggml_nbytes(x);
+        const char * y1 = y0 + ggml_nbytes(y);
+        return x1 <= y0 || y1 <= x0 || (same_ok && x0 == y0 && x1 == y1);
+    };
+    if (!disjoint_or_same(add, mul, false) || !disjoint_or_same(add, gamma, false) || !disjoint_or_same(mul, gamma, false) ||
+            !disjoint_or_same(add, a, true) || !disjoint_or_same(add, b, true) ||
+            !disjoint_or_same(mul, a, true) || !disjoint_or_same(mul, b, true)) {
+        return 0;
+    }
+
+    void *    q8      = nullptr;
+    ggml_type q8_type = GGML_TYPE_COUNT;
+    const ggml_type consumer = ggml_cuda_add_rms_q8_consumer_type(ctx, cgraph, i + 2);
+    if (consumer != GGML_TYPE_COUNT) {
+        const int64_t ne10_padded = GGML_PAD(mul->ne[0], MATRIX_ROW_PADDING);
+        const size_t  q8_bytes    = mul->ne[3]*mul->ne[2] * mul->ne[1]*ne10_padded * sizeof(block_q8_1)/QK8_1;
+        if (ggml_cuda_q8_cacheable(ctx, q8_bytes)) {
+            q8      = ggml_cuda_q8_cache_claim(ctx, mul, consumer, q8_bytes, ne10_padded);
+            q8_type = consumer;
+            ctx.fusion_stats.add_rms_q8++;
+        }
+    }
+    ggml_cuda_op_add_rms_norm_mul(ctx, add, rms, mul, q8, q8_type);
+    ctx.fusion_stats.add_rms++;
+    return 2;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -4179,6 +4278,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     *cuda_ctx, match.experts, match.expert_scale, match.weights, match.dst);
                 return match.node_count - 1;
             }
+        }
+    }
+
+    if (node->op == GGML_OP_ADD) {
+        const int n_skip = ggml_cuda_try_add_rms_norm_mul(*cuda_ctx, cgraph, i);
+        if (n_skip > 0) {
+            return n_skip;
         }
     }
 
@@ -6512,6 +6618,12 @@ int64_t ggml_backend_cuda_fusion_count(ggml_backend_t backend, const char * name
     }
     if (strcmp(name, "fused_mul") == 0) {
         return ctx->fusion_stats.fused_mul;
+    }
+    if (strcmp(name, "add_rms") == 0) {
+        return ctx->fusion_stats.add_rms;
+    }
+    if (strcmp(name, "add_rms_q8") == 0) {
+        return ctx->fusion_stats.add_rms_q8;
     }
     return -1;
 }
