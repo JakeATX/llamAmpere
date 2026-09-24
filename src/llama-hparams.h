@@ -249,10 +249,6 @@ struct llama_hparams {
     uint32_t n_embd_out_impl = 0;
 
     uint32_t dflash_block_size       = 0;
-    uint32_t dflash_conv_kernel_size = 0;
-    uint32_t dflash_conv_group_size  = 0;
-    uint32_t dflash_selector_rank    = 0;
-    uint32_t dflash_selector_top_k   = 0;
 
     // llama4 smallthinker
     uint32_t n_moe_layer_step        = 0;

@@ -1210,6 +1210,8 @@ static bool llama_model_has_cacheable_moe_weights(const llama_model &           
     LLAMA_LOG_INFO("%s: MoE cache disabled (no cacheable expert tensors found; largest expert slab=%zu KiB, minimum=%zu KiB)\n",
             __func__, largest_expert_bytes >> 10, min_expert_bytes >> 10);
     return false;
+}
+
 static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
     std::unordered_map<const ggml_tensor *, std::vector<ggml_tensor *>> users;
     for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {

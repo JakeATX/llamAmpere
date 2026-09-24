@@ -647,20 +647,6 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
                     ext_factor, attn_factor, beta_fast, beta_slow);
     };
 
-    // drafts for M-RoPE targets use degenerate sections (temporal dim only)
-    int sections[4];
-    std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
-
-    auto build_rope = [&](ggml_tensor * cur, ggml_tensor * pos) {
-        return rope_type == GGML_ROPE_TYPE_MROPE
-            ? ggml_rope_multi(ctx0, cur, pos, nullptr,
-                    n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
-                    ext_factor, attn_factor, beta_fast, beta_slow)
-            : ggml_rope_ext(ctx0, cur, pos, nullptr,
-                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
-                    ext_factor, attn_factor, beta_fast, beta_slow);
-    };
-
     // KV cache injection
     if (ubatch.embd) {
         auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp);
