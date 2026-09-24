@@ -1956,6 +1956,60 @@ static bool ggml_cuda_tq_mmq_supported(const ggml_tensor * src0, const int cc) {
     return ggml_cuda_mmq_has_config(src0->type, src0->ne[1], cc, ggml_cuda_info().devices[id].smpbo);
 }
 
+// [#46] Kernel family ggml_cuda_mul_mat picks once the ConvRot rewrite, the Hadamard hint and the EXL3 branch are behind
+// it. One copy: ggml_cuda_mul_mat dispatches on it and ggml_cuda_add_rms_q8_consumer_type asks it which MUL_MAT will
+// quantize its activation through the MMVQ shared-quantize cache, so the two cannot drift. Checks run in dispatch order.
+enum ggml_cuda_mm_route {
+    GGML_CUDA_MM_ROUTE_CUBLAS_FORCED,   // src0 padding cannot be cleared (compute-buffer view), or src1/dst not f32
+    GGML_CUDA_MM_ROUTE_MMVF,
+    GGML_CUDA_MM_ROUTE_MMVF_TRANSPOSED, // f32 src0 with one row: src1 is the matrix
+    GGML_CUDA_MM_ROUTE_MMF,
+    GGML_CUDA_MM_ROUTE_MMVQ,            // ggml_cuda_mul_mat_vec_q with the plain src1 (q8_1 through the q8_cache)
+    GGML_CUDA_MM_ROUTE_MMQ,
+    GGML_CUDA_MM_ROUTE_OTHER,           // TQ weights and the cuBLAS tail, decided in ggml_cuda_mul_mat
+};
+
+static ggml_cuda_mm_route ggml_cuda_mul_mat_route(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst,
+                                                  const int cc, const int warp_size) {
+    // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
+    // But if src0 is also a view of another tensor then this cannot be done safely because it may overwrite valid tensor data.
+    // Therefore, in such cases use cuBLAS.
+    const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE
+        && ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
+    if (bad_padding_clear || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return GGML_CUDA_MM_ROUTE_CUBLAS_FORCED;
+    }
+
+    const int64_t ne11 = src1->ne[1];
+
+    if (ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11)) {
+        // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
+        // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
+        return GGML_CUDA_MM_ROUTE_MMVF;
+    }
+    // A transposed vector can still use MMVQ (i.e. ne01 == 1)
+    if (src0->ne[1] == 1 && ne11 > MMVF_MAX_BATCH_SIZE && dst->ne[2] == 1 && dst->ne[3] == 1
+            && src0->type == GGML_TYPE_F32
+            && ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)
+            && ggml_cuda_should_use_mmvf(src1->type, cc, src1->ne, src1->nb, /*ne11 =*/ 1)) {
+        return GGML_CUDA_MM_ROUTE_MMVF_TRANSPOSED;
+    }
+    if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
+        return GGML_CUDA_MM_ROUTE_MMF;
+    }
+
+    // TQ weight types use the fused dp4a path (decode) or runtime q8_0 conversion + cuBLAS (prefill),
+    // never mmvq/mmq (mmvq's type switch has no TQ cases and aborts).
+    const bool is_tq_weight = (src0->type == GGML_TYPE_TQ4_1S || src0->type == GGML_TYPE_TQ3_1S);
+    if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11) && !is_tq_weight) {
+        return GGML_CUDA_MM_ROUTE_MMVQ;
+    }
+    if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
+        return GGML_CUDA_MM_ROUTE_MMQ;
+    }
+    return GGML_CUDA_MM_ROUTE_OTHER;
+}
+
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0_, const ggml_tensor * src1_, ggml_tensor * dst) {
     // Q8_CR weights are stored rotated: rotate the activations with the same
     // matrix and run the standard Q8_0 kernels (the rotations cancel)
@@ -2093,32 +2147,23 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         return;
     }
 
-    // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
-    // But if src0 is also a view of another tensor then this cannot be done safely because it may overwrite valid tensor data.
-    // Therefore, in such cases use cuBLAS.
-    const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE
-        && ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
-    if (bad_padding_clear || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+    const int cc        = ggml_cuda_info().devices[ctx.device].cc;
+    const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
+
+    // [#46] routing decision shared with the ADD + RMS_NORM + MUL q8_1 prefill (ggml_cuda_add_rms_q8_consumer_type)
+    const ggml_cuda_mm_route route = ggml_cuda_mul_mat_route(src0, src1, dst, cc, warp_size);
+
+    if (route == GGML_CUDA_MM_ROUTE_CUBLAS_FORCED) {
         ggml_cuda_ledger_mm("cuda.mul_mat", "cublas_forced", src0_->type, src1_->ne[1]);
         ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
         return;
     }
-
-    const int cc        = ggml_cuda_info().devices[ctx.device].cc;
-    const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
-
-    if (ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11)) {
-        // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
-        // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
+    if (route == GGML_CUDA_MM_ROUTE_MMVF) {
         ggml_cuda_ledger_mm("cuda.mul_mat", "mmvf", src0_->type, src1_->ne[1]);
         ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
         return;
     }
-    // A transposed vector can still use MMVQ (i.e. ne01 == 1)
-    if (ne01 == 1 && ne11 > MMVF_MAX_BATCH_SIZE && ne2 == 1 && ne3 == 1
-            && src0->type == GGML_TYPE_F32
-            && ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)
-            && ggml_cuda_should_use_mmvf(src1->type, cc, src1->ne, src1->nb, /*ne11 =*/ 1)) {
+    if (route == GGML_CUDA_MM_ROUTE_MMVF_TRANSPOSED) {
         ggml_tensor dst_vec = *dst;
         dst_vec.ne[0] = ne11;
         dst_vec.ne[1] = 1;
@@ -2129,7 +2174,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_vec_f(ctx, src1, src0, nullptr, &dst_vec);
         return;
     }
-    if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
+    if (route == GGML_CUDA_MM_ROUTE_MMF) {
         ggml_cuda_ledger_mm("cuda.mul_mat", "mmf", src0_->type, src1_->ne[1]);
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
         return;
@@ -2138,12 +2183,12 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // TQ weight types use the fused dp4a path (decode) or runtime q8_0 conversion + cuBLAS (prefill),
     // never mmvq/mmq (mmvq's type switch has no TQ cases and aborts).
     const bool is_tq_weight = (src0->type == GGML_TYPE_TQ4_1S || src0->type == GGML_TYPE_TQ3_1S);
-    if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11) && !is_tq_weight) {
+    if (route == GGML_CUDA_MM_ROUTE_MMVQ) {
         ggml_cuda_ledger_mm("cuda.mul_mat", "mmvq", src0_->type, src1_->ne[1]);
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
         return;
     }
-    if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
+    if (route == GGML_CUDA_MM_ROUTE_MMQ) {
         ggml_cuda_ledger_mm("cuda.mul_mat", "mmq", src0_->type, src1_->ne[1]);
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
         return;
@@ -4163,14 +4208,19 @@ static void ggml_cuda_ledger_fusion(const ggml_cgraph * cgraph, int i, int nodes
 
 // [#46] Weight type of the first MUL_MAT that consumes act, when that MUL_MAT will quantize act through the MMVQ
 // shared-quantize cache (ggml_cuda_mul_mat -> ggml_cuda_mul_mat_vec_q with the plain activation), else GGML_TYPE_COUNT.
-// This mirrors the ggml_cuda_mul_mat routing up to the MMVQ branch. A wrong answer only wastes the prefill: the
-// consumer checks the full cache key (tensor, data, epoch, size, layout, weight type) itself.
+// The routing answer is ggml_cuda_mul_mat_route, the function ggml_cuda_mul_mat dispatches on (ggml-cuda.cu:2154), so
+// it cannot drift. The three checks ahead of it are the branches ggml_cuda_mul_mat takes before the route
+// (ggml-cuda.cu:2025-2147): ConvRot weights always run on a rotated pool copy of src1 (never the cached plain
+// activation), EXL3 never reaches MMVQ, and a Hadamard hint is answered "no" without trying ggml_cuda_op_fwht (its src0
+// is the Hadamard matrix, never an MMVQ type). The fused MMVQ launches in ggml_cuda_try_fuse
+// (ggml_cuda_should_fuse_mul_mat_vec_q, ncols_dst == 1) quantize the same plain src1 through the same cache. A wrong
+// answer only wastes the prefill: the consumer checks the full cache key (tensor, data, epoch, size, layout, weight
+// type) itself (mmvq.cu:2284).
 static ggml_type ggml_cuda_add_rms_q8_consumer_type(const ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph,
                                                     const int i_act) {
     const ggml_tensor * act = cgraph->nodes[i_act];
     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
-    const int64_t ne11  = act->ne[1];
 
     for (int j = i_act + 1; j < cgraph->n_nodes; ++j) {
         const ggml_tensor * node = cgraph->nodes[j];
@@ -4178,14 +4228,10 @@ static ggml_type ggml_cuda_add_rms_q8_consumer_type(const ggml_backend_cuda_cont
             continue;
         }
         const ggml_tensor * w = node->src[0];
-        const bool rotated = w->type == GGML_TYPE_Q8_CR || w->type == GGML_TYPE_Q5_CR || w->type == GGML_TYPE_Q6_CR ||
-                             w->type == GGML_TYPE_TQ4_1S || w->type == GGML_TYPE_TQ3_1S || ggml_exl3_bits(w->type) != 0;
-        if (rotated || node->type != GGML_TYPE_F32 || w->buffer == nullptr ||
-                ggml_backend_buffer_get_usage(w->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE ||
+        const bool rotated = w->type == GGML_TYPE_Q8_CR || w->type == GGML_TYPE_Q5_CR || w->type == GGML_TYPE_Q6_CR;
+        if (rotated || w->buffer == nullptr || ggml_exl3_bits(w->type) != 0 ||
                 ggml_get_op_params_i32(node, 1) == GGML_HINT_SRC0_IS_HADAMARD ||
-                ggml_cuda_should_use_mmvf(w->type, cc, w->ne, w->nb, ne11) ||
-                ggml_cuda_should_use_mmf(w->type, cc, warp_size, w->ne, w->nb, ne11, /*mul_mat_id =*/ false) ||
-                !ggml_cuda_should_use_mmvq(w->type, cc, ne11)) {
+                ggml_cuda_mul_mat_route(w, act, node, cc, warp_size) != GGML_CUDA_MM_ROUTE_MMVQ) {
             return GGML_TYPE_COUNT;
         }
         return w->type;
