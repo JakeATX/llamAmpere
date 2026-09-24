@@ -16,6 +16,10 @@ LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         uint32_t n_seqs,
         uint32_t n_outputs);
 
+// Tokenizer identity used to pick a built-in draft vocabulary shortlist (--spec-draft-vocab-map auto):
+// FNV-1a 64 over every token string and BPE merge, see src/llama-mtp-vocab-builtin.h.
+LLAMA_API uint64_t llama_model_tokenizer_fingerprint(const struct llama_model * model);
+
 // Get the default ggml_type for a given ftype.
 LLAMA_API ggml_type llama_ftype_get_default_type(llama_ftype ftype);
 

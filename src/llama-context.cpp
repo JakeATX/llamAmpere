@@ -22,6 +22,7 @@
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-mtp-vocab.h"
+#include "llama-mtp-vocab-builtin.h"
 #include "llama-ext.h"
 #include "llama-sampler.h"
 #include "llama.h"
@@ -272,6 +273,9 @@ llama_context::llama_context(
         const char * path = params.draft_vocab_map;
         if ((path == nullptr || path[0] == '\0') && cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
             path = getenv("LLAMA_SPEC_DRAFT_VOCAB");
+        }
+        if (path != nullptr && std::strcmp(path, "none") == 0) {
+            path = nullptr;
         }
         if (path != nullptr && path[0] != '\0') {
             if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
@@ -667,15 +671,54 @@ llama_context::~llama_context() {
     ggml_opt_free(opt_ctx);
 }
 
-void llama_context::init_draft_vocab(const char * path, int32_t n_hot) {
-    std::ifstream file(path);
-    if (!file) {
-        throw std::runtime_error(format("cannot open draft vocabulary map '%s'", path));
+// tokenizer identity for the built-in shortlists: every token string and every BPE merge, in order
+// (definition in llama-mtp-vocab-builtin.h, scripts/gen-mtp-vocab-builtin.py computes the same value)
+uint64_t llama_model_tokenizer_fingerprint(const llama_model * model) {
+    const llama_vocab & vocab = model->vocab;
+    llama_fnv1a64 h;
+    const uint32_t n = vocab.n_tokens();
+    for (uint32_t i = 0; i < n; ++i) {
+        const char * text = vocab.token_get_text((llama_token) i);
+        h.add(text, std::strlen(text));
+        const uint8_t z = 0;
+        h.add(&z, 1);
     }
+    const uint8_t sep = 1;
+    h.add(&sep, 1);
+    for (const auto & m : vocab.get_bpe_merges()) {
+        h.add_str0(m);
+    }
+    return h.h;
+}
 
+void llama_context::init_draft_vocab(const char * path, int32_t n_hot) {
     const int64_t n_vocab = model.vocab.n_tokens();
 
-    llama_mtp_vocab_map map = llama_mtp_vocab_read(file, n_vocab);
+    llama_mtp_vocab_map map;
+    std::string source = path;
+
+    int64_t auto_size = 0;
+    if (llama_mtp_vocab_parse_auto(path, auto_size)) {
+        // pick the list compiled into the binary for this tokenizer + architecture, if there is one
+        const uint64_t fp   = llama_model_tokenizer_fingerprint(&model);
+        const char *   arch = llm_arch_name(model.arch);
+        const llama_mtp_vocab_builtin * b = llama_mtp_vocab_builtin_find(fp, n_vocab, arch, auto_size);
+        if (b == nullptr) {
+            LLAMA_LOG_INFO("%s: draft vocabulary '%s': no built-in shortlist for this tokenizer (fingerprint %016" PRIx64
+                    ", %lld tokens, arch %s), the draft scores the full head\n",
+                    __func__, path, fp, (long long) n_vocab, arch);
+            return;
+        }
+        map.n_vocab = b->n_vocab;
+        map.ids     = llama_mtp_vocab_builtin_ids(*b);
+        source      = format("built-in %s (%s family, tokenizer %016" PRIx64 ")", b->name, b->family, fp);
+    } else {
+        std::ifstream file(path);
+        if (!file) {
+            throw std::runtime_error(format("cannot open draft vocabulary map '%s'", path));
+        }
+        map = llama_mtp_vocab_read(file, n_vocab);
+    }
     if (map.n_vocab != n_vocab) {
         throw std::runtime_error(format("draft vocabulary map '%s' is for a %lld-token vocabulary, model has %lld",
                     path, (long long) map.n_vocab, (long long) n_vocab));
@@ -718,8 +761,8 @@ void llama_context::init_draft_vocab(const char * path, int32_t n_hot) {
         draft_vocab.hot.init(draft_vocab.host, n_vocab, n_hot);
     }
 
-    LLAMA_LOG_INFO("%s: draft vocabulary shortlist: %lld of %lld tokens from '%s', map on %s (%.1f KiB), head %s (%s)\n",
-            __func__, (long long) n_sel, (long long) n_vocab, path, ggml_backend_buft_name(buft),
+    LLAMA_LOG_INFO("%s: draft vocabulary shortlist: %lld of %lld tokens from %s, map on %s (%.1f KiB), head %s (%s)\n",
+            __func__, (long long) n_sel, (long long) n_vocab, source.c_str(), ggml_backend_buft_name(buft),
             (double) n_sel * sizeof(int32_t) / 1024.0, ggml_get_name(head), ggml_type_name(head->type));
     if (n_hot > 0) {
         LLAMA_LOG_INFO("%s: draft vocabulary tail: %d of %lld entries are adaptive hot slots\n",
@@ -3219,6 +3262,7 @@ llm_graph_params llama_context::graph_params(
         /*.hadamard_inverses  =*/ &model.hadamard_inverses,
         /*.samplers    =*/ sampling.samplers,
         /*.draft_vocab =*/ draft_vocab.ids,
+        /*.draft_vocab_warned =*/ &draft_vocab.warned,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,

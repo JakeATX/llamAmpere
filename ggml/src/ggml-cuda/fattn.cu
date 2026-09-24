@@ -5,6 +5,7 @@
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
+#include "ledger.cuh"
 
 #include <atomic>
 #include <cstdio>
@@ -24,6 +25,21 @@ static bool ggml_cuda_fattn_path_stats_enabled() {
 }
 
 static void ggml_cuda_fattn_path_note(const char * path, const ggml_tensor * dst, int ncols2) {
+    {
+        // fallback ledger (GGML_LEDGER=1): kernel family per K/V pair and query width
+        const ggml_tensor * Q = dst->src[0];
+        const ggml_tensor * K = dst->src[1];
+        const ggml_tensor * V = dst->src[2];
+        const uint64_t id = ggml_cuda_ledger_mix(ggml_cuda_ledger_mix(ggml_cuda_ledger_mix(ggml_cuda_ledger_mix(
+            (uint64_t) (uintptr_t) path, (uint64_t) K->type), (uint64_t) V->type), (uint64_t) Q->ne[0]),
+            (uint64_t) ggml_cuda_ledger_width_bucket(Q->ne[1]) * 64 + (uint64_t) (ncols2 + 1));
+        ggml_cuda_ledger_count("cuda.fattn", id, [&](char * buf, size_t size) {
+            char w[16];
+            ggml_cuda_ledger_width_str(Q->ne[1], w, sizeof(w));
+            snprintf(buf, size, "path=%s K=%s V=%s D=%d n_q=%s ncols2=%d", path, ggml_type_name(K->type), ggml_type_name(V->type),
+                (int) Q->ne[0], w, ncols2);
+        });
+    }
     if (!ggml_cuda_fattn_path_stats_enabled()) {
         return;
     }

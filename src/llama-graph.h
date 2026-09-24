@@ -11,6 +11,7 @@
 #include <memory>
 #include <set>
 #include <functional>
+#include <atomic>
 #include <map>
 #include <unordered_map>
 #include <tuple>
@@ -853,6 +854,9 @@ struct llm_graph_params {
     // draft-only vocabulary shortlist: [n_sel] I32 token ids owned by the context, or nullptr
     ggml_tensor * draft_vocab_ids = nullptr;
 
+    // bit per full-head fallback reason already warned about, owned by the context (warn once per context)
+    std::atomic<uint32_t> * draft_vocab_warned = nullptr;
+
     static bool samplers_equal(
           const std::map<llama_seq_id, llama_sampler *> & lhs,
           const std::map<llama_seq_id, llama_sampler *> & rhs) {
@@ -1105,6 +1109,10 @@ struct llm_graph_context {
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     ggml_tensor * draft_vocab_ids; // see llm_graph_params
+    std::atomic<uint32_t> * draft_vocab_warned; // see llm_graph_params
+
+    // full-head fallback of build_draft_vocab_logits: counts the reason in the fallback ledger, warns once per context
+    ggml_tensor * draft_vocab_fallback(int reason, const char * detail) const;
 
     // Shared transforms are valid for one graph build only.
     mutable std::map<std::tuple<const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, int64_t, int64_t, int64_t>, ggml_tensor *> hadamard_memo;

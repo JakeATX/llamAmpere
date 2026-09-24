@@ -18,6 +18,8 @@
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
+#include "ggml-ledger.h"
+
 #include <cassert>
 #include <cmath>
 #include <cstdlib>
@@ -1594,6 +1596,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     hadamard_inverses (params.hadamard_inverses),
     samplers         (params.samplers),
     draft_vocab_ids  (params.draft_vocab_ids),
+    draft_vocab_warned(params.draft_vocab_warned),
     cb_func          (params.cb),
     res              (params.res),
     model_ref        (params.model),
@@ -4400,20 +4403,27 @@ void llm_graph_context::build_sampling() const {
 }
 
 // Only these head layouts reach the CUDA MMVQ one-row-expert path (no expert sorting, no dequantization).
-static bool draft_vocab_direct(const ggml_tensor * head) {
-    if (!head->buffer || !ggml_is_contiguous(head)) {
-        return false;
+// Returns nullptr when the head qualifies, else why it does not.
+static const char * draft_vocab_direct(const ggml_tensor * head) {
+    if (!head->buffer) {
+        return "head has no buffer";
+    }
+    if (!ggml_is_contiguous(head)) {
+        return "head is not contiguous";
     }
     auto * buft = ggml_backend_buffer_get_type(head->buffer);
     auto * dev  = ggml_backend_buft_get_device(buft);
     if (!dev) {
-        return false;
+        return "head buffer has no device";
     }
     // a Meta device (--split-mode tensor) has no backend registry: the head is sharded across devices there,
     // so the one-row-expert path does not apply and the full head is used instead
     auto * reg = ggml_backend_dev_backend_reg(dev);
-    if (!reg || std::strcmp(ggml_backend_reg_name(reg), "CUDA") != 0 || buft != ggml_backend_dev_buffer_type(dev)) {
-        return false;
+    if (!reg || std::strcmp(ggml_backend_reg_name(reg), "CUDA") != 0) {
+        return "head is not on a CUDA device";
+    }
+    if (buft != ggml_backend_dev_buffer_type(dev)) {
+        return "head is in a split or host buffer";
     }
     switch (head->type) {
         case GGML_TYPE_Q4_0: case GGML_TYPE_Q4_1: case GGML_TYPE_Q5_0: case GGML_TYPE_Q5_1:
@@ -4421,10 +4431,42 @@ static bool draft_vocab_direct(const ggml_tensor * head) {
         case GGML_TYPE_Q5_K: case GGML_TYPE_Q6_K: case GGML_TYPE_IQ2_XXS: case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ2_S: case GGML_TYPE_IQ3_XXS: case GGML_TYPE_IQ3_S: case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_IQ4_XS: case GGML_TYPE_IQ1_S: case GGML_TYPE_IQ1_M:
-            return true;
+            return nullptr;
         default:
-            return false;
+            return "head type has no one-row MMVQ path";
     }
+}
+
+enum draft_vocab_fallback_reason {
+    DRAFT_VOCAB_FALLBACK_HADAMARD,
+    DRAFT_VOCAB_FALLBACK_LORA,
+    DRAFT_VOCAB_FALLBACK_HEAD_SCALE,
+    DRAFT_VOCAB_FALLBACK_NOT_SMALLER,
+    DRAFT_VOCAB_FALLBACK_HEAD_LAYOUT,
+    DRAFT_VOCAB_FALLBACK_NO_BACKEND_SAMPLER,
+};
+
+static const char * draft_vocab_fallback_name(int reason) {
+    switch (reason) {
+        case DRAFT_VOCAB_FALLBACK_HADAMARD:           return "hadamard_head";
+        case DRAFT_VOCAB_FALLBACK_LORA:               return "lora";
+        case DRAFT_VOCAB_FALLBACK_HEAD_SCALE:         return "per_row_head_scale";
+        case DRAFT_VOCAB_FALLBACK_NOT_SMALLER:        return "map_not_smaller_than_head";
+        case DRAFT_VOCAB_FALLBACK_HEAD_LAYOUT:        return "head_layout";
+        case DRAFT_VOCAB_FALLBACK_NO_BACKEND_SAMPLER: return "no_backend_sampler";
+        default:                                      return "unknown";
+    }
+}
+
+ggml_tensor * llm_graph_context::draft_vocab_fallback(int reason, const char * detail) const {
+    ggml_ledger_addf("llama.draft_vocab", 1, "full_head reason=%s", draft_vocab_fallback_name(reason));
+    const uint32_t bit = 1u << reason;
+    if (draft_vocab_warned == nullptr || (draft_vocab_warned->fetch_or(bit) & bit) == 0) {
+        LLAMA_LOG_WARN("%s: draft vocabulary shortlist not applied (%s%s%s), the draft scores the full head; "
+                       "logged once per context\n", __func__, draft_vocab_fallback_name(reason),
+                       detail ? ": " : "", detail ? detail : "");
+    }
+    return nullptr;
 }
 
 ggml_tensor * llm_graph_context::build_draft_vocab_logits(
@@ -4435,13 +4477,19 @@ ggml_tensor * llm_graph_context::build_draft_vocab_logits(
         return nullptr;
     }
     if (hadamard_rotations && hadamard_rotations->count(head_w)) {
-        return nullptr;
+        return draft_vocab_fallback(DRAFT_VOCAB_FALLBACK_HADAMARD, "the output head is Hadamard-rotated");
     }
-    if ((loras && !loras->empty()) || (head_s && ggml_nelements(head_s) != 1)) {
-        return nullptr;
+    if (loras && !loras->empty()) {
+        return draft_vocab_fallback(DRAFT_VOCAB_FALLBACK_LORA, "a LoRA adapter is loaded");
     }
-    if (draft_vocab_ids->ne[0] >= head_w->ne[1] || !draft_vocab_direct(head_w)) {
-        return nullptr;
+    if (head_s && ggml_nelements(head_s) != 1) {
+        return draft_vocab_fallback(DRAFT_VOCAB_FALLBACK_HEAD_SCALE, "the output head has a per-row scale");
+    }
+    if (draft_vocab_ids->ne[0] >= head_w->ne[1]) {
+        return draft_vocab_fallback(DRAFT_VOCAB_FALLBACK_NOT_SMALLER, "the map has as many rows as the head");
+    }
+    if (const char * why = draft_vocab_direct(head_w)) {
+        return draft_vocab_fallback(DRAFT_VOCAB_FALLBACK_HEAD_LAYOUT, why);
     }
     // the compact logits never reach the host: every output row must be consumed by a backend sampler
     for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
@@ -4450,13 +4498,14 @@ ggml_tensor * llm_graph_context::build_draft_vocab_logits(
         }
         for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
             if (samplers.find(ubatch.seq_id[i][j]) == samplers.end()) {
-                return nullptr;
+                return draft_vocab_fallback(DRAFT_VOCAB_FALLBACK_NO_BACKEND_SAMPLER, "an output row has no backend sampler");
             }
         }
     }
     GGML_ASSERT(cur->ne[1] == n_outputs);
 
     const int64_t n_sel = draft_vocab_ids->ne[0];
+    ggml_ledger_addf("llama.draft_vocab", 1, "shortlist n_sel=%lld", (long long) n_sel);
 
     // each vocabulary row is a one-row expert of the existing head: no second weight matrix
     ggml_tensor * rows = ggml_reshape_3d(ctx0, head_w, head_w->ne[0], 1, head_w->ne[1]);

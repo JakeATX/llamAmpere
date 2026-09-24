@@ -313,6 +313,7 @@ endif()
 # TODO: make this test (and others) not link `libllama` as it is not needed [TAG_TESTS_LLAMA_LINK]
 llama_build_and_test(test-backend-ops.cpp)
 llama_build_and_test(test-mtp-vocab.cpp)
+llama_build_and_test(test-mtp-vocab-builtin.cpp ../src/llama-mtp-vocab-builtin.cpp)
 llama_build_and_test(test-draft-vocab-hot.cpp)
 if (NOT LLAMA_USE_SYSTEM_GGML)
     llama_build(test-moe-cache.cpp)

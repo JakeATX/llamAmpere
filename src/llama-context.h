@@ -361,6 +361,7 @@ private:
         std::vector<int32_t>    host;          // same ids, host copy
         int32_t                 n_hot = 0;     // trailing adaptive slots (0 = fully static map)
         llama_mtp_hot_vocab     hot;           // ranking policy for those slots
+        mutable std::atomic<uint32_t> warned{0}; // full-head fallback reasons already logged (llm_graph_params)
     };
 
     draft_vocab_info draft_vocab;
