@@ -671,6 +671,19 @@ struct common_params {
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
 
+    // KVarN region-aware cache (-ctk kvarnN -ctv kvarnM): 0 = off; sink/tail positions kept unsealed
+    uint32_t kvarn_bits_k = 0;
+    uint32_t kvarn_bits_v = 0;
+    uint32_t kvarn_tail   = 1024;
+    uint32_t kvarn_sink   = 128;
+    ggml_type kvarn_staging_type = GGML_TYPE_F16;
+    ggml_type kvarn_sink_type = GGML_TYPE_COUNT;
+    ggml_type kvarn_body_type = GGML_TYPE_F32; // F32 sentinel selects scalar KVarN records; I16 = trellis body; COUNT = auto (see llama.h)
+    uint32_t kvarn_tail_max = 0;
+    uint32_t kvarn_edge_layers = 0; // tiered body: first/last N cache layers sealed at kvarn_edge_bits_k/v
+    uint32_t kvarn_edge_bits_k = 4;
+    uint32_t kvarn_edge_bits_v = 4;
+
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 
     // multimodal models (see tools/mtmd)

@@ -47,21 +47,56 @@ typedef void (* fattn_kernel_t)(
 // Per-KV-head view of a KVarN cache inside the MMA kernel (see ggml_flash_attn_ext_set_kvarn).
 // Position p resolves to: p < S -> exact ring row p; S <= p < B -> record (p-S)/G of the body, token (p-S)%G;
 // p >= B -> exact ring row S + (p-S)%cap. Offsets are byte offsets inside one record (ggml_kvarn::make_layout).
-// trellis-coded body (GGML_TYPE_I16): the fp16 codebooks of ggml-kvarn-cb.h (see ggml-kvarn.h, "kvarn4t")
-#include "../ggml-kvarn-cb.h"
-#define FATTN_KVARN_TR_L    KVARN_TRELLIS_CB_L
-#define FATTN_KVARN_TR_NWIN (1 << FATTN_KVARN_TR_L)
-static __device__ uint16_t fattn_kvarn_cb_k[FATTN_KVARN_TR_NWIN] = KVARN_CB_K_INIT;
-static __device__ uint16_t fattn_kvarn_cb_v[FATTN_KVARN_TR_NWIN] = KVARN_CB_V_INIT;
-void ggml_cuda_kvarn_trellis_cb_register(const void * sym_k, const void * sym_v); // kvarn-seal.cu
-struct fattn_kvarn_cb_registrar {
-    fattn_kvarn_cb_registrar() { ggml_cuda_kvarn_trellis_cb_register((const void *) fattn_kvarn_cb_k, (const void *) fattn_kvarn_cb_v); }
+// 3-bit trellis body (GGML_TYPE_I16 with 3-bit K/V, ggml-kvarn.h "trellis3"): fp16 codebooks indexed by the
+// 9-bit stream window ending at each code (built-in trained codebooks; GGML_KVARN_TRELLIS_CB3=identity reproduces the scalar codes).
+#include "../ggml-kvarn.h"
+#define FATTN_KVARN_TR3_NWIN 512
+static __device__ uint16_t fattn_kvarn_cb3_k[FATTN_KVARN_TR3_NWIN] = KVARN_CB3_TRAINED_K_INIT; // built-in trained (ggml-kvarn-cb-lowbits.h), env override copied in by kvarn-seal.cu
+static __device__ uint16_t fattn_kvarn_cb3_v[FATTN_KVARN_TR3_NWIN] = KVARN_CB3_TRAINED_V_INIT;
+// 2-bit trellis body ("trellis2"): 8-bit windows, 256 entries
+#define FATTN_KVARN_TR2_NWIN 256
+static __device__ uint16_t fattn_kvarn_cb2_k[FATTN_KVARN_TR2_NWIN] = KVARN_CB2_TRAINED_K_INIT;
+static __device__ uint16_t fattn_kvarn_cb2_v[FATTN_KVARN_TR2_NWIN] = KVARN_CB2_TRAINED_V_INIT;
+void ggml_cuda_kvarn_trellis_cb3_register(const void * sym_k, const void * sym_v); // kvarn-seal.cu
+void ggml_cuda_kvarn_trellis_cb2_register(const void * sym_k, const void * sym_v); // kvarn-seal.cu
+void ggml_cuda_kvarn_trellis_cb_init();                                            // kvarn-seal.cu
+struct fattn_kvarn_cb3_registrar {
+    fattn_kvarn_cb3_registrar() {
+        ggml_cuda_kvarn_trellis_cb3_register((const void *) fattn_kvarn_cb3_k, (const void *) fattn_kvarn_cb3_v);
+        ggml_cuda_kvarn_trellis_cb2_register((const void *) fattn_kvarn_cb2_k, (const void *) fattn_kvarn_cb2_v);
+    }
 };
-static fattn_kvarn_cb_registrar fattn_kvarn_cb_registrar_instance;
+static fattn_kvarn_cb3_registrar fattn_kvarn_cb3_registrar_instance;
 
-struct fattn_kvarn_ctx {
+// The 8 values of MMA fragment word `word` (same nibble -> (token, channel) map as kvarn_lowbits::fragment_word)
+// decoded through the BITS-bit trellis codebook, packed as q[l] = (value l, value l+4) like fattn_kvarn_lowbits_decode_word.
+template<int BITS, bool is_V>
+static __device__ __forceinline__ void fattn_kvarn_trellis_lb_word(const uint8_t * __restrict__ payload, const int word, half2 * const __restrict__ q /* [4] */) {
+    static_assert(BITS == 2 || BITS == 3, "low-bit trellis decode");
+    const uint16_t * cb = BITS == 3 ? (is_V ? fattn_kvarn_cb3_v : fattn_kvarn_cb3_k) : (is_V ? fattn_kvarn_cb2_v : fattn_kvarn_cb2_k);
+    const int lane  = word & 31;
+    const int tile  = (word >> 5) & 15;
+    const int strip = word >> 9;
+    half vals[8];
+#pragma unroll
+    for (int nib = 0; nib < 8; ++nib) {
+        const int l = nib & 3, e = nib >> 2;
+        const int row = (l & 1)*8 + (lane >> 2);
+        const int col = 2*((l >> 1)*4 + (lane & 3)) + e;
+        const int token   = strip*16 + (is_V ? col : row);
+        const int channel = tile*16  + (is_V ? row : col);
+        vals[nib] = __ushort_as_half(cb[ggml_kvarn::trellis_lb_window<BITS>(payload, token, channel, 256)]);
+    }
+#pragma unroll
+    for (int l = 0; l < 4; ++l) {
+        q[l] = __halves2half2(vals[l], vals[l + 4]);
+    }
+}
+
+struct fattn_kvarn_lowbits_ctx {
     const char * body;   // first record of this KV head; group g sits at body + g*rec_stride
     int S, cap, B, G;
+    int bits_k, bits_v;
     int type_k, type_v;
     int sink_type, sink_stride;
     int64_t sink_head_delta_k, sink_head_delta_v;
@@ -70,11 +105,13 @@ struct fattn_kvarn_ctx {
     int k_scale, k_zero, k_tok, v_payload, v_ch, v_scale, v_zero;
 };
 
-static __device__ __forceinline__ fattn_kvarn_ctx fattn_kvarn_make_ctx(
+static __device__ __forceinline__ fattn_kvarn_lowbits_ctx fattn_kvarn_lowbits_make_ctx(
         const char * body, const int32_t * desc, const int z_KV, const int D, const int bits_k, const int bits_v, const size_t k_head_stride, const size_t v_head_stride) {
-    fattn_kvarn_ctx c;
+    fattn_kvarn_lowbits_ctx c;
     const int G         = desc[GGML_KVARN_DESC_G];
     const int rec_bytes = desc[GGML_KVARN_DESC_RECBYTES];
+    c.bits_k = bits_k;
+    c.bits_v = bits_v;
     c.S          = desc[GGML_KVARN_DESC_S];
     c.cap        = desc[GGML_KVARN_DESC_CAP];
     c.B          = desc[GGML_KVARN_DESC_B];
@@ -100,14 +137,14 @@ static __device__ __forceinline__ fattn_kvarn_ctx fattn_kvarn_make_ctx(
     return c;
 }
 
-static __device__ __forceinline__ const char * fattn_kvarn_sink_row(
-        const char * head, const fattn_kvarn_ctx & kv, const size_t row_stride, const int row, const bool is_v) {
+static __device__ __forceinline__ const char * fattn_kvarn_lowbits_sink_row(
+        const char * head, const fattn_kvarn_lowbits_ctx & kv, const size_t row_stride, const int row, const bool is_v) {
     return head + (size_t) (kv.S + kv.cap)*row_stride +
         (is_v ? kv.sink_head_delta_v : kv.sink_head_delta_k) + (size_t) row*kv.sink_stride;
 }
 
 // Packed ring storage is decoded into registers or shared tiles.
-static __device__ __forceinline__ half2 fattn_kvarn_ring_pair(const char * row, const int pair, const int type) {
+static __device__ __forceinline__ half2 fattn_kvarn_lowbits_ring_pair(const char * row, const int pair, const int type) {
     if (type == GGML_TYPE_F16) {
         return ((const half2 *) row)[pair];
     }

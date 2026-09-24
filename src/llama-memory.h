@@ -14,6 +14,26 @@ class llama_batch_allocr;
 class llama_io_write_i;
 class llama_io_read_i;
 
+// KVarN region-aware attention cache configuration (see llama_kv_cache)
+struct llama_kvarn_config {
+    uint32_t bits_k   = 0;    // 0 = off
+    uint32_t bits_v   = 0;
+    ggml_type sink_type = GGML_TYPE_COUNT; // inherit staging, or a separate F16 sink
+    uint32_t sink     = 128;  // staging positions [0, sink)
+    uint32_t group    = 128;  // tokens per sealed record
+    uint32_t tail     = 1024; // minimum positions kept unsealed behind the newest token
+    uint32_t n_ubatch = 512;  // sizes the ring headroom for stores and rollback
+    ggml_type body_type = GGML_TYPE_F32;
+    uint32_t tail_max = 0;   // 0 = fixed tail; otherwise delay compression until this limit
+    // tiered body: the first and last `edge_layers` attention layers of the cache use the edge bits/codec (tier 1), the rest tier 0
+    uint32_t edge_layers = 0;
+    uint32_t edge_bits_k = 4;
+    uint32_t edge_bits_v = 4;
+    ggml_type edge_body_type = GGML_TYPE_F32;
+
+    bool enabled() const { return bits_k > 0 && bits_v > 0; }
+};
+
 struct llama_memory_params {
     // kv cache
     ggml_type type_k;
@@ -25,6 +45,8 @@ struct llama_memory_params {
     llama_context_type ctx_type;
 
     llama_memory_t mem_other;
+
+    llama_kvarn_config kvarn;
 };
 
 enum llama_memory_status {

@@ -128,6 +128,7 @@ GGML_API size_t quantize_nvfp4(const float * GGML_RESTRICT src, void * GGML_REST
 
 // TurboQuant KV cache compression (arXiv 2504.19874)
 GGML_API void quantize_row_turbo3_0_ref(const float * GGML_RESTRICT x, block_turbo3_0 * GGML_RESTRICT y, int64_t k);
+GGML_API void quantize_row_turbo4_0_rotated_ref(const float * GGML_RESTRICT x, block_turbo4_0 * GGML_RESTRICT y, int64_t k);
 GGML_API void quantize_row_turbo4_0_ref(const float * GGML_RESTRICT x, block_turbo4_0 * GGML_RESTRICT y, int64_t k);
 GGML_API void dequantize_row_turbo3_0(const block_turbo3_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API void dequantize_row_turbo4_0(const block_turbo4_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
@@ -138,6 +139,7 @@ GGML_API void dequantize_row_turbo2_0(const block_turbo2_0 * GGML_RESTRICT x, fl
 GGML_API size_t quantize_turbo2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
 
 // TQ6_0: 6-bit TurboQuant KV cache (WHT + 64-level Lloyd-Max PolarQuant)
+GGML_API void quantize_row_tq6_0_rotated_ref(const float * GGML_RESTRICT x, block_tq6_0 * GGML_RESTRICT y, int64_t k);
 GGML_API void quantize_row_tq6_0_ref(const float * GGML_RESTRICT x, block_tq6_0 * GGML_RESTRICT y, int64_t k);
 GGML_API void dequantize_row_tq6_0(const block_tq6_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API size_t quantize_tq6_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);

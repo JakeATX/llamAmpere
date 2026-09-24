@@ -119,12 +119,13 @@ llama_kv_cache::llama_kv_cache(
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
     const  layer_share_cb & share,
-             const char *   name_tag) :
+             const char *   name_tag,
+       llama_kvarn_config   kvarn) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
     other(static_cast<llama_kv_cache *>(mem_other)),
     v_cells_impl(other ? other->v_cells_impl : std::make_shared<llama_kv_cells_vec>()),
-    v_cells(*v_cells_impl) {
+    v_cells(*v_cells_impl), kvarn(kvarn) {
 
     // shared cells view the source cache's K/V tensors, so the cell count
     // follows the source allocation: a fitted target can be smaller than the
@@ -138,6 +139,30 @@ llama_kv_cache::llama_kv_cache(
     }
 
     GGML_ASSERT(kv_size % n_pad == 0);
+
+    if (this->kvarn.enabled()) {
+        GGML_ASSERT(!other && "KVarN cache: shared-cell (draft) caches are not supported");
+        GGML_ASSERT(type_k == type_v && (type_k == GGML_TYPE_F16 || type_k == GGML_TYPE_Q8_0 || type_k == GGML_TYPE_TQ6_0));
+        GGML_ASSERT(!v_trans && "KVarN cache requires flash attention");
+        GGML_ASSERT(n_stream == 1 && n_swa == 0 && swa_type == LLAMA_SWA_TYPE_NONE);
+        GGML_ASSERT(kvarn.group == 128 && kvarn.sink % 64 == 0 && kvarn.tail % kvarn.group == 0);
+        GGML_ASSERT(kv_size % 256 == 0 && "KVarN cache: the attention kernel needs n_kv padded to 256");
+        kvarn_cap           = GGML_PAD(std::max(kvarn.tail, kvarn.tail_max) + kvarn.group + 2*kvarn.n_ubatch, 128); // see apply_ubatch
+        kvarn_n_groups      = kv_size > kvarn.sink ? (kv_size - kvarn.sink + kvarn.group - 1)/kvarn.group : 1;
+        kvarn_n_groups_seal = (kvarn.n_ubatch + kvarn.group - 1)/kvarn.group + 1;
+        if (kvarn.tail_max > kvarn.tail) {
+            kvarn_n_groups_seal += (kvarn.tail_max - kvarn.tail)/kvarn.group;
+        }
+        kvarn_B = kvarn_B_prev = kvarn_B_pending = kvarn.sink;
+        kvarn_N = 0;
+        LLAMA_LOG_INFO("%s: %s cache: K%u/V%u records, sink %u (%s), tail %u, group %u, ring %u rows (%s), pool %u groups/head\n",
+                __func__, kvarn.body_type == GGML_TYPE_TURBO4_0 ? "Tiered TQ" : kvarn.body_type == GGML_TYPE_I16 ? "KVarN (trellis body)" : "KVarN", kvarn.bits_k, kvarn.bits_v, kvarn.sink, ggml_type_name(kvarn.sink_type == GGML_TYPE_COUNT ? type_k : kvarn.sink_type), kvarn.tail, kvarn.group, kvarn_cap, ggml_type_name(type_k), kvarn_n_groups);
+        if (kvarn.edge_layers > 0) {
+            LLAMA_LOG_INFO("%s: KVarN tiered body: KV layers within the first %u and last %u model layers seal at K%u/V%u (%s), interior at K%u/V%u (%s)\n",
+                    __func__, kvarn.edge_layers, kvarn.edge_layers, kvarn.edge_bits_k, kvarn.edge_bits_v, kvarn.edge_body_type == GGML_TYPE_I16 ? "trellis" : "scalar",
+                    kvarn.bits_k, kvarn.bits_v, kvarn.body_type == GGML_TYPE_I16 ? "trellis" : "scalar");
+        }
+    }
 
     // Auto-asymmetric: when symmetric turbo3 K+V is requested and the model has
     // high GQA ratio (few KV heads serving many Q heads), upgrade K to q8_0.
@@ -224,7 +249,7 @@ llama_kv_cache::llama_kv_cache(
                 // Size this for the actual layer loop below. Some models expose extra
                 // KV-bearing layers through n_layer_all, and under-reserving tensor
                 // metadata corrupts later KV/checkpoint operations.
-                /*.mem_size   =*/ size_t((3u*(1 + n_stream)*n_layer + 3)*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t((3u*(1 + n_stream)*n_layer + n_layer + 3)*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -301,6 +326,10 @@ llama_kv_cache::llama_kv_cache(
         }
         return 0;
     }();
+
+    // KVarN tiered body: the edge tier is the first and last edge_layers MODEL layers (blocks of any type, user 2026-09-23:
+    // no need to know the attention layout); whichever KV-bearing layers fall inside seal at the edge bits
+    const uint32_t kvarn_n_layers_model = hparams.n_layer(); // trunk only: nextn (MTP) layers live in their own context and cache
 
     for (uint32_t il = 0; il < n_layer; il++) {
         if (!hparams.has_kv(il)) {
@@ -386,7 +415,7 @@ llama_kv_cache::llama_kv_cache(
         // See kv_adaptive_mode above for the mode legend and env var.
         ggml_type layer_type_k = type_k;
         ggml_type layer_type_v = type_v;
-        {
+        if (!kvarn.enabled()) {
             const bool is_turbo = (type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0 || type_k == GGML_TYPE_TURBO2_0 || type_k == GGML_TYPE_TQ6_0 || type_k == GGML_TYPE_TQ5_0);
             const bool v_is_turbo = (type_v == GGML_TYPE_TURBO3_0 || type_v == GGML_TYPE_TURBO4_0 || type_v == GGML_TYPE_TURBO2_0 || type_v == GGML_TYPE_TQ6_0 || type_v == GGML_TYPE_TQ5_0);
             const uint32_t n_layer = hparams.n_layer();
@@ -449,18 +478,27 @@ llama_kv_cache::llama_kv_cache(
             }
         }
 
+        // KVarN: the K/V tensors hold only the unsealed rows (sink + ring); the body is a separate record pool
+        uint32_t kv_rows = kvarn.enabled() ? kvarn.sink + kvarn_cap : kv_size;
+        if (kvarn.enabled() && kvarn.sink_type == GGML_TYPE_F16) {
+            const size_t sink_bytes = (size_t) kvarn.sink*n_embd_k_gqa_eff*sizeof(ggml_fp16_t);
+            const size_t row_bytes = ggml_row_size(layer_type_k, n_embd_k_gqa_eff);
+            GGML_ASSERT(layer_type_k == layer_type_v && n_embd_k_gqa_eff == n_embd_v_gqa_eff);
+            kv_rows += (sink_bytes + row_bytes - 1)/row_bytes;
+        }
+
         if (offload) {
             ggml_backend_dev_t dev = model.dev_layer(il);
             if (has_k) {
-                check_set_rows_support(dev, layer_type_k, n_embd_k_gqa_eff, kv_size, "K");
+                check_set_rows_support(dev, layer_type_k, n_embd_k_gqa_eff, kv_rows, "K");
             }
             if (has_v) {
-                check_set_rows_support(dev, layer_type_v, n_embd_v_gqa_eff, kv_size, "V");
+                check_set_rows_support(dev, layer_type_v, n_embd_v_gqa_eff, kv_rows, "V");
             }
         }
 
-        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, layer_type_k, n_embd_k_gqa_eff, kv_size, n_stream) : nullptr;
-        ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, layer_type_v, n_embd_v_gqa_eff, kv_size, n_stream) : nullptr;
+        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, layer_type_k, n_embd_k_gqa_eff, kv_rows, n_stream) : nullptr;
+        ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, layer_type_v, n_embd_v_gqa_eff, kv_rows, n_stream) : nullptr;
 
         has_k && ggml_format_name(k, "cache_%sk_l%d", name_tag, il);
         has_v && ggml_format_name(v, "cache_%sv_l%d", name_tag, il);
@@ -469,16 +507,43 @@ llama_kv_cache::llama_kv_cache(
         std::vector<ggml_tensor *> v_stream;
 
         for (uint32_t s = 0; s < n_stream; ++s) {
-            k_stream.push_back(has_k ? ggml_view_2d(ctx, k, n_embd_k_gqa_eff, kv_size, k->nb[1], s*k->nb[2]) : nullptr);
-            v_stream.push_back(has_v ? ggml_view_2d(ctx, v, n_embd_v_gqa_eff, kv_size, v->nb[1], s*v->nb[2]) : nullptr);
+            k_stream.push_back(has_k ? ggml_view_2d(ctx, k, n_embd_k_gqa_eff, kv_rows, k->nb[1], s*k->nb[2]) : nullptr);
+            v_stream.push_back(has_v ? ggml_view_2d(ctx, v, n_embd_v_gqa_eff, kv_rows, v->nb[1], s*v->nb[2]) : nullptr);
+        }
+
+        ggml_tensor * body = nullptr;
+        kv_layer layer_new = { il, k, v, k_stream, v_stream, nullptr };
+        if (kvarn.enabled()) {
+            GGML_ASSERT(has_k && has_v);
+            const uint32_t D = hparams.n_embd_head_k(il);
+            GGML_ASSERT(hparams.n_embd_head_v(il) == D && n_embd_k_gqa_eff == n_embd_k_gqa && n_embd_v_gqa_eff == n_embd_v_gqa);
+            // tier: a KV-bearing layer inside the first or last edge_layers model layers is the edge tier
+            const bool edge = kvarn.edge_layers > 0 && (il < kvarn.edge_layers || il + kvarn.edge_layers >= kvarn_n_layers_model);
+            layer_new.kvarn_tier      = edge ? 1 : 0;
+            layer_new.kvarn_bits_k    = edge ? kvarn.edge_bits_k : kvarn.bits_k;
+            layer_new.kvarn_bits_v    = edge ? kvarn.edge_bits_v : kvarn.bits_v;
+            layer_new.kvarn_body_type = edge ? kvarn.edge_body_type : kvarn.body_type;
+            const size_t rb = layer_new.kvarn_body_type == GGML_TYPE_TURBO4_0 ? 2*kvarn.group*ggml_row_size(GGML_TYPE_TURBO4_0, D) : ggml_kvarn_rec_bytes(D, kvarn.group, layer_new.kvarn_bits_k, layer_new.kvarn_bits_v);
+            layer_new.kvarn_rec_bytes = rb;
+            if (kvarn_rec_bytes[layer_new.kvarn_tier] == 0) {
+                kvarn_rec_bytes[layer_new.kvarn_tier] = rb;
+            }
+            GGML_ASSERT(rb == kvarn_rec_bytes[layer_new.kvarn_tier] && "KVarN cache: head size must be constant across layers");
+            if (edge) {
+                kvarn_n_layers_edge++;
+            }
+            body = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, (int64_t) rb * hparams.n_head_kv(il) * kvarn_n_groups);
+            body->op_params[7] = layer_new.kvarn_body_type;
+            ggml_format_name(body, "cache_%skvarn_l%d", name_tag, il);
+            layer_new.body = body;
         }
 
         map_layer_ids[il] = layers.size();
 
-        layers.push_back({ il, k, v, k_stream, v_stream });
+        layers.push_back(layer_new);
 
         // TurboQuant: create rotation matrix tensors (once, shared across layers)
-        if (turbo_rotation == nullptr &&
+        if (!kvarn.enabled() && turbo_rotation == nullptr &&
             (type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0 || type_k == GGML_TYPE_TURBO2_0 || type_k == GGML_TYPE_TQ6_0 || type_k == GGML_TYPE_TQ5_0)) {
             turbo_rotation = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 128, 128);
             ggml_format_name(turbo_rotation, "turbo_rotation");  // R^T
@@ -617,14 +682,14 @@ llama_kv_cache::llama_kv_cache(
         // still apply: rotation only takes effect on quantized types with
         // head_dim % 64 == 0 (master's #21038 requirements).
         const char * ROT_K_OV = getenv("LLAMA_ATTN_ROT_K_OVERRIDE");
-        if (ROT_K_OV && atoi(ROT_K_OV) != 0 && !attn_rot_disable) {
+        if (ROT_K_OV && atoi(ROT_K_OV) != 0 && !attn_rot_disable && !kvarn.enabled()) {
             attn_rot_k =
                 n_embd_head_k_all > 0 &&
                 ggml_is_quantized(type_k) &&
                 hparams.n_embd_head_k() % 64 == 0;
         }
         const char * ROT_V_OV = getenv("LLAMA_ATTN_ROT_V_OVERRIDE");
-        if (ROT_V_OV && atoi(ROT_V_OV) != 0 && !attn_rot_disable) {
+        if (ROT_V_OV && atoi(ROT_V_OV) != 0 && !attn_rot_disable && !kvarn.enabled()) {
             attn_rot_v =
                 n_embd_head_v_all > 0 &&
                 ggml_is_quantized(type_v) &&
@@ -676,6 +741,9 @@ void llama_kv_cache::clear(bool data) {
         v_heads[s] = 0;
     }
 
+    kvarn_B = kvarn_B_prev = kvarn_B_pending = kvarn.sink;
+    kvarn_N = 0;
+
     if (data) {
         for (auto & [_, buf] : ctxs_bufs) {
             ggml_backend_buffer_clear(buf.get(), 0);
@@ -712,6 +780,18 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 
     if (p1 < 0) {
         p1 = std::numeric_limits<llama_pos>::max();
+    }
+
+    if (kvarn.enabled() && p1 > p0) {
+        // sealed records cannot be reopened: only a full clear or a removal behind the sealed end is possible
+        if (p0 == 0 && p1 == std::numeric_limits<llama_pos>::max()) {
+            kvarn_B = kvarn_B_prev = kvarn_B_pending = kvarn.sink;
+            kvarn_N = 0;
+        } else if ((uint32_t) p0 < kvarn_B && (uint32_t) p0 < kvarn_N) {
+            LLAMA_LOG_WARN("%s: KVarN cache: cannot remove positions [%d, %d): positions below %u are sealed\n",
+                    __func__, p0, p1, kvarn_B);
+            return false;
+        }
     }
 
     if (seq_id >= 0) {
@@ -1080,6 +1160,9 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
     // remember the old state of the cells so we can restore it in the end
     std::vector<state_t> states;
 
+    // KVarN: apply_ubatch advances the sealed-end bookkeeping; the dry run below must not keep it
+    const uint32_t kvarn_B_old = kvarn_B, kvarn_B_prev_old = kvarn_B_prev, kvarn_N_old = kvarn_N, kvarn_pending_old = kvarn_B_pending;
+
     bool success = true;
 
     for (const auto & ubatch : ubatches) {
@@ -1108,6 +1191,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
 
         // now emplace the ubatch
         apply_ubatch(sinfo_new, ubatch);
+        kvarn_B = kvarn_B_pending; // dry-run future ubatches after simulated maintenance
     }
 
     GGML_ASSERT(!states.empty() || !success);
@@ -1124,6 +1208,8 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
             head = it->v_heads_old[s];
         }
     }
+
+    kvarn_B = kvarn_B_old; kvarn_B_prev = kvarn_B_prev_old; kvarn_N = kvarn_N_old; kvarn_B_pending = kvarn_pending_old;
 
     if (!success) {
         return {};
@@ -1501,9 +1587,38 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
         head = sinfo.idxs[s].back() + 1;
     }
+
+    if (kvarn.enabled()) {
+        // ring rows and sealed records are addressed by position, so a cell must sit at its position
+        for (uint32_t ii = 0; ii < sinfo.size(); ++ii) {
+            GGML_ASSERT(sinfo.idxs[0][ii] == (uint32_t) ubatch.pos[ii] && "KVarN cache: cell index must equal position");
+        }
+
+        const uint32_t N    = v_cells[0].used_max_p1();
+        const uint32_t pos0 = (uint32_t) ubatch.pos[0]; // positions present before this ubatch
+
+        // The sealed boundary advances from the ubatch START, so every query row keeps at least `tail` exact
+        // positions behind it (a boundary set from the ubatch end would leave the first rows of a large prefill
+        // ubatch with no exact tail at all). The ring is sized for that: tail + group + 2*n_ubatch rows.
+        kvarn_B_prev = kvarn_B;
+        kvarn_B_pending = kvarn_B;
+        const bool due = kvarn.tail_max == 0 || (pos0 > kvarn_B && pos0 - kvarn_B >= kvarn.tail_max);
+        if (due && pos0 > kvarn.sink + kvarn.tail) {
+            kvarn_B_pending = std::max(kvarn_B, kvarn.sink + kvarn.group*((pos0 - kvarn.tail - kvarn.sink)/kvarn.group));
+        }
+        // ring rows hold [max(B_prev, sink), N); sink positions live in their own exact rows
+        GGML_ASSERT(N <= kvarn_B_prev + kvarn_cap && "KVarN cache: ring overflow (ubatch larger than n_ubatch?)");
+        GGML_ASSERT(kvarn_B_pending <= pos0 || kvarn_B_pending == kvarn.sink);
+        GGML_ASSERT((kvarn_B_pending - kvarn.sink)/kvarn.group <= kvarn_n_groups);
+
+        kvarn_N = N;
+    }
 }
 
 bool llama_kv_cache::get_can_shift() const {
+    if (kvarn.enabled()) {
+        return false; // sealed records are position-addressed
+    }
     // Step35 uses per-layer RoPE dims; K-shift assumes a single global n_rot.
     if (model.arch == LLM_ARCH_STEP35) {
         return false;
@@ -1599,6 +1714,18 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
     const uint64_t kv_size      = get_size();
     const uint64_t n_embd_k_gqa = k->ne[0];
 
+    if (kvarn.enabled()) {
+        // the attention op walks positions itself (op_params n_kv_pad); hand it the whole sink + ring
+        const uint32_t head_k = hparams.n_embd_head_k(il);
+        const uint64_t n_rows = k->ne[1];
+        return ggml_view_4d(ctx, k,
+                head_k, hparams.n_head_kv(il), n_rows, 1,
+                ggml_row_size(k->type, head_k),
+                ggml_row_size(k->type, n_embd_k_gqa),
+                ggml_row_size(k->type, n_embd_k_gqa*n_rows),
+                0);
+    }
+
     // For turbo-padded caches, n_embd_k_gqa may be larger than hparams value
     const bool k_is_turbo = (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TQ6_0 || k->type == GGML_TYPE_TQ5_0);
     if (k_is_turbo) {
@@ -1629,6 +1756,17 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
 
     const uint64_t kv_size      = get_size();
     const uint64_t n_embd_v_gqa = v->ne[0];
+
+    if (kvarn.enabled()) {
+        const uint32_t head_v = hparams.n_embd_head_v(il);
+        const uint64_t n_rows = v->ne[1];
+        return ggml_view_4d(ctx, v,
+                head_v, hparams.n_head_kv(il), n_rows, 1,
+                ggml_row_size(v->type, head_v),
+                ggml_row_size(v->type, n_embd_v_gqa),
+                ggml_row_size(v->type, n_embd_v_gqa*n_rows),
+                0);
+    }
 
     // [TAG_V_CACHE_VARIABLE] — for turbo-padded V, cache may be larger
     assert(n_embd_v_gqa >= hparams.n_embd_v_gqa(il));
@@ -1703,7 +1841,13 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
     }
 
     // store the current K values into the cache
-    ggml_tensor * result = ggml_set_rows(ctx, k, k_cur, k_idxs);
+    ggml_tensor * result = (kvarn.enabled() && k->type == GGML_TYPE_TQ6_0)
+        ? ggml_set_rows_tq6_rotated(ctx, k, k_cur, k_idxs) : ggml_set_rows(ctx, k, k_cur, k_idxs);
+
+    if (kvarn.enabled() && kvarn.sink_type == GGML_TYPE_F16) {
+        result->op_params[2] = kvarn.sink;
+        result->op_params[3] = kvarn.sink + kvarn_cap;
+    }
 
     // For turbo: store WHT group size in op_params so the CUDA kernel knows.
     // With zero-padding, all groups are always full 128-element WHT groups.
@@ -1756,7 +1900,12 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
             v = ggml_reshape_2d(ctx, v, n_embd_gqa, kv_size*n_stream);
         }
 
-        ggml_tensor * result = ggml_set_rows(ctx, v, v_cur, v_idxs);
+        ggml_tensor * result = (kvarn.enabled() && v->type == GGML_TYPE_TQ6_0)
+            ? ggml_set_rows_tq6_rotated(ctx, v, v_cur, v_idxs) : ggml_set_rows(ctx, v, v_cur, v_idxs);
+        if (kvarn.enabled() && kvarn.sink_type == GGML_TYPE_F16) {
+            result->op_params[2] = kvarn.sink;
+            result->op_params[3] = kvarn.sink + kvarn_cap;
+        }
         // With zero-padding, all groups are always full 128-element WHT groups
         if (v_is_turbo) {
             int32_t wht_group = 128;  // always 128 with padding
@@ -1869,6 +2018,13 @@ void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ub
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
     int64_t * data = (int64_t *) dst->data;
 
+    if (kvarn.enabled()) {
+        for (uint32_t i = 0; i < n_tokens; ++i) {
+            data[i] = kvarn_ring_row((uint32_t) ubatch->pos[i]);
+        }
+        return;
+    }
+
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         const int64_t offs = sinfo.strm[s]*get_size();
 
@@ -1884,6 +2040,13 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
 
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
     int64_t * data = (int64_t *) dst->data;
+
+    if (kvarn.enabled()) {
+        for (uint32_t i = 0; i < n_tokens; ++i) {
+            data[i] = kvarn_ring_row((uint32_t) ubatch->pos[i]);
+        }
+        return;
+    }
 
     if (!v_trans) {
         for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
@@ -1909,6 +2072,162 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
             }
         }
     }
+}
+
+ggml_tensor * llama_kv_cache::build_input_kvarn_desc(ggml_context * ctx) const {
+    GGML_ASSERT(kvarn.enabled());
+    ggml_tensor * desc = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, GGML_KVARN_DESC_N_ENTRIES);
+    ggml_set_input(desc);
+    return desc;
+}
+
+void llama_kv_cache::set_input_kvarn_desc(ggml_tensor * dst, const llama_ubatch * ubatch, int tier) const {
+    GGML_ASSERT(tier == 0 || tier == 1);
+    GGML_ASSERT(kvarn.enabled());
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+    GGML_ASSERT(ggml_nelements(dst) >= GGML_KVARN_DESC_N_ENTRIES);
+
+    int32_t * d = (int32_t *) dst->data;
+    for (int i = 0; i < GGML_KVARN_DESC_N_ENTRIES; ++i) {
+        d[i] = 0;
+    }
+    d[GGML_KVARN_DESC_S]        = (int32_t) kvarn.sink;
+    d[GGML_KVARN_DESC_CAP]      = (int32_t) kvarn_cap;
+    d[GGML_KVARN_DESC_B]        = (int32_t) kvarn_B;
+    d[GGML_KVARN_DESC_N]        = (int32_t) kvarn_N;
+    d[GGML_KVARN_DESC_QPOS0]    = (int32_t) ubatch->pos[0];
+    d[GGML_KVARN_DESC_G]        = (int32_t) kvarn.group;
+    d[GGML_KVARN_DESC_D]        = (int32_t) hparams.n_embd_head_k(layers[0].il);
+    d[GGML_KVARN_DESC_RECBYTES] = (int32_t) kvarn_rec_bytes[tier];
+    d[GGML_KVARN_DESC_HKV]      = (int32_t) hparams.n_head_kv(layers[0].il);
+    d[GGML_KVARN_DESC_B_OLD]    = (int32_t) kvarn_B_prev;
+    d[GGML_KVARN_DESC_BODY_TYPE] = tier == 1 ? kvarn.edge_body_type : kvarn.body_type;
+    d[GGML_KVARN_DESC_TYPE_K]   = (int32_t) layers[0].k->type;
+    d[GGML_KVARN_DESC_TYPE_V]   = (int32_t) layers[0].v->type;
+    d[GGML_KVARN_DESC_SINK_TYPE] = kvarn.sink_type == GGML_TYPE_F16 ? GGML_TYPE_F16 : 0;
+}
+
+ggml_tensor * llama_kv_cache::build_kvarn_seal(ggml_context * ctx, ggml_tensor * k_store, ggml_tensor * v_store, ggml_tensor * desc, int32_t il) const {
+    GGML_ASSERT(kvarn.enabled());
+    const int32_t ikv = map_layer_ids.at(il);
+    ggml_tensor * body = layers[ikv].body;
+    GGML_ASSERT(body != nullptr);
+    const int32_t D = (int32_t) hparams.n_embd_head_k(il);
+    return ggml_kvarn_seal_dyn(ctx, body, k_store, v_store, desc, D, (int32_t) kvarn.group,
+            (int32_t) layers[ikv].kvarn_bits_k, (int32_t) layers[ikv].kvarn_bits_v, 16, (int32_t) kvarn_n_groups_seal);
+}
+
+int llama_kv_cache::get_kvarn_layer_tier(int32_t il, uint32_t & bits_k, uint32_t & bits_v) const {
+    const auto & layer = layers.at(map_layer_ids.at(il));
+    bits_k = layer.kvarn_bits_k;
+    bits_v = layer.kvarn_bits_v;
+    return layer.kvarn_tier;
+}
+
+ggml_tensor * llama_kv_cache::get_kvarn_body(int32_t il) const {
+    return layers.at(map_layer_ids.at(il)).body;
+}
+
+bool llama_kv_cache::maintain_kvarn(llama_context * lctx) {
+    if (!kvarn.enabled() || kvarn_B_pending <= kvarn_B) {
+        return true;
+    }
+    const int64_t started = ggml_time_us();
+    const uint32_t original_B = kvarn_B;
+    // The current batch is already queued for timing, but has not computed yet.
+    ggml_backend_sched_synchronize(lctx->get_sched());
+    if (kvarn_maintenance_graphs.empty()) {
+        // These allocations and graphs do not use or reset the model scheduler.
+        std::map<ggml_backend_t, std::vector<const kv_layer *>> groups;
+        for (const auto & layer : layers) {
+            auto backend = lctx->kvarn_backend(layer.body->buffer);
+            if (!backend) {
+                LLAMA_LOG_ERROR("%s: no backend for the body buffer of layer %d\n", __func__, layer.il);
+                kvarn_B_pending = kvarn_B;
+                return false;
+            }
+            groups[backend].push_back(&layer);
+        }
+        std::vector<kvarn_maintenance_graph> prepared;
+        for (const auto & group : groups) {
+            kvarn_maintenance_graph job;
+            const size_t nodes = 32 + 8*group.second.size();
+            ggml_init_params ip = {nodes*ggml_tensor_overhead() + ggml_graph_overhead_custom(nodes, false), nullptr, true};
+            job.ctx.reset(ggml_init(ip));
+            if (!job.ctx) { LLAMA_LOG_ERROR("%s: ggml_init failed\n", __func__); kvarn_B_pending = kvarn_B; return false; }
+            job.backend = group.first;
+            for (int tier = 0; tier < 2; ++tier) {
+                job.desc[tier] = ggml_new_tensor_1d(job.ctx.get(), GGML_TYPE_I32, GGML_KVARN_DESC_N_ENTRIES);
+                ggml_set_input(job.desc[tier]);
+            }
+            job.graph = ggml_new_graph_custom(job.ctx.get(), nodes, false);
+            for (const auto * layer : group.second) {
+                auto * seal = ggml_kvarn_seal_dyn(job.ctx.get(), layer->body, layer->k_stream[0], layer->v_stream[0], job.desc[layer->kvarn_tier],
+                    hparams.n_embd_head_k(layer->il), kvarn.group, layer->kvarn_bits_k, layer->kvarn_bits_v, 16, kvarn_n_groups_seal);
+                if (!ggml_backend_supports_op(job.backend, seal)) { LLAMA_LOG_ERROR("%s: backend %s does not support the seal op (layer %d)\n", __func__, ggml_backend_name(job.backend), layer->il); kvarn_B_pending = kvarn_B; return false; }
+                ggml_build_forward_expand(job.graph, seal);
+            }
+            job.buffer.reset(ggml_backend_alloc_ctx_tensors(job.ctx.get(), job.backend));
+            if (!job.buffer) { LLAMA_LOG_ERROR("%s: maintenance buffer allocation failed\n", __func__); kvarn_B_pending = kvarn_B; return false; }
+            prepared.push_back(std::move(job));
+        }
+        kvarn_maintenance_graphs = std::move(prepared);
+    }
+    const uint32_t target = kvarn_B_pending;
+    // Flushes may exceed the normal per-ubatch capacity. Keep a fixed graph and bounded chunks.
+    for (uint32_t old = kvarn_B; old < target;) {
+        const uint32_t end = std::min(target, old + kvarn.group*kvarn_n_groups_seal);
+        int32_t d[GGML_KVARN_DESC_N_ENTRIES] = {};
+        d[GGML_KVARN_DESC_S] = kvarn.sink;
+        d[GGML_KVARN_DESC_CAP] = kvarn_cap;
+        d[GGML_KVARN_DESC_B_OLD] = old;
+        d[GGML_KVARN_DESC_B] = end;
+        d[GGML_KVARN_DESC_N] = kvarn_N;
+        d[GGML_KVARN_DESC_G] = kvarn.group;
+        d[GGML_KVARN_DESC_D] = hparams.n_embd_head_k(layers[0].il);
+        d[GGML_KVARN_DESC_HKV] = hparams.n_head_kv(layers[0].il);
+        d[GGML_KVARN_DESC_TYPE_K] = layers[0].k->type;
+        d[GGML_KVARN_DESC_TYPE_V] = layers[0].v->type;
+        bool success = true;
+        for (auto & job : kvarn_maintenance_graphs) {
+            for (int tier = 0; tier < 2; ++tier) {
+                d[GGML_KVARN_DESC_RECBYTES] = kvarn_rec_bytes[tier];
+                d[GGML_KVARN_DESC_BODY_TYPE] = tier == 1 ? kvarn.edge_body_type : kvarn.body_type;
+                ggml_backend_tensor_set(job.desc[tier], d, 0, sizeof(d));
+            }
+            success = ggml_backend_graph_compute(job.backend, job.graph) == GGML_STATUS_SUCCESS && success;
+        }
+        if (!success) {
+            LLAMA_LOG_ERROR("%s: maintenance graph compute failed\n", __func__);
+            kvarn_B_pending = kvarn_B; // partially written unpublished records are safe to overwrite on retry
+            return false;
+        }
+        old = end;
+    }
+    kvarn_B_prev = kvarn_B;
+    kvarn_B = target;
+    ++kvarn_maintenance_count;
+    kvarn_maintenance_groups += (target - original_B)/kvarn.group;
+    LLAMA_LOG_DEBUG("%s: B %u -> %u, %u groups, %.3f ms\n", __func__, original_B, target,
+        (target - original_B)/kvarn.group, (ggml_time_us() - started)/1000.0);
+    return true;
+}
+
+int32_t llama_kv_cache::compress_kvarn_idle(llama_context * lctx, llama_seq_id seq_id, llama_pos accepted_end) {
+    if (!kvarn.enabled() || kvarn.tail_max == 0 || seq_id < 0 || accepted_end < 0 ||
+        (size_t) seq_id >= seq_to_stream.size() || kvarn_B_pending != kvarn_B) {
+        return -1;
+    }
+    if (accepted_end == 0 && v_cells[0].used_max_p1() == 0) { return 0; }
+    // The caller resolved speculation. Refuse stale frontiers and an unremoved written suffix.
+    if ((uint32_t) accepted_end != v_cells[0].used_max_p1() ||
+        seq_pos_max(seq_id) < 0 || seq_pos_max(seq_id) + 1 != accepted_end) { return -1; }
+    const uint32_t end = accepted_end;
+    if (end <= kvarn.sink + kvarn.tail) { return 0; }
+    const uint32_t target = kvarn.sink + kvarn.group*((end - kvarn.tail - kvarn.sink)/kvarn.group);
+    if (target <= kvarn_B) { return 0; }
+    kvarn_B_pending = target;
+    return maintain_kvarn(lctx) ? 1 : -1;
 }
 
 void llama_kv_cache::set_input_k_shift(ggml_tensor * dst) const {
@@ -2457,6 +2776,12 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
         return;
     }
 
+    if (kvarn.enabled()) {
+        // sealed records + ring/sink rows are not serialised yet; callers treat a 0-byte state as "not cacheable"
+        // (llama-bench re-runs the depth prefill, llama-server keeps no prompt cache: use --cache-ram 0)
+        throw std::runtime_error("KVarN cache: sequence state save is not supported yet");
+    }
+
     GGML_UNUSED(flags);
 
     io.write(&n_stream, sizeof(n_stream));
@@ -2522,6 +2847,9 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
 }
 
 void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    if (kvarn.enabled()) {
+        throw std::runtime_error("KVarN cache: sequence state load is not supported yet");
+    }
     state_read_sinfo(io, seq_id, flags, nullptr, nullptr);
 }
 
@@ -3192,6 +3520,34 @@ ggml_tensor * llama_kv_cache_context::get_turbo_rot_inverse() const {
 ggml_tensor * llama_kv_cache_context::get_turbo_innerq_scale_inv() const {
     return kv->get_turbo_innerq_scale_inv();
 }
+
+bool llama_kv_cache_context::is_kvarn() const {
+    return kv->is_kvarn();
+}
+
+const llama_kvarn_config & llama_kv_cache_context::get_kvarn() const {
+    return kv->get_kvarn();
+}
+
+ggml_tensor * llama_kv_cache_context::build_input_kvarn_desc(ggml_context * ctx) const {
+    return kv->build_input_kvarn_desc(ctx);
+}
+
+void llama_kv_cache_context::set_input_kvarn_desc(ggml_tensor * dst, const llama_ubatch * ubatch, int tier) const {
+    kv->set_input_kvarn_desc(dst, ubatch, tier);
+}
+
+int llama_kv_cache_context::get_kvarn_layer_tier(int32_t il, uint32_t & bits_k, uint32_t & bits_v) const {
+    return kv->get_kvarn_layer_tier(il, bits_k, bits_v);
+}
+
+bool llama_kv_cache_context::has_kvarn_edge_tier() const {
+    return kv->has_kvarn_edge_tier();
+}
+
+ggml_tensor * llama_kv_cache_context::build_kvarn_seal(ggml_context * ctx, ggml_tensor * k_store, ggml_tensor * v_store, ggml_tensor * desc, int32_t il) const {
+    return kv->build_kvarn_seal(ctx, k_store, v_store, desc, il);
+}
 ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {
     return kv->cpy_k(ctx, k_cur, k_idxs, il, sinfos[i_cur]);
 }
@@ -3246,4 +3602,8 @@ void llama_kv_cache_context::set_input_v_rot(ggml_tensor * dst) const {
 
 void llama_kv_cache_context::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
     kv->get_prev_tokens(ubatch, n, res);
+}
+
+ggml_tensor * llama_kv_cache_context::get_kvarn_body(int32_t il) const {
+    return kv->get_kvarn_body(il);
 }
