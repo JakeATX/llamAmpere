@@ -881,6 +881,11 @@ struct llm_graph_params {
     // draft-only vocabulary shortlist: [n_sel] I32 token ids owned by the context, or nullptr
     ggml_tensor * draft_vocab_ids = nullptr;
 
+    // [#81] compact resident draft head [n_embd, n_sel] owned by the context, and the head tensor it replaces
+    // (the compact logits are used only for that head), or nullptr
+    ggml_tensor       * draft_vocab_compact     = nullptr;
+    const ggml_tensor * draft_vocab_compact_src = nullptr;
+
     // bit per full-head fallback reason already warned about, owned by the context (warn once per context)
     std::atomic<uint32_t> * draft_vocab_warned = nullptr;
 
@@ -1142,8 +1147,14 @@ struct llm_graph_context {
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     ggml_tensor * draft_vocab_ids; // see llm_graph_params
+    ggml_tensor       * draft_vocab_compact;     // see llm_graph_params
+    const ggml_tensor * draft_vocab_compact_src; // see llm_graph_params
     std::atomic<uint32_t> * draft_vocab_warned; // see llm_graph_params
     const std::vector<float> * mtp_chain_samp; // see llm_graph_params
+
+    // [#81] logits of the compact draft head for `cur` [n_embd, n], [n_sel, n]: plain mul_mat on the activation the
+    // head consumes (EXL3: x_rot = H128(suh * cur), the fused kernel's input glue built from generic ops)
+    ggml_tensor * build_draft_vocab_compact(ggml_tensor * head_w, ggml_tensor * head_s, ggml_tensor * cur) const;
 
     // full-head fallback of build_draft_vocab_logits: counts the reason in the fallback ledger, warns once per context
     ggml_tensor * draft_vocab_fallback(int reason, const char * detail) const;
