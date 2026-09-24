@@ -1279,6 +1279,12 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_mask(
 #else
 #define GGML_CUDA_TURBO_STAGE 0
 #endif
+// turbo4 flat PRMT loader for turbo4 K and for turbo4 V behind any K (backlog #66). The flat loader decodes
+// bit-identically to the row loader; 0 restores the row loader for those tiles (the q8_0/tq6_0/tq5_0 + turbo4 V
+// pairs use the flat loader either way).
+#ifndef GGML_CUDA_TURBO4_FLAT_ALL
+#define GGML_CUDA_TURBO4_FLAT_ALL 1
+#endif
 // K staging: a q8_0 / tq6_0 / tq5_0 K tile is staged under turbo3 / q8_0 / turbo4 / tq5_0 V of the D=256 GQA-packed
 // instances. tq6_0 V is left out: K-only staging under it measured -0.5% at 100K in two runs (tq5_0 V: +1.8..1.9%).
 template<int DKQ, int DV, int ncols2, ggml_type type_K, ggml_type type_V>
@@ -1529,8 +1535,14 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 flash_attn_ext_q8_0_load_tile<stride_tile_K, swz_K, nbatch_fa, nthreads_turbo, DKQ/2, oob_check>
                     (K_raw, tile_K, K_pitch, k0_start, k_VKQ_sup);
             } else if constexpr (type_K == GGML_TYPE_TURBO4_0) {
-                flash_attn_ext_turbo4_load_tile<stride_tile_K, swz_K, nbatch_fa, nthreads_turbo, oob_check>
-                    (K_raw, tile_K, k0_diff, stride_K, k0_start, k_VKQ_sup);
+                if constexpr (GGML_CUDA_TURBO4_FLAT_ALL && (DKQ/2) % 16 == 0) {
+                    // turbo4 K is never staged (K staging is q8_0/tq6_0/tq5_0 only), so this reads global memory
+                    flash_attn_ext_turbo4_load_tile_flat<stride_tile_K, swz_K, nbatch_fa, nthreads_turbo, DKQ/2, oob_check, !turbo_stage>
+                        (K_raw, tile_K, K_pitch, k0_start, k_VKQ_sup);
+                } else {
+                    flash_attn_ext_turbo4_load_tile<stride_tile_K, swz_K, nbatch_fa, nthreads_turbo, oob_check>
+                        (K_raw, tile_K, k0_diff, stride_K, k0_start, k_VKQ_sup);
+                }
             } else if constexpr (type_K == GGML_TYPE_TQ6_0) {
                 flash_attn_ext_tq6_load_tile<stride_tile_K, swz_K, nbatch_fa, nthreads_turbo, DKQ/2, oob_check, !turbo_stage>
                     (K_raw, tile_K, K_pitch, k0_start, k_VKQ_sup);
@@ -1924,7 +1936,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 flash_attn_ext_q8_0_load_tile<stride_tile_V, swz_V, nbatch_fa, nthreads_turbo, DV/2, oob_check>
                     (V_raw, tile_V, V_pitch, i0_start/2, k_VKQ_sup);
             } else if constexpr (type_V == GGML_TYPE_TURBO4_0) {
-                if constexpr (type_K == GGML_TYPE_Q8_0 || type_K == GGML_TYPE_TQ6_0 || type_K == GGML_TYPE_TQ5_0) {
+                if constexpr (type_K == GGML_TYPE_Q8_0 || type_K == GGML_TYPE_TQ6_0 || type_K == GGML_TYPE_TQ5_0 ||
+                              (GGML_CUDA_TURBO4_FLAT_ALL && (DV/2) % 16 == 0)) {
                     flash_attn_ext_turbo4_load_tile_flat<stride_tile_V, swz_V, nbatch_fa, nthreads_turbo, DV/2, oob_check, !turbo_stage_v>
                         (V_raw, tile_V, V_pitch, i0_start/2, k_VKQ_sup);
                 } else {
