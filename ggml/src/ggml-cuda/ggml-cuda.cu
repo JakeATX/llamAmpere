@@ -7113,6 +7113,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     return b->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32
                         && ggml_is_contiguous(b) && ggml_is_contiguous(op)
                         && b->ne[0] % QK8_CR == 0;
+                }
                 if (op->op == GGML_OP_MUL_MAT_ID && ggml_get_op_params_i32(op, 3) == GGML_PREC_F32) {
                     return false;
                 }
