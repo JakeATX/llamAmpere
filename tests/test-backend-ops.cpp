@@ -9880,6 +9880,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_add_rms_norm_mul_mm(GGML_TYPE_Q8_0,   GGML_TYPE_Q8_0,   k, n));
         }
     }
+    // [#45] GDN gate projections (ssm_alpha/ssm_beta, 48 x 5120) at verify widths; GGML_CUDA_MMVQ_THIN=64 routes widths
+    // 2..8 to the one-row-per-CTA launch. Odd row count and broadcast channels cover the grid edges and strides.
+    for (ggml_type type : {GGML_TYPE_Q8_0, GGML_TYPE_PTQ1_0}) {
+        for (int n = 1; n <= 8; ++n) {
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 48, n, 5120, {1, 1}, {1, 1}));
+        }
+        test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 7, 3, 1024, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 48, 5, 1024, {2, 3}, {2, 1}));
+    }
     test_cases.emplace_back(new test_elem_chain_fusion({256, 4, 2, 1}, false));
     test_cases.emplace_back(new test_elem_chain_fusion({256, 4, 2, 1}, true));
     test_cases.emplace_back(new test_elem_chain_fusion({256, 4, 2, 1}, false, true));
@@ -12393,6 +12402,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // elementwise chain vs the tuned multi-ADD kernel (GGML_CUDA_FUSE_CHAIN=0 to compare)
     test_cases.emplace_back(new test_elem_chain_fusion({4096, 64, 1, 1}, false, false, true));
     test_cases.emplace_back(new test_elem_chain_fusion({4096, 64, 1, 1}, false, false, false, 0.25f));
+
+    // [#45] GDN gate projections at verify widths (GGML_CUDA_MMVQ_THIN=64 vs unset)
+    for (ggml_type type : {GGML_TYPE_Q8_0, GGML_TYPE_PTQ1_0}) {
+        for (int n = 1; n <= 8; ++n) {
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 48, n, 5120, {1, 1}, {1, 1}));
+        }
+    }
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here

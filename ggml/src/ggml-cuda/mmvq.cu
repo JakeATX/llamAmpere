@@ -1614,6 +1614,121 @@ static __global__ void mul_mat_vec_q_indexed_rows(
     if (lane == 0) { dst[row * dst_stride] = sum; }
 }
 
+// [#45] Thin launch for matrices with few rows at verify widths 2..8. The GDN gate projections ssm_alpha and
+// ssm_beta are 48 rows x 5120 (Q8_0 in the ATX/RVN/Swift IQ4_XS quants, PTQ1_0 in the Swift ternary quant); the
+// table launch packs 8 rows per CTA at widths >= 2, so each one fills 6 CTAs on an 84-SM card and runs
+// latency-bound (9.0 us per call, 96 calls per verify round). Here each CTA owns one row and its nwarps warps split
+// K, giving nrows CTAs. The cross-warp sum has a fixed order, so the result is deterministic, but it groups partial
+// sums differently from the table launch: not bit-identical to it. Opt-in: GGML_CUDA_MMVQ_THIN=<max rows> (off when
+// unset or 0), GGML_CUDA_MMVQ_THIN_NWARPS=4|8 (default 4).
+static int ggml_cuda_mmvq_thin_max_rows() {
+    static const int value = [] {
+        const char * env = getenv("GGML_CUDA_MMVQ_THIN");
+        const int n = env == nullptr ? 0 : atoi(env);
+        return n < 0 ? 0 : n;
+    }();
+    return value;
+}
+
+static int ggml_cuda_mmvq_thin_nwarps() {
+    static const int value = [] {
+        const char * env = getenv("GGML_CUDA_MMVQ_THIN_NWARPS");
+        return env != nullptr && atoi(env) == 8 ? 8 : 4;
+    }();
+    return value;
+}
+
+static constexpr bool ggml_cuda_mmvq_thin_type(ggml_type type) {
+    return type == GGML_TYPE_Q8_0 || type == GGML_TYPE_PTQ1_0;
+}
+
+template <ggml_type type, int ncols_dst, int nwarps>
+__launch_bounds__(nwarps*ggml_cuda_get_physical_warp_size(), 1)
+static __global__ void mul_mat_vec_q_thin(
+        const void * GGML_CUDA_RESTRICT vx, const block_q8_1 * GGML_CUDA_RESTRICT vy, float * GGML_CUDA_RESTRICT dst,
+        const uint32_t ncols_x, const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
+        const uint3 channel_ratio, const uint32_t stride_channel_x, const uint32_t stride_channel_y,
+        const uint32_t stride_channel_dst, const uint3 sample_ratio, const uint32_t stride_sample_x,
+        const uint32_t stride_sample_y, const uint32_t stride_sample_dst) {
+    constexpr int qk        = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi        = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr       = get_vdr_mmvq(type);
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr vec_dot_q_cuda_t vec_dot = get_vec_dot_q_cuda(type);
+    constexpr int blocks_per_iter = vdr*nwarps*warp_size/qi;
+
+    const int      tid         = warp_size*threadIdx.y + threadIdx.x;
+    const uint32_t row         = blockIdx.x;
+    const uint32_t channel_dst = blockIdx.y;
+    const uint32_t sample_dst  = blockIdx.z;
+    const uint32_t channel_x   = fastdiv(channel_dst, channel_ratio);
+    const uint32_t sample_x    = fastdiv(sample_dst, sample_ratio);
+    const int      blocks_per_row_x = ncols_x / qk;
+
+    ggml_cuda_pdl_sync();
+    const block_q8_1 * y = vy + sample_dst*stride_sample_y + channel_dst*stride_channel_y;
+    const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row*stride_row_x;
+
+    float tmp[ncols_dst] = {0.0f};
+    for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+        const int kby = kbx * (qk/QK8_1);
+        const int kqs = vdr * (tid % (qi/vdr));
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            tmp[j] += vec_dot(vx, &y[j*stride_col_y + kby], kbx_offset + kbx, kqs);
+        }
+    }
+
+    __shared__ float tmp_shared[nwarps][ncols_dst];
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+        tmp[j] = warp_reduce_sum<warp_size>(tmp[j]);
+    }
+    if (threadIdx.x == 0) {
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            tmp_shared[threadIdx.y][j] = tmp[j];
+        }
+    }
+    __syncthreads();
+    if (tid < ncols_dst) {
+        float sum = 0.0f;
+#pragma unroll
+        for (int w = 0; w < nwarps; ++w) {
+            sum += tmp_shared[w][tid];
+        }
+        dst[sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + tid*stride_col_dst + row] = sum;
+    }
+}
+
+template <ggml_type type, int nwarps>
+static void mul_mat_vec_q_thin_launch(
+        const void * vx, const void * vy, float * dst, const int ncols_x, const int nrows_x, const int ncols_dst,
+        const int stride_row_x, const int stride_col_y, const int stride_col_dst, const uint3 channel_ratio,
+        const int nchannels_dst, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
+        const uint3 sample_ratio, const int nsamples_dst, const int stride_sample_x, const int stride_sample_y,
+        const int stride_sample_dst, const int warp_size, cudaStream_t stream) {
+    const dim3 block_nums(nrows_x, nchannels_dst, nsamples_dst);
+    const dim3 block_dims(warp_size, nwarps, 1);
+    const ggml_cuda_kernel_launch_params launch_params(block_nums, block_dims, 0, stream);
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+#define MMVQ_THIN_CASE(n) \
+        case n: ggml_cuda_kernel_launch(mul_mat_vec_q_thin<type, n, nwarps>, launch_params, vx, y, dst, \
+            ncols_x, stride_row_x, stride_col_y, stride_col_dst, channel_ratio, stride_channel_x, stride_channel_y, \
+            stride_channel_dst, sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst); break;
+    switch (ncols_dst) {
+        MMVQ_THIN_CASE(2)
+        MMVQ_THIN_CASE(3)
+        MMVQ_THIN_CASE(4)
+        MMVQ_THIN_CASE(5)
+        MMVQ_THIN_CASE(6)
+        MMVQ_THIN_CASE(7)
+        MMVQ_THIN_CASE(8)
+        default: GGML_ABORT("fatal error");
+    }
+#undef MMVQ_THIN_CASE
+}
+
 template <ggml_type type>
 static void mul_mat_vec_q_switch_ncols_dst(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
@@ -1738,6 +1853,24 @@ static void mul_mat_vec_q_switch_ncols_dst(
             ncols_dst, ids_stride, warp_size, nchannels_dst,
             0.0f, 0.0f, 0.0f, 0.0f, stream);
         return;
+    }
+
+    if constexpr (ggml_cuda_mmvq_thin_type(type)) {
+        const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
+                                fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
+        if (!has_ids && !has_fusion && ncols_dst >= 2 && nrows_x <= ggml_cuda_mmvq_thin_max_rows() &&
+                table_id == MMVQ_PARAMETERS_GENERIC) {
+            if (ggml_cuda_mmvq_thin_nwarps() == 8) {
+                mul_mat_vec_q_thin_launch<type, 8>(vx, vy, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y,
+                    stride_col_dst, channel_ratio_fd, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                    sample_ratio_fd, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, warp_size, stream);
+            } else {
+                mul_mat_vec_q_thin_launch<type, 4>(vx, vy, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y,
+                    stride_col_dst, channel_ratio_fd, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                    sample_ratio_fd, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, warp_size, stream);
+            }
+            return;
+        }
     }
 
     switch (ncols_dst) {
