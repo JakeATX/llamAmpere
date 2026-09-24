@@ -1,6 +1,7 @@
 #include "llama-memory-recurrent.h"
 
 #include "ggml-backend.h"
+#include "ggml-ledger.h"
 #include "llama-impl.h"
 #include "llama-io.h"
 #include "llama-batch.h"
@@ -545,9 +546,95 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_recurrent::memory_brea
     return ret;
 }
 
+uint32_t llama_memory_recurrent::replay_span_new(uint32_t ckpt_span, uint32_t replay_len, uint32_t n_seq_tokens, uint32_t n_rs_seq) {
+    const uint32_t m = ckpt_span - std::min(ckpt_span, replay_len);
+    return std::min(m + n_seq_tokens, n_rs_seq);
+}
+
+bool llama_memory_recurrent::replay_split::compat(llama_seq_id a, llama_seq_id b) const {
+    if (a < 0 || b < 0 || (size_t) a >= replay_len.size() || (size_t) b >= replay_len.size()) {
+        return true;
+    }
+    return replay_len[a] == replay_len[b] && ckpt_span[a] == ckpt_span[b] && s_stale[a] == s_stale[b];
+}
+
+void llama_memory_recurrent::replay_split::advance(const llama_ubatch & ubatch) {
+    if (!active || ubatch.n_tokens == 0) {
+        return;
+    }
+    // same values the graph input takes (max over the ubatch's lanes), same update as consume_replay()
+    uint32_t r = 0;
+    uint32_t span = 0;
+    for (uint32_t i = 0; i < ubatch.n_seqs_unq; ++i) {
+        const llama_seq_id seq = ubatch.seq_id_unq[i];
+        if (seq >= 0 && (size_t) seq < replay_len.size()) {
+            r    = std::max(r,    replay_len[seq]);
+            span = std::max(span, ckpt_span[seq]);
+        }
+    }
+    const uint32_t n_seq_tokens = ubatch.n_seqs > 0 ? ubatch.n_tokens / ubatch.n_seqs : 0;
+    const uint32_t span_new     = replay_span_new(span, r, n_seq_tokens, n_rs_seq);
+    for (uint32_t i = 0; i < ubatch.n_seqs_unq; ++i) {
+        const llama_seq_id seq = ubatch.seq_id_unq[i];
+        if (seq >= 0 && (size_t) seq < replay_len.size()) {
+            replay_len[seq] = 0;
+            ckpt_span[seq]  = span_new;
+            s_stale[seq]    = 0;
+        }
+    }
+}
+
+llama_batch_allocr::seq_compat_fn llama_memory_recurrent::replay_split::fn() const {
+    if (!active) {
+        return nullptr;
+    }
+    return [this](llama_seq_id a, llama_seq_id b) { return compat(a, b); };
+}
+
+llama_memory_recurrent::replay_split llama_memory_recurrent::make_replay_split(const llama_batch_allocr & balloc) const {
+    replay_split rs;
+    if (!gdn_replay) {
+        return rs;
+    }
+    rs.active     = true;
+    rs.n_rs_seq   = n_rs_seq;
+    rs.replay_len = replay_len;
+    rs.ckpt_span  = ckpt_span;
+    rs.s_stale    = s_stale;
+
+    // is anything kept apart in this batch? only for the log and the ledger
+    const llama_batch & batch = balloc.get_batch();
+    llama_seq_id first = -1;
+    bool disagree = false;
+    for (int32_t i = 0; i < batch.n_tokens && !disagree; ++i) {
+        for (int32_t k = 0; k < batch.n_seq_id[i]; ++k) {
+            const llama_seq_id seq = batch.seq_id[i][k];
+            if (first < 0) {
+                first = seq;
+            } else if (!rs.compat(first, seq)) {
+                disagree = true;
+                break;
+            }
+        }
+    }
+    if (disagree) {
+        ggml_ledger_add("llama.recurrent", "replay_split lanes_disagree", 1);
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            LLAMA_LOG_INFO("%s: gdn_replay: sequences in this batch have different pending replays; "
+                           "they go into separate ubatches (logged once)\n", __func__);
+        }
+    }
+    return rs;
+}
+
 llama_memory_context_ptr llama_memory_recurrent::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     do {
         balloc.split_reset();
+
+        // [TAG_GDN_REPLAY_SPLIT]
+        replay_split rsplit = make_replay_split(balloc);
 
         std::vector<llama_ubatch> ubatches;
         while (true) {
@@ -562,12 +649,14 @@ llama_memory_context_ptr llama_memory_recurrent::init_batch(llama_batch_allocr &
                 // [TAG_RECURRENT_ROLLBACK_SPLITS]
                 // the trailing (1 + n_rs_seq) tokens of each seq must stay in the same ubatch
                 //   so that the rollback snapshots remain valid
-                ubatch = balloc.split_equal(n_ubatch, true, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
+                ubatch = balloc.split_equal(n_ubatch, true, n_rs_seq > 0 ? n_rs_seq + 1 : 0, rsplit.fn());
             }
 
             if (ubatch.n_tokens == 0) {
                 break;
             }
+
+            rsplit.advance(ubatch);
 
             ubatches.push_back(std::move(ubatch)); // NOLINT
         }
@@ -1638,22 +1727,28 @@ uint32_t llama_memory_recurrent_context::get_ckpt_span() const {
     }
     const llama_ubatch & ubatch = get_ubatch();
     uint32_t span = 0;
-    bool     first = true;
+    llama_seq_id first = -1;
     bool     disagree = false;
     for (uint32_t i = 0; i < ubatch.n_seqs_unq; ++i) {
         const llama_seq_id seq = ubatch.seq_id_unq[i];
         if (seq >= 0 && (size_t) seq < mem->ckpt_span.size()) {
-            const uint32_t v = mem->ckpt_span[seq];
-            disagree |= !first && v != span;
-            span  = std::max(span, v);
-            first = false;
+            if (first >= 0) {
+                disagree |= mem->ckpt_span[seq]  != mem->ckpt_span[first] ||
+                            mem->replay_len[seq] != mem->replay_len[first] ||
+                            mem->s_stale[seq]    != mem->s_stale[first];
+            } else {
+                first = seq;
+            }
+            span = std::max(span, mem->ckpt_span[seq]);
         }
     }
     if (disagree) {
+        // init_batch keeps such lanes apart ([TAG_GDN_REPLAY_SPLIT]); reaching this is a bug
+        ggml_ledger_add("llama.recurrent", "replay_lanes_disagree_in_ubatch", 1);
         static bool warned = false;
         if (!warned) {
             warned = true;
-            LLAMA_LOG_WARN("%s: gdn_replay: sequences in one ubatch have different checkpoint spans; "
+            LLAMA_LOG_WARN("%s: gdn_replay: sequences in one ubatch have different pending replays; "
                            "the replay subtree has one shape per graph, so lanes other than the widest are wrong\n", __func__);
         }
     }

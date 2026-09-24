@@ -507,7 +507,7 @@ llama_ubatch llama_batch_allocr::split_simple(uint32_t n_ubatch) {
     return ubatch_add(idxs, idxs.size(), false);
 }
 
-llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail) {
+llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail, const seq_compat_fn & compat) {
     if (sequential && has_cpl) {
         LLAMA_LOG_ERROR("%s: sequential split is not supported when there are coupled sequences in the input batch (you may need to use the -kvu flag)\n", __func__);
 
@@ -516,7 +516,8 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
 
     std::vector<seq_set_t> cur_seq_set;
 
-    llama_seq_id last_seq_id = -1;
+    llama_seq_id last_seq_id  = -1;
+    llama_seq_id first_seq_id = -1;
 
     // determine the non-overlapping sequence sets participating in this ubatch
     for (int32_t i = 0; i < batch.n_tokens; ++i) {
@@ -539,7 +540,21 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
             add = add && (cur_seq_set.empty() || batch.seq_id[i][0] == last_seq_id + 1);
         }
 
+        // the caller's filter: every seq of the candidate set must be compatible with the first seq
+        if (add && compat && !cur_seq_set.empty()) {
+            for (int32_t k = 0; k < batch.n_seq_id[i]; ++k) {
+                if (!compat(first_seq_id, batch.seq_id[i][k])) {
+                    add = false;
+                    break;
+                }
+            }
+        }
+
         if (add) {
+            if (cur_seq_set.empty()) {
+                first_seq_id = batch.seq_id[i][0];
+            }
+
             cur_seq_set.push_back(seq_set[i]);
 
             last_seq_id = batch.seq_id[i][0];

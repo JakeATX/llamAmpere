@@ -8,6 +8,7 @@
 #include <vector>
 #include <set>
 #include <bitset>
+#include <functional>
 #include <memory>
 #include <unordered_map>
 
@@ -105,7 +106,9 @@ public:
     // make ubatches of equal-length sequences sets
     // if sequential == true, the tokens in the ubatch will have increasing sequential sequence ids
     // n_keep_tail = minimum trailing tokens of a seq that must land in the same ubatch
-    llama_ubatch split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail = 0);
+    // compat      = optional filter: compat(a, b) == false keeps seq b out of a ubatch whose first seq is a
+    using seq_compat_fn = std::function<bool(llama_seq_id a, llama_seq_id b)>;
+    llama_ubatch split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail = 0, const seq_compat_fn & compat = nullptr);
 
     // sequence-set-wise split - each ubatch contains a single sequence-set
     llama_ubatch split_seq(uint32_t n_ubatch);

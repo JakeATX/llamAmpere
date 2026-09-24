@@ -3930,10 +3930,8 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
     // capacity (beyond it the builder re-bases the checkpoint onto the last n_rs_seq tokens).
     // Must agree with llm_build_delta_net_base::build_recurrent_attn's bookkeeping.
     {
-        const uint32_t n_rs_seq     = mctx_cur->get_n_rs_seq();
         const uint32_t n_seq_tokens = n_seqs > 0 ? (uint32_t) (ubatch.n_tokens / n_seqs) : 0;
-        const uint32_t m            = inp->ckpt_span - std::min(inp->ckpt_span, inp->replay_len);
-        inp->span_new = std::min(m + n_seq_tokens, n_rs_seq);
+        inp->span_new = llama_memory_recurrent::replay_span_new(inp->ckpt_span, inp->replay_len, n_seq_tokens, mctx_cur->get_n_rs_seq());
     }
 
     if (inp->snap_shift > 0) {
