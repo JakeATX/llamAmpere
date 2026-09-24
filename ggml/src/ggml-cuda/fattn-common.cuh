@@ -1581,15 +1581,12 @@ void launch_fattn(
     const int cc  = ggml_cuda_info().devices[id].cc;
     const int nsm = ggml_cuda_info().devices[id].nsm;
 
-    // The f16 KV-dequant temps live inside the FA op's compute buffer (reserved by
-    // ggml_cuda_flash_attn_ext_get_f16_extra_data and sized via get_alloc_size). That buffer is
-    // allocated once at graph build time (raw cudaMalloc via ggml_cuda_device_malloc - no pool),
-    // reused across evals, and its address is stable, so it is capture-safe by construction and
-    // never touches the memory pool. This is upstream's design and avoids both the per-launch
-    // cudaMalloc/cudaFree churn and the pool's monotonic physical growth on repeated graph
-    // re-capture, which OOMed long growing-context sessions. Ref llama.cpp #22107.
-    const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
-        ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, need_f16_K, need_f16_V);
+    // Scratch f16 K/V copies. The buffer type reserves space for them behind dst
+    // (ggml_cuda_flash_attn_ext_get_f16_extra_data, upstream's design); these pool
+    // allocations are only touched when that reservation does not cover the op
+    // (dst is a view or lives in a foreign buffer), see the fallback below.
+    ggml_cuda_pool_alloc<half>   K_f16(pool);
+    ggml_cuda_pool_alloc<half>   V_f16(pool);
 
     ggml_cuda_pool_alloc<int>    KV_max(pool);
     ggml_cuda_pool_alloc<float>  dst_tmp(pool);
