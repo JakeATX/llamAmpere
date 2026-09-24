@@ -1,4 +1,5 @@
 #include "kvarn-seal.cuh"
+#include "turbo-quant.cuh"
 #include "../ggml-kvarn.h"
 
 // One block per (record, tile): blockIdx.x = 2*record + is_V. The fp16 tile lives in shared memory
@@ -11,9 +12,103 @@
 #define KVARN_SEAL_THREADS 256
 #define KVARN_SEAL_MAX_DIM 256
 
+// trellis-coded 4-bit body (body type GGML_TYPE_I16, ggml-kvarn.h "kvarn4t"): warp-parallel Viterbi, one warp per
+// (channel tile, fragment lane) sequence of G/2 values. Lane owns windows w = lane + 32*i (i < NWIN/32), i.e. states
+// lane + 32*(i % SPL) and new nibble j = i / SPL; the next state of window w is w >> 4 = (lane >> 4) + 2*i.
+namespace kvarn_tr = ggml_kvarn::trellis;
+static_assert(kvarn_tr::L >= 9 && kvarn_tr::L <= 10, "CUDA trellis sealer supports window lengths 9..10");
+#define KVARN_TR_WPL  (kvarn_tr::NWIN/32)   // windows per lane
+#define KVARN_TR_SPL  (kvarn_tr::NSTATE/32) // states per lane
+#define KVARN_TR_NVAL 64                     // values per sequence = G/2, G <= 128
+#define KVARN_TR_ARGW (KVARN_TR_NVAL*kvarn_tr::NSTATE/8)
+static __device__ uint16_t kvarn_seal_cb_k[kvarn_tr::NWIN] = KVARN_CB_K_INIT;
+static __device__ uint16_t kvarn_seal_cb_v[kvarn_tr::NWIN] = KVARN_CB_V_INIT;
+
+// 3-bit trellis body (ggml-kvarn.h "kvarn3t"): warp-parallel Viterbi over one SEQ-channel sequence of a token row.
+// Lane owns windows w = lane + 32*i (i < NWIN/32 = 16): state lane + 32*(i % 2), new code j = i / 2, next state
+// w >> 3 = (lane >> 3) + 4*i. The traceback packs the 3-bit codes into the SEQ*3/32 words of the sequence.
+namespace kvarn_tr3 = ggml_kvarn::trellis3;
+#define KVARN_TR3_WPL   (kvarn_tr3::NWIN/32)              // 16 windows per lane
+#define KVARN_TR3_SPL   (kvarn_tr3::NSTATE/32)            // 2 states per lane
+#define KVARN_TR3_NVAL  (kvarn_tr3::SEQ)                  // 128 values per sequence
+#define KVARN_TR3_ARGW  (KVARN_TR3_NVAL*kvarn_tr3::NSTATE/8) // 1024 words per warp (global scratch, p.tr3_arg)
+#define KVARN_TR3_WORDS (kvarn_tr3::SEQ*kvarn_tr3::BITS/32)  // 12 payload words per sequence
+static __device__ uint16_t kvarn_seal_cb3_k[kvarn_tr3::NWIN] = KVARN_CB3_TRAINED_K_INIT; // built-in trained (ggml-kvarn-cb-lowbits.h), overridden by the env copy below
+static __device__ uint16_t kvarn_seal_cb3_v[kvarn_tr3::NWIN] = KVARN_CB3_TRAINED_V_INIT;
+// 2-bit trellis body (ggml-kvarn.h "kvarn2t"): the same warp layout at 256 windows (8 per lane), 4 branches, L = 8
+namespace kvarn_tr2 = ggml_kvarn::trellis2;
+static __device__ uint16_t kvarn_seal_cb2_k[kvarn_tr2::NWIN] = KVARN_CB2_TRAINED_K_INIT;
+static __device__ uint16_t kvarn_seal_cb2_v[kvarn_tr2::NWIN] = KVARN_CB2_TRAINED_V_INIT;
+
+struct kvarn_trellis_cb_registry {
+    std::vector<std::pair<const void *, const void *>> syms;
+    std::vector<std::pair<const void *, const void *>> syms3;
+    std::vector<std::pair<const void *, const void *>> syms2;
+    bool done[GGML_CUDA_MAX_DEVICES] = { false };
+};
+static kvarn_trellis_cb_registry & kvarn_trellis_cb_reg() {
+    static kvarn_trellis_cb_registry r;
+    return r;
+}
+void ggml_cuda_kvarn_trellis_cb_register(const void * sym_k, const void * sym_v) {
+    kvarn_trellis_cb_reg().syms.push_back({sym_k, sym_v});
+}
+void ggml_cuda_kvarn_trellis_cb3_register(const void * sym_k, const void * sym_v) {
+    kvarn_trellis_cb_reg().syms3.push_back({sym_k, sym_v});
+}
+void ggml_cuda_kvarn_trellis_cb2_register(const void * sym_k, const void * sym_v) {
+    kvarn_trellis_cb_reg().syms2.push_back({sym_k, sym_v});
+}
+static int kvarn_trellis_cb_copy(const std::vector<std::pair<const void *, const void *>> & syms, const uint16_t * hk, const uint16_t * hv, size_t nwin) {
+    int n_ok = 0;
+    for (const auto & s : syms) {
+        // a translation unit whose device code dropped its unreferenced copy has no symbol: skip it
+        const cudaError_t ek = cudaMemcpyToSymbol(s.first,  hk, nwin*sizeof(uint16_t));
+        const cudaError_t ev = cudaMemcpyToSymbol(s.second, hv, nwin*sizeof(uint16_t));
+        if (ek == cudaSuccess && ev == cudaSuccess) {
+            ++n_ok;
+        } else {
+            (void) cudaGetLastError();
+        }
+    }
+    return n_ok;
+}
+void ggml_cuda_kvarn_trellis_cb_init() {
+    kvarn_trellis_cb_registry & r = kvarn_trellis_cb_reg();
+    const int id = ggml_cuda_get_device();
+    if (r.done[id]) {
+        return;
+    }
+    r.done[id] = true;
+    if (getenv("GGML_KVARN_TRELLIS_CB") != nullptr) {
+        const int n_ok = kvarn_trellis_cb_copy(r.syms, ggml_kvarn::trellis::cb(false), ggml_kvarn::trellis::cb(true), kvarn_tr::NWIN);
+        GGML_LOG_INFO("%s: trellis codebook override copied to %d of %zu device symbol pairs (device %d)\n", __func__, n_ok, r.syms.size(), id);
+    }
+    if (getenv("GGML_KVARN_TRELLIS_CB3") != nullptr) {
+        const int n_ok = kvarn_trellis_cb_copy(r.syms3, ggml_kvarn::trellis3::cb(false), ggml_kvarn::trellis3::cb(true), kvarn_tr3::NWIN);
+        GGML_LOG_INFO("%s: trellis3 codebook override copied to %d of %zu device symbol pairs (device %d)\n", __func__, n_ok, r.syms3.size(), id);
+    }
+    if (getenv("GGML_KVARN_TRELLIS_CB2") != nullptr) {
+        const int n_ok = kvarn_trellis_cb_copy(r.syms2, ggml_kvarn::trellis2::cb(false), ggml_kvarn::trellis2::cb(true), kvarn_tr2::NWIN);
+        GGML_LOG_INFO("%s: trellis2 codebook override copied to %d of %zu device symbol pairs (device %d)\n", __func__, n_ok, r.syms2.size(), id);
+    }
+}
+struct kvarn_seal_cb_registrar {
+    kvarn_seal_cb_registrar() {
+        ggml_cuda_kvarn_trellis_cb_register((const void *) kvarn_seal_cb_k, (const void *) kvarn_seal_cb_v);
+        ggml_cuda_kvarn_trellis_cb3_register((const void *) kvarn_seal_cb3_k, (const void *) kvarn_seal_cb3_v);
+        ggml_cuda_kvarn_trellis_cb2_register((const void *) kvarn_seal_cb2_k, (const void *) kvarn_seal_cb2_v);
+    }
+};
+static kvarn_seal_cb_registrar kvarn_seal_cb_registrar_instance;
+
 struct kvarn_seal_params {
     int D, G, iters, hkv;
+    int trellis;
+    int refit;           // trellis3 per-row affine refit mode (ggml_kvarn::trellis3::refit_mode)
+    uint32_t * tr3_arg;  // trellis3 Viterbi back-pointers, global scratch: [block][warp][KVARN_TR3_ARGW] (static + tile smem leave no room)
     int bits_k, bits_v;
+    int type_k, type_v;
     size_t rec_bytes;
     size_t k_payload, v_payload, k_scale, k_zero, k_tok, v_ch, v_scale, v_zero;
     size_t k_nb1, v_nb1; // bytes per token row of the sources
@@ -111,6 +206,175 @@ static __device__ __forceinline__ uint32_t kvarn_rtn(const float x, const float 
     return (uint32_t) r;
 }
 
+// Arithmetic contract shared with ggml_kvarn::trellis_encode (records bit-identical to the CPU reference):
+// y = (cur - lo)/step, d = y - cb[w], e = d*d, cost = e + M[w >> 4], all IEEE without contraction; strict < over
+// ascending j per state; start state 0, no termination.
+static __device__ void kvarn_trellis_phase_b(const half * tile, const float * s_row, const float * s_col,
+                                             const float * q_lo, const float * q_step, const int sr, const int sc,
+                                             const bool is_V, const int D, const int G, uint32_t * dst32,
+                                             float * ys, float * M, uint32_t * arg) {
+    using namespace kvarn_tr;
+    constexpr int WPL = KVARN_TR_WPL, SPL = KVARN_TR_SPL;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    constexpr int nwarps = KVARN_SEAL_THREADS/32;
+    const int ntiles_c = D/16, nstrips = G/16, n = G/2;
+    const uint16_t * cb = is_V ? kvarn_seal_cb_v : kvarn_seal_cb_k;
+    float cbf[WPL];
+#pragma unroll
+    for (int i = 0; i < WPL; ++i) {
+        cbf[i] = __half2float(__ushort_as_half(cb[lane + 32*i]));
+    }
+    for (int seq = warp; seq < ntiles_c*32; seq += nwarps) {
+        const int c = seq >> 5, fl = seq & 31;
+        for (int i = lane; i < n; i += 32) {
+            const int word = ((i >> 3)*ntiles_c + c)*32 + fl;
+            int t, d;
+            kvarn_frag_pos(word, i & 7, is_V, D, t, d);
+            const int r = is_V ? t : d, col = is_V ? d : t;
+            ys[i] = __fdiv_rn(__fsub_rn(kvarn_cur(tile, s_row, s_col, r, col, sr, sc), q_lo[r]), q_step[r]);
+        }
+        for (int s = lane; s < NSTATE; s += 32) M[s] = 0.0f;
+        __syncwarp();
+        for (int i = n - 1; i >= 0; --i) {
+            const float y = ys[i];
+            float best[SPL]; int bj[SPL];
+#pragma unroll
+            for (int k = 0; k < SPL; ++k) { best[k] = INFINITY; bj[k] = 0; }
+#pragma unroll
+            for (int w = 0; w < WPL; ++w) {
+                const float d   = __fsub_rn(y, cbf[w]);
+                const float e   = __fmul_rn(d, d);
+                const float cst = __fadd_rn(e, M[(lane >> 4) + 2*w]);
+                const int k = w % SPL;
+                if (cst < best[k]) { best[k] = cst; bj[k] = w / SPL; }
+            }
+            __syncwarp();
+#pragma unroll
+            for (int k = 0; k < SPL; ++k) {
+                M[lane + 32*k] = best[k];
+                uint32_t v = (uint32_t) bj[k] << (4*(lane & 7));
+                v |= __shfl_xor_sync(0xFFFFFFFF, v, 1, 32);
+                v |= __shfl_xor_sync(0xFFFFFFFF, v, 2, 32);
+                v |= __shfl_xor_sync(0xFFFFFFFF, v, 4, 32);
+                if ((lane & 7) == 0) {
+                    arg[(i*NSTATE + lane + 32*k) >> 3] = v;
+                }
+            }
+            __syncwarp();
+        }
+        uint32_t word = 0;
+        int s = 0;
+        for (int i = 0; i < n; ++i) {
+            const int j = (arg[(i*NSTATE + s) >> 3] >> (4*(s & 7))) & 15;
+            if ((i >> 3) == lane) {
+                word |= (uint32_t) j << (4*(i & 7));
+            }
+            s = (s + NSTATE*j) >> 4;
+        }
+        if (lane < nstrips) {
+            dst32[(lane*ntiles_c + c)*32 + fl] = word;
+        }
+        __syncwarp();
+    }
+}
+
+// Arithmetic contract shared with ggml_kvarn::trellis_lb_encode<BITS> (records bit-identical to the CPU reference).
+// BITS = 3: 16 windows per lane, next state (lane >> 3) + 4*w; BITS = 2: 8 windows per lane, next state (lane >> 2) + 8*w.
+template<int BITS>
+static __device__ void kvarn_trellis_lb_phase_b(const half * tile, const float * s_row, const float * s_col,
+                                                const float * q_lo, const float * q_step, const int sr, const int sc,
+                                                const bool is_V, const int D, const int G, uint32_t * dst32,
+                                                float * ys, float * M, uint32_t * arg) {
+    static_assert(BITS == 2 || BITS == 3, "low-bit trellis sealer");
+    constexpr int NSTATE = kvarn_tr3::NSTATE, SEQ = kvarn_tr3::SEQ;
+    constexpr int WPL = (1 << (6 + BITS))/32, SPL = KVARN_TR3_SPL, n = KVARN_TR3_NVAL, WORDS = SEQ*BITS/32;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    constexpr int nwarps = KVARN_SEAL_THREADS/32;
+    const int nseq_row = D/SEQ;
+    const uint16_t * cb = BITS == 3 ? (is_V ? kvarn_seal_cb3_v : kvarn_seal_cb3_k) : (is_V ? kvarn_seal_cb2_v : kvarn_seal_cb2_k);
+    float cbf[WPL];
+#pragma unroll
+    for (int i = 0; i < WPL; ++i) {
+        cbf[i] = __half2float(__ushort_as_half(cb[lane + 32*i]));
+    }
+    for (int seq = warp; seq < G*nseq_row; seq += nwarps) {
+        const int t = seq / nseq_row, h = seq % nseq_row;
+        for (int i = lane; i < n; i += 32) {
+            const int d = h*SEQ + i;
+            const int r = is_V ? t : d, c = is_V ? d : t;
+            ys[i] = __fdiv_rn(__fsub_rn(kvarn_cur(tile, s_row, s_col, r, c, sr, sc), q_lo[r]), q_step[r]);
+        }
+        for (int s = lane; s < NSTATE; s += 32) M[s] = 0.0f;
+        __syncwarp();
+        for (int i = n - 1; i >= 0; --i) {
+            const float y = ys[i];
+            float best[SPL]; int bj[SPL];
+#pragma unroll
+            for (int k = 0; k < SPL; ++k) { best[k] = INFINITY; bj[k] = 0; }
+#pragma unroll
+            for (int w = 0; w < WPL; ++w) {
+                const float d   = __fsub_rn(y, cbf[w]);
+                const float e   = __fmul_rn(d, d);
+                const float cst = __fadd_rn(e, M[(lane >> BITS) + (32 >> BITS)*w]);
+                const int k = w % SPL;
+                if (cst < best[k]) { best[k] = cst; bj[k] = w / SPL; }
+            }
+            __syncwarp();
+#pragma unroll
+            for (int k = 0; k < SPL; ++k) {
+                M[lane + 32*k] = best[k];
+                uint32_t v = (uint32_t) bj[k] << (4*(lane & 7));
+                v |= __shfl_xor_sync(0xFFFFFFFF, v, 1, 32);
+                v |= __shfl_xor_sync(0xFFFFFFFF, v, 2, 32);
+                v |= __shfl_xor_sync(0xFFFFFFFF, v, 4, 32);
+                if ((lane & 7) == 0) {
+                    arg[(i*NSTATE + lane + 32*k) >> 3] = v;
+                }
+            }
+            __syncwarp();
+        }
+        uint32_t word = 0;
+        int s = 0;
+        for (int i = 0; i < n; ++i) {
+            const int j = (arg[(i*NSTATE + s) >> 3] >> (4*(s & 7))) & 15;
+            const int b = BITS*i - 32*lane;
+            if (b > -BITS && b < 32) {
+                word |= b >= 0 ? ((uint32_t) j << b) : ((uint32_t) j >> -b);
+            }
+            s = (s + NSTATE*j) >> BITS;
+        }
+        if (lane < WORDS) {
+            dst32[((size_t) t*D + (size_t) h*SEQ)*BITS/32 + lane] = word;
+        }
+        __syncwarp();
+    }
+}
+
+// per-row affine refit of a coded low-bit trellis payload (ggml_kvarn::trellis_lb_refit_rows<BITS>): one thread per row,
+// sequential double sums in column order
+template<int BITS>
+static __device__ void kvarn_trellis_lb_refit(const half * tile, const float * s_row, const float * s_col, const int sr, const int sc,
+                                              const bool is_V, const int D, const int G, const int R, const int C,
+                                              const uint8_t * payload, uint8_t * out, const size_t o_scale, const size_t o_zero,
+                                              const int bits, const int mode) {
+    const uint16_t * cb = BITS == 3 ? (is_V ? kvarn_seal_cb3_v : kvarn_seal_cb3_k) : (is_V ? kvarn_seal_cb2_v : kvarn_seal_cb2_k);
+    for (int r = threadIdx.x; r < R; r += KVARN_SEAL_THREADS) {
+        double Sx = 0.0, Sy = 0.0, Sxx = 0.0, Syy = 0.0, Sxy = 0.0;
+        for (int c = 0; c < C; ++c) {
+            const int t = is_V ? r : c, d = is_V ? c : r;
+            const double x  = (double) kvarn_cur(tile, s_row, s_col, r, c, sr, sc);
+            const double yh = (double) __half2float(__ushort_as_half(cb[ggml_kvarn::trellis_lb_window<BITS>(payload, t, d, D)]));
+            Sx = __dadd_rn(Sx, x); Sy = __dadd_rn(Sy, yh);
+            Sxx = __dadd_rn(Sxx, __dmul_rn(x, x)); Syy = __dadd_rn(Syy, __dmul_rn(yh, yh)); Sxy = __dadd_rn(Sxy, __dmul_rn(x, yh));
+        }
+        float a, b;
+        if (!ggml_kvarn::trellis3_refit_solve(mode, (double) C, Sx, Sy, Sxx, Syy, Sxy, a, b)) { continue; }
+        const int ri = is_V ? r : ggml_kvarn::k_ch_idx(r, D, G, bits);
+        ((half *) (out + o_scale))[ri] = __float2half_rn(__fmul_rn(s_row[r], a));
+        ((half *) (out + o_zero))[ri]  = __float2half_rn(__fmul_rn(s_row[r], b));
+    }
+}
+
 static __global__ void k_kvarn_seal(const char * __restrict__ ksrc, const char * __restrict__ vsrc,
                                     uint8_t * __restrict__ body, const int32_t * __restrict__ desc,
                                     const kvarn_seal_params p) {
@@ -121,6 +385,9 @@ static __global__ void k_kvarn_seal(const char * __restrict__ ksrc, const char *
     __shared__ double log_sc[KVARN_SEAL_MAX_DIM];
     __shared__ float  q_lo[KVARN_SEAL_MAX_DIM];
     __shared__ float  q_step[KVARN_SEAL_MAX_DIM];
+    __shared__ float    tr_y[KVARN_SEAL_THREADS/32][KVARN_TR3_NVAL > KVARN_TR_NVAL ? KVARN_TR3_NVAL : KVARN_TR_NVAL];
+    __shared__ float    tr_M[KVARN_SEAL_THREADS/32][kvarn_tr::NSTATE];
+    __shared__ uint32_t tr_arg[KVARN_SEAL_THREADS/32][KVARN_TR_ARGW];
 
     const bool is_V = blockIdx.x & 1;
     const int  D = p.D, G = p.G;
@@ -146,13 +413,30 @@ static __global__ void k_kvarn_seal(const char * __restrict__ ksrc, const char *
 
     // tile load: token rows row0 + t, channels h*D .. h*D + D
     {
-        const char * src = (is_V ? vsrc : ksrc) + (size_t) h*D*sizeof(half);
+        const int type = is_V ? p.type_v : p.type_k;
+        const size_t head_bytes = type == GGML_TYPE_TQ6_0 ? (D/QK_TQ6)*sizeof(block_tq6_0) : type == GGML_TYPE_Q8_0 ? (D/QK8_0)*sizeof(block_q8_0) : D*sizeof(half);
+        const char * src = (is_V ? vsrc : ksrc) + (size_t) h*head_bytes;
         const size_t nb1 = is_V ? p.v_nb1 : p.k_nb1;
         const int chunks_per_row = D/8; // uint4 = 8 halves
         for (int i = tid; i < G*chunks_per_row; i += KVARN_SEAL_THREADS) {
             const int t = i / chunks_per_row, c = i % chunks_per_row;
-            const uint4 x = *(const uint4 *) (src + (size_t) (row0 + t)*nb1 + (size_t) c*16);
-            *(uint4 *) (tile + (size_t) t*D + c*8) = x;
+            if (type == GGML_TYPE_TQ6_0) {
+                const block_tq6_0 * b = ((const block_tq6_0 *) (src + (size_t) (row0 + t)*nb1)) + c/(QK_TQ6/8);
+                const float norm = __half2float(b->norm);
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    tile[(size_t) t*D + c*8 + j] = __float2half_rn(tq6_dequant_element(b, (c*8+j)%QK_TQ6, norm));
+                }
+            } else if (type == GGML_TYPE_Q8_0) {
+                const block_q8_0 & b = ((const block_q8_0 *) (src + (size_t) (row0 + t)*nb1))[c/4];
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    tile[(size_t) t*D + c*8 + j] = __float2half_rn(__half2float(b.d)*b.qs[(c%4)*8 + j]);
+                }
+            } else {
+                const uint4 x = *(const uint4 *) (src + (size_t) (row0 + t)*nb1 + (size_t) c*16);
+                *(uint4 *) (tile + (size_t) t*D + c*8) = x;
+            }
         }
     }
     // (R, C, sr, sc): K rows = channels (stride 1), cols = tokens (stride D); V rows = tokens, cols = channels
@@ -215,6 +499,12 @@ static __global__ void k_kvarn_seal(const char * __restrict__ ksrc, const char *
     // other widths as a token-major bit stream, 2 threads per token row.
     if (ggml_kvarn::frag_order(bits, D, G)) {
         uint32_t * dst32 = (uint32_t *) (out + payload);
+        if (p.trellis) {
+            const int warp = tid >> 5;
+            kvarn_trellis_phase_b(tile, s_row, s_col, q_lo, q_step, sr, sc, is_V, D, G, dst32,
+                                  tr_y[warp], tr_M[warp], tr_arg[warp]);
+            return;
+        }
         const int n_words = G*D/8;
         for (int w = tid; w < n_words; w += KVARN_SEAL_THREADS) {
             uint32_t word = 0;
@@ -227,6 +517,22 @@ static __global__ void k_kvarn_seal(const char * __restrict__ ksrc, const char *
                 word |= q << (4*nib);
             }
             dst32[w] = word;
+        }
+    } else if (p.trellis && (bits == 3 || bits == 2)) {
+        uint32_t * dst32 = (uint32_t *) (out + payload);
+        uint32_t * tr3_arg = p.tr3_arg + ((size_t) blockIdx.x*(KVARN_SEAL_THREADS/32) + (tid >> 5))*KVARN_TR3_ARGW;
+        if (bits == 3) {
+            kvarn_trellis_lb_phase_b<3>(tile, s_row, s_col, q_lo, q_step, sr, sc, is_V, D, G, dst32, tr_y[tid >> 5], tr_M[tid >> 5], tr3_arg);
+        } else {
+            kvarn_trellis_lb_phase_b<2>(tile, s_row, s_col, q_lo, q_step, sr, sc, is_V, D, G, dst32, tr_y[tid >> 5], tr_M[tid >> 5], tr3_arg);
+        }
+        if (p.refit) {
+            __syncthreads();
+            if (bits == 3) {
+                kvarn_trellis_lb_refit<3>(tile, s_row, s_col, sr, sc, is_V, D, G, R, C, out + payload, out, o_scale, o_zero, bits, p.refit);
+            } else {
+                kvarn_trellis_lb_refit<2>(tile, s_row, s_col, sr, sc, is_V, D, G, R, C, out + payload, out, o_scale, o_zero, bits, p.refit);
+            }
         }
     } else {
         for (int task = tid; task < 2*G; task += KVARN_SEAL_THREADS) {
@@ -253,10 +559,76 @@ static __global__ void k_kvarn_seal(const char * __restrict__ ksrc, const char *
     }
 }
 
+// Each thread converts one 128-value block in the existing rotation basis.
+static __global__ void k_tiered_tq_seal(const char * K, const char * V, char * body,
+        const int32_t * desc, kvarn_seal_params p) {
+    int record = blockIdx.x;
+    const int head = record%p.hkv;
+    const int group = record/p.hkv;
+    int row0 = group*p.G;
+    if (desc) {
+        const int S = desc[GGML_KVARN_DESC_S], old = desc[GGML_KVARN_DESC_B_OLD];
+        const int count = (desc[GGML_KVARN_DESC_B] - old)/p.G;
+        if (group >= count) return;
+        row0 = S + (old + group*p.G - S)%desc[GGML_KVARN_DESC_CAP];
+        record += ((old-S)/p.G)*p.hkv;
+    }
+    const int is_v = blockIdx.y;
+    const int type = is_v ? p.type_v : p.type_k;
+    const size_t stride = is_v ? p.v_nb1 : p.k_nb1;
+    const int blocks_per_row = p.D/QK_TURBO4;
+    const size_t head_bytes = type == GGML_TYPE_TQ6_0 ? blocks_per_row*sizeof(block_tq6_0) :
+        type == GGML_TYPE_Q8_0 ? (p.D/QK8_0)*sizeof(block_q8_0) : p.D*sizeof(half);
+    for (int task = threadIdx.x; task < p.G*blocks_per_row; task += blockDim.x) {
+        const int token = task/blocks_per_row, block = task%blocks_per_row;
+        const char * row = (is_v ? V : K) + (row0+token)*stride + head*head_bytes;
+        block_turbo4_0 * out = (block_turbo4_0 *) (body + record*p.rec_bytes) + is_v*p.G*blocks_per_row + task;
+        float norm2 = 0.0f;
+        for (int j = 0; j < QK_TURBO4; ++j) {
+            const int col = block*QK_TURBO4+j;
+            float value;
+            if (type == GGML_TYPE_TQ6_0) {
+                const block_tq6_0 * b = (const block_tq6_0 *) row + block;
+                value = tq6_dequant_element(b, j, __half2float(b->norm));
+            } else if (type == GGML_TYPE_Q8_0) {
+                const block_q8_0 & b = ((const block_q8_0 *) row)[col/QK8_0];
+                value = __fmul_rn(__half2float(b.d), (float) b.qs[col%QK8_0]);
+            } else value = __half2float(((const half *) row)[col]);
+            value = __half2float(__float2half_rn(value));
+            norm2 = __fadd_rn(norm2, __fmul_rn(value, value));
+        }
+        const float norm = __fsqrt_rn(norm2);
+        const float inv = norm > 1e-10f ? __fdiv_rn(1.0f, norm) : 0.0f;
+        float recon2 = 0.0f;
+        for (int j = 0; j < QK_TURBO4; j += 2) {
+            uint8_t packed = 0;
+            for (int e = 0; e < 2; ++e) {
+                const int col = block*QK_TURBO4+j+e;
+                float value;
+                if (type == GGML_TYPE_TQ6_0) {
+                    const block_tq6_0 * b = (const block_tq6_0 *) row + block;
+                    value = tq6_dequant_element(b, j+e, __half2float(b->norm));
+                } else if (type == GGML_TYPE_Q8_0) {
+                    const block_q8_0 & b = ((const block_q8_0 *) row)[col/QK8_0];
+                    value = __fmul_rn(__half2float(b.d), (float) b.qs[col%QK8_0]);
+                } else value = __half2float(((const half *) row)[col]);
+                value = __half2float(__float2half_rn(value));
+                const uint8_t code = turbo_nearest_centroid_4bit(__fmul_rn(value, inv));
+                packed |= code << (4*e);
+                const float centroid = TURBO_CENTROIDS_4BIT[code];
+                recon2 = __fadd_rn(recon2, __fmul_rn(centroid, centroid));
+            }
+            out->qs[j/2] = packed;
+        }
+        const float recon = __fsqrt_rn(recon2);
+        out->norm = __float2half_rn(recon > 1e-10f ? __fdiv_rn(norm, recon) : norm);
+    }
+}
+
 bool ggml_cuda_kvarn_seal_supported(const ggml_tensor * op) {
     const ggml_tensor * k = op->src[0];
     const ggml_tensor * v = op->src[1];
-    if (k == nullptr || v == nullptr || k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16 || op->type != GGML_TYPE_I8) {
+    if (k == nullptr || v == nullptr || (k->type != GGML_TYPE_F16 && k->type != GGML_TYPE_Q8_0 && k->type != GGML_TYPE_TQ6_0) || (v->type != GGML_TYPE_F16 && v->type != GGML_TYPE_Q8_0 && v->type != GGML_TYPE_TQ6_0) || op->type != GGML_TYPE_I8) {
         return false;
     }
     const int32_t D = ggml_get_op_params_i32(op, 0);
@@ -264,10 +636,20 @@ bool ggml_cuda_kvarn_seal_supported(const ggml_tensor * op) {
     const int32_t bits_k = ggml_get_op_params_i32(op, 2);
     const int32_t bits_v = ggml_get_op_params_i32(op, 3);
     if (D < 32 || D > KVARN_SEAL_MAX_DIM || (D & (D - 1)) != 0) return false;
+    if (ggml_get_op_params_i32(op, 7) == GGML_TYPE_TURBO4_0 && D % QK_TURBO4 != 0) return false;
+    if (ggml_get_op_params_i32(op, 7) == GGML_TYPE_I16) {
+        for (const int32_t bits : {bits_k, bits_v}) {
+            if (bits == 4) { if (G > 2*KVARN_TR_NVAL || G < 16) return false; }
+            else if (bits == 3 || bits == 2) { if (D % kvarn_tr3::SEQ != 0) return false; }
+            else return false;
+        }
+    }
+    if ((k->type == GGML_TYPE_TQ6_0 || v->type == GGML_TYPE_TQ6_0) && D % QK_TQ6 != 0) return false;
     if (G < 32 || G > KVARN_SEAL_MAX_DIM || (G & (G - 1)) != 0) return false;
     if (bits_k < 2 || bits_k > 8 || bits_v < 2 || bits_v > 8) return false;
-    if (k->nb[0] != sizeof(ggml_fp16_t) || v->nb[0] != sizeof(ggml_fp16_t)) return false;
-    if (k->nb[1] % 16 != 0 || v->nb[1] % 16 != 0) return false; // uint4 row loads
+    if (k->nb[0] != ggml_type_size(k->type) || v->nb[0] != ggml_type_size(v->type)) return false;
+    if ((k->type == GGML_TYPE_F16 && k->nb[1] % 16 != 0) ||
+        (v->type == GGML_TYPE_F16 && v->nb[1] % 16 != 0)) return false; // uint4 row loads
     return true;
 }
 
@@ -287,30 +669,53 @@ void ggml_cuda_kvarn_seal(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * desc = dst->src[2];
     const int n_groups = p.n_groups_max > 0 ? p.n_groups_max : (int) (k->ne[1] / p.G);
     const ggml_kvarn::layout l = ggml_kvarn::make_layout(p.D, p.G, p.bits_k, p.bits_v);
-    p.rec_bytes = l.bytes;
+    const bool turbo4_body = ggml_get_op_params_i32(dst, 7) == GGML_TYPE_TURBO4_0;
+    p.trellis = ggml_get_op_params_i32(dst, 7) == GGML_TYPE_I16;
+    p.refit   = p.trellis && (p.bits_k == 3 || p.bits_v == 3 || p.bits_k == 2 || p.bits_v == 2) ? ggml_kvarn::trellis3::refit_mode() : 0;
+    p.rec_bytes = turbo4_body ? 2*p.G*ggml_row_size(GGML_TYPE_TURBO4_0, p.D) : l.bytes;
     p.k_payload = l.k_payload; p.v_payload = l.v_payload;
     p.k_scale = l.k_scale; p.k_zero = l.k_zero; p.k_tok = l.k_tok;
     p.v_ch = l.v_ch; p.v_scale = l.v_scale; p.v_zero = l.v_zero;
     p.k_nb1 = k->nb[1]; p.v_nb1 = v->nb[1];
+    p.type_k = k->type; p.type_v = v->type;
     if (p.n_groups_max > 0) {
         GGML_ASSERT(desc != nullptr && desc->type == GGML_TYPE_I32);
-        GGML_ASSERT((int64_t) ggml_nelements(dst) % ((int64_t) l.bytes * p.hkv) == 0);
+        GGML_ASSERT((int64_t) ggml_nelements(dst) % ((int64_t) p.rec_bytes * p.hkv) == 0);
     } else {
-        GGML_ASSERT((int64_t) ggml_nelements(dst) == (int64_t) l.bytes * p.hkv * n_groups);
+        GGML_ASSERT((int64_t) ggml_nelements(dst) == (int64_t) p.rec_bytes * p.hkv * n_groups);
     }
 
+    if (p.trellis) {
+        ggml_cuda_kvarn_trellis_cb_init();
+    }
+    if (turbo4_body) {
+        GGML_ASSERT(p.D % QK_TURBO4 == 0);
+        k_tiered_tq_seal<<<dim3(p.hkv*n_groups, 2), 128, 0, ctx.stream()>>>(
+            (const char *) k->data, (const char *) v->data, (char *) dst->data,
+            desc ? (const int32_t *) desc->data : nullptr, p);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+
+    const bool tr3 = p.trellis && (p.bits_k == 3 || p.bits_v == 3 || p.bits_k == 2 || p.bits_v == 2);
     const size_t smem = (size_t) p.G * p.D * sizeof(half);
+    const size_t smem_max = (size_t) KVARN_SEAL_MAX_DIM*KVARN_SEAL_MAX_DIM/2*sizeof(half);
     static bool smem_set[GGML_CUDA_MAX_DEVICES] = { false };
     const int id = ggml_cuda_get_device();
     if (!smem_set[id]) {
-        CUDA_CHECK(cudaFuncSetAttribute(k_kvarn_seal, cudaFuncAttributeMaxDynamicSharedMemorySize, KVARN_SEAL_MAX_DIM*KVARN_SEAL_MAX_DIM/2*sizeof(half)));
+        CUDA_CHECK(cudaFuncSetAttribute(k_kvarn_seal, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_max));
         smem_set[id] = true;
     }
-    GGML_ASSERT(smem <= (size_t) KVARN_SEAL_MAX_DIM*KVARN_SEAL_MAX_DIM/2*sizeof(half));
+    GGML_ASSERT(smem <= smem_max);
 
     const int n_rec = p.hkv * n_groups;
     if (n_rec == 0) {
         return;
+    }
+    ggml_cuda_pool_alloc<uint32_t> tr3_arg_alloc(ctx.pool());
+    p.tr3_arg = nullptr;
+    if (tr3) {
+        p.tr3_arg = tr3_arg_alloc.alloc((size_t) 2*n_rec*(KVARN_SEAL_THREADS/32)*KVARN_TR3_ARGW);
     }
     k_kvarn_seal<<<2*n_rec, KVARN_SEAL_THREADS, smem, ctx.stream()>>>(
         (const char *) k->data, (const char *) v->data, (uint8_t *) dst->data,

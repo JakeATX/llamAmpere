@@ -4190,6 +4190,15 @@ struct ggml_tensor * ggml_set_rows(
     return result;
 }
 
+struct ggml_tensor * ggml_set_rows_tq6_rotated(
+        struct ggml_context * ctx, struct ggml_tensor * a,
+        struct ggml_tensor * b, struct ggml_tensor * c) {
+    GGML_ASSERT(a->type == GGML_TYPE_TQ6_0 && b->type == GGML_TYPE_F32);
+    struct ggml_tensor * result = ggml_set_rows(ctx, a, b, c);
+    ggml_set_op_params_i32(result, 1, 1);
+    return result;
+}
+
 // ggml_diag
 
 struct ggml_tensor * ggml_diag(
@@ -5757,12 +5766,13 @@ void ggml_flash_attn_ext_set_kvarn(
         int32_t              n_kv_pad) {
     GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
     GGML_ASSERT(a->src[3] == NULL || a->src[3]->type == GGML_TYPE_F16); // mask follows the standard FA convention
-    GGML_ASSERT(a->src[1]->type == GGML_TYPE_F16 && a->src[2]->type == GGML_TYPE_F16);
+    GGML_ASSERT((a->src[1]->type == GGML_TYPE_F16 || a->src[1]->type == GGML_TYPE_Q8_0 || a->src[1]->type == GGML_TYPE_TQ6_0) && a->src[1]->type == a->src[2]->type);
     GGML_ASSERT(body->type == GGML_TYPE_I8 && ggml_is_contiguous(body));
     GGML_ASSERT(desc->type == GGML_TYPE_I32 && ggml_nelements(desc) >= GGML_KVARN_DESC_N_ENTRIES);
     GGML_ASSERT(bits_k >= 2 && bits_k <= 8 && bits_v >= 2 && bits_v <= 8);
     GGML_ASSERT(n_kv_pad > 0 && n_kv_pad % 64 == 0);
 
+    ggml_set_op_params_i32(a, 7, ggml_get_op_params_i32(body, 7));
     a->src[5] = body;
     a->src[6] = desc;
     ggml_set_op_params_i32(a, 5, (bits_k << 8) | bits_v);
@@ -5793,7 +5803,7 @@ static struct ggml_tensor * ggml_kvarn_seal_impl(
         int32_t               bits_v,
         int32_t               iters,
         int32_t               n_groups_max) {
-    GGML_ASSERT(k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16);
+    GGML_ASSERT((k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_Q8_0 || k->type == GGML_TYPE_TQ6_0) && k->type == v->type);
     GGML_ASSERT(dst->type == GGML_TYPE_I8 && ggml_is_contiguous(dst));
     GGML_ASSERT(k->ne[0] == v->ne[0] && k->ne[1] == v->ne[1]);
     GGML_ASSERT(k->ne[0] % D == 0);
@@ -5801,7 +5811,11 @@ static struct ggml_tensor * ggml_kvarn_seal_impl(
     GGML_ASSERT(G % 8 == 0 && "group size must be a multiple of the reduction lanes");
     GGML_ASSERT(((int64_t) D * bits_k) % 8 == 0 && ((int64_t) D * bits_v) % 8 == 0);
     const int64_t hkv = k->ne[0] / D;
-    const size_t  rec_bytes = ggml_kvarn_rec_bytes(D, G, bits_k, bits_v);
+    const int32_t body_type = ggml_get_op_params_i32(dst, 7);
+    GGML_ASSERT(body_type == GGML_TYPE_F32 || body_type == GGML_TYPE_TURBO4_0 || body_type == GGML_TYPE_I16);
+    GGML_ASSERT(body_type != GGML_TYPE_TURBO4_0 || D % 128 == 0);
+    GGML_ASSERT(body_type != GGML_TYPE_I16 || (bits_k >= 2 && bits_k <= 4 && bits_v >= 2 && bits_v <= 4 && G % 16 == 0)); // trellis: 4-bit fragment or 3-bit/2-bit stream payloads
+    const size_t rec_bytes = body_type == GGML_TYPE_TURBO4_0 ? 2*G*ggml_row_size(GGML_TYPE_TURBO4_0, D) : ggml_kvarn_rec_bytes(D, G, bits_k, bits_v);
     if (desc == NULL) {
         GGML_ASSERT(k->ne[1] % G == 0);
         const int64_t n_groups = k->ne[1] / G;
@@ -5814,7 +5828,7 @@ static struct ggml_tensor * ggml_kvarn_seal_impl(
 
     struct ggml_tensor * result = ggml_view_tensor(ctx, dst);
 
-    int32_t params[] = { D, G, bits_k, bits_v, iters, desc == NULL ? 0 : n_groups_max };
+    int32_t params[] = { D, G, bits_k, bits_v, iters, desc == NULL ? 0 : n_groups_max, 0, body_type };
     ggml_set_op_params(result, params, sizeof(params));
 
     result->op     = GGML_OP_KVARN_SEAL;

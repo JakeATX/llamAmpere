@@ -1047,11 +1047,18 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     return f16_extra.end - (uintptr_t) dst->data;
 }
 
+void ggml_cuda_flash_attn_kvarn_lowbits(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
 
     // KVarN region-aware attention (sink/ring f16 rows + sealed 4-bit body records): dedicated MMA path.
     if (dst->src[6] != nullptr) {
+        if (ggml_get_op_params_i32(dst,5) != ((4 << 8) | 4)) {
+            ggml_cuda_fattn_path_note("kvarn_lowerbits", dst, -1);
+            ggml_cuda_flash_attn_kvarn_lowbits(ctx,dst);
+            return;
+        }
         ggml_cuda_fattn_path_note("kvarn", dst, -1);
         ggml_cuda_flash_attn_ext_mma_kvarn_switch_ncols2<256, 256>(ctx, dst);
         return;

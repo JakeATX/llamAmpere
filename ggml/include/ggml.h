@@ -1783,6 +1783,11 @@ extern "C" {
             struct ggml_tensor  * b,  // source
             struct ggml_tensor  * c); // row indices
 
+    // TQ6 packing in the input basis, without WHT or InnerQ (CPU and CUDA).
+    GGML_API struct ggml_tensor * ggml_set_rows_tq6_rotated(
+            struct ggml_context * ctx, struct ggml_tensor * a,
+            struct ggml_tensor * b, struct ggml_tensor * c);
+
     GGML_API struct ggml_tensor * ggml_diag(
         struct ggml_context     * ctx,
         struct ggml_tensor      * a);
@@ -2794,6 +2799,10 @@ extern "C" {
         GGML_KVARN_DESC_RECBYTES = 7,
         GGML_KVARN_DESC_HKV      = 8,
         GGML_KVARN_DESC_B_OLD    = 9,  // sealed end before this ubatch (ggml_kvarn_seal_dyn seals [B_OLD, B))
+        GGML_KVARN_DESC_TYPE_K   = 10, // sink/ring ggml_type
+        GGML_KVARN_DESC_TYPE_V   = 11,
+        GGML_KVARN_DESC_BODY_TYPE = 12, // 0 = KVarN, TURBO4_0 = stored-domain Turbo4
+        GGML_KVARN_DESC_SINK_TYPE = 13, // 0 inherits staging; F16 uses appended sink storage
         GGML_KVARN_DESC_N_ENTRIES = 16,
     };
 

@@ -18,10 +18,18 @@ class llama_io_read_i;
 struct llama_kvarn_config {
     uint32_t bits_k   = 0;    // 0 = off
     uint32_t bits_v   = 0;
-    uint32_t sink     = 128;  // exact fp16 positions [0, sink)
+    ggml_type sink_type = GGML_TYPE_COUNT; // inherit staging, or a separate F16 sink
+    uint32_t sink     = 128;  // staging positions [0, sink)
     uint32_t group    = 128;  // tokens per sealed record
-    uint32_t tail     = 1024; // exact fp16 positions kept unsealed behind the newest token
-    uint32_t n_ubatch = 512;  // sizes the ring: tail + group + n_ubatch rows, padded to 128
+    uint32_t tail     = 1024; // minimum positions kept unsealed behind the newest token
+    uint32_t n_ubatch = 512;  // sizes the ring headroom for stores and rollback
+    ggml_type body_type = GGML_TYPE_F32;
+    uint32_t tail_max = 0;   // 0 = fixed tail; otherwise delay compression until this limit
+    // tiered body: the first and last `edge_layers` attention layers of the cache use the edge bits/codec (tier 1), the rest tier 0
+    uint32_t edge_layers = 0;
+    uint32_t edge_bits_k = 4;
+    uint32_t edge_bits_v = 4;
+    ggml_type edge_body_type = GGML_TYPE_F32;
 
     bool enabled() const { return bits_k > 0 && bits_v > 0; }
 };

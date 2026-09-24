@@ -329,7 +329,7 @@ static ggml_type kv_cache_type_from_str(const std::string & s) {
     throw std::runtime_error("Unsupported cache type: " + s);
 }
 
-// "kvarnN" (N in 2..8) selects the KVarN region-aware cache: the ring/sink rows stay f16, the body is sealed at N bits
+// "kvarnN" (N in 2..8) selects the KVarN region-aware cache: the ring/sink use the staging type, the body is sealed at N bits
 static bool kvarn_bits_from_str(const std::string & s, uint32_t & bits) {
     if (s.size() != 6 || s.compare(0, 5, "kvarn") != 0 || s[5] < '2' || s[5] > '8') {
         return false;
@@ -2542,15 +2542,92 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
     add_opt(common_arg(
+        {"--kvarn-staging-type"}, "TYPE",
+        "KVarN sink and tail storage: f16, q8_0 or tq6_0 (default: f16)",
+        [](common_params & params, const std::string & value) {
+            if (value != "f16" && value != "q8_0" && value != "tq6_0") {
+                throw std::invalid_argument("KVarN staging type must be f16, q8_0 or tq6_0");
+            }
+            params.kvarn_staging_type = kv_cache_type_from_str(value);
+        }
+    ).set_env("LLAMA_ARG_KVARN_STAGING_TYPE"));
+    add_opt(common_arg(
+        {"--kvarn-sink-type"}, "TYPE",
+        "KVarN sink storage: staging or f16 (default: staging)",
+        [](common_params & params, const std::string & value) {
+            if (value != "staging" && value != "f16") {
+                throw std::invalid_argument("KVarN sink type must be staging or f16");
+            }
+            params.kvarn_sink_type = value == "f16" ? GGML_TYPE_F16 : GGML_TYPE_COUNT;
+        }
+    ).set_env("LLAMA_ARG_KVARN_SINK_TYPE"));
+    add_opt(common_arg(
+        {"--kvarn-body-type"}, "TYPE",
+        "Sealed body codec: kvarn4 (scalar), kvarn4t (trellis-coded payload with the built-in trained codebooks; 4-bit, or the low-bit pairs 3/3, 3/2, 2/2 with -ctk kvarn3|kvarn2 -ctv kvarn3|kvarn2), "
+        "auto (trellis for the 3/3, 3/2 and 2/2 pairs, scalar otherwise) or turbo4 (default: kvarn4)",
+        [](common_params & params, const std::string & value) {
+            if (value != "kvarn4" && value != "kvarn4t" && value != "auto" && value != "turbo4") {
+                throw std::invalid_argument("KVarN body type must be kvarn4, kvarn4t, auto or turbo4");
+            }
+            params.kvarn_body_type = value == "turbo4" ? GGML_TYPE_TURBO4_0 : value == "kvarn4t" ? GGML_TYPE_I16 : value == "auto" ? GGML_TYPE_COUNT : GGML_TYPE_F32;
+        }
+    ).set_env("LLAMA_ARG_KVARN_BODY_TYPE"));
+    add_opt(common_arg(
+        {"--tiered-tq"},
+        "Tiered TQ cache: FP16 sink 128, sealed Turbo4 body, TQ6 tail 8192",
+        [](common_params & params) {
+            params.kvarn_bits_k = params.kvarn_bits_v = 4;
+            params.kvarn_body_type = GGML_TYPE_TURBO4_0;
+            params.kvarn_staging_type = GGML_TYPE_TQ6_0;
+            params.kvarn_sink_type = GGML_TYPE_F16;
+            params.kvarn_sink = 128;
+            params.kvarn_tail = 8192;
+            params.kvarn_tail_max = 0;
+        }
+    ));
+    add_opt(common_arg(
         {"--kvarn-tail"}, "N",
-        string_format("KVarN cache: number of most recent positions kept exact (multiple of 128, default: %u)", params.kvarn_tail),
+        string_format("KVarN cache: number of most recent positions kept unsealed (multiple of 128, default: %u)", params.kvarn_tail),
         [](common_params & params, int value) {
             params.kvarn_tail = (uint32_t) value;
         }
     ).set_env("LLAMA_ARG_KVARN_TAIL"));
     add_opt(common_arg(
+        {"--kvarn-tail-max"}, "N",
+        "KVarN adaptive tail: grow to N positions, then batch compression toward --kvarn-tail; server idle compression discards prompt checkpoints; 0 disables (default: 0)",
+        [](common_params & params, int value) {
+            if (value < 0 || value % 128 != 0) {
+                throw std::invalid_argument("KVarN maximum tail must be nonnegative and a multiple of 128");
+            }
+            params.kvarn_tail_max = (uint32_t) value;
+        }
+    ).set_env("LLAMA_ARG_KVARN_TAIL_MAX"));
+    add_opt(common_arg(
+        {"--kvarn-edge-layers"}, "N",
+        "KVarN tiered body: KV layers within the first N and last N model layers (blocks of any type) seal their body at --kvarn-edge-bits instead of the -ctk/-ctv bits; one eighth of the layer count per end holds a quarter of the model (default: 0 = uniform)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("KVarN edge layer count must be nonnegative");
+            }
+            params.kvarn_edge_layers = (uint32_t) value;
+        }
+    ).set_env("LLAMA_ARG_KVARN_EDGE_LAYERS"));
+    add_opt(common_arg(
+        {"--kvarn-edge-bits"}, "K/V",
+        "KVarN tiered body: body bits for the edge layers, e.g. 4/4 (default: 4/4); the codec follows --kvarn-body-type (auto: trellis only for 3/3, 3/2, 2/2)",
+        [](common_params & params, const std::string & value) {
+            unsigned k = 0, v = 0;
+            char sep = 0;
+            if (sscanf(value.c_str(), "%u%c%u", &k, &sep, &v) != 3 || (sep != '/' && sep != ',') || k < 2 || k > 8 || v < 2 || v > 8) {
+                throw std::invalid_argument("KVarN edge bits must be K/V with K and V in 2..8");
+            }
+            params.kvarn_edge_bits_k = k;
+            params.kvarn_edge_bits_v = v;
+        }
+    ).set_env("LLAMA_ARG_KVARN_EDGE_BITS"));
+    add_opt(common_arg(
         {"--kvarn-sink"}, "N",
-        string_format("KVarN cache: number of leading positions kept exact (multiple of 64, default: %u)", params.kvarn_sink),
+        string_format("KVarN cache: number of leading positions kept unsealed (multiple of 64, default: %u)", params.kvarn_sink),
         [](common_params & params, int value) {
             params.kvarn_sink = (uint32_t) value;
         }

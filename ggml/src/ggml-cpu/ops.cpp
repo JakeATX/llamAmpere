@@ -3,6 +3,7 @@
 
 #include "ggml-cpu.h"
 #include "ggml-impl.h"
+#include "ggml-quants.h"
 #include "binary-ops.h"
 #include "simd-gemm.h"
 #include "ggml.h"
@@ -12,6 +13,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <mutex>
 
 extern "C" {
 // Declaration only. The definition lives in ggml-turbo-quant.c (libggml-base).
@@ -5296,7 +5298,9 @@ static void ggml_compute_forward_set_rows_impl(
 
     const size_t rs = ggml_row_size(src0->type, nc);
 
-    ggml_from_float_t const from_float = ggml_get_type_traits_cpu(dst->type)->from_float;
+    ggml_from_float_t const from_float = (dst->type == GGML_TYPE_TQ6_0 && ggml_get_op_params_i32(dst, 1) == 1)
+        ? (ggml_from_float_t) quantize_row_tq6_0_rotated_ref
+        : ggml_get_type_traits_cpu(dst->type)->from_float;
 
     // For turbo types: communicate WHT group size to the quantize function via global
     if (dst->type == GGML_TYPE_TURBO2_0 || dst->type == GGML_TYPE_TURBO3_0 || dst->type == GGML_TYPE_TURBO4_0 ||
@@ -5316,6 +5320,21 @@ static void ggml_compute_forward_set_rows_impl(
                 const int64_t i1 = *(idx_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
 
                 GGML_ASSERT(i1 >= 0 && i1 < ne1);
+
+                const int sink = ggml_get_op_params_i32(dst, 2);
+                if (sink > 0 && i1 < sink) {
+                    GGML_ASSERT(ne02 == 1 && ne03 == 1);
+                    const size_t offset = (size_t) ggml_get_op_params_i32(dst, 3)*nb1;
+                    GGML_ASSERT(offset + (size_t) sink*nc*sizeof(ggml_fp16_t) <= ggml_nbytes(dst));
+                    auto * out = (ggml_fp16_t *) ((char *) dst->data + offset) + i1*nc;
+                    const auto * in = (const src_t *) ((const char *) src0->data + i*nb01);
+                    if constexpr (std::is_same_v<src_t, float>) {
+                        ggml_fp32_to_fp16_row(in, out, nc);
+                    } else {
+                        memcpy(out, in, nc*sizeof(ggml_fp16_t));
+                    }
+                    continue;
+                }
 
                 if constexpr (std::is_same_v<src_t, float>) {
                     from_float(
@@ -9420,7 +9439,8 @@ static void ggml_compute_forward_flash_attn_ext_kvarn(
     const ggml_tensor * body  = dst->src[5];
     const ggml_tensor * desc  = dst->src[6];
 
-    GGML_ASSERT(q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16);
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT((k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_Q8_0 || k->type == GGML_TYPE_TQ6_0) && k->type == v->type);
     GGML_ASSERT(q->ne[3] == 1 && k->ne[3] == 1);
 
     const int32_t * dd = (const int32_t *) desc->data;
@@ -9433,7 +9453,9 @@ static void ggml_compute_forward_flash_attn_ext_kvarn(
     const int32_t bits = ggml_get_op_params_i32(dst, 5);
     const int bits_k = bits >> 8, bits_v = bits & 0xff;
     const ggml_kvarn::layout l = ggml_kvarn::make_layout(D, G, bits_k, bits_v);
-    GGML_ASSERT(l.bytes == rec_bytes);
+    const bool turbo4_body  = dd[GGML_KVARN_DESC_BODY_TYPE] == GGML_TYPE_TURBO4_0;
+    const bool trellis_body = dd[GGML_KVARN_DESC_BODY_TYPE] == GGML_TYPE_I16;
+    GGML_ASSERT((turbo4_body ? 2*G*ggml_row_size(GGML_TYPE_TURBO4_0, D) : l.bytes) == rec_bytes);
     GGML_ASSERT(q->ne[0] == D && k->ne[0] == D && v->ne[0] == D);
     GGML_ASSERT(k->ne[2] == hkv && k->ne[1] >= S + cap);
     GGML_ASSERT(B >= S || B == 0);
@@ -9478,16 +9500,25 @@ static void ggml_compute_forward_flash_attn_ext_kvarn(
             if (p >= S && p < B) {
                 const int32_t g = (p - S) / G, t = (p - S) % G;
                 const uint8_t * rec = (const uint8_t *) body->data + ((size_t) g*hkv + ikv)*rec_bytes;
-                ggml_kvarn::decode_k_row(rec, l, t, krow.data());
-                ggml_kvarn::decode_v_row(rec, l, t, vrow.data());
+                if (turbo4_body) {
+                    const size_t row_bytes = ggml_row_size(GGML_TYPE_TURBO4_0, D);
+                    dequantize_row_turbo4_0((const block_turbo4_0 *) (rec + t*row_bytes), krow.data(), D);
+                    dequantize_row_turbo4_0((const block_turbo4_0 *) (rec + (G+t)*row_bytes), vrow.data(), D);
+                } else {
+                    ggml_kvarn::decode_k_row(rec, l, t, krow.data(), trellis_body);
+                    ggml_kvarn::decode_v_row(rec, l, t, vrow.data(), trellis_body);
+                }
             } else {
                 const int32_t row = p < S ? p : S + (p - S) % cap;
-                const ggml_fp16_t * kr = (const ggml_fp16_t *) ((const char *) k->data + row*k->nb[1] + ikv*k->nb[2]);
-                const ggml_fp16_t * vr = (const ggml_fp16_t *) ((const char *) v->data + row*v->nb[1] + ikv*v->nb[2]);
-                for (int d = 0; d < D; ++d) {
-                    krow[d] = GGML_CPU_FP16_TO_FP32(kr[d]);
-                    vrow[d] = GGML_CPU_FP16_TO_FP32(vr[d]);
+                const void * kr = (const char *) k->data + row*k->nb[1] + ikv*k->nb[2];
+                const void * vr = (const char *) v->data + row*v->nb[1] + ikv*v->nb[2];
+                const bool f16_sink = p < S && dd[GGML_KVARN_DESC_SINK_TYPE] == GGML_TYPE_F16;
+                if (f16_sink) {
+                    kr = (const char *) k->data + (size_t) (S + cap)*k->nb[1] + (size_t) (p*hkv + ikv)*D*sizeof(ggml_fp16_t);
+                    vr = (const char *) v->data + (size_t) (S + cap)*v->nb[1] + (size_t) (p*hkv + ikv)*D*sizeof(ggml_fp16_t);
                 }
+                ggml_get_type_traits(f16_sink ? GGML_TYPE_F16 : k->type)->to_float(kr, krow.data(), D);
+                ggml_get_type_traits(f16_sink ? GGML_TYPE_F16 : v->type)->to_float(vr, vrow.data(), D);
             }
             float s = 0.0f;
             for (int d = 0; d < D; ++d) {
@@ -11666,6 +11697,29 @@ void ggml_compute_forward_dsv4_hc_post(
     }
 }
 
+// GGML_KVARN_DUMP=<path>: append the fp16 rows every sealed (group, head) sees, for offline codec studies.
+// Record: int32 magic 'KVD1', D, G, head; char name[64]; K [G][D] fp16; V [G][D] fp16.
+static void ggml_kvarn_dump_group(const ggml_fp16_t * K, const ggml_fp16_t * V, size_t row_stride, int D, int G, int64_t head, const char * name) {
+    static const char * path = getenv("GGML_KVARN_DUMP");
+    if (path == nullptr) {
+        return;
+    }
+    static std::mutex m;
+    std::lock_guard<std::mutex> lock(m);
+    FILE * f = fopen(path, "ab");
+    if (f == nullptr) {
+        return;
+    }
+    const int32_t hdr[4] = { 0x31445643, D, G, (int32_t) head };
+    fwrite(hdr, sizeof(int32_t), 4, f);
+    char nm[64] = { 0 };
+    strncpy(nm, name, 63);
+    fwrite(nm, 1, 64, f);
+    for (int t = 0; t < G; ++t) fwrite(K + (size_t) t*row_stride, sizeof(ggml_fp16_t), D, f);
+    for (int t = 0; t < G; ++t) fwrite(V + (size_t) t*row_stride, sizeof(ggml_fp16_t), D, f);
+    fclose(f);
+}
+
 // ggml_compute_forward_kvarn_seal
 
 void ggml_compute_forward_kvarn_seal(
@@ -11674,7 +11728,7 @@ void ggml_compute_forward_kvarn_seal(
     const ggml_tensor * k    = dst->src[0];
     const ggml_tensor * v    = dst->src[1];
     const ggml_tensor * desc = dst->src[2];
-    GGML_ASSERT(k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16);
+    GGML_ASSERT((k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_Q8_0 || k->type == GGML_TYPE_TQ6_0) && k->type == v->type);
 
     const int32_t D = ggml_get_op_params_i32(dst, 0);
     const int32_t G = ggml_get_op_params_i32(dst, 1);
@@ -11684,23 +11738,56 @@ void ggml_compute_forward_kvarn_seal(
     const int32_t n_groups_max = ggml_get_op_params_i32(dst, 5);
 
     const ggml_kvarn::layout l = ggml_kvarn::make_layout(D, G, bits_k, bits_v);
+    const bool turbo4_body  = ggml_get_op_params_i32(dst, 7) == GGML_TYPE_TURBO4_0;
+    const bool trellis_body = ggml_get_op_params_i32(dst, 7) == GGML_TYPE_I16;
+    const size_t rec_bytes = turbo4_body ? 2*G*ggml_row_size(GGML_TYPE_TURBO4_0, D) : l.bytes;
     const int64_t hkv = k->ne[0] / D;
-    GGML_ASSERT(k->nb[0] == sizeof(ggml_fp16_t) && v->nb[0] == sizeof(ggml_fp16_t));
+    GGML_ASSERT(k->nb[0] == ggml_type_size(k->type) && v->nb[0] == ggml_type_size(v->type));
     GGML_ASSERT(k->nb[1] == v->nb[1]);
 
     const size_t row_stride = k->nb[1] / sizeof(ggml_fp16_t);
+    std::vector<float> row(k->type != GGML_TYPE_F16 ? D : 0);
+    std::vector<ggml_fp16_t> kstage(k->type != GGML_TYPE_F16 ? G*D : 0);
+    std::vector<ggml_fp16_t> vstage(kstage.size());
+    auto seal = [&](int64_t first_row, int64_t head, uint8_t * record) {
+        const char * kp = (const char *) k->data + first_row*k->nb[1] + ggml_row_size(k->type, head*D);
+        const char * vp = (const char *) v->data + first_row*v->nb[1] + ggml_row_size(v->type, head*D);
+        if (turbo4_body) {
+            std::vector<float> values(D);
+            const size_t rb = ggml_row_size(GGML_TYPE_TURBO4_0, D);
+            for (int t = 0; t < G; ++t) {
+                for (int is_v = 0; is_v < 2; ++is_v) {
+                    ggml_get_type_traits(k->type)->to_float((is_v ? vp : kp) + t*k->nb[1], values.data(), D);
+                    for (float & value : values) value = GGML_FP16_TO_FP32(GGML_FP32_TO_FP16(value));
+                    quantize_row_turbo4_0_rotated_ref(values.data(), (block_turbo4_0 *) (record + (is_v*G+t)*rb), D);
+                }
+            }
+            return;
+        }
+        if (k->type == GGML_TYPE_F16) {
+            ggml_kvarn_dump_group((const ggml_fp16_t *) kp, (const ggml_fp16_t *) vp, row_stride, D, G, head, k->name);
+            ggml_kvarn::seal_group((const ggml_fp16_t *) kp, (const ggml_fp16_t *) vp, row_stride, l, iters, record, trellis_body);
+            return;
+        }
+        for (int t = 0; t < G; ++t) {
+            ggml_get_type_traits(k->type)->to_float(kp + t*k->nb[1], row.data(), D);
+            ggml_fp32_to_fp16_row(row.data(), kstage.data() + t*D, D);
+            ggml_get_type_traits(v->type)->to_float(vp + t*v->nb[1], row.data(), D);
+            ggml_fp32_to_fp16_row(row.data(), vstage.data() + t*D, D);
+        }
+        ggml_kvarn_dump_group(kstage.data(), vstage.data(), D, D, G, head, k->name);
+        ggml_kvarn::seal_group(kstage.data(), vstage.data(), D, l, iters, record, trellis_body);
+    };
 
     if (desc == nullptr) {
         // static: k/v rows are the group tokens in order, one record per (group, head)
         const int64_t n_groups = k->ne[1] / G;
         const int64_t n_rec    = hkv * n_groups;
-        GGML_ASSERT((int64_t) ggml_nelements(dst) == (int64_t) l.bytes * n_rec);
+        GGML_ASSERT((int64_t) ggml_nelements(dst) == (int64_t) rec_bytes * n_rec);
 
         for (int64_t r = params->ith; r < n_rec; r += params->nth) {
             const int64_t g = r / hkv, h = r % hkv;
-            const ggml_fp16_t * kp = (const ggml_fp16_t *) ((const char *) k->data + (size_t) g*G*k->nb[1]) + h*D;
-            const ggml_fp16_t * vp = (const ggml_fp16_t *) ((const char *) v->data + (size_t) g*G*v->nb[1]) + h*D;
-            ggml_kvarn::seal_group(kp, vp, row_stride, l, iters, (uint8_t *) dst->data + (size_t) r*l.bytes);
+            seal(g*G, h, (uint8_t *) dst->data + (size_t) r*rec_bytes);
         }
         return;
     }
@@ -11713,21 +11800,19 @@ void ggml_compute_forward_kvarn_seal(
     const int32_t B     = d[GGML_KVARN_DESC_B];
     const int32_t B_old = d[GGML_KVARN_DESC_B_OLD];
     GGML_ASSERT(d[GGML_KVARN_DESC_G] == G && d[GGML_KVARN_DESC_D] == D);
-    GGML_ASSERT(d[GGML_KVARN_DESC_HKV] == hkv && (size_t) d[GGML_KVARN_DESC_RECBYTES] == l.bytes);
+    GGML_ASSERT(d[GGML_KVARN_DESC_HKV] == hkv && (size_t) d[GGML_KVARN_DESC_RECBYTES] == rec_bytes);
     GGML_ASSERT(cap % G == 0 && (B_old - S) % G == 0 && (B - S) % G == 0);
     GGML_ASSERT(k->ne[1] >= S + cap);
     const int32_t n_new = B > B_old ? (B - B_old) / G : 0;
     GGML_ASSERT(n_new <= n_groups_max);
     const int64_t g0    = (B_old - S) / G;
     const int64_t n_rec = (int64_t) n_new * hkv;
-    GGML_ASSERT((int64_t) ggml_nelements(dst) >= (int64_t) l.bytes * (g0 + n_new) * hkv);
+    GGML_ASSERT((int64_t) ggml_nelements(dst) >= (int64_t) rec_bytes * (g0 + n_new) * hkv);
 
     for (int64_t r = params->ith; r < n_rec; r += params->nth) {
         const int64_t g = r / hkv, h = r % hkv;
         const int64_t row0 = S + (B_old + g*G - S) % cap; // cap % G == 0 -> the group never wraps
-        const ggml_fp16_t * kp = (const ggml_fp16_t *) ((const char *) k->data + (size_t) row0*k->nb[1]) + h*D;
-        const ggml_fp16_t * vp = (const ggml_fp16_t *) ((const char *) v->data + (size_t) row0*v->nb[1]) + h*D;
-        ggml_kvarn::seal_group(kp, vp, row_stride, l, iters, (uint8_t *) dst->data + (size_t) ((g0 + g)*hkv + h)*l.bytes);
+        seal(row0, h, (uint8_t *) dst->data + (size_t) ((g0 + g)*hkv + h)*rec_bytes);
     }
 }
 

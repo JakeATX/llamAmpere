@@ -20,6 +20,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -159,6 +161,431 @@ inline uint32_t rtn_code(float x, float lo, float step, uint32_t qmax) {
 }
 
 // ---------------------------------------------------------------------------------------------------------
+// Trellis-coded 4-bit payload ("kvarn4t", body type GGML_TYPE_I16).
+//
+// The record layout and all metadata are those of the scalar codec; only the meaning of the 4-bit payload
+// changes. The 8 nibbles of a lane's fragment word and that lane's words across the strips of the record form
+// one little-endian bit stream of G/2 values (value n = nibble n%8 of strip n/8). Value n reconstructs as
+// cb[window_n], window_n = bits[4n-(L-4), 4n+4) (its own nibble j on top of the L-4 bits before it, zero bits
+// before the start of the stream): a trellis with 2^(L-4) states s (the shared bits) whose branch codebook from
+// state s is {cb[s + 2^(L-4) j]}, next state = window >> 4, start state 0, no termination.
+// The identity codebook cb[w] = w >> (L-4) reproduces scalar RTN (up to ties at exact half-integers); a trained
+// codebook (ggml-kvarn-cb.h, generalized Lloyd on sealed tiles) is where the trellis coding gain comes from.
+// Encoding is the Viterbi search below; the CPU reference and the CUDA sealer share its arithmetic contract so
+// records are bit-identical: d = y - cb[w], e = d*d, cost = e + M[w >> 4] in IEEE float without contraction,
+// per-state minima with strict < over ascending j, so ties pick the smallest nibble.
+#ifndef KVARN_TRELLIS_L
+#define KVARN_TRELLIS_L 10
+#endif
+#include "ggml-kvarn-cb.h"
+#include "ggml-kvarn-cb-lowbits.h" // trained 3-bit and 2-bit codebooks (built in; env overrides for experiments)
+static_assert(KVARN_TRELLIS_CB_L == KVARN_TRELLIS_L, "codebook header and trellis window length disagree");
+
+namespace trellis {
+constexpr int L      = KVARN_TRELLIS_L;
+constexpr int NWIN   = 1 << L;    // windows = codebook entries
+constexpr int NSTATE = NWIN >> 4; // states
+constexpr int NBR    = 16;        // branches per state (the new nibble)
+static_assert(L >= 8 && L <= 12, "trellis window length 8..12");
+// host codebooks (fp16 bits, y units): the header defaults, or the file named by GGML_KVARN_TRELLIS_CB
+// (uint16 K[NWIN] then V[NWIN], as written by gate_trellis2.py --save-codebook) loaded once per translation unit
+inline const uint16_t * cb(bool is_V) {
+    static uint16_t k[NWIN] = KVARN_CB_K_INIT;
+    static uint16_t v[NWIN] = KVARN_CB_V_INIT;
+    static const bool loaded = [] {
+        const char * path = getenv("GGML_KVARN_TRELLIS_CB");
+        if (path == nullptr) { return false; }
+        FILE * f = fopen(path, "rb");
+        bool ok = f != nullptr && fread(k, sizeof(uint16_t), NWIN, f) == (size_t) NWIN && fread(v, sizeof(uint16_t), NWIN, f) == (size_t) NWIN;
+        if (f) { fclose(f); }
+        fprintf(stderr, "kvarn trellis: codebook %s from %s (L=%d)\n", ok ? "loaded" : "FAILED TO LOAD", path, L);
+        if (!ok) { abort(); }
+        return ok;
+    }();
+    (void) loaded;
+    return is_V ? v : k;
+}
+}
+
+
+// Low-bit codebook selection (trellis3 / trellis2): the built-in trained codebook is the default. The environment
+// variable named by `env` may name a file (uint16 K[NWIN] then V[NWIN]) or say "identity" (cb[w] = w >> (L-BITS), i.e.
+// the scalar codes: the matched-decoder control) or "trained" (the built-in). Reports the choice once on stderr.
+inline bool trellis_lb_load(const char * env, const char * tag, int L, int BITS, int NWIN, uint16_t * k, uint16_t * v) {
+    const char * s = getenv(env);
+    if (s == nullptr || strcmp(s, "trained") == 0 || strcmp(s, "builtin") == 0) {
+        fprintf(stderr, "kvarn %s: built-in trained codebook (L=%d)\n", tag, L);
+        return false;
+    }
+    if (strcmp(s, "identity") == 0) {
+        for (int w = 0; w < NWIN; ++w) { k[w] = v[w] = GGML_FP32_TO_FP16((float) (w >> (L - BITS))); }
+        fprintf(stderr, "kvarn %s: identity codebook (scalar codes, L=%d)\n", tag, L);
+        return true;
+    }
+    FILE * f = fopen(s, "rb");
+    const bool ok = f != nullptr && fread(k, sizeof(uint16_t), NWIN, f) == (size_t) NWIN && fread(v, sizeof(uint16_t), NWIN, f) == (size_t) NWIN;
+    if (f) { fclose(f); }
+    fprintf(stderr, "kvarn %s: codebook %s from %s (L=%d)\n", tag, ok ? "loaded" : "FAILED TO LOAD", s, L);
+    if (!ok) { abort(); }
+    return true;
+}
+// ---------------------------------------------------------------------------------------------------------
+// 3-bit trellis body ("kvarn3t"): body type GGML_TYPE_I16 on a 3-bit side. The payload keeps the plain
+// token-major 3-bit stream of code_bit(); the trellis runs along the channels of a token row and restarts
+// (history = 0) every SEQ channels. The window of code (t, d) is the current code in its top 3 bits and the
+// two codes before it below (older lower), i.e. exactly the L = 9 stream bits ending at the current code.
+// The built-in trained codebook (ggml-kvarn-cb-lowbits.h) is the default; the identity codebook cb[w] = w >> 6
+// reproduces scalar RTN codes (GGML_KVARN_TRELLIS_CB3=identity, or a file of uint16 K[NWIN] then V[NWIN] fp16
+// bits). GGML_KVARN_TRELLIS_REFIT = none | fit | norm refits the per-row scale/zero after coding (least squares /
+// moment matching of the reconstruction); norm is the default.
+namespace trellis3 {
+constexpr int BITS   = 3;
+constexpr int L      = 9;
+constexpr int NWIN   = 1 << L;       // 512 codebook entries
+constexpr int NSTATE = NWIN >> BITS; // 64 states
+constexpr int NBR    = 1 << BITS;    // 8 branches
+constexpr int SEQ    = 128;          // channels per sequence
+static_assert(SEQ*BITS % 32 == 0, "a sequence must cover whole 32-bit words");
+inline const uint16_t * cb(bool is_V) {
+    static uint16_t k[NWIN] = KVARN_CB3_TRAINED_K_INIT;
+    static uint16_t v[NWIN] = KVARN_CB3_TRAINED_V_INIT;
+    static const bool overridden = trellis_lb_load("GGML_KVARN_TRELLIS_CB3", "trellis3", L, BITS, NWIN, k, v);
+    (void) overridden;
+    return is_V ? v : k;
+}
+// per-row affine refit after coding: norm (moment matching) is the default (KL gate 2026-09-23: most of the 3-bit gain);
+// GGML_KVARN_TRELLIS_REFIT = none | fit | norm overrides
+inline int refit_mode() {
+    static const int mode = [] {
+        const char * s = getenv("GGML_KVARN_TRELLIS_REFIT");
+        if (s == nullptr || strcmp(s, "norm") == 0) { return 2; }
+        if (strcmp(s, "none") == 0 || strcmp(s, "0") == 0) { return 0; }
+        if (strcmp(s, "fit") == 0) { return 1; }
+        fprintf(stderr, "kvarn trellis3: unknown GGML_KVARN_TRELLIS_REFIT=%s (none|fit|norm)\n", s);
+        abort();
+    }();
+    return mode;
+}
+}
+// identity codebook initializer for device copies (fp16 bits of 0..7, 64 entries each)
+#define KVARN_CB3_R8(x)  x, x, x, x, x, x, x, x
+#define KVARN_CB3_R64(x) KVARN_CB3_R8(x), KVARN_CB3_R8(x), KVARN_CB3_R8(x), KVARN_CB3_R8(x), KVARN_CB3_R8(x), KVARN_CB3_R8(x), KVARN_CB3_R8(x), KVARN_CB3_R8(x)
+#define KVARN_CB3_IDENTITY_INIT { KVARN_CB3_R64(0x0000), KVARN_CB3_R64(0x3C00), KVARN_CB3_R64(0x4000), KVARN_CB3_R64(0x4200), \
+                                  KVARN_CB3_R64(0x4400), KVARN_CB3_R64(0x4500), KVARN_CB3_R64(0x4600), KVARN_CB3_R64(0x4700) }
+
+// 2-bit trellis body ("kvarn2t"): the 3-bit scheme at BITS = 2, L = 8 (current code on top of the three codes before it),
+// 256 windows, the same 64 states, 4 branches; built-in trained codebook by default, GGML_KVARN_TRELLIS_CB2 = <file>
+// (uint16 K[256] then V[256]) | identity (cb[w] = w >> 6) overrides. Refit mode is shared with trellis3.
+namespace trellis2 {
+constexpr int BITS   = 2;
+constexpr int L      = 8;
+constexpr int NWIN   = 1 << L;       // 256 codebook entries
+constexpr int NSTATE = NWIN >> BITS; // 64 states
+constexpr int NBR    = 1 << BITS;    // 4 branches
+constexpr int SEQ    = 128;          // channels per sequence
+static_assert(SEQ*BITS % 32 == 0, "a sequence must cover whole 32-bit words");
+static_assert(NSTATE == trellis3::NSTATE && SEQ == trellis3::SEQ, "trellis2 and trellis3 share the Viterbi kernel shape");
+inline const uint16_t * cb(bool is_V) {
+    static uint16_t k[NWIN] = KVARN_CB2_TRAINED_K_INIT;
+    static uint16_t v[NWIN] = KVARN_CB2_TRAINED_V_INIT;
+    static const bool overridden = trellis_lb_load("GGML_KVARN_TRELLIS_CB2", "trellis2", L, BITS, NWIN, k, v);
+    (void) overridden;
+    return is_V ? v : k;
+}
+inline int refit_mode() { return trellis3::refit_mode(); }
+}
+#define KVARN_CB2_IDENTITY_INIT { KVARN_CB3_R64(0x0000), KVARN_CB3_R64(0x3C00), KVARN_CB3_R64(0x4000), KVARN_CB3_R64(0x4200) }
+
+// the two low-bit trellis codecs share every routine below; trellis_lb<BITS> names the constants and codebook of one
+template<int BITS> struct trellis_lb;
+template<> struct trellis_lb<3> {
+    static constexpr int L = trellis3::L, NWIN = trellis3::NWIN, NSTATE = trellis3::NSTATE, NBR = trellis3::NBR, SEQ = trellis3::SEQ;
+    static const uint16_t * cb(bool is_V) { return trellis3::cb(is_V); }
+};
+template<> struct trellis_lb<2> {
+    static constexpr int L = trellis2::L, NWIN = trellis2::NWIN, NSTATE = trellis2::NSTATE, NBR = trellis2::NBR, SEQ = trellis2::SEQ;
+    static const uint16_t * cb(bool is_V) { return trellis2::cb(is_V); }
+};
+
+KVARN_HD inline float sub_rn(float a, float b) {
+#if defined(__CUDA_ARCH__)
+    return __fsub_rn(a, b);
+#else
+    volatile float r = a - b; return r; // volatile: no fma contraction under -ffp-contract=fast
+#endif
+}
+KVARN_HD inline float mul_rn(float a, float b) {
+#if defined(__CUDA_ARCH__)
+    return __fmul_rn(a, b);
+#else
+    volatile float r = a * b; return r;
+#endif
+}
+KVARN_HD inline float add_rn(float a, float b) {
+#if defined(__CUDA_ARCH__)
+    return __fadd_rn(a, b);
+#else
+    volatile float r = a + b; return r;
+#endif
+}
+KVARN_HD inline float div_rn(float a, float b) {
+#if defined(__CUDA_ARCH__)
+    return __fdiv_rn(a, b);
+#else
+    volatile float r = a / b; return r;
+#endif
+}
+KVARN_HD inline double dadd_rn(double a, double b) {
+#if defined(__CUDA_ARCH__)
+    return __dadd_rn(a, b);
+#else
+    volatile double r = a + b; return r;
+#endif
+}
+KVARN_HD inline double dsub_rn(double a, double b) {
+#if defined(__CUDA_ARCH__)
+    return __dsub_rn(a, b);
+#else
+    volatile double r = a - b; return r;
+#endif
+}
+KVARN_HD inline double dmul_rn(double a, double b) {
+#if defined(__CUDA_ARCH__)
+    return __dmul_rn(a, b);
+#else
+    volatile double r = a * b; return r;
+#endif
+}
+KVARN_HD inline double ddiv_rn(double a, double b) {
+#if defined(__CUDA_ARCH__)
+    return __ddiv_rn(a, b);
+#else
+    volatile double r = a / b; return r;
+#endif
+}
+
+// one 3-bit code of a token-major stream at bit offset `bit` (host and device)
+template<int BITS>
+KVARN_HD inline uint32_t code_lb_at(const uint8_t * payload, uint32_t bit) {
+    const uint32_t byte = bit >> 3, shift = bit & 7;
+    uint32_t v = payload[byte];
+    if (shift + BITS > 8) {
+        v |= (uint32_t) payload[byte + 1] << 8;
+    }
+    return (v >> shift) & ((1u << BITS) - 1);
+}
+KVARN_HD inline uint32_t code3_at(const uint8_t * payload, uint32_t bit) { return code_lb_at<3>(payload, bit); }
+// low-bit trellis window (codebook index) of code (token t, channel d) of a token-major BITS-bit stream with D channels:
+// the current code in the top BITS bits over the 6 stream bits before it (the 6/BITS previous codes, older lower);
+// history restarts at every SEQ-channel boundary
+template<int BITS>
+KVARN_HD inline uint32_t trellis_lb_window(const uint8_t * payload, int t, int d, int D) {
+    constexpr int SEQ = 128, NWIN = 1 << (6 + BITS), HIST = 6/BITS;
+    const uint32_t bit = ((uint32_t) t*(uint32_t) D + (uint32_t) d)*(uint32_t) BITS;
+    const int h = d & (SEQ - 1);
+    if (h >= HIST) {
+        const uint32_t bs = bit - 6u;
+        const uint32_t byte = bs >> 3, shift = bs & 7;
+        const uint32_t v = (uint32_t) payload[byte] | ((uint32_t) payload[byte + 1] << 8);
+        return (v >> shift) & (uint32_t) (NWIN - 1);
+    }
+    uint32_t w = code_lb_at<BITS>(payload, bit) << 6;
+    for (int k = 1; k <= h; ++k) {
+        w |= code_lb_at<BITS>(payload, bit - (uint32_t) (k*BITS)) << (6 - k*BITS);
+    }
+    return w;
+}
+KVARN_HD inline uint32_t trellis3_window(const uint8_t * payload, int t, int d, int D) { return trellis_lb_window<3>(payload, t, d, D); }
+KVARN_HD inline uint32_t trellis2_window(const uint8_t * payload, int t, int d, int D) { return trellis_lb_window<2>(payload, t, d, D); }
+// refit of one row's affine from sequential double sums over its C values (x = balanced value, y = reconstruction):
+// mode 1 least squares x ~ a*y + b, mode 2 moment matching (std and mean). Returns false when degenerate.
+KVARN_HD inline bool trellis3_refit_solve(int mode, double n, double Sx, double Sy, double Sxx, double Syy, double Sxy, float & a, float & b) {
+    const double vy = dsub_rn(dmul_rn(n, Syy), dmul_rn(Sy, Sy));
+    if (!(vy > 0.0)) { return false; }
+    double ad;
+    if (mode == 1) {
+        ad = ddiv_rn(dsub_rn(dmul_rn(n, Sxy), dmul_rn(Sx, Sy)), vy);
+    } else {
+        const double vx = dsub_rn(dmul_rn(n, Sxx), dmul_rn(Sx, Sx));
+        if (!(vx > 0.0)) { return false; }
+        ad = sqrt(ddiv_rn(vx, vy));
+    }
+    const double bd = ddiv_rn(dsub_rn(Sx, dmul_rn(ad, Sy)), n);
+    if (!(ad > 0.0) || !(bd == bd) || ad > 1e30 || fabs(bd) > 1e30) { return false; }
+    a = (float) ad; b = (float) bd;
+    return true;
+}
+
+// (t, d) of nibble `nib` of fragment word `word` of a 4-bit fragment-order payload (inverse of code_bit)
+KVARN_HD inline void frag_pos(int word, int nib, bool is_V, int D, int & t, int & d) {
+    const int lane = word & 31;
+    const int tile = (word >> 5) % (D/16);
+    const int s    = (word >> 5) / (D/16);
+    const int l = nib & 3, e = nib >> 2;
+    const int row = (l & 1)*8 + (lane >> 2);
+    const int col = 2*((l >> 1)*4 + (lane & 3)) + e;
+    if (!is_V) { t = s*16 + row; d = tile*16 + col; }
+    else       { d = tile*16 + row; t = s*16 + col; }
+}
+
+// window (codebook index) of nibble `nib` of word `word` given the previous word of the same lane sequence
+// (one strip = 32*ntiles_c words back, 0 for the first strip)
+KVARN_HD inline uint32_t trellis_window_of(uint32_t w, uint32_t wp, int nib) {
+    const uint64_t bits = ((uint64_t) w << 32) | wp;
+    return (uint32_t) (bits >> (32 + 4*nib + 4 - trellis::L)) & (uint32_t) (trellis::NWIN - 1);
+}
+KVARN_HD inline uint32_t trellis_window(const uint32_t * payload, uint32_t word, int nib, int ntiles_c) {
+    const uint32_t s  = (word >> 5) / (uint32_t) ntiles_c;
+    const uint32_t wp = s > 0 ? payload[word - 32u*(uint32_t) ntiles_c] : 0u;
+    return trellis_window_of(payload[word], wp, nib);
+}
+
+// Viterbi encoder of one lane sequence: y[n] (balanced, row-normalised values), cbf[NWIN] the codebook as float,
+// writes the nstrips = n/8 fragment words of the lane. Reference implementation (see the contract above).
+inline void trellis_encode(const float * y, int n, const float * cbf, uint32_t * words) {
+    using namespace trellis;
+    std::vector<float>   M(NSTATE, 0.0f), Mn(NSTATE);
+    std::vector<uint8_t> arg((size_t) n*NSTATE);
+    for (int i = n - 1; i >= 0; --i) {
+        for (int s = 0; s < NSTATE; ++s) {
+            float best = INFINITY; int bj = 0;
+            for (int j = 0; j < NBR; ++j) {
+                const int w = s + NSTATE*j;
+                const float d = sub_rn(y[i], cbf[w]);
+                const float e = mul_rn(d, d);
+                const float c = add_rn(e, M[w >> 4]);
+                if (c < best) { best = c; bj = j; }
+            }
+            Mn[s] = best;
+            arg[(size_t) i*NSTATE + s] = (uint8_t) bj;
+        }
+        M.swap(Mn);
+    }
+    for (int st = 0; st < n/8; ++st) words[st] = 0;
+    int s = 0;
+    for (int i = 0; i < n; ++i) {
+        const int j = arg[(size_t) i*NSTATE + s];
+        words[i >> 3] |= (uint32_t) j << (4*(i & 7));
+        s = (s + NSTATE*j) >> 4;
+    }
+}
+
+// Trellis-code the 4-bit payload of one tile: bal is the balanced [R][C] tile, lo/step the per-row affine,
+// payload the fragment-ordered destination (all words of the tile).
+inline void trellis_code_tile(const float * bal, int R, int C, const float * lo, const float * step, bool is_V,
+                              int D, int G, uint32_t * payload) {
+    using namespace trellis;
+    const int ntiles_c = D/16, nstrips = G/16, n = G/2;
+    std::vector<float> cbf(NWIN);
+    const uint16_t * cbh = cb(is_V);
+    for (int w = 0; w < NWIN; ++w) cbf[w] = GGML_FP16_TO_FP32(cbh[w]);
+    std::vector<float> y(n);
+    std::vector<uint32_t> words(nstrips);
+    for (int c = 0; c < ntiles_c; ++c) {
+        for (int lane = 0; lane < 32; ++lane) {
+            for (int i = 0; i < n; ++i) {
+                const int word = ((i >> 3)*ntiles_c + c)*32 + lane;
+                int t, d;
+                frag_pos(word, i & 7, is_V, D, t, d);
+                const int r = is_V ? t : d, col = is_V ? d : t;
+                y[i] = div_rn(sub_rn(bal[(size_t) r*C + col], lo[r]), step[r]);
+            }
+            trellis_encode(y.data(), n, cbf.data(), words.data());
+            for (int st = 0; st < nstrips; ++st) payload[(st*ntiles_c + c)*32 + lane] = words[st];
+        }
+    }
+    GGML_UNUSED(R);
+}
+
+// payload helpers defined further down (used by the trellis3 row coders)
+KVARN_HD inline uint32_t code_bit(int t, int d, bool is_V, int D, int G, int bits);
+KVARN_HD inline int k_ch_idx(int d, int D, int G, int bits);
+inline void pack_code(uint8_t * payload, uint32_t bit, int bits, uint32_t v);
+inline void put_half(uint8_t * rec, size_t off, float v);
+
+// Viterbi encoder of one low-bit trellis sequence (contract of trellis_encode: IEEE ops without contraction, strict <
+// over ascending branches, start state 0, no termination); codes[n] receives the BITS-bit codes.
+template<int BITS>
+inline void trellis_lb_encode(const float * y, int n, const float * cbf, uint8_t * codes) {
+    constexpr int NSTATE = trellis_lb<BITS>::NSTATE, NBR = trellis_lb<BITS>::NBR;
+    std::vector<float>   M(NSTATE, 0.0f), Mn(NSTATE);
+    std::vector<uint8_t> arg((size_t) n*NSTATE);
+    for (int i = n - 1; i >= 0; --i) {
+        for (int s = 0; s < NSTATE; ++s) {
+            float best = INFINITY; int bj = 0;
+            for (int j = 0; j < NBR; ++j) {
+                const int w = s + NSTATE*j;
+                const float d = sub_rn(y[i], cbf[w]);
+                const float e = mul_rn(d, d);
+                const float c = add_rn(e, M[w >> BITS]);
+                if (c < best) { best = c; bj = j; }
+            }
+            Mn[s] = best;
+            arg[(size_t) i*NSTATE + s] = (uint8_t) bj;
+        }
+        M.swap(Mn);
+    }
+    int s = 0;
+    for (int i = 0; i < n; ++i) {
+        const int j = arg[(size_t) i*NSTATE + s];
+        codes[i] = (uint8_t) j;
+        s = (s + NSTATE*j) >> BITS;
+    }
+}
+
+// Trellis-code the low-bit payload of one tile: bal is the balanced [R][C] tile (K: rows = channels, V: rows = tokens),
+// lo/step the per-row affine; payload the token-major bit stream of the tile (zeroed by the caller).
+template<int BITS>
+inline void trellis_lb_code_rows(const float * bal, int R, int C, const float * lo, const float * step, bool is_V,
+                                 int D, int G, uint8_t * payload) {
+    constexpr int SEQ = trellis_lb<BITS>::SEQ, NWIN = trellis_lb<BITS>::NWIN;
+    GGML_ASSERT(D % SEQ == 0);
+    std::vector<float> cbf(NWIN);
+    const uint16_t * cbh = trellis_lb<BITS>::cb(is_V);
+    for (int w = 0; w < NWIN; ++w) cbf[w] = GGML_FP16_TO_FP32(cbh[w]);
+    std::vector<float> y(SEQ);
+    std::vector<uint8_t> codes(SEQ);
+    for (int t = 0; t < G; ++t) {
+        for (int h = 0; h < D/SEQ; ++h) {
+            for (int i = 0; i < SEQ; ++i) {
+                const int d = h*SEQ + i;
+                const int r = is_V ? t : d, col = is_V ? d : t;
+                y[i] = div_rn(sub_rn(bal[(size_t) r*C + col], lo[r]), step[r]);
+            }
+            trellis_lb_encode<BITS>(y.data(), SEQ, cbf.data(), codes.data());
+            for (int i = 0; i < SEQ; ++i) {
+                pack_code(payload, code_bit(t, h*SEQ + i, is_V, D, G, BITS), BITS, codes[i]);
+            }
+        }
+    }
+    GGML_UNUSED(R);
+}
+
+// Refit the per-row scale/zero of a low-bit trellis payload (mode: trellis3::refit_mode). Sequential double sums over
+// the row's columns in column order, shared arithmetic with the CUDA sealer.
+template<int BITS>
+inline void trellis_lb_refit_rows(const float * bal, int R, int C, const float * s_row, bool is_V, int D, int G,
+                                  const uint8_t * payload, uint8_t * rec, const layout & l, int mode) {
+    if (mode == 0) { return; }
+    const uint16_t * cbh = trellis_lb<BITS>::cb(is_V);
+    for (int r = 0; r < R; ++r) {
+        double Sx = 0.0, Sy = 0.0, Sxx = 0.0, Syy = 0.0, Sxy = 0.0;
+        for (int c = 0; c < C; ++c) {
+            const int t = is_V ? r : c, d = is_V ? c : r;
+            const double x  = (double) bal[(size_t) r*C + c];
+            const double yh = (double) GGML_FP16_TO_FP32(cbh[trellis_lb_window<BITS>(payload, t, d, D)]);
+            Sx = dadd_rn(Sx, x); Sy = dadd_rn(Sy, yh);
+            Sxx = dadd_rn(Sxx, dmul_rn(x, x)); Syy = dadd_rn(Syy, dmul_rn(yh, yh)); Sxy = dadd_rn(Sxy, dmul_rn(x, yh));
+        }
+        float a, b;
+        if (!trellis3_refit_solve(mode, (double) C, Sx, Sy, Sxx, Syy, Sxy, a, b)) { continue; }
+        const int ri = is_V ? r : k_ch_idx(r, D, G, l.bits_k);
+        put_half(rec, (is_V ? l.v_scale : l.k_scale) + 2*ri, mul_rn(s_row[r], a));
+        put_half(rec, (is_V ? l.v_zero  : l.k_zero)  + 2*ri, mul_rn(s_row[r], b));
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------
 // Payload and metadata order.
 //
 // 4-bit payloads (the production width) are stored in "fragment order": the order in which one warp of the
@@ -257,10 +684,11 @@ inline float get_half(const uint8_t * rec, size_t off) {
 
 // Seal one (head, group): K and V are the rotated fp16 rows, row t at K + t*row_stride (elements),
 // D contiguous values per row. Writes l.bytes bytes to rec.
-inline void seal_group(const ggml_fp16_t * K, const ggml_fp16_t * V, size_t row_stride, const layout & l, int iters, uint8_t * rec) {
+inline void seal_group(const ggml_fp16_t * K, const ggml_fp16_t * V, size_t row_stride, const layout & l, int iters, uint8_t * rec, bool trellis_body = false) {
     const int D = l.D, G = l.G;
     std::vector<float> tile((size_t) D*G), bal((size_t) D*G), s_row(std::max(D, G)), s_col(std::max(D, G));
     memset(rec, 0, l.bytes);
+    GGML_ASSERT(!trellis_body || ((l.bits_k >= 2 && l.bits_k <= 4) && (l.bits_v >= 2 && l.bits_v <= 4)));
 
     // K: tile [D][G] (rows = channels, cols = tokens)
     for (int t = 0; t < G; ++t) {
@@ -271,6 +699,7 @@ inline void seal_group(const ggml_fp16_t * K, const ggml_fp16_t * V, size_t row_
     balance(tile.data(), D, G, iters, s_row.data(), s_col.data(), bal.data());
     {
         const uint32_t qmax = (1u << l.bits_k) - 1;
+        std::vector<float> q_lo(trellis_body ? D : 0), q_step(trellis_body ? D : 0);
         for (int d = 0; d < D; ++d) {
             const float * row = bal.data() + (size_t) d*G;
             float lo = row[0], hi = row[0];
@@ -279,9 +708,23 @@ inline void seal_group(const ggml_fp16_t * K, const ggml_fp16_t * V, size_t row_
             const int di = k_ch_idx(d, D, G, l.bits_k);
             put_half(rec, l.k_scale + 2*di, s_row[d] * step);
             put_half(rec, l.k_zero  + 2*di, s_row[d] * lo);
+            if (trellis_body) {
+                q_lo[d] = lo; q_step[d] = step;
+                continue;
+            }
             for (int t = 0; t < G; ++t) {
                 pack_code(rec + l.k_payload, code_bit(t, d, false, D, G, l.bits_k), l.bits_k, rtn_code(row[t], lo, step, qmax));
             }
+        }
+        if (trellis_body && l.bits_k == 3) {
+            trellis_lb_code_rows<3>(bal.data(), D, G, q_lo.data(), q_step.data(), false, D, G, rec + l.k_payload);
+            trellis_lb_refit_rows<3>(bal.data(), D, G, s_row.data(), false, D, G, rec + l.k_payload, rec, l, trellis3::refit_mode());
+        } else if (trellis_body && l.bits_k == 2) {
+            trellis_lb_code_rows<2>(bal.data(), D, G, q_lo.data(), q_step.data(), false, D, G, rec + l.k_payload);
+            trellis_lb_refit_rows<2>(bal.data(), D, G, s_row.data(), false, D, G, rec + l.k_payload, rec, l, trellis2::refit_mode());
+        } else if (trellis_body) {
+            GGML_ASSERT(frag_order(l.bits_k, D, G) && G % 16 == 0);
+            trellis_code_tile(bal.data(), D, G, q_lo.data(), q_step.data(), false, D, G, (uint32_t *) (rec + l.k_payload));
         }
         for (int t = 0; t < G; ++t) {
             put_half(rec, l.k_tok + 2*t, s_col[t]);
@@ -297,6 +740,7 @@ inline void seal_group(const ggml_fp16_t * K, const ggml_fp16_t * V, size_t row_
     balance(tile.data(), G, D, iters, s_row.data(), s_col.data(), bal.data());
     {
         const uint32_t qmax = (1u << l.bits_v) - 1;
+        std::vector<float> q_lo(trellis_body ? G : 0), q_step(trellis_body ? G : 0);
         for (int t = 0; t < G; ++t) {
             const float * row = bal.data() + (size_t) t*D;
             float lo = row[0], hi = row[0];
@@ -304,9 +748,23 @@ inline void seal_group(const ggml_fp16_t * K, const ggml_fp16_t * V, size_t row_
             const float step = std::max((hi - lo) / (float) qmax, 1e-10f);
             put_half(rec, l.v_scale + 2*t, s_row[t] * step);
             put_half(rec, l.v_zero  + 2*t, s_row[t] * lo);
+            if (trellis_body) {
+                q_lo[t] = lo; q_step[t] = step;
+                continue;
+            }
             for (int d = 0; d < D; ++d) {
                 pack_code(rec + l.v_payload, code_bit(t, d, true, D, G, l.bits_v), l.bits_v, rtn_code(row[d], lo, step, qmax));
             }
+        }
+        if (trellis_body && l.bits_v == 3) {
+            trellis_lb_code_rows<3>(bal.data(), G, D, q_lo.data(), q_step.data(), true, D, G, rec + l.v_payload);
+            trellis_lb_refit_rows<3>(bal.data(), G, D, s_row.data(), true, D, G, rec + l.v_payload, rec, l, trellis3::refit_mode());
+        } else if (trellis_body && l.bits_v == 2) {
+            trellis_lb_code_rows<2>(bal.data(), G, D, q_lo.data(), q_step.data(), true, D, G, rec + l.v_payload);
+            trellis_lb_refit_rows<2>(bal.data(), G, D, s_row.data(), true, D, G, rec + l.v_payload, rec, l, trellis2::refit_mode());
+        } else if (trellis_body) {
+            GGML_ASSERT(frag_order(l.bits_v, D, G) && G % 16 == 0);
+            trellis_code_tile(bal.data(), G, D, q_lo.data(), q_step.data(), true, D, G, (uint32_t *) (rec + l.v_payload));
         }
         for (int d = 0; d < D; ++d) {
             put_half(rec, l.v_ch + 2*v_ch_idx(d, D, G, l.bits_v), s_col[d]);
@@ -315,19 +773,32 @@ inline void seal_group(const ggml_fp16_t * K, const ggml_fp16_t * V, size_t row_
 }
 
 // rotated-domain reconstruction of token t of a record
-inline void decode_k_row(const uint8_t * rec, const layout & l, int t, float * out) {
+// value of the code at bit offset `bit` of a trellis-coded payload
+inline float trellis_value(const uint8_t * payload, uint32_t bit, bool is_V, int D, int G) {
+    const uint32_t idx = trellis_window((const uint32_t *) payload, bit >> 5, (bit & 31) >> 2, D/16);
+    GGML_UNUSED(G);
+    return GGML_FP16_TO_FP32(trellis::cb(is_V)[idx]);
+}
+
+inline void decode_k_row(const uint8_t * rec, const layout & l, int t, float * out, bool trellis_body = false) {
     const float tok = get_half(rec, l.k_tok + 2*t);
     for (int d = 0; d < l.D; ++d) {
-        const float q  = (float) k_code(rec, l, t, d);
+        const float q  = !trellis_body    ? (float) k_code(rec, l, t, d)
+                       : l.bits_k == 3    ? GGML_FP16_TO_FP32(trellis3::cb(false)[trellis3_window(rec + l.k_payload, t, d, l.D)])
+                       : l.bits_k == 2    ? GGML_FP16_TO_FP32(trellis2::cb(false)[trellis2_window(rec + l.k_payload, t, d, l.D)])
+                                          : trellis_value(rec + l.k_payload, code_bit(t, d, false, l.D, l.G, l.bits_k), false, l.D, l.G);
         const int   di = k_ch_idx(d, l.D, l.G, l.bits_k);
         out[d] = (q * get_half(rec, l.k_scale + 2*di) + get_half(rec, l.k_zero + 2*di)) * tok;
     }
 }
-inline void decode_v_row(const uint8_t * rec, const layout & l, int t, float * out) {
+inline void decode_v_row(const uint8_t * rec, const layout & l, int t, float * out, bool trellis_body = false) {
     const float sc = get_half(rec, l.v_scale + 2*t);
     const float zp = get_half(rec, l.v_zero  + 2*t);
     for (int d = 0; d < l.D; ++d) {
-        const float q = (float) v_code(rec, l, t, d);
+        const float q = !trellis_body    ? (float) v_code(rec, l, t, d)
+                      : l.bits_v == 3    ? GGML_FP16_TO_FP32(trellis3::cb(true)[trellis3_window(rec + l.v_payload, t, d, l.D)])
+                      : l.bits_v == 2    ? GGML_FP16_TO_FP32(trellis2::cb(true)[trellis2_window(rec + l.v_payload, t, d, l.D)])
+                                         : trellis_value(rec + l.v_payload, code_bit(t, d, true, l.D, l.G, l.bits_v), true, l.D, l.G);
         out[d] = (q * sc + zp) * get_half(rec, l.v_ch + 2*v_ch_idx(d, l.D, l.G, l.bits_v));
     }
 }

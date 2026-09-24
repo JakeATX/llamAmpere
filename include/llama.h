@@ -415,12 +415,20 @@ extern "C" {
         ggml_abort_callback abort_callback;
         void *              abort_callback_data;
 
-        // KVarN attention cache (region-aware: exact fp16 sink + tail, sealed low-bit records for the body).
-        // bits_k/bits_v > 0 enable it; type_k/type_v must be F16 and flash attention is required.
+        // KVarN attention cache: F16, Q8_0 or TQ6_0 sink + tail, sealed low-bit body.
+        // bits_k/bits_v > 0 enable it; flash attention is required.
         uint32_t kvarn_bits_k; // 0 = off
         uint32_t kvarn_bits_v; // 0 = off
-        uint32_t kvarn_tail;   // exact fp16 tail positions kept unsealed (rounded to the 128-token group)
-        uint32_t kvarn_sink;   // exact fp16 sink positions (multiple of 64)
+        uint32_t kvarn_tail;   // recent positions kept unsealed (multiple of 128)
+        uint32_t kvarn_sink;   // leading positions kept unsealed (multiple of 64)
+        enum ggml_type kvarn_body_type; // F32 sentinel = KVarN scalar records, I16 sentinel = KVarN with trellis-coded payloads (built-in codebooks), COUNT = auto (trellis for the 3/3, 3/2, 2/2 pairs, scalar otherwise), TURBO4_0 = stored-domain Turbo4
+        enum ggml_type kvarn_sink_type; // COUNT inherits staging; F16 keeps a separate sink
+        enum ggml_type kvarn_staging_type; // F16 (default), Q8_0 or stored-domain TQ6_0 for both sink and tail
+        uint32_t kvarn_tail_max; // 0 = fixed tail; otherwise batch compression between tail and tail_max
+        uint32_t kvarn_edge_layers; // tiered body: KV layers within the first and last N model layers seal at kvarn_edge_bits_k/v (0 = uniform)
+        uint32_t kvarn_edge_bits_k; // edge-tier body bits (default 4/4)
+        uint32_t kvarn_edge_bits_v;
+        enum ggml_type kvarn_edge_body_type; // edge-tier codec: COUNT = auto (trellis only for a trellis pair when kvarn_body_type is trellis/auto), F32 scalar, I16 trellis
 
         // Keep the booleans together and at the end of the struct to avoid misalignment during copy-by-value.
         bool embeddings;  // if true, extract embeddings (together with logits)
@@ -857,6 +865,19 @@ extern "C" {
     LLAMA_API llama_pos llama_memory_seq_pos_max(
             llama_memory_t mem,
               llama_seq_id seq_id);
+
+    // Exclusive end of the sealed KVarN body, or -1 if this cache is not KVarN.
+    // Removing a nonempty prefix below this boundary requires clearing the cache.
+    LLAMA_API int32_t llama_kvarn_sealed_end(struct llama_context * ctx);
+
+    // Compress an adaptive KVarN tail during an idle period. Does not evaluate model layers.
+    // accepted_pos_end is the exclusive end of accepted, materialized positions.
+    // The caller must resolve speculative rollback and discard checkpoints before calling.
+    // Supports a single sequence. Returns 1 if compressed, 0 if no work, -1 on failure.
+    LLAMA_API int32_t llama_kvarn_compress_idle(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
+                       llama_pos   accepted_pos_end);
 
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);

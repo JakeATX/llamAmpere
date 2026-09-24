@@ -1191,7 +1191,7 @@ static void set_rows_cuda_turbo4(
 // and the packing differ: the low nibble goes to qs[] exactly like turbo4, the high
 // 2 bits go to qh[] (4 codes per byte).
 
-template <typename idx_t>
+template <typename idx_t, bool already_rotated = false>
 __launch_bounds__(128)
 static __global__ void k_set_rows_tq6(
         const float * __restrict__ src0,
@@ -1241,13 +1241,13 @@ static __global__ void k_set_rows_tq6(
     __syncthreads();
 
     // ---- InnerQ: calibrate on original (unscaled) values ----
-    if (d_innerq_calibrating) {
+    if (!already_rotated && d_innerq_calibrating) {
         atomicAdd(&d_innerq_sq_accum[j], x[j] * x[j]);
         if (j == 0) atomicAdd(&d_innerq_count, 1);
     }
 
     // ---- InnerQ: apply channel scale (only when active) ----
-    if (d_innerq_active) {
+    if (!already_rotated && d_innerq_active) {
         x[j] *= d_innerq_scale[j];
     }
     __syncthreads();
@@ -1277,39 +1277,41 @@ static __global__ void k_set_rows_tq6(
     x[j] *= inv_norm;
     __syncthreads();
 
-    // ---- Step 4: Forward WHT (signs1 → butterfly → signs2, normalized) ----
-    x[j] *= TURBO_WHT_SIGNS1[j];
-    __syncthreads();
-
     const int lane = j & 31;
-    float val = x[j];
+    if constexpr (!already_rotated) {
+        // ---- Step 4: Forward WHT (signs1, butterfly, signs2, normalized) ----
+        x[j] *= TURBO_WHT_SIGNS1[j];
+        __syncthreads();
+
+        float val = x[j];
 
 #pragma unroll
-    for (int h = 1; h < 32; h <<= 1) {
-        float o = __shfl_xor_sync(0xffffffff, val, h);
-        val = (lane & h) ? (o - val) : (val + o);
+        for (int h = 1; h < 32; h <<= 1) {
+            float o = __shfl_xor_sync(0xffffffff, val, h);
+            val = (lane & h) ? (o - val) : (val + o);
+        }
+
+        x[j] = val;
+        __syncthreads();
+
+        if (j % 64 < 32) {
+            float a = x[j], b = x[j + 32];
+            x[j] = a + b;
+            x[j + 32] = a - b;
+        }
+        __syncthreads();
+
+        if (j % 128 < 64) {
+            float a = x[j], b = x[j + 64];
+            x[j] = a + b;
+            x[j + 64] = a - b;
+        }
+        __syncthreads();
+
+        constexpr float inv_sqrt_128 = 0.08838834764831845f;
+        x[j] = x[j] * inv_sqrt_128 * TURBO_WHT_SIGNS2[j];
+        __syncthreads();
     }
-
-    x[j] = val;
-    __syncthreads();
-
-    if (j % 64 < 32) {
-        float a = x[j], b = x[j + 32];
-        x[j] = a + b;
-        x[j + 32] = a - b;
-    }
-    __syncthreads();
-
-    if (j % 128 < 64) {
-        float a = x[j], b = x[j + 64];
-        x[j] = a + b;
-        x[j + 64] = a - b;
-    }
-    __syncthreads();
-
-    constexpr float inv_sqrt_128 = 0.08838834764831845f;
-    x[j] = x[j] * inv_sqrt_128 * TURBO_WHT_SIGNS2[j];
-    __syncthreads();
 
     // ---- Step 5: Quantize element j to 6-bit centroid ----
     const float rv = x[j];
@@ -1563,15 +1565,24 @@ static void set_rows_cuda_tq6(
     const int64_t s12 = nb12/sizeof(idx_t);
 
     // InnerQ: check/finalize calibration before kernel launch
-    turbo_innerq_check_finalize(QK_TQ6, ne00);
+    const bool already_rotated = ggml_get_op_params_i32(dst, 1) == 1;
+    if (!already_rotated) { turbo_innerq_check_finalize(QK_TQ6, ne00); }
 
     if (n_blocks > 0) {
         const int64_t ne_total = n_blocks * ne01 * ne02 * ne03;
-        k_set_rows_tq6<idx_t><<<(int)ne_total, 128, 0, stream>>>(
-            src0_d, src1_d, (block_tq6_0 *)dst->data,
-            ne00, ne01, ne10, ne11, ne12, ne13,
-            s01, s02, s03, s10, s11, s12,
-            nb1, nb2, nb3);
+        if (already_rotated) {
+            k_set_rows_tq6<idx_t, true><<<(int)ne_total, 128, 0, stream>>>(
+                src0_d, src1_d, (block_tq6_0 *)dst->data,
+                ne00, ne01, ne10, ne11, ne12, ne13,
+                s01, s02, s03, s10, s11, s12,
+                nb1, nb2, nb3);
+        } else {
+            k_set_rows_tq6<idx_t><<<(int)ne_total, 128, 0, stream>>>(
+                src0_d, src1_d, (block_tq6_0 *)dst->data,
+                ne00, ne01, ne10, ne11, ne12, ne13,
+                s01, s02, s03, s10, s11, s12,
+                nb1, nb2, nb3);
+        }
     }
 }
 
@@ -1614,6 +1625,19 @@ static void set_rows_cuda_tq5(
 }
 
 template<typename src_t, typename idx_t>
+static __global__ void k_set_rows_f16_sink(const src_t * src, const idx_t * idx, half * sink,
+        int64_t width, int64_t count, size_t src_stride, size_t idx_stride, int sink_rows) {
+    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= width*count) { return; }
+    const int64_t row = i/width, col = i%width;
+    const int64_t dest = *(const idx_t *) ((const char *) idx + row*idx_stride);
+    if (dest >= 0 && dest < sink_rows) {
+        const src_t * in = (const src_t *) ((const char *) src + row*src_stride);
+        sink[dest*width + col] = __float2half((float) in[col]);
+    }
+}
+
+template<typename src_t, typename idx_t>
 static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const src_t * src0_d = (const src_t *)src0->data;
     const idx_t * src1_d = (const idx_t *)src1->data;
@@ -1622,6 +1646,15 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
 
     cudaStream_t stream = ctx.stream();
 
+
+    const int sink_rows = ggml_get_op_params_i32(dst, 2);
+    if (sink_rows > 0) {
+        GGML_ASSERT(ne02 == 1 && ne03 == 1);
+        const size_t offset = (size_t) ggml_get_op_params_i32(dst, 3)*nb1;
+        GGML_ASSERT(offset + (size_t) sink_rows*ne00*sizeof(half) <= ggml_nbytes(dst));
+        k_set_rows_f16_sink<src_t, idx_t><<<(ne00*ne01 + 255)/256, 256, 0, stream>>>(
+            src0_d, src1_d, (half *) ((char *) dst->data + offset), ne00, ne01, nb01, nb10, sink_rows);
+    }
 
     if (dst->type == GGML_TYPE_F32) {
         set_rows_cuda(

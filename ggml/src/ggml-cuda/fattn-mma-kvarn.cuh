@@ -1,17 +1,17 @@
 // KVarN region-aware MMA flash-attention launcher (any number of query rows: decode widths and prefill ubatches).
 //
-// Host-side case launcher for the GQA-packed MMA path over a KVarN cache: exact fp16 rows for the sink and the
+// Host-side case launcher for the GQA-packed MMA path over a KVarN cache: F16, Q8_0 or TQ6_0 rows for the sink and the
 // ring (dst->src[1]/src[2]) plus sealed 4-bit records for the body (dst->src[5], descriptor dst->src[6]). It
 // instantiates flash_attn_ext_f16 (fattn-mma-f16.cuh) with type_K = type_V = GGML_TYPE_I8, which selects the
 // is_kvarn branches: the in-kernel tile loaders decode body records straight into shared memory and copy ring
-// rows through the plain f16 loader, so everything downstream (ldmatrix, MMA, softmax, combine) is byte-identical
-// to the f16 path. Single-stage synchronous loading, no cp.async staging, no f16 conversion in launch_fattn.
+// rows through their storage loader into F16 tiles for MMA. Single-stage synchronous loading, no cp.async staging, no f16 conversion in launch_fattn.
 
 #pragma once
 
 #include "common.cuh"
 #include "fattn-common.cuh"
 #include "fattn-mma-f16.cuh"
+#include "kvarn-seal.cuh"
 
 template <int DKQ, int DV, int ncols1, int ncols2>
 void ggml_cuda_flash_attn_ext_mma_kvarn_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -26,7 +26,8 @@ void ggml_cuda_flash_attn_ext_mma_kvarn_case(ggml_backend_cuda_context & ctx, gg
     GGML_ASSERT(dst->src[5] != nullptr && dst->src[6] != nullptr);
     GGML_ASSERT(ggml_get_op_params_i32(KQV, 5) == ((4 << 8) | 4) && "KVarN CUDA path: 4-bit K and V only");
     GGML_ASSERT(DKQ == 256 && DV == 256);
-    GGML_ASSERT(dst->src[1]->type == GGML_TYPE_F16 && dst->src[2]->type == GGML_TYPE_F16);
+    GGML_ASSERT(dst->src[1]->type == GGML_TYPE_F16 || dst->src[1]->type == GGML_TYPE_Q8_0 || dst->src[1]->type == GGML_TYPE_TQ6_0);
+    GGML_ASSERT(dst->src[2]->type == GGML_TYPE_F16 || dst->src[2]->type == GGML_TYPE_Q8_0 || dst->src[2]->type == GGML_TYPE_TQ6_0);
 
     const int  nthreads       = ggml_cuda_fattn_mma_get_nthreads      (DKQ, DV, ncols, cc);
     const int  nbatch_fa      = ggml_cuda_fattn_mma_get_nbatch_fa     (DKQ, DV, ncols, cc);
@@ -87,7 +88,7 @@ void ggml_cuda_flash_attn_ext_mma_kvarn_case(ggml_backend_cuda_context & ctx, gg
 #endif // !defined(GGML_USE_MUSA)
     }
 
-    // K/V are already f16 (ring rows); the body records travel through dst->src[5]/src[6]. stream_k = true.
+    // K/V stay in their ring storage format; only shared tiles are decoded. stream_k = true.
     launch_fattn<DV, ncols1, ncols2>
         (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa,
          /*need_f16_K=*/false, /*need_f16_V=*/false, /*stream_k=*/true, /*use_sparse=*/false, warp_size_host);
@@ -112,6 +113,7 @@ extern DECL_FATTN_MMA_KVARN_CASE(256, 256, 8, 1);
 // for n_q <= 8 at GQA <= 8; GGML_KVARN_NO_DIRECT=1 falls back to the shared-memory tile kernel below.
 bool ggml_cuda_flash_attn_ext_kvarn_direct_supported(const ggml_tensor * dst);
 void ggml_cuda_flash_attn_ext_kvarn_direct(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+bool ggml_cuda_flash_attn_ext_kvarn_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 template <int DKQ, int DV>
 static void ggml_cuda_flash_attn_ext_mma_kvarn_switch_ncols2(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -126,10 +128,16 @@ static void ggml_cuda_flash_attn_ext_mma_kvarn_switch_ncols2(ggml_backend_cuda_c
 
     const int n_kv_pad = ggml_get_op_params_i32(KQV, 6);
     const bool use_gqa_opt = mask && max_bias == 0.0f && n_kv_pad % FATTN_KQ_STRIDE == 0 &&
-        Q->nb[1] % 16 == 0 && K->nb[1] % 16 == 0 && V->nb[1] % 16 == 0 && mask->nb[1] % 16 == 0;
+        Q->nb[1] % 16 == 0 && (K->type != GGML_TYPE_F16 || K->nb[1] % 16 == 0) && (V->type != GGML_TYPE_F16 || V->nb[1] % 16 == 0) && mask->nb[1] % 16 == 0;
     GGML_ASSERT(use_gqa_opt && "KVarN CUDA path needs a mask, no ALiBi and n_kv_pad % 256 == 0");
 
     GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
+    if (ggml_get_op_params_i32(dst, 7) == GGML_TYPE_I16) {
+        ggml_cuda_kvarn_trellis_cb_init();
+    }
+    if (ggml_cuda_flash_attn_ext_kvarn_prefill(ctx, dst)) {
+        return;
+    }
     if (ggml_cuda_flash_attn_ext_kvarn_direct_supported(dst)) {
         ggml_cuda_flash_attn_ext_kvarn_direct(ctx, dst);
         return;
@@ -170,11 +178,22 @@ static inline bool ggml_cuda_flash_attn_ext_kvarn_supported(const int cc, const 
     if (!turing_mma_available(cc) || mask == nullptr || Q->ne[3] != 1) {
         return false;
     }
-    if (Q->ne[0] != 256 || V->ne[0] != 256 || K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16) {
+    if (Q->ne[0] != 256 || V->ne[0] != 256 || (K->type != GGML_TYPE_F16 && K->type != GGML_TYPE_Q8_0 && K->type != GGML_TYPE_TQ6_0) || (V->type != GGML_TYPE_F16 && V->type != GGML_TYPE_Q8_0 && V->type != GGML_TYPE_TQ6_0)) {
         return false;
     }
-    if (ggml_get_op_params_i32(dst, 5) != ((4 << 8) | 4)) {
-        return false;
+    const int bits = ggml_get_op_params_i32(dst,5);
+    if (bits != ((4 << 8) | 4)) {
+        if (bits != ((4 << 8) | 3) && bits != ((3 << 8) | 3) && bits != ((4 << 8) | 2) && bits != ((2 << 8) | 4) && bits != ((3 << 8) | 2) && bits != ((2 << 8) | 2)) {
+            return false;
+        }
+        const int gqa = Q->ne[2]/K->ne[2];
+        float softcap;
+        memcpy(&softcap, (const float *) dst->op_params + 2, sizeof(float));
+        const int body_type = ggml_get_op_params_i32(dst,7);
+        const bool trellis3 = body_type == GGML_TYPE_I16 && (bits == ((3 << 8) | 3) || bits == ((3 << 8) | 2) || bits == ((2 << 8) | 2)); // 3-bit and 2-bit trellis stream payloads
+        if (gqa <= 4 || gqa > 8 || dst->src[4] != nullptr || softcap != 0 || !cp_async_available(cc) || (body_type != 0 && !trellis3)) {
+            return false;
+        }
     }
     float max_bias = 0.0f;
     memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
@@ -183,6 +202,15 @@ static inline bool ggml_cuda_flash_attn_ext_kvarn_supported(const int cc, const 
     }
     if (Q->ne[2] % K->ne[2] != 0) {
         return false;
+    }
+    if (Q->nb[1] % 16 != 0 || mask->nb[1] % 16 != 0) {
+        return false;
+    }
+    for (const ggml_tensor * kv : {K, V}) {
+        const size_t alignment = kv->type == GGML_TYPE_F16 ? 16 : sizeof(half2);
+        if (kv->nb[1] % alignment != 0 || kv->nb[2] % alignment != 0 || kv->view_offs % alignment != 0) {
+            return false;
+        }
     }
     return true; // any n_q: the switch above tiles query rows in ncols1 blocks
 }

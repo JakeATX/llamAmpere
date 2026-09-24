@@ -405,6 +405,7 @@ public:
 
     // KVarN: I32 region descriptor (sink/ring/body bounds for this ubatch), nullptr unless the cache is KVarN
     ggml_tensor * self_kvarn_desc = nullptr;
+    ggml_tensor * self_kvarn_desc_edge = nullptr; // tiered body: descriptor of the edge tier (nullptr unless edge layers exist)
 
     // note: these have to be copies because in order to be able to reuse a graph, its inputs
     //       need to carry these parameters with them. otherwise, they can point to freed

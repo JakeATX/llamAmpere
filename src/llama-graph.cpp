@@ -578,7 +578,10 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     }
 
     if (self_kvarn_desc && self_kvarn_desc->buffer) {
-        mctx->set_input_kvarn_desc(self_kvarn_desc, ubatch);
+        mctx->set_input_kvarn_desc(self_kvarn_desc, ubatch, 0);
+    }
+    if (self_kvarn_desc_edge && self_kvarn_desc_edge->buffer) {
+        mctx->set_input_kvarn_desc(self_kvarn_desc_edge, ubatch, 1);
     }
 }
 
@@ -1199,7 +1202,10 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
     }
 
     if (inp_attn->self_kvarn_desc && inp_attn->self_kvarn_desc->buffer) {
-        mctx->get_attn()->set_input_kvarn_desc(inp_attn->self_kvarn_desc, ubatch);
+        mctx->get_attn()->set_input_kvarn_desc(inp_attn->self_kvarn_desc, ubatch, 0);
+    }
+    if (inp_attn->self_kvarn_desc_edge && inp_attn->self_kvarn_desc_edge->buffer) {
+        mctx->get_attn()->set_input_kvarn_desc(inp_attn->self_kvarn_desc_edge, ubatch, 1);
     }
 
     inp_rs->fill_s_copy(mctx->get_recr());
@@ -2901,19 +2907,21 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         ggml_prec_set_acc(cur, GGML_PREC_F32);
 
         // KVarN: attach the sealed record pool + region descriptor; Q/K/V are Hadamard-rotated, so un-rotate the output
-        if (kvarn_pending.body) {
+        const bool is_kvarn_attn = kvarn_pending.body != nullptr;
+        if (is_kvarn_attn) {
             GGML_ASSERT(kq_mask && kq_mask->ne[0] > 0 && kq_mask->ne[0] % 64 == 0);
             ggml_flash_attn_ext_set_kvarn(cur, kvarn_pending.body, kvarn_pending.desc,
                     kvarn_pending.bits_k, kvarn_pending.bits_v, (int32_t) kq_mask->ne[0]);
+            const int group = kvarn_pending.body->op_params[7] == GGML_TYPE_TURBO4_0 ? 128 : 256;
             kvarn_pending = {};
             if (!ggml_is_contiguous(cur)) { cur = ggml_cont(ctx0, cur); }
-            cur = ggml_turbo_wht(ctx0, cur, 1, 256, nullptr);
+            cur = ggml_turbo_wht(ctx0, cur, 1, group, nullptr);
         }
 
         // TurboQuant: inverse WHT on FA output when V values are WHT-rotated.
         // For MLA, V is a view of K with different ne[0] (e.g. V=512, K=576).
         // Group size must come from K (which determines the WHT rotation), not V.
-        if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0 || v->type == GGML_TYPE_TQ6_0 || v->type == GGML_TYPE_TQ5_0) {
+        if (!is_kvarn_attn && (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0 || v->type == GGML_TYPE_TQ6_0 || v->type == GGML_TYPE_TQ5_0)) {
             const bool k_is_turbo = (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TQ6_0 || k->type == GGML_TYPE_TQ5_0);
             const ggml_tensor * group_src = k_is_turbo ? k : v;
             const int turbo_group = (group_src->ne[0] % 128 == 0) ? 128 : 64;
@@ -3127,6 +3135,9 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
 
     if (mctx_cur->is_kvarn()) {
         inp->self_kvarn_desc = mctx_cur->build_input_kvarn_desc(ctx0);
+        if (mctx_cur->has_kvarn_edge_tier()) {
+            inp->self_kvarn_desc_edge = mctx_cur->build_input_kvarn_desc(ctx0);
+        }
     }
 
     return inp;
@@ -3176,9 +3187,10 @@ ggml_tensor * llm_graph_context::build_attn(
         if (!ggml_is_contiguous(q_cur)) { q_cur = ggml_cont(ctx0, q_cur); }
         if (!ggml_is_contiguous(k_cur)) { k_cur = ggml_cont(ctx0, k_cur); }
         if (!ggml_is_contiguous(v_cur)) { v_cur = ggml_cont(ctx0, v_cur); }
-        q_cur = ggml_turbo_wht(ctx0, q_cur, 0, 256, nullptr);
-        k_cur = ggml_turbo_wht(ctx0, k_cur, 0, 256, nullptr);
-        v_cur = ggml_turbo_wht(ctx0, v_cur, 0, 256, nullptr);
+        const int group = mctx_cur->get_kvarn().body_type == GGML_TYPE_TURBO4_0 ? 128 : 256;
+        q_cur = ggml_turbo_wht(ctx0, q_cur, 0, group, nullptr);
+        k_cur = ggml_turbo_wht(ctx0, k_cur, 0, group, nullptr);
+        v_cur = ggml_turbo_wht(ctx0, v_cur, 0, group, nullptr);
         cb(q_cur, "q_kvarn_rot", il);
         cb(k_cur, "k_kvarn_rot", il);
         cb(v_cur, "v_kvarn_rot", il);
@@ -3203,17 +3215,16 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_build_forward_expand(gf, v_store);
 
         if (is_kvarn) {
-            // seal the groups this ubatch pushed out of the tail; depends on the stores above, and the
-            // attention node below depends on it through src[5]
-            ggml_tensor * seal = mctx_cur->build_kvarn_seal(ctx0, k_store, v_store, inp->self_kvarn_desc, il);
-            cb(seal, "kvarn_seal", il);
-            ggml_build_forward_expand(gf, seal);
+            // Historical groups are sealed before this graph runs; stores above remain graph dependencies.
+            ggml_tensor * body = mctx_cur->get_kvarn_body(il);
 
-            const auto & kc = mctx_cur->get_kvarn();
-            kvarn_pending.body   = seal;
-            kvarn_pending.desc   = inp->self_kvarn_desc;
-            kvarn_pending.bits_k = (int32_t) kc.bits_k;
-            kvarn_pending.bits_v = (int32_t) kc.bits_v;
+            uint32_t bits_k = 0, bits_v = 0;
+            const int tier = mctx_cur->get_kvarn_layer_tier(il, bits_k, bits_v);
+            GGML_ASSERT(tier == 0 || inp->self_kvarn_desc_edge != nullptr);
+            kvarn_pending.body   = body;
+            kvarn_pending.desc   = tier == 1 ? inp->self_kvarn_desc_edge : inp->self_kvarn_desc;
+            kvarn_pending.bits_k = (int32_t) bits_k;
+            kvarn_pending.bits_v = (int32_t) bits_v;
         }
     }
 
@@ -3226,7 +3237,7 @@ ggml_tensor * llm_graph_context::build_attn(
     // TurboQuant pre-rotate-queries: O(d log d) WHT rotation via custom op
     // Q shape: (n_embd_head, n_head, n_tokens)
     // For zero-padded models (head_dim not 128-aligned), pad Q to match padded K dim first.
-    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TQ6_0 || k->type == GGML_TYPE_TQ5_0) {
+    if (!is_kvarn && (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TQ6_0 || k->type == GGML_TYPE_TQ5_0)) {
         // Pad Q per-head to next multiple of 128 if needed
         if (q->ne[0] % 128 != 0) {
             const int64_t pad = ((q->ne[0] + 127) / 128) * 128 - q->ne[0];
