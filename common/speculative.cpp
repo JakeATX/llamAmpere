@@ -1960,6 +1960,27 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         return true;
     }
 
+    // [#72] LLAMA_SPEC_DRAFT_TEMP_MULT=<x>: the p/q drafter samples at x times the request's temperature (default 1).
+    // Exactness does not depend on it: the verifier's rejection test uses the q the draft token was actually drawn
+    // from (the sampler's final candidates, temperature included), so any q > 0 keeps the output distribution. Only
+    // the acceptance rate moves: a draft head flatter than the target gains from x < 1, a sharper one from x > 1.
+    // With p_min > 0 the confidence cutoff sees the rescaled top probability too (production runs p_min 0).
+    static float pq_temp_mult() {
+        static const float v = [] {
+            const char * e = getenv("LLAMA_SPEC_DRAFT_TEMP_MULT");
+            float x = e ? (float) atof(e) : 1.0f;
+            if (!(x > 0.0f)) {
+                x = 1.0f;
+            }
+            x = std::min(std::max(x, 0.05f), 4.0f);
+            if (e) {
+                LOG_INF("spec: LLAMA_SPEC_DRAFT_TEMP_MULT = %.3f (p/q draft temperature = %.3f x request temperature)\n", x, x);
+            }
+            return x;
+        }();
+        return v;
+    }
+
     static bool pq_params_ok(const common_params_sampling & tgt) {
         return tgt.temp > 0.0f && tgt.mirostat == 0;
     }
@@ -1979,7 +2000,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         common_params_sampling sp;
         sp.no_perf           = false;
-        sp.temp              = tgt.temp;
+        sp.temp              = tgt.temp * pq_temp_mult(); // [#72]
         sp.dynatemp_range    = tgt.dynatemp_range;
         sp.dynatemp_exponent = tgt.dynatemp_exponent;
         sp.top_k             = tgt.top_k;
