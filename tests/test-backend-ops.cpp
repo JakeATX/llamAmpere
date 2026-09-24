@@ -5057,7 +5057,7 @@ struct test_gated_delta_net : public test_case {
     const bool    permuted;
     const bool    kda;
     const int64_t K; // snapshot slot count: 1 = final-only, >1 = last K states
-    const int32_t emit_mode; // 0 = full state snapshots, 1 = replay ingredients (k,v,g,beta)
+    const int32_t emit_mode; // 0 = full state snapshots, 1 = replay ingredients (k,v,g,beta), 2 = compact ingredients
 
     std::string vars() override {
         return VARS_TO_STR10(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K, emit_mode);
@@ -12308,6 +12308,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 5, 1, 3, false, false, 4));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 3, 1, 3, true, false, 4));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 128, 1, 3, false, false, 1));
+    // [#63] replay ingredients, emit_mode 1 and the compact emit_mode 2: partial window, n_tokens > K
+    // (before-the-window block), GQA, KDA, two sequences
+    for (int32_t em : { 1, 2 }) {
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 3, 1, 1, false, false, 5, em));
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 6, 2, 1, false, false, 4, em));
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 5, 1, 3, false, false, 4, em));
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 3, 64, 6, 1, 1, false, true, 4, em));
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 3, 16, 1, 2, 1, false, true, 1, em));
+    }
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, true, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, false, true));

@@ -790,11 +790,19 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const uint32_t n         = (uint32_t) n_seq_tokens;
     const bool     need_base = r > 0 || stale;          // s is not the logical state
 
-    const size_t ingr_elemsize   = ggml_element_size(ingr_all);
-    const size_t ingr_row        = (size_t) hparams.n_embd_s_ingredient(); // elements per slot
-    const size_t ring_row        = ingr_row * K;                            // elements per cell
-    const size_t state_row_bytes = (size_t) hparams.n_embd_s() * ggml_element_size(ssm_states_all);
-    GGML_ASSERT((int64_t) ingr_row == 4 * S_v * H_v); // the op's per-slot ingredient block
+    const bool kda = (g->ne[0] == S_v);
+
+    // [#63] the ring's slot layout: emit_mode 1 (k, v, g, beta each S_v wide) or 2 (compact: g and
+    // beta once per head), as llama_gdn_ingr_emit_mode() sized the ring
+    const size_t  ingr_elemsize   = ggml_element_size(ingr_all);
+    const size_t  ingr_row        = (size_t) hparams.n_embd_s_ingredient(); // elements per slot
+    const size_t  ring_row        = ingr_row * K;                            // elements per cell
+    const size_t  state_row_bytes = (size_t) hparams.n_embd_s() * ggml_element_size(ssm_states_all);
+    const int32_t ingr_mode       = (int64_t) ingr_row == 4 * S_v * H_v ? 1 : llama_gdn_ingr_emit_mode();
+    const int64_t ingr_w          = ggml_gated_delta_net_ingr_width(S_v, g->ne[0], ingr_mode); // per head
+    GGML_ASSERT((int64_t) ingr_row == ingr_w * H_v); // the op's per-slot ingredient block
+    const int64_t ingr_off_g      = 2 * S_v;
+    const int64_t ingr_off_b      = ingr_mode == 1 ? 3 * S_v : 2 * S_v + g->ne[0];
 
     ggml_tensor * s_ckpt = build_rs(inp, ckpt_all, hparams.n_embd_s(), n_seqs);
     s_ckpt = ggml_reshape_4d(ctx0, s_ckpt, S_v, S_v, H_v, n_seqs);
@@ -803,23 +811,21 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     // move, relocated) by the same s_copy mechanism as the state itself: [ring_row, n_seqs]
     ggml_tensor * ring = build_rs(inp, ingr_all, (int32_t) ring_row, n_seqs);
 
-    const bool kda = (g->ne[0] == S_v);
-
     // replay ring slots [first, first + count) forward from state4d in ONE batched K=1 call --
     // the slots are chronological, so the accepted prefix is a plain forward-order view -- and
     // return the resulting state. ggml_gated_delta_net needs g/beta (and, through q_dummy, q)
     // fully contiguous, so the strided views into the packed ring are materialized.
     auto replay_from = [&](ggml_tensor * state4d, uint32_t first, uint32_t count) -> ggml_tensor * {
         GGML_ASSERT(count > 0);
-        auto comp = [&](int64_t ne0, uint32_t c) {
+        auto comp = [&](int64_t ne0, int64_t off) {
             return ggml_cont(ctx0, ggml_view_4d(ctx0, ring, ne0, H_v, count, n_seqs,
-                4 * S_v * ingr_elemsize, ingr_row * ingr_elemsize, ring->nb[1],
-                ((size_t) first * ingr_row + (size_t) c * S_v) * ingr_elemsize));
+                ingr_w * ingr_elemsize, ingr_row * ingr_elemsize, ring->nb[1],
+                ((size_t) first * ingr_row + (size_t) off) * ingr_elemsize));
         };
         ggml_tensor * k_b = comp(S_v, 0);
-        ggml_tensor * v_b = comp(S_v, 1);
-        ggml_tensor * g_b = comp(kda ? S_v : 1, 2);
-        ggml_tensor * b_b = comp(1, 3);
+        ggml_tensor * v_b = comp(S_v, S_v);
+        ggml_tensor * g_b = comp(kda ? S_v : 1, ingr_off_g);
+        ggml_tensor * b_b = comp(1, ingr_off_b);
         ggml_tensor * q_dummy = ggml_scale(ctx0, k_b, 0.0f); // q only shapes the (discarded) attn output
         ggml_tensor * out = ggml_gated_delta_net(ctx0, q_dummy, k_b, v_b, g_b, b_b, state4d, /*K=*/1, /*emit_mode=*/0);
         return extract_state_k1(out, (int64_t) count);
@@ -862,7 +868,7 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
 
     // main call: emit_mode=1 records ingredients (+ the trailing final-state block, + the
     // before-the-window block when n > K) instead of K full snapshots.
-    ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, base_state, K, /*emit_mode=*/1);
+    ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, base_state, K, ingr_mode);
     if (n_seq_tokens > 1) {
         res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
     } else {
@@ -879,7 +885,8 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
 
     const int64_t attn_score_elems   = S_v * H_v * n_seq_tokens * n_seqs;
     const int64_t ingr_size_per_snap = (int64_t) ingr_row * n_seqs;
-    const int64_t ingr_elems_total   = (int64_t) K * ingr_size_per_snap;
+    // the slots plus emit_mode 2's padding: where the trailing blocks start
+    const int64_t ingr_elems_total   = ggml_gated_delta_net_ingr_region(S_v, g->ne[0], H_v, n_seqs, K, ingr_mode);
     const size_t  ring_row_bytes     = ingr_all->nb[1];
 
     // ring, carried slots: gathered [keep_first, keep_first + keep_count) -> head cells [0, keep_count)

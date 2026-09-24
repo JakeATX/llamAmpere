@@ -3240,7 +3240,7 @@ static int ggml_cuda_try_gdn_cache_fusion(
         (gdn->flags & GGML_TENSOR_FLAG_OUTPUT)) {
         return 0;
     }
-    // emit_mode==1 (ingredients) uses a different output layout (4*S_v-wide rows plus a
+    // emit_mode 1/2 (ingredients) use a different output layout (ingredient slots plus a
     // trailing final-state block) that this matcher's shape checks below are not written for;
     // today they happen to reject it anyway (4*S_v*H != S_v*S_v*H for any real head width), but
     // make that an explicit invariant rather than relying on a shape coincidence.
@@ -6514,8 +6514,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_RWKV_WKV7:
             return true;
         case GGML_OP_GATED_DELTA_NET:
-            // emit_mode==0 (full snapshots) and emit_mode==1 (replay ingredients) both
-            // implemented; MUSA remains unsupported for either, per the TODO below.
+            // emit_mode==0 (full snapshots) and emit_mode 1/2 (replay ingredients, compact in 2)
+            // implemented; MUSA remains unsupported for any, per the TODO below.
             //TODO: enable once MUSA compiler is solved https://github.com/ggml-org/llama.cpp/pull/19504#issuecomment-4018634327
 #ifdef GGML_USE_MUSA
             return false;

@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
+#include <cstring>
 
 void llama_hparams::set_swa_pattern(uint32_t n_pattern, bool dense_first) {
     if (dense_first) {
@@ -257,23 +259,37 @@ uint32_t llama_hparams::n_embd_s() const {
     return ssm_d_state * ssm_d_inner;
 }
 
+int32_t llama_gdn_ingr_emit_mode() {
+    static const int32_t mode = [] {
+        const char * env = getenv("LLAMA_GDN_INGR_COMPACT");
+        return env != nullptr && strcmp(env, "0") != 0 ? 2 : 1;
+    }();
+    return mode;
+}
+
 uint32_t llama_hparams::n_embd_s_ingredient() const {
-    // 4 per-token ingredient rows (k, v, g, beta) instead of a full [S_v, S_v, H_v] state --
-    // see ggml_gated_delta_net's emit_mode==1 output contract (ggml.h). Mirrors n_embd_s()'s
+    // per-token ingredients (k, v, g, beta) instead of a full [S_v, S_v, H_v] state -- see
+    // ggml_gated_delta_net's emit_mode 1/2 output contract (ggml.h). Mirrors n_embd_s()'s
     // branches, but returns 0 for wkv (RWKV's recurrence is not a delta-net rank-1 update, so
     // ingredient-replay doesn't apply).
     if (wkv_head_size != 0) {
         return 0;
     }
 
+    const int32_t mode = llama_gdn_ingr_emit_mode();
+
     if (n_embd_head_kda != 0) {
-        // Kimi KDA layers: 4 * head_dim * n_head (see n_embd_s()'s KDA branch above).
-        return 4 * n_embd_head_kda * n_head();
+        // Kimi KDA layers: per-channel gate, head_dim wide (see n_embd_s()'s KDA branch above).
+        return (uint32_t) ggml_gated_delta_net_ingr_width(n_embd_head_kda, n_embd_head_kda, mode) * n_head();
     }
 
     // qwen35/qwen3next-style GDN (llm_build_delta_net_base): head_v_dim * num_v_heads ==
     // ssm_d_inner by construction (see build_layer_attn_linear), and S_k == S_v is already
-    // required by ggml_gated_delta_net, so 4 * S_v * H_v simplifies to 4 * ssm_d_inner.
+    // required by ggml_gated_delta_net, so 4 * S_v * H_v simplifies to 4 * ssm_d_inner. The
+    // gate is one scalar per head, S_v = ssm_d_state.
+    if (mode == 2 && ssm_d_state != 0 && ssm_d_inner % ssm_d_state == 0) {
+        return (uint32_t) ggml_gated_delta_net_ingr_width(ssm_d_state, 1, mode) * (ssm_d_inner / ssm_d_state);
+    }
     return 4 * ssm_d_inner;
 }
 
