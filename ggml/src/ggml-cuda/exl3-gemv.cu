@@ -6,6 +6,11 @@
 // no QTIP code was used.
 #include "exl3.cuh"
 
+#include "ggml-ledger.h"
+
+#include <atomic>
+#include <cstring>
+
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 #include <cooperative_groups.h>
 namespace cg = cooperative_groups;
@@ -44,9 +49,19 @@ namespace cg = cooperative_groups;
 #define EXL3_GEMV_MMA_MIN_T 2
 #endif
 
-// x is staged in shared memory as fp16 (scaled by 1/16 so that fp16 partial sums cannot overflow: |w| <= 3.5,
-// |x/16| <= 4096, at most 64 products per fp16 partial)
+// x is staged in shared memory as fp16, scaled by 1/16. That scale does not by itself keep the fp16 partial sums
+// finite. The largest mul1 codebook value is |w| = 3.453125 (exhaustive over the 65,536 codes), and the partials are:
+//   - mma path (T >= EXL3_GEMV_MMA_MIN_T): D is fp16 across U = 4 k-tiles before the fp32 fold, 64 products,
+//     so it is guaranteed finite for |x/16| <= 65504 / (64 * 3.453125) = 296.4 (|x| <= 4742 after suh and H128);
+//   - HFMA2 path (T = 1): 4 products per fp16 partial, finite for |x/16| <= 4742;
+//   - the fp16 staging itself holds |x/16| <= 65504.
+// Above those bounds a partial can still be finite (signs cancel, most products are far below the maximum), so the
+// bounds are sufficient, not necessary. GGML_CUDA_EXL3_ENVELOPE=1 measures the real staged maximum, how many staged
+// values exceed the path's bound and how many outputs are inf/nan (see exl3_envelope_* below).
 #define EXL3_GEMV_X_SCALE    0.0625f
+#define EXL3_CB_ABS_MAX      3.453125f
+#define EXL3_GEMV_SAFE_X_MMA (65504.0f / (64.0f * EXL3_CB_ABS_MAX))
+#define EXL3_GEMV_SAFE_X_T1  (65504.0f / ( 4.0f * EXL3_CB_ABS_MAX))
 template <int T> struct exl3_gemv_cfg {
     static constexpr bool MMA        = T >= EXL3_GEMV_MMA_MIN_T;
     static constexpr int  XROWS      = MMA ? (T <= 8 ? 8 : 16) : T;  // staged x rows (mma: rows T..XROWS-1 stay zero)
@@ -433,6 +448,128 @@ k_exl3_gemv(const uint32_t * __restrict__ trellis, half2 * __restrict__ x, float
 #endif
 }
 
+// [#75] fp16 envelope check, GGML_CUDA_EXL3_ENVELOPE=1 (off by default; the GEMV kernel itself is unchanged). After
+// each EXL3 GEMV two small kernels read the staged fp16 x and the fp32 output: the largest staged |x/16| per path, the
+// staged values above the path's guaranteed-safe bound, and the inf/nan counts. The kernels are captured into CUDA
+// graphs like any other node, so replays keep counting. The totals are read back and printed at process exit (and
+// added to the fallback ledger under "cuda.exl3" when GGML_LEDGER=1).
+struct exl3_envelope_stats {
+    unsigned int       max_x[2];        // float bits of max |x/16|, [0] = T = 1, [1] = mma path
+    unsigned long long over[2];         // staged values above EXL3_GEMV_SAFE_X_T1 / EXL3_GEMV_SAFE_X_MMA
+    unsigned long long nonfinite_x;     // inf/nan in the staged x
+    unsigned long long nonfinite_y[2];  // inf/nan in the output
+    unsigned long long calls[2];        // GEMVs checked
+    unsigned long long n_x[2];          // staged values checked
+};
+
+// one copy per device (module global, zero at load): no allocation or memset that could land inside a graph capture
+static __device__ exl3_envelope_stats g_exl3_envelope_dev;
+
+static __global__ void k_exl3_envelope_x(const half * __restrict__ xh, const int64_t n, const int mma) {
+    exl3_envelope_stats * st = &g_exl3_envelope_dev;
+    const float bound = mma ? EXL3_GEMV_SAFE_X_MMA : EXL3_GEMV_SAFE_X_T1;
+    float m = 0.0f;
+    unsigned long long over = 0, nonf = 0;
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x) {
+        const float v = fabsf(__half2float(xh[i]));
+        if (!isfinite(v)) {
+            nonf++;
+            continue;
+        }
+        m = fmaxf(m, v);
+        over += v > bound;
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        m     = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+        over += __shfl_xor_sync(0xffffffffu, over, o);
+        nonf += __shfl_xor_sync(0xffffffffu, nonf, o);
+    }
+    if ((threadIdx.x & 31) == 0) {
+        atomicMax(&st->max_x[mma], __float_as_uint(m));   // non-negative floats order like their bits
+        if (over) atomicAdd(&st->over[mma], over);
+        if (nonf) atomicAdd(&st->nonfinite_x, nonf);
+    }
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        atomicAdd(&st->n_x[mma], (unsigned long long) n);
+    }
+}
+
+static __global__ void k_exl3_envelope_y(const float * __restrict__ y, const int64_t n, const int mma) {
+    exl3_envelope_stats * st = &g_exl3_envelope_dev;
+    unsigned long long nonf = 0;
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x) {
+        nonf += !isfinite(y[i]);
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        nonf += __shfl_xor_sync(0xffffffffu, nonf, o);
+    }
+    if ((threadIdx.x & 31) == 0 && nonf) {
+        atomicAdd(&st->nonfinite_y[mma], nonf);
+    }
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        atomicAdd(&st->calls[mma], 1ull);
+    }
+}
+
+static bool exl3_envelope_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_EXL3_ENVELOPE");
+        return env != nullptr && env[0] != '\0' && env[0] != '0';
+    }();
+    return enabled;
+}
+
+static std::atomic<bool> g_exl3_envelope_used[GGML_CUDA_MAX_DEVICES];
+
+static void exl3_envelope_report() {
+    for (int id = 0; id < GGML_CUDA_MAX_DEVICES; ++id) {
+        if (!g_exl3_envelope_used[id].load()) {
+            continue;
+        }
+        exl3_envelope_stats h = {};
+        if (cudaSetDevice(id) != cudaSuccess ||
+            cudaMemcpyFromSymbol(&h, g_exl3_envelope_dev, sizeof(h)) != cudaSuccess) {
+            (void) cudaGetLastError();
+            fprintf(stderr, "exl3_envelope: device %d: stats unreadable at exit\n", id);
+            continue;
+        }
+        const char * path[2] = {"T=1", "mma"};
+        const float  bound[2] = {EXL3_GEMV_SAFE_X_T1, EXL3_GEMV_SAFE_X_MMA};
+        for (int p = 0; p < 2; ++p) {
+            if (h.calls[p] == 0) {
+                continue;
+            }
+            float mx;
+            memcpy(&mx, &h.max_x[p], sizeof(mx));
+            fprintf(stderr, "exl3_envelope: device %d %-3s: %llu GEMVs, max |x/16| %.3f (safe bound %.1f), %llu of %llu staged values "
+                            "above the bound, %llu non-finite outputs\n",
+                    id, path[p], h.calls[p], mx, bound[p], h.over[p], h.n_x[p], h.nonfinite_y[p]);
+            ggml_ledger_addf("cuda.exl3", (int64_t) h.calls[p],       "envelope path=%s gemv_calls", path[p]);
+            ggml_ledger_addf("cuda.exl3", (int64_t) h.over[p],        "envelope path=%s x_above_safe_bound", path[p]);
+            ggml_ledger_addf("cuda.exl3", (int64_t) h.nonfinite_y[p], "envelope path=%s y_nonfinite", path[p]);
+            ggml_ledger_addf("cuda.exl3", (int64_t) (mx * 1000.0f),   "envelope path=%s max_abs_x16_milli", path[p]);
+        }
+        fprintf(stderr, "exl3_envelope: device %d: %llu non-finite staged x values\n", id, h.nonfinite_x);
+        ggml_ledger_add("cuda.exl3", "envelope x_nonfinite", (int64_t) h.nonfinite_x);
+    }
+}
+
+static void exl3_envelope_check(const int id, const half * xh, const float * y, const int64_t T, const int K, const int N, cudaStream_t stream) {
+    static std::atomic<bool> registered{false};
+    bool expected = false;
+    if (registered.compare_exchange_strong(expected, true)) {
+        atexit(exl3_envelope_report);   // registered after the CUDA runtime's own handlers, so it runs before them
+    }
+    g_exl3_envelope_used[id].store(true);
+    const int mma = T >= EXL3_GEMV_MMA_MIN_T ? 1 : 0;
+    const int64_t nx = T * K;
+    const int64_t ny = T * N;
+    k_exl3_envelope_x<<<(int) std::min<int64_t>((nx + 255) / 256, 256), 256, 0, stream>>>(xh, nx, mma);
+    k_exl3_envelope_y<<<(int) std::min<int64_t>((ny + 255) / 256, 256), 256, 0, stream>>>(y, ny, mma);
+}
+
 static int exl3_gemv_bps_cap() {   // EXL3_GEMV_BPS: cap the cooperative grid at this many blocks per SM (0 = none)
     static const int cap = [] {
         const char * env = getenv("EXL3_GEMV_BPS");
@@ -588,10 +725,13 @@ void ggml_cuda_exl3_gemv(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
     a.xf = (const float *) src1->data; a.suh = suh; a.svh = svh; a.yf = y; a.post = post;
     if (fused) {
         exl3_gemv_launch_t<true>(a, bits, (int) T, stream);
-        return;
+    } else {
+        exl3_gemv_launch_t<false>(a, bits, (int) T, stream);
+        if (post) {
+            ggml_cuda_exl3_glue_out(out, svh, y, N, T, ksplit, 1.0f, stream);
+        }
     }
-    exl3_gemv_launch_t<false>(a, bits, (int) T, stream);
-    if (post) {
-        ggml_cuda_exl3_glue_out(out, svh, y, N, T, ksplit, 1.0f, stream);
+    if (exl3_envelope_enabled()) {
+        exl3_envelope_check(id, xh.get(), y, T, K, N, stream);
     }
 }
