@@ -2861,9 +2861,11 @@ struct test_set_rows_tq6 : public test_case {
     const int64_t ne0; // head dim (must be multiple of 128)
     const int64_t ne1; // rows in dst
     const int r;       // rows to write
+    const bool already_rotated;
+    const bool f16_sink;
 
     std::string vars() override {
-        return VARS_TO_STR4(type_idx, ne0, ne1, r);
+        return VARS_TO_STR6(type_idx, ne0, ne1, r, already_rotated, f16_sink);
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -2872,11 +2874,16 @@ struct test_set_rows_tq6 : public test_case {
     }
 
     test_set_rows_tq6(ggml_type type_idx = GGML_TYPE_I32,
-            int64_t ne0 = 128, int64_t ne1 = 8, int r = 4)
-        : type_idx(type_idx), ne0(ne0), ne1(ne1), r(r) {}
+            int64_t ne0 = 128, int64_t ne1 = 8, int r = 4, bool already_rotated = false, bool f16_sink = false)
+        : type_idx(type_idx), ne0(ne0), ne1(ne1), r(r), already_rotated(already_rotated), f16_sink(f16_sink) {}
+
+    bool run_whole_graph() override { return f16_sink; }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * dst = ggml_new_tensor_2d(ctx, GGML_TYPE_TQ6_0, ne0, ne1);
+        const int sink_rows = 3;
+        const size_t packed_row = ggml_row_size(GGML_TYPE_TQ6_0, ne0);
+        const int64_t rows = ne1 + (f16_sink ? (sink_rows*ne0*2 + packed_row - 1)/packed_row : 0);
+        ggml_tensor * dst = ggml_new_tensor_2d(ctx, GGML_TYPE_TQ6_0, ne0, rows);
         ggml_set_name(dst, "dst");
 
         ggml_tensor * src = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, r);
@@ -2885,9 +2892,22 @@ struct test_set_rows_tq6 : public test_case {
         ggml_tensor * row_idxs = ggml_new_tensor_1d(ctx, type_idx, r);
         ggml_set_name(row_idxs, "row_idxs");
 
-        ggml_tensor * written = ggml_set_rows(ctx, dst, src, row_idxs);
+        ggml_tensor * written = already_rotated ? ggml_set_rows_tq6_rotated(ctx, dst, src, row_idxs) : ggml_set_rows(ctx, dst, src, row_idxs);
 
-        ggml_tensor * out = ggml_cpy(ctx, written, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, ne1));
+        ggml_tensor * out;
+        if (f16_sink) {
+            written->op_params[2] = sink_rows;
+            written->op_params[3] = ne1;
+            auto * sink = ggml_view_2d(ctx, written, ne0, sink_rows, ne0*2, ne1*packed_row);
+            sink->type = GGML_TYPE_F16;
+            sink->nb[0] = sizeof(ggml_fp16_t);
+            auto * tail = ggml_view_2d(ctx, written, ne0, ne1 - sink_rows, packed_row, sink_rows*packed_row);
+            out = ggml_concat(ctx,
+                ggml_cpy(ctx, sink, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, sink_rows)),
+                ggml_cpy(ctx, tail, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, ne1 - sink_rows)), 1);
+        } else {
+            out = ggml_cpy(ctx, written, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, ne1));
+        }
         ggml_set_name(out, "out");
         return out;
     }
@@ -2896,9 +2916,26 @@ struct test_set_rows_tq6 : public test_case {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (t->type == GGML_TYPE_I64 || t->type == GGML_TYPE_I32) {
                 if (ggml_is_view_op(t->op)) continue;
-                init_set_rows_row_ids(t, ne1);
+                if (f16_sink) {
+                    if (t->type == GGML_TYPE_I32) {
+                        std::vector<int32_t> idx(r);
+                        for (int i = 0; i < r; ++i) { idx[i] = (i*5)%ne1; }
+                        ggml_backend_tensor_set(t, idx.data(), 0, idx.size()*sizeof(int32_t));
+                    } else {
+                        std::vector<int64_t> idx(r);
+                        for (int i = 0; i < r; ++i) { idx[i] = (i*5)%ne1; }
+                        ggml_backend_tensor_set(t, idx.data(), 0, idx.size()*sizeof(int64_t));
+                    }
+                } else {
+                    init_set_rows_row_ids(t, ne1);
+                }
             } else {
+                if (f16_sink && t->view_src != nullptr) { continue; }
                 init_tensor_uniform(t);
+                if (f16_sink && strcmp(t->name, "dst") == 0) {
+                    std::vector<ggml_fp16_t> zeros(3*ne0, 0);
+                    ggml_backend_tensor_set(t, zeros.data(), ne1*t->nb[1], zeros.size()*sizeof(ggml_fp16_t));
+                }
             }
         }
     }
@@ -8520,43 +8557,66 @@ struct test_flash_attn_ext_kvarn : public test_case {
     const int64_t hkv;  // KV heads
     const int64_t n_groups; // sealed body records per head
     const int64_t n_ring;   // exact positions after the body
+    const bool row_mask;
+    const bool attn_options;
 
-    static constexpr int64_t D = 256, S = 128, G = 128, cap = 1280;
+    const ggml_type staging_type;
+    const ggml_type body_type;
+    const int64_t S;
+    const bool f16_sink;
+    static constexpr int64_t D = 256, G = 128;
+    const int64_t cap;
 
     int64_t B()        const { return S + n_groups*G; }
     int64_t N()        const { return B() + n_ring; }
     int64_t qpos0()    const { return N() - n_q; }
     int64_t n_kv_pad() const { return ((N() + 255) / 256) * 256; }
-    int64_t rec_bytes() const { return (int64_t) ggml_kvarn_rec_bytes(D, G, 4, 4); }
+    int64_t rec_bytes() const { return body_type == GGML_TYPE_TURBO4_0 ? 2*G*ggml_row_size(body_type, D) : (int64_t) ggml_kvarn_rec_bytes(D, G, 4, 4); }
 
     std::string vars() override {
-        return VARS_TO_STR5(n_q, nh, hkv, n_groups, n_ring);
+        return VARS_TO_STR9(n_q, nh, hkv, n_groups, n_ring, row_mask, attn_options, staging_type, S) + ",f16_sink=" + std::to_string(f16_sink) + ",body_type=" + ggml_type_name(body_type);
     }
 
     double max_nmse_err() override {
         return 5e-4;
     }
 
-    test_flash_attn_ext_kvarn(int64_t n_q = 1, int64_t nh = 16, int64_t hkv = 2, int64_t n_groups = 3, int64_t n_ring = 300)
-        : n_q(n_q), nh(nh), hkv(hkv), n_groups(n_groups), n_ring(n_ring) {
+    test_flash_attn_ext_kvarn(int64_t n_q = 1, int64_t nh = 16, int64_t hkv = 2, int64_t n_groups = 3, int64_t n_ring = 300, bool row_mask = false, bool attn_options = false, ggml_type staging_type = GGML_TYPE_F16, int64_t S = 128, bool f16_sink = false, ggml_type body_type = GGML_TYPE_F32)
+        : n_q(n_q), nh(nh), hkv(hkv), n_groups(n_groups), n_ring(n_ring), row_mask(row_mask), attn_options(attn_options), staging_type(staging_type), body_type(body_type), S(S), f16_sink(f16_sink),
+          cap(std::max<int64_t>(1280, ((n_ring + G - 1)/G)*G)) {
         GGML_ASSERT(n_ring <= cap && n_ring >= n_q);
     }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, n_q, nh, 1);
         ggml_set_name(q, "q");
-        ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, D, S + cap, hkv, 1);
+        auto make_ring = [&](const char * name) {
+            if (!f16_sink) { return ggml_new_tensor_4d(ctx, staging_type, D, S + cap, hkv, 1); }
+            const size_t row_bytes = ggml_row_size(staging_type, D*hkv);
+            const int64_t rows = S + cap + (S*D*hkv*2 + row_bytes - 1)/row_bytes;
+            auto * storage = ggml_new_tensor_2d(ctx, staging_type, D*hkv, rows);
+            ggml_set_name(storage, name);
+            return ggml_view_4d(ctx, storage, D, rows, hkv, 1, row_bytes,
+                    ggml_row_size(staging_type, D), ggml_nbytes(storage), 0);
+        };
+        ggml_tensor * k = make_ring("k_mixed_storage");
         ggml_set_name(k, "k");
-        ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, D, S + cap, hkv, 1);
+        ggml_tensor * v = make_ring("v_mixed_storage");
         ggml_set_name(v, "v");
         ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv_pad(), n_q, 1, 1);
         ggml_set_name(m, "m");
         ggml_tensor * body = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, rec_bytes()*hkv*n_groups);
+        body->op_params[7] = body_type;
         ggml_set_name(body, "body");
         ggml_tensor * desc = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, GGML_KVARN_DESC_N_ENTRIES);
         ggml_set_name(desc, "desc");
 
-        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf((float) D), 0.0f, 0.0f);
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf((float) D), 0.0f, attn_options ? 2.0f : 0.0f);
+        if (attn_options) {
+            ggml_tensor * sinks = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nh);
+            ggml_set_name(sinks, "sinks");
+            ggml_flash_attn_ext_add_sinks(out, sinks);
+        }
         ggml_flash_attn_ext_set_kvarn(out, body, desc, 4, 4, (int32_t) n_kv_pad());
         ggml_prec_set_acc(out, GGML_PREC_F32);
         ggml_set_name(out, "out");
@@ -8572,7 +8632,11 @@ struct test_flash_attn_ext_kvarn : public test_case {
                 for (int64_t j = 0; j < n_q; ++j) {
                     const int64_t pos = qpos0() + j;
                     for (int64_t p = 0; p < n_kv_pad(); ++p) {
-                        mask[j*n_kv_pad() + p] = ggml_fp32_to_fp16(p <= pos && p < N() ? 0.0f : -INFINITY);
+                        float value = p <= pos && p < N() ? 0.0f : -INFINITY;
+                        if (row_mask && p >= S && p < B()) {
+                            value = (p / 16 + j) % 3 == 0 ? -INFINITY : -0.25f * (float) ((p + 3*j) % 11);
+                        }
+                        mask[j*n_kv_pad() + p] = ggml_fp32_to_fp16(value);
                     }
                 }
                 ggml_backend_tensor_set(t, mask.data(), 0, mask.size()*sizeof(ggml_fp16_t));
@@ -8581,8 +8645,33 @@ struct test_flash_attn_ext_kvarn : public test_case {
                 d[GGML_KVARN_DESC_S] = S; d[GGML_KVARN_DESC_CAP] = cap; d[GGML_KVARN_DESC_B] = B(); d[GGML_KVARN_DESC_N] = N();
                 d[GGML_KVARN_DESC_QPOS0] = qpos0(); d[GGML_KVARN_DESC_G] = G; d[GGML_KVARN_DESC_D] = D;
                 d[GGML_KVARN_DESC_RECBYTES] = rec_bytes(); d[GGML_KVARN_DESC_HKV] = hkv;
+                d[GGML_KVARN_DESC_BODY_TYPE] = body_type;
+                d[GGML_KVARN_DESC_TYPE_K] = staging_type;
+                d[GGML_KVARN_DESC_TYPE_V] = staging_type;
+                d[GGML_KVARN_DESC_SINK_TYPE] = f16_sink ? GGML_TYPE_F16 : 0;
                 ggml_backend_tensor_set(t, d.data(), 0, d.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "k_mixed_storage") == 0 || strcmp(t->name, "v_mixed_storage") == 0) {
+                std::vector<float> values(ggml_nelements(t));
+                for (auto & value : values) { value = uni(-1.0f, 1.0f); }
+                std::vector<uint8_t> bytes(ggml_nbytes(t));
+                ggml_quantize_chunk(staging_type, values.data(), bytes.data(), 0, t->ne[1], t->ne[0], nullptr);
+                auto * sink = (ggml_fp16_t *) (bytes.data() + (S + cap)*t->nb[1]);
+                for (int64_t i = 0; i < S*D*hkv; ++i) { sink[i] = ggml_fp32_to_fp16(uni(-1.0f, 1.0f)); }
+                ggml_backend_tensor_set(t, bytes.data(), 0, bytes.size());
+            } else if (f16_sink && (strcmp(t->name, "k") == 0 || strcmp(t->name, "v") == 0)) {
+                continue;
             } else if (strcmp(t->name, "body") == 0) {
+                if (body_type == GGML_TYPE_TURBO4_0) {
+                    const size_t block_size = ggml_type_size(GGML_TYPE_TURBO4_0);
+                    std::vector<uint8_t> blocks(ggml_nbytes(t));
+                    for (size_t offset = 0; offset < blocks.size(); offset += block_size) {
+                        const ggml_fp16_t norm = ggml_fp32_to_fp16(uni(2.0f, 12.0f));
+                        memcpy(blocks.data()+offset, &norm, sizeof(norm));
+                        for (size_t i = sizeof(norm); i < block_size; ++i) blocks[offset+i] = rng() & 255;
+                    }
+                    ggml_backend_tensor_set(t, blocks.data(), 0, ggml_nbytes(t));
+                    continue;
+                }
                 // layout per ggml_kvarn::make_layout (D=256, G=128, 4/4): payloads then fp16 metadata
                 const size_t k_row = D/2, v_row = D/2;
                 const size_t v_payload = k_row*G, k_scale = v_payload + v_row*G, k_zero = k_scale + 2*D, k_tok = k_zero + 2*D;
@@ -8616,10 +8705,11 @@ struct test_flash_attn_ext_kvarn : public test_case {
 struct test_kvarn_seal : public test_case {
     const int64_t D, G, hkv, n_groups;
     const int bits_k, bits_v, iters;
+    const ggml_type staging_type;
     const bool strided; // K/V are row-strided views of wider tensors (like KV-cache views)
 
     std::string vars() override {
-        return VARS_TO_STR8(D, G, hkv, n_groups, bits_k, bits_v, iters, strided);
+        return VARS_TO_STR9(D, G, hkv, n_groups, bits_k, bits_v, iters, strided, staging_type);
     }
 
     double max_nmse_err() override {
@@ -8627,15 +8717,15 @@ struct test_kvarn_seal : public test_case {
     }
 
     test_kvarn_seal(int64_t D = 256, int64_t G = 128, int64_t hkv = 4, int64_t n_groups = 2,
-                    int bits_k = 4, int bits_v = 4, int iters = 16, bool strided = false)
-        : D(D), G(G), hkv(hkv), n_groups(n_groups), bits_k(bits_k), bits_v(bits_v), iters(iters), strided(strided) {}
+                    int bits_k = 4, int bits_v = 4, int iters = 16, bool strided = false, ggml_type staging_type = GGML_TYPE_F16)
+        : D(D), G(G), hkv(hkv), n_groups(n_groups), bits_k(bits_k), bits_v(bits_v), iters(iters), staging_type(staging_type), strided(strided) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t n_tok = n_groups*G;
-        const int64_t ne0   = D*hkv + (strided ? 64 : 0);
-        ggml_tensor * kbig = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, ne0, n_tok);
+        const int64_t ne0   = D*hkv + (strided ? std::max<int64_t>(64, ggml_blck_size(staging_type)) : 0);
+        ggml_tensor * kbig = ggml_new_tensor_2d(ctx, staging_type, ne0, n_tok);
         ggml_set_name(kbig, "kbig");
-        ggml_tensor * vbig = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, ne0, n_tok);
+        ggml_tensor * vbig = ggml_new_tensor_2d(ctx, staging_type, ne0, n_tok);
         ggml_set_name(vbig, "vbig");
         ggml_tensor * k = strided ? ggml_view_2d(ctx, kbig, D*hkv, n_tok, kbig->nb[1], 0) : kbig;
         ggml_tensor * v = strided ? ggml_view_2d(ctx, vbig, D*hkv, n_tok, vbig->nb[1], 0) : vbig;
@@ -8656,13 +8746,15 @@ struct test_kvarn_seal : public test_case {
                 std::vector<float> ch_scale(t->ne[0]), tok_scale(t->ne[1]);
                 for (auto & x : ch_scale)  x = uni01(rng) < 0.05f ? 8.0f : 1.0f;
                 for (auto & x : tok_scale) x = uni01(rng) < 0.05f ? 3.0f : 1.0f;
-                std::vector<ggml_fp16_t> buf((size_t) t->ne[0]*t->ne[1]);
+                std::vector<float> values((size_t) t->ne[0]*t->ne[1]);
                 for (int64_t j = 0; j < t->ne[1]; ++j) {
                     for (int64_t i = 0; i < t->ne[0]; ++i) {
-                        buf[j*t->ne[0] + i] = ggml_fp32_to_fp16(nrm(rng)*ch_scale[i]*tok_scale[j]);
+                        values[j*t->ne[0] + i] = nrm(rng)*ch_scale[i]*tok_scale[j];
                     }
                 }
-                ggml_backend_tensor_set(t, buf.data(), 0, buf.size()*sizeof(ggml_fp16_t));
+                std::vector<uint8_t> buf(ggml_nbytes(t));
+                ggml_quantize_chunk(t->type, values.data(), buf.data(), 0, t->ne[1], t->ne[0], nullptr);
+                ggml_backend_tensor_set(t, buf.data(), 0, buf.size());
             } else if (strcmp(t->name, "body") == 0) {
                 std::vector<uint8_t> buf(ggml_nbytes(t), 0xAA); // unwritten bytes would show up as 0xAA
                 ggml_backend_tensor_set(t, buf.data(), 0, buf.size());
@@ -8677,9 +8769,12 @@ struct test_kvarn_seal : public test_case {
 struct test_kvarn_seal_dyn : public test_case {
     const int64_t D, G, hkv, S, cap, B_old, B, n_groups_pool, n_groups_max;
     const int bits_k, bits_v, iters;
+    const ggml_type staging_type;
+    const ggml_type body_type;
+    size_t rec_bytes() const { return body_type == GGML_TYPE_TURBO4_0 ? 2*G*ggml_row_size(body_type, D) : ggml_kvarn_rec_bytes(D, G, bits_k, bits_v); }
 
     std::string vars() override {
-        return VARS_TO_STR12(D, G, hkv, S, cap, B_old, B, n_groups_pool, n_groups_max, bits_k, bits_v, iters);
+        return VARS_TO_STR13(D, G, hkv, S, cap, B_old, B, n_groups_pool, n_groups_max, bits_k, bits_v, iters, staging_type) + ",body_type=" + ggml_type_name(body_type);
     }
 
     double max_nmse_err() override {
@@ -8688,18 +8783,19 @@ struct test_kvarn_seal_dyn : public test_case {
 
     test_kvarn_seal_dyn(int64_t D = 256, int64_t G = 128, int64_t hkv = 4, int64_t S = 128, int64_t cap = 384,
                         int64_t B_old = 128 + 5*128, int64_t B = 128 + 7*128, int64_t n_groups_pool = 9, int64_t n_groups_max = 3,
-                        int bits_k = 4, int bits_v = 4, int iters = 16)
+                        int bits_k = 4, int bits_v = 4, int iters = 16, ggml_type staging_type = GGML_TYPE_F16, ggml_type body_type = GGML_TYPE_F32)
         : D(D), G(G), hkv(hkv), S(S), cap(cap), B_old(B_old), B(B), n_groups_pool(n_groups_pool), n_groups_max(n_groups_max),
-          bits_k(bits_k), bits_v(bits_v), iters(iters) {}
+          bits_k(bits_k), bits_v(bits_v), iters(iters), staging_type(staging_type), body_type(body_type) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * k = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, D*hkv, S + cap);
+        ggml_tensor * k = ggml_new_tensor_2d(ctx, staging_type, D*hkv, S + cap);
         ggml_set_name(k, "kbig");
-        ggml_tensor * v = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, D*hkv, S + cap);
+        ggml_tensor * v = ggml_new_tensor_2d(ctx, staging_type, D*hkv, S + cap);
         ggml_set_name(v, "vbig");
         ggml_tensor * desc = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, GGML_KVARN_DESC_N_ENTRIES);
         ggml_set_name(desc, "desc");
-        ggml_tensor * body = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, (int64_t) ggml_kvarn_rec_bytes(D, G, bits_k, bits_v)*hkv*n_groups_pool);
+        ggml_tensor * body = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, (int64_t) rec_bytes()*hkv*n_groups_pool);
+        body->op_params[7] = body_type;
         ggml_set_name(body, "body");
         ggml_tensor * out = ggml_kvarn_seal_dyn(ctx, body, k, v, desc, D, G, bits_k, bits_v, iters, n_groups_max);
         ggml_set_name(out, "out");
@@ -8715,13 +8811,15 @@ struct test_kvarn_seal_dyn : public test_case {
                 std::vector<float> ch_scale(t->ne[0]), tok_scale(t->ne[1]);
                 for (auto & x : ch_scale)  x = uni01(rng) < 0.05f ? 8.0f : 1.0f;
                 for (auto & x : tok_scale) x = uni01(rng) < 0.05f ? 3.0f : 1.0f;
-                std::vector<ggml_fp16_t> buf((size_t) t->ne[0]*t->ne[1]);
+                std::vector<float> values((size_t) t->ne[0]*t->ne[1]);
                 for (int64_t j = 0; j < t->ne[1]; ++j) {
                     for (int64_t i = 0; i < t->ne[0]; ++i) {
-                        buf[j*t->ne[0] + i] = ggml_fp32_to_fp16(nrm(rng)*ch_scale[i]*tok_scale[j]);
+                        values[j*t->ne[0] + i] = nrm(rng)*ch_scale[i]*tok_scale[j];
                     }
                 }
-                ggml_backend_tensor_set(t, buf.data(), 0, buf.size()*sizeof(ggml_fp16_t));
+                std::vector<uint8_t> buf(ggml_nbytes(t));
+                ggml_quantize_chunk(t->type, values.data(), buf.data(), 0, t->ne[1], t->ne[0], nullptr);
+                ggml_backend_tensor_set(t, buf.data(), 0, buf.size());
             } else if (strcmp(t->name, "body") == 0) {
                 std::vector<uint8_t> buf(ggml_nbytes(t), 0xAA);
                 ggml_backend_tensor_set(t, buf.data(), 0, buf.size());
@@ -8734,8 +8832,11 @@ struct test_kvarn_seal_dyn : public test_case {
                 d[GGML_KVARN_DESC_QPOS0]    = (int32_t) (B + 16);
                 d[GGML_KVARN_DESC_G]        = (int32_t) G;
                 d[GGML_KVARN_DESC_D]        = (int32_t) D;
-                d[GGML_KVARN_DESC_RECBYTES] = (int32_t) ggml_kvarn_rec_bytes(D, G, bits_k, bits_v);
+                d[GGML_KVARN_DESC_RECBYTES] = (int32_t) rec_bytes();
                 d[GGML_KVARN_DESC_HKV]      = (int32_t) hkv;
+                d[GGML_KVARN_DESC_BODY_TYPE] = body_type;
+                d[GGML_KVARN_DESC_TYPE_K] = staging_type;
+                d[GGML_KVARN_DESC_TYPE_V] = staging_type;
                 d[GGML_KVARN_DESC_B_OLD]    = (int32_t) B_old;
                 ggml_backend_tensor_set(t, d, 0, sizeof(d));
             } else if (t->op == GGML_OP_NONE && t->view_src == nullptr) {
@@ -10294,6 +10395,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_set_rows_tq6(GGML_TYPE_I32, 128, 4096, 1024));
     test_cases.emplace_back(new test_set_rows_tq6(GGML_TYPE_I32, 256, 2048, 512));
     test_cases.emplace_back(new test_set_rows_tq6(GGML_TYPE_I32, 512, 1024, 256));
+
+    for (ggml_type idx_type : {GGML_TYPE_I32, GGML_TYPE_I64}) {
+        for (int r : {1, 3, 4, 5}) {
+            test_cases.emplace_back(new test_set_rows_tq6(idx_type, 256, 16, r, true));
+        }
+    }
+    test_cases.emplace_back(new test_set_rows_tq6(GGML_TYPE_I64, 1024, 2048, 1024, true));
+    for (auto idx_type : {GGML_TYPE_I32, GGML_TYPE_I64}) {
+        test_cases.emplace_back(new test_set_rows_tq6(idx_type, 1024, 16, 8, true, true));
+    }
 
     // SET_ROWS with tq5 destination: quantize then dequant round-trip
     for (ggml_type idx_type : {GGML_TYPE_I32, GGML_TYPE_I64}) {
@@ -12378,6 +12489,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_kvarn(  64,  4, 4, 2,  200)); // GQA 1, (8,1)
     test_cases.emplace_back(new test_flash_attn_ext_kvarn( 256, 16, 2, 3,  300)); // GQA 8
 
+    for (int64_t n_q : {4, 5, 8}) {
+        test_cases.emplace_back(new test_flash_attn_ext_kvarn(n_q, 24, 4, 3, 300, true));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_kvarn(5, 24, 4, 3, 4096, true)); // full ring wraps after the sealed body
+    for (int64_t nh : {4, 8, 16, 24}) {
+        test_cases.emplace_back(new test_flash_attn_ext_kvarn(257, nh, 4, 3, 300, true));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_kvarn(257, 24, 4, 3, 300, true, true));
+    // A 21 MiB prefill cap exercises two KV heads followed by one, including sink slicing and output scatter.
+    test_cases.emplace_back(new test_flash_attn_ext_kvarn(257, 24, 3, 60, 300, true, true));
+
     test_cases.emplace_back(new test_kvarn_seal(256, 128, 4, 2, 4, 4, 16, false));
     test_cases.emplace_back(new test_kvarn_seal(256, 128, 2, 1, 4, 4, 16, true));
     test_cases.emplace_back(new test_kvarn_seal(256, 128, 2, 1, 5, 3, 16, false));
@@ -12389,6 +12511,49 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_kvarn_seal_dyn(256, 128, 4, 128, 384, 128 + 5*128, 128 + 5*128, 9, 3)); // nothing to seal
     test_cases.emplace_back(new test_kvarn_seal_dyn(256, 128, 2, 128, 512, 128 + 0*128, 128 + 1*128, 4, 1)); // first group
     test_cases.emplace_back(new test_kvarn_seal_dyn(256, 128, 4, 128, 640, 128 + 2*128, 128 + 5*128, 8, 5)); // 3 of 5
+
+    for (int64_t n_q : {1, 3, 4, 5, 6}) {
+        test_cases.emplace_back(new test_flash_attn_ext_kvarn(n_q, 24, 4, 3, 1024, true, false, GGML_TYPE_Q8_0, 256));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_kvarn(4, 4, 4, 3, 1024, true, true, GGML_TYPE_Q8_0, 256));
+    test_cases.emplace_back(new test_flash_attn_ext_kvarn(5, 24, 4, 3, 4096, true, true, GGML_TYPE_Q8_0, 256));
+    test_cases.emplace_back(new test_flash_attn_ext_kvarn(5, 24, 4, 3, 4096, true, false, GGML_TYPE_Q8_0, 256));
+    test_cases.emplace_back(new test_flash_attn_ext_kvarn(257, 24, 4, 3, 300, true, true, GGML_TYPE_Q8_0, 256));
+    test_cases.emplace_back(new test_flash_attn_ext_kvarn(257, 24, 3, 60, 300, true, true, GGML_TYPE_Q8_0, 256));
+    test_cases.emplace_back(new test_kvarn_seal(256, 128, 4, 2, 4, 4, 16, false, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_kvarn_seal(256, 128, 2, 1, 4, 4, 16, true, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_kvarn_seal_dyn(256, 128, 4, 256, 384, 256 + 5*128, 256 + 7*128, 9, 3, 4, 4, 16, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_kvarn_seal_dyn(256, 128, 4, 256, 384, 256 + 5*128, 256 + 5*128, 9, 3, 4, 4, 16, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_kvarn_seal_dyn(256, 128, 2, 256, 512, 256, 256 + 128, 4, 1, 4, 4, 16, GGML_TYPE_Q8_0));
+    // A pressure flush compresses 3072 rows and leaves other body records unchanged.
+    test_cases.emplace_back(new test_kvarn_seal_dyn(256, 128, 4, 256, 4096, 256 + 24*128, 256 + 48*128, 50, 24, 4, 4, 16, GGML_TYPE_Q8_0));
+
+    for (int64_t n_q : {1, 3, 4, 5, 6, 7, 8}) {
+        test_cases.emplace_back(new test_flash_attn_ext_kvarn(n_q, 24, 4, 3, 1024, true, false, GGML_TYPE_TQ6_0, 128));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_kvarn(4, 4, 4, 3, 1024, true, false, GGML_TYPE_TQ6_0, 128));
+    test_cases.emplace_back(new test_flash_attn_ext_kvarn(4, 4, 4, 3, 1024, true, true, GGML_TYPE_TQ6_0, 128));
+    test_cases.emplace_back(new test_flash_attn_ext_kvarn(5, 24, 4, 3, 4096, true, true, GGML_TYPE_TQ6_0, 128));
+    test_cases.emplace_back(new test_flash_attn_ext_kvarn(5, 24, 4, 3, 4096, true, false, GGML_TYPE_TQ6_0, 128));
+    test_cases.emplace_back(new test_flash_attn_ext_kvarn(257, 24, 4, 3, 300, true, true, GGML_TYPE_TQ6_0, 128));
+    test_cases.emplace_back(new test_flash_attn_ext_kvarn(257, 24, 3, 60, 300, true, true, GGML_TYPE_TQ6_0, 128));
+    for (int n_q : {1, 4, 5, 6, 8, 129, 256}) {
+        test_cases.emplace_back(new test_flash_attn_ext_kvarn(n_q, 24, 4, 3, 4096, true, false, GGML_TYPE_TQ6_0, 128, true));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_kvarn(257, 24, 3, 60, 300, true, true, GGML_TYPE_TQ6_0, 128, true));
+    test_cases.emplace_back(new test_kvarn_seal(256, 128, 4, 2, 4, 4, 16, false, GGML_TYPE_TQ6_0));
+    test_cases.emplace_back(new test_kvarn_seal(256, 128, 2, 1, 4, 4, 16, true, GGML_TYPE_TQ6_0));
+    for (int64_t n_q : {1, 4, 5, 6, 8, 129, 256}) {
+        test_cases.emplace_back(new test_flash_attn_ext_kvarn(n_q, 24, 4, 3, 4096, true, false, GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_TURBO4_0));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_kvarn(257, 24, 3, 60, 300, true, true, GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_TURBO4_0));
+    for (int64_t end : {128 + 5*128, 128 + 7*128}) {
+        test_cases.emplace_back(new test_kvarn_seal_dyn(256, 128, 4, 128, 384, 128 + 5*128, end, 9, 3, 4, 4, 16, GGML_TYPE_TQ6_0, GGML_TYPE_TURBO4_0));
+    }
+    test_cases.emplace_back(new test_kvarn_seal_dyn(256, 128, 4, 128, 384, 128 + 5*128, 128 + 7*128, 9, 3, 4, 4, 16, GGML_TYPE_TQ6_0));
+    test_cases.emplace_back(new test_kvarn_seal_dyn(256, 128, 4, 128, 384, 128 + 5*128, 128 + 5*128, 9, 3, 4, 4, 16, GGML_TYPE_TQ6_0));
+    test_cases.emplace_back(new test_kvarn_seal_dyn(256, 128, 2, 128, 512, 128, 128 + 128, 4, 1, 4, 4, 16, GGML_TYPE_TQ6_0));
+    test_cases.emplace_back(new test_kvarn_seal_dyn(256, 128, 4, 128, 4096, 128 + 24*128, 128 + 48*128, 50, 24, 4, 4, 16, GGML_TYPE_TQ6_0));
 
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));
@@ -12906,6 +13071,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // = 102528 positions; n_q 1 (tg128), 4 and 5 (MTP verify rows). f16 rows of the same shape for the bandwidth reference.
     for (int64_t n_q : {1, 4, 5}) {
         test_cases.emplace_back(new test_flash_attn_ext_kvarn(n_q, 24, 4, 792, 1024));
+    }
+    // Compare exact-tail traffic at the same 32896 visible positions.
+    for (int64_t n_q : {4, 5}) {
+        test_cases.emplace_back(new test_flash_attn_ext_kvarn(n_q, 24, 4, 255, 128));
+    }
+    // Keep visible context fixed while varying the exact suffix.
+    for (int64_t n_q : {4, 5}) {
+        test_cases.emplace_back(new test_flash_attn_ext_kvarn(n_q, 24, 4, 224, 4096));
+        test_cases.emplace_back(new test_flash_attn_ext_kvarn(n_q, 24, 4,  32, 4096));
+        test_cases.emplace_back(new test_flash_attn_ext_kvarn(n_q, 24, 4,  63,  128));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_kvarn(4, 24, 4, 56, 1024));
+    // Five-query occupancy crossover between short and long caches.
+    for (int64_t n_groups : {32, 40, 48, 56, 120}) {
+        test_cases.emplace_back(new test_flash_attn_ext_kvarn(5, 24, 4, n_groups, 1024));
+    }
+    for (int64_t n_groups : {24, 248, 504}) {
+        for (int64_t n_q : {1, 4, 5, 1024}) {
+            test_cases.emplace_back(new test_flash_attn_ext_kvarn(n_q, 24, 4, n_groups, 1024));
+        }
     }
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 102528, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
 
