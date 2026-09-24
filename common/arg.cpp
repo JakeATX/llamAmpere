@@ -4383,7 +4383,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--spec-draft-vocab-map"}, "{auto,auto:N,none,FNAME}",
         "draft-only vocabulary shortlist for the MTP draft head; the target is unaffected. 'auto' uses the list compiled in for this "
         "model's tokenizer and architecture (every quant of a supported base model, e.g. Qwen3.8-27B), 'auto:N' the one of size N, "
-        "FNAME a llama-mtp-vocab-v1 map, 'none' the full vocabulary (default: full vocabulary)",
+        "FNAME a llama-mtp-vocab-v1 map, 'none' the full vocabulary (default: auto; a model with no built-in list "
+        "drafts over the full vocabulary)",
         [](common_params & params, const std::string & value) {
             params.speculative.draft.vocab_map = value;
         }

@@ -273,8 +273,11 @@ llama_context::llama_context(
     // draft-only vocabulary shortlist: parsed once, kept as a persistent I32 map on the head's device
     {
         const char * path = params.draft_vocab_map;
-        if ((path == nullptr || path[0] == '\0') && cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
-            path = getenv("LLAMA_SPEC_DRAFT_VOCAB");
+        // the environment override also replaces common's default ("auto"), which a caller cannot tell from an explicit auto
+        if ((path == nullptr || path[0] == '\0' || std::strcmp(path, "auto") == 0) && cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+            if (const char * env = getenv("LLAMA_SPEC_DRAFT_VOCAB"); env != nullptr && env[0] != '\0') {
+                path = env;
+            }
         }
         if (path != nullptr && std::strcmp(path, "none") == 0) {
             path = nullptr;
