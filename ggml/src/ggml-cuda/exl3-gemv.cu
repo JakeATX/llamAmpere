@@ -759,6 +759,83 @@ int ggml_cuda_exl3_gemv_ksplit(const int kt, const int nt, const int T) {
     return ksplit;
 }
 
+// [#74] raw split-K partials out[ks][T][N] = W . xh for a glued, pre-scaled fp16 x (no svh, no Hadamard)
+static void exl3_gemv_raw(const ggml_tensor * src0, const half * xh, float * out, const int T, const int ksplit, cudaStream_t stream) {
+    exl3_gemv_args a;
+    a.trellis = (const uint32_t *) src0->data; a.x = (half2 *) xh; a.out = out;
+    a.kt = (int) src0->ne[0] / 16; a.nt = (int) src0->ne[1] / 16; a.K = (int) src0->ne[0]; a.N = (int) src0->ne[1];
+    a.ksplit = ksplit;
+    a.xf = nullptr; a.suh = nullptr; a.svh = nullptr; a.yf = nullptr; a.post = true;
+    exl3_gemv_launch_t<false>(a, ggml_exl3_bits(src0->type), T, stream);
+}
+
+static bool exl3_ffn_mm_ok(const ggml_tensor * mm, const int64_t T) {
+    const ggml_tensor * w  = mm->src[0];
+    const ggml_tensor * x  = mm->src[1];
+    const ggml_tensor * su = mm->src[2];
+    const ggml_tensor * sv = mm->src[3];
+    return ggml_exl3_bits(w->type) != 0 && w->ne[2] == 1 && w->ne[3] == 1 && w->ne[0] % 128 == 0 && w->ne[1] % 128 == 0 &&
+           x->type == GGML_TYPE_F32 && mm->type == GGML_TYPE_F32 && ggml_is_contiguous(x) && ggml_is_contiguous(mm) &&
+           x->ne[1] * x->ne[2] * x->ne[3] == T &&
+           su != nullptr && sv != nullptr && su->type == GGML_TYPE_F32 && sv->type == GGML_TYPE_F32 &&
+           ggml_is_contiguous(su) && ggml_is_contiguous(sv) && su->ne[0] == w->ne[0] && sv->ne[0] == w->ne[1];
+}
+
+bool ggml_cuda_exl3_ffn_bridge(ggml_backend_cuda_context & ctx, const ggml_tensor * mm_gate, const ggml_tensor * mm_up,
+                               ggml_tensor * mm_down) {
+    const int64_t T = mm_down->src[1]->ne[1] * mm_down->src[1]->ne[2] * mm_down->src[1]->ne[3];
+    // the cooperative fused GEMV does its own glue in-kernel; the envelope check wants every GEMV's x and y
+    if (!ggml_cuda_exl3_gemv_supported(T) || exl3_gemv_fused_enabled() || exl3_envelope_enabled()) {
+        return false;
+    }
+    if (!exl3_ffn_mm_ok(mm_gate, T) || !exl3_ffn_mm_ok(mm_up, T) || !exl3_ffn_mm_ok(mm_down, T)) {
+        return false;
+    }
+    const ggml_tensor * wg = mm_gate->src[0];
+    const ggml_tensor * wu = mm_up->src[0];
+    const ggml_tensor * wd = mm_down->src[0];
+    const int K  = (int) wg->ne[0];
+    const int NF = (int) wg->ne[1];
+    const int ND = (int) wd->ne[1];
+    if (wu->ne[0] != K || wu->ne[1] != NF || wd->ne[0] != NF) {
+        return false;
+    }
+
+    const int id = ggml_cuda_get_device();
+    cudaStream_t stream = ctx.stream();
+    const int ks_g = ggml_cuda_exl3_gemv_ksplit(K / 16, NF / 16, (int) T);
+    const int ks_u = ggml_cuda_exl3_gemv_ksplit(K / 16, NF / 16, (int) T);
+    const int ks_d = ggml_cuda_exl3_gemv_ksplit(NF / 16, ND / 16, (int) T);
+
+    // gate and up: glue_in (shared when both read the same x with the same suh) + raw partials
+    const float * suh_g = (const float *) mm_gate->src[2]->data;
+    const float * suh_u = (const float *) mm_up->src[2]->data;
+    ggml_cuda_pool_alloc<half> xh_g(ctx.pool(id), (size_t) T * K);
+    ggml_cuda_exl3_glue_in_f16((const float *) mm_gate->src[1]->data, suh_g, xh_g.get(), K, T, EXL3_GEMV_X_SCALE, stream);
+    ggml_cuda_pool_alloc<half> xh_u(ctx.pool(id));
+    const half * xu = xh_g.get();
+    if (mm_up->src[1]->data != mm_gate->src[1]->data || suh_u != suh_g) {
+        xu = xh_u.alloc((size_t) T * K);
+        ggml_cuda_exl3_glue_in_f16((const float *) mm_up->src[1]->data, suh_u, xh_u.get(), K, T, EXL3_GEMV_X_SCALE, stream);
+    }
+    ggml_cuda_pool_alloc<float> part_g(ctx.pool(id), (size_t) ks_g * T * NF);
+    ggml_cuda_pool_alloc<float> part_u(ctx.pool(id), (size_t) ks_u * T * NF);
+    exl3_gemv_raw(wg, xh_g.get(), part_g.get(), (int) T, ks_g, stream);
+    exl3_gemv_raw(wu, xu,         part_u.get(), (int) T, ks_u, stream);
+
+    // bridge: both glue_outs, SwiGLU, the down projection's glue_in
+    ggml_cuda_pool_alloc<half> xh_d(ctx.pool(id), (size_t) T * NF);
+    ggml_cuda_exl3_ffn_bridge_f16(part_g.get(), ks_g, (const float *) mm_gate->src[3]->data,
+                                  part_u.get(), ks_u, (const float *) mm_up->src[3]->data,
+                                  (const float *) mm_down->src[2]->data, xh_d.get(), NF, T, EXL3_GEMV_X_SCALE, stream);
+
+    // down: the prepared-fp16 entry, raw partials + glue_out (svh is always present here, so always post)
+    ggml_cuda_pool_alloc<float> part_d(ctx.pool(id), (size_t) ks_d * T * ND);
+    exl3_gemv_raw(wd, xh_d.get(), part_d.get(), (int) T, ks_d, stream);
+    ggml_cuda_exl3_glue_out(part_d.get(), (const float *) mm_down->src[3]->data, (float *) mm_down->data, ND, T, ks_d, 1.0f, stream);
+    return true;
+}
+
 void ggml_cuda_exl3_gemv(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const int64_t T,
                          const float * suh, const float * svh) {
     const int bits = ggml_exl3_bits(src0->type);

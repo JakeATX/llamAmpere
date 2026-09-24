@@ -4260,6 +4260,47 @@ static int ggml_cuda_try_add_rms_norm_mul(ggml_backend_cuda_context & ctx, ggml_
     return 2;
 }
 
+// [#74] EXL3 FFN: MUL_MAT gate/up (either order) at i, i+1, GLU SWIGLU split at i+2, MUL_MAT down at i+3 reading the
+// GLU. The gate/up outputs and the GLU output are elided; one bridge kernel replaces both glue_outs, the SwiGLU and the
+// down projection's glue_in. Opt-in with GGML_CUDA_EXL3_FFN_BRIDGE=1 (see tests/test-exl3-ffn-bridge.cpp). Returns
+// nodes to skip.
+static int ggml_cuda_try_exl3_ffn_bridge(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, const int i) {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_CUDA_EXL3_FFN_BRIDGE");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    if (!enabled || i + 3 >= cgraph->n_nodes) {
+        return 0;
+    }
+    ggml_tensor * a    = cgraph->nodes[i];
+    ggml_tensor * b    = cgraph->nodes[i + 1];
+    ggml_tensor * glu  = cgraph->nodes[i + 2];
+    ggml_tensor * down = cgraph->nodes[i + 3];
+    if (a->op != GGML_OP_MUL_MAT || b->op != GGML_OP_MUL_MAT || glu->op != GGML_OP_GLU || down->op != GGML_OP_MUL_MAT) {
+        return 0;
+    }
+    if (ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || glu->src[1] == nullptr || down->src[1] != glu) {
+        return 0;
+    }
+    const ggml_tensor * gate = glu->src[0];
+    const ggml_tensor * up   = glu->src[1];
+    if (!((gate == a && up == b) || (gate == b && up == a))) {
+        return 0;
+    }
+    if (glu->type != GGML_TYPE_F32 || !ggml_is_contiguous(glu) || !ggml_are_same_shape(gate, up) ||
+            !ggml_are_same_shape(glu, gate)) {
+        return 0;
+    }
+    if (!ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU, GGML_OP_MUL_MAT }, { i + 3 })) {
+        return 0;
+    }
+    if (!ggml_cuda_exl3_ffn_bridge(ctx, gate, up, down)) {
+        return 0;
+    }
+    ctx.fusion_stats.exl3_ffn_bridge++;
+    return 3;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -4283,6 +4324,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (node->op == GGML_OP_ADD) {
         const int n_skip = ggml_cuda_try_add_rms_norm_mul(*cuda_ctx, cgraph, i);
+        if (n_skip > 0) {
+            return n_skip;
+        }
+    }
+
+    if (node->op == GGML_OP_MUL_MAT && ggml_exl3_bits(node->src[0]->type) != 0) {
+        const int n_skip = ggml_cuda_try_exl3_ffn_bridge(*cuda_ctx, cgraph, i);
         if (n_skip > 0) {
             return n_skip;
         }
@@ -6624,6 +6672,9 @@ int64_t ggml_backend_cuda_fusion_count(ggml_backend_t backend, const char * name
     }
     if (strcmp(name, "add_rms_q8") == 0) {
         return ctx->fusion_stats.add_rms_q8;
+    }
+    if (strcmp(name, "exl3_ffn_bridge") == 0) {
+        return ctx->fusion_stats.exl3_ffn_bridge;
     }
     return -1;
 }
