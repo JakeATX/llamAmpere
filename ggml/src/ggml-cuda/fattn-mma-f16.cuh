@@ -3016,8 +3016,13 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
 
     constexpr int ncols = ncols1 * ncols2;
 
+    // [#39] The kernels below are instantiated with these K/V types (launch_fattn converts quantized K/V to f16 first),
+    // so the host nbatch_fa reads the same typed helper as flash_attn_ext_f16<..., type_K, type_V> does on the device.
+    constexpr ggml_type type_K = GGML_TYPE_F16;
+    constexpr ggml_type type_V = GGML_TYPE_F16;
+
     const int  nthreads       = ggml_cuda_fattn_mma_get_nthreads      (DKQ, DV, ncols, cc);
-    const int  nbatch_fa      = ggml_cuda_fattn_mma_get_nbatch_fa     (DKQ, DV, ncols, cc);
+    const int  nbatch_fa      = ggml_cuda_fattn_mma_get_nbatch_fa     (DKQ, DV, ncols, type_K, cc); // [#39] per K type
     const int  nbatch_K2      = ggml_cuda_fattn_mma_get_nbatch_K2     (DKQ, DV, ncols, cc);
     const int  nbatch_V2      = ggml_cuda_fattn_mma_get_nbatch_V2     (DKQ, DV, ncols, cc);
     const int  nbatch_combine = ggml_cuda_fattn_mma_get_nbatch_combine(DKQ, DV, ncols, cc);
@@ -3061,7 +3066,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
         if constexpr (ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, ncols1, ncols2)) {
             if (ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ctx, dst)) {
                 constexpr bool use_sparse_kernel = true;
-                fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, use_sparse_kernel>;
+                fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, use_sparse_kernel, type_K, type_V>;
                 use_sparse = true;
 
                 static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
@@ -3071,7 +3076,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
                 }
             } else {
                 constexpr bool use_sparse_kernel = false;
-                fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, use_sparse_kernel>;
+                fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, use_sparse_kernel, type_K, type_V>;
 
                 static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
                 if (!shared_memory_limit_raised[id]) {
@@ -3083,7 +3088,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
         {
             constexpr bool use_sparse_kernel = false;
-            fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, use_sparse_kernel>;
+            fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, use_sparse_kernel, type_K, type_V>;
 
 #if !defined(GGML_USE_MUSA)
             static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
@@ -3096,7 +3101,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     } else {
         constexpr bool use_logit_softcap = true;
         constexpr bool use_sparse_kernel = false;
-        fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, use_sparse_kernel>;
+        fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, use_sparse_kernel, type_K, type_V>;
 
 #if !defined(GGML_USE_MUSA)
         static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
