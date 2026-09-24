@@ -3,6 +3,7 @@
 #include "ggml.h"
 #include "ggml-impl.h"
 #include "ggml-cuda.h"
+#include "ggml-ledger.h"
 
 #include <cstdint>
 #include <cstdlib>
@@ -1606,6 +1607,7 @@ struct ggml_backend_cuda_context {
             last_graph_eviction_sweep = time_now;
             for (auto it = cuda_graphs.begin(); it != cuda_graphs.end(); ) {
                 if (time_now - it->second->last_used_time >= evict_us) {
+                    ggml_ledger_add("cuda.graph", "evict:idle (GGML_CUDA_GRAPH_EVICT_S)", 1); // [#68] next use recaptures ("why=new")
                     it = cuda_graphs.erase(it);
                 } else {
                     ++it;
@@ -1622,6 +1624,7 @@ struct ggml_backend_cuda_context {
                         lru = c;
                     }
                 }
+                ggml_ledger_add("cuda.graph", "evict:lru (max_cuda_graphs)", 1); // [#68]
                 cuda_graphs.erase(lru);
             }
             it = cuda_graphs.emplace(graph_key, std::make_unique<ggml_cuda_graph>()).first;

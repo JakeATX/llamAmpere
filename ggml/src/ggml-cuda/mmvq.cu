@@ -1,5 +1,6 @@
 #include "mmvq.cuh"
 #include "convrot.cuh"
+#include "ledger.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
@@ -1860,6 +1861,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
                                 fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
         if (!has_ids && !has_fusion && ncols_dst >= 2 && nrows_x <= ggml_cuda_mmvq_thin_max_rows() &&
                 table_id == MMVQ_PARAMETERS_GENERIC) {
+            ggml_cuda_ledger_mm("cuda.mmvq", "thin", type, ncols_dst); // [#68] thin launch taken (#45)
             if (ggml_cuda_mmvq_thin_nwarps() == 8) {
                 mul_mat_vec_q_thin_launch<type, 8>(vx, vy, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y,
                     stride_col_dst, channel_ratio_fd, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
@@ -2285,6 +2287,10 @@ void ggml_cuda_mul_mat_vec_q(
                         qc.data == src1->data && qc.size == q8_bytes &&
                         qc.ne10_padded == ne10_padded && qc.type == src0->type &&
                         qc.dev == ctx.device;
+
+    // [#68] fallback ledger: shared-quantize cache outcome per weight type and width (no-op when the ledger is off)
+    ggml_cuda_ledger_mm("cuda.mmvq", q8_hit ? "q8_cache_hit" : q8_cacheable ? "q8_quantize_cached" : "q8_quantize_local",
+        src0->type, ids ? src1->ne[2] : src1->ne[1]);
 
     ggml_cuda_pool_alloc<char> src1_q8_1_local(ctx.pool());
     char * src1_q8_1 = nullptr;
