@@ -23,6 +23,7 @@
 #include "llama-model.h"
 #include "llama-mtp-vocab.h"
 #include "llama-mtp-vocab-builtin.h"
+#include "llama-mtp-chain-sample.h"
 #include "llama-ext.h"
 #include "llama-sampler.h"
 #include "llama.h"
@@ -219,6 +220,7 @@ llama_context::llama_context(
     cparams.embeddings_nextn        = false;
     cparams.embeddings_nextn_masked = false;
     cparams.mtp_chain               = false;
+    cparams.mtp_chain_top_k         = 0;
     cparams.offload_kqv             = params.offload_kqv;
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
@@ -1781,6 +1783,18 @@ void llama_context::set_mtp_chain(bool value) {
     cparams.mtp_chain = value;
 }
 
+void llama_context::set_mtp_chain_sampling(int32_t top_k, float temp, float top_p, float min_p, const float * u, int32_t n_u) {
+    if (top_k <= 0) {
+        cparams.mtp_chain_top_k = 0;
+        return;
+    }
+    GGML_ASSERT(top_k <= LLAMA_MTP_CHAIN_TOP_K_MAX && temp > 0.0f && n_u >= 0 && (u != nullptr || n_u == 0));
+    cparams.mtp_chain_top_k = top_k;
+    mtp_chain_samp.resize(LLAMA_MTP_CHAIN_SAMP_N + (size_t) n_u);
+    llama_mtp_chain_samp_pack(temp, top_p, min_p, mtp_chain_samp.data());
+    std::copy(u, u + n_u, mtp_chain_samp.begin() + LLAMA_MTP_CHAIN_SAMP_N);
+}
+
 void llama_context::set_causal_attn(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -3263,6 +3277,7 @@ llm_graph_params llama_context::graph_params(
         /*.samplers    =*/ sampling.samplers,
         /*.draft_vocab =*/ draft_vocab.ids,
         /*.draft_vocab_warned =*/ &draft_vocab.warned,
+        /*.mtp_chain_samp =*/ &mtp_chain_samp,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
@@ -4734,6 +4749,10 @@ bool llama_model_uses_shared_position_draft(const llama_model * model) {
 
 void llama_set_mtp_chain(llama_context * ctx, bool value) {
     ctx->set_mtp_chain(value);
+}
+
+void llama_set_mtp_chain_sampling(llama_context * ctx, int32_t top_k, float temp, float top_p, float min_p, const float * u, int32_t n_u) {
+    ctx->set_mtp_chain_sampling(top_k, temp, top_p, min_p, u, n_u);
 }
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {

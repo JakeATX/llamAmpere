@@ -129,6 +129,7 @@ struct llama_context {
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
     void set_mtp_chain(bool value);
+    void set_mtp_chain_sampling(int32_t top_k, float temp, float top_p, float min_p, const float * u, int32_t n_u); // [#69]
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
@@ -365,6 +366,9 @@ private:
     };
 
     draft_vocab_info draft_vocab;
+
+    // [#69] sampled MTP chain inputs: the packed sampling params, then one uniform per chain step
+    std::vector<float> mtp_chain_samp;
 
     // sequence embeddings output (map of [n_embd] vectors)
     // populated only when pooling_type != LLAMA_POOLING_TYPE_NONE

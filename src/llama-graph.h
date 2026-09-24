@@ -817,6 +817,21 @@ public:
     std::map<llama_seq_id, row_input> row_inputs;
 };
 
+// [#69] sampled MTP chain: the packed sampling params and the per-step uniforms, owned by the context
+class llm_graph_input_mtp_chain_samp : public llm_graph_input_i {
+public:
+    llm_graph_input_mtp_chain_samp(const std::vector<float> * src) : src(src) {}
+    virtual ~llm_graph_input_mtp_chain_samp() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * samp = nullptr; // F32 [LLAMA_MTP_CHAIN_SAMP_N]
+    ggml_tensor * u    = nullptr; // F32 [n_chain]
+
+    const std::vector<float> * src;
+};
+
 struct llm_graph_fused_node {
     llm_fused_op op;
     ggml_tensor * tensor;
@@ -856,6 +871,9 @@ struct llm_graph_params {
 
     // bit per full-head fallback reason already warned about, owned by the context (warn once per context)
     std::atomic<uint32_t> * draft_vocab_warned = nullptr;
+
+    // [#69] sampled MTP chain inputs, owned by the context (llama_context::mtp_chain_samp)
+    const std::vector<float> * mtp_chain_samp = nullptr;
 
     static bool samplers_equal(
           const std::map<llama_seq_id, llama_sampler *> & lhs,
@@ -947,6 +965,7 @@ struct llm_graph_params {
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
             cparams.mtp_chain               == other.cparams.mtp_chain               &&
+            cparams.mtp_chain_top_k         == other.cparams.mtp_chain_top_k         &&
             cparams.causal_attn             == other.cparams.causal_attn             &&
             arch  == other.arch  &&
             gtype == other.gtype &&
@@ -1110,6 +1129,7 @@ struct llm_graph_context {
 
     ggml_tensor * draft_vocab_ids; // see llm_graph_params
     std::atomic<uint32_t> * draft_vocab_warned; // see llm_graph_params
+    const std::vector<float> * mtp_chain_samp; // see llm_graph_params
 
     // full-head fallback of build_draft_vocab_logits: counts the reason in the fallback ledger, warns once per context
     ggml_tensor * draft_vocab_fallback(int reason, const char * detail) const;
@@ -1470,6 +1490,13 @@ struct llm_graph_context {
     // draft-only vocabulary shortlist: logits over the shortlisted rows of head_w only, [n_sel, n_outputs].
     // Returns nullptr when the shortlist does not apply to this graph (caller uses the full head).
     ggml_tensor * build_draft_vocab_logits(
+            ggml_tensor * head_w,
+            ggml_tensor * head_s,
+            ggml_tensor * cur) const;
+
+    // [#69/BL7c] the shortlist for one MTP chain step, [n_sel, 1] over the rows of draft_vocab_ids. The chain
+    // emits token ids itself, so no backend sampler has to consume the compact row. nullptr: use the full head.
+    ggml_tensor * build_draft_vocab_logits_chain(
             ggml_tensor * head_w,
             ggml_tensor * head_s,
             ggml_tensor * cur) const;

@@ -1,6 +1,7 @@
 #include "llama-graph.h"
 #include "llama-sampler.h"
 #include "llama-ext.h"
+#include "llama-mtp-chain-sample.h"
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -1420,6 +1421,21 @@ bool llm_graph_input_sampling::can_reuse(const llm_graph_params & params) {
     return true;
 }
 
+void llm_graph_input_mtp_chain_samp::set_input(const llama_ubatch * ubatch) {
+    GGML_UNUSED(ubatch);
+
+    const size_t n_u = (size_t) ggml_nelements(u);
+    GGML_ASSERT(src != nullptr && src->size() >= LLAMA_MTP_CHAIN_SAMP_N + n_u && "llama_set_mtp_chain_sampling: too few uniforms for the chain");
+
+    ggml_backend_tensor_set(samp, src->data(), 0, LLAMA_MTP_CHAIN_SAMP_N * sizeof(float));
+    ggml_backend_tensor_set(u, src->data() + LLAMA_MTP_CHAIN_SAMP_N, 0, n_u * sizeof(float));
+}
+
+bool llm_graph_input_mtp_chain_samp::can_reuse(const llm_graph_params & params) {
+    // the chain length follows from the ubatch shape, which allow_reuse already matched
+    return params.mtp_chain_samp == src && params.cparams.mtp_chain_top_k > 0;
+}
+
 //
 // llm_graph_result
 //
@@ -1597,6 +1613,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     samplers         (params.samplers),
     draft_vocab_ids  (params.draft_vocab_ids),
     draft_vocab_warned(params.draft_vocab_warned),
+    mtp_chain_samp   (params.mtp_chain_samp),
     cb_func          (params.cb),
     res              (params.res),
     model_ref        (params.model),
@@ -4522,6 +4539,41 @@ ggml_tensor * llm_graph_context::build_draft_vocab_logits(
 
     res->t_logits_ids = draft_vocab_ids;
 
+    return logits;
+}
+
+ggml_tensor * llm_graph_context::build_draft_vocab_logits_chain(
+        ggml_tensor * head_w,
+        ggml_tensor * head_s,
+        ggml_tensor * cur) const {
+    if (draft_vocab_ids == nullptr || head_w == nullptr) {
+        return nullptr;
+    }
+    if (hadamard_rotations && hadamard_rotations->count(head_w)) {
+        return draft_vocab_fallback(DRAFT_VOCAB_FALLBACK_HADAMARD, "the output head is Hadamard-rotated");
+    }
+    if (loras && !loras->empty()) {
+        return draft_vocab_fallback(DRAFT_VOCAB_FALLBACK_LORA, "a LoRA adapter is loaded");
+    }
+    if (head_s && ggml_nelements(head_s) != 1) {
+        return draft_vocab_fallback(DRAFT_VOCAB_FALLBACK_HEAD_SCALE, "the output head has a per-row scale");
+    }
+    if (draft_vocab_ids->ne[0] >= head_w->ne[1]) {
+        return draft_vocab_fallback(DRAFT_VOCAB_FALLBACK_NOT_SMALLER, "the map has as many rows as the head");
+    }
+    if (const char * why = draft_vocab_direct(head_w)) {
+        return draft_vocab_fallback(DRAFT_VOCAB_FALLBACK_HEAD_LAYOUT, why);
+    }
+    GGML_ASSERT(cur->ne[1] == 1);
+
+    const int64_t n_sel = draft_vocab_ids->ne[0];
+    ggml_ledger_addf("llama.draft_vocab", 1, "chain_shortlist n_sel=%lld", (long long) n_sel);
+
+    ggml_tensor * rows   = ggml_reshape_3d(ctx0, head_w, head_w->ne[0], 1, head_w->ne[1]);
+    ggml_tensor * logits = ggml_reshape_2d(ctx0, ggml_mul_mat_id(ctx0, rows, cur, draft_vocab_ids), n_sel, 1);
+    if (head_s) {
+        logits = ggml_mul(ctx0, logits, head_s);
+    }
     return logits;
 }
 
