@@ -149,6 +149,7 @@ if (LLAMA_LLGUIDANCE)
 endif ()
 
 llama_build(test-recurrent-state-rollback.cpp)
+llama_build(test-fit-recurrent-noalloc.cpp)
 llama_build(test-output-buffer-reuse.cpp)
 
 llama_build_and_test(test-gdn-ingredient-replay.cpp LABEL "turbo")
@@ -216,6 +217,16 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         ARGS -m "${MODEL_DIR}/qwen35-dense.gguf"
     )
     set_tests_properties(test-recurrent-state-rollback PROPERTIES
+        FIXTURES_REQUIRED generate-models
+    )
+
+    # the -fit probe (no_alloc) must size the recurrent state without allocating it
+    llama_test(
+        test-fit-recurrent-noalloc
+        LABEL main
+        ARGS -m "${MODEL_DIR}/qwen35-dense.gguf"
+    )
+    set_tests_properties(test-fit-recurrent-noalloc PROPERTIES
         FIXTURES_REQUIRED generate-models
     )
 
