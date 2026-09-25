@@ -1511,6 +1511,8 @@ struct ggml_cuda_stream_context {
 };
 
 struct ggml_backend_cuda_context {
+    struct retired_buf { char * ptr; size_t cap; int dev; };
+
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;
