@@ -61,6 +61,11 @@ static std::string common_speculative_get_devices_str(const std::vector<ggml_bac
     return result.empty() ? "default" : result;
 }
 
+// llama_get_kv_cache_type_k/v return GGML_TYPE_COUNT for memory without a single K/V type
+static const char * common_speculative_kv_type_name(ggml_type type) {
+    return type < GGML_TYPE_COUNT ? ggml_type_name(type) : "n/a";
+}
+
 static bool common_speculative_mtp_chain_enabled(const common_params_speculative_draft & params) {
     const char * env = getenv("LLAMA_SPEC_CHAIN");
     return params.chain || (env != nullptr && std::strcmp(env, "0") != 0);
@@ -208,8 +213,8 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
         SPC_TRC("- n_max=%d, n_min=%d, p_min=%f\n", this->params.n_max, this->params.n_min, this->params.p_min);
         SPC_TRC("- gpu_layers=%d, cache_k=%s, cache_v=%s, ctx_tgt=%s, ctx_dft=%s, devices=[%s]\n",
                 this->params.n_gpu_layers,
-                ggml_type_name(this->params.cache_type_k),
-                ggml_type_name(this->params.cache_type_v),
+                common_speculative_kv_type_name(llama_get_kv_cache_type_k(ctx_dft)),
+                common_speculative_kv_type_name(llama_get_kv_cache_type_v(ctx_dft)),
                 ctx_tgt ? "yes" : "no",
                 ctx_dft ? "yes" : "no",
                 common_speculative_get_devices_str(this->params.devices).c_str());
@@ -1476,8 +1481,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         SPC_TRC("- n_max=%d, n_min=%d, p_min=%.2f, n_embd=%d, backend_sampling=%d\n", this->params.n_max, this->params.n_min, this->params.p_min, n_embd, (int) this->params.backend_sampling);
         SPC_TRC("- gpu_layers=%d, cache_k=%s, cache_v=%s, ctx_tgt=%s, ctx_dft=%s, devices=[%s]\n",
                 this->params.n_gpu_layers,
-                ggml_type_name(this->params.cache_type_k),
-                ggml_type_name(this->params.cache_type_v),
+                common_speculative_kv_type_name(llama_get_kv_cache_type_k(ctx_dft)),
+                common_speculative_kv_type_name(llama_get_kv_cache_type_v(ctx_dft)),
                 ctx_tgt ? "yes" : "no",
                 ctx_dft ? "yes" : "no",
                 common_speculative_get_devices_str(this->params.devices).c_str());
@@ -3422,8 +3427,11 @@ common_params common_base_params_to_speculative(const common_params & params) {
         }
     }
 
-    result.cache_type_k  = params_spec.cache_type_k;
-    result.cache_type_v  = params_spec.cache_type_v;
+    // draft KV cache types: an unset flag (GGML_TYPE_COUNT) inherits the main context's -ctk / -ctv, so the drafter
+    // sees the same quantization error as the verifier; an explicit --spec-draft-type-k/-v wins, K and V independently.
+    // result.speculative.draft keeps the unresolved values so the draft context creation can log which were inherited
+    result.cache_type_k  = params_spec.cache_type_k != GGML_TYPE_COUNT ? params_spec.cache_type_k : params.cache_type_k;
+    result.cache_type_v  = params_spec.cache_type_v != GGML_TYPE_COUNT ? params_spec.cache_type_v : params.cache_type_v;
     result.n_outputs_max = params.n_parallel;
     result.n_outputs_max_per_seq = 1;
 
@@ -3493,6 +3501,12 @@ common_speculative_init_result::common_speculative_init_result(
 
     // the draft context holds as many tokens per sequence as the target context
     cparams.n_ctx = llama_n_ctx(ctx_tgt);
+
+    // params comes from common_base_params_to_speculative: cache_type_k/v hold the resolved types,
+    // speculative.draft.cache_type_k/v are GGML_TYPE_COUNT when the flag was not given
+    LOG_INF("%s: draft KV cache: K = %s (%s), V = %s (%s)\n", __func__,
+            ggml_type_name(cparams.type_k), params.speculative.draft.cache_type_k == GGML_TYPE_COUNT ? "inherited from -ctk" : "explicit -ctkd",
+            ggml_type_name(cparams.type_v), params.speculative.draft.cache_type_v == GGML_TYPE_COUNT ? "inherited from -ctv" : "explicit -ctvd");
 
     // note: for small models maybe we can set this to the maximum possible draft from all speculative types
     //       the extra memory for small models is likely negligible?
