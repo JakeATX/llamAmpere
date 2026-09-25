@@ -61,6 +61,8 @@ llama_memory_recurrent::llama_memory_recurrent(
         const bool   arch_ok = model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE ||
                                model.arch == LLM_ARCH_QWEN3NEXT;
         this->rs_ring = n_rs_seq > 0 && !this->gdn_replay && arch_ok && !env_off;
+        const char * env_rows = getenv("LLAMA_RS_RING_ROWS");
+        this->rs_ring_rows_all = this->rs_ring && env_rows != nullptr && strcmp(env_rows, "1") == 0;
     }
     rs_base.assign(mem_size, 0);
 
@@ -1711,7 +1713,11 @@ uint32_t llama_memory_recurrent_context::get_n_written() const {
         return 0;
     }
     const uint32_t K = mem->n_rs_seq + 1;
-    return std::min<uint32_t>(get_ubatch().n_seq_tokens, K);
+    const uint32_t n = get_ubatch().n_seq_tokens;
+    if (n >= K && !mem->rs_ring_rows_all) {
+        return 0; // fills the ring: b' = 0, the static copies write group g at plane g
+    }
+    return std::min<uint32_t>(n, K);
 }
 
 // a seq whose data moves cells this ubatch (relocated tail, or a seq_cp branch decoding away from
@@ -1740,7 +1746,7 @@ uint32_t llama_memory_recurrent_context::get_n_older() const {
     return rows;
 }
 
-void llama_memory_recurrent_context::fill_rs_ring(int32_t * copy, int32_t * wr, int32_t * wr_conv, int32_t * old_src, int32_t * old_dst) const {
+void llama_memory_recurrent_context::fill_rs_ring(int32_t * copy, int32_t * wr, int32_t * const * wr_conv, int32_t * old_src, int32_t * old_dst) const {
     GGML_ASSERT(get_rs_ring());
     const llama_ubatch & ubatch = get_ubatch();
     const uint32_t K         = mem->n_rs_seq + 1;
@@ -1748,8 +1754,9 @@ void llama_memory_recurrent_context::fill_rs_ring(int32_t * copy, int32_t * wr, 
     const uint32_t n_seqs    = ubatch.n_seqs;
     const uint32_t n_rs      = get_n_rs();
     const uint32_t size      = mem->size;
-    const uint32_t n_written = std::min(n, K);
+    const uint32_t n_written = get_n_written(); // 0: the static copies write the groups (b' = 0)
     const bool     older     = n < K;
+    GGML_ASSERT(n_written == 0 || (wr != nullptr && wr_conv != nullptr));
 
     uint32_t k_old = 0;
     for (uint32_t i = 0; i < n_rs; ++i) {
@@ -1784,8 +1791,8 @@ void llama_memory_recurrent_context::fill_rs_ring(int32_t * copy, int32_t * wr, 
         mem->rs_base[cell] = b_new;
         for (uint32_t g = 0; g < n_written; ++g) {
             const int32_t row = (int32_t) (((b_new + g) % K) * size + cell);
-            wr     [g * n_seqs + i]                   = row;
-            wr_conv[(n_written - 1 - g) * n_seqs + i] = row;
+            wr     [g * n_seqs + i]          = row;
+            wr_conv[n_written - 1 - g][i]    = row;
         }
         if (older && rs_ring_needs_older(mem, cell)) {
             for (uint32_t g = n; g < K; ++g) {

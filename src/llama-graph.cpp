@@ -387,13 +387,14 @@ void llm_graph_input_rs::fill_s_copy(const llama_memory_recurrent_context * m) {
             GGML_ASSERT(ggml_backend_buffer_is_host(t->buffer));
             return (int32_t *) t->data;
         };
-        GGML_ASSERT(rs_wr && rs_wr_conv.size() == n_written);
-        const int64_t n_seqs = m->get_ubatch().n_seqs;
-        std::vector<int32_t> wr_conv((size_t) n_written * n_seqs);
-        m->fill_rs_ring(data, host_data(rs_wr), wr_conv.data(), host_data(rs_old_src), host_data(rs_old_dst));
+        GGML_ASSERT((rs_wr != nullptr) == (n_written > 0) && rs_wr_conv.size() == n_written);
+        // host pointers of the per-slot conv row inputs (sized once per graph build)
+        rs_wr_conv_host.resize(n_written);
         for (uint32_t j = 0; j < n_written; ++j) {
-            memcpy(host_data(rs_wr_conv[j]), wr_conv.data() + (size_t) j * n_seqs, n_seqs * sizeof(int32_t));
+            rs_wr_conv_host[j] = host_data(rs_wr_conv[j]);
         }
+        m->fill_rs_ring(data, host_data(rs_wr), n_written > 0 ? rs_wr_conv_host.data() : nullptr,
+                host_data(rs_old_src), host_data(rs_old_dst));
         return;
     }
 
