@@ -195,8 +195,8 @@ static void build_reference(const case_def & c, case_data & d) {
     const double  scale = 1.0 / std::sqrt((double) D);
     const int64_t gqa   = c.n_head / c.n_head_kv;
     d.ref.assign(d.ref_rows.size() * size_t(c.n_head) * D, 0.0);
-    std::vector<double> logit(size_t(c.n_kv));
-    std::vector<double> acc(size_t(D));
+    std::vector<double> logit(static_cast<size_t>(c.n_kv));
+    std::vector<double> acc(static_cast<size_t>(D));
     for (size_t ri = 0; ri < d.ref_rows.size(); ++ri) {
         const int64_t j = d.ref_rows[ri];
         for (int64_t h = 0; h < c.n_head; ++h) {
