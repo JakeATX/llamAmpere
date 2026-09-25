@@ -1592,6 +1592,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     cross            (params.cross),
     hadamard_rotations(params.hadamard_rotations),
     hadamard_inverses (params.hadamard_inverses),
+    prec_policy      (params.prec_policy),
     samplers         (params.samplers),
     draft_vocab_ids  (params.draft_vocab_ids),
     cb_func          (params.cb),
@@ -1692,6 +1693,10 @@ ggml_tensor * llm_graph_context::build_lora_mm(
         res = ggml_mul_mat(ctx0, w, cur_mm);
     }
 
+    if (prec_policy) {
+        prec_policy->apply(res);
+    }
+
     if (w_s) {
         res = ggml_mul(ctx0, res, w_s);
     }
@@ -1751,6 +1756,10 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
     }
 
     ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur_mm, ids);
+
+    if (prec_policy) {
+        prec_policy->apply(res);
+    }
 
     if (w_s) {
         const int64_t n_expert = w_s->ne[0];
