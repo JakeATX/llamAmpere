@@ -143,6 +143,30 @@ static __global__ void k_exl3_glue_out(const float * __restrict__ part, const fl
     }
 }
 
+// y[i] = scale * sum_ks part[ks][i] over the flat [T][N], one thread per element: the no-svh glue_out when N % 128 != 0
+// (N % 16 only). Same summation order as exl3_sum_partials, so the result matches the 128-chunk kernel bit for bit.
+static __global__ void k_exl3_glue_out_flat(const float * __restrict__ part, float * __restrict__ y, const size_t n,
+                                            const int ksplit, const size_t ks_stride, const float scale) {
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    const float * p = part + i;
+    float v = 0.0f;
+    int ks = 0;
+    for (; ks + 4 <= ksplit; ks += 4) {
+        const float a0 = p[(size_t) ks * ks_stride];
+        const float a1 = p[(size_t) (ks + 1) * ks_stride];
+        const float a2 = p[(size_t) (ks + 2) * ks_stride];
+        const float a3 = p[(size_t) (ks + 3) * ks_stride];
+        v += (a0 + a1) + (a2 + a3);
+    }
+    for (; ks < ksplit; ++ks) {
+        v += p[(size_t) ks * ks_stride];
+    }
+    y[i] = v * scale;
+}
+
 template <typename OUT>
 static void exl3_glue_in(const float * x, const float * suh, OUT * out, const int K, const int64_t T, const float scale, cudaStream_t stream) {
     GGML_ASSERT(K % 128 == 0);
@@ -160,9 +184,14 @@ void ggml_cuda_exl3_glue_in_f16(const float * x, const float * suh, half * out, 
 }
 
 void ggml_cuda_exl3_glue_out(const float * part, const float * svh, float * y, const int N, const int64_t T, const int ksplit, const float scale, cudaStream_t stream) {
+    const size_t ks_stride = (size_t) T * N;
+    if (svh == nullptr && N % 128 != 0) {   // no Hadamard: plain per-element split-K sum
+        const int nb = (int) ((ks_stride + 255) / 256);
+        k_exl3_glue_out_flat<<<nb, 256, 0, stream>>>(part, y, ks_stride, ksplit, ks_stride, scale);
+        return;
+    }
     GGML_ASSERT(N % 128 == 0);
     const size_t n_chunks = (size_t) T * N / 128;
-    const size_t ks_stride = (size_t) T * N;
     const int nb = (int) ((n_chunks + 3) / 4);
     if (svh) {
         k_exl3_glue_out<true ><<<nb, 128, 0, stream>>>(part, svh, y, N, n_chunks, ksplit, ks_stride, scale);

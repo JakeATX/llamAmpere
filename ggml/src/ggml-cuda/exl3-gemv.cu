@@ -852,7 +852,9 @@ void ggml_cuda_exl3_gemv(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
 
     // x -> fp16 [T][K], pre-scaled (and suh * / Hadamard when fused)
     ggml_cuda_pool_alloc<half> xh(ctx.pool(id), (size_t) T * K);
-    const bool fused = exl3_gemv_fused_enabled();
+    // the fused phase 3 walks 128-chunks of [T][N]: without svh and N % 128 != 0 it would drop the T*N % 128 tail,
+    // so that shape takes the split glue (its glue_out has a per-element path)
+    const bool fused = exl3_gemv_fused_enabled() && (svh != nullptr || N % 128 == 0);
     if (!fused) {
         ggml_cuda_exl3_glue_in_f16((const float *) src1->data, suh, xh.get(), K, T, EXL3_GEMV_X_SCALE, stream);
     }
