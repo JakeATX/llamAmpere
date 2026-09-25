@@ -1533,8 +1533,8 @@ struct ggml_backend_cuda_context {
     // Per-graph-eval shared-quantize cache for the mmvq path. Several matvecs in one decode
     // layer consume the same normed activation (Q/V/K read attn_norm; the router, fused
     // gate/up and shared-expert gate read attn_post_norm), and each used to re-quantize it to
-    // q8_1 — ~60% of all quantize launches were duplicates. The most recent quantization is
-    // kept in a persistent device buffer and reused when the same src1 tensor is seen again in
+    // q8_1 — ~60% of all quantize launches were duplicates. The two most recent quantizations
+    // are kept in persistent device buffers and reused when the same src1 tensor is seen again in
     // the same graph eval with identical layout. Stream ordering makes overwrite safe (all
     // consumers of the previous entry are already enqueued before the next quantize runs),
     // and the buffer only grows on shape changes, which force a CUDA-graph re-capture anyway.
@@ -1543,7 +1543,9 @@ struct ggml_backend_cuda_context {
     // collide into one decorated name and the linker rejects the object (LNK1179).
     struct retired_buf { char * ptr; size_t cap; int dev; };
 
-    struct {
+    // Two entries: a layer can quantize one activation in both layouts (IQ4_XS swizzled and plain)
+    // and read the first layout again after the second one.
+    struct q8_cache_entry {
         char *              ptr  = nullptr;      // raw device memory (not pool), grow-only
         size_t              cap  = 0;            // usable bytes
         int                 dev  = -1;           // device the buffer was allocated on
@@ -1552,7 +1554,13 @@ struct ggml_backend_cuda_context {
         uint64_t            epoch = 0;           // valid only within this graph eval
         size_t              size = 0;            // quantized bytes
         int64_t             ne10_padded = 0;     // layout keys
-        ggml_type           type = GGML_TYPE_COUNT;
+        bool                swizzle_iq4 = false;
+        uint64_t            last_use = 0;        // LRU order
+    };
+
+    struct {
+        q8_cache_entry entries[2];
+        uint64_t       tick = 0;
         std::vector<retired_buf> retired;        // outgrown buffers, freed at teardown (captured graphs may still use them)
     } q8_cache;
 

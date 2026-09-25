@@ -7455,14 +7455,16 @@ struct test_mul_mat_residual_fusion : public test_case {
 
 // Two quantized matvecs that consume the same activation in one graph: the second one must
 // hit the shared-quantize cache and still match the CPU result.
+// With type_b set, the graph is type, type_b, type: the third matvec must reuse the first quantization.
 struct test_mul_mat_shared_src1 : public test_case {
     const ggml_type type;
     const int64_t m;
     const int64_t n;
     const int64_t k;
+    const ggml_type type_b;
 
-    test_mul_mat_shared_src1(ggml_type type, int64_t m, int64_t n, int64_t k)
-        : type(type), m(m), n(n), k(k) {}
+    test_mul_mat_shared_src1(ggml_type type, int64_t m, int64_t n, int64_t k, ggml_type type_b = GGML_TYPE_COUNT)
+        : type(type), m(m), n(n), k(k), type_b(type_b) {}
 
     // The shared-quantize cache lives on the mmvq path, and ggml_cuda_should_use_mmvq picks that
     // path from a per-architecture table: the lowest bound among the types tested here is ne11 <= 6
@@ -7475,7 +7477,10 @@ struct test_mul_mat_shared_src1 : public test_case {
     }
 
     std::string vars() override {
-        return VARS_TO_STR4(type, m, n, k);
+        if (type_b == GGML_TYPE_COUNT) {
+            return VARS_TO_STR4(type, m, n, k);
+        }
+        return VARS_TO_STR5(type, type_b, m, n, k);
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -7497,6 +7502,14 @@ struct test_mul_mat_shared_src1 : public test_case {
         ggml_set_name(a1, "a1");
         ggml_set_name(a2, "a2");
         ggml_set_name(b, "b");
+
+        if (type_b != GGML_TYPE_COUNT) {
+            ggml_tensor * ab = ggml_new_tensor_2d(ctx, type_b, k, m);
+            ggml_set_name(ab, "ab");
+            ggml_tensor * out = ggml_add(ctx, ggml_add(ctx, ggml_mul_mat(ctx, a1, b), ggml_mul_mat(ctx, ab, b)), ggml_mul_mat(ctx, a2, b));
+            ggml_set_name(out, "out");
+            return out;
+        }
 
         ggml_tensor * out = ggml_add(ctx, ggml_mul_mat(ctx, a1, b), ggml_mul_mat(ctx, a2, b));
         ggml_set_name(out, "out");
@@ -9808,6 +9821,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int ntok : {1, 4}) {
             test_cases.emplace_back(new test_moe_reduce_fusion(type, 64, 256, 8, 4, ntok));
         }
+    }
+    // one activation quantized in both q8_1 layouts (IQ4_XS swizzled, plain), and two types with the plain layout
+    for (int n : {1, 4}) {
+        test_cases.emplace_back(new test_mul_mat_shared_src1(GGML_TYPE_IQ4_XS, 64, n, 256, GGML_TYPE_Q8_0));
+        test_cases.emplace_back(new test_mul_mat_shared_src1(GGML_TYPE_Q8_0, 64, n, 256, GGML_TYPE_Q6_K));
     }
     test_cases.emplace_back(new test_elem_chain_fusion({256, 4, 2, 1}, false));
     test_cases.emplace_back(new test_elem_chain_fusion({256, 4, 2, 1}, true));

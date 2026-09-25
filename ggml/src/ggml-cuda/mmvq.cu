@@ -2111,48 +2111,72 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
     const size_t  q8_bytes = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
 
-    // Shared-quantize cache: reuse the previous quantization when the same src1 tensor is
+    // Shared-quantize cache: reuse an earlier quantization when the same src1 tensor is
     // consumed again in this graph eval with the same layout (see q8_cache in common.cuh).
+    // The layout depends on src0->type only through the IQ4_XS swizzle (quantize_row_q8_1_cuda).
     // ConvRot types and MUL_MAT_ID stay uncached; oversized batches fall back too.
     auto & qc = ctx.q8_cache;
     static const bool q8_cache_disabled = getenv("GGML_CUDA_Q8CACHE") != nullptr && atoi(getenv("GGML_CUDA_Q8CACHE")) == 0;
     // Main stream only: a sibling stream could consume the buffer with no cross-stream ordering.
     const bool q8_cacheable = !q8_cache_disabled && !convrot && ids == nullptr && q8_bytes <= (1u << 20) &&
                               ctx.curr_stream_no == 0;
-    const bool q8_hit = q8_cacheable && qc.epoch == ctx.graph_epoch && qc.src1 == src1 &&
-                        qc.data == src1->data && qc.size == q8_bytes &&
-                        qc.ne10_padded == ne10_padded && qc.type == src0->type &&
-                        qc.dev == ctx.device;
+    const bool q8_swizzle = src0->type == GGML_TYPE_IQ4_XS;
+    ggml_backend_cuda_context::q8_cache_entry * qe = nullptr;
+    bool q8_hit = false;
+    if (q8_cacheable) {
+        for (auto & e : qc.entries) {
+            if (e.epoch == ctx.graph_epoch && e.src1 == src1 && e.data == src1->data && e.size == q8_bytes &&
+                e.ne10_padded == ne10_padded && e.swizzle_iq4 == q8_swizzle && e.dev == ctx.device) {
+                qe = &e;
+                q8_hit = true;
+                break;
+            }
+        }
+        if (!q8_hit) {
+            // replace an entry from an older graph eval first, else the least recently used one
+            qe = &qc.entries[0];
+            for (auto & e : qc.entries) {
+                if (e.epoch != ctx.graph_epoch) {
+                    qe = &e;
+                    break;
+                }
+                if (e.last_use < qe->last_use) {
+                    qe = &e;
+                }
+            }
+        }
+        qe->last_use = ++qc.tick;
+    }
 
     ggml_cuda_pool_alloc<char> src1_q8_1_local(ctx.pool());
     char * src1_q8_1 = nullptr;
 
     if (q8_hit) {
         ctx.fusion_stats.q8_cache_hits++;
-        src1_q8_1 = qc.ptr;
+        src1_q8_1 = qe->ptr;
     } else {
         if (q8_cacheable) {
-            if (qc.dev != ctx.device || qc.cap < q8_bytes) {
+            if (qe->dev != ctx.device || qe->cap < q8_bytes) {
                 // Never free a buffer here: a CUDA graph captured earlier may still replay
                 // kernels that point at it (several graphs per context with --n-cpu-moe splits).
                 // Retire it and release everything at context teardown instead.
-                if (qc.ptr != nullptr) {
-                    qc.retired.push_back({ qc.ptr, qc.cap, qc.dev });
+                if (qe->ptr != nullptr) {
+                    qc.retired.push_back({ qe->ptr, qe->cap, qe->dev });
                 }
                 // Plain device memory, not pool memory: the pool frees strict LIFO, and this
                 // buffer is taken while transient pool allocations sit below it. CUDA graph
                 // capture runs in relaxed mode, which allows cudaMalloc during capture.
-                CUDA_CHECK(ggml_cuda_device_malloc((void **) &qc.ptr, q8_bytes, ctx.device));
-                qc.cap = q8_bytes;
-                qc.dev = ctx.device;
+                CUDA_CHECK(ggml_cuda_device_malloc((void **) &qe->ptr, q8_bytes, ctx.device));
+                qe->cap = q8_bytes;
+                qe->dev = ctx.device;
             }
-            src1_q8_1 = qc.ptr;
-            qc.src1        = src1;
-            qc.data        = src1->data;
-            qc.epoch       = ctx.graph_epoch;
-            qc.size        = q8_bytes;
-            qc.ne10_padded = ne10_padded;
-            qc.type        = src0->type;
+            src1_q8_1 = qe->ptr;
+            qe->src1        = src1;
+            qe->data        = src1->data;
+            qe->epoch       = ctx.graph_epoch;
+            qe->size        = q8_bytes;
+            qe->ne10_padded = ne10_padded;
+            qe->swizzle_iq4 = q8_swizzle;
         } else {
             src1_q8_1 = src1_q8_1_local.alloc(q8_bytes);
         }

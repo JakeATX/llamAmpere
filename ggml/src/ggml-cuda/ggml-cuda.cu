@@ -747,7 +747,9 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         }
     };
 
-    free_buf(q8_cache.ptr, q8_cache.dev);
+    for (const auto & e : q8_cache.entries) {
+        free_buf(e.ptr, e.dev);
+    }
     for (const auto & r : q8_cache.retired) {
         free_buf(r.ptr, r.dev);
     }
@@ -756,7 +758,9 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         free_buf(r.ptr, r.dev);
     }
 
-    q8_cache.ptr = nullptr;
+    for (auto & e : q8_cache.entries) {
+        e.ptr = nullptr;
+    }
     q8_cache.retired.clear();
     tq_rot_cache.ptr = nullptr;
     tq_rot_cache.retired.clear();
