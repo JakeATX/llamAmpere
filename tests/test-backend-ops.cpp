@@ -7243,6 +7243,36 @@ struct test_concat : public test_case {
     }
 };
 
+// GGML_OP_CONCAT as the gated delta net builds its conv input: the kept conv state columns
+// [d_conv - 1, channels, n_seqs] ++ the transposed new rows [n_tokens, channels, n_seqs] along dim 0
+struct test_concat_conv_input : public test_case {
+    const int64_t d_conv_m1;
+    const int64_t channels;
+    const int64_t n_tokens;
+    const int64_t n_seqs;
+
+    std::string vars() override {
+        return VARS_TO_STR4(d_conv_m1, channels, n_tokens, n_seqs);
+    }
+
+    test_concat_conv_input(int64_t d_conv_m1 = 3, int64_t channels = 10240, int64_t n_tokens = 4, int64_t n_seqs = 1)
+        : d_conv_m1(d_conv_m1), channels(channels), n_tokens(n_tokens), n_seqs(n_seqs) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * states = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_conv_m1, channels, n_seqs);
+        ggml_set_name(states, "states");
+        ggml_tensor * qkv = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, channels, n_tokens, n_seqs);
+        ggml_set_name(qkv, "qkv");
+        ggml_tensor * qkv_t = ggml_transpose(ctx, qkv);
+        ggml_set_name(qkv_t, "qkv_t");
+
+        ggml_tensor * out = ggml_concat(ctx, states, qkv_t, 0);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // GGML_OP_ARGSORT
 struct test_argsort : public test_case {
     const ggml_type type;
@@ -7662,14 +7692,16 @@ struct test_mul_mat_residual_fusion : public test_case {
 
 // Two quantized matvecs that consume the same activation in one graph: the second one must
 // hit the shared-quantize cache and still match the CPU result.
+// With type_b set, the graph is type, type_b, type: the third matvec must reuse the first quantization.
 struct test_mul_mat_shared_src1 : public test_case {
     const ggml_type type;
     const int64_t m;
     const int64_t n;
     const int64_t k;
+    const ggml_type type_b;
 
-    test_mul_mat_shared_src1(ggml_type type, int64_t m, int64_t n, int64_t k)
-        : type(type), m(m), n(n), k(k) {}
+    test_mul_mat_shared_src1(ggml_type type, int64_t m, int64_t n, int64_t k, ggml_type type_b = GGML_TYPE_COUNT)
+        : type(type), m(m), n(n), k(k), type_b(type_b) {}
 
     // The shared-quantize cache lives on the mmvq path, and ggml_cuda_should_use_mmvq picks that
     // path from a per-architecture table: the lowest bound among the types tested here is ne11 <= 6
@@ -7682,7 +7714,10 @@ struct test_mul_mat_shared_src1 : public test_case {
     }
 
     std::string vars() override {
-        return VARS_TO_STR4(type, m, n, k);
+        if (type_b == GGML_TYPE_COUNT) {
+            return VARS_TO_STR4(type, m, n, k);
+        }
+        return VARS_TO_STR5(type, type_b, m, n, k);
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -7704,6 +7739,14 @@ struct test_mul_mat_shared_src1 : public test_case {
         ggml_set_name(a1, "a1");
         ggml_set_name(a2, "a2");
         ggml_set_name(b, "b");
+
+        if (type_b != GGML_TYPE_COUNT) {
+            ggml_tensor * ab = ggml_new_tensor_2d(ctx, type_b, k, m);
+            ggml_set_name(ab, "ab");
+            ggml_tensor * out = ggml_add(ctx, ggml_add(ctx, ggml_mul_mat(ctx, a1, b), ggml_mul_mat(ctx, ab, b)), ggml_mul_mat(ctx, a2, b));
+            ggml_set_name(out, "out");
+            return out;
+        }
 
         ggml_tensor * out = ggml_add(ctx, ggml_mul_mat(ctx, a1, b), ggml_mul_mat(ctx, a2, b));
         ggml_set_name(out, "out");
@@ -7773,6 +7816,83 @@ struct test_elem_chain_fusion : public test_case {
         cur = ggml_clamp(ctx, cur, -4.0f, 4.0f);
         ggml_set_name(cur, "out");
         return cur;
+    }
+};
+
+// CONT of the gate half of a joint Q+gate projection, then SIGMOID and MUL (the Qwen3.5 attention
+// gate): the chain must read the strided view in place of the CONT output.
+struct test_elem_chain_cont_head : public test_case {
+    const int64_t head_dim;
+    const int64_t n_head;
+    const int64_t n_tokens;
+
+    test_elem_chain_cont_head(int64_t head_dim, int64_t n_head, int64_t n_tokens)
+        : head_dim(head_dim), n_head(n_head), n_tokens(n_tokens) {}
+
+    std::string vars() override {
+        return VARS_TO_STR3(head_dim, n_head, n_tokens);
+    }
+
+    const char * required_fusion() override { return "elem_chain"; }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "ELEM_CHAIN_FUSION";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * qg   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2*head_dim, n_head, n_tokens);
+        ggml_tensor * attn = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head_dim*n_head, n_tokens);
+        ggml_set_name(qg, "qg");
+        ggml_set_name(attn, "attn");
+
+        ggml_tensor * gate = ggml_view_3d(ctx, qg, head_dim, n_head, n_tokens, qg->nb[1], qg->nb[2], head_dim*ggml_element_size(qg));
+        gate = ggml_cont_2d(ctx, gate, head_dim*n_head, n_tokens);
+        ggml_tensor * out = ggml_mul(ctx, attn, ggml_sigmoid(ctx, gate));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// concat(rms_norm(e)*w_e, rms_norm(h)*w_h, dim 0), the MTP block input. Over one row the CUDA
+// backend writes both fused norms straight into the concat output (norm_pair_concat); more rows
+// are coverage of the unfused path.
+struct test_norm_pair_concat : public test_case {
+    const int64_t n_embd;
+    const int64_t n_tokens;
+
+    test_norm_pair_concat(int64_t n_embd, int64_t n_tokens) : n_embd(n_embd), n_tokens(n_tokens) {}
+
+    std::string vars() override {
+        return VARS_TO_STR2(n_embd, n_tokens);
+    }
+
+    const char * required_fusion() override { return n_tokens == 1 ? "norm_pair_concat" : nullptr; }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "NORM_PAIR_CONCAT_FUSION";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * e  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_tensor * h  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_tensor * we = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd);
+        ggml_tensor * wh = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd);
+        ggml_set_name(e, "e");
+        ggml_set_name(h, "h");
+        ggml_set_name(we, "we");
+        ggml_set_name(wh, "wh");
+
+        ggml_tensor * e_norm = ggml_mul(ctx, ggml_rms_norm(ctx, e, 1e-6f), we);
+        ggml_tensor * h_norm = ggml_mul(ctx, ggml_rms_norm(ctx, h, 1e-6f), wh);
+        ggml_tensor * out = ggml_concat(ctx, e_norm, h_norm, 0);
+        ggml_set_name(out, "out");
+        return out;
     }
 };
 
@@ -10021,11 +10141,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_moe_reduce_fusion(type, 64, 256, 8, 4, ntok));
         }
     }
+    // one activation quantized in both q8_1 layouts (IQ4_XS swizzled, plain), and two types with the plain layout
+    for (int n : {1, 4}) {
+        test_cases.emplace_back(new test_mul_mat_shared_src1(GGML_TYPE_IQ4_XS, 64, n, 256, GGML_TYPE_Q8_0));
+        test_cases.emplace_back(new test_mul_mat_shared_src1(GGML_TYPE_Q8_0, 64, n, 256, GGML_TYPE_Q6_K));
+    }
     test_cases.emplace_back(new test_elem_chain_fusion({256, 4, 2, 1}, false));
     test_cases.emplace_back(new test_elem_chain_fusion({256, 4, 2, 1}, true));
     test_cases.emplace_back(new test_elem_chain_fusion({256, 4, 2, 1}, false, true));
     test_cases.emplace_back(new test_elem_chain_fusion({256, 4, 2, 1}, false, false, false, 0.25f));
     test_cases.emplace_back(new test_elem_chain_fusion({4096, 64, 1, 1}, false, false, true));
+    for (int64_t t : {1, 4}) {
+        test_cases.emplace_back(new test_elem_chain_cont_head(128, 4, t));
+    }
+    for (int64_t t : {1, 4}) {
+        test_cases.emplace_back(new test_norm_pair_concat(256, t));
+        test_cases.emplace_back(new test_norm_pair_concat(5120, t));
+    }
     std::default_random_engine rng(0);
 
     // unary ops
@@ -11932,6 +12064,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_concat(GGML_TYPE_I64, {11, 12, 13, 14}, 7, dim, v));
         }
     }
+
+    // short non-contiguous rows (flat grid) and a long one (one block per row)
+    test_cases.emplace_back(new test_concat_conv_input(3, 10240, 4, 1));
+    test_cases.emplace_back(new test_concat_conv_input(3, 10240, 1, 1));
+    test_cases.emplace_back(new test_concat_conv_input(3, 1000, 5, 3));
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {300, 5, 3, 2}, 7, 0, 1));
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 999, 2, 2}, 4, 0, 2));
 
     for (ggml_type type_a : { GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0 }) {
         for (int v : { 0, 4, 8, 12 }) {

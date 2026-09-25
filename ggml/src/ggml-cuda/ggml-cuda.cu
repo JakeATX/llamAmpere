@@ -744,7 +744,9 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         }
     };
 
-    free_buf(q8_cache.ptr, q8_cache.dev);
+    for (const auto & e : q8_cache.entries) {
+        free_buf(e.ptr, e.dev);
+    }
     for (const auto & r : q8_cache.retired) {
         free_buf(r.ptr, r.dev);
     }
@@ -769,7 +771,9 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         free_buf((char *) s.n_miss,      s.dev);
     }
 
-    q8_cache.ptr = nullptr;
+    for (auto & e : q8_cache.entries) {
+        e.ptr = nullptr;
+    }
     q8_cache.retired.clear();
     tq_rot_cache.ptr = nullptr;
     tq_rot_cache.retired.clear();
@@ -5009,6 +5013,30 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+// Row stride in floats of an f32 tensor whose rows (dims 1-3 flattened) sit at one uniform stride, else -1.
+static int64_t ggml_cuda_chain_row_stride(const ggml_tensor * t) {
+    if (t->type != GGML_TYPE_F32 || t->nb[0] != sizeof(float)) {
+        return -1;
+    }
+    size_t s1     = 0;
+    size_t expect = 0;
+    for (int d = 1; d < GGML_MAX_DIMS; ++d) {
+        if (t->ne[d] == 1) {
+            continue;
+        }
+        if (s1 == 0) {
+            s1 = t->nb[d];
+        } else if (t->nb[d] != expect) {
+            return -1;
+        }
+        expect = t->nb[d]*t->ne[d];
+    }
+    if (s1 == 0) {
+        return t->ne[0];
+    }
+    return s1 % sizeof(float) == 0 ? (int64_t) (s1/sizeof(float)) : -1;
+}
+
 // Elementwise chain ("midi-kernel"): collapse a run of consecutive same-shape elementwise
 // ops into a single kernel that keeps the value in a register across the whole run. Saves a
 // dispatch AND a full HBM round trip per elided op. Typical runs on hybrid MoE graphs are
@@ -5058,15 +5086,29 @@ static int ggml_cuda_fuse_elem_chain(ggml_backend_cuda_context & ctx, const ggml
     tq_chain_desc desc = {};
     const ggml_tensor * head_src = nullptr;
     int len = 0;
+    int head_off = 0;   // 1 when node i is a CONT that the chain folds into its head read
 
     if (!disable_chain) {
         const ggml_tensor * prev = nullptr;
-        for (int j = i; j < cgraph->n_nodes && len < TQ_CHAIN_MAX_OPS; ++j) {
+        // CONT of a row-strided f32 view (e.g. the attention gate half of a joint Q+gate
+        // projection): the chain reads the view in place and the copy is not run.
+        if (cgraph->nodes[i]->op == GGML_OP_CONT && chain_ok_tensor(cgraph->nodes[i])) {
+            const ggml_tensor * cont = cgraph->nodes[i];
+            const int64_t s1 = ggml_cuda_chain_row_stride(cont->src[0]);
+            if (s1 > 0 && ggml_nelements(cont->src[0]) == ggml_nelements(cont)) {
+                head_src     = cont->src[0];
+                desc.src_ne0 = head_src->ne[0];
+                desc.src_s1  = s1;
+                prev         = cont;
+                head_off     = 1;
+            }
+        }
+        for (int j = i + head_off; j < cgraph->n_nodes && len < TQ_CHAIN_MAX_OPS; ++j) {
             ggml_tensor * nd = cgraph->nodes[j];
             int code = 0; float p0 = 0.0f, p1 = 0.0f;
 
             if (!chain_ok_tensor(nd) || !chain_code(nd, code, p0, p1)) break;
-            if (len > 0 && !ggml_are_same_shape(nd, cgraph->nodes[i])) break;
+            if ((len > 0 || head_off) && !ggml_are_same_shape(nd, cgraph->nodes[i])) break;
 
             const bool binary = (nd->op == GGML_OP_ADD || nd->op == GGML_OP_MUL || nd->op == GGML_OP_DIV);
             const ggml_tensor * a = nd->src[0];
@@ -5082,7 +5124,7 @@ static int ggml_cuda_fuse_elem_chain(ggml_backend_cuda_context & ctx, const ggml
             const ggml_tensor * other = nullptr;
             int chain_lhs = 1;
 
-            if (len == 0) {
+            if (len == 0 && !head_off) {
                 // the value we carry must be a full-size tensor, not the broadcast scalar
                 if (ggml_nelements(a) != ggml_nelements(nd)) break;
                 head_src = a;
@@ -5116,19 +5158,20 @@ static int ggml_cuda_fuse_elem_chain(ggml_backend_cuda_context & ctx, const ggml
         }
     }
 
-    if (len >= 2) {
-        ggml_tensor * out = cgraph->nodes[i + len - 1];
-        ggml_op ops_ch[TQ_CHAIN_MAX_OPS];
-        for (int k = 0; k < len; ++k) {
+    const int n_nodes = head_off + len;
+    if (len >= 1 && n_nodes >= 2) {
+        ggml_tensor * out = cgraph->nodes[i + n_nodes - 1];
+        ggml_op ops_ch[TQ_CHAIN_MAX_OPS + 1];
+        for (int k = 0; k < n_nodes; ++k) {
             ops_ch[k] = cgraph->nodes[i + k]->op;
         }
-        const int out_ch[1] = { i + len - 1 };
+        const int out_ch[1] = { i + n_nodes - 1 };
 
         // A run of same-op ADDs or MULs over same-layout operands, chained through src0, is what
         // the tuned multi-ADD/MUL kernels in ggml_cuda_try_fuse() take, and they are a little
         // faster than the chain kernel for it (MI210, four ADDs over 4096x64 f32: 3.75-3.96 us
         // per run tuned vs 4.0 us chain). Leave that pattern to them.
-        {
+        if (!head_off) {
             bool pure_run = (ops_ch[0] == GGML_OP_ADD || ops_ch[0] == GGML_OP_MUL);
             for (int k = 0; k < len && pure_run; ++k) {
                 const ggml_tensor * nd = cgraph->nodes[i + k];
@@ -5167,7 +5210,7 @@ static int ggml_cuda_fuse_elem_chain(ggml_backend_cuda_context & ctx, const ggml
                 if (!desc.other[k]) {
                     continue;
                 }
-                const ggml_tensor * nd = cgraph->nodes[i + k];
+                const ggml_tensor * nd = cgraph->nodes[i + head_off + k];
                 const ggml_tensor * ot = desc.chain_is_lhs[k] ? nd->src[1] : nd->src[0];
                 const size_t on = ggml_nbytes(ot);
                 if (desc.bcast[k]) {
@@ -5180,19 +5223,80 @@ static int ggml_cuda_fuse_elem_chain(ggml_backend_cuda_context & ctx, const ggml
 
         if (!alias_veto &&
             ggml_are_same_shape(out, cgraph->nodes[i]) &&
-            ggml_can_fuse_subgraph(cgraph, i, len, ops_ch, out_ch, 1)) {
+            ggml_can_fuse_subgraph(cgraph, i, n_nodes, ops_ch, out_ch, 1)) {
 
             desc.n_ops = len;
             ctx.fusion_stats.elem_chain++;
             ggml_cuda_op_elem_chain(ctx, (const float *) head_src->data,
                                     (float *) out->data, ggml_nelements(out), desc);
-            return len - 1;   // nodes consumed beyond this one
+            return n_nodes - 1;   // nodes consumed beyond this one
         }
     }
     return -1;
 }
 
 // try and fuse nodes and return the number of nodes to skip
+// nodes [i, i+4] = RMS_NORM, MUL, RMS_NORM, MUL, CONCAT(dim 0) over a single row, with the two
+// MULs as the concat's only consumers of the norms. Returns the extra node count consumed, or -1.
+static int ggml_cuda_fuse_norm_pair_concat(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+    if (!ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_CONCAT }, { i + 4 })) {
+        return -1;
+    }
+    if (!ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {}) ||
+        !ggml_cuda_can_fuse(cgraph, i + 2, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
+        return -1;
+    }
+
+    ggml_tensor * norm_a = cgraph->nodes[i];
+    ggml_tensor * mul_a  = cgraph->nodes[i + 1];
+    ggml_tensor * norm_b = cgraph->nodes[i + 2];
+    ggml_tensor * mul_b  = cgraph->nodes[i + 3];
+    ggml_tensor * concat = cgraph->nodes[i + 4];
+
+    if (ggml_get_op_params_i32(concat, 0) != 0 || concat->type != GGML_TYPE_F32 || !ggml_is_contiguous(concat) ||
+        ggml_nrows(concat) != 1) {
+        return -1;
+    }
+    const bool a_first = concat->src[0] == mul_a && concat->src[1] == mul_b;
+    const bool b_first = concat->src[0] == mul_b && concat->src[1] == mul_a;
+    if (!a_first && !b_first) {
+        return -1;
+    }
+    for (const ggml_tensor * m : { mul_a, mul_b }) {
+        if (!ggml_is_contiguous(m) || ggml_nrows(m) != 1) {
+            return -1;
+        }
+    }
+    if (concat->src[0]->ne[0] + concat->src[1]->ne[0] != concat->ne[0]) {
+        return -1;
+    }
+
+    // the fused kernels write the concat output while later inputs are still to be read
+    const char * c0 = (const char *) concat->data;
+    const char * c1 = c0 + ggml_nbytes(concat);
+    for (const ggml_tensor * n : { norm_a, mul_a, norm_b, mul_b }) {
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            const ggml_tensor * src = n->src[s];
+            if (src == nullptr || src == norm_a || src == norm_b) {
+                continue;
+            }
+            const char * s0 = (const char *) src->data;
+            const char * s1 = s0 + ggml_nbytes(src);
+            if (s0 < c1 && c0 < s1) {
+                return -1;
+            }
+        }
+    }
+
+    float * dst0 = (float *) concat->data;
+    float * dst_a = a_first ? dst0 : dst0 + mul_b->ne[0];
+    float * dst_b = a_first ? dst0 + mul_a->ne[0] : dst0;
+    ggml_cuda_op_rms_norm_fused(ctx, norm_a, mul_a, dst_a);
+    ggml_cuda_op_rms_norm_fused(ctx, norm_b, mul_b, dst_b);
+    ctx.fusion_stats.norm_pair_concat++;
+    return 4;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -5947,6 +6051,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (fused_mul_mat_vec) {
         return fused_node_count - 1;
+    }
+
+    // Two RMS_NORM+MUL pairs joined by a dim-0 CONCAT over one row (the MTP block input
+    // e_norm ++ h_norm): each fused norm writes its half of the concat output directly and the
+    // concat copy is not run. Same kernels and inputs as the unfused path, so the bytes match.
+    {
+        const int n_pair_concat = ggml_cuda_fuse_norm_pair_concat(*cuda_ctx, cgraph, i);
+        if (n_pair_concat >= 0) {
+            return n_pair_concat;
+        }
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
@@ -7685,6 +7799,9 @@ int64_t ggml_backend_cuda_fusion_count(ggml_backend_t backend, const char * name
     }
     if (strcmp(name, "mul_mat_glu") == 0) {
         return ctx->fusion_stats.mul_mat_glu;
+    }
+    if (strcmp(name, "norm_pair_concat") == 0) {
+        return ctx->fusion_stats.norm_pair_concat;
     }
     return -1;
 }

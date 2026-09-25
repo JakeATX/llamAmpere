@@ -532,7 +532,7 @@ void ggml_cuda_op_rms_norm_scale_fused(ggml_backend_cuda_context & ctx, ggml_ten
     rms_norm_f32_cuda<true>(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream, scale);
 }
 
-void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor) {
+void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor, float * dst_override) {
     const ggml_tensor * rms_norm_src = (ggml_tensor *) dst->src[0];
     float eps = 0.0f;
 
@@ -552,7 +552,7 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
         GGML_ASSERT(false);
     }
 
-    float * dst_d = (float *) mul_tensor->data;
+    float * dst_d = dst_override ? dst_override : (float *) mul_tensor->data;
     cudaStream_t stream = ctx.stream();
 
     GGML_ASSERT(rms_norm_src->type == GGML_TYPE_F32);

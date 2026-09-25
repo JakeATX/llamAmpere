@@ -79,7 +79,56 @@ static void concat_cont_cuda(const T * x,
     concat_cont<T, 2><<<num_blocks, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(x, y, dst, ne00, ne01, ne02, ne0, ne1, ne2);
 }
 
-// non-contiguous kernel (slow)
+// non-contiguous kernel (slow): copies element (i0, i1, i2, i3) of dst from src0 or src1
+template <typename T, int dim>
+static __device__ __forceinline__ void concat_non_cont_elem(
+        const char * src0,
+        const char * src1,
+              char * dst,
+           int64_t   ne00,
+           int64_t   ne01,
+           int64_t   ne02,
+           int64_t   ne03,
+          uint64_t   nb00,
+          uint64_t   nb01,
+          uint64_t   nb02,
+          uint64_t   nb03,
+          uint64_t   nb10,
+          uint64_t   nb11,
+          uint64_t   nb12,
+          uint64_t   nb13,
+          uint64_t   nb0,
+          uint64_t   nb1,
+          uint64_t   nb2,
+          uint64_t   nb3,
+           int64_t   i0,
+           int64_t   i1,
+           int64_t   i2,
+           int64_t   i3) {
+    static_assert(dim >= 0 && dim <= 3, "dim must be in [0, 3]");
+
+    const T * x;
+
+    if (i0 < ne00 && i1 < ne01 && i2 < ne02 && i3 < ne03) {
+        x = (const T *)(src0 + i3*nb03 + i2*nb02 + i1*nb01 + i0*nb00);
+    } else {
+        if constexpr (dim == 0) {
+            x = (const T *)(src1 + i3*nb13 + i2*nb12 + i1*nb11 + (i0 - ne00)*nb10);
+        } else if constexpr (dim == 1) {
+            x = (const T *)(src1 + i3*nb13 + i2*nb12 + (i1 - ne01)*nb11 + i0*nb10);
+        } else if constexpr (dim == 2) {
+            x = (const T *)(src1 + i3*nb13 + (i2 - ne02)*nb12 + i1*nb11 + i0*nb10);
+        } else if constexpr (dim == 3) {
+            x = (const T *)(src1 + (i3 - ne03)*nb13 + i2*nb12 + i1*nb11 + i0*nb10);
+        }
+    }
+
+    T * y = (T *)(dst + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0);
+
+    *y = *x;
+}
+
+// one block per (i1, i2, i3) row, threads over i0
 template <typename T, int dim>
 static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
     concat_non_cont(
@@ -94,49 +143,66 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
           uint64_t   nb01,
           uint64_t   nb02,
           uint64_t   nb03,
-           int64_t /*ne10*/,
-           int64_t /*ne11*/,
-           int64_t /*ne12*/,
-           int64_t /*ne13*/,
           uint64_t   nb10,
           uint64_t   nb11,
           uint64_t   nb12,
           uint64_t   nb13,
            int64_t   ne0,
            int64_t /*ne1*/,
-           int64_t /*ne2*/,
-           int64_t /*ne3*/,
           uint64_t   nb0,
           uint64_t   nb1,
           uint64_t   nb2,
           uint64_t   nb3) {
-    static_assert(dim >= 0 && dim <= 3, "dim must be in [0, 3]");
-
     const int64_t i3 = blockIdx.z;
     const int64_t i2 = blockIdx.y;
     const int64_t i1 = blockIdx.x;
 
-    const T * x;
-
     for (int64_t i0 = threadIdx.x; i0 < ne0; i0 += blockDim.x) {
-        if (i0 < ne00 && i1 < ne01 && i2 < ne02 && i3 < ne03) {
-            x = (const T *)(src0 + i3*nb03 + i2*nb02 + i1*nb01 + i0*nb00);
-        } else {
-            if constexpr (dim == 0) {
-                x = (const T *)(src1 + i3*nb13 + i2*nb12 + i1*nb11 + (i0 - ne00)*nb10);
-            } else if constexpr (dim == 1) {
-                x = (const T *)(src1 + i3*nb13 + i2*nb12 + (i1 - ne01)*nb11 + i0*nb10);
-            } else if constexpr (dim == 2) {
-                x = (const T *)(src1 + i3*nb13 + (i2 - ne02)*nb12 + i1*nb11 + i0*nb10);
-            } else if constexpr (dim == 3) {
-                x = (const T *)(src1 + (i3 - ne03)*nb13 + i2*nb12 + i1*nb11 + i0*nb10);
-            }
-        }
-
-        T * y = (T *)(dst + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0);
-
-        *y = *x;
+        concat_non_cont_elem<T, dim>(src0, src1, dst, ne00, ne01, ne02, ne03, nb00, nb01, nb02, nb03,
+                                     nb10, nb11, nb12, nb13, nb0, nb1, nb2, nb3, i0, i1, i2, i3);
     }
+}
+
+// rows shorter than a block (e.g. the GDN conv input: 3 state columns ++ 4 new ones per channel,
+// where one block per row ran 7 of 256 threads): threads over the flattened (i0, i1) plane so
+// blocks are full. Same element mapping, so the output bytes are unchanged.
+template <typename T, int dim>
+static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
+    concat_non_cont_flat(
+        const char * src0,
+        const char * src1,
+              char * dst,
+           int64_t   ne00,
+           int64_t   ne01,
+           int64_t   ne02,
+           int64_t   ne03,
+          uint64_t   nb00,
+          uint64_t   nb01,
+          uint64_t   nb02,
+          uint64_t   nb03,
+          uint64_t   nb10,
+          uint64_t   nb11,
+          uint64_t   nb12,
+          uint64_t   nb13,
+           int64_t   ne0,
+           int64_t   ne1,
+          uint64_t   nb0,
+          uint64_t   nb1,
+          uint64_t   nb2,
+          uint64_t   nb3) {
+    const int64_t i3 = blockIdx.z;
+    const int64_t i2 = blockIdx.y;
+    const int64_t i  = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+
+    if (i >= ne0*ne1) {
+        return;
+    }
+
+    const int64_t i1 = i / ne0;
+    const int64_t i0 = i - i1*ne0;
+
+    concat_non_cont_elem<T, dim>(src0, src1, dst, ne00, ne01, ne02, ne03, nb00, nb01, nb02, nb03,
+                                 nb10, nb11, nb12, nb13, nb0, nb1, nb2, nb3, i0, i1, i2, i3);
 }
 
 template <typename T>
@@ -163,15 +229,17 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
     } else {
         GGML_ASSERT(!ggml_is_quantized(src0->type));
 
-        dim3 grid_dim(dst->ne[1], dst->ne[2], dst->ne[3]);
+        const bool flat = dst->ne[0] < CUDA_CONCAT_BLOCK_SIZE;
+        const int64_t n_flat = (dst->ne[0]*dst->ne[1] + CUDA_CONCAT_BLOCK_SIZE - 1) / CUDA_CONCAT_BLOCK_SIZE;
+        const dim3 grid_dim((unsigned) (flat ? n_flat : dst->ne[1]), (unsigned) dst->ne[2], (unsigned) dst->ne[3]);
         auto launch_kernel = [&](auto dim) {
-            concat_non_cont<T, dim><<<grid_dim, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(
+            auto kernel = flat ? concat_non_cont_flat<T, dim> : concat_non_cont<T, dim>;
+            kernel<<<grid_dim, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(
                 (const char *) src0->data, (const char *) src1->data, (char *) dst->data,
                 src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
                 src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3],
-                src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3],
                 src1->nb[0], src1->nb[1], src1->nb[2], src1->nb[3],
-                dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
+                dst->ne[0], dst->ne[1],
                 dst->nb[0], dst->nb[1], dst->nb[2], dst->nb[3]);
         };
         switch (dim) {

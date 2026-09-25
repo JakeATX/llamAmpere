@@ -2,6 +2,17 @@
 #include "llama-kv-cache.h"
 #include "llama-memory-recurrent.h"
 
+// Output-row gather indices, or nullptr when every row is an output (decode, speculative verify,
+// MTP drafts): the gather would then be an identity copy. The graph topology still depends only on
+// n_outputs vs n_tokens, which graph reuse already compares. Pipeline parallelism keeps the gather
+// for a constant topology (see build_inp_out_ids()).
+static ggml_tensor * qwen35_build_inp_out_ids(const llm_graph_context & g) {
+    if (g.n_outputs == g.n_tokens && !g.cparams.pipeline_parallel) {
+        return nullptr;
+    }
+    return g.build_inp_out_ids();
+}
+
 void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
     ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS,    hparams.rope_sections, 4, true);
@@ -173,7 +184,7 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
     auto * inp = build_inp_mem_hybrid();
 
     ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    ggml_tensor * inp_out_ids = qwen35_build_inp_out_ids(*this);
 
     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
     for (int il = 0; il < n_layer; ++il) {
@@ -652,7 +663,7 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     res->add_input(std::move(inp));
 
     ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    ggml_tensor * inp_out_ids = qwen35_build_inp_out_ids(*this);
 
     auto * inp_attn = build_attn_inp_kv();
 
@@ -837,7 +848,9 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
         res->t_h_nextn = h_all;
         ggml_build_forward_expand(gf, h_all);
 
-        ggml_build_forward_expand(gf, ggml_view_1d(ctx0, inp_out_ids, inp_out_ids->ne[0], 0));
+        if (inp_out_ids) {
+            ggml_build_forward_expand(gf, ggml_view_1d(ctx0, inp_out_ids, inp_out_ids->ne[0], 0));
+        }
 
         cb(logits_all, "result_output", -1);
         res->t_logits = logits_all;
@@ -931,7 +944,9 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     cb(cur, "h_nextn", -1);
     res->t_h_nextn = cur;
 
-    cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    if (inp_out_ids) {
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    }
     cb(cur, "mtp_shared_head_norm", -1);
 
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;

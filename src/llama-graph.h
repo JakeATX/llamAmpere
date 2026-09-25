@@ -321,7 +321,9 @@ public:
     // rs_idx-reset side effect, so the values are never re-read from the memory context)
     void set_input_shift(uint32_t mem_size);
 
-    // [TAG_RECURRENT_ROLLBACK_RING] ring mode (mctx->get_rs_ring()); all nullptr/0 otherwise.
+    // [TAG_RECURRENT_ROLLBACK_RING] ring mode (mctx->get_rs_ring()); all nullptr/0 otherwise, and
+    // n_written == 0 / rs_wr == nullptr for a ubatch that fills the ring (n >= K: the builders use
+    // the static strided copies, see llama_memory_recurrent_context::get_n_written).
     // Shapes are graph topology -> checked in can_reuse.
     uint32_t n_written = 0;
     uint32_t n_older   = 0;
@@ -329,6 +331,7 @@ public:
     // I32 [n_seqs] per written slot (oldest group first): one input tensor per slot -- a per-layer view
     // of a single input would be scheduled as a CPU node and cost a H2D copy + sync per layer
     std::vector<ggml_tensor *> rs_wr_conv;
+    std::vector<int32_t *>     rs_wr_conv_host; // fill_s_copy scratch: host data of rs_wr_conv[j]
     ggml_tensor * rs_old_src = nullptr; // I32 [n_older]: older-group rows to carry for seqs whose data moves cells
     ggml_tensor * rs_old_dst = nullptr; // I32 [n_older]
 

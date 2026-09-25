@@ -583,16 +583,22 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
         // token at a time and makes a later rollback restore a state that never existed.
         const int64_t n_written = std::min<int64_t>(n_seq_tokens, K);
 
-        if (mctx_cur->get_rs_ring()) {
-            // [TAG_RECURRENT_ROLLBACK_RING] groups live at ring planes chosen by the memory
-            // (inp->rs_wr_conv, oldest written group first): one set_rows of the last n_written
-            // conv windows, no shift. Source: the [k-1, channels, n_seqs, n_written] window view of
-            // conv_input starting at token n_seq_tokens - (n_written - 1), each later window one
+        if (inp->rs_wr != nullptr) {
+            // [TAG_RECURRENT_ROLLBACK_RING] a ubatch shorter than the ring: groups live at ring planes
+            // chosen by the memory (inp->rs_wr_conv, oldest written group first): one set_rows of the last
+            // n_written conv windows, no shift. Source: the [k-1, channels, n_seqs, n_written] window view
+            // of conv_input starting at token n_seq_tokens - (n_written - 1), each later window one
             // token further (element stride along dim 3), made contiguous first.
+            // A ubatch that fills the ring (n_seq_tokens >= K) resets the ring base to 0, so group g sits
+            // at plane g -- the static layout the copies below write (no ring inputs, fewer nodes).
             GGML_ASSERT((int64_t) inp->rs_wr_conv.size() == n_written && (int64_t) inp->n_written == n_written);
             // the windows overlap (one token apart), so no single strided view of conv_input can
             // express them: gather each slot's window (one small cont, as the shift path's cpy did)
-            // and scatter it straight into its ring plane with set_rows over that slot's row indices
+            // and scatter it straight into its ring plane with set_rows over that slot's row indices.
+            // The cont goes straight to the 2D [row_count, n_seqs] shape: a same-shape cont of the
+            // window is a cudaMemcpy2DAsync of 12-byte rows in the CUDA backend (~9 us each, 1.45 ms
+            // per MTP-3 verify on the 3090 Ti, nsys 2026-09-24), the reshaping copy is the scalar
+            // copy kernel (~2 us), as in the static path's ggml_cpy below.
             ggml_tensor * states2d = ggml_reshape_2d(ctx0, conv_states_all, row_count, conv_states_all->ne[1]);
             for (int64_t j = 0; j < n_written; ++j) {
                 const int64_t s_idx = n_seq_tokens - (n_written - 1) + j; // window ending at token n_seq_tokens - g, g = n_written - 1 - j
@@ -600,7 +606,7 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
                         conv_kernel_size - 1, conv_channels, n_seqs,
                         conv_input->nb[1], conv_input->nb[2],
                         ggml_row_size(conv_input->type, s_idx));
-                win = ggml_reshape_2d(ctx0, ggml_cont(ctx0, win), row_count, n_seqs);
+                win = ggml_cont_2d(ctx0, win, row_count, n_seqs);
                 ggml_tensor * rows_j = inp->rs_wr_conv[j];
                 ggml_build_forward_expand(gf, ggml_set_rows(ctx0, states2d, win, rows_j));
             }
@@ -714,11 +720,12 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         // op writes the last min(n_seq_tokens, K) snapshots; trailing slots are left unwritten
         const int64_t n_written = std::min<int64_t>(n_seq_tokens, K);
 
-        if (mctx_cur->get_rs_ring()) {
-            // [TAG_RECURRENT_ROLLBACK_RING] snapshot slot g -> cache row inp->rs_wr[g * n_seqs + s]
-            // (ring plane (base' + g) mod K of the seq's cell): one set_rows, no shift. The CUDA
-            // backend fuses gated_delta_net + this set_rows (ggml_cuda_try_gdn_cache_fusion) and
-            // writes the snapshots straight into those rows.
+        if (inp->rs_wr != nullptr) {
+            // [TAG_RECURRENT_ROLLBACK_RING] a ubatch shorter than the ring: snapshot slot g -> cache row
+            // inp->rs_wr[g * n_seqs + s] (ring plane (base' + g) mod K of the seq's cell): one set_rows,
+            // no shift. The CUDA backend fuses gated_delta_net + this set_rows
+            // (ggml_cuda_try_gdn_cache_fusion) and writes the snapshots straight into those rows.
+            // A ubatch that fills the ring takes the static copy below (base' = 0, group g at plane g).
             GGML_ASSERT(inp->rs_wr != nullptr && (int64_t) inp->n_written == n_written);
             ggml_tensor * src = ggml_view_2d(ctx0, gdn_out, D, n_seqs * n_written,
                 ggml_row_size(gdn_out->type, D),
