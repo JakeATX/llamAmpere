@@ -285,10 +285,10 @@ static void build_reference(const case_def & c, case_data & d, int64_t step) {
     const size_t n_tasks = d.ref_rows.size() * size_t(c.n_head_kv);
     std::atomic<size_t> next(0);
     auto worker = [&]() {
-        std::vector<double> logit(size_t(gqa * c.n_kv));
-        std::vector<double> acc(size_t(gqa * D));
-        std::vector<double> mx(size_t(gqa));
-        std::vector<double> sum(size_t(gqa));
+        std::vector<double> logit(static_cast<size_t>(gqa * c.n_kv));
+        std::vector<double> acc(static_cast<size_t>(gqa * D));
+        std::vector<double> mx(static_cast<size_t>(gqa));
+        std::vector<double> sum(static_cast<size_t>(gqa));
         for (size_t t = next++; t < n_tasks; t = next++) {
             const size_t  ri = t / size_t(c.n_head_kv);
             const int64_t hk = int64_t(t % size_t(c.n_head_kv));
