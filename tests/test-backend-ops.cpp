@@ -7048,6 +7048,36 @@ struct test_concat : public test_case {
     }
 };
 
+// GGML_OP_CONCAT as the gated delta net builds its conv input: the kept conv state columns
+// [d_conv - 1, channels, n_seqs] ++ the transposed new rows [n_tokens, channels, n_seqs] along dim 0
+struct test_concat_conv_input : public test_case {
+    const int64_t d_conv_m1;
+    const int64_t channels;
+    const int64_t n_tokens;
+    const int64_t n_seqs;
+
+    std::string vars() override {
+        return VARS_TO_STR4(d_conv_m1, channels, n_tokens, n_seqs);
+    }
+
+    test_concat_conv_input(int64_t d_conv_m1 = 3, int64_t channels = 10240, int64_t n_tokens = 4, int64_t n_seqs = 1)
+        : d_conv_m1(d_conv_m1), channels(channels), n_tokens(n_tokens), n_seqs(n_seqs) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * states = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_conv_m1, channels, n_seqs);
+        ggml_set_name(states, "states");
+        ggml_tensor * qkv = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, channels, n_tokens, n_seqs);
+        ggml_set_name(qkv, "qkv");
+        ggml_tensor * qkv_t = ggml_transpose(ctx, qkv);
+        ggml_set_name(qkv_t, "qkv_t");
+
+        ggml_tensor * out = ggml_concat(ctx, states, qkv_t, 0);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // GGML_OP_ARGSORT
 struct test_argsort : public test_case {
     const ggml_type type;
@@ -11758,6 +11788,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_concat(GGML_TYPE_I64, {11, 12, 13, 14}, 7, dim, v));
         }
     }
+
+    // short non-contiguous rows (flat grid) and a long one (one block per row)
+    test_cases.emplace_back(new test_concat_conv_input(3, 10240, 4, 1));
+    test_cases.emplace_back(new test_concat_conv_input(3, 10240, 1, 1));
+    test_cases.emplace_back(new test_concat_conv_input(3, 1000, 5, 3));
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {300, 5, 3, 2}, 7, 0, 1));
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 999, 2, 2}, 4, 0, 2));
 
     for (ggml_type type_a : { GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0 }) {
         for (int v : { 0, 4, 8, 12 }) {
