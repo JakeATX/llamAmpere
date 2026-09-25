@@ -287,6 +287,42 @@ static void test(void) {
     assert(!no_chain_params.speculative.draft.chain);
     assert(no_chain_params.speculative.draft.n_max == 3);
 
+    // draft KV cache types inherit the main -ctk/-ctv unless --spec-draft-type-k/-v is given (GGML_TYPE_COUNT = not set),
+    // K and V independently; an explicit f16 stays explicit
+    argv = {"binary_name", "-m", "model_file.gguf", "-ctk", "q8_0", "-ctv", "q4_0"};
+    common_params dkv_inherit;
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), dkv_inherit, LLAMA_EXAMPLE_SPECULATIVE));
+    assert(dkv_inherit.speculative.draft.cache_type_k == GGML_TYPE_COUNT);
+    assert(dkv_inherit.speculative.draft.cache_type_v == GGML_TYPE_COUNT);
+    {
+        const auto draft = common_base_params_to_speculative(dkv_inherit);
+        assert(draft.cache_type_k == GGML_TYPE_Q8_0);
+        assert(draft.cache_type_v == GGML_TYPE_Q4_0);
+    }
+
+    argv = {"binary_name", "-m", "model_file.gguf", "-ctk", "q8_0", "-ctv", "q4_0", "-ctkd", "f16"};
+    common_params dkv_k_only;
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), dkv_k_only, LLAMA_EXAMPLE_SPECULATIVE));
+    assert(dkv_k_only.speculative.draft.cache_type_k == GGML_TYPE_F16);
+    assert(dkv_k_only.speculative.draft.cache_type_v == GGML_TYPE_COUNT);
+    {
+        const auto draft = common_base_params_to_speculative(dkv_k_only);
+        assert(draft.cache_type_k == GGML_TYPE_F16);
+        assert(draft.cache_type_v == GGML_TYPE_Q4_0);
+    }
+
+    argv = {"binary_name", "-m", "model_file.gguf", "-ctk", "q8_0", "-ctv", "q4_0",
+            "--spec-draft-type-k", "q5_0", "--spec-draft-type-v", "f16"};
+    common_params dkv_both;
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), dkv_both, LLAMA_EXAMPLE_SPECULATIVE));
+    assert(dkv_both.speculative.draft.cache_type_k == GGML_TYPE_Q5_0);
+    assert(dkv_both.speculative.draft.cache_type_v == GGML_TYPE_F16);
+    {
+        const auto draft = common_base_params_to_speculative(dkv_both);
+        assert(draft.cache_type_k == GGML_TYPE_Q5_0);
+        assert(draft.cache_type_v == GGML_TYPE_F16);
+    }
+
     // n-gram drafters request recurrent-state snapshots for in-place rollback (draft width, capped at 8);
     // --spec-n-rs-seq overrides, 0 = checkpoint restore on every partial acceptance
     argv = {"binary_name", "-m", "model_file.gguf", "--spec-type", "ngram-cache", "--spec-ngram-cache-n-max", "7"};
