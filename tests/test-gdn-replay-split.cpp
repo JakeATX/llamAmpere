@@ -33,38 +33,30 @@ struct split_result {
 static split_result run_split(const std::vector<lane> & lanes, uint32_t n_ubatch, uint32_t n_rs_seq, bool constrain) {
     const uint32_t n_seq = lanes.size();
 
-    // token order: all of seq 0, then seq 1, ... (the server fills batches slot by slot)
-    std::vector<float>          embd;
-    std::vector<llama_pos>      pos;
-    std::vector<int32_t>        n_seq_id;
-    std::vector<llama_seq_id>   seq_ids;
-    std::vector<int8_t>         logits;
-    for (uint32_t s = 0; s < n_seq; ++s) {
-        for (uint32_t t = 0; t < lanes[s].n_tokens; ++t) {
-            embd.push_back(0.0f);
-            pos.push_back(100 + t);
-            n_seq_id.push_back(1);
-            seq_ids.push_back(s);
-            logits.push_back(1);
-        }
-    }
-    const int32_t n_tokens = (int32_t) pos.size();
-    std::vector<llama_seq_id *> seq_id_ptrs(n_tokens + 1, nullptr);
-    for (int32_t i = 0; i < n_tokens; ++i) {
-        seq_id_ptrs[i] = &seq_ids[i];
+    int32_t n_tokens = 0;
+    for (const lane & l : lanes) {
+        n_tokens += l.n_tokens;
     }
 
-    llama_batch batch = {};
-    batch.n_tokens = n_tokens;
-    batch.embd     = embd.data();
-    batch.pos      = pos.data();
-    batch.n_seq_id = n_seq_id.data();
-    batch.seq_id   = seq_id_ptrs.data();
-    batch.logits   = logits.data();
+    // 1-wide embeddings, no memory, no token ids (n_vocab 0), n_seq seqs, one position per entry
+    llama_batch_ext batch(n_tokens, 1, 1, (llama_seq_id) n_seq, nullptr, 0, 1);
+
+    // token order: all of seq 0, then seq 1, ... (the server fills batches slot by slot)
+    const float embd = 0.0f;
+    for (uint32_t s = 0; s < n_seq; ++s) {
+        for (uint32_t t = 0; t < lanes[s].n_tokens; ++t) {
+            const llama_pos pos = 100 + t;
+            const int32_t idx = batch.add_token(s);
+            GGML_ASSERT(idx >= 0);
+            GGML_ASSERT(batch.set_token_embd(idx, { &embd, 1, 1 }));
+            GGML_ASSERT(batch.set_token_pos(idx, &pos));
+            GGML_ASSERT(batch.set_output(idx, true));
+        }
+    }
 
     llama_vocab vocab;
     llama_batch_allocr balloc(1);
-    GGML_ASSERT(balloc.init(batch, vocab, nullptr, 1, n_seq, false));
+    GGML_ASSERT(balloc.init(batch, vocab, false));
 
     llama_memory_recurrent::replay_split rs;
     rs.active   = constrain;
