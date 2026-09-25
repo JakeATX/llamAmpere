@@ -7582,6 +7582,43 @@ struct test_elem_chain_fusion : public test_case {
     }
 };
 
+// CONT of the gate half of a joint Q+gate projection, then SIGMOID and MUL (the Qwen3.5 attention
+// gate): the chain must read the strided view in place of the CONT output.
+struct test_elem_chain_cont_head : public test_case {
+    const int64_t head_dim;
+    const int64_t n_head;
+    const int64_t n_tokens;
+
+    test_elem_chain_cont_head(int64_t head_dim, int64_t n_head, int64_t n_tokens)
+        : head_dim(head_dim), n_head(n_head), n_tokens(n_tokens) {}
+
+    std::string vars() override {
+        return VARS_TO_STR3(head_dim, n_head, n_tokens);
+    }
+
+    const char * required_fusion() override { return "elem_chain"; }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "ELEM_CHAIN_FUSION";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * qg   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2*head_dim, n_head, n_tokens);
+        ggml_tensor * attn = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head_dim*n_head, n_tokens);
+        ggml_set_name(qg, "qg");
+        ggml_set_name(attn, "attn");
+
+        ggml_tensor * gate = ggml_view_3d(ctx, qg, head_dim, n_head, n_tokens, qg->nb[1], qg->nb[2], head_dim*ggml_element_size(qg));
+        gate = ggml_cont_2d(ctx, gate, head_dim*n_head, n_tokens);
+        ggml_tensor * out = ggml_mul(ctx, attn, ggml_sigmoid(ctx, gate));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // MUL_MAT_ID -> MUL(weights) -> PERMUTE -> CONT -> SUM_ROWS, the MoE expert-reduce tail as
 // llama.cpp builds it, compared against the CPU graph. Coverage of the tail, not of a fusion.
 struct test_moe_reduce_fusion : public test_case {
@@ -9832,6 +9869,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_elem_chain_fusion({256, 4, 2, 1}, false, true));
     test_cases.emplace_back(new test_elem_chain_fusion({256, 4, 2, 1}, false, false, false, 0.25f));
     test_cases.emplace_back(new test_elem_chain_fusion({4096, 64, 1, 1}, false, false, true));
+    for (int64_t t : {1, 4}) {
+        test_cases.emplace_back(new test_elem_chain_cont_head(128, 4, t));
+    }
     std::default_random_engine rng(0);
 
     // unary ops

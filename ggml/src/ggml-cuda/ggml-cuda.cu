@@ -3893,6 +3893,30 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+// Row stride in floats of an f32 tensor whose rows (dims 1-3 flattened) sit at one uniform stride, else -1.
+static int64_t ggml_cuda_chain_row_stride(const ggml_tensor * t) {
+    if (t->type != GGML_TYPE_F32 || t->nb[0] != sizeof(float)) {
+        return -1;
+    }
+    size_t s1     = 0;
+    size_t expect = 0;
+    for (int d = 1; d < GGML_MAX_DIMS; ++d) {
+        if (t->ne[d] == 1) {
+            continue;
+        }
+        if (s1 == 0) {
+            s1 = t->nb[d];
+        } else if (t->nb[d] != expect) {
+            return -1;
+        }
+        expect = t->nb[d]*t->ne[d];
+    }
+    if (s1 == 0) {
+        return t->ne[0];
+    }
+    return s1 % sizeof(float) == 0 ? (int64_t) (s1/sizeof(float)) : -1;
+}
+
 // Elementwise chain ("midi-kernel"): collapse a run of consecutive same-shape elementwise
 // ops into a single kernel that keeps the value in a register across the whole run. Saves a
 // dispatch AND a full HBM round trip per elided op. Typical runs on hybrid MoE graphs are
@@ -3942,15 +3966,29 @@ static int ggml_cuda_fuse_elem_chain(ggml_backend_cuda_context & ctx, const ggml
     tq_chain_desc desc = {};
     const ggml_tensor * head_src = nullptr;
     int len = 0;
+    int head_off = 0;   // 1 when node i is a CONT that the chain folds into its head read
 
     if (!disable_chain) {
         const ggml_tensor * prev = nullptr;
-        for (int j = i; j < cgraph->n_nodes && len < TQ_CHAIN_MAX_OPS; ++j) {
+        // CONT of a row-strided f32 view (e.g. the attention gate half of a joint Q+gate
+        // projection): the chain reads the view in place and the copy is not run.
+        if (cgraph->nodes[i]->op == GGML_OP_CONT && chain_ok_tensor(cgraph->nodes[i])) {
+            const ggml_tensor * cont = cgraph->nodes[i];
+            const int64_t s1 = ggml_cuda_chain_row_stride(cont->src[0]);
+            if (s1 > 0 && ggml_nelements(cont->src[0]) == ggml_nelements(cont)) {
+                head_src     = cont->src[0];
+                desc.src_ne0 = head_src->ne[0];
+                desc.src_s1  = s1;
+                prev         = cont;
+                head_off     = 1;
+            }
+        }
+        for (int j = i + head_off; j < cgraph->n_nodes && len < TQ_CHAIN_MAX_OPS; ++j) {
             ggml_tensor * nd = cgraph->nodes[j];
             int code = 0; float p0 = 0.0f, p1 = 0.0f;
 
             if (!chain_ok_tensor(nd) || !chain_code(nd, code, p0, p1)) break;
-            if (len > 0 && !ggml_are_same_shape(nd, cgraph->nodes[i])) break;
+            if ((len > 0 || head_off) && !ggml_are_same_shape(nd, cgraph->nodes[i])) break;
 
             const bool binary = (nd->op == GGML_OP_ADD || nd->op == GGML_OP_MUL || nd->op == GGML_OP_DIV);
             const ggml_tensor * a = nd->src[0];
@@ -3966,7 +4004,7 @@ static int ggml_cuda_fuse_elem_chain(ggml_backend_cuda_context & ctx, const ggml
             const ggml_tensor * other = nullptr;
             int chain_lhs = 1;
 
-            if (len == 0) {
+            if (len == 0 && !head_off) {
                 // the value we carry must be a full-size tensor, not the broadcast scalar
                 if (ggml_nelements(a) != ggml_nelements(nd)) break;
                 head_src = a;
@@ -4000,19 +4038,20 @@ static int ggml_cuda_fuse_elem_chain(ggml_backend_cuda_context & ctx, const ggml
         }
     }
 
-    if (len >= 2) {
-        ggml_tensor * out = cgraph->nodes[i + len - 1];
-        ggml_op ops_ch[TQ_CHAIN_MAX_OPS];
-        for (int k = 0; k < len; ++k) {
+    const int n_nodes = head_off + len;
+    if (len >= 1 && n_nodes >= 2) {
+        ggml_tensor * out = cgraph->nodes[i + n_nodes - 1];
+        ggml_op ops_ch[TQ_CHAIN_MAX_OPS + 1];
+        for (int k = 0; k < n_nodes; ++k) {
             ops_ch[k] = cgraph->nodes[i + k]->op;
         }
-        const int out_ch[1] = { i + len - 1 };
+        const int out_ch[1] = { i + n_nodes - 1 };
 
         // A run of same-op ADDs or MULs over same-layout operands, chained through src0, is what
         // the tuned multi-ADD/MUL kernels in ggml_cuda_try_fuse() take, and they are a little
         // faster than the chain kernel for it (MI210, four ADDs over 4096x64 f32: 3.75-3.96 us
         // per run tuned vs 4.0 us chain). Leave that pattern to them.
-        {
+        if (!head_off) {
             bool pure_run = (ops_ch[0] == GGML_OP_ADD || ops_ch[0] == GGML_OP_MUL);
             for (int k = 0; k < len && pure_run; ++k) {
                 const ggml_tensor * nd = cgraph->nodes[i + k];
@@ -4051,7 +4090,7 @@ static int ggml_cuda_fuse_elem_chain(ggml_backend_cuda_context & ctx, const ggml
                 if (!desc.other[k]) {
                     continue;
                 }
-                const ggml_tensor * nd = cgraph->nodes[i + k];
+                const ggml_tensor * nd = cgraph->nodes[i + head_off + k];
                 const ggml_tensor * ot = desc.chain_is_lhs[k] ? nd->src[1] : nd->src[0];
                 const size_t on = ggml_nbytes(ot);
                 if (desc.bcast[k]) {
@@ -4064,13 +4103,13 @@ static int ggml_cuda_fuse_elem_chain(ggml_backend_cuda_context & ctx, const ggml
 
         if (!alias_veto &&
             ggml_are_same_shape(out, cgraph->nodes[i]) &&
-            ggml_can_fuse_subgraph(cgraph, i, len, ops_ch, out_ch, 1)) {
+            ggml_can_fuse_subgraph(cgraph, i, n_nodes, ops_ch, out_ch, 1)) {
 
             desc.n_ops = len;
             ctx.fusion_stats.elem_chain++;
             ggml_cuda_op_elem_chain(ctx, (const float *) head_src->data,
                                     (float *) out->data, ggml_nelements(out), desc);
-            return len - 1;   // nodes consumed beyond this one
+            return n_nodes - 1;   // nodes consumed beyond this one
         }
     }
     return -1;
