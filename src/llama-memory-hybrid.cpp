@@ -77,6 +77,9 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
     do {
         balloc.split_reset();
 
+        // [TAG_GDN_REPLAY_SPLIT]
+        auto rsplit = mem_recr->make_replay_split(balloc);
+
         // follow the recurrent pattern for creating the ubatch splits
         std::vector<llama_ubatch> ubatches;
 
@@ -95,12 +98,14 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
                 //   so that the rollback snapshots remain valid
                 const uint32_t n_rs_seq = mem_recr->n_rs_seq;
 
-                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
+                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0, rsplit.fn());
             }
 
             if (ubatch.n_tokens == 0) {
                 break;
             }
+
+            rsplit.advance(ubatch);
 
             ubatches.push_back(std::move(ubatch)); // NOLINT
         }

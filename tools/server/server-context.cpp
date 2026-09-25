@@ -560,6 +560,43 @@ struct spec_adapt_ctrl {
     }
 };
 
+// [#47] LLAMA_HOST_PHASES=1: the wall time of every update_slots pass split into host phases, process-wide (a
+// single-slot measurement tool; with several slots the passes are shared). outside = between passes (task queue,
+// HTTP), prep = slot checks and draft parameters, draft = the draft call (split further by
+// common_speculative_host_phases), ckpt = speculative checkpoints, batch = batch assembly up to llama_decode,
+// verify = llama_decode + sync, sample = the verify sampler call (sampling over the target logits + accept logic),
+// post = the rest of the pass (sampling of non-speculative slots, prompt bookkeeping, token output). Printed and
+// reset with the slot timings.
+struct server_host_phase_clock {
+    enum phase { OUTSIDE, PREP, DRAFT, CKPT, BATCH, VERIFY, SAMPLE, POST, N_PHASE };
+
+    const bool on = common_speculative_host_phases_enabled();
+    int64_t    t_last = 0;
+    uint64_t   us[N_PHASE] = {};
+    uint64_t   n_pass = 0;
+
+    // charge the time since the previous mark to phase p
+    void mark(phase p) {
+        if (!on) {
+            return;
+        }
+        const int64_t t = ggml_time_us();
+        if (t_last > 0) {
+            us[p] += (uint64_t) (t - t_last);
+        }
+        t_last = t;
+    }
+
+    void reset() {
+        for (auto & u : us) {
+            u = 0;
+        }
+        n_pass = 0;
+    }
+};
+
+static server_host_phase_clock g_host_phases;
+
 struct server_slot {
     int id;
 
@@ -1107,6 +1144,31 @@ struct server_slot {
             }
             if (spec_adapt.active()) {
                 SLT_INF(*this, " adaptive depth (BL6a) = %s\n", spec_adapt.summary().c_str());
+            }
+            if (g_host_phases.on) {
+                // [#47] per verify round of this slot (single-slot runs), since the previous print
+                uint64_t rounds = 0;
+                for (uint64_t r : spec_rounds_by_w) {
+                    rounds += r;
+                }
+                const double r = rounds > 0 ? (double) rounds : 1.0;
+                const auto & u = g_host_phases.us;
+                using hp = server_host_phase_clock;
+                const common_speculative_host_phases dp = common_speculative_host_phases_take();
+                SLT_INF(*this,
+                        " host phases (LLAMA_HOST_PHASES) ms/round over %" PRIu64 " rounds, %" PRIu64 " passes: outside %.3f, prep %.3f, draft %.3f, ckpt %.3f, batch %.3f, verify %.3f, sample %.3f, post %.3f\n",
+                        rounds, g_host_phases.n_pass,
+                        u[hp::OUTSIDE] / 1000.0 / r, u[hp::PREP] / 1000.0 / r, u[hp::DRAFT] / 1000.0 / r, u[hp::CKPT] / 1000.0 / r,
+                        u[hp::BATCH] / 1000.0 / r, u[hp::VERIFY] / 1000.0 / r, u[hp::SAMPLE] / 1000.0 / r, u[hp::POST] / 1000.0 / r);
+                if (dp.n_calls > 0) {
+                    const double st = dp.n_steps > 0 ? (double) dp.n_steps : 1.0;
+                    SLT_INF(*this,
+                            " draft split: %" PRIu64 " calls, %.2f steps/call; ms/step: decode call %.3f, gpu wait %.3f, sample %.3f; rest %.3f ms/call\n",
+                            dp.n_calls, (double) dp.n_steps / (double) dp.n_calls,
+                            dp.decode_us / 1000.0 / st, dp.sync_us / 1000.0 / st, dp.sample_us / 1000.0 / st,
+                            dp.rest_us / 1000.0 / (double) dp.n_calls);
+                }
+                g_host_phases.reset();
             }
 
             if (smpl) {
@@ -3446,6 +3508,20 @@ private:
 #endif
 
     void update_slots() {
+        // [#47] the time since the previous pass ended is "outside"; whatever this pass does after its last mark is "post"
+        g_host_phases.mark(server_host_phase_clock::OUTSIDE);
+        g_host_phases.n_pass += g_host_phases.on ? 1 : 0;
+        // once every slot is idle the wait for the next request is not a pass gap: drop it
+        struct host_phase_pass_end {
+            const std::vector<server_slot> & slots;
+            ~host_phase_pass_end() {
+                g_host_phases.mark(server_host_phase_clock::POST);
+                if (std::none_of(slots.begin(), slots.end(), [](const server_slot & s) { return s.is_processing(); })) {
+                    g_host_phases.t_last = 0;
+                }
+            }
+        } host_phase_pass_end_ { slots };
+
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
         int64_t t_start = ggml_time_us();
@@ -3717,6 +3793,8 @@ private:
             }
         });
 
+        g_host_phases.mark(server_host_phase_clock::PREP);
+
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
             const int64_t t_draft_start = ggml_time_us();
@@ -3728,6 +3806,8 @@ private:
                 s->spec_draft_us_pending = t_draft;
             }
         }
+
+        g_host_phases.mark(server_host_phase_clock::DRAFT);
 
         // make checkpoints if needed
         iterate(drafting, [&](server_slot & slot) {
@@ -3776,6 +3856,8 @@ private:
                 }
             }
         });
+
+        g_host_phases.mark(server_host_phase_clock::CKPT);
 
         // update the batch with the sampled/drafted tokens
         iterate(generating, [&](server_slot & slot) {
@@ -4387,6 +4469,7 @@ private:
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
         {
+            g_host_phases.mark(server_host_phase_clock::BATCH);
             const int64_t t_decode_start = ggml_time_us();
             queue_tasks.yield_to_queue([&]() {
                 ret = llama_decode(ctx_tgt, batch_view);
@@ -4395,6 +4478,7 @@ private:
                 }
             });
             t_decode_pass += ggml_time_us() - t_decode_start;
+            g_host_phases.mark(server_host_phase_clock::VERIFY);
         }
 
         if (ret != 0) {
@@ -4625,6 +4709,7 @@ private:
 
             // verify and try to accept the draft
             {
+                g_host_phases.mark(server_host_phase_clock::POST);
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
@@ -4636,6 +4721,7 @@ private:
                     : (slot.spec_draft_q.empty()
                         ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft)
                         : common_sampler_sample_and_accept_n_pq(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, slot.spec_draft_q, false, slot.spec_is_replay));
+                g_host_phases.mark(server_host_phase_clock::SAMPLE); // includes the sampler clone above
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);

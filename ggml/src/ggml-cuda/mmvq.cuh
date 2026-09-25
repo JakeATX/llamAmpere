@@ -8,6 +8,14 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11);
 // based on the quantization type and GPU architecture (compute capability).
 int get_mmvq_mmid_max_batch(ggml_type type, int cc);
 
+// Shared-quantize cache (q8_cache in common.cuh). ggml_cuda_q8_cacheable: whether a q8_1 activation of q8_bytes may be
+// cached on the current stream. ggml_cuda_q8_cache_claim: keys the cache on (src1, type_src0, layout) for this graph
+// eval and returns its buffer; the caller must fill it with quantize_row_q8_1_cuda's layout for type_src0 before any
+// consumer runs (stream order). Used by ggml_cuda_mul_mat_vec_q and the fused ADD + RMS_NORM + MUL prefill [#46].
+bool   ggml_cuda_q8_cacheable(const ggml_backend_cuda_context & ctx, size_t q8_bytes);
+char * ggml_cuda_q8_cache_claim(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, ggml_type type_src0,
+                                size_t q8_bytes, int64_t ne10_padded);
+
 void ggml_cuda_mul_mat_vec_q(ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
     const ggml_cuda_mm_fusion_args_host * fusion = nullptr, bool convrot = false);

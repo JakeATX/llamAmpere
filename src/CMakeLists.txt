@@ -38,6 +38,7 @@ set(LLAMA_CORE_SOURCES
     llama-model-loader.cpp
     llama-model-saver.cpp
     llama-model.cpp
+    llama-mtp-vocab-builtin.cpp
     llama-quant.cpp
     llama-sampler.cpp
     llama-vocab.cpp

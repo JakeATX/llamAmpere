@@ -132,6 +132,36 @@ public:
     // not a materialized rolled-back state), cleared by consume_replay().
     std::vector<uint8_t> s_stale;
 
+    // gdn_replay: the span the ring holds behind the checkpoint after a ubatch of n_seq_tokens
+    // tokens per seq -- the accepted prefix (ckpt_span - replay_len) plus the new tokens, capped
+    // at the ring capacity. The graph input and replay_split::advance() both use it.
+    static uint32_t replay_span_new(uint32_t ckpt_span, uint32_t replay_len, uint32_t n_seq_tokens, uint32_t n_rs_seq);
+
+    // [TAG_GDN_REPLAY_SPLIT] the replay subtree of a ubatch is built from one (replay_len,
+    // ckpt_span, s_stale) -- see llama_memory_recurrent_context::get_replay_len() -- so seqs that
+    // disagree on any of the three must not share a ubatch (a server with several slots
+    // accepting different draft lengths). Each init_batch makes one of these per batch, hands
+    // fn() to split_equal and calls advance() on every ubatch it keeps, which applies to a copy
+    // what consume_replay() will do to the real values when that ubatch's graph runs, so later
+    // ubatches of the same batch are grouped by the values they will actually see.
+    struct replay_split {
+        bool     active   = false;
+        uint32_t n_rs_seq = 0;
+
+        std::vector<uint32_t> replay_len;
+        std::vector<uint32_t> ckpt_span;
+        std::vector<uint8_t>  s_stale;
+
+        bool compat(llama_seq_id a, llama_seq_id b) const;
+        void advance(const llama_ubatch & ubatch);
+
+        // the split_equal filter, or nullptr when the constraint does not apply
+        llama_batch_allocr::seq_compat_fn fn() const;
+    };
+
+    // counts (ledger "llama.recurrent") and logs once when the batch's seqs disagree
+    replay_split make_replay_split(const llama_batch_allocr & balloc) const;
+
     // computed before each graph build
     uint32_t n = 0;
 
@@ -263,8 +293,9 @@ public:
 
     // DRC phase 2: the checkpoint's span for the sequence in the current ubatch (see
     // llama_memory_recurrent::ckpt_span), and whether s_l is stale for it. With several lanes
-    // the maximum span / any-stale is taken, same as get_replay_len(); lanes that disagree are
-    // not supported (logged once) -- the replay subtree has one shape per graph.
+    // the maximum span / any-stale is taken, same as get_replay_len(); init_batch keeps lanes
+    // that disagree in separate ubatches ([TAG_GDN_REPLAY_SPLIT]), get_ckpt_span() logs once if
+    // one gets through anyway -- the replay subtree has one shape per graph.
     uint32_t get_ckpt_span() const;
     bool     get_s_stale()   const;
     uint32_t get_n_rs_seq()  const;

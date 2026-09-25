@@ -8,6 +8,7 @@
 #include "llama.h"
 #include "sampling.h"
 #include "speculative.h"
+#include "ggml-ledger.h"
 #include "server-common.h"
 
 #include <sstream>
@@ -1616,6 +1617,30 @@ std::string server_task_result_metrics::to_metrics() {
             prometheus << "llamacpp:spec_decode_num_accepted_tokens_per_pos_total{position=\""
                        << i << "\"} " << metrics.n_accepted_per_pos[i] << "\n";
         }
+    }
+
+    // fallback ledger (GGML_LEDGER=1 or --fallback-ledger): which route each op took and why a fast path was skipped
+    if (ggml_ledger_enabled()) {
+        prometheus << "# HELP llamacpp:fallback_ledger_total Route and fallback counters from the fallback ledger\n"
+                   << "# TYPE llamacpp:fallback_ledger_total counter\n";
+        ggml_ledger_foreach([](const char * site, const char * key, int64_t count, void * user_data) {
+            auto & os = *(std::stringstream *) user_data;
+            auto esc = [](const char * v) {
+                std::string out;
+                for (const char * c = v; *c; ++c) {
+                    if (*c == '\\' || *c == '"') {
+                        out += '\\';
+                        out += *c;
+                    } else if (*c == '\n') {
+                        out += "\\n";
+                    } else {
+                        out += *c;
+                    }
+                }
+                return out;
+            };
+            os << "llamacpp:fallback_ledger_total{site=\"" << esc(site) << "\",key=\"" << esc(key) << "\"} " << count << "\n";
+        }, &prometheus);
     }
 
     return prometheus.str();
