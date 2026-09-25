@@ -12,20 +12,29 @@
 //
 // Cases:
 //   identity  131,072 KV / 1,024 Q, D 256, 4 KV heads, GQA 4 and 6, K/V q8_0/q8_0 and tq5_0/turbo4. The f16 copies
-//             are 512 MiB, so every budget arm below takes the bounded plan here. Gate: output bytes equal to arm
-//             "unset" for plans with 1 or 2 KV heads per group. The 3-head ragged plan (groups 3+1) is reported only.
+//             are 512 MiB, so every budget arm below takes the bounded plan here. f64 reference on every 32nd query row
+//             plus the last.
+//   prod      the ATX attention shape (server log: 24 query heads, 4 KV heads, GQA 6, D 256, tq5_0/turbo4) at
+//             262,144 KV / 1,024 Q. Every budget arm takes 1 KV head per group. Same reference rows as identity.
 //   tolerance 8,192 KV / 128 Q, the same pairs, GQA 6 and 4, plus a sinks case. The f16 copies are 32 MiB, so
 //             budgets 1/20/27 give 1/2/3 KV heads per group, and 256/272/410 fit the full copies (plan off, output
-//             identical). Reports max |bounded - unbounded| and max |x - f64 reference| for both kernels. The reference
-//             covers every 4th query row plus the last. Gates, with R = max |reference|:
-//               A: max |bounded - unbounded| <= 5e-3 * R
-//               B: max |bounded - ref| <= max |unbounded - ref| + 5e-3 * R
+//             identical). f64 reference on every 4th query row plus the last.
 //   excluded  ALiBi (max_bias 8), D 128, and a single KV head (8,192 / 128). Gate: identical to "unset" and no bounded
 //             ledger row.
-//   dst view  the first tolerance case with dst as a view of a plain tensor. Gate: identical to the reserved run in the
-//             same child, and the ledger shows scratch=bounded-pool.
-// For every bounded case the fallback ledger ("cuda.fattn" f16_convert rows) must show the bounded scratch with the
-// expected heads per group (computed independently below) and no full-copy row. Arm "unset" must show no bounded row.
+// Gates for every bounded case. The bounded route runs the unbounded kernel once per group with fewer KV heads, so only
+// the grid differs. Whether that changes the summation order is decided by mma_grid() below, which mirrors the
+// stream-k choice in launch_fattn:
+//   same order (neither the unbounded launch nor any group launch uses stream-k): output bytes equal to arm "unset".
+//   order differs, or cannot be derived (unknown GPU): with R = max |reference| and errors taken on the reference rows,
+//     a: max |bounded - ref| <= max |unbounded - ref| * 1.10
+//     b: max |bounded - unbounded| <= max |unbounded - ref| + 5e-3 * R
+//   The CASE line prints max |bounded - unbounded| (all rows and reference rows), both errors vs the reference, and R.
+// dst view: the first tolerance case with dst as a view of a plain tensor. Gate: identical to the reserved run in the
+// same child, and the ledger shows scratch=bounded-pool.
+// For every bounded case the fallback ledger ("cuda.fattn" f16_convert rows) must show exactly one live bounded row,
+// counted once, with "heads=h/n" equal to the expected heads per group (computed independently below) and the case's
+// KV head count, and no full-copy row. Ledger slots outlive ggml_ledger_reset (it zeroes the counts), so rows with
+// count 0 belong to earlier cases and are skipped. Arm "unset" must show no bounded row.
 // PLAN lines: ggml_backend_buft_get_alloc_size for the ATX FLASH_ATTN_EXT shape (24 query heads, 4 KV heads, D 256,
 // n_q 1,024, tq5_0 K / turbo4 V) at n_kv 100,352 / 131,072 / 245,760 / 262,144. For bounded arms the size must equal
 // pad128(nbytes(dst)) + max(heads * (2 * kv_per_head + out_per_head), budget).
@@ -39,6 +48,7 @@
 #include "ggml-ledger.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
@@ -47,6 +57,7 @@
 #include <map>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 #ifndef _WIN32
@@ -78,6 +89,7 @@ static std::vector<case_def> make_cases() {
             c.push_back({ KIND_IDENTITY, p.first, p.second, 256, 131072, 1024, 4*gqa, 4, false, 0.0f, "identity" });
         }
     }
+    c.push_back({ KIND_IDENTITY, GGML_TYPE_TQ5_0, GGML_TYPE_TURBO4_0, 256, 262144, 1024, 24, 4, false, 0.0f, "identity:prod" });
     for (const auto & p : pairs) {
         for (int64_t gqa : { 6, 4 }) {
             c.push_back({ KIND_TOLERANCE, p.first, p.second, 256, 8192, 128, 4*gqa, 4, false, 0.0f, "tolerance" });
@@ -104,6 +116,78 @@ static int expected_heads(const case_def & c, size_t budget_mib) {
         return 0;
     }
     return (int) std::min<size_t>(std::max<size_t>(budget / floor1, 1), size_t(c.n_head_kv));
+}
+
+// Summation order of one MMA f16 launch, re-derived from the source for D 256 on Ampere (sm_86), causal mask,
+// max_bias 0, n_kv % 256 == 0, no sparse path (op_params[4] is 0 here):
+//   ncols2 = 8 if gqa > 4, else 4 if gqa > 2 (use_gqa_opt)       fattn.cu ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2
+//   ncols1 = 64 / ncols2 when n_q > 32 / ncols2                    fattn.cu ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1
+//   ntiles = ceil(n_q / ncols1) * ceil(gqa / ncols2) * kv_heads    fattn-common.cuh launch_fattn (ntiles_dst)
+//   stream-k when 100 * ntiles / (max_blocks * waves) < 75, with max_blocks = blocks/SM * n_SM (should_use_stream_k)
+// Without stream-k every block owns one output tile and walks the whole KV range, so the per-element order does not
+// depend on the grid. With stream-k a tile's KV range is split over blocks at grid-dependent points and merged by a
+// fixup kernel, so a different tile count gives a different order. blocks/SM = 2 is the occupancy of the (8, 8) and
+// (16, 4) D 256 kernels in this build (255 registers x 128 threads, cuobjdump of libggml-cuda.so, sm_86). Shapes
+// outside this table return known = false and are treated as "order may differ".
+struct grid_info {
+    bool    known    = false;
+    bool    stream_k = false;
+    int64_t ntiles   = 0;
+    int64_t nblocks  = 0;
+};
+
+static grid_info mma_grid(const case_def & c, int64_t kv_heads, int n_sm) {
+    grid_info g;
+    const int64_t gqa = c.n_head / c.n_head_kv;
+    if (n_sm <= 0 || c.D != 256 || c.max_bias != 0.0f || c.n_kv % 256 != 0 || gqa <= 2) {
+        return g;
+    }
+    const int64_t ncols2 = gqa > 4 ? 8 : 4;
+    if (c.n_q <= 32 / ncols2) {
+        return g;
+    }
+    const int64_t ncols1     = 64 / ncols2;
+    const int64_t max_blocks = 2 * int64_t(n_sm);
+    const int64_t nbatch_fa  = 32; // ggml_cuda_fattn_mma_get_config, (256, 256, 64) on Ampere
+    g.ntiles = (c.n_q + ncols1 - 1) / ncols1 * ((gqa + ncols2 - 1) / ncols2) * kv_heads;
+    const int64_t waves = (g.ntiles + max_blocks - 1) / max_blocks;
+    g.stream_k = 100 * g.ntiles / (max_blocks * waves) < 75;
+    g.nblocks  = g.ntiles;
+    if (g.stream_k) {
+        const int64_t raw     = std::min(max_blocks, (c.n_kv + nbatch_fa - 1) / nbatch_fa * g.ntiles);
+        const int64_t rounded = raw / g.ntiles * g.ntiles;
+        const int64_t loss    = rounded > 0 ? 100 * (raw - rounded) / raw : 100;
+        g.nblocks = loss <= 5 ? rounded : raw;
+    }
+    g.known = true;
+    return g;
+}
+
+// true when the unbounded launch and every group launch (groups of h KV heads, the last one possibly smaller) run
+// without stream-k; `desc` gets the tile counts, "/sk<blocks>" marks a stream-k launch
+static bool same_order(const case_def & c, int h, int n_sm, std::string & desc) {
+    const grid_info u = mma_grid(c, c.n_head_kv, n_sm);
+    if (!u.known) {
+        desc = " order=unknown";
+        return false;
+    }
+    auto launch = [](const grid_info & g) {
+        return std::to_string(g.ntiles) + (g.stream_k ? "/sk" + std::to_string(g.nblocks) : std::string());
+    };
+    bool same = !u.stream_k;
+    std::string tiles = " tiles[unbounded " + launch(u) + " groups";
+    for (int64_t first = 0; first < c.n_head_kv; first += h) {
+        const grid_info g = mma_grid(c, std::min<int64_t>(h, c.n_head_kv - first), n_sm);
+        same = same && g.known && !g.stream_k;
+        tiles += " " + launch(g);
+    }
+    desc = std::string(" order=") + (same ? "same" : "differs") + tiles + "]";
+    return same;
+}
+
+// SM count for the order table; 0 (unknown GPU) makes every bounded case take the tolerance gates
+static int known_sm_count(const char * description) {
+    return description != nullptr && strstr(description, "RTX 3090 Ti") != nullptr ? 84 : 0;
 }
 
 struct case_data {
@@ -172,8 +256,10 @@ static const std::vector<ggml_fp16_t> & get_mask(int64_t n_kv, int64_t n_q) {
     return m;
 }
 
-// f64 reference: dequantized K/V (to_float, the same rotated domain the CUDA converters produce), f32 Q, exact softmax
-static void build_reference(const case_def & c, case_data & d) {
+// f64 reference: dequantized K/V (to_float, the same rotated domain the CUDA converters produce), f32 Q, exact softmax.
+// Rows: every `step`-th query row plus the last. One task per (row, KV head) covers that KV head's gqa query heads, so
+// each K/V row is read once per task. Tasks run on up to 16 threads, all joined before any fork.
+static void build_reference(const case_def & c, case_data & d, int64_t step) {
     const int64_t D = c.D;
     const ggml_type_traits * tk = ggml_get_type_traits(c.tk);
     const ggml_type_traits * tv = ggml_get_type_traits(c.tv);
@@ -186,7 +272,7 @@ static void build_reference(const case_def & c, case_data & d) {
         tk->to_float(d.k->data() + size_t(r) * rbk, kf.data() + size_t(r) * D, D);
         tv->to_float(d.v->data() + size_t(r) * rbv, vf.data() + size_t(r) * D, D);
     }
-    for (int64_t j = 0; j < c.n_q; j += 4) {
+    for (int64_t j = 0; j < c.n_q; j += step) {
         d.ref_rows.push_back(j);
     }
     if (d.ref_rows.back() != c.n_q - 1) {
@@ -195,53 +281,85 @@ static void build_reference(const case_def & c, case_data & d) {
     const double  scale = 1.0 / std::sqrt((double) D);
     const int64_t gqa   = c.n_head / c.n_head_kv;
     d.ref.assign(d.ref_rows.size() * size_t(c.n_head) * D, 0.0);
-    std::vector<double> logit(static_cast<size_t>(c.n_kv));
-    std::vector<double> acc(static_cast<size_t>(D));
-    for (size_t ri = 0; ri < d.ref_rows.size(); ++ri) {
-        const int64_t j = d.ref_rows[ri];
-        for (int64_t h = 0; h < c.n_head; ++h) {
-            const int64_t hk = h / gqa;
-            const float * qv = d.q.data() + size_t((j*c.n_head + h) * D);
-            double mx = -INFINITY;
+
+    const size_t n_tasks = d.ref_rows.size() * size_t(c.n_head_kv);
+    std::atomic<size_t> next(0);
+    auto worker = [&]() {
+        std::vector<double> logit(size_t(gqa * c.n_kv));
+        std::vector<double> acc(size_t(gqa * D));
+        std::vector<double> mx(size_t(gqa));
+        std::vector<double> sum(size_t(gqa));
+        for (size_t t = next++; t < n_tasks; t = next++) {
+            const size_t  ri = t / size_t(c.n_head_kv);
+            const int64_t hk = int64_t(t % size_t(c.n_head_kv));
+            const int64_t j  = d.ref_rows[ri];
+            const float * q0 = d.q.data() + size_t((j*c.n_head + hk*gqa) * D); // gqa consecutive heads
+            std::fill(mx.begin(), mx.end(), -INFINITY);
             for (int64_t i = 0; i < c.n_kv; ++i) {
                 const float mval = ggml_fp16_to_fp32((*d.m)[size_t(j)*c.n_kv + i]);
                 if (std::isinf(mval)) {
-                    logit[i] = -INFINITY;
+                    for (int64_t g = 0; g < gqa; ++g) {
+                        logit[size_t(g*c.n_kv + i)] = -INFINITY;
+                    }
                     continue;
                 }
                 const float * kr = kf.data() + size_t((i*c.n_head_kv + hk) * D);
-                double dot = 0.0;
-                for (int64_t e = 0; e < D; ++e) {
-                    dot += double(qv[e]) * double(kr[e]);
+                for (int64_t g = 0; g < gqa; ++g) {
+                    const float * qv = q0 + g*D;
+                    double dot = 0.0;
+                    for (int64_t e = 0; e < D; ++e) {
+                        dot += double(qv[e]) * double(kr[e]);
+                    }
+                    const double l = dot * scale + mval;
+                    logit[size_t(g*c.n_kv + i)] = l;
+                    mx[g] = std::max(mx[g], l);
                 }
-                logit[i] = dot * scale + mval;
-                mx = std::max(mx, logit[i]);
             }
-            if (c.sinks) {
-                mx = std::max(mx, (double) d.s[h]);
+            for (int64_t g = 0; g < gqa; ++g) {
+                if (c.sinks) {
+                    mx[g] = std::max(mx[g], (double) d.s[size_t(hk*gqa + g)]);
+                }
+                sum[g] = 0.0;
             }
-            double sum = 0.0;
             std::fill(acc.begin(), acc.end(), 0.0);
             for (int64_t i = 0; i < c.n_kv; ++i) {
-                if (std::isinf(logit[i])) {
-                    continue;
-                }
-                const double p = std::exp(logit[i] - mx);
-                sum += p;
                 const float * vr = vf.data() + size_t((i*c.n_head_kv + hk) * D);
-                for (int64_t e = 0; e < D; ++e) {
-                    acc[e] += p * double(vr[e]);
+                for (int64_t g = 0; g < gqa; ++g) {
+                    const double l = logit[size_t(g*c.n_kv + i)];
+                    if (std::isinf(l)) {
+                        continue;
+                    }
+                    const double p = std::exp(l - mx[g]);
+                    sum[g] += p;
+                    double * a = acc.data() + g*D;
+                    for (int64_t e = 0; e < D; ++e) {
+                        a[e] += p * double(vr[e]);
+                    }
                 }
             }
-            if (c.sinks) {
-                sum += std::exp(double(d.s[h]) - mx);
-            }
-            double * o = d.ref.data() + (ri*c.n_head + h) * D;
-            for (int64_t e = 0; e < D; ++e) {
-                o[e] = acc[e] / sum;
-                d.ref_max = std::max(d.ref_max, std::fabs(o[e]));
+            for (int64_t g = 0; g < gqa; ++g) {
+                const int64_t h = hk*gqa + g;
+                if (c.sinks) {
+                    sum[g] += std::exp(double(d.s[size_t(h)]) - mx[g]);
+                }
+                double * o = d.ref.data() + (ri*c.n_head + h) * D;
+                for (int64_t e = 0; e < D; ++e) {
+                    o[e] = acc[size_t(g*D + e)] / sum[g];
+                }
             }
         }
+    };
+    const size_t n_threads = std::min<size_t>(std::max(1u, std::thread::hardware_concurrency()), 16);
+    std::vector<std::thread> pool;
+    for (size_t i = 1; i < std::min(n_threads, n_tasks); ++i) {
+        pool.emplace_back(worker);
+    }
+    worker();
+    for (std::thread & th : pool) {
+        th.join();
+    }
+    for (const double o : d.ref) {
+        d.ref_max = std::max(d.ref_max, std::fabs(o));
     }
 }
 
@@ -261,8 +379,8 @@ static void build_inputs(const case_def & c, case_data & d, uint32_t seed) {
             x = nd(rng);
         }
     }
-    if (c.kind == KIND_TOLERANCE) {
-        build_reference(c, d);
+    if (c.kind != KIND_EXCLUDED) {
+        build_reference(c, d, c.kind == KIND_TOLERANCE ? 4 : 32);
     }
 }
 
@@ -274,13 +392,18 @@ struct ledger_counts {
     int64_t bounded_pool     = 0;
     int64_t full_reserved    = 0;
     int64_t full_pool        = 0;
-    int     heads            = -1; // from the bounded row's "heads=h/nh"
-    int     heads_rows       = 0;  // distinct bounded keys seen
+    int     heads            = -1; // from the bounded row's "heads=h/nh": h
+    int     heads_nkv        = -1; // nh
+    int     heads_rows       = 0;  // live bounded keys seen
+    int64_t heads_count      = 0;  // bounded launches counted on those keys
     std::map<std::string, int64_t> graph; // cuda.graph outcome -> count
 };
 
 static void ledger_cb(const char * site, const char * key, int64_t count, void * user_data) {
     ledger_counts * c = (ledger_counts *) user_data;
+    if (count == 0) {
+        return; // a slot from an earlier case: ggml_ledger_reset zeroes counts but keeps the slots
+    }
     if (strcmp(site, "cuda.graph") == 0) {
         const char * sp = strchr(key, ' ');
         c->graph[sp ? std::string(key, sp - key) : std::string(key)] += count;
@@ -298,10 +421,13 @@ static void ledger_cb(const char * site, const char * key, int64_t count, void *
     } else if (strstr(key, "scratch=pool") != nullptr) {
         c->full_pool += count;
     }
-    const char * h = strstr(key, "heads=");
+    const char * h = strstr(key, "scratch=bounded-") != nullptr ? strstr(key, "heads=") : nullptr;
     if (h != nullptr) {
-        c->heads = atoi(h + 6);
+        if (sscanf(h + 6, "%d/%d", &c->heads, &c->heads_nkv) != 2) {
+            c->heads = c->heads_nkv = -1;
+        }
         c->heads_rows++;
+        c->heads_count += count;
     }
 }
 
@@ -403,6 +529,22 @@ static double max_abs_vs_ref(const case_def & c, const case_data & d, const std:
                 if (!(dd <= mx)) {
                     mx = std::isnan(dd) ? INFINITY : dd;
                 }
+            }
+        }
+    }
+    return mx;
+}
+
+// max |a - b| on the reference rows only, the same rows the errors vs the reference are taken on
+static double max_abs_diff_ref_rows(const case_def & c, const case_data & d, const std::vector<float> & a,
+                                    const std::vector<float> & b) {
+    double mx = 0.0;
+    for (const int64_t j : d.ref_rows) {
+        const size_t o = size_t(j * c.n_head * c.D);
+        for (size_t i = o; i < o + size_t(c.n_head * c.D); ++i) {
+            const double dd = std::fabs(double(a[i]) - double(b[i]));
+            if (!(dd <= mx)) {
+                mx = std::isnan(dd) ? INFINITY : dd;
             }
         }
     }
@@ -538,6 +680,11 @@ static int child_main(const arm_def & arm, int out_fd) {
 
     plan_lines(dev, arm, n_fail);
 
+    const char * dev_desc = ggml_backend_dev_description(dev);
+    const int    n_sm     = known_sm_count(dev_desc);
+    printf("DEVICE arm=%s \"%s\" n_sm=%d%s\n", arm.name, dev_desc ? dev_desc : "?", n_sm,
+           n_sm > 0 ? "" : " (not in the order table: every bounded case takes the tolerance gates)");
+
     for (size_t ci = 0; ci < g_cases.size(); ++ci) {
         const case_def & c = g_cases[ci];
         const case_data & d = g_data[ci];
@@ -574,7 +721,7 @@ static int child_main(const arm_def & arm, int out_fd) {
                 const bool rep = memcmp(again.data(), out.data(), out.size()*sizeof(float)) == 0;
                 info += rep ? " unbounded_repeatable" : " unbounded_NOT_repeatable";
             }
-            if (c.kind == KIND_TOLERANCE) {
+            if (c.kind != KIND_EXCLUDED) {
                 snprintf(buf, sizeof(buf), " max|unbounded-ref|=%.3e R=%.3e", max_abs_vs_ref(c, d, out), d.ref_max);
                 info += buf;
             }
@@ -598,42 +745,43 @@ static int child_main(const arm_def & arm, int out_fd) {
                 if (l.bounded_pool != 0 || l.full_reserved != 0 || l.full_pool != 0) {
                     why += " unexpected_scratch_rows";
                 }
-                if (l.heads != h || l.heads_rows != 1) {
-                    snprintf(buf, sizeof(buf), " heads=%d(rows %d)!=expected_%d", l.heads, l.heads_rows, h);
+                // one live bounded row, counted once, naming this plan's heads per group and the case's KV heads
+                if (l.heads_rows != 1 || l.heads_count != 1 || l.heads != h || l.heads_nkv != c.n_head_kv) {
+                    snprintf(buf, sizeof(buf), " heads=%d/%d(rows %d, launches %lld)!=expected_%d/%lld", l.heads, l.heads_nkv,
+                             l.heads_rows, (long long) l.heads_count, h, (long long) c.n_head_kv);
                     why += buf;
                 }
-                if (c.kind == KIND_IDENTITY) {
-                    const bool ragged = c.n_head_kv % h != 0;
-                    snprintf(buf, sizeof(buf), " %s max|bounded-unbounded|=%.3e%s", same ? "identical" : "differs", dmax,
-                             ragged ? " (ragged groups: reported only)" : "");
+                std::string order;
+                const bool order_same = same_order(c, h, n_sm, order);
+                const double e_b   = max_abs_vs_ref(c, d, out);
+                const double e_u   = max_abs_vs_ref(c, d, ref);
+                const double drows = same ? 0.0 : max_abs_diff_ref_rows(c, d, out, ref);
+                snprintf(buf, sizeof(buf), " %s max|bounded-unbounded|=%.3e (ref rows %.3e) max|bounded-ref|=%.3e "
+                         "max|unbounded-ref|=%.3e R=%.3e", same ? "identical" : "differs", dmax, drows, e_b, e_u, d.ref_max);
+                info += order + buf;
+                if (order_same) {
+                    if (!same) {
+                        why += " bytes_differ(same_order)";
+                    }
+                } else {
+                    if (!(e_b <= e_u * 1.10)) {
+                        why += " gate_a(bounded_ref>1.10*unbounded_ref)";
+                    }
+                    if (!(drows <= e_u + 5e-3 * d.ref_max)) {
+                        why += " gate_b(bounded_unbounded>unbounded_ref+5e-3*R)";
+                    }
+                }
+                // dst as a view: the executor must fall back to the pool and give the same bytes
+                if (ci == first_tolerance_case()) {
+                    std::vector<float> outv;
+                    ledger_counts lv;
+                    run_case(backend, c, d, true, outv, lv);
+                    const bool vsame = memcmp(outv.data(), out.data(), out.size()*sizeof(float)) == 0;
+                    snprintf(buf, sizeof(buf), " dst_view:%s pool_rows=%lld reserved_rows=%lld",
+                             vsame ? "identical" : "differs", (long long) lv.bounded_pool, (long long) lv.bounded_reserved);
                     info += buf;
-                    if (!same && !ragged) {
-                        why += " bytes_differ";
-                    }
-                } else if (c.kind == KIND_TOLERANCE) {
-                    const double e_b = max_abs_vs_ref(c, d, out);
-                    const double e_u = max_abs_vs_ref(c, d, ref);
-                    snprintf(buf, sizeof(buf), " %s max|bounded-unbounded|=%.3e max|bounded-ref|=%.3e max|unbounded-ref|=%.3e R=%.3e",
-                             same ? "identical" : "differs", dmax, e_b, e_u, d.ref_max);
-                    info += buf;
-                    if (!(dmax <= 5e-3 * d.ref_max)) {
-                        why += " gateA";
-                    }
-                    if (!(e_b <= e_u + 5e-3 * d.ref_max)) {
-                        why += " gateB";
-                    }
-                    // dst as a view: the executor must fall back to the pool and give the same bytes
-                    if (ci == first_tolerance_case()) {
-                        std::vector<float> outv;
-                        ledger_counts lv;
-                        run_case(backend, c, d, true, outv, lv);
-                        const bool vsame = memcmp(outv.data(), out.data(), out.size()*sizeof(float)) == 0;
-                        snprintf(buf, sizeof(buf), " dst_view:%s pool_rows=%lld reserved_rows=%lld",
-                                 vsame ? "identical" : "differs", (long long) lv.bounded_pool, (long long) lv.bounded_reserved);
-                        info += buf;
-                        if (!vsame || lv.bounded_pool == 0 || lv.bounded_reserved != 0) {
-                            why += " dst_view";
-                        }
+                    if (!vsame || lv.bounded_pool == 0 || lv.bounded_reserved != 0) {
+                        why += " dst_view";
                     }
                 }
             }
