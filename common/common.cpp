@@ -1328,11 +1328,16 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         }
         cparams_dft.n_rs_seq = 0;
 
+        // an MTP context borrows the target's compute buffers unless LLAMA_SHARED_COMPUTE=0 (see llama_context)
+        const char * shared_compute_env = std::getenv("LLAMA_SHARED_COMPUTE");
+        const bool   shared_compute     = shared_compute_env == nullptr || shared_compute_env[0] != '0';
+
         const common_fit_extra_model extra = {
-            /*.path_model   =*/ params_dft.model.path.c_str(),
-            /*.mparams      =*/ &mparams_dft,
-            /*.cparams      =*/ &cparams_dft,
-            /*.shares_model =*/ !has_draft, // an MTP context runs on the weights of the main model
+            /*.path_model     =*/ params_dft.model.path.c_str(),
+            /*.mparams        =*/ &mparams_dft,
+            /*.cparams        =*/ &cparams_dft,
+            /*.shares_model   =*/ !has_draft, // an MTP context runs on the weights of the main model
+            /*.shares_compute =*/ !has_draft && spec_mtp && shared_compute,
         };
 
         const common_params_fit_status fit_status = common_fit_params(
