@@ -5921,6 +5921,32 @@ struct test_mul_mat_id : public test_case {
     }
 };
 
+// MUL_MAT_ID with one-row experts (m = 1, n = 1): the output is just n_used scalars. With n_used = 1 the NMSE is the
+// squared relative error of a single dot product, which explodes whenever the random dot product lands near 0: the
+// CPU reference quantizes the activations to q8_K (256-value blocks) for K-quants and IQ types while CUDA MMVQ uses
+// q8_1 (32-value blocks), a fixed absolute gap of ~0.04 at k = 512 (rms output ~7.5), and ~14% of n_used = 1 runs
+// failed 5e-4 on the random draw alone. The denominator is floored at the expected output power for the uniform
+// inputs, n_vals * k * amax^2 / 9 (E[w^2] = 1/3 for U(-1, 1) weights, E[x^2] = amax^2/3), i.e. the error is
+// normalised by the typical output magnitude rather than by the one output that happened to be drawn. It only binds
+// when the drawn outputs are smaller than typical; a wrong row, a dropped block or a bad scale still scores
+// >> 5e-4 (a 0.17 absolute error on one k = 512 output already fails). CPU Monte Carlo of the q8_1-vs-q8_K gap,
+// 2M draws: 10 over 5e-4 (5e-6 per case) vs 14% unfloored.
+struct test_mul_mat_id_onerow : public test_mul_mat_id {
+    using test_mul_mat_id::test_mul_mat_id;
+
+    double err(const float * a, const float * b, size_t n_vals) override {
+        double mse_a_b = 0.0;
+        double mse_a_0 = 0.0;
+        for (size_t i = 0; i < n_vals; i++) {
+            const double d = double(a[i]) - double(b[i]);
+            mse_a_b += d * d;
+            mse_a_0 += double(a[i]) * double(a[i]);
+        }
+        const double floor_a_0 = double(n_vals) * double(k) * double(amax) * double(amax) / 9.0;
+        return mse_a_b / std::max(mse_a_0, floor_a_0);
+    }
+};
+
 // GGML_OP_MUL_MAT_ID + GGML_OP_ADD or GGML_OP_MUL
 struct test_mul_mat_id_fusion : public test_case {
     const ggml_type type_a;
@@ -11682,9 +11708,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_F16, GGML_TYPE_F32, 16, 16, false, 32, 32, 32, 3));
 
     // Indexed draft heads: one-row experts, shared activation, and partial warp groups.
+    // test_mul_mat_id_onerow: 1..17 scalar outputs, error normalised by the expected output power (see the struct).
     for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS}) {
         for (int n_used : {1, 3, 17}) {
-            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 17, n_used, true, 1, 1, 512));
+            test_cases.emplace_back(new test_mul_mat_id_onerow(type, GGML_TYPE_F32, 17, n_used, true, 1, 1, 512));
         }
     }
 
