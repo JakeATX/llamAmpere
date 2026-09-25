@@ -34,7 +34,8 @@ gated_delta_net_cuda(const float * q,
                                      float         scale,
                                      int64_t       state_slot_stride,
                                      int           K,
-                                     const int32_t * slot_rows) {
+                                     const int32_t * slot_rows,
+                                     const ggml_cuda_gated_delta_net_state_src state_src) {
     const uint32_t h_idx    = blockIdx.x;
     const uint32_t sequence = blockIdx.y;
     // each warp owns one column, using warp-level primitives to reduce across rows
@@ -53,8 +54,9 @@ gated_delta_net_cuda(const float * q,
     // (seq,head)'s slot-0 storage either way. `state` (unoffset) is kept around separately so
     // the trailing final-state block (always S_v*S_v-shaped, at a fixed offset past all K
     // ingredient slots) can be addressed too.
+    // [#87] state_src.rows: this sequence's input state is cache row rows[sequence] (read after the
+    // PDL sync below, the rows are an input of the graph); otherwise src[5] at sequence * D
     const int64_t state_in_offset = sequence * H * S_v * S_v + h_idx * S_v * S_v;
-    curr_state += state_in_offset + col * S_v;
     attn_data += (sequence * n_tokens * H + h_idx) * S_v;
 
     float * state_out;
@@ -71,6 +73,9 @@ gated_delta_net_cuda(const float * q,
     // state is stored transposed: M[col][i] = S[i][col], row col is contiguous
 
     ggml_cuda_pdl_sync();
+    curr_state += (state_src.rows != nullptr
+                       ? (int64_t) state_src.rows[sequence] * state_src.row_stride + h_idx * S_v * S_v
+                       : state_in_offset) + col * S_v;
 #pragma unroll
     for (int r = 0; r < rows_per_lane; r++) {
         const int i = r * warp_size + lane;
@@ -269,7 +274,8 @@ gated_delta_net_cuda_ilp(const float * q,
                          float         scale,
                          int64_t       state_slot_stride,
                          int           K,
-                         const int32_t * slot_rows) {
+                         const int32_t * slot_rows,
+                         const ggml_cuda_gated_delta_net_state_src state_src) {
     const uint32_t h_idx    = blockIdx.x;
     const uint32_t sequence = blockIdx.y;
     const int      lane     = threadIdx.x;
@@ -284,7 +290,6 @@ gated_delta_net_cuda_ilp(const float * q,
     const int64_t state_out_offset = (sequence * H + h_idx) * S_v * S_v;
     float * const state_base = state; // unoffset, for the slot_rows form
     state      += state_out_offset;
-    curr_state += state_in_offset + col0 * S_v;
     attn_data  += (sequence * n_tokens * H + h_idx) * S_v;
 
     constexpr int warp_size = ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v;
@@ -294,6 +299,10 @@ gated_delta_net_cuda_ilp(const float * q,
     float s_shard[NC][rows_per_lane];
 
     ggml_cuda_pdl_sync();
+    // [#87] see gated_delta_net_cuda: cache row rows[sequence], or src[5] at sequence * D
+    curr_state += (state_src.rows != nullptr
+                       ? (int64_t) state_src.rows[sequence] * state_src.row_stride + h_idx * S_v * S_v
+                       : state_in_offset) + col0 * S_v;
 #pragma unroll
     for (int c = 0; c < NC; c++) {
 #pragma unroll
@@ -465,7 +474,8 @@ static void launch_gated_delta_net_ilp_inst(
         int64_t sv1,   int64_t sv2, int64_t sv3,
         int64_t sb1,   int64_t sb2, int64_t sb3,
         int64_t neqk1, int64_t rq3,
-        float scale, int64_t state_slot_stride, int K, const int32_t * slot_rows, cudaStream_t stream) {
+        float scale, int64_t state_slot_stride, int K, const int32_t * slot_rows,
+        const ggml_cuda_gated_delta_net_state_src state_src, cudaStream_t stream) {
     constexpr int S_v = 128;
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     const int num_warps = 4;
@@ -480,7 +490,7 @@ static void launch_gated_delta_net_ilp_inst(
     ggml_cuda_kernel_launch(gated_delta_net_cuda_ilp<S_v, keep_rs_t, NC, PREFETCH>, launch_params,
         q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
         n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-        sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, slot_rows);
+        sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, slot_rows, state_src);
 }
 
 // returns false when this path does not apply; caller falls back to the original kernel
@@ -494,7 +504,8 @@ static bool launch_gated_delta_net_ilp(
         int64_t sv1,   int64_t sv2, int64_t sv3,
         int64_t sb1,   int64_t sb2, int64_t sb3,
         int64_t neqk1, int64_t rq3,
-        float scale, int64_t state_slot_stride, int K, const int32_t * slot_rows, cudaStream_t stream) {
+        float scale, int64_t state_slot_stride, int K, const int32_t * slot_rows,
+        const ggml_cuda_gated_delta_net_state_src state_src, cudaStream_t stream) {
     const int  nc       = ggml_cuda_sm86_gdn_cols();
     const bool prefetch = ggml_cuda_sm86_gdn_prefetch();
     if (S_v != 128 || n_tokens < 2 || (nc == 1 && !prefetch)) {
@@ -502,7 +513,7 @@ static bool launch_gated_delta_net_ilp(
     }
 #define GDN_ILP_LAUNCH(NC_, PF_) \
     launch_gated_delta_net_ilp_inst<keep_rs_t, NC_, PF_>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, \
-        H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, slot_rows, stream)
+        H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, slot_rows, state_src, stream)
     if (nc == 8) {
         if (prefetch) { GDN_ILP_LAUNCH(8, true); } else { GDN_ILP_LAUNCH(8, false); }
     } else if (nc == 4) {
@@ -526,7 +537,8 @@ static void launch_gated_delta_net(
         int64_t sv1,   int64_t sv2, int64_t sv3,
         int64_t sb1,   int64_t sb2, int64_t sb3,
         int64_t neqk1, int64_t rq3,
-        float scale, int64_t state_slot_stride, int K, const int32_t * slot_rows, cudaStream_t stream) {
+        float scale, int64_t state_slot_stride, int K, const int32_t * slot_rows,
+        const ggml_cuda_gated_delta_net_state_src state_src, cudaStream_t stream) {
     //TODO: Add chunked kernel for even faster pre-fill
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     const int num_warps = 4;
@@ -542,26 +554,26 @@ static void launch_gated_delta_net(
             ggml_cuda_kernel_launch(gated_delta_net_cuda<16, KDA, keep_rs_t, emit_ingredients_t>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, slot_rows);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, slot_rows, state_src);
             break;
         case 32:
             ggml_cuda_kernel_launch(gated_delta_net_cuda<32, KDA, keep_rs_t, emit_ingredients_t>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, slot_rows);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, slot_rows, state_src);
             break;
         case 64: {
             ggml_cuda_kernel_launch(gated_delta_net_cuda<64, KDA, keep_rs_t, emit_ingredients_t>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, slot_rows);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, slot_rows, state_src);
             break;
         }
         case 128: {
             ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t, emit_ingredients_t>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, slot_rows);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, slot_rows, state_src);
             break;
         }
         default:
@@ -607,6 +619,22 @@ static void ggml_cuda_op_gated_delta_net_impl(
 
     const float * s_d   = (const float *) src_state->data;
     float *       dst_d = (float *) dst->data;
+
+    // [#87] the GET_ROWS that gathered src[5] from the recurrent cache was skipped by the graph
+    // evaluator (ggml_cuda_gdn_state_read_plan): read the source rows directly. Same floats, same
+    // positions, so the launch computes exactly what it would have from the gathered copy.
+    ggml_cuda_gated_delta_net_state_src state_src;
+    for (auto & e : ctx.gdn_state_reads) {
+        if (e.gdn == dst) {
+            GGML_ASSERT(!e.used);
+            s_d                  = e.base;
+            state_src.rows       = e.rows;
+            state_src.row_stride = e.row_stride;
+            e.used               = true;
+            ctx.fusion_stats.gdn_state_read++;
+            break;
+        }
+    }
 
     GGML_ASSERT(ggml_is_contiguous_rows(src_q));
     GGML_ASSERT(ggml_is_contiguous_rows(src_k));
@@ -657,39 +685,39 @@ static void ggml_cuda_op_gated_delta_net_impl(
         if (emit_ingr) {
             launch_gated_delta_net<true, true, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, slot_rows, stream);
+                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, slot_rows, state_src, stream);
         } else if (keep_rs) {
             launch_gated_delta_net<true, true, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, slot_rows, stream);
+                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, slot_rows, state_src, stream);
         } else {
             launch_gated_delta_net<true, false, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, slot_rows, stream);
+                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, slot_rows, state_src, stream);
         }
     } else {
         if (emit_ingr) {
             launch_gated_delta_net<false, true, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, slot_rows, stream);
+                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, slot_rows, state_src, stream);
         } else if (keep_rs) {
             if (launch_gated_delta_net_ilp<true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                     S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                    sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, slot_rows, stream)) {
+                    sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, slot_rows, state_src, stream)) {
                 return;
             }
             launch_gated_delta_net<false, true, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, slot_rows, stream);
+                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, slot_rows, state_src, stream);
         } else {
             if (launch_gated_delta_net_ilp<false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                     S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                    sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, slot_rows, stream)) {
+                    sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, slot_rows, state_src, stream)) {
                 return;
             }
             launch_gated_delta_net<false, false, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, slot_rows, stream);
+                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, slot_rows, state_src, stream);
         }
     }
 }

@@ -1264,6 +1264,8 @@ struct test_case {
     // Name of a backend fusion counter (see ggml_backend_cuda_fusion_count) that must advance while
     // the graph runs on the tested backend. Backends without the counter are not checked.
     virtual const char * required_fusion() { return nullptr; }
+    // Name of a backend fusion counter that must NOT advance (a guard that has to refuse the fusion).
+    virtual const char * forbidden_fusion() { return nullptr; }
     virtual bool use_weight_context() { return false; }
 
     ggml_cgraph * gf = nullptr;
@@ -1552,15 +1554,18 @@ struct test_case {
 
         typedef int64_t (*fusion_count_t)(ggml_backend_t, const char *);
         const char *   fusion        = fusion_off ? nullptr : required_fusion();
+        const char *   forbidden     = forbidden_fusion();
         fusion_count_t fusion_count  = nullptr;
         int64_t        fusion_before = -1;
-        if (fusion != nullptr) {
+        int64_t        forbidden_before = -1;
+        if (fusion != nullptr || forbidden != nullptr) {
             ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend1));
             if (reg != nullptr) {
                 fusion_count = (fusion_count_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_fusion_count");
             }
             if (fusion_count != nullptr) {
-                fusion_before = fusion_count(backend1, fusion);
+                fusion_before    = fusion != nullptr ? fusion_count(backend1, fusion) : 0;
+                forbidden_before = forbidden != nullptr ? fusion_count(backend1, forbidden) : 0;
             }
         }
 
@@ -1570,7 +1575,7 @@ struct test_case {
 
         bool        fusion_ok = true;
         std::string fusion_err;
-        if (fusion_count != nullptr) {
+        if (fusion_count != nullptr && fusion != nullptr) {
             if (fusion_before < 0) {
                 // the backend has the counters but does not know this name: a typo would otherwise
                 // disable the check silently, which defeats the point of having it
@@ -1579,6 +1584,15 @@ struct test_case {
             } else if (fusion_count(backend1, fusion) <= fusion_before) {
                 fusion_ok  = false;
                 fusion_err = std::string("fusion '") + fusion + "' did not fire";
+            }
+        }
+        if (fusion_count != nullptr && forbidden != nullptr) {
+            if (forbidden_before < 0) {
+                fusion_ok  = false;
+                fusion_err = std::string("unknown fusion counter '") + forbidden + "'";
+            } else if (fusion_count(backend1, forbidden) != forbidden_before) {
+                fusion_ok  = false;
+                fusion_err = std::string("fusion '") + forbidden + "' fired where its guard must refuse it";
             }
         }
 
@@ -5225,6 +5239,177 @@ struct test_gated_delta_net_cache_fusion : public test_case {
                 init_tensor_uniform(t, -0.3f, 5.0f);
             } else if (strcmp(t->name, "cache") == 0) {
                 init_tensor_uniform(t, 0.0f, 0.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// [#87] GET_ROWS(cache, s_copy) -> RESHAPE -> GATED_DELTA_NET, as build_rs + build_recurrent_attn emit it.
+// The CUDA backend skips the GET_ROWS and lets the gdn read cache row s_copy[s] itself; these cases check the
+// result against the CPU reference (which runs the gather), that the skip fires where it may (counter
+// "gdn_state_read") and that it is refused where it must be.
+struct test_gated_delta_net_state_read : public test_case {
+    enum cache_write_mode { CW_NONE = 0, CW_SET_ROWS = 1, CW_CPY = 2 };
+
+    const int64_t head_count;
+    const int64_t head_size;
+    const int64_t n_seq_tokens;
+    const int64_t n_seqs;
+    const int64_t K;
+    const int     cache_write;   // cache_write_mode
+    const std::vector<int32_t> src_rows;  // s_copy_main: cache row each sequence reads
+    const std::vector<int32_t> dst_rows;  // CW_SET_ROWS: snapshot rows, slot-major; CW_CPY: { first cell }
+    const bool    clobber;       // a cpy overwrites cache row src_rows[0] between the GET_ROWS and the gdn
+    const bool    kda;
+    const int32_t emit_mode;
+    const bool    expect_fusion;
+
+    static constexpr int64_t n_cells = 4;   // cache rows per rollback plane
+    static constexpr int64_t n_rows  = 20;  // 5 planes
+
+    std::vector<ggml_tensor *> check_nodes;
+
+    static std::string rows_str(const std::vector<int32_t> & r) {
+        std::string s = "[";
+        for (size_t i = 0; i < r.size(); ++i) {
+            s += (i ? "," : "") + std::to_string(r[i]);
+        }
+        return s + "]";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR10(head_count, head_size, n_seq_tokens, n_seqs, K, cache_write, clobber, kda, emit_mode, expect_fusion) +
+               ",src_rows=" + rows_str(src_rows) + ",dst_rows=" + rows_str(dst_rows);
+    }
+
+    test_gated_delta_net_state_read(int64_t head_count, int64_t head_size, int64_t n_seq_tokens, int64_t n_seqs, int64_t K,
+                                    int cache_write, std::vector<int32_t> src_rows, std::vector<int32_t> dst_rows,
+                                    bool clobber = false, bool kda = false, int32_t emit_mode = 0, bool expect_fusion = true)
+        : head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), K(K),
+          cache_write(cache_write), src_rows(std::move(src_rows)), dst_rows(std::move(dst_rows)),
+          clobber(clobber), kda(kda), emit_mode(emit_mode), expect_fusion(expect_fusion) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const ggml_type type = GGML_TYPE_F32;
+        const int64_t S_v = head_size;
+        const int64_t H   = head_count;
+        const int64_t T   = n_seq_tokens;
+        const int64_t D   = S_v * S_v * H;
+        const int64_t n_written = std::min<int64_t>(T, K);
+        GGML_ASSERT((int64_t) src_rows.size() == n_seqs);
+
+        check_nodes.clear();
+
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, type, D, n_rows);
+        ggml_set_name(cache, "cache_all");
+        ggml_tensor * s_copy = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seqs);
+        ggml_set_name(s_copy, "s_copy");
+
+        ggml_tensor * gathered = ggml_get_rows(ctx, cache, s_copy);
+        ggml_set_name(gathered, "state_gather");
+
+        if (clobber && mode == MODE_TEST) {
+            // pin the order GET_ROWS, clobbering cpy, ..., gdn: the cpy runs after the gather reads the row
+            ggml_build_forward_expand(gf, gathered);
+            ggml_tensor * junk = ggml_new_tensor_1d(ctx, type, D);
+            ggml_set_name(junk, "clobber");
+            ggml_tensor * row = ggml_view_1d(ctx, cache, D, (size_t) src_rows[0] * cache->nb[1]);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, junk, row));
+        }
+
+        ggml_tensor * state = ggml_reshape_4d(ctx, gathered, S_v, S_v, H, n_seqs);
+
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, type, S_v, H, T, n_seqs);
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, type, S_v, H, T, n_seqs);
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, type, S_v, H, T, n_seqs);
+        ggml_set_name(q, "q");
+        ggml_set_name(k, "k");
+        ggml_set_name(v, "v");
+        ggml_tensor * g    = ggml_new_tensor_4d(ctx, type, kda ? S_v : 1, H, T, n_seqs);
+        ggml_tensor * beta = ggml_new_tensor_4d(ctx, type, 1, H, T, n_seqs);
+        ggml_set_name(g,    "g");
+        ggml_set_name(beta, "beta");
+        q = ggml_l2_norm(ctx, q, 1e-6f);
+        k = ggml_l2_norm(ctx, k, 1e-6f);
+
+        ggml_tensor * gdn = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, K, emit_mode);
+        ggml_set_name(gdn, "gdn_out");
+
+        if (cache_write == CW_NONE) {
+            check_nodes.push_back(gdn);
+            return gdn;
+        }
+
+        const size_t tail_off = ggml_row_size(type, S_v * H * T * n_seqs);
+        ggml_tensor * snap;
+        if (cache_write == CW_SET_ROWS) {
+            GGML_ASSERT((int64_t) dst_rows.size() == n_written * n_seqs);
+            ggml_tensor * tail = ggml_view_2d(ctx, gdn, D, n_seqs * n_written, ggml_row_size(type, D), tail_off);
+            ggml_tensor * rows = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seqs * n_written);
+            ggml_set_name(rows, "snap_rows");
+            snap = ggml_set_rows(ctx, cache, tail, rows);
+        } else {
+            GGML_ASSERT(dst_rows.size() == 1);
+            ggml_tensor * tail = ggml_view_3d(ctx, gdn, D, n_seqs, n_written,
+                                              ggml_row_size(type, D), ggml_row_size(type, D * n_seqs), tail_off);
+            ggml_tensor * dst  = ggml_view_3d(ctx, cache, D, n_seqs, n_written,
+                                              cache->nb[1], n_cells * cache->nb[1], (size_t) dst_rows[0] * cache->nb[1]);
+            snap = ggml_cpy(ctx, tail, dst);
+        }
+        ggml_set_name(snap, "snap_write");
+
+        // attention scores, read after the snapshot write so the write stays the first node after the gdn
+        ggml_tensor * attn = ggml_cont(ctx, ggml_view_4d(ctx, gdn, S_v, H, T, n_seqs,
+                                                         ggml_row_size(type, S_v), ggml_row_size(type, S_v * H),
+                                                         ggml_row_size(type, S_v * H * T), 0));
+        ggml_set_name(attn, "attn");
+
+        // CW_CPY with n_seqs * n_written > 1 leaves snap a strided view of the cache (planes n_cells rows apart);
+        // the CUDA SUM needs a contiguously allocated source, so reduce a contiguous copy made after the write
+        // (the snapshot write stays the first real node after the gdn; snap itself is still what is compared)
+        ggml_tensor * snap_sum_src = snap;
+        if (!ggml_is_contiguously_allocated(snap)) {
+            snap_sum_src = ggml_cont(ctx, snap);
+            ggml_set_name(snap_sum_src, "snap_cont");
+        }
+
+        check_nodes.push_back(snap);
+        check_nodes.push_back(attn);
+        return ggml_add(ctx, ggml_sum(ctx, snap_sum_src), ggml_sum(ctx, attn));
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GATED_DELTA_NET_STATE_READ";
+    }
+
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return check_nodes; }
+
+    static bool state_read_off() {
+        const char * e = getenv("GGML_CUDA_GDN_STATE_READ");
+        return e != nullptr && atoi(e) == 0;
+    }
+    const char * required_fusion() override { return expect_fusion && !state_read_off() ? "gdn_state_read" : nullptr; }
+    const char * forbidden_fusion() override { return expect_fusion ? nullptr : "gdn_state_read"; }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) { continue; }
+            if (strcmp(t->name, "s_copy") == 0) {
+                ggml_backend_tensor_set(t, src_rows.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "snap_rows") == 0) {
+                ggml_backend_tensor_set(t, dst_rows.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "g") == 0) {
+                init_tensor_uniform(t, -20.0f, -1e-4f);
+            } else if (strcmp(t->name, "beta") == 0) {
+                init_tensor_uniform(t, 0.0f, 1.0f);
+            } else if (strcmp(t->name, "v") == 0) {
+                init_tensor_uniform(t, -0.3f, 5.0f);
+            } else if (strcmp(t->name, "clobber") == 0) {
+                init_tensor_uniform(t, 2.0f, 3.0f);
             } else {
                 init_tensor_uniform(t);
             }
@@ -12425,6 +12610,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   4, 1, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 8, 32,   4, 2, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   8, 1, 4));
+
+    // [#87] GATED_DELTA_NET reading its state through s_copy (the GET_ROWS gather skipped on CUDA).
+    // cache: 5 rollback planes of 4 cells, row = plane * 4 + cell. Modes: 0 no cache write, 1 ring set_rows,
+    // 2 static strided cpy (dst_rows = { first cell }).
+    {
+        using t = test_gated_delta_net_state_read;
+        // production shape: S_v 128, 4-token verify, K 4 (ILP kernel)
+        // ring snapshot rows on other planes than the source
+        test_cases.emplace_back(new t(4, 128, 4, 1, 4, t::CW_SET_ROWS, { 5 }, { 9, 13, 17, 1 }));
+        // source row is also the slot-0 snapshot row (in place)
+        test_cases.emplace_back(new t(4, 128, 4, 1, 4, t::CW_SET_ROWS, { 5 }, { 5, 9, 13, 17 }));
+        // static strided cache, source on plane 2 (rs_idx 2) = the slot-2 snapshot row
+        test_cases.emplace_back(new t(4, 128, 4, 1, 4, t::CW_CPY, { 9 }, { 1 }));
+        // two sequences, permuted source rows, no cache write: the read fires for n_seqs > 1
+        test_cases.emplace_back(new t(4, 128, 4, 2, 4, t::CW_NONE, { 7, 2 }, {}));
+        // two sequences whose cells swap while the gdn writes the cache: must fall back to the gather
+        test_cases.emplace_back(new t(4, 128, 4, 2, 4, t::CW_CPY, { 2, 1 }, { 1 }, false, false, 0, false));
+        // the source row is overwritten between the gather and the gdn: must fall back to the gather
+        test_cases.emplace_back(new t(4, 128, 4, 1, 4, t::CW_SET_ROWS, { 5 }, { 9, 13, 17, 1 }, true, false, 0, false));
+        // K 1 (final state only): 1 token (generic kernel) and 4 tokens (ILP kernel), source != and == destination
+        test_cases.emplace_back(new t(4, 128, 1, 1, 1, t::CW_CPY, { 6 }, { 2 }));
+        test_cases.emplace_back(new t(4, 128, 4, 1, 1, t::CW_CPY, { 2 }, { 2 }));
+        // generic kernel with ring snapshots, KDA with two sequences, replay ingredients (emit_mode 1)
+        test_cases.emplace_back(new t(4, 32, 2, 1, 2, t::CW_SET_ROWS, { 3 }, { 7, 11 }));
+        test_cases.emplace_back(new t(4, 64, 2, 2, 1, t::CW_NONE, { 3, 0 }, {}, false, true));
+        test_cases.emplace_back(new t(4, 64, 4, 1, 4, t::CW_NONE, { 3 }, {}, false, false, 1));
+    }
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging

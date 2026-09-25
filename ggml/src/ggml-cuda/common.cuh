@@ -1588,7 +1588,20 @@ struct ggml_backend_cuda_context {
         int64_t fused_add     = 0;   // tuned multi-ADD runs (ggml_cuda_op_fused_add)
         int64_t fused_mul     = 0;   // tuned multi-MUL runs (ggml_cuda_op_fused_mul)
         int64_t norm_pair_concat = 0; // RMS_NORM+MUL pairs written straight into a CONCAT (ggml_cuda_fuse_norm_pair_concat)
+        int64_t gdn_state_read = 0;  // gated_delta_net launches that read the state through s_copy (#87)
     } fusion_stats;
+
+    // [#87] gated_delta_net nodes of the graph being evaluated whose GET_ROWS state gather is skipped:
+    // the launch reads sequence s's input state from base + rows[s] * row_stride instead of src[5].
+    // Filled by ggml_cuda_gdn_state_read_plan at the start of each evaluation, cleared at its end.
+    struct gdn_state_read_entry {
+        const ggml_tensor * gdn        = nullptr;
+        const float *       base       = nullptr;
+        const int32_t *     rows       = nullptr;
+        int64_t             row_stride = 0;       // floats
+        bool                used       = false;
+    };
+    std::vector<gdn_state_read_entry> gdn_state_reads;
 
 #ifdef USE_CUDA_GRAPH
     std::unordered_map<uint64_t, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
