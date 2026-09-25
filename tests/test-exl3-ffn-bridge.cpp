@@ -2,9 +2,10 @@
 //
 // Each case builds the dense FFN of a decoder layer the way llama build_ffn + build_lora_mm do for EXL3 weights:
 // gate = W_gate x and up = W_up x (EXL3 trellis weights, suh/svh on src[2]/src[3]), h = swiglu_split(gate, up),
-// out = W_down h. It runs on a GPU backend twice, in forked children: once with the bridge off and once with it on
-// (the env var is read once per process), and the FFN outputs are compared byte for byte. The trellis words are
-// random: every 16-bit code decodes to a codebook value, so any bit pattern is a valid EXL3 tensor.
+// out = W_down h. It runs on a GPU backend twice, in forked children: once with the bridge off
+// (GGML_CUDA_EXL3_FFN_BRIDGE=0; the bridge is on by default) and once with it on (=1; the env var is read once per
+// process), and the FFN outputs are compared byte for byte. The trellis words are random: every 16-bit code decodes
+// to a codebook value, so any bit pattern is a valid EXL3 tensor.
 // Cases cover 2..5 bits, widths 1..16 (the GEMV range) plus width 20 (the bridge must decline and fall back), both
 // graph orders of the gate and up nodes, and the 27B FFN shape (5120 -> 17408 -> 5120).
 // The fusion counter must stay at 0 with the bridge off; with it on every case of width <= 16 must fuse. Needs a
@@ -164,7 +165,7 @@ static std::vector<uint8_t> run_child(bool fused) {
         if (fused) {
             setenv("GGML_CUDA_EXL3_FFN_BRIDGE", "1", 1);
         } else {
-            unsetenv("GGML_CUDA_EXL3_FFN_BRIDGE");
+            setenv("GGML_CUDA_EXL3_FFN_BRIDGE", "0", 1); // the bridge is on by default: the reference must turn it off
         }
         std::vector<uint8_t> blob;
         run_all(blob);
@@ -238,7 +239,7 @@ int main() {
            (long long) max_bridge_T, (long long) n_bridge);
     if (cnt_fus >= 0) {
         if (cnt_ref != 0) {
-            printf("bridge fired with GGML_CUDA_EXL3_FFN_BRIDGE unset\n");
+            printf("bridge fired with GGML_CUDA_EXL3_FFN_BRIDGE=0\n");
             n_fail++;
         }
         if (cnt_fus != n_bridge) {
