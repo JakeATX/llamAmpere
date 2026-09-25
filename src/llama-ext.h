@@ -16,6 +16,10 @@ LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         uint32_t n_seqs,
         uint32_t n_outputs);
 
+// Tokenizer identity used to pick a built-in draft vocabulary shortlist (--spec-draft-vocab-map auto):
+// FNV-1a 64 over every token string and BPE merge, see src/llama-mtp-vocab-builtin.h.
+LLAMA_API uint64_t llama_model_tokenizer_fingerprint(const struct llama_model * model);
+
 // Get the default ggml_type for a given ftype.
 LLAMA_API ggml_type llama_ftype_get_default_type(llama_ftype ftype);
 
@@ -129,6 +133,14 @@ LLAMA_API bool llama_model_uses_shared_position_draft(const struct llama_model *
 // real (token, h) inputs and each following row's inputs come from the previous
 // row's in-graph argmax and hidden state. One decode drafts n_tokens tokens.
 LLAMA_API void llama_set_mtp_chain(struct llama_context * ctx, bool value);
+
+// [#69] Sampled chain: top_k > 0 makes each chain step draw its token in-graph from the draft sampler chain
+// top_k -> top_p -> min_p -> temperature, with u[j] (in [0, 1), drawn by the caller) as the inverse-CDF
+// uniform of step j. Chain rows become LLAMA_MTP_CHAIN_ROW(top_k) floats (llama-mtp-chain-sample.h), and the
+// caller re-derives each step with llama_mtp_chain_rederive. top_k <= 0 restores the argmax chain. n_u must
+// cover the chain rows of the next decode. top_k <= LLAMA_MTP_CHAIN_TOP_K_MAX, temp > 0.
+LLAMA_API void llama_set_mtp_chain_sampling(struct llama_context * ctx, int32_t top_k, float temp, float top_p, float min_p,
+                                            const float * u, int32_t n_u);
 
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);

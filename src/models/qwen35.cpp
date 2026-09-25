@@ -1,6 +1,7 @@
 #include "models.h"
 #include "llama-kv-cache.h"
 #include "llama-memory-recurrent.h"
+#include "llama-mtp-chain-sample.h"
 
 // Output-row gather indices, or nullptr when every row is an output (decode, speculative verify,
 // MTP drafts): the gather would then be an identity copy. The graph topology still depends only on
@@ -797,6 +798,24 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
         ggml_tensor * logits_all = nullptr;
         ggml_tensor * h_all      = nullptr;
 
+        // [#69] sampled chain: each step draws in-graph over its top chain_k candidates against a
+        // host-drawn uniform (llama-mtp-chain-sample.h); 0 keeps the argmax chain
+        const int32_t chain_k = params.cparams.mtp_chain_top_k;
+        ggml_tensor * chain_samp = nullptr;
+        ggml_tensor * chain_u    = nullptr;
+        if (chain_k > 0) {
+            auto inp_s = std::make_unique<llm_graph_input_mtp_chain_samp>(mtp_chain_samp);
+            inp_s->samp = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, LLAMA_MTP_CHAIN_SAMP_N);
+            ggml_set_input(inp_s->samp);
+            ggml_set_name(inp_s->samp, "mtp_chain_samp");
+            inp_s->u = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_chain);
+            ggml_set_input(inp_s->u);
+            ggml_set_name(inp_s->u, "mtp_chain_u");
+            chain_samp = inp_s->samp;
+            chain_u    = inp_s->u;
+            res->add_input(std::move(inp_s));
+        }
+
         for (int64_t j = 0; j < n_chain; ++j) {
             ggml_tensor * cur_j = build_block(proj_cur, n_catchup + j, 1);
 
@@ -813,8 +832,13 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
                 return env != nullptr ? atoll(env) : 32768;
             }();
 
-            ggml_tensor * logits_j;
-            if (n_sub_env > 0 && n_sub_env < head_w2->ne[1] &&
+            // [BL7c] a loaded draft vocabulary shortlist replaces the leading-rows cut: logit positions are
+            // then map rows, translated back to token ids through draft_vocab_ids
+            ggml_tensor * id_map   = nullptr;
+            ggml_tensor * logits_j = build_draft_vocab_logits_chain(head_w2, head_s2, h_next_j);
+            if (logits_j != nullptr) {
+                id_map = draft_vocab_ids;
+            } else if (n_sub_env > 0 && n_sub_env < head_w2->ne[1] &&
                     !(hadamard_rotations && hadamard_rotations->count(head_w2))) {
                 ggml_tensor * head_sub = ggml_view_2d(ctx0, head_w2,
                         head_w2->ne[0], n_sub_env, head_w2->nb[1], 0);
@@ -826,13 +850,22 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
                 logits_j = build_lora_mm(head_w2, h_next_j, head_s2);
             }
 
-            ggml_tensor * id_j = ggml_argmax(ctx0, logits_j);
-            ggml_tensor * probs_j = ggml_soft_max(ctx0, logits_j);
-            ggml_tensor * p_j = ggml_get_rows(ctx0,
-                    ggml_reshape_2d(ctx0, probs_j, 1, probs_j->ne[0]), id_j);
-            p_j = ggml_reshape_2d(ctx0, p_j, 1, 1);
-            ggml_tensor * id_f = ggml_cast(ctx0, ggml_reshape_2d(ctx0, id_j, 1, 1), GGML_TYPE_F32);
-            ggml_tensor * out_j = ggml_concat(ctx0, id_f, p_j, 0);
+            ggml_tensor * id_j;
+            ggml_tensor * out_j;
+            if (chain_k > 0) {
+                ggml_tensor * u_j = ggml_view_1d(ctx0, chain_u, 1, (size_t) j*chain_u->nb[0]);
+                out_j = llama_mtp_chain_sample_graph(ctx0, logits_j, chain_k, chain_samp, u_j, id_map, &id_j);
+            } else {
+                ggml_tensor * pos_j = ggml_argmax(ctx0, logits_j);
+                ggml_tensor * probs_j = ggml_soft_max(ctx0, logits_j);
+                ggml_tensor * p_j = ggml_get_rows(ctx0,
+                        ggml_reshape_2d(ctx0, probs_j, 1, probs_j->ne[0]), pos_j);
+                p_j = ggml_reshape_2d(ctx0, p_j, 1, 1);
+                id_j = id_map == nullptr ? pos_j
+                    : ggml_reshape_1d(ctx0, ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, id_map, 1, id_map->ne[0]), pos_j), 1);
+                ggml_tensor * id_f = ggml_cast(ctx0, ggml_reshape_2d(ctx0, id_j, 1, 1), GGML_TYPE_F32);
+                out_j = ggml_concat(ctx0, id_f, p_j, 0);
+            }
 
             logits_all = logits_all == nullptr ? out_j : ggml_concat(ctx0, logits_all, out_j, 1);
             h_all      = h_all      == nullptr ? h_next_j : ggml_concat(ctx0, h_all, h_next_j, 1);

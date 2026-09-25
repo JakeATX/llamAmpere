@@ -6,6 +6,7 @@
 // no QTIP code was used.
 #include "exl3.cuh"
 #include "convert.cuh"
+#include "unary.cuh"
 
 // exllamav3 "mul1" codebook (cb2, exl3_dq.cuh): x = code * 0x83DCD12D; s = bytesum(x) + 0x6400 as an fp16 bit
 // pattern; value = hfma(s, fp16(0x1eee), fp16(0xc931)) -- one rounding.
@@ -88,20 +89,14 @@ static __global__ void k_exl3_glue_in(const float * __restrict__ x, const float 
     }
 }
 
-// y[T][N] = scale * svh * H128( sum_ks part[ks][T][N] )   (HAD)  |  scale * sum_ks part   (!HAD);  N % 128 == 0
-template <bool HAD>
-static __global__ void k_exl3_glue_out(const float * __restrict__ part, const float * __restrict__ svh, float * __restrict__ y,
-                                       const int N, const size_t n_chunks, const int ksplit, const size_t ks_stride, const float scale) {
-    const size_t c = (size_t) blockIdx.x * 4 + (threadIdx.x >> 5);
-    if (c >= n_chunks) {
-        return;
+// sum the split-K partials of one 128-chunk with four rows in flight (the serial chain was latency-bound at width > 1);
+// summation order is fixed => deterministic. Shared by glue_out and the FFN bridge so both compile the same sums.
+static __device__ __forceinline__ void exl3_sum_partials(const float * __restrict__ part, const size_t base, const int lane,
+                                                         const int ksplit, const size_t ks_stride, float (&v)[4]) {
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        v[j] = 0.0f;
     }
-    const int lane = threadIdx.x & 31;
-    const size_t base = c * 128;
-    const int nc = (int) (base % (size_t) N);
-    // sum the split-K partials with four rows in flight (the serial chain was latency-bound at width > 1);
-    // summation order is fixed => deterministic
-    float v[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     int ks = 0;
     for (; ks + 4 <= ksplit; ks += 4) {
         const float * p = part + (size_t) ks * ks_stride + base + lane;
@@ -121,6 +116,21 @@ static __global__ void k_exl3_glue_out(const float * __restrict__ part, const fl
             v[j] += p[j * 32];
         }
     }
+}
+
+// y[T][N] = scale * svh * H128( sum_ks part[ks][T][N] )   (HAD)  |  scale * sum_ks part   (!HAD);  N % 128 == 0
+template <bool HAD>
+static __global__ void k_exl3_glue_out(const float * __restrict__ part, const float * __restrict__ svh, float * __restrict__ y,
+                                       const int N, const size_t n_chunks, const int ksplit, const size_t ks_stride, const float scale) {
+    const size_t c = (size_t) blockIdx.x * 4 + (threadIdx.x >> 5);
+    if (c >= n_chunks) {
+        return;
+    }
+    const int lane = threadIdx.x & 31;
+    const size_t base = c * 128;
+    const int nc = (int) (base % (size_t) N);
+    float v[4];
+    exl3_sum_partials(part, base, lane, ksplit, ks_stride, v);
     float s = scale;
     if (HAD) {
         exl3_wht128(v);
@@ -159,6 +169,65 @@ void ggml_cuda_exl3_glue_out(const float * part, const float * svh, float * y, c
     } else {
         k_exl3_glue_out<false><<<nb, 128, 0, stream>>>(part, svh, y, N, n_chunks, ksplit, ks_stride, scale);
     }
+}
+
+// [#74] EXL3 FFN light bridge. For one 128-chunk of the [T][N] FFN activation (one warp):
+//   g = svh_gate * H128(sum part_gate), u = svh_up * H128(sum part_up)        (glue_out of both projections)
+//   h = silu(g) * u                                                           (ggml SWIGLU split, our SiLU)
+//   out = x_scale * H128(suh_down * h) as fp16                                (glue_in of the down projection)
+// All three Hadamards are 128-block local and the down projection's K is the FFN width, so a chunk never leaves its
+// warp. Each step is the same float expression, in the same order, as the unfused kernels (glue_out -> f32 tensor ->
+// unary_gated_op_kernel -> f32 tensor -> glue_in), so the prepared fp16 input matches the unfused one.
+static __global__ void k_exl3_ffn_bridge(const float * __restrict__ part_g, const int ksplit_g, const float * __restrict__ svh_g,
+                                         const float * __restrict__ part_u, const int ksplit_u, const float * __restrict__ svh_u,
+                                         const float * __restrict__ suh_d, half * __restrict__ out,
+                                         const int N, const size_t n_chunks, const size_t ks_stride, const float x_scale) {
+    const size_t c = (size_t) blockIdx.x * 4 + (threadIdx.x >> 5);
+    if (c >= n_chunks) {
+        return;
+    }
+    const int lane = threadIdx.x & 31;
+    const size_t base = c * 128;
+    const int nc = (int) (base % (size_t) N);
+
+    float g[4];
+    float u[4];
+    exl3_sum_partials(part_g, base, lane, ksplit_g, ks_stride, g);
+    exl3_sum_partials(part_u, base, lane, ksplit_u, ks_stride, u);
+    exl3_wht128(g);
+    exl3_wht128(u);
+    float so = 1.0f;   // glue_out scale
+    so *= EXL3_WHT128_SCALE;
+    float h[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const float gj = g[j] * so * svh_g[nc + j * 32 + lane];
+        const float uj = u[j] * so * svh_u[nc + j * 32 + lane];
+        h[j] = ggml_cuda_op_silu_single(gj) * uj;
+    }
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        h[j] *= suh_d[nc + j * 32 + lane];
+    }
+    exl3_wht128(h);
+    float si = x_scale;
+    si *= EXL3_WHT128_SCALE;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        exl3_store(out + base + j * 32 + lane, h[j] * si);
+    }
+}
+
+void ggml_cuda_exl3_ffn_bridge_f16(const float * part_gate, const int ksplit_gate, const float * svh_gate,
+                                   const float * part_up, const int ksplit_up, const float * svh_up,
+                                   const float * suh_down, half * out, const int N, const int64_t T, const float x_scale,
+                                   cudaStream_t stream) {
+    GGML_ASSERT(N % 128 == 0);
+    const size_t n_chunks  = (size_t) T * N / 128;
+    const size_t ks_stride = (size_t) T * N;
+    const int nb = (int) ((n_chunks + 3) / 4);
+    k_exl3_ffn_bridge<<<nb, 128, 0, stream>>>(part_gate, ksplit_gate, svh_gate, part_up, ksplit_up, svh_up, suh_down, out,
+                                              N, n_chunks, ks_stride, x_scale);
 }
 
 void ggml_cuda_mul_mat_exl3(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
