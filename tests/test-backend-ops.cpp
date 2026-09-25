@@ -8359,7 +8359,11 @@ struct test_mul_mat_vec_fusion : public test_case {
     }
 
     // Each case builds exactly one epilogue; require the counter for the one it built.
+    // CUDA fuses dense only at ncols_dst == 1 (ggml_cuda_should_fuse_mul_mat_vec_f/_q), mmid via mmvq up to the per-arch mmid max batch (>= 4).
     const char * required_fusion() override {
+        if (!(m == 1 || (use_id && ggml_is_quantized(type) && m <= 4))) {
+            return nullptr;
+        }
         return with_gate ? "mul_mat_glu" : (with_bias ? "mul_mat_bias" : nullptr);
     }
 
