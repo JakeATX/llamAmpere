@@ -344,8 +344,10 @@ struct common_params_speculative_draft {
 
     int32_t n_gpu_layers = -1; // number of layers to store in VRAM for the draft model (-1 - use default)
 
-    ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
-    ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
+    // KV cache data types of the draft context; GGML_TYPE_COUNT = not set, inherit the main context's
+    // cache_type_k / cache_type_v (resolved in common_base_params_to_speculative)
+    ggml_type cache_type_k = GGML_TYPE_COUNT; // KV cache data type for the K
+    ggml_type cache_type_v = GGML_TYPE_COUNT; // KV cache data type for the V
 
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;
