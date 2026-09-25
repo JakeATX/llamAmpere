@@ -25,6 +25,8 @@
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-mtp-vocab.h"
+#include "llama-mtp-vocab-builtin.h"
+#include "llama-mtp-chain-sample.h"
 #include "llama-ext.h"
 #include "llama-sampler.h"
 #include "llama.h"
@@ -220,6 +222,7 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
     cparams.embeddings_nextn     = false;
     cparams.embeddings_nextn_masked = false;
     cparams.mtp_chain               = false;
+    cparams.mtp_chain_top_k         = 0;
     cparams.offload_kqv             = params.offload_kqv;
     cparams.kv_stream_arena_mib     = params.kv_stream_arena_mib;
     cparams.no_perf                 = params.no_perf;
@@ -274,8 +277,14 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
     // draft-only vocabulary shortlist: parsed once, kept as a persistent I32 map on the head's device
     {
         const char * path = params.draft_vocab_map;
-        if ((path == nullptr || path[0] == '\0') && cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
-            path = getenv("LLAMA_SPEC_DRAFT_VOCAB");
+        // the environment override also replaces common's default ("auto"), which a caller cannot tell from an explicit auto
+        if ((path == nullptr || path[0] == '\0' || std::strcmp(path, "auto") == 0) && cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+            if (const char * env = getenv("LLAMA_SPEC_DRAFT_VOCAB"); env != nullptr && env[0] != '\0') {
+                path = env;
+            }
+        }
+        if (path != nullptr && std::strcmp(path, "none") == 0) {
+            path = nullptr;
         }
         if (path != nullptr && path[0] != '\0') {
             if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
@@ -956,15 +965,54 @@ llama_context::~llama_context() {
     ggml_opt_free(opt_ctx);
 }
 
-void llama_context::init_draft_vocab(const char * path, int32_t n_hot) {
-    std::ifstream file(path);
-    if (!file) {
-        throw std::runtime_error(format("cannot open draft vocabulary map '%s'", path));
+// tokenizer identity for the built-in shortlists: every token string and every BPE merge, in order
+// (definition in llama-mtp-vocab-builtin.h, scripts/gen-mtp-vocab-builtin.py computes the same value)
+uint64_t llama_model_tokenizer_fingerprint(const llama_model * model) {
+    const llama_vocab & vocab = model->vocab;
+    llama_fnv1a64 h;
+    const uint32_t n = vocab.n_tokens();
+    for (uint32_t i = 0; i < n; ++i) {
+        const char * text = vocab.token_get_text((llama_token) i);
+        h.add(text, std::strlen(text));
+        const uint8_t z = 0;
+        h.add(&z, 1);
     }
+    const uint8_t sep = 1;
+    h.add(&sep, 1);
+    for (const auto & m : vocab.get_bpe_merges()) {
+        h.add_str0(m);
+    }
+    return h.h;
+}
 
+void llama_context::init_draft_vocab(const char * path, int32_t n_hot) {
     const int64_t n_vocab = model.vocab.n_tokens();
 
-    llama_mtp_vocab_map map = llama_mtp_vocab_read(file, n_vocab);
+    llama_mtp_vocab_map map;
+    std::string source = path;
+
+    int64_t auto_size = 0;
+    if (llama_mtp_vocab_parse_auto(path, auto_size)) {
+        // pick the list compiled into the binary for this tokenizer + architecture, if there is one
+        const uint64_t fp   = llama_model_tokenizer_fingerprint(&model);
+        const char *   arch = llm_arch_name(model.arch);
+        const llama_mtp_vocab_builtin * b = llama_mtp_vocab_builtin_find(fp, n_vocab, arch, auto_size);
+        if (b == nullptr) {
+            LLAMA_LOG_INFO("%s: draft vocabulary '%s': no built-in shortlist for this tokenizer (fingerprint %016" PRIx64
+                    ", %lld tokens, arch %s), the draft scores the full head\n",
+                    __func__, path, fp, (long long) n_vocab, arch);
+            return;
+        }
+        map.n_vocab = b->n_vocab;
+        map.ids     = llama_mtp_vocab_builtin_ids(*b);
+        source      = format("built-in %s (%s family, tokenizer %016" PRIx64 ")", b->name, b->family, fp);
+    } else {
+        std::ifstream file(path);
+        if (!file) {
+            throw std::runtime_error(format("cannot open draft vocabulary map '%s'", path));
+        }
+        map = llama_mtp_vocab_read(file, n_vocab);
+    }
     if (map.n_vocab != n_vocab) {
         throw std::runtime_error(format("draft vocabulary map '%s' is for a %lld-token vocabulary, model has %lld",
                     path, (long long) map.n_vocab, (long long) n_vocab));
@@ -1007,8 +1055,8 @@ void llama_context::init_draft_vocab(const char * path, int32_t n_hot) {
         draft_vocab.hot.init(draft_vocab.host, n_vocab, n_hot);
     }
 
-    LLAMA_LOG_INFO("%s: draft vocabulary shortlist: %lld of %lld tokens from '%s', map on %s (%.1f KiB), head %s (%s)\n",
-            __func__, (long long) n_sel, (long long) n_vocab, path, ggml_backend_buft_name(buft),
+    LLAMA_LOG_INFO("%s: draft vocabulary shortlist: %lld of %lld tokens from %s, map on %s (%.1f KiB), head %s (%s)\n",
+            __func__, (long long) n_sel, (long long) n_vocab, source.c_str(), ggml_backend_buft_name(buft),
             (double) n_sel * sizeof(int32_t) / 1024.0, ggml_get_name(head), ggml_type_name(head->type));
     if (n_hot > 0) {
         LLAMA_LOG_INFO("%s: draft vocabulary tail: %d of %lld entries are adaptive hot slots\n",
@@ -2333,6 +2381,18 @@ void llama_context::set_nextn_layer_offset(int32_t offset) {
 
 void llama_context::set_mtp_chain(bool value) {
     cparams.mtp_chain = value;
+}
+
+void llama_context::set_mtp_chain_sampling(int32_t top_k, float temp, float top_p, float min_p, const float * u, int32_t n_u) {
+    if (top_k <= 0) {
+        cparams.mtp_chain_top_k = 0;
+        return;
+    }
+    GGML_ASSERT(top_k <= LLAMA_MTP_CHAIN_TOP_K_MAX && temp > 0.0f && n_u >= 0 && (u != nullptr || n_u == 0));
+    cparams.mtp_chain_top_k = top_k;
+    mtp_chain_samp.resize(LLAMA_MTP_CHAIN_SAMP_N + (size_t) n_u);
+    llama_mtp_chain_samp_pack(temp, top_p, min_p, mtp_chain_samp.data());
+    std::copy(u, u + n_u, mtp_chain_samp.begin() + LLAMA_MTP_CHAIN_SAMP_N);
 }
 
 void llama_context::set_causal_attn(bool value) {
@@ -3880,6 +3940,8 @@ llm_graph_params llama_context::graph_params(llm_graph_result *             res,
         /*.prec_policy =*/ &model.prec_policy,
         /*.samplers    =*/ sampling.samplers,
         /*.draft_vocab =*/ draft_vocab.ids,
+        /*.draft_vocab_warned =*/ &draft_vocab.warned,
+        /*.mtp_chain_samp =*/ &mtp_chain_samp,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
@@ -5367,6 +5429,10 @@ bool llama_model_uses_shared_position_draft(const llama_model * model) {
 
 void llama_set_mtp_chain(llama_context * ctx, bool value) {
     ctx->set_mtp_chain(value);
+}
+
+void llama_set_mtp_chain_sampling(llama_context * ctx, int32_t top_k, float temp, float top_p, float min_p, const float * u, int32_t n_u) {
+    ctx->set_mtp_chain_sampling(top_k, temp, top_p, min_p, u, n_u);
 }
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {

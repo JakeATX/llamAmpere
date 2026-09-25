@@ -335,7 +335,7 @@ struct common_params_speculative_draft {
     bool chain = false; // chained drafting: all n_max tokens in one GPU decode (MTP only)
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 
-    std::string vocab_map; // draft-only vocabulary shortlist map for the MTP draft head (empty = full vocabulary)
+    std::string vocab_map = "auto"; // draft-only vocabulary shortlist for the MTP draft head: auto, auto:N, none or a map file
     int32_t vocab_hot = 0; // trailing entries of that map kept adaptive: repointed at ids seen in recent requests
 
     common_params_model mparams;

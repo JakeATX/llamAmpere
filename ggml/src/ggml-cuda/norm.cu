@@ -1,5 +1,6 @@
 #include "norm.cuh"
 #include <cstdint>
+#include <climits>
 
 template <int block_size>
 static __global__ void norm_f32(
@@ -154,6 +155,85 @@ static __global__ void rms_norm_f32(const float * x,
             dst[col] = scale_out * (scale * x[col]);
         } else {
             dst[col] = scale * x[col];
+        }
+    }
+}
+
+// [#46] ADD -> RMS_NORM -> MUL(gamma) in one pass: sum = a + b (kept, it is the residual), dst = rms_norm(sum) * gamma.
+// The arithmetic is rms_norm_f32<block_size, true>'s, in the same order, so both outputs are bit-identical to the
+// unfused ADD + fused RMS_NORM/MUL. With q8_mode != 0 the pass also writes dst as q8_1 rows of ncols_padded values,
+// exactly as quantize_q8_1 would (q8_mode 2: the IQ4_XS-swizzled layout), which prefills the MMVQ shared-quantize cache
+// for the consumer. Every warp owns whole q8_1 blocks: col = tid + k*block_size and block_size % QK8_1 == 0.
+// sum may alias a or b exactly (each element is read before its own thread writes it), and dst may alias a or b
+// exactly (a row is written only after the block's reduction barrier, and only this block reads that row).
+template <int block_size, int q8_mode>
+static __global__ void add_rms_norm_mul_f32(const float * a,
+                                            const float * b,
+                                            float *       sum,
+                                            const float * gamma,
+                                            float *       dst,
+                                            block_q8_1 *  q8,
+                                            const int     ncols,
+                                            const int     ncols_padded,
+                                            const float   eps) {
+    ggml_cuda_pdl_lc();
+    const int64_t row = ((int64_t) blockIdx.z*gridDim.y + blockIdx.y)*gridDim.x + blockIdx.x;
+    const int     tid = threadIdx.x;
+
+    static_assert(block_size % QK8_1 == 0, "q8_1 blocks must not straddle warps");
+
+    a   += row*ncols;
+    b   += row*ncols;
+    sum += row*ncols;
+    dst += row*ncols;
+
+    float tmp = 0.0f; // partial sum for thread in warp
+
+    ggml_cuda_pdl_sync();
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = a[col] + b[col];
+        sum[col] = xi;
+        tmp += xi * xi;
+    }
+
+    // sum up partial sums
+    extern __shared__ float s_sum[];
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+    const float mean = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+
+    if constexpr (q8_mode == 0) {
+        for (int col = tid; col < ncols; col += block_size) {
+            dst[col] = scale * sum[col] * gamma[col];
+        }
+    } else {
+        const int    lane = tid % QK8_1;
+        block_q8_1 * y    = q8 + row*(ncols_padded/QK8_1);
+        // the loop condition is warp-uniform (ncols_padded % QK8_1 == 0): the shuffles below see full warps
+        for (int col = tid; col - lane < ncols_padded; col += block_size) {
+            float xi = 0.0f;
+            if (col < ncols) {
+                xi = scale * sum[col] * gamma[col];
+                dst[col] = xi;
+            }
+            float amax = fabsf(xi);
+            amax = warp_reduce_max<QK8_1>(amax);
+
+            const float  d = amax / 127.0f;
+            const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+
+            const int ib = col / QK8_1;
+            if constexpr (q8_mode == 2) {
+                y[ib].qs[2*(lane % 16) + lane/16] = q;
+            } else {
+                y[ib].qs[lane] = q;
+            }
+            const float qsum = warp_reduce_sum<QK8_1>((float) q);
+
+            if (lane == 0) {
+                y[ib].ds = make_half2(d, d * qsum);
+            }
         }
     }
 }
@@ -678,6 +758,69 @@ void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
                           /*add_s00*/ add_s01, add_s02, add_s03,
                           add_ncols, add_nrows, add_nchannels, add_nsamples,
                           eps, stream);
+}
+
+template <int block_size, int q8_mode>
+static void add_rms_norm_mul_f32_launch(const float * a, const float * b, float * sum, const float * gamma, float * dst,
+                                        block_q8_1 * q8, const int ncols, const int ncols_padded, const dim3 blocks_num,
+                                        const float eps, cudaStream_t stream) {
+    const dim3 block_dims(block_size, 1, 1);
+    const ggml_cuda_kernel_launch_params launch_params = {blocks_num, block_dims, block_size > WARP_SIZE ? 32 * sizeof(float) : 0, stream};
+    ggml_cuda_kernel_launch(add_rms_norm_mul_f32<block_size, q8_mode>, launch_params,
+                            a, b, sum, gamma, dst, q8, ncols, ncols_padded, eps);
+}
+
+template <int q8_mode>
+static void add_rms_norm_mul_f32_cuda(const float * a, const float * b, float * sum, const float * gamma, float * dst,
+                                      block_q8_1 * q8, const int ncols, const int ncols_padded, const dim3 blocks_num,
+                                      const float eps, cudaStream_t stream) {
+    // same block size choice as rms_norm_f32_cuda: the reduction order, and so the result, depends on it
+    if (ncols < 1024) {
+        add_rms_norm_mul_f32_launch<256, q8_mode>(a, b, sum, gamma, dst, q8, ncols, ncols_padded, blocks_num, eps, stream);
+    } else {
+        add_rms_norm_mul_f32_launch<1024, q8_mode>(a, b, sum, gamma, dst, q8, ncols, ncols_padded, blocks_num, eps, stream);
+    }
+}
+
+void ggml_cuda_op_add_rms_norm_mul(ggml_backend_cuda_context & ctx,
+                                   ggml_tensor *               add,
+                                   ggml_tensor *               rms_norm,
+                                   ggml_tensor *               mul,
+                                   void *                      q8_dst,
+                                   ggml_type                   q8_type) {
+    const ggml_tensor * gamma = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
+    GGML_ASSERT(rms_norm->src[0] == add && (mul->src[0] == rms_norm || mul->src[1] == rms_norm));
+    GGML_ASSERT(add->type == GGML_TYPE_F32 && add->src[0]->type == GGML_TYPE_F32 && add->src[1]->type == GGML_TYPE_F32);
+    GGML_ASSERT(mul->type == GGML_TYPE_F32 && gamma->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(add->src[0], add) && ggml_are_same_shape(add->src[1], add) && ggml_are_same_shape(mul, add));
+    GGML_ASSERT(ggml_is_contiguous(add->src[0]) && ggml_is_contiguous(add->src[1]) && ggml_is_contiguous(add) &&
+                ggml_is_contiguous(mul) && ggml_is_contiguous(gamma));
+    GGML_ASSERT(gamma->ne[0] == add->ne[0] && ggml_nrows(gamma) == 1);
+    GGML_ASSERT(add->ne[0] <= INT_MAX);
+
+    float eps = 0.0f;
+    memcpy(&eps, rms_norm->op_params, sizeof(float));
+    GGML_ASSERT(eps >= 0.0f);
+
+    const int  ncols        = (int) add->ne[0];
+    const int  ncols_padded = (int) GGML_PAD(add->ne[0], MATRIX_ROW_PADDING);
+    const dim3 blocks_num(add->ne[1], add->ne[2], add->ne[3]);
+
+    const float * a     = (const float *) add->src[0]->data;
+    const float * b     = (const float *) add->src[1]->data;
+    float *       sum   = (float *) add->data;
+    const float * g     = (const float *) gamma->data;
+    float *       dst   = (float *) mul->data;
+    block_q8_1 *  q8    = (block_q8_1 *) q8_dst;
+    cudaStream_t stream = ctx.stream();
+
+    if (q8 == nullptr) {
+        add_rms_norm_mul_f32_cuda<0>(a, b, sum, g, dst, nullptr, ncols, ncols_padded, blocks_num, eps, stream);
+    } else if (q8_type == GGML_TYPE_IQ4_XS) {
+        add_rms_norm_mul_f32_cuda<2>(a, b, sum, g, dst, q8, ncols, ncols_padded, blocks_num, eps, stream);
+    } else {
+        add_rms_norm_mul_f32_cuda<1>(a, b, sum, g, dst, q8, ncols, ncols_padded, blocks_num, eps, stream);
+    }
 }
 
 void ggml_cuda_op_rms_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

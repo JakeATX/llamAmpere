@@ -3,6 +3,7 @@
 #include "ggml.h"
 #include "ggml-impl.h"
 #include "ggml-cuda.h"
+#include "ggml-ledger.h"
 
 #include <cstdint>
 #include <cstdlib>
@@ -1593,6 +1594,10 @@ struct ggml_backend_cuda_context {
                                      // same-shape residual: both arrive as fusion x_bias)
         int64_t mul_mat_glu   = 0;   // GLU epilogues folded into mul_mat_vec
         int64_t norm_pair_concat = 0; // RMS_NORM+MUL pairs written straight into a CONCAT (ggml_cuda_fuse_norm_pair_concat)
+        int64_t gdn_state_read = 0;  // gated_delta_net launches that read the state through s_copy (#87)
+        int64_t add_rms       = 0;   // fused ADD + RMS_NORM + MUL runs (ggml_cuda_op_add_rms_norm_mul) [#46]
+        int64_t add_rms_q8    = 0;   // ... of which also prefilled the q8_1 cache for the next MMVQ consumer
+        int64_t exl3_ffn_bridge = 0; // EXL3 gate/up -> SwiGLU -> down runs through ggml_cuda_exl3_ffn_bridge [#74]
     } fusion_stats;
     // Landing slots for paged-in experts. One slab per expert tensor, n_slots experts wide; the
     // address table is pointed at a slot instead of at the expert's home address once it is copied.
@@ -1618,6 +1623,18 @@ struct ggml_backend_cuda_context {
     moe_expert_slab * moe_expert_slab_get(const ggml_tensor * src0, int64_t nb_expert,
                                           int n_expert, int n_routed, cudaStream_t stream);
 
+    // [#87] gated_delta_net nodes of the graph being evaluated whose GET_ROWS state gather is skipped:
+    // the launch reads sequence s's input state from base + rows[s] * row_stride instead of src[5].
+    // Filled by ggml_cuda_gdn_state_read_plan at the start of each evaluation, cleared at its end.
+    struct gdn_state_read_entry {
+        const ggml_tensor * gdn        = nullptr;
+        const float *       base       = nullptr;
+        const int32_t *     rows       = nullptr;
+        int64_t             row_stride = 0;       // floats
+        bool                used       = false;
+    };
+    std::vector<gdn_state_read_entry> gdn_state_reads;
+
 #ifdef USE_CUDA_GRAPH
     std::unordered_map<uint64_t, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
 
@@ -1640,6 +1657,7 @@ struct ggml_backend_cuda_context {
             last_graph_eviction_sweep = time_now;
             for (auto it = cuda_graphs.begin(); it != cuda_graphs.end(); ) {
                 if (time_now - it->second->last_used_time >= evict_us) {
+                    ggml_ledger_add("cuda.graph", "evict:idle (GGML_CUDA_GRAPH_EVICT_S)", 1); // [#68] next use recaptures ("why=new")
                     it = cuda_graphs.erase(it);
                 } else {
                     ++it;
@@ -1656,6 +1674,7 @@ struct ggml_backend_cuda_context {
                         lru = c;
                     }
                 }
+                ggml_ledger_add("cuda.graph", "evict:lru (max_cuda_graphs)", 1); // [#68]
                 cuda_graphs.erase(lru);
             }
             it = cuda_graphs.emplace(graph_key, std::make_unique<ggml_cuda_graph>()).first;

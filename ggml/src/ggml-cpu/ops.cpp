@@ -10996,9 +10996,10 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     // K (snapshot slot count) is an op param; state holds s0 only [S_v, S_v, H, n_seqs].
     const int64_t K = ggml_get_op_params_i32(dst, 0);
     GGML_ASSERT(K >= 1);
-    // emit_mode: 0 = full state snapshots (default), 1 = per-token replay ingredients (k,v,g,beta).
-    const int64_t emit_mode = ggml_get_op_params_i32(dst, 1);
-    GGML_ASSERT(emit_mode == 0 || emit_mode == 1);
+    // emit_mode: 0 = full state snapshots (default), 1 = per-token replay ingredients (k,v,g,beta),
+    // 2 = the same ingredients with g and beta stored once per head (compact).
+    const int32_t emit_mode = ggml_get_op_params_i32(dst, 1);
+    GGML_ASSERT(emit_mode >= 0 && emit_mode <= 2);
     // per-seq stride in floats (seq s starts at state + s * seq_stride)
     const int64_t state_seq_stride = src_state->nb[3] / sizeof(float);
 
@@ -11016,19 +11017,22 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     // attn_scores: S_v * H * n_tokens * n_seqs                                  floats
     // new_states (emit_mode==0): S_v * S_v * H * n_seqs * K                     floats
     // new_states (emit_mode==1): 4   * S_v * H * n_seqs * K                     floats (k,v,g,beta rows)
-    // final_state (emit_mode==1 only): S_v * S_v * H * n_seqs                   floats (fixed, not scaled by K)
-    // ckpt_state (emit_mode==1 && n_tokens>K only): S_v * S_v * H * n_seqs      floats (state before
+    // new_states (emit_mode==2): (2 * S_v + neg0 + 1) * H * n_seqs * K          floats, padded to whole rows
+    // final_state (emit_mode!=0 only): S_v * S_v * H * n_seqs                   floats (fixed, not scaled by K)
+    // ckpt_state (emit_mode!=0 && n_tokens>K only): S_v * S_v * H * n_seqs      floats (state before
     //   the K-token retained window starts -- free to capture, the recurrence already passes
     //   through it; lets a caller reconstruct a rollback without a second op call over the prefix)
     const int64_t attn_score_elems    = S_v * H * n_tokens * n_seqs;
-    const int64_t snap_rows_per_head  = (emit_mode == 0) ? S_v : 4;
-    const int64_t state_size_per_snap = snap_rows_per_head * S_v * H * n_seqs;
-    const bool    needs_ckpt          = (emit_mode == 1) && (n_tokens > K);
+    // floats per head in one slot: a full state, or the ingredient width of emit_mode 1 or 2
+    const int64_t slot_w              = (emit_mode == 0) ? S_v * S_v : ggml_gated_delta_net_ingr_width(S_v, neg0, emit_mode);
+    const int64_t state_size_per_snap = slot_w * H * n_seqs;
+    const bool    needs_ckpt          = (emit_mode != 0) && (n_tokens > K);
     const int64_t t_ckpt              = n_tokens - K - 1; // token index whose post-step state to save
     float * attn_out_base   = (float *)dst->data;
     float * state_out_base  = (float *)dst->data + attn_score_elems;
-    float * final_state_out = state_out_base + K * state_size_per_snap; // emit_mode==1 only
-    float * ckpt_state_out  = final_state_out + S_v * S_v * H * n_seqs; // emit_mode==1 && needs_ckpt only
+    float * final_state_out = emit_mode == 0 ? nullptr    // emit_mode!=0 only
+        : state_out_base + ggml_gated_delta_net_ingr_region(S_v, neg0, H, n_seqs, K, emit_mode);
+    float * ckpt_state_out  = needs_ckpt ? final_state_out + S_v * S_v * H * n_seqs : nullptr;
 
     // snapshot slot mapping: slot 0 = most recent state, slot s = s tokens back.
     // When n_tokens < K only slots 0..n_tokens-1 are written; older slots are caller-owned.
@@ -11126,6 +11130,14 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
                         float * curr_state_o = state_out_base + target_slot * state_size_per_snap +
                                          (iv3 * H + iv1) * S_v * S_v;
                         memcpy(curr_state_o, s_out, S_v * S_v * sizeof(float));
+                    } else if (emit_mode == 2) {
+                        // compact ingredients: k, v, g (1 or S_v wide), beta, back to back
+                        float * ingr_o = state_out_base + target_slot * state_size_per_snap +
+                                         (iv3 * H + iv1) * slot_w;
+                        memcpy(ingr_o,       k_d, S_v  * sizeof(float));
+                        memcpy(ingr_o + S_v, v_d, S_v  * sizeof(float));
+                        memcpy(ingr_o + 2 * S_v, g_d, neg0 * sizeof(float));
+                        ingr_o[2 * S_v + neg0] = beta_val;
                     } else {
                         // ingredients: k (already head-broadcast), v, g, beta -- each padded/
                         // broadcast to width S_v, packed as 4 consecutive rows in that order.
@@ -11155,9 +11167,9 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
             }
         }
 
-        // emit_mode==1: also write the true final state (s_out holds it, since s_out was
+        // emit_mode!=0: also write the true final state (s_out holds it, since s_out was
         // updated in place through the whole token loop) -- fixed cost, not scaled by K.
-        if (emit_mode == 1) {
+        if (emit_mode != 0) {
             float * final_o = final_state_out + (iv3 * H + iv1) * S_v * S_v;
             memcpy(final_o, s_out, S_v * S_v * sizeof(float));
         }

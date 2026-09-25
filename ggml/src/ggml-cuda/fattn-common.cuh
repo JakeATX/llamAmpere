@@ -4,6 +4,7 @@
 #include "convert.cuh"
 #include "vecdotq.cuh"
 #include "turbo-quant.cuh"
+#include "ledger.cuh"
 
 #include <cstdint>
 
@@ -1612,6 +1613,20 @@ void launch_fattn(
         if (want.end - (uintptr_t) dst->data <= ggml_backend_buffer_get_alloc_size(dst->buffer, dst)) {
             f16_extra = want;
         }
+    }
+
+    if ((need_f16_K && K->type != GGML_TYPE_F16) || (need_f16_V && V->type != GGML_TYPE_F16)) {
+        // fallback ledger: a quantized K/V cache converted to a full f16 copy before the kernel
+        const ggml_type Kc = need_f16_K ? K->type : GGML_TYPE_F16;
+        const ggml_type Vc = need_f16_V && !V_is_K_view ? V->type : GGML_TYPE_F16;
+        const uint64_t id = ggml_cuda_ledger_mix(ggml_cuda_ledger_mix(ggml_cuda_ledger_mix(
+            (uint64_t) Kc, (uint64_t) Vc), (uint64_t) ggml_cuda_ledger_width_bucket(Q->ne[1])), (uint64_t) (f16_extra.K != 0 || f16_extra.V != 0));
+        ggml_cuda_ledger_count("cuda.fattn", id, [&](char * buf, size_t size) {
+            char w[16];
+            ggml_cuda_ledger_width_str(Q->ne[1], w, sizeof(w));
+            snprintf(buf, size, "f16_convert K=%s V=%s n_q=%s scratch=%s", ggml_type_name(Kc), ggml_type_name(Vc), w,
+                f16_extra.K != 0 || f16_extra.V != 0 ? "reserved" : "pool");
+        });
     }
 
     if (need_f16_K && K->type != GGML_TYPE_F16) {

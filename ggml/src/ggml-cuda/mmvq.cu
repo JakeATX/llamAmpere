@@ -1,5 +1,6 @@
 #include "mmvq.cuh"
 #include "convrot.cuh"
+#include "ledger.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
@@ -1630,6 +1631,121 @@ static __global__ void mul_mat_vec_q_indexed_rows(
     if (lane == 0) { dst[row * dst_stride] = sum; }
 }
 
+// [#45] Thin launch for matrices with few rows at verify widths 2..8. The GDN gate projections ssm_alpha and
+// ssm_beta are 48 rows x 5120 (Q8_0 in the ATX/RVN/Swift IQ4_XS quants, PTQ1_0 in the Swift ternary quant); the
+// table launch packs 8 rows per CTA at widths >= 2, so each one fills 6 CTAs on an 84-SM card and runs
+// latency-bound (9.0 us per call, 96 calls per verify round). Here each CTA owns one row and its nwarps warps split
+// K, giving nrows CTAs. The cross-warp sum has a fixed order, so the result is deterministic, but it groups partial
+// sums differently from the table launch: not bit-identical to it. Opt-in: GGML_CUDA_MMVQ_THIN=<max rows> (off when
+// unset or 0), GGML_CUDA_MMVQ_THIN_NWARPS=4|8 (default 4).
+static int ggml_cuda_mmvq_thin_max_rows() {
+    static const int value = [] {
+        const char * env = getenv("GGML_CUDA_MMVQ_THIN");
+        const int n = env == nullptr ? 0 : atoi(env);
+        return n < 0 ? 0 : n;
+    }();
+    return value;
+}
+
+static int ggml_cuda_mmvq_thin_nwarps() {
+    static const int value = [] {
+        const char * env = getenv("GGML_CUDA_MMVQ_THIN_NWARPS");
+        return env != nullptr && atoi(env) == 8 ? 8 : 4;
+    }();
+    return value;
+}
+
+static constexpr bool ggml_cuda_mmvq_thin_type(ggml_type type) {
+    return type == GGML_TYPE_Q8_0 || type == GGML_TYPE_PTQ1_0;
+}
+
+template <ggml_type type, int ncols_dst, int nwarps>
+__launch_bounds__(nwarps*ggml_cuda_get_physical_warp_size(), 1)
+static __global__ void mul_mat_vec_q_thin(
+        const void * GGML_CUDA_RESTRICT vx, const block_q8_1 * GGML_CUDA_RESTRICT vy, float * GGML_CUDA_RESTRICT dst,
+        const uint32_t ncols_x, const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
+        const uint3 channel_ratio, const uint32_t stride_channel_x, const uint32_t stride_channel_y,
+        const uint32_t stride_channel_dst, const uint3 sample_ratio, const uint32_t stride_sample_x,
+        const uint32_t stride_sample_y, const uint32_t stride_sample_dst) {
+    constexpr int qk        = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi        = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr       = get_vdr_mmvq(type);
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr vec_dot_q_cuda_t vec_dot = get_vec_dot_q_cuda(type);
+    constexpr int blocks_per_iter = vdr*nwarps*warp_size/qi;
+
+    const int      tid         = warp_size*threadIdx.y + threadIdx.x;
+    const uint32_t row         = blockIdx.x;
+    const uint32_t channel_dst = blockIdx.y;
+    const uint32_t sample_dst  = blockIdx.z;
+    const uint32_t channel_x   = fastdiv(channel_dst, channel_ratio);
+    const uint32_t sample_x    = fastdiv(sample_dst, sample_ratio);
+    const int      blocks_per_row_x = ncols_x / qk;
+
+    ggml_cuda_pdl_sync();
+    const block_q8_1 * y = vy + sample_dst*stride_sample_y + channel_dst*stride_channel_y;
+    const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row*stride_row_x;
+
+    float tmp[ncols_dst] = {0.0f};
+    for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+        const int kby = kbx * (qk/QK8_1);
+        const int kqs = vdr * (tid % (qi/vdr));
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            tmp[j] += vec_dot(vx, &y[j*stride_col_y + kby], kbx_offset + kbx, kqs);
+        }
+    }
+
+    __shared__ float tmp_shared[nwarps][ncols_dst];
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+        tmp[j] = warp_reduce_sum<warp_size>(tmp[j]);
+    }
+    if (threadIdx.x == 0) {
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            tmp_shared[threadIdx.y][j] = tmp[j];
+        }
+    }
+    __syncthreads();
+    if (tid < ncols_dst) {
+        float sum = 0.0f;
+#pragma unroll
+        for (int w = 0; w < nwarps; ++w) {
+            sum += tmp_shared[w][tid];
+        }
+        dst[sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + tid*stride_col_dst + row] = sum;
+    }
+}
+
+template <ggml_type type, int nwarps>
+static void mul_mat_vec_q_thin_launch(
+        const void * vx, const void * vy, float * dst, const int ncols_x, const int nrows_x, const int ncols_dst,
+        const int stride_row_x, const int stride_col_y, const int stride_col_dst, const uint3 channel_ratio,
+        const int nchannels_dst, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
+        const uint3 sample_ratio, const int nsamples_dst, const int stride_sample_x, const int stride_sample_y,
+        const int stride_sample_dst, const int warp_size, cudaStream_t stream) {
+    const dim3 block_nums(nrows_x, nchannels_dst, nsamples_dst);
+    const dim3 block_dims(warp_size, nwarps, 1);
+    const ggml_cuda_kernel_launch_params launch_params(block_nums, block_dims, 0, stream);
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+#define MMVQ_THIN_CASE(n) \
+        case n: ggml_cuda_kernel_launch(mul_mat_vec_q_thin<type, n, nwarps>, launch_params, vx, y, dst, \
+            ncols_x, stride_row_x, stride_col_y, stride_col_dst, channel_ratio, stride_channel_x, stride_channel_y, \
+            stride_channel_dst, sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst); break;
+    switch (ncols_dst) {
+        MMVQ_THIN_CASE(2)
+        MMVQ_THIN_CASE(3)
+        MMVQ_THIN_CASE(4)
+        MMVQ_THIN_CASE(5)
+        MMVQ_THIN_CASE(6)
+        MMVQ_THIN_CASE(7)
+        MMVQ_THIN_CASE(8)
+        default: GGML_ABORT("fatal error");
+    }
+#undef MMVQ_THIN_CASE
+}
+
 template <ggml_type type>
 static void mul_mat_vec_q_switch_ncols_dst(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
@@ -1754,6 +1870,25 @@ static void mul_mat_vec_q_switch_ncols_dst(
             ncols_dst, ids_stride, warp_size, nchannels_dst,
             0.0f, 0.0f, 0.0f, 0.0f, stream);
         return;
+    }
+
+    if constexpr (ggml_cuda_mmvq_thin_type(type)) {
+        const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
+                                fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
+        if (!has_ids && !has_fusion && ncols_dst >= 2 && nrows_x <= ggml_cuda_mmvq_thin_max_rows() &&
+                table_id == MMVQ_PARAMETERS_GENERIC) {
+            ggml_cuda_ledger_mm("cuda.mmvq", "thin", type, ncols_dst); // [#68] thin launch taken (#45)
+            if (ggml_cuda_mmvq_thin_nwarps() == 8) {
+                mul_mat_vec_q_thin_launch<type, 8>(vx, vy, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y,
+                    stride_col_dst, channel_ratio_fd, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                    sample_ratio_fd, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, warp_size, stream);
+            } else {
+                mul_mat_vec_q_thin_launch<type, 4>(vx, vy, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y,
+                    stride_col_dst, channel_ratio_fd, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                    sample_ratio_fd, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, warp_size, stream);
+            }
+            return;
+        }
     }
 
     switch (ncols_dst) {
@@ -2044,6 +2179,71 @@ static void mul_mat_vec_q_switch_type(
     }
 }
 
+bool ggml_cuda_q8_cacheable(const ggml_backend_cuda_context & ctx, size_t q8_bytes) {
+    static const bool q8_cache_disabled = getenv("GGML_CUDA_Q8CACHE") != nullptr && atoi(getenv("GGML_CUDA_Q8CACHE")) == 0;
+    // Main stream only: a sibling stream could consume the buffer with no cross-stream ordering.
+    return !q8_cache_disabled && q8_bytes <= (1u << 20) && ctx.curr_stream_no == 0;
+}
+
+// The q8_1 layout depends on the weight type only through the IQ4_XS swizzle (quantize_row_q8_1_cuda), so the
+// cache keys on that layout, not on the type (#89a).
+static bool ggml_cuda_q8_cache_swizzle(ggml_type type_src0) {
+    return type_src0 == GGML_TYPE_IQ4_XS;
+}
+
+static ggml_backend_cuda_context::q8_cache_entry * ggml_cuda_q8_cache_find(ggml_backend_cuda_context & ctx, const ggml_tensor * src1,
+                                                                           ggml_type type_src0, size_t q8_bytes, int64_t ne10_padded) {
+    const bool swizzle = ggml_cuda_q8_cache_swizzle(type_src0);
+    for (auto & e : ctx.q8_cache.entries) {
+        if (e.epoch == ctx.graph_epoch && e.src1 == src1 && e.data == src1->data && e.size == q8_bytes &&
+            e.ne10_padded == ne10_padded && e.swizzle_iq4 == swizzle && e.dev == ctx.device) {
+            return &e;
+        }
+    }
+    return nullptr;
+}
+
+char * ggml_cuda_q8_cache_claim(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, ggml_type type_src0,
+                                size_t q8_bytes, int64_t ne10_padded) {
+    auto & qc = ctx.q8_cache;
+    ggml_backend_cuda_context::q8_cache_entry * qe = ggml_cuda_q8_cache_find(ctx, src1, type_src0, q8_bytes, ne10_padded);
+    if (qe == nullptr) {
+        // replace an entry from an older graph eval first, else the least recently used one
+        qe = &qc.entries[0];
+        for (auto & e : qc.entries) {
+            if (e.epoch != ctx.graph_epoch) {
+                qe = &e;
+                break;
+            }
+            if (e.last_use < qe->last_use) {
+                qe = &e;
+            }
+        }
+    }
+    qe->last_use = ++qc.tick;
+    if (qe->dev != ctx.device || qe->cap < q8_bytes) {
+        // Never free a buffer here: a CUDA graph captured earlier may still replay
+        // kernels that point at it (several graphs per context with --n-cpu-moe splits).
+        // Retire it and release everything at context teardown instead.
+        if (qe->ptr != nullptr) {
+            qc.retired.push_back({ qe->ptr, qe->cap, qe->dev });
+        }
+        // Plain device memory, not pool memory: the pool frees strict LIFO, and this
+        // buffer is taken while transient pool allocations sit below it. CUDA graph
+        // capture runs in relaxed mode, which allows cudaMalloc during capture.
+        CUDA_CHECK(ggml_cuda_device_malloc((void **) &qe->ptr, q8_bytes, ctx.device));
+        qe->cap = q8_bytes;
+        qe->dev = ctx.device;
+    }
+    qe->src1        = src1;
+    qe->data        = src1->data;
+    qe->epoch       = ctx.graph_epoch;
+    qe->size        = q8_bytes;
+    qe->ne10_padded = ne10_padded;
+    qe->swizzle_iq4 = ggml_cuda_q8_cache_swizzle(type_src0);
+    return qe->ptr;
+}
+
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion, bool convrot) {
@@ -2132,37 +2332,17 @@ void ggml_cuda_mul_mat_vec_q(
     // The layout depends on src0->type only through the IQ4_XS swizzle (quantize_row_q8_1_cuda).
     // ConvRot types and MUL_MAT_ID stay uncached; oversized batches fall back too.
     auto & qc = ctx.q8_cache;
-    static const bool q8_cache_disabled = getenv("GGML_CUDA_Q8CACHE") != nullptr && atoi(getenv("GGML_CUDA_Q8CACHE")) == 0;
-    // Main stream only: a sibling stream could consume the buffer with no cross-stream ordering.
-    const bool q8_cacheable = !q8_cache_disabled && !convrot && ids == nullptr && q8_bytes <= (1u << 20) &&
-                              ctx.curr_stream_no == 0;
-    const bool q8_swizzle = src0->type == GGML_TYPE_IQ4_XS;
-    ggml_backend_cuda_context::q8_cache_entry * qe = nullptr;
-    bool q8_hit = false;
-    if (q8_cacheable) {
-        for (auto & e : qc.entries) {
-            if (e.epoch == ctx.graph_epoch && e.src1 == src1 && e.data == src1->data && e.size == q8_bytes &&
-                e.ne10_padded == ne10_padded && e.swizzle_iq4 == q8_swizzle && e.dev == ctx.device) {
-                qe = &e;
-                q8_hit = true;
-                break;
-            }
-        }
-        if (!q8_hit) {
-            // replace an entry from an older graph eval first, else the least recently used one
-            qe = &qc.entries[0];
-            for (auto & e : qc.entries) {
-                if (e.epoch != ctx.graph_epoch) {
-                    qe = &e;
-                    break;
-                }
-                if (e.last_use < qe->last_use) {
-                    qe = &e;
-                }
-            }
-        }
+    const bool q8_cacheable = !convrot && ids == nullptr && ggml_cuda_q8_cacheable(ctx, q8_bytes);
+    ggml_backend_cuda_context::q8_cache_entry * qe =
+        q8_cacheable ? ggml_cuda_q8_cache_find(ctx, src1, src0->type, q8_bytes, ne10_padded) : nullptr;
+    const bool q8_hit = qe != nullptr;
+    if (q8_hit) {
         qe->last_use = ++qc.tick;
     }
+
+    // [#68] fallback ledger: shared-quantize cache outcome per weight type and width (no-op when the ledger is off)
+    ggml_cuda_ledger_mm("cuda.mmvq", q8_hit ? "q8_cache_hit" : q8_cacheable ? "q8_quantize_cached" : "q8_quantize_local",
+        src0->type, ids ? src1->ne[2] : src1->ne[1]);
 
     ggml_cuda_pool_alloc<char> src1_q8_1_local(ctx.pool());
     char * src1_q8_1 = nullptr;
@@ -2172,27 +2352,7 @@ void ggml_cuda_mul_mat_vec_q(
         src1_q8_1 = qe->ptr;
     } else {
         if (q8_cacheable) {
-            if (qe->dev != ctx.device || qe->cap < q8_bytes) {
-                // Never free a buffer here: a CUDA graph captured earlier may still replay
-                // kernels that point at it (several graphs per context with --n-cpu-moe splits).
-                // Retire it and release everything at context teardown instead.
-                if (qe->ptr != nullptr) {
-                    qc.retired.push_back({ qe->ptr, qe->cap, qe->dev });
-                }
-                // Plain device memory, not pool memory: the pool frees strict LIFO, and this
-                // buffer is taken while transient pool allocations sit below it. CUDA graph
-                // capture runs in relaxed mode, which allows cudaMalloc during capture.
-                CUDA_CHECK(ggml_cuda_device_malloc((void **) &qe->ptr, q8_bytes, ctx.device));
-                qe->cap = q8_bytes;
-                qe->dev = ctx.device;
-            }
-            src1_q8_1 = qe->ptr;
-            qe->src1        = src1;
-            qe->data        = src1->data;
-            qe->epoch       = ctx.graph_epoch;
-            qe->size        = q8_bytes;
-            qe->ne10_padded = ne10_padded;
-            qe->swizzle_iq4 = q8_swizzle;
+            src1_q8_1 = ggml_cuda_q8_cache_claim(ctx, src1, src0->type, q8_bytes, ne10_padded);
         } else {
             src1_q8_1 = src1_q8_1_local.alloc(q8_bytes);
         }

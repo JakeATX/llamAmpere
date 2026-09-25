@@ -4,6 +4,7 @@
 #include "chat.h"
 #include "common.h"
 #include "download.h"
+#include "ggml-ledger.h"
 #include "json-schema-to-grammar.h"
 #include "json.h"
 #include "llama.h"
@@ -4006,6 +4007,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"--fallback-ledger"},
+        "count which kernel route each op takes and why a fast path was skipped (CUDA graph rebuild reasons, "
+        "mul_mat routes by width, flash-attention kernels and f16 KV conversions, fusions that did not fire, "
+        "draft vocabulary fallbacks); printed at exit and, in llama-server, on /metrics (same as GGML_LEDGER=1)",
+        [](common_params &) {
+            ggml_ledger_set_enabled(true);
+        }
+    ).set_env("LLAMA_ARG_FALLBACK_LEDGER"));
+    add_opt(common_arg(
         {"--log-file"}, "FNAME",
         "Log to file",
         [](common_params &, const std::string & value) {
@@ -4396,8 +4406,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_P_MIN"));
     add_opt(common_arg(
-        {"--spec-draft-vocab-map"}, "FNAME",
-        "draft-only vocabulary shortlist for the MTP draft head (llama-mtp-vocab-v1 map); the target is unaffected (default: full vocabulary)",
+        {"--spec-draft-vocab-map"}, "{auto,auto:N,none,FNAME}",
+        "draft-only vocabulary shortlist for the MTP draft head; the target is unaffected. 'auto' uses the list compiled in for this "
+        "model's tokenizer and architecture (every quant of a supported base model, e.g. Qwen3.8-27B), 'auto:N' the one of size N, "
+        "FNAME a llama-mtp-vocab-v1 map, 'none' the full vocabulary (default: auto; a model with no built-in list "
+        "drafts over the full vocabulary)",
         [](common_params & params, const std::string & value) {
             params.speculative.draft.vocab_map = value;
         }
