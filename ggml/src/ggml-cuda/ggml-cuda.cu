@@ -3048,7 +3048,7 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph, const ggml_t
         }
 
         // [#22/#29] bounded f16 prefill runs a group loop with pool/reserved scratch and asserts it is not captured:
-        // a graph holding such a node always runs eagerly. With GGML_CUDA_PREFILL_KV_MIB unset the check returns at once.
+        // a graph holding such a node always runs eagerly. With GGML_CUDA_PREFILL_KV_MIB=0/off the check returns at once.
         if (node->op == GGML_OP_FLASH_ATTN_EXT && ggml_cuda_flash_attn_ext_bounded_prefill_applies(ggml_cuda_get_device(), node)) {
             use_cuda_graph = false;
             if (why_node) {
