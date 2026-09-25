@@ -7619,6 +7619,46 @@ struct test_elem_chain_cont_head : public test_case {
     }
 };
 
+// concat(rms_norm(e)*w_e, rms_norm(h)*w_h, dim 0), the MTP block input. Over one row the CUDA
+// backend writes both fused norms straight into the concat output (norm_pair_concat); more rows
+// are coverage of the unfused path.
+struct test_norm_pair_concat : public test_case {
+    const int64_t n_embd;
+    const int64_t n_tokens;
+
+    test_norm_pair_concat(int64_t n_embd, int64_t n_tokens) : n_embd(n_embd), n_tokens(n_tokens) {}
+
+    std::string vars() override {
+        return VARS_TO_STR2(n_embd, n_tokens);
+    }
+
+    const char * required_fusion() override { return n_tokens == 1 ? "norm_pair_concat" : nullptr; }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "NORM_PAIR_CONCAT_FUSION";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * e  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_tensor * h  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_tensor * we = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd);
+        ggml_tensor * wh = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd);
+        ggml_set_name(e, "e");
+        ggml_set_name(h, "h");
+        ggml_set_name(we, "we");
+        ggml_set_name(wh, "wh");
+
+        ggml_tensor * e_norm = ggml_mul(ctx, ggml_rms_norm(ctx, e, 1e-6f), we);
+        ggml_tensor * h_norm = ggml_mul(ctx, ggml_rms_norm(ctx, h, 1e-6f), wh);
+        ggml_tensor * out = ggml_concat(ctx, e_norm, h_norm, 0);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // MUL_MAT_ID -> MUL(weights) -> PERMUTE -> CONT -> SUM_ROWS, the MoE expert-reduce tail as
 // llama.cpp builds it, compared against the CPU graph. Coverage of the tail, not of a fusion.
 struct test_moe_reduce_fusion : public test_case {
@@ -9871,6 +9911,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_elem_chain_fusion({4096, 64, 1, 1}, false, false, true));
     for (int64_t t : {1, 4}) {
         test_cases.emplace_back(new test_elem_chain_cont_head(128, 4, t));
+    }
+    for (int64_t t : {1, 4}) {
+        test_cases.emplace_back(new test_norm_pair_concat(256, t));
+        test_cases.emplace_back(new test_norm_pair_concat(5120, t));
     }
     std::default_random_engine rng(0);
 

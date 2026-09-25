@@ -4281,7 +4281,11 @@ void llm_graph_context::build_sampling() const {
     // add a dummy row of logits
     // this trick makes the graph static, regardless of which samplers are activated
     // this is important in order to minimize graph reallocations
-    ggml_tensor * logits_t = ggml_pad(ctx0, res->t_logits, 0, 1, 0, 0);
+    // The single-row samplers below read row 0 at most when no row is an output, so the pad is only
+    // needed when there are no logit rows; otherwise they view res->t_logits directly (same row
+    // stride, same bytes) and the copy is not run. Graph reuse already compares n_outputs.
+    ggml_tensor * logits_t = res->t_logits->ne[1] > 0 && ggml_is_contiguous(res->t_logits)
+            ? res->t_logits : ggml_pad(ctx0, res->t_logits, 0, 1, 0, 0);
 
     // upstream: give stateful backend sampler chains a chance to reset before the graph is rebuilt
     for (const auto & entry : samplers) {

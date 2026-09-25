@@ -4116,6 +4116,67 @@ static int ggml_cuda_fuse_elem_chain(ggml_backend_cuda_context & ctx, const ggml
 }
 
 // try and fuse nodes and return the number of nodes to skip
+// nodes [i, i+4] = RMS_NORM, MUL, RMS_NORM, MUL, CONCAT(dim 0) over a single row, with the two
+// MULs as the concat's only consumers of the norms. Returns the extra node count consumed, or -1.
+static int ggml_cuda_fuse_norm_pair_concat(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+    if (!ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_CONCAT }, { i + 4 })) {
+        return -1;
+    }
+    if (!ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {}) ||
+        !ggml_cuda_can_fuse(cgraph, i + 2, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
+        return -1;
+    }
+
+    ggml_tensor * norm_a = cgraph->nodes[i];
+    ggml_tensor * mul_a  = cgraph->nodes[i + 1];
+    ggml_tensor * norm_b = cgraph->nodes[i + 2];
+    ggml_tensor * mul_b  = cgraph->nodes[i + 3];
+    ggml_tensor * concat = cgraph->nodes[i + 4];
+
+    if (ggml_get_op_params_i32(concat, 0) != 0 || concat->type != GGML_TYPE_F32 || !ggml_is_contiguous(concat) ||
+        ggml_nrows(concat) != 1) {
+        return -1;
+    }
+    const bool a_first = concat->src[0] == mul_a && concat->src[1] == mul_b;
+    const bool b_first = concat->src[0] == mul_b && concat->src[1] == mul_a;
+    if (!a_first && !b_first) {
+        return -1;
+    }
+    for (const ggml_tensor * m : { mul_a, mul_b }) {
+        if (!ggml_is_contiguous(m) || ggml_nrows(m) != 1) {
+            return -1;
+        }
+    }
+    if (concat->src[0]->ne[0] + concat->src[1]->ne[0] != concat->ne[0]) {
+        return -1;
+    }
+
+    // the fused kernels write the concat output while later inputs are still to be read
+    const char * c0 = (const char *) concat->data;
+    const char * c1 = c0 + ggml_nbytes(concat);
+    for (const ggml_tensor * n : { norm_a, mul_a, norm_b, mul_b }) {
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            const ggml_tensor * src = n->src[s];
+            if (src == nullptr || src == norm_a || src == norm_b) {
+                continue;
+            }
+            const char * s0 = (const char *) src->data;
+            const char * s1 = s0 + ggml_nbytes(src);
+            if (s0 < c1 && c0 < s1) {
+                return -1;
+            }
+        }
+    }
+
+    float * dst0 = (float *) concat->data;
+    float * dst_a = a_first ? dst0 : dst0 + mul_b->ne[0];
+    float * dst_b = a_first ? dst0 + mul_a->ne[0] : dst0;
+    ggml_cuda_op_rms_norm_fused(ctx, norm_a, mul_a, dst_a);
+    ggml_cuda_op_rms_norm_fused(ctx, norm_b, mul_b, dst_b);
+    ctx.fusion_stats.norm_pair_concat++;
+    return 4;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -4856,6 +4917,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (fused_mul_mat_vec) {
         return fused_node_count - 1;
+    }
+
+    // Two RMS_NORM+MUL pairs joined by a dim-0 CONCAT over one row (the MTP block input
+    // e_norm ++ h_norm): each fused norm writes its half of the concat output directly and the
+    // concat copy is not run. Same kernels and inputs as the unfused path, so the bytes match.
+    {
+        const int n_pair_concat = ggml_cuda_fuse_norm_pair_concat(*cuda_ctx, cgraph, i);
+        if (n_pair_concat >= 0) {
+            return n_pair_concat;
+        }
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
@@ -6436,6 +6507,9 @@ int64_t ggml_backend_cuda_fusion_count(ggml_backend_t backend, const char * name
     }
     if (strcmp(name, "fused_mul") == 0) {
         return ctx->fusion_stats.fused_mul;
+    }
+    if (strcmp(name, "norm_pair_concat") == 0) {
+        return ctx->fusion_stats.norm_pair_concat;
     }
     return -1;
 }
