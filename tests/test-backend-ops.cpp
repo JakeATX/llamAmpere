@@ -5366,9 +5366,18 @@ struct test_gated_delta_net_state_read : public test_case {
                                                          ggml_row_size(type, S_v * H * T), 0));
         ggml_set_name(attn, "attn");
 
+        // CW_CPY with n_seqs * n_written > 1 leaves snap a strided view of the cache (planes n_cells rows apart);
+        // the CUDA SUM needs a contiguously allocated source, so reduce a contiguous copy made after the write
+        // (the snapshot write stays the first real node after the gdn; snap itself is still what is compared)
+        ggml_tensor * snap_sum_src = snap;
+        if (!ggml_is_contiguously_allocated(snap)) {
+            snap_sum_src = ggml_cont(ctx, snap);
+            ggml_set_name(snap_sum_src, "snap_cont");
+        }
+
         check_nodes.push_back(snap);
         check_nodes.push_back(attn);
-        return ggml_add(ctx, ggml_sum(ctx, snap), ggml_sum(ctx, attn));
+        return ggml_add(ctx, ggml_sum(ctx, snap_sum_src), ggml_sum(ctx, attn));
     }
 
     std::string op_desc(ggml_tensor * t) override {
