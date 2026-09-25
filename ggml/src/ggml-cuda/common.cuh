@@ -3,6 +3,7 @@
 #include "ggml.h"
 #include "ggml-impl.h"
 #include "ggml-cuda.h"
+#include "ggml-ledger.h"
 
 #include <cstdint>
 #include <cstdlib>
@@ -1589,6 +1590,9 @@ struct ggml_backend_cuda_context {
         int64_t fused_mul     = 0;   // tuned multi-MUL runs (ggml_cuda_op_fused_mul)
         int64_t norm_pair_concat = 0; // RMS_NORM+MUL pairs written straight into a CONCAT (ggml_cuda_fuse_norm_pair_concat)
         int64_t gdn_state_read = 0;  // gated_delta_net launches that read the state through s_copy (#87)
+        int64_t add_rms       = 0;   // fused ADD + RMS_NORM + MUL runs (ggml_cuda_op_add_rms_norm_mul) [#46]
+        int64_t add_rms_q8    = 0;   // ... of which also prefilled the q8_1 cache for the next MMVQ consumer
+        int64_t exl3_ffn_bridge = 0; // EXL3 gate/up -> SwiGLU -> down runs through ggml_cuda_exl3_ffn_bridge [#74]
     } fusion_stats;
 
     // [#87] gated_delta_net nodes of the graph being evaluated whose GET_ROWS state gather is skipped:
@@ -1625,6 +1629,7 @@ struct ggml_backend_cuda_context {
             last_graph_eviction_sweep = time_now;
             for (auto it = cuda_graphs.begin(); it != cuda_graphs.end(); ) {
                 if (time_now - it->second->last_used_time >= evict_us) {
+                    ggml_ledger_add("cuda.graph", "evict:idle (GGML_CUDA_GRAPH_EVICT_S)", 1); // [#68] next use recaptures ("why=new")
                     it = cuda_graphs.erase(it);
                 } else {
                     ++it;
@@ -1641,6 +1646,7 @@ struct ggml_backend_cuda_context {
                         lru = c;
                     }
                 }
+                ggml_ledger_add("cuda.graph", "evict:lru (max_cuda_graphs)", 1); // [#68]
                 cuda_graphs.erase(lru);
             }
             it = cuda_graphs.emplace(graph_key, std::make_unique<ggml_cuda_graph>()).first;

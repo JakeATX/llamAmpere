@@ -5,6 +5,7 @@
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
+#include "ledger.cuh"
 
 #include <atomic>
 #include <cstdio>
@@ -24,6 +25,21 @@ static bool ggml_cuda_fattn_path_stats_enabled() {
 }
 
 static void ggml_cuda_fattn_path_note(const char * path, const ggml_tensor * dst, int ncols2) {
+    {
+        // fallback ledger (GGML_LEDGER=1): kernel family per K/V pair and query width
+        const ggml_tensor * Q = dst->src[0];
+        const ggml_tensor * K = dst->src[1];
+        const ggml_tensor * V = dst->src[2];
+        const uint64_t id = ggml_cuda_ledger_mix(ggml_cuda_ledger_mix(ggml_cuda_ledger_mix(ggml_cuda_ledger_mix(
+            (uint64_t) (uintptr_t) path, (uint64_t) K->type), (uint64_t) V->type), (uint64_t) Q->ne[0]),
+            (uint64_t) ggml_cuda_ledger_width_bucket(Q->ne[1]) * 64 + (uint64_t) (ncols2 + 1));
+        ggml_cuda_ledger_count("cuda.fattn", id, [&](char * buf, size_t size) {
+            char w[16];
+            ggml_cuda_ledger_width_str(Q->ne[1], w, sizeof(w));
+            snprintf(buf, size, "path=%s K=%s V=%s D=%d n_q=%s ncols2=%d", path, ggml_type_name(K->type), ggml_type_name(V->type),
+                (int) Q->ne[0], w, ncols2);
+        });
+    }
     if (!ggml_cuda_fattn_path_stats_enabled()) {
         return;
     }
@@ -1009,18 +1025,148 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     return BEST_FATTN_KERNEL_TILE;
 }
 
-size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * dst) {
-    GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
-    GGML_UNUSED(device);
+// The fused packed-KV routes (q8_0 K over turbo3 / q8_0 V, and the turbo / tq gate) run before the generic selector
+// and read K/V in place: launch_fattn gets need_f16_K = need_f16_V = false. This one function decides the route for
+// execution (ctx != nullptr: launch) and for ggml_cuda_flash_attn_ext_get_alloc_size (ctx == nullptr: only report),
+// so the scratch reserved behind dst follows the kernel that runs (#64). Returns true when a fused route applies.
+static bool ggml_cuda_flash_attn_ext_fused(ggml_backend_cuda_context * ctx, ggml_tensor * dst, const int device) {
+#define FATTN_FUSED_NOTE(...) do { if (ctx != nullptr) { ggml_cuda_fattn_path_note(__VA_ARGS__); } } while (0)
+#define FATTN_FUSED_LAUNCH(DKQ_, DV_, TK_, TV_) \
+    do { if (ctx != nullptr) { ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<DKQ_, DV_, TK_, TV_>(*ctx, dst); } return true; } while (0)
 
+    // Qwen3.8 verification fast path: Q8 K and Turbo3 V are decoded directly
+    // into the Stream-K MMA tile. This removes full-cache FP16 conversion and
+    // shares each compressed tile across the packed MTP query rows.
+    {
+        const ggml_tensor * Q = dst->src[0];
+        const ggml_tensor * K = dst->src[1];
+        const ggml_tensor * V = dst->src[2];
+        const int cc = ggml_cuda_info().devices[device].cc;
+        if (ggml_cuda_q8_turbo3_mma_fused() && K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_TURBO3_0 &&
+                Q->ne[0] == 256 && V->ne[0] == 256 && Q->ne[1] >= ggml_cuda_q8_turbo3_mma_min_q() && Q->ne[1] <= ggml_cuda_q8_turbo3_mma_max_q() && turing_mma_available(cc)) {
+            FATTN_FUSED_NOTE("q8_turbo3_fused", dst, -1);
+            FATTN_FUSED_LAUNCH(256, 256, GGML_TYPE_Q8_0, GGML_TYPE_TURBO3_0);
+        }
+        // Same fused path for a q8_0 K / q8_0 V cache (e.g. the MTP draft cache): identical staging and
+        // K decode, V decoded with the q8_0 tile loader instead of turbo3. Same routing knobs.
+        if (ggml_cuda_q8_turbo3_mma_fused() && K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0 &&
+                Q->ne[0] == 256 && V->ne[0] == 256 && Q->ne[1] >= ggml_cuda_q8_turbo3_mma_min_q() && Q->ne[1] <= ggml_cuda_q8_turbo3_mma_max_q() && turing_mma_available(cc)) {
+            FATTN_FUSED_NOTE("q8_q8_fused", dst, -1);
+            FATTN_FUSED_LAUNCH(256, 256, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0);
+        }
+    }
+
+    // Fused turbo MMA decode gate (DEFAULT ON, see ggml_cuda_turbo_mma_fused; GGML_TURBO_MMA_FUSED=0 disables).
+    // Routes turbo2/3/4 K==V, D in {128,256}, decode (Q->ne[1] <= 4) onto the GQA-packed
+    // MMA path (KV read once per head-group instead of per query head). Q is ALREADY
+    // graph-rotated (src/llama-graph.cpp) and the FA output is inverse-rotated there, so this
+    // path does NO inline FWHT and NO src swap. GGML_TURBO_MMA_FUSED=0 falls straight through
+    // to the original VEC dispatch (kill-switch).
+    {
+        const ggml_tensor * Q = dst->src[0];
+        const ggml_tensor * K = dst->src[1];
+        const ggml_tensor * V = dst->src[2];
+        const int cc = ggml_cuda_info().devices[device].cc;
+        const bool turbo_matched = (K->type == V->type &&
+            (K->type == GGML_TYPE_TURBO4_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO2_0 ||
+             K->type == GGML_TYPE_TQ6_0 || K->type == GGML_TYPE_TQ5_0)) ||
+            // asymmetric tq6/tq5 K over a turbo3 V: the pair they are meant for, K and V decoded by
+            // their own tile loaders into the same GQA-packed tile.
+            ((K->type == GGML_TYPE_TQ6_0 || K->type == GGML_TYPE_TQ5_0) && V->type == GGML_TYPE_TURBO3_0) ||
+            // turbo4 V under a q8_0/tq6_0/tq5_0 K (D=256 only): unstaged turbo4 V tile loader, K loader as above
+            ((K->type == GGML_TYPE_TQ6_0 || K->type == GGML_TYPE_TQ5_0 || K->type == GGML_TYPE_Q8_0) && V->type == GGML_TYPE_TURBO4_0 && Q->ne[0] == 256) ||
+            // tq6_0 K over a tq5_0 V (D=256 only): both tiles staged, same loaders as the matched tq6/tq5 pairs
+            (K->type == GGML_TYPE_TQ6_0 && V->type == GGML_TYPE_TQ5_0 && Q->ne[0] == 256);
+        // the tq6_0/tq5_0 K / turbo3_0 V pairs at D=256 have an (8,8) instance, so MTP verify widths 5..8 stay fused
+        const int turbo_max_q = (((K->type == GGML_TYPE_TQ6_0 || K->type == GGML_TYPE_TQ5_0 || K->type == GGML_TYPE_Q8_0) &&
+                                  (V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0) && Q->ne[0] == 256) ||
+                                 (K->type == GGML_TYPE_TQ6_0 && V->type == GGML_TYPE_TQ5_0 && Q->ne[0] == 256)) ? 8 : 4;
+        if (ggml_cuda_turbo_mma_fused() && turbo_matched
+                && Q->ne[1] <= turbo_max_q && V->ne[0] == Q->ne[0] && turing_mma_available(cc)) {
+            FATTN_FUSED_NOTE("turbo_fused_gate", dst, -1);
+            if (K->type == GGML_TYPE_TQ6_0 && V->type == GGML_TYPE_TURBO3_0) {
+                if (Q->ne[0] == 128) { FATTN_FUSED_LAUNCH(128, 128, GGML_TYPE_TQ6_0, GGML_TYPE_TURBO3_0); }
+                if (Q->ne[0] == 256) { FATTN_FUSED_LAUNCH(256, 256, GGML_TYPE_TQ6_0, GGML_TYPE_TURBO3_0); }
+            }
+            if (V->type == GGML_TYPE_TURBO4_0 && Q->ne[0] == 256) {
+                if (K->type == GGML_TYPE_TQ5_0) { FATTN_FUSED_LAUNCH(256, 256, GGML_TYPE_TQ5_0, GGML_TYPE_TURBO4_0); }
+                if (K->type == GGML_TYPE_TQ6_0) { FATTN_FUSED_LAUNCH(256, 256, GGML_TYPE_TQ6_0, GGML_TYPE_TURBO4_0); }
+                if (K->type == GGML_TYPE_Q8_0)  { FATTN_FUSED_LAUNCH(256, 256, GGML_TYPE_Q8_0,  GGML_TYPE_TURBO4_0); }
+            }
+            if (K->type == GGML_TYPE_TQ6_0 && V->type == GGML_TYPE_TQ5_0 && Q->ne[0] == 256) {
+                FATTN_FUSED_LAUNCH(256, 256, GGML_TYPE_TQ6_0, GGML_TYPE_TQ5_0);
+            }
+            if (K->type == GGML_TYPE_TQ5_0 && V->type == GGML_TYPE_TURBO3_0) {
+                if (Q->ne[0] == 128) { FATTN_FUSED_LAUNCH(128, 128, GGML_TYPE_TQ5_0, GGML_TYPE_TURBO3_0); }
+                if (Q->ne[0] == 256) { FATTN_FUSED_LAUNCH(256, 256, GGML_TYPE_TQ5_0, GGML_TYPE_TURBO3_0); }
+            }
+            if (Q->ne[0] == 128) {
+                switch (K->type) {
+                    case GGML_TYPE_TURBO4_0: FATTN_FUSED_LAUNCH(128, 128, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0);
+                    case GGML_TYPE_TURBO3_0: FATTN_FUSED_LAUNCH(128, 128, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0);
+                    case GGML_TYPE_TURBO2_0: FATTN_FUSED_LAUNCH(128, 128, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO2_0);
+                    case GGML_TYPE_TQ6_0:    FATTN_FUSED_LAUNCH(128, 128, GGML_TYPE_TQ6_0,    GGML_TYPE_TQ6_0);
+                    case GGML_TYPE_TQ5_0:    FATTN_FUSED_LAUNCH(128, 128, GGML_TYPE_TQ5_0,    GGML_TYPE_TQ5_0);
+                    default: break;
+                }
+            }
+            if (Q->ne[0] == 256) {
+                switch (K->type) {
+                    case GGML_TYPE_TURBO4_0: FATTN_FUSED_LAUNCH(256, 256, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0);
+                    case GGML_TYPE_TURBO3_0: FATTN_FUSED_LAUNCH(256, 256, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0);
+                    case GGML_TYPE_TQ6_0:    FATTN_FUSED_LAUNCH(256, 256, GGML_TYPE_TQ6_0,    GGML_TYPE_TQ6_0);
+                    case GGML_TYPE_TQ5_0:    FATTN_FUSED_LAUNCH(256, 256, GGML_TYPE_TQ5_0,    GGML_TYPE_TQ5_0);
+                    // turbo2 + head_dim 256: intentionally NO fused case (routes to VEC via
+                    // default below). At 2-bit KV the fused path's GQA-pack saving is tiny while the
+                    // dequant/no-pipeline overhead is unchanged, so it is neutral on high-BW GPUs and
+                    // regresses ~1-2.5% on bandwidth-limited ones (tester @everson: Gemma-12B / RTX
+                    // 5060 Ti). VEC == baseline there. turbo2 + hd128 keeps fused (a +6.6..+69% depth
+                    // win on dense models); turbo3/turbo4 stay fused at both head dims.
+                    default: break;
+                }
+            }
+        }
+    }
+
+
+    return false;
+#undef FATTN_FUSED_LAUNCH
+#undef FATTN_FUSED_NOTE
+}
+
+static const char * ggml_cuda_fattn_kernel_name(const best_fattn_kernel kernel) {
+    switch (kernel) {
+        case BEST_FATTN_KERNEL_TILE:    return "tile";
+        case BEST_FATTN_KERNEL_VEC:     return "vec";
+        case BEST_FATTN_KERNEL_MMA_F16: return "mma_f16";
+        case BEST_FATTN_KERNEL_NONE:    break;
+    }
+    return "none";
+}
+
+// GGML_CUDA_FATTN_ALLOC_ROUTE=0 restores the generic-selector sizing: f16 K+V copies for TILE/MMA (and VEC without a
+// type instance) even when a fused route runs and never touches them. Default 1 (#64).
+static bool ggml_cuda_fattn_alloc_route() {
+    static const bool v = [] { const char * e = getenv("GGML_CUDA_FATTN_ALLOC_ROUTE"); return !(e && e[0] == '0'); }();
+    return v;
+}
+
+// GGML_CUDA_FATTN_ALLOC_LOG=1: one line per new (K type, V type, n_q, log2 n_kv, route) with the scratch reserved
+// behind dst and what the generic selector would reserve, to size the gap at 32K / 100K (#64).
+static bool ggml_cuda_fattn_alloc_log() {
+    static const bool v = [] { const char * e = getenv("GGML_CUDA_FATTN_ALLOC_LOG"); return e && e[0] == '1'; }();
+    return v;
+}
+
+static size_t ggml_cuda_fattn_generic_alloc_size(const int device, const ggml_tensor * dst, best_fattn_kernel * kernel_out) {
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
 
-    GGML_ASSERT(K != nullptr);
-    GGML_ASSERT(V != nullptr);
-
     const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(device, dst);
+    if (kernel_out) {
+        *kernel_out = kernel;
+    }
 
     bool need_f16_K = false;
     bool need_f16_V = false;
@@ -1046,103 +1192,53 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     return f16_extra.end - (uintptr_t) dst->data;
 }
 
-void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    ggml_cuda_set_device(ctx.device);
+size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * dst) {
+    GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
 
-    // Qwen3.8 verification fast path: Q8 K and Turbo3 V are decoded directly
-    // into the Stream-K MMA tile. This removes full-cache FP16 conversion and
-    // shares each compressed tile across the packed MTP query rows.
-    {
-        const ggml_tensor * Q = dst->src[0];
-        const ggml_tensor * K = dst->src[1];
-        const ggml_tensor * V = dst->src[2];
-        const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-        if (ggml_cuda_q8_turbo3_mma_fused() && K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_TURBO3_0 &&
-                Q->ne[0] == 256 && V->ne[0] == 256 && Q->ne[1] >= ggml_cuda_q8_turbo3_mma_min_q() && Q->ne[1] <= ggml_cuda_q8_turbo3_mma_max_q() && turing_mma_available(cc)) {
-            ggml_cuda_fattn_path_note("q8_turbo3_fused", dst, -1);
-            ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_Q8_0, GGML_TYPE_TURBO3_0>(ctx, dst);
-            return;
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+
+    GGML_ASSERT(K != nullptr);
+    GGML_ASSERT(V != nullptr);
+
+    // dry run: nothing launches and dst is not modified
+    const bool fused = ggml_cuda_flash_attn_ext_fused(nullptr, const_cast<ggml_tensor *>(dst), device);
+
+    best_fattn_kernel kernel = BEST_FATTN_KERNEL_NONE;
+    const size_t size_generic = ggml_cuda_fattn_generic_alloc_size(device, dst, &kernel);
+    const size_t size_fused   = ggml_nbytes(dst); // no f16 K/V copies
+    const size_t size         = fused && ggml_cuda_fattn_alloc_route() ? size_fused : size_generic;
+
+    if (ggml_cuda_fattn_alloc_log()) {
+        static std::mutex mtx;
+        static std::map<uint64_t, bool> seen;
+        int log2_kv = 0;
+        while ((int64_t(1) << (log2_kv + 1)) <= K->ne[1]) {
+            log2_kv++;
         }
-        // Same fused path for a q8_0 K / q8_0 V cache (e.g. the MTP draft cache): identical staging and
-        // K decode, V decoded with the q8_0 tile loader instead of turbo3. Same routing knobs.
-        if (ggml_cuda_q8_turbo3_mma_fused() && K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0 &&
-                Q->ne[0] == 256 && V->ne[0] == 256 && Q->ne[1] >= ggml_cuda_q8_turbo3_mma_min_q() && Q->ne[1] <= ggml_cuda_q8_turbo3_mma_max_q() && turing_mma_available(cc)) {
-            ggml_cuda_fattn_path_note("q8_q8_fused", dst, -1);
-            ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0>(ctx, dst);
-            return;
+        const uint64_t key = ggml_cuda_ledger_mix(ggml_cuda_ledger_mix(ggml_cuda_ledger_mix(ggml_cuda_ledger_mix(
+            (uint64_t) K->type, (uint64_t) V->type), (uint64_t) Q->ne[1]), (uint64_t) log2_kv), (uint64_t) fused * 2 + (uint64_t) kernel);
+        std::lock_guard<std::mutex> lock(mtx);
+        if (seen.emplace(key, true).second) {
+            // WARN, not INFO: ggml INFO maps to trace verbosity (4), above the server's default of 3, so INFO never prints
+            GGML_LOG_WARN("fattn alloc: dev %d K=%s V=%s n_q=%lld n_kv=%lld route=%s reserve %.1f MiB behind dst "
+                          "(generic selector: %s, %.1f MiB; saved %.1f MiB)\n",
+                device, ggml_type_name(K->type), ggml_type_name(V->type), (long long) Q->ne[1], (long long) K->ne[1],
+                fused ? "fused" : ggml_cuda_fattn_kernel_name(kernel),
+                (size - ggml_nbytes(dst)) / 1048576.0, ggml_cuda_fattn_kernel_name(kernel),
+                (size_generic - ggml_nbytes(dst)) / 1048576.0, (size_generic - size) / 1048576.0);
         }
     }
 
-    // Fused turbo MMA decode gate (DEFAULT ON, see ggml_cuda_turbo_mma_fused; GGML_TURBO_MMA_FUSED=0 disables).
-    // Routes turbo2/3/4 K==V, D in {128,256}, decode (Q->ne[1] <= 4) onto the GQA-packed
-    // MMA path (KV read once per head-group instead of per query head). Q is ALREADY
-    // graph-rotated (src/llama-graph.cpp) and the FA output is inverse-rotated there, so this
-    // path does NO inline FWHT and NO src swap. GGML_TURBO_MMA_FUSED=0 falls straight through
-    // to the original VEC dispatch (kill-switch).
-    {
-        const ggml_tensor * Q = dst->src[0];
-        const ggml_tensor * K = dst->src[1];
-        const ggml_tensor * V = dst->src[2];
-        const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-        const bool turbo_matched = (K->type == V->type &&
-            (K->type == GGML_TYPE_TURBO4_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO2_0 ||
-             K->type == GGML_TYPE_TQ6_0 || K->type == GGML_TYPE_TQ5_0)) ||
-            // asymmetric tq6/tq5 K over a turbo3 V: the pair they are meant for, K and V decoded by
-            // their own tile loaders into the same GQA-packed tile.
-            ((K->type == GGML_TYPE_TQ6_0 || K->type == GGML_TYPE_TQ5_0) && V->type == GGML_TYPE_TURBO3_0) ||
-            // turbo4 V under a q8_0/tq6_0/tq5_0 K (D=256 only): unstaged turbo4 V tile loader, K loader as above
-            ((K->type == GGML_TYPE_TQ6_0 || K->type == GGML_TYPE_TQ5_0 || K->type == GGML_TYPE_Q8_0) && V->type == GGML_TYPE_TURBO4_0 && Q->ne[0] == 256) ||
-            // tq6_0 K over a tq5_0 V (D=256 only): both tiles staged, same loaders as the matched tq6/tq5 pairs
-            (K->type == GGML_TYPE_TQ6_0 && V->type == GGML_TYPE_TQ5_0 && Q->ne[0] == 256);
-        // the tq6_0/tq5_0 K / turbo3_0 V pairs at D=256 have an (8,8) instance, so MTP verify widths 5..8 stay fused
-        const int turbo_max_q = (((K->type == GGML_TYPE_TQ6_0 || K->type == GGML_TYPE_TQ5_0 || K->type == GGML_TYPE_Q8_0) &&
-                                  (V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0) && Q->ne[0] == 256) ||
-                                 (K->type == GGML_TYPE_TQ6_0 && V->type == GGML_TYPE_TQ5_0 && Q->ne[0] == 256)) ? 8 : 4;
-        if (ggml_cuda_turbo_mma_fused() && turbo_matched
-                && Q->ne[1] <= turbo_max_q && V->ne[0] == Q->ne[0] && turing_mma_available(cc)) {
-            ggml_cuda_fattn_path_note("turbo_fused_gate", dst, -1);
-            if (K->type == GGML_TYPE_TQ6_0 && V->type == GGML_TYPE_TURBO3_0) {
-                if (Q->ne[0] == 128) { ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<128, 128, GGML_TYPE_TQ6_0, GGML_TYPE_TURBO3_0>(ctx, dst); return; }
-                if (Q->ne[0] == 256) { ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_TQ6_0, GGML_TYPE_TURBO3_0>(ctx, dst); return; }
-            }
-            if (V->type == GGML_TYPE_TURBO4_0 && Q->ne[0] == 256) {
-                if (K->type == GGML_TYPE_TQ5_0) { ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_TQ5_0, GGML_TYPE_TURBO4_0>(ctx, dst); return; }
-                if (K->type == GGML_TYPE_TQ6_0) { ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_TQ6_0, GGML_TYPE_TURBO4_0>(ctx, dst); return; }
-                if (K->type == GGML_TYPE_Q8_0)  { ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_Q8_0,  GGML_TYPE_TURBO4_0>(ctx, dst); return; }
-            }
-            if (K->type == GGML_TYPE_TQ6_0 && V->type == GGML_TYPE_TQ5_0 && Q->ne[0] == 256) {
-                ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_TQ6_0, GGML_TYPE_TQ5_0>(ctx, dst); return;
-            }
-            if (K->type == GGML_TYPE_TQ5_0 && V->type == GGML_TYPE_TURBO3_0) {
-                if (Q->ne[0] == 128) { ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<128, 128, GGML_TYPE_TQ5_0, GGML_TYPE_TURBO3_0>(ctx, dst); return; }
-                if (Q->ne[0] == 256) { ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_TQ5_0, GGML_TYPE_TURBO3_0>(ctx, dst); return; }
-            }
-            if (Q->ne[0] == 128) {
-                switch (K->type) {
-                    case GGML_TYPE_TURBO4_0: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<128, 128, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0>(ctx, dst); return;
-                    case GGML_TYPE_TURBO3_0: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<128, 128, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0>(ctx, dst); return;
-                    case GGML_TYPE_TURBO2_0: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<128, 128, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO2_0>(ctx, dst); return;
-                    case GGML_TYPE_TQ6_0:    ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<128, 128, GGML_TYPE_TQ6_0,    GGML_TYPE_TQ6_0>(ctx, dst); return;
-                    case GGML_TYPE_TQ5_0:    ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<128, 128, GGML_TYPE_TQ5_0,    GGML_TYPE_TQ5_0>(ctx, dst); return;
-                    default: break;
-                }
-            }
-            if (Q->ne[0] == 256) {
-                switch (K->type) {
-                    case GGML_TYPE_TURBO4_0: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0>(ctx, dst); return;
-                    case GGML_TYPE_TURBO3_0: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0>(ctx, dst); return;
-                    case GGML_TYPE_TQ6_0:    ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_TQ6_0,    GGML_TYPE_TQ6_0>(ctx, dst); return;
-                    case GGML_TYPE_TQ5_0:    ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_TQ5_0,    GGML_TYPE_TQ5_0>(ctx, dst); return;
-                    // turbo2 + head_dim 256: intentionally NO fused case (routes to VEC via
-                    // default below). At 2-bit KV the fused path's GQA-pack saving is tiny while the
-                    // dequant/no-pipeline overhead is unchanged, so it is neutral on high-BW GPUs and
-                    // regresses ~1-2.5% on bandwidth-limited ones (tester @everson: Gemma-12B / RTX
-                    // 5060 Ti). VEC == baseline there. turbo2 + hd128 keeps fused (a +6.6..+69% depth
-                    // win on dense models); turbo3/turbo4 stay fused at both head dims.
-                    default: break;
-                }
-            }
-        }
+    return size;
+}
+
+void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    ggml_cuda_set_device(ctx.device);
+
+    if (ggml_cuda_flash_attn_ext_fused(&ctx, dst, ggml_cuda_get_device())) {
+        return;
     }
 
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
