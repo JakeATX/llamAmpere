@@ -63,6 +63,12 @@ llama_memory_recurrent::llama_memory_recurrent(
         this->rs_ring = n_rs_seq > 0 && !this->gdn_replay && arch_ok && !env_off;
         const char * env_rows = getenv("LLAMA_RS_RING_ROWS");
         this->rs_ring_rows_all = this->rs_ring && env_rows != nullptr && strcmp(env_rows, "1") == 0;
+        if (n_rs_seq > 0) {
+            // one line so A/B cells can confirm the rollback layout from the server log
+            LLAMA_LOG_INFO("%s: rollback layout = %s (n_rs_seq %u%s%s)\n", __func__,
+                    this->rs_ring ? (this->rs_ring_rows_all ? "ring, set_rows for every ubatch" : "ring") : "shift",
+                    n_rs_seq, env_off ? ", LLAMA_RS_RING=0" : "", this->gdn_replay ? ", gdn_replay" : "");
+        }
     }
     rs_base.assign(mem_size, 0);
 
