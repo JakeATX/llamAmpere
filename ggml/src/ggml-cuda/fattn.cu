@@ -1161,8 +1161,12 @@ static bool ggml_cuda_fattn_alloc_log() {
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
-// [#22/#29] Bounded f16 prefill. GGML_CUDA_PREFILL_KV_MIB=<MiB> (1..16384); unset, empty or 0 = off, and off runs none
-// of the code below (the plan returns before reading the tensors), so sizing and launch are exactly the #64 tree's.
+// [#22/#29] Bounded f16 prefill. GGML_CUDA_PREFILL_KV_MIB=<MiB> (1..16384) sets the workspace budget; unset or empty
+// = the default budget of 256 MiB; 0 or off = off, and off runs none of the code below (the plan returns before reading
+// the tensors), so sizing and launch are exactly the #64 tree's. The default: at 256 MiB prefill measured 1.5% slower
+// than unbounded (4.8-5.1% at 1 MiB), decode unchanged, output identical, and ATX IQ4_XS tq5_0/turbo4 at ctx 262,144
+// fits under 23,552 MiB (bounded-prefill/STATUS.md, 2026-09-25). Shapes whose full f16 K+V copies fit the budget keep
+// the unbounded route, so the default changes nothing below that size (4 KV heads at D 256: n_kv <= 65,536).
 //
 // The generic MMA route converts the whole quantized K and V cache to f16 before the kernel (launch_fattn,
 // fattn-common.cuh), and ggml_cuda_flash_attn_ext_get_alloc_size reserves both copies behind dst in the compute buffer:
@@ -1188,7 +1192,7 @@ struct ggml_cuda_fattn_bounded_plan {
     size_t offset     = 0;     // workspace offset behind dst->data: ggml_nbytes(dst) padded to 128
     size_t workspace  = 0;     // 2 * kv_bytes + out_bytes
     size_t reserve    = 0;     // bytes reserved behind dst: max(workspace, budget), see below
-    size_t budget     = 0;     // GGML_CUDA_PREFILL_KV_MIB in bytes
+    size_t budget     = 0;     // GGML_CUDA_PREFILL_KV_MIB in bytes (256 MiB when unset)
     size_t floor_bytes = 0;     // one KV head's f16 K+V plus its GQA group's output at this n_kv
     size_t full       = 0;     // the full f16 K+V copies the unbounded route reserves
     bool   floor_used = false; // budget < floor: one head per group
@@ -1196,8 +1200,12 @@ struct ggml_cuda_fattn_bounded_plan {
 
 static size_t ggml_cuda_fattn_prefill_budget() {
     static const size_t budget = [] {
+        constexpr size_t default_mib = 256;
         const char * s = getenv("GGML_CUDA_PREFILL_KV_MIB");
         if (s == nullptr || *s == '\0') {
+            return default_mib << 20;
+        }
+        if (strcmp(s, "off") == 0) {
             return size_t(0);
         }
         size_t n = 0;

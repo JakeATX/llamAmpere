@@ -3,8 +3,8 @@
 // GGML_CUDA_PREFILL_KV_MIB is read once per process, so every budget arm runs in its own forked child. The parent never
 // touches a ggml backend (CUDA does not survive fork): it builds the inputs (quantized with ggml_quantize_chunk) and the
 // f64 CPU reference, then forks one child per arm. The child sets the env, loads the backends and runs every case.
-// Arm "unset" runs first and sends its outputs back through a pipe. Later children inherit those outputs and compare
-// against them.
+// Arm "off" (GGML_CUDA_PREFILL_KV_MIB=0) runs first and sends its outputs back through a pipe. Later children inherit
+// those outputs and compare against them. Arm "unset" checks the default budget (256 MiB).
 //
 // Layout: the model's. Q is the permuted view [D, n_q, n_head] of [D, n_head, n_q]. K and V are the permuted views
 // [D, n_kv, n_head_kv] of the cache [D, n_head_kv, n_kv], so a head slice is strided, as in llama-server. The mask is
@@ -19,12 +19,12 @@
 //   tolerance 8,192 KV / 128 Q, the same pairs, GQA 6 and 4, plus a sinks case. The f16 copies are 32 MiB, so
 //             budgets 1/20/27 give 1/2/3 KV heads per group, and 256/272/410 fit the full copies (plan off, output
 //             identical). f64 reference on every 4th query row plus the last.
-//   excluded  ALiBi (max_bias 8), D 128, and a single KV head (8,192 / 128). Gate: identical to "unset" and no bounded
+//   excluded  ALiBi (max_bias 8), D 128, and a single KV head (8,192 / 128). Gate: identical to "off" and no bounded
 //             ledger row.
 // Gates for every bounded case. The bounded route runs the unbounded kernel once per group with fewer KV heads, so only
 // the grid differs. Whether that changes the summation order is decided by mma_grid() below, which mirrors the
 // stream-k choice in launch_fattn:
-//   same order (neither the unbounded launch nor any group launch uses stream-k): output bytes equal to arm "unset".
+//   same order (neither the unbounded launch nor any group launch uses stream-k): output bytes equal to arm "off".
 //   order differs, or cannot be derived (unknown GPU): with R = max |reference| and errors taken on the reference rows,
 //     a: max |bounded - ref| <= max |unbounded - ref| * 1.10
 //     b: max |bounded - unbounded| <= max |unbounded - ref| + 5e-3 * R
@@ -34,11 +34,12 @@
 // For every bounded case the fallback ledger ("cuda.fattn" f16_convert rows) must show exactly one live bounded row,
 // counted once, with "heads=h/n" equal to the expected heads per group (computed independently below) and the case's
 // KV head count, and no full-copy row. Ledger slots outlive ggml_ledger_reset (it zeroes the counts), so rows with
-// count 0 belong to earlier cases and are skipped. Arm "unset" must show no bounded row.
+// count 0 belong to earlier cases and are skipped. Arm "off" must show no bounded row.
 // PLAN lines: ggml_backend_buft_get_alloc_size for the ATX FLASH_ATTN_EXT shape (24 query heads, 4 KV heads, D 256,
 // n_q 1,024, tq5_0 K / turbo4 V) at n_kv 100,352 / 131,072 / 245,760 / 262,144. For bounded arms the size must equal
 // pad128(nbytes(dst)) + max(heads * (2 * kv_per_head + out_per_head), budget).
-// Graph arms (CUDA graphs on): the same 8,192 / 128 q8_0 graph computed 4 times. With the env unset a capture must happen.
+// Graph arms (CUDA graphs on): the same 8,192 / 128 q8_0 graph computed 4 times. With the env 0 (off), and unset (the
+// 256 MiB default, which the 32 MiB f16 copies fit), a capture must happen.
 // With budget 1 the graph must stay eager with the ledger outcome "eager:incompatible_fattn_bounded_prefill".
 // Needs a GPU backend; skips (exit 0) without one, and on Windows (no fork).
 
@@ -553,26 +554,28 @@ static double max_abs_diff_ref_rows(const case_def & c, const case_data & d, con
 
 struct arm_def {
     const char * name;
-    const char * env;    // nullptr = unset
-    size_t       mib;
+    const char * env;    // nullptr = unset (the 256 MiB default)
+    size_t       mib;    // the budget the arm runs with; 0 = off (the control)
     bool         graphs; // graph arm: CUDA graphs on, only the graph check runs
 };
 
 static const arm_def g_arms[] = {
-    { "unset", nullptr, 0,   false },
+    { "off",   "0",     0,   false },
+    { "unset", nullptr, 256, false },
     { "1",     "1",     1,   false },
     { "20",    "20",    20,  false },
     { "27",    "27",    27,  false },
     { "256",   "256",   256, false },
     { "272",   "272",   272, false },
     { "410",   "410",   410, false },
-    { "graph-unset", nullptr, 0, true },
+    { "graph-off",   "0",     0, true },
+    { "graph-unset", nullptr, 256, true },
     { "graph-1",     "1",     1, true },
 };
 
 static std::vector<case_def>          g_cases;
 static std::vector<case_data>         g_data;
-static std::vector<std::vector<float>> g_ref_out; // arm "unset" outputs, per case
+static std::vector<std::vector<float>> g_ref_out; // arm "off" outputs, per case
 
 static size_t first_tolerance_case() {
     size_t ci = 0;
@@ -668,7 +671,7 @@ static int child_main(const arm_def & arm, int out_fd) {
             why = " control_never_captured";
         }
         const bool same = out.size() == g_ref_out[ci].size() && memcmp(out.data(), g_ref_out[ci].data(), out.size()*sizeof(float)) == 0;
-        printf("GRAPH arm=%-11s K=%s V=%s n_kv=%lld n_q=%lld outcomes:%s  bounded_rows=%lld  vs_unset_eager=%s  %s%s\n",
+        printf("GRAPH arm=%-11s K=%s V=%s n_kv=%lld n_q=%lld outcomes:%s  bounded_rows=%lld  vs_off_eager=%s  %s%s\n",
                arm.name, ggml_type_name(c.tk), ggml_type_name(c.tv), (long long) c.n_kv, (long long) c.n_q, outcomes.c_str(),
                (long long) (l.bounded_reserved + l.bounded_pool), bounded ? (same ? "identical" : "differs(reported)") : "n/a",
                why.empty() ? "OK" : "FAIL:", why.c_str());
@@ -696,7 +699,7 @@ static int child_main(const arm_def & arm, int out_fd) {
         std::string why;
         std::string info;
         char buf[256];
-        if (arm.env == nullptr) {
+        if (arm.mib == 0) {
             // control arm: send outputs to the parent; must never take the bounded route
             const size_t bytes = out.size() * sizeof(float);
             size_t off = 0;
@@ -709,7 +712,7 @@ static int child_main(const arm_def & arm, int out_fd) {
                 off += size_t(w);
             }
             if (l.bounded_reserved + l.bounded_pool != 0) {
-                why += " unset_took_bounded";
+                why += " off_took_bounded";
             }
             if (c.kind != KIND_EXCLUDED && l.full_reserved == 0) {
                 why += " no_full_f16_copy(route_changed?)";
@@ -735,7 +738,7 @@ static int child_main(const arm_def & arm, int out_fd) {
                     why += " bounded_row_on_excluded_or_fitting_shape";
                 }
                 if (!same) {
-                    snprintf(buf, sizeof(buf), " differs_from_unset(max %.3e)", dmax);
+                    snprintf(buf, sizeof(buf), " differs_from_off(max %.3e)", dmax);
                     why += buf;
                 }
             } else {
@@ -818,7 +821,7 @@ int main() {
     int n_arms = 0;
     for (const arm_def & arm : g_arms) {
         int fds[2] = { -1, -1 };
-        const bool control = arm.env == nullptr && !arm.graphs;
+        const bool control = arm.mib == 0 && !arm.graphs;
         if (control && pipe(fds) != 0) {
             perror("pipe");
             return 1;
@@ -859,7 +862,7 @@ int main() {
             }
             close(fds[0]);
             if (!ok) {
-                printf("ARM unset: short read of the control outputs\n");
+                printf("ARM off: short read of the control outputs\n");
             }
         }
         int status = 0;
