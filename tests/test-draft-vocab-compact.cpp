@@ -20,7 +20,15 @@
 //     Negative control: the raw trellis rows (no output Hadamard, no svh) on the same x_rot must MISS (rel >= 0.5),
 //     which shows the output-side mixing is required and that (c) detects a wrong domain.
 // (d) a plain row-addressable head (Q6_K, the LLAMA_DRAFT_VOCAB_COMPACT=1 path): f32 compact rows are byte-equal
-//     to to_float of the head rows, and (b)/(c) are repeated with x_rot = x against mul_mat(head, x).
+//     to to_float of the head rows, and (b) is repeated against those rows. (c) is repeated with x_rot = x against
+//     an exact host reference, as (a) does for EXL3: y_ref[i] = sum_k to_float(head row ids[i])[k] * x[k] accumulated
+//     in double, with the same per-type bounds as above. The backend's plain-head mul_mat(head, x) cannot be that
+//     reference: it quantizes x (q8_K on CPU, q8_1 on CUDA) and carries ~1e-2 relative error, more than the f32
+//     bound allows (the EXL3 reference path keeps x in f32/fp16, so the EXL3 heads keep it as their reference).
+// (c2) plain heads only, so the backend full-head path stays exercised: the same compact logits against
+//     mul_mat(head, x) on the backend gathered at the selected ids. Bound = the (c) bound of the compact type widened
+//     to at least rel 2e-2 / NMSE 2e-4 for the reference's own activation quantization (measured for the byte-exact
+//     f32 compact rows on the 3090 Ti box: rel 5.0e-3..8.3e-3, NMSE 2.5e-5..4.9e-5, CPU and CUDA, T = 1..8).
 // Every measured value is printed; the process exits 1 on any bound miss.
 
 #include "../src/llama-draft-vocab-compact.h"
@@ -196,6 +204,9 @@ static double logit_rel_bound(ggml_type t) {
 static double logit_nmse_bound(ggml_type t) {
     return t == GGML_TYPE_F32 ? 1e-5 : t == GGML_TYPE_Q8_0 ? 3e-4 : t == GGML_TYPE_Q6_K ? 3e-3 : 2e-2;
 }
+// (c2) plain heads vs the backend's full-head mul_mat, whose x is quantized (q8_K CPU / q8_1 CUDA)
+static double backend_rel_bound(ggml_type t)  { return std::max(logit_rel_bound(t),  2e-2); }
+static double backend_nmse_bound(ggml_type t) { return std::max(logit_nmse_bound(t), 2e-4); }
 
 // (c)/(d) logits on one backend: every compact type (+ the negative control for EXL3) at widths 1..8
 static void run_logits(ggml_backend_t be, const head_case & h,
@@ -275,16 +286,40 @@ static void run_logits(ggml_backend_t be, const head_case & h,
                 ysel[(size_t) t * n_sel + i] = yf[(size_t) t * N + h.ids[i]];
             }
         }
+        // plain heads: the (c) reference is exact, the dequantized head rows (h.ref) times the f32 x in double
+        std::vector<float> yref;
+        if (!exl3) {
+            yref.resize((size_t) n_sel * T);
+            for (int64_t t = 0; t < T; ++t) {
+                const float * xt = xv.data() + (size_t) t * K;
+                for (int64_t i = 0; i < n_sel; ++i) {
+                    const float * r = h.ref.data() + (size_t) i * K;
+                    double s = 0.0;
+                    for (int64_t k = 0; k < K; ++k) s += (double) r[k] * (double) xt[k];
+                    yref[(size_t) t * n_sel + i] = (float) s;
+                }
+            }
+        }
+        const std::vector<float> & yc_ref = exl3 ? ysel : yref;
         std::vector<float> yv((size_t) n_sel * T);
         for (size_t i = 0; i < compact.size(); ++i) {
             ggml_backend_tensor_get(yc[i], yv.data(), 0, ggml_nbytes(yc[i]));
-            const err e = compare(yv.data(), ysel.data(), yv.size());
+            const err e = compare(yv.data(), yc_ref.data(), yv.size());
             const ggml_type qt = compact[i].first;
             const bool ok = e.rel_max <= logit_rel_bound(qt) && e.nmse <= logit_nmse_bound(qt) && std::isfinite(e.nmse);
-            printf("  (c) %-6s %-10s T=%lld %-7s rel %.3e (<= %.0e)  nmse %.3e (<= %.0e)  %s\n", bname, h.name.c_str(),
+            printf("  (c) %-6s %-10s T=%lld %-7s rel %.3e (<= %.0e)  nmse %.3e (<= %.0e)%s  %s\n", bname, h.name.c_str(),
                     (long long) T, ggml_type_name(qt), e.rel_max, logit_rel_bound(qt), e.nmse, logit_nmse_bound(qt),
-                    ok ? "ok" : "FAIL");
+                    exl3 ? "" : "  vs f64 host reference", ok ? "ok" : "FAIL");
             check(ok, "logits bound");
+            if (!exl3) {
+                const err e2 = compare(yv.data(), ysel.data(), yv.size());
+                const bool ok2 = e2.rel_max <= backend_rel_bound(qt) && e2.nmse <= backend_nmse_bound(qt) &&
+                        std::isfinite(e2.nmse);
+                printf("  (c2) %-6s %-10s T=%lld %-7s rel %.3e (<= %.0e)  nmse %.3e (<= %.0e)  vs backend full-head mul_mat  %s\n",
+                        bname, h.name.c_str(), (long long) T, ggml_type_name(qt), e2.rel_max, backend_rel_bound(qt),
+                        e2.nmse, backend_nmse_bound(qt), ok2 ? "ok" : "FAIL");
+                check(ok2, "(c2) backend full-head logits bound");
+            }
         }
         if (exl3) {
             ggml_backend_tensor_get(yneg, yv.data(), 0, ggml_nbytes(yneg));
