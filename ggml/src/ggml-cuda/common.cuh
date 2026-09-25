@@ -1529,6 +1529,8 @@ struct ggml_cuda_conv_ring_args {
 };
 
 struct ggml_backend_cuda_context {
+    struct retired_buf { char * ptr; size_t cap; int dev; };
+
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;
