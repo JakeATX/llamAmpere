@@ -37,7 +37,7 @@ void ggml_cuda_exl3_gemv(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
 
 // out[T][K] (f16) = scale * H128(suh * x)  (suh null: scale * x)
 void ggml_cuda_exl3_glue_in_f16(const float * x, const float * suh, half * out, const int K, const int64_t T, const float scale, cudaStream_t stream);
-// y[T][N] = scale * svh * H128( sum_ks part[ks][T][N] )  (svh null: scale * sum)
+// y[T][N] = scale * svh * H128( sum_ks part[ks][T][N] )  (svh null: scale * sum); N % 128 == 0 when svh is set
 void ggml_cuda_exl3_glue_out(const float * part, const float * svh, float * y, const int N, const int64_t T, const int ksplit, const float scale, cudaStream_t stream);
 
 // [#74] out[T][N] (f16) = x_scale * H128(suh_down * silu(svh_gate * H128(sum part_gate)) * svh_up * H128(sum part_up)):
