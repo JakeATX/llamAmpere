@@ -689,6 +689,12 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             //printf("cuda pool[%d]: size increased to %llu MB (reserved %llu MB)\n",
             //       device, (unsigned long long) (pool_size/1024/1024),
             //       (unsigned long long) (reserve_size/1024/1024));
+            // [#22/#29] GGML_CUDA_POOL_LOG=1: the VMM pool only grows, so the last line is the high-water mark
+            static const bool pool_log = [] { const char * e = getenv("GGML_CUDA_POOL_LOG"); return e && e[0] == '1'; }();
+            if (pool_log) {
+                GGML_LOG_WARN("cuda pool[%d]: vmm size increased to %.1f MiB (+%.1f MiB, request %.1f MiB)\n", device,
+                              pool_size / 1048576.0, reserve_size / 1048576.0, size / 1048576.0);
+            }
         }
 
         GGML_ASSERT(pool_addr != 0);
@@ -3038,6 +3044,15 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph, const ggml_t
 #ifndef NDEBUG
                 GGML_LOG_DEBUG("%s: disabling CUDA graphs due to unsupported node type\n", __func__);
 #endif
+            }
+        }
+
+        // [#22/#29] bounded f16 prefill runs a group loop with pool/reserved scratch and asserts it is not captured:
+        // a graph holding such a node always runs eagerly. With GGML_CUDA_PREFILL_KV_MIB unset the check returns at once.
+        if (node->op == GGML_OP_FLASH_ATTN_EXT && ggml_cuda_flash_attn_ext_bounded_prefill_applies(ggml_cuda_get_device(), node)) {
+            use_cuda_graph = false;
+            if (why_node) {
+                *why_node = node;
             }
         }
 
@@ -5929,7 +5944,12 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             }
         } else {
             outcome = "eager:incompatible_mul_mat_id_sync";
-            if (why_node) {
+            if (why_node && why_node->op == GGML_OP_FLASH_ATTN_EXT) {
+                outcome      = "eager:incompatible_fattn_bounded_prefill"; // [#22/#29]
+                change.op    = why_node->op;
+                change.type  = why_node->src[1]->type;
+                change.width = why_node->src[0]->ne[1];
+            } else if (why_node) {
                 change.op    = why_node->op;
                 change.type  = why_node->src[0]->type;
                 change.width = why_node->src[1]->ne[2];
