@@ -16,7 +16,7 @@ Set of LLM REST APIs and a web UI to interact with llama.cpp.
  * Schema-constrained JSON response format
  * Prefilling of assistant messages similar to the Claude API
  * [Function calling](../../docs/function-calling.md) / tool use for ~any model
- * Speculative decoding
+ * Speculative decoding (the model's built-in MTP drafter is on by default for Qwen3.8 / `qwen35` models, see [below](#mtp-drafter-default))
  * Easy-to-use web UI
 
 For the full list of features, please refer to [server's changelog](https://github.com/ggml-org/llama.cpp/issues/9291)
@@ -111,8 +111,8 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `-lv, --verbosity, --log-verbosity N` | Set the verbosity threshold. Messages with a higher verbosity will be ignored. Values:<br/> - 0: generic output<br/> - 1: error<br/> - 2: warning<br/> - 3: info<br/> - 4: trace (more info)<br/> - 5: debug<br/>(default: 3)<br/><br/>(env: LLAMA_ARG_LOG_VERBOSITY) |
 | `--log-prefix, --no-log-prefix` | Enable prefix in log messages<br/>(env: LLAMA_ARG_LOG_PREFIX) |
 | `--log-timestamps, --no-log-timestamps` | Enable timestamps in log messages<br/>(env: LLAMA_ARG_LOG_TIMESTAMPS) |
-| `--spec-draft-type-k, -ctkd, --cache-type-k-draft TYPE` | KV cache data type for K for the draft model<br/>allowed values: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1<br/>(default: f16)<br/>(env: LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_K) |
-| `--spec-draft-type-v, -ctvd, --cache-type-v-draft TYPE` | KV cache data type for V for the draft model<br/>allowed values: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1<br/>(default: f16)<br/>(env: LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V) |
+| `--spec-draft-type-k, -ctkd, --cache-type-k-draft TYPE` | KV cache data type for K for the draft model<br/>allowed values: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1<br/>(default: the main model's K cache type from -ctk; pass f16 to force f16)<br/>(env: LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_K) |
+| `--spec-draft-type-v, -ctvd, --cache-type-v-draft TYPE` | KV cache data type for V for the draft model<br/>allowed values: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1<br/>(default: the main model's V cache type from -ctv; pass f16 to force f16)<br/>(env: LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V) |
 
 
 ### Sampling params
@@ -273,7 +273,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--spec-draft-device, -devd, --device-draft <dev1,dev2,..>` | comma-separated list of devices to use for offloading the draft model (none = don't offload, default: follows --device)<br/>use --list-devices to see a list of available devices |
 | `--spec-draft-ngl, -ngld, --gpu-layers-draft, --n-gpu-layers-draft N` | max. number of draft model layers to store in VRAM, either an exact number, 'auto', or 'all' (default: auto)<br/>(env: LLAMA_ARG_N_GPU_LAYERS_DRAFT) |
 | `--spec-draft-model, -md, --model-draft FNAME` | draft model for speculative decoding (default: unused)<br/>(env: LLAMA_ARG_SPEC_DRAFT_MODEL) |
-| `--spec-type none,draft-simple,draft-eagle3,draft-mtp,draft-mtp-adaptive,draft-dflash,draft-dspark,ngram-simple,ngram-map-k,ngram-map-k4v,ngram-mod,ngram-cache` | comma-separated list of types of speculative decoding to use (default: none)<br/><br/>(env: LLAMA_ARG_SPEC_TYPE) |
+| `--spec-type none,draft-simple,draft-eagle3,draft-mtp,draft-mtp-adaptive,draft-dflash,draft-dspark,ngram-simple,ngram-map-k,ngram-map-k4v,ngram-mod,ngram-cache` | comma-separated list of types of speculative decoding to use (default: auto, i.e. the model's built-in drafter with its measured settings for qwen35 with an MTP head: draft-mtp-adaptive, none for other models; any explicit value, including none, turns auto off, explicit --spec-draft-* values are kept)<br/><br/>(env: LLAMA_ARG_SPEC_TYPE) |
 | `--spec-ngram-mod-n-min N` | minimum number of ngram tokens to use for ngram-based speculative decoding (default: 48) |
 | `--spec-ngram-mod-n-max N` | maximum number of ngram tokens to use for ngram-based speculative decoding (default: 64) |
 | `--spec-ngram-mod-n-match N` | ngram-mod lookup length (default: 24) |
@@ -338,6 +338,20 @@ services:
       LLAMA_ARG_ENDPOINT_METRICS: 1
       LLAMA_ARG_PORT: 8080
 ```
+
+### MTP drafter default
+
+When `--spec-type` is not given, the server looks up the model family in a small table (`common/spec-defaults.cpp`) before the model is loaded. A model whose family has a row gets its built-in drafter with the measured production settings. Today the table has one row:
+
+| Family (`general.architecture`) | Condition | Default |
+|---|---|---|
+| `qwen35` (Qwen3.8) | `qwen35.nextn_predict_layers` > 0 and the MTP tensors are in the model file | `--spec-type draft-mtp-adaptive --spec-draft-n-max 4 --spec-draft-n-min-adaptive 3 --spec-draft-p-min 0 --spec-draft-vocab-map auto` |
+
+- The default is resolved from the GGUF header before `-fit` and the context sizing run, so the memory fit sees the drafter exactly as with the explicit flags.
+- The draft KV cache types are not set by the default: they follow `-ctk`/`-ctv` unless `--spec-draft-type-k`/`-v` is given.
+- Any explicit `--spec-type` (including `--spec-type none`), a draft model (`-md`), `--eagle3` or `--dflash` turns the default off. Explicit `--spec-draft-n-max`, `--spec-draft-n-min-adaptive`, `--spec-draft-p-min` and `--spec-draft-vocab-map` values are kept on top of it. When only `--spec-draft-n-max` is given, a smaller value also lowers the adaptive floor (e.g. `--spec-draft-n-max 2` gives n-max 2, n-min-adaptive 2).
+- The server logs one line when the default applies, e.g. `speculative: MTP drafter on by default for qwen35 (nextn=1): draft-mtp-adaptive, n-max 4, n-min-adaptive 3, p-min 0, vocab map auto; --spec-type none disables`.
+- The same default applies to `llama-cli`, which runs the server in-process. Other tools (`llama-perplexity`, `llama-bench`, `llama-kld-depth`, ...) are unaffected.
 
 ### Multimodal support
 
