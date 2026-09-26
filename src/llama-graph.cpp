@@ -407,10 +407,10 @@ void llm_graph_input_rs::fill_s_copy(const llama_memory_recurrent_context * m) {
         data[i] = m->s_copy((int) i);
     }
 
-    set_input_shift(m->get_size());
+    set_input_shift(m);
 }
 
-void llm_graph_input_rs::set_input_shift(uint32_t mem_size) {
+void llm_graph_input_rs::set_input_shift(const llama_memory_recurrent_context * m) {
     // read by the shift-layout snapshot writers (delta-net, Mamba2, and the kimi-k3 / bailingmoe3 / qwen4exp / lfm2
     // conv); a graph with no shift-layout writer never reads it and leaves it without a buffer
     if (!s_copy_shift || !s_copy_shift->buffer) {
@@ -423,10 +423,29 @@ void llm_graph_input_rs::set_input_shift(uint32_t mem_size) {
     const int32_t * main = (const int32_t *) s_copy->data;
     int32_t *       data = (int32_t *) s_copy_shift->data;
 
+    const uint32_t mem_size = m->get_size();
+    const uint32_t K        = m->get_n_rs_seq() + 1;
+    const uint32_t n        = m->get_ubatch().n_seq_tokens;
+    GGML_ASSERT(n + snap_shift <= K);
+
+    // [TAG_RECURRENT_ROLLBACK_SHIFT] per lane: snap_shift is sized for the lane with the smallest
+    // pending rollback. Lane s, with pending rollback r_s, has only K - max(n, r_s) older groups; its
+    // remaining groups are gathered from its own destination rows (n + j) * mem_size + head + s, so the
+    // write puts back what is there. Those planes stay stale and uncredited: rs_valid after the ubatch is
+    // at most rs_valid - r_s + n <= n + K - 1 - r_s. In replay mode s_copy carries no rollback group
+    // (rs_idx stays 0, plane0 = replay_len) and the lanes agree, so every lane moves snap_shift groups.
     const int64_t n_seqs = s_copy_shift->ne[0] / snap_shift;
-    for (uint32_t j = 0; j < snap_shift; ++j) {
-        for (int64_t s = 0; s < n_seqs; ++s) {
-            data[j * n_seqs + s] = (int32_t) (j * (int64_t) mem_size + main[s]);
+    for (int64_t s = 0; s < n_seqs; ++s) {
+        uint32_t n_move = snap_shift;
+        if (replay_len == 0) {
+            const uint32_t r_s = (uint32_t) main[s] / mem_size;
+            n_move = K - std::max(n, r_s);
+            GGML_ASSERT(n_move <= snap_shift);
+        }
+        for (uint32_t j = 0; j < snap_shift; ++j) {
+            data[j * n_seqs + s] = j < n_move
+                ? (int32_t) (j * (int64_t) mem_size + main[s])
+                : (int32_t) ((int64_t) (n + j) * mem_size + head + s);
         }
     }
 }

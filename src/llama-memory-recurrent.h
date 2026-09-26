@@ -303,7 +303,8 @@ public:
     // [TAG_RECURRENT_ROLLBACK_SHIFT] number of older snapshot groups (conv in both modes, the
     // recurrent state in the non-replay mode) the builder must move back by n_seq_tokens for the
     // current ubatch: K - max(n_seq_tokens, pending rollback) when n_seq_tokens < K = n_rs_seq + 1,
-    // else 0. The op only rewrites the newest min(n, K) groups, so without the move group g
+    // else 0, for the lane with the smallest pending rollback (lanes with a deeper one move fewer
+    // groups; set_input_shift makes the rest no-ops). The op only rewrites the newest min(n, K) groups, so without the move group g
     // holds the state g tokens behind the PREVIOUS head after a short ubatch, and a rollback of
     // exactly one short batch (the multi-seq test's shape) restores a state that never existed.
     // Never nonzero on the speculative verify path (n = n_draft + 1 = K).

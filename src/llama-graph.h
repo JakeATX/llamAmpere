@@ -315,12 +315,14 @@ public:
     uint32_t snap_shift = 0; // [TAG_RECURRENT_ROLLBACK_SHIFT] see llama_memory_recurrent_context::get_snap_shift
 
     // row indices for gathering all snap_shift older snapshot groups of the ubatch's cells in one
-    // ggml_get_rows: [j * n_seqs + s] = j * mem_size + s_copy_main[s]; nullptr when snap_shift == 0
+    // ggml_get_rows: [j * n_seqs + s] = j * mem_size + s_copy_main[s] for the groups lane s really
+    // has (j < K - max(n, r_s)), and lane s's own destination row (n + j) * mem_size + head + s --
+    // a copy onto itself -- for the rest; nullptr when snap_shift == 0
     ggml_tensor * s_copy_shift = nullptr; // I32 [snap_shift * n_seqs]
 
     // fill s_copy_shift from the already-filled s_copy (call after the s_copy fill; s_copy() has a
     // rs_idx-reset side effect, so the values are never re-read from the memory context)
-    void set_input_shift(uint32_t mem_size);
+    void set_input_shift(const llama_memory_recurrent_context * m);
 
     // [TAG_RECURRENT_ROLLBACK_RING] ring mode (mctx->get_rs_ring()); all nullptr/0 otherwise, and
     // n_written == 0 / rs_wr == nullptr for a ubatch that fills the ring (n >= K: the builders use

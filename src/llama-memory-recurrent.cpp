@@ -1813,13 +1813,20 @@ uint32_t llama_memory_recurrent_context::get_snap_shift() const {
         return 0;
     }
     // the group the logical state lives in: replay_len (conv, replay mode) or rs_idx (both
-    // groups, non-replay mode); max over the lanes, like get_replay_len()
+    // groups, non-replay mode). A lane with pending rollback r has K - max(n, r) older groups to
+    // move; the graph is sized for the lane with the most (the smallest r), and
+    // llm_graph_input_rs::set_input_shift turns the surplus groups of the other lanes into
+    // copies of their own destination rows. Sizing it for the largest r instead moved too few
+    // groups for the other lanes, whose rs_valid still credited them (test gate G).
+    // In replay mode the lanes agree ([TAG_GDN_REPLAY_SPLIT]), so min == max there.
     uint32_t r = 0;
+    bool     first = true;
     const auto & group_of = mem->gdn_replay ? mem->replay_len : mem->rs_idx;
     for (uint32_t i = 0; i < ubatch.n_seqs_unq; ++i) {
         const llama_seq_id seq = ubatch.seq_id_unq[i];
         if (seq >= 0 && (size_t) seq < group_of.size()) {
-            r = std::max(r, group_of[seq]);
+            r = first ? group_of[seq] : std::min(r, group_of[seq]);
+            first = false;
         }
     }
     return K - std::max(n, r);
