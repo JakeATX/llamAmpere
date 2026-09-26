@@ -603,9 +603,8 @@ questions: vLLM wins single-request decode at 5K, cannot hold 200K on this card.
   three rotating conversations at RAM budgets below and equal to one
   conversation: spill, restore with `cache_n` = full prefix (~360 ms for
   539 MiB, ~1.5 GB/s), restart re-index, greedy output identical to an
-  uninterrupted control; flag-off path unchanged. Manual test:
-  `tools/server/tests/test_prompt_cache_disk_tier_manual.py`. Multimodal
-  prompts are not spilled.
+  uninterrupted control; flag-off path unchanged. Multimodal prompts are not
+  spilled.
 
 ### Current recommended server command (single user)
 
