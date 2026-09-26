@@ -861,7 +861,7 @@ static bool ggml_tq_convert_q8();
 // (garbage scales, NaN). Keep views consistent with their base:
 //  - view created before the base's data arrived: mark the base so the conversion skips it and the
 //    tensor stays native TQ4_1S (the native kernels handle it; the q8_0-sized allocation is only
-//    padding then);
+//    padding then). The TQ4_1S sources of an op whose result is that view stay native with it;
 //  - view created after the conversion: rewrite the view to the base's q8_0 layout. TQ4_1S and q8_0
 //    both hold 32 values per block, so block-aligned byte offsets and strides scale by 34/20.
 static void ggml_backend_cuda_buffer_tq_view_follow_base(ggml_backend_cuda_buffer_context * ctx, ggml_tensor * tensor) {
@@ -871,6 +871,15 @@ static void ggml_backend_cuda_buffer_tq_view_follow_base(ggml_backend_cuda_buffe
     const ggml_tensor * base = tensor->view_src;
     if (base->type == GGML_TYPE_TQ4_1S) {
         ctx->tq_keep_native.insert(base);
+        // A view that is an op result (CPY into its dst) pairs the base with the op's other sources.
+        // Keep their TQ4_1S sources native too so the op sees one format. The sources are operands
+        // of the tensor being initialised, so they are alive here.
+        for (int i = 0; i < GGML_MAX_SRC; ++i) {
+            const ggml_tensor * src = tensor->src[i];
+            if (src != nullptr && src->type == GGML_TYPE_TQ4_1S) {
+                ctx->tq_keep_native.insert(src->view_src != nullptr ? src->view_src : src);
+            }
+        }
         return;
     }
     if (base->type != GGML_TYPE_Q8_0 || ctx->tq_converted.count(base) == 0) {
