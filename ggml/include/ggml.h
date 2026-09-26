@@ -806,6 +806,9 @@ extern "C" {
 
     GGML_API bool    ggml_is_quantized(enum ggml_type type);
     GGML_API int     ggml_exl3_bits   (enum ggml_type type); // bits/weight for GGML_TYPE_EXL3_*, 0 otherwise
+    // EXL3 reference decode of trellis rows 16*g .. 16*g+15 of a [K, N] EXL3 tensor (bits 2..8) into y[16][K]
+    // (row-major, y[col*K + k]); the rows stay in the trellis domain (suh/svh and both Hadamards not applied)
+    GGML_API void    ggml_exl3_dequantize_row_group(const void * data, int64_t K, int64_t N, int bits, int64_t g, float * y);
 
     // TODO: temporary until model loading of ggml examples is refactored
     GGML_API enum ggml_type ggml_ftype_to_ggml_type(enum ggml_ftype ftype);
