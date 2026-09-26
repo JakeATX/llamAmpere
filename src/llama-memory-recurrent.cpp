@@ -718,6 +718,9 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
     auto org_cells = cells;
     auto org_used = used;
     auto org_head = head;
+    // find_slot credits each sequence's rs_valid with the ubatch's tokens; this dry run must not,
+    // or apply() credits them a second time and a rollback deeper than the real history is accepted
+    auto org_rs_valid = rs_valid;
 
     bool success = true;
 
@@ -732,6 +735,7 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
     cells = std::move(org_cells);
     used = org_used;
     head = org_head;
+    rs_valid = std::move(org_rs_valid);
 
     return success;
 }
