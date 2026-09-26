@@ -820,6 +820,11 @@ struct ggml_backend_cuda_buffer_context {
     ggml_backend_cuda_phase_arena_t arena = nullptr;
     std::string name;
 
+    // TQ4_1S load-time q8_0 conversion bookkeeping (see ggml_tq_convert_q8). Pointers are only
+    // compared, never dereferenced from these sets.
+    std::unordered_set<const ggml_tensor *> tq_keep_native; // bases viewed before their data arrived
+    std::unordered_set<const ggml_tensor *> tq_converted;   // bases rewritten to q8_0 in place
+
     ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
         device(device), dev_ptr(dev_ptr),
         name(GGML_CUDA_NAME + std::to_string(device)) {
@@ -848,11 +853,53 @@ static void * ggml_backend_cuda_buffer_get_base(ggml_backend_buffer_t buffer) {
     return ctx->dev_ptr;
 }
 
+static bool ggml_tq_convert_q8();
+
+// The TQ4_1S -> q8_0 load-time conversion (ggml_backend_cuda_buffer_set_tensor) rewrites the base
+// tensor's bytes, type and strides in place. A view keeps the TQ4_1S type and the TQ4_1S strides and
+// offset it was created with, so after the conversion it would read q8_0 bytes as TQ4_1S blocks
+// (garbage scales, NaN). Keep views consistent with their base:
+//  - view created before the base's data arrived: mark the base so the conversion skips it and the
+//    tensor stays native TQ4_1S (the native kernels handle it; the q8_0-sized allocation is only
+//    padding then);
+//  - view created after the conversion: rewrite the view to the base's q8_0 layout. TQ4_1S and q8_0
+//    both hold 32 values per block, so block-aligned byte offsets and strides scale by 34/20.
+static void ggml_backend_cuda_buffer_tq_view_follow_base(ggml_backend_cuda_buffer_context * ctx, ggml_tensor * tensor) {
+    if (tensor->type != GGML_TYPE_TQ4_1S || !ggml_tq_convert_q8()) {
+        return;
+    }
+    const ggml_tensor * base = tensor->view_src;
+    if (base->type == GGML_TYPE_TQ4_1S) {
+        ctx->tq_keep_native.insert(base);
+        return;
+    }
+    if (base->type != GGML_TYPE_Q8_0 || ctx->tq_converted.count(base) == 0) {
+        return;
+    }
+    const size_t tb = sizeof(block_tq4_1s);
+    const size_t qb = sizeof(block_q8_0);
+    bool aligned = tensor->nb[0] == tb && tensor->view_offs % tb == 0;
+    for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+        aligned = aligned && tensor->nb[i] % tb == 0;
+    }
+    if (!aligned) {
+        GGML_ABORT("%s: view '%s' of a TQ4_1S tensor converted to q8_0 is not block aligned; "
+                   "set GGML_TQ_NATIVE=1 to keep TQ4_1S weights native", __func__, tensor->name);
+    }
+    tensor->type = GGML_TYPE_Q8_0;
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        tensor->nb[i] = tensor->nb[i] / tb * qb;
+    }
+    tensor->view_offs = tensor->view_offs / tb * qb;
+    tensor->data      = (char *) base->data + tensor->view_offs;
+}
+
 static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
     if (tensor->view_src != NULL) {
         assert(tensor->view_src->buffer->buft == buffer->buft);
+        ggml_backend_cuda_buffer_tq_view_follow_base(ctx, tensor);
         return GGML_STATUS_SUCCESS;
     }
 
@@ -894,8 +941,10 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
-    // TQ4_1S → q8_0 load-time conversion (opt-in: GGML_TQ_CONVERT_Q8=1)
-    if (ggml_tq_convert_q8() && tensor->type == GGML_TYPE_TQ4_1S && offset == 0 && size == ggml_nbytes(tensor)) {
+    // TQ4_1S → q8_0 load-time conversion (default on, GGML_TQ_NATIVE=1 disables). Skipped for views
+    // and for bases that already have a view (see ggml_backend_cuda_buffer_tq_view_follow_base).
+    if (ggml_tq_convert_q8() && tensor->type == GGML_TYPE_TQ4_1S && offset == 0 && size == ggml_nbytes(tensor) &&
+            tensor->view_src == nullptr && ctx->tq_keep_native.count(tensor) == 0) {
         const int64_t n_elements = ggml_nelements(tensor);
 
         // Upload TQ4_1S to a temp GPU buffer
@@ -910,6 +959,7 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
         CUDA_CHECK(cudaFree(tmp_tq4));
 
         // Update tensor metadata to q8_0
+        ctx->tq_converted.insert(tensor);
         tensor->type = GGML_TYPE_Q8_0;
         tensor->nb[0] = ggml_type_size(GGML_TYPE_Q8_0);
         tensor->nb[1] = tensor->nb[0] * (tensor->ne[0] / ggml_blck_size(GGML_TYPE_Q8_0));
