@@ -5189,7 +5189,7 @@ llama_context * llama_init_from_model(llama_model * model, llama_context_params 
     }
 
     if (params.type_k == GGML_TYPE_TURBO2_0) {
-        LLAMA_LOG_ERROR("%s: turbo2 is a V-only cache type; pick a different K cache type (q8_0, tq5_0, tq6_0, turbo4)\n", __func__);
+        LLAMA_LOG_ERROR("%s: turbo2 is a V-only cache type; pick a different K cache type (q8_0, turbo4, turbo5, turbo6)\n", __func__);
         return nullptr;
     }
 
