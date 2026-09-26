@@ -411,7 +411,9 @@ void llm_graph_input_rs::fill_s_copy(const llama_memory_recurrent_context * m) {
 }
 
 void llm_graph_input_rs::set_input_shift(uint32_t mem_size) {
-    if (!s_copy_shift) {
+    // only the delta-net (GDN) graphs read s_copy_shift; for the other recurrent graphs (e.g. the Mamba2 layers of
+    // nemotron_h) the input is created but never consumed, so the scheduler leaves it without a buffer
+    if (!s_copy_shift || !s_copy_shift->buffer) {
         return;
     }
     GGML_ASSERT(s_copy && snap_shift > 0 && ggml_backend_buffer_is_host(s_copy_shift->buffer));
