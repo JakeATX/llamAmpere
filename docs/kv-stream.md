@@ -126,8 +126,7 @@ keeps widening with context - which is the regime this feature exists for.
 Arena size barely matters either way: 4096 MiB lands within 3% of 1024 MiB
 at every length in both builds.
 
-Every benchmark number in the PR description and `benchmarks/results/` was
-measured with the flag on. A default build remains functionally correct -
+Every benchmark number in the PR description was measured with the flag on. A default build remains functionally correct -
 output is unchanged - but treat the flag as a practical requirement rather
 than an optimization. Since it is off by default, `llama_kv_cache` logs a
 one-time warning at startup naming the K/V pair that fell back.
@@ -212,10 +211,9 @@ Two categories of failure exist near the VRAM boundary:
   construction (e.g. the compute buffer) aren't yet accounted for, so it
   catches the clearly-too-tight case, not necessarily every possible one.
 
-Use `benchmarks/benchmark_kv_stream.py` (see `benchmarks/README.md`) to find
-a safe arena size empirically for your model/GPU/context combination rather
-than guessing - it probes VRAM headroom and backs off automatically on
-allocation failure, which a production deployment does not get for free.
+Size the arena for your model/GPU/context combination by trying it at the
+full context before relying on it: a production deployment does not back off
+automatically on allocation failure.
 
 ## Verifying it's actually active
 

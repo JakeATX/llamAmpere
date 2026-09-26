@@ -319,10 +319,6 @@ if (NOT BUILD_SHARED_LIBS)
 endif()
 llama_build_and_test(test-kv-stream-softmax.cpp llama-kv-stream-softmax.cpp)
 if (GGML_CUDA)
-    llama_build_and_test(
-        test-kv-stream-bench-config.cpp
-        ${PROJECT_SOURCE_DIR}/tools/kv-stream-bench/kv-stream-bench-config.cpp)
-    target_include_directories(test-kv-stream-bench-config PRIVATE ${PROJECT_SOURCE_DIR}/tools/kv-stream-bench)
     llama_build_and_test(test-kv-stream-cuda-buffer.cpp LABEL cuda)
     target_include_directories(test-kv-stream-cuda-buffer PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda)
     # The test exits 77 when no CUDA device is present (e.g. a CUDA build run

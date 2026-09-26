@@ -744,9 +744,7 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
             // This uses free VRAM as measured right now; other allocations
             // later in context construction (e.g. the compute buffer) are
             // not yet accounted for, so this catches the clearly-too-tight
-            // case, not every possible one - the empirical probing in
-            // benchmarks/benchmark_kv_stream.py remains the reliable way to
-            // size an arena for production.
+            // case, not every possible one.
             {
                 using transient_workspace_fn_t = bool (*)(uint32_t, uint32_t, uint32_t, size_t *);
                 auto transient_workspace_fn    = (transient_workspace_fn_t) ggml_backend_reg_get_proc_address(
