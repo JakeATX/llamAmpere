@@ -836,10 +836,13 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
             // then map rows, translated back to token ids through draft_vocab_ids
             ggml_tensor * id_map   = nullptr;
             ggml_tensor * logits_j = build_draft_vocab_logits_chain(head_w2, head_s2, h_next_j);
+            // an EXL3 head is K-major tiled and needs the suh/svh glue (build_lora_mm): a leading-rows view of it
+            // is not its first rows, so it scores the full head as with LLAMA_SPEC_CHAIN_SUB=0
+            const bool sub_exl3 = ggml_exl3_bits(head_w2->type) != 0;
             if (logits_j != nullptr) {
                 id_map = draft_vocab_ids;
             } else if (n_sub_env > 0 && n_sub_env < head_w2->ne[1] &&
-                    !(hadamard_rotations && hadamard_rotations->count(head_w2))) {
+                    !(hadamard_rotations && hadamard_rotations->count(head_w2)) && !sub_exl3) {
                 ggml_tensor * head_sub = ggml_view_2d(ctx0, head_w2,
                         head_w2->ne[0], n_sub_env, head_w2->nb[1], 0);
                 logits_j = ggml_mul_mat(ctx0, head_sub, h_next_j);
@@ -847,6 +850,12 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
                     logits_j = ggml_mul(ctx0, logits_j, head_s2);
                 }
             } else {
+                static bool logged_sub_exl3 = false;
+                if (sub_exl3 && n_sub_env > 0 && n_sub_env < head_w2->ne[1] && !logged_sub_exl3) {
+                    logged_sub_exl3 = true;
+                    LLAMA_LOG_INFO("%s: MTP chain: the output head is EXL3, the %lld-row sub-head cut does not apply; "
+                                   "the chain scores the full head (logged once)\n", __func__, (long long) n_sub_env);
+                }
                 logits_j = build_lora_mm(head_w2, h_next_j, head_s2);
             }
 
