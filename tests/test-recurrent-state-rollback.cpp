@@ -337,6 +337,118 @@ static int run_rb1b_gates(const common_params & params, llama_model * model,
         }
     }
 
+    // --- Gate F: a rollback after a run of 1-token decodes restores the EXACT state. Gates A-D roll back within
+    // one multi-token ubatch; here every snapshot behind the head comes from a separate 1-token ubatch, so the ring
+    // must have accumulated them (DSV4 once wrote the pre-ubatch state into every plane deeper than the ubatch and
+    // accepted the rollback). Prefill P tokens, decode n_single more one at a time, roll back r (in one seq_rm, and
+    // as r-1 then 1), replay, and compare bitwise against a fresh context that never went past the rollback point.
+    // Depths 1..max_depth and n_rs_seq must be accepted; one depth past the ring capacity (n_rs_seq + 1, still inside the
+    // decoded history) must be refused, in one call and as n_rs_seq then 1 -- not skipped.
+    {
+        constexpr uint32_t n_single   = 8;
+        constexpr uint32_t n_replay_f = 3;
+        constexpr uint32_t max_depth  = 4;
+
+        std::vector<llama_token> toks(9 + n_single + n_replay_f);
+        for (size_t i = 0; i < toks.size(); ++i) {
+            toks[i] = (llama_token) ((7*i + 3) % (size_t) n_vocab);
+        }
+
+        // prefill `n_prefill` in one batch, then single tokens up to (excluding) position `end`
+        const auto build = [&](llama_context * ctx, uint32_t n_prefill, llama_pos end) {
+            if (!decode_tokens_seq(ctx, toks, n_prefill, 0)) {
+                return false;
+            }
+            for (llama_pos p = (llama_pos) n_prefill; p < end; ++p) {
+                if (!decode_one_seq(ctx, toks[p], p, 0)) {
+                    return false;
+                }
+            }
+            return true;
+        };
+
+        int n_checked = 0;
+        int n_refused = 0;
+        const int failures_before = failures;
+        for (uint32_t n_prefill : { 3u, 9u }) {
+            const llama_pos end = (llama_pos) (n_prefill + n_single); // head = end - 1
+            std::vector<uint32_t> depths;
+            for (uint32_t r = 1; r <= max_depth; ++r) {
+                depths.push_back(r);
+            }
+            if (n_rs_seq > max_depth && (llama_pos) n_rs_seq < end) {
+                depths.push_back(n_rs_seq);     // the deepest plane, reached only through n_single shifts
+            }
+            if ((llama_pos) (n_rs_seq + 1) < end) {
+                depths.push_back(n_rs_seq + 1); // past the ring, p0 = end - r still > 0
+            }
+            for (uint32_t r : depths) {
+                const bool expect_ok = r <= n_rs_seq;
+
+                std::vector<std::vector<float>> lg_ref;
+                if (expect_ok) {
+                    llama_context * ctx_ref = make_ctx(params, model);
+                    if (ctx_ref == nullptr) { fprintf(stderr, "rb1b : gate F context init failed\n"); return 1; }
+                    const bool ok = build(ctx_ref, n_prefill, end - (llama_pos) r) &&
+                                    replay_capture(ctx_ref, toks, end - (llama_pos) r, n_replay_f, 0, n_vocab, lg_ref);
+                    llama_free(ctx_ref);
+                    if (!ok) {
+                        fprintf(stderr, "rb1b : gate F FAIL -- reference decode failed (P=%u r=%u)\n", n_prefill, r);
+                        failures++;
+                        continue;
+                    }
+                }
+
+                for (bool two_step : { false, true }) {
+                    if (two_step && r < 2) {
+                        continue;
+                    }
+                    llama_context * ctx_rb = make_ctx(params, model);
+                    if (ctx_rb == nullptr) { fprintf(stderr, "rb1b : gate F context init failed\n"); return 1; }
+
+                    bool ok = build(ctx_rb, n_prefill, end);
+                    bool accepted = false;
+                    if (ok) {
+                        llama_memory_t mem = llama_get_memory(ctx_rb);
+                        const llama_pos p0 = end - (llama_pos) r;
+                        accepted = two_step ? llama_memory_seq_rm(mem, 0, p0 + 1, -1) && llama_memory_seq_rm(mem, 0, p0, -1)
+                                            : llama_memory_seq_rm(mem, 0, p0, -1);
+                    }
+
+                    std::vector<std::vector<float>> lg_rb;
+                    const char * mode = two_step ? "two-step" : "single";
+                    if (!ok) {
+                        fprintf(stderr, "rb1b : gate F FAIL -- decode failed (P=%u r=%u %s)\n", n_prefill, r, mode);
+                        failures++;
+                    } else if (accepted != expect_ok) {
+                        fprintf(stderr, "rb1b : gate F FAIL -- rollback of %u after %u single decodes was %s "
+                                        "(P=%u %s, n_rs_seq=%u)\n", r, n_single, accepted ? "accepted" : "refused",
+                                        n_prefill, mode, n_rs_seq);
+                        failures++;
+                    } else if (!accepted) {
+                        n_refused++;
+                    } else if (!replay_capture(ctx_rb, toks, end - (llama_pos) r, n_replay_f, 0, n_vocab, lg_rb)) {
+                        fprintf(stderr, "rb1b : gate F FAIL -- replay failed (P=%u r=%u %s)\n", n_prefill, r, mode);
+                        failures++;
+                    } else {
+                        char what[96];
+                        snprintf(what, sizeof(what), "gate F (P=%u r=%u %s vs fresh)", n_prefill, r, mode);
+                        if (!logits_match(lg_rb, lg_ref, 0.0f, what)) {
+                            failures++;
+                        } else {
+                            n_checked++;
+                        }
+                    }
+                    llama_free(ctx_rb);
+                }
+            }
+        }
+        if (failures == failures_before) {
+            fprintf(stderr, "rb1b : gate F PASS -- %d rollbacks after 1-token decodes match a fresh context exactly, "
+                            "%d refused beyond the ring\n", n_checked, n_refused);
+        }
+    }
+
     fprintf(stderr, "rb1b : %d gate failure(s)\n", failures);
     return failures == 0 ? 0 : 1;
 }
