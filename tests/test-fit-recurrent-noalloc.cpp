@@ -1,10 +1,12 @@
 // The -fit memory probe creates contexts from a no_alloc model and reads the device free memory while the probe context
 // is alive (common/fit.cpp common_get_device_memory_data_impl). Every context buffer must therefore only be sized, not
 // allocated, in that mode, or the probe's free memory drops by the buffer while memory_breakdown() also reports it.
-// This test checks the recurrent state (llama_memory_recurrent, with rollback snapshots n_rs_seq > 0) on the CPU:
+// This test checks the recurrent state (llama_memory_recurrent, with rollback snapshots n_rs_seq > 0), or for deepseek4
+// the DSV4 compressor states (llama_dsv4_comp_state, also with n_rs_seq snapshot planes), on the CPU:
 //   1. a no_alloc context reports the same context bytes as a real context with the same parameters;
 //   2. creating the no_alloc context does not make those bytes resident (RSS grows by far less than their size).
-// usage: test-fit-recurrent-noalloc -m <recurrent or hybrid model, e.g. the generated qwen35-dense.gguf>
+// usage: test-fit-recurrent-noalloc -m <recurrent, hybrid or deepseek4 model, e.g. the generated qwen35-dense.gguf or
+//        deepseek4-moe.gguf>
 
 #include "arg.h"
 #include "common.h"
@@ -15,6 +17,7 @@
 #include <clocale>
 #include <cstdio>
 #include <cstdint>
+#include <cstring>
 #include <unistd.h>
 
 static int64_t resident_bytes() {
@@ -88,7 +91,10 @@ int main(int argc, char ** argv) {
             std::fprintf(stderr, "%s: failed to load the model (no_alloc)\n", __func__);
             return 1;
         }
-        if (!llama_model_is_recurrent(model) && !llama_model_is_hybrid(model)) {
+        char arch[64] = {0};
+        llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch));
+        const bool is_dsv4 = std::strcmp(arch, "deepseek4") == 0;
+        if (!llama_model_is_recurrent(model) && !llama_model_is_hybrid(model) && !is_dsv4) {
             std::fprintf(stderr, "%s: skipping for non-recurrent model\n", __func__);
             llama_model_free(model);
             return 0;

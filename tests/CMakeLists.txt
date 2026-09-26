@@ -229,6 +229,16 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     set_tests_properties(test-fit-recurrent-noalloc PROPERTIES
         FIXTURES_REQUIRED generate-models
     )
+    # same check for the DSV4 compressor states
+    llama_test(
+        test-fit-recurrent-noalloc
+        NAME test-fit-recurrent-noalloc-dsv4
+        LABEL main
+        ARGS -m "${MODEL_DIR}/deepseek4-moe.gguf"
+    )
+    set_tests_properties(test-fit-recurrent-noalloc-dsv4 PROPERTIES
+        FIXTURES_REQUIRED generate-models
+    )
 
     llama_test(
         test-recurrent-state-rollback

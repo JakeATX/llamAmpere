@@ -66,6 +66,9 @@ private:
     const uint32_t n_stream;
     const uint32_t n_rs_seq;
 
+    // the model was loaded with no_alloc (-fit probe): the state is sized but not allocated
+    const bool no_alloc;
+
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
 
     std::vector<layer> layers;
