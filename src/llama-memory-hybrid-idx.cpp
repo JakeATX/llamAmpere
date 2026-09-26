@@ -398,7 +398,10 @@ void llama_memory_hybrid_idx::ple_hist_div(llama_seq_id seq_id, llama_pos p0, ll
 // sequence share one format:
 //   u32 n_entries
 //   n_entries * { i32 seq_id, i32 next_pos, u32 n_toks, i32 toks[n_toks] }
-// n_toks is at most ple_ngram_size - 1, so an entry is a handful of bytes.
+// n_toks is at most ple_ngram_size - 1, so an entry is a handful of bytes: only the newest tokens
+// are written. The rollback tail the live window keeps (n_rs_seq more) is not needed after a
+// restore, which leaves no rollback history (rs_valid starts at 0), and dropping it keeps the
+// format and the read bound below unchanged.
 void llama_memory_hybrid_idx::ple_hist_state_write(llama_io_write_i & io, llama_seq_id seq_id) const {
     uint32_t n_entries = 0;
     for (const auto & it : ple_hist) {
@@ -416,13 +419,14 @@ void llama_memory_hybrid_idx::ple_hist_state_write(llama_io_write_i & io, llama_
 
         const int32_t  id       = it.first;
         const int32_t  next_pos = it.second.next_pos;
-        const uint32_t n_toks   = (uint32_t) it.second.toks.size();
+        const uint32_t n_all    = (uint32_t) it.second.toks.size();
+        const uint32_t n_toks   = std::min<uint32_t>(n_all, LLAMA_MAX_PLE_NGRAM - 1);
 
         io.write(&id,       sizeof(id));
         io.write(&next_pos, sizeof(next_pos));
         io.write(&n_toks,   sizeof(n_toks));
         if (n_toks > 0) {
-            io.write(it.second.toks.data(), n_toks*sizeof(llama_token));
+            io.write(it.second.toks.data() + (n_all - n_toks), n_toks*sizeof(llama_token));
         }
     }
 }

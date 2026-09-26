@@ -1349,6 +1349,12 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
 
     std::vector<int32_t> idx(n_heads * n_tokens);
 
+    // [TAG_PLE_HISTORY] the hash reads n_gram - 1 predecessors, but the history keeps n_rs_seq more:
+    // a rollback of r <= n_rs_seq tokens (seq_rm rewind, ple_hist_truncate) must still leave the
+    // n_gram - 1 tokens before the new head. Keeping only n_gram - 1 left a rewound window short
+    // and EOS-padded, so every rollback decoded different PLE rows than a fresh context would.
+    const int64_t n_keep = n_gram - 1 + (int64_t) mctx->get_recr()->get_n_rs_seq();
+
     // missing predecessors come from the per-sequence history, but only when it is
     // contiguous with the incoming position; otherwise the window is EOS-padded
     GGML_ASSERT(mctx != nullptr);
@@ -1366,12 +1372,13 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
             h.next_pos = ubatch->pos[i];
             h.toks.clear();
         }
-        if ((int64_t) h.toks.size() > n_gram - 1) {
-            h.toks.erase(h.toks.begin(), h.toks.end() - (n_gram - 1));
+        if ((int64_t) h.toks.size() > n_keep) {
+            h.toks.erase(h.toks.begin(), h.toks.end() - n_keep);
         }
 
         std::vector<llama_token> padded(n_gram - 1, (llama_token) eos);
-        std::copy(h.toks.begin(), h.toks.end(), padded.end() - (int64_t) h.toks.size());
+        const int64_t n_use = std::min<int64_t>((int64_t) h.toks.size(), n_gram - 1);
+        std::copy(h.toks.end() - n_use, h.toks.end(), padded.end() - n_use);
         snap[seq] = std::move(padded);
     }
 
@@ -1423,8 +1430,8 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
 
         auto & h = mctx->get_ple_hist(seq);
         h.toks.push_back(tok_of(i));
-        if ((int64_t) h.toks.size() > n_gram - 1) {
-            h.toks.erase(h.toks.begin(), h.toks.end() - (n_gram - 1));
+        if ((int64_t) h.toks.size() > n_keep) {
+            h.toks.erase(h.toks.begin(), h.toks.end() - n_keep);
         }
         h.next_pos = pos + 1;
     }

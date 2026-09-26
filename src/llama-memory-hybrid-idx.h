@@ -87,8 +87,9 @@ public:
         // position the next token of this sequence must have; -1 means the window is not trusted
         llama_pos next_pos = -1;
 
-        // the tokens at [next_pos - toks.size(), next_pos), oldest first, at most ple_ngram_size - 1
-        // it can be shorter near a sequence start or after a rewind; the caller pads the front with EOS
+        // the tokens at [next_pos - toks.size(), next_pos), oldest first, at most ple_ngram_size - 1 + n_rs_seq
+        // (the extra n_rs_seq survive a rollback rewind); the hash reads the last ple_ngram_size - 1.
+        // It can be shorter near a sequence start or after a rewind; the caller pads the front with EOS
         std::vector<llama_token> toks;
     };
 
