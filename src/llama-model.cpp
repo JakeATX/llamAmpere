@@ -2873,7 +2873,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             nullptr,
                             filter,
                             nullptr,
-                            nullptr);
+                            nullptr,
+                            "",
+                            0, nullptr, 0, // no block KV streaming (as on the v0.4 side)
+                            params.kvarn);
                 } else {
                     // Main context: DSA cache for the trunk layers only - the nextn
                     // layer(s) are never attended by the trunk graph.
@@ -2920,7 +2923,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             nullptr,
                             nullptr,
                             nullptr,
-                            nullptr);
+                            nullptr,
+                            "",
+                            0, nullptr, 0, // no block KV streaming (as on the v0.4 side)
+                            params.kvarn);
                 } else {
                     // only "full" layers own an indexer, so the shared layers need no indexer cache
                     llama_kv_cache::layer_filter_cb filter_lid = [&](uint32_t il) { return hparams.is_indexer_full(il); };
@@ -2967,7 +2973,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             nullptr,
                             filter,
                             nullptr,
-                            nullptr);
+                            nullptr,
+                            "",
+                            0, nullptr, 0, // no block KV streaming (as on the v0.4 side)
+                            params.kvarn);
                 } else {
                     // main context: DSA cache for the trunk full-attention layers plus a window-sized SWA cache
                     llama_kv_cache::layer_filter_cb filter_mla = nullptr;
@@ -3194,7 +3203,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* filter_recr       */ std::move(filter_recr),
                             /* kv stream stage   */ params.kv_stream_stage_bytes,
                             /* kv stream arena   */ params.kv_stream_phase_arena,
-                            /* kv stream maximum */ params.kv_stream_maximum_pool_bytes);
+                            /* kv stream maximum */ params.kv_stream_maximum_pool_bytes,
+                            /* kvarn             */ params.kvarn);
                     }
                 } else {
                     llama_kv_cache::layer_filter_cb filter = nullptr;
@@ -3306,7 +3316,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 "",
                                 params.kv_stream_stage_bytes,
                                 params.kv_stream_phase_arena,
-                                params.kv_stream_maximum_pool_bytes);
+                                params.kv_stream_maximum_pool_bytes,
+                                params.kvarn);
                     }
                 }
             }

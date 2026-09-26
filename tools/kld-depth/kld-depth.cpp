@@ -8,7 +8,8 @@
 //
 // Base records are sparse: for each scored position the tokens whose base log-prob is above -16 (the same
 // cutoff the perplexity tool applies inside its KLD sum), plus the base NLL of the actual next token and the
-// base argmax. KLD against such a record is exactly what llama-perplexity computes, at ~1-5% of the bytes.
+// base argmax. This truncated sum follows the perplexity cutoff, but is not full-vocabulary KL.
+// KLD_FULL_VOCAB=1 stores dense double log-probabilities without a cutoff.
 //
 // All ordinary flags are the perplexity tool's (-m -f -c -b -ub -t -tb -ngl -fa -ctk -ctv ...). Extras via env:
 //   KLD_MODE=write|read   write the base file (default read)
@@ -16,6 +17,9 @@
 //   KLD_STRIDE=<n>        score every n-th position (default 1); must match between write and read
 //   KLD_OUT=<csv>         per-position CSV (read mode)
 //   KLD_BINS=a,b,c,...    bin upper edges in tokens (default 10240,25600,51200,76800,102400,128000,153600)
+//   KLD_KVARN_IDLE_EVERY=n compress adaptive KVarN after every n input tokens (default 0/off)
+//   KLD_FULL_VOCAB=1     dense double log-probabilities, exact token/config validation
+//   KLD_CONTRACT=<text>   required in full mode; caller model/config identity (exclude cache type)
 //   KLD_MAX_TOKENS=<n>    use at most n tokens of the file (default: the context size)
 
 #include "arg.h"
@@ -29,6 +33,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iomanip>
+#include <cerrno>
+#include <climits>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -52,6 +59,7 @@ struct sparse_record {
     int32_t top;        // base argmax
     std::vector<int32_t> ids;
     std::vector<float>   logp;
+    std::vector<double> full_logp;
 };
 
 struct pos_result {
@@ -63,6 +71,19 @@ struct pos_result {
     float   nll_base;
     int     same_top;
 };
+
+static int integer_env(const char * name, int fallback, int minimum = 1) {
+    const char * value = getenv(name);
+    if (!value) return fallback;
+    char * end = nullptr;
+    errno = 0;
+    const long result = strtol(value, &end, 10);
+    if (errno || !*value || *end || result < minimum || result > INT_MAX) {
+        LOG_ERR("%s must be an integer in [%d, %d]\n", name, minimum, INT_MAX);
+        exit(1);
+    }
+    return (int) result;
+}
 
 static std::vector<int> parse_bins(const char * s) {
     std::vector<int> bins;
@@ -82,27 +103,37 @@ static std::vector<int> parse_bins(const char * s) {
 }
 
 // log-softmax pieces for one row
-static void row_max_lse(const float * logits, int n_vocab, float & max_logit, int & imax, double & lse) {
+static void row_max_lse(const float * logits, int n_vocab, float & max_logit, int & imax, double & lse, bool full = false) {
     max_logit = logits[0];
     imax = 0;
-    for (int i = 1; i < n_vocab; ++i) {
+    for (int i = 0; i < n_vocab; ++i) {
+        if (!std::isfinite(logits[i])) {
+            max_logit = NAN; lse = NAN; return;
+        }
         if (logits[i] > max_logit) { max_logit = logits[i]; imax = i; }
     }
     double sum_exp = 0.0;
     for (int i = 0; i < n_vocab; ++i) {
-        sum_exp += expf(logits[i] - max_logit);
+        sum_exp += full ? exp((double) logits[i] - max_logit) : expf(logits[i] - max_logit);
     }
     lse = log(sum_exp);
 }
 
-static void make_record(const float * logits, int n_vocab, int32_t pos, int32_t tok, sparse_record & rec) {
+static void make_record(const float * logits, int n_vocab, int32_t pos, int32_t tok, sparse_record & rec, bool full) {
     float max_logit; int imax; double lse;
-    row_max_lse(logits, n_vocab, max_logit, imax, lse);
+    row_max_lse(logits, n_vocab, max_logit, imax, lse, full);
     const float shift = (float) (max_logit + lse);
     rec.pos = pos;
     rec.tok = tok;
     rec.nll = shift - logits[tok];
     rec.top = imax;
+    if (full) {
+        const double shift_full = (double) max_logit + lse;
+        rec.nll = shift_full - logits[tok];
+        rec.full_logp.resize(n_vocab);
+        for (int i = 0; i < n_vocab; ++i) rec.full_logp[i] = (double) logits[i] - shift_full;
+        return;
+    }
     rec.ids.clear();
     rec.logp.clear();
     for (int i = 0; i < n_vocab; ++i) {
@@ -114,9 +145,9 @@ static void make_record(const float * logits, int n_vocab, int32_t pos, int32_t 
     }
 }
 
-static pos_result score_record(const float * logits, int n_vocab, const sparse_record & rec) {
+static pos_result score_record(const float * logits, int n_vocab, const sparse_record & rec, bool full) {
     float max_logit; int imax; double lse;
-    row_max_lse(logits, n_vocab, max_logit, imax, lse);
+    row_max_lse(logits, n_vocab, max_logit, imax, lse, full);
     const float shift = (float) (max_logit + lse);
     double kld = 0.0;
     for (size_t k = 0; k < rec.ids.size(); ++k) {
@@ -124,40 +155,63 @@ static pos_result score_record(const float * logits, int n_vocab, const sparse_r
         const float lp_q    = logits[rec.ids[k]] - shift;
         kld += expf(lp_base) * (double) (lp_base - lp_q);
     }
+    if (full) {
+        const double shift_full = (double) max_logit + lse;
+        for (int i = 0; i < n_vocab; ++i) {
+            const double lp = rec.full_logp[i];
+            kld += exp(lp) * (lp - ((double) logits[i] - shift_full));
+        }
+    }
     pos_result r;
     r.pos      = rec.pos;
     r.tok      = rec.tok;
     r.kld      = (float) kld;
-    r.nll      = shift - logits[rec.tok];
+    r.nll      = (full ? (double) max_logit + lse : shift) - logits[rec.tok];
     r.nll_base = rec.nll;
     r.p_diff   = expf(-r.nll) - expf(-r.nll_base);
     r.same_top = imax == rec.top ? 1 : 0;
     return r;
 }
 
-static void write_record(std::ofstream & out, const sparse_record & rec) {
-    const int32_t n = (int32_t) rec.ids.size();
+static void write_record(std::ofstream & out, const sparse_record & rec, bool full) {
+    const int32_t n = full ? (int32_t) rec.full_logp.size() : (int32_t) rec.ids.size();
     out.write((const char *) &rec.pos, sizeof(rec.pos));
     out.write((const char *) &rec.tok, sizeof(rec.tok));
     out.write((const char *) &rec.nll, sizeof(rec.nll));
     out.write((const char *) &rec.top, sizeof(rec.top));
     out.write((const char *) &n, sizeof(n));
+    if (full) {
+        out.write((const char *) rec.full_logp.data(), n * sizeof(double));
+        return;
+    }
     out.write((const char *) rec.ids.data(),  n * sizeof(int32_t));
     out.write((const char *) rec.logp.data(), n * sizeof(float));
 }
 
-static bool read_record(std::ifstream & in, sparse_record & rec) {
+static bool read_record(std::ifstream & in, sparse_record & rec, int n_vocab, bool full) {
     int32_t n = 0;
     if (!in.read((char *) &rec.pos, sizeof(rec.pos))) return false;
     in.read((char *) &rec.tok, sizeof(rec.tok));
     in.read((char *) &rec.nll, sizeof(rec.nll));
     in.read((char *) &rec.top, sizeof(rec.top));
     in.read((char *) &n, sizeof(n));
-    if (!in || n < 0) return false;
+    if (!in || n < 0 || n > n_vocab || rec.tok < 0 || rec.tok >= n_vocab ||
+        rec.top < 0 || rec.top >= n_vocab || !std::isfinite(rec.nll)) return false;
+    if (full) {
+        if (n != n_vocab) return false;
+        rec.full_logp.resize(n);
+        in.read((char *) rec.full_logp.data(), n * sizeof(double));
+        for (double lp : rec.full_logp) if (!std::isfinite(lp) || lp > 0) return false;
+        return (bool) in;
+    }
     rec.ids.resize(n);
     rec.logp.resize(n);
     in.read((char *) rec.ids.data(),  n * sizeof(int32_t));
     in.read((char *) rec.logp.data(), n * sizeof(float));
+    for (int i = 0; i < n; ++i) {
+        if (rec.ids[i] < 0 || rec.ids[i] >= n_vocab || !std::isfinite(rec.logp[i]) ||
+            (i > 0 && rec.ids[i] <= rec.ids[i - 1])) return false;
+    }
     return (bool) in;
 }
 
@@ -181,18 +235,30 @@ int main(int argc, char ** argv) {
 
     const char * env_mode   = getenv("KLD_MODE");
     const char * env_base   = getenv("KLD_BASE");
-    const char * env_stride = getenv("KLD_STRIDE");
     const char * env_out    = getenv("KLD_OUT");
     const char * env_bins   = getenv("KLD_BINS");
-    const char * env_max    = getenv("KLD_MAX_TOKENS");
 
+    const bool full = getenv("KLD_FULL_VOCAB") && strcmp(getenv("KLD_FULL_VOCAB"), "1") == 0;
+    const char * contract_env = getenv("KLD_CONTRACT");
+    const std::string contract = contract_env ? contract_env : "";
+    if (full && (contract.empty() || contract.size() > 65536)) {
+        LOG_ERR("full mode requires KLD_CONTRACT of 1..65536 bytes\n"); return 1;
+    }
+    if (env_mode && strcmp(env_mode, "write") && strcmp(env_mode, "read")) {
+        LOG_ERR("KLD_MODE must be write or read\n"); return 1;
+    }
+    const char * magic = full ? "KLDDPTH2" : KLD_MAGIC;
     const bool write_mode = env_mode && strcmp(env_mode, "write") == 0;
     if (!env_base || !*env_base) {
         LOG_ERR("KLD_BASE is required\n");
         return 1;
     }
-    const int stride = env_stride ? std::max(1, atoi(env_stride)) : 1;
+    const int stride = integer_env("KLD_STRIDE", 1);
     const std::vector<int> bins = parse_bins(env_bins);
+    const int idle_every = integer_env("KLD_KVARN_IDLE_EVERY", 0, 0);
+    if (idle_every && (params.n_batch <= 0 || idle_every % params.n_batch != 0)) {
+        LOG_ERR("KLD_KVARN_IDLE_EVERY must be a multiple of batch size\n"); return 1;
+    }
 
     llama_backend_init();
     llama_numa_init(params.numa);
@@ -211,7 +277,7 @@ int main(int argc, char ** argv) {
 
     std::vector<llama_token> tokens = common_tokenize(ctx, params.prompt, add_bos, true);
     int n_tokens = (int) tokens.size();
-    const int max_tokens = env_max ? atoi(env_max) : n_ctx;
+    const int max_tokens = integer_env("KLD_MAX_TOKENS", n_ctx);
     if (n_tokens > std::min(n_ctx, max_tokens)) {
         n_tokens = std::min(n_ctx, max_tokens);
         tokens.resize(n_tokens);
@@ -230,18 +296,45 @@ int main(int argc, char ** argv) {
         base_out.open(env_base, std::ios::binary);
         if (!base_out) { LOG_ERR("cannot open %s for writing\n", env_base); return 1; }
         memset(&hdr, 0, sizeof(hdr));
-        memcpy(hdr.magic, KLD_MAGIC, 8);
+        memcpy(hdr.magic, magic, 8);
         hdr.n_vocab = n_vocab; hdr.stride = stride; hdr.n_tokens = n_tokens; hdr.n_records = 0;
         base_out.write((const char *) &hdr, sizeof(hdr));
     } else {
         base_in.open(env_base, std::ios::binary);
         if (!base_in) { LOG_ERR("cannot open %s\n", env_base); return 1; }
         base_in.read((char *) &hdr, sizeof(hdr));
-        if (!base_in || memcmp(hdr.magic, KLD_MAGIC, 8) != 0) { LOG_ERR("bad base file\n"); return 1; }
+        if (!base_in || memcmp(hdr.magic, magic, 8) != 0) { LOG_ERR("bad base file\n"); return 1; }
         if (hdr.n_vocab != n_vocab || hdr.stride != stride || hdr.n_tokens != n_tokens) {
             LOG_ERR("base mismatch: n_vocab %d/%d stride %d/%d n_tokens %d/%d\n",
                     hdr.n_vocab, n_vocab, hdr.stride, stride, hdr.n_tokens, n_tokens);
             return 1;
+        }
+    }
+
+    const int32_t expected_records = (n_tokens - 2) / stride + 1;
+    if (!write_mode && hdr.n_records != expected_records) {
+        LOG_ERR("base record count mismatch or incomplete file\n"); return 1;
+    }
+    if (full) {
+        const int32_t config[4] = {(int32_t) llama_n_batch(ctx), (int32_t) llama_n_ubatch(ctx),
+                                  n_ctx, (int32_t) contract.size()};
+        if (write_mode) {
+            base_out.write((const char *) config, sizeof(config));
+            base_out.write(contract.data(), contract.size());
+            base_out.write((const char *) tokens.data(), tokens.size() * sizeof(llama_token));
+        } else {
+            int32_t saved[4];
+            base_in.read((char *) saved, sizeof(saved));
+            if (!base_in || memcmp(config, saved, sizeof(config))) {
+                LOG_ERR("base batch/ubatch/context/contract length mismatch\n"); return 1;
+            }
+            std::string saved_contract(contract.size(), '\0');
+            std::vector<llama_token> saved_tokens(tokens.size());
+            base_in.read(&saved_contract[0], saved_contract.size());
+            base_in.read((char *) saved_tokens.data(), saved_tokens.size() * sizeof(llama_token));
+            if (!base_in || saved_contract != contract || saved_tokens != tokens) {
+                LOG_ERR("base model/config contract or exact token stream mismatch\n"); return 1;
+            }
         }
     }
 
@@ -279,19 +372,26 @@ int main(int argc, char ** argv) {
                     if (k >= n_scored) break;
                     const int bi = scored_idx[k];
                     const float * logits = llama_get_logits_ith(ctx, bi);
-                    make_record(logits, n_vocab, start + bi, tokens[start + bi + 1], recs[k]);
+                    make_record(logits, n_vocab, start + bi, tokens[start + bi + 1], recs[k], full);
                 }
             };
             std::vector<std::thread> th;
             for (int t = 1; t < n_threads; ++t) th.emplace_back(work);
             work();
             for (auto & t : th) t.join();
-            for (auto & r : recs) { write_record(base_out, r); ++n_records; }
+            for (auto & r : recs) {
+                if (!std::isfinite(r.nll) || (full && !std::all_of(r.full_logp.begin(), r.full_logp.end(),
+                        [](double lp) { return std::isfinite(lp) && lp <= 0; }))) {
+                    LOG_ERR("non-finite reference distribution at pos=%d\n", r.pos); return 1;
+                }
+                write_record(base_out, r, full);
+                ++n_records;
+            }
         } else {
             std::vector<sparse_record> recs(n_scored);
             for (int k = 0; k < n_scored; ++k) {
-                if (!read_record(base_in, recs[k])) { LOG_ERR("base file ended early at record %d\n", n_records + k); return 1; }
-                if (recs[k].pos != start + scored_idx[k]) {
+                if (!read_record(base_in, recs[k], n_vocab, full)) { LOG_ERR("base file ended early at record %d\n", n_records + k); return 1; }
+                if (recs[k].pos != start + scored_idx[k] || recs[k].tok != tokens[start + scored_idx[k] + 1]) {
                     LOG_ERR("base record pos %d != %d\n", recs[k].pos, start + scored_idx[k]); return 1;
                 }
             }
@@ -303,16 +403,31 @@ int main(int argc, char ** argv) {
                     { std::lock_guard<std::mutex> lock(m); k = counter++; }
                     if (k >= n_scored) break;
                     const float * logits = llama_get_logits_ith(ctx, scored_idx[k]);
-                    out[k] = score_record(logits, n_vocab, recs[k]);
+                    out[k] = score_record(logits, n_vocab, recs[k], full);
                 }
             };
             std::vector<std::thread> th;
             for (int t = 1; t < n_threads; ++t) th.emplace_back(work);
             work();
             for (auto & t : th) t.join();
+            for (const auto & r : out) {
+                if (!std::isfinite(r.kld) || !std::isfinite(r.nll)) {
+                    LOG_ERR("non-finite candidate distribution at pos=%d\n", r.pos); return 1;
+                }
+            }
             results.insert(results.end(), out.begin(), out.end());
             n_records += n_scored;
         }
+        if (idle_every && end % idle_every == 0) {
+            // All logits have been consumed. Teacher forcing has no speculative suffix or checkpoints.
+            const int32_t before = llama_kvarn_sealed_end(ctx);
+            const int32_t status = llama_kvarn_compress_idle(ctx, 0, end);
+            const int32_t after = llama_kvarn_sealed_end(ctx);
+            LOG_INF("kld_idle: accepted_end=%d status=%d sealed_before=%d sealed_after=%d\n",
+                    end, status, before, after);
+            if (status < 0) { LOG_ERR("KVarN idle compression failed\n"); return 1; }
+        }
+        if (write_mode && !base_out) { LOG_ERR("base write failed\n"); return 1; }
         const double el = (ggml_time_us() - t_start) / 1e6;
         LOG_INF("progress: %d / %d tokens, %d records, %.1f s (%.0f tok/s)\n", end, n_tokens, n_records, el, end / el);
     }
@@ -322,14 +437,21 @@ int main(int argc, char ** argv) {
         base_out.seekp(0);
         base_out.write((const char *) &hdr, sizeof(hdr));
         base_out.close();
+        if (!base_out) { LOG_ERR("base finalization failed\n"); return 1; }
         LOG_INF("wrote %d records to %s\n", n_records, env_base);
     } else {
+        if (base_in.peek() != std::ifstream::traits_type::eof()) {
+            LOG_ERR("unexpected trailing base records\n"); return 1;
+        }
         if (env_out && *env_out) {
             std::ofstream csv(env_out);
+            csv << std::setprecision(9);
             csv << "pos,tok,kld,p_diff,nll_q,nll_base,same_top\n";
             for (const auto & r : results) {
                 csv << r.pos << "," << r.tok << "," << r.kld << "," << r.p_diff << "," << r.nll << "," << r.nll_base << "," << r.same_top << "\n";
             }
+            csv.close();
+            if (!csv) { LOG_ERR("CSV write failed\n"); return 1; }
         }
         // per-bin summary
         printf("\n== KLD by position bin (records every %d tokens, %d total) ==\n", stride, (int) results.size());

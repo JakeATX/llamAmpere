@@ -410,6 +410,10 @@ public:
     ggml_tensor * self_k_rot = nullptr;
     ggml_tensor * self_v_rot = nullptr;
 
+    // KVarN: I32 region descriptor (sink/ring/body bounds for this ubatch), nullptr unless the cache is KVarN
+    ggml_tensor * self_kvarn_desc = nullptr;
+    ggml_tensor * self_kvarn_desc_edge = nullptr; // tiered body: descriptor of the edge tier (nullptr unless edge layers exist)
+
     // note: these have to be copies because in order to be able to reuse a graph, its inputs
     //       need to carry these parameters with them. otherwise, they can point to freed
     //       llm_graph_params from a previous batch, causing stack-use-after-return
@@ -1155,6 +1159,14 @@ struct llm_graph_context {
 
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
+
+    // KVarN: handed from build_attn (which owns the cache) to build_attn_mha (which owns the FA node)
+    mutable struct {
+        ggml_tensor * body = nullptr; // seal output (view of the layer's record pool)
+        ggml_tensor * desc = nullptr;
+        int32_t bits_k = 0;
+        int32_t bits_v = 0;
+    } kvarn_pending;
 
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;

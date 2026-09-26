@@ -619,6 +619,9 @@ struct server_slot {
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
+    // Invalid while a decode or speculative transaction is unresolved.
+    llama_pos kvarn_accepted_end = -1;
+    bool kvarn_idle_pending = false;
     std::mt19937 spec_synth_rng;
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
@@ -715,6 +718,8 @@ struct server_slot {
     }
 
     void prompt_clear() {
+        kvarn_accepted_end = -1;
+        kvarn_idle_pending = false;
         SLT_TRC(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
 
         mem.seq_rm(id, -1, -1);
@@ -986,6 +991,7 @@ struct server_slot {
 
             t_last_used = ggml_time_us();
 
+            kvarn_idle_pending = kvarn_accepted_end >= 0 && !task->is_child();
             state = SLOT_STATE_IDLE;
 
             // do not keep context of the child slots - the parent's context is enough
@@ -2413,6 +2419,8 @@ private:
         // the per-request limit takes priority over the global one
         slot.n_predict_max = task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
 
+        slot.kvarn_accepted_end = -1;
+        slot.kvarn_idle_pending = false;
         slot.task = std::make_unique<const server_task>(std::move(task));
 
         slot.state = slot.task->is_child()
@@ -3551,6 +3559,33 @@ private:
 
                 metrics_flush_idle();
 
+                if (params_base.kvarn_bits_k > 0 && params_base.kvarn_tail_max > 0 && slots.size() == 1) {
+                    auto & slot = slots.front();
+                    if (slot.kvarn_idle_pending) {
+                        slot.kvarn_idle_pending = false;
+                        const llama_pos end = slot.kvarn_accepted_end;
+                        if (end >= 0 && slot.spec_ckpt.empty() &&
+                                end == slot.prompt.tokens.pos_next() &&
+                                end == llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id) + 1) {
+                            // These snapshots could require rows that idle compression seals.
+                            // Keep the live prompt and recurrent state for ordinary continuation.
+                            if (!slot.prompt.checkpoints.empty()) {
+                                SLT_DBG(slot, "discarding %zu prompt checkpoints before KVarN idle compression\n",
+                                        slot.prompt.checkpoints.size());
+                                slot.prompt.checkpoints.clear();
+                            }
+                            const int64_t start = ggml_time_us();
+                            const int32_t result = llama_kvarn_compress_idle(ctx_tgt, slot.id, end);
+                            if (result < 0) {
+                                SLT_WRN(slot, "%s", "KVarN idle compression failed\n");
+                            } else if (result > 0) {
+                                SLT_INF(slot, "KVarN idle compression: end=%d, %.3f ms\n", end,
+                                        (ggml_time_us() - start) / 1000.0);
+                            }
+                        }
+                    }
+                }
+
                 return; // skip further processing
 
             } else {
@@ -3639,6 +3674,12 @@ private:
     }
 
     void pre_decode() {
+        for (auto & slot : slots) {
+            if (slot.is_processing()) {
+                slot.kvarn_accepted_end = -1;
+                slot.kvarn_idle_pending = false;
+            }
+        }
         // apply context-shift if needed
         // TODO: simplify and improve
         iterate(slots, [&](server_slot & slot) {
@@ -4171,6 +4212,13 @@ private:
                             SLT_WRN(slot, "n_past was set to %d\n", n_past);
                         }
 
+                        if (params_base.kvarn_bits_k > 0 && n_past > 0 &&
+                                slot.prompt.tokens.pos_next(n_past) < llama_kvarn_sealed_end(ctx_tgt)) {
+                            SLT_INF(slot, "%s", "edited prompt reaches sealed KVarN rows; reprocessing full prompt\n");
+                            slot.prompt_clear();
+                            n_past = 0;
+                        }
+
                         slot.stats.n_prompt_cached    = n_past;
                         slot.stats.n_prompt_processed = 0;
 
@@ -4655,6 +4703,7 @@ private:
             slot.i_batch = -1;
 
             common_sampler_accept(slot.smpl.get(), id, true);
+            slot.kvarn_accepted_end = slot.prompt.tokens.pos_next();
 
             // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
             const int64_t t_now = ggml_time_us();
@@ -4837,6 +4886,9 @@ private:
             SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
 
             slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
+            if (llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id) + 1 == slot.prompt.tokens.pos_next()) {
+                slot.kvarn_accepted_end = slot.prompt.tokens.pos_next();
+            }
 
             for (size_t i = 0; i < ids.size(); ++i) {
                 completion_token_output result;

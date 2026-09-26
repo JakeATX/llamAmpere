@@ -58,6 +58,10 @@ struct llama_context {
     void sched_reserve();
 
     void synchronize();
+    ggml_backend_t kvarn_backend(ggml_backend_buffer_t buffer) const;
+    bool maintain_kvarn();
+    int32_t compress_kvarn_idle(llama_seq_id seq_id, llama_pos accepted_end);
+
 
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;

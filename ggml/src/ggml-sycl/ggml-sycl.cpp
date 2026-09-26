@@ -6559,6 +6559,9 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
 
         case GGML_OP_SET_ROWS:
             {
+                    if (op->type == GGML_TYPE_TQ6_0 && ggml_get_op_params_i32(op, 1) != 0) {
+                        return false;
+                    }
                     if (op->type == GGML_TYPE_TQ2_0 || op->type == GGML_TYPE_TQ1_0) {
                         return false;
                     }

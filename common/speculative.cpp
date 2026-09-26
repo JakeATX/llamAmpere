@@ -3739,6 +3739,14 @@ common_params common_base_params_to_speculative(const common_params & params) {
     // The first block-streaming implementation owns only the target cache.
     // MTP keeps its ordinary cache until both contexts can share one pool.
     result.kv_stream_arena_mib = 0;
+    // the draft/MTP context shares cells with the target (or is a separate small cache): never KVarN.
+    // A KVarN trunk (-ctk/-ctv kvarnN) leaves cache_type_k/v at the plain type -ctk/-ctv kvarnN set (F16),
+    // so an inheriting drafter gets that plain cache, not the KVarN staging type.
+    result.kvarn_bits_k  = 0;
+    result.kvarn_bits_v  = 0;
+    result.kvarn_tail_max = 0;
+    result.kvarn_edge_layers = 0;
+    result.kvarn_flush_chunk = 0;
     result.n_outputs_max = params.n_parallel;
     result.n_outputs_max_per_seq = 1;
 

@@ -612,6 +612,7 @@ extern "C" {
         GGML_OP_GATED_DELTA_NET,
         GGML_OP_TURBO_WHT,
         GGML_OP_LIGHTNING_INDEXER,
+        GGML_OP_KVARN_SEAL,
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
@@ -1782,6 +1783,11 @@ extern "C" {
             struct ggml_tensor  * b,  // source
             struct ggml_tensor  * c); // row indices
 
+    // TQ6 packing in the input basis, without WHT or InnerQ (CPU and CUDA).
+    GGML_API struct ggml_tensor * ggml_set_rows_tq6_rotated(
+            struct ggml_context * ctx, struct ggml_tensor * a,
+            struct ggml_tensor * b, struct ggml_tensor * c);
+
     GGML_API struct ggml_tensor * ggml_diag(
         struct ggml_context     * ctx,
         struct ggml_tensor      * a);
@@ -2543,6 +2549,24 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
 
+    // KVarN-style region-aware attention (see ggml_kvarn_seal for the record format).
+    // k and v (src[1], src[2]) are the EXACT fp16 rows (sink + ring), body is the pool of sealed
+    // records for this layer (I8/U8, contiguous), desc is an I32 input tensor of GGML_KVARN_DESC_N
+    // entries laid out per ggml_kvarn_desc. With a mask (F16, ne[0] >= n_kv_pad, -INF for p >= N) the mask
+    // decides visibility exactly as in plain flash attention; without one the CPU reference is causal by
+    // position. The CUDA path requires a mask.
+    // K/V position p resolves to: p < S -> k row p; S <= p < B -> record (p-S)/G row (p-S)%G;
+    // p >= B -> k row S + (p-S)%cap. n_kv_pad bounds the KV loop (>= N, multiple of 64).
+    GGML_API void ggml_flash_attn_ext_set_kvarn(
+            struct ggml_tensor * a,
+            struct ggml_tensor * body,
+            struct ggml_tensor * desc,
+            int32_t              bits_k,
+            int32_t              bits_v,
+            int32_t              n_kv_pad);
+
+    GGML_API bool ggml_flash_attn_ext_is_kvarn(const struct ggml_tensor * a);
+
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
            struct ggml_context * ctx,
@@ -2736,6 +2760,63 @@ extern "C" {
             int                   direction,
             int                   group_size,    // 0 = auto (64 or 128 from ne[0])
             struct ggml_tensor  * scale);        // NULL = no InnerQ scaling
+
+    // KVarN-style sealed KV record (math: github.com/huawei-csl/KVarN; layout is this project's own).
+    // One record = one (head, group of G tokens), head dim D, token-major bit-packed K and V payloads followed
+    // by fp16 metadata: Kscale[D], Kzero[D], Ktok[G], Vch[D], Vscale[G], Vzero[G].
+    //   K[t,d] = (qK[t,d]*Kscale[d] + Kzero[d]) * Ktok[t]
+    //   V[t,d] = (qV[t,d]*Vscale[t] + Vzero[t]) * Vch[d]
+    // Inputs are the rotated fp16 rows: k, v are [D*Hkv, n_groups*G] (row = token, all heads concatenated).
+    // dst is I8 [rec_bytes*Hkv*n_groups]. Records are ordered (group, head).
+    GGML_API size_t ggml_kvarn_rec_bytes(int32_t D, int32_t G, int32_t bits_k, int32_t bits_v);
+
+    GGML_API struct ggml_tensor * ggml_kvarn_seal(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * dst,        // I8 view of the body pool receiving the records
+            struct ggml_tensor  * k,          // F16 [D*Hkv, n_groups*G]
+            struct ggml_tensor  * v,          // F16 [D*Hkv, n_groups*G]
+            int32_t               D,
+            int32_t               G,
+            int32_t               bits_k,
+            int32_t               bits_v,
+            int32_t               iters);     // variance-balancing iterations (16)
+
+    // Descriptor-driven seal for the decode graph: k, v are the full ring tensors [D*Hkv, S+cap] (rows S..S+cap-1
+    // hold position p at S + (p-S) % cap), dst is the whole body pool (I8, n_groups_pool*Hkv records). The op reads
+    // desc (I32, ggml_kvarn_desc) at run time and seals the groups covering positions [B_OLD, B) into records
+    // (B_OLD-S)/G .. (B-S)/G - 1; the rest of the pool is left untouched. n_groups_max bounds the per-call work
+    // (the launch size is static so the graph can be reused); (B - B_OLD)/G must not exceed it.
+    GGML_API struct ggml_tensor * ggml_kvarn_seal_dyn(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * dst,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * desc,
+            int32_t               D,
+            int32_t               G,
+            int32_t               bits_k,
+            int32_t               bits_v,
+            int32_t               iters,
+            int32_t               n_groups_max);
+
+    // descriptor entries for ggml_flash_attn_ext_set_kvarn
+    enum ggml_kvarn_desc {
+        GGML_KVARN_DESC_S        = 0,  // sink size (exact positions [0,S))
+        GGML_KVARN_DESC_CAP      = 1,  // ring capacity (rows S..S+cap-1 of k/v)
+        GGML_KVARN_DESC_B        = 2,  // sealed end (positions [S,B) are in body)
+        GGML_KVARN_DESC_N        = 3,  // visible end (positions [0,N) exist)
+        GGML_KVARN_DESC_QPOS0    = 4,  // position of the first query row
+        GGML_KVARN_DESC_G        = 5,
+        GGML_KVARN_DESC_D        = 6,
+        GGML_KVARN_DESC_RECBYTES = 7,
+        GGML_KVARN_DESC_HKV      = 8,
+        GGML_KVARN_DESC_B_OLD    = 9,  // sealed end before this ubatch (ggml_kvarn_seal_dyn seals [B_OLD, B))
+        GGML_KVARN_DESC_TYPE_K   = 10, // sink/ring ggml_type
+        GGML_KVARN_DESC_TYPE_V   = 11,
+        GGML_KVARN_DESC_BODY_TYPE = 12, // 0 = KVarN, TURBO4_0 = stored-domain Turbo4
+        GGML_KVARN_DESC_SINK_TYPE = 13, // 0 inherits staging; F16 uses appended sink storage
+        GGML_KVARN_DESC_N_ENTRIES = 16,
+    };
 
     // DeepSeek V4 Lightning Indexer
     GGML_API struct ggml_tensor * ggml_lightning_indexer(

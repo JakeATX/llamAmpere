@@ -1843,6 +1843,19 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.type_v = params.cache_type_v;
     cparams.kv_stream_arena_mib = params.kv_stream_arena_mib;
 
+    cparams.kvarn_bits_k = params.kvarn_bits_k;
+    cparams.kvarn_bits_v = params.kvarn_bits_v;
+    cparams.kvarn_tail   = params.kvarn_tail;
+    cparams.kvarn_sink   = params.kvarn_sink;
+    cparams.kvarn_staging_type = params.kvarn_staging_type;
+    cparams.kvarn_sink_type = params.kvarn_sink_type;
+    cparams.kvarn_body_type = params.kvarn_body_type;
+    cparams.kvarn_tail_max = params.kvarn_tail_max;
+    cparams.kvarn_edge_layers = params.kvarn_edge_layers;
+    cparams.kvarn_edge_bits_k = params.kvarn_edge_bits_k;
+    cparams.kvarn_edge_bits_v = params.kvarn_edge_bits_v;
+    cparams.kvarn_flush_chunk = params.kvarn_flush_chunk;
+
     if (params.moe_cache.mode_explicit) {
         switch (params.moe_cache.mode) {
             case COMMON_MOE_CACHE_MODE_OFF:

@@ -567,7 +567,7 @@ size_t quantize_turbo2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT d
 
 /* ---------- TURBO4_0: 3-bit PolarQuant + 1-bit QJL ---------- */
 
-void quantize_row_turbo4_0_ref(const float * GGML_RESTRICT x, block_turbo4_0 * GGML_RESTRICT y, int64_t k) {
+static void quantize_row_turbo4_0_impl(const float * GGML_RESTRICT x, block_turbo4_0 * GGML_RESTRICT y, int64_t k, bool already_rotated) {
     turbo_init_rotation();
     turbo_init_qjl();
 
@@ -595,7 +595,7 @@ void quantize_row_turbo4_0_ref(const float * GGML_RESTRICT x, block_turbo4_0 * G
         /* Step 2: Forward WHT rotation (matches CUDA set_rows) */
         float rotated[TURBO_D];
         memcpy(rotated, normalized, d * sizeof(float));
-        turbo_cpu_fwht(rotated, d);
+        if (!already_rotated) { turbo_cpu_fwht(rotated, d); }
 
 #if TURBO4_USE_4BIT
         /* Step 3: 4-bit quantization (16 centroids) */
@@ -675,6 +675,14 @@ void quantize_row_turbo4_0_ref(const float * GGML_RESTRICT x, block_turbo4_0 * G
         }
 #endif
     }
+}
+
+void quantize_row_turbo4_0_ref(const float * GGML_RESTRICT x, block_turbo4_0 * GGML_RESTRICT y, int64_t k) {
+    quantize_row_turbo4_0_impl(x, y, k, false);
+}
+
+void quantize_row_turbo4_0_rotated_ref(const float * GGML_RESTRICT x, block_turbo4_0 * GGML_RESTRICT y, int64_t k) {
+    quantize_row_turbo4_0_impl(x, y, k, true);
 }
 
 void dequantize_row_turbo4_0(const block_turbo4_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
@@ -772,7 +780,7 @@ size_t quantize_turbo4_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT d
  *
  * Same five-step pipeline as quantize_row_turbo4_0_ref, only the codebook and packing differ.
  */
-void quantize_row_tq6_0_ref(const float * GGML_RESTRICT x, block_tq6_0 * GGML_RESTRICT y, int64_t k) {
+static void quantize_row_tq6_0_impl(const float * GGML_RESTRICT x, block_tq6_0 * GGML_RESTRICT y, int64_t k, bool already_rotated) {
     turbo_init_rotation();
 
     assert(k % QK_TQ6 == 0);
@@ -799,7 +807,7 @@ void quantize_row_tq6_0_ref(const float * GGML_RESTRICT x, block_tq6_0 * GGML_RE
         /* Step 2: Forward WHT rotation (matches CUDA set_rows) */
         float rotated[TURBO_D];
         memcpy(rotated, normalized, d * sizeof(float));
-        turbo_cpu_fwht(rotated, d);
+        if (!already_rotated) { turbo_cpu_fwht(rotated, d); }
 
         /* Step 3: 6-bit quantization (64 centroids) */
         uint8_t indices[TURBO_D];
@@ -825,6 +833,15 @@ void quantize_row_tq6_0_ref(const float * GGML_RESTRICT x, block_tq6_0 * GGML_RE
             y[block].qh[i / 4] |= (uint8_t)(((idx >> 4) & 0x3) << ((i % 4) * 2));
         }
     }
+}
+
+void quantize_row_tq6_0_ref(const float * GGML_RESTRICT x, block_tq6_0 * GGML_RESTRICT y, int64_t k) {
+    quantize_row_tq6_0_impl(x, y, k, false);
+}
+
+// KVarN inputs already share the 256-point rotated basis.
+void quantize_row_tq6_0_rotated_ref(const float * GGML_RESTRICT x, block_tq6_0 * GGML_RESTRICT y, int64_t k) {
+    quantize_row_tq6_0_impl(x, y, k, true);
 }
 
 void dequantize_row_tq6_0(const block_tq6_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
