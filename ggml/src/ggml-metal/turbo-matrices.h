@@ -1,6 +1,6 @@
 // Auto-generated TurboQuant rotation and QJL matrices
 // Generated from Python turboquant with seed=42 (rotation) and seed=1042 (QJL)
-// DO NOT EDIT — regenerate with benchmarks/generate_metal_matrices.py
+// DO NOT EDIT — generated data
 
 constant float turbo_rotation_mtl[16384] = {
     2.82600336e-02f, -8.67175311e-02f, 7.18313754e-02f, 8.69530439e-02f, -2.14736775e-01f, -9.97434929e-02f, -9.84738488e-03f, -4.04329076e-02f,
