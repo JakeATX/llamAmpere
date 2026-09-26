@@ -3,6 +3,7 @@
 #include "ggml-backend.h"
 #include "llama.h"
 
+#include "../src/llama-context.h"
 #include "../src/llama-io.h"
 #include "../src/llama-memory.h"
 
@@ -530,6 +531,21 @@ static double nmse(const float * a, const float * b, int n) {
 // ubatches while its rollback restore is still pending. Compared against a
 // reference context that never advanced past the rollback point and decodes
 // the identical replay batch.
+// true when every backend the context schedules on is a CPU device (no GPU, no accelerator)
+static bool ctx_all_cpu(llama_context * ctx) {
+    ggml_backend_sched_t sched = ctx->get_sched();
+    if (sched == nullptr) {
+        return false;
+    }
+    for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(ggml_backend_sched_get_backend(sched, i));
+        if (dev == nullptr || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool test_multi_seq_split_replay(const common_params & params, llama_model * model, const int n_vocab, uint8_t fill) {
     constexpr uint32_t  n_seqs     = 2;
     constexpr uint32_t  n_ubatch   = 16;
@@ -622,9 +638,20 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
         return false;
     }
 
-    // identical ubatch shapes should produce identical states, but the larger
-    // stdev makes the model sensitive to backend scheduling/rounding noise
-    constexpr float nmse_eps = 1e-5f;
+    // Both contexts run the identical prefill and the identical replay batch, so the only
+    // difference is where ctx_roll's replay starts from: the restored rollback snapshot.
+    // Exact on CPU: same ubatch shapes, same kernels, so the logits must match bit for bit.
+    // On any other backend the bound is nmse <= 1e-10, which is provisional until a GPU run
+    // confirms exactness (the queue owner runs it). It must stay far below what a stale
+    // snapshot does here: the tiny test models barely lean on the recurrent state, and the
+    // nemotron-h rollback before the snapshot shift moved the logits by only 2e-4 (nmse 3.6e-8),
+    // which the old nmse <= 1e-5 bound passed.
+    const bool   exact    = ctx_all_cpu(ctx_roll) && ctx_all_cpu(ctx_ref);
+    const double nmse_eps = 1e-10;
+    const auto mismatch = [&](float diff, double nmse_v) {
+        return exact ? diff > 0.0f : !(nmse_v <= nmse_eps);
+    };
+    const char * rule = exact ? "exact, CPU" : "nmse <= 1e-10, non-CPU backend";
 
     float    diff_max  = 0.0f;
     uint32_t seq_first = 0;
@@ -660,14 +687,14 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
     }
     const double nmse_val = nmse_a0 == 0.0 ? (nmse_ab == 0.0 ? 0.0 : std::numeric_limits<double>::infinity()) : nmse_ab/nmse_a0;
 
-    if (nmse_val > nmse_eps) {
-        fprintf(stderr, "%s : multi-seq split replay logits mismatch (max diff %g, nmse %g, first at seq %u pos %d)\n",
-                __func__, (double) diff_max, nmse_val, seq_first, pos_first);
+    if (mismatch(diff_max, nmse_val)) {
+        fprintf(stderr, "%s : multi-seq split replay logits mismatch (%s; max diff %g, nmse %g, first at seq %u pos %d)\n",
+                __func__, rule, (double) diff_max, nmse_val, seq_first, pos_first);
         cleanup();
         return false;
     }
 
-    fprintf(stderr, "%s : multi-seq split replay matched (max diff %g, nmse %g)\n", __func__, (double) diff_max, nmse_val);
+    fprintf(stderr, "%s : multi-seq split replay matched (%s; max diff %g, nmse %g)\n", __func__, rule, (double) diff_max, nmse_val);
 
     // seq-1-only decodes must be independent of seq 0's content: diverge seq 0
     // in ctx_ref only, then compare identical seq-1-only continuations bitwise
@@ -716,14 +743,14 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
     }
     const double nmse_tail = nmse_tail_a0 == 0.0 ? (nmse_tail_ab == 0.0 ? 0.0 : std::numeric_limits<double>::infinity()) : nmse_tail_ab/nmse_tail_a0;
 
-    if (!ok || nmse_tail > nmse_eps) {
-        fprintf(stderr, "%s : seq-1-only decode leaked seq 0 state (ok=%d, max diff %g, nmse %g)\n",
-                __func__, ok ? 1 : 0, (double) diff_tail, nmse_tail);
+    if (!ok || mismatch(diff_tail, nmse_tail)) {
+        fprintf(stderr, "%s : seq-1-only decode leaked seq 0 state (%s; ok=%d, max diff %g, nmse %g)\n",
+                __func__, rule, ok ? 1 : 0, (double) diff_tail, nmse_tail);
         cleanup();
         return false;
     }
 
-    fprintf(stderr, "%s : seq-1-only decode independent of seq 0 (max diff %g, nmse %g)\n", __func__, (double) diff_tail, nmse_tail);
+    fprintf(stderr, "%s : seq-1-only decode independent of seq 0 (%s; max diff %g, nmse %g)\n", __func__, rule, (double) diff_tail, nmse_tail);
     cleanup();
     return true;
 }
