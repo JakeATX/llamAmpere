@@ -2333,7 +2333,7 @@ static bool ggml_cuda_fattn_path_stats_enabled() {
 
 static void ggml_cuda_fattn_path_note(const char * path, const ggml_tensor * dst, int ncols2) {
     {
-        // fallback ledger (GGML_LEDGER=1): kernel family per K/V pair and query width
+        // fallback ledger: kernel family per K/V pair and query width
         const ggml_tensor * Q = dst->src[0];
         const ggml_tensor * K = dst->src[1];
         const ggml_tensor * V = dst->src[2];
@@ -3772,7 +3772,7 @@ static void ggml_cuda_flash_attn_ext_bounded_prefill(
     float * O_ws = (float *) (ws + 2*p.kv_bytes);
 
     {
-        // fallback ledger (GGML_LEDGER=1): the same f16_convert family as launch_fattn, with the bounded scratch
+        // fallback ledger: the same f16_convert family as launch_fattn, with the bounded scratch
         const uint64_t id = ggml_cuda_ledger_mix(ggml_cuda_ledger_mix(ggml_cuda_ledger_mix(ggml_cuda_ledger_mix(ggml_cuda_ledger_mix(
             ggml_cuda_ledger_mix(0x22b0dedull, (uint64_t) K->type), (uint64_t) V->type), (uint64_t) ggml_cuda_ledger_width_bucket(Q->ne[1])),
             (uint64_t) reserved + 2), (uint64_t) p.heads), (uint64_t) p.n_head_kv);

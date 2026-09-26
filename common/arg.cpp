@@ -4,7 +4,6 @@
 #include "chat.h"
 #include "common.h"
 #include "download.h"
-#include "ggml-ledger.h"
 #include "json-schema-to-grammar.h"
 #include "json.h"
 #include "llama.h"
@@ -4064,15 +4063,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             common_log_pause(common_log_main());
         }
     ));
-    add_opt(common_arg(
-        {"--fallback-ledger"},
-        "count which kernel route each op takes and why a fast path was skipped (CUDA graph rebuild reasons, "
-        "mul_mat routes by width, flash-attention kernels and f16 KV conversions, fusions that did not fire, "
-        "draft vocabulary fallbacks); printed at exit and, in llama-server, on /metrics (same as GGML_LEDGER=1)",
-        [](common_params &) {
-            ggml_ledger_set_enabled(true);
-        }
-    ).set_env("LLAMA_ARG_FALLBACK_LEDGER"));
     add_opt(common_arg(
         {"--log-file"}, "FNAME",
         "Log to file",

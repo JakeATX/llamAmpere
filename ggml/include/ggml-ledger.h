@@ -2,13 +2,13 @@
 
 // Fallback ledger: host-side counters that record which route an op took and why a fast path was
 // skipped (CUDA graph rebuilds, mul_mat routes by width, flash-attention kernels, fusions that did
-// not fire, draft-vocab fallbacks). Off unless GGML_LEDGER=1 (or ggml_ledger_set_enabled(true)).
+// not fire, draft-vocab fallbacks). Off unless a test calls ggml_ledger_set_enabled(true).
 // Counting never touches the device and never synchronizes; a disabled ledger costs one cached
 // bool test per site.
 //
 // Counts are (site, key) pairs. `site` groups related counters ("cuda.graph", "cuda.mul_mat", ...),
-// `key` names the outcome. Both strings are copied on first use. With GGML_LEDGER=1 the table is
-// printed to stderr at process exit; tools can also walk it with ggml_ledger_foreach().
+// `key` names the outcome. Both strings are copied on first use. Once enabled, the table is printed
+// to stderr at process exit; tests can also walk it with ggml_ledger_foreach().
 
 #include "ggml.h"
 
@@ -21,7 +21,7 @@ extern "C" {
 
     struct ggml_ledger_slot;
 
-    // true when counting is on; the first call reads GGML_LEDGER
+    // true when counting is on (off by default)
     GGML_API bool ggml_ledger_enabled(void);
     GGML_API void ggml_ledger_set_enabled(bool enabled);
 
