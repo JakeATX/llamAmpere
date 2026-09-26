@@ -4986,7 +4986,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
 
     add_opt(common_arg(
         {"--spec-default"},
-        string_format("enable default speculative decoding config"),
+        string_format("enable the n-gram speculative preset (--spec-type ngram-mod, n-match 24, n-min 48, n-max 64); "
+            "this is not the per-family model default (e.g. the qwen35 MTP drafter), which it replaces like any explicit --spec-type"),
         [](common_params & params) {
             params.speculative.types.push_back(COMMON_SPECULATIVE_TYPE_NGRAM_MOD);
             params.speculative.user_set |= COMMON_PARAMS_SPECULATIVE_USER_TYPE;

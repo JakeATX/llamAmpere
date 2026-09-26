@@ -302,7 +302,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--gpt-oss-120b-default` | use gpt-oss-120b (note: can download weights from the internet) |
 | `--vision-gemma-4b-default` | use Gemma 3 4B QAT (note: can download weights from the internet) |
 | `--vision-gemma-12b-default` | use Gemma 3 12B QAT (note: can download weights from the internet) |
-| `--spec-default` | enable default speculative decoding config |
+| `--spec-default` | enable the n-gram speculative preset (--spec-type ngram-mod, n-match 24, n-min 48, n-max 64); this is not the per-family model default (e.g. the qwen35 MTP drafter), which it replaces like any explicit --spec-type |
 
 <!-- HELP_END -->
 
@@ -351,6 +351,8 @@ When `--spec-type` is not given, the server looks up the model family in a small
 - The draft KV cache types are not set by the default: they follow `-ctk`/`-ctv` unless `--spec-draft-type-k`/`-v` is given.
 - Any explicit `--spec-type` (including `--spec-type none`), a draft model (`-md`), `--eagle3` or `--dflash` turns the default off. Explicit `--spec-draft-n-max`, `--spec-draft-n-min-adaptive`, `--spec-draft-p-min` and `--spec-draft-vocab-map` values are kept on top of it. When only `--spec-draft-n-max` is given, a smaller value also lowers the adaptive floor (e.g. `--spec-draft-n-max 2` gives n-max 2, n-min-adaptive 2).
 - The server logs one line when the default applies, e.g. `speculative: MTP drafter on by default for qwen35 (nextn=1): draft-mtp-adaptive, n-max 4, n-min-adaptive 3, p-min 0, vocab map auto; --spec-type none disables`.
+- `--spec-default` is not this default. It is the upstream n-gram preset (`--spec-type ngram-mod` with `--spec-ngram-mod-n-match 24 --spec-ngram-mod-n-min 48 --spec-ngram-mod-n-max 64`) and, like any explicit `--spec-type`, it replaces the MTP drafter default rather than adding to it.
+- To run without speculative decoding, pass `--spec-type none` (or set `LLAMA_ARG_SPEC_TYPE=none`). `--spec-draft-n-max 0` also keeps the default from applying.
 - The same default applies to `llama-cli`, which runs the server in-process. Other tools (`llama-perplexity`, `llama-bench`, `llama-kld-depth`, ...) are unaffected.
 
 ### Multimodal support
