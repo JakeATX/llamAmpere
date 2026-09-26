@@ -686,12 +686,6 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             //printf("cuda pool[%d]: size increased to %llu MB (reserved %llu MB)\n",
             //       device, (unsigned long long) (pool_size/1024/1024),
             //       (unsigned long long) (reserve_size/1024/1024));
-            // [#22/#29] GGML_CUDA_POOL_LOG=1: the VMM pool only grows, so the last line is the high-water mark
-            static const bool pool_log = [] { const char * e = getenv("GGML_CUDA_POOL_LOG"); return e && e[0] == '1'; }();
-            if (pool_log) {
-                GGML_LOG_WARN("cuda pool[%d]: vmm size increased to %.1f MiB (+%.1f MiB, request %.1f MiB)\n", device,
-                              pool_size / 1048576.0, reserve_size / 1048576.0, size / 1048576.0);
-            }
         }
 
         GGML_ASSERT(pool_addr != 0);

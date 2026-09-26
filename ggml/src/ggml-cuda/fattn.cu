@@ -3498,27 +3498,10 @@ static bool ggml_cuda_flash_attn_ext_fused(ggml_backend_cuda_context * ctx, ggml
 #undef FATTN_FUSED_NOTE
 }
 
-static const char * ggml_cuda_fattn_kernel_name(const best_fattn_kernel kernel) {
-    switch (kernel) {
-        case BEST_FATTN_KERNEL_TILE:    return "tile";
-        case BEST_FATTN_KERNEL_VEC:     return "vec";
-        case BEST_FATTN_KERNEL_MMA_F16: return "mma_f16";
-        case BEST_FATTN_KERNEL_NONE:    break;
-    }
-    return "none";
-}
-
 // GGML_CUDA_FATTN_ALLOC_ROUTE=0 restores the generic-selector sizing: f16 K+V copies for TILE/MMA (and VEC without a
 // type instance) even when a fused route runs and never touches them. Default 1 (#64).
 static bool ggml_cuda_fattn_alloc_route() {
     static const bool v = [] { const char * e = getenv("GGML_CUDA_FATTN_ALLOC_ROUTE"); return !(e && e[0] == '0'); }();
-    return v;
-}
-
-// GGML_CUDA_FATTN_ALLOC_LOG=1: one line per new (K type, V type, n_q, log2 n_kv, route) with the scratch reserved
-// behind dst and what the generic selector would reserve, to size the gap at 32K / 100K (#64).
-static bool ggml_cuda_fattn_alloc_log() {
-    static const bool v = [] { const char * e = getenv("GGML_CUDA_FATTN_ALLOC_LOG"); return e && e[0] == '1'; }();
     return v;
 }
 
@@ -3878,15 +3861,12 @@ static void ggml_cuda_flash_attn_ext_bounded_prefill(
     }
 }
 
-static size_t ggml_cuda_fattn_generic_alloc_size(const int device, const ggml_tensor * dst, best_fattn_kernel * kernel_out) {
+static size_t ggml_cuda_fattn_generic_alloc_size(const int device, const ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
 
     const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(device, dst);
-    if (kernel_out) {
-        *kernel_out = kernel;
-    }
 
     bool need_f16_K = false;
     bool need_f16_V = false;
@@ -3925,8 +3905,7 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     // dry run: nothing launches and dst is not modified
     const bool fused = ggml_cuda_flash_attn_ext_fused(nullptr, const_cast<ggml_tensor *>(dst), device);
 
-    best_fattn_kernel kernel = BEST_FATTN_KERNEL_NONE;
-    const size_t size_generic = ggml_cuda_fattn_generic_alloc_size(device, dst, &kernel);
+    const size_t size_generic = ggml_cuda_fattn_generic_alloc_size(device, dst);
     const size_t size_fused   = ggml_nbytes(dst); // no f16 K/V copies
     // [#22/#29] the same plan the executor runs (ggml_cuda_fattn_bounded_prefill_plan); budget 0 = never applies
     const ggml_cuda_fattn_bounded_plan bounded = fused ? ggml_cuda_fattn_bounded_plan() :
@@ -3934,37 +3913,6 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     const size_t size_bounded = bounded.offset + bounded.reserve;
     const size_t size         = fused && ggml_cuda_fattn_alloc_route() ? size_fused :
                                 bounded.heads > 0 ? size_bounded : size_generic;
-
-    if (ggml_cuda_fattn_alloc_log()) {
-        static std::mutex mtx;
-        static std::map<uint64_t, bool> seen;
-        int log2_kv = 0;
-        while ((int64_t(1) << (log2_kv + 1)) <= K->ne[1]) {
-            log2_kv++;
-        }
-        const uint64_t key = ggml_cuda_ledger_mix(ggml_cuda_ledger_mix(ggml_cuda_ledger_mix(ggml_cuda_ledger_mix(
-            (uint64_t) K->type, (uint64_t) V->type), (uint64_t) Q->ne[1]), (uint64_t) log2_kv), (uint64_t) fused * 2 + (uint64_t) kernel);
-        const uint64_t key_bp = bounded.heads > 0 ? ggml_cuda_ledger_mix(key, (uint64_t) bounded.heads) : key;
-        std::lock_guard<std::mutex> lock(mtx);
-        if (bounded.heads > 0 && seen.emplace(key_bp, true).second) {
-            GGML_LOG_WARN("fattn alloc: dev %d K=%s V=%s n_q=%lld n_kv=%lld route=bounded_mma_f16 reserve %.1f MiB behind dst "
-                          "(%d of %d KV heads per group: f16 K+V %.1f MiB + group output %.1f MiB; budget %zu MiB, "
-                          "one-group floor %.1f MiB%s; generic selector: %s, %.1f MiB; saved %.1f MiB)\n",
-                device, ggml_type_name(K->type), ggml_type_name(V->type), (long long) Q->ne[1], (long long) K->ne[1],
-                (size - ggml_nbytes(dst)) / 1048576.0, bounded.heads, bounded.n_head_kv, 2 * bounded.kv_bytes / 1048576.0,
-                bounded.out_bytes / 1048576.0, bounded.budget >> 20, bounded.floor_bytes / 1048576.0,
-                bounded.floor_used ? " used" : "", ggml_cuda_fattn_kernel_name(kernel),
-                (size_generic - ggml_nbytes(dst)) / 1048576.0, ((double) size_generic - (double) size) / 1048576.0);
-        } else if (bounded.heads == 0 && seen.emplace(key, true).second) {
-            // WARN, not INFO: ggml INFO maps to trace verbosity (4), above the server's default of 3, so INFO never prints
-            GGML_LOG_WARN("fattn alloc: dev %d K=%s V=%s n_q=%lld n_kv=%lld route=%s reserve %.1f MiB behind dst "
-                          "(generic selector: %s, %.1f MiB; saved %.1f MiB)\n",
-                device, ggml_type_name(K->type), ggml_type_name(V->type), (long long) Q->ne[1], (long long) K->ne[1],
-                fused ? "fused" : ggml_cuda_fattn_kernel_name(kernel),
-                (size - ggml_nbytes(dst)) / 1048576.0, ggml_cuda_fattn_kernel_name(kernel),
-                (size_generic - ggml_nbytes(dst)) / 1048576.0, (size_generic - size) / 1048576.0);
-        }
-    }
 
     return size;
 }
