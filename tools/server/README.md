@@ -351,7 +351,7 @@ When `--spec-type` is not given, the server looks up the model family in a small
 - The draft KV cache types are not set by the default: they follow `-ctk`/`-ctv` unless `--spec-draft-type-k`/`-v` is given.
 - Any explicit `--spec-type` (including `--spec-type none`), a draft model (`-md`), `--eagle3` or `--dflash` turns the default off. Explicit `--spec-draft-n-max`, `--spec-draft-n-min-adaptive`, `--spec-draft-p-min` and `--spec-draft-vocab-map` values are kept on top of it. When only `--spec-draft-n-max` is given, a smaller value also lowers the adaptive floor (e.g. `--spec-draft-n-max 2` gives n-max 2, n-min-adaptive 2).
 - The server logs one line when the default applies, e.g. `speculative: MTP drafter on by default for qwen35 (nextn=1): draft-mtp-adaptive, n-max 4, n-min-adaptive 3, p-min 0, vocab map auto; --spec-type none disables`.
-- The same default applies to `llama-cli`, which runs the server in-process. Other tools (`llama-perplexity`, `llama-bench`, `llama-kld-depth`, ...) are unaffected.
+- The same default applies to `llama-cli`, which runs the server in-process. Other tools (`llama-perplexity`, `llama-bench`, ...) are unaffected.
 
 ### Multimodal support
 
