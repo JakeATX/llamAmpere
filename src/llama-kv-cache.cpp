@@ -1931,16 +1931,6 @@ ggml_tensor * llama_kv_cache::get_k_storage(int32_t il) const {
     return layers[ikv].k;
 }
 
-ggml_tensor * llama_kv_cache::get_v_storage(int32_t il) const {
-    const int32_t ikv = map_layer_ids.at(il);
-
-    return layers[ikv].v;
-}
-
-bool llama_kv_cache::get_v_transposed() const {
-    return v_trans;
-}
-
 const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
 

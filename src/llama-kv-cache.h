@@ -192,8 +192,6 @@ public:
     uint32_t get_n_stream() const;
     std::vector<uint32_t> get_layer_ids() const;
     ggml_tensor * get_k_storage(int32_t il) const;
-    ggml_tensor * get_v_storage(int32_t il) const;
-    bool get_v_transposed() const;
 
     bool kv_stream_adapt(uint32_t active_tokens, uint32_t query_tokens);
     bool kv_stream_resize_pool(
