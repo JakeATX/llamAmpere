@@ -989,12 +989,23 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     }
 
     if (kvarn.enabled() && p1 > p0) {
-        // sealed records cannot be reopened: only a full clear or a removal behind the sealed end is possible
-        if (p0 == 0 && p1 == std::numeric_limits<llama_pos>::max()) {
+        // Cells sit at their positions (cell index == position) and sealed records cannot be reopened, so besides
+        // a full clear only a suffix [p0, end) at or above the sealed end B can go: a hole or a prefix would let
+        // the next ubatch land in a freed cell below the frontier. B == sink means no record is sealed yet, so
+        // the exact sink is still mutable (speculative rollback inside a short prompt). Once a record exists the
+        // sink freezes with it: llama_kvarn_sealed_end() promises that nothing below B can be removed, and
+        // re-decoding a sink position would give apply_ubatch a pos0 below B. B_prev, B_pending and draining
+        // only describe [B, N), so a suffix removal at or above B leaves them valid.
+        const uint32_t n_present = v_cells[0].used_max_p1();
+        if (p0 == 0 && (uint32_t) p1 >= n_present) {
             kvarn_B = kvarn_B_prev = kvarn_B_pending = kvarn.sink;
             kvarn_draining = false;
             kvarn_N = 0;
-        } else if ((uint32_t) p0 < kvarn_B && (uint32_t) p0 < kvarn_N) {
+        } else if ((uint32_t) p0 < n_present && (uint32_t) p1 < n_present) {
+            LLAMA_LOG_WARN("%s: KVarN cache: cannot remove positions [%d, %d): positions [%d, %u) would remain behind a hole\n",
+                    __func__, p0, p1, p1, n_present);
+            return false;
+        } else if (kvarn_B > kvarn.sink && (uint32_t) p0 < kvarn_B && (uint32_t) p0 < n_present) {
             LLAMA_LOG_WARN("%s: KVarN cache: cannot remove positions [%d, %d): positions below %u are sealed\n",
                     __func__, p0, p1, kvarn_B);
             return false;

@@ -3,8 +3,9 @@
 // [S,B) are records sealed with ggml_kvarn::seal_group; the plain reference sees those records decoded
 // back to fp16, so the two graphs must agree up to fp16/fp32 rounding.
 //
-//   test-kvarn-attn            runs the built-in cases
+//   test-kvarn-attn            runs the built-in cases, then the seq_rm gate
 //   test-kvarn-attn n_q N n_groups cap [nh hkv]
+//   test-kvarn-attn --seq-rm [out.gguf]   seq_rm against the sealed boundary on a generated CPU model
 
 #include "ggml.h"
 #include "ggml-cpu.h"
@@ -13,9 +14,13 @@
 #include "ggml-backend.h"
 #include "llama.h"
 
+#include "gguf.h"
+
 #include "../src/llama-memory-hybrid.h"
 #include "../src/llama-io.h"
 #include "../src/llama-context.h"
+#include "../src/llama-arch.h"
+#include "../src/llama-model-saver.h"
 
 #include <cmath>
 #include <cstdio>
@@ -745,7 +750,185 @@ static int run_tiered_tq_oracle() {
     return ok?0:1;
 }
 
+// seq_rm against the sealed boundary on a generated 1-layer llama (head 256, CPU only, no model file).
+// The sink is mutable until the first record is sealed (speculative rollback inside a short prompt,
+// e.g. [111, end) after a 111-token prompt); after that everything below B is frozen, sink included,
+// and only removals at or above B succeed. Refused removals must leave cells and descriptor unchanged.
+static void seq_rm_tensor_data(ggml_tensor * tensor, void * /*userdata*/) {
+    std::mt19937 gen(std::hash<std::string>()(tensor->name));
+    std::normal_distribution<float> dis(0.0f, 0.1f);
+    GGML_ASSERT(tensor->type == GGML_TYPE_F32);
+    std::vector<float> tmp(ggml_nelements(tensor));
+    for (auto & v : tmp) v = dis(gen);
+    ggml_backend_tensor_set(tensor, tmp.data(), 0, ggml_nbytes(tensor));
+}
+
+static int run_seq_rm(const char * save_path) {
+    const uint32_t n_vocab = 128, n_embd = 256, sink = 128, tail = 256;
+    ggml_backend_load_all();
+    llama_backend_init();
+    gguf_context * meta = gguf_init_empty();
+    {
+        llama_model_saver ms(LLM_ARCH_LLAMA, meta);
+        ms.add_kv(LLM_KV_GENERAL_ARCHITECTURE,         llm_arch_name(LLM_ARCH_LLAMA));
+        ms.add_kv(LLM_KV_VOCAB_SIZE,                   n_vocab);
+        ms.add_kv(LLM_KV_CONTEXT_LENGTH,               uint32_t(4096));
+        ms.add_kv(LLM_KV_EMBEDDING_LENGTH,             n_embd);
+        ms.add_kv(LLM_KV_BLOCK_COUNT,                  uint32_t(1));
+        ms.add_kv(LLM_KV_FEED_FORWARD_LENGTH,          uint32_t(384));
+        ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT,         uint32_t(1));
+        ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV,      uint32_t(1));
+        ms.add_kv(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,  1e-5f);
+        std::vector<std::string> tokens(n_vocab);
+        for (uint32_t i = 0; i < n_vocab; ++i) tokens[i] = "tok_" + std::to_string(i);
+        ms.add_kv(LLM_KV_TOKENIZER_MODEL,  "test");
+        ms.add_kv(LLM_KV_TOKENIZER_LIST,   tokens);
+        ms.add_kv(LLM_KV_TOKENIZER_SCORES, std::vector<float>(n_vocab, 0.0f));
+    }
+    llama_model_params mp = llama_model_default_params();
+    ggml_backend_dev_t no_devices[] = { nullptr };
+    mp.devices = no_devices; // CPU only, also in a CUDA build
+    llama_model * model = llama_model_init_from_user(meta, seq_rm_tensor_data, nullptr, mp);
+    gguf_free(meta);
+    if (!model) {
+        fprintf(stderr, "seq_rm: model init failed\n");
+        return 1;
+    }
+    if (save_path) {
+        llama_model_save_to_file(model, save_path);
+        printf("seq_rm: wrote %s\n", save_path);
+    }
+    llama_context_params cp = llama_context_default_params();
+    cp.n_ctx = 2048;
+    cp.n_batch = 128;
+    cp.n_ubatch = 128;
+    cp.n_threads = 4;
+    cp.n_threads_batch = 4;
+    cp.n_seq_max = 1;
+    cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    cp.kvarn_bits_k = cp.kvarn_bits_v = 4;
+    cp.kvarn_sink = sink;
+    cp.kvarn_tail = tail;
+    cp.kvarn_tail_max = 0;
+    cp.kvarn_staging_type = GGML_TYPE_F16;
+    llama_context * ctx = llama_init_from_model(model, cp);
+    if (!ctx) {
+        llama_model_free(model);
+        fprintf(stderr, "seq_rm: context creation failed\n");
+        return 1;
+    }
+    int result = 0;
+    try {
+        auto * memory = llama_get_memory(ctx);
+        auto * cache = dynamic_cast<llama_kv_cache *>(memory);
+        maintenance_require(cache && cache->is_kvarn(), "KVarN attention cache required");
+        auto token = [](llama_pos p, int salt) { return (llama_token) ((p*37 + salt*11 + 5) % 128); };
+        // decode [from, to) in chunks of `width`, return the logits of the last position
+        auto decode = [&](llama_pos from, llama_pos to, int width, int salt) {
+            std::vector<float> last;
+            for (llama_pos p = from; p < to;) {
+                const int n = std::min<int>(width, to - p);
+                llama_batch batch = llama_batch_init(n, 0, 1);
+                batch.n_tokens = n;
+                for (int j = 0; j < n; ++j) {
+                    batch.token[j] = token(p + j, p + j >= 111 ? salt : 0);
+                    batch.pos[j] = p + j;
+                    batch.n_seq_id[j] = 1;
+                    batch.seq_id[j][0] = 0;
+                    batch.logits[j] = j + 1 == n;
+                }
+                const int rc = llama_decode(ctx, batch);
+                llama_batch_free(batch);
+                maintenance_require(rc == 0, "decode");
+                p += n;
+                const float * logits = llama_get_logits_ith(ctx, -1);
+                maintenance_require(logits != nullptr, "logits present");
+                last.assign(logits, logits + n_vocab);
+                for (float v : last) maintenance_require(std::isfinite(v), "finite logits");
+            }
+            return last;
+        };
+        auto pos_max = [&]() { return llama_memory_seq_pos_max(memory, 0); };
+        auto pos_min = [&]() { return llama_memory_seq_pos_min(memory, 0); };
+        auto sealed = [&]() { return cache->get_kvarn_sealed_end(); };
+
+        // reference: prompt [0, 111) then a salt-2 continuation [111, 119) on a fresh cache
+        decode(0, 111, 128, 0);
+        const auto ref = decode(111, 119, 8, 2);
+        llama_memory_clear(memory, true);
+
+        // 1. no body yet (B == sink): rollback inside the sink succeeds and the rows are rewritten
+        decode(0, 111, 128, 0);
+        decode(111, 119, 8, 1); // rejected draft
+        maintenance_require(sealed() == sink, "no record sealed below sink + tail");
+        maintenance_require(cache->seq_rm(0, 111, -1), "rollback inside the sink before any record");
+        maintenance_require(pos_max() == 110 && sealed() == sink, "rollback leaves prefix and boundary");
+        const auto redo = decode(111, 119, 8, 2);
+        float max_diff = 0.0f;
+        for (uint32_t i = 0; i < n_vocab; ++i) max_diff = std::max(max_diff, std::fabs(redo[i] - ref[i]));
+        maintenance_require(max_diff < 1e-3f, "rewritten sink rows match a fresh decode");
+        auto refused = [&](llama_pos p0, llama_pos p1, llama_pos n, const char * name) {
+            const auto before = maintenance_descriptor(cache, n);
+            maintenance_require(!cache->seq_rm(0, p0, p1), name);
+            maintenance_require(pos_min() == 0 && pos_max() == n - 1, "refused removal keeps cells");
+            maintenance_require(maintenance_descriptor(cache, n) == before && !cache->has_kvarn_maintenance(),
+                                "refused removal keeps the descriptor");
+        };
+        // holes and prefixes would let the next ubatch land in a freed cell below the frontier
+        refused(40, 50,  119, "hole inside the sink is refused");
+        refused(0, 100,  119, "sink prefix is refused");
+        maintenance_require(cache->seq_rm(0, 60, 1000), "suffix from inside the sink with a finite end");
+        maintenance_require(pos_max() == 59 && sealed() == sink, "suffix removed");
+        decode(60, 127, 8, 0);
+        printf("seq_rm: before body: rollback [111,end) max|dlogit|=%.2e, [60,1000) OK, hole and prefix refused\n", max_diff);
+        llama_memory_clear(memory, true);
+
+        // 2. body sealed (B > sink): everything below B is frozen, the sink included
+        decode(0, 700, 128, 0);
+        decode(700, 705, 5, 0);
+        const uint32_t B = sealed();
+        maintenance_require(B > sink && (B - sink) % 128 == 0 && B <= 705 - tail, "body records sealed");
+        refused(111, -1,           705, "rollback from inside the sink after a record is refused");
+        refused(0, 704,            705, "prefix up to the frontier is refused");
+        refused(B - 1, -1,         705, "rollback into the sealed body is refused");
+        refused(sink, 1000,        705, "suffix from the first sealed position is refused");
+        refused(40, 50,            705, "hole inside the sink is refused");
+        refused(sink + 10, B - 10, 705, "hole inside the sealed body is refused");
+        refused(B + 10, B + 20,    705, "hole in the exact tail is refused");
+        maintenance_require(!llama_memory_seq_rm(memory, 0, 111, -1), "public API refuses the same removal");
+
+        // 3. at or above B: succeeds, and generation continues on the same boundary
+        maintenance_require(cache->seq_rm(0, 800, 900), "removal past the frontier is a no-op");
+        maintenance_require(cache->seq_rm(0, 702, -1), "speculative rollback above B");
+        maintenance_require(pos_max() == 701 && sealed() == B, "rollback above B keeps the boundary");
+        decode(702, 708, 6, 0);
+        maintenance_require(cache->seq_rm(0, B, -1), "rollback exactly at B");
+        maintenance_require(pos_max() == (llama_pos) B - 1 && sealed() == B, "rollback at B keeps every record");
+        decode(B, B + 8, 8, 0);
+        maintenance_require(sealed() == B, "short resume after rollback seals nothing new");
+        decode(B + 8, B + 8 + 4*128, 128, 0);
+        maintenance_require(sealed() > B, "sealing resumes after rollback at B");
+        printf("seq_rm: after body B=%u: 8 removals below B or with a hole refused unchanged, [702,end) and [B,end) OK, B -> %u\n", B, sealed());
+
+        const llama_pos n_end = pos_max() + 1;
+        maintenance_require(cache->seq_rm(0, 0, n_end) && sealed() == sink, "removing every position clears the boundary");
+        decode(0, 130, 128, 0);
+        maintenance_require(cache->seq_rm(0, 50, -1) && pos_max() == 49, "cleared cache reopens the sink");
+        printf("seq_rm: all gates passed\n");
+    } catch (const std::exception & e) {
+        fprintf(stderr, "seq_rm: FAIL: %s\n", e.what());
+        result = 1;
+    }
+    llama_free(ctx);
+    llama_model_free(model);
+    llama_backend_free();
+    return result;
+}
+
 int main(int argc, char ** argv) {
+    if (argc >= 2 && strcmp(argv[1], "--seq-rm") == 0) {
+        return run_seq_rm(argc > 2 ? argv[2] : nullptr);
+    }
     if (argc >= 3 && strcmp(argv[1], "--maintenance-tiered") == 0) {
         return run_maintenance(argv[2], argc > 3 ? atoi(argv[3]) : 99, GGML_TYPE_TQ6_0, 128, GGML_TYPE_TURBO4_0, true, true);
     }
@@ -795,5 +978,8 @@ int main(int argc, char ** argv) {
     int fails = 0;
     for (size_t i = 0; i < cases.size(); ++i) fails += run_case(cases[i], 1234 + (uint32_t) i, tq6_attn ? GGML_TYPE_TQ6_0 : GGML_TYPE_F16, f16_sink);
     printf("%s: %d/%zu cases passed\n", fails ? "FAIL" : "OK", (int) (cases.size() - fails), cases.size());
+    if (argc == 1 && run_seq_rm(nullptr) != 0) {
+        return 1; // the built-in run (ctest) also gates seq_rm on the generated CPU model
+    }
     return fails ? 1 : 0;
 }
