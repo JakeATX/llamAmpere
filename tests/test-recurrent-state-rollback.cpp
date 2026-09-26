@@ -450,6 +450,156 @@ static int run_rb1b_gates(const common_params & params, llama_model * model,
         }
     }
 
+    // --- Gate G: two sequences decoding 1 token each in one shared ubatch, with different pending rollbacks.
+    // In the shift layout the ubatch moves the older snapshot groups of every lane by one shared amount; if that
+    // amount follows the deepest pending rollback in the ubatch (seq A), the other lane (seq B, nothing pending)
+    // keeps groups its rs_valid still credits, and a deep rollback on B later restores a stale state.
+    // Schedule: prefill A and B together, n_single joint 1-token decodes, roll A back by rb_a, one more joint
+    // 1-token decode (A replays, B advances), then roll B back by each depth in depths_b (and A by its full
+    // remaining credit, plus one past it, which must be refused), replay 3 tokens of that sequence alone, and
+    // compare bitwise against a fresh context that ran the same joint schedule only up to the rollback point.
+    {
+        constexpr uint32_t n_prefill  = 9;
+        constexpr uint32_t n_single   = 8;
+        constexpr uint32_t n_replay_g = 3;
+        constexpr uint32_t rb_a       = 6;
+
+        const auto tok_of = [&](llama_seq_id seq, llama_pos pos) {
+            return (llama_token) ((7*(uint32_t) pos + 31*(uint32_t) seq + 3) % (uint32_t) n_vocab);
+        };
+        std::vector<std::vector<llama_token>> toks_g(2, std::vector<llama_token>(n_prefill + n_single + n_replay_g + 1));
+        for (llama_seq_id seq = 0; seq < 2; ++seq) {
+            for (size_t i = 0; i < toks_g[seq].size(); ++i) {
+                toks_g[seq][i] = tok_of(seq, (llama_pos) i);
+            }
+        }
+
+        const auto make_ctx_g = [&]() {
+            auto cparams = common_context_params_to_llama(params);
+            cparams.n_seq_max  = 2;
+            cparams.n_rs_seq   = n_rs_seq;
+            cparams.n_ctx      = 256;
+            cparams.n_batch    = 64;
+            cparams.n_ubatch   = 64;
+            cparams.kv_unified = false;
+            return llama_init_from_model(model, cparams);
+        };
+
+        // one batch holding (seq, first pos, count) runs; only the first token is an output, so the
+        // batch is not all-output and both sequences share each equal-split ubatch
+        struct run { llama_seq_id seq; llama_pos p0; uint32_t n; };
+        const auto decode_joint = [&](llama_context * ctx, std::initializer_list<run> runs) {
+            uint32_t n_tok = 0;
+            for (const run & r : runs) {
+                n_tok += r.n;
+            }
+            llama_batch batch = llama_batch_init(n_tok, 0, 1);
+            bool first = true;
+            for (const run & r : runs) {
+                for (uint32_t i = 0; i < r.n; ++i) {
+                    const llama_pos pos = r.p0 + (llama_pos) i;
+                    common_batch_add(batch, toks_g[r.seq][pos], pos, { r.seq }, first);
+                    first = false;
+                }
+            }
+            const bool ok = llama_decode(ctx, batch) == 0;
+            llama_batch_free(batch);
+            return ok;
+        };
+
+        // joint prefill, then joint 1-token decodes for steps [0, n_steps)
+        const auto build = [&](llama_context * ctx, uint32_t n_steps) {
+            if (!decode_joint(ctx, { { 0, 0, n_prefill }, { 1, 0, n_prefill } })) {
+                return false;
+            }
+            for (uint32_t t = 0; t < n_steps; ++t) {
+                const llama_pos pos = (llama_pos) (n_prefill + t);
+                if (!decode_joint(ctx, { { 0, pos, 1 }, { 1, pos, 1 } })) {
+                    return false;
+                }
+            }
+            return true;
+        };
+
+        // after build(n_single) both heads are at end - 1; A rolls back rb_a, then one joint step:
+        // A's head is end - rb_a, B's head is end
+        const llama_pos end    = (llama_pos) (n_prefill + n_single);
+        const llama_pos head_a = end - (llama_pos) rb_a;
+        const llama_pos head_b = end;
+
+        struct check { llama_seq_id seq; uint32_t depth; };
+        std::vector<check> checks;
+        for (uint32_t d : { 2u, 4u, n_rs_seq }) {
+            checks.push_back({ 1, d });
+        }
+        // A: rs_valid = n_rs_seq - rb_a + 1 after the joint step; one deeper is refused
+        checks.push_back({ 0, n_rs_seq - rb_a + 1 });
+        checks.push_back({ 0, n_rs_seq - rb_a + 2 });
+
+        int n_checked = 0;
+        int n_refused = 0;
+        const int failures_before = failures;
+        for (const check & c : checks) {
+            const char    what_seq  = c.seq == 0 ? 'A' : 'B';
+            const llama_pos head    = c.seq == 0 ? head_a : head_b;
+            const llama_pos p0      = head - (llama_pos) c.depth + 1;
+            const bool    expect_ok = c.seq == 1 || c.depth <= n_rs_seq - rb_a + 1;
+
+            std::vector<std::vector<float>> lg_ref;
+            if (expect_ok) {
+                // the reference stops the joint schedule where the checked sequence's history ends at p0
+                // (both sequences share the position line until A's rollback)
+                llama_context * ctx_ref = make_ctx_g();
+                if (ctx_ref == nullptr) { fprintf(stderr, "rb1b : gate G context init failed\n"); return 1; }
+                const bool ok = p0 >= (llama_pos) n_prefill &&
+                                build(ctx_ref, (uint32_t) (p0 - (llama_pos) n_prefill)) &&
+                                replay_capture(ctx_ref, toks_g[c.seq], p0, n_replay_g, c.seq, n_vocab, lg_ref);
+                llama_free(ctx_ref);
+                if (!ok) {
+                    fprintf(stderr, "rb1b : gate G FAIL -- reference decode failed (seq %c depth %u)\n", what_seq, c.depth);
+                    failures++;
+                    continue;
+                }
+            }
+
+            llama_context * ctx_rb = make_ctx_g();
+            if (ctx_rb == nullptr) { fprintf(stderr, "rb1b : gate G context init failed\n"); return 1; }
+            llama_memory_t mem = llama_get_memory(ctx_rb);
+            bool ok = build(ctx_rb, n_single) &&
+                      rollback_by(ctx_rb, 0, end - 1, rb_a) &&
+                      decode_joint(ctx_rb, { { 0, head_a, 1 }, { 1, head_b, 1 } });
+            const bool accepted = ok && llama_memory_seq_rm(mem, c.seq, p0, -1);
+
+            std::vector<std::vector<float>> lg_rb;
+            if (!ok) {
+                fprintf(stderr, "rb1b : gate G FAIL -- joint schedule failed (seq %c depth %u)\n", what_seq, c.depth);
+                failures++;
+            } else if (accepted != expect_ok) {
+                fprintf(stderr, "rb1b : gate G FAIL -- rollback of seq %c by %u after a shared ubatch with seq A's "
+                                "pending rollback of %u was %s\n", what_seq, c.depth, rb_a, accepted ? "accepted" : "refused");
+                failures++;
+            } else if (!accepted) {
+                n_refused++;
+            } else if (!replay_capture(ctx_rb, toks_g[c.seq], p0, n_replay_g, c.seq, n_vocab, lg_rb)) {
+                fprintf(stderr, "rb1b : gate G FAIL -- replay failed (seq %c depth %u)\n", what_seq, c.depth);
+                failures++;
+            } else {
+                char what[96];
+                snprintf(what, sizeof(what), "gate G (seq %c depth %u vs fresh)", what_seq, c.depth);
+                if (!logits_match(lg_rb, lg_ref, 0.0f, what)) {
+                    failures++;
+                } else {
+                    n_checked++;
+                }
+            }
+            llama_free(ctx_rb);
+        }
+        if (failures == failures_before) {
+            fprintf(stderr, "rb1b : gate G PASS -- %d rollbacks after a shared ubatch with different pending rollbacks "
+                            "match a fresh context exactly, %d refused past the credit\n", n_checked, n_refused);
+        }
+    }
+
     fprintf(stderr, "rb1b : %d gate failure(s)\n", failures);
     return failures == 0 ? 0 : 1;
 }
