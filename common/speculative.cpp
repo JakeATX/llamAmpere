@@ -27,44 +27,6 @@
 #include <thread>
 #include <cinttypes>
 
-// [#47] host phase split of the MTP draft call (LLAMA_HOST_PHASES=1), see speculative.h
-bool common_speculative_host_phases_enabled() {
-    static const bool v = [] { const char * e = getenv("LLAMA_HOST_PHASES"); return e && atoi(e) != 0; }();
-    return v;
-}
-
-static std::mutex                     g_spec_host_phases_mtx;
-static common_speculative_host_phases g_spec_host_phases;
-
-common_speculative_host_phases common_speculative_host_phases_take() {
-    std::lock_guard<std::mutex> lock(g_spec_host_phases_mtx);
-    common_speculative_host_phases r = g_spec_host_phases;
-    g_spec_host_phases = {};
-    return r;
-}
-
-// one draft call: accumulates locally, adds to the process totals on destruction (rest = wall - the named parts)
-struct common_spec_host_phase_call {
-    const bool on = common_speculative_host_phases_enabled();
-    const int64_t t0 = on ? ggml_time_us() : 0;
-    common_speculative_host_phases acc;
-
-    ~common_spec_host_phase_call() {
-        if (!on) {
-            return;
-        }
-        const uint64_t wall  = (uint64_t) (ggml_time_us() - t0);
-        const uint64_t named = acc.decode_us + acc.sync_us + acc.sample_us;
-        std::lock_guard<std::mutex> lock(g_spec_host_phases_mtx);
-        g_spec_host_phases.n_calls   += 1;
-        g_spec_host_phases.n_steps   += acc.n_steps;
-        g_spec_host_phases.decode_us += acc.decode_us;
-        g_spec_host_phases.sync_us   += acc.sync_us;
-        g_spec_host_phases.sample_us += acc.sample_us;
-        g_spec_host_phases.rest_us   += wall > named ? wall - named : 0;
-    }
-};
-
 #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SPC_TRC(fmt, ...) LOG_TRC("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SPC_INF(fmt, ...) LOG_INF("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -2192,8 +2154,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
 
-        common_spec_host_phase_call hp; // [#47]
-
         common_batch_clear(batch);
 
         // keep track of which sequences are still drafting
@@ -2503,19 +2463,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 llama_set_nextn_layer_offset(ctx_dft, i);
             }
 
-            const int64_t t_dec0 = hp.on ? ggml_time_us() : 0;
             int ret = llama_decode(ctx_dft, batch);
             if (ret != 0) {
                 SPC_ERR("llama_decode[%d] returned %d\n", i, ret);
                 break;
-            }
-            if (hp.on) {
-                const int64_t t_dec1 = ggml_time_us();
-                llama_synchronize(ctx_dft); // [#47] separates the GPU wait from host sampling; the sampler syncs anyway
-                const int64_t t_dec2 = ggml_time_us();
-                hp.acc.decode_us += t_dec1 - t_dec0;
-                hp.acc.sync_us   += t_dec2 - t_dec1;
-                hp.acc.n_steps   += 1;
             }
 
             // rebuild the batch for the next step: the growing-KV paths re-add only the
@@ -2537,11 +2488,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 auto * smpl = pq ? pq_sampler(seq_id, *dp.sampling) : smpls[seq_id].get();
 
-                const int64_t t_smp0 = hp.on ? ggml_time_us() : 0;
                 llama_token id = common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
-                if (hp.on) {
-                    hp.acc.sample_us += ggml_time_us() - t_smp0;
-                }
                 const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
 
                 if (pq && llama_get_sampled_token_ith(ctx_dft, i_last[seq_id]) != LLAMA_TOKEN_NULL) {
@@ -2576,13 +2523,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     continue;
                 }
 
-                {
-                    const int64_t t_acc0 = hp.on ? ggml_time_us() : 0;
-                    common_sampler_accept(smpl, id, true);
-                    if (hp.on) {
-                        hp.acc.sample_us += ggml_time_us() - t_acc0;
-                    }
-                }
+                common_sampler_accept(smpl, id, true);
 
                 if (dp.result_q) {
                     if (pq) {
