@@ -12913,7 +12913,6 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
 
         std::atomic<size_t> n_ok = 0;
         std::atomic<size_t> tests_run = 0;
-        std::atomic<size_t> tests_skipped = 0;
         std::vector<std::string> failed_tests;
         std::mutex failed_tests_mutex;
 
@@ -12939,7 +12938,6 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
                     auto & test = test_cases[i];
                     test_status_t status = test->eval(b, b_cpu, op_names_filter, output_printer);
                     if (status == test_status_t::SKIPPED || status == test_status_t::NOT_SUPPORTED) {
-                        tests_skipped++;
                         continue;
                     }
                     tests_run++;
@@ -12996,16 +12994,14 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
         if (tests_run_out) {
             *tests_run_out = tests_run;
         }
-        output_printer->print_summary(test_summary_info(n_ok, tests_run + tests_skipped, false));
+        output_printer->print_summary(test_summary_info(n_ok, tests_run, false));
         output_printer->print_failed_tests(failed_tests);
 
-        const bool slice_ok = run_fa_vec_slice(backend, backend_cpu.get(), op_names_filter);
-
         if (tests_run == 0) {
-            // 0/0 must never read as OK: the change under test was not exercised
-            fprintf(stderr, "WARNING: 0 tests ran (%zu cases skipped or filtered)\n", tests_run + tests_skipped);
             return false;
         }
+
+        const bool slice_ok = run_fa_vec_slice(backend, backend_cpu.get(), op_names_filter);
 
         return n_ok == tests_run && slice_ok;
     }
@@ -13029,6 +13025,11 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
         if (tests_run_out) {
             *tests_run_out = test_cases.size();
         }
+
+        if (test_cases.empty()) {
+            return false;
+        }
+
         return n_ok == test_cases.size();
     }
 
