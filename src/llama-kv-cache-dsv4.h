@@ -167,7 +167,13 @@ private:
     const uint32_t n_seq_max;
     const uint32_t n_rs_seq;
 
+    // pending rollback per seq: the snapshot plane the next ubatch restores from (0 = none)
     std::vector<uint32_t> rs_idx;
+
+    // RB1b: how many snapshot planes behind the logical head really hold this seq's history. n_rs_seq is only the
+    // ring capacity; after a state restore, a seq_cp into a fresh stream or rollbacks that consumed the ring, fewer
+    // (or none) are real, and a rollback deeper than this must be refused instead of restoring a stale plane
+    std::vector<uint32_t> rs_valid;
 
     std::unique_ptr<llama_kv_cache_iswa> kv_raw;
     std::unique_ptr<llama_kv_cache>      kv_csa;

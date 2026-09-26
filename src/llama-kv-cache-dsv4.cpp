@@ -697,8 +697,18 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
                 const int64_t dst_plane = (int64_t) d*state_rows;
                 const uint32_t prefix = d <= n_seq_tokens ? n_seq_tokens - d : 0;
 
+                // plane d must hold the state d tokens behind the new head. For d <= n_seq_tokens that is the restored
+                // plane 0 plus a prefix of this ubatch; deeper than the ubatch it is the state d - n_seq_tokens behind
+                // the pre-ubatch logical head, i.e. the old plane (d - n_seq_tokens + rollback) -- the ring shifts
+                // like the recurrent one, so snapshots accumulate across short (e.g. 1-token) ubatches instead of
+                // all repeating the pre-ubatch state. A plane beyond the ring keeps the pre-ubatch state; rs_valid
+                // never counts it. The snapshot source is a copy (concat) of all planes, so reading an old plane
+                // while this op rewrites another is safe.
+                const uint32_t old_plane = d > n_seq_tokens ? d - n_seq_tokens + rollback : 0;
+                const int64_t base_plane = old_plane <= n_rs_seq ? (int64_t) old_plane*state_rows : 0;
+
                 for (uint32_t r = 0; r < state_size; ++r) {
-                    int32_t src = (int32_t) (stream_off + r);
+                    int32_t src = (int32_t) (base_plane + stream_off + r);
 
                     for (uint32_t j = 0; j < prefix; ++j) {
                         const uint32_t i_tok = token_idxs[j];
@@ -1062,6 +1072,39 @@ void llama_dsv4_comp_state::apply_copies(const stream_copy_info & sc_info) const
             ggml_backend_tensor_copy(layer.kv_stream[ssrc], layer.kv_stream[sdst]);
             ggml_backend_tensor_copy(layer.score_stream[ssrc], layer.score_stream[sdst]);
         }
+
+        if (n_rs_seq == 0) {
+            continue;
+        }
+
+        // copy the snapshot planes too: the destination inherits the source's rollback bookkeeping (rs_idx,
+        // rs_valid), so it must also hold the history those indices point at. Plane d of stream s is slice
+        // d*n_stream + s; the views are made here, per copy, rather than kept for every plane of every stream
+        ggml_init_params params = {
+            /*.mem_size   =*/ size_t(4u*ggml_tensor_overhead()),
+            /*.mem_buffer =*/ NULL,
+            /*.no_alloc   =*/ true,
+        };
+
+        for (const auto & layer : layers) {
+            for (uint32_t d = 1; d <= n_rs_seq; ++d) {
+                ggml_context_ptr ctx { ggml_init(params) };
+                GGML_ASSERT(ctx);
+
+                ggml_tensor * views[4];
+                int iv = 0;
+                for (ggml_tensor * t : { layer.kv, layer.score }) {
+                    for (uint32_t s : { ssrc, sdst }) {
+                        ggml_tensor * v = ggml_view_2d(ctx.get(), t, t->ne[0], t->ne[1], t->nb[1], (size_t) (d*n_stream + s)*t->nb[2]);
+                        GGML_ASSERT(ggml_backend_view_init(v) == GGML_STATUS_SUCCESS);
+                        views[iv++] = v;
+                    }
+                }
+
+                ggml_backend_tensor_copy(views[0], views[1]);
+                ggml_backend_tensor_copy(views[2], views[3]);
+            }
+        }
     }
 }
 
@@ -1254,7 +1297,8 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     hparams_lid(model.hparams),
     n_seq_max(n_seq_max),
     n_rs_seq(n_rs_seq),
-    rs_idx(n_seq_max, 0) {
+    rs_idx(n_seq_max, 0),
+    rs_valid(n_seq_max, 0) {
 
     const layer_filter_cb filter_raw = [&](int32_t il) {
         if (filter && !filter(il)) {
@@ -1526,19 +1570,18 @@ bool llama_kv_cache_dsv4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
             return false;
         }
 
+        // RB1b: bound the request by the snapshots this seq really has (not the ring capacity), and compose with a
+        // rollback that is already pending -- two seq_rm before the next decode add up, like the recurrent memory
         const llama_pos rollback = pos_max - (p0 - 1);
-        if (rollback < 1 || rollback > (llama_pos) n_rs_seq) {
+        if (rollback < 1 || rollback > (llama_pos) n_rs_seq || rollback > (llama_pos) rs_valid[seq_id]) {
             return false;
         }
-
-        // pending rollback is single-use: stacked partial removals don't compose
-        if (rs_idx[seq_id] != 0) {
-            return false;
-        }
+        GGML_ASSERT(rs_idx[seq_id] + (uint32_t) rollback <= n_rs_seq);
 
         const bool res = kv_raw->seq_rm(seq_id, p0, p1);
         if (res) {
-            rs_idx[seq_id] = (uint32_t) rollback;
+            rs_idx[seq_id]   += (uint32_t) rollback;
+            rs_valid[seq_id] -= (uint32_t) rollback;
         }
 
         return res;
@@ -1566,7 +1609,9 @@ void llama_kv_cache_dsv4::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_ds
     lid_state->seq_cp(seq_id_src, seq_id_dst);
 
     if (seq_id_src != seq_id_dst) {
-        rs_idx[seq_id_dst] = 0;
+        // the comp states copy every snapshot plane, so the destination carries the source's rollback bookkeeping
+        rs_idx  [seq_id_dst] = rs_idx  [seq_id_src];
+        rs_valid[seq_id_dst] = rs_valid[seq_id_src];
     }
 }
 
@@ -1708,11 +1753,14 @@ void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     hca_state->state_read(io, seq_id, flags);
     lid_state->state_read(io, seq_id, flags);
 
+    // the blob carries only the live plane: a restored sequence has no snapshots of its own
     if (seq_id >= 0) {
         GGML_ASSERT((uint32_t) seq_id < n_seq_max);
-        rs_idx[seq_id] = 0;
+        rs_idx  [seq_id] = 0;
+        rs_valid[seq_id] = 0;
     } else {
-        std::fill(rs_idx.begin(), rs_idx.end(), 0);
+        std::fill(rs_idx.begin(),   rs_idx.end(),   0);
+        std::fill(rs_valid.begin(), rs_valid.end(), 0);
     }
 }
 
@@ -1757,13 +1805,28 @@ void llama_kv_cache_dsv4::reset_rs_idx_for_ubatches(const std::vector<llama_ubat
         return;
     }
 
+    const bool unified_state = csa_state->get_n_stream() == 1;
+
     for (const llama_ubatch & ubatch : ubatches) {
+        std::vector<uint32_t> n_seq_tokens(n_seq_max, 0);
         for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
             for (int32_t s = 0; s < ubatch.n_seq_id[i]; ++s) {
                 const llama_seq_id seq_id = ubatch.seq_id[i][s];
                 if (seq_id >= 0 && (uint32_t) seq_id < n_seq_max) {
                     rs_idx[seq_id] = 0;
+                    n_seq_tokens[seq_id]++;
                 }
+            }
+        }
+
+        // RB1b: each token of the seq in this ubatch adds one real snapshot behind the new head (the plan shifts the
+        // older planes back), saturating at the ring capacity
+        for (uint32_t seq_id = 0; seq_id < n_seq_max; ++seq_id) {
+            if (n_seq_tokens[seq_id] > 0) {
+                rs_valid[seq_id] = std::min<uint32_t>(n_rs_seq, rs_valid[seq_id] + n_seq_tokens[seq_id]);
+            } else if (unified_state) {
+                // a single state stream now holds another seq's history
+                rs_valid[seq_id] = 0;
             }
         }
     }
@@ -1798,9 +1861,11 @@ void llama_kv_cache_dsv4::clear_compressed(llama_seq_id seq_id, bool data) {
     lid_state->clear(seq_id, data);
 
     if (seq_id >= 0) {
-        rs_idx[seq_id] = 0;
+        rs_idx  [seq_id] = 0;
+        rs_valid[seq_id] = 0;
     } else {
-        std::fill(rs_idx.begin(), rs_idx.end(), 0);
+        std::fill(rs_idx.begin(),   rs_idx.end(),   0);
+        std::fill(rs_valid.begin(), rs_valid.end(), 0);
     }
 }
 
