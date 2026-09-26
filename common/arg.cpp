@@ -11,6 +11,7 @@
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
+#include "spec-defaults.h"
 #include "preset.h"
 
 // fix problem with std::min and std::max
@@ -4230,9 +4231,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format(
             "KV cache data type for K for the draft model\n"
             "allowed values: %s\n"
-            "(default: %s)",
-            get_all_kv_cache_types().c_str(),
-            ggml_type_name(params.speculative.draft.cache_type_k)
+            "(default: the main model's K cache type from -ctk; pass f16 to force f16)",
+            get_all_kv_cache_types().c_str()
         ),
         [](common_params & params, const std::string & value) {
             params.speculative.draft.cache_type_k = kv_cache_type_from_str(value);
@@ -4243,9 +4243,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format(
             "KV cache data type for V for the draft model\n"
             "allowed values: %s\n"
-            "(default: %s)",
-            get_all_kv_cache_types().c_str(),
-            ggml_type_name(params.speculative.draft.cache_type_v)
+            "(default: the main model's V cache type from -ctv; pass f16 to force f16)",
+            get_all_kv_cache_types().c_str()
         ),
         [](common_params & params, const std::string & value) {
             params.speculative.draft.cache_type_v = kv_cache_type_from_str(value);
@@ -4311,6 +4310,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 throw std::invalid_argument("invalid value");
             }
             params.speculative.draft.n_max = value;
+            params.speculative.user_set |= COMMON_PARAMS_SPECULATIVE_USER_DRAFT_N_MAX;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX"));
     add_opt(common_arg(
@@ -4358,6 +4358,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("minimum adaptive MTP draft depth; the depth starts here and never drops below it (default: %d)", params.speculative.draft.n_min_adaptive),
         [](common_params & params, int value) {
             params.speculative.draft.n_min_adaptive = value;
+            params.speculative.user_set |= COMMON_PARAMS_SPECULATIVE_USER_DRAFT_N_MIN_ADAPTIVE;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MIN_ADAPTIVE"));
 
@@ -4374,6 +4375,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 if (n < 1) throw std::invalid_argument("spec-chain depth must be >= 1");
                 params.speculative.draft.chain = true;
                 params.speculative.draft.n_max = n;
+                params.speculative.user_set |= COMMON_PARAMS_SPECULATIVE_USER_DRAFT_N_MAX;
             }
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_CHAIN"));
@@ -4403,6 +4405,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("minimum speculative decoding probability (greedy) (default: %.2f)", (double)params.speculative.draft.p_min),
         [](common_params & params, const std::string & value) {
             params.speculative.draft.p_min = std::stof(value);
+            params.speculative.user_set |= COMMON_PARAMS_SPECULATIVE_USER_DRAFT_P_MIN;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_P_MIN"));
     add_opt(common_arg(
@@ -4413,6 +4416,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "drafts over the full vocabulary)",
         [](common_params & params, const std::string & value) {
             params.speculative.draft.vocab_map = value;
+            params.speculative.user_set |= COMMON_PARAMS_SPECULATIVE_USER_DRAFT_VOCAB_MAP;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_VOCAB_MAP"));
     add_opt(common_arg(
@@ -4471,12 +4475,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_MODEL"));
     add_opt(common_arg(
         {"--spec-type"}, common_speculative_all_types_str(),
-        string_format("comma-separated list of types of speculative decoding to use (default: %s)\n",
+        string_format("comma-separated list of types of speculative decoding to use (default: auto, i.e. the model's "
+            "built-in drafter with its measured settings for %s, %s for other models; any explicit value, "
+            "including none, turns auto off, explicit --spec-draft-* values are kept)\n",
+            common_speculative_family_defaults_str().c_str(),
             common_speculative_type_name_str(params.speculative.types).c_str()),
         [](common_params & params, const std::string & value) {
             const auto types_str = string_split<std::string>(value, ',');
             auto types = common_speculative_types_from_names(types_str);
             params.speculative.types.insert(params.speculative.types.end(), types.begin(), types.end());
+            params.speculative.user_set |= COMMON_PARAMS_SPECULATIVE_USER_TYPE;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_TYPE"));
     add_opt(common_arg(
@@ -4981,6 +4989,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("enable default speculative decoding config"),
         [](common_params & params) {
             params.speculative.types.push_back(COMMON_SPECULATIVE_TYPE_NGRAM_MOD);
+            params.speculative.user_set |= COMMON_PARAMS_SPECULATIVE_USER_TYPE;
             params.speculative.ngram_mod.n_match = 24;
             params.speculative.ngram_mod.n_min = 48;
             params.speculative.ngram_mod.n_max = 64;

@@ -5832,6 +5832,158 @@ struct test_mul_mat_cr : public test_mul_mat {
     }
 };
 
+// EXL3 (exllamav3 trellis) weights, GGML_TYPE_EXL3_2..8. The type has no from_float (not row-addressable: 16x16 tiles
+// stored k-tile major), so the weight bytes are random 32-bit words: every 16-bit window decodes through the mul1
+// codebook to a finite value, so any bit pattern is a valid EXL3 tensor. The CPU reference is
+// ggml_compute_forward_mul_mat_exl3 (f32 codebook values, f32 dot). K must be a multiple of 256 (one ggml block is one
+// 16x16 tile, so ggml_nbytes is only exact for K % 256 == 0) and N a multiple of 16.
+// glue: the node carries suh [K] / svh [N] on src[2] / src[3] the way llama build_lora_mm attaches them, and both
+// backends apply y = svh * H128(W . H128(suh * x)) (needs K, N % 128 == 0).
+static void init_tensor_exl3_random(ggml_tensor * t) {
+    GGML_ASSERT(ggml_exl3_bits(t->type) != 0 && ggml_is_contiguous(t));
+    std::random_device rd;
+    std::mt19937 rng(rd());
+    std::vector<uint32_t> words(ggml_nbytes(t) / sizeof(uint32_t));
+    for (uint32_t & w : words) {
+        w = (uint32_t) rng();
+    }
+    ggml_backend_tensor_set(t, words.data(), 0, words.size() * sizeof(uint32_t));
+}
+
+struct test_mul_mat_exl3 : public test_mul_mat {
+    const bool glue;
+
+    test_mul_mat_exl3(ggml_type type_a, int64_t m, int64_t n, int64_t k, bool glue)
+        : test_mul_mat(type_a, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}), glue(glue) {
+        GGML_ASSERT(ggml_exl3_bits(type_a) != 0);
+        GGML_ASSERT(k % 256 == 0 && m % 16 == 0);
+        GGML_ASSERT(!glue || (k % 128 == 0 && m % 128 == 0));
+    }
+
+    std::string vars() override {
+        return test_mul_mat::vars() + ",glue=" + (glue ? "1" : "0");
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, type_a, k, m);
+        ggml_set_name(a, "a");
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, type_b, k, n);
+        ggml_set_name(b, "b");
+        ggml_tensor * out = ggml_mul_mat(ctx, a, b);
+        if (glue) {
+            ggml_tensor * suh = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k);
+            ggml_set_name(suh, "suh");
+            ggml_tensor * svh = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, m);
+            ggml_set_name(svh, "svh");
+            out->src[2] = suh;
+            out->src[3] = svh;
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_exl3_bits(t->type) != 0) {
+                init_tensor_exl3_random(t);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// [#74] the dense FFN of an EXL3 decoder layer as llama build_ffn + build_lora_mm build it: gate = W_gate x and
+// up = W_up x with suh/svh glue, h = swiglu_split(gate, up), out = W_down h. Run as a whole graph so the CUDA
+// backend's FFN bridge (GGML_CUDA_EXL3_FFN_BRIDGE, on by default) replaces gate/up glue_out + SwiGLU + down glue_in,
+// and the result is checked against the CPU reference. tests/test-exl3-ffn-bridge.cpp checks the bridge against the
+// unfused GPU path bit for bit; this case checks it against the CPU. The exl3_ffn_bridge counter must move at
+// T <= 16 (the GEMV range) and must not move above it, unless an env switch turns the bridge off.
+struct test_exl3_ffn : public test_case {
+    const ggml_type type;
+    const int64_t n_embd;
+    const int64_t n_ff;
+    const int64_t T;
+
+    test_exl3_ffn(ggml_type type, int64_t n_embd, int64_t n_ff, int64_t T)
+        : type(type), n_embd(n_embd), n_ff(n_ff), T(T) {
+        GGML_ASSERT(ggml_exl3_bits(type) != 0);
+        GGML_ASSERT(n_embd % 256 == 0 && n_ff % 256 == 0);
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR4(type, n_embd, n_ff, T);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "EXL3_FFN";
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * 3 * n_embd * n_ff * T;
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    // mirrors the CUDA gates: ggml_cuda_exl3_ffn_bridge_enabled, ggml_cuda_exl3_gemv_supported (T <= 16),
+    // exl3_gemv_fused_enabled and exl3_envelope_enabled (either one makes the bridge decline)
+    static bool bridge_env_on() {
+        const char * br  = getenv("GGML_CUDA_EXL3_FFN_BRIDGE");
+        const char * gv  = getenv("GGML_CUDA_EXL3_GEMV");
+        const char * fu  = getenv("GGML_CUDA_EXL3_FUSED");
+        const char * env = getenv("GGML_CUDA_EXL3_ENVELOPE");
+        return (br == nullptr || atoi(br) != 0) &&
+               (gv == nullptr || strcmp(gv, "0") != 0) &&
+               !(fu != nullptr && strcmp(fu, "1") == 0) &&
+               !(env != nullptr && env[0] != '\0' && env[0] != '0');
+    }
+    const char * required_fusion() override { return T <= 16 && bridge_env_on() ? "exl3_ffn_bridge" : nullptr; }
+    const char * forbidden_fusion() override { return T > 16 ? "exl3_ffn_bridge" : nullptr; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, T);
+        ggml_set_name(x, "x");
+
+        auto proj = [&](const char * name, int64_t n_in, int64_t n_out, ggml_tensor * in) {
+            ggml_tensor * w = ggml_new_tensor_2d(ctx, type, n_in, n_out);
+            ggml_set_name(w, (std::string(name) + ".weight").c_str());
+            ggml_tensor * suh = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_in);
+            ggml_set_name(suh, (std::string(name) + ".suh").c_str());
+            ggml_tensor * svh = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_out);
+            ggml_set_name(svh, (std::string(name) + ".svh").c_str());
+            ggml_tensor * y = ggml_mul_mat(ctx, w, in);
+            y->src[2] = suh;
+            y->src[3] = svh;
+            ggml_set_name(y, name);
+            return y;
+        };
+
+        ggml_tensor * gate = proj("gate", n_embd, n_ff, x);
+        ggml_tensor * up   = proj("up",   n_embd, n_ff, x);
+        ggml_tensor * h    = ggml_swiglu_split(ctx, gate, up);
+        ggml_set_name(h, "h");
+        ggml_tensor * out  = proj("down", n_ff, n_embd, h);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_exl3_bits(t->type) != 0) {
+                init_tensor_exl3_random(t);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_HINT_SRC0_IS_HADAMARD
 struct test_mul_mat_hadamard : public test_mul_mat {
     test_mul_mat_hadamard(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
@@ -6096,6 +6248,32 @@ struct test_mul_mat_id_w4a4 : public test_mul_mat_id {
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
         return "MUL_MAT_ID_W4A4";
+    }
+};
+
+// MUL_MAT_ID with one-row experts (m = 1, n = 1): the output is just n_used scalars. With n_used = 1 the NMSE is the
+// squared relative error of a single dot product, which explodes whenever the random dot product lands near 0: the
+// CPU reference quantizes the activations to q8_K (256-value blocks) for K-quants and IQ types while CUDA MMVQ uses
+// q8_1 (32-value blocks), a fixed absolute gap of ~0.04 at k = 512 (rms output ~7.5), and ~14% of n_used = 1 runs
+// failed 5e-4 on the random draw alone. The denominator is floored at the expected output power for the uniform
+// inputs, n_vals * k * amax^2 / 9 (E[w^2] = 1/3 for U(-1, 1) weights, E[x^2] = amax^2/3), i.e. the error is
+// normalised by the typical output magnitude rather than by the one output that happened to be drawn. It only binds
+// when the drawn outputs are smaller than typical; a wrong row, a dropped block or a bad scale still scores
+// >> 5e-4 (a 0.17 absolute error on one k = 512 output already fails). CPU Monte Carlo of the q8_1-vs-q8_K gap,
+// 2M draws: 10 over 5e-4 (5e-6 per case) vs 14% unfloored.
+struct test_mul_mat_id_onerow : public test_mul_mat_id {
+    using test_mul_mat_id::test_mul_mat_id;
+
+    double err(const float * a, const float * b, size_t n_vals) override {
+        double mse_a_b = 0.0;
+        double mse_a_0 = 0.0;
+        for (size_t i = 0; i < n_vals; i++) {
+            const double d = double(a[i]) - double(b[i]);
+            mse_a_b += d * d;
+            mse_a_0 += double(a[i]) * double(a[i]);
+        }
+        const double floor_a_0 = double(n_vals) * double(k) * double(amax) * double(amax) / 9.0;
+        return mse_a_b / std::max(mse_a_0, floor_a_0);
     }
 };
 
@@ -11656,6 +11834,64 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             {1, 1}, {1, 1}, true));
     }
 
+    // EXL3 trellis weights (m = N outputs, n = T activation columns, k = K). CUDA routes T <= 16 to the trellis
+    // GEMV (T = 1: HFMA2, T >= 2: mma; 3/4-bit at T = 2..8 take the #73 weight-major mma unless
+    // GGML_CUDA_EXL3_WEIGHT_MAJOR=0) and T > 16 to reconstruct + cuBLAS. No MUL_MAT_ID: the CUDA backend
+    // declines EXL3 experts (supports_op), and the CPU backend has no EXL3 vec_dot for the ID path.
+    {
+        const ggml_type exl3_types[] = {
+            GGML_TYPE_EXL3_2, GGML_TYPE_EXL3_3, GGML_TYPE_EXL3_4, GGML_TYPE_EXL3_5,
+            GGML_TYPE_EXL3_6, GGML_TYPE_EXL3_7, GGML_TYPE_EXL3_8,
+        };
+        // every bit width: decode widths 1..8, the GEMV edge (12, 16), the first cuBLAS widths and a prefill width
+        for (ggml_type type : exl3_types) {
+            for (int64_t n : {1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 17, 32, 512}) {
+                test_cases.emplace_back(new test_mul_mat_exl3(type, 256, n, 512, false));
+            }
+        }
+        // suh/svh + 128-block Hadamard glue on the node, as the model runs it
+        for (ggml_type type : {GGML_TYPE_EXL3_3, GGML_TYPE_EXL3_4}) {
+            for (int64_t n : {1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 512}) {
+                test_cases.emplace_back(new test_mul_mat_exl3(type, 256, n, 512, true));
+            }
+        }
+        for (ggml_type type : {GGML_TYPE_EXL3_2, GGML_TYPE_EXL3_5, GGML_TYPE_EXL3_8}) {
+            for (int64_t n : {1, 4, 32}) {
+                test_cases.emplace_back(new test_mul_mat_exl3(type, 256, n, 512, true));
+            }
+        }
+        // split-K with full 4-tile groups plus a tail per warp: K = 2048, N = 4096 (128 x 256 tiles, ksplit 6)
+        for (ggml_type type : {GGML_TYPE_EXL3_3, GGML_TYPE_EXL3_4}) {
+            for (int64_t n : {1, 2, 3, 4, 5, 6, 7, 8}) {
+                test_cases.emplace_back(new test_mul_mat_exl3(type, 4096, n, 2048, true));
+            }
+        }
+        // odd tile counts, no glue: N = 17 tiles, K = 48 tiles
+        for (ggml_type type : {GGML_TYPE_EXL3_2, GGML_TYPE_EXL3_4, GGML_TYPE_EXL3_6}) {
+            for (int64_t n : {1, 3, 8, 33}) {
+                test_cases.emplace_back(new test_mul_mat_exl3(type, 272, n, 768, false));
+            }
+        }
+        // Qwen3.8 27B FFN gate/up (5120 -> 17408) and down (17408 -> 5120) at decode widths
+        for (ggml_type type : {GGML_TYPE_EXL3_3, GGML_TYPE_EXL3_4}) {
+            for (int64_t n : {1, 8}) {
+                test_cases.emplace_back(new test_mul_mat_exl3(type, 17408, n, 5120, true));
+                test_cases.emplace_back(new test_mul_mat_exl3(type, 5120, n, 17408, true));
+            }
+        }
+        // [#74] FFN bridge vs the CPU: bridged widths 1..16, and 17/32 where the bridge must decline
+        for (ggml_type type : {GGML_TYPE_EXL3_3, GGML_TYPE_EXL3_4}) {
+            for (int64_t T : {1, 2, 3, 4, 5, 8, 16, 17, 32}) {
+                test_cases.emplace_back(new test_exl3_ffn(type, 512, 1536, T));
+            }
+        }
+        for (ggml_type type : {GGML_TYPE_EXL3_2, GGML_TYPE_EXL3_5}) {
+            for (int64_t T : {1, 4}) {
+                test_cases.emplace_back(new test_exl3_ffn(type, 512, 1536, T));
+            }
+        }
+    }
+
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP4, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
@@ -11953,9 +12189,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_F16, GGML_TYPE_F32, 16, 16, false, 32, 32, 32, 3));
 
     // Indexed draft heads: one-row experts, shared activation, and partial warp groups.
+    // test_mul_mat_id_onerow: 1..17 scalar outputs, error normalised by the expected output power (see the struct).
     for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS}) {
         for (int n_used : {1, 3, 17}) {
-            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 17, n_used, true, 1, 1, 512));
+            test_cases.emplace_back(new test_mul_mat_id_onerow(type, GGML_TYPE_F32, 17, n_used, true, 1, 1, 512));
         }
     }
 

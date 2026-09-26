@@ -132,9 +132,15 @@ model's own MTP head, exact p/q verification on by default. `--spec-draft-vocab-
 this file: the shortlist in `docs/mtp-vocab/` was built for the ATX quant's head. Raise `-c` for longer
 contexts; the decode flags do not change.
 
-Environment switches, all off by default:
+Environment switches:
 
 - `GGML_CUDA_EXL3_GEMV=0` forces every matmul onto the reconstruct-plus-cuBLAS path. Debug only.
+- `GGML_CUDA_EXL3_WEIGHT_MAJOR=0` turns off the weight-major tensor-core GEMV (3- and 4-bit, widths 2-8),
+  which is on by default. Compiling with the macro `LLAMAMPERE_EXL3_WEIGHT_MAJOR=0` (for example
+  `-DCMAKE_CUDA_FLAGS=-DLLAMAMPERE_EXL3_WEIGHT_MAJOR=0`) leaves it out of the binary.
+- `GGML_CUDA_EXL3_FFN_BRIDGE=0` turns off the FFN bridge, which is on by default: one kernel between the
+  gate/up and down projections replaces the two gate/up output glues, the SwiGLU and the down input glue.
+  `GGML_CUDA_DISABLE_FUSION=1` also turns it off.
 - `GGML_CUDA_EXL3_FUSED=1` runs the cooperative kernel that does the Hadamard prologue and epilogue
   in-kernel behind two grid barriers. It was measured slower than the separate glue kernels on a 1008-block
   persistent grid, so it is opt-in. `EXL3_GEMV_BPS=n` caps that grid at n blocks per SM.
@@ -143,6 +149,10 @@ Environment switches, all off by default:
   Hadamard matmul, `ggml_mul` by `svh`. It exists as an A/B check against the fused form. The code tests
   for the variable's presence, so `LLAMA_EXL3_GLUE_GRAPH=1` and any other value both enable it; unset it
   to get the default path.
+
+Weight-major and the FFN bridge were measured on the 4.0 bpw model (2026-09-25, ms per MTP round, output
+byte-identical in every arm): both off 35.791 / 35.798 (two brackets), weight-major only 35.001 (-2.2%),
+bridge only 35.671 (-0.3%), both on 34.862 (-2.6%).
 
 ## The fused-group layout
 

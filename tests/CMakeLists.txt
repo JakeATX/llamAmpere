@@ -149,6 +149,7 @@ if (LLAMA_LLGUIDANCE)
 endif ()
 
 llama_build(test-recurrent-state-rollback.cpp)
+llama_build(test-fit-recurrent-noalloc.cpp)
 llama_build(test-output-buffer-reuse.cpp)
 
 llama_build_and_test(test-gdn-ingredient-replay.cpp LABEL "turbo")
@@ -216,6 +217,16 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         ARGS -m "${MODEL_DIR}/qwen35-dense.gguf"
     )
     set_tests_properties(test-recurrent-state-rollback PROPERTIES
+        FIXTURES_REQUIRED generate-models
+    )
+
+    # the -fit probe (no_alloc) must size the recurrent state without allocating it
+    llama_test(
+        test-fit-recurrent-noalloc
+        LABEL main
+        ARGS -m "${MODEL_DIR}/qwen35-dense.gguf"
+    )
+    set_tests_properties(test-fit-recurrent-noalloc PROPERTIES
         FIXTURES_REQUIRED generate-models
     )
 
@@ -340,6 +351,7 @@ llama_build_and_test(test-mtp-vocab-builtin.cpp ../src/llama-mtp-vocab-builtin.c
 llama_build_and_test(test-gdn-replay-split.cpp)
 llama_build_and_test(test-add-rms-q8.cpp) # [#46] skips without a GPU backend
 llama_build_and_test(test-exl3-ffn-bridge.cpp) # [#74] skips without a GPU backend
+llama_build_and_test(test-exl3-weight-major.cpp) # [#73] skips without a GPU backend
 llama_build_and_test(test-fattn-alloc-route.cpp) # [#64] skips without a GPU backend
 llama_build_and_test(test-fattn-bounded-prefill.cpp) # [#22/#29] forks one child per GGML_CUDA_PREFILL_KV_MIB arm; skips without a GPU backend
 llama_build_and_test(test-mtp-chain-sample.cpp) # [#69] CPU always, the GPU when present
@@ -367,6 +379,7 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
 endif()
 
 llama_build_and_test(test-moe-cache-fit.cpp)
+llama_build_and_test(test-fit-extra.cpp)
 
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")

@@ -416,10 +416,12 @@ Use exactly one of these options:
 --spec-draft-type-k, -ctkd, --cache-type-k-draft  TYPE
                                         KV cache data type for K for the draft model
                                         allowed values: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1
+                                        (default: the main model's K cache type from -ctk; pass f16 to force f16)
                                         (env: LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_K)
 --spec-draft-type-v, -ctvd, --cache-type-v-draft  TYPE
                                         KV cache data type for V for the draft model
                                         allowed values: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1
+                                        (default: the main model's V cache type from -ctv; pass f16 to force f16)
                                         (env: LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V)
 --spec-draft-override-tensor, -otd, --override-tensor-draft  <tensor name pattern>=<buffer type>,...
                                         override tensor buffer type for draft model
@@ -481,7 +483,7 @@ Specifies a comma-separated list of speculative decoding types to use.
 
 | Type | Description |
 |------|-------------|
-| `none` | No speculative decoding (default) |
+| `none` | No speculative decoding (default for models without a family default, see below) |
 | `draft-simple` | Use a simple draft model for speculation |
 | `draft-eagle3` | Use an EAGLE-3 draft model that reads the target's hidden states |
 | `draft-dflash` | Use a DFlash block-diffusion draft model that emits a block per step |
@@ -493,6 +495,11 @@ Specifies a comma-separated list of speculative decoding types to use.
 | `ngram-map-k` | Use n-gram pattern matching with n-gram-keys |
 | `ngram-map-k4v` | Use n-gram pattern matching with n-gram-keys and up to four m-gram values (experimental) |
 | `ngram-mod` | Use basic ngram hasher for speculative decoding with shared pool |
+
+Without `--spec-type`, `llama-server` and `llama-cli` turn on a model family's built-in drafter with its measured
+settings; today `qwen35` (Qwen3.8) models with an MTP head get `draft-mtp-adaptive`, n-max 4, n-min-adaptive 3,
+p-min 0 and vocab map `auto`. Any explicit `--spec-type`, including `none`, turns this off. See
+[MTP drafter default](../tools/server/README.md#mtp-drafter-default).
 
 **Example:** Server-instance used to refactor source code.
 ```bash

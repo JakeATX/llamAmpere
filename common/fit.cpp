@@ -11,6 +11,7 @@
 #include <array>
 #include <cassert>
 #include <cinttypes>
+#include <cmath>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -484,6 +485,18 @@ common_device_memory_data_vec common_get_device_memory_data_with_parent(
     return ret;
 }
 
+common_fit_extra_memory common_fit_extra_memory_at(
+        const common_fit_extra_memory & measured, uint32_t n_ctx_measured, uint32_t n_ctx, size_t compute_main, bool shares_compute) {
+    common_fit_extra_memory ret = measured;
+    if (n_ctx != n_ctx_measured && n_ctx_measured > 0) {
+        ret.context = (size_t) std::ceil((double) measured.context * n_ctx / n_ctx_measured);
+    }
+    if (shares_compute && measured.compute <= compute_main) {
+        ret.compute = 0;
+    }
+    return ret;
+}
+
 static void common_params_fit_impl(
         const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
@@ -516,21 +529,33 @@ static void common_params_fit_impl(
 
     // the extra model competes for the same memory as the main model, add it to every measurement
     // its memory is measured again whenever the context it follows changes
+    // a context that shares the compute buffers of the main context (MTP, single device) adds only its KV cache next to
+    // the main context: it is measured once at the minimum context and its KV cache is scaled from there, rather than
+    // measured standalone at every context the fit probes (up to n_ctx_train * n_seq_max tokens)
     auto add_extra_memory = [&](dmds_t & dmds) {
         if (extra == nullptr) {
             return;
         }
 
-        if (dmds_extra.empty() || n_ctx_extra != cparams->n_ctx) {
+        const bool shares_compute = extra->shares_compute && devs.size() == 1;
+
+        uint32_t n_ctx_measure = cparams->n_ctx;
+        if (shares_compute) {
+            const uint64_t align = 256 * uint64_t(n_streams);
+            const uint64_t n_min = std::max(align, (uint64_t(n_ctx_min) * n_streams + align - 1) / align * align);
+            n_ctx_measure = (uint32_t) std::min<uint64_t>(n_min, cparams->n_ctx);
+        }
+
+        if (dmds_extra.empty() || n_ctx_extra != n_ctx_measure) {
             std::vector<ggml_backend_dev_t> devs_extra;
             uint32_t ngl_extra = 0;
             uint32_t nct_extra = 0;
             uint32_t nex_extra = 0;
 
-            extra->cparams->n_ctx = cparams->n_ctx;
+            extra->cparams->n_ctx = n_ctx_measure;
 
             LOG_TRC("%s: getting device memory data for the extra model at a context size of %" PRIu32 ":\n",
-                __func__, cparams->n_ctx);
+                __func__, n_ctx_measure);
 
             dmds_t measured;
             try {
@@ -540,7 +565,7 @@ static void common_params_fit_impl(
                 // the extra model is optional, fit the main model alone rather than giving up
                 LOG_WRN("%s: failed to measure the memory of the extra model, fitting without it: %s\n", __func__, e.what());
                 dmds_extra = dmds_t(devs.size() + 1);
-                n_ctx_extra = cparams->n_ctx;
+                n_ctx_extra = n_ctx_measure;
                 return;
             }
 
@@ -562,13 +587,20 @@ static void common_params_fit_impl(
                 }
             }
 
-            n_ctx_extra = cparams->n_ctx;
+            n_ctx_extra = n_ctx_measure;
         }
 
+        if (n_ctx_extra != cparams->n_ctx) {
+            LOG_TRC("%s: extra model shares the compute buffers of the main context, scaling its KV cache from a context size of %"
+                PRIu32 " to %" PRIu32 "\n", __func__, n_ctx_extra, cparams->n_ctx);
+        }
         for (size_t id = 0; id < dmds.size(); id++) {
-            dmds[id].mb.model   += dmds_extra[id].mb.model;
-            dmds[id].mb.context += dmds_extra[id].mb.context;
-            dmds[id].mb.compute += dmds_extra[id].mb.compute;
+            const llama_memory_breakdown_data & mb = dmds_extra[id].mb;
+            const common_fit_extra_memory mem = common_fit_extra_memory_at(
+                {mb.model, mb.context, mb.compute}, n_ctx_extra, cparams->n_ctx, dmds[id].mb.compute, shares_compute);
+            dmds[id].mb.model   += mem.model;
+            dmds[id].mb.context += mem.context;
+            dmds[id].mb.compute += mem.compute;
         }
     };
 
