@@ -79,7 +79,9 @@ deliberate — the model loads through that path.
     -ngl 99 -fa on -c 32768 --parallel 1 --jinja
 ```
 
-Add the MTP head with `--spec-type draft-mtp --spec-draft-n-max 3`.
+The file reads as `qwen35` with an MTP head, so this tree turns the MTP drafter on by default (adaptive depth
+3-4, see [speculative.md](speculative.md#--spec-type-type)); `--spec-type draft-mtp --spec-draft-n-max 3` gives
+fixed depth 3 instead, and `--spec-type none` turns the drafter off.
 
 ## Vision
 

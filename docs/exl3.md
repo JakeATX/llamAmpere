@@ -132,6 +132,15 @@ model's own MTP head, exact p/q verification on by default. `--spec-draft-vocab-
 this file: the shortlist in `docs/mtp-vocab/` was built for the ATX quant's head. Raise `-c` for longer
 contexts; the decode flags do not change.
 
+On the v0.4 tree the MTP drafter is on by default for a Qwen3.8 GGUF with the MTP head (adaptive depth
+3-4, see [speculative.md](speculative.md#--spec-type-type)), and the drafter's KV cache follows `-ctk`/`-ctv`
+unless `--spec-draft-type-k/-v` are given. The command above keeps the measured flags. `--spec-type draft-mtp`
+is still needed to get the measured fixed depth 4 instead of the adaptive default; `--spec-draft-p-min 0` and
+`--spec-draft-type-k q8_0` are now redundant (p-min 0 is the default and the drafter K cache inherits
+`-ctk q8_0`); `--spec-draft-type-v q8_0` is not, because without it the drafter V cache would follow
+`-ctv turbo3`. The vocabulary map now defaults to `auto`, but it does not engage on the EXL3 output head:
+the draft falls back to the full head, as in the measurements.
+
 Environment switches:
 
 - `GGML_CUDA_EXL3_GEMV=0` forces every matmul onto the reconstruct-plus-cuBLAS path. Debug only.
