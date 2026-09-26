@@ -895,12 +895,6 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
         {
             const char * env = getenv("LLAMA_SHARED_COMPUTE");
             const bool enabled = env == nullptr || env[0] != '0';
-            if (getenv("LLAMA_SHARED_COMPUTE_DEBUG") != nullptr) {
-                fprintf(stderr, "shared-compute: enabled=%d ctx_type=%d ctx_other=%p same_model=%d n_devices=%zu other_peer=%p\n",
-                    (int) enabled, (int) cparams.ctx_type, (void *) params.ctx_other,
-                    params.ctx_other ? (int) (&params.ctx_other->get_model() == &model) : -1, model.n_devices(),
-                    params.ctx_other ? (void *) params.ctx_other->compute_peer : nullptr);
-            }
             // not with a tensor split: the meta backend keeps per-device tensor mappings in its compute buffer that
             // the donor's graph allocation resets while the MTP context still reuses its graph (each context gets
             // its own compute buffers instead)
@@ -1584,9 +1578,6 @@ void llama_context::sched_reserve() {
                    moe_cache_eligible ? moe_cache_requested : "off");
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
-    if (getenv("LLAMA_SHARED_COMPUTE_DEBUG") != nullptr) {
-        fprintf(stderr, "shared-compute: sched_reserve peer=%p peer_sched=%p\n", (void *) compute_peer, compute_peer ? (void *) compute_peer->sched.get() : nullptr);
-    }
     if (compute_peer != nullptr && compute_peer->sched) {
         if (!ggml_backend_sched_set_donor(sched.get(), compute_peer->sched.get())) {
             LLAMA_LOG_WARN("%s: could not share compute buffers with the peer context\n", __func__);
