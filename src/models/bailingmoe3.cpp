@@ -264,6 +264,13 @@ llama_model_bailingmoe3::graph::graph(const llama_model & model, const llm_graph
             ggml_tensor * conv_states_all = mctx_cur->get_r_l(il);
             ggml_tensor * conv_state_all = build_rs(inp_rs, conv_states_all, hparams.n_embd_r(), n_seqs);
 
+            // the conv writer below stores only this ubatch's min(n, K) windows per third; the older
+            // groups move back by n ([TAG_RECURRENT_ROLLBACK_SHIFT]): gather all three thirds before the
+            // window writes, write them after. plane0 follows build_conv_state (see kimi-k3).
+            std::vector<ggml_tensor *> conv_older;
+            snapshot_shift_gather(ctx0, gf, inp_rs, conv_states_all, hparams.n_embd_r(), mctx_cur->get_replay_len(),
+                    mem_size, conv_older);
+
             ggml_tensor * q = bailingmoe3_causal_conv1d(
                     gf, ctx0, conv_states_all, conv_state_all, 0, cur, layer.wq, layer.ssm_q_conv,
                     d_conv, head_dim, n_head, n_seq_tokens, n_seqs, n_tokens, cache_head, mem_size, cparams.n_rs_seq);
@@ -273,6 +280,8 @@ llama_model_bailingmoe3::graph::graph(const llama_model & model, const llm_graph
             ggml_tensor * v = bailingmoe3_causal_conv1d(
                     gf, ctx0, conv_states_all, conv_state_all, 2, cur, layer.wv, layer.ssm_v_conv,
                     d_conv, head_dim, n_head, n_seq_tokens, n_seqs, n_tokens, cache_head, mem_size, cparams.n_rs_seq);
+            snapshot_shift_write(ctx0, gf, inp_rs, conv_states_all, hparams.n_embd_r(), n_seq_tokens, cache_head,
+                    mem_size, conv_older);
 
             ggml_tensor * gate = ggml_mul_mat(ctx0, layer.ssm_f_a, cur);
             gate = ggml_add(ctx0, gate, layer.ssm_dt_b);

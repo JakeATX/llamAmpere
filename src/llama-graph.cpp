@@ -411,8 +411,8 @@ void llm_graph_input_rs::fill_s_copy(const llama_memory_recurrent_context * m) {
 }
 
 void llm_graph_input_rs::set_input_shift(uint32_t mem_size) {
-    // read by the shift-layout snapshot writers (delta-net, Mamba2, the kimi-k3 conv); a graph whose writers do not
-    // shift (the lfm2 / bailingmoe3 / qwen4exp conv writers, as of this change) leaves it without a buffer
+    // read by the shift-layout snapshot writers (delta-net, Mamba2, and the kimi-k3 / bailingmoe3 / qwen4exp / lfm2
+    // conv); a graph with no shift-layout writer never reads it and leaves it without a buffer
     if (!s_copy_shift || !s_copy_shift->buffer) {
         return;
     }

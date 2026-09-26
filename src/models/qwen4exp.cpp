@@ -1449,7 +1449,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
     GGML_ASSERT(state_cols * channels == row_total);
 
     auto it = rs_rows.find(conv_states_all);
-    if (it == rs_rows.end()) {
+    const bool first_use = it == rs_rows.end();
+    if (first_use) {
         it = rs_rows.emplace(conv_states_all, build_rs(inp, conv_states_all, row_total, n_seqs)).first;
     }
     ggml_tensor * rows = it->second;
@@ -1464,10 +1465,22 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
     const size_t row_size = ggml_row_size(conv_states_all->type, row_total);
     const uint32_t mem_size = mctx_cur->get_size();
 
-    const int64_t n_slots = (int64_t) cparams.n_rs_seq + 1;
+    const int64_t n_slots   = (int64_t) cparams.n_rs_seq + 1;
+    const int64_t n_written = std::min<int64_t>(ubatch.n_seq_tokens, n_slots);
 
-    for (int64_t slot = 0; slot < n_slots; ++slot) {
-        const int64_t s_idx = std::max<int64_t>(0, conv_input->ne[0] - state_cols - slot);
+    // only this ubatch's windows are written (slot < min(n, K)); the older slots move back by n
+    // ([TAG_RECURRENT_ROLLBACK_SHIFT], no-op for n >= K). Writing every slot with the window clamped to
+    // the pre-ubatch one filled the slots past n with it while rs_valid counted them as older history.
+    // The shift runs once per state tensor and graph, on the call that also builds its rows (rs_rows):
+    // a second shift of the same tensor would move the history back twice. plane0 follows
+    // build_conv_state (the pending replay in replay mode, s_copy_shift carries rs_idx otherwise).
+    std::vector<ggml_tensor *> older;
+    if (first_use) {
+        snapshot_shift_gather(ctx0, gf, inp, conv_states_all, row_total, mctx_cur->get_replay_len(), mem_size, older);
+    }
+
+    for (int64_t slot = 0; slot < n_written; ++slot) {
+        const int64_t s_idx = conv_input->ne[0] - state_cols - slot; // = n_seq_tokens - slot >= 1
 
         ggml_tensor * tail = ggml_view_3d(ctx0, conv_input,
                 state_cols, channels, n_seqs,
@@ -1481,6 +1494,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
 
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
     }
+
+    snapshot_shift_write(ctx0, gf, inp, conv_states_all, row_total, ubatch.n_seq_tokens, kv_head, mem_size, older);
 
     return conv_input;
 }

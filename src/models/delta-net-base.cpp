@@ -473,6 +473,7 @@ void snapshot_shift_gather(ggml_context * ctx0, ggml_cgraph * gf, const llm_grap
     GGML_ASSERT(rows_off + (size_t) inp->snap_shift * mem_size <= (size_t) all->ne[1]);
     ggml_tensor * planes = ggml_view_2d(ctx0, all, row_elems, all->ne[1] - (int64_t) rows_off, all->nb[1], rows_off * all->nb[1]);
     ggml_tensor * g = ggml_get_rows(ctx0, planes, inp->s_copy_shift);
+    ggml_format_name(g, "rs_shift_gather-%s", all->name); // one per state tensor and graph (test-visible)
     ggml_build_forward_expand(gf, g);
     gathered.push_back(g);
 }
@@ -494,7 +495,9 @@ void snapshot_shift_write(ggml_context * ctx0, ggml_cgraph * gf, const llm_graph
     ggml_tensor * src3 = ggml_reshape_3d(ctx0, src, row_elems, n_seqs, inp->snap_shift);
     ggml_tensor * dst  = ggml_view_3d(ctx0, all, row_elems, n_seqs, inp->snap_shift,
             all->nb[1], (size_t) mem_size * all->nb[1], rows_off * all->nb[1]);
-    ggml_build_forward_expand(gf, ggml_cpy(ctx0, src3, dst));
+    ggml_tensor * w = ggml_cpy(ctx0, src3, dst);
+    ggml_format_name(w, "rs_shift_write-%s", all->name);
+    ggml_build_forward_expand(gf, w);
 }
 
 ggml_tensor * llm_build_delta_net_base::build_conv_state(

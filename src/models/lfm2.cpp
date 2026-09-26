@@ -210,6 +210,14 @@ llama_model_lfm2::graph<iswa>::graph(const llama_model & model, const llm_graph_
         const auto    mem_size  = mctx_cur->get_size();
         const size_t  row_size  = ggml_row_size(conv_state->type, (int64_t) d_conv * n_embd);
 
+        // the older slots move back by n_seq_tokens ([TAG_RECURRENT_ROLLBACK_SHIFT], no-op for n >= K): without
+        // it slot n (the pre-ubatch window) and deeper kept what an earlier ubatch left there while rs_valid
+        // counted them as history. Only the causal writer keeps rollback slots (K == 1 otherwise).
+        std::vector<ggml_tensor *> conv_older;
+        if (K > 1) {
+            snapshot_shift_gather(ctx0, gf, inp_recr, conv_state, (int64_t) d_conv * n_embd, 0, mem_size, conv_older);
+        }
+
         for (int64_t slot = 0; slot < n_written; ++slot) {
             auto * conv_snap = ggml_view_3d(ctx0, bx, d_conv, bx->ne[1], bx->ne[2], bx->nb[1], bx->nb[2],
                                             (bx->ne[0] - d_conv - slot) * ggml_element_size(bx));
@@ -218,6 +226,8 @@ llama_model_lfm2::graph<iswa>::graph(const llama_model & model, const llm_graph_
                                                                 conv_state->nb[1],
                                                                 ((size_t) slot * mem_size + kv_head) * row_size)));
         }
+        snapshot_shift_write(ctx0, gf, inp_recr, conv_state, (int64_t) d_conv * n_embd, n_seq_tokens, kv_head, mem_size,
+                conv_older);
 
         auto * conv_kernel = model.layers[il].shortconv.conv;
         auto * conv_out    = ggml_ssm_conv(ctx0, bx, conv_kernel);
