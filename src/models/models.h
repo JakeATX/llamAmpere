@@ -7,6 +7,7 @@
 // note: almost all graphs require at least sqrtf, so include cmath globally
 #include <cmath>
 #include <map>
+#include <vector>
 
 class llama_memory_hybrid_idx_context;
 
@@ -16,6 +17,18 @@ static inline ggml_tensor * build_gdn_l2_norm(ggml_context * ctx, ggml_tensor * 
 
     return ggml_scale(ctx, ggml_rms_norm(ctx, x, eps/n), 1.0f/sqrtf(n));
 }
+
+// [TAG_RECURRENT_ROLLBACK_SHIFT] shift-layout snapshot history (delta-net-base.cpp). A writer that
+// stores only the newest min(n, K) snapshot groups of a ubatch of n tokens must also move the
+// older groups back by n, or group g stops meaning "g tokens behind the head" and the rs_valid
+// bookkeeping in llama-memory-recurrent.cpp over-credits the history. Gather before the ubatch's
+// own snapshot writes, write after them. No-op when inp->snap_shift == 0 (ring layout, n >= K).
+void snapshot_shift_gather(ggml_context * ctx0, ggml_cgraph * gf, const llm_graph_input_rs * inp,
+        ggml_tensor * all, int64_t row_elems, uint32_t plane0, uint32_t mem_size,
+        std::vector<ggml_tensor *> & gathered);
+void snapshot_shift_write(ggml_context * ctx0, ggml_cgraph * gf, const llm_graph_input_rs * inp,
+        ggml_tensor * all, int64_t row_elems, int64_t n_seq_tokens, uint32_t kv_head, uint32_t mem_size,
+        const std::vector<ggml_tensor *> & gathered);
 
 //
 // base classes

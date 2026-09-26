@@ -374,10 +374,13 @@ static ggml_tensor * kimi_k3_conv1d(ggml_cgraph * gf, ggml_context * ctx0,
     ggml_tensor * x_3d   = ggml_reshape_3d(ctx0, x_proj, d_inner, n_seq_tokens, n_seqs);
     ggml_tensor * conv_x = ggml_concat(ctx0, conv_state_x, ggml_transpose(ctx0, x_3d), 0);
 
-    // group s holds the conv window s tokens back.
-    // [TAG_RECURRENT_ROLLBACK_SPLITS]: the last K_rs tokens must share one ubatch.
-    for (int64_t s = 0; s < K_rs; ++s) {
-        const int64_t s_idx = std::max<int64_t>(0, n_seq_tokens - s);
+    // group s holds the conv window s tokens back. Only this ubatch's windows are written here
+    // (s < min(n, K_rs)); build_kda_layer moves the older groups back by n around these writes
+    // ([TAG_RECURRENT_ROLLBACK_SHIFT]). Writing every group with s_idx clamped to 0 filled the
+    // groups past n with the pre-ubatch window while rs_valid counted them as older history.
+    const int64_t n_written = std::min<int64_t>(n_seq_tokens, K_rs);
+    for (int64_t s = 0; s < n_written; ++s) {
+        const int64_t s_idx = n_seq_tokens - s;
         ggml_tensor * conv_x_s = ggml_view_3d(ctx0, conv_x, d_conv - 1, d_inner, n_seqs,
             conv_x->nb[1], conv_x->nb[2], s_idx * conv_x->nb[0]);
         ggml_build_forward_expand(gf,
@@ -410,9 +413,18 @@ ggml_tensor * llama_model_kimi_k3::graph::build_kda_layer(
     const int64_t mem_size = mctx_cur->get_size();
     const int64_t K_rs     = (int64_t) cparams.n_rs_seq + 1;
 
+    // older conv groups move back by n_seq_tokens (no-op for n >= K_rs): gather all three thirds
+    // before the per-third window writes below, write them back after. plane0 follows
+    // build_conv_state (the pending replay in replay mode, s_copy_shift carries rs_idx otherwise).
+    std::vector<ggml_tensor *> conv_older;
+    snapshot_shift_gather(ctx0, gf, inp_rs, conv_states_all, hparams.n_embd_r(), mctx_cur->get_replay_len(),
+            (uint32_t) mem_size, conv_older);
+
     ggml_tensor * Qcur = kimi_k3_conv1d(gf, ctx0, conv_states_all, conv_state_all, 0, cur, layer.wq, layer.ssm_q_conv, d_conv, head_dim, n_head_kda, n_seq_tokens, n_seqs, n_tokens, kv_head, mem_size, K_rs);
     ggml_tensor * Kcur = kimi_k3_conv1d(gf, ctx0, conv_states_all, conv_state_all, 1, cur, layer.wk, layer.ssm_k_conv, d_conv, head_dim, n_head_kda, n_seq_tokens, n_seqs, n_tokens, kv_head, mem_size, K_rs);
     ggml_tensor * Vcur = kimi_k3_conv1d(gf, ctx0, conv_states_all, conv_state_all, 2, cur, layer.wv, layer.ssm_v_conv, d_conv, head_dim, n_head_kda, n_seq_tokens, n_seqs, n_tokens, kv_head, mem_size, K_rs);
+    snapshot_shift_write(ctx0, gf, inp_rs, conv_states_all, hparams.n_embd_r(), n_seq_tokens, kv_head,
+            (uint32_t) mem_size, conv_older);
     cb(Qcur, "kda_q_conv", il);
     cb(Kcur, "kda_k_conv", il);
     cb(Vcur, "kda_v_conv", il);

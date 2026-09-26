@@ -455,7 +455,7 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
 // pending rollback in replay mode (rs_idx stays 0 there, replay_len selects the conv group), and
 // 0 otherwise, since s_copy already carries rs_idx * mem_size. All gathers are materialized before
 // any write (gather() then write()) because the source planes overlap the destinations.
-static void snapshot_shift_gather(ggml_context * ctx0, ggml_cgraph * gf, const llm_graph_input_rs * inp,
+void snapshot_shift_gather(ggml_context * ctx0, ggml_cgraph * gf, const llm_graph_input_rs * inp,
         ggml_tensor * all, int64_t row_elems, uint32_t plane0, uint32_t mem_size,
         std::vector<ggml_tensor *> & gathered) {
     gathered.clear();
@@ -477,7 +477,7 @@ static void snapshot_shift_gather(ggml_context * ctx0, ggml_cgraph * gf, const l
     gathered.push_back(g);
 }
 
-static void snapshot_shift_write(ggml_context * ctx0, ggml_cgraph * gf, const llm_graph_input_rs * inp,
+void snapshot_shift_write(ggml_context * ctx0, ggml_cgraph * gf, const llm_graph_input_rs * inp,
         ggml_tensor * all, int64_t row_elems, int64_t n_seq_tokens, uint32_t kv_head, uint32_t mem_size,
         const std::vector<ggml_tensor *> & gathered) {
     if (gathered.empty()) {
