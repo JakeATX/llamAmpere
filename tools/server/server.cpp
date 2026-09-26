@@ -11,6 +11,7 @@
 #include "fit.h"
 #include "llama.h"
 #include "log.h"
+#include "spec-defaults.h"
 
 #include <atomic>
 #include <clocale>
@@ -397,6 +398,13 @@ int llama_server(common_params & params, int argc, char ** argv) {
             SRV_ERR("failed to download model: %s\n", e.what());
             return 1;
         }
+    }
+
+    // per-family speculative default (e.g. the built-in MTP drafter of qwen35 models) when --spec-type is not given:
+    // resolved from the GGUF header before the model is loaded, so -fit and the context sizing see the drafter
+    // exactly as with the explicit flags
+    if (!is_router_server && !common_speculative_apply_model_default(params)) {
+        return 1;
     }
 
     //

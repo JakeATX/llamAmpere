@@ -3,6 +3,7 @@
 #include "download.h"
 #include "llama.h"
 #include "speculative.h"
+#include "spec-defaults.h"
 
 #include <cstdlib>
 #include <cmath>
@@ -287,6 +288,42 @@ static void test(void) {
     assert(!no_chain_params.speculative.draft.chain);
     assert(no_chain_params.speculative.draft.n_max == 3);
 
+    // draft KV cache types inherit the main -ctk/-ctv unless --spec-draft-type-k/-v is given (GGML_TYPE_COUNT = not set),
+    // K and V independently; an explicit f16 stays explicit
+    argv = {"binary_name", "-m", "model_file.gguf", "-ctk", "q8_0", "-ctv", "q4_0"};
+    common_params dkv_inherit;
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), dkv_inherit, LLAMA_EXAMPLE_SPECULATIVE));
+    assert(dkv_inherit.speculative.draft.cache_type_k == GGML_TYPE_COUNT);
+    assert(dkv_inherit.speculative.draft.cache_type_v == GGML_TYPE_COUNT);
+    {
+        const auto draft = common_base_params_to_speculative(dkv_inherit);
+        assert(draft.cache_type_k == GGML_TYPE_Q8_0);
+        assert(draft.cache_type_v == GGML_TYPE_Q4_0);
+    }
+
+    argv = {"binary_name", "-m", "model_file.gguf", "-ctk", "q8_0", "-ctv", "q4_0", "-ctkd", "f16"};
+    common_params dkv_k_only;
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), dkv_k_only, LLAMA_EXAMPLE_SPECULATIVE));
+    assert(dkv_k_only.speculative.draft.cache_type_k == GGML_TYPE_F16);
+    assert(dkv_k_only.speculative.draft.cache_type_v == GGML_TYPE_COUNT);
+    {
+        const auto draft = common_base_params_to_speculative(dkv_k_only);
+        assert(draft.cache_type_k == GGML_TYPE_F16);
+        assert(draft.cache_type_v == GGML_TYPE_Q4_0);
+    }
+
+    argv = {"binary_name", "-m", "model_file.gguf", "-ctk", "q8_0", "-ctv", "q4_0",
+            "--spec-draft-type-k", "q5_0", "--spec-draft-type-v", "f16"};
+    common_params dkv_both;
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), dkv_both, LLAMA_EXAMPLE_SPECULATIVE));
+    assert(dkv_both.speculative.draft.cache_type_k == GGML_TYPE_Q5_0);
+    assert(dkv_both.speculative.draft.cache_type_v == GGML_TYPE_F16);
+    {
+        const auto draft = common_base_params_to_speculative(dkv_both);
+        assert(draft.cache_type_k == GGML_TYPE_Q5_0);
+        assert(draft.cache_type_v == GGML_TYPE_F16);
+    }
+
     // n-gram drafters request recurrent-state snapshots for in-place rollback (draft width, capped at 8);
     // --spec-n-rs-seq overrides, 0 = checkpoint restore on every partial acceptance
     argv = {"binary_name", "-m", "model_file.gguf", "--spec-type", "ngram-cache", "--spec-ngram-cache-n-max", "7"};
@@ -323,6 +360,100 @@ static void test(void) {
     argv = {"binary_name", "-m", "model_file.gguf", "--spec-type", "draft-mtp-adaptive", "--spec-draft-n-max", "2"};
     common_params invalid_adaptive_params;
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), invalid_adaptive_params, LLAMA_EXAMPLE_SPECULATIVE));
+
+    // per-family speculative defaults (spec-defaults.h): qwen35 with an MTP head gets the adaptive MTP drafter
+    // with the production settings unless --spec-type was given; explicit --spec-draft-* values are kept
+    {
+        const std::vector<enum common_speculative_type> types_none     = { COMMON_SPECULATIVE_TYPE_NONE };
+        const std::vector<enum common_speculative_type> types_adaptive = { COMMON_SPECULATIVE_TYPE_NONE, COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE };
+
+        assert(common_speculative_family_default_find("qwen35", 1) != nullptr);
+        assert(common_speculative_family_default_find("qwen35", 0) == nullptr);
+        assert(common_speculative_family_default_find("llama",  1) == nullptr);
+        assert(!common_speculative_family_defaults_str().empty());
+
+        // qwen35 + nextn=1 -> the production settings, the same parameters as the explicit flags
+        argv = {"binary_name", "-m", "model_file.gguf"};
+        common_params auto_params;
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), auto_params, LLAMA_EXAMPLE_SERVER));
+        assert(auto_params.speculative.user_set == 0);
+        assert(common_speculative_apply_family_default(auto_params.speculative, "qwen35", 1) != nullptr);
+        assert(auto_params.speculative.types == types_adaptive);
+        assert(auto_params.speculative.draft.n_max == 4);
+        assert(auto_params.speculative.draft.n_min_adaptive == 3);
+        assert(auto_params.speculative.draft.p_min == 0.0f);
+        assert(auto_params.speculative.draft.vocab_map == "auto");
+        assert(auto_params.speculative.draft.cache_type_k == GGML_TYPE_COUNT);
+        assert(auto_params.speculative.draft.cache_type_v == GGML_TYPE_COUNT);
+
+        argv = {"binary_name", "-m", "model_file.gguf", "--spec-type", "draft-mtp-adaptive", "--spec-draft-n-max", "4",
+                "--spec-draft-n-min-adaptive", "3", "--spec-draft-p-min", "0"};
+        common_params explicit_params;
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), explicit_params, LLAMA_EXAMPLE_SERVER));
+        assert(common_speculative_apply_family_default(explicit_params.speculative, "qwen35", 1) == nullptr);
+        assert(explicit_params.speculative.types                == auto_params.speculative.types);
+        assert(explicit_params.speculative.draft.n_max          == auto_params.speculative.draft.n_max);
+        assert(explicit_params.speculative.draft.n_min          == auto_params.speculative.draft.n_min);
+        assert(explicit_params.speculative.draft.n_min_adaptive == auto_params.speculative.draft.n_min_adaptive);
+        assert(explicit_params.speculative.draft.p_min          == auto_params.speculative.draft.p_min);
+        assert(explicit_params.speculative.draft.vocab_map      == auto_params.speculative.draft.vocab_map);
+        assert(explicit_params.speculative.draft.chain          == auto_params.speculative.draft.chain);
+        assert(explicit_params.speculative.need_n_rs_seq()      == auto_params.speculative.need_n_rs_seq());
+
+        // qwen35 without an MTP head, and other architectures -> none
+        argv = {"binary_name", "-m", "model_file.gguf"};
+        common_params no_head_params;
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), no_head_params, LLAMA_EXAMPLE_SERVER));
+        assert(common_speculative_apply_family_default(no_head_params.speculative, "qwen35", 0) == nullptr);
+        assert(no_head_params.speculative.types == types_none);
+        assert(common_speculative_apply_family_default(no_head_params.speculative, "llama", 1) == nullptr);
+        assert(no_head_params.speculative.types == types_none);
+        assert(no_head_params.speculative.draft.n_max == 3);
+
+        // an explicit --spec-type none turns the default off
+        argv = {"binary_name", "-m", "model_file.gguf", "--spec-type", "none"};
+        common_params none_params;
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), none_params, LLAMA_EXAMPLE_SERVER));
+        assert(none_params.speculative.user_set & COMMON_PARAMS_SPECULATIVE_USER_TYPE);
+        assert(common_speculative_apply_family_default(none_params.speculative, "qwen35", 1) == nullptr);
+        assert(std::find(none_params.speculative.types.begin(), none_params.speculative.types.end(),
+                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE) == none_params.speculative.types.end());
+
+        // an explicit --spec-draft-n-max without --spec-type -> the auto type with that n-max (the floor follows it)
+        argv = {"binary_name", "-m", "model_file.gguf", "--spec-draft-n-max", "2"};
+        common_params n_max_params;
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), n_max_params, LLAMA_EXAMPLE_SERVER));
+        assert(n_max_params.speculative.user_set == COMMON_PARAMS_SPECULATIVE_USER_DRAFT_N_MAX);
+        assert(common_speculative_apply_family_default(n_max_params.speculative, "qwen35", 1) != nullptr);
+        assert(n_max_params.speculative.types == types_adaptive);
+        assert(n_max_params.speculative.draft.n_max == 2);
+        assert(n_max_params.speculative.draft.n_min_adaptive == 2);
+
+        // other explicit draft values are kept on top of the default
+        argv = {"binary_name", "-m", "model_file.gguf", "--spec-draft-p-min", "0.5", "--spec-draft-vocab-map", "none",
+                "--spec-draft-n-min-adaptive", "5"};
+        common_params kept_params;
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), kept_params, LLAMA_EXAMPLE_SERVER));
+        assert(common_speculative_apply_family_default(kept_params.speculative, "qwen35", 1) != nullptr);
+        assert(kept_params.speculative.draft.p_min == 0.5f);
+        assert(kept_params.speculative.draft.vocab_map == "none");
+        assert(kept_params.speculative.draft.n_min_adaptive == 5);
+        assert(kept_params.speculative.draft.n_max == 5);
+
+        // an explicit --spec-draft-n-max 0 asks for no drafting
+        argv = {"binary_name", "-m", "model_file.gguf", "--spec-draft-n-max", "0"};
+        common_params n_max0_params;
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), n_max0_params, LLAMA_EXAMPLE_SERVER));
+        assert(common_speculative_apply_family_default(n_max0_params.speculative, "qwen35", 1) == nullptr);
+        assert(n_max0_params.speculative.types == types_none);
+
+        // a separate draft model turns the default off
+        argv = {"binary_name", "-m", "model_file.gguf", "-md", "draft_file.gguf"};
+        common_params draft_model_params;
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), draft_model_params, LLAMA_EXAMPLE_SERVER));
+        assert(common_speculative_apply_family_default(draft_model_params.speculative, "qwen35", 1) == nullptr);
+        assert(draft_model_params.speculative.types == types_none);
+    }
 
     {
         common_params synth_params;

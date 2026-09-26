@@ -43,7 +43,7 @@ namespace cg = cooperative_groups;
 // per call for the barriers on the 1008-block persistent grid, more than the glue costs, so the split-glue path stays
 // the default; GGML_CUDA_EXL3_FUSED=1 opts in, EXL3_GEMV_BPS caps the cooperative grid at n blocks per SM.
 
-// [#73] weight-major mma (GPT-6 SM86 PTX kit C1, experiment, off at run time unless GGML_CUDA_EXL3_WEIGHT_MAJOR=1):
+// [#73] weight-major mma (GPT-6 SM86 PTX kit C1; on by default, GGML_CUDA_EXL3_WEIGHT_MAJOR=0 turns it off):
 // the decoded weight tile is the A operand ({wv0, wv2, wv1, wv3}: A rows = the 16 output columns, A cols = k) and x
 // the B operand (tokens on n8), so one mma.m16n8k16 per 16x16 tile instead of two with x as A, whose rows 8-15 are
 // zero at T <= 8. D rows are outputs, D columns tokens. 3- and 4-bit, T = 2..8, split glue (not FUSED) only; the
@@ -649,11 +649,12 @@ static void exl3_gemv_launch_bt(const exl3_gemv_args & a, cudaStream_t stream) {
     k_exl3_gemv<BITS, T, FUSED, WM><<<grid, block, 0, stream>>>(trellis, x, out, kt, nt, K, N, ksplit, kpi_, xf, suh, svh, yf, post);
 }
 
-// [#73] GGML_CUDA_EXL3_WEIGHT_MAJOR=1 selects the weight-major mma at T = 2..8 (3/4-bit, split glue); off by default
+// [#73] the weight-major mma runs at T = 2..8 (3/4-bit, split glue) by default (measured 2026-09-25 on 4.0 bpw:
+// -2.2% per round, identical output); GGML_CUDA_EXL3_WEIGHT_MAJOR=0 selects the x-as-A mma
 static bool exl3_gemv_weight_major_env() {
     static const bool enabled = [] {
         const char * env = getenv("GGML_CUDA_EXL3_WEIGHT_MAJOR");
-        return env != nullptr && strcmp(env, "1") == 0;
+        return env == nullptr || strcmp(env, "0") != 0;
     }();
     return enabled;
 }
@@ -851,7 +852,9 @@ void ggml_cuda_exl3_gemv(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
 
     // x -> fp16 [T][K], pre-scaled (and suh * / Hadamard when fused)
     ggml_cuda_pool_alloc<half> xh(ctx.pool(id), (size_t) T * K);
-    const bool fused = exl3_gemv_fused_enabled();
+    // the fused phase 3 walks 128-chunks of [T][N]: without svh and N % 128 != 0 it would drop the T*N % 128 tail,
+    // so that shape takes the split glue (its glue_out has a per-element path)
+    const bool fused = exl3_gemv_fused_enabled() && (svh != nullptr || N % 128 == 0);
     if (!fused) {
         ggml_cuda_exl3_glue_in_f16((const float *) src1->data, suh, xh.get(), K, T, EXL3_GEMV_X_SCALE, stream);
     }

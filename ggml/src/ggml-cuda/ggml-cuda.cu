@@ -5870,12 +5870,13 @@ static int ggml_cuda_try_add_rms_norm_mul(ggml_backend_cuda_context & ctx, ggml_
 
 // [#74] EXL3 FFN: MUL_MAT gate/up (either order) at i, i+1, GLU SWIGLU split at i+2, MUL_MAT down at i+3 reading the
 // GLU. The gate/up outputs and the GLU output are elided; one bridge kernel replaces both glue_outs, the SwiGLU and the
-// down projection's glue_in. Opt-in with GGML_CUDA_EXL3_FFN_BRIDGE=1 (see tests/test-exl3-ffn-bridge.cpp). Returns
+// down projection's glue_in. On by default (measured 2026-09-25 on 4.0 bpw: -0.3% per round, identical output);
+// GGML_CUDA_EXL3_FFN_BRIDGE=0 or GGML_CUDA_DISABLE_FUSION=1 turn it off (see tests/test-exl3-ffn-bridge.cpp). Returns
 // nodes to skip.
 static bool ggml_cuda_exl3_ffn_bridge_enabled() {
     static const bool enabled = [] {
         const char * e = getenv("GGML_CUDA_EXL3_FFN_BRIDGE");
-        return e != nullptr && atoi(e) != 0;
+        return e == nullptr || atoi(e) != 0;
     }();
     return enabled;
 }
