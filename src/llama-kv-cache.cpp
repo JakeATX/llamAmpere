@@ -765,6 +765,8 @@ llama_kv_cache::llama_kv_cache(
 
         attn_rot_k = other->attn_rot_k;
         attn_rot_v = other->attn_rot_v;
+
+        attn_rot_k_full = other->attn_rot_k_full;
     } else {
         // TurboQuant: master's #21038 attention rotation is OFF by default on this
         // fork. Enable per-side via LLAMA_ATTN_ROT_K_OVERRIDE=1 and/or
@@ -826,7 +828,8 @@ llama_kv_cache::llama_kv_cache(
         if (!attn_rot_disable && (model.arch == LLM_ARCH_DEEPSEEK32 || model.arch == LLM_ARCH_DEEPSEEK4 ||
                  model.arch == LLM_ARCH_DOTS3NOTE) &&
             hparams.n_embd_head_k_full == hparams.indexer_head_size) {
-            attn_rot_k = true;
+            attn_rot_k      = true;
+            attn_rot_k_full = true;
         }
     }
 
@@ -2205,6 +2208,13 @@ ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
         // ref: https://github.com/ggml-org/llama.cpp/pull/21038#issuecomment-4141323088
         const char * LLAMA_ATTN_ROT_K_NROT = getenv("LLAMA_ATTN_ROT_K_NROT");
         int nrot = LLAMA_ATTN_ROT_K_NROT ? atoi(LLAMA_ATTN_ROT_K_NROT) : 64;
+
+        // the DSA lightning-indexer rotation is not tuning: the deepseek32/dots3note indexer graphs apply it with a
+        // plain ggml_mul_mat over the whole indexer head, so it keeps master's size (the largest power of 2 dividing
+        // the head, 128 for the DeepSeek V3.2 indexer); a 64x64 matrix there fails ggml_can_mul_mat
+        if (attn_rot_k_full) {
+            nrot = 0;
+        }
 
         // Original master behavior (largest power-of-2): set LLAMA_ATTN_ROT_K_NROT=0
         if (nrot == 0) {

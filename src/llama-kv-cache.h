@@ -325,6 +325,10 @@ private:
     bool attn_rot_k = false;
     bool attn_rot_v = false;
 
+    // the K rotation is the functional Hadamard transform of a DSA lightning-indexer cache (not tuning): the indexer
+    // graphs of deepseek32/dots3note multiply by it as one full-width matrix, so it must span the whole head
+    bool attn_rot_k_full = false;
+
     // if all layers participating in the cache have constant head size, the value is stored here
     // otherwise the value is -1
     int32_t n_embd_head_k_all = 0;
