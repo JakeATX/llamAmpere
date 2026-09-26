@@ -39,7 +39,7 @@ The PTQ1_0 checkpoint is 5,946,648,928 bytes; SHA256 `53107f530aa52eb00912263ab1
 
 The PQ2_0 checkpoint at the same revision is 7,206,168,928 bytes; SHA256 `3907dc1658db1f78a9826bf8d5bcb8dc65db0d466388937af57f2294fae62ec1`.
 
-Start validation with ordinary decoding. Compatibility of a particular external speculative drafter is a separate test; the existing Qwen vocabulary maps should not be assumed appropriate for this checkpoint.
+Start validation with ordinary decoding. The model reads as `qwen35`, so if the GGUF carries the MTP head this tree turns the MTP drafter on by default ([speculative.md](speculative.md#--spec-type-type)); add `--spec-type none` to the command above for ordinary decoding. Compatibility of a particular external speculative drafter is a separate test; the existing Qwen vocabulary maps should not be assumed appropriate for this checkpoint.
 
 ## Review checks
 

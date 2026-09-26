@@ -3,6 +3,9 @@
 `--spec-draft-vocab-map /path/to/map.txt` (shipped maps for Qwen3.8-27B ATX-IQ4_XS-M: `docs/mtp-vocab/atx_65536.txt`, the production choice, and `docs/mtp-vocab/atx_32768.txt`; on v0.4 with adaptive MTP depth 3-4 the 65,536 map measured G +8.45% ± 0.94% over no map on the coding/agentic/rag ship corpus, the 32,768 map +7.59% ± 1.10%) (env `LLAMA_ARG_SPEC_DRAFT_VOCAB_MAP`; quick-test env
 `LLAMA_SPEC_DRAFT_VOCAB` read by MTP draft contexts) restricts the **draft** context's output head to a
 shortlist of token rows. The target context, its verification batches and the final sampler are unchanged.
+The default is `auto`: the shortlist compiled into the binary for the model's tokenizer and architecture (the
+65,536-token Qwen3.8-27B list, the same ids as `atx_65536.txt`), `auto:N` the built-in list of size N, and `none`
+the full vocabulary; a model with no built-in list drafts over the full vocabulary.
 Without a map the draft path is byte-for-byte the stock full-vocabulary path.
 
 Applies to the sequential `draft-mtp` / `draft-mtp-adaptive` drafters of the Qwen3.5/3.6/3.8 dense
