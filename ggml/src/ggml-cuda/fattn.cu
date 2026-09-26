@@ -2317,62 +2317,22 @@ void ggml_cuda_flash_attn_ext_streamed(
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <map>
-#include <mutex>
-#include <string>
 
-// Flash-attention path census, opt-in via GGML_FATTN_PATH_STATS=1.
-// Counts every ggml_cuda_flash_attn_ext dispatch keyed by (path, K type, V type,
-// n_q = Q->ne[1], gqa_ratio, ncols2 when the MMA path packs GQA). Dumped to stderr at
-// exit. Purpose (W5): prove or kill the premise that an f16 draft K/V cache routes the
-// drafter's width-1 attention onto the GQA-packed MMA path instead of VEC.
-static bool ggml_cuda_fattn_path_stats_enabled() {
-    static const bool enabled = [] { const char * e = getenv("GGML_FATTN_PATH_STATS"); return e && e[0] == '1'; }();
-    return enabled;
-}
-
+// fallback ledger: kernel family per K/V pair and query width, for every ggml_cuda_flash_attn_ext
+// dispatch (no-op while the ledger is off)
 static void ggml_cuda_fattn_path_note(const char * path, const ggml_tensor * dst, int ncols2) {
-    {
-        // fallback ledger: kernel family per K/V pair and query width
-        const ggml_tensor * Q = dst->src[0];
-        const ggml_tensor * K = dst->src[1];
-        const ggml_tensor * V = dst->src[2];
-        const uint64_t id = ggml_cuda_ledger_mix(ggml_cuda_ledger_mix(ggml_cuda_ledger_mix(ggml_cuda_ledger_mix(
-            (uint64_t) (uintptr_t) path, (uint64_t) K->type), (uint64_t) V->type), (uint64_t) Q->ne[0]),
-            (uint64_t) ggml_cuda_ledger_width_bucket(Q->ne[1]) * 64 + (uint64_t) (ncols2 + 1));
-        ggml_cuda_ledger_count("cuda.fattn", id, [&](char * buf, size_t size) {
-            char w[16];
-            ggml_cuda_ledger_width_str(Q->ne[1], w, sizeof(w));
-            snprintf(buf, size, "path=%s K=%s V=%s D=%d n_q=%s ncols2=%d", path, ggml_type_name(K->type), ggml_type_name(V->type),
-                (int) Q->ne[0], w, ncols2);
-        });
-    }
-    if (!ggml_cuda_fattn_path_stats_enabled()) {
-        return;
-    }
-    static std::mutex mtx;
-    static std::map<std::string, uint64_t> counts;
-    static const bool registered = [] {
-        atexit([] {
-            std::lock_guard<std::mutex> lock(mtx);
-            fprintf(stderr, "fattn_path_stats: begin (%zu keys)\n", counts.size());
-            for (const auto & kv : counts) {
-                fprintf(stderr, "fattn_path_stats: %s count=%llu\n", kv.first.c_str(), (unsigned long long) kv.second);
-            }
-            fprintf(stderr, "fattn_path_stats: end\n");
-        });
-        return true;
-    }();
-    GGML_UNUSED(registered);
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
-    char key[256];
-    snprintf(key, sizeof(key), "path=%s K=%s V=%s D=%d n_q=%d gqa=%d ncols2=%d kv_len_bucket=%dk",
-        path, ggml_type_name(K->type), ggml_type_name(V->type), (int) Q->ne[0], (int) Q->ne[1],
-        (int) (Q->ne[2] / K->ne[2]), ncols2, (int) (K->ne[1] / 1024));
-    std::lock_guard<std::mutex> lock(mtx);
-    counts[key]++;
+    const uint64_t id = ggml_cuda_ledger_mix(ggml_cuda_ledger_mix(ggml_cuda_ledger_mix(ggml_cuda_ledger_mix(
+        (uint64_t) (uintptr_t) path, (uint64_t) K->type), (uint64_t) V->type), (uint64_t) Q->ne[0]),
+        (uint64_t) ggml_cuda_ledger_width_bucket(Q->ne[1]) * 64 + (uint64_t) (ncols2 + 1));
+    ggml_cuda_ledger_count("cuda.fattn", id, [&](char * buf, size_t size) {
+        char w[16];
+        ggml_cuda_ledger_width_str(Q->ne[1], w, sizeof(w));
+        snprintf(buf, size, "path=%s K=%s V=%s D=%d n_q=%s ncols2=%d", path, ggml_type_name(K->type), ggml_type_name(V->type),
+            (int) Q->ne[0], w, ncols2);
+    });
 }
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)

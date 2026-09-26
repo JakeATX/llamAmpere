@@ -289,7 +289,7 @@ case only; nothing here speaks to batched throughput, which is what those engine
 What changed since v0.2 (`44233f009`), in merge order -- 17 commits, and excluding documentation and
 the vocabulary map, 36 files with 1,802 insertions and 130 deletions:
 
-- `b6d29742b` W5 instrumentation: donor-arena adoption log and fattn path census.
+- `b6d29742b` W5 instrumentation: donor-arena adoption log (plus a development-only flash-attention counter, no longer in the tree).
 - `2d41505a1` cuda: route q8_0-K/turbo3-V verify attention through the fused MMA kernel by default (P5b).
 - `05b49181d` cuda: conversion-free q8_0 K and turbo3 V tile loaders for the fused MMA verify kernel (P5c).
 - `52c723bb0` cuda: fused MMA attention for q8_0-K / q8_0-V caches (P6) -- gives the drafter's own cache the same kernel, and hands back 170-260 MiB.

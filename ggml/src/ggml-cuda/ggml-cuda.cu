@@ -4220,7 +4220,7 @@ static uint64_t ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
     return key;
 }
 
-// why a captured graph could not be replayed (fallback ledger and GGML_CUDA_GRAPH_DEBUG)
+// why a captured graph could not be replayed (fallback ledger)
 struct ggml_cuda_graph_change {
     const char * what = nullptr; // "new", "n_nodes", "ne", "nb", "data", "view_offs", "op_params", "src_data", "src_shape", "other"; "uid" on a uid reuse
     int          op   = -1;      // ggml_op of the first changed node, -1 when not node-specific
@@ -4293,10 +4293,6 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
         if (change) {
             change->what = graph->node_props.empty() ? "new" : "n_nodes";
         }
-        static const bool dbg2 = getenv("GGML_CUDA_GRAPH_DEBUG") != nullptr;
-        if (dbg2) {
-            fprintf(stderr, "cuda-graph-debug: key=%016llx n_nodes %zu -> %d\n", (unsigned long long) graph_key, graph->node_props.size(), cgraph->n_nodes);
-        }
         res = true;
         graph->node_props.resize(cgraph->n_nodes);
     }
@@ -4322,18 +4318,9 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
         }
 
         if (res || memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0) {
-            static const bool dbg = getenv("GGML_CUDA_GRAPH_DEBUG") != nullptr;
-            if (!res && (dbg || change)) {
-                const ggml_tensor * t = cgraph->nodes[i];
-                const char * what = ggml_cuda_graph_change_what(graph->node_props[i], prop);
-                if (dbg) {
-                    fprintf(stderr, "cuda-graph-debug: key=%016llx n_nodes=%d first change at node %d %s op=%s (%s)\n",
-                        (unsigned long long) graph_key, cgraph->n_nodes, i, t->name, ggml_op_name(t->op), what);
-                }
-                if (change) {
-                    change->what = what;
-                    change->op   = t->op;
-                }
+            if (!res && change) {
+                change->what = ggml_cuda_graph_change_what(graph->node_props[i], prop);
+                change->op   = cgraph->nodes[i]->op;
             }
             graph->node_props[i] = prop;
             res = true;
@@ -7191,12 +7178,6 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_ledger_add("cuda.graph", "eager:no_graph_support", 1);
 #endif // USE_CUDA_GRAPH
 
-    {
-        static const bool dbg3 = getenv("GGML_CUDA_GRAPH_DEBUG") != nullptr;
-        if (dbg3) {
-            fprintf(stderr, "cuda-graph-debug: key=%016llx n_nodes=%d use_graph=%d update=%d\n", (unsigned long long) graph_key, cgraph->n_nodes, (int) use_cuda_graph, (int) cuda_graph_update_required);
-        }
-    }
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
         {
