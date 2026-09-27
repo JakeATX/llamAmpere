@@ -89,11 +89,26 @@ static size_t fattn_kvarn_prefill_budget() {
     return budget;
 }
 
-bool ggml_cuda_flash_attn_ext_kvarn_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+// One plan decides eligibility and sizes for the executor below and for the allocator
+// (ggml_cuda_flash_attn_ext_kvarn_prefill_alloc_size, called from ggml_cuda_flash_attn_ext_get_alloc_size), so they
+// cannot disagree. n_kv_max >= n_kv (0 = n_kv) only widens the reservation bound; the executor's grouping depends on
+// n_kv alone, exactly as before.
+struct fattn_kvarn_prefill_plan {
+    bool   ok               = false;
+    bool   grouped          = false;
+    int    heads_per_group  = 0;
+    size_t kv_elements_per_head    = 0;
+    size_t output_elements_per_head = 0;
+    size_t kv_elements      = 0;     // one group's f16 K elements (V has as many)
+    size_t output_bytes     = 0;     // one group's f32 output temporary (grouped only)
+    size_t scratch_bytes    = 0;     // 2*kv_elements*2 + output_bytes
+};
+
+static fattn_kvarn_prefill_plan fattn_kvarn_prefill_make_plan(const int cc, const ggml_tensor * dst) {
+    fattn_kvarn_prefill_plan p;
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
-    const int cc = ggml_cuda_info().devices[ctx.device].cc;
     const int n_kv = ggml_get_op_params_i32(dst, 6);
     const size_t budget = fattn_kvarn_prefill_budget();
     if (budget == 0 || Q->ne[1] < 128 || !ampere_mma_available(cc) || ggml_get_op_params_i32(dst, 7) == GGML_TYPE_I16 ||
@@ -104,7 +119,7 @@ bool ggml_cuda_flash_attn_ext_kvarn_prefill(ggml_backend_cuda_context & ctx, ggm
             K->ne[2] != V->ne[2] || K->ne[2] <= 0 || K->ne[2] > 65535 ||
             dst->src[5] == nullptr || dst->src[6] == nullptr ||
             ggml_get_op_params_i32(dst, 5) != ((4 << 8) | 4) || n_kv <= 0 || n_kv % 256 != 0) {
-        return false;
+        return p;
     }
     GGML_ASSERT(!ggml_cuda_fattn_kvarn_rot(dst)); // [#139] no in-kernel rotation: fattn.cu runs it in separate passes
 
@@ -122,19 +137,69 @@ bool ggml_cuda_flash_attn_ext_kvarn_prefill(ggml_backend_cuda_context & ctx, ggm
         }();
         // Each group includes complete GQA groups. Head-specific masks need a separate slicing policy.
         if (!head_groups || dst->src[3] == nullptr || dst->src[3]->ne[2] != 1) {
-            return false;
+            return p;
         }
         heads_per_group = std::min(size_t(K->ne[2]), budget/(kv_bytes_per_head + output_bytes_per_head));
         if (heads_per_group == 0) {
-            return false;
+            return p;
         }
     }
 
     // Include the output temporary in the byte cap. Other FA workspace remains owned by its launcher.
-    const size_t kv_elements = kv_elements_per_head*heads_per_group;
-    const size_t output_bytes = grouped ? output_bytes_per_head*heads_per_group : 0;
-    ggml_cuda_pool_alloc<half> scratch(ctx.pool(), 2*kv_elements + output_bytes/sizeof(half));
-    float * output = grouped ? (float *) (scratch.ptr + 2*kv_elements) : (float *) dst->data;
+    p.ok = true;
+    p.grouped = grouped;
+    p.heads_per_group = heads_per_group;
+    p.kv_elements_per_head = kv_elements_per_head;
+    p.output_elements_per_head = output_elements_per_head;
+    p.kv_elements = kv_elements_per_head*heads_per_group;
+    p.output_bytes = grouped ? output_bytes_per_head*heads_per_group : 0;
+    p.scratch_bytes = 2*p.kv_elements*sizeof(half) + p.output_bytes;
+    return p;
+}
+
+// Bytes to reserve behind dst in the compute buffer for the expand scratch: dst padded to 128, then an upper bound on
+// the scratch of every n_kv' <= this graph's n_kv (the allocator sizes each graph with its own dst). Ungrouped
+// scratch is n_head_kv * f16 K+V bytes <= budget; grouped scratch is heads_per_group * (f16 K+V + output) <= budget.
+// Returns 0 when the prefill expand does not apply. Before 2026-09-27 this scratch came from the CUDA VMM pool,
+// which never shrinks, so it stayed resident beside the compute buffer.
+size_t ggml_cuda_flash_attn_ext_kvarn_prefill_alloc_size(const int device, const ggml_tensor * dst) {
+    const fattn_kvarn_prefill_plan p = fattn_kvarn_prefill_make_plan(ggml_cuda_info().devices[device].cc, dst);
+    if (!p.ok) {
+        return 0;
+    }
+    const size_t n_head_kv = dst->src[1]->ne[2];
+    const size_t bound = std::max(p.scratch_bytes,
+        std::min(fattn_kvarn_prefill_budget(), n_head_kv*2*p.kv_elements_per_head*sizeof(half)));
+    return GGML_PAD(ggml_nbytes(dst), 128) + bound;
+}
+
+bool ggml_cuda_flash_attn_ext_kvarn_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    const int n_kv = ggml_get_op_params_i32(dst, 6);
+    const fattn_kvarn_prefill_plan plan = fattn_kvarn_prefill_make_plan(ggml_cuda_info().devices[ctx.device].cc, dst);
+    if (!plan.ok) {
+        return false;
+    }
+    const int gqa = Q->ne[2]/K->ne[2];
+    const bool grouped = plan.grouped;
+    const int heads_per_group = plan.heads_per_group;
+    const size_t kv_elements_per_head = plan.kv_elements_per_head;
+    const size_t output_elements_per_head = plan.output_elements_per_head;
+    const size_t kv_elements = plan.kv_elements;
+    const size_t output_bytes = plan.output_bytes;
+
+    // Scratch: the region ggml_cuda_flash_attn_ext_kvarn_prefill_alloc_size reserved behind dst in the compute buffer,
+    // or the pool when dst was not allocated through the buffer type (a view, no buffer) or the region is short.
+    const size_t offset = GGML_PAD(ggml_nbytes(dst), 128);
+    const bool reserved = dst->buffer != nullptr && dst->view_src == nullptr && (uintptr_t) dst->data % 128 == 0 &&
+        offset + plan.scratch_bytes <= ggml_backend_buffer_get_alloc_size(dst->buffer, dst);
+    ggml_cuda_pool_alloc<half> scratch_pool(ctx.pool());
+    half * scratch_ptr = reserved ? (half *) ((char *) dst->data + offset) :
+        scratch_pool.alloc(2*kv_elements + output_bytes/sizeof(half));
+
+    float * output = grouped ? (float *) (scratch_ptr + 2*kv_elements) : (float *) dst->data;
     static const bool trace = [] {
         const char * value = getenv("GGML_KVARN_PREFILL_TRACE");
         return value != nullptr && value[0] == '1';
@@ -150,7 +215,7 @@ bool ggml_cuda_flash_attn_ext_kvarn_prefill(ggml_backend_cuda_context & ctx, ggm
             (const char *) K->data, (const char *) V->data,
             (const char *) dst->src[5]->data, (const int32_t *) dst->src[6]->data,
             K->nb[1], K->nb[2], V->nb[1], V->nb[2],
-            (half2 *) scratch.ptr, (half2 *) (scratch.ptr + elements), n_kv, head_first);
+            (half2 *) scratch_ptr, (half2 *) (scratch_ptr + elements), n_kv, head_first);
         CUDA_CHECK(cudaGetLastError());
 
         ggml_tensor q = *Q;
@@ -169,8 +234,8 @@ bool ggml_cuda_flash_attn_ext_kvarn_prefill(ggml_backend_cuda_context & ctx, ggm
             t->view_src = nullptr;
             t->view_offs = 0;
         }
-        k.data = scratch.ptr;
-        v.data = scratch.ptr + elements;
+        k.data = scratch_ptr;
+        v.data = scratch_ptr + elements;
         ggml_tensor out = *dst;
         out.src[0] = &q;
         out.src[1] = &k;
@@ -199,9 +264,9 @@ bool ggml_cuda_flash_attn_ext_kvarn_prefill(ggml_backend_cuda_context & ctx, ggm
         }
 
         if (trace) {
-            GGML_LOG_INFO("KVarN prefill: queries=%lld positions=%d kv_heads=%d first_head=%d scratch=%zu KiB%s\n",
+            GGML_LOG_INFO("KVarN prefill: queries=%lld positions=%d kv_heads=%d first_head=%d scratch=%zu KiB%s%s\n",
                 (long long) Q->ne[1], n_kv, heads, head_first,
-                (2*kv_elements*sizeof(half) + output_bytes)/1024, grouped ? " grouped" : "");
+                (2*kv_elements*sizeof(half) + output_bytes)/1024, grouped ? " grouped" : "", reserved ? " reserved" : " pool");
         }
         if (gqa > 4) {
             ggml_cuda_flash_attn_ext_mma_f16_case<256, 256, 8, 8>(ctx, &out);

@@ -4245,6 +4245,8 @@ static size_t ggml_cuda_fattn_generic_alloc_size(const int device, const ggml_te
     return f16_extra.end - (uintptr_t) dst->data;
 }
 
+size_t ggml_cuda_flash_attn_ext_kvarn_prefill_alloc_size(int device, const ggml_tensor * dst); // fattn-kvarn-prefill.cu
+
 size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * dst) {
     GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
 
@@ -4265,8 +4267,11 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     const ggml_cuda_fattn_bounded_plan bounded = fused ? ggml_cuda_fattn_bounded_plan() :
         ggml_cuda_fattn_bounded_prefill_plan(device, dst);
     const size_t size_bounded = bounded.offset + bounded.reserve;
-    const size_t size         = fused && ggml_cuda_fattn_alloc_route() ? size_fused :
-                                bounded.heads > 0 ? size_bounded : size_generic;
+    // KVarN 4/4 prefill expand (fattn-kvarn-prefill.cu): its f16 K/V scratch lives behind dst in the compute buffer
+    // (0 when the expand does not apply); the bounded plan above never applies to KVarN ops.
+    const size_t size_kvarn   = dst->src[6] != nullptr ? ggml_cuda_flash_attn_ext_kvarn_prefill_alloc_size(device, dst) : 0;
+    const size_t size         = std::max(size_kvarn, fused && ggml_cuda_fattn_alloc_route() ? size_fused :
+                                bounded.heads > 0 ? size_bounded : size_generic);
 
     if (ggml_cuda_fattn_alloc_log()) {
         static std::mutex mtx;
