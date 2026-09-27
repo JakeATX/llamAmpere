@@ -4,6 +4,7 @@
 #include "convert.cuh"
 #include "vecdotq.cuh"
 #include "turbo-quant.cuh"
+#include "fattn-query-layout.cuh"
 #include "ledger.cuh"
 
 #include <cstdint>
@@ -1390,7 +1391,7 @@ static __global__ void flash_attn_mask_to_KV_max(
 void ggml_cuda_flash_attn_ext_compact_mask(
         const ggml_tensor * mask, int32_t * indices, int32_t * counts, int32_t n_queries, int32_t ncols1, int32_t n_kv_max, cudaStream_t stream);
 
-template<int D, int ncols1, int ncols2> // D == head size
+template<int D, int ncols1, int ncols2, bool compact_q5g6 = false> // D == head size
 __launch_bounds__(D, 1)
 static __global__ void flash_attn_stream_k_fixup_uniform(
         float * __restrict__ dst,
@@ -1402,12 +1403,15 @@ static __global__ void flash_attn_stream_k_fixup_uniform(
         const uint3 fd_iter_j_z_ne12,
         const uint3 fd_iter_j_z,
         const uint3 fd_iter_j) {
+    const int jc = blockIdx.y*ncols2 + blockIdx.z;
+    const int j = ggml_fattn_query_layout<ncols1,ncols2,compact_q5g6>::token(jc);
+    const int c = ggml_fattn_query_layout<ncols1,ncols2,compact_q5g6>::head(jc);
+
+    using query_layout = ggml_fattn_query_layout<ncols1, ncols2, compact_q5g6>;
+
     constexpr int ncols = ncols1*ncols2;
 
     const int tile_idx = blockIdx.x; // One block per output tile.
-    const int j        = blockIdx.y;
-    const int c        = blockIdx.z;
-    const int jc       = j*ncols2 + c;
     const int tid      = threadIdx.x;
 
     // nblocks_stream_k is a multiple of ntiles_dst (== gridDim.x), so each tile gets the same number of blocks.
@@ -1428,11 +1432,11 @@ static __global__ void flash_attn_stream_k_fixup_uniform(
 
     const int zt_Q = z_KV*gqa_ratio + zt_gqa*ncols2; // Global Q head start index.
 
-    if (jt*ncols1 + j >= ne01 || zt_gqa*ncols2 + c >= gqa_ratio) {
+    if (jt*query_layout::token_step + j >= ne01 || zt_gqa*ncols2 + c >= gqa_ratio) {
         return;
     }
 
-    dst += sequence*ne02*ne01*D + jt*ne02*(ncols1*D) + zt_Q*D + (j*ne02 + c)*D + tid;
+    dst += sequence*ne02*ne01*D + jt*ne02*(query_layout::token_step*D) + zt_Q*D + (j*ne02 + c)*D + tid;
 
     // Load the partial result that needs a fixup
     float dst_val = *dst;
@@ -1470,7 +1474,7 @@ static __global__ void flash_attn_stream_k_fixup_uniform(
 
 // General fixup kernel for the case where the number of blocks per tile is not uniform across tiles
 // (blocks_num.x not a multiple of ntiles_dst)
-template <int D, int ncols1, int ncols2> // D == head size
+template <int D, int ncols1, int ncols2, bool compact_q5g6 = false> // D == head size
 __launch_bounds__(D, 1)
 static __global__ void flash_attn_stream_k_fixup_general(
         float * __restrict__ dst,
@@ -1482,12 +1486,15 @@ static __global__ void flash_attn_stream_k_fixup_general(
         const uint3 fd_iter_k_j_z,
         const uint3 fd_iter_k_j,
         const uint3 fd_iter_k) {
+    const int jc = blockIdx.y*ncols2 + blockIdx.z;
+    const int j = ggml_fattn_query_layout<ncols1,ncols2,compact_q5g6>::token(jc);
+    const int c = ggml_fattn_query_layout<ncols1,ncols2,compact_q5g6>::head(jc);
+
+    using query_layout = ggml_fattn_query_layout<ncols1, ncols2, compact_q5g6>;
+
     constexpr int ncols = ncols1*ncols2;
 
     const int bidx0 = blockIdx.x;
-    const int j     = blockIdx.y;
-    const int c     = blockIdx.z;
-    const int jc    = j*ncols2 + c;
     const int tid   = threadIdx.x;
 
     const float * dst_fixup_data = ((const float *) dst_fixup) + gridDim.x*(2*2*ncols);
@@ -1515,11 +1522,11 @@ static __global__ void flash_attn_stream_k_fixup_general(
 
     const int zt_Q = z_KV*gqa_ratio + zt_gqa*ncols2; // Global Q head start index.
 
-    if (jt*ncols1 + j >= ne01 || zt_gqa*ncols2 + c >= gqa_ratio) {
+    if (jt*query_layout::token_step + j >= ne01 || zt_gqa*ncols2 + c >= gqa_ratio) {
         return;
     }
 
-    dst += sequence*ne02*ne01*D + jt*ne02*(ncols1*D) + zt_Q*D + (j*ne02 + c)*D + tid;
+    dst += sequence*ne02*ne01*D + jt*ne02*(query_layout::token_step*D) + zt_Q*D + (j*ne02 + c)*D + tid;
 
     // Load the partial result that needs a fixup:
     float dst_val = 0.0f;
@@ -1629,7 +1636,7 @@ static __global__ void flash_attn_combine_results(
     dst[tid] = VKQ_numerator / VKQ_denominator;
 }
 
-template <int DV, int ncols1, int ncols2>
+template <int DV, int ncols1, int ncols2, bool compact_q5g6 = false>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
     const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const bool use_sparse,
@@ -1637,6 +1644,13 @@ void launch_fattn(
     float * partial_dst = nullptr, float2 * partial_meta = nullptr,
     const int parallel_blocks_override = 0
 ) {
+    if constexpr (compact_q5g6) {
+        GGML_ASSERT(stream_k && !use_sparse && dst->src[0]->ne[1] == 5 && dst->src[0]->ne[3] == 1);
+        GGML_ASSERT(dst->src[0]->ne[2] == 6 * dst->src[1]->ne[2]);
+    }
+
+    using query_layout = ggml_fattn_query_layout<ncols1, ncols2, compact_q5g6>;
+
     constexpr int ncols = ncols1 * ncols2;
 
     const ggml_tensor * Q = dst->src[0];
@@ -1785,7 +1799,7 @@ void launch_fattn(
         }
     }
 
-    const int ntiles_x     = ((Q->ne[1] + ncols1 - 1) / ncols1);
+    const int ntiles_x = query_layout::query_tiles(Q->ne[1]);
     const int gqa_ratio    = Q->ne[2] / K->ne[2];
     const int ntiles_z_gqa = ((gqa_ratio + ncols2 - 1) / ncols2);
     const int ntiles_dst   = ntiles_x * ntiles_z_gqa * K->ne[2] * Q->ne[3];
@@ -1985,7 +1999,7 @@ void launch_fattn(
             const dim3 block_dim_combine(DV, 1, 1);
             const dim3 blocks_num_combine = {(unsigned)ntiles_dst, ncols1, ncols2};
 
-            flash_attn_stream_k_fixup_uniform<DV, ncols1, ncols2>
+            flash_attn_stream_k_fixup_uniform<DV, ncols1, ncols2, compact_q5g6>
                 <<<blocks_num_combine, block_dim_combine, 0, main_stream>>>
                 ((float *) KQV->data, dst_tmp_meta.ptr,
                  Q->ne[1], Q->ne[2], K->ne[2], nblocks_sk,
@@ -2002,7 +2016,7 @@ void launch_fattn(
             const dim3 block_dim_combine(DV, 1, 1);
             const dim3 blocks_num_combine = {blocks_num.x, ncols1, ncols2};
 
-            flash_attn_stream_k_fixup_general<DV, ncols1, ncols2>
+            flash_attn_stream_k_fixup_general<DV, ncols1, ncols2, compact_q5g6>
                 <<<blocks_num_combine, block_dim_combine, 0, main_stream>>>
                 ((float *) KQV->data, dst_tmp_meta.ptr,
                  Q->ne[1], Q->ne[2], gqa_ratio, total_work,

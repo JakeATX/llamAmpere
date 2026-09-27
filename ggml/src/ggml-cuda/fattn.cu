@@ -2678,7 +2678,28 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
 
 template <int DKQ, int DV, ggml_type type_K, ggml_type type_V>
 static void ggml_cuda_flash_attn_ext_mma_turbo_dispatch_ncols1_8(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    const ggml_tensor * Q = dst->src[0]; // ncols2 == 8: (1,8),(2,8),(4,8)
+    const ggml_tensor * Q = dst->src[0];
+    // Experimental: 30 Qwen query/head pairs in the EXISTING physical 4x8
+    // tile. This is not a 5x8 instantiation. Numerical qualification required.
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if constexpr (DKQ == 256 && DV == 256 && type_K == GGML_TYPE_TQ5_0 && type_V == GGML_TYPE_TURBO4_0) {
+        static const bool compact = [] {
+            const char * e = getenv("GGML_CUDA_FATTN_Q5G6_COMPACT");
+            return e != nullptr && strcmp(e, "1") == 0;
+        }();
+        const ggml_tensor * K = dst->src[1];
+        const ggml_tensor * mask = dst->src[3];
+        if (compact && ggml_cuda_info().devices[ctx.device].cc == 860 &&
+                Q->ne[1] == 5 && Q->ne[3] == 1 && Q->ne[2] == 6*K->ne[2] &&
+                K->ne[3] == 1 && dst->src[2]->ne[3] == 1 &&
+                mask != nullptr && mask->ne[1] >= 5 && mask->ne[2] == 1 && mask->ne[3] == 1) {
+            ggml_cuda_fattn_path_note("q5g6_compact32", dst, 8);
+            ggml_cuda_flash_attn_ext_mma_turbo_case<DKQ, DV, 4, 8, type_K, type_V, true>(ctx, dst);
+            return;
+        }
+    }
+#endif
+ // ncols2 == 8: (1,8),(2,8),(4,8)
     // GGML_Q8_TURBO3_MMA_NCOLS1_MIN pads single queries into the (2,8) instance. Default 2 since P5b:
     // the (1,8) instance runs 84 blocks at 4% occupancy (883 us at 100K under ncu) while the padded
     // (2,8) route runs 252 blocks (390 vs 700 us/launch in test-backend-ops perf). Set =1 to disable.
