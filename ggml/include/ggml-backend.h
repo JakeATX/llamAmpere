@@ -336,6 +336,9 @@ extern "C" {
     GGML_API size_t                     ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend);
     // Adopt the donor scheduler's compute buffers (same backends and buffer types); the two schedulers must never compute concurrently
     GGML_API bool                       ggml_backend_sched_set_donor(ggml_backend_sched_t sched, ggml_backend_sched_t donor);
+    // Changes when a recipient scheduler grew this scheduler's compute buffers (see ggml_gallocr_get_epoch): a graph
+    // allocated under an older value must go through ggml_backend_sched_alloc_graph again before it is computed
+    GGML_API uint64_t                   ggml_backend_sched_get_alloc_epoch(ggml_backend_sched_t sched);
 
     GGML_API void                 ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend);
     GGML_API ggml_backend_t       ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node);

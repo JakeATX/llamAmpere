@@ -2502,6 +2502,11 @@ bool ggml_backend_sched_set_donor(ggml_backend_sched_t sched, ggml_backend_sched
     return true;
 }
 
+uint64_t ggml_backend_sched_get_alloc_epoch(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    return ggml_gallocr_get_epoch(sched->galloc);
+}
+
 size_t ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend) {
     GGML_ASSERT(sched);
     int backend_index = ggml_backend_sched_backend_id(sched, backend);

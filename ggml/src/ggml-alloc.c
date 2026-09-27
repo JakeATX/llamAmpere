@@ -444,6 +444,31 @@ static struct vbuffer * ggml_vbuffer_alloc(ggml_backend_buffer_type_t buft, cons
     return buf;
 }
 
+// a buffer whose every chunk is the larger of the donor's chunk and the chunk this allocator needs (grown donor)
+static struct vbuffer * ggml_vbuffer_alloc_max(ggml_backend_buffer_type_t buft, const struct ggml_dyn_tallocr * talloc,
+        struct vbuffer * donor, enum ggml_backend_buffer_usage usage) {
+    struct vbuffer * buf = (struct vbuffer *)calloc(1, sizeof(struct vbuffer));
+    if (buf == NULL) {
+        return NULL;
+    }
+    buf->refs = 1;
+
+    for (int n = 0; n < GGML_VBUFFER_MAX_CHUNKS; n++) {
+        const size_t need = n < talloc->n_chunks ? talloc->chunks[n]->max_size : 0;
+        const size_t cap  = ggml_vbuffer_chunk_size(donor, n);
+        if (n >= talloc->n_chunks && donor->chunks[n] == NULL) {
+            break;
+        }
+        buf->chunks[n] = ggml_backend_buft_alloc_buffer(buft, need > cap ? need : cap);
+        if (buf->chunks[n] == NULL) {
+            ggml_vbuffer_free(buf);
+            return NULL;
+        }
+        ggml_backend_buffer_set_usage(buf->chunks[n], usage);
+    }
+    return buf;
+}
+
 static void ggml_vbuffer_tensor_alloc(struct vbuffer * buf, struct ggml_tensor * tensor, struct buffer_address buf_addr) {
     void * base = ggml_backend_buffer_get_base(buf->chunks[buf_addr.chunk]);
     void * addr = (char *)base + buf_addr.offset;
@@ -488,6 +513,7 @@ struct ggml_gallocr {
     ggml_backend_buffer_type_t * bufts; // [n_buffers]
     struct vbuffer ** buffers; // [n_buffers]
     struct ggml_gallocr * donor; // optional: adopt this allocator's buffers when they are large enough
+    uint64_t epoch; // bumped when a recipient replaces this allocator's buffers (grown donor): its allocated graphs are stale
     struct ggml_dyn_tallocr ** buf_tallocs; // [n_buffers]
     int n_buffers;
 
@@ -597,6 +623,10 @@ void ggml_gallocr_set_donor(ggml_gallocr_t galloc, ggml_gallocr_t donor) {
         }
     }
     galloc->donor = donor;
+}
+
+uint64_t ggml_gallocr_get_epoch(ggml_gallocr_t galloc) {
+    return galloc != NULL ? galloc->epoch : 0;
 }
 
 bool ggml_gallocr_shares_buffer(ggml_gallocr_t galloc, int buffer_id) {
@@ -985,8 +1015,31 @@ static bool ggml_gallocr_reserve_n_impl(
                     GGML_LOG_INFO("%s: sharing the %s compute buffer of the donor context (%.02f MiB)\n",
                         __func__, ggml_backend_buft_name(galloc->bufts[i]), ggml_vbuffer_size(db) / 1024.0 / 1024.0);
                 } else {
-                    GGML_LOG_WARN("%s: donor %s compute buffer too small (%.02f MiB < %.02f MiB needed), allocating privately\n",
-                        __func__, ggml_backend_buft_name(galloc->bufts[i]), ggml_vbuffer_size(db) / 1024.0 / 1024.0, new_size / 1024.0 / 1024.0);
+                    // Grow the donor instead of allocating a second, private buffer: one buffer sized to the larger of
+                    // the two needs replaces the donor's and both allocators share it (the graphs never run
+                    // concurrently). The donor's graphs that were allocated in the old buffer are stale from here on:
+                    // its next alloc_graph re-initializes them against the new base, and the epoch bump tells callers
+                    // that reuse an allocated graph without alloc_graph (llama graph reuse) to allocate again.
+                    // The old buffer is freed only when no other allocator still references it.
+                    struct vbuffer * nb = ggml_vbuffer_alloc_max(galloc->bufts[i], galloc->buf_tallocs[i], db, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+                    if (nb != NULL) {
+                        const size_t old_size = ggml_vbuffer_size(db);
+                        for (int j = 0; j < galloc->donor->n_buffers; j++) {
+                            if (galloc->donor->buffers[j] == db) {
+                                galloc->donor->buffers[j] = nb;
+                            }
+                        }
+                        galloc->donor->epoch++;
+                        ggml_vbuffer_free(db); // the donor's reference
+                        nb->refs++;
+                        galloc->buffers[i] = nb;
+                        GGML_LOG_INFO("%s: donor %s compute buffer too small (%.02f MiB < %.02f MiB needed): grown to %.02f MiB and shared\n",
+                            __func__, ggml_backend_buft_name(galloc->bufts[i]), old_size / 1024.0 / 1024.0, new_size / 1024.0 / 1024.0,
+                            ggml_vbuffer_size(nb) / 1024.0 / 1024.0);
+                    } else {
+                        GGML_LOG_WARN("%s: donor %s compute buffer too small (%.02f MiB < %.02f MiB needed) and could not be grown, allocating privately\n",
+                            __func__, ggml_backend_buft_name(galloc->bufts[i]), ggml_vbuffer_size(db) / 1024.0 / 1024.0, new_size / 1024.0 / 1024.0);
+                    }
                 }
             }
             if (no_alloc) {

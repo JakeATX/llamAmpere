@@ -77,6 +77,9 @@ GGML_API size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_i
 // Only valid when the two allocators' graphs never execute concurrently (the caller must synchronize).
 GGML_API void ggml_gallocr_set_donor(ggml_gallocr_t galloc, ggml_gallocr_t donor);
 GGML_API bool ggml_gallocr_shares_buffer(ggml_gallocr_t galloc, int buffer_id);
+// Incremented when a recipient grows this (donor) allocator's buffers: graphs it allocated before are stale and must be
+// allocated again (ggml_gallocr_alloc_graph) before they are computed.
+GGML_API uint64_t ggml_gallocr_get_epoch(ggml_gallocr_t galloc);
 
 // Utils
 // Create a buffer and allocate all the tensors in a ggml_context

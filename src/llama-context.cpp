@@ -972,7 +972,12 @@ llama_context::~llama_context() {
 
             const size_t size_exp = backend_buf_exp_size[i];
             const size_t size_act = ggml_backend_sched_get_buffer_size(sched.get(), backend);
-            if (size_exp == size_act) {
+            if (size_exp != size_act && backend_buf_exp_epoch != ggml_backend_sched_get_alloc_epoch(sched.get())) {
+                // a peer context sharing this compute buffer (the MTP drafter) grew it after this context reserved
+                LLAMA_LOG_DEBUG("%s: %10s compute buffer size is %8.4f MiB, grown from %8.4f MiB by a peer sharing it\n",
+                                __func__, ggml_backend_buft_name(buft), size_act / (1024.0 * 1024.0),
+                                size_exp / (1024.0 * 1024.0));
+            } else if (size_exp == size_act) {
                 LLAMA_LOG_DEBUG("%s: %10s compute buffer size is %8.4f MiB, matches expectation of %8.4f MiB\n",
                                 __func__, ggml_backend_buft_name(buft), size_act / (1024.0 * 1024.0),
                                 size_exp / (1024.0 * 1024.0));
@@ -1900,6 +1905,7 @@ void llama_context::sched_reserve() {
         ggml_backend_buffer_type_t buft    = backend_buft[i];
         if (!model.hparams.no_alloc) {
             backend_buf_exp_size[i] = ggml_backend_sched_get_buffer_size(sched.get(), backend);
+            backend_buf_exp_epoch   = ggml_backend_sched_get_alloc_epoch(sched.get());
         }
         if (backend_buf_exp_size[i] > 1) {
             LLAMA_LOG_INFO("%s: %10s compute buffer size = %8.2f MiB\n", __func__, ggml_backend_buft_name(buft),
@@ -2785,7 +2791,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
+    // a peer context that grew the shared compute buffer (ggml_gallocr donor) invalidates this context's allocated graph
+    if (!graph_reuse_disable && gf_res_prev_active == res && gf_res_prev_epoch == ggml_backend_sched_get_alloc_epoch(sched.get()) &&
+            res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -2826,6 +2834,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
         }
 
         gf_res_prev_active = res;
+        gf_res_prev_epoch  = ggml_backend_sched_get_alloc_epoch(sched.get());
     }
 
     // set the input data for the input tensors
