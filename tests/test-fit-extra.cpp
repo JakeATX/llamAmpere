@@ -34,10 +34,19 @@ int main() {
     }
 
     {
-        // a draft graph larger than the main one gets a private buffer of its own size (ggml_gallocr donor rule)
+        // a draft graph larger than the main one grows the shared buffer to the larger graph (ggml_gallocr donor rule)
         const common_fit_extra_memory at = common_fit_extra_memory_at(mtp, 4096, 4096, 100*MiB, true);
         expect(at.context == 16*MiB, "the measured context should be kept unscaled");
-        expect(at.compute == 126*MiB, "a compute buffer larger than the donor's should be counted in full");
+        expect(at.compute == 26*MiB, "a compute buffer larger than the donor's should add only the growth of the shared buffer");
+    }
+
+    {
+        // KVarN 3/3 target at 110592 tokens: main graph 460.03 MiB, MTP draft graph 632.03 MiB, both measured at the
+        // probed context -> the shared buffer grows by 172 MiB
+        const common_fit_extra_memory kvarn_mtp = {0, 165*MiB + MiB/2, 632*MiB + 32*1024};
+        const common_fit_extra_memory at = common_fit_extra_memory_at(kvarn_mtp, 110592, 110592, 460*MiB + 32*1024, true);
+        expect(at.context == 165*MiB + MiB/2, "a measurement at the probed context should be used as is");
+        expect(at.compute == 172*MiB, "the shared buffer should grow by the difference of the two graphs");
     }
 
     {
