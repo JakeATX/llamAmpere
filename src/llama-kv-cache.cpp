@@ -242,7 +242,11 @@ llama_kv_cache::llama_kv_cache(
         GGML_ASSERT(kvarn.group == 128 && kvarn.sink % 64 == 0 && kvarn.tail % kvarn.group == 0);
         GGML_ASSERT(kv_size % 256 == 0 && "KVarN cache: the attention kernel needs n_kv padded to 256");
         kvarn_cap           = GGML_PAD(std::max(kvarn.tail, kvarn.tail_max) + kvarn.group + 2*kvarn.n_ubatch, 128); // see apply_ubatch
-        kvarn_n_groups      = kv_size > kvarn.sink ? (kv_size - kvarn.sink + kvarn.group - 1)/kvarn.group : 1;
+        // Records the pool can ever hold: every seal target is sink + group*floor((end - tail - sink)/group) with
+        // end <= kv_size (apply_ubatch: end = pos0 < kv_size; compress_kvarn_idle: end = accepted_end <= kv_size),
+        // so the newest `tail` positions never reach the body. Sizing for kv_size - sink kept `tail` positions'
+        // worth of records (32 groups/head at tail 4096) that no path can seal.
+        kvarn_n_groups      = kv_size >= kvarn.sink + kvarn.tail + kvarn.group ? (kv_size - kvarn.sink - kvarn.tail)/kvarn.group : 1;
         kvarn_n_groups_seal = (kvarn.n_ubatch + kvarn.group - 1)/kvarn.group + 1;
         if (kvarn.tail_max > kvarn.tail) {
             kvarn_n_groups_seal += (kvarn.tail_max - kvarn.tail)/kvarn.group;
