@@ -1332,6 +1332,22 @@ struct llm_graph_context {
                   float   kq_scale,
                     int   il) const;
 
+    // TurboQuant/TQ K caches hold WHT-rotated K (the set_rows quantizer rotates on store): pad Q per head
+    // to the cached K head size and rotate it to match. No-op for other K types and for KVarN caches
+    // (their tq6_0 staging K is stored in the KVarN Hadamard basis without the turbo WHT). Any graph that calls
+    // build_attn_mha on llama_kv_cache views must apply this and build_attn_turbo_v_out as build_attn does.
+    ggml_tensor * build_attn_turbo_q(
+            ggml_tensor * q,       // [n_embd_head_q, n_head_q, n_tokens]
+      const ggml_tensor * k,       // K cache view (its type selects the rotation)
+      const llama_kv_cache_context * mctx_cur) const;
+
+    // TurboQuant: build_attn_mha undoes the V rotation on its output; when the cached V head was padded
+    // to 128, cut the output back to n_embd_head_v(il). No-op for other V types.
+    ggml_tensor * build_attn_turbo_v_out(
+            ggml_tensor * cur,     // [n_embd_head_v_cache * n_head_q, n_tokens] build_attn_mha output
+      const ggml_tensor * v,       // V cache view
+                    int   il) const;
+
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 
     ggml_tensor * build_attn(

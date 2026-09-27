@@ -738,6 +738,17 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
                     n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
                     ext_factor, attn_factor, beta_fast, beta_slow);
 
+            // attention below reads the cache through build_attn_mha directly, so it applies the
+            // same rotations build_attn(llm_graph_input_attn_kv *) does, in the same order
+            if (inp_attn->self_k_rot) {
+                Q_b = llama_mul_mat_hadamard(ctx0, Q_b, inp_attn->self_k_rot);
+                K_b = llama_mul_mat_hadamard(ctx0, K_b, inp_attn->self_k_rot);
+            }
+
+            if (inp_attn->self_v_rot) {
+                V_b = llama_mul_mat_hadamard(ctx0, V_b, inp_attn->self_v_rot);
+            }
+
             ggml_build_forward_expand(gf, Q_b);
             ggml_build_forward_expand(gf, V_b);
             ggml_build_forward_expand(gf, K_b);
@@ -757,7 +768,16 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
 
             ggml_tensor * mask_b = ggml_view_2d(ctx0, kq_mask, n_kv, width, kq_mask->nb[1], (size_t) row0*kq_mask->nb[1]);
 
+            // TurboQuant/TQ K caches hold WHT-rotated K: Q must be rotated to match
+            Q_b = build_attn_turbo_q(Q_b, k_view, mctx_kv);
+
             cur_b = build_attn_mha(Q_b, k_view, v_view, nullptr, mask_b, nullptr, nullptr, 0, kq_scale, il);
+
+            cur_b = build_attn_turbo_v_out(cur_b, v_view, il);
+
+            if (inp_attn->self_v_rot) {
+                cur_b = llama_mul_mat_hadamard(ctx0, cur_b, inp_attn->self_v_rot);
+            }
 
             cur_b = ggml_mul(ctx0, cur_b, ggml_sigmoid(ctx0, gate_b));
             cur_b = build_lora_mm(layer.wo, cur_b, layer.wo_s);
