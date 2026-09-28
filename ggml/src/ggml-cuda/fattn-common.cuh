@@ -1999,6 +1999,9 @@ void launch_fattn(
             const dim3 block_dim_combine(DV, 1, 1);
             const dim3 blocks_num_combine = {(unsigned)ntiles_dst, ncols1, ncols2};
 
+            if constexpr (compact_q5g6) {
+                ggml_ledger_add("cuda.fattn.fixup", "q5g6_uniform", 1);
+            }
             flash_attn_stream_k_fixup_uniform<DV, ncols1, ncols2, compact_q5g6>
                 <<<blocks_num_combine, block_dim_combine, 0, main_stream>>>
                 ((float *) KQV->data, dst_tmp_meta.ptr,
@@ -2016,6 +2019,9 @@ void launch_fattn(
             const dim3 block_dim_combine(DV, 1, 1);
             const dim3 blocks_num_combine = {blocks_num.x, ncols1, ncols2};
 
+            if constexpr (compact_q5g6) {
+                ggml_ledger_add("cuda.fattn.fixup", "q5g6_general", 1);
+            }
             flash_attn_stream_k_fixup_general<DV, ncols1, ncols2, compact_q5g6>
                 <<<blocks_num_combine, block_dim_combine, 0, main_stream>>>
                 ((float *) KQV->data, dst_tmp_meta.ptr,

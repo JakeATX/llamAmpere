@@ -19,6 +19,7 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
+#include "ggml-ledger.h"
 
 #include <algorithm>
 #include <atomic>
@@ -15446,6 +15447,10 @@ int main(int argc, char ** argv) {
             usage(argv);
             return 1;
         }
+    }
+
+    if (getenv("GGML_TEST_BACKEND_LEDGER") != nullptr) {
+        ggml_ledger_set_enabled(true);
     }
 
     // load and enumerate backends
