@@ -10111,6 +10111,29 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
+struct test_flash_attn_ext_causal : public test_flash_attn_ext {
+    using test_flash_attn_ext::test_flash_attn_ext;
+
+    std::string vars() override {
+        return test_flash_attn_ext::vars() + ",causal=1";
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_flash_attn_ext::initialize_tensors(ctx);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "m") != 0) {
+                continue;
+            }
+            std::vector<ggml_fp16_t> data(ggml_nelements(t), ggml_fp32_to_fp16(-INFINITY));
+            for (int64_t row = 0; row < ggml_nrows(t); ++row) {
+                const int64_t visible = std::max<int64_t>(0, t->ne[0] - t->ne[1] + row % t->ne[1] + 1);
+                std::fill_n(data.data() + row*t->ne[0], visible, ggml_fp32_to_fp16(0.0f));
+            }
+            ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(ggml_fp16_t));
+        }
+    }
+};
+
 struct test_flash_attn_ext_turbo4_vec : public test_flash_attn_ext {
     const int64_t head_dim;
 
@@ -13723,6 +13746,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 1024, nb, true, true, 0, 10, GGML_PREC_F32, types.first, types.second, {0, 2, 1, 3}));
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 1024, nb, true, true, 8, 10, GGML_PREC_F32, types.first, types.second));
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 1024, nb, false, false, 0, 0, GGML_PREC_F32, types.first, types.second));
+            test_cases.emplace_back(new test_flash_attn_ext_causal(256, 256, 4, {6, 1}, 1024, nb, true, false, 0, 0, GGML_PREC_F32, types.first, types.second, {0, 2, 1, 3}, false));
         }
     }
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 13, {6, 1}, 4096, 5, true, true, 0, 10, GGML_PREC_F32, GGML_TYPE_TQ5_0, GGML_TYPE_TURBO4_0));
@@ -14260,7 +14284,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (int64_t nb = 1; nb <= 8; ++nb) {
             for (const auto & types : {std::pair{GGML_TYPE_TQ5_0, GGML_TYPE_TURBO4_0},
                                       std::pair{GGML_TYPE_Q8_0, GGML_TYPE_Q8_0}}) {
-                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, types.first, types.second, {0, 2, 1, 3}, false));
+                test_cases.emplace_back(new test_flash_attn_ext_causal(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, types.first, types.second, {0, 2, 1, 3}, false));
             }
         }
     }
