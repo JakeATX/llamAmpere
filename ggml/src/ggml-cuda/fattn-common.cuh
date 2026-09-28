@@ -1403,11 +1403,11 @@ static __global__ void flash_attn_stream_k_fixup_uniform(
         const uint3 fd_iter_j_z_ne12,
         const uint3 fd_iter_j_z,
         const uint3 fd_iter_j) {
-    const int jc = blockIdx.y*ncols2 + blockIdx.z;
-    const int j = ggml_fattn_query_layout<ncols1,ncols2,compact_q5g6>::token(jc);
-    const int c = ggml_fattn_query_layout<ncols1,ncols2,compact_q5g6>::head(jc);
-
     using query_layout = ggml_fattn_query_layout<ncols1, ncols2, compact_q5g6>;
+
+    const int jc = blockIdx.y*ncols2 + blockIdx.z;
+    const int j = query_layout::token(jc);
+    const int c = query_layout::head(jc);
 
     constexpr int ncols = ncols1*ncols2;
 
@@ -1486,11 +1486,11 @@ static __global__ void flash_attn_stream_k_fixup_general(
         const uint3 fd_iter_k_j_z,
         const uint3 fd_iter_k_j,
         const uint3 fd_iter_k) {
-    const int jc = blockIdx.y*ncols2 + blockIdx.z;
-    const int j = ggml_fattn_query_layout<ncols1,ncols2,compact_q5g6>::token(jc);
-    const int c = ggml_fattn_query_layout<ncols1,ncols2,compact_q5g6>::head(jc);
-
     using query_layout = ggml_fattn_query_layout<ncols1, ncols2, compact_q5g6>;
+
+    const int jc = blockIdx.y*ncols2 + blockIdx.z;
+    const int j = query_layout::token(jc);
+    const int c = query_layout::head(jc);
 
     constexpr int ncols = ncols1*ncols2;
 

@@ -1564,6 +1564,10 @@ struct test_case {
                 // machine-parseable: op, shape vars, error vs the CPU reference
                 printf("TBOERR\t%s\t%s\t%.12g\n", ggml_op_desc(t1), ud->tc->vars().c_str(), err);
             }
+            static const bool print_nmse = getenv("GGML_TEST_BACKEND_PRINT_NMSE") != nullptr;
+            if (print_nmse && t1->op == GGML_OP_FLASH_ATTN_EXT) {
+                printf("[FLASH_ATTN_EXT] NMSE=%.12g (%s)\n", err, ud->tc->vars().c_str());
+            }
             if (err > ud->tc->max_err(ud->backend1)) {
                 printf("[%s] ERR = %.9f > %.9f ", ggml_op_desc(t1), err, ud->tc->max_err(ud->backend1));
                 //for (int i = 0; i < (int) f1.size(); i++) {
@@ -13704,6 +13708,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // D256 decode/verify: mixed KV types, Stream-K fixup, and an incomplete KV tile.
+    for (const auto & types : {std::pair{GGML_TYPE_TQ5_0, GGML_TYPE_TURBO4_0},
+                              std::pair{GGML_TYPE_TQ6_0, GGML_TYPE_TURBO4_0},
+                              std::pair{GGML_TYPE_Q8_0,  GGML_TYPE_TURBO4_0},
+                              std::pair{GGML_TYPE_TQ6_0, GGML_TYPE_TQ5_0}}) {
+        for (int64_t nb = 1; nb <= 8; ++nb) {
+            for (int64_t nh : {4, 13}) {
+                for (int64_t kv : {1024, 1057}) {
+                    test_cases.emplace_back(new test_flash_attn_ext(256, 256, nh, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, types.first, types.second));
+                }
+            }
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 1024, nb, true, true, 0, 10, GGML_PREC_F32, types.first, types.second, {0, 2, 1, 3}));
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 1024, nb, true, true, 8, 10, GGML_PREC_F32, types.first, types.second));
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 1024, nb, false, false, 0, 0, GGML_PREC_F32, types.first, types.second));
+        }
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 13, {6, 1}, 4096, 5, true, true, 0, 10, GGML_PREC_F32, GGML_TYPE_TQ5_0, GGML_TYPE_TURBO4_0));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 2}, 1024, 5, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TQ5_0, GGML_TYPE_TURBO4_0));
+
     // asymmetric head_dim (hsk != hsv) with one or both sides not 64-aligned
     test_cases.emplace_back(new test_flash_attn_ext(72, 64, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(64, 72, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
@@ -14230,6 +14253,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     add_iq4xs_k4_cases(test_cases, true);
+
+    // Decode/verify attention bandwidth at GQA 6, with q8_0 as a control.
+    for (int64_t kv : {32768, 102400}) {
+        for (int64_t nb = 1; nb <= 8; ++nb) {
+            for (const auto & types : {std::pair{GGML_TYPE_TQ5_0, GGML_TYPE_TURBO4_0},
+                                      std::pair{GGML_TYPE_Q8_0, GGML_TYPE_Q8_0}}) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, types.first, types.second, {0, 2, 1, 3}));
+            }
+        }
+    }
 
     // elementwise chain vs the tuned multi-ADD kernel (GGML_CUDA_FUSE_CHAIN=0 to compare)
     test_cases.emplace_back(new test_elem_chain_fusion({4096, 64, 1, 1}, false, false, true));

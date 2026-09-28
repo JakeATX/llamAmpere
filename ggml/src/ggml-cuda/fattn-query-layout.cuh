@@ -1,7 +1,6 @@
 #pragma once
-// Physical tensor-core columns need not form a rectangular token/head grid.
-// Keep this header free of CUDA runtime dependencies so its address contract can
-// be exhaustively tested by an ordinary C++ compiler.
+
+// Map physical tensor-core columns to query tokens and heads.
 #if defined(__CUDACC__) || defined(__HIPCC__)
 # define GGML_FATTN_LAYOUT_HD __host__ __device__
 #else
@@ -13,7 +12,6 @@ struct ggml_fattn_query_layout {
     static_assert(query_rows > 0 && head_columns > 0, "invalid physical shape");
     static_assert(!compact_q5g6 || (query_rows == 4 && head_columns == 8),
                   "compact Q5/G6 requires the existing physical 4x8 tile");
-    static constexpr int slots = query_rows * head_columns;
     static constexpr int token_step = compact_q5g6 ? 5 : query_rows;
     static constexpr int mask_rows = token_step;
     GGML_FATTN_LAYOUT_HD static constexpr int token(int slot) {
@@ -22,18 +20,12 @@ struct ggml_fattn_query_layout {
     GGML_FATTN_LAYOUT_HD static constexpr int head(int slot) {
         return slot % (compact_q5g6 ? 6 : head_columns);
     }
-    // Slots 30 and 31 are padding. Their internal arithmetic can read mask row
-    // zero, but must NEVER form an address into nonexistent mask row five.
+    // Padding slots use mask row zero; their outputs are not stored.
     GGML_FATTN_LAYOUT_HD static constexpr int mask_row(int slot) {
         return compact_q5g6 && token(slot) >= 5 ? 0 : token(slot);
     }
     GGML_FATTN_LAYOUT_HD static constexpr int query_tiles(int tokens) {
         return (tokens + token_step - 1) / token_step;
-    }
-    GGML_FATTN_LAYOUT_HD static constexpr bool live(int slot, int tokens, int gqa,
-                                                   int token_tile=0, int head_tile=0) {
-        return slot >= 0 && slot < slots && token_tile * token_step + token(slot) < tokens
-            && head_tile * head_columns + head(slot) < gqa;
     }
 };
 #undef GGML_FATTN_LAYOUT_HD
