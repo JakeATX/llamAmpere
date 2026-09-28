@@ -10551,6 +10551,9 @@ struct test_generic_op : public test_case {
     void initialize_tensors(ggml_context * ctx) override {
         ggml_tensor * out = ggml_get_tensor(ctx, "out");
 
+        // Initialize sentinels, view backing tensors and untouched output rows.
+        test_case::initialize_tensors(ctx);
+
         std::random_device rd;
         std::default_random_engine rng(rd());
 
