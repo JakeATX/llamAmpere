@@ -20,8 +20,8 @@
 #include "fattn-common.cuh"
 #include "fattn-mma-f16.cuh"
 
-template <int DKQ, int DV, int ncols1, int ncols2, ggml_type type_K, ggml_type type_V, bool compact_q5g6 = false>
-void ggml_cuda_flash_attn_ext_mma_turbo_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+template <int DKQ, int DV, int ncols1, int ncols2, ggml_type type_K, ggml_type type_V, bool compact_q5g6, bool early_v>
+static void ggml_cuda_flash_attn_ext_mma_turbo_case_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     using query_layout = ggml_fattn_query_layout<ncols1, ncols2, compact_q5g6>;
 
     const ggml_tensor * KQV = dst;
@@ -78,11 +78,15 @@ void ggml_cuda_flash_attn_ext_mma_turbo_case(ggml_backend_cuda_context & ctx, gg
         constexpr bool stage_v = ggml_cuda_fattn_turbo_stage_v<DKQ, DV, ncols2, type_K, type_V>(); // tq6/tq5 V: K-only staging
         GGML_ASSERT(dst->src[1]->nb[1] % k_align == 0 && dst->src[1]->nb[2] % k_align == 0 && ((uintptr_t) dst->src[1]->data) % k_align == 0);
         GGML_ASSERT(!stage_v || (dst->src[2]->nb[1] % v_align == 0 && dst->src[2]->nb[2] % v_align == 0 && ((uintptr_t) dst->src[2]->data) % v_align == 0));
-        nbytes_shared_total = std::max(nbytes_shared_total, stage_off + (size_t) ggml_cuda_fattn_turbo_stage_bytes<DKQ, DV, ncols2, type_K, type_V>(nbatch_fa));
+        const size_t extra_v = early_v ? nbatch_fa * ggml_cuda_fattn_turbo_stage_v_pitch<DV, type_V>() : 0;
+        nbytes_shared_total = std::max(nbytes_shared_total, stage_off + (size_t) ggml_cuda_fattn_turbo_stage_bytes<DKQ, DV, ncols2, type_K, type_V>(nbatch_fa) + extra_v);
     }
 
     float logit_softcap;
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
+    if constexpr (early_v) {
+        ggml_ledger_addf("cuda.fattn.early_v", 1, "cols=%dx%d,compact=%d,softcap=%d", ncols1, ncols2, compact_q5g6, logit_softcap != 0.0f);
+    }
 
 #if defined(GGML_USE_HIP)
     using fattn_kernel_ptr_t = const void*;
@@ -92,7 +96,7 @@ void ggml_cuda_flash_attn_ext_mma_turbo_case(ggml_backend_cuda_context & ctx, gg
     fattn_kernel_t fattn_kernel;
     if (logit_softcap == 0.0f) {
         constexpr bool use_logit_softcap = false;
-        fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, /* use_sparse */ false, type_K, type_V, /* output_partial */ false, preserve_cand, compact_q5g6>;
+        fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, /* use_sparse */ false, type_K, type_V, /* output_partial */ false, preserve_cand, compact_q5g6, early_v>;
 
 #if !defined(GGML_USE_MUSA)
         static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
@@ -103,7 +107,7 @@ void ggml_cuda_flash_attn_ext_mma_turbo_case(ggml_backend_cuda_context & ctx, gg
 #endif // !defined(GGML_USE_MUSA)
     } else {
         constexpr bool use_logit_softcap = true;
-        fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, /* use_sparse */ false, type_K, type_V, /* output_partial */ false, preserve_cand, compact_q5g6>;
+        fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, /* use_sparse */ false, type_K, type_V, /* output_partial */ false, preserve_cand, compact_q5g6, early_v>;
 
 #if !defined(GGML_USE_MUSA)
         static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
@@ -119,6 +123,29 @@ void ggml_cuda_flash_attn_ext_mma_turbo_case(ggml_backend_cuda_context & ctx, gg
     launch_fattn<DV, ncols1, ncols2, compact_q5g6>
         (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa,
          /*need_f16_K=*/false, /*need_f16_V=*/false, /*stream_k=*/true, /*use_sparse=*/false, warp_size_host);
+}
+
+
+template <int DKQ, int DV, int ncols1, int ncols2, ggml_type type_K, ggml_type type_V, bool compact_q5g6 = false>
+void ggml_cuda_flash_attn_ext_mma_turbo_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if constexpr (DKQ == 256 && DV == 256 && ncols2 == 8 && type_K == GGML_TYPE_TQ5_0 && type_V == GGML_TYPE_TURBO4_0 &&
+                  ggml_cuda_fattn_turbo_stage_v<DKQ, DV, ncols2, type_K, type_V>()) {
+        static const bool early_v = [] {
+            const char * e = getenv("GGML_VL_AT");
+            return e != nullptr && strcmp(e, "1") == 0;
+        }();
+        const ggml_tensor * Q = dst->src[0];
+        const ggml_tensor * K = dst->src[1];
+        if (early_v && ggml_cuda_info().devices[ctx.device].cc == 860 && Q->ne[1] >= 1 && Q->ne[1] <= 8 &&
+                Q->ne[2] == 6*K->ne[2] && K->ne[1] % FATTN_KQ_STRIDE == 0) {
+            ggml_cuda_flash_attn_ext_mma_turbo_case_impl<DKQ, DV, ncols1, ncols2, type_K, type_V, compact_q5g6, true>(ctx, dst);
+            return;
+        }
+    }
+#endif
+    // Other widths, pairs, devices, and GQA layouts keep the existing pipeline.
+    ggml_cuda_flash_attn_ext_mma_turbo_case_impl<DKQ, DV, ncols1, ncols2, type_K, type_V, compact_q5g6, false>(ctx, dst);
 }
 
 
