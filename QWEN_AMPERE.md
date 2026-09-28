@@ -1,5 +1,8 @@
 # llamAmpere
 
+**v0.4 (2026-09-28)** is the current release: [release notes](docs/llamampere-v0.4/RELEASE_NOTES.md), build and
+run commands in [Build and run](#build-and-run). The measurements below this line are from v0.3 and earlier.
+
 Qwen3.8-27B on one Ampere card (RTX 3090 / 3090 Ti, 24 GB): a fork of
 [TheTom/llama-cpp-turboquant](https://github.com/TheTom/llama-cpp-turboquant)
 (TurboQuant+ KV cache, native MTP speculative decoding) carrying SM86-specific
@@ -34,7 +37,7 @@ Measured on a 3090 Ti at 350 W with the ATX-IQ4_XS-M quant (working name ATX-4-X
 | long session from 56K to 207K KV, temperature 1, MTP-3 (v0.3) | 95.1 tok/s at 56K, 85.2 at 207K; -9.6% first five windows to last five (TurboQuant -21.6%) |
 | single stream vs vLLM / SGLang at 32K / 64K (v0.3) | 112.4 / 100.7 tok/s; tuned vLLM MTP-4 101.7 / 90.3, tuned SGLang 68.6 / 64.4 |
 | largest measured fit | 245,760-token window with a 240K prompt, 22.1 GiB ready for the server (measured before v0.3; P6 uses 170-260 MiB less). Counting the whole card, a desktop leaves room for 237,568 |
-| context by KV cache type under a 23 GB card budget | measured at full depth: q8_0/turbo3 237,568 (shipped), q8_0/q5_1 204,800, q8_0/q8_0 180,224, see [KV cache options](#kv-cache-options) |
+| context by KV cache type under a 23 GB card budget | measured at full depth: q8_0/turbo3 237,568 (shipped), q8_0/q5_1 204,800, q8_0/q8_0 180,224, see [KV cache options](#kv-cache-options-v03) |
 | agent session 100K -> 245K context | 120K generated tokens, 52 tok/s cumulative (60 at 110K, 47 at 245K), 76% draft acceptance |
 | per speculative round vs Q3_K_XL / Q4_K_M | +9-10% / +23% |
 
@@ -86,16 +89,68 @@ The experiment log, with hypotheses, results, and what did not work, is
 
 ## Build and run
 
-> **v0.4:** the commands in this section are v0.3's (`q8_0`/`turbo3` cache, draft depth 3). For v0.4 use the
-> build and run commands in [docs/llamampere-v0.4/RELEASE_NOTES.md](docs/llamampere-v0.4/RELEASE_NOTES.md#recommended-settings-for-24-gb-cards-rtx-3090--3090-ti).
+v0.4 commands for one 24 GB card (RTX 3090 / 3090 Ti). Measured speeds and peaks for each are in the
+[v0.4 release notes](docs/llamampere-v0.4/RELEASE_NOTES.md#recommended-settings-for-24-gb-cards-rtx-3090--3090-ti).
 
 ```bash
-git clone -b main https://github.com/JakeATX/llamAmpere.git
+git clone -b v0.4 https://github.com/JakeATX/llamAmpere.git
 cd llamAmpere
-cmake -S . -B build-sm86 -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DGGML_CUDA_FA=ON \
-      -DCMAKE_CUDA_ARCHITECTURES=86 -DGGML_NATIVE=ON
+cmake -S . -B build-sm86 -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86
 cmake --build build-sm86 -j8 --target llama-server
+```
 
+Everyday coding, agent and RAG work (49K context):
+
+```bash
+./build-sm86/bin/llama-server -m ATX-Swift-Qwen3.8-27B-Uncensored-IQ4_XS-M.gguf -c 49152 \
+  -ngl 99 -fa on -ctk turbo5 -ctv turbo4 -b 4096 -ub 1024 -t 8 -tb 8 --parallel 1
+```
+
+100K-token prompts:
+
+```bash
+./build-sm86/bin/llama-server -m ATX-Swift-Qwen3.8-27B-Uncensored-IQ4_XS-M.gguf -c 110592 \
+  -ngl 99 -fa on -ctk turbo5 -ctv turbo4 -b 4096 -ub 1024 -t 8 -tb 8 --parallel 1
+```
+
+Long multi-turn sessions:
+
+```bash
+./build-sm86/bin/llama-server -m ATX-Swift-Qwen3.8-27B-Uncensored-IQ4_XS-M.gguf -c 208896 \
+  -ngl 99 -fa on -ctk turbo5 -ctv turbo4 -b 4096 -ub 1024 -t 8 -tb 8 --parallel 1 \
+  --cache-ram 0 --ctx-checkpoints 4
+```
+
+Largest context (262,144 tokens):
+
+```bash
+./build-sm86/bin/llama-server -m ATX-Swift-Qwen3.8-27B-Uncensored-IQ4_XS-M.gguf -c 262144 \
+  -ngl 99 -fa on -ctk turbo5 -ctv turbo4 -b 4096 -ub 1024 -t 8 -tb 8 --parallel 1
+```
+
+Largest context on EXL3 4.0 bpw:
+
+```bash
+./build-sm86/bin/llama-server -m Qwen3.8-27B-EXL3-4.0bpw.gguf -c 262144 \
+  -ngl 99 -fa on -ctk turbo5 -ctv turbo4 -b 4096 -ub 1024 -t 8 -tb 8 --parallel 1
+```
+
+No tuning (`-fit` sizes the context to the card):
+
+```bash
+./build-sm86/bin/llama-server -m ATX-Swift-Qwen3.8-27B-Uncensored-IQ4_XS-M.gguf
+```
+
+In v0.4 the MTP drafter (fixed depth 4, p-min 0), the 65,536-token vocabulary shortlist and the drafter's cache types
+(they follow `-ctk`/`-ctv`) are defaults for Qwen3.8 GGUFs with the MTP head, so none of these commands pass
+`--spec-*` flags. For chats where you edit or regenerate turns, the prompt-cache and checkpoint flags described
+below (`--cache-prompt --cache-ram 8192 --ctx-checkpoints 24 --checkpoint-min-step 10240`) use host RAM, not VRAM.
+
+### v0.3 command and notes (previous release)
+
+The rest of this section describes v0.3, measured with its own command:
+
+```bash
 GGML_Q8_TURBO3_MMA_FUSED=1 ./build-sm86/bin/llama-server -m Qwen3.8-27B-ATX-4-XS.gguf \
   -c 245760 -b 4096 -ub 1024 -t 8 -tb 8 -ngl 99 -fa on -ctk q8_0 -ctv turbo3 \
   --parallel 1 --jinja --fit off \
@@ -123,9 +178,9 @@ gain and costs 150 MiB of VRAM at 220K. See `docs/mtp-vocabulary-shortlist.md`. 
 `--spec-draft-vocab-hot` tail that the same code supports measured 2.7-4.0% slower than the static
 map and is left off.
 
-### KV cache options
+### KV cache options (v0.3)
 
-`-ctk q8_0 -ctv turbo3` is the shipped cache and the one every number in this file was measured with. The attention
+v0.4 recommends `-ctk turbo5 -ctv turbo4`; see the v0.4 release notes. In v0.3, `-ctk q8_0 -ctv turbo3` was the shipped cache and the one every number in this file was measured with. The attention
 layers are the only ones with a KV cache (16 of 64, 4 KV heads, head dim 256); the other 48 are recurrent and
 their state does not grow with context. Two alternatives keep the value cache at a conventional llama.cpp format for
 anyone who would rather not run turbo3. The drafter cache stays `--spec-draft-type-k/v q8_0` (2,176 B/token) in
@@ -133,7 +188,7 @@ all three.
 
 | `-ctk` / `-ctv` | KV bytes per token, incl. drafter | largest context under a 23 GB card budget | suggested `-c` | decode speed vs shipped | build |
 |---|---:|---|---:|---|---|
-| `q8_0` / `turbo3` (shipped) | 25,984 | 237,568 whole-card; 245,760 on a card with nothing else on it | 237568 | reference | default |
+| `q8_0` / `turbo3` (v0.3 shipped) | 25,984 | 237,568 whole-card; 245,760 on a card with nothing else on it | 237568 | reference | default |
 | `q8_0` / `q8_0` | 36,992 (+42%) | 180,224 | 180224 | -0.3% weighted, within 1.2% at every depth | default |
 | `q8_0` / `q5_1` | 31,872 (+23%) | 204,800 | 204800 | -23% weighted, and it gets worse with depth | `-DGGML_CUDA_FA_ALL_QUANTS=ON` |
 
