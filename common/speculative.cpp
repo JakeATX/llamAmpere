@@ -3701,12 +3701,22 @@ const std::vector<double> & common_speculative_get_synth_probs(const common_spec
 
 common_params common_base_params_to_speculative(const common_params & params) {
     const bool has_draft = params.speculative.has_dft();
+    const bool spec_mtp = std::any_of(params.speculative.types.begin(), params.speculative.types.end(),
+            [](common_speculative_type t) {
+                return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE;
+            });
 
     const auto & params_spec = params.speculative.draft;
     common_params result = params;
 
     result.embedding    = false;
     result.pooling_type = LLAMA_POOLING_TYPE_UNSPECIFIED;
+
+    const char * lean = std::getenv("LLAMA_MTP_DRAFT_COMPUTE_LEAN");
+    if (lean && std::strcmp(lean, "1") == 0 && spec_mtp && !has_draft && params.n_parallel == 1) {
+        // Catch-up still needs the full logical batch; decode splits it into smaller microbatches.
+        result.n_ubatch = std::min(params.n_ubatch == 0 ? params.n_batch : params.n_ubatch, 64);
+    }
 
     if (has_draft) {
         // default to global devices value

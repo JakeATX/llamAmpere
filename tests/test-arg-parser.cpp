@@ -103,6 +103,45 @@ static void test(void) {
         assert(draft.n_outputs_max_per_seq == 1);
     }
 
+#ifndef _WIN32
+    {
+        const char * saved_env = std::getenv("LLAMA_MTP_DRAFT_COMPUTE_LEAN");
+        const bool had_env = saved_env != nullptr;
+        const std::string saved = saved_env ? saved_env : "";
+        common_params base;
+        base.n_parallel = 1;
+        base.n_batch = 4096;
+        base.n_ubatch = 1024;
+        base.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE };
+        unsetenv("LLAMA_MTP_DRAFT_COMPUTE_LEAN");
+        assert(common_base_params_to_speculative(base).n_ubatch == 1024);
+        setenv("LLAMA_MTP_DRAFT_COMPUTE_LEAN", "0", 1);
+        assert(common_base_params_to_speculative(base).n_ubatch == 1024);
+        setenv("LLAMA_MTP_DRAFT_COMPUTE_LEAN", "1", 1);
+        const auto draft = common_base_params_to_speculative(base);
+        assert(draft.n_batch == 4096);
+        assert(draft.n_ubatch == 64);
+        assert(common_context_params_to_llama(draft).n_ubatch == 64);
+        for (int width = 1; width <= 8; ++width) {
+            base.n_ubatch = width;
+            assert(common_base_params_to_speculative(base).n_ubatch == width);
+        }
+        base.n_ubatch = 0;
+        assert(common_base_params_to_speculative(base).n_ubatch == 64);
+        base.n_ubatch = 1024;
+        base.n_parallel = 2;
+        assert(common_base_params_to_speculative(base).n_ubatch == 1024);
+        base.n_parallel = 1;
+        base.speculative.types = { COMMON_SPECULATIVE_TYPE_NONE };
+        assert(common_base_params_to_speculative(base).n_ubatch == 1024);
+        if (had_env) {
+            setenv("LLAMA_MTP_DRAFT_COMPUTE_LEAN", saved.c_str(), 1);
+        } else {
+            unsetenv("LLAMA_MTP_DRAFT_COMPUTE_LEAN");
+        }
+    }
+#endif
+
     printf("test-arg-parser: make sure there is no duplicated arguments in any examples\n\n");
     for (int ex = 0; ex < LLAMA_EXAMPLE_COUNT; ex++) {
         try {
