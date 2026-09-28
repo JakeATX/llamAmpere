@@ -49,15 +49,19 @@
 
 ## Recommended settings for 24 GB cards (RTX 3090 / 3090 Ti)
 
-Build as in [QWEN_AMPERE.md](../../QWEN_AMPERE.md#build-and-run). The first five rows below use these flags:
+Build v0.4:
 
 ```bash
-./build-sm86/bin/llama-server -m <model.gguf> -c <context> \
-  -ngl 99 -fa on -ctk turbo5 -ctv turbo4 -b 4096 -ub 1024 -t 8 -tb 8 --parallel 1
+git clone -b v0.4 https://github.com/JakeATX/llamAmpere.git
+cd llamAmpere
+cmake -S . -B build-sm86 -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86
+cmake --build build-sm86 -j8 --target llama-server
 ```
 
-The MTP drafter, its depth, the vocabulary shortlist and the drafter's cache types are all defaults, so they need no
-flags. Pick `-c` for what you run:
+The MTP drafter (fixed depth 4), the vocabulary shortlist and the drafter's cache types are all defaults, so none of
+the commands below pass drafter flags. The model is
+[jakeatx/ATX-Swift-Qwen3.8-27B-Uncensored-IQ4_XS-M-GGUF](https://huggingface.co/jakeatx/ATX-Swift-Qwen3.8-27B-Uncensored-IQ4_XS-M-GGUF)
+unless the row says EXL3.
 
 | use | model | `-c` | measured decode tok/s | peak whole-card VRAM |
 |---|---|---|---|---|
@@ -68,13 +72,53 @@ flags. Pick `-c` for what you run:
 | Largest context, EXL3 | Qwen3.8-27B EXL3 4.0 bpw | 262144 | 61.9 after a 250K prompt | 21,632 MiB |
 | No tuning | ATX-Swift IQ4_XS-M | only `-m`; `-fit` picks 61,952 | 112.1 on a 5K request | 23,168 MiB |
 
+Everyday coding, agent and RAG work:
+
+```bash
+./build-sm86/bin/llama-server -m ATX-Swift-Qwen3.8-27B-Uncensored-IQ4_XS-M.gguf -c 49152 \
+  -ngl 99 -fa on -ctk turbo5 -ctv turbo4 -b 4096 -ub 1024 -t 8 -tb 8 --parallel 1
+```
+
+100K-token prompts:
+
+```bash
+./build-sm86/bin/llama-server -m ATX-Swift-Qwen3.8-27B-Uncensored-IQ4_XS-M.gguf -c 110592 \
+  -ngl 99 -fa on -ctk turbo5 -ctv turbo4 -b 4096 -ub 1024 -t 8 -tb 8 --parallel 1
+```
+
+Long multi-turn sessions:
+
+```bash
+./build-sm86/bin/llama-server -m ATX-Swift-Qwen3.8-27B-Uncensored-IQ4_XS-M.gguf -c 208896 \
+  -ngl 99 -fa on -ctk turbo5 -ctv turbo4 -b 4096 -ub 1024 -t 8 -tb 8 --parallel 1 \
+  --cache-ram 0 --ctx-checkpoints 4
+```
+
+Largest context:
+
+```bash
+./build-sm86/bin/llama-server -m ATX-Swift-Qwen3.8-27B-Uncensored-IQ4_XS-M.gguf -c 262144 \
+  -ngl 99 -fa on -ctk turbo5 -ctv turbo4 -b 4096 -ub 1024 -t 8 -tb 8 --parallel 1
+```
+
+Largest context, EXL3 4.0 bpw:
+
+```bash
+./build-sm86/bin/llama-server -m Qwen3.8-27B-EXL3-4.0bpw.gguf -c 262144 \
+  -ngl 99 -fa on -ctk turbo5 -ctv turbo4 -b 4096 -ub 1024 -t 8 -tb 8 --parallel 1
+```
+
+No tuning (`-fit` sizes the context to the card):
+
+```bash
+./build-sm86/bin/llama-server -m ATX-Swift-Qwen3.8-27B-Uncensored-IQ4_XS-M.gguf
+```
+
 - **Where the numbers come from.** RTX 3090 Ti at 350 W, temperature 1.0, 5,120 or more generated tokens. The peaks are
   whole-card, so they include about 1.1 GB that other processes already held on the card. The 49,152 row is the
   release build at its default fixed depth 4. The other rows ran on v0.4 builds from before that default, when it was
-  adaptive depth 3-4. The first five rows used the same cache types and flags; the no-tuning row passed only `-m`. The long-session row also used `--cache-ram 0 --ctx-checkpoints 4`.
+  adaptive depth 3-4, with the same cache types and flags as the commands above.
 - **RTX 3090.** It has the same 24 GB, so the same contexts fit. We measured speed on the 3090 Ti only.
 - **Cache types.** `-ctk turbo5 -ctv turbo4` is the recommended pair. On 2,400 GPQA and LiveCodeBench answers, its task
-  accuracy was not distinguishable from `q8_0/q8_0`. The first five rows were measured with it.
-- **Multi-turn chats that edit or regenerate turns.** Add the prompt-cache and checkpoint flags from
-  [QWEN_AMPERE.md](../../QWEN_AMPERE.md#build-and-run). They use host RAM, not VRAM.
+  accuracy was not distinguishable from `q8_0/q8_0`. Every command above except the no-tuning one uses it.
 - **Keep `--parallel 1`.** Every number here is one slot.
