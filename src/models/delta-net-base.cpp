@@ -459,24 +459,42 @@ static void snapshot_shift_gather(ggml_context * ctx0, ggml_cgraph * gf, const l
         ggml_tensor * all, int64_t row_elems, uint32_t plane0, uint32_t mem_size,
         std::vector<ggml_tensor *> & gathered) {
     gathered.clear();
-    for (uint32_t j = 0; j < inp->snap_shift; ++j) {
-        const size_t rows_off = (size_t) (plane0 + j) * mem_size;
-        GGML_ASSERT(rows_off + mem_size <= (size_t) all->ne[1]);
-        ggml_tensor * planes = ggml_view_2d(ctx0, all, row_elems, all->ne[1] - rows_off, all->nb[1], rows_off * all->nb[1]);
-        ggml_tensor * g = ggml_get_rows(ctx0, planes, inp->s_copy_main);
-        ggml_build_forward_expand(gf, g);
-        gathered.push_back(g);
+    if (inp->snap_shift == 0) {
+        return;
     }
+    // one gather for all snap_shift groups: rows [plane0*mem_size, (plane0+snap_shift)*mem_size) of `all`
+    // indexed by s_copy_shift (j * mem_size + source cell), result [row_elems, snap_shift * n_seqs] with the
+    // groups back to back. One op per plane instead of snap_shift: with 49 GDN layers and a 7-deep ring the
+    // per-group form cost ~9 ms of launches per short ubatch (V04_ngram_rs_fix phase A).
+    // The view runs to the end of `all` (not just snap_shift planes): s_copy_shift entries carry
+    // the rollback group offset rs_idx * mem_size, so group j may read plane plane0 + j + rs_idx.
+    GGML_ASSERT(inp->s_copy_shift != nullptr);
+    const size_t rows_off = (size_t) plane0 * mem_size;
+    GGML_ASSERT(rows_off + (size_t) inp->snap_shift * mem_size <= (size_t) all->ne[1]);
+    ggml_tensor * planes = ggml_view_2d(ctx0, all, row_elems, all->ne[1] - (int64_t) rows_off, all->nb[1], rows_off * all->nb[1]);
+    ggml_tensor * g = ggml_get_rows(ctx0, planes, inp->s_copy_shift);
+    ggml_build_forward_expand(gf, g);
+    gathered.push_back(g);
 }
 
-static void snapshot_shift_write(ggml_context * ctx0, ggml_cgraph * gf,
+static void snapshot_shift_write(ggml_context * ctx0, ggml_cgraph * gf, const llm_graph_input_rs * inp,
         ggml_tensor * all, int64_t row_elems, int64_t n_seq_tokens, uint32_t kv_head, uint32_t mem_size,
         const std::vector<ggml_tensor *> & gathered) {
-    for (size_t j = 0; j < gathered.size(); ++j) {
-        const size_t rows_off = ((size_t) n_seq_tokens + j) * mem_size + kv_head;
-        ggml_tensor * dst = ggml_view_2d(ctx0, all, row_elems, gathered[j]->ne[1], all->nb[1], rows_off * all->nb[1]);
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, gathered[j], dst));
+    if (gathered.empty()) {
+        return;
     }
+    // gathered[0] holds snap_shift groups of n_seqs rows back to back; group j goes to rows
+    // (n_seq_tokens + j) * mem_size + kv_head .. + n_seqs, i.e. a [row_elems, n_seqs, snap_shift] view of
+    // `all` with a group stride of mem_size rows -- one strided copy per plane.
+    ggml_tensor * src = gathered[0];
+    GGML_ASSERT(inp->snap_shift > 0 && src->ne[1] % inp->snap_shift == 0);
+    const int64_t n_seqs = src->ne[1] / inp->snap_shift;
+    const size_t rows_off = (size_t) n_seq_tokens * mem_size + kv_head;
+    GGML_ASSERT(rows_off + (size_t) (inp->snap_shift - 1) * mem_size + n_seqs <= (size_t) all->ne[1]);
+    ggml_tensor * src3 = ggml_reshape_3d(ctx0, src, row_elems, n_seqs, inp->snap_shift);
+    ggml_tensor * dst  = ggml_view_3d(ctx0, all, row_elems, n_seqs, inp->snap_shift,
+            all->nb[1], (size_t) mem_size * all->nb[1], rows_off * all->nb[1]);
+    ggml_build_forward_expand(gf, ggml_cpy(ctx0, src3, dst));
 }
 
 ggml_tensor * llm_build_delta_net_base::build_conv_state(
@@ -565,6 +583,36 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
         // token at a time and makes a later rollback restore a state that never existed.
         const int64_t n_written = std::min<int64_t>(n_seq_tokens, K);
 
+        if (inp->rs_wr != nullptr) {
+            // [TAG_RECURRENT_ROLLBACK_RING] a ubatch shorter than the ring: groups live at ring planes
+            // chosen by the memory (inp->rs_wr_conv, oldest written group first): one set_rows of the last
+            // n_written conv windows, no shift. Source: the [k-1, channels, n_seqs, n_written] window view
+            // of conv_input starting at token n_seq_tokens - (n_written - 1), each later window one
+            // token further (element stride along dim 3), made contiguous first.
+            // A ubatch that fills the ring (n_seq_tokens >= K) resets the ring base to 0, so group g sits
+            // at plane g -- the static layout the copies below write (no ring inputs, fewer nodes).
+            GGML_ASSERT((int64_t) inp->rs_wr_conv.size() == n_written && (int64_t) inp->n_written == n_written);
+            // the windows overlap (one token apart), so no single strided view of conv_input can
+            // express them: gather each slot's window (one small cont, as the shift path's cpy did)
+            // and scatter it straight into its ring plane with set_rows over that slot's row indices.
+            // The cont goes straight to the 2D [row_count, n_seqs] shape: a same-shape cont of the
+            // window is a cudaMemcpy2DAsync of 12-byte rows in the CUDA backend (~9 us each, 1.45 ms
+            // per MTP-3 verify on the 3090 Ti, nsys 2026-09-24), the reshaping copy is the scalar
+            // copy kernel (~2 us), as in the static path's ggml_cpy below.
+            ggml_tensor * states2d = ggml_reshape_2d(ctx0, conv_states_all, row_count, conv_states_all->ne[1]);
+            for (int64_t j = 0; j < n_written; ++j) {
+                const int64_t s_idx = n_seq_tokens - (n_written - 1) + j; // window ending at token n_seq_tokens - g, g = n_written - 1 - j
+                ggml_tensor * win = ggml_view_3d(ctx0, conv_input,
+                        conv_kernel_size - 1, conv_channels, n_seqs,
+                        conv_input->nb[1], conv_input->nb[2],
+                        ggml_row_size(conv_input->type, s_idx));
+                win = ggml_cont_2d(ctx0, win, row_count, n_seqs);
+                ggml_tensor * rows_j = inp->rs_wr_conv[j];
+                ggml_build_forward_expand(gf, ggml_set_rows(ctx0, states2d, win, rows_j));
+            }
+            return conv_input;
+        }
+
         // ... and the older groups move back by n_seq_tokens (no-op when n_seq_tokens >= K)
         std::vector<ggml_tensor *> older;
         snapshot_shift_gather(ctx0, gf, inp, conv_states_all, row_count, conv_rollback, mem_size, older);
@@ -588,7 +636,7 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
             ggml_build_forward_expand(gf, ggml_cpy(ctx0, conv_state_last, conv_state_update));
         }
 
-        snapshot_shift_write(ctx0, gf, conv_states_all, row_count, n_seq_tokens, kv_head, mem_size, older);
+        snapshot_shift_write(ctx0, gf, inp, conv_states_all, row_count, n_seq_tokens, kv_head, mem_size, older);
     }
 
     return conv_input;
@@ -672,6 +720,21 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         // op writes the last min(n_seq_tokens, K) snapshots; trailing slots are left unwritten
         const int64_t n_written = std::min<int64_t>(n_seq_tokens, K);
 
+        if (inp->rs_wr != nullptr) {
+            // [TAG_RECURRENT_ROLLBACK_RING] a ubatch shorter than the ring: snapshot slot g -> cache row
+            // inp->rs_wr[g * n_seqs + s] (ring plane (base' + g) mod K of the seq's cell): one set_rows,
+            // no shift. The CUDA backend fuses gated_delta_net + this set_rows
+            // (ggml_cuda_try_gdn_cache_fusion) and writes the snapshots straight into those rows.
+            // A ubatch that fills the ring takes the static copy below (base' = 0, group g at plane g).
+            GGML_ASSERT(inp->rs_wr != nullptr && (int64_t) inp->n_written == n_written);
+            ggml_tensor * src = ggml_view_2d(ctx0, gdn_out, D, n_seqs * n_written,
+                ggml_row_size(gdn_out->type, D),
+                ggml_row_size(gdn_out->type, attn_score_elems));
+            ggml_tensor * all2d = ggml_reshape_2d(ctx0, ssm_states_all, hparams.n_embd_s(), ssm_states_all->ne[1]);
+            ggml_build_forward_expand(gf, ggml_set_rows(ctx0, all2d, src, inp->rs_wr));
+            return output;
+        }
+
         // the older groups move back by n_seq_tokens (see snapshot_shift_gather; no-op for n >= K)
         std::vector<ggml_tensor *> older;
         snapshot_shift_gather(ctx0, gf, inp, ssm_states_all, hparams.n_embd_s(), 0, mem_size, older);
@@ -691,7 +754,7 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
 
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
 
-        snapshot_shift_write(ctx0, gf, ssm_states_all, hparams.n_embd_s(), n_seq_tokens, kv_head, mem_size, older);
+        snapshot_shift_write(ctx0, gf, inp, ssm_states_all, hparams.n_embd_s(), n_seq_tokens, kv_head, mem_size, older);
 
         return output;
     }
@@ -734,11 +797,19 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const uint32_t n         = (uint32_t) n_seq_tokens;
     const bool     need_base = r > 0 || stale;          // s is not the logical state
 
-    const size_t ingr_elemsize   = ggml_element_size(ingr_all);
-    const size_t ingr_row        = (size_t) hparams.n_embd_s_ingredient(); // elements per slot
-    const size_t ring_row        = ingr_row * K;                            // elements per cell
-    const size_t state_row_bytes = (size_t) hparams.n_embd_s() * ggml_element_size(ssm_states_all);
-    GGML_ASSERT((int64_t) ingr_row == 4 * S_v * H_v); // the op's per-slot ingredient block
+    const bool kda = (g->ne[0] == S_v);
+
+    // [#63] the ring's slot layout: emit_mode 1 (k, v, g, beta each S_v wide) or 2 (compact: g and
+    // beta once per head), as llama_gdn_ingr_emit_mode() sized the ring
+    const size_t  ingr_elemsize   = ggml_element_size(ingr_all);
+    const size_t  ingr_row        = (size_t) hparams.n_embd_s_ingredient(); // elements per slot
+    const size_t  ring_row        = ingr_row * K;                            // elements per cell
+    const size_t  state_row_bytes = (size_t) hparams.n_embd_s() * ggml_element_size(ssm_states_all);
+    const int32_t ingr_mode       = (int64_t) ingr_row == 4 * S_v * H_v ? 1 : llama_gdn_ingr_emit_mode();
+    const int64_t ingr_w          = ggml_gated_delta_net_ingr_width(S_v, g->ne[0], ingr_mode); // per head
+    GGML_ASSERT((int64_t) ingr_row == ingr_w * H_v); // the op's per-slot ingredient block
+    const int64_t ingr_off_g      = 2 * S_v;
+    const int64_t ingr_off_b      = ingr_mode == 1 ? 3 * S_v : 2 * S_v + g->ne[0];
 
     ggml_tensor * s_ckpt = build_rs(inp, ckpt_all, hparams.n_embd_s(), n_seqs);
     s_ckpt = ggml_reshape_4d(ctx0, s_ckpt, S_v, S_v, H_v, n_seqs);
@@ -747,23 +818,21 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     // move, relocated) by the same s_copy mechanism as the state itself: [ring_row, n_seqs]
     ggml_tensor * ring = build_rs(inp, ingr_all, (int32_t) ring_row, n_seqs);
 
-    const bool kda = (g->ne[0] == S_v);
-
     // replay ring slots [first, first + count) forward from state4d in ONE batched K=1 call --
     // the slots are chronological, so the accepted prefix is a plain forward-order view -- and
     // return the resulting state. ggml_gated_delta_net needs g/beta (and, through q_dummy, q)
     // fully contiguous, so the strided views into the packed ring are materialized.
     auto replay_from = [&](ggml_tensor * state4d, uint32_t first, uint32_t count) -> ggml_tensor * {
         GGML_ASSERT(count > 0);
-        auto comp = [&](int64_t ne0, uint32_t c) {
+        auto comp = [&](int64_t ne0, int64_t off) {
             return ggml_cont(ctx0, ggml_view_4d(ctx0, ring, ne0, H_v, count, n_seqs,
-                4 * S_v * ingr_elemsize, ingr_row * ingr_elemsize, ring->nb[1],
-                ((size_t) first * ingr_row + (size_t) c * S_v) * ingr_elemsize));
+                ingr_w * ingr_elemsize, ingr_row * ingr_elemsize, ring->nb[1],
+                ((size_t) first * ingr_row + (size_t) off) * ingr_elemsize));
         };
         ggml_tensor * k_b = comp(S_v, 0);
-        ggml_tensor * v_b = comp(S_v, 1);
-        ggml_tensor * g_b = comp(kda ? S_v : 1, 2);
-        ggml_tensor * b_b = comp(1, 3);
+        ggml_tensor * v_b = comp(S_v, S_v);
+        ggml_tensor * g_b = comp(kda ? S_v : 1, ingr_off_g);
+        ggml_tensor * b_b = comp(1, ingr_off_b);
         ggml_tensor * q_dummy = ggml_scale(ctx0, k_b, 0.0f); // q only shapes the (discarded) attn output
         ggml_tensor * out = ggml_gated_delta_net(ctx0, q_dummy, k_b, v_b, g_b, b_b, state4d, /*K=*/1, /*emit_mode=*/0);
         return extract_state_k1(out, (int64_t) count);
@@ -806,7 +875,7 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
 
     // main call: emit_mode=1 records ingredients (+ the trailing final-state block, + the
     // before-the-window block when n > K) instead of K full snapshots.
-    ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, base_state, K, /*emit_mode=*/1);
+    ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, base_state, K, ingr_mode);
     if (n_seq_tokens > 1) {
         res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
     } else {
@@ -823,7 +892,8 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
 
     const int64_t attn_score_elems   = S_v * H_v * n_seq_tokens * n_seqs;
     const int64_t ingr_size_per_snap = (int64_t) ingr_row * n_seqs;
-    const int64_t ingr_elems_total   = (int64_t) K * ingr_size_per_snap;
+    // the slots plus emit_mode 2's padding: where the trailing blocks start
+    const int64_t ingr_elems_total   = ggml_gated_delta_net_ingr_region(S_v, g->ne[0], H_v, n_seqs, K, ingr_mode);
     const size_t  ring_row_bytes     = ingr_all->nb[1];
 
     // ring, carried slots: gathered [keep_first, keep_first + keep_count) -> head cells [0, keep_count)

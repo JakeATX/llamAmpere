@@ -1,6 +1,7 @@
 #include "llama-graph.h"
 #include "llama-sampler.h"
 #include "llama-ext.h"
+#include "llama-mtp-chain-sample.h"
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -17,6 +18,8 @@
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
+
+#include "ggml-ledger.h"
 
 #include <cassert>
 #include <cmath>
@@ -367,19 +370,63 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
 void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
     GGML_UNUSED(ubatch);
 
-    const int64_t n_rs = mctx->get_n_rs();
-
-    if (s_copy) {
-        GGML_ASSERT(ggml_backend_buffer_is_host(s_copy->buffer));
-        int32_t * data = (int32_t *) s_copy->data;
-
-        // assuming copy destinations ALWAYS happen ONLY on the cells between head and head+n
-        for (uint32_t i = 0; i < n_rs; ++i) {
-            data[i] = mctx->s_copy(i);
-        }
-    }
+    fill_s_copy(mctx);
 
     mctx->consume_replay(span_new);
+}
+
+void llm_graph_input_rs::fill_s_copy(const llama_memory_recurrent_context * m) {
+    if (!s_copy) {
+        return;
+    }
+    GGML_ASSERT(ggml_backend_buffer_is_host(s_copy->buffer));
+    int32_t * data = (int32_t *) s_copy->data;
+
+    if (m->get_rs_ring()) {
+        auto host_data = [](ggml_tensor * t) -> int32_t * {
+            if (t == nullptr) {
+                return nullptr;
+            }
+            GGML_ASSERT(ggml_backend_buffer_is_host(t->buffer));
+            return (int32_t *) t->data;
+        };
+        GGML_ASSERT((rs_wr != nullptr) == (n_written > 0) && rs_wr_conv.size() == n_written);
+        // host pointers of the per-slot conv row inputs (sized once per graph build)
+        rs_wr_conv_host.resize(n_written);
+        for (uint32_t j = 0; j < n_written; ++j) {
+            rs_wr_conv_host[j] = host_data(rs_wr_conv[j]);
+        }
+        m->fill_rs_ring(data, host_data(rs_wr), n_written > 0 ? rs_wr_conv_host.data() : nullptr,
+                host_data(rs_old_src), host_data(rs_old_dst));
+        return;
+    }
+
+    const int64_t n_rs = m->get_n_rs();
+    // assuming copy destinations ALWAYS happen ONLY on the cells between head and head+n
+    for (int64_t i = 0; i < n_rs; ++i) {
+        data[i] = m->s_copy((int) i);
+    }
+
+    set_input_shift(m->get_size());
+}
+
+void llm_graph_input_rs::set_input_shift(uint32_t mem_size) {
+    if (!s_copy_shift) {
+        return;
+    }
+    GGML_ASSERT(s_copy && snap_shift > 0 && ggml_backend_buffer_is_host(s_copy_shift->buffer));
+    // s_copy_main[s] (the first n_seqs entries of s_copy) already carries the rollback group offset
+    // rs_idx * mem_size + src0, so group j of the shift reads plane plane0 + j + rs_idx -- exactly
+    // what the per-group form did with a view at plane0 + j indexed by s_copy_main.
+    const int32_t * main = (const int32_t *) s_copy->data;
+    int32_t *       data = (int32_t *) s_copy_shift->data;
+
+    const int64_t n_seqs = s_copy_shift->ne[0] / snap_shift;
+    for (uint32_t j = 0; j < snap_shift; ++j) {
+        for (int64_t s = 0; s < n_seqs; ++s) {
+            data[j * n_seqs + s] = (int32_t) (j * (int64_t) mem_size + main[s]);
+        }
+    }
 }
 
 bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
@@ -403,6 +450,8 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
     res &= ckpt_span  == mctx->get_ckpt_span();
     res &= s_stale    == mctx->get_s_stale();
     res &= snap_shift == mctx->get_snap_shift();
+    res &= n_written  == mctx->get_n_written();
+    res &= n_older    == mctx->get_n_older();
 
     return res;
 }
@@ -1149,17 +1198,7 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
         mctx->get_attn()->set_input_v_rot(inp_attn->self_v_rot);
     }
 
-    const int64_t n_rs = mctx->get_recr()->get_n_rs();
-
-    if (inp_rs->s_copy) {
-        GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
-        int32_t * data = (int32_t *) inp_rs->s_copy->data;
-
-        // assuming copy destinations ALWAYS happen ONLY on the cells between head and head+n
-        for (uint32_t i = 0; i < n_rs; ++i) {
-            data[i] = mctx->get_recr()->s_copy(i);
-        }
-    }
+    inp_rs->fill_s_copy(mctx->get_recr());
 
     mctx->get_recr()->consume_replay(inp_rs->span_new);
 }
@@ -1190,6 +1229,8 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
     res &= inp_rs->ckpt_span  == mctx->get_recr()->get_ckpt_span();
     res &= inp_rs->s_stale    == mctx->get_recr()->get_s_stale();
     res &= inp_rs->snap_shift == mctx->get_recr()->get_snap_shift();
+    res &= inp_rs->n_written  == mctx->get_recr()->get_n_written();
+    res &= inp_rs->n_older    == mctx->get_recr()->get_n_older();
 
     return res;
 }
@@ -1202,17 +1243,7 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
 
     mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
 
-    const int64_t n_rs = mctx->get_recr()->get_n_rs();
-
-    if (inp_rs->s_copy) {
-        GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
-        int32_t * data = (int32_t *) inp_rs->s_copy->data;
-
-        // assuming copy destinations ALWAYS happen ONLY on the cells between head and head+n
-        for (uint32_t i = 0; i < n_rs; ++i) {
-            data[i] = mctx->get_recr()->s_copy(i);
-        }
-    }
+    inp_rs->fill_s_copy(mctx->get_recr());
 
     mctx->get_recr()->consume_replay(inp_rs->span_new);
 }
@@ -1242,6 +1273,8 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
     res &= inp_rs->ckpt_span  == mctx->get_recr()->get_ckpt_span();
     res &= inp_rs->s_stale    == mctx->get_recr()->get_s_stale();
     res &= inp_rs->snap_shift == mctx->get_recr()->get_snap_shift();
+    res &= inp_rs->n_written  == mctx->get_recr()->get_n_written();
+    res &= inp_rs->n_older    == mctx->get_recr()->get_n_older();
 
     return res;
 }
@@ -1285,17 +1318,7 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
         attn_ctx->get_swa()->set_input_v_rot(inp_attn->self_v_rot_swa);
     }
 
-    const int64_t n_rs = mctx->get_recr()->get_n_rs();
-
-    if (inp_rs->s_copy) {
-        GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
-        int32_t * data = (int32_t *) inp_rs->s_copy->data;
-
-        // assuming copy destinations ALWAYS happen ONLY on the cells between head and head+n
-        for (uint32_t i = 0; i < n_rs; ++i) {
-            data[i] = mctx->get_recr()->s_copy(i);
-        }
-    }
+    inp_rs->fill_s_copy(mctx->get_recr());
 
     mctx->get_recr()->consume_replay(inp_rs->span_new);
 }
@@ -1339,6 +1362,8 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
     res &= inp_rs->ckpt_span  == mctx->get_recr()->get_ckpt_span();
     res &= inp_rs->s_stale    == mctx->get_recr()->get_s_stale();
     res &= inp_rs->snap_shift == mctx->get_recr()->get_snap_shift();
+    res &= inp_rs->n_written  == mctx->get_recr()->get_n_written();
+    res &= inp_rs->n_older    == mctx->get_recr()->get_n_older();
 
     return res;
 }
@@ -1395,6 +1420,21 @@ bool llm_graph_input_sampling::can_reuse(const llm_graph_params & params) {
     }
 
     return true;
+}
+
+void llm_graph_input_mtp_chain_samp::set_input(const llama_ubatch * ubatch) {
+    GGML_UNUSED(ubatch);
+
+    const size_t n_u = (size_t) ggml_nelements(u);
+    GGML_ASSERT(src != nullptr && src->size() >= LLAMA_MTP_CHAIN_SAMP_N + n_u && "llama_set_mtp_chain_sampling: too few uniforms for the chain");
+
+    ggml_backend_tensor_set(samp, src->data(), 0, LLAMA_MTP_CHAIN_SAMP_N * sizeof(float));
+    ggml_backend_tensor_set(u, src->data() + LLAMA_MTP_CHAIN_SAMP_N, 0, n_u * sizeof(float));
+}
+
+bool llm_graph_input_mtp_chain_samp::can_reuse(const llm_graph_params & params) {
+    // the chain length follows from the ubatch shape, which allow_reuse already matched
+    return params.mtp_chain_samp == src && params.cparams.mtp_chain_top_k > 0;
 }
 
 //
@@ -1571,8 +1611,13 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     cross            (params.cross),
     hadamard_rotations(params.hadamard_rotations),
     hadamard_inverses (params.hadamard_inverses),
+    prec_policy      (params.prec_policy),
     samplers         (params.samplers),
     draft_vocab_ids  (params.draft_vocab_ids),
+    draft_vocab_compact    (params.draft_vocab_compact),
+    draft_vocab_compact_src(params.draft_vocab_compact_src),
+    draft_vocab_warned(params.draft_vocab_warned),
+    mtp_chain_samp   (params.mtp_chain_samp),
     cb_func          (params.cb),
     res              (params.res),
     model_ref        (params.model),
@@ -1671,6 +1716,10 @@ ggml_tensor * llm_graph_context::build_lora_mm(
         res = ggml_mul_mat(ctx0, w, cur_mm);
     }
 
+    if (prec_policy) {
+        prec_policy->apply(res);
+    }
+
     if (w_s) {
         res = ggml_mul(ctx0, res, w_s);
     }
@@ -1730,6 +1779,10 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
     }
 
     ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur_mm, ids);
+
+    if (prec_policy) {
+        prec_policy->apply(res);
+    }
 
     if (w_s) {
         const int64_t n_expert = w_s->ne[0];
@@ -2514,6 +2567,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     } else {
         experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s); // [n_embd, n_expert_used, n_tokens]
     }
+    if (arch == LLM_ARCH_MISTRAL4) {
+        // src1 can exceed F16 range
+        ggml_prec_set_src(experts, GGML_PREC_F32, 1);
+    }
     cb(experts, "ffn_moe_down", il);
 
     if (down_exps_s) {
@@ -2680,6 +2737,7 @@ ggml_tensor * llm_graph_context::build_inp_pos() const {
 
     cur = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int64_t)n_tokens*hparams.n_pos_per_embd());
     ggml_set_input(cur);
+    cb(cur, "inp_pos", -1);
 
     res->add_input(std::move(inp));
 
@@ -2694,7 +2752,7 @@ ggml_tensor * llm_graph_context::build_inp_attn_scale() const {
     // this need to be 1x1xN for broadcasting
     cur = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, 1, n_tokens);
     ggml_set_input(cur);
-    ggml_set_name(cur, "attn_scale");
+    cb(cur, "inp_attn_scale", -1);
 
     res->add_input(std::move(inp));
 
@@ -2716,6 +2774,7 @@ ggml_tensor * llm_graph_context::build_inp_out_ids() const {
 
     cur = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_outputs);
     ggml_set_input(cur);
+    ggml_set_name(cur, "out_ids");
 
     res->add_input(std::move(inp));
 
@@ -2729,6 +2788,7 @@ ggml_tensor * llm_graph_context::build_inp_mean() const {
 
     cur = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_tokens, ubatch.n_seqs_unq);
     ggml_set_input(cur);
+    ggml_set_name(cur, "mean");
 
     res->add_input(std::move(inp));
 
@@ -2742,6 +2802,7 @@ ggml_tensor * llm_graph_context::build_inp_cls() const {
 
     cur = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_seqs_unq);
     ggml_set_input(cur);
+    ggml_set_name(cur, "cls");
 
     res->add_input(std::move(inp));
 
@@ -2766,6 +2827,7 @@ ggml_tensor * llm_graph_context::build_inp_cross_embd() const {
 
     cur = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_enc);
     ggml_set_input(cur);
+    ggml_set_name(cur, "cross_embd");
 
     res->add_input(std::move(inp));
 
@@ -2779,6 +2841,7 @@ ggml_tensor * llm_graph_context::build_inp_pos_bucket_enc() const {
 
     cur = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_tokens, n_tokens);
     ggml_set_input(cur);
+    ggml_set_name(cur, "pos_bucket_enc");
 
     res->add_input(std::move(inp));
 
@@ -2796,6 +2859,7 @@ ggml_tensor * llm_graph_context::build_inp_pos_bucket_dec() const {
 
     cur = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_tokens);
     ggml_set_input(cur);
+    ggml_set_name(cur, "pos_bucket_dec");
 
     res->add_input(std::move(inp));
 
@@ -2874,8 +2938,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         // TurboQuant: inverse WHT on FA output when V values are WHT-rotated.
         // For MLA, V is a view of K with different ne[0] (e.g. V=512, K=576).
         // Group size must come from K (which determines the WHT rotation), not V.
-        if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0) {
-            const bool k_is_turbo = (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0);
+        if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0 || v->type == GGML_TYPE_TQ6_0 || v->type == GGML_TYPE_TQ5_0) {
+            const bool k_is_turbo = (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TQ6_0 || k->type == GGML_TYPE_TQ5_0);
             const ggml_tensor * group_src = k_is_turbo ? k : v;
             const int turbo_group = (group_src->ne[0] % 128 == 0) ? 128 : 64;
             if (cur->ne[0] % turbo_group == 0) {
@@ -2952,8 +3016,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         cb(kqv, "kqv", il);
 
         // TurboQuant: inverse WHT on attention output (non-FA path)
-        if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0) {
-            const bool k_is_turbo = (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0);
+        if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0 || v->type == GGML_TYPE_TQ6_0 || v->type == GGML_TYPE_TQ5_0) {
+            const bool k_is_turbo = (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TQ6_0 || k->type == GGML_TYPE_TQ5_0);
             const ggml_tensor * group_src = k_is_turbo ? k : v;
             const int turbo_group = (group_src->ne[0] % 128 == 0) ? 128 : 64;
             if (kqv->ne[0] % turbo_group == 0) {
@@ -2996,6 +3060,7 @@ llm_graph_input_attn_no_cache * llm_graph_context::build_attn_inp_no_cache() con
     // note: there is no KV cache, so the number of KV values is equal to the number of tokens in the batch
     inp->self_kq_mask = ggml_new_tensor_4d(ctx0, type_mask, n_tokens, n_tokens, 1, 1);
     ggml_set_input(inp->self_kq_mask);
+    cb(inp->self_kq_mask, "self_kq_mask", -1);
 
     inp->self_kq_mask_cnv = inp->self_kq_mask;
 
@@ -3148,7 +3213,7 @@ ggml_tensor * llm_graph_context::build_attn(
     // TurboQuant pre-rotate-queries: O(d log d) WHT rotation via custom op
     // Q shape: (n_embd_head, n_head, n_tokens)
     // For zero-padded models (head_dim not 128-aligned), pad Q to match padded K dim first.
-    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0) {
+    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TQ6_0 || k->type == GGML_TYPE_TQ5_0) {
         // Pad Q per-head to next multiple of 128 if needed
         if (q->ne[0] % 128 != 0) {
             const int64_t pad = ((q->ne[0] + 127) / 128) * 128 - q->ne[0];
@@ -3165,7 +3230,7 @@ ggml_tensor * llm_graph_context::build_attn(
     // TurboQuant: if V was padded, the output has padded dimensions.
     // Extract original V head_dim after inverse WHT (applied inside build_attn_mha).
     // NOTE: gate on v->type (not k->type) for asymmetric configs where K=q8_0 but V=turbo
-    if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0) {
+    if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0 || v->type == GGML_TYPE_TQ6_0 || v->type == GGML_TYPE_TQ5_0) {
         const int64_t orig_v_head = hparams.n_embd_head_v(il);
         // cur is 2D: (n_embd_head * n_head, n_tokens) after build_attn_mha
         const int64_t padded_v_head = v->ne[0];
@@ -3281,7 +3346,7 @@ ggml_tensor * llm_graph_context::build_attn(
 
     // TurboQuant: pre-rotate Q for K-only (MLA) attention
     // For zero-padded models, pad Q to match padded K dim first.
-    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0) {
+    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TQ6_0 || k->type == GGML_TYPE_TQ5_0) {
         // Pad Q per-head to next multiple of 128 if needed
         if (q->ne[0] % 128 != 0) {
             const int64_t pad = ((q->ne[0] + 127) / 128) * 128 - q->ne[0];
@@ -3297,7 +3362,7 @@ ggml_tensor * llm_graph_context::build_attn(
 
     // TurboQuant: if V was padded (MLA: V is view of K, may have padded dim),
     // extract original V head_dim after inverse WHT.
-    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0) {
+    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TQ6_0 || k->type == GGML_TYPE_TQ5_0) {
         const int64_t orig_v_head = v_cur->ne[0];  // original V head_dim from model
         const int64_t padded_v_head = v->ne[0];     // padded V head_dim in cache
         if (padded_v_head != orig_v_head) {
@@ -3483,7 +3548,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
     // TurboQuant: pre-rotate Q for ISWA attention (pad to 128-aligned if needed)
-    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0) {
+    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TQ6_0 || k->type == GGML_TYPE_TQ5_0) {
         if (q->ne[0] % 128 != 0) {
             const int64_t pad = ((q->ne[0] + 127) / 128) * 128 - q->ne[0];
             q = ggml_pad(ctx0, q, pad, 0, 0, 0);
@@ -3498,7 +3563,7 @@ ggml_tensor * llm_graph_context::build_attn(
 
     // TurboQuant: if V was padded, extract original V head_dim after inverse WHT
     // NOTE: gate on v->type (not k->type) for asymmetric configs where K=q8_0 but V=turbo
-    if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0) {
+    if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0 || v->type == GGML_TYPE_TQ6_0 || v->type == GGML_TYPE_TQ5_0) {
         const int64_t orig_v_head = hparams.n_embd_head_v(il);
         const int64_t padded_v_head = v->ne[0];
         if (padded_v_head != orig_v_head) {
@@ -3890,6 +3955,7 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
 
     inp->s_copy = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_rs);
     ggml_set_input(inp->s_copy);
+    ggml_set_name(inp->s_copy, "rs_s_copy");
 
     inp->s_copy_main  = ggml_view_1d(ctx0, inp->s_copy, n_seqs, 0);
     inp->s_copy_extra = ggml_view_1d(ctx0, inp->s_copy, n_rs - n_seqs, n_seqs * inp->s_copy->nb[0]);
@@ -3906,10 +3972,32 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
     // capacity (beyond it the builder re-bases the checkpoint onto the last n_rs_seq tokens).
     // Must agree with llm_build_delta_net_base::build_recurrent_attn's bookkeeping.
     {
-        const uint32_t n_rs_seq     = mctx_cur->get_n_rs_seq();
         const uint32_t n_seq_tokens = n_seqs > 0 ? (uint32_t) (ubatch.n_tokens / n_seqs) : 0;
-        const uint32_t m            = inp->ckpt_span - std::min(inp->ckpt_span, inp->replay_len);
-        inp->span_new = std::min(m + n_seq_tokens, n_rs_seq);
+        inp->span_new = llama_memory_recurrent::replay_span_new(inp->ckpt_span, inp->replay_len, n_seq_tokens, mctx_cur->get_n_rs_seq());
+    }
+
+    if (inp->snap_shift > 0) {
+        inp->s_copy_shift = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int64_t) inp->snap_shift * n_seqs);
+        ggml_set_input(inp->s_copy_shift);
+    }
+
+    // [TAG_RECURRENT_ROLLBACK_RING]
+    inp->n_written = mctx_cur->get_n_written();
+    inp->n_older   = mctx_cur->get_n_older();
+    if (inp->n_written > 0) {
+        inp->rs_wr = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int64_t) inp->n_written * n_seqs);
+        ggml_set_input(inp->rs_wr);
+        inp->rs_wr_conv.resize(inp->n_written);
+        for (uint32_t j = 0; j < inp->n_written; ++j) {
+            inp->rs_wr_conv[j] = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_seqs);
+            ggml_set_input(inp->rs_wr_conv[j]);
+        }
+    }
+    if (inp->n_older > 0) {
+        inp->rs_old_src = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, inp->n_older);
+        inp->rs_old_dst = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, inp->n_older);
+        ggml_set_input(inp->rs_old_src);
+        ggml_set_input(inp->rs_old_dst);
     }
 
     return inp;
@@ -3931,9 +4019,27 @@ ggml_tensor * llm_graph_context::build_rs(
         const llm_graph_get_rows_fn & get_state_rows) const {
     const auto * kv_state = inp->mctx;
 
-    return build_rs(s, inp->s_copy_main, inp->s_copy_extra, state_size, n_seqs,
+    // [TAG_RECURRENT_ROLLBACK_RING] a seq whose data moves cells this ubatch takes its older
+    // rollback groups along, plane for plane. Gather before build_rs's extra-state copy (an
+    // extra may be the seq that was swapped out of our destination cell, and it reads from
+    // there), scatter after it.
+    ggml_tensor * states = nullptr;
+    ggml_tensor * older  = nullptr;
+    if (inp->rs_old_src != nullptr) {
+        states = ggml_reshape_2d(ctx0, s, state_size, s->ne[1]);
+        older  = ggml_get_rows(ctx0, states, inp->rs_old_src);
+        ggml_build_forward_expand(gf, older);
+    }
+
+    ggml_tensor * out = build_rs(s, inp->s_copy_main, inp->s_copy_extra, state_size, n_seqs,
                     kv_state->get_n_rs(), kv_state->get_head(), kv_state->get_size(), kv_state->get_rs_z(),
                     get_state_rows);
+
+    if (older != nullptr) {
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx0, states, older, inp->rs_old_dst));
+    }
+
+    return out;
 }
 
 ggml_tensor * llm_graph_context::build_rwkv_token_shift_load(
@@ -4217,7 +4323,11 @@ void llm_graph_context::build_sampling() const {
     // add a dummy row of logits
     // this trick makes the graph static, regardless of which samplers are activated
     // this is important in order to minimize graph reallocations
-    ggml_tensor * logits_t = ggml_pad(ctx0, res->t_logits, 0, 1, 0, 0);
+    // The single-row samplers below read row 0 at most when no row is an output, so the pad is only
+    // needed when there are no logit rows; otherwise they view res->t_logits directly (same row
+    // stride, same bytes) and the copy is not run. Graph reuse already compares n_outputs.
+    ggml_tensor * logits_t = res->t_logits->ne[1] > 0 && ggml_is_contiguous(res->t_logits)
+            ? res->t_logits : ggml_pad(ctx0, res->t_logits, 0, 1, 0, 0);
 
     // upstream: give stateful backend sampler chains a chance to reset before the graph is rebuilt
     for (const auto & entry : samplers) {
@@ -4337,20 +4447,27 @@ void llm_graph_context::build_sampling() const {
 }
 
 // Only these head layouts reach the CUDA MMVQ one-row-expert path (no expert sorting, no dequantization).
-static bool draft_vocab_direct(const ggml_tensor * head) {
-    if (!head->buffer || !ggml_is_contiguous(head)) {
-        return false;
+// Returns nullptr when the head qualifies, else why it does not.
+static const char * draft_vocab_direct(const ggml_tensor * head) {
+    if (!head->buffer) {
+        return "head has no buffer";
+    }
+    if (!ggml_is_contiguous(head)) {
+        return "head is not contiguous";
     }
     auto * buft = ggml_backend_buffer_get_type(head->buffer);
     auto * dev  = ggml_backend_buft_get_device(buft);
     if (!dev) {
-        return false;
+        return "head buffer has no device";
     }
     // a Meta device (--split-mode tensor) has no backend registry: the head is sharded across devices there,
     // so the one-row-expert path does not apply and the full head is used instead
     auto * reg = ggml_backend_dev_backend_reg(dev);
-    if (!reg || std::strcmp(ggml_backend_reg_name(reg), "CUDA") != 0 || buft != ggml_backend_dev_buffer_type(dev)) {
-        return false;
+    if (!reg || std::strcmp(ggml_backend_reg_name(reg), "CUDA") != 0) {
+        return "head is not on a CUDA device";
+    }
+    if (buft != ggml_backend_dev_buffer_type(dev)) {
+        return "head is in a split or host buffer";
     }
     switch (head->type) {
         case GGML_TYPE_Q4_0: case GGML_TYPE_Q4_1: case GGML_TYPE_Q5_0: case GGML_TYPE_Q5_1:
@@ -4358,10 +4475,66 @@ static bool draft_vocab_direct(const ggml_tensor * head) {
         case GGML_TYPE_Q5_K: case GGML_TYPE_Q6_K: case GGML_TYPE_IQ2_XXS: case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ2_S: case GGML_TYPE_IQ3_XXS: case GGML_TYPE_IQ3_S: case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_IQ4_XS: case GGML_TYPE_IQ1_S: case GGML_TYPE_IQ1_M:
-            return true;
+            return nullptr;
         default:
-            return false;
+            return "head type has no one-row MMVQ path";
     }
+}
+
+enum draft_vocab_fallback_reason {
+    DRAFT_VOCAB_FALLBACK_HADAMARD,
+    DRAFT_VOCAB_FALLBACK_LORA,
+    DRAFT_VOCAB_FALLBACK_HEAD_SCALE,
+    DRAFT_VOCAB_FALLBACK_NOT_SMALLER,
+    DRAFT_VOCAB_FALLBACK_HEAD_LAYOUT,
+    DRAFT_VOCAB_FALLBACK_NO_BACKEND_SAMPLER,
+};
+
+static const char * draft_vocab_fallback_name(int reason) {
+    switch (reason) {
+        case DRAFT_VOCAB_FALLBACK_HADAMARD:           return "hadamard_head";
+        case DRAFT_VOCAB_FALLBACK_LORA:               return "lora";
+        case DRAFT_VOCAB_FALLBACK_HEAD_SCALE:         return "per_row_head_scale";
+        case DRAFT_VOCAB_FALLBACK_NOT_SMALLER:        return "map_not_smaller_than_head";
+        case DRAFT_VOCAB_FALLBACK_HEAD_LAYOUT:        return "head_layout";
+        case DRAFT_VOCAB_FALLBACK_NO_BACKEND_SAMPLER: return "no_backend_sampler";
+        default:                                      return "unknown";
+    }
+}
+
+ggml_tensor * llm_graph_context::draft_vocab_fallback(int reason, const char * detail) const {
+    ggml_ledger_addf("llama.draft_vocab", 1, "full_head reason=%s", draft_vocab_fallback_name(reason));
+    const uint32_t bit = 1u << reason;
+    if (draft_vocab_warned == nullptr || (draft_vocab_warned->fetch_or(bit) & bit) == 0) {
+        LLAMA_LOG_WARN("%s: draft vocabulary shortlist not applied (%s%s%s), the draft scores the full head; "
+                       "logged once per context\n", __func__, draft_vocab_fallback_name(reason),
+                       detail ? ": " : "", detail ? detail : "");
+    }
+    return nullptr;
+}
+
+ggml_tensor * llm_graph_context::build_draft_vocab_compact(
+        ggml_tensor * head_w,
+        ggml_tensor * head_s,
+        ggml_tensor * cur) const {
+    const int64_t n_sel = draft_vocab_compact->ne[1];
+    GGML_ASSERT(n_sel == draft_vocab_ids->ne[0] && draft_vocab_compact->ne[0] == head_w->ne[0]);
+    ggml_ledger_addf("llama.draft_vocab", 1, "compact type=%s n_sel=%lld", ggml_type_name(draft_vocab_compact->type), (long long) n_sel);
+
+    ggml_tensor * x = cur;
+    if (ggml_exl3_bits(head_w->type) != 0) {
+        // the compact rows live in the rotated input domain of the EXL3 head (llama-draft-vocab-compact.h): feed them
+        // x_rot = H128(suh * x), the same input glue build_lora_mm builds with LLAMA_EXL3_GLUE_GRAPH=1
+        const llama_model::exl3_side * exl3 = model_ref ? model_ref->exl3_side_of(head_w) : nullptr;
+        GGML_ASSERT(exl3 != nullptr && model_ref->exl3_had128 != nullptr);
+        x = ggml_mul(ctx0, x, exl3->suh);
+        x = build_exl3_had128(ctx0, model_ref->exl3_had128, x);
+    }
+    ggml_tensor * logits = ggml_mul_mat(ctx0, draft_vocab_compact, x); // [n_sel, n]
+    if (head_s) {
+        logits = ggml_mul(ctx0, logits, head_s);
+    }
+    return logits;
 }
 
 ggml_tensor * llm_graph_context::build_draft_vocab_logits(
@@ -4371,14 +4544,24 @@ ggml_tensor * llm_graph_context::build_draft_vocab_logits(
     if (draft_vocab_ids == nullptr || n_outputs == 0 || head_w == nullptr) {
         return nullptr;
     }
-    if (hadamard_rotations && hadamard_rotations->count(head_w)) {
-        return nullptr;
+    // [#81] a compact head built from this head replaces the hadamard_head / head_layout outcomes
+    const bool compact = draft_vocab_compact != nullptr && draft_vocab_compact_src == head_w;
+    if (!compact && hadamard_rotations && hadamard_rotations->count(head_w)) {
+        return draft_vocab_fallback(DRAFT_VOCAB_FALLBACK_HADAMARD, "the output head is Hadamard-rotated");
     }
-    if ((loras && !loras->empty()) || (head_s && ggml_nelements(head_s) != 1)) {
-        return nullptr;
+    if (loras && !loras->empty()) {
+        return draft_vocab_fallback(DRAFT_VOCAB_FALLBACK_LORA, "a LoRA adapter is loaded");
     }
-    if (draft_vocab_ids->ne[0] >= head_w->ne[1] || !draft_vocab_direct(head_w)) {
-        return nullptr;
+    if (head_s && ggml_nelements(head_s) != 1) {
+        return draft_vocab_fallback(DRAFT_VOCAB_FALLBACK_HEAD_SCALE, "the output head has a per-row scale");
+    }
+    if (draft_vocab_ids->ne[0] >= head_w->ne[1]) {
+        return draft_vocab_fallback(DRAFT_VOCAB_FALLBACK_NOT_SMALLER, "the map has as many rows as the head");
+    }
+    if (!compact) {
+        if (const char * why = draft_vocab_direct(head_w)) {
+            return draft_vocab_fallback(DRAFT_VOCAB_FALLBACK_HEAD_LAYOUT, why);
+        }
     }
     // the compact logits never reach the host: every output row must be consumed by a backend sampler
     for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
@@ -4387,13 +4570,21 @@ ggml_tensor * llm_graph_context::build_draft_vocab_logits(
         }
         for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
             if (samplers.find(ubatch.seq_id[i][j]) == samplers.end()) {
-                return nullptr;
+                return draft_vocab_fallback(DRAFT_VOCAB_FALLBACK_NO_BACKEND_SAMPLER, "an output row has no backend sampler");
             }
         }
     }
     GGML_ASSERT(cur->ne[1] == n_outputs);
 
+    if (compact) {
+        ggml_tensor * logits = build_draft_vocab_compact(head_w, head_s, cur); // [n_sel, n_outputs]
+        cb(logits, "draft_vocab_logits", -1);
+        res->t_logits_ids = draft_vocab_ids;
+        return logits;
+    }
+
     const int64_t n_sel = draft_vocab_ids->ne[0];
+    ggml_ledger_addf("llama.draft_vocab", 1, "shortlist n_sel=%lld", (long long) n_sel);
 
     // each vocabulary row is a one-row expert of the existing head: no second weight matrix
     ggml_tensor * rows = ggml_reshape_3d(ctx0, head_w, head_w->ne[0], 1, head_w->ne[1]);
@@ -4412,6 +4603,47 @@ ggml_tensor * llm_graph_context::build_draft_vocab_logits(
 
     res->t_logits_ids = draft_vocab_ids;
 
+    return logits;
+}
+
+ggml_tensor * llm_graph_context::build_draft_vocab_logits_chain(
+        ggml_tensor * head_w,
+        ggml_tensor * head_s,
+        ggml_tensor * cur) const {
+    if (draft_vocab_ids == nullptr || head_w == nullptr) {
+        return nullptr;
+    }
+    const bool compact = draft_vocab_compact != nullptr && draft_vocab_compact_src == head_w;
+    if (!compact && hadamard_rotations && hadamard_rotations->count(head_w)) {
+        return draft_vocab_fallback(DRAFT_VOCAB_FALLBACK_HADAMARD, "the output head is Hadamard-rotated");
+    }
+    if (loras && !loras->empty()) {
+        return draft_vocab_fallback(DRAFT_VOCAB_FALLBACK_LORA, "a LoRA adapter is loaded");
+    }
+    if (head_s && ggml_nelements(head_s) != 1) {
+        return draft_vocab_fallback(DRAFT_VOCAB_FALLBACK_HEAD_SCALE, "the output head has a per-row scale");
+    }
+    if (draft_vocab_ids->ne[0] >= head_w->ne[1]) {
+        return draft_vocab_fallback(DRAFT_VOCAB_FALLBACK_NOT_SMALLER, "the map has as many rows as the head");
+    }
+    if (!compact) {
+        if (const char * why = draft_vocab_direct(head_w)) {
+            return draft_vocab_fallback(DRAFT_VOCAB_FALLBACK_HEAD_LAYOUT, why);
+        }
+    }
+    GGML_ASSERT(cur->ne[1] == 1);
+    if (compact) {
+        return build_draft_vocab_compact(head_w, head_s, cur);
+    }
+
+    const int64_t n_sel = draft_vocab_ids->ne[0];
+    ggml_ledger_addf("llama.draft_vocab", 1, "chain_shortlist n_sel=%lld", (long long) n_sel);
+
+    ggml_tensor * rows   = ggml_reshape_3d(ctx0, head_w, head_w->ne[0], 1, head_w->ne[1]);
+    ggml_tensor * logits = ggml_reshape_2d(ctx0, ggml_mul_mat_id(ctx0, rows, cur, draft_vocab_ids), n_sel, 1);
+    if (head_s) {
+        logits = ggml_mul(ctx0, logits, head_s);
+    }
     return logits;
 }
 

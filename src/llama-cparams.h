@@ -40,6 +40,7 @@ struct llama_cparams {
     bool embeddings_nextn;        // also extract the hidden state before the final output norm
     bool embeddings_nextn_masked; // extract for only rows where batch.logits != 0
     bool mtp_chain;               // DECODER_MTP: chain rows in-graph from the first row's inputs
+    int32_t mtp_chain_top_k;      // [#69] 0: the chain drafts by argmax; > 0: it samples over this many candidates
     bool causal_attn;
     bool offload_kqv;
     bool flash_attn;
@@ -58,6 +59,8 @@ struct llama_cparams {
     bool op_offload;
     bool kv_unified;
     bool pipeline_parallel;
+
+    uint32_t kv_stream_arena_mib;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 

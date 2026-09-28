@@ -44,6 +44,7 @@
 #define cudaDeviceGetPCIBusId musaDeviceGetPCIBusId
 #define cudaDeviceProp musaDeviceProp
 #define cudaDeviceSynchronize musaDeviceSynchronize
+#define cudaDeviceGetAttribute musaDeviceGetAttribute
 #define cudaError_t musaError_t
 #define cudaErrorMemoryAllocation musaErrorMemoryAllocation
 #define cudaErrorPeerAccessAlreadyEnabled musaErrorPeerAccessAlreadyEnabled
@@ -55,6 +56,9 @@
 #define cudaEventSynchronize musaEventSynchronize
 #define cudaEvent_t musaEvent_t
 #define cudaEventDestroy musaEventDestroy
+#define cudaEventQuery musaEventQuery
+#define cudaEventElapsedTime musaEventElapsedTime
+#define cudaErrorNotReady musaErrorNotReady
 #define cudaFree musaFree
 #define cudaFreeHost musaFreeHost
 #define cudaGetDevice musaGetDevice
@@ -66,6 +70,12 @@
 #define cudaHostRegisterPortable musaHostRegisterPortable
 #define cudaHostRegisterReadOnly musaHostRegisterReadOnly
 #define cudaHostUnregister musaHostUnregister
+#define cudaHostAlloc musaHostAlloc
+#define cudaHostAllocMapped musaHostAllocMapped
+#define cudaHostAllocPortable musaHostAllocPortable
+#define cudaHostAllocWriteCombined musaHostAllocWriteCombined
+#define cudaHostGetDevicePointer musaHostGetDevicePointer
+#define cudaHostGetFlags musaHostGetFlags
 #define cudaLaunchCooperativeKernel musaLaunchCooperativeKernel
 #define cudaLaunchHostFunc musaLaunchHostFunc
 #define cudaMalloc musaMalloc
@@ -117,6 +127,7 @@
 #define cuMemRelease muMemRelease
 #define cuMemSetAccess muMemSetAccess
 #define cuMemUnmap muMemUnmap
+#define cudaDevAttrCooperativeLaunch musaDevAttrCooperativeLaunch
 #define cudaFuncAttributeMaxDynamicSharedMemorySize musaFuncAttributeMaxDynamicSharedMemorySize
 #define cudaFuncSetAttribute musaFuncSetAttribute
 #define cudaMemcpy3DPeerParms musaMemcpy3DPeerParms
@@ -148,6 +159,9 @@
 #define cudaStreamCaptureModeRelaxed musaStreamCaptureModeRelaxed
 #define cudaStreamBeginCapture musaStreamBeginCapture
 #define cudaStreamEndCapture musaStreamEndCapture
+#define cudaStreamCaptureStatus musaStreamCaptureStatus
+#define cudaStreamCaptureStatusNone musaStreamCaptureStatusNone
+#define cudaStreamIsCapturing musaStreamIsCapturing
 #define cudaOccupancyMaxActiveBlocksPerMultiprocessor musaOccupancyMaxActiveBlocksPerMultiprocessor
 
 typedef __mt_bfloat16 nv_bfloat16;

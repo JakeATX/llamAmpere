@@ -1,6 +1,18 @@
 #include "models.h"
 #include "llama-kv-cache.h"
 #include "llama-memory-recurrent.h"
+#include "llama-mtp-chain-sample.h"
+
+// Output-row gather indices, or nullptr when every row is an output (decode, speculative verify,
+// MTP drafts): the gather would then be an identity copy. The graph topology still depends only on
+// n_outputs vs n_tokens, which graph reuse already compares. Pipeline parallelism keeps the gather
+// for a constant topology (see build_inp_out_ids()).
+static ggml_tensor * qwen35_build_inp_out_ids(const llm_graph_context & g) {
+    if (g.n_outputs == g.n_tokens && !g.cparams.pipeline_parallel) {
+        return nullptr;
+    }
+    return g.build_inp_out_ids();
+}
 
 void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
@@ -173,7 +185,7 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
     auto * inp = build_inp_mem_hybrid();
 
     ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    ggml_tensor * inp_out_ids = qwen35_build_inp_out_ids(*this);
 
     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
     for (int il = 0; il < n_layer; ++il) {
@@ -652,7 +664,7 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     res->add_input(std::move(inp));
 
     ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    ggml_tensor * inp_out_ids = qwen35_build_inp_out_ids(*this);
 
     auto * inp_attn = build_attn_inp_kv();
 
@@ -786,6 +798,24 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
         ggml_tensor * logits_all = nullptr;
         ggml_tensor * h_all      = nullptr;
 
+        // [#69] sampled chain: each step draws in-graph over its top chain_k candidates against a
+        // host-drawn uniform (llama-mtp-chain-sample.h); 0 keeps the argmax chain
+        const int32_t chain_k = params.cparams.mtp_chain_top_k;
+        ggml_tensor * chain_samp = nullptr;
+        ggml_tensor * chain_u    = nullptr;
+        if (chain_k > 0) {
+            auto inp_s = std::make_unique<llm_graph_input_mtp_chain_samp>(mtp_chain_samp);
+            inp_s->samp = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, LLAMA_MTP_CHAIN_SAMP_N);
+            ggml_set_input(inp_s->samp);
+            ggml_set_name(inp_s->samp, "mtp_chain_samp");
+            inp_s->u = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_chain);
+            ggml_set_input(inp_s->u);
+            ggml_set_name(inp_s->u, "mtp_chain_u");
+            chain_samp = inp_s->samp;
+            chain_u    = inp_s->u;
+            res->add_input(std::move(inp_s));
+        }
+
         for (int64_t j = 0; j < n_chain; ++j) {
             ggml_tensor * cur_j = build_block(proj_cur, n_catchup + j, 1);
 
@@ -802,9 +832,17 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
                 return env != nullptr ? atoll(env) : 32768;
             }();
 
-            ggml_tensor * logits_j;
-            if (n_sub_env > 0 && n_sub_env < head_w2->ne[1] &&
-                    !(hadamard_rotations && hadamard_rotations->count(head_w2))) {
+            // [BL7c] a loaded draft vocabulary shortlist replaces the leading-rows cut: logit positions are
+            // then map rows, translated back to token ids through draft_vocab_ids
+            ggml_tensor * id_map   = nullptr;
+            ggml_tensor * logits_j = build_draft_vocab_logits_chain(head_w2, head_s2, h_next_j);
+            // an EXL3 head is K-major tiled and needs the suh/svh glue (build_lora_mm): a leading-rows view of it
+            // is not its first rows, so it scores the full head as with LLAMA_SPEC_CHAIN_SUB=0
+            const bool sub_exl3 = ggml_exl3_bits(head_w2->type) != 0;
+            if (logits_j != nullptr) {
+                id_map = draft_vocab_ids;
+            } else if (n_sub_env > 0 && n_sub_env < head_w2->ne[1] &&
+                    !(hadamard_rotations && hadamard_rotations->count(head_w2)) && !sub_exl3) {
                 ggml_tensor * head_sub = ggml_view_2d(ctx0, head_w2,
                         head_w2->ne[0], n_sub_env, head_w2->nb[1], 0);
                 logits_j = ggml_mul_mat(ctx0, head_sub, h_next_j);
@@ -812,16 +850,31 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
                     logits_j = ggml_mul(ctx0, logits_j, head_s2);
                 }
             } else {
+                static bool logged_sub_exl3 = false;
+                if (sub_exl3 && n_sub_env > 0 && n_sub_env < head_w2->ne[1] && !logged_sub_exl3) {
+                    logged_sub_exl3 = true;
+                    LLAMA_LOG_INFO("%s: MTP chain: the output head is EXL3, the %lld-row sub-head cut does not apply; "
+                                   "the chain scores the full head (logged once)\n", __func__, (long long) n_sub_env);
+                }
                 logits_j = build_lora_mm(head_w2, h_next_j, head_s2);
             }
 
-            ggml_tensor * id_j = ggml_argmax(ctx0, logits_j);
-            ggml_tensor * probs_j = ggml_soft_max(ctx0, logits_j);
-            ggml_tensor * p_j = ggml_get_rows(ctx0,
-                    ggml_reshape_2d(ctx0, probs_j, 1, probs_j->ne[0]), id_j);
-            p_j = ggml_reshape_2d(ctx0, p_j, 1, 1);
-            ggml_tensor * id_f = ggml_cast(ctx0, ggml_reshape_2d(ctx0, id_j, 1, 1), GGML_TYPE_F32);
-            ggml_tensor * out_j = ggml_concat(ctx0, id_f, p_j, 0);
+            ggml_tensor * id_j;
+            ggml_tensor * out_j;
+            if (chain_k > 0) {
+                ggml_tensor * u_j = ggml_view_1d(ctx0, chain_u, 1, (size_t) j*chain_u->nb[0]);
+                out_j = llama_mtp_chain_sample_graph(ctx0, logits_j, chain_k, chain_samp, u_j, id_map, &id_j);
+            } else {
+                ggml_tensor * pos_j = ggml_argmax(ctx0, logits_j);
+                ggml_tensor * probs_j = ggml_soft_max(ctx0, logits_j);
+                ggml_tensor * p_j = ggml_get_rows(ctx0,
+                        ggml_reshape_2d(ctx0, probs_j, 1, probs_j->ne[0]), pos_j);
+                p_j = ggml_reshape_2d(ctx0, p_j, 1, 1);
+                id_j = id_map == nullptr ? pos_j
+                    : ggml_reshape_1d(ctx0, ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, id_map, 1, id_map->ne[0]), pos_j), 1);
+                ggml_tensor * id_f = ggml_cast(ctx0, ggml_reshape_2d(ctx0, id_j, 1, 1), GGML_TYPE_F32);
+                out_j = ggml_concat(ctx0, id_f, p_j, 0);
+            }
 
             logits_all = logits_all == nullptr ? out_j : ggml_concat(ctx0, logits_all, out_j, 1);
             h_all      = h_all      == nullptr ? h_next_j : ggml_concat(ctx0, h_all, h_next_j, 1);
@@ -837,7 +890,9 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
         res->t_h_nextn = h_all;
         ggml_build_forward_expand(gf, h_all);
 
-        ggml_build_forward_expand(gf, ggml_view_1d(ctx0, inp_out_ids, inp_out_ids->ne[0], 0));
+        if (inp_out_ids) {
+            ggml_build_forward_expand(gf, ggml_view_1d(ctx0, inp_out_ids, inp_out_ids->ne[0], 0));
+        }
 
         cb(logits_all, "result_output", -1);
         res->t_logits = logits_all;
@@ -931,7 +986,9 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     cb(cur, "h_nextn", -1);
     res->t_h_nextn = cur;
 
-    cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    if (inp_out_ids) {
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    }
     cb(cur, "mtp_shared_head_norm", -1);
 
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;

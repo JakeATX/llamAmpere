@@ -16,6 +16,7 @@
 #include <vector>
 #include <map>
 #include <algorithm>
+#include <filesystem>
 #include <fstream>
 
 #if defined(_WIN32) && !defined(_WIN32_WINNT)
@@ -184,6 +185,16 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_COUNT          // number of types, unknown type
 };
 
+// speculative settings the user set explicitly (command line, environment, config or preset file);
+// the per-family defaults of spec-defaults.h never override them
+enum common_params_speculative_user_field : uint32_t {
+    COMMON_PARAMS_SPECULATIVE_USER_TYPE                 = 1 << 0, // --spec-type (any value, including none)
+    COMMON_PARAMS_SPECULATIVE_USER_DRAFT_N_MAX          = 1 << 1, // --spec-draft-n-max, --spec-chain N
+    COMMON_PARAMS_SPECULATIVE_USER_DRAFT_N_MIN_ADAPTIVE = 1 << 2, // --spec-draft-n-min-adaptive
+    COMMON_PARAMS_SPECULATIVE_USER_DRAFT_P_MIN          = 1 << 3, // --spec-draft-p-min
+    COMMON_PARAMS_SPECULATIVE_USER_DRAFT_VOCAB_MAP      = 1 << 4, // --spec-draft-vocab-map
+};
+
 // Grammar type enumeration
 enum common_grammar_type {
     COMMON_GRAMMAR_TYPE_NONE,           // no grammar set
@@ -334,7 +345,7 @@ struct common_params_speculative_draft {
     bool chain = false; // chained drafting: all n_max tokens in one GPU decode (MTP only)
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 
-    std::string vocab_map; // draft-only vocabulary shortlist map for the MTP draft head (empty = full vocabulary)
+    std::string vocab_map = "auto"; // draft-only vocabulary shortlist for the MTP draft head: auto, auto:N, none or a map file
     int32_t vocab_hot = 0; // trailing entries of that map kept adaptive: repointed at ids seen in recent requests
 
     common_params_model mparams;
@@ -344,8 +355,10 @@ struct common_params_speculative_draft {
 
     int32_t n_gpu_layers = -1; // number of layers to store in VRAM for the draft model (-1 - use default)
 
-    ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
-    ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
+    // KV cache data types of the draft context; GGML_TYPE_COUNT = not set, inherit the main context's
+    // cache_type_k / cache_type_v (resolved in common_base_params_to_speculative)
+    ggml_type cache_type_k = GGML_TYPE_COUNT; // KV cache data type for the K
+    ggml_type cache_type_v = GGML_TYPE_COUNT; // KV cache data type for the V
 
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;
@@ -378,6 +391,9 @@ struct common_params_speculative_ngram_cache {
     std::string lookup_cache_static;  // path of static ngram cache file for lookup decoding
     std::string lookup_cache_dynamic; // path of dynamic ngram cache file for lookup decoding
 
+    int32_t n_max = 0; // maximum number of tokens to draft (0 = the built-in default of the ngram-cache drafter)
+    int32_t n_min = 0; // shorter drafts are discarded, the next implementation then drafts (0 = keep every draft)
+
     bool    save_dynamic          = false;   // write the dynamic cache back to lookup_cache_dynamic (checkpoints and shutdown)
     int32_t save_dynamic_interval = 300;     // seconds between checkpoints of the dynamic cache (0 = only at shutdown)
     int32_t max_ngrams_dynamic    = 1000000; // n-grams kept in the dynamic cache when saving, lowest utility evicted (0 = unlimited)
@@ -389,6 +405,8 @@ struct common_params_speculative_ngram_cache {
 
 struct common_params_speculative {
     std::vector<enum common_speculative_type> types = { COMMON_SPECULATIVE_TYPE_NONE };
+
+    uint32_t user_set = 0; // bitfield of common_params_speculative_user_field
 
     double synth_len = -1.0;
     std::vector<double> synth_rates;
@@ -411,14 +429,55 @@ struct common_params_speculative {
         return synth_len != -1.0 || !synth_rates.empty();
     }
 
-    uint32_t need_n_rs_seq() const {
-        bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
-            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP ||
-                   t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE ||
-                   t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
-        });
+    // recurrent-state snapshots requested per sequence (-1 = derive from the drafters, see need_n_rs_seq())
+    int32_t n_rs_seq_override = -1;
 
-        return needs_rs_seq ? draft.n_max : 0u;
+    // per-token recurrent-state snapshots the target context must keep so that a partial draft
+    // acceptance can roll the GDN/SSM state back in place (COMMON_CONTEXT_SEQ_RM_TYPE_RS).
+    // Without them a hybrid/recurrent target falls back to a full checkpoint restore + replay
+    // decode pass on every partial acceptance (COMMON_CONTEXT_SEQ_RM_TYPE_FULL), which on the
+    // n-gram drafters showed up as a fixed ~50 ms per drafted pass on Qwen3.5-27B.
+    // n-gram drafters are capped at 8 snapshots (each snapshot is a full S state, ~144 MiB on
+    // Qwen3.5-27B); a rollback deeper than the cap still works through the checkpoint path.
+    uint32_t need_n_rs_seq() const {
+        if (n_rs_seq_override >= 0) {
+            return (uint32_t) n_rs_seq_override;
+        }
+
+        constexpr uint32_t n_rs_seq_ngram_max = 8;
+
+        uint32_t n = 0;
+        for (auto t : types) {
+            switch (t) {
+                case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
+                case COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE:
+                case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:
+                case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
+                case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
+                    n = std::max(n, (uint32_t) draft.n_max);
+                    break;
+                case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:
+                    // 8 = the drafter's built-in default width (common_speculative_impl_ngram_cache::N_DRAFT_DEFAULT)
+                    n = std::max(n, std::min(n_rs_seq_ngram_max, ngram_cache.n_max > 0 ? (uint32_t) ngram_cache.n_max : 8u));
+                    break;
+                case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:
+                    n = std::max(n, std::min(n_rs_seq_ngram_max, (uint32_t) ngram_simple.size_m));
+                    break;
+                case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:
+                    n = std::max(n, std::min(n_rs_seq_ngram_max, (uint32_t) ngram_map_k.size_m));
+                    break;
+                case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V:
+                    n = std::max(n, std::min(n_rs_seq_ngram_max, (uint32_t) ngram_map_k4v.size_m));
+                    break;
+                case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:
+                    n = std::max(n, std::min(n_rs_seq_ngram_max, (uint32_t) std::max(0, ngram_mod.n_max)));
+                    break;
+                default:
+                    break;
+            }
+        }
+
+        return n;
     }
 };
 
@@ -626,6 +685,7 @@ struct common_params {
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
+    uint32_t kv_stream_arena_mib = 0;        // shared CUDA KV + compute arena, 0 = disabled [EXPERIMENTAL]
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 
@@ -673,10 +733,10 @@ struct common_params {
     std::string cache_disk_path;         // spill prompt-cache entries evicted from RAM to this directory (empty = off)
     int32_t cache_disk_mib      = 0;     // disk tier size limit in MiB, 0 = no limit
 
-    std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT
     std::string api_prefix    = "";                                                                         // NOLINT
     std::string chat_template = "";                                                                         // NOLINT
+    std::vector<std::string> hostnames = {"127.0.0.1"};
     bool use_jinja = true;                                                                                  // NOLINT
 
     // server CORS params
@@ -925,6 +985,18 @@ std::string string_from(const struct llama_context * ctx, const struct llama_bat
 bool glob_match(const std::string & pattern, const std::string & str);
 
 //
+// Unicode utils
+//
+
+#ifdef _WIN32
+std::wstring utf8_to_wstring(const std::string & str);
+std::string  wstring_to_utf8(const std::wstring & str);
+#endif
+
+// returns the path as a UTF-8 string, preserving its separators
+std::string fs_path_to_utf8(const std::filesystem::path & path);
+
+//
 // Environment utils
 //
 
@@ -993,6 +1065,8 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
 
 struct llama_model_params   common_model_params_to_llama  (      common_params & params);
 struct llama_context_params common_context_params_to_llama(const common_params & params);
+
+bool common_params_should_fit_device_memory(const common_params & params);
 
 // clear LoRA adapters from context, then apply new list of adapters
 void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adapter_lora_info> & lora);
@@ -1065,6 +1139,10 @@ void common_batch_add(
     const std::vector<llama_seq_id> & seq_ids,
                                bool   logits);
 
+// create a single-sequence batch from a list of tokens
+// last token always have output_logits set to true
+llama_batch_ext_ptr common_batch_ext_get_one(struct llama_context * ctx, const llama_tokens & tokens);
+
 // decodes a single batch of tokens for a prompt and manages session tokens
 //
 // Note: We save state before the last token so that we can replay it to ensure
@@ -1072,7 +1150,7 @@ void common_batch_add(
 // tokens from memory, so this approach works across all model architectures.
 bool common_prompt_batch_decode(
               struct llama_context * ctx,
-    const std::vector<llama_token> & all_tokens,
+                const llama_tokens & all_tokens,
                                int   n_new,
                                int & n_past,
                                int   n_batch,

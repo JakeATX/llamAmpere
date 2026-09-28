@@ -14,7 +14,7 @@ static __global__ void k_elem_chain(const float * __restrict__ src,
         return;
     }
 
-    float v = src[i];
+    float v = desc.src_s1 == desc.src_ne0 ? src[i] : src[(i / desc.src_ne0) * desc.src_s1 + i % desc.src_ne0];
 
 #pragma unroll 1
     for (int k = 0; k < desc.n_ops; ++k) {

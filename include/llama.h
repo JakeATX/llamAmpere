@@ -77,6 +77,7 @@ extern "C" {
         LLAMA_VOCAB_TYPE_UGM    = 4, // T5 tokenizer based on Unigram
         LLAMA_VOCAB_TYPE_RWKV   = 5, // RWKV tokenizer based on greedy tokenization
         LLAMA_VOCAB_TYPE_PLAMO2 = 6, // PLaMo-2 tokenizer based on Aho-Corasick with dynamic programming
+        LLAMA_VOCAB_TYPE_TEST   = 7, // Dummy tokenizer for testing: rolling hash of fixed-size chunks -> tokens, tokens -> hex
     };
 
     enum llama_rope_type {
@@ -308,6 +309,11 @@ extern "C" {
         LLAMA_MODEL_META_KEY_SAMPLING_MIROSTAT_ETA,
     };
 
+    enum llama_process_type {
+        LLAMA_PROCESS_TYPE_ENCODE,
+        LLAMA_PROCESS_TYPE_DECODE,
+    };
+
     struct llama_model_kv_override {
         enum llama_model_kv_override_type tag;
 
@@ -446,6 +452,14 @@ extern "C" {
         // slots: the runtime may repoint them at token ids seen in recent requests (see
         // llama_draft_vocab_observe / llama_draft_vocab_refresh). 0 = the map is fully static.
         int32_t draft_vocab_hot;
+
+        // [EXPERIMENTAL] block-granular KV cache streaming: total shared CUDA
+        // arena (compute workspace + resident KV pages + transfer ring), in
+        // MiB. 0 disables streaming.
+        // Appended here (not with the other [EXPERIMENTAL] fields above) so
+        // a caller built against a pre-streaming header keeps the same
+        // offsets for every field before it.
+        uint32_t kv_stream_arena_mib;
     };
 
     struct llama_model_tensor_override {
@@ -1040,6 +1054,104 @@ extern "C" {
     LLAMA_API int32_t llama_decode(
             struct llama_context * ctx,
               struct llama_batch   batch);
+
+    // Describes the role of subsequent llama_decode() batches for
+    // phase-specialized memory allocators. It does not change model math.
+    enum llama_decode_phase {
+        LLAMA_DECODE_PHASE_AUTOMATIC  = 0,
+        LLAMA_DECODE_PHASE_PROMPT     = 1,
+        LLAMA_DECODE_PHASE_GENERATION = 2,
+    };
+
+    // The selected phase remains active until changed. AUTOMATIC preserves
+    // the traditional token-count heuristic for callers without phase state.
+    LLAMA_API void llama_set_decode_phase(
+        struct llama_context * ctx, enum llama_decode_phase phase);
+
+    //
+    // Extended batch API
+    //
+
+    struct llama_batch_ext;
+
+    struct llama_embd {
+        const float * data;
+        size_t n_rows; // number of embedding rows in data
+        size_t n_embd; // size of one row
+    };
+
+    LLAMA_API struct llama_batch_ext * llama_batch_ext_init (struct llama_context * ctx);
+    LLAMA_API void                     llama_batch_ext_free (struct llama_batch_ext * batch);
+    LLAMA_API void                     llama_batch_ext_clear(struct llama_batch_ext * batch);
+
+    // Add an input token to the batch, with default values:
+    //     id = LLAMA_TOKEN_NULL
+    //     embd = nullptr
+    //     pos = not set, the caller must set it with llama_batch_ext_set_pos()
+    // Returns the batch index (>= 0)
+    // On error:
+    //     -1: batch is full
+    //     -2: token is invalid (id == LLAMA_TOKEN_NULL or invalid embd)
+    //     -3: invalid sequence id
+    LLAMA_API int32_t llama_batch_ext_add      (struct llama_batch_ext * batch, llama_seq_id seq_id);
+
+    // Add an input token to the batch, with a specified token ID or token embedding
+    LLAMA_API int32_t llama_batch_ext_add_token(struct llama_batch_ext * batch, llama_seq_id seq_id, llama_token id);
+    LLAMA_API int32_t llama_batch_ext_add_embd (struct llama_batch_ext * batch, llama_seq_id seq_id, struct llama_embd embd);
+
+    // Add the token at index idx in the batch to another sequence id. The position will stays the same.
+    // Note: this should be called before other _set() functions
+    LLAMA_API bool llama_batch_ext_add_seq(
+                                struct llama_batch_ext * batch,
+                                               int32_t   idx,
+                                          llama_seq_id   seq_id);
+
+    // Set the token embedding for the token at index idx in the batch
+    // use it after llama_batch_ext_add_token() to have an entry with both a token id and an embedding
+    LLAMA_API bool llama_batch_ext_set_embd_token(
+                                struct llama_batch_ext * batch,
+                                               int32_t   idx,
+                                     struct llama_embd   embd);
+
+    // Set the "state" embedding for the token at index idx in the batch
+    // "state" here means extra hidden state carried over from a previous stage, e.g.:
+    //   - MTP: state from N layers of the target model
+    //   - Qwen3 VL (deepstack): state from N layers of the vision encoder
+    LLAMA_API bool llama_batch_ext_set_embd_state(
+                                struct llama_batch_ext * batch,
+                                               int32_t   idx,
+                                     struct llama_embd   embd);
+
+    // Set if output embeddings should be available for the token at index idx in the batch
+    // Note: for now, this is equivalent to setting the output logits
+    LLAMA_API bool llama_batch_ext_set_output_embd(
+                                struct llama_batch_ext * batch,
+                                               int32_t  idx,
+                                                  bool  value);
+
+    // Set output logits for the token at index idx in the batch
+    // Note: for now, this is equivalent to setting the output embd
+    LLAMA_API bool llama_batch_ext_set_output_logits(
+                                struct llama_batch_ext * batch,
+                                               int32_t  idx,
+                                                  bool  value);
+
+    // Set custom position for the token at index idx in the batch
+    // For M-RoPE models:
+    //     - Embedding tokens must have multiple positions per token
+    //     - Text token only requires one single position per token
+    LLAMA_API bool llama_batch_ext_set_pos(
+                                struct llama_batch_ext * batch,
+                                               int32_t   idx,
+                                       const llama_pos * pos);
+
+    // TODO: implement get_embeddings() and get_logits() for llama_batch_ext
+
+    // Return values are the same as llama_decode()
+    LLAMA_API int32_t llama_process(
+                                struct llama_context * ctx,
+                             enum llama_process_type   type,
+                              struct llama_batch_ext * batch);
 
     // Set the number of threads used for decoding
     // n_threads is the number of threads used for generation (single token)

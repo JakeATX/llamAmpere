@@ -10,6 +10,7 @@
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
+#include "spec-defaults.h"
 #include "preset.h"
 
 // fix problem with std::min and std::max
@@ -23,6 +24,7 @@
 #endif
 
 #include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <cinttypes>
 #include <climits>
@@ -261,6 +263,13 @@ static void parse_tensor_buffer_overrides(const std::string & value, std::vector
         if (buft) {
             buft_list[ggml_backend_buft_name(buft)] = buft;
         }
+        // Also offer the device's pinned host buffer, so a tensor can deliberately be left in host
+        // memory and read in place. Worth it only for a large tensor that is gathered from rather
+        // than streamed; whether the backend will accept one as a kernel input is its own decision.
+        auto * host_buft = ggml_backend_dev_host_buffer_type(dev);
+        if (host_buft) {
+            buft_list[ggml_backend_buft_name(host_buft)] = host_buft;
+        }
     }
 
     for (const auto & override : string_split<std::string>(value, ',')) {
@@ -316,23 +325,81 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_TURBO2_0,
     GGML_TYPE_TURBO3_0,
     GGML_TYPE_TURBO4_0,
+    GGML_TYPE_TQ5_0,
+    GGML_TYPE_TQ6_0,
 };
 
-static ggml_type kv_cache_type_from_str(const std::string & s) {
+// Alternative spellings of the TurboQuant KV cache types, so that 2..6 bit all work
+// as turboN and as tqN. The ggml type names (turbo2/3/4, tq5_0, tq6_0) stay the canonical
+// ones printed in logs. tq2_0 is not an alias: it is ggml's ternary weight type.
+static const struct {
+    const char * name;
+    ggml_type    type;
+} kv_cache_type_aliases[] = {
+    { "tq2",    GGML_TYPE_TURBO2_0 },
+    { "tq3",    GGML_TYPE_TURBO3_0 },
+    { "tq3_0",  GGML_TYPE_TURBO3_0 },
+    { "tq4",    GGML_TYPE_TURBO4_0 },
+    { "tq4_0",  GGML_TYPE_TURBO4_0 },
+    { "turbo5", GGML_TYPE_TQ5_0    },
+    { "tq5",    GGML_TYPE_TQ5_0    },
+    { "turbo6", GGML_TYPE_TQ6_0    },
+    { "tq6",    GGML_TYPE_TQ6_0    },
+};
+
+ggml_type common_kv_cache_type_from_name(const std::string & name) {
+    std::string s = name;
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return std::tolower(c); });
     for (const auto & type : kv_cache_types) {
         if (ggml_type_name(type) == s) {
             return type;
         }
     }
-    throw std::runtime_error("Unsupported cache type: " + s);
+    for (const auto & alias : kv_cache_type_aliases) {
+        if (alias.name == s) {
+            return alias.type;
+        }
+    }
+    return GGML_TYPE_COUNT;
+}
+
+// "turbo5 (tq5_0)", "turbo3 (tq3_0)", "turbo2 (tq2)", or the plain ggml name for types without an alias
+static std::string kv_cache_type_display_name(ggml_type type) {
+    std::vector<std::string> names = { ggml_type_name(type) };
+    for (const auto & alias : kv_cache_type_aliases) {
+        if (alias.type == type) {
+            names.push_back(alias.name);
+        }
+    }
+    std::string turbo, tq; // prefer the tqN_0 spelling
+    for (const auto & n : names) {
+        if (n.rfind("turbo", 0) == 0) {
+            turbo = n;
+        } else if (n.rfind("tq", 0) == 0 && (tq.empty() || n.compare(n.size() - 2, 2, "_0") == 0)) {
+            tq = n;
+        }
+    }
+    return turbo.empty() || tq.empty() ? names[0] : turbo + " (" + tq + ")";
 }
 
 static std::string get_all_kv_cache_types() {
     std::ostringstream msg;
     for (const auto & type : kv_cache_types) {
-        msg << ggml_type_name(type) << (&type == &kv_cache_types.back() ? "" : ", ");
+        msg << kv_cache_type_display_name(type) << (&type == &kv_cache_types.back() ? "" : ", ");
     }
     return msg.str();
+}
+
+static ggml_type kv_cache_type_from_str(const std::string & s) {
+    const ggml_type type = common_kv_cache_type_from_name(s);
+    if (type != GGML_TYPE_COUNT) {
+        return type;
+    }
+    std::string hint;
+    if (s == "tq2_0" || s == "TQ2_0") {
+        hint = " (tq2_0 is ggml's ternary weight type, not a KV cache type; the 2-bit cache is turbo2, also spelled tq2)";
+    }
+    throw std::runtime_error("Unsupported cache type: " + s + hint + "; allowed values: " + get_all_kv_cache_types());
 }
 
 static bool parse_bool_value(const std::string & value) {
@@ -2080,7 +2147,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.sampling.temp = std::max(params.sampling.temp, 0.0f);
             params.sampling.user_sampling_config |= common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_TEMP;
         }
-    ).set_sampling());
+    ).set_sampling().set_env("LLAMA_ARG_TEMPERATURE"));
     add_opt(common_arg(
         {"--top-k"}, "N",
         string_format("top-k sampling (default: %d, 0 = disabled)", params.sampling.top_k),
@@ -2096,7 +2163,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.sampling.top_p = std::stof(value);
             params.sampling.user_sampling_config |= common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_TOP_P;
         }
-    ).set_sampling());
+    ).set_sampling().set_env("LLAMA_ARG_TOP_P"));
     add_opt(common_arg(
         {"--min-p"}, "N",
         string_format("min-p sampling (default: %.2f, 0.0 = disabled)", (double)params.sampling.min_p),
@@ -2104,7 +2171,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.sampling.min_p = std::stof(value);
             params.sampling.user_sampling_config |= common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_MIN_P;
         }
-    ).set_sampling());
+    ).set_sampling().set_env("LLAMA_ARG_MIN_P"));
     add_opt(common_arg(
         {"--top-nsigma", "--top-n-sigma"}, "N",
         string_format("top-n-sigma sampling (default: %.2f, -1.0 = disabled)", params.sampling.top_n_sigma),
@@ -2160,7 +2227,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.sampling.penalty_repeat = penalty_repeat;
             params.sampling.user_sampling_config |= common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_PENALTY_REPEAT;
         }
-    ).set_sampling());
+    ).set_sampling().set_env("LLAMA_ARG_REPEAT_PENALTY"));
     add_opt(common_arg(
         {"--presence-penalty"}, "N",
         string_format("repeat alpha presence penalty (default: %.2f, 0.0 = disabled)", (double)params.sampling.penalty_present),
@@ -2171,7 +2238,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.sampling.penalty_present = penalty_present;
         }
-    ).set_sampling());
+    ).set_sampling().set_env("LLAMA_ARG_PRESENCE_PENALTY"));
     add_opt(common_arg(
         {"--frequency-penalty"}, "N",
         string_format("repeat alpha frequency penalty (default: %.2f, 0.0 = disabled)", (double)params.sampling.penalty_freq),
@@ -2182,7 +2249,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.sampling.penalty_freq = penalty_freq;
         }
-    ).set_sampling());
+    ).set_sampling().set_env("LLAMA_ARG_FREQUENCY_PENALTY"));
     add_opt(common_arg(
         {"--dry-multiplier"}, "N",
         string_format("set DRY sampling multiplier (default: %.2f, 0.0 = disabled)", (double)params.sampling.dry_multiplier),
@@ -2479,6 +2546,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.no_kv_offload = !value;
         }
     ).set_env("LLAMA_ARG_KV_OFFLOAD"));
+    add_opt(common_arg(
+        {"--kv-stream-arena-mib", "--kv-stream-stage-mib"}, "N",
+        string_format("shared CUDA arena for block-streaming KV and phase compute buffers in MiB; 0 disables it (default: %u)", params.kv_stream_arena_mib),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("KV stream arena size must be non-negative");
+            }
+            params.kv_stream_arena_mib = value;
+        }
+    ).set_env("LLAMA_ARG_KV_STREAM_ARENA_MIB"));
     add_opt(common_arg(
         {"--repack"},
         {"-nr", "--no-repack"},
@@ -3408,9 +3485,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_EMBEDDING}));
     add_opt(common_arg(
         {"--host"}, "HOST",
-        string_format("ip address to listen, or bind to an UNIX socket if the address ends with .sock (default: %s)", params.hostname.c_str()),
+        string_format("IP addresses to listen on, comma-separated, or UNIX socket paths ending in .sock; with multiple TCP addresses, :: binds IPv6 only; overlapping addresses result in undefined behavior (default: %s)", params.hostnames[0].c_str()),
         [](common_params & params, const std::string & value) {
-            params.hostname = value;
+            params.hostnames.clear();
+            for (auto & host : parse_csv_row(value)) {
+                host = string_strip(host);
+                if (!host.empty()) {
+                    params.hostnames.push_back(host);
+                }
+            }
+            if (params.hostnames.empty()) {
+                throw std::invalid_argument("--host requires at least one address");
+            }
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_HOST"));
     add_opt(common_arg(
@@ -4192,9 +4278,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format(
             "KV cache data type for K for the draft model\n"
             "allowed values: %s\n"
-            "(default: %s)",
-            get_all_kv_cache_types().c_str(),
-            ggml_type_name(params.speculative.draft.cache_type_k)
+            "(default: the main model's K cache type from -ctk; pass f16 to force f16)",
+            get_all_kv_cache_types().c_str()
         ),
         [](common_params & params, const std::string & value) {
             params.speculative.draft.cache_type_k = kv_cache_type_from_str(value);
@@ -4205,9 +4290,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format(
             "KV cache data type for V for the draft model\n"
             "allowed values: %s\n"
-            "(default: %s)",
-            get_all_kv_cache_types().c_str(),
-            ggml_type_name(params.speculative.draft.cache_type_v)
+            "(default: the main model's V cache type from -ctv; pass f16 to force f16)",
+            get_all_kv_cache_types().c_str()
         ),
         [](common_params & params, const std::string & value) {
             params.speculative.draft.cache_type_v = kv_cache_type_from_str(value);
@@ -4273,6 +4357,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 throw std::invalid_argument("invalid value");
             }
             params.speculative.draft.n_max = value;
+            params.speculative.user_set |= COMMON_PARAMS_SPECULATIVE_USER_DRAFT_N_MAX;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX"));
     add_opt(common_arg(
@@ -4320,6 +4405,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("minimum adaptive MTP draft depth; the depth starts here and never drops below it (default: %d)", params.speculative.draft.n_min_adaptive),
         [](common_params & params, int value) {
             params.speculative.draft.n_min_adaptive = value;
+            params.speculative.user_set |= COMMON_PARAMS_SPECULATIVE_USER_DRAFT_N_MIN_ADAPTIVE;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MIN_ADAPTIVE"));
 
@@ -4336,6 +4422,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 if (n < 1) throw std::invalid_argument("spec-chain depth must be >= 1");
                 params.speculative.draft.chain = true;
                 params.speculative.draft.n_max = n;
+                params.speculative.user_set |= COMMON_PARAMS_SPECULATIVE_USER_DRAFT_N_MAX;
             }
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_CHAIN"));
@@ -4365,13 +4452,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("minimum speculative decoding probability (greedy) (default: %.2f)", (double)params.speculative.draft.p_min),
         [](common_params & params, const std::string & value) {
             params.speculative.draft.p_min = std::stof(value);
+            params.speculative.user_set |= COMMON_PARAMS_SPECULATIVE_USER_DRAFT_P_MIN;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_P_MIN"));
     add_opt(common_arg(
-        {"--spec-draft-vocab-map"}, "FNAME",
-        "draft-only vocabulary shortlist for the MTP draft head (llama-mtp-vocab-v1 map); the target is unaffected (default: full vocabulary)",
+        {"--spec-draft-vocab-map"}, "{auto,auto:N,none,FNAME}",
+        "draft-only vocabulary shortlist for the MTP draft head; the target is unaffected. 'auto' uses the list compiled in for this "
+        "model's tokenizer and architecture (every quant of a supported base model, e.g. Qwen3.8-27B), 'auto:N' the one of size N, "
+        "FNAME a llama-mtp-vocab-v1 map, 'none' the full vocabulary (default: auto; a model with no built-in list "
+        "drafts over the full vocabulary)",
         [](common_params & params, const std::string & value) {
             params.speculative.draft.vocab_map = value;
+            params.speculative.user_set |= COMMON_PARAMS_SPECULATIVE_USER_DRAFT_VOCAB_MAP;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_VOCAB_MAP"));
     add_opt(common_arg(
@@ -4430,12 +4522,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_MODEL"));
     add_opt(common_arg(
         {"--spec-type"}, common_speculative_all_types_str(),
-        string_format("comma-separated list of types of speculative decoding to use (default: %s)\n",
+        string_format("comma-separated list of types of speculative decoding to use (default: auto, i.e. the model's "
+            "built-in drafter with its measured settings for %s, %s for other models; any explicit value, "
+            "including none, turns auto off, explicit --spec-draft-* values are kept)\n",
+            common_speculative_family_defaults_str().c_str(),
             common_speculative_type_name_str(params.speculative.types).c_str()),
         [](common_params & params, const std::string & value) {
             const auto types_str = string_split<std::string>(value, ',');
             auto types = common_speculative_types_from_names(types_str);
             params.speculative.types.insert(params.speculative.types.end(), types.begin(), types.end());
+            params.speculative.user_set |= COMMON_PARAMS_SPECULATIVE_USER_TYPE;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_TYPE"));
     add_opt(common_arg(
@@ -4456,6 +4552,39 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 throw std::invalid_argument("ngram n-max must be between 0 and 1024 inclusive");
             }
             params.speculative.ngram_mod.n_max = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-ngram-cache-n-max"}, "N",
+        "maximum number of tokens to draft for ngram-cache speculative decoding, 0 = built-in default of 8 (default: 0)",
+        [](common_params & params, int value) {
+            if (value < 0 || value > 1024) {
+                throw std::invalid_argument("ngram-cache n-max must be between 0 and 1024 inclusive");
+            }
+            params.speculative.ngram_cache.n_max = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-n-rs-seq"}, "N",
+        "recurrent-state snapshots per sequence kept by the target context for in-place rollback of partial draft "
+        "acceptances on GDN/SSM (hybrid) models, -1 = derive from the drafters: draft n-max for MTP/EAGLE3/DFlash/DSpark, "
+        "the draft width capped at 8 for the n-gram drafters; 0 = none (every partial acceptance restores a checkpoint "
+        "and replays the accepted tokens) (default: -1)",
+        [](common_params & params, int value) {
+            if (value < -1 || value > 1024) {
+                throw std::invalid_argument("spec-n-rs-seq must be between -1 and 1024 inclusive");
+            }
+            params.speculative.n_rs_seq_override = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-ngram-cache-n-min"}, "N",
+        "minimum number of draft tokens for ngram-cache speculative decoding, shorter drafts are discarded so the next --spec-type drafts instead, 0 = keep every draft (default: 0)",
+        [](common_params & params, int value) {
+            if (value < 0 || value > 1024) {
+                throw std::invalid_argument("ngram-cache n-min must be between 0 and 1024 inclusive");
+            }
+            params.speculative.ngram_cache.n_min = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
@@ -4907,6 +5036,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("enable default speculative decoding config"),
         [](common_params & params) {
             params.speculative.types.push_back(COMMON_SPECULATIVE_TYPE_NGRAM_MOD);
+            params.speculative.user_set |= COMMON_PARAMS_SPECULATIVE_USER_TYPE;
             params.speculative.ngram_mod.n_match = 24;
             params.speculative.ngram_mod.n_min = 48;
             params.speculative.ngram_mod.n_max = 64;

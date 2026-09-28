@@ -90,6 +90,22 @@ public:
 
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
 
+    // [TAG_RECURRENT_ROLLBACK_RING] ring-indexed snapshot groups. When true, rollback group g of
+    // the data in cell c lives in plane (rs_base[c] + g) mod K (K = n_rs_seq + 1) of the widened
+    // r_l/s_l tensors instead of plane g. A ubatch of n < K tokens then writes its newest n groups
+    // at planes (b' + g), b' = (rs_base[src] + rollback - n) mod K, and the older groups stay where
+    // they are -- no snapshot shift (get_snap_shift() == 0 in this mode). Only the archs whose
+    // conv and state writers go through llm_build_delta_net_base opt in (see the constructor);
+    // gdn_replay keeps the shift path.
+    bool rs_ring = false;
+    // LLAMA_RS_RING_ROWS=1: write ring snapshots with set_rows even when the ubatch fills the ring
+    // (the first v0.4 form; A/B only, see get_n_written)
+    bool rs_ring_rows_all = false;
+
+    // per data cell (index = cell whose planes hold the data, i.e. cells[i].src0): plane of
+    // rollback group 0. Set when a ubatch writes the cell, 0 for rs_z, restored or cleared cells.
+    std::vector<uint32_t> rs_base;
+
     // DRC phase 2 (opt-in, env-gated by LLAMA_GDN_REPLAY): when true, `s_l` holds only the
     // authoritative state (no (1+n_rs_seq) widening) and `ingr_l` holds a per-seq ring of
     // n_rs_seq ggml_gated_delta_net emit_mode==1 ingredient slots instead. Rollback marks
@@ -115,6 +131,36 @@ public:
     // ring on the next decode. Set by state_read (the blob carries the checkpoint and the ring,
     // not a materialized rolled-back state), cleared by consume_replay().
     std::vector<uint8_t> s_stale;
+
+    // gdn_replay: the span the ring holds behind the checkpoint after a ubatch of n_seq_tokens
+    // tokens per seq -- the accepted prefix (ckpt_span - replay_len) plus the new tokens, capped
+    // at the ring capacity. The graph input and replay_split::advance() both use it.
+    static uint32_t replay_span_new(uint32_t ckpt_span, uint32_t replay_len, uint32_t n_seq_tokens, uint32_t n_rs_seq);
+
+    // [TAG_GDN_REPLAY_SPLIT] the replay subtree of a ubatch is built from one (replay_len,
+    // ckpt_span, s_stale) -- see llama_memory_recurrent_context::get_replay_len() -- so seqs that
+    // disagree on any of the three must not share a ubatch (a server with several slots
+    // accepting different draft lengths). Each init_batch makes one of these per batch, hands
+    // fn() to split_equal and calls advance() on every ubatch it keeps, which applies to a copy
+    // what consume_replay() will do to the real values when that ubatch's graph runs, so later
+    // ubatches of the same batch are grouped by the values they will actually see.
+    struct replay_split {
+        bool     active   = false;
+        uint32_t n_rs_seq = 0;
+
+        std::vector<uint32_t> replay_len;
+        std::vector<uint32_t> ckpt_span;
+        std::vector<uint8_t>  s_stale;
+
+        bool compat(llama_seq_id a, llama_seq_id b) const;
+        void advance(const llama_ubatch & ubatch);
+
+        // the split_equal filter, or nullptr when the constraint does not apply
+        llama_batch_allocr::seq_compat_fn fn() const;
+    };
+
+    // counts (ledger "llama.recurrent") and logs once when the batch's seqs disagree
+    replay_split make_replay_split(const llama_batch_allocr & balloc) const;
 
     // computed before each graph build
     uint32_t n = 0;
@@ -247,8 +293,9 @@ public:
 
     // DRC phase 2: the checkpoint's span for the sequence in the current ubatch (see
     // llama_memory_recurrent::ckpt_span), and whether s_l is stale for it. With several lanes
-    // the maximum span / any-stale is taken, same as get_replay_len(); lanes that disagree are
-    // not supported (logged once) -- the replay subtree has one shape per graph.
+    // the maximum span / any-stale is taken, same as get_replay_len(); init_batch keeps lanes
+    // that disagree in separate ubatches ([TAG_GDN_REPLAY_SPLIT]), get_ckpt_span() logs once if
+    // one gets through anyway -- the replay subtree has one shape per graph.
     uint32_t get_ckpt_span() const;
     bool     get_s_stale()   const;
     uint32_t get_n_rs_seq()  const;
@@ -261,6 +308,24 @@ public:
     // exactly one short batch (the multi-seq test's shape) restores a state that never existed.
     // Never nonzero on the speculative verify path (n = n_draft + 1 = K).
     uint32_t get_snap_shift() const;
+
+    // [TAG_RECURRENT_ROLLBACK_RING] ring mode accessors (all 0/false when rs_ring is off)
+    bool     get_rs_ring()   const;
+    // snapshot groups this ubatch writes through set_rows at ring rows: min(n_seq_tokens, K) for a
+    // short ubatch (n < K), 0 for a ubatch that fills the ring (n >= K): that one re-bases every
+    // written cell to plane 0, so its groups land at the static planes (group g at plane g) and the
+    // builders write them with the plain strided copies of the non-ring path -- no row inputs, no
+    // per-slot gather (LLAMA_RS_RING_ROWS=1 keeps the set_rows form for every ubatch, for A/B)
+    uint32_t get_n_written() const;
+    uint32_t get_n_older()   const; // rows of the older-group copy for relocated cells ((K - n) per moved seq)
+    // one-shot input fill for ring mode, replacing the s_copy(i) loop: `copy` [n_rs] read rows
+    // (plane (base + rollback) of the source cell), `wr` [n_written * n_seqs] write rows for group
+    // g at [g * n_seqs + s], `wr_conv[j]` [n_seqs] the same rows of group n_written - 1 - j (oldest
+    // group first, the order build_conv_state's source windows have), `old_src`/`old_dst` [n_older]
+    // the rows to copy for the older groups of seqs whose data moves cells this ubatch. `wr` and
+    // `wr_conv` are nullptr when get_n_written() == 0.
+    // Side effects (once per ubatch, like s_copy): rs_idx reset, rs_base of the written cells set.
+    void fill_rs_ring(int32_t * copy, int32_t * wr, int32_t * const * wr_conv, int32_t * old_src, int32_t * old_dst) const;
 
     // DRC phase 2: mark the pending replay as consumed and record the span the graph just
     // built leaves behind the checkpoint. Called exactly once per decode, after the graph has

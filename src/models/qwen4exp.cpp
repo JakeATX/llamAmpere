@@ -279,9 +279,9 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         layer.nextn.hnorm   = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM,   "weight", il), { hc_dim }, flags);
         layer.nextn.eh_proj = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ, "weight", il), { 2 * n_embd, n_embd }, flags);
 
-        // unused: graph_mtp reuses the trunk's own model.hc_head_* (see qwen4exp.cpp's
-        // graph_mtp). Kept optional here only so files that still carry this tensor
-        // (e.g. blk.N.nextn.hc_head_* from an older PR 27836-style export) still load.
+        // graph_mtp prefers these when present and falls back to the trunk's own
+        // model.hc_head_*. A draft-only export has no trunk, so this is the only mixer it
+        // has; a full export normally shares the trunk's and leaves these absent.
         layer.nextn.hc_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_NORM, "weight", il), { hc_dim }, flags | TENSOR_NOT_REQUIRED);
         layer.nextn.hc_head_down = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_DOWN, "weight", il), { hc_dim, hc_lr }, flags | TENSOR_NOT_REQUIRED);
         layer.nextn.hc_head_up   = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_UP,   "weight", il), { hc_lr, hc_dim }, flags | TENSOR_NOT_REQUIRED);
@@ -534,10 +534,16 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     GGML_ASSERT(layer.nextn.eh_proj     && "MTP block missing nextn.eh_proj");
     GGML_ASSERT(layer.nextn.enorm       && "MTP block missing nextn.enorm");
     GGML_ASSERT(layer.nextn.hnorm       && "MTP block missing nextn.hnorm");
-    // the MTP head's final mixer is the trunk's own output_hc_* (model.hc_head_*), not a
-    // private per-layer copy: upstream trains one hc mixer, shared between the trunk's last
-    // layer and the draft head, same as the trunk's own final-output call below.
-    GGML_ASSERT(model.hc_head_norm && "QWEN4EXP MTP: model missing hc_head_norm (trunk output mixer)");
+    // The MTP head's final mixer is normally the trunk's own output_hc_* (model.hc_head_*):
+    // upstream trains one hc mixer, shared between the trunk's last layer and the draft head.
+    // A draft-only export has no trunk to share with, so it carries its own
+    // blk.N.nextn.hc_head_* instead. Prefer that when it is there, the same way the LM head
+    // is chosen further down. Without this an MTP-only file loads (trunk_flags makes the
+    // trunk mixer optional for it) and then aborts here.
+    ggml_tensor * mtp_hc_norm = layer.nextn.hc_head_norm ? layer.nextn.hc_head_norm : model.hc_head_norm;
+    ggml_tensor * mtp_hc_down = layer.nextn.hc_head_down ? layer.nextn.hc_head_down : model.hc_head_down;
+    ggml_tensor * mtp_hc_up   = layer.nextn.hc_head_up   ? layer.nextn.hc_head_up   : model.hc_head_up;
+    GGML_ASSERT(mtp_hc_norm && "QWEN4EXP MTP: no output mixer (neither nextn.hc_head_norm nor model.hc_head_norm)");
 
     int sections[4];
     std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
@@ -554,9 +560,14 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     ggml_set_input(inp->h);
     ggml_set_name(inp->h, "mtp_h_input");
 
-    GGML_ASSERT((layer.nextn.embed_tokens || model.tok_embd) &&
-            "QWEN4EXP MTP: checkpoint has neither nextn.embed_tokens nor a trunk token_embd.weight to draft from");
     ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
+    if (tok_embd_w == nullptr) {
+        GGML_ASSERT(cparams.ctx_other != nullptr);
+        const auto * model_other = llama_get_model(cparams.ctx_other);
+        GGML_ASSERT(model_other->tok_embd != nullptr &&
+                "QWEN4EXP MTP: draft-only checkpoint requires the target model's token embeddings");
+        tok_embd_w = model_other->tok_embd;
+    }
     ggml_tensor * tok_embd   = ggml_get_rows(ctx0, tok_embd_w, inp->tokens);
     cb(tok_embd, "mtp_tok_embd", il);
 
@@ -687,10 +698,10 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
         res_hc = ggml_reshape_3d(ctx0, res_hc, n_embd, hc, res_hc->ne[1]);
     }
 
-    // the final mixer is shared with the trunk's own output mixer (model.hc_head_*), not a
-    // private per-layer copy -- see the GGML_ASSERT above
+    // the trunk's own output mixer, or the head's private copy for a draft-only export
+    // -- chosen above
     cur = build_hc_mix(res_hc,
-            model.hc_head_norm, model.hc_head_down, model.hc_head_up,
+            mtp_hc_norm, mtp_hc_down, mtp_hc_up,
             nullptr, nullptr, -1);
     cb(cur, "mtp_hc_head", -1);
 
@@ -699,7 +710,14 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
 
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
-    GGML_ASSERT(head_w && "QWEN4EXP MTP: missing LM head (nextn.shared_head_head or model.output)");
+    if (head_w == nullptr) {
+        GGML_ASSERT(cparams.ctx_other != nullptr);
+        const auto * model_other = llama_get_model(cparams.ctx_other);
+        GGML_ASSERT(model_other->output != nullptr &&
+                "QWEN4EXP MTP: draft-only checkpoint requires the target model's output projection");
+        head_w = model_other->output;
+        head_s = model_other->output_s;
+    }
 
     cur = build_lora_mm(head_w, cur, head_s);
     cb(cur, "result_output", -1);
@@ -1012,7 +1030,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, 0, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, top_k->ne[0], kq_scale, il);
     cb(cur, "kqv_out", il);
 
     // the rotation is its own inverse, so undo it on the value side of the output

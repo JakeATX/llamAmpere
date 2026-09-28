@@ -9,7 +9,9 @@ struct __builtin_align__(32) float8 {
     float p; float q; float r; float s;
 };
 
-#if CUDART_VERSION >= 12080
+// Only the Blackwell NVFP4 activation quantizer below calls this; defining it for other arches
+// leaves an unreferenced function that nvcc 13 rejects under -Werror all-warnings.
+#if defined(BLACKWELL_MMA_AVAILABLE) && CUDART_VERSION >= 12080
 static __device__ __forceinline__ float nvfp4_native_scale_error(
         const float vals[QK_NVFP4_SUB], const float inv_col_scale, const float inv_scale, const float scale) {
     const float scale_dequant = 2.0f * scale;

@@ -4,8 +4,8 @@ project("ggml" C CXX ASM)
 
 ### GGML Version
 set(GGML_VERSION_MAJOR 0)
-set(GGML_VERSION_MINOR 24)
-set(GGML_VERSION_PATCH 0)
+set(GGML_VERSION_MINOR 25)
+set(GGML_VERSION_PATCH 3)
 set(GGML_VERSION_BASE "${GGML_VERSION_MAJOR}.${GGML_VERSION_MINOR}.${GGML_VERSION_PATCH}")
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/")
@@ -332,6 +332,7 @@ set(GGML_PUBLIC_HEADERS
     include/ggml-cann.h
     include/ggml-cpp.h
     include/ggml-cuda.h
+    include/ggml-ledger.h
     include/ggml-opt.h
     include/ggml-metal.h
     include/ggml-rpc.h

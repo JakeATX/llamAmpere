@@ -149,6 +149,7 @@ if (LLAMA_LLGUIDANCE)
 endif ()
 
 llama_build(test-recurrent-state-rollback.cpp)
+llama_build(test-fit-recurrent-noalloc.cpp)
 llama_build(test-output-buffer-reuse.cpp)
 
 llama_build_and_test(test-gdn-ingredient-replay.cpp LABEL "turbo")
@@ -216,6 +217,16 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         ARGS -m "${MODEL_DIR}/qwen35-dense.gguf"
     )
     set_tests_properties(test-recurrent-state-rollback PROPERTIES
+        FIXTURES_REQUIRED generate-models
+    )
+
+    # the -fit probe (no_alloc) must size the recurrent state without allocating it
+    llama_test(
+        test-fit-recurrent-noalloc
+        LABEL main
+        ARGS -m "${MODEL_DIR}/qwen35-dense.gguf"
+    )
+    set_tests_properties(test-fit-recurrent-noalloc PROPERTIES
         FIXTURES_REQUIRED generate-models
     )
 
@@ -300,6 +311,25 @@ llama_build_and_test(test-thread-safety.cpp ARGS -m "${MODEL_DEST}" -ngl 99 -p "
 set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
 
 llama_build_and_test(test-arg-parser.cpp)
+if (NOT BUILD_SHARED_LIBS)
+    llama_build_and_test(test-kv-stream-plan.cpp ${PROJECT_SOURCE_DIR}/src/llama-kv-stream-plan.cpp)
+    target_include_directories(test-kv-stream-plan PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    llama_build_and_test(test-kv-stream-config.cpp ${PROJECT_SOURCE_DIR}/src/llama-kv-stream-config.cpp)
+    target_include_directories(test-kv-stream-config PRIVATE ${PROJECT_SOURCE_DIR}/src)
+endif()
+llama_build_and_test(test-kv-stream-softmax.cpp llama-kv-stream-softmax.cpp)
+if (GGML_CUDA)
+    llama_build_and_test(test-kv-stream-cuda-buffer.cpp LABEL cuda)
+    target_include_directories(test-kv-stream-cuda-buffer PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda)
+    # The test exits 77 when no CUDA device is present (e.g. a CUDA build run
+    # on a GPU-less CI runner). ctest only treats that as a skip when
+    # SKIP_RETURN_CODE says so; without it the skip is recorded as a failure.
+    set_tests_properties(test-kv-stream-cuda-buffer PROPERTIES SKIP_RETURN_CODE 77)
+    llama_build_and_test(test-kv-stream-cuda-attn.cpp LABEL cuda)
+    target_include_directories(test-kv-stream-cuda-attn PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda)
+    llama_build_and_test(test-kv-stream-cuda-set-rows.cpp LABEL cuda)
+    target_include_directories(test-kv-stream-cuda-set-rows PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda)
+endif()
 llama_build_and_test(test-model-resolution.cpp)
 # the test serves its repos from an httplib server, and the library links it privately
 target_link_libraries(test-model-resolution PRIVATE cpp-httplib)
@@ -313,7 +343,17 @@ endif()
 # TODO: make this test (and others) not link `libllama` as it is not needed [TAG_TESTS_LLAMA_LINK]
 llama_build_and_test(test-backend-ops.cpp)
 llama_build_and_test(test-mtp-vocab.cpp)
+llama_build_and_test(test-mtp-vocab-builtin.cpp ../src/llama-mtp-vocab-builtin.cpp)
+llama_build_and_test(test-gdn-replay-split.cpp)
+llama_build_and_test(test-add-rms-q8.cpp) # [#46] skips without a GPU backend
+llama_build_and_test(test-exl3-ffn-bridge.cpp) # [#74] skips without a GPU backend
+llama_build_and_test(test-exl3-weight-major.cpp) # [#73] skips without a GPU backend
+llama_build_and_test(test-fattn-alloc-route.cpp) # [#64] skips without a GPU backend
+llama_build_and_test(test-fattn-bounded-prefill.cpp) # [#22/#29] forks one child per GGML_CUDA_PREFILL_KV_MIB arm; skips without a GPU backend
+llama_build_and_test(test-mtp-chain-sample.cpp) # [#69] CPU always, the GPU when present
+llama_build_and_test(test-gdn-ingr-compact.cpp) # [#63] CPU always, the GPU when present
 llama_build_and_test(test-draft-vocab-hot.cpp)
+llama_build_and_test(test-draft-vocab-compact.cpp)
 if (NOT LLAMA_USE_SYSTEM_GGML)
     llama_build(test-moe-cache.cpp)
     if (GGML_CUDA)
@@ -336,6 +376,7 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
 endif()
 
 llama_build_and_test(test-moe-cache-fit.cpp)
+llama_build_and_test(test-fit-extra.cpp)
 
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
@@ -350,7 +391,7 @@ if (APPLE)
     llama_build(test-rset-release.cpp)
 endif()
 
-if (NOT GGML_BACKEND_DL)
+if (NOT GGML_BACKEND_DL AND GGML_CPU)
     # these tests use the backends directly and cannot be built with dynamic loading
     llama_build_and_test(test-barrier.cpp)
     llama_build_and_test(test-quantize-fns.cpp)

@@ -61,12 +61,34 @@ enum common_params_fit_status {
 // a second model that shares the devices of the main model, e.g. a draft model
 //   - its context follows the context of the main model, so its memory is measured again whenever that context changes
 //   - shares_model tells the fit that the weights are already counted in the main model, as for an MTP context
+//   - shares_compute tells the fit that the context borrows the compute buffers of the main context, as an MTP context
+//     does on a single device (LLAMA_SHARED_COMPUTE); it is then measured once at the minimum context size and its KV
+//     cache is scaled from there
 struct common_fit_extra_model {
     const char * path_model;
     llama_model_params * mparams;
     llama_context_params * cparams;
     bool shares_model;
+    bool shares_compute;
 };
+
+// memory of the extra model on one device, in bytes
+struct common_fit_extra_memory {
+    size_t model;
+    size_t context;
+    size_t compute;
+};
+
+// memory the extra model adds to one device at context size n_ctx, from a measurement at n_ctx_measured:
+//   - the weights do not depend on the context, the KV cache grows linearly with it (rounded up)
+//   - a context that shares compute buffers adds nothing while its own buffer fits in the main context's buffer
+//     (compute_main), otherwise it allocates a private buffer of the measured size
+common_fit_extra_memory common_fit_extra_memory_at(
+        const common_fit_extra_memory & measured,
+                             uint32_t   n_ctx_measured,
+                             uint32_t   n_ctx,
+                               size_t   compute_main,
+                                 bool   shares_compute);
 
 // fits mparams and cparams to free device memory (assumes system memory is unlimited)
 //   - returns true if the parameters could be successfully modified to fit device memory

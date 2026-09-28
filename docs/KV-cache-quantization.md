@@ -1,15 +1,22 @@
 # KV Cache Quantization with TurboQuant
 
-TurboQuant adds three runtime-only KV cache quantization types that compress
+TurboQuant adds five runtime-only KV cache quantization types that compress
 the K/V cache far beyond the standard `q8_0` while keeping decode quality via a
 Walsh-Hadamard rotation (WHT) that Gaussianizes the cache vectors before
-quantization:
+quantization. They are named by bit width, `turbo2` to `turbo6`:
 
-| Type               | Enum                       | Size            | Compression vs f16 |
-|--------------------|----------------------------|-----------------|--------------------|
-| `turbo2`           | `GGML_TYPE_TURBO2_0` (43)  | 2 bits/value    | 6.4x               |
-| `turbo3`           | `GGML_TYPE_TURBO3_0` (44)  | 3.25 bits/value | 4.9x               |
-| `turbo4`           | `GGML_TYPE_TURBO4_0` (47)  | 4.25 bits/value | 3.8x               |
+| Type               | Also accepted     | Enum (name in logs)                 | Size             | Compression vs f16 |
+|--------------------|-------------------|-------------------------------------|------------------|--------------------|
+| `turbo2`           | `tq2`             | `GGML_TYPE_TURBO2_0` (43, `turbo2`) | 2.125 bits/value | 7.5x               |
+| `turbo3`           | `tq3`, `tq3_0`    | `GGML_TYPE_TURBO3_0` (44, `turbo3`) | 3.125 bits/value | 5.1x               |
+| `turbo4`           | `tq4`, `tq4_0`    | `GGML_TYPE_TURBO4_0` (47, `turbo4`) | 4.125 bits/value | 3.9x               |
+| `turbo5`           | `tq5`, `tq5_0`    | `GGML_TYPE_TQ5_0` (59, `tq5_0`)     | 5.125 bits/value | 3.1x               |
+| `turbo6`           | `tq6`, `tq6_0`    | `GGML_TYPE_TQ6_0` (58, `tq6_0`)     | 6.125 bits/value | 2.6x               |
+
+Every flag that takes a cache type (`-ctk`/`-ctv`, `-ctkd`/`-ctvd`, `llama-bench -ctk/-ctv`)
+accepts both spellings, case-insensitively. Logs and `llama-bench` output print the ggml
+name in the third column (for example `K (tq5_0)` for `-ctk turbo5`). `tq2_0` is not an
+alias: it is ggml's ternary weight type, and `-ctk tq2_0` is rejected.
 
 These are KV-cache-only types: they are never stored in model files. The
 corresponding model-weight quantization types are `TQ3_1S` (45) and `TQ4_1S`
@@ -23,8 +30,9 @@ llama-cli -m model.gguf -c 8192 -ngl 99 \
     --cache-type-k q8_0 --cache-type-v turbo3
 ```
 
-Any combination of `f16`, `q8_0`, `turbo2`, `turbo3`, `turbo4` for K and V is
-supported; mixing quantized V with unquantized K is the common configuration.
+Any combination of `f16`, `q8_0`, `turbo3`, `turbo4`, `turbo5`, `turbo6` for K and V is
+supported, and `turbo2` for V only (a `turbo2` K request is rejected at context
+creation); mixing a low-bit V with a higher-bit K is the common configuration.
 
 Turbo KV types require flash attention. If a turbo cache type is requested
 with flash attention disabled, it is enabled automatically (a warning is
@@ -32,6 +40,12 @@ printed). A quantized V cache with flash attention explicitly disabled is an
 error, matching upstream behavior for all quantized V types.
 
 The same flags work in `llama-server`, `llama-bench`, and `llama-perplexity`.
+
+## Model-specific quality
+
+Models with attention sinks can be unusually sensitive to K-cache quantization. GPT-OSS is a known case: even `q8_0` K changes the output distribution substantially, and lower-bit K types degrade it further despite normal codec and kernel accuracy. Use `f16` K for GPT-OSS and other sink-heavy models. Validate a quantized V cache separately against an `f16` K/V baseline before deploying it.
+
+Short output samples are not a sufficient quality check for this class of model because the text can remain fluent while token probabilities move significantly. Use `llama-perplexity --kl-divergence` or an equivalent logit comparison when selecting cache types.
 
 ## Rotation
 
@@ -46,7 +60,7 @@ K), so V rotation and padding are skipped for them.
 | Variable                        | Default | Effect                                                          |
 |---------------------------------|---------|-----------------------------------------------------------------|
 | `TURBO_LAYER_ADAPTIVE`          | `0`     | Layer-adaptive KV precision; `7` = Boundary V (first/last layers in `q8_0`, middle in turbo) |
-| `TURBO_AUTO_ASYMMETRIC`         | `1`     | Auto-select asymmetric K/V types for large-GQA models (`0` disables) |
+| `TURBO_AUTO_ASYMMETRIC`         | `1`     | Rewrite a symmetric turbo3 K+V request to q8_0 K on models with GQA ratio >= 6 (`0` disables); turbo4, turbo5 and turbo6 K are never rewritten, turbo2 is V-only |
 | `TURBO_SPARSE_V`                | `1`     | Sparse-V dequant skip in flash attention (`0` disables)        |
 | `LLAMA_ATTN_ROT_K_OVERRIDE`     | off     | Enable upstream #21038 attention rotation for K                |
 | `LLAMA_ATTN_ROT_V_OVERRIDE`     | off     | Enable upstream #21038 attention rotation for V                |

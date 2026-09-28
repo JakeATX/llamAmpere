@@ -37,7 +37,18 @@ void ggml_cuda_exl3_gemv(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
 
 // out[T][K] (f16) = scale * H128(suh * x)  (suh null: scale * x)
 void ggml_cuda_exl3_glue_in_f16(const float * x, const float * suh, half * out, const int K, const int64_t T, const float scale, cudaStream_t stream);
-// y[T][N] = scale * svh * H128( sum_ks part[ks][T][N] )  (svh null: scale * sum)
+// y[T][N] = scale * svh * H128( sum_ks part[ks][T][N] )  (svh null: scale * sum); N % 128 == 0 when svh is set
 void ggml_cuda_exl3_glue_out(const float * part, const float * svh, float * y, const int N, const int64_t T, const int ksplit, const float scale, cudaStream_t stream);
+
+// [#74] out[T][N] (f16) = x_scale * H128(suh_down * silu(svh_gate * H128(sum part_gate)) * svh_up * H128(sum part_up)):
+// glue_out of the FFN gate and up projections, the SwiGLU and glue_in of the down projection in one kernel
+void ggml_cuda_exl3_ffn_bridge_f16(const float * part_gate, const int ksplit_gate, const float * svh_gate,
+                                   const float * part_up, const int ksplit_up, const float * svh_up,
+                                   const float * suh_down, half * out, const int N, const int64_t T, const float x_scale,
+                                   cudaStream_t stream);
+// [#74] gate/up/down EXL3 projections with glu = swiglu_split(gate, up) between them, through the bridge above; the
+// gate and up outputs are never materialized. Returns false (nothing launched) when a precondition fails.
+bool ggml_cuda_exl3_ffn_bridge(ggml_backend_cuda_context & ctx, const ggml_tensor * mm_gate, const ggml_tensor * mm_up,
+                               ggml_tensor * mm_down);
 
 void ggml_cuda_mul_mat_exl3(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);

@@ -173,7 +173,9 @@ content hashes, between the two paths.
 Multi Token Prediction (MTP) with an adaptive draft depth. Same machinery as `draft-mtp`
 (MTP heads from the main model, see the Qwen3 MTP head docs), but the number of draft tokens is
 tuned per sequence at runtime by a hysteresis controller instead of being fixed at
-`--spec-draft-n-max`.
+`--spec-draft-n-max`. It is not the default: Qwen3.8 models with an MTP head get `draft-mtp` at a fixed
+depth of 4 (see below); pass `--spec-type draft-mtp-adaptive --spec-draft-n-max 4 --spec-draft-n-min-adaptive 3`
+for adaptive depth 3-4 instead.
 
 The depth starts at the floor `max(1, --spec-draft-n-min-adaptive)` (default 3) and stays in
 `[floor, n_max]`. It climbs one step after a run of consecutive verifies that accepted every
@@ -339,7 +341,10 @@ Use exactly one of these options:
 ```
 --spec-type [none|draft-simple|draft-eagle3|draft-dflash|draft-dspark|draft-mtp|draft-mtp-adaptive|ngram-cache|ngram-simple|ngram-map-k|ngram-map-k4v|ngram-mod]
                                         comma-separated list of types of speculative decoding to use
-                                        (default: none)
+                                        (default: auto, i.e. the model's built-in drafter with its measured
+                                        settings for qwen35 with an MTP head: draft-mtp, none for other
+                                        models; any explicit value, including none, turns auto off, explicit
+                                        --spec-draft-* values are kept)
                                         (env: LLAMA_ARG_SPEC_TYPE)
 --spec-default                          use default speculative decoding config
                                         (enables ngram-mod)
@@ -415,11 +420,13 @@ Use exactly one of these options:
 ```
 --spec-draft-type-k, -ctkd, --cache-type-k-draft  TYPE
                                         KV cache data type for K for the draft model
-                                        allowed values: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1
+                                        allowed values: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1, turbo2 (tq2), turbo3 (tq3_0), turbo4 (tq4_0), turbo5 (tq5_0), turbo6 (tq6_0)
+                                        (default: the main model's K cache type from -ctk; pass f16 to force f16)
                                         (env: LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_K)
 --spec-draft-type-v, -ctvd, --cache-type-v-draft  TYPE
                                         KV cache data type for V for the draft model
-                                        allowed values: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1
+                                        allowed values: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1, turbo2 (tq2), turbo3 (tq3_0), turbo4 (tq4_0), turbo5 (tq5_0), turbo6 (tq6_0)
+                                        (default: the main model's V cache type from -ctv; pass f16 to force f16)
                                         (env: LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V)
 --spec-draft-override-tensor, -otd, --override-tensor-draft  <tensor name pattern>=<buffer type>,...
                                         override tensor buffer type for draft model
@@ -430,6 +437,9 @@ Use exactly one of these options:
                                         keep the MoE weights of the first N layers in the CPU for the draft model
                                         (env: LLAMA_ARG_SPEC_DRAFT_N_CPU_MOE)
 ```
+
+The TurboQuant cache types are named `turbo2` to `turbo6` by bit width; the `tq2` to `tq6` spellings (and
+`tq3_0` to `tq6_0`) are accepted too ([KV-cache-quantization.md](KV-cache-quantization.md)).
 
 ### n-gram Mod Parameters
 
@@ -481,7 +491,7 @@ Specifies a comma-separated list of speculative decoding types to use.
 
 | Type | Description |
 |------|-------------|
-| `none` | No speculative decoding (default) |
+| `none` | No speculative decoding (default for models without a family default, see below) |
 | `draft-simple` | Use a simple draft model for speculation |
 | `draft-eagle3` | Use an EAGLE-3 draft model that reads the target's hidden states |
 | `draft-dflash` | Use a DFlash block-diffusion draft model that emits a block per step |
@@ -493,6 +503,16 @@ Specifies a comma-separated list of speculative decoding types to use.
 | `ngram-map-k` | Use n-gram pattern matching with n-gram-keys |
 | `ngram-map-k4v` | Use n-gram pattern matching with n-gram-keys and up to four m-gram values (experimental) |
 | `ngram-mod` | Use basic ngram hasher for speculative decoding with shared pool |
+
+Without `--spec-type`, `llama-server` and `llama-cli` turn on a model family's built-in drafter with its measured
+settings; today `qwen35` (Qwen3.8) models with an MTP head get `draft-mtp` at a fixed depth (n-max 4), p-min 0 and
+vocab map `auto`. Adaptive depth 3-4 is available with `--spec-type draft-mtp-adaptive --spec-draft-n-max 4
+--spec-draft-n-min-adaptive 3`. Any explicit `--spec-type` (including `none`), `--spec-default`, a draft model
+(`-md`), `--eagle3` or `--dflash` turns this off, and so does an explicit `--spec-draft-n-max 0`. Explicit
+`--spec-draft-n-max`, `--spec-draft-n-min-adaptive`, `--spec-draft-p-min` and `--spec-draft-vocab-map` values are
+kept on top of the default. The default does not set the draft KV cache types: like any drafter's, they follow
+`-ctk`/`-ctv` unless `--spec-draft-type-k`/`-v` is given. Other tools (`llama-bench`, `llama-perplexity`, ...) are
+unaffected. See [MTP drafter default](../tools/server/README.md#mtp-drafter-default).
 
 **Example:** Server-instance used to refactor source code.
 ```bash

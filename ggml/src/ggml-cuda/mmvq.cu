@@ -1,11 +1,15 @@
 #include "mmvq.cuh"
 #include "convrot.cuh"
+#include "ledger.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
 
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
+#include <string>
 #include <type_traits>
 
 // only enabled on DGX Spark, where it is a gain on every type below. On the higher-bandwidth parts the kernel
@@ -260,13 +264,55 @@ static bool ggml_cuda_qc4_nw1() {
 
 // IQ3_XXS / IQ3_S: stage the codebook grid (1 KB / 2 KB, a static const __device__ table in
 // global memory) into shared memory once per block. Same values, same accumulation order, so
-// bit-identical to the global-table path. OFF by default; GGML_CUDA_SM86_IQ3_SMEM_GRID=1 enables.
-static bool ggml_cuda_sm86_iq3_smem_grid() {
-    static const bool value = [] {
+// bit-identical to the global-table path. ON by default for SM86 at ncols_dst 1..4 (3090 Ti gate
+// 2026-09-16, m=4096 k=14336: iq3_s +2.3/+9.1/+6.9/+10.1%, iq3_xxs +1.2/+5.3/+14.1/+5.5% at widths
+// 1/2/3/4; at widths 5..8 rows_per_block drops 8 -> 2 and the win vanishes: iq3_xxs -4.1/-2.8%,
+// iq3_s +0.9/+0.2%). GGML_CUDA_SM86_IQ3_SMEM_GRID=0 disables it, =1 forces it at every width.
+// Returns the largest ncols_dst that uses the staged grid.
+static int ggml_cuda_sm86_iq3_smem_grid_max_ncols() {
+    static const int value = [] {
         const char * env = getenv("GGML_CUDA_SM86_IQ3_SMEM_GRID");
-        return env != nullptr && env[0] == '1';
+        if (env == nullptr) {
+            return 4;
+        }
+        return env[0] == '1' ? MMVQ_MAX_BATCH_SIZE : 0;
     }();
     return value;
+}
+
+// IQ2_XXS / IQ2_XS / IQ2_S: same staged-codebook trick (2 KB / 4 KB / 8 KB uint64 tables). 2026-09-20 gate
+// (m=4096 k=14336, us/run): iq2_xxs +1.1..+7.2% at every width 1..8, iq2_xs -0.5(noise)/+6.8/+7.5/+4.9/+9.7/+2.2%,
+// iq2_s -18.1% at width 1 and -9.3% at width 8 (the 8 KB per-block copy dominates there) but +5.4..+8.9% at 2..5.
+// SM86 default: iq2_xxs and iq2_xs at every width, iq2_s at widths 2..5. GGML_CUDA_SM86_IQ2_SMEM_GRID=0 turns it
+// off, =1 stages at every width, =N at widths 1..N (overrides the per-type default).
+static int ggml_cuda_sm86_iq2_smem_grid_env() {
+    static const int value = [] {
+        const char * env = getenv("GGML_CUDA_SM86_IQ2_SMEM_GRID");
+        if (env == nullptr) {
+            return -1;
+        }
+        const int n = atoi(env);
+        return n == 1 ? MMVQ_MAX_BATCH_SIZE : (n < 0 ? 0 : (n > MMVQ_MAX_BATCH_SIZE ? MMVQ_MAX_BATCH_SIZE : n));
+    }();
+    return value;
+}
+
+static bool ggml_cuda_sm86_iq2_smem_grid_use(ggml_type type, int ncols_dst) {
+    const int env = ggml_cuda_sm86_iq2_smem_grid_env();
+    if (env >= 0) {
+        return ncols_dst <= env;
+    }
+    switch (type) {
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_XS:  return true;
+        case GGML_TYPE_IQ2_S:   return ncols_dst >= 2 && ncols_dst <= 5;
+        default:                return false;
+    }
+}
+
+static constexpr __host__ __device__ bool ggml_cuda_mmvq_smem_grid_type(ggml_type type) {
+    return type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S ||
+           type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ2_S;
 }
 
 // PTQ1_0 cross-column reuse (widths 2-8) is exact and on by default for SM86; GGML_CUDA_SM86_PTQ1_REUSE=0 disables it.
@@ -576,11 +622,43 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
     }
 #if !defined(GGML_USE_HIP)
     if (type == GGML_TYPE_PTQ1_0 && GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_TURING) {
-        return ne11 <= 7;
+        return ne11 <= 8; // the V6 reuse lane kernel beats the MMQ tile at width 8 too
     }
 #endif
+    // Per-type MMVQ width ceiling override for kernel tuning sweeps, e.g.
+    // GGML_MMVQ_NMAX="q6_K=5,iq4_xs=8" (batches above the ceiling go to MMQ when it
+    // supports the type). Read once; unset = no override.
+    {
+        static const std::string spec = [] { const char * e = getenv("GGML_MMVQ_NMAX"); return std::string(e ? e : ""); }();
+        if (!spec.empty()) {
+            const char * tn = ggml_type_name(type);
+            const size_t tl = strlen(tn);
+            size_t pos = 0;
+            while (pos < spec.size()) {
+                size_t end = spec.find(',', pos); if (end == std::string::npos) end = spec.size();
+                size_t eq = spec.find('=', pos);
+                if (eq != std::string::npos && eq < end && eq - pos == tl && spec.compare(pos, tl, tn) == 0) {
+                    return ne11 <= atoll(spec.c_str() + eq + 1);
+                }
+                pos = end + 1;
+            }
+        }
+    }
     // k-quants cost more to decode and mvq redoes that per column, so MMQ wins sooner.
     // Only list quant-types MMQ supports, others would fall back to cuBLAS.
+    if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE && cc < GGML_CUDA_CC_ADA_LOVELACE) {
+        switch (type) { // tuned on RTX 3090 Ti (m=4096 k=14336 sweep, W58 width-5..8 MMVQ cells vs MMQ):
+                        // MMQ at widths 5..8 costs the same as its width-9 tile, and for the K-quants that is
+                        // already below the width-5 MMVQ cell (q5_K +8%, q6_K +7%, q4_K +2%); iq4_xs/q5_0 keep MMVQ
+                        // through width 8 (MMQ 10-20% slower there).
+            case GGML_TYPE_Q4_K:
+            case GGML_TYPE_Q5_K:
+            case GGML_TYPE_Q6_K:
+                return ne11 <= 4;
+            default:
+                return ne11 <= MMVQ_MAX_BATCH_SIZE;
+        }
+    }
     if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_ADA_LOVELACE) {
         switch (type) { // tuned on RTX 4090
             case GGML_TYPE_Q2_K:
@@ -621,6 +699,22 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
             case GGML_TYPE_Q5_K:
             case GGML_TYPE_Q6_K:
                 return ne11 <= 1;
+            default:
+                return ne11 <= MMVQ_MAX_BATCH_SIZE;
+        }
+    }
+    if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_VOLTA) {
+        switch (type) {
+            case GGML_TYPE_Q2_K:
+                return ne11 <= 4;
+            case GGML_TYPE_Q3_K:
+                return ne11 <= 6;
+            case GGML_TYPE_Q4_K:
+                return ne11 <= 5;
+            case GGML_TYPE_Q5_K:
+                return ne11 <= 6;
+            case GGML_TYPE_Q6_K:
+                return ne11 <= 7;
             default:
                 return ne11 <= MMVQ_MAX_BATCH_SIZE;
         }
@@ -704,10 +798,32 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 #define QC4_NWARPS_2 4
 #define QC4_NWARPS_3 4
 #define QC4_NWARPS_4 4
+#ifndef PTQ1_REUSE_ROWS_2_4
+#define PTQ1_REUSE_ROWS_2_4 8
+#endif
+#ifndef PTQ1_REUSE_ROWS_5_8
+#define PTQ1_REUSE_ROWS_5_8 8
+#endif
 #define QC4_ROWS_1   1
 #define QC4_ROWS_2   8
 #define QC4_ROWS_3   8
 #define QC4_ROWS_4   8
+#endif
+// Verify widths 5..8 (W58, KDEV 2026-09-17, microbench m=4096 k=14336): rows 8 is the whole win, nwarps 2 beats 4
+// for iq4_xs/q5_0/q6_K (width 5 = 1.03x width 4 for iq4_xs, was 1.33x; width 8 = 1.25x, was 1.94x); the Q4_K/Q5_K
+// reuse kernel wants nwarps 4. PTQ1_0 keeps rows 2 (ALU-bound, see calc_rows_per_block).
+#ifndef QC4_NWARPS_5
+#define QC4_NWARPS_5 2
+#define QC4_NWARPS_6 2
+#define QC4_NWARPS_7 2
+#define QC4_NWARPS_8 2
+#define QC4_ROWS_5   8
+#define QC4_ROWS_6   8
+#define QC4_ROWS_7   8
+#define QC4_ROWS_8   8
+#endif
+#ifndef QC4_NWARPS_58_K
+#define QC4_NWARPS_58_K 4
 #endif
 
 static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id,
@@ -718,11 +834,10 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
             case 2: return nw1 ? 1 : QC4_NWARPS_2;
             case 3: return nw1 ? 1 : QC4_NWARPS_3;
             case 4: return nw1 ? 1 : QC4_NWARPS_4;
-            case 5:
-            case 6:
-            case 7:
-            case 8:
-                return 2;
+            case 5: return (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K) ? QC4_NWARPS_58_K : QC4_NWARPS_5;
+            case 6: return (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K) ? QC4_NWARPS_58_K : QC4_NWARPS_6;
+            case 7: return (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K) ? QC4_NWARPS_58_K : QC4_NWARPS_7;
+            case 8: return (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K) ? QC4_NWARPS_58_K : QC4_NWARPS_8;
             default:
                 return 1;
         }
@@ -840,18 +955,20 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
 static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
     if (table_id == MMVQ_PARAMETERS_GENERIC) {
         if (type == GGML_TYPE_PTQ1_0 && ncols_dst >= 2 && ncols_dst <= 4) {
-            return 2; // ternary is ALU-bound: 8 rows x ncols unrolled dots run out of registers (widths 5-8 already use 2)
+            return PTQ1_REUSE_ROWS_2_4; // y loads are shared across the rows of a block; the reuse lane kernel needs enough rows to amortize them
+        }
+        if (type == GGML_TYPE_PTQ1_0 && ncols_dst >= 5 && ncols_dst <= 8) {
+            return PTQ1_REUSE_ROWS_5_8;
         }
         switch (ncols_dst) {
             case 1: return small_k ? nwarps : QC4_ROWS_1;
             case 2: return QC4_ROWS_2;
             case 3: return QC4_ROWS_3;
             case 4: return QC4_ROWS_4;
-            case 5:
-            case 6:
-            case 7:
-            case 8:
-                return 2;
+            case 5: return QC4_ROWS_5;
+            case 6: return QC4_ROWS_6;
+            case 7: return QC4_ROWS_7;
+            case 8: return QC4_ROWS_8;
             default:
                 return 1;
         }
@@ -916,11 +1033,16 @@ static __global__ void mul_mat_vec_q(
 
     // GGML_CUDA_SM86_IQ3_SMEM_GRID: cooperative copy of the IQ3 codebook into shared memory.
     // One __syncthreads() per block, amortized over the whole K loop.
-    constexpr bool use_smem_grid = smem_grid && (type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S);
-    constexpr int  smem_grid_n   = type == GGML_TYPE_IQ3_S ? 512 : 256;
+    // Table sizes in 32-bit words: iq3_xxs 256 (1 KB), iq3_s 512 (2 KB), iq2_xxs 512 (2 KB), iq2_xs 1024 (4 KB),
+    // iq2_s 2048 (8 KB). All are static const __device__ tables in global memory (ggml-common.h).
+    constexpr bool use_smem_grid = smem_grid && ggml_cuda_mmvq_smem_grid_type(type);
+    constexpr int  smem_grid_n   = type == GGML_TYPE_IQ3_XXS ? 256 : type == GGML_TYPE_IQ3_S ? 512 :
+                                   type == GGML_TYPE_IQ2_XXS ? 512 : type == GGML_TYPE_IQ2_XS ? 1024 : 2048;
     [[maybe_unused]] __shared__ uint32_t grid_s[use_smem_grid ? smem_grid_n : 1];
     if constexpr (use_smem_grid) {
-        const uint32_t * grid_g = type == GGML_TYPE_IQ3_S ? iq3s_grid : iq3xxs_grid;
+        const uint32_t * grid_g = type == GGML_TYPE_IQ3_XXS ? iq3xxs_grid : type == GGML_TYPE_IQ3_S ? iq3s_grid :
+                                  type == GGML_TYPE_IQ2_XXS ? (const uint32_t *) iq2xxs_grid :
+                                  type == GGML_TYPE_IQ2_XS  ? (const uint32_t *) iq2xs_grid : (const uint32_t *) iq2s_grid;
 #pragma unroll
         for (int i = tid; i < smem_grid_n; i += nwarps*warp_size) {
             grid_s[i] = grid_g[i];
@@ -932,6 +1054,12 @@ static __global__ void mul_mat_vec_q(
             return vec_dot_iq3_xxs_q8_1_impl(grid_s, vbq, bq8, kbx_, iqs_);
         } else if constexpr (use_smem_grid && type == GGML_TYPE_IQ3_S) {
             return vec_dot_iq3_s_q8_1_impl(grid_s, vbq, bq8, kbx_, iqs_);
+        } else if constexpr (use_smem_grid && type == GGML_TYPE_IQ2_XXS) {
+            return vec_dot_iq2_xxs_q8_1_impl((const uint2 *) grid_s, vbq, bq8, kbx_, iqs_);
+        } else if constexpr (use_smem_grid && type == GGML_TYPE_IQ2_XS) {
+            return vec_dot_iq2_xs_q8_1_impl((const uint2 *) grid_s, vbq, bq8, kbx_, iqs_);
+        } else if constexpr (use_smem_grid && type == GGML_TYPE_IQ2_S) {
+            return vec_dot_iq2_s_q8_1_impl((const uint2 *) grid_s, vbq, bq8, kbx_, iqs_);
         } else {
             return vec_dot_q_cuda(vbq, bq8, kbx_, iqs_);
         }
@@ -1044,17 +1172,30 @@ static __global__ void mul_mat_vec_q(
         }
 #endif
 
-        if constexpr (reuse_weights && (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_Q5_0 || type == GGML_TYPE_PTQ1_0)) {
+        if constexpr (reuse_weights && type == GGML_TYPE_PTQ1_0) {
+            // 4 lanes per 128-weight block (kqs = lane, VDR 1): the lane's y ints, scales and y sums are loaded
+            // once per k step and shared by every row below; each lane unpacks its share once and dots every column.
+            // Kept in its own branch: declaring the lane struct for the other reuse types put its 160-byte y array
+            // on the stack of the iq4_xs width-5 kernel (REG 179 -> 109 + 160 B spill, 3x slower).
+            ptq1_lane_y<ncols_dst> ptq1_y;
+            ptq1_0_lane_load_y<ncols_dst>(y + kby, kqs, stride_col_y, ptq1_y);
+#pragma unroll
+            for (int i = 0; i < rows_per_cuda_block; ++i) {
+                float dots[ncols_dst];
+                vec_dot_ptq1_0_q8_1_lane<ncols_dst>(
+                    vx, kbx_offset + i*stride_row_x + kbx, kqs, ptq1_y, dots);
+#pragma unroll
+                for (int j = 0; j < ncols_dst; ++j) {
+                    tmp[j][i] += dots[j];
+                }
+            }
+        } else if constexpr (reuse_weights && (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_Q5_0)) {
 #pragma unroll
             for (int i = 0; i < rows_per_cuda_block; ++i) {
                 float dots[ncols_dst];
                 if constexpr (type == GGML_TYPE_IQ4_XS) {
                     vec_dot_iq4_xs_q8_1_multi<ncols_dst>(
                         vx, y, stride_col_y, kby, kbx_offset + i*stride_row_x + kbx, kqs, dots);
-                } else if constexpr (type == GGML_TYPE_PTQ1_0) {
-                    // 4 lanes per 128-weight block (kqs = lane, VDR 1): each lane unpacks its share once and dots every column.
-                    vec_dot_ptq1_0_q8_1_lane<ncols_dst>(
-                        vx, y + kby, kbx_offset + i*stride_row_x + kbx, kqs, stride_col_y, dots);
                 } else if constexpr (type == GGML_TYPE_Q5_0) {
                     vec_dot_q5_0_q8_1_multi<ncols_dst>(
                         vx, y, stride_col_y, kby, kbx_offset + i*stride_row_x + kbx, kqs, dots);
@@ -1378,17 +1519,19 @@ static void mul_mat_vec_q_switch_fusion(
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
                             fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
 
-    [[maybe_unused]] bool iq3_smem = false;
-    if constexpr (type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S) {
+    [[maybe_unused]] bool iq3_smem = false; // staged codebook grid (IQ3 and IQ2 types)
+    if constexpr (ggml_cuda_mmvq_smem_grid_type(type)) {
         const int device = ggml_cuda_get_device();
         const int cc = ggml_cuda_info().devices[device].cc;
-        iq3_smem = cc == 860 && ggml_cuda_sm86_iq3_smem_grid();
+        const bool use = (type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S) ?
+            c_ncols_dst <= ggml_cuda_sm86_iq3_smem_grid_max_ncols() : ggml_cuda_sm86_iq2_smem_grid_use(type, c_ncols_dst);
+        iq3_smem = cc == 860 && use;
     }
 
     if constexpr (c_ncols_dst == 1) {
         if (has_fusion) {
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-            if constexpr (type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S) {
+            if constexpr (ggml_cuda_mmvq_smem_grid_type(type)) {
                 if (iq3_smem) {
                     ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters, false, nw1, true>, launch_params,
                          vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
@@ -1408,7 +1551,7 @@ static void mul_mat_vec_q_switch_fusion(
     GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-    if constexpr (type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S) {
+    if constexpr (ggml_cuda_mmvq_smem_grid_type(type)) {
         if (iq3_smem) {
             ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters, false, nw1, true>, launch_params,
                 vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
@@ -1486,6 +1629,121 @@ static __global__ void mul_mat_vec_q_indexed_rows(
     }
     sum = warp_reduce_sum<warp_size>(sum);
     if (lane == 0) { dst[row * dst_stride] = sum; }
+}
+
+// [#45] Thin launch for matrices with few rows at verify widths 2..8. The GDN gate projections ssm_alpha and
+// ssm_beta are 48 rows x 5120 (Q8_0 in the ATX/RVN/Swift IQ4_XS quants, PTQ1_0 in the Swift ternary quant); the
+// table launch packs 8 rows per CTA at widths >= 2, so each one fills 6 CTAs on an 84-SM card and runs
+// latency-bound (9.0 us per call, 96 calls per verify round). Here each CTA owns one row and its nwarps warps split
+// K, giving nrows CTAs. The cross-warp sum has a fixed order, so the result is deterministic, but it groups partial
+// sums differently from the table launch: not bit-identical to it. Opt-in: GGML_CUDA_MMVQ_THIN=<max rows> (off when
+// unset or 0), GGML_CUDA_MMVQ_THIN_NWARPS=4|8 (default 4).
+static int ggml_cuda_mmvq_thin_max_rows() {
+    static const int value = [] {
+        const char * env = getenv("GGML_CUDA_MMVQ_THIN");
+        const int n = env == nullptr ? 0 : atoi(env);
+        return n < 0 ? 0 : n;
+    }();
+    return value;
+}
+
+static int ggml_cuda_mmvq_thin_nwarps() {
+    static const int value = [] {
+        const char * env = getenv("GGML_CUDA_MMVQ_THIN_NWARPS");
+        return env != nullptr && atoi(env) == 8 ? 8 : 4;
+    }();
+    return value;
+}
+
+static constexpr bool ggml_cuda_mmvq_thin_type(ggml_type type) {
+    return type == GGML_TYPE_Q8_0 || type == GGML_TYPE_PTQ1_0;
+}
+
+template <ggml_type type, int ncols_dst, int nwarps>
+__launch_bounds__(nwarps*ggml_cuda_get_physical_warp_size(), 1)
+static __global__ void mul_mat_vec_q_thin(
+        const void * GGML_CUDA_RESTRICT vx, const block_q8_1 * GGML_CUDA_RESTRICT vy, float * GGML_CUDA_RESTRICT dst,
+        const uint32_t ncols_x, const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
+        const uint3 channel_ratio, const uint32_t stride_channel_x, const uint32_t stride_channel_y,
+        const uint32_t stride_channel_dst, const uint3 sample_ratio, const uint32_t stride_sample_x,
+        const uint32_t stride_sample_y, const uint32_t stride_sample_dst) {
+    constexpr int qk        = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi        = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr       = get_vdr_mmvq(type);
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr vec_dot_q_cuda_t vec_dot = get_vec_dot_q_cuda(type);
+    constexpr int blocks_per_iter = vdr*nwarps*warp_size/qi;
+
+    const int      tid         = warp_size*threadIdx.y + threadIdx.x;
+    const uint32_t row         = blockIdx.x;
+    const uint32_t channel_dst = blockIdx.y;
+    const uint32_t sample_dst  = blockIdx.z;
+    const uint32_t channel_x   = fastdiv(channel_dst, channel_ratio);
+    const uint32_t sample_x    = fastdiv(sample_dst, sample_ratio);
+    const int      blocks_per_row_x = ncols_x / qk;
+
+    ggml_cuda_pdl_sync();
+    const block_q8_1 * y = vy + sample_dst*stride_sample_y + channel_dst*stride_channel_y;
+    const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row*stride_row_x;
+
+    float tmp[ncols_dst] = {0.0f};
+    for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+        const int kby = kbx * (qk/QK8_1);
+        const int kqs = vdr * (tid % (qi/vdr));
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            tmp[j] += vec_dot(vx, &y[j*stride_col_y + kby], kbx_offset + kbx, kqs);
+        }
+    }
+
+    __shared__ float tmp_shared[nwarps][ncols_dst];
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+        tmp[j] = warp_reduce_sum<warp_size>(tmp[j]);
+    }
+    if (threadIdx.x == 0) {
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            tmp_shared[threadIdx.y][j] = tmp[j];
+        }
+    }
+    __syncthreads();
+    if (tid < ncols_dst) {
+        float sum = 0.0f;
+#pragma unroll
+        for (int w = 0; w < nwarps; ++w) {
+            sum += tmp_shared[w][tid];
+        }
+        dst[sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + tid*stride_col_dst + row] = sum;
+    }
+}
+
+template <ggml_type type, int nwarps>
+static void mul_mat_vec_q_thin_launch(
+        const void * vx, const void * vy, float * dst, const int ncols_x, const int nrows_x, const int ncols_dst,
+        const int stride_row_x, const int stride_col_y, const int stride_col_dst, const uint3 channel_ratio,
+        const int nchannels_dst, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
+        const uint3 sample_ratio, const int nsamples_dst, const int stride_sample_x, const int stride_sample_y,
+        const int stride_sample_dst, const int warp_size, cudaStream_t stream) {
+    const dim3 block_nums(nrows_x, nchannels_dst, nsamples_dst);
+    const dim3 block_dims(warp_size, nwarps, 1);
+    const ggml_cuda_kernel_launch_params launch_params(block_nums, block_dims, 0, stream);
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+#define MMVQ_THIN_CASE(n) \
+        case n: ggml_cuda_kernel_launch(mul_mat_vec_q_thin<type, n, nwarps>, launch_params, vx, y, dst, \
+            ncols_x, stride_row_x, stride_col_y, stride_col_dst, channel_ratio, stride_channel_x, stride_channel_y, \
+            stride_channel_dst, sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst); break;
+    switch (ncols_dst) {
+        MMVQ_THIN_CASE(2)
+        MMVQ_THIN_CASE(3)
+        MMVQ_THIN_CASE(4)
+        MMVQ_THIN_CASE(5)
+        MMVQ_THIN_CASE(6)
+        MMVQ_THIN_CASE(7)
+        MMVQ_THIN_CASE(8)
+        default: GGML_ABORT("fatal error");
+    }
+#undef MMVQ_THIN_CASE
 }
 
 template <ggml_type type>
@@ -1612,6 +1870,25 @@ static void mul_mat_vec_q_switch_ncols_dst(
             ncols_dst, ids_stride, warp_size, nchannels_dst,
             0.0f, 0.0f, 0.0f, 0.0f, stream);
         return;
+    }
+
+    if constexpr (ggml_cuda_mmvq_thin_type(type)) {
+        const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
+                                fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
+        if (!has_ids && !has_fusion && ncols_dst >= 2 && nrows_x <= ggml_cuda_mmvq_thin_max_rows() &&
+                table_id == MMVQ_PARAMETERS_GENERIC) {
+            ggml_cuda_ledger_mm("cuda.mmvq", "thin", type, ncols_dst); // [#68] thin launch taken (#45)
+            if (ggml_cuda_mmvq_thin_nwarps() == 8) {
+                mul_mat_vec_q_thin_launch<type, 8>(vx, vy, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y,
+                    stride_col_dst, channel_ratio_fd, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                    sample_ratio_fd, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, warp_size, stream);
+            } else {
+                mul_mat_vec_q_thin_launch<type, 4>(vx, vy, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y,
+                    stride_col_dst, channel_ratio_fd, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                    sample_ratio_fd, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, warp_size, stream);
+            }
+            return;
+        }
     }
 
     switch (ncols_dst) {
@@ -1902,6 +2179,71 @@ static void mul_mat_vec_q_switch_type(
     }
 }
 
+bool ggml_cuda_q8_cacheable(const ggml_backend_cuda_context & ctx, size_t q8_bytes) {
+    static const bool q8_cache_disabled = getenv("GGML_CUDA_Q8CACHE") != nullptr && atoi(getenv("GGML_CUDA_Q8CACHE")) == 0;
+    // Main stream only: a sibling stream could consume the buffer with no cross-stream ordering.
+    return !q8_cache_disabled && q8_bytes <= (1u << 20) && ctx.curr_stream_no == 0;
+}
+
+// The q8_1 layout depends on the weight type only through the IQ4_XS swizzle (quantize_row_q8_1_cuda), so the
+// cache keys on that layout, not on the type (#89a).
+static bool ggml_cuda_q8_cache_swizzle(ggml_type type_src0) {
+    return type_src0 == GGML_TYPE_IQ4_XS;
+}
+
+static ggml_backend_cuda_context::q8_cache_entry * ggml_cuda_q8_cache_find(ggml_backend_cuda_context & ctx, const ggml_tensor * src1,
+                                                                           ggml_type type_src0, size_t q8_bytes, int64_t ne10_padded) {
+    const bool swizzle = ggml_cuda_q8_cache_swizzle(type_src0);
+    for (auto & e : ctx.q8_cache.entries) {
+        if (e.epoch == ctx.graph_epoch && e.src1 == src1 && e.data == src1->data && e.size == q8_bytes &&
+            e.ne10_padded == ne10_padded && e.swizzle_iq4 == swizzle && e.dev == ctx.device) {
+            return &e;
+        }
+    }
+    return nullptr;
+}
+
+char * ggml_cuda_q8_cache_claim(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, ggml_type type_src0,
+                                size_t q8_bytes, int64_t ne10_padded) {
+    auto & qc = ctx.q8_cache;
+    ggml_backend_cuda_context::q8_cache_entry * qe = ggml_cuda_q8_cache_find(ctx, src1, type_src0, q8_bytes, ne10_padded);
+    if (qe == nullptr) {
+        // replace an entry from an older graph eval first, else the least recently used one
+        qe = &qc.entries[0];
+        for (auto & e : qc.entries) {
+            if (e.epoch != ctx.graph_epoch) {
+                qe = &e;
+                break;
+            }
+            if (e.last_use < qe->last_use) {
+                qe = &e;
+            }
+        }
+    }
+    qe->last_use = ++qc.tick;
+    if (qe->dev != ctx.device || qe->cap < q8_bytes) {
+        // Never free a buffer here: a CUDA graph captured earlier may still replay
+        // kernels that point at it (several graphs per context with --n-cpu-moe splits).
+        // Retire it and release everything at context teardown instead.
+        if (qe->ptr != nullptr) {
+            qc.retired.push_back({ qe->ptr, qe->cap, qe->dev });
+        }
+        // Plain device memory, not pool memory: the pool frees strict LIFO, and this
+        // buffer is taken while transient pool allocations sit below it. CUDA graph
+        // capture runs in relaxed mode, which allows cudaMalloc during capture.
+        CUDA_CHECK(ggml_cuda_device_malloc((void **) &qe->ptr, q8_bytes, ctx.device));
+        qe->cap = q8_bytes;
+        qe->dev = ctx.device;
+    }
+    qe->src1        = src1;
+    qe->data        = src1->data;
+    qe->epoch       = ctx.graph_epoch;
+    qe->size        = q8_bytes;
+    qe->ne10_padded = ne10_padded;
+    qe->swizzle_iq4 = ggml_cuda_q8_cache_swizzle(type_src0);
+    return qe->ptr;
+}
+
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion, bool convrot) {
@@ -1985,48 +2327,32 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
     const size_t  q8_bytes = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
 
-    // Shared-quantize cache: reuse the previous quantization when the same src1 tensor is
+    // Shared-quantize cache: reuse an earlier quantization when the same src1 tensor is
     // consumed again in this graph eval with the same layout (see q8_cache in common.cuh).
+    // The layout depends on src0->type only through the IQ4_XS swizzle (quantize_row_q8_1_cuda).
     // ConvRot types and MUL_MAT_ID stay uncached; oversized batches fall back too.
     auto & qc = ctx.q8_cache;
-    static const bool q8_cache_disabled = getenv("GGML_CUDA_Q8CACHE") != nullptr && atoi(getenv("GGML_CUDA_Q8CACHE")) == 0;
-    // Main stream only: a sibling stream could consume the buffer with no cross-stream ordering.
-    const bool q8_cacheable = !q8_cache_disabled && !convrot && ids == nullptr && q8_bytes <= (1u << 20) &&
-                              ctx.curr_stream_no == 0;
-    const bool q8_hit = q8_cacheable && qc.epoch == ctx.graph_epoch && qc.src1 == src1 &&
-                        qc.data == src1->data && qc.size == q8_bytes &&
-                        qc.ne10_padded == ne10_padded && qc.type == src0->type &&
-                        qc.dev == ctx.device;
+    const bool q8_cacheable = !convrot && ids == nullptr && ggml_cuda_q8_cacheable(ctx, q8_bytes);
+    ggml_backend_cuda_context::q8_cache_entry * qe =
+        q8_cacheable ? ggml_cuda_q8_cache_find(ctx, src1, src0->type, q8_bytes, ne10_padded) : nullptr;
+    const bool q8_hit = qe != nullptr;
+    if (q8_hit) {
+        qe->last_use = ++qc.tick;
+    }
+
+    // [#68] fallback ledger: shared-quantize cache outcome per weight type and width (no-op when the ledger is off)
+    ggml_cuda_ledger_mm("cuda.mmvq", q8_hit ? "q8_cache_hit" : q8_cacheable ? "q8_quantize_cached" : "q8_quantize_local",
+        src0->type, ids ? src1->ne[2] : src1->ne[1]);
 
     ggml_cuda_pool_alloc<char> src1_q8_1_local(ctx.pool());
     char * src1_q8_1 = nullptr;
 
     if (q8_hit) {
         ctx.fusion_stats.q8_cache_hits++;
-        src1_q8_1 = qc.ptr;
+        src1_q8_1 = qe->ptr;
     } else {
         if (q8_cacheable) {
-            if (qc.dev != ctx.device || qc.cap < q8_bytes) {
-                // Never free a buffer here: a CUDA graph captured earlier may still replay
-                // kernels that point at it (several graphs per context with --n-cpu-moe splits).
-                // Retire it and release everything at context teardown instead.
-                if (qc.ptr != nullptr) {
-                    qc.retired.push_back({ qc.ptr, qc.cap, qc.dev });
-                }
-                // Plain device memory, not pool memory: the pool frees strict LIFO, and this
-                // buffer is taken while transient pool allocations sit below it. CUDA graph
-                // capture runs in relaxed mode, which allows cudaMalloc during capture.
-                CUDA_CHECK(ggml_cuda_device_malloc((void **) &qc.ptr, q8_bytes, ctx.device));
-                qc.cap = q8_bytes;
-                qc.dev = ctx.device;
-            }
-            src1_q8_1 = qc.ptr;
-            qc.src1        = src1;
-            qc.data        = src1->data;
-            qc.epoch       = ctx.graph_epoch;
-            qc.size        = q8_bytes;
-            qc.ne10_padded = ne10_padded;
-            qc.type        = src0->type;
+            src1_q8_1 = ggml_cuda_q8_cache_claim(ctx, src1, src0->type, q8_bytes, ne10_padded);
         } else {
             src1_q8_1 = src1_q8_1_local.alloc(q8_bytes);
         }

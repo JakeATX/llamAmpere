@@ -30,7 +30,10 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn,
-    const layer_filter_cb & filter_recr) :
+    const layer_filter_cb & filter_recr,
+                     size_t kv_stream_stage_bytes,
+                     void * kv_stream_phase_arena,
+                     size_t kv_stream_maximum_pool_bytes) :
     hparams(model.hparams),
     mem_attn(new llama_kv_cache_iswa(
         model,
@@ -49,7 +52,10 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
             [&](int32_t il) { return !hparams.is_recr(il); }
             : filter_attn,
         nullptr,
-        nullptr
+        nullptr,
+        kv_stream_stage_bytes,
+        kv_stream_phase_arena,
+        kv_stream_maximum_pool_bytes
     )),
     mem_recr(new llama_memory_recurrent(
         model,
@@ -69,6 +75,9 @@ llama_memory_context_ptr llama_memory_hybrid_iswa::init_batch(llama_batch_allocr
     do {
         balloc.split_reset();
 
+        // [TAG_GDN_REPLAY_SPLIT]
+        auto rsplit = mem_recr->make_replay_split(balloc);
+
         // follow the recurrent pattern for creating the ubatch splits
         std::vector<llama_ubatch> ubatches;
 
@@ -87,12 +96,14 @@ llama_memory_context_ptr llama_memory_hybrid_iswa::init_batch(llama_batch_allocr
                 //   so that the rollback snapshots remain valid
                 const uint32_t n_rs_seq = mem_recr->n_rs_seq;
 
-                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
+                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0, rsplit.fn());
             }
 
             if (ubatch.n_tokens == 0) {
                 break;
             }
+
+            rsplit.advance(ubatch);
 
             ubatches.push_back(std::move(ubatch)); // NOLINT
         }
@@ -194,6 +205,14 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_iswa::memory_br
     return mb;
 }
 
+bool llama_memory_hybrid_iswa::has_kv_stream_targets() const {
+    return mem_attn->has_kv_stream_targets();
+}
+
+std::vector<llama_kv_stream_target> llama_memory_hybrid_iswa::get_kv_stream_targets() const {
+    return mem_attn->get_kv_stream_targets();
+}
+
 void llama_memory_hybrid_iswa::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     mem_attn->state_write(io, seq_id, flags);
     mem_recr->state_write(io, seq_id, flags);
@@ -276,6 +295,14 @@ llama_memory_status llama_memory_hybrid_iswa_context::get_status() const {
 const llama_ubatch & llama_memory_hybrid_iswa_context::get_ubatch() const {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
     return ubatches[i_next];
+}
+
+bool llama_memory_hybrid_iswa_context::has_kv_stream_targets() const {
+    return ctx_attn ? ctx_attn->has_kv_stream_targets() : false;
+}
+
+std::vector<llama_kv_stream_active_target> llama_memory_hybrid_iswa_context::get_kv_stream_active_targets() const {
+    return ctx_attn ? ctx_attn->get_kv_stream_active_targets() : std::vector<llama_kv_stream_active_target>{};
 }
 
 const llama_kv_cache_iswa_context * llama_memory_hybrid_iswa_context::get_attn() const {

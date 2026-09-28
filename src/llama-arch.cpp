@@ -162,31 +162,33 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
 };
 
 static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
-    { LLM_KV_GENERAL_TYPE,                     "general.type"                          },
-    { LLM_KV_GENERAL_ARCHITECTURE,             "general.architecture"                  },
-    { LLM_KV_GENERAL_QUANTIZATION_VERSION,     "general.quantization_version"          },
-    { LLM_KV_GENERAL_ALIGNMENT,                "general.alignment"                     },
-    { LLM_KV_GENERAL_FILE_TYPE,                "general.file_type"                     },
-    { LLM_KV_GENERAL_SAMPLING_SEQUENCE,        "general.sampling.sequence"             },
-    { LLM_KV_GENERAL_SAMPLING_TOP_K,           "general.sampling.top_k"                },
-    { LLM_KV_GENERAL_SAMPLING_TOP_P,           "general.sampling.top_p"                },
-    { LLM_KV_GENERAL_SAMPLING_MIN_P,           "general.sampling.min_p"                },
-    { LLM_KV_GENERAL_SAMPLING_XTC_PROBABILITY, "general.sampling.xtc_probability"      },
-    { LLM_KV_GENERAL_SAMPLING_XTC_THRESHOLD,   "general.sampling.xtc_threshold"        },
-    { LLM_KV_GENERAL_SAMPLING_TEMP,            "general.sampling.temp"                 },
-    { LLM_KV_GENERAL_SAMPLING_PENALTY_LAST_N,  "general.sampling.penalty_last_n"       },
-    { LLM_KV_GENERAL_SAMPLING_PENALTY_REPEAT,  "general.sampling.penalty_repeat"       },
-    { LLM_KV_GENERAL_SAMPLING_MIROSTAT,        "general.sampling.mirostat"             },
-    { LLM_KV_GENERAL_SAMPLING_MIROSTAT_TAU,    "general.sampling.mirostat_tau"         },
-    { LLM_KV_GENERAL_SAMPLING_MIROSTAT_ETA,    "general.sampling.mirostat_eta"         },
-    { LLM_KV_GENERAL_NAME,                     "general.name"                          },
-    { LLM_KV_GENERAL_AUTHOR,                   "general.author"                        },
-    { LLM_KV_GENERAL_VERSION,                  "general.version"                       },
-    { LLM_KV_GENERAL_URL,                      "general.url"                           },
-    { LLM_KV_GENERAL_DESCRIPTION,              "general.description"                   },
-    { LLM_KV_GENERAL_LICENSE,                  "general.license"                       },
-    { LLM_KV_GENERAL_SOURCE_URL,               "general.source.url"                    },
-    { LLM_KV_GENERAL_SOURCE_HF_REPO,           "general.source.huggingface.repository" },
+    { LLM_KV_GENERAL_TYPE,                           "general.type"                          },
+    { LLM_KV_GENERAL_ARCHITECTURE,                   "general.architecture"                  },
+    { LLM_KV_GENERAL_QUANTIZATION_VERSION,           "general.quantization_version"          },
+    { LLM_KV_GENERAL_ALIGNMENT,                      "general.alignment"                     },
+    { LLM_KV_GENERAL_FILE_TYPE,                      "general.file_type"                     },
+    { LLM_KV_GENERAL_SAMPLING_SEQUENCE,              "general.sampling.sequence"             },
+    { LLM_KV_GENERAL_SAMPLING_TOP_K,                 "general.sampling.top_k"                },
+    { LLM_KV_GENERAL_SAMPLING_TOP_P,                 "general.sampling.top_p"                },
+    { LLM_KV_GENERAL_SAMPLING_MIN_P,                 "general.sampling.min_p"                },
+    { LLM_KV_GENERAL_SAMPLING_XTC_PROBABILITY,       "general.sampling.xtc_probability"      },
+    { LLM_KV_GENERAL_SAMPLING_XTC_THRESHOLD,         "general.sampling.xtc_threshold"        },
+    { LLM_KV_GENERAL_SAMPLING_TEMP,                  "general.sampling.temp"                 },
+    { LLM_KV_GENERAL_SAMPLING_PENALTY_LAST_N,        "general.sampling.penalty_last_n"       },
+    { LLM_KV_GENERAL_SAMPLING_PENALTY_REPEAT,        "general.sampling.penalty_repeat"       },
+    { LLM_KV_GENERAL_SAMPLING_MIROSTAT,              "general.sampling.mirostat"             },
+    { LLM_KV_GENERAL_SAMPLING_MIROSTAT_TAU,          "general.sampling.mirostat_tau"         },
+    { LLM_KV_GENERAL_SAMPLING_MIROSTAT_ETA,          "general.sampling.mirostat_eta"         },
+    { LLM_KV_GENERAL_NAME,                           "general.name"                          },
+    { LLM_KV_GENERAL_AUTHOR,                         "general.author"                        },
+    { LLM_KV_GENERAL_VERSION,                        "general.version"                       },
+    { LLM_KV_GENERAL_URL,                            "general.url"                           },
+    { LLM_KV_GENERAL_DESCRIPTION,                    "general.description"                   },
+    { LLM_KV_GENERAL_LICENSE,                        "general.license"                       },
+    { LLM_KV_GENERAL_SOURCE_URL,                     "general.source.url"                    },
+    { LLM_KV_GENERAL_SOURCE_HF_REPO,                 "general.source.huggingface.repository" },
+    { LLM_KV_GENERAL_TENSOR_EXTRA_NAME,              "general.tensor_extra.name"             },
+    { LLM_KV_GENERAL_TENSOR_EXTRA_PREC_A4,           "general.tensor_extra.prec_a4"          },
 
     { LLM_KV_VOCAB_SIZE,                        "%s.vocab_size"                        },
     { LLM_KV_CONTEXT_LENGTH,                    "%s.context_length"                    },
@@ -367,11 +369,6 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_NORM_BEFORE_FC,        "%s.norm_before_fc"       },
     { LLM_KV_DECODER_ARCH,          "%s.decoder_arch"         },
 
-    { LLM_KV_DFLASH_CONV_KERNEL_SIZE, "%s.conv_kernel_size" },
-    { LLM_KV_DFLASH_CONV_GROUP_SIZE,  "%s.conv_group_size"  },
-    { LLM_KV_DFLASH_SELECTOR_RANK,    "%s.selector_rank"    },
-    { LLM_KV_DFLASH_SELECTOR_TOP_K,   "%s.selector_top_k"   },
-
     { LLM_KV_SHORTCONV_L_CACHE, "%s.shortconv.l_cache" },
     // sentence-transformers dense modules feature dims
     { LLM_KV_DENSE_2_FEAT_IN,        "%s.dense_2_feat_in"  },
@@ -437,6 +434,10 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_DFLASH_TARGET_LAYER_IDS,    "%s.target_layers"         },
     { LLM_KV_DFLASH_BLOCK_SIZE,          "%s.block_size"            },
     { LLM_KV_DFLASH_MASK_TOKEN_ID,       "%s.mask_token_id"         },
+    { LLM_KV_DFLASH_CONV_KERNEL_SIZE,    "%s.conv_kernel_size"      },
+    { LLM_KV_DFLASH_CONV_GROUP_SIZE,     "%s.conv_group_size"       },
+    { LLM_KV_DFLASH_SELECTOR_RANK,       "%s.selector_rank"         },
+    { LLM_KV_DFLASH_SELECTOR_TOP_K,      "%s.selector_top_k"        },
 
 };
 
@@ -749,7 +750,6 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     { LLM_TENSOR_DSPARK_MARKOV_W1,                       "markov_w1" },
     { LLM_TENSOR_DSPARK_MARKOV_W2,                       "markov_w2" },
     { LLM_TENSOR_DSPARK_CONF_PROJ,                       "conf_proj" },
-
     // EAGLE3 draft model
     { LLM_TENSOR_EAGLE3_HIDDEN_NORM,                     "blk.%d.eagle3_hidden_norm" },
     { LLM_TENSOR_EAGLE3_FC,                              "eagle3_fc" },
@@ -1058,7 +1058,6 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     {LLM_TENSOR_DSPARK_MARKOV_W1,           {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_GET_ROWS}},
     {LLM_TENSOR_DSPARK_MARKOV_W2,           {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
     {LLM_TENSOR_DSPARK_CONF_PROJ,           {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
-
     // EAGLE3
     {LLM_TENSOR_EAGLE3_HIDDEN_NORM,                     {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
     {LLM_TENSOR_EAGLE3_FC,                              {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},

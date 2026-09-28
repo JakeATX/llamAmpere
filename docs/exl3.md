@@ -130,11 +130,27 @@ in place of the ATX file:
 The MTP flags are the ones the measurements below used: `--spec-draft-n-max 4 --spec-draft-p-min 0`, the
 model's own MTP head, exact p/q verification on by default. `--spec-draft-vocab-map` is not used with
 this file: the shortlist in `docs/mtp-vocab/` was built for the ATX quant's head. Raise `-c` for longer
-contexts; the decode flags do not change.
+contexts; the decode flags do not change. The TurboQuant cache types are named `turbo2` to `turbo6` by bit width;
+the `tq2` to `tq6` spellings (and `tq3_0` to `tq6_0`) are accepted too ([KV-cache-quantization.md](KV-cache-quantization.md)).
 
-Environment switches, all off by default:
+On the v0.4 tree the MTP drafter is on by default for a Qwen3.8 GGUF with the MTP head (adaptive depth
+3-4, see [speculative.md](speculative.md#--spec-type-type)), and the drafter's KV cache follows `-ctk`/`-ctv`
+unless `--spec-draft-type-k/-v` are given. The command above keeps the measured flags. `--spec-type draft-mtp`
+is still needed to get the measured fixed depth 4 instead of the adaptive default; `--spec-draft-p-min 0` and
+`--spec-draft-type-k q8_0` are now redundant (p-min 0 is the default and the drafter K cache inherits
+`-ctk q8_0`); `--spec-draft-type-v q8_0` is not, because without it the drafter V cache would follow
+`-ctv turbo3`. The vocabulary map now defaults to `auto`, but it does not engage on the EXL3 output head:
+the draft falls back to the full head, as in the measurements.
+
+Environment switches:
 
 - `GGML_CUDA_EXL3_GEMV=0` forces every matmul onto the reconstruct-plus-cuBLAS path. Debug only.
+- `GGML_CUDA_EXL3_WEIGHT_MAJOR=0` turns off the weight-major tensor-core GEMV (3- and 4-bit, widths 2-8),
+  which is on by default. Compiling with the macro `LLAMAMPERE_EXL3_WEIGHT_MAJOR=0` (for example
+  `-DCMAKE_CUDA_FLAGS=-DLLAMAMPERE_EXL3_WEIGHT_MAJOR=0`) leaves it out of the binary.
+- `GGML_CUDA_EXL3_FFN_BRIDGE=0` turns off the FFN bridge, which is on by default: one kernel between the
+  gate/up and down projections replaces the two gate/up output glues, the SwiGLU and the down input glue.
+  `GGML_CUDA_DISABLE_FUSION=1` also turns it off.
 - `GGML_CUDA_EXL3_FUSED=1` runs the cooperative kernel that does the Hadamard prologue and epilogue
   in-kernel behind two grid barriers. It was measured slower than the separate glue kernels on a 1008-block
   persistent grid, so it is opt-in. `EXL3_GEMV_BPS=n` caps that grid at n blocks per SM.
@@ -143,6 +159,10 @@ Environment switches, all off by default:
   Hadamard matmul, `ggml_mul` by `svh`. It exists as an A/B check against the fused form. The code tests
   for the variable's presence, so `LLAMA_EXL3_GLUE_GRAPH=1` and any other value both enable it; unset it
   to get the default path.
+
+Weight-major and the FFN bridge were measured on the 4.0 bpw model (2026-09-25, ms per MTP round, output
+byte-identical in every arm): both off 35.791 / 35.798 (two brackets), weight-major only 35.001 (-2.2%),
+bridge only 35.671 (-0.3%), both on 34.862 (-2.6%).
 
 ## The fused-group layout
 

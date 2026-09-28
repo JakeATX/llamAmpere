@@ -31,6 +31,8 @@ struct tq_chain_desc {
     int           bcast  [TQ_CHAIN_MAX_OPS];   // operand is a single value broadcast over all elements
     float         p0     [TQ_CHAIN_MAX_OPS];
     float         p1     [TQ_CHAIN_MAX_OPS];
+    int64_t       src_ne0;                     // strided head source: row length and row stride in floats,
+    int64_t       src_s1;                      // equal (or both 0) when the source is contiguous
 };
 
 void ggml_cuda_op_elem_chain(ggml_backend_cuda_context & ctx,

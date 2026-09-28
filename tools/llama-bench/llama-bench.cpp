@@ -589,6 +589,11 @@ static void print_usage(int /* argc */, char ** argv) {
 }
 
 static ggml_type ggml_type_from_name(const std::string & s) {
+    // KV cache names and aliases shared with -ctk/-ctv in common (turbo5 = tq5_0, tq4 = turbo4, ...)
+    const ggml_type kv_type = common_kv_cache_type_from_name(s);
+    if (kv_type != GGML_TYPE_COUNT) {
+        return kv_type;
+    }
     if (s == "f16") {
         return GGML_TYPE_F16;
     }
@@ -621,6 +626,12 @@ static ggml_type ggml_type_from_name(const std::string & s) {
     }
     if (s == "turbo4") {
         return GGML_TYPE_TURBO4_0;
+    }
+    if (s == "tq6_0") {
+        return GGML_TYPE_TQ6_0;
+    }
+    if (s == "tq5_0") {
+        return GGML_TYPE_TQ5_0;
     }
     if (s == "tq3_1s") {
         return GGML_TYPE_TQ3_1S;

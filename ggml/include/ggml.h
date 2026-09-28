@@ -450,6 +450,8 @@ extern "C" {
         GGML_TYPE_EXL3_6  = 55,
         GGML_TYPE_EXL3_7  = 56,
         GGML_TYPE_EXL3_8  = 57,
+        GGML_TYPE_TQ6_0   = 58, // TurboQuant 6-bit KV cache: WHT + 6-bit PolarQuant (runtime-only KV type)
+        GGML_TYPE_TQ5_0   = 59, // TurboQuant 5-bit KV cache: WHT + 5-bit PolarQuant (runtime-only KV type)
         GGML_TYPE_PQ2_0   = 142, // Prism group-128 ternary weights
         GGML_TYPE_PTQ1_0  = 143, // Prism packed group-128 ternary weights
         GGML_TYPE_COUNT   = 144,
@@ -804,6 +806,9 @@ extern "C" {
 
     GGML_API bool    ggml_is_quantized(enum ggml_type type);
     GGML_API int     ggml_exl3_bits   (enum ggml_type type); // bits/weight for GGML_TYPE_EXL3_*, 0 otherwise
+    // EXL3 reference decode of trellis rows 16*g .. 16*g+15 of a [K, N] EXL3 tensor (bits 2..8) into y[16][K]
+    // (row-major, y[col*K + k]); the rows stay in the trellis domain (suh/svh and both Hadamards not applied)
+    GGML_API void    ggml_exl3_dequantize_row_group(const void * data, int64_t K, int64_t N, int bits, int64_t g, float * y);
 
     // TODO: temporary until model loading of ggml examples is refactored
     GGML_API enum ggml_type ggml_ftype_to_ggml_type(enum ggml_ftype ftype);
@@ -2702,6 +2707,11 @@ extern "C" {
     //     the recurrence already passes through that exact intermediate value on its way to the
     //     final state, so capturing it here is free relative to a separate K=1 call over the same
     //     prefix. Omitted (and not counted in the output size) when n_tokens <= K.
+    //   2 (compact ingredients) - as 1, but each head's slot stores g and beta once instead of
+    //     broadcast to width S_v: k [S_v], v [S_v], g [g->ne[0]], beta [1], back to back, so a
+    //     slot is 2*S_v + g->ne[0] + 1 floats per head (about half of 4*S_v for a scalar gate).
+    //     The K slots are padded at their end to a whole number of output rows, and the trailing
+    //     blocks follow that padding; ggml_gated_delta_net_ingr_width/_region give both sizes.
     GGML_API struct ggml_tensor * ggml_gated_delta_net(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,
@@ -2712,6 +2722,13 @@ extern "C" {
             struct ggml_tensor  * state,
             int64_t               K,
             int32_t               emit_mode);
+
+    // ggml_gated_delta_net emit_mode 1 and 2: floats per head in one ingredient slot (g_width = g->ne[0])
+    GGML_API int64_t ggml_gated_delta_net_ingr_width(int64_t S_v, int64_t g_width, int32_t emit_mode);
+
+    // ggml_gated_delta_net emit_mode 1 and 2: floats from the first ingredient slot to the trailing
+    // final-state block (the K slots plus emit_mode 2's padding)
+    GGML_API int64_t ggml_gated_delta_net_ingr_region(int64_t S_v, int64_t g_width, int64_t H, int64_t n_seqs, int64_t K, int32_t emit_mode);
 
     // TurboQuant Walsh-Hadamard Transform (O(d log d) rotation for KV cache compression)
     // Applies WHT rotation to 128-element groups along ne[0]: sign1 → butterfly → sign2 → normalize

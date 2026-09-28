@@ -230,7 +230,11 @@ int main(int argc, char ** argv) {
 
             //LOG_DBG("target batch: %s\n", string_from(ctx_tgt, batch_tgt).c_str());
 
-            llama_decode(ctx_tgt, batch_tgt);
+            const int32_t rc = llama_decode(ctx_tgt, batch_tgt);
+            if (rc != 0) {
+                LOG_ERR("%s: target decode failed, ret = %d\n", __func__, rc);
+                return 1;
+            }
         }
 
         // feed the batch to the speculative implementation(s) - this drives the draft model, MTP, Eagle3, etc.

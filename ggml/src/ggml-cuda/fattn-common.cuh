@@ -4,6 +4,7 @@
 #include "convert.cuh"
 #include "vecdotq.cuh"
 #include "turbo-quant.cuh"
+#include "ledger.cuh"
 
 #include <cstdint>
 
@@ -473,6 +474,108 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo4_0(
             float2 kv;
             kv.x = TURBO_CENTROIDS_4BIT[idx0] * norm;
             kv.y = TURBO_CENTROIDS_4BIT[idx1] * norm;
+
+#ifdef V_DOT2_F32_F16_AVAILABLE
+            const half2 qv = ((const half2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1];
+            ggml_cuda_mad(sum, make_float2(kv.x, kv.y), __half22float2(qv));
+#else
+            const float2 qv = ((const float2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1];
+            sum += kv.x * qv.x + kv.y * qv.y;
+#endif // V_DOT2_F32_F16_AVAILABLE
+        }
+    }
+
+    return sum;
+}
+
+// TQ6 KQ dot product: dequantize K from tq6 blocks, dot with Q (float2/half2)
+// 6-bit code = low nibble in qs[j/2] + high 2 bits in qh[j/4]. elem0 is even, so elem0
+// and elem0+1 share one qs byte and one qh byte, same pair structure as turbo4.
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tq6_0(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+
+    const block_tq6_0 * K_tq6 = (const block_tq6_0 *) K_c;
+    GGML_UNUSED(Q_q8);
+    GGML_UNUSED(Q_ds_v);
+
+    constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
+    constexpr int cpy_ne = cpy_nb / 4;
+
+    float sum = 0.0f;
+
+#pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads*cpy_ne) {
+#pragma unroll
+        for (int k_KQ_1 = 0; k_KQ_1 < cpy_ne; ++k_KQ_1) {
+            const int k_KQ = k_KQ_0 + (threadIdx.x % nthreads)*cpy_ne + k_KQ_1;
+
+            const int elem0 = k_KQ * 2;                   // always even
+            const int ib    = elem0 / QK_TQ6;              // block index
+            const int j0    = elem0 % QK_TQ6;              // always even
+
+            const float   norm    = __half2float(K_tq6[ib].norm);
+            const uint8_t qs_byte = K_tq6[ib].qs[j0 / 2];  // low nibbles of j0 and j0+1
+            const uint8_t qh_byte = K_tq6[ib].qh[j0 / 4];  // high 2 bits of j0 .. j0+3
+
+            const int     hshift = (j0 % 4) * 2;           // 0 or 4
+            const uint8_t idx0 = ((qs_byte >> 0) & 0xF) | (((qh_byte >> hshift)       & 0x3) << 4);
+            const uint8_t idx1 = ((qs_byte >> 4) & 0xF) | (((qh_byte >> (hshift + 2)) & 0x3) << 4);
+
+            float2 kv;
+            kv.x = TQ6_CENTROIDS[idx0] * norm;
+            kv.y = TQ6_CENTROIDS[idx1] * norm;
+
+#ifdef V_DOT2_F32_F16_AVAILABLE
+            const half2 qv = ((const half2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1];
+            ggml_cuda_mad(sum, make_float2(kv.x, kv.y), __half22float2(qv));
+#else
+            const float2 qv = ((const float2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1];
+            sum += kv.x * qv.x + kv.y * qv.y;
+#endif // V_DOT2_F32_F16_AVAILABLE
+        }
+    }
+
+    return sum;
+}
+
+// TQ5 KQ dot product: dequantize K from tq5 blocks, dot with Q (float2/half2)
+// 5-bit code = low nibble in qs[j/2] + high bit in qh[j/8] (bit j%8). elem0 is even, so
+// elem0 and elem0+1 share one qs byte and one qh byte, same pair structure as tq6.
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tq5_0(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+
+    const block_tq5_0 * K_tq5 = (const block_tq5_0 *) K_c;
+    GGML_UNUSED(Q_q8);
+    GGML_UNUSED(Q_ds_v);
+
+    constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
+    constexpr int cpy_ne = cpy_nb / 4;
+
+    float sum = 0.0f;
+
+#pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads*cpy_ne) {
+#pragma unroll
+        for (int k_KQ_1 = 0; k_KQ_1 < cpy_ne; ++k_KQ_1) {
+            const int k_KQ = k_KQ_0 + (threadIdx.x % nthreads)*cpy_ne + k_KQ_1;
+
+            const int elem0 = k_KQ * 2;                   // always even
+            const int ib    = elem0 / QK_TQ5;              // block index
+            const int j0    = elem0 % QK_TQ5;              // always even
+
+            const float   norm    = __half2float(K_tq5[ib].norm);
+            const uint8_t qs_byte = K_tq5[ib].qs[j0 / 2];  // magnitude nibbles of j0 and j0+1
+            const uint8_t qh_byte = K_tq5[ib].qh[j0 / 8];  // sign bits of j0 .. j0+7
+
+            const int     hshift = j0 % 8;                 // even, 0..6
+            const uint8_t idx0 = tq5_sm_to_code((qs_byte >> 0) & 0xF, (qh_byte >> hshift)       & 0x1);
+            const uint8_t idx1 = tq5_sm_to_code((qs_byte >> 4) & 0xF, (qh_byte >> (hshift + 1)) & 0x1);
+
+            float2 kv;
+            kv.x = TQ5_CENTROIDS[idx0] * norm;
+            kv.y = TQ5_CENTROIDS[idx1] * norm;
 
 #ifdef V_DOT2_F32_F16_AVAILABLE
             const half2 qv = ((const half2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1];
@@ -1005,6 +1108,80 @@ static __device__ __forceinline__ void dequantize_V_turbo4_0(const void * __rest
     }
 }
 
+// TQ6 V dequantize: extract `ne` float/half values at position i0.
+// The centroid index is rebuilt per element; the 64-entry table is too big to
+// materialise scaled in registers, so it is read from __constant__ and scaled inline.
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_tq6_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_tq6_0 * x = (const block_tq6_0 *) vx;
+
+    const int64_t ib   = i0 / QK_TQ6;
+    const int     j0   = i0 % QK_TQ6;
+    const float   norm = __half2float(x[ib].norm);
+
+    static_assert(ne == 2 || ne == 4 || ne == 8, "bad ne");
+
+    float vals[ne];
+#pragma unroll
+    for (int l = 0; l < ne; ++l) {
+        vals[l] = tq6_dequant_element(&x[ib], j0 + l, norm);
+    }
+
+#ifdef FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, half>) {
+#pragma unroll
+        for (int l = 0; l < ne/2; ++l) {
+            ((half2 *) dst)[l] = make_half2(__float2half(vals[2*l]), __float2half(vals[2*l + 1]));
+        }
+    } else
+#endif // FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, float>) {
+#pragma unroll
+        for (int l = 0; l < ne; ++l) {
+            ((float *) dst)[l] = vals[l];
+        }
+    } else {
+        static_assert(std::is_same_v<T, void>, "unsupported type");
+    }
+}
+
+// TQ5 V dequantize: extract `ne` float/half values at position i0.
+// The centroid index is rebuilt per element; the 32-entry table is too big to
+// materialise scaled in registers, so it is read from __constant__ and scaled inline.
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_tq5_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_tq5_0 * x = (const block_tq5_0 *) vx;
+
+    const int64_t ib   = i0 / QK_TQ5;
+    const int     j0   = i0 % QK_TQ5;
+    const float   norm = __half2float(x[ib].norm);
+
+    static_assert(ne == 2 || ne == 4 || ne == 8, "bad ne");
+
+    float vals[ne];
+#pragma unroll
+    for (int l = 0; l < ne; ++l) {
+        vals[l] = tq5_dequant_element(&x[ib], j0 + l, norm);
+    }
+
+#ifdef FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, half>) {
+#pragma unroll
+        for (int l = 0; l < ne/2; ++l) {
+            ((half2 *) dst)[l] = make_half2(__float2half(vals[2*l]), __float2half(vals[2*l + 1]));
+        }
+    } else
+#endif // FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, float>) {
+#pragma unroll
+        for (int l = 0; l < ne; ++l) {
+            ((float *) dst)[l] = vals[l];
+        }
+    } else {
+        static_assert(std::is_same_v<T, void>, "unsupported type");
+    }
+}
+
 template <ggml_type type_K, int D, int nthreads>
 constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
     if constexpr (type_K == GGML_TYPE_F16) {
@@ -1027,6 +1204,10 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
         return vec_dot_fattn_vec_KQ_turbo2_0<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_TURBO4_0) {
         return vec_dot_fattn_vec_KQ_turbo4_0<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_TQ6_0) {
+        return vec_dot_fattn_vec_KQ_tq6_0<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_TQ5_0) {
+        return vec_dot_fattn_vec_KQ_tq5_0<D, nthreads>;
     } else {
         static_assert(type_K == -1, "bad type");
         return nullptr;
@@ -1055,6 +1236,10 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
         return dequantize_V_turbo2_0<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_TURBO4_0) {
         return dequantize_V_turbo4_0<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_TQ6_0) {
+        return dequantize_V_tq6_0<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_TQ5_0) {
+        return dequantize_V_tq5_0<T, ne>;
     } else {
         static_assert(type_V == -1, "bad type");
         return nullptr;
@@ -1118,7 +1303,7 @@ static __global__ void flash_attn_mask_to_KV_max(
 }
 
 void ggml_cuda_flash_attn_ext_compact_mask(
-        const ggml_tensor * mask, int32_t * indices, int32_t n_kv_max, cudaStream_t stream);
+        const ggml_tensor * mask, int32_t * indices, int32_t * counts, int32_t n_queries, int32_t ncols1, int32_t n_kv_max, cudaStream_t stream);
 
 template<int D, int ncols1, int ncols2> // D == head size
 __launch_bounds__(D, 1)
@@ -1363,7 +1548,8 @@ template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
     const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const bool use_sparse,
-    const int warp_size = WARP_SIZE
+    const int warp_size = WARP_SIZE,
+    float * partial_dst = nullptr, float2 * partial_meta = nullptr
 ) {
     constexpr int ncols = ncols1 * ncols2;
 
@@ -1377,6 +1563,9 @@ void launch_fattn(
     const ggml_tensor * sinks = dst->src[4];
 
     ggml_tensor * KQV = dst;
+    const bool output_partial = partial_dst != nullptr;
+    GGML_ASSERT(output_partial == (partial_meta != nullptr));
+    GGML_ASSERT(!output_partial || !stream_k);
 
     GGML_ASSERT(Q->type == GGML_TYPE_F32);
     GGML_ASSERT(KQV->type == GGML_TYPE_F32);
@@ -1393,56 +1582,13 @@ void launch_fattn(
     const int cc  = ggml_cuda_info().devices[id].cc;
     const int nsm = ggml_cuda_info().devices[id].nsm;
 
-#ifdef GGML_USE_HIP
-    // HIP/ROCm: allocate the f16 KV-dequant temp buffers in a CUDA-graph-capture-aware way.
-    //
-    // Default (no graph capture): bypass the memory pool and use raw cudaMalloc/cudaFree so the
-    // temp buffer (up to ~2x the quantized KV size) is released the moment the kernel completes.
-    // The legacy pool (ggml_cuda_pool_leg) retains peak-sized allocations permanently on HIP
-    // without VMM support (RDNA 3/4) because free() stores buffers for reuse rather than releasing
-    // them; pooling this temp would negate the KV compression and OOM at long context.
-    // Ref: https://github.com/ggml-org/llama.cpp/issues/22107
-    //
-    // While a CUDA graph is being captured, cudaMalloc/cudaFree/cudaStreamSynchronize are all
-    // illegal. When the current graph will be captured (ctx.fa_f16_use_pool, set for graph-enabled
-    // and graph-compatible cgraphs), use the pool instead: capture only begins once the shape is
-    // stable (see ggml_cuda_graph_update_required), so this temp is a single fixed-size buffer that
-    // the pool allocates during the eager warmup passes and then reuses across every graph replay
-    // — exactly the capture-safe path the non-HIP build always takes. Holding it is required anyway
-    // for replay to reference a stable buffer address.
-    const bool fa_f16_use_pool = ctx.fa_f16_use_pool;
-    struct hip_f16_alloc {
-        half * ptr = nullptr;
-        cudaStream_t stream;
-        bool use_pool;
-        ggml_cuda_pool_alloc<half> pool_alloc;
-        hip_f16_alloc(cudaStream_t s, ggml_cuda_pool & p, bool use_pool)
-            : stream(s), use_pool(use_pool), pool_alloc(p) {}
-        hip_f16_alloc(const hip_f16_alloc &) = delete;
-        hip_f16_alloc & operator=(const hip_f16_alloc &) = delete;
-        ~hip_f16_alloc() {
-            if (use_pool || ptr == nullptr) {
-                return;  // pool_alloc releases back to the pool; nothing to do if unused
-            }
-            // Destructor: cannot propagate errors, and under HIP both calls are
-            // [[nodiscard]], which is fatal under -Werror. Discard explicitly.
-            (void) cudaStreamSynchronize(stream);
-            (void) cudaFree(ptr);
-        }
-        void alloc(size_t nelements) {
-            if (use_pool) {
-                ptr = pool_alloc.alloc(nelements);
-            } else {
-                CUDA_CHECK(cudaMalloc(&ptr, nelements * sizeof(half)));
-            }
-        }
-    };
-    hip_f16_alloc K_f16(main_stream, pool, fa_f16_use_pool);
-    hip_f16_alloc V_f16(main_stream, pool, fa_f16_use_pool);
-#else
+    // Scratch f16 K/V copies. The buffer type reserves space for them behind dst
+    // (ggml_cuda_flash_attn_ext_get_f16_extra_data, upstream's design); these pool
+    // allocations are only touched when that reservation does not cover the op
+    // (dst is a view or lives in a foreign buffer), see the fallback below.
     ggml_cuda_pool_alloc<half>   K_f16(pool);
     ggml_cuda_pool_alloc<half>   V_f16(pool);
-#endif
+
     ggml_cuda_pool_alloc<int>    KV_max(pool);
     ggml_cuda_pool_alloc<float>  dst_tmp(pool);
     ggml_cuda_pool_alloc<float2> dst_tmp_meta(pool);
@@ -1467,6 +1613,20 @@ void launch_fattn(
         if (want.end - (uintptr_t) dst->data <= ggml_backend_buffer_get_alloc_size(dst->buffer, dst)) {
             f16_extra = want;
         }
+    }
+
+    if ((need_f16_K && K->type != GGML_TYPE_F16) || (need_f16_V && V->type != GGML_TYPE_F16)) {
+        // fallback ledger: a quantized K/V cache converted to a full f16 copy before the kernel
+        const ggml_type Kc = need_f16_K ? K->type : GGML_TYPE_F16;
+        const ggml_type Vc = need_f16_V && !V_is_K_view ? V->type : GGML_TYPE_F16;
+        const uint64_t id = ggml_cuda_ledger_mix(ggml_cuda_ledger_mix(ggml_cuda_ledger_mix(
+            (uint64_t) Kc, (uint64_t) Vc), (uint64_t) ggml_cuda_ledger_width_bucket(Q->ne[1])), (uint64_t) (f16_extra.K != 0 || f16_extra.V != 0));
+        ggml_cuda_ledger_count("cuda.fattn", id, [&](char * buf, size_t size) {
+            char w[16];
+            ggml_cuda_ledger_width_str(Q->ne[1], w, sizeof(w));
+            snprintf(buf, size, "f16_convert K=%s V=%s n_q=%s scratch=%s", ggml_type_name(Kc), ggml_type_name(Vc), w,
+                f16_extra.K != 0 || f16_extra.V != 0 ? "reserved" : "pool");
+        });
     }
 
     if (need_f16_K && K->type != GGML_TYPE_F16) {
@@ -1544,14 +1704,18 @@ void launch_fattn(
     const int ntiles_z_gqa = ((gqa_ratio + ncols2 - 1) / ncols2);
     const int ntiles_dst   = ntiles_x * ntiles_z_gqa * K->ne[2] * Q->ne[3];
 
-    const int32_t n_kv_max = use_sparse ? ggml_get_op_params_i32(KQV, 4) : 0;
+    // sparse: a query tile of ncols1 queries shares one index list, the union of the queries' visible columns
+    int32_t n_kv_max = 0;
     if (use_sparse) {
         GGML_ASSERT(mask != nullptr);
-        GGML_ASSERT(n_kv_max > 0);
-        const size_t mask_rows = size_t(mask->ne[1]) * mask->ne[3];
+        const int32_t n_kv_max_query = ggml_get_op_params_i32(KQV, 4);
+        GGML_ASSERT(n_kv_max_query > 0);
+        n_kv_max = std::min<int64_t>(K->ne[1], int64_t(ncols1)*n_kv_max_query);
 
-        KV_max.alloc(size_t(n_kv_max) * mask_rows);
-        ggml_cuda_flash_attn_ext_compact_mask(mask, KV_max.ptr, n_kv_max, main_stream);
+        const size_t n_lists = size_t(ntiles_x) * mask->ne[3];
+
+        KV_max.alloc(size_t(n_kv_max)*n_lists + n_lists);
+        ggml_cuda_flash_attn_ext_compact_mask(mask, KV_max.ptr, KV_max.ptr + size_t(n_kv_max)*n_lists, Q->ne[1], ncols1, n_kv_max, main_stream);
     }
 
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
@@ -1625,14 +1789,15 @@ void launch_fattn(
         }
     } else {
         // parallel_blocks must not be larger than what the tensor size allows:
-        parallel_blocks = std::min(parallel_blocks, ntiles_KV);
+        parallel_blocks = output_partial ? 1 : std::min(parallel_blocks, ntiles_KV);
 
         // If ntiles_total % blocks_per_wave != 0 then some efficiency is lost due to tail effects.
         // Test whether parallel_blocks can be set to a higher value for better efficiency.
         const int blocks_per_wave = nsm * max_blocks_per_sm;
         int nwaves_best = 0;
         int efficiency_percent_best = 0;
-        for (int parallel_blocks_test = parallel_blocks; parallel_blocks_test <= ntiles_KV; ++parallel_blocks_test) {
+        for (int parallel_blocks_test = parallel_blocks;
+                !output_partial && parallel_blocks_test <= ntiles_KV; ++parallel_blocks_test) {
             const int nblocks_total = ntiles_dst * parallel_blocks_test;
             const int nwaves = (nblocks_total + blocks_per_wave - 1) / blocks_per_wave;
             const int efficiency_percent = 100 * nblocks_total / (nwaves*blocks_per_wave);
@@ -1649,9 +1814,19 @@ void launch_fattn(
             }
         }
 
-        blocks_num.x = ntiles_x;
-        blocks_num.y = parallel_blocks;
-        blocks_num.z = ntiles_z_gqa*K->ne[2]*Q->ne[3];
+        if (output_partial) {
+            // MMA kernels flatten Q tiles, GQA groups, KV heads, and sequences
+            // into blockIdx.x. A multidimensional grid would duplicate every
+            // tile once per KV head. One block per complete tile also avoids
+            // fixups while preserving exact partial numerator/meta output.
+            blocks_num.x = ntiles_dst;
+            blocks_num.y = 1;
+            blocks_num.z = 1;
+        } else {
+            blocks_num.x = ntiles_x;
+            blocks_num.y = parallel_blocks;
+            blocks_num.z = ntiles_z_gqa*K->ne[2]*Q->ne[3];
+        }
 
         if (parallel_blocks > 1) {
             dst_tmp.alloc(parallel_blocks*ggml_nelements(KQV));
@@ -1681,14 +1856,17 @@ void launch_fattn(
     const uint3 ne01 = init_fastdiv_values(Q->ne[1]);
 
     GGML_ASSERT(block_dim.x % warp_size == 0);
-    fattn_kernel<<<blocks_num, block_dim, nbytes_shared, main_stream>>>(
+
+    ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num, block_dim, nbytes_shared, main_stream);
+    ggml_cuda_kernel_launch(fattn_kernel, launch_params,
         (const char *) Q->data,
         K_data,
         V_data,
         mask ? ((const char *) mask->data) : nullptr,
         sinks ? ((const char *) sinks->data) : nullptr,
         KV_max.ptr,
-        !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
+        output_partial ? partial_dst : (!stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data),
+        output_partial ? partial_meta : dst_tmp_meta.ptr,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,
         Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
         K->ne[0], n_kv, K->ne[2], K->ne[3], nb11, nb12, nb13,

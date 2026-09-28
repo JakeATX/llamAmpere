@@ -11,6 +11,7 @@
 #include <memory>
 #include <set>
 #include <functional>
+#include <atomic>
 #include <map>
 #include <unordered_map>
 #include <tuple>
@@ -37,6 +38,7 @@ using llama_hadamard_rotations = std::unordered_map<const ggml_tensor *, llama_h
 struct llama_cparams;
 struct llama_model;
 struct llama_layer;
+struct llama_prec_policy;
 
 struct llama_memory_context_i;
 
@@ -311,6 +313,32 @@ public:
     bool     s_stale    = false;
     uint32_t span_new   = 0;
     uint32_t snap_shift = 0; // [TAG_RECURRENT_ROLLBACK_SHIFT] see llama_memory_recurrent_context::get_snap_shift
+
+    // row indices for gathering all snap_shift older snapshot groups of the ubatch's cells in one
+    // ggml_get_rows: [j * n_seqs + s] = j * mem_size + s_copy_main[s]; nullptr when snap_shift == 0
+    ggml_tensor * s_copy_shift = nullptr; // I32 [snap_shift * n_seqs]
+
+    // fill s_copy_shift from the already-filled s_copy (call after the s_copy fill; s_copy() has a
+    // rs_idx-reset side effect, so the values are never re-read from the memory context)
+    void set_input_shift(uint32_t mem_size);
+
+    // [TAG_RECURRENT_ROLLBACK_RING] ring mode (mctx->get_rs_ring()); all nullptr/0 otherwise, and
+    // n_written == 0 / rs_wr == nullptr for a ubatch that fills the ring (n >= K: the builders use
+    // the static strided copies, see llama_memory_recurrent_context::get_n_written).
+    // Shapes are graph topology -> checked in can_reuse.
+    uint32_t n_written = 0;
+    uint32_t n_older   = 0;
+    ggml_tensor * rs_wr      = nullptr; // I32 [n_written * n_seqs]: cache row of group g of seq s at [g * n_seqs + s]
+    // I32 [n_seqs] per written slot (oldest group first): one input tensor per slot -- a per-layer view
+    // of a single input would be scheduled as a CPU node and cost a H2D copy + sync per layer
+    std::vector<ggml_tensor *> rs_wr_conv;
+    std::vector<int32_t *>     rs_wr_conv_host; // fill_s_copy scratch: host data of rs_wr_conv[j]
+    ggml_tensor * rs_old_src = nullptr; // I32 [n_older]: older-group rows to carry for seqs whose data moves cells
+    ggml_tensor * rs_old_dst = nullptr; // I32 [n_older]
+
+    // fill every rs input (s_copy and the shift or ring tensors) from the memory context; exactly
+    // once per ubatch -- both fills consume the pending rollback
+    void fill_s_copy(const llama_memory_recurrent_context * m);
 };
 
 class llm_graph_input_cross_embd : public llm_graph_input_i {
@@ -793,6 +821,21 @@ public:
     std::map<llama_seq_id, row_input> row_inputs;
 };
 
+// [#69] sampled MTP chain: the packed sampling params and the per-step uniforms, owned by the context
+class llm_graph_input_mtp_chain_samp : public llm_graph_input_i {
+public:
+    llm_graph_input_mtp_chain_samp(const std::vector<float> * src) : src(src) {}
+    virtual ~llm_graph_input_mtp_chain_samp() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * samp = nullptr; // F32 [LLAMA_MTP_CHAIN_SAMP_N]
+    ggml_tensor * u    = nullptr; // F32 [n_chain]
+
+    const std::vector<float> * src;
+};
+
 struct llm_graph_fused_node {
     llm_fused_op op;
     ggml_tensor * tensor;
@@ -825,10 +868,23 @@ struct llm_graph_params {
     const llama_hadamard_rotations * hadamard_rotations;
     const llama_hadamard_rotations * hadamard_inverses;
 
+    const llama_prec_policy * prec_policy = nullptr;
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     // draft-only vocabulary shortlist: [n_sel] I32 token ids owned by the context, or nullptr
     ggml_tensor * draft_vocab_ids = nullptr;
+
+    // [#81] compact resident draft head [n_embd, n_sel] owned by the context, and the head tensor it replaces
+    // (the compact logits are used only for that head), or nullptr
+    ggml_tensor       * draft_vocab_compact     = nullptr;
+    const ggml_tensor * draft_vocab_compact_src = nullptr;
+
+    // bit per full-head fallback reason already warned about, owned by the context (warn once per context)
+    std::atomic<uint32_t> * draft_vocab_warned = nullptr;
+
+    // [#69] sampled MTP chain inputs, owned by the context (llama_context::mtp_chain_samp)
+    const std::vector<float> * mtp_chain_samp = nullptr;
 
     static bool samplers_equal(
           const std::map<llama_seq_id, llama_sampler *> & lhs,
@@ -920,6 +976,7 @@ struct llm_graph_params {
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
             cparams.mtp_chain               == other.cparams.mtp_chain               &&
+            cparams.mtp_chain_top_k         == other.cparams.mtp_chain_top_k         &&
             cparams.causal_attn             == other.cparams.causal_attn             &&
             arch  == other.arch  &&
             gtype == other.gtype &&
@@ -1079,9 +1136,22 @@ struct llm_graph_context {
     const llama_hadamard_rotations * hadamard_rotations;
     const llama_hadamard_rotations * hadamard_inverses;
 
+    const llama_prec_policy * prec_policy;
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     ggml_tensor * draft_vocab_ids; // see llm_graph_params
+    ggml_tensor       * draft_vocab_compact;     // see llm_graph_params
+    const ggml_tensor * draft_vocab_compact_src; // see llm_graph_params
+    std::atomic<uint32_t> * draft_vocab_warned; // see llm_graph_params
+    const std::vector<float> * mtp_chain_samp; // see llm_graph_params
+
+    // [#81] logits of the compact draft head for `cur` [n_embd, n], [n_sel, n]: plain mul_mat on the activation the
+    // head consumes (EXL3: x_rot = H128(suh * cur), the fused kernel's input glue built from generic ops)
+    ggml_tensor * build_draft_vocab_compact(ggml_tensor * head_w, ggml_tensor * head_s, ggml_tensor * cur) const;
+
+    // full-head fallback of build_draft_vocab_logits: counts the reason in the fallback ledger, warns once per context
+    ggml_tensor * draft_vocab_fallback(int reason, const char * detail) const;
 
     // Shared transforms are valid for one graph build only.
     mutable std::map<std::tuple<const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, int64_t, int64_t, int64_t>, ggml_tensor *> hadamard_memo;
@@ -1439,6 +1509,13 @@ struct llm_graph_context {
     // draft-only vocabulary shortlist: logits over the shortlisted rows of head_w only, [n_sel, n_outputs].
     // Returns nullptr when the shortlist does not apply to this graph (caller uses the full head).
     ggml_tensor * build_draft_vocab_logits(
+            ggml_tensor * head_w,
+            ggml_tensor * head_s,
+            ggml_tensor * cur) const;
+
+    // [#69/BL7c] the shortlist for one MTP chain step, [n_sel, 1] over the rows of draft_vocab_ids. The chain
+    // emits token ids itself, so no backend sampler has to consume the compact row. nullptr: use the full head.
+    ggml_tensor * build_draft_vocab_logits_chain(
             ggml_tensor * head_w,
             ggml_tensor * head_s,
             ggml_tensor * cur) const;

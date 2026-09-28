@@ -249,10 +249,6 @@ struct llama_hparams {
     uint32_t n_embd_out_impl = 0;
 
     uint32_t dflash_block_size       = 0;
-    uint32_t dflash_conv_kernel_size = 0;
-    uint32_t dflash_conv_group_size  = 0;
-    uint32_t dflash_selector_rank    = 0;
-    uint32_t dflash_selector_top_k   = 0;
 
     // llama4 smallthinker
     uint32_t n_moe_layer_step        = 0;
@@ -448,8 +444,9 @@ struct llama_hparams {
     // dimension of the recurrent state embeddings
     uint32_t n_embd_s() const;
 
-    // dimension of one ggml_gated_delta_net emit_mode==1 ingredient slot (4 rows of head_dim,
-    // one each for k/v/g/beta) -- only meaningful for GDN/KDA-style layers (n_embd_head_kda != 0).
+    // dimension of one ggml_gated_delta_net ingredient slot in the layout llama_gdn_ingr_emit_mode()
+    // selects: emit_mode 1 = 4 rows of head_dim (k/v/g/beta), emit_mode 2 = k, v, g, beta stored
+    // once per head [#63] -- only meaningful for GDN/KDA-style layers.
     uint32_t n_embd_s_ingredient() const;
 
     uint32_t n_pos_per_embd() const;
@@ -520,6 +517,10 @@ struct llama_hparams {
 
     // DFlash draft model
     uint32_t dflash_mask_token_id           = 0;
+    uint32_t dflash_conv_kernel_size        = 0;
+    uint32_t dflash_conv_group_size         = 0;
+    uint32_t dflash_selector_rank           = 0;
+    uint32_t dflash_selector_top_k          = 0;
 
 
 
@@ -527,3 +528,8 @@ struct llama_hparams {
 };
 
 static_assert(std::is_trivially_copyable<llama_hparams>::value, "llama_hparams must be trivially copyable");
+
+// [#63] the gdn_replay ingredient layout, process-wide: 2 (compact, g and beta once per head) when
+// LLAMA_GDN_INGR_COMPACT is set to anything but 0, else 1. The ring size (n_embd_s_ingredient) and
+// the replay graph both follow it.
+int32_t llama_gdn_ingr_emit_mode();

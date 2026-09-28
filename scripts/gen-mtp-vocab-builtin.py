@@ -1,0 +1,139 @@
+#!/usr/bin/env python3
+"""Generate src/llama-mtp-vocab-builtin-data.inc: the draft vocabulary shortlists compiled into the binary.
+
+Each --list is FAMILY:ARCH:GGUF:MAP[:NAME]. GGUF is any GGUF of the base model (only its tokenizer arrays
+are read, never the weights), MAP a llama-mtp-vocab-v1 file. The tokenizer fingerprint is the one
+defined in src/llama-mtp-vocab-builtin.h. Lists are sorted id sets, stored as bitmaps.
+
+    python3 scripts/gen-mtp-vocab-builtin.py \\
+        --list Qwen3.8-27B:qwen35:/path/Qwen3.8-27B-ATX-4-XS.gguf:docs/mtp-vocab/atx_65536.txt:qwen3.8-27b-65536 \\
+        --list Qwen3.8-27B:qwen35:/path/Qwen3.8-27B-ATX-4-XS.gguf:docs/mtp-vocab/atx_32768.txt:qwen3.8-27b-32768
+
+--fingerprint GGUF prints the fingerprint of a GGUF's tokenizer and exits (use it to check that a new quant
+of a base model matches an existing entry).
+"""
+import argparse
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "gguf-py"))
+from gguf import GGUFReader  # noqa: E402
+
+FNV_OFFSET = 1469598103934665603
+FNV_PRIME = 1099511628211
+MASK = (1 << 64) - 1
+CHUNK = 4096  # hex characters per string literal (MSVC-safe)
+
+
+def fnv_add(h, data):
+    for b in data:
+        h ^= b
+        h = (h * FNV_PRIME) & MASK
+    return h
+
+
+def str_array(reader, key):
+    f = reader.fields.get(key)
+    if f is None:
+        return None
+    return [bytes(f.parts[i]) for i in f.data]
+
+
+def tokenizer_info(path):
+    r = GGUFReader(path, "r")
+    toks = str_array(r, "tokenizer.ggml.tokens")
+    if toks is None:
+        raise SystemExit(f"{path}: no tokenizer.ggml.tokens")
+    merges = str_array(r, "tokenizer.ggml.merges") or []
+    model = str_array(r, "tokenizer.ggml.model") or [b"?"]
+    pre = str_array(r, "tokenizer.ggml.pre") or [b"?"]
+    if model[0] not in (b"gpt2", b"hybriddna", b"whitespace", b"gemma4") or pre[0] == b"kimi-k2":
+        merges = []  # llama_vocab keeps no BPE ranks for these tokenizers
+    arch_f = r.fields.get("general.architecture")
+    arch = bytes(arch_f.parts[arch_f.data[0]]).decode() if arch_f is not None else "?"
+
+    # llama_vocab::get_bpe_merges(): ranks from the first occurrence of each pair, holes stay empty
+    ranks = {}
+    for i, m in enumerate(merges):
+        sp = m.find(b" ", 1)
+        pair = (m[:sp], m[sp + 1:]) if sp != -1 else (b"", b"")  # the loader keeps a malformed merge as ("", "")
+        if pair not in ranks:
+            ranks[pair] = i
+    by_rank = [b""] * ((max(ranks.values()) + 1) if ranks else 0)
+    for (a, b), i in ranks.items():
+        by_rank[i] = a + b" " + b
+
+    h = FNV_OFFSET
+    for t in toks:
+        h = fnv_add(h, t + b"\0")
+    h = fnv_add(h, b"\x01")
+    for m in by_rank:
+        h = fnv_add(h, m + b"\0")
+    return h, len(toks), arch
+
+
+def read_map(path):
+    t = open(path).read().split()
+    if len(t) < 3 or t[0] != "llama-mtp-vocab-v1":
+        raise SystemExit(f"{path}: not a llama-mtp-vocab-v1 map")
+    n_vocab, count = int(t[1]), int(t[2])
+    ids = [int(x) for x in t[3:]]
+    if len(ids) != count or len(set(ids)) != count or min(ids) < 0 or max(ids) >= n_vocab:
+        raise SystemExit(f"{path}: bad id list")
+    return n_vocab, sorted(ids)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--list", action="append", default=[], help="FAMILY:ARCH:GGUF:MAP[:NAME]")
+    ap.add_argument("--out", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src",
+                                                  "llama-mtp-vocab-builtin-data.inc"))
+    ap.add_argument("--fingerprint", metavar="GGUF")
+    a = ap.parse_args()
+
+    if a.fingerprint:
+        h, n, arch = tokenizer_info(a.fingerprint)
+        print(f"{h:016x} n_vocab={n} arch={arch} {a.fingerprint}")
+        return
+
+    fp_cache = {}
+    entries = []
+    for spec in a.list:
+        parts = spec.split(":")
+        if len(parts) not in (4, 5):
+            raise SystemExit(f"bad --list {spec!r}")
+        family, arch, gguf, mp = parts[:4]
+        if gguf not in fp_cache:
+            fp_cache[gguf] = tokenizer_info(gguf)
+        h, n_vocab, gguf_arch = fp_cache[gguf]
+        if gguf_arch != arch:
+            raise SystemExit(f"{gguf}: architecture {gguf_arch}, --list says {arch}")
+        mv, ids = read_map(mp)
+        if mv != n_vocab:
+            raise SystemExit(f"{mp}: map is for {mv} tokens, {gguf} has {n_vocab}")
+        name = parts[4] if len(parts) == 5 else f"{family.lower()}-{len(ids)}"
+        bm = bytearray((n_vocab + 7) // 8)
+        for i in ids:
+            bm[i >> 3] |= 1 << (i & 7)
+        entries.append((name, family, arch, h, n_vocab, len(ids), bm.hex(), os.path.basename(mp)))
+        print(f"{name}: {family} {arch} fp={h:016x} n_vocab={n_vocab} n_sel={len(ids)} from {mp}", file=sys.stderr)
+
+    with open(a.out, "w") as f:
+        f.write("// generated by scripts/gen-mtp-vocab-builtin.py, do not edit\n")
+        f.write("// sources: " + ", ".join(e[7] for e in entries) + "\n\n")
+        for k, e in enumerate(entries):
+            hx = e[6]
+            f.write(f"// {e[0]}: {e[5]} of {e[4]} tokens\n")
+            f.write(f"static const char * const k_bitmap_{k}[] = {{\n")
+            for c in range(0, len(hx), CHUNK):
+                f.write(f'    "{hx[c:c + CHUNK]}",\n')
+            f.write("    nullptr,\n};\n\n")
+        f.write("static const llama_mtp_vocab_builtin k_builtins[] = {\n")
+        for k, e in enumerate(entries):
+            f.write(f'    {{ "{e[0]}", "{e[1]}", "{e[2]}", 0x{e[3]:016x}ULL, {e[4]}, {e[5]}, k_bitmap_{k} }},\n')
+        f.write("    { nullptr, nullptr, nullptr, 0, 0, 0, nullptr },\n};\n")
+    print(f"wrote {a.out}", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()

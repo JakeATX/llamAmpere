@@ -316,6 +316,13 @@ The control column is the same binary run twice with the flag off against the sa
 
 Note the perplexity row in particular: the flag-ON arm's PPL ratio (1.000222) is *closer to 1* than the control's (1.000252), and both sit inside their own error bars. Perplexity cannot distinguish this change from no change at all, while the KL divergence separates them by three orders of magnitude at the 99.9th percentile and same-top-1 shows roughly 1 token in 91 selecting a different argmax. Perplexity averages over the observed token's log-probability only, so redistribution among the alternatives -- which is exactly what a different summation order produces -- is invisible to it. Use the KLD rows to judge this flag; the PPL row is reported only to document that it is uninformative here.
 
+#### GGML_CUDA_MMQ_PREC
+
+Override the activation precision that the model requests for NVFP4 and MXFP4 matrix multiplications.
+Currently supported values: `auto`, `q8`, `q4`.
+
+NVFP4 and MXFP4 layers marked as W4A16 request 8-bit activations, so on Blackwell those layers run through the W4A8 path instead of the native W4A4 path. Set `q4` to keep the native W4A4 path for faster prompt processing at the cost of accuracy, or `q8` to use the W4A8 path for every layer, `auto` uses per-tensor prec metadata (this is the same behavior as when the environment variable is not set).
+
 ### Unified Memory
 
 The environment variable `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1` can be used to enable unified memory in Linux. This allows swapping to system RAM instead of crashing when the GPU VRAM is exhausted. In Windows this setting is available in the NVIDIA control panel as `System Memory Fallback`.
@@ -357,11 +364,11 @@ cmake --build build --config Release
 By default, all supported compute capabilities are enabled. To customize this behavior, you can specify the `MUSA_ARCHITECTURES` option in the CMake command:
 
 ```bash
-cmake -B build -DGGML_MUSA=ON -DMUSA_ARCHITECTURES="21"
+cmake -B build -DGGML_MUSA=ON -DMUSA_ARCHITECTURES="31"
 cmake --build build --config Release
 ```
 
-This configuration enables only compute capability `2.1` (MTT S80) during compilation, which can help reduce compilation time.
+This configuration enables only compute capability `3.1` (MTT S5000) during compilation, which can help reduce compilation time.
 
 #### Compilation options
 

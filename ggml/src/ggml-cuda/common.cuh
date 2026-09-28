@@ -3,6 +3,7 @@
 #include "ggml.h"
 #include "ggml-impl.h"
 #include "ggml-cuda.h"
+#include "ggml-ledger.h"
 
 #include <cstdint>
 #include <cstdlib>
@@ -111,9 +112,9 @@
 #define GGML_CUDA_CC_IS_QY2(cc)      (cc >= GGML_CUDA_CC_QY2 && cc < GGML_CUDA_CC_PH1)
 #define GGML_CUDA_CC_IS_PH1(cc)      (cc >= GGML_CUDA_CC_PH1)
 
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11070
+#if !defined(GGML_USE_HIP) && (defined(GGML_USE_MUSA) || CUDART_VERSION >= 11070)
 #    define GGML_CUDA_USE_CUB
-#endif  // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11070
+#endif  // !defined(GGML_USE_HIP) && (defined(GGML_USE_MUSA) || CUDART_VERSION >= 11070)
 
 // PDL host-side support (cudaLaunchKernelEx) requires CUDART >= 11.8.
 // However, this has been bugged in CTK < 12.3 for MSVC builds, see
@@ -237,7 +238,7 @@ static const char * cu_get_error_str(CUresult err) {
 #define CU_CHECK(err) CUDA_CHECK_GEN(err, CUDA_SUCCESS, cu_get_error_str)
 #endif
 
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#if !defined(GGML_USE_HIP)
 #    define CUDA_SET_SHARED_MEMORY_LIMIT(kernel, nbytes)                                                       \
         do {                                                                                                   \
             static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = { false };                         \
@@ -252,7 +253,7 @@ static const char * cu_get_error_str(CUresult err) {
         do {                                             \
             GGML_UNUSED(nbytes);                         \
         } while (0)
-#endif // !(defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#endif // !defined(GGML_USE_HIP)
 
 #if CUDART_VERSION >= 11010 || defined(GGML_USE_MUSA)
 #define GGML_CUDA_ASSUME(x) __builtin_assume(x)
@@ -397,7 +398,7 @@ static constexpr __device__ int ggml_cuda_get_physical_warp_size() {
 
 // Maximum number of bytes that can be copied in a single instruction.
 static constexpr __device__ int ggml_cuda_get_max_cpy_bytes() {
-#ifdef GGML_USE_HIP
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
     return 16;
 #else
 #if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
@@ -405,7 +406,7 @@ static constexpr __device__ int ggml_cuda_get_max_cpy_bytes() {
 #else
     return 8;
 #endif // __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
-#endif // GGML_USE_HIP
+#endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
 }
 
 
@@ -424,10 +425,6 @@ static __device__ void no_device_code(
     __trap();
 
     GGML_UNUSED(no_device_code); // suppress unused function warning
-
-#if defined(GGML_USE_MUSA)
-    __builtin_unreachable();
-#endif // defined(GGML_USE_MUSA)
 }
 
 #ifdef __CUDA_ARCH__
@@ -696,16 +693,11 @@ static __device__ __forceinline__ half2 ggml_cuda_hmax2(const half2 a, const hal
 
 template<int width = WARP_SIZE>
 static __device__ __forceinline__ half2 warp_reduce_max(half2 x) {
-#if !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_PASCAL || defined(GGML_USE_HIP)
 #pragma unroll
    for (int offset = width/2; offset > 0; offset >>= 1) {
        x = ggml_cuda_hmax2(x, __shfl_xor_sync(0xffffffff, x, offset, width));
    }
    return x;
-#else
-   GGML_UNUSED(x);
-   NO_DEVICE_CODE;
-#endif // !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_PASCAL || defined(GGML_USE_HIP)
 }
 
 #if (defined(CUDART_VERSION) && CUDART_VERSION < CUDART_HMASK) || defined(GGML_USE_HIP) || \
@@ -1349,6 +1341,7 @@ struct ggml_cuda_graph {
         void *   node_src_data_ptrs[GGML_MAX_SRC];
         int64_t  node_src_ne[GGML_MAX_SRC][GGML_MAX_DIMS];
         size_t   node_src_nb[GGML_MAX_SRC][GGML_MAX_DIMS];
+        uint64_t kv_stream_generation;
     };
     std::vector<node_properties> node_props;
 
@@ -1522,19 +1515,11 @@ struct ggml_backend_cuda_context {
 
     int curr_stream_no = 0;
 
-    // [TAG_FA_F16_CUDA_GRAPHS] Set once per compute call in ggml_backend_cuda_graph_compute: true
-    // when the current cgraph is graph-enabled AND graph-compatible (i.e. it will be captured).
-    // On HIP the flash-attention launcher reads this to place its f16 KV-dequant temp buffers in the
-    // capture-safe memory pool instead of raw cudaMalloc/cudaFree, which are illegal while a CUDA
-    // graph is being captured. Left false for graph-incompatible graphs so those keep the raw
-    // release-after-use path (avoids the legacy pool retaining the temp; ref llama.cpp #22107).
-    bool fa_f16_use_pool = false;
-
     // Per-graph-eval shared-quantize cache for the mmvq path. Several matvecs in one decode
     // layer consume the same normed activation (Q/V/K read attn_norm; the router, fused
     // gate/up and shared-expert gate read attn_post_norm), and each used to re-quantize it to
-    // q8_1 — ~60% of all quantize launches were duplicates. The most recent quantization is
-    // kept in a persistent device buffer and reused when the same src1 tensor is seen again in
+    // q8_1 — ~60% of all quantize launches were duplicates. The two most recent quantizations
+    // are kept in persistent device buffers and reused when the same src1 tensor is seen again in
     // the same graph eval with identical layout. Stream ordering makes overwrite safe (all
     // consumers of the previous entry are already enqueued before the next quantize runs),
     // and the buffer only grows on shape changes, which force a CUDA-graph re-capture anyway.
@@ -1543,7 +1528,9 @@ struct ggml_backend_cuda_context {
     // collide into one decorated name and the linker rejects the object (LNK1179).
     struct retired_buf { char * ptr; size_t cap; int dev; };
 
-    struct {
+    // Two entries: a layer can quantize one activation in both layouts (IQ4_XS swizzled and plain)
+    // and read the first layout again after the second one.
+    struct q8_cache_entry {
         char *              ptr  = nullptr;      // raw device memory (not pool), grow-only
         size_t              cap  = 0;            // usable bytes
         int                 dev  = -1;           // device the buffer was allocated on
@@ -1552,7 +1539,13 @@ struct ggml_backend_cuda_context {
         uint64_t            epoch = 0;           // valid only within this graph eval
         size_t              size = 0;            // quantized bytes
         int64_t             ne10_padded = 0;     // layout keys
-        ggml_type           type = GGML_TYPE_COUNT;
+        bool                swizzle_iq4 = false;
+        uint64_t            last_use = 0;        // LRU order
+    };
+
+    struct {
+        q8_cache_entry entries[2];
+        uint64_t       tick = 0;
         std::vector<retired_buf> retired;        // outgrown buffers, freed at teardown (captured graphs may still use them)
     } q8_cache;
 
@@ -1570,6 +1563,24 @@ struct ggml_backend_cuda_context {
         std::vector<retired_buf> retired;        // outgrown buffers, freed at teardown (captured graphs may still use them)
     } tq_rot_cache;
 
+    // Per-expert address tables for the MoE weight indirection (see tq_build_expert_table). One
+    // entry per expert tensor, built on first use and kept for the life of the context: a captured
+    // graph replays kernels that read this exact address, so it cannot be pool memory and cannot be
+    // freed early. Same discipline as the caches above.
+    struct moe_expert_table {
+        const void *  base      = nullptr;   // src0->data the table was built from
+        int64_t       nb_expert = 0;
+        int           n_expert  = 0;
+        int           dev       = -1;
+        const void ** ptr       = nullptr;   // device array of n_expert addresses
+    };
+    std::vector<moe_expert_table> moe_tables;
+    std::vector<retired_buf>      moe_tables_retired;
+
+    // The cached table for this expert tensor, built on first use. Stable across calls so a
+    // captured graph can keep referencing it.
+    const void ** moe_expert_table_get(const ggml_tensor * src0, int64_t nb_expert, cudaStream_t stream);
+
     uint64_t graph_epoch = 1;
 
     // Fusion hit counters. Read through ggml_backend_cuda_fusion_count(); test-backend-ops uses
@@ -1579,7 +1590,50 @@ struct ggml_backend_cuda_context {
         int64_t q8_cache_hits = 0;   // mmvq shared-quantize cache hits
         int64_t fused_add     = 0;   // tuned multi-ADD runs (ggml_cuda_op_fused_add)
         int64_t fused_mul     = 0;   // tuned multi-MUL runs (ggml_cuda_op_fused_mul)
+        int64_t mul_mat_bias  = 0;   // ADD epilogues folded into mul_mat_vec (bias or a full
+                                     // same-shape residual: both arrive as fusion x_bias)
+        int64_t mul_mat_glu   = 0;   // GLU epilogues folded into mul_mat_vec
+        int64_t norm_pair_concat = 0; // RMS_NORM+MUL pairs written straight into a CONCAT (ggml_cuda_fuse_norm_pair_concat)
+        int64_t gdn_state_read = 0;  // gated_delta_net launches that read the state through s_copy (#87)
+        int64_t add_rms       = 0;   // fused ADD + RMS_NORM + MUL runs (ggml_cuda_op_add_rms_norm_mul) [#46]
+        int64_t add_rms_q8    = 0;   // ... of which also prefilled the q8_1 cache for the next MMVQ consumer
+        int64_t exl3_ffn_bridge = 0; // EXL3 gate/up -> SwiGLU -> down runs through ggml_cuda_exl3_ffn_bridge [#74]
     } fusion_stats;
+    // Landing slots for paged-in experts. One slab per expert tensor, n_slots experts wide; the
+    // address table is pointed at a slot instead of at the expert's home address once it is copied.
+    struct moe_expert_slab {
+        const void * base = nullptr;
+        int64_t      nb_expert = 0;
+        int          n_slots = 0;
+        int          n_expert = 0;
+        int          n_routed = 0;
+        int          dev = -1;
+        void *       slab = nullptr;
+        // residency bookkeeping, all device-resident so the policy stays inside the graph
+        int32_t *    slot_expert = nullptr;   // n_slots,  expert in this slot or -1
+        int32_t *    claim       = nullptr;   // n_slots,  lowest routed index claiming it this call
+        int32_t *    hit         = nullptr;   // n_routed, already resident
+        int32_t *    won         = nullptr;   // n_routed, will read from a slot rather than in place
+        int32_t *    miss_expert = nullptr;   // n_routed
+        int32_t *    miss_slot   = nullptr;   // n_routed
+        int32_t *    n_miss      = nullptr;   // 1
+    };
+    std::vector<moe_expert_slab> moe_slabs;
+
+    moe_expert_slab * moe_expert_slab_get(const ggml_tensor * src0, int64_t nb_expert,
+                                          int n_expert, int n_routed, cudaStream_t stream);
+
+    // [#87] gated_delta_net nodes of the graph being evaluated whose GET_ROWS state gather is skipped:
+    // the launch reads sequence s's input state from base + rows[s] * row_stride instead of src[5].
+    // Filled by ggml_cuda_gdn_state_read_plan at the start of each evaluation, cleared at its end.
+    struct gdn_state_read_entry {
+        const ggml_tensor * gdn        = nullptr;
+        const float *       base       = nullptr;
+        const int32_t *     rows       = nullptr;
+        int64_t             row_stride = 0;       // floats
+        bool                used       = false;
+    };
+    std::vector<gdn_state_read_entry> gdn_state_reads;
 
 #ifdef USE_CUDA_GRAPH
     std::unordered_map<uint64_t, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
@@ -1603,6 +1657,7 @@ struct ggml_backend_cuda_context {
             last_graph_eviction_sweep = time_now;
             for (auto it = cuda_graphs.begin(); it != cuda_graphs.end(); ) {
                 if (time_now - it->second->last_used_time >= evict_us) {
+                    ggml_ledger_add("cuda.graph", "evict:idle (GGML_CUDA_GRAPH_EVICT_S)", 1); // [#68] next use recaptures ("why=new")
                     it = cuda_graphs.erase(it);
                 } else {
                     ++it;
@@ -1619,6 +1674,7 @@ struct ggml_backend_cuda_context {
                         lru = c;
                     }
                 }
+                ggml_ledger_add("cuda.graph", "evict:lru (max_cuda_graphs)", 1); // [#68]
                 cuda_graphs.erase(lru);
             }
             it = cuda_graphs.emplace(graph_key, std::make_unique<ggml_cuda_graph>()).first;

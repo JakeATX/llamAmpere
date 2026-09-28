@@ -671,6 +671,29 @@ static __global__ void convert_unary(
     }
 }
 
+template <typename T> struct alignas(sizeof(T)*4) cvt_vec4 { T v[4]; };
+
+// four elements per thread, so a warp moves 512B (RDNA) / 1k (CDNA) per load
+template <typename src_t, typename dst_t>
+static __global__ void convert_unary_cont_vec4(
+        const void * __restrict__ vx, dst_t * __restrict__ y, const int64_t k4) {
+    const int64_t i = (int64_t)blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (i >= k4) {
+        return;
+    }
+
+    const cvt_vec4<src_t> xv = ((const cvt_vec4<src_t> *) vx)[i];
+
+    cvt_vec4<dst_t> yv;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        yv.v[j] = ggml_cuda_cast<dst_t>(xv.v[j]);
+    }
+
+    ((cvt_vec4<dst_t> *) y)[i] = yv;
+}
+
 template <typename src_t, typename dst_t>
 static void convert_unary_cuda(const void * vx, dst_t * y,
         const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
@@ -684,6 +707,15 @@ static void convert_unary_cuda(const void * vx, dst_t * y,
 
 template <typename src_t, typename dst_t>
 static void convert_unary_cont_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    if (k % 4 == 0 &&
+        (uintptr_t) vx % alignof(cvt_vec4<src_t>) == 0 &&
+        (uintptr_t) y  % alignof(cvt_vec4<dst_t>) == 0) {
+        const int64_t k4 = k/4;
+        const int64_t num_blocks = (k4 + CUDA_DEQUANTIZE_BLOCK_SIZE - 1) / CUDA_DEQUANTIZE_BLOCK_SIZE;
+        convert_unary_cont_vec4<src_t, dst_t><<<num_blocks, CUDA_DEQUANTIZE_BLOCK_SIZE, 0, stream>>>(vx, y, k4);
+        return;
+    }
+
     convert_unary_cuda<src_t>(vx, y, k, 1, 1, 1, k, k, k, stream);
 }
 
@@ -829,6 +861,10 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
             return dequantize_block_cont_cuda<QK_TURBO2, QR_TURBO2, dequantize_turbo2_0>;
         case GGML_TYPE_TURBO4_0:
             return dequantize_block_cont_cuda<QK_TURBO4, QR_TURBO4, dequantize_turbo4_0>;
+        case GGML_TYPE_TQ6_0:
+            return dequantize_block_cont_cuda<QK_TQ6, QR_TQ6, dequantize_tq6_0>;
+        case GGML_TYPE_TQ5_0:
+            return dequantize_block_cont_cuda<QK_TQ5, QR_TQ5, dequantize_tq5_0>;
         case GGML_TYPE_TQ4_1S:
             return dequantize_tq4_1s_warp_cuda<half>;  // fast warp-cooperative WHT
         case GGML_TYPE_TQ3_1S:
@@ -910,6 +946,10 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
             return dequantize_block_cont_cuda<QK_TURBO2, QR_TURBO2, dequantize_turbo2_0>;
         case GGML_TYPE_TURBO4_0:
             return dequantize_block_cont_cuda<QK_TURBO4, QR_TURBO4, dequantize_turbo4_0>;
+        case GGML_TYPE_TQ6_0:
+            return dequantize_block_cont_cuda<QK_TQ6, QR_TQ6, dequantize_tq6_0>;
+        case GGML_TYPE_TQ5_0:
+            return dequantize_block_cont_cuda<QK_TQ5, QR_TQ5, dequantize_tq5_0>;
         case GGML_TYPE_TQ4_1S:
             return dequantize_tq4_1s_warp_cuda<float>;  // fast warp-cooperative WHT
         case GGML_TYPE_TQ3_1S:
@@ -951,6 +991,10 @@ to_fp16_nc_cuda_t ggml_get_to_fp16_nc_cuda(ggml_type type) {
             return dequantize_block_cuda<QK_TURBO2, QR_TURBO2, dequantize_turbo2_0>;
         case GGML_TYPE_TURBO4_0:
             return dequantize_block_cuda<QK_TURBO4, QR_TURBO4, dequantize_turbo4_0>;
+        case GGML_TYPE_TQ6_0:
+            return dequantize_block_cuda<QK_TQ6, QR_TQ6, dequantize_tq6_0>;
+        case GGML_TYPE_TQ5_0:
+            return dequantize_block_cuda<QK_TQ5, QR_TQ5, dequantize_tq5_0>;
         case GGML_TYPE_TQ4_1S:
             return dequantize_block_cuda<QK_TQ4_1S, QR_TQ4_1S, dequantize_tq4_1s>;
         case GGML_TYPE_TQ3_1S:
@@ -1019,6 +1063,10 @@ to_fp32_nc_cuda_t ggml_get_to_fp32_nc_cuda(ggml_type type) {
             return dequantize_block_cuda<QK_TURBO2, QR_TURBO2, dequantize_turbo2_0>;
         case GGML_TYPE_TURBO4_0:
             return dequantize_block_cuda<QK_TURBO4, QR_TURBO4, dequantize_turbo4_0>;
+        case GGML_TYPE_TQ6_0:
+            return dequantize_block_cuda<QK_TQ6, QR_TQ6, dequantize_tq6_0>;
+        case GGML_TYPE_TQ5_0:
+            return dequantize_block_cuda<QK_TQ5, QR_TQ5, dequantize_tq5_0>;
         case GGML_TYPE_TQ4_1S:
             return dequantize_block_cuda<QK_TQ4_1S, QR_TQ4_1S, dequantize_tq4_1s>;
         case GGML_TYPE_TQ3_1S:

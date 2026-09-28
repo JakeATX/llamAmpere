@@ -877,6 +877,22 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_turbo4_0,
         .from_float_ref           = (ggml_from_float_t) quantize_row_turbo4_0_ref,
     },
+    [GGML_TYPE_TQ6_0] = {
+        .type_name                = "tq6_0",
+        .blck_size                = QK_TQ6,
+        .type_size                = sizeof(block_tq6_0),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_tq6_0,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_tq6_0_ref,
+    },
+    [GGML_TYPE_TQ5_0] = {
+        .type_name                = "tq5_0",
+        .blck_size                = QK_TQ5,
+        .type_size                = sizeof(block_tq5_0),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_tq5_0,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_tq5_0_ref,
+    },
     [GGML_TYPE_TURBO2_0] = {
         .type_name                = "turbo2",
         .blck_size                = QK_TURBO2,
@@ -4044,8 +4060,8 @@ struct ggml_tensor * ggml_permute(
     struct ggml_tensor * result = ggml_view_tensor(ctx, a);
     ggml_format_name(result, "%s (permuted)", a->name);
 
-    int ne[GGML_MAX_DIMS];
-    int nb[GGML_MAX_DIMS];
+    int64_t ne[GGML_MAX_DIMS];
+    size_t nb[GGML_MAX_DIMS];
 
     ne[axis0] = a->ne[0];
     ne[axis1] = a->ne[1];
@@ -6520,7 +6536,7 @@ struct ggml_tensor * ggml_gated_delta_net(
         struct ggml_tensor  * state,
         int64_t               K,
         int32_t               emit_mode) {
-    GGML_ASSERT(emit_mode == 0 || emit_mode == 1);
+    GGML_ASSERT(emit_mode >= 0 && emit_mode <= 2);
     GGML_ASSERT(ggml_is_contiguous_rows(q));
     GGML_ASSERT(ggml_is_contiguous_rows(k));
     GGML_ASSERT(ggml_is_contiguous_rows(v));
@@ -6557,10 +6573,12 @@ struct ggml_tensor * ggml_gated_delta_net(
     //                 when n_tokens > K) one further such block: the state immediately before the
     //                 K-token retained window starts, free to capture since the recurrence already
     //                 passes through it en route to the final state.
-    const bool    needs_ckpt  = emit_mode == 1 && n_tokens > K;
+    // emit_mode == 2: compact slots (g and beta stored once per head), padded to whole rows.
+    const bool    needs_ckpt  = emit_mode != 0 && n_tokens > K;
     const int64_t state_rows  = emit_mode == 0
         ? K * S_v * n_seqs
-        : K * 4 * n_seqs + S_v * n_seqs + (needs_ckpt ? S_v * n_seqs : 0);
+        : ggml_gated_delta_net_ingr_region(S_v, g->ne[0], H, n_seqs, K, emit_mode) / (S_v * H) +
+          S_v * n_seqs + (needs_ckpt ? S_v * n_seqs : 0);
     const int64_t ne[4] = { S_v * H, n_tokens * n_seqs + state_rows, 1, 1 };
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
 
@@ -6576,6 +6594,17 @@ struct ggml_tensor * ggml_gated_delta_net(
     result->src[5] = state;
 
     return result;
+}
+
+int64_t ggml_gated_delta_net_ingr_width(int64_t S_v, int64_t g_width, int32_t emit_mode) {
+    GGML_ASSERT(emit_mode == 1 || emit_mode == 2);
+    return emit_mode == 1 ? 4 * S_v : 2 * S_v + g_width + 1;
+}
+
+int64_t ggml_gated_delta_net_ingr_region(int64_t S_v, int64_t g_width, int64_t H, int64_t n_seqs, int64_t K, int32_t emit_mode) {
+    const int64_t n   = K * ggml_gated_delta_net_ingr_width(S_v, g_width, emit_mode) * H * n_seqs;
+    const int64_t row = S_v * H; // the op's output row
+    return (n + row - 1) / row * row;
 }
 
 // ggml_turbo_wht
@@ -7642,7 +7671,7 @@ static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
 
 static size_t ggml_graph_nbytes(size_t size, bool grads) {
     size_t hash_size = ggml_hash_size(size * 2);
-    void * p = 0;
+    void * p = (char *) 1024; // workaround for ubsan error "applying non-zero offset X to null pointer"
     incr_ptr_aligned(&p, sizeof(struct ggml_cgraph), 1);
     incr_ptr_aligned(&p, size * sizeof(struct ggml_tensor *), sizeof(struct ggml_tensor *)); // nodes
     incr_ptr_aligned(&p, size * sizeof(struct ggml_tensor *), sizeof(struct ggml_tensor *)); // leafs
@@ -7655,7 +7684,7 @@ static size_t ggml_graph_nbytes(size_t size, bool grads) {
     incr_ptr_aligned(&p, ggml_bitset_size(hash_size) * sizeof(ggml_bitset_t), sizeof(ggml_bitset_t));
 
     size_t nbytes = (size_t) p;
-    return nbytes;
+    return nbytes - 1024;
 }
 
 size_t ggml_graph_overhead_custom(size_t size, bool grads) {
@@ -8304,6 +8333,8 @@ size_t ggml_quantize_chunk(
         case GGML_TYPE_TURBO3_0: result = quantize_turbo3_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_TURBO4_0: result = quantize_turbo4_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_TURBO2_0: result = quantize_turbo2_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_TQ6_0:   result = quantize_tq6_0  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_TQ5_0:   result = quantize_tq5_0  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_TQ3_1S:  result = quantize_tq3_1s(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_TQ4_1S:  result = quantize_tq4_1s(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_F16:

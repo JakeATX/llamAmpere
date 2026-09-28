@@ -6,6 +6,8 @@
 // no QTIP code was used.
 #include "exl3.cuh"
 
+#include <cstring>
+
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 #include <cooperative_groups.h>
 namespace cg = cooperative_groups;
@@ -38,14 +40,29 @@ namespace cg = cooperative_groups;
 // per call for the barriers on the 1008-block persistent grid, more than the glue costs, so the split-glue path stays
 // the default; GGML_CUDA_EXL3_FUSED=1 opts in, EXL3_GEMV_BPS caps the cooperative grid at n blocks per SM.
 
+// [#73] weight-major mma (on by default, GGML_CUDA_EXL3_WEIGHT_MAJOR=0 turns it off):
+// the decoded weight tile is the A operand ({wv0, wv2, wv1, wv3}: A rows = the 16 output columns, A cols = k) and x
+// the B operand (tokens on n8), so one mma.m16n8k16 per 16x16 tile instead of two with x as A, whose rows 8-15 are
+// zero at T <= 8. D rows are outputs, D columns tokens. 3- and 4-bit, T = 2..8, split glue (not FUSED) only; the
+// split-K, the fold schedule and the reduction are the ones above. -DLLAMAMPERE_EXL3_WEIGHT_MAJOR=0 leaves the
+// variant out of the build.
+#ifndef LLAMAMPERE_EXL3_WEIGHT_MAJOR
+#define LLAMAMPERE_EXL3_WEIGHT_MAJOR 1
+#endif
 #define EXL3_GEMV_NWARPS 4
 #define EXL3_GEMV_MAX_T  16
 #ifndef EXL3_GEMV_MMA_MIN_T
 #define EXL3_GEMV_MMA_MIN_T 2
 #endif
 
-// x is staged in shared memory as fp16 (scaled by 1/16 so that fp16 partial sums cannot overflow: |w| <= 3.5,
-// |x/16| <= 4096, at most 64 products per fp16 partial)
+// x is staged in shared memory as fp16, scaled by 1/16. That scale does not by itself keep the fp16 partial sums
+// finite. The largest mul1 codebook value is |w| = 3.453125 (exhaustive over the 65,536 codes), and the partials are:
+//   - mma path (T >= EXL3_GEMV_MMA_MIN_T): D is fp16 across U = 4 k-tiles before the fp32 fold, 64 products,
+//     so it is guaranteed finite for |x/16| <= 65504 / (64 * 3.453125) = 296.4 (|x| <= 4742 after suh and H128);
+//   - HFMA2 path (T = 1): 4 products per fp16 partial, finite for |x/16| <= 4742;
+//   - the fp16 staging itself holds |x/16| <= 65504.
+// Above those bounds a partial can still be finite (signs cancel, most products are far below the maximum), so the
+// bounds are sufficient, not necessary.
 #define EXL3_GEMV_X_SCALE    0.0625f
 template <int T> struct exl3_gemv_cfg {
     static constexpr bool MMA        = T >= EXL3_GEMV_MMA_MIN_T;
@@ -62,7 +79,7 @@ static __device__ __forceinline__ void exl3_mma_f16(uint32_t (&d)[2], const uint
         : "+r"(d[0]), "+r"(d[1]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
 
-template <int BITS, int T, bool FUSED>
+template <int BITS, int T, bool FUSED, bool WM = false>
 static __global__ void __launch_bounds__(32 * EXL3_GEMV_NWARPS)
 k_exl3_gemv(const uint32_t * __restrict__ trellis, half2 * __restrict__ x, float * __restrict__ y,
             const int kt, const int nt, const int K, const int N, const int ksplit, const int kpi,
@@ -70,6 +87,7 @@ k_exl3_gemv(const uint32_t * __restrict__ trellis, half2 * __restrict__ x, float
             float * __restrict__ yf, const int post) {
     using cfg = exl3_gemv_cfg<T>;
     constexpr bool MMA        = cfg::MMA;
+    constexpr bool WEIGHT_MAJOR = WM && MMA && T >= 2 && T <= 8 && (BITS == 3 || BITS == 4) && !FUSED;
     constexpr int  XROWS      = cfg::XROWS;
     constexpr int  KTILES_MAX = cfg::KTILES_MAX;
     constexpr int  NW    = 8 * BITS;       // words per tile
@@ -101,7 +119,9 @@ k_exl3_gemv(const uint32_t * __restrict__ trellis, half2 * __restrict__ x, float
     const half2 cb_mul = __halves2half2(__ushort_as_half((unsigned short) 0x1eee), __ushort_as_half((unsigned short) 0x1eee));
     const half2 cb_add = __halves2half2(__ushort_as_half((unsigned short) 0xc931), __ushort_as_half((unsigned short) 0xc931));
 
-    __shared__ float part[EXL3_GEMV_NWARPS][T][16];
+    // weight-major writes part[.][2q + {0,1}][g + {0,8}]: a row pitch of 20 floats puts the 32 lanes of a store on
+    // banks 8q + g (+ const), conflict-free; the column-sum reader below does not care about the pitch
+    __shared__ float part[EXL3_GEMV_NWARPS][T][WEIGHT_MAJOR ? 20 : 16];
     __shared__ __align__(16) half2 xs[XROWS][KTILES_MAX * 8];   // fp16 x of the item's k-range, as row pairs
 
     if (MMA && T < XROWS) {   // A rows T..7 are zero for every item (the barrier of the first staging orders this)
@@ -222,8 +242,14 @@ k_exl3_gemv(const uint32_t * __restrict__ trellis, half2 * __restrict__ x, float
                 a[1] = XROWS > 8 ? exl3_h2u(xs[(XROWS > 8 ? g + 8 : 0)][kl * 8 + q]) : 0u;       // A[g+8][2q, 2q+1]
                 a[2] = exl3_h2u(xs[g][kl * 8 + q + 4]);      // A[g][2q+8, 2q+9]
                 a[3] = XROWS > 8 ? exl3_h2u(xs[(XROWS > 8 ? g + 8 : 0)][kl * 8 + q + 4]) : 0u;   // A[g+8][2q+8, 2q+9]
-                exl3_mma_f16(d[0], a, exl3_h2u(wv[0]), exl3_h2u(wv[1]));
-                exl3_mma_f16(d[1], a, exl3_h2u(wv[2]), exl3_h2u(wv[3]));
+                if constexpr (WEIGHT_MAJOR) {
+                    const uint32_t wa[4] = {exl3_h2u(wv[0]), exl3_h2u(wv[2]),
+                                           exl3_h2u(wv[1]), exl3_h2u(wv[3])};
+                    exl3_mma_f16(d[0], wa, a[0], a[2]);
+                } else {
+                    exl3_mma_f16(d[0], a, exl3_h2u(wv[0]), exl3_h2u(wv[1]));
+                    exl3_mma_f16(d[1], a, exl3_h2u(wv[2]), exl3_h2u(wv[3]));
+                }
             } else {
                 // x row pairs of this tile for this lane: (2q, 2q+1) and (2q+8, 2q+9)
                 half2 xa[T], xb[T];
@@ -257,8 +283,14 @@ k_exl3_gemv(const uint32_t * __restrict__ trellis, half2 * __restrict__ x, float
                 }
             }
         };
-        auto fold = [&]() {   // mma: fp16 D (row g = d[.][0]) -> fp32, restart the fp16 accumulation
-            if (MMA) {
+        auto fold = [&]() {   // mma: fp16 D -> fp32, restart the fp16 accumulation (same schedule in both orientations)
+            if constexpr (WEIGHT_MAJOR) {
+                const float2 v0 = __half22float2(exl3_u2h(d[0][0]));
+                const float2 v1 = __half22float2(exl3_u2h(d[0][1]));
+                accf[0].x += v0.x; accf[0].y += v0.y;
+                accf[1].x += v1.x; accf[1].y += v1.y;
+                d[0][0] = 0u; d[0][1] = 0u;
+            } else if (MMA) {
 #pragma unroll
                 for (int s = 0; s < 2; ++s) {
                     const float2 v = __half22float2(exl3_u2h(d[s][0]));
@@ -340,7 +372,17 @@ k_exl3_gemv(const uint32_t * __restrict__ trellis, half2 * __restrict__ x, float
             for (int m = 0; m < NWORDS; ++m) wl[m] += sw;
         }
 
-        if (MMA) {
+        if constexpr (WEIGHT_MAJOR) {
+            // lane holds D[outputs g, g + 8][tokens 2q, 2q+1]
+            if (2*q < T) {
+                part[warp][2*q][g] = accf[0].x;
+                part[warp][2*q][g + 8] = accf[1].x;
+            }
+            if (2*q + 1 < T) {
+                part[warp][2*q + 1][g] = accf[0].y;
+                part[warp][2*q + 1][g + 8] = accf[1].y;
+            }
+        } else if (MMA) {
             // lane holds D[row g][cols 2q, 2q+1] of both n8 halves
             if (g < T) {
                 part[warp][g][2 * q]         = accf[0].x;
@@ -446,12 +488,12 @@ struct exl3_gemv_args {
     const float * xf; const float * suh; const float * svh; float * yf; bool post;
 };
 
-template <int BITS, int T, bool FUSED>
+template <int BITS, int T, bool FUSED, bool WM = false>
 static void exl3_gemv_launch_bt(const exl3_gemv_args & a, cudaStream_t stream) {
     static int grid_max = 0;   // resident blocks on the device (per instantiation), measured once
     if (grid_max == 0) {
         int nb = 0;
-        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, k_exl3_gemv<BITS, T, FUSED>, 32 * EXL3_GEMV_NWARPS, 0));
+        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, k_exl3_gemv<BITS, T, FUSED, WM>, 32 * EXL3_GEMV_NWARPS, 0));
         const int id = ggml_cuda_get_device();
         nb = std::max(1, nb);
         if (FUSED && exl3_gemv_bps_cap() > 0) {
@@ -475,15 +517,46 @@ static void exl3_gemv_launch_bt(const exl3_gemv_args & a, cudaStream_t stream) {
         return;
     }
 #endif
-    k_exl3_gemv<BITS, T, FUSED><<<grid, block, 0, stream>>>(trellis, x, out, kt, nt, K, N, ksplit, kpi_, xf, suh, svh, yf, post);
+    k_exl3_gemv<BITS, T, FUSED, WM><<<grid, block, 0, stream>>>(trellis, x, out, kt, nt, K, N, ksplit, kpi_, xf, suh, svh, yf, post);
+}
+
+// [#73] the weight-major mma runs at T = 2..8 (3/4-bit, split glue) by default (measured 2026-09-25 on 4.0 bpw:
+// -2.2% per round, identical output); GGML_CUDA_EXL3_WEIGHT_MAJOR=0 selects the x-as-A mma
+static bool exl3_gemv_weight_major_env() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_EXL3_WEIGHT_MAJOR");
+        return env == nullptr || strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+template <int T, bool FUSED>
+static constexpr bool exl3_gemv_weight_major_ok() {
+    return LLAMAMPERE_EXL3_WEIGHT_MAJOR && !FUSED && T >= EXL3_GEMV_MMA_MIN_T && T >= 2 && T <= 8;
 }
 
 template <int T, bool FUSED>
 static void exl3_gemv_launch(const exl3_gemv_args & a, const int bits, cudaStream_t stream) {
     switch (bits) {
         case 2: exl3_gemv_launch_bt<2, T, FUSED>(a, stream); break;
-        case 3: exl3_gemv_launch_bt<3, T, FUSED>(a, stream); break;
-        case 4: exl3_gemv_launch_bt<4, T, FUSED>(a, stream); break;
+        case 3:
+            if constexpr (exl3_gemv_weight_major_ok<T, FUSED>()) {
+                if (exl3_gemv_weight_major_env()) {
+                    exl3_gemv_launch_bt<3, T, FUSED, true>(a, stream);
+                    break;
+                }
+            }
+            exl3_gemv_launch_bt<3, T, FUSED>(a, stream);
+            break;
+        case 4:
+            if constexpr (exl3_gemv_weight_major_ok<T, FUSED>()) {
+                if (exl3_gemv_weight_major_env()) {
+                    exl3_gemv_launch_bt<4, T, FUSED, true>(a, stream);
+                    break;
+                }
+            }
+            exl3_gemv_launch_bt<4, T, FUSED>(a, stream);
+            break;
         case 5: exl3_gemv_launch_bt<5, T, FUSED>(a, stream); break;
         case 6: exl3_gemv_launch_bt<6, T, FUSED>(a, stream); break;
         case 7: exl3_gemv_launch_bt<7, T, FUSED>(a, stream); break;
@@ -558,6 +631,83 @@ int ggml_cuda_exl3_gemv_ksplit(const int kt, const int nt, const int T) {
     return ksplit;
 }
 
+// [#74] raw split-K partials out[ks][T][N] = W . xh for a glued, pre-scaled fp16 x (no svh, no Hadamard)
+static void exl3_gemv_raw(const ggml_tensor * src0, const half * xh, float * out, const int T, const int ksplit, cudaStream_t stream) {
+    exl3_gemv_args a;
+    a.trellis = (const uint32_t *) src0->data; a.x = (half2 *) xh; a.out = out;
+    a.kt = (int) src0->ne[0] / 16; a.nt = (int) src0->ne[1] / 16; a.K = (int) src0->ne[0]; a.N = (int) src0->ne[1];
+    a.ksplit = ksplit;
+    a.xf = nullptr; a.suh = nullptr; a.svh = nullptr; a.yf = nullptr; a.post = true;
+    exl3_gemv_launch_t<false>(a, ggml_exl3_bits(src0->type), T, stream);
+}
+
+static bool exl3_ffn_mm_ok(const ggml_tensor * mm, const int64_t T) {
+    const ggml_tensor * w  = mm->src[0];
+    const ggml_tensor * x  = mm->src[1];
+    const ggml_tensor * su = mm->src[2];
+    const ggml_tensor * sv = mm->src[3];
+    return ggml_exl3_bits(w->type) != 0 && w->ne[2] == 1 && w->ne[3] == 1 && w->ne[0] % 128 == 0 && w->ne[1] % 128 == 0 &&
+           x->type == GGML_TYPE_F32 && mm->type == GGML_TYPE_F32 && ggml_is_contiguous(x) && ggml_is_contiguous(mm) &&
+           x->ne[1] * x->ne[2] * x->ne[3] == T &&
+           su != nullptr && sv != nullptr && su->type == GGML_TYPE_F32 && sv->type == GGML_TYPE_F32 &&
+           ggml_is_contiguous(su) && ggml_is_contiguous(sv) && su->ne[0] == w->ne[0] && sv->ne[0] == w->ne[1];
+}
+
+bool ggml_cuda_exl3_ffn_bridge(ggml_backend_cuda_context & ctx, const ggml_tensor * mm_gate, const ggml_tensor * mm_up,
+                               ggml_tensor * mm_down) {
+    const int64_t T = mm_down->src[1]->ne[1] * mm_down->src[1]->ne[2] * mm_down->src[1]->ne[3];
+    // the cooperative fused GEMV does its own glue in-kernel
+    if (!ggml_cuda_exl3_gemv_supported(T) || exl3_gemv_fused_enabled()) {
+        return false;
+    }
+    if (!exl3_ffn_mm_ok(mm_gate, T) || !exl3_ffn_mm_ok(mm_up, T) || !exl3_ffn_mm_ok(mm_down, T)) {
+        return false;
+    }
+    const ggml_tensor * wg = mm_gate->src[0];
+    const ggml_tensor * wu = mm_up->src[0];
+    const ggml_tensor * wd = mm_down->src[0];
+    const int K  = (int) wg->ne[0];
+    const int NF = (int) wg->ne[1];
+    const int ND = (int) wd->ne[1];
+    if (wu->ne[0] != K || wu->ne[1] != NF || wd->ne[0] != NF) {
+        return false;
+    }
+
+    const int id = ggml_cuda_get_device();
+    cudaStream_t stream = ctx.stream();
+    const int ks_g = ggml_cuda_exl3_gemv_ksplit(K / 16, NF / 16, (int) T);
+    const int ks_u = ggml_cuda_exl3_gemv_ksplit(K / 16, NF / 16, (int) T);
+    const int ks_d = ggml_cuda_exl3_gemv_ksplit(NF / 16, ND / 16, (int) T);
+
+    // gate and up: glue_in (shared when both read the same x with the same suh) + raw partials
+    const float * suh_g = (const float *) mm_gate->src[2]->data;
+    const float * suh_u = (const float *) mm_up->src[2]->data;
+    ggml_cuda_pool_alloc<half> xh_g(ctx.pool(id), (size_t) T * K);
+    ggml_cuda_exl3_glue_in_f16((const float *) mm_gate->src[1]->data, suh_g, xh_g.get(), K, T, EXL3_GEMV_X_SCALE, stream);
+    ggml_cuda_pool_alloc<half> xh_u(ctx.pool(id));
+    const half * xu = xh_g.get();
+    if (mm_up->src[1]->data != mm_gate->src[1]->data || suh_u != suh_g) {
+        xu = xh_u.alloc((size_t) T * K);
+        ggml_cuda_exl3_glue_in_f16((const float *) mm_up->src[1]->data, suh_u, xh_u.get(), K, T, EXL3_GEMV_X_SCALE, stream);
+    }
+    ggml_cuda_pool_alloc<float> part_g(ctx.pool(id), (size_t) ks_g * T * NF);
+    ggml_cuda_pool_alloc<float> part_u(ctx.pool(id), (size_t) ks_u * T * NF);
+    exl3_gemv_raw(wg, xh_g.get(), part_g.get(), (int) T, ks_g, stream);
+    exl3_gemv_raw(wu, xu,         part_u.get(), (int) T, ks_u, stream);
+
+    // bridge: both glue_outs, SwiGLU, the down projection's glue_in
+    ggml_cuda_pool_alloc<half> xh_d(ctx.pool(id), (size_t) T * NF);
+    ggml_cuda_exl3_ffn_bridge_f16(part_g.get(), ks_g, (const float *) mm_gate->src[3]->data,
+                                  part_u.get(), ks_u, (const float *) mm_up->src[3]->data,
+                                  (const float *) mm_down->src[2]->data, xh_d.get(), NF, T, EXL3_GEMV_X_SCALE, stream);
+
+    // down: the prepared-fp16 entry, raw partials + glue_out (svh is always present here, so always post)
+    ggml_cuda_pool_alloc<float> part_d(ctx.pool(id), (size_t) ks_d * T * ND);
+    exl3_gemv_raw(wd, xh_d.get(), part_d.get(), (int) T, ks_d, stream);
+    ggml_cuda_exl3_glue_out(part_d.get(), (const float *) mm_down->src[3]->data, (float *) mm_down->data, ND, T, ks_d, 1.0f, stream);
+    return true;
+}
+
 void ggml_cuda_exl3_gemv(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const int64_t T,
                          const float * suh, const float * svh) {
     const int bits = ggml_exl3_bits(src0->type);
@@ -573,7 +723,9 @@ void ggml_cuda_exl3_gemv(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
 
     // x -> fp16 [T][K], pre-scaled (and suh * / Hadamard when fused)
     ggml_cuda_pool_alloc<half> xh(ctx.pool(id), (size_t) T * K);
-    const bool fused = exl3_gemv_fused_enabled();
+    // the fused phase 3 walks 128-chunks of [T][N]: without svh and N % 128 != 0 it would drop the T*N % 128 tail,
+    // so that shape takes the split glue (its glue_out has a per-element path)
+    const bool fused = exl3_gemv_fused_enabled() && (svh != nullptr || N % 128 == 0);
     if (!fused) {
         ggml_cuda_exl3_glue_in_f16((const float *) src1->data, suh, xh.get(), K, T, EXL3_GEMV_X_SCALE, stream);
     }
@@ -588,10 +740,10 @@ void ggml_cuda_exl3_gemv(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
     a.xf = (const float *) src1->data; a.suh = suh; a.svh = svh; a.yf = y; a.post = post;
     if (fused) {
         exl3_gemv_launch_t<true>(a, bits, (int) T, stream);
-        return;
-    }
-    exl3_gemv_launch_t<false>(a, bits, (int) T, stream);
-    if (post) {
-        ggml_cuda_exl3_glue_out(out, svh, y, N, T, ksplit, 1.0f, stream);
+    } else {
+        exl3_gemv_launch_t<false>(a, bits, (int) T, stream);
+        if (post) {
+            ggml_cuda_exl3_glue_out(out, svh, y, N, T, ksplit, 1.0f, stream);
+        }
     }
 }
