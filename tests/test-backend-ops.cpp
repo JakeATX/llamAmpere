@@ -1635,6 +1635,22 @@ struct test_case {
             return total;
         };
         const int64_t replay_before = check_replay ? graph_replays() : 0;
+        const auto attention_routes = [] {
+            std::array<int64_t, 4> counts = {};
+            ggml_ledger_foreach([](const char * site, const char * key, int64_t count, void * data) {
+                auto & routes = *static_cast<std::array<int64_t, 4> *>(data);
+                if (strcmp(site, "cuda.fattn.early_v") == 0) {
+                    routes[0] += count;
+                } else if (strcmp(site, "cuda.fattn") == 0 && strncmp(key, "path=q5g6_compact32 ", 20) == 0) {
+                    routes[1] += count;
+                } else if (strcmp(site, "cuda.fattn.fixup") == 0) {
+                    routes[2] += strcmp(key, "q5g6_uniform") == 0 ? count : 0;
+                    routes[3] += strcmp(key, "q5g6_general") == 0 ? count : 0;
+                }
+            }, &counts);
+            return counts;
+        };
+        const auto routes_before = check_replay ? attention_routes() : std::array<int64_t, 4>{};
         bool cmp_ok = true;
         for (int round = 0; round < (replay ? 4 : 1); ++round) {
             // Keep graph shapes and pointers fixed while changing inputs between replays.
@@ -1647,7 +1663,11 @@ struct test_case {
         }
         if (check_replay) {
             const int64_t count = graph_replays() - replay_before;
+            const auto routes_after = attention_routes();
             printf("[FLASH_ATTN_EXT] REPLAY=%" PRId64 " (%s)\n", count, vars().c_str());
+            printf("[FLASH_ATTN_EXT] ROUTES=%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 " (%s)\n",
+                   routes_after[0] - routes_before[0], routes_after[1] - routes_before[1],
+                   routes_after[2] - routes_before[2], routes_after[3] - routes_before[3], vars().c_str());
             cmp_ok = count >= 2 && cmp_ok;
         }
 
