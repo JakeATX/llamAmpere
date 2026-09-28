@@ -43,7 +43,7 @@ What each part buys:
 - **PTQ1_0 prefill tiles** (built in): Ternary-Bonsai-2-27B prefill 846 to 1,148 tok/s at 512 tokens and 815 to 1,126 at 16K (llama-bench, v0.3.1 to v0.4).
 - **`--gdn-replay`** (opt-in, off by default) rebuilds rolled-back recurrent state by replay instead of snapshots: 84 MiB less VRAM at one slot, G -4.31% ± 0.39% against the default.
 
-Start with [QWEN_AMPERE.md](QWEN_AMPERE.md) (its numbers are v0.3) and the write-up in [docs/llamampere-v0.3/ARTICLE.md](docs/llamampere-v0.3/ARTICLE.md) (v0.2: [docs/llamampere-v0.2/ARTICLE.md](docs/llamampere-v0.2/ARTICLE.md)); the flags are documented in [docs/speculative.md](docs/speculative.md) and [docs/KV-cache-quantization.md](docs/KV-cache-quantization.md). Successor of [llama-cpp-qwen-ampere](https://github.com/JakeATX/llama-cpp-qwen-ampere) (v0.1). The rest of this README is upstream llama.cpp's.
+Start with [QWEN_AMPERE.md](QWEN_AMPERE.md) and the write-up in [docs/llamampere-v0.3/ARTICLE.md](docs/llamampere-v0.3/ARTICLE.md) (v0.2: [docs/llamampere-v0.2/ARTICLE.md](docs/llamampere-v0.2/ARTICLE.md)); the flags are documented in [docs/speculative.md](docs/speculative.md) and [docs/KV-cache-quantization.md](docs/KV-cache-quantization.md). Successor of [llama-cpp-qwen-ampere](https://github.com/JakeATX/llama-cpp-qwen-ampere) (v0.1). The rest of this README is upstream llama.cpp's.
 
 # llama.cpp
 
