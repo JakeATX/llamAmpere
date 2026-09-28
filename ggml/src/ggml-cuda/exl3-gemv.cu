@@ -40,7 +40,7 @@ namespace cg = cooperative_groups;
 // per call for the barriers on the 1008-block persistent grid, more than the glue costs, so the split-glue path stays
 // the default; GGML_CUDA_EXL3_FUSED=1 opts in, EXL3_GEMV_BPS caps the cooperative grid at n blocks per SM.
 
-// [#73] weight-major mma (GPT-6 SM86 PTX kit C1; on by default, GGML_CUDA_EXL3_WEIGHT_MAJOR=0 turns it off):
+// [#73] weight-major mma (on by default, GGML_CUDA_EXL3_WEIGHT_MAJOR=0 turns it off):
 // the decoded weight tile is the A operand ({wv0, wv2, wv1, wv3}: A rows = the 16 output columns, A cols = k) and x
 // the B operand (tokens on n8), so one mma.m16n8k16 per 16x16 tile instead of two with x as A, whose rows 8-15 are
 // zero at T <= 8. D rows are outputs, D columns tokens. 3- and 4-bit, T = 2..8, split glue (not FUSED) only; the
