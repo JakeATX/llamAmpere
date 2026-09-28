@@ -10624,6 +10624,31 @@ struct test_generic_op : public test_case {
 };
 
 
+struct test_generic_init : public test_generic_op {
+    test_generic_init(ggml_op op)
+        : test_generic_op(op, GGML_TYPE_F32, {32, op == GGML_OP_GET_ROWS ? 1 : 8, 1, 1}, {},
+              op == GGML_OP_GET_ROWS ? std::vector<input_tensor>{
+                  {GGML_TYPE_F32, {32, 8, 1, 1}, {4, 256, 2048, 2048}},
+                  {GGML_TYPE_I32, {1, 1, 1, 1}, {}}} : std::vector<input_tensor>{
+                  {GGML_TYPE_F32, {32, 1, 1, 1}, {}},
+                  {GGML_TYPE_I32, {1, 1, 1, 1}, {}},
+                  {GGML_TYPE_F32, {32, 8, 1, 1}, {}}}, op == GGML_OP_GET_ROWS ? "generic_init_get" : "generic_init_set") {}
+
+    void initialize_tensors(ggml_context * ctx) override {
+        // Poison storage so missing initialization fails even on a fresh allocation.
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src == nullptr) {
+                std::vector<uint8_t> data(ggml_nbytes(t), 0xff);
+                ggml_backend_tensor_set(t, data.data(), 0, data.size());
+            }
+        }
+        test_generic_op::initialize_tensors(ctx);
+        const int32_t row = 7;
+        ggml_backend_tensor_set(ggml_get_tensor(ctx, "out")->src[1], &row, 0, sizeof(row));
+    }
+};
+
+
 enum llm_norm_type {
     LLM_NORM,
     LLM_NORM_RMS,
@@ -11078,6 +11103,9 @@ static const ggml_type other_types[] = {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     add_iq4xs_k4_cases(test_cases, false);
+
+    test_cases.emplace_back(new test_generic_init(GGML_OP_GET_ROWS));
+    test_cases.emplace_back(new test_generic_init(GGML_OP_SET_ROWS));
 
     // multi-node fusion coverage: residual epilogue, shared-quantize cache, elementwise chain, MoE reduce
     for (ggml_type type : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_TQ4_1S}) {
