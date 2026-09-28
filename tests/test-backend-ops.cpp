@@ -10552,7 +10552,11 @@ struct test_generic_op : public test_case {
         ggml_tensor * out = ggml_get_tensor(ctx, "out");
 
         // Initialize sentinels, view backing tensors and untouched output rows.
-        test_case::initialize_tensors(ctx);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src == nullptr && std::find(out->src, out->src + GGML_MAX_SRC, t) == out->src + GGML_MAX_SRC) {
+                init_tensor_uniform(t);
+            }
+        }
 
         std::random_device rd;
         std::default_random_engine rng(rd());
