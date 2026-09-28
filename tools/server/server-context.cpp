@@ -4505,8 +4505,10 @@ private:
                             SLT_WRN(slot, "n_past was set to %d\n", n_past);
                         }
 
+                        const llama_pos sealed_end = std::max(llama_kvarn_sealed_end(ctx_tgt),
+                                ctx_dft && params_base.speculative.draft.kvarn ? llama_kvarn_sealed_end(ctx_dft) : llama_pos(0));
                         if (params_base.kvarn_bits_k > 0 && n_past > 0 &&
-                                slot.prompt.tokens.pos_next(n_past) < llama_kvarn_sealed_end(ctx_tgt)) {
+                                slot.prompt.tokens.pos_next(n_past) < sealed_end) {
                             SLT_INF(slot, "%s", "edited prompt reaches sealed KVarN rows; reprocessing full prompt\n");
                             slot.prompt_clear();
                             n_past = 0;

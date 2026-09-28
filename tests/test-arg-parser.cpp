@@ -479,6 +479,69 @@ static void test(void) {
         assert(!draft.speculative.draft.cache_type_kvarn_default);
     }
 
+    argv = {"binary_name", "-m", "model_file.gguf", "--spec-type", "draft-mtp-adaptive",
+            "--spec-draft-kvarn", "-ctk", "kvarn3", "-ctv", "kvarn2", "--kvarn-body-type", "kvarn4t",
+            "--kvarn-staging-type", "tq6_0", "--kvarn-sink-type", "f16", "--kvarn-tail", "4096",
+            "--kvarn-tail-max", "8192", "--kvarn-flush-chunk", "4", "--parallel", "1"};
+    common_params dkv_kvarn_inh;
+    assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), dkv_kvarn_inh, LLAMA_EXAMPLE_SERVER));
+    {
+        const auto draft = common_base_params_to_speculative(dkv_kvarn_inh);
+        const auto cparams = common_context_params_to_llama(draft);
+        assert(cparams.kvarn_bits_k == 3 && cparams.kvarn_bits_v == 2);
+        assert(cparams.kvarn_body_type == GGML_TYPE_I16);
+        assert(cparams.kvarn_staging_type == GGML_TYPE_TQ6_0);
+        assert(cparams.kvarn_sink_type == GGML_TYPE_F16);
+        assert(cparams.kvarn_tail == 4096 && cparams.kvarn_tail_max == 8192);
+        assert(cparams.kvarn_flush_chunk == 4 && cparams.kvarn_edge_layers == 0);
+        assert(cparams.type_k == GGML_TYPE_TQ6_0 && cparams.type_v == GGML_TYPE_TQ6_0);
+
+        auto invalid = [](const common_params & p) {
+            bool rejected = false;
+            try {
+                common_base_params_to_speculative(p);
+            } catch (const std::invalid_argument &) {
+                rejected = true;
+            }
+            assert(rejected);
+        };
+        auto bad = dkv_kvarn_inh;
+        bad.speculative.draft.cache_type_k = GGML_TYPE_Q8_0;
+        invalid(bad);
+        bad = dkv_kvarn_inh;
+        bad.speculative.draft.cache_type_v = GGML_TYPE_F16;
+        invalid(bad);
+        bad = dkv_kvarn_inh;
+        bad.n_parallel = 2;
+        invalid(bad);
+        bad = dkv_kvarn_inh;
+        bad.kvarn_bits_k = 0;
+        invalid(bad);
+        bad = dkv_kvarn_inh;
+        bad.speculative.types = { COMMON_SPECULATIVE_TYPE_NONE };
+        invalid(bad);
+        bad = dkv_kvarn_inh;
+        bad.speculative.draft.mparams.path = "draft.gguf";
+        invalid(bad);
+        bad = dkv_kvarn_inh;
+        bad.kvarn_tail = 0;
+        invalid(bad);
+        for (int width = 1; width <= 8; ++width) {
+            auto p = dkv_kvarn_inh;
+            p.n_ctx = 262144;
+            p.speculative.draft.n_max = width;
+            assert(common_context_params_to_llama(common_base_params_to_speculative(p)).kvarn_tail == 4096);
+        }
+        bad = dkv_kvarn_inh;
+        bad.speculative.draft.kvarn = false;
+        const auto plain = common_base_params_to_speculative(bad);
+        assert(plain.kvarn_bits_k == 0 && plain.kvarn_bits_v == 0);
+        assert(plain.kvarn_tail_max == 0 && plain.kvarn_flush_chunk == 0);
+        assert(plain.cache_type_k == COMMON_KVARN_MTP_DRAFT_KV[0] && plain.cache_type_v == COMMON_KVARN_MTP_DRAFT_KV[1]);
+        assert(plain.speculative.draft.cache_type_kvarn_default);
+        assert(!draft.speculative.draft.cache_type_kvarn_default);
+    }
+
     // n-gram drafters request recurrent-state snapshots for in-place rollback (draft width, capped at 8);
     // --spec-n-rs-seq overrides, 0 = checkpoint restore on every partial acceptance
     argv = {"binary_name", "-m", "model_file.gguf", "--spec-type", "ngram-cache", "--spec-ngram-cache-n-max", "7"};

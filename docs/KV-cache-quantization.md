@@ -112,23 +112,21 @@ The trained trellis codebooks are compiled into the binary (`ggml/src/ggml-kvarn
 | `GGML_KVARN_TRELLIS_CB2`     | built-in  | same for the 2-bit codebook (256 entries)                              |
 | `GGML_KVARN_TRELLIS_REFIT`   | `norm`    | `none` (codebook reconstruction as is), `fit` (least-squares scale), `norm` (match the group norm) |
 
-## Small-card overhead switches
+## MTP draft memory experiments
 
-These cut CUDA memory that is not part of the model, KV or compute buffers. The numbers are from Qwen3.8-27B EXL3 2.0 bpw
-at `-c 204800`, ub 512, with the MTP drafter, on an RTX 3090 Ti (84 SMs); the token streams were byte-identical with and
-without each switch.
+`LLAMA_MTP_DRAFT_COMPUTE_LEAN=1` caps a single-sequence MTP draft context's physical microbatch at 64 rows. The logical batch stays unchanged, so prompt catch-up is split by the existing decoder. This reduces the full-context attention mask and intermediate graph storage. The switch is off by default; prefill geometry changes, so fixed-seed draft acceptance and output identity still require validation. Separate draft models and multiple sequences keep their existing microbatch size.
 
-| Switch | Default | Effect | Measured |
-|--------|---------|--------|----------|
-| `GGML_CUDA_EXL3_GLUE_INPLACE` | `1` | EXL3 prefill GEMM applies its output transform in place when there is no split-K, instead of through a T x N f32 scratch buffer | scratch pool 102 -> 52 MiB |
-| `LLAMA_SHARED_POOL=1` | off | the MTP draft context uses the trunk context's CUDA scratch pool instead of its own (the two contexts already run one after the other) | scratch pool 52 -> 28 MiB |
-| `GGML_CUDA_STACK_LIMIT=<bytes>` | 0 (set at backend init) | per-thread stack reservation; the driver reserves bytes x 1536 threads x SMs and grows it at launch to the largest stack of any kernel that runs | 1024 -> 0 (regrown to 112): -112 MiB on 84 SMs |
+`--spec-draft-kvarn` gives the MTP context its own KVarN cache with the trunk's body bits, body codec, sink, staging type and tail policy. It requires a KVarN trunk, one sequence, and no separate draft model or explicit `-ctkd`/`-ctvd`. The draft layer uses the trunk's main body precision, without trunk edge tiers. Existing KVarN head-dimension and flash-attention restrictions apply. For example:
 
-The stack reservation scales with the SM count. The CUDA backend sets the limit to 0 when it creates a device's
-first backend; the driver then grows the reservation to the largest per-thread stack of any kernel that runs. With the
-12 GB command that is 112 B (the KVarN 3/2 lowbits prefill attention kernel, which spills registers), reached at the
-first warm-up launch: 13.8 MiB on 84 SMs, 13.1 MiB on 80 SMs, 4.6 MiB on 28 SMs, instead of 126 / 120 / 42 MiB at the
-driver's 1024 B default. `GGML_CUDA_STACK_LIMIT=1024` restores the driver default.
+```bash
+LLAMA_MTP_DRAFT_COMPUTE_LEAN=1 llama-server -m model.gguf -c 204800 -ngl 99 -fa on --parallel 1 \
+    -ctk kvarn3 -ctv kvarn2 --kvarn-body-type kvarn4t \
+    --kvarn-staging-type tq6_0 --kvarn-sink-type f16 \
+    --kvarn-sink 128 --kvarn-tail 4096 --kvarn-tail-max 8192 \
+    --spec-type draft-mtp-adaptive --spec-draft-n-max 4 --spec-draft-kvarn
+```
+
+The tail must exceed the maximum draft width so speculative rollback stays in unsealed rows. The server reprocesses an edited prompt if it reaches sealed rows in either context. Draft sealing runs during decode; server idle compression still applies only to the trunk. State serialization retains the existing KVarN restrictions. Cache compression changes draft probabilities and needs acceptance/quality validation separately from the lean microbatch switch.
 
 ## Rotation
 

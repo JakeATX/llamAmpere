@@ -3764,14 +3764,31 @@ common_params common_base_params_to_speculative(const common_params & params) {
     // The first block-streaming implementation owns only the target cache.
     // MTP keeps its ordinary cache until both contexts can share one pool.
     result.kv_stream_arena_mib = 0;
-    // the draft/MTP context shares cells with the target (or is a separate small cache): never KVarN.
-    // A KVarN trunk (-ctk/-ctv kvarnN) leaves cache_type_k/v at the plain type -ctk/-ctv kvarnN set (F16),
-    // so an unset draft type is resolved above to tq5_0/turbo4 instead of that plain cache.
-    result.kvarn_bits_k  = 0;
-    result.kvarn_bits_v  = 0;
-    result.kvarn_tail_max = 0;
+    if (params_spec.kvarn) {
+        if (!spec_mtp || has_draft || params.n_parallel != 1 || params.kvarn_bits_k == 0 || params.kvarn_bits_v == 0) {
+            throw std::invalid_argument("--spec-draft-kvarn requires single-sequence MTP and a KVarN trunk");
+        }
+        if (params_spec.cache_type_k != GGML_TYPE_COUNT || params_spec.cache_type_v != GGML_TYPE_COUNT) {
+            throw std::invalid_argument("--spec-draft-kvarn cannot be combined with -ctkd/-ctvd");
+        }
+        if (params_spec.n_max < 0 || params.kvarn_tail < (uint32_t) params_spec.n_max + 1) {
+            throw std::invalid_argument("--spec-draft-kvarn requires a tail larger than the maximum draft width");
+        }
+        // opt-in: the drafter keeps the trunk's KVarN regions instead of the tq5_0/turbo4 default above
+        result.cache_type_k = params.kvarn_staging_type;
+        result.cache_type_v = params.kvarn_staging_type;
+        result.speculative.draft.cache_type_kvarn_default = false;
+    } else {
+        // the draft/MTP context shares cells with the target (or is a separate small cache): never KVarN.
+        // A KVarN trunk (-ctk/-ctv kvarnN) leaves cache_type_k/v at the plain type -ctk/-ctv kvarnN set (F16),
+        // so an unset draft type is resolved above to tq5_0/turbo4 instead of that plain cache.
+        result.kvarn_bits_k  = 0;
+        result.kvarn_bits_v  = 0;
+        result.kvarn_tail_max = 0;
+        result.kvarn_flush_chunk = 0;
+    }
+    // The nextn layer has no trunk edge tier.
     result.kvarn_edge_layers = 0;
-    result.kvarn_flush_chunk = 0;
     result.n_outputs_max = params.n_parallel;
     result.n_outputs_max_per_seq = 1;
 
