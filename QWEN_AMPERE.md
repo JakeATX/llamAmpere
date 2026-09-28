@@ -86,6 +86,9 @@ The experiment log, with hypotheses, results, and what did not work, is
 
 ## Build and run
 
+> **v0.4:** the commands in this section are v0.3's (`q8_0`/`turbo3` cache, draft depth 3). For v0.4 use the
+> build and run commands in [docs/llamampere-v0.4/RELEASE_NOTES.md](docs/llamampere-v0.4/RELEASE_NOTES.md#recommended-settings-for-24-gb-cards-rtx-3090--3090-ti).
+
 ```bash
 git clone -b main https://github.com/JakeATX/llamAmpere.git
 cd llamAmpere
