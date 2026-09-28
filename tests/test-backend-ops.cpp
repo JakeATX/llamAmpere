@@ -1138,11 +1138,16 @@ struct csv_printer : public printer {
 
     static std::vector<std::string> get_fields_csv() {
         return {
+            "test_time",
+            "build_commit",
             "op_name",
             "op_params",
             "supported",
+            "passed",
             "error_message",
             "test_mode",
+            "time_us",
+            "n_runs",
             "backend_reg_name",
             "backend_name",
         };
@@ -1567,6 +1572,7 @@ struct test_case {
             }
             static const bool print_nmse = getenv("GGML_TEST_BACKEND_PRINT_NMSE") != nullptr;
             if (print_nmse && t1->op == GGML_OP_FLASH_ATTN_EXT) {
+                std::lock_guard<std::mutex> guard(g_test_output_mutex);
                 printf("[FLASH_ATTN_EXT] NMSE=%.12g (%s)\n", err, ud->tc->vars().c_str());
             }
             if (err > ud->tc->max_err(ud->backend1)) {
@@ -1586,6 +1592,11 @@ struct test_case {
         std::vector<ggml_tensor *> fused_nodes_to_verify = fusion_test_nodes();
         if (fused_nodes_to_verify.size() == 0 && run_whole_graph()) {
             fused_nodes_to_verify.push_back(out);
+        }
+        const bool replay = out->op == GGML_OP_FLASH_ATTN_EXT && getenv("GGML_TEST_BACKEND_REPLAY") != nullptr;
+        if (replay) {
+            fused_nodes_to_verify = {out};
+            fused_nodes_to_verify.insert(fused_nodes_to_verify.end(), sentinels.begin(), sentinels.end());
         }
 
         // optional guard that the fusion under test really fired on backend1.
@@ -1613,9 +1624,32 @@ struct test_case {
             }
         }
 
-        const bool cmp_ok = ggml_backend_compare_graph_backend(backend1, backend2, gf, callback, &ud,
-                                                               run_whole_graph() ? fused_nodes_to_verify.data() : nullptr,
-                                                               fused_nodes_to_verify.size());
+        const bool check_replay = replay && strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend1))), "CUDA") == 0;
+        const auto graph_replays = [] {
+            int64_t total = 0;
+            ggml_ledger_foreach([](const char * site, const char * key, int64_t count, void * data) {
+                if (strcmp(site, "cuda.graph") == 0 && (strcmp(key, "replay") == 0 || strncmp(key, "replay ", 7) == 0)) {
+                    *static_cast<int64_t *>(data) += count;
+                }
+            }, &total);
+            return total;
+        };
+        const int64_t replay_before = check_replay ? graph_replays() : 0;
+        bool cmp_ok = true;
+        for (int round = 0; round < (replay ? 4 : 1); ++round) {
+            // Keep graph shapes and pointers fixed while changing inputs between replays.
+            if (round > 0) {
+                initialize_tensors(ctx.get());
+            }
+            cmp_ok = ggml_backend_compare_graph_backend(backend1, backend2, gf, callback, &ud,
+                                                        run_whole_graph() || replay ? fused_nodes_to_verify.data() : nullptr,
+                                                        fused_nodes_to_verify.size()) && cmp_ok;
+        }
+        if (check_replay) {
+            const int64_t count = graph_replays() - replay_before;
+            printf("[FLASH_ATTN_EXT] REPLAY=%" PRId64 " (%s)\n", count, vars().c_str());
+            cmp_ok = count >= 2 && cmp_ok;
+        }
 
         bool        fusion_ok = true;
         std::string fusion_err;
@@ -13751,6 +13785,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 13, {6, 1}, 4096, 5, true, true, 0, 10, GGML_PREC_F32, GGML_TYPE_TQ5_0, GGML_TYPE_TURBO4_0));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 2}, 1024, 5, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TQ5_0, GGML_TYPE_TURBO4_0));
+    // Long segments exercise next-tile prefetch; 59 heads also resist uniform Stream-K rounding on SM86.
+    for (int64_t nh : {4, 59}) {
+        for (int64_t nb = 1; nb <= 8; ++nb) {
+            if (nh == 59 && nb != 5) {
+                continue;
+            }
+            for (float softcap : {0.0f, 10.0f}) {
+                test_cases.emplace_back(new test_flash_attn_ext_causal(256, 256, nh, {6, 1}, 8192, nb, true, true, 0, softcap, GGML_PREC_F32, GGML_TYPE_TQ5_0, GGML_TYPE_TURBO4_0, {0, 2, 1, 3}, false));
+            }
+        }
+    }
 
     // asymmetric head_dim (hsk != hsv) with one or both sides not 64-aligned
     test_cases.emplace_back(new test_flash_attn_ext(72, 64, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
@@ -15473,7 +15518,11 @@ int main(int argc, char ** argv) {
         }
     }
 
-    if (getenv("GGML_TEST_BACKEND_LEDGER") != nullptr) {
+    if (getenv("GGML_TEST_BACKEND_REPLAY") != nullptr) {
+        // Per-case replay counters are global, so do not share them between test workers.
+        parallel_workers = 1;
+        ggml_ledger_set_enabled(true);
+    } else if (getenv("GGML_TEST_BACKEND_LEDGER") != nullptr) {
         ggml_ledger_set_enabled(true);
     }
 
