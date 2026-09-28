@@ -4,6 +4,9 @@
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#include "mmvq-iq4xs-k4.cuh"
+#endif
 
 #include <cstdint>
 #include <cstdlib>
@@ -2342,6 +2345,29 @@ void ggml_cuda_mul_mat_vec_q(
         fusion_local.glu_op = fusion->glu_op;
         fusion_local.glu_limit = fusion->glu_limit;
     }
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    // Other types, fused/batched ops and unsupported layouts keep the existing MMVQ route.
+    if (src0->type == GGML_TYPE_IQ4_XS && ggml_cuda_iq4xs_k4_variant() != IQ4XS_K4_OFF &&
+            !ids && !fusion && !convrot && ne1 >= ggml_cuda_iq4xs_k4_min_n() && ne1 <= 8 &&
+            ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
+            ne00 > 0 && ne00 % QK_K == 0 && ne00 <= std::numeric_limits<int>::max() &&
+            ne01 > 0 && ne01 % IQ4XS_TC_ROWS == 0 && ne01 <= std::numeric_limits<int>::max() &&
+            nb01 % ts_src0 == 0 && nb11 % ts_src1 == 0 && nb1 % ts_dst == 0 &&
+            (uintptr_t) src0->data % alignof(uint2) == 0) {
+        const int cc = ggml_cuda_info().devices[ctx.device].cc;
+        if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE) {
+            if (ggml_cuda_iq4xs_k4_variant() == IQ4XS_K4A) {
+                ggml_cuda_mul_mat_iq4xs_k4<true>(ctx, src0->data, src1_d, dst_d, ne00, ne01, ne1,
+                                               nb01 / ts_src0, nb11 / ts_src1, nb1 / ts_dst);
+            } else {
+                ggml_cuda_mul_mat_iq4xs_k4<false>(ctx, src0->data, src1_d, dst_d, ne00, ne01, ne1,
+                                                nb01 / ts_src0, nb11 / ts_src1, nb1 / ts_dst);
+            }
+            return;
+        }
+    }
+#endif
 
     // If src0 is a temporary compute buffer, clear any potential padding.
     if (ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {

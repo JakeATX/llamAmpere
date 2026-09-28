@@ -5794,6 +5794,40 @@ struct test_mul_mat : public test_case {
     }
 };
 
+struct test_mul_mat_iq4xs_k4 : public test_mul_mat {
+    using test_mul_mat::test_mul_mat;
+
+    std::string vars() override {
+        return test_mul_mat::vars() + ",iq4xs_k4=1";
+    }
+};
+
+static void add_iq4xs_k4_cases(std::vector<std::unique_ptr<test_case>> & cases, bool perf) {
+    if (getenv("GGML_TEST_IQ4XS_K4") == nullptr) {
+        return;
+    }
+    // Qwen3.8-27B Swift IQ4_XS projections, in (K, M) order.
+    for (const auto & shape : {std::array<int64_t, 2>{5120, 17408}, {17408, 5120}, {5120, 10240},
+                              {5120, 6144}, {6144, 5120}, {5120, 12288}}) {
+        for (int64_t n = 1; n <= 8; ++n) {
+            if (perf && n != 1 && n != 4 && n != 5 && n != 6) {
+                continue;
+            }
+            cases.emplace_back(new test_mul_mat_iq4xs_k4(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, shape[1], n, shape[0], {1, 1}, {1, 1}));
+        }
+    }
+    if (!perf) {
+        for (int64_t n = 1; n <= 8; ++n) {
+            // Partial warp K work, padded row strides, and the non-tiled/batched fallbacks.
+            cases.emplace_back(new test_mul_mat_iq4xs_k4(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, 16, n, 256, {1, 1}, {1, 1}));
+            cases.emplace_back(new test_mul_mat_iq4xs_k4(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, 32, n, 768, {1, 1}, {1, 1}, {0, 1, 2, 3}, 1024));
+            cases.emplace_back(new test_mul_mat_iq4xs_k4(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, 17, n, 256, {1, 1}, {1, 1}));
+            cases.emplace_back(new test_mul_mat_iq4xs_k4(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, 16, n, 256, {2, 1}, {1, 1}));
+        }
+        cases.emplace_back(new test_mul_mat_iq4xs_k4(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, 16, 9, 256, {1, 1}, {1, 1}));
+    }
+}
+
 enum class cr_activation_pattern {
     RANDOM,
     ZERO,
@@ -11036,6 +11070,7 @@ static const ggml_type other_types[] = {
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    add_iq4xs_k4_cases(test_cases, false);
 
     // multi-node fusion coverage: residual epilogue, shared-quantize cache, elementwise chain, MoE reduce
     for (ggml_type type : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_TQ4_1S}) {
@@ -13925,6 +13960,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    add_iq4xs_k4_cases(test_cases, true);
 
     // elementwise chain vs the tuned multi-ADD kernel (GGML_CUDA_FUSE_CHAIN=0 to compare)
     test_cases.emplace_back(new test_elem_chain_fusion({4096, 64, 1, 1}, false, false, true));
