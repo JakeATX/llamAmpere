@@ -89,62 +89,24 @@ The experiment log, with hypotheses, results, and what did not work, is
 
 ## Build and run
 
-v0.4 commands for one 24 GB card (RTX 3090 / 3090 Ti). Measured speeds and peaks for each are in the
-[v0.4 release notes](docs/llamampere-v0.4/RELEASE_NOTES.md#recommended-settings-for-24-gb-cards-rtx-3090--3090-ti).
+Needs Linux, an NVIDIA card with 24 GB (RTX 3090 / 3090 Ti), the CUDA toolkit (tested with 12.4), CMake, git and a C++
+compiler. Paste into a terminal; the model download is 15.6 GB.
 
 ```bash
 git clone -b v0.4 https://github.com/JakeATX/llamAmpere.git
 cd llamAmpere
 cmake -S . -B build-sm86 -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86
 cmake --build build-sm86 -j8 --target llama-server
-```
-
-Everyday coding, agent and RAG work (49K context):
-
-```bash
-./build-sm86/bin/llama-server -m ATX-Swift-Qwen3.8-27B-Uncensored-IQ4_XS-M.gguf -c 49152 \
-  -ngl 99 -fa on -ctk turbo5 -ctv turbo4 -b 4096 -ub 1024 -t 8 -tb 8 --parallel 1
-```
-
-100K-token prompts:
-
-```bash
-./build-sm86/bin/llama-server -m ATX-Swift-Qwen3.8-27B-Uncensored-IQ4_XS-M.gguf -c 110592 \
-  -ngl 99 -fa on -ctk turbo5 -ctv turbo4 -b 4096 -ub 1024 -t 8 -tb 8 --parallel 1
-```
-
-Long multi-turn sessions:
-
-```bash
-./build-sm86/bin/llama-server -m ATX-Swift-Qwen3.8-27B-Uncensored-IQ4_XS-M.gguf -c 208896 \
-  -ngl 99 -fa on -ctk turbo5 -ctv turbo4 -b 4096 -ub 1024 -t 8 -tb 8 --parallel 1 \
-  --cache-ram 0 --ctx-checkpoints 4
-```
-
-Largest context (262,144 tokens):
-
-```bash
+curl -L -o ATX-Swift-Qwen3.8-27B-Uncensored-IQ4_XS-M.gguf \
+  https://huggingface.co/jakeatx/ATX-Swift-Qwen3.8-27B-Uncensored-IQ4_XS-M-GGUF/resolve/main/ATX-Swift-Qwen3.8-27B-Uncensored-IQ4_XS-M.gguf
 ./build-sm86/bin/llama-server -m ATX-Swift-Qwen3.8-27B-Uncensored-IQ4_XS-M.gguf -c 262144 \
   -ngl 99 -fa on -ctk turbo5 -ctv turbo4 -b 4096 -ub 1024 -t 8 -tb 8 --parallel 1
 ```
 
-Largest context on EXL3 4.0 bpw:
-
-```bash
-./build-sm86/bin/llama-server -m Qwen3.8-27B-EXL3-4.0bpw.gguf -c 262144 \
-  -ngl 99 -fa on -ctk turbo5 -ctv turbo4 -b 4096 -ub 1024 -t 8 -tb 8 --parallel 1
-```
-
-No tuning (`-fit` sizes the context to the card):
-
-```bash
-./build-sm86/bin/llama-server -m ATX-Swift-Qwen3.8-27B-Uncensored-IQ4_XS-M.gguf
-```
-
-In v0.4 the MTP drafter (fixed depth 4, p-min 0), the 65,536-token vocabulary shortlist and the drafter's cache types
-(they follow `-ctk`/`-ctv`) are defaults for Qwen3.8 GGUFs with the MTP head, so none of these commands pass
-`--spec-*` flags. For chats where you edit or regenerate turns, the prompt-cache and checkpoint flags described
-below (`--cache-prompt --cache-ram 8192 --ctx-checkpoints 24 --checkpoint-min-step 10240`) use host RAM, not VRAM.
+The server listens on http://127.0.0.1:8080 (OpenAI-compatible API). The MTP drafter (draft depth 4), the vocabulary
+shortlist and the drafter's cache types are on by default, so no drafter flags are needed. Tested exactly as written from
+a fresh clone of v0.4: 262,144-token context, 67.8 tok/s after a 250,000-token prompt (5,120 generated), peak
+22,346 MiB on an RTX 3090 Ti.
 
 ### v0.3 command and notes (previous release)
 

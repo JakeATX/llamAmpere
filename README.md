@@ -4,12 +4,24 @@
 
 **From v0.3.1, all still in this tree** (numbers measured on v0.3.1; [release notes](docs/llamampere-v0.3.1/RELEASE_NOTES.md)): up to 245K context; 99 tok/s on clean agentic and coding fixtures at temperature 1 (1.46x stock llama.cpp, 1.28x v0.2), 93 tok/s at 100K KV depth, and 1.10x tuned vLLM single-stream at 32K. **EXL3** (Turboderp's exllamav3 trellis format) as GGUF-native types with an SM86 decode kernel: 82 tok/s at a 20K prompt and 74 at 50K with the MTP head on Qwen3.8-27B at 4.0 bpw, and the same 81-82 tok/s at 3.5 bpw and 80.7 at 3.0 bpw from files of 12.3 and 10.9 GiB ([docs/exl3.md](docs/exl3.md)). **Ternary Bonsai 2 27B** from Prism ML at 1.75 and 2.125 bits per weight, 105 tok/s with the MTP drafter at 16K on the 2.125-bit container ([docs/bonsai2.md](docs/bonsai2.md)). A shared-memory codebook for IQ3 decode (opt-in in v0.3.1, the SM86 default in v0.4). A full upstream catch-up (llama.cpp master `b49650adb` and TurboQuant `407f3237b`, 772 commits ahead of the v0.3 base). **Agnes 3.0 Flash** loads with its MTP head, which upstream llama.cpp does not ([docs/agnes-3.0-flash.md](docs/agnes-3.0-flash.md)).
 
-**Fastest configuration (v0.4, one RTX 3090 / 3090 Ti).** Build and run as in the [v0.4 release notes](docs/llamampere-v0.4/RELEASE_NOTES.md#recommended-settings-for-24-gb-cards-rtx-3090--3090-ti), with the GGUF from [jakeatx/ATX-Swift-Qwen3.8-27B-Uncensored-IQ4_XS-M-GGUF](https://huggingface.co/jakeatx/ATX-Swift-Qwen3.8-27B-Uncensored-IQ4_XS-M-GGUF), the model the v0.4 numbers cite (same ATX-IQ4_XS-M recipe and MTP head as [jakeatx/Qwen3.8-27B-ATX-IQ4_XS-M-GGUF](https://huggingface.co/jakeatx/Qwen3.8-27B-ATX-IQ4_XS-M-GGUF); G +1.14% ± 0.56% over it on the same build), then:
+**Build and run (v0.4, one RTX 3090 / 3090 Ti, 262,144-token context).** Needs Linux, an NVIDIA card with 24 GB (RTX 3090 / 3090 Ti), the CUDA toolkit (tested with 12.4), CMake, git and a C++
+compiler. Paste into a terminal; the model download is 15.6 GB.
 
 ```bash
-./build-sm86/bin/llama-server -m ATX-Swift-Qwen3.8-27B-Uncensored-IQ4_XS-M.gguf \
-  -c 49152 -b 4096 -ub 1024 -t 8 -tb 8 -ngl 99 -fa on -ctk turbo5 -ctv turbo4 --parallel 1
+git clone -b v0.4 https://github.com/JakeATX/llamAmpere.git
+cd llamAmpere
+cmake -S . -B build-sm86 -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86
+cmake --build build-sm86 -j8 --target llama-server
+curl -L -o ATX-Swift-Qwen3.8-27B-Uncensored-IQ4_XS-M.gguf \
+  https://huggingface.co/jakeatx/ATX-Swift-Qwen3.8-27B-Uncensored-IQ4_XS-M-GGUF/resolve/main/ATX-Swift-Qwen3.8-27B-Uncensored-IQ4_XS-M.gguf
+./build-sm86/bin/llama-server -m ATX-Swift-Qwen3.8-27B-Uncensored-IQ4_XS-M.gguf -c 262144 \
+  -ngl 99 -fa on -ctk turbo5 -ctv turbo4 -b 4096 -ub 1024 -t 8 -tb 8 --parallel 1
 ```
+
+The server listens on http://127.0.0.1:8080 (OpenAI-compatible API). The MTP drafter (draft depth 4), the vocabulary
+shortlist and the drafter's cache types are on by default, so no drafter flags are needed. Tested exactly as written from
+a fresh clone of v0.4: 262,144-token context, 67.8 tok/s after a 250,000-token prompt (5,120 generated), peak
+22,346 MiB on an RTX 3090 Ti.
 
 The drafter needs no flags. For a Qwen3.8 GGUF with the MTP head, `llama-server` and `llama-cli` apply `--spec-type draft-mtp --spec-draft-n-max 4 --spec-draft-p-min 0 --spec-draft-vocab-map auto`, a fixed draft depth of 4 (`auto` is the built-in 65,536-token list, the same shortlist as `docs/mtp-vocab/atx_65536.txt`), and the drafter's KV cache takes the trunk's `-ctk`/`-ctv` (here turbo5/turbo4). `--spec-type none` turns the drafter off; explicit `--spec-draft-*` flags override the default values, and `--spec-type draft-mtp-adaptive --spec-draft-n-max 4 --spec-draft-n-min-adaptive 3` selects adaptive depth 3-4 instead. Against the same flags spelled out, the default gave identical text and acceptance on 3 seeds (checked when the default was adaptive 3-4).
 
