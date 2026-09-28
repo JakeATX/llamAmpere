@@ -173,7 +173,9 @@ content hashes, between the two paths.
 Multi Token Prediction (MTP) with an adaptive draft depth. Same machinery as `draft-mtp`
 (MTP heads from the main model, see the Qwen3 MTP head docs), but the number of draft tokens is
 tuned per sequence at runtime by a hysteresis controller instead of being fixed at
-`--spec-draft-n-max`.
+`--spec-draft-n-max`. It is not the default: Qwen3.8 models with an MTP head get `draft-mtp` at a fixed
+depth of 4 (see below); pass `--spec-type draft-mtp-adaptive --spec-draft-n-max 4 --spec-draft-n-min-adaptive 3`
+for adaptive depth 3-4 instead.
 
 The depth starts at the floor `max(1, --spec-draft-n-min-adaptive)` (default 3) and stays in
 `[floor, n_max]`. It climbs one step after a run of consecutive verifies that accepted every
@@ -340,7 +342,7 @@ Use exactly one of these options:
 --spec-type [none|draft-simple|draft-eagle3|draft-dflash|draft-dspark|draft-mtp|draft-mtp-adaptive|ngram-cache|ngram-simple|ngram-map-k|ngram-map-k4v|ngram-mod]
                                         comma-separated list of types of speculative decoding to use
                                         (default: auto, i.e. the model's built-in drafter with its measured
-                                        settings for qwen35 with an MTP head: draft-mtp-adaptive, none for other
+                                        settings for qwen35 with an MTP head: draft-mtp, none for other
                                         models; any explicit value, including none, turns auto off, explicit
                                         --spec-draft-* values are kept)
                                         (env: LLAMA_ARG_SPEC_TYPE)
@@ -503,8 +505,9 @@ Specifies a comma-separated list of speculative decoding types to use.
 | `ngram-mod` | Use basic ngram hasher for speculative decoding with shared pool |
 
 Without `--spec-type`, `llama-server` and `llama-cli` turn on a model family's built-in drafter with its measured
-settings; today `qwen35` (Qwen3.8) models with an MTP head get `draft-mtp-adaptive`, n-max 4, n-min-adaptive 3,
-p-min 0 and vocab map `auto`. Any explicit `--spec-type` (including `none`), `--spec-default`, a draft model
+settings; today `qwen35` (Qwen3.8) models with an MTP head get `draft-mtp` at a fixed depth (n-max 4), p-min 0 and
+vocab map `auto`. Adaptive depth 3-4 is available with `--spec-type draft-mtp-adaptive --spec-draft-n-max 4
+--spec-draft-n-min-adaptive 3`. Any explicit `--spec-type` (including `none`), `--spec-default`, a draft model
 (`-md`), `--eagle3` or `--dflash` turns this off, and so does an explicit `--spec-draft-n-max 0`. Explicit
 `--spec-draft-n-max`, `--spec-draft-n-min-adaptive`, `--spec-draft-p-min` and `--spec-draft-vocab-map` values are
 kept on top of the default. The default does not set the draft KV cache types: like any drafter's, they follow

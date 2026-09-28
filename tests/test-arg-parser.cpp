@@ -401,11 +401,11 @@ static void test(void) {
     common_params invalid_adaptive_params;
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), invalid_adaptive_params, LLAMA_EXAMPLE_SPECULATIVE));
 
-    // per-family speculative defaults (spec-defaults.h): qwen35 with an MTP head gets the adaptive MTP drafter
-    // with the production settings unless --spec-type was given; explicit --spec-draft-* values are kept
+    // per-family speculative defaults (spec-defaults.h): qwen35 with an MTP head gets the MTP drafter at fixed
+    // depth 4 with the production settings unless --spec-type was given; explicit --spec-draft-* values are kept
     {
         const std::vector<enum common_speculative_type> types_none     = { COMMON_SPECULATIVE_TYPE_NONE };
-        const std::vector<enum common_speculative_type> types_adaptive = { COMMON_SPECULATIVE_TYPE_NONE, COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE };
+        const std::vector<enum common_speculative_type> types_mtp      = { COMMON_SPECULATIVE_TYPE_NONE, COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
 
         assert(common_speculative_family_default_find("qwen35", 1) != nullptr);
         assert(common_speculative_family_default_find("qwen35", 0) == nullptr);
@@ -418,7 +418,7 @@ static void test(void) {
         assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), auto_params, LLAMA_EXAMPLE_SERVER));
         assert(auto_params.speculative.user_set == 0);
         assert(common_speculative_apply_family_default(auto_params.speculative, "qwen35", 1) != nullptr);
-        assert(auto_params.speculative.types == types_adaptive);
+        assert(auto_params.speculative.types == types_mtp);
         assert(auto_params.speculative.draft.n_max == 4);
         assert(auto_params.speculative.draft.n_min_adaptive == 3);
         assert(auto_params.speculative.draft.p_min == 0.0f);
@@ -426,8 +426,8 @@ static void test(void) {
         assert(auto_params.speculative.draft.cache_type_k == GGML_TYPE_COUNT);
         assert(auto_params.speculative.draft.cache_type_v == GGML_TYPE_COUNT);
 
-        argv = {"binary_name", "-m", "model_file.gguf", "--spec-type", "draft-mtp-adaptive", "--spec-draft-n-max", "4",
-                "--spec-draft-n-min-adaptive", "3", "--spec-draft-p-min", "0"};
+        argv = {"binary_name", "-m", "model_file.gguf", "--spec-type", "draft-mtp", "--spec-draft-n-max", "4",
+                "--spec-draft-p-min", "0"};
         common_params explicit_params;
         assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), explicit_params, LLAMA_EXAMPLE_SERVER));
         assert(common_speculative_apply_family_default(explicit_params.speculative, "qwen35", 1) == nullptr);
@@ -457,7 +457,7 @@ static void test(void) {
         assert(none_params.speculative.user_set & COMMON_PARAMS_SPECULATIVE_USER_TYPE);
         assert(common_speculative_apply_family_default(none_params.speculative, "qwen35", 1) == nullptr);
         assert(std::find(none_params.speculative.types.begin(), none_params.speculative.types.end(),
-                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE) == none_params.speculative.types.end());
+                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) == none_params.speculative.types.end());
 
         // an explicit --spec-draft-n-max without --spec-type -> the auto type with that n-max (the floor follows it)
         argv = {"binary_name", "-m", "model_file.gguf", "--spec-draft-n-max", "2"};
@@ -465,7 +465,7 @@ static void test(void) {
         assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), n_max_params, LLAMA_EXAMPLE_SERVER));
         assert(n_max_params.speculative.user_set == COMMON_PARAMS_SPECULATIVE_USER_DRAFT_N_MAX);
         assert(common_speculative_apply_family_default(n_max_params.speculative, "qwen35", 1) != nullptr);
-        assert(n_max_params.speculative.types == types_adaptive);
+        assert(n_max_params.speculative.types == types_mtp);
         assert(n_max_params.speculative.draft.n_max == 2);
         assert(n_max_params.speculative.draft.n_min_adaptive == 2);
 

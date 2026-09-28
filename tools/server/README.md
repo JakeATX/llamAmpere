@@ -273,7 +273,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--spec-draft-device, -devd, --device-draft <dev1,dev2,..>` | comma-separated list of devices to use for offloading the draft model (none = don't offload, default: follows --device)<br/>use --list-devices to see a list of available devices |
 | `--spec-draft-ngl, -ngld, --gpu-layers-draft, --n-gpu-layers-draft N` | max. number of draft model layers to store in VRAM, either an exact number, 'auto', or 'all' (default: auto)<br/>(env: LLAMA_ARG_N_GPU_LAYERS_DRAFT) |
 | `--spec-draft-model, -md, --model-draft FNAME` | draft model for speculative decoding (default: unused)<br/>(env: LLAMA_ARG_SPEC_DRAFT_MODEL) |
-| `--spec-type none,draft-simple,draft-eagle3,draft-mtp,draft-mtp-adaptive,draft-dflash,draft-dspark,ngram-simple,ngram-map-k,ngram-map-k4v,ngram-mod,ngram-cache` | comma-separated list of types of speculative decoding to use (default: auto, i.e. the model's built-in drafter with its measured settings for qwen35 with an MTP head: draft-mtp-adaptive, none for other models; any explicit value, including none, turns auto off, explicit --spec-draft-* values are kept)<br/><br/>(env: LLAMA_ARG_SPEC_TYPE) |
+| `--spec-type none,draft-simple,draft-eagle3,draft-mtp,draft-mtp-adaptive,draft-dflash,draft-dspark,ngram-simple,ngram-map-k,ngram-map-k4v,ngram-mod,ngram-cache` | comma-separated list of types of speculative decoding to use (default: auto, i.e. the model's built-in drafter with its measured settings for qwen35 with an MTP head: draft-mtp, none for other models; any explicit value, including none, turns auto off, explicit --spec-draft-* values are kept)<br/><br/>(env: LLAMA_ARG_SPEC_TYPE) |
 | `--spec-ngram-mod-n-min N` | minimum number of ngram tokens to use for ngram-based speculative decoding (default: 48) |
 | `--spec-ngram-mod-n-max N` | maximum number of ngram tokens to use for ngram-based speculative decoding (default: 64) |
 | `--spec-ngram-mod-n-match N` | ngram-mod lookup length (default: 24) |
@@ -345,12 +345,13 @@ When `--spec-type` is not given, the server looks up the model family in a small
 
 | Family (`general.architecture`) | Condition | Default |
 |---|---|---|
-| `qwen35` (Qwen3.8) | `qwen35.nextn_predict_layers` > 0 and the MTP tensors are in the model file | `--spec-type draft-mtp-adaptive --spec-draft-n-max 4 --spec-draft-n-min-adaptive 3 --spec-draft-p-min 0 --spec-draft-vocab-map auto` |
+| `qwen35` (Qwen3.8) | `qwen35.nextn_predict_layers` > 0 and the MTP tensors are in the model file | `--spec-type draft-mtp --spec-draft-n-max 4 --spec-draft-p-min 0 --spec-draft-vocab-map auto` (fixed draft depth 4) |
 
 - The default is resolved from the GGUF header before `-fit` and the context sizing run, so the memory fit sees the drafter exactly as with the explicit flags.
 - The draft KV cache types are not set by the default: they follow `-ctk`/`-ctv` unless `--spec-draft-type-k`/`-v` is given.
-- Any explicit `--spec-type` (including `--spec-type none`), a draft model (`-md`), `--eagle3` or `--dflash` turns the default off. Explicit `--spec-draft-n-max`, `--spec-draft-n-min-adaptive`, `--spec-draft-p-min` and `--spec-draft-vocab-map` values are kept on top of it. When only `--spec-draft-n-max` is given, a smaller value also lowers the adaptive floor (e.g. `--spec-draft-n-max 2` gives n-max 2, n-min-adaptive 2).
-- The server logs one line when the default applies, e.g. `speculative: MTP drafter on by default for qwen35 (nextn=1): draft-mtp-adaptive, n-max 4, n-min-adaptive 3, p-min 0, vocab map auto; --spec-type none disables`.
+- Any explicit `--spec-type` (including `--spec-type none`), a draft model (`-md`), `--eagle3` or `--dflash` turns the default off. Explicit `--spec-draft-n-max`, `--spec-draft-n-min-adaptive`, `--spec-draft-p-min` and `--spec-draft-vocab-map` values are kept on top of it (e.g. `--spec-draft-n-max 3` alone gives a fixed depth of 3).
+- Adaptive depth 3-4 stays available as an explicit choice: `--spec-type draft-mtp-adaptive --spec-draft-n-max 4 --spec-draft-n-min-adaptive 3 --spec-draft-p-min 0`.
+- The server logs one line when the default applies, e.g. `speculative: MTP drafter on by default for qwen35 (nextn=1): draft-mtp, n-max 4, p-min 0, vocab map auto; --spec-type none disables`.
 - The same default applies to `llama-cli`, which runs the server in-process. Other tools (`llama-perplexity`, `llama-bench`, ...) are unaffected.
 
 ### Multimodal support
