@@ -14260,7 +14260,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (int64_t nb = 1; nb <= 8; ++nb) {
             for (const auto & types : {std::pair{GGML_TYPE_TQ5_0, GGML_TYPE_TURBO4_0},
                                       std::pair{GGML_TYPE_Q8_0, GGML_TYPE_Q8_0}}) {
-                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, types.first, types.second, {0, 2, 1, 3}));
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, types.first, types.second, {0, 2, 1, 3}, false));
             }
         }
     }
