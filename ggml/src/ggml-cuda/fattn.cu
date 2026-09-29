@@ -6,6 +6,7 @@
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
+#include "fattn-prefill-policy.h"
 #include "convert.cuh"
 #include "kv-stream-span-tuner.h"
 #include "ledger.cuh"
@@ -2593,6 +2594,29 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
 
     GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
     const int gqa_ratio = Q->ne[2] / K->ne[2];
+
+    // [HQ4] opt-in prefill tile probe (fattn-prefill-policy.h); unset = the rule below
+    if constexpr (DKQ == 256 && DV == 256) {
+        const int arm = ggml_cuda_fa_prefill_ncols2_env();
+        if (arm != 0) {
+            switch (ggml_cuda_fa_prefill_ncols2_pick(arm, cc, DKQ, DV, Q->ne[1], gqa_ratio, Q->ne[3] == 1, use_gqa_opt)) {
+                case 1:
+                    ggml_cuda_fattn_path_note("mma_f16_prefill_probe", dst, 1);
+                    ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 1>(ctx, dst);
+                    return;
+                case 2:
+                    ggml_cuda_fattn_path_note("mma_f16_prefill_probe", dst, 2);
+                    ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 2>(ctx, dst);
+                    return;
+                case 8:
+                    ggml_cuda_fattn_path_note("mma_f16_prefill_probe", dst, 8);
+                    ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8>(ctx, dst);
+                    return;
+                default:
+                    break;
+            }
+        }
+    }
 
     // On Volta the GQA optimizations aren't as impactful vs. minimizing wasted compute:
     if (cc == GGML_CUDA_CC_VOLTA) {
