@@ -12,7 +12,7 @@ This file describes v0.4 (2026-09-28). The full list of changes is in the
 
 | model | size | notes |
 |---|---|---|
-| [`jakeatx/ATX-Swift-Qwen3.8-27B-Uncensored-IQ4_XS-M-GGUF`](https://huggingface.co/jakeatx/ATX-Swift-Qwen3.8-27B-Uncensored-IQ4_XS-M-GGUF) | 14.52 GiB | Recommended. The command below downloads it. |
+| [`jakeatx/ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M-GGUF`](https://huggingface.co/jakeatx/ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M-GGUF) | 14.52 GiB | Recommended. The command below downloads it. |
 | [`ukisai/Swift-Qwen3.8-27B-GGUF`](https://huggingface.co/ukisai/Swift-Qwen3.8-27B-GGUF), file `Swift-Qwen3.8-27B-IQ4_XS.gguf` | 14.61 GiB | The Swift authors' own IQ4_XS. Fits the card the same way; not benchmarked head to head. |
 | [`jakeatx/Qwen3.8-27B-ATX-IQ4_XS-M-GGUF`](https://huggingface.co/jakeatx/Qwen3.8-27B-ATX-IQ4_XS-M-GGUF) | 14.5 GiB | The original ATX quant, used for all v0.3 numbers. |
 
@@ -34,9 +34,9 @@ git clone -b v0.4 https://github.com/JakeATX/llamAmpere.git
 cd llamAmpere
 cmake -S . -B build-sm86 -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86
 cmake --build build-sm86 -j8 --target llama-server
-curl -L -o ATX-Swift-Qwen3.8-27B-Uncensored-IQ4_XS-M.gguf \
-  https://huggingface.co/jakeatx/ATX-Swift-Qwen3.8-27B-Uncensored-IQ4_XS-M-GGUF/resolve/main/ATX-Swift-Qwen3.8-27B-Uncensored-IQ4_XS-M.gguf
-./build-sm86/bin/llama-server -m ATX-Swift-Qwen3.8-27B-Uncensored-IQ4_XS-M.gguf -c 262144 \
+curl -L -o ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M.gguf \
+  https://huggingface.co/jakeatx/ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M-GGUF/resolve/main/ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M.gguf
+./build-sm86/bin/llama-server -m ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M.gguf -c 262144 \
   -ngl 99 -fa on -ctk turbo5 -ctv turbo4 -b 4096 -ub 1024 -t 8 -tb 8 --parallel 1
 ```
 
