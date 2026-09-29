@@ -839,7 +839,10 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
             if (logits_j != nullptr) {
                 id_map = draft_vocab_ids;
             } else if (n_sub_env > 0 && n_sub_env < head_w2->ne[1] &&
-                    !(hadamard_rotations && hadamard_rotations->count(head_w2))) {
+                    !(hadamard_rotations && hadamard_rotations->count(head_w2)) &&
+                    ggml_exl3_bits(head_w2->type) == 0) {
+                // [#82] the leading-rows cut is a plain mul_mat on a view: an EXL3 head needs the suh/svh
+                // Hadamard glue that build_lora_mm adds, so EXL3 heads take the full head below
                 ggml_tensor * head_sub = ggml_view_2d(ctx0, head_w2,
                         head_w2->ne[0], n_sub_env, head_w2->nb[1], 0);
                 logits_j = ggml_mul_mat(ctx0, head_sub, h_next_j);
