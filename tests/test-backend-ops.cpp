@@ -13817,6 +13817,28 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // SLOWKV (GGML_SLOWKV): the same verify-width coverage for the other fused D256 pairs. Width 5 takes the compact
+    // tile when the switch is on; kv 1057, no mask, softcap/sinks and nr23 [6,2] cover the fallbacks and nh 13/59 the
+    // Stream-K fixups. The route counters (GGML_TEST_BACKEND_REPLAY) prove which cases took the compact tile.
+    for (const ggml_type type_KV : {GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_0, GGML_TYPE_TQ6_0}) {
+        for (int64_t nb = 1; nb <= 8; ++nb) {
+            for (int64_t nh : {4, 13}) {
+                for (int64_t kv : {1024, 1057}) {
+                    test_cases.emplace_back(new test_flash_attn_ext(256, 256, nh, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+                }
+            }
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 1024, nb, true, true, 0, 10, GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}));
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 1024, nb, false, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+            test_cases.emplace_back(new test_flash_attn_ext_causal(256, 256, 4, {6, 1}, 1024, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}, false));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 2}, 1024, 5, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+        for (int64_t nh : {4, 59}) {
+            for (float softcap : {0.0f, 10.0f}) {
+                test_cases.emplace_back(new test_flash_attn_ext_causal(256, 256, nh, {6, 1}, 8192, 5, true, true, 0, softcap, GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}, false));
+            }
+        }
+    }
+
     // asymmetric head_dim (hsk != hsv) with one or both sides not 64-aligned
     test_cases.emplace_back(new test_flash_attn_ext(72, 64, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(64, 72, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
@@ -14349,6 +14371,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (int64_t nb = 1; nb <= 8; ++nb) {
             for (const auto & types : {std::pair{GGML_TYPE_TQ5_0, GGML_TYPE_TURBO4_0},
                                       std::pair{GGML_TYPE_Q8_0, GGML_TYPE_Q8_0}}) {
+                test_cases.emplace_back(new test_flash_attn_ext_causal(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, types.first, types.second, {0, 2, 1, 3}, false));
+            }
+        }
+    }
+    // SLOWKV: the same shape for the non-default pairs (q8_0/q8_0 is in the loop above).
+    for (int64_t kv : {32768, 102400}) {
+        for (int64_t nb = 1; nb <= 8; ++nb) {
+            for (const auto & types : {std::pair{GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0},
+                                      std::pair{GGML_TYPE_Q8_0, GGML_TYPE_Q5_1},
+                                      std::pair{GGML_TYPE_TQ6_0, GGML_TYPE_TQ6_0}}) {
                 test_cases.emplace_back(new test_flash_attn_ext_causal(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, types.first, types.second, {0, 2, 1, 3}, false));
             }
         }
