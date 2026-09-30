@@ -15284,6 +15284,67 @@ bool ggml_backend_is_vk(ggml_backend_t backend) {
     return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_vk_guid());
 }
 
+VkDevice ggml_backend_vk_get_device_handle(ggml_backend_t backend) {
+    if (!ggml_backend_is_vk(backend)) {
+        return VK_NULL_HANDLE;
+    }
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+    if (!ctx->device) {
+        return VK_NULL_HANDLE;
+    }
+    return (VkDevice)ctx->device->device;
+}
+
+VkQueue ggml_backend_vk_get_queue_handle(ggml_backend_t backend) {
+    if (!ggml_backend_is_vk(backend)) {
+        return VK_NULL_HANDLE;
+    }
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+    if (!ctx->device || !ctx->device->compute_queue ||
+        !ctx->device->compute_queue->handle) {
+        return VK_NULL_HANDLE;
+    }
+    return (VkQueue)ctx->device->compute_queue->handle->queue;
+}
+
+void ggml_backend_vk_lock_queue(ggml_backend_t backend) {
+    GGML_ASSERT(ggml_backend_is_vk(backend));
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+    GGML_ASSERT(ctx->device && ctx->device->compute_queue &&
+                ctx->device->compute_queue->handle);
+    ctx->device->compute_queue->handle->lock();
+}
+
+void ggml_backend_vk_unlock_queue(ggml_backend_t backend) {
+    GGML_ASSERT(ggml_backend_is_vk(backend));
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+    GGML_ASSERT(ctx->device && ctx->device->compute_queue &&
+                ctx->device->compute_queue->handle);
+    ctx->device->compute_queue->handle->unlock();
+}
+
+VkPhysicalDevice ggml_backend_vk_get_physical_device(ggml_backend_t backend) {
+    if (!ggml_backend_is_vk(backend)) {
+        return VK_NULL_HANDLE;
+    }
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+    if (!ctx->device) {
+        return VK_NULL_HANDLE;
+    }
+    return (VkPhysicalDevice)ctx->device->physical_device;
+}
+
+uint32_t ggml_backend_vk_get_queue_family(ggml_backend_t backend) {
+    if (!ggml_backend_is_vk(backend)) {
+        return 0;
+    }
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+    if (!ctx->device || !ctx->device->compute_queue) {
+        return 0;
+    }
+    return ctx->device->compute_queue->queue_family_index;
+}
+
 int ggml_backend_vk_get_device_count() {
     return ggml_vk_get_device_count();
 }
