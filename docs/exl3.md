@@ -130,7 +130,8 @@ in place of the ATX file:
 The MTP flags are the ones the measurements below used: `--spec-draft-n-max 4 --spec-draft-p-min 0`, the
 model's own MTP head, exact p/q verification on by default. `--spec-draft-vocab-map` is not used with
 this file: the shortlist in `docs/mtp-vocab/` was built for the ATX quant's head. Raise `-c` for longer
-contexts; the decode flags do not change.
+contexts; the decode flags do not change. The TurboQuant cache types are named `turbo2` to `turbo6` by bit width;
+the `tq2` to `tq6` spellings (and `tq3_0` to `tq6_0`) are accepted too ([KV-cache-quantization.md](KV-cache-quantization.md)).
 
 On the v0.4 tree the MTP drafter is on by default for a Qwen3.8 GGUF with the MTP head (adaptive depth
 3-4, see [speculative.md](speculative.md#--spec-type-type)), and the drafter's KV cache follows `-ctk`/`-ctv`

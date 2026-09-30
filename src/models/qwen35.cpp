@@ -738,6 +738,17 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
                     n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
                     ext_factor, attn_factor, beta_fast, beta_slow);
 
+            // attention below reads the cache through build_attn_mha directly, so it applies the
+            // same rotations build_attn(llm_graph_input_attn_kv *) does, in the same order
+            if (inp_attn->self_k_rot) {
+                Q_b = llama_mul_mat_hadamard(ctx0, Q_b, inp_attn->self_k_rot);
+                K_b = llama_mul_mat_hadamard(ctx0, K_b, inp_attn->self_k_rot);
+            }
+
+            if (inp_attn->self_v_rot) {
+                V_b = llama_mul_mat_hadamard(ctx0, V_b, inp_attn->self_v_rot);
+            }
+
             ggml_build_forward_expand(gf, Q_b);
             ggml_build_forward_expand(gf, V_b);
             ggml_build_forward_expand(gf, K_b);
@@ -757,7 +768,16 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
 
             ggml_tensor * mask_b = ggml_view_2d(ctx0, kq_mask, n_kv, width, kq_mask->nb[1], (size_t) row0*kq_mask->nb[1]);
 
+            // TurboQuant/TQ K caches hold WHT-rotated K: Q must be rotated to match
+            Q_b = build_attn_turbo_q(Q_b, k_view, mctx_kv);
+
             cur_b = build_attn_mha(Q_b, k_view, v_view, nullptr, mask_b, nullptr, nullptr, 0, kq_scale, il);
+
+            cur_b = build_attn_turbo_v_out(cur_b, v_view, il);
+
+            if (inp_attn->self_v_rot) {
+                cur_b = llama_mul_mat_hadamard(ctx0, cur_b, inp_attn->self_v_rot);
+            }
 
             cur_b = ggml_mul(ctx0, cur_b, ggml_sigmoid(ctx0, gate_b));
             cur_b = build_lora_mm(layer.wo, cur_b, layer.wo_s);
@@ -836,13 +856,13 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
             // then map rows, translated back to token ids through draft_vocab_ids
             ggml_tensor * id_map   = nullptr;
             ggml_tensor * logits_j = build_draft_vocab_logits_chain(head_w2, head_s2, h_next_j);
+            // an EXL3 head is K-major tiled and needs the suh/svh glue (build_lora_mm): a leading-rows view of it
+            // is not its first rows, so it scores the full head as with LLAMA_SPEC_CHAIN_SUB=0
+            const bool sub_exl3 = ggml_exl3_bits(head_w2->type) != 0;
             if (logits_j != nullptr) {
                 id_map = draft_vocab_ids;
             } else if (n_sub_env > 0 && n_sub_env < head_w2->ne[1] &&
-                    !(hadamard_rotations && hadamard_rotations->count(head_w2)) &&
-                    ggml_exl3_bits(head_w2->type) == 0) {
-                // [#82] the leading-rows cut is a plain mul_mat on a view: an EXL3 head needs the suh/svh
-                // Hadamard glue that build_lora_mm adds, so EXL3 heads take the full head below
+                    !(hadamard_rotations && hadamard_rotations->count(head_w2)) && !sub_exl3) {
                 ggml_tensor * head_sub = ggml_view_2d(ctx0, head_w2,
                         head_w2->ne[0], n_sub_env, head_w2->nb[1], 0);
                 logits_j = ggml_mul_mat(ctx0, head_sub, h_next_j);
@@ -850,6 +870,12 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
                     logits_j = ggml_mul(ctx0, logits_j, head_s2);
                 }
             } else {
+                static bool logged_sub_exl3 = false;
+                if (sub_exl3 && n_sub_env > 0 && n_sub_env < head_w2->ne[1] && !logged_sub_exl3) {
+                    logged_sub_exl3 = true;
+                    LLAMA_LOG_INFO("%s: MTP chain: the output head is EXL3, the %lld-row sub-head cut does not apply; "
+                                   "the chain scores the full head (logged once)\n", __func__, (long long) n_sub_env);
+                }
                 logits_j = build_lora_mm(head_w2, h_next_j, head_s2);
             }
 

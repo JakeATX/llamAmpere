@@ -25,6 +25,7 @@
 #endif
 
 #include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <cinttypes>
 #include <climits>
@@ -325,17 +326,61 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_TURBO2_0,
     GGML_TYPE_TURBO3_0,
     GGML_TYPE_TURBO4_0,
-    GGML_TYPE_TQ6_0,
     GGML_TYPE_TQ5_0,
+    GGML_TYPE_TQ6_0,
 };
 
-static ggml_type kv_cache_type_from_str(const std::string & s) {
+// Alternative spellings of the TurboQuant KV cache types, so that 2..6 bit all work
+// as turboN and as tqN. The ggml type names (turbo2/3/4, tq5_0, tq6_0) stay the canonical
+// ones printed in logs. tq2_0 is not an alias: it is ggml's ternary weight type.
+static const struct {
+    const char * name;
+    ggml_type    type;
+} kv_cache_type_aliases[] = {
+    { "tq2",    GGML_TYPE_TURBO2_0 },
+    { "tq3",    GGML_TYPE_TURBO3_0 },
+    { "tq3_0",  GGML_TYPE_TURBO3_0 },
+    { "tq4",    GGML_TYPE_TURBO4_0 },
+    { "tq4_0",  GGML_TYPE_TURBO4_0 },
+    { "turbo5", GGML_TYPE_TQ5_0    },
+    { "tq5",    GGML_TYPE_TQ5_0    },
+    { "turbo6", GGML_TYPE_TQ6_0    },
+    { "tq6",    GGML_TYPE_TQ6_0    },
+};
+
+ggml_type common_kv_cache_type_from_name(const std::string & name) {
+    std::string s = name;
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return std::tolower(c); });
     for (const auto & type : kv_cache_types) {
         if (ggml_type_name(type) == s) {
             return type;
         }
     }
-    throw std::runtime_error("Unsupported cache type: " + s);
+    for (const auto & alias : kv_cache_type_aliases) {
+        if (alias.name == s) {
+            return alias.type;
+        }
+    }
+    return GGML_TYPE_COUNT;
+}
+
+// "turbo5 (tq5_0)", "turbo3 (tq3_0)", "turbo2 (tq2)", or the plain ggml name for types without an alias
+static std::string kv_cache_type_display_name(ggml_type type) {
+    std::vector<std::string> names = { ggml_type_name(type) };
+    for (const auto & alias : kv_cache_type_aliases) {
+        if (alias.type == type) {
+            names.push_back(alias.name);
+        }
+    }
+    std::string turbo, tq; // prefer the tqN_0 spelling
+    for (const auto & n : names) {
+        if (n.rfind("turbo", 0) == 0) {
+            turbo = n;
+        } else if (n.rfind("tq", 0) == 0 && (tq.empty() || n.compare(n.size() - 2, 2, "_0") == 0)) {
+            tq = n;
+        }
+    }
+    return turbo.empty() || tq.empty() ? names[0] : turbo + " (" + tq + ")";
 }
 
 // "kvarnN" (N in 2..8) selects the KVarN region-aware cache: the ring/sink use the staging type, the body is sealed at N bits
@@ -350,9 +395,21 @@ static bool kvarn_bits_from_str(const std::string & s, uint32_t & bits) {
 static std::string get_all_kv_cache_types() {
     std::ostringstream msg;
     for (const auto & type : kv_cache_types) {
-        msg << ggml_type_name(type) << (&type == &kv_cache_types.back() ? "" : ", ");
+        msg << kv_cache_type_display_name(type) << (&type == &kv_cache_types.back() ? "" : ", ");
     }
     return msg.str();
+}
+
+static ggml_type kv_cache_type_from_str(const std::string & s) {
+    const ggml_type type = common_kv_cache_type_from_name(s);
+    if (type != GGML_TYPE_COUNT) {
+        return type;
+    }
+    std::string hint;
+    if (s == "tq2_0" || s == "TQ2_0") {
+        hint = " (tq2_0 is ggml's ternary weight type, not a KV cache type; the 2-bit cache is turbo2, also spelled tq2)";
+    }
+    throw std::runtime_error("Unsupported cache type: " + s + hint + "; allowed values: " + get_all_kv_cache_types());
 }
 
 static bool parse_bool_value(const std::string & value) {

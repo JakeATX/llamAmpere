@@ -881,6 +881,11 @@ struct llm_graph_params {
     // draft-only vocabulary shortlist: [n_sel] I32 token ids owned by the context, or nullptr
     ggml_tensor * draft_vocab_ids = nullptr;
 
+    // [#81] compact resident draft head [n_embd, n_sel] owned by the context, and the head tensor it replaces
+    // (the compact logits are used only for that head), or nullptr
+    ggml_tensor       * draft_vocab_compact     = nullptr;
+    const ggml_tensor * draft_vocab_compact_src = nullptr;
+
     // bit per full-head fallback reason already warned about, owned by the context (warn once per context)
     std::atomic<uint32_t> * draft_vocab_warned = nullptr;
 
@@ -1142,8 +1147,14 @@ struct llm_graph_context {
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     ggml_tensor * draft_vocab_ids; // see llm_graph_params
+    ggml_tensor       * draft_vocab_compact;     // see llm_graph_params
+    const ggml_tensor * draft_vocab_compact_src; // see llm_graph_params
     std::atomic<uint32_t> * draft_vocab_warned; // see llm_graph_params
     const std::vector<float> * mtp_chain_samp; // see llm_graph_params
+
+    // [#81] logits of the compact draft head for `cur` [n_embd, n], [n_sel, n]: plain mul_mat on the activation the
+    // head consumes (EXL3: x_rot = H128(suh * cur), the fused kernel's input glue built from generic ops)
+    ggml_tensor * build_draft_vocab_compact(ggml_tensor * head_w, ggml_tensor * head_s, ggml_tensor * cur) const;
 
     // full-head fallback of build_draft_vocab_logits: counts the reason in the fallback ledger, warns once per context
     ggml_tensor * draft_vocab_fallback(int reason, const char * detail) const;
@@ -1319,6 +1330,22 @@ struct llm_graph_context {
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                 int64_t   n_kv_max,
                   float   kq_scale,
+                    int   il) const;
+
+    // TurboQuant/TQ K caches hold WHT-rotated K (the set_rows quantizer rotates on store): pad Q per head
+    // to the cached K head size and rotate it to match. No-op for other K types and for KVarN caches
+    // (their tq6_0 staging K is stored in the KVarN Hadamard basis without the turbo WHT). Any graph that calls
+    // build_attn_mha on llama_kv_cache views must apply this and build_attn_turbo_v_out as build_attn does.
+    ggml_tensor * build_attn_turbo_q(
+            ggml_tensor * q,       // [n_embd_head_q, n_head_q, n_tokens]
+      const ggml_tensor * k,       // K cache view (its type selects the rotation)
+      const llama_kv_cache_context * mctx_cur) const;
+
+    // TurboQuant: build_attn_mha undoes the V rotation on its output; when the cached V head was padded
+    // to 128, cut the output back to n_embd_head_v(il). No-op for other V types.
+    ggml_tensor * build_attn_turbo_v_out(
+            ggml_tensor * cur,     // [n_embd_head_v_cache * n_head_q, n_tokens] build_attn_mha output
+      const ggml_tensor * v,       // V cache view
                     int   il) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;

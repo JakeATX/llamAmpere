@@ -1649,6 +1649,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     prec_policy      (params.prec_policy),
     samplers         (params.samplers),
     draft_vocab_ids  (params.draft_vocab_ids),
+    draft_vocab_compact    (params.draft_vocab_compact),
+    draft_vocab_compact_src(params.draft_vocab_compact_src),
     draft_vocab_warned(params.draft_vocab_warned),
     mtp_chain_samp   (params.mtp_chain_samp),
     cb_func          (params.cb),
@@ -2914,6 +2916,66 @@ ggml_tensor * llm_graph_context::build_pos_bias(ggml_tensor * pos_bucket, ggml_t
     return pos_bias;
 }
 
+ggml_tensor * llm_graph_context::build_attn_turbo_q(
+              ggml_tensor * q,
+        const ggml_tensor * k,
+        const llama_kv_cache_context * mctx_cur) const {
+    // TurboQuant pre-rotate-queries: O(d log d) WHT rotation via custom op
+    // Q shape: (n_embd_head, n_head, n_tokens)
+    // For zero-padded models (head_dim not 128-aligned), pad Q to match padded K dim first.
+    // KVarN: the staging K view is tq6_0 but holds K in the KVarN Hadamard basis (build_attn rotates Q/K/V
+    // itself and stores K with ggml_set_rows_tq6_rotated, no WHT and no InnerQ), so no turbo rotation here.
+    const bool is_kvarn = mctx_cur->is_kvarn();
+    if (!is_kvarn && (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TQ6_0 || k->type == GGML_TYPE_TQ5_0)) {
+        // Pad Q per-head to next multiple of 128 if needed
+        if (q->ne[0] % 128 != 0) {
+            const int64_t pad = ((q->ne[0] + 127) / 128) * 128 - q->ne[0];
+            q = ggml_pad(ctx0, q, pad, 0, 0, 0);
+        }
+        if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
+        ggml_tensor * innerq_scale = mctx_cur->get_turbo_innerq_scale_inv();
+        q = ggml_turbo_wht(ctx0, q, 0, 0, innerq_scale);  // 0 = forward, 0 = auto group size from q->ne[0]
+    }
+
+    return q;
+}
+
+ggml_tensor * llm_graph_context::build_attn_turbo_v_out(
+              ggml_tensor * cur,
+        const ggml_tensor * v,
+                      int   il) const {
+    // TurboQuant: if V was padded, the output has padded dimensions.
+    // Extract original V head_dim after inverse WHT (applied inside build_attn_mha).
+    // NOTE: gate on v->type (not k->type) for asymmetric configs where K=q8_0 but V=turbo
+    if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0 || v->type == GGML_TYPE_TQ6_0 || v->type == GGML_TYPE_TQ5_0) {
+        const int64_t orig_v_head = hparams.n_embd_head_v(il);
+        // cur is 2D: (n_embd_head * n_head, n_tokens) after build_attn_mha
+        const int64_t padded_v_head = v->ne[0];
+        if (padded_v_head != orig_v_head) {
+            // Reshape to 4D, extract original head_dim, reshape back to 2D
+            // Fix #78 (bingh0): cur shape post-MHA is (n_embd_head * n_head, n_tokens),
+            // not (n_embd_head * n_head_kv, n_tokens). The output carries one
+            // row per Q head, so derive the head count from the tensor itself:
+            // hparams.n_head(il) is correct but is a second source of truth
+            // that has to agree with cur — ne[0]/padded_v_head cannot disagree,
+            // and the assert turns a silent nelements mismatch (observed live:
+            // gpt-oss 64->128 V pad, 64q/8kv, abort in ggml_reshape_3d during
+            // graph reserve) into a loud failure at the exact site.
+            GGML_ASSERT(cur->ne[0] % padded_v_head == 0);
+            const int64_t n_head_v = cur->ne[0] / padded_v_head;
+            const int64_t n_tokens_cur = cur->ne[1];
+            cur = ggml_reshape_3d(ctx0, cur, padded_v_head, n_head_v, n_tokens_cur);
+            // ggml_view_3d to extract first orig_v_head elements per head
+            cur = ggml_view_3d(ctx0, cur, orig_v_head, n_head_v, n_tokens_cur,
+                               cur->nb[1], cur->nb[2], 0);
+            cur = ggml_cont(ctx0, cur);
+            cur = ggml_reshape_2d(ctx0, cur, orig_v_head * n_head_v, n_tokens_cur);
+        }
+    }
+
+    return cur;
+}
+
 ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * q,
          ggml_tensor * k,
@@ -3297,53 +3359,14 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    // TurboQuant pre-rotate-queries: O(d log d) WHT rotation via custom op
-    // Q shape: (n_embd_head, n_head, n_tokens)
-    // For zero-padded models (head_dim not 128-aligned), pad Q to match padded K dim first.
-    if (!is_kvarn && (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TQ6_0 || k->type == GGML_TYPE_TQ5_0)) {
-        // Pad Q per-head to next multiple of 128 if needed
-        if (q->ne[0] % 128 != 0) {
-            const int64_t pad = ((q->ne[0] + 127) / 128) * 128 - q->ne[0];
-            q = ggml_pad(ctx0, q, pad, 0, 0, 0);
-        }
-        if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
-        ggml_tensor * innerq_scale = mctx_cur->get_turbo_innerq_scale_inv();
-        q = ggml_turbo_wht(ctx0, q, 0, 0, innerq_scale);  // 0 = forward, 0 = auto group size from q->ne[0]
-    }
+    q = build_attn_turbo_q(q, k, mctx_cur);
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
     cb(cur, "kqv_out", il);
 
     GGML_ASSERT(kvarn_pending.body == nullptr && "KVarN cache requires the flash-attention path");
 
-    // TurboQuant: if V was padded, the output has padded dimensions.
-    // Extract original V head_dim after inverse WHT (applied inside build_attn_mha).
-    // NOTE: gate on v->type (not k->type) for asymmetric configs where K=q8_0 but V=turbo
-    if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0 || v->type == GGML_TYPE_TQ6_0 || v->type == GGML_TYPE_TQ5_0) {
-        const int64_t orig_v_head = hparams.n_embd_head_v(il);
-        // cur is 2D: (n_embd_head * n_head, n_tokens) after build_attn_mha
-        const int64_t padded_v_head = v->ne[0];
-        if (padded_v_head != orig_v_head) {
-            // Reshape to 4D, extract original head_dim, reshape back to 2D
-            // Fix #78 (bingh0): cur shape post-MHA is (n_embd_head * n_head, n_tokens),
-            // not (n_embd_head * n_head_kv, n_tokens). The output carries one
-            // row per Q head, so derive the head count from the tensor itself:
-            // hparams.n_head(il) is correct but is a second source of truth
-            // that has to agree with cur — ne[0]/padded_v_head cannot disagree,
-            // and the assert turns a silent nelements mismatch (observed live:
-            // gpt-oss 64->128 V pad, 64q/8kv, abort in ggml_reshape_3d during
-            // graph reserve) into a loud failure at the exact site.
-            GGML_ASSERT(cur->ne[0] % padded_v_head == 0);
-            const int64_t n_head_v = cur->ne[0] / padded_v_head;
-            const int64_t n_tokens_cur = cur->ne[1];
-            cur = ggml_reshape_3d(ctx0, cur, padded_v_head, n_head_v, n_tokens_cur);
-            // ggml_view_3d to extract first orig_v_head elements per head
-            cur = ggml_view_3d(ctx0, cur, orig_v_head, n_head_v, n_tokens_cur,
-                               cur->nb[1], cur->nb[2], 0);
-            cur = ggml_cont(ctx0, cur);
-            cur = ggml_reshape_2d(ctx0, cur, orig_v_head * n_head_v, n_tokens_cur);
-        }
-    }
+    cur = build_attn_turbo_v_out(cur, v, il);
 
     if (inp->self_v_rot) {
         cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
@@ -3434,17 +3457,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
     // TurboQuant: pre-rotate Q for K-only (MLA) attention
-    // For zero-padded models, pad Q to match padded K dim first.
-    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TQ6_0 || k->type == GGML_TYPE_TQ5_0) {
-        // Pad Q per-head to next multiple of 128 if needed
-        if (q->ne[0] % 128 != 0) {
-            const int64_t pad = ((q->ne[0] + 127) / 128) * 128 - q->ne[0];
-            q = ggml_pad(ctx0, q, pad, 0, 0, 0);
-        }
-        if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
-        ggml_tensor * innerq_scale = mctx_cur->get_turbo_innerq_scale_inv();
-        q = ggml_turbo_wht(ctx0, q, 0, 0, innerq_scale);  // 0 = forward, 0 = auto group size
-    }
+    q = build_attn_turbo_q(q, k, mctx_cur);
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
     cb(cur, "kqv_out", il);
@@ -3637,43 +3650,12 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
     // TurboQuant: pre-rotate Q for ISWA attention (pad to 128-aligned if needed)
-    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TQ6_0 || k->type == GGML_TYPE_TQ5_0) {
-        if (q->ne[0] % 128 != 0) {
-            const int64_t pad = ((q->ne[0] + 127) / 128) * 128 - q->ne[0];
-            q = ggml_pad(ctx0, q, pad, 0, 0, 0);
-        }
-        if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
-        ggml_tensor * innerq_scale = mctx_cur->get_turbo_innerq_scale_inv();
-        q = ggml_turbo_wht(ctx0, q, 0, 0, innerq_scale);
-    }
+    q = build_attn_turbo_q(q, k, mctx_cur);
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
     cb(cur, "kqv_out", il);
 
-    // TurboQuant: if V was padded, extract original V head_dim after inverse WHT
-    // NOTE: gate on v->type (not k->type) for asymmetric configs where K=q8_0 but V=turbo
-    if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0 || v->type == GGML_TYPE_TQ6_0 || v->type == GGML_TYPE_TQ5_0) {
-        const int64_t orig_v_head = hparams.n_embd_head_v(il);
-        const int64_t padded_v_head = v->ne[0];
-        if (padded_v_head != orig_v_head) {
-            // Fix #78 (bingh0): cur shape post-MHA is (n_embd_head * n_head, n_tokens),
-            // not (n_embd_head * n_head_kv, n_tokens). The output carries one
-            // row per Q head, so derive the head count from the tensor itself:
-            // hparams.n_head(il) is correct but is a second source of truth
-            // that has to agree with cur — ne[0]/padded_v_head cannot disagree,
-            // and the assert turns a silent nelements mismatch (observed live:
-            // gpt-oss 64->128 V pad, 64q/8kv, abort in ggml_reshape_3d during
-            // graph reserve) into a loud failure at the exact site.
-            GGML_ASSERT(cur->ne[0] % padded_v_head == 0);
-            const int64_t n_head_v = cur->ne[0] / padded_v_head;
-            const int64_t n_tokens_cur = cur->ne[1];
-            cur = ggml_reshape_3d(ctx0, cur, padded_v_head, n_head_v, n_tokens_cur);
-            cur = ggml_view_3d(ctx0, cur, orig_v_head, n_head_v, n_tokens_cur,
-                               cur->nb[1], cur->nb[2], 0);
-            cur = ggml_cont(ctx0, cur);
-            cur = ggml_reshape_2d(ctx0, cur, orig_v_head * n_head_v, n_tokens_cur);
-        }
-    }
+    cur = build_attn_turbo_v_out(cur, v, il);
 
     if (v_rot) {
         cur = llama_mul_mat_hadamard(ctx0, cur, v_rot);
@@ -4602,6 +4584,30 @@ ggml_tensor * llm_graph_context::draft_vocab_fallback(int reason, const char * d
     return nullptr;
 }
 
+ggml_tensor * llm_graph_context::build_draft_vocab_compact(
+        ggml_tensor * head_w,
+        ggml_tensor * head_s,
+        ggml_tensor * cur) const {
+    const int64_t n_sel = draft_vocab_compact->ne[1];
+    GGML_ASSERT(n_sel == draft_vocab_ids->ne[0] && draft_vocab_compact->ne[0] == head_w->ne[0]);
+    ggml_ledger_addf("llama.draft_vocab", 1, "compact type=%s n_sel=%lld", ggml_type_name(draft_vocab_compact->type), (long long) n_sel);
+
+    ggml_tensor * x = cur;
+    if (ggml_exl3_bits(head_w->type) != 0) {
+        // the compact rows live in the rotated input domain of the EXL3 head (llama-draft-vocab-compact.h): feed them
+        // x_rot = H128(suh * x), the same input glue build_lora_mm builds with LLAMA_EXL3_GLUE_GRAPH=1
+        const llama_model::exl3_side * exl3 = model_ref ? model_ref->exl3_side_of(head_w) : nullptr;
+        GGML_ASSERT(exl3 != nullptr && model_ref->exl3_had128 != nullptr);
+        x = ggml_mul(ctx0, x, exl3->suh);
+        x = build_exl3_had128(ctx0, model_ref->exl3_had128, x);
+    }
+    ggml_tensor * logits = ggml_mul_mat(ctx0, draft_vocab_compact, x); // [n_sel, n]
+    if (head_s) {
+        logits = ggml_mul(ctx0, logits, head_s);
+    }
+    return logits;
+}
+
 ggml_tensor * llm_graph_context::build_draft_vocab_logits(
         ggml_tensor * head_w,
         ggml_tensor * head_s,
@@ -4609,7 +4615,9 @@ ggml_tensor * llm_graph_context::build_draft_vocab_logits(
     if (draft_vocab_ids == nullptr || n_outputs == 0 || head_w == nullptr) {
         return nullptr;
     }
-    if (hadamard_rotations && hadamard_rotations->count(head_w)) {
+    // [#81] a compact head built from this head replaces the hadamard_head / head_layout outcomes
+    const bool compact = draft_vocab_compact != nullptr && draft_vocab_compact_src == head_w;
+    if (!compact && hadamard_rotations && hadamard_rotations->count(head_w)) {
         return draft_vocab_fallback(DRAFT_VOCAB_FALLBACK_HADAMARD, "the output head is Hadamard-rotated");
     }
     if (loras && !loras->empty()) {
@@ -4621,8 +4629,10 @@ ggml_tensor * llm_graph_context::build_draft_vocab_logits(
     if (draft_vocab_ids->ne[0] >= head_w->ne[1]) {
         return draft_vocab_fallback(DRAFT_VOCAB_FALLBACK_NOT_SMALLER, "the map has as many rows as the head");
     }
-    if (const char * why = draft_vocab_direct(head_w)) {
-        return draft_vocab_fallback(DRAFT_VOCAB_FALLBACK_HEAD_LAYOUT, why);
+    if (!compact) {
+        if (const char * why = draft_vocab_direct(head_w)) {
+            return draft_vocab_fallback(DRAFT_VOCAB_FALLBACK_HEAD_LAYOUT, why);
+        }
     }
     // the compact logits never reach the host: every output row must be consumed by a backend sampler
     for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
@@ -4636,6 +4646,13 @@ ggml_tensor * llm_graph_context::build_draft_vocab_logits(
         }
     }
     GGML_ASSERT(cur->ne[1] == n_outputs);
+
+    if (compact) {
+        ggml_tensor * logits = build_draft_vocab_compact(head_w, head_s, cur); // [n_sel, n_outputs]
+        cb(logits, "draft_vocab_logits", -1);
+        res->t_logits_ids = draft_vocab_ids;
+        return logits;
+    }
 
     const int64_t n_sel = draft_vocab_ids->ne[0];
     ggml_ledger_addf("llama.draft_vocab", 1, "shortlist n_sel=%lld", (long long) n_sel);
@@ -4667,7 +4684,8 @@ ggml_tensor * llm_graph_context::build_draft_vocab_logits_chain(
     if (draft_vocab_ids == nullptr || head_w == nullptr) {
         return nullptr;
     }
-    if (hadamard_rotations && hadamard_rotations->count(head_w)) {
+    const bool compact = draft_vocab_compact != nullptr && draft_vocab_compact_src == head_w;
+    if (!compact && hadamard_rotations && hadamard_rotations->count(head_w)) {
         return draft_vocab_fallback(DRAFT_VOCAB_FALLBACK_HADAMARD, "the output head is Hadamard-rotated");
     }
     if (loras && !loras->empty()) {
@@ -4679,10 +4697,15 @@ ggml_tensor * llm_graph_context::build_draft_vocab_logits_chain(
     if (draft_vocab_ids->ne[0] >= head_w->ne[1]) {
         return draft_vocab_fallback(DRAFT_VOCAB_FALLBACK_NOT_SMALLER, "the map has as many rows as the head");
     }
-    if (const char * why = draft_vocab_direct(head_w)) {
-        return draft_vocab_fallback(DRAFT_VOCAB_FALLBACK_HEAD_LAYOUT, why);
+    if (!compact) {
+        if (const char * why = draft_vocab_direct(head_w)) {
+            return draft_vocab_fallback(DRAFT_VOCAB_FALLBACK_HEAD_LAYOUT, why);
+        }
     }
     GGML_ASSERT(cur->ne[1] == 1);
+    if (compact) {
+        return build_draft_vocab_compact(head_w, head_s, cur);
+    }
 
     const int64_t n_sel = draft_vocab_ids->ne[0];
     ggml_ledger_addf("llama.draft_vocab", 1, "chain_shortlist n_sel=%lld", (long long) n_sel);

@@ -26,12 +26,14 @@
 #include "llama-model.h"
 #include "llama-mtp-vocab.h"
 #include "llama-mtp-vocab-builtin.h"
+#include "llama-draft-vocab-compact.h"
 #include "llama-mtp-chain-sample.h"
 #include "llama-ext.h"
 #include "llama-sampler.h"
 #include "llama.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -1053,17 +1055,119 @@ void llama_context::init_draft_vocab(const char * path, int32_t n_hot) {
                     n_hot, (long long) n_sel));
     }
 
-    ggml_init_params ip = { ggml_tensor_overhead(), nullptr, true };
+    // [#81] compact resident draft head: auto for EXL3 heads (no one-row path), LLAMA_DRAFT_VOCAB_COMPACT=1 forces it
+    // on any head (A/B), =0 keeps the full-head fallback; prism-rotated heads keep their fallback
+    ggml_type compact_type = GGML_TYPE_COUNT;
+    {
+        const char * env = getenv("LLAMA_DRAFT_VOCAB_COMPACT");
+        const int force = env != nullptr && env[0] != '\0' ? atoi(env) : -1;
+        const bool is_exl3 = ggml_exl3_bits(head->type) != 0;
+        const bool want = !model.hparams.no_alloc && !model.hadamard_rotations.count(head) &&
+                n_sel < head->ne[1] && (force == 1 || (force != 0 && is_exl3));
+        if (want) {
+            compact_type = GGML_TYPE_IQ4_XS;
+            if (const char * te = getenv("LLAMA_DRAFT_VOCAB_COMPACT_TYPE"); te != nullptr && te[0] != '\0') {
+                compact_type = GGML_TYPE_COUNT;
+                for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
+                    const char * name = ggml_type_name((ggml_type) t);
+                    auto ieq = [](const char * a, const char * b) {
+                        for (; *a && *b; ++a, ++b) {
+                            if (std::tolower((unsigned char) *a) != std::tolower((unsigned char) *b)) {
+                                return false;
+                            }
+                        }
+                        return *a == *b;
+                    };
+                    if (name != nullptr && ieq(name, te)) {
+                        compact_type = (ggml_type) t;
+                        break;
+                    }
+                }
+                if (compact_type == GGML_TYPE_COUNT || !llama_draft_compact_type_ok(compact_type, head->ne[0])) {
+                    throw std::runtime_error(format("LLAMA_DRAFT_VOCAB_COMPACT_TYPE=%s is not one of f32, f16, q8_0, q6_K, "
+                                "q5_K, q4_K, iq4_xs, iq4_nl for rows of %lld", te, (long long) head->ne[0]));
+                }
+            }
+            if (is_exl3 && (model.exl3_side_of(head) == nullptr || model.exl3_had128 == nullptr ||
+                        head->ne[0] % 128 != 0 || head->ne[1] % 128 != 0)) {
+                LLAMA_LOG_WARN("%s: EXL3 head %s has no .suh/.svh or no exl3_had128, no compact draft head\n",
+                        __func__, ggml_get_name(head));
+                compact_type = GGML_TYPE_COUNT;
+            } else if (!is_exl3 && (ggml_get_type_traits(head->type)->to_float == nullptr || !ggml_is_contiguous(head))) {
+                LLAMA_LOG_WARN("%s: head %s (%s) has no row decoder, no compact draft head\n",
+                        __func__, ggml_get_name(head), ggml_type_name(head->type));
+                compact_type = GGML_TYPE_COUNT;
+            } else {
+                // a split (multi-device row) buffer cannot hold the compact head as one tensor
+                ggml_backend_buffer_type_t hb = ggml_backend_buffer_get_type(head->buffer);
+                ggml_backend_dev_t hd = ggml_backend_buft_get_device(hb);
+                if (!ggml_backend_buft_is_host(hb) && (hd == nullptr || ggml_backend_dev_buffer_type(hd) != hb)) {
+                    LLAMA_LOG_WARN("%s: head %s is in a split buffer (%s), no compact draft head\n",
+                            __func__, ggml_get_name(head), ggml_backend_buft_name(hb));
+                    compact_type = GGML_TYPE_COUNT;
+                }
+            }
+        }
+    }
+    const bool use_compact = compact_type != GGML_TYPE_COUNT;
+    if (use_compact && n_hot > 0) {
+        // the hot tail repoints ids at request boundaries; the compact rows are built once at load
+        LLAMA_LOG_WARN("%s: the %d adaptive hot slots are disabled with the compact draft head (static map)\n", __func__, n_hot);
+        n_hot = 0;
+    }
+
+    ggml_init_params ip = { 2*ggml_tensor_overhead(), nullptr, true };
     draft_vocab.ctx.reset(ggml_init(ip));
     draft_vocab.ids = ggml_new_tensor_1d(draft_vocab.ctx.get(), GGML_TYPE_I32, n_sel);
     ggml_set_name(draft_vocab.ids, "draft_vocab_ids");
+    if (use_compact) {
+        draft_vocab.compact = ggml_new_tensor_2d(draft_vocab.ctx.get(), compact_type, head->ne[0], n_sel);
+        ggml_set_name(draft_vocab.compact, "draft_vocab_compact");
+    }
 
     ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(head->buffer);
     draft_vocab.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(draft_vocab.ctx.get(), buft));
     if (!draft_vocab.buf) {
         throw std::runtime_error("draft vocabulary map: failed to allocate the id map");
     }
+    if (use_compact) {
+        ggml_backend_buffer_set_usage(draft_vocab.buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    }
     ggml_backend_tensor_set(draft_vocab.ids, map.ids.data(), 0, (size_t) n_sel * sizeof(int32_t));
+
+    if (use_compact) {
+        const int64_t t0 = ggml_time_us();
+        // host copies of the head and its EXL3 side data; freed when the rows are built
+        std::vector<uint8_t> head_bytes(ggml_nbytes(head));
+        ggml_backend_tensor_get(head, head_bytes.data(), 0, head_bytes.size());
+        std::vector<float> svh, had;
+        llama_draft_compact_src src;
+        src.data = head_bytes.data();
+        src.type = head->type;
+        src.K    = head->ne[0];
+        src.N    = head->ne[1];
+        if (ggml_exl3_bits(head->type) != 0) {
+            const auto * side = model.exl3_side_of(head);
+            svh.resize(head->ne[1]);
+            had.resize(128 * 128);
+            ggml_backend_tensor_get(side->svh, svh.data(), 0, svh.size() * sizeof(float));
+            ggml_backend_tensor_get(model.exl3_had128, had.data(), 0, had.size() * sizeof(float));
+            src.svh = svh.data();
+            src.had = had.data();
+        }
+        std::vector<uint8_t> rows(ggml_nbytes(draft_vocab.compact));
+        const int n_thr = std::max(1, (int) std::min<uint32_t>(cparams.n_threads_batch, 16));
+        if (!llama_draft_compact_build(src, map.ids.data(), n_sel, compact_type, rows.data(), n_thr)) {
+            throw std::runtime_error("draft vocabulary map: building the compact draft head failed");
+        }
+        ggml_backend_tensor_set(draft_vocab.compact, rows.data(), 0, rows.size());
+        draft_vocab.compact_src = head;
+        // WARN so it shows at the server's default verbosity: resident memory next to the model weights
+        LLAMA_LOG_WARN("%s: compact draft head: type %s, n_sel %lld, %.1f MiB on %s, from %s (%s) in %.2f s (%d threads)\n",
+                __func__, ggml_type_name(compact_type), (long long) n_sel,
+                ggml_nbytes(draft_vocab.compact) / 1024.0 / 1024.0, ggml_backend_buft_name(buft),
+                ggml_get_name(head), ggml_type_name(head->type), (ggml_time_us() - t0) / 1e6, n_thr);
+    }
     draft_vocab.host = std::move(map.ids);
 
     draft_vocab.n_hot = n_hot;
@@ -4006,6 +4110,8 @@ llm_graph_params llama_context::graph_params(llm_graph_result *             res,
         /*.prec_policy =*/ &model.prec_policy,
         /*.samplers    =*/ sampling.samplers,
         /*.draft_vocab =*/ draft_vocab.ids,
+        /*.draft_vocab_compact =*/ draft_vocab.compact,
+        /*.draft_vocab_compact_src =*/ draft_vocab.compact_src,
         /*.draft_vocab_warned =*/ &draft_vocab.warned,
         /*.mtp_chain_samp =*/ &mtp_chain_samp,
         /*.n_outputs   =*/ n_outputs,
@@ -5268,7 +5374,7 @@ llama_context * llama_init_from_model(llama_model * model, llama_context_params 
     }
 
     if (params.type_k == GGML_TYPE_TURBO2_0) {
-        LLAMA_LOG_ERROR("%s: turbo2 is a V-only cache type; pick a different K cache type (q8_0, tq5_0, tq6_0, turbo4)\n", __func__);
+        LLAMA_LOG_ERROR("%s: turbo2 is a V-only cache type; pick a different K cache type (q8_0, turbo4, turbo5, turbo6)\n", __func__);
         return nullptr;
     }
 
