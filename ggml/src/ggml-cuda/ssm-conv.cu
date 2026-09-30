@@ -157,6 +157,105 @@ static void ssm_conv_f32_cuda(const float * src0, const float * src1, const floa
     }
 }
 
+// [#110 SF fold 2] ssm_conv_f32 with the conv input read from the two CONCAT operands instead of the CONCAT
+// result, plus the conv-state snapshot windows the CPY / CONT+SET_ROWS nodes would have copied out of it. The
+// conv arithmetic is ssm_conv_f32's, term for term (same products, same order, same bias add and SILU), so the
+// output bytes match; the windows are bit copies. Each thread owns one channel of one sequence: it reads every
+// value it needs before it writes anything, and it is the only writer of that channel's window columns.
+template <bool apply_silu, int d_conv, int n_t>
+static __global__ void ssm_conv_ring_f32(const ggml_cuda_conv_ring_args args, const float * __restrict__ w_ptr,
+                                         const int w_nb1, const float * __restrict__ bias,
+                                         float * __restrict__ dst, const int dst_nb1, const int dst_nb2) {
+    ggml_cuda_pdl_lc();
+    constexpr int n_keep = d_conv - 1;
+    constexpr int n_col  = n_keep + n_t;
+
+    const int     tid = threadIdx.x;
+    const int     s   = blockIdx.x;
+    const int64_t c   = (int64_t) blockIdx.y * blockDim.x + tid;
+
+    float x[n_col];
+    float w[d_conv];
+
+    ggml_cuda_pdl_sync();
+    const float * xs = (const float *) ((const char *) args.state + s * args.state_nb2 + c * args.state_nb1);
+#pragma unroll
+    for (int j = 0; j < n_keep; ++j) {
+        x[j] = xs[j];
+    }
+    const char * xn = (const char *) args.x + s * args.x_nb2 + c * args.x_nb1;
+#pragma unroll
+    for (int i = 0; i < n_t; ++i) {
+        x[n_keep + i] = *(const float *) (xn + i * args.x_nb0);
+    }
+    const int stride_w = w_nb1 / sizeof(float);
+#pragma unroll
+    for (int j = 0; j < d_conv; ++j) {
+        w[j] = w_ptr[c * stride_w + j];
+    }
+    const float b = bias != nullptr ? bias[c] : 0.0f;
+
+    // windows in graph order; s_idx picks the columns through an unrolled compare so x stays in registers
+#pragma unroll
+    for (int k = 0; k < GGML_CUDA_CONV_RING_MAX_WIN; ++k) {
+        if (k < args.n_win) {
+            const ggml_cuda_conv_ring_window & win = args.win[k];
+            const int64_t row = win.rows != nullptr ? (int64_t) win.rows[s] : (int64_t) s;
+            float * out = win.dst + row * win.row_stride + c * n_keep;
+#pragma unroll
+            for (int q = 0; q <= n_t; ++q) {
+                if (q == win.s_idx) {
+#pragma unroll
+                    for (int j = 0; j < n_keep; ++j) {
+                        out[j] = x[q + j];
+                    }
+                }
+            }
+        }
+    }
+
+    float * y = (float *) ((char *) dst + s * dst_nb2) + c;
+    const int stride_y = dst_nb1 / sizeof(float);
+#pragma unroll
+    for (int i = 0; i < n_t; i++) {
+        float sumf = 0.0f;
+#pragma unroll
+        for (int j = 0; j < d_conv; j++) {
+            sumf += x[i + j] * w[j];
+        }
+        sumf += b;
+        y[i * stride_y] = apply_silu ? ggml_cuda_op_silu_single(sumf) : sumf;
+    }
+}
+
+template <bool apply_silu>
+static void ssm_conv_ring_f32_cuda(const ggml_cuda_conv_ring_args & args, const float * w, const int w_nb1,
+                                   const float * bias, float * dst, const int dst_nb1, const int dst_nb2,
+                                   const int64_t nr, const int64_t n_t, const int64_t n_s, cudaStream_t stream) {
+    const int threads = 128;
+    GGML_ASSERT(nr % threads == 0);
+    const dim3 blocks(n_s, nr / threads, 1);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks, threads, 0, stream);
+
+    auto launch = [&](auto NT) {
+        constexpr int kNT = decltype(NT)::value;
+        ggml_cuda_kernel_launch(ssm_conv_ring_f32<apply_silu, 4, kNT>, launch_params, args, w, w_nb1, bias,
+                                dst, dst_nb1, dst_nb2);
+    };
+    // the plan (ggml_cuda_conv_ring_match) only accepts d_conv 4 and 1 <= n_t <= GGML_CUDA_CONV_RING_MAX_T
+    switch (n_t) {
+        case 1: launch(std::integral_constant<int, 1>{}); break;
+        case 2: launch(std::integral_constant<int, 2>{}); break;
+        case 3: launch(std::integral_constant<int, 3>{}); break;
+        case 4: launch(std::integral_constant<int, 4>{}); break;
+        case 5: launch(std::integral_constant<int, 5>{}); break;
+        case 6: launch(std::integral_constant<int, 6>{}); break;
+        case 7: launch(std::integral_constant<int, 7>{}); break;
+        case 8: launch(std::integral_constant<int, 8>{}); break;
+        default: GGML_ABORT("conv ring: n_t %lld outside 1..%d", (long long) n_t, GGML_CUDA_CONV_RING_MAX_T);
+    }
+}
+
 void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * bias_add_node, ggml_tensor * silu_dst) {
     const struct ggml_tensor * src0 = dst->src[0];  // conv_x
     const struct ggml_tensor * src1 = dst->src[1];  // conv1d.weight
@@ -194,6 +293,22 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
         GGML_ASSERT(bias->type == GGML_TYPE_F32);
         GGML_ASSERT(ggml_is_contiguous(bias));
         GGML_ASSERT(ggml_nelements(bias) == nr);
+    }
+
+    // [#110] planned conv ring: src0 (the CONCAT) was not computed; read its operands instead
+    for (auto & e : ctx.conv_rings) {
+        if (e.conv != dst) {
+            continue;
+        }
+        GGML_ASSERT(nc == 4 && n_t >= 1 && n_t <= GGML_CUDA_CONV_RING_MAX_T && out->nb[0] == sizeof(float));
+        if (fuse_silu) {
+            ssm_conv_ring_f32_cuda<true>(e.args, src1_d, src1->nb[1], bias_d, dst_d, out->nb[1], out->nb[2], nr, n_t, n_s, stream);
+        } else {
+            ssm_conv_ring_f32_cuda<false>(e.args, src1_d, src1->nb[1], bias_d, dst_d, out->nb[1], out->nb[2], nr, n_t, n_s, stream);
+        }
+        e.used = true;
+        ctx.fusion_stats.conv_ring++;
+        return;
     }
 
     if (fuse_silu) {

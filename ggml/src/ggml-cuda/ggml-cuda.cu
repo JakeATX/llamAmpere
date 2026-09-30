@@ -4818,6 +4818,363 @@ static void ggml_cuda_gdn_state_read_finish(ggml_backend_cuda_context * cuda_ctx
     cuda_ctx->gdn_state_reads.clear();
 }
 
+// [#110 SF fold 2] conv ring read in place (GGML_VL_SF_CONVRING=1, or GGML_VL_SF=1 with GGML_VL_SF_CONVRING unset).
+//
+// llm_build_delta_net_base::build_conv_state (src/models/delta-net-base.cpp) emits, per GDN layer,
+//   C = CONCAT(RESHAPE(GET_ROWS(conv cache)) [d_conv-1, ch, n_seqs], TRANSPOSE(qkv) [n_t, ch, n_seqs], dim 0)
+//   for each snapshot window g: CPY(VIEW(C, column s_g), cache view)             (ubatch fills the ring / no ring)
+//                           or  SET_ROWS(cache2d, CONT(VIEW(C, column s_g)), rows_g)   (ring, ubatch shorter than it)
+//   SSM_CONV(C, conv1d) [-> ADD bias] -> SILU
+// With a plan entry the CONCAT and the window nodes are not launched: the ssm_conv launch reads the two CONCAT
+// operands itself and writes the windows (ssm_conv_ring_f32, ssm-conv.cu). The windows are therefore written at the
+// ssm_conv's position instead of right after the CONCAT, and the operands are read there too. The result is the same
+// bytes only while all of this holds (checked per evaluation, with data pointers):
+//  - C is read by the window views and the ssm_conv only; each view by its one CPY / CONT, each CONT by its one
+//    SET_ROWS; none of them is a graph output or read by anything else (use counts), so no reader of an unwritten
+//    tensor remains;
+//  - every other node that runs between C and the ssm_conv neither writes the operands, the conv weight or the row
+//    indices, nor reads or writes the window destinations (byte ranges);
+//  - the ssm_conv output does not overlap the operands, the rows or the windows; graph_optimize keeps the operands
+//    and rows allocated until the ssm_conv's last fused node so the allocator does not hand their memory to it;
+//  - d_conv 4, 1 <= n_t <= GGML_CUDA_CONV_RING_MAX_T, channels % 128 == 0, F32 throughout, I32 rows. Prefill
+//    ubatches and anything else fail the match and run the unfused nodes.
+// The window writes keep graph order (a later window wins an address two windows share), and every thread reads
+// its channel's operands before it writes, so the rollback rows the ring keeps are bit copies of what the CPY /
+// SET_ROWS nodes wrote. GGML_VL_SF_CONVRING_LOG=1 prints a per-evaluation summary (planned / seen / why not).
+static bool ggml_cuda_conv_ring_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_VL_SF_CONVRING");
+        if (e != nullptr) {
+            return atoi(e) != 0;
+        }
+        const char * u = getenv("GGML_VL_SF");
+        return u != nullptr && atoi(u) != 0;
+    }();
+    return enabled;
+}
+
+static bool ggml_cuda_conv_ring_log_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_VL_SF_CONVRING_LOG");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return enabled;
+}
+
+struct ggml_cuda_conv_ring_match {
+    int                 concat_idx = -1;
+    int                 last_idx   = -1; // last node of the ssm_conv launch (SILU, or ADD+SILU when fused)
+    const ggml_tensor * concat     = nullptr;
+    int                 n_win      = 0;
+    struct {
+        const ggml_tensor * dst  = nullptr; // CPY: its destination view; SET_ROWS: the cache matrix
+        const ggml_tensor * rows = nullptr; // SET_ROWS indices, nullptr for a CPY
+        int                 s_idx = 0;
+    } win[GGML_CUDA_CONV_RING_MAX_WIN];
+    std::vector<int>    skip;              // CONCAT, CPY, CONT and SET_ROWS nodes the launch replaces
+    std::vector<int>    between;           // other computed nodes between the CONCAT and the ssm_conv
+    const char *        why = nullptr;     // reason for a refusal
+};
+
+// structural match (no data pointers: also runs in graph_optimize before allocation)
+static bool ggml_cuda_conv_ring_match_at(const ggml_cgraph * cgraph, int conv_idx, ggml_cuda_conv_ring_match & m) {
+    const ggml_tensor * conv   = cgraph->nodes[conv_idx];
+    const ggml_tensor * concat = conv->src[0];
+    const ggml_tensor * weight = conv->src[1];
+    auto refuse = [&m](const char * why) {
+        m.why = why;
+        return false;
+    };
+    if (concat->op != GGML_OP_CONCAT || ggml_get_op_params_i32(concat, 0) != 0) {
+        return refuse("input not a dim-0 concat");
+    }
+    const ggml_tensor * keep = concat->src[0];
+    const ggml_tensor * xnew = concat->src[1];
+    if (conv->type != GGML_TYPE_F32 || concat->type != GGML_TYPE_F32 || keep->type != GGML_TYPE_F32 ||
+        xnew->type != GGML_TYPE_F32 || weight->type != GGML_TYPE_F32) {
+        return refuse("type");
+    }
+    const int64_t d_conv = weight->ne[0];
+    const int64_t ch     = conv->ne[0];
+    const int64_t n_t    = conv->ne[1];
+    const int64_t n_s    = conv->ne[2];
+    if (d_conv != 4) {
+        return refuse("d_conv");
+    }
+    if (n_t < 1 || n_t > GGML_CUDA_CONV_RING_MAX_T) {
+        return refuse("width");  // prefill ubatches: the unfused nodes
+    }
+    if (ch % 128 != 0 || weight->ne[1] != ch || weight->nb[0] != sizeof(float) || weight->nb[1] % sizeof(float) != 0 ||
+        conv->nb[0] != sizeof(float)) {
+        return refuse("layout");
+    }
+    const int64_t n_keep = d_conv - 1;
+    const std::array<int64_t, 4> ne_c = { n_keep + n_t, ch, n_s, 1 };
+    const std::array<int64_t, 4> ne_k = { n_keep, ch, n_s, 1 };
+    const std::array<int64_t, 4> ne_x = { n_t, ch, n_s, 1 };
+    if (!std::equal(ne_c.begin(), ne_c.end(), concat->ne) || !std::equal(ne_k.begin(), ne_k.end(), keep->ne) ||
+        !std::equal(ne_x.begin(), ne_x.end(), xnew->ne) || keep->nb[0] != sizeof(float)) {
+        return refuse("shape");
+    }
+    if ((concat->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_cuda_gdn_state_read_uses(cgraph, concat) < 1) {
+        return refuse("concat is an output / no use counts");
+    }
+
+    m.concat_idx = -1;
+    for (int j = conv_idx - 1; j >= 0; --j) {
+        if (cgraph->nodes[j] == concat) {
+            m.concat_idx = j;
+            break;
+        }
+    }
+    if (m.concat_idx < 0) {
+        return refuse("concat not in this graph");
+    }
+
+    const int64_t row_count = n_keep * ch;
+    // a window: [d_conv-1, ch, n_seqs] view of the concat at column s_idx, read once
+    auto window_col = [&](const ggml_tensor * v) -> int {
+        if (v == nullptr || v->op != GGML_OP_VIEW || v->view_src != concat || v->type != GGML_TYPE_F32 ||
+            v->ne[0] != n_keep || v->ne[1] != ch || v->ne[2] != n_s || v->ne[3] != 1 ||
+            v->nb[0] != sizeof(float) || v->nb[1] != concat->nb[1] || v->nb[2] != concat->nb[2] ||
+            v->view_offs % sizeof(float) != 0 || (v->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+            ggml_cuda_gdn_state_read_uses(cgraph, v) != 1) {
+            return -1;
+        }
+        const int64_t col = (int64_t) (v->view_offs / sizeof(float));
+        return col <= n_t ? (int) col : -1;
+    };
+    auto sink = [&](const ggml_tensor * t) {
+        return !(t->flags & GGML_TENSOR_FLAG_OUTPUT) && ggml_cuda_gdn_state_read_uses(cgraph, t) == 0;
+    };
+
+    int n_views = 0;
+    m.n_win = 0;
+    m.skip.clear();
+    m.between.clear();
+    m.skip.push_back(m.concat_idx);
+    std::vector<std::pair<const ggml_tensor *, int>> conts; // CONT waiting for its SET_ROWS, window column
+    for (int j = m.concat_idx + 1; j < conv_idx; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (n->op == GGML_OP_VIEW && n->view_src == concat) {
+            if (window_col(n) < 0) {
+                return refuse("concat view is not a snapshot window");
+            }
+            n_views++;
+            continue;
+        }
+        if (ggml_cuda_is_view_or_noop(n) || (n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+        const int col = n->op == GGML_OP_CPY || n->op == GGML_OP_CONT ? window_col(n->src[0]) : -1;
+        if (n->op == GGML_OP_CPY && col >= 0) {
+            const ggml_tensor * d = n->src[1];
+            if (d->type != GGML_TYPE_F32 || d->ne[0] != row_count || d->ne[1] != n_s || d->ne[2] != 1 ||
+                d->ne[3] != 1 || d->nb[0] != sizeof(float) || d->nb[1] % sizeof(float) != 0 || !sink(n)) {
+                return refuse("window copy layout");
+            }
+            if (m.n_win == GGML_CUDA_CONV_RING_MAX_WIN) {
+                return refuse("too many windows");
+            }
+            m.win[m.n_win++] = { d, nullptr, col };
+            m.skip.push_back(j);
+            continue;
+        }
+        if (n->op == GGML_OP_CONT && col >= 0) {
+            if (n->type != GGML_TYPE_F32 || n->ne[0] != row_count || n->ne[1] != n_s || n->ne[2] != 1 ||
+                n->ne[3] != 1 || !ggml_is_contiguous(n) || (n->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+                ggml_cuda_gdn_state_read_uses(cgraph, n) != 1) {
+                return refuse("window cont layout");
+            }
+            conts.push_back({ n, col });
+            m.skip.push_back(j);
+            continue;
+        }
+        if (n->op == GGML_OP_SET_ROWS) {
+            auto it = std::find_if(conts.begin(), conts.end(), [n](const auto & p) { return p.first == n->src[1]; });
+            if (it != conts.end()) {
+                const ggml_tensor * a    = n->src[0];
+                const ggml_tensor * rows = n->src[2];
+                if (a->type != GGML_TYPE_F32 || a->ne[0] != row_count || a->ne[2] != 1 || a->ne[3] != 1 ||
+                    a->nb[0] != sizeof(float) || a->nb[1] % sizeof(float) != 0 ||
+                    rows->type != GGML_TYPE_I32 || rows->ne[0] != n_s || rows->ne[1] != 1 || rows->ne[2] != 1 ||
+                    rows->ne[3] != 1 || rows->nb[0] != sizeof(int32_t) || !sink(n)) {
+                    return refuse("window set_rows layout");
+                }
+                if (m.n_win == GGML_CUDA_CONV_RING_MAX_WIN) {
+                    return refuse("too many windows");
+                }
+                m.win[m.n_win++] = { a, rows, it->second };
+                conts.erase(it);
+                m.skip.push_back(j);
+                continue;
+            }
+        }
+        m.between.push_back(j);
+    }
+    if (!conts.empty()) {
+        return refuse("window cont without its set_rows");
+    }
+    // every reader of the concat is accounted for: the windows (each consumed above) and the ssm_conv
+    if (ggml_cuda_gdn_state_read_uses(cgraph, concat) != n_views + 1 || n_views != m.n_win) {
+        return refuse("concat has other readers");
+    }
+
+    m.last_idx = conv_idx;
+    if (conv_idx + 1 < cgraph->n_nodes) {
+        const ggml_tensor * n1 = cgraph->nodes[conv_idx + 1];
+        if (n1->op == GGML_OP_UNARY && ggml_get_unary_op(n1) == GGML_UNARY_OP_SILU && n1->src[0] == conv) {
+            m.last_idx = conv_idx + 1;
+        } else if (n1->op == GGML_OP_ADD && conv_idx + 2 < cgraph->n_nodes) {
+            const ggml_tensor * n2 = cgraph->nodes[conv_idx + 2];
+            if (n2->op == GGML_OP_UNARY && ggml_get_unary_op(n2) == GGML_UNARY_OP_SILU && n2->src[0] == n1) {
+                m.last_idx = conv_idx + 2;
+            }
+        }
+    }
+    m.concat = concat;
+    return true;
+}
+
+// pointer checks of the match (see the list above ggml_cuda_conv_ring_enabled)
+static bool ggml_cuda_conv_ring_check(const ggml_cgraph * cgraph, int conv_idx, ggml_cuda_conv_ring_match & m) {
+    const ggml_tensor * conv = cgraph->nodes[conv_idx];
+    std::vector<const ggml_tensor *> reads  = { m.concat->src[0], m.concat->src[1], conv->src[1] };
+    std::vector<const ggml_tensor *> writes;
+    for (int k = 0; k < m.n_win; ++k) {
+        writes.push_back(m.win[k].dst);
+        if (m.win[k].rows != nullptr) {
+            reads.push_back(m.win[k].rows);
+        }
+    }
+    auto any_overlap = [](const ggml_tensor * t, const std::vector<const ggml_tensor *> & set) {
+        for (const ggml_tensor * u : set) {
+            if (ggml_cuda_gdn_state_read_overlap(t, u)) {
+                return true;
+            }
+        }
+        return false;
+    };
+    for (const ggml_tensor * t : reads) {
+        if (t->data == nullptr || any_overlap(t, writes)) {
+            m.why = "operands overlap the windows";
+            return false;
+        }
+    }
+    for (const ggml_tensor * t : writes) {
+        if (t->data == nullptr) {
+            m.why = "unallocated window";
+            return false;
+        }
+    }
+    for (int j = conv_idx; j <= m.last_idx; ++j) {
+        const ggml_tensor * out = cgraph->nodes[j];
+        if (out->data == nullptr || any_overlap(out, reads) || any_overlap(out, writes)) {
+            m.why = "ssm_conv output overlaps its operands";
+            return false;
+        }
+    }
+    for (int j : m.between) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (n->data == nullptr || any_overlap(n, reads) || any_overlap(n, writes)) {
+            m.why = "a node in between writes the operands or the windows";
+            return false;
+        }
+        for (int si = 0; si < GGML_MAX_SRC; ++si) {
+            if (n->src[si] != nullptr && n->src[si]->data != nullptr && any_overlap(n->src[si], writes)) {
+                m.why = "a node in between reads the windows";
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+// fills cuda_ctx->conv_rings and marks the nodes the planned ssm_conv launches replace
+static void ggml_cuda_conv_ring_plan(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph,
+                                     std::vector<uint8_t> & skip) {
+    cuda_ctx->conv_rings.clear();
+    skip.clear();
+
+    static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
+    if (disable_fusion || !ggml_cuda_conv_ring_enabled()) {
+        return;
+    }
+
+    int          n_seen = 0;
+    int          n_t_hist[GGML_CUDA_CONV_RING_MAX_T + 1] = {};
+    const char * why    = nullptr;
+    int          n_why  = 0;
+    ggml_cuda_conv_ring_match m;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * conv = cgraph->nodes[i];
+        if (conv->op != GGML_OP_SSM_CONV || (conv->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+        n_seen++;
+        if (!ggml_cuda_conv_ring_match_at(cgraph, i, m) || !ggml_cuda_conv_ring_check(cgraph, i, m)) {
+            why = why != nullptr ? why : m.why;
+            n_why++;
+            continue;
+        }
+
+        ggml_backend_cuda_context::conv_ring_entry e;
+        e.conv           = conv;
+        e.args.state     = (const float *) m.concat->src[0]->data;
+        e.args.state_nb1 = (int64_t) m.concat->src[0]->nb[1];
+        e.args.state_nb2 = (int64_t) m.concat->src[0]->nb[2];
+        e.args.x         = (const float *) m.concat->src[1]->data;
+        e.args.x_nb0     = (int64_t) m.concat->src[1]->nb[0];
+        e.args.x_nb1     = (int64_t) m.concat->src[1]->nb[1];
+        e.args.x_nb2     = (int64_t) m.concat->src[1]->nb[2];
+        e.args.n_win     = m.n_win;
+        for (int k = 0; k < m.n_win; ++k) {
+            ggml_cuda_conv_ring_window & w = e.args.win[k];
+            w.dst        = (float *) m.win[k].dst->data;
+            w.rows       = m.win[k].rows != nullptr ? (const int32_t *) m.win[k].rows->data : nullptr;
+            w.row_stride = (int64_t) (m.win[k].dst->nb[1] / sizeof(float));
+            w.s_idx      = m.win[k].s_idx;
+        }
+        cuda_ctx->conv_rings.push_back(e);
+
+        if (skip.empty()) {
+            skip.assign(cgraph->n_nodes, 0);
+        }
+        for (int j : m.skip) {
+            skip[j] = 1;
+        }
+        n_t_hist[conv->ne[1]]++;
+    }
+
+    if (ggml_cuda_conv_ring_log_enabled() && n_seen > 0) {
+        static std::atomic<int64_t> n_eval{0};
+        const int64_t ev = ++n_eval;
+        // every evaluation up to 64, then powers of two: CUDA graph replays do not re-plan, eager runs do
+        if (ev <= 64 || (ev & (ev - 1)) == 0) {
+            std::string widths;
+            for (int t = 1; t <= GGML_CUDA_CONV_RING_MAX_T; ++t) {
+                if (n_t_hist[t] > 0) {
+                    widths += " w" + std::to_string(t) + "=" + std::to_string(n_t_hist[t]);
+                }
+            }
+            GGML_LOG_WARN("ggml_cuda: [SF convring] eval %lld: planned %d of %d ssm_conv%s%s%s\n", (long long) ev,
+                          (int) cuda_ctx->conv_rings.size(), n_seen, widths.c_str(),
+                          n_why > 0 ? ", first refusal: " : "", n_why > 0 ? why : "");
+        }
+    }
+}
+
+// every planned ssm_conv must have run the ring kernel: a skipped CONCAT whose reader did not would leave it unread
+static void ggml_cuda_conv_ring_finish(ggml_backend_cuda_context * cuda_ctx) {
+    for (const auto & e : cuda_ctx->conv_rings) {
+        if (!e.used) {
+            GGML_ABORT("[#110] ssm_conv %s skipped its concat and windows but did not run the conv ring kernel",
+                       e.conv->name);
+        }
+    }
+    cuda_ctx->conv_rings.clear();
+}
+
 static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int node_idx, ggml_cuda_topk_moe_args & args) {
     args.sigmoid         = false;
     args.sqrt_softplus   = false;
@@ -7012,10 +7369,14 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             // [#87] GET_ROWS state gathers the gated_delta_net launches replace (see ggml_cuda_gdn_state_read_plan)
             std::vector<uint8_t> gdn_state_read_skip;
+            // [#110] CONCAT and snapshot-window nodes the conv ring ssm_conv launches replace (ggml_cuda_conv_ring_plan)
+            std::vector<uint8_t> conv_ring_skip;
             if (should_launch_concurrent_events) {
                 cuda_ctx->gdn_state_reads.clear();
+                cuda_ctx->conv_rings.clear();
             } else {
                 ggml_cuda_gdn_state_read_plan(cuda_ctx, cgraph, gdn_state_read_skip);
+                ggml_cuda_conv_ring_plan(cuda_ctx, cgraph, conv_ring_skip);
             }
 
             for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -7061,6 +7422,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
 
                 if (!gdn_state_read_skip.empty() && gdn_state_read_skip[i]) {
+                    continue;
+                }
+
+                if (!conv_ring_skip.empty() && conv_ring_skip[i]) {
                     continue;
                 }
 
@@ -7129,6 +7494,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             }
 
             ggml_cuda_gdn_state_read_finish(cuda_ctx);
+            ggml_cuda_conv_ring_finish(cuda_ctx);
         }
 
 #ifdef USE_CUDA_GRAPH
@@ -7458,6 +7824,25 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             params->add_alloc_dep(params->user_data, G->src[1], cgraph->nodes[i]);
             if (G->src[0]->data == nullptr) {
                 params->add_alloc_dep(params->user_data, G->src[0], cgraph->nodes[i]);
+            }
+        }
+    }
+
+    // [#110] a planned ssm_conv reads the CONCAT operands and the window row indices at its own position: keep them
+    // allocated until its last fused node (the eval-time plan re-checks with pointers and falls back otherwise)
+    if (!disable_fusion && ggml_cuda_conv_ring_enabled()) {
+        ggml_cuda_conv_ring_match m;
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            if (cgraph->nodes[i]->op != GGML_OP_SSM_CONV || !ggml_cuda_conv_ring_match_at(cgraph, i, m)) {
+                continue;
+            }
+            ggml_tensor * until = cgraph->nodes[m.last_idx];
+            params->add_alloc_dep(params->user_data, m.concat->src[0], until);
+            params->add_alloc_dep(params->user_data, m.concat->src[1], until);
+            for (int k = 0; k < m.n_win; ++k) {
+                if (m.win[k].rows != nullptr) {
+                    params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(m.win[k].rows), until);
+                }
             }
         }
     }
@@ -8715,6 +9100,9 @@ int64_t ggml_backend_cuda_fusion_count(ggml_backend_t backend, const char * name
     }
     if (strcmp(name, "gdn_state_read") == 0) {
         return ctx->fusion_stats.gdn_state_read;
+    }
+    if (strcmp(name, "conv_ring") == 0) {
+        return ctx->fusion_stats.conv_ring;
     }
     if (strcmp(name, "add_rms") == 0) {
         return ctx->fusion_stats.add_rms;

@@ -1503,6 +1503,31 @@ struct ggml_cuda_stream_context {
     }
 };
 
+// [#110 SF fold 2] GGML_VL_SF_CONVRING: ssm_conv reads its conv input straight from the two CONCAT operands
+// (kept conv-state columns and the new rows) and writes the conv-state snapshot windows itself, so the CONCAT
+// and the window CPY / CONT+SET_ROWS nodes are not launched (ggml_cuda_conv_ring_plan, ggml-cuda.cu).
+#define GGML_CUDA_CONV_RING_MAX_T   8  // widest ubatch (tokens per sequence) the fused kernel takes
+#define GGML_CUDA_CONV_RING_MAX_WIN 8  // snapshot windows per ssm_conv
+
+struct ggml_cuda_conv_ring_window {
+    float *         dst        = nullptr; // static copy: sequence 0's row; ring: row 0 of the cache matrix
+    const int32_t * rows       = nullptr; // ring: cache row of each sequence (set_rows indices); nullptr: static
+    int64_t         row_stride = 0;       // floats: static, between sequences; ring, between cache rows
+    int             s_idx      = 0;       // first conv-input column of the window
+};
+
+struct ggml_cuda_conv_ring_args {
+    const float * state    = nullptr;     // CONCAT src0: kept columns [d_conv - 1, channels, n_seqs], nb0 == 4
+    int64_t       state_nb1 = 0;          // bytes
+    int64_t       state_nb2 = 0;
+    const float * x        = nullptr;     // CONCAT src1: new rows [n_t, channels, n_seqs], any strides
+    int64_t       x_nb0    = 0;           // bytes
+    int64_t       x_nb1    = 0;
+    int64_t       x_nb2    = 0;
+    int           n_win    = 0;
+    ggml_cuda_conv_ring_window win[GGML_CUDA_CONV_RING_MAX_WIN]; // in graph order: a later window wins a shared address
+};
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1598,6 +1623,7 @@ struct ggml_backend_cuda_context {
         int64_t add_rms       = 0;   // fused ADD + RMS_NORM + MUL runs (ggml_cuda_op_add_rms_norm_mul) [#46]
         int64_t add_rms_q8    = 0;   // ... of which also prefilled the q8_1 cache for the next MMVQ consumer
         int64_t exl3_ffn_bridge = 0; // EXL3 gate/up -> SwiGLU -> down runs through ggml_cuda_exl3_ffn_bridge [#74]
+        int64_t conv_ring     = 0;   // ssm_conv launches that read the CONCAT operands and wrote the windows [#110]
     } fusion_stats;
     // Landing slots for paged-in experts. One slab per expert tensor, n_slots experts wide; the
     // address table is pointed at a slot instead of at the expert's home address once it is copied.
@@ -1634,6 +1660,15 @@ struct ggml_backend_cuda_context {
         bool                used       = false;
     };
     std::vector<gdn_state_read_entry> gdn_state_reads;
+
+    // [#110 SF fold 2] ssm_conv nodes of the graph being evaluated that run the conv-ring kernel. Filled by
+    // ggml_cuda_conv_ring_plan at the start of each evaluation, cleared at its end.
+    struct conv_ring_entry {
+        const ggml_tensor *      conv = nullptr;
+        ggml_cuda_conv_ring_args args;
+        bool                     used = false;
+    };
+    std::vector<conv_ring_entry> conv_rings;
 
 #ifdef USE_CUDA_GRAPH
     std::unordered_map<uint64_t, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
