@@ -5568,6 +5568,214 @@ struct test_gated_delta_net_state_read : public test_case {
     }
 };
 
+// [#110] GET_ROWS(conv cache, s_copy) -> RESHAPE, TRANSPOSE(qkv) -> CONCAT -> snapshot windows (ring: CONT +
+// SET_ROWS per window; static: CPY per window) -> SSM_CONV -> SILU, as build_conv_state + the qwen35 GDN layer
+// emit it. With GGML_VL_SF_CONVRING=1 the CUDA backend skips the CONCAT and the window nodes and the ssm_conv
+// reads the two CONCAT operands and writes the windows itself (counter "conv_ring"). The graph also carries an
+// unfused copy of the same pattern on its own cache (its CONCAT is a graph output, which refuses the fold), and the
+// checked nodes are the differences fused - unfused of the conv output and of the whole cache after both wrote it:
+// each must be exactly zero (byte identity on the tested backend), next to the usual CPU comparison of the output.
+struct test_conv_ring : public test_case {
+    enum window_mode { WM_RING = 0, WM_STATIC = 1 };
+
+    const int64_t channels;
+    const int64_t n_t;
+    const int64_t n_s;
+    const int64_t K;
+    const int     wmode;               // window_mode
+    const int64_t rollback;            // GET_ROWS reads cache plane `rollback` (the conv_rollback view)
+    const std::vector<int32_t> src_rows;  // s_copy: row of that plane each sequence reads
+    const std::vector<int32_t> dst_rows;  // WM_RING: cache row per (window, sequence), window-major; WM_STATIC: { kv_head }
+    const bool    reader_between;      // a GET_ROWS of the cache between the windows and the ssm_conv (must refuse)
+    const bool    expect_fusion;
+
+    static constexpr int64_t d_conv   = 4;
+    static constexpr int64_t mem_size = 4;  // cache rows per plane
+
+    std::vector<ggml_tensor *> check_nodes;
+    ggml_tensor * cache     = nullptr;
+    ggml_tensor * cache_ref = nullptr;
+
+    static std::string rows_str(const std::vector<int32_t> & r) {
+        std::string s = "[";
+        for (size_t i = 0; i < r.size(); ++i) {
+            s += (i ? "," : "") + std::to_string(r[i]);
+        }
+        return s + "]";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR8(channels, n_t, n_s, K, wmode, rollback, reader_between, expect_fusion) +
+               ",src_rows=" + rows_str(src_rows) + ",dst_rows=" + rows_str(dst_rows);
+    }
+
+    test_conv_ring(int64_t channels, int64_t n_t, int64_t n_s, int64_t K, int wmode, int64_t rollback,
+                   std::vector<int32_t> src_rows, std::vector<int32_t> dst_rows,
+                   bool reader_between = false, bool expect_fusion = true)
+        : channels(channels), n_t(n_t), n_s(n_s), K(K), wmode(wmode), rollback(rollback),
+          src_rows(std::move(src_rows)), dst_rows(std::move(dst_rows)),
+          reader_between(reader_between), expect_fusion(expect_fusion) {}
+
+    int64_t n_written() const { return std::min<int64_t>(n_t, K); }
+
+    // one copy of the layer's conv pattern on `all`; returns the SILU output, sets *concat_out
+    ggml_tensor * build_pattern(ggml_context * ctx, ggml_tensor * all, ggml_tensor * s_copy, ggml_tensor * qkv,
+                                ggml_tensor * weight, const std::vector<ggml_tensor *> & rows,
+                                bool with_reader, ggml_tensor ** concat_out, ggml_tensor ** reader_out) {
+        const int64_t row_count = (d_conv - 1) * channels;
+        const size_t  row_size  = ggml_row_size(GGML_TYPE_F32, row_count);
+
+        ggml_tensor * src = ggml_view_2d(ctx, all, row_count, mem_size, all->nb[1], (size_t) rollback * mem_size * all->nb[1]);
+        ggml_tensor * keep = ggml_reshape_3d(ctx, ggml_get_rows(ctx, src, s_copy), d_conv - 1, channels, n_s);
+        ggml_tensor * conv_input = ggml_concat(ctx, keep, ggml_transpose(ctx, qkv), 0);
+        *concat_out = conv_input;
+
+        const int64_t nw = n_written();
+        if (wmode == WM_RING) {
+            ggml_tensor * states2d = ggml_reshape_2d(ctx, all, row_count, all->ne[1]);
+            for (int64_t j = 0; j < nw; ++j) {
+                const int64_t s_idx = n_t - (nw - 1) + j;
+                ggml_tensor * win = ggml_view_3d(ctx, conv_input, d_conv - 1, channels, n_s,
+                                                 conv_input->nb[1], conv_input->nb[2], ggml_row_size(GGML_TYPE_F32, s_idx));
+                win = ggml_cont_2d(ctx, win, row_count, n_s);
+                ggml_build_forward_expand(gf, ggml_set_rows(ctx, states2d, win, rows[j]));
+            }
+        } else {
+            const int64_t kv_head = dst_rows[0];
+            for (int64_t t = K - nw + 1; t <= K; ++t) {
+                const int64_t s_idx  = n_t - K + t;
+                const int64_t s_slot = K - t;
+                ggml_tensor * win = ggml_view_3d(ctx, conv_input, d_conv - 1, channels, n_s,
+                                                 conv_input->nb[1], conv_input->nb[2], ggml_row_size(GGML_TYPE_F32, s_idx));
+                ggml_tensor * upd = ggml_view_2d(ctx, all, row_count, n_s, all->nb[1], (s_slot * mem_size + kv_head) * row_size);
+                ggml_build_forward_expand(gf, ggml_cpy(ctx, win, upd));
+            }
+        }
+
+        if (with_reader) {
+            // reads every cache row the windows may have written, after them in graph order
+            ggml_tensor * all_rows = ggml_view_2d(ctx, all, row_count, all->ne[1], all->nb[1], 0);
+            *reader_out = ggml_get_rows(ctx, all_rows, s_copy);
+            ggml_set_name(*reader_out, "reader_between");
+            ggml_build_forward_expand(gf, *reader_out);
+        }
+
+        return ggml_silu(ctx, ggml_ssm_conv(ctx, conv_input, weight));
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t row_count = (d_conv - 1) * channels;
+        const int64_t n_rows    = K * mem_size;
+        const int64_t nw        = n_written();
+        GGML_ASSERT((int64_t) src_rows.size() == n_s);
+        GGML_ASSERT(wmode == WM_RING ? (int64_t) dst_rows.size() == nw * n_s : dst_rows.size() == 1);
+
+        check_nodes.clear();
+
+        cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, row_count, n_rows);
+        ggml_set_name(cache, "conv_cache");
+        cache_ref = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, row_count, n_rows);
+        ggml_set_name(cache_ref, "conv_cache_ref");
+        ggml_tensor * s_copy = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_s);
+        ggml_set_name(s_copy, "s_copy");
+        ggml_tensor * qkv = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, channels, n_t, n_s);
+        ggml_set_name(qkv, "qkv");
+        ggml_tensor * weight = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, channels);
+        ggml_set_name(weight, "conv_weight");
+        std::vector<ggml_tensor *> rows;
+        if (wmode == WM_RING) {
+            for (int64_t j = 0; j < nw; ++j) {
+                rows.push_back(ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_s));
+                ggml_set_name(rows.back(), ("ring_rows_" + std::to_string(j)).c_str());
+            }
+        }
+
+        // the unfused copy first: its windows land in cache_ref, its CONCAT is an output (the fold refuses it)
+        ggml_tensor * concat_ref = nullptr;
+        ggml_tensor * reader_ref = nullptr;
+        ggml_tensor * out_ref = build_pattern(ctx, cache_ref, s_copy, qkv, weight, rows, false, &concat_ref, &reader_ref);
+        ggml_set_output(concat_ref);
+        ggml_build_forward_expand(gf, out_ref);
+
+        ggml_tensor * concat = nullptr;
+        ggml_tensor * reader = nullptr;
+        ggml_tensor * out = build_pattern(ctx, cache, s_copy, qkv, weight, rows, reader_between, &concat, &reader);
+        ggml_set_name(out, "conv_out");
+        ggml_build_forward_expand(gf, out);
+
+        // after both patterns wrote their caches
+        ggml_tensor * d_out   = ggml_sub(ctx, out, out_ref);
+        ggml_tensor * d_cache = ggml_sub(ctx, cache, cache_ref);
+        ggml_set_name(d_out, "diff_out");
+        ggml_set_name(d_cache, "diff_cache");
+
+        check_nodes.push_back(out);
+        check_nodes.push_back(d_out);
+        check_nodes.push_back(d_cache);
+        ggml_tensor * total = ggml_add(ctx, ggml_add(ctx, ggml_sum(ctx, out), ggml_sum(ctx, d_out)), ggml_sum(ctx, d_cache));
+        if (reader != nullptr) {
+            check_nodes.push_back(reader);
+            total = ggml_add(ctx, total, ggml_sum(ctx, reader));
+        }
+        return total;
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "CONV_RING";
+    }
+
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return check_nodes; }
+
+    static bool conv_ring_on() {
+        const char * e = getenv("GGML_VL_SF_CONVRING");
+        if (e != nullptr) {
+            return atoi(e) != 0;
+        }
+        const char * u = getenv("GGML_VL_SF");
+        return u != nullptr && atoi(u) != 0;
+    }
+    const char * required_fusion() override { return expect_fusion && conv_ring_on() ? "conv_ring" : nullptr; }
+    const char * forbidden_fusion() override { return expect_fusion && conv_ring_on() ? nullptr : "conv_ring"; }
+
+    // the diff nodes are exactly zero on the reference backend: any nonzero (or NaN) element on the tested one
+    // is a byte mismatch between the fused and the unfused path and counts as an error
+    double err(const float * a, const float * b, size_t n) override {
+        bool ref_zero = true;
+        for (size_t i = 0; i < n && ref_zero; ++i) {
+            ref_zero = b[i] == 0.0f;
+        }
+        if (!ref_zero) {
+            return nmse(a, b, n);
+        }
+        size_t n_diff = 0;
+        for (size_t i = 0; i < n; ++i) {
+            n_diff += a[i] != 0.0f;
+        }
+        return (double) n_diff;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op) || t == cache_ref) {
+                continue;
+            }
+            if (strcmp(t->name, "s_copy") == 0) {
+                ggml_backend_tensor_set(t, src_rows.data(), 0, ggml_nbytes(t));
+            } else if (strncmp(t->name, "ring_rows_", 10) == 0) {
+                const int j = atoi(t->name + 10);
+                ggml_backend_tensor_set(t, dst_rows.data() + j * n_s, 0, ggml_nbytes(t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+        std::vector<uint8_t> bytes(ggml_nbytes(cache));
+        ggml_backend_tensor_get(cache, bytes.data(), 0, bytes.size());
+        ggml_backend_tensor_set(cache_ref, bytes.data(), 0, bytes.size());
+    }
+};
+
 // GGML_OP_GATED_LINEAR_ATTN
 struct test_gla : public test_case {
     const ggml_type type;
@@ -13966,6 +14174,28 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new t(4, 32, 2, 1, 2, t::CW_SET_ROWS, { 3 }, { 7, 11 }));
         test_cases.emplace_back(new t(4, 64, 2, 2, 1, t::CW_NONE, { 3, 0 }, {}, false, true));
         test_cases.emplace_back(new t(4, 64, 4, 1, 4, t::CW_NONE, { 3 }, {}, false, false, 1));
+    }
+
+    // [#110] conv ring read in place (GGML_VL_SF_CONVRING=1 folds CONCAT + windows into the ssm_conv on CUDA).
+    // cache: K planes of 4 cells, row = plane * 4 + cell; checks fused == unfused bytes for output and cache.
+    {
+        using t = test_conv_ring;
+        // production shape (10240 channels, K 5): w1 on the ring, w5 static (slot 0 is the source row)
+        test_cases.emplace_back(new t(10240, 1, 1, 5, t::WM_RING,   0, { 1 }, { 5 }));
+        test_cases.emplace_back(new t(10240, 5, 1, 5, t::WM_STATIC, 0, { 1 }, { 1 }));
+        // rollback: the source is plane 2 (conv_rollback view), the last window rewrites that same row
+        test_cases.emplace_back(new t(256, 3, 1, 5, t::WM_RING, 2, { 1 }, { 13, 5, 9 }));
+        // in place: the w1 window rewrites the row the gather read
+        test_cases.emplace_back(new t(256, 1, 1, 5, t::WM_RING, 0, { 1 }, { 1 }));
+        // two sequences whose rows swap
+        test_cases.emplace_back(new t(256, 2, 2, 5, t::WM_RING, 0, { 2, 1 }, { 1, 2, 6, 5 }));
+        test_cases.emplace_back(new t(256, 4, 2, 5, t::WM_STATIC, 0, { 3, 2 }, { 2 }));
+        // widest ubatch (8 windows at K 8), K 1 (n_rs_seq 0: one window at column n_t)
+        test_cases.emplace_back(new t(256, 8, 1, 8, t::WM_STATIC, 0, { 1 }, { 1 }));
+        test_cases.emplace_back(new t(256, 1, 1, 1, t::WM_STATIC, 0, { 1 }, { 1 }));
+        // guards: a cache reader between the windows and the ssm_conv, and a 9-token ubatch, must refuse
+        test_cases.emplace_back(new t(256, 1, 1, 5, t::WM_RING, 0, { 1 }, { 5 }, true, false));
+        test_cases.emplace_back(new t(256, 9, 1, 5, t::WM_STATIC, 0, { 1 }, { 1 }, false, false));
     }
 
 #if 0
