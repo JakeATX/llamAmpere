@@ -1,14 +1,16 @@
 > **llamAmpere** (v0.4): this fork runs Qwen3.8-27B on one RTX 3090 / 3090 Ti with the model's own MTP head. New kernels make verifying 5 to 8 tokens per step cheaper, so the MTP drafter now proposes 4 tokens per step by default: +6.70% tokens/s over the v0.3.1 build running the same depth-4 flags. An adaptive depth 3-4 is available as an option. The drafter is now on by default for Qwen3.8 GGUFs that carry the MTP head, and its KV cache follows `-ctk`/`-ctv`. v0.4 also adds a 5-bit key cache type (`turbo5`) with fused attention for turbo4 values, an n-gram drafter for cards where the MTP head does not fit, faster prefill for ternary PTQ1_0 models, and a catch-up to llama.cpp master `a25c9865f`. Against the numbers v0.3.1 published, the release tree decodes 104.28 tok/s on the same fixtures (99.4, +4.9%) and 103.09 tok/s at 100K KV depth (93.16, +10.7%), and runs a 262,144-token context under the 23 GB cap. Unless noted, v0.4 numbers are from an RTX 3090 Ti at 350 W on the coding / agentic / rag ship corpus (real task histories): temperature 1.0, reasoning effort medium, 3 seeds, 10K-27K generated tokens per answer, whole-card VRAM at or under 23 GB. G is the weighted tokens/s gain 0.4 coding + 0.4 agentic + 0.2 rag, and ± is two standard errors over the seeds.
 
+**v0.4.1** brings the tree even with TheTom's TurboQuant `tqp-v0.4.0`: [docs/llamampere-v0.4.1/RELEASE_NOTES.md](docs/llamampere-v0.4.1/RELEASE_NOTES.md).
+
 **v0.4 release notes**, with what is new and recommended settings for 24 GB cards: [docs/llamampere-v0.4/RELEASE_NOTES.md](docs/llamampere-v0.4/RELEASE_NOTES.md).
 
 **From v0.3.1, all still in this tree** (numbers measured on v0.3.1; [release notes](docs/llamampere-v0.3.1/RELEASE_NOTES.md)): up to 245K context; 99 tok/s on clean agentic and coding fixtures at temperature 1 (1.46x stock llama.cpp, 1.28x v0.2), 93 tok/s at 100K KV depth, and 1.10x tuned vLLM single-stream at 32K. **EXL3** (Turboderp's exllamav3 trellis format) as GGUF-native types with an SM86 decode kernel: 82 tok/s at a 20K prompt and 74 at 50K with the MTP head on Qwen3.8-27B at 4.0 bpw, and the same 81-82 tok/s at 3.5 bpw and 80.7 at 3.0 bpw from files of 12.3 and 10.9 GiB ([docs/exl3.md](docs/exl3.md)). **Ternary Bonsai 2 27B** from Prism ML at 1.75 and 2.125 bits per weight, 105 tok/s with the MTP drafter at 16K on the 2.125-bit container ([docs/bonsai2.md](docs/bonsai2.md)). A shared-memory codebook for IQ3 decode (opt-in in v0.3.1, the SM86 default in v0.4). A full upstream catch-up (llama.cpp master `b49650adb` and TurboQuant `407f3237b`, 772 commits ahead of the v0.3 base). **Agnes 3.0 Flash** loads with its MTP head, which upstream llama.cpp does not ([docs/agnes-3.0-flash.md](docs/agnes-3.0-flash.md)).
 
-**Build and run (v0.4, one RTX 3090 / 3090 Ti, 262,144-token context).** Needs Linux, an NVIDIA card with 24 GB (RTX 3090 / 3090 Ti), the CUDA toolkit (tested with 12.4), CMake, git and a C++
+**Build and run (v0.4.1, one RTX 3090 / 3090 Ti, 262,144-token context).** Needs Linux, an NVIDIA card with 24 GB (RTX 3090 / 3090 Ti), the CUDA toolkit (tested with 12.4), CMake, git and a C++
 compiler. Paste into a terminal; the model download is 15.6 GB.
 
 ```bash
-git clone -b v0.4 https://github.com/JakeATX/llamAmpere.git
+git clone -b v0.4.1 https://github.com/JakeATX/llamAmpere.git
 cd llamAmpere
 cmake -S . -B build-sm86 -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86
 cmake --build build-sm86 -j8 --target llama-server
