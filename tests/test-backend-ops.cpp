@@ -10507,6 +10507,10 @@ struct test_generic_op : public test_case {
         ggml_tensor * out;
         if (inplace && source_count > 0) {
             out = ggml_view_tensor(ctx, source_tensors[0]);
+        } else if (op == GGML_OP_CPY && source_count > 1) {
+            // ggml_cpy returns a view of its destination src[1]; CUDA writes into src[1], CPU into the node,
+            // so a standalone out tensor made the two backends disagree whenever out held non-zero init data.
+            out = ggml_view_tensor(ctx, source_tensors[1]);
         } else {
             out = ggml_new_tensor_4d(ctx, type, ne[0], ne[1], ne[2], ne[3]);
         }
