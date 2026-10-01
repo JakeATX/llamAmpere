@@ -1636,9 +1636,9 @@ struct test_case {
         };
         const int64_t replay_before = check_replay ? graph_replays() : 0;
         const auto attention_routes = [] {
-            std::array<int64_t, 4> counts = {};
+            std::array<int64_t, 6> counts = {};
             ggml_ledger_foreach([](const char * site, const char * key, int64_t count, void * data) {
-                auto & routes = *static_cast<std::array<int64_t, 4> *>(data);
+                auto & routes = *static_cast<std::array<int64_t, 6> *>(data);
                 if (strcmp(site, "cuda.fattn.early_v") == 0) {
                     routes[0] += count;
                 } else if (strcmp(site, "cuda.fattn") == 0 && strncmp(key, "path=q5g6_compact32 ", 20) == 0) {
@@ -1646,11 +1646,15 @@ struct test_case {
                 } else if (strcmp(site, "cuda.fattn.fixup") == 0) {
                     routes[2] += strcmp(key, "q5g6_uniform") == 0 ? count : 0;
                     routes[3] += strcmp(key, "q5g6_general") == 0 ? count : 0;
+                } else if (strcmp(site, "cuda.fattn") == 0 && strncmp(key, "path=slowkv_wide88 ", 19) == 0) {
+                    routes[4] += count; // GGML_SLOWKV turbo4/tq6_0 widths 5-8 on the fused (8,8) tile
+                } else if (strcmp(site, "cuda.fattn") == 0 && strncmp(key, "path=slowkv_q5_1 ", 17) == 0) {
+                    routes[5] += count; // GGML_SLOWKV q8_0 K / q5_1 V on the fused tiles
                 }
             }, &counts);
             return counts;
         };
-        const auto routes_before = check_replay ? attention_routes() : std::array<int64_t, 4>{};
+        const auto routes_before = check_replay ? attention_routes() : std::array<int64_t, 6>{};
         bool cmp_ok = true;
         for (int round = 0; round < (replay ? 4 : 1); ++round) {
             // Keep graph shapes and pointers fixed while changing inputs between replays.
@@ -1665,9 +1669,10 @@ struct test_case {
             const int64_t count = graph_replays() - replay_before;
             const auto routes_after = attention_routes();
             printf("[FLASH_ATTN_EXT] REPLAY=%" PRId64 " (%s)\n", count, vars().c_str());
-            printf("[FLASH_ATTN_EXT] ROUTES=%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 " (%s)\n",
+            printf("[FLASH_ATTN_EXT] ROUTES=%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 " (%s)\n",
                    routes_after[0] - routes_before[0], routes_after[1] - routes_before[1],
-                   routes_after[2] - routes_before[2], routes_after[3] - routes_before[3], vars().c_str());
+                   routes_after[2] - routes_before[2], routes_after[3] - routes_before[3],
+                   routes_after[4] - routes_before[4], routes_after[5] - routes_before[5], vars().c_str());
             cmp_ok = count >= 2 && cmp_ok;
         }
 
@@ -13818,24 +13823,31 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // SLOWKV (GGML_SLOWKV): the same verify-width coverage for the other fused D256 pairs. Width 5 takes the compact
-    // tile when the switch is on; kv 1057, no mask, softcap/sinks and nr23 [6,2] cover the fallbacks and nh 13/59 the
-    // Stream-K fixups. The route counters (GGML_TEST_BACKEND_REPLAY) prove which cases took the compact tile.
-    for (const ggml_type type_KV : {GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_0, GGML_TYPE_TQ6_0}) {
+    // tile when the switch is on, turbo4/tq6_0 widths 5-8 otherwise the fused (8,8) tile, q8_0/q5_1 the fused tiles at
+    // every width; kv 1057, no mask, softcap/sinks and nr23 [6,2] cover the fallbacks and nh 13/59 the Stream-K
+    // fixups. The route counters (GGML_TEST_BACKEND_REPLAY) prove which cases took which route.
+    for (const auto & types : {std::pair{GGML_TYPE_Q8_0, GGML_TYPE_Q8_0}, std::pair{GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0},
+                               std::pair{GGML_TYPE_TQ6_0, GGML_TYPE_TQ6_0}, std::pair{GGML_TYPE_Q8_0, GGML_TYPE_Q5_1}}) {
+        const ggml_type type_K = types.first;
+        const ggml_type type_V = types.second;
         for (int64_t nb = 1; nb <= 8; ++nb) {
             for (int64_t nh : {4, 13}) {
                 for (int64_t kv : {1024, 1057}) {
-                    test_cases.emplace_back(new test_flash_attn_ext(256, 256, nh, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+                    test_cases.emplace_back(new test_flash_attn_ext(256, 256, nh, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_K, type_V));
                 }
             }
-            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 1024, nb, true, true, 0, 10, GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}));
-            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 1024, nb, false, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
-            test_cases.emplace_back(new test_flash_attn_ext_causal(256, 256, 4, {6, 1}, 1024, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}, false));
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 1024, nb, true, true, 0, 10, GGML_PREC_F32, type_K, type_V, {0, 2, 1, 3}));
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 1024, nb, false, false, 0, 0, GGML_PREC_F32, type_K, type_V));
+            test_cases.emplace_back(new test_flash_attn_ext_causal(256, 256, 4, {6, 1}, 1024, nb, true, false, 0, 0, GGML_PREC_F32, type_K, type_V, {0, 2, 1, 3}, false));
         }
-        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 2}, 1024, 5, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+        for (int64_t nb : {5, 7}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 2}, 1024, nb, true, false, 0, 0, GGML_PREC_F32, type_K, type_V));
+        }
         for (int64_t nh : {4, 59}) {
             for (float softcap : {0.0f, 10.0f}) {
-                test_cases.emplace_back(new test_flash_attn_ext_causal(256, 256, nh, {6, 1}, 8192, 5, true, true, 0, softcap, GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}, false));
+                test_cases.emplace_back(new test_flash_attn_ext_causal(256, 256, nh, {6, 1}, 8192, 5, true, true, 0, softcap, GGML_PREC_F32, type_K, type_V, {0, 2, 1, 3}, false));
             }
+            test_cases.emplace_back(new test_flash_attn_ext_causal(256, 256, nh, {6, 1}, 8192, 8, true, true, 0, 0.0f, GGML_PREC_F32, type_K, type_V, {0, 2, 1, 3}, false));
         }
     }
 
