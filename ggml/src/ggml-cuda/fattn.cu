@@ -2676,18 +2676,24 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
 // has an explicit dispatcher so ONLY those pairs are instantiated (an unguarded ncols1=8/ncols2
 // fallthrough would also instantiate uncompiled cases like (8,4) -> link error).
 
-// SLOWKV: the compact width-5 tile (5 queries x 6 heads in the 32-column (4,8) tile, see fattn-query-layout.cuh) for
-// the non-default fused D256 pairs. GGML_VL_AT_Q5G6 keeps tq5_0/turbo4 alone; GGML_SLOWKV picks these pairs:
-//   unset, empty or "0" = off (routing and kernels exactly as before); "1" or "all" = all three;
-//   otherwise a comma list of q8 (q8_0/q8_0), turbo4 (turbo4_0/turbo4_0), tq6 (tq6_0/tq6_0).
-// q8_0/q8_0 is already fused at widths 1-8 and swaps its (8,8) width-5 tile for the compact one. turbo4/turbo4 and
-// tq6_0/tq6_0 are fused only up to width 4 (no (8,8) instance) and fall to the generic f16 MMA route at width 5, which
-// converts the whole K and V cache to f16 per call; with the switch their width-5 calls take the fused compact tile.
-// Widths 6-8 of those two pairs are unchanged (still generic). The switch is read once per process.
+// SLOWKV: fused routes for the non-default D256 KV pairs on sm86 (GGML_VL_AT_Q5G6 keeps tq5_0/turbo4 alone).
+// GGML_SLOWKV picks the pairs:
+//   unset, empty or "0" = off (routing and kernels exactly as before); "1" or "all" = all four;
+//   otherwise a comma list of q8 (q8_0/q8_0), turbo4 (turbo4_0/turbo4_0), tq6 (tq6_0/tq6_0), q5_1 (q8_0 K / q5_1 V).
+// Routes per pair:
+//   - width 5, GQA 6 (compact_applies): the compact tile, 5 queries x 6 heads in the 32-column (4,8) tile (see
+//     fattn-query-layout.cuh). q8_0/q8_0 swaps its (8,8) width-5 tile for it.
+//   - turbo4/turbo4 and tq6_0/tq6_0 widths 5-8 that do not take the compact tile (wide_applies): the fused (8,8) tile.
+//     Without the switch these pairs are fused only up to width 4 and fall to the generic f16 MMA route above it,
+//     which converts the whole K and V cache to f16 per call.
+//   - q8_0/q5_1 widths 1-8 (q5_1_applies): the fused tiles with the q5_1 V loader (flash_attn_ext_q5_1_load_tile)
+//     instead of the generic route (full-cache f16 conversion at every width).
+// The switch is read once per process.
 enum : int {
     GGML_CUDA_SLOWKV_Q8_Q8   = 1,
     GGML_CUDA_SLOWKV_T4_T4   = 2,
     GGML_CUDA_SLOWKV_TQ6_TQ6 = 4,
+    GGML_CUDA_SLOWKV_Q8_Q51  = 8,
 };
 
 static int ggml_cuda_fattn_slowkv_pairs() {
@@ -2697,7 +2703,7 @@ static int ggml_cuda_fattn_slowkv_pairs() {
             return 0;
         }
         if (strcmp(e, "1") == 0 || strcmp(e, "all") == 0) {
-            return GGML_CUDA_SLOWKV_Q8_Q8 | GGML_CUDA_SLOWKV_T4_T4 | GGML_CUDA_SLOWKV_TQ6_TQ6;
+            return GGML_CUDA_SLOWKV_Q8_Q8 | GGML_CUDA_SLOWKV_T4_T4 | GGML_CUDA_SLOWKV_TQ6_TQ6 | GGML_CUDA_SLOWKV_Q8_Q51;
         }
         int m = 0;
         const char * p = e;
@@ -2710,8 +2716,10 @@ static int ggml_cuda_fattn_slowkv_pairs() {
                 m |= GGML_CUDA_SLOWKV_T4_T4;
             } else if (n == 3 && strncmp(p, "tq6", 3) == 0) {
                 m |= GGML_CUDA_SLOWKV_TQ6_TQ6;
+            } else if (n == 4 && strncmp(p, "q5_1", 4) == 0) {
+                m |= GGML_CUDA_SLOWKV_Q8_Q51;
             } else if (n > 0) {
-                GGML_LOG_WARN("GGML_SLOWKV: ignoring unknown pair \"%.*s\" (known: q8, turbo4, tq6, 1, all)\n", (int) n, p);
+                GGML_LOG_WARN("GGML_SLOWKV: ignoring unknown pair \"%.*s\" (known: q8, turbo4, tq6, q5_1, 1, all)\n", (int) n, p);
             }
             p += n;
             if (*p == ',') {
@@ -2725,7 +2733,13 @@ static int ggml_cuda_fattn_slowkv_pairs() {
 
 static bool ggml_cuda_fattn_slowkv_pair(const ggml_type type_K, const ggml_type type_V) {
     const int pairs = ggml_cuda_fattn_slowkv_pairs();
-    if (pairs == 0 || type_K != type_V) {
+    if (pairs == 0) {
+        return false;
+    }
+    if (type_K == GGML_TYPE_Q8_0 && type_V == GGML_TYPE_Q5_1) {
+        return (pairs & GGML_CUDA_SLOWKV_Q8_Q51) != 0;
+    }
+    if (type_K != type_V) {
         return false;
     }
     switch (type_K) {
@@ -2736,14 +2750,11 @@ static bool ggml_cuda_fattn_slowkv_pair(const ggml_type type_K, const ggml_type 
     }
 }
 
-// True when a SLOWKV pair's call takes the compact tile. The fused gate uses it to admit width 5 for turbo4/turbo4 and
-// tq6_0/tq6_0, and the ncols1 == 8 dispatch below uses it to pick the tile, so the two cannot disagree. It repeats the
-// ncols2 switch's use_gqa_opt test so an admitted call always reaches the ncols1 == 8 dispatch (GQA 6 > 4).
-static bool ggml_cuda_fattn_slowkv_compact_applies(const ggml_tensor * dst, const int device) {
-    const ggml_tensor * Q    = dst->src[0];
-    const ggml_tensor * K    = dst->src[1];
-    const ggml_tensor * V    = dst->src[2];
-    const ggml_tensor * mask = dst->src[3];
+// Common SLOWKV preconditions: an enabled pair on a cc 8.6 CUDA device with D256 for Q/K/V.
+static bool ggml_cuda_fattn_slowkv_base(const ggml_tensor * dst, const int device) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
     if (!ggml_cuda_fattn_slowkv_pair(K->type, V->type)) {
         return false;
     }
@@ -2751,16 +2762,18 @@ static bool ggml_cuda_fattn_slowkv_compact_applies(const ggml_tensor * dst, cons
     GGML_UNUSED(device);
     return false;
 #else
-    if (ggml_cuda_info().devices[device].cc != 860) {
-        return false;
-    }
-    if (Q->ne[0] != 256 || K->ne[0] != 256 || V->ne[0] != 256) {
-        return false;
-    }
-    if (Q->ne[1] != 5 || Q->ne[3] != 1 || K->ne[3] != 1 || V->ne[3] != 1 || Q->ne[2] != 6*K->ne[2]) {
-        return false;
-    }
-    if (mask == nullptr || mask->ne[1] < 5 || mask->ne[2] != 1 || mask->ne[3] != 1) {
+    return ggml_cuda_info().devices[device].cc == 860 && Q->ne[0] == 256 && K->ne[0] == 256 && V->ne[0] == 256;
+#endif
+}
+
+// The ncols2 switch's use_gqa_opt test (mask present, no ALiBi, KV a multiple of FATTN_KQ_STRIDE, 16-byte strides on
+// the non-quantized tensors). With GQA > 4 it sends a call to the ncols1 == 8 dispatch.
+static bool ggml_cuda_fattn_slowkv_gqa_opt(const ggml_tensor * dst) {
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * V    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+    if (mask == nullptr) {
         return false;
     }
     float max_bias = 0.0f;
@@ -2779,7 +2792,56 @@ static bool ggml_cuda_fattn_slowkv_compact_applies(const ggml_tensor * dst, cons
         }
     }
     return true;
-#endif
+}
+
+// True when a SLOWKV pair's call takes the compact tile. The fused gate uses it to admit width 5 for turbo4/turbo4 and
+// tq6_0/tq6_0, and the ncols1 == 8 dispatch below uses it to pick the tile, so the two cannot disagree. It repeats the
+// ncols2 switch's use_gqa_opt test so an admitted call always reaches the ncols1 == 8 dispatch (GQA 6 > 4).
+static bool ggml_cuda_fattn_slowkv_compact_applies(const ggml_tensor * dst, const int device) {
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * V    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+    if (!ggml_cuda_fattn_slowkv_base(dst, device)) {
+        return false;
+    }
+    if (Q->ne[1] != 5 || Q->ne[3] != 1 || K->ne[3] != 1 || V->ne[3] != 1 || Q->ne[2] != 6*K->ne[2]) {
+        return false;
+    }
+    if (mask == nullptr || mask->ne[1] < 5 || mask->ne[2] != 1 || mask->ne[3] != 1) {
+        return false;
+    }
+    return ggml_cuda_fattn_slowkv_gqa_opt(dst);
+}
+
+// True when a turbo4/turbo4 or tq6_0/tq6_0 call of width 5-8 takes the fused (8,8) tile: the switch is on for the pair,
+// the call reaches the ncols1 == 8 dispatch (use_gqa_opt, GQA > 4) and the compact tile does not apply. The fused gate
+// admits widths 5-8 for these pairs on this predicate only, and the dispatch picks (8,8) for every admitted width > 4
+// that is not compact, so gate and tile cannot disagree.
+static bool ggml_cuda_fattn_slowkv_wide_applies(const ggml_tensor * dst, const int device) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    if (K->type != V->type || (K->type != GGML_TYPE_TURBO4_0 && K->type != GGML_TYPE_TQ6_0)) {
+        return false;
+    }
+    if (Q->ne[1] < 5 || Q->ne[1] > 8 || !ggml_cuda_fattn_slowkv_base(dst, device)) {
+        return false;
+    }
+    if (Q->ne[2] % K->ne[2] != 0 || Q->ne[2] / K->ne[2] <= 4 || !ggml_cuda_fattn_slowkv_gqa_opt(dst)) {
+        return false;
+    }
+    return !ggml_cuda_fattn_slowkv_compact_applies(dst, device);
+}
+
+// True when a q8_0 K / q5_1 V call of width 1-8 takes the fused tiles (q5_1 V loader). The tile follows the usual
+// GQA-packed dispatch: (2,8)/(4,8) up to width 4, compact at width 5 when compact_applies, (8,8) above.
+static bool ggml_cuda_fattn_slowkv_q5_1_applies(const ggml_tensor * dst, const int device) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    return K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q5_1 && Q->ne[1] >= 1 && Q->ne[1] <= 8 &&
+        ggml_cuda_fattn_slowkv_base(dst, device);
 }
 
 template <int DKQ, int DV, ggml_type type_K, ggml_type type_V>
@@ -2787,11 +2849,20 @@ static void ggml_cuda_flash_attn_ext_mma_turbo_dispatch_ncols1_8(ggml_backend_cu
     const ggml_tensor * Q = dst->src[0];
     // Pack five queries and six heads into the 32-column tile.
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-    if constexpr (DKQ == 256 && DV == 256 && type_K == type_V &&
-                  (type_K == GGML_TYPE_Q8_0 || type_K == GGML_TYPE_TURBO4_0 || type_K == GGML_TYPE_TQ6_0)) {
+    if constexpr (DKQ == 256 && DV == 256 && ((type_K == type_V &&
+                  (type_K == GGML_TYPE_Q8_0 || type_K == GGML_TYPE_TURBO4_0 || type_K == GGML_TYPE_TQ6_0)) ||
+                  (type_K == GGML_TYPE_Q8_0 && type_V == GGML_TYPE_Q5_1))) {
         if (ggml_cuda_fattn_slowkv_compact_applies(dst, ctx.device)) {
             ggml_cuda_fattn_path_note("q5g6_compact32", dst, 8);
             ggml_cuda_flash_attn_ext_mma_turbo_case<DKQ, DV, 4, 8, type_K, type_V, true>(ctx, dst);
+            return;
+        }
+    }
+    // SLOWKV widths 5-8 of turbo4/turbo4 and tq6_0/tq6_0: the fused gate admits them only when wide_applies holds
+    if constexpr (DKQ == 256 && DV == 256 && type_K == type_V && (type_K == GGML_TYPE_TURBO4_0 || type_K == GGML_TYPE_TQ6_0)) {
+        if (Q->ne[1] > 4) {
+            ggml_cuda_fattn_path_note("slowkv_wide88", dst, 8);
+            ggml_cuda_flash_attn_ext_mma_turbo_case<DKQ, DV, 8, 8, type_K, type_V>(ctx, dst);
             return;
         }
     }
@@ -2826,7 +2897,8 @@ static void ggml_cuda_flash_attn_ext_mma_turbo_dispatch_ncols1_8(ggml_backend_cu
                                              (type_K == GGML_TYPE_TQ6_0 && type_V == GGML_TYPE_TURBO3_0) ||
                                              (type_K == GGML_TYPE_TQ5_0 && type_V == GGML_TYPE_TURBO3_0) ||
                                              ((type_K == GGML_TYPE_TQ5_0 || type_K == GGML_TYPE_TQ6_0 || type_K == GGML_TYPE_Q8_0) && type_V == GGML_TYPE_TURBO4_0) ||
-                                             (type_K == GGML_TYPE_TQ6_0 && type_V == GGML_TYPE_TQ5_0))) {
+                                             (type_K == GGML_TYPE_TQ6_0 && type_V == GGML_TYPE_TQ5_0) ||
+                                             (type_K == GGML_TYPE_Q8_0 && type_V == GGML_TYPE_Q5_1))) {
         if (Q->ne[1] > 4) { ggml_cuda_flash_attn_ext_mma_turbo_case<DKQ, DV, 8, 8, type_K, type_V>(ctx, dst); return; }
     }
     ggml_cuda_flash_attn_ext_mma_turbo_case<DKQ, DV, 4, 8, type_K, type_V>(ctx, dst); // Q->ne[1] in {3,4}
@@ -3591,10 +3663,17 @@ static bool ggml_cuda_flash_attn_ext_fused(ggml_backend_cuda_context * ctx, ggml
         int turbo_max_q = (((K->type == GGML_TYPE_TQ6_0 || K->type == GGML_TYPE_TQ5_0 || K->type == GGML_TYPE_Q8_0) &&
                                   (V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0) && Q->ne[0] == 256) ||
                                  (K->type == GGML_TYPE_TQ6_0 && V->type == GGML_TYPE_TQ5_0 && Q->ne[0] == 256)) ? 8 : 4;
-        // SLOWKV (GGML_SLOWKV, default off): width 5 of turbo4/turbo4 and tq6_0/tq6_0 takes the fused compact (4,8)
-        // tile instead of the generic f16 route; only when the ncols1 == 8 dispatch will pick that tile.
-        if (turbo_max_q == 4 && Q->ne[1] == 5 && ggml_cuda_fattn_slowkv_compact_applies(dst, device)) {
-            turbo_max_q = 5;
+        // SLOWKV (GGML_SLOWKV, default off): widths 5-8 of turbo4/turbo4 and tq6_0/tq6_0 take the fused compact (4,8)
+        // tile (width 5) or the fused (8,8) tile instead of the generic f16 route; only when the ncols1 == 8 dispatch
+        // will pick one of those tiles.
+        if (turbo_max_q == 4 && Q->ne[1] > 4 && Q->ne[1] <= 8 &&
+                (ggml_cuda_fattn_slowkv_compact_applies(dst, device) || ggml_cuda_fattn_slowkv_wide_applies(dst, device))) {
+            turbo_max_q = (int) Q->ne[1];
+        }
+        // SLOWKV q8_0 K / q5_1 V: fused at widths 1-8 with the q5_1 V tile loader (generic route without the switch)
+        if (ggml_cuda_turbo_mma_fused() && turing_mma_available(cc) && ggml_cuda_fattn_slowkv_q5_1_applies(dst, device)) {
+            FATTN_FUSED_NOTE("slowkv_q5_1", dst, -1);
+            FATTN_FUSED_LAUNCH(256, 256, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1);
         }
         if (ggml_cuda_turbo_mma_fused() && turbo_matched
                 && Q->ne[1] <= turbo_max_q && V->ne[0] == Q->ne[0] && turing_mma_available(cc)) {
