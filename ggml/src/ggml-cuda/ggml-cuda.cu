@@ -4991,10 +4991,11 @@ static bool ggml_cuda_conv_ring_match_at(const ggml_cgraph * cgraph, int conv_id
             continue;
         }
         if (n->op == GGML_OP_SET_ROWS) {
-            auto it = std::find_if(conts.begin(), conts.end(), [n](const auto & p) { return p.first == n->src[1]; });
+            // ggml_set_rows(a, b, c) stores src[0] = b (the rows written), src[1] = c (indices), src[2] = a (dst)
+            auto it = std::find_if(conts.begin(), conts.end(), [n](const auto & p) { return p.first == n->src[0]; });
             if (it != conts.end()) {
-                const ggml_tensor * a    = n->src[0];
-                const ggml_tensor * rows = n->src[2];
+                const ggml_tensor * a    = n->src[2];
+                const ggml_tensor * rows = n->src[1];
                 if (a->type != GGML_TYPE_F32 || a->ne[0] != row_count || a->ne[2] != 1 || a->ne[3] != 1 ||
                     a->nb[0] != sizeof(float) || a->nb[1] % sizeof(float) != 0 ||
                     rows->type != GGML_TYPE_I32 || rows->ne[0] != n_s || rows->ne[1] != 1 || rows->ne[2] != 1 ||
