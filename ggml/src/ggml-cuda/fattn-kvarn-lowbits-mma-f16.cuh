@@ -653,9 +653,9 @@ static __device__ __forceinline__ void flash_attn_ext_kvarn_load_tile(
                 const uint8_t * packed = reinterpret_cast<const uint8_t *>(payload);
                 half2 q[4];
                 if (kv.body_type == GGML_TYPE_I16 && bits == 3) {
-                    fattn_kvarn_trellis_lb_word<3,is_V>(packed, word, q);
+                    if (kv.trellis_words) { fattn_kvarn_trellis_lb_word_w<3,is_V>(packed, word, q); } else { fattn_kvarn_trellis_lb_word<3,is_V>(packed, word, q); }
                 } else if (kv.body_type == GGML_TYPE_I16 && bits == 2) {
-                    fattn_kvarn_trellis_lb_word<2,is_V>(packed, word, q);
+                    if (kv.trellis_words) { fattn_kvarn_trellis_lb_word_w<2,is_V>(packed, word, q); } else { fattn_kvarn_trellis_lb_word<2,is_V>(packed, word, q); }
                 } else {
                     const uint32_t w = bits == 4 ? __ldg(payload + word)
                         : bits == 3 ? kvarn_lowbits::fragment_word<3,is_V>(packed,word)
@@ -698,9 +698,9 @@ static __device__ __forceinline__ void flash_attn_ext_kvarn_load_tile(
                 const uint8_t * packed = reinterpret_cast<const uint8_t *>(payload);
                 half2 q[4];
                 if (kv.body_type == GGML_TYPE_I16 && bits == 3) {
-                    fattn_kvarn_trellis_lb_word<3,is_V>(packed, word, q);
+                    if (kv.trellis_words) { fattn_kvarn_trellis_lb_word_w<3,is_V>(packed, word, q); } else { fattn_kvarn_trellis_lb_word<3,is_V>(packed, word, q); }
                 } else if (kv.body_type == GGML_TYPE_I16 && bits == 2) {
-                    fattn_kvarn_trellis_lb_word<2,is_V>(packed, word, q);
+                    if (kv.trellis_words) { fattn_kvarn_trellis_lb_word_w<2,is_V>(packed, word, q); } else { fattn_kvarn_trellis_lb_word<2,is_V>(packed, word, q); }
                 } else {
                     const uint32_t w = bits == 4 ? __ldg(payload + word)
                         : bits == 3 ? kvarn_lowbits::fragment_word<3,is_V>(packed,word)

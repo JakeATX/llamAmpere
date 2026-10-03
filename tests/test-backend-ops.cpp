@@ -8562,6 +8562,7 @@ struct test_flash_attn_ext_kvarn : public test_case {
 
     const ggml_type staging_type;
     const ggml_type body_type;
+    const int bits_k, bits_v; // 3/3, 3/2, 2/2 with body_type I16 = trellis body
     const int64_t S;
     const bool f16_sink;
     static constexpr int64_t D = 256, G = 128;
@@ -8571,18 +8572,26 @@ struct test_flash_attn_ext_kvarn : public test_case {
     int64_t N()        const { return B() + n_ring; }
     int64_t qpos0()    const { return N() - n_q; }
     int64_t n_kv_pad() const { return ((N() + 255) / 256) * 256; }
-    int64_t rec_bytes() const { return body_type == GGML_TYPE_TURBO4_0 ? 2*G*ggml_row_size(body_type, D) : (int64_t) ggml_kvarn_rec_bytes(D, G, 4, 4); }
+    int64_t rec_bytes() const { return body_type == GGML_TYPE_TURBO4_0 ? 2*G*ggml_row_size(body_type, D) : (int64_t) ggml_kvarn_rec_bytes(D, G, bits_k, bits_v); }
 
     std::string vars() override {
-        return VARS_TO_STR9(n_q, nh, hkv, n_groups, n_ring, row_mask, attn_options, staging_type, S) + ",f16_sink=" + std::to_string(f16_sink) + ",body_type=" + ggml_type_name(body_type);
+        std::string result = VARS_TO_STR9(n_q, nh, hkv, n_groups, n_ring, row_mask, attn_options, staging_type, S) + ",f16_sink=" + std::to_string(f16_sink) + ",body_type=" + ggml_type_name(body_type);
+        if (bits_k != 4 || bits_v != 4) {
+            result += ",bits_k=" + std::to_string(bits_k) + ",bits_v=" + std::to_string(bits_v);
+        }
+        return result;
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        return body_type == GGML_TYPE_I16 && bits_k <= 3 ? "FLASH_ATTN_EXT_KVARN_TRELLIS" : ggml_op_desc(t);
     }
 
     double max_nmse_err() override {
         return 5e-4;
     }
 
-    test_flash_attn_ext_kvarn(int64_t n_q = 1, int64_t nh = 16, int64_t hkv = 2, int64_t n_groups = 3, int64_t n_ring = 300, bool row_mask = false, bool attn_options = false, ggml_type staging_type = GGML_TYPE_F16, int64_t S = 128, bool f16_sink = false, ggml_type body_type = GGML_TYPE_F32)
-        : n_q(n_q), nh(nh), hkv(hkv), n_groups(n_groups), n_ring(n_ring), row_mask(row_mask), attn_options(attn_options), staging_type(staging_type), body_type(body_type), S(S), f16_sink(f16_sink),
+    test_flash_attn_ext_kvarn(int64_t n_q = 1, int64_t nh = 16, int64_t hkv = 2, int64_t n_groups = 3, int64_t n_ring = 300, bool row_mask = false, bool attn_options = false, ggml_type staging_type = GGML_TYPE_F16, int64_t S = 128, bool f16_sink = false, ggml_type body_type = GGML_TYPE_F32, int bits_k = 4, int bits_v = 4)
+        : n_q(n_q), nh(nh), hkv(hkv), n_groups(n_groups), n_ring(n_ring), row_mask(row_mask), attn_options(attn_options), staging_type(staging_type), body_type(body_type), bits_k(bits_k), bits_v(bits_v), S(S), f16_sink(f16_sink),
           cap(std::max<int64_t>(1280, ((n_ring + G - 1)/G)*G)) {
         GGML_ASSERT(n_ring <= cap && n_ring >= n_q);
     }
@@ -8617,7 +8626,7 @@ struct test_flash_attn_ext_kvarn : public test_case {
             ggml_set_name(sinks, "sinks");
             ggml_flash_attn_ext_add_sinks(out, sinks);
         }
-        ggml_flash_attn_ext_set_kvarn(out, body, desc, 4, 4, (int32_t) n_kv_pad());
+        ggml_flash_attn_ext_set_kvarn(out, body, desc, bits_k, bits_v, (int32_t) n_kv_pad());
         ggml_prec_set_acc(out, GGML_PREC_F32);
         ggml_set_name(out, "out");
         return out;
@@ -8672,8 +8681,8 @@ struct test_flash_attn_ext_kvarn : public test_case {
                     ggml_backend_tensor_set(t, blocks.data(), 0, ggml_nbytes(t));
                     continue;
                 }
-                // layout per ggml_kvarn::make_layout (D=256, G=128, 4/4): payloads then fp16 metadata
-                const size_t k_row = D/2, v_row = D/2;
+                // layout per ggml_kvarn::make_layout (D=256, G=128): payloads then fp16 metadata
+                const size_t k_row = D*bits_k/8, v_row = D*bits_v/8;
                 const size_t v_payload = k_row*G, k_scale = v_payload + v_row*G, k_zero = k_scale + 2*D, k_tok = k_zero + 2*D;
                 const size_t v_ch = k_tok + 2*G, v_scale = v_ch + 2*D, v_zero = v_scale + 2*G;
                 GGML_ASSERT((int64_t) (v_zero + 2*G) == rec_bytes());
@@ -12547,6 +12556,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext_kvarn(n_q, 24, 4, 3, 4096, true, false, GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_TURBO4_0));
     }
     test_cases.emplace_back(new test_flash_attn_ext_kvarn(257, 24, 3, 60, 300, true, true, GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_TURBO4_0));
+    // [F5] trellis bodies (I16, 3/3 3/2 2/2) at decode widths 1-5 and 8 (GGML_KVARN_TRELLIS_WORDS=1 A/B), tq6 staging + f16 sink;
+    // 32K (255 records + 128) and 100K (792 records + 1024) visible positions, plus prefill width 64 and f16/q8 staging.
+    for (auto [bk, bv] : std::vector<std::pair<int,int>>{{3, 3}, {3, 2}, {2, 2}}) {
+        for (int64_t n_q : {1, 2, 3, 4, 5, 8}) {
+            test_cases.emplace_back(new test_flash_attn_ext_kvarn(n_q, 24, 4, 3, 301, true, false, GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_I16, bk, bv));
+        }
+        for (int64_t n_q : {1, 5}) {
+            test_cases.emplace_back(new test_flash_attn_ext_kvarn(n_q, 24, 4, 255, 128, true, false, GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_I16, bk, bv));
+            test_cases.emplace_back(new test_flash_attn_ext_kvarn(n_q, 24, 4, 792, 1024, true, false, GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_I16, bk, bv));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext_kvarn(64, 24, 4, 3, 301, true, true, GGML_TYPE_F16, 128, false, GGML_TYPE_I16, bk, bv));
+        test_cases.emplace_back(new test_flash_attn_ext_kvarn(4, 24, 4, 3, 1024, true, false, GGML_TYPE_Q8_0, 256, false, GGML_TYPE_I16, bk, bv));
+    }
     for (int64_t end : {128 + 5*128, 128 + 7*128}) {
         test_cases.emplace_back(new test_kvarn_seal_dyn(256, 128, 4, 128, 384, 128 + 5*128, end, 9, 3, 4, 4, 16, GGML_TYPE_TQ6_0, GGML_TYPE_TURBO4_0));
     }
@@ -13071,6 +13093,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // = 102528 positions; n_q 1 (tg128), 4 and 5 (MTP verify rows). f16 rows of the same shape for the bandwidth reference.
     for (int64_t n_q : {1, 4, 5}) {
         test_cases.emplace_back(new test_flash_attn_ext_kvarn(n_q, 24, 4, 792, 1024));
+    }
+    // [F5] trellis 3/3 and 3/2 vs scalar 4/4 at 32K (255 records) and 100K (792 records), widths 1-5, production tq6
+    // staging + f16 sink. Filter: -o FLASH_ATTN_EXT_KVARN_TRELLIS (trellis) / -p 'body_type=f32' (scalar comparator).
+    for (int64_t n_groups : {255, 792}) {
+        for (int64_t n_q = 1; n_q <= 5; ++n_q) {
+            test_cases.emplace_back(new test_flash_attn_ext_kvarn(n_q, 24, 4, n_groups, 1024, false, false, GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_I16, 3, 3));
+            test_cases.emplace_back(new test_flash_attn_ext_kvarn(n_q, 24, 4, n_groups, 1024, false, false, GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_I16, 3, 2));
+            test_cases.emplace_back(new test_flash_attn_ext_kvarn(n_q, 24, 4, n_groups, 1024, false, false, GGML_TYPE_TQ6_0, 128, true));
+        }
     }
     // Compare exact-tail traffic at the same 32896 visible positions.
     for (int64_t n_q : {4, 5}) {

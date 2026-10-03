@@ -395,6 +395,20 @@ KVARN_HD inline uint32_t trellis_lb_window(const uint8_t * payload, int t, int d
     }
     return w;
 }
+// Same window as trellis_lb_window, taken from 32-bit words already loaded in registers (the fast attention decode,
+// GGML_KVARN_TRELLIS_WORDS=1). w0..w2 are consecutive payload words starting at word `base`; rel = code bit - 32*base,
+// h = channel % 128 (history restart). Requires rel >= min(h*BITS, 6) and the window inside the 96 loaded bits.
+// The current code lands in the top BITS bits and missing history (h < HIST) reads as zero, exactly as above.
+template<int BITS>
+KVARN_HD inline uint32_t trellis_lb_window_w(const uint32_t w0, const uint32_t w1, const uint32_t w2, const uint32_t rel, const int h) {
+    const uint32_t hb  = (uint32_t) h*BITS < 6u ? (uint32_t) h*BITS : 6u;
+    const uint32_t pos = rel - hb;
+    const uint32_t n   = BITS + hb;
+    const uint64_t lo  = (uint64_t) w0 | ((uint64_t) w1 << 32);
+    const uint64_t hi  = (uint64_t) w1 | ((uint64_t) w2 << 32);
+    const uint64_t v   = pos + n <= 64u ? lo >> pos : hi >> (pos - 32u);
+    return ((uint32_t) v & ((1u << n) - 1u)) << (6u - hb);
+}
 KVARN_HD inline uint32_t trellis3_window(const uint8_t * payload, int t, int d, int D) { return trellis_lb_window<3>(payload, t, d, D); }
 KVARN_HD inline uint32_t trellis2_window(const uint8_t * payload, int t, int d, int D) { return trellis_lb_window<2>(payload, t, d, D); }
 // refit of one row's affine from sequential double sums over its C values (x = balanced value, y = reconstruction):
