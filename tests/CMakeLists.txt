@@ -430,6 +430,7 @@ llama_build_and_test(test-fattn-bounded-prefill.cpp) # [#22/#29] forks one child
 llama_build_and_test(test-mtp-chain-sample.cpp) # [#69] CPU always, the GPU when present
 llama_build_and_test(test-gdn-ingr-compact.cpp) # [#63] CPU always, the GPU when present
 llama_build_and_test(test-draft-vocab-hot.cpp)
+llama_build_and_test(test-draft-vocab-compact.cpp)
 if (NOT LLAMA_USE_SYSTEM_GGML)
     llama_build(test-moe-cache.cpp)
     if (GGML_CUDA)

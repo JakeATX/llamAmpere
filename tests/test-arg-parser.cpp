@@ -251,6 +251,46 @@ static void test(void) {
     assert(params.n_predict == 6789);
     assert(params.n_batch == 9090);
 
+    printf("test-arg-parser: test KV cache type names and aliases\n\n");
+    {
+        const std::vector<std::pair<std::string, ggml_type>> names = {
+            // ggml type names
+            {"f16",      GGML_TYPE_F16},      {"q8_0",     GGML_TYPE_Q8_0},
+            {"turbo2",   GGML_TYPE_TURBO2_0}, {"turbo3",   GGML_TYPE_TURBO3_0},
+            {"turbo4",   GGML_TYPE_TURBO4_0}, {"tq5_0",    GGML_TYPE_TQ5_0},
+            {"tq6_0",    GGML_TYPE_TQ6_0},
+            // aliases
+            {"tq2",      GGML_TYPE_TURBO2_0},
+            {"tq3",      GGML_TYPE_TURBO3_0}, {"tq3_0",    GGML_TYPE_TURBO3_0},
+            {"tq4",      GGML_TYPE_TURBO4_0}, {"tq4_0",    GGML_TYPE_TURBO4_0},
+            {"turbo5",   GGML_TYPE_TQ5_0},    {"tq5",      GGML_TYPE_TQ5_0},
+            {"turbo6",   GGML_TYPE_TQ6_0},    {"tq6",      GGML_TYPE_TQ6_0},
+            // case-insensitive
+            {"Turbo5",   GGML_TYPE_TQ5_0},    {"TQ4",      GGML_TYPE_TURBO4_0},
+        };
+        for (const auto & [name, type] : names) {
+            assert(common_kv_cache_type_from_name(name) == type);
+
+            common_params kv_params;
+            argv = {"binary_name", "-ctk", name, "-ctv", name, "-ctkd", name, "-ctvd", name};
+            assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), kv_params, LLAMA_EXAMPLE_SERVER));
+            assert(kv_params.cache_type_k == type);
+            assert(kv_params.cache_type_v == type);
+            assert(kv_params.speculative.draft.cache_type_k == type);
+            assert(kv_params.speculative.draft.cache_type_v == type);
+        }
+
+        // unknown names are rejected; tq2_0 is ggml's ternary weight type, and the
+        // TurboQuant weight formats and a turbo5_0/turbo6_0 spelling are not cache types
+        for (const std::string name : {"hello", "tq2_0", "tq1_0", "tq3_1s", "tq4_1s", "turbo5_0", "turbo6_0", "turbo7", "tq7"}) {
+            assert(common_kv_cache_type_from_name(name) == GGML_TYPE_COUNT);
+
+            common_params kv_params;
+            argv = {"binary_name", "-ctk", name};
+            assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), kv_params, LLAMA_EXAMPLE_COMMON));
+        }
+    }
+
     // --draft cannot be used outside llama-speculative
     argv = {"binary_name", "--spec-draft-n-max", "123"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));

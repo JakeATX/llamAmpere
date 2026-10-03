@@ -416,6 +416,10 @@ private:
         ggml_context_ptr        ctx;
         ggml_backend_buffer_ptr buf;
         ggml_tensor           * ids = nullptr; // [n_sel]
+        // [#81] compact resident draft head [n_embd, n_sel] (row i scores token ids[i]) and the head it was built
+        // from; set for EXL3 heads (or LLAMA_DRAFT_VOCAB_COMPACT=1), see llama-draft-vocab-compact.h
+        ggml_tensor           * compact     = nullptr;
+        const ggml_tensor     * compact_src = nullptr;
         std::vector<int32_t>    host;          // same ids, host copy
         int32_t                 n_hot = 0;     // trailing adaptive slots (0 = fully static map)
         llama_mtp_hot_vocab     hot;           // ranking policy for those slots

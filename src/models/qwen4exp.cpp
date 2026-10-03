@@ -927,8 +927,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
+    // TurboQuant/TQ K caches hold WHT-rotated K: rotate Q to match, as the dense path does
+    q = build_attn_turbo_q(q, k, mctx_cur);
+
     ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, mask, nullptr, nullptr, n_sel, kq_scale, il);
     cb(cur, "kqv_out", il);
+
+    cur = build_attn_turbo_v_out(cur, v, il);
 
     // the rotation is its own inverse, so undo it on the value side of the output
     if (inp->self_v_rot) {
