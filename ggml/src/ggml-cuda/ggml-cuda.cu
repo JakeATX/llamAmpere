@@ -1294,9 +1294,11 @@ static size_t ggml_backend_cuda_phase_arena_buffer_type_alloc_size(
 static const ggml_backend_buffer_type_i ggml_backend_cuda_phase_arena_buffer_type_interface = {
     /* .get_name         = */ ggml_backend_cuda_phase_arena_buffer_type_get_name,
     /* .alloc_buffer     = */ ggml_backend_cuda_phase_arena_buffer_type_alloc,
+    /* .alloc_buffer_n   = */ nullptr,
     /* .get_alignment    = */ ggml_backend_cuda_phase_arena_buffer_type_alignment,
     /* .get_max_size     = */ nullptr,
     /* .get_alloc_size   = */ ggml_backend_cuda_phase_arena_buffer_type_alloc_size,
+    /* .get_alloc_size_n = */ nullptr,
     /* .is_host          = */ nullptr,
 };
 
@@ -1901,9 +1903,11 @@ static bool ggml_backend_cuda_kv_stream_buffer_is_host(ggml_backend_buffer_type_
 static const ggml_backend_buffer_type_i ggml_backend_cuda_kv_stream_buffer_type_interface = {
     /* .get_name         = */ ggml_backend_cuda_kv_stream_buffer_type_name,
     /* .alloc_buffer     = */ ggml_backend_cuda_kv_stream_buffer_alloc,
+    /* .alloc_buffer_n   = */ nullptr,
     /* .get_alignment    = */ ggml_backend_cuda_kv_stream_buffer_alignment,
     /* .get_max_size     = */ nullptr,
     /* .get_alloc_size   = */ ggml_backend_cuda_kv_stream_buffer_alloc_size,
+    /* .get_alloc_size_n = */ nullptr,
     /* .is_host          = */ ggml_backend_cuda_kv_stream_buffer_is_host,
 };
 

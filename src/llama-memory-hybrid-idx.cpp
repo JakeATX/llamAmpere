@@ -1,14 +1,11 @@
 #include "llama-memory-hybrid-idx.h"
 
-#include <algorithm>
-#include <cmath>
 #include <type_traits>
 
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-model.h"
-
 
 #include <algorithm>
 #include <cassert>
@@ -37,6 +34,7 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
                             /* common */
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
+                     bool   gdn_replay_req,
                      bool   offload,
                      bool   unified,
                             /* layer filters */
@@ -47,7 +45,7 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         model,
         type_k, type_v, v_trans, kv_size, n_pad, n_swa, swa_type,
         type_r, type_s, rs_size,
-        n_seq_max, n_rs_seq, offload, unified,
+        n_seq_max, n_rs_seq, gdn_replay_req, offload, unified,
         filter_attn, filter_recr),
     hparams_idx(model.hparams),
     mem_idx(filter_idx == nullptr ? nullptr : [&] {
@@ -78,6 +76,9 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr 
     do {
         balloc.split_reset();
 
+        // [TAG_GDN_REPLAY_SPLIT]
+        auto rsplit = get_mem_recr()->make_replay_split(balloc);
+
         // follow the recurrent pattern for creating the ubatch splits
         std::vector<llama_ubatch> ubatches;
 
@@ -96,12 +97,14 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr 
                 //   so that the rollback snapshots remain valid
                 const uint32_t n_rs_seq = get_mem_recr()->n_rs_seq;
 
-                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
+                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0, rsplit.fn());
             }
 
             if (ubatch.n_tokens == 0) {
                 break;
             }
+
+            rsplit.advance(ubatch);
 
             ubatches.push_back(std::move(ubatch)); // NOLINT
         }
