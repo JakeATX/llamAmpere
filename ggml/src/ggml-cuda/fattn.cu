@@ -2602,15 +2602,15 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
             switch (ggml_cuda_fa_prefill_ncols2_pick(arm, cc, DKQ, DV, Q->ne[1], gqa_ratio, Q->ne[3] == 1, use_gqa_opt)) {
                 case 1:
                     ggml_cuda_fattn_path_note("mma_f16_prefill_probe", dst, 1);
-                    ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 1>(ctx, dst);
+                    ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 1>(ctx, dst, preserve_cand);
                     return;
                 case 2:
                     ggml_cuda_fattn_path_note("mma_f16_prefill_probe", dst, 2);
-                    ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 2>(ctx, dst);
+                    ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 2>(ctx, dst, preserve_cand);
                     return;
                 case 8:
                     ggml_cuda_fattn_path_note("mma_f16_prefill_probe", dst, 8);
-                    ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8>(ctx, dst);
+                    ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8>(ctx, dst, preserve_cand);
                     return;
                 default:
                     break;
