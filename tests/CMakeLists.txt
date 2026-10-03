@@ -421,6 +421,10 @@ llama_build_and_test(test-gdn-replay-split.cpp)
 llama_build_and_test(test-add-rms-q8.cpp) # [#46] skips without a GPU backend
 llama_build_and_test(test-exl3-ffn-bridge.cpp) # [#74] skips without a GPU backend
 llama_build_and_test(test-exl3-weight-major.cpp) # [#73] skips without a GPU backend
+add_executable(test-fattn-mma-config test-fattn-mma-config.cpp)
+target_include_directories(test-fattn-mma-config PRIVATE ${PROJECT_SOURCE_DIR}/ggml/include)
+llama_test(test-fattn-mma-config)
+
 llama_build_and_test(test-fattn-alloc-route.cpp) # [#64] skips without a GPU backend
 llama_build_and_test(test-fattn-bounded-prefill.cpp) # [#22/#29] forks one child per GGML_CUDA_PREFILL_KV_MIB arm; skips without a GPU backend
 llama_build_and_test(test-mtp-chain-sample.cpp) # [#69] CPU always, the GPU when present

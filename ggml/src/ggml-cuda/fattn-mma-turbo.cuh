@@ -27,13 +27,19 @@ void ggml_cuda_flash_attn_ext_mma_turbo_case(ggml_backend_cuda_context & ctx, gg
     const int cc = ggml_cuda_info().devices[id].cc;
 
     constexpr int ncols = ncols1 * ncols2;
+    constexpr bool preserve_cand = ggml_cuda_fattn_mma_cand_pair(type_K, type_V);
+    if constexpr (preserve_cand && ggml_cuda_fattn_mma_cand_shape(DKQ, DV, ncols)) {
+        if (ampere_mma_available(cc)) {
+            ggml_cuda_fattn_mma_note_cand(DKQ, ncols);
+        }
+    }
 
-    const int  nthreads       = ggml_cuda_fattn_mma_get_nthreads      (DKQ, DV, ncols, cc);
-    const int  nbatch_fa      = ggml_cuda_fattn_mma_get_nbatch_fa     (DKQ, DV, ncols, type_K, cc); // [#39] per K type
-    const int  nbatch_K2      = ggml_cuda_fattn_mma_get_nbatch_K2     (DKQ, DV, ncols, cc);
-    const int  nbatch_V2      = ggml_cuda_fattn_mma_get_nbatch_V2     (DKQ, DV, ncols, cc);
-    const int  nbatch_combine = ggml_cuda_fattn_mma_get_nbatch_combine(DKQ, DV, ncols, cc);
-    const bool Q_in_reg       = ggml_cuda_fattn_mma_get_Q_in_reg      (DKQ, DV, ncols, cc);
+    const int  nthreads       = ggml_cuda_fattn_mma_get_nthreads<preserve_cand>      (DKQ, DV, ncols, cc);
+    const int  nbatch_fa      = ggml_cuda_fattn_mma_get_nbatch_fa<preserve_cand>     (DKQ, DV, ncols, type_K, cc); // [#39] per K type
+    const int  nbatch_K2      = ggml_cuda_fattn_mma_get_nbatch_K2<preserve_cand>     (DKQ, DV, ncols, cc);
+    const int  nbatch_V2      = ggml_cuda_fattn_mma_get_nbatch_V2<preserve_cand>     (DKQ, DV, ncols, cc);
+    const int  nbatch_combine = ggml_cuda_fattn_mma_get_nbatch_combine<preserve_cand>(DKQ, DV, ncols, cc);
+    const bool Q_in_reg       = ggml_cuda_fattn_mma_get_Q_in_reg<preserve_cand>      (DKQ, DV, ncols, cc);
 
     // turbo path is always single-stage synchronous (nstages forced to 0 in the kernel).
     const int cols_per_warp = std::min(ncols, get_cols_per_warp(cc));
@@ -45,7 +51,7 @@ void ggml_cuda_flash_attn_ext_mma_turbo_case(ggml_backend_cuda_context & ctx, gg
 
     // must match the swizzled tile stride flash_attn_ext_turbo{2,3,4}_load_tile write through
     // (fattn-mma-f16.cuh's turbo_store_h2 / swizzle_bytes), same helpers as the f16 host launcher.
-    const bool swizzled     = ggml_cuda_fattn_mma_get_swizzled(DKQ, DV, ncols1, ncols2, cc);
+    const bool swizzled     = ggml_cuda_fattn_mma_get_swizzled<preserve_cand>(DKQ, DV, ncols1, ncols2, cc);
     const int stride_tile_K = ggml_cuda_fattn_mma_get_stride_tile(nbatch_K2, swizzled);
     const int stride_tile_V = ggml_cuda_fattn_mma_get_stride_tile(nbatch_V2, swizzled);
     const size_t nbytes_shared_KV_1stage = nbatch_fa            * std::max(stride_tile_K, stride_tile_V) * sizeof(half2);
