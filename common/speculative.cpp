@@ -3833,7 +3833,7 @@ common_speculative_init_result::common_speculative_init_result(
         model_path = params.speculative.draft.mparams.path;
         LOG_INF("%s: loading draft model '%s'\n", __func__, model_path.c_str());
 
-        llama_model * model_dft = llama_model_load_from_file(params.model.path.c_str(), mparams);
+        llama_model * model_dft = llama_model_load_from_file(model_path.c_str(), mparams);
         if (model_dft == NULL) {
             LOG_ERR("%s: failed to load draft model, '%s'\n", __func__, model_path.c_str());
             return;
@@ -4124,15 +4124,86 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
     }
 }
 
-bool common_speculative_process(common_speculative * spec, const llama_batch & batch) {
+// The drafter implementations read the incoming target batch through the flat llama_batch layout
+// (token/pos/seq_id/logits arrays, one contiguous embd block). Upstream moved the server to
+// common_batch (llama_batch_ext); this adapter renders a common_batch into that layout so the
+// drafter code paths stay byte-for-byte the ones the v0.4/v0.5 gates measured.
+namespace {
+struct spec_batch_view {
+    std::vector<llama_token>    token;
+    std::vector<float>          embd;
+    std::vector<llama_pos>      pos;
+    std::vector<int32_t>        n_seq_id;
+    std::vector<llama_seq_id>   seq_flat;
+    std::vector<llama_seq_id *> seq_id;
+    std::vector<int8_t>         logits;
+
+    llama_batch render(const common_batch & cb) {
+        const int32_t n = cb.size();
+        const bool has_tok  = cb.has_token();
+        const bool has_embd = cb.has_embd();
+
+        token.resize(has_tok ? n : 0);
+        pos.resize(n);
+        n_seq_id.resize(n);
+        logits.resize(n);
+        seq_id.resize(n);
+
+        size_t n_seq_total = 0;
+        size_t n_embd = 0;
+        for (int32_t i = 0; i < n; ++i) {
+            n_seq_total += 1 + cb.tokens[i].seq_ids_extra.size();
+            if (has_embd) {
+                n_embd = std::max(n_embd, cb.tokens[i].embd.n_embd);
+            }
+        }
+        seq_flat.resize(n_seq_total);
+        embd.resize(has_embd ? (size_t) n * n_embd : 0);
+
+        size_t o = 0;
+        for (int32_t i = 0; i < n; ++i) {
+            const auto & t = cb.tokens[i];
+            if (has_tok) {
+                token[i] = t.id;
+            }
+            if (has_embd && t.embd.data != nullptr) {
+                std::memcpy(embd.data() + (size_t) i * n_embd, t.embd.data, t.embd.n_embd * sizeof(float));
+            }
+            pos[i]      = t.pos[0];
+            logits[i]   = t.output ? 1 : 0;
+            n_seq_id[i] = 1 + (int32_t) t.seq_ids_extra.size();
+            seq_id[i]   = seq_flat.data() + o;
+            seq_flat[o++] = t.seq_id;
+            for (const auto s : t.seq_ids_extra) {
+                seq_flat[o++] = s;
+            }
+        }
+
+        llama_batch b = {};
+        b.n_tokens = n;
+        b.token    = has_tok  ? token.data() : nullptr;
+        b.embd     = has_embd ? embd.data()  : nullptr;
+        b.pos      = pos.data();
+        b.n_seq_id = n_seq_id.data();
+        b.seq_id   = seq_id.data();
+        b.logits   = logits.data();
+        return b;
+    }
+};
+}
+
+bool common_speculative_process(common_speculative * spec, const common_batch & batch) {
     bool result = true;
 
     if (spec == nullptr) {
         return result;
     }
 
+    static thread_local spec_batch_view view;
+    const llama_batch b = view.render(batch);
+
     for (auto & impl : spec->impls) {
-        result = result && impl->process(batch);
+        result = result && impl->process(b);
     }
 
     return result;

@@ -1193,7 +1193,7 @@ static void llama_sampler_dist_apply(struct llama_sampler * smpl, llama_token_da
 
     if (cur_p->size == 1) {
         // keep the RNG state aligned with backend sampling, which draws once per output
-        dist(ctx->rng);
+        (void) dist(ctx->rng);
         cur_p->data[0].p = 1.0f;
         return;
     }
@@ -1407,7 +1407,7 @@ static void llama_sampler_dist_accept(struct llama_sampler * smpl, llama_token t
     }
 
     std::uniform_real_distribution<double> dist(0.0f, 1.0f);
-    dist(sctx->rng);
+    (void) dist(sctx->rng);
     ++sctx->n_backend_draws_committed;
 }
 

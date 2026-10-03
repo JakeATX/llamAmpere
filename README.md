@@ -54,6 +54,14 @@ Start with [QWEN_AMPERE.md](QWEN_AMPERE.md) (its numbers are v0.3) and the write
 
 A few options to get `llama.cpp` installed on your machine:
 
+```bash
+# curl
+curl -LsSf https://llama.app/install.sh | sh
+
+# powershell
+irm https://llama.app/install.ps1 | iex
+```
+
 - Visit https://llama.app and follow the instructions
 - Run with Docker - see our [Docker documentation](docs/docker.md)
 - Download pre-built binaries from the [releases page](https://github.com/ggml-org/llama.cpp/releases)

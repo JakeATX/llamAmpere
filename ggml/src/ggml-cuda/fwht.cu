@@ -1,6 +1,7 @@
 // Signed/blockwise FWHT for Prism ML's folded-Hadamard Bonsai 2 runtime: adapted from
 // https://github.com/PrismML-Eng/llama.cpp (MIT); see docs/bonsai2.md.
 #include "common.cuh"
+#include "convert.cuh"
 #include "fwht.cuh"
 
 #include <cstdlib>
@@ -338,4 +339,14 @@ bool ggml_cuda_op_fwht(ggml_backend_cuda_context & ctx, const ggml_tensor * src,
 bool ggml_cuda_op_fwht_signed(ggml_backend_cuda_context & ctx, const ggml_tensor * src,
                               const ggml_tensor * signs, ggml_tensor * dst) {
     return fwht_dispatch(ctx, src, dst, signs);
+}
+
+bool ggml_cuda_op_mul_mat_use_fwht(const struct ggml_tensor * op) {
+    const struct ggml_tensor * a = op->src[0];
+    const struct ggml_tensor * b = op->src[1];
+
+    return op->op == GGML_OP_MUL_MAT && ggml_get_op_params_i32(op, 1) == GGML_HINT_SRC0_IS_HADAMARD &&
+           a->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+           (b->type == GGML_TYPE_F32 || b->type == GGML_TYPE_F16) && ggml_is_contiguous(b) && ggml_is_contiguous(op) &&
+           ggml_are_same_shape(b, op);
 }
