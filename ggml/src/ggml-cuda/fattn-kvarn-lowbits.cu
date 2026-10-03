@@ -12,7 +12,7 @@ void ggml_cuda_lowbits_prefill_case(ggml_backend_cuda_context & ctx, ggml_tensor
     constexpr int ncols = ncols1 * ncols2;
 
     GGML_ASSERT(dst->src[5] != nullptr && dst->src[6] != nullptr);
-    GGML_ASSERT(ggml_get_op_params_i32(KQV, 5) == ((bits_k << 8) | bits_v));
+    GGML_ASSERT(ggml_get_op_params_i32(KQV, 5) == (((bits_k & 7) << 8) | bits_v)); // bits_k | 8: GGML_KVARN_TRELLIS_WORDS build
     GGML_ASSERT(DKQ == 256 && DV == 256);
     GGML_ASSERT(dst->src[1]->type == GGML_TYPE_F16 || dst->src[1]->type == GGML_TYPE_Q8_0 || dst->src[1]->type == GGML_TYPE_TQ6_0);
     GGML_ASSERT(dst->src[2]->type == GGML_TYPE_F16 || dst->src[2]->type == GGML_TYPE_Q8_0 || dst->src[2]->type == GGML_TYPE_TQ6_0);
@@ -90,11 +90,34 @@ static bool kvarn_lowbits_no_direct() {
     return v;
 }
 
+// GGML_KVARN_TRELLIS_WORDS=1 (default off): trellis tile loads read the payload as aligned 32-bit words instead of two
+// byte loads per code (fattn_kvarn_trellis_lb_word_w, bit-identical values). Selected by a separate kernel build
+// (template bits_k | 8), so the default kernel is unchanged.
+static bool kvarn_trellis_words() {
+    static const bool v = [] { const char * e = getenv("GGML_KVARN_TRELLIS_WORDS"); return e != nullptr && e[0] == '1'; }();
+    return v;
+}
+// route proof for end-to-end gates: one line on the first trellis attention call that takes the word-load build
+static void kvarn_trellis_words_note() {
+    static bool done = false;
+    if (!done) {
+        done = true;
+        GGML_LOG_INFO("%s: KVarN trellis attention uses the word-load decode (GGML_KVARN_TRELLIS_WORDS=1)\n", __func__);
+    }
+}
+
 template<int bits_k, int bits_v>
 static void ggml_cuda_lowbits_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     if (ggml_get_op_params_i32(dst,7) == GGML_TYPE_I16) {
         // trellis-coded body: the stream kernel has no codebook path, the tile loader decodes every width
         ggml_cuda_kvarn_trellis_cb_init();
+        if constexpr (bits_k <= 3 && bits_v <= 3) {
+            if (kvarn_trellis_words()) {
+                kvarn_trellis_words_note();
+                ggml_cuda_lowbits_prefill_case<256,256,8,8,bits_k | 8,bits_v>(ctx,dst);
+                return;
+            }
+        }
         ggml_cuda_lowbits_prefill_case<256,256,8,8,bits_k,bits_v>(ctx,dst);
     } else if (dst->src[0]->ne[1] <= 8 && !kvarn_lowbits_no_direct()) {
         ggml_cuda_kvarn_lowbits_width<bits_k,bits_v>(ctx,dst);
