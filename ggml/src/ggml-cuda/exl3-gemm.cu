@@ -362,6 +362,7 @@ static bool exl3_gemm_acc16() {
 }
 
 #define EXL3_GEMM_STAGES 2
+#define EXL3_GEMM_MIN_T  16   // = EXL3_GEMV_MAX_T (exl3-gemv.cu): T <= 16 never reaches this GEMM
 
 // probe == true: return the resident blocks per SM of the instantiation instead of launching
 template <int BITS, int MT, bool ACC16>
@@ -424,11 +425,15 @@ static int exl3_gemm_mt(const int64_t T) {
 }
 
 // split-K so that the grid fills the device: the smallest ksplit whose last wave is >= 85% full (or the best one up to
-// the cap), each slice keeping >= 4 k-steps
+// the cap), each slice keeping >= 4 k-steps; only for grids of <= 2 waves (beyond that the tail is a small fraction and
+// the split costs a ksplit*T*N fp32 partial buffer plus a reduction pass)
 static int exl3_gemm_ksplit(const int blocks, const int resident, const int nsteps) {
     static const int forced = exl3_gemm_env_int("GGML_CUDA_EXL3_GEMM_KSPLIT", 0);
     if (forced > 0) {
         return std::max(1, std::min(forced, nsteps));
+    }
+    if (blocks > 2 * resident) {
+        return 1;
     }
     const int ks_max = std::max(1, std::min(8, nsteps / 4));
     int best = 1;
@@ -449,7 +454,8 @@ static int exl3_gemm_ksplit(const int blocks, const int resident, const int nste
 }
 
 bool ggml_cuda_exl3_gemm_supported(const ggml_tensor * src0, const int64_t T) {
-    if (!ggml_cuda_exl3_gemm_enabled() || T <= 0) {
+    // T <= EXL3_GEMV_MAX_T stays with the GEMV or, with GGML_CUDA_EXL3_GEMV=0, the M1 reconstruct + cuBLAS reference
+    if (!ggml_cuda_exl3_gemm_enabled() || T <= EXL3_GEMM_MIN_T) {
         return false;
     }
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -457,7 +463,8 @@ bool ggml_cuda_exl3_gemm_supported(const ggml_tensor * src0, const int64_t T) {
         return false;
     }
     // 16-byte cp.async of whole tiles: the tensor base must be 16-byte aligned (tiles are 32*bits bytes)
-    return ((uintptr_t) src0->data % 16) == 0 && src0->ne[0] % 16 == 0 && src0->ne[1] % 16 == 0 &&
+    // glue_in (x -> fp16, optional suh Hadamard) needs K % 128
+    return ((uintptr_t) src0->data % 16) == 0 && src0->ne[0] % 128 == 0 && src0->ne[1] % 16 == 0 &&
            T * src0->ne[0] < INT32_MAX && T * src0->ne[1] < INT32_MAX;
 }
 
@@ -469,12 +476,14 @@ void ggml_cuda_exl3_gemm(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
     const int N  = (int) src0->ne[1];
     const int kt = K / 16;
     const int nt = N / 16;
-    const int id = ggml_cuda_get_device();
+    // pools and device info by the context's (virtual) device id, as GGML_CUDA_DEVICES emulation maps several contexts to
+    // one physical device; the per-device occupancy/attribute cache inside exl3_gemm_launch keys on the physical id
+    const int id = ctx.device;
     cudaStream_t stream = ctx.stream();
 
     const bool  acc16   = exl3_gemm_acc16();
     const float x_scale = acc16 ? EXL3_GEMM_X_SCALE_ACC16 : 1.0f;
-    ggml_cuda_pool_alloc<half> xh(ctx.pool(id), (size_t) T * K);
+    ggml_cuda_pool_alloc<half> xh(ctx.pool(), (size_t) T * K);
     ggml_cuda_exl3_glue_in_f16((const float *) src1->data, suh, xh.get(), K, T, x_scale, stream);
 
     const int mt = exl3_gemm_mt(T);
@@ -488,7 +497,7 @@ void ggml_cuda_exl3_gemm(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
     const int ksplit = (nsteps + kps - 1) / kps;   // no empty z slices
 
     const bool post = ksplit > 1 || svh != nullptr;
-    ggml_cuda_pool_alloc<float> part(ctx.pool(id));
+    ggml_cuda_pool_alloc<float> part(ctx.pool());
     float * y   = (float *) dst->data;
     float * out = post ? part.alloc((size_t) ksplit * T * N) : y;
     const float out_scale = 1.0f / x_scale;

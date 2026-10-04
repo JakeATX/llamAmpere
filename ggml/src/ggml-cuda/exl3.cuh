@@ -28,7 +28,8 @@ static __device__ __forceinline__ void exl3_wht128(float (&v)[4]) {
 // dst: f16 [N][K] row-major (row n = output feature), codebook values, no suh/svh/Hadamard
 void ggml_cuda_exl3_reconstruct_f16(const ggml_tensor * src0, half * dst, cudaStream_t stream);
 
-// M2: trellis-direct GEMV/GEMM for T <= 8 activation columns (env GGML_CUDA_EXL3_GEMV=0 forces the M1 path)
+// M2: trellis-direct GEMV/GEMM for T <= EXL3_GEMV_MAX_T (16) activation columns (env GGML_CUDA_EXL3_GEMV=0 forces the
+// M1 reconstruct + cuBLAS path for those widths; the #13 GEMM only takes T > 16)
 bool ggml_cuda_exl3_gemv_supported(const int64_t T);
 int  ggml_cuda_exl3_gemv_ksplit(const int kt, const int nt, const int T);
 // suh/svh may be null (no Hadamard/scale glue)
