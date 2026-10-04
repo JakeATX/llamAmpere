@@ -31,7 +31,7 @@
 #define EXL3_GEMM_WARPS_N 4
 #define EXL3_GEMM_THREADS (32 * EXL3_GEMM_WARPS_M * EXL3_GEMM_WARPS_N)
 #ifndef EXL3_GEMM_ACC16_MT4_MINB
-#define EXL3_GEMM_ACC16_MT4_MINB 1   // ACC16 MT4 holds 150+ registers; minBlocks 2 caps it at 128
+#define EXL3_GEMM_ACC16_MT4_MINB 2   // 2 blocks/SM (128-register cap; <= 16 B spill in 2 of 21 ACC16 instantiations): +1.0% pp4096, +1.8% pp20480 vs 1
 #endif
 #define EXL3_GEMM_X_SCALE_ACC16 0.0625f         // == EXL3_GEMV_X_SCALE (exl3-gemv.cu): same fp16 envelope
 
