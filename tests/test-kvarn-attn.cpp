@@ -556,6 +556,7 @@ static int run_tq6_graph(const char * model_path) {
     cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
     cp.kvarn_bits_k = cp.kvarn_bits_v = 4;
     cp.kvarn_staging_type = GGML_TYPE_TQ6_0;
+    cp.kvarn_sink_type = GGML_TYPE_COUNT; // inheriting TQ6 sink, as before the F16-sink default
     cp.kvarn_sink = 128;
     cp.kvarn_tail = 2048;
     cp.kvarn_tail_max = 8192;

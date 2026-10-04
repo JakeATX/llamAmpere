@@ -696,8 +696,9 @@ struct common_params {
     uint32_t kvarn_bits_v = 0;
     uint32_t kvarn_tail   = 4096;
     uint32_t kvarn_sink   = 128;
-    ggml_type kvarn_staging_type = GGML_TYPE_F16;
-    ggml_type kvarn_sink_type = GGML_TYPE_COUNT;
+    ggml_type kvarn_staging_type = GGML_TYPE_TQ6_0; // intermediate tail precision; f16 is opt-in only
+    ggml_type kvarn_sink_type = GGML_TYPE_F16;      // separate F16 sink (TQ6 staging); q8_0 staging inherits
+    bool      kvarn_sink_type_set = false;          // --kvarn-sink-type given explicitly
     ggml_type kvarn_body_type = GGML_TYPE_F32; // F32 sentinel selects scalar KVarN records; I16 = trellis body; COUNT = auto (see llama.h)
     uint32_t kvarn_tail_max = 8192;   // adaptive tail by default; 0 = fixed tail
     bool     kvarn_tail_max_set = false; // --kvarn-tail-max given explicitly

@@ -2622,22 +2622,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
     add_opt(common_arg(
         {"--kvarn-staging-type"}, "TYPE",
-        "KVarN sink and tail storage: f16, q8_0 or tq6_0 (default: f16)",
+        "KVarN tail (and sink) storage: tq6_0, q8_0 or f16 (default: tq6_0 with a separate f16 sink; q8_0 stores the sink in q8_0 too)",
         [](common_params & params, const std::string & value) {
             if (value != "f16" && value != "q8_0" && value != "tq6_0") {
                 throw std::invalid_argument("KVarN staging type must be f16, q8_0 or tq6_0");
             }
             params.kvarn_staging_type = kv_cache_type_from_str(value);
+            // the default F16 sink exists only beside TQ6 staging; other staging types inherit unless --kvarn-sink-type was given
+            if (!params.kvarn_sink_type_set) {
+                params.kvarn_sink_type = params.kvarn_staging_type == GGML_TYPE_TQ6_0 ? GGML_TYPE_F16 : GGML_TYPE_COUNT;
+            }
         }
     ).set_env("LLAMA_ARG_KVARN_STAGING_TYPE"));
     add_opt(common_arg(
         {"--kvarn-sink-type"}, "TYPE",
-        "KVarN sink storage: staging or f16 (default: staging)",
+        "KVarN sink storage: staging or f16 (default: f16 with tq6_0 staging, staging otherwise)",
         [](common_params & params, const std::string & value) {
             if (value != "staging" && value != "f16") {
                 throw std::invalid_argument("KVarN sink type must be staging or f16");
             }
             params.kvarn_sink_type = value == "f16" ? GGML_TYPE_F16 : GGML_TYPE_COUNT;
+            params.kvarn_sink_type_set = true;
         }
     ).set_env("LLAMA_ARG_KVARN_SINK_TYPE"));
     add_opt(common_arg(

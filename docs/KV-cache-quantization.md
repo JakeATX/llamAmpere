@@ -80,7 +80,7 @@ llama-cli -m model.gguf -c 32768 -ngl 99 -fa on \
     --kvarn-sink 128 --kvarn-tail 2048 --kvarn-tail-max 8192
 ```
 
-These are experiment settings; the default staging type remains `f16`. The tail grows toward 8192 positions during active generation, then complete 128-token groups are compressed toward the 2048-position floor. The allocation includes group and batch headroom. Server idle maintenance can compress toward the floor after resolving speculative rollback and discarding prompt checkpoints. See [KVarN CUDA attention](development/kvarn-cuda.md) for the maintenance contract.
+The default staging is `tq6_0` with a separate F16 sink; `q8_0` staging stores the sink in Q8_0 as well, and `f16` staging is opt-in only. The tail grows toward 8192 positions during active generation, then complete 128-token groups are compressed toward the 2048-position floor. The allocation includes group and batch headroom. Server idle maintenance can compress toward the floor after resolving speculative rollback and discarding prompt checkpoints. See [KVarN CUDA attention](development/kvarn-cuda.md) for the maintenance contract.
 
 KVarN rotates Q, K, and V once with its 256-point Hadamard transform. TQ6 staging applies its 64-entry codebook, norm correction, and 6-bit packing separately to each 128-value block in that existing basis, without another WHT128 or InnerQ scaling. Attention reads that same basis and applies only the inverse KVarN256 transform to its output. KVarN ignores `TURBO_LAYER_ADAPTIVE` and the optional `LLAMA_ATTN_ROT_K/V_OVERRIDE` rotations. Ordinary `-ctk tq6_0 -ctv tq6_0` retains its existing WHT128 behavior.
 

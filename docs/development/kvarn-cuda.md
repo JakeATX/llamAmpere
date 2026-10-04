@@ -10,7 +10,7 @@ The cache sink is distinct from an attention sink input. Direct decode excludes 
 
 ## Sink and tail precision
 
-`--kvarn-staging-type q8_0` stores both the sink and ring in Q8_0; the default remains `f16`. For example, use `-ctk kvarn4 -ctv kvarn4 --kvarn-staging-type q8_0 --kvarn-sink 256 --kvarn-tail 4096`. Without `--kvarn-tail-max`, the tail keeps its fixed minimum and seals mature groups as they become available.
+`--kvarn-staging-type q8_0` stores both the sink and ring in Q8_0; the default is `tq6_0` with a separate F16 sink. For example, use `-ctk kvarn4 -ctv kvarn4 --kvarn-staging-type q8_0 --kvarn-sink 256 --kvarn-tail 4096`. The adaptive tail is the default (`--kvarn-tail 4096 --kvarn-tail-max 8192`); with `--kvarn-tail-max 0` the tail keeps its fixed minimum and seals mature groups as they become available.
 
 Q8 rows use the existing quantized SET_ROWS writer after the KVarN rotation. Attention dequantizes only the tile being read to FP16. Compression also reads Q8, rounds its reconstruction to FP16, and seals the resulting values into K4/V4 records. There is no persistent FP16 copy of the Q8 sink or tail. Q8 staging therefore introduces an additional quantization step before body compression; a larger retained window must be evaluated against this cost using matched-token KLD.
 

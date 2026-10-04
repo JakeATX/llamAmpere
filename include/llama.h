@@ -428,8 +428,8 @@ extern "C" {
         uint32_t kvarn_tail;   // recent positions kept unsealed (multiple of 128, default 4096)
         uint32_t kvarn_sink;   // leading positions kept unsealed (multiple of 64)
         enum ggml_type kvarn_body_type; // F32 sentinel = KVarN scalar records, I16 sentinel = KVarN with trellis-coded payloads (built-in codebooks), COUNT = auto (trellis for the 3/3, 3/2, 2/2 pairs, scalar otherwise), TURBO4_0 = stored-domain Turbo4
-        enum ggml_type kvarn_sink_type; // COUNT inherits staging; F16 keeps a separate sink
-        enum ggml_type kvarn_staging_type; // F16 (default), Q8_0 or stored-domain TQ6_0 for both sink and tail
+        enum ggml_type kvarn_sink_type; // F16 (default) keeps a separate sink and needs TQ6_0 staging; COUNT inherits staging (required with Q8_0)
+        enum ggml_type kvarn_staging_type; // stored-domain TQ6_0 (default), Q8_0 or F16 for the tail (and an inheriting sink)
         uint32_t kvarn_tail_max; // 0 = fixed tail; otherwise batch compression between tail and tail_max (default 8192, adaptive)
         uint32_t kvarn_edge_layers; // tiered body: KV layers within the first and last N model layers seal at kvarn_edge_bits_k/v (0 = uniform)
         uint32_t kvarn_edge_bits_k; // edge-tier body bits (default 4/4)
