@@ -51,4 +51,11 @@ void ggml_cuda_exl3_ffn_bridge_f16(const float * part_gate, const int ksplit_gat
 bool ggml_cuda_exl3_ffn_bridge(ggml_backend_cuda_context & ctx, const ggml_tensor * mm_gate, const ggml_tensor * mm_up,
                                ggml_tensor * mm_down);
 
+// [#13] trellis-direct tensor-core GEMM for T > EXL3_GEMV_MAX_T (prefill); GGML_CUDA_EXL3_GEMM=0 forces the M1
+// reconstruct + cuBLAS path. suh/svh may be null.
+bool ggml_cuda_exl3_gemm_enabled();
+bool ggml_cuda_exl3_gemm_supported(const ggml_tensor * src0, const int64_t T);
+void ggml_cuda_exl3_gemm(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
+                         const int64_t T, const float * suh, const float * svh);
+
 void ggml_cuda_mul_mat_exl3(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);

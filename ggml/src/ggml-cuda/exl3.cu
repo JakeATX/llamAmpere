@@ -287,6 +287,10 @@ void ggml_cuda_mul_mat_exl3(ggml_backend_cuda_context & ctx, const ggml_tensor *
         ggml_cuda_exl3_gemv(ctx, src0, src1, dst, T, suh, svh);
         return;
     }
+    if (ggml_cuda_exl3_gemm_supported(src0, T)) {
+        ggml_cuda_exl3_gemm(ctx, src0, src1, dst, T, suh, svh);
+        return;
+    }
 
     const int id = ggml_cuda_get_device();
     cudaStream_t stream = ctx.stream();
