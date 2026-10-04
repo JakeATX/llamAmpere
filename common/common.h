@@ -694,12 +694,13 @@ struct common_params {
     // KVarN region-aware cache (-ctk kvarnN -ctv kvarnM): 0 = off; sink/tail positions kept unsealed
     uint32_t kvarn_bits_k = 0;
     uint32_t kvarn_bits_v = 0;
-    uint32_t kvarn_tail   = 1024;
+    uint32_t kvarn_tail   = 4096;
     uint32_t kvarn_sink   = 128;
     ggml_type kvarn_staging_type = GGML_TYPE_F16;
     ggml_type kvarn_sink_type = GGML_TYPE_COUNT;
     ggml_type kvarn_body_type = GGML_TYPE_F32; // F32 sentinel selects scalar KVarN records; I16 = trellis body; COUNT = auto (see llama.h)
-    uint32_t kvarn_tail_max = 0;
+    uint32_t kvarn_tail_max = 8192;   // adaptive tail by default; 0 = fixed tail
+    bool     kvarn_tail_max_set = false; // --kvarn-tail-max given explicitly
     uint32_t kvarn_edge_layers = 0; // tiered body: first/last N cache layers sealed at kvarn_edge_bits_k/v
     uint32_t kvarn_edge_bits_k = 4;
     uint32_t kvarn_edge_bits_v = 4;

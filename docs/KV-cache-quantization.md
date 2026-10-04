@@ -89,7 +89,7 @@ Each 128-value TQ6 block occupies 98 bytes, including its FP16 norm; a 256-chann
 ## KVarN low-bit bodies and the trellis codec
 
 Three KVarN body configurations are the production paths, all with the staged sink (`--kvarn-sink 128`) and the
-adaptive tq6_0 tail (`--kvarn-tail 4096 --kvarn-tail-max 8192`):
+adaptive tq6_0 tail (`--kvarn-tail 4096 --kvarn-tail-max 8192`). The adaptive tail is the default for every KVarN body (`--kvarn-tail 4096 --kvarn-tail-max 8192`); `--kvarn-tail-max 0` selects a fixed tail. A larger `--kvarn-tail` without `--kvarn-tail-max` raises the ceiling to match:
 
 | Path        | Flags                                                  | Body bits per element | Sealed body codec                     |
 |-------------|--------------------------------------------------------|-----------------------|---------------------------------------|

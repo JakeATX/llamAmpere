@@ -2669,16 +2669,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("KVarN cache: number of most recent positions kept unsealed (multiple of 128, default: %u)", params.kvarn_tail),
         [](common_params & params, int value) {
             params.kvarn_tail = (uint32_t) value;
+            // the default adaptive ceiling follows a larger explicit tail; an explicit --kvarn-tail-max is kept as given
+            if (!params.kvarn_tail_max_set && params.kvarn_tail_max != 0 && params.kvarn_tail_max < params.kvarn_tail) {
+                params.kvarn_tail_max = params.kvarn_tail;
+            }
         }
     ).set_env("LLAMA_ARG_KVARN_TAIL"));
     add_opt(common_arg(
         {"--kvarn-tail-max"}, "N",
-        "KVarN adaptive tail: grow to N positions, then batch compression toward --kvarn-tail; server idle compression discards prompt checkpoints; 0 disables (default: 0)",
+        string_format("KVarN adaptive tail: grow to N positions, then batch compression toward --kvarn-tail; server idle compression discards prompt checkpoints; 0 = fixed tail (default: %u)", params.kvarn_tail_max),
         [](common_params & params, int value) {
             if (value < 0 || value % 128 != 0) {
                 throw std::invalid_argument("KVarN maximum tail must be nonnegative and a multiple of 128");
             }
             params.kvarn_tail_max = (uint32_t) value;
+            params.kvarn_tail_max_set = true;
         }
     ).set_env("LLAMA_ARG_KVARN_TAIL_MAX"));
     add_opt(common_arg(
