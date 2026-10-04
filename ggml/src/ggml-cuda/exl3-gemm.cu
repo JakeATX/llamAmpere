@@ -30,6 +30,9 @@
 #define EXL3_GEMM_WARPS_M 2
 #define EXL3_GEMM_WARPS_N 4
 #define EXL3_GEMM_THREADS (32 * EXL3_GEMM_WARPS_M * EXL3_GEMM_WARPS_N)
+#ifndef EXL3_GEMM_ACC16_MT4_MINB
+#define EXL3_GEMM_ACC16_MT4_MINB 1   // ACC16 MT4 holds 150+ registers; minBlocks 2 caps it at 128
+#endif
 #define EXL3_GEMM_X_SCALE_ACC16 0.0625f         // == EXL3_GEMV_X_SCALE (exl3-gemv.cu): same fp16 envelope
 
 template <int BITS, int MT, int STAGES>
@@ -146,7 +149,7 @@ static __device__ __forceinline__ void exl3_gemm_decode(const uint32_t * __restr
 // x: fp16 [T][K]; trellis [kt][nt][8*BITS]; out [gridDim.z][T][N] (gridDim.z == 1: y itself); ksteps_per_split
 // k-steps of BK per z slice
 template <int BITS, int MT, int STAGES, bool ACC16>
-static __global__ void __launch_bounds__(EXL3_GEMM_THREADS, (MT >= 4 && ACC16) ? 1 : 2)
+static __global__ void __launch_bounds__(EXL3_GEMM_THREADS, (MT >= 4 && ACC16) ? EXL3_GEMM_ACC16_MT4_MINB : 2)
 k_exl3_gemm(const uint32_t * __restrict__ trellis, const half * __restrict__ x, float * __restrict__ out,
             const int T, const int K, const int N, const int ksteps_per_split, const float out_scale) {
 #if __CUDA_ARCH__ >= 800
