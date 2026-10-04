@@ -59,11 +59,21 @@ static __device__ uint16_t fattn_kvarn_cb2_k[FATTN_KVARN_TR2_NWIN] = KVARN_CB2_T
 static __device__ uint16_t fattn_kvarn_cb2_v[FATTN_KVARN_TR2_NWIN] = KVARN_CB2_TRAINED_V_INIT;
 void ggml_cuda_kvarn_trellis_cb3_register(const void * sym_k, const void * sym_v); // kvarn-seal.cu
 void ggml_cuda_kvarn_trellis_cb2_register(const void * sym_k, const void * sym_v); // kvarn-seal.cu
+void ggml_cuda_kvarn_trellis_cb4_register(const void * sym_k, const void * sym_v); // kvarn-seal.cu
+// 4-bit token-axis trellis (ggml-kvarn.h "trellis4", GGML_KVARN_TRELLIS_TOKENS=1 only): 10-bit windows, 1024 entries
+#define FATTN_KVARN_TR4_NWIN 1024
+static __device__ uint16_t fattn_kvarn_cb4_k[FATTN_KVARN_TR4_NWIN] = KVARN_CB_K_INIT;
+static __device__ uint16_t fattn_kvarn_cb4_v[FATTN_KVARN_TR4_NWIN] = KVARN_CB_V_INIT;
 void ggml_cuda_kvarn_trellis_cb_init();                                            // kvarn-seal.cu
+void ggml_cuda_kvarn_trellis_tok_register(const void * sym);                       // kvarn-seal.cu
+// GGML_KVARN_TRELLIS_TOKENS=1 (ggml_kvarn::trellis3::tokens): channel-major low-bit trellis payload; set by cb_init
+static __device__ int fattn_kvarn_trtok = 0;
 struct fattn_kvarn_cb3_registrar {
     fattn_kvarn_cb3_registrar() {
         ggml_cuda_kvarn_trellis_cb3_register((const void *) fattn_kvarn_cb3_k, (const void *) fattn_kvarn_cb3_v);
         ggml_cuda_kvarn_trellis_cb2_register((const void *) fattn_kvarn_cb2_k, (const void *) fattn_kvarn_cb2_v);
+        ggml_cuda_kvarn_trellis_cb4_register((const void *) fattn_kvarn_cb4_k, (const void *) fattn_kvarn_cb4_v);
+        ggml_cuda_kvarn_trellis_tok_register((const void *) &fattn_kvarn_trtok);
     }
 };
 static fattn_kvarn_cb3_registrar fattn_kvarn_cb3_registrar_instance;
@@ -72,11 +82,12 @@ static fattn_kvarn_cb3_registrar fattn_kvarn_cb3_registrar_instance;
 // decoded through the BITS-bit trellis codebook, packed as q[l] = (value l, value l+4) like fattn_kvarn_lowbits_decode_word.
 template<int BITS, bool is_V>
 static __device__ __forceinline__ void fattn_kvarn_trellis_lb_word(const uint8_t * __restrict__ payload, const int word, half2 * const __restrict__ q /* [4] */) {
-    static_assert(BITS == 2 || BITS == 3, "low-bit trellis decode");
-    const uint16_t * cb = BITS == 3 ? (is_V ? fattn_kvarn_cb3_v : fattn_kvarn_cb3_k) : (is_V ? fattn_kvarn_cb2_v : fattn_kvarn_cb2_k);
+    static_assert(BITS >= 2 && BITS <= 4, "low-bit trellis decode (4 = token-axis trellis4)");
+    const uint16_t * cb = BITS == 4 ? (is_V ? fattn_kvarn_cb4_v : fattn_kvarn_cb4_k) : BITS == 3 ? (is_V ? fattn_kvarn_cb3_v : fattn_kvarn_cb3_k) : (is_V ? fattn_kvarn_cb2_v : fattn_kvarn_cb2_k);
     const int lane  = word & 31;
     const int tile  = (word >> 5) & 15;
     const int strip = word >> 9;
+    const bool tok  = fattn_kvarn_trtok != 0;
     half vals[8];
 #pragma unroll
     for (int nib = 0; nib < 8; ++nib) {
@@ -85,7 +96,7 @@ static __device__ __forceinline__ void fattn_kvarn_trellis_lb_word(const uint8_t
         const int col = 2*((l >> 1)*4 + (lane & 3)) + e;
         const int token   = strip*16 + (is_V ? col : row);
         const int channel = tile*16  + (is_V ? row : col);
-        vals[nib] = __ushort_as_half(cb[ggml_kvarn::trellis_lb_window<BITS>(payload, token, channel, 256)]);
+        vals[nib] = __ushort_as_half(cb[ggml_kvarn::trellis_lb_window_any<BITS>(payload, token, channel, 256, 128, tok)]);
     }
 #pragma unroll
     for (int l = 0; l < 4; ++l) {
@@ -108,6 +119,61 @@ static __device__ __forceinline__ void fattn_kvarn_trellis_lb_word_w(const uint8
     const int strip = word >> 9;
     half vals[8];
     // nib = (e << 2) | (j << 1) | r with row = r*8 + lane/4, col = 2*(j*4 + lane%4) + e (fattn_kvarn_trellis_lb_word)
+    if (fattn_kvarn_trtok) {
+        // token-traversal payload (GGML_KVARN_TRELLIS_TOKENS): channel-major stream, bit (channel*128 + token)*BITS,
+        // history along the tokens of a channel (h = token % 128). The roles of the two branches below swap:
+        // K: per channel one run over tokens t0, t0+8 (2 words); V: per channel one run over tokens t1..t1+9 (2-3 words).
+        constexpr int G = 128;
+        if constexpr (!is_V) {
+            static_assert(37 + 9*BITS <= 64, "K token-traversal span");
+            const int t0 = strip*16 + (lane >> 2);
+            const int g0 = tile*16 + 2*(lane & 3);
+#pragma unroll
+            for (int j = 0; j < 2; ++j) {
+#pragma unroll
+                for (int e = 0; e < 2; ++e) {
+                    const int ch = g0 + 8*j + e;
+                    const uint32_t b0   = ((uint32_t) ch*G + (uint32_t) t0)*BITS;
+                    const uint32_t base = (b0 >= 6u ? b0 - 6u : 0u) >> 5;
+                    const uint32_t w0 = __ldg(p32 + base);
+                    const uint32_t w1 = __ldg(p32 + base + 1);
+#pragma unroll
+                    for (int r = 0; r < 2; ++r) {
+                        const uint32_t rel = b0 + (uint32_t) (8*r)*BITS - 32u*base;
+                        const uint32_t win = ggml_kvarn::trellis_lb_window_w<BITS>(w0, w1, 0u, rel, (t0 + 8*r) & 127);
+                        vals[(e << 2) | (j << 1) | r] = __ushort_as_half(__ldg(cb + win));
+                    }
+                }
+            }
+        } else {
+            constexpr bool need_w2 = 37 + 10*BITS > 64;
+            const int t1 = strip*16 + 2*(lane & 3);
+            const int d0 = tile*16 + (lane >> 2);
+#pragma unroll
+            for (int r = 0; r < 2; ++r) {
+                const int ch = d0 + 8*r;
+                const uint32_t b0   = ((uint32_t) ch*G + (uint32_t) t1)*BITS;
+                const uint32_t base = (b0 >= 6u ? b0 - 6u : 0u) >> 5;
+                const uint32_t w0 = __ldg(p32 + base);
+                const uint32_t w1 = __ldg(p32 + base + 1);
+                const uint32_t w2 = need_w2 ? __ldg(p32 + base + 2) : 0u;
+#pragma unroll
+                for (int j = 0; j < 2; ++j) {
+#pragma unroll
+                    for (int e = 0; e < 2; ++e) {
+                        const uint32_t rel = b0 + (uint32_t) (8*j + e)*BITS - 32u*base;
+                        const uint32_t win = ggml_kvarn::trellis_lb_window_w<BITS>(w0, w1, w2, rel, (t1 + 8*j + e) & 127);
+                        vals[(e << 2) | (j << 1) | r] = __ushort_as_half(__ldg(cb + win));
+                    }
+                }
+            }
+        }
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            q[l] = __halves2half2(vals[l], vals[l + 4]);
+        }
+        return;
+    }
     if constexpr (!is_V) {
         // span per token: codes g0 .. g0+9 plus 6 history bits, <= 31 + 6 + 10*BITS bits -> 3 words (3-bit), 2 (2-bit)
         constexpr bool need_w2 = 37 + 10*BITS > 64;

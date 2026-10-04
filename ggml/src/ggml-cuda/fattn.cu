@@ -13,6 +13,7 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include "../ggml-kvarn.h"
 
 // Flash-attention path census, opt-in via GGML_FATTN_PATH_STATS=1.
 // Counts every ggml_cuda_flash_attn_ext dispatch keyed by (path, K type, V type,
@@ -1054,7 +1055,8 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 
     // KVarN region-aware attention (sink/ring f16 rows + sealed 4-bit body records): dedicated MMA path.
     if (dst->src[6] != nullptr) {
-        if (ggml_get_op_params_i32(dst,5) != ((4 << 8) | 4)) {
+        // 4/4 token-axis trellis4 body (I16 under GGML_KVARN_TRELLIS_TOKENS=1, audit default off): the low-bit tile loader
+        if (ggml_get_op_params_i32(dst,5) != ((4 << 8) | 4) || (ggml_get_op_params_i32(dst,7) == GGML_TYPE_I16 && ggml_kvarn::trellis3::tokens())) {
             ggml_cuda_fattn_path_note("kvarn_lowerbits", dst, -1);
             ggml_cuda_flash_attn_kvarn_lowbits(ctx,dst);
             return;

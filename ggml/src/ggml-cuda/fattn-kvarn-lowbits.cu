@@ -108,7 +108,12 @@ static void kvarn_trellis_words_note() {
 
 template<int bits_k, int bits_v>
 static void ggml_cuda_lowbits_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    if (ggml_get_op_params_i32(dst,7) == GGML_TYPE_I16) {
+    if constexpr (bits_k == 4 && bits_v == 4) {
+        // 4/4 reaches this path only as the token-axis trellis4 body (GGML_KVARN_TRELLIS_TOKENS=1, fattn.cu)
+        GGML_ASSERT(ggml_get_op_params_i32(dst,7) == GGML_TYPE_I16 && ggml_kvarn::trellis3::tokens());
+        ggml_cuda_kvarn_trellis_cb_init();
+        ggml_cuda_lowbits_prefill_case<256,256,8,8,4,4>(ctx,dst);
+    } else if (ggml_get_op_params_i32(dst,7) == GGML_TYPE_I16) {
         // trellis-coded body: the stream kernel has no codebook path, the tile loader decodes every width
         ggml_cuda_kvarn_trellis_cb_init();
         if constexpr (bits_k <= 3 && bits_v <= 3) {
@@ -134,6 +139,7 @@ void ggml_cuda_flash_attn_kvarn_lowbits(ggml_backend_cuda_context & ctx, ggml_te
         case (2 << 8) | 4: ggml_cuda_lowbits_case<2,4>(ctx,dst); break;
         case (3 << 8) | 2: ggml_cuda_lowbits_case<3,2>(ctx,dst); break;
         case (2 << 8) | 2: ggml_cuda_lowbits_case<2,2>(ctx,dst); break;
+        case (4 << 8) | 4: ggml_cuda_lowbits_case<4,4>(ctx,dst); break; // token-axis trellis4 only (GGML_KVARN_TRELLIS_TOKENS=1)
         default: GGML_ABORT("Unsupported KVarN lower-bit pair");
     }
 }
