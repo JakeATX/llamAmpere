@@ -1848,11 +1848,15 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
         auto & cells = v_cells[seq_to_stream[s]];
 
-        if (cells.seq_pos_min(s) <= seq_pos_max_rm[s]) {
-            LLAMA_LOG_DEBUG("%s: purging positions [%d, %d] of sequence %d from KV cache\n",
-                    __func__, cells.seq_pos_min(s), seq_pos_max_rm[s], s);
+        // attention sinks ([0, n_swa_sink), only set for the MTP drafter window) are kept: the purge starts above
+        // them, which leaves a deliberate gap between the sinks and the window (n_swa_sink = 0: unchanged)
+        const llama_pos p_purge = std::max(cells.seq_pos_min(s), (llama_pos) n_swa_sink);
 
-            seq_rm(s, cells.seq_pos_min(s), seq_pos_max_rm[s] + 1);
+        if (p_purge <= seq_pos_max_rm[s]) {
+            LLAMA_LOG_DEBUG("%s: purging positions [%d, %d] of sequence %d from KV cache\n",
+                    __func__, p_purge, seq_pos_max_rm[s], s);
+
+            seq_rm(s, p_purge, seq_pos_max_rm[s] + 1);
         }
     }
 

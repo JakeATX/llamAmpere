@@ -3378,9 +3378,17 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         llama_swa_type swa_type_cur = hparams.swa_type;
 
                         if (draft_window) {
-                            const uint32_t ring = GGML_PAD(cparams.draft_attn_window + cparams.draft_attn_sink + cparams.n_ubatch, 256);
+                            // a KVarN cache addresses its rows by position, which a recycled ring breaks
+                            GGML_ASSERT(!params.kvarn.enabled() && "the MTP draft attention window needs a plain KV cache");
 
-                            kv_size_cur  = std::min(cparams.n_ctx_seq, ring);
+                            // in a unified cache every sequence keeps its own window + sinks (as llama_kv_cache_iswa
+                            // sizes its SWA half); 64-bit math and the context cap keep absurd values from wrapping
+                            const uint64_t n_seq_ring = cparams.kv_unified ? cparams.n_seq_max : 1;
+                            const uint64_t ring = GGML_PAD(
+                                    (std::min<uint64_t>(cparams.draft_attn_window, cparams.n_ctx_seq) + cparams.draft_attn_sink)*n_seq_ring +
+                                    cparams.n_ubatch, 256);
+
+                            kv_size_cur  = (uint32_t) std::min<uint64_t>(cparams.n_ctx_seq, ring);
                             n_swa_cur    = cparams.draft_attn_window;
                             swa_type_cur = LLAMA_SWA_TYPE_STANDARD;
 

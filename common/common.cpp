@@ -1259,7 +1259,10 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         auto cparams_dft = common_context_params_to_llama(params_dft);
         if (spec_mtp) {
             cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
-            common_speculative_mtp_cparams(params_dft, cparams_dft);
+            // as in common_speculative_init_result: the window applies to the MTP head, not to a separate draft model
+            if (!has_draft) {
+                common_speculative_mtp_cparams(params_dft, cparams_dft);
+            }
         }
         cparams_dft.n_rs_seq = 0;
 
