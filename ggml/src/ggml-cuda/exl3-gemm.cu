@@ -503,13 +503,20 @@ void ggml_cuda_exl3_gemm(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
     const int ksplit = (nsteps + kps - 1) / kps;   // no empty z slices
 
     const bool post = ksplit > 1 || svh != nullptr;
+    // [FIT12 overhead] without split-K the svh/Hadamard epilogue runs in place on dst (bit-identical), so the T x N f32
+    // partial buffer is not taken from the pool (68 MiB for the fused gate+up at T = 512). GGML_CUDA_EXL3_GLUE_INPLACE=0
+    // restores the out-of-place epilogue.
+    static const bool inplace_ok = [] { const char * e = getenv("GGML_CUDA_EXL3_GLUE_INPLACE"); return !(e && e[0] == '0'); }();
+    const bool inplace = post && ksplit == 1 && svh != nullptr && N % 128 == 0 && inplace_ok;
     ggml_cuda_pool_alloc<float> part(ctx.pool());
     float * y   = (float *) dst->data;
-    float * out = post ? part.alloc((size_t) ksplit * T * N) : y;
+    float * out = post && !inplace ? part.alloc((size_t) ksplit * T * N) : y;
     const float out_scale = 1.0f / x_scale;
 
     exl3_gemm_launch(false, mt, acc16, bits, (const uint32_t *) src0->data, xh.get(), out, (int) T, K, N, ksplit, kps, out_scale, stream);
-    if (post) {
+    if (inplace) {
+        ggml_cuda_exl3_glue_out_inplace(y, svh, N, T, 1.0f, stream);
+    } else if (post) {
         ggml_cuda_exl3_glue_out(out, svh, y, N, T, ksplit, 1.0f, stream);
     }
 }

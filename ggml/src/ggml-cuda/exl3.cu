@@ -143,6 +143,40 @@ static __global__ void k_exl3_glue_out(const float * __restrict__ part, const fl
     }
 }
 
+// [FIT12 overhead] glue_out of a single partial (ksplit == 1) in place: y[T][N] = scale * svh * H128(y). Each lane reads
+// and writes only its own four elements of its warp's 128-chunk, so there is no cross-thread hazard, and the float
+// expression is the one k_exl3_glue_out evaluates for ksplit == 1 (including the 0.0f + a of the partial sum), so the
+// result is bit-identical to the out-of-place call. Saves the T x N f32 partial buffer.
+static __global__ void k_exl3_glue_out_inplace(float * y, const float * __restrict__ svh, const int N, const size_t n_chunks,
+                                               const float scale) {
+    const size_t c = (size_t) blockIdx.x * 4 + (threadIdx.x >> 5);
+    if (c >= n_chunks) {
+        return;
+    }
+    const int lane = threadIdx.x & 31;
+    const size_t base = c * 128;
+    const int nc = (int) (base % (size_t) N);
+    float v[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        v[j] = 0.0f;
+        v[j] += y[base + j * 32 + lane];
+    }
+    exl3_wht128(v);
+    const float s = scale * EXL3_WHT128_SCALE;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        y[base + j * 32 + lane] = v[j] * s * svh[nc + j * 32 + lane];
+    }
+}
+
+void ggml_cuda_exl3_glue_out_inplace(float * y, const float * svh, const int N, const int64_t T, const float scale, cudaStream_t stream) {
+    GGML_ASSERT(svh != nullptr && N % 128 == 0);
+    const size_t n_chunks = (size_t) T * N / 128;
+    const int nb = (int) ((n_chunks + 3) / 4);
+    k_exl3_glue_out_inplace<<<nb, 128, 0, stream>>>(y, svh, N, n_chunks, scale);
+}
+
 // y[i] = scale * sum_ks part[ks][i] over the flat [T][N], one thread per element: the no-svh glue_out when N % 128 != 0
 // (N % 16 only). Same summation order as exl3_sum_partials, so the result matches the 128-chunk kernel bit for bit.
 static __global__ void k_exl3_glue_out_flat(const float * __restrict__ part, float * __restrict__ y, const size_t n,
