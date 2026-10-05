@@ -359,8 +359,11 @@ bool ggml_cuda_exl3_gemm_enabled() {
     return enabled;
 }
 
+// ACC16 is the default: same fp16 envelope as the shipped GEMV mma path (x/16, 64 products per fold); generated-token
+// KLD vs the base build equals the fp32-acc kernel's (q8 KV 0.000021 vs 0.000017 at 25.6K) at +19% prefill (pp4096).
+// GGML_CUDA_EXL3_GEMM_ACC16=0 selects fp32 accumulation.
 static bool exl3_gemm_acc16() {
-    static const bool on = exl3_gemm_env_int("GGML_CUDA_EXL3_GEMM_ACC16", 0) != 0;
+    static const bool on = exl3_gemm_env_int("GGML_CUDA_EXL3_GEMM_ACC16", 1) != 0;
     return on;
 }
 
