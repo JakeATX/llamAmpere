@@ -110,7 +110,7 @@ template<int bits_k, int bits_v>
 static void ggml_cuda_lowbits_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     if constexpr (bits_k == 4 && bits_v == 4) {
         // 4/4 reaches this path only as the token-axis trellis4 body (GGML_KVARN_TRELLIS_TOKENS=1, fattn.cu)
-        GGML_ASSERT(ggml_get_op_params_i32(dst,7) == GGML_TYPE_I16 && ggml_kvarn::trellis3::tokens());
+        GGML_ASSERT(ggml_get_op_params_i32(dst,7) == GGML_TYPE_I16 && ggml_kvarn::trellis3::tokens4());
         ggml_cuda_kvarn_trellis_cb_init();
         ggml_cuda_lowbits_prefill_case<256,256,8,8,4,4>(ctx,dst);
     } else if (ggml_get_op_params_i32(dst,7) == GGML_TYPE_I16) {

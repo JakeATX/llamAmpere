@@ -60,13 +60,14 @@ static __device__ uint16_t fattn_kvarn_cb2_v[FATTN_KVARN_TR2_NWIN] = KVARN_CB2_T
 void ggml_cuda_kvarn_trellis_cb3_register(const void * sym_k, const void * sym_v); // kvarn-seal.cu
 void ggml_cuda_kvarn_trellis_cb2_register(const void * sym_k, const void * sym_v); // kvarn-seal.cu
 void ggml_cuda_kvarn_trellis_cb4_register(const void * sym_k, const void * sym_v); // kvarn-seal.cu
-// 4-bit token-axis trellis (ggml-kvarn.h "trellis4", GGML_KVARN_TRELLIS_TOKENS=1 only): 10-bit windows, 1024 entries
+// 4-bit token-axis trellis (ggml-kvarn.h "trellis4", explicit GGML_KVARN_TRELLIS_TOKENS=1 only): 10-bit windows, 1024 entries
 #define FATTN_KVARN_TR4_NWIN 1024
-static __device__ uint16_t fattn_kvarn_cb4_k[FATTN_KVARN_TR4_NWIN] = KVARN_CB_K_INIT;
-static __device__ uint16_t fattn_kvarn_cb4_v[FATTN_KVARN_TR4_NWIN] = KVARN_CB_V_INIT;
+static __device__ uint16_t fattn_kvarn_cb4_k[FATTN_KVARN_TR4_NWIN] = KVARN_CB4_TOK_K_INIT;
+static __device__ uint16_t fattn_kvarn_cb4_v[FATTN_KVARN_TR4_NWIN] = KVARN_CB4_TOK_V_INIT;
 void ggml_cuda_kvarn_trellis_cb_init();                                            // kvarn-seal.cu
 void ggml_cuda_kvarn_trellis_tok_register(const void * sym);                       // kvarn-seal.cu
-// GGML_KVARN_TRELLIS_TOKENS=1 (ggml_kvarn::trellis3::tokens): channel-major low-bit trellis payload; set by cb_init
+// token-axis flags, set by cb_init: bit 0 = channel-major low-bit trellis payload (ggml_kvarn::trellis3::tokens, default on,
+// GGML_KVARN_TRELLIS_TOKENS=0 clears it), bit 1 = the 4/4 trellis4 body (trellis3::tokens4, explicit GGML_KVARN_TRELLIS_TOKENS=1)
 static __device__ int fattn_kvarn_trtok = 0;
 struct fattn_kvarn_cb3_registrar {
     fattn_kvarn_cb3_registrar() {
@@ -87,7 +88,7 @@ static __device__ __forceinline__ void fattn_kvarn_trellis_lb_word(const uint8_t
     const int lane  = word & 31;
     const int tile  = (word >> 5) & 15;
     const int strip = word >> 9;
-    const bool tok  = fattn_kvarn_trtok != 0;
+    const bool tok  = (fattn_kvarn_trtok & (BITS == 4 ? 2 : 1)) != 0; // bit 0 low-bit token axis (default), bit 1 trellis4
     half vals[8];
 #pragma unroll
     for (int nib = 0; nib < 8; ++nib) {
@@ -119,7 +120,7 @@ static __device__ __forceinline__ void fattn_kvarn_trellis_lb_word_w(const uint8
     const int strip = word >> 9;
     half vals[8];
     // nib = (e << 2) | (j << 1) | r with row = r*8 + lane/4, col = 2*(j*4 + lane%4) + e (fattn_kvarn_trellis_lb_word)
-    if (fattn_kvarn_trtok) {
+    if (fattn_kvarn_trtok & 1) {
         // token-traversal payload (GGML_KVARN_TRELLIS_TOKENS): channel-major stream, bit (channel*128 + token)*BITS,
         // history along the tokens of a channel (h = token % 128). The roles of the two branches below swap:
         // K: per channel one run over tokens t0, t0+8 (2 words); V: per channel one run over tokens t1..t1+9 (2-3 words).

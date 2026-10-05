@@ -656,8 +656,8 @@ static __device__ __forceinline__ void flash_attn_ext_kvarn_load_tile(
                     if (kv.trellis_words) { fattn_kvarn_trellis_lb_word_w<3,is_V>(packed, word, q); } else { fattn_kvarn_trellis_lb_word<3,is_V>(packed, word, q); }
                 } else if (kv.body_type == GGML_TYPE_I16 && bits == 2) {
                     if (kv.trellis_words) { fattn_kvarn_trellis_lb_word_w<2,is_V>(packed, word, q); } else { fattn_kvarn_trellis_lb_word<2,is_V>(packed, word, q); }
-                } else if (kv.body_type == GGML_TYPE_I16 && bits == 4 && fattn_kvarn_trtok) {
-                    fattn_kvarn_trellis_lb_word<4,is_V>(packed, word, q); // token-axis trellis4 (GGML_KVARN_TRELLIS_TOKENS=1)
+                } else if (kv.body_type == GGML_TYPE_I16 && bits == 4 && (fattn_kvarn_trtok & 2)) {
+                    fattn_kvarn_trellis_lb_word<4,is_V>(packed, word, q); // token-axis trellis4 (opt-in, explicit GGML_KVARN_TRELLIS_TOKENS=1)
                 } else {
                     const uint32_t w = bits == 4 ? __ldg(payload + word)
                         : bits == 3 ? kvarn_lowbits::fragment_word<3,is_V>(packed,word)
@@ -703,8 +703,8 @@ static __device__ __forceinline__ void flash_attn_ext_kvarn_load_tile(
                     if (kv.trellis_words) { fattn_kvarn_trellis_lb_word_w<3,is_V>(packed, word, q); } else { fattn_kvarn_trellis_lb_word<3,is_V>(packed, word, q); }
                 } else if (kv.body_type == GGML_TYPE_I16 && bits == 2) {
                     if (kv.trellis_words) { fattn_kvarn_trellis_lb_word_w<2,is_V>(packed, word, q); } else { fattn_kvarn_trellis_lb_word<2,is_V>(packed, word, q); }
-                } else if (kv.body_type == GGML_TYPE_I16 && bits == 4 && fattn_kvarn_trtok) {
-                    fattn_kvarn_trellis_lb_word<4,is_V>(packed, word, q); // token-axis trellis4 (GGML_KVARN_TRELLIS_TOKENS=1)
+                } else if (kv.body_type == GGML_TYPE_I16 && bits == 4 && (fattn_kvarn_trtok & 2)) {
+                    fattn_kvarn_trellis_lb_word<4,is_V>(packed, word, q); // token-axis trellis4 (opt-in, explicit GGML_KVARN_TRELLIS_TOKENS=1)
                 } else {
                     const uint32_t w = bits == 4 ? __ldg(payload + word)
                         : bits == 3 ? kvarn_lowbits::fragment_word<3,is_V>(packed,word)

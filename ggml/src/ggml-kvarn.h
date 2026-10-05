@@ -230,11 +230,12 @@ inline bool trellis_lb_load(const char * env, const char * tag, int L, int BITS,
     return true;
 }
 // ---------------------------------------------------------------------------------------------------------
-// 3-bit trellis body ("kvarn3t"): body type GGML_TYPE_I16 on a 3-bit side. The payload keeps the plain
-// token-major 3-bit stream of code_bit(); the trellis runs along the channels of a token row and restarts
-// (history = 0) every SEQ channels. The window of code (t, d) is the current code in its top 3 bits and the
+// 3-bit trellis body ("kvarn3t"): body type GGML_TYPE_I16 on a 3-bit side. Default (2026-10-05): the trellis
+// runs along the tokens of each channel and the payload is the channel-major stream (see tokens() below).
+// GGML_KVARN_TRELLIS_TOKENS=0 (channel axis): the payload keeps the plain token-major 3-bit stream of code_bit();
+// the trellis runs along the channels of a token row and restarts (history = 0) every SEQ channels. The window of code (t, d) is the current code in its top 3 bits and the
 // two codes before it below (older lower), i.e. exactly the L = 9 stream bits ending at the current code.
-// The built-in trained codebook (ggml-kvarn-cb-lowbits.h) is the default; the identity codebook cb[w] = w >> 6
+// The built-in trained codebook of the active axis (ggml-kvarn-cb-lowbits.h) is the default; the identity codebook cb[w] = w >> 6
 // reproduces scalar RTN codes (GGML_KVARN_TRELLIS_CB3=identity, or a file of uint16 K[NWIN] then V[NWIN] fp16
 // bits). GGML_KVARN_TRELLIS_REFIT = none | fit | norm refits the per-row scale/zero after coding (least squares /
 // moment matching of the reconstruction); norm is the default.
@@ -246,10 +247,45 @@ constexpr int NSTATE = NWIN >> BITS; // 64 states
 constexpr int NBR    = 1 << BITS;    // 8 branches
 constexpr int SEQ    = 128;          // channels per sequence
 static_assert(SEQ*BITS % 32 == 0, "a sequence must cover whole 32-bit words");
+// GGML_KVARN_TRELLIS_TOKENS (default on since 2026-10-05; =0 selects the channel-axis payload of v0.4/the audit's
+// production arm): the low-bit (3- and 2-bit) trellis runs along the TOKENS of each channel (one 128-token sequence per
+// channel and record, history restarting at every record) instead of along the channels of a token row, and the payload
+// becomes the channel-major stream (bit (d*G + t)*BITS). K and V are correlated along tokens (lag-1 0.42 / 0.28 in the
+// balanced y domain, about 0 along channels), so the history-indexed codebook predicts. Each axis has its own built-in
+// codebooks (KVARN_CB3_TOK_* / KVARN_CB2_TOK_* for tokens, KVARN_CB3_TRAINED_* / KVARN_CB2_TRAINED_* for channels).
+// Codec audit KL (6 histories, generated region, vs the channel axis): 0.769x (3/3), 0.772x (3/2).
+// The axis is process-wide and nothing sealed leaves the process (KVarN state save/load is refused), so the reader of a
+// record always shares its writer's axis.
+inline bool tokens() {
+    static const bool on = [] {
+        const char * s = getenv("GGML_KVARN_TRELLIS_TOKENS");
+        const bool v = s == nullptr || *s == '\0' || atoi(s) != 0;
+        fprintf(stderr, v ? "kvarn trellis: token-traversal payload (default; GGML_KVARN_TRELLIS_TOKENS=0 selects the channel axis)\n"
+                          : "kvarn trellis: channel-traversal payload (GGML_KVARN_TRELLIS_TOKENS=0)\n");
+        return v;
+    }();
+    return on;
+}
+// the 4/4 token-axis trellis4 body (audit item B, k44t_tok) stays opt-in: only an explicit nonzero GGML_KVARN_TRELLIS_TOKENS
+// (the audit's =1) turns a 4/4 trellis (I16, kvarn4t) body into trellis4. Unset = kvarn4t, unchanged.
+inline bool tokens4() {
+    static const bool on = [] {
+        const char * s = getenv("GGML_KVARN_TRELLIS_TOKENS");
+        return s != nullptr && *s != '\0' && atoi(s) != 0;
+    }();
+    return on;
+}
 inline const uint16_t * cb(bool is_V) {
     static uint16_t k[NWIN] = KVARN_CB3_TRAINED_K_INIT;
     static uint16_t v[NWIN] = KVARN_CB3_TRAINED_V_INIT;
-    static const bool overridden = trellis_lb_load("GGML_KVARN_TRELLIS_CB3", "trellis3", L, BITS, NWIN, k, v);
+    static const bool overridden = [] {
+        if (tokens()) {
+            static const uint16_t tk[NWIN] = KVARN_CB3_TOK_K_INIT;
+            static const uint16_t tv[NWIN] = KVARN_CB3_TOK_V_INIT;
+            memcpy(k, tk, sizeof(k)); memcpy(v, tv, sizeof(v));
+        }
+        return trellis_lb_load("GGML_KVARN_TRELLIS_CB3", tokens() ? "trellis3 (token axis)" : "trellis3 (channel axis)", L, BITS, NWIN, k, v);
+    }();
     (void) overridden;
     return is_V ? v : k;
 }
@@ -265,20 +301,6 @@ inline int refit_mode() {
         abort();
     }();
     return mode;
-}
-// GGML_KVARN_TRELLIS_TOKENS=1 (audit 2026-10-03, default off): the low-bit trellis runs along the TOKENS of each channel
-// (one 128-token sequence per channel and record, history restarting at every record) instead of along the channels of a
-// token row, and the payload becomes the channel-major stream (bit (d*G + t)*BITS). K and V are correlated along tokens
-// (lag-1 0.42 / 0.28 in the balanced y domain, about 0 along channels), so the history-indexed codebook predicts; pair it
-// with codebooks trained on that traversal (GGML_KVARN_TRELLIS_CB3 / _CB2 = file). Off = the production format, unchanged.
-inline bool tokens() {
-    static const bool on = [] {
-        const char * s = getenv("GGML_KVARN_TRELLIS_TOKENS");
-        const bool v = s != nullptr && atoi(s) != 0;
-        if (v) { fprintf(stderr, "kvarn trellis: token-traversal payload (GGML_KVARN_TRELLIS_TOKENS=1)\n"); }
-        return v;
-    }();
-    return on;
 }
 }
 // GGML_KVARN_SCALAR_CLIP=cK,cV | row (audit 2026-10-03, default off): scalar (RTN) bodies shrink each row's min/max range
@@ -330,7 +352,14 @@ static_assert(NSTATE == trellis3::NSTATE && SEQ == trellis3::SEQ, "trellis2 and 
 inline const uint16_t * cb(bool is_V) {
     static uint16_t k[NWIN] = KVARN_CB2_TRAINED_K_INIT;
     static uint16_t v[NWIN] = KVARN_CB2_TRAINED_V_INIT;
-    static const bool overridden = trellis_lb_load("GGML_KVARN_TRELLIS_CB2", "trellis2", L, BITS, NWIN, k, v);
+    static const bool overridden = [] {
+        if (trellis3::tokens()) {
+            static const uint16_t tk[NWIN] = KVARN_CB2_TOK_K_INIT;
+            static const uint16_t tv[NWIN] = KVARN_CB2_TOK_V_INIT;
+            memcpy(k, tk, sizeof(k)); memcpy(v, tv, sizeof(v));
+        }
+        return trellis_lb_load("GGML_KVARN_TRELLIS_CB2", trellis3::tokens() ? "trellis2 (token axis)" : "trellis2 (channel axis)", L, BITS, NWIN, k, v);
+    }();
     (void) overridden;
     return is_V ? v : k;
 }
@@ -338,12 +367,12 @@ inline int refit_mode() { return trellis3::refit_mode(); }
 }
 #define KVARN_CB2_IDENTITY_INIT { KVARN_CB3_R64(0x0000), KVARN_CB3_R64(0x3C00), KVARN_CB3_R64(0x4000), KVARN_CB3_R64(0x4200) }
 
-// 4-bit token-axis trellis (audit 2026-10-03, Item B "k44t_tok", default off): with GGML_KVARN_TRELLIS_TOKENS=1 a 4-bit
-// side of a trellis (I16) body is coded by the low-bit scheme at BITS = 4, L = 10 (current code over the 6 stream bits
-// before it = 1.5 codes), 64 states, 16 branches, along the tokens of each channel (channel-major payload, G == 128), with
-// the norm refit, instead of the fragment-order kvarn4t. Codebook: GGML_KVARN_TRELLIS_CB4 = <file> (uint16 K[1024] then
-// V[1024]) | identity; unset = the kvarn4t built-in tables (same size, trained for the other window map: a fallback only).
-// Off (TOKENS unset) = kvarn4t, unchanged.
+// 4-bit token-axis trellis (audit 2026-10-03, Item B "k44t_tok", opt-in: trellis3::tokens4(), i.e. an explicit
+// GGML_KVARN_TRELLIS_TOKENS=1): a 4-bit side of a trellis (I16) body is coded by the low-bit scheme at BITS = 4, L = 10
+// (current code over the 6 stream bits before it = 1.5 codes), 64 states, 16 branches, along the tokens of each channel
+// (channel-major payload, G == 128), with the norm refit, instead of the fragment-order kvarn4t. Codebook: the built-in
+// token-trained KVARN_CB4_TOK_* (the audit's cb4_tok.bin); GGML_KVARN_TRELLIS_CB4 = <file> (uint16 K[1024] then V[1024])
+// | identity overrides. Measured +35%/round decode vs 4/4 scalar, hence opt-in. Unset TOKENS = kvarn4t, unchanged.
 namespace trellis4 {
 constexpr int BITS   = 4;
 constexpr int L      = 10;
@@ -354,8 +383,8 @@ constexpr int SEQ    = 128;          // tokens per sequence
 static_assert(NSTATE == trellis3::NSTATE && SEQ == trellis3::SEQ, "trellis4 shares the low-bit Viterbi kernel shape");
 static_assert(KVARN_TRELLIS_L == L, "trellis4 fallback codebook is the kvarn4t table (L = 10)");
 inline const uint16_t * cb(bool is_V) {
-    static uint16_t k[NWIN] = KVARN_CB_K_INIT;
-    static uint16_t v[NWIN] = KVARN_CB_V_INIT;
+    static uint16_t k[NWIN] = KVARN_CB4_TOK_K_INIT;
+    static uint16_t v[NWIN] = KVARN_CB4_TOK_V_INIT;
     static const bool overridden = trellis_lb_load("GGML_KVARN_TRELLIS_CB4", "trellis4 (token axis)", L, BITS, NWIN, k, v);
     (void) overridden;
     return is_V ? v : k;
@@ -664,7 +693,7 @@ inline void trellis_lb_code_rows(const float * bal, int R, int C, const float * 
     for (int w = 0; w < NWIN; ++w) cbf[w] = GGML_FP16_TO_FP32(cbh[w]);
     std::vector<float> y(SEQ);
     std::vector<uint8_t> codes(SEQ);
-    if (trellis3::tokens()) {
+    if (BITS == 4 || trellis3::tokens()) { // trellis4 is token-axis only
         GGML_ASSERT(G == SEQ);
         for (int d = 0; d < D; ++d) {
             for (int t = 0; t < G; ++t) {
@@ -707,7 +736,7 @@ inline void trellis_lb_refit_rows(const float * bal, int R, int C, const float *
         for (int c = 0; c < C; ++c) {
             const int t = is_V ? r : c, d = is_V ? c : r;
             const double x  = (double) bal[(size_t) r*C + c];
-            const double yh = (double) GGML_FP16_TO_FP32(cbh[trellis_lb_window_any<BITS>(payload, t, d, D, G, trellis3::tokens())]);
+            const double yh = (double) GGML_FP16_TO_FP32(cbh[trellis_lb_window_any<BITS>(payload, t, d, D, G, BITS == 4 || trellis3::tokens())]);
             Sx = dadd_rn(Sx, x); Sy = dadd_rn(Sy, yh);
             Sxx = dadd_rn(Sxx, dmul_rn(x, x)); Syy = dadd_rn(Syy, dmul_rn(yh, yh)); Sxy = dadd_rn(Sxy, dmul_rn(x, yh));
         }
@@ -875,7 +904,7 @@ inline void seal_group(const ggml_fp16_t * K, const ggml_fp16_t * V, size_t row_
         } else if (trellis_body && l.bits_k == 2) {
             trellis_lb_code_rows<2>(bal.data(), D, G, q_lo.data(), q_step.data(), false, D, G, rec + l.k_payload);
             trellis_lb_refit_rows<2>(bal.data(), D, G, s_row.data(), false, D, G, rec + l.k_payload, rec, l, trellis2::refit_mode());
-        } else if (trellis_body && trellis3::tokens()) { // 4-bit token-axis trellis (trellis4)
+        } else if (trellis_body && trellis3::tokens4()) { // 4-bit token-axis trellis (trellis4, opt-in)
             trellis_lb_code_rows<4>(bal.data(), D, G, q_lo.data(), q_step.data(), false, D, G, rec + l.k_payload);
             trellis_lb_refit_rows<4>(bal.data(), D, G, s_row.data(), false, D, G, rec + l.k_payload, rec, l, trellis3::refit_mode());
         } else if (trellis_body) {
@@ -921,7 +950,7 @@ inline void seal_group(const ggml_fp16_t * K, const ggml_fp16_t * V, size_t row_
         } else if (trellis_body && l.bits_v == 2) {
             trellis_lb_code_rows<2>(bal.data(), G, D, q_lo.data(), q_step.data(), true, D, G, rec + l.v_payload);
             trellis_lb_refit_rows<2>(bal.data(), G, D, s_row.data(), true, D, G, rec + l.v_payload, rec, l, trellis2::refit_mode());
-        } else if (trellis_body && trellis3::tokens()) { // 4-bit token-axis trellis (trellis4)
+        } else if (trellis_body && trellis3::tokens4()) { // 4-bit token-axis trellis (trellis4, opt-in)
             trellis_lb_code_rows<4>(bal.data(), G, D, q_lo.data(), q_step.data(), true, D, G, rec + l.v_payload);
             trellis_lb_refit_rows<4>(bal.data(), G, D, s_row.data(), true, D, G, rec + l.v_payload, rec, l, trellis3::refit_mode());
         } else if (trellis_body) {
@@ -948,7 +977,7 @@ inline void decode_k_row(const uint8_t * rec, const layout & l, int t, float * o
         const float q  = !trellis_body    ? (float) k_code(rec, l, t, d)
                        : l.bits_k == 3    ? GGML_FP16_TO_FP32(trellis3::cb(false)[trellis_lb_window_any<3>(rec + l.k_payload, t, d, l.D, l.G, trellis3::tokens())])
                        : l.bits_k == 2    ? GGML_FP16_TO_FP32(trellis2::cb(false)[trellis_lb_window_any<2>(rec + l.k_payload, t, d, l.D, l.G, trellis3::tokens())])
-                       : trellis3::tokens() ? GGML_FP16_TO_FP32(trellis4::cb(false)[trellis_lb_window_any<4>(rec + l.k_payload, t, d, l.D, l.G, true)])
+                       : trellis3::tokens4() ? GGML_FP16_TO_FP32(trellis4::cb(false)[trellis_lb_window_any<4>(rec + l.k_payload, t, d, l.D, l.G, true)])
                                           : trellis_value(rec + l.k_payload, code_bit(t, d, false, l.D, l.G, l.bits_k), false, l.D, l.G);
         const int   di = k_ch_idx(d, l.D, l.G, l.bits_k);
         out[d] = (q * get_half(rec, l.k_scale + 2*di) + get_half(rec, l.k_zero + 2*di)) * tok;
@@ -961,7 +990,7 @@ inline void decode_v_row(const uint8_t * rec, const layout & l, int t, float * o
         const float q = !trellis_body    ? (float) v_code(rec, l, t, d)
                       : l.bits_v == 3    ? GGML_FP16_TO_FP32(trellis3::cb(true)[trellis_lb_window_any<3>(rec + l.v_payload, t, d, l.D, l.G, trellis3::tokens())])
                       : l.bits_v == 2    ? GGML_FP16_TO_FP32(trellis2::cb(true)[trellis_lb_window_any<2>(rec + l.v_payload, t, d, l.D, l.G, trellis3::tokens())])
-                      : trellis3::tokens() ? GGML_FP16_TO_FP32(trellis4::cb(true)[trellis_lb_window_any<4>(rec + l.v_payload, t, d, l.D, l.G, true)])
+                      : trellis3::tokens4() ? GGML_FP16_TO_FP32(trellis4::cb(true)[trellis_lb_window_any<4>(rec + l.v_payload, t, d, l.D, l.G, true)])
                                          : trellis_value(rec + l.v_payload, code_bit(t, d, true, l.D, l.G, l.bits_v), true, l.D, l.G);
         out[d] = (q * sc + zp) * get_half(rec, l.v_ch + 2*v_ch_idx(d, l.D, l.G, l.bits_v));
     }
