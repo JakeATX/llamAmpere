@@ -1606,6 +1606,29 @@ void llama_context::sched_reserve() {
     if (compute_peer != nullptr && compute_peer->sched) {
         if (!ggml_backend_sched_set_donor(sched.get(), compute_peer->sched.get())) {
             LLAMA_LOG_WARN("%s: could not share compute buffers with the peer context\n", __func__);
+        } else if (const char * env = getenv("LLAMA_SHARED_POOL"); env != nullptr && env[0] == '1') {
+            // [FIT12 overhead] also share the backends' scratch pools (op temporaries outside the compute buffer):
+            // the two contexts already synchronize each other before every compute, so one pool serves both and its
+            // high-water mark is the larger of the two instead of the sum. Opt-in.
+            using share_pool_fn_t = bool (*)(ggml_backend_t, ggml_backend_t);
+            for (auto & b : backends) {
+                ggml_backend_dev_t dev = ggml_backend_get_device(b.get());
+                if (dev == nullptr) {
+                    continue;
+                }
+                auto fn = (share_pool_fn_t) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), "ggml_backend_cuda_share_pool");
+                if (fn == nullptr) {
+                    continue;
+                }
+                for (auto & pb : compute_peer->backends) {
+                    if (ggml_backend_get_device(pb.get()) == dev) {
+                        if (!fn(b.get(), pb.get())) {
+                            LLAMA_LOG_WARN("%s: could not share the scratch pool of %s with the peer context\n", __func__, ggml_backend_dev_name(dev));
+                        }
+                        break;
+                    }
+                }
+            }
         }
     }
     ggml_backend_sched_set_moe_cache(

@@ -732,6 +732,24 @@ std::unique_ptr<ggml_cuda_pool> ggml_backend_cuda_context::new_pool_for_device(i
     return std::unique_ptr<ggml_cuda_pool>(new ggml_cuda_pool_leg(device));
 }
 
+// [FIT12 overhead] One scratch pool for two backend contexts on the same device whose graphs never run at the same time
+// (a target context and its MTP draft context with shared compute buffers: each synchronizes the other before it
+// computes). Each context keeps a forwarding entry in its pools[][] slot; the pool itself lives as long as either
+// context. The high-water mark becomes max(target, draft) instead of the sum. Opt-in from llama (LLAMA_SHARED_POOL=1).
+struct ggml_cuda_pool_shared_ref : public ggml_cuda_pool {
+    std::shared_ptr<ggml_cuda_pool> pool;
+
+    explicit ggml_cuda_pool_shared_ref(std::shared_ptr<ggml_cuda_pool> pool) : pool(std::move(pool)) {}
+
+    void * alloc(size_t size, size_t * actual_size) override {
+        return pool->alloc(size, actual_size);
+    }
+
+    void free(void * ptr, size_t size) override {
+        pool->free(ptr, size);
+    }
+};
+
 // destroying a cuBLAS handle while a graph is being captured in a different thread can result in a CUDA error
 // this lock is used to ensure that no cuBLAS handle is destroyed while a graph is being captured
 
@@ -9240,6 +9258,8 @@ static void * ggml_backend_cuda_kv_stream_runtime_new_for_device_impl(
             phase_arena, maximum_pool_bytes, params);
 }
 
+static bool ggml_backend_cuda_share_pool(ggml_backend_t dst, ggml_backend_t src);
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
@@ -9289,6 +9309,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
             return ggml_backend_cuda_phase_arena_buffer_type(
                 static_cast<ggml_backend_cuda_phase_arena_t>(arena));
         };
+    }
+    if (strcmp(name, "ggml_backend_cuda_share_pool") == 0) {
+        return (void *) ggml_backend_cuda_share_pool;
     }
     if (strcmp(name, "ggml_backend_cuda_graph_reset") == 0) {
         return (void *) ggml_backend_cuda_graph_reset;
@@ -9533,6 +9556,72 @@ ggml_backend_reg_t ggml_backend_cuda_reg() {
     return &reg;
 }
 
+// [FIT12 overhead] dst uses src's scratch pools on their common device (see ggml_cuda_pool_shared_ref). dst must not
+// have allocated from its own pools yet, because a captured CUDA graph may hold addresses inside them.
+static bool ggml_backend_cuda_share_pool(ggml_backend_t dst, ggml_backend_t src) {
+    if (dst == nullptr || src == nullptr || dst == src || !ggml_backend_is_cuda(dst) || !ggml_backend_is_cuda(src)) {
+        return false;
+    }
+    auto * d = static_cast<ggml_backend_cuda_context *>(dst->context);
+    auto * s = static_cast<ggml_backend_cuda_context *>(src->context);
+    const int dev = d->device;
+    if (s->device != dev) {
+        return false;
+    }
+    for (int st = 0; st < GGML_CUDA_MAX_STREAMS; ++st) {
+        if (d->pools[dev][st] != nullptr && dynamic_cast<ggml_cuda_pool_shared_ref *>(d->pools[dev][st].get()) == nullptr) {
+            GGML_LOG_WARN("%s: device %d stream %d: destination pool already in use, not shared\n", __func__, dev, st);
+            return false;
+        }
+    }
+    for (int st = 0; st < GGML_CUDA_MAX_STREAMS; ++st) {
+        std::shared_ptr<ggml_cuda_pool> shared;
+        if (auto * ref = dynamic_cast<ggml_cuda_pool_shared_ref *>(s->pools[dev][st].get())) {
+            shared = ref->pool;
+        } else {
+            if (s->pools[dev][st] == nullptr) {
+                s->pools[dev][st] = ggml_backend_cuda_context::new_pool_for_device(dev, st);
+            }
+            shared = std::shared_ptr<ggml_cuda_pool>(s->pools[dev][st].release());
+            s->pools[dev][st] = std::make_unique<ggml_cuda_pool_shared_ref>(shared);
+        }
+        d->pools[dev][st] = std::make_unique<ggml_cuda_pool_shared_ref>(shared);
+    }
+    GGML_LOG_INFO("%s: %s shares the scratch pool of %s\n", __func__, d->name.c_str(), s->name.c_str());
+    return true;
+}
+
+// [FIT12 overhead] GGML_CUDA_STACK_LIMIT=<bytes>: per-thread stack (local memory) limit, set once per device when the
+// first backend on it is created. The driver reserves limit x max resident threads per SM x SMs (the 1024 B default
+// is 42 MiB on a 28-SM 3060, 126 MiB on an 84-SM 3090 Ti) and grows the reservation again at the launch of any
+// kernel whose frame is larger, so a low value keeps only what the launched kernels need. Unset: driver default.
+static void ggml_cuda_apply_stack_limit(int device) {
+    static const char * env = getenv("GGML_CUDA_STACK_LIMIT");
+    if (env == nullptr || env[0] == '\0') {
+        return;
+    }
+    static std::mutex mtx;
+    static bool done[GGML_CUDA_MAX_DEVICES] = {};
+    std::lock_guard<std::mutex> lock(mtx);
+    if (done[device]) {
+        return;
+    }
+    done[device] = true;
+    ggml_cuda_set_device(device);
+    size_t before = 0;
+    CUDA_CHECK(cudaDeviceGetLimit(&before, cudaLimitStackSize));
+    const size_t want = (size_t) strtoull(env, nullptr, 10);
+    const cudaError_t err = cudaDeviceSetLimit(cudaLimitStackSize, want);
+    if (err != cudaSuccess) {
+        (void) cudaGetLastError();
+        GGML_LOG_WARN("%s: device %d: cudaDeviceSetLimit(stack, %zu) failed: %s\n", __func__, device, want, cudaGetErrorString(err));
+        return;
+    }
+    size_t after = 0;
+    CUDA_CHECK(cudaDeviceGetLimit(&after, cudaLimitStackSize));
+    GGML_LOG_INFO("%s: device %d: per-thread stack limit %zu -> %zu B (GGML_CUDA_STACK_LIMIT)\n", __func__, device, before, after);
+}
+
 ggml_backend_t ggml_backend_cuda_init(int device) {
     if (device < 0 || device >= ggml_backend_cuda_get_device_count()) {
         GGML_LOG_ERROR("%s: invalid device %d\n", __func__, device);
@@ -9544,6 +9633,7 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
         GGML_LOG_ERROR("%s: failed to allocate context\n", __func__);
         return nullptr;
     }
+    ggml_cuda_apply_stack_limit(device);
 
     ggml_backend_t cuda_backend = new ggml_backend {
         /* .guid    = */ ggml_backend_cuda_guid(),
