@@ -100,6 +100,8 @@ void ggml_cuda_kvarn_trellis_cb_init() {
     if (getenv("GGML_KVARN_TRELLIS_CB3") != nullptr || ggml_kvarn::trellis3::tokens()) {
         const int n_ok = kvarn_trellis_cb_copy(r.syms3, ggml_kvarn::trellis3::cb(false), ggml_kvarn::trellis3::cb(true), kvarn_tr3::NWIN);
         GGML_LOG_INFO("%s: trellis3 host codebook copied to %d of %zu device symbol pairs (device %d)\n", __func__, n_ok, r.syms3.size(), id);
+        // the seal encodes with the host tables: a failed copy would decode with the other axis' codebook (silent mismatch)
+        GGML_ASSERT(r.syms3.empty() || n_ok > 0);
     }
     // token-axis flags for the decoders (fattn_kvarn_trtok): bit 0 = low-bit (3/2-bit) token axis (default on,
     // GGML_KVARN_TRELLIS_TOKENS=0 clears it), bit 1 = the opt-in 4/4 trellis4 body (explicit GGML_KVARN_TRELLIS_TOKENS=1)
@@ -110,14 +112,17 @@ void ggml_cuda_kvarn_trellis_cb_init() {
             if (cudaMemcpyToSymbol(s, &flags, sizeof(flags)) == cudaSuccess) { ++n_ok; } else { (void) cudaGetLastError(); }
         }
         GGML_LOG_INFO("%s: trellis token-traversal flags %d set in %d of %zu decoder symbols (device %d)\n", __func__, flags, n_ok, r.tok.size(), id);
+        GGML_ASSERT(r.tok.empty() || n_ok > 0); // the seal uses the token axis: the decoders must see the flag
     }
     if (getenv("GGML_KVARN_TRELLIS_CB2") != nullptr || ggml_kvarn::trellis3::tokens()) {
         const int n_ok = kvarn_trellis_cb_copy(r.syms2, ggml_kvarn::trellis2::cb(false), ggml_kvarn::trellis2::cb(true), kvarn_tr2::NWIN);
         GGML_LOG_INFO("%s: trellis2 host codebook copied to %d of %zu device symbol pairs (device %d)\n", __func__, n_ok, r.syms2.size(), id);
+        GGML_ASSERT(r.syms2.empty() || n_ok > 0);
     }
     if (getenv("GGML_KVARN_TRELLIS_CB4") != nullptr || ggml_kvarn::trellis3::tokens4()) {
         const int n_ok = kvarn_trellis_cb_copy(r.syms4, ggml_kvarn::trellis4::cb(false), ggml_kvarn::trellis4::cb(true), kvarn_tr4::NWIN);
         GGML_LOG_INFO("%s: trellis4 (token axis) host codebook copied to %d of %zu device symbol pairs (device %d)\n", __func__, n_ok, r.syms4.size(), id);
+        GGML_ASSERT(r.syms4.empty() || n_ok > 0);
     }
 }
 struct kvarn_seal_cb_registrar {
