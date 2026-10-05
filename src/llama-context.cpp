@@ -5441,9 +5441,9 @@ llama_context * llama_init_from_model(llama_model * model, llama_context_params 
         return nullptr;
     }
 
+    // the adaptive tail is a KVarN-only setting; the 8192 default must not block non-KVarN caches
     if (params.kvarn_tail_max > 0 && params.kvarn_bits_k == 0 && params.kvarn_bits_v == 0) {
-        LLAMA_LOG_ERROR("%s: KVarN tail-max requires KVarN cache types\n", __func__);
-        return nullptr;
+        params.kvarn_tail_max = 0;
     }
 
     // KVarN region-aware cache: staged sink + tail, sealed low-bit body
