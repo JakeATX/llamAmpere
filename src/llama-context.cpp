@@ -227,6 +227,8 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
     cparams.mtp_chain_top_k         = 0;
     cparams.offload_kqv             = params.offload_kqv;
     cparams.kv_stream_arena_mib     = params.kv_stream_arena_mib;
+    cparams.draft_attn_window       = params.draft_attn_window > 0 ? (uint32_t) params.draft_attn_window : 0;
+    cparams.draft_attn_sink         = params.draft_attn_sink   > 0 ? (uint32_t) params.draft_attn_sink   : 0;
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
 
@@ -5413,6 +5415,8 @@ llama_context_params llama_context_default_params() {
         /*.draft_vocab_map             =*/ nullptr,
         /*.draft_vocab_hot             =*/ 0,
         /*.kv_stream_arena_mib         =*/ 0,
+        /*.draft_attn_window           =*/ 0,
+        /*.draft_attn_sink             =*/ 0,
     };
 
     return result;

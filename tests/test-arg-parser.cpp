@@ -303,6 +303,39 @@ static void test(void) {
     assert(spec_defaults.speculative.draft.n_max == 3);
     assert(spec_defaults.speculative.draft.n_min_adaptive == 3);
 
+    // MTP drafter attention window: off by default, the default context params carry no window,
+    // and the cparams helper leaves them untouched when the flags are absent
+    assert(spec_defaults.speculative.draft.attn_window == 0);
+    assert(spec_defaults.speculative.draft.attn_sink == -1);
+    {
+        llama_context_params cp = llama_context_default_params();
+        assert(cp.draft_attn_window == 0 && cp.draft_attn_sink == 0);
+        common_speculative_mtp_cparams(spec_defaults, cp);
+        assert(cp.draft_attn_window == 0 && cp.draft_attn_sink == 0);
+    }
+    for (const auto & ex : {LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}) {
+        argv = {"binary_name", "-m", "model_file.gguf", "--spec-draft-window", "8192"};
+        common_params window_params;
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), window_params, ex));
+        assert(window_params.speculative.draft.attn_window == 8192);
+        llama_context_params cp = llama_context_default_params();
+        common_speculative_mtp_cparams(window_params, cp);
+        assert(cp.draft_attn_window == 8192 && cp.draft_attn_sink == 128); // default sink
+
+        argv = {"binary_name", "-m", "model_file.gguf", "--spec-draft-window", "4096", "--spec-draft-window-sink", "0"};
+        common_params sink_params;
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), sink_params, ex));
+        cp = llama_context_default_params();
+        common_speculative_mtp_cparams(sink_params, cp);
+        assert(cp.draft_attn_window == 4096 && cp.draft_attn_sink == 0);
+
+        // a negative window is clamped to 0 (off)
+        argv = {"binary_name", "-m", "model_file.gguf", "--spec-draft-window", "-5"};
+        common_params neg_params;
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), neg_params, ex));
+        assert(neg_params.speculative.draft.attn_window == 0);
+    }
+
     argv = {"binary_name", "-m", "model_file.gguf", "--spec-draft-n-min-adaptive", "5"};
     common_params adaptive_params;
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), adaptive_params, LLAMA_EXAMPLE_SPECULATIVE));

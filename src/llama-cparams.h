@@ -63,6 +63,10 @@ struct llama_cparams {
 
     uint32_t kv_stream_arena_mib;
 
+    // MTP draft context attention window (0 = full attention) and sink positions
+    uint32_t draft_attn_window = 0;
+    uint32_t draft_attn_sink   = 0;
+
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 
     enum llama_context_type ctx_type;

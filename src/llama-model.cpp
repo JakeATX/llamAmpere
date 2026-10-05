@@ -3367,7 +3367,28 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     } else {
                         GGML_ASSERT(!hparams.is_swa_any());
 
-                        res = new llama_kv_cache(
+                        // optional MTP drafter attention window: the draft KV cache becomes a sliding-window
+                        // ring holding the last draft_attn_window positions + draft_attn_sink sink positions
+                        // (+ one ubatch of headroom, as for the SWA half of llama_kv_cache_iswa)
+                        const bool draft_window =
+                            params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && cparams.draft_attn_window > 0;
+
+                        uint32_t       kv_size_cur  = cparams.n_ctx_seq;
+                        uint32_t       n_swa_cur    = hparams.n_swa;
+                        llama_swa_type swa_type_cur = hparams.swa_type;
+
+                        if (draft_window) {
+                            const uint32_t ring = GGML_PAD(cparams.draft_attn_window + cparams.draft_attn_sink + cparams.n_ubatch, 256);
+
+                            kv_size_cur  = std::min(cparams.n_ctx_seq, ring);
+                            n_swa_cur    = cparams.draft_attn_window;
+                            swa_type_cur = LLAMA_SWA_TYPE_STANDARD;
+
+                            LLAMA_LOG_INFO("%s: MTP draft attention window: n_swa = %u, sink = %u, kv_size = %u (ctx %u)\n",
+                                    __func__, n_swa_cur, cparams.draft_attn_sink, kv_size_cur, cparams.n_ctx_seq);
+                        }
+
+                        auto * kv = new llama_kv_cache(
                                 *this,
                                 hparams,
                                 params.type_k,
@@ -3375,11 +3396,11 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 !cparams.flash_attn,
                                 cparams.offload_kqv,
                                 cparams.kv_unified,
-                                cparams.n_ctx_seq,
+                                kv_size_cur,
                                 cparams.n_seq_max,
                                 1,
-                                hparams.n_swa,
-                                hparams.swa_type,
+                                n_swa_cur,
+                                swa_type_cur,
                                 nullptr,
                                 filter,
                                 nullptr,
@@ -3389,6 +3410,12 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 params.kv_stream_phase_arena,
                                 params.kv_stream_maximum_pool_bytes,
                                 params.kvarn);
+
+                        if (draft_window) {
+                            kv->set_swa_sink(cparams.draft_attn_sink);
+                        }
+
+                        res = kv;
                     }
                 }
             }

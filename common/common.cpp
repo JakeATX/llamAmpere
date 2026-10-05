@@ -1259,6 +1259,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         auto cparams_dft = common_context_params_to_llama(params_dft);
         if (spec_mtp) {
             cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+            common_speculative_mtp_cparams(params_dft, cparams_dft);
         }
         cparams_dft.n_rs_seq = 0;
 
@@ -1864,6 +1865,15 @@ struct ggml_threadpool_params ggml_threadpool_params_from_cpu_params(const commo
     tpp.strict_cpu = params.strict_cpu;
 
     return tpp;
+}
+
+void common_speculative_mtp_cparams(const common_params & params, llama_context_params & cparams) {
+    const auto & dp = params.speculative.draft;
+
+    if (dp.attn_window > 0) {
+        cparams.draft_attn_window = dp.attn_window;
+        cparams.draft_attn_sink   = dp.attn_sink >= 0 ? dp.attn_sink : 128;
+    }
 }
 
 common_threadpools::~common_threadpools() {

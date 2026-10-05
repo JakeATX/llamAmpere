@@ -377,6 +377,10 @@ struct common_params_speculative_draft {
     bool    dflash_defer_injection = true;  // defer encoder KV injection to draft time (set false for higher acceptance on some models)
     int32_t n_ctx                 = 0;     // draft context size
 
+    // MTP drafter attention window (default off)
+    int32_t attn_window = 0;     // > 0: the MTP drafter attends only to its last attn_window positions (+ sinks)
+    int32_t attn_sink   = -1;    // sink positions kept with attn_window (-1 = default 128)
+
 };
 
 struct common_params_speculative_ngram_mod {
@@ -1138,6 +1142,10 @@ char * common_get_model_or_exit(int, char*[]);
 //
 
 struct ggml_threadpool_params ggml_threadpool_params_from_cpu_params(const common_cpu_params & params);
+
+// apply the MTP drafter attention-window options (--spec-draft-window, --spec-draft-window-sink)
+// to the llama_context_params of an MTP draft context; no-op when they are off
+void common_speculative_mtp_cparams(const common_params & params, llama_context_params & cparams);
 
 struct common_threadpools {
     common_threadpools() = default;

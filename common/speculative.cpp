@@ -3819,6 +3819,13 @@ common_speculative_init_result::common_speculative_init_result(
 
     if (spec_mtp) {
         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        if (!has_draft) {
+            common_speculative_mtp_cparams(params, cparams);
+            if (cparams.draft_attn_window > 0) {
+                LOG_INF("%s: MTP draft attention window = %d, sink = %d\n",
+                        __func__, cparams.draft_attn_window, cparams.draft_attn_sink);
+            }
+        }
         if (!params.speculative.draft.vocab_map.empty() && params.speculative.draft.vocab_map != "none") {
             cparams.draft_vocab_map = params.speculative.draft.vocab_map.c_str();
             cparams.draft_vocab_hot = params.speculative.draft.vocab_hot;

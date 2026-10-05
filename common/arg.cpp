@@ -4648,6 +4648,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_VOCAB_HOT"));
     add_opt(common_arg(
+        {"--spec-draft-window"}, "N",
+        "[EXPERIMENTAL] MTP drafter attention window: the drafter attends only to its last N positions plus "
+        "--spec-draft-window-sink sink positions; its KV cache becomes a ring of that size (default: 0 = full attention)",
+        [](common_params & params, int value) {
+            params.speculative.draft.attn_window = std::max(0, value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-draft-window-sink"}, "N",
+        "[EXPERIMENTAL] sink positions (the first N) kept with --spec-draft-window (default: 128)",
+        [](common_params & params, int value) {
+            params.speculative.draft.attn_sink = std::max(0, value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
         {"--spec-draft-backend-sampling"},
         {"--no-spec-draft-backend-sampling"},
         string_format("offload draft sampling to the backend (default: %s)",

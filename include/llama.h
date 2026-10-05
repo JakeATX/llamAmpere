@@ -476,6 +476,12 @@ extern "C" {
         // a caller built against a pre-streaming header keeps the same
         // offsets for every field before it.
         uint32_t kv_stream_arena_mib;
+
+        // [EXPERIMENTAL] MTP draft contexts only: attention window over the drafter's own KV.
+        // > 0 = the draft KV cache keeps only the last draft_attn_window positions plus the first
+        // draft_attn_sink positions (a sliding-window ring). 0 = full attention (default).
+        int32_t draft_attn_window;
+        int32_t draft_attn_sink;
     };
 
     struct llama_model_tensor_override {

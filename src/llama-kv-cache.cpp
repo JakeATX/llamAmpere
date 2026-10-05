@@ -1732,7 +1732,8 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
                         const llama_seq_id seq_id_cell = cells.seq_get(idx);
 
                         // SWA mask
-                        if (llama_hparams::is_masked_swa(n_swa, swa_type, pos_cell, cells.seq_pos_max(seq_id_cell) + 1)) {
+                        if (pos_cell >= (llama_pos) n_swa_sink &&
+                            llama_hparams::is_masked_swa(n_swa, swa_type, pos_cell, cells.seq_pos_max(seq_id_cell) + 1)) {
                             can_use = true;
                         }
                     }
@@ -2738,6 +2739,7 @@ struct args_set_input_kq_mask {
 
     uint32_t       n_swa;
     llama_swa_type swa_type;
+    uint32_t       n_swa_sink;
 
     int64_t n_kv;
     int64_t n_stream;
@@ -2876,7 +2878,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                 if (swa) {
                     // see llama_non_causal_type
                     const bool in_span = !causal && args.hparams.non_causal_type == LLAMA_NON_CAUSAL_TYPE_SWA_FULL && p0 >= seq_pos_min[seq_id];
-                    if (!in_span && llama_hparams::is_masked_swa(n_swa, swa_type, p0, p1)) {
+                    if (!in_span && p0 >= (llama_pos) args.n_swa_sink && llama_hparams::is_masked_swa(n_swa, swa_type, p0, p1)) {
                         goto skip;
                     }
                 }
@@ -3078,6 +3080,7 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         /*.seq_to_stream    =*/ seq_to_stream,
         /*.n_swa            =*/ n_swa,
         /*.swa_type         =*/ swa_type,
+        /*.n_swa_sink       =*/ n_swa_sink,
         /*.n_kv             =*/ n_kv,
         /*.n_stream         =*/ n_stream,
         /*.n_tps            =*/ n_tps,
@@ -3422,7 +3425,8 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
 
             // check the cell is not SWA-masked
             if (add_cell && seq_id != -1) {
-                const bool is_masked = llama_hparams::is_masked_swa(n_swa, swa_type, cells.pos_get(i), cells.seq_pos_max(seq_id));
+                const bool is_masked = cells.pos_get(i) >= (llama_pos) n_swa_sink &&
+                    llama_hparams::is_masked_swa(n_swa, swa_type, cells.pos_get(i), cells.seq_pos_max(seq_id));
 
                 add_cell = !is_masked;
             }

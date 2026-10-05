@@ -331,6 +331,9 @@ public:
     // note: used by n-gram input embeddings
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
 
+    // attention sinks for a sliding-window cache: positions [0, n) are never SWA-masked or evicted
+    void set_swa_sink(uint32_t n) { n_swa_sink = n; }
+
 private:
     const llama_model & model;
     const llama_hparams & hparams;
@@ -386,6 +389,10 @@ private:
 
     // SWA
     const uint32_t n_swa = 0;
+
+    // positions [0, n_swa_sink) are never SWA-masked or evicted (attention sinks)
+    // used by the optional MTP drafter attention window (--spec-draft-window); 0 = off
+    uint32_t n_swa_sink = 0;
 
     // env: LLAMA_ATTN_ROT_DISABLE
     bool attn_rot_k = false;
