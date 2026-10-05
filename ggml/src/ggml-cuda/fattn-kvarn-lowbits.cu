@@ -90,11 +90,11 @@ static bool kvarn_lowbits_no_direct() {
     return v;
 }
 
-// GGML_KVARN_TRELLIS_WORDS=1 (default off): trellis tile loads read the payload as aligned 32-bit words instead of two
-// byte loads per code (fattn_kvarn_trellis_lb_word_w, bit-identical values). Selected by a separate kernel build
-// (template bits_k | 8), so the default kernel is unchanged.
+// GGML_KVARN_TRELLIS_WORDS (default on; =0 selects the byte-load kernel): trellis tile loads read the payload as aligned
+// 32-bit words instead of two byte loads per code (fattn_kvarn_trellis_lb_word_w, bit-identical values). Separate kernel
+// build (template bits_k | 8). Measured 2026-10-01: +19.3% (3/3) / +17.8% (3/2) decode at 100K, identical text.
 static bool kvarn_trellis_words() {
-    static const bool v = [] { const char * e = getenv("GGML_KVARN_TRELLIS_WORDS"); return e != nullptr && e[0] == '1'; }();
+    static const bool v = [] { const char * e = getenv("GGML_KVARN_TRELLIS_WORDS"); return e == nullptr || e[0] != '0'; }();
     return v;
 }
 // route proof for end-to-end gates: one line on the first trellis attention call that takes the word-load build
@@ -102,7 +102,7 @@ static void kvarn_trellis_words_note() {
     static bool done = false;
     if (!done) {
         done = true;
-        GGML_LOG_INFO("%s: KVarN trellis attention uses the word-load decode (GGML_KVARN_TRELLIS_WORDS=1)\n", __func__);
+        GGML_LOG_INFO("%s: KVarN trellis attention uses the word-load decode (GGML_KVARN_TRELLIS_WORDS=0 disables)\n", __func__);
     }
 }
 
