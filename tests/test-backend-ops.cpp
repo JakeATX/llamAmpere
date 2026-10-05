@@ -12737,7 +12737,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // EXL3 trellis weights (m = N outputs, n = T activation columns, k = K). CUDA routes T <= 16 to the trellis
     // GEMV (T = 1: HFMA2, T >= 2: mma; 3/4-bit at T = 2..8 take the #73 weight-major mma unless
-    // GGML_CUDA_EXL3_WEIGHT_MAJOR=0) and T > 16 to reconstruct + cuBLAS. No MUL_MAT_ID: the CUDA backend
+    // GGML_CUDA_EXL3_WEIGHT_MAJOR=0) and T > 16 to the #13 trellis-direct GEMM (reconstruct + cuBLAS with
+    // GGML_CUDA_EXL3_GEMM=0). No MUL_MAT_ID: the CUDA backend
     // declines EXL3 experts (supports_op), and the CPU backend has no EXL3 vec_dot for the ID path.
     {
         const ggml_type exl3_types[] = {
@@ -12779,6 +12780,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_mul_mat_exl3(type, 17408, n, 5120, true));
                 test_cases.emplace_back(new test_mul_mat_exl3(type, 5120, n, 17408, true));
             }
+        }
+        // [#13] prefill GEMM: every bit width at the 32/64/128-token block shapes with ragged token tails (17, 33, 100,
+        // 129, 255, 1000), split-K on the small grids; ragged n-blocks (N = 17 tiles); glue; the Qwen3.8 shapes
+        for (ggml_type type : exl3_types) {
+            for (int64_t n : {33, 64, 100, 129, 255, 1000}) {
+                test_cases.emplace_back(new test_mul_mat_exl3(type, 256, n, 512, false));
+            }
+            for (int64_t n : {17, 100, 255}) {
+                test_cases.emplace_back(new test_mul_mat_exl3(type, 272, n, 768, false));
+            }
+            test_cases.emplace_back(new test_mul_mat_exl3(type, 256, 129, 512, true));
+        }
+        for (ggml_type type : {GGML_TYPE_EXL3_3, GGML_TYPE_EXL3_4}) {
+            for (int64_t n : {17, 64, 100, 300}) {
+                test_cases.emplace_back(new test_mul_mat_exl3(type, 4096, n, 2048, true));
+            }
+            test_cases.emplace_back(new test_mul_mat_exl3(type, 17408, 100, 5120, true));
+            test_cases.emplace_back(new test_mul_mat_exl3(type, 5120, 100, 17408, true));
+            test_cases.emplace_back(new test_mul_mat_exl3(type, 1024, 512, 5120, true));
         }
         // [#74] FFN bridge vs the CPU: bridged widths 1..16, and 17/32 where the bridge must decline
         for (ggml_type type : {GGML_TYPE_EXL3_3, GGML_TYPE_EXL3_4}) {
