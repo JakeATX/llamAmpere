@@ -244,6 +244,21 @@ GeForce RTX 3070      8.6
 cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="86;89"
 ```
 
+#### Ampere-only build (opt-in preset)
+
+```bash
+cmake --preset x64-linux-gcc-cuda-ampere-release
+cmake --build build-x64-linux-gcc-cuda-ampere-release --target llama-server
+```
+
+The preset sets `CMAKE_CUDA_ARCHITECTURES="80-real;86-real"`: sm_80 machine code for compute capability 8.0 and sm_86
+machine code for 8.6 and 8.7, with no PTX, so it does not run on GPUs outside compute capability 8.x. It shortens the
+build and shrinks the library file. It does not reduce VRAM: with lazy module loading (the default) the driver loads
+only the kernels that run, from the one image that matches the card. Measured on an RTX 3090 Ti with Qwen3.8-27B EXL3
+2.0 bpw at `-c 204800` and the MTP drafter, the process used the same VRAM to the MiB with this preset and with
+`CMAKE_CUDA_ARCHITECTURES=86` (10,506 MiB after boot, 10,568 MiB after an 8,192-token prompt and 512 generated tokens;
+kernel loading 30-32 MiB in both).
+
 ### Overriding the CUDA Version
 
 If you have multiple CUDA installations on your system and want to compile llama.cpp for a specific one, e.g. for CUDA 11.7 installed under `/opt/cuda-11.7`:

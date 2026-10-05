@@ -128,6 +128,22 @@ LLAMA_MTP_DRAFT_COMPUTE_LEAN=1 llama-server -m model.gguf -c 204800 -ngl 99 -fa 
 
 The tail must exceed the maximum draft width so speculative rollback stays in unsealed rows. The server reprocesses an edited prompt if it reaches sealed rows in either context. Draft sealing runs during decode; server idle compression still applies only to the trunk. State serialization retains the existing KVarN restrictions. Cache compression changes draft probabilities and needs acceptance/quality validation separately from the lean microbatch switch.
 
+### Small-card overhead switches
+
+These cut CUDA memory that is not part of the model, KV or compute buffers. The numbers are from Qwen3.8-27B EXL3 2.0 bpw
+at `-c 204800`, ub 512, with the MTP drafter, on an RTX 3090 Ti (84 SMs); the token streams were byte-identical with and
+without each switch.
+
+| Switch | Default | Effect | Measured |
+|--------|---------|--------|----------|
+| `GGML_CUDA_EXL3_GLUE_INPLACE` | `1` | EXL3 prefill GEMM applies its output transform in place when there is no split-K, instead of through a T x N f32 scratch buffer | scratch pool 102 -> 52 MiB |
+| `LLAMA_SHARED_POOL=1` | off | the MTP draft context uses the trunk context's CUDA scratch pool instead of its own (the two contexts already run one after the other) | scratch pool 52 -> 28 MiB |
+| `GGML_CUDA_STACK_LIMIT=<bytes>` | driver (1024) | per-thread stack reservation; the driver reserves bytes x 1536 threads x SMs | 256: -94 MiB on 84 SMs |
+
+The stack reservation scales with the SM count, so the saving is smaller on small cards (1024 -> 256 B is 31.5 MiB at
+28 SMs). The largest stack any kernel used in these runs was 256 B; if a kernel needs more, the driver grows the
+reservation at launch.
+
 ## Rotation
 
 K and V vectors are rotated by a fixed 128x128 orthonormal Walsh-Hadamard
