@@ -9776,7 +9776,7 @@ struct test_flash_attn_ext_kvarn : public test_case {
     }
 
     std::string op_desc(ggml_tensor * t) override {
-        return body_type == GGML_TYPE_I16 && bits_k <= 3 ? "FLASH_ATTN_EXT_KVARN_TRELLIS" : ggml_op_desc(t);
+        return body_type == GGML_TYPE_I16 ? "FLASH_ATTN_EXT_KVARN_TRELLIS" : ggml_op_desc(t);
     }
 
     double max_nmse_err() override {
@@ -14145,6 +14145,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext_kvarn(64, 24, 4, 3, 301, true, true, GGML_TYPE_F16, 128, false, GGML_TYPE_I16, bk, bv));
         test_cases.emplace_back(new test_flash_attn_ext_kvarn(4, 24, 4, 3, 1024, true, false, GGML_TYPE_Q8_0, 256, false, GGML_TYPE_I16, bk, bv));
     }
+    // [audit 2026-10-03] 4/4 trellis bodies (I16): kvarn4t by default, the token-axis trellis4 under GGML_KVARN_TRELLIS_TOKENS=1
+    for (int64_t n_q : {1, 5, 8}) {
+        test_cases.emplace_back(new test_flash_attn_ext_kvarn(n_q, 24, 4, 3, 301, true, false, GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_I16, 4, 4));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_kvarn(5, 24, 4, 255, 128, true, false, GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_I16, 4, 4));
+    test_cases.emplace_back(new test_flash_attn_ext_kvarn(64, 24, 4, 3, 301, true, true, GGML_TYPE_F16, 128, false, GGML_TYPE_I16, 4, 4));
+    test_cases.emplace_back(new test_flash_attn_ext_kvarn(4, 24, 4, 3, 1024, true, false, GGML_TYPE_Q8_0, 256, false, GGML_TYPE_I16, 4, 4));
+    test_cases.emplace_back(new test_kvarn_seal_dyn(256, 128, 4, 128, 384, 128 + 5*128, 128 + 7*128, 9, 3, 4, 4, 16, GGML_TYPE_TQ6_0, GGML_TYPE_I16));
+    test_cases.emplace_back(new test_kvarn_seal_dyn(256, 128, 4, 128, 384, 128 + 5*128, 128 + 7*128, 9, 3, 3, 3, 16, GGML_TYPE_TQ6_0, GGML_TYPE_I16));
     for (int64_t end : {128 + 5*128, 128 + 7*128}) {
         test_cases.emplace_back(new test_kvarn_seal_dyn(256, 128, 4, 128, 384, 128 + 5*128, end, 9, 3, 4, 4, 16, GGML_TYPE_TQ6_0, GGML_TYPE_TURBO4_0));
     }

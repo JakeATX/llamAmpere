@@ -39,11 +39,17 @@ static __device__ uint16_t kvarn_seal_cb3_v[kvarn_tr3::NWIN] = KVARN_CB3_TRAINED
 namespace kvarn_tr2 = ggml_kvarn::trellis2;
 static __device__ uint16_t kvarn_seal_cb2_k[kvarn_tr2::NWIN] = KVARN_CB2_TRAINED_K_INIT;
 static __device__ uint16_t kvarn_seal_cb2_v[kvarn_tr2::NWIN] = KVARN_CB2_TRAINED_V_INIT;
+// 4-bit token-axis trellis (ggml-kvarn.h "trellis4", GGML_KVARN_TRELLIS_TOKENS=1 only): 1024 windows (32 per lane), 16 branches
+namespace kvarn_tr4 = ggml_kvarn::trellis4;
+static __device__ uint16_t kvarn_seal_cb4_k[kvarn_tr4::NWIN] = KVARN_CB_K_INIT;
+static __device__ uint16_t kvarn_seal_cb4_v[kvarn_tr4::NWIN] = KVARN_CB_V_INIT;
 
 struct kvarn_trellis_cb_registry {
     std::vector<std::pair<const void *, const void *>> syms;
     std::vector<std::pair<const void *, const void *>> syms3;
     std::vector<std::pair<const void *, const void *>> syms2;
+    std::vector<std::pair<const void *, const void *>> syms4;
+    std::vector<const void *> tok;
     bool done[GGML_CUDA_MAX_DEVICES] = { false };
 };
 static kvarn_trellis_cb_registry & kvarn_trellis_cb_reg() {
@@ -58,6 +64,12 @@ void ggml_cuda_kvarn_trellis_cb3_register(const void * sym_k, const void * sym_v
 }
 void ggml_cuda_kvarn_trellis_cb2_register(const void * sym_k, const void * sym_v) {
     kvarn_trellis_cb_reg().syms2.push_back({sym_k, sym_v});
+}
+void ggml_cuda_kvarn_trellis_cb4_register(const void * sym_k, const void * sym_v) {
+    kvarn_trellis_cb_reg().syms4.push_back({sym_k, sym_v});
+}
+void ggml_cuda_kvarn_trellis_tok_register(const void * sym) {
+    kvarn_trellis_cb_reg().tok.push_back(sym);
 }
 static int kvarn_trellis_cb_copy(const std::vector<std::pair<const void *, const void *>> & syms, const uint16_t * hk, const uint16_t * hv, size_t nwin) {
     int n_ok = 0;
@@ -88,9 +100,21 @@ void ggml_cuda_kvarn_trellis_cb_init() {
         const int n_ok = kvarn_trellis_cb_copy(r.syms3, ggml_kvarn::trellis3::cb(false), ggml_kvarn::trellis3::cb(true), kvarn_tr3::NWIN);
         GGML_LOG_INFO("%s: trellis3 codebook override copied to %d of %zu device symbol pairs (device %d)\n", __func__, n_ok, r.syms3.size(), id);
     }
+    if (ggml_kvarn::trellis3::tokens()) {
+        const int one = 1;
+        int n_ok = 0;
+        for (const void * s : r.tok) {
+            if (cudaMemcpyToSymbol(s, &one, sizeof(one)) == cudaSuccess) { ++n_ok; } else { (void) cudaGetLastError(); }
+        }
+        GGML_LOG_INFO("%s: trellis token-traversal flag set in %d of %zu decoder symbols (device %d)\n", __func__, n_ok, r.tok.size(), id);
+    }
     if (getenv("GGML_KVARN_TRELLIS_CB2") != nullptr) {
         const int n_ok = kvarn_trellis_cb_copy(r.syms2, ggml_kvarn::trellis2::cb(false), ggml_kvarn::trellis2::cb(true), kvarn_tr2::NWIN);
         GGML_LOG_INFO("%s: trellis2 codebook override copied to %d of %zu device symbol pairs (device %d)\n", __func__, n_ok, r.syms2.size(), id);
+    }
+    if (getenv("GGML_KVARN_TRELLIS_CB4") != nullptr) {
+        const int n_ok = kvarn_trellis_cb_copy(r.syms4, ggml_kvarn::trellis4::cb(false), ggml_kvarn::trellis4::cb(true), kvarn_tr4::NWIN);
+        GGML_LOG_INFO("%s: trellis4 (token axis) codebook override copied to %d of %zu device symbol pairs (device %d)\n", __func__, n_ok, r.syms4.size(), id);
     }
 }
 struct kvarn_seal_cb_registrar {
@@ -98,6 +122,7 @@ struct kvarn_seal_cb_registrar {
         ggml_cuda_kvarn_trellis_cb_register((const void *) kvarn_seal_cb_k, (const void *) kvarn_seal_cb_v);
         ggml_cuda_kvarn_trellis_cb3_register((const void *) kvarn_seal_cb3_k, (const void *) kvarn_seal_cb3_v);
         ggml_cuda_kvarn_trellis_cb2_register((const void *) kvarn_seal_cb2_k, (const void *) kvarn_seal_cb2_v);
+        ggml_cuda_kvarn_trellis_cb4_register((const void *) kvarn_seal_cb4_k, (const void *) kvarn_seal_cb4_v);
     }
 };
 static kvarn_seal_cb_registrar kvarn_seal_cb_registrar_instance;
@@ -106,6 +131,8 @@ struct kvarn_seal_params {
     int D, G, iters, hkv;
     int trellis;
     int refit;           // trellis3 per-row affine refit mode (ggml_kvarn::trellis3::refit_mode)
+    float clip_k, clip_v; // GGML_KVARN_SCALAR_CLIP (1 = off)
+    int trtok;           // GGML_KVARN_TRELLIS_TOKENS: low-bit trellis along tokens, channel-major payload (ggml_kvarn::trellis3::tokens)
     uint32_t * tr3_arg;  // trellis3 Viterbi back-pointers, global scratch: [block][warp][KVARN_TR3_ARGW] (static + tile smem leave no room)
     int bits_k, bits_v;
     int type_k, type_v;
@@ -284,24 +311,26 @@ template<int BITS>
 static __device__ void kvarn_trellis_lb_phase_b(const half * tile, const float * s_row, const float * s_col,
                                                 const float * q_lo, const float * q_step, const int sr, const int sc,
                                                 const bool is_V, const int D, const int G, uint32_t * dst32,
-                                                float * ys, float * M, uint32_t * arg) {
-    static_assert(BITS == 2 || BITS == 3, "low-bit trellis sealer");
+                                                float * ys, float * M, uint32_t * arg, const bool tok) {
+    static_assert(BITS >= 2 && BITS <= 4, "low-bit trellis sealer (4 = token-axis trellis4)");
     constexpr int NSTATE = kvarn_tr3::NSTATE, SEQ = kvarn_tr3::SEQ;
     constexpr int WPL = (1 << (6 + BITS))/32, SPL = KVARN_TR3_SPL, n = KVARN_TR3_NVAL, WORDS = SEQ*BITS/32;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     constexpr int nwarps = KVARN_SEAL_THREADS/32;
     const int nseq_row = D/SEQ;
-    const uint16_t * cb = BITS == 3 ? (is_V ? kvarn_seal_cb3_v : kvarn_seal_cb3_k) : (is_V ? kvarn_seal_cb2_v : kvarn_seal_cb2_k);
+    const uint16_t * cb = BITS == 4 ? (is_V ? kvarn_seal_cb4_v : kvarn_seal_cb4_k) : BITS == 3 ? (is_V ? kvarn_seal_cb3_v : kvarn_seal_cb3_k) : (is_V ? kvarn_seal_cb2_v : kvarn_seal_cb2_k);
     float cbf[WPL];
 #pragma unroll
     for (int i = 0; i < WPL; ++i) {
         cbf[i] = __half2float(__ushort_as_half(cb[lane + 32*i]));
     }
-    for (int seq = warp; seq < G*nseq_row; seq += nwarps) {
+    // tok (GGML_KVARN_TRELLIS_TOKENS): one sequence per channel along its G == SEQ tokens, channel-major payload
+    for (int seq = warp; seq < (tok ? D : G*nseq_row); seq += nwarps) {
         const int t = seq / nseq_row, h = seq % nseq_row;
         for (int i = lane; i < n; i += 32) {
-            const int d = h*SEQ + i;
-            const int r = is_V ? t : d, c = is_V ? d : t;
+            const int d = tok ? seq : h*SEQ + i;
+            const int tt = tok ? i : t;
+            const int r = is_V ? tt : d, c = is_V ? d : tt;
             ys[i] = __fdiv_rn(__fsub_rn(kvarn_cur(tile, s_row, s_col, r, c, sr, sc), q_lo[r]), q_step[r]);
         }
         for (int s = lane; s < NSTATE; s += 32) M[s] = 0.0f;
@@ -344,7 +373,7 @@ static __device__ void kvarn_trellis_lb_phase_b(const half * tile, const float *
             s = (s + NSTATE*j) >> BITS;
         }
         if (lane < WORDS) {
-            dst32[((size_t) t*D + (size_t) h*SEQ)*BITS/32 + lane] = word;
+            dst32[(tok ? (size_t) seq*G : (size_t) t*D + (size_t) h*SEQ)*BITS/32 + lane] = word;
         }
         __syncwarp();
     }
@@ -356,14 +385,14 @@ template<int BITS>
 static __device__ void kvarn_trellis_lb_refit(const half * tile, const float * s_row, const float * s_col, const int sr, const int sc,
                                               const bool is_V, const int D, const int G, const int R, const int C,
                                               const uint8_t * payload, uint8_t * out, const size_t o_scale, const size_t o_zero,
-                                              const int bits, const int mode) {
-    const uint16_t * cb = BITS == 3 ? (is_V ? kvarn_seal_cb3_v : kvarn_seal_cb3_k) : (is_V ? kvarn_seal_cb2_v : kvarn_seal_cb2_k);
+                                              const int bits, const int mode, const bool tok) {
+    const uint16_t * cb = BITS == 4 ? (is_V ? kvarn_seal_cb4_v : kvarn_seal_cb4_k) : BITS == 3 ? (is_V ? kvarn_seal_cb3_v : kvarn_seal_cb3_k) : (is_V ? kvarn_seal_cb2_v : kvarn_seal_cb2_k);
     for (int r = threadIdx.x; r < R; r += KVARN_SEAL_THREADS) {
         double Sx = 0.0, Sy = 0.0, Sxx = 0.0, Syy = 0.0, Sxy = 0.0;
         for (int c = 0; c < C; ++c) {
             const int t = is_V ? r : c, d = is_V ? c : r;
             const double x  = (double) kvarn_cur(tile, s_row, s_col, r, c, sr, sc);
-            const double yh = (double) __half2float(__ushort_as_half(cb[ggml_kvarn::trellis_lb_window<BITS>(payload, t, d, D)]));
+            const double yh = (double) __half2float(__ushort_as_half(cb[ggml_kvarn::trellis_lb_window_any<BITS>(payload, t, d, D, G, tok)]));
             Sx = __dadd_rn(Sx, x); Sy = __dadd_rn(Sy, yh);
             Sxx = __dadd_rn(Sxx, __dmul_rn(x, x)); Syy = __dadd_rn(Syy, __dmul_rn(yh, yh)); Sxy = __dadd_rn(Sxy, __dmul_rn(x, yh));
         }
@@ -460,6 +489,7 @@ static __global__ void k_kvarn_seal(const char * __restrict__ ksrc, const char *
     const int      bits    = is_V ? p.bits_v : p.bits_k;
     const uint32_t qmax    = (1u << bits) - 1;
     const float    qmaxf   = (float) qmax;
+    const float    clipf   = is_V ? p.clip_v : p.clip_k;
     const size_t   payload = is_V ? p.v_payload : p.k_payload;
     const size_t   o_scale = is_V ? p.v_scale : p.k_scale;
     const size_t   o_zero  = is_V ? p.v_zero  : p.k_zero;
@@ -478,6 +508,21 @@ static __global__ void k_kvarn_seal(const char * __restrict__ ksrc, const char *
         }
         lo = fminf(lo, __shfl_xor_sync(0xFFFFFFFF, lo, 1, 32));
         hi = fmaxf(hi, __shfl_xor_sync(0xFFFFFFFF, hi, 1, 32));
+        if (!p.trellis && clipf < 0.0f) { // GGML_KVARN_SCALAR_CLIP=row: ggml_kvarn::row_clip_search, this thread = one half
+            float best = 0.0f; int bi = 0;
+            for (int i = 0; i < KVARN_CLIP_NCAND; ++i) {
+                float clo, cstep;
+                ggml_kvarn::clip_cand_range(lo, hi, i, qmax, clo, cstep);
+                float part = 0.0f;
+                for (int c = c0; c < c1; ++c) {
+                    part = __fadd_rn(part, ggml_kvarn::clip_err_term(kvarn_cur(tile, s_row, s_col, r, c, sr, sc), clo, cstep, qmax));
+                }
+                const float other = __shfl_xor_sync(0xFFFFFFFF, part, 1, 32);
+                const float e = half_ == 0 ? __fadd_rn(part, other) : __fadd_rn(other, part);
+                if (i == 0 || e < best) { best = e; bi = i; }
+            }
+            if (bi > 0) { ggml_kvarn::clip_range(lo, hi, ggml_kvarn::clip_cand(bi)); }
+        } else if (!p.trellis && clipf != 1.0f) { ggml_kvarn::clip_range(lo, hi, clipf); } // GGML_KVARN_SCALAR_CLIP
         const float step = fmaxf(__fdiv_rn(__fsub_rn(hi, lo), qmaxf), 1e-10f);
         if (half_ == 0) {
             q_lo[r]   = lo;
@@ -499,6 +544,15 @@ static __global__ void k_kvarn_seal(const char * __restrict__ ksrc, const char *
     // other widths as a token-major bit stream, 2 threads per token row.
     if (ggml_kvarn::frag_order(bits, D, G)) {
         uint32_t * dst32 = (uint32_t *) (out + payload);
+        if (p.trellis && p.trtok) { // 4-bit token-axis trellis (trellis4): low-bit sealer at BITS = 4, then the refit
+            uint32_t * tr3_arg = p.tr3_arg + ((size_t) blockIdx.x*(KVARN_SEAL_THREADS/32) + (tid >> 5))*KVARN_TR3_ARGW;
+            kvarn_trellis_lb_phase_b<4>(tile, s_row, s_col, q_lo, q_step, sr, sc, is_V, D, G, dst32, tr_y[tid >> 5], tr_M[tid >> 5], tr3_arg, true);
+            if (p.refit) {
+                __syncthreads();
+                kvarn_trellis_lb_refit<4>(tile, s_row, s_col, sr, sc, is_V, D, G, R, C, out + payload, out, o_scale, o_zero, bits, p.refit, true);
+            }
+            return;
+        }
         if (p.trellis) {
             const int warp = tid >> 5;
             kvarn_trellis_phase_b(tile, s_row, s_col, q_lo, q_step, sr, sc, is_V, D, G, dst32,
@@ -522,16 +576,16 @@ static __global__ void k_kvarn_seal(const char * __restrict__ ksrc, const char *
         uint32_t * dst32 = (uint32_t *) (out + payload);
         uint32_t * tr3_arg = p.tr3_arg + ((size_t) blockIdx.x*(KVARN_SEAL_THREADS/32) + (tid >> 5))*KVARN_TR3_ARGW;
         if (bits == 3) {
-            kvarn_trellis_lb_phase_b<3>(tile, s_row, s_col, q_lo, q_step, sr, sc, is_V, D, G, dst32, tr_y[tid >> 5], tr_M[tid >> 5], tr3_arg);
+            kvarn_trellis_lb_phase_b<3>(tile, s_row, s_col, q_lo, q_step, sr, sc, is_V, D, G, dst32, tr_y[tid >> 5], tr_M[tid >> 5], tr3_arg, p.trtok != 0);
         } else {
-            kvarn_trellis_lb_phase_b<2>(tile, s_row, s_col, q_lo, q_step, sr, sc, is_V, D, G, dst32, tr_y[tid >> 5], tr_M[tid >> 5], tr3_arg);
+            kvarn_trellis_lb_phase_b<2>(tile, s_row, s_col, q_lo, q_step, sr, sc, is_V, D, G, dst32, tr_y[tid >> 5], tr_M[tid >> 5], tr3_arg, p.trtok != 0);
         }
         if (p.refit) {
             __syncthreads();
             if (bits == 3) {
-                kvarn_trellis_lb_refit<3>(tile, s_row, s_col, sr, sc, is_V, D, G, R, C, out + payload, out, o_scale, o_zero, bits, p.refit);
+                kvarn_trellis_lb_refit<3>(tile, s_row, s_col, sr, sc, is_V, D, G, R, C, out + payload, out, o_scale, o_zero, bits, p.refit, p.trtok != 0);
             } else {
-                kvarn_trellis_lb_refit<2>(tile, s_row, s_col, sr, sc, is_V, D, G, R, C, out + payload, out, o_scale, o_zero, bits, p.refit);
+                kvarn_trellis_lb_refit<2>(tile, s_row, s_col, sr, sc, is_V, D, G, R, C, out + payload, out, o_scale, o_zero, bits, p.refit, p.trtok != 0);
             }
         }
     } else {
@@ -671,7 +725,11 @@ void ggml_cuda_kvarn_seal(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_kvarn::layout l = ggml_kvarn::make_layout(p.D, p.G, p.bits_k, p.bits_v);
     const bool turbo4_body = ggml_get_op_params_i32(dst, 7) == GGML_TYPE_TURBO4_0;
     p.trellis = ggml_get_op_params_i32(dst, 7) == GGML_TYPE_I16;
-    p.refit   = p.trellis && (p.bits_k == 3 || p.bits_v == 3 || p.bits_k == 2 || p.bits_v == 2) ? ggml_kvarn::trellis3::refit_mode() : 0;
+    p.trtok   = p.trellis && ggml_kvarn::trellis3::tokens() ? 1 : 0;
+    p.refit   = p.trellis && (p.bits_k == 3 || p.bits_v == 3 || p.bits_k == 2 || p.bits_v == 2 || p.trtok) ? ggml_kvarn::trellis3::refit_mode() : 0;
+    p.clip_k  = ggml_kvarn::scalar_clip::factors()[0];
+    p.clip_v  = ggml_kvarn::scalar_clip::factors()[1];
+    GGML_ASSERT(!p.trtok || p.G == kvarn_tr3::SEQ);
     p.rec_bytes = turbo4_body ? 2*p.G*ggml_row_size(GGML_TYPE_TURBO4_0, p.D) : l.bytes;
     p.k_payload = l.k_payload; p.v_payload = l.v_payload;
     p.k_scale = l.k_scale; p.k_zero = l.k_zero; p.k_tok = l.k_tok;
@@ -697,7 +755,7 @@ void ggml_cuda_kvarn_seal(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         return;
     }
 
-    const bool tr3 = p.trellis && (p.bits_k == 3 || p.bits_v == 3 || p.bits_k == 2 || p.bits_v == 2);
+    const bool tr3 = p.trellis && (p.bits_k == 3 || p.bits_v == 3 || p.bits_k == 2 || p.bits_v == 2 || p.trtok);
     const size_t smem = (size_t) p.G * p.D * sizeof(half);
     const size_t smem_max = (size_t) KVARN_SEAL_MAX_DIM*KVARN_SEAL_MAX_DIM/2*sizeof(half);
     static bool smem_set[GGML_CUDA_MAX_DEVICES] = { false };

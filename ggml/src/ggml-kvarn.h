@@ -266,6 +266,48 @@ inline int refit_mode() {
     }();
     return mode;
 }
+// GGML_KVARN_TRELLIS_TOKENS=1 (audit 2026-10-03, default off): the low-bit trellis runs along the TOKENS of each channel
+// (one 128-token sequence per channel and record, history restarting at every record) instead of along the channels of a
+// token row, and the payload becomes the channel-major stream (bit (d*G + t)*BITS). K and V are correlated along tokens
+// (lag-1 0.42 / 0.28 in the balanced y domain, about 0 along channels), so the history-indexed codebook predicts; pair it
+// with codebooks trained on that traversal (GGML_KVARN_TRELLIS_CB3 / _CB2 = file). Off = the production format, unchanged.
+inline bool tokens() {
+    static const bool on = [] {
+        const char * s = getenv("GGML_KVARN_TRELLIS_TOKENS");
+        const bool v = s != nullptr && atoi(s) != 0;
+        if (v) { fprintf(stderr, "kvarn trellis: token-traversal payload (GGML_KVARN_TRELLIS_TOKENS=1)\n"); }
+        return v;
+    }();
+    return on;
+}
+}
+// GGML_KVARN_SCALAR_CLIP=cK,cV | row (audit 2026-10-03, default off): scalar (RTN) bodies shrink each row's min/max range
+// symmetrically around its centre by cK (K rows = channels) / cV (V rows = tokens) before choosing the step; values
+// outside clamp to the end codes (rtn_code). Record format and decode are unchanged. Off (unset) = factor 1, which is
+// not applied at all, so the off path is the production arithmetic.
+namespace scalar_clip {
+inline const float * factors() {
+    static float f[2] = { 1.0f, 1.0f };
+    static const bool init = [] {
+        const char * s = getenv("GGML_KVARN_SCALAR_CLIP");
+        if (s != nullptr && strcmp(s, "row") == 0) {
+            f[0] = f[1] = -1.0f; // per-row search (row_clip_search)
+            fprintf(stderr, "kvarn: scalar range clip per-row search (GGML_KVARN_SCALAR_CLIP=row)\n");
+        } else if (s != nullptr && *s) {
+            float a = 1.0f, b = 1.0f;
+            const int n = sscanf(s, "%f,%f", &a, &b);
+            if (n < 1 || !(a > 0.0f && a <= 1.0f) || (n == 2 && !(b > 0.0f && b <= 1.0f))) {
+                fprintf(stderr, "kvarn: bad GGML_KVARN_SCALAR_CLIP=%s (cK[,cV] in (0,1])\n", s);
+                abort();
+            }
+            f[0] = a; f[1] = n == 2 ? b : a;
+            fprintf(stderr, "kvarn: scalar range clip K %.4f V %.4f (GGML_KVARN_SCALAR_CLIP)\n", f[0], f[1]);
+        }
+        return true;
+    }();
+    GGML_UNUSED(init);
+    return f;
+}
 }
 // identity codebook initializer for device copies (fp16 bits of 0..7, 64 entries each)
 #define KVARN_CB3_R8(x)  x, x, x, x, x, x, x, x
@@ -296,6 +338,30 @@ inline int refit_mode() { return trellis3::refit_mode(); }
 }
 #define KVARN_CB2_IDENTITY_INIT { KVARN_CB3_R64(0x0000), KVARN_CB3_R64(0x3C00), KVARN_CB3_R64(0x4000), KVARN_CB3_R64(0x4200) }
 
+// 4-bit token-axis trellis (audit 2026-10-03, Item B "k44t_tok", default off): with GGML_KVARN_TRELLIS_TOKENS=1 a 4-bit
+// side of a trellis (I16) body is coded by the low-bit scheme at BITS = 4, L = 10 (current code over the 6 stream bits
+// before it = 1.5 codes), 64 states, 16 branches, along the tokens of each channel (channel-major payload, G == 128), with
+// the norm refit, instead of the fragment-order kvarn4t. Codebook: GGML_KVARN_TRELLIS_CB4 = <file> (uint16 K[1024] then
+// V[1024]) | identity; unset = the kvarn4t built-in tables (same size, trained for the other window map: a fallback only).
+// Off (TOKENS unset) = kvarn4t, unchanged.
+namespace trellis4 {
+constexpr int BITS   = 4;
+constexpr int L      = 10;
+constexpr int NWIN   = 1 << L;       // 1024 codebook entries
+constexpr int NSTATE = NWIN >> BITS; // 64 states
+constexpr int NBR    = 1 << BITS;    // 16 branches
+constexpr int SEQ    = 128;          // tokens per sequence
+static_assert(NSTATE == trellis3::NSTATE && SEQ == trellis3::SEQ, "trellis4 shares the low-bit Viterbi kernel shape");
+static_assert(KVARN_TRELLIS_L == L, "trellis4 fallback codebook is the kvarn4t table (L = 10)");
+inline const uint16_t * cb(bool is_V) {
+    static uint16_t k[NWIN] = KVARN_CB_K_INIT;
+    static uint16_t v[NWIN] = KVARN_CB_V_INIT;
+    static const bool overridden = trellis_lb_load("GGML_KVARN_TRELLIS_CB4", "trellis4 (token axis)", L, BITS, NWIN, k, v);
+    (void) overridden;
+    return is_V ? v : k;
+}
+}
+
 // the two low-bit trellis codecs share every routine below; trellis_lb<BITS> names the constants and codebook of one
 template<int BITS> struct trellis_lb;
 template<> struct trellis_lb<3> {
@@ -305,6 +371,10 @@ template<> struct trellis_lb<3> {
 template<> struct trellis_lb<2> {
     static constexpr int L = trellis2::L, NWIN = trellis2::NWIN, NSTATE = trellis2::NSTATE, NBR = trellis2::NBR, SEQ = trellis2::SEQ;
     static const uint16_t * cb(bool is_V) { return trellis2::cb(is_V); }
+};
+template<> struct trellis_lb<4> {
+    static constexpr int L = trellis4::L, NWIN = trellis4::NWIN, NSTATE = trellis4::NSTATE, NBR = trellis4::NBR, SEQ = trellis4::SEQ;
+    static const uint16_t * cb(bool is_V) { return trellis4::cb(is_V); }
 };
 
 KVARN_HD inline float sub_rn(float a, float b) {
@@ -334,6 +404,33 @@ KVARN_HD inline float div_rn(float a, float b) {
 #else
     volatile float r = a / b; return r;
 #endif
+}
+// symmetric range shrink of [lo, hi] by c (GGML_KVARN_SCALAR_CLIP); identical rounding on host and device
+KVARN_HD inline void clip_range(float & lo, float & hi, float c) {
+    const float mid  = mul_rn(add_rn(lo, hi), 0.5f);
+    const float half = mul_rn(mul_rn(sub_rn(hi, lo), 0.5f), c);
+    lo = sub_rn(mid, half);
+    hi = add_rn(mid, half);
+}
+// GGML_KVARN_SCALAR_CLIP=row: per row, the shrink factor of KVARN_CLIP_NCAND candidates (1 first, ties keep the wider
+// range) with the least float squared RTN error over the row. The error of one half of the row (values x0..x0+n-1) for
+// candidate i; the caller adds the two halves as p0 + p1 (host) / a shuffle (device), identical rounding.
+// candidates 1.00, 0.95, ..., 0.45 (offline E9: the 2-bit scalar V optimum sits near 0.6, 3/4-bit near 0.75-0.95)
+#define KVARN_CLIP_NCAND 12
+KVARN_HD inline float clip_cand(int i) {
+    return i == 0 ? 1.0f : sub_rn(1.0f, mul_rn(0.05f, (float) i)); // _rn: no fma contraction, host == device
+}
+KVARN_HD inline void clip_cand_range(float lo, float hi, int i, uint32_t qmax, float & clo, float & cstep) {
+    if (i > 0) { clip_range(lo, hi, clip_cand(i)); }
+    clo = lo;
+    cstep = fmaxf(div_rn(sub_rn(hi, lo), (float) qmax), 1e-10f);
+}
+KVARN_HD inline float clip_err_term(float x, float clo, float cstep, uint32_t qmax) {
+    float y = div_rn(sub_rn(x, clo), cstep);
+    float r = rintf(y);
+    r = fminf(fmaxf(r, 0.0f), (float) qmax);
+    const float e = sub_rn(x, add_rn(clo, mul_rn(cstep, r)));
+    return mul_rn(e, e);
 }
 KVARN_HD inline double dadd_rn(double a, double b) {
 #if defined(__CUDA_ARCH__)
@@ -380,7 +477,8 @@ KVARN_HD inline uint32_t code3_at(const uint8_t * payload, uint32_t bit) { retur
 // history restarts at every SEQ-channel boundary
 template<int BITS>
 KVARN_HD inline uint32_t trellis_lb_window(const uint8_t * payload, int t, int d, int D) {
-    constexpr int SEQ = 128, NWIN = 1 << (6 + BITS), HIST = 6/BITS;
+    // HIST = codes needed to fill the 6 history bits = ceil(6/BITS): 2 (3-bit), 3 (2-bit), 2 (4-bit: 1.5 codes)
+    constexpr int SEQ = 128, NWIN = 1 << (6 + BITS), HIST = (6 + BITS - 1)/BITS;
     const uint32_t bit = ((uint32_t) t*(uint32_t) D + (uint32_t) d)*(uint32_t) BITS;
     const int h = d & (SEQ - 1);
     if (h >= HIST) {
@@ -411,6 +509,13 @@ KVARN_HD inline uint32_t trellis_lb_window_w(const uint32_t w0, const uint32_t w
 }
 KVARN_HD inline uint32_t trellis3_window(const uint8_t * payload, int t, int d, int D) { return trellis_lb_window<3>(payload, t, d, D); }
 KVARN_HD inline uint32_t trellis2_window(const uint8_t * payload, int t, int d, int D) { return trellis_lb_window<2>(payload, t, d, D); }
+// window of code (t, d) under either payload order: tok = false the production token-major stream (history along the
+// channels of row t), tok = true the channel-major stream of GGML_KVARN_TRELLIS_TOKENS (history along the tokens of
+// channel d; requires G == 128, so the history restarts exactly at each record)
+template<int BITS>
+KVARN_HD inline uint32_t trellis_lb_window_any(const uint8_t * payload, int t, int d, int D, int G, bool tok) {
+    return tok ? trellis_lb_window<BITS>(payload, d, t, G) : trellis_lb_window<BITS>(payload, t, d, D);
+}
 // refit of one row's affine from sequential double sums over its C values (x = balanced value, y = reconstruction):
 // mode 1 least squares x ~ a*y + b, mode 2 moment matching (std and mean). Returns false when degenerate.
 KVARN_HD inline bool trellis3_refit_solve(int mode, double n, double Sx, double Sy, double Sxx, double Syy, double Sxy, float & a, float & b) {
@@ -559,6 +664,21 @@ inline void trellis_lb_code_rows(const float * bal, int R, int C, const float * 
     for (int w = 0; w < NWIN; ++w) cbf[w] = GGML_FP16_TO_FP32(cbh[w]);
     std::vector<float> y(SEQ);
     std::vector<uint8_t> codes(SEQ);
+    if (trellis3::tokens()) {
+        GGML_ASSERT(G == SEQ);
+        for (int d = 0; d < D; ++d) {
+            for (int t = 0; t < G; ++t) {
+                const int r = is_V ? t : d, col = is_V ? d : t;
+                y[t] = div_rn(sub_rn(bal[(size_t) r*C + col], lo[r]), step[r]);
+            }
+            trellis_lb_encode<BITS>(y.data(), SEQ, cbf.data(), codes.data());
+            for (int t = 0; t < G; ++t) {
+                pack_code(payload, ((uint32_t) d*(uint32_t) G + (uint32_t) t)*BITS, BITS, codes[t]);
+            }
+        }
+        GGML_UNUSED(R);
+        return;
+    }
     for (int t = 0; t < G; ++t) {
         for (int h = 0; h < D/SEQ; ++h) {
             for (int i = 0; i < SEQ; ++i) {
@@ -587,7 +707,7 @@ inline void trellis_lb_refit_rows(const float * bal, int R, int C, const float *
         for (int c = 0; c < C; ++c) {
             const int t = is_V ? r : c, d = is_V ? c : r;
             const double x  = (double) bal[(size_t) r*C + c];
-            const double yh = (double) GGML_FP16_TO_FP32(cbh[trellis_lb_window<BITS>(payload, t, d, D)]);
+            const double yh = (double) GGML_FP16_TO_FP32(cbh[trellis_lb_window_any<BITS>(payload, t, d, D, G, trellis3::tokens())]);
             Sx = dadd_rn(Sx, x); Sy = dadd_rn(Sy, yh);
             Sxx = dadd_rn(Sxx, dmul_rn(x, x)); Syy = dadd_rn(Syy, dmul_rn(yh, yh)); Sxy = dadd_rn(Sxy, dmul_rn(x, yh));
         }
@@ -696,6 +816,22 @@ inline float get_half(const uint8_t * rec, size_t off) {
     return GGML_FP16_TO_FP32(h);
 }
 
+// host per-row clip search over a contiguous row of n values (n even): two halves summed sequentially, added p0 + p1
+inline void row_clip_search(const float * row, int n, uint32_t qmax, float & lo, float & hi) {
+    float best = 0.0f; int bi = 0;
+    for (int i = 0; i < KVARN_CLIP_NCAND; ++i) {
+        float clo, cstep;
+        clip_cand_range(lo, hi, i, qmax, clo, cstep);
+        float p[2] = { 0.0f, 0.0f };
+        for (int h = 0; h < 2; ++h) {
+            for (int c = h*(n/2); c < (h + 1)*(n/2); ++c) { p[h] = add_rn(p[h], clip_err_term(row[c], clo, cstep, qmax)); }
+        }
+        const float e = add_rn(p[0], p[1]);
+        if (i == 0 || e < best) { best = e; bi = i; }
+    }
+    if (bi > 0) { clip_range(lo, hi, clip_cand(bi)); }
+}
+
 // Seal one (head, group): K and V are the rotated fp16 rows, row t at K + t*row_stride (elements),
 // D contiguous values per row. Writes l.bytes bytes to rec.
 inline void seal_group(const ggml_fp16_t * K, const ggml_fp16_t * V, size_t row_stride, const layout & l, int iters, uint8_t * rec, bool trellis_body = false) {
@@ -718,6 +854,9 @@ inline void seal_group(const ggml_fp16_t * K, const ggml_fp16_t * V, size_t row_
             const float * row = bal.data() + (size_t) d*G;
             float lo = row[0], hi = row[0];
             for (int t = 1; t < G; ++t) { lo = std::min(lo, row[t]); hi = std::max(hi, row[t]); }
+            if (!trellis_body && scalar_clip::factors()[0] != 1.0f) {
+                if (scalar_clip::factors()[0] < 0.0f) { row_clip_search(row, G, qmax, lo, hi); } else { clip_range(lo, hi, scalar_clip::factors()[0]); }
+            }
             const float step = std::max((hi - lo) / (float) qmax, 1e-10f);
             const int di = k_ch_idx(d, D, G, l.bits_k);
             put_half(rec, l.k_scale + 2*di, s_row[d] * step);
@@ -736,6 +875,9 @@ inline void seal_group(const ggml_fp16_t * K, const ggml_fp16_t * V, size_t row_
         } else if (trellis_body && l.bits_k == 2) {
             trellis_lb_code_rows<2>(bal.data(), D, G, q_lo.data(), q_step.data(), false, D, G, rec + l.k_payload);
             trellis_lb_refit_rows<2>(bal.data(), D, G, s_row.data(), false, D, G, rec + l.k_payload, rec, l, trellis2::refit_mode());
+        } else if (trellis_body && trellis3::tokens()) { // 4-bit token-axis trellis (trellis4)
+            trellis_lb_code_rows<4>(bal.data(), D, G, q_lo.data(), q_step.data(), false, D, G, rec + l.k_payload);
+            trellis_lb_refit_rows<4>(bal.data(), D, G, s_row.data(), false, D, G, rec + l.k_payload, rec, l, trellis3::refit_mode());
         } else if (trellis_body) {
             GGML_ASSERT(frag_order(l.bits_k, D, G) && G % 16 == 0);
             trellis_code_tile(bal.data(), D, G, q_lo.data(), q_step.data(), false, D, G, (uint32_t *) (rec + l.k_payload));
@@ -759,6 +901,9 @@ inline void seal_group(const ggml_fp16_t * K, const ggml_fp16_t * V, size_t row_
             const float * row = bal.data() + (size_t) t*D;
             float lo = row[0], hi = row[0];
             for (int d = 1; d < D; ++d) { lo = std::min(lo, row[d]); hi = std::max(hi, row[d]); }
+            if (!trellis_body && scalar_clip::factors()[1] != 1.0f) {
+                if (scalar_clip::factors()[1] < 0.0f) { row_clip_search(row, D, qmax, lo, hi); } else { clip_range(lo, hi, scalar_clip::factors()[1]); }
+            }
             const float step = std::max((hi - lo) / (float) qmax, 1e-10f);
             put_half(rec, l.v_scale + 2*t, s_row[t] * step);
             put_half(rec, l.v_zero  + 2*t, s_row[t] * lo);
@@ -776,6 +921,9 @@ inline void seal_group(const ggml_fp16_t * K, const ggml_fp16_t * V, size_t row_
         } else if (trellis_body && l.bits_v == 2) {
             trellis_lb_code_rows<2>(bal.data(), G, D, q_lo.data(), q_step.data(), true, D, G, rec + l.v_payload);
             trellis_lb_refit_rows<2>(bal.data(), G, D, s_row.data(), true, D, G, rec + l.v_payload, rec, l, trellis2::refit_mode());
+        } else if (trellis_body && trellis3::tokens()) { // 4-bit token-axis trellis (trellis4)
+            trellis_lb_code_rows<4>(bal.data(), G, D, q_lo.data(), q_step.data(), true, D, G, rec + l.v_payload);
+            trellis_lb_refit_rows<4>(bal.data(), G, D, s_row.data(), true, D, G, rec + l.v_payload, rec, l, trellis3::refit_mode());
         } else if (trellis_body) {
             GGML_ASSERT(frag_order(l.bits_v, D, G) && G % 16 == 0);
             trellis_code_tile(bal.data(), G, D, q_lo.data(), q_step.data(), true, D, G, (uint32_t *) (rec + l.v_payload));
@@ -798,8 +946,9 @@ inline void decode_k_row(const uint8_t * rec, const layout & l, int t, float * o
     const float tok = get_half(rec, l.k_tok + 2*t);
     for (int d = 0; d < l.D; ++d) {
         const float q  = !trellis_body    ? (float) k_code(rec, l, t, d)
-                       : l.bits_k == 3    ? GGML_FP16_TO_FP32(trellis3::cb(false)[trellis3_window(rec + l.k_payload, t, d, l.D)])
-                       : l.bits_k == 2    ? GGML_FP16_TO_FP32(trellis2::cb(false)[trellis2_window(rec + l.k_payload, t, d, l.D)])
+                       : l.bits_k == 3    ? GGML_FP16_TO_FP32(trellis3::cb(false)[trellis_lb_window_any<3>(rec + l.k_payload, t, d, l.D, l.G, trellis3::tokens())])
+                       : l.bits_k == 2    ? GGML_FP16_TO_FP32(trellis2::cb(false)[trellis_lb_window_any<2>(rec + l.k_payload, t, d, l.D, l.G, trellis3::tokens())])
+                       : trellis3::tokens() ? GGML_FP16_TO_FP32(trellis4::cb(false)[trellis_lb_window_any<4>(rec + l.k_payload, t, d, l.D, l.G, true)])
                                           : trellis_value(rec + l.k_payload, code_bit(t, d, false, l.D, l.G, l.bits_k), false, l.D, l.G);
         const int   di = k_ch_idx(d, l.D, l.G, l.bits_k);
         out[d] = (q * get_half(rec, l.k_scale + 2*di) + get_half(rec, l.k_zero + 2*di)) * tok;
@@ -810,8 +959,9 @@ inline void decode_v_row(const uint8_t * rec, const layout & l, int t, float * o
     const float zp = get_half(rec, l.v_zero  + 2*t);
     for (int d = 0; d < l.D; ++d) {
         const float q = !trellis_body    ? (float) v_code(rec, l, t, d)
-                      : l.bits_v == 3    ? GGML_FP16_TO_FP32(trellis3::cb(true)[trellis3_window(rec + l.v_payload, t, d, l.D)])
-                      : l.bits_v == 2    ? GGML_FP16_TO_FP32(trellis2::cb(true)[trellis2_window(rec + l.v_payload, t, d, l.D)])
+                      : l.bits_v == 3    ? GGML_FP16_TO_FP32(trellis3::cb(true)[trellis_lb_window_any<3>(rec + l.v_payload, t, d, l.D, l.G, trellis3::tokens())])
+                      : l.bits_v == 2    ? GGML_FP16_TO_FP32(trellis2::cb(true)[trellis_lb_window_any<2>(rec + l.v_payload, t, d, l.D, l.G, trellis3::tokens())])
+                      : trellis3::tokens() ? GGML_FP16_TO_FP32(trellis4::cb(true)[trellis_lb_window_any<4>(rec + l.v_payload, t, d, l.D, l.G, true)])
                                          : trellis_value(rec + l.v_payload, code_bit(t, d, true, l.D, l.G, l.bits_v), true, l.D, l.G);
         out[d] = (q * sc + zp) * get_half(rec, l.v_ch + 2*v_ch_idx(d, l.D, l.G, l.bits_v));
     }

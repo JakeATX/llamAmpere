@@ -5479,6 +5479,14 @@ llama_context * llama_init_from_model(llama_model * model, llama_context_params 
         if (params.kvarn_edge_layers > 0) {
             const int pair = (params.kvarn_edge_bits_k << 8) | params.kvarn_edge_bits_v;
             const bool ok = pair == ((4 << 8) | 4) || pair == ((4 << 8) | 3) || pair == ((3 << 8) | 3) || pair == ((4 << 8) | 2) || pair == ((2 << 8) | 4) || pair == ((3 << 8) | 2) || pair == ((2 << 8) | 2);
+            // audit 2026-10-03: an explicit I16 (trellis) edge tier is valid only where the main tier allows a trellis body (4/4, 3/3,
+            // 3/2, 2/2); for 4/3, 4/2, 2/4 the 4-bit side would be sealed as kvarn4t and read as scalar nibbles by the low-bit loader
+            const bool edge_trellis_ok = pair == ((4 << 8) | 4) || pair == ((3 << 8) | 3) || pair == ((3 << 8) | 2) || pair == ((2 << 8) | 2);
+            if (params.kvarn_edge_body_type == GGML_TYPE_I16 && !edge_trellis_ok) {
+                LLAMA_LOG_ERROR("%s: KVarN tiered body: a trellis edge tier needs a 4/4, 3/3, 3/2 or 2/2 edge pair (got %u/%u)\n",
+                        __func__, params.kvarn_edge_bits_k, params.kvarn_edge_bits_v);
+                return nullptr;
+            }
             if (!ok || params.kvarn_body_type == GGML_TYPE_TURBO4_0 || (params.kvarn_edge_body_type != GGML_TYPE_F32 && params.kvarn_edge_body_type != GGML_TYPE_I16)) {
                 LLAMA_LOG_ERROR("%s: KVarN tiered body: edge pair must be one of 4/4, 4/3, 3/3, 4/2, 2/4, 3/2, 2/2 (got %u/%u) and the body codec cannot be turbo4\n",
                         __func__, params.kvarn_edge_bits_k, params.kvarn_edge_bits_v);
