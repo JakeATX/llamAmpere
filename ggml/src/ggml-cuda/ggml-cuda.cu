@@ -9591,15 +9591,14 @@ static bool ggml_backend_cuda_share_pool(ggml_backend_t dst, ggml_backend_t src)
     return true;
 }
 
-// [FIT12 overhead] GGML_CUDA_STACK_LIMIT=<bytes>: per-thread stack (local memory) limit, set once per device when the
-// first backend on it is created. The driver reserves limit x max resident threads per SM x SMs (the 1024 B default
-// is 42 MiB on a 28-SM 3060, 126 MiB on an 84-SM 3090 Ti) and grows the reservation again at the launch of any
-// kernel whose frame is larger, so a low value keeps only what the launched kernels need. Unset: driver default.
+// [FIT12 overhead] Per-thread stack (local memory) limit, set once per device when the first backend on it is created.
+// The driver reserves limit x max resident threads per SM x SMs (the 1024 B driver default is 42 MiB on a 28-SM 3060,
+// 120 MiB on an 80-SM 3080 Ti, 126 MiB on an 84-SM 3090 Ti) and grows the reservation again at the launch of any kernel
+// whose frame is larger. Default: 0, so only what the launched kernels need is kept.
+// GGML_CUDA_STACK_LIMIT=<bytes> overrides (1024 restores the driver default).
 static void ggml_cuda_apply_stack_limit(int device) {
     static const char * env = getenv("GGML_CUDA_STACK_LIMIT");
-    if (env == nullptr || env[0] == '\0') {
-        return;
-    }
+    const bool from_env = env != nullptr && env[0] != '\0';
     static std::mutex mtx;
     static bool done[GGML_CUDA_MAX_DEVICES] = {};
     std::lock_guard<std::mutex> lock(mtx);
@@ -9610,7 +9609,7 @@ static void ggml_cuda_apply_stack_limit(int device) {
     ggml_cuda_set_device(device);
     size_t before = 0;
     CUDA_CHECK(cudaDeviceGetLimit(&before, cudaLimitStackSize));
-    const size_t want = (size_t) strtoull(env, nullptr, 10);
+    const size_t want = from_env ? (size_t) strtoull(env, nullptr, 10) : 0;
     const cudaError_t err = cudaDeviceSetLimit(cudaLimitStackSize, want);
     if (err != cudaSuccess) {
         (void) cudaGetLastError();
@@ -9619,7 +9618,8 @@ static void ggml_cuda_apply_stack_limit(int device) {
     }
     size_t after = 0;
     CUDA_CHECK(cudaDeviceGetLimit(&after, cudaLimitStackSize));
-    GGML_LOG_INFO("%s: device %d: per-thread stack limit %zu -> %zu B (GGML_CUDA_STACK_LIMIT)\n", __func__, device, before, after);
+    GGML_LOG_INFO("%s: device %d: per-thread stack limit %zu -> %zu B (%s)\n", __func__, device, before, after,
+                  from_env ? "GGML_CUDA_STACK_LIMIT" : "default; grows at launch to the largest kernel need");
 }
 
 ggml_backend_t ggml_backend_cuda_init(int device) {
