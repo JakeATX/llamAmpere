@@ -12,7 +12,7 @@ void ggml_cuda_lowbits_prefill_case(ggml_backend_cuda_context & ctx, ggml_tensor
     constexpr int ncols = ncols1 * ncols2;
 
     GGML_ASSERT(dst->src[5] != nullptr && dst->src[6] != nullptr);
-    GGML_ASSERT(ggml_get_op_params_i32(KQV, 5) == (((bits_k & 7) << 8) | bits_v)); // bits_k | 8: GGML_KVARN_TRELLIS_WORDS build
+    GGML_ASSERT(ggml_get_op_params_i32(KQV, 5) == (((bits_k & 7) << 8) | bits_v)); // bits_k | 8 / | 16: word-load / byte-load trellis build
     GGML_ASSERT(DKQ == 256 && DV == 256);
     GGML_ASSERT(dst->src[1]->type == GGML_TYPE_F16 || dst->src[1]->type == GGML_TYPE_Q8_0 || dst->src[1]->type == GGML_TYPE_TQ6_0);
     GGML_ASSERT(dst->src[2]->type == GGML_TYPE_F16 || dst->src[2]->type == GGML_TYPE_Q8_0 || dst->src[2]->type == GGML_TYPE_TQ6_0);
@@ -91,8 +91,9 @@ static bool kvarn_lowbits_no_direct() {
 }
 
 // GGML_KVARN_TRELLIS_WORDS (default on; =0 selects the byte-load kernel): trellis tile loads read the payload as aligned
-// 32-bit words instead of two byte loads per code (fattn_kvarn_trellis_lb_word_w, bit-identical values). Separate kernel
-// build (template bits_k | 8). Measured 2026-10-01: +19.3% (3/3) / +17.8% (3/2) decode at 100K, identical text.
+// 32-bit words instead of two byte loads per code (fattn_kvarn_trellis_lb_word_w, bit-identical values). Kernel build
+// bits_k | 8 (byte-load: bits_k | 16); both stage the codebooks in shared memory (#126).
+// Measured 2026-10-01: +19.3% (3/3) / +17.8% (3/2) decode at 100K, identical text.
 static bool kvarn_trellis_words() {
     static const bool v = [] { const char * e = getenv("GGML_KVARN_TRELLIS_WORDS"); return e == nullptr || e[0] != '0'; }();
     return v;
@@ -114,16 +115,19 @@ static void ggml_cuda_lowbits_case(ggml_backend_cuda_context & ctx, ggml_tensor 
         ggml_cuda_kvarn_trellis_cb_init();
         ggml_cuda_lowbits_prefill_case<256,256,8,8,4,4>(ctx,dst);
     } else if (ggml_get_op_params_i32(dst,7) == GGML_TYPE_I16) {
-        // trellis-coded body: the stream kernel has no codebook path, the tile loader decodes every width
-        ggml_cuda_kvarn_trellis_cb_init();
+        // trellis-coded body: the stream kernel has no codebook path, the tile loader decodes every width from the
+        // codebooks staged in shared memory (#126). Only 3/3, 3/2 and 2/2 seal a 2/3-bit trellis body (llama-context.cpp).
         if constexpr (bits_k <= 3 && bits_v <= 3) {
+            ggml_cuda_kvarn_trellis_cb_init();
             if (kvarn_trellis_words()) {
                 kvarn_trellis_words_note();
                 ggml_cuda_lowbits_prefill_case<256,256,8,8,bits_k | 8,bits_v>(ctx,dst);
-                return;
+            } else {
+                ggml_cuda_lowbits_prefill_case<256,256,8,8,bits_k | 16,bits_v>(ctx,dst);
             }
+        } else {
+            GGML_ABORT("KVarN trellis body on a %d/%d pair (trellis needs 3/3, 3/2, 2/2 or the 4/4 trellis4 body)", bits_k, bits_v);
         }
-        ggml_cuda_lowbits_prefill_case<256,256,8,8,bits_k,bits_v>(ctx,dst);
     } else if (dst->src[0]->ne[1] <= 8 && !kvarn_lowbits_no_direct()) {
         ggml_cuda_kvarn_lowbits_width<bits_k,bits_v>(ctx,dst);
     } else {

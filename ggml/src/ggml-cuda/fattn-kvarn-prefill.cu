@@ -36,6 +36,10 @@ static __global__ void fattn_kvarn_expand_prefill(
         }
     } else {
         const int visible_end = desc[GGML_KVARN_DESC_N];
+        // fattn_kvarn_ring_pair_warp (#127): a warp's 32 consecutive i share one row (D2 % 32 == 0), so pos, f16_sink
+        // and the row type are warp-uniform and every lane reaches the shuffle
+        static_assert(D2 % 32 == 0, "fattn_kvarn_ring_pair_warp: warp-uniform rows");
+        const float tq6_mag = TQ6_CENTROIDS[32 + threadIdx.x];
         for (int i = tid; i < rows*D2; i += 256) {
             const int pos = p0 + i/D2;
             const int col = i%D2;
@@ -46,8 +50,8 @@ static __global__ void fattn_kvarn_expand_prefill(
                 const bool f16_sink = pos < kv.S && kv.sink_type == GGML_TYPE_F16;
                 const char * kh = K + (size_t) head*k_head_stride;
                 const char * vh = V + (size_t) head*v_head_stride;
-                k = fattn_kvarn_ring_pair(f16_sink ? fattn_kvarn_sink_row(kh, kv, k_row_stride, row, false) : kh + (size_t) row*k_row_stride, col, f16_sink ? GGML_TYPE_F16 : kv.type_k);
-                v = fattn_kvarn_ring_pair(f16_sink ? fattn_kvarn_sink_row(vh, kv, v_row_stride, row, true) : vh + (size_t) row*v_row_stride, col, f16_sink ? GGML_TYPE_F16 : kv.type_v);
+                k = fattn_kvarn_ring_pair_warp(f16_sink ? fattn_kvarn_sink_row(kh, kv, k_row_stride, row, false) : kh + (size_t) row*k_row_stride, col, f16_sink ? GGML_TYPE_F16 : kv.type_k, tq6_mag);
+                v = fattn_kvarn_ring_pair_warp(f16_sink ? fattn_kvarn_sink_row(vh, kv, v_row_stride, row, true) : vh + (size_t) row*v_row_stride, col, f16_sink ? GGML_TYPE_F16 : kv.type_v, tq6_mag);
             }
             K_out[out_offset + i] = k;
             V_out[out_offset + i] = v;

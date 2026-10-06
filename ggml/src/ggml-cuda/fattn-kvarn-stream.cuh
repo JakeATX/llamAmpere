@@ -476,7 +476,10 @@ static __global__ void flash_attn_ext_kvarn_stream(
     };
 
     // stage one exact f16 strip (16 rows of D halves, K or V) into the ring, rows swizzled by 16-byte chunk
+    static_assert((EXACT_BYTES/16) % WARP_SIZE == 0, "fattn_kvarn_ring_pair_warp needs whole warps per exact strip");
     auto issue_exact = [&](const char * rows, const size_t nb, const int type) {
+        // per-strip load keeps the tq6 lane register out of the kernel's live range (#127)
+        const float tq6_mag = type == GGML_TYPE_TQ6_0 ? TQ6_CENTROIDS[32 + lane] : 0.0f;
         for (int q = nt*WARP_SIZE + lane; q < EXACT_BYTES/16; q += NT*WARP_SIZE) {
             const int r = q / (EXACT_ROW_BYTES/16);
             const int j = q % (EXACT_ROW_BYTES/16);
@@ -484,7 +487,7 @@ static __global__ void flash_attn_ext_kvarn_stream(
                 half2 * out = (half2 *) (ring + r*EXACT_ROW_BYTES + 16*(j ^ (r & 7)));
 #pragma unroll
                 for (int i = 0; i < 4; ++i) {
-                    out[i] = fattn_kvarn_ring_pair(rows + (size_t) r*nb, 4*j+i, type);
+                    out[i] = fattn_kvarn_ring_pair_warp(rows + (size_t) r*nb, 4*j+i, type, tq6_mag); // warp-uniform: q steps by whole warps
                 }
             } else {
                 cp_async_cg_16<0>(ring_s + r*EXACT_ROW_BYTES + 16*(j ^ (r & 7)), rows + (size_t) r*nb + 16*j);

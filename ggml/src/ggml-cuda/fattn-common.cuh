@@ -108,16 +108,31 @@ static __device__ __forceinline__ const char * fattn_kvarn_sink_row(
         (is_v ? kv.sink_head_delta_v : kv.sink_head_delta_k) + (size_t) row*kv.sink_stride;
 }
 
-// Packed ring storage is decoded into registers or shared tiles.
-static __device__ __forceinline__ half2 fattn_kvarn_ring_pair(const char * row, const int pair, const int type) {
-    if (type == GGML_TYPE_F16) {
-        return ((const half2 *) row)[pair];
-    }
+// Packed ring storage (f16, q8_0, tq6_0) decoded into registers or shared tiles; warp-collective for tq6_0 (#127).
+// A per-lane tq6_dequant_element is a lane-divergent __constant__ read: 64 random 6-bit codes replay through the
+// constant cache once per distinct address. The TQ6 table is exactly antisymmetric (TQ6_CENTROIDS[63-i] ==
+// -TQ6_CENTROIDS[i], bitwise), so lane L holds tq6_mag = TQ6_CENTROIDS[32 + L] and a lookup is one __shfl_sync plus a
+// sign flip; (-c)*norm == -(c*norm) in IEEE, so values are bit-identical to tq6_dequant_element.
+// Every lane of the warp must reach the call with the same row type (full-mask shuffle).
+static __device__ __forceinline__ float fattn_kvarn_tq6_centroid_shfl(const float tq6_mag, const int idx) {
+    const int neg = ((idx >> 5) & 1) - 1; // 0 for idx >= 32, -1 (all ones) for idx < 32
+    const float v = __shfl_sync(0xFFFFFFFF, tq6_mag, (idx ^ neg) & 31, 32);
+    return __uint_as_float(__float_as_uint(v) ^ ((uint32_t) neg & 0x80000000u));
+}
+
+static __device__ __forceinline__ half2 fattn_kvarn_ring_pair_warp(const char * row, const int pair, const int type, const float tq6_mag) {
     if (type == GGML_TYPE_TQ6_0) {
         const block_tq6_0 * b = ((const block_tq6_0 *) row) + pair/(QK_TQ6/2);
-        const int i = 2*(pair%(QK_TQ6/2));
+        const int i = 2*(pair%(QK_TQ6/2)); // even: elements i, i+1 share qs[i/2] and qh[i/4]
         const float norm = __half2float(b->norm);
-        return __floats2half2_rn(tq6_dequant_element(b, i, norm), tq6_dequant_element(b, i+1, norm));
+        const int qs = b->qs[i/2];
+        const int qh = b->qh[i/4] >> ((i%4)*2);
+        const int q0 = (qs & 0xF) | ((qh & 3) << 4);
+        const int q1 = (qs >> 4)  | (((qh >> 2) & 3) << 4);
+        return __floats2half2_rn(fattn_kvarn_tq6_centroid_shfl(tq6_mag, q0) * norm, fattn_kvarn_tq6_centroid_shfl(tq6_mag, q1) * norm);
+    }
+    if (type == GGML_TYPE_F16) {
+        return ((const half2 *) row)[pair];
     }
     const block_q8_0 & b = ((const block_q8_0 *) row)[pair/(QK8_0/2)];
     const int i = 2*(pair%(QK8_0/2));

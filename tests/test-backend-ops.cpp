@@ -14780,6 +14780,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_flash_attn_ext_kvarn(n_q, 24, 4, n_groups, 1024, false, false, GGML_TYPE_TQ6_0, 128, true));
         }
     }
+    // [#126/#127] trellis prefill ubatch (n_q 1024) at 100K, and the 4/4 tq6 exact ring at its 8192 cap (decode widths
+    // and prefill): the staged codebook and the shuffle-decoded tq6 ring.
+    for (auto [bk, bv] : std::vector<std::pair<int,int>>{{3, 3}, {3, 2}}) {
+        test_cases.emplace_back(new test_flash_attn_ext_kvarn(1024, 24, 4, 792, 1024, false, false, GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_I16, bk, bv));
+    }
+    for (int64_t n_q : {1, 5, 1024}) {
+        test_cases.emplace_back(new test_flash_attn_ext_kvarn(n_q, 24, 4, 792, 8192, false, false, GGML_TYPE_TQ6_0, 128, true));
+    }
     // Compare exact-tail traffic at the same 32896 visible positions.
     for (int64_t n_q : {4, 5}) {
         test_cases.emplace_back(new test_flash_attn_ext_kvarn(n_q, 24, 4, 255, 128));

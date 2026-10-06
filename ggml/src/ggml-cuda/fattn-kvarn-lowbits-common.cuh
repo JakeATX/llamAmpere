@@ -79,12 +79,46 @@ struct fattn_kvarn_cb3_registrar {
 };
 static fattn_kvarn_cb3_registrar fattn_kvarn_cb3_registrar_instance;
 
+// Shared-memory copy of the 2/3-bit trellis codebooks (#126). The window lookups are lane-divergent: through L1 a warp
+// load of 32 random entries of a 1 KB table costs up to 8 wavefronts plus the global-load latency; from shared memory
+// it is one LDS with bank conflicts. The trellis builds of flash_attn_ext_f16 (template bits_k | 8 word-load, bits_k |
+// 16 byte-load) copy the K table to [0, 512) and the V table to [FATTN_KVARN_CB_SMEM_V, +512) once per CTA, from the
+// per-device __device__ symbols, i.e. after ggml_cuda_kvarn_trellis_cb_init() has copied any GGML_KVARN_TRELLIS_CB*
+// override in. 2-bit tables fill the first 256 entries of their half. Only kernels that reference the array allocate it
+// (2 KB). Every 2/3-bit trellis decode reads this copy; the 4-bit token-axis trellis4 table (opt-in) stays global.
+#define FATTN_KVARN_CB_SMEM_V FATTN_KVARN_TR3_NWIN
+static __shared__ uint16_t fattn_kvarn_cb_smem[2*FATTN_KVARN_CB_SMEM_V];
+
+// Block-wide: every thread of the CTA must call it (it ends in __syncthreads()).
+template<int BITS_K, int BITS_V>
+static __device__ __forceinline__ void fattn_kvarn_trellis_cb_stage() {
+    static_assert(BITS_K >= 2 && BITS_K <= 3 && BITS_V >= 2 && BITS_V <= 3, "trellis codebook staging: 2/3-bit tables");
+    constexpr int nk = BITS_K == 3 ? FATTN_KVARN_TR3_NWIN : FATTN_KVARN_TR2_NWIN;
+    constexpr int nv = BITS_V == 3 ? FATTN_KVARN_TR3_NWIN : FATTN_KVARN_TR2_NWIN;
+    const uint16_t * cbk = BITS_K == 3 ? fattn_kvarn_cb3_k : fattn_kvarn_cb2_k;
+    const uint16_t * cbv = BITS_V == 3 ? fattn_kvarn_cb3_v : fattn_kvarn_cb2_v;
+    const int tid  = threadIdx.y*blockDim.x + threadIdx.x;
+    const int nthr = blockDim.x*blockDim.y;
+    for (int i = tid; i < nk; i += nthr) {
+        fattn_kvarn_cb_smem[i] = cbk[i];
+    }
+    for (int i = tid; i < nv; i += nthr) {
+        fattn_kvarn_cb_smem[FATTN_KVARN_CB_SMEM_V + i] = cbv[i];
+    }
+    __syncthreads();
+}
+
+// Staged codebook entry for a 2/3-bit trellis window (fattn_kvarn_trellis_cb_stage must have run in this CTA).
+template<bool is_V>
+static __device__ __forceinline__ uint16_t fattn_kvarn_trellis_cb_at(const uint32_t win) {
+    return fattn_kvarn_cb_smem[(is_V ? FATTN_KVARN_CB_SMEM_V : 0) + win];
+}
+
 // The 8 values of MMA fragment word `word` (same nibble -> (token, channel) map as kvarn_lowbits::fragment_word)
 // decoded through the BITS-bit trellis codebook, packed as q[l] = (value l, value l+4) like fattn_kvarn_lowbits_decode_word.
 template<int BITS, bool is_V>
 static __device__ __forceinline__ void fattn_kvarn_trellis_lb_word(const uint8_t * __restrict__ payload, const int word, half2 * const __restrict__ q /* [4] */) {
     static_assert(BITS >= 2 && BITS <= 4, "low-bit trellis decode (4 = token-axis trellis4)");
-    const uint16_t * cb = BITS == 4 ? (is_V ? fattn_kvarn_cb4_v : fattn_kvarn_cb4_k) : BITS == 3 ? (is_V ? fattn_kvarn_cb3_v : fattn_kvarn_cb3_k) : (is_V ? fattn_kvarn_cb2_v : fattn_kvarn_cb2_k);
     const int lane  = word & 31;
     const int tile  = (word >> 5) & 15;
     const int strip = word >> 9;
@@ -97,7 +131,12 @@ static __device__ __forceinline__ void fattn_kvarn_trellis_lb_word(const uint8_t
         const int col = 2*((l >> 1)*4 + (lane & 3)) + e;
         const int token   = strip*16 + (is_V ? col : row);
         const int channel = tile*16  + (is_V ? row : col);
-        vals[nib] = __ushort_as_half(cb[ggml_kvarn::trellis_lb_window_any<BITS>(payload, token, channel, 256, 128, tok)]);
+        const uint32_t win = ggml_kvarn::trellis_lb_window_any<BITS>(payload, token, channel, 256, 128, tok);
+        if constexpr (BITS == 4) {
+            vals[nib] = __ushort_as_half((is_V ? fattn_kvarn_cb4_v : fattn_kvarn_cb4_k)[win]); // trellis4 table is not staged
+        } else {
+            vals[nib] = __ushort_as_half(fattn_kvarn_trellis_cb_at<is_V>(win));
+        }
     }
 #pragma unroll
     for (int l = 0; l < 4; ++l) {
@@ -105,15 +144,14 @@ static __device__ __forceinline__ void fattn_kvarn_trellis_lb_word(const uint8_t
     }
 }
 
-// GGML_KVARN_TRELLIS_WORDS=1: the same 8 values as fattn_kvarn_trellis_lb_word, bit-identical, read with aligned
+// Word-load decode (default; GGML_KVARN_TRELLIS_WORDS=0 selects the byte loader): the same 8 values as fattn_kvarn_trellis_lb_word, bit-identical, read with aligned
 // 32-bit payload loads (one 2-3 word run per token covers 2-4 codes plus their history) instead of two byte loads
-// per code, and read-only codebook loads. K: 2 tokens x 4 channels per lane; V: 4 tokens x 2 channels per lane.
+// per code, codebook from the staged shared copy. K: 2 tokens x 4 channels per lane; V: 4 tokens x 2 channels per lane.
 // Every word read lies inside the record (payloads are followed by metadata; record/payload offsets are 4-byte aligned).
 template<int BITS, bool is_V>
 static __device__ __forceinline__ void fattn_kvarn_trellis_lb_word_w(const uint8_t * __restrict__ payload, const int word, half2 * const __restrict__ q /* [4] */) {
     static_assert(BITS == 2 || BITS == 3, "low-bit trellis decode");
     constexpr int D = 256;
-    const uint16_t * cb = BITS == 3 ? (is_V ? fattn_kvarn_cb3_v : fattn_kvarn_cb3_k) : (is_V ? fattn_kvarn_cb2_v : fattn_kvarn_cb2_k);
     const uint32_t * p32 = reinterpret_cast<const uint32_t *>(payload);
     const int lane  = word & 31;
     const int tile  = (word >> 5) & 15;
@@ -142,7 +180,7 @@ static __device__ __forceinline__ void fattn_kvarn_trellis_lb_word_w(const uint8
                     for (int r = 0; r < 2; ++r) {
                         const uint32_t rel = b0 + (uint32_t) (8*r)*BITS - 32u*base;
                         const uint32_t win = ggml_kvarn::trellis_lb_window_w<BITS>(w0, w1, 0u, rel, (t0 + 8*r) & 127);
-                        vals[(e << 2) | (j << 1) | r] = __ushort_as_half(__ldg(cb + win));
+                        vals[(e << 2) | (j << 1) | r] = __ushort_as_half(fattn_kvarn_trellis_cb_at<is_V>(win));
                     }
                 }
             }
@@ -164,7 +202,7 @@ static __device__ __forceinline__ void fattn_kvarn_trellis_lb_word_w(const uint8
                     for (int e = 0; e < 2; ++e) {
                         const uint32_t rel = b0 + (uint32_t) (8*j + e)*BITS - 32u*base;
                         const uint32_t win = ggml_kvarn::trellis_lb_window_w<BITS>(w0, w1, w2, rel, (t1 + 8*j + e) & 127);
-                        vals[(e << 2) | (j << 1) | r] = __ushort_as_half(__ldg(cb + win));
+                        vals[(e << 2) | (j << 1) | r] = __ushort_as_half(fattn_kvarn_trellis_cb_at<is_V>(win));
                     }
                 }
             }
@@ -194,7 +232,7 @@ static __device__ __forceinline__ void fattn_kvarn_trellis_lb_word_w(const uint8
                     const int ch = g0 + 8*j + e;
                     const uint32_t rel = b0 + (uint32_t) (8*j + e)*BITS - 32u*base;
                     const uint32_t win = ggml_kvarn::trellis_lb_window_w<BITS>(w0, w1, w2, rel, ch & 127);
-                    vals[(e << 2) | (j << 1) | r] = __ushort_as_half(__ldg(cb + win));
+                    vals[(e << 2) | (j << 1) | r] = __ushort_as_half(fattn_kvarn_trellis_cb_at<is_V>(win));
                 }
             }
         }
@@ -216,7 +254,7 @@ static __device__ __forceinline__ void fattn_kvarn_trellis_lb_word_w(const uint8
                     const int ch = d0 + 8*r;
                     const uint32_t rel = b0 + (uint32_t) (8*r)*BITS - 32u*base;
                     const uint32_t win = ggml_kvarn::trellis_lb_window_w<BITS>(w0, w1, 0u, rel, ch & 127);
-                    vals[(e << 2) | (j << 1) | r] = __ushort_as_half(__ldg(cb + win));
+                    vals[(e << 2) | (j << 1) | r] = __ushort_as_half(fattn_kvarn_trellis_cb_at<is_V>(win));
                 }
             }
         }
@@ -228,7 +266,8 @@ static __device__ __forceinline__ void fattn_kvarn_trellis_lb_word_w(const uint8
 }
 
 struct fattn_kvarn_lowbits_ctx {
-    bool trellis_words;  // GGML_KVARN_TRELLIS_WORDS=1 build of the kernel (template bits_k | 8): fattn_kvarn_trellis_lb_word_w
+    bool trellis;        // 2/3-bit trellis build (template bits_k | 8 or | 16): codebooks staged in fattn_kvarn_cb_smem (#126)
+    bool trellis_words;  // word-load trellis build (template bits_k | 8, default): fattn_kvarn_trellis_lb_word_w
     const char * body;   // first record of this KV head; group g sits at body + g*rec_stride
     int S, cap, B, G;
     int bits_k, bits_v;
@@ -245,7 +284,8 @@ static __device__ __forceinline__ fattn_kvarn_lowbits_ctx fattn_kvarn_lowbits_ma
     fattn_kvarn_lowbits_ctx c;
     const int G         = desc[GGML_KVARN_DESC_G];
     const int rec_bytes = desc[GGML_KVARN_DESC_RECBYTES];
-    c.trellis_words = (bits_k & 8) != 0; // compile-time in every caller: template bits_k | 8 = GGML_KVARN_TRELLIS_WORDS build
+    c.trellis       = (bits_k & 24) != 0; // compile-time in every caller: bits_k | 8 word-load, | 16 byte-load trellis build
+    c.trellis_words = (bits_k & 8) != 0;
     c.bits_k = bits_k & 7;
     c.bits_v = bits_v;
     c.S          = desc[GGML_KVARN_DESC_S];

@@ -652,9 +652,9 @@ static __device__ __forceinline__ void flash_attn_ext_kvarn_load_tile(
                 const int bits = is_V ? kv.bits_v : kv.bits_k;
                 const uint8_t * packed = reinterpret_cast<const uint8_t *>(payload);
                 half2 q[4];
-                if (kv.body_type == GGML_TYPE_I16 && bits == 3) {
+                if (kv.trellis && kv.body_type == GGML_TYPE_I16 && bits == 3) { // staged codebooks (#126)
                     if (kv.trellis_words) { fattn_kvarn_trellis_lb_word_w<3,is_V>(packed, word, q); } else { fattn_kvarn_trellis_lb_word<3,is_V>(packed, word, q); }
-                } else if (kv.body_type == GGML_TYPE_I16 && bits == 2) {
+                } else if (kv.trellis && kv.body_type == GGML_TYPE_I16 && bits == 2) { // staged codebooks (#126)
                     if (kv.trellis_words) { fattn_kvarn_trellis_lb_word_w<2,is_V>(packed, word, q); } else { fattn_kvarn_trellis_lb_word<2,is_V>(packed, word, q); }
                 } else if (kv.body_type == GGML_TYPE_I16 && bits == 4 && (fattn_kvarn_trtok & 2)) {
                     fattn_kvarn_trellis_lb_word<4,is_V>(packed, word, q); // token-axis trellis4 (opt-in, explicit GGML_KVARN_TRELLIS_TOKENS=1)
@@ -699,9 +699,9 @@ static __device__ __forceinline__ void flash_attn_ext_kvarn_load_tile(
                 const int bits = is_V ? kv.bits_v : kv.bits_k;
                 const uint8_t * packed = reinterpret_cast<const uint8_t *>(payload);
                 half2 q[4];
-                if (kv.body_type == GGML_TYPE_I16 && bits == 3) {
+                if (kv.trellis && kv.body_type == GGML_TYPE_I16 && bits == 3) { // staged codebooks (#126)
                     if (kv.trellis_words) { fattn_kvarn_trellis_lb_word_w<3,is_V>(packed, word, q); } else { fattn_kvarn_trellis_lb_word<3,is_V>(packed, word, q); }
-                } else if (kv.body_type == GGML_TYPE_I16 && bits == 2) {
+                } else if (kv.trellis && kv.body_type == GGML_TYPE_I16 && bits == 2) { // staged codebooks (#126)
                     if (kv.trellis_words) { fattn_kvarn_trellis_lb_word_w<2,is_V>(packed, word, q); } else { fattn_kvarn_trellis_lb_word<2,is_V>(packed, word, q); }
                 } else if (kv.body_type == GGML_TYPE_I16 && bits == 4 && (fattn_kvarn_trtok & 2)) {
                     fattn_kvarn_trellis_lb_word<4,is_V>(packed, word, q); // token-axis trellis4 (opt-in, explicit GGML_KVARN_TRELLIS_TOKENS=1)
@@ -3084,6 +3084,12 @@ static __global__ void flash_attn_ext_f16(
     constexpr int nwarps    = nthreads / warp_size;
 
     const int gqa_ratio = ne02 / ne12; // With grouped query attention there are > 1 Q matrices per K, V matrix.
+
+    // #126: 2/3-bit trellis builds (bits_k | 8 word-load, bits_k | 16 byte-load) stage the K/V codebooks into shared
+    // memory once per CTA, before the stream-k loop (every thread is still present: no early return comes before this).
+    if constexpr (type_K == GGML_TYPE_I8 && (bits_k & 24) != 0) {
+        fattn_kvarn_trellis_cb_stage<bits_k & 7, bits_v>();
+    }
 
     // For turbo4 KV the kernel receives RAW quantized bytes (need_f16_K/V = false in the
     // launcher), so stride_K/stride_V must be the true byte pitch nb11/nb21 — the turbo
