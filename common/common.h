@@ -743,6 +743,7 @@ struct common_params {
     int32_t timeout_read        = 3600;          // http read timeout in seconds
     int32_t timeout_write       = timeout_read;  // http write timeout in seconds
     int32_t sse_ping_interval   = 30;            // SSE ping interval in seconds
+    bool    sse_ping_queued     = false;         // start a queued streaming request with SSE pings after one ping interval
     int32_t slot_stall_timeout  = 0;             // report a busy slot with no progress for this many seconds (0 = disabled)
     bool    slot_stall_cancel   = false;         // also fail the stalled request so that its client is released
     int32_t n_threads_http      = -1;    // number of threads to process HTTP requests (TODO: support threadpool)
@@ -1104,6 +1105,10 @@ struct common_init_result {
     void reset_samplers();
 
     std::vector<llama_adapter_lora_ptr> & lora();
+
+    // free the context (and the samplers that may refer to it), so that context() returns nullptr: used when the
+    // context was created but cannot run
+    void free_context();
 
 private:
     struct impl;

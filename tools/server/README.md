@@ -219,7 +219,8 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--chat-template-kwargs STRING` | sets additional params for the json template parser, must be a valid json object string, e.g. '{"key1":"value1","key2":"value2"}'<br/>(env: LLAMA_ARG_CHAT_TEMPLATE_KWARGS) |
 | `-to, --timeout N` | server read/write timeout in seconds (default: 3600)<br/>(env: LLAMA_ARG_TIMEOUT) |
 | `--sse-ping-interval N` | server SSE ping interval in seconds (-1 = disabled, default: 30)<br/>(env: LLAMA_ARG_SSE_PING_INTERVAL) |
-| `--slot-stall-timeout N` | log a warning when a busy slot makes no progress (prompt or generated tokens) for N seconds, including a decode that does not return (0 = disabled, default: 0)<br/>(env: LLAMA_ARG_SLOT_STALL_TIMEOUT) |
+| `--sse-ping-queued` | keep-alive for queued streaming requests: when no slot has started the request within one SSE ping interval, send the HTTP 200 headers and pings while it waits; an error raised after that is sent as an SSE error event instead of an HTTP error status (default: disabled)<br/>(env: LLAMA_ARG_SSE_PING_QUEUED) |
+| `--slot-stall-timeout N` | log a warning when a busy slot makes no progress (prompt or generated tokens) for N seconds while no other slot progresses either, including a decode that does not return; set N above the longest single batch (0 = disabled, default: 0)<br/>(env: LLAMA_ARG_SLOT_STALL_TIMEOUT) |
 | `--slot-stall-cancel` | with --slot-stall-timeout, also fail the stalled request with an error so that its client is released; the slot is freed once the main loop runs again (default: disabled)<br/>(env: LLAMA_ARG_SLOT_STALL_CANCEL) |
 | `--threads-http N` | number of threads used to process HTTP requests (default: -1)<br/>(env: LLAMA_ARG_THREADS_HTTP) |
 | `--cache-prompt, --no-cache-prompt` | whether to enable prompt caching (default: enabled)<br/>(env: LLAMA_ARG_CACHE_PROMPT) |

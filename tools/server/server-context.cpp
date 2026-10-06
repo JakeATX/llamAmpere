@@ -336,6 +336,18 @@ enum slot_state {
     SLOT_STATE_GENERATING,
 };
 
+static const char * slot_state_name(int state) {
+    switch (state) {
+        case SLOT_STATE_IDLE:              return "idle";
+        case SLOT_STATE_WAIT_OTHER:        return "wait_other";
+        case SLOT_STATE_STARTED:           return "started";
+        case SLOT_STATE_PROCESSING_PROMPT: return "processing_prompt";
+        case SLOT_STATE_DONE_PROMPT:       return "done_prompt";
+        case SLOT_STATE_GENERATING:        return "generating";
+    }
+    return "unknown";
+}
+
 struct server_slot; // forward declaration
 
 struct server_batch {
@@ -1500,6 +1512,7 @@ private:
     std::mutex                 stall_mutex;
     std::condition_variable    stall_cv;
     std::vector<slot_progress> stall_progress;
+    int64_t                    stall_t_any_ms = 0; // last time any watched slot made progress
     std::thread                stall_thread;
     bool                       stall_stop = false;
 
@@ -1534,6 +1547,7 @@ private:
                 p.n_gen     = n_gen;
                 p.t_last_ms = t_now;
                 p.reported  = false;
+                stall_t_any_ms = t_now;
             }
             p.state = slot.state;
         }
@@ -1561,13 +1575,15 @@ private:
             const int64_t t_now = ggml_time_ms();
             for (size_t i = 0; i < stall_progress.size(); i++) {
                 slot_progress & p = stall_progress[i];
-                if (p.id_task < 0 || p.reported || t_now - p.t_last_ms < timeout_ms) {
+                // a slot is stalled only while no slot makes progress: a slot that waits for batch space while
+                // another slot's prompt fills every batch is not stalled
+                if (p.id_task < 0 || p.reported || t_now - p.t_last_ms < timeout_ms || t_now - stall_t_any_ms < timeout_ms) {
                     continue;
                 }
                 p.reported = true;
 
-                SRV_WRN("slot %zu, task %d: no progress for %.1f s (state = %d, n_tokens = %d, n_gen = %d)\n",
-                        i, p.id_task, (t_now - p.t_last_ms) / 1000.0, p.state, p.n_tokens, p.n_gen);
+                SRV_WRN("slot %zu, task %d: no progress for %.1f s (state = %s, n_tokens = %d, n_gen = %d)\n",
+                        i, p.id_task, (t_now - p.t_last_ms) / 1000.0, slot_state_name(p.state), p.n_tokens, p.n_gen);
 
                 if (params_base.slot_stall_cancel) {
                     // release the client: the HTTP side receives the error and posts a cancel for the task,
@@ -5596,33 +5612,58 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         // in streaming mode, the first error must be treated as non-stream response
         // this is to match the OAI API behavior
         // ref: https://github.com/ggml-org/llama.cpp/pull/16486#discussion_r2419657309
-        auto first_result = rd.next(req.should_stop);
-        if (first_result == nullptr) {
-            GGML_ASSERT(req.should_stop());
-            return res; // connection is closed
-        }
+        //
+        // keep-alive while queued: a request that waits for a free slot gets no result, so without a limit its
+        // client would see no headers and no pings until the slot starts. after one SSE ping interval without a
+        // first result the stream is started with a ping; from then on the streaming loop below sends the pings,
+        // and an error that arrives later is sent as an SSE error event, like any error during streaming
+        // opt-in (--sse-ping-queued): once the stream has started, a later error is sent with HTTP 200 as an SSE
+        // error event instead of an HTTP error status
+        bool first_timeout = false;
+        const bool ping_queued = params.sse_ping_queued && sse_ping_interval > 0;
+        const int64_t t_first_start = ggml_time_ms();
+        auto first_result = rd.next([&req, &first_timeout, t_first_start, sse_ping_interval, ping_queued]() {
+            if (req.should_stop()) {
+                return true;
+            }
+            if (ping_queued && ggml_time_ms() - t_first_start > (int64_t) sse_ping_interval * 1000) {
+                first_timeout = true;
+                return true;
+            }
+            return false;
+        });
 
-        if (first_result->is_error()) {
-            res->error(first_result->to_json());
-            return res;
-        }
-
-        GGML_ASSERT(
-            dynamic_cast<server_task_result_cmpl_partial*>(first_result.get()) != nullptr ||
-            dynamic_cast<server_task_result_cmpl_final*>  (first_result.get()) != nullptr
-        );
-
-        // next responses are streamed
-        // to be sent immediately
-        json first_result_json = first_result->to_json();
-        if (first_result_json == nullptr) {
-            res->data = ""; // simply send HTTP headers and status code
-        } else if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
-            res->data = format_anthropic_sse(first_result_json);
-        } else if (res_type == TASK_RESPONSE_TYPE_OAI_RESP) {
-            res->data = format_oai_resp_sse(first_result_json);
+        if (first_timeout) {
+            SRV_DBG("%s", "no first result within the SSE ping interval, starting the stream with a ping\n");
+            res->data = ":\n\n";
         } else {
-            res->data = format_oai_sse(first_result_json);
+            if (first_result == nullptr) {
+                GGML_ASSERT(req.should_stop());
+                return res; // connection is closed
+            }
+
+            if (first_result->is_error()) {
+                res->error(first_result->to_json());
+                return res;
+            }
+
+            GGML_ASSERT(
+                dynamic_cast<server_task_result_cmpl_partial*>(first_result.get()) != nullptr ||
+                dynamic_cast<server_task_result_cmpl_final*>  (first_result.get()) != nullptr
+            );
+
+            // next responses are streamed
+            // to be sent immediately
+            json first_result_json = first_result->to_json();
+            if (first_result_json == nullptr) {
+                res->data = ""; // simply send HTTP headers and status code
+            } else if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
+                res->data = format_anthropic_sse(first_result_json);
+            } else if (res_type == TASK_RESPONSE_TYPE_OAI_RESP) {
+                res->data = format_oai_resp_sse(first_result_json);
+            } else {
+                res->data = format_oai_sse(first_result_json);
+            }
         }
         res->status = 200;
         res->content_type = "text/event-stream";
@@ -5712,7 +5753,11 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                         || dynamic_cast<server_task_result_cmpl_final*>(result.get()) != nullptr
                     );
                     json res_json = result->to_json();
-                    if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
+                    if (res_json.is_null()) {
+                        // the begin partial (no return_progress) has no payload; it reaches this loop when the
+                        // stream was started early by a queued-request ping
+                        output = "";
+                    } else if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
                         output = format_anthropic_sse(res_json);
                     } else if (res_type == TASK_RESPONSE_TYPE_OAI_RESP) {
                         output = format_oai_resp_sse(res_json);
