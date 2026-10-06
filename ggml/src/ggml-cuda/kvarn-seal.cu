@@ -601,22 +601,30 @@ static __global__ void k_kvarn_seal(const char * __restrict__ ksrc, const char *
             const int t = task >> 1, half_ = task & 1;
             const int i0 = half_*(D/2);
             uint8_t * dst = out + payload + (size_t) t*row_bytes + (size_t) half_*(row_bytes/2);
-            uint8_t buf[KVARN_SEAL_MAX_DIM]; // <= D/2 bytes at 8 bits
+            // LSB-first bit stream, streamed through a register accumulator (no per-thread
+            // array: a dynamically indexed buffer here put 256 B of local memory on the kernel,
+            // and the driver sizes the per-thread stack reservation of every SM to it).
             const int nbytes = (D/2)*bits/8;
-            for (int b = 0; b < nbytes; ++b) buf[b] = 0;
+            uint32_t acc = 0;
+            int nacc = 0, nout = 0;
             for (int j = 0; j < D/2; ++j) {
                 const int i = i0 + j;
                 const int r = is_V ? t : i, c = is_V ? i : t;
                 const uint32_t q = kvarn_rtn(kvarn_cur(tile, s_row, s_col, r, c, sr, sc), q_lo[r], q_step[r], qmaxf);
-                const uint32_t bit = (uint32_t) j*bits;
-                const uint32_t byte = bit >> 3, shift = bit & 7;
-                const uint32_t wv = (q & qmax) << shift;
-                buf[byte] |= (uint8_t) wv;
-                if (shift + bits > 8) {
-                    buf[byte + 1] |= (uint8_t) (wv >> 8);
+                acc |= (q & qmax) << nacc;
+                nacc += bits;
+                while (nacc >= 8) {
+                    if (nout < nbytes) {
+                        dst[nout] = (uint8_t) acc;
+                    }
+                    ++nout;
+                    acc >>= 8;
+                    nacc -= 8;
                 }
             }
-            for (int b = 0; b < nbytes; ++b) dst[b] = buf[b];
+            if (nacc > 0 && nout < nbytes) {
+                dst[nout] = (uint8_t) acc;
+            }
         }
     }
 }
