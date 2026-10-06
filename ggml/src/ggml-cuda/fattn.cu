@@ -2922,9 +2922,13 @@ static void ggml_cuda_flash_attn_ext_mma_turbo_dispatch_ncols1_8(ggml_backend_cu
                                              (type_K == GGML_TYPE_TQ6_0 && type_V == GGML_TYPE_TURBO3_0) ||
                                              (type_K == GGML_TYPE_TQ5_0 && type_V == GGML_TYPE_TURBO3_0) ||
                                              ((type_K == GGML_TYPE_TQ5_0 || type_K == GGML_TYPE_TQ6_0 || type_K == GGML_TYPE_Q8_0) && type_V == GGML_TYPE_TURBO4_0) ||
-                                             (type_K == GGML_TYPE_TQ6_0 && type_V == GGML_TYPE_TQ5_0) ||
+                                             ((type_K == GGML_TYPE_TQ6_0 || type_K == GGML_TYPE_TQ5_0) && type_V == GGML_TYPE_TQ5_0) ||
                                              (type_K == GGML_TYPE_Q8_0 && type_V == GGML_TYPE_Q5_1))) {
-        if (Q->ne[1] > 4) { ggml_cuda_flash_attn_ext_mma_turbo_case<DKQ, DV, 8, 8, type_K, type_V>(ctx, dst); return; }
+        if (Q->ne[1] > 4) {
+            ggml_cuda_fattn_path_note("turbo_fused_8x8", dst, 8);
+            ggml_cuda_flash_attn_ext_mma_turbo_case<DKQ, DV, 8, 8, type_K, type_V>(ctx, dst);
+            return;
+        }
     }
     ggml_cuda_flash_attn_ext_mma_turbo_case<DKQ, DV, 4, 8, type_K, type_V>(ctx, dst); // Q->ne[1] in {3,4}
 }
@@ -2935,8 +2939,7 @@ static void ggml_cuda_flash_attn_ext_mma_turbo_dispatch_ncols1_4(ggml_backend_cu
     ggml_cuda_flash_attn_ext_mma_turbo_case<DKQ, DV, 4, 4, type_K, type_V>(ctx, dst); // Q->ne[1] in {3,4}
 }
 
-template <int DKQ, int DV, ggml_type type_K, ggml_type type_V>
-static void ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+static bool ggml_cuda_flash_attn_ext_mma_turbo_use_gqa(const ggml_tensor * dst) {
     const ggml_tensor * KQV  = dst;
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * K    = dst->src[1];
@@ -2959,6 +2962,15 @@ static void ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2(ggml_backend_cuda_c
             }
         }
     }
+
+    return use_gqa_opt;
+}
+
+template <int DKQ, int DV, ggml_type type_K, ggml_type type_V>
+static void ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const bool use_gqa_opt = ggml_cuda_flash_attn_ext_mma_turbo_use_gqa(dst);
 
     GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
     const int gqa_ratio = Q->ne[2] / K->ne[2];
@@ -3684,10 +3696,14 @@ static bool ggml_cuda_flash_attn_ext_fused(ggml_backend_cuda_context * ctx, ggml
             ((K->type == GGML_TYPE_TQ6_0 || K->type == GGML_TYPE_TQ5_0 || K->type == GGML_TYPE_Q8_0) && V->type == GGML_TYPE_TURBO4_0 && Q->ne[0] == 256) ||
             // tq6_0 K over a tq5_0 V (D=256 only): both tiles staged, same loaders as the matched tq6/tq5 pairs
             (K->type == GGML_TYPE_TQ6_0 && V->type == GGML_TYPE_TQ5_0 && Q->ne[0] == 256);
-        // the tq6_0/tq5_0 K / turbo3_0 V pairs at D=256 have an (8,8) instance, so MTP verify widths 5..8 stay fused
+        // the tq6_0/tq5_0 K / turbo3_0 V pairs at D=256 have an (8,8) instance, so MTP verify widths 5..8 stay fused.
+        // FA55: matched tq5_0/tq5_0 at D=256 takes the compiled (8,8) route when the GQA-packed dispatch picks ncols2 = 8
+        // (gqa > 4); other layouts keep their existing fallback.
+        const bool tq5_wide = K->type == GGML_TYPE_TQ5_0 && V->type == GGML_TYPE_TQ5_0 && Q->ne[0] == 256 &&
+            Q->ne[2] / K->ne[2] > 4 && ggml_cuda_flash_attn_ext_mma_turbo_use_gqa(dst);
         int turbo_max_q = (((K->type == GGML_TYPE_TQ6_0 || K->type == GGML_TYPE_TQ5_0 || K->type == GGML_TYPE_Q8_0) &&
                                   (V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0) && Q->ne[0] == 256) ||
-                                 (K->type == GGML_TYPE_TQ6_0 && V->type == GGML_TYPE_TQ5_0 && Q->ne[0] == 256)) ? 8 : 4;
+                                 (K->type == GGML_TYPE_TQ6_0 && V->type == GGML_TYPE_TQ5_0 && Q->ne[0] == 256) || tq5_wide) ? 8 : 4;
         // SLOWKV (GGML_SLOWKV, default off): widths 5-8 of turbo4/turbo4 and tq6_0/tq6_0 take the fused compact (4,8)
         // tile (width 5) or the fused (8,8) tile instead of the generic f16 route; only when the ncols1 == 8 dispatch
         // will pick one of those tiles.

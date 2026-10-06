@@ -13906,6 +13906,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TQ6_0, GGML_TYPE_TQ5_0));
         }
     }
+    // Matched TQ5 wide fused dispatch and its GQA/layout fallbacks.
+    for (int nb : {5, 8}) {
+        for (float logit_softcap : {0.0f, 10.0f}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 512, nb, true, false, 0, logit_softcap, GGML_PREC_F32, GGML_TYPE_TQ5_0, GGML_TYPE_TQ5_0));
+        }
+        for (int gqa : {2, 4}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {gqa, 1}, 512, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TQ5_0, GGML_TYPE_TQ5_0));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 512, nb, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TQ5_0, GGML_TYPE_TQ5_0));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 512, nb, true, false, 8, 0, GGML_PREC_F32, GGML_TYPE_TQ5_0, GGML_TYPE_TQ5_0));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 513, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TQ5_0, GGML_TYPE_TQ5_0));
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {6, 1}, 512, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TQ5_0, GGML_TYPE_TQ5_0));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 512, 9, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TQ5_0, GGML_TYPE_TQ5_0));
+
     // the same D=256 pairs in the KV-cache layout (heads interleaved per token: K/V row pitch = n_head_kv rows, so
     // the tq5_0/tq6_0/turbo3/turbo4 rows of heads 1..3 are only 4-byte aligned and the staging paths take their
     // non-contiguous branches, unlike the per-head-contiguous default layout above)
