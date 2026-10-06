@@ -14475,6 +14475,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // [#41] EXL3 trellis GEMV at the Qwen3.8-27B EXL3 4.0 bpw projection shapes (m = N out, k = K in) with the
+    // suh/svh glue: ffn_gate/up, ffn_down, attn_qkv, attn_gate, ssm_out, and the exl3_6 output head; decode width 1
+    // and MTP verify widths 2-8, 16 (GGML_CUDA_EXL3_DEC=0 vs unset for the #41 decode kernel)
+    for (auto mk : std::vector<std::array<int64_t, 2>>{{17408, 5120}, {5120, 17408}, {10240, 5120}, {6144, 5120}, {5120, 6144}}) {
+        for (int n : {1, 2, 3, 4, 5, 6, 7, 8, 16}) {
+            test_cases.emplace_back(new test_mul_mat_exl3(GGML_TYPE_EXL3_4, mk[0], n, mk[1], true));
+        }
+    }
+    for (int n : {1, 5, 8}) {
+        test_cases.emplace_back(new test_mul_mat_exl3(GGML_TYPE_EXL3_6, 248320, n, 5120, true));
+    }
+
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {

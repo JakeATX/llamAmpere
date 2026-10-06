@@ -6,8 +6,10 @@
 // output must match the x-as-A path byte for byte. Each case is one EXL3 mul_mat, with or without the suh/svh +
 // Hadamard glue on src[2]/src[3] (llama build_lora_mm). The cases run on a GPU backend in forked children, once with
 // GGML_CUDA_EXL3_WEIGHT_MAJOR=0 and once with =1 (the env var is read once per process), and the outputs are compared
-// byte for byte. Cases outside the weight-major range (2/5/6/7/8-bit, T = 1, T > 8) run the same kernel in both
-// children and act as a determinism control. A third child computes every case on the CPU backend
+// byte for byte. Under the #41 decode kernel (k_exl3_gemv_dec, the default; GGML_CUDA_EXL3_DEC=0 selects the old
+// k_exl3_gemv) the weight-major range is every bit width at T = 2..8, so the 2/5/6/7/8-bit cases compare the two mma
+// orientations too; under the old kernel they and T = 1, T > 8 run the same kernel in both children and act as a
+// determinism control. A third child computes every case on the CPU backend
 // (ggml_compute_forward_mul_mat_exl3, f32 codebook values) and both GPU arms must stay within NMSE 5e-4 of it, the
 // test-backend-ops MUL_MAT tolerance.
 // The trellis words are random: every 16-bit code decodes to a codebook value, so any bit pattern is a valid EXL3
@@ -73,7 +75,9 @@ static std::vector<test_case_def> cases() {
 // the weight-major mma covers these cases (exl3_gemv_weight_major_ok + the kernel's WEIGHT_MAJOR condition)
 static bool weight_major_case(const test_case_def & c) {
     const int bits = ggml_exl3_bits(c.type);
-    return (bits == 3 || bits == 4) && c.T >= 2 && c.T <= 8;
+    const char * dec = getenv("GGML_CUDA_EXL3_DEC");
+    const bool   all = dec == nullptr || strcmp(dec, "0") != 0;   // #41 k_exl3_gemv_dec: every bit width
+    return (all || bits == 3 || bits == 4) && c.T >= 2 && c.T <= 8;
 }
 
 static void run_case(ggml_backend_t backend, size_t idx, const test_case_def & c, std::vector<uint8_t> & blob) {

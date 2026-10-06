@@ -8,6 +8,7 @@
 
 #include "ggml-ledger.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstring>
 
@@ -46,7 +47,9 @@ namespace cg = cooperative_groups;
 // [#73] weight-major mma (GPT-6 SM86 PTX kit C1; on by default, GGML_CUDA_EXL3_WEIGHT_MAJOR=0 turns it off):
 // the decoded weight tile is the A operand ({wv0, wv2, wv1, wv3}: A rows = the 16 output columns, A cols = k) and x
 // the B operand (tokens on n8), so one mma.m16n8k16 per 16x16 tile instead of two with x as A, whose rows 8-15 are
-// zero at T <= 8. D rows are outputs, D columns tokens. 3- and 4-bit, T = 2..8, split glue (not FUSED) only; the
+// zero at T <= 8. D rows are outputs, D columns tokens. T = 2..8, split glue (not FUSED) only: 3- and 4-bit in
+// k_exl3_gemv, every bit width in the #41 k_exl3_gemv_dec (output bits identical to the x-as-A mma, measured on SM86 by
+// test-exl3-decode and test-exl3-weight-major; PTX does not specify the mma's internal summation order); the
 // split-K, the fold schedule and the reduction are the ones above. -DLLAMAMPERE_EXL3_WEIGHT_MAJOR=0 leaves the
 // variant out of the build.
 #ifndef LLAMAMPERE_EXL3_WEIGHT_MAJOR
@@ -482,6 +485,348 @@ k_exl3_gemv(const uint32_t * __restrict__ trellis, half2 * __restrict__ x, float
 #endif
 }
 
+// [#41] EXL3DEC: decode-width GEMV with the same arithmetic as k_exl3_gemv (split glue), restructured for bandwidth.
+// Every work item (n-tile ni, k-split ks) computes exactly what k_exl3_gemv computes for it -- same k-split, same
+// tile-to-warp assignment, same fp16 fold schedule, same warp and split-K reduction order -- so the output is
+// bit-identical (tests/test-exl3-decode.cpp compares the two byte for byte). What changes is the schedule:
+//   1. contiguous item ranges: block b walks items [b*n/G, (b+1)*n/G) in k-split-major order, so consecutive items
+//      share their k-range and x is staged into shared memory once per k-range instead of once per item. The old
+//      grid stride restaged x for every item: at T = 8 that read twice as many bytes from L2 as the weights, which is
+//      most of why the GEMV slowed down with T although the mma cost does not depend on T;
+//   2. register prefetch: the next group of U weight tiles (of this item, or the first group of the block's next
+//      item) is issued before the current group is decoded, so a warp keeps up to 2*U tiles in flight and its load
+//      stream does not drain at group or item boundaries; the first group is in flight while x is being staged;
+//   3. double-buffered warp partials: one __syncthreads per item instead of two;
+//   4. weight-major mma (#73) for every bit width at T = 2..8 (was 3/4-bit only), with x staged for the T real
+//      tokens only (B fragments of tokens >= T are register zeros instead of zero rows in shared memory): 2*T KiB of
+//      shared memory per block instead of 16 KiB, so more blocks fit per SM.
+// GGML_CUDA_EXL3_DEC=0 selects k_exl3_gemv (A/B and the identity test); the cooperative FUSED path is unchanged.
+template <int BITS, int T, bool WM>
+static __global__ void __launch_bounds__(32 * EXL3_GEMV_NWARPS)
+k_exl3_gemv_dec(const uint32_t * __restrict__ trellis, const half2 * __restrict__ x, float * __restrict__ y,
+                const int kt, const int nt, const int K, const int N, const int ksplit, const int kpi) {
+    using cfg = exl3_gemv_cfg<T>;
+    constexpr bool MMA          = cfg::MMA;
+    constexpr bool WEIGHT_MAJOR = WM && MMA && T >= 2 && T <= 8;
+    constexpr int  XROWS        = cfg::XROWS;
+    constexpr int  XS_ROWS      = WEIGHT_MAJOR ? T : XROWS;   // staged x rows; weight-major zeros tokens >= T in registers
+    constexpr int  KTILES_MAX   = cfg::KTILES_MAX;
+    constexpr int  NW     = 8 * BITS;
+    constexpr int  NBITS  = 256 * BITS;
+    constexpr int  NWORDS = BITS <= 4 ? 2 : 3;
+    constexpr bool SHFL   = BITS <= 4;
+    constexpr int  NL     = SHFL ? 1 : NWORDS;   // words a lane loads per tile
+    constexpr int  U      = 4;                   // fold period, tiles per load group (must match k_exl3_gemv)
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int q    = lane & 3;
+    const int g    = lane >> 2;
+
+    const int p0   = ((lane * 8 + 1) * BITS - 16 + NBITS) % NBITS;
+    const int ws   = p0 >> 5;
+    const int rel0 = p0 & 31;
+    int woff[NWORDS];
+#pragma unroll
+    for (int m = 0; m < NWORDS; ++m) {
+        woff[m] = (ws + m) % NW;
+    }
+    int loff[NL];                                // word offsets this lane loads inside a tile
+#pragma unroll
+    for (int m = 0; m < NL; ++m) {
+        loff[m] = SHFL ? (lane % NW) : woff[m];
+    }
+    const size_t sw = (size_t) EXL3_GEMV_NWARPS * nt * NW;   // words between a warp's consecutive tiles
+
+    const half2 cb_mul = __halves2half2(__ushort_as_half((unsigned short) 0x1eee), __ushort_as_half((unsigned short) 0x1eee));
+    const half2 cb_add = __halves2half2(__ushort_as_half((unsigned short) 0xc931), __ushort_as_half((unsigned short) 0xc931));
+
+    __shared__ float part[2][EXL3_GEMV_NWARPS][T][WEIGHT_MAJOR ? 20 : 16];
+    __shared__ __align__(16) half2 xs[XS_ROWS][KTILES_MAX * 8];
+
+    if (MMA && T < XS_ROWS) {   // x-as-A mma: A rows T..XROWS-1 are zero (ordered by the first staging barrier)
+        half2 * z = &xs[T < XS_ROWS ? T : 0][0];
+        for (int p = threadIdx.x; p < (XS_ROWS - T) * KTILES_MAX * 8; p += 32 * EXL3_GEMV_NWARPS) {
+            z[p] = __float2half2_rn(0.0f);
+        }
+    }
+
+    auto decode = [&](const uint32_t (&w)[NWORDS], half2 (&wv)[4]) {
+        uint32_t a[NWORDS];
+#pragma unroll
+        for (int m = 0; m < NWORDS; ++m) {
+            a[m] = __funnelshift_l(m + 1 < NWORDS ? w[m + 1] : 0u, w[m], rel0);
+        }
+#pragma unroll
+        for (int jp = 0; jp < 4; ++jp) {
+            uint32_t sum[2];
+#pragma unroll
+            for (int e = 0; e < 2; ++e) {
+                const int o  = (2 * jp + e) * BITS;
+                const int wi = o >> 5;
+                const int sh = o & 31;
+                const uint32_t hi = a[wi];
+                const uint32_t lo = (wi + 1 < NWORDS) ? a[wi + 1] : 0u;
+                uint32_t code;
+                if (sh == 0) {
+                    code = hi >> 16;
+                } else if (sh == 8) {
+                    code = __byte_perm(hi, 0u, 0x4421);
+                } else if (sh == 16) {
+                    code = hi & 0xffffu;
+                } else {
+                    code = __funnelshift_l(lo, hi, sh) >> 16;
+                }
+                sum[e] = __dp4a(code * 0x83DCD12Du, 0x01010101u, 0x6400u);
+            }
+            wv[jp] = __hfma2(__halves2half2(__ushort_as_half((unsigned short) sum[0]),
+                                            __ushort_as_half((unsigned short) sum[1])), cb_mul, cb_add);
+        }
+    };
+
+    float    acc[2][T];
+    uint32_t d[2][2];
+    float2   accf[2] = {};   // zeroed per item below; the initializer only silences #549-D (lambda capture)
+    float2   accg[2];
+
+    auto tile_fma = [&](const uint32_t (&w)[NWORDS], const int kl) {
+        half2 wv[4];
+        decode(w, wv);
+        if constexpr (WEIGHT_MAJOR) {
+            // B = x^T: lane (g, q) holds tokens g of k rows (2q, 2q+1) and (2q+8, 2q+9); tokens >= T are zero
+            const int gr = g < T ? g : 0;
+            const uint32_t x0 = exl3_h2u(xs[gr][kl * 8 + q]);
+            const uint32_t x1 = exl3_h2u(xs[gr][kl * 8 + q + 4]);
+            const uint32_t b0 = (T >= 8 || g < T) ? x0 : 0u;
+            const uint32_t b1 = (T >= 8 || g < T) ? x1 : 0u;
+            const uint32_t wa[4] = {exl3_h2u(wv[0]), exl3_h2u(wv[2]), exl3_h2u(wv[1]), exl3_h2u(wv[3])};
+            exl3_mma_f16(d[0], wa, b0, b1);
+        } else if constexpr (MMA) {
+            uint32_t a[4];
+            a[0] = exl3_h2u(xs[g][kl * 8 + q]);
+            a[1] = XROWS > 8 ? exl3_h2u(xs[(XROWS > 8 ? g + 8 : 0)][kl * 8 + q]) : 0u;
+            a[2] = exl3_h2u(xs[g][kl * 8 + q + 4]);
+            a[3] = XROWS > 8 ? exl3_h2u(xs[(XROWS > 8 ? g + 8 : 0)][kl * 8 + q + 4]) : 0u;
+            exl3_mma_f16(d[0], a, exl3_h2u(wv[0]), exl3_h2u(wv[1]));
+            exl3_mma_f16(d[1], a, exl3_h2u(wv[2]), exl3_h2u(wv[3]));
+        } else {
+            half2 xa[T], xb[T];
+#pragma unroll
+            for (int t = 0; t < T; ++t) {
+                xa[t] = xs[t][kl * 8 + q];
+                xb[t] = xs[t][kl * 8 + q + 4];
+            }
+            half2 acc2[2][T];
+#pragma unroll
+            for (int s = 0; s < 2; ++s) {
+#pragma unroll
+                for (int t = 0; t < T; ++t) {
+                    acc2[s][t] = __float2half2_rn(0.0f);
+                }
+            }
+#pragma unroll
+            for (int jp = 0; jp < 4; ++jp) {
+                const int s = jp >> 1;
+#pragma unroll
+                for (int t = 0; t < T; ++t) {
+                    acc2[s][t] = __hfma2(wv[jp], (jp & 1) ? xb[t] : xa[t], acc2[s][t]);
+                }
+            }
+#pragma unroll
+            for (int s = 0; s < 2; ++s) {
+#pragma unroll
+                for (int t = 0; t < T; ++t) {
+                    acc[s][t] += __half2float(__hadd(__low2half(acc2[s][t]), __high2half(acc2[s][t])));
+                }
+            }
+        }
+    };
+    auto fold = [&]() {
+        if constexpr (WEIGHT_MAJOR) {
+            const float2 v0 = __half22float2(exl3_u2h(d[0][0]));
+            const float2 v1 = __half22float2(exl3_u2h(d[0][1]));
+            accf[0].x += v0.x; accf[0].y += v0.y;
+            accf[1].x += v1.x; accf[1].y += v1.y;
+            d[0][0] = 0u; d[0][1] = 0u;
+        } else if constexpr (MMA) {
+#pragma unroll
+            for (int s = 0; s < 2; ++s) {
+                const float2 v = __half22float2(exl3_u2h(d[s][0]));
+                accf[s].x += v.x;
+                accf[s].y += v.y;
+                if (XROWS > 8) {
+                    const float2 u = __half22float2(exl3_u2h(d[s][1]));
+                    accg[s].x += u.x;
+                    accg[s].y += u.y;
+                }
+                d[s][0] = 0u; d[s][1] = 0u;
+            }
+        }
+    };
+
+    // prefetched words of the next load group: pf[u][m] = word loff[m] of the warp's tile u of that group
+    uint32_t pf[U][NL] = {};
+    auto load_group = [&](const uint32_t * base, const int cnt) {
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            if (u < cnt) {
+#pragma unroll
+                for (int m = 0; m < NL; ++m) {
+                    pf[u][m] = __ldcs(base + (size_t) u * sw + loff[m]);
+                }
+            }
+        }
+    };
+
+    // the block's contiguous item range, k-split major (item = ks * nt + ni)
+    const int n_items = nt * ksplit;
+    const int i_beg = (int) (((long long) blockIdx.x * n_items) / gridDim.x);
+    const int i_end = (int) (((long long) (blockIdx.x + 1) * n_items) / gridDim.x);
+
+    struct item_t { int ks, ni, kb, nk, n_my; const uint32_t * wp; };
+    auto setup = [&](const int item) {
+        item_t it;
+        it.ks   = item / nt;
+        it.ni   = item - it.ks * nt;
+        it.kb   = it.ks * kpi;
+        it.nk   = min(kpi, kt - it.kb);
+        it.n_my = max(0, (it.nk - warp + EXL3_GEMV_NWARPS - 1) / EXL3_GEMV_NWARPS);   // nk < 0 past the last k-split
+        it.wp   = trellis + ((size_t) (it.kb + warp) * nt + it.ni) * NW;
+        return it;
+    };
+
+    item_t cur = {};
+    if (i_beg < i_end) {
+        cur = setup(i_beg);
+        load_group(cur.wp, min(U, cur.n_my));
+    }
+    int staged = -1;
+    int pb     = 0;
+    for (int item = i_beg; item < i_end; ++item) {
+        const bool has_next = item + 1 < i_end;
+        const item_t nxt = has_next ? setup(item + 1) : cur;
+
+        if (cur.ks != staged) {
+            // every thread is past the previous item's barrier, so its tile loop no longer reads xs
+#pragma unroll
+            for (int t = 0; t < T; ++t) {
+                const half2 * xt = x + (size_t) t * (K / 2) + (size_t) cur.kb * 8;
+                for (int p = threadIdx.x; p < cur.nk * 8; p += 32 * EXL3_GEMV_NWARPS) {
+                    xs[t][p] = xt[p];
+                }
+            }
+            __syncthreads();
+            staged = cur.ks;
+        }
+
+#pragma unroll
+        for (int s = 0; s < 2; ++s) {
+#pragma unroll
+            for (int t = 0; t < T; ++t) {
+                acc[s][t] = 0.0f;
+            }
+            d[s][0] = 0u; d[s][1] = 0u;
+            accf[s] = make_float2(0.0f, 0.0f);
+            accg[s] = make_float2(0.0f, 0.0f);
+        }
+
+        for (int step = 0; step < cur.n_my; step += U) {
+            const int cnt = min(U, cur.n_my - step);
+            uint32_t w[U][NWORDS];
+#pragma unroll
+            for (int u = 0; u < U; ++u) {
+#pragma unroll
+                for (int m = 0; m < NWORDS; ++m) {
+                    if (SHFL) {
+                        w[u][m] = (BITS == 4 && m == 1) ? pf[u][0] : __shfl_sync(0xffffffffu, pf[u][0], woff[m]);
+                    } else {
+                        w[u][m] = pf[u][SHFL ? 0 : m];
+                    }
+                }
+            }
+            if (step + U < cur.n_my) {
+                load_group(cur.wp + (size_t) (step + U) * sw, min(U, cur.n_my - step - U));
+            } else if (has_next) {
+                load_group(nxt.wp, min(U, nxt.n_my));
+            }
+            if (cnt == U) {
+#pragma unroll
+                for (int u = 0; u < U; ++u) {
+                    tile_fma(w[u], (step + u) * EXL3_GEMV_NWARPS + warp);
+                }
+                fold();
+            } else {
+#pragma unroll
+                for (int u = 0; u < U; ++u) {
+                    if (u < cnt) {
+                        tile_fma(w[u], (step + u) * EXL3_GEMV_NWARPS + warp);
+                        fold();
+                    }
+                }
+            }
+        }
+        if (cur.n_my == 0 && has_next) {
+            load_group(nxt.wp, min(U, nxt.n_my));
+        }
+
+        float (&pp)[EXL3_GEMV_NWARPS][T][WEIGHT_MAJOR ? 20 : 16] = part[pb];
+        if constexpr (WEIGHT_MAJOR) {
+            if (2*q < T) {
+                pp[warp][2*q][g]     = accf[0].x;
+                pp[warp][2*q][g + 8] = accf[1].x;
+            }
+            if (2*q + 1 < T) {
+                pp[warp][2*q + 1][g]     = accf[0].y;
+                pp[warp][2*q + 1][g + 8] = accf[1].y;
+            }
+        } else if constexpr (MMA) {
+            if (g < T) {
+                pp[warp][g][2 * q]         = accf[0].x;
+                pp[warp][g][2 * q + 1]     = accf[0].y;
+                pp[warp][g][8 + 2 * q]     = accf[1].x;
+                pp[warp][g][8 + 2 * q + 1] = accf[1].y;
+            }
+            if (XROWS > 8 && g + 8 < T) {
+                const int r = (XROWS > 8) ? g + 8 : 0;
+                pp[warp][r][2 * q]         = accg[0].x;
+                pp[warp][r][2 * q + 1]     = accg[0].y;
+                pp[warp][r][8 + 2 * q]     = accg[1].x;
+                pp[warp][r][8 + 2 * q + 1] = accg[1].y;
+            }
+        } else {
+#pragma unroll
+            for (int s = 0; s < 2; ++s) {
+#pragma unroll
+                for (int t = 0; t < T; ++t) {
+                    float v = acc[s][t];
+                    v += __shfl_xor_sync(0xffffffffu, v, 1);
+                    v += __shfl_xor_sync(0xffffffffu, v, 2);
+                    acc[s][t] = v;
+                }
+            }
+            if (q == 0) {
+#pragma unroll
+                for (int t = 0; t < T; ++t) {
+                    pp[warp][t][g]     = acc[0][t];
+                    pp[warp][t][g + 8] = acc[1][t];
+                }
+            }
+        }
+        __syncthreads();   // the next writer of part[pb] is two items away, behind the next item's barrier
+        for (int i = threadIdx.x; i < 16 * T; i += 32 * EXL3_GEMV_NWARPS) {
+            const int t = i >> 4;
+            const int n = i & 15;
+            float v = 0.0f;
+#pragma unroll
+            for (int wv = 0; wv < EXL3_GEMV_NWARPS; ++wv) {
+                v += pp[wv][t][n];
+            }
+            y[((size_t) cur.ks * T + t) * N + (size_t) cur.ni * 16 + n] = v * (1.0f / EXL3_GEMV_X_SCALE);
+        }
+        pb ^= 1;
+        cur = nxt;
+    }
+}
+
 // [#75] fp16 envelope check, GGML_CUDA_EXL3_ENVELOPE=1 (off by default; the GEMV kernel itself is unchanged). After
 // each EXL3 GEMV two small kernels read the staged fp16 x and the fp32 output: the largest staged |x/16| per path, the
 // staged values above the path's guaranteed-safe bound, and the inf/nan counts. The kernels are captured into CUDA
@@ -649,7 +994,7 @@ static void exl3_gemv_launch_bt(const exl3_gemv_args & a, cudaStream_t stream) {
     k_exl3_gemv<BITS, T, FUSED, WM><<<grid, block, 0, stream>>>(trellis, x, out, kt, nt, K, N, ksplit, kpi_, xf, suh, svh, yf, post);
 }
 
-// [#73] the weight-major mma runs at T = 2..8 (3/4-bit, split glue) by default (measured 2026-09-25 on 4.0 bpw:
+// [#73] the weight-major mma runs at T = 2..8 (split glue; 3/4-bit in k_exl3_gemv, all bits in k_exl3_gemv_dec) by default (measured 2026-09-25 on 4.0 bpw:
 // -2.2% per round, identical output); GGML_CUDA_EXL3_WEIGHT_MAJOR=0 selects the x-as-A mma
 static bool exl3_gemv_weight_major_env() {
     static const bool enabled = [] {
@@ -664,8 +1009,73 @@ static constexpr bool exl3_gemv_weight_major_ok() {
     return LLAMAMPERE_EXL3_WEIGHT_MAJOR && !FUSED && T >= EXL3_GEMV_MMA_MIN_T && T >= 2 && T <= 8;
 }
 
+// [#41] GGML_CUDA_EXL3_DEC=0 selects the pre-#41 split-glue kernel k_exl3_gemv (same output bits)
+static bool exl3_gemv_dec_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_EXL3_DEC");
+        return env == nullptr || strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+template <int BITS, int T, bool WM>
+static void exl3_gemv_dec_launch_bt(const exl3_gemv_args & a, cudaStream_t stream) {
+    static int grid_max = 0;   // resident blocks on the device (per instantiation), measured once
+    if (grid_max == 0) {
+        int nb = 0;
+        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, k_exl3_gemv_dec<BITS, T, WM>, 32 * EXL3_GEMV_NWARPS, 0));
+        grid_max = std::max(1, nb) * ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
+    }
+    const int kpi = (a.kt + a.ksplit - 1) / a.ksplit;   // same k-split as k_exl3_gemv => same output bits
+    GGML_ASSERT(kpi <= exl3_gemv_cfg<T>::KTILES_MAX);
+    const int n_items = a.nt * a.ksplit;
+    // test-only: GGML_CUDA_EXL3_DEC_GRID=n caps the grid so blocks walk long item ranges (several k-split changes, the
+    // partials buffer reused at distance 2); any grid gives the same output bits
+    static const int grid_cap = [] {
+        const char * env = getenv("GGML_CUDA_EXL3_DEC_GRID");
+        return env ? std::max(0, atoi(env)) : 0;
+    }();
+    const int grid = grid_cap > 0 ? std::min({n_items, grid_max, grid_cap}) : std::min(n_items, grid_max);
+    k_exl3_gemv_dec<BITS, T, WM><<<grid, 32 * EXL3_GEMV_NWARPS, 0, stream>>>(
+        a.trellis, a.x, a.out, a.kt, a.nt, a.K, a.N, a.ksplit, kpi);
+}
+
+// the weight-major mma covers every bit width here (k_exl3_gemv: 3/4-bit only; bit-identical to the x-as-A mma on SM86
+// by test, see the [#73] note at the top); GGML_CUDA_EXL3_WEIGHT_MAJOR=0 or -DLLAMAMPERE_EXL3_WEIGHT_MAJOR=0 keep the
+// x-as-A mma
+template <int BITS, int T>
+static void exl3_gemv_dec_launch_wm(const exl3_gemv_args & a, cudaStream_t stream) {
+    if constexpr (exl3_gemv_weight_major_ok<T, false>()) {
+        if (exl3_gemv_weight_major_env()) {
+            exl3_gemv_dec_launch_bt<BITS, T, true>(a, stream);
+            return;
+        }
+    }
+    exl3_gemv_dec_launch_bt<BITS, T, false>(a, stream);
+}
+
+template <int T>
+static void exl3_gemv_dec_launch(const exl3_gemv_args & a, const int bits, cudaStream_t stream) {
+    switch (bits) {
+        case 2: exl3_gemv_dec_launch_wm<2, T>(a, stream); break;
+        case 3: exl3_gemv_dec_launch_wm<3, T>(a, stream); break;
+        case 4: exl3_gemv_dec_launch_wm<4, T>(a, stream); break;
+        case 5: exl3_gemv_dec_launch_wm<5, T>(a, stream); break;
+        case 6: exl3_gemv_dec_launch_wm<6, T>(a, stream); break;
+        case 7: exl3_gemv_dec_launch_wm<7, T>(a, stream); break;
+        case 8: exl3_gemv_dec_launch_wm<8, T>(a, stream); break;
+        default: GGML_ABORT("exl3 gemv: unsupported bits");
+    }
+}
+
 template <int T, bool FUSED>
 static void exl3_gemv_launch(const exl3_gemv_args & a, const int bits, cudaStream_t stream) {
+    if constexpr (!FUSED) {
+        if (exl3_gemv_dec_enabled()) {
+            exl3_gemv_dec_launch<T>(a, bits, stream);
+            return;
+        }
+    }
     switch (bits) {
         case 2: exl3_gemv_launch_bt<2, T, FUSED>(a, stream); break;
         case 3:
