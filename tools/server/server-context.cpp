@@ -24,10 +24,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <cinttypes>
+#include <condition_variable>
 #include <exception>
 #include <memory>
 #include <filesystem>
 #include <random>
+#include <thread>
 #include <utility>
 #include <fstream>
 
@@ -1402,6 +1404,8 @@ public:
     }
 
     ~server_context_impl() {
+        stall_watch_stop();
+
         if (!sleeping) {
             // destroy() is already called when entering sleeping state
             // we don't call it again here to avoid double free
@@ -1480,6 +1484,111 @@ private:
     bool sleeping = false;
 
     int64_t t_last_load_progress_ms = 0;
+
+    // stall detector (--slot-stall-timeout): the main loop records the progress of each busy slot around
+    // update_slots(), a watchdog thread reports the slots that made no progress for the timeout. a decode that
+    // does not return blocks the main loop, so it shows up as no progress on every busy slot
+    struct slot_progress {
+        int     id_task    = -1; // -1 = the slot is not watched
+        int     state      = SLOT_STATE_IDLE;
+        int32_t n_tokens   = 0;  // tokens in the slot (prompt + generated)
+        int32_t n_gen      = 0;  // generated tokens
+        int64_t t_last_ms  = 0;  // last time n_tokens or n_gen changed
+        bool    reported   = false;
+    };
+
+    std::mutex                 stall_mutex;
+    std::condition_variable    stall_cv;
+    std::vector<slot_progress> stall_progress;
+    std::thread                stall_thread;
+    bool                       stall_stop = false;
+
+    // main thread only
+    void stall_watch_update() {
+        if (params_base.slot_stall_timeout <= 0) {
+            return;
+        }
+
+        const int64_t t_now = ggml_time_ms();
+
+        std::lock_guard<std::mutex> lock(stall_mutex);
+        stall_progress.resize(slots.size());
+        for (size_t i = 0; i < slots.size(); i++) {
+            const server_slot & slot = slots[i];
+            slot_progress & p = stall_progress[i];
+
+            // a child slot waits for the prompt of its parent, the parent slot is watched instead
+            if (!slot.is_processing() || slot.state == SLOT_STATE_WAIT_OTHER) {
+                p.id_task = -1;
+                continue;
+            }
+
+            const int32_t n_tokens = slot.prompt.n_tokens();
+            const int32_t n_gen    = slot.stats.n_gen;
+            if (p.id_task != slot.task->id || p.n_tokens != n_tokens || p.n_gen != n_gen) {
+                if (p.reported && p.id_task == slot.task->id) {
+                    SLT_WRN(slot, "progress resumed after %.1f s without progress\n", (t_now - p.t_last_ms) / 1000.0);
+                }
+                p.id_task   = slot.task->id;
+                p.n_tokens  = n_tokens;
+                p.n_gen     = n_gen;
+                p.t_last_ms = t_now;
+                p.reported  = false;
+            }
+            p.state = slot.state;
+        }
+    }
+
+    void stall_watch_start() {
+        if (params_base.slot_stall_timeout <= 0) {
+            return;
+        }
+
+        SRV_INF("slot stall detector enabled: timeout = %d s, cancel = %s\n",
+                params_base.slot_stall_timeout, params_base.slot_stall_cancel ? "true" : "false");
+
+        stall_thread = std::thread([this]() {
+            stall_watch_loop();
+        });
+    }
+
+    // watchdog thread
+    void stall_watch_loop() {
+        const int64_t timeout_ms = (int64_t) params_base.slot_stall_timeout * 1000;
+
+        std::unique_lock<std::mutex> lock(stall_mutex);
+        while (!stall_cv.wait_for(lock, std::chrono::seconds(1), [this]() { return stall_stop; })) {
+            const int64_t t_now = ggml_time_ms();
+            for (size_t i = 0; i < stall_progress.size(); i++) {
+                slot_progress & p = stall_progress[i];
+                if (p.id_task < 0 || p.reported || t_now - p.t_last_ms < timeout_ms) {
+                    continue;
+                }
+                p.reported = true;
+
+                SRV_WRN("slot %zu, task %d: no progress for %.1f s (state = %d, n_tokens = %d, n_gen = %d)\n",
+                        i, p.id_task, (t_now - p.t_last_ms) / 1000.0, p.state, p.n_tokens, p.n_gen);
+
+                if (params_base.slot_stall_cancel) {
+                    // release the client: the HTTP side receives the error and posts a cancel for the task,
+                    // which frees the slot as soon as the main loop processes tasks again
+                    send_error(p.id_task, string_format("slot stalled: no progress for %d seconds", params_base.slot_stall_timeout));
+                }
+            }
+        }
+    }
+
+    void stall_watch_stop() {
+        if (!stall_thread.joinable()) {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(stall_mutex);
+            stall_stop = true;
+        }
+        stall_cv.notify_all();
+        stall_thread.join();
+    }
 
     void destroy() {
         spec.reset();
@@ -1673,7 +1782,13 @@ private:
             params_base.load_progress_callback_user_data = &load_progress_text;
         }
 
-        llama_init = common_init_from_params(params_base);
+        try {
+            llama_init = common_init_from_params(params_base);
+        } catch (const std::exception & e) {
+            // e.g. a hard fit error: report it as a load failure instead of aborting on an uncaught exception
+            SRV_ERR("failed to load model, '%s': %s\n", params_base.model.path.c_str(), e.what());
+            return false;
+        }
 
         model_tgt = llama_init->model();
         ctx_tgt   = llama_init->context();
@@ -2043,13 +2158,17 @@ private:
             return process_single_task(std::move(task), is_yielding);
         });
         queue_tasks.on_update_slots([this]() {
+            stall_watch_update();
             update_slots();
+            stall_watch_update();
         });
         queue_tasks.on_sleeping_state([this](bool sleeping) {
             handle_sleeping_state(sleeping);
         });
 
         metrics.init();
+
+        stall_watch_start();
 
         if (params_base.cache_idle_slots) {
             if (params_base.cache_ram_mib == 0) {

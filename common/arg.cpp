@@ -3874,6 +3874,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SSE_PING_INTERVAL"));
     add_opt(common_arg(
+        {"--slot-stall-timeout"}, "N",
+        string_format("log a warning when a busy slot makes no progress (prompt or generated tokens) for N seconds, "
+                      "including a decode that does not return (0 = disabled, default: %d)", params.slot_stall_timeout),
+        [](common_params & params, int value) {
+            params.slot_stall_timeout = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SLOT_STALL_TIMEOUT"));
+    add_opt(common_arg(
+        {"--slot-stall-cancel"},
+        string_format("with --slot-stall-timeout, also fail the stalled request with an error so that its client is released; "
+                      "the slot is freed once the main loop runs again (default: %s)", params.slot_stall_cancel ? "enabled" : "disabled"),
+        [](common_params & params) {
+            params.slot_stall_cancel = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SLOT_STALL_CANCEL"));
+    add_opt(common_arg(
         {"--threads-http"}, "N",
         string_format("number of threads used to process HTTP requests (default: %d)", params.n_threads_http),
         [](common_params & params, int value) {
