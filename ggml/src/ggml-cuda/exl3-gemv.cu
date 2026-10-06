@@ -1047,13 +1047,17 @@ static void exl3_gemv_dec_launch_bt(const exl3_gemv_args & a, cudaStream_t strea
         a.trellis, a.x, a.out, a.kt, a.nt, a.K, a.N, a.ksplit, kpi);
 }
 
-// the weight-major mma covers every bit width here (k_exl3_gemv: 3/4-bit only; bit-identical to the x-as-A mma on SM86
+// the weight-major mma covers every bit width here on SM86 (k_exl3_gemv: 3/4-bit only; bit-identical to the x-as-A mma on SM86
 // by test, see the [#73] note at the top); GGML_CUDA_EXL3_WEIGHT_MAJOR=0 or -DLLAMAMPERE_EXL3_WEIGHT_MAJOR=0 keep the
 // x-as-A mma
 template <int BITS, int T>
 static void exl3_gemv_dec_launch_wm(const exl3_gemv_args & a, cudaStream_t stream) {
     if constexpr (exl3_gemv_weight_major_ok<T, false>()) {
-        if (exl3_gemv_weight_major_env()) {
+        // 2- and 5..8-bit weight-major is proven bit-identical to x-as-A on SM86 only (PTX does not fix the mma
+        // accumulation order): run it on compute capability 8.6 and keep x-as-A everywhere else; 3/4-bit keep their
+        // pre-#41 behaviour (weight-major on every arch)
+        const bool wm_arch_ok = BITS == 3 || BITS == 4 || ggml_cuda_info().devices[ggml_cuda_get_device()].cc == 860;
+        if (exl3_gemv_weight_major_env() && wm_arch_ok) {
             exl3_gemv_dec_launch_bt<BITS, T, true>(a, stream);
             return;
         }
