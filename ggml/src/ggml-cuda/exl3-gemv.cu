@@ -1036,6 +1036,13 @@ static void exl3_gemv_dec_launch_bt(const exl3_gemv_args & a, cudaStream_t strea
         return env ? std::max(0, atoi(env)) : 0;
     }();
     const int grid = grid_cap > 0 ? std::min({n_items, grid_max, grid_cap}) : std::min(n_items, grid_max);
+    // engagement line, once per (bits, T, layout) instantiation (WARN so it reaches server logs at default verbosity);
+    // the old kernel (GGML_CUDA_EXL3_DEC=0) never gets here
+    static bool announced = false;
+    if (!announced) {
+        announced = true;
+        GGML_LOG_WARN("EXL3 decode GEMV k_exl3_gemv_dec engaged (bits %d, T %d, weight-major %d)\n", BITS, T, (int) WM);
+    }
     k_exl3_gemv_dec<BITS, T, WM><<<grid, 32 * EXL3_GEMV_NWARPS, 0, stream>>>(
         a.trellis, a.x, a.out, a.kt, a.nt, a.K, a.N, a.ksplit, kpi);
 }
