@@ -137,12 +137,14 @@ without each switch.
 | Switch | Default | Effect | Measured |
 |--------|---------|--------|----------|
 | `GGML_CUDA_EXL3_GLUE_INPLACE` | `1` | EXL3 prefill GEMM applies its output transform in place when there is no split-K, instead of through a T x N f32 scratch buffer | scratch pool 102 -> 52 MiB |
-| `LLAMA_SHARED_POOL=1` | off | the MTP draft context uses the trunk context's CUDA scratch pool instead of its own (the two contexts already run one after the other) | scratch pool 52 -> 28 MiB |
-| `GGML_CUDA_STACK_LIMIT=<bytes>` | driver (1024) | per-thread stack reservation; the driver reserves bytes x 1536 threads x SMs | 256: -94 MiB on 84 SMs |
+| `LLAMA_SHARED_POOL` | `1` (`0` opts out) | the MTP draft context uses the trunk context's CUDA scratch pool instead of its own (the two contexts already run one after the other) | scratch pool 52 -> 28 MiB |
+| `GGML_CUDA_STACK_LIMIT=<bytes>` | 0 (set at backend init) | per-thread stack reservation; the driver reserves bytes x 1536 threads x SMs and grows it at launch to the largest stack of any kernel that runs | 1024 -> 0 (regrown to 112): -112 MiB on 84 SMs |
 
-The stack reservation scales with the SM count, so the saving is smaller on small cards (1024 -> 256 B is 31.5 MiB at
-28 SMs). The largest stack any kernel used in these runs was 256 B; if a kernel needs more, the driver grows the
-reservation at launch.
+The stack reservation scales with the SM count. The CUDA backend sets the limit to 0 when it creates a device's
+first backend; the driver then grows the reservation to the largest per-thread stack of any kernel that runs. With the
+12 GB command that is 112 B (the KVarN 3/2 lowbits prefill attention kernel, which spills registers), reached at the
+first warm-up launch: 13.8 MiB on 84 SMs, 13.1 MiB on 80 SMs, 4.6 MiB on 28 SMs, instead of 126 / 120 / 42 MiB at the
+driver's 1024 B default. `GGML_CUDA_STACK_LIMIT=1024` restores the driver default.
 
 ## Rotation
 

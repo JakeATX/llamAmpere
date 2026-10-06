@@ -1614,10 +1614,10 @@ void llama_context::sched_reserve() {
     if (compute_peer != nullptr && compute_peer->sched) {
         if (!ggml_backend_sched_set_donor(sched.get(), compute_peer->sched.get())) {
             LLAMA_LOG_WARN("%s: could not share compute buffers with the peer context\n", __func__);
-        } else if (const char * env = getenv("LLAMA_SHARED_POOL"); env != nullptr && env[0] == '1') {
+        } else if (const char * env = getenv("LLAMA_SHARED_POOL"); env == nullptr || env[0] != '0') {
             // [FIT12 overhead] also share the backends' scratch pools (op temporaries outside the compute buffer):
             // the two contexts already synchronize each other before every compute, so one pool serves both and its
-            // high-water mark is the larger of the two instead of the sum. Opt-in.
+            // high-water mark is the larger of the two instead of the sum. Default on; LLAMA_SHARED_POOL=0 opts out.
             using share_pool_fn_t = bool (*)(ggml_backend_t, ggml_backend_t);
             for (auto & b : backends) {
                 ggml_backend_dev_t dev = ggml_backend_get_device(b.get());

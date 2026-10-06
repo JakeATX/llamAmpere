@@ -735,7 +735,7 @@ std::unique_ptr<ggml_cuda_pool> ggml_backend_cuda_context::new_pool_for_device(i
 // [FIT12 overhead] One scratch pool for two backend contexts on the same device whose graphs never run at the same time
 // (a target context and its MTP draft context with shared compute buffers: each synchronizes the other before it
 // computes). Each context keeps a forwarding entry in its pools[][] slot; the pool itself lives as long as either
-// context. The high-water mark becomes max(target, draft) instead of the sum. Opt-in from llama (LLAMA_SHARED_POOL=1).
+// context. The high-water mark becomes max(target, draft) instead of the sum. Requested by llama by default (LLAMA_SHARED_POOL=0 opts out).
 struct ggml_cuda_pool_shared_ref : public ggml_cuda_pool {
     std::shared_ptr<ggml_cuda_pool> pool;
 
