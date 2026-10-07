@@ -7,6 +7,7 @@
 #include "llama-context.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cmath>
 #include <cstdlib>
@@ -2895,6 +2896,54 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
     }
 }
 
+// [DSL L5] KQ mask fast path for a causal ubatch whose rows each belong to a sequence that owns every used cell of
+// the stream (the single-slot server's trunk and MTP draft caches). A cell is then visible to row i iff it is used and
+// its position is <= pos_i, and with M-RoPE a same-position cell is also hidden when its (y, x) is greater, exactly as
+// in the general loop above. That loop tests the cell's sequence bitset per cell (~2.5 us per 1K cells for every
+// decode on a 5800X3D, linear in depth); this is one branch-free pass over the positions with the same values.
+// LLAMA_KQ_MASK_FAST=0 keeps the general loop (A/B and identity checks).
+static bool kq_mask_fast_enabled() {
+    static const bool v = [] {
+        const char * e = getenv("LLAMA_KQ_MASK_FAST");
+        return e == nullptr || strcmp(e, "0") != 0;
+    }();
+    return v;
+}
+
+template<typename T>
+static void set_input_kq_mask_seq_prefix(const llama_kv_cells & cells, const llama_ubatch * ubatch, int64_t n_kv, T * data) {
+    const T mask_keep = llama_cast<T>(0.0f);
+    const T mask_drop = llama_cast<T>(-INFINITY);
+
+    const bool is_2d = ubatch->is_pos_2d();
+
+    const llama_pos * pos = cells.pos_data();
+
+    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+        const llama_pos p1 = ubatch->pos[i];
+
+        T * row = data + (uint64_t) n_kv*i;
+
+        // p1 >= 0 and empty cells hold -1, so one unsigned compare covers both "used" and "p0 <= p1"
+        const uint32_t u1 = (uint32_t) p1;
+        for (int64_t j = 0; j < n_kv; ++j) {
+            row[j] = (uint32_t) pos[j] <= u1 ? mask_keep : mask_drop;
+        }
+
+        if (is_2d) {
+            // the same-position cells, from the sequence's (pos, cell) set: every used cell carries the row's sequence
+            const llama_pos p1_x = ubatch->pos[i + ubatch->n_tokens*2];
+            const llama_pos p1_y = ubatch->pos[i + ubatch->n_tokens];
+            const auto & sp = cells.seq_pos_get(ubatch->seq_id[i][0]);
+            for (auto it = sp.lower_bound({ p1, 0u }); it != sp.end() && it->first == p1; ++it) {
+                if ((int64_t) it->second < n_kv && cells.ext_get(it->second).is_2d_gt(p1_x, p1_y)) {
+                    row[it->second] = mask_drop;
+                }
+            }
+        }
+    }
+}
+
 void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
     const uint32_t n_tokens = ubatch->n_tokens;
 
@@ -2915,6 +2964,74 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     }
 
     //const int64_t t_start = ggml_time_us();
+
+    // LLAMA_KQ_MASK_FAST_VERIFY=1: rebuild every fast mask with the general loop and abort on any difference, and
+    // report (at WARN, so the server prints it) how many masks took the fast path and why any did not
+    static const bool fast_verify = [] {
+        const char * e = getenv("LLAMA_KQ_MASK_FAST_VERIFY");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    static std::atomic<uint64_t> n_fast_checked{0};
+    static std::atomic<uint64_t> n_fast_fallback{0};
+
+    if (fast_verify && kq_mask_fast_enabled()) {
+        const bool shape_ok = n_stream == 1 && causal_attn && swa_type == LLAMA_SWA_TYPE_NONE && !hparams.use_alibi && n_tokens > 0;
+        bool owns = false;
+        if (shape_ok) {
+            const auto & c = v_cells.at(seq_to_stream[ubatch->seq_id[0][0]]);
+            owns = c.seq_covers_used(ubatch->seq_id[0][0]);
+        }
+        if (!shape_ok || !owns) {
+            const uint64_t n = ++n_fast_fallback;
+            if (n <= 8 || (n & (n - 1)) == 0) {
+                LLAMA_LOG_WARN("%s: KQ mask general path #%llu: n_stream = %lld, causal = %d, swa = %d, alibi = %d, n_tokens = %u, n_kv = %lld, seq owns used cells = %d\n",
+                        __func__, (unsigned long long) n, (long long) n_stream, (int) causal_attn, (int) swa_type, (int) hparams.use_alibi,
+                        n_tokens, (long long) n_kv, (int) owns);
+            }
+        }
+    }
+
+    if (n_stream == 1 && causal_attn && swa_type == LLAMA_SWA_TYPE_NONE && !hparams.use_alibi && n_tokens > 0 &&
+            kq_mask_fast_enabled()) {
+        const llama_seq_id seq_id = ubatch->seq_id[0][0];
+        const auto & cells = v_cells.at(seq_to_stream[seq_id]);
+        bool ok = n_kv <= (int64_t) cells.size();
+        for (uint32_t i = 0; ok && i < n_tokens; ++i) {
+            const llama_seq_id s = ubatch->seq_id[i][0];
+            ok = ubatch->pos[i] >= 0 && (s == seq_id || cells.seq_covers_used(s));
+        }
+        if (ok && cells.seq_covers_used(seq_id)) {
+            if (dst->type == GGML_TYPE_F16) {
+                set_input_kq_mask_seq_prefix<ggml_fp16_t>(cells, ubatch, n_kv, (ggml_fp16_t *) dst->data);
+            } else {
+                set_input_kq_mask_seq_prefix<float>(cells, ubatch, n_kv, (float *) dst->data);
+            }
+
+            if (fast_verify) {
+                const size_t nbytes = ggml_nbytes(dst);
+                std::vector<uint8_t> fast((const uint8_t *) dst->data, (const uint8_t *) dst->data + nbytes);
+                const args_set_input_kq_mask args = { hparams, ubatch, v_cells, seq_to_stream, n_swa, swa_type, n_kv, n_stream, n_tps };
+                if (dst->type == GGML_TYPE_F16) {
+                    set_input_kq_mask_impl<ggml_fp16_t>(args, (ggml_fp16_t *) dst->data, causal_attn);
+                } else {
+                    set_input_kq_mask_impl<float>(args, (float *) dst->data, causal_attn);
+                }
+                const size_t nrow = (size_t) n_kv*ggml_element_size(dst);
+                for (uint32_t i = 0; i < n_tokens; ++i) {
+                    if (memcmp(fast.data() + i*nrow, (const uint8_t *) dst->data + i*nrow, nrow) != 0) {
+                        GGML_ABORT("KQ mask fast path differs from the general loop (row %u of %u, n_kv = %lld, pos = %d)",
+                                i, n_tokens, (long long) n_kv, ubatch->pos[i]);
+                    }
+                }
+                const uint64_t n = ++n_fast_checked;
+                if ((n & (n - 1)) == 0) {
+                    LLAMA_LOG_WARN("%s: KQ mask fast path verified identical on %llu ubatches (this one: n_kv = %lld, n_tokens = %u; general-path masks so far: %llu)\n",
+                            __func__, (unsigned long long) n, (long long) n_kv, n_tokens, (unsigned long long) n_fast_fallback.load());
+                }
+            }
+            return;
+        }
+    }
 
     const args_set_input_kq_mask args = {
         /*.hparams          =*/ hparams,
