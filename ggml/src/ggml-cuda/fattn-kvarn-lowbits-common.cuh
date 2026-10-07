@@ -4,6 +4,7 @@
 #include "convert.cuh"
 #include "vecdotq.cuh"
 #include "turbo-quant.cuh"
+#include "fattn-kvarn-rot.cuh"
 
 #include <cstdint>
 
@@ -1594,7 +1595,7 @@ static __global__ void flash_attn_mask_to_KV_max(
 // ggml_cuda_flash_attn_ext_compact_mask: not declared here. The v0.4 upstream merge changed its signature and index
 // layout (per-group counts, ncols1), and no instantiated KVarN low-bit launch uses the sparse path (see launch_fattn).
 
-template<int D, int ncols1, int ncols2> // D == head size
+template<int D, int ncols1, int ncols2, bool rot = false> // D == head size
 __launch_bounds__(D, 1)
 static __global__ void flash_attn_stream_k_fixup_uniform(
         float * __restrict__ dst,
@@ -1669,12 +1670,19 @@ static __global__ void flash_attn_stream_k_fixup_uniform(
     }
 
     // Write back final result:
-    *dst = dst_val / rowsum;
+    if constexpr (rot) {
+        // #139: the early returns above are block-uniform, every thread of the block reaches this.
+        static_assert(D == 256, "KVarN fused rotation is D = 256");
+        __shared__ float rot_buf[D];
+        *dst = kvarn_rot256_block(dst_val / rowsum, tid, rot_buf);
+    } else {
+        *dst = dst_val / rowsum;
+    }
 }
 
 // General fixup kernel for the case where the number of blocks per tile is not uniform across tiles
 // (blocks_num.x not a multiple of ntiles_dst)
-template <int D, int ncols1, int ncols2> // D == head size
+template <int D, int ncols1, int ncols2, bool rot = false> // D == head size
 __launch_bounds__(D, 1)
 static __global__ void flash_attn_stream_k_fixup_general(
         float * __restrict__ dst,
@@ -1777,10 +1785,17 @@ static __global__ void flash_attn_stream_k_fixup_general(
     }
 
     // Write back final result:
-    *dst = dst_val / rowsum;
+    if constexpr (rot) {
+        // #139: the early returns above are block-uniform, every thread of the block reaches this.
+        static_assert(D == 256, "KVarN fused rotation is D = 256");
+        __shared__ float rot_buf[D];
+        *dst = kvarn_rot256_block(dst_val / rowsum, tid, rot_buf);
+    } else {
+        *dst = dst_val / rowsum;
+    }
 }
 
-template<int D> // D == head size
+template<int D, bool rot = false> // D == head size
 __launch_bounds__(D, 1)
 static __global__ void flash_attn_combine_results(
         const float  * __restrict__ VKQ_parts,
@@ -1830,7 +1845,13 @@ static __global__ void flash_attn_combine_results(
         VKQ_denominator += KQ_max_scale * meta[l].y;
     }
 
-    dst[tid] = VKQ_numerator / VKQ_denominator;
+    if constexpr (rot) {
+        static_assert(D == 256, "KVarN fused rotation is D = 256");
+        __shared__ float rot_buf[D];
+        dst[tid] = kvarn_rot256_block(VKQ_numerator / VKQ_denominator, tid, rot_buf);
+    } else {
+        dst[tid] = VKQ_numerator / VKQ_denominator;
+    }
 }
 
 template <int DV, int ncols1, int ncols2>
@@ -1860,6 +1881,10 @@ void launch_fattn(
     GGML_ASSERT(V->nb[0] == ggml_element_size(V));
 
     GGML_ASSERT(!mask || mask->type == GGML_TYPE_F16);
+
+    // #139: the kernel rotates Q and its final outputs; the fixup / combine kernels rotate the values they finish.
+    const bool rot = ggml_cuda_fattn_kvarn_rot(KQV);
+    GGML_ASSERT(!rot || DV == 256);
 
     ggml_cuda_pool & pool = ctx.pool();
     cudaStream_t main_stream = ctx.stream();
@@ -2195,7 +2220,13 @@ void launch_fattn(
             const dim3 block_dim_combine(DV, 1, 1);
             const dim3 blocks_num_combine = {(unsigned)ntiles_dst, ncols1, ncols2};
 
-            flash_attn_stream_k_fixup_uniform<DV, ncols1, ncols2>
+            auto fixup_uniform = flash_attn_stream_k_fixup_uniform<DV, ncols1, ncols2>;
+            if constexpr (DV == 256) {
+                if (rot) {
+                    fixup_uniform = flash_attn_stream_k_fixup_uniform<DV, ncols1, ncols2, true>;
+                }
+            }
+            fixup_uniform
                 <<<blocks_num_combine, block_dim_combine, 0, main_stream>>>
                 ((float *) KQV->data, dst_tmp_meta.ptr,
                  Q->ne[1], Q->ne[2], K->ne[2], nblocks_sk,
@@ -2212,7 +2243,13 @@ void launch_fattn(
             const dim3 block_dim_combine(DV, 1, 1);
             const dim3 blocks_num_combine = {blocks_num.x, ncols1, ncols2};
 
-            flash_attn_stream_k_fixup_general<DV, ncols1, ncols2>
+            auto fixup_general = flash_attn_stream_k_fixup_general<DV, ncols1, ncols2>;
+            if constexpr (DV == 256) {
+                if (rot) {
+                    fixup_general = flash_attn_stream_k_fixup_general<DV, ncols1, ncols2, true>;
+                }
+            }
+            fixup_general
                 <<<blocks_num_combine, block_dim_combine, 0, main_stream>>>
                 ((float *) KQV->data, dst_tmp_meta.ptr,
                  Q->ne[1], Q->ne[2], gqa_ratio, total_work,
@@ -2223,7 +2260,13 @@ void launch_fattn(
         const dim3 blocks_num_combine(Q->ne[1], Q->ne[2], Q->ne[3]);
         const size_t nbytes_shared_combine = parallel_blocks*sizeof(float2);
 
-        flash_attn_combine_results<DV>
+        auto combine = flash_attn_combine_results<DV>;
+        if constexpr (DV == 256) {
+            if (rot) {
+                combine = flash_attn_combine_results<DV, true>;
+            }
+        }
+        combine
             <<<blocks_num_combine, block_dim_combine, nbytes_shared_combine, main_stream>>>
             (dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks);
     }

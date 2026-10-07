@@ -4260,7 +4260,7 @@ static bool ggml_cuda_fattn_kvarn_rot_in_kernel(ggml_backend_cuda_context & ctx,
         return false;
     }
     if (ggml_cuda_fattn_kvarn_is_lowbits(dst)) {
-        return false;
+        return true; // fattn-kvarn-lowbits.cu rotates in-kernel or takes the separate passes itself
     }
     GGML_UNUSED(ctx);
     // 4/4: the stream decode kernel (fattn-kvarn-stream.cuh) through ggml_cuda_flash_attn_ext_kvarn_direct_impl
