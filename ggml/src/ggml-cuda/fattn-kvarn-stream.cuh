@@ -654,64 +654,187 @@ static __global__ void flash_attn_ext_kvarn_stream(
     if (split < n_ex) {
         setup_exact();
     }
-    for (int e = split; e < n_ex; e += nsplit) {
-        const int p0 = e < n_ex_sink ? 16*e : kv.B + 16*(e - n_ex_sink);
+    const half * mrow_h = (const half *) mrow;
+
+    // KQ of the exact strip staged in the ring (fragment order, K straight) + mask, online softmax -> P
+    auto exact_kq = [&](const int p0) -> T_B {
+        T_C kq;
+        const float mk0 = __half2float(mrow_h[p0 + (lane >> 2)]);
+        const float mk1 = __half2float(mrow_h[p0 + (lane >> 2) + 8]);
+#pragma unroll
+        for (int c = 0; c < NTC; ++c) {
+            T_A a;
+#pragma unroll
+            for (int l = 0; l < 4; ++l) {
+                const int row = (lane >> 2) + 8*(l & 1);
+                const int cp  = 8*c + 4*(l >> 1) + (lane & 3);
+                a.x[l] = fattn_kvarn_u32_as_half2(exact_word(row, cp));
+            }
+            mma(kq, a, qp[c]);
+        }
+        kq.x[0] += mk0;
+        kq.x[1] += mk0;
+        kq.x[2] += mk1;
+        kq.x[3] += mk1;
+        return softmax(kq);
+    };
+    // acc += V^T P from the V strip staged in the ring (8x8 transposes)
+    auto exact_pv = [&](const T_B & P) {
+#pragma unroll
+        for (int c = 0; c < NTC; ++c) {
+            T_A a;
+#pragma unroll
+            for (int l = 0; l < 4; ++l) {
+                const int row = 8*(l >> 1) + (lane >> 2);      // token row of the 8x8 block
+                const int cp  = 8*c + 4*(l & 1) + (lane & 3);  // channel pair
+                a.x[l] = ggml_cuda_movmatrix(fattn_kvarn_u32_as_half2(exact_word(row, cp)));
+            }
+            mma(acc[c], a, P);
+        }
+    };
+    auto exact_p0 = [&](const int e) { return e < n_ex_sink ? 16*e : kv.B + 16*(e - n_ex_sink); };
+    auto exact_row0 = [&](const int p0) { return p0 < kv.S ? p0 : kv.S + (p0 - kv.S) % kv.cap; };
+
+    // Pipelined exact strips (the packed ring, and the sink when it shares the ring type): the raw rows of the
+    // split's strips go through a queue of items K(e), V(e), K(e + nsplit), ... staged by cp.async into nraw raw
+    // slots behind the f16 strip buffer, nraw items ahead of the decode. Each item is decoded from shared memory into
+    // the same swizzled f16 strip as before and consumed in the same order, so the result is bit-identical.
+    // The separate f16 sink (8 KB per item) keeps the direct cp.async path below.
+    auto raw_row_bytes = [](const int type) -> int {
+        return type == GGML_TYPE_TQ6_0 ? (D/QK_TQ6)*(int) sizeof(block_tq6_0)
+             : type == GGML_TYPE_Q8_0  ? (D/QK8_0)*(int) sizeof(block_q8_0)
+             : type == GGML_TYPE_F16   ? D*(int) sizeof(half) : 0;
+    };
+    constexpr int raw_avail = (turbo4_body ? NSTAGE*TURBO4_STAGE_BYTES : NSTAGE*STAGE_BYTES + 2*RMETA_BYTES) - EXACT_BYTES; // split_bytes()
+    constexpr int RAW_MAX = 6;
+    const int rb_k = raw_row_bytes(kv.type_k);
+    const int rb_v = raw_row_bytes(kv.type_v);
+    const int raw_slot = 16*max(rb_k, rb_v);
+    const bool raw_ok = rb_k > 0 && rb_v > 0 && raw_slot <= raw_avail &&
+        (((uintptr_t) Kh | (uintptr_t) Vh | (uintptr_t) nb11 | (uintptr_t) nb21 | (uintptr_t) rb_k | (uintptr_t) rb_v) & 3) == 0;
+    // the MTP-4 verification kernel (max_warps 5) sits at its register cap; the queue's state costs its body loop
+    // more than the pipeline saves (measured +30-35 us/call at 102K), so it keeps the direct path
+    constexpr bool raw_pipe = max_warps != 5;
+    const int nraw = raw_pipe && raw_ok ? min(RAW_MAX, raw_avail/raw_slot) : 0;
+    int e_pipe = n_ex; // first strip of the pipelined range (n_ex: none)
+    if (nraw > 0) {
+        e_pipe = split;
+        if (kv.sink_type == GGML_TYPE_F16 && split < n_ex_sink) {
+            e_pipe = split + ((n_ex_sink - split + nsplit - 1)/nsplit)*nsplit;
+        }
+    }
+
+    // direct path: the f16 sink, and every exact strip when the raw queue does not fit
+    for (int e = split; e < min(e_pipe, n_ex); e += nsplit) {
+        const int p0 = exact_p0(e);
 #ifdef KVARN_STREAM_DBG_TIME
         dbg_nexact += 1;
         dbg_ts = clock64();
 #endif
         {
-            T_C kq;
             // exact f16 rows, staged K then V through the ring, read in fragment order: K straight, V via an 8x8
             // transpose
-            const int row0 = p0 < kv.S ? p0 : kv.S + (p0 - kv.S) % kv.cap;
+            const int row0 = exact_row0(p0);
             const bool f16_sink = p0 < kv.S && kv.sink_type == GGML_TYPE_F16;
             const char * Kr = f16_sink ? fattn_kvarn_sink_row(Kh, kv, nb11, row0, false) : Kh + (size_t) row0*nb11;
             const char * Vr = f16_sink ? fattn_kvarn_sink_row(Vh, kv, nb21, row0, true) : Vh + (size_t) row0*nb21;
-            const half * mrow_h = (const half *) mrow;
-            const float mk0 = __half2float(mrow_h[p0 + (lane >> 2)]);
-            const float mk1 = __half2float(mrow_h[p0 + (lane >> 2) + 8]);
             issue_exact(Kr, f16_sink ? kv.sink_stride : nb11, f16_sink ? GGML_TYPE_F16 : kv.type_k);
             cp_async_wait_all();
             sync_split();
-#pragma unroll
-            for (int c = 0; c < NTC; ++c) {
-                T_A a;
-#pragma unroll
-                for (int l = 0; l < 4; ++l) {
-                    const int row = (lane >> 2) + 8*(l & 1);
-                    const int cp  = 8*c + 4*(l >> 1) + (lane & 3);
-                    a.x[l] = fattn_kvarn_u32_as_half2(exact_word(row, cp));
-                }
-                mma(kq, a, qp[c]);
-            }
-            kq.x[0] += mk0;
-            kq.x[1] += mk0;
-            kq.x[2] += mk1;
-            kq.x[3] += mk1;
-
-            const T_B P = softmax(kq);
+            const T_B P = exact_kq(p0);
 
             sync_split(); // everyone has read K
             issue_exact(Vr, f16_sink ? kv.sink_stride : nb21, f16_sink ? GGML_TYPE_F16 : kv.type_v);
             cp_async_wait_all();
             sync_split();
-#pragma unroll
-            for (int c = 0; c < NTC; ++c) {
-                T_A a;
-#pragma unroll
-                for (int l = 0; l < 4; ++l) {
-                    const int row = 8*(l >> 1) + (lane >> 2);      // token row of the 8x8 block
-                    const int cp  = 8*c + 4*(l & 1) + (lane & 3);  // channel pair
-                    a.x[l] = ggml_cuda_movmatrix(fattn_kvarn_u32_as_half2(exact_word(row, cp)));
-                }
-                mma(acc[c], a, P);
-            }
+            exact_pv(P);
             sync_split(); // everyone has read V before the next strip (or the combine) reuses the ring
         }
 #ifdef KVARN_STREAM_DBG_TIME
         { const long long t = clock64(); dbg_exact += t - dbg_ts; }
 #endif
+    }
+
+    if (e_pipe < n_ex) {
+        const uint32_t raw_s = ring_s + EXACT_BYTES;
+        const char *   raw   = ring + EXACT_BYTES;
+        // stage item it (raw rows, 4-byte cp.async: tq6 rows are only 4-byte aligned) into slot it % nraw
+        auto issue_raw = [&](const int it) {
+            const int e = e_pipe + (it >> 1)*nsplit;
+            if (e < n_ex) {
+                const bool   is_v = it & 1;
+                const size_t nb   = is_v ? nb21 : nb11;
+                const char * src  = (is_v ? Vh : Kh) + (size_t) exact_row0(exact_p0(e))*nb;
+                const int    wpr  = (is_v ? rb_v : rb_k)/4;
+                const uint32_t dst = raw_s + (it % nraw)*raw_slot;
+                const int step = NT*WARP_SIZE;
+                int r = (nt*WARP_SIZE + lane) / wpr;
+                int c = (nt*WARP_SIZE + lane) - r*wpr;
+                while (r < 16) {
+                    cp_async_ca_4(dst + 4*(r*wpr + c), src + (size_t) r*nb + 4*c);
+                    c += step;
+                    while (c >= wpr) {
+                        c -= wpr;
+                        ++r;
+                    }
+                }
+            }
+            cp_async_commit();
+        };
+        // wait for item it (nraw - 1 younger groups may stay in flight), then decode it into the f16 strip
+        auto land_raw = [&]() {
+            switch (nraw) {
+                case 1:  cp_async_wait_group<0>(); break;
+                case 2:  cp_async_wait_group<1>(); break;
+                case 3:  cp_async_wait_group<2>(); break;
+                case 4:  cp_async_wait_group<3>(); break;
+                case 5:  cp_async_wait_group<4>(); break;
+                default: cp_async_wait_group<5>(); break;
+            }
+        };
+        auto decode_raw = [&](const int it, const int type, const int rb) {
+            const char * rows = raw + (it % nraw)*raw_slot;
+            const float tq6_mag = type == GGML_TYPE_TQ6_0 ? TQ6_CENTROIDS[32 + lane] : 0.0f;
+            for (int q = nt*WARP_SIZE + lane; q < EXACT_BYTES/16; q += NT*WARP_SIZE) {
+                const int r = q / (EXACT_ROW_BYTES/16);
+                const int j = q % (EXACT_ROW_BYTES/16);
+                half2 * out = (half2 *) (ring + r*EXACT_ROW_BYTES + 16*(j ^ (r & 7)));
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    out[i] = fattn_kvarn_ring_pair_warp(rows + r*rb, 4*j+i, type, tq6_mag); // warp-uniform
+                }
+            }
+        };
+
+        for (int it = 0; it < nraw; ++it) {
+            issue_raw(it);
+        }
+        int it = 0;
+        for (int e = e_pipe; e < n_ex; e += nsplit, it += 2) {
+            const int p0 = exact_p0(e);
+#ifdef KVARN_STREAM_DBG_TIME
+            dbg_nexact += 1;
+            dbg_ts = clock64();
+#endif
+            land_raw();
+            sync_split();                 // K raw landed; everyone is done with the previous V strip
+            decode_raw(it, kv.type_k, rb_k);
+            sync_split();                 // f16 K strip complete; its raw slot is free
+            issue_raw(it + nraw);
+            const T_B P = exact_kq(p0);
+
+            land_raw();
+            sync_split();                 // V raw landed; everyone has read K
+            decode_raw(it + 1, kv.type_v, rb_v);
+            sync_split();
+            issue_raw(it + 1 + nraw);
+            exact_pv(P);
+#ifdef KVARN_STREAM_DBG_TIME
+            { const long long t = clock64(); dbg_exact += t - dbg_ts; }
+#endif
+        }
+        cp_async_wait_all();
+        sync_split(); // everyone has read V before the combine reuses the ring
     }
 #ifdef KVARN_STREAM_DBG_TIME
     {
