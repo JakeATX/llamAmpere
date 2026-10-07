@@ -100,6 +100,16 @@ TURBO_IQ_IMPORT void turbo_innerq_mark_tensor_updated(void);
 [[maybe_unused]] static void turbo_innerq_mark_tensor_updated(void) {}
 #endif
 
+// KVarN fused write rotation (#139): compile-time default GGML_KVARN_FUSED_ROT (1 in llamAmpere), runtime
+// override with the GGML_KVARN_FUSED_ROT environment variable (0 = unfused graph rotation, 1 = fused)
+#ifndef GGML_KVARN_FUSED_ROT
+#define GGML_KVARN_FUSED_ROT 1
+#endif
+static bool llama_kvarn_fused_rot_switch() {
+    const char * e = getenv("GGML_KVARN_FUSED_ROT");
+    return e != nullptr ? atoi(e) != 0 : GGML_KVARN_FUSED_ROT != 0;
+}
+
 //
 // llama_kv_cache
 //
@@ -748,6 +758,32 @@ llama_kv_cache::llama_kv_cache(
             turbo_innerq_scale_inv = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, INNERQ_MAX_CHANNELS);
             ggml_format_name(turbo_innerq_scale_inv, "turbo_innerq_scale_inv");
         }
+    }
+
+    // KVarN fused write rotation (#139, GGML_KVARN_FUSED_ROT): the TQ6_0 ring/sink write applies the KVarN
+    // Hadamard itself, so the graph drops its standalone K/V GGML_OP_TURBO_WHT nodes. Needs a backend kernel
+    // for the fused SET_ROWS on every device that holds a layer; otherwise the unfused path stays.
+    if (kvarn.enabled() && type_k == GGML_TYPE_TQ6_0 && type_v == GGML_TYPE_TQ6_0 && llama_kvarn_fused_rot_switch()) {
+        kvarn_fused_rot_on = true;
+        const int group = kvarn.body_type == GGML_TYPE_TURBO4_0 ? 128 : 256;
+        for (const auto & layer : layers) {
+            const int64_t ne0 = layer.k->ne[0];
+            if (ne0 % group != 0) { kvarn_fused_rot_on = false; break; }
+            if (!offload) { continue; }
+            ggml_backend_dev_t dev = model.dev_layer(layer.il);
+            if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) { continue; }
+            ggml_init_params params = { 4*ggml_tensor_overhead(), NULL, true };
+            ggml_context_ptr tctx { ggml_init(params) };
+            ggml_tensor * dst = ggml_new_tensor_2d(tctx.get(), GGML_TYPE_TQ6_0, ne0, 2);
+            ggml_tensor * src = ggml_new_tensor_2d(tctx.get(), GGML_TYPE_F32, ne0, 1);
+            ggml_tensor * idx = ggml_new_tensor_1d(tctx.get(), GGML_TYPE_I64, 1);
+            if (!ggml_backend_dev_supports_op(dev, ggml_set_rows_kvarn_rot(tctx.get(), dst, src, idx, group))) {
+                LLAMA_LOG_WARN("%s: KVarN fused write rotation not supported on %s, using the unfused path\n", __func__, ggml_backend_dev_name(dev));
+                kvarn_fused_rot_on = false;
+                break;
+            }
+        }
+        LLAMA_LOG_INFO("%s: KVarN K/V rotation %s the cache write (GGML_KVARN_FUSED_ROT)\n", __func__, kvarn_fused_rot_on ? "fused into" : "NOT fused into");
     }
 
     if (reuse) {
@@ -2269,7 +2305,8 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
     }
 
     // store the current K values into the cache
-    ggml_tensor * result = (kvarn.enabled() && k->type == GGML_TYPE_TQ6_0)
+    ggml_tensor * result = kvarn_fused_rot_on ? ggml_set_rows_kvarn_rot(ctx, k, k_cur, k_idxs, kvarn_rot_group())
+        : (kvarn.enabled() && k->type == GGML_TYPE_TQ6_0)
         ? ggml_set_rows_tq6_rotated(ctx, k, k_cur, k_idxs) : ggml_set_rows(ctx, k, k_cur, k_idxs);
 
     if (kvarn.enabled() && kvarn.sink_type == GGML_TYPE_F16) {
@@ -2328,7 +2365,8 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
             v = ggml_reshape_2d(ctx, v, n_embd_gqa, kv_size*n_stream);
         }
 
-        ggml_tensor * result = (kvarn.enabled() && v->type == GGML_TYPE_TQ6_0)
+        ggml_tensor * result = kvarn_fused_rot_on ? ggml_set_rows_kvarn_rot(ctx, v, v_cur, v_idxs, kvarn_rot_group())
+            : (kvarn.enabled() && v->type == GGML_TYPE_TQ6_0)
             ? ggml_set_rows_tq6_rotated(ctx, v, v_cur, v_idxs) : ggml_set_rows(ctx, v, v_cur, v_idxs);
         if (kvarn.enabled() && kvarn.sink_type == GGML_TYPE_F16) {
             result->op_params[2] = kvarn.sink;
@@ -4116,6 +4154,10 @@ bool llama_kv_cache_context::is_kvarn() const {
 
 const llama_kvarn_config & llama_kv_cache_context::get_kvarn() const {
     return kv->get_kvarn();
+}
+
+bool llama_kv_cache_context::kvarn_fused_rot() const {
+    return kv->kvarn_fused_rot();
 }
 
 ggml_tensor * llama_kv_cache_context::build_input_kvarn_desc(ggml_context * ctx) const {

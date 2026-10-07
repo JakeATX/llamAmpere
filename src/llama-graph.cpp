@@ -3288,6 +3288,19 @@ llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
     return (llm_graph_input_attn_kv *) res->add_input(std::move(inp));
 }
 
+// KVarN fused write rotation (#139, GGML_KVARN_FUSED_ROT): when the cache write rotates K/V itself, hand
+// cpy_k/cpy_v the unrotated input of the K/V GGML_OP_TURBO_WHT node; the WHT node (and its ggml_cont when the
+// raw input already has packed heads) is never expanded into the graph.
+static ggml_tensor * llm_graph_kvarn_unrotate(ggml_tensor * cur) {
+    GGML_ASSERT(cur->op == GGML_OP_TURBO_WHT);
+    ggml_tensor * src = cur->src[0];
+    if (src->op == GGML_OP_CONT && src->src[0]->nb[0] == sizeof(float) &&
+            src->src[0]->nb[1] == ggml_row_size(GGML_TYPE_F32, src->src[0]->ne[0])) {
+        src = src->src[0];
+    }
+    return src;
+}
+
 void llm_graph_context::build_attn_store(
         llm_graph_input_attn_kv * inp,
         ggml_tensor * k_cur,
@@ -3312,6 +3325,11 @@ void llm_graph_context::build_attn_store(
         v_cur = ggml_turbo_wht(ctx0, v_cur, 0, group, nullptr);
         cb(k_cur, "k_kvarn_rot", il);
         cb(v_cur, "v_kvarn_rot", il);
+    }
+
+    if (inp->self_kvarn_desc != nullptr && mctx_cur->kvarn_fused_rot()) {
+        k_cur = llm_graph_kvarn_unrotate(k_cur);  // #139: rotated inside the cache write
+        v_cur = llm_graph_kvarn_unrotate(v_cur);
     }
 
     ggml_build_forward_expand(gf, v_cur);
@@ -3364,6 +3382,12 @@ ggml_tensor * llm_graph_context::build_attn(
         cb(q_cur, "q_kvarn_rot", il);
         cb(k_cur, "k_kvarn_rot", il);
         cb(v_cur, "v_kvarn_rot", il);
+    }
+
+    // KVarN fused write rotation (#139): the K/V WHT nodes above are dropped, the cache write rotates
+    if (is_kvarn && mctx_cur->kvarn_fused_rot()) {
+        k_cur = llm_graph_kvarn_unrotate(k_cur);
+        v_cur = llm_graph_kvarn_unrotate(v_cur);
     }
 
     // these nodes are added to the graph together so that they are not reordered
