@@ -681,18 +681,18 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     res->add_input(std::move(inp));
 
     // [#91] a decode without output rows (the MTP catch-up update) only has to store the MTP layer's K/V;
-    // its query, attention, FFN and head are never read. LLAMA_MTP_UPDATE_KV_ONLY=1 builds that KV-only graph.
+    // its query, attention, FFN and head are never read. On by default; LLAMA_MTP_UPDATE_KV_ONLY=0 builds the full graph.
     // An unmasked nextn-embedding read copies every row even without outputs, so it keeps the full graph.
     static const bool update_kv_only = [] {
         const char * value = getenv("LLAMA_MTP_UPDATE_KV_ONLY");
-        return value != nullptr && strcmp(value, "1") == 0;
+        return value == nullptr || strcmp(value, "0") != 0;
     }();
     const bool kv_only = update_kv_only && n_outputs == 0 && !cparams.mtp_chain && !cparams.embeddings &&
         (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked);
     if (kv_only) {
         static std::atomic_flag noted = ATOMIC_FLAG_INIT;
         if (!noted.test_and_set()) {
-            LLAMA_LOG_INFO("%s: MTP update builds the KV-only graph (LLAMA_MTP_UPDATE_KV_ONLY)\n", __func__);
+            LLAMA_LOG_INFO("%s: MTP update builds the KV-only graph (LLAMA_MTP_UPDATE_KV_ONLY=0 disables)\n", __func__);
         }
     }
 
