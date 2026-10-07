@@ -394,6 +394,19 @@ public:
         return seq_pos[seq_id].rbegin()->first;
     }
 
+    // true when every used cell carries seq_id, i.e. the cells hold no other sequence; O(1)
+    bool seq_covers_used(llama_seq_id seq_id) const {
+        assert(seq_id >= 0);
+        assert(seq_id < LLAMA_MAX_SEQ);
+
+        return seq_pos[seq_id].size() == used.size();
+    }
+
+    // the raw positions (-1 = empty cell), for branch-free scans
+    const llama_pos * pos_data() const {
+        return pos.data();
+    }
+
     // note: call only if the cell is not empty
     llama_pos pos_get(uint32_t i) const {
         assert(i < pos.size());
