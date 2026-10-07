@@ -21,6 +21,11 @@
 //   KLD_FULL_VOCAB=1     dense double log-probabilities, exact token/config validation
 //   KLD_CONTRACT=<text>   required in full mode; caller model/config identity (exclude cache type)
 //   KLD_MAX_TOKENS=<n>    use at most n tokens of the file (default: the context size)
+//   KLD_INPUT_IDS=<path>  read the sequence as raw int32 token IDs instead of tokenizing -f (exact replay of a
+//                         recorded trajectory, e.g. tokens.i32)
+//   KLD_SCORE_MASK=<path> one uint8 (0/1) per input token: position i is scored only if mask[i] = 1 (position i
+//                         predicts token i+1, so a trajectory's score_mask.u8 selects the generated region);
+//                         must have the same length as the input before KLD_MAX_TOKENS truncation
 
 #include "arg.h"
 #include "common.h"
@@ -275,12 +280,40 @@ int main(int argc, char ** argv) {
     const int n_ctx   = llama_n_ctx(ctx);
     const bool add_bos = llama_vocab_get_add_bos(vocab);
 
-    std::vector<llama_token> tokens = common_tokenize(ctx, params.prompt, add_bos, true);
+    std::vector<llama_token> tokens;
+    if (const char * input_ids = getenv("KLD_INPUT_IDS")) {
+        std::ifstream input(input_ids, std::ios::binary | std::ios::ate);
+        const auto bytes = input ? (long long) input.tellg() : -1;
+        if (bytes < 2*(long long) sizeof(llama_token) || bytes > 64ll*1024*1024 || bytes % sizeof(llama_token) != 0) {
+            LOG_ERR("invalid input token file %s\n", input_ids); return 1;
+        }
+        tokens.resize((size_t) bytes / sizeof(llama_token));
+        input.seekg(0);
+        input.read((char *) tokens.data(), bytes);
+        if (!input || std::any_of(tokens.begin(), tokens.end(), [n_vocab](llama_token t) { return t < 0 || t >= n_vocab; })) {
+            LOG_ERR("invalid input token IDs in %s\n", input_ids); return 1;
+        }
+    } else {
+        tokens = common_tokenize(ctx, params.prompt, add_bos, true);
+    }
+    std::vector<unsigned char> score_mask(tokens.size(), 1);
+    if (const char * mask_path = getenv("KLD_SCORE_MASK")) {
+        std::ifstream mask_in(mask_path, std::ios::binary | std::ios::ate);
+        if (!mask_in || (long long) mask_in.tellg() != (long long) tokens.size()) {
+            LOG_ERR("score mask %s length does not match the %zu input tokens\n", mask_path, tokens.size()); return 1;
+        }
+        mask_in.seekg(0);
+        mask_in.read((char *) score_mask.data(), (std::streamsize) score_mask.size());
+        if (!mask_in || std::any_of(score_mask.begin(), score_mask.end(), [](unsigned char x) { return x > 1; })) {
+            LOG_ERR("invalid score mask %s\n", mask_path); return 1;
+        }
+    }
     int n_tokens = (int) tokens.size();
     const int max_tokens = integer_env("KLD_MAX_TOKENS", n_ctx);
     if (n_tokens > std::min(n_ctx, max_tokens)) {
         n_tokens = std::min(n_ctx, max_tokens);
         tokens.resize(n_tokens);
+        score_mask.resize(n_tokens);
     }
     LOG_INF("%s: n_vocab=%d n_ctx=%d file tokens used=%d stride=%d mode=%s base=%s\n", __func__,
             n_vocab, n_ctx, n_tokens, stride, write_mode ? "write" : "read", env_base);
@@ -311,7 +344,8 @@ int main(int argc, char ** argv) {
         }
     }
 
-    const int32_t expected_records = (n_tokens - 2) / stride + 1;
+    int32_t expected_records = 0;
+    for (int i = 0; i + 1 < n_tokens; ++i) { expected_records += (i % stride == 0 && score_mask[i]); }
     if (!write_mode && hdr.n_records != expected_records) {
         LOG_ERR("base record count mismatch or incomplete file\n"); return 1;
     }
@@ -352,7 +386,7 @@ int main(int argc, char ** argv) {
         common_batch_clear(batch);
         std::vector<int> scored_idx;   // index within the batch
         for (int i = start; i < end; ++i) {
-            const bool want = (i % stride == 0) && (i + 1 < n_tokens);
+            const bool want = (i % stride == 0) && (i + 1 < n_tokens) && score_mask[i];
             common_batch_add(batch, tokens[i], i, {0}, want);
             if (want) scored_idx.push_back(i - start);
         }

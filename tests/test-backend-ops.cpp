@@ -13998,6 +13998,29 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // [I8QK] prefill shapes (>= 64 queries) for the opt-in int8-QK route (GGML_CUDA_FA_I8QK=1, fattn-i8qk.cu); without
+    // the switch they cover the f16 MMA prefill route. Production head dims 256 (Qwen3.8, GQA 6) and 128, the production
+    // KV pairs, causal / random / no mask, permuted Q, a partial query tile (200), a single KV head and large logits
+    // (q_range 20: peaked softmax, online rescaling). F16/F16 checks the fallback (f16 caches keep the f16 route).
+    // GGML_FATTN_PATH_STATS=1 shows the route taken; GGML_CUDA_PREFILL_KV_MIB=1 sends the D 256 cases through the
+    // bounded per-KV-head-group branch (first > 0).
+    for (const auto & types : {std::pair{GGML_TYPE_F16,      GGML_TYPE_F16},      std::pair{GGML_TYPE_Q8_0,  GGML_TYPE_Q8_0},
+                               std::pair{GGML_TYPE_TQ5_0,    GGML_TYPE_TURBO4_0}, std::pair{GGML_TYPE_TQ6_0, GGML_TYPE_TURBO4_0},
+                               std::pair{GGML_TYPE_Q8_0,     GGML_TYPE_TURBO4_0}, std::pair{GGML_TYPE_TQ6_0, GGML_TYPE_TQ5_0},
+                               std::pair{GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0}, std::pair{GGML_TYPE_TQ5_0, GGML_TYPE_TQ5_0}}) {
+        for (int64_t hs : {128, 256}) {
+            for (int64_t nb : {64, 200, 512}) {
+                for (int64_t kv : {512, 2048}) {
+                    test_cases.emplace_back(new test_flash_attn_ext_causal(hs, hs, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, types.first, types.second, {0, 2, 1, 3}, false));
+                    test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, types.first, types.second));
+                }
+            }
+            test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 4, {6, 1}, 1024, 128, false, false, 0, 0, GGML_PREC_F32, types.first, types.second));
+            test_cases.emplace_back(new test_flash_attn_ext_causal(hs, hs, 1, {1, 1}, 1024, 130, true, false, 0, 0, GGML_PREC_F32, types.first, types.second, {0, 2, 1, 3}, false));
+            test_cases.emplace_back(new test_flash_attn_ext_large_logits(hs, hs, 4, {6, 1}, 1024, 200, true, false, 0, 0, GGML_PREC_F32, types.first, types.second));
+        }
+    }
+
     // SLOWKV (GGML_SLOWKV): the same verify-width coverage for the other fused D256 pairs. Width 5 takes the compact
     // tile when the switch is on, turbo4/tq6_0 widths 5-8 otherwise the fused (8,8) tile, q8_0/q5_1 the fused tiles at
     // every width; kv 1057, no mask, softcap/sinks and nr23 [6,2] cover the fallbacks and nh 13/59 the Stream-K

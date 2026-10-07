@@ -8,6 +8,7 @@
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
 #include "fattn-prefill-policy.h"
+#include "fattn-i8qk.cuh"
 #include "convert.cuh"
 #include "kv-stream-span-tuner.h"
 #include "ledger.cuh"
@@ -4157,6 +4158,58 @@ static void ggml_cuda_flash_attn_ext_bounded_prefill(
     }
 }
 
+// [I8QK] opt-in int8-QK prefill route (GGML_CUDA_FA_I8QK=1, fattn-i8qk.cu). Takes only ops that would run the f16 MMA
+// kernel (generic or bounded prefill route) and reuses the reservation the allocator made for that route: the f16 K
+// region holds the int8 K, the f16 V region first stages the f16 K, then holds the f16 V. No new reservation.
+static bool ggml_cuda_flash_attn_ext_i8qk_route(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const int device = ggml_cuda_get_device();
+    const int cc     = ggml_cuda_info().devices[device].cc;
+    if (!ggml_cuda_fattn_i8qk_applies(cc, dst)) {
+        return false;
+    }
+    if (ggml_cuda_flash_attn_ext_fused(nullptr, dst, device) ||
+            ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_MMA_F16) {
+        return false;
+    }
+    const ggml_tensor * K = dst->src[1];
+
+    const ggml_cuda_fattn_bounded_plan p = ggml_cuda_fattn_bounded_prefill_plan(device, dst);
+    if (p.heads > 0) {
+        // same workspace and capture rule as ggml_cuda_flash_attn_ext_bounded_prefill
+        cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+        CUDA_CHECK(cudaStreamIsCapturing(ctx.stream(), &capture_status));
+        GGML_ASSERT(capture_status == cudaStreamCaptureStatusNone && "bounded prefill must not run inside CUDA graph capture");
+
+        ggml_cuda_pool_alloc<char> ws_pool(ctx.pool());
+        char * ws = nullptr;
+        const bool reserved = dst->buffer != nullptr && dst->view_src == nullptr && (uintptr_t) dst->data % 128 == 0 &&
+            p.offset + p.workspace <= ggml_backend_buffer_get_alloc_size(dst->buffer, dst);
+        ws = reserved ? (char *) dst->data + p.offset : ws_pool.alloc(p.workspace);
+
+        ggml_cuda_fattn_path_note("i8qk_bounded", dst, 0);
+        for (int first = 0; first < p.n_head_kv; first += p.heads) {
+            const int heads = std::min(p.heads, p.n_head_kv - first);
+            ggml_cuda_flash_attn_ext_i8qk(ctx, dst, first, heads, ws, (half *) (ws + p.kv_bytes));
+        }
+        return true;
+    }
+
+    // generic route: the f16 K/V copies reserved behind dst (both caches are quantized, see the gate); without that
+    // reservation the op keeps the f16 route rather than taking new VRAM from the pool
+    if (dst->buffer == nullptr || dst->view_src != nullptr) {
+        return false;
+    }
+    const ggml_cuda_flash_attn_ext_f16_extra_data want = ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, true, true);
+    if (want.K == 0 || want.V == 0 || want.end - (uintptr_t) dst->data > ggml_backend_buffer_get_alloc_size(dst->buffer, dst)) {
+        return false;
+    }
+    void * ws_k = (void *) want.K;
+    half * ws_v = (half *) want.V;
+    ggml_cuda_fattn_path_note("i8qk", dst, 0);
+    ggml_cuda_flash_attn_ext_i8qk(ctx, dst, 0, (int) K->ne[2], ws_k, ws_v);
+    return true;
+}
+
 static size_t ggml_cuda_fattn_generic_alloc_size(const int device, const ggml_tensor * dst, best_fattn_kernel * kernel_out) {
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
@@ -4298,6 +4351,10 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     }
 
     if (ggml_cuda_flash_attn_ext_fused(&ctx, dst, ggml_cuda_get_device())) {
+        return;
+    }
+
+    if (ggml_cuda_flash_attn_ext_i8qk_route(ctx, dst)) {
         return;
     }
 
