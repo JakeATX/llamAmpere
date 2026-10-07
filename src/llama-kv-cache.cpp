@@ -2965,6 +2965,32 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
 
     //const int64_t t_start = ggml_time_us();
 
+    // LLAMA_KQ_MASK_FAST_VERIFY=1: rebuild every fast mask with the general loop and abort on any difference, and
+    // report (at WARN, so the server prints it) how many masks took the fast path and why any did not
+    static const bool fast_verify = [] {
+        const char * e = getenv("LLAMA_KQ_MASK_FAST_VERIFY");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    static std::atomic<uint64_t> n_fast_checked{0};
+    static std::atomic<uint64_t> n_fast_fallback{0};
+
+    if (fast_verify && kq_mask_fast_enabled()) {
+        const bool shape_ok = n_stream == 1 && causal_attn && swa_type == LLAMA_SWA_TYPE_NONE && !hparams.use_alibi && n_tokens > 0;
+        bool owns = false;
+        if (shape_ok) {
+            const auto & c = v_cells.at(seq_to_stream[ubatch->seq_id[0][0]]);
+            owns = c.seq_covers_used(ubatch->seq_id[0][0]);
+        }
+        if (!shape_ok || !owns) {
+            const uint64_t n = ++n_fast_fallback;
+            if (n <= 8 || (n & (n - 1)) == 0) {
+                LLAMA_LOG_WARN("%s: KQ mask general path #%llu: n_stream = %lld, causal = %d, swa = %d, alibi = %d, n_tokens = %u, n_kv = %lld, seq owns used cells = %d\n",
+                        __func__, (unsigned long long) n, (long long) n_stream, (int) causal_attn, (int) swa_type, (int) hparams.use_alibi,
+                        n_tokens, (long long) n_kv, (int) owns);
+            }
+        }
+    }
+
     if (n_stream == 1 && causal_attn && swa_type == LLAMA_SWA_TYPE_NONE && !hparams.use_alibi && n_tokens > 0 &&
             kq_mask_fast_enabled()) {
         const llama_seq_id seq_id = ubatch->seq_id[0][0];
@@ -2981,12 +3007,7 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
                 set_input_kq_mask_seq_prefix<float>(cells, ubatch, n_kv, (float *) dst->data);
             }
 
-            // LLAMA_KQ_MASK_FAST_VERIFY=1: rebuild with the general loop and abort on any difference
-            static const bool verify = [] {
-                const char * e = getenv("LLAMA_KQ_MASK_FAST_VERIFY");
-                return e != nullptr && atoi(e) != 0;
-            }();
-            if (verify) {
+            if (fast_verify) {
                 const size_t nbytes = ggml_nbytes(dst);
                 std::vector<uint8_t> fast((const uint8_t *) dst->data, (const uint8_t *) dst->data + nbytes);
                 const args_set_input_kq_mask args = { hparams, ubatch, v_cells, seq_to_stream, n_swa, swa_type, n_kv, n_stream, n_tps };
@@ -3002,11 +3023,10 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
                                 i, n_tokens, (long long) n_kv, ubatch->pos[i]);
                     }
                 }
-                static std::atomic<uint64_t> n_checked{0};
-                const uint64_t n = ++n_checked;
+                const uint64_t n = ++n_fast_checked;
                 if ((n & (n - 1)) == 0) {
-                    LLAMA_LOG_INFO("%s: KQ mask fast path verified on %llu ubatches (n_kv = %lld, n_tokens = %u)\n",
-                            __func__, (unsigned long long) n, (long long) n_kv, n_tokens);
+                    LLAMA_LOG_WARN("%s: KQ mask fast path verified identical on %llu ubatches (this one: n_kv = %lld, n_tokens = %u; general-path masks so far: %llu)\n",
+                            __func__, (unsigned long long) n, (long long) n_kv, n_tokens, (unsigned long long) n_fast_fallback.load());
                 }
             }
             return;
