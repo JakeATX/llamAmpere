@@ -1538,9 +1538,28 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
             tmp.push_back(0);
         }
 
+        // a fatal error in the warmup (e.g. a compute buffer that cannot be allocated) fails every later decode
+        // too: report it as an init error instead of starting a context that cannot run. the context is freed, so
+        // callers take their existing "failed to create context" path
+        const auto check_warmup = [](int32_t ret, const char * what) {
+            if (ret < 0) {
+                COM_ERR("warmup %s failed, ret = %d\n", what, ret);
+                return false;
+            }
+            if (ret != 0) {
+                COM_WRN("warmup %s did not complete, ret = %d\n", what, ret);
+            }
+            return true;
+        };
+        bool warmup_ok = true;
+
         if (llama_model_has_encoder(model)) {
             common_batch batch = common_batch_get_one(lctx, tmp);
-            llama_process(lctx, LLAMA_PROCESS_TYPE_ENCODE, batch.get());
+            // an encoder warmup failure only warns (some encoder GGUFs carry special token ids it cannot run)
+            const int32_t ret = llama_process(lctx, LLAMA_PROCESS_TYPE_ENCODE, batch.get());
+            if (ret != 0) {
+                COM_WRN("warmup encode did not complete, ret = %d\n", ret);
+            }
             llama_token decoder_start_token_id = llama_model_decoder_start_token(model);
             if (decoder_start_token_id == LLAMA_TOKEN_NULL) {
                 decoder_start_token_id = bos;
@@ -1551,7 +1570,11 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         if (llama_model_has_decoder(model)) {
             tmp.resize(std::min(tmp.size(), (size_t) params.n_batch));
             common_batch batch = common_batch_get_one(lctx, tmp);
-            llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+            warmup_ok = check_warmup(llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()), "decode");
+        }
+        if (!warmup_ok) {
+            res->free_context();
+            return res;
         }
         llama_memory_clear(llama_get_memory(lctx), true);
         llama_synchronize(lctx);
@@ -1562,6 +1585,12 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
     }
 
     return res;
+}
+
+void common_init_result::free_context() {
+    pimpl->samplers.clear();
+    pimpl->samplers_seq_config.clear();
+    pimpl->context.reset();
 }
 
 common_init_result::~common_init_result() = default;
