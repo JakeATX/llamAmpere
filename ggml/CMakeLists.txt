@@ -204,7 +204,7 @@ option(GGML_CUDA_FORCE_CUBLAS               "ggml: always use cuBLAS instead of 
 option(GGML_CUDA_NO_PEER_COPY               "ggml: do not use peer to peer copies"            OFF)
 option(GGML_CUDA_NO_VMM                     "ggml: do not try to use CUDA VMM"                OFF)
 option(GGML_CUDA_FA                         "ggml: compile ggml FlashAttention CUDA kernels"  ON)
-option(GGML_KVARN_FUSED_ROT                  "ggml: KVarN Q/output rotation inside the FA node (env GGML_KVARN_FUSED_ROT overrides)" ON)
+option(GGML_KVARN_FUSED_ROT                  "ggml: KVarN Q/output rotation inside the FA node (env GGML_KVARN_FUSED_ROT overrides)" OFF)
 option(GGML_CUDA_FA_ALL_QUANTS              "ggml: compile all quants for FlashAttention"     OFF)
 set   (GGML_CUDA_FA_QUANTS "q4_0-q4_0;q8_0-q8_0;f16-f16;bf16-bf16;f16-q8_0;q8_0-f16;bf16-q8_0;q8_0-bf16" CACHE STRING
                                             "ggml: FlashAttention K-V type combinations to compile, \"all\" or a list such as \"q8_0-q8_0;q8_0-q4_0\"")
