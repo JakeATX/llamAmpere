@@ -148,38 +148,16 @@ static __device__ __forceinline__ float kvarn_rot256_block(float x, const int ti
     return __fmul_rn(x, 0.0625f);
 }
 
-// Q prologue of the stream decode kernels: rotate rows (row r = (query row nt, head column hc)) into the 256-float
-// output slots this block owns and writes only at its end, so the kernel body reads the rotated Q from there.
-// Q rows need 16-byte alignment (checked on the host). Ends with __syncthreads.
-static __device__ __forceinline__ void kvarn_rot256_q_to_slots(
-        const char * __restrict__ Q, float * __restrict__ dst, const int n_q, const int gqa, const int head0, const int ne02,
-        const int nb01, const int nb02, const int lane, const int warp, const int nwarps) {
-    for (int r = warp; r < n_q*gqa; r += nwarps) {
-        const int nt = r / gqa, hc = r % gqa;
-        const float4 * src = (const float4 *) (Q + (size_t) nt*nb01 + (size_t) (head0 + hc)*nb02) + 2*lane;
-        float x[8];
-        {
-            const float4 a = src[0], b = src[1];
-            x[0] = a.x; x[1] = a.y; x[2] = a.z; x[3] = a.w;
-            x[4] = b.x; x[5] = b.y; x[6] = b.z; x[7] = b.w;
-        }
-        kvarn_rot256_row8(x, lane);
-        float4 * out = (float4 *) (dst + ((size_t) (nt*ne02 + head0 + hc)*gridDim.y + blockIdx.y)*256) + 2*lane;
-        out[0] = make_float4(x[0], x[1], x[2], x[3]);
-        out[1] = make_float4(x[4], x[5], x[6], x[7]);
-    }
-    __syncthreads();
-}
-
-// host: Q rows readable as float4 (the stream kernels' Q prologue)
+// host: Q rows readable as float2 / float4 (the tile kernel's rotating Q load)
 static inline bool ggml_cuda_fattn_kvarn_rot_q_aligned(const ggml_tensor * Q) {
     return ((uintptr_t) Q->data % 16) == 0 && Q->nb[1] % 16 == 0 && Q->nb[2] % 16 == 0 && Q->nb[0] == sizeof(float);
 }
 
 // Q pre-pass of the stream decode kernels (rot builds rotate only the output): H256/16 of every Q row into q_rot
 // (ggml_nelements(Q) floats, contiguous); *q2 becomes a copy of Q that points at it. Same butterfly as above, so the
-// kernel sees the same rotated Q values; its Q loads stay on the read-only path (the in-kernel prologue had to re-read
-// Q from the output slots it wrote, plain LDG instead of LDG.CONSTANT).
+// kernel sees the same rotated Q values; its Q loads stay on the read-only path. (An in-kernel prologue that wrote the
+// rotated rows into the block's output slots and re-read them per record cost +13.8% kernel time in the 4/4 stream
+// kernel at 100K: plain LDG instead of LDG.E.CONSTANT.)
 void ggml_cuda_kvarn_rot256_q_pass(ggml_backend_cuda_context & ctx, const ggml_tensor * Q, float * q_rot, ggml_tensor * q2);
 
 // Separate-pass rotation around any KVarN path (fattn-kvarn-rot.cu): Q is rotated into a pool buffer, run(ctx, dst')

@@ -143,9 +143,10 @@ static void ggml_cuda_lowbits_case(ggml_backend_cuda_context & ctx, ggml_tensor 
 
 void ggml_cuda_flash_attn_kvarn_lowbits(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
-// [#139] fused Q / output rotation: the tile build (Ampere table: one 128-half2 combine batch at 8x8 columns), the
-// word-load trellis build and the width kernel rotate in-kernel; the 4/4 trellis4 body, the byte-load trellis build,
-// logit softcap and other MMA tables take the separate passes around this same dispatch.
+// [#139] fused Q / output rotation: the tile build (Ampere table: one 128-half2 combine batch at 8x8 columns) and the
+// word-load trellis build rotate in-kernel, the width kernel takes a Q pre-pass and rotates its output in-kernel; the
+// 4/4 trellis4 body, the byte-load trellis build, logit softcap and other MMA tables take the separate passes around
+// this same dispatch.
 template<int bits_k, int bits_v>
 static void ggml_cuda_lowbits_case_rot(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     if (!ggml_cuda_fattn_kvarn_rot(dst)) {
