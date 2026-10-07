@@ -876,6 +876,136 @@ static __device__ __forceinline__ void flash_attn_ext_tq6_load_tile(
     }
 }
 
+// FA66 tq6 loader (matched tq6_0/tq6_0 turbo path). Bit-identical to flash_attn_ext_tq6_load_tile.
+//
+// Work split: one lane decodes eight consecutive values (four half2, one uint4) per chunk, so the sixteen lanes of a
+// half-warp cover exactly one 128-value block of one row and share its norm. That makes a pre-scaled fp16 table
+// possible: lane l of the half-warp holds half2(rn(c[32+l]*norm), rn(c[48+l]*norm)) (the 32 positive magnitudes;
+// c[63-i] == -c[i]) and a lookup is one width-16 __shfl_sync plus a byte select. rn(-x) == -rn(x) and the products
+// are the same fp32 c*norm products the shuffle loader rounded, so the tile is bit-identical.
+//
+// Latency: all packed words of the tile are loaded up front (fully unrolled, compile-time trip count) before any
+// decode, so one tile costs about one memory latency instead of one per loop iteration.
+//
+// Code layout: value v of a chunk (v = 0..7) has its low nibble in qs byte v/2 nibble v&1 and its 2 high bits at
+// bits 2v..2v+1 of the chunk's 16-bit qh word. Index i (6 bits): i >= 32 -> +c[i] = +T[i-32], i < 32 -> -T[31-i].
+// m = (i ^ (i >= 32 ? 0 : 31)) & 31 is the magnitude index, the shuffle source lane is m & 15 (width 16 uses only
+// bits 0..3 of the source lane) and bit 4 of m picks the half of the half2.
+static __device__ __forceinline__ uint32_t fa66_tq6_quad(const uint32_t q_spread, const uint32_t h8) {
+    // q_spread: bytes [b0,b0,b1,b1] of the two qs bytes of this quad; h8: the qh byte of this quad (2 bits per value)
+    const uint32_t lo = (q_spread & 0x000F000Fu) | ((q_spread >> 4) & 0x0F000F00u);              // low nibbles
+    const uint32_t hi = (((h8 & 0x33u) * 0x00010010u) | ((h8 & 0xCCu) * 0x00400400u)) & 0x30303030u; // bits 4-5
+    return lo | hi;                                                                                  // 4 x idx
+}
+
+static __device__ __forceinline__ uint2 fa66_tq6_lookup4(const uint32_t I, const half2 T2) {
+    const uint32_t NP  = (~I >> 5) & 0x01010101u;      // 1 where the value is negative (i < 32)
+    const uint32_t M   = (I ^ (NP * 0x1Fu)) & 0x1F1F1F1Fu; // magnitude index per byte
+    const uint32_t S80 = NP << 7;                       // 0x80 in the bytes of negative values
+    const uint32_t Hs  = (M >> 3) & 0x02020202u;        // 2 where m >= 16 (high half of the table entry)
+    const uint32_t sel01 = (Hs & 0xFFFFu) * 0x11u + 0x5410u;
+    const uint32_t sel23 = (Hs >> 16)     * 0x11u + 0x5410u;
+    uint32_t T;
+    memcpy(&T, &T2, sizeof(T)); // half2 bits
+    const uint32_t t0 = __shfl_sync(0xFFFFFFFF, T, (int) (M      ), 16);
+    const uint32_t t1 = __shfl_sync(0xFFFFFFFF, T, (int) (M >>  8), 16);
+    const uint32_t t2 = __shfl_sync(0xFFFFFFFF, T, (int) (M >> 16), 16);
+    const uint32_t t3 = __shfl_sync(0xFFFFFFFF, T, (int) (M >> 24), 16);
+    uint2 r;
+    r.x = __byte_perm(t0, t1, sel01) ^ __byte_perm(S80, 0u, 0x1404); // sign of value 0 -> bit 15, value 1 -> bit 31
+    r.y = __byte_perm(t2, t3, sel23) ^ __byte_perm(S80, 0u, 0x3424);
+    return r;
+}
+
+// Load group size (chunks loaded before any is decoded). 0 = auto: 8 when a tile takes >= 16 chunks per thread
+// (ncols1 1-2), else 4: the wider tiles' accumulators leave less register room (group 8 spilled 40..440 B there).
+#ifndef GGML_CUDA_FA66_GROUP
+#define GGML_CUDA_FA66_GROUP 0
+#endif
+template<int stride_tile, bool swz, int nbatch_fa, int nthreads, int D2, bool oob_check, bool stream_loads>
+static __device__ __forceinline__ void flash_attn_ext_tq6_load_tile_fa66(
+        const char * const __restrict__ KV_raw, half2 * const __restrict__ tile_KV,
+        const int stride_bytes, const int col_offset, const int i_sup) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    static_assert(warp_size == 32, "FA66 tq6 loader assumes 32-lane warps");
+    const int tid  = threadIdx.y * warp_size + threadIdx.x;
+    const int l16  = threadIdx.x & 15;
+    constexpr int half2_per_chunk = 4;                   // eight values
+    static_assert(D2 % (QK_TQ6/2) == 0, "D2 must be whole tq6 blocks");
+    constexpr int chunks_per_row = D2 / half2_per_chunk; // 16 per block
+    constexpr int nchunks = nbatch_fa * chunks_per_row;
+    static_assert(nthreads % warp_size == 0 && nchunks % nthreads == 0, "every lane must reach the shuffles");
+    constexpr int niter = nchunks / nthreads;
+
+    const float mag_lo = TQ6_CENTROIDS[32 + l16];
+    const float mag_hi = TQ6_CENTROIDS[48 + l16];
+
+    // Loads are issued in groups of `group` chunks (all loads of a group before any decode of it): one memory latency
+    // per group, and a bounded register footprint at the narrow widths where niter is largest.
+    constexpr int group_max = GGML_CUDA_FA66_GROUP > 0 ? GGML_CUDA_FA66_GROUP : (niter >= 16 ? 8 : 4);
+    constexpr int group = niter < group_max ? niter : group_max;
+    static_assert(niter % group == 0, "niter must be a multiple of the load group");
+
+#pragma unroll 1
+    for (int it0 = 0; it0 < niter; it0 += group) {
+    uint32_t qsw[group];
+    uint32_t hnw[group]; // qh word (bits 0..15) | norm bits (16..31)
+#pragma unroll
+    for (int ig = 0; ig < group; ++ig) {
+        const int linear = tid + (it0 + ig)*nthreads;
+        const int row = linear / chunks_per_row;
+        const int col = (linear - row*chunks_per_row) * half2_per_chunk;
+        qsw[ig] = 0; hnw[ig] = 0;
+        if (!(oob_check && row >= i_sup)) {
+            const int j0 = 2*(col_offset + col);            // first of eight values, multiple of 8
+            const block_tq6_0 * blk = (const block_tq6_0 *) (KV_raw + (int64_t) row * stride_bytes) + j0 / QK_TQ6;
+            const int in_blk = j0 % QK_TQ6;
+            const uint16_t * qsp = (const uint16_t *) (blk->qs + in_blk/2); // 2-byte aligned
+            const uint16_t * qhp = (const uint16_t *) (blk->qh + in_blk/4);
+            const uint16_t * nrp = (const uint16_t *) &blk->norm;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+            if constexpr (stream_loads) {
+                qsw[ig] = __byte_perm((uint32_t) __ldcs(qsp), (uint32_t) __ldcs(qsp + 1), 0x5410);
+                hnw[ig] = __byte_perm((uint32_t) __ldcs(qhp), (uint32_t) __ldcs(nrp),     0x5410);
+            } else
+#endif
+            {
+                qsw[ig] = __byte_perm((uint32_t) qsp[0], (uint32_t) qsp[1], 0x5410);
+                hnw[ig] = __byte_perm((uint32_t) qhp[0], (uint32_t) nrp[0], 0x5410);
+            }
+        }
+    }
+
+#pragma unroll
+    for (int ig = 0; ig < group; ++ig) {
+        const int linear = tid + (it0 + ig)*nthreads;
+        const int row = linear / chunks_per_row;
+        const int col = (linear - row*chunks_per_row) * half2_per_chunk;
+        const float norm = __half2float(__ushort_as_half((unsigned short) (hnw[ig] >> 16)));
+        const half2 T2 = __floats2half2_rn(mag_lo * norm, mag_hi * norm);
+        const uint32_t q = qsw[ig];
+        const uint2 a = fa66_tq6_lookup4(fa66_tq6_quad(__byte_perm(q, 0u, 0x1100), hnw[ig]        & 0xFFu), T2);
+        const uint2 b = fa66_tq6_lookup4(fa66_tq6_quad(__byte_perm(q, 0u, 0x3322), (hnw[ig] >> 8) & 0xFFu), T2);
+        uint4 decoded = make_uint4(a.x, a.y, b.x, b.y);
+        if (oob_check && row >= i_sup) {
+            decoded = uint4{};
+        }
+        turbo_store_u4<stride_tile, swz>(tile_KV, row, col, decoded);
+    }
+    }
+}
+
+// Turbo-path tq6 tile loader (K and V of every tq6_0 pair on the compressed MMA path). 1 = the FA66 loader (default),
+// 0 = the previous shuffle loader. Both write identical tiles.
+#ifndef GGML_CUDA_FA66_TQ6_LOADER
+#define GGML_CUDA_FA66_TQ6_LOADER 1
+#endif
+#if GGML_CUDA_FA66_TQ6_LOADER
+#define FA66_TQ6_LOADER flash_attn_ext_tq6_load_tile_fa66
+#else
+#define FA66_TQ6_LOADER flash_attn_ext_tq6_load_tile
+#endif
+
 static __constant__ float TURBO_CENTROIDS_3BIT_FATTN[8] = {
     -0.190207f, -0.118786f, -0.066822f, -0.021663f,
      0.021663f,  0.066822f,  0.118786f,  0.190207f
@@ -1513,11 +1643,16 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_mask(
 // K staging: a q8_0 / tq6_0 / tq5_0 K tile is staged under turbo3 / q8_0 / turbo4 / tq5_0 V of the D=256 GQA-packed
 // instances. tq6_0 V is left out: K-only staging under it measured -0.5% at 100K in two runs (tq5_0 V: +1.8..1.9%).
 // q5_1 V (SLOWKV q8_0/q5_1 only) gets K-only staging like tq5_0 V; not measured separately.
+// FA66: matched tq6_0/tq6_0 staging (0 = none as before, 1 = K only, 2 = K and V).
+#ifndef GGML_CUDA_FA66_STAGE
+#define GGML_CUDA_FA66_STAGE 0
+#endif
 template<int DKQ, int DV, int ncols2, ggml_type type_K, ggml_type type_V>
 static constexpr __host__ __device__ bool ggml_cuda_fattn_turbo_stage() {
     return GGML_CUDA_TURBO_STAGE && (type_K == GGML_TYPE_Q8_0 || type_K == GGML_TYPE_TQ6_0 || type_K == GGML_TYPE_TQ5_0) &&
         (type_V == GGML_TYPE_TURBO3_0 || type_V == GGML_TYPE_Q8_0 || type_V == GGML_TYPE_TURBO4_0 ||
-         type_V == GGML_TYPE_TQ5_0 || (type_V == GGML_TYPE_Q5_1 && type_K == GGML_TYPE_Q8_0)) &&
+         type_V == GGML_TYPE_TQ5_0 || (type_V == GGML_TYPE_Q5_1 && type_K == GGML_TYPE_Q8_0) ||
+         (GGML_CUDA_FA66_STAGE >= 1 && type_K == GGML_TYPE_TQ6_0 && type_V == GGML_TYPE_TQ6_0)) &&
         ncols2 > 1 && DKQ == 256 && DV == 256;
 }
 // V staging: only turbo3 / q8_0 / turbo4 V tiles. tq5_0 V stays unstaged: its streaming tile loader already
@@ -1526,7 +1661,8 @@ static constexpr __host__ __device__ bool ggml_cuda_fattn_turbo_stage() {
 template<int DKQ, int DV, int ncols2, ggml_type type_K, ggml_type type_V>
 static constexpr __host__ __device__ bool ggml_cuda_fattn_turbo_stage_v() {
     return ggml_cuda_fattn_turbo_stage<DKQ, DV, ncols2, type_K, type_V>() &&
-        (type_V == GGML_TYPE_TURBO3_0 || type_V == GGML_TYPE_Q8_0 || type_V == GGML_TYPE_TURBO4_0);
+        (type_V == GGML_TYPE_TURBO3_0 || type_V == GGML_TYPE_Q8_0 || type_V == GGML_TYPE_TURBO4_0 ||
+         (GGML_CUDA_FA66_STAGE >= 2 && type_K == GGML_TYPE_TQ6_0 && type_V == GGML_TYPE_TQ6_0));
 }
 // packed K row bytes: q8_0 272 B (16-byte aligned rows), tq6_0 196 B / tq5_0 164 B (only 4-byte aligned per head)
 template<int DKQ, ggml_type type_K>
@@ -1810,7 +1946,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                         (K_raw, tile_K, k0_diff, stride_K, k0_start, k_VKQ_sup);
                 }
             } else if constexpr (type_K == GGML_TYPE_TQ6_0) {
-                flash_attn_ext_tq6_load_tile<stride_tile_K, swz, nbatch_fa, nthreads_turbo, DKQ/2, oob_check, !turbo_stage>
+                FA66_TQ6_LOADER<stride_tile_K, swz, nbatch_fa, nthreads_turbo, DKQ/2, oob_check, !turbo_stage>
                     (K_raw, tile_K, K_pitch, k0_start, k_VKQ_sup);
             } else if constexpr (type_K == GGML_TYPE_TQ5_0) {
                 flash_attn_ext_tq5_load_tile<stride_tile_K, swz, nbatch_fa, nthreads_turbo, DKQ/2, oob_check, !turbo_stage>
@@ -2248,7 +2384,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                         (V_raw, tile_V, i0_diff/2, stride_V, i0_start/2, k_VKQ_sup);
                 }
             } else if constexpr (type_V == GGML_TYPE_TQ6_0) {
-                flash_attn_ext_tq6_load_tile<stride_tile_V, swz, nbatch_fa, nthreads_turbo, DV/2, oob_check, !turbo_stage_v>
+                FA66_TQ6_LOADER<stride_tile_V, swz, nbatch_fa, nthreads_turbo, DV/2, oob_check, !turbo_stage_v>
                     (V_raw, tile_V, V_pitch, i0_start/2, k_VKQ_sup);
             } else if constexpr (type_V == GGML_TYPE_TQ5_0) {
                 flash_attn_ext_tq5_load_tile<stride_tile_V, swz, nbatch_fa, nthreads_turbo, DV/2, oob_check, !turbo_stage_v>

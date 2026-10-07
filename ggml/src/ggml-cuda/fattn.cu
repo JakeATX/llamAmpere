@@ -2704,6 +2704,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
 // SLOWKV: fused routes for the non-default D256 KV pairs on sm86 (GGML_VL_AT_Q5G6 keeps tq5_0/turbo4 alone).
 // GGML_SLOWKV picks the pairs:
 //   unset, empty or "0" = off (routing and kernels exactly as before); "1" or "all" = all four;
+//   tq6_0/tq6_0 is always on since FA66 (see ggml_cuda_fattn_slowkv_pair);
 //   otherwise a comma list of q8 (q8_0/q8_0), turbo4 (turbo4_0/turbo4_0), tq6 (tq6_0/tq6_0), q5_1 (q8_0 K / q5_1 V).
 // Routes per pair:
 //   - width 5, GQA 6 (compact_applies): the compact tile, 5 queries x 6 heads in the 32-column (4,8) tile (see
@@ -2757,6 +2758,11 @@ static int ggml_cuda_fattn_slowkv_pairs() {
 }
 
 static bool ggml_cuda_fattn_slowkv_pair(const ggml_type type_K, const ggml_type type_V) {
+    // FA66: matched tq6_0/tq6_0 (the MTP drafter cache under a KVarN 4/4 trunk) takes the fused SLOWKV tiles at widths
+    // 5-8 by default, independent of GGML_SLOWKV (the "tq6" entry is kept and is now a no-op).
+    if (type_K == GGML_TYPE_TQ6_0 && type_V == GGML_TYPE_TQ6_0) {
+        return true;
+    }
     const int pairs = ggml_cuda_fattn_slowkv_pairs();
     if (pairs == 0) {
         return false;
