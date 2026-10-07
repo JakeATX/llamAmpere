@@ -4263,7 +4263,10 @@ static bool ggml_cuda_fattn_kvarn_rot_in_kernel(ggml_backend_cuda_context & ctx,
         return false;
     }
     GGML_UNUSED(ctx);
-    return false;
+    // 4/4: the stream decode kernel (fattn-kvarn-stream.cuh) through ggml_cuda_flash_attn_ext_kvarn_direct_impl
+    static const int stream_max = getenv("GGML_KVARN_DIRECT_STREAM_MAX") != nullptr
+                                ? atoi(getenv("GGML_KVARN_DIRECT_STREAM_MAX")) : 8; // same default as fattn-kvarn-direct.cuh
+    return Q->ne[1] <= 8 && Q->ne[1] <= stream_max && Q->ne[1] < 128 && ggml_cuda_flash_attn_ext_kvarn_direct_supported(dst);
 }
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

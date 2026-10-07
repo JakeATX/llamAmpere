@@ -6,6 +6,7 @@
 #include "turbo-quant.cuh"
 #include "fattn-query-layout.cuh"
 #include "ledger.cuh"
+#include "fattn-kvarn-rot.cuh"
 
 #include <cstdint>
 
@@ -1598,7 +1599,7 @@ static __global__ void flash_attn_stream_k_fixup_general(
     *dst = dst_val / rowsum;
 }
 
-template<int D> // D == head size
+template<int D, bool rot = false> // D == head size; rot: [#139] KVarN fused output rotation of the final row
 __launch_bounds__(D, 1)
 static __global__ void flash_attn_combine_results(
         const float  * __restrict__ VKQ_parts,
@@ -1648,6 +1649,12 @@ static __global__ void flash_attn_combine_results(
         VKQ_denominator += KQ_max_scale * meta[l].y;
     }
 
+    if constexpr (rot) {
+        static_assert(D == 256, "plain H256");
+        __shared__ float rot_buf[D];
+        dst[tid] = kvarn_rot256_block(VKQ_numerator / VKQ_denominator, tid, rot_buf);
+        return;
+    }
     dst[tid] = VKQ_numerator / VKQ_denominator;
 }
 
@@ -1681,6 +1688,7 @@ void launch_fattn(
     const bool output_partial = partial_dst != nullptr;
     GGML_ASSERT(output_partial == (partial_meta != nullptr));
     GGML_ASSERT(!output_partial || !stream_k);
+    GGML_ASSERT(!ggml_cuda_fattn_kvarn_rot(KQV) || (!stream_k && !output_partial)); // [#139] combine_results rotates
 
     GGML_ASSERT(Q->type == GGML_TYPE_F32);
     GGML_ASSERT(KQV->type == GGML_TYPE_F32);
@@ -2048,9 +2056,19 @@ void launch_fattn(
         const dim3 blocks_num_combine(Q->ne[1], Q->ne[2], Q->ne[3]);
         const size_t nbytes_shared_combine = parallel_blocks*sizeof(float2);
 
+        if (ggml_cuda_fattn_kvarn_rot(KQV)) { // [#139] the KVarN stream kernel rotated Q; the combine rotates the output
+            if constexpr (DV == 256) {
+                flash_attn_combine_results<DV, true>
+                    <<<blocks_num_combine, block_dim_combine, nbytes_shared_combine, main_stream>>>
+                    (dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks);
+            } else {
+                GGML_ABORT("KVarN fused rotation needs DV == 256");
+            }
+        } else {
         flash_attn_combine_results<DV>
             <<<blocks_num_combine, block_dim_combine, nbytes_shared_combine, main_stream>>>
             (dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks);
+        }
     }
     CUDA_CHECK(cudaGetLastError());
 }
