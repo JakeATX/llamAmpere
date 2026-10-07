@@ -1,7 +1,10 @@
 #include "models.h"
+#include "llama-impl.h"
 #include "llama-kv-cache.h"
 #include "llama-memory-recurrent.h"
 #include "llama-mtp-chain-sample.h"
+
+#include <atomic>
 
 // Output-row gather indices, or nullptr when every row is an output (decode, speculative verify,
 // MTP drafts): the gather would then be an identity copy. The graph topology still depends only on
@@ -677,8 +680,24 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
 
     res->add_input(std::move(inp));
 
+    // [#91] a decode without output rows (the MTP catch-up update) only has to store the MTP layer's K/V;
+    // its query, attention, FFN and head are never read. LLAMA_MTP_UPDATE_KV_ONLY=1 builds that KV-only graph.
+    // An unmasked nextn-embedding read copies every row even without outputs, so it keeps the full graph.
+    static const bool update_kv_only = [] {
+        const char * value = getenv("LLAMA_MTP_UPDATE_KV_ONLY");
+        return value != nullptr && strcmp(value, "1") == 0;
+    }();
+    const bool kv_only = update_kv_only && n_outputs == 0 && !cparams.mtp_chain && !cparams.embeddings &&
+        (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked);
+    if (kv_only) {
+        static std::atomic_flag noted = ATOMIC_FLAG_INIT;
+        if (!noted.test_and_set()) {
+            LLAMA_LOG_INFO("%s: MTP update builds the KV-only graph (LLAMA_MTP_UPDATE_KV_ONLY)\n", __func__);
+        }
+    }
+
     ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = qwen35_build_inp_out_ids(*this);
+    ggml_tensor * inp_out_ids = kv_only ? nullptr : qwen35_build_inp_out_ids(*this);
 
     auto * inp_attn = build_attn_inp_kv();
 
@@ -988,6 +1007,12 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     Kcur = ggml_rope_multi(ctx0, Kcur, inp_pos, nullptr,
             n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
             ext_factor, attn_factor, beta_fast, beta_slow);
+
+    if (kv_only) {
+        // the Q/gate nodes built above are not expanded, so they drop out of the graph
+        build_attn_store(inp_attn, Kcur, Vcur, il);
+        return;
+    }
 
     cur = build_attn(inp_attn,
             nullptr, nullptr, nullptr,
