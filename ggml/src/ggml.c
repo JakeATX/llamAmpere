@@ -4208,6 +4208,18 @@ struct ggml_tensor * ggml_set_rows_tq6_rotated(
     return result;
 }
 
+// KVarN fused write rotation (llamAmpere #139): see ggml.h
+struct ggml_tensor * ggml_set_rows_kvarn_rot(
+        struct ggml_context * ctx, struct ggml_tensor * a,
+        struct ggml_tensor * b, struct ggml_tensor * c, int group) {
+    GGML_ASSERT(a->type == GGML_TYPE_TQ6_0 && b->type == GGML_TYPE_F32);
+    GGML_ASSERT((group == 256 || group == 128) && b->ne[0] % group == 0);
+    GGML_ASSERT(b->nb[0] == sizeof(float));
+    struct ggml_tensor * result = ggml_set_rows(ctx, a, b, c);
+    ggml_set_op_params_i32(result, 1, group == 256 ? GGML_SET_ROWS_KVARN_ROT256 : GGML_SET_ROWS_KVARN_ROT128);
+    return result;
+}
+
 // ggml_diag
 
 struct ggml_tensor * ggml_diag(

@@ -1786,6 +1786,21 @@ extern "C" {
             struct ggml_tensor  * b,  // source
             struct ggml_tensor  * c); // row indices
 
+    // KVarN fused write rotation (llamAmpere #139, GGML_KVARN_FUSED_ROT): like ggml_set_rows_tq6_rotated,
+    // but the op first applies the KVarN rotation to every group of src elements, so the graph needs no
+    // separate GGML_OP_TURBO_WHT on K/V. group 256 = plain orthonormal Sylvester H_256 (KVarN body),
+    // group 128 = the signed turbo WHT (turbo4 body). The stored bytes equal
+    // ggml_set_rows_tq6_rotated(a, ggml_turbo_wht(b, 0, group, NULL), c). dst must be TQ6_0, src F32.
+    // A f16 sink mirror (op_params 2/3) receives the rotated rows, as on the unfused path.
+#define GGML_SET_ROWS_KVARN_ROT256 2
+#define GGML_SET_ROWS_KVARN_ROT128 3
+    GGML_API struct ggml_tensor * ggml_set_rows_kvarn_rot(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,  // destination (TQ6_0)
+            struct ggml_tensor  * b,  // source (F32, ne0 % group == 0)
+            struct ggml_tensor  * c,  // row indices
+            int                   group);
+
     // TQ6 packing in the input basis, without WHT or InnerQ (CPU and CUDA).
     GGML_API struct ggml_tensor * ggml_set_rows_tq6_rotated(
             struct ggml_context * ctx, struct ggml_tensor * a,

@@ -253,6 +253,9 @@ public:
     //
     bool is_kvarn() const { return kvarn.enabled(); }
     const llama_kvarn_config & get_kvarn() const { return kvarn; }
+    // KVarN fused write rotation (#139): cpy_k/cpy_v rotate K/V inside the TQ6_0 cache write
+    bool kvarn_fused_rot() const { return kvarn_fused_rot_on; }
+    int  kvarn_rot_group() const { return kvarn.body_type == GGML_TYPE_TURBO4_0 ? 128 : 256; }
     ggml_tensor * get_kvarn_body(int32_t il) const;
     bool maintain_kvarn(llama_context * lctx);
     int32_t compress_kvarn_idle(llama_context * lctx, llama_seq_id seq_id, llama_pos accepted_end);
@@ -362,6 +365,7 @@ private:
     uint32_t kvarn_cap           = 0; // ring rows
     uint32_t kvarn_n_groups      = 0; // records per head in the pool
     uint32_t kvarn_n_groups_seal = 0; // static per-ubatch seal launch size
+    bool     kvarn_fused_rot_on  = false; // #139, see kvarn_fused_rot()
     size_t   kvarn_rec_bytes[2]  = {0, 0}; // per tier (0 interior, 1 edge)
     uint32_t kvarn_n_layers_edge = 0;      // cache layers on tier 1 (first + last edge_layers)
     uint32_t kvarn_B      = 0;        // sealed end
@@ -592,6 +596,7 @@ public:
     bool is_kvarn() const;
     ggml_tensor * get_kvarn_body(int32_t il) const;
     const llama_kvarn_config & get_kvarn() const;
+    bool kvarn_fused_rot() const; // #139: the cache write rotates K/V (graph skips its K/V WHT)
     ggml_tensor * build_input_kvarn_desc(ggml_context * ctx) const;
     void set_input_kvarn_desc(ggml_tensor * dst, const llama_ubatch * ubatch, int tier = 0) const;
     int get_kvarn_layer_tier(int32_t il, uint32_t & bits_k, uint32_t & bits_v) const;
