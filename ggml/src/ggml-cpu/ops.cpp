@@ -5587,12 +5587,19 @@ static void ggml_compute_forward_set_rows_impl(
     }
 }
 
+// KVarN fused write rotation (#139), defined beside the turbo WHT below
+static bool ggml_compute_forward_set_rows_kvarn_rot(const ggml_compute_params * params, ggml_tensor * dst);
+
 void ggml_compute_forward_set_rows(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
 
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
+
+    if (ggml_compute_forward_set_rows_kvarn_rot(params, dst)) {
+        return;
+    }
 
     switch (src0->type) {
         case GGML_TYPE_F32:
@@ -12154,6 +12161,92 @@ void ggml_compute_forward_turbo_wht(
         case GGML_TYPE_F32: ggml_compute_forward_turbo_wht_f32(params, dst); break;
         default: GGML_ABORT("fatal error");
     }
+}
+
+// KVarN fused write rotation (llamAmpere #139, GGML_KVARN_FUSED_ROT): SET_ROWS into TQ6_0 that first applies
+// the forward KVarN rotation per group (the exact arithmetic of ggml_compute_forward_turbo_wht_f32 with
+// direction 0 and no InnerQ), then packs in the rotated basis like ggml_set_rows_tq6_rotated, including the
+// f16 sink semantics of ggml_compute_forward_set_rows_impl. Returns false when dst is not this op.
+template <typename idx_t>
+static void ggml_compute_forward_set_rows_kvarn_rot_impl(const ggml_compute_params * params, ggml_tensor * dst, int group) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_TQ6_0);
+    GGML_ASSERT(ne00 % group == 0 && nb00 == sizeof(float));
+
+    const int64_t nc = ne00;
+    const int64_t nr = ne01;
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+    const int64_t dr  = (nr + nth - 1)/nth;
+    const int64_t ir0 = dr*ith;
+    const int64_t ir1 = std::min(ir0 + dr, nr);
+
+    const float inv_sqrt = 1.0f / sqrtf((float)group);
+    std::vector<float> rot(nc);
+
+    for (int64_t i03 = 0; i03 < ne03; ++i03) {
+        for (int64_t i02 = 0; i02 < ne02; ++i02) {
+            for (int64_t i = ir0; i < ir1; ++i) {
+                const int64_t i12 = i03%ne12;
+                const int64_t i11 = i02%ne11;
+                const int64_t i10 = i;
+
+                const int64_t i1 = *(idx_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
+                GGML_ASSERT(i1 >= 0 && i1 < ne1);
+
+                const float * in = (const float *) ((const char *) src0->data + i*nb01 + i02*nb02 + i03*nb03);
+                for (int64_t base = 0; base < nc; base += group) {
+                    float * x = rot.data() + base;
+                    for (int k = 0; k < group; k++) x[k] = in[base + k];
+                    if (group != 256) {
+                        for (int k = 0; k < group; k++) x[k] *= turbo_wht_s1[k];
+                    }
+                    for (int h = 1; h < group; h *= 2) {
+                        for (int k0 = 0; k0 < group; k0 += h * 2) {
+                            for (int k = k0; k < k0 + h; k++) {
+                                float a = x[k], b = x[k + h];
+                                x[k] = a + b;
+                                x[k + h] = a - b;
+                            }
+                        }
+                    }
+                    for (int k = 0; k < group; k++) {
+                        x[k] = x[k] * inv_sqrt * (group != 256 ? turbo_wht_s2[k] : 1.0f);
+                    }
+                }
+
+                const int sink = ggml_get_op_params_i32(dst, 2);
+                if (sink > 0 && i1 < sink) {
+                    GGML_ASSERT(ne02 == 1 && ne03 == 1);
+                    const size_t offset = (size_t) ggml_get_op_params_i32(dst, 3)*nb1;
+                    GGML_ASSERT(offset + (size_t) sink*nc*sizeof(ggml_fp16_t) <= ggml_nbytes(dst));
+                    ggml_fp32_to_fp16_row(rot.data(), (ggml_fp16_t *) ((char *) dst->data + offset) + i1*nc, nc);
+                    continue;
+                }
+
+                quantize_row_tq6_0_rotated_ref(rot.data(), (block_tq6_0 *) ((char *) dst->data + i1*nb1 + i02*nb2 + i03*nb3), nc);
+            }
+        }
+    }
+}
+
+static bool ggml_compute_forward_set_rows_kvarn_rot(const ggml_compute_params * params, ggml_tensor * dst) {
+    const int32_t mode = ggml_get_op_params_i32(dst, 1);
+    if (mode != GGML_SET_ROWS_KVARN_ROT256 && mode != GGML_SET_ROWS_KVARN_ROT128) {
+        return false;
+    }
+    const int group = mode == GGML_SET_ROWS_KVARN_ROT256 ? 256 : 128;
+    if (dst->src[1]->type == GGML_TYPE_I64) {
+        ggml_compute_forward_set_rows_kvarn_rot_impl<int64_t>(params, dst, group);
+    } else {
+        ggml_compute_forward_set_rows_kvarn_rot_impl<int32_t>(params, dst, group);
+    }
+    return true;
 }
 
 // ggml_compute_forward_rwkv_wkv7

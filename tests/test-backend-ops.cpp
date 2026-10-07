@@ -2982,8 +2982,12 @@ struct test_set_rows_tq6 : public test_case {
     const int r;       // rows to write
     const bool already_rotated;
     const bool f16_sink;
+    const int  kvarn_rot; // #139: 0, or the KVarN rotation group fused into the write (ggml_set_rows_kvarn_rot)
 
     std::string vars() override {
+        if (kvarn_rot) {
+            return VARS_TO_STR7(type_idx, ne0, ne1, r, already_rotated, f16_sink, kvarn_rot);
+        }
         return VARS_TO_STR6(type_idx, ne0, ne1, r, already_rotated, f16_sink);
     }
 
@@ -2993,8 +2997,8 @@ struct test_set_rows_tq6 : public test_case {
     }
 
     test_set_rows_tq6(ggml_type type_idx = GGML_TYPE_I32,
-            int64_t ne0 = 128, int64_t ne1 = 8, int r = 4, bool already_rotated = false, bool f16_sink = false)
-        : type_idx(type_idx), ne0(ne0), ne1(ne1), r(r), already_rotated(already_rotated), f16_sink(f16_sink) {}
+            int64_t ne0 = 128, int64_t ne1 = 8, int r = 4, bool already_rotated = false, bool f16_sink = false, int kvarn_rot = 0)
+        : type_idx(type_idx), ne0(ne0), ne1(ne1), r(r), already_rotated(already_rotated), f16_sink(f16_sink), kvarn_rot(kvarn_rot) {}
 
     bool run_whole_graph() override { return f16_sink; }
 
@@ -3011,7 +3015,8 @@ struct test_set_rows_tq6 : public test_case {
         ggml_tensor * row_idxs = ggml_new_tensor_1d(ctx, type_idx, r);
         ggml_set_name(row_idxs, "row_idxs");
 
-        ggml_tensor * written = already_rotated ? ggml_set_rows_tq6_rotated(ctx, dst, src, row_idxs) : ggml_set_rows(ctx, dst, src, row_idxs);
+        ggml_tensor * written = kvarn_rot ? ggml_set_rows_kvarn_rot(ctx, dst, src, row_idxs, kvarn_rot)
+            : already_rotated ? ggml_set_rows_tq6_rotated(ctx, dst, src, row_idxs) : ggml_set_rows(ctx, dst, src, row_idxs);
 
         ggml_tensor * out;
         if (f16_sink) {
@@ -11722,6 +11727,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_set_rows_tq6(GGML_TYPE_I64, 1024, 2048, 1024, true));
     for (auto idx_type : {GGML_TYPE_I32, GGML_TYPE_I64}) {
         test_cases.emplace_back(new test_set_rows_tq6(idx_type, 1024, 16, 8, true, true));
+    }
+    // KVarN fused write rotation (#139): plain H_256 and signed 128 rotation inside the TQ6 write
+    for (int rot : {256, 128}) {
+        for (auto idx_type : {GGML_TYPE_I32, GGML_TYPE_I64}) {
+            for (int r : {1, 5, 8}) {
+                test_cases.emplace_back(new test_set_rows_tq6(idx_type, 1024, 16, r, true, false, rot));
+                test_cases.emplace_back(new test_set_rows_tq6(idx_type, 1024, 16, r, true, true, rot));
+            }
+        }
+        test_cases.emplace_back(new test_set_rows_tq6(GGML_TYPE_I64, 1024, 2048, 512, true, false, rot));
     }
 
     // SET_ROWS with tq5 destination: quantize then dequant round-trip

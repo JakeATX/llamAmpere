@@ -1,6 +1,7 @@
 #include "set-rows.cuh"
 #include "cpy-utils.cuh"
 #include "turbo-quant.cuh"
+#include "set-rows-kvarn-rot.cuh"
 
 typedef void (*set_rows_kernel_t)(const char * src, char * dst);
 
@@ -1859,6 +1860,11 @@ void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     GGML_ASSERT(src0->type == GGML_TYPE_F32 || (src0->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F16));
     GGML_ASSERT(src1->type == GGML_TYPE_I64 || src1->type == GGML_TYPE_I32);
+
+    if (ggml_cuda_set_rows_is_kvarn_rot(dst)) {
+        ggml_cuda_set_rows_kvarn_rot(ctx, dst);  // KVarN fused write rotation (#139)
+        return;
+    }
 
     if (src0->type == GGML_TYPE_F32) {
         if (src1->type == GGML_TYPE_I64) {

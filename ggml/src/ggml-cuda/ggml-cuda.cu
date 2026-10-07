@@ -69,6 +69,7 @@
 #include "ggml-cuda/gated_delta_net.cuh"
 #include "ggml-cuda/dsv4-hc.cuh"
 #include "ggml-cuda/set.cuh"
+#include "ggml-cuda/set-rows-kvarn-rot.cuh"
 #include "ggml-cuda/set-rows.cuh"
 #include "ggml-cuda/turbo-wht.cuh"
 #include "ggml-cuda/kvarn-seal.cuh"
@@ -8631,6 +8632,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             } break;
         case GGML_OP_SET_ROWS:
             {
+                if (ggml_cuda_set_rows_is_kvarn_rot(op)) {  // KVarN fused write rotation (#139)
+                    const int64_t group = ggml_get_op_params_i32(op, 1) == GGML_SET_ROWS_KVARN_ROT256 ? 256 : 128;
+                    return op->type == GGML_TYPE_TQ6_0 && op->src[0]->type == GGML_TYPE_F32 && op->src[0]->ne[0] % group == 0 &&
+                           (op->src[1]->type == GGML_TYPE_I64 || op->src[1]->type == GGML_TYPE_I32);
+                }
                 // turbo types require head_dim divisible by appropriate group size
                 if ((op->type == GGML_TYPE_TURBO3_0 || op->type == GGML_TYPE_TURBO2_0) && op->src[0]->ne[0] % 64 != 0) {
                     return false;
