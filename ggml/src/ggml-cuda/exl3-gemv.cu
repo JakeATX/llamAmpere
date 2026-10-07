@@ -512,7 +512,7 @@ k_exl3_gemv(const uint32_t * __restrict__ trellis, half2 * __restrict__ x, float
 // two halves; each half is refilled right after it is consumed, so 8 tiles of trellis words are outstanding while 4 are
 // computed (before: 4 while 4). At T >= 5 the kernel runs fewer resident warps (shared memory per block grows with T),
 // so it needs more bytes in flight per warp to cover DRAM latency. Same tiles, same fold-every-4 schedule, same order
-// => same output bits. GGML_CUDA_EXL3_PF2=0 keeps one group in flight.
+// => same output bits. Opt-in, GGML_CUDA_EXL3_PF2=1 (measured no gain).
 template <int BITS, int T, bool WM, bool FR = false, bool PF2 = false>
 static __global__ void __launch_bounds__(32 * EXL3_GEMV_NWARPS)
 k_exl3_gemv_dec(const uint32_t * __restrict__ trellis, const half2 * __restrict__ x, float * __restrict__ y,
@@ -1157,11 +1157,12 @@ static bool exl3_gemv_vw_enabled() {
     return enabled;
 }
 
-// [#41 EXL3W] GGML_CUDA_EXL3_PF2=0 keeps one load group in flight per warp in the fragment-staged dec kernel (same bits)
+// [#41 EXL3W] GGML_CUDA_EXL3_PF2=1 keeps two load groups in flight per warp in the fragment-staged dec kernel (same
+// bits). Off by default: measured neutral to -1% per verify step at widths 2-8 (EXL3W_20261006 pf2a, 4 ABBA passes)
 static bool exl3_gemv_pf2_enabled() {
     static const bool enabled = [] {
         const char * env = getenv("GGML_CUDA_EXL3_PF2");
-        return env == nullptr || strcmp(env, "0") != 0;
+        return env != nullptr && strcmp(env, "1") == 0;
     }();
     return enabled;
 }
