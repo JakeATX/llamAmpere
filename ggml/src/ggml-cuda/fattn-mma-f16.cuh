@@ -917,12 +917,13 @@ static __device__ __forceinline__ uint2 fa66_tq6_lookup4(const uint32_t I, const
     return r;
 }
 
-// Load group size (chunks loaded before any is decoded). 0 = auto: 8 when a tile takes >= 16 chunks per thread
-// (ncols1 1-2), else 4: the wider tiles' accumulators leave less register room (group 8 spilled 40..440 B there).
+// Load group size (chunks loaded before any is decoded). 0 = auto: 4 on the 64-column tiles, whose accumulators leave
+// the least register room (group 8 spilled 440 B there and ran 26% slower at 102.4K), else 8. On the 32-column tiles
+// group 8 spills 40..128 B and is still faster than group 4 (444 vs 476 us at width 3, 102.4K).
 #ifndef GGML_CUDA_FA66_GROUP
 #define GGML_CUDA_FA66_GROUP 0
 #endif
-template<int stride_tile, bool swz, int nbatch_fa, int nthreads, int D2, bool oob_check, bool stream_loads>
+template<int stride_tile, bool swz, int nbatch_fa, int nthreads, int D2, bool oob_check, bool stream_loads, int ncols = 0>
 static __device__ __forceinline__ void flash_attn_ext_tq6_load_tile_fa66(
         const char * const __restrict__ KV_raw, half2 * const __restrict__ tile_KV,
         const int stride_bytes, const int col_offset, const int i_sup) {
@@ -942,7 +943,7 @@ static __device__ __forceinline__ void flash_attn_ext_tq6_load_tile_fa66(
 
     // Loads are issued in groups of `group` chunks (all loads of a group before any decode of it): one memory latency
     // per group, and a bounded register footprint at the narrow widths where niter is largest.
-    constexpr int group_max = GGML_CUDA_FA66_GROUP > 0 ? GGML_CUDA_FA66_GROUP : (niter >= 16 ? 8 : 4);
+    constexpr int group_max = GGML_CUDA_FA66_GROUP > 0 ? GGML_CUDA_FA66_GROUP : (ncols >= 64 ? 4 : 8);
     constexpr int group = niter < group_max ? niter : group_max;
     static_assert(niter % group == 0, "niter must be a multiple of the load group");
 
@@ -1002,8 +1003,10 @@ static __device__ __forceinline__ void flash_attn_ext_tq6_load_tile_fa66(
 #endif
 #if GGML_CUDA_FA66_TQ6_LOADER
 #define FA66_TQ6_LOADER flash_attn_ext_tq6_load_tile_fa66
+#define FA66_NCOLS_ARG , ncols1*ncols2
 #else
 #define FA66_TQ6_LOADER flash_attn_ext_tq6_load_tile
+#define FA66_NCOLS_ARG
 #endif
 
 static __constant__ float TURBO_CENTROIDS_3BIT_FATTN[8] = {
@@ -1946,7 +1949,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                         (K_raw, tile_K, k0_diff, stride_K, k0_start, k_VKQ_sup);
                 }
             } else if constexpr (type_K == GGML_TYPE_TQ6_0) {
-                FA66_TQ6_LOADER<stride_tile_K, swz, nbatch_fa, nthreads_turbo, DKQ/2, oob_check, !turbo_stage>
+                FA66_TQ6_LOADER<stride_tile_K, swz, nbatch_fa, nthreads_turbo, DKQ/2, oob_check, !turbo_stage FA66_NCOLS_ARG>
                     (K_raw, tile_K, K_pitch, k0_start, k_VKQ_sup);
             } else if constexpr (type_K == GGML_TYPE_TQ5_0) {
                 flash_attn_ext_tq5_load_tile<stride_tile_K, swz, nbatch_fa, nthreads_turbo, DKQ/2, oob_check, !turbo_stage>
@@ -2384,7 +2387,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                         (V_raw, tile_V, i0_diff/2, stride_V, i0_start/2, k_VKQ_sup);
                 }
             } else if constexpr (type_V == GGML_TYPE_TQ6_0) {
-                FA66_TQ6_LOADER<stride_tile_V, swz, nbatch_fa, nthreads_turbo, DV/2, oob_check, !turbo_stage_v>
+                FA66_TQ6_LOADER<stride_tile_V, swz, nbatch_fa, nthreads_turbo, DV/2, oob_check, !turbo_stage_v FA66_NCOLS_ARG>
                     (V_raw, tile_V, V_pitch, i0_start/2, k_VKQ_sup);
             } else if constexpr (type_V == GGML_TYPE_TQ5_0) {
                 flash_attn_ext_tq5_load_tile<stride_tile_V, swz, nbatch_fa, nthreads_turbo, DV/2, oob_check, !turbo_stage_v>
