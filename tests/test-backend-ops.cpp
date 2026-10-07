@@ -14694,6 +14694,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // [#41 EXL3W] EXL3 verify widths at the Qwen3.8-27B projection shapes (m = N out, k = K in), with the suh/svh glue,
+    // next to IQ4_XS on its default path at the same shapes: ffn_gate/up, ffn_down, GDN attn_qkv / attn_gate / ssm_out
+    // (= attn_output), attn_q (+gate), attn_k/v; widths 1..8, plus the output head (exl3_6 vs q6_K)
+    if (getenv("GGML_EXL3W_BENCH") != nullptr) {
+        const std::array<std::array<int64_t, 2>, 7> shapes = {{
+            {17408, 5120}, {5120, 17408}, {10240, 5120}, {6144, 5120}, {5120, 6144}, {12288, 5120}, {1024, 5120}}};
+        for (int64_t n = 1; n <= 8; ++n) {
+            for (const auto & mk : shapes) {
+                test_cases.emplace_back(new test_mul_mat_exl3(GGML_TYPE_EXL3_4, mk[0], n, mk[1], true));
+            }
+            test_cases.emplace_back(new test_mul_mat_exl3(GGML_TYPE_EXL3_6, 248320, n, 5120, true));
+            for (const auto & mk : shapes) {
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, mk[0], n, mk[1], {1, 1}, {1, 1}));
+            }
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 248320, n, 5120, {1, 1}, {1, 1}));
+        }
+    }
+
     if (getenv("GGML_QWEN38_MMVQ_BENCH") != nullptr) {
         for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}) {
             for (int64_t n : {3, 4, 5}) {
