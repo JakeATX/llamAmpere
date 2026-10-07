@@ -52,6 +52,28 @@
 #   define N_THREADS std::thread::hardware_concurrency()
 #endif
 
+// GGML_TBO_SEED=<n>: deterministic tensor data per test case (seeded from the case's vars() and the init order), so
+// two binaries or two routing switches can be compared output-for-output (GGML_TBO_DUMP_DIR writes backend1 outputs).
+static thread_local uint64_t g_tbo_case_seed    = 0;
+static thread_local uint64_t g_tbo_case_counter = 0;
+static bool tbo_seeded() {
+    static const bool on = getenv("GGML_TBO_SEED") != nullptr;
+    return on;
+}
+static uint64_t tbo_fnv1a(const void * p, size_t n, uint64_t h = 1469598103934665603ull) {
+    const uint8_t * b = (const uint8_t *) p;
+    for (size_t i = 0; i < n; ++i) {
+        h = (h ^ b[i]) * 1099511628211ull;
+    }
+    return h;
+}
+static void tbo_begin_case(const std::string & v) {
+    if (tbo_seeded()) {
+        g_tbo_case_seed    = tbo_fnv1a(v.data(), v.size(), (uint64_t) atoll(getenv("GGML_TBO_SEED")) * 1099511628211ull + 1469598103934665603ull);
+        g_tbo_case_counter = 0;
+    }
+}
+
 static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
     if (ggml_is_empty(tensor)) {
         return;
@@ -65,16 +87,25 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
 
         // GGML_TEST_SEED: per-chunk seeded inputs, reproducible across runs and builds (bit-identity checks)
         static const char * seed_env = getenv("GGML_TEST_SEED");
-        auto init_thread = [&](size_t start, size_t end) {
-            thread_local std::default_random_engine gen(std::random_device{}());
+        const bool     seeded = tbo_seeded();
+        const uint64_t base   = seeded ? (g_tbo_case_seed + 0x9E3779B97F4A7C15ull * ++g_tbo_case_counter) : 0;
+        auto init_thread = [&, seeded, base](size_t start, size_t end) {
             std::uniform_real_distribution<float> distribution(min, max);
             if (seed_env != nullptr) {
-                std::default_random_engine seeded((unsigned) (strtoul(seed_env, nullptr, 10) ^ (start*2654435761u) ^ (nels*40503u)));
+                std::default_random_engine seeded_gen((unsigned) (strtoul(seed_env, nullptr, 10) ^ (start*2654435761u) ^ (nels*40503u)));
                 for (size_t i = start; i < end; i++) {
-                    data[i] = distribution(seeded);
+                    data[i] = distribution(seeded_gen);
                 }
                 return;
             }
+            if (seeded) {
+                std::mt19937_64 sgen(base ^ (0xD1B54A32D192ED03ull * (start + 1)));
+                for (size_t i = start; i < end; i++) {
+                    data[i] = distribution(sgen);
+                }
+                return;
+            }
+            thread_local std::default_random_engine gen(std::random_device{}());
             for (size_t i = start; i < end; i++) {
                 data[i] = distribution(gen);
             }
@@ -184,8 +215,10 @@ static void init_tensor_kq_mask(ggml_tensor * tensor, float min = -1.0f, float m
     std::vector<ggml_fp16_t> data_f16(ne0*ne1*ne2*ne3);
 
     std::random_device rd;
-    std::mt19937 gen(rd());
+    // GGML_TBO_SEED: the mask is seeded from the case like the other inputs (the -INFINITY blocks below draw from gen)
+    std::mt19937 gen(tbo_seeded() ? (uint32_t) (g_tbo_case_seed ^ (0xC2B2AE3D27D4EB4Full * ++g_tbo_case_counter)) : rd());
     std::uniform_real_distribution<float> dis(min, max);
+    auto rnd = [&]() -> uint32_t { return tbo_seeded() ? (uint32_t) gen() : rd(); };
 
     for (size_t i = 0; i < data_f32.size(); i++) {
         data_f32[i] = dis(gen);
@@ -199,12 +232,12 @@ static void init_tensor_kq_mask(ggml_tensor * tensor, float min = -1.0f, float m
     const int n_inf_zero_blocks = 0.2*(ne0*ne1*ne2*ne3)/(blck0*blck1);
 
     for (int b = 0; b < n_inf_zero_blocks; b++) {
-        const int p3 = (rd() % ne3);
-        const int p2 = (rd() % ne2);
-        const int p1 = (rd() % ne1);
-        const int p0 = (rd() % ne0);
+        const int p3 = (rnd() % ne3);
+        const int p2 = (rnd() % ne2);
+        const int p1 = (rnd() % ne1);
+        const int p0 = (rnd() % ne0);
 
-        bool inf = rd() & 1;
+        bool inf = rnd() & 1;
 
         for (int i1 = 0; i1 < blck1 && p1 + i1 < ne1; i1++) {
             const int idx = p3*ne2*ne1*ne0 + p2*ne1*ne0 + (p1 + i1)*ne0 + p0;
@@ -1509,6 +1542,7 @@ struct test_case {
         }
 
         // randomize tensors
+        tbo_begin_case(vars());
         initialize_tensors(ctx.get());
         if (ctx_weights) {
             initialize_tensors(ctx_weights.get());
@@ -1583,6 +1617,19 @@ struct test_case {
                 printf("TBOHASH\t%s\t%s\t%016" PRIx64 "\n", ggml_op_desc(t1), ud->tc->vars().c_str(), h);
             }
             double err = ud->tc->err(f1.data(), f2.data(), f1.size());
+            if (const char * dir = getenv("GGML_TBO_DUMP_DIR"); dir != nullptr && t1->op == GGML_OP_FLASH_ATTN_EXT) {
+                // backend1 output as raw f32, named by the case vars hash; TBOOUT line maps hash -> vars
+                const std::string v = ud->tc->vars();
+                const uint64_t vh = tbo_fnv1a(v.data(), v.size());
+                const uint64_t oh = tbo_fnv1a(f1.data(), f1.size()*sizeof(float));
+                char path[1024];
+                snprintf(path, sizeof(path), "%s/%016llx.f32", dir, (unsigned long long) vh);
+                if (FILE * fo = fopen(path, "wb")) {
+                    fwrite(f1.data(), sizeof(float), f1.size(), fo);
+                    fclose(fo);
+                }
+                printf("TBOOUT\t%016llx\t%016llx\t%s\n", (unsigned long long) vh, (unsigned long long) oh, v.c_str());
+            }
             if (getenv("GGML_TBO_DUMP_ERR")) {
                 // machine-parseable: op, shape vars, error vs the CPU reference
                 printf("TBOERR\t%s\t%s\t%.12g\n", ggml_op_desc(t1), ud->tc->vars().c_str(), err);
@@ -1795,6 +1842,7 @@ struct test_case {
         }
 
         // randomize tensors
+        tbo_begin_case(vars());
         initialize_tensors(ctx.get());
         if (ctx_weights) {
             initialize_tensors(ctx_weights.get());
@@ -13923,6 +13971,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TQ6_0, GGML_TYPE_TQ5_0));
         }
     }
+    // FA66: matched tq6_0/tq6_0 (the MTP drafter cache over a KVarN trunk) at every verify width 1-8, per-head-contiguous
+    // and KV-cache (interleaved-head) layouts, plus odd KV lengths for the oob tail tiles.
+    for (int64_t kv : {4096, 100352}) {
+        for (int nb = 1; nb <= 8; ++nb) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TQ6_0, GGML_TYPE_TQ6_0));
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TQ6_0, GGML_TYPE_TQ6_0, {0, 2, 1, 3}));
+        }
+    }
+    for (int64_t kv : {4103, 4127}) {
+        for (int nb : {1, 4, 5, 8}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TQ6_0, GGML_TYPE_TQ6_0));
+        }
+    }
     // Matched TQ5 wide fused dispatch and its GQA/layout fallbacks.
     for (int nb : {5, 8}) {
         for (float logit_softcap : {0.0f, 10.0f}) {
@@ -14482,6 +14543,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             for (const auto & types : {std::pair{GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0},
                                       std::pair{GGML_TYPE_Q8_0, GGML_TYPE_Q5_1},
                                       std::pair{GGML_TYPE_TQ6_0, GGML_TYPE_TQ6_0}}) {
+                test_cases.emplace_back(new test_flash_attn_ext_causal(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, types.first, types.second, {0, 2, 1, 3}, false));
+            }
+        }
+    }
+
+    // FA66: matched tq6_0/tq6_0 vs tq5_0/turbo4 and tq5_0/tq5_0 at 200K (32K/100K above), plus tq5_0/tq5_0 at 32K/100K.
+    for (int64_t kv : {32768, 102400, 204800}) {
+        for (int64_t nb = 1; nb <= 8; ++nb) {
+            for (const auto & types : {std::pair{GGML_TYPE_TQ5_0, GGML_TYPE_TURBO4_0},
+                                      std::pair{GGML_TYPE_TQ6_0, GGML_TYPE_TQ6_0},
+                                      std::pair{GGML_TYPE_TQ5_0, GGML_TYPE_TQ5_0}}) {
+                if (kv != 204800 && types.second != GGML_TYPE_TQ5_0) {
+                    continue; // already in the loops above
+                }
                 test_cases.emplace_back(new test_flash_attn_ext_causal(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, types.first, types.second, {0, 2, 1, 3}, false));
             }
         }
