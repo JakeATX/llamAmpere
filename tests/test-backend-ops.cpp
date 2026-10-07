@@ -14848,6 +14848,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             }
         }
     }
+    // [KVW35] turbo4 body, widths 1..8 at the 100K body
+    for (int64_t n_q = 1; n_q <= 8; ++n_q) {
+        test_cases.emplace_back(new test_flash_attn_ext_kvarn(n_q, 24, 4, 792, 4096, false, false, GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_TURBO4_0));
+    }
     // Compare exact-tail traffic at the same 32896 visible positions.
     for (int64_t n_q : {4, 5}) {
         test_cases.emplace_back(new test_flash_attn_ext_kvarn(n_q, 24, 4, 255, 128));
