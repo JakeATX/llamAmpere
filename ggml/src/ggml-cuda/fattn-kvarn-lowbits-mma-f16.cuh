@@ -6,6 +6,7 @@
 #include "fattn-kvarn-lowbits-common.cuh"
 #include "kvarn-lowbits.cuh"
 #include "fattn-kvarn-lowbits-swizzle.cuh"
+#include "fattn-kvarn-rot.cuh"
 
 using namespace ggml_cuda_mma;
 
@@ -2361,7 +2362,7 @@ template<int DV, int ncols> struct mma_tile_sizes {
 #endif // defined(TURING_MMA_AVAILABLE)
 
 template<int DKQ, int DV, int ncols1, int ncols2, int nwarps, bool use_logit_softcap, bool V_is_K_view, bool use_sparse, bool needs_fixup, bool is_fixup,
-    ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16>
+    ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, bool rot = false>
 static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         const float2 * const __restrict__ Q_f2,
         const half2  * const __restrict__ K_h2,
@@ -2414,6 +2415,12 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     constexpr int  nstages         = (is_turbo_kv || is_kvarn) ? 0 : ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2, use_sparse);
 
     if (cols_per_warp > ncols) {
+        NO_DEVICE_CODE;
+        return;
+    }
+    // #139 fused rotation: Q is rotated in the warp-per-row Q load and the final output in the warp-per-row store,
+    // which needs the whole 256-row in one combine batch.
+    if constexpr (rot && (DKQ != 256 || DV != 256 || nbatch_combine != DV/2)) {
         NO_DEVICE_CODE;
         return;
     }
@@ -2491,6 +2498,21 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
             const int c = jc % ncols2;
 
             if ((ncols1 == 1 || jt*ncols1 + j < int(ne01.z)) && (ncols2 == 1 || zt_gqa*ncols2 + c < gqa_ratio)) {
+                if constexpr (rot) {
+                    // #139: one warp holds the whole row (stride_k == warp_size, k0 = 0, 32, 64, 96): rotate in f32
+                    // before the scale and the f16 conversion, as the unfused graph does.
+                    float2 v[4];
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        v[i] = Q_f2[(jt*ncols1 + j)*stride_Q1 + c*stride_Q2 + 32*i + threadIdx.x];
+                    }
+                    kvarn_rot256_f2x4(v, threadIdx.x);
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        tile_Q[jc*stride_tile_Q + 32*i + threadIdx.x] = scale_h2 * make_half2(v[i].x, v[i].y);
+                    }
+                    continue;
+                }
 #pragma unroll
                 for (int k0 = k0_start; k0 < k0_stop; k0 += stride_k) {
                     const int k = k0 + (stride_k == warp_size ? threadIdx.x : threadIdx.x % stride_k);
@@ -2949,6 +2971,33 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                     }
 
                     const float * meta_j = (const float *) tile_Q + jc_tile_K*tile_stride + nbatch_combine;
+                    if constexpr (rot && !needs_fixup && !is_fixup) {
+                        // #139: final output of a whole tile; one warp holds the row (k = 32i + lane), rotate after
+                        // the normalisation. Partial results (needs_fixup / is_fixup) stay unrotated for the fixup.
+                        float2 v[4];
+#pragma unroll
+                        for (int i = 0; i < 4; ++i) {
+                            const int k = 32*i + threadIdx.x;
+                            float2 dstk_val = make_float2(0.0f, 0.0f);
+#pragma unroll
+                            for (int ip = 0; ip < np; ++ip) {
+                                const float KQ_crs = np == 1 ? 1.0f : meta_j[ip*cols_per_warp * tile_stride + 0];
+                                const float2 dstk_val_add = __half22float2(tile_Q[(jc_tile_K + ip*cols_per_warp) * tile_stride + k]);
+                                dstk_val.x += dstk_val_add.x*KQ_crs;
+                                dstk_val.y += dstk_val_add.y*KQ_crs;
+                            }
+                            const float KQ_rowsum_j = meta_j[1];
+                            dstk_val.x /= KQ_rowsum_j;
+                            dstk_val.y /= KQ_rowsum_j;
+                            v[i] = dstk_val;
+                        }
+                        kvarn_rot256_f2x4(v, threadIdx.x);
+#pragma unroll
+                        for (int i = 0; i < 4; ++i) {
+                            dstk[((jt*ncols1 + j_dst)*ne02 + c_dst)*(DV/2) + 32*i + threadIdx.x] = v[i];
+                        }
+                        continue;
+                    }
 #pragma unroll
                     for (int k0 = k0_start; k0 < k0_stop; k0 += stride_k) {
                         const int k = k0 + (stride_k == warp_size ? threadIdx.x : threadIdx.x % stride_k);
@@ -2997,7 +3046,7 @@ static constexpr __host__ __device__ bool ggml_cuda_flash_attn_ext_mma_f16_may_u
 }
 
 template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool V_is_K_view, bool use_sparse,
-    ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, int bits_k = 4, int bits_v = 4>
+    ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, int bits_k = 4, int bits_v = 4, bool rot = false>
 __launch_bounds__(ggml_cuda_fattn_mma_get_nthreads(DKQ, DV, ncols1*ncols2), ggml_cuda_fattn_mma_get_occupancy(DKQ, DV, ncols1*ncols2))
 static __global__ void flash_attn_ext_f16(
         const char * Q_ptr,
@@ -3152,12 +3201,12 @@ static __global__ void flash_attn_ext_f16(
         constexpr bool is_fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
         if (kb0_start == 0) {
             constexpr bool needs_fixup = false; // CUDA block is working on an entire tile.
-            flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, type_K, type_V>
+            flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, type_K, type_V, rot>
                 (Q_f2, K_h2, V_h2, mask_h, indices, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
                  ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop, kv);
         } else {
             constexpr bool needs_fixup = true; // CUDA block is missing the beginning of a tile.
-            flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, type_K, type_V>
+            flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, type_K, type_V, rot>
                 (Q_f2, K_h2, V_h2, mask_h, indices, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
                  ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop, kv);
         }
@@ -3204,7 +3253,7 @@ static __global__ void flash_attn_ext_f16(
 
     constexpr bool is_fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.
     constexpr bool needs_fixup = false;
-    flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, type_K, type_V>
+    flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, type_K, type_V, rot>
         (Q_f2, K_h2, V_h2, mask_h, indices, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
          ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop, kv);
 #else

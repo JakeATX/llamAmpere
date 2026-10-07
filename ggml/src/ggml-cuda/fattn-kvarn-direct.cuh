@@ -943,6 +943,7 @@ template <int W, int NWIN, int NQ_MAX_T>
 static bool ggml_cuda_flash_attn_ext_kvarn_direct_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     using namespace fattn_kvarn_direct;
     fattn_kernel_t fattn_kernel = flash_attn_ext_kvarn_direct<W, NWIN>;
+    GGML_ASSERT(!ggml_cuda_fattn_kvarn_rot(dst)); // [#139] no in-kernel rotation: fattn.cu runs it in separate passes
     const int n_q = dst->src[0]->ne[1];
     GGML_ASSERT(n_q <= NQ_MAX_T);
     const size_t nbytes_shared = ring_bytes(W, NWIN) + (size_t) n_q*Q_ROW_BYTES; // the combine slots alias the ring

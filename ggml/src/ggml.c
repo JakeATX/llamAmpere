@@ -5804,6 +5804,32 @@ bool ggml_flash_attn_ext_is_kvarn(const struct ggml_tensor * a) {
     return a->op == GGML_OP_FLASH_ATTN_EXT && a->src[6] != NULL;
 }
 
+#define GGML_KVARN_ROT_PARAM 8
+
+void ggml_flash_attn_ext_set_kvarn_rot(struct ggml_tensor * a, int32_t group) {
+    GGML_ASSERT(ggml_flash_attn_ext_is_kvarn(a));
+    GGML_ASSERT(group == 0 || (group == 256 && a->src[0]->ne[0] == 256 && a->src[2]->ne[0] == 256));
+    GGML_ASSERT(group == 0 || ggml_get_op_params_i32(a, 7) != GGML_TYPE_TURBO4_0); // grouped signed basis: unfused only
+    ggml_set_op_params_i32(a, GGML_KVARN_ROT_PARAM, group);
+}
+
+int32_t ggml_flash_attn_ext_get_kvarn_rot(const struct ggml_tensor * a) {
+    return ggml_flash_attn_ext_is_kvarn(a) ? ggml_get_op_params_i32(a, GGML_KVARN_ROT_PARAM) : 0;
+}
+
+#ifndef GGML_KVARN_FUSED_ROT_DEFAULT
+#define GGML_KVARN_FUSED_ROT_DEFAULT 1
+#endif
+
+bool ggml_kvarn_fused_rot_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char * e = getenv("GGML_KVARN_FUSED_ROT");
+        enabled = e != NULL ? (atoi(e) != 0) : (GGML_KVARN_FUSED_ROT_DEFAULT != 0);
+    }
+    return enabled != 0;
+}
+
 // ggml_kvarn_seal
 
 size_t ggml_kvarn_rec_bytes(int32_t D, int32_t G, int32_t bits_k, int32_t bits_v) {

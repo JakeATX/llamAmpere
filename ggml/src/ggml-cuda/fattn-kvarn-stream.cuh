@@ -45,6 +45,7 @@
 #include "fattn-common.cuh"
 #include "fattn-mma-f16.cuh" // fattn_kvarn_u32_as_half2
 #include "mma.cuh"
+#include "fattn-kvarn-rot.cuh"
 
 #include <cfloat>
 #include <climits>
@@ -169,7 +170,7 @@ struct cursor {
 static __device__ unsigned int fattn_kvarn_stream_dbg_run = 0;
 #endif
 
-template <int max_warps, int NSTAGE, bool turbo4_body = false, bool PACK = true>
+template <int max_warps, int NSTAGE, bool turbo4_body = false, bool PACK = true, bool rot = false>
 __launch_bounds__(WARP_SIZE*max_warps, max_warps == 3 ? 3 : max_warps == 4 || max_warps == 5 || max_warps == 6 ? 2 : 1)
 static __global__ void flash_attn_ext_kvarn_stream(
         const char * __restrict__ Q,
@@ -246,6 +247,8 @@ static __global__ void flash_attn_ext_kvarn_stream(
 
     const float * Qf = (const float *) (Q + (size_t) (hvalid ? col_q(hcol) : 0)*nb01 + (size_t) (head0 + (hvalid ? col_h(hcol) : 0))*nb02);
     // mask rows of the lane's two C fragment columns 2(lane%4) and +1 (padding columns read the last row)
+    // [#139] rot build: Q arrives rotated (ggml_cuda_kvarn_rot256_q_pass in the launcher); only the output is rotated here
+    static_assert(!rot || !turbo4_body, "turbo4 bodies use the grouped signed basis");
     const char  * mrow0 = mask + (size_t) min(PACK ? col_q(2*(lane & 3) + 0) : nt, n_q - 1)*nb31;
     const char  * mrow1 = PACK ? mask + (size_t) min(col_q(2*(lane & 3) + 1), n_q - 1)*nb31 : mrow0;
     const char  * Kh = K + (size_t) z_KV*nb12;
@@ -920,6 +923,22 @@ static __global__ void flash_attn_ext_kvarn_stream(
 
     // output: heads head0 + col for col < gqa; unnormalized parts + meta when several blocks share the KV range
     const bool single = gridDim.y == 1;
+    if constexpr (rot) {
+        // [#139] fused rotation: the final rows are normalized first, then rotated (combine_results rotates parts)
+        if (single) {
+            const float inv0 = 1.0f/kq_sum[0], inv1 = 1.0f/kq_sum[1];
+#pragma unroll
+            for (int c = 0; c < NTC; ++c) {
+#pragma unroll
+                for (int l = 0; l < 4; ++l) {
+                    acc[c].x[l] *= (l & 1) ? inv1 : inv0;
+                }
+            }
+            kvarn_rot256_frag<T_C, NTC>(acc, lane);
+            kq_sum[0] = 1.0f;
+            kq_sum[1] = 1.0f;
+        }
+    }
 #pragma unroll
     for (int l = 0; l < 4; l += 2) {
         // l and l+1 share the row d, differ in column
@@ -972,10 +991,10 @@ static __global__ void flash_attn_ext_kvarn_stream(
 } // namespace fattn_kvarn_stream
 
 // Each query warp shares a packed-data ring with the other query warps in its KV split.
-template <int max_warps, int NSTAGE, bool turbo4_body = false, bool PACK = true>
+template <int max_warps, int NSTAGE, bool turbo4_body = false, bool PACK = true, bool rot = false>
 static fattn_kernel_t ggml_cuda_fattn_kvarn_stream_kernel() {
     using namespace fattn_kvarn_stream;
-    fattn_kernel_t kernel = flash_attn_ext_kvarn_stream<max_warps, NSTAGE, turbo4_body, PACK>;
+    fattn_kernel_t kernel = flash_attn_ext_kvarn_stream<max_warps, NSTAGE, turbo4_body, PACK, rot>;
     const int id = ggml_cuda_get_device();
     static bool initialized[GGML_CUDA_MAX_DEVICES] = {false};
     if (!initialized[id]) {
@@ -991,33 +1010,34 @@ static size_t ggml_cuda_fattn_kvarn_stream_shared(const int NT, const int KW, co
     return std::max(ring_bytes(KW, nstage, turbo4_body), (size_t) NT*(KW/2)*SLOT_BYTES);
 }
 
-template <int max_warps, int NSTAGE, bool turbo4_body = false, bool PACK = true>
+template <int max_warps, int NSTAGE, bool turbo4_body = false, bool PACK = true, bool rot = false>
 static int ggml_cuda_fattn_kvarn_stream_occupancy(const int NT, const int KW) {
     const size_t shared = ggml_cuda_fattn_kvarn_stream_shared(NT, KW, NSTAGE, turbo4_body);
     if (shared > ggml_cuda_info().devices[ggml_cuda_get_device()].smpbo) {
         return 0;
     }
     int blocks = 0;
+    // #139: always the plain build, so the rot build picks the same stage count and KV split
     CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks,
-        ggml_cuda_fattn_kvarn_stream_kernel<max_warps, NSTAGE, turbo4_body, PACK>(), WARP_SIZE*NT*KW, shared));
+        ggml_cuda_fattn_kvarn_stream_kernel<max_warps, NSTAGE, turbo4_body, PACK, false>(), WARP_SIZE*NT*KW, shared));
     return blocks;
 }
 
-template <int max_warps, int NSTAGE, bool turbo4_body = false, bool PACK = true>
+template <int max_warps, int NSTAGE, bool turbo4_body = false, bool PACK = true, bool rot = false>
 static void ggml_cuda_flash_attn_ext_kvarn_stream_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int NT, const int KW, const int parallel_blocks) {
     using namespace fattn_kvarn_stream;
     launch_fattn<D, NCOLS2, NCOLS2>
-        (ctx, dst, ggml_cuda_fattn_kvarn_stream_kernel<max_warps, NSTAGE, turbo4_body, PACK>(), NT*KW,
+        (ctx, dst, ggml_cuda_fattn_kvarn_stream_kernel<max_warps, NSTAGE, turbo4_body, PACK, rot>(), NT*KW,
          ggml_cuda_fattn_kvarn_stream_shared(NT, KW, NSTAGE, turbo4_body), UNIT,
          /*need_f16_K=*/false, /*need_f16_V=*/false, /*stream_k=*/false, /*use_sparse=*/false, WARP_SIZE, nullptr, nullptr, parallel_blocks);
 }
 
-template <int max_warps, bool turbo4_body = false, bool PACK = true>
+template <int max_warps, bool turbo4_body = false, bool PACK = true, bool rot = false>
 static void ggml_cuda_fattn_kvarn_stream_select(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int NT, const int KW, int nstage, const int parallel_blocks) {
     if (nstage != 0) {
-        const int blocks = nstage >= 6 ? ggml_cuda_fattn_kvarn_stream_occupancy<max_warps, 6, turbo4_body, PACK>(NT, KW)
-                         : nstage >= 4 ? ggml_cuda_fattn_kvarn_stream_occupancy<max_warps, 4, turbo4_body, PACK>(NT, KW)
-                                       : ggml_cuda_fattn_kvarn_stream_occupancy<max_warps, 2, turbo4_body, PACK>(NT, KW);
+        const int blocks = nstage >= 6 ? ggml_cuda_fattn_kvarn_stream_occupancy<max_warps, 6, turbo4_body, PACK, rot>(NT, KW)
+                         : nstage >= 4 ? ggml_cuda_fattn_kvarn_stream_occupancy<max_warps, 4, turbo4_body, PACK, rot>(NT, KW)
+                                       : ggml_cuda_fattn_kvarn_stream_occupancy<max_warps, 2, turbo4_body, PACK, rot>(NT, KW);
         if (blocks == 0) {
             nstage = 0;
         }
@@ -1027,9 +1047,9 @@ static void ggml_cuda_fattn_kvarn_stream_select(ggml_backend_cuda_context & ctx,
         static int stages[GGML_CUDA_MAX_DEVICES][9] = {};
         int & cached = stages[id][NT];
         if (cached == 0) {
-            const int blocks2 = ggml_cuda_fattn_kvarn_stream_occupancy<max_warps, 2, turbo4_body, PACK>(NT, KW);
-            const int blocks4 = ggml_cuda_fattn_kvarn_stream_occupancy<max_warps, 4, turbo4_body, PACK>(NT, KW);
-            const int blocks6 = ggml_cuda_fattn_kvarn_stream_occupancy<max_warps, 6, turbo4_body, PACK>(NT, KW);
+            const int blocks2 = ggml_cuda_fattn_kvarn_stream_occupancy<max_warps, 2, turbo4_body, PACK, rot>(NT, KW);
+            const int blocks4 = ggml_cuda_fattn_kvarn_stream_occupancy<max_warps, 4, turbo4_body, PACK, rot>(NT, KW);
+            const int blocks6 = ggml_cuda_fattn_kvarn_stream_occupancy<max_warps, 6, turbo4_body, PACK, rot>(NT, KW);
             GGML_ASSERT(std::max(blocks2, std::max(blocks4, blocks6)) > 0);
             // Preserve resident warps first, then allow more strips in flight.
             cached = blocks6 >= blocks4 && blocks6 >= blocks2 ? 6 : blocks4 >= blocks2 ? 4 : 2;
@@ -1037,25 +1057,25 @@ static void ggml_cuda_fattn_kvarn_stream_select(ggml_backend_cuda_context & ctx,
         nstage = cached;
     }
     if (nstage >= 6) {
-        ggml_cuda_flash_attn_ext_kvarn_stream_launch<max_warps, 6, turbo4_body, PACK>(ctx, dst, NT, KW, parallel_blocks);
+        ggml_cuda_flash_attn_ext_kvarn_stream_launch<max_warps, 6, turbo4_body, PACK, rot>(ctx, dst, NT, KW, parallel_blocks);
     } else if (nstage >= 4) {
-        ggml_cuda_flash_attn_ext_kvarn_stream_launch<max_warps, 4, turbo4_body, PACK>(ctx, dst, NT, KW, parallel_blocks);
+        ggml_cuda_flash_attn_ext_kvarn_stream_launch<max_warps, 4, turbo4_body, PACK, rot>(ctx, dst, NT, KW, parallel_blocks);
     } else {
-        ggml_cuda_flash_attn_ext_kvarn_stream_launch<max_warps, 2, turbo4_body, PACK>(ctx, dst, NT, KW, parallel_blocks);
+        ggml_cuda_flash_attn_ext_kvarn_stream_launch<max_warps, 2, turbo4_body, PACK, rot>(ctx, dst, NT, KW, parallel_blocks);
     }
 }
 
-template <bool turbo4_body, bool PACK>
+template <bool turbo4_body, bool PACK, bool rot>
 static void ggml_cuda_flash_attn_ext_kvarn_stream_impl_tiles(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int NT,
         const int nstage_env, const bool kw8, const bool stable, const int nt5_mode) {
     GGML_ASSERT(NT >= 1 && NT <= 8);
     if (stable) {
         // Fix both KV ranges and reduction order across query widths; useful for verification checks.
         const auto & device = ggml_cuda_info().devices[ggml_cuda_get_device()];
-        const int blocks = ggml_cuda_fattn_kvarn_stream_occupancy<8, 6, turbo4_body, PACK>(4, 1);
+        const int blocks = ggml_cuda_fattn_kvarn_stream_occupancy<8, 6, turbo4_body, PACK, rot>(4, 1);
         const int heads = dst->src[1]->ne[2];
         const int parallel_blocks = std::max(1, (device.nsm*blocks + heads - 1)/heads);
-        ggml_cuda_flash_attn_ext_kvarn_stream_launch<8, 6, turbo4_body, PACK>(ctx, dst, NT, 1, parallel_blocks);
+        ggml_cuda_flash_attn_ext_kvarn_stream_launch<8, 6, turbo4_body, PACK, rot>(ctx, dst, NT, 1, parallel_blocks);
         return;
     }
     // KV splits per block: 4 warps for 1-2 tiles; 3-4 tiles (widths 3-4, packed width 5) take 2 splits (6-8 warps),
@@ -1068,21 +1088,33 @@ static void ggml_cuda_flash_attn_ext_kvarn_stream_impl_tiles(ggml_backend_cuda_c
     if constexpr (PACK) {
         if (NT*KW == 6) {
             // packed widths 7-8 at GQA 6: 6 tiles in 6-warp blocks, 2 blocks (12 warps) per SM under the 168-register cap
-            ggml_cuda_fattn_kvarn_stream_select<6, turbo4_body, PACK>(ctx, dst, NT, KW, nstage_env, 0);
+            ggml_cuda_fattn_kvarn_stream_select<6, turbo4_body, PACK, rot>(ctx, dst, NT, KW, nstage_env, 0);
             return;
         }
     }
     if (NT == 5 && !nt5_generic) {
-        ggml_cuda_fattn_kvarn_stream_select<5, turbo4_body, PACK>(ctx, dst, NT, KW, nstage_env, 0);
+        ggml_cuda_fattn_kvarn_stream_select<5, turbo4_body, PACK, rot>(ctx, dst, NT, KW, nstage_env, 0);
     } else if (NT*KW <= 4) {
-        ggml_cuda_fattn_kvarn_stream_select<4, turbo4_body, PACK>(ctx, dst, NT, KW, nstage_env, 0);
+        ggml_cuda_fattn_kvarn_stream_select<4, turbo4_body, PACK, rot>(ctx, dst, NT, KW, nstage_env, 0);
     } else {
-        ggml_cuda_fattn_kvarn_stream_select<8, turbo4_body, PACK>(ctx, dst, NT, KW, nstage_env, 0);
+        ggml_cuda_fattn_kvarn_stream_select<8, turbo4_body, PACK, rot>(ctx, dst, NT, KW, nstage_env, 0);
     }
 }
 
-template <bool turbo4_body = false>
+template <bool turbo4_body = false, bool rot = false>
 inline void ggml_cuda_flash_attn_ext_kvarn_stream_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if constexpr (!turbo4_body && !rot) {
+        if (ggml_cuda_fattn_kvarn_rot(dst)) { // [#139] fused rotation: Q pre-pass here, output rotation in the kernel
+            ggml_cuda_pool_alloc<float> q_rot(ctx.pool(), ggml_nelements(dst->src[0]));
+            ggml_tensor q2;
+            ggml_cuda_kvarn_rot256_q_pass(ctx, dst->src[0], q_rot.ptr, &q2);
+            ggml_tensor d2 = *dst;
+            d2.src[0] = &q2;
+            ggml_cuda_flash_attn_ext_kvarn_stream_impl<false, true>(ctx, &d2);
+            return;
+        }
+    }
+    GGML_ASSERT(turbo4_body || rot || !ggml_cuda_fattn_kvarn_rot(dst));
     static const int nstage_env = getenv("GGML_KVARN_DIRECT_NSTAGE") != nullptr ? atoi(getenv("GGML_KVARN_DIRECT_NSTAGE")) : 0;
     static const bool kw8 = getenv("GGML_KVARN_DIRECT_KW8") != nullptr;
     static const bool stable = getenv("GGML_KVARN_DIRECT_STABLE") != nullptr && atoi(getenv("GGML_KVARN_DIRECT_STABLE")) != 0;
@@ -1098,8 +1130,8 @@ inline void ggml_cuda_flash_attn_ext_kvarn_stream_impl(ggml_backend_cuda_context
     // warps and measured slower; equal tile counts keep the one-row-per-tile layout and its bit-exact output.
     const int NT_pack = (n_q*gqa + fattn_kvarn_stream::NCOLS2 - 1)/fattn_kvarn_stream::NCOLS2;
     if (NT_pack < n_q && NT_pack >= 4) {
-        ggml_cuda_flash_attn_ext_kvarn_stream_impl_tiles<turbo4_body, true>(ctx, dst, NT_pack, nstage_env, kw8, stable, nt5_mode);
+        ggml_cuda_flash_attn_ext_kvarn_stream_impl_tiles<turbo4_body, true, rot>(ctx, dst, NT_pack, nstage_env, kw8, stable, nt5_mode);
     } else {
-        ggml_cuda_flash_attn_ext_kvarn_stream_impl_tiles<turbo4_body, false>(ctx, dst, n_q, nstage_env, kw8, stable, nt5_mode);
+        ggml_cuda_flash_attn_ext_kvarn_stream_impl_tiles<turbo4_body, false, rot>(ctx, dst, n_q, nstage_env, kw8, stable, nt5_mode);
     }
 }

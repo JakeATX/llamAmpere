@@ -50,6 +50,7 @@
 #include "fattn-kvarn-lowbits-common.cuh"
 #include "fattn-kvarn-lowbits-mma-f16.cuh" // fattn_kvarn_lowbits_u32_as_half2
 #include "mma.cuh"
+#include "fattn-kvarn-rot.cuh"
 
 #include <cfloat>
 #include <climits>
@@ -174,7 +175,7 @@ struct cursor {
 static __device__ unsigned int fattn_kvarn_lowbits_stream_dbg_run = 0;
 #endif
 
-template <int max_warps, int NSTAGE, int bits_k, int bits_v, bool turbo4_body = false>
+template <int max_warps, int NSTAGE, int bits_k, int bits_v, bool turbo4_body = false, bool rot = false>
 __launch_bounds__(WARP_SIZE*max_warps, max_warps == 4 || max_warps == 5 ? 2 : 1)
 static __global__ void flash_attn_ext_kvarn_lowbits_stream(
         const char * __restrict__ Q,
@@ -245,6 +246,8 @@ static __global__ void flash_attn_ext_kvarn_lowbits_stream(
     const int n_ex      = n_ex_sink + (n_kv_pad - kv.B)/16; // padded positions are masked
 
     const float * Qf = (const float *) (Q + (size_t) nt*nb01 + (size_t) (head0 + (hvalid ? hcol : 0))*nb02);
+    // [#139] rot build: Q arrives rotated (ggml_cuda_kvarn_rot256_q_pass in the launcher); only the output is rotated here
+    static_assert(!rot || !turbo4_body, "turbo4 bodies use the grouped signed basis");
     const char  * mrow = mask + (size_t) nt*nb31;
     const char  * Kh = K + (size_t) z_KV*nb12;
     const char  * Vh = V + (size_t) z_KV*nb22;
@@ -873,6 +876,22 @@ static __global__ void flash_attn_ext_kvarn_lowbits_stream(
 
     // output: heads head0 + col for col < gqa; unnormalized parts + meta when several blocks share the KV range
     const bool single = gridDim.y == 1;
+    if constexpr (rot) {
+        // [#139] fused rotation: the final rows are normalized first, then rotated (combine_results rotates parts)
+        if (single) {
+            const float inv0 = 1.0f/kq_sum[0], inv1 = 1.0f/kq_sum[1];
+#pragma unroll
+            for (int c = 0; c < NTC; ++c) {
+#pragma unroll
+                for (int l = 0; l < 4; ++l) {
+                    acc[c].x[l] *= (l & 1) ? inv1 : inv0;
+                }
+            }
+            kvarn_rot256_frag<T_C, NTC>(acc, lane);
+            kq_sum[0] = 1.0f;
+            kq_sum[1] = 1.0f;
+        }
+    }
 #pragma unroll
     for (int l = 0; l < 4; l += 2) {
         // l and l+1 share the row d, differ in column
@@ -925,33 +944,51 @@ static __global__ void flash_attn_ext_kvarn_lowbits_stream(
 
 
 // Dedicated lower-bit instantiations leave the selected 4/4 kernels unchanged.
-template<int max_warps, int bits_k, int bits_v>
+template<int max_warps, int bits_k, int bits_v, bool rot = false>
 static void ggml_cuda_kvarn_lowbits_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, int nt, int kw) {
     using namespace fattn_kvarn_lowbits_stream;
     constexpr int stages = 6;
-    fattn_kernel_t kernel = flash_attn_ext_kvarn_lowbits_stream<max_warps, stages, bits_k, bits_v>;
+    fattn_kernel_t kernel = flash_attn_ext_kvarn_lowbits_stream<max_warps, stages, bits_k, bits_v, false, rot>;
     const int id = ggml_cuda_get_device();
+    // #139: the rot build plans its grid from the plain build's occupancy (register counts differ), so both launch alike
+    fattn_kernel_t plain = flash_attn_ext_kvarn_lowbits_stream<max_warps, stages, bits_k, bits_v, false, false>;
     const size_t shared = std::max(ring_bytes(kw, stages), (size_t) nt*(kw/2)*SLOT_BYTES);
     static bool initialized[GGML_CUDA_MAX_DEVICES] = {};
     if (!initialized[id]) {
         CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<const void *>(kernel), cudaFuncAttributeMaxDynamicSharedMemorySize,
                                        (int) ggml_cuda_info().devices[id].smpbo));
+        if (rot) {
+            CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<const void *>(plain), cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                           (int) ggml_cuda_info().devices[id].smpbo));
+        }
         initialized[id] = true;
     }
     launch_fattn<D, NCOLS2, NCOLS2>(ctx, dst, kernel, nt*kw, shared, UNIT,
-        false, false, false, false, WARP_SIZE, 0);
+        false, false, false, false, WARP_SIZE, 0, rot ? plain : nullptr);
 }
 
-template<int bits_k, int bits_v>
+template<int bits_k, int bits_v, bool rot = false>
 static void ggml_cuda_kvarn_lowbits_width(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int nt = dst->src[0]->ne[1];
     GGML_ASSERT(nt >= 1 && nt <= 8);
+    // [#139] the rot build rotates the output in-kernel; the plain build must not see the flag
+    GGML_ASSERT(rot == ggml_cuda_fattn_kvarn_rot(dst));
+    // [#139] rot: Q pre-pass here (pool buffer, read-only loads in the kernel), the node copy carries the rotated Q
+    ggml_cuda_pool_alloc<float> q_rot;
+    ggml_tensor q2, d2;
+    if constexpr (rot) {
+        q_rot.alloc(ctx.pool(), ggml_nelements(dst->src[0]));
+        ggml_cuda_kvarn_rot256_q_pass(ctx, dst->src[0], q_rot.ptr, &q2);
+        d2 = *dst;
+        d2.src[0] = &q2;
+        dst = &d2;
+    }
     if (nt <= 4) {
-        ggml_cuda_kvarn_lowbits_launch<4,bits_k,bits_v>(ctx,dst,nt,nt == 1 ? 2 : 4/nt);
+        ggml_cuda_kvarn_lowbits_launch<4,bits_k,bits_v,rot>(ctx,dst,nt,nt == 1 ? 2 : 4/nt);
     } else if (nt == 5) {
-        ggml_cuda_kvarn_lowbits_launch<5,bits_k,bits_v>(ctx,dst,nt,1);
+        ggml_cuda_kvarn_lowbits_launch<5,bits_k,bits_v,rot>(ctx,dst,nt,1);
     } else {
-        ggml_cuda_kvarn_lowbits_launch<8,bits_k,bits_v>(ctx,dst,nt,1);
+        ggml_cuda_kvarn_lowbits_launch<8,bits_k,bits_v,rot>(ctx,dst,nt,1);
     }
 }
 

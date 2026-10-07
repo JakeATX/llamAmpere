@@ -1177,6 +1177,7 @@ struct llm_graph_context {
         ggml_tensor * desc = nullptr;
         int32_t bits_k = 0;
         int32_t bits_v = 0;
+        bool fused_rot = false; // Q/output rotation inside the FA node (ggml_kvarn_fused_rot_enabled)
     } kvarn_pending;
 
     llm_graph_context(const llm_graph_params & params);
