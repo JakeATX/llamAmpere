@@ -501,7 +501,14 @@ k_exl3_gemv(const uint32_t * __restrict__ trellis, half2 * __restrict__ x, float
 //      tokens only (B fragments of tokens >= T are register zeros instead of zero rows in shared memory): 2*T KiB of
 //      shared memory per block instead of 16 KiB, so more blocks fit per SM.
 // GGML_CUDA_EXL3_DEC=0 selects k_exl3_gemv (A/B and the identity test); the cooperative FUSED path is unchanged.
-template <int BITS, int T, bool WM>
+//
+// [#41 EXL3W] FR (weight-major only): x is staged in the mma B-fragment order, xf[kl][token][q] = {x[t][16kl + 2q, +1],
+// x[t][16kl + 2q + 8, +9]} (one uint2 per lane per tile), instead of row-major [token][k]. The row-major layout put every
+// token row on the same banks (row pitch 512 words), so the two 32-bit B loads of a tile were T-way bank conflicts:
+// 2*T shared-memory wavefronts per tile per warp, a cost that grows with the verify width and at T = 8 nearly fills the
+// shared-memory pipe at full DRAM rate. The fragment layout is one conflict-free 64-bit load (T*32 contiguous bytes).
+// Same B values, same mma, same everything else => same output bits. GGML_CUDA_EXL3_VW=0 selects the row-major layout.
+template <int BITS, int T, bool WM, bool FR = false>
 static __global__ void __launch_bounds__(32 * EXL3_GEMV_NWARPS)
 k_exl3_gemv_dec(const uint32_t * __restrict__ trellis, const half2 * __restrict__ x, float * __restrict__ y,
                 const int kt, const int nt, const int K, const int N, const int ksplit, const int kpi) {
@@ -510,6 +517,7 @@ k_exl3_gemv_dec(const uint32_t * __restrict__ trellis, const half2 * __restrict_
     constexpr bool WEIGHT_MAJOR = WM && MMA && T >= 2 && T <= 8;
     constexpr int  XROWS        = cfg::XROWS;
     constexpr int  XS_ROWS      = WEIGHT_MAJOR ? T : XROWS;   // staged x rows; weight-major zeros tokens >= T in registers
+    constexpr bool FRAG         = FR && WEIGHT_MAJOR;          // B-fragment staging layout (same bytes as xs)
     constexpr int  KTILES_MAX   = cfg::KTILES_MAX;
     constexpr int  NW     = 8 * BITS;
     constexpr int  NBITS  = 256 * BITS;
@@ -542,6 +550,7 @@ k_exl3_gemv_dec(const uint32_t * __restrict__ trellis, const half2 * __restrict_
 
     __shared__ float part[2][EXL3_GEMV_NWARPS][T][WEIGHT_MAJOR ? 20 : 16];
     __shared__ __align__(16) half2 xs[XS_ROWS][KTILES_MAX * 8];
+    uint2 * xf = reinterpret_cast<uint2 *>(&xs[0][0]);   // FRAG: [KTILES_MAX][T][4] uint2 = the same T*KTILES_MAX*32 B
 
     if (MMA && T < XS_ROWS) {   // x-as-A mma: A rows T..XROWS-1 are zero (ordered by the first staging barrier)
         half2 * z = &xs[T < XS_ROWS ? T : 0][0];
@@ -594,8 +603,15 @@ k_exl3_gemv_dec(const uint32_t * __restrict__ trellis, const half2 * __restrict_
         if constexpr (WEIGHT_MAJOR) {
             // B = x^T: lane (g, q) holds tokens g of k rows (2q, 2q+1) and (2q+8, 2q+9); tokens >= T are zero
             const int gr = g < T ? g : 0;
-            const uint32_t x0 = exl3_h2u(xs[gr][kl * 8 + q]);
-            const uint32_t x1 = exl3_h2u(xs[gr][kl * 8 + q + 4]);
+            uint32_t x0, x1;
+            if constexpr (FRAG) {
+                const uint2 xb = xf[(kl * T + gr) * 4 + q];
+                x0 = xb.x;
+                x1 = xb.y;
+            } else {
+                x0 = exl3_h2u(xs[gr][kl * 8 + q]);
+                x1 = exl3_h2u(xs[gr][kl * 8 + q + 4]);
+            }
             const uint32_t b0 = (T >= 8 || g < T) ? x0 : 0u;
             const uint32_t b1 = (T >= 8 || g < T) ? x1 : 0u;
             const uint32_t wa[4] = {exl3_h2u(wv[0]), exl3_h2u(wv[2]), exl3_h2u(wv[1]), exl3_h2u(wv[3])};
@@ -707,11 +723,23 @@ k_exl3_gemv_dec(const uint32_t * __restrict__ trellis, const half2 * __restrict_
 
         if (cur.ks != staged) {
             // every thread is past the previous item's barrier, so its tile loop no longer reads xs
+            if constexpr (FRAG) {
+                // p = (kl * T + t) * 4 + q  ->  {x[t][kl*8 + q], x[t][kl*8 + q + 4]} (half2 units)
+                for (int p = threadIdx.x; p < cur.nk * T * 4; p += 32 * EXL3_GEMV_NWARPS) {
+                    const int qq = p & 3;
+                    const int r  = p >> 2;
+                    const int kl = r / T;
+                    const int t  = r - kl * T;
+                    const half2 * xt = x + (size_t) t * (K / 2) + (size_t) (cur.kb + kl) * 8 + qq;
+                    xf[p] = make_uint2(exl3_h2u(xt[0]), exl3_h2u(xt[4]));
+                }
+            } else {
 #pragma unroll
-            for (int t = 0; t < T; ++t) {
-                const half2 * xt = x + (size_t) t * (K / 2) + (size_t) cur.kb * 8;
-                for (int p = threadIdx.x; p < cur.nk * 8; p += 32 * EXL3_GEMV_NWARPS) {
-                    xs[t][p] = xt[p];
+                for (int t = 0; t < T; ++t) {
+                    const half2 * xt = x + (size_t) t * (K / 2) + (size_t) cur.kb * 8;
+                    for (int p = threadIdx.x; p < cur.nk * 8; p += 32 * EXL3_GEMV_NWARPS) {
+                        xs[t][p] = xt[p];
+                    }
                 }
             }
             __syncthreads();
@@ -1018,12 +1046,27 @@ static bool exl3_gemv_dec_enabled() {
     return enabled;
 }
 
-template <int BITS, int T, bool WM>
+// [#41 EXL3W] GGML_CUDA_EXL3_VW=0 selects the row-major x staging in the weight-major dec kernel (same output bits)
+static bool exl3_gemv_vw_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_EXL3_VW");
+        return env == nullptr || strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+template <int BITS, int T, bool WM, bool FR = false>
 static void exl3_gemv_dec_launch_bt(const exl3_gemv_args & a, cudaStream_t stream) {
+    if constexpr (WM && !FR) {
+        if (exl3_gemv_vw_enabled()) {
+            exl3_gemv_dec_launch_bt<BITS, T, WM, true>(a, stream);
+            return;
+        }
+    }
     static int grid_max = 0;   // resident blocks on the device (per instantiation), measured once
     if (grid_max == 0) {
         int nb = 0;
-        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, k_exl3_gemv_dec<BITS, T, WM>, 32 * EXL3_GEMV_NWARPS, 0));
+        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, k_exl3_gemv_dec<BITS, T, WM, FR>, 32 * EXL3_GEMV_NWARPS, 0));
         grid_max = std::max(1, nb) * ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
     }
     const int kpi = (a.kt + a.ksplit - 1) / a.ksplit;   // same k-split as k_exl3_gemv => same output bits
@@ -1041,9 +1084,9 @@ static void exl3_gemv_dec_launch_bt(const exl3_gemv_args & a, cudaStream_t strea
     static bool announced = false;
     if (!announced) {
         announced = true;
-        GGML_LOG_WARN("EXL3 decode GEMV k_exl3_gemv_dec engaged (bits %d, T %d, weight-major %d)\n", BITS, T, (int) WM);
+        GGML_LOG_WARN("EXL3 decode GEMV k_exl3_gemv_dec engaged (bits %d, T %d, weight-major %d, fragment staging %d)\n", BITS, T, (int) WM, (int) FR);
     }
-    k_exl3_gemv_dec<BITS, T, WM><<<grid, 32 * EXL3_GEMV_NWARPS, 0, stream>>>(
+    k_exl3_gemv_dec<BITS, T, WM, FR><<<grid, 32 * EXL3_GEMV_NWARPS, 0, stream>>>(
         a.trellis, a.x, a.out, a.kt, a.nt, a.K, a.N, a.ksplit, kpi);
 }
 
