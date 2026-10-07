@@ -63,9 +63,18 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
         // parallel initialization
         static const size_t n_threads = std::max<size_t>(1, std::min<size_t>(nels/1024, std::min<size_t>(4, N_THREADS/2)));
 
+        // GGML_TEST_SEED: per-chunk seeded inputs, reproducible across runs and builds (bit-identity checks)
+        static const char * seed_env = getenv("GGML_TEST_SEED");
         auto init_thread = [&](size_t start, size_t end) {
             thread_local std::default_random_engine gen(std::random_device{}());
             std::uniform_real_distribution<float> distribution(min, max);
+            if (seed_env != nullptr) {
+                std::default_random_engine seeded((unsigned) (strtoul(seed_env, nullptr, 10) ^ (start*2654435761u) ^ (nels*40503u)));
+                for (size_t i = start; i < end; i++) {
+                    data[i] = distribution(seeded);
+                }
+                return;
+            }
             for (size_t i = start; i < end; i++) {
                 data[i] = distribution(gen);
             }
@@ -1565,6 +1574,14 @@ struct test_case {
                 }
             }
 
+            if (t1->op == GGML_OP_FLASH_ATTN_EXT && getenv("GGML_TEST_DUMP_HASH")) {
+                // raw backend1 output bytes (FNV-1a 64) for bit-identity checks between two builds
+                std::vector<uint8_t> raw(ggml_nbytes(t1));
+                ggml_backend_tensor_get(t1, raw.data(), 0, raw.size());
+                uint64_t h = 1469598103934665603ULL;
+                for (const uint8_t b : raw) { h = (h ^ b) * 1099511628211ULL; }
+                printf("TBOHASH\t%s\t%s\t%016" PRIx64 "\n", ggml_op_desc(t1), ud->tc->vars().c_str(), h);
+            }
             double err = ud->tc->err(f1.data(), f2.data(), f1.size());
             if (getenv("GGML_TBO_DUMP_ERR")) {
                 // machine-parseable: op, shape vars, error vs the CPU reference
@@ -14141,6 +14158,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext_kvarn(n_q, 24, 4, 3, 4096, true, false, GGML_TYPE_TQ6_0, 128, true));
     }
     test_cases.emplace_back(new test_flash_attn_ext_kvarn(257, 24, 3, 60, 300, true, true, GGML_TYPE_TQ6_0, 128, true));
+    // [KVRP] tq6 ring at 1024/4096/8192 rows with the f16 sink: the cp.async-pipelined exact strips
+    for (int64_t n_ring : {1024, 4096, 8192}) {
+        for (int64_t n_q : {1, 4, 5, 8}) {
+            test_cases.emplace_back(new test_flash_attn_ext_kvarn(n_q, 24, 4, 3, n_ring, true, false, GGML_TYPE_TQ6_0, 128, true));
+        }
+    }
     test_cases.emplace_back(new test_kvarn_seal(256, 128, 4, 2, 4, 4, 16, false, GGML_TYPE_TQ6_0));
     test_cases.emplace_back(new test_kvarn_seal(256, 128, 2, 1, 4, 4, 16, true, GGML_TYPE_TQ6_0));
     for (int64_t n_q : {1, 4, 5, 6, 8, 129, 256}) {
@@ -14803,6 +14826,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (int64_t n_q : {1, 5, 1024}) {
         test_cases.emplace_back(new test_flash_attn_ext_kvarn(n_q, 24, 4, 792, 8192, false, false, GGML_TYPE_TQ6_0, 128, true));
     }
+    // [KVRP] the adaptive tail between its 4096 floor and 8192 cap, and width 4 at the cap
+    for (int64_t n_q : {1, 4, 5}) {
+        test_cases.emplace_back(new test_flash_attn_ext_kvarn(n_q, 24, 4, 792, 4096, false, false, GGML_TYPE_TQ6_0, 128, true));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_kvarn(4, 24, 4, 792, 8192, false, false, GGML_TYPE_TQ6_0, 128, true));
     // Compare exact-tail traffic at the same 32896 visible positions.
     for (int64_t n_q : {4, 5}) {
         test_cases.emplace_back(new test_flash_attn_ext_kvarn(n_q, 24, 4, 255, 128));
