@@ -1,4 +1,5 @@
 #include "fattn-kvarn-lowbits-stream.cuh"
+#include <atomic>
 #include <cstdlib>
 
 template <int DKQ, int DV, int ncols1, int ncols2, int bits_k, int bits_v>
@@ -100,9 +101,8 @@ static bool kvarn_trellis_words() {
 }
 // route proof for end-to-end gates: one line on the first trellis attention call that takes the word-load build
 static void kvarn_trellis_words_note() {
-    static bool done = false;
-    if (!done) {
-        done = true;
+    static std::atomic_flag done = ATOMIC_FLAG_INIT;
+    if (!done.test_and_set()) {
         GGML_LOG_INFO("%s: KVarN trellis attention uses the word-load decode (GGML_KVARN_TRELLIS_WORDS=0 disables)\n", __func__);
     }
 }

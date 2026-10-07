@@ -85,7 +85,8 @@ static fattn_kvarn_cb3_registrar fattn_kvarn_cb3_registrar_instance;
 // 16 byte-load) copy the K table to [0, 512) and the V table to [FATTN_KVARN_CB_SMEM_V, +512) once per CTA, from the
 // per-device __device__ symbols, i.e. after ggml_cuda_kvarn_trellis_cb_init() has copied any GGML_KVARN_TRELLIS_CB*
 // override in. 2-bit tables fill the first 256 entries of their half. Only kernels that reference the array allocate it
-// (2 KB). Every 2/3-bit trellis decode reads this copy; the 4-bit token-axis trellis4 table (opt-in) stays global.
+// (2 KB, static: on top of the dynamic tile smem, below the SM86 per-CTA limit for every lowbits instance). Every
+// 2/3-bit trellis decode reads this copy; the 4-bit token-axis trellis4 table (opt-in) stays global.
 #define FATTN_KVARN_CB_SMEM_V FATTN_KVARN_TR3_NWIN
 static __shared__ uint16_t fattn_kvarn_cb_smem[2*FATTN_KVARN_CB_SMEM_V];
 
@@ -116,6 +117,7 @@ static __device__ __forceinline__ uint16_t fattn_kvarn_trellis_cb_at(const uint3
 
 // The 8 values of MMA fragment word `word` (same nibble -> (token, channel) map as kvarn_lowbits::fragment_word)
 // decoded through the BITS-bit trellis codebook, packed as q[l] = (value l, value l+4) like fattn_kvarn_lowbits_decode_word.
+// BITS 2/3 read the shared codebook copy: only call from a kernel that ran fattn_kvarn_trellis_cb_stage first.
 template<int BITS, bool is_V>
 static __device__ __forceinline__ void fattn_kvarn_trellis_lb_word(const uint8_t * __restrict__ payload, const int word, half2 * const __restrict__ q /* [4] */) {
     static_assert(BITS >= 2 && BITS <= 4, "low-bit trellis decode (4 = token-axis trellis4)");
@@ -146,7 +148,7 @@ static __device__ __forceinline__ void fattn_kvarn_trellis_lb_word(const uint8_t
 
 // Word-load decode (default; GGML_KVARN_TRELLIS_WORDS=0 selects the byte loader): the same 8 values as fattn_kvarn_trellis_lb_word, bit-identical, read with aligned
 // 32-bit payload loads (one 2-3 word run per token covers 2-4 codes plus their history) instead of two byte loads
-// per code, codebook from the staged shared copy. K: 2 tokens x 4 channels per lane; V: 4 tokens x 2 channels per lane.
+// per code, codebook from the staged shared copy (the kernel must run fattn_kvarn_trellis_cb_stage first). K: 2 tokens x 4 channels per lane; V: 4 tokens x 2 channels per lane.
 // Every word read lies inside the record (payloads are followed by metadata; record/payload offsets are 4-byte aligned).
 template<int BITS, bool is_V>
 static __device__ __forceinline__ void fattn_kvarn_trellis_lb_word_w(const uint8_t * __restrict__ payload, const int word, half2 * const __restrict__ q /* [4] */) {
@@ -319,16 +321,11 @@ static __device__ __forceinline__ const char * fattn_kvarn_lowbits_sink_row(
         (is_v ? kv.sink_head_delta_v : kv.sink_head_delta_k) + (size_t) row*kv.sink_stride;
 }
 
-// Packed ring storage is decoded into registers or shared tiles.
+// Packed ring storage is decoded into registers or shared tiles. f16 and q8_0 only: the one caller
+// (lowbits-stream ring fill) decodes tq6_0 rows itself with the warp-shuffle centroid table.
 static __device__ __forceinline__ half2 fattn_kvarn_lowbits_ring_pair(const char * row, const int pair, const int type) {
     if (type == GGML_TYPE_F16) {
         return ((const half2 *) row)[pair];
-    }
-    if (type == GGML_TYPE_TQ6_0) {
-        const block_tq6_0 * b = ((const block_tq6_0 *) row) + pair/(QK_TQ6/2);
-        const int i = 2*(pair%(QK_TQ6/2));
-        const float norm = __half2float(b->norm);
-        return __floats2half2_rn(tq6_dequant_element(b, i, norm), tq6_dequant_element(b, i+1, norm));
     }
     const block_q8_0 & b = ((const block_q8_0 *) row)[pair/(QK8_0/2)];
     const int i = 2*(pair%(QK8_0/2));

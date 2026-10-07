@@ -523,7 +523,7 @@ KVARN_HD inline uint32_t trellis_lb_window(const uint8_t * payload, int t, int d
     return w;
 }
 // Same window as trellis_lb_window, taken from 32-bit words already loaded in registers (the fast attention decode,
-// GGML_KVARN_TRELLIS_WORDS=1). w0..w2 are consecutive payload words starting at word `base`; rel = code bit - 32*base,
+// the default; GGML_KVARN_TRELLIS_WORDS=0 selects the byte loader). w0..w2 are consecutive payload words starting at word `base`; rel = code bit - 32*base,
 // h = channel % 128 (history restart). Requires rel >= min(h*BITS, 6) and the window inside the 96 loaded bits.
 // The current code lands in the top BITS bits and missing history (h < HIST) reads as zero, exactly as above.
 template<int BITS>
