@@ -10,6 +10,10 @@
 // paths), or run under ggml_cuda_flash_attn_ext_kvarn_rot_unfused (fattn-kvarn-rot.cu), which strips the flag and
 // runs the rotations as separate passes around the path.
 
+// The butterfly adds use __fadd_rn / __fsub_rn (never contracted): inside a FA kernel the first stage follows the
+// output normalisation (x / rowsum, a reciprocal multiply under -use_fast_math), and a plain add lets nvcc fuse the two
+// into an FMA that rounds differently from the unfused graph (the 1-ulp low-bit prefill mismatch of the first gate).
+
 #pragma once
 
 #include "common.cuh"
@@ -23,13 +27,13 @@ static inline bool ggml_cuda_fattn_kvarn_rot(const ggml_tensor * dst) {
 // one butterfly stage across lanes: the partner value sits in lane ^ m; the lane with bit m set holds the upper index
 static __device__ __forceinline__ float kvarn_rot_xlane(const float x, const int lane, const int m) {
     const float p = __shfl_xor_sync(0xFFFFFFFF, x, m, WARP_SIZE);
-    return (lane & m) ? p - x : x + p;
+    return (lane & m) ? __fsub_rn(p, x) : __fadd_rn(x, p);
 }
 
 static __device__ __forceinline__ void kvarn_rot_pair(float & a, float & b) {
     const float x = a, y = b;
-    a = x + y;
-    b = x - y;
+    a = __fadd_rn(x, y);
+    b = __fsub_rn(x, y);
 }
 
 // Layout "row8": lane t holds elements 8t .. 8t+7 of one 256-row (the k_turbo_wht_f32_plain256 layout). Whole warp.
@@ -53,7 +57,7 @@ static __device__ __forceinline__ void kvarn_rot256_row8(float x[8], const int l
     }
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
-        x[j] *= 0.0625f;
+        x[j] = __fmul_rn(x[j], 0.0625f);
     }
 }
 
@@ -78,8 +82,8 @@ static __device__ __forceinline__ void kvarn_rot256_f2x4(float2 v[4], const int 
     kvarn_rot_pair(v[1].x, v[3].x); kvarn_rot_pair(v[1].y, v[3].y);
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
-        v[i].x *= 0.0625f;
-        v[i].y *= 0.0625f;
+        v[i].x = __fmul_rn(v[i].x, 0.0625f);
+        v[i].y = __fmul_rn(v[i].y, 0.0625f);
     }
 }
 
@@ -120,7 +124,7 @@ static __device__ __forceinline__ void kvarn_rot256_frag(T_C * acc, const int la
     for (int c = 0; c < NTC; ++c) {
 #pragma unroll
         for (int l = 0; l < 4; ++l) {
-            acc[c].x[l] *= 0.0625f;
+            acc[c].x[l] = __fmul_rn(acc[c].x[l], 0.0625f);
         }
     }
 }
@@ -138,10 +142,10 @@ static __device__ __forceinline__ float kvarn_rot256_block(float x, const int ti
         sh[tid] = x;
         __syncthreads();
         const float p = sh[tid ^ h];
-        x = (tid & h) ? p - x : x + p;
+        x = (tid & h) ? __fsub_rn(p, x) : __fadd_rn(x, p);
         __syncthreads();
     }
-    return x*0.0625f;
+    return __fmul_rn(x, 0.0625f);
 }
 
 // Q prologue of the stream decode kernels: rotate rows (row r = (query row nt, head column hc)) into the 256-float
