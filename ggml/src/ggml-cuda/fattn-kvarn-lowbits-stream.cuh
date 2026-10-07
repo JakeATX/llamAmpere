@@ -955,15 +955,21 @@ static void ggml_cuda_kvarn_lowbits_launch(ggml_backend_cuda_context & ctx, ggml
     constexpr int stages = 6;
     fattn_kernel_t kernel = flash_attn_ext_kvarn_lowbits_stream<max_warps, stages, bits_k, bits_v, false, rot>;
     const int id = ggml_cuda_get_device();
+    // #139: the rot build plans its grid from the plain build's occupancy (register counts differ), so both launch alike
+    fattn_kernel_t plain = flash_attn_ext_kvarn_lowbits_stream<max_warps, stages, bits_k, bits_v, false, false>;
     const size_t shared = std::max(ring_bytes(kw, stages), (size_t) nt*(kw/2)*SLOT_BYTES);
     static bool initialized[GGML_CUDA_MAX_DEVICES] = {};
     if (!initialized[id]) {
         CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<const void *>(kernel), cudaFuncAttributeMaxDynamicSharedMemorySize,
                                        (int) ggml_cuda_info().devices[id].smpbo));
+        if (rot) {
+            CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<const void *>(plain), cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                           (int) ggml_cuda_info().devices[id].smpbo));
+        }
         initialized[id] = true;
     }
     launch_fattn<D, NCOLS2, NCOLS2>(ctx, dst, kernel, nt*kw, shared, UNIT,
-        false, false, false, false, WARP_SIZE, 0);
+        false, false, false, false, WARP_SIZE, 0, rot ? plain : nullptr);
 }
 
 template<int bits_k, int bits_v, bool rot = false>

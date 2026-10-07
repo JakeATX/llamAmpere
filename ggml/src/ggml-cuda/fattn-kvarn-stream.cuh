@@ -888,8 +888,9 @@ static int ggml_cuda_fattn_kvarn_stream_occupancy(const int NT, const int KW) {
         return 0;
     }
     int blocks = 0;
+    // #139: always the plain build, so the rot build picks the same stage count and KV split
     CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks,
-        ggml_cuda_fattn_kvarn_stream_kernel<max_warps, NSTAGE, turbo4_body, rot>(), WARP_SIZE*NT*KW, shared));
+        ggml_cuda_fattn_kvarn_stream_kernel<max_warps, NSTAGE, turbo4_body, false>(), WARP_SIZE*NT*KW, shared));
     return blocks;
 }
 

@@ -90,7 +90,6 @@ static size_t fattn_kvarn_prefill_budget() {
 }
 
 bool ggml_cuda_flash_attn_ext_kvarn_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    GGML_ASSERT(!ggml_cuda_fattn_kvarn_rot(dst)); // [#139] no in-kernel rotation: fattn.cu runs it in separate passes
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
@@ -107,6 +106,7 @@ bool ggml_cuda_flash_attn_ext_kvarn_prefill(ggml_backend_cuda_context & ctx, ggm
             ggml_get_op_params_i32(dst, 5) != ((4 << 8) | 4) || n_kv <= 0 || n_kv % 256 != 0) {
         return false;
     }
+    GGML_ASSERT(!ggml_cuda_fattn_kvarn_rot(dst)); // [#139] no in-kernel rotation: fattn.cu runs it in separate passes
 
     const int gqa = Q->ne[2]/K->ne[2];
     const size_t kv_elements_per_head = size_t(n_kv)*256;
