@@ -1139,11 +1139,13 @@ static bool exl3_gemv_dec_enabled() {
     return enabled;
 }
 
-// [#41 EXL3W] GGML_CUDA_EXL3_DEC_TMIN=n: widths below n run k_exl3_gemv (same output bits as the dec kernel)
+// [#41 EXL3W] GGML_CUDA_EXL3_DEC_TMIN=n: widths below n run k_exl3_gemv (same output bits as the dec kernel). Default 2:
+// at width 1 the old kernel is ~9% faster per step (40 vs 56 registers, x restaging is cheap at T = 1; head 1360 vs
+// 1460 us), from width 2 the dec kernel is equal or faster (EXL3W_20261006 pf2a/ord1). 1 = dec at every width.
 static int exl3_gemv_dec_tmin() {
     static const int tmin = [] {
         const char * env = getenv("GGML_CUDA_EXL3_DEC_TMIN");
-        return env ? atoi(env) : 1;
+        return env ? atoi(env) : 2;
     }();
     return tmin;
 }
