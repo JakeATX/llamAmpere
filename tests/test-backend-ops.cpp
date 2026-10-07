@@ -63,8 +63,12 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
         // parallel initialization
         static const size_t n_threads = std::max<size_t>(1, std::min<size_t>(nels/1024, std::min<size_t>(4, N_THREADS/2)));
 
+        // GGML_TBO_SEED=n: deterministic inputs (per chunk seed) so output hashes compare across binaries/runs
+        static const char * tbo_seed = getenv("GGML_TBO_SEED");
         auto init_thread = [&](size_t start, size_t end) {
-            thread_local std::default_random_engine gen(std::random_device{}());
+            thread_local std::default_random_engine gen_rd(std::random_device{}());
+            std::default_random_engine gen_fixed(tbo_seed ? (uint32_t) (strtoul(tbo_seed, nullptr, 10) ^ (start*2654435761u) ^ nels) : 0u);
+            std::default_random_engine & gen = tbo_seed ? gen_fixed : gen_rd;
             std::uniform_real_distribution<float> distribution(min, max);
             for (size_t i = start; i < end; i++) {
                 data[i] = distribution(gen);
