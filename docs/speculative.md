@@ -508,7 +508,7 @@ p-min 0 and vocab map `auto`. Any explicit `--spec-type` (including `none`), `--
 (`-md`), `--eagle3` or `--dflash` turns this off, and so does an explicit `--spec-draft-n-max 0`. Explicit
 `--spec-draft-n-max`, `--spec-draft-n-min-adaptive`, `--spec-draft-p-min` and `--spec-draft-vocab-map` values are
 kept on top of the default. The default does not set the draft KV cache types: like any drafter's, they follow
-`-ctk`/`-ctv` unless `--spec-draft-type-k`/`-v` is given. Other tools (`llama-bench`, `llama-perplexity`, ...) are
+`-ctk`/`-ctv` unless `--spec-draft-type-k`/`-v` is given (over a KVarN trunk: `tq5_0`/`turbo4`). Other tools (`llama-bench`, `llama-perplexity`, ...) are
 unaffected. See [MTP drafter default](../tools/server/README.md#mtp-drafter-default).
 
 **Example:** Server-instance used to refactor source code.

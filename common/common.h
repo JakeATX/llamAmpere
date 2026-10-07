@@ -363,6 +363,7 @@ struct common_params_speculative_draft {
     // cache_type_k / cache_type_v (resolved in common_base_params_to_speculative)
     ggml_type cache_type_k = GGML_TYPE_COUNT; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_COUNT; // KV cache data type for the V
+    bool      cache_type_kvarn_default = false; // set on the resolved copy: an unset type took the KVarN-trunk default
 
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;

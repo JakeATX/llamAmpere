@@ -4424,7 +4424,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format(
             "KV cache data type for K for the draft model\n"
             "allowed values: %s\n"
-            "(default: the main model's K cache type from -ctk; pass f16 to force f16)",
+            "(default: the main model's K cache type from -ctk; tq5_0 for an MTP drafter over a KVarN trunk; pass f16 to force f16)",
             get_all_kv_cache_types().c_str()
         ),
         [](common_params & params, const std::string & value) {
@@ -4436,7 +4436,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format(
             "KV cache data type for V for the draft model\n"
             "allowed values: %s\n"
-            "(default: the main model's V cache type from -ctv; pass f16 to force f16)",
+            "(default: the main model's V cache type from -ctv; turbo4 for an MTP drafter over a KVarN trunk; pass f16 to force f16)",
             get_all_kv_cache_types().c_str()
         ),
         [](common_params & params, const std::string & value) {
