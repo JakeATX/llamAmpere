@@ -516,7 +516,7 @@ k_exl3_gemv(const uint32_t * __restrict__ trellis, half2 * __restrict__ x, float
 template <int BITS, int T, bool WM, bool FR = false, bool PF2 = false>
 static __global__ void __launch_bounds__(32 * EXL3_GEMV_NWARPS)
 k_exl3_gemv_dec(const uint32_t * __restrict__ trellis, const half2 * __restrict__ x, float * __restrict__ y,
-                const int kt, const int nt, const int K, const int N, const int ksplit, const int kpi) {
+                const int kt, const int nt, const int K, const int N, const int ksplit, const int kpi, const int bpk) {
     using cfg = exl3_gemv_cfg<T>;
     constexpr bool MMA          = cfg::MMA;
     constexpr bool WEIGHT_MAJOR = WM && MMA && T >= 2 && T <= 8;
@@ -742,16 +742,23 @@ k_exl3_gemv_dec(const uint32_t * __restrict__ trellis, const half2 * __restrict_
         }
     };
 
-    // the block's contiguous item range, k-split major (item = ks * nt + ni)
+    // bpk == 0: the block's contiguous item range, k-split major (item = ks * nt + ni).
+    // bpk > 0 ([#41 EXL3W] ORDER): bpk blocks per k-split; block b takes k-split b / bpk and the n-tiles
+    // b % bpk + j * bpk, j = 0, 1, .. Every block still stays on one k-split (x staged once), and the blocks that run
+    // at the same time read neighbouring n-tiles of the same k-tile rows (one contiguous front through the weights)
+    // instead of n-tiles ~n_items/grid apart. Same items, same per-item work => same output bits.
     const int n_items = nt * ksplit;
-    const int i_beg = (int) (((long long) blockIdx.x * n_items) / gridDim.x);
-    const int i_end = (int) (((long long) (blockIdx.x + 1) * n_items) / gridDim.x);
+    const int o_ks = bpk > 0 ? (int) blockIdx.x / bpk : 0;
+    const int o_nb = bpk > 0 ? (int) blockIdx.x - o_ks * bpk : 0;
+    const int i_beg = bpk > 0 ? 0 : (int) (((long long) blockIdx.x * n_items) / gridDim.x);
+    const int i_end = bpk > 0 ? ((o_ks < ksplit && o_nb < nt) ? (nt - o_nb + bpk - 1) / bpk : 0)
+                              : (int) (((long long) (blockIdx.x + 1) * n_items) / gridDim.x);
 
     struct item_t { int ks, ni, kb, nk, n_my; const uint32_t * wp; };
     auto setup = [&](const int item) {
         item_t it;
-        it.ks   = item / nt;
-        it.ni   = item - it.ks * nt;
+        it.ks   = bpk > 0 ? o_ks : item / nt;
+        it.ni   = bpk > 0 ? o_nb + item * bpk : item - it.ks * nt;
         it.kb   = it.ks * kpi;
         it.nk   = min(kpi, kt - it.kb);
         it.n_my = max(0, (it.nk - warp + EXL3_GEMV_NWARPS - 1) / EXL3_GEMV_NWARPS);   // nk < 0 past the last k-split
@@ -1132,6 +1139,15 @@ static bool exl3_gemv_dec_enabled() {
     return enabled;
 }
 
+// [#41 EXL3W] GGML_CUDA_EXL3_DEC_TMIN=n: widths below n run k_exl3_gemv (same output bits as the dec kernel)
+static int exl3_gemv_dec_tmin() {
+    static const int tmin = [] {
+        const char * env = getenv("GGML_CUDA_EXL3_DEC_TMIN");
+        return env ? atoi(env) : 1;
+    }();
+    return tmin;
+}
+
 // [#41 EXL3W] GGML_CUDA_EXL3_VW=0 selects the row-major x staging in the weight-major dec kernel (same output bits)
 static bool exl3_gemv_vw_enabled() {
     static const bool enabled = [] {
@@ -1145,6 +1161,15 @@ static bool exl3_gemv_vw_enabled() {
 static bool exl3_gemv_pf2_enabled() {
     static const bool enabled = [] {
         const char * env = getenv("GGML_CUDA_EXL3_PF2");
+        return env == nullptr || strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+// [#41 EXL3W] GGML_CUDA_EXL3_ORDER=0 keeps the contiguous per-block item ranges in the dec kernel (same bits)
+static bool exl3_gemv_order_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_EXL3_ORDER");
         return env == nullptr || strcmp(env, "0") != 0;
     }();
     return enabled;
@@ -1179,16 +1204,21 @@ static void exl3_gemv_dec_launch_bt(const exl3_gemv_args & a, cudaStream_t strea
         const char * env = getenv("GGML_CUDA_EXL3_DEC_GRID");
         return env ? std::max(0, atoi(env)) : 0;
     }();
-    const int grid = grid_cap > 0 ? std::min({n_items, grid_max, grid_cap}) : std::min(n_items, grid_max);
+    int grid = grid_cap > 0 ? std::min({n_items, grid_max, grid_cap}) : std::min(n_items, grid_max);
+    // ORDER: whole groups of blocks per k-split (grid >= ksplit; else the contiguous ranges)
+    const int bpk = exl3_gemv_order_enabled() && grid >= a.ksplit ? grid / a.ksplit : 0;
+    if (bpk > 0) {
+        grid = bpk * a.ksplit;
+    }
     // engagement line, once per (bits, T, layout) instantiation (WARN so it reaches server logs at default verbosity);
     // the old kernel (GGML_CUDA_EXL3_DEC=0) never gets here
     static bool announced = false;
     if (!announced) {
         announced = true;
-        GGML_LOG_WARN("EXL3 decode GEMV k_exl3_gemv_dec engaged (bits %d, T %d, weight-major %d, fragment staging %d, prefetch depth %d)\n", BITS, T, (int) WM, (int) FR, PF2 ? 2 : 1);
+        GGML_LOG_WARN("EXL3 decode GEMV k_exl3_gemv_dec engaged (bits %d, T %d, weight-major %d, fragment staging %d, prefetch depth %d, k-split order %d)\n", BITS, T, (int) WM, (int) FR, PF2 ? 2 : 1, (int) (bpk > 0));
     }
     k_exl3_gemv_dec<BITS, T, WM, FR, PF2><<<grid, 32 * EXL3_GEMV_NWARPS, 0, stream>>>(
-        a.trellis, a.x, a.out, a.kt, a.nt, a.K, a.N, a.ksplit, kpi);
+        a.trellis, a.x, a.out, a.kt, a.nt, a.K, a.N, a.ksplit, kpi, bpk);
 }
 
 // the weight-major mma covers every bit width here on SM86 (k_exl3_gemv: 3/4-bit only; bit-identical to the x-as-A mma on SM86
@@ -1226,7 +1256,7 @@ static void exl3_gemv_dec_launch(const exl3_gemv_args & a, const int bits, cudaS
 template <int T, bool FUSED>
 static void exl3_gemv_launch(const exl3_gemv_args & a, const int bits, cudaStream_t stream) {
     if constexpr (!FUSED) {
-        if (exl3_gemv_dec_enabled()) {
+        if (exl3_gemv_dec_enabled() && T >= exl3_gemv_dec_tmin()) {
             exl3_gemv_dec_launch<T>(a, bits, stream);
             return;
         }
