@@ -508,7 +508,12 @@ k_exl3_gemv(const uint32_t * __restrict__ trellis, half2 * __restrict__ x, float
 // 2*T shared-memory wavefronts per tile per warp, a cost that grows with the verify width and at T = 8 nearly fills the
 // shared-memory pipe at full DRAM rate. The fragment layout is one conflict-free 64-bit load (T*32 contiguous bytes).
 // Same B values, same mma, same everything else => same output bits. GGML_CUDA_EXL3_VW=0 selects the row-major layout.
-template <int BITS, int T, bool WM, bool FR = false>
+// [#41 EXL3W] PF2: two load groups in flight per warp instead of one. The prefetch buffer holds the next 8 tiles as
+// two halves; each half is refilled right after it is consumed, so 8 tiles of trellis words are outstanding while 4 are
+// computed (before: 4 while 4). At T >= 5 the kernel runs fewer resident warps (shared memory per block grows with T),
+// so it needs more bytes in flight per warp to cover DRAM latency. Same tiles, same fold-every-4 schedule, same order
+// => same output bits. GGML_CUDA_EXL3_PF2=0 keeps one group in flight.
+template <int BITS, int T, bool WM, bool FR = false, bool PF2 = false>
 static __global__ void __launch_bounds__(32 * EXL3_GEMV_NWARPS)
 k_exl3_gemv_dec(const uint32_t * __restrict__ trellis, const half2 * __restrict__ x, float * __restrict__ y,
                 const int kt, const int nt, const int K, const int N, const int ksplit, const int kpi) {
@@ -692,6 +697,50 @@ k_exl3_gemv_dec(const uint32_t * __restrict__ trellis, const half2 * __restrict_
             }
         }
     };
+    // PF2: pf2[h] = half h (tiles 4h..4h+3) of the warp's next 8-tile group
+    uint32_t pf2[2][U][NL] = {};
+    auto load_half = [&](const int h, const uint32_t * base, const int cnt) {
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            if (u < cnt) {
+#pragma unroll
+                for (int m = 0; m < NL; ++m) {
+                    pf2[h][u][m] = __ldcs(base + (size_t) u * sw + loff[m]);
+                }
+            }
+        }
+    };
+    auto take = [&](const uint32_t (&src)[U][NL], uint32_t (&w)[U][NWORDS]) {
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+#pragma unroll
+            for (int m = 0; m < NWORDS; ++m) {
+                if (SHFL) {
+                    w[u][m] = (BITS == 4 && m == 1) ? src[u][0] : __shfl_sync(0xffffffffu, src[u][0], woff[m]);
+                } else {
+                    w[u][m] = src[u][SHFL ? 0 : m];
+                }
+            }
+        }
+    };
+    // one original 4-tile load group: full groups fold once, the tail group folds after every tile (as k_exl3_gemv)
+    auto run_group = [&](const uint32_t (&w)[U][NWORDS], const int step, const int cnt) {
+        if (cnt == U) {
+#pragma unroll
+            for (int u = 0; u < U; ++u) {
+                tile_fma(w[u], (step + u) * EXL3_GEMV_NWARPS + warp);
+            }
+            fold();
+        } else {
+#pragma unroll
+            for (int u = 0; u < U; ++u) {
+                if (u < cnt) {
+                    tile_fma(w[u], (step + u) * EXL3_GEMV_NWARPS + warp);
+                    fold();
+                }
+            }
+        }
+    };
 
     // the block's contiguous item range, k-split major (item = ks * nt + ni)
     const int n_items = nt * ksplit;
@@ -713,7 +762,12 @@ k_exl3_gemv_dec(const uint32_t * __restrict__ trellis, const half2 * __restrict_
     item_t cur = {};
     if (i_beg < i_end) {
         cur = setup(i_beg);
-        load_group(cur.wp, min(U, cur.n_my));
+        if constexpr (PF2) {
+            load_half(0, cur.wp, min(U, cur.n_my));
+            load_half(1, cur.wp + (size_t) U * sw, min(U, cur.n_my - U));
+        } else {
+            load_group(cur.wp, min(U, cur.n_my));
+        }
     }
     int staged = -1;
     int pb     = 0;
@@ -757,6 +811,37 @@ k_exl3_gemv_dec(const uint32_t * __restrict__ trellis, const half2 * __restrict_
             accg[s] = make_float2(0.0f, 0.0f);
         }
 
+        if constexpr (PF2) {
+            for (int step = 0; step < cur.n_my; step += 2 * U) {
+                const bool more = step + 2 * U < cur.n_my;   // the next 8-tile group is in this item
+                uint32_t w[U][NWORDS];
+                // half 0: tiles step..step+3 (always present)
+                take(pf2[0], w);
+                if (more) {
+                    load_half(0, cur.wp + (size_t) (step + 2 * U) * sw, min(U, cur.n_my - step - 2 * U));
+                } else if (has_next) {
+                    load_half(0, nxt.wp, min(U, nxt.n_my));
+                }
+                run_group(w, step, min(U, cur.n_my - step));
+                // half 1: tiles step+4..step+7 (absent in an item's short last group)
+                const int cnt1 = cur.n_my - step - U;
+                if (cnt1 > 0) {
+                    take(pf2[1], w);
+                }
+                if (more) {
+                    load_half(1, cur.wp + (size_t) (step + 3 * U) * sw, min(U, cur.n_my - step - 3 * U));
+                } else if (has_next) {
+                    load_half(1, nxt.wp + (size_t) U * sw, min(U, nxt.n_my - U));
+                }
+                if (cnt1 > 0) {
+                    run_group(w, step + U, min(U, cnt1));
+                }
+            }
+            if (cur.n_my == 0 && has_next) {
+                load_half(0, nxt.wp, min(U, nxt.n_my));
+                load_half(1, nxt.wp + (size_t) U * sw, min(U, nxt.n_my - U));
+            }
+        } else {
         for (int step = 0; step < cur.n_my; step += U) {
             const int cnt = min(U, cur.n_my - step);
             uint32_t w[U][NWORDS];
@@ -794,6 +879,7 @@ k_exl3_gemv_dec(const uint32_t * __restrict__ trellis, const half2 * __restrict_
         }
         if (cur.n_my == 0 && has_next) {
             load_group(nxt.wp, min(U, nxt.n_my));
+        }
         }
 
         float (&pp)[EXL3_GEMV_NWARPS][T][WEIGHT_MAJOR ? 20 : 16] = part[pb];
@@ -1055,7 +1141,16 @@ static bool exl3_gemv_vw_enabled() {
     return enabled;
 }
 
-template <int BITS, int T, bool WM, bool FR = false>
+// [#41 EXL3W] GGML_CUDA_EXL3_PF2=0 keeps one load group in flight per warp in the fragment-staged dec kernel (same bits)
+static bool exl3_gemv_pf2_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_EXL3_PF2");
+        return env == nullptr || strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+template <int BITS, int T, bool WM, bool FR = false, bool PF2 = false>
 static void exl3_gemv_dec_launch_bt(const exl3_gemv_args & a, cudaStream_t stream) {
     if constexpr (WM && !FR) {
         if (exl3_gemv_vw_enabled()) {
@@ -1063,10 +1158,16 @@ static void exl3_gemv_dec_launch_bt(const exl3_gemv_args & a, cudaStream_t strea
             return;
         }
     }
+    if constexpr (WM && FR && !PF2) {
+        if (exl3_gemv_pf2_enabled()) {
+            exl3_gemv_dec_launch_bt<BITS, T, WM, true, true>(a, stream);
+            return;
+        }
+    }
     static int grid_max = 0;   // resident blocks on the device (per instantiation), measured once
     if (grid_max == 0) {
         int nb = 0;
-        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, k_exl3_gemv_dec<BITS, T, WM, FR>, 32 * EXL3_GEMV_NWARPS, 0));
+        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, k_exl3_gemv_dec<BITS, T, WM, FR, PF2>, 32 * EXL3_GEMV_NWARPS, 0));
         grid_max = std::max(1, nb) * ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
     }
     const int kpi = (a.kt + a.ksplit - 1) / a.ksplit;   // same k-split as k_exl3_gemv => same output bits
@@ -1084,9 +1185,9 @@ static void exl3_gemv_dec_launch_bt(const exl3_gemv_args & a, cudaStream_t strea
     static bool announced = false;
     if (!announced) {
         announced = true;
-        GGML_LOG_WARN("EXL3 decode GEMV k_exl3_gemv_dec engaged (bits %d, T %d, weight-major %d, fragment staging %d)\n", BITS, T, (int) WM, (int) FR);
+        GGML_LOG_WARN("EXL3 decode GEMV k_exl3_gemv_dec engaged (bits %d, T %d, weight-major %d, fragment staging %d, prefetch depth %d)\n", BITS, T, (int) WM, (int) FR, PF2 ? 2 : 1);
     }
-    k_exl3_gemv_dec<BITS, T, WM, FR><<<grid, 32 * EXL3_GEMV_NWARPS, 0, stream>>>(
+    k_exl3_gemv_dec<BITS, T, WM, FR, PF2><<<grid, 32 * EXL3_GEMV_NWARPS, 0, stream>>>(
         a.trellis, a.x, a.out, a.kt, a.nt, a.K, a.N, a.ksplit, kpi);
 }
 
