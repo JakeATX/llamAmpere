@@ -1634,28 +1634,6 @@ struct test_case {
                 // machine-parseable: op, shape vars, error vs the CPU reference
                 printf("TBOERR\t%s\t%s\t%.12g\n", ggml_op_desc(t1), ud->tc->vars().c_str(), err);
             }
-            if (t1->op == GGML_OP_FLASH_ATTN_EXT && getenv("GGML_TBO_FA_HASH")) {
-                // bit-identity across builds: FNV-1a over the backend1 output, optional raw dump for NMSE between builds
-                uint64_t h = 1469598103934665603ULL;
-                const uint8_t * bytes = (const uint8_t *) f1.data();
-                for (size_t i = 0; i < f1.size()*sizeof(float); ++i) { h = (h ^ bytes[i]) * 1099511628211ULL; }
-                std::lock_guard<std::mutex> guard(g_test_output_mutex);
-                printf("TBOHASH\t%s\t%016llx\n", ud->tc->vars().c_str(), (unsigned long long) h);
-                if (const char * dir = getenv("GGML_TBO_FA_DUMP_DIR")) {
-                    char path[512];
-                    snprintf(path, sizeof(path), "%s/%016llx.f32", dir, (unsigned long long) std::hash<std::string>{}(ud->tc->vars()));
-                    if (FILE * f = fopen(path, "wb")) {
-                        fwrite(f1.data(), sizeof(float), f1.size(), f);
-                        fclose(f);
-                    }
-                    snprintf(path, sizeof(path), "%s/%016llx.ref.f32", dir, (unsigned long long) std::hash<std::string>{}(ud->tc->vars()));
-                    if (FILE * f = fopen(path, "wb")) {
-                        fwrite(f2.data(), sizeof(float), f2.size(), f);
-                        fclose(f);
-                    }
-                    printf("TBODUMP\t%s\t%016llx\n", ud->tc->vars().c_str(), (unsigned long long) std::hash<std::string>{}(ud->tc->vars()));
-                }
-            }
             static const bool print_nmse = getenv("GGML_TEST_BACKEND_PRINT_NMSE") != nullptr;
             if (print_nmse && t1->op == GGML_OP_FLASH_ATTN_EXT) {
                 std::lock_guard<std::mutex> guard(g_test_output_mutex);
@@ -14330,13 +14308,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_flash_attn_ext_kvarn(n_q, 24, 4, 3, n_ring, true, false, GGML_TYPE_TQ6_0, 128, true));
         }
     }
-    // [KVW35] every decode width 1..8 on the production staging, short body (generic NT5 path) and a 40-record body
-    // with several records per KV split
-    for (int64_t n_q = 1; n_q <= 8; ++n_q) {
-        test_cases.emplace_back(new test_flash_attn_ext_kvarn(n_q, 24, 4,  3, 1024, true, false, GGML_TYPE_TQ6_0, 128, true));
-        test_cases.emplace_back(new test_flash_attn_ext_kvarn(n_q, 24, 4, 40, 4096, true, false, GGML_TYPE_TQ6_0, 128, true));
-        test_cases.emplace_back(new test_flash_attn_ext_kvarn(n_q, 24, 4, 40,  300, false, false, GGML_TYPE_TQ6_0, 128, true));
-    }
     test_cases.emplace_back(new test_kvarn_seal(256, 128, 4, 2, 4, 4, 16, false, GGML_TYPE_TQ6_0));
     test_cases.emplace_back(new test_kvarn_seal(256, 128, 2, 1, 4, 4, 16, true, GGML_TYPE_TQ6_0));
     for (int64_t n_q : {1, 4, 5, 6, 8, 129, 256}) {
@@ -15074,22 +15045,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_flash_attn_ext_kvarn(n_q, 24, 4, 792, 4096, false, false, GGML_TYPE_TQ6_0, 128, true));
     }
     test_cases.emplace_back(new test_flash_attn_ext_kvarn(4, 24, 4, 792, 8192, false, false, GGML_TYPE_TQ6_0, 128, true));
-    // [KVW35] widths 1..8 x ring 1024/4096/8192 x 32K/100K body, production tq6 staging + f16 sink (scalar 4/4 body);
-    // the (n_q, 255|792, 1024) cells for n_q <= 5 and (1|5, 792, 8192) are already above
-    for (int64_t n_groups : {255, 792}) {
-        for (int64_t n_ring : {1024, 4096, 8192}) {
-            for (int64_t n_q = 1; n_q <= 8; ++n_q) {
-                if ((n_ring == 1024 && n_q <= 5) || (n_ring == 8192 && n_groups == 792 && (n_q == 1 || n_q == 5))) {
-                    continue;
-                }
-                test_cases.emplace_back(new test_flash_attn_ext_kvarn(n_q, 24, 4, n_groups, n_ring, false, false, GGML_TYPE_TQ6_0, 128, true));
-            }
-        }
-    }
-    // [KVW35] turbo4 body, widths 1..8 at the 100K body
-    for (int64_t n_q = 1; n_q <= 8; ++n_q) {
-        test_cases.emplace_back(new test_flash_attn_ext_kvarn(n_q, 24, 4, 792, 4096, false, false, GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_TURBO4_0));
-    }
     // Compare exact-tail traffic at the same 32896 visible positions.
     for (int64_t n_q : {4, 5}) {
         test_cases.emplace_back(new test_flash_attn_ext_kvarn(n_q, 24, 4, 255, 128));
