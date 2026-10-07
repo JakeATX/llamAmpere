@@ -35,6 +35,10 @@ std::vector<double> common_speculative_synth_rates_resolve(const common_params_s
 // return the conditional synthetic acceptance probabilities
 const std::vector<double> & common_speculative_get_synth_probs(const common_speculative * spec);
 
+// MTP drafter KV cache types over a KVarN trunk when --spec-draft-type-k/-v are not given ({K, V}).
+// Provisional: one line to change (tq6_0/tq6_0 once its fused verify-width kernel lands).
+inline constexpr ggml_type COMMON_KVARN_MTP_DRAFT_KV[2] = { GGML_TYPE_TQ5_0, GGML_TYPE_TURBO4_0 };
+
 common_params common_base_params_to_speculative(const common_params & params);
 
 struct common_speculative_output_limits {

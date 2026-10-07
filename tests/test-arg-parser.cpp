@@ -364,6 +364,49 @@ static void test(void) {
         assert(draft.cache_type_v == GGML_TYPE_F16);
     }
 
+    // a KVarN trunk cannot be inherited: unset draft types default to tq5_0 K / turbo4 V, explicit ones win
+    argv = {"binary_name", "-m", "model_file.gguf", "-ctk", "kvarn4", "-ctv", "kvarn4"};
+    common_params dkv_kvarn;
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), dkv_kvarn, LLAMA_EXAMPLE_SPECULATIVE));
+    {
+        const auto draft = common_base_params_to_speculative(dkv_kvarn);
+        assert(draft.cache_type_k == COMMON_KVARN_MTP_DRAFT_KV[0]);
+        assert(draft.cache_type_v == COMMON_KVARN_MTP_DRAFT_KV[1]);
+        assert(draft.speculative.draft.cache_type_kvarn_default);
+        assert(draft.kvarn_bits_k == 0 && draft.kvarn_bits_v == 0);
+    }
+    argv = {"binary_name", "-m", "model_file.gguf", "-ctk", "kvarn4", "-ctv", "kvarn4", "-ctkd", "f16", "-ctvd", "tq6_0"};
+    common_params dkv_kvarn_pin;
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), dkv_kvarn_pin, LLAMA_EXAMPLE_SPECULATIVE));
+    {
+        const auto draft = common_base_params_to_speculative(dkv_kvarn_pin);
+        assert(draft.cache_type_k == GGML_TYPE_F16);
+        assert(draft.cache_type_v == GGML_TYPE_TQ6_0);
+    }
+    {
+        const auto draft = common_base_params_to_speculative(dkv_inherit);
+        assert(!draft.speculative.draft.cache_type_kvarn_default);
+    }
+    // one side explicit, the other takes the KVarN default
+    argv = {"binary_name", "-m", "model_file.gguf", "-ctk", "kvarn4", "-ctv", "kvarn4", "-ctkd", "q8_0"};
+    common_params dkv_kvarn_k;
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), dkv_kvarn_k, LLAMA_EXAMPLE_SPECULATIVE));
+    {
+        const auto draft = common_base_params_to_speculative(dkv_kvarn_k);
+        assert(draft.cache_type_k == GGML_TYPE_Q8_0);
+        assert(draft.cache_type_v == COMMON_KVARN_MTP_DRAFT_KV[1]);
+    }
+    // a separate draft model keeps the plain cache the KVarN trunk flags leave behind
+    argv = {"binary_name", "-m", "model_file.gguf", "-md", "draft.gguf", "-ctk", "kvarn4", "-ctv", "kvarn4"};
+    common_params dkv_kvarn_md;
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), dkv_kvarn_md, LLAMA_EXAMPLE_SPECULATIVE));
+    {
+        const auto draft = common_base_params_to_speculative(dkv_kvarn_md);
+        assert(draft.cache_type_k == dkv_kvarn_md.cache_type_k);
+        assert(draft.cache_type_v == dkv_kvarn_md.cache_type_v);
+        assert(!draft.speculative.draft.cache_type_kvarn_default);
+    }
+
     // n-gram drafters request recurrent-state snapshots for in-place rollback (draft width, capped at 8);
     // --spec-n-rs-seq overrides, 0 = checkpoint restore on every partial acceptance
     argv = {"binary_name", "-m", "model_file.gguf", "--spec-type", "ngram-cache", "--spec-ngram-cache-n-max", "7"};
