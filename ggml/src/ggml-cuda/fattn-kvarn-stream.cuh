@@ -934,7 +934,9 @@ static void ggml_cuda_flash_attn_ext_kvarn_stream_impl_tiles(ggml_backend_cuda_c
         ggml_cuda_flash_attn_ext_kvarn_stream_launch<8, 6, turbo4_body, PACK>(ctx, dst, NT, 1, parallel_blocks);
         return;
     }
-    const int KW = NT <= 4 ? (kw8 ? 8/NT : 4/NT) : 1;
+    // KV splits per block: 4 warps for 1-2 tiles; 3-4 tiles (widths 3-4, packed width 5) take 2 splits (6-8 warps),
+    // 2-4% faster than 1 split at 32K/100K bodies
+    const int KW = NT <= 4 ? (kw8 ? 8/NT : NT <= 2 ? 4/NT : 2) : 1;
     // Measured SM86 crossover for 24 query heads / 4 KV heads; retain other shapes.
     const bool short_nt5 = !turbo4_body && ggml_cuda_info().devices[ctx.device].cc == 860 &&
         dst->src[0]->ne[2] == 24 && dst->src[1]->ne[2] == 4 && ggml_get_op_params_i32(dst, 6) <= 5376;
