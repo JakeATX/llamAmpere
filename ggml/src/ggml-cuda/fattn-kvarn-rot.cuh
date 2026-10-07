@@ -176,6 +176,12 @@ static inline bool ggml_cuda_fattn_kvarn_rot_q_aligned(const ggml_tensor * Q) {
     return ((uintptr_t) Q->data % 16) == 0 && Q->nb[1] % 16 == 0 && Q->nb[2] % 16 == 0 && Q->nb[0] == sizeof(float);
 }
 
+// Q pre-pass of the stream decode kernels (rot builds rotate only the output): H256/16 of every Q row into q_rot
+// (ggml_nelements(Q) floats, contiguous); *q2 becomes a copy of Q that points at it. Same butterfly as above, so the
+// kernel sees the same rotated Q values; its Q loads stay on the read-only path (the in-kernel prologue had to re-read
+// Q from the output slots it wrote, plain LDG instead of LDG.CONSTANT).
+void ggml_cuda_kvarn_rot256_q_pass(ggml_backend_cuda_context & ctx, const ggml_tensor * Q, float * q_rot, ggml_tensor * q2);
+
 // Separate-pass rotation around any KVarN path (fattn-kvarn-rot.cu): Q is rotated into a pool buffer, run(ctx, dst')
 // executes on a copy of dst without the flag and with Q replaced, then the output is rotated in place.
 void ggml_cuda_flash_attn_ext_kvarn_rot_unfused(ggml_backend_cuda_context & ctx, ggml_tensor * dst,

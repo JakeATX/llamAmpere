@@ -246,13 +246,8 @@ static __global__ void flash_attn_ext_kvarn_lowbits_stream(
     const int n_ex      = n_ex_sink + (n_kv_pad - kv.B)/16; // padded positions are masked
 
     const float * Qf = (const float *) (Q + (size_t) nt*nb01 + (size_t) (head0 + (hvalid ? hcol : 0))*nb02);
-    if constexpr (rot) {
-        // [#139] fused rotation: H256/16 of this block's Q rows into its own output slots (written only at the end,
-        // after the unconditional __syncthreads of the split combine)
-        static_assert(!turbo4_body, "turbo4 bodies use the grouped signed basis");
-        kvarn_rot256_q_to_slots(Q, dst, n_q, gqa, head0, ne02, nb01, nb02, lane, warp, nwarps);
-        Qf = dst + ((size_t) (nt*ne02 + head0 + (hvalid ? hcol : 0))*gridDim.y + blockIdx.y)*D;
-    }
+    // [#139] rot build: Q arrives rotated (ggml_cuda_kvarn_rot256_q_pass in the launcher); only the output is rotated here
+    static_assert(!rot || !turbo4_body, "turbo4 bodies use the grouped signed basis");
     const char  * mrow = mask + (size_t) nt*nb31;
     const char  * Kh = K + (size_t) z_KV*nb12;
     const char  * Vh = V + (size_t) z_KV*nb22;
@@ -976,9 +971,18 @@ template<int bits_k, int bits_v, bool rot = false>
 static void ggml_cuda_kvarn_lowbits_width(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int nt = dst->src[0]->ne[1];
     GGML_ASSERT(nt >= 1 && nt <= 8);
-    // [#139] the rot build reads the flag's Q prologue / output rotation; the plain build must not see the flag
+    // [#139] the rot build rotates the output in-kernel; the plain build must not see the flag
     GGML_ASSERT(rot == ggml_cuda_fattn_kvarn_rot(dst));
-    GGML_ASSERT(!rot || ggml_cuda_fattn_kvarn_rot_q_aligned(dst->src[0]));
+    // [#139] rot: Q pre-pass here (pool buffer, read-only loads in the kernel), the node copy carries the rotated Q
+    ggml_cuda_pool_alloc<float> q_rot;
+    ggml_tensor q2, d2;
+    if constexpr (rot) {
+        q_rot.alloc(ctx.pool(), ggml_nelements(dst->src[0]));
+        ggml_cuda_kvarn_rot256_q_pass(ctx, dst->src[0], q_rot.ptr, &q2);
+        d2 = *dst;
+        d2.src[0] = &q2;
+        dst = &d2;
+    }
     if (nt <= 4) {
         ggml_cuda_kvarn_lowbits_launch<4,bits_k,bits_v,rot>(ctx,dst,nt,nt == 1 ? 2 : 4/nt);
     } else if (nt == 5) {

@@ -241,12 +241,8 @@ static __global__ void flash_attn_ext_kvarn_stream(
     const int n_ex      = n_ex_sink + (n_kv_pad - kv.B)/16; // padded positions are masked
 
     const float * Qf = (const float *) (Q + (size_t) nt*nb01 + (size_t) (head0 + (hvalid ? hcol : 0))*nb02);
-    if constexpr (rot) {
-        // [#139] fused rotation: H256/16 of this block's Q rows into its own output slots (written only at the end)
-        static_assert(!turbo4_body, "turbo4 bodies use the grouped signed basis");
-        kvarn_rot256_q_to_slots(Q, dst, n_q, gqa, head0, ne02, nb01, nb02, lane, warp, nwarps);
-        Qf = dst + ((size_t) (nt*ne02 + head0 + (hvalid ? hcol : 0))*gridDim.y + blockIdx.y)*D;
-    }
+    // [#139] rot build: Q arrives rotated (ggml_cuda_kvarn_rot256_q_pass in the launcher); only the output is rotated here
+    static_assert(!rot || !turbo4_body, "turbo4 bodies use the grouped signed basis");
     const char  * mrow = mask + (size_t) nt*nb31;
     const char  * Kh = K + (size_t) z_KV*nb12;
     const char  * Vh = V + (size_t) z_KV*nb22;
@@ -939,9 +935,13 @@ static void ggml_cuda_fattn_kvarn_stream_select(ggml_backend_cuda_context & ctx,
 template <bool turbo4_body = false, bool rot = false>
 inline void ggml_cuda_flash_attn_ext_kvarn_stream_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     if constexpr (!turbo4_body && !rot) {
-        if (ggml_cuda_fattn_kvarn_rot(dst)) { // [#139] fused rotation (fattn.cu checked the Q alignment)
-            GGML_ASSERT(ggml_cuda_fattn_kvarn_rot_q_aligned(dst->src[0]));
-            ggml_cuda_flash_attn_ext_kvarn_stream_impl<false, true>(ctx, dst);
+        if (ggml_cuda_fattn_kvarn_rot(dst)) { // [#139] fused rotation: Q pre-pass here, output rotation in the kernel
+            ggml_cuda_pool_alloc<float> q_rot(ctx.pool(), ggml_nelements(dst->src[0]));
+            ggml_tensor q2;
+            ggml_cuda_kvarn_rot256_q_pass(ctx, dst->src[0], q_rot.ptr, &q2);
+            ggml_tensor d2 = *dst;
+            d2.src[0] = &q2;
+            ggml_cuda_flash_attn_ext_kvarn_stream_impl<false, true>(ctx, &d2);
             return;
         }
     }

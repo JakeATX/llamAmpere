@@ -42,24 +42,29 @@ static void kvarn_rot256_launch(const char * src, float * dst, const int64_t ne1
     CUDA_CHECK(cudaGetLastError());
 }
 
+void ggml_cuda_kvarn_rot256_q_pass(ggml_backend_cuda_context & ctx, const ggml_tensor * Q, float * q_rot, ggml_tensor * q2) {
+    GGML_ASSERT(Q->type == GGML_TYPE_F32 && Q->ne[0] == 256 && Q->nb[0] == sizeof(float));
+    kvarn_rot256_launch((const char *) Q->data, q_rot, Q->ne[1], Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3], ctx.stream());
+
+    *q2 = *Q;
+    q2->data  = q_rot;
+    q2->nb[0] = sizeof(float);
+    q2->nb[1] = q2->nb[0]*q2->ne[0];
+    q2->nb[2] = q2->nb[1]*q2->ne[1];
+    q2->nb[3] = q2->nb[2]*q2->ne[2];
+    q2->view_src  = nullptr;
+    q2->view_offs = 0;
+}
+
 void ggml_cuda_flash_attn_ext_kvarn_rot_unfused(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
         void (*run)(ggml_backend_cuda_context & ctx, ggml_tensor * dst)) {
     const ggml_tensor * Q = dst->src[0];
-    GGML_ASSERT(Q->type == GGML_TYPE_F32 && Q->ne[0] == 256 && Q->nb[0] == sizeof(float));
     GGML_ASSERT(dst->type == GGML_TYPE_F32 && dst->ne[0] == 256 && ggml_is_contiguous(dst));
     cudaStream_t stream = ctx.stream();
 
     ggml_cuda_pool_alloc<float> q_rot(ctx.pool(), ggml_nelements(Q));
-    kvarn_rot256_launch((const char *) Q->data, q_rot.ptr, Q->ne[1], Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3], stream);
-
-    ggml_tensor q2 = *Q;
-    q2.data  = q_rot.ptr;
-    q2.nb[0] = sizeof(float);
-    q2.nb[1] = q2.nb[0]*q2.ne[0];
-    q2.nb[2] = q2.nb[1]*q2.ne[1];
-    q2.nb[3] = q2.nb[2]*q2.ne[2];
-    q2.view_src  = nullptr;
-    q2.view_offs = 0;
+    ggml_tensor q2;
+    ggml_cuda_kvarn_rot256_q_pass(ctx, Q, q_rot.ptr, &q2);
 
     ggml_tensor d2 = *dst;
     d2.src[0] = &q2;
