@@ -2904,7 +2904,8 @@ static void ggml_cuda_flash_attn_ext_mma_turbo_dispatch_ncols1_8(ggml_backend_cu
             if (e == nullptr) {
                 e = getenv("GGML_CUDA_FATTN_Q5G6_COMPACT");
             }
-            return e != nullptr && strcmp(e, "1") == 0;
+            // default ON since the M1 gate (2026-10-07, +2.33% G at 100K); =0 restores the generic tile
+            return e == nullptr || strcmp(e, "0") != 0;
         }();
         const ggml_tensor * K = dst->src[1];
         const ggml_tensor * mask = dst->src[3];
