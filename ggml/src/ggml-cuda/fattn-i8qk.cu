@@ -16,7 +16,8 @@ static constexpr int i8qk_nthreads = I8QK_NW*WARP_SIZE;
 bool ggml_cuda_fattn_i8qk_enabled() {
     static const bool v = [] {
         const char * e = getenv("GGML_CUDA_FA_I8QK");
-        return e != nullptr && e[0] == '1' && e[1] == '\0';
+        // default ON since the I8QK gate (2026-10-07: prefill +5.21% G, decode +4.77% G at 100K); =0 disables
+        return e == nullptr || !(e[0] == '0' && e[1] == '\0');
     }();
     return v;
 }
