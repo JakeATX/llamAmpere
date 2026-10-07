@@ -3049,9 +3049,14 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             ggml_flash_attn_ext_set_kvarn(cur, kvarn_pending.body, kvarn_pending.desc,
                     kvarn_pending.bits_k, kvarn_pending.bits_v, (int32_t) kq_mask->ne[0]);
             const int group = kvarn_pending.body->op_params[7] == GGML_TYPE_TURBO4_0 ? 128 : 256;
+            const bool fused_rot = kvarn_pending.fused_rot;
             kvarn_pending = {};
-            if (!ggml_is_contiguous(cur)) { cur = ggml_cont(ctx0, cur); }
-            cur = ggml_turbo_wht(ctx0, cur, 1, group, nullptr);
+            if (fused_rot) {
+                ggml_flash_attn_ext_set_kvarn_rot(cur, 256); // the node un-rotates its output itself
+            } else {
+                if (!ggml_is_contiguous(cur)) { cur = ggml_cont(ctx0, cur); }
+                cur = ggml_turbo_wht(ctx0, cur, 1, group, nullptr);
+            }
         }
 
         // TurboQuant: inverse WHT on FA output when V values are WHT-rotated.
@@ -3352,16 +3357,21 @@ ggml_tensor * llm_graph_context::build_attn(
     // KVarN: the whole cache lives in the 256-pt Hadamard-rotated basis (ring rows and sealed records alike),
     // so rotate Q/K/V here; the FA output is un-rotated in build_attn_mha. The plain Sylvester Hadamard is an
     // involution, so the same op serves both directions.
+    // With the fused rotation (plain-256 bodies only) the FA node rotates Q and un-rotates its output itself.
+    const bool kvarn_fused_rot = is_kvarn && mctx_cur->get_kvarn().body_type != GGML_TYPE_TURBO4_0 &&
+        ggml_kvarn_fused_rot_enabled();
     if (is_kvarn) {
         GGML_ASSERT(q_cur->ne[0] == 256 && k_cur->ne[0] == 256 && v_cur->ne[0] == 256);
-        if (!ggml_is_contiguous(q_cur)) { q_cur = ggml_cont(ctx0, q_cur); }
+        if (!kvarn_fused_rot && !ggml_is_contiguous(q_cur)) { q_cur = ggml_cont(ctx0, q_cur); }
         if (!ggml_is_contiguous(k_cur)) { k_cur = ggml_cont(ctx0, k_cur); }
         if (!ggml_is_contiguous(v_cur)) { v_cur = ggml_cont(ctx0, v_cur); }
         const int group = mctx_cur->get_kvarn().body_type == GGML_TYPE_TURBO4_0 ? 128 : 256;
-        q_cur = ggml_turbo_wht(ctx0, q_cur, 0, group, nullptr);
+        if (!kvarn_fused_rot) {
+            q_cur = ggml_turbo_wht(ctx0, q_cur, 0, group, nullptr);
+            cb(q_cur, "q_kvarn_rot", il);
+        }
         k_cur = ggml_turbo_wht(ctx0, k_cur, 0, group, nullptr);
         v_cur = ggml_turbo_wht(ctx0, v_cur, 0, group, nullptr);
-        cb(q_cur, "q_kvarn_rot", il);
         cb(k_cur, "k_kvarn_rot", il);
         cb(v_cur, "v_kvarn_rot", il);
     }
@@ -3406,6 +3416,7 @@ ggml_tensor * llm_graph_context::build_attn(
                 kvarn_pending.desc   = tier == 1 ? inp->self_kvarn_desc_edge : inp->self_kvarn_desc;
                 kvarn_pending.bits_k = (int32_t) bits_k;
                 kvarn_pending.bits_v = (int32_t) bits_v;
+                kvarn_pending.fused_rot = kvarn_fused_rot;
             }
         }
 

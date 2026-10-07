@@ -9705,12 +9705,37 @@ static void ggml_compute_forward_flash_attn_ext_kvarn(
 
     std::vector<float> krow(D), vrow(D), acc(D);
 
+    // fused rotation (ggml_flash_attn_ext_set_kvarn_rot): plain H256/16 on Q and on the output, same butterfly order
+    // as ggml_compute_forward_turbo_wht_f32
+    const bool fused_rot = ggml_flash_attn_ext_get_kvarn_rot(dst) == 256;
+    GGML_ASSERT(!fused_rot || (D == 256 && !turbo4_body));
+    auto rot256 = [](float * x) {
+        for (int h = 1; h < 256; h *= 2) {
+            for (int i = 0; i < 256; i += h * 2) {
+                for (int j = i; j < i + h; j++) {
+                    const float a = x[j], b = x[j + h];
+                    x[j] = a + b;
+                    x[j + h] = a - b;
+                }
+            }
+        }
+        for (int i = 0; i < 256; i++) {
+            x[i] = x[i] * 0.0625f;
+        }
+    };
+    std::vector<float> qrot(fused_rot ? D : 0);
+
     for (int64_t ir = params->ith; ir < nrows; ir += params->nth) {
         const int64_t iq1 = ir % n_q;
         const int64_t iq2 = ir / n_q;
         const int64_t ikv = iq2 / gqa;
         const int32_t qpos = qpos0 + (int32_t) iq1;
         const float * pq = (const float *) ((const char *) q->data + iq1*q->nb[1] + iq2*q->nb[2]);
+        if (fused_rot) {
+            memcpy(qrot.data(), pq, D*sizeof(float));
+            rot256(qrot.data());
+            pq = qrot.data();
+        }
         // mask rows follow the standard flash_attn_ext convention: [n_kv, n_q(padded), ne2 % mask->ne[2], ne3 % mask->ne[3]]
         const ggml_fp16_t * mp = mask ? (const ggml_fp16_t *) ((const char *) mask->data + iq1*mask->nb[1]
                                          + (iq2 % mask->ne[2])*mask->nb[2]) : NULL;
@@ -9787,6 +9812,9 @@ static void ggml_compute_forward_flash_attn_ext_kvarn(
         float * out = (float *) ((char *) dst->data + (iq2 + iq1*dst->ne[1])*dst->nb[1]);
         for (int d = 0; d < D; ++d) {
             out[d] = acc[d] * S_inv;
+        }
+        if (fused_rot) {
+            rot256(out);
         }
     }
 }

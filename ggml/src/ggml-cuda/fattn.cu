@@ -3,6 +3,7 @@
 #include "fattn-mma-f16.cuh"
 #include "fattn-mma-turbo.cuh"
 #include "fattn-mma-kvarn.cuh"
+#include "fattn-kvarn-rot.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
@@ -4243,11 +4244,38 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
 void ggml_cuda_flash_attn_kvarn_lowbits(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
+// [#139] same predicate as the low-bit branch of ggml_cuda_flash_attn_ext below
+static bool ggml_cuda_fattn_kvarn_is_lowbits(const ggml_tensor * dst) {
+    return ggml_get_op_params_i32(dst,5) != ((4 << 8) | 4) || (ggml_get_op_params_i32(dst,7) == GGML_TYPE_I16 && ggml_kvarn::trellis3::tokens4());
+}
+
+// [#139] fork-only: the KVarN paths that apply the fused Q / output rotation inside their kernels. Must mirror the
+// dispatch above: the low-bit tile kernel (Ampere config, nbatch_combine == DV/2) and width kernel, and the 4/4
+// stream decode kernel (widths <= GGML_KVARN_DIRECT_STREAM_MAX). Everything else runs the separate-pass fallback.
+static bool ggml_cuda_fattn_kvarn_rot_in_kernel(ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
+    const ggml_tensor * Q = dst->src[0];
+    // GGML_KVARN_FUSED_ROT_SEPARATE=1: every path takes the separate passes (A/B of the in-kernel rotation)
+    static const bool separate = getenv("GGML_KVARN_FUSED_ROT_SEPARATE") != nullptr && atoi(getenv("GGML_KVARN_FUSED_ROT_SEPARATE")) != 0;
+    if (separate || !ggml_cuda_fattn_kvarn_rot_q_aligned(Q) || ggml_get_op_params_i32(dst, 7) == GGML_TYPE_TURBO4_0) {
+        return false;
+    }
+    if (ggml_cuda_fattn_kvarn_is_lowbits(dst)) {
+        return false;
+    }
+    GGML_UNUSED(ctx);
+    return false;
+}
+
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
 
     // KVarN region-aware attention (sink/ring f16 rows + sealed 4-bit body records): dedicated MMA path.
     if (dst->src[6] != nullptr) {
+        if (ggml_cuda_fattn_kvarn_rot(dst) && !ggml_cuda_fattn_kvarn_rot_in_kernel(ctx, dst)) {
+            // separate passes around this same dispatch, on a copy of the node without the flag
+            ggml_cuda_flash_attn_ext_kvarn_rot_unfused(ctx, dst, ggml_cuda_flash_attn_ext);
+            return;
+        }
         // 4/4 token-axis trellis4 body (I16 under an explicit nonzero GGML_KVARN_TRELLIS_TOKENS; the low-bit token-axis default does not apply to 4/4): the low-bit tile loader
         if (ggml_get_op_params_i32(dst,5) != ((4 << 8) | 4) || (ggml_get_op_params_i32(dst,7) == GGML_TYPE_I16 && ggml_kvarn::trellis3::tokens4())) {
             ggml_cuda_fattn_path_note("kvarn_lowerbits", dst, -1);

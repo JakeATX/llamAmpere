@@ -2570,6 +2570,14 @@ extern "C" {
 
     GGML_API bool ggml_flash_attn_ext_is_kvarn(const struct ggml_tensor * a);
 
+    // KVarN fused rotation (fork-only): with group == 256 the node takes Q and returns its output in the unrotated
+    // basis and applies the plain 256-point Hadamard H/16 to Q and to the output itself (op_params[8]), replacing the
+    // two GGML_OP_TURBO_WHT nodes around it. Bit-identical to the unfused graph. Only for the plain-256 body bases.
+    GGML_API void ggml_flash_attn_ext_set_kvarn_rot(struct ggml_tensor * a, int32_t group);
+    GGML_API int32_t ggml_flash_attn_ext_get_kvarn_rot(const struct ggml_tensor * a);
+    // compile default GGML_KVARN_FUSED_ROT_DEFAULT (CMake GGML_KVARN_FUSED_ROT, ON), env GGML_KVARN_FUSED_ROT=0|1 overrides
+    GGML_API bool ggml_kvarn_fused_rot_enabled(void);
+
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
            struct ggml_context * ctx,
