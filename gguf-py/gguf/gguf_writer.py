@@ -1438,6 +1438,9 @@ class GGUFWriter:
     def add_vision_image_mean(self, values: Sequence[float]) -> None:
         self.add_array(Keys.ClipVision.IMAGE_MEAN, values)
 
+    def add_vision_image_resize_algo(self, value: str) -> None:
+        self.add_string(Keys.ClipVision.IMAGE_RESIZE_ALGO, value)
+
     def add_vision_image_std(self, values: Sequence[float]) -> None:
         self.add_array(Keys.ClipVision.IMAGE_STD, values)
 
@@ -1626,6 +1629,12 @@ class GGUFWriter:
 
     def add_xielu_eps(self, values: Sequence[float]):
         self.add_array(Keys.xIELU.EPS, values)
+
+    def add_attention_value_expert_count(self, count: int):
+        self.add_uint32(Keys.Attention.VALUE_EXPERT_COUNT.format(arch=self.arch), count)
+
+    def add_attention_value_expert_used_count(self, count: int):
+        self.add_uint32(Keys.Attention.VALUE_EXPERT_USED_COUNT.format(arch=self.arch), count)
 
     # diffusion models
 

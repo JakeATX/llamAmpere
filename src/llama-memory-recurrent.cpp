@@ -297,6 +297,10 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
             // partial rollback via per-token snapshot index (bounded by n_rs_seq), or (gdn_replay)
             // via a pending replay of the last `rollback` ingredient-ring steps.
             if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
+                // a cell shared by several sequences cannot move back for only one of them
+                if (cell.seq_id.size() > 1) {
+                    return false;
+                }
                 // the filter kept no layer (e.g. an MTP draft context), so only the position moves back
                 if (is_empty()) {
                     cell.pos = p0 - 1;

@@ -664,10 +664,10 @@ void ggml_sycl_flash_attn_ext_vec_case_impl(ggml_backend_sycl_context & ctx, ggm
     const bool need_f16_V = type_V == GGML_TYPE_F16;
     constexpr size_t nbytes_shared = 0;
 
+    const auto arch = ggml_sycl_info().devices[ggml_sycl_get_device()].hw_info.arch;
     // D=512 does not fit the default register file; it spills up to 343 bytes per thread, against at most 57 for D <= 256. This kernel is decode only, so thread occupancy is not the limit. It is 1.9x faster at every KV depth on Battlemage.
     constexpr bool use_large_grf = D >= 512;
 
-    const auto arch = ggml_sycl_info().devices[ctx.device].hw_info.arch;
     const int nthreads = ggml_sycl_fattn_vec_get_nthreads_device(arch);
     // 256 threads would overflow the 64 KB work-group local memory at D == 512, so keep 128 there.
     // if constexpr, not a runtime if: a runtime guard still instantiates the D == 512

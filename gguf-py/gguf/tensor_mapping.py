@@ -88,6 +88,7 @@ class TensorNameMap:
             "model.lm_head",             # dflash
             "model.transformer.ff_out",  # llada
             "head.decoder",              # modern-bert
+            "embedding_projection",      # embeddinggemma2
         ),
         MODEL_TENSOR.DENSE_2_OUT: (
             "dense_2_out",  # embeddinggemma
@@ -399,6 +400,7 @@ class TensorNameMap:
             "model.layers.{bid}.self_attn.g_proj",    # step3.5 head-wise attention gate
             "model.layers.{bid}.self_attn.output_gate",  # minimax-01
             "model.layers.{bid}.self_attn.linear_gate",  # hy-v4
+            "model.layers.{bid}.self_attn.attn_gate_proj",  # k2-horizon
         ),
 
         # Feed-forward norm
@@ -766,6 +768,7 @@ class TensorNameMap:
 
         MODEL_TENSOR.LAYER_OUT_SCALE: (
             "model.layers.{bid}.layer_scalar", # gemma4
+            "layers.{bid}.layer_scalar", # embeddinggemma2
             "model.blocks.{bid}.embed_skip.a_g", # talkie
         ),
 
@@ -775,10 +778,12 @@ class TensorNameMap:
 
         MODEL_TENSOR.PER_LAYER_MODEL_PROJ: (
             "model.per_layer_model_projection",  # gemma3n
+            "ple.per_layer_model_projection",    # embeddinggemma2
         ),
 
         MODEL_TENSOR.PER_LAYER_PROJ_NORM: (
             "model.per_layer_projection_norm",  # gemma3n
+            "ple.per_layer_projection_norm",    # embeddinggemma2
         ),
 
         MODEL_TENSOR.ALTUP_PROJ: (
@@ -791,14 +796,17 @@ class TensorNameMap:
 
         MODEL_TENSOR.PER_LAYER_INP_GATE: (
             "model.layers.{bid}.per_layer_input_gate",  # gemma3n
+            "layers.{bid}.ple_block.per_layer_input_gate",  # embeddinggemma2
         ),
 
         MODEL_TENSOR.PER_LAYER_PROJ: (
             "model.layers.{bid}.per_layer_projection",  # gemma3n
+            "layers.{bid}.ple_block.per_layer_projection",  # embeddinggemma2
         ),
 
         MODEL_TENSOR.PER_LAYER_POST_NORM: (
             "model.layers.{bid}.post_per_layer_input_norm",  # gemma3n
+            "layers.{bid}.ple_block.post_per_layer_input_norm",  # embeddinggemma2
         ),
 
         MODEL_TENSOR.ALTUP_CORRECT_COEF: (
@@ -1628,6 +1636,7 @@ class TensorNameMap:
         MODEL_TENSOR.V_MMPROJ: (
             "aligner.w{bid}", # deepseek4v (w1 -> mm.1, w2 -> mm.2)
             "multi_modal_projector.linear_{bid}",
+            "model.multi_modal_projector.linear_{bid}", # cohere2v
             "mm_projector.proj.linear_{bid}", # Kimi-K2.5
             "visual.merger.mlp.{bid}", # qwen2vl
             "mlp_AR.linear_{bid}", # PaddleOCR-VL
@@ -2868,6 +2877,14 @@ class TensorNameMap:
 
         MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM: (
             "model.layers.{bid}.shared_head.norm",
+        ),
+
+        MODEL_TENSOR.ATTN_V_GATE: (
+            "model.layers.{bid}.self_attn.v_router",  # k2-horizon
+        ),
+
+        MODEL_TENSOR.ATTN_V_EXP: (
+            "model.layers.{bid}.self_attn.v_experts",  # k2-horizon
         ),
     }
 

@@ -388,8 +388,8 @@ private:
     const uint32_t n_swa = 0;
 
     // env: LLAMA_ATTN_ROT_DISABLE
-    bool attn_rot_k = false;
-    bool attn_rot_v = false;
+    uint32_t n_rot_k = 0;
+    uint32_t n_rot_v = 0;
 
     // the K rotation is the functional Hadamard transform of a DSA lightning-indexer cache (not tuning): the indexer
     // graphs of deepseek32/dots3note multiply by it as one full-width matrix, so it must span the whole head
