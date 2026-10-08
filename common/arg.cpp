@@ -3086,6 +3086,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_env("LLAMA_ARG_MOE_CACHE"));
+    add_opt(common_arg(
         {"--moe-cache-mib"}, "N",
         "GPU cache size in MiB for the MoE experts kept in the CPU (default: 0, disabled)",
         [](common_params & params, int value) {
