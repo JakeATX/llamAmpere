@@ -1,4 +1,4 @@
-> **llamAmpere v0.5**: a llama.cpp fork tuned for the RTX 3090 / 3090 Ti (Ampere, SM86), running Qwen3.8-27B with its MTP draft head.
+> **llamAmpere v0.5**: a llama.cpp fork tuned for the Ampere generation (SM86). Testing focused primarily on 30xx cards, running Qwen3.8-27B variants with its MTP draft head.
 
 ## What's new in v0.5
 
