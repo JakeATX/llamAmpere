@@ -2028,13 +2028,14 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
     if (it_best != states.end()) {
         const int64_t t_start = ggml_time_us();
+        const size_t  n_bytes = it_best->size(); // restore() may release the state buffers
 
         if (!restore(*it_best, ctx_tgt, ctx_dft, id_slot)) {
             return false;
         }
 
         SRV_INF(" - restored prompt from RAM with f_keep = %.3f, f_sim = %.3f (%zu tokens, %.3f MiB) in %.2f ms\n",
-                f_keep_best, f_sim_best, it_best->prompt.tokens.size(), it_best->size() / (1024.0 * 1024.0), (ggml_time_us() - t_start) / 1000.0);
+                f_keep_best, f_sim_best, it_best->prompt.tokens.size(), n_bytes / (1024.0 * 1024.0), (ggml_time_us() - t_start) / 1000.0);
 
         prompt = std::move(it_best->prompt);
 
