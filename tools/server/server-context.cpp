@@ -1794,6 +1794,8 @@ private:
             "LLAMA_MTP_UPDATE_KV_ONLY", "LLAMA_DRAFT_VOCAB_COMPACT", "LLAMA_DRAFT_VOCAB_COMPACT_TYPE",
             "GGML_SJKVARN_TRELLIS_WORDS", "GGML_SJKVARN_TRELLIS_CB", "GGML_SJKVARN_TRELLIS_CB2",
             "GGML_SJKVARN_TRELLIS_CB3", "GGML_SJKVARN_TRELLIS_CB4",
+            // SJ-KVaRN record encoding: trellis payload axis, fused write rotation, refit and scalar range clip
+            "GGML_SJKVARN_TRELLIS_TOKENS", "GGML_SJKVARN_FUSED_ROT", "GGML_SJKVARN_TRELLIS_REFIT", "GGML_SJKVARN_SCALAR_CLIP",
         };
         for (const char * name : env_names) {
             if (const char * v = getenv(name)) {

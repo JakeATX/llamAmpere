@@ -254,8 +254,8 @@ static_assert(SEQ*BITS % 32 == 0, "a sequence must cover whole 32-bit words");
 // balanced y domain, about 0 along channels), so the history-indexed codebook predicts. Each axis has its own built-in
 // codebooks (SJKVARN_CB3_TOK_* / SJKVARN_CB2_TOK_* for tokens, SJKVARN_CB3_TRAINED_* / SJKVARN_CB2_TRAINED_* for channels).
 // Codec audit KL (6 histories, generated region, vs the channel axis): 0.769x (3/3), 0.772x (3/2).
-// The axis is process-wide and nothing sealed leaves the process (SJ-KVaRN state save/load is refused), so the reader of a
-// record always shares its writer's axis.
+// The axis is process-wide. Sealed records leave the process through state save/load (SJKV v1) and the server's disk
+// prompt cache; the server keys disk entries on GGML_SJKVARN_TRELLIS_TOKENS, so a record is only read under its writer's axis.
 inline bool tokens() {
     static const bool on = [] {
         const char * s = getenv("GGML_SJKVARN_TRELLIS_TOKENS");
