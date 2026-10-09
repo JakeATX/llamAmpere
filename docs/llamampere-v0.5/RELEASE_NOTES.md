@@ -137,7 +137,8 @@ LLAMA_MTP_DRAFT_COMPUTE_LEAN=1 ./build-sm86/bin/llama-server \
   --temp 1.0 --top-k 20 --top-p 0.95 --min-p 0
 ```
 
-- **Fit.** With 3/3t at 204,800 context, the server uses 11,064 MiB after boot and a short reply.
+- **Fit.** With 3/3t at 204,800 context, the server uses 11,064 MiB after boot and a short reply. With a 203,568-token
+  prompt plus 256 generated tokens, the whole card peaked at 12,052 MiB, including about 1 GB used by the desktop.
 - **3/2t option.** With 3/2t (`-ctv sjkvarn2`), the same command uses 10,672 MiB after boot. It peaked at 10,690 MiB
   with a 203,568-token prompt plus 256 generated tokens. Use 3/2t if you need about 390 MiB more room. Its KL is about
   twice that of 3/3t.
