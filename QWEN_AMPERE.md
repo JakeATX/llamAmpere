@@ -1,5 +1,7 @@
 # llamAmpere
 
+
+**v0.5 is out:** SJ-KVaRN compressed KV cache (4/4, 3/3t, 3/2t), prompt cache on by default, faster decode at 100K. Commands and settings: [README.md](README.md) and [docs/llamampere-v0.5/RECOMMENDED.md](docs/llamampere-v0.5/RECOMMENDED.md). The rest of this page describes v0.4.
 llamAmpere runs Qwen3.8-27B on one 24 GB Ampere card (RTX 3090 / 3090 Ti), using the model's own MTP head to draft
 tokens. It is a fork of [TheTom/llama-cpp-turboquant](https://github.com/TheTom/llama-cpp-turboquant) (llama.cpp
 with the TurboQuant KV cache types and native MTP speculative decoding), plus kernel and memory work tuned for SM86
