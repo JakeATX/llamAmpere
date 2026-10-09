@@ -6,7 +6,7 @@
 #include "turbo-quant.cuh"
 #include "fattn-query-layout.cuh"
 #include "ledger.cuh"
-#include "fattn-kvarn-rot.cuh"
+#include "fattn-sjkvarn-rot.cuh"
 
 #include <cstdint>
 
@@ -44,25 +44,25 @@ typedef void (* fattn_kernel_t)(
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
                             const int32_t nb31, const int32_t nb32, const int64_t nb33,
-        const char    * __restrict__ kvarn_body,   // KVarN sealed records (dst->src[5]) or nullptr
-        const int32_t * __restrict__ kvarn_desc);  // KVarN descriptor (dst->src[6]) or nullptr
+        const char    * __restrict__ sj_kvarn_body,   // SJ-KVaRN sealed records (dst->src[5]) or nullptr
+        const int32_t * __restrict__ sj_kvarn_desc);  // SJ-KVaRN descriptor (dst->src[6]) or nullptr
 
-// Per-KV-head view of a KVarN cache inside the MMA kernel (see ggml_flash_attn_ext_set_kvarn).
+// Per-KV-head view of a SJ-KVaRN cache inside the MMA kernel (see ggml_flash_attn_ext_set_sj_kvarn).
 // Position p resolves to: p < S -> exact ring row p; S <= p < B -> record (p-S)/G of the body, token (p-S)%G;
-// p >= B -> exact ring row S + (p-S)%cap. Offsets are byte offsets inside one record (ggml_kvarn::make_layout).
-// trellis-coded body (GGML_TYPE_I16): the fp16 codebooks of ggml-kvarn-cb.h (see ggml-kvarn.h, "kvarn4t")
-#include "../ggml-kvarn-cb.h"
-#define FATTN_KVARN_TR_L    KVARN_TRELLIS_CB_L
-#define FATTN_KVARN_TR_NWIN (1 << FATTN_KVARN_TR_L)
-static __device__ uint16_t fattn_kvarn_cb_k[FATTN_KVARN_TR_NWIN] = KVARN_CB_K_INIT;
-static __device__ uint16_t fattn_kvarn_cb_v[FATTN_KVARN_TR_NWIN] = KVARN_CB_V_INIT;
-void ggml_cuda_kvarn_trellis_cb_register(const void * sym_k, const void * sym_v); // kvarn-seal.cu
-struct fattn_kvarn_cb_registrar {
-    fattn_kvarn_cb_registrar() { ggml_cuda_kvarn_trellis_cb_register((const void *) fattn_kvarn_cb_k, (const void *) fattn_kvarn_cb_v); }
+// p >= B -> exact ring row S + (p-S)%cap. Offsets are byte offsets inside one record (ggml_sj_kvarn::make_layout).
+// trellis-coded body (GGML_TYPE_I16): the fp16 codebooks of ggml-sjkvarn-cb.h (see ggml-sjkvarn.h, "sjkvarn4t")
+#include "../ggml-sjkvarn-cb.h"
+#define FATTN_SJKVARN_TR_L    SJKVARN_TRELLIS_CB_L
+#define FATTN_SJKVARN_TR_NWIN (1 << FATTN_SJKVARN_TR_L)
+static __device__ uint16_t fattn_sj_kvarn_cb_k[FATTN_SJKVARN_TR_NWIN] = SJKVARN_CB_K_INIT;
+static __device__ uint16_t fattn_sj_kvarn_cb_v[FATTN_SJKVARN_TR_NWIN] = SJKVARN_CB_V_INIT;
+void ggml_cuda_sj_kvarn_trellis_cb_register(const void * sym_k, const void * sym_v); // sjkvarn-seal.cu
+struct fattn_sj_kvarn_cb_registrar {
+    fattn_sj_kvarn_cb_registrar() { ggml_cuda_sj_kvarn_trellis_cb_register((const void *) fattn_sj_kvarn_cb_k, (const void *) fattn_sj_kvarn_cb_v); }
 };
-static fattn_kvarn_cb_registrar fattn_kvarn_cb_registrar_instance;
+static fattn_sj_kvarn_cb_registrar fattn_sj_kvarn_cb_registrar_instance;
 
-struct fattn_kvarn_ctx {
+struct fattn_sj_kvarn_ctx {
     const char * body;   // first record of this KV head; group g sits at body + g*rec_stride
     int S, cap, B, G;
     int type_k, type_v;
@@ -73,23 +73,23 @@ struct fattn_kvarn_ctx {
     int k_scale, k_zero, k_tok, v_payload, v_ch, v_scale, v_zero;
 };
 
-static __device__ __forceinline__ fattn_kvarn_ctx fattn_kvarn_make_ctx(
+static __device__ __forceinline__ fattn_sj_kvarn_ctx fattn_sj_kvarn_make_ctx(
         const char * body, const int32_t * desc, const int z_KV, const int D, const int bits_k, const int bits_v, const size_t k_head_stride, const size_t v_head_stride) {
-    fattn_kvarn_ctx c;
-    const int G         = desc[GGML_KVARN_DESC_G];
-    const int rec_bytes = desc[GGML_KVARN_DESC_RECBYTES];
-    c.S          = desc[GGML_KVARN_DESC_S];
-    c.cap        = desc[GGML_KVARN_DESC_CAP];
-    c.B          = desc[GGML_KVARN_DESC_B];
+    fattn_sj_kvarn_ctx c;
+    const int G         = desc[GGML_SJKVARN_DESC_G];
+    const int rec_bytes = desc[GGML_SJKVARN_DESC_RECBYTES];
+    c.S          = desc[GGML_SJKVARN_DESC_S];
+    c.cap        = desc[GGML_SJKVARN_DESC_CAP];
+    c.B          = desc[GGML_SJKVARN_DESC_B];
     c.G          = G;
-    c.body_type  = desc[GGML_KVARN_DESC_BODY_TYPE];
-    c.type_k     = desc[GGML_KVARN_DESC_TYPE_K];
-    c.type_v     = desc[GGML_KVARN_DESC_TYPE_V];
-    c.sink_type  = desc[GGML_KVARN_DESC_SINK_TYPE];
-    c.sink_stride = desc[GGML_KVARN_DESC_HKV]*D*sizeof(half);
+    c.body_type  = desc[GGML_SJKVARN_DESC_BODY_TYPE];
+    c.type_k     = desc[GGML_SJKVARN_DESC_TYPE_K];
+    c.type_v     = desc[GGML_SJKVARN_DESC_TYPE_V];
+    c.sink_type  = desc[GGML_SJKVARN_DESC_SINK_TYPE];
+    c.sink_stride = desc[GGML_SJKVARN_DESC_HKV]*D*sizeof(half);
     c.sink_head_delta_k = (int64_t) z_KV*((int64_t) D*sizeof(half) - (int64_t) k_head_stride);
     c.sink_head_delta_v = (int64_t) z_KV*((int64_t) D*sizeof(half) - (int64_t) v_head_stride);
-    c.rec_stride = desc[GGML_KVARN_DESC_HKV] * rec_bytes;
+    c.rec_stride = desc[GGML_SJKVARN_DESC_HKV] * rec_bytes;
     c.body       = body + (size_t) z_KV * rec_bytes;
     const int k_row = D*bits_k/8;
     const int v_row = D*bits_v/8;
@@ -103,8 +103,8 @@ static __device__ __forceinline__ fattn_kvarn_ctx fattn_kvarn_make_ctx(
     return c;
 }
 
-static __device__ __forceinline__ const char * fattn_kvarn_sink_row(
-        const char * head, const fattn_kvarn_ctx & kv, const size_t row_stride, const int row, const bool is_v) {
+static __device__ __forceinline__ const char * fattn_sj_kvarn_sink_row(
+        const char * head, const fattn_sj_kvarn_ctx & kv, const size_t row_stride, const int row, const bool is_v) {
     return head + (size_t) (kv.S + kv.cap)*row_stride +
         (is_v ? kv.sink_head_delta_v : kv.sink_head_delta_k) + (size_t) row*kv.sink_stride;
 }
@@ -115,13 +115,13 @@ static __device__ __forceinline__ const char * fattn_kvarn_sink_row(
 // -TQ6_CENTROIDS[i], bitwise), so lane L holds tq6_mag = TQ6_CENTROIDS[32 + L] and a lookup is one __shfl_sync plus a
 // sign flip; (-c)*norm == -(c*norm) in IEEE, so values are bit-identical to tq6_dequant_element.
 // Every lane of the warp must reach the call with the same row type (full-mask shuffle).
-static __device__ __forceinline__ float fattn_kvarn_tq6_centroid_shfl(const float tq6_mag, const int idx) {
+static __device__ __forceinline__ float fattn_sj_kvarn_tq6_centroid_shfl(const float tq6_mag, const int idx) {
     const int neg = ((idx >> 5) & 1) - 1; // 0 for idx >= 32, -1 (all ones) for idx < 32
     const float v = __shfl_sync(0xFFFFFFFF, tq6_mag, (idx ^ neg) & 31, 32);
     return __uint_as_float(__float_as_uint(v) ^ ((uint32_t) neg & 0x80000000u));
 }
 
-static __device__ __forceinline__ half2 fattn_kvarn_ring_pair_warp(const char * row, const int pair, const int type, const float tq6_mag) {
+static __device__ __forceinline__ half2 fattn_sj_kvarn_ring_pair_warp(const char * row, const int pair, const int type, const float tq6_mag) {
     if (type == GGML_TYPE_TQ6_0) {
         const block_tq6_0 * b = ((const block_tq6_0 *) row) + pair/(QK_TQ6/2);
         const int i = 2*(pair%(QK_TQ6/2)); // even: elements i, i+1 share qs[i/2] and qh[i/4]
@@ -130,7 +130,7 @@ static __device__ __forceinline__ half2 fattn_kvarn_ring_pair_warp(const char * 
         const int qh = b->qh[i/4] >> ((i%4)*2);
         const int q0 = (qs & 0xF) | ((qh & 3) << 4);
         const int q1 = (qs >> 4)  | (((qh >> 2) & 3) << 4);
-        return __floats2half2_rn(fattn_kvarn_tq6_centroid_shfl(tq6_mag, q0) * norm, fattn_kvarn_tq6_centroid_shfl(tq6_mag, q1) * norm);
+        return __floats2half2_rn(fattn_sj_kvarn_tq6_centroid_shfl(tq6_mag, q0) * norm, fattn_sj_kvarn_tq6_centroid_shfl(tq6_mag, q1) * norm);
     }
     if (type == GGML_TYPE_F16) {
         return ((const half2 *) row)[pair];
@@ -1599,7 +1599,7 @@ static __global__ void flash_attn_stream_k_fixup_general(
     *dst = dst_val / rowsum;
 }
 
-template<int D, bool rot = false> // D == head size; rot: [#139] KVarN fused output rotation of the final row
+template<int D, bool rot = false> // D == head size; rot: [#139] SJ-KVaRN fused output rotation of the final row
 __launch_bounds__(D, 1)
 static __global__ void flash_attn_combine_results(
         const float  * __restrict__ VKQ_parts,
@@ -1652,7 +1652,7 @@ static __global__ void flash_attn_combine_results(
     if constexpr (rot) {
         static_assert(D == 256, "plain H256");
         __shared__ float rot_buf[D];
-        dst[tid] = kvarn_rot256_block(VKQ_numerator / VKQ_denominator, tid, rot_buf);
+        dst[tid] = sj_kvarn_rot256_block(VKQ_numerator / VKQ_denominator, tid, rot_buf);
         return;
     }
     dst[tid] = VKQ_numerator / VKQ_denominator;
@@ -1688,7 +1688,7 @@ void launch_fattn(
     const bool output_partial = partial_dst != nullptr;
     GGML_ASSERT(output_partial == (partial_meta != nullptr));
     GGML_ASSERT(!output_partial || !stream_k);
-    GGML_ASSERT(!ggml_cuda_fattn_kvarn_rot(KQV) || (!stream_k && !output_partial)); // [#139] combine_results rotates
+    GGML_ASSERT(!ggml_cuda_fattn_sj_kvarn_rot(KQV) || (!stream_k && !output_partial)); // [#139] combine_results rotates
 
     GGML_ASSERT(Q->type == GGML_TYPE_F32);
     GGML_ASSERT(KQV->type == GGML_TYPE_F32);
@@ -1829,8 +1829,8 @@ void launch_fattn(
 
     // sparse: a query tile of ncols1 queries shares one index list, the union of the queries' visible columns
     int32_t n_kv_max = 0;
-    // KVarN: K/V are the exact-row ring tensors; the attended range is the padded position count (op_params[6])
-    const bool    is_kvarn = KQV->src[6] != nullptr;
+    // SJ-KVaRN: K/V are the exact-row ring tensors; the attended range is the padded position count (op_params[6])
+    const bool    is_sj_kvarn = KQV->src[6] != nullptr;
     if (use_sparse) {
         GGML_ASSERT(mask != nullptr);
         const int32_t n_kv_max_query = ggml_get_op_params_i32(KQV, 4);
@@ -1846,7 +1846,7 @@ void launch_fattn(
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths.
-    const bool scan_mask = !use_sparse && !is_kvarn && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1);
+    const bool scan_mask = !use_sparse && !is_sj_kvarn && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1);
     if (scan_mask) {
         const int64_t s31 = mask->nb[1] / sizeof(half2);
         const int64_t s33 = mask->nb[3] / sizeof(half2);
@@ -1869,7 +1869,7 @@ void launch_fattn(
     GGML_ASSERT(max_blocks_per_sm > 0);
     int parallel_blocks = max_blocks_per_sm;
 
-    const int64_t n_kv = use_sparse ? n_kv_max : (is_kvarn ? ggml_get_op_params_i32(KQV, 6) : K->ne[1]);
+    const int64_t n_kv = use_sparse ? n_kv_max : (is_sj_kvarn ? ggml_get_op_params_i32(KQV, 6) : K->ne[1]);
     const int ntiles_KV = (n_kv + nbatch_fa - 1) / nbatch_fa; // Max. number of parallel blocks limited by KV cache length.
 
     dim3 blocks_num;
@@ -1947,7 +1947,7 @@ void launch_fattn(
         }
 
         if (parallel_blocks_override > 0) {
-            // KVarN stream kernels pick their own KV split (never together with output_partial)
+            // SJ-KVaRN stream kernels pick their own KV split (never together with output_partial)
             GGML_ASSERT(!output_partial);
             parallel_blocks = std::min(parallel_blocks_override, ntiles_KV);
         }
@@ -2011,8 +2011,8 @@ void launch_fattn(
         nb21, nb22, nb23,
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
         mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
-        is_kvarn ? (const char    *) KQV->src[5]->data : nullptr,
-        is_kvarn ? (const int32_t *) KQV->src[6]->data : nullptr
+        is_sj_kvarn ? (const char    *) KQV->src[5]->data : nullptr,
+        is_sj_kvarn ? (const int32_t *) KQV->src[6]->data : nullptr
     );
     CUDA_CHECK(cudaGetLastError());
 
@@ -2063,13 +2063,13 @@ void launch_fattn(
         const dim3 blocks_num_combine(Q->ne[1], Q->ne[2], Q->ne[3]);
         const size_t nbytes_shared_combine = parallel_blocks*sizeof(float2);
 
-        if (ggml_cuda_fattn_kvarn_rot(KQV)) { // [#139] the KVarN stream kernel rotated Q; the combine rotates the output
+        if (ggml_cuda_fattn_sj_kvarn_rot(KQV)) { // [#139] the SJ-KVaRN stream kernel rotated Q; the combine rotates the output
             if constexpr (DV == 256) {
                 flash_attn_combine_results<DV, true>
                     <<<blocks_num_combine, block_dim_combine, nbytes_shared_combine, main_stream>>>
                     (dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks);
             } else {
-                GGML_ABORT("KVarN fused rotation needs DV == 256");
+                GGML_ABORT("SJ-KVaRN fused rotation needs DV == 256");
             }
         } else {
         flash_attn_combine_results<DV>

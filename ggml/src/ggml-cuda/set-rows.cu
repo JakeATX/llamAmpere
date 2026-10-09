@@ -1,7 +1,7 @@
 #include "set-rows.cuh"
 #include "cpy-utils.cuh"
 #include "turbo-quant.cuh"
-#include "set-rows-kvarn-rot.cuh"
+#include "set-rows-sjkvarn-rot.cuh"
 
 typedef void (*set_rows_kernel_t)(const char * src, char * dst);
 
@@ -1681,8 +1681,8 @@ static void set_rows_cuda(
 
 
     const int sink_rows = ggml_get_op_params_i32(dst, 2);
-    // the KVarN f16 sink mirror indexes absolute cache rows; the block-KV-stream staged path (DstRowBase)
-    // writes into a row window, and the KV cache refuses KVarN together with streaming
+    // the SJ-KVaRN f16 sink mirror indexes absolute cache rows; the block-KV-stream staged path (DstRowBase)
+    // writes into a row window, and the KV cache refuses SJ-KVaRN together with streaming
     GGML_ASSERT(!DstRowBase || sink_rows == 0);
     if (sink_rows > 0) {
         GGML_ASSERT(ne02 == 1 && ne03 == 1);
@@ -1861,8 +1861,8 @@ void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(src0->type == GGML_TYPE_F32 || (src0->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F16));
     GGML_ASSERT(src1->type == GGML_TYPE_I64 || src1->type == GGML_TYPE_I32);
 
-    if (ggml_cuda_set_rows_is_kvarn_rot(dst)) {
-        ggml_cuda_set_rows_kvarn_rot(ctx, dst);  // KVarN fused write rotation (#139)
+    if (ggml_cuda_set_rows_is_sj_kvarn_rot(dst)) {
+        ggml_cuda_set_rows_sj_kvarn_rot(ctx, dst);  // SJ-KVaRN fused write rotation (#139)
         return;
     }
 

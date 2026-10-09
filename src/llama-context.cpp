@@ -835,21 +835,21 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
             /*.swa_full              =*/params.swa_full,
             /*.ctx_type              =*/cparams.ctx_type,
             /*.mem_other             =*/llama_get_memory(cparams.ctx_other),
-            /*.kvarn     =*/ {
-                /*.bits_k   =*/ params.kvarn_bits_k,
-                /*.bits_v   =*/ params.kvarn_bits_v,
-                /*.sink_type =*/ params.kvarn_sink_type,
-                /*.sink     =*/ params.kvarn_sink,
+            /*.sj_kvarn     =*/ {
+                /*.bits_k   =*/ params.sj_kvarn_bits_k,
+                /*.bits_v   =*/ params.sj_kvarn_bits_v,
+                /*.sink_type =*/ params.sj_kvarn_sink_type,
+                /*.sink     =*/ params.sj_kvarn_sink,
                 /*.group    =*/ 128,
-                /*.tail     =*/ params.kvarn_tail,
+                /*.tail     =*/ params.sj_kvarn_tail,
                 /*.n_ubatch =*/ cparams.n_ubatch,
-                /*.body_type =*/ params.kvarn_body_type,
-                /*.tail_max =*/ params.kvarn_tail_max,
-                /*.edge_layers =*/ params.kvarn_edge_layers,
-                /*.edge_bits_k =*/ params.kvarn_edge_bits_k,
-                /*.edge_bits_v =*/ params.kvarn_edge_bits_v,
-                /*.edge_body_type =*/ params.kvarn_edge_body_type,
-                /*.flush_chunk =*/ params.kvarn_flush_chunk,
+                /*.body_type =*/ params.sj_kvarn_body_type,
+                /*.tail_max =*/ params.sj_kvarn_tail_max,
+                /*.edge_layers =*/ params.sj_kvarn_edge_layers,
+                /*.edge_bits_k =*/ params.sj_kvarn_edge_bits_k,
+                /*.edge_bits_v =*/ params.sj_kvarn_edge_bits_v,
+                /*.edge_body_type =*/ params.sj_kvarn_edge_body_type,
+                /*.flush_chunk =*/ params.sj_kvarn_flush_chunk,
             },
         };
 
@@ -2116,13 +2116,13 @@ static enum ggml_type llama_memory_get_kv_type(const llama_memory_i * mem, bool 
     return GGML_TYPE_COUNT;
 }
 
-static llama_kv_cache * llama_kvarn_cache(llama_memory_i * memory) {
+static llama_kv_cache * llama_sj_kvarn_cache(llama_memory_i * memory) {
     if (auto * kv = dynamic_cast<llama_kv_cache *>(memory)) { return kv; }
     if (auto * hy = dynamic_cast<llama_memory_hybrid *>(memory)) { return hy->get_mem_attn(); }
     return nullptr;
 }
 
-ggml_backend_t llama_context::kvarn_backend(ggml_backend_buffer_t buffer) const {
+ggml_backend_t llama_context::sj_kvarn_backend(ggml_backend_buffer_t buffer) const {
     const auto buft = ggml_backend_buffer_get_type(buffer);
     const auto device = ggml_backend_buft_get_device(buft);
     for (const auto & backend : backends) {
@@ -2138,27 +2138,27 @@ ggml_backend_t llama_context::kvarn_backend(ggml_backend_buffer_t buffer) const 
     return nullptr;
 }
 
-bool llama_context::maintain_kvarn() {
-    auto * kv = llama_kvarn_cache(memory.get());
-    if (!kv || !kv->is_kvarn() || !kv->has_kvarn_maintenance()) { return true; }
+bool llama_context::maintain_sj_kvarn() {
+    auto * kv = llama_sj_kvarn_cache(memory.get());
+    if (!kv || !kv->is_sj_kvarn() || !kv->has_sj_kvarn_maintenance()) { return true; }
     if (compute_peer && compute_peer->sched) { ggml_backend_sched_synchronize(compute_peer->sched.get()); }
-    return kv->maintain_kvarn(this);
+    return kv->maintain_sj_kvarn(this);
 }
 
-int32_t llama_context::compress_kvarn_idle(llama_seq_id seq_id, llama_pos accepted_end) {
-    auto * kv = llama_kvarn_cache(memory.get());
-    if (!kv || !kv->is_kvarn()) { return -1; }
+int32_t llama_context::compress_sj_kvarn_idle(llama_seq_id seq_id, llama_pos accepted_end) {
+    auto * kv = llama_sj_kvarn_cache(memory.get());
+    if (!kv || !kv->is_sj_kvarn()) { return -1; }
     if (compute_peer && compute_peer->sched) { ggml_backend_sched_synchronize(compute_peer->sched.get()); }
-    return kv->compress_kvarn_idle(this, seq_id, accepted_end);
+    return kv->compress_sj_kvarn_idle(this, seq_id, accepted_end);
 }
 
-int32_t llama_kvarn_sealed_end(llama_context * ctx) {
-    auto * kv = ctx ? llama_kvarn_cache(ctx->get_memory()) : nullptr;
-    return kv && kv->is_kvarn() ? (int32_t) kv->get_kvarn_sealed_end() : -1;
+int32_t llama_sj_kvarn_sealed_end(llama_context * ctx) {
+    auto * kv = ctx ? llama_sj_kvarn_cache(ctx->get_memory()) : nullptr;
+    return kv && kv->is_sj_kvarn() ? (int32_t) kv->get_sj_kvarn_sealed_end() : -1;
 }
 
-int32_t llama_kvarn_compress_idle(llama_context * ctx, llama_seq_id seq_id, llama_pos accepted_end) {
-    return ctx ? ctx->compress_kvarn_idle(seq_id, accepted_end) : -1;
+int32_t llama_sj_kvarn_compress_idle(llama_context * ctx, llama_seq_id seq_id, llama_pos accepted_end) {
+    return ctx ? ctx->compress_sj_kvarn_idle(seq_id, accepted_end) : -1;
 }
 
 enum ggml_type llama_context::get_kv_type_k() const {
@@ -2770,7 +2770,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
         return nullptr;
     }
 
-    if (!maintain_kvarn()) {
+    if (!maintain_sj_kvarn()) {
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
@@ -5527,19 +5527,19 @@ llama_context_params llama_context_default_params() {
         /*.moe_cache_size              =*/ 0,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
-        /*.kvarn_bits_k                =*/ 0,
-        /*.kvarn_bits_v                =*/ 0,
-        /*.kvarn_tail                  =*/ 4096,
-        /*.kvarn_sink                  =*/ 128,
-        /*.kvarn_body_type             =*/ GGML_TYPE_F32,
-        /*.kvarn_sink_type             =*/ GGML_TYPE_F16,
-        /*.kvarn_staging_type          =*/ GGML_TYPE_TQ6_0,
-        /*.kvarn_tail_max              =*/ 8192,
-        /*.kvarn_edge_layers           =*/ 0,
-        /*.kvarn_edge_bits_k           =*/ 4,
-        /*.kvarn_edge_bits_v           =*/ 4,
-        /*.kvarn_edge_body_type        =*/ GGML_TYPE_COUNT,
-        /*.kvarn_flush_chunk           =*/ 0,
+        /*.sj_kvarn_bits_k                =*/ 0,
+        /*.sj_kvarn_bits_v                =*/ 0,
+        /*.sj_kvarn_tail                  =*/ 4096,
+        /*.sj_kvarn_sink                  =*/ 128,
+        /*.sj_kvarn_body_type             =*/ GGML_TYPE_F32,
+        /*.sj_kvarn_sink_type             =*/ GGML_TYPE_F16,
+        /*.sj_kvarn_staging_type          =*/ GGML_TYPE_TQ6_0,
+        /*.sj_kvarn_tail_max              =*/ 8192,
+        /*.sj_kvarn_edge_layers           =*/ 0,
+        /*.sj_kvarn_edge_bits_k           =*/ 4,
+        /*.sj_kvarn_edge_bits_v           =*/ 4,
+        /*.sj_kvarn_edge_body_type        =*/ GGML_TYPE_COUNT,
+        /*.sj_kvarn_flush_chunk           =*/ 0,
         /*.embeddings                  =*/ false,
         /*.offload_kqv                 =*/ true,
         /*.no_perf                     =*/ true,
@@ -5611,99 +5611,99 @@ llama_context * llama_init_from_model(llama_model * model, llama_context_params 
         return nullptr;
     }
 
-    // the adaptive tail is a KVarN-only setting; the 8192 default must not block non-KVarN caches
-    if (params.kvarn_tail_max > 0 && params.kvarn_bits_k == 0 && params.kvarn_bits_v == 0) {
-        params.kvarn_tail_max = 0;
+    // the adaptive tail is a SJ-KVaRN-only setting; the 8192 default must not block non-SJ-KVaRN caches
+    if (params.sj_kvarn_tail_max > 0 && params.sj_kvarn_bits_k == 0 && params.sj_kvarn_bits_v == 0) {
+        params.sj_kvarn_tail_max = 0;
     }
 
-    // KVarN region-aware cache: staged sink + tail, sealed low-bit body
-    // tiered body: the edge tier (first/last kvarn_edge_layers cache layers) resolves its codec by the same auto rule
+    // SJ-KVaRN region-aware cache: staged sink + tail, sealed low-bit body
+    // tiered body: the edge tier (first/last sj_kvarn_edge_layers cache layers) resolves its codec by the same auto rule
     // (trellis only for a trellis-capable pair and only when the body codec is auto or trellis)
-    if (params.kvarn_edge_body_type == GGML_TYPE_COUNT) {
-        const int pair = (params.kvarn_edge_bits_k << 8) | params.kvarn_edge_bits_v;
+    if (params.sj_kvarn_edge_body_type == GGML_TYPE_COUNT) {
+        const int pair = (params.sj_kvarn_edge_bits_k << 8) | params.sj_kvarn_edge_bits_v;
         const bool trellis_pair = pair == ((3 << 8) | 3) || pair == ((3 << 8) | 2) || pair == ((2 << 8) | 2);
-        const bool trellis_ok = params.kvarn_body_type == GGML_TYPE_COUNT || params.kvarn_body_type == GGML_TYPE_I16;
-        params.kvarn_edge_body_type = (params.kvarn_edge_layers > 0 && trellis_pair && trellis_ok) ? GGML_TYPE_I16 : GGML_TYPE_F32;
+        const bool trellis_ok = params.sj_kvarn_body_type == GGML_TYPE_COUNT || params.sj_kvarn_body_type == GGML_TYPE_I16;
+        params.sj_kvarn_edge_body_type = (params.sj_kvarn_edge_layers > 0 && trellis_pair && trellis_ok) ? GGML_TYPE_I16 : GGML_TYPE_F32;
     }
-    if (params.kvarn_body_type == GGML_TYPE_COUNT) {
+    if (params.sj_kvarn_body_type == GGML_TYPE_COUNT) {
         // auto body codec: the trellis body (built-in trained codebooks) for the 3/3, 3/2 and 2/2 pairs, scalar records otherwise
-        const int pair = (params.kvarn_bits_k << 8) | params.kvarn_bits_v;
+        const int pair = (params.sj_kvarn_bits_k << 8) | params.sj_kvarn_bits_v;
         const bool trellis_pair = pair == ((3 << 8) | 3) || pair == ((3 << 8) | 2) || pair == ((2 << 8) | 2);
-        params.kvarn_body_type = trellis_pair ? GGML_TYPE_I16 : GGML_TYPE_F32;
+        params.sj_kvarn_body_type = trellis_pair ? GGML_TYPE_I16 : GGML_TYPE_F32;
     }
-    if (params.kvarn_bits_k > 0 || params.kvarn_bits_v > 0) {
+    if (params.sj_kvarn_bits_k > 0 || params.sj_kvarn_bits_v > 0) {
         {
-            const int pair = (params.kvarn_bits_k << 8) | params.kvarn_bits_v;
+            const int pair = (params.sj_kvarn_bits_k << 8) | params.sj_kvarn_bits_v;
             const bool lower_pair = pair == ((4 << 8) | 3) || pair == ((3 << 8) | 3) || pair == ((4 << 8) | 2) || pair == ((2 << 8) | 4) || pair == ((3 << 8) | 2) || pair == ((2 << 8) | 2);
-            const bool trellis    = params.kvarn_body_type == GGML_TYPE_I16;
-            // scalar bodies: 4/4 plus the lower-bit pairs; trellis bodies (kvarn4t / auto): 4/4, 3/3, 3/2 and 2/2 (a 4-bit side of a
+            const bool trellis    = params.sj_kvarn_body_type == GGML_TYPE_I16;
+            // scalar bodies: 4/4 plus the lower-bit pairs; trellis bodies (sjkvarn4t / auto): 4/4, 3/3, 3/2 and 2/2 (a 4-bit side of a
             // low-bit pair would be read as scalar by the low-bit tile loader)
             const bool trellis_pair = pair == ((3 << 8) | 3) || pair == ((3 << 8) | 2) || pair == ((2 << 8) | 2);
             const bool ok = pair == ((4 << 8) | 4) || (lower_pair && (!trellis || trellis_pair));
             if (!ok) {
-                LLAMA_LOG_ERROR("%s: KVarN cache: supported K/V pairs are 4/4, 4/3, 3/3, 4/2, 2/4, 3/2 and 2/2 (trellis body: 4/4, 3/3, 3/2 and 2/2), got %d/%d\n",
-                        __func__, params.kvarn_bits_k, params.kvarn_bits_v);
+                LLAMA_LOG_ERROR("%s: SJ-KVaRN cache: supported K/V pairs are 4/4, 4/3, 3/3, 4/2, 2/4, 3/2 and 2/2 (trellis body: 4/4, 3/3, 3/2 and 2/2), got %d/%d\n",
+                        __func__, params.sj_kvarn_bits_k, params.sj_kvarn_bits_v);
                 return nullptr;
             }
         }
-        if (params.kvarn_edge_layers > 0) {
-            const int pair = (params.kvarn_edge_bits_k << 8) | params.kvarn_edge_bits_v;
+        if (params.sj_kvarn_edge_layers > 0) {
+            const int pair = (params.sj_kvarn_edge_bits_k << 8) | params.sj_kvarn_edge_bits_v;
             const bool ok = pair == ((4 << 8) | 4) || pair == ((4 << 8) | 3) || pair == ((3 << 8) | 3) || pair == ((4 << 8) | 2) || pair == ((2 << 8) | 4) || pair == ((3 << 8) | 2) || pair == ((2 << 8) | 2);
             // audit 2026-10-03: an explicit I16 (trellis) edge tier is valid only where the main tier allows a trellis body (4/4, 3/3,
-            // 3/2, 2/2); for 4/3, 4/2, 2/4 the 4-bit side would be sealed as kvarn4t and read as scalar nibbles by the low-bit loader
+            // 3/2, 2/2); for 4/3, 4/2, 2/4 the 4-bit side would be sealed as sjkvarn4t and read as scalar nibbles by the low-bit loader
             const bool edge_trellis_ok = pair == ((4 << 8) | 4) || pair == ((3 << 8) | 3) || pair == ((3 << 8) | 2) || pair == ((2 << 8) | 2);
-            if (params.kvarn_edge_body_type == GGML_TYPE_I16 && !edge_trellis_ok) {
-                LLAMA_LOG_ERROR("%s: KVarN tiered body: a trellis edge tier needs a 4/4, 3/3, 3/2 or 2/2 edge pair (got %u/%u)\n",
-                        __func__, params.kvarn_edge_bits_k, params.kvarn_edge_bits_v);
+            if (params.sj_kvarn_edge_body_type == GGML_TYPE_I16 && !edge_trellis_ok) {
+                LLAMA_LOG_ERROR("%s: SJ-KVaRN tiered body: a trellis edge tier needs a 4/4, 3/3, 3/2 or 2/2 edge pair (got %u/%u)\n",
+                        __func__, params.sj_kvarn_edge_bits_k, params.sj_kvarn_edge_bits_v);
                 return nullptr;
             }
-            if (!ok || params.kvarn_body_type == GGML_TYPE_TURBO4_0 || (params.kvarn_edge_body_type != GGML_TYPE_F32 && params.kvarn_edge_body_type != GGML_TYPE_I16)) {
-                LLAMA_LOG_ERROR("%s: KVarN tiered body: edge pair must be one of 4/4, 4/3, 3/3, 4/2, 2/4, 3/2, 2/2 (got %u/%u) and the body codec cannot be turbo4\n",
-                        __func__, params.kvarn_edge_bits_k, params.kvarn_edge_bits_v);
+            if (!ok || params.sj_kvarn_body_type == GGML_TYPE_TURBO4_0 || (params.sj_kvarn_edge_body_type != GGML_TYPE_F32 && params.sj_kvarn_edge_body_type != GGML_TYPE_I16)) {
+                LLAMA_LOG_ERROR("%s: SJ-KVaRN tiered body: edge pair must be one of 4/4, 4/3, 3/3, 4/2, 2/4, 3/2, 2/2 (got %u/%u) and the body codec cannot be turbo4\n",
+                        __func__, params.sj_kvarn_edge_bits_k, params.sj_kvarn_edge_bits_v);
                 return nullptr;
             }
         }
         if (model->hparams.is_mla() || model->arch == LLM_ARCH_DEEPSEEK4) {
-            LLAMA_LOG_ERROR("%s: KVarN cache does not support MLA models\n", __func__);
+            LLAMA_LOG_ERROR("%s: SJ-KVaRN cache does not support MLA models\n", __func__);
             return nullptr;
         }
-        if (params.kvarn_staging_type != GGML_TYPE_F16 && params.kvarn_staging_type != GGML_TYPE_Q8_0 && params.kvarn_staging_type != GGML_TYPE_TQ6_0) {
-            LLAMA_LOG_ERROR("%s: KVarN staging type must be f16, q8_0 or tq6_0\n", __func__);
+        if (params.sj_kvarn_staging_type != GGML_TYPE_F16 && params.sj_kvarn_staging_type != GGML_TYPE_Q8_0 && params.sj_kvarn_staging_type != GGML_TYPE_TQ6_0) {
+            LLAMA_LOG_ERROR("%s: SJ-KVaRN staging type must be f16, q8_0 or tq6_0\n", __func__);
             return nullptr;
         }
-        if (params.kvarn_body_type != GGML_TYPE_F32 && params.kvarn_body_type != GGML_TYPE_TURBO4_0 && params.kvarn_body_type != GGML_TYPE_I16) {
+        if (params.sj_kvarn_body_type != GGML_TYPE_F32 && params.sj_kvarn_body_type != GGML_TYPE_TURBO4_0 && params.sj_kvarn_body_type != GGML_TYPE_I16) {
             LLAMA_LOG_ERROR("invalid sealed body codec\n");
             return nullptr;
         }
-        if (params.kvarn_sink_type != GGML_TYPE_COUNT && params.kvarn_sink_type != GGML_TYPE_F16) {
-            LLAMA_LOG_ERROR("%s: KVarN sink type must inherit staging or be f16\n", __func__);
+        if (params.sj_kvarn_sink_type != GGML_TYPE_COUNT && params.sj_kvarn_sink_type != GGML_TYPE_F16) {
+            LLAMA_LOG_ERROR("%s: SJ-KVaRN sink type must inherit staging or be f16\n", __func__);
             return nullptr;
         }
-        if (params.kvarn_sink_type == GGML_TYPE_F16 && params.kvarn_staging_type == GGML_TYPE_Q8_0) {
-            LLAMA_LOG_ERROR("%s: independent F16 KVarN sink requires TQ6 staging\n", __func__);
+        if (params.sj_kvarn_sink_type == GGML_TYPE_F16 && params.sj_kvarn_staging_type == GGML_TYPE_Q8_0) {
+            LLAMA_LOG_ERROR("%s: independent F16 SJ-KVaRN sink requires TQ6 staging\n", __func__);
             return nullptr;
         }
-        if (params.kvarn_staging_type == GGML_TYPE_F16) {
-            params.kvarn_sink_type = GGML_TYPE_COUNT;
+        if (params.sj_kvarn_staging_type == GGML_TYPE_F16) {
+            params.sj_kvarn_sink_type = GGML_TYPE_COUNT;
         }
-        params.type_k = params.kvarn_staging_type;
-        params.type_v = params.kvarn_staging_type;
+        params.type_k = params.sj_kvarn_staging_type;
+        params.type_v = params.sj_kvarn_staging_type;
         if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
-            LLAMA_LOG_ERROR("%s: KVarN cache requires flash attention\n", __func__);
+            LLAMA_LOG_ERROR("%s: SJ-KVaRN cache requires flash attention\n", __func__);
             return nullptr;
         }
         params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
         if (params.n_seq_max != 1) {
-            LLAMA_LOG_ERROR("%s: KVarN cache supports a single sequence (n_seq_max = %u)\n", __func__, params.n_seq_max);
+            LLAMA_LOG_ERROR("%s: SJ-KVaRN cache supports a single sequence (n_seq_max = %u)\n", __func__, params.n_seq_max);
             return nullptr;
         }
-        if (params.kvarn_tail_max != 0 && (params.kvarn_tail_max < params.kvarn_tail || params.kvarn_tail_max % 128 != 0)) {
-            LLAMA_LOG_ERROR("%s: KVarN tail-max must be aligned to 128 and >= tail\n", __func__);
+        if (params.sj_kvarn_tail_max != 0 && (params.sj_kvarn_tail_max < params.sj_kvarn_tail || params.sj_kvarn_tail_max % 128 != 0)) {
+            LLAMA_LOG_ERROR("%s: SJ-KVaRN tail-max must be aligned to 128 and >= tail\n", __func__);
             return nullptr;
         }
-        if (params.kvarn_sink == 0 || params.kvarn_sink % 64 != 0 || params.kvarn_tail % 128 != 0) {
-            LLAMA_LOG_ERROR("%s: KVarN cache: sink must be a positive multiple of 64 and tail a multiple of 128 (got %u / %u)\n",
-                    __func__, params.kvarn_sink, params.kvarn_tail);
+        if (params.sj_kvarn_sink == 0 || params.sj_kvarn_sink % 64 != 0 || params.sj_kvarn_tail % 128 != 0) {
+            LLAMA_LOG_ERROR("%s: SJ-KVaRN cache: sink must be a positive multiple of 64 and tail a multiple of 128 (got %u / %u)\n",
+                    __func__, params.sj_kvarn_sink, params.sj_kvarn_tail);
             return nullptr;
         }
         for (uint32_t il = 0; il < model->hparams.n_layer(); ++il) {
@@ -5711,7 +5711,7 @@ llama_context * llama_init_from_model(llama_model * model, llama_context_params 
                 continue;
             }
             if (model->hparams.n_embd_head_k(il) != 256 || model->hparams.n_embd_head_v(il) != 256) {
-                LLAMA_LOG_ERROR("%s: KVarN cache requires 256-channel K/V heads (layer %u has %u/%u)\n", __func__,
+                LLAMA_LOG_ERROR("%s: SJ-KVaRN cache requires 256-channel K/V heads (layer %u has %u/%u)\n", __func__,
                         il, model->hparams.n_embd_head_k(il), model->hparams.n_embd_head_v(il));
                 return nullptr;
             }

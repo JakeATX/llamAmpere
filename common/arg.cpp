@@ -383,12 +383,12 @@ static std::string kv_cache_type_display_name(ggml_type type) {
     return turbo.empty() || tq.empty() ? names[0] : turbo + " (" + tq + ")";
 }
 
-// "kvarnN" (N in 2..8) selects the KVarN region-aware cache: the ring/sink use the staging type, the body is sealed at N bits
-static bool kvarn_bits_from_str(const std::string & s, uint32_t & bits) {
-    if (s.size() != 6 || s.compare(0, 5, "kvarn") != 0 || s[5] < '2' || s[5] > '8') {
+// "sjkvarnN" (N in 2..8) selects the SJ-KVaRN region-aware cache: the ring/sink use the staging type, the body is sealed at N bits
+static bool sj_kvarn_bits_from_str(const std::string & s, uint32_t & bits) {
+    if (s.size() != 8 || s.compare(0, 7, "sjkvarn") != 0 || s[7] < '2' || s[7] > '8') {
         return false;
     }
-    bits = (uint32_t) (s[5] - '0');
+    bits = (uint32_t) (s[7] - '0');
     return true;
 }
 
@@ -2591,17 +2591,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"-ctk", "--cache-type-k"}, "TYPE",
         string_format(
             "KV cache data type for K\n"
-            "allowed values: %s, kvarn4 (KVarN region-aware cache, pair with -ctv kvarn4)\n"
+            "allowed values: %s, sjkvarn4 (SJ-KVaRN region-aware cache, pair with -ctv sjkvarn4)\n"
             "(default: %s)",
             get_all_kv_cache_types().c_str(),
             ggml_type_name(params.cache_type_k)
         ),
         [](common_params & params, const std::string & value) {
-            if (kvarn_bits_from_str(value, params.kvarn_bits_k)) {
+            if (sj_kvarn_bits_from_str(value, params.sj_kvarn_bits_k)) {
                 params.cache_type_k = GGML_TYPE_F16;
                 return;
             }
-            params.kvarn_bits_k = 0;
+            params.sj_kvarn_bits_k = 0;
             params.cache_type_k = kv_cache_type_from_str(value);
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_K"));
@@ -2609,17 +2609,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"-ctv", "--cache-type-v"}, "TYPE",
         string_format(
             "KV cache data type for V\n"
-            "allowed values: %s, kvarn4 (KVarN region-aware cache, pair with -ctk kvarn4)\n"
+            "allowed values: %s, sjkvarn4 (SJ-KVaRN region-aware cache, pair with -ctk sjkvarn4)\n"
             "(default: %s)",
             get_all_kv_cache_types().c_str(),
             ggml_type_name(params.cache_type_v)
         ),
         [](common_params & params, const std::string & value) {
-            if (kvarn_bits_from_str(value, params.kvarn_bits_v)) {
+            if (sj_kvarn_bits_from_str(value, params.sj_kvarn_bits_v)) {
                 params.cache_type_v = GGML_TYPE_F16;
                 return;
             }
-            params.kvarn_bits_v = 0;
+            params.sj_kvarn_bits_v = 0;
             params.cache_type_v = kv_cache_type_from_str(value);
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
@@ -2649,118 +2649,118 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_S"));
     add_opt(common_arg(
-        {"--kvarn-staging-type"}, "TYPE",
-        "KVarN tail (and sink) storage: tq6_0, q8_0 or f16 (default: tq6_0 with a separate f16 sink; q8_0 stores the sink in q8_0 too)",
+        {"--sjkvarn-staging-type"}, "TYPE",
+        "SJ-KVaRN tail (and sink) storage: tq6_0, q8_0 or f16 (default: tq6_0 with a separate f16 sink; q8_0 stores the sink in q8_0 too)",
         [](common_params & params, const std::string & value) {
             if (value != "f16" && value != "q8_0" && value != "tq6_0") {
-                throw std::invalid_argument("KVarN staging type must be f16, q8_0 or tq6_0");
+                throw std::invalid_argument("SJ-KVaRN staging type must be f16, q8_0 or tq6_0");
             }
-            params.kvarn_staging_type = kv_cache_type_from_str(value);
-            // the default F16 sink exists only beside TQ6 staging; other staging types inherit unless --kvarn-sink-type was given
-            if (!params.kvarn_sink_type_set) {
-                params.kvarn_sink_type = params.kvarn_staging_type == GGML_TYPE_TQ6_0 ? GGML_TYPE_F16 : GGML_TYPE_COUNT;
+            params.sj_kvarn_staging_type = kv_cache_type_from_str(value);
+            // the default F16 sink exists only beside TQ6 staging; other staging types inherit unless --sjkvarn-sink-type was given
+            if (!params.sj_kvarn_sink_type_set) {
+                params.sj_kvarn_sink_type = params.sj_kvarn_staging_type == GGML_TYPE_TQ6_0 ? GGML_TYPE_F16 : GGML_TYPE_COUNT;
             }
         }
-    ).set_env("LLAMA_ARG_KVARN_STAGING_TYPE"));
+    ).set_env("LLAMA_ARG_SJKVARN_STAGING_TYPE"));
     add_opt(common_arg(
-        {"--kvarn-sink-type"}, "TYPE",
-        "KVarN sink storage: staging or f16 (default: f16 with tq6_0 staging, staging otherwise)",
+        {"--sjkvarn-sink-type"}, "TYPE",
+        "SJ-KVaRN sink storage: staging or f16 (default: f16 with tq6_0 staging, staging otherwise)",
         [](common_params & params, const std::string & value) {
             if (value != "staging" && value != "f16") {
-                throw std::invalid_argument("KVarN sink type must be staging or f16");
+                throw std::invalid_argument("SJ-KVaRN sink type must be staging or f16");
             }
-            params.kvarn_sink_type = value == "f16" ? GGML_TYPE_F16 : GGML_TYPE_COUNT;
-            params.kvarn_sink_type_set = true;
+            params.sj_kvarn_sink_type = value == "f16" ? GGML_TYPE_F16 : GGML_TYPE_COUNT;
+            params.sj_kvarn_sink_type_set = true;
         }
-    ).set_env("LLAMA_ARG_KVARN_SINK_TYPE"));
+    ).set_env("LLAMA_ARG_SJKVARN_SINK_TYPE"));
     add_opt(common_arg(
-        {"--kvarn-body-type"}, "TYPE",
-        "Sealed body codec: kvarn4 (scalar), kvarn4t (trellis-coded payload with the built-in trained codebooks; 4-bit, or the low-bit pairs 3/3, 3/2, 2/2 with -ctk kvarn3|kvarn2 -ctv kvarn3|kvarn2), "
-        "auto (trellis for the 3/3, 3/2 and 2/2 pairs, scalar otherwise) or turbo4 (default: kvarn4)",
+        {"--sjkvarn-body-type"}, "TYPE",
+        "Sealed body codec: sjkvarn4 (scalar), sjkvarn4t (trellis-coded payload with the built-in trained codebooks; 4-bit, or the low-bit pairs 3/3, 3/2, 2/2 with -ctk sjkvarn3|sjkvarn2 -ctv sjkvarn3|sjkvarn2), "
+        "auto (trellis for the 3/3, 3/2 and 2/2 pairs, scalar otherwise) or turbo4 (default: sjkvarn4)",
         [](common_params & params, const std::string & value) {
-            if (value != "kvarn4" && value != "kvarn4t" && value != "auto" && value != "turbo4") {
-                throw std::invalid_argument("KVarN body type must be kvarn4, kvarn4t, auto or turbo4");
+            if (value != "sjkvarn4" && value != "sjkvarn4t" && value != "auto" && value != "turbo4") {
+                throw std::invalid_argument("SJ-KVaRN body type must be sjkvarn4, sjkvarn4t, auto or turbo4");
             }
-            params.kvarn_body_type = value == "turbo4" ? GGML_TYPE_TURBO4_0 : value == "kvarn4t" ? GGML_TYPE_I16 : value == "auto" ? GGML_TYPE_COUNT : GGML_TYPE_F32;
+            params.sj_kvarn_body_type = value == "turbo4" ? GGML_TYPE_TURBO4_0 : value == "sjkvarn4t" ? GGML_TYPE_I16 : value == "auto" ? GGML_TYPE_COUNT : GGML_TYPE_F32;
         }
-    ).set_env("LLAMA_ARG_KVARN_BODY_TYPE"));
+    ).set_env("LLAMA_ARG_SJKVARN_BODY_TYPE"));
     add_opt(common_arg(
         {"--tiered-tq"},
         "Tiered TQ cache: FP16 sink 128, sealed Turbo4 body, TQ6 tail 8192",
         [](common_params & params) {
-            params.kvarn_bits_k = params.kvarn_bits_v = 4;
-            params.kvarn_body_type = GGML_TYPE_TURBO4_0;
-            params.kvarn_staging_type = GGML_TYPE_TQ6_0;
-            params.kvarn_sink_type = GGML_TYPE_F16;
-            params.kvarn_sink = 128;
-            params.kvarn_tail = 8192;
-            params.kvarn_tail_max = 0;
+            params.sj_kvarn_bits_k = params.sj_kvarn_bits_v = 4;
+            params.sj_kvarn_body_type = GGML_TYPE_TURBO4_0;
+            params.sj_kvarn_staging_type = GGML_TYPE_TQ6_0;
+            params.sj_kvarn_sink_type = GGML_TYPE_F16;
+            params.sj_kvarn_sink = 128;
+            params.sj_kvarn_tail = 8192;
+            params.sj_kvarn_tail_max = 0;
         }
     ));
     add_opt(common_arg(
-        {"--kvarn-tail"}, "N",
-        string_format("KVarN cache: number of most recent positions kept unsealed (multiple of 128, default: %u)", params.kvarn_tail),
+        {"--sjkvarn-tail"}, "N",
+        string_format("SJ-KVaRN cache: number of most recent positions kept unsealed (multiple of 128, default: %u)", params.sj_kvarn_tail),
         [](common_params & params, int value) {
-            params.kvarn_tail = (uint32_t) value;
-            // the default adaptive ceiling follows a larger explicit tail; an explicit --kvarn-tail-max is kept as given
-            if (!params.kvarn_tail_max_set && params.kvarn_tail_max != 0 && params.kvarn_tail_max < params.kvarn_tail) {
-                params.kvarn_tail_max = params.kvarn_tail;
+            params.sj_kvarn_tail = (uint32_t) value;
+            // the default adaptive ceiling follows a larger explicit tail; an explicit --sjkvarn-tail-max is kept as given
+            if (!params.sj_kvarn_tail_max_set && params.sj_kvarn_tail_max != 0 && params.sj_kvarn_tail_max < params.sj_kvarn_tail) {
+                params.sj_kvarn_tail_max = params.sj_kvarn_tail;
             }
         }
-    ).set_env("LLAMA_ARG_KVARN_TAIL"));
+    ).set_env("LLAMA_ARG_SJKVARN_TAIL"));
     add_opt(common_arg(
-        {"--kvarn-tail-max"}, "N",
-        string_format("KVarN adaptive tail: grow to N positions, then batch compression toward --kvarn-tail; server idle compression discards prompt checkpoints; 0 = fixed tail (default: %u)", params.kvarn_tail_max),
+        {"--sjkvarn-tail-max"}, "N",
+        string_format("SJ-KVaRN adaptive tail: grow to N positions, then batch compression toward --sjkvarn-tail; server idle compression discards prompt checkpoints; 0 = fixed tail (default: %u)", params.sj_kvarn_tail_max),
         [](common_params & params, int value) {
             if (value < 0 || value % 128 != 0) {
-                throw std::invalid_argument("KVarN maximum tail must be nonnegative and a multiple of 128");
+                throw std::invalid_argument("SJ-KVaRN maximum tail must be nonnegative and a multiple of 128");
             }
-            params.kvarn_tail_max = (uint32_t) value;
-            params.kvarn_tail_max_set = true;
+            params.sj_kvarn_tail_max = (uint32_t) value;
+            params.sj_kvarn_tail_max_set = true;
         }
-    ).set_env("LLAMA_ARG_KVARN_TAIL_MAX"));
+    ).set_env("LLAMA_ARG_SJKVARN_TAIL_MAX"));
     add_opt(common_arg(
-        {"--kvarn-edge-layers"}, "N",
-        "KVarN tiered body: KV layers within the first N and last N model layers (blocks of any type) seal their body at --kvarn-edge-bits instead of the -ctk/-ctv bits; one eighth of the layer count per end holds a quarter of the model (default: 0 = uniform)",
+        {"--sjkvarn-edge-layers"}, "N",
+        "SJ-KVaRN tiered body: KV layers within the first N and last N model layers (blocks of any type) seal their body at --sjkvarn-edge-bits instead of the -ctk/-ctv bits; one eighth of the layer count per end holds a quarter of the model (default: 0 = uniform)",
         [](common_params & params, int value) {
             if (value < 0) {
-                throw std::invalid_argument("KVarN edge layer count must be nonnegative");
+                throw std::invalid_argument("SJ-KVaRN edge layer count must be nonnegative");
             }
-            params.kvarn_edge_layers = (uint32_t) value;
+            params.sj_kvarn_edge_layers = (uint32_t) value;
         }
-    ).set_env("LLAMA_ARG_KVARN_EDGE_LAYERS"));
+    ).set_env("LLAMA_ARG_SJKVARN_EDGE_LAYERS"));
     add_opt(common_arg(
-        {"--kvarn-edge-bits"}, "K/V",
-        "KVarN tiered body: body bits for the edge layers, e.g. 4/4 (default: 4/4); the codec follows --kvarn-body-type (auto: trellis only for 3/3, 3/2, 2/2)",
+        {"--sjkvarn-edge-bits"}, "K/V",
+        "SJ-KVaRN tiered body: body bits for the edge layers, e.g. 4/4 (default: 4/4); the codec follows --sjkvarn-body-type (auto: trellis only for 3/3, 3/2, 2/2)",
         [](common_params & params, const std::string & value) {
             unsigned k = 0, v = 0;
             char sep = 0;
             if (sscanf(value.c_str(), "%u%c%u", &k, &sep, &v) != 3 || (sep != '/' && sep != ',') || k < 2 || k > 8 || v < 2 || v > 8) {
-                throw std::invalid_argument("KVarN edge bits must be K/V with K and V in 2..8");
+                throw std::invalid_argument("SJ-KVaRN edge bits must be K/V with K and V in 2..8");
             }
-            params.kvarn_edge_bits_k = k;
-            params.kvarn_edge_bits_v = v;
+            params.sj_kvarn_edge_bits_k = k;
+            params.sj_kvarn_edge_bits_v = v;
         }
-    ).set_env("LLAMA_ARG_KVARN_EDGE_BITS"));
+    ).set_env("LLAMA_ARG_SJKVARN_EDGE_BITS"));
     add_opt(common_arg(
-        {"--kvarn-flush-chunk"}, "N",
-        "KVarN adaptive tail: when the tail reaches --kvarn-tail-max, seal at most N groups (128 positions each) per "
+        {"--sjkvarn-flush-chunk"}, "N",
+        "SJ-KVaRN adaptive tail: when the tail reaches --sjkvarn-tail-max, seal at most N groups (128 positions each) per "
         "decode step and drain the rest over the following steps instead of in one pause; prefill-sized ubatches "
         "still flush at once; 0 = one flush (default: 0)",
         [](common_params & params, int value) {
             if (value < 0) {
-                throw std::invalid_argument("KVarN flush chunk must be nonnegative");
+                throw std::invalid_argument("SJ-KVaRN flush chunk must be nonnegative");
             }
-            params.kvarn_flush_chunk = (uint32_t) value;
+            params.sj_kvarn_flush_chunk = (uint32_t) value;
         }
-    ).set_env("LLAMA_ARG_KVARN_FLUSH_CHUNK"));
+    ).set_env("LLAMA_ARG_SJKVARN_FLUSH_CHUNK"));
     add_opt(common_arg(
-        {"--kvarn-sink"}, "N",
-        string_format("KVarN cache: number of leading positions kept unsealed (multiple of 64, default: %u)", params.kvarn_sink),
+        {"--sjkvarn-sink"}, "N",
+        string_format("SJ-KVaRN cache: number of leading positions kept unsealed (multiple of 64, default: %u)", params.sj_kvarn_sink),
         [](common_params & params, int value) {
-            params.kvarn_sink = (uint32_t) value;
+            params.sj_kvarn_sink = (uint32_t) value;
         }
-    ).set_env("LLAMA_ARG_KVARN_SINK"));
+    ).set_env("LLAMA_ARG_SJKVARN_SINK"));
     add_opt(common_arg(
         {"--hellaswag"},
         "compute HellaSwag score over random tasks from datafile supplied with -f",
@@ -4495,8 +4495,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format(
             "KV cache data type for K for the draft model\n"
             "allowed values: %s\n"
-            "(default: the main model's K cache type from -ctk; %s for an MTP drafter over a KVarN trunk; pass f16 to force f16)",
-            get_all_kv_cache_types().c_str(), ggml_type_name(COMMON_KVARN_MTP_DRAFT_KV[0])
+            "(default: the main model's K cache type from -ctk; %s for an MTP drafter over a SJ-KVaRN trunk; pass f16 to force f16)",
+            get_all_kv_cache_types().c_str(), ggml_type_name(COMMON_SJKVARN_MTP_DRAFT_KV[0])
         ),
         [](common_params & params, const std::string & value) {
             params.speculative.draft.cache_type_k = kv_cache_type_from_str(value);
@@ -4507,18 +4507,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format(
             "KV cache data type for V for the draft model\n"
             "allowed values: %s\n"
-            "(default: the main model's V cache type from -ctv; %s for an MTP drafter over a KVarN trunk; pass f16 to force f16)",
-            get_all_kv_cache_types().c_str(), ggml_type_name(COMMON_KVARN_MTP_DRAFT_KV[1])
+            "(default: the main model's V cache type from -ctv; %s for an MTP drafter over a SJ-KVaRN trunk; pass f16 to force f16)",
+            get_all_kv_cache_types().c_str(), ggml_type_name(COMMON_SJKVARN_MTP_DRAFT_KV[1])
         ),
         [](common_params & params, const std::string & value) {
             params.speculative.draft.cache_type_v = kv_cache_type_from_str(value);
         }
     ).set_env("LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V"));
     add_opt(common_arg(
-        {"--spec-draft-kvarn"},
-        "inherit the trunk's KVarN body, sink, staging and tail for single-sequence MTP (incompatible with -ctkd/-ctvd)",
+        {"--spec-draft-sjkvarn"},
+        "inherit the trunk's SJ-KVaRN body, sink, staging and tail for single-sequence MTP (incompatible with -ctkd/-ctvd)",
         [](common_params & params) {
-            params.speculative.draft.kvarn = true;
+            params.speculative.draft.sj_kvarn = true;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(

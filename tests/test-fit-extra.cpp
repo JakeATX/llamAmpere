@@ -41,10 +41,10 @@ int main() {
     }
 
     {
-        // KVarN 3/3 target at 110592 tokens: main graph 460.03 MiB, MTP draft graph 632.03 MiB, both measured at the
+        // SJ-KVaRN 3/3 target at 110592 tokens: main graph 460.03 MiB, MTP draft graph 632.03 MiB, both measured at the
         // probed context -> the shared buffer grows by 172 MiB
-        const common_fit_extra_memory kvarn_mtp = {0, 165*MiB + MiB/2, 632*MiB + 32*1024};
-        const common_fit_extra_memory at = common_fit_extra_memory_at(kvarn_mtp, 110592, 110592, 460*MiB + 32*1024, true);
+        const common_fit_extra_memory sj_kvarn_mtp = {0, 165*MiB + MiB/2, 632*MiB + 32*1024};
+        const common_fit_extra_memory at = common_fit_extra_memory_at(sj_kvarn_mtp, 110592, 110592, 460*MiB + 32*1024, true);
         expect(at.context == 165*MiB + MiB/2, "a measurement at the probed context should be used as is");
         expect(at.compute == 172*MiB, "the shared buffer should grow by the difference of the two graphs");
     }

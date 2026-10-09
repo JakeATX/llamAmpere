@@ -221,11 +221,11 @@ static __global__ void k_turbo_wht_f32_fast(const float * __restrict__ src,
     *((float4 *) (dst + base) + lane) = v;
 }
 
-// ─── Plain 256-point Sylvester Hadamard (KVarN full-head rotation) ───────────
+// ─── Plain 256-point Sylvester Hadamard (SJ-KVaRN full-head rotation) ───────────
 //
 // One group per warp; lane t holds elements 8t..8t+7 as two float4. No sign
 // vectors and no InnerQ scale: this is the orthonormal H_256 used for the
-// sealed KV records (see ggml-kvarn.h). Stages h=1,2,4 pair within the lane,
+// sealed KV records (see ggml-sjkvarn.h). Stages h=1,2,4 pair within the lane,
 // h=8..128 pair lane t with t^(h/8).
 
 template <int warps_per_block>

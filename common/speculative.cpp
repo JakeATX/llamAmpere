@@ -3742,53 +3742,53 @@ common_params common_base_params_to_speculative(const common_params & params) {
     }
 
     // draft KV cache types: an unset flag (GGML_TYPE_COUNT) inherits the main context's -ctk / -ctv, so the drafter
-    // sees the same quantization error as the verifier (exception: an MTP drafter over a KVarN trunk, below); an explicit --spec-draft-type-k/-v wins, K and V independently.
+    // sees the same quantization error as the verifier (exception: an MTP drafter over a SJ-KVaRN trunk, below); an explicit --spec-draft-type-k/-v wins, K and V independently.
     // result.speculative.draft keeps the unresolved values so the draft context creation can log which were inherited
     result.cache_type_k  = params_spec.cache_type_k != GGML_TYPE_COUNT ? params_spec.cache_type_k : params.cache_type_k;
     result.cache_type_v  = params_spec.cache_type_v != GGML_TYPE_COUNT ? params_spec.cache_type_v : params.cache_type_v;
-    // A KVarN trunk cannot be inherited (see below) and would leave the drafter on the plain F16 cache, so an unset
-    // draft type defaults to COMMON_KVARN_MTP_DRAFT_KV there (tq5_0 K / turbo4 V: the fused attention path at every
+    // A SJ-KVaRN trunk cannot be inherited (see below) and would leave the drafter on the plain F16 cache, so an unset
+    // draft type defaults to COMMON_SJKVARN_MTP_DRAFT_KV there (tq5_0 K / turbo4 V: the fused attention path at every
     // MTP width 1-8; tq6_0/tq6_0 at width 5 takes the slow f16-convert route unless GGML_SLOWKV is set).
     // MTP drafter only (no separate draft model): the fused tq5_0/turbo4 route needs D = 256, and a -md / EAGLE3 /
-    // DFlash draft model of another head size keeps the plain cache. A trunk that is KVarN on one side only fails
-    // the KVarN pair check before this runs.
-    const bool kvarn_mtp_default = !has_draft;
-    if (kvarn_mtp_default && params.kvarn_bits_k > 0 && params_spec.cache_type_k == GGML_TYPE_COUNT) {
-        result.cache_type_k = COMMON_KVARN_MTP_DRAFT_KV[0];
-        result.speculative.draft.cache_type_kvarn_default = true;
+    // DFlash draft model of another head size keeps the plain cache. A trunk that is SJ-KVaRN on one side only fails
+    // the SJ-KVaRN pair check before this runs.
+    const bool sj_kvarn_mtp_default = !has_draft;
+    if (sj_kvarn_mtp_default && params.sj_kvarn_bits_k > 0 && params_spec.cache_type_k == GGML_TYPE_COUNT) {
+        result.cache_type_k = COMMON_SJKVARN_MTP_DRAFT_KV[0];
+        result.speculative.draft.cache_type_sj_kvarn_default = true;
     }
-    if (kvarn_mtp_default && params.kvarn_bits_v > 0 && params_spec.cache_type_v == GGML_TYPE_COUNT) {
-        result.cache_type_v = COMMON_KVARN_MTP_DRAFT_KV[1];
-        result.speculative.draft.cache_type_kvarn_default = true;
+    if (sj_kvarn_mtp_default && params.sj_kvarn_bits_v > 0 && params_spec.cache_type_v == GGML_TYPE_COUNT) {
+        result.cache_type_v = COMMON_SJKVARN_MTP_DRAFT_KV[1];
+        result.speculative.draft.cache_type_sj_kvarn_default = true;
     }
     // The first block-streaming implementation owns only the target cache.
     // MTP keeps its ordinary cache until both contexts can share one pool.
     result.kv_stream_arena_mib = 0;
-    if (params_spec.kvarn) {
-        if (!spec_mtp || has_draft || params.n_parallel != 1 || params.kvarn_bits_k == 0 || params.kvarn_bits_v == 0) {
-            throw std::invalid_argument("--spec-draft-kvarn requires single-sequence MTP and a KVarN trunk");
+    if (params_spec.sj_kvarn) {
+        if (!spec_mtp || has_draft || params.n_parallel != 1 || params.sj_kvarn_bits_k == 0 || params.sj_kvarn_bits_v == 0) {
+            throw std::invalid_argument("--spec-draft-sjkvarn requires single-sequence MTP and a SJ-KVaRN trunk");
         }
         if (params_spec.cache_type_k != GGML_TYPE_COUNT || params_spec.cache_type_v != GGML_TYPE_COUNT) {
-            throw std::invalid_argument("--spec-draft-kvarn cannot be combined with -ctkd/-ctvd");
+            throw std::invalid_argument("--spec-draft-sjkvarn cannot be combined with -ctkd/-ctvd");
         }
-        if (params_spec.n_max < 0 || params.kvarn_tail < (uint32_t) params_spec.n_max + 1) {
-            throw std::invalid_argument("--spec-draft-kvarn requires a tail larger than the maximum draft width");
+        if (params_spec.n_max < 0 || params.sj_kvarn_tail < (uint32_t) params_spec.n_max + 1) {
+            throw std::invalid_argument("--spec-draft-sjkvarn requires a tail larger than the maximum draft width");
         }
-        // opt-in: the drafter keeps the trunk's KVarN regions instead of the tq5_0/turbo4 default above
-        result.cache_type_k = params.kvarn_staging_type;
-        result.cache_type_v = params.kvarn_staging_type;
-        result.speculative.draft.cache_type_kvarn_default = false;
+        // opt-in: the drafter keeps the trunk's SJ-KVaRN regions instead of the tq5_0/turbo4 default above
+        result.cache_type_k = params.sj_kvarn_staging_type;
+        result.cache_type_v = params.sj_kvarn_staging_type;
+        result.speculative.draft.cache_type_sj_kvarn_default = false;
     } else {
-        // the draft/MTP context shares cells with the target (or is a separate small cache): never KVarN.
-        // A KVarN trunk (-ctk/-ctv kvarnN) leaves cache_type_k/v at the plain type -ctk/-ctv kvarnN set (F16),
+        // the draft/MTP context shares cells with the target (or is a separate small cache): never SJ-KVaRN.
+        // A SJ-KVaRN trunk (-ctk/-ctv sj_kvarnN) leaves cache_type_k/v at the plain type -ctk/-ctv sj_kvarnN set (F16),
         // so an unset draft type is resolved above to tq5_0/turbo4 instead of that plain cache.
-        result.kvarn_bits_k  = 0;
-        result.kvarn_bits_v  = 0;
-        result.kvarn_tail_max = 0;
-        result.kvarn_flush_chunk = 0;
+        result.sj_kvarn_bits_k  = 0;
+        result.sj_kvarn_bits_v  = 0;
+        result.sj_kvarn_tail_max = 0;
+        result.sj_kvarn_flush_chunk = 0;
     }
     // The nextn layer has no trunk edge tier.
-    result.kvarn_edge_layers = 0;
+    result.sj_kvarn_edge_layers = 0;
     result.n_outputs_max = params.n_parallel;
     result.n_outputs_max_per_seq = 1;
 
@@ -3871,7 +3871,7 @@ common_speculative_init_result::common_speculative_init_result(
 
     // params comes from common_base_params_to_speculative: cache_type_k/v hold the resolved types,
     // speculative.draft.cache_type_k/v are GGML_TYPE_COUNT when the flag was not given
-    const char * unset_src = params.speculative.draft.cache_type_kvarn_default ? "KVarN trunk default" : nullptr;
+    const char * unset_src = params.speculative.draft.cache_type_sj_kvarn_default ? "SJ-KVaRN trunk default" : nullptr;
     LOG_INF("%s: draft KV cache: K = %s (%s), V = %s (%s)\n", __func__,
             ggml_type_name(cparams.type_k), params.speculative.draft.cache_type_k == GGML_TYPE_COUNT ? (unset_src ? unset_src : "inherited from -ctk") : "explicit -ctkd",
             ggml_type_name(cparams.type_v), params.speculative.draft.cache_type_v == GGML_TYPE_COUNT ? (unset_src ? unset_src : "inherited from -ctv") : "explicit -ctvd");

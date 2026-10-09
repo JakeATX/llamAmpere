@@ -2,8 +2,8 @@
 #include "fattn-common.cuh"
 #include "fattn-mma-f16.cuh"
 #include "fattn-mma-turbo.cuh"
-#include "fattn-mma-kvarn.cuh"
-#include "fattn-kvarn-rot.cuh"
+#include "fattn-mma-sjkvarn.cuh"
+#include "fattn-sjkvarn-rot.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
@@ -2324,7 +2324,7 @@ void ggml_cuda_flash_attn_ext_streamed(
 #include <map>
 #include <mutex>
 #include <string>
-#include "../ggml-kvarn.h"
+#include "../ggml-sjkvarn.h"
 
 // Flash-attention path census, opt-in via GGML_FATTN_PATH_STATS=1.
 // Counts every ggml_cuda_flash_attn_ext dispatch keyed by (path, K type, V type,
@@ -2760,7 +2760,7 @@ static int ggml_cuda_fattn_slowkv_pairs() {
 }
 
 static bool ggml_cuda_fattn_slowkv_pair(const ggml_type type_K, const ggml_type type_V) {
-    // FA66: matched tq6_0/tq6_0 (the MTP drafter cache under a KVarN 4/4 trunk) takes the fused SLOWKV tiles at widths
+    // FA66: matched tq6_0/tq6_0 (the MTP drafter cache under a SJ-KVaRN 4/4 trunk) takes the fused SLOWKV tiles at widths
     // 5-8 by default, independent of GGML_SLOWKV (the "tq6" entry is kept and is now a no-op).
     if (type_K == GGML_TYPE_TQ6_0 && type_V == GGML_TYPE_TQ6_0) {
         return true;
@@ -3659,7 +3659,7 @@ static bool ggml_cuda_flash_attn_ext_fused(ggml_backend_cuda_context * ctx, ggml
 #define FATTN_FUSED_LAUNCH(DKQ_, DV_, TK_, TV_) \
     do { if (ctx != nullptr) { ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<DKQ_, DV_, TK_, TV_>(*ctx, dst); } return true; } while (0)
 
-    // KVarN region attention: its q8_0 / tq6_0 staging rows would otherwise match the q8/q8 and turbo gates below
+    // SJ-KVaRN region attention: its q8_0 / tq6_0 staging rows would otherwise match the q8/q8 and turbo gates below
     if (dst->src[6] != nullptr) {
         return false;
     }
@@ -3887,7 +3887,7 @@ static ggml_cuda_fattn_bounded_plan ggml_cuda_fattn_bounded_prefill_plan(const i
     if (Q == nullptr || K == nullptr || V == nullptr) {
         return p;
     }
-    // any further source (hybrid / KVarN descriptors and the like) is not an ordinary quantized cache: excluded
+    // any further source (hybrid / SJ-KVaRN descriptors and the like) is not an ordinary quantized cache: excluded
     for (int i = 5; i < GGML_MAX_SRC; ++i) {
         if (dst->src[i] != nullptr) {
             return p;
@@ -4217,7 +4217,7 @@ static size_t ggml_cuda_fattn_generic_alloc_size(const int device, const ggml_te
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
 
-    // KVarN region attention (src[6]) runs its own MMA path with no f16 K/V copies behind dst
+    // SJ-KVaRN region attention (src[6]) runs its own MMA path with no f16 K/V copies behind dst
     const best_fattn_kernel kernel = dst->src[6] != nullptr ? BEST_FATTN_KERNEL_NONE : ggml_cuda_get_best_fattn_kernel(device, dst);
     if (kernel_out) {
         *kernel_out = kernel;
@@ -4247,7 +4247,7 @@ static size_t ggml_cuda_fattn_generic_alloc_size(const int device, const ggml_te
     return f16_extra.end - (uintptr_t) dst->data;
 }
 
-size_t ggml_cuda_flash_attn_ext_kvarn_prefill_alloc_size(int device, const ggml_tensor * dst); // fattn-kvarn-prefill.cu
+size_t ggml_cuda_flash_attn_ext_sj_kvarn_prefill_alloc_size(int device, const ggml_tensor * dst); // fattn-sjkvarn-prefill.cu
 
 size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * dst) {
     GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
@@ -4269,10 +4269,10 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     const ggml_cuda_fattn_bounded_plan bounded = fused ? ggml_cuda_fattn_bounded_plan() :
         ggml_cuda_fattn_bounded_prefill_plan(device, dst);
     const size_t size_bounded = bounded.offset + bounded.reserve;
-    // KVarN 4/4 prefill expand (fattn-kvarn-prefill.cu): its f16 K/V scratch lives behind dst in the compute buffer
-    // (0 when the expand does not apply); the bounded plan above never applies to KVarN ops.
-    const size_t size_kvarn   = dst->src[6] != nullptr ? ggml_cuda_flash_attn_ext_kvarn_prefill_alloc_size(device, dst) : 0;
-    const size_t size         = std::max(size_kvarn, fused && ggml_cuda_fattn_alloc_route() ? size_fused :
+    // SJ-KVaRN 4/4 prefill expand (fattn-sjkvarn-prefill.cu): its f16 K/V scratch lives behind dst in the compute buffer
+    // (0 when the expand does not apply); the bounded plan above never applies to SJ-KVaRN ops.
+    const size_t size_sj_kvarn   = dst->src[6] != nullptr ? ggml_cuda_flash_attn_ext_sj_kvarn_prefill_alloc_size(device, dst) : 0;
+    const size_t size         = std::max(size_sj_kvarn, fused && ggml_cuda_fattn_alloc_route() ? size_fused :
                                 bounded.heads > 0 ? size_bounded : size_generic);
 
     if (ggml_cuda_fattn_alloc_log()) {
@@ -4309,51 +4309,51 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     return size;
 }
 
-void ggml_cuda_flash_attn_kvarn_lowbits(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+void ggml_cuda_flash_attn_sj_kvarn_lowbits(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 // [#139] same predicate as the low-bit branch of ggml_cuda_flash_attn_ext below
-static bool ggml_cuda_fattn_kvarn_is_lowbits(const ggml_tensor * dst) {
-    return ggml_get_op_params_i32(dst,5) != ((4 << 8) | 4) || (ggml_get_op_params_i32(dst,7) == GGML_TYPE_I16 && ggml_kvarn::trellis3::tokens4());
+static bool ggml_cuda_fattn_sj_kvarn_is_lowbits(const ggml_tensor * dst) {
+    return ggml_get_op_params_i32(dst,5) != ((4 << 8) | 4) || (ggml_get_op_params_i32(dst,7) == GGML_TYPE_I16 && ggml_sj_kvarn::trellis3::tokens4());
 }
 
-// [#139] fork-only: the KVarN paths that apply the fused Q / output rotation inside their kernels. Must mirror the
+// [#139] fork-only: the SJ-KVaRN paths that apply the fused Q / output rotation inside their kernels. Must mirror the
 // dispatch above: the low-bit tile kernel (Ampere config, nbatch_combine == DV/2) and width kernel, and the 4/4
-// stream decode kernel (widths <= GGML_KVARN_DIRECT_STREAM_MAX). Everything else runs the separate-pass fallback.
-static bool ggml_cuda_fattn_kvarn_rot_in_kernel(ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
+// stream decode kernel (widths <= GGML_SJKVARN_DIRECT_STREAM_MAX). Everything else runs the separate-pass fallback.
+static bool ggml_cuda_fattn_sj_kvarn_rot_in_kernel(ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
-    // GGML_KVARN_FUSED_ROT_SEPARATE=1: every path takes the separate passes (A/B of the in-kernel rotation)
-    static const bool separate = getenv("GGML_KVARN_FUSED_ROT_SEPARATE") != nullptr && atoi(getenv("GGML_KVARN_FUSED_ROT_SEPARATE")) != 0;
-    if (separate || !ggml_cuda_fattn_kvarn_rot_q_aligned(Q) || ggml_get_op_params_i32(dst, 7) == GGML_TYPE_TURBO4_0) {
+    // GGML_SJKVARN_FUSED_ROT_SEPARATE=1: every path takes the separate passes (A/B of the in-kernel rotation)
+    static const bool separate = getenv("GGML_SJKVARN_FUSED_ROT_SEPARATE") != nullptr && atoi(getenv("GGML_SJKVARN_FUSED_ROT_SEPARATE")) != 0;
+    if (separate || !ggml_cuda_fattn_sj_kvarn_rot_q_aligned(Q) || ggml_get_op_params_i32(dst, 7) == GGML_TYPE_TURBO4_0) {
         return false;
     }
-    if (ggml_cuda_fattn_kvarn_is_lowbits(dst)) {
-        return true; // fattn-kvarn-lowbits.cu rotates in-kernel or takes the separate passes itself
+    if (ggml_cuda_fattn_sj_kvarn_is_lowbits(dst)) {
+        return true; // fattn-sjkvarn-lowbits.cu rotates in-kernel or takes the separate passes itself
     }
     GGML_UNUSED(ctx);
-    // 4/4: the stream decode kernel (fattn-kvarn-stream.cuh) through ggml_cuda_flash_attn_ext_kvarn_direct_impl
-    static const int stream_max = getenv("GGML_KVARN_DIRECT_STREAM_MAX") != nullptr
-                                ? atoi(getenv("GGML_KVARN_DIRECT_STREAM_MAX")) : 8; // same default as fattn-kvarn-direct.cuh
-    return Q->ne[1] <= 8 && Q->ne[1] <= stream_max && Q->ne[1] < 128 && ggml_cuda_flash_attn_ext_kvarn_direct_supported(dst);
+    // 4/4: the stream decode kernel (fattn-sjkvarn-stream.cuh) through ggml_cuda_flash_attn_ext_sj_kvarn_direct_impl
+    static const int stream_max = getenv("GGML_SJKVARN_DIRECT_STREAM_MAX") != nullptr
+                                ? atoi(getenv("GGML_SJKVARN_DIRECT_STREAM_MAX")) : 8; // same default as fattn-sjkvarn-direct.cuh
+    return Q->ne[1] <= 8 && Q->ne[1] <= stream_max && Q->ne[1] < 128 && ggml_cuda_flash_attn_ext_sj_kvarn_direct_supported(dst);
 }
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
 
-    // KVarN region-aware attention (sink/ring f16 rows + sealed 4-bit body records): dedicated MMA path.
+    // SJ-KVaRN region-aware attention (sink/ring f16 rows + sealed 4-bit body records): dedicated MMA path.
     if (dst->src[6] != nullptr) {
-        if (ggml_cuda_fattn_kvarn_rot(dst) && !ggml_cuda_fattn_kvarn_rot_in_kernel(ctx, dst)) {
+        if (ggml_cuda_fattn_sj_kvarn_rot(dst) && !ggml_cuda_fattn_sj_kvarn_rot_in_kernel(ctx, dst)) {
             // separate passes around this same dispatch, on a copy of the node without the flag
-            ggml_cuda_flash_attn_ext_kvarn_rot_unfused(ctx, dst, ggml_cuda_flash_attn_ext);
+            ggml_cuda_flash_attn_ext_sj_kvarn_rot_unfused(ctx, dst, ggml_cuda_flash_attn_ext);
             return;
         }
-        // 4/4 token-axis trellis4 body (I16 under an explicit nonzero GGML_KVARN_TRELLIS_TOKENS; the low-bit token-axis default does not apply to 4/4): the low-bit tile loader
-        if (ggml_get_op_params_i32(dst,5) != ((4 << 8) | 4) || (ggml_get_op_params_i32(dst,7) == GGML_TYPE_I16 && ggml_kvarn::trellis3::tokens4())) {
-            ggml_cuda_fattn_path_note("kvarn_lowerbits", dst, -1);
-            ggml_cuda_flash_attn_kvarn_lowbits(ctx,dst);
+        // 4/4 token-axis trellis4 body (I16 under an explicit nonzero GGML_SJKVARN_TRELLIS_TOKENS; the low-bit token-axis default does not apply to 4/4): the low-bit tile loader
+        if (ggml_get_op_params_i32(dst,5) != ((4 << 8) | 4) || (ggml_get_op_params_i32(dst,7) == GGML_TYPE_I16 && ggml_sj_kvarn::trellis3::tokens4())) {
+            ggml_cuda_fattn_path_note("sj_kvarn_lowerbits", dst, -1);
+            ggml_cuda_flash_attn_sj_kvarn_lowbits(ctx,dst);
             return;
         }
-        ggml_cuda_fattn_path_note("kvarn", dst, -1);
-        ggml_cuda_flash_attn_ext_mma_kvarn_switch_ncols2<256, 256>(ctx, dst);
+        ggml_cuda_fattn_path_note("sj_kvarn", dst, -1);
+        ggml_cuda_flash_attn_ext_mma_sj_kvarn_switch_ncols2<256, 256>(ctx, dst);
         return;
     }
 
@@ -4394,9 +4394,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
     if (dst->src[6] != NULL) {
-        // KVarN region attention: only the dedicated MMA path (fattn-mma-kvarn.cuh) serves it
+        // SJ-KVaRN region attention: only the dedicated MMA path (fattn-mma-sjkvarn.cuh) serves it
         const int cc = ggml_cuda_info().devices[device].cc;
-        return ggml_cuda_flash_attn_ext_kvarn_supported(cc, dst);
+        return ggml_cuda_flash_attn_ext_sj_kvarn_supported(cc, dst);
     }
     return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
 }

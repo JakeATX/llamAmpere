@@ -564,42 +564,42 @@ static __device__ __forceinline__ void turbo_store_u4(half2 * const __restrict__
 }
 
 // ---------------------------------------------------------------------------
-// KVarN sealed-record tile loaders (record layout: ggml_kvarn::code_bit, context: fattn_kvarn_ctx).
+// SJ-KVaRN sealed-record tile loaders (record layout: ggml_sj_kvarn::code_bit, context: fattn_sj_kvarn_ctx).
 //
 // A 4-bit payload word holds one tensor-core A fragment of a lane: nibbles (l, l+4) are the half2 pair of
 // fragment register l. Masking bits 0-3 and 16-19 of a word therefore yields pair 0, bits 4-7 and 20-23 pair 1,
 // and the same masks on word>>8 give pairs 2 and 3. Each masked word is turned into a half2 with the fp16 magic
 // number 1024 (0x6400): 0x6400|v is 1024+v exactly, and for the shifted nibble (1024+16v)/16-64 = v exactly, so
 // no rounding happens before the affine step.
-static __device__ __forceinline__ half2 fattn_kvarn_u32_as_half2(const uint32_t u) {
+static __device__ __forceinline__ half2 fattn_sj_kvarn_u32_as_half2(const uint32_t u) {
     half2 h;
     memcpy(&h, &u, sizeof(h));
     return h;
 }
 
-static __device__ __forceinline__ void fattn_kvarn_decode_word(const uint32_t x, half2 * const __restrict__ q /* [4] */) {
+static __device__ __forceinline__ void fattn_sj_kvarn_decode_word(const uint32_t x, half2 * const __restrict__ q /* [4] */) {
     const half2 m1024 = make_half2(1024.0f, 1024.0f);
     const half2 c16   = make_half2(0.0625f, 0.0625f);
     const half2 m64   = make_half2(-64.0f, -64.0f);
     const uint32_t y = x >> 8;
-    q[0] = __hsub2(fattn_kvarn_u32_as_half2((x & 0x000F000FU) | 0x64006400U), m1024);
-    q[1] = __hfma2(fattn_kvarn_u32_as_half2((x & 0x00F000F0U) | 0x64006400U), c16, m64);
-    q[2] = __hsub2(fattn_kvarn_u32_as_half2((y & 0x000F000FU) | 0x64006400U), m1024);
-    q[3] = __hfma2(fattn_kvarn_u32_as_half2((y & 0x00F000F0U) | 0x64006400U), c16, m64);
+    q[0] = __hsub2(fattn_sj_kvarn_u32_as_half2((x & 0x000F000FU) | 0x64006400U), m1024);
+    q[1] = __hfma2(fattn_sj_kvarn_u32_as_half2((x & 0x00F000F0U) | 0x64006400U), c16, m64);
+    q[2] = __hsub2(fattn_sj_kvarn_u32_as_half2((y & 0x000F000FU) | 0x64006400U), m1024);
+    q[3] = __hfma2(fattn_sj_kvarn_u32_as_half2((y & 0x00F000F0U) | 0x64006400U), c16, m64);
 }
 
 // Trellis-coded word (body type GGML_TYPE_I16): nibble n of word w reconstructs as cb[window], window = the L bits
 // ending at nibble n of the lane's stream (w on top of the previous strip's word wp, zero for the first strip).
 template <bool is_V>
-static __device__ __forceinline__ void fattn_kvarn_decode_word_trellis(const uint32_t w, const uint32_t wp, half2 * const __restrict__ q /* [4] */) {
-    constexpr int L = FATTN_KVARN_TR_L;
-    const uint16_t * cb = is_V ? fattn_kvarn_cb_v : fattn_kvarn_cb_k;
+static __device__ __forceinline__ void fattn_sj_kvarn_decode_word_trellis(const uint32_t w, const uint32_t wp, half2 * const __restrict__ q /* [4] */) {
+    constexpr int L = FATTN_SJKVARN_TR_L;
+    const uint16_t * cb = is_V ? fattn_sj_kvarn_cb_v : fattn_sj_kvarn_cb_k;
     half v[8];
 #pragma unroll
     for (int nib = 0; nib < 8; ++nib) {
         constexpr int base = 32 + 4 - L;
         const int sh = base + 4*nib;
-        const uint32_t idx = (sh < 32 ? __funnelshift_r(wp, w, sh) : (w >> (sh - 32))) & (FATTN_KVARN_TR_NWIN - 1);
+        const uint32_t idx = (sh < 32 ? __funnelshift_r(wp, w, sh) : (w >> (sh - 32))) & (FATTN_SJKVARN_TR_NWIN - 1);
         v[nib] = __ushort_as_half(cb[idx]);
     }
 #pragma unroll
@@ -609,21 +609,21 @@ static __device__ __forceinline__ void fattn_kvarn_decode_word_trellis(const uin
 }
 
 // Decode tokens [t0, t0+nbatch_fa) of one record into a [nbatch_fa][D2] half2 tile (row = token, col = channel pair),
-// the same layout the f16 loader produces, from the fragment-ordered record (ggml_kvarn::code_bit: one 32-bit word per
+// the same layout the f16 loader produces, from the fragment-ordered record (ggml_sj_kvarn::code_bit: one 32-bit word per
 // (16-token strip, 16-channel tile, lane) holding a tensor-core A fragment). K: (q*Kscale[d] + Kzero[d]) * Ktok[t];
 // V: (q*Vscale[t] + Vzero[t]) * Vch[d]. Each warp owns channel tiles c = warp, warp + nwarps, ... and walks the strips
 // of the tile, so the per-channel metadata of a tile is loaded once per warp. This is the fallback (shared-memory
-// tile) path; the decode kernel in fattn-kvarn-direct.cuh consumes the same words straight into registers.
+// tile) path; the decode kernel in fattn-sjkvarn-direct.cuh consumes the same words straight into registers.
 template<int stride_tile, bool swz, int nbatch_fa, int nthreads, int D2, bool oob_check, bool is_V>
-static __device__ __forceinline__ void flash_attn_ext_kvarn_load_tile(
-        const char * const __restrict__ rec, const int t0, const fattn_kvarn_ctx & kv,
+static __device__ __forceinline__ void flash_attn_ext_sj_kvarn_load_tile(
+        const char * const __restrict__ rec, const int t0, const fattn_sj_kvarn_ctx & kv,
         half2 * const __restrict__ tile_KV, const int i_sup) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int D         = 2*D2;
     constexpr int ntiles_c  = D/16;
     constexpr int nstrips   = nbatch_fa/16;
     constexpr int nwarps    = nthreads/warp_size;
-    static_assert(nbatch_fa % 16 == 0 && D % 16 == 0, "KVarN fragment tiles are 16 tokens x 16 channels");
+    static_assert(nbatch_fa % 16 == 0 && D % 16 == 0, "SJ-KVaRN fragment tiles are 16 tokens x 16 channels");
 
     const int lane = threadIdx.x;
     const int wg   = threadIdx.y;
@@ -659,9 +659,9 @@ static __device__ __forceinline__ void flash_attn_ext_kvarn_load_tile(
                 half2 q[4];
                 if (kv.body_type == GGML_TYPE_I16) {
                     const uint32_t wp = s0 + s > 0 ? __ldg(payload + ((s0 + s - 1)*ntiles_c + c)*32 + lane) : 0u;
-                    fattn_kvarn_decode_word_trellis<false>(w, wp, q);
+                    fattn_sj_kvarn_decode_word_trellis<false>(w, wp, q);
                 } else {
-                    fattn_kvarn_decode_word(w, q);
+                    fattn_sj_kvarn_decode_word(w, q);
                 }
                 const int tt0 = s*16 + (lane >> 2);
                 const half2 tok0 = __half2half2(__ldg((const half *) (rec + kv.k_tok) + t0 + tt0));
@@ -692,9 +692,9 @@ static __device__ __forceinline__ void flash_attn_ext_kvarn_load_tile(
                 half2 q[4];
                 if (kv.body_type == GGML_TYPE_I16) {
                     const uint32_t wp = s0 + s > 0 ? __ldg(payload + ((s0 + s - 1)*ntiles_c + c)*32 + lane) : 0u;
-                    fattn_kvarn_decode_word_trellis<true>(w, wp, q);
+                    fattn_sj_kvarn_decode_word_trellis<true>(w, wp, q);
                 } else {
-                    fattn_kvarn_decode_word(w, q);
+                    fattn_sj_kvarn_decode_word(w, q);
                 }
                 // token pairs p = lane%4 (l < 2) and lane%4 + 4 (l >= 2): tokens 2p, 2p+1 of the strip
                 const int tp0 = s*16 + 2*(lane & 3);
@@ -1820,7 +1820,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         const int k_VKQ_sup,
         char         * const __restrict__ raw_K,
         char         * const __restrict__ raw_V,
-        const fattn_kvarn_ctx & kv) {
+        const fattn_sj_kvarn_ctx & kv) {
     using query_layout = ggml_fattn_query_layout<ncols1, ncols2, compact_q5g6>;
 
 #if defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
@@ -1838,9 +1838,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     // turbo4 KV is dequantized synchronously into SRAM in the load tile; the cp.async
     // multi-stage pipeline (nstages>1) would copy raw turbo bytes as half2 => garbage.
     // Force single-stage synchronous loading for the turbo path.
-    constexpr bool is_kvarn        = type_K == GGML_TYPE_I8; // KVarN: f16 ring rows + sealed 4-bit body records
-    constexpr bool is_turbo_kv     = !is_kvarn && (type_K != GGML_TYPE_F16 || type_V != GGML_TYPE_F16);
-    constexpr int  nstages         = (is_turbo_kv || is_kvarn) ? 0 : ggml_cuda_fattn_mma_get_nstages<preserve_cand>(DKQ, DV, ncols1, ncols2, use_sparse);
+    constexpr bool is_sj_kvarn        = type_K == GGML_TYPE_I8; // SJ-KVaRN: f16 ring rows + sealed 4-bit body records
+    constexpr bool is_turbo_kv     = !is_sj_kvarn && (type_K != GGML_TYPE_F16 || type_V != GGML_TYPE_F16);
+    constexpr int  nstages         = (is_turbo_kv || is_sj_kvarn) ? 0 : ggml_cuda_fattn_mma_get_nstages<preserve_cand>(DKQ, DV, ncols1, ncols2, use_sparse);
 
     constexpr bool swz = ggml_cuda_fattn_mma_get_swizzled<preserve_cand>(DKQ, DV, ncols1, ncols2);
     constexpr int stride_tile_K = ggml_cuda_fattn_mma_get_stride_tile(nbatch_K2, swz);
@@ -1879,22 +1879,22 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     for (int k0_start = (DKQ/2-1) - (DKQ/2-1) % nbatch_K2; k0_start >= 0; k0_start -= nbatch_K2) {
         const int k0_stop = k0_start + nbatch_K2 < DKQ/2 ? k0_start + nbatch_K2 : DKQ/2;
 
-        if constexpr (is_kvarn) {
-            // KVarN: resolve the tile's first position to a body record (sealed 4-bit rows) or an exact ring row.
+        if constexpr (is_sj_kvarn) {
+            // SJ-KVaRN: resolve the tile's first position to a body record (sealed 4-bit rows) or an exact ring row.
             // Tiles never straddle regions or the ring wrap (S % 64 == 0, cap % 128 == 0, B - S a multiple of G).
-            static_assert(nbatch_K2 == DKQ/2, "KVarN MMA load assumes full-row K tiles (nbatch_K2==DKQ/2)");
+            static_assert(nbatch_K2 == DKQ/2, "SJ-KVaRN MMA load assumes full-row K tiles (nbatch_K2==DKQ/2)");
             const int k0_diff = k0_stop - k0_start;
             constexpr int nthreads_kv = nwarps * ggml_cuda_get_physical_warp_size();
             const int p0 = k_VKQ_0;
             if (p0 >= kv.S && p0 < kv.B) {
                 const int g  = (p0 - kv.S) / kv.G;
                 const int t0 = (p0 - kv.S) - g*kv.G;
-                flash_attn_ext_kvarn_load_tile<stride_tile_K, swz, nbatch_fa, nthreads_kv, DKQ/2, oob_check, false>
+                flash_attn_ext_sj_kvarn_load_tile<stride_tile_K, swz, nbatch_fa, nthreads_kv, DKQ/2, oob_check, false>
                     (kv.body + (size_t) g*kv.rec_stride, t0, kv, tile_K, k_VKQ_sup);
             } else {
                 const int row0 = p0 < kv.S ? p0 : kv.S + (p0 - kv.S) % kv.cap;
                 if (p0 < kv.S && kv.sink_type == GGML_TYPE_F16) {
-                    const half2 * sink = (const half2 *) fattn_kvarn_sink_row((const char *) K_h2, kv, stride_K*sizeof(half2), row0, false);
+                    const half2 * sink = (const half2 *) fattn_sj_kvarn_sink_row((const char *) K_h2, kv, stride_K*sizeof(half2), row0, false);
                     flash_attn_ext_f16_load_tile<stride_tile_K, swz, nwarps, nbatch_fa, false, oob_check, false>
                         (sink + k0_start, tile_K, k0_diff, kv.sink_stride/sizeof(half2), 0, k_VKQ_sup, nullptr);
                 } else if (kv.type_k == GGML_TYPE_TQ6_0) {
@@ -2319,21 +2319,21 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         static_assert(DV % (2*nbatch_V2) == 0, "bad loop size");
         const int i0_stop = i0_start + 2*nbatch_V2;
 
-        if constexpr (is_kvarn) {
-            static_assert(!V_is_K_view, "KVarN MMA path never uses V_is_K_view");
-            static_assert(nbatch_V2 == DV/2, "KVarN MMA load assumes full-row V tiles (nbatch_V2==DV/2)");
+        if constexpr (is_sj_kvarn) {
+            static_assert(!V_is_K_view, "SJ-KVaRN MMA path never uses V_is_K_view");
+            static_assert(nbatch_V2 == DV/2, "SJ-KVaRN MMA load assumes full-row V tiles (nbatch_V2==DV/2)");
             const int i0_diff = i0_stop - i0_start;
             constexpr int nthreads_kv = nwarps * ggml_cuda_get_physical_warp_size();
             const int p0 = k_VKQ_0;
             if (p0 >= kv.S && p0 < kv.B) {
                 const int g  = (p0 - kv.S) / kv.G;
                 const int t0 = (p0 - kv.S) - g*kv.G;
-                flash_attn_ext_kvarn_load_tile<stride_tile_V, swz, nbatch_fa, nthreads_kv, DV/2, oob_check, true>
+                flash_attn_ext_sj_kvarn_load_tile<stride_tile_V, swz, nbatch_fa, nthreads_kv, DV/2, oob_check, true>
                     (kv.body + (size_t) g*kv.rec_stride, t0, kv, tile_V, k_VKQ_sup);
             } else {
                 const int row0 = p0 < kv.S ? p0 : kv.S + (p0 - kv.S) % kv.cap;
                 if (p0 < kv.S && kv.sink_type == GGML_TYPE_F16) {
-                    const half2 * sink = (const half2 *) fattn_kvarn_sink_row((const char *) V_h2, kv, stride_V*sizeof(half2), row0, true);
+                    const half2 * sink = (const half2 *) fattn_sj_kvarn_sink_row((const char *) V_h2, kv, stride_V*sizeof(half2), row0, true);
                     flash_attn_ext_f16_load_tile<stride_tile_V, swz, nwarps, nbatch_fa, false, oob_check, false>
                         (sink + i0_start/2, tile_V, i0_diff/2, kv.sink_stride/sizeof(half2), 0, k_VKQ_sup, nullptr);
                 } else if (kv.type_v == GGML_TYPE_TQ6_0) {
@@ -2622,7 +2622,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         const int zt_gqa,
         const int kb0_start,
         const int kb0_stop,
-        const fattn_kvarn_ctx & kv) {
+        const fattn_sj_kvarn_ctx & kv) {
     using query_layout = ggml_fattn_query_layout<ncols1, ncols2, compact_q5g6>;
 
 #if defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
@@ -2655,9 +2655,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     constexpr int  nbatch_combine  = ggml_cuda_fattn_mma_get_nbatch_combine<preserve_cand>(DKQ, DV, ncols);
     constexpr bool Q_in_reg        = ggml_cuda_fattn_mma_get_Q_in_reg<preserve_cand>      (DKQ, DV, ncols);
     // Force single-stage synchronous loading for the turbo path (see iter for rationale).
-    constexpr bool is_kvarn        = type_K == GGML_TYPE_I8; // KVarN: f16 ring rows + sealed 4-bit body records
-    constexpr bool is_turbo_kv     = !is_kvarn && (type_K != GGML_TYPE_F16 || type_V != GGML_TYPE_F16);
-    constexpr int  nstages         = (is_turbo_kv || is_kvarn) ? 0 : ggml_cuda_fattn_mma_get_nstages<preserve_cand>(DKQ, DV, ncols1, ncols2, use_sparse);
+    constexpr bool is_sj_kvarn        = type_K == GGML_TYPE_I8; // SJ-KVaRN: f16 ring rows + sealed 4-bit body records
+    constexpr bool is_turbo_kv     = !is_sj_kvarn && (type_K != GGML_TYPE_F16 || type_V != GGML_TYPE_F16);
+    constexpr int  nstages         = (is_turbo_kv || is_sj_kvarn) ? 0 : ggml_cuda_fattn_mma_get_nstages<preserve_cand>(DKQ, DV, ncols1, ncols2, use_sparse);
 
     if (cols_per_warp > ncols) {
         NO_DEVICE_CODE;
@@ -3282,8 +3282,8 @@ static __global__ void flash_attn_ext_f16(
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
                             const int32_t nb31, const int32_t nb32, const int64_t nb33,
-        const char    * __restrict__ kvarn_body,
-        const int32_t * __restrict__ kvarn_desc) {
+        const char    * __restrict__ sj_kvarn_body,
+        const int32_t * __restrict__ sj_kvarn_desc) {
     using query_layout = ggml_fattn_query_layout<ncols1, ncols2, compact_q5g6>;
 
     ggml_cuda_pdl_sync(); // TODO optimize placement
@@ -3353,8 +3353,8 @@ static __global__ void flash_attn_ext_f16(
     // launcher), so stride_K/stride_V must be the true byte pitch nb11/nb21 — the turbo
     // load tile does sizeof(block_turbo4_0)-driven pointer math off these byte strides.
     // For f16/q8 (the default), keep the existing half2-element pitch byte-identical.
-    constexpr bool is_kvarn    = type_K == GGML_TYPE_I8; // KVarN: K/V pointers are the f16 ring tensors, body records separate
-    constexpr bool is_turbo_kv = !is_kvarn && (type_K != GGML_TYPE_F16 || type_V != GGML_TYPE_F16);
+    constexpr bool is_sj_kvarn    = type_K == GGML_TYPE_I8; // SJ-KVaRN: K/V pointers are the f16 ring tensors, body records separate
+    constexpr bool is_turbo_kv = !is_sj_kvarn && (type_K != GGML_TYPE_F16 || type_V != GGML_TYPE_F16);
     const int stride_Q1   = nb01 / sizeof(float2);
     const int stride_Q2   = nb02 / sizeof(float2);
     const int stride_K    = is_turbo_kv ? nb11 : nb11 / sizeof(half2);
@@ -3405,9 +3405,9 @@ static __global__ void flash_attn_ext_f16(
 
         const float slope = ncols2 == 1 ? get_alibi_slope(max_bias, zt_Q, n_head_log2, m0, m1) : 1.0f;
 
-        fattn_kvarn_ctx kv = {};
-        if constexpr (is_kvarn) {
-            kv = fattn_kvarn_make_ctx(kvarn_body, kvarn_desc, z_KV, DKQ, 4, 4, nb12, nb22);
+        fattn_sj_kvarn_ctx kv = {};
+        if constexpr (is_sj_kvarn) {
+            kv = fattn_sj_kvarn_make_ctx(sj_kvarn_body, sj_kvarn_desc, z_KV, DKQ, 4, 4, nb12, nb22);
         }
 
         if (use_sparse) {
@@ -3461,9 +3461,9 @@ static __global__ void flash_attn_ext_f16(
 
     const float slope = ncols2 == 1 ? get_alibi_slope(max_bias, zt_Q, n_head_log2, m0, m1) : 1.0f;
 
-    fattn_kvarn_ctx kv = {};
-    if constexpr (is_kvarn) {
-        kv = fattn_kvarn_make_ctx(kvarn_body, kvarn_desc, z_KV, DKQ, 4, 4, nb12, nb22);
+    fattn_sj_kvarn_ctx kv = {};
+    if constexpr (is_sj_kvarn) {
+        kv = fattn_sj_kvarn_make_ctx(sj_kvarn_body, sj_kvarn_desc, z_KV, DKQ, 4, 4, nb12, nb22);
     }
 
     if (use_sparse) {
@@ -3487,7 +3487,7 @@ static __global__ void flash_attn_ext_f16(
               nb21, nb22, nb23,
               ne31, ne32, ne33,
               nb31, nb32, nb33,
-        kvarn_body, kvarn_desc);
+        sj_kvarn_body, sj_kvarn_desc);
     NO_DEVICE_CODE;
 #endif // defined(FLASH_ATTN_AVAILABLE) && (defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE))
 }

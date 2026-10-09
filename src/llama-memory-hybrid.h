@@ -44,7 +44,7 @@ public:
                      size_t kv_stream_stage_bytes = 0,
                      void * kv_stream_phase_arena = nullptr,
                      size_t kv_stream_maximum_pool_bytes = 0,
-      llama_kvarn_config    kvarn = llama_kvarn_config());
+      llama_sj_kvarn_config    sj_kvarn = llama_sj_kvarn_config());
 
     ~llama_memory_hybrid() = default;
 

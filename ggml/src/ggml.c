@@ -1234,7 +1234,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GATED_DELTA_NET",
     "TURBO_WHT",
     "LIGHTNING_INDEXER",
-    "KVARN_SEAL",
+    "SJKVARN_SEAL",
     "DSV4_HC_COMB",
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
@@ -1351,7 +1351,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "gated_delta_net(q, k, v, g, beta, s)",
     "turbo_wht(a)",
     "lightning_indexer(q, k, weights, mask)",
-    "kvarn_seal(k,v)",
+    "sj_kvarn_seal(k,v)",
     "dsv4_hc_comb(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
@@ -4208,15 +4208,15 @@ struct ggml_tensor * ggml_set_rows_tq6_rotated(
     return result;
 }
 
-// KVarN fused write rotation (llamAmpere #139): see ggml.h
-struct ggml_tensor * ggml_set_rows_kvarn_rot(
+// SJ-KVaRN fused write rotation (llamAmpere #139): see ggml.h
+struct ggml_tensor * ggml_set_rows_sj_kvarn_rot(
         struct ggml_context * ctx, struct ggml_tensor * a,
         struct ggml_tensor * b, struct ggml_tensor * c, int group) {
     GGML_ASSERT(a->type == GGML_TYPE_TQ6_0 && b->type == GGML_TYPE_F32);
     GGML_ASSERT((group == 256 || group == 128) && b->ne[0] % group == 0);
     GGML_ASSERT(b->nb[0] == sizeof(float));
     struct ggml_tensor * result = ggml_set_rows(ctx, a, b, c);
-    ggml_set_op_params_i32(result, 1, group == 256 ? GGML_SET_ROWS_KVARN_ROT256 : GGML_SET_ROWS_KVARN_ROT128);
+    ggml_set_op_params_i32(result, 1, group == 256 ? GGML_SET_ROWS_SJKVARN_ROT256 : GGML_SET_ROWS_SJKVARN_ROT128);
     return result;
 }
 
@@ -5778,7 +5778,7 @@ void ggml_flash_attn_ext_add_sinks(
     a->src[4] = sinks;
 }
 
-void ggml_flash_attn_ext_set_kvarn(
+void ggml_flash_attn_ext_set_sj_kvarn(
         struct ggml_tensor * a,
         struct ggml_tensor * body,
         struct ggml_tensor * desc,
@@ -5789,7 +5789,7 @@ void ggml_flash_attn_ext_set_kvarn(
     GGML_ASSERT(a->src[3] == NULL || a->src[3]->type == GGML_TYPE_F16); // mask follows the standard FA convention
     GGML_ASSERT((a->src[1]->type == GGML_TYPE_F16 || a->src[1]->type == GGML_TYPE_Q8_0 || a->src[1]->type == GGML_TYPE_TQ6_0) && a->src[1]->type == a->src[2]->type);
     GGML_ASSERT(body->type == GGML_TYPE_I8 && ggml_is_contiguous(body));
-    GGML_ASSERT(desc->type == GGML_TYPE_I32 && ggml_nelements(desc) >= GGML_KVARN_DESC_N_ENTRIES);
+    GGML_ASSERT(desc->type == GGML_TYPE_I32 && ggml_nelements(desc) >= GGML_SJKVARN_DESC_N_ENTRIES);
     GGML_ASSERT(bits_k >= 2 && bits_k <= 8 && bits_v >= 2 && bits_v <= 8);
     GGML_ASSERT(n_kv_pad > 0 && n_kv_pad % 64 == 0);
 
@@ -5800,45 +5800,45 @@ void ggml_flash_attn_ext_set_kvarn(
     ggml_set_op_params_i32(a, 6, n_kv_pad);
 }
 
-bool ggml_flash_attn_ext_is_kvarn(const struct ggml_tensor * a) {
+bool ggml_flash_attn_ext_is_sj_kvarn(const struct ggml_tensor * a) {
     return a->op == GGML_OP_FLASH_ATTN_EXT && a->src[6] != NULL;
 }
 
-#define GGML_KVARN_ROT_PARAM 8
+#define GGML_SJKVARN_ROT_PARAM 8
 
-void ggml_flash_attn_ext_set_kvarn_rot(struct ggml_tensor * a, int32_t group) {
-    GGML_ASSERT(ggml_flash_attn_ext_is_kvarn(a));
+void ggml_flash_attn_ext_set_sj_kvarn_rot(struct ggml_tensor * a, int32_t group) {
+    GGML_ASSERT(ggml_flash_attn_ext_is_sj_kvarn(a));
     GGML_ASSERT(group == 0 || (group == 256 && a->src[0]->ne[0] == 256 && a->src[2]->ne[0] == 256));
     GGML_ASSERT(group == 0 || ggml_get_op_params_i32(a, 7) != GGML_TYPE_TURBO4_0); // grouped signed basis: unfused only
-    ggml_set_op_params_i32(a, GGML_KVARN_ROT_PARAM, group);
+    ggml_set_op_params_i32(a, GGML_SJKVARN_ROT_PARAM, group);
 }
 
-int32_t ggml_flash_attn_ext_get_kvarn_rot(const struct ggml_tensor * a) {
-    return ggml_flash_attn_ext_is_kvarn(a) ? ggml_get_op_params_i32(a, GGML_KVARN_ROT_PARAM) : 0;
+int32_t ggml_flash_attn_ext_get_sj_kvarn_rot(const struct ggml_tensor * a) {
+    return ggml_flash_attn_ext_is_sj_kvarn(a) ? ggml_get_op_params_i32(a, GGML_SJKVARN_ROT_PARAM) : 0;
 }
 
-#ifndef GGML_KVARN_FUSED_ROT_DEFAULT
-#define GGML_KVARN_FUSED_ROT_DEFAULT 1
+#ifndef GGML_SJKVARN_FUSED_ROT_DEFAULT
+#define GGML_SJKVARN_FUSED_ROT_DEFAULT 1
 #endif
 
-bool ggml_kvarn_fused_rot_enabled(void) {
+bool ggml_sj_kvarn_fused_rot_enabled(void) {
     static int enabled = -1;
     if (enabled < 0) {
-        const char * e = getenv("GGML_KVARN_FUSED_ROT");
-        enabled = e != NULL ? (atoi(e) != 0) : (GGML_KVARN_FUSED_ROT_DEFAULT != 0);
+        const char * e = getenv("GGML_SJKVARN_FUSED_ROT");
+        enabled = e != NULL ? (atoi(e) != 0) : (GGML_SJKVARN_FUSED_ROT_DEFAULT != 0);
     }
     return enabled != 0;
 }
 
-// ggml_kvarn_seal
+// ggml_sj_kvarn_seal
 
-size_t ggml_kvarn_rec_bytes(int32_t D, int32_t G, int32_t bits_k, int32_t bits_v) {
+size_t ggml_sj_kvarn_rec_bytes(int32_t D, int32_t G, int32_t bits_k, int32_t bits_v) {
     const size_t payload = (size_t) G * D * bits_k / 8 + (size_t) G * D * bits_v / 8;
     const size_t meta    = 2 * (3 * (size_t) D + 3 * (size_t) G);
     return payload + meta;
 }
 
-static struct ggml_tensor * ggml_kvarn_seal_impl(
+static struct ggml_tensor * ggml_sj_kvarn_seal_impl(
         struct ggml_context * ctx,
         struct ggml_tensor  * dst,
         struct ggml_tensor  * k,
@@ -5862,13 +5862,13 @@ static struct ggml_tensor * ggml_kvarn_seal_impl(
     GGML_ASSERT(body_type == GGML_TYPE_F32 || body_type == GGML_TYPE_TURBO4_0 || body_type == GGML_TYPE_I16);
     GGML_ASSERT(body_type != GGML_TYPE_TURBO4_0 || D % 128 == 0);
     GGML_ASSERT(body_type != GGML_TYPE_I16 || (bits_k >= 2 && bits_k <= 4 && bits_v >= 2 && bits_v <= 4 && G % 16 == 0)); // trellis: 4-bit fragment or 3-bit/2-bit stream payloads
-    const size_t rec_bytes = body_type == GGML_TYPE_TURBO4_0 ? 2*G*ggml_row_size(GGML_TYPE_TURBO4_0, D) : ggml_kvarn_rec_bytes(D, G, bits_k, bits_v);
+    const size_t rec_bytes = body_type == GGML_TYPE_TURBO4_0 ? 2*G*ggml_row_size(GGML_TYPE_TURBO4_0, D) : ggml_sj_kvarn_rec_bytes(D, G, bits_k, bits_v);
     if (desc == NULL) {
         GGML_ASSERT(k->ne[1] % G == 0);
         const int64_t n_groups = k->ne[1] / G;
         GGML_ASSERT((int64_t) ggml_nelements(dst) == (int64_t) rec_bytes * hkv * n_groups);
     } else {
-        GGML_ASSERT(desc->type == GGML_TYPE_I32 && ggml_nelements(desc) >= GGML_KVARN_DESC_N_ENTRIES);
+        GGML_ASSERT(desc->type == GGML_TYPE_I32 && ggml_nelements(desc) >= GGML_SJKVARN_DESC_N_ENTRIES);
         GGML_ASSERT(n_groups_max > 0);
         GGML_ASSERT((int64_t) ggml_nelements(dst) % ((int64_t) rec_bytes * hkv) == 0);
     }
@@ -5878,7 +5878,7 @@ static struct ggml_tensor * ggml_kvarn_seal_impl(
     int32_t params[] = { D, G, bits_k, bits_v, iters, desc == NULL ? 0 : n_groups_max, 0, body_type };
     ggml_set_op_params(result, params, sizeof(params));
 
-    result->op     = GGML_OP_KVARN_SEAL;
+    result->op     = GGML_OP_SJKVARN_SEAL;
     result->src[0] = k;
     result->src[1] = v;
     result->src[2] = desc;
@@ -5886,7 +5886,7 @@ static struct ggml_tensor * ggml_kvarn_seal_impl(
     return result;
 }
 
-struct ggml_tensor * ggml_kvarn_seal(
+struct ggml_tensor * ggml_sj_kvarn_seal(
         struct ggml_context * ctx,
         struct ggml_tensor  * dst,
         struct ggml_tensor  * k,
@@ -5896,10 +5896,10 @@ struct ggml_tensor * ggml_kvarn_seal(
         int32_t               bits_k,
         int32_t               bits_v,
         int32_t               iters) {
-    return ggml_kvarn_seal_impl(ctx, dst, k, v, NULL, D, G, bits_k, bits_v, iters, 0);
+    return ggml_sj_kvarn_seal_impl(ctx, dst, k, v, NULL, D, G, bits_k, bits_v, iters, 0);
 }
 
-struct ggml_tensor * ggml_kvarn_seal_dyn(
+struct ggml_tensor * ggml_sj_kvarn_seal_dyn(
         struct ggml_context * ctx,
         struct ggml_tensor  * dst,
         struct ggml_tensor  * k,
@@ -5912,7 +5912,7 @@ struct ggml_tensor * ggml_kvarn_seal_dyn(
         int32_t               iters,
         int32_t               n_groups_max) {
     GGML_ASSERT(desc != NULL);
-    return ggml_kvarn_seal_impl(ctx, dst, k, v, desc, D, G, bits_k, bits_v, iters, n_groups_max);
+    return ggml_sj_kvarn_seal_impl(ctx, dst, k, v, desc, D, G, bits_k, bits_v, iters, n_groups_max);
 }
 
 // ggml_flash_attn_back
@@ -6793,7 +6793,7 @@ struct ggml_tensor * ggml_turbo_wht(
         group_size = (a->ne[0] % 128 == 0) ? 128 : 64;
     }
     // 256 = plain orthonormal Sylvester Hadamard over the whole 256-wide head (no sign arrays, no InnerQ),
-    // used by the KVarN cache mode. It is an involution, so direction is irrelevant there.
+    // used by the SJ-KVaRN cache mode. It is an involution, so direction is irrelevant there.
     GGML_ASSERT(group_size == 32 || group_size == 64 || group_size == 128 || group_size == 256);
     GGML_ASSERT(group_size != 256 || scale == NULL);
     GGML_ASSERT(a->ne[0] % group_size == 0);

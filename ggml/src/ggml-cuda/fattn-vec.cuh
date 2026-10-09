@@ -42,9 +42,9 @@ static __global__ void flash_attn_ext_vec(
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
                             const int32_t nb31, const int32_t nb32, const int64_t nb33,
-        const char    * __restrict__ kvarn_body,
-        const int32_t * __restrict__ kvarn_desc) {
-    GGML_UNUSED(kvarn_body); GGML_UNUSED(kvarn_desc); // KVarN caches only run on the MMA kernel
+        const char    * __restrict__ sj_kvarn_body,
+        const int32_t * __restrict__ sj_kvarn_desc) {
+    GGML_UNUSED(sj_kvarn_body); GGML_UNUSED(sj_kvarn_desc); // SJ-KVaRN caches only run on the MMA kernel
     ggml_cuda_pdl_lc();
 #ifdef FLASH_ATTN_AVAILABLE
     const char * GGML_CUDA_RESTRICT Q        = Q_ptr;
@@ -835,7 +835,7 @@ void ggml_cuda_flash_attn_ext_vec_partial_case_impl(
         V->nb[1], V->nb[2], V->nb[3],
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
         mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
-        /*kvarn_body=*/nullptr, /*kvarn_desc=*/nullptr); // partial path never sees a KVarN op
+        /*sj_kvarn_body=*/nullptr, /*sj_kvarn_desc=*/nullptr); // partial path never sees a SJ-KVaRN op
     CUDA_CHECK(cudaGetLastError());
 }
 

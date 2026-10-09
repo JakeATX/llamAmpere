@@ -640,11 +640,11 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
         mctx->set_input_v_rot(self_v_rot);
     }
 
-    if (self_kvarn_desc && self_kvarn_desc->buffer) {
-        mctx->set_input_kvarn_desc(self_kvarn_desc, ubatch, 0);
+    if (self_sj_kvarn_desc && self_sj_kvarn_desc->buffer) {
+        mctx->set_input_sj_kvarn_desc(self_sj_kvarn_desc, ubatch, 0);
     }
-    if (self_kvarn_desc_edge && self_kvarn_desc_edge->buffer) {
-        mctx->set_input_kvarn_desc(self_kvarn_desc_edge, ubatch, 1);
+    if (self_sj_kvarn_desc_edge && self_sj_kvarn_desc_edge->buffer) {
+        mctx->set_input_sj_kvarn_desc(self_sj_kvarn_desc_edge, ubatch, 1);
     }
 }
 
@@ -1264,11 +1264,11 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
         mctx->get_attn()->set_input_v_rot(inp_attn->self_v_rot);
     }
 
-    if (inp_attn->self_kvarn_desc && inp_attn->self_kvarn_desc->buffer) {
-        mctx->get_attn()->set_input_kvarn_desc(inp_attn->self_kvarn_desc, ubatch, 0);
+    if (inp_attn->self_sj_kvarn_desc && inp_attn->self_sj_kvarn_desc->buffer) {
+        mctx->get_attn()->set_input_sj_kvarn_desc(inp_attn->self_sj_kvarn_desc, ubatch, 0);
     }
-    if (inp_attn->self_kvarn_desc_edge && inp_attn->self_kvarn_desc_edge->buffer) {
-        mctx->get_attn()->set_input_kvarn_desc(inp_attn->self_kvarn_desc_edge, ubatch, 1);
+    if (inp_attn->self_sj_kvarn_desc_edge && inp_attn->self_sj_kvarn_desc_edge->buffer) {
+        mctx->get_attn()->set_input_sj_kvarn_desc(inp_attn->self_sj_kvarn_desc_edge, ubatch, 1);
     }
 
     inp_rs->fill_s_copy(mctx->get_recr());
@@ -3051,10 +3051,10 @@ ggml_tensor * llm_graph_context::build_attn_turbo_q(
     // TurboQuant pre-rotate-queries: O(d log d) WHT rotation via custom op
     // Q shape: (n_embd_head, n_head, n_tokens)
     // For zero-padded models (head_dim not 128-aligned), pad Q to match padded K dim first.
-    // KVarN: the staging K view is tq6_0 but holds K in the KVarN Hadamard basis (build_attn rotates Q/K/V
+    // SJ-KVaRN: the staging K view is tq6_0 but holds K in the SJ-KVaRN Hadamard basis (build_attn rotates Q/K/V
     // itself and stores K with ggml_set_rows_tq6_rotated, no WHT and no InnerQ), so no turbo rotation here.
-    const bool is_kvarn = mctx_cur->is_kvarn();
-    if (!is_kvarn && (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TQ6_0 || k->type == GGML_TYPE_TQ5_0)) {
+    const bool is_sj_kvarn = mctx_cur->is_sj_kvarn();
+    if (!is_sj_kvarn && (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TQ6_0 || k->type == GGML_TYPE_TQ5_0)) {
         // Pad Q per-head to next multiple of 128 if needed
         if (q->ne[0] % 128 != 0) {
             const int64_t pad = ((q->ne[0] + 127) / 128) * 128 - q->ne[0];
@@ -3161,17 +3161,17 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
         ggml_prec_set_acc(cur, GGML_PREC_F32);
 
-        // KVarN: attach the sealed record pool + region descriptor; Q/K/V are Hadamard-rotated, so un-rotate the output
-        const bool is_kvarn_attn = kvarn_pending.body != nullptr;
-        if (is_kvarn_attn) {
+        // SJ-KVaRN: attach the sealed record pool + region descriptor; Q/K/V are Hadamard-rotated, so un-rotate the output
+        const bool is_sj_kvarn_attn = sj_kvarn_pending.body != nullptr;
+        if (is_sj_kvarn_attn) {
             GGML_ASSERT(kq_mask && kq_mask->ne[0] > 0 && kq_mask->ne[0] % 64 == 0);
-            ggml_flash_attn_ext_set_kvarn(cur, kvarn_pending.body, kvarn_pending.desc,
-                    kvarn_pending.bits_k, kvarn_pending.bits_v, (int32_t) kq_mask->ne[0]);
-            const int group = kvarn_pending.body->op_params[7] == GGML_TYPE_TURBO4_0 ? 128 : 256;
-            const bool fused_rot = kvarn_pending.fused_rot;
-            kvarn_pending = {};
+            ggml_flash_attn_ext_set_sj_kvarn(cur, sj_kvarn_pending.body, sj_kvarn_pending.desc,
+                    sj_kvarn_pending.bits_k, sj_kvarn_pending.bits_v, (int32_t) kq_mask->ne[0]);
+            const int group = sj_kvarn_pending.body->op_params[7] == GGML_TYPE_TURBO4_0 ? 128 : 256;
+            const bool fused_rot = sj_kvarn_pending.fused_rot;
+            sj_kvarn_pending = {};
             if (fused_rot) {
-                ggml_flash_attn_ext_set_kvarn_rot(cur, 256); // the node un-rotates its output itself
+                ggml_flash_attn_ext_set_sj_kvarn_rot(cur, 256); // the node un-rotates its output itself
             } else {
                 if (!ggml_is_contiguous(cur)) { cur = ggml_cont(ctx0, cur); }
                 cur = ggml_turbo_wht(ctx0, cur, 1, group, nullptr);
@@ -3181,7 +3181,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         // TurboQuant: inverse WHT on FA output when V values are WHT-rotated.
         // For MLA, V is a view of K with different ne[0] (e.g. V=512, K=576).
         // Group size must come from K (which determines the WHT rotation), not V.
-        if (!is_kvarn_attn && (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0 || v->type == GGML_TYPE_TQ6_0 || v->type == GGML_TYPE_TQ5_0)) {
+        if (!is_sj_kvarn_attn && (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0 || v->type == GGML_TYPE_TQ6_0 || v->type == GGML_TYPE_TQ5_0)) {
             const bool k_is_turbo = (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TQ6_0 || k->type == GGML_TYPE_TQ5_0);
             const ggml_tensor * group_src = k_is_turbo ? k : v;
             const int turbo_group = (group_src->ne[0] % 128 == 0) ? 128 : 64;
@@ -3394,10 +3394,10 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
     inp->self_v_rot = mctx_cur->build_input_v_rot(ctx0);
 
-    if (mctx_cur->is_kvarn()) {
-        inp->self_kvarn_desc = mctx_cur->build_input_kvarn_desc(ctx0);
-        if (mctx_cur->has_kvarn_edge_tier()) {
-            inp->self_kvarn_desc_edge = mctx_cur->build_input_kvarn_desc(ctx0);
+    if (mctx_cur->is_sj_kvarn()) {
+        inp->self_sj_kvarn_desc = mctx_cur->build_input_sj_kvarn_desc(ctx0);
+        if (mctx_cur->has_sj_kvarn_edge_tier()) {
+            inp->self_sj_kvarn_desc_edge = mctx_cur->build_input_sj_kvarn_desc(ctx0);
         }
     }
 
@@ -3412,10 +3412,10 @@ llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
     return (llm_graph_input_attn_kv *) res->add_input(std::move(inp));
 }
 
-// KVarN fused write rotation (#139, GGML_KVARN_FUSED_ROT): when the cache write rotates K/V itself, hand
+// SJ-KVaRN fused write rotation (#139, GGML_SJKVARN_FUSED_ROT): when the cache write rotates K/V itself, hand
 // cpy_k/cpy_v the unrotated input of the K/V GGML_OP_TURBO_WHT node; the WHT node (and its ggml_cont when the
 // raw input already has packed heads) is never expanded into the graph.
-static ggml_tensor * llm_graph_kvarn_unrotate(ggml_tensor * cur) {
+static ggml_tensor * llm_graph_sj_kvarn_unrotate(ggml_tensor * cur) {
     GGML_ASSERT(cur->op == GGML_OP_TURBO_WHT);
     ggml_tensor * src = cur->src[0];
     if (src->op == GGML_OP_CONT && src->src[0]->nb[0] == sizeof(float) &&
@@ -3440,20 +3440,20 @@ void llm_graph_context::build_attn_store(
 
     const auto * mctx_cur = inp->mctx;
 
-    if (inp->self_kvarn_desc != nullptr) {
+    if (inp->self_sj_kvarn_desc != nullptr) {
         GGML_ASSERT(k_cur->ne[0] == 256 && v_cur->ne[0] == 256);
         if (!ggml_is_contiguous(k_cur)) { k_cur = ggml_cont(ctx0, k_cur); }
         if (!ggml_is_contiguous(v_cur)) { v_cur = ggml_cont(ctx0, v_cur); }
-        const int group = mctx_cur->get_kvarn().body_type == GGML_TYPE_TURBO4_0 ? 128 : 256;
+        const int group = mctx_cur->get_sj_kvarn().body_type == GGML_TYPE_TURBO4_0 ? 128 : 256;
         k_cur = ggml_turbo_wht(ctx0, k_cur, 0, group, nullptr);
         v_cur = ggml_turbo_wht(ctx0, v_cur, 0, group, nullptr);
-        cb(k_cur, "k_kvarn_rot", il);
-        cb(v_cur, "v_kvarn_rot", il);
+        cb(k_cur, "k_sj_kvarn_rot", il);
+        cb(v_cur, "v_sj_kvarn_rot", il);
     }
 
-    if (inp->self_kvarn_desc != nullptr && mctx_cur->kvarn_fused_rot()) {
-        k_cur = llm_graph_kvarn_unrotate(k_cur);  // #139: rotated inside the cache write
-        v_cur = llm_graph_kvarn_unrotate(v_cur);
+    if (inp->self_sj_kvarn_desc != nullptr && mctx_cur->sj_kvarn_fused_rot()) {
+        k_cur = llm_graph_sj_kvarn_unrotate(k_cur);  // #139: rotated inside the cache write
+        v_cur = llm_graph_sj_kvarn_unrotate(v_cur);
     }
 
     ggml_build_forward_expand(gf, v_cur);
@@ -3489,34 +3489,34 @@ ggml_tensor * llm_graph_context::build_attn(
 
     const auto * mctx_cur = inp->mctx;
 
-    const bool is_kvarn = inp->self_kvarn_desc != nullptr;
+    const bool is_sj_kvarn = inp->self_sj_kvarn_desc != nullptr;
 
-    // KVarN: the whole cache lives in the 256-pt Hadamard-rotated basis (ring rows and sealed records alike),
+    // SJ-KVaRN: the whole cache lives in the 256-pt Hadamard-rotated basis (ring rows and sealed records alike),
     // so rotate Q/K/V here; the FA output is un-rotated in build_attn_mha. The plain Sylvester Hadamard is an
     // involution, so the same op serves both directions.
     // With the fused rotation (plain-256 bodies only) the FA node rotates Q and un-rotates its output itself.
-    const bool kvarn_fused_rot = is_kvarn && mctx_cur->get_kvarn().body_type != GGML_TYPE_TURBO4_0 &&
-        ggml_kvarn_fused_rot_enabled();
-    if (is_kvarn) {
+    const bool sj_kvarn_fused_rot = is_sj_kvarn && mctx_cur->get_sj_kvarn().body_type != GGML_TYPE_TURBO4_0 &&
+        ggml_sj_kvarn_fused_rot_enabled();
+    if (is_sj_kvarn) {
         GGML_ASSERT(q_cur->ne[0] == 256 && k_cur->ne[0] == 256 && v_cur->ne[0] == 256);
-        if (!kvarn_fused_rot && !ggml_is_contiguous(q_cur)) { q_cur = ggml_cont(ctx0, q_cur); }
+        if (!sj_kvarn_fused_rot && !ggml_is_contiguous(q_cur)) { q_cur = ggml_cont(ctx0, q_cur); }
         if (!ggml_is_contiguous(k_cur)) { k_cur = ggml_cont(ctx0, k_cur); }
         if (!ggml_is_contiguous(v_cur)) { v_cur = ggml_cont(ctx0, v_cur); }
-        const int group = mctx_cur->get_kvarn().body_type == GGML_TYPE_TURBO4_0 ? 128 : 256;
-        if (!kvarn_fused_rot) {
+        const int group = mctx_cur->get_sj_kvarn().body_type == GGML_TYPE_TURBO4_0 ? 128 : 256;
+        if (!sj_kvarn_fused_rot) {
             q_cur = ggml_turbo_wht(ctx0, q_cur, 0, group, nullptr);
-            cb(q_cur, "q_kvarn_rot", il);
+            cb(q_cur, "q_sj_kvarn_rot", il);
         }
         k_cur = ggml_turbo_wht(ctx0, k_cur, 0, group, nullptr);
         v_cur = ggml_turbo_wht(ctx0, v_cur, 0, group, nullptr);
-        cb(k_cur, "k_kvarn_rot", il);
-        cb(v_cur, "v_kvarn_rot", il);
+        cb(k_cur, "k_sj_kvarn_rot", il);
+        cb(v_cur, "v_sj_kvarn_rot", il);
     }
 
-    // KVarN fused write rotation (#139): the K/V WHT nodes above are dropped, the cache write rotates
-    if (is_kvarn && mctx_cur->kvarn_fused_rot()) {
-        k_cur = llm_graph_kvarn_unrotate(k_cur);
-        v_cur = llm_graph_kvarn_unrotate(v_cur);
+    // SJ-KVaRN fused write rotation (#139): the K/V WHT nodes above are dropped, the cache write rotates
+    if (is_sj_kvarn && mctx_cur->sj_kvarn_fused_rot()) {
+        k_cur = llm_graph_sj_kvarn_unrotate(k_cur);
+        v_cur = llm_graph_sj_kvarn_unrotate(v_cur);
     }
 
     // these nodes are added to the graph together so that they are not reordered
@@ -3532,7 +3532,7 @@ ggml_tensor * llm_graph_context::build_attn(
 
     if (cparams.training) {
         GGML_ASSERT(mctx_cur->get_n_kv() == n_tokens);
-        GGML_ASSERT(!is_kvarn);
+        GGML_ASSERT(!is_sj_kvarn);
 
         k = k_cur;
         v = v_cur;
@@ -3548,18 +3548,18 @@ ggml_tensor * llm_graph_context::build_attn(
             ggml_build_forward_expand(gf, k_store);
             ggml_build_forward_expand(gf, v_store);
 
-            if (is_kvarn) {
+            if (is_sj_kvarn) {
                 // Historical groups are sealed before this graph runs; stores above remain graph dependencies.
-                ggml_tensor * body = mctx_cur->get_kvarn_body(il);
+                ggml_tensor * body = mctx_cur->get_sj_kvarn_body(il);
 
                 uint32_t bits_k = 0, bits_v = 0;
-                const int tier = mctx_cur->get_kvarn_layer_tier(il, bits_k, bits_v);
-                GGML_ASSERT(tier == 0 || inp->self_kvarn_desc_edge != nullptr);
-                kvarn_pending.body   = body;
-                kvarn_pending.desc   = tier == 1 ? inp->self_kvarn_desc_edge : inp->self_kvarn_desc;
-                kvarn_pending.bits_k = (int32_t) bits_k;
-                kvarn_pending.bits_v = (int32_t) bits_v;
-                kvarn_pending.fused_rot = kvarn_fused_rot;
+                const int tier = mctx_cur->get_sj_kvarn_layer_tier(il, bits_k, bits_v);
+                GGML_ASSERT(tier == 0 || inp->self_sj_kvarn_desc_edge != nullptr);
+                sj_kvarn_pending.body   = body;
+                sj_kvarn_pending.desc   = tier == 1 ? inp->self_sj_kvarn_desc_edge : inp->self_sj_kvarn_desc;
+                sj_kvarn_pending.bits_k = (int32_t) bits_k;
+                sj_kvarn_pending.bits_v = (int32_t) bits_v;
+                sj_kvarn_pending.fused_rot = sj_kvarn_fused_rot;
             }
         }
 
@@ -3574,7 +3574,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
     cb(cur, "kqv_out", il);
 
-    GGML_ASSERT(kvarn_pending.body == nullptr && "KVarN cache requires the flash-attention path");
+    GGML_ASSERT(sj_kvarn_pending.body == nullptr && "SJ-KVaRN cache requires the flash-attention path");
 
     cur = build_attn_turbo_v_out(cur, v, il);
 

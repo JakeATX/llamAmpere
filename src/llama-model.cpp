@@ -2909,7 +2909,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             nullptr,
                             "",
                             0, nullptr, 0, // no block KV streaming (as on the v0.4 side)
-                            params.kvarn);
+                            params.sj_kvarn);
                 } else {
                     // Main context: DSA cache for the trunk layers only - the nextn
                     // layer(s) are never attended by the trunk graph.
@@ -3004,7 +3004,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             nullptr,
                             "",
                             0, nullptr, 0, // no block KV streaming (as on the v0.4 side)
-                            params.kvarn);
+                            params.sj_kvarn);
                 } else {
                     // only "full" layers own an indexer, so the shared layers need no indexer cache
                     llama_kv_cache::layer_filter_cb filter_lid = [&](uint32_t il) { return hparams.is_indexer_full(il); };
@@ -3054,7 +3054,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             nullptr,
                             "",
                             0, nullptr, 0, // no block KV streaming (as on the v0.4 side)
-                            params.kvarn);
+                            params.sj_kvarn);
                 } else {
                     // main context: DSA cache for the trunk full-attention layers plus a window-sized SWA cache
                     llama_kv_cache::layer_filter_cb filter_mla = nullptr;
@@ -3314,7 +3314,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* kv stream stage   */ params.kv_stream_stage_bytes,
                             /* kv stream arena   */ params.kv_stream_phase_arena,
                             /* kv stream maximum */ params.kv_stream_maximum_pool_bytes,
-                            /* kvarn             */ params.kvarn);
+                            /* sj_kvarn             */ params.sj_kvarn);
                     }
                 } else {
                     llama_kv_cache::layer_filter_cb filter = nullptr;
@@ -3417,8 +3417,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         llama_swa_type swa_type_cur = hparams.swa_type;
 
                         if (draft_window) {
-                            // a KVarN cache addresses its rows by position, which a recycled ring breaks
-                            GGML_ASSERT(!params.kvarn.enabled() && "the MTP draft attention window needs a plain KV cache");
+                            // a SJ-KVaRN cache addresses its rows by position, which a recycled ring breaks
+                            GGML_ASSERT(!params.sj_kvarn.enabled() && "the MTP draft attention window needs a plain KV cache");
 
                             // in a unified cache every sequence keeps its own window + sinks (as llama_kv_cache_iswa
                             // sizes its SWA half); 64-bit math and the context cap keep absurd values from wrapping
@@ -3456,7 +3456,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 params.kv_stream_stage_bytes,
                                 params.kv_stream_phase_arena,
                                 params.kv_stream_maximum_pool_bytes,
-                                params.kvarn);
+                                params.sj_kvarn);
 
                         if (draft_window) {
                             kv->set_swa_sink(cparams.draft_attn_sink);

@@ -35,8 +35,8 @@ struct llama_kv_stream_active_target {
     uint32_t         n_kv  = 0;
 };
 
-// KVarN region-aware attention cache configuration (see llama_kv_cache)
-struct llama_kvarn_config {
+// SJ-KVaRN region-aware attention cache configuration (see llama_kv_cache)
+struct llama_sj_kvarn_config {
     uint32_t bits_k   = 0;    // 0 = off
     uint32_t bits_v   = 0;
     ggml_type sink_type = GGML_TYPE_COUNT; // inherit staging, or a separate F16 sink
@@ -74,7 +74,7 @@ struct llama_memory_params {
 
     llama_memory_t mem_other;
 
-    llama_kvarn_config kvarn;
+    llama_sj_kvarn_config sj_kvarn;
 };
 
 enum llama_memory_status {

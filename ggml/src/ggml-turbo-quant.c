@@ -839,7 +839,7 @@ void quantize_row_tq6_0_ref(const float * GGML_RESTRICT x, block_tq6_0 * GGML_RE
     quantize_row_tq6_0_impl(x, y, k, false);
 }
 
-// KVarN inputs already share the 256-point rotated basis.
+// SJ-KVaRN inputs already share the 256-point rotated basis.
 void quantize_row_tq6_0_rotated_ref(const float * GGML_RESTRICT x, block_tq6_0 * GGML_RESTRICT y, int64_t k) {
     quantize_row_tq6_0_impl(x, y, k, true);
 }

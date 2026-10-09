@@ -363,8 +363,8 @@ struct common_params_speculative_draft {
     // cache_type_k / cache_type_v (resolved in common_base_params_to_speculative)
     ggml_type cache_type_k = GGML_TYPE_COUNT; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_COUNT; // KV cache data type for the V
-    bool      cache_type_kvarn_default = false; // set on the resolved copy: an unset type took the KVarN-trunk default
-    bool kvarn = false; // inherit the trunk's KVarN body, sink and tail for MTP
+    bool      cache_type_sj_kvarn_default = false; // set on the resolved copy: an unset type took the SJ-KVaRN-trunk default
+    bool sj_kvarn = false; // inherit the trunk's SJ-KVaRN body, sink and tail for MTP
 
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;
@@ -698,21 +698,21 @@ struct common_params {
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
     uint32_t kv_stream_arena_mib = 0;        // shared CUDA KV + compute arena, 0 = disabled [EXPERIMENTAL]
 
-    // KVarN region-aware cache (-ctk kvarnN -ctv kvarnM): 0 = off; sink/tail positions kept unsealed
-    uint32_t kvarn_bits_k = 0;
-    uint32_t kvarn_bits_v = 0;
-    uint32_t kvarn_tail   = 4096;
-    uint32_t kvarn_sink   = 128;
-    ggml_type kvarn_staging_type = GGML_TYPE_TQ6_0; // intermediate tail precision; f16 is opt-in only
-    ggml_type kvarn_sink_type = GGML_TYPE_F16;      // separate F16 sink (TQ6 staging); q8_0 staging inherits
-    bool      kvarn_sink_type_set = false;          // --kvarn-sink-type given explicitly
-    ggml_type kvarn_body_type = GGML_TYPE_F32; // F32 sentinel selects scalar KVarN records; I16 = trellis body; COUNT = auto (see llama.h)
-    uint32_t kvarn_tail_max = 8192;   // adaptive tail by default; 0 = fixed tail
-    bool     kvarn_tail_max_set = false; // --kvarn-tail-max given explicitly
-    uint32_t kvarn_edge_layers = 0; // tiered body: first/last N cache layers sealed at kvarn_edge_bits_k/v
-    uint32_t kvarn_edge_bits_k = 4;
-    uint32_t kvarn_edge_bits_v = 4;
-    uint32_t kvarn_flush_chunk = 0; // groups per decode step while an adaptive-tail flush drains (0 = one flush)
+    // SJ-KVaRN region-aware cache (-ctk sj_kvarnN -ctv sj_kvarnM): 0 = off; sink/tail positions kept unsealed
+    uint32_t sj_kvarn_bits_k = 0;
+    uint32_t sj_kvarn_bits_v = 0;
+    uint32_t sj_kvarn_tail   = 4096;
+    uint32_t sj_kvarn_sink   = 128;
+    ggml_type sj_kvarn_staging_type = GGML_TYPE_TQ6_0; // intermediate tail precision; f16 is opt-in only
+    ggml_type sj_kvarn_sink_type = GGML_TYPE_F16;      // separate F16 sink (TQ6 staging); q8_0 staging inherits
+    bool      sj_kvarn_sink_type_set = false;          // --sjkvarn-sink-type given explicitly
+    ggml_type sj_kvarn_body_type = GGML_TYPE_F32; // F32 sentinel selects scalar SJ-KVaRN records; I16 = trellis body; COUNT = auto (see llama.h)
+    uint32_t sj_kvarn_tail_max = 8192;   // adaptive tail by default; 0 = fixed tail
+    bool     sj_kvarn_tail_max_set = false; // --sjkvarn-tail-max given explicitly
+    uint32_t sj_kvarn_edge_layers = 0; // tiered body: first/last N cache layers sealed at sj_kvarn_edge_bits_k/v
+    uint32_t sj_kvarn_edge_bits_k = 4;
+    uint32_t sj_kvarn_edge_bits_v = 4;
+    uint32_t sj_kvarn_flush_chunk = 0; // groups per decode step while an adaptive-tail flush drains (0 = one flush)
     ggml_type cache_type_s = GGML_TYPE_F32; // recurrent (gated delta-net) state cache data type
 
     size_t moe_cache_size = 0; // GPU cache size in bytes for the MoE experts kept in the CPU

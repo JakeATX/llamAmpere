@@ -14,7 +14,7 @@
 static const common_speculative_family_default common_speculative_family_defaults[] = {
     // Qwen3.8 (qwen35) with the built-in MTP head: the production settings
     // (--spec-type draft-mtp-adaptive --spec-draft-n-max 4 --spec-draft-n-min-adaptive 3 --spec-draft-p-min 0,
-    //  vocab map auto); the draft KV cache types are left unset and inherit the trunk -ctk/-ctv (tq5_0/turbo4 over KVarN)
+    //  vocab map auto); the draft KV cache types are left unset and inherit the trunk -ctk/-ctv (tq5_0/turbo4 over SJ-KVaRN)
     { "qwen35", true, "MTP drafter", COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE, 4, 3, 0.0f, "auto" },
 };
 

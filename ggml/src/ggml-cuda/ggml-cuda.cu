@@ -69,10 +69,10 @@
 #include "ggml-cuda/gated_delta_net.cuh"
 #include "ggml-cuda/dsv4-hc.cuh"
 #include "ggml-cuda/set.cuh"
-#include "ggml-cuda/set-rows-kvarn-rot.cuh"
+#include "ggml-cuda/set-rows-sjkvarn-rot.cuh"
 #include "ggml-cuda/set-rows.cuh"
 #include "ggml-cuda/turbo-wht.cuh"
-#include "ggml-cuda/kvarn-seal.cuh"
+#include "ggml-cuda/sjkvarn-seal.cuh"
 #include "ggml-cuda/mmvq-tq.cuh"
 #include "ggml-cuda/exl3.cuh"
 #include "ggml-cuda/chain.cuh"
@@ -3706,8 +3706,8 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_TURBO_WHT:
             ggml_cuda_turbo_wht(ctx, dst);
             break;
-        case GGML_OP_KVARN_SEAL:
-            ggml_cuda_kvarn_seal(ctx, dst);
+        case GGML_OP_SJKVARN_SEAL:
+            ggml_cuda_sj_kvarn_seal(ctx, dst);
             break;
         case GGML_OP_SET:
             ggml_cuda_op_set(ctx, dst);
@@ -8693,8 +8693,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             } break;
         case GGML_OP_SET_ROWS:
             {
-                if (ggml_cuda_set_rows_is_kvarn_rot(op)) {  // KVarN fused write rotation (#139)
-                    const int64_t group = ggml_get_op_params_i32(op, 1) == GGML_SET_ROWS_KVARN_ROT256 ? 256 : 128;
+                if (ggml_cuda_set_rows_is_sj_kvarn_rot(op)) {  // SJ-KVaRN fused write rotation (#139)
+                    const int64_t group = ggml_get_op_params_i32(op, 1) == GGML_SET_ROWS_SJKVARN_ROT256 ? 256 : 128;
                     return op->type == GGML_TYPE_TQ6_0 && op->src[0]->type == GGML_TYPE_F32 && op->src[0]->ne[0] % group == 0 &&
                            (op->src[1]->type == GGML_TYPE_I64 || op->src[1]->type == GGML_TYPE_I32);
                 }
@@ -9010,8 +9010,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 && (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F32) &&
                 op->type == GGML_TYPE_F32;
-        case GGML_OP_KVARN_SEAL:
-            return ggml_cuda_kvarn_seal_supported(op);
+        case GGML_OP_SJKVARN_SEAL:
+            return ggml_cuda_sj_kvarn_seal_supported(op);
         case GGML_OP_FLASH_ATTN_EXT:
             if (uses_streamed_kv) {
                 return ggml_cuda_kv_stream_fattn_fits(op);

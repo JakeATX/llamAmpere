@@ -1,5 +1,5 @@
 #include "ops.h"
-#include "../ggml-kvarn.h"
+#include "../ggml-sjkvarn.h"
 
 #include "ggml-cpu.h"
 #include "ggml-impl.h"
@@ -5672,8 +5672,8 @@ static void ggml_compute_forward_set_rows_impl(
     }
 }
 
-// KVarN fused write rotation (#139), defined beside the turbo WHT below
-static bool ggml_compute_forward_set_rows_kvarn_rot(const ggml_compute_params * params, ggml_tensor * dst);
+// SJ-KVaRN fused write rotation (#139), defined beside the turbo WHT below
+static bool ggml_compute_forward_set_rows_sj_kvarn_rot(const ggml_compute_params * params, ggml_tensor * dst);
 
 void ggml_compute_forward_set_rows(
         const ggml_compute_params * params,
@@ -5682,7 +5682,7 @@ void ggml_compute_forward_set_rows(
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
-    if (ggml_compute_forward_set_rows_kvarn_rot(params, dst)) {
+    if (ggml_compute_forward_set_rows_sj_kvarn_rot(params, dst)) {
         return;
     }
 
@@ -9746,9 +9746,9 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     }
 }
 
-// KVarN region-aware attention reference: exact rows for the sink and the ring, sealed records for the
+// SJ-KVaRN region-aware attention reference: exact rows for the sink and the ring, sealed records for the
 // body, causal by position. Scalar and slow; the CUDA kernel is checked against this path.
-static void ggml_compute_forward_flash_attn_ext_kvarn(
+static void ggml_compute_forward_flash_attn_ext_sj_kvarn(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
     const ggml_tensor * q     = dst->src[0];
@@ -9764,17 +9764,17 @@ static void ggml_compute_forward_flash_attn_ext_kvarn(
     GGML_ASSERT(q->ne[3] == 1 && k->ne[3] == 1);
 
     const int32_t * dd = (const int32_t *) desc->data;
-    const int32_t S = dd[GGML_KVARN_DESC_S], cap = dd[GGML_KVARN_DESC_CAP], B = dd[GGML_KVARN_DESC_B];
-    const int32_t N = dd[GGML_KVARN_DESC_N], qpos0 = dd[GGML_KVARN_DESC_QPOS0], G = dd[GGML_KVARN_DESC_G];
-    const int32_t D = dd[GGML_KVARN_DESC_D], hkv = dd[GGML_KVARN_DESC_HKV];
-    const size_t rec_bytes = (size_t) dd[GGML_KVARN_DESC_RECBYTES];
+    const int32_t S = dd[GGML_SJKVARN_DESC_S], cap = dd[GGML_SJKVARN_DESC_CAP], B = dd[GGML_SJKVARN_DESC_B];
+    const int32_t N = dd[GGML_SJKVARN_DESC_N], qpos0 = dd[GGML_SJKVARN_DESC_QPOS0], G = dd[GGML_SJKVARN_DESC_G];
+    const int32_t D = dd[GGML_SJKVARN_DESC_D], hkv = dd[GGML_SJKVARN_DESC_HKV];
+    const size_t rec_bytes = (size_t) dd[GGML_SJKVARN_DESC_RECBYTES];
     GGML_ASSERT(mask == NULL || (mask->type == GGML_TYPE_F16 && mask->ne[0] >= N));
 
     const int32_t bits = ggml_get_op_params_i32(dst, 5);
     const int bits_k = bits >> 8, bits_v = bits & 0xff;
-    const ggml_kvarn::layout l = ggml_kvarn::make_layout(D, G, bits_k, bits_v);
-    const bool turbo4_body  = dd[GGML_KVARN_DESC_BODY_TYPE] == GGML_TYPE_TURBO4_0;
-    const bool trellis_body = dd[GGML_KVARN_DESC_BODY_TYPE] == GGML_TYPE_I16;
+    const ggml_sj_kvarn::layout l = ggml_sj_kvarn::make_layout(D, G, bits_k, bits_v);
+    const bool turbo4_body  = dd[GGML_SJKVARN_DESC_BODY_TYPE] == GGML_TYPE_TURBO4_0;
+    const bool trellis_body = dd[GGML_SJKVARN_DESC_BODY_TYPE] == GGML_TYPE_I16;
     GGML_ASSERT((turbo4_body ? 2*G*ggml_row_size(GGML_TYPE_TURBO4_0, D) : l.bytes) == rec_bytes);
     GGML_ASSERT(q->ne[0] == D && k->ne[0] == D && v->ne[0] == D);
     GGML_ASSERT(k->ne[2] == hkv && k->ne[1] >= S + cap);
@@ -9797,9 +9797,9 @@ static void ggml_compute_forward_flash_attn_ext_kvarn(
 
     std::vector<float> krow(D), vrow(D), acc(D);
 
-    // fused rotation (ggml_flash_attn_ext_set_kvarn_rot): plain H256/16 on Q and on the output, same butterfly order
+    // fused rotation (ggml_flash_attn_ext_set_sj_kvarn_rot): plain H256/16 on Q and on the output, same butterfly order
     // as ggml_compute_forward_turbo_wht_f32
-    const bool fused_rot = ggml_flash_attn_ext_get_kvarn_rot(dst) == 256;
+    const bool fused_rot = ggml_flash_attn_ext_get_sj_kvarn_rot(dst) == 256;
     GGML_ASSERT(!fused_rot || (D == 256 && !turbo4_body));
     auto rot256 = [](float * x) {
         for (int h = 1; h < 256; h *= 2) {
@@ -9850,14 +9850,14 @@ static void ggml_compute_forward_flash_attn_ext_kvarn(
                     dequantize_row_turbo4_0((const block_turbo4_0 *) (rec + t*row_bytes), krow.data(), D);
                     dequantize_row_turbo4_0((const block_turbo4_0 *) (rec + (G+t)*row_bytes), vrow.data(), D);
                 } else {
-                    ggml_kvarn::decode_k_row(rec, l, t, krow.data(), trellis_body);
-                    ggml_kvarn::decode_v_row(rec, l, t, vrow.data(), trellis_body);
+                    ggml_sj_kvarn::decode_k_row(rec, l, t, krow.data(), trellis_body);
+                    ggml_sj_kvarn::decode_v_row(rec, l, t, vrow.data(), trellis_body);
                 }
             } else {
                 const int32_t row = p < S ? p : S + (p - S) % cap;
                 const void * kr = (const char *) k->data + row*k->nb[1] + ikv*k->nb[2];
                 const void * vr = (const char *) v->data + row*v->nb[1] + ikv*v->nb[2];
-                const bool f16_sink = p < S && dd[GGML_KVARN_DESC_SINK_TYPE] == GGML_TYPE_F16;
+                const bool f16_sink = p < S && dd[GGML_SJKVARN_DESC_SINK_TYPE] == GGML_TYPE_F16;
                 if (f16_sink) {
                     kr = (const char *) k->data + (size_t) (S + cap)*k->nb[1] + (size_t) (p*hkv + ikv)*D*sizeof(ggml_fp16_t);
                     vr = (const char *) v->data + (size_t) (S + cap)*v->nb[1] + (size_t) (p*hkv + ikv)*D*sizeof(ggml_fp16_t);
@@ -9915,7 +9915,7 @@ void ggml_compute_forward_flash_attn_ext(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
     if (dst->src[6] != NULL) {
-        ggml_compute_forward_flash_attn_ext_kvarn(params, dst);
+        ggml_compute_forward_flash_attn_ext_sj_kvarn(params, dst);
         return;
     }
     switch (dst->op_params[3]) {
@@ -12057,10 +12057,10 @@ void ggml_compute_forward_dsv4_hc_post(
     }
 }
 
-// GGML_KVARN_DUMP=<path>: append the fp16 rows every sealed (group, head) sees, for offline codec studies.
+// GGML_SJKVARN_DUMP=<path>: append the fp16 rows every sealed (group, head) sees, for offline codec studies.
 // Record: int32 magic 'KVD1', D, G, head; char name[64]; K [G][D] fp16; V [G][D] fp16.
-static void ggml_kvarn_dump_group(const ggml_fp16_t * K, const ggml_fp16_t * V, size_t row_stride, int D, int G, int64_t head, const char * name) {
-    static const char * path = getenv("GGML_KVARN_DUMP");
+static void ggml_sj_kvarn_dump_group(const ggml_fp16_t * K, const ggml_fp16_t * V, size_t row_stride, int D, int G, int64_t head, const char * name) {
+    static const char * path = getenv("GGML_SJKVARN_DUMP");
     if (path == nullptr) {
         return;
     }
@@ -12080,9 +12080,9 @@ static void ggml_kvarn_dump_group(const ggml_fp16_t * K, const ggml_fp16_t * V, 
     fclose(f);
 }
 
-// ggml_compute_forward_kvarn_seal
+// ggml_compute_forward_sj_kvarn_seal
 
-void ggml_compute_forward_kvarn_seal(
+void ggml_compute_forward_sj_kvarn_seal(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
     const ggml_tensor * k    = dst->src[0];
@@ -12097,7 +12097,7 @@ void ggml_compute_forward_kvarn_seal(
     const int32_t iters  = ggml_get_op_params_i32(dst, 4);
     const int32_t n_groups_max = ggml_get_op_params_i32(dst, 5);
 
-    const ggml_kvarn::layout l = ggml_kvarn::make_layout(D, G, bits_k, bits_v);
+    const ggml_sj_kvarn::layout l = ggml_sj_kvarn::make_layout(D, G, bits_k, bits_v);
     const bool turbo4_body  = ggml_get_op_params_i32(dst, 7) == GGML_TYPE_TURBO4_0;
     const bool trellis_body = ggml_get_op_params_i32(dst, 7) == GGML_TYPE_I16;
     const size_t rec_bytes = turbo4_body ? 2*G*ggml_row_size(GGML_TYPE_TURBO4_0, D) : l.bytes;
@@ -12125,8 +12125,8 @@ void ggml_compute_forward_kvarn_seal(
             return;
         }
         if (k->type == GGML_TYPE_F16) {
-            ggml_kvarn_dump_group((const ggml_fp16_t *) kp, (const ggml_fp16_t *) vp, row_stride, D, G, head, k->name);
-            ggml_kvarn::seal_group((const ggml_fp16_t *) kp, (const ggml_fp16_t *) vp, row_stride, l, iters, record, trellis_body);
+            ggml_sj_kvarn_dump_group((const ggml_fp16_t *) kp, (const ggml_fp16_t *) vp, row_stride, D, G, head, k->name);
+            ggml_sj_kvarn::seal_group((const ggml_fp16_t *) kp, (const ggml_fp16_t *) vp, row_stride, l, iters, record, trellis_body);
             return;
         }
         for (int t = 0; t < G; ++t) {
@@ -12135,8 +12135,8 @@ void ggml_compute_forward_kvarn_seal(
             ggml_get_type_traits(v->type)->to_float(vp + t*v->nb[1], row.data(), D);
             ggml_fp32_to_fp16_row(row.data(), vstage.data() + t*D, D);
         }
-        ggml_kvarn_dump_group(kstage.data(), vstage.data(), D, D, G, head, k->name);
-        ggml_kvarn::seal_group(kstage.data(), vstage.data(), D, l, iters, record, trellis_body);
+        ggml_sj_kvarn_dump_group(kstage.data(), vstage.data(), D, D, G, head, k->name);
+        ggml_sj_kvarn::seal_group(kstage.data(), vstage.data(), D, l, iters, record, trellis_body);
     };
 
     if (desc == nullptr) {
@@ -12155,12 +12155,12 @@ void ggml_compute_forward_kvarn_seal(
     // dynamic: seal the groups covering positions [B_OLD, B) out of the ring rows
     GGML_ASSERT(desc->type == GGML_TYPE_I32);
     const int32_t * d = (const int32_t *) desc->data;
-    const int32_t S     = d[GGML_KVARN_DESC_S];
-    const int32_t cap   = d[GGML_KVARN_DESC_CAP];
-    const int32_t B     = d[GGML_KVARN_DESC_B];
-    const int32_t B_old = d[GGML_KVARN_DESC_B_OLD];
-    GGML_ASSERT(d[GGML_KVARN_DESC_G] == G && d[GGML_KVARN_DESC_D] == D);
-    GGML_ASSERT(d[GGML_KVARN_DESC_HKV] == hkv && (size_t) d[GGML_KVARN_DESC_RECBYTES] == rec_bytes);
+    const int32_t S     = d[GGML_SJKVARN_DESC_S];
+    const int32_t cap   = d[GGML_SJKVARN_DESC_CAP];
+    const int32_t B     = d[GGML_SJKVARN_DESC_B];
+    const int32_t B_old = d[GGML_SJKVARN_DESC_B_OLD];
+    GGML_ASSERT(d[GGML_SJKVARN_DESC_G] == G && d[GGML_SJKVARN_DESC_D] == D);
+    GGML_ASSERT(d[GGML_SJKVARN_DESC_HKV] == hkv && (size_t) d[GGML_SJKVARN_DESC_RECBYTES] == rec_bytes);
     GGML_ASSERT(cap % G == 0 && (B_old - S) % G == 0 && (B - S) % G == 0);
     GGML_ASSERT(k->ne[1] >= S + cap);
     const int32_t n_new = B > B_old ? (B - B_old) / G : 0;
@@ -12276,12 +12276,12 @@ void ggml_compute_forward_turbo_wht(
     }
 }
 
-// KVarN fused write rotation (llamAmpere #139, GGML_KVARN_FUSED_ROT): SET_ROWS into TQ6_0 that first applies
-// the forward KVarN rotation per group (the exact arithmetic of ggml_compute_forward_turbo_wht_f32 with
+// SJ-KVaRN fused write rotation (llamAmpere #139, GGML_SJKVARN_FUSED_ROT): SET_ROWS into TQ6_0 that first applies
+// the forward SJ-KVaRN rotation per group (the exact arithmetic of ggml_compute_forward_turbo_wht_f32 with
 // direction 0 and no InnerQ), then packs in the rotated basis like ggml_set_rows_tq6_rotated, including the
 // f16 sink semantics of ggml_compute_forward_set_rows_impl. Returns false when dst is not this op.
 template <typename idx_t>
-static void ggml_compute_forward_set_rows_kvarn_rot_impl(const ggml_compute_params * params, ggml_tensor * dst, int group) {
+static void ggml_compute_forward_set_rows_sj_kvarn_rot_impl(const ggml_compute_params * params, ggml_tensor * dst, int group) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
@@ -12348,16 +12348,16 @@ static void ggml_compute_forward_set_rows_kvarn_rot_impl(const ggml_compute_para
     }
 }
 
-static bool ggml_compute_forward_set_rows_kvarn_rot(const ggml_compute_params * params, ggml_tensor * dst) {
+static bool ggml_compute_forward_set_rows_sj_kvarn_rot(const ggml_compute_params * params, ggml_tensor * dst) {
     const int32_t mode = ggml_get_op_params_i32(dst, 1);
-    if (mode != GGML_SET_ROWS_KVARN_ROT256 && mode != GGML_SET_ROWS_KVARN_ROT128) {
+    if (mode != GGML_SET_ROWS_SJKVARN_ROT256 && mode != GGML_SET_ROWS_SJKVARN_ROT128) {
         return false;
     }
-    const int group = mode == GGML_SET_ROWS_KVARN_ROT256 ? 256 : 128;
+    const int group = mode == GGML_SET_ROWS_SJKVARN_ROT256 ? 256 : 128;
     if (dst->src[1]->type == GGML_TYPE_I64) {
-        ggml_compute_forward_set_rows_kvarn_rot_impl<int64_t>(params, dst, group);
+        ggml_compute_forward_set_rows_sj_kvarn_rot_impl<int64_t>(params, dst, group);
     } else {
-        ggml_compute_forward_set_rows_kvarn_rot_impl<int32_t>(params, dst, group);
+        ggml_compute_forward_set_rows_sj_kvarn_rot_impl<int32_t>(params, dst, group);
     }
     return true;
 }

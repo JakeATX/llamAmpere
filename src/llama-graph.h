@@ -418,9 +418,9 @@ public:
     ggml_tensor * self_k_rot = nullptr;
     ggml_tensor * self_v_rot = nullptr;
 
-    // KVarN: I32 region descriptor (sink/ring/body bounds for this ubatch), nullptr unless the cache is KVarN
-    ggml_tensor * self_kvarn_desc = nullptr;
-    ggml_tensor * self_kvarn_desc_edge = nullptr; // tiered body: descriptor of the edge tier (nullptr unless edge layers exist)
+    // SJ-KVaRN: I32 region descriptor (sink/ring/body bounds for this ubatch), nullptr unless the cache is SJ-KVaRN
+    ggml_tensor * self_sj_kvarn_desc = nullptr;
+    ggml_tensor * self_sj_kvarn_desc_edge = nullptr; // tiered body: descriptor of the edge tier (nullptr unless edge layers exist)
 
     // note: these have to be copies because in order to be able to reuse a graph, its inputs
     //       need to carry these parameters with them. otherwise, they can point to freed
@@ -1182,14 +1182,14 @@ struct llm_graph_context {
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
 
-    // KVarN: handed from build_attn (which owns the cache) to build_attn_mha (which owns the FA node)
+    // SJ-KVaRN: handed from build_attn (which owns the cache) to build_attn_mha (which owns the FA node)
     mutable struct {
         ggml_tensor * body = nullptr; // seal output (view of the layer's record pool)
         ggml_tensor * desc = nullptr;
         int32_t bits_k = 0;
         int32_t bits_v = 0;
-        bool fused_rot = false; // Q/output rotation inside the FA node (ggml_kvarn_fused_rot_enabled)
-    } kvarn_pending;
+        bool fused_rot = false; // Q/output rotation inside the FA node (ggml_sj_kvarn_fused_rot_enabled)
+    } sj_kvarn_pending;
 
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;
@@ -1368,8 +1368,8 @@ struct llm_graph_context {
                     int   il) const;
 
     // TurboQuant/TQ K caches hold WHT-rotated K (the set_rows quantizer rotates on store): pad Q per head
-    // to the cached K head size and rotate it to match. No-op for other K types and for KVarN caches
-    // (their tq6_0 staging K is stored in the KVarN Hadamard basis without the turbo WHT). Any graph that calls
+    // to the cached K head size and rotate it to match. No-op for other K types and for SJ-KVaRN caches
+    // (their tq6_0 staging K is stored in the SJ-KVaRN Hadamard basis without the turbo WHT). Any graph that calls
     // build_attn_mha on llama_kv_cache views must apply this and build_attn_turbo_v_out as build_attn does.
     ggml_tensor * build_attn_turbo_q(
             ggml_tensor * q,       // [n_embd_head_q, n_head_q, n_tokens]

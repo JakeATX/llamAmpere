@@ -34,7 +34,7 @@ llama_memory_hybrid::llama_memory_hybrid(
                      size_t kv_stream_stage_bytes,
                      void * kv_stream_phase_arena,
                      size_t kv_stream_maximum_pool_bytes,
-      llama_kvarn_config    kvarn) :
+      llama_sj_kvarn_config    sj_kvarn) :
     hparams(model.hparams),
     mem_attn(new llama_kv_cache(
         model,
@@ -59,7 +59,7 @@ llama_memory_hybrid::llama_memory_hybrid(
         kv_stream_stage_bytes,
         kv_stream_phase_arena,
         kv_stream_maximum_pool_bytes,
-        kvarn
+        sj_kvarn
     )),
     mem_recr(new llama_memory_recurrent(
         model,

@@ -17,7 +17,7 @@
 //   KLD_STRIDE=<n>        score every n-th position (default 1); must match between write and read
 //   KLD_OUT=<csv>         per-position CSV (read mode)
 //   KLD_BINS=a,b,c,...    bin upper edges in tokens (default 10240,25600,51200,76800,102400,128000,153600)
-//   KLD_KVARN_IDLE_EVERY=n compress adaptive KVarN after every n input tokens (default 0/off)
+//   KLD_SJKVARN_IDLE_EVERY=n compress adaptive SJ-KVaRN after every n input tokens (default 0/off)
 //   KLD_FULL_VOCAB=1     dense double log-probabilities, exact token/config validation
 //   KLD_CONTRACT=<text>   required in full mode; caller model/config identity (exclude cache type)
 //   KLD_MAX_TOKENS=<n>    use at most n tokens of the file (default: the context size)
@@ -260,9 +260,9 @@ int main(int argc, char ** argv) {
     }
     const int stride = integer_env("KLD_STRIDE", 1);
     const std::vector<int> bins = parse_bins(env_bins);
-    const int idle_every = integer_env("KLD_KVARN_IDLE_EVERY", 0, 0);
+    const int idle_every = integer_env("KLD_SJKVARN_IDLE_EVERY", 0, 0);
     if (idle_every && (params.n_batch <= 0 || idle_every % params.n_batch != 0)) {
-        LOG_ERR("KLD_KVARN_IDLE_EVERY must be a multiple of batch size\n"); return 1;
+        LOG_ERR("KLD_SJKVARN_IDLE_EVERY must be a multiple of batch size\n"); return 1;
     }
 
     llama_backend_init();
@@ -454,12 +454,12 @@ int main(int argc, char ** argv) {
         }
         if (idle_every && end % idle_every == 0) {
             // All logits have been consumed. Teacher forcing has no speculative suffix or checkpoints.
-            const int32_t before = llama_kvarn_sealed_end(ctx);
-            const int32_t status = llama_kvarn_compress_idle(ctx, 0, end);
-            const int32_t after = llama_kvarn_sealed_end(ctx);
+            const int32_t before = llama_sj_kvarn_sealed_end(ctx);
+            const int32_t status = llama_sj_kvarn_compress_idle(ctx, 0, end);
+            const int32_t after = llama_sj_kvarn_sealed_end(ctx);
             LOG_INF("kld_idle: accepted_end=%d status=%d sealed_before=%d sealed_after=%d\n",
                     end, status, before, after);
-            if (status < 0) { LOG_ERR("KVarN idle compression failed\n"); return 1; }
+            if (status < 0) { LOG_ERR("SJ-KVaRN idle compression failed\n"); return 1; }
         }
         if (write_mode && !base_out) { LOG_ERR("base write failed\n"); return 1; }
         const double el = (ggml_time_us() - t_start) / 1e6;

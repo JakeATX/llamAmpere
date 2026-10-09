@@ -424,21 +424,21 @@ extern "C" {
         ggml_abort_callback abort_callback;
         void *              abort_callback_data;
 
-        // KVarN attention cache: F16, Q8_0 or TQ6_0 sink + tail, sealed low-bit body.
+        // SJ-KVaRN attention cache: F16, Q8_0 or TQ6_0 sink + tail, sealed low-bit body.
         // bits_k/bits_v > 0 enable it; flash attention is required.
-        uint32_t kvarn_bits_k; // 0 = off
-        uint32_t kvarn_bits_v; // 0 = off
-        uint32_t kvarn_tail;   // recent positions kept unsealed (multiple of 128, default 4096)
-        uint32_t kvarn_sink;   // leading positions kept unsealed (multiple of 64)
-        enum ggml_type kvarn_body_type; // F32 sentinel = KVarN scalar records, I16 sentinel = KVarN with trellis-coded payloads (built-in codebooks), COUNT = auto (trellis for the 3/3, 3/2, 2/2 pairs, scalar otherwise), TURBO4_0 = stored-domain Turbo4
-        enum ggml_type kvarn_sink_type; // F16 (default) keeps a separate sink and needs TQ6_0 staging; COUNT inherits staging (required with Q8_0)
-        enum ggml_type kvarn_staging_type; // stored-domain TQ6_0 (default), Q8_0 or F16 for the tail (and an inheriting sink)
-        uint32_t kvarn_tail_max; // 0 = fixed tail; otherwise batch compression between tail and tail_max (default 8192, adaptive)
-        uint32_t kvarn_edge_layers; // tiered body: KV layers within the first and last N model layers seal at kvarn_edge_bits_k/v (0 = uniform)
-        uint32_t kvarn_edge_bits_k; // edge-tier body bits (default 4/4)
-        uint32_t kvarn_edge_bits_v;
-        enum ggml_type kvarn_edge_body_type; // edge-tier codec: COUNT = auto (trellis only for a trellis pair when kvarn_body_type is trellis/auto), F32 scalar, I16 trellis
-        uint32_t kvarn_flush_chunk; // adaptive tail: max groups sealed per small (decode) ubatch; 0 = whole flush at once
+        uint32_t sj_kvarn_bits_k; // 0 = off
+        uint32_t sj_kvarn_bits_v; // 0 = off
+        uint32_t sj_kvarn_tail;   // recent positions kept unsealed (multiple of 128, default 4096)
+        uint32_t sj_kvarn_sink;   // leading positions kept unsealed (multiple of 64)
+        enum ggml_type sj_kvarn_body_type; // F32 sentinel = SJ-KVaRN scalar records, I16 sentinel = SJ-KVaRN with trellis-coded payloads (built-in codebooks), COUNT = auto (trellis for the 3/3, 3/2, 2/2 pairs, scalar otherwise), TURBO4_0 = stored-domain Turbo4
+        enum ggml_type sj_kvarn_sink_type; // F16 (default) keeps a separate sink and needs TQ6_0 staging; COUNT inherits staging (required with Q8_0)
+        enum ggml_type sj_kvarn_staging_type; // stored-domain TQ6_0 (default), Q8_0 or F16 for the tail (and an inheriting sink)
+        uint32_t sj_kvarn_tail_max; // 0 = fixed tail; otherwise batch compression between tail and tail_max (default 8192, adaptive)
+        uint32_t sj_kvarn_edge_layers; // tiered body: KV layers within the first and last N model layers seal at sj_kvarn_edge_bits_k/v (0 = uniform)
+        uint32_t sj_kvarn_edge_bits_k; // edge-tier body bits (default 4/4)
+        uint32_t sj_kvarn_edge_bits_v;
+        enum ggml_type sj_kvarn_edge_body_type; // edge-tier codec: COUNT = auto (trellis only for a trellis pair when sj_kvarn_body_type is trellis/auto), F32 scalar, I16 trellis
+        uint32_t sj_kvarn_flush_chunk; // adaptive tail: max groups sealed per small (decode) ubatch; 0 = whole flush at once
 
         // Keep the booleans together and at the end of the struct to avoid misalignment during copy-by-value.
         bool embeddings;  // if true, extract embeddings (together with logits)
@@ -890,15 +890,15 @@ extern "C" {
             llama_memory_t mem,
               llama_seq_id seq_id);
 
-    // Exclusive end of the sealed KVarN body, or -1 if this cache is not KVarN.
+    // Exclusive end of the sealed SJ-KVaRN body, or -1 if this cache is not SJ-KVaRN.
     // Removing a nonempty prefix below this boundary requires clearing the cache.
-    LLAMA_API int32_t llama_kvarn_sealed_end(struct llama_context * ctx);
+    LLAMA_API int32_t llama_sj_kvarn_sealed_end(struct llama_context * ctx);
 
-    // Compress an adaptive KVarN tail during an idle period. Does not evaluate model layers.
+    // Compress an adaptive SJ-KVaRN tail during an idle period. Does not evaluate model layers.
     // accepted_pos_end is the exclusive end of accepted, materialized positions.
     // The caller must resolve speculative rollback and discard checkpoints before calling.
     // Supports a single sequence. Returns 1 if compressed, 0 if no work, -1 on failure.
-    LLAMA_API int32_t llama_kvarn_compress_idle(
+    LLAMA_API int32_t llama_sj_kvarn_compress_idle(
             struct llama_context * ctx,
                     llama_seq_id   seq_id,
                        llama_pos   accepted_pos_end);
