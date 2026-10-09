@@ -108,10 +108,14 @@ You need:
 - the CUDA toolkit (tested with 12.4);
 - CMake, git and a C++ compiler.
 
+`-DLLAMA_BUILD_BORINGSSL=ON` builds HTTPS support from source so that `-hf` can download models. Without it, a
+machine that has no OpenSSL development files gets a build whose `-hf` fails with "HTTPS is not supported".
+
 ```bash
 git clone -b v0.5 https://github.com/JakeATX/llamAmpere.git
 cd llamAmpere
-cmake -S . -B build-sm86 -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86
+cmake -S . -B build-sm86 -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 \
+  -DLLAMA_BUILD_BORINGSSL=ON
 cmake --build build-sm86 -j8 --target llama-server
 ```
 
