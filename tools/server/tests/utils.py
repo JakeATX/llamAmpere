@@ -123,6 +123,10 @@ class ServerProcess:
     mcp_servers_config: str | None = None
     mcp_servers_json: str | None = None
     cors_origins: str | None = None
+    sse_ping_interval: int | None = None
+    sse_ping_queued: bool = False
+    slot_stall_timeout: int | None = None
+    slot_stall_cancel: bool = False
 
     # session variables
     process: subprocess.Popen | None = None
@@ -291,6 +295,14 @@ class ServerProcess:
             server_args.extend(["--mcp-servers-json", self.mcp_servers_json])
         if self.backend_sampling:
             server_args.append("--backend_sampling")
+        if self.sse_ping_interval is not None:
+            server_args.extend(["--sse-ping-interval", self.sse_ping_interval])
+        if self.sse_ping_queued:
+            server_args.append("--sse-ping-queued")
+        if self.slot_stall_timeout is not None:
+            server_args.extend(["--slot-stall-timeout", self.slot_stall_timeout])
+        if self.slot_stall_cancel:
+            server_args.append("--slot-stall-cancel")
         if self.gcp_compat:
             env["AIP_MODE"] = "PREDICTION"
             env["AIP_HTTP_PORT"] = str(self.server_port)
@@ -626,6 +638,37 @@ class ServerPreset:
         server.n_slots = 1
         server.seed = 42
         server.server_reranking = True
+        return server
+
+    @staticmethod
+    def tinylaya() -> ServerProcess:
+        server = ServerProcess()
+        server.offline = True # will be downloaded by load_all()
+        local_model = os.environ.get("TINYLAYA_LOCAL_MODEL")
+        server.model_hf_file = None
+        if local_model:
+            server.model_file = local_model
+            server.model_hf_repo = None
+        else:
+            server.model_hf_repo = "ggml-org/tinylaya-for-testing-gguf"
+        server.n_ctx = 1024
+        server.n_batch = 512
+        server.n_ubatch = 512
+        server.n_slots = 2
+        server.seed = 42
+        return server
+
+    @staticmethod
+    def tinyopenjev() -> ServerProcess:
+        server = ServerProcess()
+        server.offline = True # will be downloaded by load_all()
+        # mmproj is already provided by HF registry API
+        server.model_hf_file = None
+        server.model_hf_repo = "ggml-org/tinyopenjev-for-testing-gguf:Q8_0"
+        server.n_ctx = 4096
+        server.n_batch = 512
+        server.n_slots = 4
+        server.seed = 42
         return server
 
     @staticmethod

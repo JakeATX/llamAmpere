@@ -132,15 +132,15 @@ static __device__ __forceinline__ void ggml_cuda_syncwarp() {
 }
 
 static __device__ __forceinline__ void ggml_cuda_pdl_sync() {
-#if defined(GGML_CUDA_USE_PDL) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
+#if defined(GGML_CUDA_USE_PDL) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
     cudaGridDependencySynchronize();
-#endif // defined(GGML_CUDA_USE_PDL) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
+#endif // defined(GGML_CUDA_USE_PDL) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
 }
 
 static __device__ __forceinline__ void ggml_cuda_pdl_lc() {
-#if defined(GGML_CUDA_USE_PDL) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
+#if defined(GGML_CUDA_USE_PDL) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
     cudaTriggerProgrammaticLaunchCompletion();
-#endif // defined(GGML_CUDA_USE_PDL) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
+#endif // defined(GGML_CUDA_USE_PDL) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
 }
 
 #ifdef __CUDA_ARCH_LIST__
@@ -286,21 +286,21 @@ static const char * cu_get_error_str(CUresult err) {
 #define VOLTA_MMA_AVAILABLE
 #endif // !defined(GGML_USE_HIP) && __CUDA_ARCH__ == GGML_CUDA_CC_VOLTA
 
-#if !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_TURING
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_TURING
 #define TURING_MMA_AVAILABLE
-#endif // !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_TURING
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_TURING
 
-#if !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
 #define AMPERE_MMA_AVAILABLE
-#endif // !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
 
 #if !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_BLACKWELL && __CUDA_ARCH__ < GGML_CUDA_CC_RUBIN
 #    define BLACKWELL_MMA_AVAILABLE
 #endif // !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_BLACKWELL
 
-#if !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
 #define CP_ASYNC_AVAILABLE
-#endif // !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
 
 #if !defined(GGML_CUDA_NO_FA) && !(defined(GGML_USE_MUSA) && __MUSA_ARCH__ < 220)
 #define FLASH_ATTN_AVAILABLE
@@ -454,7 +454,7 @@ struct ggml_cuda_unroll<1> {
 
 template<int width = WARP_SIZE>
 static __device__ __forceinline__ int warp_reduce_sum(int x) {
-#if !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
     return __reduce_add_sync(0xffffffff, x);
 #else
 #pragma unroll
@@ -462,7 +462,7 @@ static __device__ __forceinline__ int warp_reduce_sum(int x) {
         x += __shfl_xor_sync(0xffffffff, x, offset, width);
     }
     return x;
-#endif // !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
 }
 
 template<int width = WARP_SIZE>
@@ -1503,6 +1503,31 @@ struct ggml_cuda_stream_context {
     }
 };
 
+// [#110 SF fold 2] GGML_VL_SF_CONVRING: ssm_conv reads its conv input straight from the two CONCAT operands
+// (kept conv-state columns and the new rows) and writes the conv-state snapshot windows itself, so the CONCAT
+// and the window CPY / CONT+SET_ROWS nodes are not launched (ggml_cuda_conv_ring_plan, ggml-cuda.cu).
+#define GGML_CUDA_CONV_RING_MAX_T   8  // widest ubatch (tokens per sequence) the fused kernel takes
+#define GGML_CUDA_CONV_RING_MAX_WIN 8  // snapshot windows per ssm_conv
+
+struct ggml_cuda_conv_ring_window {
+    float *         dst        = nullptr; // static copy: sequence 0's row; ring: row 0 of the cache matrix
+    const int32_t * rows       = nullptr; // ring: cache row of each sequence (set_rows indices); nullptr: static
+    int64_t         row_stride = 0;       // floats: static, between sequences; ring, between cache rows
+    int             s_idx      = 0;       // first conv-input column of the window
+};
+
+struct ggml_cuda_conv_ring_args {
+    const float * state    = nullptr;     // CONCAT src0: kept columns [d_conv - 1, channels, n_seqs], nb0 == 4
+    int64_t       state_nb1 = 0;          // bytes
+    int64_t       state_nb2 = 0;
+    const float * x        = nullptr;     // CONCAT src1: new rows [n_t, channels, n_seqs], any strides
+    int64_t       x_nb0    = 0;           // bytes
+    int64_t       x_nb1    = 0;
+    int64_t       x_nb2    = 0;
+    int           n_win    = 0;
+    ggml_cuda_conv_ring_window win[GGML_CUDA_CONV_RING_MAX_WIN]; // in graph order: a later window wins a shared address
+};
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1598,6 +1623,7 @@ struct ggml_backend_cuda_context {
         int64_t add_rms       = 0;   // fused ADD + RMS_NORM + MUL runs (ggml_cuda_op_add_rms_norm_mul) [#46]
         int64_t add_rms_q8    = 0;   // ... of which also prefilled the q8_1 cache for the next MMVQ consumer
         int64_t exl3_ffn_bridge = 0; // EXL3 gate/up -> SwiGLU -> down runs through ggml_cuda_exl3_ffn_bridge [#74]
+        int64_t conv_ring     = 0;   // ssm_conv launches that read the CONCAT operands and wrote the windows [#110]
     } fusion_stats;
     // Landing slots for paged-in experts. One slab per expert tensor, n_slots experts wide; the
     // address table is pointed at a slot instead of at the expert's home address once it is copied.
@@ -1634,6 +1660,15 @@ struct ggml_backend_cuda_context {
         bool                used       = false;
     };
     std::vector<gdn_state_read_entry> gdn_state_reads;
+
+    // [#110 SF fold 2] ssm_conv nodes of the graph being evaluated that run the conv-ring kernel. Filled by
+    // ggml_cuda_conv_ring_plan at the start of each evaluation, cleared at its end.
+    struct conv_ring_entry {
+        const ggml_tensor *      conv = nullptr;
+        ggml_cuda_conv_ring_args args;
+        bool                     used = false;
+    };
+    std::vector<conv_ring_entry> conv_rings;
 
 #ifdef USE_CUDA_GRAPH
     std::unordered_map<uint64_t, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
@@ -1769,6 +1804,9 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * gate_scale = nullptr;
     ggml_glu_op glu_op;
     float glu_limit = 0.0f;
+    const ggml_tensor * shared_up = nullptr;
+    const ggml_tensor * shared_gate = nullptr;
+    ggml_tensor * shared_dst = nullptr;
 };
 struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias = nullptr;
@@ -1778,6 +1816,10 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * gate_scale = nullptr;
     ggml_glu_op glu_op;
     float glu_limit = 0.0f;
+    const void * shared_up = nullptr;
+    const void * shared_gate = nullptr;
+    float * shared_dst = nullptr;
+    uint32_t shared_stride_col_dst = 0;
 };
 
 struct ggml_cuda_kernel_launch_params {
@@ -1878,11 +1920,11 @@ static bool ggml_cuda_kernel_can_use_pdl(const void * kernel) {
 #endif //defined(GGML_CUDA_USE_PDL)
 
 // PDL and __restrict__ need to be mutually exclusive, see https://github.com/ggml-org/llama.cpp/pull/24030
-# if (defined(GGML_CUDA_USE_PDL) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER)
+# if (defined(GGML_CUDA_USE_PDL) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER)
 # define GGML_CUDA_RESTRICT
 # else
 # define GGML_CUDA_RESTRICT __restrict__
-# endif // defined(GGML_CUDA_USE_PDL) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
+# endif // defined(GGML_CUDA_USE_PDL) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
 
 template<typename Kernel, typename... Args>
 static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_kernel_launch_params & launch_params, Args&&... args) {

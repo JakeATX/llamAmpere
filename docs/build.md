@@ -116,6 +116,20 @@ This provides BLAS acceleration using only the CPU. Make sure to have OpenBLAS i
 
 Check [BLIS.md](./backend/BLIS.md) for more information.
 
+### AMD AOCL-BLAS
+
+For AMD CPU inference, the [ZenDNN backend](#zendnn) is recommended. AOCL-BLAS is also available as a vendor option for the generic `GGML_BLAS` backend.
+
+Source `amd-libs.cfg` from your AOCL install (MT tree by default), then build (CMake 3.27+ recommended for the `AOCL` / `AOCL_mt` vendors):
+
+```bash
+source /opt/aocl/<version>/aocc/MT/amd-libs.cfg   # adjust path; ST tree uses .../ST/amd-libs.cfg
+cmake -B build -DGGML_BLAS=ON -DGGML_BLAS_VENDOR=AOCL_mt -DBLAS_INCLUDE_DIRS="${AOCL_ROOT}/include" -DGGML_NATIVE=ON
+cmake --build build --config Release
+```
+
+Full steps, threading notes, and a fallback for older CMake: [AOCL.md](./backend/AOCL.md).
+
 ### Intel oneMKL
 
 Building through oneAPI compilers will make avx_vnni instruction set available for intel processors that do not support avx512 and avx512_vnni. Please note that this build config **does not support Intel GPU**. For Intel GPU support, please refer to [llama.cpp for SYCL](./backend/SYCL.md).
@@ -181,6 +195,16 @@ cmake -B build -DGGML_CUDA=ON
 cmake --build build --config Release
 ```
 
+To use a specific CCCL version instead of the one bundled with the installed CUDA Toolkit, add `-DGGML_CUDA_CCCL_VERSION=vMAJOR.MINOR.PATCH`. CUB DeviceTopK requires CCCL 3.4.3 or newer; older versions use the sort fallback.
+
+Note that this also builds the CPU backend by default. On Windows on ARM, MSVC's
+support for the ARM NEON intrinsics used by the CPU backend may be incomplete, so
+a CUDA build produced entirely with MSVC might have a slower CPU backend. If CPU
+performance matters, try following the split build used in our release workflow
+([.github/workflows/release.yml](../.github/workflows/release.yml)): the CPU backend
+is built with clang (`cmake/arm64-windows-llvm.cmake`) and the CUDA backend with MSVC
+(`cmake/arm64-windows-msvc-cuda.cmake`), and the artifacts are merged afterwards.
+
 ### Non-Native Builds
 
 By default llama.cpp will be built for the hardware that is connected to the system at that time.
@@ -219,6 +243,21 @@ GeForce RTX 3070      8.6
 ```bash
 cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="86;89"
 ```
+
+#### Ampere-only build (opt-in preset)
+
+```bash
+cmake --preset x64-linux-gcc-cuda-ampere-release
+cmake --build build-x64-linux-gcc-cuda-ampere-release --target llama-server
+```
+
+The preset sets `CMAKE_CUDA_ARCHITECTURES="80-real;86-real"`: sm_80 machine code for compute capability 8.0 and sm_86
+machine code for 8.6 and 8.7, with no PTX, so it does not run on GPUs outside compute capability 8.x. It shortens the
+build and shrinks the library file. It does not reduce VRAM: with lazy module loading (the default) the driver loads
+only the kernels that run, from the one image that matches the card. Measured on an RTX 3090 Ti with Qwen3.8-27B EXL3
+2.0 bpw at `-c 204800` and the MTP drafter, the process used the same VRAM to the MiB with this preset and with
+`CMAKE_CUDA_ARCHITECTURES=86` (10,506 MiB after boot, 10,568 MiB after an 8,192-token prompt and 512 generated tokens;
+kernel loading 30-32 MiB in both).
 
 ### Overriding the CUDA Version
 

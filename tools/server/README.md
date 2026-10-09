@@ -111,8 +111,8 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `-lv, --verbosity, --log-verbosity N` | Set the verbosity threshold. Messages with a higher verbosity will be ignored. Values:<br/> - 0: generic output<br/> - 1: error<br/> - 2: warning<br/> - 3: info<br/> - 4: trace (more info)<br/> - 5: debug<br/>(default: 3)<br/><br/>(env: LLAMA_ARG_LOG_VERBOSITY) |
 | `--log-prefix, --no-log-prefix` | Enable prefix in log messages<br/>(env: LLAMA_ARG_LOG_PREFIX) |
 | `--log-timestamps, --no-log-timestamps` | Enable timestamps in log messages<br/>(env: LLAMA_ARG_LOG_TIMESTAMPS) |
-| `--spec-draft-type-k, -ctkd, --cache-type-k-draft TYPE` | KV cache data type for K for the draft model<br/>allowed values: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1, turbo2 (tq2), turbo3 (tq3_0), turbo4 (tq4_0), turbo5 (tq5_0), turbo6 (tq6_0)<br/>(default: the main model's K cache type from -ctk; pass f16 to force f16)<br/>(env: LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_K) |
-| `--spec-draft-type-v, -ctvd, --cache-type-v-draft TYPE` | KV cache data type for V for the draft model<br/>allowed values: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1, turbo2 (tq2), turbo3 (tq3_0), turbo4 (tq4_0), turbo5 (tq5_0), turbo6 (tq6_0)<br/>(default: the main model's V cache type from -ctv; pass f16 to force f16)<br/>(env: LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V) |
+| `--spec-draft-type-k, -ctkd, --cache-type-k-draft TYPE` | KV cache data type for K for the draft model<br/>allowed values: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1, turbo2 (tq2), turbo3 (tq3_0), turbo4 (tq4_0), turbo5 (tq5_0), turbo6 (tq6_0)<br/>(default: the main model's K cache type from -ctk; tq5_0 for an MTP drafter over a SJ-KVaRN trunk; pass f16 to force f16)<br/>(env: LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_K) |
+| `--spec-draft-type-v, -ctvd, --cache-type-v-draft TYPE` | KV cache data type for V for the draft model<br/>allowed values: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1, turbo2 (tq2), turbo3 (tq3_0), turbo4 (tq4_0), turbo5 (tq5_0), turbo6 (tq6_0)<br/>(default: the main model's V cache type from -ctv; turbo4 for an MTP drafter over a SJ-KVaRN trunk; pass f16 to force f16)<br/>(env: LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V) |
 
 
 ### Sampling params
@@ -167,7 +167,10 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--kv-unified-per-slot N` | context limit per parallel slot (default: unset, behavior unchanged).<br/>when set without -c/--ctx-size, the shared KV pool is sized to n_parallel*N<br/>(env: LLAMA_ARG_KV_UNIFIED_PER_SLOT) |
 | `-ctxcp, --ctx-checkpoints, --swa-checkpoints N` | max number of context checkpoints to create per slot (default: 32)[(more info)](https://github.com/ggml-org/llama.cpp/pull/15293)<br/>(env: LLAMA_ARG_CTX_CHECKPOINTS) |
 | `-cms, --checkpoint-min-step N` | minimum spacing between context checkpoints in tokens (default: 8192, 0 = no minimum)<br/>(env: LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT) |
-| `-cram, --cache-ram N` | set the maximum cache size in MiB (default: 8192, -1 - no limit, 0 - disable)[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)<br/>(env: LLAMA_ARG_CACHE_RAM) |
+| `-cram, --cache-ram N` | maximum RAM size of the prompt cache in MiB (default: sized from total host RAM: <16 GB 2048, 16 GB 4096, 32 GB 8192, 64 GB 12288, 96 GB 16384, 128 GB+ 20480, at most half of the available memory at startup; -1 = half of the free host memory at startup, 0 = disable)[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)<br/>(env: LLAMA_ARG_CACHE_RAM) |
+| `--cache-disk-path PATH` | directory of the prompt-cache disk tier: entries evicted from the RAM cache (and the cache at shutdown) are written here and restored on a later cache miss or after a restart instead of re-processing the prompt; created if missing (default: $XDG_CACHE_HOME/llamampere/prompt-cache, else ~/.cache/llamampere/prompt-cache)<br/>(env: LLAMA_ARG_CACHE_DISK_PATH) |
+| `--cache-disk-limit N` | size limit of the prompt-cache disk tier in MiB; the oldest-written entries are deleted first; writes are skipped while the filesystem has less than max(10%, 8 GiB) free (default: 16384, -1 = no limit, the free-space guard still applies, 0 = disable the disk tier)<br/>(env: LLAMA_ARG_CACHE_DISK_LIMIT) |
+| `--no-cache-disk` | disable the prompt-cache disk tier (RAM cache only)<br/>(env: LLAMA_ARG_NO_CACHE_DISK) |
 | `-kvu, --kv-unified, -no-kvu, --no-kv-unified` | use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)<br/>(env: LLAMA_ARG_KV_UNIFIED) |
 | `--cache-idle-slots, --no-cache-idle-slots` | save idle slots to the prompt cache on new task, and clear them when using unified KV (default: enabled, requires cache-ram)<br/>(env: LLAMA_ARG_CACHE_IDLE_SLOTS) |
 | `--context-shift, --no-context-shift` | whether to use context shift on infinite text generation (default: disabled)<br/>(env: LLAMA_ARG_CONTEXT_SHIFT) |
@@ -219,6 +222,9 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--chat-template-kwargs STRING` | sets additional params for the json template parser, must be a valid json object string, e.g. '{"key1":"value1","key2":"value2"}'<br/>(env: LLAMA_ARG_CHAT_TEMPLATE_KWARGS) |
 | `-to, --timeout N` | server read/write timeout in seconds (default: 3600)<br/>(env: LLAMA_ARG_TIMEOUT) |
 | `--sse-ping-interval N` | server SSE ping interval in seconds (-1 = disabled, default: 30)<br/>(env: LLAMA_ARG_SSE_PING_INTERVAL) |
+| `--sse-ping-queued` | keep-alive for queued streaming requests: when no slot has started the request within one SSE ping interval, send the HTTP 200 headers and pings while it waits; an error raised after that is sent as an SSE error event instead of an HTTP error status (default: disabled)<br/>(env: LLAMA_ARG_SSE_PING_QUEUED) |
+| `--slot-stall-timeout N` | log a warning when a busy slot makes no progress (prompt or generated tokens) for N seconds while no other slot progresses either, including a decode that does not return; set N above the longest single batch (0 = disabled, default: 0)<br/>(env: LLAMA_ARG_SLOT_STALL_TIMEOUT) |
+| `--slot-stall-cancel` | with --slot-stall-timeout, also fail the stalled request with an error so that its client is released; the slot is freed once the main loop runs again (default: disabled)<br/>(env: LLAMA_ARG_SLOT_STALL_CANCEL) |
 | `--threads-http N` | number of threads used to process HTTP requests (default: -1)<br/>(env: LLAMA_ARG_THREADS_HTTP) |
 | `--cache-prompt, --no-cache-prompt` | whether to enable prompt caching (default: enabled)<br/>(env: LLAMA_ARG_CACHE_PROMPT) |
 | `--cache-reuse N` | min chunk size to attempt reusing from the cache via KV shifting, requires prompt caching to be enabled (default: 0)<br/>[(card)](https://ggml.ai/f0.png)<br/>(env: LLAMA_ARG_CACHE_REUSE) |
@@ -273,7 +279,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--spec-draft-device, -devd, --device-draft <dev1,dev2,..>` | comma-separated list of devices to use for offloading the draft model (none = don't offload, default: follows --device)<br/>use --list-devices to see a list of available devices |
 | `--spec-draft-ngl, -ngld, --gpu-layers-draft, --n-gpu-layers-draft N` | max. number of draft model layers to store in VRAM, either an exact number, 'auto', or 'all' (default: auto)<br/>(env: LLAMA_ARG_N_GPU_LAYERS_DRAFT) |
 | `--spec-draft-model, -md, --model-draft FNAME` | draft model for speculative decoding (default: unused)<br/>(env: LLAMA_ARG_SPEC_DRAFT_MODEL) |
-| `--spec-type none,draft-simple,draft-eagle3,draft-mtp,draft-mtp-adaptive,draft-dflash,draft-dspark,ngram-simple,ngram-map-k,ngram-map-k4v,ngram-mod,ngram-cache` | comma-separated list of types of speculative decoding to use (default: auto, i.e. the model's built-in drafter with its measured settings for qwen35 with an MTP head: draft-mtp, none for other models; any explicit value, including none, turns auto off, explicit --spec-draft-* values are kept)<br/><br/>(env: LLAMA_ARG_SPEC_TYPE) |
+| `--spec-type none,draft-simple,draft-eagle3,draft-mtp,draft-mtp-adaptive,draft-dflash,draft-dspark,ngram-simple,ngram-map-k,ngram-map-k4v,ngram-mod,ngram-cache` | comma-separated list of types of speculative decoding to use (default: auto, i.e. the model's built-in drafter with its measured settings for qwen35 with an MTP head: draft-mtp-adaptive, none for other models; any explicit value, including none, turns auto off, explicit --spec-draft-* values are kept)<br/><br/>(env: LLAMA_ARG_SPEC_TYPE) |
 | `--spec-ngram-mod-n-min N` | minimum number of ngram tokens to use for ngram-based speculative decoding (default: 48) |
 | `--spec-ngram-mod-n-max N` | maximum number of ngram tokens to use for ngram-based speculative decoding (default: 64) |
 | `--spec-ngram-mod-n-match N` | ngram-mod lookup length (default: 24) |
@@ -302,7 +308,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--gpt-oss-120b-default` | use gpt-oss-120b (note: can download weights from the internet) |
 | `--vision-gemma-4b-default` | use Gemma 3 4B QAT (note: can download weights from the internet) |
 | `--vision-gemma-12b-default` | use Gemma 3 12B QAT (note: can download weights from the internet) |
-| `--spec-default` | enable default speculative decoding config |
+| `--spec-default` | enable the n-gram speculative preset (--spec-type ngram-mod, n-match 24, n-min 48, n-max 64); this is not the per-family model default (e.g. the qwen35 MTP drafter), which it replaces like any explicit --spec-type |
 
 <!-- HELP_END -->
 
@@ -345,14 +351,15 @@ When `--spec-type` is not given, the server looks up the model family in a small
 
 | Family (`general.architecture`) | Condition | Default |
 |---|---|---|
-| `qwen35` (Qwen3.8) | `qwen35.nextn_predict_layers` > 0 and the MTP tensors are in the model file | `--spec-type draft-mtp --spec-draft-n-max 4 --spec-draft-p-min 0 --spec-draft-vocab-map auto` (fixed draft depth 4) |
+| `qwen35` (Qwen3.8) | `qwen35.nextn_predict_layers` > 0 and the MTP tensors are in the model file | `--spec-type draft-mtp-adaptive --spec-draft-n-max 4 --spec-draft-n-min-adaptive 3 --spec-draft-p-min 0 --spec-draft-vocab-map auto` |
 
 - The default is resolved from the GGUF header before `-fit` and the context sizing run, so the memory fit sees the drafter exactly as with the explicit flags.
-- The draft KV cache types are not set by the default: they follow `-ctk`/`-ctv` unless `--spec-draft-type-k`/`-v` is given.
-- Any explicit `--spec-type` (including `--spec-type none`), a draft model (`-md`), `--eagle3` or `--dflash` turns the default off. Explicit `--spec-draft-n-max`, `--spec-draft-n-min-adaptive`, `--spec-draft-p-min` and `--spec-draft-vocab-map` values are kept on top of it (e.g. `--spec-draft-n-max 3` alone gives a fixed depth of 3).
-- Adaptive depth 3-4 stays available as an explicit choice: `--spec-type draft-mtp-adaptive --spec-draft-n-max 4 --spec-draft-n-min-adaptive 3 --spec-draft-p-min 0`.
-- The server logs one line when the default applies, e.g. `speculative: MTP drafter on by default for qwen35 (nextn=1): draft-mtp, n-max 4, p-min 0, vocab map auto; --spec-type none disables`.
-- The same default applies to `llama-cli`, which runs the server in-process. Other tools (`llama-perplexity`, `llama-bench`, ...) are unaffected.
+- The draft KV cache types are not set by the default: they follow `-ctk`/`-ctv` unless `--spec-draft-type-k`/`-v` is given. Over a SJ-KVaRN trunk (`-ctk sj_kvarnN`), which a drafter cannot share, they default to `tq5_0`/`turbo4`.
+- Any explicit `--spec-type` (including `--spec-type none`), a draft model (`-md`), `--eagle3` or `--dflash` turns the default off. Explicit `--spec-draft-n-max`, `--spec-draft-n-min-adaptive`, `--spec-draft-p-min` and `--spec-draft-vocab-map` values are kept on top of it. When only `--spec-draft-n-max` is given, a smaller value also lowers the adaptive floor (e.g. `--spec-draft-n-max 2` gives n-max 2, n-min-adaptive 2).
+- The server logs one line when the default applies, e.g. `speculative: MTP drafter on by default for qwen35 (nextn=1): draft-mtp-adaptive, n-max 4, n-min-adaptive 3, p-min 0, vocab map auto; --spec-type none disables`.
+- `--spec-default` is not this default. It is the upstream n-gram preset (`--spec-type ngram-mod` with `--spec-ngram-mod-n-match 24 --spec-ngram-mod-n-min 48 --spec-ngram-mod-n-max 64`) and, like any explicit `--spec-type`, it replaces the MTP drafter default rather than adding to it.
+- To run without speculative decoding, pass `--spec-type none` (or set `LLAMA_ARG_SPEC_TYPE=none`). `--spec-draft-n-max 0` also keeps the default from applying.
+- The same default applies to `llama-cli`, which runs the server in-process. Other tools (`llama-perplexity`, `llama-bench`, `llama-kld-depth`, ...) are unaffected.
 
 ### Multimodal support
 
@@ -1268,6 +1275,30 @@ Returns information about the loaded model. See [OpenAI Models API documentation
 
 The returned list always has one single element. The `meta` field can be `null` (for example, while the model is still loading).
 
+Each object in `data` has an `architecture` object. It has two string arrays:
+
+- `input_modalities` lists what the model can read. It always has `text`, plus each media type that the model supports.
+- `output_modalities` lists what the model can produce.
+
+One output value is special:
+
+| Value | Meaning |
+|---|---|
+| `decisions` | The model is a native decision model. Serve it with [`/v1/systemone`](#post-v1systemone-typesafe-compatible-system-one-api). |
+
+A language model that classifies with prompts does not get `decisions`. Only native decision models do.
+
+Check for membership. Tolerate values that you do not know:
+
+```js
+const useSystemOne =
+    model.architecture?.output_modalities?.includes("decisions") === true;
+```
+
+Without decision metadata, `output_modalities` is `["text"]`. This default is for compatibility only. It does not mean that the model can generate text. Values can change. New combinations such as `["text", "decisions"]` use the same shape.
+
+The router returns the same `architecture` object in [`GET /models`](#get-models-list-available-models). You can find a native decision model without a probe or a model load. This works for unloaded and sleeping models too. Older servers can omit `architecture`. If it is absent, use the legacy behavior of your client.
+
 By default, model `id` field is the path to model file, specified via `-m`. You can set a custom value for model `id` field via `--alias` argument. For example, `--alias gpt-4o-mini`.
 
 Example:
@@ -1279,6 +1310,10 @@ Example:
         {
             "id": "../models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
             "object": "model",
+            "architecture": {
+                "input_modalities": ["text"],
+                "output_modalities": ["text"]
+            },
             "created": 1735142223,
             "owned_by": "llamacpp",
             "meta": {
@@ -1529,6 +1564,13 @@ This endpoint requires that the model uses a pooling different than type `none`.
 
 See [OpenAI Embeddings API documentation](https://platform.openai.com/docs/api-reference/embeddings).
 
+For multimodal models (loaded with `--mmproj`), each element of `input` can also be an object with a `content` array, using the same parts as `/v1/chat/completions`:
+- `{ "type": "text", "text": "..." }`: text is added to the prompt as-is
+- `{ "type": "image_url", "image_url": { "url": "..." } }`: remote URL, base64 data URI, or local file (`file://`, requires `--media-path`)
+- `{ "type": "input_audio", "input_audio": { "data": "..." } }` and `{ "type": "input_video", "input_video": { "url": "..." } }`: same as `/v1/chat/completions`, requires a model with audio or video support
+
+Each object gives one embedding. This input shape is not part of the OpenAI Embeddings API; it follows the shape used by providers like OpenRouter for vision embedding models.
+
 *Examples:*
 
 - input as string
@@ -1553,6 +1595,26 @@ See [OpenAI Embeddings API documentation](https://platform.openai.com/docs/api-r
   -d '{
           "input": ["hello", "world"],
           "model":"GPT-4",
+          "encoding_format": "float"
+  }'
+  ```
+
+- `input` as multimodal content
+
+  ```shell
+  curl http://localhost:8080/v1/embeddings \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer no-key" \
+  -d '{
+          "input": [
+              { "content": [
+                  { "type": "image_url", "image_url": { "url": "data:image/jpeg;base64,/9j/4AAQSkZJRg..." } },
+                  { "type": "text", "text": "Describe this image" }
+              ] },
+              { "content": [
+                  { "type": "text", "text": "hello" }
+              ] }
+          ],
           "encoding_format": "float"
   }'
   ```
@@ -1657,6 +1719,144 @@ curl http://localhost:8080/v1/messages/count_tokens \
 ```json
 {"input_tokens": 10}
 ```
+
+## TypeSafe-compatible API Endpoints
+
+### POST `/v1/systemone`: TypeSafe-compatible System One API
+
+Answers typed questions about a `state` with a decision model.
+
+Follows the [TypeSafe API](https://docs.typesafe.ai/api), streaming is not supported. Multimodal input is an extension to this API, see the [OpenJev multimodal API](https://jev-skills.github.io/openjev-multimodal/api) for reference.
+
+*Options:*
+
+`state`: The content to evaluate. Can be a string, an object or an array. A value that is not a string is given to the model as JSON text. For lfm2-d1 and lfm2-d1-omni, it can be `null`, for example to ask about images only.
+
+`files`: Optional. An array of input files, the maximum number may be limited depending on the model. Each one is a data URL (`data:image/...;base64,...`). For audio-capable models, it can be audio clips (`data:audio/...;base64,...`). See the image input section below.
+
+`images`: Optional. An alias of `files`.
+
+`questions`: An object that maps a question id to a question. Each question has these fields:
+
+- `type`: One of `choice`, `score`, `noul`.
+- `instructions`: The question. Can be a string, an object or an array.
+- `criteria`: The possible answers, the shape depends on `type`:
+  - `choice`: An object that maps each option to its description. The description can be `null`.
+  - `score`: An array of 2 to 10 level descriptions, lowest level first.
+  - `noul`: Optional. An object with the descriptions of `true` and `false`.
+
+The questions of a request are answered independently, an answer does not depend on the other questions. The exception is clef: it reads all the questions in one prompt and decides them jointly.
+
+The number of options of a `choice` question is limited by the model, for example: 52 for openjev, 255 for laya, clef, pplx-decider, lfm2-d1 and lfm2-d1-omni. For laya, long questions and options are truncated to the token budget the model was trained with.
+
+For laya, clef and lfm2-d1-omni, the whole prompt is evaluated in one batch: it must fit in `--ubatch-size`. An lfm2-d1-omni prompt is cut to 16384 tokens. A server that runs clef only serves this endpoint, text generation is not available.
+
+*Image input:*
+
+Image input needs a model that supports it (for example: openjev, clef, pplx-decider, lfm2-d1, lfm2-d1-omni) and its multimodal projector, see `--mmproj`.
+
+Images can be given in two ways, and both can be used in the same request:
+
+- The `files` field, or its alias `images`.
+- A `state` made of chat messages, either an array of messages or an object with a `messages` array. An `image_url` part in the `content` of a message is taken as an image, in the same format as chat completions. Only data URLs are accepted. For lfm2-d1-omni, an `input_audio` part is taken as an audio clip, as base64 data.
+
+All the images are placed before the state in the prompt, the ones from `files` and `images` first. The image parts are removed from the state.
+
+*Response:*
+
+`answers`: An object that maps each question id to its answer. The fields depend on the question type:
+
+- `choice`:
+  - `choice`: The option with the highest probability.
+  - `probabilities`: The probability of each option, they sum to 1.
+  - `confidence`: A value from 0 to 1, where 0 means all options are equally likely.
+- `score`:
+  - `score`: The expected level index, weighted by probability. It can be between two levels.
+  - `legend`: The description of each level index.
+  - `probabilities`: The probability of each level index, they sum to 1.
+  - `confidence`: A value from 0 to 1.
+- `noul`:
+  - `noul`: The probability that the answer is true.
+
+`usage`: `input_tokens` is the number of prompt tokens of all questions. `output_tokens` is always 0.
+
+The probabilities are scaled with the temperatures stored in the model file. They are not guaranteed to be calibrated for your data.
+
+*Examples:*
+
+```shell
+curl http://127.0.0.1:8080/v1/systemone \
+    -H "Content-Type: application/json" \
+    -d '{
+        "state": "Customer message: I was charged twice for my order last week and nobody has replied.",
+        "questions": {
+            "route": {
+                "type": "choice",
+                "instructions": "Which team should handle this?",
+                "criteria": {"billing": null, "shipping": null, "technical": null}
+            },
+            "angry": {
+                "type": "noul",
+                "instructions": "Is the customer angry?"
+            },
+            "urgency": {
+                "type": "score",
+                "instructions": "How urgent is this?",
+                "criteria": ["can wait", "this week", "today", "right now"]
+            }
+        }
+    }' | jq
+```
+
+Response (values are shortened):
+
+```json
+{
+  "model": "openjev",
+  "answers": {
+    "route": {
+      "type": "choice",
+      "choice": "billing",
+      "probabilities": {"billing": 0.9998, "shipping": 0.0001, "technical": 0.0001},
+      "confidence": 0.9997
+    },
+    "angry": {
+      "type": "noul",
+      "noul": 0.6328
+    },
+    "urgency": {
+      "type": "score",
+      "score": 2.0858,
+      "legend": {"0": "can wait", "1": "this week", "2": "today", "3": "right now"},
+      "probabilities": {"0": 0.0023, "1": 0.116, "2": 0.6753, "3": 0.2064},
+      "confidence": 0.673
+    }
+  },
+  "usage": {
+    "input_tokens": 239,
+    "output_tokens": 0
+  }
+}
+```
+
+Example with an image:
+
+```shell
+curl http://127.0.0.1:8080/v1/systemone \
+    -H "Content-Type: application/json" \
+    -d '{
+        "state": "The document was received by the accounting team this morning.",
+        "images": ["data:image/jpeg;base64,/9j/4AAQSkZJRg..."],
+        "questions": {
+            "has_table": {
+                "type": "noul",
+                "instructions": "Does the image contain a table?"
+            }
+        }
+    }' | jq
+```
+
+An invalid request returns the error `400`. A model that is not a decision model returns the error `501`. A request with images returns the error `501` if the model does not support image input, or if no multimodal projector is loaded.
 
 ## Server tools
 
@@ -1846,6 +2046,37 @@ Note:
     - If a model is running but updated or removed from the source, it will be unloaded
     - If a model is not running, it will be added or updated according to the source
 2. When the model is loaded, the info from `/v1/models` is forwarded to router's `/v1/models`. This includes metadata about the model and the runtime instance.
+
+Each object in `data` has the same `architecture` object as [`GET /v1/models`](#get-v1models-openai-compatible-model-info-api) of a direct server. The server computes both arrays offline. It does not load the model, download files, or run inference. `output_modalities` comes from the GGUF metadata. `input_modalities` comes from the projector file. A native decision model shows `decisions` before its first load, after unload, and while it sleeps:
+
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "my-decision-model",
+      "object": "model",
+      "tags": ["local"],
+      "architecture": {
+        "input_modalities": ["text"],
+        "output_modalities": ["decisions"]
+      },
+      "status": {
+        "value": "unloaded"
+      }
+    }
+  ]
+}
+```
+
+The values work like this:
+
+- A loaded model reports both arrays. Its values replace the cached values in full.
+- The cache keeps the values across sleep and unload. A known decision model stays advertised.
+- Before the first report, the values come from the offline computation.
+- Offline computation cannot see video. Only a loaded model reports `video` in `input_modalities`.
+- If the metadata or the model file is not available, both arrays are `["text"]`.
+- A source or preset refresh computes both arrays again. A replaced model does not keep old values.
 
 The `status` object can be:
 

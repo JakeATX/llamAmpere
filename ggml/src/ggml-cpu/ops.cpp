@@ -1,7 +1,9 @@
 #include "ops.h"
+#include "../ggml-sjkvarn.h"
 
 #include "ggml-cpu.h"
 #include "ggml-impl.h"
+#include "ggml-quants.h"
 #include "binary-ops.h"
 #include "simd-gemm.h"
 #include "ggml.h"
@@ -11,6 +13,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <mutex>
 
 extern "C" {
 // Declaration only. The definition lives in ggml-turbo-quant.c (libggml-base).
@@ -326,6 +329,31 @@ static void ggml_compute_forward_dup_to_q(
                 id += rs * (ne01 - ir1);
             }
         }
+    } else if (ggml_are_same_shape(src0, dst) &&
+            nb0 == ggml_type_size(dst->type) && ne00 % ggml_blck_size(dst->type) == 0 &&
+            ggml_get_type_traits_cpu(dst->type)->from_float) {
+        // same shape, strided destination rows (e.g. a view of a quantized recurrent state cache
+        // with a plane stride): quantize row by row into each destination row
+        ggml_from_float_t const quantize_row_q = ggml_get_type_traits_cpu(dst->type)->from_float;
+        float * src0_f32 = (float *) params->wdata + (ne00 + CACHE_LINE_SIZE_F32) * ith;
+
+        const int64_t nr_all = ne01*ne02*ne03;
+        const int64_t dr_all = (nr_all + nth - 1) / nth;
+        const int64_t jr0    = dr_all * ith;
+        const int64_t jr1    = MIN(jr0 + dr_all, nr_all);
+
+        for (int64_t ir = jr0; ir < jr1; ++ir) {
+            const int64_t i03 = ir/(ne02*ne01);
+            const int64_t i02 = (ir - i03*ne02*ne01)/ne01;
+            const int64_t i01 = ir - i03*ne02*ne01 - i02*ne01;
+
+            const char * src0_row = (const char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03;
+            for (int64_t i00 = 0; i00 < ne00; i00++) {
+                src0_f32[i00] = type_conversion_table<src_t>::to_f32(*(const src_t *) (src0_row + i00*nb00));
+            }
+
+            quantize_row_q(src0_f32, (char *) dst->data + i01*nb1 + i02*nb2 + i03*nb3, ne00);
+        }
     } else {
         // printf("%s %s\n", ggml_type_name(src0->type), ggml_type_name(dst->type));
         GGML_ABORT("not implemented");
@@ -487,20 +515,22 @@ static void ggml_compute_forward_dup_from_q(
               ggml_tensor * dst) {
 
     const ggml_tensor * src0 = dst->src[0];
-    const ggml_tensor * src1 = dst->src[1];
 
-    GGML_TENSOR_BINARY_OP_LOCALS
+    // address the destination through dst itself, not src[1]: for a cpy node src[1] has dst's shape
+    // and strides, but ggml_cast's src[1] self-reference comes back NULL from ggml_backend_graph_copy
+    // (a node's copy is registered only after its sources are duplicated)
+    GGML_TENSOR_UNARY_OP_LOCALS
 
     const ggml_type type = src0->type;
     ggml_to_float_t const dequantize_row_q = ggml_get_type_traits(type)->to_float;
 
     size_t qk = ggml_blck_size(type);
-    const int64_t nr = ggml_nelements(src1) / qk;
+    const int64_t nr = ggml_nelements(dst) / qk;
 
     // destination must be contiguous in the first dimension
-    GGML_ASSERT(nb10 == ggml_type_size(dst->type));
+    GGML_ASSERT(nb0 == ggml_type_size(dst->type));
     // must either have first dimension large enough to hold a row, or fully contiguous
-    GGML_ASSERT((ne10 % qk) == 0 || ggml_is_contiguous(dst));
+    GGML_ASSERT((ne0 % qk) == 0 || ggml_is_contiguous(dst));
 
     const int ith = params->ith;
     const int nth = params->nth;
@@ -521,11 +551,11 @@ static void ggml_compute_forward_dup_from_q(
         const int64_t i00 = i - i03*ne00*ne01*ne02 - i02*ne01*ne00 - i01*ne00;
         const int64_t x_offset = (i00/qk)*nb00 + i01*nb01 + i02*nb02 + i03 * nb03;
 
-        const int64_t i13 = i/(ne10 * ne11 * ne12);
-        const int64_t i12 = (i - i13*ne10*ne11*ne12) / (ne10*ne11);
-        const int64_t i11 = (i - i13*ne10*ne11*ne12 - i12*ne10*ne11) / ne10;
-        const int64_t i10 = i - i13*ne10*ne11*ne12 - i12*ne10*ne11 - i11*ne10;
-        const int64_t dst_offset = i10*nb10 + i11*nb11 + i12*nb12 + i13*nb13;
+        const int64_t i13 = i/(ne0 * ne1 * ne2);
+        const int64_t i12 = (i - i13*ne0*ne1*ne2) / (ne0*ne1);
+        const int64_t i11 = (i - i13*ne0*ne1*ne2 - i12*ne0*ne1) / ne0;
+        const int64_t i10 = i - i13*ne0*ne1*ne2 - i12*ne0*ne1 - i11*ne0;
+        const int64_t dst_offset = i10*nb0 + i11*nb1 + i12*nb2 + i13*nb3;
 
         dequantize_row_q(
                 (const void *) ((char *) src0->data + x_offset),
@@ -2134,6 +2164,46 @@ void ggml_compute_forward_concat(
     }
 }
 
+// row loop shared by the BF16 unary ops
+template <void (*vec_op)(const int, ggml_bf16_t *, const ggml_bf16_t *)>
+static void ggml_compute_forward_unary_bf16_rows(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+
+    assert(ggml_is_contiguous_rows(src0));
+    assert(ggml_are_same_shape(src0, dst));
+
+    GGML_TENSOR_LOCALS(int64_t, ne0, src0, ne)
+    GGML_TENSOR_LOCALS(size_t,  nb0, src0, nb)
+    GGML_TENSOR_LOCALS(int64_t, ne,  dst,  ne)
+    GGML_TENSOR_LOCALS(size_t,  nb,  dst,  nb)
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int nc = src0->ne[0];
+    const int nr = ggml_nrows(src0);
+
+    // rows per thread
+    const int dr = (nr + nth - 1)/nth;
+
+    // row range for this thread
+    const int ir0 = dr*ith;
+    const int ir1 = MIN(ir0 + dr, nr);
+
+    for (int ir = ir0; ir < ir1; ++ir) {
+        const int i3 = ir/(ne02*ne01);
+        const int i2 = (ir - i3*ne02*ne01)/ne01;
+        const int i1 = (ir - i3*ne02*ne01 - i2*ne01);
+
+        vec_op(nc,
+                (ggml_bf16_t *) ((char *) dst->data  + i3*nb3  + i2*nb2  + i1*nb1),
+                (ggml_bf16_t *) ((char *) src0->data + i3*nb03 + i2*nb02 + i1*nb01));
+    }
+}
+
 // ggml_compute_forward_gelu
 
 static void ggml_compute_forward_gelu_f32(
@@ -2231,6 +2301,12 @@ static void ggml_compute_forward_gelu_f16(
     }
 }
 
+static void ggml_compute_forward_gelu_bf16(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    ggml_compute_forward_unary_bf16_rows<ggml_vec_gelu_bf16>(params, dst);
+}
+
 static void ggml_compute_forward_gelu(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
@@ -2245,6 +2321,10 @@ static void ggml_compute_forward_gelu(
         case GGML_TYPE_F16:
             {
                 ggml_compute_forward_gelu_f16(params, dst);
+            } break;
+        case GGML_TYPE_BF16:
+            {
+                ggml_compute_forward_gelu_bf16(params, dst);
             } break;
         default:
             {
@@ -2293,6 +2373,56 @@ static void ggml_compute_forward_fill_f16(const ggml_compute_params * params, gg
     }
 }
 
+static void ggml_compute_forward_fill_bf16(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_bf16_t c = GGML_FP32_TO_BF16(ggml_get_op_params_f32(dst, 0));
+
+    GGML_TENSOR_LOCALS(int64_t, ne, dst, ne);
+    GGML_TENSOR_LOCALS(size_t,  nb, dst, nb);
+
+    const auto [ir0, ir1] = get_thread_range(params, dst);
+
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t i03 = ir/(ne2*ne1);
+        const int64_t i02 = (ir - i03*ne2*ne1)/ne1;
+        const int64_t i01 = (ir - i03*ne2*ne1 - i02*ne1);
+
+        ggml_bf16_t * dst_ptr  = (ggml_bf16_t *) ((char *) dst->data + i03*nb3 + i02*nb2 + i01*nb1);
+
+        ggml_vec_set_bf16(ne0, dst_ptr, c);
+    }
+}
+
+// quantized fill: every block holds the same values, so quantize one block and replicate its bytes
+static void ggml_compute_forward_fill_quant(const ggml_compute_params * params, ggml_tensor * dst) {
+    const float c = ggml_get_op_params_f32(dst, 0);
+
+    GGML_TENSOR_LOCALS(int64_t, ne, dst, ne);
+    GGML_TENSOR_LOCALS(size_t,  nb, dst, nb);
+
+    const int64_t blck = ggml_blck_size(dst->type);
+    const size_t  bsz  = ggml_type_size(dst->type);
+    GGML_ASSERT(ne0 % blck == 0 && blck <= 256 && bsz <= 512);
+
+    float   vals[256];
+    uint8_t block[512];
+    std::fill(vals, vals + blck, c);
+    ggml_get_type_traits_cpu(dst->type)->from_float(vals, block, blck);
+
+    const auto [ir0, ir1] = get_thread_range(params, dst);
+
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t i03 = ir/(ne2*ne1);
+        const int64_t i02 = (ir - i03*ne2*ne1)/ne1;
+        const int64_t i01 = (ir - i03*ne2*ne1 - i02*ne1);
+
+        char * dst_ptr = (char *) dst->data + i03*nb3 + i02*nb2 + i01*nb1;
+
+        for (int64_t ib = 0; ib < ne0/blck; ++ib) {
+            memcpy(dst_ptr + ib*bsz, block, bsz);
+        }
+    }
+}
+
 void ggml_compute_forward_fill(const ggml_compute_params * params, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
 
@@ -2304,6 +2434,14 @@ void ggml_compute_forward_fill(const ggml_compute_params * params, ggml_tensor *
         case GGML_TYPE_F16:
             {
                 ggml_compute_forward_fill_f16(params, dst);
+            } break;
+        case GGML_TYPE_BF16:
+            {
+                ggml_compute_forward_fill_bf16(params, dst);
+            } break;
+        case GGML_TYPE_Q8_0:
+            {
+                ggml_compute_forward_fill_quant(params, dst);
             } break;
         default:
             {
@@ -2461,6 +2599,12 @@ static void ggml_compute_forward_gelu_erf_f16(
     }
 }
 
+static void ggml_compute_forward_gelu_erf_bf16(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    ggml_compute_forward_unary_bf16_rows<ggml_vec_gelu_erf_bf16>(params, dst);
+}
+
 static void ggml_compute_forward_gelu_erf(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
@@ -2475,6 +2619,10 @@ static void ggml_compute_forward_gelu_erf(
         case GGML_TYPE_F16:
             {
                 ggml_compute_forward_gelu_erf_f16(params, dst);
+            } break;
+        case GGML_TYPE_BF16:
+            {
+                ggml_compute_forward_gelu_erf_bf16(params, dst);
             } break;
         default:
             {
@@ -2580,6 +2728,12 @@ static void ggml_compute_forward_gelu_quick_f16(
     }
 }
 
+static void ggml_compute_forward_gelu_quick_bf16(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    ggml_compute_forward_unary_bf16_rows<ggml_vec_gelu_quick_bf16>(params, dst);
+}
+
 static void ggml_compute_forward_gelu_quick(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
@@ -2594,6 +2748,10 @@ static void ggml_compute_forward_gelu_quick(
         case GGML_TYPE_F16:
             {
                 ggml_compute_forward_gelu_quick_f16(params, dst);
+            } break;
+        case GGML_TYPE_BF16:
+            {
+                ggml_compute_forward_gelu_quick_bf16(params, dst);
             } break;
         default:
             {
@@ -2699,6 +2857,12 @@ static void ggml_compute_forward_silu_f16(
     }
 }
 
+static void ggml_compute_forward_silu_bf16(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    ggml_compute_forward_unary_bf16_rows<ggml_vec_silu_bf16>(params, dst);
+}
+
 static void ggml_compute_forward_silu(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
@@ -2713,6 +2877,10 @@ static void ggml_compute_forward_silu(
         case GGML_TYPE_F16:
             {
                 ggml_compute_forward_silu_f16(params, dst);
+            } break;
+        case GGML_TYPE_BF16:
+            {
+                ggml_compute_forward_silu_bf16(params, dst);
             } break;
         default:
             {
@@ -2917,6 +3085,59 @@ void ggml_compute_forward_silu_back(
 
 // ggml_compute_forward_reglu
 
+// row loop shared by the BF16 GLU ops
+template <void (*vec_op)(const int, ggml_bf16_t *, const ggml_bf16_t *, const ggml_bf16_t *)>
+static void ggml_compute_forward_glu_bf16_rows(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    char * src0_d = (char *) src0->data;
+    char * src1_d = (char *) (src1 ? src1->data : src0->data);
+    const size_t src0_o = src0->nb[1];
+    const size_t src1_o = src1 ? src1->nb[1] : src0->nb[1];
+
+    GGML_ASSERT(ggml_is_contiguous_1(src0));
+    GGML_ASSERT(ggml_is_contiguous_1(dst));
+
+    if (src1) {
+        GGML_ASSERT(ggml_is_contiguous_1(src1));
+        GGML_ASSERT(src0->type == src1->type);
+    }
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int nc = src1 ? src0->ne[0] : src0->ne[0] / 2;
+    const int nr = ggml_nrows(src0);
+
+    GGML_ASSERT(dst->ne[0] == nc);
+    GGML_ASSERT(ggml_nrows(dst) == nr);
+
+    const int32_t swapped = ggml_get_op_params_i32(dst, 1);
+
+    // rows per thread
+    const int dr = (nr + nth - 1)/nth;
+
+    // row range for this thread
+    const int ir0 = dr*ith;
+    const int ir1 = MIN(ir0 + dr, nr);
+
+    for (int i1 = ir0; i1 < ir1; i1++) {
+        const ggml_bf16_t * src0_p = (const ggml_bf16_t *) (src0_d + i1*src0_o);
+        const ggml_bf16_t * src1_p = (const ggml_bf16_t *) (src1_d + i1*src1_o);
+        ggml_bf16_t       * dst_p  = (ggml_bf16_t *) ((char *) dst->data + i1*(dst->nb[1]));
+
+        if (!src1) {
+            src0_p += swapped ? nc : 0;
+            src1_p += swapped ? 0 : nc;
+        }
+
+        vec_op(nc, dst_p, src0_p, src1_p);
+    }
+}
+
 static void ggml_compute_forward_reglu_f32(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
@@ -3036,6 +3257,12 @@ static void ggml_compute_forward_reglu_f16(
     }
 }
 
+static void ggml_compute_forward_reglu_bf16(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    ggml_compute_forward_glu_bf16_rows<ggml_vec_reglu_bf16>(params, dst);
+}
+
 static void ggml_compute_forward_reglu(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
@@ -3050,6 +3277,10 @@ static void ggml_compute_forward_reglu(
         case GGML_TYPE_F16:
             {
                 ggml_compute_forward_reglu_f16(params, dst);
+            } break;
+        case GGML_TYPE_BF16:
+            {
+                ggml_compute_forward_reglu_bf16(params, dst);
             } break;
         default:
             {
@@ -3179,6 +3410,12 @@ static void ggml_compute_forward_geglu_f16(
     }
 }
 
+static void ggml_compute_forward_geglu_bf16(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    ggml_compute_forward_glu_bf16_rows<ggml_vec_geglu_bf16>(params, dst);
+}
+
 static void ggml_compute_forward_geglu(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
@@ -3193,6 +3430,10 @@ static void ggml_compute_forward_geglu(
         case GGML_TYPE_F16:
             {
                 ggml_compute_forward_geglu_f16(params, dst);
+            } break;
+        case GGML_TYPE_BF16:
+            {
+                ggml_compute_forward_geglu_bf16(params, dst);
             } break;
         default:
             {
@@ -3322,6 +3563,12 @@ static void ggml_compute_forward_swiglu_f16(
     }
 }
 
+static void ggml_compute_forward_swiglu_bf16(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    ggml_compute_forward_glu_bf16_rows<ggml_vec_swiglu_bf16>(params, dst);
+}
+
 static void ggml_compute_forward_swiglu(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
@@ -3336,6 +3583,10 @@ static void ggml_compute_forward_swiglu(
         case GGML_TYPE_F16:
             {
                 ggml_compute_forward_swiglu_f16(params, dst);
+            } break;
+        case GGML_TYPE_BF16:
+            {
+                ggml_compute_forward_swiglu_bf16(params, dst);
             } break;
         default:
             {
@@ -3685,6 +3936,12 @@ static void ggml_compute_forward_geglu_erf_f16(
     }
 }
 
+static void ggml_compute_forward_geglu_erf_bf16(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    ggml_compute_forward_glu_bf16_rows<ggml_vec_geglu_erf_bf16>(params, dst);
+}
+
 static void ggml_compute_forward_geglu_erf(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
@@ -3699,6 +3956,10 @@ static void ggml_compute_forward_geglu_erf(
         case GGML_TYPE_F16:
             {
                 ggml_compute_forward_geglu_erf_f16(params, dst);
+            } break;
+        case GGML_TYPE_BF16:
+            {
+                ggml_compute_forward_geglu_erf_bf16(params, dst);
             } break;
         default:
             {
@@ -3828,6 +4089,12 @@ static void ggml_compute_forward_geglu_quick_f16(
     }
 }
 
+static void ggml_compute_forward_geglu_quick_bf16(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    ggml_compute_forward_glu_bf16_rows<ggml_vec_geglu_quick_bf16>(params, dst);
+}
+
 static void ggml_compute_forward_geglu_quick(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
@@ -3842,6 +4109,10 @@ static void ggml_compute_forward_geglu_quick(
         case GGML_TYPE_F16:
             {
                 ggml_compute_forward_geglu_quick_f16(params, dst);
+            } break;
+        case GGML_TYPE_BF16:
+            {
+                ggml_compute_forward_geglu_quick_bf16(params, dst);
             } break;
         default:
             {
@@ -4778,6 +5049,44 @@ static void ggml_compute_forward_scale_f32(
     }
 }
 
+static void ggml_compute_forward_scale_bf16(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+
+    GGML_ASSERT(ggml_is_contiguous(src0));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+    GGML_ASSERT(ggml_are_same_shape(src0, dst));
+
+    float s; // scale factor
+    float b; // bias
+
+    memcpy(&s, (float *) dst->op_params + 0, sizeof(float));
+    memcpy(&b, (float *) dst->op_params + 1, sizeof(float));
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int nc = src0->ne[0];
+    const int nr = ggml_nrows(src0);
+
+    // rows per thread
+    const int dr = (nr + nth - 1)/nth;
+
+    // row range for this thread
+    const int ir0 = dr*ith;
+    const int ir1 = MIN(ir0 + dr, nr);
+
+    for (int i1 = ir0; i1 < ir1; i1++) {
+        const ggml_bf16_t * x = (const ggml_bf16_t *) ((const char *) src0->data + i1*src0->nb[1]);
+        ggml_bf16_t       * y = (ggml_bf16_t *)       ((char *)       dst->data  + i1*dst->nb[1]);
+        for (int k = 0; k < nc; k++) {
+            y[k] = GGML_FP32_TO_BF16(s*GGML_BF16_TO_FP32(x[k]) + b);
+        }
+    }
+}
+
 void ggml_compute_forward_scale(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
@@ -4788,6 +5097,10 @@ void ggml_compute_forward_scale(
         case GGML_TYPE_F32:
             {
                 ggml_compute_forward_scale_f32(params, dst);
+            } break;
+        case GGML_TYPE_BF16:
+            {
+                ggml_compute_forward_scale_bf16(params, dst);
             } break;
         default:
             {
@@ -5295,7 +5608,9 @@ static void ggml_compute_forward_set_rows_impl(
 
     const size_t rs = ggml_row_size(src0->type, nc);
 
-    ggml_from_float_t const from_float = ggml_get_type_traits_cpu(dst->type)->from_float;
+    ggml_from_float_t const from_float = (dst->type == GGML_TYPE_TQ6_0 && ggml_get_op_params_i32(dst, 1) == 1)
+        ? (ggml_from_float_t) quantize_row_tq6_0_rotated_ref
+        : ggml_get_type_traits_cpu(dst->type)->from_float;
 
     // For turbo types: communicate WHT group size to the quantize function via global
     if (dst->type == GGML_TYPE_TURBO2_0 || dst->type == GGML_TYPE_TURBO3_0 || dst->type == GGML_TYPE_TURBO4_0 ||
@@ -5315,6 +5630,21 @@ static void ggml_compute_forward_set_rows_impl(
                 const int64_t i1 = *(idx_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
 
                 GGML_ASSERT(i1 >= 0 && i1 < ne1);
+
+                const int sink = ggml_get_op_params_i32(dst, 2);
+                if (sink > 0 && i1 < sink) {
+                    GGML_ASSERT(ne02 == 1 && ne03 == 1);
+                    const size_t offset = (size_t) ggml_get_op_params_i32(dst, 3)*nb1;
+                    GGML_ASSERT(offset + (size_t) sink*nc*sizeof(ggml_fp16_t) <= ggml_nbytes(dst));
+                    auto * out = (ggml_fp16_t *) ((char *) dst->data + offset) + i1*nc;
+                    const auto * in = (const src_t *) ((const char *) src0->data + i*nb01);
+                    if constexpr (std::is_same_v<src_t, float>) {
+                        ggml_fp32_to_fp16_row(in, out, nc);
+                    } else {
+                        memcpy(out, in, nc*sizeof(ggml_fp16_t));
+                    }
+                    continue;
+                }
 
                 if constexpr (std::is_same_v<src_t, float>) {
                     from_float(
@@ -5342,12 +5672,19 @@ static void ggml_compute_forward_set_rows_impl(
     }
 }
 
+// SJ-KVaRN fused write rotation (#139), defined beside the turbo WHT below
+static bool ggml_compute_forward_set_rows_sj_kvarn_rot(const ggml_compute_params * params, ggml_tensor * dst);
+
 void ggml_compute_forward_set_rows(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
 
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
+
+    if (ggml_compute_forward_set_rows_sj_kvarn_rot(params, dst)) {
+        return;
+    }
 
     switch (src0->type) {
         case GGML_TYPE_F32:
@@ -5400,6 +5737,8 @@ static void ggml_compute_forward_get_rows_back_f32_f16(
     for (int i = 0; i < nr; ++i) {
         const int r = ((int32_t *) src1->data)[i];
 
+        GGML_ASSERT(r >= 0 && r < dst->ne[1]);
+
         for (int j = 0; j < nc; ++j) {
             ggml_fp16_t v = ((ggml_fp16_t *) ((char *) src0->data + i*src0->nb[1]))[j];
             ((float *) ((char *) dst->data + r*dst->nb[1]))[j] += GGML_CPU_FP16_TO_FP32(v);
@@ -5432,6 +5771,8 @@ static void ggml_compute_forward_get_rows_back_f32(
 
     for (int i = 0; i < nr; ++i) {
         const int r = ((int32_t *) src1->data)[i];
+
+        GGML_ASSERT(r >= 0 && r < dst->ne[1]);
 
         ggml_vec_add_f32(nc,
                 (float *) ((char *)  dst->data + r*dst->nb[1]),
@@ -5832,11 +6173,10 @@ static void ggml_compute_forward_soft_max_ext_back_f32(
 
         // linear runtime, no additional memory
         float dot_y_dy = 0;
-        ggml_vec_dot_f32  (nc, &dot_y_dy, 0, y, 0, dy, 0, 1);
-        ggml_vec_cpy_f32  (nc, dx, dy);
-        ggml_vec_acc1_f32 (nc, dx, -dot_y_dy);
-        ggml_vec_mul_f32  (nc, dx, dx, y);
-        ggml_vec_scale_f32(nc, dx, scale);
+        ggml_vec_dot_f32(nc, &dot_y_dy, 0, y, 0, dy, 0, 1);
+        for (int i = 0; i < nc; i++) {
+            dx[i] = scale * (dy[i] - dot_y_dy) * y[i];
+        }
 
 #ifndef NDEBUG
         for (int i = 0; i < nc; ++i) {
@@ -5884,18 +6224,18 @@ static void ggml_compute_forward_clamp_f32(
     const int n  = ggml_nrows(src0);
     const int nc = src0->ne[0];
 
-    const size_t nb00 = src0->nb[0];
-    const size_t nb01 = src0->nb[1];
-
-    const size_t nb0 = dst->nb[0];
-    const size_t nb1 = dst->nb[1];
+    GGML_TENSOR_UNARY_OP_LOCALS
 
     GGML_ASSERT( nb0 == sizeof(float));
     GGML_ASSERT(nb00 == sizeof(float));
 
     for (int j = ith; j < n; j += nth) {
-        float * dst_ptr  = (float *) ((char *)  dst->data + j*nb1);
-        float * src0_ptr = (float *) ((char *) src0->data + j*nb01);
+        const int64_t i1 = j % ne01;
+        const int64_t i2 = (j / ne01) % ne02;
+        const int64_t i3 = j / (ne01*ne02);
+
+        float * dst_ptr  = (float *) ((char *)  dst->data + i1*nb1  + i2*nb2  + i3*nb3);
+        float * src0_ptr = (float *) ((char *) src0->data + i1*nb01 + i2*nb02 + i3*nb03);
 
         for (int i = 0; i < nc; i++) {
             dst_ptr[i] = MAX(MIN(src0_ptr[i], max), min);
@@ -5920,18 +6260,18 @@ static void ggml_compute_forward_clamp_f16(
     const int n  = ggml_nrows(src0);
     const int nc = src0->ne[0];
 
-    const size_t nb00 = src0->nb[0];
-    const size_t nb01 = src0->nb[1];
-
-    const size_t nb0 = dst->nb[0];
-    const size_t nb1 = dst->nb[1];
+    GGML_TENSOR_UNARY_OP_LOCALS
 
     GGML_ASSERT( nb0 == sizeof(ggml_fp16_t));
     GGML_ASSERT(nb00 == sizeof(ggml_fp16_t));
 
     for (int j = ith; j < n; j += nth) {
-        ggml_fp16_t * dst_ptr  = (ggml_fp16_t *) ((char *)  dst->data + j*nb1);
-        ggml_fp16_t * src0_ptr = (ggml_fp16_t *) ((char *) src0->data + j*nb01);
+        const int64_t i1 = j % ne01;
+        const int64_t i2 = (j / ne01) % ne02;
+        const int64_t i3 = j / (ne01*ne02);
+
+        ggml_fp16_t * dst_ptr  = (ggml_fp16_t *) ((char *)  dst->data + i1*nb1  + i2*nb2  + i3*nb3);
+        ggml_fp16_t * src0_ptr = (ggml_fp16_t *) ((char *) src0->data + i1*nb01 + i2*nb02 + i3*nb03);
 
         for (int i = 0; i < nc; i++) {
             float v = GGML_CPU_FP16_TO_FP32(src0_ptr[i]);
@@ -9098,6 +9438,11 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
             simd_gemm(KQ, (const float *)Q_q, K_f32, Q_TILE_SZ, DK, KV_TILE_SZ);
             ggml_vec_scale_f32(Q_TILE_SZ * KV_TILE_SZ, KQ, scale);
 
+            if (logit_softcap != 0.0f) {
+                ggml_vec_tanh_f32(Q_TILE_SZ * KV_TILE_SZ, KQ, KQ);
+                ggml_vec_scale_f32(Q_TILE_SZ * KV_TILE_SZ, KQ, logit_softcap);
+            }
+
             // Set padded KQ entries to -inf so softmax gives them zero weight
             if (kv_tile < KV_TILE_SZ) {
                 for (int tq = 0; tq < Q_TILE_SZ; tq++) {
@@ -9105,11 +9450,6 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
                         KQ[tq * KV_TILE_SZ + tk] = -INFINITY;
                     }
                 }
-            }
-
-            if (logit_softcap != 0.0f) {
-                ggml_vec_tanh_f32(Q_TILE_SZ * KV_TILE_SZ, KQ, KQ);
-                ggml_vec_scale_f32(Q_TILE_SZ * KV_TILE_SZ, KQ, logit_softcap);
             }
 
             if (mask) {
@@ -9381,7 +9721,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
                                 kv_is_f32_or_f16 &&
                                 k->type == v->type &&
                                 neq1 >= Q_TILE_SZ);
-#ifdef GGML_SIMD
+#if defined(GGML_SIMD) && !defined(__x86_64__) && !defined(_M_X64)
 #if defined(__ARM_FEATURE_SVE)
         const int64_t f32_epr = svcntw();
 #else
@@ -9406,9 +9746,178 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     }
 }
 
+// SJ-KVaRN region-aware attention reference: exact rows for the sink and the ring, sealed records for the
+// body, causal by position. Scalar and slow; the CUDA kernel is checked against this path.
+static void ggml_compute_forward_flash_attn_ext_sj_kvarn(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * q     = dst->src[0];
+    const ggml_tensor * k     = dst->src[1];
+    const ggml_tensor * v     = dst->src[2];
+    const ggml_tensor * mask  = dst->src[3];
+    const ggml_tensor * sinks = dst->src[4];
+    const ggml_tensor * body  = dst->src[5];
+    const ggml_tensor * desc  = dst->src[6];
+
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT((k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_Q8_0 || k->type == GGML_TYPE_TQ6_0) && k->type == v->type);
+    GGML_ASSERT(q->ne[3] == 1 && k->ne[3] == 1);
+
+    const int32_t * dd = (const int32_t *) desc->data;
+    const int32_t S = dd[GGML_SJKVARN_DESC_S], cap = dd[GGML_SJKVARN_DESC_CAP], B = dd[GGML_SJKVARN_DESC_B];
+    const int32_t N = dd[GGML_SJKVARN_DESC_N], qpos0 = dd[GGML_SJKVARN_DESC_QPOS0], G = dd[GGML_SJKVARN_DESC_G];
+    const int32_t D = dd[GGML_SJKVARN_DESC_D], hkv = dd[GGML_SJKVARN_DESC_HKV];
+    const size_t rec_bytes = (size_t) dd[GGML_SJKVARN_DESC_RECBYTES];
+    GGML_ASSERT(mask == NULL || (mask->type == GGML_TYPE_F16 && mask->ne[0] >= N));
+
+    const int32_t bits = ggml_get_op_params_i32(dst, 5);
+    const int bits_k = bits >> 8, bits_v = bits & 0xff;
+    const ggml_sj_kvarn::layout l = ggml_sj_kvarn::make_layout(D, G, bits_k, bits_v);
+    const bool turbo4_body  = dd[GGML_SJKVARN_DESC_BODY_TYPE] == GGML_TYPE_TURBO4_0;
+    const bool trellis_body = dd[GGML_SJKVARN_DESC_BODY_TYPE] == GGML_TYPE_I16;
+    GGML_ASSERT((turbo4_body ? 2*G*ggml_row_size(GGML_TYPE_TURBO4_0, D) : l.bytes) == rec_bytes);
+    GGML_ASSERT(q->ne[0] == D && k->ne[0] == D && v->ne[0] == D);
+    GGML_ASSERT(k->ne[2] == hkv && k->ne[1] >= S + cap);
+    GGML_ASSERT(B >= S || B == 0);
+    GGML_ASSERT((B - S) % G == 0 || B == 0);
+
+    float scale = 1.0f, max_bias = 0.0f, logit_softcap = 0.0f;
+    memcpy(&scale,         (float *) dst->op_params + 0, sizeof(float));
+    memcpy(&max_bias,      (float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (float *) dst->op_params + 2, sizeof(float));
+    GGML_ASSERT(max_bias == 0.0f);
+    if (logit_softcap != 0.0f) {
+        scale /= logit_softcap;
+    }
+
+    const int64_t n_q   = q->ne[1];
+    const int64_t n_h   = q->ne[2];
+    const int64_t gqa   = n_h / hkv;
+    const int64_t nrows = n_q * n_h;
+
+    std::vector<float> krow(D), vrow(D), acc(D);
+
+    // fused rotation (ggml_flash_attn_ext_set_sj_kvarn_rot): plain H256/16 on Q and on the output, same butterfly order
+    // as ggml_compute_forward_turbo_wht_f32
+    const bool fused_rot = ggml_flash_attn_ext_get_sj_kvarn_rot(dst) == 256;
+    GGML_ASSERT(!fused_rot || (D == 256 && !turbo4_body));
+    auto rot256 = [](float * x) {
+        for (int h = 1; h < 256; h *= 2) {
+            for (int i = 0; i < 256; i += h * 2) {
+                for (int j = i; j < i + h; j++) {
+                    const float a = x[j], b = x[j + h];
+                    x[j] = a + b;
+                    x[j + h] = a - b;
+                }
+            }
+        }
+        for (int i = 0; i < 256; i++) {
+            x[i] = x[i] * 0.0625f;
+        }
+    };
+    std::vector<float> qrot(fused_rot ? D : 0);
+
+    for (int64_t ir = params->ith; ir < nrows; ir += params->nth) {
+        const int64_t iq1 = ir % n_q;
+        const int64_t iq2 = ir / n_q;
+        const int64_t ikv = iq2 / gqa;
+        const int32_t qpos = qpos0 + (int32_t) iq1;
+        const float * pq = (const float *) ((const char *) q->data + iq1*q->nb[1] + iq2*q->nb[2]);
+        if (fused_rot) {
+            memcpy(qrot.data(), pq, D*sizeof(float));
+            rot256(qrot.data());
+            pq = qrot.data();
+        }
+        // mask rows follow the standard flash_attn_ext convention: [n_kv, n_q(padded), ne2 % mask->ne[2], ne3 % mask->ne[3]]
+        const ggml_fp16_t * mp = mask ? (const ggml_fp16_t *) ((const char *) mask->data + iq1*mask->nb[1]
+                                         + (iq2 % mask->ne[2])*mask->nb[2]) : NULL;
+
+        float M = -INFINITY, Ssum = 0.0f;
+        std::fill(acc.begin(), acc.end(), 0.0f);
+
+        // without a mask the reference is causal by position; with one the mask decides (llama supplies one)
+        const int32_t p_end = mask ? N : std::min(N, qpos + 1);
+        for (int32_t p = 0; p < p_end; ++p) {
+            const float mv = mp ? GGML_CPU_FP16_TO_FP32(mp[p]) : 0.0f;
+            if (mv == -INFINITY) {
+                continue;
+            }
+            if (p >= S && p < B) {
+                const int32_t g = (p - S) / G, t = (p - S) % G;
+                const uint8_t * rec = (const uint8_t *) body->data + ((size_t) g*hkv + ikv)*rec_bytes;
+                if (turbo4_body) {
+                    const size_t row_bytes = ggml_row_size(GGML_TYPE_TURBO4_0, D);
+                    dequantize_row_turbo4_0((const block_turbo4_0 *) (rec + t*row_bytes), krow.data(), D);
+                    dequantize_row_turbo4_0((const block_turbo4_0 *) (rec + (G+t)*row_bytes), vrow.data(), D);
+                } else {
+                    ggml_sj_kvarn::decode_k_row(rec, l, t, krow.data(), trellis_body);
+                    ggml_sj_kvarn::decode_v_row(rec, l, t, vrow.data(), trellis_body);
+                }
+            } else {
+                const int32_t row = p < S ? p : S + (p - S) % cap;
+                const void * kr = (const char *) k->data + row*k->nb[1] + ikv*k->nb[2];
+                const void * vr = (const char *) v->data + row*v->nb[1] + ikv*v->nb[2];
+                const bool f16_sink = p < S && dd[GGML_SJKVARN_DESC_SINK_TYPE] == GGML_TYPE_F16;
+                if (f16_sink) {
+                    kr = (const char *) k->data + (size_t) (S + cap)*k->nb[1] + (size_t) (p*hkv + ikv)*D*sizeof(ggml_fp16_t);
+                    vr = (const char *) v->data + (size_t) (S + cap)*v->nb[1] + (size_t) (p*hkv + ikv)*D*sizeof(ggml_fp16_t);
+                }
+                ggml_get_type_traits(f16_sink ? GGML_TYPE_F16 : k->type)->to_float(kr, krow.data(), D);
+                ggml_get_type_traits(f16_sink ? GGML_TYPE_F16 : v->type)->to_float(vr, vrow.data(), D);
+            }
+            float s = 0.0f;
+            for (int d = 0; d < D; ++d) {
+                s += pq[d] * krow[d];
+            }
+            s *= scale;
+            if (logit_softcap != 0.0f) {
+                s = logit_softcap * tanhf(s);
+            }
+            s += mv;
+            const float Mold = M;
+            float ms = 1.0f, vs = 1.0f;
+            if (s > M) {
+                M = s;
+                ms = expf(Mold - M);
+                for (int d = 0; d < D; ++d) acc[d] *= ms;
+            } else {
+                vs = expf(s - M);
+            }
+            for (int d = 0; d < D; ++d) acc[d] += vrow[d] * vs;
+            Ssum = Ssum*ms + vs;
+        }
+
+        if (sinks) {
+            const float s = ((const float *) sinks->data)[iq2];
+            float ms = 1.0f, vs = 1.0f;
+            if (s > M) {
+                ms = expf(M - s);
+                M = s;
+                for (int d = 0; d < D; ++d) acc[d] *= ms;
+            } else {
+                vs = expf(s - M);
+            }
+            Ssum = Ssum*ms + vs;
+        }
+
+        const float S_inv = Ssum == 0.0f ? 0.0f : 1.0f/Ssum;
+        float * out = (float *) ((char *) dst->data + (iq2 + iq1*dst->ne[1])*dst->nb[1]);
+        for (int d = 0; d < D; ++d) {
+            out[d] = acc[d] * S_inv;
+        }
+        if (fused_rot) {
+            rot256(out);
+        }
+    }
+}
+
 void ggml_compute_forward_flash_attn_ext(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
+    if (dst->src[6] != NULL) {
+        ggml_compute_forward_flash_attn_ext_sj_kvarn(params, dst);
+        return;
+    }
     switch (dst->op_params[3]) {
         case GGML_PREC_DEFAULT:
         case GGML_PREC_F32:
@@ -11548,6 +12057,125 @@ void ggml_compute_forward_dsv4_hc_post(
     }
 }
 
+// GGML_SJKVARN_DUMP=<path>: append the fp16 rows every sealed (group, head) sees, for offline codec studies.
+// Record: int32 magic 'KVD1', D, G, head; char name[64]; K [G][D] fp16; V [G][D] fp16.
+static void ggml_sj_kvarn_dump_group(const ggml_fp16_t * K, const ggml_fp16_t * V, size_t row_stride, int D, int G, int64_t head, const char * name) {
+    static const char * path = getenv("GGML_SJKVARN_DUMP");
+    if (path == nullptr) {
+        return;
+    }
+    static std::mutex m;
+    std::lock_guard<std::mutex> lock(m);
+    FILE * f = fopen(path, "ab");
+    if (f == nullptr) {
+        return;
+    }
+    const int32_t hdr[4] = { 0x31445643, D, G, (int32_t) head };
+    fwrite(hdr, sizeof(int32_t), 4, f);
+    char nm[64] = { 0 };
+    strncpy(nm, name, 63);
+    fwrite(nm, 1, 64, f);
+    for (int t = 0; t < G; ++t) fwrite(K + (size_t) t*row_stride, sizeof(ggml_fp16_t), D, f);
+    for (int t = 0; t < G; ++t) fwrite(V + (size_t) t*row_stride, sizeof(ggml_fp16_t), D, f);
+    fclose(f);
+}
+
+// ggml_compute_forward_sj_kvarn_seal
+
+void ggml_compute_forward_sj_kvarn_seal(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * k    = dst->src[0];
+    const ggml_tensor * v    = dst->src[1];
+    const ggml_tensor * desc = dst->src[2];
+    GGML_ASSERT((k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_Q8_0 || k->type == GGML_TYPE_TQ6_0) && k->type == v->type);
+
+    const int32_t D = ggml_get_op_params_i32(dst, 0);
+    const int32_t G = ggml_get_op_params_i32(dst, 1);
+    const int32_t bits_k = ggml_get_op_params_i32(dst, 2);
+    const int32_t bits_v = ggml_get_op_params_i32(dst, 3);
+    const int32_t iters  = ggml_get_op_params_i32(dst, 4);
+    const int32_t n_groups_max = ggml_get_op_params_i32(dst, 5);
+
+    const ggml_sj_kvarn::layout l = ggml_sj_kvarn::make_layout(D, G, bits_k, bits_v);
+    const bool turbo4_body  = ggml_get_op_params_i32(dst, 7) == GGML_TYPE_TURBO4_0;
+    const bool trellis_body = ggml_get_op_params_i32(dst, 7) == GGML_TYPE_I16;
+    const size_t rec_bytes = turbo4_body ? 2*G*ggml_row_size(GGML_TYPE_TURBO4_0, D) : l.bytes;
+    const int64_t hkv = k->ne[0] / D;
+    GGML_ASSERT(k->nb[0] == ggml_type_size(k->type) && v->nb[0] == ggml_type_size(v->type));
+    GGML_ASSERT(k->nb[1] == v->nb[1]);
+
+    const size_t row_stride = k->nb[1] / sizeof(ggml_fp16_t);
+    std::vector<float> row(k->type != GGML_TYPE_F16 ? D : 0);
+    std::vector<ggml_fp16_t> kstage(k->type != GGML_TYPE_F16 ? G*D : 0);
+    std::vector<ggml_fp16_t> vstage(kstage.size());
+    auto seal = [&](int64_t first_row, int64_t head, uint8_t * record) {
+        const char * kp = (const char *) k->data + first_row*k->nb[1] + ggml_row_size(k->type, head*D);
+        const char * vp = (const char *) v->data + first_row*v->nb[1] + ggml_row_size(v->type, head*D);
+        if (turbo4_body) {
+            std::vector<float> values(D);
+            const size_t rb = ggml_row_size(GGML_TYPE_TURBO4_0, D);
+            for (int t = 0; t < G; ++t) {
+                for (int is_v = 0; is_v < 2; ++is_v) {
+                    ggml_get_type_traits(k->type)->to_float((is_v ? vp : kp) + t*k->nb[1], values.data(), D);
+                    for (float & value : values) value = GGML_FP16_TO_FP32(GGML_FP32_TO_FP16(value));
+                    quantize_row_turbo4_0_rotated_ref(values.data(), (block_turbo4_0 *) (record + (is_v*G+t)*rb), D);
+                }
+            }
+            return;
+        }
+        if (k->type == GGML_TYPE_F16) {
+            ggml_sj_kvarn_dump_group((const ggml_fp16_t *) kp, (const ggml_fp16_t *) vp, row_stride, D, G, head, k->name);
+            ggml_sj_kvarn::seal_group((const ggml_fp16_t *) kp, (const ggml_fp16_t *) vp, row_stride, l, iters, record, trellis_body);
+            return;
+        }
+        for (int t = 0; t < G; ++t) {
+            ggml_get_type_traits(k->type)->to_float(kp + t*k->nb[1], row.data(), D);
+            ggml_fp32_to_fp16_row(row.data(), kstage.data() + t*D, D);
+            ggml_get_type_traits(v->type)->to_float(vp + t*v->nb[1], row.data(), D);
+            ggml_fp32_to_fp16_row(row.data(), vstage.data() + t*D, D);
+        }
+        ggml_sj_kvarn_dump_group(kstage.data(), vstage.data(), D, D, G, head, k->name);
+        ggml_sj_kvarn::seal_group(kstage.data(), vstage.data(), D, l, iters, record, trellis_body);
+    };
+
+    if (desc == nullptr) {
+        // static: k/v rows are the group tokens in order, one record per (group, head)
+        const int64_t n_groups = k->ne[1] / G;
+        const int64_t n_rec    = hkv * n_groups;
+        GGML_ASSERT((int64_t) ggml_nelements(dst) == (int64_t) rec_bytes * n_rec);
+
+        for (int64_t r = params->ith; r < n_rec; r += params->nth) {
+            const int64_t g = r / hkv, h = r % hkv;
+            seal(g*G, h, (uint8_t *) dst->data + (size_t) r*rec_bytes);
+        }
+        return;
+    }
+
+    // dynamic: seal the groups covering positions [B_OLD, B) out of the ring rows
+    GGML_ASSERT(desc->type == GGML_TYPE_I32);
+    const int32_t * d = (const int32_t *) desc->data;
+    const int32_t S     = d[GGML_SJKVARN_DESC_S];
+    const int32_t cap   = d[GGML_SJKVARN_DESC_CAP];
+    const int32_t B     = d[GGML_SJKVARN_DESC_B];
+    const int32_t B_old = d[GGML_SJKVARN_DESC_B_OLD];
+    GGML_ASSERT(d[GGML_SJKVARN_DESC_G] == G && d[GGML_SJKVARN_DESC_D] == D);
+    GGML_ASSERT(d[GGML_SJKVARN_DESC_HKV] == hkv && (size_t) d[GGML_SJKVARN_DESC_RECBYTES] == rec_bytes);
+    GGML_ASSERT(cap % G == 0 && (B_old - S) % G == 0 && (B - S) % G == 0);
+    GGML_ASSERT(k->ne[1] >= S + cap);
+    const int32_t n_new = B > B_old ? (B - B_old) / G : 0;
+    GGML_ASSERT(n_new <= n_groups_max);
+    const int64_t g0    = (B_old - S) / G;
+    const int64_t n_rec = (int64_t) n_new * hkv;
+    GGML_ASSERT((int64_t) ggml_nelements(dst) >= (int64_t) rec_bytes * (g0 + n_new) * hkv);
+
+    for (int64_t r = params->ith; r < n_rec; r += params->nth) {
+        const int64_t g = r / hkv, h = r % hkv;
+        const int64_t row0 = S + (B_old + g*G - S) % cap; // cap % G == 0 -> the group never wraps
+        seal(row0, h, (uint8_t *) dst->data + (size_t) ((g0 + g)*hkv + h)*rec_bytes);
+    }
+}
+
 // ggml_compute_forward_turbo_wht
 
 // WHT sign arrays (must match Metal shader turbo_wht_signs1/2)
@@ -11591,7 +12219,7 @@ static void ggml_compute_forward_turbo_wht_f32(
         const int64_t grp_in_head = g % groups_per_head;
         const int64_t base        = head_idx * head_dim + grp_in_head * group_size;
 
-        float x[128];  // max group_size
+        float x[256];  // max group_size
         const float * in = src_data + base;
 
         // InnerQ forward: apply scale_inv BEFORE signs+WHT (for Q pre-rotation)
@@ -11601,8 +12229,10 @@ static void ggml_compute_forward_turbo_wht_f32(
             for (int i = 0; i < group_size; i++) x[i] = in[i];
         }
 
-        // Apply first signs
-        for (int i = 0; i < group_size; i++) x[i] *= s_first[i];
+        // Apply first signs (group 256 is the plain Sylvester Hadamard: no signs)
+        if (group_size != 256) {
+            for (int i = 0; i < group_size; i++) x[i] *= s_first[i];
+        }
 
         // WHT butterfly (log2(group_size) stages)
         for (int h = 1; h < group_size; h *= 2) {
@@ -11618,7 +12248,7 @@ static void ggml_compute_forward_turbo_wht_f32(
         // Normalize + second signs
         float * out = dst_data + base;
         for (int i = 0; i < group_size; i++) {
-            float val = x[i] * inv_sqrt * s_second[i];
+            float val = x[i] * inv_sqrt * (group_size != 256 ? s_second[i] : 1.0f);
             // InnerQ inverse: apply scale_inv AFTER WHT+signs (for V un-rotation)
             if (direction == 1 && scale_inv != NULL) {
                 val *= scale_inv[i % group_size];
@@ -11644,6 +12274,92 @@ void ggml_compute_forward_turbo_wht(
         case GGML_TYPE_F32: ggml_compute_forward_turbo_wht_f32(params, dst); break;
         default: GGML_ABORT("fatal error");
     }
+}
+
+// SJ-KVaRN fused write rotation (llamAmpere #139, GGML_SJKVARN_FUSED_ROT): SET_ROWS into TQ6_0 that first applies
+// the forward SJ-KVaRN rotation per group (the exact arithmetic of ggml_compute_forward_turbo_wht_f32 with
+// direction 0 and no InnerQ), then packs in the rotated basis like ggml_set_rows_tq6_rotated, including the
+// f16 sink semantics of ggml_compute_forward_set_rows_impl. Returns false when dst is not this op.
+template <typename idx_t>
+static void ggml_compute_forward_set_rows_sj_kvarn_rot_impl(const ggml_compute_params * params, ggml_tensor * dst, int group) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_TQ6_0);
+    GGML_ASSERT(ne00 % group == 0 && nb00 == sizeof(float));
+
+    const int64_t nc = ne00;
+    const int64_t nr = ne01;
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+    const int64_t dr  = (nr + nth - 1)/nth;
+    const int64_t ir0 = dr*ith;
+    const int64_t ir1 = std::min(ir0 + dr, nr);
+
+    const float inv_sqrt = 1.0f / sqrtf((float)group);
+    std::vector<float> rot(nc);
+
+    for (int64_t i03 = 0; i03 < ne03; ++i03) {
+        for (int64_t i02 = 0; i02 < ne02; ++i02) {
+            for (int64_t i = ir0; i < ir1; ++i) {
+                const int64_t i12 = i03%ne12;
+                const int64_t i11 = i02%ne11;
+                const int64_t i10 = i;
+
+                const int64_t i1 = *(idx_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
+                GGML_ASSERT(i1 >= 0 && i1 < ne1);
+
+                const float * in = (const float *) ((const char *) src0->data + i*nb01 + i02*nb02 + i03*nb03);
+                for (int64_t base = 0; base < nc; base += group) {
+                    float * x = rot.data() + base;
+                    for (int k = 0; k < group; k++) x[k] = in[base + k];
+                    if (group != 256) {
+                        for (int k = 0; k < group; k++) x[k] *= turbo_wht_s1[k];
+                    }
+                    for (int h = 1; h < group; h *= 2) {
+                        for (int k0 = 0; k0 < group; k0 += h * 2) {
+                            for (int k = k0; k < k0 + h; k++) {
+                                float a = x[k], b = x[k + h];
+                                x[k] = a + b;
+                                x[k + h] = a - b;
+                            }
+                        }
+                    }
+                    for (int k = 0; k < group; k++) {
+                        x[k] = x[k] * inv_sqrt * (group != 256 ? turbo_wht_s2[k] : 1.0f);
+                    }
+                }
+
+                const int sink = ggml_get_op_params_i32(dst, 2);
+                if (sink > 0 && i1 < sink) {
+                    GGML_ASSERT(ne02 == 1 && ne03 == 1);
+                    const size_t offset = (size_t) ggml_get_op_params_i32(dst, 3)*nb1;
+                    GGML_ASSERT(offset + (size_t) sink*nc*sizeof(ggml_fp16_t) <= ggml_nbytes(dst));
+                    ggml_fp32_to_fp16_row(rot.data(), (ggml_fp16_t *) ((char *) dst->data + offset) + i1*nc, nc);
+                    continue;
+                }
+
+                quantize_row_tq6_0_rotated_ref(rot.data(), (block_tq6_0 *) ((char *) dst->data + i1*nb1 + i02*nb2 + i03*nb3), nc);
+            }
+        }
+    }
+}
+
+static bool ggml_compute_forward_set_rows_sj_kvarn_rot(const ggml_compute_params * params, ggml_tensor * dst) {
+    const int32_t mode = ggml_get_op_params_i32(dst, 1);
+    if (mode != GGML_SET_ROWS_SJKVARN_ROT256 && mode != GGML_SET_ROWS_SJKVARN_ROT128) {
+        return false;
+    }
+    const int group = mode == GGML_SET_ROWS_SJKVARN_ROT256 ? 256 : 128;
+    if (dst->src[1]->type == GGML_TYPE_I64) {
+        ggml_compute_forward_set_rows_sj_kvarn_rot_impl<int64_t>(params, dst, group);
+    } else {
+        ggml_compute_forward_set_rows_sj_kvarn_rot_impl<int32_t>(params, dst, group);
+    }
+    return true;
 }
 
 // ggml_compute_forward_rwkv_wkv7

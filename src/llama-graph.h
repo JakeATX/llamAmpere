@@ -40,6 +40,8 @@ struct llama_model;
 struct llama_layer;
 struct llama_prec_policy;
 
+class llama_moe_cache;
+
 struct llama_memory_context_i;
 
 class llama_kv_cache_context;
@@ -155,8 +157,14 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override;
 
-    ggml_tensor * tokens = nullptr; // I32 [n_batch]
-    ggml_tensor * embd   = nullptr; // F32 [n_embd, n_batch]
+    ggml_tensor * tokens       = nullptr; // I32 [n_batch]
+    ggml_tensor * embd         = nullptr; // F32 [n_embd, n_batch]
+    ggml_tensor * mixed_tokens = nullptr; // I32 [n_tok_rows], mixed path: ids of the token rows
+    ggml_tensor * mixed_slots  = nullptr; // I64 [n_tok_rows], mixed path: batch index of the token rows
+    ggml_tensor * mixed_embd   = nullptr; // F32 [n_embd, n_batch], mixed path: embd rows, token rows are overwritten
+    ggml_tensor * scale_rows   = nullptr; // F32 [1, n_batch], per-row scale: scale_tok for token rows, 1 for embd rows
+
+    float scale_tok = 1.0f;
 
     const int64_t n_embd = 0;
 };
@@ -294,8 +302,8 @@ public:
 
     // views of s_copy, computed once per graph
     // and shared across layers which use build_rs
-    ggml_tensor * s_copy_main;   // I32 [n_seqs]
-    ggml_tensor * s_copy_extra;  // I32 [n_rs - n_seqs]
+    ggml_tensor * s_copy_main; // I32 [n_seqs]
+    ggml_tensor * s_copy_tail; // I32 [n_rs - 1]
 
     const llama_memory_recurrent_context * mctx;
 
@@ -315,12 +323,14 @@ public:
     uint32_t snap_shift = 0; // [TAG_RECURRENT_ROLLBACK_SHIFT] see llama_memory_recurrent_context::get_snap_shift
 
     // row indices for gathering all snap_shift older snapshot groups of the ubatch's cells in one
-    // ggml_get_rows: [j * n_seqs + s] = j * mem_size + s_copy_main[s]; nullptr when snap_shift == 0
+    // ggml_get_rows: [j * n_seqs + s] = j * mem_size + s_copy_main[s] for the groups lane s really
+    // has (j < K - max(n, r_s)), and lane s's own destination row (n + j) * mem_size + head + s --
+    // a copy onto itself -- for the rest; nullptr when snap_shift == 0
     ggml_tensor * s_copy_shift = nullptr; // I32 [snap_shift * n_seqs]
 
     // fill s_copy_shift from the already-filled s_copy (call after the s_copy fill; s_copy() has a
     // rs_idx-reset side effect, so the values are never re-read from the memory context)
-    void set_input_shift(uint32_t mem_size);
+    void set_input_shift(const llama_memory_recurrent_context * m);
 
     // [TAG_RECURRENT_ROLLBACK_RING] ring mode (mctx->get_rs_ring()); all nullptr/0 otherwise, and
     // n_written == 0 / rs_wr == nullptr for a ubatch that fills the ring (n >= K: the builders use
@@ -407,6 +417,10 @@ public:
     // note: assumes v_rot^2 == I
     ggml_tensor * self_k_rot = nullptr;
     ggml_tensor * self_v_rot = nullptr;
+
+    // SJ-KVaRN: I32 region descriptor (sink/ring/body bounds for this ubatch), nullptr unless the cache is SJ-KVaRN
+    ggml_tensor * self_sj_kvarn_desc = nullptr;
+    ggml_tensor * self_sj_kvarn_desc_edge = nullptr; // tiered body: descriptor of the edge tier (nullptr unless edge layers exist)
 
     // note: these have to be copies because in order to be able to reuse a graph, its inputs
     //       need to carry these parameters with them. otherwise, they can point to freed
@@ -867,6 +881,7 @@ struct llm_graph_params {
     const llama_cross            * cross;
     const llama_hadamard_rotations * hadamard_rotations;
     const llama_hadamard_rotations * hadamard_inverses;
+    const llama_moe_cache        * moe_cache;
 
     const llama_prec_policy * prec_policy = nullptr;
 
@@ -920,6 +935,7 @@ struct llm_graph_params {
             ubatch.n_seq_tokens == other.ubatch.n_seq_tokens &&
             ubatch.n_seqs       == other.ubatch.n_seqs &&
             ubatch.n_seqs_unq   == other.ubatch.n_seqs_unq &&
+            ubatch.is_mixed()   == other.ubatch.is_mixed() &&
             (
                 (!ubatch.token && !other.ubatch.token) ||
                 (!ubatch.embd  && !other.ubatch.embd)  ||
@@ -1135,6 +1151,7 @@ struct llm_graph_context {
     const llama_cross            * cross;
     const llama_hadamard_rotations * hadamard_rotations;
     const llama_hadamard_rotations * hadamard_inverses;
+    const llama_moe_cache        * moe_cache;
 
     const llama_prec_policy * prec_policy;
 
@@ -1165,10 +1182,29 @@ struct llm_graph_context {
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
 
+    // SJ-KVaRN: handed from build_attn (which owns the cache) to build_attn_mha (which owns the FA node)
+    mutable struct {
+        ggml_tensor * body = nullptr; // seal output (view of the layer's record pool)
+        ggml_tensor * desc = nullptr;
+        int32_t bits_k = 0;
+        int32_t bits_v = 0;
+        bool fused_rot = false; // Q/output rotation inside the FA node (ggml_sj_kvarn_fused_rot_enabled)
+    } sj_kvarn_pending;
+
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;
 
     void cb(ggml_tensor * cur, const char * name, int il) const;
+
+    // true when the last layer must be narrowed to the output rows before the nextn hidden state is captured
+    bool crop_before_nextn(const ggml_tensor * inp_out_ids) const {
+        return inp_out_ids != nullptr && (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked);
+    }
+
+    // true when the nextn hidden state must be narrowed to the output rows after it is captured
+    bool crop_after_nextn(const ggml_tensor * inp_out_ids) const {
+        return inp_out_ids != nullptr && cparams.embeddings_nextn && !cparams.embeddings_nextn_masked;
+    }
 
     //
     // common
@@ -1185,11 +1221,13 @@ struct llm_graph_context {
               ggml_tensor * w_s = nullptr) const;
 
     // do mat_mul_id, while optionally apply lora and per-expert scale
+    // if slots is set, the experts are read from the MoE cache at these slots (see build_moe_cache_slots)
     ggml_tensor * build_lora_mm_id(
               ggml_tensor * w,   // ggml_tensor * as
               ggml_tensor * cur, // ggml_tensor * b
               ggml_tensor * ids,
-              ggml_tensor * w_s = nullptr) const;
+              ggml_tensor * w_s   = nullptr,
+              ggml_tensor * slots = nullptr) const;
 
     ggml_tensor * build_norm(
              ggml_tensor * cur,
@@ -1285,11 +1323,22 @@ struct llm_graph_context {
              ggml_tensor * gate_exps_s = nullptr,
              ggml_tensor * down_exps_s = nullptr,
              ggml_tensor * selected_experts_in = nullptr) const;
+
+    // the slots of the selected experts in the MoE cache, nullptr if the experts of the layer are not read from the cache
+    ggml_tensor * build_moe_cache_slots(
+             ggml_tensor * selected_experts,
+             ggml_tensor * up_exps,
+             ggml_tensor * gate_exps,
+             ggml_tensor * down_exps,
+             ggml_tensor * gate_up_exps,
+                     int   il) const;
+
     //
     // inputs
     //
 
-    ggml_tensor * build_inp_embd(ggml_tensor * tok_embd) const;
+    // tok_scale: applied to token rows only
+    ggml_tensor * build_inp_embd(ggml_tensor * tok_embd, float tok_scale = 1.0f) const;
     ggml_tensor * build_hadamard_inverse(ggml_tensor * table, ggml_tensor * cur) const;
     ggml_tensor * build_inp_pos() const;
     ggml_tensor * build_inp_attn_scale() const;
@@ -1316,6 +1365,22 @@ struct llm_graph_context {
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                 int64_t   n_kv_max,
                   float   kq_scale,
+                    int   il) const;
+
+    // TurboQuant/TQ K caches hold WHT-rotated K (the set_rows quantizer rotates on store): pad Q per head
+    // to the cached K head size and rotate it to match. No-op for other K types and for SJ-KVaRN caches
+    // (their tq6_0 staging K is stored in the SJ-KVaRN Hadamard basis without the turbo WHT). Any graph that calls
+    // build_attn_mha on llama_kv_cache views must apply this and build_attn_turbo_v_out as build_attn does.
+    ggml_tensor * build_attn_turbo_q(
+            ggml_tensor * q,       // [n_embd_head_q, n_head_q, n_tokens]
+      const ggml_tensor * k,       // K cache view (its type selects the rotation)
+      const llama_kv_cache_context * mctx_cur) const;
+
+    // TurboQuant: build_attn_mha undoes the V rotation on its output; when the cached V head was padded
+    // to 128, cut the output back to n_embd_head_v(il). No-op for other V types.
+    ggml_tensor * build_attn_turbo_v_out(
+            ggml_tensor * cur,     // [n_embd_head_v_cache * n_head_q, n_tokens] build_attn_mha output
+      const ggml_tensor * v,       // V cache view
                     int   il) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
@@ -1348,6 +1413,13 @@ struct llm_graph_context {
             ggml_tensor * sinks, // [n_head_q]
             ggml_tensor * v_mla, // [n_embd_head_v_mla, n_embd_head_v, n_head_v] // TODO: remove
                   float   kq_scale,
+                    int   il) const;
+
+    // [#91] the K/V store half of the build_attn above, for graphs whose attention output nothing reads
+    void build_attn_store(
+            llm_graph_input_attn_kv * inp,
+            ggml_tensor * k_cur, // [n_embd_head_k, n_head_k, n_tokens]
+            ggml_tensor * v_cur, // [n_embd_head_v, n_head_v, n_tokens]
                     int   il) const;
 
     llm_graph_input_attn_k  * build_attn_inp_k() const;
@@ -1452,15 +1524,15 @@ struct llm_graph_context {
     //         `llama_memory_recurrent`
     ggml_tensor * build_rs(
             ggml_tensor * s,
+            ggml_tensor * state_copy,
             ggml_tensor * state_copy_main,
-            ggml_tensor * state_copy_extra,
                 int32_t   state_size,
                 int32_t   n_seqs,
                uint32_t   n_rs,
                uint32_t   rs_head,
                uint32_t   rs_size,
                 int32_t   rs_zero,
-            const llm_graph_get_rows_fn & get_state_rows = ggml_get_rows) const;
+            const llm_graph_get_rows_fn & get_state_rows = nullptr) const;
 
     llm_graph_input_rs * build_rs_inp() const;
 
@@ -1469,7 +1541,7 @@ struct llm_graph_context {
             ggml_tensor * s,
                 int32_t   state_size,
                 int32_t   n_seqs,
-            const llm_graph_get_rows_fn & get_state_rows = ggml_get_rows) const;
+            const llm_graph_get_rows_fn & get_state_rows = nullptr) const;
 
     ggml_tensor * build_rwkv_token_shift_load(
         llm_graph_input_rs * inp,

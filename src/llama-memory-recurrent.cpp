@@ -156,8 +156,10 @@ llama_memory_recurrent::llama_memory_recurrent(
         s_l[i] = s;
 
         if (gdn_replay) {
-            // one row per cell, n_rs_seq ingredient slots back to back (see the header)
-            ggml_tensor * ingr = ggml_new_tensor_2d(ctx, type_s, (int64_t) hparams.n_embd_s_ingredient() * n_rs_seq, mem_size);
+            // one row per cell, n_rs_seq ingredient slots back to back (see the header). Always F32,
+            // whatever type_s is: the replay reads the gathered ring with this tensor's element size
+            // (llm_build_delta_net_base::build_recurrent_attn), and k/v/g/beta are op inputs, not state.
+            ggml_tensor * ingr = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (int64_t) hparams.n_embd_s_ingredient() * n_rs_seq, mem_size);
             ggml_format_name(ingr, "cache_ingr_l%d", i);
             ingr_l[i] = ingr;
 
@@ -193,6 +195,13 @@ llama_memory_recurrent::llama_memory_recurrent(
         ggml_backend_buffer_clear(buf, 0);
         LLAMA_LOG_INFO("%s: %10s RS buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
         ctxs_bufs.emplace_back(std::move(ctx), buf);
+    }
+
+    if (is_empty()) {
+        if (n_rs_seq > 0) {
+            n_rs_seq = 0;
+            LLAMA_LOG_INFO("%s: disabling rollback snapshots because the memory module is empty\n", __func__);
+        }
     }
 
     {
@@ -290,6 +299,15 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
             // partial rollback via per-token snapshot index (bounded by n_rs_seq), or (gdn_replay)
             // via a pending replay of the last `rollback` ingredient-ring steps.
             if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
+                // a cell shared by several sequences cannot move back for only one of them
+                if (cell.seq_id.size() > 1) {
+                    return false;
+                }
+                // the filter kept no layer (e.g. an MTP draft context), so only the position moves back
+                if (is_empty()) {
+                    cell.pos = p0 - 1;
+                    return true;
+                }
                 const llama_pos rollback = cell.pos - (p0 - 1);
                 // RB1b: n_rs_seq is the ring capacity, not the number of slots this sequence has
                 // actually filled. Bound the request by what was really written, and compose with
@@ -718,6 +736,9 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
     auto org_cells = cells;
     auto org_used = used;
     auto org_head = head;
+    // find_slot credits each sequence's rs_valid with the ubatch's tokens; this dry run must not,
+    // or apply() credits them a second time and a rollback deeper than the real history is accepted
+    auto org_rs_valid = rs_valid;
 
     bool success = true;
 
@@ -732,6 +753,7 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
     cells = std::move(org_cells);
     used = org_used;
     head = org_head;
+    rs_valid = std::move(org_rs_valid);
 
     return success;
 }
@@ -978,6 +1000,12 @@ bool llama_memory_recurrent::get_can_shift() const {
     return true;
 }
 
+bool llama_memory_recurrent::is_empty() const {
+    const bool res = ctxs_bufs.empty();
+    assert(!res || total_size() == 0);
+    return res;
+}
+
 size_t llama_memory_recurrent::total_size() const {
     size_t size = 0;
     for (const auto & [_, buf] : ctxs_bufs) {
@@ -1152,7 +1180,12 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
 
     bool res = true;
 
-    res = res && state_read_meta(io, cell_count, seq_id);
+    // save the head of the restored cells - could be needed to clear the state
+    // the head is valid only when state_read_meta() succeeded
+    const bool meta_read = state_read_meta(io, cell_count, seq_id);
+    const uint32_t cell_head = head;
+
+    res = res && meta_read;
 
     try {
         res = res && state_read_data(io, cell_count);
@@ -1164,12 +1197,7 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
     }
 
     if (!res) {
-        // TODO: fix incosistent handling of `seq_id < 0` and `seq_id == -1` in the codebase [TAG_LLAMA_SEQ_ID_NEG]
-        if (seq_id == -1) {
-            clear(true);
-        } else {
-            seq_rm(seq_id, -1, -1);
-        }
+        state_clear(seq_id, cell_head, meta_read ? cell_count : 0);
         throw std::runtime_error("failed to restore kv cache");
     }
 
@@ -1410,6 +1438,11 @@ void llama_memory_recurrent::state_write_replay(llama_io_write_i & io, const std
 bool llama_memory_recurrent::state_read_meta(llama_io_read_i & io, uint32_t cell_count, llama_seq_id dest_seq_id) {
     if (dest_seq_id != -1) {
         // single sequence
+        if (cell_count > size) {
+            LLAMA_LOG_ERROR("%s: not enough cells in kv cache\n", __func__);
+            return false;
+        }
+
         seq_rm(dest_seq_id, -1, -1);
 
         if (cell_count == 0) {
@@ -1641,6 +1674,41 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
     return true;
 }
 
+// the cleared ranges mirror the write pattern of state_read_data() - keep both in sync
+// the transposed s layout is not handled - state_read_data() rejects it before any write
+void llama_memory_recurrent::state_clear(llama_seq_id seq_id, uint32_t cell_head, uint32_t cell_count) {
+    // TODO: fix incosistent handling of `seq_id < 0` and `seq_id == -1` in the codebase [TAG_LLAMA_SEQ_ID_NEG]
+    if (seq_id == -1) {
+        clear(true);
+        return;
+    }
+
+    seq_rm(seq_id, -1, -1);
+
+    if (cell_count == 0) {
+        return;
+    }
+
+    const uint32_t n_layer = hparams.n_layer();
+
+    for (uint32_t il = 0; il < n_layer; ++il) {
+        if (r_l[il] != nullptr) {
+            const size_t r_size_row = ggml_row_size(r_l[il]->type, hparams.n_embd_r());
+            llama_clear_tensor_data(r_l[il], cell_head * r_size_row, cell_count * r_size_row);
+        }
+
+        if (s_l[il] != nullptr) {
+            const size_t s_size_row = ggml_row_size(s_l[il]->type, hparams.n_embd_s());
+            llama_clear_tensor_data(s_l[il], cell_head * s_size_row, cell_count * s_size_row);
+        }
+
+        if (p_l[il] != nullptr) {
+            const size_t p_size_row = ggml_row_size(p_l[il]->type, hparams.ple_conv_state());
+            llama_clear_tensor_data(p_l[il], cell_head * p_size_row, cell_count * p_size_row);
+        }
+    }
+}
+
 //
 // llama_memory_recurrent_context
 //
@@ -1809,13 +1877,20 @@ uint32_t llama_memory_recurrent_context::get_snap_shift() const {
         return 0;
     }
     // the group the logical state lives in: replay_len (conv, replay mode) or rs_idx (both
-    // groups, non-replay mode); max over the lanes, like get_replay_len()
+    // groups, non-replay mode). A lane with pending rollback r has K - max(n, r) older groups to
+    // move; the graph is sized for the lane with the most (the smallest r), and
+    // llm_graph_input_rs::set_input_shift turns the surplus groups of the other lanes into
+    // copies of their own destination rows. Sizing it for the largest r instead moved too few
+    // groups for the other lanes, whose rs_valid still credited them (test gate G).
+    // In replay mode the lanes agree ([TAG_GDN_REPLAY_SPLIT]), so min == max there.
     uint32_t r = 0;
+    bool     first = true;
     const auto & group_of = mem->gdn_replay ? mem->replay_len : mem->rs_idx;
     for (uint32_t i = 0; i < ubatch.n_seqs_unq; ++i) {
         const llama_seq_id seq = ubatch.seq_id_unq[i];
         if (seq >= 0 && (size_t) seq < group_of.size()) {
-            r = std::max(r, group_of[seq]);
+            r = first ? group_of[seq] : std::min(r, group_of[seq]);
+            first = false;
         }
     }
     return K - std::max(n, r);

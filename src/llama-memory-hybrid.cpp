@@ -33,7 +33,8 @@ llama_memory_hybrid::llama_memory_hybrid(
     const layer_filter_cb & filter_recr,
                      size_t kv_stream_stage_bytes,
                      void * kv_stream_phase_arena,
-                     size_t kv_stream_maximum_pool_bytes) :
+                     size_t kv_stream_maximum_pool_bytes,
+      llama_sj_kvarn_config    sj_kvarn) :
     hparams(model.hparams),
     mem_attn(new llama_kv_cache(
         model,
@@ -57,7 +58,8 @@ llama_memory_hybrid::llama_memory_hybrid(
         "",
         kv_stream_stage_bytes,
         kv_stream_phase_arena,
-        kv_stream_maximum_pool_bytes
+        kv_stream_maximum_pool_bytes,
+        sj_kvarn
     )),
     mem_recr(new llama_memory_recurrent(
         model,
@@ -217,10 +219,22 @@ void llama_memory_hybrid::state_write(llama_io_write_i & io, llama_seq_id seq_id
 }
 
 void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+    const bool read_attn = (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0;
+
+    if (read_attn) {
         mem_attn->state_read(io, seq_id, flags);
     }
-    mem_recr->state_read(io, seq_id, flags);
+
+    try {
+        mem_recr->state_read(io, seq_id, flags);
+    } catch (...) {
+        // the attention part is already restored - undo it
+        if (read_attn) {
+            mem_attn->state_clear(seq_id);
+        }
+
+        throw;
+    }
 }
 
 llama_kv_cache * llama_memory_hybrid::get_mem_attn() const {

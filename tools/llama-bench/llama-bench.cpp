@@ -442,6 +442,7 @@ struct cmd_params {
     std::vector<int>                 main_gpu;
     std::vector<bool>                no_kv_offload;
     std::vector<llama_flash_attn_type> flash_attn;
+    std::vector<std::string>         sj_kvarn;   // "" = off, "K/V" or "K/V/tail" = SJ-KVaRN region-aware cache
     std::vector<std::vector<ggml_backend_dev_t>> devices;
     std::vector<std::vector<float>>  tensor_split;
     std::vector<std::vector<llama_model_tensor_buft_override>> tensor_buft_overrides;
@@ -493,6 +494,7 @@ static const cmd_params cmd_params_defaults = {
     /* main_gpu             */ { 0 },
     /* no_kv_offload        */ { false },
     /* flash_attn           */ { LLAMA_FLASH_ATTN_TYPE_AUTO },
+    /* sj_kvarn                */ { "" },
     /* devices              */ { {} },
     /* tensor_split         */ { std::vector<float>(llama_max_devices(), 0.0f) },
     /* tensor_buft_overrides*/ { std::vector<llama_model_tensor_buft_override>{ { nullptr, nullptr } } },
@@ -572,6 +574,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -mg, --main-gpu <i>                               (default: %s)\n", join(cmd_params_defaults.main_gpu, ",").c_str());
     printf("  -nkvo, --no-kv-offload <0|1>                      (default: %s)\n", join(cmd_params_defaults.no_kv_offload, ",").c_str());
     printf("  -fa, --flash-attn <on|off|auto>                   (default: %s)\n", join(transform_to_str(cmd_params_defaults.flash_attn, llama_flash_attn_type_name), ",").c_str());
+    printf("  -sjkvarn, --sjkvarn <K/V[/tail]>                      (default: off; e.g. 4/4 or 4/4/1024: SJ-KVaRN cache, K/V forced to f16)\n");
     printf("  -dev, --device <dev0/dev1/...>                    (default: auto)\n");
     printf("  -lm, --load-mode <auto|none|mmap|mlock|mmap+mlock|dio> (default: %s)\n", join(transform_to_str(cmd_params_defaults.load_mode, llama_load_mode_name), ",").c_str());
     printf("  -lzm, --lazy-mode <on|auto|off>                   (default: %s)\n", join(transform_to_str(cmd_params_defaults.lazy_mode, lazy_mode_str), ",").c_str());
@@ -586,6 +589,22 @@ static void print_usage(int /* argc */, char ** argv) {
         "Multiple values can be given for list-valued parameters by separating them with ','\n"
         "or by specifying the parameter multiple times. Supported ranges can be given as\n"
         "'first-last' or 'first-last+step' or 'first-last*mult'.\n");
+}
+
+// "K/V" or "K/V/tail": SJ-KVaRN record bit widths (2..8) and an optional exact-tail length
+static bool sj_kvarn_parse(const std::string & s, uint32_t & bits_k, uint32_t & bits_v, uint32_t & tail) {
+    auto p = string_split<std::string>(s, '/');
+    if (p.size() < 2 || p.size() > 3) {
+        return false;
+    }
+    try {
+        bits_k = (uint32_t) std::stoul(p[0]);
+        bits_v = (uint32_t) std::stoul(p[1]);
+        tail   = p.size() == 3 ? (uint32_t) std::stoul(p[2]) : 0;
+    } catch (...) {
+        return false;
+    }
+    return bits_k >= 2 && bits_k <= 8 && bits_v >= 2 && bits_v <= 8;
 }
 
 static ggml_type ggml_type_from_name(const std::string & s) {
@@ -1046,6 +1065,28 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     break;
                 }
                 params.flash_attn.insert(params.flash_attn.end(), types.begin(), types.end());
+            } else if (arg == "-sjkvarn" || arg == "--sjkvarn") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<std::string>(argv[i], split_delim);
+                for (auto & v : p) {
+                    if (v == "off" || v == "0" || v == "none") {
+                        v = "";
+                    } else {
+                        uint32_t bk = 0, bv = 0, tail = 0;
+                        if (!sj_kvarn_parse(v, bk, bv, tail)) {
+                            fprintf(stderr, "error: invalid SJ-KVaRN spec '%s' (expected K/V or K/V/tail)\n", v.c_str());
+                            invalid_param = true;
+                            break;
+                        }
+                    }
+                }
+                if (invalid_param) {
+                    break;
+                }
+                params.sj_kvarn.insert(params.sj_kvarn.end(), p.begin(), p.end());
             } else if (arg == "-embd" || arg == "--embeddings") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1248,7 +1289,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
             p.hf_token      = params.hf_token;
             p.offline       = params.offline;
             p.model.hf_repo = params.hf_repo[i];
-            if (!params.hf_file.empty() && !params.hf_file[i].empty()) {
+            if (i < params.hf_file.size() && !params.hf_file[i].empty()) {
                 p.model.hf_file = params.hf_file[i];
             }
 
@@ -1323,6 +1364,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     }
     if (params.flash_attn.empty()) {
         params.flash_attn = cmd_params_defaults.flash_attn;
+    }
+    if (params.sj_kvarn.empty()) {
+        params.sj_kvarn = cmd_params_defaults.sj_kvarn;
     }
     if (params.devices.empty()) {
         params.devices = cmd_params_defaults.devices;
@@ -1399,6 +1443,7 @@ struct cmd_params_instance {
     int                main_gpu;
     bool               no_kv_offload;
     llama_flash_attn_type flash_attn;
+    std::string        sj_kvarn;
     std::vector<ggml_backend_dev_t> devices;
     std::vector<float> tensor_split;
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
@@ -1482,6 +1527,18 @@ struct cmd_params_instance {
         cparams.type_v          = type_v;
         cparams.offload_kqv     = !no_kv_offload;
         cparams.flash_attn_type = flash_attn;
+        if (!sj_kvarn.empty()) {
+            uint32_t bk = 0, bv = 0, tail = 0;
+            GGML_ASSERT(sj_kvarn_parse(sj_kvarn, bk, bv, tail));
+            cparams.type_k = GGML_TYPE_F16;
+            cparams.type_v = GGML_TYPE_F16;
+            cparams.sj_kvarn_bits_k = bk;
+            cparams.sj_kvarn_bits_v = bv;
+            if (tail > 0) {
+                cparams.sj_kvarn_tail = tail;
+            }
+            cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        }
         cparams.embeddings      = embeddings;
         cparams.op_offload      = !no_op_offload;
         cparams.swa_full        = false;
@@ -1517,6 +1574,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & tv : params.type_v)
     for (const auto & nkvo : params.no_kv_offload)
     for (const auto & fa : params.flash_attn)
+    for (const auto & kvn : params.sj_kvarn)
     for (const auto & nt : params.n_threads)
     for (const auto & cm : params.cpu_mask)
     for (const auto & cs : params.cpu_strict)
@@ -1550,6 +1608,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .main_gpu              = */ mg,
                 /* .no_kv_offload         = */ nkvo,
                 /* .flash_attn            = */ fa,
+                /* .sj_kvarn                 = */ kvn,
                 /* .devices               = */ devs,
                 /* .tensor_split          = */ ts,
                 /* .tensor_buft_overrides = */ ot,
@@ -1590,6 +1649,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .main_gpu              = */ mg,
                 /* .no_kv_offload         = */ nkvo,
                 /* .flash_attn            = */ fa,
+                /* .sj_kvarn                 = */ kvn,
                 /* .devices               = */ devs,
                 /* .tensor_split          = */ ts,
                 /* .tensor_buft_overrides = */ ot,
@@ -1630,6 +1690,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .main_gpu              = */ mg,
                 /* .no_kv_offload         = */ nkvo,
                 /* .flash_attn            = */ fa,
+                /* .sj_kvarn                 = */ kvn,
                 /* .devices               = */ devs,
                 /* .tensor_split          = */ ts,
                 /* .tensor_buft_overrides = */ ot,
@@ -1675,6 +1736,7 @@ struct test {
     int                      main_gpu;
     bool                     no_kv_offload;
     llama_flash_attn_type    flash_attn;
+    std::string              sj_kvarn;
     std::vector<ggml_backend_dev_t> devices;
     std::vector<float>       tensor_split;
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
@@ -1728,6 +1790,7 @@ struct test {
             main_gpu       = mparams.main_gpu;
         no_kv_offload  = inst.no_kv_offload;
         flash_attn     = inst.flash_attn;
+        sj_kvarn          = inst.sj_kvarn.empty() ? "off" : inst.sj_kvarn;
         devices        = inst.devices;
         if (mparams.tensor_split) {
             tensor_split.assign(mparams.tensor_split, mparams.tensor_split + llama_max_devices());
@@ -1806,7 +1869,7 @@ struct test {
             "n_ubatch",       "n_threads",      "cpu_mask",      "cpu_strict",     "poll",
             "type_k",         "type_v",         "n_gpu_layers",  "n_cpu_moe",      "moe_cache",
             "moe_cache_fit",  "repack",         "split_mode",
-            "main_gpu",       "no_kv_offload",  "flash_attn",    "devices",        "tensor_split",
+            "main_gpu",       "no_kv_offload",  "flash_attn",    "sj_kvarn",         "devices",        "tensor_split",
             "tensor_buft_overrides",            "load_mode",     "lazy_mode",
             "embeddings",
             "no_op_offload",  "no_host",        "fit_target",    "fit_min_ctx",
@@ -1903,6 +1966,7 @@ struct test {
                                             std::to_string(main_gpu),
                                             std::to_string(no_kv_offload),
                                             std::to_string((int) flash_attn),
+                                            sj_kvarn,
                                             devices_to_string(devices),
                                             tensor_split_str,
                                             tensor_buft_overrides_str,
@@ -2106,6 +2170,9 @@ struct markdown_printer : public printer {
         if (field == "flash_attn") {
             return 3;
         }
+        if (field == "sj_kvarn") {
+            return 10;
+        }
         if (field == "devices") {
             return -12;
         }
@@ -2253,6 +2320,9 @@ struct markdown_printer : public printer {
         }
         if (params.flash_attn.size() > 1 || params.flash_attn != cmd_params_defaults.flash_attn) {
             fields.emplace_back("flash_attn");
+        }
+        if (params.sj_kvarn.size() > 1 || params.sj_kvarn != cmd_params_defaults.sj_kvarn) {
+            fields.emplace_back("sj_kvarn");
         }
         if (params.devices.size() > 1 || params.devices != cmd_params_defaults.devices) {
             fields.emplace_back("devices");
@@ -2477,8 +2547,10 @@ static bool test_gen(llama_context * ctx, int n_gen, int n_threads, uint64_t see
 }
 
 static void llama_null_log_callback(enum ggml_log_level level, const char * text, void * user_data) {
-    (void) level;
-    (void) text;
+    if (level == GGML_LOG_LEVEL_ERROR) {
+        fprintf(stderr, "%s", text);
+        return;
+    }
     (void) user_data;
 }
 

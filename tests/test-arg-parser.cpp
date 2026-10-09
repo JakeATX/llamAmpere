@@ -103,6 +103,45 @@ static void test(void) {
         assert(draft.n_outputs_max_per_seq == 1);
     }
 
+#ifndef _WIN32
+    {
+        const char * saved_env = std::getenv("LLAMA_MTP_DRAFT_COMPUTE_LEAN");
+        const bool had_env = saved_env != nullptr;
+        const std::string saved = saved_env ? saved_env : "";
+        common_params base;
+        base.n_parallel = 1;
+        base.n_batch = 4096;
+        base.n_ubatch = 1024;
+        base.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE };
+        unsetenv("LLAMA_MTP_DRAFT_COMPUTE_LEAN");
+        assert(common_base_params_to_speculative(base).n_ubatch == 1024);
+        setenv("LLAMA_MTP_DRAFT_COMPUTE_LEAN", "0", 1);
+        assert(common_base_params_to_speculative(base).n_ubatch == 1024);
+        setenv("LLAMA_MTP_DRAFT_COMPUTE_LEAN", "1", 1);
+        const auto draft = common_base_params_to_speculative(base);
+        assert(draft.n_batch == 4096);
+        assert(draft.n_ubatch == 64);
+        assert(common_context_params_to_llama(draft).n_ubatch == 64);
+        for (int width = 1; width <= 8; ++width) {
+            base.n_ubatch = width;
+            assert(common_base_params_to_speculative(base).n_ubatch == width);
+        }
+        base.n_ubatch = 0;
+        assert(common_base_params_to_speculative(base).n_ubatch == 64);
+        base.n_ubatch = 1024;
+        base.n_parallel = 2;
+        assert(common_base_params_to_speculative(base).n_ubatch == 1024);
+        base.n_parallel = 1;
+        base.speculative.types = { COMMON_SPECULATIVE_TYPE_NONE };
+        assert(common_base_params_to_speculative(base).n_ubatch == 1024);
+        if (had_env) {
+            setenv("LLAMA_MTP_DRAFT_COMPUTE_LEAN", saved.c_str(), 1);
+        } else {
+            unsetenv("LLAMA_MTP_DRAFT_COMPUTE_LEAN");
+        }
+    }
+#endif
+
     printf("test-arg-parser: make sure there is no duplicated arguments in any examples\n\n");
     for (int ex = 0; ex < LLAMA_EXAMPLE_COUNT; ex++) {
         try {
@@ -303,6 +342,39 @@ static void test(void) {
     assert(spec_defaults.speculative.draft.n_max == 3);
     assert(spec_defaults.speculative.draft.n_min_adaptive == 3);
 
+    // MTP drafter attention window: off by default, the default context params carry no window,
+    // and the cparams helper leaves them untouched when the flags are absent
+    assert(spec_defaults.speculative.draft.attn_window == 0);
+    assert(spec_defaults.speculative.draft.attn_sink == -1);
+    {
+        llama_context_params cp = llama_context_default_params();
+        assert(cp.draft_attn_window == 0 && cp.draft_attn_sink == 0);
+        common_speculative_mtp_cparams(spec_defaults, cp);
+        assert(cp.draft_attn_window == 0 && cp.draft_attn_sink == 0);
+    }
+    for (const auto & ex : {LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}) {
+        argv = {"binary_name", "-m", "model_file.gguf", "--spec-draft-window", "8192"};
+        common_params window_params;
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), window_params, ex));
+        assert(window_params.speculative.draft.attn_window == 8192);
+        llama_context_params cp = llama_context_default_params();
+        common_speculative_mtp_cparams(window_params, cp);
+        assert(cp.draft_attn_window == 8192 && cp.draft_attn_sink == 128); // default sink
+
+        argv = {"binary_name", "-m", "model_file.gguf", "--spec-draft-window", "4096", "--spec-draft-window-sink", "0"};
+        common_params sink_params;
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), sink_params, ex));
+        cp = llama_context_default_params();
+        common_speculative_mtp_cparams(sink_params, cp);
+        assert(cp.draft_attn_window == 4096 && cp.draft_attn_sink == 0);
+
+        // a negative window is clamped to 0 (off)
+        argv = {"binary_name", "-m", "model_file.gguf", "--spec-draft-window", "-5"};
+        common_params neg_params;
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), neg_params, ex));
+        assert(neg_params.speculative.draft.attn_window == 0);
+    }
+
     argv = {"binary_name", "-m", "model_file.gguf", "--spec-draft-n-min-adaptive", "5"};
     common_params adaptive_params;
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), adaptive_params, LLAMA_EXAMPLE_SPECULATIVE));
@@ -364,6 +436,112 @@ static void test(void) {
         assert(draft.cache_type_v == GGML_TYPE_F16);
     }
 
+    // a SJ-KVaRN trunk cannot be inherited: unset draft types default to tq5_0 K / turbo4 V, explicit ones win
+    argv = {"binary_name", "-m", "model_file.gguf", "-ctk", "sjkvarn4", "-ctv", "sjkvarn4"};
+    common_params dkv_sj_kvarn;
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), dkv_sj_kvarn, LLAMA_EXAMPLE_SPECULATIVE));
+    {
+        const auto draft = common_base_params_to_speculative(dkv_sj_kvarn);
+        assert(draft.cache_type_k == COMMON_SJKVARN_MTP_DRAFT_KV[0]);
+        assert(draft.cache_type_v == COMMON_SJKVARN_MTP_DRAFT_KV[1]);
+        assert(draft.speculative.draft.cache_type_sj_kvarn_default);
+        assert(draft.sj_kvarn_bits_k == 0 && draft.sj_kvarn_bits_v == 0);
+    }
+    argv = {"binary_name", "-m", "model_file.gguf", "-ctk", "sjkvarn4", "-ctv", "sjkvarn4", "-ctkd", "f16", "-ctvd", "tq6_0"};
+    common_params dkv_sj_kvarn_pin;
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), dkv_sj_kvarn_pin, LLAMA_EXAMPLE_SPECULATIVE));
+    {
+        const auto draft = common_base_params_to_speculative(dkv_sj_kvarn_pin);
+        assert(draft.cache_type_k == GGML_TYPE_F16);
+        assert(draft.cache_type_v == GGML_TYPE_TQ6_0);
+    }
+    {
+        const auto draft = common_base_params_to_speculative(dkv_inherit);
+        assert(!draft.speculative.draft.cache_type_sj_kvarn_default);
+    }
+    // one side explicit, the other takes the SJ-KVaRN default
+    argv = {"binary_name", "-m", "model_file.gguf", "-ctk", "sjkvarn4", "-ctv", "sjkvarn4", "-ctkd", "q8_0"};
+    common_params dkv_sj_kvarn_k;
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), dkv_sj_kvarn_k, LLAMA_EXAMPLE_SPECULATIVE));
+    {
+        const auto draft = common_base_params_to_speculative(dkv_sj_kvarn_k);
+        assert(draft.cache_type_k == GGML_TYPE_Q8_0);
+        assert(draft.cache_type_v == COMMON_SJKVARN_MTP_DRAFT_KV[1]);
+    }
+    // a separate draft model keeps the plain cache the SJ-KVaRN trunk flags leave behind
+    argv = {"binary_name", "-m", "model_file.gguf", "-md", "draft.gguf", "-ctk", "sjkvarn4", "-ctv", "sjkvarn4"};
+    common_params dkv_sj_kvarn_md;
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), dkv_sj_kvarn_md, LLAMA_EXAMPLE_SPECULATIVE));
+    {
+        const auto draft = common_base_params_to_speculative(dkv_sj_kvarn_md);
+        assert(draft.cache_type_k == dkv_sj_kvarn_md.cache_type_k);
+        assert(draft.cache_type_v == dkv_sj_kvarn_md.cache_type_v);
+        assert(!draft.speculative.draft.cache_type_sj_kvarn_default);
+    }
+
+    argv = {"binary_name", "-m", "model_file.gguf", "--spec-type", "draft-mtp-adaptive",
+            "--spec-draft-sjkvarn", "-ctk", "sjkvarn3", "-ctv", "sjkvarn2", "--sjkvarn-body-type", "sjkvarn4t",
+            "--sjkvarn-staging-type", "tq6_0", "--sjkvarn-sink-type", "f16", "--sjkvarn-tail", "4096",
+            "--sjkvarn-tail-max", "8192", "--sjkvarn-flush-chunk", "4", "--parallel", "1"};
+    common_params dkv_sj_kvarn_inh;
+    assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), dkv_sj_kvarn_inh, LLAMA_EXAMPLE_SERVER));
+    {
+        const auto draft = common_base_params_to_speculative(dkv_sj_kvarn_inh);
+        const auto cparams = common_context_params_to_llama(draft);
+        assert(cparams.sj_kvarn_bits_k == 3 && cparams.sj_kvarn_bits_v == 2);
+        assert(cparams.sj_kvarn_body_type == GGML_TYPE_I16);
+        assert(cparams.sj_kvarn_staging_type == GGML_TYPE_TQ6_0);
+        assert(cparams.sj_kvarn_sink_type == GGML_TYPE_F16);
+        assert(cparams.sj_kvarn_tail == 4096 && cparams.sj_kvarn_tail_max == 8192);
+        assert(cparams.sj_kvarn_flush_chunk == 4 && cparams.sj_kvarn_edge_layers == 0);
+        assert(cparams.type_k == GGML_TYPE_TQ6_0 && cparams.type_v == GGML_TYPE_TQ6_0);
+
+        auto invalid = [](const common_params & p) {
+            bool rejected = false;
+            try {
+                common_base_params_to_speculative(p);
+            } catch (const std::invalid_argument &) {
+                rejected = true;
+            }
+            assert(rejected);
+        };
+        auto bad = dkv_sj_kvarn_inh;
+        bad.speculative.draft.cache_type_k = GGML_TYPE_Q8_0;
+        invalid(bad);
+        bad = dkv_sj_kvarn_inh;
+        bad.speculative.draft.cache_type_v = GGML_TYPE_F16;
+        invalid(bad);
+        bad = dkv_sj_kvarn_inh;
+        bad.n_parallel = 2;
+        invalid(bad);
+        bad = dkv_sj_kvarn_inh;
+        bad.sj_kvarn_bits_k = 0;
+        invalid(bad);
+        bad = dkv_sj_kvarn_inh;
+        bad.speculative.types = { COMMON_SPECULATIVE_TYPE_NONE };
+        invalid(bad);
+        bad = dkv_sj_kvarn_inh;
+        bad.speculative.draft.mparams.path = "draft.gguf";
+        invalid(bad);
+        bad = dkv_sj_kvarn_inh;
+        bad.sj_kvarn_tail = 0;
+        invalid(bad);
+        for (int width = 1; width <= 8; ++width) {
+            auto p = dkv_sj_kvarn_inh;
+            p.n_ctx = 262144;
+            p.speculative.draft.n_max = width;
+            assert(common_context_params_to_llama(common_base_params_to_speculative(p)).sj_kvarn_tail == 4096);
+        }
+        bad = dkv_sj_kvarn_inh;
+        bad.speculative.draft.sj_kvarn = false;
+        const auto plain = common_base_params_to_speculative(bad);
+        assert(plain.sj_kvarn_bits_k == 0 && plain.sj_kvarn_bits_v == 0);
+        assert(plain.sj_kvarn_tail_max == 0 && plain.sj_kvarn_flush_chunk == 0);
+        assert(plain.cache_type_k == COMMON_SJKVARN_MTP_DRAFT_KV[0] && plain.cache_type_v == COMMON_SJKVARN_MTP_DRAFT_KV[1]);
+        assert(plain.speculative.draft.cache_type_sj_kvarn_default);
+        assert(!draft.speculative.draft.cache_type_sj_kvarn_default);
+    }
+
     // n-gram drafters request recurrent-state snapshots for in-place rollback (draft width, capped at 8);
     // --spec-n-rs-seq overrides, 0 = checkpoint restore on every partial acceptance
     argv = {"binary_name", "-m", "model_file.gguf", "--spec-type", "ngram-cache", "--spec-ngram-cache-n-max", "7"};
@@ -401,11 +579,11 @@ static void test(void) {
     common_params invalid_adaptive_params;
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), invalid_adaptive_params, LLAMA_EXAMPLE_SPECULATIVE));
 
-    // per-family speculative defaults (spec-defaults.h): qwen35 with an MTP head gets the MTP drafter at fixed
-    // depth 4 with the production settings unless --spec-type was given; explicit --spec-draft-* values are kept
+    // per-family speculative defaults (spec-defaults.h): qwen35 with an MTP head gets the adaptive MTP drafter
+    // with the production settings unless --spec-type was given; explicit --spec-draft-* values are kept
     {
         const std::vector<enum common_speculative_type> types_none     = { COMMON_SPECULATIVE_TYPE_NONE };
-        const std::vector<enum common_speculative_type> types_mtp      = { COMMON_SPECULATIVE_TYPE_NONE, COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+        const std::vector<enum common_speculative_type> types_adaptive = { COMMON_SPECULATIVE_TYPE_NONE, COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE };
 
         assert(common_speculative_family_default_find("qwen35", 1) != nullptr);
         assert(common_speculative_family_default_find("qwen35", 0) == nullptr);
@@ -418,7 +596,7 @@ static void test(void) {
         assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), auto_params, LLAMA_EXAMPLE_SERVER));
         assert(auto_params.speculative.user_set == 0);
         assert(common_speculative_apply_family_default(auto_params.speculative, "qwen35", 1) != nullptr);
-        assert(auto_params.speculative.types == types_mtp);
+        assert(auto_params.speculative.types == types_adaptive);
         assert(auto_params.speculative.draft.n_max == 4);
         assert(auto_params.speculative.draft.n_min_adaptive == 3);
         assert(auto_params.speculative.draft.p_min == 0.0f);
@@ -426,8 +604,8 @@ static void test(void) {
         assert(auto_params.speculative.draft.cache_type_k == GGML_TYPE_COUNT);
         assert(auto_params.speculative.draft.cache_type_v == GGML_TYPE_COUNT);
 
-        argv = {"binary_name", "-m", "model_file.gguf", "--spec-type", "draft-mtp", "--spec-draft-n-max", "4",
-                "--spec-draft-p-min", "0"};
+        argv = {"binary_name", "-m", "model_file.gguf", "--spec-type", "draft-mtp-adaptive", "--spec-draft-n-max", "4",
+                "--spec-draft-n-min-adaptive", "3", "--spec-draft-p-min", "0"};
         common_params explicit_params;
         assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), explicit_params, LLAMA_EXAMPLE_SERVER));
         assert(common_speculative_apply_family_default(explicit_params.speculative, "qwen35", 1) == nullptr);
@@ -457,7 +635,7 @@ static void test(void) {
         assert(none_params.speculative.user_set & COMMON_PARAMS_SPECULATIVE_USER_TYPE);
         assert(common_speculative_apply_family_default(none_params.speculative, "qwen35", 1) == nullptr);
         assert(std::find(none_params.speculative.types.begin(), none_params.speculative.types.end(),
-                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) == none_params.speculative.types.end());
+                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE) == none_params.speculative.types.end());
 
         // an explicit --spec-draft-n-max without --spec-type -> the auto type with that n-max (the floor follows it)
         argv = {"binary_name", "-m", "model_file.gguf", "--spec-draft-n-max", "2"};
@@ -465,7 +643,7 @@ static void test(void) {
         assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), n_max_params, LLAMA_EXAMPLE_SERVER));
         assert(n_max_params.speculative.user_set == COMMON_PARAMS_SPECULATIVE_USER_DRAFT_N_MAX);
         assert(common_speculative_apply_family_default(n_max_params.speculative, "qwen35", 1) != nullptr);
-        assert(n_max_params.speculative.types == types_mtp);
+        assert(n_max_params.speculative.types == types_adaptive);
         assert(n_max_params.speculative.draft.n_max == 2);
         assert(n_max_params.speculative.draft.n_min_adaptive == 2);
 

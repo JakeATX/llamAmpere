@@ -211,9 +211,10 @@ Two categories of failure exist near the VRAM boundary:
   construction (e.g. the compute buffer) aren't yet accounted for, so it
   catches the clearly-too-tight case, not necessarily every possible one.
 
-Size the arena for your model/GPU/context combination by trying it at the
-full context before relying on it: a production deployment does not back off
-automatically on allocation failure.
+Use `benchmarks/benchmark_kv_stream.py` (see `benchmarks/README.md`) to find
+a safe arena size empirically for your model/GPU/context combination rather
+than guessing - it probes VRAM headroom and backs off automatically on
+allocation failure, which a production deployment does not get for free.
 
 ## Verifying it's actually active
 

@@ -228,6 +228,6 @@
 | `--gpt-oss-120b-default` | use gpt-oss-120b (note: can download weights from the internet) |
 | `--vision-gemma-4b-default` | use Gemma 3 4B QAT (note: can download weights from the internet) |
 | `--vision-gemma-12b-default` | use Gemma 3 12B QAT (note: can download weights from the internet) |
-| `--spec-default` | enable default speculative decoding config |
+| `--spec-default` | enable the n-gram speculative preset (--spec-type ngram-mod, n-match 24, n-min 48, n-max 64); this is not the per-family model default (e.g. the qwen35 MTP drafter), which it replaces like any explicit --spec-type |
 
 <!-- HELP_END -->

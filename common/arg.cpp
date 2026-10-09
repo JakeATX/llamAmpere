@@ -4,6 +4,7 @@
 #include "chat.h"
 #include "common.h"
 #include "download.h"
+#include "ggml-ledger.h"
 #include "json-schema-to-grammar.h"
 #include "json.h"
 #include "llama.h"
@@ -382,6 +383,15 @@ static std::string kv_cache_type_display_name(ggml_type type) {
     return turbo.empty() || tq.empty() ? names[0] : turbo + " (" + tq + ")";
 }
 
+// "sjkvarnN" (N in 2..8) selects the SJ-KVaRN region-aware cache: the ring/sink use the staging type, the body is sealed at N bits
+static bool sj_kvarn_bits_from_str(const std::string & s, uint32_t & bits) {
+    if (s.size() != 8 || s.compare(0, 7, "sjkvarn") != 0 || s[7] < '2' || s[7] > '8') {
+        return false;
+    }
+    bits = (uint32_t) (s[7] - '0');
+    return true;
+}
+
 static std::string get_all_kv_cache_types() {
     std::ostringstream msg;
     for (const auto & type : kv_cache_types) {
@@ -423,7 +433,7 @@ static bool parse_bool_value(const std::string & value) {
 static std::string get_default_local_path(const std::string & url) {
     auto f = string_split<std::string>(url, '#').front();
     f = string_split<std::string>(f, '?').front();
-    return fs_get_cache_file(string_split<std::string>(f, '/').back());
+    return fs_path_to_utf8(fs_get_cache_file(string_split<std::string>(f, '/').back()));
 }
 
 static bool spec_types_is_default(const common_params & params) {
@@ -461,6 +471,9 @@ common_models_handler common_models_handler_init(const common_params & params, l
             use_mmproj = true;
             break;
         }
+    }
+    if (curr_ex == LLAMA_EXAMPLE_DOWNLOAD) {
+        use_mmproj = true;
     }
 
     opts.bearer_token    = params.hf_token;
@@ -754,7 +767,10 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
             // if HF repo is a preset repo, we simply run server in router mode with the preset.ini file
             params.models_preset_hf = params.model.hf_repo; // only for showing a warning
             params.models_preset    = hf_cache::finalize_file(plan.preset);
-            params.model = common_params_model{}; // make sure to clear model, so server starts in router mode
+            // clear the model so the server starts in router mode
+            params.model.path.clear();
+            params.model.hf_repo.clear();
+            params.model.docker_repo.clear();
         });
     }
 
@@ -792,24 +808,24 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
 // 1. system-wide: /etc/llama.cpp/config.ini (%PROGRAMDATA%\llama.cpp\config.ini on windows)
 // 2. user-level: ${XDG_CONFIG_HOME:-~/.config}/llama.cpp/config.ini (%APPDATA%\llama.cpp\config.ini on windows)
 static void common_params_apply_system_config(common_params & params, llama_example ex) {
-    std::vector<std::string> paths;
+    std::vector<std::filesystem::path> paths;
 
 #if defined(_WIN32)
-    const std::string program_data = common_get_env("PROGRAMDATA");
+    const std::filesystem::path program_data = common_get_path_from_env("PROGRAMDATA");
     if (!program_data.empty()) {
-        paths.push_back(program_data + "\\llama.cpp\\config.ini");
+        paths.push_back(program_data / "llama.cpp" / "config.ini");
     }
 #else
     paths.push_back("/etc/llama.cpp/config.ini");
 #endif
 
     try {
-        paths.push_back(fs_get_config_directory() + "config.ini");
+        paths.push_back(fs_get_config_directory() / "config.ini");
     } catch (const std::exception & e) {
         LOG_DBG("cannot read user-level config file, skipping: %s\n", e.what());
     }
 
-    std::vector<std::string> found;
+    std::vector<std::filesystem::path> found;
     for (const auto & path : paths) {
         std::error_code ec;
         if (std::filesystem::exists(path, ec)) {
@@ -823,7 +839,7 @@ static void common_params_apply_system_config(common_params & params, llama_exam
     common_preset_context ctx(ex);
     ctx.ignore_unknown_keys = true; // the same config file is shared by all programs
     for (const auto & path : found) {
-        LOG_INF("using config file: %s\n", path.c_str());
+        LOG_INF("using config file: %s\n", fs_path_to_utf8(path).c_str());
         common_preset global;
         common_presets presets = ctx.load_from_ini(path, global);
         global.apply_to_params(params);
@@ -1824,30 +1840,46 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"-cram", "--cache-ram"}, "N",
-        string_format("set the maximum cache size in MiB (default: %d, -1 - half of the free host memory at startup, 0 - disable)"
-            "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)", params.cache_ram_mib),
+        "maximum RAM size of the prompt cache in MiB (default: sized from total host RAM: <16 GB 2048, 16 GB 4096, "
+        "32 GB 8192, 64 GB 12288, 96 GB 16384, 128 GB+ 20480, at most half of the available memory at startup; "
+        "-1 = half of the free host memory at startup, 0 = disable)"
+        "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)",
         [](common_params & params, int value) {
+            if (value < -1) {
+                throw std::invalid_argument("cache-ram must be -1, 0 or a size in MiB");
+            }
             params.cache_ram_mib = value;
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
         {"--cache-disk-path"}, "PATH",
-        "directory for a disk tier of the prompt cache: entries evicted from the RAM cache are written here and "
-        "restored on a later cache miss instead of re-processing the prompt (default: disabled)",
+        "directory of the prompt-cache disk tier: entries evicted from the RAM cache (and the cache at shutdown) are "
+        "written here and restored on a later cache miss or after a restart instead of re-processing the prompt; "
+        "created if missing (default: $XDG_CACHE_HOME/llamampere/prompt-cache, else ~/.cache/llamampere/prompt-cache)",
         [](common_params & params, const std::string & value) {
             params.cache_disk_path = value;
-            if (!fs_is_directory(params.cache_disk_path)) {
-                throw std::invalid_argument("cache-disk-path must be an existing directory");
-            }
+            params.cache_disk      = true;
         }
     ).set_env("LLAMA_ARG_CACHE_DISK_PATH").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--cache-disk-limit"}, "N",
-        string_format("size limit of the prompt-cache disk tier in MiB (default: %d, 0 = no limit)", params.cache_disk_mib),
+        string_format("size limit of the prompt-cache disk tier in MiB; the oldest-written entries are deleted first, "
+            "and writes are skipped while the filesystem has less than max(10%%, 8 GiB) free "
+            "(default: %d, -1 = no limit, the free-space guard still applies, 0 = disable the disk tier)", params.cache_disk_mib),
         [](common_params & params, int value) {
+            if (value < -1) {
+                throw std::invalid_argument("cache-disk-limit must be -1, 0 or a size in MiB");
+            }
             params.cache_disk_mib = value;
         }
     ).set_env("LLAMA_ARG_CACHE_DISK_LIMIT").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--no-cache-disk"},
+        "disable the prompt-cache disk tier (RAM cache only)",
+        [](common_params & params) {
+            params.cache_disk = false;
+        }
+    ).set_env("LLAMA_ARG_NO_CACHE_DISK").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
@@ -2575,12 +2607,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"-ctk", "--cache-type-k"}, "TYPE",
         string_format(
             "KV cache data type for K\n"
-            "allowed values: %s\n"
+            "allowed values: %s, sjkvarn4 (SJ-KVaRN region-aware cache, pair with -ctv sjkvarn4)\n"
             "(default: %s)",
             get_all_kv_cache_types().c_str(),
             ggml_type_name(params.cache_type_k)
         ),
         [](common_params & params, const std::string & value) {
+            if (sj_kvarn_bits_from_str(value, params.sj_kvarn_bits_k)) {
+                params.cache_type_k = GGML_TYPE_F16;
+                return;
+            }
+            params.sj_kvarn_bits_k = 0;
             params.cache_type_k = kv_cache_type_from_str(value);
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_K"));
@@ -2588,15 +2625,158 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"-ctv", "--cache-type-v"}, "TYPE",
         string_format(
             "KV cache data type for V\n"
-            "allowed values: %s\n"
+            "allowed values: %s, sjkvarn4 (SJ-KVaRN region-aware cache, pair with -ctk sjkvarn4)\n"
             "(default: %s)",
             get_all_kv_cache_types().c_str(),
             ggml_type_name(params.cache_type_v)
         ),
         [](common_params & params, const std::string & value) {
+            if (sj_kvarn_bits_from_str(value, params.sj_kvarn_bits_v)) {
+                params.cache_type_v = GGML_TYPE_F16;
+                return;
+            }
+            params.sj_kvarn_bits_v = 0;
             params.cache_type_v = kv_cache_type_from_str(value);
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
+    add_opt(common_arg(
+        {"-cts", "--cache-type-s"}, "TYPE",
+        string_format(
+            "recurrent state cache data type for gated delta-net layers (Qwen3.5/3.6, Qwen3-Next, Qwen3.8-Flash-Next, Kimi Linear);\n"
+            "bf16 and f16 halve the state memory, q8_0 cuts it to 8.5 bits per value (0.27x);\n"
+            "the recurrence itself still runs in f32, only the stored state is rounded;\n"
+            "f16 keeps 3 more mantissa bits than bf16 but becomes inf/nan if a state value exceeds 65504\n"
+            "allowed values: f32, bf16, f16, q8_0\n"
+            "(default: %s)",
+            ggml_type_name(params.cache_type_s)
+        ),
+        [](common_params & params, const std::string & value) {
+            if (value == "f32") {
+                params.cache_type_s = GGML_TYPE_F32;
+            } else if (value == "bf16") {
+                params.cache_type_s = GGML_TYPE_BF16;
+            } else if (value == "f16") {
+                params.cache_type_s = GGML_TYPE_F16;
+            } else if (value == "q8_0") {
+                params.cache_type_s = GGML_TYPE_Q8_0;
+            } else {
+                throw std::runtime_error("Unsupported recurrent state cache type: " + value + " (f32, bf16, f16, q8_0)");
+            }
+        }
+    ).set_env("LLAMA_ARG_CACHE_TYPE_S"));
+    add_opt(common_arg(
+        {"--sjkvarn-staging-type"}, "TYPE",
+        "SJ-KVaRN tail (and sink) storage: tq6_0, q8_0 or f16 (default: tq6_0 with a separate f16 sink; q8_0 stores the sink in q8_0 too)",
+        [](common_params & params, const std::string & value) {
+            if (value != "f16" && value != "q8_0" && value != "tq6_0") {
+                throw std::invalid_argument("SJ-KVaRN staging type must be f16, q8_0 or tq6_0");
+            }
+            params.sj_kvarn_staging_type = kv_cache_type_from_str(value);
+            // the default F16 sink exists only beside TQ6 staging; other staging types inherit unless --sjkvarn-sink-type was given
+            if (!params.sj_kvarn_sink_type_set) {
+                params.sj_kvarn_sink_type = params.sj_kvarn_staging_type == GGML_TYPE_TQ6_0 ? GGML_TYPE_F16 : GGML_TYPE_COUNT;
+            }
+        }
+    ).set_env("LLAMA_ARG_SJKVARN_STAGING_TYPE"));
+    add_opt(common_arg(
+        {"--sjkvarn-sink-type"}, "TYPE",
+        "SJ-KVaRN sink storage: staging or f16 (default: f16 with tq6_0 staging, staging otherwise)",
+        [](common_params & params, const std::string & value) {
+            if (value != "staging" && value != "f16") {
+                throw std::invalid_argument("SJ-KVaRN sink type must be staging or f16");
+            }
+            params.sj_kvarn_sink_type = value == "f16" ? GGML_TYPE_F16 : GGML_TYPE_COUNT;
+            params.sj_kvarn_sink_type_set = true;
+        }
+    ).set_env("LLAMA_ARG_SJKVARN_SINK_TYPE"));
+    add_opt(common_arg(
+        {"--sjkvarn-body-type"}, "TYPE",
+        "Sealed body codec: sjkvarn4 (scalar), sjkvarn4t (trellis-coded payload with the built-in trained codebooks; 4-bit, or the low-bit pairs 3/3, 3/2, 2/2 with -ctk sjkvarn3|sjkvarn2 -ctv sjkvarn3|sjkvarn2), "
+        "auto (trellis for the 3/3, 3/2 and 2/2 pairs, scalar otherwise) or turbo4 (default: sjkvarn4)",
+        [](common_params & params, const std::string & value) {
+            if (value != "sjkvarn4" && value != "sjkvarn4t" && value != "auto" && value != "turbo4") {
+                throw std::invalid_argument("SJ-KVaRN body type must be sjkvarn4, sjkvarn4t, auto or turbo4");
+            }
+            params.sj_kvarn_body_type = value == "turbo4" ? GGML_TYPE_TURBO4_0 : value == "sjkvarn4t" ? GGML_TYPE_I16 : value == "auto" ? GGML_TYPE_COUNT : GGML_TYPE_F32;
+        }
+    ).set_env("LLAMA_ARG_SJKVARN_BODY_TYPE"));
+    add_opt(common_arg(
+        {"--tiered-tq"},
+        "Tiered TQ cache: FP16 sink 128, sealed Turbo4 body, TQ6 tail 8192",
+        [](common_params & params) {
+            params.sj_kvarn_bits_k = params.sj_kvarn_bits_v = 4;
+            params.sj_kvarn_body_type = GGML_TYPE_TURBO4_0;
+            params.sj_kvarn_staging_type = GGML_TYPE_TQ6_0;
+            params.sj_kvarn_sink_type = GGML_TYPE_F16;
+            params.sj_kvarn_sink = 128;
+            params.sj_kvarn_tail = 8192;
+            params.sj_kvarn_tail_max = 0;
+        }
+    ));
+    add_opt(common_arg(
+        {"--sjkvarn-tail"}, "N",
+        string_format("SJ-KVaRN cache: number of most recent positions kept unsealed (multiple of 128, default: %u)", params.sj_kvarn_tail),
+        [](common_params & params, int value) {
+            params.sj_kvarn_tail = (uint32_t) value;
+            // the default adaptive ceiling follows a larger explicit tail; an explicit --sjkvarn-tail-max is kept as given
+            if (!params.sj_kvarn_tail_max_set && params.sj_kvarn_tail_max != 0 && params.sj_kvarn_tail_max < params.sj_kvarn_tail) {
+                params.sj_kvarn_tail_max = params.sj_kvarn_tail;
+            }
+        }
+    ).set_env("LLAMA_ARG_SJKVARN_TAIL"));
+    add_opt(common_arg(
+        {"--sjkvarn-tail-max"}, "N",
+        string_format("SJ-KVaRN adaptive tail: grow to N positions, then batch compression toward --sjkvarn-tail; server idle compression discards prompt checkpoints; 0 = fixed tail (default: %u)", params.sj_kvarn_tail_max),
+        [](common_params & params, int value) {
+            if (value < 0 || value % 128 != 0) {
+                throw std::invalid_argument("SJ-KVaRN maximum tail must be nonnegative and a multiple of 128");
+            }
+            params.sj_kvarn_tail_max = (uint32_t) value;
+            params.sj_kvarn_tail_max_set = true;
+        }
+    ).set_env("LLAMA_ARG_SJKVARN_TAIL_MAX"));
+    add_opt(common_arg(
+        {"--sjkvarn-edge-layers"}, "N",
+        "SJ-KVaRN tiered body: KV layers within the first N and last N model layers (blocks of any type) seal their body at --sjkvarn-edge-bits instead of the -ctk/-ctv bits; one eighth of the layer count per end holds a quarter of the model (default: 0 = uniform)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("SJ-KVaRN edge layer count must be nonnegative");
+            }
+            params.sj_kvarn_edge_layers = (uint32_t) value;
+        }
+    ).set_env("LLAMA_ARG_SJKVARN_EDGE_LAYERS"));
+    add_opt(common_arg(
+        {"--sjkvarn-edge-bits"}, "K/V",
+        "SJ-KVaRN tiered body: body bits for the edge layers, e.g. 4/4 (default: 4/4); the codec follows --sjkvarn-body-type (auto: trellis only for 3/3, 3/2, 2/2)",
+        [](common_params & params, const std::string & value) {
+            unsigned k = 0, v = 0;
+            char sep = 0;
+            if (sscanf(value.c_str(), "%u%c%u", &k, &sep, &v) != 3 || (sep != '/' && sep != ',') || k < 2 || k > 8 || v < 2 || v > 8) {
+                throw std::invalid_argument("SJ-KVaRN edge bits must be K/V with K and V in 2..8");
+            }
+            params.sj_kvarn_edge_bits_k = k;
+            params.sj_kvarn_edge_bits_v = v;
+        }
+    ).set_env("LLAMA_ARG_SJKVARN_EDGE_BITS"));
+    add_opt(common_arg(
+        {"--sjkvarn-flush-chunk"}, "N",
+        "SJ-KVaRN adaptive tail: when the tail reaches --sjkvarn-tail-max, seal at most N groups (128 positions each) per "
+        "decode step and drain the rest over the following steps instead of in one pause; prefill-sized ubatches "
+        "still flush at once; 0 = one flush (default: 0)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("SJ-KVaRN flush chunk must be nonnegative");
+            }
+            params.sj_kvarn_flush_chunk = (uint32_t) value;
+        }
+    ).set_env("LLAMA_ARG_SJKVARN_FLUSH_CHUNK"));
+    add_opt(common_arg(
+        {"--sjkvarn-sink"}, "N",
+        string_format("SJ-KVaRN cache: number of leading positions kept unsealed (multiple of 64, default: %u)", params.sj_kvarn_sink),
+        [](common_params & params, int value) {
+            params.sj_kvarn_sink = (uint32_t) value;
+        }
+    ).set_env("LLAMA_ARG_SJKVARN_SINK"));
     add_opt(common_arg(
         {"--hellaswag"},
         "compute HellaSwag score over random tasks from datafile supplied with -f",
@@ -2815,16 +2995,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.video_ffmpeg_bin_dir = value;
         }
     ).set_examples(mmproj_examples).set_env("LLAMA_ARG_VIDEO_FFMPEG_DIR"));
-    if (params.is_gen_docs || llama_supports_rpc()) {
-        add_opt(common_arg(
-            {"--rpc"}, "SERVERS",
-            "comma-separated list of RPC servers (host:port)",
-            [](common_params & params, const std::string & value) {
-                add_rpc_devices(value);
-                GGML_UNUSED(params);
+    add_opt(common_arg(
+        {"--rpc"}, "SERVERS",
+        "comma-separated list of RPC servers (host:port)",
+        [](common_params & params, const std::string & value) {
+            if (!llama_supports_rpc()) {
+                throw std::invalid_argument("RPC not supported in this build");
             }
-        ).set_env("LLAMA_ARG_RPC"));
-    }
+            add_rpc_devices(value);
+            GGML_UNUSED(params);
+        }
+    ).set_env("LLAMA_ARG_RPC"));
     add_opt(common_arg(
         {"-lm", "--load-mode"}, "MODE",
         "model loading mode (default: auto)\n"
@@ -2946,6 +3127,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_env("LLAMA_ARG_MOE_CACHE"));
+    add_opt(common_arg(
+        {"--moe-cache-mib"}, "N",
+        "GPU cache size in MiB for the MoE experts kept in the CPU (default: 0, disabled)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_cache_size = (size_t) value*1024*1024;
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_MIB"));
     add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"
@@ -3354,6 +3545,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_IMATRIX}));
     add_opt(common_arg(
+        {"--nextn"},
+        string_format("collect data for MTP/NextN layers (default: %s)", params.load_mtp ? "true" : "false"),
+        [](common_params & params) {
+            params.load_mtp = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_IMATRIX}));
+    add_opt(common_arg(
         {"--ppl"},
         {"--no-ppl"},
         string_format("whether to compute perplexity (default: %s)", params.compute_ppl ? "true" : "false"),
@@ -3737,6 +3935,32 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SSE_PING_INTERVAL"));
     add_opt(common_arg(
+        {"--sse-ping-queued"},
+        "keep-alive for queued streaming requests: when no slot has started the request within one SSE ping interval, "
+        "send the HTTP 200 headers and pings while it waits; an error raised after that is sent as an SSE error event "
+        "instead of an HTTP error status (default: disabled)",
+        [](common_params & params) {
+            params.sse_ping_queued = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SSE_PING_QUEUED"));
+    add_opt(common_arg(
+        {"--slot-stall-timeout"}, "N",
+        string_format("log a warning when a busy slot makes no progress (prompt or generated tokens) for N seconds while "
+                      "no other slot progresses either, including a decode that does not return; set N above the longest "
+                      "single batch (0 = disabled, default: %d)", params.slot_stall_timeout),
+        [](common_params & params, int value) {
+            params.slot_stall_timeout = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SLOT_STALL_TIMEOUT"));
+    add_opt(common_arg(
+        {"--slot-stall-cancel"},
+        string_format("with --slot-stall-timeout, also fail the stalled request with an error so that its client is released; "
+                      "the slot is freed once the main loop runs again (default: %s)", params.slot_stall_cancel ? "enabled" : "disabled"),
+        [](common_params & params) {
+            params.slot_stall_cancel = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SLOT_STALL_CANCEL"));
+    add_opt(common_arg(
         {"--threads-http"}, "N",
         string_format("number of threads used to process HTTP requests (default: %d)", params.n_threads_http),
         [](common_params & params, int value) {
@@ -4064,6 +4288,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"--fallback-ledger"},
+        "count which kernel route each op takes and why a fast path was skipped (CUDA graph rebuild reasons, "
+        "mul_mat routes by width, flash-attention kernels and f16 KV conversions, fusions that did not fire, "
+        "draft vocabulary fallbacks); printed at exit and, in llama-server, on /metrics (same as GGML_LEDGER=1)",
+        [](common_params &) {
+            ggml_ledger_set_enabled(true);
+        }
+    ).set_env("LLAMA_ARG_FALLBACK_LEDGER"));
+    add_opt(common_arg(
         {"--log-file"}, "FNAME",
         "Log to file",
         [](common_params &, const std::string & value) {
@@ -4278,8 +4511,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format(
             "KV cache data type for K for the draft model\n"
             "allowed values: %s\n"
-            "(default: the main model's K cache type from -ctk; pass f16 to force f16)",
-            get_all_kv_cache_types().c_str()
+            "(default: the main model's K cache type from -ctk; %s for an MTP drafter over a SJ-KVaRN trunk; pass f16 to force f16)",
+            get_all_kv_cache_types().c_str(), ggml_type_name(COMMON_SJKVARN_MTP_DRAFT_KV[0])
         ),
         [](common_params & params, const std::string & value) {
             params.speculative.draft.cache_type_k = kv_cache_type_from_str(value);
@@ -4290,13 +4523,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format(
             "KV cache data type for V for the draft model\n"
             "allowed values: %s\n"
-            "(default: the main model's V cache type from -ctv; pass f16 to force f16)",
-            get_all_kv_cache_types().c_str()
+            "(default: the main model's V cache type from -ctv; %s for an MTP drafter over a SJ-KVaRN trunk; pass f16 to force f16)",
+            get_all_kv_cache_types().c_str(), ggml_type_name(COMMON_SJKVARN_MTP_DRAFT_KV[1])
         ),
         [](common_params & params, const std::string & value) {
             params.speculative.draft.cache_type_v = kv_cache_type_from_str(value);
         }
     ).set_env("LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V"));
+    add_opt(common_arg(
+        {"--spec-draft-sjkvarn"},
+        "inherit the trunk's SJ-KVaRN body, sink, staging and tail for single-sequence MTP (incompatible with -ctkd/-ctvd)",
+        [](common_params & params) {
+            params.speculative.draft.sj_kvarn = true;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
         {"--spec-draft-override-tensor", "-otd", "--override-tensor-draft"}, "<tensor name pattern>=<buffer type>,...",
         "override tensor buffer type for draft model", [](common_params & params, const std::string & value) {
@@ -4476,6 +4716,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_VOCAB_HOT"));
     add_opt(common_arg(
+        {"--spec-draft-window"}, "N",
+        "[EXPERIMENTAL] MTP drafter attention window: the drafter attends only to its last N positions plus "
+        "--spec-draft-window-sink sink positions; its KV cache becomes a ring of that size (default: 0 = full attention)",
+        [](common_params & params, int value) {
+            params.speculative.draft.attn_window = std::max(0, value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-draft-window-sink"}, "N",
+        "[EXPERIMENTAL] sink positions (the first N) kept with --spec-draft-window (default: 128)",
+        [](common_params & params, int value) {
+            params.speculative.draft.attn_sink = std::max(0, value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
         {"--spec-draft-backend-sampling"},
         {"--no-spec-draft-backend-sampling"},
         string_format("offload draft sampling to the backend (default: %s)",
@@ -4484,6 +4739,23 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.backend_sampling = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_BACKEND_SAMPLING"));
+    add_opt(common_arg(
+        {"--spec-draft-sampling"}, "{greedy,probabilistic}",
+        string_format("how the draft is sampled: greedy takes its argmax, probabilistic samples it and has "
+                      "the target verify by rejection sampling (default: %s)",
+                      params.speculative.draft.probabilistic ? "probabilistic" : "greedy"),
+        [](common_params & params, const std::string & value) {
+            if (value == "greedy") {
+                params.speculative.draft.probabilistic = false;
+            } else if (value == "probabilistic") {
+                params.speculative.draft.probabilistic = true;
+                LOG_WRN("--spec-draft-sampling probabilistic: not wired in this tree; the sampled-draft path here is "
+                        "exact p/q drafting (LLAMA_SPEC_PQ=1)\n");
+            } else {
+                throw std::invalid_argument("invalid value, must be one of: greedy, probabilistic");
+            }
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_SAMPLING"));
     add_opt(common_arg(
         {"--spec-draft-device", "-devd", "--device-draft"}, "<dev1,dev2,..>",
         "comma-separated list of devices to use for offloading the draft model (none = don't offload, default: follows --device)\n"
@@ -4519,7 +4791,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.mparams.path = value;
             params.speculative.draft.mparams.hf_file = value; // will be used if --spec-draft-hf is set
         }
-    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_MODEL"));
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_IMATRIX}).set_env("LLAMA_ARG_SPEC_DRAFT_MODEL"));
     add_opt(common_arg(
         {"--spec-type"}, common_speculative_all_types_str(),
         string_format("comma-separated list of types of speculative decoding to use (default: auto, i.e. the model's "
@@ -5033,7 +5305,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
 
     add_opt(common_arg(
         {"--spec-default"},
-        string_format("enable default speculative decoding config"),
+        string_format("enable the n-gram speculative preset (--spec-type ngram-mod, n-match 24, n-min 48, n-max 64); "
+            "this is not the per-family model default (e.g. the qwen35 MTP drafter), which it replaces like any explicit --spec-type"),
         [](common_params & params) {
             params.speculative.types.push_back(COMMON_SPECULATIVE_TYPE_NGRAM_MOD);
             params.speculative.user_set |= COMMON_PARAMS_SPECULATIVE_USER_TYPE;

@@ -62,8 +62,8 @@ enum common_params_fit_status {
 //   - its context follows the context of the main model, so its memory is measured again whenever that context changes
 //   - shares_model tells the fit that the weights are already counted in the main model, as for an MTP context
 //   - shares_compute tells the fit that the context borrows the compute buffers of the main context, as an MTP context
-//     does on a single device (LLAMA_SHARED_COMPUTE); it is then measured once at the minimum context size and its KV
-//     cache is scaled from there
+//     does on a single device (LLAMA_SHARED_COMPUTE); it then adds its KV cache and only the growth of the shared
+//     compute buffer beyond the main context's own need
 struct common_fit_extra_model {
     const char * path_model;
     llama_model_params * mparams;
@@ -81,8 +81,8 @@ struct common_fit_extra_memory {
 
 // memory the extra model adds to one device at context size n_ctx, from a measurement at n_ctx_measured:
 //   - the weights do not depend on the context, the KV cache grows linearly with it (rounded up)
-//   - a context that shares compute buffers adds nothing while its own buffer fits in the main context's buffer
-//     (compute_main), otherwise it allocates a private buffer of the measured size
+//   - a context that shares compute buffers grows the main context's buffer (compute_main) to the larger of the two
+//     graphs (ggml_gallocr donor rule), so it adds max(0, measured compute - compute_main)
 common_fit_extra_memory common_fit_extra_memory_at(
         const common_fit_extra_memory & measured,
                              uint32_t   n_ctx_measured,

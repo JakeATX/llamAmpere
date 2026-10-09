@@ -8,6 +8,7 @@
 #include "ggml.h"
 #include "llama.h"
 
+#include <array>
 #include <list>
 #include <set>
 #include <sstream>
@@ -18,6 +19,7 @@
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
+#include <cstdio>
 
 #if defined(_WIN32) && !defined(_WIN32_WINNT)
 #define _WIN32_WINNT 0x0A00
@@ -348,6 +350,8 @@ struct common_params_speculative_draft {
     std::string vocab_map = "auto"; // draft-only vocabulary shortlist for the MTP draft head: auto, auto:N, none or a map file
     int32_t vocab_hot = 0; // trailing entries of that map kept adaptive: repointed at ids seen in recent requests
 
+    bool probabilistic = false; // sample the draft and verify by rejection, instead of argmax and match
+
     common_params_model mparams;
 
     llama_context * ctx_tgt = nullptr;
@@ -359,6 +363,8 @@ struct common_params_speculative_draft {
     // cache_type_k / cache_type_v (resolved in common_base_params_to_speculative)
     ggml_type cache_type_k = GGML_TYPE_COUNT; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_COUNT; // KV cache data type for the V
+    bool      cache_type_sj_kvarn_default = false; // set on the resolved copy: an unset type took the SJ-KVaRN-trunk default
+    bool sj_kvarn = false; // inherit the trunk's SJ-KVaRN body, sink and tail for MTP
 
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;
@@ -371,6 +377,10 @@ struct common_params_speculative_draft {
     bool    dflash                = false; // use DFlash speculative decoding
     bool    dflash_defer_injection = true;  // defer encoder KV injection to draft time (set false for higher acceptance on some models)
     int32_t n_ctx                 = 0;     // draft context size
+
+    // MTP drafter attention window (default off)
+    int32_t attn_window = 0;     // > 0: the MTP drafter attends only to its last attn_window positions (+ sinks)
+    int32_t attn_sink   = -1;    // sink positions kept with attn_window (-1 = default 128)
 
 };
 
@@ -540,6 +550,9 @@ struct common_moe_cache_params {
     bool fit_selected          = false;
 };
 
+// --cache-ram not given: pick the prompt-cache RAM budget from the host's memory at startup
+#define COMMON_CACHE_RAM_AUTO (-2)
+
 struct common_params {
     int32_t n_predict             =    -1; // max. number of new tokens to predict, -1 == no limit
     int32_t n_ctx                 =     0; // context size, 0 == context the model was trained with
@@ -680,12 +693,32 @@ struct common_params {
     bool no_extra_bufts    = false; // disable extra buffer types (used for weight repacking)
     common_moe_cache_params moe_cache;
     bool no_host           = false; // bypass host buffer allowing extra buffers to be used
+    bool load_mtp          = false; // load MTP/NextN layers
 
     bool single_turn       = false; // single turn chat conversation
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
     uint32_t kv_stream_arena_mib = 0;        // shared CUDA KV + compute arena, 0 = disabled [EXPERIMENTAL]
+
+    // SJ-KVaRN region-aware cache (-ctk sj_kvarnN -ctv sj_kvarnM): 0 = off; sink/tail positions kept unsealed
+    uint32_t sj_kvarn_bits_k = 0;
+    uint32_t sj_kvarn_bits_v = 0;
+    uint32_t sj_kvarn_tail   = 4096;
+    uint32_t sj_kvarn_sink   = 128;
+    ggml_type sj_kvarn_staging_type = GGML_TYPE_TQ6_0; // intermediate tail precision; f16 is opt-in only
+    ggml_type sj_kvarn_sink_type = GGML_TYPE_F16;      // separate F16 sink (TQ6 staging); q8_0 staging inherits
+    bool      sj_kvarn_sink_type_set = false;          // --sjkvarn-sink-type given explicitly
+    ggml_type sj_kvarn_body_type = GGML_TYPE_F32; // F32 sentinel selects scalar SJ-KVaRN records; I16 = trellis body; COUNT = auto (see llama.h)
+    uint32_t sj_kvarn_tail_max = 8192;   // adaptive tail by default; 0 = fixed tail
+    bool     sj_kvarn_tail_max_set = false; // --sjkvarn-tail-max given explicitly
+    uint32_t sj_kvarn_edge_layers = 0; // tiered body: first/last N cache layers sealed at sj_kvarn_edge_bits_k/v
+    uint32_t sj_kvarn_edge_bits_k = 4;
+    uint32_t sj_kvarn_edge_bits_v = 4;
+    uint32_t sj_kvarn_flush_chunk = 0; // groups per decode step while an adaptive-tail flush drains (0 = one flush)
+    ggml_type cache_type_s = GGML_TYPE_F32; // recurrent (gated delta-net) state cache data type
+
+    size_t moe_cache_size = 0; // GPU cache size in bytes for the MoE experts kept in the CPU
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 
@@ -722,6 +755,9 @@ struct common_params {
     int32_t timeout_read        = 3600;          // http read timeout in seconds
     int32_t timeout_write       = timeout_read;  // http write timeout in seconds
     int32_t sse_ping_interval   = 30;            // SSE ping interval in seconds
+    bool    sse_ping_queued     = false;         // start a queued streaming request with SSE pings after one ping interval
+    int32_t slot_stall_timeout  = 0;             // report a busy slot with no progress for this many seconds (0 = disabled)
+    bool    slot_stall_cancel   = false;         // also fail the stalled request so that its client is released
     int32_t n_threads_http      = -1;    // number of threads to process HTTP requests (TODO: support threadpool)
     int32_t n_cache_reuse       = 0;     // min chunk size to reuse from the cache via KV shifting
     bool    cache_prompt        = true;  // whether to enable prompt caching
@@ -729,9 +765,11 @@ struct common_params {
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
-    int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
-    std::string cache_disk_path;         // spill prompt-cache entries evicted from RAM to this directory (empty = off)
-    int32_t cache_disk_mib      = 0;     // disk tier size limit in MiB, 0 = no limit
+    int32_t cache_ram_mib       = COMMON_CACHE_RAM_AUTO; // auto = sized from host RAM (see common_prompt_cache_ram_auto_mib),
+                                                             // -1 = half of the free host memory, 0 = disable, N = N MiB
+    bool        cache_disk      = true;  // prompt-cache disk tier (--no-cache-disk turns it off)
+    std::string cache_disk_path;         // disk tier directory (empty = common_prompt_cache_default_dir())
+    int32_t cache_disk_mib      = 16384; // disk tier size limit in MiB, -1 = no limit (free-space guard only), 0 = disable
 
     std::string public_path   = "";                                                                         // NOLINT
     std::string api_prefix    = "";                                                                         // NOLINT
@@ -823,10 +861,11 @@ struct common_params {
     int32_t i_chunk     =  0; // start processing from this chunk
     int8_t  imat_dat    =  0; // whether the legacy imatrix.dat format should be output (gguf <= 0 < dat)
 
-    bool process_output  = false; // collect data for the output tensor
-    bool compute_ppl     = true;  // whether to compute perplexity
-    bool show_statistics = false; // show imatrix statistics per tensor
-    bool parse_special   = false; // whether to parse special tokens during imatrix tokenization
+    bool process_output         = false; // collect data for the output tensor
+    bool compute_ppl            = true;  // whether to compute perplexity
+    bool show_statistics        = false; // show imatrix statistics per tensor
+    bool activation_statistics  = false; // generate data to calculate activation based statistics
+    bool parse_special          = false; // whether to parse special tokens during imatrix tokenization
 
     // cvector-generator params
     int n_pca_batch = 100;
@@ -912,7 +951,9 @@ static std::vector<T> string_split(const std::string & str, char delim) {
     while (std::getline(str_stream, token, delim)) {
         T value;
         std::istringstream token_stream(token);
-        token_stream >> value;
+        if (!(token_stream >> value)) {
+            throw std::invalid_argument("invalid value: \"" + token + "\"");
+        }
         values.push_back(value);
     }
     return values;
@@ -980,7 +1021,6 @@ void string_process_escapes(std::string & input);
 std::string string_from(bool value);
 std::string string_from(const std::vector<int> & values);
 std::string string_from(const struct llama_context * ctx, const std::vector<llama_token> & tokens);
-std::string string_from(const struct llama_context * ctx, const struct llama_batch & batch);
 
 bool glob_match(const std::string & pattern, const std::string & str);
 
@@ -1005,28 +1045,48 @@ std::string fs_path_to_utf8(const std::filesystem::path & path);
 std::string common_get_env(const std::string & name);
 void        common_set_env(const std::string & name, const std::string & value);
 
+// reads a path from the environment, an unset variable gives an empty path
+std::filesystem::path common_get_path_from_env(const std::string & name);
+
 //
 // Filesystem utils
 //
 
 bool fs_validate_filename(const std::string & filename, bool allow_subdirs = false);
-bool fs_create_directory_with_parents(const std::string & path);
 bool fs_is_directory(const std::string & path);
 
-std::string fs_get_cache_directory();
-std::string fs_get_cache_file(const std::string & filename);
-std::string fs_get_config_directory();
+// some old libstdc++ versions don't follow symlinks here, so adding a trailing "/" fixes it: https://gcc.gnu.org/bugzilla/show_bug.cgi?id=101510
+inline bool common_create_directories(const std::filesystem::path & path, std::error_code & ec) {
+#if defined(__linux__)
+    return std::filesystem::create_directories(path / "", ec);
+#else
+    return std::filesystem::create_directories(path, ec);
+#endif
+}
 
-struct common_file_info {
-    std::string path;
-    std::string name;
-    size_t      size = 0; // in bytes
-    bool        is_dir = false;
-};
-std::vector<common_file_info> fs_list(const std::string & path, bool include_directories);
+std::filesystem::path fs_get_cache_directory();
+std::filesystem::path fs_get_cache_file(const std::string & filename);
 
-// fs open, also handle UTF8 on Windows
-std::ifstream fs_open_ifstream(const std::string & fname, std::ios_base::openmode mode);
+//
+// Prompt-cache defaults (llama-server)
+//
+
+// total and available host memory in bytes (MemTotal / MemAvailable on Linux); false if unknown
+bool common_host_memory(uint64_t & total, uint64_t & available);
+
+// RAM budget of the prompt cache when --cache-ram is not given, from the host's total memory:
+//   < 16 GB -> 2048 MiB, >= 16 -> 4096, >= 32 -> 8192, >= 64 -> 12288, >= 96 -> 16384, >= 128 -> 20480
+// A machine sold as N GB reports a little less than N GiB (firmware and iGPU reservations), so a tier is
+// reached once total memory is within 10% below its nominal size. The result is clamped to half of the
+// available memory. `why` receives a one-line explanation for the log.
+int32_t common_prompt_cache_ram_auto_mib(uint64_t total, uint64_t available, std::string & why);
+
+// default disk-tier directory: $XDG_CACHE_HOME/llamampere/prompt-cache, else ~/.cache/llamampere/prompt-cache
+// (~/Library/Caches/llamampere/prompt-cache on macOS, %LOCALAPPDATA%\llamampere\prompt-cache on Windows)
+std::filesystem::path common_prompt_cache_default_dir();
+std::filesystem::path fs_get_config_directory();
+
+void fs_write_atomic(const std::filesystem::path & path, const std::string & data);
 
 //
 // TTY utils
@@ -1034,12 +1094,37 @@ std::ifstream fs_open_ifstream(const std::string & fname, std::ios_base::openmod
 
 // Auto-detect if colors can be enabled based on terminal and environment
 bool tty_can_use_colors();
+bool tty_enable_ansi(); // false when stdout or stderr is a console that cannot render ANSI sequences
+
+// Check if the given file is attached to a terminal
+bool common_is_tty(FILE * file);
 
 //
 // Model utils
 //
 
 struct common_sampler;
+
+// typed decision models, see "<arch>.decision.type" in the model metadata
+enum common_decision_type {
+    COMMON_DECISION_TYPE_NONE,    // not a decision model
+    COMMON_DECISION_TYPE_OPENJEV, // logits of one label token per option, read at the last prompt token
+    COMMON_DECISION_TYPE_LEV,     // same as openjev, noul is read from a rating scale
+    COMMON_DECISION_TYPE_KEV,     // dot product of the hidden states of the last token and of one end token per option
+    COMMON_DECISION_TYPE_NIMBLE,  // same as openjev, the prompt lists all the questions of the request
+    COMMON_DECISION_TYPE_LAYA,    // score of one marker token per option, read from the embeddings output
+    COMMON_DECISION_TYPE_CLEF,    // all questions in one prompt, score of option i read from the embeddings output at row i
+    COMMON_DECISION_TYPE_PPLX_DECIDER, // same as openjev, label codes of 1 or 2 letters
+    COMMON_DECISION_TYPE_LFM2_D1, // same as openjev, the labels depend on the question type
+    COMMON_DECISION_TYPE_LFM2_D1_OMNI, // same as laya, other prompt layout
+    COMMON_DECISION_TYPE_UNKNOWN, // a decision model of a type that is not supported
+};
+
+common_decision_type common_get_decision_type(const struct llama_model * model);
+
+// same as above, but reads a GGUF file; it does not load the model
+// returns COMMON_DECISION_TYPE_UNKNOWN if the file is missing, unreadable, or invalid
+common_decision_type common_get_decision_type(const std::string & fname);
 
 // note: defines the model, context, samplers, ets. lifetimes
 struct common_init_result {
@@ -1053,6 +1138,10 @@ struct common_init_result {
     void reset_samplers();
 
     std::vector<llama_adapter_lora_ptr> & lora();
+
+    // free the context (and the samplers that may refer to it), so that context() returns nullptr: used when the
+    // context was created but cannot run
+    void free_context();
 
 private:
     struct impl;
@@ -1082,6 +1171,10 @@ char * common_get_model_or_exit(int, char*[]);
 //
 
 struct ggml_threadpool_params ggml_threadpool_params_from_cpu_params(const common_cpu_params & params);
+
+// apply the MTP drafter attention-window options (--spec-draft-window, --spec-draft-window-sink)
+// to the llama_context_params of an MTP draft context; no-op when they are off
+void common_speculative_mtp_cparams(const common_params & params, llama_context_params & cparams);
 
 struct common_threadpools {
     common_threadpools() = default;
@@ -1130,6 +1223,66 @@ struct common_memory {
 // Batch utils
 //
 
+// wrapper around llama_batch_ext that provide getter functions for downstream code
+// entries can exceed n_batch, use get_sub_batch() to decode them in chunks
+struct common_batch {
+    struct token {
+        llama_token  id;
+        std::array<llama_pos, GGML_MROPE_SECTIONS> pos; // only pos[0] is used for text tokens
+        llama_seq_id seq_id; // the first sequence id, see add_seq()
+        bool         output;
+        llama_embd   embd; // non-owning view of the data passed to add_embd()/set_embd(), data == NULL if none
+        std::vector<llama_seq_id> seq_ids_extra; // see add_seq()
+        int32_t      decision_order = 0; // see llama_batch_ext_set_decision_order()
+    };
+
+    std::vector<token> tokens; // mirror of the entries, tokens[i] describes batch index i
+    llama_batch_ext_ptr batch;
+
+    int32_t n_pos = 1; // positions per embedding entry, GGML_MROPE_SECTIONS for MROPE/IMROPE
+
+    common_batch() = default;
+    common_batch(struct llama_context * ctx);
+
+    llama_batch_ext * get() { return get_sub_batch(0, size()); }
+
+    // render entries [off, off + n) into batch, the result is overwritten by the next call
+    llama_batch_ext * get_sub_batch(int32_t off, int32_t n);
+
+    // content type of the batch, all entries carry the same combination
+    bool has_token() const { return !tokens.empty() && tokens[0].id != LLAMA_TOKEN_NULL; }
+    bool has_embd () const { return !tokens.empty() && tokens[0].embd.data != nullptr; }
+
+    void clear();
+
+    // returns the batch index
+    int32_t add(llama_token id, llama_pos pos, llama_seq_id seq_id, bool output);
+
+    // same, with the entry shared by all seq_ids (must not be empty)
+    int32_t add(llama_token id, llama_pos pos, const std::vector<llama_seq_id> & seq_ids, bool output);
+
+    // add the entry at idx to another sequence, tokens[idx].seq_id keeps the first one
+    bool add_seq(int32_t idx, llama_seq_id seq_id);
+
+    bool set_output(int32_t idx, bool value);
+
+    // attach a token embedding to the entry at idx, can only be set once per entry
+    bool set_embd(int32_t idx, llama_embd embd);
+
+    // add an embedding-only entry (no token id)
+    // pos points to n_pos positions
+    int32_t add_embd(llama_embd embd, const llama_pos * pos, llama_seq_id seq_id, bool output);
+
+    int32_t size() const { return (int32_t) tokens.size(); }
+};
+
+// create a single-sequence batch from a list of tokens
+// positions continue from the memory, last token always have output_logits set to true
+common_batch common_batch_get_one(struct llama_context * ctx, const llama_token * tokens, int32_t n_tokens);
+common_batch common_batch_get_one(struct llama_context * ctx, const llama_tokens & tokens);
+
+// flat llama_batch helpers, still used by the drafter implementations in speculative.cpp
+// (their draft-context batches stay on llama_batch + llama_decode)
 void common_batch_clear(struct llama_batch & batch);
 
 void common_batch_add(
@@ -1138,10 +1291,6 @@ void common_batch_add(
                           llama_pos   pos,
     const std::vector<llama_seq_id> & seq_ids,
                                bool   logits);
-
-// create a single-sequence batch from a list of tokens
-// last token always have output_logits set to true
-llama_batch_ext_ptr common_batch_ext_get_one(struct llama_context * ctx, const llama_tokens & tokens);
 
 // decodes a single batch of tokens for a prompt and manages session tokens
 //

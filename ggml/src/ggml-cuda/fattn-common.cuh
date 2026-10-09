@@ -4,7 +4,9 @@
 #include "convert.cuh"
 #include "vecdotq.cuh"
 #include "turbo-quant.cuh"
+#include "fattn-query-layout.cuh"
 #include "ledger.cuh"
+#include "fattn-sjkvarn-rot.cuh"
 
 #include <cstdint>
 
@@ -41,7 +43,102 @@ typedef void (* fattn_kernel_t)(
                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t nb31, const int32_t nb32, const int64_t nb33);
+                            const int32_t nb31, const int32_t nb32, const int64_t nb33,
+        const char    * __restrict__ sj_kvarn_body,   // SJ-KVaRN sealed records (dst->src[5]) or nullptr
+        const int32_t * __restrict__ sj_kvarn_desc);  // SJ-KVaRN descriptor (dst->src[6]) or nullptr
+
+// Per-KV-head view of a SJ-KVaRN cache inside the MMA kernel (see ggml_flash_attn_ext_set_sj_kvarn).
+// Position p resolves to: p < S -> exact ring row p; S <= p < B -> record (p-S)/G of the body, token (p-S)%G;
+// p >= B -> exact ring row S + (p-S)%cap. Offsets are byte offsets inside one record (ggml_sj_kvarn::make_layout).
+// trellis-coded body (GGML_TYPE_I16): the fp16 codebooks of ggml-sjkvarn-cb.h (see ggml-sjkvarn.h, "sjkvarn4t")
+#include "../ggml-sjkvarn-cb.h"
+#define FATTN_SJKVARN_TR_L    SJKVARN_TRELLIS_CB_L
+#define FATTN_SJKVARN_TR_NWIN (1 << FATTN_SJKVARN_TR_L)
+static __device__ uint16_t fattn_sj_kvarn_cb_k[FATTN_SJKVARN_TR_NWIN] = SJKVARN_CB_K_INIT;
+static __device__ uint16_t fattn_sj_kvarn_cb_v[FATTN_SJKVARN_TR_NWIN] = SJKVARN_CB_V_INIT;
+void ggml_cuda_sj_kvarn_trellis_cb_register(const void * sym_k, const void * sym_v); // sjkvarn-seal.cu
+struct fattn_sj_kvarn_cb_registrar {
+    fattn_sj_kvarn_cb_registrar() { ggml_cuda_sj_kvarn_trellis_cb_register((const void *) fattn_sj_kvarn_cb_k, (const void *) fattn_sj_kvarn_cb_v); }
+};
+static fattn_sj_kvarn_cb_registrar fattn_sj_kvarn_cb_registrar_instance;
+
+struct fattn_sj_kvarn_ctx {
+    const char * body;   // first record of this KV head; group g sits at body + g*rec_stride
+    int S, cap, B, G;
+    int type_k, type_v;
+    int sink_type, sink_stride;
+    int64_t sink_head_delta_k, sink_head_delta_v;
+    int body_type;
+    int rec_stride;      // n_head_kv * rec_bytes
+    int k_scale, k_zero, k_tok, v_payload, v_ch, v_scale, v_zero;
+};
+
+static __device__ __forceinline__ fattn_sj_kvarn_ctx fattn_sj_kvarn_make_ctx(
+        const char * body, const int32_t * desc, const int z_KV, const int D, const int bits_k, const int bits_v, const size_t k_head_stride, const size_t v_head_stride) {
+    fattn_sj_kvarn_ctx c;
+    const int G         = desc[GGML_SJKVARN_DESC_G];
+    const int rec_bytes = desc[GGML_SJKVARN_DESC_RECBYTES];
+    c.S          = desc[GGML_SJKVARN_DESC_S];
+    c.cap        = desc[GGML_SJKVARN_DESC_CAP];
+    c.B          = desc[GGML_SJKVARN_DESC_B];
+    c.G          = G;
+    c.body_type  = desc[GGML_SJKVARN_DESC_BODY_TYPE];
+    c.type_k     = desc[GGML_SJKVARN_DESC_TYPE_K];
+    c.type_v     = desc[GGML_SJKVARN_DESC_TYPE_V];
+    c.sink_type  = desc[GGML_SJKVARN_DESC_SINK_TYPE];
+    c.sink_stride = desc[GGML_SJKVARN_DESC_HKV]*D*sizeof(half);
+    c.sink_head_delta_k = (int64_t) z_KV*((int64_t) D*sizeof(half) - (int64_t) k_head_stride);
+    c.sink_head_delta_v = (int64_t) z_KV*((int64_t) D*sizeof(half) - (int64_t) v_head_stride);
+    c.rec_stride = desc[GGML_SJKVARN_DESC_HKV] * rec_bytes;
+    c.body       = body + (size_t) z_KV * rec_bytes;
+    const int k_row = D*bits_k/8;
+    const int v_row = D*bits_v/8;
+    c.v_payload = k_row*G;
+    c.k_scale   = c.v_payload + v_row*G;
+    c.k_zero    = c.k_scale + 2*D;
+    c.k_tok     = c.k_zero  + 2*D;
+    c.v_ch      = c.k_tok   + 2*G;
+    c.v_scale   = c.v_ch    + 2*D;
+    c.v_zero    = c.v_scale + 2*G;
+    return c;
+}
+
+static __device__ __forceinline__ const char * fattn_sj_kvarn_sink_row(
+        const char * head, const fattn_sj_kvarn_ctx & kv, const size_t row_stride, const int row, const bool is_v) {
+    return head + (size_t) (kv.S + kv.cap)*row_stride +
+        (is_v ? kv.sink_head_delta_v : kv.sink_head_delta_k) + (size_t) row*kv.sink_stride;
+}
+
+// Packed ring storage (f16, q8_0, tq6_0) decoded into registers or shared tiles; warp-collective for tq6_0 (#127).
+// A per-lane tq6_dequant_element is a lane-divergent __constant__ read: 64 random 6-bit codes replay through the
+// constant cache once per distinct address. The TQ6 table is exactly antisymmetric (TQ6_CENTROIDS[63-i] ==
+// -TQ6_CENTROIDS[i], bitwise), so lane L holds tq6_mag = TQ6_CENTROIDS[32 + L] and a lookup is one __shfl_sync plus a
+// sign flip; (-c)*norm == -(c*norm) in IEEE, so values are bit-identical to tq6_dequant_element.
+// Every lane of the warp must reach the call with the same row type (full-mask shuffle).
+static __device__ __forceinline__ float fattn_sj_kvarn_tq6_centroid_shfl(const float tq6_mag, const int idx) {
+    const int neg = ((idx >> 5) & 1) - 1; // 0 for idx >= 32, -1 (all ones) for idx < 32
+    const float v = __shfl_sync(0xFFFFFFFF, tq6_mag, (idx ^ neg) & 31, 32);
+    return __uint_as_float(__float_as_uint(v) ^ ((uint32_t) neg & 0x80000000u));
+}
+
+static __device__ __forceinline__ half2 fattn_sj_kvarn_ring_pair_warp(const char * row, const int pair, const int type, const float tq6_mag) {
+    if (type == GGML_TYPE_TQ6_0) {
+        const block_tq6_0 * b = ((const block_tq6_0 *) row) + pair/(QK_TQ6/2);
+        const int i = 2*(pair%(QK_TQ6/2)); // even: elements i, i+1 share qs[i/2] and qh[i/4]
+        const float norm = __half2float(b->norm);
+        const int qs = b->qs[i/2];
+        const int qh = b->qh[i/4] >> ((i%4)*2);
+        const int q0 = (qs & 0xF) | ((qh & 3) << 4);
+        const int q1 = (qs >> 4)  | (((qh >> 2) & 3) << 4);
+        return __floats2half2_rn(fattn_sj_kvarn_tq6_centroid_shfl(tq6_mag, q0) * norm, fattn_sj_kvarn_tq6_centroid_shfl(tq6_mag, q1) * norm);
+    }
+    if (type == GGML_TYPE_F16) {
+        return ((const half2 *) row)[pair];
+    }
+    const block_q8_0 & b = ((const block_q8_0 *) row)[pair/(QK8_0/2)];
+    const int i = 2*(pair%(QK8_0/2));
+    return __hmul2(__half2half2(b.d), __floats2half2_rn((float) b.qs[i], (float) b.qs[i+1]));
+}
 
 typedef float (*vec_dot_KQ_t)(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds);
@@ -678,9 +775,14 @@ static __device__ __forceinline__ void dequantize_V_q4_0(const void * __restrict
     int q;
     static_assert(ne == 2 || ne == 4, "bad ne");
     ggml_cuda_memcpy_1<ne, 2>(&q, x[ib].qs + iqs);
+#if defined(GGML_USE_HIP)
+    // Keep this VMEM read close to its packed-byte dequantization. Hoisting it too far
+    // increases VGPR pressure substantially in some FlashAttention vector kernels.
+    __builtin_amdgcn_sched_group_barrier(0x20, 1, 0);
+#endif // defined(GGML_USE_HIP)
     q >>= 4*shift;
     q &= 0x0F0F0F0F;
-    q = __vsubss4(q, 0x08080808);
+    q = __vsub4(q, 0x08080808);
 
     const int8_t * q8 = (const int8_t *) &q;
 
@@ -770,7 +872,7 @@ static __device__ __forceinline__ void dequantize_V_q5_0(const void * __restrict
         }
     }
 
-    q = __vsubss4(q, 0x10101010);
+    q = __vsub4(q, 0x10101010);
 
     const int8_t * q8 = (const int8_t *) &q;
 
@@ -1305,7 +1407,7 @@ static __global__ void flash_attn_mask_to_KV_max(
 void ggml_cuda_flash_attn_ext_compact_mask(
         const ggml_tensor * mask, int32_t * indices, int32_t * counts, int32_t n_queries, int32_t ncols1, int32_t n_kv_max, cudaStream_t stream);
 
-template<int D, int ncols1, int ncols2> // D == head size
+template<int D, int ncols1, int ncols2, bool compact_q5g6 = false> // D == head size
 __launch_bounds__(D, 1)
 static __global__ void flash_attn_stream_k_fixup_uniform(
         float * __restrict__ dst,
@@ -1317,12 +1419,15 @@ static __global__ void flash_attn_stream_k_fixup_uniform(
         const uint3 fd_iter_j_z_ne12,
         const uint3 fd_iter_j_z,
         const uint3 fd_iter_j) {
+    using query_layout = ggml_fattn_query_layout<ncols1, ncols2, compact_q5g6>;
+
+    const int jc = blockIdx.y*ncols2 + blockIdx.z;
+    const int j = query_layout::token(jc);
+    const int c = query_layout::head(jc);
+
     constexpr int ncols = ncols1*ncols2;
 
     const int tile_idx = blockIdx.x; // One block per output tile.
-    const int j        = blockIdx.y;
-    const int c        = blockIdx.z;
-    const int jc       = j*ncols2 + c;
     const int tid      = threadIdx.x;
 
     // nblocks_stream_k is a multiple of ntiles_dst (== gridDim.x), so each tile gets the same number of blocks.
@@ -1343,11 +1448,11 @@ static __global__ void flash_attn_stream_k_fixup_uniform(
 
     const int zt_Q = z_KV*gqa_ratio + zt_gqa*ncols2; // Global Q head start index.
 
-    if (jt*ncols1 + j >= ne01 || zt_gqa*ncols2 + c >= gqa_ratio) {
+    if (jt*query_layout::token_step + j >= ne01 || zt_gqa*ncols2 + c >= gqa_ratio) {
         return;
     }
 
-    dst += sequence*ne02*ne01*D + jt*ne02*(ncols1*D) + zt_Q*D + (j*ne02 + c)*D + tid;
+    dst += sequence*ne02*ne01*D + jt*ne02*(query_layout::token_step*D) + zt_Q*D + (j*ne02 + c)*D + tid;
 
     // Load the partial result that needs a fixup
     float dst_val = *dst;
@@ -1385,7 +1490,7 @@ static __global__ void flash_attn_stream_k_fixup_uniform(
 
 // General fixup kernel for the case where the number of blocks per tile is not uniform across tiles
 // (blocks_num.x not a multiple of ntiles_dst)
-template <int D, int ncols1, int ncols2> // D == head size
+template <int D, int ncols1, int ncols2, bool compact_q5g6 = false> // D == head size
 __launch_bounds__(D, 1)
 static __global__ void flash_attn_stream_k_fixup_general(
         float * __restrict__ dst,
@@ -1397,12 +1502,15 @@ static __global__ void flash_attn_stream_k_fixup_general(
         const uint3 fd_iter_k_j_z,
         const uint3 fd_iter_k_j,
         const uint3 fd_iter_k) {
+    using query_layout = ggml_fattn_query_layout<ncols1, ncols2, compact_q5g6>;
+
+    const int jc = blockIdx.y*ncols2 + blockIdx.z;
+    const int j = query_layout::token(jc);
+    const int c = query_layout::head(jc);
+
     constexpr int ncols = ncols1*ncols2;
 
     const int bidx0 = blockIdx.x;
-    const int j     = blockIdx.y;
-    const int c     = blockIdx.z;
-    const int jc    = j*ncols2 + c;
     const int tid   = threadIdx.x;
 
     const float * dst_fixup_data = ((const float *) dst_fixup) + gridDim.x*(2*2*ncols);
@@ -1430,11 +1538,11 @@ static __global__ void flash_attn_stream_k_fixup_general(
 
     const int zt_Q = z_KV*gqa_ratio + zt_gqa*ncols2; // Global Q head start index.
 
-    if (jt*ncols1 + j >= ne01 || zt_gqa*ncols2 + c >= gqa_ratio) {
+    if (jt*query_layout::token_step + j >= ne01 || zt_gqa*ncols2 + c >= gqa_ratio) {
         return;
     }
 
-    dst += sequence*ne02*ne01*D + jt*ne02*(ncols1*D) + zt_Q*D + (j*ne02 + c)*D + tid;
+    dst += sequence*ne02*ne01*D + jt*ne02*(query_layout::token_step*D) + zt_Q*D + (j*ne02 + c)*D + tid;
 
     // Load the partial result that needs a fixup:
     float dst_val = 0.0f;
@@ -1491,7 +1599,7 @@ static __global__ void flash_attn_stream_k_fixup_general(
     *dst = dst_val / rowsum;
 }
 
-template<int D> // D == head size
+template<int D, bool rot = false> // D == head size; rot: [#139] SJ-KVaRN fused output rotation of the final row
 __launch_bounds__(D, 1)
 static __global__ void flash_attn_combine_results(
         const float  * __restrict__ VKQ_parts,
@@ -1541,16 +1649,30 @@ static __global__ void flash_attn_combine_results(
         VKQ_denominator += KQ_max_scale * meta[l].y;
     }
 
+    if constexpr (rot) {
+        static_assert(D == 256, "plain H256");
+        __shared__ float rot_buf[D];
+        dst[tid] = sj_kvarn_rot256_block(VKQ_numerator / VKQ_denominator, tid, rot_buf);
+        return;
+    }
     dst[tid] = VKQ_numerator / VKQ_denominator;
 }
 
-template <int DV, int ncols1, int ncols2>
+template <int DV, int ncols1, int ncols2, bool compact_q5g6 = false>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
     const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const bool use_sparse,
     const int warp_size = WARP_SIZE,
-    float * partial_dst = nullptr, float2 * partial_meta = nullptr
+    float * partial_dst = nullptr, float2 * partial_meta = nullptr,
+    const int parallel_blocks_override = 0, const bool async_kv_preload = false
 ) {
+    if constexpr (compact_q5g6) {
+        GGML_ASSERT(stream_k && !use_sparse && dst->src[0]->ne[1] == 5 && dst->src[0]->ne[3] == 1);
+        GGML_ASSERT(dst->src[0]->ne[2] == 6 * dst->src[1]->ne[2]);
+    }
+
+    using query_layout = ggml_fattn_query_layout<ncols1, ncols2, compact_q5g6>;
+
     constexpr int ncols = ncols1 * ncols2;
 
     const ggml_tensor * Q = dst->src[0];
@@ -1566,6 +1688,7 @@ void launch_fattn(
     const bool output_partial = partial_dst != nullptr;
     GGML_ASSERT(output_partial == (partial_meta != nullptr));
     GGML_ASSERT(!output_partial || !stream_k);
+    GGML_ASSERT(!ggml_cuda_fattn_sj_kvarn_rot(KQV) || (!stream_k && !output_partial)); // [#139] combine_results rotates
 
     GGML_ASSERT(Q->type == GGML_TYPE_F32);
     GGML_ASSERT(KQV->type == GGML_TYPE_F32);
@@ -1699,13 +1822,15 @@ void launch_fattn(
         }
     }
 
-    const int ntiles_x     = ((Q->ne[1] + ncols1 - 1) / ncols1);
+    const int ntiles_x = query_layout::query_tiles(Q->ne[1]);
     const int gqa_ratio    = Q->ne[2] / K->ne[2];
     const int ntiles_z_gqa = ((gqa_ratio + ncols2 - 1) / ncols2);
     const int ntiles_dst   = ntiles_x * ntiles_z_gqa * K->ne[2] * Q->ne[3];
 
     // sparse: a query tile of ncols1 queries shares one index list, the union of the queries' visible columns
     int32_t n_kv_max = 0;
+    // SJ-KVaRN: K/V are the exact-row ring tensors; the attended range is the padded position count (op_params[6])
+    const bool    is_sj_kvarn = KQV->src[6] != nullptr;
     if (use_sparse) {
         GGML_ASSERT(mask != nullptr);
         const int32_t n_kv_max_query = ggml_get_op_params_i32(KQV, 4);
@@ -1721,7 +1846,8 @@ void launch_fattn(
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths.
-    if (!use_sparse && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1)) {
+    const bool scan_mask = !use_sparse && !is_sj_kvarn && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1);
+    if (scan_mask) {
         const int64_t s31 = mask->nb[1] / sizeof(half2);
         const int64_t s33 = mask->nb[3] / sizeof(half2);
 
@@ -1743,15 +1869,21 @@ void launch_fattn(
     GGML_ASSERT(max_blocks_per_sm > 0);
     int parallel_blocks = max_blocks_per_sm;
 
-    const int64_t n_kv = use_sparse ? n_kv_max : K->ne[1];
+    const int64_t n_kv = use_sparse ? n_kv_max : (is_sj_kvarn ? ggml_get_op_params_i32(KQV, 6) : K->ne[1]);
     const int ntiles_KV = (n_kv + nbatch_fa - 1) / nbatch_fa; // Max. number of parallel blocks limited by KV cache length.
 
     dim3 blocks_num;
     if (stream_k) {
-        auto should_use_stream_k = [](const int cc, const int ntiles_dst, const int max_blocks, const int DKQ) {
+        // Stream-K splits the work before the mask scan is applied, so skipped KV tiles make the blocks uneven.
+        const bool prefer_whole_tiles = GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_DGX_SPARK && async_kv_preload && scan_mask;
+
+        auto should_use_stream_k = [prefer_whole_tiles](const int cc, const int ntiles_dst, const int max_blocks, const int DKQ) {
             const int tiles_nwaves             = (ntiles_dst + max_blocks - 1) / max_blocks;
             const int tiles_efficiency_percent = 100 * ntiles_dst / (max_blocks*tiles_nwaves);
 
+            if (prefer_whole_tiles && tiles_efficiency_percent >= 75) {
+                return false;
+            }
             if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_ADA_LOVELACE) {
                 return true;
             }
@@ -1814,6 +1946,12 @@ void launch_fattn(
             }
         }
 
+        if (parallel_blocks_override > 0) {
+            // SJ-KVaRN stream kernels pick their own KV split (never together with output_partial)
+            GGML_ASSERT(!output_partial);
+            parallel_blocks = std::min(parallel_blocks_override, ntiles_KV);
+        }
+
         if (output_partial) {
             // MMA kernels flatten Q tiles, GQA groups, KV heads, and sequences
             // into blockIdx.x. A multidimensional grid would duplicate every
@@ -1872,7 +2010,9 @@ void launch_fattn(
         K->ne[0], n_kv, K->ne[2], K->ne[3], nb11, nb12, nb13,
         nb21, nb22, nb23,
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
-        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0
+        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
+        is_sj_kvarn ? (const char    *) KQV->src[5]->data : nullptr,
+        is_sj_kvarn ? (const int32_t *) KQV->src[6]->data : nullptr
     );
     CUDA_CHECK(cudaGetLastError());
 
@@ -1889,7 +2029,10 @@ void launch_fattn(
             const dim3 block_dim_combine(DV, 1, 1);
             const dim3 blocks_num_combine = {(unsigned)ntiles_dst, ncols1, ncols2};
 
-            flash_attn_stream_k_fixup_uniform<DV, ncols1, ncols2>
+            if constexpr (compact_q5g6) {
+                ggml_ledger_add("cuda.fattn.fixup", "q5g6_uniform", 1);
+            }
+            flash_attn_stream_k_fixup_uniform<DV, ncols1, ncols2, compact_q5g6>
                 <<<blocks_num_combine, block_dim_combine, 0, main_stream>>>
                 ((float *) KQV->data, dst_tmp_meta.ptr,
                  Q->ne[1], Q->ne[2], K->ne[2], nblocks_sk,
@@ -1906,7 +2049,10 @@ void launch_fattn(
             const dim3 block_dim_combine(DV, 1, 1);
             const dim3 blocks_num_combine = {blocks_num.x, ncols1, ncols2};
 
-            flash_attn_stream_k_fixup_general<DV, ncols1, ncols2>
+            if constexpr (compact_q5g6) {
+                ggml_ledger_add("cuda.fattn.fixup", "q5g6_general", 1);
+            }
+            flash_attn_stream_k_fixup_general<DV, ncols1, ncols2, compact_q5g6>
                 <<<blocks_num_combine, block_dim_combine, 0, main_stream>>>
                 ((float *) KQV->data, dst_tmp_meta.ptr,
                  Q->ne[1], Q->ne[2], gqa_ratio, total_work,
@@ -1917,9 +2063,19 @@ void launch_fattn(
         const dim3 blocks_num_combine(Q->ne[1], Q->ne[2], Q->ne[3]);
         const size_t nbytes_shared_combine = parallel_blocks*sizeof(float2);
 
+        if (ggml_cuda_fattn_sj_kvarn_rot(KQV)) { // [#139] the SJ-KVaRN stream kernel rotated Q; the combine rotates the output
+            if constexpr (DV == 256) {
+                flash_attn_combine_results<DV, true>
+                    <<<blocks_num_combine, block_dim_combine, nbytes_shared_combine, main_stream>>>
+                    (dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks);
+            } else {
+                GGML_ABORT("SJ-KVaRN fused rotation needs DV == 256");
+            }
+        } else {
         flash_attn_combine_results<DV>
             <<<blocks_num_combine, block_dim_combine, nbytes_shared_combine, main_stream>>>
             (dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks);
+        }
     }
     CUDA_CHECK(cudaGetLastError());
 }

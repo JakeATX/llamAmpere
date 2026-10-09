@@ -491,8 +491,9 @@ common_fit_extra_memory common_fit_extra_memory_at(
     if (n_ctx != n_ctx_measured && n_ctx_measured > 0) {
         ret.context = (size_t) std::ceil((double) measured.context * n_ctx / n_ctx_measured);
     }
-    if (shares_compute && measured.compute <= compute_main) {
-        ret.compute = 0;
+    if (shares_compute) {
+        // the shared buffer is grown to the larger of the two graphs (ggml_gallocr donor rule): only the growth is new
+        ret.compute = measured.compute > compute_main ? measured.compute - compute_main : 0;
     }
     return ret;
 }
@@ -519,19 +520,19 @@ static void common_params_fit_impl(
         moe_cache->fit_selected = false;
     }
 
-    // size the context for all sequences, but keep minimums and alignment per KV stream
-    const uint32_t n_seq_max  = std::max<uint32_t>(1, cparams->n_seq_max);
-    const uint32_t n_streams  = cparams->kv_unified ? 1 : n_seq_max;
+    // with non-unified kv, we need to take into account n_streams
+    // for example, if memory can hold more than model's trained context size, we must extend the n_ctx to hold enough n_streams
+    const uint32_t n_streams  = cparams->kv_unified ? 1 : std::max<uint32_t>(1, cparams->n_seq_max);
     const bool     n_ctx_auto = cparams->n_ctx == 0;
 
     dmds_t   dmds_extra;       // memory of the extra model, laid out on the devices of the main model
     uint32_t n_ctx_extra = 0;  // context that memory was measured at
 
     // the extra model competes for the same memory as the main model, add it to every measurement
-    // its memory is measured again whenever the context it follows changes
-    // a context that shares the compute buffers of the main context (MTP, single device) adds only its KV cache next to
-    // the main context: it is measured once at the minimum context and its KV cache is scaled from there, rather than
-    // measured standalone at every context the fit probes (up to n_ctx_train * n_seq_max tokens)
+    // its memory is measured again whenever the context it follows changes: both its KV cache and its compute graph
+    // depend on the context (flash-attention workspace grows with n_kv), so it is measured at the probed context itself
+    // a context that shares the compute buffers of the main context (MTP, single device) adds its KV cache and only the
+    // growth of the shared compute buffer beyond the main context's own need (common_fit_extra_memory_at)
     auto add_extra_memory = [&](dmds_t & dmds) {
         if (extra == nullptr) {
             return;
@@ -539,12 +540,7 @@ static void common_params_fit_impl(
 
         const bool shares_compute = extra->shares_compute && devs.size() == 1;
 
-        uint32_t n_ctx_measure = cparams->n_ctx;
-        if (shares_compute) {
-            const uint64_t align = 256 * uint64_t(n_streams);
-            const uint64_t n_min = std::max(align, (uint64_t(n_ctx_min) * n_streams + align - 1) / align * align);
-            n_ctx_measure = (uint32_t) std::min<uint64_t>(n_min, cparams->n_ctx);
-        }
+        const uint32_t n_ctx_measure = cparams->n_ctx;
 
         if (dmds_extra.empty() || n_ctx_extra != n_ctx_measure) {
             std::vector<ggml_backend_dev_t> devs_extra;
@@ -590,14 +586,16 @@ static void common_params_fit_impl(
             n_ctx_extra = n_ctx_measure;
         }
 
-        if (n_ctx_extra != cparams->n_ctx) {
-            LOG_TRC("%s: extra model shares the compute buffers of the main context, scaling its KV cache from a context size of %"
-                PRIu32 " to %" PRIu32 "\n", __func__, n_ctx_extra, cparams->n_ctx);
-        }
         for (size_t id = 0; id < dmds.size(); id++) {
             const llama_memory_breakdown_data & mb = dmds_extra[id].mb;
             const common_fit_extra_memory mem = common_fit_extra_memory_at(
                 {mb.model, mb.context, mb.compute}, n_ctx_extra, cparams->n_ctx, dmds[id].mb.compute, shares_compute);
+            if (shares_compute && id < devs.size()) {
+                LOG_TRC("%s: extra model at a context size of %" PRIu32 " on %s: KV cache %" PRId64 " MiB, compute %" PRId64
+                    " MiB next to the main context's %" PRId64 " MiB -> shared buffer grows by %" PRId64 " MiB\n", __func__,
+                    cparams->n_ctx, ggml_backend_dev_name(devs[id]), int64_t(mem.context/MiB), int64_t(mb.compute/MiB),
+                    int64_t(dmds[id].mb.compute/MiB), int64_t(mem.compute/MiB));
+            }
             dmds[id].mb.model   += mem.model;
             dmds[id].mb.context += mem.context;
             dmds[id].mb.compute += mem.compute;
@@ -611,15 +609,15 @@ static void common_params_fit_impl(
             path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level, &moe_tensors);
 
     // saturate instead of overflowing, this also preserves the UINT32_MAX sentinel of n_ctx_min:
-    const uint32_t n_ctx_max       = (uint32_t) std::min<uint64_t>(uint64_t(hp_nct)    * n_seq_max, UINT32_MAX);
+    const uint32_t n_ctx_max       = (uint32_t) std::min<uint64_t>(uint64_t(hp_nct)    * n_streams, UINT32_MAX);
     const uint32_t n_ctx_min_total = (uint32_t) std::min<uint64_t>(uint64_t(n_ctx_min) * n_streams, UINT32_MAX);
 
     // llama_context would use only hp_nct in total for n_ctx == 0, resolve the context before measuring anything else:
     if (n_ctx_auto) {
         cparams->n_ctx = n_ctx_max;
-        if (n_seq_max > 1) {
-            LOG_TRC("%s: context size unset -> using %" PRIu32 " for %" PRIu32 " sequences:\n",
-                __func__, n_ctx_max, n_seq_max);
+        if (n_streams > 1) {
+            LOG_TRC("%s: context size unset and KV cache not unified -> using %" PRIu32 " for %" PRIu32 " sequences:\n",
+                __func__, n_ctx_max, n_streams);
             dmds_full = common_get_device_memory_data_impl(
             path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level, &moe_tensors);
         }
@@ -792,6 +790,22 @@ static void common_params_fit_impl(
                         LOG_TRC("%s: context size reduced from %" PRIu32 " to %" PRIu32 " -> need %" PRId64 " MiB less memory in total\n",
                             __func__, n_ctx_max, cparams->n_ctx, memory_reduction/MiB);
                         if (nd <= 1) {
+                            // the interpolation assumes memory linear in the context, but the compute buffers are not
+                            // (flash-attention workspace grows with n_kv up to a cap, the MTP draft graph grows the shared
+                            // buffer): measure the chosen context and step down while it misses the target
+                            for (int it = 0; nd == 1 && it < 8; it++) {
+                                dmds_t dmds_chk = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+                                add_extra_memory(dmds_chk);
+                                const int64_t deficit = margins[0] - (dmds_chk[0].free - int64_t(dmds_chk[0].mb.total()));
+                                if (deficit <= 0 || cparams->n_ctx <= n_ctx_min_total) {
+                                    break;
+                                }
+                                const int64_t step = std::max<int64_t>(align, (deficit + std::max<int64_t>(bytes_per_ctx, 1) - 1) / std::max<int64_t>(bytes_per_ctx, 1));
+                                const uint32_t n_ctx_prev = cparams->n_ctx;
+                                cparams->n_ctx = (uint32_t) std::max<int64_t>(int64_t(cparams->n_ctx) - (step + align - 1) / align * align, n_ctx_min_total);
+                                LOG_TRC("%s: context size %" PRIu32 " is projected %" PRId64 " MiB over the target -> reduced to %" PRIu32 "\n",
+                                    __func__, n_ctx_prev, deficit/MiB, cparams->n_ctx);
+                            }
                             LOG_TRC("%s: entire model can be fit by reducing context\n", __func__);
                             return;
                         }

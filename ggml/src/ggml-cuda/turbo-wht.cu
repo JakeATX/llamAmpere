@@ -221,6 +221,68 @@ static __global__ void k_turbo_wht_f32_fast(const float * __restrict__ src,
     *((float4 *) (dst + base) + lane) = v;
 }
 
+// ─── Plain 256-point Sylvester Hadamard (SJ-KVaRN full-head rotation) ───────────
+//
+// One group per warp; lane t holds elements 8t..8t+7 as two float4. No sign
+// vectors and no InnerQ scale: this is the orthonormal H_256 used for the
+// sealed KV records (see ggml-sjkvarn.h). Stages h=1,2,4 pair within the lane,
+// h=8..128 pair lane t with t^(h/8).
+
+template <int warps_per_block>
+static __global__ void k_turbo_wht_f32_plain256(const float * __restrict__ src,
+                                                float * __restrict__ dst,
+                                                int64_t n_groups,
+                                                int64_t head_dim,
+                                                int64_t groups_per_head) {
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+
+    const int64_t g = (int64_t) blockIdx.x * warps_per_block + warp;
+    if (g >= n_groups) return;
+
+    const int64_t head_idx    = g / groups_per_head;
+    const int64_t grp_in_head = g % groups_per_head;
+    const int64_t base        = head_idx * head_dim + grp_in_head * 256;
+
+    float x[8];
+    {
+        const float4 a = *((const float4 *) (src + base) + 2*lane);
+        const float4 b = *((const float4 *) (src + base) + 2*lane + 1);
+        x[0] = a.x; x[1] = a.y; x[2] = a.z; x[3] = a.w;
+        x[4] = b.x; x[5] = b.y; x[6] = b.z; x[7] = b.w;
+    }
+
+#pragma unroll
+    for (int h = 1; h < 8; h <<= 1) {
+#pragma unroll
+        for (int i = 0; i < 8; i += 2*h) {
+#pragma unroll
+            for (int j = i; j < i + h; ++j) {
+                const float a = x[j], b = x[j + h];
+                x[j]     = a + b;
+                x[j + h] = a - b;
+            }
+        }
+    }
+
+#pragma unroll
+    for (int m = 1; m <= 16; m <<= 1) {
+        const bool hi = (lane & m) != 0;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const float p = __shfl_xor_sync(0xffffffff, x[j], m);
+            x[j] = hi ? p - x[j] : x[j] + p;
+        }
+    }
+
+    constexpr float inv_sqrt = 0.0625f;  // 1/sqrt(256)
+    float4 a, b;
+    a.x = x[0]*inv_sqrt; a.y = x[1]*inv_sqrt; a.z = x[2]*inv_sqrt; a.w = x[3]*inv_sqrt;
+    b.x = x[4]*inv_sqrt; b.y = x[5]*inv_sqrt; b.z = x[6]*inv_sqrt; b.w = x[7]*inv_sqrt;
+    *((float4 *) (dst + base) + 2*lane)     = a;
+    *((float4 *) (dst + base) + 2*lane + 1) = b;
+}
+
 // ─── Simple copy kernel for tail elements (identity pass-through) ────────────
 
 static __global__ void k_turbo_wht_copy_tail(const float * __restrict__ src,
@@ -257,7 +319,7 @@ void ggml_cuda_turbo_wht(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t head_dim        = src->ne[0];
     const int64_t n_heads         = ggml_nelements(src) / head_dim;
 
-    GGML_ASSERT(group_size == 32 || group_size == 64 || group_size == 128);
+    GGML_ASSERT(group_size == 32 || group_size == 64 || group_size == 128 || group_size == 256);
     const int64_t groups_per_head = head_dim / group_size;
     const int     tail_size       = (int)(head_dim % group_size);
     const int64_t n_groups        = groups_per_head * n_heads;
@@ -281,7 +343,13 @@ void ggml_cuda_turbo_wht(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
         dim3 blocks(n_groups);
 
-        if (fast_ok) {
+        if (group_size == 256) {
+            GGML_ASSERT(scale_inv_ptr == nullptr);
+            GGML_ASSERT((((uintptr_t) src_ptr | (uintptr_t) dst_ptr) % 16) == 0 && (head_dim % 4) == 0);
+            constexpr int warps = 4;
+            const int64_t n_blocks = (n_groups + warps - 1) / warps;
+            k_turbo_wht_f32_plain256<warps><<<(int) n_blocks, warps*32, 0, stream>>>(src_ptr, dst_ptr, n_groups, head_dim, groups_per_head);
+        } else if (fast_ok) {
             // 1 warp per block underfeeds the SMs; 2 and up saturate.
             constexpr int warps = 4;
             const int64_t n_blocks = (n_groups + warps - 1) / warps;

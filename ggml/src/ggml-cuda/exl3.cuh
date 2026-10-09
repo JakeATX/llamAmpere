@@ -28,7 +28,8 @@ static __device__ __forceinline__ void exl3_wht128(float (&v)[4]) {
 // dst: f16 [N][K] row-major (row n = output feature), codebook values, no suh/svh/Hadamard
 void ggml_cuda_exl3_reconstruct_f16(const ggml_tensor * src0, half * dst, cudaStream_t stream);
 
-// M2: trellis-direct GEMV/GEMM for T <= 8 activation columns (env GGML_CUDA_EXL3_GEMV=0 forces the M1 path)
+// M2: trellis-direct GEMV/GEMM for T <= EXL3_GEMV_MAX_T (16) activation columns (env GGML_CUDA_EXL3_GEMV=0 forces the
+// M1 reconstruct + cuBLAS path for those widths; the #13 GEMM only takes T > 16)
 bool ggml_cuda_exl3_gemv_supported(const int64_t T);
 int  ggml_cuda_exl3_gemv_ksplit(const int kt, const int nt, const int T);
 // suh/svh may be null (no Hadamard/scale glue)
@@ -39,6 +40,8 @@ void ggml_cuda_exl3_gemv(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
 void ggml_cuda_exl3_glue_in_f16(const float * x, const float * suh, half * out, const int K, const int64_t T, const float scale, cudaStream_t stream);
 // y[T][N] = scale * svh * H128( sum_ks part[ks][T][N] )  (svh null: scale * sum); N % 128 == 0 when svh is set
 void ggml_cuda_exl3_glue_out(const float * part, const float * svh, float * y, const int N, const int64_t T, const int ksplit, const float scale, cudaStream_t stream);
+// [FIT12 overhead] ksplit == 1 with svh, in place on y (bit-identical to glue_out(y, svh, y2, ..., 1, ...))
+void ggml_cuda_exl3_glue_out_inplace(float * y, const float * svh, const int N, const int64_t T, const float scale, cudaStream_t stream);
 
 // [#74] out[T][N] (f16) = x_scale * H128(suh_down * silu(svh_gate * H128(sum part_gate)) * svh_up * H128(sum part_up)):
 // glue_out of the FFN gate and up projections, the SwiGLU and glue_in of the down projection in one kernel
@@ -50,5 +53,12 @@ void ggml_cuda_exl3_ffn_bridge_f16(const float * part_gate, const int ksplit_gat
 // gate and up outputs are never materialized. Returns false (nothing launched) when a precondition fails.
 bool ggml_cuda_exl3_ffn_bridge(ggml_backend_cuda_context & ctx, const ggml_tensor * mm_gate, const ggml_tensor * mm_up,
                                ggml_tensor * mm_down);
+
+// [#13] trellis-direct tensor-core GEMM for T > EXL3_GEMV_MAX_T (prefill); GGML_CUDA_EXL3_GEMM=0 forces the M1
+// reconstruct + cuBLAS path. suh/svh may be null.
+bool ggml_cuda_exl3_gemm_enabled();
+bool ggml_cuda_exl3_gemm_supported(const ggml_tensor * src0, const int64_t T);
+void ggml_cuda_exl3_gemm(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
+                         const int64_t T, const float * suh, const float * svh);
 
 void ggml_cuda_mul_mat_exl3(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);

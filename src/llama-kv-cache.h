@@ -144,7 +144,8 @@ public:
                  const char *   name_tag = "",
                           size_t kv_stream_stage_bytes = 0,
                           void * kv_stream_phase_arena = nullptr,
-                          size_t kv_stream_maximum_pool_bytes = 0);
+                          size_t kv_stream_maximum_pool_bytes = 0,
+           llama_sj_kvarn_config   sj_kvarn = llama_sj_kvarn_config());
 
     ~llama_kv_cache() = default;
 
@@ -189,9 +190,12 @@ public:
     //
 
     uint32_t get_size()     const;
+    uint32_t get_n_seq_max() const;
     uint32_t get_n_stream() const;
     std::vector<uint32_t> get_layer_ids() const;
     ggml_tensor * get_k_storage(int32_t il) const;
+    ggml_tensor * get_v_storage(int32_t il) const;
+    bool get_v_transposed() const;
 
     bool kv_stream_adapt(uint32_t active_tokens, uint32_t query_tokens);
     bool kv_stream_resize_pool(
@@ -203,6 +207,9 @@ public:
     ggml_type type_v() const;
 
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
+
+    // The stream holding seq_id's cells.
+    uint32_t get_stream(llama_seq_id seq_id) const;
 
     // state_read, plus the cells the restored tokens were placed in.
     // a cache that mirrors another one cell for cell (the qwen4exp indexer) cannot search for
@@ -218,6 +225,9 @@ public:
       llama_state_seq_flags   flags,
           slot_info_vec_t *   sinfos_out,
      const slot_info_vec_t *   sinfos_in);
+
+    // undo a state_read() of seq_id (-1 for the whole cache) that another memory module failed to complete
+    void state_clear(llama_seq_id seq_id);
 
     //
     // graph_build API
@@ -237,6 +247,38 @@ public:
 
     // TurboQuant InnerQ: per-channel scale_inv for Q/V equalization
     ggml_tensor * get_turbo_innerq_scale_inv() const { return turbo_innerq_scale_inv; }
+
+    //
+    // SJ-KVaRN region-aware cache (sink + ring rows exact fp16, body sealed into low-bit records)
+    //
+    bool is_sj_kvarn() const { return sj_kvarn.enabled(); }
+    const llama_sj_kvarn_config & get_sj_kvarn() const { return sj_kvarn; }
+    // SJ-KVaRN fused write rotation (#139): cpy_k/cpy_v rotate K/V inside the TQ6_0 cache write
+    bool sj_kvarn_fused_rot() const { return sj_kvarn_fused_rot_on; }
+    int  sj_kvarn_rot_group() const { return sj_kvarn.body_type == GGML_TYPE_TURBO4_0 ? 128 : 256; }
+    ggml_tensor * get_sj_kvarn_body(int32_t il) const;
+    bool maintain_sj_kvarn(llama_context * lctx);
+    int32_t compress_sj_kvarn_idle(llama_context * lctx, llama_seq_id seq_id, llama_pos accepted_end, llama_pos keep_from = -1);
+    uint32_t get_sj_kvarn_sealed_end() const { return sj_kvarn_B; }
+    // largest position <= pos that seq_rm(pos, -1) can truncate to: pos itself unless pos lies inside the sealed body
+    // below the intact ring rows, then the group boundary below it
+    llama_pos sj_kvarn_rm_floor(llama_seq_id seq_id, llama_pos pos) const;
+    uint32_t get_sj_kvarn_visible_end() const { return sj_kvarn_N; }
+    uint32_t get_sj_kvarn_capacity() const { return sj_kvarn_cap; }
+    uint64_t get_sj_kvarn_maintenance_count() const { return sj_kvarn_maintenance_count; }
+    uint64_t get_sj_kvarn_maintenance_groups() const { return sj_kvarn_maintenance_groups; }
+    bool has_sj_kvarn_maintenance() const { return sj_kvarn_B_pending > sj_kvarn_B; }
+
+
+    // I32[GGML_SJKVARN_DESC_N_ENTRIES] graph input consumed by the seal op and the attention op
+    ggml_tensor * build_input_sj_kvarn_desc(ggml_context * ctx) const;
+    void set_input_sj_kvarn_desc(ggml_tensor * dst, const llama_ubatch * ubatch, int tier = 0) const;
+    // tier (0 interior, 1 edge) and body bits of a model layer
+    int get_sj_kvarn_layer_tier(int32_t il, uint32_t & bits_k, uint32_t & bits_v) const;
+    bool has_sj_kvarn_edge_tier() const { return sj_kvarn_n_layers_edge > 0; }
+
+    // seal the groups that this ubatch pushed out of the tail: k_store/v_store are the set_rows outputs of cpy_k/cpy_v
+    ggml_tensor * build_sj_kvarn_seal(ggml_context * ctx, ggml_tensor * k_store, ggml_tensor * v_store, ggml_tensor * desc, int32_t il) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
@@ -292,6 +334,9 @@ public:
     // note: used by n-gram input embeddings
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
 
+    // attention sinks for a sliding-window cache: positions [0, n) are never SWA-masked or evicted
+    void set_swa_sink(uint32_t n) { n_swa_sink = n; }
+
 private:
     const llama_model & model;
     const llama_hparams & hparams;
@@ -306,9 +351,41 @@ private:
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
+
+        // SJ-KVaRN: sealed record pool, I8 [rec_bytes*n_head_kv*sj_kvarn_n_groups]
+        ggml_tensor * body = nullptr;
+        // SJ-KVaRN tier of this layer: 0 = interior (sj_kvarn.bits_k/v, body_type), 1 = edge (sj_kvarn.edge_*); record geometry follows
+        int       sj_kvarn_tier      = 0;
+        uint32_t  sj_kvarn_bits_k    = 0;
+        uint32_t  sj_kvarn_bits_v    = 0;
+        ggml_type sj_kvarn_body_type = GGML_TYPE_F32;
+        size_t    sj_kvarn_rec_bytes = 0;
     };
 
     bool v_trans = true;  // the value tensor is transposed
+
+    // SJ-KVaRN state (see is_sj_kvarn()). Positions: [0, sink) exact rows 0..sink-1; [sink, B) sealed records
+    // (sink..B in groups of `group`); [B, N) exact ring rows sink + (p - sink) % cap. Cells stay one per
+    // position (cell index == position) so the mask and the sequence bookkeeping are unchanged.
+    llama_sj_kvarn_config sj_kvarn;
+    uint32_t sj_kvarn_cap           = 0; // ring rows
+    uint32_t sj_kvarn_n_groups      = 0; // records per head in the pool
+    uint32_t sj_kvarn_n_groups_seal = 0; // static per-ubatch seal launch size
+    bool     sj_kvarn_fused_rot_on  = false; // #139, see sj_kvarn_fused_rot()
+    size_t   sj_kvarn_rec_bytes[2]  = {0, 0}; // per tier (0 interior, 1 edge)
+    uint32_t sj_kvarn_n_layers_edge = 0;      // cache layers on tier 1 (first + last edge_layers)
+    uint32_t sj_kvarn_B      = 0;        // sealed end
+    uint32_t sj_kvarn_B_pending = 0;     // proposed end, published after all layers complete
+    bool     sj_kvarn_draining  = false; // an adaptive-tail flush is being sealed in flush_chunk steps
+    uint64_t sj_kvarn_maintenance_count = 0;
+    uint64_t sj_kvarn_maintenance_groups = 0;
+    uint32_t sj_kvarn_B_prev = 0;        // sealed end before the current ubatch
+    uint32_t sj_kvarn_N      = 0;        // positions present
+    // per stream: positions [ring_lo, N) still hold their ring rows (lower ones were overwritten by p + cap or never
+    // restored); a body truncation may reopen sealed groups there
+    std::vector<uint32_t> sj_kvarn_ring_lo;
+
+    uint32_t sj_kvarn_ring_row(uint32_t pos) const { return pos < sj_kvarn.sink ? pos : sj_kvarn.sink + (pos - sj_kvarn.sink) % sj_kvarn_cap; }
 
     const uint32_t n_seq_max = 1;
     const uint32_t n_stream  = 1;
@@ -319,14 +396,31 @@ private:
     // SWA
     const uint32_t n_swa = 0;
 
+    // positions [0, n_swa_sink) are never SWA-masked or evicted (attention sinks)
+    // used by the optional MTP drafter attention window (--spec-draft-window); 0 = off
+    uint32_t n_swa_sink = 0;
+
     // env: LLAMA_ATTN_ROT_DISABLE
-    bool attn_rot_k = false;
-    bool attn_rot_v = false;
+    uint32_t n_rot_k = 0;
+    uint32_t n_rot_v = 0;
+
+    // the K rotation is the functional Hadamard transform of a DSA lightning-indexer cache (not tuning): the indexer
+    // graphs of deepseek32/dots3note multiply by it as one full-width matrix, so it must span the whole head
+    bool attn_rot_k_full = false;
 
     // if all layers participating in the cache have constant head size, the value is stored here
     // otherwise the value is -1
     int32_t n_embd_head_k_all = 0;
     int32_t n_embd_head_v_all = 0;
+
+    struct sj_kvarn_maintenance_graph {
+        ggml_context_ptr ctx;
+        ggml_backend_buffer_ptr buffer;
+        ggml_backend_t backend = nullptr;
+        ggml_cgraph * graph = nullptr;
+        ggml_tensor * desc[2] = {nullptr, nullptr}; // per tier
+    };
+    std::vector<sj_kvarn_maintenance_graph> sj_kvarn_maintenance_graphs;
 
     // pre-computed hadamard martrices
     std::unordered_map<int64_t, std::vector<float>> attn_rot_hadamard;
@@ -442,6 +536,18 @@ private:
     // sinfo_in, when set, replaces the find_slot call: the cells are given by the caller
     bool state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count,       slot_info & sinfo, llama_seq_id dest_seq_id = -1, const slot_info * sinfo_in = nullptr);
     bool state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo);
+
+    void state_clear(llama_seq_id seq_id, uint32_t strm, const slot_info & sinfo);
+
+    // SJ-KVaRN truncation into the sealed body (see the comment above sj_kvarn_truncate_body in llama-kv-cache.cpp)
+    uint32_t sj_kvarn_floor_g(uint32_t pos) const;
+    uint32_t sj_kvarn_stream(llama_seq_id seq_id) const;
+    uint32_t sj_kvarn_reopen_lo(uint32_t s) const;
+    bool     sj_kvarn_truncate_body(llama_seq_id seq_id, uint32_t p0);
+
+    // SJ-KVaRN sequence state (format: see the comment above state_write_sj_kvarn in llama-kv-cache.cpp)
+    void state_write_sj_kvarn(llama_io_write_i & io, llama_seq_id seq_id) const;
+    void state_read_sj_kvarn (llama_io_read_i  & io, llama_seq_id seq_id);
 };
 
 class llama_kv_cache_context : public llama_memory_context_i {
@@ -508,6 +614,17 @@ public:
 
     // TurboQuant InnerQ: per-channel scale_inv for Q/V equalization
     ggml_tensor * get_turbo_innerq_scale_inv() const override;
+
+    // SJ-KVaRN (see llama_kv_cache)
+    bool is_sj_kvarn() const;
+    ggml_tensor * get_sj_kvarn_body(int32_t il) const;
+    const llama_sj_kvarn_config & get_sj_kvarn() const;
+    bool sj_kvarn_fused_rot() const; // #139: the cache write rotates K/V (graph skips its K/V WHT)
+    ggml_tensor * build_input_sj_kvarn_desc(ggml_context * ctx) const;
+    void set_input_sj_kvarn_desc(ggml_tensor * dst, const llama_ubatch * ubatch, int tier = 0) const;
+    int get_sj_kvarn_layer_tier(int32_t il, uint32_t & bits_k, uint32_t & bits_v) const;
+    bool has_sj_kvarn_edge_tier() const;
+    ggml_tensor * build_sj_kvarn_seal(ggml_context * ctx, ggml_tensor * k_store, ggml_tensor * v_store, ggml_tensor * desc, int32_t il) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
     // note: the heads in k_cur and v_cur should be laid out contiguously in memory

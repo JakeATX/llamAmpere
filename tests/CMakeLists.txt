@@ -153,7 +153,16 @@ llama_build(test-fit-recurrent-noalloc.cpp)
 llama_build(test-output-buffer-reuse.cpp)
 
 llama_build_and_test(test-gdn-ingredient-replay.cpp LABEL "turbo")
+llama_build_and_test(test-sjkvarn-codec.cpp LABEL "turbo")
+target_include_directories(test-sjkvarn-codec PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+llama_build_and_test(test-sjkvarn-attn.cpp LABEL "turbo")
+target_include_directories(test-sjkvarn-attn PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+llama_build_and_test(test-sjkvarn-fused-rot.cpp LABEL "turbo")
+llama_build_and_test(test-sjkvarn-state.cpp LABEL "turbo")
+target_include_directories(test-sjkvarn-state PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 llama_build(test-save-load-state.cpp)
+# prompt-cache state round trip over every KV / drafter / recurrent-state type (needs an MTP model: -m)
+llama_build(test-prompt-cache-types.cpp)
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
@@ -167,6 +176,9 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-chat.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
     target_include_directories(test-chat PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-chat PRIVATE server-context)
+    llama_build_and_test(test-prompt-cache-disk.cpp)
+    target_include_directories(test-prompt-cache-disk PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+    target_link_libraries(test-prompt-cache-disk PRIVATE server-context)
     llama_build_and_test(test-json-schema-to-grammar.cpp)
 
     if (NOT GGML_BACKEND_DL)
@@ -211,6 +223,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         FIXTURES_SETUP generate-models
     )
 
+    # Test recurrent-state rollback across all architectures, using the generated dummy models
     llama_test(
         test-recurrent-state-rollback
         LABEL main
@@ -227,6 +240,16 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         ARGS -m "${MODEL_DIR}/qwen35-dense.gguf"
     )
     set_tests_properties(test-fit-recurrent-noalloc PROPERTIES
+        FIXTURES_REQUIRED generate-models
+    )
+    # same check for the DSV4 compressor states
+    llama_test(
+        test-fit-recurrent-noalloc
+        NAME test-fit-recurrent-noalloc-dsv4
+        LABEL main
+        ARGS -m "${MODEL_DIR}/deepseek4-moe.gguf"
+    )
+    set_tests_properties(test-fit-recurrent-noalloc-dsv4 PROPERTIES
         FIXTURES_REQUIRED generate-models
     )
 
@@ -255,6 +278,60 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         ARGS -m "${MODEL_DIR}/kimi-k3-moe.gguf"
     )
     set_tests_properties(test-recurrent-state-rollback-kimi-k3 PROPERTIES
+        FIXTURES_REQUIRED generate-models
+    )
+    llama_test(
+        test-recurrent-state-rollback
+        NAME test-recurrent-state-rollback-lfm2
+        LABEL main
+        ARGS -m "${MODEL_DIR}/lfm2-dense.gguf"
+    )
+    set_tests_properties(test-recurrent-state-rollback-lfm2 PROPERTIES
+        FIXTURES_REQUIRED generate-models
+    )
+    llama_test(
+        test-recurrent-state-rollback
+        NAME test-recurrent-state-rollback-lfm2moe
+        LABEL main
+        ARGS -m "${MODEL_DIR}/lfm2moe-moe.gguf"
+    )
+    set_tests_properties(test-recurrent-state-rollback-lfm2moe PROPERTIES
+        FIXTURES_REQUIRED generate-models
+    )
+    llama_test(
+        test-recurrent-state-rollback
+        NAME test-recurrent-state-rollback-bailingmoe3
+        LABEL main
+        ARGS -m "${MODEL_DIR}/bailingmoe3-moe.gguf"
+    )
+    set_tests_properties(test-recurrent-state-rollback-bailingmoe3 PROPERTIES
+        FIXTURES_REQUIRED generate-models
+    )
+    llama_test(
+        test-recurrent-state-rollback
+        NAME test-recurrent-state-rollback-qwen4exp
+        LABEL main
+        ARGS -m "${MODEL_DIR}/qwen4exp-moe.gguf"
+    )
+    set_tests_properties(test-recurrent-state-rollback-qwen4exp PROPERTIES
+        FIXTURES_REQUIRED generate-models
+    )
+    llama_test(
+        test-recurrent-state-rollback
+        NAME test-recurrent-state-rollback-qwen35moe
+        LABEL main
+        ARGS -m "${MODEL_DIR}/qwen35moe-moe.gguf"
+    )
+    set_tests_properties(test-recurrent-state-rollback-qwen35moe PROPERTIES
+        FIXTURES_REQUIRED generate-models
+    )
+    llama_test(
+        test-recurrent-state-rollback
+        NAME test-recurrent-state-rollback-nemotron-h-moe
+        LABEL main
+        ARGS -m "${MODEL_DIR}/nemotron_h_moe-dense.gguf"
+    )
+    set_tests_properties(test-recurrent-state-rollback-nemotron-h-moe PROPERTIES
         FIXTURES_REQUIRED generate-models
     )
 
@@ -319,6 +396,10 @@ if (NOT BUILD_SHARED_LIBS)
 endif()
 llama_build_and_test(test-kv-stream-softmax.cpp llama-kv-stream-softmax.cpp)
 if (GGML_CUDA)
+    llama_build_and_test(
+        test-kv-stream-bench-config.cpp
+        ${PROJECT_SOURCE_DIR}/tools/kv-stream-bench/kv-stream-bench-config.cpp)
+    target_include_directories(test-kv-stream-bench-config PRIVATE ${PROJECT_SOURCE_DIR}/tools/kv-stream-bench)
     llama_build_and_test(test-kv-stream-cuda-buffer.cpp LABEL cuda)
     target_include_directories(test-kv-stream-cuda-buffer PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda)
     # The test exits 77 when no CUDA device is present (e.g. a CUDA build run
@@ -339,15 +420,27 @@ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   # TODO: repair known memory leaks
   llama_build_and_test(test-opt.cpp)
 endif()
+if (GGML_METAL AND NOT GGML_BACKEND_DL)
+    # calls the Metal backend's graph optimizer and fusion table directly
+    llama_build_and_test(test-metal-graph-optimize.cpp)
+    target_include_directories(test-metal-graph-optimize PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src ${PROJECT_SOURCE_DIR}/ggml/src/ggml-metal)
+    target_link_libraries(test-metal-graph-optimize PRIVATE ggml-metal)
+endif()
 
 # TODO: make this test (and others) not link `libllama` as it is not needed [TAG_TESTS_LLAMA_LINK]
 llama_build_and_test(test-backend-ops.cpp)
+llama_build_and_test(test-fattn-prefill-policy.cpp)
 llama_build_and_test(test-mtp-vocab.cpp)
 llama_build_and_test(test-mtp-vocab-builtin.cpp ../src/llama-mtp-vocab-builtin.cpp)
 llama_build_and_test(test-gdn-replay-split.cpp)
 llama_build_and_test(test-add-rms-q8.cpp) # [#46] skips without a GPU backend
 llama_build_and_test(test-exl3-ffn-bridge.cpp) # [#74] skips without a GPU backend
 llama_build_and_test(test-exl3-weight-major.cpp) # [#73] skips without a GPU backend
+llama_build_and_test(test-exl3-decode.cpp) # [#41] skips without a GPU backend
+add_executable(test-fattn-mma-config test-fattn-mma-config.cpp)
+target_include_directories(test-fattn-mma-config PRIVATE ${PROJECT_SOURCE_DIR}/ggml/include)
+llama_test(test-fattn-mma-config)
+
 llama_build_and_test(test-fattn-alloc-route.cpp) # [#64] skips without a GPU backend
 llama_build_and_test(test-fattn-bounded-prefill.cpp) # [#22/#29] forks one child per GGML_CUDA_PREFILL_KV_MIB arm; skips without a GPU backend
 llama_build_and_test(test-mtp-chain-sample.cpp) # [#69] CPU always, the GPU when present
@@ -378,12 +471,14 @@ endif()
 llama_build_and_test(test-moe-cache-fit.cpp)
 llama_build_and_test(test-fit-extra.cpp)
 
+llama_build_and_test(test-tiled-mulmat.cpp)
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
 
 # Test for state restore with fragmented KV cache
 # Requires a model, uses same args pattern as test-thread-safety
+# TODO: run on all dummy models
 llama_build_and_test(test-state-restore-fragmented.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-state-restore-fragmented PROPERTIES FIXTURES_REQUIRED test-download-model)
 

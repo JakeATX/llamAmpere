@@ -448,6 +448,10 @@ server_task_result_ptr server_response::recv(const std::unordered_set<int> & id_
 }
 
 server_task_result_ptr server_response::recv_with_timeout(const std::unordered_set<int> & id_tasks, int timeout) {
+    // the timeout is a deadline for the whole call: condition_results is notified for the results of every task,
+    // so restarting the wait on each wakeup never times out while other tasks produce results, and the caller
+    // would not get to check its should_stop() (client disconnect, SSE ping) until one of its own results arrives
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout);
     while (true) {
         std::unique_lock<std::mutex> lock(mutex_results);
 
@@ -459,7 +463,7 @@ server_task_result_ptr server_response::recv_with_timeout(const std::unordered_s
             }
         }
 
-        std::cv_status cr_res = condition_results.wait_for(lock, std::chrono::seconds(timeout));
+        std::cv_status cr_res = condition_results.wait_until(lock, deadline);
         if (!running) {
             RES_DBG("%s : queue result stop\n", __func__);
             std::terminate(); // we cannot return here since the caller is HTTP code

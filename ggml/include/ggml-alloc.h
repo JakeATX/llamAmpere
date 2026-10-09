@@ -77,12 +77,16 @@ GGML_API size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_i
 // Only valid when the two allocators' graphs never execute concurrently (the caller must synchronize).
 GGML_API void ggml_gallocr_set_donor(ggml_gallocr_t galloc, ggml_gallocr_t donor);
 GGML_API bool ggml_gallocr_shares_buffer(ggml_gallocr_t galloc, int buffer_id);
+// Incremented when a recipient grows this (donor) allocator's buffers: graphs it allocated before are stale and must be
+// allocated again (ggml_gallocr_alloc_graph) before they are computed.
+GGML_API uint64_t ggml_gallocr_get_epoch(ggml_gallocr_t galloc);
 
 // Utils
 // Create a buffer and allocate all the tensors in a ggml_context
-// ggml_backend_alloc_ctx_tensors_from_buft_size returns the size of the buffer that would be allocated by ggml_backend_alloc_ctx_tensors_from_buft
-// ggml_backend_alloc_ctx_tensors_from_buft returns NULL on failure or if all tensors in ctx are already allocated or zero-sized
+
+// returns the size of the buffer that would be allocated by ggml_backend_alloc_ctx_tensors_from_buft. returns 0 on failure
 GGML_API size_t                       ggml_backend_alloc_ctx_tensors_from_buft_size(struct ggml_context * ctx, ggml_backend_buffer_type_t buft);
+// returns NULL on failure or if all tensors in ctx are already allocated or zero-sized
 GGML_API struct ggml_backend_buffer * ggml_backend_alloc_ctx_tensors_from_buft(struct ggml_context * ctx, ggml_backend_buffer_type_t buft);
 GGML_API struct ggml_backend_buffer * ggml_backend_alloc_ctx_tensors(struct ggml_context * ctx, ggml_backend_t backend);
 

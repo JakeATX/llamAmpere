@@ -224,6 +224,9 @@ private:
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
 
+    // true if no layers - can happen if the layer filter removes all layers
+    bool is_empty() const;
+
     size_t total_size() const;
 
     size_t size_r_bytes() const;
@@ -242,6 +245,8 @@ private:
     bool state_read_meta(llama_io_read_i & io, uint32_t cell_count, llama_seq_id dest_seq_id = -1);
     bool state_read_data(llama_io_read_i & io, uint32_t cell_count);
     bool state_read_replay(llama_io_read_i & io, uint32_t cell_count);
+
+    void state_clear(llama_seq_id seq_id, uint32_t cell_head, uint32_t cell_count);
 };
 
 class llama_memory_recurrent_context : public llama_memory_context_i {
@@ -303,7 +308,8 @@ public:
     // [TAG_RECURRENT_ROLLBACK_SHIFT] number of older snapshot groups (conv in both modes, the
     // recurrent state in the non-replay mode) the builder must move back by n_seq_tokens for the
     // current ubatch: K - max(n_seq_tokens, pending rollback) when n_seq_tokens < K = n_rs_seq + 1,
-    // else 0. The op only rewrites the newest min(n, K) groups, so without the move group g
+    // else 0, for the lane with the smallest pending rollback (lanes with a deeper one move fewer
+    // groups; set_input_shift makes the rest no-ops). The op only rewrites the newest min(n, K) groups, so without the move group g
     // holds the state g tokens behind the PREVIOUS head after a short ubatch, and a rollback of
     // exactly one short batch (the multi-seq test's shape) restores a state that never existed.
     // Never nonzero on the speculative verify path (n = n_draft + 1 = K).

@@ -8,6 +8,7 @@
 #include "llama.h"
 #include "sampling.h"
 #include "speculative.h"
+#include "ggml-ledger.h"
 #include "server-common.h"
 
 #include <sstream>
@@ -81,7 +82,7 @@ json task_params::to_json(bool only_metrics) const {
             {"chat_format",               common_chat_format_name(chat_parser_params.format)},
             {"reasoning_format",          common_reasoning_format_name(chat_parser_params.reasoning_format)},
             {"reasoning_in_content",      chat_parser_params.reasoning_in_content},
-            {"generation_prompt",         chat_parser_params.generation_prompt},
+            {"generation_prompt",         chat_parser_params.generation_prompt.text},
             {"samplers",                  samplers},
             {"speculative.types",         common_speculative_type_name_str(speculative.types)},
             {"timings_per_token",         timings_per_token},
@@ -140,7 +141,7 @@ json task_params::to_json(bool only_metrics) const {
         {"chat_format",               common_chat_format_name(chat_parser_params.format)},
         {"reasoning_format",          common_reasoning_format_name(chat_parser_params.reasoning_format)},
         {"reasoning_in_content",      chat_parser_params.reasoning_in_content},
-        {"generation_prompt",         chat_parser_params.generation_prompt},
+        {"generation_prompt",         chat_parser_params.generation_prompt.text},
         {"samplers",                  samplers},
         {"speculative.types",         common_speculative_type_name_str(speculative.types)},
         {"timings_per_token",         timings_per_token},
@@ -160,20 +161,20 @@ task_result_state::task_result_state(const common_chat_parser_params & chat_pars
     , oai_resp_message_id("msg_" + random_string()) {
     if (chat_parser_params.is_continuation && !chat_parser_params.echo) {
         // initialize chat_msg to avoid emitting a delta containing the assistant prefill
-        chat_msg = common_chat_parse("", true, chat_parser_params);
+        chat_msg = common_chat_parse(generated_input, true, chat_parser_params);
     }
 }
 
 common_chat_msg task_result_state::update_chat_msg(
-        const std::string & text_added,
+        const common_chat_input & added,
         bool is_partial,
         std::vector<common_chat_msg_diff> & diffs,
         bool filter_tool_calls) {
-    generated_text += text_added;
+    generated_input.append(added);
     auto msg_prv_copy = chat_msg;
-    //SRV_DBG("Parsing chat message: %s\n", generated_text.c_str());
+    //SRV_DBG("Parsing chat message: %s\n", generated_input.text.c_str());
     auto new_msg = common_chat_parse(
-        generated_text,
+        generated_input,
         is_partial,
         chat_parser_params);
     if (!new_msg.empty()) {
@@ -345,7 +346,7 @@ json server_task_result_cmpl_final::to_json() {
 json server_task_result_cmpl_final::to_json_non_oaicompat() {
     json res = json {
         {"index",               index},
-        {"content",             content},
+        {"content",             content.text},
         {"tokens",              tokens},
         {"id_slot",             id_slot},
         {"stop",                true},
@@ -391,7 +392,7 @@ json server_task_result_cmpl_final::to_json_oaicompat() {
     json res = json {
         {"choices",            json::array({
             json{
-                {"text",          content},
+                {"text",          content.text},
                 {"index",         index},
                 {"logprobs",      logprobs},
                 {"finish_reason", finish_reason},
@@ -423,7 +424,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat() {
         msg = oaicompat_msg;
     } else {
         msg.role = "assistant";
-        msg.content = content;
+        msg.content = content.text;
     }
     if (stop == STOP_TYPE_WORD || stop == STOP_TYPE_EOS) {
         finish_reason = msg.tool_calls.empty() ? "stop" : "tool_calls";
@@ -536,7 +537,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp() {
         msg = oaicompat_msg;
     } else {
         msg.role = "assistant";
-        msg.content = content;
+        msg.content = content.text;
     }
 
     std::vector<json> output;
@@ -746,7 +747,7 @@ json server_task_result_cmpl_final::to_json_anthropic() {
         msg = oaicompat_msg;
     } else {
         msg.role = "assistant";
-        msg.content = content;
+        msg.content = content.text;
     }
 
     // thinking block comes first (Anthropic extended thinking format)
@@ -1055,7 +1056,7 @@ json server_task_result_cmpl_partial::to_json_non_oaicompat() {
     // non-OAI-compat JSON
     json res = json {
         {"index",            index},
-        {"content",          content},
+        {"content",          content.text},
         {"tokens",           tokens},
         {"stop",             false},
         {"id_slot",          id_slot},
@@ -1086,7 +1087,7 @@ json server_task_result_cmpl_partial::to_json_oaicompat() {
     json res = json {
         {"choices",            json::array({
             json{
-                {"text",          content},
+                {"text",          content.text},
                 {"index",         index},
                 {"logprobs",      logprobs},
                 {"finish_reason", nullptr},
@@ -1321,7 +1322,7 @@ json server_task_result_cmpl_partial::to_json_oaicompat_resp() {
 json server_task_result_cmpl_partial::to_json_oaicompat_asr() {
     json event = json {
         {"type", "transcript.text.delta"},
-        {"delta", content},
+        {"delta", content.text},
     };
     return event;
 }
@@ -1501,6 +1502,17 @@ json server_task_result_rerank::to_json() {
 }
 
 //
+// server_task_result_decision
+//
+json server_task_result_decision::to_json() {
+    return json {
+        {"index",            index},
+        {"scores",           scores},
+        {"tokens_evaluated", n_tokens},
+    };
+}
+
+//
 // server_task_result_error
 //
 json server_task_result_error::to_json() {
@@ -1616,6 +1628,30 @@ std::string server_task_result_metrics::to_metrics() {
             prometheus << "llamacpp:spec_decode_num_accepted_tokens_per_pos_total{position=\""
                        << i << "\"} " << metrics.n_accepted_per_pos[i] << "\n";
         }
+    }
+
+    // fallback ledger (GGML_LEDGER=1 or --fallback-ledger): which route each op took and why a fast path was skipped
+    if (ggml_ledger_enabled()) {
+        prometheus << "# HELP llamacpp:fallback_ledger_total Route and fallback counters from the fallback ledger\n"
+                   << "# TYPE llamacpp:fallback_ledger_total counter\n";
+        ggml_ledger_foreach([](const char * site, const char * key, int64_t count, void * user_data) {
+            auto & os = *(std::stringstream *) user_data;
+            auto esc = [](const char * v) {
+                std::string out;
+                for (const char * c = v; *c; ++c) {
+                    if (*c == '\\' || *c == '"') {
+                        out += '\\';
+                        out += *c;
+                    } else if (*c == '\n') {
+                        out += "\\n";
+                    } else {
+                        out += *c;
+                    }
+                }
+                return out;
+            };
+            os << "llamacpp:fallback_ledger_total{site=\"" << esc(site) << "\",key=\"" << esc(key) << "\"} " << count << "\n";
+        }, &prometheus);
     }
 
     return prometheus.str();
@@ -1774,22 +1810,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         }
     }
 
-    // same for the disk tier: a spilled prompt that is a prefix of the current one is superseded
-    if (disk_enabled() && !prompt.tokens.has_mtmd) {
-        for (auto it = disk_entries.begin(); it != disk_entries.end();) {
-            const server_tokens tmp(it->tokens, false);
-
-            const int len = tmp.get_common_prefix(prompt.tokens);
-
-            if (len == (int) it->tokens.size()) {
-                SRV_TRC(" - removing obsolete disk-cached prompt with length %d\n", len);
-
-                disk_remove(it++);
-            } else {
-                ++it;
-            }
-        }
-    }
+    // note: disk entries that are a prefix of this prompt are kept until this prompt itself reaches the
+    // disk tier (server_prompt_disk_tier::write supersedes them then), so a restart never loses both
 
     if (limit_size > 0) {
         // make room before allocating the new vectors to avoid breaching the limit
@@ -1881,7 +1903,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     SRV_TRC(" - looking for better prompt, base f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 
     auto it_best      = states.end();
-    auto it_best_disk = disk_entries.end();
+    auto it_best_disk = disk.entries.end();
 
     // find the most similar cached prompt, that would also preserve the most context
     for (auto it = states.begin(); it != states.end(); ++it) {
@@ -1924,7 +1946,11 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
     // the disk tier competes under the same rule; a RAM entry wins ties
     if (disk_enabled() && !tokens_new.has_mtmd) {
-        for (auto it = disk_entries.begin(); it != disk_entries.end(); ++it) {
+        for (auto it = disk.entries.begin(); it != disk.entries.end(); ++it) {
+            if (!it->match) {
+                continue; // another model or KV configuration
+            }
+
             const server_tokens tmp(it->tokens, false);
 
             const int lcp_cur = tmp.get_common_prefix(tokens_new);
@@ -1967,20 +1993,27 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         return true;
     }
 
-    if (it_best_disk != disk_entries.end()) {
+    if (it_best_disk != disk.entries.end()) {
         SRV_INF(" - found better prompt on disk with f_keep = %.3f, f_sim = %.3f (%zu tokens, %.3f MiB), restoring\n",
                 f_keep_best, f_sim_best, it_best_disk->tokens.size(), it_best_disk->size / (1024.0 * 1024.0));
 
-        server_prompt_cache_state state;
-
         const int64_t t_start = ggml_time_us();
 
-        const bool ok = disk_read(*it_best_disk, state) && restore(state, ctx_tgt, ctx_dft, id_slot);
+        // the file stays on disk: it is FIFO-evicted, or superseded once a longer prompt with this prefix is written
+        server_prompt_disk_record rec;
+        if (!disk.read(it_best_disk, rec)) {
+            SRV_WRN("%s", " - failed to read prompt from the disk tier\n");
 
-        // the entry is consumed either way: a file that failed to load is useless
-        disk_remove(it_best_disk);
+            return false;
+        }
 
-        if (!ok) {
+        server_prompt_cache_state state;
+        state.prompt.tokens      = server_tokens(rec.tokens, false);
+        state.prompt.checkpoints = std::move(rec.checkpoints);
+        state.data.main          = std::move(rec.main);
+        state.data.drft          = std::move(rec.drft);
+
+        if (!restore(state, ctx_tgt, ctx_dft, id_slot)) {
             SRV_WRN("%s", " - failed to restore prompt from the disk tier\n");
 
             return false;
@@ -1994,11 +2027,15 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     }
 
     if (it_best != states.end()) {
-        SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
+        const int64_t t_start = ggml_time_us();
+        const size_t  n_bytes = it_best->size(); // restore() may release the state buffers
 
         if (!restore(*it_best, ctx_tgt, ctx_dft, id_slot)) {
             return false;
         }
+
+        SRV_INF(" - restored prompt from RAM with f_keep = %.3f, f_sim = %.3f (%zu tokens, %.3f MiB) in %.2f ms\n",
+                f_keep_best, f_sim_best, it_best->prompt.tokens.size(), n_bytes / (1024.0 * 1024.0), (ggml_time_us() - t_start) / 1000.0);
 
         prompt = std::move(it_best->prompt);
 
@@ -2039,8 +2076,6 @@ void server_prompt_cache::update() {
             staging = server_prompt_cache_state();
             staging_pending = false;
         }
-
-        disk_update();
     }
 
     // one line per update at info level: the cache is the largest host allocation the server makes,
@@ -2055,45 +2090,19 @@ void server_prompt_cache::update() {
 }
 
 //
-// prompt cache disk tier
+// prompt cache disk tier (format and file handling in server-prompt-cache-disk.cpp)
 //
-// file layout (little-endian): magic "LCPC", u32 version, u64 n_tokens, i32 tokens[n_tokens],
-//   u64 main_len, bytes, u64 drft_len, bytes, u32 n_checkpoints, then per checkpoint:
-//   i64 n_tokens, i32 id_task, i32 pos_min, i32 pos_max, u64 len_tgt, bytes, u64 len_dft, bytes, u64 len_spec, bytes
-//
-static const char     PROMPT_CACHE_DISK_MAGIC[4] = {'L', 'C', 'P', 'C'};
-static const uint32_t PROMPT_CACHE_DISK_VERSION  = 1;
 
-template <typename T> static void pc_write(std::ofstream & f, const T & v) { f.write((const char *) &v, sizeof(T)); }
-template <typename T> static bool pc_read (std::ifstream & f, T & v)       { f.read((char *) &v, sizeof(T)); return (bool) f; }
-
-static void pc_write_bytes(std::ofstream & f, const std::vector<uint8_t> & v) {
-    pc_write<uint64_t>(f, v.size());
-    if (!v.empty()) {
-        f.write((const char *) v.data(), v.size());
-    }
-}
-
-static bool pc_read_bytes(std::ifstream & f, std::vector<uint8_t> & v, size_t max_len) {
-    uint64_t n = 0;
-    if (!pc_read(f, n) || n > max_len) {
+bool server_prompt_cache::disk_open(const std::string & dir, const std::string & key, size_t limit_bytes, std::string & err) {
+    if (!disk.open(dir, key, limit_bytes, err)) {
         return false;
     }
-    v.resize(n);
-    if (n > 0) {
-        f.read((char *) v.data(), n);
-    }
-    return (bool) f;
-}
 
-size_t server_prompt_cache::disk_size() const {
-    size_t res = 0;
+    SRV_INF("prompt cache disk tier: %s, %zu entries for this model and KV config, %zu in total, %.1f MiB (limit %s)\n",
+            dir.c_str(), disk.n_match(), disk.entries.size(), disk.size() / (1024.0 * 1024.0),
+            limit_bytes > 0 ? string_format("%.0f MiB", limit_bytes / (1024.0 * 1024.0)).c_str() : "none, free-space guard only");
 
-    for (const auto & entry : disk_entries) {
-        res += entry.size;
-    }
-
-    return res;
+    return true;
 }
 
 void server_prompt_cache::evict_front() {
@@ -2119,162 +2128,27 @@ bool server_prompt_cache::disk_spill(const server_prompt_cache_state & state) {
         return false;
     }
 
-    const llama_tokens tokens = state.prompt.tokens.get_text_tokens();
-
-    const std::string file = disk_path + "/pc-" + std::to_string(ggml_time_us()) + ".bin";
-
-    std::ofstream f(file, std::ios::binary);
-    if (!f) {
-        SRV_ERR(" - cannot open %s for writing\n", file.c_str());
-
-        return false;
-    }
-
-    f.write(PROMPT_CACHE_DISK_MAGIC, 4);
-    pc_write<uint32_t>(f, PROMPT_CACHE_DISK_VERSION);
-    pc_write<uint64_t>(f, tokens.size());
-    if (!tokens.empty()) {
-        f.write((const char *) tokens.data(), tokens.size() * sizeof(llama_token));
-    }
-    pc_write_bytes(f, state.data.main);
-    pc_write_bytes(f, state.data.drft);
-    pc_write<uint32_t>(f, (uint32_t) state.prompt.checkpoints.size());
-    for (const auto & ckpt : state.prompt.checkpoints) {
-        pc_write<int64_t>(f, ckpt.n_tokens);
-        pc_write<int32_t>(f, ckpt.id_task);
-        pc_write<int32_t>(f, ckpt.pos_min);
-        pc_write<int32_t>(f, ckpt.pos_max);
-        pc_write_bytes(f, ckpt.data_tgt);
-        pc_write_bytes(f, ckpt.data_dft);
-        pc_write_bytes(f, ckpt.data_spec);
-    }
-    f.close();
-
-    if (!f) {
-        SRV_ERR(" - failed to write %s\n", file.c_str());
-        std::filesystem::remove(file);
-
-        return false;
-    }
-
-    const size_t size = std::filesystem::file_size(file);
-
-    SRV_INF(" - spilled prompt with %zu tokens and %zu checkpoints to disk (%.3f MiB): %s\n",
-            tokens.size(), state.prompt.checkpoints.size(), size / (1024.0 * 1024.0), file.c_str());
-
-    disk_entries.push_back({ file, tokens, size });
-
-    disk_update();
-
-    return true;
+    return disk.write(state.prompt.tokens.get_text_tokens(), state.data.main, state.data.drft, state.prompt.checkpoints);
 }
 
-bool server_prompt_cache::disk_read(const server_prompt_cache_disk_entry & entry, server_prompt_cache_state & out) const {
-    std::ifstream f(entry.file, std::ios::binary);
-    if (!f) {
-        SRV_ERR(" - cannot open %s\n", entry.file.c_str());
-
-        return false;
+void server_prompt_cache::flush_to_disk() {
+    if (!disk_enabled()) {
+        return;
     }
 
-    char magic[4];
-    uint32_t version = 0;
-    uint64_t n_tokens = 0;
-    f.read(magic, 4);
-    if (!f || memcmp(magic, PROMPT_CACHE_DISK_MAGIC, 4) != 0 || !pc_read(f, version) || version != PROMPT_CACHE_DISK_VERSION || !pc_read(f, n_tokens)) {
-        SRV_ERR(" - %s is not a prompt cache file\n", entry.file.c_str());
-
-        return false;
+    size_t n = 0;
+    const size_t n_total = states.size() + (staging_pending ? 1 : 0);
+    for (const auto & state : states) {
+        n += disk_spill(state) ? 1 : 0;
     }
 
-    llama_tokens tokens(n_tokens);
-    if (n_tokens > 0) {
-        f.read((char *) tokens.data(), n_tokens * sizeof(llama_token));
+    if (staging_pending) {
+        n += disk_spill(staging) ? 1 : 0;
+
+        staging = server_prompt_cache_state();
+        staging_pending = false;
     }
 
-    const size_t max_len = entry.size + 1;
-
-    uint32_t n_ckpt = 0;
-    if (!f || !pc_read_bytes(f, out.data.main, max_len) || !pc_read_bytes(f, out.data.drft, max_len) || !pc_read(f, n_ckpt)) {
-        SRV_ERR(" - %s is truncated\n", entry.file.c_str());
-
-        return false;
-    }
-
-    std::list<common_prompt_checkpoint> checkpoints;
-    for (uint32_t i = 0; i < n_ckpt; ++i) {
-        common_prompt_checkpoint ckpt;
-        if (!pc_read(f, ckpt.n_tokens) || !pc_read(f, ckpt.id_task) || !pc_read(f, ckpt.pos_min) || !pc_read(f, ckpt.pos_max) ||
-            !pc_read_bytes(f, ckpt.data_tgt, max_len) || !pc_read_bytes(f, ckpt.data_dft, max_len) || !pc_read_bytes(f, ckpt.data_spec, max_len)) {
-            SRV_ERR(" - %s has a truncated checkpoint\n", entry.file.c_str());
-
-            return false;
-        }
-        checkpoints.push_back(std::move(ckpt));
-    }
-
-    out.prompt.tokens      = server_tokens(tokens, false);
-    out.prompt.checkpoints = std::move(checkpoints);
-
-    return true;
-}
-
-void server_prompt_cache::disk_remove(std::list<server_prompt_cache_disk_entry>::iterator it) {
-    std::error_code ec;
-    std::filesystem::remove(it->file, ec);
-
-    disk_entries.erase(it);
-}
-
-void server_prompt_cache::disk_update() {
-    if (disk_limit > 0) {
-        while (!disk_entries.empty() && disk_size() > disk_limit) {
-            SRV_WRN(" - disk tier limit reached, removing oldest spilled prompt (%.3f MiB)\n", disk_entries.front().size / (1024.0 * 1024.0));
-
-            disk_remove(disk_entries.begin());
-        }
-    }
-
-    SRV_TRC(" - disk tier: %zu prompts, %.3f MiB (limit: %.3f MiB)\n",
-            disk_entries.size(), disk_size() / (1024.0 * 1024.0), disk_limit / (1024.0 * 1024.0));
-}
-
-// index spill files left by a previous run (only their token lists are read)
-void server_prompt_cache::disk_scan() {
-    std::vector<std::string> files;
-
-    std::error_code ec;
-    for (const auto & e : std::filesystem::directory_iterator(disk_path, ec)) {
-        const std::string name = e.path().filename().string();
-        if (e.is_regular_file() && name.rfind("pc-", 0) == 0 && name.size() > 7 && name.compare(name.size() - 4, 4, ".bin") == 0) {
-            files.push_back(e.path().string());
-        }
-    }
-
-    std::sort(files.begin(), files.end()); // names carry the spill timestamp
-
-    for (const auto & file : files) {
-        std::ifstream f(file, std::ios::binary);
-        char magic[4];
-        uint32_t version = 0;
-        uint64_t n_tokens = 0;
-        f.read(magic, 4);
-        if (!f || memcmp(magic, PROMPT_CACHE_DISK_MAGIC, 4) != 0 || !pc_read(f, version) || version != PROMPT_CACHE_DISK_VERSION || !pc_read(f, n_tokens) || n_tokens > (1u << 24)) {
-            SRV_WRN(" - ignoring unreadable prompt cache file %s\n", file.c_str());
-            continue;
-        }
-
-        llama_tokens tokens(n_tokens);
-        f.read((char *) tokens.data(), n_tokens * sizeof(llama_token));
-        if (!f) {
-            continue;
-        }
-
-        disk_entries.push_back({ file, std::move(tokens), (size_t) std::filesystem::file_size(file) });
-    }
-
-    SRV_INF("prompt cache disk tier: %s, %zu prompts indexed, %.3f MiB (limit: %.3f MiB)\n",
-            disk_path.c_str(), disk_entries.size(), disk_size() / (1024.0 * 1024.0), disk_limit / (1024.0 * 1024.0));
-
-    disk_update();
+    SRV_INF("prompt cache: flushed %zu of %zu prompts to the disk tier (%zu entries, %.1f MiB on disk)\n",
+            n, n_total, disk.entries.size(), disk.size() / (1024.0 * 1024.0));
 }

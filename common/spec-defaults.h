@@ -26,7 +26,7 @@ struct common_speculative_family_default {
 // the table row for this architecture and number of MTP (nextn) layers, nullptr if the family has no default
 const common_speculative_family_default * common_speculative_family_default_find(const std::string & arch, uint32_t n_nextn);
 
-// "qwen35 with an MTP head: draft-mtp, ..." for help texts
+// "qwen35 with an MTP head: draft-mtp-adaptive, ..." for help texts
 std::string common_speculative_family_defaults_str();
 
 // apply the family default to spec (pure: no model file, no logging)

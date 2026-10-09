@@ -10,12 +10,14 @@
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
+#include "server-prompt-cache-disk.h"
 
 
 enum server_task_type {
     SERVER_TASK_TYPE_COMPLETION,
     SERVER_TASK_TYPE_EMBEDDING,
     SERVER_TASK_TYPE_RERANK,
+    SERVER_TASK_TYPE_DECISION,
     SERVER_TASK_TYPE_INFILL,
     SERVER_TASK_TYPE_CANCEL,
     SERVER_TASK_TYPE_CONTROL,
@@ -107,7 +109,7 @@ struct task_result_state {
     std::vector<common_chat_msg_diff> diffs;
     common_chat_parser_params chat_parser_params;
     common_chat_msg chat_msg;
-    std::string generated_text; // append new chunks of generated text here
+    common_chat_input generated_input; // append new chunks of generated text here
     std::vector<std::string> generated_tool_call_ids;
     std::unordered_set<size_t> sent_tool_call_names;
 
@@ -127,7 +129,7 @@ struct task_result_state {
 
     // parse partial tool calls and update the internal state
     common_chat_msg update_chat_msg(
-        const std::string & text_added,
+        const common_chat_input & added,
         bool is_partial,
         std::vector<common_chat_msg_diff> & diffs,
         bool filter_tool_calls = false);
@@ -148,6 +150,8 @@ struct server_task {
     // temporary store of child tasks for scheduling
     // note: accessing to elements is invalid after the task is moved to server_slot
     std::vector<server_task> child_tasks;
+    // if set on a parent, the children have their own prompt and only share its first n_tokens_shared tokens
+    int32_t n_tokens_shared = 0;
 
     // used by SERVER_TASK_TYPE_INFERENCE
     task_params   params;
@@ -172,6 +176,32 @@ struct server_task {
     // used by SERVER_TASK_TYPE_METRICS
     bool metrics_reset_bucket = false;
 
+    // used by SERVER_TASK_TYPE_DECISION
+    // where to read the model output of each option, exactly one of the two lists is used
+    struct decision {
+        std::vector<llama_token> labels;       // logits of these tokens, at the last prompt token
+        std::vector<int32_t>     label_groups; // if set, number of labels per output, the output is their max
+        std::vector<int32_t>     markers;      // embeddings[column] at these prompt positions
+        int32_t                  column = 0;
+        // if set, embeddings is [q | k], and the output is instead the scaled dot product of q[pointer] and k[marker]
+        int32_t                  pointer = -1;
+
+        // first prompt position that is read, -1 if none
+        int32_t pos_first() const {
+            int32_t pos = pointer;
+            for (const int32_t marker : markers) {
+                pos = pos < 0 ? marker : std::min(pos, marker);
+            }
+            return pos;
+        }
+
+        // for a joint head: one value per prompt token, see llama_batch_ext_set_decision_order()
+        // the scores are the first n_scores rows of the embeddings
+        std::vector<int32_t> order;
+        int32_t              n_scores = 0;
+    };
+    decision decision;
+
     // used by SERVER_TASK_TYPE_SET_LORA
     std::map<int, float> set_lora; // mapping adapter ID -> scale
 
@@ -188,6 +218,8 @@ struct server_task {
             case SERVER_TASK_TYPE_EMBEDDING:
             case SERVER_TASK_TYPE_RERANK:
                 return true;
+            case SERVER_TASK_TYPE_DECISION:
+                return !decision.markers.empty() || !decision.order.empty();
             default:
                 return false;
         }
@@ -198,6 +230,8 @@ struct server_task {
             case SERVER_TASK_TYPE_COMPLETION:
             case SERVER_TASK_TYPE_INFILL:
                 return true;
+            case SERVER_TASK_TYPE_DECISION:
+                return !decision.labels.empty();
             default:
                 return false;
         }
@@ -318,7 +352,7 @@ struct completion_token_output {
 };
 
 struct server_task_result_cmpl_final : server_task_result {
-    std::string content;
+    common_chat_input content;
     llama_tokens tokens;
 
     bool stream;
@@ -393,8 +427,8 @@ struct server_task_result_cmpl_final : server_task_result {
 };
 
 struct server_task_result_cmpl_partial : server_task_result {
-    std::string  content;
-    llama_tokens tokens;
+    common_chat_input content;
+    llama_tokens      tokens;
 
     int32_t n_decoded;
     int32_t n_prompt_tokens;
@@ -468,6 +502,14 @@ struct server_task_result_embd : server_task_result {
 
 struct server_task_result_rerank : server_task_result {
     float score = -1e6;
+
+    int32_t n_tokens;
+
+    virtual json to_json() override;
+};
+
+struct server_task_result_decision : server_task_result {
+    std::vector<float> scores; // one raw model output per option
 
     int32_t n_tokens;
 
@@ -609,23 +651,10 @@ struct server_prompt_cache_state {
     }
 };
 
-// an entry of the prompt-cache disk tier: the serialized state lives in `file`, only the tokens stay in RAM
-struct server_prompt_cache_disk_entry {
-    std::string  file;
-    llama_tokens tokens;
-    size_t       size = 0; // bytes on disk
-};
-
 struct server_prompt_cache {
-    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens, const std::string & disk_path = "", int32_t disk_limit_mib = 0) {
+    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
         this->limit_tokens = limit_tokens;
-        this->disk_path    = disk_path;
-        this->disk_limit   = 1024ull*1024ull*(disk_limit_mib < 0 ? 0 : disk_limit_mib);
-
-        if (disk_enabled()) {
-            disk_scan();
-        }
     }
 
     std::list<server_prompt_cache_state> states;
@@ -636,17 +665,17 @@ struct server_prompt_cache {
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
 
-    // disk tier (opt-in via --cache-disk-path): RAM evictions are spilled here and consulted on a RAM miss
-    std::string disk_path;
-    size_t      disk_limit = 0; // bytes, 0 = no limit
-    std::list<server_prompt_cache_disk_entry> disk_entries;
+    // disk tier: RAM evictions are spilled here and consulted on a RAM miss (see server-prompt-cache-disk.h)
+    server_prompt_disk_tier disk;
 
     // a prompt too large for the RAM budget is staged here and spilled straight to disk on the next update()
     server_prompt_cache_state staging;
     bool                      staging_pending = false;
 
-    bool   disk_enabled() const { return !disk_path.empty(); }
-    size_t disk_size() const;
+    // open the disk tier; on failure the cache stays RAM-only and `err` says why
+    bool disk_open(const std::string & dir, const std::string & key, size_t limit_bytes, std::string & err);
+
+    bool disk_enabled() const { return disk.enabled(); }
 
     size_t size() const;
 
@@ -658,6 +687,10 @@ struct server_prompt_cache {
 
     void update();
 
+    // write every RAM entry (and the staging area) to the disk tier, oldest first; used at shutdown and
+    // before sleeping so that a restarted server finds them. The RAM entries are kept.
+    void flush_to_disk();
+
 private:
     // move a RAM entry's state into the slot's contexts; clears the entry's data on success
     bool restore(server_prompt_cache_state & state, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
@@ -665,11 +698,7 @@ private:
     // drop the oldest RAM entry, spilling it to disk first when the disk tier is enabled
     void evict_front();
 
-    void disk_scan();
     bool disk_spill(const server_prompt_cache_state & state);
-    bool disk_read(const server_prompt_cache_disk_entry & entry, server_prompt_cache_state & out) const;
-    void disk_remove(std::list<server_prompt_cache_disk_entry>::iterator it);
-    void disk_update();
 };
 
 // used exclusively by router mode

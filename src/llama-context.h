@@ -8,6 +8,7 @@
 #include "llama-impl.h"
 #include "llama-memory.h"
 #include "llama-mtp-vocab.h"
+#include "llama-moe-cache.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -18,6 +19,7 @@
 
 struct llama_model;
 class llama_batch_allocr;
+class llama_moe_cache;
 
 class llama_io_read_i;
 class llama_io_write_i;
@@ -58,6 +60,10 @@ struct llama_context {
     void sched_reserve();
 
     void synchronize();
+    ggml_backend_t sj_kvarn_backend(ggml_backend_buffer_t buffer) const;
+    bool maintain_sj_kvarn();
+    int32_t compress_sj_kvarn_idle(llama_seq_id seq_id, llama_pos accepted_end, llama_pos keep_from = -1);
+
 
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;
@@ -113,6 +119,8 @@ struct llama_context {
 
     const llama_token * get_sampled_candidates_ith(int32_t idx);
     size_t get_sampled_candidates_count(int32_t idx);
+
+    bool get_causal_attn() const;
 
     void attach_threadpool(
             ggml_threadpool_t threadpool,
@@ -255,7 +263,7 @@ private:
 
     // async-copy enabled layer-input tensors (per cparams.output_layer_inp)
     // from backend into host-side embd_layer_inp buffers
-    void extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
+    bool extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
 
     //
     // graph
@@ -296,6 +304,9 @@ private:
                           llm_graph_type   gtype) const;
 
     llm_graph_cb graph_get_cb() const;
+
+    // ggml_backend_sched copy callback, copies only the experts used by MUL_MAT_ID and updates the MoE cache
+    static bool sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
 
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
     // that differs from the layer it belongs to (usually due to missing backend support)
@@ -367,6 +378,7 @@ private:
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
     llama_memory_ptr memory;
+    llama_moe_cache_ptr moe_cache;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
@@ -383,6 +395,7 @@ private:
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true
     std::vector<buffer_view<float>> embd_layer_inp;
+    std::vector<int32_t> embd_batch_idxs; // extracted index -> original batch index
 
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active
@@ -451,6 +464,21 @@ private:
 
     bool sched_need_reserve = true;
 
+    // state of sched_copy_experts, reset before each graph compute
+    struct copy_experts_info {
+        const ggml_tensor *  ids = nullptr;
+        std::vector<int32_t> ids_data;
+        std::vector<bool>    used;
+
+        void reset() {
+            ids = nullptr;
+            ids_data.clear();
+            used.clear();
+        }
+    };
+
+    copy_experts_info copy_experts;
+
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
 
@@ -475,6 +503,8 @@ private:
     llm_graph_result_ptr gf_res_reserve;
 
     llm_graph_result * gf_res_prev_active = nullptr;
+    uint64_t           gf_res_prev_epoch  = 0; // ggml_backend_sched_get_alloc_epoch when gf_res_prev_active was allocated
+    uint64_t           backend_buf_exp_epoch = 0; // ggml_backend_sched_get_alloc_epoch when backend_buf_exp_size was taken
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;

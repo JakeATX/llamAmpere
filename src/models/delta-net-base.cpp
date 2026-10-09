@@ -455,7 +455,7 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
 // pending rollback in replay mode (rs_idx stays 0 there, replay_len selects the conv group), and
 // 0 otherwise, since s_copy already carries rs_idx * mem_size. All gathers are materialized before
 // any write (gather() then write()) because the source planes overlap the destinations.
-static void snapshot_shift_gather(ggml_context * ctx0, ggml_cgraph * gf, const llm_graph_input_rs * inp,
+void snapshot_shift_gather(ggml_context * ctx0, ggml_cgraph * gf, const llm_graph_input_rs * inp,
         ggml_tensor * all, int64_t row_elems, uint32_t plane0, uint32_t mem_size,
         std::vector<ggml_tensor *> & gathered) {
     gathered.clear();
@@ -473,11 +473,12 @@ static void snapshot_shift_gather(ggml_context * ctx0, ggml_cgraph * gf, const l
     GGML_ASSERT(rows_off + (size_t) inp->snap_shift * mem_size <= (size_t) all->ne[1]);
     ggml_tensor * planes = ggml_view_2d(ctx0, all, row_elems, all->ne[1] - (int64_t) rows_off, all->nb[1], rows_off * all->nb[1]);
     ggml_tensor * g = ggml_get_rows(ctx0, planes, inp->s_copy_shift);
+    ggml_format_name(g, "rs_shift_gather-%s", all->name); // one per state tensor and graph (test-visible)
     ggml_build_forward_expand(gf, g);
     gathered.push_back(g);
 }
 
-static void snapshot_shift_write(ggml_context * ctx0, ggml_cgraph * gf, const llm_graph_input_rs * inp,
+void snapshot_shift_write(ggml_context * ctx0, ggml_cgraph * gf, const llm_graph_input_rs * inp,
         ggml_tensor * all, int64_t row_elems, int64_t n_seq_tokens, uint32_t kv_head, uint32_t mem_size,
         const std::vector<ggml_tensor *> & gathered) {
     if (gathered.empty()) {
@@ -494,7 +495,9 @@ static void snapshot_shift_write(ggml_context * ctx0, ggml_cgraph * gf, const ll
     ggml_tensor * src3 = ggml_reshape_3d(ctx0, src, row_elems, n_seqs, inp->snap_shift);
     ggml_tensor * dst  = ggml_view_3d(ctx0, all, row_elems, n_seqs, inp->snap_shift,
             all->nb[1], (size_t) mem_size * all->nb[1], rows_off * all->nb[1]);
-    ggml_build_forward_expand(gf, ggml_cpy(ctx0, src3, dst));
+    ggml_tensor * w = ggml_cpy(ctx0, src3, dst);
+    ggml_format_name(w, "rs_shift_write-%s", all->name);
+    ggml_build_forward_expand(gf, w);
 }
 
 ggml_tensor * llm_build_delta_net_base::build_conv_state(
@@ -673,7 +676,7 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         ggml_build_forward_expand(gf,
                 ggml_cpy(ctx0, new_state,
                     ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
-                        kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all))));
+                        kv_head * ggml_row_size(ssm_states_all->type, hparams.n_embd_s()))));
 
         return output;
     }
@@ -715,7 +718,7 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
             0);
         cb(output, "attn_output", il);
 
-        const size_t row_size = hparams.n_embd_s() * ggml_element_size(ssm_states_all);
+        const size_t row_size = ggml_row_size(ssm_states_all->type, hparams.n_embd_s());
 
         // op writes the last min(n_seq_tokens, K) snapshots; trailing slots are left unwritten
         const int64_t n_written = std::min<int64_t>(n_seq_tokens, K);
@@ -804,7 +807,7 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const size_t  ingr_elemsize   = ggml_element_size(ingr_all);
     const size_t  ingr_row        = (size_t) hparams.n_embd_s_ingredient(); // elements per slot
     const size_t  ring_row        = ingr_row * K;                            // elements per cell
-    const size_t  state_row_bytes = (size_t) hparams.n_embd_s() * ggml_element_size(ssm_states_all);
+    const size_t  state_row_bytes = ggml_row_size(ssm_states_all->type, hparams.n_embd_s());
     const int32_t ingr_mode       = (int64_t) ingr_row == 4 * S_v * H_v ? 1 : llama_gdn_ingr_emit_mode();
     const int64_t ingr_w          = ggml_gated_delta_net_ingr_width(S_v, g->ne[0], ingr_mode); // per head
     GGML_ASSERT((int64_t) ingr_row == ingr_w * H_v); // the op's per-slot ingredient block

@@ -1,7 +1,10 @@
 #include "models.h"
+#include "llama-impl.h"
 #include "llama-kv-cache.h"
 #include "llama-memory-recurrent.h"
 #include "llama-mtp-chain-sample.h"
+
+#include <atomic>
 
 // Output-row gather indices, or nullptr when every row is an output (decode, speculative verify,
 // MTP drafts): the gather would then be an identity copy. The graph topology still depends only on
@@ -46,9 +49,9 @@ void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
 void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
     LLAMA_LOAD_LOCALS;
 
-    const bool mtp_only = (hparams.n_layer_nextn > 0) && (ml.get_weight("blk.0.attn_norm.weight") == nullptr);
-    const int trunk_flags = mtp_only ? TENSOR_NOT_REQUIRED : 0;
-    int mtp_flags = !ml.load_mtp ? TENSOR_SKIP : 0;
+    const auto nf = nextn_flags(ml);
+    const int trunk_flags = nf.trunk;
+    const int mtp_flags   = nf.mtp;
 
 
 
@@ -57,6 +60,10 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
     // output
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd }, 0);
     output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
+
+    // optional projection of the embeddings output
+    cls_out   = create_tensor(tn(LLM_TENSOR_CLS_OUT, "weight"), { n_embd, hparams.n_embd_out() }, TENSOR_NOT_REQUIRED);
+    cls_out_b = create_tensor(tn(LLM_TENSOR_CLS_OUT, "bias"),   { hparams.n_embd_out() },         TENSOR_NOT_REQUIRED);
 
     // if output is NULL, init from the input tok embed
     if (output == NULL) {
@@ -207,7 +214,7 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
             cur = build_layer_attn(inp->get_attn(), cur, inp_pos, sections, il);
         }
 
-        if (il == n_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked) {
+        if (il == n_layer - 1 && crop_before_nextn(inp_out_ids)) {
             cur   = ggml_get_rows(ctx0, cur,   inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
@@ -244,12 +251,22 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
     cb(cur, "h_nextn", -1);
     res->t_h_nextn = cur;
 
-    if (!cparams.embeddings_nextn_masked && inp_out_ids) {
+    if (crop_after_nextn(inp_out_ids)) {
         cur = ggml_get_rows(ctx0, cur, inp_out_ids);
     }
 
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
+
+    if (model.cls_out) {
+        ggml_tensor * embd = build_lora_mm(model.cls_out, cur);
+        if (model.cls_out_b) {
+            embd = ggml_add(ctx0, embd, model.cls_out_b);
+        }
+        cb(embd, "result_embd_proj", -1);
+        res->t_embd = embd;
+        ggml_build_forward_expand(gf, embd);
+    }
 
     // LM head
     cur = build_lora_mm(model.output, cur, model.output_s);
@@ -645,6 +662,7 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     // TODO: make static using `ggml_build_forward_select()`
     //       see llm_graph_context::build_inp_embd() for reference
     ggml_tensor * tok_embd;
+    ASSERT_EMBD_OR_TOKEN(ubatch);
     if (ubatch.token) {
         ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
 
@@ -663,8 +681,24 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
 
     res->add_input(std::move(inp));
 
+    // [#91] a decode without output rows (the MTP catch-up update) only has to store the MTP layer's K/V;
+    // its query, attention, FFN and head are never read. On by default; LLAMA_MTP_UPDATE_KV_ONLY=0 builds the full graph.
+    // An unmasked nextn-embedding read copies every row even without outputs, so it keeps the full graph.
+    static const bool update_kv_only = [] {
+        const char * value = getenv("LLAMA_MTP_UPDATE_KV_ONLY");
+        return value == nullptr || strcmp(value, "0") != 0;
+    }();
+    const bool kv_only = update_kv_only && n_outputs == 0 && !cparams.mtp_chain && !cparams.embeddings &&
+        (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked);
+    if (kv_only) {
+        static std::atomic_flag noted = ATOMIC_FLAG_INIT;
+        if (!noted.test_and_set()) {
+            LLAMA_LOG_INFO("%s: MTP update builds the KV-only graph (LLAMA_MTP_UPDATE_KV_ONLY=0 disables)\n", __func__);
+        }
+    }
+
     ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = qwen35_build_inp_out_ids(*this);
+    ggml_tensor * inp_out_ids = kv_only ? nullptr : qwen35_build_inp_out_ids(*this);
 
     auto * inp_attn = build_attn_inp_kv();
 
@@ -738,6 +772,17 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
                     n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
                     ext_factor, attn_factor, beta_fast, beta_slow);
 
+            // attention below reads the cache through build_attn_mha directly, so it applies the
+            // same rotations build_attn(llm_graph_input_attn_kv *) does, in the same order
+            if (inp_attn->self_k_rot) {
+                Q_b = llama_mul_mat_hadamard(ctx0, Q_b, inp_attn->self_k_rot);
+                K_b = llama_mul_mat_hadamard(ctx0, K_b, inp_attn->self_k_rot);
+            }
+
+            if (inp_attn->self_v_rot) {
+                V_b = llama_mul_mat_hadamard(ctx0, V_b, inp_attn->self_v_rot);
+            }
+
             ggml_build_forward_expand(gf, Q_b);
             ggml_build_forward_expand(gf, V_b);
             ggml_build_forward_expand(gf, K_b);
@@ -757,7 +802,16 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
 
             ggml_tensor * mask_b = ggml_view_2d(ctx0, kq_mask, n_kv, width, kq_mask->nb[1], (size_t) row0*kq_mask->nb[1]);
 
+            // TurboQuant/TQ K caches hold WHT-rotated K: Q must be rotated to match
+            Q_b = build_attn_turbo_q(Q_b, k_view, mctx_kv);
+
             cur_b = build_attn_mha(Q_b, k_view, v_view, nullptr, mask_b, nullptr, nullptr, 0, kq_scale, il);
+
+            cur_b = build_attn_turbo_v_out(cur_b, v_view, il);
+
+            if (inp_attn->self_v_rot) {
+                cur_b = llama_mul_mat_hadamard(ctx0, cur_b, inp_attn->self_v_rot);
+            }
 
             cur_b = ggml_mul(ctx0, cur_b, ggml_sigmoid(ctx0, gate_b));
             cur_b = build_lora_mm(layer.wo, cur_b, layer.wo_s);
@@ -954,6 +1008,12 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     Kcur = ggml_rope_multi(ctx0, Kcur, inp_pos, nullptr,
             n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
             ext_factor, attn_factor, beta_fast, beta_slow);
+
+    if (kv_only) {
+        // the Q/gate nodes built above are not expanded, so they drop out of the graph
+        build_attn_store(inp_attn, Kcur, Vcur, il);
+        return;
+    }
 
     cur = build_attn(inp_attn,
             nullptr, nullptr, nullptr,

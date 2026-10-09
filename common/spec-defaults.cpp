@@ -12,11 +12,10 @@
 
 // one row per model family, keyed by general.architecture and whether the model has an MTP head
 static const common_speculative_family_default common_speculative_family_defaults[] = {
-    // Qwen3.8 (qwen35) with the built-in MTP head: the production settings, fixed draft depth 4
-    // (--spec-type draft-mtp --spec-draft-n-max 4 --spec-draft-p-min 0, vocab map auto); n-min-adaptive is the
-    // --spec-draft-n-min-adaptive default and only matters for draft-mtp-adaptive, which stays available as an
-    // explicit --spec-type; the draft KV cache types are left unset and inherit the trunk -ctk/-ctv
-    { "qwen35", true, "MTP drafter", COMMON_SPECULATIVE_TYPE_DRAFT_MTP, 4, 3, 0.0f, "auto" },
+    // Qwen3.8 (qwen35) with the built-in MTP head: the production settings
+    // (--spec-type draft-mtp-adaptive --spec-draft-n-max 4 --spec-draft-n-min-adaptive 3 --spec-draft-p-min 0,
+    //  vocab map auto); the draft KV cache types are left unset and inherit the trunk -ctk/-ctv (tq5_0/turbo4 over SJ-KVaRN)
+    { "qwen35", true, "MTP drafter", COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE, 4, 3, 0.0f, "auto" },
 };
 
 const common_speculative_family_default * common_speculative_family_default_find(const std::string & arch, uint32_t n_nextn) {

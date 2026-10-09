@@ -227,6 +227,12 @@ if (GGML_SCHED_NO_REALLOC)
     target_compile_definitions(ggml-base PUBLIC GGML_SCHED_NO_REALLOC)
 endif()
 
+if (GGML_SJKVARN_FUSED_ROT)
+    target_compile_definitions(ggml-base PRIVATE GGML_SJKVARN_FUSED_ROT_DEFAULT=1)
+else()
+    target_compile_definitions(ggml-base PRIVATE GGML_SJKVARN_FUSED_ROT_DEFAULT=0)
+endif()
+
 if (GGML_OPENMP_FETCH)
     if (NOT GGML_OPENMP)
         message(FATAL_ERROR "GGML_OPENMP_FETCH requires GGML_OPENMP")

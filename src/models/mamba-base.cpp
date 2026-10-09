@@ -210,6 +210,14 @@ ggml_tensor * llm_build_mamba_base::build_mamba2_layer(llm_graph_input_rs * inp,
         const size_t  row_size  = ggml_row_size(conv_states_all->type, row_count);
         const int64_t n_written = std::min<int64_t>(n_seq_tokens, K);
 
+        // slots [0, n_written) are this ubatch's windows; the older groups move back by n_seq_tokens
+        // ([TAG_RECURRENT_ROLLBACK_SHIFT], no-op for n_seq_tokens >= K). Without the shift, slot n (the
+        // pre-ubatch window) and deeper kept whatever an earlier ubatch left there while rs_valid
+        // counted them as history, so a rollback past the last ubatch restored a stale window.
+        // plane0 = 0: s_copy_shift already carries the pending rollback group (rs_idx).
+        std::vector<ggml_tensor *> conv_older;
+        snapshot_shift_gather(ctx0, gf, inp, conv_states_all, row_count, 0, mem_size, conv_older);
+
         for (int64_t slot = 0; slot < n_written; ++slot) {
             ggml_tensor * last_conv = ggml_view_3d(ctx0, conv_x, d_conv - 1, d_inner + 2 * n_group * d_state, n_seqs,
                                                    conv_x->nb[1], conv_x->nb[2], (n_seq_tokens - slot) * conv_x->nb[0]);
@@ -219,6 +227,8 @@ ggml_tensor * llm_build_mamba_base::build_mamba2_layer(llm_graph_input_rs * inp,
                                                                 conv_states_all->nb[1],
                                                                 ((size_t) slot * mem_size + kv_head) * row_size)));
         }
+
+        snapshot_shift_write(ctx0, gf, inp, conv_states_all, row_count, n_seq_tokens, kv_head, mem_size, conv_older);
 
         // 1D convolution
         // The equivalent is to make a self-overlapping view of conv_x
@@ -271,12 +281,18 @@ ggml_tensor * llm_build_mamba_base::build_mamba2_layer(llm_graph_input_rs * inp,
         const size_t  y_row_size   = ggml_row_size(y_ssm->type, D);
         const size_t  state_offset = ggml_nelements(x) * ggml_element_size(x);
 
+        // same shift for the SSM snapshot groups: the scan emits only the newest n_written states
+        std::vector<ggml_tensor *> ssm_older;
+        snapshot_shift_gather(ctx0, gf, inp, ssm_states_all, hparams.n_embd_s(), 0, mem_size, ssm_older);
+
         ggml_build_forward_expand(
             gf, ggml_cpy(ctx0,
                          ggml_view_3d(ctx0, y_ssm, D, n_seqs, n_written,
                                       y_row_size, y_row_size * n_seqs, state_offset),
                          ggml_view_3d(ctx0, ssm_states_all, D, n_seqs, n_written,
                                       ssm_states_all->nb[1], (size_t) mem_size * row_size, kv_head * row_size)));
+
+        snapshot_shift_write(ctx0, gf, inp, ssm_states_all, hparams.n_embd_s(), n_seq_tokens, kv_head, mem_size, ssm_older);
 
         ggml_tensor * y = ggml_view_4d(ctx0, y_ssm, head_dim, n_head, n_seq_tokens, n_seqs, x->nb[1], n_head * x->nb[1],
                                        n_seq_tokens * n_head * x->nb[1], 0);

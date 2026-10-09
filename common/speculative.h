@@ -35,6 +35,10 @@ std::vector<double> common_speculative_synth_rates_resolve(const common_params_s
 // return the conditional synthetic acceptance probabilities
 const std::vector<double> & common_speculative_get_synth_probs(const common_speculative * spec);
 
+// MTP drafter KV cache types over a SJ-KVaRN trunk when --spec-draft-type-k/-v are not given ({K, V}).
+// Provisional: one line to change (tq6_0/tq6_0 once its fused verify-width kernel lands).
+inline constexpr ggml_type COMMON_SJKVARN_MTP_DRAFT_KV[2] = { GGML_TYPE_TQ5_0, GGML_TYPE_TURBO4_0 };
+
 common_params common_base_params_to_speculative(const common_params & params);
 
 struct common_speculative_output_limits {
@@ -45,6 +49,9 @@ struct common_speculative_output_limits {
 // return the output limits needed for speculative decoding
 common_speculative_output_limits common_speculative_get_output_limits(
         int32_t n_batch, int32_t n_parallel, int32_t n_draft);
+
+// return true if the target and draft models have compatible vocabs
+bool common_speculative_are_compatible(const llama_model * model_tgt, const llama_model * model_dft);
 
 common_speculative * common_speculative_init(common_params_speculative & params, uint32_t n_seq);
 
@@ -75,6 +82,11 @@ struct common_speculative_draft_params {
     // (candidate ids with normalised probabilities, aligned with *result; an empty row means id-match)
     const common_params_sampling * sampling = nullptr;
     std::vector<std::vector<llama_token_data>> * result_q = nullptr;
+
+    // upstream #27694 fields (probabilistic draft sampling); kept for API compatibility. In this tree the
+    // exact p/q path above (LLAMA_SPEC_PQ=1, `sampling`) is the sampled-draft implementation.
+    float    temp = 1.0f;
+    uint32_t seed = LLAMA_DEFAULT_SEED;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
@@ -83,7 +95,7 @@ common_speculative_draft_params & common_speculative_get_draft_params(common_spe
 void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt);
 
 // process the batch and update the internal state of the speculative context
-bool common_speculative_process(common_speculative * spec, const llama_batch & batch);
+bool common_speculative_process(common_speculative * spec, const common_batch & batch);
 
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);
@@ -97,6 +109,24 @@ void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id
 
 // print statistics about the speculative decoding
 void common_speculative_print_stats(const common_speculative * spec);
+
+// [#47] LLAMA_HOST_PHASES=1: host-side split of the MTP draft call, process-wide. decode = llama_decode calls (graph
+// build + launch), sync = the wait for the draft GPU work (an explicit llama_synchronize after each decode, only
+// while enabled), sample = common_sampler_sample + common_sampler_accept on the draft logits, rest = everything
+// else inside the draft call (batch rebuild, hidden-row copies, KV trims, candidate bookkeeping).
+struct common_speculative_host_phases {
+    uint64_t n_calls   = 0;
+    uint64_t n_steps   = 0; // draft decodes
+    uint64_t decode_us = 0;
+    uint64_t sync_us   = 0;
+    uint64_t sample_us = 0;
+    uint64_t rest_us   = 0;
+};
+
+bool common_speculative_host_phases_enabled();
+
+// returns the totals since the previous call and resets them
+common_speculative_host_phases common_speculative_host_phases_take();
 
 struct common_speculative_deleter {
     void operator()(common_speculative * s) { common_speculative_free(s); }

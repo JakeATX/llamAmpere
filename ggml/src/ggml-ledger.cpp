@@ -29,7 +29,12 @@ ledger_table & table() {
     return *t;
 }
 
-std::atomic<int> g_enabled{0};
+int env_state() {
+    const char * e = getenv("GGML_LEDGER");
+    return e != nullptr && e[0] != '\0' && e[0] != '0' ? 1 : 0;
+}
+
+std::atomic<int> g_enabled{-1};
 std::atomic<bool> g_atexit_registered{false};
 
 void print_at_exit() {
@@ -48,7 +53,20 @@ void register_atexit() {
 } // namespace
 
 bool ggml_ledger_enabled(void) {
-    return g_enabled.load(std::memory_order_relaxed) != 0;
+    int s = g_enabled.load(std::memory_order_relaxed);
+    if (s < 0) {
+        const int e = env_state();
+        int expected = -1;
+        if (g_enabled.compare_exchange_strong(expected, e)) {
+            s = e;
+            if (e) {
+                register_atexit();
+            }
+        } else {
+            s = expected;
+        }
+    }
+    return s != 0;
 }
 
 void ggml_ledger_set_enabled(bool enabled) {

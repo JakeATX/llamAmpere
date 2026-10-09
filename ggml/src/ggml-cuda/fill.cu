@@ -12,6 +12,19 @@ static __global__ void fill_kernel(T * dst, const int64_t k, const T value) {
     dst[i] = value;
 }
 
+// every block of a quantized fill is identical: one thread per block writes the precomputed block
+static __global__ void fill_q8_0_kernel(block_q8_0 * dst, const int64_t nblocks, const half d, const int8_t q) {
+    const int64_t ib = (int64_t)blockDim.x * blockIdx.x + threadIdx.x;
+    if (ib >= nblocks) {
+        return;
+    }
+    dst[ib].d = d;
+#pragma unroll
+    for (int j = 0; j < QK8_0; ++j) {
+        dst[ib].qs[j] = q;
+    }
+}
+
 void ggml_cuda_op_fill(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     void * dst_d = dst->data;
     cudaStream_t stream = ctx.stream();
@@ -31,6 +44,19 @@ void ggml_cuda_op_fill(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         case GGML_TYPE_F16:
             fill_kernel<<<num_blocks, CUDA_FILL_BLOCK_SIZE, 0, stream>>>((half *)dst_d, k, ggml_cuda_cast<half>(value));
             break;
+        case GGML_TYPE_BF16:
+            fill_kernel<<<num_blocks, CUDA_FILL_BLOCK_SIZE, 0, stream>>>((nv_bfloat16 *)dst_d, k, ggml_cuda_cast<nv_bfloat16>(value));
+            break;
+        case GGML_TYPE_Q8_0: {
+            // same block as the CPU reference quantization of QK8_0 copies of value
+            GGML_ASSERT(k % QK8_0 == 0);
+            const float  d  = fabsf(value) / 127.0f;
+            const float  id = d != 0.0f ? 1.0f / d : 0.0f;
+            const int8_t q  = (int8_t) roundf(value * id);
+            const int64_t nblocks = k / QK8_0;
+            fill_q8_0_kernel<<<(nblocks + CUDA_FILL_BLOCK_SIZE - 1) / CUDA_FILL_BLOCK_SIZE, CUDA_FILL_BLOCK_SIZE, 0, stream>>>(
+                (block_q8_0 *) dst_d, nblocks, __float2half(d), q);
+        } break;
         default:
             GGML_ABORT("unsupported type");
     }

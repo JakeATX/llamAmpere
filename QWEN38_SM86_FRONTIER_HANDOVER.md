@@ -503,7 +503,8 @@ one graph per graph identity (verify width and accepted-draft count vary)
 and evicted graphs after 10 s idle. `7296ede65` keys graphs by shape,
 retains them for 300 s (`GGML_CUDA_GRAPH_EVICT_S`), and reserves 8 output
 rows up front. Exact; +5.4% decode at Q3 100K, +1.7% at Q4 64K, 200K within
-noise. Record: `frontier/A2_decode_graphs/`.
+noise. `GGML_CUDA_GRAPH_DEBUG=1` prints the first changed graph node per
+call. Record: `frontier/A2_decode_graphs/`.
 
 Also settled: MTP4 gives nothing over MTP3 even with the cheaper verify
 launch; the routing candidate (widths 1-2 on the MMA path) fails the
@@ -603,8 +604,9 @@ questions: vLLM wins single-request decode at 5K, cannot hold 200K on this card.
   three rotating conversations at RAM budgets below and equal to one
   conversation: spill, restore with `cache_n` = full prefix (~360 ms for
   539 MiB, ~1.5 GB/s), restart re-index, greedy output identical to an
-  uninterrupted control; flag-off path unchanged. Multimodal prompts are not
-  spilled.
+  uninterrupted control; flag-off path unchanged. Manual test:
+  `tools/server/tests/test_prompt_cache_disk_tier_manual.py`. Multimodal
+  prompts are not spilled.
 
 ### Current recommended server command (single user)
 

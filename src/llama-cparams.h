@@ -59,8 +59,14 @@ struct llama_cparams {
     bool op_offload;
     bool kv_unified;
     bool pipeline_parallel;
+    bool training;           // set by llama_opt_init()
 
     uint32_t kv_stream_arena_mib;
+    size_t moe_cache_size;
+
+    // MTP draft context attention window (0 = full attention) and sink positions
+    uint32_t draft_attn_window = 0;
+    uint32_t draft_attn_sink   = 0;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 

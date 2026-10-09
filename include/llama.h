@@ -43,10 +43,10 @@
 #define LLAMA_FILE_MAGIC_GGSQ 0x67677371u // 'ggsq'
 
 #define LLAMA_SESSION_MAGIC   LLAMA_FILE_MAGIC_GGSN
-#define LLAMA_SESSION_VERSION 10
+#define LLAMA_SESSION_VERSION 11
 
 #define LLAMA_STATE_SEQ_MAGIC   LLAMA_FILE_MAGIC_GGSQ
-#define LLAMA_STATE_SEQ_VERSION 3
+#define LLAMA_STATE_SEQ_VERSION 4
 
 #ifdef __cplusplus
 extern "C" {
@@ -78,6 +78,7 @@ extern "C" {
         LLAMA_VOCAB_TYPE_RWKV   = 5, // RWKV tokenizer based on greedy tokenization
         LLAMA_VOCAB_TYPE_PLAMO2 = 6, // PLaMo-2 tokenizer based on Aho-Corasick with dynamic programming
         LLAMA_VOCAB_TYPE_TEST   = 7, // Dummy tokenizer for testing: rolling hash of fixed-size chunks -> tokens, tokens -> hex
+        LLAMA_VOCAB_TYPE_PLAMO3 = 8, // PLaMo-3 tokenizer with pre-segmentation and dynamic programming
     };
 
     enum llama_rope_type {
@@ -411,15 +412,33 @@ extern "C" {
 
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
+        enum ggml_type type_s; // data type for the gated delta-net recurrent state cache: f32 (default), bf16, f16 or q8_0 [EXPERIMENTAL]
 
         enum llama_moe_cache_mode moe_cache_mode; // runtime MoE expert cache mode
         size_t moe_cache_budget_mib;               // 0 uses the provider's available-memory budget
+        size_t moe_cache_size; // device cache in bytes for the experts kept in host memory, 0 = disabled [EXPERIMENTAL]
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
         // currently works only with CPU execution
         ggml_abort_callback abort_callback;
         void *              abort_callback_data;
+
+        // SJ-KVaRN attention cache: F16, Q8_0 or TQ6_0 sink + tail, sealed low-bit body.
+        // bits_k/bits_v > 0 enable it; flash attention is required.
+        uint32_t sj_kvarn_bits_k; // 0 = off
+        uint32_t sj_kvarn_bits_v; // 0 = off
+        uint32_t sj_kvarn_tail;   // recent positions kept unsealed (multiple of 128, default 4096)
+        uint32_t sj_kvarn_sink;   // leading positions kept unsealed (multiple of 64)
+        enum ggml_type sj_kvarn_body_type; // F32 sentinel = SJ-KVaRN scalar records, I16 sentinel = SJ-KVaRN with trellis-coded payloads (built-in codebooks), COUNT = auto (trellis for the 3/3, 3/2, 2/2 pairs, scalar otherwise), TURBO4_0 = stored-domain Turbo4
+        enum ggml_type sj_kvarn_sink_type; // F16 (default) keeps a separate sink and needs TQ6_0 staging; COUNT inherits staging (required with Q8_0)
+        enum ggml_type sj_kvarn_staging_type; // stored-domain TQ6_0 (default), Q8_0 or F16 for the tail (and an inheriting sink)
+        uint32_t sj_kvarn_tail_max; // 0 = fixed tail; otherwise batch compression between tail and tail_max (default 8192, adaptive)
+        uint32_t sj_kvarn_edge_layers; // tiered body: KV layers within the first and last N model layers seal at sj_kvarn_edge_bits_k/v (0 = uniform)
+        uint32_t sj_kvarn_edge_bits_k; // edge-tier body bits (default 4/4)
+        uint32_t sj_kvarn_edge_bits_v;
+        enum ggml_type sj_kvarn_edge_body_type; // edge-tier codec: COUNT = auto (trellis only for a trellis pair when sj_kvarn_body_type is trellis/auto), F32 scalar, I16 trellis
+        uint32_t sj_kvarn_flush_chunk; // adaptive tail: max groups sealed per small (decode) ubatch; 0 = whole flush at once
 
         // Keep the booleans together and at the end of the struct to avoid misalignment during copy-by-value.
         bool embeddings;  // if true, extract embeddings (together with logits)
@@ -460,6 +479,12 @@ extern "C" {
         // a caller built against a pre-streaming header keeps the same
         // offsets for every field before it.
         uint32_t kv_stream_arena_mib;
+
+        // [EXPERIMENTAL] MTP draft contexts only: attention window over the drafter's own KV.
+        // > 0 = the draft KV cache keeps only the last draft_attn_window positions plus the first
+        // draft_attn_sink positions (a sliding-window ring). 0 = full attention (default).
+        int32_t draft_attn_window;
+        int32_t draft_attn_sink;
     };
 
     struct llama_model_tensor_override {
@@ -520,14 +545,14 @@ extern "C" {
     LLAMA_API struct llama_model_quantize_params llama_model_quantize_default_params(void);
 
     // Initialize the llama + ggml backend
-    // If numa is true, use NUMA optimizations
     // Call once at the start of the program
     LLAMA_API void llama_backend_init(void);
 
     // Call once at the end of the program - currently only used for MPI
     LLAMA_API void llama_backend_free(void);
 
-    //optional:
+    // Optional: enable numa optimizations
+    // TODO: deprecate and make part of llama_backend_init()
     LLAMA_API void llama_numa_init(enum ggml_numa_strategy numa);
 
     // Optional: an auto threadpool gets created in ggml if not passed explicitly
@@ -865,6 +890,38 @@ extern "C" {
             llama_memory_t mem,
               llama_seq_id seq_id);
 
+    // Exclusive end of the sealed SJ-KVaRN body, or -1 if this cache is not SJ-KVaRN.
+    // Removing a nonempty prefix below this boundary requires clearing the cache.
+    LLAMA_API int32_t llama_sj_kvarn_sealed_end(struct llama_context * ctx);
+
+    // Compress an adaptive SJ-KVaRN tail during an idle period. Does not evaluate model layers.
+    // accepted_pos_end is the exclusive end of accepted, materialized positions.
+    // The caller must resolve speculative rollback and discard checkpoints before calling.
+    // Supports a single sequence. Returns 1 if compressed, 0 if no work, -1 on failure.
+    LLAMA_API int32_t llama_sj_kvarn_compress_idle(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
+                       llama_pos   accepted_pos_end);
+
+    // Like llama_sj_kvarn_compress_idle, but leaves keep_from and the tail positions behind it unsealed: the turn the
+    // next request is likely to re-render (from keep_from on) stays exact, and a re-prefill from there keeps the same
+    // exact window as a fresh prefill. keep_from < 0 = no bound.
+    LLAMA_API int32_t llama_sj_kvarn_compress_idle_keep(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
+                       llama_pos   accepted_pos_end,
+                       llama_pos   keep_from);
+
+    // Largest position <= pos that llama_memory_seq_rm(mem, seq, p, -1) can truncate the SJ-KVaRN cache to. Sealed
+    // groups whose staging rows are still in the ring are reopened (any pos works); below that only whole groups can
+    // be dropped, so pos rounds down to a group boundary. Kept records stay bit-identical, nothing is re-quantised.
+    // Returns pos when the context has no SJ-KVaRN cache.
+    LLAMA_API llama_pos llama_sj_kvarn_rm_floor(struct llama_context * ctx, llama_seq_id seq_id, llama_pos pos);
+
+    // The SJ-KVaRN group boundary at or below pos (pos itself when pos <= sink or the context has no SJ-KVaRN cache).
+    // A checkpoint taken at a boundary stays reachable by seq_rm after the rows behind it are sealed.
+    LLAMA_API llama_pos llama_sj_kvarn_group_floor(struct llama_context * ctx, llama_pos pos);
+
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
 
@@ -1171,6 +1228,9 @@ extern "C" {
     // Set whether to use causal attention or not
     // If set to true, the model will only attend to the past tokens
     LLAMA_API void llama_set_causal_attn(struct llama_context * ctx, bool causal_attn);
+
+    // Returns whether the context is currently using causal attention
+    LLAMA_API bool llama_get_causal_attn(const struct llama_context * ctx);
 
     // Set whether the model is in warmup mode or not
     // If true, all model tensors are activated during llama_decode() to load and cache their weights.

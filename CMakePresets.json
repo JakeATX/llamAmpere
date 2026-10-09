@@ -30,6 +30,10 @@
     { "name": "static",   "hidden": true, "cacheVariables": { "GGML_STATIC":      "ON" } },
     { "name": "sycl_f16", "hidden": true, "cacheVariables": { "GGML_SYCL_F16":    "ON" } },
     { "name": "vulkan",   "hidden": true, "cacheVariables": { "GGML_VULKAN":      "ON" } },
+    {
+        "name": "cuda-ampere", "hidden": true,
+        "cacheVariables": { "GGML_CUDA": "ON", "GGML_NATIVE": "OFF", "CMAKE_CUDA_ARCHITECTURES": "80-real;86-real" }
+    },
 
     {
         "name": "x64-windows-llvm", "hidden": true,
@@ -66,6 +70,7 @@
     { "name": "x64-linux-gcc-release", "inherits": [ "base", "x64-linux-gcc", "release" ] },
     { "name": "x64-linux-gcc-reldbg", "inherits": [ "base", "x64-linux-gcc", "reldbg" ] },
     { "name": "x64-linux-gcc+static-release", "inherits": [ "base", "x64-linux-gcc", "release", "static" ] },
+    { "name": "x64-linux-gcc-cuda-ampere-release", "inherits": [ "base", "x64-linux-gcc", "release", "cuda-ampere" ] },
 
     { "name": "arm64-windows-llvm-debug", "inherits": [ "base", "arm64-windows-llvm", "debug" ] },
     { "name": "arm64-windows-llvm-release", "inherits": [ "base", "arm64-windows-llvm", "reldbg" ] },

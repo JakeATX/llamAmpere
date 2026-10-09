@@ -16,8 +16,9 @@ vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
                 data_a[a_offset + ib + 2], data_a[a_offset + ib + 3]);
 }
 vec4 dequantize4_2aligned(uint ib, uint iqs, uint a_offset) {
-    return vec4(data_a[a_offset + ib    ], data_a[a_offset + ib + 1],
-                data_a[a_offset + ib + 2], data_a[a_offset + ib + 3]);
+    const vec2 a = data_a_packed64[(a_offset + ib)/2];
+    const vec2 b = data_a_packed64[(a_offset + ib)/2 + 1];
+    return vec4(a, b);
 }
 
 #endif
@@ -759,8 +760,8 @@ vec2 get_dm(uint ib, uint a_offset) {
 vec2 dequantize(uint ib, uint iqs, uint a_offset) {
     // PolarQuant 3-bit centroids (Lloyd-Max for Gaussian)
     const float centroids[8] = float[8](
-        -0.190685, -0.117832, -0.065717, -0.021460,
-         0.021460,  0.065717,  0.117832,  0.190685
+        -0.190207, -0.118786, -0.066822, -0.021663,
+         0.021663,  0.066822,  0.118786,  0.190207
     );
 
     // iqs is the element index within the block (0..31), we decode 2 consecutive elements
@@ -787,8 +788,8 @@ vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
     // byte (4 per byte) and a single signs byte (iqs/8 constant over the range).
     // One qs load + one signs load instead of two of each via dequantize().
     const float centroids[8] = float[8](
-        -0.190685, -0.117832, -0.065717, -0.021460,
-         0.021460,  0.065717,  0.117832,  0.190685
+        -0.190207, -0.118786, -0.066822, -0.021663,
+         0.021663,  0.066822,  0.118786,  0.190207
     );
 
     const uint qs_byte  = uint(data_a[a_offset + ib].qs[iqs / 4]);
