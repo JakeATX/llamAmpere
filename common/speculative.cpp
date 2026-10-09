@@ -120,7 +120,7 @@ struct common_speculative_config {
             const common_params_speculative & p = common_params_speculative{}) : type(t), params(p) {}
 };
 
-static bool common_speculative_are_compatible(
+bool common_speculative_are_compatible(
     const llama_model * model_tgt,
     const llama_model * model_dft) {
     const llama_vocab * vocab_tgt = llama_model_get_vocab(model_tgt);
@@ -3792,6 +3792,9 @@ common_params common_base_params_to_speculative(const common_params & params) {
     result.n_outputs_max = params.n_parallel;
     result.n_outputs_max_per_seq = 1;
 
+    // the MoE cache is only used by the target context
+    result.moe_cache_size = 0;
+
     // dflash/dspark decode the whole noise block in a single pass and sample every block position on the backend
     // TODO: refactor such properties to be announced by the speculative types
     //       something like `struct common_speculative_type_props common_speculative_type_get_props(...);`
@@ -4308,6 +4311,11 @@ void common_speculative_draft(common_speculative * spec) {
                     if (!result.empty() && (int) result.size() > dp.n_max) {
                         SPC_DBG("truncating draft to %d tokens\n", dp.n_max);
                         result.resize(dp.n_max);
+
+                        // trim the candidates only if the drafter produced them (n-gram drafters do not)
+                        if (dp.result_q && !dp.result_q->empty()) {
+                            dp.result_q->resize(dp.n_max);
+                        }
                     }
                 }
 
