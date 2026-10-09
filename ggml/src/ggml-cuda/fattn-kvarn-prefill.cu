@@ -121,7 +121,8 @@ static fattn_kvarn_prefill_plan fattn_kvarn_prefill_make_plan(const int cc, cons
             ggml_get_op_params_i32(dst, 5) != ((4 << 8) | 4) || n_kv <= 0 || n_kv % 256 != 0) {
         return p;
     }
-    GGML_ASSERT(!ggml_cuda_fattn_kvarn_rot(dst)); // [#139] no in-kernel rotation: fattn.cu runs it in separate passes
+    // [#139] a fused-rotation node is planned like the unflagged copy that ggml_cuda_flash_attn_ext_kvarn_rot_unfused
+    // dispatches, so the allocator reserves the same scratch; the executor below asserts the flag is gone.
 
     const int gqa = Q->ne[2]/K->ne[2];
     const size_t kv_elements_per_head = size_t(n_kv)*256;
@@ -182,6 +183,7 @@ bool ggml_cuda_flash_attn_ext_kvarn_prefill(ggml_backend_cuda_context & ctx, ggm
     if (!plan.ok) {
         return false;
     }
+    GGML_ASSERT(!ggml_cuda_fattn_kvarn_rot(dst)); // [#139] no in-kernel rotation: fattn.cu runs it in separate passes
     const int gqa = Q->ne[2]/K->ne[2];
     const bool grouped = plan.grouped;
     const int heads_per_group = plan.heads_per_group;
