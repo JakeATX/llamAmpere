@@ -41,7 +41,7 @@ cache is tq5_0/turbo4.
 | SJ-KVaRN 4/4 | 4.72 | 0.00066 | 93.3 tok/s (paired with tq5_0/turbo4) | 262,144 at 252K deep, peak 22,182 MiB |
 | SJ-KVaRN 3/3t | 3.76 | 0.00130 | 0.79x of 4/4 (paired) | 262,144 boots; full depth not measured |
 | SJ-KVaRN 3/2t | 3.27 | 0.00256 | 0.77x of 4/4 (paired) | 262,144 boots; full depth not measured |
-| 12 GB: SJ-KVaRN 3/2t, 2.3 bpw model | 3.27 | not measured on this model | not a speed cell | 204,800 at 203,568 deep, peak 10,690 MiB |
+| 12 GB: SJ-KVaRN 3/3t, 2.3 bpw model | 3.76 | not measured on this model | not a speed cell | 204,800: 11,064 MiB after boot and a short reply (3/2t: 10,672 after boot, 10,690 at 203,568 deep) |
 
 How each column was measured:
 
@@ -193,7 +193,7 @@ corpus and +4.09% ± 3.03% on the fixtures. G = 0.4 coding + 0.4 agentic + 0.2 r
 - Encoded from Swift 1.5 BF16.
 - The Q8_0 token embedding stays in host RAM.
 
-**Command** (SJ-KVaRN 3/2t, 204,800 context, MTP), with the flags of the measured runs:
+**Command** (SJ-KVaRN 3/3t, 204,800 context, MTP):
 
 ```bash
 LLAMA_MTP_DRAFT_COMPUTE_LEAN=1 ./build-sm86/bin/llama-server \
@@ -201,7 +201,7 @@ LLAMA_MTP_DRAFT_COMPUTE_LEAN=1 ./build-sm86/bin/llama-server \
   -hff ATX-Swift-1.5-Qwen3.8-27B-Uncensored-2.3bpw-MTP.gguf \
   -c 204800 --parallel 1 -ngl 99 -fa on -fit off -b 4096 -ub 512 \
   --no-context-shift --cache-ram 0 --jinja \
-  -ctk sjkvarn3 -ctv sjkvarn2 --sjkvarn-body-type sjkvarn4t \
+  -ctk sjkvarn3 -ctv sjkvarn3 --sjkvarn-body-type sjkvarn4t \
   --sjkvarn-sink 128 --sjkvarn-sink-type f16 --sjkvarn-staging-type tq6_0 \
   --sjkvarn-tail 4096 --sjkvarn-tail-max 8192 \
   --cache-type-s q8_0 \
@@ -221,8 +221,11 @@ What the 12 GB-specific settings do:
 The measured runs also set `GGML_CUDA_PREFILL_KV_MIB=256 GGML_SJKVARN_PREFILL_MIB=256`. These only restate the built-in
 default. `--spec-draft-vocab-map auto:65536` selects the same built-in list as the file.
 
-**Fit.** At context 204,800, a 203,568-token prompt plus 256 generated tokens peaked at 10,690 MiB whole-card memory.
-That is under the 11,000 MiB budget we use for 12 GB cards. The counted agent runs peaked at 10,728-10,744 MiB.
+**Fit.** We size 12 GB configurations to about 11 GB of GPU memory, which leaves about 1 GB for the desktop. With 3/3t
+at context 204,800, the server uses 11,064 MiB after boot and a short reply. With 3/2t (`-ctv sjkvarn2`) the same
+command uses 10,672 MiB after boot and peaked at 10,690 MiB with a 203,568-token prompt plus 256 generated tokens, so
+3/3t at full depth should land near 11,080 MiB. 3/2t is the option if you need about 390 MiB more room; it has about
+twice the KL of 3/3t (see the measurements above).
 
 **Quality.** The model reaches about 85% of the BF16 model's LiveCodeBench score, so expect weaker answers than the
 24 GB configurations.
@@ -231,9 +234,9 @@ That is under the 11,000 MiB budget we use for 12 GB cards. The counted agent ru
   **77.71%** pooled (95% CI 75.74-79.69).
   - Qwen3.8-27B BF16: 90.3%, so 86% of it.
   - Swift 1.5 IQ4_XS-M on our engine: 89.25%.
-- These runs used the configuration above, with the context calibrated on each card: 229,376 on the RTX 3060 and 221,184
+- These runs used the command above with 3/2t (`-ctv sjkvarn2`), with the context calibrated on each card: 229,376 on the RTX 3060 and 221,184
   on the RTX 3080 / 3080 Ti. MTP acceptance was 0.513 and generation 34.7 tok/s pooled.
-- The model was also tested as a Hermes agent backend at xhigh with the 3/2t configuration above.
+- The model was also tested as a Hermes agent backend at xhigh with 3/2t.
 
 Runs, grader, audit and the agent test outputs:
 [`jakeatx/ATX-Swift-1.5-Qwen3.8-27B-Uncensored-2.3bpw-LiveCodeBench-Pagoda`](https://huggingface.co/datasets/jakeatx/ATX-Swift-1.5-Qwen3.8-27B-Uncensored-2.3bpw-LiveCodeBench-Pagoda).

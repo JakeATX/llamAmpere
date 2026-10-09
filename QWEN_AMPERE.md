@@ -8,15 +8,15 @@ and the quantization recipe behind the ATX models.
 This file describes v0.4 (2026-09-28). The full list of changes is in the
 [v0.4 release notes](docs/llamampere-v0.4/RELEASE_NOTES.md).
 
-**v0.5:** the SJ-KVaRN compressed KV cache (`-ctk kvarnN -ctv kvarnN`) and a 12 GB configuration. Recommended
+**v0.5:** the SJ-KVaRN compressed KV cache (`-ctk sjkvarnN -ctv sjkvarnN`) and a 12 GB configuration. Recommended
 settings, with commands and measurements: [docs/llamampere-v0.5/RECOMMENDED.md](docs/llamampere-v0.5/RECOMMENDED.md).
 
 | option | KV flags |
 |---|---|
 | Pure speed (24 GB) | `-ctk tq5_0 -ctv turbo4` |
-| Balanced (24 GB) | `-ctk kvarn4 -ctv kvarn4` |
-| Small-card fit | `-ctk kvarn3 -ctv kvarn3 --kvarn-body-type auto` |
-| Maximum context (acceptable, not first class) | `-ctk kvarn3 -ctv kvarn2 --kvarn-body-type auto` |
+| Balanced (24 GB) | `-ctk sjkvarn4 -ctv sjkvarn4` |
+| Small-card fit | `-ctk sjkvarn3 -ctv sjkvarn3 --sjkvarn-body-type auto` |
+| Maximum context (acceptable, not first class) | `-ctk sjkvarn3 -ctv sjkvarn2 --sjkvarn-body-type auto` |
 
 ## Which model
 
