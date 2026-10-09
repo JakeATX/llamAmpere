@@ -916,7 +916,7 @@ extern "C" {
     // groups whose staging rows are still in the ring are reopened (any pos works); below that only whole groups can
     // be dropped, so pos rounds down to a group boundary. Kept records stay bit-identical, nothing is re-quantised.
     // Returns pos when the context has no SJ-KVaRN cache.
-    LLAMA_API llama_pos llama_sj_kvarn_rm_floor(struct llama_context * ctx, llama_pos pos);
+    LLAMA_API llama_pos llama_sj_kvarn_rm_floor(struct llama_context * ctx, llama_seq_id seq_id, llama_pos pos);
 
     // The SJ-KVaRN group boundary at or below pos (pos itself when pos <= sink or the context has no SJ-KVaRN cache).
     // A checkpoint taken at a boundary stays reachable by seq_rm after the rows behind it are sealed.

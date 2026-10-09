@@ -3350,14 +3350,14 @@ private:
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     // SJ-KVaRN: largest position <= p that seq_rm can cut both caches back to (p unless p lies in a sealed body)
-    llama_pos sj_kvarn_rm_floor(llama_pos p) const {
+    llama_pos sj_kvarn_rm_floor(llama_seq_id seq_id, llama_pos p) const {
         if (params_base.sj_kvarn_bits_k == 0 && !params_base.speculative.draft.sj_kvarn) {
             return p;
         }
         llama_pos f = p;
         for (int i = 0; i < 4; ++i) { // the two caches share sink/group, so this settles after one round
-            const llama_pos g = ctx_dft ? llama_sj_kvarn_rm_floor(ctx_dft, llama_sj_kvarn_rm_floor(ctx_tgt, f))
-                                        : llama_sj_kvarn_rm_floor(ctx_tgt, f);
+            const llama_pos g = ctx_dft ? llama_sj_kvarn_rm_floor(ctx_dft, seq_id, llama_sj_kvarn_rm_floor(ctx_tgt, seq_id, f))
+                                        : llama_sj_kvarn_rm_floor(ctx_tgt, seq_id, f);
             if (g == f) {
                 break;
             }
@@ -3367,9 +3367,9 @@ private:
     }
 
     // a prompt checkpoint restores the state at max(pos_min + 1, pos_max); it is usable only if seq_rm can reach it
-    bool sj_kvarn_ckpt_reachable(const common_prompt_checkpoint & cur) const {
+    bool sj_kvarn_ckpt_reachable(llama_seq_id seq_id, const common_prompt_checkpoint & cur) const {
         const llama_pos p = std::max(cur.pos_min + 1, cur.pos_max);
-        return sj_kvarn_rm_floor(p) == p;
+        return sj_kvarn_rm_floor(seq_id, p) == p;
     }
 
     // SJ-KVaRN group boundary at or below n (n when SJ-KVaRN is off)
@@ -3966,7 +3966,7 @@ private:
                             }
                             size_t n_dropped = 0;
                             for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end();) {
-                                if (!sj_kvarn_ckpt_reachable(*it)) {
+                                if (!sj_kvarn_ckpt_reachable(slot.id, *it)) {
                                     it = slot.prompt.checkpoints.erase(it);
                                     ++n_dropped;
                                 } else {
@@ -4580,7 +4580,7 @@ private:
                                                 return false;
                                             }
                                             // SJ-KVaRN: seq_rm can only cut the sealed body at a group boundary
-                                            if (!sj_kvarn_ckpt_reachable(cur)) {
+                                            if (!sj_kvarn_ckpt_reachable(slot.id, cur)) {
                                                 return false;
                                             }
                                             return cur.pos_min < pos_min_thold || cur.pos_min == 0;
@@ -4638,7 +4638,7 @@ private:
                         // without recurrent state just re-processes from the boundary.
                         if (n_past > 0) {
                             const llama_pos p = slot.prompt.tokens.pos_next(n_past);
-                            const llama_pos f = sj_kvarn_rm_floor(p);
+                            const llama_pos f = sj_kvarn_rm_floor(slot.id, p);
                             if (f != p) {
                                 if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART && !slot.prompt.tokens.has_mtmd) {
                                     n_past = (int32_t) slot.prompt.tokens.size_up_to_pos(f);

@@ -2165,9 +2165,9 @@ int32_t llama_sj_kvarn_compress_idle_keep(llama_context * ctx, llama_seq_id seq_
     return ctx ? ctx->compress_sj_kvarn_idle(seq_id, accepted_end, keep_from) : -1;
 }
 
-llama_pos llama_sj_kvarn_rm_floor(llama_context * ctx, llama_pos pos) {
+llama_pos llama_sj_kvarn_rm_floor(llama_context * ctx, llama_seq_id seq_id, llama_pos pos) {
     auto * kv = ctx ? llama_sj_kvarn_cache(ctx->get_memory()) : nullptr;
-    return kv && kv->is_sj_kvarn() ? kv->sj_kvarn_rm_floor(pos) : pos;
+    return kv && kv->is_sj_kvarn() ? kv->sj_kvarn_rm_floor(seq_id, pos) : pos;
 }
 
 llama_pos llama_sj_kvarn_group_floor(llama_context * ctx, llama_pos pos) {

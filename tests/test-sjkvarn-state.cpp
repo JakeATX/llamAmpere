@@ -387,7 +387,7 @@ static int run_case(llama_model * model, const sj_cfg & c, const std::vector<sj_
             // (1) below the intact rows: unaligned refused, aligned cut drops whole records
             if (lo_g > S + G) {
                 const llama_pos c_al = lo_g - G; // a boundary below the intact rows
-                require(llama_sj_kvarn_rm_floor(cut, c_al + 5) == c_al && llama_sj_kvarn_rm_floor(cut, c_al) == c_al, "rm_floor below the ring");
+                require(llama_sj_kvarn_rm_floor(cut, 0, c_al + 5) == c_al && llama_sj_kvarn_rm_floor(cut, 0, c_al) == c_al, "rm_floor below the ring");
                 require(!llama_memory_seq_rm(llama_get_memory(cut), 0, c_al + 5, -1), "unaligned cut below the ring refused");
                 require(llama_memory_seq_pos_max(llama_get_memory(cut), 0) == N0 - 1 && kv_cut->get_sj_kvarn_sealed_end() == B0,
                         "refused cut leaves the cache");
@@ -395,7 +395,7 @@ static int run_case(llama_model * model, const sj_cfg & c, const std::vector<sj_
             // (2) above the intact rows: reopen
             if (lo_g + G < B0) {
                 const llama_pos c_re = lo_g + G + 37; // unaligned, inside the body, rows intact
-                require(llama_sj_kvarn_rm_floor(cut, c_re) == c_re, "rm_floor keeps a reopenable position");
+                require(llama_sj_kvarn_rm_floor(cut, 0, c_re) == c_re, "rm_floor keeps a reopenable position");
                 require(llama_memory_seq_rm(llama_get_memory(cut), 0, c_re, -1), "unaligned cut inside the reopenable body");
                 const uint32_t want = std::min<uint32_t>(B0, std::max<uint32_t>(lo_g, floor_g(c_re > (llama_pos) (S + c.tail) ? c_re - c.tail : S)));
                 require(kv_cut->get_sj_kvarn_sealed_end() == want, "reopened down to max(lo_g, floor_g(c - tail))");

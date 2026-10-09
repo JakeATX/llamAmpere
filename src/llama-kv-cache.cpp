@@ -254,7 +254,7 @@ llama_kv_cache::llama_kv_cache(
         sj_kvarn_B = sj_kvarn_B_prev = sj_kvarn_B_pending = sj_kvarn.sink;
         sj_kvarn_draining = false;
         sj_kvarn_N = 0;
-        sj_kvarn_ring_lo = 0;
+        sj_kvarn_ring_lo.assign(n_stream, 0);
         LLAMA_LOG_INFO("%s: %s cache: K%u/V%u records, sink %u (%s), tail %u, group %u, ring %u rows (%s), pool %u groups/head\n",
                 __func__, sj_kvarn.body_type == GGML_TYPE_TURBO4_0 ? "Tiered TQ" : sj_kvarn.body_type == GGML_TYPE_I16 ? "SJ-KVaRN (trellis body)" : "SJ-KVaRN", sj_kvarn.bits_k, sj_kvarn.bits_v, sj_kvarn.sink, ggml_type_name(sj_kvarn.sink_type == GGML_TYPE_COUNT ? type_k : sj_kvarn.sink_type), sj_kvarn.tail, sj_kvarn.group, sj_kvarn_cap, ggml_type_name(type_k), sj_kvarn_n_groups);
         if (sj_kvarn.edge_layers > 0) {
@@ -1020,7 +1020,7 @@ void llama_kv_cache::clear(bool data) {
     sj_kvarn_B = sj_kvarn_B_prev = sj_kvarn_B_pending = sj_kvarn.sink;
     sj_kvarn_draining = false;
     sj_kvarn_N = 0;
-    sj_kvarn_ring_lo = 0;
+    std::fill(sj_kvarn_ring_lo.begin(), sj_kvarn_ring_lo.end(), 0);
 
     if (data) {
         for (auto & [_, buf] : ctxs_bufs) {
@@ -1069,25 +1069,24 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     }
 
     if (sj_kvarn.enabled() && p1 > p0) {
-        // Cells sit at their positions (cell index == position) and sealed records cannot be reopened, so besides
-        // a full clear only a suffix [p0, end) at or above the sealed end B can go: a hole or a prefix would let
-        // the next ubatch land in a freed cell below the frontier. B == sink means no record is sealed yet, so
-        // the exact sink is still mutable (speculative rollback inside a short prompt). Once a record exists the
-        // sink freezes with it: llama_sj_kvarn_sealed_end() promises that nothing below B can be removed, and
-        // re-decoding a sink position would give apply_ubatch a pos0 below B. B_prev, B_pending and draining
-        // only describe [B, N), so a suffix removal at or above B leaves them valid.
+        // Cells sit at their positions (cell index == position), so besides a full clear only a suffix [p0, end) can
+        // go: a hole or a prefix would let the next ubatch land in a freed cell below the frontier. A suffix at or
+        // above the sealed end B leaves B, B_prev, B_pending and draining valid. A suffix below B goes through
+        // sj_kvarn_truncate_body(): groups whose staging rows are still in the ring are reopened (they re-seal from
+        // the same rows into the same records), below them only a cut on a group boundary works (whole records are
+        // dropped). A cut at or below the sink drops every record.
         const uint32_t n_present = v_cells[0].used_max_p1();
         if (p0 == 0 && (uint32_t) p1 >= n_present) {
             sj_kvarn_B = sj_kvarn_B_prev = sj_kvarn_B_pending = sj_kvarn.sink;
             sj_kvarn_draining = false;
             sj_kvarn_N = 0;
-            sj_kvarn_ring_lo = 0;
+            std::fill(sj_kvarn_ring_lo.begin(), sj_kvarn_ring_lo.end(), 0);
         } else if ((uint32_t) p0 < n_present && (uint32_t) p1 < n_present) {
             LLAMA_LOG_WARN("%s: SJ-KVaRN cache: cannot remove positions [%d, %d): positions [%d, %u) would remain behind a hole\n",
                     __func__, p0, p1, p1, n_present);
             return false;
         } else if (sj_kvarn_B > sj_kvarn.sink && (uint32_t) p0 < sj_kvarn_B && (uint32_t) p0 < n_present) {
-            if (!sj_kvarn_truncate_body((uint32_t) p0)) {
+            if (!sj_kvarn_truncate_body(seq_id, (uint32_t) p0)) {
                 LLAMA_LOG_WARN("%s: SJ-KVaRN cache: cannot remove positions [%d, %d): positions below %u are sealed, the ring no "
                         "longer holds the rows below %d and %d is not on a group boundary (truncate at llama_sj_kvarn_rm_floor())\n",
                         __func__, p0, p1, sj_kvarn_B, p0, p0);
@@ -1482,7 +1481,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
     // SJ-KVaRN: apply_ubatch advances the sealed-end bookkeeping; the dry run below must not keep it
     const uint32_t sj_kvarn_B_old = sj_kvarn_B, sj_kvarn_B_prev_old = sj_kvarn_B_prev, sj_kvarn_N_old = sj_kvarn_N, sj_kvarn_pending_old = sj_kvarn_B_pending;
     const bool     sj_kvarn_draining_old = sj_kvarn_draining;
-    const uint32_t sj_kvarn_ring_lo_old  = sj_kvarn_ring_lo;
+    const std::vector<uint32_t> sj_kvarn_ring_lo_old = sj_kvarn_ring_lo;
 
     bool success = true;
 
@@ -1958,7 +1957,8 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
         sj_kvarn_N = N;
         if (N > sj_kvarn_cap) {
-            sj_kvarn_ring_lo = std::max(sj_kvarn_ring_lo, N - sj_kvarn_cap); // position p's ring row now holds p + cap
+            // position p's ring row now holds p + cap (one stream today, TODO(multi-seq): the ubatch's stream)
+            sj_kvarn_ring_lo[0] = std::max(sj_kvarn_ring_lo[0], N - sj_kvarn_cap);
         }
     }
 }
@@ -2767,30 +2767,35 @@ uint32_t llama_kv_cache::sj_kvarn_floor_g(uint32_t pos) const {
     return pos <= sj_kvarn.sink ? sj_kvarn.sink : sj_kvarn.sink + sj_kvarn.group*((pos - sj_kvarn.sink)/sj_kvarn.group);
 }
 
-uint32_t llama_kv_cache::sj_kvarn_reopen_lo() const {
-    const uint32_t lo = std::max(sj_kvarn_ring_lo, sj_kvarn.sink);
+uint32_t llama_kv_cache::sj_kvarn_stream(llama_seq_id seq_id) const {
+    return seq_id >= 0 && (size_t) seq_id < seq_to_stream.size() ? seq_to_stream[seq_id] : 0;
+}
+
+uint32_t llama_kv_cache::sj_kvarn_reopen_lo(uint32_t s) const {
+    const uint32_t lo = std::max(sj_kvarn_ring_lo[s], sj_kvarn.sink);
     return sj_kvarn.sink + sj_kvarn.group*((lo - sj_kvarn.sink + sj_kvarn.group - 1)/sj_kvarn.group);
 }
 
-llama_pos llama_kv_cache::sj_kvarn_rm_floor(llama_pos pos) const {
+llama_pos llama_kv_cache::sj_kvarn_rm_floor(llama_seq_id seq_id, llama_pos pos) const {
     if (!sj_kvarn.enabled() || pos < 0 || (uint32_t) pos >= sj_kvarn_B || (uint32_t) pos <= sj_kvarn.sink ||
-        (uint32_t) pos >= sj_kvarn_reopen_lo()) {
+        (uint32_t) pos >= sj_kvarn_reopen_lo(sj_kvarn_stream(seq_id))) {
         return pos;
     }
     return (llama_pos) sj_kvarn_floor_g((uint32_t) pos);
 }
 
-bool llama_kv_cache::sj_kvarn_truncate_body(uint32_t p0) {
+bool llama_kv_cache::sj_kvarn_truncate_body(llama_seq_id seq_id, uint32_t p0) {
     GGML_ASSERT(sj_kvarn.enabled() && p0 < sj_kvarn_B);
+    const uint32_t s = sj_kvarn_stream(seq_id);
     if (sj_kvarn_B_pending != sj_kvarn_B) {
         return false; // a seal is in flight; callers truncate between decodes
     }
     uint32_t B_new;
     if (p0 <= sj_kvarn.sink) {
         B_new = sj_kvarn.sink;
-    } else if (p0 >= sj_kvarn_reopen_lo()) {
+    } else if (p0 >= sj_kvarn_reopen_lo(s)) {
         const uint32_t want = p0 > sj_kvarn.sink + sj_kvarn.tail ? sj_kvarn_floor_g(p0 - sj_kvarn.tail) : sj_kvarn.sink;
-        B_new = std::min(sj_kvarn_B, std::max(sj_kvarn_reopen_lo(), want));
+        B_new = std::min(sj_kvarn_B, std::max(sj_kvarn_reopen_lo(s), want));
     } else if ((p0 - sj_kvarn.sink) % sj_kvarn.group == 0) {
         B_new = p0;
     } else {
@@ -4051,7 +4056,7 @@ void llama_kv_cache::state_read_sj_kvarn(llama_io_read_i & io, llama_seq_id seq_
     sj_kvarn_B_prev    = B_prev;
     sj_kvarn_B_pending = B;
     sj_kvarn_N         = std::max(sj_N, n);
-    sj_kvarn_ring_lo   = B; // only the ring rows of [B, n) were restored
+    sj_kvarn_ring_lo[sj_kvarn_stream(seq_id)] = B; // only the ring rows of [B, n) were restored
     sj_kvarn_draining  = draining;
 
     LLAMA_LOG_DEBUG("%s: restored %u cells, sealed end %u (%u groups), tail %u rows\n", __func__, n, B, n_rec, n - std::min(n, B));
