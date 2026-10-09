@@ -33,6 +33,16 @@ The MTP drafter is on by default for Qwen3.8 GGUFs that carry the MTP head. It r
 built-in 65,536-token draft vocabulary, and its KV cache takes the trunk's types. Over an SJ-KVaRN trunk the drafter
 cache is tq5_0/turbo4.
 
+**Prompt cache.** The commands below set no cache flag; the server sizes the cache itself. When another conversation
+takes the slot, the old one is parked in host RAM: 2,048 MiB under 16 GB of RAM, 4,096 at 16 GB, 8,192 at 32 GB,
+12,288 at 64 GB, 16,384 at 96 GB and 20,480 at 128 GB or more, capped at half of the memory available at startup (the
+log says what it chose). Entries evicted from RAM, and everything cached at shutdown, go to a 16,384 MiB disk tier in
+`~/.cache/llamampere/prompt-cache` (`$XDG_CACHE_HOME` if set), oldest written deleted first, with writes paused while the
+filesystem has less than the larger of 10% and 8 GiB free; an entry is only restored into the same model with the same
+KV, drafter-KV and state settings. Override with `--cache-ram N` (MiB; `-1` = half of free memory, `0` = no prompt
+cache), `--cache-disk-path DIR`, `--cache-disk-limit N` (MiB; `-1` = no limit, `0` = off) or `--no-cache-disk`. Block KV
+streaming (`--kv-stream-arena-mib`) cannot be cached.
+
 ## Measurements
 
 | option | KV bits per value | KL at 100K (nats) | decode speed at 100K | max context measured (24 GB) |
@@ -200,7 +210,7 @@ LLAMA_MTP_DRAFT_COMPUTE_LEAN=1 ./build-sm86/bin/llama-server \
   -hf jakeatx/ATX-Swift-1.5-Qwen3.8-27B-Uncensored-2.3bpw-MTP-GGUF \
   -hff ATX-Swift-1.5-Qwen3.8-27B-Uncensored-2.3bpw-MTP.gguf \
   -c 204800 --parallel 1 -ngl 99 -fa on -fit off -b 4096 -ub 512 \
-  --no-context-shift --cache-ram 0 --jinja \
+  --no-context-shift --jinja \
   -ctk sjkvarn3 -ctv sjkvarn3 --sjkvarn-body-type sjkvarn4t \
   --sjkvarn-sink 128 --sjkvarn-sink-type f16 --sjkvarn-staging-type tq6_0 \
   --sjkvarn-tail 4096 --sjkvarn-tail-max 8192 \

@@ -64,10 +64,15 @@ a fresh clone of v0.4: 262,144-token context, 67.8 tok/s after a 250,000-token p
   3-4. The fixed depth 4 default measured +1.50% ± 1.16% over it.
 - Long conversations: `--cache-prompt` keeps the KV cache between turns, so a new turn only pays for its new tokens.
   48 of the model's 64 layers are recurrent and cannot be rewound, so `--ctx-checkpoints N --checkpoint-min-step T`
-  keeps state snapshots for editing or regenerating a turn. `--cache-ram MiB` parks a whole conversation when another
-  takes the slot, and `--cache-disk-path DIR --cache-disk-limit MiB` adds a disk tier under it that survives a
-  restart. All of these live in host RAM or on disk, not VRAM. With `--cache-ram 8192 --ctx-checkpoints 24
-  --checkpoint-min-step 10240`, v0.3 needed about 16 GB of host RAM at the deep end.
+  keeps state snapshots for editing or regenerating a turn. When another conversation takes the slot, the old one is
+  parked in host RAM. With no flags, that RAM tier is sized from host RAM (12,288 MiB on a 64 GB box, at most half of
+  what is available). Below it, a disk tier in `~/.cache/llamampere/prompt-cache` holds up to 16,384 MiB, deleting
+  the oldest-written entries first, and survives a restart. The disk tier stops writing when the filesystem has less
+  than the larger of 10% and 8 GiB free, and it restores an entry only into the same model and KV settings.
+  `--cache-ram N`, `--cache-disk-path DIR`, `--cache-disk-limit N` and `--no-cache-disk` override these defaults;
+  `--cache-ram 0` turns prompt caching off. Checkpoints and both cache tiers live in host RAM or on disk, not VRAM.
+  With `--cache-ram 8192 --ctx-checkpoints 24 --checkpoint-min-step 10240`, v0.3 needed about 16 GB of host RAM at
+  the deep end.
 
 ## Numbers
 
