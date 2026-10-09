@@ -43,7 +43,7 @@ void ggml_cuda_flash_attn_ext_mma_kvarn_case(ggml_backend_cuda_context & ctx, gg
 
     constexpr bool V_is_K_view = false;
 
-    // must match the tile stride the device side uses (ggml_cuda_fattn_mma_get_swizzled / ggml_cuda_mma::swizzle<stride_tile> in
+    // must match the tile stride the device side uses (ggml_cuda_fattn_mma_get_swizzled / swizzle_bytes in
     // fattn-mma-f16.cuh, which flash_attn_ext_kvarn_load_tile writes through): same helpers as the turbo launcher.
     const bool swizzled     = ggml_cuda_fattn_mma_get_swizzled(DKQ, DV, ncols1, ncols2, cc);
     const int stride_tile_K = ggml_cuda_fattn_mma_get_stride_tile(nbatch_K2, swizzled);
