@@ -550,6 +550,9 @@ struct common_moe_cache_params {
     bool fit_selected          = false;
 };
 
+// --cache-ram not given: pick the prompt-cache RAM budget from the host's memory at startup
+#define COMMON_CACHE_RAM_AUTO (-2)
+
 struct common_params {
     int32_t n_predict             =    -1; // max. number of new tokens to predict, -1 == no limit
     int32_t n_ctx                 =     0; // context size, 0 == context the model was trained with
@@ -762,9 +765,11 @@ struct common_params {
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
-    int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
-    std::string cache_disk_path;         // spill prompt-cache entries evicted from RAM to this directory (empty = off)
-    int32_t cache_disk_mib      = 0;     // disk tier size limit in MiB, 0 = no limit
+    int32_t cache_ram_mib       = COMMON_CACHE_RAM_AUTO; // auto = sized from host RAM (see common_prompt_cache_ram_auto_mib),
+                                                             // -1 = half of the free host memory, 0 = disable, N = N MiB
+    bool        cache_disk      = true;  // prompt-cache disk tier (--no-cache-disk turns it off)
+    std::string cache_disk_path;         // disk tier directory (empty = common_prompt_cache_default_dir())
+    int32_t cache_disk_mib      = 16384; // disk tier size limit in MiB, -1 = no limit (free-space guard only), 0 = disable
 
     std::string public_path   = "";                                                                         // NOLINT
     std::string api_prefix    = "";                                                                         // NOLINT
@@ -1061,6 +1066,24 @@ inline bool common_create_directories(const std::filesystem::path & path, std::e
 
 std::filesystem::path fs_get_cache_directory();
 std::filesystem::path fs_get_cache_file(const std::string & filename);
+
+//
+// Prompt-cache defaults (llama-server)
+//
+
+// total and available host memory in bytes (MemTotal / MemAvailable on Linux); false if unknown
+bool common_host_memory(uint64_t & total, uint64_t & available);
+
+// RAM budget of the prompt cache when --cache-ram is not given, from the host's total memory:
+//   < 16 GB -> 2048 MiB, >= 16 -> 4096, >= 32 -> 8192, >= 64 -> 12288, >= 96 -> 16384, >= 128 -> 20480
+// A machine sold as N GB reports a little less than N GiB (firmware and iGPU reservations), so a tier is
+// reached once total memory is within 10% below its nominal size. The result is clamped to half of the
+// available memory. `why` receives a one-line explanation for the log.
+int32_t common_prompt_cache_ram_auto_mib(uint64_t total, uint64_t available, std::string & why);
+
+// default disk-tier directory: $XDG_CACHE_HOME/llamampere/prompt-cache, else ~/.cache/llamampere/prompt-cache
+// (~/Library/Caches/llamampere/prompt-cache on macOS, %LOCALAPPDATA%\llamampere\prompt-cache on Windows)
+std::filesystem::path common_prompt_cache_default_dir();
 std::filesystem::path fs_get_config_directory();
 
 void fs_write_atomic(const std::filesystem::path & path, const std::string & data);
