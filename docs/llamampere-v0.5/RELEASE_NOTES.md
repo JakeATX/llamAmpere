@@ -213,7 +213,7 @@ The comparison against KVarN as published covers nine task histories, and SJ-KVa
 histories are short, so the two caches did not use the same bytes per token in that comparison. Higher-bit cache types
 (q8_0, q5_1) have lower KL than SJ-KVaRN 4/4.
 
-Full method, measurements and caveats: the [SJ-KVaRN paper](https://claude.ai/artifact/GFj87G99yEcgnMe2e1MDjV). The
+Full method, measurements and caveats: the [SJ-KVaRN paper](https://huggingface.co/spaces/jakeatx/sj-kvarn-paper). The
 standalone codec (single-header C99 library plus CUDA reference kernels, MIT) is at
 [JakeATX/sj-kvarn-codec](https://github.com/JakeATX/sj-kvarn-codec).
 
