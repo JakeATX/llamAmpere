@@ -35,12 +35,12 @@ cache is tq5_0/turbo4.
 
 ## Measurements
 
-| option | KV bits per value | KL at 100K (nats) | 100K tok/s | max context measured (24 GB) |
-|---|---:|---:|---:|---|
-| tq5_0 / turbo4 | 4.63 | 0.00113 | 94.47 | 262,144 at 252K deep, peak 21,274 MiB |
-| SJ-KVaRN 4/4 | 4.72 | 0.00066 | 93.31 / 94.55 | 262,144 at 252K deep, peak 22,182 MiB |
-| SJ-KVaRN 3/3t | 3.76 | 0.00130 | 75.07 | 262,144 boots; full depth not measured |
-| SJ-KVaRN 3/2t | 3.27 | 0.00256 | 72.43 | 262,144 boots; full depth not measured |
+| option | KV bits per value | KL at 100K (nats) | decode speed at 100K | max context measured (24 GB) |
+|---|---:|---:|---|---|
+| tq5_0 / turbo4 | 4.63 | 0.00113 | 94.5 tok/s (paired with 4/4) | 262,144 at 252K deep, peak 21,274 MiB |
+| SJ-KVaRN 4/4 | 4.72 | 0.00066 | 93.3 tok/s (paired with tq5_0/turbo4) | 262,144 at 252K deep, peak 22,182 MiB |
+| SJ-KVaRN 3/3t | 3.76 | 0.00130 | 0.79x of 4/4 (paired) | 262,144 boots; full depth not measured |
+| SJ-KVaRN 3/2t | 3.27 | 0.00256 | 0.77x of 4/4 (paired) | 262,144 boots; full depth not measured |
 | 12 GB: SJ-KVaRN 3/2t, 2.3 bpw model | 3.27 | not measured on this model | not a speed cell | 204,800 at 203,568 deep, peak 10,690 MiB |
 
 How each column was measured:
@@ -56,23 +56,31 @@ How each column was measured:
 
   The tq5_0/turbo4 and 4/4 cells share one reference run; at that depth 4/4 is 0.58x tq5_0/turbo4. The 3/3t and 3/2t
   cells come from a codec audit that regenerated the q8_0 reference, which moves KL by up to about 10%.
-- **100K tok/s.**
-  - Ship-corpus mean at a 100,000-token depth (context 110,592), seeds 7300 and 7301.
-  - The tq5_0/turbo4 row and the first 4/4 value come from one session. 4/4 vs tq5_0/turbo4 measured −0.80% ± 6.32%,
-    not significant.
-  - The second 4/4 value and both trellis rows come from a second session. Peaks were 18,836-19,707 MiB.
-  - On the five-seed headline cell at 100K depth, 4/4 read 101.31 against 97.07 (+4.52% ± 7.21%, not significant). Its
-    per-round time was 1.76% ± 1.17% lower (significant).
-  - On the fixture set, tq5_0/turbo4 was faster: 107.47 vs 103.32 (−3.70% ± 2.70% for 4/4).
-  - The trellis rows decode at 0.79x (3/3t) and 0.77x (3/2t) of 4/4. 3/2t vs 3/3t measured −3.11% ± 5.53%, not
-    significant.
-  - Trellis prefill runs about 575-613 tok/s against about 990-1,018 for the scalar cache types.
+- **Decode speed.** Speeds are only compared within one run, because the card moves a few percent between sessions.
+  Ship-corpus speeds are means at a 100,000-token depth (context 110,592), seeds 7300 and 7301, 5,120 generated.
+  - tq5_0/turbo4 vs 4/4, same run:
+
+    | measurement | tq5_0 / turbo4 | 4/4 | difference |
+    |---|---:|---:|---|
+    | ship corpus at 100K (tok/s) | 94.5 | 93.3 | within noise |
+    | one 100K prompt, v0.4 headline protocol, 5 clean seeds (tok/s) | 97.1 | 101.3 | not significant |
+    | short fixtures (tok/s) | 107.5 | 103.3 | tq5_0/turbo4 faster, significant |
+    | prefill at 100K (tok/s) | 1,016 | 986 | |
+    | peak VRAM at 110,592 context (MiB) | 18,936 | 19,707 | |
+
+  - 3/3t and 3/2t vs 4/4, a second run: 3/3t decodes at 0.79x and 3/2t at 0.77x of 4/4.
+    - The 3/3t cost is per round (−20.8% per-round speed); acceptance is unchanged.
+    - 3/2t vs 3/3t is not significant (−3.1% ± 5.5%).
+    - Trellis prefill runs at about 575-613 tok/s, against about 990-1,018 for 4/4.
 - **Max context.**
   - 262,144 tokens is the model's trained context.
   - The 252K-deep cells ran on a rented RTX 3090 at 350 W with 5,120 generated tokens: 61.58 tok/s for tq5_0/turbo4 and
     60.37 for 4/4.
   - For 3/3t and 3/2t on 24 GB, only the allocation at 262,144 is measured: 19,813 and 19,309 MiB after boot, against
     20,888 for tq5_0/turbo4 and 20,820 for 4/4. A full 262K-deep run is not measured.
+  - The release check of the four commands below ran on an RTX 3090 Ti that also drives a desktop (about 790 MiB idle).
+    Each command booted at 262,144 and generated 512 tokens. Whole-card peaks were 22,031 MiB for tq5_0/turbo4,
+    22,693 for 4/4, 21,669 for 3/3t and 21,157 for 3/2t. This is a short prompt, not a full-depth run.
 
 ### KL against an f16 cache
 
@@ -171,6 +179,13 @@ None of these need an environment variable. With tq5_0/turbo4, v0.5 measured +8.
 corpus and +4.09% ± 3.03% on the fixtures. G = 0.4 coding + 0.4 agentic + 0.2 rag.
 
 ## 12 GB cards (RTX 3060 12 GB, 3080 12 GB, 3080 Ti)
+
+**Token efficiency.** Total output, reasoning plus answer, was 0.73x that of stock Qwen3.8-27B at 4 bits (ATX-4-XS).
+
+- Measured on 24 fixed questions run greedy to the end of the answer; 90% CI 0.54-0.98.
+- Swift 1.5 IQ4_XS on the same questions: 0.81x stock. This build keeps some, but not all, of Swift 1.5's shorter
+  output.
+- At temperature 1.0 its reasoning was about 1.22x as long as Swift 1.5 IQ4_XS's (90% CI 1.11-1.33).
 
 **Model:** [`jakeatx/ATX-Swift-1.5-Qwen3.8-27B-Uncensored-2.3bpw-MTP-GGUF`](https://huggingface.co/jakeatx/ATX-Swift-1.5-Qwen3.8-27B-Uncensored-2.3bpw-MTP-GGUF).
 
