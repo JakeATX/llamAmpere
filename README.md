@@ -17,7 +17,7 @@
 - **Read more:** the [SJ-KVaRN paper](https://claude.ai/artifact/GFj87G99yEcgnMe2e1MDjV) and the standalone codec,
   [JakeATX/sj-kvarn-codec](https://github.com/JakeATX/sj-kvarn-codec) (MIT).
 
-Recommended settings for every card size: [docs/llamampere-v0.5/RECOMMENDED.md](docs/llamampere-v0.5/RECOMMENDED.md).
+Release notes, including what we tried and did not ship: [docs/llamampere-v0.5/RELEASE_NOTES.md](docs/llamampere-v0.5/RELEASE_NOTES.md). Recommended settings for every card size: [docs/llamampere-v0.5/RECOMMENDED.md](docs/llamampere-v0.5/RECOMMENDED.md).
 
 **Build and run (v0.5, one RTX 3090 / 3090 Ti, 262,144-token context).** Needs Linux, an NVIDIA card with 24 GB, the
 CUDA toolkit (tested with 12.4), CMake, git and a C++ compiler. The model download is 15.6 GB.
