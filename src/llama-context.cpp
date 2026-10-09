@@ -2156,11 +2156,11 @@ bool llama_context::maintain_sj_kvarn() {
     return kv->maintain_sj_kvarn(this);
 }
 
-int32_t llama_context::compress_sj_kvarn_idle(llama_seq_id seq_id, llama_pos accepted_end) {
+int32_t llama_context::compress_sj_kvarn_idle(llama_seq_id seq_id, llama_pos accepted_end, llama_pos keep_from) {
     auto * kv = llama_sj_kvarn_cache(memory.get());
     if (!kv || !kv->is_sj_kvarn()) { return -1; }
     if (compute_peer && compute_peer->sched) { ggml_backend_sched_synchronize(compute_peer->sched.get()); }
-    return kv->compress_sj_kvarn_idle(this, seq_id, accepted_end);
+    return kv->compress_sj_kvarn_idle(this, seq_id, accepted_end, keep_from);
 }
 
 int32_t llama_sj_kvarn_sealed_end(llama_context * ctx) {
@@ -2178,6 +2178,23 @@ int32_t llama_sj_kvarn_seq_sealed_end(llama_context * ctx, llama_seq_id seq_id) 
 
 int32_t llama_sj_kvarn_compress_idle(llama_context * ctx, llama_seq_id seq_id, llama_pos accepted_end) {
     return ctx ? ctx->compress_sj_kvarn_idle(seq_id, accepted_end) : -1;
+}
+
+int32_t llama_sj_kvarn_compress_idle_keep(llama_context * ctx, llama_seq_id seq_id, llama_pos accepted_end, llama_pos keep_from) {
+    return ctx ? ctx->compress_sj_kvarn_idle(seq_id, accepted_end, keep_from) : -1;
+}
+
+llama_pos llama_sj_kvarn_rm_floor(llama_context * ctx, llama_seq_id seq_id, llama_pos pos) {
+    auto * kv = ctx ? llama_sj_kvarn_cache(ctx->get_memory()) : nullptr;
+    return kv && kv->is_sj_kvarn() ? kv->sj_kvarn_rm_floor(seq_id, pos) : pos;
+}
+
+llama_pos llama_sj_kvarn_group_floor(llama_context * ctx, llama_pos pos) {
+    auto * kv = ctx ? llama_sj_kvarn_cache(ctx->get_memory()) : nullptr;
+    if (!kv || !kv->is_sj_kvarn() || pos < 0) { return pos; }
+    const auto & c = kv->get_sj_kvarn();
+    if ((uint32_t) pos <= c.sink) { return pos; }
+    return (llama_pos) (c.sink + c.group*(((uint32_t) pos - c.sink)/c.group));
 }
 
 enum ggml_type llama_context::get_kv_type_k() const {

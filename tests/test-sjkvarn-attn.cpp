@@ -216,12 +216,17 @@ static void maintenance_require(bool condition, const char * message) {
 static std::vector<int32_t> maintenance_descriptor(llama_kv_cache * cache, llama_pos next_pos) {
     ggml_init_params ip = { 4*ggml_tensor_overhead(), nullptr, true };
     ggml_context * ctx = ggml_init(ip);
-    ggml_tensor * desc = cache->build_input_sj_kvarn_desc(ctx);
-    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_cpu_buffer_type());
-    maintenance_require(buffer != nullptr, "allocate maintenance descriptor");
     llama_ubatch ubatch = {};
     ubatch.pos = &next_pos;
-    cache->set_input_sj_kvarn_desc(desc, &ubatch);
+    ubatch.n_seqs_unq = 1;
+    ggml_tensor * desc = cache->build_input_sj_kvarn_desc(ctx, ubatch);
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_cpu_buffer_type());
+    maintenance_require(buffer != nullptr, "allocate maintenance descriptor");
+    llama_kv_cache::slot_info sinfo;
+    sinfo.s0 = sinfo.s1 = 0;
+    sinfo.strm  = { 0 };
+    sinfo.idxs  = { { 0 } };
+    cache->set_input_sj_kvarn_desc(desc, &ubatch, sinfo);
     std::vector<int32_t> result(GGML_SJKVARN_DESC_N_ENTRIES);
     ggml_backend_tensor_get(desc, result.data(), 0, result.size()*sizeof(int32_t));
     ggml_backend_buffer_free(buffer);
@@ -887,16 +892,25 @@ static int run_seq_rm(const char * save_path) {
         // 2. body sealed (B > sink): everything below B is frozen, the sink included
         decode(0, 700, 128, 0);
         decode(700, 705, 5, 0);
-        const uint32_t B = sealed();
+        uint32_t B = sealed();
         maintenance_require(B > sink && (B - sink) % 128 == 0 && B <= 705 - tail, "body records sealed");
-        refused(111, -1,           705, "rollback from inside the sink after a record is refused");
         refused(0, 704,            705, "prefix up to the frontier is refused");
-        refused(B - 1, -1,         705, "rollback into the sealed body is refused");
-        refused(sink, 1000,        705, "suffix from the first sealed position is refused");
         refused(40, 50,            705, "hole inside the sink is refused");
         refused(sink + 10, B - 10, 705, "hole inside the sealed body is refused");
         refused(B + 10, B + 20,    705, "hole in the exact tail is refused");
-        maintenance_require(!llama_memory_seq_rm(memory, 0, 111, -1), "public API refuses the same removal");
+        maintenance_require(!llama_memory_seq_rm(memory, 0, 40, 50), "public API refuses the same removal");
+        // a suffix into the sealed body whose staging rows are still in the ring reopens the groups at or above it
+        // (all of them here, 705 positions fit the ring); sealing resumes from the same rows
+        maintenance_require(cache->seq_rm(0, B - 1, -1), "rollback into the sealed body reopens it");
+        maintenance_require(pos_max() == (llama_pos) B - 2 && sealed() < B && sealed() >= sink && (sealed() - sink) % 128 == 0,
+                            "reopen moves the boundary down to a group boundary");
+        decode(B - 1, 705, 128, 0);
+        maintenance_require(cache->seq_rm(0, 111, -1) && sealed() == sink && pos_max() == 110,
+                            "rollback from inside the sink drops every record");
+        decode(111, 700, 128, 0);
+        decode(700, 705, 5, 0);
+        B = sealed(); // the ubatch boundaries moved, so the seal schedule may differ
+        maintenance_require(B > sink && (B - sink) % 128 == 0 && B <= 705 - tail, "re-decode seals the body again");
 
         // 3. at or above B: succeeds, and generation continues on the same boundary
         maintenance_require(cache->seq_rm(0, 800, 900), "removal past the frontier is a no-op");
@@ -909,7 +923,7 @@ static int run_seq_rm(const char * save_path) {
         maintenance_require(sealed() == B, "short resume after rollback seals nothing new");
         decode(B + 8, B + 8 + 4*128, 128, 0);
         maintenance_require(sealed() > B, "sealing resumes after rollback at B");
-        printf("seq_rm: after body B=%u: 8 removals below B or with a hole refused unchanged, [702,end) and [B,end) OK, B -> %u\n", B, sealed());
+        printf("seq_rm: after body B=%u: 4 holes/prefixes refused unchanged, reopen and sink rollback OK, [702,end) and [B,end) OK, B -> %u\n", B, sealed());
 
         const llama_pos n_end = pos_max() + 1;
         maintenance_require(cache->seq_rm(0, 0, n_end) && sealed() == sink, "removing every position clears the boundary");
