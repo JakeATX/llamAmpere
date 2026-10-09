@@ -31,6 +31,7 @@
 #include <random>
 #include <thread>
 #include <utility>
+#include <chrono>
 #include <fstream>
 
 // fix problem with std::min and std::max
@@ -1666,6 +1667,159 @@ private:
         stall_thread.join();
     }
 
+    // identity of a model file: size plus a hash of its first and last MiB and 16 evenly spaced 64 KiB samples
+    static std::string prompt_cache_file_identity(const std::string & path) {
+        if (path.empty()) {
+            return "none";
+        }
+
+        std::error_code ec;
+        const uint64_t fsize = std::filesystem::file_size(path, ec);
+        if (ec) {
+            return "unreadable:" + path;
+        }
+
+        std::ifstream f(path, std::ios::binary);
+        uint64_t h = server_prompt_disk_hash(&fsize, sizeof(fsize));
+
+        auto sample = [&](uint64_t off, uint64_t len) {
+            if (off >= fsize) {
+                return;
+            }
+            len = std::min(len, fsize - off);
+            std::vector<char> buf(len);
+            f.clear();
+            f.seekg((std::streamoff) off);
+            f.read(buf.data(), (std::streamsize) len);
+            h = server_prompt_disk_hash(buf.data(), (size_t) f.gcount(), h);
+        };
+
+        const uint64_t MiB = 1024*1024;
+        sample(0, MiB);
+        for (int i = 1; i <= 16; ++i) {
+            sample(fsize / 17 * i, 64*1024);
+        }
+        sample(fsize > MiB ? fsize - MiB : 0, MiB);
+
+        return string_format("%" PRIu64 ":%016" PRIx64, fsize, h);
+    }
+
+    // everything that decides whether a serialized slot state can be restored into this server: the model
+    // (and drafter) weights, the KV / recurrent-state layout of the trunk and the drafter, and the knobs that
+    // change what the stored values mean. A disk entry with any other key is never restored.
+    std::string prompt_cache_key() const {
+        std::string k;
+
+        auto add = [&](const char * name, const std::string & v) {
+            k += name;
+            k += '=';
+            k += v;
+            k += ';';
+        };
+        auto add_type = [&](const char * name, ggml_type t) {
+            add(name, t == GGML_TYPE_COUNT ? std::string("unset") : std::string(ggml_type_name(t)));
+        };
+        auto add_kv = [&](const char * pfx, const common_params & p) {
+            const std::string s(pfx);
+            add_type((s + "ctk").c_str(), p.cache_type_k);
+            add_type((s + "ctv").c_str(), p.cache_type_v);
+            add_type((s + "cts").c_str(), p.cache_type_s);
+            add((s + "sjkvarn").c_str(), string_format("%u/%u,tail=%u,sink=%u,tailmax=%u,edge=%u:%u/%u,flush=%u",
+                    p.sj_kvarn_bits_k, p.sj_kvarn_bits_v, p.sj_kvarn_tail, p.sj_kvarn_sink, p.sj_kvarn_tail_max,
+                    p.sj_kvarn_edge_layers, p.sj_kvarn_edge_bits_k, p.sj_kvarn_edge_bits_v, p.sj_kvarn_flush_chunk));
+            add_type((s + "sjstage").c_str(), p.sj_kvarn_staging_type);
+            add_type((s + "sjsink").c_str(),  p.sj_kvarn_sink_type);
+            add_type((s + "sjbody").c_str(),  p.sj_kvarn_body_type);
+        };
+
+        add("fmt", "llamampere-prompt-cache");
+        add("build", string_format("%d-%s", llama_build_number(), llama_commit()));
+
+        {
+            char desc[256] = {0};
+            llama_model_desc(model_tgt, desc, sizeof(desc));
+            add("model", prompt_cache_file_identity(params_base.model.path));
+            add("model_desc", string_format("%s,n_params=%" PRIu64 ",size=%" PRIu64, desc,
+                    llama_model_n_params(model_tgt), llama_model_size(model_tgt)));
+        }
+        if (model_dft) {
+            add("draft_model", prompt_cache_file_identity(params_base.speculative.draft.mparams.path));
+        }
+        for (const auto & la : params_base.lora_adapters) {
+            add("lora", prompt_cache_file_identity(la.path) + string_format("@%g", la.scale));
+        }
+        for (const auto & cv : params_base.control_vectors) {
+            add("cvec", prompt_cache_file_identity(cv.fname) + string_format("@%g", cv.strength));
+        }
+
+        add_kv("", params_base);
+        add("kv_stream_arena", std::to_string(params_base.kv_stream_arena_mib));
+        add("fa", std::to_string((int) params_base.flash_attn_type));
+        add("n_ctx", std::to_string(llama_n_ctx(ctx_tgt)));
+        add("n_seq", std::to_string(llama_n_seq_max(ctx_tgt)));
+        add("kv_unified", std::to_string(params_base.kv_unified));
+        add("swa_full", std::to_string(params_base.swa_full));
+        add("n_rs_seq", std::to_string(params_base.speculative.need_n_rs_seq()));
+        add("gdn_replay", std::to_string(params_base.gdn_replay));
+        add("rope", string_format("%g,%g,%g,%g,%g,%g,%d,%d", params_base.rope_freq_base, params_base.rope_freq_scale,
+                params_base.yarn_ext_factor, params_base.yarn_attn_factor, params_base.yarn_beta_fast, params_base.yarn_beta_slow,
+                params_base.yarn_orig_ctx, (int) params_base.rope_scaling_type));
+
+        if (ctx_dft) {
+            // the drafter's KV types as actually resolved (inherited from the trunk unless set)
+            const common_params p_dft = common_base_params_to_speculative(params_base);
+            add_kv("dft_", p_dft);
+            add("dft_n_ctx", std::to_string(llama_n_ctx(ctx_dft)));
+            add("dft_n_seq", std::to_string(llama_n_seq_max(ctx_dft)));
+            add("dft_window", string_format("%d,%d", params_base.speculative.draft.attn_window, params_base.speculative.draft.attn_sink));
+            add("dft_sj", std::to_string(params_base.speculative.draft.sj_kvarn));
+            std::string types;
+            for (auto t : params_base.speculative.types) {
+                types += std::to_string((int) t) + ",";
+            }
+            add("spec_types", types);
+        } else {
+            add("dft", "none");
+        }
+
+        // environment knobs that change the stored values or their layout
+        static const char * env_names[] = {
+            "TURBO_INNERQ", "TURBO_INNERQ_STRENGTH", "TURBO_LAYER_ADAPTIVE", "TURBO_AUTO_ASYMMETRIC",
+            "LLAMA_ATTN_ROT_K_OVERRIDE", "LLAMA_ATTN_ROT_V_OVERRIDE", "LLAMA_ATTN_ROT_K_NROT", "LLAMA_ATTN_ROT_DISABLE",
+            "GGML_TQ_NATIVE", "GGML_TQ_ROTCACHE", "LLAMA_GDN_REPLAY", "LLAMA_RS_RING", "LLAMA_RS_RING_ROWS",
+            "LLAMA_MTP_UPDATE_KV_ONLY", "LLAMA_DRAFT_VOCAB_COMPACT", "LLAMA_DRAFT_VOCAB_COMPACT_TYPE",
+            "GGML_SJKVARN_TRELLIS_WORDS", "GGML_SJKVARN_TRELLIS_CB", "GGML_SJKVARN_TRELLIS_CB2",
+            "GGML_SJKVARN_TRELLIS_CB3", "GGML_SJKVARN_TRELLIS_CB4",
+        };
+        for (const char * name : env_names) {
+            if (const char * v = getenv(name)) {
+                add(name, v);
+            }
+        }
+        if (getenv("TURBO_INNERQ")) {
+            // InnerQ calibrates a per-process scale: states written by another process are not comparable
+            add("innerq_process", std::to_string((long long) std::chrono::steady_clock::now().time_since_epoch().count()));
+        }
+
+        return k;
+    }
+
+    // save the idle slots' prompts into the cache and write the whole RAM tier to disk, so that a
+    // restarted (or woken) server finds them
+    void prompt_cache_flush() {
+        if (!prompt_cache || !prompt_cache->disk_enabled() || ctx_tgt == nullptr) {
+            return;
+        }
+
+        for (auto & slot : slots) {
+            if (!slot.is_processing()) {
+                slot.prompt_save(*prompt_cache);
+            }
+        }
+
+        prompt_cache->flush_to_disk();
+    }
+
     void destroy() {
         spec.reset();
         spec_init.reset();
@@ -1690,6 +1844,7 @@ private:
                 // note: for sleeping == false, event is emitted by load_model()
             }
             SRV_INF("%s", "server is entering sleeping state\n");
+            prompt_cache_flush();
             destroy();
         } else {
             SRV_INF("%s", "server is exiting sleeping state\n");
@@ -2166,9 +2321,23 @@ private:
             batch.init(ctx_tgt, std::max(n_batch, params_base.n_parallel), n_embd);
         }
 
+        if (params_base.kv_stream_arena_mib > 0 && params_base.cache_ram_mib != 0) {
+            // a block-streamed KV cache cannot be serialized (llama_kv_cache::state_write refuses it)
+            SRV_INF("%s", "prompt cache is disabled: block KV streaming (--kv-stream-arena-mib) state cannot be saved\n");
+            params_base.cache_ram_mib = 0;
+        }
+
         if (params_base.cache_ram_mib != 0) {
             int32_t cache_ram_mib = params_base.cache_ram_mib;
-            if (cache_ram_mib < 0) {
+            if (cache_ram_mib == COMMON_CACHE_RAM_AUTO) {
+                // no --cache-ram: size the RAM tier from the host's total memory, clamped to half of what is free
+                uint64_t total_host = 0, avail_host = 0;
+                common_host_memory(total_host, avail_host);
+                std::string why;
+                cache_ram_mib = common_prompt_cache_ram_auto_mib(total_host, avail_host, why);
+                SRV_INF("prompt cache RAM tier: %d MiB (auto: %s; set --cache-ram N to override, 0 disables the prompt cache)\n",
+                        cache_ram_mib, why.c_str());
+            } else if (cache_ram_mib < 0) {
                 // "no limit" must still be bounded by the machine: every cached prompt is a full copy of a
                 // sequence's KV state in host memory (14 GiB for a 220k-token f16 cache on a 27B model),
                 // and an unbounded cache swaps the box to death long before it helps anyone.
@@ -2183,11 +2352,27 @@ private:
             } else {
                 SRV_INF("prompt cache is enabled, size limit: %d MiB\n", cache_ram_mib);
             }
-            SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
-            prompt_cache = std::make_unique<server_prompt_cache>(cache_ram_mib, n_ctx, params_base.cache_disk_path, params_base.cache_disk_mib);
+            prompt_cache = std::make_unique<server_prompt_cache>(cache_ram_mib, n_ctx);
+
+            if (params_base.cache_disk && params_base.cache_disk_mib != 0) {
+                std::string dir = params_base.cache_disk_path;
+                if (dir.empty()) {
+                    dir = common_prompt_cache_default_dir().string();
+                }
+
+                const size_t limit = params_base.cache_disk_mib < 0 ? 0 : 1024ull*1024ull*(size_t) params_base.cache_disk_mib;
+
+                std::string err;
+                if (dir.empty() || !prompt_cache->disk_open(dir, prompt_cache_key(), limit, err)) {
+                    SRV_WRN("prompt cache disk tier disabled, running RAM-only: %s\n",
+                            dir.empty() ? "no cache directory could be determined" : err.c_str());
+                }
+            } else {
+                SRV_INF("%s", "prompt cache disk tier is disabled\n");
+            }
         } else {
-            SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
+            SRV_INF("%s", "prompt cache is disabled (--cache-ram 0)\n");
         }
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 
@@ -5536,6 +5721,11 @@ bool server_context::load_model(common_params & params) {
 void server_context::start_loop() {
     auto & params = impl->params_base;
     impl->queue_tasks.start_loop(params.sleep_idle_seconds * 1000);
+
+    // the loop returns on shutdown: keep the cached conversations for the next run
+    if (!impl->sleeping) {
+        impl->prompt_cache_flush();
+    }
 }
 
 void server_context::terminate() {

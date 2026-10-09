@@ -1840,30 +1840,46 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"-cram", "--cache-ram"}, "N",
-        string_format("set the maximum cache size in MiB (default: %d, -1 - half of the free host memory at startup, 0 - disable)"
-            "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)", params.cache_ram_mib),
+        "maximum RAM size of the prompt cache in MiB (default: sized from total host RAM: <16 GB 2048, 16 GB 4096, "
+        "32 GB 8192, 64 GB 12288, 96 GB 16384, 128 GB+ 20480, at most half of the available memory at startup; "
+        "-1 = half of the free host memory at startup, 0 = disable)"
+        "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)",
         [](common_params & params, int value) {
+            if (value < -1) {
+                throw std::invalid_argument("cache-ram must be -1, 0 or a size in MiB");
+            }
             params.cache_ram_mib = value;
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
         {"--cache-disk-path"}, "PATH",
-        "directory for a disk tier of the prompt cache: entries evicted from the RAM cache are written here and "
-        "restored on a later cache miss instead of re-processing the prompt (default: disabled)",
+        "directory of the prompt-cache disk tier: entries evicted from the RAM cache (and the cache at shutdown) are "
+        "written here and restored on a later cache miss or after a restart instead of re-processing the prompt; "
+        "created if missing (default: $XDG_CACHE_HOME/llamampere/prompt-cache, else ~/.cache/llamampere/prompt-cache)",
         [](common_params & params, const std::string & value) {
             params.cache_disk_path = value;
-            if (!fs_is_directory(params.cache_disk_path)) {
-                throw std::invalid_argument("cache-disk-path must be an existing directory");
-            }
+            params.cache_disk      = true;
         }
     ).set_env("LLAMA_ARG_CACHE_DISK_PATH").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--cache-disk-limit"}, "N",
-        string_format("size limit of the prompt-cache disk tier in MiB (default: %d, 0 = no limit)", params.cache_disk_mib),
+        string_format("size limit of the prompt-cache disk tier in MiB; the oldest-written entries are deleted first, "
+            "and writes are skipped while the filesystem has less than max(10%%, 8 GiB) free "
+            "(default: %d, -1 = no limit, the free-space guard still applies, 0 = disable the disk tier)", params.cache_disk_mib),
         [](common_params & params, int value) {
+            if (value < -1) {
+                throw std::invalid_argument("cache-disk-limit must be -1, 0 or a size in MiB");
+            }
             params.cache_disk_mib = value;
         }
     ).set_env("LLAMA_ARG_CACHE_DISK_LIMIT").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--no-cache-disk"},
+        "disable the prompt-cache disk tier (RAM cache only)",
+        [](common_params & params) {
+            params.cache_disk = false;
+        }
+    ).set_env("LLAMA_ARG_NO_CACHE_DISK").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},

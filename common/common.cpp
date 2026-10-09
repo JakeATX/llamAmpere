@@ -1013,6 +1013,114 @@ std::filesystem::path fs_get_cache_directory() {
     return cache_directory / "llama.cpp";
 }
 
+//
+// Prompt-cache defaults
+//
+
+bool common_host_memory(uint64_t & total, uint64_t & available) {
+    total     = 0;
+    available = 0;
+#if defined(_WIN32)
+    MEMORYSTATUSEX st;
+    st.dwLength = sizeof(st);
+    if (GlobalMemoryStatusEx(&st)) {
+        total     = st.ullTotalPhys;
+        available = st.ullAvailPhys;
+    }
+#elif defined(__APPLE__) && defined(__MACH__)
+    uint64_t memsize = 0;
+    size_t   len     = sizeof(memsize);
+    if (sysctlbyname("hw.memsize", &memsize, &len, nullptr, 0) == 0) {
+        total = memsize;
+    }
+    // no MemAvailable equivalent that is cheap and stable: take the total, the clamp is then a no-op
+    available = total;
+#else
+    std::ifstream f("/proc/meminfo");
+    std::string   key;
+    uint64_t      value = 0;
+    std::string   unit;
+    while (f >> key >> value >> unit) {
+        if (key == "MemTotal:") {
+            total = value * 1024;
+        } else if (key == "MemAvailable:") {
+            available = value * 1024;
+        }
+    }
+    if (total == 0) {
+        long pages = sysconf(_SC_PHYS_PAGES);
+        long psize = sysconf(_SC_PAGE_SIZE);
+        if (pages > 0 && psize > 0) {
+            total = (uint64_t) pages * (uint64_t) psize;
+        }
+    }
+    if (available == 0) {
+        available = total;
+    }
+#endif
+    return total > 0;
+}
+
+int32_t common_prompt_cache_ram_auto_mib(uint64_t total, uint64_t available, std::string & why) {
+    static const struct { uint32_t gb; int32_t mib; } tiers[] = {
+        { 128, 20480 }, { 96, 16384 }, { 64, 12288 }, { 32, 8192 }, { 16, 4096 },
+    };
+    const uint64_t GiB = 1024ull*1024ull*1024ull;
+
+    if (total == 0) {
+        why = "host memory unknown, using the smallest tier";
+        return 2048;
+    }
+
+    int32_t  mib  = 2048;
+    uint32_t tier = 0;
+    for (const auto & t : tiers) {
+        // within 10% below the nominal size counts: a 64 GB machine reports ~61 GiB
+        if ((double) total >= 0.9 * (double) t.gb * (double) GiB) {
+            mib  = t.mib;
+            tier = t.gb;
+            break;
+        }
+    }
+
+    char buf[256];
+    if (tier > 0) {
+        snprintf(buf, sizeof(buf), "%.1f GiB total host memory (>= %u GB tier)", total / (double) GiB, tier);
+    } else {
+        snprintf(buf, sizeof(buf), "%.1f GiB total host memory (< 16 GB tier)", total / (double) GiB);
+    }
+    why = buf;
+
+    const uint64_t half_avail_mib = available / 2 / (1024*1024);
+    if (available > 0 && (uint64_t) mib > half_avail_mib) {
+        mib = (int32_t) std::max<uint64_t>(half_avail_mib, 1);
+        snprintf(buf, sizeof(buf), ", clamped to half of the %.1f GiB available", available / (double) GiB);
+        why += buf;
+    }
+
+    return mib;
+}
+
+std::filesystem::path common_prompt_cache_default_dir() try {
+    std::filesystem::path base;
+#if defined(_WIN32)
+    base = common_get_path_from_env("LOCALAPPDATA");
+    if (base.empty()) {
+        return {};
+    }
+#elif defined(__APPLE__)
+    base = get_home_directory() / "Library/Caches";
+#else
+    base = common_get_path_from_env("XDG_CACHE_HOME");
+    if (base.empty()) {
+        base = get_home_directory() / ".cache";
+    }
+#endif
+    return base / "llamampere" / "prompt-cache";
+} catch (const std::exception &) {
+    return {}; // no home directory: the server runs without a disk tier
+}
+
 std::filesystem::path fs_get_config_directory() {
     std::filesystem::path config_directory;
 #if defined(_WIN32)
