@@ -421,6 +421,8 @@ public:
     // SJ-KVaRN: I32 region descriptor (sink/ring/body bounds for this ubatch), nullptr unless the cache is SJ-KVaRN
     ggml_tensor * self_sj_kvarn_desc = nullptr;
     ggml_tensor * self_sj_kvarn_desc_edge = nullptr; // tiered body: descriptor of the edge tier (nullptr unless edge layers exist)
+    // multi-stream SJ-KVaRN: attended (padded) position count per stream of the ubatch; one FA node per stream
+    std::vector<uint32_t> sj_kvarn_n_kv_streams;
 
     // note: these have to be copies because in order to be able to reuse a graph, its inputs
     //       need to carry these parameters with them. otherwise, they can point to freed
@@ -1189,6 +1191,7 @@ struct llm_graph_context {
         int32_t bits_k = 0;
         int32_t bits_v = 0;
         bool fused_rot = false; // Q/output rotation inside the FA node (ggml_sj_kvarn_fused_rot_enabled)
+        const std::vector<uint32_t> * n_kv_streams = nullptr; // multi-stream: per-stream n_kv (see llm_graph_input_attn_kv)
     } sj_kvarn_pending;
 
     llm_graph_context(const llm_graph_params & params);

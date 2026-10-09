@@ -411,7 +411,7 @@ static __global__ void flash_attn_ext_sj_kvarn_stream(
     };
 
     auto is_body = [&](const int p0) { return p0 >= kv.S && p0 < kv.B; };
-    auto rec_of  = [&](const cursor & cu) { return kv.body + (size_t) cu.g*kv.rec_stride; };
+    auto rec_of  = [&](const cursor & cu) { return fattn_sj_kvarn_rec(kv, cu.g); };
     auto cursor_init = [&](const int p0) {
         cursor cu;
         cu.p0 = p0;

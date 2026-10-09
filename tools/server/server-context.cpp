@@ -3888,6 +3888,37 @@ private:
         }
 #endif
 
+        // SJ-KVaRN idle compression, per slot: every sequence has its own stream, so an idle slot seals its
+        // adaptive tail even while other slots keep generating
+        if (params_base.sj_kvarn_bits_k > 0 && params_base.sj_kvarn_tail_max > 0) {
+            for (auto & slot : slots) {
+                if (slot.is_processing() || !slot.sj_kvarn_idle_pending) {
+                    continue;
+                }
+                slot.sj_kvarn_idle_pending = false;
+                const llama_pos end = slot.sj_kvarn_accepted_end;
+                if (end >= 0 && slot.spec_ckpt.empty() &&
+                        end == slot.prompt.tokens.pos_next() &&
+                        end == llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id) + 1) {
+                    // These snapshots could require rows that idle compression seals.
+                    // Keep the live prompt and recurrent state for ordinary continuation.
+                    if (!slot.prompt.checkpoints.empty()) {
+                        SLT_DBG(slot, "discarding %zu prompt checkpoints before SJ-KVaRN idle compression\n",
+                                slot.prompt.checkpoints.size());
+                        slot.prompt.checkpoints.clear();
+                    }
+                    const int64_t start = ggml_time_us();
+                    const int32_t result = llama_sj_kvarn_compress_idle(ctx_tgt, slot.id, end);
+                    if (result < 0) {
+                        SLT_WRN(slot, "%s", "SJ-KVaRN idle compression failed\n");
+                    } else if (result > 0) {
+                        SLT_INF(slot, "SJ-KVaRN idle compression: end=%d, %.3f ms\n", end,
+                                (ggml_time_us() - start) / 1000.0);
+                    }
+                }
+            }
+        }
+
         // check if all slots are idle
         {
             bool all_idle = true;
@@ -3903,33 +3934,6 @@ private:
                 SRV_TRC("%s", "all slots are idle\n");
 
                 metrics_flush_idle();
-
-                if (params_base.sj_kvarn_bits_k > 0 && params_base.sj_kvarn_tail_max > 0 && slots.size() == 1) {
-                    auto & slot = slots.front();
-                    if (slot.sj_kvarn_idle_pending) {
-                        slot.sj_kvarn_idle_pending = false;
-                        const llama_pos end = slot.sj_kvarn_accepted_end;
-                        if (end >= 0 && slot.spec_ckpt.empty() &&
-                                end == slot.prompt.tokens.pos_next() &&
-                                end == llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id) + 1) {
-                            // These snapshots could require rows that idle compression seals.
-                            // Keep the live prompt and recurrent state for ordinary continuation.
-                            if (!slot.prompt.checkpoints.empty()) {
-                                SLT_DBG(slot, "discarding %zu prompt checkpoints before SJ-KVaRN idle compression\n",
-                                        slot.prompt.checkpoints.size());
-                                slot.prompt.checkpoints.clear();
-                            }
-                            const int64_t start = ggml_time_us();
-                            const int32_t result = llama_sj_kvarn_compress_idle(ctx_tgt, slot.id, end);
-                            if (result < 0) {
-                                SLT_WRN(slot, "%s", "SJ-KVaRN idle compression failed\n");
-                            } else if (result > 0) {
-                                SLT_INF(slot, "SJ-KVaRN idle compression: end=%d, %.3f ms\n", end,
-                                        (ggml_time_us() - start) / 1000.0);
-                            }
-                        }
-                    }
-                }
 
                 return; // skip further processing
 
@@ -4579,8 +4583,8 @@ private:
                             SLT_WRN(slot, "n_past was set to %d\n", n_past);
                         }
 
-                        const llama_pos sealed_end = std::max(llama_sj_kvarn_sealed_end(ctx_tgt),
-                                ctx_dft && params_base.speculative.draft.sj_kvarn ? llama_sj_kvarn_sealed_end(ctx_dft) : llama_pos(0));
+                        const llama_pos sealed_end = std::max(llama_sj_kvarn_seq_sealed_end(ctx_tgt, slot.id),
+                                ctx_dft && params_base.speculative.draft.sj_kvarn ? llama_sj_kvarn_seq_sealed_end(ctx_dft, slot.id) : llama_pos(0));
                         if (params_base.sj_kvarn_bits_k > 0 && n_past > 0 &&
                                 slot.prompt.tokens.pos_next(n_past) < sealed_end) {
                             SLT_INF(slot, "%s", "edited prompt reaches sealed SJ-KVaRN rows; reprocessing full prompt\n");

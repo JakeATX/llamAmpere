@@ -455,7 +455,7 @@ static __global__ void flash_attn_ext_sj_kvarn_direct(
                 const int pb = 16*s - kv.S;
                 const int g  = pb / kv.G;
                 const int sl = (pb - g*kv.G) / 16;
-                const char * rec = kv.body + (size_t) g*kv.rec_stride;
+                const char * rec = fattn_sj_kvarn_rec(kv, g);
                 const char * ks  = rec + sl*STRIP_BYTES;
                 const uint32_t dst_s = ring_s + (base + i)*STAGE_BYTES;
 #pragma unroll

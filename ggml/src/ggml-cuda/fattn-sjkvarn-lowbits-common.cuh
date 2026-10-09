@@ -279,8 +279,18 @@ struct fattn_sj_kvarn_lowbits_ctx {
     int64_t sink_head_delta_k, sink_head_delta_v;
     int body_type;
     int rec_stride;      // n_head_kv * rec_bytes
+    const int32_t * table; // paged pool (multi-sequence cache): group g sits at record table[g]; nullptr = identity
     int k_scale, k_zero, k_tok, v_payload, v_ch, v_scale, v_zero;
 };
+
+// record of group g of this stream: g itself, or the paged-pool slot of a multi-sequence cache (desc[GGML_SJKVARN_DESC_TABLE])
+#ifndef FATTN_SJKVARN_REC_DEFINED
+#define FATTN_SJKVARN_REC_DEFINED
+template <typename ctx_t>
+static __device__ __forceinline__ const char * fattn_sj_kvarn_rec(const ctx_t & kv, const int g) {
+    return kv.body + (size_t) (kv.table ? kv.table[g] : g)*kv.rec_stride;
+}
+#endif
 
 static __device__ __forceinline__ fattn_sj_kvarn_lowbits_ctx fattn_sj_kvarn_lowbits_make_ctx(
         const char * body, const int32_t * desc, const int z_KV, const int D, const int bits_k, const int bits_v, const size_t k_head_stride, const size_t v_head_stride) {
@@ -303,6 +313,7 @@ static __device__ __forceinline__ fattn_sj_kvarn_lowbits_ctx fattn_sj_kvarn_lowb
     c.sink_head_delta_k = (int64_t) z_KV*((int64_t) D*sizeof(half) - (int64_t) k_head_stride);
     c.sink_head_delta_v = (int64_t) z_KV*((int64_t) D*sizeof(half) - (int64_t) v_head_stride);
     c.rec_stride = desc[GGML_SJKVARN_DESC_HKV] * rec_bytes;
+    c.table      = desc[GGML_SJKVARN_DESC_TABLE] ? desc + GGML_SJKVARN_DESC_N_ENTRIES : nullptr;
     c.body       = body + (size_t) z_KV * rec_bytes;
     const int k_row = D*c.bits_k/8;
     const int v_row = D*bits_v/8;

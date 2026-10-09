@@ -2841,6 +2841,7 @@ extern "C" {
         GGML_SJKVARN_DESC_TYPE_V   = 11,
         GGML_SJKVARN_DESC_BODY_TYPE = 12, // 0 = SJ-KVaRN, TURBO4_0 = stored-domain Turbo4
         GGML_SJKVARN_DESC_SINK_TYPE = 13, // 0 inherits staging; F16 uses appended sink storage
+        GGML_SJKVARN_DESC_TABLE    = 14, // 0: group g is body record g; 1: paged pool, group g is record desc[GGML_SJKVARN_DESC_N_ENTRIES + g]
         GGML_SJKVARN_DESC_N_ENTRIES = 16,
     };
 
