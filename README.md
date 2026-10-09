@@ -14,7 +14,7 @@
   of context in about 11 GB.
 - **Faster MTP verify decode on EXL3 models**, and a catch-up to upstream llama.cpp and TheTom's TurboQuant fork.
 - **Coming in v0.5.1:** a Swift 1.5 EXL3 4.0 bpw model.
-- **Read more:** the [SJ-KVaRN paper](https://claude.ai/artifact/GFj87G99yEcgnMe2e1MDjV) and the standalone codec,
+- **Read more:** the [SJ-KVaRN paper](https://huggingface.co/spaces/jakeatx/sj-kvarn-paper) and the standalone codec,
   [JakeATX/sj-kvarn-codec](https://github.com/JakeATX/sj-kvarn-codec) (MIT).
 
 Release notes, including what we tried and did not ship: [docs/llamampere-v0.5/RELEASE_NOTES.md](docs/llamampere-v0.5/RELEASE_NOTES.md). Recommended settings for every card size: [docs/llamampere-v0.5/RECOMMENDED.md](docs/llamampere-v0.5/RECOMMENDED.md).
