@@ -25,17 +25,14 @@ static __global__ void fattn_kvarn_expand_prefill(
         const char * rec = kv.body + (size_t) group*kv.rec_stride;
         flash_attn_ext_kvarn_load_tile<D2, false, rows, 256, D2, false, false>(rec, token, kv, tile, rows);
         __syncthreads();
-        // The tile loaders write through ggml_cuda_mma::swizzle<stride_tile> (upstream #29612), which XOR-swizzles any
-        // stride that is a multiple of 32 bytes regardless of the swz flag (D2 = 128 half2 = 512 B is), so read back
-        // through the same map instead of linearly.
         for (int i = tid; i < rows*D2; i += 256) {
-            K_out[out_offset + i] = *swizzle<D2>(tile, i, i/D2);
+            K_out[out_offset + i] = tile[i];
         }
         __syncthreads();
         flash_attn_ext_kvarn_load_tile<D2, false, rows, 256, D2, false, true>(rec, token, kv, tile, rows);
         __syncthreads();
         for (int i = tid; i < rows*D2; i += 256) {
-            V_out[out_offset + i] = *swizzle<D2>(tile, i, i/D2);
+            V_out[out_offset + i] = tile[i];
         }
     } else {
         const int visible_end = desc[GGML_KVARN_DESC_N];

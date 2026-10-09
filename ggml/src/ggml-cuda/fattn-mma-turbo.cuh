@@ -52,7 +52,7 @@ static void ggml_cuda_flash_attn_ext_mma_turbo_case_impl(ggml_backend_cuda_conte
     constexpr bool V_is_K_view = false;
 
     // must match the swizzled tile stride flash_attn_ext_turbo{2,3,4}_load_tile write through
-    // (fattn-mma-f16.cuh's turbo_store_h2 / ggml_cuda_mma::swizzle), same helpers as the f16 host launcher.
+    // (fattn-mma-f16.cuh's turbo_store_h2 / swizzle_bytes), same helpers as the f16 host launcher.
     const bool swizzled     = ggml_cuda_fattn_mma_get_swizzled<preserve_cand>(DKQ, DV, ncols1, ncols2, cc);
     const int stride_tile_K = ggml_cuda_fattn_mma_get_stride_tile(nbatch_K2, swizzled);
     const int stride_tile_V = ggml_cuda_fattn_mma_get_stride_tile(nbatch_V2, swizzled);
