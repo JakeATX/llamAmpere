@@ -2824,7 +2824,13 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
 
     // mixed path (ubatch.is_mixed()): set_rows the token rows into a copy of the embd rows, with its own inputs as select branches must not share tensors
     // TODO: use inp->tokens and inp->embd once ggml_build_forward_select allows it
-    const bool has_mixed = llm_arch_supports_mixed_batch(arch) && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT;
+    // llamAmpere: build the mixed branch only for a mixed ubatch. Its three inputs live in host memory, and the
+    // scheduler uploads every split input with a synchronous copy whether or not its select branch runs, so the
+    // always-built branch cost three extra blocking H2D copies per decode on every text-only round (~30 us/round
+    // on a 5800X3D, more on slower hosts). The graph params compare is_mixed(), so a mixed ubatch still gets a
+    // fresh graph (and, the first time, a larger compute buffer).
+    const bool has_mixed = llm_arch_supports_mixed_batch(arch) && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT &&
+        ubatch.is_mixed();
     if (has_mixed) {
         const int64_t n_tok_rows = llm_graph_n_tok_rows(ubatch);
 
