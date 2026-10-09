@@ -1,8 +1,8 @@
 # llamAmpere v0.5: recommended settings
 
 v0.5 adds **SJ-KVaRN**, a compressed KV cache. It stores keys and values at 4, 3 or 2 bits, with a short
-full-precision recent window, and it can use a trellis-coded body. You select it with `-ctk kvarnN -ctv kvarnN`; the
-code and the flag names still say `kvarn`. This page lists the configurations we recommend for Qwen3.8-27B, with the
+full-precision recent window, and it can use a trellis-coded body. You select it with `-ctk sjkvarnN -ctv sjkvarnN`.
+ This page lists the configurations we recommend for Qwen3.8-27B, with the
 measurements behind each one. Unless a row says otherwise:
 
 - Model: [ATX-Swift 1.5 IQ4_XS-M](https://huggingface.co/jakeatx/ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M-GGUF).
@@ -16,18 +16,18 @@ measurements behind each one. Unless a row says otherwise:
 | option | use it for | KV flags |
 |---|---|---|
 | 1. Pure speed | 24 GB cards, fastest decode | `-ctk tq5_0 -ctv turbo4` |
-| 2. Balanced | 24 GB cards, lowest KL at about the same speed | `-ctk kvarn4 -ctv kvarn4` |
-| 3. Small-card fit | the least KL that still frees memory | `-ctk kvarn3 -ctv kvarn3 --kvarn-body-type auto` |
-| 4. Maximum context (acceptable, not first class) | the most context per GB | `-ctk kvarn3 -ctv kvarn2 --kvarn-body-type auto` |
+| 2. Balanced | 24 GB cards, lowest KL at about the same speed | `-ctk sjkvarn4 -ctv sjkvarn4` |
+| 3. Small-card fit | the least KL that still frees memory | `-ctk sjkvarn3 -ctv sjkvarn3 --sjkvarn-body-type auto` |
+| 4. Maximum context (acceptable, not first class) | the most context per GB | `-ctk sjkvarn3 -ctv sjkvarn2 --sjkvarn-body-type auto` |
 
 You do not need to set any other SJ-KVaRN flag. These are the built-in defaults:
 
 - a 128-token f16 sink;
 - tq6_0 staging;
-- an adaptive full-precision tail of 4,096 to 8,192 tokens (`--kvarn-tail-max 0` fixes it at `--kvarn-tail`);
+- an adaptive full-precision tail of 4,096 to 8,192 tokens (`--sjkvarn-tail-max 0` fixes it at `--sjkvarn-tail`);
 - a scalar body at 4/4.
 
-`--kvarn-body-type auto` selects the trellis body for 3/3 and 3/2.
+`--sjkvarn-body-type auto` selects the trellis body for 3/3 and 3/2.
 
 The MTP drafter is on by default for Qwen3.8 GGUFs that carry the MTP head. It runs at adaptive depth 3-4 with the
 built-in 65,536-token draft vocabulary, and its KV cache takes the trunk's types. Over an SJ-KVaRN trunk the drafter
@@ -143,21 +143,21 @@ http://127.0.0.1:8080 and serves an OpenAI-compatible API.
 
 ```bash
 ./build-sm86/bin/llama-server -hf jakeatx/ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M-GGUF \
-  -c 262144 -ngl 99 -fa on -ctk kvarn4 -ctv kvarn4 -b 4096 -ub 1024 --parallel 1
+  -c 262144 -ngl 99 -fa on -ctk sjkvarn4 -ctv sjkvarn4 -b 4096 -ub 1024 --parallel 1
 ```
 
 **3. Small-card fit: SJ-KVaRN 3/3t**
 
 ```bash
 ./build-sm86/bin/llama-server -hf jakeatx/ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M-GGUF \
-  -c 262144 -ngl 99 -fa on -ctk kvarn3 -ctv kvarn3 --kvarn-body-type auto -b 4096 -ub 1024 --parallel 1
+  -c 262144 -ngl 99 -fa on -ctk sjkvarn3 -ctv sjkvarn3 --sjkvarn-body-type auto -b 4096 -ub 1024 --parallel 1
 ```
 
 **4. Maximum context: SJ-KVaRN 3/2t** (acceptable, not first class)
 
 ```bash
 ./build-sm86/bin/llama-server -hf jakeatx/ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M-GGUF \
-  -c 262144 -ngl 99 -fa on -ctk kvarn3 -ctv kvarn2 --kvarn-body-type auto -b 4096 -ub 1024 --parallel 1
+  -c 262144 -ngl 99 -fa on -ctk sjkvarn3 -ctv sjkvarn2 --sjkvarn-body-type auto -b 4096 -ub 1024 --parallel 1
 ```
 
 The speed cells used the same KV flags, `-b 4096 -ub 1024` and the drafter flags, spelled out explicitly
@@ -173,7 +173,7 @@ v0.5 builds in these defaults:
 Two items are off by default:
 
 - int8 Q·K attention for prefill (`GGML_CUDA_FA_I8QK=1` turns it on);
-- the fused-rotation SJ-KVaRN kernels (CMake option `GGML_KVARN_FUSED_ROT`).
+- the fused-rotation SJ-KVaRN kernels (CMake option `GGML_SJKVARN_FUSED_ROT`).
 
 None of these need an environment variable. With tq5_0/turbo4, v0.5 measured +8.41% ± 5.76% G over v0.4 on the ship
 corpus and +4.09% ± 3.03% on the fixtures. G = 0.4 coding + 0.4 agentic + 0.2 rag.
@@ -201,9 +201,9 @@ LLAMA_MTP_DRAFT_COMPUTE_LEAN=1 ./build-sm86/bin/llama-server \
   -hff ATX-Swift-1.5-Qwen3.8-27B-Uncensored-2.3bpw-MTP.gguf \
   -c 204800 --parallel 1 -ngl 99 -fa on -fit off -b 4096 -ub 512 \
   --no-context-shift --cache-ram 0 --jinja \
-  -ctk kvarn3 -ctv kvarn2 --kvarn-body-type kvarn4t \
-  --kvarn-sink 128 --kvarn-sink-type f16 --kvarn-staging-type tq6_0 \
-  --kvarn-tail 4096 --kvarn-tail-max 8192 \
+  -ctk sjkvarn3 -ctv sjkvarn2 --sjkvarn-body-type sjkvarn4t \
+  --sjkvarn-sink 128 --sjkvarn-sink-type f16 --sjkvarn-staging-type tq6_0 \
+  --sjkvarn-tail 4096 --sjkvarn-tail-max 8192 \
   --cache-type-s q8_0 \
   --spec-type draft-mtp --spec-draft-n-max 4 --spec-draft-p-min 0 \
   --spec-draft-vocab-map docs/mtp-vocab/atx_65536.txt \
@@ -218,7 +218,7 @@ What the 12 GB-specific settings do:
 - `LLAMA_MTP_DRAFT_COMPUTE_LEAN=1` caps the draft context's micro-batch at 64 tokens.
 - `-ub 512` keeps the compute buffers inside the budget.
 
-The measured runs also set `GGML_CUDA_PREFILL_KV_MIB=256 GGML_KVARN_PREFILL_MIB=256`. These only restate the built-in
+The measured runs also set `GGML_CUDA_PREFILL_KV_MIB=256 GGML_SJKVARN_PREFILL_MIB=256`. These only restate the built-in
 default. `--spec-draft-vocab-map auto:65536` selects the same built-in list as the file.
 
 **Fit.** At context 204,800, a 203,568-token prompt plus 256 generated tokens peaked at 10,690 MiB whole-card memory.
