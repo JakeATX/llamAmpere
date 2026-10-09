@@ -258,8 +258,11 @@ public:
     int  sj_kvarn_rot_group() const { return sj_kvarn.body_type == GGML_TYPE_TURBO4_0 ? 128 : 256; }
     ggml_tensor * get_sj_kvarn_body(int32_t il) const;
     bool maintain_sj_kvarn(llama_context * lctx);
-    int32_t compress_sj_kvarn_idle(llama_context * lctx, llama_seq_id seq_id, llama_pos accepted_end);
+    int32_t compress_sj_kvarn_idle(llama_context * lctx, llama_seq_id seq_id, llama_pos accepted_end, llama_pos keep_from = -1);
     uint32_t get_sj_kvarn_sealed_end() const { return sj_kvarn_B; }
+    // largest position <= pos that seq_rm(pos, -1) can truncate to: pos itself unless pos lies inside the sealed body
+    // below the intact ring rows, then the group boundary below it
+    llama_pos sj_kvarn_rm_floor(llama_seq_id seq_id, llama_pos pos) const;
     uint32_t get_sj_kvarn_visible_end() const { return sj_kvarn_N; }
     uint32_t get_sj_kvarn_capacity() const { return sj_kvarn_cap; }
     uint64_t get_sj_kvarn_maintenance_count() const { return sj_kvarn_maintenance_count; }
@@ -378,6 +381,9 @@ private:
     uint64_t sj_kvarn_maintenance_groups = 0;
     uint32_t sj_kvarn_B_prev = 0;        // sealed end before the current ubatch
     uint32_t sj_kvarn_N      = 0;        // positions present
+    // per stream: positions [ring_lo, N) still hold their ring rows (lower ones were overwritten by p + cap or never
+    // restored); a body truncation may reopen sealed groups there
+    std::vector<uint32_t> sj_kvarn_ring_lo;
 
     uint32_t sj_kvarn_ring_row(uint32_t pos) const { return pos < sj_kvarn.sink ? pos : sj_kvarn.sink + (pos - sj_kvarn.sink) % sj_kvarn_cap; }
 
@@ -532,6 +538,16 @@ private:
     bool state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo);
 
     void state_clear(llama_seq_id seq_id, uint32_t strm, const slot_info & sinfo);
+
+    // SJ-KVaRN truncation into the sealed body (see the comment above sj_kvarn_truncate_body in llama-kv-cache.cpp)
+    uint32_t sj_kvarn_floor_g(uint32_t pos) const;
+    uint32_t sj_kvarn_stream(llama_seq_id seq_id) const;
+    uint32_t sj_kvarn_reopen_lo(uint32_t s) const;
+    bool     sj_kvarn_truncate_body(llama_seq_id seq_id, uint32_t p0);
+
+    // SJ-KVaRN sequence state (format: see the comment above state_write_sj_kvarn in llama-kv-cache.cpp)
+    void state_write_sj_kvarn(llama_io_write_i & io, llama_seq_id seq_id) const;
+    void state_read_sj_kvarn (llama_io_read_i  & io, llama_seq_id seq_id);
 };
 
 class llama_kv_cache_context : public llama_memory_context_i {

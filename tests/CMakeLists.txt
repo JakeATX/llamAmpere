@@ -158,6 +158,8 @@ target_include_directories(test-sjkvarn-codec PRIVATE ${PROJECT_SOURCE_DIR}/ggml
 llama_build_and_test(test-sjkvarn-attn.cpp LABEL "turbo")
 target_include_directories(test-sjkvarn-attn PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 llama_build_and_test(test-sjkvarn-fused-rot.cpp LABEL "turbo")
+llama_build_and_test(test-sjkvarn-state.cpp LABEL "turbo")
+target_include_directories(test-sjkvarn-state PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 llama_build(test-save-load-state.cpp)
 # prompt-cache state round trip over every KV / drafter / recurrent-state type (needs an MTP model: -m)
 llama_build(test-prompt-cache-types.cpp)

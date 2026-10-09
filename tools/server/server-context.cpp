@@ -643,6 +643,9 @@ struct server_slot {
     // Invalid while a decode or speculative transaction is unresolved.
     llama_pos sj_kvarn_accepted_end = -1;
     bool sj_kvarn_idle_pending = false;
+    // end of the last prompt: idle compression leaves the turn generated after it unsealed, since the next
+    // request typically re-renders that turn (e.g. strips its reasoning)
+    llama_pos sj_kvarn_keep_from = -1;
     std::mt19937 spec_synth_rng;
 
     // TODO: move members that belong to the task (such as `generated`, `has_new_line`) to task_results_state
@@ -741,6 +744,7 @@ struct server_slot {
     void prompt_clear() {
         sj_kvarn_accepted_end = -1;
         sj_kvarn_idle_pending = false;
+        sj_kvarn_keep_from = -1;
         SLT_TRC(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
 
         mem.seq_rm(id, -1, -1);
@@ -3530,6 +3534,41 @@ private:
     }
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
+    // SJ-KVaRN: largest position <= p that seq_rm can cut both caches back to (p unless p lies in a sealed body)
+    llama_pos sj_kvarn_rm_floor(llama_seq_id seq_id, llama_pos p) const {
+        if (params_base.sj_kvarn_bits_k == 0 && !params_base.speculative.draft.sj_kvarn) {
+            return p;
+        }
+        llama_pos f = p;
+        for (int i = 0; i < 4; ++i) { // the two caches share sink/group, so this settles after one round
+            const llama_pos g = ctx_dft ? llama_sj_kvarn_rm_floor(ctx_dft, seq_id, llama_sj_kvarn_rm_floor(ctx_tgt, seq_id, f))
+                                        : llama_sj_kvarn_rm_floor(ctx_tgt, seq_id, f);
+            if (g == f) {
+                break;
+            }
+            f = g;
+        }
+        return f;
+    }
+
+    // a prompt checkpoint restores the state at max(pos_min + 1, pos_max); it is usable only if seq_rm can reach it
+    bool sj_kvarn_ckpt_reachable(llama_seq_id seq_id, const common_prompt_checkpoint & cur) const {
+        const llama_pos p = std::max(cur.pos_min + 1, cur.pos_max);
+        return sj_kvarn_rm_floor(seq_id, p) == p;
+    }
+
+    // SJ-KVaRN group boundary at or below n (n when SJ-KVaRN is off)
+    llama_pos sj_kvarn_group_floor(llama_pos n) const {
+        if (params_base.sj_kvarn_bits_k == 0 && !params_base.speculative.draft.sj_kvarn) {
+            return n;
+        }
+        llama_pos f = llama_sj_kvarn_group_floor(ctx_tgt, n);
+        if (ctx_dft) {
+            f = std::min(f, llama_sj_kvarn_group_floor(ctx_dft, f));
+        }
+        return f;
+    }
+
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         // Slot restore can synthesize a checkpoint without an active inference task.
         const int id_task = slot.task ? slot.task->id : -1;
@@ -4097,20 +4136,30 @@ private:
                         if (end >= 0 && slot.spec_ckpt.empty() &&
                                 end == slot.prompt.tokens.pos_next() &&
                                 end == llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id) + 1) {
-                            // These snapshots could require rows that idle compression seals.
-                            // Keep the live prompt and recurrent state for ordinary continuation.
-                            if (!slot.prompt.checkpoints.empty()) {
-                                SLT_DBG(slot, "discarding %zu prompt checkpoints before SJ-KVaRN idle compression\n",
-                                        slot.prompt.checkpoints.size());
-                                slot.prompt.checkpoints.clear();
-                            }
+                            // The last turn (from the end of its prompt) stays unsealed: the next request usually
+                            // re-renders it, and an edit there must not reach sealed rows. Checkpoints stay valid
+                            // when they sit at or above the new sealed end or on a group boundary (whole sealed
+                            // groups can be dropped by seq_rm); the server creates them on boundaries.
                             const int64_t start = ggml_time_us();
-                            const int32_t result = llama_sj_kvarn_compress_idle(ctx_tgt, slot.id, end);
+                            const int32_t result = llama_sj_kvarn_compress_idle_keep(ctx_tgt, slot.id, end, slot.sj_kvarn_keep_from);
                             if (result < 0) {
                                 SLT_WRN(slot, "%s", "SJ-KVaRN idle compression failed\n");
                             } else if (result > 0) {
-                                SLT_INF(slot, "SJ-KVaRN idle compression: end=%d, %.3f ms\n", end,
+                                SLT_INF(slot, "SJ-KVaRN idle compression: end=%d, sealed end=%d (keep from %d), %.3f ms\n", end,
+                                        llama_sj_kvarn_sealed_end(ctx_tgt), slot.sj_kvarn_keep_from,
                                         (ggml_time_us() - start) / 1000.0);
+                            }
+                            size_t n_dropped = 0;
+                            for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end();) {
+                                if (!sj_kvarn_ckpt_reachable(slot.id, *it)) {
+                                    it = slot.prompt.checkpoints.erase(it);
+                                    ++n_dropped;
+                                } else {
+                                    ++it;
+                                }
+                            }
+                            if (n_dropped > 0) {
+                                SLT_DBG(slot, "dropped %zu prompt checkpoints behind the sealed SJ-KVaRN end\n", n_dropped);
                             }
                         }
                     }
@@ -4715,6 +4764,10 @@ private:
                                             if (cur.pos_max > pos_next) {
                                                 return false;
                                             }
+                                            // SJ-KVaRN: seq_rm can only cut the sealed body at a group boundary
+                                            if (!sj_kvarn_ckpt_reachable(slot.id, cur)) {
+                                                return false;
+                                            }
                                             return cur.pos_min < pos_min_thold || cur.pos_min == 0;
                                         }
                                     );
@@ -4764,13 +4817,26 @@ private:
                             SLT_WRN(slot, "n_past was set to %d\n", n_past);
                         }
 
-                        const llama_pos sealed_end = std::max(llama_sj_kvarn_sealed_end(ctx_tgt),
-                                ctx_dft && params_base.speculative.draft.sj_kvarn ? llama_sj_kvarn_sealed_end(ctx_dft) : llama_pos(0));
-                        if (params_base.sj_kvarn_bits_k > 0 && n_past > 0 &&
-                                slot.prompt.tokens.pos_next(n_past) < sealed_end) {
-                            SLT_INF(slot, "%s", "edited prompt reaches sealed SJ-KVaRN rows; reprocessing full prompt\n");
-                            slot.prompt_clear();
-                            n_past = 0;
+                        // SJ-KVaRN: an edit inside the sealed body truncates at the group boundary below it (whole
+                        // records are dropped, kept records stay bit-identical, nothing is re-quantised). Recurrent
+                        // models get there through a boundary checkpoint (see sj_kvarn_ckpt_reachable); a model
+                        // without recurrent state just re-processes from the boundary.
+                        if (n_past > 0) {
+                            const llama_pos p = slot.prompt.tokens.pos_next(n_past);
+                            const llama_pos f = sj_kvarn_rm_floor(slot.id, p);
+                            if (f != p) {
+                                if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART && !slot.prompt.tokens.has_mtmd) {
+                                    n_past = (int32_t) slot.prompt.tokens.size_up_to_pos(f);
+                                    SLT_INF(slot, "edited prompt reaches sealed SJ-KVaRN rows; truncating at group boundary %d (n_past = %d)\n", f, n_past);
+                                    for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end();) {
+                                        it = it->pos_max > f ? slot.prompt.checkpoints.erase(it) : std::next(it);
+                                    }
+                                } else {
+                                    SLT_WRN(slot, "edited prompt reaches sealed SJ-KVaRN rows at %d and no boundary checkpoint restores it; reprocessing full prompt\n", p);
+                                    slot.prompt_clear();
+                                    n_past = 0;
+                                }
+                            }
                         }
 
                         slot.stats.n_prompt_cached    = n_past;
@@ -4935,6 +5001,28 @@ private:
 
                     const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
 
+                    // SJ-KVaRN: prompt checkpoints go on group boundaries only, at the boundary below each usual
+                    // spot (last user message, 4 + n_ubatch and 4 tokens before the end), so an edit that reaches
+                    // sealed rows restores the recurrent state where seq_rm can cut the sealed body
+                    const bool sj_align = params_base.sj_kvarn_bits_k > 0 || params_base.speculative.draft.sj_kvarn;
+                    const int64_t n_task = slot.task->n_tokens();
+                    auto sj_ckpt_target = [&](int64_t n) {
+                        if (n <= 0 || n >= n_task || sj_kvarn_group_floor((llama_pos) n) != n) {
+                            return false;
+                        }
+                        const int64_t spots[3] = {
+                            (int64_t) last_user_pos,
+                            n_task - std::min<int64_t>(n_batch, 4),
+                            n_task - std::min<int64_t>(n_batch, 4 + n_ubatch),
+                        };
+                        for (int64_t q : spots) {
+                            if (q > 0 && sj_kvarn_group_floor((llama_pos) q) == n) {
+                                return true;
+                            }
+                        }
+                        return false;
+                    };
+
                     // add prompt tokens for processing in the current batch
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
                         // get next token to process
@@ -4974,6 +5062,11 @@ private:
                         }
                         slot.prompt.tokens.push_back(cur_tok);
 
+                        if (do_checkpoint && sj_align) {
+                            if (sj_ckpt_target(slot.prompt.n_tokens())) {
+                                break;
+                            }
+                        } else
                         // break at the last user message, or at user messages at least min step past the last checkpoint
                         if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
                             const auto pos = slot.prompt.n_tokens();
@@ -4989,7 +5082,7 @@ private:
                         //  - 4 + n_ubatch
                         //  - 4
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
-                        if (do_checkpoint) {
+                        if (do_checkpoint && !sj_align) {
                             static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
 
                             bool should_break = false;
@@ -5022,6 +5115,7 @@ private:
                     // entire prompt has been processed
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
                         slot.state = SLOT_STATE_DONE_PROMPT;
+                        slot.sj_kvarn_keep_from = slot.prompt.tokens.pos_next();
 
                         GGML_ASSERT(batch.size() > 0);
 
@@ -5033,7 +5127,7 @@ private:
                         slot.prompt_checkpoint_restored = false;
 
                         slot.init_sampler();
-                    } else {
+                    } else if (!sj_align) {
                         // skip ordinary mid-prompt checkpoints, unless the batch starts a user
                         // message or we are near the end of the prompt
                         if (!is_user_start && !near_prompt_end) {
@@ -5053,11 +5147,20 @@ private:
                     // do not checkpoint after mtmd chunks
                     do_checkpoint = do_checkpoint && !has_mtmd;
 
-                    // no need to create checkpoints that are too close together, unless it's the last user message
-                    do_checkpoint = do_checkpoint && (
-                            slot.prompt.checkpoints.empty() ||
-                            is_last_user_message || near_prompt_end ||
-                            n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
+                    if (sj_align) {
+                        // boundary checkpoints: the targeted spots, plus one per min step along a long prompt
+                        do_checkpoint = do_checkpoint && n_tokens_start > 0 &&
+                            sj_kvarn_group_floor((llama_pos) n_tokens_start) == n_tokens_start && (
+                                sj_ckpt_target(n_tokens_start) ||
+                                slot.prompt.checkpoints.empty() ||
+                                n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
+                    } else {
+                        // no need to create checkpoints that are too close together, unless it's the last user message
+                        do_checkpoint = do_checkpoint && (
+                                slot.prompt.checkpoints.empty() ||
+                                is_last_user_message || near_prompt_end ||
+                                n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
+                    }
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not

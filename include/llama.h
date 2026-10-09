@@ -903,6 +903,25 @@ extern "C" {
                     llama_seq_id   seq_id,
                        llama_pos   accepted_pos_end);
 
+    // Like llama_sj_kvarn_compress_idle, but leaves keep_from and the tail positions behind it unsealed: the turn the
+    // next request is likely to re-render (from keep_from on) stays exact, and a re-prefill from there keeps the same
+    // exact window as a fresh prefill. keep_from < 0 = no bound.
+    LLAMA_API int32_t llama_sj_kvarn_compress_idle_keep(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
+                       llama_pos   accepted_pos_end,
+                       llama_pos   keep_from);
+
+    // Largest position <= pos that llama_memory_seq_rm(mem, seq, p, -1) can truncate the SJ-KVaRN cache to. Sealed
+    // groups whose staging rows are still in the ring are reopened (any pos works); below that only whole groups can
+    // be dropped, so pos rounds down to a group boundary. Kept records stay bit-identical, nothing is re-quantised.
+    // Returns pos when the context has no SJ-KVaRN cache.
+    LLAMA_API llama_pos llama_sj_kvarn_rm_floor(struct llama_context * ctx, llama_seq_id seq_id, llama_pos pos);
+
+    // The SJ-KVaRN group boundary at or below pos (pos itself when pos <= sink or the context has no SJ-KVaRN cache).
+    // A checkpoint taken at a boundary stays reachable by seq_rm after the rows behind it are sealed.
+    LLAMA_API llama_pos llama_sj_kvarn_group_floor(struct llama_context * ctx, llama_pos pos);
+
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
 
