@@ -2027,11 +2027,14 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     }
 
     if (it_best != states.end()) {
-        SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
+        const int64_t t_start = ggml_time_us();
 
         if (!restore(*it_best, ctx_tgt, ctx_dft, id_slot)) {
             return false;
         }
+
+        SRV_INF(" - restored prompt from RAM with f_keep = %.3f, f_sim = %.3f (%zu tokens, %.3f MiB) in %.2f ms\n",
+                f_keep_best, f_sim_best, it_best->prompt.tokens.size(), it_best->size() / (1024.0 * 1024.0), (ggml_time_us() - t_start) / 1000.0);
 
         prompt = std::move(it_best->prompt);
 
@@ -2133,6 +2136,7 @@ void server_prompt_cache::flush_to_disk() {
     }
 
     size_t n = 0;
+    const size_t n_total = states.size() + (staging_pending ? 1 : 0);
     for (const auto & state : states) {
         n += disk_spill(state) ? 1 : 0;
     }
@@ -2145,5 +2149,5 @@ void server_prompt_cache::flush_to_disk() {
     }
 
     SRV_INF("prompt cache: flushed %zu of %zu prompts to the disk tier (%zu entries, %.1f MiB on disk)\n",
-            n, states.size(), disk.entries.size(), disk.size() / (1024.0 * 1024.0));
+            n, n_total, disk.entries.size(), disk.size() / (1024.0 * 1024.0));
 }
