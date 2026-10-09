@@ -71,6 +71,7 @@ a fresh clone of v0.4: 262,144-token context, 67.8 tok/s after a 250,000-token p
   than the larger of 10% and 8 GiB free, and it restores an entry only into the same model and KV settings.
   `--cache-ram N`, `--cache-disk-path DIR`, `--cache-disk-limit N` and `--no-cache-disk` override these defaults;
   `--cache-ram 0` turns prompt caching off. Checkpoints and both cache tiers live in host RAM or on disk, not VRAM.
+  SJ-KVaRN caches take part too: reuse restarts at the 128-token group boundary at or below the first changed token.
   With `--cache-ram 8192 --ctx-checkpoints 24 --checkpoint-min-step 10240`, v0.3 needed about 16 GB of host RAM at
   the deep end.
 
