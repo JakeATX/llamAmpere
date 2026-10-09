@@ -3183,8 +3183,20 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                 ggml_tensor * q_s = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2], 1, q->nb[1], q->nb[2], q->nb[3], s*q->nb[3]);
                 ggml_tensor * k_s = ggml_view_4d(ctx0, k, k->ne[0], k->ne[1], k->ne[2], 1, k->nb[1], k->nb[2], k->nb[3], s*k->nb[3]);
                 ggml_tensor * v_s = ggml_view_4d(ctx0, v, v->ne[0], v->ne[1], v->ne[2], 1, v->nb[1], v->nb[2], v->nb[3], s*v->nb[3]);
-                ggml_tensor * m_s = ggml_view_4d(ctx0, kq_mask, n_kv_s, kq_mask->ne[1], kq_mask->ne[2], 1,
-                        kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], s*kq_mask->nb[3]);
+                if (sj_kvarn_mask_src != kq_mask) {
+                    sj_kvarn_mask_src = kq_mask;
+                    sj_kvarn_mask_s.assign(ns, nullptr);
+                }
+                GGML_ASSERT((int64_t) sj_kvarn_mask_s.size() == ns);
+                ggml_tensor * m_s = sj_kvarn_mask_s[s];
+                if (m_s == nullptr || m_s->ne[0] != n_kv_s) {
+                    m_s = ggml_view_4d(ctx0, kq_mask, n_kv_s, kq_mask->ne[1], kq_mask->ne[2], 1,
+                            kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], s*kq_mask->nb[3]);
+                    if (!ggml_is_contiguous(m_s)) {
+                        m_s = ggml_cont(ctx0, m_s);
+                    }
+                    sj_kvarn_mask_s[s] = m_s;
+                }
                 ggml_tensor * d_s = ggml_view_1d(ctx0, desc, desc->ne[0], s*desc->nb[1]);
                 ggml_tensor * c = ggml_flash_attn_ext(ctx0, q_s, k_s, v_s, m_s, kq_scale, hparams.f_max_alibi_bias,
                                           hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);

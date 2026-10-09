@@ -538,6 +538,18 @@ static float max_diff(const std::vector<float> & a, const std::vector<float> & b
 }
 
 
+// control for the mixed-ubatch tolerance: the same mixed-vs-alone comparison on a plain f16 cache (no SJ-KVaRN)
+static void plain_mixed_control(llama_model * model) {
+    sj_cfg pc = { "plain f16", 0, 0, GGML_TYPE_F32 };
+    pc.plain = true;
+    llama_context * mx = make_ctx(model, pc, 2, false);
+    llama_context * r1 = make_ctx(model, pc);
+    const auto rm = decode_mixed(mx, { { 0, 0, 704, 0 }, { 1, 0, 704, 3 } }, 64);
+    const auto a = decode(r1, 0, 704, 64, 3);
+    printf("control: plain f16 cache, mixed ubatch vs alone: max|d| = %g\n", max_diff(rm[1], a));
+    llama_free(mx); llama_free(r1);
+}
+
 // Several sequences, one stream each (paged record pool; `unified` = --kv-unified shared pool). Every sequence must
 // give the logits a single-sequence context gives for the same tokens, through mixed ubatches, seals, a truncation
 // into the sealed body, a per-sequence state save/restore into another sequence's stream, and seq_cp.
@@ -564,8 +576,13 @@ static int run_multi(llama_model * model, const sj_cfg & c, bool unified) {
             require(mx && r1, "contexts");
             const auto rm = decode_mixed(mx, { { 0, 0, 1536, 0 }, { 1, 0, 704, 3 } }, 64);
             const float d = max_diff(rm[1], decode(r1, 0, 704, 64, 3));
-            llama_free(mx); llama_free(r1);
             require(d < 1e-3f, "mixed prefill within 1e-3 of the single sequence (max|d| " + std::to_string(d) + ")");
+            // mixed multi-token ubatches with different lengths per stream (each FA node cuts the mask to its
+            // stream's own n_kv: the per-stream mask view is not contiguous and is copied)
+            const auto ru = decode_mixed(mx, { { 0, 1536, 1792, 0 }, { 1, 704, 960, 3 } }, 64);
+            const float du = max_diff(ru[1], decode(r1, 704, 960, 64, 3));
+            llama_free(mx); llama_free(r1);
+            require(du < 1e-3f, "mixed unequal-length chunks within 1e-3 (max|d| " + std::to_string(du) + ")");
         }
         // prefill both sequences, seq 1 shorter (span lengths are multiples of the chunk: same ubatch boundaries)
         auto r = decode_mixed(mc, { { 0, 0, 1536, 0 }, { 1, 0, 704, 3 } }, 64, false);
@@ -682,6 +699,7 @@ int main(int argc, char ** argv) {
     for (const auto & c : cases) {
         fails += run_case(model, c.first, c.second, tmp_dir);
     }
+    plain_mixed_control(model);
     int fails_multi = 0;
     for (const auto & c : { s44, s33t, s32t }) {
         fails_multi += run_multi(model, c, false);

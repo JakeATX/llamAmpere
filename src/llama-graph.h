@@ -1193,6 +1193,11 @@ struct llm_graph_context {
         bool fused_rot = false; // Q/output rotation inside the FA node (ggml_sj_kvarn_fused_rot_enabled)
         const std::vector<uint32_t> * n_kv_streams = nullptr; // multi-stream: per-stream n_kv (see llm_graph_input_attn_kv)
     } sj_kvarn_pending;
+    // multi-stream SJ-KVaRN: per-stream mask views cut to the stream's own n_kv are not contiguous when the ubatch
+    // has more than one token row, and FA needs a contiguous mask; the contiguous copies are made once per graph
+    // (the mask is shared by every layer)
+    mutable ggml_tensor * sj_kvarn_mask_src = nullptr;
+    mutable std::vector<ggml_tensor *> sj_kvarn_mask_s;
 
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;
