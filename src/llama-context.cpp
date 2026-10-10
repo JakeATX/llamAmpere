@@ -2168,6 +2168,11 @@ int32_t llama_sj_kvarn_sealed_end(llama_context * ctx) {
     return kv && kv->is_sj_kvarn() ? (int32_t) kv->get_sj_kvarn_sealed_end() : -1;
 }
 
+int32_t llama_sj_kvarn_seq_unsealed_max(llama_context * ctx) {
+    auto * kv = ctx ? llama_sj_kvarn_cache(ctx->get_memory()) : nullptr;
+    return kv && kv->is_sj_kvarn() ? (int32_t) (kv->get_sj_kvarn_sink() + kv->get_sj_kvarn_capacity()) : -1;
+}
+
 int32_t llama_sj_kvarn_seq_sealed_end(llama_context * ctx, llama_seq_id seq_id) {
     auto * kv = ctx ? llama_sj_kvarn_cache(ctx->get_memory()) : nullptr;
     if (!kv || !kv->is_sj_kvarn() || seq_id < 0 || (uint32_t) seq_id >= kv->get_n_stream()) {

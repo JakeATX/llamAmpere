@@ -266,6 +266,7 @@ public:
     llama_pos sj_kvarn_rm_floor(llama_seq_id seq_id, llama_pos pos) const;
     uint32_t get_sj_kvarn_visible_end() const { return sj_kvarn_st[0].N; }
     uint32_t get_sj_kvarn_capacity() const { return sj_kvarn_cap; }
+    uint32_t get_sj_kvarn_sink() const { return sj_kvarn.sink; }
     uint64_t get_sj_kvarn_maintenance_count() const { return sj_kvarn_maintenance_count; }
     uint64_t get_sj_kvarn_maintenance_groups() const { return sj_kvarn_maintenance_groups; }
     bool has_sj_kvarn_maintenance() const {

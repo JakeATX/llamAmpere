@@ -3870,14 +3870,17 @@ common_speculative_init_result::common_speculative_init_result(
     cparams.n_ctx = llama_n_ctx(ctx_tgt);
 
     // SJ-KVaRN trunk with --kv-unified and several slots: every target sequence may address the whole context
-    // (one shared record pool, per-sequence rings), so a plain unified draft cache of n_ctx cells would run out
-    // when the slots together pass n_ctx. The (plain) draft cache gets one n_ctx stream per sequence instead.
+    // (one shared record pool of n_ctx - sink - tail tokens, plus a per-sequence sink and ring), so the slots
+    // together can hold up to n_ctx + n_seq*(sink + ring) tokens. A plain unified draft cache of n_ctx cells would
+    // run out first (decode: failed to find a memory slot); it gets that many cells instead, still unified
+    // (one n_ctx stream per sequence would cost n_seq*n_ctx cells and a matching compute buffer).
     if (cparams.kv_unified && cparams.n_seq_max > 1 && cparams.sj_kvarn_bits_k == 0 &&
         llama_sj_kvarn_sealed_end(ctx_tgt) >= 0 && llama_n_ctx_seq(ctx_tgt) == llama_n_ctx(ctx_tgt)) {
-        cparams.kv_unified = false;
-        cparams.n_ctx      = llama_n_ctx(ctx_tgt) * cparams.n_seq_max;
-        LOG_INF("%s: SJ-KVaRN shared pool: draft KV cache uses %u streams of %u cells\n", __func__,
-                cparams.n_seq_max, llama_n_ctx(ctx_tgt));
+        const uint32_t unsealed = (uint32_t) std::max(0, llama_sj_kvarn_seq_unsealed_max(ctx_tgt));
+        const uint32_t n_ctx_draft = GGML_PAD(llama_n_ctx(ctx_tgt) + cparams.n_seq_max*unsealed, 256);
+        LOG_INF("%s: SJ-KVaRN shared pool: unified draft KV cache of %u cells (n_ctx %u + %u slots x %u sink + ring rows)\n",
+                __func__, n_ctx_draft, llama_n_ctx(ctx_tgt), cparams.n_seq_max, unsealed);
+        cparams.n_ctx = n_ctx_draft;
     }
 
     // params comes from common_base_params_to_speculative: cache_type_k/v hold the resolved types,

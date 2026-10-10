@@ -896,6 +896,10 @@ extern "C" {
     // llama_sj_kvarn_seq_sealed_end for one sequence.
     LLAMA_API int32_t llama_sj_kvarn_sealed_end(struct llama_context * ctx);
 
+    // Unsealed positions one SJ-KVaRN sequence can hold beside the record pool (sink + ring rows), or -1 if this
+    // cache is not SJ-KVaRN. Under --kv-unified all sequences together hold at most n_ctx + n_seq * this.
+    LLAMA_API int32_t llama_sj_kvarn_seq_unsealed_max(struct llama_context * ctx);
+
     // Exclusive end of the sealed SJ-KVaRN body of one sequence, or -1 (not SJ-KVaRN, or seq_id out of range).
     LLAMA_API int32_t llama_sj_kvarn_seq_sealed_end(struct llama_context * ctx, llama_seq_id seq_id);
 
