@@ -1812,6 +1812,24 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 
         const auto & cells = v_cells[seq_to_stream[seq_id]];
 
+        if (sj_kvarn.enabled()) {
+            // SJ-KVaRN: ring rows and sealed records are addressed by position, so a cell sits at its position and a
+            // sequence only grows at its end. A ubatch that does not continue its sequence (for example tokens of a
+            // slot the server purged after building the batch) cannot be placed: fail the slot search (decode
+            // returns 1) instead of reaching the cell == position assert in apply_ubatch.
+            const llama_pos p_next = cells.seq_pos_max(seq_id) + 1; // 0 for an empty sequence
+            for (uint32_t ii = 0; ii < n_tokens; ++ii) {
+                const llama_pos pos = ubatch.pos[s*n_tokens + ii];
+                if (pos != p_next + (llama_pos) ii || pos < 0 || (uint32_t) pos >= cells.size() || !cells.is_empty(pos)) {
+                    LLAMA_LOG_WARN("%s: SJ-KVaRN cache: sequence %d: ubatch position %d does not continue the sequence (next %d)\n",
+                            __func__, seq_id, pos, p_next + (llama_pos) ii);
+                    return { };
+                }
+                res.idxs[s].push_back((uint32_t) pos);
+            }
+            continue;
+        }
+
         uint32_t head_cur = v_heads[seq_to_stream[seq_id]];
 
         // if we have enough unused cells before the current head ->
