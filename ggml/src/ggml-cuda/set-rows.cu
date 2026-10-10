@@ -1656,15 +1656,22 @@ static void set_rows_cuda_tq5(
 }
 
 template<typename src_t, typename idx_t>
-static __global__ void k_set_rows_f16_sink(const src_t * src, const idx_t * idx, half * sink,
-        int64_t width, int64_t count, size_t src_stride, size_t idx_stride, int sink_rows) {
+static __global__ void k_set_rows_f16_sink(const src_t * src, const idx_t * idx, char * sink,
+        int64_t width, int64_t count, size_t src_stride, size_t idx_stride, int sink_rows,
+        int64_t rows_per_stream, size_t stream_bytes) {
     const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
     if (i >= width*count) { return; }
     const int64_t row = i/width, col = i%width;
-    const int64_t dest = *(const idx_t *) ((const char *) idx + row*idx_stride);
+    int64_t dest = *(const idx_t *) ((const char *) idx + row*idx_stride);
+    char * base = sink;
+    if (rows_per_stream > 0 && dest >= 0) { // multi-stream cache: rows are stream*rows_per_stream + row, one sink per stream
+        const int64_t s = dest/rows_per_stream;
+        dest -= s*rows_per_stream;
+        base += s*stream_bytes;
+    }
     if (dest >= 0 && dest < sink_rows) {
         const src_t * in = (const src_t *) ((const char *) src + row*src_stride);
-        sink[dest*width + col] = __float2half((float) in[col]);
+        ((half *) base)[dest*width + col] = __float2half((float) in[col]);
     }
 }
 
@@ -1688,8 +1695,10 @@ static void set_rows_cuda(
         GGML_ASSERT(ne02 == 1 && ne03 == 1);
         const size_t offset = (size_t) ggml_get_op_params_i32(dst, 3)*nb1;
         GGML_ASSERT(offset + (size_t) sink_rows*ne00*sizeof(half) <= ggml_nbytes(dst));
+        const int64_t rows_per_stream = ggml_get_op_params_i32(dst, 4); // 0: single stream
+        GGML_ASSERT(rows_per_stream == 0 || (offset + (size_t) sink_rows*ne00*sizeof(half) <= (size_t) rows_per_stream*nb1 && (rows_per_stream*nb1) % sizeof(half) == 0));
         k_set_rows_f16_sink<src_t, idx_t><<<(ne00*ne01 + 255)/256, 256, 0, stream>>>(
-            src0_d, src1_d, (half *) ((char *) dst->data + offset), ne00, ne01, nb01, nb10, sink_rows);
+            src0_d, src1_d, (char *) dst->data + offset, ne00, ne01, nb01, nb10, sink_rows, rows_per_stream, (size_t) rows_per_stream*nb1);
     }
 
     if (dst->type == GGML_TYPE_F32) {

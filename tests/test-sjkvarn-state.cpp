@@ -76,7 +76,9 @@ static llama_model * make_model() {
     }
     llama_model_params mp = llama_model_default_params();
     ggml_backend_dev_t no_devices[] = { nullptr };
-    mp.devices = no_devices; // CPU only, also in a CUDA build
+    if (!getenv("SJ_TEST_GPU")) {
+        mp.devices = no_devices; // CPU only, also in a CUDA build (SJ_TEST_GPU=1: default devices, all layers offloaded)
+    }
     llama_model * model = llama_model_init_from_user(meta, tensor_data, nullptr, mp);
     gguf_free(meta);
     return model;
@@ -94,14 +96,16 @@ struct sj_cfg {
     bool      plain = false;        // plain f16 cache (no SJ-KVaRN)
 };
 
-static llama_context * make_ctx(llama_model * model, const sj_cfg & c) {
+static llama_context * make_ctx(llama_model * model, const sj_cfg & c, uint32_t n_seq = 1, bool unified = false) {
     llama_context_params cp = llama_context_default_params();
-    cp.n_ctx = 4096;
+    // several sequences: every sequence gets the same 4096-position stream a single-sequence context has
+    cp.n_ctx = unified ? 4096 : 4096*n_seq;
+    cp.kv_unified = unified;
     cp.n_batch = 128;
     cp.n_ubatch = 128;
     cp.n_threads = 4;
     cp.n_threads_batch = 4;
-    cp.n_seq_max = 1;
+    cp.n_seq_max = n_seq;
     cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
     if (!c.plain) {
         cp.sj_kvarn_bits_k = c.bits_k;
@@ -124,7 +128,7 @@ static llama_context * make_ctx(llama_model * model, const sj_cfg & c) {
 static llama_token token_at(llama_pos p, int salt) { return (llama_token) ((p*37 + salt*11 + 5) % n_vocab); }
 
 // decode [from, to) in chunks of `width`; returns the logits of the last position
-static std::vector<float> decode(llama_context * ctx, llama_pos from, llama_pos to, int width, int salt = 0) {
+static std::vector<float> decode(llama_context * ctx, llama_pos from, llama_pos to, int width, int salt = 0, llama_seq_id seq = 0) {
     std::vector<float> last;
     for (llama_pos p = from; p < to;) {
         const int n = std::min<int>(width, to - p);
@@ -134,7 +138,7 @@ static std::vector<float> decode(llama_context * ctx, llama_pos from, llama_pos 
             batch.token[j] = token_at(p + j, salt);
             batch.pos[j] = p + j;
             batch.n_seq_id[j] = 1;
-            batch.seq_id[j][0] = 0;
+            batch.seq_id[j][0] = seq;
             batch.logits[j] = j + 1 == n;
         }
         const int rc = llama_decode(ctx, batch);
@@ -157,12 +161,17 @@ static llama_kv_cache * cache_of(llama_context * ctx) {
 static std::vector<int32_t> descriptor(llama_kv_cache * cache, llama_pos next_pos) {
     ggml_init_params ip = { 4*ggml_tensor_overhead(), nullptr, true };
     ggml_context * ctx = ggml_init(ip);
-    ggml_tensor * desc = cache->build_input_sj_kvarn_desc(ctx);
-    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_cpu_buffer_type());
-    require(buffer != nullptr, "allocate descriptor");
     llama_ubatch ubatch = {};
     ubatch.pos = &next_pos;
-    cache->set_input_sj_kvarn_desc(desc, &ubatch);
+    ubatch.n_seqs_unq = 1;
+    ggml_tensor * desc = cache->build_input_sj_kvarn_desc(ctx, ubatch);
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_cpu_buffer_type());
+    require(buffer != nullptr, "allocate descriptor");
+    llama_kv_cache::slot_info sinfo;
+    sinfo.s0 = sinfo.s1 = 0;
+    sinfo.strm  = { 0 };
+    sinfo.idxs  = { { 0 } };
+    cache->set_input_sj_kvarn_desc(desc, &ubatch, sinfo);
     std::vector<int32_t> result(GGML_SJKVARN_DESC_N_ENTRIES);
     ggml_backend_tensor_get(desc, result.data(), 0, result.size()*sizeof(int32_t));
     ggml_backend_buffer_free(buffer);
@@ -196,6 +205,9 @@ static live_cache snapshot(llama_context * ctx) {
     ggml_init_params ip = { 16*ggml_tensor_overhead(), nullptr, true };
     ggml_context * gctx = ggml_init(ip);
     llama_kv_cache::slot_info si;
+    si.s0 = si.s1 = 0;
+    si.strm = { 0 };
+    si.idxs = { { 0 } };
     for (uint32_t il = 0; il < n_layer; ++il) {
         const ggml_tensor * k = kv->get_k(gctx, il, 0, si)->view_src;
         const ggml_tensor * v = kv->get_v(gctx, il, 0, si)->view_src;
@@ -456,6 +468,195 @@ static int run_case(llama_model * model, const sj_cfg & c, const std::vector<sj_
     return result;
 }
 
+// one span of a sequence decoded inside a mixed batch
+struct span { llama_seq_id seq; llama_pos from, to; int salt; };
+
+// decode several sequences together: every batch takes up to `width` positions of every span (mixed ubatches);
+// returns each span's logits at its last position
+// mixed = false: the same rounds, but every span in its own llama_decode (no batch mixing)
+static std::vector<std::vector<float>> decode_mixed(llama_context * ctx, std::vector<span> spans, int width, bool mixed = true) {
+    std::vector<std::vector<float>> last(spans.size());
+    if (!mixed) {
+        for (bool any = true; any;) {
+            any = false;
+            for (size_t i = 0; i < spans.size(); ++i) {
+                auto & sp = spans[i];
+                const int m = std::min<int>(width, sp.to - sp.from);
+                if (m > 0) {
+                    last[i] = decode(ctx, sp.from, sp.from + m, m, sp.salt, sp.seq);
+                    sp.from += m;
+                    any = true;
+                }
+            }
+        }
+        return last;
+    }
+    for (;;) {
+        llama_batch batch = llama_batch_init(width*(int) spans.size(), 0, 1);
+        std::vector<int> out(spans.size(), -1);
+        int n = 0;
+        for (size_t i = 0; i < spans.size(); ++i) {
+            auto & sp = spans[i];
+            const int m = std::min<int>(width, sp.to - sp.from);
+            for (int j = 0; j < m; ++j) {
+                batch.token[n] = token_at(sp.from + j, sp.salt);
+                batch.pos[n] = sp.from + j;
+                batch.n_seq_id[n] = 1;
+                batch.seq_id[n][0] = sp.seq;
+                batch.logits[n] = j + 1 == m;
+                if (j + 1 == m) { out[i] = n; }
+                ++n;
+            }
+            sp.from += m;
+        }
+        batch.n_tokens = n;
+        if (n == 0) { llama_batch_free(batch); break; }
+        const int rc = llama_decode(ctx, batch);
+        llama_batch_free(batch);
+        require(rc == 0, "mixed decode");
+        for (size_t i = 0; i < spans.size(); ++i) {
+            if (out[i] >= 0) {
+                const float * l = llama_get_logits_ith(ctx, out[i]);
+                require(l != nullptr, "mixed logits present");
+                last[i].assign(l, l + n_vocab);
+            }
+        }
+    }
+    return last;
+}
+
+static std::vector<uint8_t> seq_state_of(llama_context * ctx, llama_seq_id seq) {
+    const size_t n = llama_state_seq_get_size_ext(ctx, seq, 0);
+    require(n > 0, "llama_state_seq_get_size > 0");
+    std::vector<uint8_t> buf(n);
+    require(llama_state_seq_get_data_ext(ctx, buf.data(), n, seq, 0) == n, "llama_state_seq_get_data");
+    return buf;
+}
+
+static float max_diff(const std::vector<float> & a, const std::vector<float> & b) {
+    float m = a.size() == b.size() ? 0.0f : 1e30f;
+    for (size_t i = 0; i < std::min(a.size(), b.size()); ++i) { m = std::max(m, std::fabs(a[i] - b[i])); }
+    return m;
+}
+
+
+// control for the mixed-ubatch tolerance: the same mixed-vs-alone comparison on a plain f16 cache (no SJ-KVaRN)
+static void plain_mixed_control(llama_model * model) {
+    sj_cfg pc = { "plain f16", 0, 0, GGML_TYPE_F32 };
+    pc.plain = true;
+    llama_context * mx = make_ctx(model, pc, 2, false);
+    llama_context * r1 = make_ctx(model, pc);
+    const auto rm = decode_mixed(mx, { { 0, 0, 704, 0 }, { 1, 0, 704, 3 } }, 64);
+    const auto a = decode(r1, 0, 704, 64, 3);
+    printf("control: plain f16 cache, mixed ubatch vs alone: max|d| = %g\n", max_diff(rm[1], a));
+    llama_free(mx); llama_free(r1);
+}
+
+// Several sequences, one stream each (paged record pool; `unified` = --kv-unified shared pool). Every sequence must
+// give the logits a single-sequence context gives for the same tokens, through mixed ubatches, seals, a truncation
+// into the sealed body, a per-sequence state save/restore into another sequence's stream, and seq_cp.
+static int run_multi(llama_model * model, const sj_cfg & c, bool unified) {
+    const std::string name = std::string(c.name) + (unified ? " x2 unified" : " x2");
+    llama_context * ref0 = make_ctx(model, c);
+    llama_context * ref1 = make_ctx(model, c);
+    llama_context * mc   = make_ctx(model, c, 2, unified);
+    llama_context * mc2  = make_ctx(model, c, 2, unified);
+    int result = 0;
+    try {
+        require(ref0 && ref1 && mc && mc2, "contexts");
+        require(cache_of(mc)->is_sj_kvarn() && cache_of(mc)->get_n_stream() == 2, "two SJ-KVaRN streams");
+        const uint32_t S = 128;
+        auto * m_ref0 = llama_get_memory(ref0);
+        auto * m_mc   = llama_get_memory(mc);
+
+        // Mixed ubatches change the shapes of the non-attention matmuls, whose CPU results are not batch-invariant
+        // (~1e-7 differences at the first layer, with or without SJ-KVaRN), so a mixed batch is checked to a
+        // tolerance in a separate context, and the exact checks interleave the sequences one decode call each.
+        {
+            llama_context * mx = make_ctx(model, c, 2, unified);
+            llama_context * r1 = make_ctx(model, c);
+            require(mx && r1, "contexts");
+            const auto rm = decode_mixed(mx, { { 0, 0, 1536, 0 }, { 1, 0, 704, 3 } }, 64);
+            const float d = max_diff(rm[1], decode(r1, 0, 704, 64, 3));
+            require(d < 1e-3f, "mixed prefill within 1e-3 of the single sequence (max|d| " + std::to_string(d) + ")");
+            // mixed multi-token ubatches with different lengths per stream (each FA node cuts the mask to its
+            // stream's own n_kv: the per-stream mask view is not contiguous and is copied)
+            const auto ru = decode_mixed(mx, { { 0, 1536, 1792, 0 }, { 1, 704, 960, 3 } }, 64);
+            const float du = max_diff(ru[1], decode(r1, 704, 960, 64, 3));
+            llama_free(mx); llama_free(r1);
+            printf("%-18s mixed ubatch vs alone: max|d| = %g (equal lengths), %g (unequal lengths)\n", name.c_str(), d, du);
+            require(du < 1e-3f, "mixed unequal-length chunks within 1e-3 (max|d| " + std::to_string(du) + ")");
+        }
+        // prefill both sequences, seq 1 shorter (span lengths are multiples of the chunk: same ubatch boundaries)
+        auto r = decode_mixed(mc, { { 0, 0, 1536, 0 }, { 1, 0, 704, 3 } }, 64, false);
+        require(same_logits(r[0], decode(ref0, 0, 1536, 64, 0)), "seq 0 prefill logits = single sequence");
+        require(same_logits(r[1], decode(ref1, 0, 704, 64, 3)), "seq 1 prefill logits = single sequence");
+        // interleaved single-token steps: the adaptive tail flushes per stream at different times
+        uint32_t flush0 = 0, flush1 = 0;
+        uint32_t b0 = llama_sj_kvarn_seq_sealed_end(mc, 0), b1 = llama_sj_kvarn_seq_sealed_end(mc, 1);
+        for (llama_pos k = 0; k < 600; ++k) {
+            r = decode_mixed(mc, { { 0, 1536 + k, 1537 + k, 0 }, { 1, 704 + k, 705 + k, 3 } }, 1, false);
+            require(same_logits(r[0], decode(ref0, 1536 + k, 1537 + k, 1, 0)), "seq 0 step " + std::to_string(k));
+            require(same_logits(r[1], decode(ref1, 704 + k, 705 + k, 1, 3)), "seq 1 step " + std::to_string(k));
+            require(llama_sj_kvarn_seq_sealed_end(mc, 0) == llama_sj_kvarn_sealed_end(ref0), "seq 0 sealed end = single");
+            require(llama_sj_kvarn_seq_sealed_end(mc, 1) == llama_sj_kvarn_sealed_end(ref1), "seq 1 sealed end = single");
+            if ((uint32_t) llama_sj_kvarn_seq_sealed_end(mc, 0) != b0) { ++flush0; b0 = llama_sj_kvarn_seq_sealed_end(mc, 0); }
+            if ((uint32_t) llama_sj_kvarn_seq_sealed_end(mc, 1) != b1) { ++flush1; b1 = llama_sj_kvarn_seq_sealed_end(mc, 1); }
+        }
+        require(flush0 > 0 && flush1 > 0, "both streams flushed");
+        llama_pos n0 = 2136;
+        const llama_pos n1 = 1304;
+
+        // truncate seq 0 into its sealed body (reopen) on both, seq 1 untouched; re-prefill and continue
+        const llama_pos cut = llama_sj_kvarn_rm_floor(ref0, 0, b0 - 50);
+        require(llama_sj_kvarn_rm_floor(mc, 0, b0 - 50) == cut, "same rm floor");
+        require(llama_memory_seq_rm(m_ref0, 0, cut, -1) && llama_memory_seq_rm(m_mc, 0, cut, -1), "truncate into the body on both");
+        require(llama_sj_kvarn_seq_sealed_end(mc, 0) == llama_sj_kvarn_sealed_end(ref0), "same sealed end after the truncation");
+        require(llama_sj_kvarn_seq_sealed_end(mc, 1) == (int32_t) b1, "seq 1 sealed end untouched by the truncation");
+        require(same_logits(decode(mc, cut, n0, 128, 5, 0), decode(ref0, cut, n0, 128, 5)), "seq 0 re-prefill after the truncation");
+        require(same_logits(decode(mc, n1, n1 + 1, 1, 3, 1), decode(ref1, n1, n1 + 1, 1, 3)), "seq 1 step after the re-prefill");
+
+        // per-sequence state: save seq 0, restore it into seq 1 of another two-stream context that holds other data
+        const auto blob = seq_state_of(mc, 0);
+        decode_mixed(mc2, { { 0, 0, 900, 9 }, { 1, 0, 1700, 11 } }, 64); // mixed: content only
+        require(llama_state_seq_set_data(mc2, blob.data(), blob.size(), 1) == blob.size(), "restore seq 0's state into seq 1");
+        // (the per-cell meta carries the sequence id, 0 in the blob and 1 here, so compare the sizes only)
+        require(seq_state_of(mc2, 1).size() == blob.size(), "re-saved state the same size");
+        require(llama_sj_kvarn_seq_sealed_end(mc2, 1) == llama_sj_kvarn_seq_sealed_end(mc, 0), "restored sealed end");
+        for (llama_pos k = 0; k < 300; ++k) {
+            r = decode_mixed(mc2, { { 1, n0 + k, n0 + k + 1, 5 }, { 0, 900 + k, 901 + k, 9 } }, 1, false);
+            const auto a = decode(ref0, n0 + k, n0 + k + 1, 1, 5);
+            require(same_logits(r[0], a), "restored sequence step " + std::to_string(k));
+        }
+
+        // seq_cp: seq 1 of mc2 (the restored one) into seq 0; both continue like the single sequence
+        n0 += 300;
+        llama_memory_seq_rm(llama_get_memory(mc2), 0, -1, -1);
+        llama_memory_seq_cp(llama_get_memory(mc2), 1, 0, -1, -1);
+        const auto c1 = decode(mc2, n0, n0 + 1, 1, 5, 1);
+        const auto c0 = decode(mc2, n0, n0 + 200, 128, 13, 0);
+        llama_context * ref2 = make_ctx(model, c);
+        require(ref2 != nullptr, "context");
+        {
+            const auto rb = seq_state_of(ref0, 0);
+            require(llama_state_seq_set_data(ref2, rb.data(), rb.size(), 0) == rb.size(), "single restore");
+        }
+        const bool cp0 = same_logits(c0, decode(ref2, n0, n0 + 200, 128, 13));
+        const bool cp1 = same_logits(c1, decode(ref0, n0, n0 + 1, 1, 5));
+        llama_free(ref2);
+        require(cp0, "seq_cp copy continues like the single sequence");
+        require(cp1, "seq_cp source continues like the single sequence");
+        printf("%-18s OK: interleaved prefill/steps identical (mixed within 1e-3), %u/%u flushes, truncation at %d, cross-stream restore, seq_cp\n",
+               name.c_str(), flush0, flush1, cut);
+        GGML_UNUSED(S);
+    } catch (const std::exception & e) {
+        fprintf(stderr, "%-18s FAIL: %s\n", name.c_str(), e.what());
+        result = 1;
+    }
+    for (auto * x : { ref0, ref1, mc, mc2 }) { if (x) llama_free(x); }
+    return result;
+}
+
 int main(int argc, char ** argv) {
     const char * tmp_dir = argc > 1 ? argv[1] : (getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
     ggml_backend_load_all();
@@ -498,10 +699,19 @@ int main(int argc, char ** argv) {
         { fixed, { s44 } },
     };
     int fails = 0;
+    const bool multi_only = getenv("SJ_TEST_MULTI_ONLY") != nullptr; // debugging: only the multi-sequence checks
     for (const auto & c : cases) {
+        if (multi_only) { break; }
         fails += run_case(model, c.first, c.second, tmp_dir);
     }
-    printf("%s: %d/%zu cases passed\n", fails ? "FAIL" : "OK", (int) (cases.size() - fails), cases.size());
+    if (!multi_only) { plain_mixed_control(model); }
+    int fails_multi = 0;
+    for (const auto & c : { s44, s33t, s32t }) {
+        fails_multi += run_multi(model, c, false);
+    }
+    fails_multi += run_multi(model, s44, true);
+    printf("%s: %d/%zu cases passed, multi-sequence %d/4\n", fails || fails_multi ? "FAIL" : "OK", (int) (cases.size() - fails), cases.size(), 4 - fails_multi);
+    fails += fails_multi;
     llama_model_free(model);
     llama_backend_free();
     return fails ? 1 : 0;

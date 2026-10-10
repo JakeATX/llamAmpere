@@ -9964,8 +9964,16 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
     // 1 = the fused node vs the CPU reference, 2 = fused minus the unfused WHT -> FA -> WHT graph on the same backend
     // (must be exactly 0: the fused paths are bit-identical to the separate rotations)
     const int rot;
+    // [SJMULTI] ns > 0: multi-sequence cache with ns streams over one paged record pool (desc TABLE = 1), built like
+    // llama-graph: one FA node per stream on k/v/q/mask/desc-row views, joined with ggml_concat on dim 3.
+    // Stream s sees n_ring - 37*s ring positions; logical groups map to shuffled pool records.
+    const int ns;
     static constexpr int64_t D = 256, G = 128;
     const int64_t cap;
+    int64_t n_streams() const { return ns > 0 ? ns : 1; }
+    int64_t n_rec_pool() const { return ns > 0 ? ns*n_groups + 2 : n_groups; }
+    int64_t desc_n() const { return GGML_SJKVARN_DESC_N_ENTRIES + (ns > 0 ? n_groups : 0); }
+    int64_t N_s(int64_t s) const { return B() + n_ring - 37*s; }
 
     int64_t B()        const { return S + n_groups*G; }
     int64_t N()        const { return B() + n_ring; }
@@ -9980,6 +9988,9 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
         }
         if (rot != 0) {
             result += ",rot=" + std::to_string(rot);
+        }
+        if (ns != 0) {
+            result += ",ns=" + std::to_string(ns);
         }
         return result;
     }
@@ -10001,17 +10012,21 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
         if (rot == 2) {
             return "FLASH_ATTN_EXT_SJKVARN_ROT_EXACT";
         }
-        return body_type == GGML_TYPE_I16 ? "FLASH_ATTN_EXT_SJKVARN_TRELLIS" : ggml_op_desc(t);
+        if (body_type == GGML_TYPE_I16) {
+            return "FLASH_ATTN_EXT_SJKVARN_TRELLIS";
+        }
+        return ns > 1 ? "FLASH_ATTN_EXT" : ggml_op_desc(t); // ns > 1: the output node is the CONCAT of the per-stream FA nodes
     }
 
     double max_nmse_err() override {
         return rot == 2 ? 0.0 : 5e-4;
     }
 
-    test_flash_attn_ext_sj_kvarn(int64_t n_q = 1, int64_t nh = 16, int64_t hkv = 2, int64_t n_groups = 3, int64_t n_ring = 300, bool row_mask = false, bool attn_options = false, ggml_type staging_type = GGML_TYPE_F16, int64_t S = 128, bool f16_sink = false, ggml_type body_type = GGML_TYPE_F32, int bits_k = 4, int bits_v = 4, int rot = 0)
-        : n_q(n_q), nh(nh), hkv(hkv), n_groups(n_groups), n_ring(n_ring), row_mask(row_mask), attn_options(attn_options), staging_type(staging_type), body_type(body_type), bits_k(bits_k), bits_v(bits_v), S(S), f16_sink(f16_sink), rot(rot),
+    test_flash_attn_ext_sj_kvarn(int64_t n_q = 1, int64_t nh = 16, int64_t hkv = 2, int64_t n_groups = 3, int64_t n_ring = 300, bool row_mask = false, bool attn_options = false, ggml_type staging_type = GGML_TYPE_F16, int64_t S = 128, bool f16_sink = false, ggml_type body_type = GGML_TYPE_F32, int bits_k = 4, int bits_v = 4, int rot = 0, int ns = 0)
+        : n_q(n_q), nh(nh), hkv(hkv), n_groups(n_groups), n_ring(n_ring), row_mask(row_mask), attn_options(attn_options), staging_type(staging_type), body_type(body_type), bits_k(bits_k), bits_v(bits_v), S(S), f16_sink(f16_sink), rot(rot), ns(ns),
           cap(std::max<int64_t>(1280, ((n_ring + G - 1)/G)*G)) {
-        GGML_ASSERT(n_ring <= cap && n_ring >= n_q);
+        GGML_ASSERT(n_ring <= cap && n_ring - 37*(n_streams() - 1) >= n_q);
+        GGML_ASSERT(ns == 0 || rot == 0);
     }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
@@ -10022,28 +10037,28 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
             ggml_set_name(q_rows, "q");
             q = ggml_permute(ctx, q_rows, 0, 2, 1, 3);
         } else {
-            q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, n_q, nh, 1);
+            q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, n_q, nh, n_streams());
             ggml_set_name(q, "q");
         }
         auto make_ring = [&](const char * name) {
-            if (!f16_sink) { return ggml_new_tensor_4d(ctx, staging_type, D, S + cap, hkv, 1); }
+            if (!f16_sink && ns == 0) { return ggml_new_tensor_4d(ctx, staging_type, D, S + cap, hkv, 1); }
             const size_t row_bytes = ggml_row_size(staging_type, D*hkv);
-            const int64_t rows = S + cap + (S*D*hkv*2 + row_bytes - 1)/row_bytes;
-            auto * storage = ggml_new_tensor_2d(ctx, staging_type, D*hkv, rows);
+            const int64_t rows = S + cap + (f16_sink ? (S*D*hkv*2 + row_bytes - 1)/row_bytes : 0);
+            auto * storage = ggml_new_tensor_2d(ctx, staging_type, D*hkv, rows*n_streams());
             ggml_set_name(storage, name);
-            return ggml_view_4d(ctx, storage, D, rows, hkv, 1, row_bytes,
-                    ggml_row_size(staging_type, D), ggml_nbytes(storage), 0);
+            return ggml_view_4d(ctx, storage, D, rows, hkv, n_streams(), row_bytes,
+                    ggml_row_size(staging_type, D), rows*row_bytes, 0);
         };
         ggml_tensor * k = make_ring("k_mixed_storage");
         ggml_set_name(k, "k");
         ggml_tensor * v = make_ring("v_mixed_storage");
         ggml_set_name(v, "v");
-        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv_pad(), n_q, 1, 1);
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv_pad(), n_q, 1, n_streams());
         ggml_set_name(m, "m");
-        ggml_tensor * body = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, rec_bytes()*hkv*n_groups);
+        ggml_tensor * body = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, rec_bytes()*hkv*n_rec_pool());
         body->op_params[7] = body_type;
         ggml_set_name(body, "body");
-        ggml_tensor * desc = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, GGML_SJKVARN_DESC_N_ENTRIES);
+        ggml_tensor * desc = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, desc_n(), n_streams());
         ggml_set_name(desc, "desc");
 
         ggml_tensor * sinks = nullptr;
@@ -10058,7 +10073,24 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
             ggml_prec_set_acc(o, GGML_PREC_F32);
             return o;
         };
-        ggml_tensor * out = fa(q);
+        ggml_tensor * out = nullptr;
+        if (ns > 0) {
+            // per-stream nodes over views, exactly as llm_graph_context::build_attn_mha splits a multi-stream cache
+            for (int64_t s = 0; s < ns; ++s) {
+                ggml_tensor * qs = ggml_view_4d(ctx, q, q->ne[0], q->ne[1], q->ne[2], 1, q->nb[1], q->nb[2], q->nb[3], s*q->nb[3]);
+                ggml_tensor * ks = ggml_view_4d(ctx, k, k->ne[0], k->ne[1], k->ne[2], 1, k->nb[1], k->nb[2], k->nb[3], s*k->nb[3]);
+                ggml_tensor * vs = ggml_view_4d(ctx, v, v->ne[0], v->ne[1], v->ne[2], 1, v->nb[1], v->nb[2], v->nb[3], s*v->nb[3]);
+                ggml_tensor * ms = ggml_view_4d(ctx, m, m->ne[0], m->ne[1], 1, 1, m->nb[1], m->nb[2], m->nb[3], s*m->nb[3]);
+                ggml_tensor * ds = ggml_view_1d(ctx, desc, desc_n(), s*desc->nb[1]);
+                ggml_tensor * o = ggml_flash_attn_ext(ctx, qs, ks, vs, ms, 1.0f/sqrtf((float) D), 0.0f, attn_options ? 2.0f : 0.0f);
+                ggml_flash_attn_ext_add_sinks(o, sinks);
+                ggml_flash_attn_ext_set_sj_kvarn(o, body, ds, bits_k, bits_v, (int32_t) n_kv_pad());
+                ggml_prec_set_acc(o, GGML_PREC_F32);
+                out = out ? ggml_concat(ctx, out, o, 3) : o;
+            }
+        } else {
+            out = fa(q);
+        }
         if (rot != 0) {
             ggml_flash_attn_ext_set_sj_kvarn_rot(out, 256);
         }
@@ -10076,38 +10108,61 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
         std::mt19937 rng(1234);
         auto uni = [&](float lo, float hi) { return lo + (hi - lo) * (float) (rng() / 4294967296.0); };
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src != nullptr) {
+                continue; // per-stream q/k/v/mask/desc views (ns > 0), the ring views, the permuted q: their storage is set below
+            }
             if (strcmp(t->name, "m") == 0) {
-                std::vector<ggml_fp16_t> mask((size_t) n_kv_pad() * n_q);
-                for (int64_t j = 0; j < n_q; ++j) {
-                    const int64_t pos = qpos0() + j;
-                    for (int64_t p = 0; p < n_kv_pad(); ++p) {
-                        float value = p <= pos && p < N() ? 0.0f : -INFINITY;
-                        if (row_mask && p >= S && p < B()) {
-                            value = (p / 16 + j) % 3 == 0 ? -INFINITY : -0.25f * (float) ((p + 3*j) % 11);
+                std::vector<ggml_fp16_t> mask((size_t) n_kv_pad() * n_q * n_streams());
+                for (int64_t s = 0; s < n_streams(); ++s) {
+                    const int64_t Ns = ns > 0 ? N_s(s) : N();
+                    for (int64_t j = 0; j < n_q; ++j) {
+                        const int64_t pos = Ns - n_q + j;
+                        for (int64_t p = 0; p < n_kv_pad(); ++p) {
+                            float value = p <= pos && p < Ns ? 0.0f : -INFINITY;
+                            if (row_mask && p >= S && p < B()) {
+                                value = (p / 16 + j + s) % 3 == 0 ? -INFINITY : -0.25f * (float) ((p + 3*j) % 11);
+                            }
+                            mask[(s*n_q + j)*n_kv_pad() + p] = ggml_fp32_to_fp16(value);
                         }
-                        mask[j*n_kv_pad() + p] = ggml_fp32_to_fp16(value);
                     }
                 }
                 ggml_backend_tensor_set(t, mask.data(), 0, mask.size()*sizeof(ggml_fp16_t));
             } else if (strcmp(t->name, "desc") == 0) {
-                std::vector<int32_t> d(GGML_SJKVARN_DESC_N_ENTRIES, 0);
-                d[GGML_SJKVARN_DESC_S] = S; d[GGML_SJKVARN_DESC_CAP] = cap; d[GGML_SJKVARN_DESC_B] = B(); d[GGML_SJKVARN_DESC_N] = N();
-                d[GGML_SJKVARN_DESC_QPOS0] = qpos0(); d[GGML_SJKVARN_DESC_G] = G; d[GGML_SJKVARN_DESC_D] = D;
-                d[GGML_SJKVARN_DESC_RECBYTES] = rec_bytes(); d[GGML_SJKVARN_DESC_HKV] = hkv;
-                d[GGML_SJKVARN_DESC_BODY_TYPE] = body_type;
-                d[GGML_SJKVARN_DESC_TYPE_K] = staging_type;
-                d[GGML_SJKVARN_DESC_TYPE_V] = staging_type;
-                d[GGML_SJKVARN_DESC_SINK_TYPE] = f16_sink ? GGML_TYPE_F16 : 0;
-                ggml_backend_tensor_set(t, d.data(), 0, d.size()*sizeof(int32_t));
+                // pool records handed out in a scrambled order: stream s group g -> record perm[s*n_groups + g]
+                std::vector<int32_t> perm(n_rec_pool());
+                for (size_t i = 0; i < perm.size(); ++i) perm[i] = (int32_t) i;
+                std::shuffle(perm.begin(), perm.end(), std::mt19937(77));
+                std::vector<int32_t> dd((size_t) desc_n()*n_streams(), 0);
+                for (int64_t s = 0; s < n_streams(); ++s) {
+                    int32_t * d = dd.data() + s*desc_n();
+                    const int64_t Ns = ns > 0 ? N_s(s) : N();
+                    d[GGML_SJKVARN_DESC_S] = S; d[GGML_SJKVARN_DESC_CAP] = cap; d[GGML_SJKVARN_DESC_B] = B(); d[GGML_SJKVARN_DESC_N] = Ns;
+                    d[GGML_SJKVARN_DESC_QPOS0] = Ns - n_q; d[GGML_SJKVARN_DESC_G] = G; d[GGML_SJKVARN_DESC_D] = D;
+                    d[GGML_SJKVARN_DESC_RECBYTES] = rec_bytes(); d[GGML_SJKVARN_DESC_HKV] = hkv;
+                    d[GGML_SJKVARN_DESC_BODY_TYPE] = body_type;
+                    d[GGML_SJKVARN_DESC_TYPE_K] = staging_type;
+                    d[GGML_SJKVARN_DESC_TYPE_V] = staging_type;
+                    d[GGML_SJKVARN_DESC_SINK_TYPE] = f16_sink ? GGML_TYPE_F16 : 0;
+                    if (ns > 0) {
+                        d[GGML_SJKVARN_DESC_TABLE] = 1;
+                        for (int64_t g = 0; g < n_groups; ++g) d[GGML_SJKVARN_DESC_N_ENTRIES + g] = perm[s*n_groups + g];
+                    }
+                }
+                ggml_backend_tensor_set(t, dd.data(), 0, dd.size()*sizeof(int32_t));
             } else if (strcmp(t->name, "k_mixed_storage") == 0 || strcmp(t->name, "v_mixed_storage") == 0) {
                 std::vector<float> values(ggml_nelements(t));
                 for (auto & value : values) { value = uni(-1.0f, 1.0f); }
                 std::vector<uint8_t> bytes(ggml_nbytes(t));
                 ggml_quantize_chunk(staging_type, values.data(), bytes.data(), 0, t->ne[1], t->ne[0], nullptr);
-                auto * sink = (ggml_fp16_t *) (bytes.data() + (S + cap)*t->nb[1]);
-                for (int64_t i = 0; i < S*D*hkv; ++i) { sink[i] = ggml_fp32_to_fp16(uni(-1.0f, 1.0f)); }
+                if (f16_sink) {
+                    const int64_t rows = t->ne[1] / n_streams();
+                    for (int64_t s = 0; s < n_streams(); ++s) {
+                        auto * sink = (ggml_fp16_t *) (bytes.data() + (s*rows + S + cap)*t->nb[1]);
+                        for (int64_t i = 0; i < S*D*hkv; ++i) { sink[i] = ggml_fp32_to_fp16(uni(-1.0f, 1.0f)); }
+                    }
+                }
                 ggml_backend_tensor_set(t, bytes.data(), 0, bytes.size());
-            } else if (f16_sink && (strcmp(t->name, "k") == 0 || strcmp(t->name, "v") == 0)) {
+            } else if ((f16_sink || ns > 0) && (strcmp(t->name, "k") == 0 || strcmp(t->name, "v") == 0)) {
                 continue;
             } else if (strcmp(t->name, "body") == 0) {
                 if (body_type == GGML_TYPE_TURBO4_0) {
@@ -10126,9 +10181,9 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
                 const size_t v_payload = k_row*G, k_scale = v_payload + v_row*G, k_zero = k_scale + 2*D, k_tok = k_zero + 2*D;
                 const size_t v_ch = k_tok + 2*G, v_scale = v_ch + 2*D, v_zero = v_scale + 2*G;
                 GGML_ASSERT((int64_t) (v_zero + 2*G) == rec_bytes());
-                std::vector<uint8_t> buf((size_t) rec_bytes()*hkv*n_groups);
+                std::vector<uint8_t> buf((size_t) rec_bytes()*hkv*n_rec_pool());
                 auto put = [&](uint8_t * rec, size_t off, float x) { ggml_fp16_t h = ggml_fp32_to_fp16(x); memcpy(rec + off, &h, 2); };
-                for (int64_t r = 0; r < hkv*n_groups; ++r) {
+                for (int64_t r = 0; r < hkv*n_rec_pool(); ++r) {
                     uint8_t * rec = buf.data() + r*rec_bytes();
                     for (size_t i = 0; i < k_scale; ++i) rec[i] = (uint8_t) (rng() & 0xFF);
                     for (int64_t d = 0; d < D; ++d) {
@@ -10220,10 +10275,13 @@ struct test_sj_kvarn_seal_dyn : public test_case {
     const int bits_k, bits_v, iters;
     const ggml_type staging_type;
     const ggml_type body_type;
+    const bool paged; // [SJMULTI] desc TABLE = 1: logical group g seals into pool record desc[N_ENTRIES + g] (shuffled)
     size_t rec_bytes() const { return body_type == GGML_TYPE_TURBO4_0 ? 2*G*ggml_row_size(body_type, D) : ggml_sj_kvarn_rec_bytes(D, G, bits_k, bits_v); }
+    int64_t desc_n() const { return GGML_SJKVARN_DESC_N_ENTRIES + (paged ? (B - S)/G : 0); }
 
     std::string vars() override {
-        return VARS_TO_STR13(D, G, hkv, S, cap, B_old, B, n_groups_pool, n_groups_max, bits_k, bits_v, iters, staging_type) + ",body_type=" + ggml_type_name(body_type);
+        return VARS_TO_STR13(D, G, hkv, S, cap, B_old, B, n_groups_pool, n_groups_max, bits_k, bits_v, iters, staging_type) + ",body_type=" + ggml_type_name(body_type) +
+            (paged ? ",paged=1" : "");
     }
 
     double max_nmse_err() override {
@@ -10232,16 +10290,18 @@ struct test_sj_kvarn_seal_dyn : public test_case {
 
     test_sj_kvarn_seal_dyn(int64_t D = 256, int64_t G = 128, int64_t hkv = 4, int64_t S = 128, int64_t cap = 384,
                         int64_t B_old = 128 + 5*128, int64_t B = 128 + 7*128, int64_t n_groups_pool = 9, int64_t n_groups_max = 3,
-                        int bits_k = 4, int bits_v = 4, int iters = 16, ggml_type staging_type = GGML_TYPE_F16, ggml_type body_type = GGML_TYPE_F32)
+                        int bits_k = 4, int bits_v = 4, int iters = 16, ggml_type staging_type = GGML_TYPE_F16, ggml_type body_type = GGML_TYPE_F32, bool paged = false)
         : D(D), G(G), hkv(hkv), S(S), cap(cap), B_old(B_old), B(B), n_groups_pool(n_groups_pool), n_groups_max(n_groups_max),
-          bits_k(bits_k), bits_v(bits_v), iters(iters), staging_type(staging_type), body_type(body_type) {}
+          bits_k(bits_k), bits_v(bits_v), iters(iters), staging_type(staging_type), body_type(body_type), paged(paged) {
+        GGML_ASSERT(!paged || (B - S)/G <= n_groups_pool);
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * k = ggml_new_tensor_2d(ctx, staging_type, D*hkv, S + cap);
         ggml_set_name(k, "kbig");
         ggml_tensor * v = ggml_new_tensor_2d(ctx, staging_type, D*hkv, S + cap);
         ggml_set_name(v, "vbig");
-        ggml_tensor * desc = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, GGML_SJKVARN_DESC_N_ENTRIES);
+        ggml_tensor * desc = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, desc_n());
         ggml_set_name(desc, "desc");
         ggml_tensor * body = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, (int64_t) rec_bytes()*hkv*n_groups_pool);
         body->op_params[7] = body_type;
@@ -10273,7 +10333,14 @@ struct test_sj_kvarn_seal_dyn : public test_case {
                 std::vector<uint8_t> buf(ggml_nbytes(t), 0xAA);
                 ggml_backend_tensor_set(t, buf.data(), 0, buf.size());
             } else if (strcmp(t->name, "desc") == 0) {
-                int32_t d[GGML_SJKVARN_DESC_N_ENTRIES] = { 0 };
+                std::vector<int32_t> d(desc_n(), 0);
+                if (paged) {
+                    std::vector<int32_t> perm(n_groups_pool);
+                    for (size_t i = 0; i < perm.size(); ++i) perm[i] = (int32_t) i;
+                    std::shuffle(perm.begin(), perm.end(), std::mt19937(99));
+                    d[GGML_SJKVARN_DESC_TABLE] = 1;
+                    for (int64_t g = 0; g < (B - S)/G; ++g) d[GGML_SJKVARN_DESC_N_ENTRIES + g] = perm[g];
+                }
                 d[GGML_SJKVARN_DESC_S]        = (int32_t) S;
                 d[GGML_SJKVARN_DESC_CAP]      = (int32_t) cap;
                 d[GGML_SJKVARN_DESC_B]        = (int32_t) B;
@@ -10287,7 +10354,7 @@ struct test_sj_kvarn_seal_dyn : public test_case {
                 d[GGML_SJKVARN_DESC_TYPE_K] = staging_type;
                 d[GGML_SJKVARN_DESC_TYPE_V] = staging_type;
                 d[GGML_SJKVARN_DESC_B_OLD]    = (int32_t) B_old;
-                ggml_backend_tensor_set(t, d, 0, sizeof(d));
+                ggml_backend_tensor_set(t, d.data(), 0, d.size()*sizeof(int32_t));
             } else if (t->op == GGML_OP_NONE && t->view_src == nullptr) {
                 init_tensor_uniform(t);
             }
@@ -14526,6 +14593,31 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 3, 4096, true, false, GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_TURBO4_0));
     }
     test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(257, 24, 3, 60, 300, true, true, GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_TURBO4_0));
+    // [SJMULTI] multi-sequence cache: ns streams split into per-stream FA nodes over views, paged record pool (desc TABLE)
+    // with shuffled group->record maps, per body type (scalar 4/4, trellis 3/3 + 3/2, turbo4), decode widths, MTP widths,
+    // and a prefill ubatch; plus paged seals (records land at the table entries, the rest of the pool untouched).
+    for (int ns : {1, 2, 3}) {
+        for (int64_t n_q : {1, 4, 5}) {
+            test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 5, 400, true, false, GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_F32, 4, 4, 0, ns));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(257, 24, 4, 5, 400, true, false, GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_F32, 4, 4, 0, ns));
+    }
+    for (int64_t n_q : {1, 5, 257}) {
+        test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 5, 400, true, false, GGML_TYPE_F16, 128, false, GGML_TYPE_F32, 4, 4, 0, 2));
+        test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 5, 400, true, false, GGML_TYPE_Q8_0, 256, false, GGML_TYPE_F32, 4, 4, 0, 2));
+        test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 5, 400, true, false, GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_TURBO4_0, 4, 4, 0, 2));
+        for (auto [bk, bv] : std::vector<std::pair<int,int>>{{3, 3}, {3, 2}}) {
+            test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 5, 400, true, false, GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_I16, bk, bv, 0, 2));
+        }
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(4, 24, 4, 40, 1024, true, false, GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_F32, 4, 4, 0, 4));
+    test_cases.emplace_back(new test_sj_kvarn_seal_dyn(256, 128, 4, 128, 384, 128 + 5*128, 128 + 7*128, 9, 3, 4, 4, 16, GGML_TYPE_TQ6_0, GGML_TYPE_F32, true));
+    test_cases.emplace_back(new test_sj_kvarn_seal_dyn(256, 128, 4, 128, 384, 128 + 0*128, 128 + 2*128, 9, 3, 4, 4, 16, GGML_TYPE_TQ6_0, GGML_TYPE_F32, true));
+    test_cases.emplace_back(new test_sj_kvarn_seal_dyn(256, 128, 4, 128, 384, 128 + 5*128, 128 + 7*128, 9, 3, 4, 4, 16, GGML_TYPE_TQ6_0, GGML_TYPE_TURBO4_0, true));
+    for (auto [bk, bv] : std::vector<std::pair<int,int>>{{3, 3}, {3, 2}}) {
+        test_cases.emplace_back(new test_sj_kvarn_seal_dyn(256, 128, 4, 128, 384, 128 + 5*128, 128 + 7*128, 9, 3, bk, bv, 16, GGML_TYPE_TQ6_0, GGML_TYPE_I16, true));
+    }
+    test_cases.emplace_back(new test_sj_kvarn_seal_dyn(256, 128, 4, 256, 384, 256 + 5*128, 256 + 7*128, 9, 3, 4, 4, 16, GGML_TYPE_Q8_0, GGML_TYPE_F32, true));
     // [F5] trellis bodies (I16, 3/3 3/2 2/2) at decode widths 1-5 and 8 (GGML_SJKVARN_TRELLIS_WORDS=1 A/B), tq6 staging + f16 sink;
     // 32K (255 records + 128) and 100K (792 records + 1024) visible positions, plus prefill width 64 and f16/q8 staging.
     for (auto [bk, bv] : std::vector<std::pair<int,int>>{{3, 3}, {3, 2}, {2, 2}}) {

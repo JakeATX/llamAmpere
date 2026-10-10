@@ -892,12 +892,21 @@ extern "C" {
 
     // Exclusive end of the sealed SJ-KVaRN body, or -1 if this cache is not SJ-KVaRN.
     // Removing a nonempty prefix below this boundary requires clearing the cache.
+    // With several sequences (--parallel N) this is the largest sealed end over all sequences; use
+    // llama_sj_kvarn_seq_sealed_end for one sequence.
     LLAMA_API int32_t llama_sj_kvarn_sealed_end(struct llama_context * ctx);
+
+    // Unsealed positions one SJ-KVaRN sequence can hold beside the record pool (sink + ring rows), or -1 if this
+    // cache is not SJ-KVaRN. Under --kv-unified all sequences together hold at most n_ctx + n_seq * this.
+    LLAMA_API int32_t llama_sj_kvarn_seq_unsealed_max(struct llama_context * ctx);
+
+    // Exclusive end of the sealed SJ-KVaRN body of one sequence, or -1 (not SJ-KVaRN, or seq_id out of range).
+    LLAMA_API int32_t llama_sj_kvarn_seq_sealed_end(struct llama_context * ctx, llama_seq_id seq_id);
 
     // Compress an adaptive SJ-KVaRN tail during an idle period. Does not evaluate model layers.
     // accepted_pos_end is the exclusive end of accepted, materialized positions.
     // The caller must resolve speculative rollback and discard checkpoints before calling.
-    // Supports a single sequence. Returns 1 if compressed, 0 if no work, -1 on failure.
+    // Works per sequence (its own stream). Returns 1 if compressed, 0 if no work, -1 on failure.
     LLAMA_API int32_t llama_sj_kvarn_compress_idle(
             struct llama_context * ctx,
                     llama_seq_id   seq_id,

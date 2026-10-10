@@ -444,7 +444,9 @@ static __global__ void k_sj_kvarn_seal(const char * __restrict__ ksrc, const cha
             return;
         }
         row0 = S + (B_old + g*G - S) % cap; // cap % G == 0 -> the group never wraps
-        rec  = ((B_old - S)/G + g)*p.hkv + rec % p.hkv;
+        const int lg    = (B_old - S)/G + g; // logical group; a paged pool (multi-sequence cache) maps it to a record
+        const int pg    = desc[GGML_SJKVARN_DESC_TABLE] ? desc[GGML_SJKVARN_DESC_N_ENTRIES + lg] : lg;
+        rec  = pg*p.hkv + rec % p.hkv;
     }
     const int h = rec % p.hkv;
 
@@ -641,7 +643,8 @@ static __global__ void k_tiered_tq_seal(const char * K, const char * V, char * b
         const int count = (desc[GGML_SJKVARN_DESC_B] - old)/p.G;
         if (group >= count) return;
         row0 = S + (old + group*p.G - S)%desc[GGML_SJKVARN_DESC_CAP];
-        record += ((old-S)/p.G)*p.hkv;
+        const int lg = (old-S)/p.G + group;
+        record = (desc[GGML_SJKVARN_DESC_TABLE] ? desc[GGML_SJKVARN_DESC_N_ENTRIES + lg] : lg)*p.hkv + head;
     }
     const int is_v = blockIdx.y;
     const int type = is_v ? p.type_v : p.type_k;

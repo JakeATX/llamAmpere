@@ -5632,11 +5632,14 @@ static void ggml_compute_forward_set_rows_impl(
                 GGML_ASSERT(i1 >= 0 && i1 < ne1);
 
                 const int sink = ggml_get_op_params_i32(dst, 2);
-                if (sink > 0 && i1 < sink) {
+                const int64_t sink_rps = ggml_get_op_params_i32(dst, 4); // multi-stream cache: rows per stream (0: single)
+                const int64_t i1_s = sink_rps > 0 ? i1/sink_rps : 0;
+                const int64_t i1_r = i1 - i1_s*sink_rps;
+                if (sink > 0 && i1_r < sink) {
                     GGML_ASSERT(ne02 == 1 && ne03 == 1);
-                    const size_t offset = (size_t) ggml_get_op_params_i32(dst, 3)*nb1;
+                    const size_t offset = (size_t) ggml_get_op_params_i32(dst, 3)*nb1 + (size_t) i1_s*sink_rps*nb1;
                     GGML_ASSERT(offset + (size_t) sink*nc*sizeof(ggml_fp16_t) <= ggml_nbytes(dst));
-                    auto * out = (ggml_fp16_t *) ((char *) dst->data + offset) + i1*nc;
+                    auto * out = (ggml_fp16_t *) ((char *) dst->data + offset) + i1_r*nc;
                     const auto * in = (const src_t *) ((const char *) src0->data + i*nb01);
                     if constexpr (std::is_same_v<src_t, float>) {
                         ggml_fp32_to_fp16_row(in, out, nc);
@@ -9844,7 +9847,8 @@ static void ggml_compute_forward_flash_attn_ext_sj_kvarn(
             }
             if (p >= S && p < B) {
                 const int32_t g = (p - S) / G, t = (p - S) % G;
-                const uint8_t * rec = (const uint8_t *) body->data + ((size_t) g*hkv + ikv)*rec_bytes;
+                const int32_t gr = dd[GGML_SJKVARN_DESC_TABLE] ? dd[GGML_SJKVARN_DESC_N_ENTRIES + g] : g; // paged pool record
+                const uint8_t * rec = (const uint8_t *) body->data + ((size_t) gr*hkv + ikv)*rec_bytes;
                 if (turbo4_body) {
                     const size_t row_bytes = ggml_row_size(GGML_TYPE_TURBO4_0, D);
                     dequantize_row_turbo4_0((const block_turbo4_0 *) (rec + t*row_bytes), krow.data(), D);
@@ -12167,12 +12171,15 @@ void ggml_compute_forward_sj_kvarn_seal(
     GGML_ASSERT(n_new <= n_groups_max);
     const int64_t g0    = (B_old - S) / G;
     const int64_t n_rec = (int64_t) n_new * hkv;
-    GGML_ASSERT((int64_t) ggml_nelements(dst) >= (int64_t) rec_bytes * (g0 + n_new) * hkv);
+    const bool paged = d[GGML_SJKVARN_DESC_TABLE] != 0; // paged pool (multi-sequence cache): group -> record table
+    GGML_ASSERT(paged || (int64_t) ggml_nelements(dst) >= (int64_t) rec_bytes * (g0 + n_new) * hkv);
 
     for (int64_t r = params->ith; r < n_rec; r += params->nth) {
         const int64_t g = r / hkv, h = r % hkv;
         const int64_t row0 = S + (B_old + g*G - S) % cap; // cap % G == 0 -> the group never wraps
-        seal(row0, h, (uint8_t *) dst->data + (size_t) ((g0 + g)*hkv + h)*rec_bytes);
+        const int64_t gr = paged ? d[GGML_SJKVARN_DESC_N_ENTRIES + g0 + g] : g0 + g;
+        GGML_ASSERT((int64_t) ggml_nelements(dst) >= (int64_t) rec_bytes * (gr + 1) * hkv);
+        seal(row0, h, (uint8_t *) dst->data + (size_t) (gr*hkv + h)*rec_bytes);
     }
 }
 
@@ -12334,11 +12341,14 @@ static void ggml_compute_forward_set_rows_sj_kvarn_rot_impl(const ggml_compute_p
                 }
 
                 const int sink = ggml_get_op_params_i32(dst, 2);
-                if (sink > 0 && i1 < sink) {
+                const int64_t sink_rps = ggml_get_op_params_i32(dst, 4); // multi-stream cache: rows per stream (0: single)
+                const int64_t i1_s = sink_rps > 0 ? i1/sink_rps : 0;
+                const int64_t i1_r = i1 - i1_s*sink_rps;
+                if (sink > 0 && i1_r < sink) {
                     GGML_ASSERT(ne02 == 1 && ne03 == 1);
-                    const size_t offset = (size_t) ggml_get_op_params_i32(dst, 3)*nb1;
+                    const size_t offset = (size_t) ggml_get_op_params_i32(dst, 3)*nb1 + (size_t) i1_s*sink_rps*nb1;
                     GGML_ASSERT(offset + (size_t) sink*nc*sizeof(ggml_fp16_t) <= ggml_nbytes(dst));
-                    ggml_fp32_to_fp16_row(rot.data(), (ggml_fp16_t *) ((char *) dst->data + offset) + i1*nc, nc);
+                    ggml_fp32_to_fp16_row(rot.data(), (ggml_fp16_t *) ((char *) dst->data + offset) + i1_r*nc, nc);
                     continue;
                 }
 

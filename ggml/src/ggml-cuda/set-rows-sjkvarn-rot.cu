@@ -18,8 +18,10 @@ static __global__ void k_set_rows_tq6_sj_kvarn_rot(
         const float * __restrict__ src0,
         const idx_t * __restrict__ src1,
         char        * __restrict__ dst,
-        half        * __restrict__ sink,
+        char        * __restrict__ sink,
         const int     sink_rows,
+        const int64_t sink_rows_per_stream, // multi-stream cache: one sink per stream of this many rows (0: single)
+        const size_t  sink_stream_bytes,
         const int64_t ne00,
         const int64_t ne01,
         const int64_t ne02,
@@ -94,8 +96,17 @@ static __global__ void k_set_rows_tq6_sj_kvarn_rot(
     }
 
     // ---- f16 sink mirror of the rotated row (k_set_rows_f16_sink on the unfused path) ----
-    if (sink != nullptr && dst_row >= 0 && dst_row < sink_rows) {
-        sink[dst_row*ne00 + i_grp*GROUP + t] = __float2half(r);
+    if (sink != nullptr && dst_row >= 0) {
+        int64_t srow = dst_row;
+        char * sbase = sink;
+        if (sink_rows_per_stream > 0) {
+            const int64_t s = srow/sink_rows_per_stream;
+            srow  -= s*sink_rows_per_stream;
+            sbase += s*sink_stream_bytes;
+        }
+        if (srow < sink_rows) {
+            ((half *) sbase)[srow*ne00 + i_grp*GROUP + t] = __float2half(r);
+        }
     }
 
     // ---- TQ6 pack in the rotated basis (k_set_rows_tq6<idx_t, true>, per 128-element block) ----
@@ -171,14 +182,17 @@ static void set_rows_cuda_tq6_sj_kvarn_rot(ggml_backend_cuda_context & ctx, cons
     GGML_ASSERT(ne00 % group == 0);
     GGML_ASSERT(nb00 == sizeof(float));
 
-    half * sink = nullptr;
+    char * sink = nullptr;
     const int sink_rows = ggml_get_op_params_i32(dst, 2);
+    const int64_t sink_rows_per_stream = ggml_get_op_params_i32(dst, 4); // 0: single stream
     if (sink_rows > 0) {
         GGML_ASSERT(ne02 == 1 && ne03 == 1);
         const size_t offset = (size_t) ggml_get_op_params_i32(dst, 3)*nb1;
         GGML_ASSERT(offset + (size_t) sink_rows*ne00*sizeof(half) <= ggml_nbytes(dst));
-        sink = (half *) ((char *) dst->data + offset);
+        GGML_ASSERT(sink_rows_per_stream == 0 || (offset + (size_t) sink_rows*ne00*sizeof(half) <= (size_t) sink_rows_per_stream*nb1 && (sink_rows_per_stream*nb1) % sizeof(half) == 0));
+        sink = (char *) dst->data + offset;
     }
+    const size_t sink_stream_bytes = (size_t) sink_rows_per_stream*nb1;
 
     const int64_t n_slices = (ne00/group)*ne01*ne02*ne03;
     if (n_slices == 0) {
@@ -198,11 +212,11 @@ static void set_rows_cuda_tq6_sj_kvarn_rot(ggml_backend_cuda_context & ctx, cons
 
     if (group == 256) {
         k_set_rows_tq6_sj_kvarn_rot<idx_t, 256><<<(int) n_slices, 256, 0, stream>>>(
-            src0_d, src1_d, (char *) dst->data, sink, sink_rows, ne00, ne01, ne02, ne11, ne12,
+            src0_d, src1_d, (char *) dst->data, sink, sink_rows, sink_rows_per_stream, sink_stream_bytes, ne00, ne01, ne02, ne11, ne12,
             s01, s02, s03, s10, s11, s12, nb1, nb2, nb3);
     } else {
         k_set_rows_tq6_sj_kvarn_rot<idx_t, 128><<<(int) n_slices, 128, 0, stream>>>(
-            src0_d, src1_d, (char *) dst->data, sink, sink_rows, ne00, ne01, ne02, ne11, ne12,
+            src0_d, src1_d, (char *) dst->data, sink, sink_rows, sink_rows_per_stream, sink_stream_bytes, ne00, ne01, ne02, ne11, ne12,
             s01, s02, s03, s10, s11, s12, nb1, nb2, nb3);
     }
 }
