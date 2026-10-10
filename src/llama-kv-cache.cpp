@@ -714,6 +714,16 @@ llama_kv_cache::llama_kv_cache(
             GGML_ASSERT(layer_type_k == layer_type_v && n_embd_k_gqa_eff == n_embd_v_gqa_eff);
             kv_rows += (sink_bytes + row_bytes - 1)/row_bytes;
         }
+        if (sj_kvarn.enabled() && n_stream > 1) {
+            // multi-stream FA views stream s at s*kv_rows*row_bytes and the MMA tile loads are 16-byte:
+            // pad the rows per stream so the stream stride is 256-byte aligned (an odd row count with
+            // n_head_kv*196-byte tq6_0 rows gave 8 mod 16 -> misaligned global read, Xid 13).
+            // Single-stream caches keep the release layout (state and identity unchanged).
+            const size_t row_bytes = ggml_row_size(layer_type_k, n_embd_k_gqa_eff);
+            while (((size_t) kv_rows*row_bytes) % 256 != 0) {
+                kv_rows++;
+            }
+        }
         if (sj_kvarn.enabled()) {
             GGML_ASSERT((sj_kvarn_kv_rows == 0 || sj_kvarn_kv_rows == kv_rows) && "SJ-KVaRN cache: rows per stream must be constant across layers");
             sj_kvarn_kv_rows = kv_rows;

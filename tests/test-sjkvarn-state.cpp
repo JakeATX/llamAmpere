@@ -76,7 +76,9 @@ static llama_model * make_model() {
     }
     llama_model_params mp = llama_model_default_params();
     ggml_backend_dev_t no_devices[] = { nullptr };
-    mp.devices = no_devices; // CPU only, also in a CUDA build
+    if (!getenv("SJ_TEST_GPU")) {
+        mp.devices = no_devices; // CPU only, also in a CUDA build (SJ_TEST_GPU=1: default devices, all layers offloaded)
+    }
     llama_model * model = llama_model_init_from_user(meta, tensor_data, nullptr, mp);
     gguf_free(meta);
     return model;
@@ -582,6 +584,7 @@ static int run_multi(llama_model * model, const sj_cfg & c, bool unified) {
             const auto ru = decode_mixed(mx, { { 0, 1536, 1792, 0 }, { 1, 704, 960, 3 } }, 64);
             const float du = max_diff(ru[1], decode(r1, 704, 960, 64, 3));
             llama_free(mx); llama_free(r1);
+            printf("%-18s mixed ubatch vs alone: max|d| = %g (equal lengths), %g (unequal lengths)\n", name.c_str(), d, du);
             require(du < 1e-3f, "mixed unequal-length chunks within 1e-3 (max|d| " + std::to_string(du) + ")");
         }
         // prefill both sequences, seq 1 shorter (span lengths are multiples of the chunk: same ubatch boundaries)
@@ -696,10 +699,12 @@ int main(int argc, char ** argv) {
         { fixed, { s44 } },
     };
     int fails = 0;
+    const bool multi_only = getenv("SJ_TEST_MULTI_ONLY") != nullptr; // debugging: only the multi-sequence checks
     for (const auto & c : cases) {
+        if (multi_only) { break; }
         fails += run_case(model, c.first, c.second, tmp_dir);
     }
-    plain_mixed_control(model);
+    if (!multi_only) { plain_mixed_control(model); }
     int fails_multi = 0;
     for (const auto & c : { s44, s33t, s32t }) {
         fails_multi += run_multi(model, c, false);
