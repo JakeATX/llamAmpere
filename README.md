@@ -1,4 +1,4 @@
-> **llamAmpere v0.5**: a llama.cpp fork tuned for the RTX 3090 / 3090 Ti (Ampere, SM86), running Qwen3.8-27B with its MTP draft head.
+> **llamAmpere v0.5.1**: a llama.cpp fork tuned for the RTX 3090 / 3090 Ti (Ampere, SM86), running Qwen3.8-27B with its MTP draft head.
 
 ## What's new in v0.5
 
@@ -13,7 +13,9 @@
 - **12 GB cards (RTX 3060 12 GB):** a 2.3 bpw Swift 1.5 model with SJ-KVaRN 3/3t and the MTP drafter, 204,800 tokens
   of context in about 11 GB.
 - **Faster MTP verify decode on EXL3 models**, and a catch-up to upstream llama.cpp and TheTom's TurboQuant fork.
-- **Coming in v0.5.1:** a Swift 1.5 EXL3 4.0 bpw model.
+- **New in v0.5.1:** SJ-KVaRN works with parallel decode slots (`--parallel N`, optionally `--kv-unified`);
+  `--parallel 1` output is unchanged. [Release notes](docs/llamampere-v0.5.1/RELEASE_NOTES.md).
+- **Coming in v0.5.2:** a Swift 1.5 EXL3 4.0 bpw model.
 - **Read more:** the [SJ-KVaRN paper](https://huggingface.co/spaces/jakeatx/sj-kvarn-paper) and the standalone codec,
   [JakeATX/sj-kvarn-codec](https://github.com/JakeATX/sj-kvarn-codec) (MIT).
 
