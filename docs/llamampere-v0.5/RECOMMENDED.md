@@ -52,7 +52,7 @@ boundary at or below the first changed token, so a resumed 27K-token conversatio
 | SJ-KVaRN 4/4 | 4.72 | 0.00066 | 93.3 tok/s (paired with tq5_0/turbo4) | 262,144 at 252K deep, peak 22,182 MiB |
 | SJ-KVaRN 3/3t | 3.76 | 0.00130 | 0.79x of 4/4 (paired) | 262,144 boots; full depth not measured |
 | SJ-KVaRN 3/2t | 3.27 | 0.00256 | 0.77x of 4/4 (paired) | 262,144 boots; full depth not measured |
-| 12 GB: SJ-KVaRN 3/3t, 2.3 bpw model | 3.76 | not measured on this model | not a speed cell | 204,800: 11,064 MiB after boot and a short reply (3/2t: 10,672 after boot, 10,690 at 203,568 deep) |
+| 12 GB: SJ-KVaRN 3/3t, 2.3 bpw model | 3.76 | not measured on this model | not a speed cell | 204,800: 11,064 MiB after boot and a short reply; 12,052 MiB whole card (desktop included) at 203,568 deep (3/2t: 10,672 after boot, 10,690 at 203,568 deep) |
 
 How each column was measured:
 
@@ -234,8 +234,8 @@ default. `--spec-draft-vocab-map auto:65536` selects the same built-in list as t
 
 **Fit.** We size 12 GB configurations to about 11 GB of GPU memory, which leaves about 1 GB for the desktop. With 3/3t
 at context 204,800, the server uses 11,064 MiB after boot and a short reply. With 3/2t (`-ctv sjkvarn2`) the same
-command uses 10,672 MiB after boot and peaked at 10,690 MiB with a 203,568-token prompt plus 256 generated tokens, so
-3/3t at full depth should land near 11,080 MiB. 3/2t is the option if you need about 390 MiB more room; it has about
+command uses 10,672 MiB after boot and peaked at 10,690 MiB with a 203,568-token prompt plus 256 generated tokens.
+3/3t with the same prompt peaked at 12,052 MiB on the whole card, including about 1 GB used by the desktop. 3/2t is the option if you need about 390 MiB more room; it has about
 twice the KL of 3/3t (see the measurements above).
 
 **Quality.** The model reaches about 85% of the BF16 model's LiveCodeBench score, so expect weaker answers than the

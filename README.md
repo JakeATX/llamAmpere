@@ -1,6 +1,80 @@
-> **llamAmpere** (v0.4): this fork runs Qwen3.8-27B on one RTX 3090 / 3090 Ti with the model's own MTP head. New kernels make verifying 5 to 8 tokens per step cheaper, so the MTP drafter now proposes 4 tokens per step by default: +6.70% tokens/s over the v0.3.1 build running the same depth-4 flags. An adaptive depth 3-4 is available as an option. The drafter is now on by default for Qwen3.8 GGUFs that carry the MTP head, and its KV cache follows `-ctk`/`-ctv`. v0.4 also adds a 5-bit key cache type (`turbo5`) with fused attention for turbo4 values, an n-gram drafter for cards where the MTP head does not fit, faster prefill for ternary PTQ1_0 models, and a catch-up to llama.cpp master `a25c9865f`. Against the numbers v0.3.1 published, the release tree decodes 104.28 tok/s on the same fixtures (99.4, +4.9%) and 103.09 tok/s at 100K KV depth (93.16, +10.7%), and runs a 262,144-token context under the 23 GB cap. Unless noted, v0.4 numbers are from an RTX 3090 Ti at 350 W on the coding / agentic / rag ship corpus (real task histories): temperature 1.0, reasoning effort medium, 3 seeds, 10K-27K generated tokens per answer, whole-card VRAM at or under 23 GB. G is the weighted tokens/s gain 0.4 coding + 0.4 agentic + 0.2 rag, and ± is two standard errors over the seeds.
+> **llamAmpere v0.5**: a llama.cpp fork tuned for the RTX 3090 / 3090 Ti (Ampere, SM86), running Qwen3.8-27B with its MTP draft head.
 
-**v0.5 recommended settings** (SJ-KVaRN compressed KV cache, four 24 GB configurations and a 12 GB one): [docs/llamampere-v0.5/RECOMMENDED.md](docs/llamampere-v0.5/RECOMMENDED.md).
+## What's new in v0.5
+
+- **SJ-KVaRN**, a new compressed KV cache, in 4/4, 3/3t and 3/2t configurations. It builds on the KVarN method
+  (huawei-csl/KVarN).
+  - At 4/4 it has 41% lower KL than v0.4's tq5_0/turbo4 cache for 2% more cache memory.
+  - The full 262,144-token context fits on one 24 GB card at 4/4: 21,924 MiB peak at full depth.
+- **Faster decode at 100K.** On our coding/agentic/RAG task benchmark at 100K depth, v0.5 with tq5_0/turbo4 is
+  +8.41% ± 5.76% over v0.4, and with SJ-KVaRN 4/4 +6.77% ± 2.68%.
+- **Prompt cache on by default.** A RAM tier sized from host memory plus a 16 GiB disk tier, for every KV type,
+  SJ-KVaRN included. A resumed conversation skips the full re-prefill. `--no-cache-disk` turns the disk tier off.
+- **12 GB cards (RTX 3060 12 GB):** a 2.3 bpw Swift 1.5 model with SJ-KVaRN 3/3t and the MTP drafter, 204,800 tokens
+  of context in about 11 GB.
+- **Faster MTP verify decode on EXL3 models**, and a catch-up to upstream llama.cpp and TheTom's TurboQuant fork.
+- **Coming in v0.5.1:** a Swift 1.5 EXL3 4.0 bpw model.
+- **Read more:** the [SJ-KVaRN paper](https://huggingface.co/spaces/jakeatx/sj-kvarn-paper) and the standalone codec,
+  [JakeATX/sj-kvarn-codec](https://github.com/JakeATX/sj-kvarn-codec) (MIT).
+
+Release notes, including what we tried and did not ship: [docs/llamampere-v0.5/RELEASE_NOTES.md](docs/llamampere-v0.5/RELEASE_NOTES.md). Recommended settings for every card size: [docs/llamampere-v0.5/RECOMMENDED.md](docs/llamampere-v0.5/RECOMMENDED.md).
+
+**Build and run (v0.5, one RTX 3090 / 3090 Ti, 262,144-token context).** Needs Linux, an NVIDIA card with 24 GB, the
+CUDA toolkit (tested with 12.4), CMake, git and a C++ compiler. The model download is 15.6 GB.
+
+```bash
+git clone https://github.com/JakeATX/llamAmpere.git
+cd llamAmpere
+cmake -S . -B build-sm86 -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86
+cmake --build build-sm86 -j8 --target llama-server
+```
+
+Fastest decode (tq5_0 K / turbo4 V):
+
+```bash
+./build-sm86/bin/llama-server \
+  --hf-repo jakeatx/ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M-GGUF \
+  --hf-file ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M.gguf -c 262144 \
+  -ngl 99 -fa on -ctk tq5_0 -ctv turbo4 -b 4096 -ub 1024 --parallel 1
+```
+
+Lowest KL at about the same speed (SJ-KVaRN 4/4):
+
+```bash
+./build-sm86/bin/llama-server \
+  --hf-repo jakeatx/ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M-GGUF \
+  --hf-file ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M.gguf -c 262144 \
+  -ngl 99 -fa on -ctk sjkvarn4 -ctv sjkvarn4 -b 4096 -ub 1024 --parallel 1
+```
+
+For a smaller cache, use `-ctk sjkvarn3 -ctv sjkvarn3 --sjkvarn-body-type auto` (3/3t) or
+`-ctk sjkvarn3 -ctv sjkvarn2 --sjkvarn-body-type auto` (3/2t). The server listens on http://127.0.0.1:8080
+(OpenAI-compatible API). The MTP drafter and the prompt cache are on by default.
+
+**12 GB cards (RTX 3060 12 GB, 3080 12 GB, 3080 Ti), 204,800-token context.** Same build. Run from the `llamAmpere`
+directory; the model download is 9.0 GB.
+
+```bash
+LLAMA_MTP_DRAFT_COMPUTE_LEAN=1 ./build-sm86/bin/llama-server \
+  -hf jakeatx/ATX-Swift-1.5-Qwen3.8-27B-Uncensored-2.3bpw-MTP-GGUF \
+  -hff ATX-Swift-1.5-Qwen3.8-27B-Uncensored-2.3bpw-MTP.gguf \
+  -c 204800 --parallel 1 -ngl 99 -fa on -fit off -b 4096 -ub 512 \
+  --no-context-shift --jinja \
+  -ctk sjkvarn3 -ctv sjkvarn3 --sjkvarn-body-type sjkvarn4t \
+  --sjkvarn-sink 128 --sjkvarn-sink-type f16 --sjkvarn-staging-type tq6_0 \
+  --sjkvarn-tail 4096 --sjkvarn-tail-max 8192 \
+  --cache-type-s q8_0 \
+  --spec-type draft-mtp --spec-draft-n-max 4 --spec-draft-p-min 0 \
+  --spec-draft-vocab-map docs/mtp-vocab/atx_65536.txt \
+  --spec-draft-type-k q8_0 --spec-draft-type-v q8_0 --spec-draft-window 8192 \
+  --temp 1.0 --top-k 20 --top-p 0.95 --min-p 0
+```
+
+With a 203,568-token prompt this peaked at 12,052 MiB on the whole card, including about 1 GB used by the desktop.
+
+---
+
+**v0.4** (previous release): this fork runs Qwen3.8-27B on one RTX 3090 / 3090 Ti with the model's own MTP head. New kernels make verifying 5 to 8 tokens per step cheaper, so the MTP drafter now proposes 4 tokens per step by default: +6.70% tokens/s over the v0.3.1 build running the same depth-4 flags. An adaptive depth 3-4 is available as an option. The drafter is now on by default for Qwen3.8 GGUFs that carry the MTP head, and its KV cache follows `-ctk`/`-ctv`. v0.4 also adds a 5-bit key cache type (`turbo5`) with fused attention for turbo4 values, an n-gram drafter for cards where the MTP head does not fit, faster prefill for ternary PTQ1_0 models, and a catch-up to llama.cpp master `a25c9865f`. Against the numbers v0.3.1 published, the release tree decodes 104.28 tok/s on the same fixtures (99.4, +4.9%) and 103.09 tok/s at 100K KV depth (93.16, +10.7%), and runs a 262,144-token context under the 23 GB cap. Unless noted, v0.4 numbers are from an RTX 3090 Ti at 350 W on the coding / agentic / rag ship corpus (real task histories): temperature 1.0, reasoning effort medium, 3 seeds, 10K-27K generated tokens per answer, whole-card VRAM at or under 23 GB. G is the weighted tokens/s gain 0.4 coding + 0.4 agentic + 0.2 rag, and ± is two standard errors over the seeds.
 
 **v0.4 release notes**, with what is new and recommended settings for 24 GB cards: [docs/llamampere-v0.4/RELEASE_NOTES.md](docs/llamampere-v0.4/RELEASE_NOTES.md).
 
@@ -14,10 +88,10 @@ git clone -b v0.4 https://github.com/JakeATX/llamAmpere.git
 cd llamAmpere
 cmake -S . -B build-sm86 -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86
 cmake --build build-sm86 -j8 --target llama-server
-curl -L -o ATX-Swift-Qwen3.8-27B-Uncensored-IQ4_XS-M.gguf \
-  https://huggingface.co/jakeatx/ATX-Swift-Qwen3.8-27B-Uncensored-IQ4_XS-M-GGUF/resolve/main/ATX-Swift-Qwen3.8-27B-Uncensored-IQ4_XS-M.gguf
-./build-sm86/bin/llama-server -m ATX-Swift-Qwen3.8-27B-Uncensored-IQ4_XS-M.gguf -c 262144 \
-  -ngl 99 -fa on -ctk turbo5 -ctv turbo4 -b 4096 -ub 1024 -t 8 -tb 8 --parallel 1
+./build-sm86/bin/llama-server \
+  --hf-repo jakeatx/ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M-GGUF \
+  --hf-file ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M.gguf -c 262144 \
+  -ngl 99 -fa on -ctk turbo5 -ctv turbo4 -b 4096 -ub 1024 --parallel 1
 ```
 
 The server listens on http://127.0.0.1:8080 (OpenAI-compatible API). The MTP drafter (draft depth 4), the vocabulary
@@ -69,14 +143,6 @@ Start with [QWEN_AMPERE.md](QWEN_AMPERE.md) and the write-up in [docs/llamampere
 ## Quick start
 
 A few options to get `llama.cpp` installed on your machine:
-
-```bash
-# curl
-curl -LsSf https://llama.app/install.sh | sh
-
-# powershell
-irm https://llama.app/install.ps1 | iex
-```
 
 - Visit https://llama.app and follow the instructions
 - Run with Docker - see our [Docker documentation](docs/docker.md)
