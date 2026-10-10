@@ -216,12 +216,17 @@ static void maintenance_require(bool condition, const char * message) {
 static std::vector<int32_t> maintenance_descriptor(llama_kv_cache * cache, llama_pos next_pos) {
     ggml_init_params ip = { 4*ggml_tensor_overhead(), nullptr, true };
     ggml_context * ctx = ggml_init(ip);
-    ggml_tensor * desc = cache->build_input_sj_kvarn_desc(ctx);
-    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_cpu_buffer_type());
-    maintenance_require(buffer != nullptr, "allocate maintenance descriptor");
     llama_ubatch ubatch = {};
     ubatch.pos = &next_pos;
-    cache->set_input_sj_kvarn_desc(desc, &ubatch);
+    ubatch.n_seqs_unq = 1;
+    ggml_tensor * desc = cache->build_input_sj_kvarn_desc(ctx, ubatch);
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_cpu_buffer_type());
+    maintenance_require(buffer != nullptr, "allocate maintenance descriptor");
+    llama_kv_cache::slot_info sinfo;
+    sinfo.s0 = sinfo.s1 = 0;
+    sinfo.strm  = { 0 };
+    sinfo.idxs  = { { 0 } };
+    cache->set_input_sj_kvarn_desc(desc, &ubatch, sinfo);
     std::vector<int32_t> result(GGML_SJKVARN_DESC_N_ENTRIES);
     ggml_backend_tensor_get(desc, result.data(), 0, result.size()*sizeof(int32_t));
     ggml_backend_buffer_free(buffer);

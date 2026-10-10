@@ -22,7 +22,7 @@ static __global__ void fattn_sj_kvarn_expand_prefill(
     if (p0 >= kv.S && p0 < kv.B) {
         const int group = (p0 - kv.S)/kv.G;
         const int token = (p0 - kv.S)%kv.G;
-        const char * rec = kv.body + (size_t) group*kv.rec_stride;
+        const char * rec = fattn_sj_kvarn_rec(kv, group);
         flash_attn_ext_sj_kvarn_load_tile<D2, false, rows, 256, D2, false, false>(rec, token, kv, tile, rows);
         __syncthreads();
         for (int i = tid; i < rows*D2; i += 256) {

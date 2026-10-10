@@ -4532,7 +4532,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V"));
     add_opt(common_arg(
         {"--spec-draft-sjkvarn"},
-        "inherit the trunk's SJ-KVaRN body, sink, staging and tail for single-sequence MTP (incompatible with -ctkd/-ctvd)",
+        "inherit the trunk's SJ-KVaRN body, sink, staging and tail for MTP (one stream per --parallel slot) (incompatible with -ctkd/-ctvd)",
         [](common_params & params) {
             params.speculative.draft.sj_kvarn = true;
         }

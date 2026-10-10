@@ -429,6 +429,16 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
     cparams.kv_unified     = params.kv_unified;
     cparams.moe_cache_size = params.moe_cache_size;
 
+    // SJ-KVaRN keeps one sink/ring stream per sequence in every mode; --kv-unified shares the sealed-record
+    // pool between them instead (every sequence may address the whole context), so the rest of the context
+    // runs the per-sequence-stream path: unified off, n_ctx_seq = n_ctx
+    const bool sj_kvarn_shared_pool = params.sj_kvarn_bits_k > 0 && params.sj_kvarn_bits_v > 0 &&
+        params.kv_unified && params.n_seq_max > 1;
+    if (sj_kvarn_shared_pool) {
+        cparams.kv_unified = false;
+        LLAMA_LOG_INFO("%s: SJ-KVaRN with kv_unified: per-sequence streams over one shared record pool\n", __func__);
+    }
+
     // initialized later
     cparams.pipeline_parallel = false;
     cparams.training = false;
@@ -445,7 +455,7 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
     // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
     cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256);
 
-    if (cparams.kv_unified) {
+    if (cparams.kv_unified || sj_kvarn_shared_pool) {
         cparams.n_ctx_seq = cparams.n_ctx;
     } else {
         cparams.n_ctx_seq = cparams.n_ctx / cparams.n_seq_max;
@@ -850,6 +860,7 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
                 /*.edge_bits_v =*/ params.sj_kvarn_edge_bits_v,
                 /*.edge_body_type =*/ params.sj_kvarn_edge_body_type,
                 /*.flush_chunk =*/ params.sj_kvarn_flush_chunk,
+                /*.shared_pool =*/ sj_kvarn_shared_pool,
             },
         };
 
@@ -2155,6 +2166,14 @@ int32_t llama_context::compress_sj_kvarn_idle(llama_seq_id seq_id, llama_pos acc
 int32_t llama_sj_kvarn_sealed_end(llama_context * ctx) {
     auto * kv = ctx ? llama_sj_kvarn_cache(ctx->get_memory()) : nullptr;
     return kv && kv->is_sj_kvarn() ? (int32_t) kv->get_sj_kvarn_sealed_end() : -1;
+}
+
+int32_t llama_sj_kvarn_seq_sealed_end(llama_context * ctx, llama_seq_id seq_id) {
+    auto * kv = ctx ? llama_sj_kvarn_cache(ctx->get_memory()) : nullptr;
+    if (!kv || !kv->is_sj_kvarn() || seq_id < 0 || (uint32_t) seq_id >= kv->get_n_stream()) {
+        return -1;
+    }
+    return (int32_t) kv->get_sj_kvarn_sealed_end(seq_id);
 }
 
 int32_t llama_sj_kvarn_compress_idle(llama_context * ctx, llama_seq_id seq_id, llama_pos accepted_end) {
@@ -5710,10 +5729,6 @@ llama_context * llama_init_from_model(llama_model * model, llama_context_params 
             return nullptr;
         }
         params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
-        if (params.n_seq_max != 1) {
-            LLAMA_LOG_ERROR("%s: SJ-KVaRN cache supports a single sequence (n_seq_max = %u)\n", __func__, params.n_seq_max);
-            return nullptr;
-        }
         if (params.sj_kvarn_tail_max != 0 && (params.sj_kvarn_tail_max < params.sj_kvarn_tail || params.sj_kvarn_tail_max % 128 != 0)) {
             LLAMA_LOG_ERROR("%s: SJ-KVaRN tail-max must be aligned to 128 and >= tail\n", __func__);
             return nullptr;

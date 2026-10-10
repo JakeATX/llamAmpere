@@ -660,6 +660,10 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
 
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
 
+    if (self_sj_kvarn_desc) {
+        res &= sj_kvarn_n_kv_streams == mctx->get_sj_kvarn_n_kv_streams();
+    }
+
     return res;
 }
 
@@ -1287,6 +1291,10 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
   //res &= inp_attn->self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
+
+    if (inp_attn->self_sj_kvarn_desc) {
+        res &= inp_attn->sj_kvarn_n_kv_streams == mctx->get_attn()->get_sj_kvarn_n_kv_streams();
+    }
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
@@ -3158,6 +3166,62 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             v = ggml_cast(ctx0, v, GGML_TYPE_F16);
         }
 
+        if (sj_kvarn_pending.body != nullptr && k->ne[3] > 1) {
+            // SJ-KVaRN with several streams (one per sequence) in the ubatch: one FA node per stream, each with its
+            // own descriptor row (sealed end, ring state, group table) and its own attended length, exactly the
+            // node a single-sequence cache builds for that stream; the outputs are concatenated stream-major
+            const int64_t ns = k->ne[3];
+            GGML_ASSERT(sj_kvarn_pending.n_kv_streams && (int64_t) sj_kvarn_pending.n_kv_streams->size() == ns);
+            ggml_tensor * desc = sj_kvarn_pending.desc;
+            GGML_ASSERT(desc->ne[1] == ns && q->ne[3] == ns && v->ne[3] == ns && kq_mask->ne[3] == ns);
+            const int group = sj_kvarn_pending.body->op_params[7] == GGML_TYPE_TURBO4_0 ? 128 : 256;
+            const bool fused_rot = sj_kvarn_pending.fused_rot;
+            ggml_tensor * out = nullptr;
+            for (int64_t s = 0; s < ns; ++s) {
+                const int32_t n_kv_s = (int32_t) (*sj_kvarn_pending.n_kv_streams)[s];
+                GGML_ASSERT(n_kv_s > 0 && n_kv_s % 64 == 0 && n_kv_s <= kq_mask->ne[0]);
+                ggml_tensor * q_s = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2], 1, q->nb[1], q->nb[2], q->nb[3], s*q->nb[3]);
+                ggml_tensor * k_s = ggml_view_4d(ctx0, k, k->ne[0], k->ne[1], k->ne[2], 1, k->nb[1], k->nb[2], k->nb[3], s*k->nb[3]);
+                ggml_tensor * v_s = ggml_view_4d(ctx0, v, v->ne[0], v->ne[1], v->ne[2], 1, v->nb[1], v->nb[2], v->nb[3], s*v->nb[3]);
+                if (sj_kvarn_mask_src != kq_mask) {
+                    sj_kvarn_mask_src = kq_mask;
+                    sj_kvarn_mask_s.assign(ns, nullptr);
+                }
+                GGML_ASSERT((int64_t) sj_kvarn_mask_s.size() == ns);
+                ggml_tensor * m_s = sj_kvarn_mask_s[s];
+                if (m_s == nullptr || m_s->ne[0] != n_kv_s) {
+                    m_s = ggml_view_4d(ctx0, kq_mask, n_kv_s, kq_mask->ne[1], kq_mask->ne[2], 1,
+                            kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], s*kq_mask->nb[3]);
+                    if (!ggml_is_contiguous(m_s)) {
+                        m_s = ggml_cont(ctx0, m_s);
+                    }
+                    sj_kvarn_mask_s[s] = m_s;
+                }
+                ggml_tensor * d_s = ggml_view_1d(ctx0, desc, desc->ne[0], s*desc->nb[1]);
+                ggml_tensor * c = ggml_flash_attn_ext(ctx0, q_s, k_s, v_s, m_s, kq_scale, hparams.f_max_alibi_bias,
+                                          hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+                ggml_flash_attn_ext_add_sinks(c, sinks);
+                GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
+                ggml_flash_attn_ext_set_n_kv_max(c, static_cast<int32_t>(n_kv_max));
+                ggml_prec_set_acc(c, GGML_PREC_F32);
+                ggml_flash_attn_ext_set_sj_kvarn(c, sj_kvarn_pending.body, d_s,
+                        sj_kvarn_pending.bits_k, sj_kvarn_pending.bits_v, n_kv_s);
+                if (fused_rot) {
+                    ggml_flash_attn_ext_set_sj_kvarn_rot(c, 256);
+                }
+                out = out ? ggml_concat(ctx0, out, c, 3) : c;
+            }
+            sj_kvarn_pending = {};
+            cur = out;
+            if (!fused_rot) {
+                if (!ggml_is_contiguous(cur)) { cur = ggml_cont(ctx0, cur); }
+                cur = ggml_turbo_wht(ctx0, cur, 1, group, nullptr);
+            }
+            cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+            ggml_build_forward_expand(gf, cur);
+            return cur;
+        }
+
         cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
                                   hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
         res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
@@ -3401,10 +3465,11 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
     inp->self_v_rot = mctx_cur->build_input_v_rot(ctx0);
 
     if (mctx_cur->is_sj_kvarn()) {
-        inp->self_sj_kvarn_desc = mctx_cur->build_input_sj_kvarn_desc(ctx0);
+        inp->self_sj_kvarn_desc = mctx_cur->build_input_sj_kvarn_desc(ctx0, ubatch);
         if (mctx_cur->has_sj_kvarn_edge_tier()) {
-            inp->self_sj_kvarn_desc_edge = mctx_cur->build_input_sj_kvarn_desc(ctx0);
+            inp->self_sj_kvarn_desc_edge = mctx_cur->build_input_sj_kvarn_desc(ctx0, ubatch);
         }
+        inp->sj_kvarn_n_kv_streams = mctx_cur->get_sj_kvarn_n_kv_streams();
     }
 
     return inp;
@@ -3566,6 +3631,7 @@ ggml_tensor * llm_graph_context::build_attn(
                 sj_kvarn_pending.bits_k = (int32_t) bits_k;
                 sj_kvarn_pending.bits_v = (int32_t) bits_v;
                 sj_kvarn_pending.fused_rot = sj_kvarn_fused_rot;
+                sj_kvarn_pending.n_kv_streams = &inp->sj_kvarn_n_kv_streams;
             }
         }
 

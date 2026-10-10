@@ -4114,6 +4114,47 @@ private:
         }
 #endif
 
+        // SJ-KVaRN idle compression, per slot: every sequence has its own stream, so an idle slot seals its
+        // adaptive tail even while other slots keep generating
+        if (params_base.sj_kvarn_bits_k > 0 && params_base.sj_kvarn_tail_max > 0) {
+            for (auto & slot : slots) {
+                if (slot.is_processing() || !slot.sj_kvarn_idle_pending) {
+                    continue;
+                }
+                slot.sj_kvarn_idle_pending = false;
+                const llama_pos end = slot.sj_kvarn_accepted_end;
+                if (end >= 0 && slot.spec_ckpt.empty() &&
+                        end == slot.prompt.tokens.pos_next() &&
+                        end == llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id) + 1) {
+                    // The last turn (from the end of its prompt) stays unsealed: the next request usually
+                    // re-renders it, and an edit there must not reach sealed rows. Checkpoints stay valid
+                    // when they sit at or above the new sealed end or on a group boundary (whole sealed
+                    // groups can be dropped by seq_rm); the server creates them on boundaries.
+                    const int64_t start = ggml_time_us();
+                    const int32_t result = llama_sj_kvarn_compress_idle_keep(ctx_tgt, slot.id, end, slot.sj_kvarn_keep_from);
+                    if (result < 0) {
+                        SLT_WRN(slot, "%s", "SJ-KVaRN idle compression failed\n");
+                    } else if (result > 0) {
+                        SLT_INF(slot, "SJ-KVaRN idle compression: end=%d, sealed end=%d (keep from %d), %.3f ms\n", end,
+                                llama_sj_kvarn_seq_sealed_end(ctx_tgt, slot.id), slot.sj_kvarn_keep_from,
+                                (ggml_time_us() - start) / 1000.0);
+                    }
+                    size_t n_dropped = 0;
+                    for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end();) {
+                        if (!sj_kvarn_ckpt_reachable(slot.id, *it)) {
+                            it = slot.prompt.checkpoints.erase(it);
+                            ++n_dropped;
+                        } else {
+                            ++it;
+                        }
+                    }
+                    if (n_dropped > 0) {
+                        SLT_DBG(slot, "dropped %zu prompt checkpoints behind the sealed SJ-KVaRN end\n", n_dropped);
+                    }
+                }
+            }
+        }
+
         // check if all slots are idle
         {
             bool all_idle = true;
@@ -4129,43 +4170,6 @@ private:
                 SRV_TRC("%s", "all slots are idle\n");
 
                 metrics_flush_idle();
-
-                if (params_base.sj_kvarn_bits_k > 0 && params_base.sj_kvarn_tail_max > 0 && slots.size() == 1) {
-                    auto & slot = slots.front();
-                    if (slot.sj_kvarn_idle_pending) {
-                        slot.sj_kvarn_idle_pending = false;
-                        const llama_pos end = slot.sj_kvarn_accepted_end;
-                        if (end >= 0 && slot.spec_ckpt.empty() &&
-                                end == slot.prompt.tokens.pos_next() &&
-                                end == llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id) + 1) {
-                            // The last turn (from the end of its prompt) stays unsealed: the next request usually
-                            // re-renders it, and an edit there must not reach sealed rows. Checkpoints stay valid
-                            // when they sit at or above the new sealed end or on a group boundary (whole sealed
-                            // groups can be dropped by seq_rm); the server creates them on boundaries.
-                            const int64_t start = ggml_time_us();
-                            const int32_t result = llama_sj_kvarn_compress_idle_keep(ctx_tgt, slot.id, end, slot.sj_kvarn_keep_from);
-                            if (result < 0) {
-                                SLT_WRN(slot, "%s", "SJ-KVaRN idle compression failed\n");
-                            } else if (result > 0) {
-                                SLT_INF(slot, "SJ-KVaRN idle compression: end=%d, sealed end=%d (keep from %d), %.3f ms\n", end,
-                                        llama_sj_kvarn_sealed_end(ctx_tgt), slot.sj_kvarn_keep_from,
-                                        (ggml_time_us() - start) / 1000.0);
-                            }
-                            size_t n_dropped = 0;
-                            for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end();) {
-                                if (!sj_kvarn_ckpt_reachable(slot.id, *it)) {
-                                    it = slot.prompt.checkpoints.erase(it);
-                                    ++n_dropped;
-                                } else {
-                                    ++it;
-                                }
-                            }
-                            if (n_dropped > 0) {
-                                SLT_DBG(slot, "dropped %zu prompt checkpoints behind the sealed SJ-KVaRN end\n", n_dropped);
-                            }
-                        }
-                    }
-                }
 
                 return; // skip further processing
 

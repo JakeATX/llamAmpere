@@ -3869,6 +3869,17 @@ common_speculative_init_result::common_speculative_init_result(
     // the draft context holds as many tokens per sequence as the target context
     cparams.n_ctx = llama_n_ctx(ctx_tgt);
 
+    // SJ-KVaRN trunk with --kv-unified and several slots: every target sequence may address the whole context
+    // (one shared record pool, per-sequence rings), so a plain unified draft cache of n_ctx cells would run out
+    // when the slots together pass n_ctx. The (plain) draft cache gets one n_ctx stream per sequence instead.
+    if (cparams.kv_unified && cparams.n_seq_max > 1 && cparams.sj_kvarn_bits_k == 0 &&
+        llama_sj_kvarn_sealed_end(ctx_tgt) >= 0 && llama_n_ctx_seq(ctx_tgt) == llama_n_ctx(ctx_tgt)) {
+        cparams.kv_unified = false;
+        cparams.n_ctx      = llama_n_ctx(ctx_tgt) * cparams.n_seq_max;
+        LOG_INF("%s: SJ-KVaRN shared pool: draft KV cache uses %u streams of %u cells\n", __func__,
+                cparams.n_seq_max, llama_n_ctx(ctx_tgt));
+    }
+
     // params comes from common_base_params_to_speculative: cache_type_k/v hold the resolved types,
     // speculative.draft.cache_type_k/v are GGML_TYPE_COUNT when the flag was not given
     const char * unset_src = params.speculative.draft.cache_type_sj_kvarn_default ? "SJ-KVaRN trunk default" : nullptr;

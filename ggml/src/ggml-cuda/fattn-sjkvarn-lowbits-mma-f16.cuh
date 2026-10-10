@@ -1703,7 +1703,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 const int g  = (p0 - kv.S) / kv.G;
                 const int t0 = (p0 - kv.S) - g*kv.G;
                 flash_attn_ext_sj_kvarn_load_tile<stride_tile_K, swz_K, nbatch_fa, nthreads_kv, DKQ/2, oob_check, false>
-                    (kv.body + (size_t) g*kv.rec_stride, t0, kv, tile_K, k_VKQ_sup);
+                    (fattn_sj_kvarn_rec(kv, g), t0, kv, tile_K, k_VKQ_sup);
             } else {
                 const int row0 = p0 < kv.S ? p0 : kv.S + (p0 - kv.S) % kv.cap;
                 if (p0 < kv.S && kv.sink_type == GGML_TYPE_F16) {
@@ -2130,7 +2130,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 const int g  = (p0 - kv.S) / kv.G;
                 const int t0 = (p0 - kv.S) - g*kv.G;
                 flash_attn_ext_sj_kvarn_load_tile<stride_tile_V, swz_V, nbatch_fa, nthreads_kv, DV/2, oob_check, true>
-                    (kv.body + (size_t) g*kv.rec_stride, t0, kv, tile_V, k_VKQ_sup);
+                    (fattn_sj_kvarn_rec(kv, g), t0, kv, tile_V, k_VKQ_sup);
             } else {
                 const int row0 = p0 < kv.S ? p0 : kv.S + (p0 - kv.S) % kv.cap;
                 if (p0 < kv.S && kv.sink_type == GGML_TYPE_F16) {
