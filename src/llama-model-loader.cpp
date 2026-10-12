@@ -776,6 +776,7 @@ llama_model_loader::llama_model_loader(
             case GGML_TYPE_Q8_CR:   ftype = LLAMA_FTYPE_MOSTLY_Q8_CR;   break;
             case GGML_TYPE_Q5_CR:   ftype = LLAMA_FTYPE_MOSTLY_Q5_CR;   break;
             case GGML_TYPE_Q6_CR:   ftype = LLAMA_FTYPE_MOSTLY_Q6_CR;   break;
+            case GGML_TYPE_EXL3_1:  ftype = LLAMA_FTYPE_MOSTLY_EXL3;    break;
             case GGML_TYPE_EXL3_2:  ftype = LLAMA_FTYPE_MOSTLY_EXL3;    break;
             case GGML_TYPE_EXL3_3:  ftype = LLAMA_FTYPE_MOSTLY_EXL3;    break;
             case GGML_TYPE_EXL3_4:  ftype = LLAMA_FTYPE_MOSTLY_EXL3;    break;

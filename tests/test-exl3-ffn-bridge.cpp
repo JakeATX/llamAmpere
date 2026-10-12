@@ -36,7 +36,7 @@ struct test_case_def {
 
 static std::vector<test_case_def> cases() {
     std::vector<test_case_def> out;
-    for (ggml_type type : { GGML_TYPE_EXL3_2, GGML_TYPE_EXL3_3, GGML_TYPE_EXL3_4, GGML_TYPE_EXL3_5 }) {
+    for (ggml_type type : { GGML_TYPE_EXL3_1, GGML_TYPE_EXL3_2, GGML_TYPE_EXL3_3, GGML_TYPE_EXL3_4, GGML_TYPE_EXL3_5 }) {
         for (int64_t T : { 1, 2, 3, 4, 5, 8, 12, 16, 20 }) {
             out.push_back({ 512, 1536, T, type, false });
         }

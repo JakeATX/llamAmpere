@@ -398,6 +398,7 @@ template <int MT, bool ACC16>
 static int exl3_gemm_launch_bits(const bool probe, const int bits, const uint32_t * trellis, const half * x, float * out, const int T,
                                  const int K, const int N, const int ksplit, const int kps, const float out_scale, cudaStream_t stream) {
     switch (bits) {
+        case 1: return exl3_gemm_launch_bm<1, MT, ACC16>(probe, trellis, x, out, T, K, N, ksplit, kps, out_scale, stream);
         case 2: return exl3_gemm_launch_bm<2, MT, ACC16>(probe, trellis, x, out, T, K, N, ksplit, kps, out_scale, stream);
         case 3: return exl3_gemm_launch_bm<3, MT, ACC16>(probe, trellis, x, out, T, K, N, ksplit, kps, out_scale, stream);
         case 4: return exl3_gemm_launch_bm<4, MT, ACC16>(probe, trellis, x, out, T, K, N, ksplit, kps, out_scale, stream);
@@ -477,7 +478,7 @@ bool ggml_cuda_exl3_gemm_supported(const ggml_tensor * src0, const int64_t T) {
 void ggml_cuda_exl3_gemm(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
                          const int64_t T, const float * suh, const float * svh) {
     const int bits = ggml_exl3_bits(src0->type);
-    GGML_ASSERT(bits >= 2 && bits <= 8);
+    GGML_ASSERT(bits >= 1 && bits <= 8);
     const int K  = (int) src0->ne[0];
     const int N  = (int) src0->ne[1];
     const int kt = K / 16;

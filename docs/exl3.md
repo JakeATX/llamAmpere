@@ -23,7 +23,7 @@ was consulted, and no other project has any claim on this format.
 
 ## What the types are
 
-Seven ggml types, `GGML_TYPE_EXL3_2` through `GGML_TYPE_EXL3_8` (ids 51 to 57), one per bit width. A
+Eight ggml types, `GGML_TYPE_EXL3_1` and `GGML_TYPE_EXL3_2` through `GGML_TYPE_EXL3_8` (ids 60 and 51 to 57), one per bit width. A
 block is one 16x16 tile, 256 weights in `32 * bits` bytes, so a tensor's byte size equals the trellis
 array's byte size exactly. `ggml_exl3_bits()` returns the bit width for these types and 0 otherwise.
 The ggml file type is `LLAMA_FTYPE_MOSTLY_EXL3` (47).
