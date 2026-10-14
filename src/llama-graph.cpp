@@ -1711,6 +1711,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     b1_il0           (params.b1_il0),
     b1_il1           (params.b1_il1),
     b1_carry         (params.b1_carry),
+    ple_pf           (params.ple_pf),
     cb_func          (params.cb),
     res              (params.res),
     model_ref        (params.model),

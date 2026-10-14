@@ -30,6 +30,7 @@
 #include "llama-mtp-chain-sample.h"
 #include "llama-moe-cache.h"
 #include "llama-b1.h"
+#include "llama-ple-prefetch.h"
 #include "llama-ext.h"
 #include "llama-sampler.h"
 #include "llama.h"
@@ -1000,6 +1001,7 @@ llama_context::~llama_context() {
 
     // [B1] give lent expert layers back to the model before the backends go away
     b1.reset();
+    ple_pf.reset();
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
@@ -3348,6 +3350,23 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
     const uint32_t n_outputs_all = balloc->get_n_outputs();
 
+    // [PLEPF] start reading the PLE pages of a prompt call; stopped when the call returns
+    if (!ple_pf_tried) {
+        ple_pf_tried = true;
+        ple_pf = llama_ple_prefetch::create(model, cparams.n_ubatch);
+    }
+    struct ple_pf_guard {
+        llama_ple_prefetch * p = nullptr;
+        ~ple_pf_guard() {
+            if (p) {
+                p->stop();
+            }
+        }
+    } ple_pf_g;
+    if (ple_pf && ple_pf->start(batch_inp, balloc->get_batch().pos[0])) {
+        ple_pf_g.p = ple_pf.get();
+    }
+
     if (output_all) {
         // require that all tokens are output
         if (n_outputs_all != n_tokens_all) {
@@ -4564,6 +4583,7 @@ llm_graph_params llama_context::graph_params(llm_graph_result *             res,
         /*.res         =*/ res,
         /*.model       =*/ &model,
     };
+    p.ple_pf = ple_pf.get();
     if (b1_cur.active) {
         p.b1_il0   = b1_cur.il0;
         p.b1_il1   = b1_cur.il1;

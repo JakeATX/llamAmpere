@@ -41,6 +41,7 @@ struct llama_layer;
 struct llama_prec_policy;
 
 class llama_moe_cache;
+class llama_ple_prefetch;
 
 struct llama_memory_context_i;
 
@@ -934,6 +935,9 @@ struct llm_graph_params {
     int32_t       b1_il1   = -1;
     ggml_tensor * b1_carry = nullptr;
 
+    // [PLEPF] the context's PLE page prefetch (null when off); set after construction
+    llama_ple_prefetch * ple_pf = nullptr;
+
     // true for a graph built only to reserve compute buffers (llama_context::graph_reserve): its output rows are
     // placeholders and may sit on sequences that have no backend sampler (none is attached yet at context creation)
     // set after construction, so it stays last
@@ -1184,6 +1188,7 @@ struct llm_graph_context {
     const int32_t       b1_il0;   // see llm_graph_params
     const int32_t       b1_il1;   // see llm_graph_params (-1 = n_layer)
     ggml_tensor * const b1_carry; // see llm_graph_params
+    llama_ple_prefetch * const ple_pf; // see llm_graph_params
 
     // [#81] logits of the compact draft head for `cur` [n_embd, n], [n_sel, n]: plain mul_mat on the activation the
     // head consumes (EXL3: x_rot = H128(suh * cur), the fused kernel's input glue built from generic ops)

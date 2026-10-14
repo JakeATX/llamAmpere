@@ -21,6 +21,7 @@ struct llama_model;
 class llama_batch_allocr;
 class llama_moe_cache;
 class llama_b1;
+class llama_ple_prefetch;
 
 class llama_io_read_i;
 class llama_io_write_i;
@@ -511,6 +512,9 @@ private:
     // [B1] layer-major prefill (LLAMA_B1=1, opt-in; see llama-b1.h). Declared after the backends so it is
     // destroyed first; the destructor also resets it explicitly.
     std::unique_ptr<llama_b1> b1;
+    // [PLEPF] PLE page prefetch (LLAMA_PLE_PREFETCH=<threads>, opt-in; see llama-ple-prefetch.h)
+    std::unique_ptr<llama_ple_prefetch> ple_pf;
+    bool ple_pf_tried = false;
     bool b1_env   = false; // LLAMA_B1 set
     bool b1_tried = false; // b1 construction attempted
     struct {

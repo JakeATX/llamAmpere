@@ -2,6 +2,7 @@
 #include "llama-impl.h"
 #include "llama-memory-hybrid-idx.h"
 #include "llama-memory-recurrent.h"
+#include "llama-ple-prefetch.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -1310,6 +1311,9 @@ public:
     // the predecessor tokens live in the attention KV cells (ext.tok)
     const llama_kv_cache_context * mctx;
 
+    // [PLEPF] the context's page prefetch, null when off
+    llama_ple_prefetch * pf = nullptr;
+
     // scratch, reused across set_input() calls
     std::vector<llama_token> prev;
 };
@@ -1379,7 +1383,9 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
         ggml_tensor * ple = model.per_layer_tok_embd;
 
         const bool prefetch = model.can_prefetch.count(ple);
-        if (prefetch) {
+        // [PLEPF] the context already reads this call's pages ahead: wait for this ubatch's instead
+        const bool covered = pf && pf->consume((uint32_t) n_tokens, idx.data(), idx.size());
+        if (prefetch && !covered) {
             llama_prefetch_rows(ple, idx.data(), idx.size());
         }
     }
@@ -1464,6 +1470,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
 
     // the attention cells see every ubatch regardless of the layer types
     auto ple_inp = std::make_unique<llm_graph_input_qwen4exp_ple>(model, mctx_hyb->get_attn());
+    ple_inp->pf = ple_pf;
 
     ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
     ggml_set_input(ple_inp->rows);

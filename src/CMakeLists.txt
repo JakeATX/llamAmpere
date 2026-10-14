@@ -32,6 +32,7 @@ set(LLAMA_CORE_SOURCES
     llama-memory.cpp
     llama-moe-cache.cpp
     llama-b1.cpp
+    llama-ple-prefetch.cpp
     llama-memory-hybrid.cpp
     llama-memory-hybrid-iswa.cpp
     llama-memory-hybrid-idx.cpp
