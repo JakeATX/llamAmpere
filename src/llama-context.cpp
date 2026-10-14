@@ -4383,8 +4383,11 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
     }
 
     const std::vector<uint32_t> sizes = mctx->b1_ubatch_sizes();
-    const int64_t min_tok = b1_ctx_env("LLAMA_B1_MIN_TOKENS", (int64_t) cparams.n_ubatch + 1);
-    if (sizes.size() < 2 || (int64_t) n_tokens_all < min_tok || !mctx->b1_supported()) {
+    // auto threshold: shorter calls take the normal path. A one-ubatch call also runs layer-major: it moves the same
+    // expert bytes as the normal path but overlaps the copies with compute (the server sends the last n_ubatch + 4
+    // prompt tokens as their own calls for its context checkpoints)
+    const int64_t min_tok = b1_ctx_env("LLAMA_B1_MIN_TOKENS", 4096);
+    if (sizes.empty() || (int64_t) n_tokens_all < min_tok || !mctx->b1_supported()) {
         return normal();
     }
 
