@@ -269,6 +269,15 @@ public:
     int  sj_kvarn_rot_group() const { return sj_kvarn.body_type == GGML_TYPE_TURBO4_0 ? 128 : 256; }
     ggml_tensor * get_sj_kvarn_body(int32_t il) const;
     bool maintain_sj_kvarn(llama_context * lctx);
+    // [B1] layer-major prefill: every ubatch of the call is applied up front, so the seal bookkeeping of each one is
+    // saved after its apply (b1_sj_save, which also advances B and takes the paged records the way maintenance
+    // would), restored before each of its layer slices (b1_sj_seek), and each slice seals its own layers only
+    // (b1_sj_seal). One sequence per call.
+    void b1_sj_begin(llama_seq_id seq_id); // before the call's first apply: snapshot the bookkeeping for b1_sj_rewind
+    void b1_sj_save(size_t i);
+    bool b1_sj_seek(size_t i);
+    bool b1_sj_seal(llama_context * lctx, int32_t il0, int32_t il1);
+    void b1_sj_rewind(); // undo the bookkeeping of a call whose ubatches were applied but never computed
     int32_t compress_sj_kvarn_idle(llama_context * lctx, llama_seq_id seq_id, llama_pos accepted_end, llama_pos keep_from = -1);
     // sealed end: of the sequence's stream (seq_id >= 0), or the largest over all streams (seq_id < 0)
     uint32_t get_sj_kvarn_sealed_end(llama_seq_id seq_id = -1) const;
@@ -425,6 +434,7 @@ private:
         std::vector<int32_t> table;
     };
     std::vector<sj_kvarn_stream> sj_kvarn_st;
+    sj_kvarn_stream b1_sj_pre; // [B1] the bookkeeping before the current layer-major call (for b1_sj_rewind)
     // Paged record pool (n_stream > 1): records are handed out per group at seal time from a free list and
     // reference counted (seq_cp shares sealed records, which are immutable). Phase 1 (per-stream contexts) sizes
     // the pool for every stream at full length, so it never runs out; with --kv-unified the pool holds
@@ -477,6 +487,15 @@ private:
         ggml_tensor * desc[2] = {nullptr, nullptr}; // per tier
     };
     std::vector<std::vector<sj_kvarn_maintenance_graph>> sj_kvarn_maintenance_graphs; // [stream][backend]
+    // [B1] per ubatch of the current layer-major call: the stream bookkeeping its graph sees (B_old = sealed end
+    // before it, B = after its seal)
+    struct b1_sj_view { uint32_t B_old, B, N, ring_lo; bool draining; };
+    std::vector<b1_sj_view> b1_sj;
+    size_t   b1_sj_cur  = 0;
+    uint32_t b1_sj_strm = 0;     // the call's stream
+    bool     b1_sj_bad  = false; // a save failed (paged pool exhausted): every seek fails, the call falls back
+    std::vector<uint32_t> b1_sj_new; // paged: groups whose records this call took (for b1_sj_rewind)
+    std::vector<std::vector<sj_kvarn_maintenance_graph>> b1_sj_graphs; // [stream][cache layer]: one seal node each
     bool maintain_sj_kvarn_stream(llama_context * lctx, uint32_t strm);
 
     // pre-computed hadamard martrices

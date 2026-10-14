@@ -2161,6 +2161,12 @@ bool llama_context::maintain_sj_kvarn() {
     return kv->maintain_sj_kvarn(this);
 }
 
+bool llama_context::b1_seal_sj_kvarn(int32_t il0, int32_t il1) {
+    auto * kv = llama_sj_kvarn_cache(memory.get());
+    if (!kv || !kv->is_sj_kvarn()) { return true; }
+    return kv->b1_sj_seal(this, il0, il1);
+}
+
 int32_t llama_context::compress_sj_kvarn_idle(llama_seq_id seq_id, llama_pos accepted_end, llama_pos keep_from) {
     auto * kv = llama_sj_kvarn_cache(memory.get());
     if (!kv || !kv->is_sj_kvarn()) { return -1; }
@@ -2833,7 +2839,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
         return nullptr;
     }
 
-    if (!maintain_sj_kvarn()) {
+    // [B1] a layer slice seals its own layers for its ubatch (the bookkeeping was advanced when it was applied)
+    if (b1_cur.active ? !b1_seal_sj_kvarn(b1_cur.il0, b1_cur.il1) : !maintain_sj_kvarn()) {
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
@@ -3451,8 +3458,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     auto b1_fail = [&](ggml_status st) -> int {
         b1_cur = {};
         b1->end(true);
-        LLAMA_LOG_WARN("%s: [B1] removing memory module entries for seq_id = %d, pos = [%d, +inf)\n", __func__, b1_seq, b1_pos0);
-        memory->seq_rm(b1_seq, b1_pos0, -1);
+        // SJ-KVaRN: layers stopped at different ubatches, so ring rows below b1_pos0 may already be overwritten in
+        // some layers and sealed groups disagree between layers; only a full clear of the sequence is exact
+        const bool sj_on = llama_sj_kvarn_cache(memory.get()) && llama_sj_kvarn_cache(memory.get())->is_sj_kvarn();
+        const llama_pos rm0 = sj_on ? -1 : b1_pos0;
+        LLAMA_LOG_WARN("%s: [B1] removing memory module entries for seq_id = %d, pos = [%d, +inf)\n", __func__, b1_seq, std::max<llama_pos>(0, rm0));
+        memory->seq_rm(b1_seq, rm0, -1);
         switch (st) {
             case GGML_STATUS_ABORTED:      return 2;
             case GGML_STATUS_ALLOC_FAILED: return -2;
@@ -4418,11 +4429,21 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
     }
 
     // apply every ubatch now, saving each memory view
+    auto * sj = llama_sj_kvarn_cache(memory.get());
+    if (sj && !sj->is_sj_kvarn()) {
+        sj = nullptr;
+    }
+    if (sj) {
+        sj->b1_sj_begin(seq);
+    }
     size_t n_applied = 0;
     do {
         if (!mctx->apply()) {
             LLAMA_LOG_ERROR("%s: [B1] failed to apply memory context of ubatch %zu\n", __func__, n_applied);
             b1->end(true);
+            if (sj) {
+                sj->b1_sj_rewind();
+            }
             memory->seq_rm(seq, balloc->seq_pos_min(seq), -1);
             return -3;
         }
@@ -4433,6 +4454,9 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
     if (n_applied != sizes.size() || !mctx->b1_seek(0)) {
         LLAMA_LOG_ERROR("%s: [B1] the memory context did not keep its ubatch views\n", __func__);
         b1->end(true);
+        if (sj) {
+            sj->b1_sj_rewind();
+        }
         memory->seq_rm(seq, balloc->seq_pos_min(seq), -1);
         return -3;
     }

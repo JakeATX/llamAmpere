@@ -63,6 +63,7 @@ struct llama_context {
     void synchronize();
     ggml_backend_t sj_kvarn_backend(ggml_backend_buffer_t buffer) const;
     bool maintain_sj_kvarn();
+    bool b1_seal_sj_kvarn(int32_t il0, int32_t il1); // [B1] seal the current ubatch's groups in layers [il0, il1) only
     int32_t compress_sj_kvarn_idle(llama_seq_id seq_id, llama_pos accepted_end, llama_pos keep_from = -1);
 
 
