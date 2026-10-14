@@ -156,6 +156,7 @@ struct common_sampler_pq_stats {
     size_t n_match = 0; // accepted because the target sample equalled the draft token
     size_t n_extra = 0; // accepted by the residual acceptance test (id-match would have rejected)
     size_t n_rej   = 0; // rejected: token drawn from the residual distribution norm(max(p - q, 0))
+    size_t n_lossy = 0; // rejected by the exact test but kept because p(draft) >= p(replacement)
     double sum_p_d = 0; // sum of p(draft[i]): the id-match acceptance probability
     double sum_min = 0; // sum of sum_x min(p(x), q(x)): the p/q acceptance probability
 };

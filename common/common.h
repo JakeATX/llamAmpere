@@ -309,6 +309,9 @@ struct common_params_sampling {
 
     bool backend_sampling = false;
 
+    // Keep a rejected draft if its target probability is at least the residual replacement's probability.
+    bool spec_lossy = false;
+
     // print the parameters into a string
     std::string print() const;
 };
