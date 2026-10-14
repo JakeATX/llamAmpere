@@ -6543,6 +6543,376 @@ static int ggml_cuda_fuse_norm_mul_cast(ggml_backend_cuda_context & ctx, const g
     return c - i;
 }
 
+// [HCPN] Flash-Next hyper-connection norm fusions, both opt-in and exact (see dsv4_hc_post_norm_f32 in dsv4-hc.cu).
+//
+// GGML_CUDA_HC_POST_NORM=1: DSV4_HC_POST (identity comb) -> RMS_NORM -> MUL(gamma) [-> RESHAPE/VIEW nodes -> CPY to
+// BF16, the NORM_CAST pattern] runs as one kernel per norm row. The hc_post output is still written in f32 (the
+// residual stream reads it), and the norm takes it from registers instead of reading it back. hc_post's expression
+// and the norm's sum, reduction tree, scale and products are unchanged, so every output byte matches the unfused graph.
+//
+// GGML_CUDA_HC_PRE_XN=1: when the norm output xn has the BF16 copy and its only other reader is one gated
+// DSV4_HC_PRE (through RESHAPE/VIEW nodes), the norm writes the BF16 copy plus one scale per row, into the first float
+// of that row of xn's own buffer, instead of the f32 xn; the hc_pre rebuilds each xn value from the norm input as
+// (scale * x) * gamma, the norm's two products in its order. xn stays allocated until that hc_pre (its reader) has
+// run, and the norm input must be read again after the hc_pre (in this graph or, when this graph is a scheduler split
+// that computes it, in a later split: the whole graph's use counts tell), so nothing reuses either buffer in between.
+// Nothing between the norm and the hc_pre may write over the norm input. The hc_pre launch is queued here and issued
+// by the graph loop when it reaches that node (ggml_cuda_hc_pre_xn_launch). Applies with or without HC_POST_NORM (the
+// first layer and the PLE layers norm a tensor that is not an hc_post output).
+static bool ggml_cuda_hc_post_norm_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_CUDA_HC_POST_NORM");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return enabled;
+}
+
+static bool ggml_cuda_hc_pre_xn_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_CUDA_HC_PRE_XN");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return enabled;
+}
+
+static std::atomic<int64_t> g_hc_post_norm_count{0};
+static std::atomic<int64_t> g_hc_pre_xn_count{0};
+
+struct ggml_cuda_hc_pre_xn_rec {
+    const ggml_tensor * hc_pre;
+    const ggml_tensor * x;          // the norm input
+    const ggml_tensor * gamma;
+    const float *       row_scale;  // in xn's buffer
+};
+// queued by the norm, issued by the graph loop at the hc_pre node in the same pass (cleared at the start of a pass)
+static thread_local std::vector<ggml_cuda_hc_pre_xn_rec> g_hc_pre_xn_pending;
+
+static bool ggml_cuda_hc_pre_xn_launch(ggml_backend_cuda_context & ctx, ggml_tensor * node) {
+    if (g_hc_pre_xn_pending.empty() || node->op != GGML_OP_DSV4_HC_PRE) {
+        return false;
+    }
+    for (size_t k = 0; k < g_hc_pre_xn_pending.size(); ++k) {
+        const ggml_cuda_hc_pre_xn_rec rec = g_hc_pre_xn_pending[k];
+        if (rec.hc_pre == node) {
+            g_hc_pre_xn_pending.erase(g_hc_pre_xn_pending.begin() + k);
+            ggml_cuda_op_dsv4_hc_pre_xn(ctx, node, rec.x, rec.gamma, rec.row_scale);
+            g_hc_pre_xn_count++;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool ggml_cuda_overlaps(const ggml_tensor * a, const ggml_tensor * b) {
+    const char * a0 = (const char *) a->data;
+    const char * b0 = (const char *) b->data;
+    return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
+}
+
+static int32_t ggml_cuda_graph_use_count(const ggml_cgraph * cgraph, const ggml_tensor * t) {
+    const size_t pos = ggml_hash_find(&cgraph->visited_hash_set, t);
+    if (pos == GGML_HASHSET_FULL || !ggml_bitset_get(cgraph->visited_hash_set.used, pos)) {
+        return 0;
+    }
+    return cgraph->use_counts[pos];
+}
+
+// HC_PRE_XN: the index of the one gated DSV4_HC_PRE that, with the CPY, accounts for every use of mul (xn) and of its
+// RESHAPE/VIEW descendants (use counts are the whole graph's, so a reader in another split also refuses), or -1
+static int ggml_cuda_hc_pre_xn_match(const ggml_cgraph * cgraph, int n, const ggml_tensor * x, const ggml_tensor * gamma,
+                                     const ggml_tensor * mul, const ggml_tensor * cpy) {
+    if (mul->ne[3] != 1 || x->view_src != nullptr || (mul->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return -1;
+    }
+    const ggml_tensor * set[16];
+    int     n_set = 0;
+    int64_t want  = 0;
+    int64_t seen  = 0;
+    const auto in_set = [&](const ggml_tensor * t) {
+        for (int k = 0; k < n_set; ++k) {
+            if (set[k] == t) {
+                return true;
+            }
+        }
+        return false;
+    };
+    set[n_set++] = mul;
+    want += ggml_cuda_graph_use_count(cgraph, mul);
+
+    int pre_idx = -1;
+    const int end = std::min(cgraph->n_nodes, n + 64);
+    for (int j = n + 2; j < end && seen < want; ++j) {
+        const ggml_tensor * t = cgraph->nodes[j];
+        int  refs    = 0;
+        bool src0_in = false;
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            if (t->src[s] != nullptr && in_set(t->src[s])) {
+                refs++;
+                src0_in = src0_in || s == 0;
+            }
+        }
+        if (refs == 0) {
+            continue;
+        }
+        if (refs != 1 || !src0_in) {
+            return -1;
+        }
+        if (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW) {
+            if (n_set == 16 || (t->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                return -1;
+            }
+            set[n_set++] = t;
+            want += ggml_cuda_graph_use_count(cgraph, t);
+        } else if (t == cpy) {
+            // the absorbed BF16 copy
+        } else if (t->op == GGML_OP_DSV4_HC_PRE && pre_idx < 0) {
+            pre_idx = j;
+        } else {
+            return -1;
+        }
+        seen += refs;
+    }
+    if (pre_idx < 0 || seen != want) {
+        return -1;
+    }
+
+    const ggml_tensor * pre  = cgraph->nodes[pre_idx];
+    const ggml_tensor * pxn  = pre->src[0];
+    const ggml_tensor * gate = pre->src[1];
+    if (ggml_get_op_params_i32(pre, 1) == 0 || (pre->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || pre->type != GGML_TYPE_F32 ||
+        gate == nullptr || gate->type != GGML_TYPE_F32 || gate->view_src == mul ||
+        !(pxn == mul || (pxn->view_src == mul && pxn->view_offs == 0)) || !ggml_is_contiguous(pxn) ||
+        !ggml_are_same_shape(pxn, mul)) {
+        return -1;
+    }
+    // the scale lives in xn's buffer: nothing the hc_pre reads or writes may share it, and the hc_pre output must not
+    // overlap what it reads
+    if (ggml_cuda_overlaps(mul, x) || ggml_cuda_overlaps(mul, gamma) || ggml_cuda_overlaps(mul, gate) ||
+        ggml_cuda_overlaps(mul, pre) || ggml_cuda_overlaps(pre, x) || ggml_cuda_overlaps(pre, gamma) ||
+        ggml_cuda_overlaps(pre, gate)) {
+        return -1;
+    }
+    // nothing between the norm and the hc_pre may write over the norm input
+    for (int j = n + 1; j < pre_idx; ++j) {
+        const ggml_tensor * t = cgraph->nodes[j];
+        if (!ggml_op_is_empty(t->op) && ggml_cuda_overlaps(t, x)) {
+            return -1;
+        }
+    }
+    // the norm input must outlive the hc_pre: an output, a weight, or read again (directly or through a view) later
+    bool live = (x->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+                (x->buffer != nullptr && ggml_backend_buffer_get_usage(x->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    for (int j = pre_idx + 1; j < cgraph->n_nodes && !live; ++j) {
+        const ggml_tensor * t = cgraph->nodes[j];
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            if (t->src[s] != nullptr && (t->src[s] == x || t->src[s]->view_src == x)) {
+                live = true;
+                break;
+            }
+        }
+    }
+    // the reader may be in a later split (this graph is then a view sharing the whole graph's use counts): when x is
+    // computed in this graph, no reader precedes it, so whole-graph uses beyond those up to the hc_pre come after it
+    if (!live) {
+        int x_idx = -1;
+        for (int j = n - 1; j >= 0 && j >= n - 8; --j) {
+            if (cgraph->nodes[j] == x) {
+                x_idx = j;
+                break;
+            }
+        }
+        if (x_idx >= 0) {
+            int32_t uses = 0;
+            for (int j = x_idx + 1; j <= pre_idx; ++j) {
+                for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                    uses += cgraph->nodes[j]->src[s] == x;
+                }
+            }
+            live = ggml_cuda_graph_use_count(cgraph, x) > uses;
+        }
+    }
+    return live ? pre_idx : -1;
+}
+
+// HC_POST_NORM, at graph_optimize: the index of the last node of the run DSV4_HC_POST (identity comb, node i) ->
+// RMS_NORM -> MUL [-> RESHAPE/VIEW nodes -> CPY to BF16] that ggml_cuda_fuse_hc_norm may fuse, or -1. The fused kernel
+// reads the hc_post inputs while it writes the norm output and its BF16 copy, and a block output or post weight row
+// is read by every stream row of its token, so those outputs must not be placed over the inputs: the caller keeps the
+// inputs allocated until this node.
+static int ggml_cuda_hc_post_norm_last(const ggml_cgraph * cgraph, int i) {
+    const ggml_tensor * hpost = cgraph->nodes[i];
+    if (hpost->op != GGML_OP_DSV4_HC_POST || hpost->src[3] != nullptr || hpost->type != GGML_TYPE_F32 ||
+        hpost->ne[0] > 4*1024 || i + 2 >= cgraph->n_nodes) {
+        return -1;
+    }
+    const ggml_tensor * norm = cgraph->nodes[i + 1];
+    const ggml_tensor * mul  = cgraph->nodes[i + 2];
+    if (norm->op != GGML_OP_RMS_NORM || norm->src[0] != hpost || mul->op != GGML_OP_MUL ||
+        (mul->src[0] != norm && mul->src[1] != norm)) {
+        return -1;
+    }
+    int c = i + 3;
+    while (c < cgraph->n_nodes && c < i + 9 && (cgraph->nodes[c]->op == GGML_OP_RESHAPE || cgraph->nodes[c]->op == GGML_OP_VIEW)) {
+        ++c;
+    }
+    if (c < cgraph->n_nodes) {
+        const ggml_tensor * t = cgraph->nodes[c];
+        if (t->op == GGML_OP_CPY && t->type == GGML_TYPE_BF16 && t->src[0] != nullptr &&
+            (t->src[0] == mul || t->src[0]->view_src == mul)) {
+            return c;
+        }
+    }
+    return i + 2;
+}
+
+// GGML_LEDGER=1: why a candidate did not fuse, site cuda.hc_norm
+static int ggml_cuda_hc_norm_refuse(const char * key) {
+    if (ggml_ledger_enabled()) {
+        ggml_ledger_add("cuda.hc_norm", key, 1);
+    }
+    return -1;
+}
+
+// node i is DSV4_HC_POST (HC_POST_NORM, and HC_PRE_XN too if it applies) or RMS_NORM (HC_PRE_XN only).
+// Returns the number of extra nodes consumed, or -1.
+static int ggml_cuda_fuse_hc_norm(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+    const bool f_post = ggml_cuda_hc_post_norm_enabled();
+    const bool f_xn   = ggml_cuda_hc_pre_xn_enabled();
+    if (!f_post && !f_xn) {
+        return -1;
+    }
+    const ggml_tensor * node  = cgraph->nodes[i];
+    const ggml_tensor * hpost = nullptr;
+    int n = i;
+    if (node->op == GGML_OP_DSV4_HC_POST) {
+        if (!f_post) {
+            return -1;
+        }
+        hpost = node;
+        n     = i + 1;
+    } else if (node->op != GGML_OP_RMS_NORM || !f_xn) {
+        return -1;
+    }
+    if (n + 1 >= cgraph->n_nodes) {
+        return -1;
+    }
+    ggml_tensor * norm = cgraph->nodes[n];
+    if (norm->op != GGML_OP_RMS_NORM || (hpost != nullptr && norm->src[0] != hpost) ||
+        !ggml_cuda_can_fuse(cgraph, n, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
+        return hpost != nullptr ? ggml_cuda_hc_norm_refuse("post:refuse=no_norm") : -1;
+    }
+    if (!ctx.stream_context().concurrent_events.empty()) {
+        return hpost != nullptr ? ggml_cuda_hc_norm_refuse("post:refuse=concurrent") : -1;
+    }
+    ggml_tensor *       mul   = cgraph->nodes[n + 1];
+    const ggml_tensor * x     = norm->src[0];
+    const ggml_tensor * gamma = mul->src[0] == norm ? mul->src[1] : mul->src[0];
+    if (!ggml_is_contiguous(mul) || x->type != GGML_TYPE_F32 || x->nb[0] != sizeof(float) ||
+        gamma->type != GGML_TYPE_F32 || gamma->nb[0] != sizeof(float) || gamma->ne[0] != x->ne[0] ||
+        x->ne[0] > 4*1024 || x->ne[1] > INT_MAX || x->ne[2] > 65535 || x->ne[3] > 65535) {
+        return hpost != nullptr ? ggml_cuda_hc_norm_refuse("post:refuse=norm_shape") : -1;
+    }
+    if (hpost != nullptr) {
+        const ggml_tensor * hx  = hpost->src[0];
+        const ggml_tensor * res = hpost->src[1];
+        const ggml_tensor * pw  = hpost->src[2];
+        if (hpost->src[3] != nullptr || hpost->type != GGML_TYPE_F32 || hx->type != GGML_TYPE_F32 ||
+            res->type != GGML_TYPE_F32 || pw->type != GGML_TYPE_F32 || hpost->ne[3] != 1 ||
+            hpost->ne[0] != hx->ne[0] || hpost->ne[1] != res->ne[1] || hpost->ne[2] != hx->ne[1] ||
+            (hpost->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            return ggml_cuda_hc_norm_refuse("post:refuse=post_shape");
+        }
+    }
+
+    // the NORM_CAST tail, if the graph has it
+    ggml_tensor * cpy = nullptr;
+    int c = n + 2;
+    while (c < cgraph->n_nodes && c < n + 8 && (cgraph->nodes[c]->op == GGML_OP_RESHAPE || cgraph->nodes[c]->op == GGML_OP_VIEW)) {
+        ++c;
+    }
+    if (c < cgraph->n_nodes) {
+        ggml_tensor *       t   = cgraph->nodes[c];
+        const ggml_tensor * src = t->src[0];
+        if (t->op == GGML_OP_CPY && t->type == GGML_TYPE_BF16 && ggml_is_contiguous(t) && t->buffer != nullptr &&
+            (t->flags & GGML_TENSOR_FLAG_COMPUTE) && src != nullptr && src->type == GGML_TYPE_F32 &&
+            ggml_is_contiguous(src) && (src == mul || (src->view_src == mul && src->view_offs == 0)) &&
+            ggml_nelements(t) == ggml_nelements(mul)) {
+            cpy = t;
+        }
+    }
+    if (hpost == nullptr && cpy == nullptr) {
+        return -1; // HC_PRE_XN needs the BF16 copy
+    }
+
+    // the outputs (xn or its scales, the BF16 copy, the hc_post output) must not overlap each other or any input. One
+    // overlap is allowed: xn or the hc_post output sitting exactly on the hc_post residual (same address and layout),
+    // which the allocator does when the hc_post was the residual's last reader; each block reads its own residual row
+    // before it writes the same row of the output (dsv4_hc_post_norm_f32), so no block reads what another wrote.
+    const ggml_tensor * res = hpost != nullptr ? hpost->src[1] : nullptr;
+    const auto on_residual = [&](const ggml_tensor * out, const ggml_tensor * in) {
+        return in == res && out != cpy && out->data == in->data && ggml_are_same_layout(out, in);
+    };
+    std::array<const ggml_tensor *, 4> ins  = { x, gamma, nullptr, nullptr };
+    std::array<const ggml_tensor *, 3> outs = { mul, cpy, hpost };
+    if (hpost != nullptr) {
+        ins = { hpost->src[0], hpost->src[1], hpost->src[2], gamma };
+    }
+    for (size_t a = 0; a < outs.size(); ++a) {
+        if (outs[a] == nullptr) {
+            continue;
+        }
+        for (const ggml_tensor * in : ins) {
+            if (in != nullptr && ggml_cuda_overlaps(outs[a], in) && !on_residual(outs[a], in)) {
+                return ggml_cuda_hc_norm_refuse(hpost != nullptr ? "post:refuse=overlap" : "xn:refuse=overlap");
+            }
+        }
+        for (size_t b = a + 1; b < outs.size(); ++b) {
+            if (outs[b] != nullptr && ggml_cuda_overlaps(outs[a], outs[b])) {
+                return ggml_cuda_hc_norm_refuse(hpost != nullptr ? "post:refuse=overlap" : "xn:refuse=overlap");
+            }
+        }
+    }
+
+    const int pre_idx = f_xn && cpy != nullptr ? ggml_cuda_hc_pre_xn_match(cgraph, n, x, gamma, mul, cpy) : -1;
+    if (f_xn && cpy != nullptr && pre_idx < 0) {
+        ggml_cuda_hc_norm_refuse("xn:refuse=no_match");
+    }
+    if (hpost == nullptr && pre_idx < 0) {
+        return -1;
+    }
+    if (ggml_ledger_enabled()) {
+        if (hpost != nullptr) {
+            ggml_ledger_add("cuda.hc_norm", mul->data == res->data ? "post:fused xn_on_residual" : "post:fused", 1);
+        }
+        if (pre_idx >= 0) {
+            ggml_ledger_add("cuda.hc_norm", "xn:fused", 1);
+        }
+    }
+    float * row_scale = pre_idx >= 0 ? (float *) mul->data : nullptr;
+
+    ggml_cuda_op_dsv4_hc_post_norm(ctx, hpost, norm, mul, cpy ? (nv_bfloat16 *) cpy->data : nullptr, row_scale);
+
+    if (hpost != nullptr) {
+        g_hc_post_norm_count++;
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            GGML_LOG_INFO("%s: GGML_CUDA_HC_POST_NORM: hc_post+rms_norm+mul%s fused (%s)\n", __func__,
+                          cpy ? "+cpy(bf16)" : "", mul->name);
+        }
+    }
+    if (pre_idx >= 0) {
+        g_hc_pre_xn_pending.push_back({ cgraph->nodes[pre_idx], x, gamma, row_scale });
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            GGML_LOG_INFO("%s: GGML_CUDA_HC_PRE_XN: %s rebuilds xn from the norm input, no f32 xn (%s)\n", __func__,
+                          cgraph->nodes[pre_idx]->name, mul->name);
+        }
+    }
+    return (cpy != nullptr ? c : n + 1) - i;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 // nodes [i, i+4] = RMS_NORM, MUL, RMS_NORM, MUL, CONCAT(dim 0) over a single row, with the two
 // MULs as the concat's only consumers of the norms. Returns the extra node count consumed, or -1.
@@ -6782,6 +7152,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             }
         }
         return 0;
+    }
+
+    // [HCPN] ahead of the other RMS_NORM fusions: HC_PRE_XN supersedes NORM_CAST at the norms it applies to
+    if (node->op == GGML_OP_DSV4_HC_POST || node->op == GGML_OP_RMS_NORM) {
+        const int n_hc = ggml_cuda_fuse_hc_norm(*cuda_ctx, cgraph, i);
+        if (n_hc >= 0) {
+            return n_hc;
+        }
     }
 
     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
@@ -7752,6 +8130,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 ggml_cuda_conv_ring_plan(cuda_ctx, cgraph, conv_ring_skip);
             }
 
+            g_hc_pre_xn_pending.clear();
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (is_concurrent_event_active) {
@@ -7799,6 +8178,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
 
                 if (!conv_ring_skip.empty() && conv_ring_skip[i]) {
+                    continue;
+                }
+
+                // [HCPN] the hc_pre whose xn the norm did not write (GGML_CUDA_HC_PRE_XN)
+                if (ggml_cuda_hc_pre_xn_launch(*cuda_ctx, node)) {
                     continue;
                 }
 
@@ -7865,6 +8249,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     try_launch_concurrent_event(node);
                }
             }
+            // [HCPN] every queued hc_pre must have run: its xn was never written
+            GGML_ASSERT(g_hc_pre_xn_pending.empty() && "GGML_CUDA_HC_PRE_XN: a queued hc_pre was not reached");
             for (auto * runtime : kv_stream_runtimes) {
                 ggml_cuda_kv_stream_graph_end(runtime->transfer_ring, cuda_ctx->stream());
             }
@@ -8157,6 +8543,23 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                     }
                 }
             }
+        }
+    }
+
+    // [HCPN] GGML_CUDA_HC_POST_NORM: keep the hc_post inputs allocated until the last fused node, so the norm output
+    // and its BF16 copy cannot be placed over them (ggml_cuda_hc_post_norm_last; the fusion still refuses any overlap
+    // at eval). This may increase the compute buffer size.
+    if (!disable_fusion && ggml_cuda_hc_post_norm_enabled()) {
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            const int last = ggml_cuda_hc_post_norm_last(cgraph, i);
+            if (last < 0) {
+                continue;
+            }
+            ggml_tensor * hpost = cgraph->nodes[i];
+            for (int s = 0; s < 3; ++s) {
+                params->add_alloc_dep(params->user_data, hpost->src[s], cgraph->nodes[last]);
+            }
+            i = last;
         }
     }
 
@@ -9482,6 +9885,13 @@ int64_t ggml_backend_cuda_fusion_count(ggml_backend_t backend, const char * name
     }
     if (strcmp(name, "exl3_ffn_bridge") == 0) {
         return ctx->fusion_stats.exl3_ffn_bridge;
+    }
+    // [HCPN] process-wide counts (not per context)
+    if (strcmp(name, "hc_post_norm") == 0) {
+        return g_hc_post_norm_count.load();
+    }
+    if (strcmp(name, "hc_pre_xn") == 0) {
+        return g_hc_pre_xn_count.load();
     }
     return -1;
 }

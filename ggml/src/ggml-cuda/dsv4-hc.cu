@@ -1,4 +1,5 @@
 #include "common.cuh"
+#include "convert.cuh"
 #include "dsv4-hc.cuh"
 
 
@@ -313,4 +314,320 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
             nbp0 / sizeof(float), nbp1 / sizeof(float),
             nbc0 / sizeof(float), nbc1 / sizeof(float), nbc2 / sizeof(float),
             nbd0 / sizeof(float), nbd1 / sizeof(float), nbd2 / sizeof(float));
+}
+
+// [HCPN] GGML_CUDA_HC_POST_NORM=1 / GGML_CUDA_HC_PRE_XN=1, see ggml_cuda_fuse_hc_norm in ggml-cuda.cu.
+//
+// dsv4_hc_post_norm_f32 runs one row of the hyper-connection norm RMS_NORM -> MUL(gamma) [-> CPY to BF16], and with
+// do_post first produces that row with the identity-comb hc_post (dsv4_hc_post_f32<false>'s expression), writing it
+// to the hc_post output for the residual stream and keeping it in registers for the norm. The norm arithmetic is
+// rms_norm_mul_cast_bf16_f32<old_bs>'s (norm.cu) in the same order: old thread o sums x*x over the columns
+// o, o + old_bs, ... in that order, block_reduce<SUM, old_bs> adds the partial sums, and each output is
+// (scale * x) * gamma. Here old_bs/R threads each play R old threads (thread t is old thread t + r*old_bs/R, so it
+// sits on the same lane of old warp t/32 + r*old_bs/(32*R)); every old partial sum stays in its own register and goes
+// through the same warp shuffles, the same shared-memory slot and the same final warp sum, so every value and every
+// output byte is the unfused path's. write_xn == false (HC_PRE_XN) writes the per-row scale instead of the f32 output,
+// into the first float of that row of the output buffer.
+//
+// The f32 output (or its scales) may sit exactly on the hc_post residual (same layout, same address): the graph
+// allocator gives the norm output the residual's buffer once the hc_post was its last reader. That is race-free here:
+// block srow reads only row srow of the residual, all of it before the __syncthreads, and writes only row srow of the
+// output after it. Any other overlap between what one block writes and what another reads is refused by the caller.
+static constexpr int DSV4_HC_NORM_MAX_ITER = 4; // columns per old thread kept in registers: ncols <= 4*old_bs
+static constexpr int DSV4_HC_NORM_R        = 4; // old threads per thread in the 1024-thread layout (256 threads), the fastest
+                                                // of 1/2/4 at 12288 tokens
+
+template <int old_bs, int R, bool do_post, bool write_xn>
+static __global__ void dsv4_hc_post_norm_f32(
+        const float * hx,           // do_post: hc_post x (the block output), [n_embd, n_tokens]
+        const float * residual,     // do_post: hc_post residual, [n_embd, hc, n_tokens]
+        const float * post,         // do_post: hc_post weights, [hc, n_tokens]
+        float *       h,            // do_post: hc_post output, the norm input
+        const float * x,            // !do_post: the norm input
+        const int64_t sx0,
+        const int64_t sx1,
+        const int64_t sr0,
+        const int64_t sr1,
+        const int64_t sr2,
+        const int64_t sp0,
+        const int64_t sp1,
+        const int64_t sh0,
+        const int64_t sh1,
+        const int64_t sh2,
+        const int64_t stride_row,
+        const int64_t stride_channel,
+        const int64_t stride_sample,
+        const int     ncols,
+        const float   eps,
+        const float * mul,
+        const int64_t mul_stride_row,
+        const int64_t mul_stride_channel,
+        const int64_t mul_stride_sample,
+        const uint3   mul_nrows_packed,
+        const uint3   mul_nchannels_packed,
+        const uint3   mul_nsamples_packed,
+        float *       dst,
+        nv_bfloat16 * dst_bf16,
+        float *       row_scale) {
+    constexpr int NB = old_bs / R;          // threads per block
+    constexpr int NW = NB / WARP_SIZE;      // warps per block
+    constexpr int K  = DSV4_HC_NORM_MAX_ITER;
+    static_assert(old_bs % R == 0 && NB % WARP_SIZE == 0 && old_bs <= 1024, "bad block layout");
+
+    ggml_cuda_pdl_lc();
+    const int nrows     = gridDim.x;
+    const int nchannels = gridDim.y;
+
+    const int row     = blockIdx.x;
+    const int channel = blockIdx.y;
+    const int sample  = blockIdx.z;
+    const int tid     = threadIdx.x;
+
+    const int64_t srow    = (int64_t(sample)*nchannels + channel)*nrows + row;
+    const int64_t dst_off = srow*ncols;
+
+    const uint32_t mul_row     = fastmodulo(row, mul_nrows_packed);
+    const uint32_t mul_channel = fastmodulo(channel, mul_nchannels_packed);
+    const uint32_t mul_sample  = fastmodulo(sample, mul_nsamples_packed);
+    mul += mul_sample * mul_stride_sample + mul_channel * mul_stride_channel + mul_row * mul_stride_row;
+
+    if constexpr (!do_post) {
+        x += sample*stride_sample + channel*stride_channel + row*stride_row;
+    }
+
+    float v[R][K];
+    float tmp[R]; // the partial sums of old threads tid + r*NB
+
+    ggml_cuda_pdl_sync();
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        tmp[r] = 0.0f;
+#pragma unroll
+        for (int k = 0; k < K; ++k) {
+            const int col = tid + r*NB + k*old_bs;
+            v[r][k] = 0.0f;
+            if (col < ncols) {
+                float xi;
+                if constexpr (do_post) {
+                    // hc_post element (i0, idst, it) = (col, row, channel); the norm reads hc_post's output row by row
+                    float sum = hx[col*sx0 + channel*sx1] * post[row*sp0 + channel*sp1];
+                    sum += residual[col*sr0 + row*sr1 + channel*sr2];
+                    h[col*sh0 + row*sh1 + channel*sh2] = sum;
+                    xi = sum;
+                } else {
+                    xi = x[col];
+                }
+                v[r][k] = xi;
+                tmp[r] += xi * xi;
+            }
+        }
+    }
+
+    // block_reduce<SUM, old_bs>: each old warp's shuffle sum, one shared slot per old warp, then one warp sum
+    __shared__ float s_sum[32];
+    const int warp_id = tid / WARP_SIZE;
+    const int lane_id = tid % WARP_SIZE;
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        tmp[r] = warp_reduce_sum(tmp[r]);
+    }
+    if (lane_id == 0) {
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            s_sum[warp_id + r*NW] = tmp[r];
+        }
+    }
+    __syncthreads();
+    float total = 0.0f;
+    if (lane_id < old_bs / WARP_SIZE) {
+        total = s_sum[lane_id];
+    }
+    total = warp_reduce_sum(total);
+
+    const float mean  = total / ncols;
+    const float scale = rsqrtf(mean + eps);
+
+    if constexpr (!write_xn) {
+        if (tid == 0) {
+            row_scale[dst_off] = scale; // the first float of this row of the f32 output, which only this block touches
+        }
+    }
+
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+#pragma unroll
+        for (int k = 0; k < K; ++k) {
+            const int col = tid + r*NB + k*old_bs;
+            if (col < ncols) {
+                const float o = scale * v[r][k] * mul[col];
+                if constexpr (write_xn) {
+                    dst[dst_off + col] = o;
+                }
+                if (dst_bf16 != nullptr) {
+                    dst_bf16[dst_off + col] = ggml_cuda_cast<nv_bfloat16>(o);
+                }
+            }
+        }
+    }
+}
+
+// dsv4_hc_pre_f32<true> with each xn value rebuilt from the norm input: xn = (scale * x) * gamma, the norm's two
+// products in its order, so the value, and so the sum and the output, are bit-identical. x and xn share the
+// [n_embd, hc, n_tokens] element order (hc_pre's xn is a contiguous view of the norm output), the scale of
+// (stream, token) row it*hc + ih is the first float of that row of xn's buffer, and gamma is broadcast over rows and
+// tokens as the MUL did.
+static __global__ void dsv4_hc_pre_xn_f32(
+        const float * x,
+        const float * gamma,
+        const float * row_scale,
+        const float * weights,
+        float *       dst,
+        int64_t       n_embd,
+        int64_t       hc,
+        int64_t       n_tokens,
+        int64_t       sx1,
+        int64_t       sx2,
+        int64_t       sg1,
+        int64_t       sg2,
+        int64_t       g_ne1,
+        int64_t       g_ne2,
+        int64_t       sw0,
+        int64_t       sw1,
+        int64_t       sw2,
+        int64_t       sd0,
+        int64_t       sd1,
+        float         scale) {
+    ggml_cuda_pdl_lc();
+    const int64_t ir = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t nr = n_embd * n_tokens;
+
+    if (ir >= nr) {
+        return;
+    }
+
+    ggml_cuda_pdl_sync();
+
+    const int64_t i0 = ir % n_embd;
+    const int64_t it = ir / n_embd;
+
+    const float * g_it = gamma + (it % g_ne2)*sg2 + i0;
+
+    float sum = 0.0f;
+    for (int64_t ih = 0; ih < hc; ++ih) {
+        const float xv = row_scale[(it*hc + ih)*n_embd] * x[i0 + ih*sx1 + it*sx2] * g_it[(ih % g_ne1)*sg1];
+        const float wv = 1.0f / (1.0f + expf(-weights[i0*sw0 + ih*sw1 + it*sw2]));
+        sum += xv * wv;
+    }
+
+    dst[i0*sd0 + it*sd1] = scale * sum;
+}
+
+template <int old_bs, int R, bool do_post, bool write_xn>
+static void dsv4_hc_post_norm_launch(ggml_backend_cuda_context & ctx, const ggml_tensor * post, const ggml_tensor * norm,
+                                     const ggml_tensor * mul, nv_bfloat16 * dst_bf16, float * row_scale) {
+    const ggml_tensor * src   = norm->src[0];
+    const ggml_tensor * gamma = mul->src[0] == norm ? mul->src[1] : mul->src[0];
+
+    float eps = 0.0f;
+    memcpy(&eps, norm->op_params, sizeof(float));
+
+    const int64_t ne00 = src->ne[0];
+    const dim3 blocks_num(src->ne[1], src->ne[2], src->ne[3]);
+    const dim3 block_dims(old_bs / R, 1, 1);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num, block_dims, 0, ctx.stream());
+
+    const float * hx  = nullptr;
+    const float * res = nullptr;
+    const float * pw  = nullptr;
+    float * h = nullptr;
+    int64_t sx0 = 0, sx1 = 0, sr0 = 0, sr1 = 0, sr2 = 0, sp0 = 0, sp1 = 0, sh0 = 0, sh1 = 0, sh2 = 0;
+    if (do_post) {
+        const ggml_tensor * x        = post->src[0];
+        const ggml_tensor * residual = post->src[1];
+        const ggml_tensor * weights  = post->src[2];
+        hx  = (const float *) x->data;
+        res = (const float *) residual->data;
+        pw  = (const float *) weights->data;
+        h   = (float *) post->data;
+        sx0 = x->nb[0] / sizeof(float);         sx1 = x->nb[1] / sizeof(float);
+        sr0 = residual->nb[0] / sizeof(float);  sr1 = residual->nb[1] / sizeof(float); sr2 = residual->nb[2] / sizeof(float);
+        sp0 = weights->nb[0] / sizeof(float);   sp1 = weights->nb[1] / sizeof(float);
+        sh0 = post->nb[0] / sizeof(float);      sh1 = post->nb[1] / sizeof(float);     sh2 = post->nb[2] / sizeof(float);
+    }
+
+    ggml_cuda_kernel_launch(dsv4_hc_post_norm_f32<old_bs, R, do_post, write_xn>, launch_params,
+            hx, res, pw, h, (const float *) src->data,
+            sx0, sx1, sr0, sr1, sr2, sp0, sp1, sh0, sh1, sh2,
+            (int64_t) (src->nb[1] / sizeof(float)), (int64_t) (src->nb[2] / sizeof(float)), (int64_t) (src->nb[3] / sizeof(float)),
+            (int) ne00, eps,
+            (const float *) gamma->data,
+            (int64_t) (gamma->nb[1] / sizeof(float)), (int64_t) (gamma->nb[2] / sizeof(float)), (int64_t) (gamma->nb[3] / sizeof(float)),
+            init_fastdiv_values((uint32_t) gamma->ne[1]), init_fastdiv_values((uint32_t) gamma->ne[2]),
+            init_fastdiv_values((uint32_t) gamma->ne[3]),
+            (float *) mul->data, dst_bf16, row_scale);
+}
+
+void ggml_cuda_op_dsv4_hc_post_norm(ggml_backend_cuda_context & ctx, const ggml_tensor * post, const ggml_tensor * norm,
+                                    const ggml_tensor * mul, nv_bfloat16 * dst_bf16, float * row_scale) {
+    const ggml_tensor * src = norm->src[0];
+    GGML_ASSERT(src->type == GGML_TYPE_F32 && src->nb[0] == sizeof(float));
+    GGML_ASSERT(post == nullptr || src == post);
+    GGML_ASSERT(row_scale != nullptr || post != nullptr); // the norm alone with the f32 output is NORM_CAST's kernel
+    GGML_ASSERT(row_scale == nullptr || (dst_bf16 != nullptr && row_scale == (const float *) mul->data));
+    // same block size choice as rms_norm_f32_cuda: the reduction order, and so the result, depends on it
+    const int64_t ne00 = src->ne[0];
+    if (ne00 < 1024) {
+        if (post != nullptr && row_scale == nullptr) {
+            dsv4_hc_post_norm_launch<256, 1, true,  true >(ctx, post, norm, mul, dst_bf16, row_scale);
+        } else if (post != nullptr) {
+            dsv4_hc_post_norm_launch<256, 1, true,  false>(ctx, post, norm, mul, dst_bf16, row_scale);
+        } else {
+            dsv4_hc_post_norm_launch<256, 1, false, false>(ctx, post, norm, mul, dst_bf16, row_scale);
+        }
+    } else {
+        GGML_ASSERT(ne00 <= DSV4_HC_NORM_MAX_ITER*1024);
+        if (post != nullptr && row_scale == nullptr) {
+            dsv4_hc_post_norm_launch<1024, DSV4_HC_NORM_R, true,  true >(ctx, post, norm, mul, dst_bf16, row_scale);
+        } else if (post != nullptr) {
+            dsv4_hc_post_norm_launch<1024, DSV4_HC_NORM_R, true,  false>(ctx, post, norm, mul, dst_bf16, row_scale);
+        } else {
+            dsv4_hc_post_norm_launch<1024, DSV4_HC_NORM_R, false, false>(ctx, post, norm, mul, dst_bf16, row_scale);
+        }
+    }
+}
+
+void ggml_cuda_op_dsv4_hc_pre_xn(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_tensor * x,
+                                 const ggml_tensor * gamma, const float * row_scale) {
+    const ggml_tensor * weights = dst->src[1];
+
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && x->nb[0] == sizeof(float));
+    GGML_ASSERT(gamma->type == GGML_TYPE_F32 && gamma->nb[0] == sizeof(float));
+    GGML_ASSERT(weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_get_op_params_i32(dst, 1) != 0);
+    GGML_ASSERT(ggml_are_same_shape(x, dst->src[0]) && x->ne[3] == 1);
+
+    GGML_TENSOR_LOCALS(size_t, nbw, weights, nb);
+    GGML_TENSOR_LOCALS(size_t, nbd, dst,     nb);
+
+    const int64_t n_embd   = x->ne[0];
+    const int64_t hc       = x->ne[1];
+    const int64_t n_tokens = x->ne[2];
+
+    const float scale = ggml_get_op_params_f32(dst, 0);
+
+    const int block_size = 256;
+    const int64_t nr = n_embd * n_tokens;
+    const dim3 block_dims(block_size, 1, 1);
+    const dim3 grid_dims((nr + block_size - 1) / block_size, 1, 1);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, ctx.stream());
+
+    ggml_cuda_kernel_launch(dsv4_hc_pre_xn_f32, launch_params,
+            (const float *) x->data, (const float *) gamma->data, row_scale, (const float *) weights->data, (float *) dst->data,
+            n_embd, hc, n_tokens,
+            (int64_t) (x->nb[1] / sizeof(float)), (int64_t) (x->nb[2] / sizeof(float)),
+            (int64_t) (gamma->nb[1] / sizeof(float)), (int64_t) (gamma->nb[2] / sizeof(float)), gamma->ne[1], gamma->ne[2],
+            nbw0 / sizeof(float), nbw1 / sizeof(float), nbw2 / sizeof(float),
+            nbd0 / sizeof(float), nbd1 / sizeof(float),
+            scale);
 }

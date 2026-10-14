@@ -5080,6 +5080,147 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
     }
 };
 
+// [HCPN] One Flash-Next hyper-connection step as qwen4exp builds it: H = identity-comb hc_post (post_in) or an ADD (as
+// after a PLE block), xn = rms_norm(H) * gamma, its BF16 copy feeding both BF16 matmuls (cast, LLAMA_HC_BF16_ONCE),
+// the low-rank gate, the gated hc_pre and the next hc_post. GGML_CUDA_HC_POST_NORM=1 and GGML_CUDA_HC_PRE_XN=1 fuse
+// it (required_fusion checks that the fusion fired); tests/test-hc-norm-fuse.cpp checks the fused CUDA graph against
+// the unfused one byte for byte.
+struct test_hc_post_norm : public test_case {
+    static constexpr int64_t hc    = 4;
+    static constexpr int64_t hc_lr = 64;
+
+    const int64_t n_embd;
+    const int64_t n_tokens;
+    const bool    post_in;
+    const bool    cast;
+
+    ggml_tensor * h      = nullptr;
+    ggml_tensor * xn     = nullptr;
+    ggml_tensor * xb     = nullptr;
+    ggml_tensor * mixed  = nullptr;
+    ggml_tensor * inject = nullptr;
+    ggml_tensor * out    = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "HC_POST_NORM";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR4(n_embd, n_tokens, post_in, cast);
+    }
+
+    static bool env_on(const char * name) {
+        const char * e = getenv(name);
+        return e != nullptr && atoi(e) != 0;
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        std::vector<ggml_tensor *> v = { h, mixed, inject, out };
+        if (xb != nullptr) {
+            v.push_back(xb);
+        }
+        // HC_PRE_XN does not write the f32 xn (its buffer holds the per-row scales)
+        if (!(cast && env_on("GGML_CUDA_HC_PRE_XN"))) {
+            v.push_back(xn);
+        }
+        return v;
+    }
+
+    const char * required_fusion() override {
+        if (n_embd > 4096) {
+            return nullptr;
+        }
+        if (cast && env_on("GGML_CUDA_HC_PRE_XN")) {
+            return "hc_pre_xn";
+        }
+        if (post_in && env_on("GGML_CUDA_HC_POST_NORM")) {
+            return "hc_post_norm";
+        }
+        return nullptr;
+    }
+
+    test_hc_post_norm(int64_t n_embd = 2560, int64_t n_tokens = 64, bool post_in = true, bool cast = true)
+        : n_embd(n_embd), n_tokens(n_tokens), post_in(post_in), cast(cast) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t hc_dim = n_embd * hc;
+        const float   inv_hc = 1.0f / (float) hc;
+
+        ggml_tensor * gamma    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,  n_embd, hc);
+        ggml_tensor * w_down   = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, hc_dim, hc_lr);
+        ggml_tensor * w_up     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,  hc_lr,  hc_dim);
+        ggml_tensor * w_inject = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, hc_dim, hc);
+        ggml_set_name(gamma, "gamma");
+        ggml_set_name(w_down, "w_down");
+        ggml_set_name(w_up, "w_up");
+        ggml_set_name(w_inject, "w_inject");
+
+        if (post_in) {
+            ggml_tensor * block_out = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+            ggml_tensor * residual  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+            ggml_tensor * inject0   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, n_tokens);
+            ggml_set_name(block_out, "block_out");
+            ggml_set_name(residual, "residual");
+            ggml_set_name(inject0, "inject0");
+            ggml_tensor * w0 = ggml_scale(ctx, ggml_sigmoid(ctx, ggml_scale(ctx, inject0, inv_hc)), 2.0f);
+            h = ggml_dsv4_hc_post(ctx, block_out, residual, w0, nullptr);
+        } else {
+            ggml_tensor * a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+            ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+            ggml_set_name(a, "a");
+            ggml_set_name(b, "b");
+            h = ggml_add(ctx, a, b);
+        }
+        ggml_set_name(h, "h");
+
+        xn = ggml_mul(ctx, ggml_rms_norm(ctx, h, 1e-6f), gamma);
+        ggml_set_name(xn, "xn");
+        ggml_tensor * xn2 = ggml_reshape_2d(ctx, xn, hc_dim, n_tokens);
+
+        ggml_tensor * lo_mm = ggml_mul_mat(ctx, w_down, xn2);
+        ggml_tensor * lo    = ggml_silu(ctx, ggml_scale(ctx, lo_mm, inv_hc));
+        ggml_tensor * gate  = ggml_mul_mat(ctx, w_up, lo);
+
+        mixed = ggml_dsv4_hc_pre_gated(ctx,
+                ggml_reshape_3d(ctx, xn2,  n_embd, hc, n_tokens),
+                ggml_reshape_3d(ctx, gate, n_embd, hc, n_tokens), inv_hc);
+        ggml_set_name(mixed, "mixed");
+
+        inject = ggml_mul_mat(ctx, w_inject, xn2);
+        ggml_set_name(inject, "inject");
+
+        if (cast) {
+            xb = ggml_cast(ctx, xn2, GGML_TYPE_BF16);
+            ggml_set_name(xb, "xb");
+            lo_mm->src[1]  = xb;
+            inject->src[1] = xb;
+        }
+
+        ggml_tensor * w2 = ggml_scale(ctx, ggml_sigmoid(ctx, ggml_scale(ctx, inject, inv_hc)), 2.0f);
+        out = ggml_dsv4_hc_post(ctx, mixed, h, w2, nullptr);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            const std::string name = ggml_get_name(t);
+            if (name == "gamma") {
+                init_tensor_uniform(t, 0.5f, 1.5f);
+            } else if (name == "w_down" || name == "w_up" || name == "w_inject") {
+                init_tensor_uniform(t, -0.05f, 0.05f);
+            } else if (name == "inject0") {
+                init_tensor_uniform(t, -4.0f, 4.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 
 // GGML_OP_SSM_CONV
 struct test_ssm_conv : public test_case {
@@ -12434,6 +12575,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, true, true));
     test_cases.emplace_back(new test_dsv4_hc_post(2560, 21, true, true));
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, false, true));
+    // [HCPN] the Flash-Next hyper-connection step, with and without the BF16 copy, the hc_post or the ADD as norm input,
+    // both norm block sizes and a width over the fused kernel's 4096 columns
+    for (int64_t n_embd : { 2560, 768 }) {
+        for (int64_t n_tokens : { 64, 33 }) {
+            for (bool post_in : { true, false }) {
+                for (bool cast : { true, false }) {
+                    test_cases.emplace_back(new test_hc_post_norm(n_embd, n_tokens, post_in, cast));
+                }
+            }
+        }
+    }
+    test_cases.emplace_back(new test_hc_post_norm(2560, 512, true,  true));
+    test_cases.emplace_back(new test_hc_post_norm(2560, 512, false, true));
+    test_cases.emplace_back(new test_hc_post_norm(2560, 16,  true,  false));
+    test_cases.emplace_back(new test_hc_post_norm(5120, 40,  true,  true));
 
     // glu ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {
@@ -15679,6 +15835,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     add_get_rows_narrow_cases(test_cases, true);
     add_iq4xs_k4_cases(test_cases, true);
+
+    // [HCPN] Flash-Next hyper-connection step (GGML_CUDA_HC_POST_NORM / GGML_CUDA_HC_PRE_XN)
+    for (int64_t n_tokens : { 512, 12288 }) {
+        test_cases.emplace_back(new test_hc_post_norm(2560, n_tokens, true, true));
+    }
 
     // Flash-Next routed experts at prefill ubatch 4096/8192: 512 experts, 10 used, gate/up 2560->640 (broadcast input),
     // down 640->2560. ~160 tokens per expert at 8192.
