@@ -20,6 +20,7 @@
 struct llama_model;
 class llama_batch_allocr;
 class llama_moe_cache;
+class llama_b1;
 
 class llama_io_read_i;
 class llama_io_write_i;
@@ -505,6 +506,25 @@ private:
     llm_graph_result * gf_res_prev_active = nullptr;
     uint64_t           gf_res_prev_epoch  = 0; // ggml_backend_sched_get_alloc_epoch when gf_res_prev_active was allocated
     uint64_t           backend_buf_exp_epoch = 0; // ggml_backend_sched_get_alloc_epoch when backend_buf_exp_size was taken
+
+    // [B1] layer-major prefill (LLAMA_B1=1, opt-in; see llama-b1.h). Declared after the backends so it is
+    // destroyed first; the destructor also resets it explicitly.
+    std::unique_ptr<llama_b1> b1;
+    bool b1_env   = false; // LLAMA_B1 set
+    bool b1_tried = false; // b1 construction attempted
+    struct {
+        bool          active = false;   // the graph being built is a B1 graph (memory already applied)
+        int32_t       il0    = 0;
+        int32_t       il1    = -1;
+        ggml_tensor * carry  = nullptr;
+    } b1_cur;
+
+    // returns 1 when this decode call runs layer-major (every ubatch applied and saved, the plan made),
+    // 0 for the normal path, < 0 for a decode error code
+    int  b1_prepare(llama_memory_context_i * mctx, const llama_batch_ext & batch_inp, uint32_t n_tokens_all);
+    // runs layers [0, n_layer - 1) of every ubatch of the group that starts at ub0, then seeks back to ub0 with
+    // the last layer's experts ready; false on failure (status set)
+    bool b1_run_prefix(llama_memory_context_i * mctx, size_t ub0, ggml_status & status);
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;

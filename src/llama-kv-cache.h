@@ -653,6 +653,11 @@ public:
     bool has_kv_stream_targets() const override;
     std::vector<llama_kv_stream_active_target> get_kv_stream_active_targets() const override;
 
+    // [B1] layer-major prefill: the per-ubatch view is i_cur + n_kv (the slot infos are kept anyway)
+    bool b1_supported() const override;
+    void b1_save() override;
+    bool b1_seek(size_t i) override;
+
     //
     // llama_kv_cache_context specific API
     //
@@ -754,4 +759,7 @@ private:
     // a heuristic, to avoid attending the full cache if it is not yet utilized
     // as the cache gets filled, the benefit from this heuristic disappears
     int32_t n_kv;
+
+    // [B1] n_kv of each ubatch, recorded right after its apply()
+    std::vector<int32_t> b1_n_kv;
 };

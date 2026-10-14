@@ -29,6 +29,7 @@
 #include "llama-draft-vocab-compact.h"
 #include "llama-mtp-chain-sample.h"
 #include "llama-moe-cache.h"
+#include "llama-b1.h"
 #include "llama-ext.h"
 #include "llama-sampler.h"
 #include "llama.h"
@@ -996,6 +997,9 @@ llama_context::~llama_context() {
     }
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+
+    // [B1] give lent expert layers back to the model before the backends go away
+    b1.reset();
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
@@ -2822,7 +2826,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
                                                  llm_graph_type           gtype,
                                                  llama_memory_context_i * mctx,
                                                  ggml_status &            ret) {
-    if (mctx && !mctx->apply()) {
+    // [B1] the layer-major prefill applied every ubatch up front and seeks between their saved views
+    if (mctx && !b1_cur.active && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
@@ -2878,8 +2883,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
     // a peer context that grew the shared compute buffer (ggml_gallocr donor) invalidates this context's allocated graph
-    if (!graph_reuse_disable && gf_res_prev_active == res && gf_res_prev_epoch == ggml_backend_sched_get_alloc_epoch(sched.get()) &&
-            res->can_reuse(gparams)) {
+    if (!graph_reuse_disable && !b1_cur.active && gf_res_prev_active == res &&
+            gf_res_prev_epoch == ggml_backend_sched_get_alloc_epoch(sched.get()) && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -2919,7 +2924,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
             return nullptr;
         }
 
-        gf_res_prev_active = res;
+        // [B1] a layer-range graph is never reused: its carry, KV views and expert slots change every call
+        gf_res_prev_active = b1_cur.active ? nullptr : res;
         gf_res_prev_epoch  = ggml_backend_sched_get_alloc_epoch(sched.get());
     }
 
@@ -3427,6 +3433,33 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         return -2;
     };
 
+    // [B1] layer-major prefill: plan the call and apply every ubatch up front, or give lent experts back first
+    const int b1_mode = b1_prepare(mctx.get(), batch_inp, n_tokens_all);
+    if (b1_mode < 0) {
+        return b1_mode;
+    }
+    llama_seq_id b1_seq      = -1;
+    llama_pos    b1_pos0     = 0;
+    int32_t      b1_final_l0 = 0;
+    size_t       b1_i        = 0;
+    if (b1_mode == 1) {
+        b1_seq = *batch_inp.tokens[0].seq_ids.begin();
+        b1_pos0 = balloc->seq_pos_min(b1_seq);
+        b1_final_l0 = b1->final_l0();
+    }
+    // on a failure every ubatch of the call is incomplete: drop the whole batch from the memory
+    auto b1_fail = [&](ggml_status st) -> int {
+        b1_cur = {};
+        b1->end(true);
+        LLAMA_LOG_WARN("%s: [B1] removing memory module entries for seq_id = %d, pos = [%d, +inf)\n", __func__, b1_seq, b1_pos0);
+        memory->seq_rm(b1_seq, b1_pos0, -1);
+        switch (st) {
+            case GGML_STATUS_ABORTED:      return 2;
+            case GGML_STATUS_ALLOC_FAILED: return -2;
+            default:                       return -3;
+        }
+    };
+
     // start a new sampling transaction for this logical batch
     for (const auto & entry : sampling.samplers) {
         llama_sampler_backend_begin(entry.second);
@@ -3436,6 +3469,16 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     int64_t n_tokens_prev  = 0;
 
     do {
+        if (b1_mode == 1) {
+            if (b1->is_group_first(b1_i)) {
+                ggml_status st_pre = GGML_STATUS_SUCCESS;
+                if (!b1_run_prefix(mctx.get(), b1_i, st_pre)) {
+                    return b1_fail(st_pre);
+                }
+            }
+            b1_cur = { true, b1_final_l0, -1, b1_final_l0 > 0 ? b1->carry(b1_i) : nullptr };
+        }
+
         const auto & ubatch = mctx->get_ubatch();
 
         // count the outputs in this ubatch
@@ -3457,6 +3500,16 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         ggml_status status;
 
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+
+        if (b1_mode == 1) {
+            b1_cur = {};
+            if (!res) {
+                return b1_fail(status);
+            }
+            if (b1->is_group_last(b1_i)) {
+                b1->layer_end(b1_final_l0);
+            }
+        }
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
@@ -3675,7 +3728,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         n_outputs_prev += n_outputs;
         n_tokens_prev += ubatch.n_tokens;
-    } while (mctx->next());
+    } while (b1_mode == 1 ? (++b1_i < b1->n_ub() && mctx->b1_seek(b1_i)) : mctx->next());
+
+    if (b1_mode == 1) {
+        GGML_ASSERT(b1_i == b1->n_ub());
+        b1->end(false);
+    }
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     n_outputs = n_outputs_all;
@@ -4251,11 +4309,177 @@ ggml_cgraph * llama_context::graph_reserve(
     return gf;
 }
 
+//
+// [B1] layer-major prefill
+//
+
+static int64_t b1_ctx_env(const char * name, int64_t def) {
+    const char * e = getenv(name);
+    return e && *e ? atoll(e) : def;
+}
+
+int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_ext & batch_inp, uint32_t n_tokens_all) {
+    if (!b1_tried) {
+        b1_tried = true;
+        b1_env   = b1_ctx_env("LLAMA_B1", 0) != 0;
+        if (b1_env) {
+            const char * why = nullptr;
+            ggml_backend_t gpu = nullptr;
+            int n_gpu = 0;
+            for (auto & be : backends) {
+                ggml_backend_dev_t d = ggml_backend_get_device(be.get());
+                if (d && ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                    ++n_gpu;
+                    gpu = be.get();
+                }
+            }
+            if (model.arch != LLM_ARCH_QWEN4EXP) {
+                why = "only qwen4exp builds layer-range graphs";
+            } else if (n_gpu != 1) {
+                why = "it needs exactly one GPU";
+            } else if (cparams.embeddings) {
+                why = "the context computes embeddings";
+            }
+            if (why) {
+                LLAMA_LOG_WARN("%s: [B1] LLAMA_B1 is set but layer-major prefill is off: %s\n", __func__, why);
+            } else {
+                b1 = std::make_unique<llama_b1>(model, gpu);
+                if (!b1->ok()) {
+                    b1.reset();
+                }
+            }
+        }
+    }
+    if (!b1) {
+        return 0;
+    }
+
+    auto normal = [&]() -> int {
+        if (b1->dirty() && !b1->refill()) {
+            LLAMA_LOG_ERROR("%s: [B1] cannot restore the lent expert layers\n", __func__);
+            return -3;
+        }
+        return 0;
+    };
+
+    // per call: the conditions another component may have changed since construction
+    if (moe_cache || compute_peer || std::any_of(cparams.embeddings_layer_inp.begin(), cparams.embeddings_layer_inp.end(),
+                [](bool b) { return b; })) {
+        return normal();
+    }
+
+    // one sequence; batches that mix slots take the normal path
+    llama_seq_id seq = -1;
+    for (const auto & tok : batch_inp.tokens) {
+        if (tok.seq_ids.size() != 1) {
+            return normal();
+        }
+        const llama_seq_id s = *tok.seq_ids.begin();
+        if (seq < 0) {
+            seq = s;
+        } else if (s != seq) {
+            return normal();
+        }
+    }
+
+    const std::vector<uint32_t> sizes = mctx->b1_ubatch_sizes();
+    const int64_t min_tok = b1_ctx_env("LLAMA_B1_MIN_TOKENS", (int64_t) cparams.n_ubatch + 1);
+    if (sizes.size() < 2 || (int64_t) n_tokens_all < min_tok || !mctx->b1_supported()) {
+        return normal();
+    }
+
+    // lend the whole expert cache when this is the only sequence; when other sequences hold memory (other slots
+    // that decode between calls), lend at most LLAMA_B1_LEND_PAR_MIB so they find most experts resident
+    bool others = false;
+    for (llama_seq_id s = 0; s < (llama_seq_id) n_seq_max() && !others; ++s) {
+        others = s != seq && memory->seq_pos_max(s) >= 0;
+    }
+    size_t lend_cap = SIZE_MAX;
+    if (others) {
+        lend_cap = (size_t) std::max<int64_t>(0, b1_ctx_env("LLAMA_B1_LEND_PAR_MIB", 3072)) << 20;
+    }
+    const int64_t lend_mib = b1_ctx_env("LLAMA_B1_LEND_MIB", -1);
+    if (lend_mib >= 0) {
+        lend_cap = std::min(lend_cap, (size_t) lend_mib << 20);
+    }
+
+    // tokens per group (S): 0 = the whole call
+    const int64_t s_tok = b1_ctx_env("LLAMA_B1_GROUP", 0);
+    uint32_t group_ub = 0;
+    if (s_tok > 0) {
+        group_ub = (uint32_t) std::max<int64_t>(1, (s_tok + cparams.n_ubatch/2)/cparams.n_ubatch);
+    }
+
+    if (!b1->begin(sizes, group_ub, lend_cap)) {
+        return normal();
+    }
+
+    // apply every ubatch now, saving each memory view
+    size_t n_applied = 0;
+    do {
+        if (!mctx->apply()) {
+            LLAMA_LOG_ERROR("%s: [B1] failed to apply memory context of ubatch %zu\n", __func__, n_applied);
+            b1->end(true);
+            memory->seq_rm(seq, balloc->seq_pos_min(seq), -1);
+            return -3;
+        }
+        mctx->b1_save();
+        ++n_applied;
+    } while (mctx->next());
+
+    if (n_applied != sizes.size() || !mctx->b1_seek(0)) {
+        LLAMA_LOG_ERROR("%s: [B1] the memory context did not keep its ubatch views\n", __func__);
+        b1->end(true);
+        memory->seq_rm(seq, balloc->seq_pos_min(seq), -1);
+        return -3;
+    }
+
+    LLAMA_LOG_WARN("%s: [B1] layer-major prefill of %u tokens: %zu ubatches, %zu groups of %zu, %s\n", __func__,
+            n_tokens_all, sizes.size(), b1->n_groups(), b1->group_ub(), others ? "other sequences present" : "alone");
+    return 1;
+}
+
+bool llama_context::b1_run_prefix(llama_memory_context_i * mctx, size_t ub0, ggml_status & status) {
+    const int32_t l_final = b1->final_l0();
+    const size_t  ub1     = b1->group_end(ub0);
+    const llm_graph_type gtype = ctx_type_to_graph_type(cparams.ctx_type);
+
+    status = GGML_STATUS_FAILED;
+    for (int32_t l0 = 0; l0 < l_final; ) {
+        const int32_t l1 = b1->range_end(l0);
+        if (!b1->layer_begin(l0)) {
+            return false;
+        }
+        for (size_t u = ub0; u < ub1; ++u) {
+            if (!mctx->b1_seek(u)) {
+                LLAMA_LOG_ERROR("%s: [B1] cannot seek to ubatch %zu\n", __func__, u);
+                return false;
+            }
+            n_outputs = 0;
+            b1_cur = { true, l0, l1, b1->carry(u) };
+            const auto * res = process_ubatch(mctx->get_ubatch(), gtype, mctx, status);
+            b1_cur = {};
+            if (!res) {
+                return false;
+            }
+        }
+        b1->layer_end(l0);
+        l0 = l1;
+    }
+
+    if (!mctx->b1_seek(ub0) || !b1->layer_begin(l_final)) {
+        status = GGML_STATUS_FAILED;
+        return false;
+    }
+    status = GGML_STATUS_SUCCESS;
+    return true;
+}
+
 llm_graph_params llama_context::graph_params(llm_graph_result *             res,
                                              const llama_ubatch &           ubatch,
                                              const llama_memory_context_i * mctx,
                                              llm_graph_type                 gtype) const {
-    return {
+    llm_graph_params p = {
         /*.arch        =*/ model.arch,
         /*.hparams     =*/ model.hparams,
         /*.cparams     =*/ cparams,
@@ -4282,6 +4506,12 @@ llm_graph_params llama_context::graph_params(llm_graph_result *             res,
         /*.res         =*/ res,
         /*.model       =*/ &model,
     };
+    if (b1_cur.active) {
+        p.b1_il0   = b1_cur.il0;
+        p.b1_il1   = b1_cur.il1;
+        p.b1_carry = b1_cur.carry;
+    }
+    return p;
 }
 
 ggml_status llama_context::graph_compute(ggml_cgraph * gf, bool batched) {

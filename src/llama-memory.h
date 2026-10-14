@@ -138,6 +138,16 @@ struct llama_memory_context_i {
     virtual bool has_kv_stream_targets() const { return false; }
 
     virtual std::vector<llama_kv_stream_active_target> get_kv_stream_active_targets() const { return {}; }
+
+    // [B1] layer-major prefill (LLAMA_B1): the driver applies every ubatch up front, saving the memory view right
+    // after each apply(), then runs each layer over all ubatches, seeking back to a ubatch's saved view before each
+    // of its graphs. b1_supported() says whether this context can do that; b1_save() records the view of the
+    // current ubatch (call right after apply()); b1_seek(i) makes ubatch i current with its saved view.
+    virtual bool b1_supported() const { return false; }
+    virtual void b1_save() {}
+    virtual bool b1_seek(size_t i) { GGML_UNUSED(i); return false; }
+    // the token count of every ubatch of this context, readable before any apply(); empty when unknown
+    virtual std::vector<uint32_t> b1_ubatch_sizes() const { return {}; }
 };
 
 using llama_memory_context_ptr = std::unique_ptr<llama_memory_context_i>;

@@ -298,6 +298,33 @@ bool llama_memory_hybrid_context::apply() {
     return res;
 }
 
+bool llama_memory_hybrid_context::b1_supported() const {
+    return status == LLAMA_MEMORY_STATUS_SUCCESS && !ubatches.empty() && ctx_attn && ctx_recr &&
+           ctx_attn->b1_supported() && ctx_recr->b1_supported();
+}
+
+void llama_memory_hybrid_context::b1_save() {
+    ctx_attn->b1_save();
+    ctx_recr->b1_save();
+}
+
+bool llama_memory_hybrid_context::b1_seek(size_t i) {
+    if (i >= ubatches.size() || !ctx_attn->b1_seek(i) || !ctx_recr->b1_seek(i)) {
+        return false;
+    }
+    i_next = i;
+    return true;
+}
+
+std::vector<uint32_t> llama_memory_hybrid_context::b1_ubatch_sizes() const {
+    std::vector<uint32_t> res;
+    res.reserve(ubatches.size());
+    for (const auto & ub : ubatches) {
+        res.push_back(ub.n_tokens);
+    }
+    return res;
+}
+
 llama_memory_status llama_memory_hybrid_context::get_status() const {
     return status;
 }

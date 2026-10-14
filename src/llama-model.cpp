@@ -43,6 +43,10 @@
 #include <string>
 #include <vector>
 
+#ifndef _WIN32
+#include <unistd.h>
+#endif
+
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
     switch (arch) {
         case LLM_ARCH_CLIP:
@@ -1397,6 +1401,11 @@ llama_model::~llama_model() {
     for (auto * lora : loras) {
         delete lora;
     }
+#ifndef _WIN32
+    for (int fd : b1_fds) {
+        close(fd);
+    }
+#endif
 }
 
 void llama_model_base::load_stats(llama_model_loader & ml) {
@@ -2259,6 +2268,31 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
             return false;
         }
+    }
+
+    // [B1] remember where the expert tensors live in the files, so the layer-major prefill can copy borrowed resident
+    // experts back from there (the loader closes its files when it returns)
+    if (const char * e = getenv("LLAMA_B1"); e && atoi(e) != 0) {
+#ifndef _WIN32
+        std::map<uint16_t, int> fd_of;
+        for (const auto & [name, w] : ml.weights_map) {
+            if (name.find("_exps") == std::string::npos) {
+                continue;
+            }
+            auto it = fd_of.find(w.idx);
+            if (it == fd_of.end()) {
+                const int fd = dup(ml.files.at(w.idx)->file_id());
+                if (fd < 0) {
+                    LLAMA_LOG_WARN("%s: [B1] dup of model file %u failed, resident experts cannot be lent\n", __func__, w.idx);
+                    b1_src.clear();
+                    break;
+                }
+                b1_fds.push_back(fd);
+                it = fd_of.emplace(w.idx, fd).first;
+            }
+            b1_src[name] = { it->second, w.offs };
+        }
+#endif
     }
 
     if (use_mmap_buffer) {

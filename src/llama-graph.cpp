@@ -214,7 +214,8 @@ bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
 }
 
 void llm_graph_input_pos::set_input(const llama_ubatch * ubatch) {
-    if (ubatch->pos && pos) {
+    // a layer-range graph (LLAMA_B1) without a positional op leaves pos unallocated
+    if (ubatch->pos && pos && pos->buffer) {
         const int64_t n_tokens = ubatch->n_tokens;
 
         ggml_backend_tensor_set(pos, ubatch->pos, 0, n_tokens*n_pos_per_embd*ggml_element_size(pos));
@@ -410,7 +411,8 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
 }
 
 void llm_graph_input_rs::fill_s_copy(const llama_memory_recurrent_context * m) {
-    if (!s_copy) {
+    // a layer-range graph (LLAMA_B1) without a recurrent layer leaves s_copy unallocated
+    if (!s_copy || !s_copy->buffer) {
         return;
     }
     GGML_ASSERT(ggml_backend_buffer_is_host(s_copy->buffer));
@@ -1706,6 +1708,9 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     draft_vocab_warned(params.draft_vocab_warned),
     is_reserve       (params.is_reserve),
     mtp_chain_samp   (params.mtp_chain_samp),
+    b1_il0           (params.b1_il0),
+    b1_il1           (params.b1_il1),
+    b1_carry         (params.b1_carry),
     cb_func          (params.cb),
     res              (params.res),
     model_ref        (params.model),

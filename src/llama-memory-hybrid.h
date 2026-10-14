@@ -136,6 +136,12 @@ public:
     bool has_kv_stream_targets() const override;
     std::vector<llama_kv_stream_active_target> get_kv_stream_active_targets() const override;
 
+    // [B1] layer-major prefill: both children
+    bool b1_supported() const override;
+    void b1_save() override;
+    bool b1_seek(size_t i) override;
+    std::vector<uint32_t> b1_ubatch_sizes() const override;
+
     //
     // llama_memory_hybrid_context
     //

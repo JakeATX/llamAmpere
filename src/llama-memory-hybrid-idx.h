@@ -179,6 +179,12 @@ public:
     bool next()  override;
     bool apply() override;
 
+    // [B1] layer-major prefill: the base views plus the indexer cache, and a copy of the k-pool state and layout per
+    // ubatch (the memory's own layout is already the last ubatch's, so a seek only points at the copies)
+    bool b1_supported() const override;
+    void b1_save() override;
+    bool b1_seek(size_t i) override;
+
     //
     // llama_memory_hybrid_idx_context specific API
     //
@@ -233,4 +239,11 @@ private:
 
     // Positions each sequence must re-pool from, cleared only after the first ubatch succeeds
     llama_memory_hybrid_idx::stale_pos_t mem_idx_stale_batch = llama_memory_hybrid_idx::stale_pos_clean();
+
+    // [B1] per-ubatch copies, and the ones the current seek points at (null: the live state)
+    std::vector<std::shared_ptr<kpool_state>> b1_st;
+    std::vector<std::shared_ptr<llama_memory_hybrid_idx::kpool_layout>> b1_lay;
+    const kpool_state * b1_st_cur = nullptr;
+    const llama_memory_hybrid_idx::kpool_layout * b1_lay_cur = nullptr;
+    const llama_memory_hybrid_idx::kpool_layout & kpool_lay_cur() const;
 };

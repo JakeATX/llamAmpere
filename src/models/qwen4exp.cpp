@@ -429,9 +429,28 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     int sections[4];
     std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
 
-    ggml_tensor * inpL = build_inp_embd(model.tok_embd);
-    cb(inpL, "model.input_embed", -1);
-    ggml_build_forward_expand(gf, inpL);
+    // [B1] layer range of this graph: the whole model unless the layer-major prefill builds one slice of it
+    const int  b1_l0    = b1_il0;
+    const int  b1_l1    = b1_il1 < 0 ? (int) n_layer : b1_il1;
+    const bool b1_full  = b1_l0 == 0 && b1_l1 == (int) n_layer;
+    const bool b1_first = b1_l0 == 0;
+    const bool b1_last  = b1_l1 == (int) n_layer;
+    GGML_ASSERT(0 <= b1_l0 && b1_l0 < b1_l1 && b1_l1 <= (int) n_layer);
+    GGML_ASSERT((b1_first && b1_last) || b1_carry != nullptr);
+
+    bool b1_has_qsa = b1_full;
+    bool b1_has_ple = b1_full;
+    for (int il = b1_l0; il < b1_l1; ++il) {
+        b1_has_qsa = b1_has_qsa || !hparams.is_recr(il);
+        b1_has_ple = b1_has_ple || hparams.is_ple(il);
+    }
+
+    ggml_tensor * inpL = nullptr;
+    if (b1_first) {
+        inpL = build_inp_embd(model.tok_embd);
+        cb(inpL, "model.input_embed", -1);
+        ggml_build_forward_expand(gf, inpL);
+    }
 
     auto * inp = build_inp_mem_hybrid();
 
@@ -448,29 +467,37 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     // the QSA layers share one set of k-pool inputs
     // the CUDA lightning indexer takes 32 or 64 heads, QSA has a few, so it scores with plain ops
     llm_graph_input_kpool * inp_kpool = nullptr;
-    if (mctx_idx && hparams.indexer_kpool > 0) {
+    if (mctx_idx && hparams.indexer_kpool > 0 && b1_has_qsa) {
         inp_kpool = build_inp_kpool(mctx_hyb);
     }
 
     ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    ggml_tensor * inp_out_ids = b1_last ? build_inp_out_ids() : nullptr;
 
     ggml_tensor * ple_emb = nullptr;
-    if (hparams.ple_n_heads > 0) {
+    if (hparams.ple_n_heads > 0 && b1_has_ple) {
         ple_emb = build_inp_ple(mctx_hyb);
         // make sure ple_emb and build_inp_embd are in the same graph split
         ggml_build_forward_expand(gf, ple_emb);
     }
 
-    // the wide residual starts as hc identical copies of the embedding
-    ggml_tensor * res_hc = ggml_repeat_4d(ctx0,
-            ggml_reshape_3d(ctx0, inpL, n_embd, 1, n_tokens),
-            n_embd, hc, n_tokens, 1);
-    cb(res_hc, "hc_init", -1);
-    // make sure hc_init is in the same graph split as the first layer (-sm tensor)
-    ggml_build_forward_expand(gf, res_hc);
+    ggml_tensor * res_hc = nullptr;
+    if (b1_first) {
+        // the wide residual starts as hc identical copies of the embedding
+        res_hc = ggml_repeat_4d(ctx0,
+                ggml_reshape_3d(ctx0, inpL, n_embd, 1, n_tokens),
+                n_embd, hc, n_tokens, 1);
+        cb(res_hc, "hc_init", -1);
+        // make sure hc_init is in the same graph split as the first layer (-sm tensor)
+        ggml_build_forward_expand(gf, res_hc);
+    } else {
+        // [B1] the hidden state the previous layer range left for this ubatch
+        GGML_ASSERT(b1_carry->type == GGML_TYPE_F32 && b1_carry->ne[0] == n_embd && b1_carry->ne[1] == hc &&
+                    b1_carry->ne[2] == n_tokens);
+        res_hc = b1_carry;
+    }
 
-    for (int il = 0; il < n_layer; ++il) {
+    for (int il = b1_l0; il < b1_l1; ++il) {
         res->t_layer_inp[il] = res_hc;
 
         if (hparams.is_ple(il)) {
@@ -519,6 +546,14 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
 
         // "l_last" is the layer output name that build_cvec and imatrix look for
         cb(res_hc, "l_last", il);
+    }
+
+    if (!b1_last) {
+        // [B1] hand the hidden state to the next layer range; this graph has no outputs
+        GGML_ASSERT(res_hc->type == b1_carry->type && b1_carry->ne[0] == res_hc->ne[0] && b1_carry->ne[1] == res_hc->ne[1] &&
+                    b1_carry->ne[2] == res_hc->ne[2]);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, res_hc, b1_carry));
+        return;
     }
 
     // the MTP head reads the hc-wide residual, before the final mixer

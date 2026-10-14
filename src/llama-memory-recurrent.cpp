@@ -1766,6 +1766,37 @@ bool llama_memory_recurrent_context::apply() {
     return true;
 }
 
+bool llama_memory_recurrent_context::b1_supported() const {
+    return status == LLAMA_MEMORY_STATUS_SUCCESS && !is_full && !ubatches.empty() &&
+           mem->n_rs_seq == 0 && !mem->rs_ring && !mem->gdn_replay;
+}
+
+void llama_memory_recurrent_context::b1_save() {
+    if (b1_views.size() <= i_next) {
+        b1_views.resize(i_next + 1);
+    }
+    auto & v = b1_views[i_next];
+    v.head  = mem->head;
+    v.n     = mem->n;
+    v.used  = mem->used;
+    v.rs_z  = mem->rs_z;
+    v.cells = mem->cells;
+}
+
+bool llama_memory_recurrent_context::b1_seek(size_t i) {
+    if (i >= b1_views.size() || i >= ubatches.size()) {
+        return false;
+    }
+    const auto & v = b1_views[i];
+    mem->head  = v.head;
+    mem->n     = v.n;
+    mem->used  = v.used;
+    mem->rs_z  = v.rs_z;
+    mem->cells = v.cells;
+    i_next = i;
+    return true;
+}
+
 llama_memory_status llama_memory_recurrent_context::get_status() const {
     return status;
 }

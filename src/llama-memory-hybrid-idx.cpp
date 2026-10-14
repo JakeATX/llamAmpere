@@ -566,6 +566,45 @@ bool llama_memory_hybrid_idx_context::apply() {
     return res;
 }
 
+bool llama_memory_hybrid_idx_context::b1_supported() const {
+    return llama_memory_hybrid_context::b1_supported() && (!ctx_idx || ctx_idx->b1_supported());
+}
+
+void llama_memory_hybrid_idx_context::b1_save() {
+    llama_memory_hybrid_context::b1_save();
+    if (ctx_idx) {
+        ctx_idx->b1_save();
+    }
+    if (b1_st.size() <= i_cur) {
+        b1_st.resize(i_cur + 1);
+        b1_lay.resize(i_cur + 1);
+    }
+    if (kpool_track() && kpool_st && i_kpool == i_cur) {
+        b1_st[i_cur]  = std::make_shared<kpool_state>(*kpool_st);
+        b1_lay[i_cur] = std::make_shared<llama_memory_hybrid_idx::kpool_layout>(mem->kpool_layout_get());
+    }
+}
+
+bool llama_memory_hybrid_idx_context::b1_seek(size_t i) {
+    if (!llama_memory_hybrid_context::b1_seek(i) || (ctx_idx && !ctx_idx->b1_seek(i))) {
+        return false;
+    }
+    i_cur = i;
+    if (kpool_track()) {
+        if (i >= b1_st.size() || !b1_st[i] || !b1_lay[i]) {
+            return false;
+        }
+        b1_st_cur  = b1_st[i].get();
+        b1_lay_cur = b1_lay[i].get();
+        i_kpool    = i;
+    }
+    return true;
+}
+
+const llama_memory_hybrid_idx::kpool_layout & llama_memory_hybrid_idx_context::kpool_lay_cur() const {
+    return b1_lay_cur ? *b1_lay_cur : mem->kpool_layout_get();
+}
+
 bool llama_memory_hybrid_idx_context::kpool_track() const {
     // Derived from mem instead of being cached.
     return mem != nullptr && mem->get_mem_idx() != nullptr && mem->get_kpool() > 0 && !ns_ubatch.empty();
@@ -727,7 +766,7 @@ void llama_memory_hybrid_idx_context::kpool_build_state(const llama_ubatch & uba
 const llama_memory_hybrid_idx_context::kpool_state & llama_memory_hybrid_idx_context::kpool_cur() const {
     GGML_ASSERT(kpool_st != nullptr && i_kpool == i_cur && "k-pool state read before apply()");
 
-    return *kpool_st;
+    return b1_st_cur ? *b1_st_cur : *kpool_st;
 }
 
 uint32_t llama_memory_hybrid_idx_context::get_n_kpool() const {
@@ -751,7 +790,7 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
     const uint32_t n_kv  = get_idx()->get_n_kv();
 
     const auto & st  = kpool_cur();
-    const auto & lay = mem->kpool_layout_get();
+    const auto & lay = kpool_lay_cur();
 
     const uint32_t n_tokens = ubatch->n_tokens;
     const uint32_t n_pool   = (uint32_t) pool_cells->ne[0];
