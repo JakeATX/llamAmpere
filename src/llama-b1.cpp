@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <tuple>
 
 #ifndef _WIN32
 #include <unistd.h>
@@ -332,7 +333,9 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
         }
     }
 
-    // try the largest group first, lending as little as possible
+    // group picker: find the largest group that fits (lending allowed up to the cap), then spread the ubatches evenly
+    // over the passes that group size needs, and lend as little as that even group size requires. A group larger than
+    // the even size takes the same number of passes but carries more ubatches and lends (and later refills) more.
     const size_t g_max = group_ub_req == 0 ? nub : std::min<size_t>(group_ub_req, nub);
     bool   found = false;
     size_t g_sel = 0;
@@ -341,7 +344,8 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
     std::vector<std::pair<char *, std::pair<ggml_backend_buffer_t, size_t>>> regs_sel; // base, (buf, size)
     size_t fresh_sel = 0;
 
-    for (size_t g = g_max; g >= 1 && !found; --g) {
+    // the smallest lend (fewest layers, highest first) that fits g ubatches per group; false when none does
+    auto try_group = [&](size_t g) -> bool {
         std::vector<size_t> items;
         for (int s = 0; s < 2; ++s) {
             for (size_t r = 0; r < n_roles; ++r) {
@@ -352,17 +356,20 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
             items.push_back(carry_bytes);
         }
 
-        for (size_t k = 0; k <= order.size() && !found; ++k) {
+        for (size_t k = 0; k <= order.size(); ++k) {
             std::vector<int> lent = forced;
             size_t lent_bytes = 0;
+            for (int il : forced) {
+                lent_bytes += layers[il].bytes;
+            }
             bool over_cap = false;
             for (size_t i = 0; i < k; ++i) {
                 lent_bytes += layers[order[i]].bytes;
                 over_cap = over_cap || lent_bytes > lend_cap;
                 lent.push_back(order[i]);
             }
-            if (over_cap) {
-                break;
+            if (over_cap && k > 0) {
+                break; // layers still holding borrowed data are lent whatever the cap; new ones only within it
             }
 
             // the lent spans, merged where they touch (the gap is the previous tensor's own alignment padding)
@@ -402,16 +409,35 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
             }
 
             if (fresh <= fresh_avail) {
-                found     = true;
                 g_sel     = g;
                 lent_sel  = lent;
                 place_sel = place;
                 regs_sel  = merged;
                 fresh_sel = fresh;
+                return true;
             }
         }
-        if (g == 1) {
+        return false;
+    };
+
+    size_t g_fit = 0;
+    for (size_t g = g_max; g >= 1; --g) {
+        if (try_group(g)) {
+            g_fit = g;
             break;
+        }
+    }
+    size_t passes = 0;
+    if (g_fit > 0) {
+        found  = true;
+        passes = (nub + g_fit - 1)/g_fit;
+        const size_t g_even = (nub + passes - 1)/passes;
+        if (g_even < g_fit) {
+            // keep the g_fit selection if the smaller group unexpectedly does not pack (first-fit is not monotone)
+            const auto keep = std::make_tuple(g_sel, lent_sel, place_sel, regs_sel, fresh_sel);
+            if (!try_group(g_even)) {
+                std::tie(g_sel, lent_sel, place_sel, regs_sel, fresh_sel) = keep;
+            }
         }
     }
 
@@ -535,10 +561,12 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
         return false;
     }
 
-    LLAMA_LOG_WARN("%s: [B1] plan: %zu ubatches (max %u tokens) in %zu groups of %zu, %zu layer streams, "
-            "lent %zu layers (%.1f MiB), fresh %.1f MiB, carry %.1f MiB, free before %.1f MiB\n", __func__,
-            nub, max_tok, n_grp, g_sel, steps.size(), lent_sel.size(), st.bytes_lent/1048576.0,
-            fresh_sel/1048576.0, st.bytes_carry/1048576.0, free_mem/1048576.0);
+    LLAMA_LOG_WARN("%s: [B1] plan: %zu ubatches (max %u tokens), largest fitting group %zu (asked %zu) -> %zu passes "
+            "of g = %zu, %zu layer streams, lent %zu layers (%.1f MiB, cap %.1f MiB), fresh %.1f MiB, carry %.1f MiB, "
+            "free before %.1f MiB\n", __func__,
+            nub, max_tok, g_fit, g_max, n_grp, g_sel, steps.size(), lent_sel.size(), st.bytes_lent/1048576.0,
+            lend_cap == SIZE_MAX ? -1.0 : lend_cap/1048576.0, fresh_sel/1048576.0, st.bytes_carry/1048576.0,
+            free_mem/1048576.0);
 
     stop     = false;
     io_error = false;
