@@ -4073,10 +4073,27 @@ const slot_info_vec_t *   sinfos_in) {
     GGML_UNUSED(flags);
 
     if (sj_kvarn.enabled()) {
-        if (sinfos_out || sinfos_in) {
-            throw std::runtime_error("SJ-KVaRN cache: mirrored (indexer) state restore is not supported");
+        if (sinfos_in) {
+            throw std::runtime_error("SJ-KVaRN cache: an SJ-KVaRN cache cannot mirror another cache's restored layout");
         }
-        state_read_sj_kvarn(io, seq_id);
+        const uint32_t n = state_read_sj_kvarn(io, seq_id);
+        if (sinfos_out) {
+            // a cache that mirrors this one (the qwen4exp QSA indexer) takes the restored layout: one stream per
+            // sequence, position p at cell p, so the sequence's stream holds cells [0, n)
+            sinfos_out->assign(n_stream, slot_info{});
+            if (n > 0) {
+                const uint32_t strm = sj_kvarn_seq_stream(seq_id);
+                slot_info & si = (*sinfos_out)[strm];
+                si.s0 = strm;
+                si.s1 = strm;
+                si.resize(1);
+                si.strm[0] = strm;
+                si.idxs[0].resize(n);
+                for (uint32_t i = 0; i < n; ++i) {
+                    si.idxs[0][i] = i;
+                }
+            }
+        }
         return;
     }
 
@@ -4104,13 +4121,17 @@ const slot_info_vec_t *   sinfos_in) {
         clear(true);
     }
 
+    // the mirrored layout is keyed by the stream the cells land in (for one sequence: that sequence's stream,
+    // whichever stream the file held it in), so the two caches agree even when the file came from another sequence
+    bool mirror_used = false;
+
     for (uint32_t s = 0; s < n_stream; ++s) {
         uint32_t cell_count;
         io.read(&cell_count, sizeof(cell_count));
 
         if (cell_count == 0) {
             // a mirrored cache must be empty here as well, or the two no longer agree cell for cell
-            if (sinfos_in && !(*sinfos_in)[s].empty()) {
+            if (seq_id == -1 && sinfos_in && !(*sinfos_in)[s].empty()) {
                 throw std::runtime_error("failed to restore kv cache: mirrored cache holds cells this one does not");
             }
             continue;
@@ -4121,7 +4142,8 @@ const slot_info_vec_t *   sinfos_in) {
         slot_info sinfo;
 
         bool res = true;
-        res = res && state_read_meta(io, strm, cell_count, sinfo, seq_id, sinfos_in ? &(*sinfos_in)[s] : nullptr);
+        res = res && state_read_meta(io, strm, cell_count, sinfo, seq_id, sinfos_in ? &(*sinfos_in)[strm] : nullptr);
+        mirror_used = true;
 
         try {
             res = res && state_read_data(io, strm, cell_count, sinfo);
@@ -4135,8 +4157,13 @@ const slot_info_vec_t *   sinfos_in) {
         }
 
         if (sinfos_out) {
-            (*sinfos_out)[s] = sinfo;
+            (*sinfos_out)[strm] = sinfo;
         }
+    }
+
+    // one sequence: the mirrored cache restored cells for it, so this cache must have restored some as well
+    if (seq_id != -1 && sinfos_in && !mirror_used && !(*sinfos_in)[seq_to_stream[seq_id]].empty()) {
+        throw std::runtime_error("failed to restore kv cache: mirrored cache holds cells this one does not");
     }
 }
 
@@ -4339,7 +4366,7 @@ void llama_kv_cache::state_write_sj_kvarn(llama_io_write_i & io, llama_seq_id se
     }
 }
 
-void llama_kv_cache::state_read_sj_kvarn(llama_io_read_i & io, llama_seq_id seq_id) {
+uint32_t llama_kv_cache::state_read_sj_kvarn(llama_io_read_i & io, llama_seq_id seq_id) {
     GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()));
     if (seq_id == -1 && n_stream > 1) {
         throw std::runtime_error("SJ-KVaRN cache: with several sequences (--parallel > 1) the state is restored per sequence");
@@ -4372,7 +4399,7 @@ void llama_kv_cache::state_read_sj_kvarn(llama_io_read_i & io, llama_seq_id seq_
         if (seq_id == -1) {
             clear(true);
         }
-        return;
+        return 0;
     }
 
     if (n > cells.size()) {
@@ -4590,6 +4617,8 @@ void llama_kv_cache::state_read_sj_kvarn(llama_io_read_i & io, llama_seq_id seq_
     sst.draining  = draining;
 
     LLAMA_LOG_DEBUG("%s: restored %u cells, sealed end %u (%u groups), tail %u rows\n", __func__, n, B, n_rec, n - std::min(n, B));
+
+    return n;
 }
 
 void llama_kv_cache::state_write_meta(llama_io_write_i & io, const cell_ranges_t & cr, llama_seq_id seq_id) const {

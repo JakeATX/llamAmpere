@@ -609,7 +609,7 @@ private:
 
     // SJ-KVaRN sequence state (format: see the comment above state_write_sj_kvarn in llama-kv-cache.cpp)
     void state_write_sj_kvarn(llama_io_write_i & io, llama_seq_id seq_id) const;
-    void state_read_sj_kvarn (llama_io_read_i  & io, llama_seq_id seq_id);
+    uint32_t state_read_sj_kvarn (llama_io_read_i  & io, llama_seq_id seq_id); // returns the cells restored
 };
 
 class llama_kv_cache_context : public llama_memory_context_i {
