@@ -822,13 +822,14 @@ static inline int aik_roll(int k) {
 
 // Viterbi at rate k (k = 4 equals ai4_viterbi). t0 < 0: free start; t0 >= 0: the first state's top 16-k bits and the last
 // state's low 16-k bits both equal t0. ws->arg holds 128 x 2^(16-k) decisions; levels come from ws->lev (aik_work_set_mul).
-static inline float aik_viterbi(ai4_work * ws, int k, const float * y, int t0, uint16_t * st) {
+static inline float aik_viterbi_metric(ai4_work * ws, int k, const float * y, const float * weight,
+                                     int t0, uint16_t * st) {
     float * cur = ws->cur, * nxt = ws->nxt;
     const float * L = ws->lev;
     const int tb = 16 - k, ntl = 1 << tb, nhi = 1 << k;
     for (int s = 0; s < AI4_NSTATE; ++s) {
         const float e = L[s] - y[0];
-        cur[s] = (t0 >= 0 && (s >> k) != t0) ? FLT_MAX : e*e;
+        cur[s] = (t0 >= 0 && (s >> k) != t0) ? FLT_MAX : e*e*(weight ? weight[0] : 1.0f);
     }
     float * m = ws->mscr;
     for (int i = 1; i < AI4_TILE; ++i) {
@@ -848,7 +849,7 @@ static inline float aik_viterbi(ai4_work * ws, int k, const float * y, int t0, u
         const float yi = y[i];
         for (int s = 0; s < AI4_NSTATE; ++s) {
             const float e = L[s] - yi;
-            nxt[s] = m[s >> k] + e*e;
+            nxt[s] = m[s >> k] + e*e*(weight ? weight[i] : 1.0f);
         }
         float * tmp = cur; cur = nxt; nxt = tmp;
     }
@@ -874,32 +875,49 @@ static inline float aik_viterbi(ai4_work * ws, int k, const float * y, int t0, u
     return bc;
 }
 
-static inline void aik_encode_tile(ai4_work * ws, int k, const float * y, uint16_t * st) {
-    float yr[AI4_TILE];
+static inline float aik_viterbi(ai4_work * ws, int k, const float * y, int t0, uint16_t * st) {
+    return aik_viterbi_metric(ws, k, y, NULL, t0, st);
+}
+
+static inline void aik_encode_tile_metric(ai4_work * ws, int k, const float * y, const float * weight, uint16_t * st) {
+    float yr[AI4_TILE], wr[AI4_TILE];
     uint16_t sr[AI4_TILE];
     const int roll = aik_roll(k);
     for (int i = 0; i < AI4_TILE; ++i) {
         yr[i] = y[(i + roll) % AI4_TILE];
+        if (weight) wr[i] = weight[(i + roll) % AI4_TILE];
     }
-    aik_viterbi(ws, k, yr, -1, sr);
+    aik_viterbi_metric(ws, k, yr, weight ? wr : NULL, -1, sr);
     const int t0 = sr[AI4_TILE - 1 - roll] & ((1 << (16 - k)) - 1);
-    aik_viterbi(ws, k, y, t0, st);
+    aik_viterbi_metric(ws, k, y, weight, t0, st);
+}
+
+static inline void aik_encode_tile(ai4_work * ws, int k, const float * y, uint16_t * st) {
+    aik_encode_tile_metric(ws, k, y, NULL, st);
 }
 
 // ai4_encode_slab_block_n at rate k. tiles: n/8 tiles x 4k words, column-step order.
-static inline void aik_encode_slab_block_n(ai4_work * ws, int k, float * y, int ys, const float * d, const float * U, int n,
-                                          uint32_t * tiles) {
+static inline void aik_encode_slab_block_n_metric(ai4_work * ws, int k, float * y, int ys, const float * d,
+                                                 const float * U, int n, uint32_t * tiles, int weight_metric) {
     const int ng = n/AI4_GS, tw = AIK_TILE_WORDS(k);
     for (int c0 = 0; c0 < n; c0 += AI4_TC) {
-        float t[AI4_TILE];
+        float t[AI4_TILE], weight[AI4_TILE], maxd = 0.0f;
         uint16_t st[AI4_TILE];
         for (int r = 0; r < AI4_TR; ++r) {
             for (int j = 0; j < AI4_TC; ++j) {
                 const float dr = d[r*ng + (c0 + j)/AI4_GS];
                 t[r*AI4_TC + j] = dr > 0.0f ? y[r*ys + c0 + j]/dr : 0.0f;
+                weight[r*AI4_TC + j] = dr;
+                if (dr > maxd) maxd = dr;
             }
         }
-        aik_encode_tile(ws, k, t, st);
+        if (weight_metric) {
+            for (int i = 0; i < AI4_TILE; ++i) {
+                const float v = maxd > 0.0f ? weight[i]/maxd : 0.0f;
+                weight[i] = v*v;
+            }
+        }
+        aik_encode_tile_metric(ws, k, t, weight_metric ? weight : NULL, st);
         uint32_t * wd = tiles + (c0/AI4_TC)*tw;
         memset(wd, 0, sizeof(uint32_t)*tw);
         for (int i = 0; i < AI4_TILE; ++i) {
@@ -937,13 +955,18 @@ static inline void aik_encode_slab_block_n(ai4_work * ws, int k, float * y, int 
     }
 }
 
+static inline void aik_encode_slab_block_n(ai4_work * ws, int k, float * y, int ys, const float * d, const float * U, int n,
+                                          uint32_t * tiles) {
+    aik_encode_slab_block_n_metric(ws, k, y, ys, d, U, n, tiles, 0);
+}
+
 // Quantize one slab (16 rows of K, row stride K) to K/128 rate-k units at dst (ai4u_quantize_slab_rb at rate k).
 // dfix (optional): per-(row, 128-group) RMS table [16][K/128] row-major used in place of each group's own rotated RMS,
 // i.e. the CPU twin of the GPU encoder's sfix. A table that is constant inside every 1024 span (--scale-mode row / span)
 // makes the output packable into the AIk_S span layout (ai4s_pack_slab). NULL = each group's own RMS.
-static inline void aik_quantize_slab_rb_cf(ai4_work * ws, int k, uint32_t C, const float * src, int64_t K, const float * imatrix,
+static inline void aik_quantize_slab_rb_cfm(ai4_work * ws, int k, uint32_t C, const float * src, int64_t K, const float * imatrix,
                                        const float * Uall, const uint8_t * ok, uint8_t * dst, int rb, float smul,
-                                       const float * dfix) {
+                                       const float * dfix, int weight_metric) {
     const int ub = AI4U_UNIT_BYTES(k), tw = AIK_TILE_WORDS(k);
     aik_work_set_mul(ws, C);
     const float lrms = aik_level_rms_c(C);
@@ -980,7 +1003,7 @@ static inline void aik_quantize_slab_rb_cf(ai4_work * ws, int k, uint32_t C, con
         } else if (imatrix && tmpU) {
             U = ai4_ldlq_prep_n(imatrix + b*rb, tmpU, rb) ? tmpU : NULL;
         }
-        aik_encode_slab_block_n(ws, k, y, rb, dsc, U, rb, tiles);
+        aik_encode_slab_block_n_metric(ws, k, y, rb, dsc, U, rb, tiles, weight_metric);
         for (int g = 0; g < ng; ++g) {
             memcpy(dst + (b*ng + g)*ub + AI4U_SCALE_BYTES, tiles + g*16*tw, (size_t) 16*tw*4);
         }
@@ -988,6 +1011,12 @@ static inline void aik_quantize_slab_rb_cf(ai4_work * ws, int k, uint32_t C, con
     free(tiles);
     free(y);
     free(tmpU);
+}
+
+static inline void aik_quantize_slab_rb_cf(ai4_work * ws, int k, uint32_t C, const float * src, int64_t K, const float * imatrix,
+                                         const float * Uall, const uint8_t * ok, uint8_t * dst, int rb, float smul,
+                                         const float * dfix) {
+    aik_quantize_slab_rb_cfm(ws, k, C, src, K, imatrix, Uall, ok, dst, rb, smul, dfix, 0);
 }
 
 static inline void aik_quantize_slab_rb_c(ai4_work * ws, int k, uint32_t C, const float * src, int64_t K, const float * imatrix,

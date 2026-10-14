@@ -10,6 +10,8 @@
 //   T6  the span types AI2_S..AI6_S (one fp16 scale per row and 1024 K): a row-scaled AIk_U encode packs losslessly
 //       (unpack(pack) == the source bytes), the CPU and CUDA span decoders are bit-identical to the AIk_U decode of the
 //       same bytes, and the CPU span encoder + pack reproduces the GPU encoder + pack
+//   T7  weighted metric: equal nonzero scales reproduce legacy GPU bytes at every rate; zero scales reconstruct zero;
+//       weighted GPU bytes decode exactly on CPU/CUDA. GPU vs float-CPU weighted error is reported (half costs differ).
 // usage: llama-ai4-rate-test [K M]   (K % 256, M % 16; default 256 64 for T1/T2, T4 and T6 use 1024 x 64). Exit 0 = pass.
 #include "ai4-encode.h"
 #include "ggml-ai4.h"
@@ -241,6 +243,52 @@ int main(int argc, char ** argv) {
                    (32.0 + 2048.0*k)*8.0/16384.0, (32.0 + 256.0*k)*8.0/2048.0,
                    (long long) AI4S_SPAN_BYTES(k), (long long) AI4S_ROW_BYTES(k));
         }
+    }
+
+    // ---- T7: optional physical row metric, including equal-scale and all-zero scale cases ----
+    for (int it = 0; it < g_ntype; ++it) {
+        const ggml_type ty = g_types[it];
+        const int k = ggml_ai4_rate(ty);
+        const uint32_t C = ggml_ai4_trellis_mul(ty);
+        const float sm = ggml_ai4_scale_mul(ty), lrms = aik_level_rms_c(C);
+        const size_t sb = (size_t) ai4x_slab_bytes_k(K, k);
+        std::vector<uint8_t> qn(sb*(M/16)), qw(qn.size()), qc(qn.size());
+        std::vector<float> sfix((size_t) M*(K/128), 0.02f);
+        std::vector<float> rg((size_t) M*K), rc(rg.size());
+        float ms = 0.0f;
+        char buf[256];
+        if (ai4_cuda_encode_rate(W.data(), K, M, nullptr, nullptr, lrms, sm, k, C, qn.data(), &ms, sfix.data(), 0)) return 1;
+        if (ai4_cuda_encode_rate(W.data(), K, M, nullptr, nullptr, lrms, sm, k, C, qw.data(), &ms, sfix.data(), 1)) return 1;
+        snprintf(buf, sizeof(buf), "T7 %-6s weighted metric with constant scales == normalized GPU bytes", ggml_type_name(ty));
+        check(memcmp(qn.data(), qw.data(), qn.size()) == 0, buf);
+
+        std::fill(sfix.begin(), sfix.end(), 0.0f);
+        if (ai4_cuda_encode_rate(W.data(), K, M, nullptr, nullptr, lrms, sm, k, C, qw.data(), &ms, sfix.data(), 1)) return 1;
+        if (ai4_cuda_reconstruct_rate(qw.data(), K, M, k, C, 1, rg.data())) return 1;
+        bool zero = true;
+        for (float v : rg) zero = zero && v == 0.0f;
+        snprintf(buf, sizeof(buf), "T7 %-6s weighted metric with zero scales reconstructs zero", ggml_type_name(ty));
+        check(zero, buf);
+
+        // Unequal group scales: compare the physical metric using the same FP16 scale values, then check decode identity.
+        if (ai4_cuda_encode_rate(W.data(), K, M, nullptr, nullptr, lrms, sm, k, C, qw.data(), &ms, nullptr, 1)) return 1;
+        ai4_work * ws = ai4_work_new();
+        for (int64_t sl = 0; sl < M/16; ++sl) {
+            aik_quantize_slab_rb_cfm(ws, k, C, W.data() + (size_t) sl*16*K, K, nullptr, nullptr, nullptr,
+                                     qc.data() + sl*sb, ai4u_rot_size(K), sm, nullptr, 1);
+            aik_dequantize_slab_c(k, C, qc.data() + sl*sb, rc.data() + (size_t) sl*16*K, K);
+        }
+        free(ws);
+        if (ai4_cuda_reconstruct_rate(qw.data(), K, M, k, C, 0, rg.data())) return 1;
+        const double eg = rel_err(W, rg), ec = rel_err(W, rc);
+        printf("INFO  T7 %-6s weighted GPU/CPU bytes %s, err gpu %.5e cpu %.5e ratio %.4f (half vs float costs)\n",
+               ggml_type_name(ty), memcmp(qw.data(), qc.data(), qw.size()) == 0 ? "IDENTICAL" : "differ", eg, ec, eg/ec);
+        for (int64_t sl = 0; sl < M/16; ++sl) {
+            aik_dequantize_slab_rotated_c(k, C, qw.data() + sl*sb, rc.data() + (size_t) sl*16*K, K);
+        }
+        if (ai4_cuda_reconstruct_rate(qw.data(), K, M, k, C, 1, rg.data())) return 1;
+        snprintf(buf, sizeof(buf), "T7 %-6s weighted GPU bytes reconstruct exactly on CPU and CUDA", ggml_type_name(ty));
+        check(std::isfinite(eg) && std::isfinite(ec) && memcmp(rg.data(), rc.data(), rg.size()*sizeof(float)) == 0, buf);
     }
 
     printf("%s (%d failures)\n", g_fail ? "FAIL" : "PASS", g_fail);

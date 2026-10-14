@@ -5,6 +5,7 @@
 //   T3  rate 5 full-K error < rate 4 full-K error
 //   T4  rate 5 full-K error < rate 5 with no LDLQ, and full-K error < diagonal-only (mode 2) error on correlated inputs
 //   T5  --refit: same encode before the refit, lower error after it, and the rewritten fp16 scales reproduce it
+//   T6  optional weighted trellis metric: the internal score equals the full-H score of the stored reconstruction
 // usage: llama-ai4-fullk-test [K M]   (K % 1024, M % 16). Exit code 0 = all pass.
 #include "ai4-encode.h"
 #include "ggml-ai4.h"
@@ -83,14 +84,23 @@ int main(int argc, char ** argv) {
     printf("max |R_ai4 - R_k4| = %.3e\n", md);
     check(md == 0.0, "T1 rate-4 full-K == AI4 full-K reconstruction (bit exact)");
     auto rel = [](double a, double b) { return std::fabs(a - b) / std::fmax(std::fabs(b), 1e-30); };
-    // internal werr is from the rotated-basis fp32 encoder state, the external one from the fp16-scale reconstruction
-    // (mode 2 is excluded: its internal error is measured against the diagonal-only H it encoded with, not the full H)
-    check(rel(w0, e0) < 2e-3 && rel(w4, e4) < 2e-3 && rel(w5, e5) < 2e-3, "T2 internal werr == reconstructed werr (rel < 2e-3)");
+    // Both scores use the full undamped Hessian, including the diagonal-only fit.
+    check(rel(w0, e0) < 2e-3 && rel(w4, e4) < 2e-3 && rel(w5, e5) < 2e-3 && rel(w5d, e5d) < 2e-3,
+          "T2 internal werr == reconstructed werr in full and diagonal modes (rel < 2e-3)");
     check(e5 < e4, "T3 rate 5 error < rate 4 error");
     check(e5 < e5n && e5 < e5d, "T4 rate 5 full-K error < no-LDLQ and < diagonal-only");
     check(rel(w5p, w5) < 1e-6 && rel(w0p, w0) < 1e-6, "T5a refit pre-error == plain full-K error (same encode)");
     check(w5f <= w5p && w0f <= w0p && e5f <= e5 * 1.0005 && e0f <= e0 * 1.0005, "T5b refit lowers the H-weighted error (internal; reconstructed within fp16 rounding)");
-    check(rel(w5f, e5f) < 2e-3 && rel(w0f, e0f) < 2e-3, "T5c refit internal werr == reconstructed werr (stored fp16 scales updated)");
+    check(rel(w5f, e5f) < 1e-5 && rel(w0f, e0f) < 1e-5, "T5c refit internal werr == reconstructed werr after fp16 rounding (rel < 1e-5)");
+    std::vector<uint8_t> q5w(nq5);
+    std::vector<float> R5w(R0.size());
+    double w5w = -1.0, e5w = -1.0;
+    if (ai4_cuda_encode_fullk_rate(W.data(), H.data(), K, M, 0, 0.01, lrms, smul, 5, AI4_MUL, 0,
+                                  q5w.data(), &ms, &w5w, nullptr, 1)) return 1;
+    if (ai4_cuda_reconstruct_rate(q5w.data(), K, M, 5, AI4_MUL, 0, R5w.data())) return 1;
+    if (ai4_cuda_werr(W.data(), R5w.data(), H.data(), K, M, &e5w)) return 1;
+    printf("weighted trellis: k5 full-H %.4e (internal %.4e), normalized %.4e, ratio %.4f\n", e5w, w5w, e5, e5w/e5);
+    check(std::isfinite(e5w) && rel(w5w, e5w) < 2e-3, "T6 weighted trellis internal werr == full-H reconstructed werr");
     printf("%s (%d failed)\n", g_fail ? "FAILED" : "ALL PASS", g_fail);
     return g_fail ? 1 : 0;
 }

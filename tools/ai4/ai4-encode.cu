@@ -590,18 +590,20 @@ struct aik_geom {
     static constexpr int SPW = 32 / KB;
     static constexpr int DW  = (TPT + SPW - 1) / SPW;
     // Decision window. The min-over-hi buffer is 2*NT halves, which grows as 2^(16-KB), so the window shrinks at the low
-    // rates to stay inside the 100 KB SM86 dynamic shared-memory limit (all rates land at <= 99,852 B, the KB = 4 size).
+    // rates to stay inside the 100 KB SM86 dynamic shared-memory limit (all rates land at <= 100,368 B, the KB = 4 size).
     static constexpr int WIN  = KB >= 4 ? 32 : (KB == 3 ? 8 : 4);
     static constexpr int ROLL = WIN - 1;     // tail-biting roll: original index 127 at rolled index 128 - WIN (== aik_roll)
 };
 
-// Shared memory of one rate-KB encoder CTA (the AI4 enc_smem generalized; KB = 4 has the same layout and size).
+// Shared memory of one rate-KB encoder CTA (the AI4 enc_smem generalized, plus optional row metric weights).
 template <int KB>
 struct aik_smem {
     uint32_t dec[aik_geom<KB>::WIN][aik_geom<KB>::DW][ENC_NT];
     __half2  mb[2][aik_geom<KB>::NT / 2];   // NT halves per buffer (double-buffered min over hi)
     float    y[16][256];
     float    tgt[128];
+    float    weight[128];
+    float    maxd;
     float    ebuf[128];
     float    wmin[2][16];
     float    redv[16];
@@ -622,7 +624,7 @@ static __device__ __forceinline__ __half2 aik_lev2(const uint32_t (&Lp)[aik_geom
 template <int KB>
 static __device__ __forceinline__ void aik_viterbi(aik_smem<KB> & S, const uint32_t (&Lp)[aik_geom<KB>::NHI][aik_geom<KB>::NL],
                                    __half2 (&c)[aik_geom<KB>::NHI][aik_geom<KB>::NP],
-                                   const int R, const int t0, const int E, const int W0, const int endmode) {
+                                   const int R, const int t0, const int E, const int W0, const int endmode, const int weight_metric) {
     using G = aik_geom<KB>;
     const int j    = threadIdx.x;
     const int lane = j & 31;
@@ -636,13 +638,16 @@ static __device__ __forceinline__ void aik_viterbi(aik_smem<KB> & S, const uint3
 
     {
         const __half2 y2 = __float2half2_rn(S.tgt[R & 127]);
+        const float weight = weight_metric ? S.weight[R & 127] : 1.0f;
+        const __half2 w2 = __float2half2_rn(weight);
 #pragma unroll
         for (int hi = 0; hi < G::NHI; ++hi) {
 #pragma unroll
             for (int p = 0; p < G::NP; ++p) {
                 const bool off = t0 >= 0 && (((hi << (G::TB - KB)) | AIK_TG(p)) != t0);
                 const __half2 mv = off ? hinf : __float2half2_rn(0.0f);
-                const __half2 e = __hsub2(aik_lev2<KB>(Lp, hi, p), y2);
+                __half2 e = __hsub2(aik_lev2<KB>(Lp, hi, p), y2);
+                if (weight < 1.0f) e = __hmul2(e, w2);
                 c[hi][p] = __hfma2(e, e, mv);
             }
         }
@@ -695,13 +700,16 @@ static __device__ __forceinline__ void aik_viterbi(aik_smem<KB> & S, const uint3
         }
         const __half  gminh = __float2half_rn(gmin);
         const __half2 y2    = __float2half2_rn(S.tgt[(i + R) & 127]);
+        const float weight = weight_metric ? S.weight[(i + R) & 127] : 1.0f;
+        const __half2 w2 = __float2half2_rn(weight);
         const __half * mbh  = reinterpret_cast<const __half *>(S.mb[buf]);
 #pragma unroll
         for (int hi = 0; hi < G::NHI; ++hi) {
 #pragma unroll
             for (int p = 0; p < G::NP; ++p) {
                 const __half2 mv = __half2half2(__hsub(mbh[(hi << (G::TB - KB)) | AIK_TG(p)], gminh));
-                const __half2 e = __hsub2(aik_lev2<KB>(Lp, hi, p), y2);
+                __half2 e = __hsub2(aik_lev2<KB>(Lp, hi, p), y2);
+                if (weight < 1.0f) e = __hmul2(e, w2);
                 c[hi][p] = __hfma2(e, e, mv);
             }
         }
@@ -780,7 +788,7 @@ template <int RB, int KB>
 static __global__ void __launch_bounds__(ENC_NT, 1) k_aik_encode(const float * __restrict__ W, const int64_t K,
         const float * __restrict__ Gm, const uint8_t * __restrict__ gok, const float lrms, const float smul,
         uint8_t * __restrict__ out, const int hb0, const int prerot, float * __restrict__ qr, const uint32_t lmul,
-        const float * __restrict__ sfix) {
+        const float * __restrict__ sfix, const int weight_metric) {
     // hb0 / prerot / qr: as for k_ai4_encode (EXLGAP full-K LDLQ at rate KB, RB = 256 only): with prerot W holds rotated,
     // cross-block LDLQ-updated weights; hb = hb0 + blockIdx.x; G / gok are indexed by blockIdx.x; qr gets [M][RB].
     using G = aik_geom<KB>;
@@ -880,12 +888,23 @@ static __global__ void __launch_bounds__(ENC_NT, 1) k_aik_encode(const float * _
             for (int q = 0; q < 8; ++q) {
                 const float t = dv > 0.0f ? S.y[r][cs * 8 + q] / dv : 0.0f;
                 S.tgt[r * 8 + q] = fminf(fmaxf(t, -250.0f), 250.0f);
+                if (weight_metric) S.weight[r * 8 + q] = dv;
             }
         }
         __syncthreads();
+        if (weight_metric) {
+            if (j == 0) {
+                float maxd = 0.0f;
+                for (int row = 0; row < 16; ++row) maxd = fmaxf(maxd, S.weight[row * 8]);
+                S.maxd = maxd;
+            }
+            __syncthreads();
+            if (j < 128) S.weight[j] = S.maxd > 0.0f ? S.weight[j] / S.maxd : 0.0f;
+            __syncthreads();
+        }
 
         constexpr int WB = 128 - G::WIN;   // first step of the last decision window
-        aik_viterbi<KB>(S, Lp, c, G::ROLL, -1, 127, WB, 1);
+        aik_viterbi<KB>(S, Lp, c, G::ROLL, -1, 127, WB, 1, weight_metric);
         if (j == 0) {
             const int sw = aik_trace<KB>(S, S.bests, 127, WB + 1, WB, nullptr);
             S.t0 = sw & (G::NT - 1);
@@ -893,7 +912,7 @@ static __global__ void __launch_bounds__(ENC_NT, 1) k_aik_encode(const float * _
         __syncthreads();
         const int t0 = S.t0;
 
-        aik_viterbi<KB>(S, Lp, c, 0, t0, 127, WB, 2);
+        aik_viterbi<KB>(S, Lp, c, 0, t0, 127, WB, 2, weight_metric);
         if (j == 0) {
             S.st[WB - 1] = (uint16_t) aik_trace<KB>(S, S.bests, 127, WB, WB, S.st);
         }
@@ -901,7 +920,7 @@ static __global__ void __launch_bounds__(ENC_NT, 1) k_aik_encode(const float * _
 #pragma unroll 1
         for (int E = WB - 1; E > 0; E -= G::WIN) {
             const int W0 = E - (G::WIN - 1);
-            aik_viterbi<KB>(S, Lp, c, 0, t0, E, W0, 0);
+            aik_viterbi<KB>(S, Lp, c, 0, t0, E, W0, 0, weight_metric);
             if (j == 0) {
                 const int lo = W0 > 0 ? W0 : 1;
                 S.st[lo - 1] = (uint16_t) aik_trace<KB>(S, S.st[E], E, lo, W0, S.st);
@@ -959,12 +978,13 @@ static __global__ void __launch_bounds__(ENC_NT, 1) k_aik_encode(const float * _
 // Launch table: the rate-KB encoder at RB = 256 / 128, and its shared-memory size (grows as 2^(16-KB), see aik_geom).
 struct aik_kern_info {
     void (*fn)(const float *, int64_t, const float *, const uint8_t *, float, float, uint8_t *, int, int, float *, uint32_t,
-               const float *);
+               const float *, int);
     int  smem;
 };
 
 template <int KB>
 static aik_kern_info aik_kern_of(int rb) {
+    static_assert(sizeof(aik_smem<KB>) <= 100 * 1024, "AI+ encoder exceeds Ampere shared-memory limit");
     return { rb == 256 ? k_aik_encode<256, KB> : k_aik_encode<128, KB>, (int) sizeof(aik_smem<KB>) };
 }
 
@@ -980,8 +1000,8 @@ static bool aik_kern(int kbits, int rb, aik_kern_info & ki) {
 }
 
 int ai4_cuda_encode_rate(const float * W, int64_t K, int64_t M, const float * G, const uint8_t * gok, float lrms, float smul,
-                         int kbits, uint32_t lmul, uint8_t * out, float * ms, const float * sfix) {
-    if (K % 128 != 0 || M % 16 != 0 || kbits < 2 || kbits > 6) {
+                         int kbits, uint32_t lmul, uint8_t * out, float * ms, const float * sfix, int weight_metric) {
+    if (K % 128 != 0 || M % 16 != 0 || kbits < 2 || kbits > 6 || weight_metric < 0 || weight_metric > 1) {
         return 2;
     }
     const int rb = K % 256 == 0 ? 256 : 128;
@@ -1016,7 +1036,7 @@ int ai4_cuda_encode_rate(const float * W, int64_t K, int64_t M, const float * G,
     AI4_CU(cudaEventCreate(&e1));
     AI4_CU(cudaEventRecord(e0));
     const dim3 grid((unsigned) (K / rb), (unsigned) (M / 16));
-    kern<<<grid, ENC_NT, smem>>>(dW, K, dG, dok, lrms, smul, dq, 0, 0, nullptr, lmul, dsf);
+    kern<<<grid, ENC_NT, smem>>>(dW, K, dG, dok, lrms, smul, dq, 0, 0, nullptr, lmul, dsf, weight_metric);
     AI4_CU(cudaGetLastError());
     AI4_CU(cudaEventRecord(e1));
     AI4_CU(cudaEventSynchronize(e1));
@@ -1117,16 +1137,12 @@ static __global__ void k_aiq_rowfit(const float * __restrict__ Y0, const float *
     }
 }
 
-static __global__ void k_aiq_rowscale(float * __restrict__ Q, const float * __restrict__ c, const int64_t K, const int64_t M) {
-    const int64_t idx = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < K * M) Q[idx] *= c[idx / K];
-}
-
 static int aiq_encode_fullk_impl(const float * W, const float * H, int64_t K, int64_t M, int mode, double damp, float lrms,
                                  float smul, int kbits, uint32_t lmul, int refit, uint8_t * out, float * ms, double * werr_out,
-                                 double * werr_pre) {
+                                 double * werr_pre, int weight_metric) {
     if (M % 16 != 0) return 2;
     if (kbits == 0 ? K % 1024 != 0 : ((kbits < 2 || kbits > 6) || K % 256 != 0)) return 2;
+    if (weight_metric < 0 || weight_metric > 1 || (weight_metric && kbits == 0)) return 2;
     const int NB = (int) (K / 256);
     const size_t nw = (size_t) K * M, nh = (size_t) K * K;
     const size_t nq = kbits == 0 ? (size_t) (M / 16) * (K / 1024) * AI4_DEV_SB_BYTES
@@ -1158,22 +1174,32 @@ static int aiq_encode_fullk_impl(const float * W, const float * H, int64_t K, in
     // H' = R H R^T: rotate rows, transpose, rotate rows
     AI4_CU(cudaMemcpy(dU, H, nh * sizeof(float), cudaMemcpyHostToDevice));
     const unsigned nbk = (unsigned) ((nh + 255) / 256);
-    if (mode == 2) k_aiq_mask<<<nbk, 256>>>(dU, K, 2);
-    k_aiq_rot<<<dim3((unsigned) NB, (unsigned) K), 32>>>(dU, K);
-    {
+    const bool need_full_h = werr_out || refit;
+    auto rotate_h = [&]() -> int {
+        k_aiq_rot<<<dim3((unsigned) NB, (unsigned) K), 32>>>(dU, K);
         const float one = 1.0f, zero = 0.0f;
         AIQ_CB(cublasSgeam(cb, CUBLAS_OP_T, CUBLAS_OP_N, (int) K, (int) K, &one, dU, (int) K, &zero, dT, (int) K, dT, (int) K));
-    }
-    k_aiq_rot<<<dim3((unsigned) NB, (unsigned) K), 32>>>(dT, K);
-    if (mode == 1) k_aiq_mask<<<nbk, 256>>>(dT, K, 1);
-    // keep the undamped H' for the error report
-    if (werr_out || refit) {
+        k_aiq_rot<<<dim3((unsigned) NB, (unsigned) K), 32>>>(dT, K);
+        return 0;
+    };
+    if (mode == 2 && !need_full_h) k_aiq_mask<<<nbk, 256>>>(dU, K, 2);
+    const int hrc = rotate_h();
+    if (hrc) return hrc;
+    // Score and refit every mode against the same full, undamped Hessian.
+    if (need_full_h) {
         AI4_CU(cudaMalloc(&dH0, nh * sizeof(float)));
         AI4_CU(cudaMemcpy(dH0, dT, nh * sizeof(float), cudaMemcpyDeviceToDevice));
         AI4_CU(cudaMalloc(&dY0, nw * sizeof(float)));
         AI4_CU(cudaMemcpy(dY0, dY, nw * sizeof(float), cudaMemcpyDeviceToDevice));
         AI4_CU(cudaMalloc(&dQ, nw * sizeof(float)));
     }
+    if (mode == 2 && need_full_h) {
+        AI4_CU(cudaMemcpy(dU, H, nh * sizeof(float), cudaMemcpyHostToDevice));
+        k_aiq_mask<<<nbk, 256>>>(dU, K, 2);
+        const int rc = rotate_h();
+        if (rc) return rc;
+    }
+    if (mode == 1) k_aiq_mask<<<nbk, 256>>>(dT, K, 1);
     {
         std::vector<float> dg(K);
         AI4_CU(cudaMemcpy2D(dg.data(), sizeof(float), dT, (K + 1) * sizeof(float), sizeof(float), K, cudaMemcpyDeviceToHost));
@@ -1230,7 +1256,7 @@ static int aiq_encode_fullk_impl(const float * W, const float * H, int64_t K, in
         AI4_CU(cudaMemcpy(dG, G.data(), G.size() * sizeof(float), cudaMemcpyHostToDevice));
         const dim3 g1(1, (unsigned) (M / 16));
         if (kbits == 0) k_ai4_encode<256, 0><<<g1, ENC_NT, smem>>>(dY, K, dG, nullptr, lrms, smul, dq, b, 1, dQr);
-        else { auto kf = ki.fn; kf<<<g1, ENC_NT, ki.smem>>>(dY, K, dG, nullptr, lrms, smul, dq, b, 1, dQr, lmul, nullptr); }
+        else { auto kf = ki.fn; kf<<<g1, ENC_NT, ki.smem>>>(dY, K, dG, nullptr, lrms, smul, dq, b, 1, dQr, lmul, nullptr, weight_metric); }
         AI4_CU(cudaGetLastError());
         // D = Y_b - Qr ; F = D U_bb^-1 (TRSM) ; Y_later -= F U_b,later
         if (dQ) {
@@ -1251,27 +1277,51 @@ static int aiq_encode_fullk_impl(const float * W, const float * H, int64_t K, in
     }
     AI4_CU(cudaDeviceSynchronize());
     std::vector<float> cfit;
+    double refit_pre = -1.0;
     if (refit) {
         float * dTf = nullptr, * dc = nullptr;
         AI4_CU(cudaMalloc(&dTf, nw * sizeof(float)));
         AI4_CU(cudaMalloc(&dc, (size_t) M * sizeof(float)));
         const float one = 1.0f, zero = 0.0f;
-        if (werr_pre) {   // error before the refit (same formula as below)
+        if (werr_pre || werr_out) {   // error before the refit (same formula as below)
             float num = 0.0f, den = 0.0f, mone = -1.0f;
             AIQ_CB(cublasSgeam(cb, CUBLAS_OP_N, CUBLAS_OP_N, (int) K, (int) M, &one, dY0, (int) K, &mone, dQ, (int) K, dY, (int) K));
             AIQ_CB(cublasSgemm(cb, CUBLAS_OP_N, CUBLAS_OP_N, (int) K, (int) M, (int) K, &one, dH0, (int) K, dY, (int) K, &zero, dTf, (int) K));
             AIQ_CB(cublasSdot(cb, (int) nw, dY, 1, dTf, 1, &num));
             AIQ_CB(cublasSgemm(cb, CUBLAS_OP_N, CUBLAS_OP_N, (int) K, (int) M, (int) K, &one, dH0, (int) K, dY0, (int) K, &zero, dTf, (int) K));
             AIQ_CB(cublasSdot(cb, (int) nw, dY0, 1, dTf, 1, &den));
-            *werr_pre = (double) num / (double) den;
+            refit_pre = (double) num / (double) den;
+            if (werr_pre) *werr_pre = refit_pre;
         }
         AIQ_CB(cublasSgemm(cb, CUBLAS_OP_N, CUBLAS_OP_N, (int) K, (int) M, (int) K, &one, dH0, (int) K, dQ, (int) K, &zero, dTf, (int) K));
         k_aiq_rowfit<<<(unsigned) M, 256>>>(dY0, dQ, dTf, K, dc);
-        k_aiq_rowscale<<<(unsigned) ((nw + 255) / 256), 256>>>(dQ, dc, K, M);
         AI4_CU(cudaGetLastError());
         cfit.resize(M);
         AI4_CU(cudaMemcpy(cfit.data(), dc, (size_t) M * sizeof(float), cudaMemcpyDeviceToHost));
         cudaFree(dTf); cudaFree(dc);
+        AI4_CU(cudaMemcpy(out, dq, nq, cudaMemcpyDeviceToHost));
+        // Rewrite the stored scales first; the reported error must describe these exact bytes.
+        for (int64_t row = 0; row < M; ++row) {
+            const int64_t slab = row / 16, r = row % 16;
+            for (int64_t kc = 0; kc < K / 128; ++kc) {
+                uint16_t * sp = kbits == 0
+                    ? reinterpret_cast<uint16_t *>(out + (slab * (K / 1024) + (kc >> 3)) * AI4_DEV_SB_BYTES) + r * 8 + (kc & 7)
+                    : reinterpret_cast<uint16_t *>(out + (slab * (K / 128) + kc) * (32 + 256 * kbits)) + r;
+                __half h; memcpy(&h, sp, 2);
+                const __half n = __float2half_rn(__half2float(h) * cfit[row]);
+                memcpy(sp, &n, 2);
+            }
+        }
+        if (werr_out) {
+            AI4_CU(cudaMemcpy(dq, out, nq, cudaMemcpyHostToDevice));
+            if (kbits == 0) {
+                ai4_reconstruct_launch<float>(dq, dQ, K, M, 0);
+                k_aiq_rot<<<dim3((unsigned) NB, (unsigned) M), 32>>>(dQ, K);
+            } else if (!aik_reconstruct_rate<float>(kbits, dq, dQ, K, M, false, 0, lmul)) {
+                return 2;
+            }
+            AI4_CU(cudaGetLastError());
+        }
     }
     if (werr_out) {
         // H'-weighted relative error tr(E H' E^T) / tr(Y0 H' Y0^T), E = Y0 - Q (rotated domain, undamped H')
@@ -1287,24 +1337,14 @@ static int aiq_encode_fullk_impl(const float * W, const float * H, int64_t K, in
         AIQ_CB(cublasSgemm(cb, CUBLAS_OP_N, CUBLAS_OP_N, (int) K, (int) M, (int) K, &one, dH0, (int) K, dY0, (int) K, &zero, dT1, (int) K));
         AIQ_CB(cublasSdot(cb, (int) nw, dY0, 1, dT1, 1, &den));
         *werr_out = (double) num / (double) den;
+        if (refit && refit_pre >= 0.0 && *werr_out > refit_pre * 1.00001) {
+            fprintf(stderr, "aiq: stored fp16 refit increased full-H error %.6e -> %.6e\n", refit_pre, *werr_out);
+        }
     }
     AI4_CU(cudaEventRecord(e1));
     AI4_CU(cudaEventSynchronize(e1));
     if (ms) AI4_CU(cudaEventElapsedTime(ms, e0, e1));
-    AI4_CU(cudaMemcpy(out, dq, nq, cudaMemcpyDeviceToHost));
-    if (refit) {   // rescale every stored fp16 group scale of row r by c_r
-        for (int64_t row = 0; row < M; ++row) {
-            const int64_t slab = row / 16, r = row % 16;
-            for (int64_t kc = 0; kc < K / 128; ++kc) {
-                uint16_t * sp = kbits == 0
-                    ? reinterpret_cast<uint16_t *>(out + (slab * (K / 1024) + (kc >> 3)) * AI4_DEV_SB_BYTES) + r * 8 + (kc & 7)
-                    : reinterpret_cast<uint16_t *>(out + (slab * (K / 128) + kc) * (32 + 256 * kbits)) + r;
-                __half h; memcpy(&h, sp, 2);
-                const __half n = __float2half_rn(__half2float(h) * cfit[row]);
-                memcpy(sp, &n, 2);
-            }
-        }
-    }
+    if (!refit) AI4_CU(cudaMemcpy(out, dq, nq, cudaMemcpyDeviceToHost));
     cudaFree(dY); cudaFree(dY0); cudaFree(dU); cudaFree(dH0); cudaFree(dG); cudaFree(dQr); cudaFree(dD); cudaFree(dQ);
     cudaFree(dq); cudaFree(dinfo);
     cublasDestroy(cb);
@@ -1316,12 +1356,12 @@ static int aiq_encode_fullk_impl(const float * W, const float * H, int64_t K, in
 
 int ai4_cuda_encode_fullk(const float * W, const float * H, int64_t K, int64_t M, int mode, double damp, float lrms,
                           float smul, uint8_t * out, float * ms, double * werr_out) {
-    return aiq_encode_fullk_impl(W, H, K, M, mode, damp, lrms, smul, 0, AI4_DEV_MUL, 0, out, ms, werr_out, nullptr);
+    return aiq_encode_fullk_impl(W, H, K, M, mode, damp, lrms, smul, 0, AI4_DEV_MUL, 0, out, ms, werr_out, nullptr, 0);
 }
 
 int ai4_cuda_encode_fullk_rate(const float * W, const float * H, int64_t K, int64_t M, int mode, double damp, float lrms,
                                float smul, int kbits, uint32_t lmul, int refit, uint8_t * out, float * ms, double * werr_out,
-                               double * werr_pre) {
-    return aiq_encode_fullk_impl(W, H, K, M, mode, damp, lrms, smul, kbits, lmul, refit, out, ms, werr_out, werr_pre);
+                               double * werr_pre, int weight_metric) {
+    return aiq_encode_fullk_impl(W, H, K, M, mode, damp, lrms, smul, kbits, lmul, refit, out, ms, werr_out, werr_pre, weight_metric);
 }
 

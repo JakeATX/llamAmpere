@@ -253,6 +253,8 @@ static void print_usage(const char * argv0) {
         "  --hess-unit (EXLGAP, opt-in): with --hessian-dir, ai4u / ai5u tensors (K %% 256) also use the full-K LDLQ\n"
         "              (--hess-mode / --damp apply); without it they keep the imatrix path\n"
         "  --selftest-all / --selftest-max N: check every selected tensor (default: one per type / K class, 4 max).\n"
+        "  --trellis-metric normalized|weight: normalized (default) reproduces today's bytes; weight minimizes\n"
+        "    row-scale-weighted tile error (unit-128 / span types at rates 2..6 only; decode unchanged).\n"
         "  --scale-mode group|rank1|row|span (private A/B control): where the fp16 per-128-group scale comes from. group\n"
         "    (default) = that group's own RMS, today's bytes; rank1 = rank-1 additive fit of log per-block row RMS;\n"
         "    row = one scale per row; span = one scale per row and 1024 K. Needs a unit-128 or span AI+ type; not\n"
@@ -439,6 +441,7 @@ int main(int argc, char ** argv) {
     bool hess_unit = false, refit = false;   // EXLGAP --hess-unit, --refit
     int scale_mode = 0;   // --scale-mode: 0 group (default), 1 rank1, 2 row, 3 span
     const char * scale_mode_name = "group";
+    int weight_metric = 0;   // --trellis-metric: 0 normalized (legacy), 1 physical row-weight error
     std::string repack_in;       // --repack-s IN.gguf: AIk_U -> AIk_S, no encode
     bool repack_verify_all = false;
     bool selftest_all = false;   // --selftest-all: check every selected tensor, not one per (type, K class)
@@ -482,6 +485,11 @@ int main(int argc, char ** argv) {
         else if (a == "--repack-verify-all") repack_verify_all = true;
         else if (a == "--selftest-all") { selftest_all = true; selftest_max = 1 << 20; }
         else if (a == "--selftest-max") selftest_max = atoi(next().c_str());
+        else if (a == "--trellis-metric") {
+            const std::string v = next();
+            weight_metric = v == "normalized" ? 0 : v == "weight" ? 1 : -1;
+            if (weight_metric < 0) { fprintf(stderr, "--trellis-metric wants normalized | weight, got %s\n", v.c_str()); return 2; }
+        }
         else if (a == "--scale-mode") {
             const std::string v = next();
             scale_mode = v == "group" ? 0 : v == "rank1" ? 1 : v == "row" ? 2 : v == "span" ? 3 : -1;
@@ -498,6 +506,10 @@ int main(int argc, char ** argv) {
     }
     if (f_tmpl.empty() || f_bf16.empty() || f_imat.empty() || (f_out.empty() && !selftest)) {
         print_usage(argv[0]);
+        return 2;
+    }
+    if (selftest && !hess_dir.empty() && hess_mode != "imatrix") {
+        fprintf(stderr, "--selftest with --hessian-dir needs --hess-mode imatrix; use llama-ai4-fullk-test for full-Hessian checks\n");
         return 2;
     }
     if (!f_out.empty()) {
@@ -635,6 +647,10 @@ int main(int argc, char ** argv) {
         if (max_tensors >= 0 && n_repl >= max_tensors) {
             continue;
         }
+        if (weight_metric && want == GGML_TYPE_AI4) {
+            fprintf(stderr, "--trellis-metric weight needs a unit-128 or span AI+ type; %s selects legacy ai4\n", name);
+            return 2;
+        }
         repl[i] = want;
         n_repl++;
         n_by_type[std::string(ggml_type_name(t->type)) + " -> " + ggml_type_name(want)]++;
@@ -659,6 +675,11 @@ int main(int argc, char ** argv) {
         const uint32_t lmul = ai_mul(ty);
         const float lrms = ai_lrms(ty), smul = ai_smul(ty);
         const int rb = unit ? ai4u_rot_size(K) : AI4_HB;
+        if (scale_mode != 0 && !hess_dir.empty() && hess_mode != "imatrix" && (!unit || (hess_unit && K % 256 == 0))) {
+            fprintf(stderr, "%s: --scale-mode %s is unsupported on full-K Hessian paths; use --scale-mode group\n",
+                    name.c_str(), scale_mode_name);
+            return 1;
+        }
         std::vector<float> W, lam, Uall, G;
         std::vector<uint8_t> ok;
         if (!load_rows_f32(s, e * M, nr, W)) { fprintf(stderr, "read source %s failed\n", name.c_str()); return 1; }
@@ -695,7 +716,7 @@ int main(int argc, char ** argv) {
             q.assign((size_t) (nr / 16) * (K / 128) * ai_unit_bytes(ty), 0);
             const int rc = ai4_cuda_encode_fullk_rate(W.data(), Hf.data(), K, nr, hmode, damp, lrms,
                                                       smul, kbits, lmul, refit ? 1 : 0, q.data(), &ms,
-                                                      want_werr ? &we : nullptr, want_werr && refit ? &wp : nullptr);
+                                                      want_werr ? &we : nullptr, want_werr && refit ? &wp : nullptr, weight_metric);
             if (rc) { fprintf(stderr, "encode %s failed (%d)\n", name.c_str(), rc); return 1; }
             if (want_werr && refit) fprintf(stderr, "werr %s before refit: %.6e\n", name.c_str(), wp);
             if (want_werr) fprintf(stderr, "werr %s k%d mode %s damp %g: %.6e\n", name.c_str(), kbits, hess_mode.c_str(), damp, we);
@@ -725,9 +746,9 @@ int main(int argc, char ** argv) {
             fprintf(stderr, "%s needs --scale-mode row or span (a per-128-group scale cannot be stored)\n", ggml_type_name(ty));
             return 1;
         }
-        const int rc = (kbits != 4 || lmul != AI4_MUL || !sfix.empty())
+        const int rc = (weight_metric || kbits != 4 || lmul != AI4_MUL || !sfix.empty())
             ? ai4_cuda_encode_rate(W.data(), K, nr, has_im ? G.data() : nullptr, has_im ? ok.data() : nullptr, lrms, smul, kbits,
-                                   lmul, qenc, &ms, sfix.empty() ? nullptr : sfix.data())
+                                   lmul, qenc, &ms, sfix.empty() ? nullptr : sfix.data(), weight_metric)
             : ai4_cuda_encode_layout(W.data(), K, nr, has_im ? G.data() : nullptr, has_im ? ok.data() : nullptr, lrms,
                                      smul, unit, qenc, &ms);
         if (rc) { fprintf(stderr, "encode %s failed (%d)\n", name.c_str(), rc); return 1; }
@@ -826,9 +847,9 @@ int main(int argc, char ** argv) {
                 th.emplace_back([&, sl]() {
                     ai4_work * ws = ai4_work_new();
                     const float * dfix = sfix.empty() ? nullptr : sfix.data() + (size_t) sl * 16 * (K / 128);
-                    if (kbits != 4 || lmul != AI4_MUL || dfix) {
-                        aik_quantize_slab_rb_cf(ws, kbits, lmul, W.data() + (size_t) sl * 16 * K, K, lam.data(), Uall.data(), ok.data(),
-                                               qc.data() + sl * sb, ai4u_rot_size(K), smul, dfix);
+                    if (weight_metric || kbits != 4 || lmul != AI4_MUL || dfix) {
+                        aik_quantize_slab_rb_cfm(ws, kbits, lmul, W.data() + (size_t) sl * 16 * K, K, lam.data(), Uall.data(), ok.data(),
+                                                qc.data() + sl * sb, ai4u_rot_size(K), smul, dfix, weight_metric);
                     } else if (unit) {
                         ai4u_quantize_slab(ws, W.data() + (size_t) sl * 16 * K, K, lam.data(), Uall.data(), ok.data(), qc.data() + sl * sb);
                     } else {
@@ -865,7 +886,7 @@ int main(int argc, char ** argv) {
                        name.c_str(), dsame ? "YES" : "NO", psame ? "YES" : "NO", pok ? "YES" : "NO");
                 fail |= !dsame || !psame;
             }
-            if (kbits == 4 && unit && lmul == AI4_MUL && rate_check && scale_mode == 0) {
+            if (kbits == 4 && unit && lmul == AI4_MUL && rate_check && scale_mode == 0 && weight_metric == 0) {
                 // the generalized rate-k kernel at k = 4 must reproduce the AI4_U encoder byte for byte
                 std::vector<uint8_t> q4(qg.size());
                 float ms4 = 0;
@@ -903,6 +924,7 @@ int main(int argc, char ** argv) {
         gguf_set_val_u32(out, "general.file_type", LLAMA_FTYPE_MOSTLY_AI4);
     }
     gguf_set_val_u32(out, "ai4.format_version", 2);
+    if (weight_metric) gguf_set_val_str(out, "ai4.trellis_metric", "weight");
     gguf_set_val_str(out, "ai4.note", "AI+ (AI4 = Ampere INT4) trellis (ggml-ai4.h); selected tensors replaced from BF16 with imatrix block LDLQ");
     if (explicit_sel) {
         std::string sel;

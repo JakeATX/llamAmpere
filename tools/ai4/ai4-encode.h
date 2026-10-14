@@ -24,9 +24,14 @@ int ai4_cuda_encode_fullk(const float * W, const float * H, int64_t K, int64_t M
 // 256 = ai4u_rot_size(K) for those K; out (M/16)*(K/128)*(32 + 256*kbits) bytes), or kbits 0 = the AI4 1024 layout as above.
 // refit 1: after the encode, multiply all fp16 group scales of each row by the closed-form c_r that minimizes the H'-weighted
 // row error with the trellis fixed (EXL3 refit_scales, output side). werr_pre (optional, refit only): error before the refit.
+// weight_metric 1: minimize row-scale-weighted tile error (rate 2..6 only); 0 keeps the legacy normalized metric.
 int ai4_cuda_encode_fullk_rate(const float * W, const float * H, int64_t K, int64_t M, int mode, double damp, float lrms,
                                float smul, int kbits, uint32_t lmul, int refit, uint8_t * out, float * ms, double * werr,
-                               double * werr_pre);
+                               double * werr_pre, int weight_metric
+#ifdef __cplusplus
+                               = 0
+#endif
+                               );
 int ai4_cuda_werr(const float * W, const float * Wh, const float * H, int64_t K, int64_t M, double * werr);
 // unit = 0: AI4 (1024 layout, K % 1024, as above). unit = 1: AI4_U (unit-128 layout, K % 128, rotation block rb =
 // ai4u_rot_size(K); G is then [K/rb][rb/8][8][rb] and gok[K/rb]). out: (M/16)*(K/128)*1056 bytes for both.
@@ -38,10 +43,15 @@ int ai4_cuda_reconstruct_layout(const uint8_t * q, int64_t K, int64_t M, int uni
 // out: (M/16)*(K/128)*(32 + 256*kbits) bytes.
 // sfix (optional, private A/B control, do not ship): per-128-group scale table [M][K/128] f32 used in place of each
 // group's own RMS (rank-1 / per-row scale fits); nullptr reproduces the shipped encoder's bytes exactly.
+// weight_metric 1: branch cost e^2 * (row_scale / tile_max_scale)^2, instead of normalized e^2 (0, legacy).
 int ai4_cuda_encode_rate(const float * W, int64_t K, int64_t M, const float * G, const uint8_t * gok, float lrms, float smul,
                          int kbits, uint32_t lmul, uint8_t * out, float * ms, const float * sfix
 #ifdef __cplusplus
                          = nullptr
+#endif
+                         , int weight_metric
+#ifdef __cplusplus
+                         = 0
 #endif
                          );
 // rotated != 0: leave the output in the rotated basis (the values the decoder multiplies with rotated activations), which is
