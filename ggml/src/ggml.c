@@ -6821,11 +6821,14 @@ struct ggml_tensor * ggml_lightning_indexer(
         struct ggml_tensor  * weights,
         struct ggml_tensor  * mask) {
 
+    // mask: F16 [n_kv, n_tokens, 1, ns] added to the scores, or (fork, opt-in) a range mask I32 [2, n_tokens, 1, ns]:
+    // per token the keys [lo, hi) get 0 added and every other key -inf, the same values as the F16 mask of 0 and -inf
+    const bool mrange = mask->type == GGML_TYPE_I32;
     GGML_ASSERT(       q->type == GGML_TYPE_F32);
     GGML_ASSERT( weights->type == GGML_TYPE_F32);
-    GGML_ASSERT(    mask->type == GGML_TYPE_F16);
+    GGML_ASSERT(    mask->type == GGML_TYPE_F16 || (mrange && mask->ne[0] == 2));
     GGML_ASSERT(      q->ne[0] == k->ne[0]);
-    GGML_ASSERT(   mask->ne[0] == k->ne[2]);
+    GGML_ASSERT(mrange || mask->ne[0] == k->ne[2]);
     GGML_ASSERT(      q->ne[1] == weights->ne[0]);
     GGML_ASSERT(      k->ne[1] == 1);
     GGML_ASSERT(   mask->ne[1] == q->ne[2]);

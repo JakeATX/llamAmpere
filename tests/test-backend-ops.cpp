@@ -11248,6 +11248,77 @@ struct test_lightning_indexer_range : public test_lightning_indexer {
     }
 };
 
+// GGML_OP_LIGHTNING_INDEXER with a range mask (fork): I32 [2, nb, 1, nm], keys [lo, hi) get 0 and the others -inf
+struct test_lightning_indexer_rmask : public test_lightning_indexer {
+    test_lightning_indexer_rmask(int64_t hsk, int64_t nh, int64_t kv, int64_t nb, int64_t ns, int64_t nm, ggml_type type_K)
+        : test_lightning_indexer(hsk, nh, kv, nb, ns, nm, type_K) {}
+
+    std::string vars() override {
+        return test_lightning_indexer::vars() + ",mask=range";
+    }
+
+    // the caller already checked that the -inf outputs sit at the same places; the NMSE is taken over the finite
+    // outputs (the plain nmse() would be NaN here and never fail)
+    double err(const float * a, const float * b, size_t n) override {
+        double mse_a_b = 0.0;
+        double mse_a_0 = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            if (!std::isfinite(a[i]) || !std::isfinite(b[i])) {
+                continue;
+            }
+            mse_a_b += ((double) a[i] - b[i])*((double) a[i] - b[i]);
+            mse_a_0 += (double) a[i]*a[i];
+        }
+        return mse_a_0 > 0.0 ? mse_a_b/mse_a_0 : mse_a_b;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsk, nh, nb, ns);
+        ggml_set_name(q, "q");
+
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, type_K, hsk, 1, kv, ns);
+        ggml_set_name(k, "k");
+
+        ggml_tensor * w = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, nh, nb, 1, ns);
+        ggml_set_name(w, "w");
+
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, 2, nb, 1, nm);
+        ggml_set_name(m, "m");
+
+        ggml_tensor * out = ggml_lightning_indexer(ctx, q, k, w, m);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(1234);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "m") != 0) {
+                init_tensor_uniform(t);
+                continue;
+            }
+            // every token row gets one of: all keys, no key, a prefix, a run in the middle
+            std::vector<int32_t> data(2*nb*nm);
+            for (int64_t r = 0; r < nb*nm; ++r) {
+                const int32_t a = (int32_t) (rng() % (kv + 1));
+                const int32_t b = (int32_t) (rng() % (kv + 1));
+                int32_t lo = std::min(a, b);
+                int32_t hi = std::max(a, b);
+                switch (r % 4) {
+                    case 0: lo = 0;  hi = (int32_t) kv; break;
+                    case 1: hi = lo;                   break;
+                    case 2: lo = 0;                    break;
+                    default:                           break;
+                }
+                data[2*r + 0] = lo;
+                data[2*r + 1] = hi;
+            }
+            ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+        }
+    }
+};
+
 // Deserializable generic test case
 struct input_tensor {
     ggml_type type;
@@ -15241,6 +15312,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // Flash-Next indexer (4 heads, float32 keys): key and token counts off the register-blocked tile edges
     test_cases.emplace_back(new test_lightning_indexer(128, 4, 1000, 77, 1, 1, GGML_TYPE_F32));
     test_cases.emplace_back(new test_lightning_indexer(128, 4, 4133, 300, 2, 1, GGML_TYPE_F32));
+    // the range mask: Flash-Next tile/exact/prefill (4 heads, 8+ tokens), vector (4 heads, < 8 tokens), 32/64 heads
+    test_cases.emplace_back(new test_lightning_indexer_rmask(128, 4, 1000, 77, 1, 1, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_lightning_indexer_rmask(128, 4, 4133, 300, 2, 2, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_lightning_indexer_rmask(128, 4, 4133, 300, 2, 1, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_lightning_indexer_rmask(128, 4, 1000, 3, 1, 1, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_lightning_indexer_rmask(128, 4, 1000, 77, 1, 1, GGML_TYPE_F16));
+    for (int nh : { 32, 64 }) {
+        for (ggml_type type_K : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+            test_cases.emplace_back(new test_lightning_indexer_rmask(128, nh, 300, 33, 2, 2, type_K));
+        }
+    }
     for (int kv : { 256 }) {
         for (int bs : { 1, 512 }) {
             for (int nh : { 4, 32, 64 }) {
