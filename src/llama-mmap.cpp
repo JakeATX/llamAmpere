@@ -10,6 +10,10 @@
 #include <stdexcept>
 #include <cerrno>
 #include <algorithm>
+#include <atomic>
+#include <thread>
+#include <utility>
+#include <vector>
 
 #ifdef __has_include
     #if __has_include(<unistd.h>)
@@ -873,7 +877,23 @@ void llama_prefetch(llama_memory_ranges mr) {
         return true;
     };
 #else
+    // [PLEMT] opt-in: LLAMA_PREFETCH_THREADS=N issues the merged ranges from N threads. One thread calling
+    // madvise(MADV_WILLNEED) one range at a time keeps few reads in flight, and a 12,288-token Flash-Next ubatch
+    // touches ~130K scattered pages of the PLE table; N threads keep the SSD queue full. Reads only.
+    static const int n_threads = [] {
+        const char * v = getenv("LLAMA_PREFETCH_THREADS");
+        const int n = v ? std::max(1, std::min(64, atoi(v))) : 1;
+        if (n > 1) {
+            LLAMA_LOG_INFO("llama_prefetch: [PLEMT] %d threads (LLAMA_PREFETCH_THREADS)\n", n);
+        }
+        return n;
+    }();
+    std::vector<std::pair<uintptr_t, uintptr_t>> merged;
     auto prefetch = [&]() {
+        if (n_threads > 1) {
+            merged.emplace_back(begin, end);
+            return true;
+        }
         if (madvise((void *) begin, end - begin, MADV_WILLNEED) != 0) {
             LLAMA_LOG_WARN("llama_prefetch: madvise(MADV_WILLNEED) failed: %s\n", strerror(errno));
             return false;
@@ -902,6 +922,33 @@ void llama_prefetch(llama_memory_ranges mr) {
     if (end) {
         prefetch();
     }
+#if !defined(_WIN32)
+    if (!merged.empty()) {
+        // [PLEMT] at least ~1K ranges per thread, so small calls (decode) stay on this thread
+        const size_t n_t = std::min<size_t>((size_t) n_threads, (merged.size() + 1023) / 1024);
+        std::atomic<bool> failed{false};
+        auto work = [&](size_t t) {
+            const size_t a = merged.size() * t / n_t;
+            const size_t b = merged.size() * (t + 1) / n_t;
+            for (size_t k = a; k < b && !failed.load(std::memory_order_relaxed); ++k) {
+                if (madvise((void *) merged[k].first, merged[k].second - merged[k].first, MADV_WILLNEED) != 0) {
+                    failed = true;
+                }
+            }
+        };
+        std::vector<std::thread> workers;
+        for (size_t t = 1; t < n_t; ++t) {
+            workers.emplace_back(work, t);
+        }
+        work(0);
+        for (auto & w : workers) {
+            w.join();
+        }
+        if (failed) {
+            LLAMA_LOG_WARN("llama_prefetch: madvise(MADV_WILLNEED) failed\n");
+        }
+    }
+#endif
 #if defined(_WIN32)
     if (!entries.empty() && !pPrefetchVirtualMemory(GetCurrentProcess(), (ULONG_PTR) entries.size(), entries.data(), 0)) {
         LLAMA_LOG_WARN("llama_prefetch: PrefetchVirtualMemory failed: %s\n",
