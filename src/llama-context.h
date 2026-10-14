@@ -517,6 +517,7 @@ private:
     bool ple_pf_tried = false;
     bool b1_env   = false; // LLAMA_B1 set
     bool b1_tried = false; // b1 construction attempted
+    bool b1_off_logged = false; // the once-per-context note on why B1 is not used was printed
     struct {
         bool          active = false;   // the graph being built is a B1 graph (memory already applied)
         int32_t       il0    = 0;

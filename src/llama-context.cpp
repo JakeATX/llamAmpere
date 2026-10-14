@@ -4377,6 +4377,8 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
             }
             if (model.arch != LLM_ARCH_QWEN4EXP) {
                 why = "only qwen4exp builds layer-range graphs";
+            } else if (cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT) {
+                why = "this is a draft (MTP) context; only the main context reads prompts layer-major";
             } else if (n_gpu != 1) {
                 why = "it needs exactly one GPU";
             } else if (cparams.embeddings) {
@@ -4409,6 +4411,13 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
     // per call: the conditions another component may have changed since construction
     if (moe_cache || compute_peer || std::any_of(cparams.embeddings_layer_inp.begin(), cparams.embeddings_layer_inp.end(),
                 [](bool b) { return b; })) {
+        if (!b1_off_logged) {
+            b1_off_logged = true;
+            LLAMA_LOG_WARN("%s: [B1] prompts take the normal path: %s\n", __func__,
+                moe_cache ? "the MoE cache is on (--moe-cache off enables B1)" :
+                compute_peer ? "an MTP context of the same model shares the compute buffers (LLAMA_SHARED_COMPUTE=0 enables B1)" :
+                "layer inputs are being extracted");
+        }
         return normal();
     }
 
