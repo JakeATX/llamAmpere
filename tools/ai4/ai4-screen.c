@@ -50,4 +50,3 @@ int ai4_screen_encode(const float * W, int K, int M, const float * lam, int bits
     free(fixed);
     return 0;
 }
-
