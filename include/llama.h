@@ -423,6 +423,10 @@ extern "C" {
         size_t moe_cache_budget_mib;               // 0 uses the provider's available-memory budget
         size_t moe_cache_size; // device cache in bytes for the experts kept in host memory, 0 = disabled [EXPERIMENTAL]
 
+        // Expert keep policy for CPU-held MoE experts (#215/#217) [EXPERIMENTAL]
+        int32_t      moe_draft_keep; // MTP draft context only, lossless for the output: leave out experts at route rank >= N that are not resident on the device (-1 = off)
+        const char * moe_keep_map;   // non-MTP contexts, LOSSY (changes answers): "N" or "a-b:N,c:M,..." per model layer, same rule as moe_draft_keep (NULL or "" = off)
+
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
         // currently works only with CPU execution

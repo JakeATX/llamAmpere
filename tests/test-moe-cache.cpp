@@ -6559,6 +6559,152 @@ static bool run_device_tables(ggml_backend_t gpu, ggml_backend_t cpu,
 
 // Run a test only when the provider supports the behavior it checks; on
 // other providers print a skip line so CI shows the coverage gap explicitly.
+// [#215/#217] expert keep policy: the provider residency probe is read-only, and a scheduler keep policy leaves out
+// only non-resident experts past the keep rank (kept rows match the CPU reference, left-out rows are exactly 0).
+static bool keep_rows_ok(const std::vector<float> & reference, const std::vector<float> & actual,
+                         int64_t n_out, int64_t n_rows, int keep, int & n_left_out) {
+    n_left_out = 0;
+    for (int64_t row = 0; row < n_rows; row++) {
+        std::vector<float> want(reference.begin() + row*n_out, reference.begin() + (row + 1)*n_out);
+        std::vector<float> got(actual.begin() + row*n_out, actual.begin() + (row + 1)*n_out);
+        bool zero = true;
+        for (float v : got) {
+            zero &= v == 0.0f;
+        }
+        const bool match = compare_output(want, got, 5e-4);
+        if (row < keep && !match) {
+            return false;
+        }
+        if (row >= keep && !match && !zero) {
+            return false;
+        }
+        if (row >= keep && zero && !match) {
+            n_left_out++;
+        }
+    }
+    return true;
+}
+
+static bool run_expert_keep(
+        ggml_backend_t gpu, ggml_backend_t cpu, ggml_tensor * weights,
+        test_graph & graph, const std::vector<float> & reference,
+        test_graph & fused_graph, const std::vector<float> & fused_reference) {
+    configure_cache(nullptr);
+    bool ok = true;
+
+    // 1) probe: resident reports exactly the filled experts and never fills
+    {
+        void * session = create_direct_session(gpu, cpu);
+        if (!session) {
+            fprintf(stderr, "cache-expert-keep: failed to create session\n");
+            return false;
+        }
+        const size_t expert_size = ggml_nbytes(weights) / weights->ne[2];
+        const ggml_moe_cache_tensor_desc desc = {
+            weights->name, weights->data, expert_size,
+            weights->ne[0], weights->ne[1], weights->ne[2], (int32_t) weights->type,
+        };
+        active_api().session_enter(session);
+        bool probe_ok = active_api().resident != nullptr &&
+            wait_for_direct_pool(weights->name, weights->data, expert_size,
+                    weights->ne[0], weights->ne[1], weights->type, weights->ne[2]) &&
+            wait_for_direct_resident(weights, 3) && wait_for_direct_resident(weights, 7);
+        if (probe_ok) {
+            const int32_t ids[] = { 3, 5, 7, 9, -1, 1000 };
+            uint8_t resident[6] = {};
+            for (int rep = 0; rep < 40; rep++) {
+                const int n = active_api().resident(&desc, ids, 6, resident);
+                probe_ok &= n == 2 && resident[0] == 1 && resident[1] == 0 && resident[2] == 1 &&
+                            resident[3] == 0 && resident[4] == 0 && resident[5] == 0;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            const int n = active_api().resident(&desc, ids, 6, resident);
+            probe_ok &= n == 2 && resident[1] == 0 && resident[3] == 0; // 40 probes queued no fill
+        }
+        active_api().session_leave(session);
+        if (probe_ok) {
+            const int32_t ids[] = { 3 };
+            uint8_t resident[1] = { 1 };
+            probe_ok &= active_api().resident(&desc, ids, 1, resident) == 0 && resident[0] == 0; // no active session
+        }
+        active_api().session_destroy(session);
+        printf("cache-expert-keep-probe: %s\n", probe_ok ? "OK" : "FAIL");
+        ok &= probe_ok;
+    }
+
+    // 2) scheduler, keep 1 from the start: rank 0 runs (and caches), rank 1 is never planned so never resident -> 0
+    // 3) same scheduler warmed with the policy off: once rank 1's expert is resident, keep 1 runs it
+    for (int fused = 0; fused < 2; fused++) {
+        test_graph & g = fused ? fused_graph : graph;
+        const char * name = fused ? "cache-expert-keep-fused" : "cache-expert-keep-sched";
+        (void) reference;
+        (void) fused_reference;
+        // earlier scenarios mutate the shared weights (invalidation tests), so take a fresh CPU reference
+        // with two distinct experts {0, 1} at ranks 0 and 1
+        ggml_tensor * ids_t = fused ? g.out->src[0]->src[2] : g.out->src[2];
+        const int32_t ids_keep[2] = { 0, 1 };
+        GGML_ASSERT(ids_t && ggml_nelements(ids_t) == 2);
+        ggml_backend_tensor_set(ids_t, ids_keep, 0, sizeof(ids_keep));
+        std::vector<float> ref(ggml_nelements(g.out));
+        if (ggml_backend_graph_compute(cpu, g.graph) != GGML_STATUS_SUCCESS) {
+            fprintf(stderr, "%s: CPU reference compute failed\n", name);
+            ok = false;
+            continue;
+        }
+        ggml_backend_tensor_get(g.out, ref.data(), 0, ref.size() * sizeof(float));
+        ggml_backend_sched_t sched = make_scheduler(name, gpu, cpu, g);
+        if (!sched) {
+            ok = false;
+            continue;
+        }
+        const int64_t n_out = g.out->ne[0];
+        const int64_t n_rows = g.out->ne[1] * g.out->ne[2];
+        std::vector<float> actual(ref.size());
+        bool stage_ok = true;
+        int always_left_out = 0;
+        ggml_backend_sched_set_moe_expert_keep(sched, 1, nullptr, 0);
+        for (int step = 0; step < 60 && stage_ok; step++) {
+            stage_ok &= ggml_backend_sched_graph_compute(sched, g.graph) == GGML_STATUS_SUCCESS;
+            ggml_backend_tensor_get(g.out, actual.data(), 0, actual.size() * sizeof(float));
+            int left = 0;
+            stage_ok &= keep_rows_ok(ref, actual, n_out, n_rows, 1, left);
+            always_left_out += left == (int) (n_rows - 1) ? 1 : 0;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        stage_ok &= always_left_out == 60;
+        if (!stage_ok) {
+            fprintf(stderr, "%s: keep 1 cold stage failed (left out %d/60)\n", name, always_left_out);
+        }
+
+        bool resident_ran = false;
+        for (int round = 0; round < 20 && stage_ok && !resident_ran; round++) {
+            ggml_backend_sched_set_moe_expert_keep(sched, -1, nullptr, 0);
+            for (int step = 0; step < 20 && stage_ok; step++) {
+                stage_ok &= compute_matches(name, sched, g, ref, step);
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            ggml_backend_sched_set_moe_expert_keep(sched, 1, nullptr, 0);
+            stage_ok &= ggml_backend_sched_graph_compute(sched, g.graph) == GGML_STATUS_SUCCESS;
+            ggml_backend_tensor_get(g.out, actual.data(), 0, actual.size() * sizeof(float));
+            int left = 0;
+            stage_ok &= keep_rows_ok(ref, actual, n_out, n_rows, 1, left);
+            resident_ran = left == 0;
+        }
+        stage_ok &= resident_ran;
+        if (!resident_ran) {
+            fprintf(stderr, "%s: a resident expert past the keep rank never ran\n", name);
+        }
+        // policy cleared: the same scheduler is back to the reference
+        ggml_backend_sched_set_moe_expert_keep(sched, -1, nullptr, 0);
+        stage_ok &= compute_matches(name, sched, g, ref, 0);
+        ggml_backend_sched_free(sched);
+        printf("%s: %s\n", name, stage_ok ? "OK" : "FAIL");
+        ok &= stage_ok;
+    }
+    configure_cache(nullptr);
+    return ok;
+}
+
 static bool run_optional(
         bool enabled, const char * name, std::function<bool()> test) {
     if (!enabled) {
@@ -7280,6 +7426,9 @@ int main(int argc, char ** argv) {
     ok &= run_single_gpu_auto(provider_device, gpu, cpu, capture);
     ok &= run_optional(provider_is_cuda, "cache-admission-policy", [&] {
         return run_admission_policy(gpu, cpu, capture);
+    });
+    ok &= run_optional(provider_is_cuda, "cache-expert-keep", [&] {
+        return run_expert_keep(gpu, cpu, weights, graph, reference, fused_graph, fused_reference);
     });
 
     free_graph(clamped_fused_graph);

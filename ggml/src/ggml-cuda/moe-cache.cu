@@ -3865,6 +3865,52 @@ static int moe_cache_plan(
     return hits;
 }
 
+// Expert keep policy probe (#215/#217): read-only residency lookup, no fills, demand counts, LRU or pin changes.
+static int moe_cache_resident(
+        const ggml_moe_cache_tensor_desc * tensor, const int32_t * ids, int n_ids, uint8_t * resident) {
+    if (!resident || n_ids <= 0) {
+        return 0;
+    }
+    memset(resident, 0, (size_t) n_ids);
+    if (!tensor || !tensor->data || !ids || tensor->expert_size == 0 ||
+        g_session_suppressed > 0 || g_session_stack.empty()) {
+        return 0;
+    }
+    moe_cache_session * session = g_session_stack.back().active;
+    if (!session || session->stopping || session->dormant) {
+        return 0;
+    }
+    int count = 0;
+    std::lock_guard<std::mutex> lock(session->mu);
+    if (session->stopping) {
+        return 0;
+    }
+    for (const auto & device_ptr : session->devices) {
+        const moe_cache_device & device = *device_ptr;
+        if (device.dead.load()) {
+            continue;
+        }
+        const int pool_index = moe_cache_find_pool(device, tensor->expert_size, tensor->type);
+        if (pool_index < 0 || !device.pools[pool_index]->slab) {
+            continue;
+        }
+        const moe_cache_pool & pool = *device.pools[pool_index];
+        for (int index = 0; index < n_ids; index++) {
+            const int32_t expert = ids[index];
+            if (resident[index] || expert < 0 || expert >= tensor->n_expert) {
+                continue;
+            }
+            const auto found = pool.map.find({tensor->data, expert});
+            if (found != pool.map.end() &&
+                pool.slots[found->second].state == moe_cache_slot_state::valid) {
+                resident[index] = 1;
+                count++;
+            }
+        }
+    }
+    return count;
+}
+
 static int moe_cache_dispatch_internal(
         void * opaque, int wtype, int64_t n_in, int64_t n_out, int n_hits,
         const int32_t * slot_indices, const float * const * act_rows,
@@ -9696,6 +9742,7 @@ static void moe_cache_register(const void * owner) {
     api.trim = moe_cache_lend;
     api.restore = moe_cache_return;
     api.prompt_resume = moe_cache_prompt_resume;
+    api.resident = moe_cache_resident;
     ggml_moe_cache_register(&api);
 }
 

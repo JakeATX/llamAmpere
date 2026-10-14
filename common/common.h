@@ -734,6 +734,9 @@ struct common_params {
 
     size_t moe_cache_size = 0; // GPU cache size in bytes for the MoE experts kept in the CPU
 
+    int32_t     moe_draft_keep = -1; // --spec-moe-keep: MTP draft leaves out non-resident experts at route rank >= N (lossless)
+    std::string moe_keep_map;        // --moe-keep-map: LOSSY per-layer expert keep map for the main model (empty = off)
+
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 
     // multimodal models (see tools/mtmd)

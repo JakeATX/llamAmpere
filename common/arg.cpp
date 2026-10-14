@@ -12,6 +12,7 @@
 #include "speculative.h"
 #include "spec-defaults.h"
 #include "preset.h"
+#include "../src/llama-ext.h" // llama_parse_moe_keep_map
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -3309,6 +3310,33 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_env("LLAMA_ARG_MOE_CACHE"));
+    add_opt(common_arg(
+        {"--spec-moe-keep"}, "N",
+        "MTP draft only: experts the router picks at rank >= N run only when they are already resident in VRAM "
+        "(--moe-cache); the others are left out of the draft. The verify pass is unchanged, so output is unchanged; "
+        "only the draft acceptance can move (default: -1, off)",
+        [](common_params & params, int value) {
+            if (value < -1) {
+                throw std::invalid_argument("expected -1 (off) or N >= 0");
+            }
+            params.moe_draft_keep = value;
+        }
+    ).set_env("LLAMA_ARG_SPEC_MOE_KEEP"));
+    add_opt(common_arg(
+        {"--moe-keep-map"}, "MAP",
+        "LOSSY, changes answers: main-model experts at route rank >= N that are not resident in VRAM are left out. "
+        "MAP = N (every layer) or a list of L:N, A-B:N, *:N (e.g. 0-11:10,12-47:5); unlisted layers keep every expert "
+        "(default: off)",
+        [](common_params & params, const std::string & value) {
+            int32_t keep_default = -1;
+            std::vector<int32_t> keep_layer;
+            std::string error;
+            if (!llama_parse_moe_keep_map(value.c_str(), 65536, keep_default, keep_layer, error)) {
+                throw std::invalid_argument(error);
+            }
+            params.moe_keep_map = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_KEEP_MAP"));
     add_opt(common_arg(
         {"--moe-cache-mib"}, "N",
         "GPU cache size in MiB for the MoE experts kept in the CPU (default: 0, disabled)",

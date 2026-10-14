@@ -65,6 +65,10 @@ struct llama_cparams {
     uint32_t kv_stream_arena_mib;
     size_t moe_cache_size;
 
+    // expert keep policy (#215/#217): keep_default for layers past the table, -1 = keep every expert
+    int32_t              moe_keep_default = -1;
+    std::vector<int32_t> moe_keep_layer;
+
     // MTP draft context attention window (0 = full attention) and sink positions
     uint32_t draft_attn_window = 0;
     uint32_t draft_attn_sink   = 0;

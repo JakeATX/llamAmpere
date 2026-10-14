@@ -152,6 +152,10 @@ struct ggml_moe_cache_api {
     // A prompt returned a suspended pool; the replacement session is past startup.
     void (*prompt_resume)(void * session);
 
+    // Optional residency probe for the expert keep policy (#215/#217). For each ids[i], sets resident[i] to 1 when that
+    // expert of the tensor is valid in the active session's device pool right now, else 0. No side effects: no fills,
+    // no demand counts, no LRU or pin changes. Returns the number of resident ids. NULL means nothing is resident.
+    int (*resident)(const struct ggml_moe_cache_tensor_desc * tensor, const int32_t * ids, int n_ids, uint8_t * resident);
 };
 
 GGML_API void ggml_backend_sched_moe_cache_prefetch_configure(ggml_backend_sched_t sched, int mode);
@@ -246,6 +250,17 @@ GGML_API void ggml_backend_sched_set_moe_cache(
 // Resume makes it again the way it was made; the new pool fills from the experts decode asks for.
 GGML_API bool ggml_backend_sched_moe_cache_suspend(ggml_backend_sched_t sched);
 GGML_API void ggml_backend_sched_moe_cache_resume(ggml_backend_sched_t sched);
+
+// Expert keep policy (#215 lossless MTP draft, #217 lossy trunk map). For each CPU MUL_MAT_ID node of a weight named
+// "blk.<L>...", routed rows at route rank >= keep(L) whose expert is not resident on the device (see `resident`) are
+// left out: the row is not computed and its output is zero, so the expert contributes nothing. keep(L) is
+// keep_per_layer[L] when L < n_layer, else keep_default; a negative keep keeps every expert. keep_default < 0 with
+// n_layer == 0 turns the policy off (the default). Only nodes of at most 64 routed rows (decode, draft and verify
+// widths) are affected. The scheduler copies the table and makes it active on the computing thread.
+GGML_API void ggml_backend_sched_set_moe_expert_keep(
+        ggml_backend_sched_t sched, int32_t keep_default, const int32_t * keep_per_layer, int32_t n_layer);
+// keep(L) for the weight tensor name under the policy active on this thread; -1 = keep every expert.
+GGML_API int32_t ggml_moe_cache_expert_keep(const char * tensor_name);
 
 #ifdef __cplusplus
 }

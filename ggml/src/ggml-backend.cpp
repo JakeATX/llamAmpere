@@ -18,6 +18,8 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <thread>
 #include <string>
@@ -70,6 +72,42 @@ ggml_moe_cache_api ggml_moe_cache_get(const void * owner) {
 // scheduler scope while a graph with a cache session runs; the CPU backend
 // reads it to reach the session's provider callbacks.
 static thread_local ggml_moe_cache_api t_moe_cache_active;
+
+// Expert keep policy active on this thread (#215/#217), set by the scheduler scope.
+struct ggml_moe_expert_keep_policy {
+    int32_t         keep_default = -1;
+    const int32_t * keep_layer   = nullptr;
+    int32_t         n_layer      = 0;
+};
+static thread_local ggml_moe_expert_keep_policy t_moe_expert_keep;
+
+int32_t ggml_moe_cache_expert_keep(const char * tensor_name) {
+    const ggml_moe_expert_keep_policy & policy = t_moe_expert_keep;
+    if (policy.keep_default < 0 && policy.n_layer <= 0) {
+        return -1;
+    }
+    int layer = -1;
+    if (tensor_name && strncmp(tensor_name, "blk.", 4) == 0) {
+        const char * p = tensor_name + 4;
+        if (*p >= '0' && *p <= '9') {
+            long value = 0;
+            while (*p >= '0' && *p <= '9' && value < 1000000) {
+                value = value*10 + (*p - '0');
+                p++;
+            }
+            if (*p == '.') {
+                layer = (int) value;
+            }
+        }
+    }
+    if (layer < 0) {
+        return -1;
+    }
+    if (layer < policy.n_layer && policy.keep_layer) {
+        return policy.keep_layer[layer] < 0 ? -1 : policy.keep_layer[layer];
+    }
+    return policy.keep_default < 0 ? -1 : policy.keep_default;
+}
 
 ggml_moe_cache_api ggml_moe_cache_active(void) {
     if (t_moe_cache_active.owner) {
@@ -1276,6 +1314,10 @@ struct ggml_backend_sched {
     size_t                   moe_cache_budget_last;
     bool                     moe_cache_suspended;
     int                      moe_cache_prefetch_mode;
+    // expert keep policy (#215/#217), owned copy; keep_default -1 and n_layer 0 = off
+    int32_t   moe_keep_default;
+    int32_t * moe_keep_layer;
+    int32_t   moe_keep_n_layer;
 
     ggml_backend_sched_eval_callback callback_eval;
     void * callback_eval_user_data;
@@ -3127,14 +3169,18 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
         void (*leave)(void *);
         ggml_moe_cache_api previous_active;
         ggml_backend_sched_bookkeep_perf * perf;
+        ggml_moe_expert_keep_policy previous_keep;
 
         explicit moe_cache_scope(void * session, void (*enter)(void *),
                                  void (*leave_fn)(void *),
                                  const ggml_moe_cache_api & active_api,
-                                 ggml_backend_sched_bookkeep_perf * perf)
-            : session(session), leave(leave_fn), previous_active(t_moe_cache_active), perf(perf) {
+                                 ggml_backend_sched_bookkeep_perf * perf,
+                                 const ggml_moe_expert_keep_policy & keep)
+            : session(session), leave(leave_fn), previous_active(t_moe_cache_active), perf(perf),
+              previous_keep(t_moe_expert_keep) {
             const ggml_backend_bookkeep_timer timer(perf ? &perf->session_host_us : nullptr);
             t_moe_cache_active = active_api;
+            t_moe_expert_keep = keep;
             if (enter && leave) {
                 enter(session);
             } else {
@@ -3145,6 +3191,7 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
         ~moe_cache_scope() {
             const ggml_backend_bookkeep_timer timer(perf ? &perf->session_host_us : nullptr);
             t_moe_cache_active = previous_active;
+            t_moe_expert_keep = previous_keep;
             if (leave) {
                 leave(session);
             }
@@ -3152,7 +3199,8 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
     } cache_scope(sched->moe_cache_session,
                   sched->moe_cache_api.session_enter,
                   sched->moe_cache_api.session_leave,
-                  sched->moe_cache_api, perf);
+                  sched->moe_cache_api, perf,
+                  ggml_moe_expert_keep_policy{sched->moe_keep_default, sched->moe_keep_layer, sched->moe_keep_n_layer});
     if (t_vf_cur) { t_vf_cur->enter += ggml_sched_vf_lap(); }
 
     if (sched->moe_cache_device_graph) {
@@ -3368,6 +3416,10 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     ggml_sched_moe_cache_default(sched);
 
+    sched->moe_keep_default = -1;
+    sched->moe_keep_layer   = nullptr;
+    sched->moe_keep_n_layer = 0;
+
     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
     sched->op_offload = op_offload;
     sched->xs = ggml_sched_xs_new();
@@ -3547,10 +3599,27 @@ void ggml_backend_sched_moe_cache_resume(ggml_backend_sched_t sched) {
     ggml_backend_sched_reset(sched);
 }
 
+void ggml_backend_sched_set_moe_expert_keep(
+        ggml_backend_sched_t sched, int32_t keep_default, const int32_t * keep_per_layer, int32_t n_layer) {
+    GGML_ASSERT(sched);
+    free(sched->moe_keep_layer);
+    sched->moe_keep_layer   = nullptr;
+    sched->moe_keep_n_layer = 0;
+    sched->moe_keep_default = keep_default < 0 ? -1 : keep_default;
+    if (keep_per_layer && n_layer > 0) {
+        sched->moe_keep_layer = (int32_t *) malloc(sizeof(int32_t) * n_layer);
+        GGML_ASSERT(sched->moe_keep_layer);
+        memcpy(sched->moe_keep_layer, keep_per_layer, sizeof(int32_t) * n_layer);
+        sched->moe_keep_n_layer = n_layer;
+    }
+}
+
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
     }
+    free(sched->moe_keep_layer);
+    sched->moe_keep_layer = nullptr;
     if (sched->moe_cache_session && sched->moe_cache_api.session_destroy) {
         sched->moe_cache_api.session_destroy(sched->moe_cache_session);
         sched->moe_cache_session = NULL;

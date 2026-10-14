@@ -290,3 +290,10 @@ struct llama_sampler_child_perf {
     uint64_t calls;
 };
 LLAMA_API std::vector<llama_sampler_child_perf> llama_perf_sampler_children(const struct llama_sampler * sampler);
+// Expert keep map parser (#217, --moe-keep-map): "N" (every layer) or a comma list of "L:N", "A-B:N", "*:N".
+// keep_layer is empty when no explicit layer is listed; otherwise it has n_layer entries (-1 = keep every expert).
+// Returns false and sets error on bad input.
+#include <string>
+#include <vector>
+LLAMA_API bool llama_parse_moe_keep_map(const char * text, int32_t n_layer, int32_t & keep_default,
+                                        std::vector<int32_t> & keep_layer, std::string & error);

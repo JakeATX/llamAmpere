@@ -2039,6 +2039,47 @@ static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
     return ptr;
 }
 
+// Expert keep policy (#215 MTP draft, #217 lossy trunk map): bit r set = leave logical routed row r out, because its
+// route rank (r % n_ids, ids are sorted by descending router score) is >= keep for this weight's layer and the expert
+// is not resident on the device. Returns 0 when no policy is active or the node has more than 64 routed rows.
+static uint64_t ggml_moe_keep_skip_mask(
+        const struct ggml_moe_cache_api * api,
+        const struct ggml_tensor * weight,
+        const struct ggml_tensor * ids) {
+    const int64_t n_ids    = ids->ne[0];
+    const int64_t n_tokens = ids->ne[1];
+    if (n_ids <= 0 || n_tokens <= 0 || n_ids > MOE_CACHE_MAX_TOPK || n_tokens > MOE_CACHE_MAX_TOPK / n_ids) {
+        return 0;
+    }
+    const int32_t keep = ggml_moe_cache_expert_keep(weight->name);
+    if (keep < 0 || keep >= n_ids) {
+        return 0;
+    }
+    const int n_rows = (int) (n_ids*n_tokens);
+    int32_t expert_ids[MOE_CACHE_MAX_TOPK];
+    uint8_t resident[MOE_CACHE_MAX_TOPK];
+    memset(resident, 0, sizeof(resident));
+    for (int64_t token = 0; token < n_tokens; ++token) {
+        for (int64_t id = 0; id < n_ids; ++id) {
+            expert_ids[token*n_ids + id] = *(const int32_t *) ((const char *) ids->data + token*ids->nb[1] + id*ids->nb[0]);
+        }
+    }
+    if (api && api->resident && weight->data) {
+        const struct ggml_moe_cache_tensor_desc desc = {
+            weight->name, weight->data, weight->nb[2],
+            weight->ne[0], weight->ne[1], weight->ne[2], (int32_t) weight->type,
+        };
+        api->resident(&desc, expert_ids, n_rows, resident);
+    }
+    uint64_t mask = 0;
+    for (int row = 0; row < n_rows; ++row) {
+        if (row % n_ids >= keep && !resident[row]) {
+            mask |= UINT64_C(1) << row;
+        }
+    }
+    return mask;
+}
+
 static void ggml_compute_forward_mul_mat_id_impl(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst,
@@ -2160,6 +2201,8 @@ static void ggml_compute_forward_mul_mat_id_impl(
         const struct ggml_moe_cache_api moe_cache = ggml_moe_cache_active();
         ggml_backend_buffer_t src0_buffer =
             src0->view_src ? src0->view_src->buffer : src0->buffer;
+        // expert keep policy: rows left out entirely (not planned, not computed, output zero)
+        const uint64_t keep_skip = allow_moe_cache ? ggml_moe_keep_skip_mask(&moe_cache, src0, ids) : 0;
         if (allow_moe_cache &&
             moe_cache.begin && moe_cache.plan &&
             moe_cache.dispatch && moe_cache.collect && moe_cache.end &&
@@ -2178,6 +2221,9 @@ static void ggml_compute_forward_mul_mat_id_impl(
                 for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
                     for (int id = 0; id < n_ids; ++id) {
                         expert_ids[iid1*n_ids + id] = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
+                        if (keep_skip & (UINT64_C(1) << (iid1*n_ids + id))) {
+                            expert_ids[iid1*n_ids + id] = -1; // no lookup, no fill
+                        }
                     }
                 }
                 moe_cache.plan(moe_cache_node, expert_ids, n_ids * ids->ne[1], moe_cache_slot_idx);
@@ -2200,6 +2246,11 @@ static void ggml_compute_forward_mul_mat_id_impl(
                 const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
 
                 assert(i02 >= 0 && i02 < n_as);
+
+                if (keep_skip & (UINT64_C(1) << logical_row)) {
+                    memset((char *) dst->data + iid1*nb2 + id*nb1, 0, ne0*sizeof(float));
+                    continue;
+                }
 
                 if (moe_cache_node && moe_cache_slot_idx[iid1*n_ids + id] >= 0) {
                     const int64_t i11 = id % ne11;
@@ -2379,6 +2430,7 @@ static void ggml_compute_forward_mul_mat_id(
 struct moe_cache_fused_state {
     void * node;
     uint64_t hit_mask;
+    uint64_t keep_skip;
     int n_hits;
     int collect_ok;
     int32_t ids[MOE_CACHE_MAX_TOPK];
@@ -4008,6 +4060,14 @@ static int ggml_cpu_try_fuse_moe_cache(
                 state->acts[row] = (const float *)((const char *)acts->data + token*acts->nb[2] + (id % acts->ne[1])*acts->nb[1]);
             }
         }
+        // expert keep policy: a row whose up or gate expert is left out contributes nothing (SwiGLU of a zero row is 0)
+        state->keep_skip = ggml_moe_keep_skip_mask(&moe_cache, up_weight, ids) |
+                           ggml_moe_keep_skip_mask(&moe_cache, gate_weight, ids);
+        for (int row = 0; row < n_rows; row++) {
+            if (state->keep_skip & (UINT64_C(1) << row)) {
+                state->ids[row] = -1; // no lookup, no fill
+            }
+        }
         state->node = moe_cache.fused_begin(
                 &up_desc, &gate_desc, (int)GGML_GLU_OP_SWIGLU,
                 fusion.up_min, fusion.up_max,
@@ -4019,6 +4079,8 @@ static int ggml_cpu_try_fuse_moe_cache(
                 if (state->hit_mask & (UINT64_C(1) << row)) {
                     state->rows[state->n_hits++] =
                         (float *)((char *)glu->data + row*glu->nb[1]);
+                } else if (state->keep_skip & (UINT64_C(1) << row)) {
+                    memset((char *)glu->data + row*glu->nb[1], 0, glu->ne[0]*sizeof(float));
                 }
             }
         }
@@ -4036,7 +4098,7 @@ static int ggml_cpu_try_fuse_moe_cache(
     sub_params.wsize = params->wsize - MOE_CACHE_FUSED_WORK_SIZE;
     const uint64_t valid_mask = n_rows == MOE_CACHE_MAX_TOPK
         ? UINT64_MAX : (UINT64_C(1) << n_rows) - 1;
-    const uint64_t miss_mask = valid_mask & ~state->hit_mask;
+    const uint64_t miss_mask = valid_mask & ~state->hit_mask & ~state->keep_skip;
 
     ggml_compute_forward_mul_mat_id_impl(
             &sub_params, up, miss_mask, true, false, false);

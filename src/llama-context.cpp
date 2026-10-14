@@ -298,6 +298,95 @@ static void b1_memory_trim(const char * phase) {
 #endif
 }
 
+// Expert keep map (#217): "N" (every layer) or a comma list of "L:N", "A-B:N" or "*:N" (layers not listed keep every
+// expert unless "*" set a default). N >= 0 is the route rank from which non-resident experts are left out.
+bool llama_parse_moe_keep_map(const char * text, int32_t n_layer, int32_t & keep_default,
+                              std::vector<int32_t> & keep_layer, std::string & error) {
+    keep_default = -1;
+    keep_layer.clear();
+    if (text == nullptr || text[0] == '\0') {
+        return true;
+    }
+    auto parse_int = [](const std::string & s, int32_t & out) {
+        if (s.empty() || s.size() > 6) {
+            return false;
+        }
+        for (char c : s) {
+            if (c < '0' || c > '9') {
+                return false;
+            }
+        }
+        out = (int32_t) std::stol(s);
+        return true;
+    };
+    const std::string spec(text);
+    if (spec.find(':') == std::string::npos) {
+        if (!parse_int(spec, keep_default)) {
+            error = "expected N or a list of L:N, A-B:N, *:N, got '" + spec + "'";
+            return false;
+        }
+        return true;
+    }
+    size_t start = 0;
+    while (start <= spec.size()) {
+        size_t end = spec.find(',', start);
+        if (end == std::string::npos) {
+            end = spec.size();
+        }
+        const std::string item = spec.substr(start, end - start);
+        const size_t colon = item.find(':');
+        int32_t keep = -1;
+        if (colon == std::string::npos || !parse_int(item.substr(colon + 1), keep)) {
+            error = "bad entry '" + item + "' (expected L:N, A-B:N or *:N)";
+            return false;
+        }
+        const std::string layers = item.substr(0, colon);
+        if (layers == "*") {
+            keep_default = keep;
+        } else {
+            int32_t first = -1;
+            int32_t last  = -1;
+            const size_t dash = layers.find('-');
+            if (dash == std::string::npos) {
+                if (!parse_int(layers, first)) {
+                    error = "bad layer '" + layers + "'";
+                    return false;
+                }
+                last = first;
+            } else if (!parse_int(layers.substr(0, dash), first) || !parse_int(layers.substr(dash + 1), last) || last < first) {
+                error = "bad layer range '" + layers + "'";
+                return false;
+            }
+            if (last >= n_layer) {
+                error = "layer " + std::to_string(last) + " out of range (model has " + std::to_string(n_layer) + " layers)";
+                return false;
+            }
+            if (keep_layer.empty()) {
+                keep_layer.assign(n_layer, -2); // -2 = not listed, resolved below
+            }
+            for (int32_t il = first; il <= last; ++il) {
+                keep_layer[il] = keep;
+            }
+        }
+        start = end + 1;
+    }
+    for (auto & k : keep_layer) {
+        if (k == -2) {
+            k = keep_default;
+        }
+    }
+    return true;
+}
+
+static void llama_sched_apply_moe_keep(ggml_backend_sched_t sched, const llama_cparams & cparams) {
+    if (sched == nullptr) {
+        return;
+    }
+    ggml_backend_sched_set_moe_expert_keep(sched, cparams.moe_keep_default,
+            cparams.moe_keep_layer.empty() ? nullptr : cparams.moe_keep_layer.data(),
+            (int32_t) cparams.moe_keep_layer.size());
+}
+
 llama_context::llama_context(const llama_model & model, llama_context_params params) :
     model(model),
     cvec(std::make_unique<llama_adapter_cvec>()),
@@ -551,6 +640,23 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
     cparams.op_offload     = params.op_offload;
     cparams.kv_unified     = params.kv_unified;
     cparams.moe_cache_size = params.moe_cache_size;
+
+    // expert keep policy (#215 draft, lossless for the output; #217 trunk map, lossy)
+    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+        if (params.moe_draft_keep >= 0) {
+            cparams.moe_keep_default = params.moe_draft_keep;
+            LLAMA_LOG_INFO("%s: MTP draft MoE expert keep = %d (experts at route rank >= %d run only when resident on the device; verify is unchanged)\n",
+                    __func__, params.moe_draft_keep, params.moe_draft_keep);
+        }
+    } else if (params.moe_keep_map != nullptr && params.moe_keep_map[0] != '\0') {
+        std::string error;
+        if (!llama_parse_moe_keep_map(params.moe_keep_map, (int32_t) model.hparams.n_layer_all,
+                cparams.moe_keep_default, cparams.moe_keep_layer, error)) {
+            throw std::runtime_error(std::string("invalid MoE keep map: ") + error);
+        }
+        LLAMA_LOG_WARN("%s: LOSSY MoE expert keep map '%s' active: non-resident experts past the per-layer route rank are left out, answers change\n",
+                __func__, params.moe_keep_map);
+    }
 
     // SJ-KVaRN keeps one sink/ring stream per sequence in every mode; --kv-unified shares the sealed-record
     // pool between them instead (every sequence may address the whole context), so the rest of the context
@@ -1754,6 +1860,7 @@ bool llama_context::kv_stream_switch_phase(bool decode, uint32_t active_tokens) 
         LLAMA_LOG_ERROR("%s: failed to recreate scheduler\n", __func__);
         return false;
     }
+    llama_sched_apply_moe_keep(sched.get(), cparams);
 
     auto reserve_mctx = memory->init_full();
     if (!reserve_mctx) {
@@ -1947,6 +2054,7 @@ void llama_context::sched_reserve() {
         ggml_backend_sched_set_moe_cache(sched.get(), moe_cache_mode, cparams.moe_cache_budget_mib);
         ggml_backend_sched_moe_cache_prefetch_configure(sched.get(), cparams.moe_prefetch);
     }
+    llama_sched_apply_moe_keep(sched.get(), cparams);
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
     if (mtp_prefill_async || mtp_scratch_enabled) {
         ggml_backend_sched_set_input_copy_callback(sched.get(), sched_copy_mtp_inputs, this);
@@ -2192,6 +2300,7 @@ void llama_context::sched_reserve() {
                 }
                 ggml_backend_sched_set_moe_cache(sched.get(), moe_cache_mode, cparams.moe_cache_budget_mib);
                 ggml_backend_sched_moe_cache_prefetch_configure(sched.get(), cparams.moe_prefetch);
+                llama_sched_apply_moe_keep(sched.get(), cparams);
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
@@ -8771,6 +8880,8 @@ llama_context_params llama_context_default_params() {
         /*.moe_prefetch                =*/ 0,
         /*.moe_cache_budget_mib        =*/ 0,
         /*.moe_cache_size              =*/ 0,
+        /*.moe_draft_keep              =*/ -1,
+        /*.moe_keep_map                =*/ nullptr,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.sj_kvarn_bits_k                =*/ 0,
