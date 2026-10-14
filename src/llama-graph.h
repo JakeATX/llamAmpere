@@ -1451,6 +1451,22 @@ struct llm_graph_context {
             ggml_tensor * v_cur, // [n_embd_head_v, n_head_v, n_tokens]
                     int   il) const;
 
+    // SJ-KVaRN steps of build_attn above, for model graphs that store K/V and call build_attn_mha themselves
+    // (qwen4exp QSA): rotate q/k/v into the cache basis before the stores (returns true when the FA node rotates
+    // q and un-rotates its output itself), then, after the stores, hand the layer's sealed records and descriptor
+    // to the next build_attn_mha. No-ops unless the cache is SJ-KVaRN.
+    bool build_attn_sj_kvarn_rot(
+            llm_graph_input_attn_kv * inp,
+            ggml_tensor *& q_cur,
+            ggml_tensor *& k_cur,
+            ggml_tensor *& v_cur,
+                    int   il) const;
+
+    void build_attn_sj_kvarn_pend(
+            llm_graph_input_attn_kv * inp,
+                   bool   fused_rot,
+                    int   il) const;
+
     llm_graph_input_attn_k  * build_attn_inp_k() const;
 
     ggml_tensor * build_attn(

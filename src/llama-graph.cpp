@@ -3573,6 +3573,70 @@ void llm_graph_context::build_attn_store(
     ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, inp->get_v_idxs(), il));
 }
 
+// the same rotation build_attn applies below, step for step, so the cache bytes and the FA node match it
+bool llm_graph_context::build_attn_sj_kvarn_rot(
+        llm_graph_input_attn_kv * inp,
+        ggml_tensor *& q_cur,
+        ggml_tensor *& k_cur,
+        ggml_tensor *& v_cur,
+                int   il) const {
+    if (inp->self_sj_kvarn_desc == nullptr) {
+        return false;
+    }
+    const auto * mctx_cur = inp->mctx;
+    const auto * sj_wush = mctx_cur->get_sj_wush(il); // EXPERIMENTAL WUSH-KV layer
+    const bool fused_rot = sj_wush == nullptr && mctx_cur->get_sj_kvarn().body_type != GGML_TYPE_TURBO4_0 &&
+        ggml_sj_kvarn_fused_rot_enabled();
+    GGML_ASSERT(q_cur->ne[0] == 256 && k_cur->ne[0] == 256 && v_cur->ne[0] == 256);
+    if (!fused_rot && !ggml_is_contiguous(q_cur)) { q_cur = ggml_cont(ctx0, q_cur); }
+    if (!ggml_is_contiguous(k_cur)) { k_cur = ggml_cont(ctx0, k_cur); }
+    if (!ggml_is_contiguous(v_cur)) { v_cur = ggml_cont(ctx0, v_cur); }
+    const int group = mctx_cur->get_sj_kvarn().body_type == GGML_TYPE_TURBO4_0 ? 128 : 256;
+    if (sj_wush) {
+        q_cur = llm_graph_sj_wush_apply(ctx0, q_cur, sj_wush->aq);
+        k_cur = llm_graph_sj_wush_apply(ctx0, k_cur, sj_wush->ak);
+        v_cur = llm_graph_sj_wush_apply(ctx0, v_cur, sj_wush->av);
+        cb(q_cur, "q_sj_kvarn_rot", il);
+    } else {
+        if (!fused_rot) {
+            q_cur = ggml_turbo_wht(ctx0, q_cur, 0, group, nullptr);
+            cb(q_cur, "q_sj_kvarn_rot", il);
+        }
+        k_cur = ggml_turbo_wht(ctx0, k_cur, 0, group, nullptr);
+        v_cur = ggml_turbo_wht(ctx0, v_cur, 0, group, nullptr);
+    }
+    cb(k_cur, "k_sj_kvarn_rot", il);
+    cb(v_cur, "v_sj_kvarn_rot", il);
+
+    // fused write rotation (#139): the K/V WHT nodes above are dropped, the cache write rotates
+    if (mctx_cur->sj_kvarn_fused_rot()) {
+        k_cur = llm_graph_sj_kvarn_unrotate(k_cur);
+        v_cur = llm_graph_sj_kvarn_unrotate(v_cur);
+    }
+    return fused_rot;
+}
+
+void llm_graph_context::build_attn_sj_kvarn_pend(
+        llm_graph_input_attn_kv * inp,
+               bool   fused_rot,
+                int   il) const {
+    if (inp->self_sj_kvarn_desc == nullptr) {
+        return;
+    }
+    const auto * mctx_cur = inp->mctx;
+    const auto * sj_wush = mctx_cur->get_sj_wush(il);
+    uint32_t bits_k = 0, bits_v = 0;
+    const int tier = mctx_cur->get_sj_kvarn_layer_tier(il, bits_k, bits_v);
+    GGML_ASSERT(tier == 0 || inp->self_sj_kvarn_desc_edge != nullptr);
+    sj_kvarn_pending.body   = mctx_cur->get_sj_kvarn_body(il);
+    sj_kvarn_pending.desc   = tier == 1 ? inp->self_sj_kvarn_desc_edge : inp->self_sj_kvarn_desc;
+    sj_kvarn_pending.bits_k = (int32_t) bits_k;
+    sj_kvarn_pending.bits_v = (int32_t) bits_v;
+    sj_kvarn_pending.fused_rot = fused_rot;
+    sj_kvarn_pending.n_kv_streams = &inp->sj_kvarn_n_kv_streams;
+    sj_kvarn_pending.wush_ao = sj_wush ? sj_wush->ao : nullptr;
+}
+
 ggml_tensor * llm_graph_context::build_attn(
         llm_graph_input_attn_kv * inp,
         ggml_tensor * wo,

@@ -504,6 +504,7 @@ llama_kv_cache::llama_kv_cache(
                 sj_kvarn.transform.c_str(), sj_wush_host.size(), NL, (unsigned long long) sj_wush_hash);
     }
 
+    bool sj_kvarn_gqa_warned = false;
     for (uint32_t il = 0; il < n_layer; il++) {
         if (!hparams.has_kv(il)) {
             LLAMA_LOG_DEBUG("%s: layer %3d: does not have KV cache\n", __func__, il);
@@ -833,6 +834,15 @@ llama_kv_cache::llama_kv_cache(
             GGML_ASSERT(rb == sj_kvarn_rec_bytes[layer_new.sj_kvarn_tier] && "SJ-KVaRN cache: head size must be constant across layers");
             if (edge) {
                 sj_kvarn_n_layers_edge++;
+            }
+            // the CUDA kernels of the low-bit pairs (every pair but 4/4) serve GQA ratios 5..8 only; at other ratios that
+            // attention runs on the CPU, which works but is many times slower
+            const uint32_t gqa = hparams.n_head(il)/std::max<uint32_t>(1, hparams.n_head_kv(il));
+            if ((layer_new.sj_kvarn_bits_k != 4 || layer_new.sj_kvarn_bits_v != 4) && (gqa <= 4 || gqa > 8) && !sj_kvarn_gqa_warned) {
+                sj_kvarn_gqa_warned = true;
+                LLAMA_LOG_WARN("%s: SJ-KVaRN K%u/V%u: this model has %u query heads per KV head; the CUDA low-bit attention "
+                        "kernels serve 5 to 8, so this attention runs on the CPU (it works, but much slower). Use -ctk sjkvarn4 "
+                        "-ctv sjkvarn4 on this model.\n", __func__, layer_new.sj_kvarn_bits_k, layer_new.sj_kvarn_bits_v, gqa);
             }
             body = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, (int64_t) rb * hparams.n_head_kv(il) * sj_kvarn_n_groups);
             body->op_params[7] = layer_new.sj_kvarn_body_type;

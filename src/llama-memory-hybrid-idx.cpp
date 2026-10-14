@@ -40,13 +40,15 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
                             /* layer filters */
     const layer_filter_cb & filter_attn,
     const layer_filter_cb & filter_recr,
-    const layer_filter_cb & filter_idx) :
+    const layer_filter_cb & filter_idx,
+      llama_sj_kvarn_config   sj_kvarn) :
     llama_memory_hybrid(
         model,
         type_k, type_v, v_trans, kv_size, n_pad, n_swa, swa_type,
         type_r, type_s, rs_size,
         n_seq_max, n_rs_seq, gdn_replay_req, offload, unified,
-        filter_attn, filter_recr),
+        filter_attn, filter_recr,
+        0, nullptr, 0, sj_kvarn),
     hparams_idx(model.hparams),
     mem_idx(filter_idx == nullptr ? nullptr : [&] {
         // MQA with a single key head of indexer_head_size, as llama_kv_cache_dsa shapes its own
@@ -63,10 +65,20 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         hparams_idx.n_embd_head_k_mla_impl = model.hparams.indexer_head_size;
         hparams_idx.n_embd_head_v_mla_impl = model.hparams.indexer_head_size;
 
-        LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells\n", __func__, kv_size);
+        // the indexer gathers its raw keys with GET_ROWS. The WHT-rotating KV types (turbo*, tq5_0, tq6_0, and the
+        // SJ-KVaRN staging type) rotate on write and have no GET_ROWS kernel on any backend, so their indexer keys stay
+        // f16. With SJ-KVaRN the attention cache keeps one stream per sequence, and the indexer must use the same
+        // streams, since cell j is the same token in both.
+        const bool rotating_k = type_k == GGML_TYPE_TURBO2_0 || type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0 ||
+                                type_k == GGML_TYPE_TQ5_0    || type_k == GGML_TYPE_TQ6_0;
+        const ggml_type type_k_idx = sj_kvarn.enabled() || rotating_k ? GGML_TYPE_F16 : type_k;
+        const ggml_type type_v_idx = sj_kvarn.enabled() || rotating_k ? GGML_TYPE_F16 : type_v; // no V rows are cached
+        const bool      unified_idx = unified && !sj_kvarn.enabled();
+
+        LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells, type = %s\n", __func__, kv_size, ggml_type_name(type_k_idx));
 
         return new llama_kv_cache(
-            model, hparams_idx, type_k, type_v, v_trans, offload, unified,
+            model, hparams_idx, type_k_idx, type_v_idx, v_trans, offload, unified_idx,
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
             nullptr, filter_idx, nullptr, nullptr, "idx_");
     }()) {}
@@ -192,13 +204,18 @@ bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
         return false;
     }
 
+    // the attention cache can refuse too (SJ-KVaRN: a range inside the sealed records), so the indexer follows it
+    if (!get_mem_attn()->seq_rm(seq_id, p0, p1)) {
+        return false;
+    }
+
     if (mem_idx) {
         const llama_pos stale = mem_idx_stale_pos(seq_id, p0);
         mem_idx->seq_rm(seq_id, p0, p1);
         mem_idx_stale_set(seq_id, stale);
     }
 
-    return get_mem_attn()->seq_rm(seq_id, p0, p1);
+    return true;
 }
 
 void llama_memory_hybrid_idx::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
