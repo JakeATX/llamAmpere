@@ -28,6 +28,7 @@ class llama_io_write_i;
 
 // "memory" as in abstract memory for the context
 struct llama_memory_i;
+class  llama_memory_recurrent;
 struct llama_memory_context_i;
 
 // stores copy of the memory in device buffer. used for fast state save/load
@@ -532,6 +533,42 @@ private:
     // the last layer's experts ready; false on failure (status set)
     bool b1_run_prefix(llama_memory_context_i * mctx, size_t ub0, ggml_status & status);
     int64_t b1_final_rows(int64_t n_out, int64_t n_tok) const;
+
+public:
+    // in-call checkpoints (llama_state_seq_capture_arm)
+    struct ckpt_write {
+        ggml_tensor * t;
+        size_t        offset;   // in the tensor
+        size_t        size;
+        size_t        blob_off; // in the blob
+        int32_t       il;       // layer of the tensor
+    };
+    struct ckpt_capture {
+        llama_pos n_tokens = 0; // copied after the ubatch whose last position is n_tokens - 1
+        llama_pos pos_min  = -1;
+        llama_pos pos_max  = -1;
+        std::vector<uint8_t>    blob;   // the bytes state_seq_get_data(PARTIAL_ONLY) would write at that spot
+        std::vector<ckpt_write> writes; // where the blob's tensor rows come from
+        std::vector<uint8_t>    layer_done;
+        bool laid_out = false;
+        bool failed   = false;
+    };
+
+    int32_t capture_arm(llama_seq_id seq_id, const llama_pos * n_tokens, int32_t n);
+    int32_t capture_min_tail() const;
+    bool    capture_select(int32_t k, llama_pos * pos_min, llama_pos * pos_max);
+
+private:
+    llama_seq_id              ckpt_seq   = -1;
+    bool                      ckpt_armed = false; // set by capture_arm, consumed by the next decode
+    int32_t                   ckpt_sel   = -1;
+    std::vector<ckpt_capture> ckpt_caps;
+
+    // the recurrent memory whose PARTIAL_ONLY state the captures copy, nullptr when unsupported
+    const llama_memory_recurrent * capture_mem() const;
+    // after a ubatch graph over layers [il0, il1) (il1 < 0: to the last layer) ran: copy the rows of a capture
+    // whose spot this ubatch ends
+    void capture_ubatch(const llama_ubatch & ubatch, int32_t il0, int32_t il1);
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;

@@ -1078,6 +1078,30 @@ extern "C" {
                     llama_seq_id   dest_seq_id,
            llama_state_seq_flags   flags);
 
+    // In-call checkpoints: copy the partial state (LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) of seq_id as it stands after
+    // the first n_tokens[i] tokens, while the next llama_decode runs, so one call can hold the prompt checkpoints that
+    // would otherwise each end a call. Each n_tokens[i] must end a ubatch of that call and the batch must hold seq_id
+    // only. The next decode consumes the request; n = 0 drops it. Returns 0 when armed, -1 when the memory has no
+    // partial state this can copy.
+    LLAMA_API int32_t llama_state_seq_capture_arm(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
+               const llama_pos   * n_tokens,
+                         int32_t   n);
+
+    // The fewest tokens that must follow a capture spot in the same call (the ubatch split keeps that many trailing
+    // tokens together, so a spot closer to the end of the call does not end a ubatch); -1 when unsupported.
+    LLAMA_API int32_t llama_state_seq_capture_min_tail(struct llama_context * ctx);
+
+    // After the decode: true when capture k is complete. It then sets pos_min/pos_max to the memory's range at that
+    // spot, and until llama_state_seq_capture_select(ctx, -1, ...) llama_state_seq_get_size_ext/get_data_ext with
+    // LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY return the captured state instead of the live one.
+    LLAMA_API bool llama_state_seq_capture_select(
+            struct llama_context * ctx,
+                         int32_t   k,
+                     llama_pos   * pos_min,
+                     llama_pos   * pos_max);
+
     //
     // Decoding
     //

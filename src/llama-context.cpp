@@ -3290,6 +3290,13 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         return encode(batch_inp);
     }
 
+    // in-call checkpoints: a request is for this call only; an older one's copies are dropped here
+    if (!ckpt_armed) {
+        ckpt_caps.clear();
+    }
+    ckpt_armed = false;
+    ckpt_sel   = -1;
+
     if (batch_inp.tokens.empty()) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
@@ -3588,6 +3595,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                     GGML_ABORT("should not happen");
             }
         }
+
+        // in-call checkpoints: the normal path ran every layer, B1's last range the layers from b1_final_l0 on
+        capture_ubatch(ubatch, b1_mode == 1 ? b1_final_l0 : 0, -1);
 
         // plot the computation graph in dot format (for debugging purposes)
         //if (n_past%100 == 0) {
@@ -4556,6 +4566,7 @@ bool llama_context::b1_run_prefix(llama_memory_context_i * mctx, size_t ub0, ggm
             if (!res) {
                 return false;
             }
+            capture_ubatch(mctx->get_ubatch(), l0, l1);
         }
         b1->layer_end(l0);
         l0 = l1;
@@ -5281,6 +5292,10 @@ size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
 static constexpr uint32_t io_magic = 0xaf143cd8;
 
 size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_flags flags) {
+    if (ckpt_sel >= 0 && seq_id == ckpt_seq && flags == LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) {
+        return ckpt_caps[ckpt_sel].blob.size();
+    }
+
     llama_io_write_dummy io(flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
     try {
         io.write(&io_magic, sizeof(io_magic));
@@ -5294,6 +5309,16 @@ size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_fl
 }
 
 size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_state_seq_flags flags) {
+    if (ckpt_sel >= 0 && seq_id == ckpt_seq && flags == LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) {
+        const auto & blob = ckpt_caps[ckpt_sel].blob;
+        if (size < blob.size()) {
+            LLAMA_LOG_ERROR("%s: error saving state: unexpectedly reached end of buffer\n", __func__);
+            return 0;
+        }
+        memcpy(dst, blob.data(), blob.size());
+        return blob.size();
+    }
+
     std::unique_ptr<llama_io_write_i> io;
     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
         io = std::make_unique<llama_io_write_device>(dst, size, mem_storage[seq_id]);
@@ -5309,6 +5334,213 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error saving state: %s\n", __func__, err.what());
         return 0;
+    }
+}
+
+// in-call checkpoints: lays out the PARTIAL_ONLY state like llama_io_write_host would write it, without reading the
+// tensors (fill), or checks that a later layout is the same one (check)
+class llama_io_write_layout : public llama_io_write_i {
+  public:
+    llama_io_write_layout(std::vector<uint8_t> & blob, std::vector<llama_context::ckpt_write> & writes, bool check) :
+        blob(blob), writes(writes), check(check) {}
+
+    void write(const void * src, size_t size) override {
+        if (check) {
+            same = same && off + size <= blob.size() && memcmp(blob.data() + off, src, size) == 0;
+        } else {
+            blob.insert(blob.end(), (const uint8_t *) src, (const uint8_t *) src + size);
+        }
+        off += size;
+    }
+
+    void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        if (check) {
+            same = same && iw < writes.size() && writes[iw].t == tensor && writes[iw].offset == offset &&
+                writes[iw].size == size && writes[iw].blob_off == off;
+            ++iw;
+        } else {
+            writes.push_back({ tensor, offset, size, off, -1 });
+            blob.resize(blob.size() + size);
+        }
+        off += size;
+    }
+
+    size_t n_bytes() override { return off; }
+
+    // check mode: the layout matched the earlier one exactly
+    bool matched() const { return same && iw == writes.size() && off == blob.size(); }
+
+  private:
+    std::vector<uint8_t> &                   blob;
+    std::vector<llama_context::ckpt_write> & writes;
+    const bool check;
+
+    size_t off  = 0;
+    size_t iw   = 0;
+    bool   same = true;
+};
+
+const llama_memory_recurrent * llama_context::capture_mem() const {
+    // PARTIAL_ONLY is exactly the recurrent state for these memories (the hybrid ones skip their attention cache and
+    // indexer); a replay ring travels in an extra section the copy does not keep
+    const llama_memory_recurrent * mem_recr = nullptr;
+    if (const auto * hyb = dynamic_cast<const llama_memory_hybrid *>(memory.get())) {
+        mem_recr = hyb->get_mem_recr();
+    } else {
+        mem_recr = dynamic_cast<const llama_memory_recurrent *>(memory.get());
+    }
+    if (mem_recr == nullptr || mem_recr->gdn_replay) {
+        return nullptr;
+    }
+    return mem_recr;
+}
+
+int32_t llama_context::capture_arm(llama_seq_id seq_id, const llama_pos * n_tokens, int32_t n) {
+    ckpt_caps.clear();
+    ckpt_sel   = -1;
+    ckpt_armed = false;
+    ckpt_seq   = -1;
+    if (n <= 0) {
+        return 0;
+    }
+    if (capture_mem() == nullptr || seq_id < 0) {
+        return -1;
+    }
+    ckpt_seq = seq_id;
+    ckpt_caps.resize(n);
+    for (int32_t i = 0; i < n; ++i) {
+        ckpt_caps[i].n_tokens = n_tokens[i];
+    }
+    ckpt_armed = true;
+    return 0;
+}
+
+int32_t llama_context::capture_min_tail() const {
+    const auto * mem_recr = capture_mem();
+    if (mem_recr == nullptr) {
+        return -1;
+    }
+    // split_equal keeps the last n_rs_seq + 1 tokens of a sequence in one ubatch
+    return mem_recr->n_rs_seq > 0 ? (int32_t) mem_recr->n_rs_seq + 1 : 1;
+}
+
+bool llama_context::capture_select(int32_t k, llama_pos * pos_min, llama_pos * pos_max) {
+    ckpt_sel = -1;
+    if (k < 0 || k >= (int32_t) ckpt_caps.size()) {
+        return false;
+    }
+    const auto & c = ckpt_caps[k];
+    if (c.failed || !c.laid_out) {
+        return false;
+    }
+    for (size_t il = 0; il < c.layer_done.size(); ++il) {
+        if (!c.layer_done[il]) {
+            return false;
+        }
+    }
+    ckpt_sel = k;
+    if (pos_min) {
+        *pos_min = c.pos_min;
+    }
+    if (pos_max) {
+        *pos_max = c.pos_max;
+    }
+    return true;
+}
+
+void llama_context::capture_ubatch(const llama_ubatch & ubatch, int32_t il0, int32_t il1) {
+    if (ckpt_caps.empty() || ubatch.n_tokens == 0) {
+        return;
+    }
+
+    // the token count this ubatch ends at; a ubatch of another sequence fails the request
+    llama_pos p_end = -1;
+    bool      other = false;
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        if (ubatch.n_seq_id[i] != 1 || ubatch.seq_id[i][0] != ckpt_seq) {
+            other = true;
+        } else {
+            p_end = std::max<llama_pos>(p_end, ubatch.pos[i] + 1);
+        }
+    }
+
+    const auto * mem_recr = capture_mem();
+    const int32_t n_layer = (int32_t) mem_recr->r_l.size();
+    if (il1 < 0 || il1 > n_layer) {
+        il1 = n_layer;
+    }
+
+    for (auto & c : ckpt_caps) {
+        if (c.failed) {
+            continue;
+        }
+        if (other) {
+            LLAMA_LOG_WARN("%s: in-call checkpoint at %d dropped: a ubatch holds another sequence\n", __func__, c.n_tokens);
+            c.failed = true;
+            continue;
+        }
+        if (c.n_tokens != p_end) {
+            continue;
+        }
+
+        // the rows are written by the graph that just ran
+        ggml_backend_sched_synchronize(sched.get());
+
+        // the memory's bookkeeping is now that of the ubatch just computed, so it lays out the state the way a call
+        // ending here would write it; every later layer range must find the same layout
+        {
+            llama_io_write_layout io(c.blob, c.writes, c.laid_out);
+            try {
+                io.write(&io_magic, sizeof(io_magic));
+                io.write(&ckpt_seq, sizeof(ckpt_seq));
+                state_seq_write_data(io, ckpt_seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            } catch (const std::exception & err) {
+                LLAMA_LOG_WARN("%s: in-call checkpoint at %d dropped: %s\n", __func__, c.n_tokens, err.what());
+                c.failed = true;
+                continue;
+            }
+            if (c.laid_out && !io.matched()) {
+                LLAMA_LOG_WARN("%s: in-call checkpoint at %d dropped: the state layout changed between layer ranges\n", __func__, c.n_tokens);
+                c.failed = true;
+                continue;
+            }
+        }
+        if (!c.laid_out) {
+            c.laid_out = true;
+            c.pos_min  = memory->seq_pos_min(ckpt_seq);
+            c.pos_max  = memory->seq_pos_max(ckpt_seq);
+            c.layer_done.assign(n_layer, 1);
+            for (int32_t il = 0; il < n_layer; ++il) {
+                if (mem_recr->r_l[il] || mem_recr->s_l[il] || mem_recr->p_l[il]) {
+                    c.layer_done[il] = 0;
+                }
+            }
+            for (auto & w : c.writes) {
+                for (int32_t il = 0; il < n_layer && w.il < 0; ++il) {
+                    if (w.t == mem_recr->r_l[il] || w.t == mem_recr->s_l[il] || w.t == mem_recr->p_l[il]) {
+                        w.il = il;
+                    }
+                }
+                if (w.il < 0) {
+                    LLAMA_LOG_WARN("%s: in-call checkpoint at %d dropped: a state row is not a layer's\n", __func__, c.n_tokens);
+                    c.failed = true;
+                    break;
+                }
+            }
+            if (c.failed) {
+                continue;
+            }
+        }
+
+        // copy the rows of the layers this graph computed
+        for (const auto & w : c.writes) {
+            if (w.il >= il0 && w.il < il1) {
+                ggml_backend_tensor_get(w.t, c.blob.data() + w.blob_off, w.offset, w.size);
+            }
+        }
+        for (int32_t il = il0; il < il1; ++il) {
+            c.layer_done[il] = 1;
+        }
     }
 }
 
@@ -6673,6 +6905,18 @@ size_t llama_state_seq_get_data_ext(llama_context *       ctx,
     ctx->synchronize();
 
     return ctx->state_seq_get_data(seq_id, dst, size, flags);
+}
+
+int32_t llama_state_seq_capture_arm(llama_context * ctx, llama_seq_id seq_id, const llama_pos * n_tokens, int32_t n) {
+    return ctx->capture_arm(seq_id, n_tokens, n);
+}
+
+int32_t llama_state_seq_capture_min_tail(llama_context * ctx) {
+    return ctx->capture_min_tail();
+}
+
+bool llama_state_seq_capture_select(llama_context * ctx, int32_t k, llama_pos * pos_min, llama_pos * pos_max) {
+    return ctx->capture_select(k, pos_min, pos_max);
 }
 
 size_t llama_state_seq_set_data_ext(llama_context *       ctx,

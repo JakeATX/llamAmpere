@@ -376,6 +376,11 @@ struct server_batch {
     float  alora_scale       = -1.0f;
     size_t alora_disabled_id = 0;
 
+    // in-call checkpoints: the slot whose prompt crosses these checkpoint spots without ending the batch there; the
+    // decode copies the state at each spot and the checkpoints are made after it. No other slot joins such a batch.
+    int32_t                ckpt_slot = -1;
+    std::vector<llama_pos> ckpt_spots;
+
     void init(llama_context * ctx, int32_t n_tokens_alloc, int32_t n_embd) {
         this->n_tokens_alloc = n_tokens_alloc;
         this->n_embd = n_embd;
@@ -413,6 +418,8 @@ struct server_batch {
         slot_batched      = nullptr;
         alora_scale       = -1.0f;
         alora_disabled_id = 0;
+        ckpt_slot         = -1;
+        ckpt_spots.clear();
     }
 
     int32_t size() const {
@@ -3644,6 +3651,19 @@ private:
         return ctx_dft != nullptr && (force || ctx_dft_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART);
     }
 
+    // In-call checkpoints: on with B1 (LLAMA_B1=1, layer-major prefill), unless LLAMA_B1_CKPT=0. A prompt checkpoint
+    // spot on the SJ-KVaRN grid then no longer ends the batch: the decode copies the recurrent state when the ubatch
+    // that ends there has run (llama_state_seq_capture_arm), and the checkpoint is made from the copy after the call.
+    // A B1 call that ended at the spot would pay another pass over the streamed experts for the tokens after it.
+    bool ckpt_in_call_enabled() const {
+        static const bool on = [] {
+            const char * b1 = getenv("LLAMA_B1");
+            const char * ck = getenv("LLAMA_B1_CKPT");
+            return b1 && atoi(b1) != 0 && !(ck && atoi(ck) == 0);
+        }();
+        return on;
+    }
+
     // [#197] prompt-checkpoint boundary at or below n: on the seal grid (n_ubatch) as well as a group boundary, so cold
     // and restored prefills break into the same ubatches (n when SJ-KVaRN is off)
     llama_pos sj_kvarn_ckpt_floor(llama_pos n) const {
@@ -3658,6 +3678,12 @@ private:
     }
 
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
+        create_checkpoint_at(slot, slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
+    }
+
+    // a checkpoint of the first n_tokens_new tokens of the slot's prompt, from the live memory (or from an in-call
+    // capture selected with llama_state_seq_capture_select)
+    void create_checkpoint_at(server_slot & slot, const int64_t n_tokens_new, llama_pos pos_min, llama_pos pos_max) {
         // Slot restore can synthesize a checkpoint without an active inference task.
         const int id_task = slot.task ? slot.task->id : -1;
 
@@ -3694,7 +3720,6 @@ private:
 
         // replace an existing checkpoint at the same n_tokens instead of appending a duplicate
         {
-            const int64_t n_tokens_new = slot.prompt.n_tokens() - n_tokens_cur;
             for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
                 if (it->n_tokens == n_tokens_new) {
                     SLT_TRC(slot, "superseding context checkpoint at n_tokens = %" PRId64 "\n", it->n_tokens);
@@ -3713,7 +3738,7 @@ private:
         // [TAG_CHECKPOINTS_FIX_POS_MIN]
         // TODO: here we incorrectly deterimne that the saved checkpoint data covers the [pos_min, pos_max] range
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
-        cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
+        cur.update_pos(n_tokens_new, pos_min, pos_max);
 
         llama_synchronize(ctx_tgt); // (update_tgt syncs anyway) keep the previous batch's compute out of the copy time
         const int64_t t_ckpt_us = ggml_time_us();
@@ -4646,6 +4671,11 @@ private:
                     return; // batch is full, skip remaining slots
                 }
 
+                // a batch with in-call checkpoints holds that slot's prompt only (the copies need its ubatches alone)
+                if (batch.ckpt_slot >= 0) {
+                    return;
+                }
+
                 if (!slot.is_processing()) {
                     return;
                 }
@@ -5176,6 +5206,25 @@ private:
                         return false;
                     };
 
+                    // in-call checkpoints: a spot may stay inside the batch when the batch is this slot's alone and the
+                    // spot ends one of its ubatches, i.e. it is a whole number of ubatches from the batch start and at
+                    // least min_tail tokens before the batch end (the ubatch split keeps that many trailing tokens
+                    // together). The drafter must not need a checkpoint of its own, nor keep speculative state in one.
+                    const int64_t ckpt_call0 = slot.prompt.n_tokens();
+                    int32_t ckpt_min_tail = -1;
+                    if (do_checkpoint && sj_align && ckpt_in_call_enabled() && n_tokens_prev == 0 && !has_mtmd && !input_tokens.has_mtmd &&
+                            alora_scale <= 0.0f && slot.task->decision.order.empty() && n_decision_first < 0 &&
+                            !wait_shared && !ckpt_needs_dft()) {
+                        std::vector<uint8_t> spec_state;
+                        if (!common_speculative_get_state(spec.get(), slot.id, spec_state) && spec_state.empty()) {
+                            ckpt_min_tail = llama_state_seq_capture_min_tail(ctx_tgt);
+                        }
+                    }
+                    auto ckpt_in_call = [&](int64_t n) {
+                        const int64_t n_end = std::min<int64_t>(slot.task->n_tokens(), ckpt_call0 + n_batch);
+                        return ckpt_min_tail >= 0 && (n - ckpt_call0) % n_ubatch == 0 && n_end - n >= ckpt_min_tail;
+                    };
+
                     // add prompt tokens for processing in the current batch
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
                         // get next token to process
@@ -5217,7 +5266,10 @@ private:
 
                         if (do_checkpoint && sj_align) {
                             if (sj_ckpt_target(slot.prompt.n_tokens())) {
-                                break;
+                                if (!ckpt_in_call(slot.prompt.n_tokens())) {
+                                    break;
+                                }
+                                batch.ckpt_spots.push_back((llama_pos) slot.prompt.n_tokens());
                             }
                         } else
                         // break at the last user message, or at user messages at least min step past the last checkpoint
@@ -5257,6 +5309,12 @@ private:
 
                     // the number of tokens added to the batch for the current slot
                     const auto n_tokens_cur = batch.size() - n_tokens_prev;
+
+                    if (!batch.ckpt_spots.empty()) {
+                        batch.ckpt_slot = slot.id;
+                        SLT_INF(slot, "in-call checkpoints at %zu spot(s), first n_tokens = %d, batch [%" PRId64 ", %d)\n",
+                                batch.ckpt_spots.size(), batch.ckpt_spots.front(), ckpt_call0, slot.prompt.n_tokens());
+                    }
 
                     const auto n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;
 
@@ -5421,6 +5479,19 @@ private:
             has_output |= batch.tokens[i].output;
         }
 
+        // in-call checkpoints are armed only for the whole batch in one view; a retry with a smaller view drops them
+        bool ckpt_armed = false;
+        if (batch.ckpt_slot >= 0) {
+            if (off == 0 && batch.view.size() == batch.size() &&
+                    llama_state_seq_capture_arm(ctx_tgt, batch.ckpt_slot, batch.ckpt_spots.data(), (int32_t) batch.ckpt_spots.size()) == 0) {
+                ckpt_armed = true;
+            } else {
+                SRV_WRN("dropping %zu in-call checkpoint(s): the batch is decoded in parts\n", batch.ckpt_spots.size());
+                batch.ckpt_slot = -1;
+                batch.ckpt_spots.clear();
+            }
+        }
+
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
@@ -5435,6 +5506,13 @@ private:
             });
             t_decode_pass += ggml_time_us() - t_decode_start;
             g_host_phases.mark(server_host_phase_clock::VERIFY);
+        }
+
+        if (ckpt_armed && ret != 0) {
+            SRV_WRN("dropping %zu in-call checkpoint(s): the decode returned %d\n", batch.ckpt_spots.size(), ret);
+            llama_state_seq_capture_arm(ctx_tgt, -1, nullptr, 0);
+            batch.ckpt_slot = -1;
+            batch.ckpt_spots.clear();
         }
 
         if (ret != 0) {
@@ -5488,6 +5566,29 @@ private:
         } else {
             // success, apply batch metrics
             metrics_post_decode(off, batch.view.size(), has_output);
+        }
+
+        // in-call checkpoints: made in spot order, as the batches that would have started at each spot make them
+        if (ckpt_armed) {
+            server_slot * cslot = nullptr;
+            for (auto & s : slots) {
+                if (s.id == batch.ckpt_slot) {
+                    cslot = &s;
+                }
+            }
+            for (size_t k = 0; k < batch.ckpt_spots.size() && cslot && cslot->task; ++k) {
+                llama_pos p_min = -1;
+                llama_pos p_max = -1;
+                if (!llama_state_seq_capture_select(ctx_tgt, (int32_t) k, &p_min, &p_max) || p_min < 0) {
+                    SLT_WRN(*cslot, "in-call checkpoint at n_tokens = %d was not captured\n", batch.ckpt_spots[k]);
+                    continue;
+                }
+                create_checkpoint_at(*cslot, batch.ckpt_spots[k], p_min, p_max);
+                llama_state_seq_capture_select(ctx_tgt, -1, nullptr, nullptr);
+            }
+            llama_state_seq_capture_arm(ctx_tgt, -1, nullptr, 0);
+            batch.ckpt_slot = -1;
+            batch.ckpt_spots.clear();
         }
 
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
