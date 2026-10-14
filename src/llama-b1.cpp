@@ -360,8 +360,10 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
     // the mmap and the lent layers from the file. When that loop is larger than the RAM free for the page cache,
     // almost every read misses and goes to the disk. So lend only what fits next to the experts kept in RAM (they
     // count only when they are mmap'd file pages). If even those do not fit, the loop misses anyway and fewer passes
-    // read less, so there is no cap. LLAMA_B1_RAM_MARGIN_MIB < 0 turns this off.
-    const int64_t ram_margin = b1_env_int("LLAMA_B1_RAM_MARGIN_MIB", 2048);
+    // read less, so there is no cap. Off by default (measured at about 37 GiB MemAvailable: the capped lend split
+    // the call into one-ubatch passes and read as much from the disk as the uncapped lend); LLAMA_B1_RAM_MARGIN_MIB
+    // >= 0 turns it on with that margin.
+    const int64_t ram_margin = b1_env_int("LLAMA_B1_RAM_MARGIN_MIB", -1);
     const int64_t ram_avail  = ram_margin >= 0 ? b1_ram_available() : -1;
     int64_t ram_cap = -1;
     if (ram_avail >= 0) {
