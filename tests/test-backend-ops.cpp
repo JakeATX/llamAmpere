@@ -14102,6 +14102,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_concat_conv_input(3, 10240, 4, 1));
     test_cases.emplace_back(new test_concat_conv_input(3, 10240, 1, 1));
     test_cases.emplace_back(new test_concat_conv_input(3, 1000, 5, 3));
+    // prefill-sized conv inputs (rows of 256+ columns: the row kernel, or the tile kernel with GGML_CUDA_CONCAT_TILE=1)
+    test_cases.emplace_back(new test_concat_conv_input(3, 10240, 512, 1));
+    test_cases.emplace_back(new test_concat_conv_input(3, 1000, 300, 3));
+    test_cases.emplace_back(new test_concat_conv_input(3, 4100, 2049, 1));
     test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {300, 5, 3, 2}, 7, 0, 1));
     test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 999, 2, 2}, 4, 0, 2));
 
@@ -15890,6 +15894,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_cumsum(GGML_TYPE_F32, {cols, nrows, 1, 1}));
         }
     }
+
+    // GDN conv input at prefill ubatch 8192 / 12288 (Flash-Next: 10240 conv channels): the row kernel, or the tile kernel
+    // with GGML_CUDA_CONCAT_TILE=1
+    test_cases.emplace_back(new test_concat_conv_input(3, 10240, 8192, 1));
+    test_cases.emplace_back(new test_concat_conv_input(3, 10240, 12288, 1));
 
     // Examples from granite-4.0-h-1b/ggml-model-Q8_0.gguf
     test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {515, 3328, 1, 1}, {4, 3328, 1, 1})); // prefill
