@@ -4570,6 +4570,50 @@ struct test_rms_norm_mul_add : public test_case {
     }
 };
 
+// RMS_NORM -> MUL(gamma) -> RESHAPE -> CPY(BF16), the Flash-Next hyper-connection norm with one BF16 copy for its
+// matmuls (GGML_CUDA_NORM_CAST=1 fuses the CPY into the norm). x is [n_embd, hc, n_tokens], gamma is [n_embd, hc]; the
+// f32 norm output and the BF16 copy (widened back) are both checked through the final ADD.
+struct test_rms_norm_mul_cast : public test_case {
+    const std::array<int64_t, 3> ne;
+    const float eps;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_MUL_CAST";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR2(ne, eps);
+    }
+
+    test_rms_norm_mul_cast(std::array<int64_t, 3> ne = {2560, 4, 64}, float eps = 1e-6f) : ne(ne), eps(eps) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2]);
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne[0], ne[1]);
+        ggml_set_name(x, "x");
+        ggml_set_name(w, "w");
+
+        ggml_tensor * xn  = ggml_mul(ctx, ggml_rms_norm(ctx, x, eps), w);
+        ggml_tensor * xn2 = ggml_reshape_2d(ctx, xn, ne[0]*ne[1], ne[2]);
+        ggml_tensor * f32 = ggml_reshape_3d(ctx, xn2, ne[0], ne[1], ne[2]);
+        ggml_tensor * xb  = ggml_cast(ctx, xn2, GGML_TYPE_BF16);
+        ggml_tensor * xbf = ggml_reshape_3d(ctx, ggml_cast(ctx, xb, GGML_TYPE_F32), ne[0], ne[1], ne[2]);
+        ggml_tensor * out = ggml_add(ctx, f32, ggml_scale(ctx, xbf, 0.5f));
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -10.f, 10.f);
+        }
+    }
+};
+
 // GGML_OP_ADD + GGML_OP_ADD (fused residual chain)
 struct test_add_add : public test_case {
     const ggml_type type;
@@ -12950,6 +12994,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 256, 4, 3, 2 }, 1e-6f, false, false, true, false, true));
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 1536, 1, 1, 1 }, 1e-6f, false, false, false, true));
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 256, 4, 1, 1 }, 1e-6f, false, false, false, true));
+
+    test_cases.emplace_back(new test_rms_norm_mul_cast({2560, 4, 64}));
+    test_cases.emplace_back(new test_rms_norm_mul_cast({2560, 4, 37}));
+    test_cases.emplace_back(new test_rms_norm_mul_cast({1000, 3, 5}));
 
     test_cases.emplace_back(new test_rms_norm_mul_rope({128, 4, 7, 2}));
     test_cases.emplace_back(new test_rms_norm_mul_rope({128, 4, 7, 2}, 1e-6f, false, true));

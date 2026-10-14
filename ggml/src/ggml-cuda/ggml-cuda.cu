@@ -6096,6 +6096,63 @@ static int ggml_cuda_fuse_elem_chain(ggml_backend_cuda_context & ctx, const ggml
     return -1;
 }
 
+// [CAST] GGML_CUDA_NORM_CAST=1 (opt-in): RMS_NORM -> MUL(gamma) -> (RESHAPE/VIEW nodes) -> CPY to BF16 in one kernel.
+// This is Flash-Next's hyper-connection norm with LLAMA_HC_BF16_ONCE: the norm output is read in f32 by the mixer and
+// as one BF16 copy by its two BF16 matmuls. The fused norm writes both, so the CPY kernel (read f32, write BF16) does
+// not run. Same f32 values and the same round-to-nearest-even conversion, so both outputs are bit-identical. Only
+// RESHAPE/VIEW nodes (which run nothing and allocate nothing) may sit between MUL and CPY, so writing the CPY output
+// early cannot clobber a buffer another node still uses. Returns the number of extra nodes consumed, or -1.
+static bool ggml_cuda_norm_cast_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_CUDA_NORM_CAST");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return enabled;
+}
+
+static int ggml_cuda_fuse_norm_mul_cast(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+    if (!ggml_cuda_norm_cast_enabled() || i + 2 >= cgraph->n_nodes ||
+        !ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
+        return -1;
+    }
+    ggml_tensor * norm = cgraph->nodes[i];
+    ggml_tensor * mul  = cgraph->nodes[i + 1];
+    if (!ggml_is_contiguous(mul)) {
+        return -1;
+    }
+    int c = i + 2;
+    while (c < cgraph->n_nodes && c < i + 8 && (cgraph->nodes[c]->op == GGML_OP_RESHAPE || cgraph->nodes[c]->op == GGML_OP_VIEW)) {
+        ++c;
+    }
+    if (c >= cgraph->n_nodes) {
+        return -1;
+    }
+    ggml_tensor * cpy = cgraph->nodes[c];
+    const ggml_tensor * src = cpy->src[0];
+    // the CPY reads the whole MUL output in its own element order: MUL itself, or a contiguous view of it at offset 0
+    if (cpy->op != GGML_OP_CPY || cpy->type != GGML_TYPE_BF16 || !ggml_is_contiguous(cpy) || cpy->buffer == nullptr ||
+        src == nullptr || src->type != GGML_TYPE_F32 || !ggml_is_contiguous(src) ||
+        !(src == mul || (src->view_src == mul && src->view_offs == 0)) || ggml_nelements(cpy) != ggml_nelements(mul)) {
+        return -1;
+    }
+    // the BF16 output must not overlap anything the norm reads or writes
+    const auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const char * a0 = (const char *) a->data;
+        const char * b0 = (const char *) b->data;
+        return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
+    };
+    if (overlaps(cpy, norm->src[0]) || overlaps(cpy, mul->src[0]) || overlaps(cpy, mul->src[1]) || overlaps(cpy, mul)) {
+        return -1;
+    }
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        GGML_LOG_INFO("%s: GGML_CUDA_NORM_CAST: rms_norm+mul+cpy(bf16) fused (%s, %d extra nodes)\n", __func__, cpy->name, c - i);
+    }
+    ggml_cuda_op_rms_norm_fused(ctx, norm, mul, nullptr, (nv_bfloat16 *) cpy->data);
+    return c - i;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 // nodes [i, i+4] = RMS_NORM, MUL, RMS_NORM, MUL, CONCAT(dim 0) over a single row, with the two
 // MULs as the concat's only consumers of the norms. Returns the extra node count consumed, or -1.
@@ -7276,6 +7333,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         const int n_pair_concat = ggml_cuda_fuse_norm_pair_concat(*cuda_ctx, cgraph, i);
         if (n_pair_concat >= 0) {
             return n_pair_concat;
+        }
+    }
+
+    {
+        const int n_norm_cast = ggml_cuda_fuse_norm_mul_cast(*cuda_ctx, cgraph, i);
+        if (n_norm_cast >= 0) {
+            return n_norm_cast;
         }
     }
 
