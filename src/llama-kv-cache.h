@@ -255,54 +255,21 @@ public:
     const llama_sj_kvarn_config & get_sj_kvarn() const { return sj_kvarn; }
     // SJ-KVaRN fused write rotation (#139): cpy_k/cpy_v rotate K/V inside the TQ6_0 cache write
     bool sj_kvarn_fused_rot() const { return sj_kvarn_fused_rot_on; }
-    // EXPERIMENTAL WUSH-KV (arXiv 2609.38121): per-layer transforms replacing the Hadamard; nullptr = Hadamard layer
-    struct sj_wush_layer {
-        ggml_tensor * aq = nullptr; // F32 [D, D, n_head_kv]: q' = AQ q   (row-major per head, ggml_mul_mat(A, x) = A x)
-        ggml_tensor * ak = nullptr; // k' = AK k
-        ggml_tensor * av = nullptr; // v' = AV v
-        ggml_tensor * ao = nullptr; // o  = AO o'
-    };
-    const sj_wush_layer * get_sj_wush(int32_t il) const {
-        auto it = sj_wush.find(il);
-        return it == sj_wush.end() ? nullptr : &it->second;
-    }
     int  sj_kvarn_rot_group() const { return sj_kvarn.body_type == GGML_TYPE_TURBO4_0 ? 128 : 256; }
     ggml_tensor * get_sj_kvarn_body(int32_t il) const;
     bool maintain_sj_kvarn(llama_context * lctx);
-    int32_t compress_sj_kvarn_idle(llama_context * lctx, llama_seq_id seq_id, llama_pos accepted_end, llama_pos keep_from = -1);
-    // sealed end: of the sequence's stream (seq_id >= 0), or the largest over all streams (seq_id < 0)
-    uint32_t get_sj_kvarn_sealed_end(llama_seq_id seq_id = -1) const;
-    // largest position <= pos that seq_rm(pos, -1) can truncate to: pos itself unless pos lies inside the sealed body
-    // below the intact ring rows, then the group boundary below it
-    llama_pos sj_kvarn_rm_floor(llama_seq_id seq_id, llama_pos pos) const;
-    uint32_t get_sj_kvarn_visible_end() const { return sj_kvarn_st[0].N; }
+    int32_t compress_sj_kvarn_idle(llama_context * lctx, llama_seq_id seq_id, llama_pos accepted_end);
+    uint32_t get_sj_kvarn_sealed_end() const { return sj_kvarn_B; }
+    uint32_t get_sj_kvarn_visible_end() const { return sj_kvarn_N; }
     uint32_t get_sj_kvarn_capacity() const { return sj_kvarn_cap; }
-    // [#197] position grid of the seal schedule (0 = off): the splitter must not let a ubatch cross a grid line
-    uint32_t get_sj_kvarn_pos_grid() const { return sj_kvarn_grid; }
-    // [#197] ubatch split grid (full grid mode only, 0 otherwise)
-    uint32_t get_sj_kvarn_split_grid() const { return sj_kvarn_split_grid; }
-    // [PCR1] before a re-prefill of seq_id from the grid point p0: reopen to the cold sealed end at p0 (see .cpp)
-    bool sj_kvarn_prefill_cut(llama_seq_id seq_id, llama_pos p0);
-    // [PCR1] the ring still holds every staging row a cold prefill of [0, p0) keeps exact (the cut can be bit-identical)
-    bool sj_kvarn_cut_in_reach(llama_seq_id seq_id, llama_pos p0) const;
-    uint32_t get_sj_kvarn_sink() const { return sj_kvarn.sink; }
     uint64_t get_sj_kvarn_maintenance_count() const { return sj_kvarn_maintenance_count; }
     uint64_t get_sj_kvarn_maintenance_groups() const { return sj_kvarn_maintenance_groups; }
-    bool has_sj_kvarn_maintenance() const {
-        for (const auto & st : sj_kvarn_st) { if (st.B_pending > st.B) { return true; } }
-        return false;
-    }
-    // multi-stream: the record pool is paged (per-stream group tables, see sj_kvarn_stream)
-    bool sj_kvarn_is_paged() const { return sj_kvarn_paged; }
-    // records free in the paged pool (0 when not paged)
-    uint32_t get_sj_kvarn_free_records() const { return (uint32_t) sj_kvarn_free.size(); }
-    // padded attended position count of one stream (the per-stream FA n_kv of a multi-stream ubatch)
-    uint32_t get_sj_kvarn_n_kv_stream(uint32_t strm) const;
+    bool has_sj_kvarn_maintenance() const { return sj_kvarn_B_pending > sj_kvarn_B; }
+
 
     // I32[GGML_SJKVARN_DESC_N_ENTRIES] graph input consumed by the seal op and the attention op
-    // multi-stream (paged) caches: I32[GGML_SJKVARN_DESC_N_ENTRIES + n_groups_seq, n_stream of the ubatch], one row per stream
-    ggml_tensor * build_input_sj_kvarn_desc(ggml_context * ctx, const llama_ubatch & ubatch) const;
-    void set_input_sj_kvarn_desc(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo, int tier = 0) const;
+    ggml_tensor * build_input_sj_kvarn_desc(ggml_context * ctx) const;
+    void set_input_sj_kvarn_desc(ggml_tensor * dst, const llama_ubatch * ubatch, int tier = 0) const;
     // tier (0 interior, 1 edge) and body bits of a model layer
     int get_sj_kvarn_layer_tier(int32_t il, uint32_t & bits_k, uint32_t & bits_v) const;
     bool has_sj_kvarn_edge_tier() const { return sj_kvarn_n_layers_edge > 0; }
@@ -399,47 +366,18 @@ private:
     // position (cell index == position) so the mask and the sequence bookkeeping are unchanged.
     llama_sj_kvarn_config sj_kvarn;
     uint32_t sj_kvarn_cap           = 0; // ring rows
-    uint32_t sj_kvarn_grid          = 0; // [#197] restore grid (n_ubatch): checkpoint floor, replay, state ring rows; 0 = off
-    uint32_t sj_kvarn_split_grid    = 0; // [#197] full grid mode: seal schedule on grid cells + ubatch split at grid lines
     uint32_t sj_kvarn_n_groups      = 0; // records per head in the pool
     uint32_t sj_kvarn_n_groups_seal = 0; // static per-ubatch seal launch size
     bool     sj_kvarn_fused_rot_on  = false; // #139, see sj_kvarn_fused_rot()
-    void sj_wush_upload(); // (re)upload sj_wush_host into the transform tensors
-    std::map<int32_t, sj_wush_layer> sj_wush;  // EXPERIMENTAL WUSH-KV, see get_sj_wush()
-    std::map<int32_t, std::vector<float>> sj_wush_host; // file contents per layer (AQ|AK|AV|AO), uploaded after the buffer clear
-    uint64_t sj_wush_hash = 0;                 // FNV-1a 64 of the transform file (0 = off)
     size_t   sj_kvarn_rec_bytes[2]  = {0, 0}; // per tier (0 interior, 1 edge)
     uint32_t sj_kvarn_n_layers_edge = 0;      // cache layers on tier 1 (first + last edge_layers)
-    // per-stream bookkeeping (one stream per sequence; a single-sequence cache has exactly one)
-    struct sj_kvarn_stream {
-        uint32_t B         = 0;     // sealed end
-        uint32_t B_pending = 0;     // proposed end, published after all layers complete
-        bool     draining  = false; // an adaptive-tail flush is being sealed in flush_chunk steps
-        uint32_t B_prev    = 0;     // sealed end before the current ubatch
-        uint32_t N         = 0;     // positions present
-        // positions [ring_lo, N) still hold their ring rows (lower ones were overwritten by p + cap or never
-        // restored); a body truncation may reopen sealed groups there
-        uint32_t ring_lo   = 0;
-        // paged pool only: logical group g of this stream lives in pool record table[g] (-1: not allocated).
-        // Groups [0, (B - sink)/group) are allocated, the rest are not.
-        std::vector<int32_t> table;
-    };
-    std::vector<sj_kvarn_stream> sj_kvarn_st;
-    // Paged record pool (n_stream > 1): records are handed out per group at seal time from a free list and
-    // reference counted (seq_cp shares sealed records, which are immutable). Phase 1 (per-stream contexts) sizes
-    // the pool for every stream at full length, so it never runs out; with --kv-unified the pool holds
-    // n_groups_seq records in total, shared by all streams, and prepare() refuses a ubatch that would need more.
-    bool     sj_kvarn_paged        = false;
-    bool     sj_kvarn_shared_pool  = false; // --kv-unified: one budget shared by all streams
-    uint32_t sj_kvarn_n_groups_seq = 0;     // logical groups one stream can address
-    uint32_t sj_kvarn_kv_rows      = 0;     // rows per stream of the K/V tensors (sink + ring + f16 sink rows)
-    std::vector<int32_t>  sj_kvarn_free;    // free pool records (stack)
-    std::vector<uint16_t> sj_kvarn_ref;     // per pool record reference count
-    void     sj_kvarn_reset_stream(uint32_t strm);              // drop all records and state of one stream
-    void     sj_kvarn_release_groups(uint32_t strm, uint32_t g0); // drop the stream's records of groups >= g0
-    bool     sj_kvarn_alloc_groups(uint32_t strm, uint32_t g0, uint32_t g1); // allocate records for groups [g0, g1)
+    uint32_t sj_kvarn_B      = 0;        // sealed end
+    uint32_t sj_kvarn_B_pending = 0;     // proposed end, published after all layers complete
+    bool     sj_kvarn_draining  = false; // an adaptive-tail flush is being sealed in flush_chunk steps
     uint64_t sj_kvarn_maintenance_count = 0;
     uint64_t sj_kvarn_maintenance_groups = 0;
+    uint32_t sj_kvarn_B_prev = 0;        // sealed end before the current ubatch
+    uint32_t sj_kvarn_N      = 0;        // positions present
 
     uint32_t sj_kvarn_ring_row(uint32_t pos) const { return pos < sj_kvarn.sink ? pos : sj_kvarn.sink + (pos - sj_kvarn.sink) % sj_kvarn_cap; }
 
@@ -457,8 +395,8 @@ private:
     uint32_t n_swa_sink = 0;
 
     // env: LLAMA_ATTN_ROT_DISABLE
-    uint32_t n_rot_k = 0;
-    uint32_t n_rot_v = 0;
+    bool attn_rot_k = false;
+    bool attn_rot_v = false;
 
     // the K rotation is the functional Hadamard transform of a DSA lightning-indexer cache (not tuning): the indexer
     // graphs of deepseek32/dots3note multiply by it as one full-width matrix, so it must span the whole head
@@ -476,8 +414,7 @@ private:
         ggml_cgraph * graph = nullptr;
         ggml_tensor * desc[2] = {nullptr, nullptr}; // per tier
     };
-    std::vector<std::vector<sj_kvarn_maintenance_graph>> sj_kvarn_maintenance_graphs; // [stream][backend]
-    bool maintain_sj_kvarn_stream(llama_context * lctx, uint32_t strm);
+    std::vector<sj_kvarn_maintenance_graph> sj_kvarn_maintenance_graphs;
 
     // pre-computed hadamard martrices
     std::unordered_map<int64_t, std::vector<float>> attn_rot_hadamard;
@@ -595,21 +532,6 @@ private:
     bool state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo);
 
     void state_clear(llama_seq_id seq_id, uint32_t strm, const slot_info & sinfo);
-
-    // SJ-KVaRN truncation into the sealed body (see the comment above sj_kvarn_truncate_body in llama-kv-cache.cpp)
-    uint32_t sj_kvarn_floor_g(uint32_t pos) const;
-    // [#197] the sealed-end schedule: B after one more ubatch starting in the grid cell at G (or at pos0 without grid)
-    uint32_t sj_kvarn_next_B(uint32_t B, uint32_t G) const;
-    // [#197] the sealed end a split-free prefill of [0, end) leaves (grid schedule only)
-    uint32_t sj_kvarn_replay_B(uint32_t end) const;
-    uint32_t sj_kvarn_seq_stream(llama_seq_id seq_id) const;
-    uint32_t sj_kvarn_reopen_lo(uint32_t s) const;
-    bool     sj_kvarn_truncate_target(uint32_t s, uint32_t p0, uint32_t & B_new) const;
-    bool     sj_kvarn_truncate_body(uint32_t s, uint32_t p0);
-
-    // SJ-KVaRN sequence state (format: see the comment above state_write_sj_kvarn in llama-kv-cache.cpp)
-    void state_write_sj_kvarn(llama_io_write_i & io, llama_seq_id seq_id) const;
-    void state_read_sj_kvarn (llama_io_read_i  & io, llama_seq_id seq_id);
 };
 
 class llama_kv_cache_context : public llama_memory_context_i {
@@ -682,11 +604,8 @@ public:
     ggml_tensor * get_sj_kvarn_body(int32_t il) const;
     const llama_sj_kvarn_config & get_sj_kvarn() const;
     bool sj_kvarn_fused_rot() const; // #139: the cache write rotates K/V (graph skips its K/V WHT)
-    const llama_kv_cache::sj_wush_layer * get_sj_wush(int32_t il) const; // EXPERIMENTAL WUSH-KV
-    ggml_tensor * build_input_sj_kvarn_desc(ggml_context * ctx, const llama_ubatch & ubatch) const;
+    ggml_tensor * build_input_sj_kvarn_desc(ggml_context * ctx) const;
     void set_input_sj_kvarn_desc(ggml_tensor * dst, const llama_ubatch * ubatch, int tier = 0) const;
-    // multi-stream caches: padded attended position count of each stream of the current ubatch (empty otherwise)
-    std::vector<uint32_t> get_sj_kvarn_n_kv_streams() const;
     int get_sj_kvarn_layer_tier(int32_t il, uint32_t & bits_k, uint32_t & bits_v) const;
     bool has_sj_kvarn_edge_tier() const;
     ggml_tensor * build_sj_kvarn_seal(ggml_context * ctx, ggml_tensor * k_store, ggml_tensor * v_store, ggml_tensor * desc, int32_t il) const;

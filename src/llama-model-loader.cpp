@@ -75,6 +75,11 @@ const char * llama_ftype_name(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_IQ1_M:     name = LLAMA_FTYPE_PREFIX "IQ1_M - 1.75 bpw"; break;
         case LLAMA_FTYPE_MOSTLY_IQ4_NL:    name = LLAMA_FTYPE_PREFIX "IQ4_NL - 4.5 bpw"; break;
         case LLAMA_FTYPE_MOSTLY_IQ4_XS:    name = LLAMA_FTYPE_PREFIX "IQ4_XS - 4.25 bpw"; break;
+        case LLAMA_FTYPE_MOSTLY_RQ4_G128:  name = LLAMA_FTYPE_PREFIX "RQ4_G128 - 4.125 bpw rotated W4A8"; break;
+        case LLAMA_FTYPE_MOSTLY_RQ4_G64:   name = LLAMA_FTYPE_PREFIX "RQ4_G64 - 4.25 bpw rotated W4A8"; break;
+        case LLAMA_FTYPE_MOSTLY_RQ4NL_G128: name = LLAMA_FTYPE_PREFIX "RQ4NL_G128 - 4.125 bpw rotated W4A8, IQ4_NL grid"; break;
+        case LLAMA_FTYPE_MOSTLY_RQ4NL_G64:  name = LLAMA_FTYPE_PREFIX "RQ4NL_G64 - 4.25 bpw rotated W4A8, IQ4_NL grid"; break;
+        case LLAMA_FTYPE_MOSTLY_AI4:       name = LLAMA_FTYPE_PREFIX "AI4 - 4.125 bpw Ampere INT4 trellis"; break;
         case LLAMA_FTYPE_MOSTLY_IQ3_S:     name = LLAMA_FTYPE_PREFIX "IQ3_S - 3.4375 bpw"; break;
         case LLAMA_FTYPE_MOSTLY_IQ3_M:     name = LLAMA_FTYPE_PREFIX "IQ3_S mix - 3.66 bpw"; break;
         default:                           name = LLAMA_FTYPE_PREFIX "unknown, may not work"; break;
@@ -727,6 +732,77 @@ llama_model_loader::llama_model_loader(
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
     }
 
+    // AIQ research overlay (private tooling, not for release): LLAMA_OVERLAY_GGUF=<file> + LLAMA_OVERLAY_RE=<regex>.
+    // Every overlay weight whose name matches the regex replaces (or adds) that weight, together with its EXL3 side
+    // vectors (<name>.suh / .svh); exl3_had128.weight is taken from the overlay when the main file lacks it. Lets one
+    // file's tensor groups be scored inside another file without writing a hybrid GGUF. Several overlays: separate
+    // the files and the regexes with '|' -> use LLAMA_OVERLAY_GGUF=a.gguf,b.gguf and LLAMA_OVERLAY_RE=re_a,,re_b
+    // (two commas separate the regexes).
+    if (const char * ov_env = getenv("LLAMA_OVERLAY_GGUF"); ov_env && *ov_env && !fname.empty()) {
+        std::vector<std::string> ov_files, ov_res;
+        {
+            std::string s = ov_env, r = getenv("LLAMA_OVERLAY_RE") ? getenv("LLAMA_OVERLAY_RE") : ".*";
+            for (size_t p = 0;;) { const size_t q = s.find(',', p); ov_files.push_back(s.substr(p, q - p)); if (q == std::string::npos) break; p = q + 1; }
+            for (size_t p = 0;;) { const size_t q = r.find(",,", p); ov_res.push_back(r.substr(p, q - p)); if (q == std::string::npos) break; p = q + 2; }
+            if (ov_res.size() != ov_files.size()) {
+                throw std::runtime_error(format("LLAMA_OVERLAY_RE: %zu regexes for %zu files", ov_res.size(), ov_files.size()));
+            }
+        }
+        for (size_t oi = 0; oi < ov_files.size(); ++oi) {
+            struct ggml_context * octx = NULL;
+            struct gguf_init_params oparams = { /*.no_alloc = */ true, /*.ctx = */ &octx };
+            gguf_context_ptr ogguf { gguf_init_from_file(ov_files[oi].c_str(), oparams) };
+            if (!ogguf) {
+                throw std::runtime_error(format("%s: failed to load overlay GGUF %s", __func__, ov_files[oi].c_str()));
+            }
+            const std::regex re(ov_res[oi]);
+            files.emplace_back(new llama_file(ov_files[oi].c_str(), "rb", use_direct_io));
+            contexts.emplace_back(octx);
+            const uint16_t oidx = (uint16_t) (files.size() - 1);
+            auto take = [&](ggml_tensor * cur) {
+                const std::string nm = cur->name;
+                auto it = weights_map.find(nm);
+                if (it != weights_map.end()) {
+                    n_elements -= ggml_nelements(it->second.tensor);
+                    n_bytes    -= ggml_nbytes(it->second.tensor);
+                    weights_map.erase(it);
+                }
+                n_elements += ggml_nelements(cur);
+                n_bytes    += ggml_nbytes(cur);
+                weights_map.emplace(nm, llama_tensor_weight(files.back().get(), oidx, ogguf.get(), cur));
+            };
+            int n_ov = 0;
+            for (ggml_tensor * cur = ggml_get_first_tensor(octx); cur; cur = ggml_get_next_tensor(octx, cur)) {
+                const std::string nm = cur->name;
+                if (nm.size() < 7 || nm.compare(nm.size() - 7, 7, ".weight") != 0) {
+                    continue;
+                }
+                const bool had = nm == "exl3_had128.weight";
+                if (had ? weights_map.find(nm) != weights_map.end() : !std::regex_match(nm, re)) {
+                    continue;
+                }
+                const std::string base = nm.substr(0, nm.size() - 7);
+                // drop the main file's side vectors of a replaced weight (an EXL3 weight replaced by a non-EXL3 one)
+                for (const char * sfx : { ".suh", ".svh" }) {
+                    auto it = weights_map.find(base + sfx);
+                    if (it != weights_map.end()) {
+                        n_elements -= ggml_nelements(it->second.tensor);
+                        n_bytes    -= ggml_nbytes(it->second.tensor);
+                        weights_map.erase(it);
+                    }
+                }
+                take(cur);
+                n_ov++;
+                for (const char * sfx : { ".suh", ".svh" }) {
+                    if (ggml_tensor * side = ggml_get_tensor(octx, (base + sfx).c_str())) {
+                        take(side);
+                    }
+                }
+            }
+            LLAMA_LOG_INFO("%s: overlay %s: %d weights matching '%s' taken\n", __func__, ov_files[oi].c_str(), n_ov, ov_res[oi].c_str());
+        }
+    }
+
     n_kv      = gguf_get_n_kv(metadata);
     n_tensors = weights_map.size();
 
@@ -800,6 +876,23 @@ llama_model_loader::llama_model_loader(
             case GGML_TYPE_IQ1_M:   ftype = LLAMA_FTYPE_MOSTLY_IQ1_M;   break;
             case GGML_TYPE_IQ4_NL:  ftype = LLAMA_FTYPE_MOSTLY_IQ4_NL;  break;
             case GGML_TYPE_IQ4_XS:  ftype = LLAMA_FTYPE_MOSTLY_IQ4_XS;  break;
+            case GGML_TYPE_AI4:     ftype = LLAMA_FTYPE_MOSTLY_AI4;     break; // AI4 (Ampere INT4, formerly D2)
+            case GGML_TYPE_AI4_U:   ftype = LLAMA_FTYPE_MOSTLY_AI4;     break; // AI+ unit-128 layout at the AI4 rate
+            case GGML_TYPE_AI5_U:   ftype = LLAMA_FTYPE_MOSTLY_AI4;     break; // AI+ unit-128 layout at rate 5
+            case GGML_TYPE_AI3_U:   ftype = LLAMA_FTYPE_MOSTLY_AI4;     break; // AI+ unit-128 layout at rate 3
+            case GGML_TYPE_AI2_U:   ftype = LLAMA_FTYPE_MOSTLY_AI4;     break; // AI+ unit-128 layout at rate 2
+            case GGML_TYPE_AI6_U:   ftype = LLAMA_FTYPE_MOSTLY_AI4;     break; // AI+ unit-128 layout at rate 6
+            case GGML_TYPE_AI6_UO:  ftype = LLAMA_FTYPE_MOSTLY_AI4;     break; // private A/B control, do not ship
+            case GGML_TYPE_AI5_UN:  ftype = LLAMA_FTYPE_MOSTLY_AI4;     break; // private A/B control, do not ship
+            case GGML_TYPE_AI2_S:   ftype = LLAMA_FTYPE_MOSTLY_AI4;     break; // AI+ span-1024 layout at rate 2
+            case GGML_TYPE_AI3_S:   ftype = LLAMA_FTYPE_MOSTLY_AI4;     break; // AI+ span-1024 layout at rate 3
+            case GGML_TYPE_AI4_S:   ftype = LLAMA_FTYPE_MOSTLY_AI4;     break; // AI+ span-1024 layout at rate 4
+            case GGML_TYPE_AI5_S:   ftype = LLAMA_FTYPE_MOSTLY_AI4;     break; // AI+ span-1024 layout at rate 5
+            case GGML_TYPE_AI6_S:   ftype = LLAMA_FTYPE_MOSTLY_AI4;     break; // AI+ span-1024 layout at rate 6
+            case GGML_TYPE_RQ4_G128: ftype = LLAMA_FTYPE_MOSTLY_RQ4_G128; break;
+            case GGML_TYPE_RQ4_G64:  ftype = LLAMA_FTYPE_MOSTLY_RQ4_G64;  break;
+            case GGML_TYPE_RQ4NL_G128: ftype = LLAMA_FTYPE_MOSTLY_RQ4NL_G128; break;
+            case GGML_TYPE_RQ4NL_G64:  ftype = LLAMA_FTYPE_MOSTLY_RQ4NL_G64;  break;
             case GGML_TYPE_IQ3_S:   ftype = LLAMA_FTYPE_MOSTLY_IQ3_S;   break;
             case GGML_TYPE_NVFP4:   ftype = LLAMA_FTYPE_MOSTLY_NVFP4;   break;
             case GGML_TYPE_Q1_0:    ftype = LLAMA_FTYPE_MOSTLY_Q1_0;    break;

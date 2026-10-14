@@ -292,7 +292,7 @@ void ggml_cuda_mul_mat_q(
     }
 
     const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * y_block_size/y_values_per_block +
-        ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne12) * sizeof(block_q8_1_mmq);
+        ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11) * sizeof(block_q8_1_mmq);
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
     ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
     if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4) {
@@ -356,6 +356,15 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
 #ifdef GGML_CUDA_FORCE_CUBLAS
     return false;
 #endif // GGML_CUDA_FORCE_CUBLAS
+    // AI4 (Ampere INT4, formerly D2): GGML_CUDA_FORCE_CUBLAS_RT=1 sends every MMQ-eligible matmul to the cuBLAS dequant path at run
+    // time (weight-only quantization error, the D-003 IQ4_XS control arm for AI4's cuBLAS path)
+    static const bool force_cublas_rt = [] {
+        const char * e = getenv("GGML_CUDA_FORCE_CUBLAS_RT");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    if (force_cublas_rt) {
+        return false;
+    }
 
     bool mmq_supported;
 

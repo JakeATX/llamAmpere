@@ -63,6 +63,10 @@ static const std::vector<quant_option> QUANT_OPTIONS = {
     { "Q3_K_L",   LLAMA_FTYPE_MOSTLY_Q3_K_L,   " 4.03G, +0.5562 ppl @ Llama-3-8B",  },
     { "IQ4_NL",   LLAMA_FTYPE_MOSTLY_IQ4_NL,   " 4.50 bpw non-linear quantization", },
     { "IQ4_XS",   LLAMA_FTYPE_MOSTLY_IQ4_XS,   " 4.25 bpw non-linear quantization", },
+    { "RQ4_G128", LLAMA_FTYPE_MOSTLY_RQ4_G128, " IQ4_XS mixture, IQ4_XS tensors -> Hadamard-rotated W4A8 4.125 bpw", },
+    { "RQ4_G64",  LLAMA_FTYPE_MOSTLY_RQ4_G64,  " IQ4_XS mixture, IQ4_XS tensors -> Hadamard-rotated W4A8 4.25 bpw", },
+    { "RQ4NL_G128", LLAMA_FTYPE_MOSTLY_RQ4NL_G128, " IQ4_XS mixture, IQ4_XS tensors -> rotated W4A8 IQ4_NL grid 4.125 bpw", },
+    { "RQ4NL_G64",  LLAMA_FTYPE_MOSTLY_RQ4NL_G64,  " IQ4_XS mixture, IQ4_XS tensors -> rotated W4A8 IQ4_NL grid 4.25 bpw", },
     { "Q4_K",     LLAMA_FTYPE_MOSTLY_Q4_K_M,   "alias for Q4_K_M",                  },
     { "Q4_K_S",   LLAMA_FTYPE_MOSTLY_Q4_K_S,   " 4.37G, +0.2689 ppl @ Llama-3-8B",  },
     { "Q4_K_M",   LLAMA_FTYPE_MOSTLY_Q4_K_M,   " 4.58G, +0.1754 ppl @ Llama-3-8B",  },
@@ -184,7 +188,17 @@ static void usage(const char * executable) {
         }
         printf("%-7s : %s\n", it.name.c_str(), it.desc.c_str());
     }
+    printf("\n  AI4 (Ampere INT4) is not made here: its trellis encoder runs on the GPU in llama-ai4-quantize, which\n"
+           "  re-encodes the IQ4_XS tensors of an IQ4_XS quant (the template) from the BF16 model (see docs/ai4.md)\n");
     exit(1);
+}
+
+// AI4 (formerly D2) has no llama-quantize ftype; say where it is made instead of only "invalid ftype"
+static void ai4_ftype_hint(const char * s) {
+    if (striequals(s, "AI4") || striequals(s, "D2")) {
+        fprintf(stderr, "note: %s is encoded on the GPU by llama-ai4-quantize from an IQ4_XS template, the BF16 model and "
+                        "an imatrix (see docs/ai4.md); llama-quantize cannot produce it\n", s);
+    }
 }
 
 static int load_imatrix(const std::string & imatrix_file, std::vector<std::string> & imatrix_datasets, std::unordered_map<std::string, std::vector<float>> & imatrix_data) {
@@ -601,10 +615,12 @@ int llama_quantize(int argc, char ** argv) {
 
         if (argc <= arg_idx) {
             fprintf(stderr, "%s: missing ftype\n", __func__);
+            ai4_ftype_hint(argv[arg_idx - 1]);
             return 1;
         }
         if (!try_parse_ftype(argv[arg_idx], params.ftype, ftype_str)) {
             fprintf(stderr, "%s: invalid ftype '%s'\n", __func__, argv[arg_idx]);
+            ai4_ftype_hint(argv[arg_idx]);
             return 1;
         }
         if (ftype_str == "COPY") {

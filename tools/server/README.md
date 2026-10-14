@@ -167,11 +167,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--kv-unified-per-slot N` | context limit per parallel slot (default: unset, behavior unchanged).<br/>when set without -c/--ctx-size, the shared KV pool is sized to n_parallel*N<br/>(env: LLAMA_ARG_KV_UNIFIED_PER_SLOT) |
 | `-ctxcp, --ctx-checkpoints, --swa-checkpoints N` | max number of context checkpoints to create per slot (default: 32)[(more info)](https://github.com/ggml-org/llama.cpp/pull/15293)<br/>(env: LLAMA_ARG_CTX_CHECKPOINTS) |
 | `-cms, --checkpoint-min-step N` | minimum spacing between context checkpoints in tokens (default: 8192, 0 = no minimum)<br/>(env: LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT) |
-| `-cram, --cache-ram N` | maximum RAM size of the prompt cache in MiB (default: sized from total host RAM: <16 GB 2048, 16 GB 4096, 32 GB 8192, 64 GB 12288, 96 GB 16384, 128 GB+ 20480, at most half of the available memory at startup; -1 = half of the free host memory at startup, 0 = disable)[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)<br/>(env: LLAMA_ARG_CACHE_RAM) |
-| `--cache-disk-path PATH` | directory of the prompt-cache disk tier: entries evicted from the RAM cache (and the cache at shutdown) are written here and restored on a later cache miss or after a restart instead of re-processing the prompt; created if missing (default: $XDG_CACHE_HOME/llamampere/prompt-cache, else ~/.cache/llamampere/prompt-cache)<br/>(env: LLAMA_ARG_CACHE_DISK_PATH) |
-| `--cache-disk-limit N` | size limit of the prompt-cache disk tier in MiB; the oldest-written entries are deleted first; writes are skipped while the filesystem has less than max(10%, 8 GiB) free (default: 16384, -1 = no limit, the free-space guard still applies, 0 = disable the disk tier)<br/>(env: LLAMA_ARG_CACHE_DISK_LIMIT) |
-| `--no-cache-disk` | disable the prompt-cache disk tier (RAM cache only)<br/>(env: LLAMA_ARG_NO_CACHE_DISK) |
-| `--cache-ram-checkpoints N` | RAM prompt cache: context checkpoints (hybrid/recurrent models) kept per cached entry: the N newest plus one each time the distance from the end doubles; an edit between two kept checkpoints re-processes from the earlier one. The active slot keeps all of its checkpoints. 0 = all (default: 4)<br/>(env: LLAMA_ARG_CACHE_RAM_CHECKPOINTS) |
+| `-cram, --cache-ram N` | set the maximum cache size in MiB (default: 8192, -1 - no limit, 0 - disable)[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)<br/>(env: LLAMA_ARG_CACHE_RAM) |
 | `-kvu, --kv-unified, -no-kvu, --no-kv-unified` | use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)<br/>(env: LLAMA_ARG_KV_UNIFIED) |
 | `--cache-idle-slots, --no-cache-idle-slots` | save idle slots to the prompt cache on new task, and clear them when using unified KV (default: enabled, requires cache-ram)<br/>(env: LLAMA_ARG_CACHE_IDLE_SLOTS) |
 | `--context-shift, --no-context-shift` | whether to use context shift on infinite text generation (default: disabled)<br/>(env: LLAMA_ARG_CONTEXT_SHIFT) |
@@ -1276,30 +1272,6 @@ Returns information about the loaded model. See [OpenAI Models API documentation
 
 The returned list always has one single element. The `meta` field can be `null` (for example, while the model is still loading).
 
-Each object in `data` has an `architecture` object. It has two string arrays:
-
-- `input_modalities` lists what the model can read. It always has `text`, plus each media type that the model supports.
-- `output_modalities` lists what the model can produce.
-
-One output value is special:
-
-| Value | Meaning |
-|---|---|
-| `decisions` | The model is a native decision model. Serve it with [`/v1/systemone`](#post-v1systemone-typesafe-compatible-system-one-api). |
-
-A language model that classifies with prompts does not get `decisions`. Only native decision models do.
-
-Check for membership. Tolerate values that you do not know:
-
-```js
-const useSystemOne =
-    model.architecture?.output_modalities?.includes("decisions") === true;
-```
-
-Without decision metadata, `output_modalities` is `["text"]`. This default is for compatibility only. It does not mean that the model can generate text. Values can change. New combinations such as `["text", "decisions"]` use the same shape.
-
-The router returns the same `architecture` object in [`GET /models`](#get-models-list-available-models). You can find a native decision model without a probe or a model load. This works for unloaded and sleeping models too. Older servers can omit `architecture`. If it is absent, use the legacy behavior of your client.
-
 By default, model `id` field is the path to model file, specified via `-m`. You can set a custom value for model `id` field via `--alias` argument. For example, `--alias gpt-4o-mini`.
 
 Example:
@@ -1311,10 +1283,6 @@ Example:
         {
             "id": "../models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
             "object": "model",
-            "architecture": {
-                "input_modalities": ["text"],
-                "output_modalities": ["text"]
-            },
             "created": 1735142223,
             "owned_by": "llamacpp",
             "meta": {
@@ -1731,11 +1699,9 @@ Follows the [TypeSafe API](https://docs.typesafe.ai/api), streaming is not suppo
 
 *Options:*
 
-`state`: The content to evaluate. Can be a string, an object or an array. A value that is not a string is given to the model as JSON text. For lfm2-d1 and lfm2-d1-omni, it can be `null`, for example to ask about images only.
+`state`: The content to evaluate. Can be a string, an object or an array. A value that is not a string is given to the model as JSON text.
 
-`files`: Optional. An array of input files, the maximum number may be limited depending on the model. Each one is a data URL (`data:image/...;base64,...`). For audio-capable models, it can be audio clips (`data:audio/...;base64,...`). See the image input section below.
-
-`images`: Optional. An alias of `files`.
+`images`: Optional. An array of images, the maximum number may be limited depending on the model. Each one is a data URL (`data:image/...;base64,...`). See the image input section below.
 
 `questions`: An object that maps a question id to a question. Each question has these fields:
 
@@ -1748,20 +1714,20 @@ Follows the [TypeSafe API](https://docs.typesafe.ai/api), streaming is not suppo
 
 The questions of a request are answered independently, an answer does not depend on the other questions. The exception is clef: it reads all the questions in one prompt and decides them jointly.
 
-The number of options of a `choice` question is limited by the model, for example: 52 for openjev, 255 for laya, clef, pplx-decider, lfm2-d1 and lfm2-d1-omni. For laya, long questions and options are truncated to the token budget the model was trained with.
+The number of options of a `choice` question is limited by the model, for example: 52 for openjev, 255 for laya and clef. For laya, long questions and options are truncated to the token budget the model was trained with.
 
-For laya, clef and lfm2-d1-omni, the whole prompt is evaluated in one batch: it must fit in `--ubatch-size`. An lfm2-d1-omni prompt is cut to 16384 tokens. A server that runs clef only serves this endpoint, text generation is not available.
+For laya and clef, the whole prompt is evaluated in one batch: it must fit in `--ubatch-size`. A server that runs clef only serves this endpoint, text generation is not available.
 
 *Image input:*
 
-Image input needs a model that supports it (for example: openjev, clef, pplx-decider, lfm2-d1, lfm2-d1-omni) and its multimodal projector, see `--mmproj`.
+Image input needs a model that supports it (for example: openjev) and its multimodal projector, see `--mmproj`. Image input is not supported yet for clef.
 
 Images can be given in two ways, and both can be used in the same request:
 
-- The `files` field, or its alias `images`.
-- A `state` made of chat messages, either an array of messages or an object with a `messages` array. An `image_url` part in the `content` of a message is taken as an image, in the same format as chat completions. Only data URLs are accepted. For lfm2-d1-omni, an `input_audio` part is taken as an audio clip, as base64 data.
+- The `images` field.
+- A `state` made of chat messages, either an array of messages or an object with a `messages` array. An `image_url` part in the `content` of a message is taken as an image, in the same format as chat completions. Only data URLs are accepted.
 
-All the images are placed before the state in the prompt, the ones from `files` and `images` first. The image parts are removed from the state.
+All the images are placed before the state in the prompt, the ones from `images` first. The image parts are removed from the state.
 
 *Response:*
 
@@ -2047,37 +2013,6 @@ Note:
     - If a model is running but updated or removed from the source, it will be unloaded
     - If a model is not running, it will be added or updated according to the source
 2. When the model is loaded, the info from `/v1/models` is forwarded to router's `/v1/models`. This includes metadata about the model and the runtime instance.
-
-Each object in `data` has the same `architecture` object as [`GET /v1/models`](#get-v1models-openai-compatible-model-info-api) of a direct server. The server computes both arrays offline. It does not load the model, download files, or run inference. `output_modalities` comes from the GGUF metadata. `input_modalities` comes from the projector file. A native decision model shows `decisions` before its first load, after unload, and while it sleeps:
-
-```json
-{
-  "object": "list",
-  "data": [
-    {
-      "id": "my-decision-model",
-      "object": "model",
-      "tags": ["local"],
-      "architecture": {
-        "input_modalities": ["text"],
-        "output_modalities": ["decisions"]
-      },
-      "status": {
-        "value": "unloaded"
-      }
-    }
-  ]
-}
-```
-
-The values work like this:
-
-- A loaded model reports both arrays. Its values replace the cached values in full.
-- The cache keeps the values across sleep and unload. A known decision model stays advertised.
-- Before the first report, the values come from the offline computation.
-- Offline computation cannot see video. Only a loaded model reports `video` in `input_modalities`.
-- If the metadata or the model file is not available, both arrays are `["text"]`.
-- A source or preset refresh computes both arrays again. A replaced model does not keep old values.
 
 The `status` object can be:
 

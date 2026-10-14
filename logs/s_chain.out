@@ -1,0 +1,6 @@
+Running as unit: run-p1840293-i6028225.service
+          Finished with result: success
+Main processes terminated with: code=exited, status=0/SUCCESS
+               Service runtime: 1min 49.490s
+             CPU time consumed: 3min 1.379s
+                   Memory peak: 1G (swap: 0B)

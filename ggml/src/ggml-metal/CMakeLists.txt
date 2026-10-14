@@ -54,7 +54,6 @@ set(METALLIB_KERNEL_SOURCES
     kernels/fa_vec_q5_1.metal
     kernels/fa_vec_q8_0.metal
     kernels/mul_mv.metal
-    kernels/mul_mv_mma.metal
     kernels/mul_mm.metal
     kernels/quantize.metal
     kernels/softmax.metal

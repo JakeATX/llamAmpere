@@ -1,5 +1,4 @@
 #include "ggml.h"
-#include "ggml-cpp.h"
 #include "gguf.h"
 
 #include "build-info.h"
@@ -1013,114 +1012,6 @@ std::filesystem::path fs_get_cache_directory() {
     return cache_directory / "llama.cpp";
 }
 
-//
-// Prompt-cache defaults
-//
-
-bool common_host_memory(uint64_t & total, uint64_t & available) {
-    total     = 0;
-    available = 0;
-#if defined(_WIN32)
-    MEMORYSTATUSEX st;
-    st.dwLength = sizeof(st);
-    if (GlobalMemoryStatusEx(&st)) {
-        total     = st.ullTotalPhys;
-        available = st.ullAvailPhys;
-    }
-#elif defined(__APPLE__) && defined(__MACH__)
-    uint64_t memsize = 0;
-    size_t   len     = sizeof(memsize);
-    if (sysctlbyname("hw.memsize", &memsize, &len, nullptr, 0) == 0) {
-        total = memsize;
-    }
-    // no MemAvailable equivalent that is cheap and stable: take the total, the clamp is then a no-op
-    available = total;
-#else
-    std::ifstream f("/proc/meminfo");
-    std::string   key;
-    uint64_t      value = 0;
-    std::string   unit;
-    while (f >> key >> value >> unit) {
-        if (key == "MemTotal:") {
-            total = value * 1024;
-        } else if (key == "MemAvailable:") {
-            available = value * 1024;
-        }
-    }
-    if (total == 0) {
-        long pages = sysconf(_SC_PHYS_PAGES);
-        long psize = sysconf(_SC_PAGE_SIZE);
-        if (pages > 0 && psize > 0) {
-            total = (uint64_t) pages * (uint64_t) psize;
-        }
-    }
-    if (available == 0) {
-        available = total;
-    }
-#endif
-    return total > 0;
-}
-
-int32_t common_prompt_cache_ram_auto_mib(uint64_t total, uint64_t available, std::string & why) {
-    static const struct { uint32_t gb; int32_t mib; } tiers[] = {
-        { 128, 20480 }, { 96, 16384 }, { 64, 12288 }, { 32, 8192 }, { 16, 4096 },
-    };
-    const uint64_t GiB = 1024ull*1024ull*1024ull;
-
-    if (total == 0) {
-        why = "host memory unknown, using the smallest tier";
-        return 2048;
-    }
-
-    int32_t  mib  = 2048;
-    uint32_t tier = 0;
-    for (const auto & t : tiers) {
-        // within 10% below the nominal size counts: a 64 GB machine reports ~61 GiB
-        if ((double) total >= 0.9 * (double) t.gb * (double) GiB) {
-            mib  = t.mib;
-            tier = t.gb;
-            break;
-        }
-    }
-
-    char buf[256];
-    if (tier > 0) {
-        snprintf(buf, sizeof(buf), "%.1f GiB total host memory (>= %u GB tier)", total / (double) GiB, tier);
-    } else {
-        snprintf(buf, sizeof(buf), "%.1f GiB total host memory (< 16 GB tier)", total / (double) GiB);
-    }
-    why = buf;
-
-    const uint64_t half_avail_mib = available / 2 / (1024*1024);
-    if (available > 0 && (uint64_t) mib > half_avail_mib) {
-        mib = (int32_t) std::max<uint64_t>(half_avail_mib, 1);
-        snprintf(buf, sizeof(buf), ", clamped to half of the %.1f GiB available", available / (double) GiB);
-        why += buf;
-    }
-
-    return mib;
-}
-
-std::filesystem::path common_prompt_cache_default_dir() try {
-    std::filesystem::path base;
-#if defined(_WIN32)
-    base = common_get_path_from_env("LOCALAPPDATA");
-    if (base.empty()) {
-        return {};
-    }
-#elif defined(__APPLE__)
-    base = get_home_directory() / "Library/Caches";
-#else
-    base = common_get_path_from_env("XDG_CACHE_HOME");
-    if (base.empty()) {
-        base = get_home_directory() / ".cache";
-    }
-#endif
-    return base / "llamampere" / "prompt-cache";
-} catch (const std::exception &) {
-    return {}; // no home directory: the server runs without a disk tier
-}
-
 std::filesystem::path fs_get_config_directory() {
     std::filesystem::path config_directory;
 #if defined(_WIN32)
@@ -1146,6 +1037,47 @@ std::filesystem::path fs_get_cache_file(const std::string & filename) {
         throw std::runtime_error("failed to create cache directory: " + fs_path_to_utf8(cache_directory));
     }
     return cache_directory / std::filesystem::u8path(filename);
+}
+
+std::vector<common_file_info> fs_list(const std::string & path, bool include_directories) {
+    std::vector<common_file_info> files;
+    if (path.empty()) return files;
+
+    std::filesystem::path dir(path);
+    if (!std::filesystem::exists(dir) || !std::filesystem::is_directory(dir)) {
+        return files;
+    }
+
+    for (const auto & entry : std::filesystem::directory_iterator(dir)) {
+        try {
+            // Only include regular files (skip directories)
+            const auto & p = entry.path();
+            if (std::filesystem::is_regular_file(p)) {
+                common_file_info info;
+                info.path   = p.string();
+                info.name   = p.filename().string();
+                info.is_dir = false;
+                try {
+                    info.size = static_cast<size_t>(std::filesystem::file_size(p));
+                } catch (const std::filesystem::filesystem_error &) {
+                    info.size = 0;
+                }
+                files.push_back(std::move(info));
+            } else if (include_directories && std::filesystem::is_directory(p)) {
+                common_file_info info;
+                info.path   = p.string();
+                info.name   = p.filename().string();
+                info.size   = 0; // Directories have no size
+                info.is_dir = true;
+                files.push_back(std::move(info));
+            }
+        } catch (const std::filesystem::filesystem_error &) {
+            // skip entries we cannot inspect
+            continue;
+        }
+    }
+
+    return files;
 }
 
 //
@@ -1178,20 +1110,6 @@ bool tty_can_use_colors() {
     // Check if stdout and stderr are connected to a terminal
     // We check both because log messages can go to either
     return common_is_tty(stdout) || common_is_tty(stderr);
-}
-
-bool tty_enable_ansi() {
-#if defined(_WIN32)
-    // a Windows console renders ANSI sequences only in virtual terminal mode, pipes and files take them as is
-    for (DWORD id : { STD_OUTPUT_HANDLE, STD_ERROR_HANDLE }) {
-        HANDLE h    = GetStdHandle(id);
-        DWORD  mode = 0;
-        if (GetConsoleMode(h, &mode) && !SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING)) {
-            return false;
-        }
-    }
-#endif
-    return true;
 }
 
 //
@@ -1277,15 +1195,12 @@ struct common_init_result::impl {
 };
 
 static const std::map<common_decision_type, std::string> COMMON_DECISION_TYPE_NAMES = {
-    { COMMON_DECISION_TYPE_OPENJEV,        "openjev"       },
-    { COMMON_DECISION_TYPE_LEV,            "lev"           },
-    { COMMON_DECISION_TYPE_KEV,            "kev"           },
-    { COMMON_DECISION_TYPE_NIMBLE,         "nimble"        },
-    { COMMON_DECISION_TYPE_LAYA,           "laya"          },
-    { COMMON_DECISION_TYPE_CLEF,           "clef"          },
-    { COMMON_DECISION_TYPE_PPLX_DECIDER,   "pplx-decider"  },
-    { COMMON_DECISION_TYPE_LFM2_D1,        "lfm2-d1"       },
-    { COMMON_DECISION_TYPE_LFM2_D1_OMNI,   "lfm2-d1-omni"  },
+    { COMMON_DECISION_TYPE_OPENJEV, "openjev" },
+    { COMMON_DECISION_TYPE_LEV,     "lev"     },
+    { COMMON_DECISION_TYPE_KEV,     "kev"     },
+    { COMMON_DECISION_TYPE_NIMBLE,  "nimble"  },
+    { COMMON_DECISION_TYPE_LAYA,    "laya"    },
+    { COMMON_DECISION_TYPE_CLEF,    "clef"    },
 };
 
 static common_decision_type common_decision_type_from_string(const std::string & str) {
@@ -1307,41 +1222,6 @@ common_decision_type common_get_decision_type(const struct llama_model * model) 
         return COMMON_DECISION_TYPE_NONE;
     }
     return common_decision_type_from_string(buf);
-}
-
-common_decision_type common_get_decision_type(const std::string & fname) {
-    struct gguf_init_params gguf_params = {
-        /* .no_alloc = */ true,
-        /* .ctx      = */ nullptr,
-    };
-
-    gguf_context_ptr gguf_ctx(gguf_init_from_file(fname.c_str(), gguf_params));
-    if (!gguf_ctx) {
-        return COMMON_DECISION_TYPE_UNKNOWN; // missing or unreadable file
-    }
-
-    std::string arch;
-    const int64_t arch_id = gguf_find_key(gguf_ctx.get(), "general.architecture");
-    if (arch_id < 0) {
-        return COMMON_DECISION_TYPE_UNKNOWN; // no architecture in the metadata
-    }
-    if (gguf_get_kv_type(gguf_ctx.get(), arch_id) != GGUF_TYPE_STRING) {
-        return COMMON_DECISION_TYPE_UNKNOWN; // malformed metadata
-    }
-    arch = gguf_get_val_str(gguf_ctx.get(), arch_id);
-    if (arch.empty()) {
-        return COMMON_DECISION_TYPE_UNKNOWN;
-    }
-
-    const std::string key = arch + ".decision.type";
-    const int64_t type_id = gguf_find_key(gguf_ctx.get(), key.c_str());
-    if (type_id < 0) {
-        return COMMON_DECISION_TYPE_NONE;
-    }
-    if (gguf_get_kv_type(gguf_ctx.get(), type_id) != GGUF_TYPE_STRING) {
-        return COMMON_DECISION_TYPE_UNKNOWN; // malformed metadata
-    }
-    return common_decision_type_from_string(gguf_get_val_str(gguf_ctx.get(), type_id));
 }
 
 common_init_result::common_init_result(common_params & params, bool model_only) :
@@ -1455,8 +1335,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     // these decision models return a score for each token via the embeddings output
     // TODO: maybe improve this in the future
     const auto decision_type = common_get_decision_type(model);
-    if (decision_type == COMMON_DECISION_TYPE_LAYA || decision_type == COMMON_DECISION_TYPE_KEV || decision_type == COMMON_DECISION_TYPE_CLEF ||
-        decision_type == COMMON_DECISION_TYPE_LFM2_D1_OMNI) {
+    if (decision_type == COMMON_DECISION_TYPE_LAYA || decision_type == COMMON_DECISION_TYPE_KEV || decision_type == COMMON_DECISION_TYPE_CLEF) {
         params.embedding    = true;
         params.pooling_type = LLAMA_POOLING_TYPE_NONE;
 
@@ -1883,8 +1762,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.progress_callback           = params.load_progress_callback;
     mparams.progress_callback_user_data = params.load_progress_callback_user_data;
     mparams.no_alloc                    = params.no_alloc;
-    mparams.load_mtp                    = params.load_mtp ||
-                                          std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end() ||
+    mparams.load_mtp                    = std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end() ||
                                           std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE) != params.speculative.types.end();
 
     return mparams;
@@ -1948,7 +1826,6 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.sj_kvarn_edge_bits_k = params.sj_kvarn_edge_bits_k;
     cparams.sj_kvarn_edge_bits_v = params.sj_kvarn_edge_bits_v;
     cparams.sj_kvarn_flush_chunk = params.sj_kvarn_flush_chunk;
-    cparams.sj_kvarn_transform = params.sj_kvarn_transform.empty() ? nullptr : params.sj_kvarn_transform.c_str();
     cparams.type_s = params.cache_type_s;
 
     if (params.moe_cache.mode_explicit) {
@@ -1966,8 +1843,6 @@ struct llama_context_params common_context_params_to_llama(const common_params &
         }
     }
     cparams.moe_cache_budget_mib = params.moe_cache.budget_mib;
-
-    cparams.moe_cache_size = params.moe_cache_size;
 
     return cparams;
 }
@@ -2633,21 +2508,12 @@ void common_prompt_checkpoint::update_pos(
 void common_prompt_checkpoint::update_tgt(
         llama_context * ctx,
         llama_seq_id seq_id,
-        llama_state_seq_flags flags,
-        std::vector<uint8_t> * spare) {
+        llama_state_seq_flags flags) {
     if (ctx == nullptr) {
         return;
     }
 
     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
-
-    // reuse the spare only when it fits without growing and without wasting more than 1/8 of it
-    if (spare != nullptr && data_tgt.capacity() < ckpt_size &&
-            spare->size() >= ckpt_size && spare->size() - ckpt_size <= ckpt_size / 8) {
-        data_tgt.swap(*spare);
-        spare->clear();
-        spare->shrink_to_fit();
-    }
 
     data_tgt.resize(ckpt_size);
 

@@ -4,32 +4,25 @@
 
 #include <cstdlib>
 
-#ifndef GGML_SJKVARN_TRELLIS_PREFILL_MIB_DEFAULT
-#define GGML_SJKVARN_TRELLIS_PREFILL_MIB_DEFAULT 64
-#endif
-
 // Expand each packed tile once, then share the result across all query tiles in ordinary f16 attention.
 static __global__ void fattn_sj_kvarn_expand_prefill(
         const char * K, const char * V, const char * body, const int32_t * desc,
         const size_t k_row_stride, const size_t k_head_stride,
         const size_t v_row_stride, const size_t v_head_stride,
-        half2 * K_out, half2 * V_out, const int n_out, const int p_begin, const int head_first, const bool skip_body) {
+        half2 * K_out, half2 * V_out, const int n_kv, const int head_first) {
     constexpr int D2 = 128;
     constexpr int rows = 16;
     extern __shared__ half2 tile[];
     const int tid = threadIdx.y*32 + threadIdx.x;
-    const int p0 = p_begin + blockIdx.x*rows; // [TRPF] positions [p_begin, p_begin + n_out) land at rows [0, n_out)
+    const int p0 = blockIdx.x*rows;
     const int head = head_first + blockIdx.y;
     const fattn_sj_kvarn_ctx kv = fattn_sj_kvarn_make_ctx(body, desc, head, 2*D2, 4, 4, k_head_stride, v_head_stride);
-    const size_t out_offset = ((size_t) blockIdx.y*n_out + (p0 - p_begin))*D2;
+    const size_t out_offset = ((size_t) blockIdx.y*n_kv + p0)*D2;
 
     if (p0 >= kv.S && p0 < kv.B) {
-        if (skip_body) {
-            return; // trellis body: ggml_cuda_sj_kvarn_trellis_expand_body (fattn-sjkvarn-lowbits.cu) writes these rows
-        }
         const int group = (p0 - kv.S)/kv.G;
         const int token = (p0 - kv.S)%kv.G;
-        const char * rec = fattn_sj_kvarn_rec(kv, group);
+        const char * rec = kv.body + (size_t) group*kv.rec_stride;
         flash_attn_ext_sj_kvarn_load_tile<D2, false, rows, 256, D2, false, false>(rec, token, kv, tile, rows);
         __syncthreads();
         for (int i = tid; i < rows*D2; i += 256) {
@@ -96,49 +89,6 @@ static size_t fattn_sj_kvarn_prefill_budget() {
     return budget;
 }
 
-// [TRPF] 2/3-bit trellis bodies (3/3, 3/2, 2/2 with body type I16) take the same expand-once path: the body records are
-// decoded by ggml_cuda_sj_kvarn_trellis_expand_body with the fused kernel's own tile loader (identical f16 values), the
-// sink/ring rows by fattn_sj_kvarn_expand_prefill. Before this, n_q >= 128 trellis attention re-decoded every KV tile once
-// per query tile in the one-stage low-bit tile kernel. GGML_SJKVARN_TRELLIS_EXPAND=0 restores that path.
-// [TRPF] Scratch cap for trellis bodies (GGML_SJKVARN_TRELLIS_PREFILL_MIB, MiB). The trellis pairs are the low-VRAM
-// configurations (the 12 GB default runs 3/3t at 204,800), so they get their own, smaller cap: when all KV heads' f16
-// K/V do not fit, the KV axis is cut into chunks that do (fattn_sj_kvarn_prefill_plan::chunked) instead of head groups.
-static size_t fattn_sj_kvarn_prefill_trellis_budget() {
-    static const size_t budget = [] {
-        constexpr size_t def = size_t(GGML_SJKVARN_TRELLIS_PREFILL_MIB_DEFAULT) << 20;
-        const char * value = getenv("GGML_SJKVARN_TRELLIS_PREFILL_MIB");
-        if (value == nullptr) {
-            return def;
-        }
-        char * end = nullptr;
-        const long mib = strtol(value, &end, 10);
-        if (end == value || *end != '\0' || mib < 0 || mib > 16384) {
-            return def;
-        }
-        return size_t(mib) << 20;
-    }();
-    return budget;
-}
-
-static bool fattn_sj_kvarn_prefill_trellis(const ggml_tensor * dst) {
-    static const bool enabled = [] {
-        const char * value = getenv("GGML_SJKVARN_TRELLIS_EXPAND");
-        return value == nullptr || atoi(value) != 0;
-    }();
-    const int bits_pair = ggml_get_op_params_i32(dst, 5);
-    return enabled && ggml_get_op_params_i32(dst, 7) == GGML_TYPE_I16 &&
-        (bits_pair == ((3 << 8) | 3) || bits_pair == ((3 << 8) | 2) || bits_pair == ((2 << 8) | 2));
-}
-
-void ggml_cuda_sj_kvarn_trellis_expand_body(int bits_pair, const char * body, const int32_t * desc,
-        size_t k_head_stride, size_t v_head_stride, half2 * K_out, half2 * V_out, int n_out, int p_begin, int heads,
-        int head_first, cudaStream_t stream); // fattn-sjkvarn-lowbits.cu
-void ggml_cuda_sj_kvarn_prefill_partial(ggml_backend_cuda_context & ctx, ggml_tensor * dst, float * parts, float2 * meta); // fattn.cu
-void ggml_cuda_sj_kvarn_prefill_accumulate(const float * parts, const float2 * meta, float * acc, float2 * acc_meta,
-        int nrows, bool initialize, cudaStream_t stream); // fattn.cu
-void ggml_cuda_sj_kvarn_prefill_normalize(const float * acc, const float2 * acc_meta, float * dst, int nrows,
-        cudaStream_t stream); // fattn.cu
-
 // One plan decides eligibility and sizes for the executor below and for the allocator
 // (ggml_cuda_flash_attn_ext_sj_kvarn_prefill_alloc_size, called from ggml_cuda_flash_attn_ext_get_alloc_size), so they
 // cannot disagree. n_kv_max >= n_kv (0 = n_kv) only widens the reservation bound; the executor's grouping depends on
@@ -151,14 +101,7 @@ struct fattn_sj_kvarn_prefill_plan {
     size_t output_elements_per_head = 0;
     size_t kv_elements      = 0;     // one group's f16 K elements (V has as many)
     size_t output_bytes     = 0;     // one group's f32 output temporary (grouped only)
-    size_t scratch_bytes    = 0;     // 2*kv_elements*2 + output_bytes (chunked: K/V chunk + parts + metas)
-    // [TRPF] chunked (trellis only): all KV heads, KV positions in chunks of chunk_kv, queries in launches of work_q;
-    // each launch writes unnormalized partials that are folded into dst (numerator) + acc_meta (max, sum).
-    bool   chunked          = false;
-    int    chunk_kv         = 0;
-    int    work_q           = 0;
-    size_t parts_bytes      = 0;     // work_q*n_head*256 floats
-    size_t meta_bytes       = 0;     // work_q*n_head float2
+    size_t scratch_bytes    = 0;     // 2*kv_elements*2 + output_bytes
 };
 
 static fattn_sj_kvarn_prefill_plan fattn_sj_kvarn_prefill_make_plan(const int cc, const ggml_tensor * dst) {
@@ -167,17 +110,15 @@ static fattn_sj_kvarn_prefill_plan fattn_sj_kvarn_prefill_make_plan(const int cc
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
     const int n_kv = ggml_get_op_params_i32(dst, 6);
-    const int bits_pair = ggml_get_op_params_i32(dst, 5);
-    const bool trellis = fattn_sj_kvarn_prefill_trellis(dst);
-    const size_t budget = trellis ? fattn_sj_kvarn_prefill_trellis_budget() : fattn_sj_kvarn_prefill_budget();
-    if (budget == 0 || Q->ne[1] < 128 || !ampere_mma_available(cc) || (ggml_get_op_params_i32(dst, 7) == GGML_TYPE_I16 && !trellis) ||
+    const size_t budget = fattn_sj_kvarn_prefill_budget();
+    if (budget == 0 || Q->ne[1] < 128 || !ampere_mma_available(cc) || ggml_get_op_params_i32(dst, 7) == GGML_TYPE_I16 ||
             Q->ne[3] != 1 || K->ne[3] != 1 || V->ne[3] != 1 ||
             Q->ne[0] != 256 || K->ne[0] != 256 || V->ne[0] != 256 ||
             (K->type != GGML_TYPE_F16 && K->type != GGML_TYPE_Q8_0 && K->type != GGML_TYPE_TQ6_0) ||
             (V->type != GGML_TYPE_F16 && V->type != GGML_TYPE_Q8_0 && V->type != GGML_TYPE_TQ6_0) ||
             K->ne[2] != V->ne[2] || K->ne[2] <= 0 || K->ne[2] > 65535 ||
             dst->src[5] == nullptr || dst->src[6] == nullptr ||
-            (bits_pair != ((4 << 8) | 4) && !trellis) || n_kv <= 0 || n_kv % 256 != 0) {
+            ggml_get_op_params_i32(dst, 5) != ((4 << 8) | 4) || n_kv <= 0 || n_kv % 256 != 0) {
         return p;
     }
     // [#139] a fused-rotation node is planned like the unflagged copy that ggml_cuda_flash_attn_ext_sj_kvarn_rot_unfused
@@ -190,49 +131,6 @@ static fattn_sj_kvarn_prefill_plan fattn_sj_kvarn_prefill_make_plan(const int cc
     const size_t output_bytes_per_head = output_elements_per_head*sizeof(float);
     const bool grouped = size_t(K->ne[2]) > budget/kv_bytes_per_head;
     int heads_per_group = K->ne[2];
-    static const bool kv_chunks = [] {
-        const char * value = getenv("GGML_SJKVARN_PREFILL_KV_CHUNKS");
-        return value == nullptr || atoi(value) != 0;
-    }();
-    // [TRPF] test hook: GGML_SJKVARN_PREFILL_CHUNK_KV=<multiple of 256> forces the chunked plan with at most that many
-    // KV positions per chunk, so the op tests (small KV) exercise the partial + fold path.
-    static const int force_chunk_kv = [] {
-        const char * value = getenv("GGML_SJKVARN_PREFILL_CHUNK_KV");
-        const int v = value ? atoi(value) : 0;
-        return v >= 256 && v % 256 == 0 ? v : 0;
-    }();
-    if ((grouped || force_chunk_kv > 0) && trellis && kv_chunks && dst->src[3] != nullptr && dst->src[3]->ne[2] == 1 && dst->src[3]->ne[3] == 1 &&
-            Q->ne[2] % K->ne[2] == 0 && gqa <= 8 && ggml_is_contiguous(dst)) {
-        // [TRPF] KV chunks: K/V chunk (all heads) + one launch's partials + metas + the running (max, sum) per row
-        const size_t n_head = Q->ne[2];
-        const size_t acc_meta_bytes = size_t(Q->ne[1])*n_head*sizeof(float2);
-        const size_t per_query = n_head*(256*sizeof(float) + sizeof(float2));
-        int64_t work_q = Q->ne[1];
-        while (work_q > 64 && acc_meta_bytes + work_q*per_query > budget/2) {
-            work_q = GGML_PAD(work_q/2, 64);
-        }
-        const size_t fixed = acc_meta_bytes + size_t(work_q)*per_query;
-        const size_t kv_bytes_per_token = size_t(K->ne[2])*2*256*sizeof(half);
-        int64_t chunk_kv = fixed < budget ? int64_t((budget - fixed)/kv_bytes_per_token/256*256) : 0;
-        if (force_chunk_kv > 0) {
-            chunk_kv = std::min<int64_t>(std::max<int64_t>(chunk_kv, 256), force_chunk_kv);
-        }
-        if (chunk_kv >= 256) {
-            p.ok = true;
-            p.chunked = true;
-            p.chunk_kv = int(std::min<int64_t>(chunk_kv, n_kv));
-            p.work_q = int(work_q);
-            p.parts_bytes = size_t(work_q)*n_head*256*sizeof(float);
-            p.meta_bytes = size_t(work_q)*n_head*sizeof(float2);
-            p.heads_per_group = K->ne[2];
-            p.kv_elements_per_head = size_t(p.chunk_kv)*256;
-            p.kv_elements = p.kv_elements_per_head*K->ne[2];
-            p.output_elements_per_head = output_elements_per_head;
-            p.scratch_bytes = GGML_PAD(2*p.kv_elements*sizeof(half), 128) + GGML_PAD(p.parts_bytes, 128) +
-                GGML_PAD(p.meta_bytes, 128) + acc_meta_bytes;
-            return p;
-        }
-    }
     if (grouped) {
         static const bool head_groups = [] {
             const char * value = getenv("GGML_SJKVARN_PREFILL_HEAD_GROUPS");
@@ -271,16 +169,9 @@ size_t ggml_cuda_flash_attn_ext_sj_kvarn_prefill_alloc_size(const int device, co
         return 0;
     }
     const size_t n_head_kv = dst->src[1]->ne[2];
-    const size_t budget = fattn_sj_kvarn_prefill_trellis(dst) ? fattn_sj_kvarn_prefill_trellis_budget() : fattn_sj_kvarn_prefill_budget();
     const size_t bound = std::max(p.scratch_bytes,
-        std::min(budget, n_head_kv*2*size_t(ggml_get_op_params_i32(dst, 6))*256*sizeof(half)));
+        std::min(fattn_sj_kvarn_prefill_budget(), n_head_kv*2*p.kv_elements_per_head*sizeof(half)));
     return GGML_PAD(ggml_nbytes(dst), 128) + bound;
-}
-
-// [TRPF] host predicate for the low-bit dispatch: true when the executor below will take this node (a fused-rotation
-// node is planned like its unflagged copy, so the caller can route it through the separate rotation passes first).
-bool ggml_cuda_flash_attn_ext_sj_kvarn_prefill_applies(const int device, const ggml_tensor * dst) {
-    return fattn_sj_kvarn_prefill_make_plan(ggml_cuda_info().devices[device].cc, dst).ok;
 }
 
 bool ggml_cuda_flash_attn_ext_sj_kvarn_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -292,7 +183,6 @@ bool ggml_cuda_flash_attn_ext_sj_kvarn_prefill(ggml_backend_cuda_context & ctx, 
     if (!plan.ok) {
         return false;
     }
-    const bool trellis = fattn_sj_kvarn_prefill_trellis(dst);
     GGML_ASSERT(!ggml_cuda_fattn_sj_kvarn_rot(dst)); // [#139] no in-kernel rotation: fattn.cu runs it in separate passes
     const int gqa = Q->ne[2]/K->ne[2];
     const bool grouped = plan.grouped;
@@ -317,93 +207,6 @@ bool ggml_cuda_flash_attn_ext_sj_kvarn_prefill(ggml_backend_cuda_context & ctx, 
         return value != nullptr && value[0] == '1';
     }();
 
-    if (plan.chunked) {
-        // [TRPF] KV chunks: expand positions [c0, c0 + cn) of every KV head, run the f16 MMA kernel in partial mode on
-        // them (one launch per work_q queries), fold each launch into dst (unnormalized numerator) and acc_meta
-        // (running max, sum), and normalize once at the end. Attention sinks count once: only the first chunk sees them.
-        const int heads = K->ne[2];
-        const int n_head = Q->ne[2];
-        const int chunk_kv = plan.chunk_kv;
-        half * K_chunk = scratch_ptr;
-        char * tail = (char *) scratch_ptr + GGML_PAD(2*kv_elements*sizeof(half), 128);
-        float  * parts    = (float *) tail;
-        float2 * meta     = (float2 *) (tail + GGML_PAD(plan.parts_bytes, 128));
-        float2 * acc_meta = (float2 *) (tail + GGML_PAD(plan.parts_bytes, 128) + GGML_PAD(plan.meta_bytes, 128));
-        float  * acc      = (float *) dst->data;
-        const ggml_tensor * mask = dst->src[3];
-        if (trace) {
-            GGML_LOG_INFO("SJ-KVaRN prefill: queries=%lld positions=%d kv_heads=%d chunk=%d work_q=%d scratch=%zu KiB chunked%s\n",
-                (long long) Q->ne[1], n_kv, heads, chunk_kv, plan.work_q, plan.scratch_bytes/1024, reserved ? " reserved" : " pool");
-        }
-        for (int c0 = 0; c0 < n_kv; c0 += chunk_kv) {
-            const int cn = std::min(chunk_kv, n_kv - c0);
-            const size_t elements = size_t(cn)*256*heads;
-            const ggml_cuda_kernel_launch_params launch_params(dim3(cn/16, heads, 1), dim3(32, 8, 1), 16*128*sizeof(half2), ctx.stream());
-            ggml_cuda_kernel_launch(fattn_sj_kvarn_expand_prefill, launch_params,
-                (const char *) K->data, (const char *) V->data,
-                (const char *) dst->src[5]->data, (const int32_t *) dst->src[6]->data,
-                K->nb[1], K->nb[2], V->nb[1], V->nb[2],
-                (half2 *) K_chunk, (half2 *) (K_chunk + elements), cn, c0, 0, true);
-            CUDA_CHECK(cudaGetLastError());
-            ggml_cuda_sj_kvarn_trellis_expand_body(ggml_get_op_params_i32(dst, 5), (const char *) dst->src[5]->data,
-                (const int32_t *) dst->src[6]->data, K->nb[2], V->nb[2],
-                (half2 *) K_chunk, (half2 *) (K_chunk + elements), cn, c0, heads, 0, ctx.stream());
-
-            ggml_tensor k = *K;
-            ggml_tensor v = *V;
-            for (ggml_tensor * t : {&k, &v}) {
-                t->type = GGML_TYPE_F16;
-                t->ne[1] = cn;
-                t->ne[2] = heads;
-                t->nb[0] = sizeof(half);
-                for (int d = 1; d < GGML_MAX_DIMS; ++d) {
-                    t->nb[d] = t->nb[d - 1]*t->ne[d - 1];
-                }
-                t->view_src = nullptr;
-                t->view_offs = 0;
-            }
-            k.data = K_chunk;
-            v.data = K_chunk + elements;
-
-            for (int64_t q0 = 0; q0 < Q->ne[1]; q0 += plan.work_q) {
-                const int64_t qn = std::min<int64_t>(plan.work_q, Q->ne[1] - q0);
-                ggml_tensor q = *Q;
-                q.data = (char *) Q->data + q0*Q->nb[1];
-                q.ne[1] = qn;
-                ggml_tensor m = *mask;
-                m.data = (char *) mask->data + q0*mask->nb[1] + size_t(c0)*mask->nb[0];
-                m.ne[0] = cn;
-                m.ne[1] = qn;
-                m.view_src = nullptr;
-                m.view_offs = 0;
-                ggml_tensor out = *dst;
-                out.src[0] = &q;
-                out.src[1] = &k;
-                out.src[2] = &v;
-                out.src[3] = &m;
-                out.src[4] = c0 == 0 ? dst->src[4] : nullptr;
-                out.src[5] = nullptr;
-                out.src[6] = nullptr;
-                ggml_set_op_params_i32(&out, 5, 0);
-                ggml_set_op_params_i32(&out, 6, 0);
-                out.ne[2] = qn;
-                for (int d = 2; d < GGML_MAX_DIMS; ++d) {
-                    out.nb[d] = out.nb[d - 1]*out.ne[d - 1];
-                }
-                out.data = parts;
-                out.buffer = nullptr;
-                out.view_src = nullptr;
-                out.view_offs = 0;
-                ggml_cuda_sj_kvarn_prefill_partial(ctx, &out, parts, meta);
-                const size_t row0 = size_t(q0)*n_head;
-                ggml_cuda_sj_kvarn_prefill_accumulate(parts, meta, acc + row0*256, acc_meta + row0,
-                    int(qn*n_head), c0 == 0, ctx.stream());
-            }
-        }
-        ggml_cuda_sj_kvarn_prefill_normalize(acc, acc_meta, acc, int(Q->ne[1]*n_head), ctx.stream());
-        return true;
-    }
-
     for (int head_first = 0; head_first < K->ne[2]; head_first += heads_per_group) {
         const int heads = std::min(heads_per_group, int(K->ne[2]) - head_first);
         const size_t elements = kv_elements_per_head*heads;
@@ -414,13 +217,8 @@ bool ggml_cuda_flash_attn_ext_sj_kvarn_prefill(ggml_backend_cuda_context & ctx, 
             (const char *) K->data, (const char *) V->data,
             (const char *) dst->src[5]->data, (const int32_t *) dst->src[6]->data,
             K->nb[1], K->nb[2], V->nb[1], V->nb[2],
-            (half2 *) scratch_ptr, (half2 *) (scratch_ptr + elements), n_kv, 0, head_first, trellis);
+            (half2 *) scratch_ptr, (half2 *) (scratch_ptr + elements), n_kv, head_first);
         CUDA_CHECK(cudaGetLastError());
-        if (trellis) {
-            ggml_cuda_sj_kvarn_trellis_expand_body(ggml_get_op_params_i32(dst, 5), (const char *) dst->src[5]->data,
-                (const int32_t *) dst->src[6]->data, K->nb[2], V->nb[2],
-                (half2 *) scratch_ptr, (half2 *) (scratch_ptr + elements), n_kv, 0, heads, head_first, ctx.stream());
-        }
 
         ggml_tensor q = *Q;
         q.ne[2] = heads*gqa;

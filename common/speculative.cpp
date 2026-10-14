@@ -120,7 +120,7 @@ struct common_speculative_config {
             const common_params_speculative & p = common_params_speculative{}) : type(t), params(p) {}
 };
 
-bool common_speculative_are_compatible(
+static bool common_speculative_are_compatible(
     const llama_model * model_tgt,
     const llama_model * model_dft) {
     const llama_vocab * vocab_tgt = llama_model_get_vocab(model_tgt);
@@ -1782,17 +1782,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
         if (seq_id < (llama_seq_id) chain_rng_seeded.size()) {
             chain_rng_seeded[seq_id] = 0; // [#69] same for the sampled chain's uniform stream
-        }
-
-        // [#196] new request: restart the adaptive depth controller of this seq at its floor, so the
-        // verify widths (and with them the temp-0 output) depend only on this request, not on whatever
-        // the previous request on the slot left behind. LLAMA_SPEC_ADAPTIVE_CARRY=1 keeps the old
-        // carry-over across requests (A/B arm for the speed gate).
-        if (adaptive && seq_id >= 0 && seq_id < (llama_seq_id) adaptive_ctrl.size()) {
-            static const bool carry = [] { const char * e = getenv("LLAMA_SPEC_ADAPTIVE_CARRY"); return e && atoi(e) != 0; }();
-            if (!carry) {
-                adaptive_ctrl[seq_id].reset(params.n_max, params.n_min_adaptive);
-            }
         }
 
         const int32_t N = (int32_t) prompt.size();
@@ -3798,14 +3787,10 @@ common_params common_base_params_to_speculative(const common_params & params) {
         result.sj_kvarn_tail_max = 0;
         result.sj_kvarn_flush_chunk = 0;
     }
-    // The nextn layer has no trunk edge tier, and no WUSH transform (the file covers trunk layers only).
+    // The nextn layer has no trunk edge tier.
     result.sj_kvarn_edge_layers = 0;
-    result.sj_kvarn_transform.clear();
     result.n_outputs_max = params.n_parallel;
     result.n_outputs_max_per_seq = 1;
-
-    // the MoE cache is only used by the target context
-    result.moe_cache_size = 0;
 
     // dflash/dspark decode the whole noise block in a single pass and sample every block position on the backend
     // TODO: refactor such properties to be announced by the speculative types
@@ -3880,20 +3865,6 @@ common_speculative_init_result::common_speculative_init_result(
 
     // the draft context holds as many tokens per sequence as the target context
     cparams.n_ctx = llama_n_ctx(ctx_tgt);
-
-    // SJ-KVaRN trunk with --kv-unified and several slots: every target sequence may address the whole context
-    // (one shared record pool of n_ctx - sink - tail tokens, plus a per-sequence sink and ring), so the slots
-    // together can hold up to n_ctx + n_seq*(sink + ring) tokens. A plain unified draft cache of n_ctx cells would
-    // run out first (decode: failed to find a memory slot); it gets that many cells instead, still unified
-    // (one n_ctx stream per sequence would cost n_seq*n_ctx cells and a matching compute buffer).
-    if (cparams.kv_unified && cparams.n_seq_max > 1 && cparams.sj_kvarn_bits_k == 0 &&
-        llama_sj_kvarn_sealed_end(ctx_tgt) >= 0 && llama_n_ctx_seq(ctx_tgt) == llama_n_ctx(ctx_tgt)) {
-        const uint32_t unsealed = (uint32_t) std::max(0, llama_sj_kvarn_seq_unsealed_max(ctx_tgt));
-        const uint32_t n_ctx_draft = GGML_PAD(llama_n_ctx(ctx_tgt) + cparams.n_seq_max*unsealed, 256);
-        LOG_INF("%s: SJ-KVaRN shared pool: unified draft KV cache of %u cells (n_ctx %u + %u slots x %u sink + ring rows)\n",
-                __func__, n_ctx_draft, llama_n_ctx(ctx_tgt), cparams.n_seq_max, unsealed);
-        cparams.n_ctx = n_ctx_draft;
-    }
 
     // params comes from common_base_params_to_speculative: cache_type_k/v hold the resolved types,
     // speculative.draft.cache_type_k/v are GGML_TYPE_COUNT when the flag was not given
@@ -4337,11 +4308,6 @@ void common_speculative_draft(common_speculative * spec) {
                     if (!result.empty() && (int) result.size() > dp.n_max) {
                         SPC_DBG("truncating draft to %d tokens\n", dp.n_max);
                         result.resize(dp.n_max);
-
-                        // trim the candidates only if the drafter produced them (n-gram drafters do not)
-                        if (dp.result_q && !dp.result_q->empty()) {
-                            dp.result_q->resize(dp.n_max);
-                        }
                     }
                 }
 

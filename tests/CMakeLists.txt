@@ -158,13 +158,7 @@ target_include_directories(test-sjkvarn-codec PRIVATE ${PROJECT_SOURCE_DIR}/ggml
 llama_build_and_test(test-sjkvarn-attn.cpp LABEL "turbo")
 target_include_directories(test-sjkvarn-attn PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 llama_build_and_test(test-sjkvarn-fused-rot.cpp LABEL "turbo")
-llama_build_and_test(test-sjkvarn-state.cpp LABEL "turbo")
-target_include_directories(test-sjkvarn-state PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
-llama_build_and_test(test-sjkvarn-split.cpp LABEL "turbo")
-target_include_directories(test-sjkvarn-split PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 llama_build(test-save-load-state.cpp)
-# prompt-cache state round trip over every KV / drafter / recurrent-state type (needs an MTP model: -m)
-llama_build(test-prompt-cache-types.cpp)
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
@@ -178,9 +172,6 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-chat.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
     target_include_directories(test-chat PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-chat PRIVATE server-context)
-    llama_build_and_test(test-prompt-cache-disk.cpp)
-    target_include_directories(test-prompt-cache-disk PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
-    target_link_libraries(test-prompt-cache-disk PRIVATE server-context)
     llama_build_and_test(test-json-schema-to-grammar.cpp)
 
     if (NOT GGML_BACKEND_DL)
@@ -421,12 +412,6 @@ llama_build_and_test(test-speculative-adaptive.cpp)
 if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   # TODO: repair known memory leaks
   llama_build_and_test(test-opt.cpp)
-endif()
-if (GGML_METAL AND NOT GGML_BACKEND_DL)
-    # calls the Metal backend's graph optimizer and fusion table directly
-    llama_build_and_test(test-metal-graph-optimize.cpp)
-    target_include_directories(test-metal-graph-optimize PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src ${PROJECT_SOURCE_DIR}/ggml/src/ggml-metal)
-    target_link_libraries(test-metal-graph-optimize PRIVATE ggml-metal)
 endif()
 
 # TODO: make this test (and others) not link `libllama` as it is not needed [TAG_TESTS_LLAMA_LINK]

@@ -30,11 +30,6 @@ struct llama_ubatch {
         return n_pos >= 3;
     }
 
-    // mixed: type picks token or embd per row, pos has n_pos sections for all rows
-    bool is_mixed() const {
-        return type != nullptr;
-    }
-
     uint32_t b_equal_seqs; // note: this is a boolean, but we use an int32_t for alignment
                            //       otherwise address sanitizer complains
     // TODO: whole_seqs for embeddings?
@@ -58,7 +53,6 @@ struct llama_ubatch {
     llama_seq_id *  seq_id_unq; // [n_seqs_unq]       | s   | seq_id
     int32_t      *  seq_idx;    // [LLAMA_MAX_SEQ]    | -   | seq_idx
     int8_t       *  output;     // [n_tokens]         | i   | -
-    int8_t       *  type;       // [n_tokens]         | i   | -     (mixed ubatch only, 0 - token, 1 - embd)
     int32_t      *  decision_order; // [n_tokens], NULL if no entry has one, see llama_batch_ext_set_decision_order()
 
     struct data_t {
@@ -70,7 +64,6 @@ struct llama_ubatch {
         std::vector<llama_seq_id>   seq_id_unq;
         std::vector<int32_t>        seq_idx;
         std::vector<int8_t>         output;
-        std::vector<int8_t>         type;
         std::vector<int32_t>        batch_idxs;  // original batch index for each token
         std::vector<int32_t>        decision_order;
 
@@ -80,9 +73,6 @@ struct llama_ubatch {
     // the llama_ubatch pointers above point to this data if set. otherwise - point to external non-owning data
     std::shared_ptr<data_t> data;
 };
-
-// crash if a mixed ubatch reaches code that expects only tokens or only embd
-#define ASSERT_EMBD_OR_TOKEN(ubatch) GGML_ASSERT(!(ubatch).is_mixed() && "mixed token/embd ubatch is not supported here")
 
 struct llama_hparams;
 
@@ -145,7 +135,7 @@ struct llama_batch_ext {
 // a helper for sanitizing, fulfilling and splitting a batch
 class llama_batch_allocr {
 public:
-    llama_batch_allocr(uint32_t n_pos_per_embd, bool allow_mixed = false);
+    llama_batch_allocr(uint32_t n_pos_per_embd);
 
     // convert a llama_batch_ext to internal llama_batch and sanitize it
     bool init(
@@ -169,11 +159,6 @@ public:
     // call once before splitting the batch to reset the internal state
     void split_reset();
 
-    // [#197] position grid for the splits below (0 = off): a ubatch never continues past a token whose position is
-    // a multiple of the grid, so every ubatch lies inside one grid cell whatever the batch boundaries were (set by a
-    // memory whose per-ubatch state follows the cell of the ubatch start, e.g. the SJ-KVaRN sealed end)
-    void set_split_pos_grid(uint32_t grid) { split_pos_grid = grid; }
-
     // simple split, unknown number of sequence sets of unequal lengths
     llama_ubatch split_simple(uint32_t n_ubatch);
 
@@ -194,13 +179,6 @@ public:
 private:
     void clear();
 
-    uint32_t split_pos_grid = 0;
-
-    // true if the token at batch index idx starts a new grid cell (a ubatch must not continue into it)
-    bool split_on_grid(int32_t idx) const {
-        return split_pos_grid > 0 && batch.pos[idx] > 0 && batch.pos[idx] % (llama_pos) split_pos_grid == 0;
-    }
-
     // create the next ubatch based on the provided batch indices (idxs) and the number of sequence sets (n_seqs)
     // return llama_ubatch.n_tokens == 0 if the entire batch was consumed
     llama_ubatch ubatch_add(const std::vector<int32_t> & idxs, uint32_t n_seqs, bool equal_seqs);
@@ -217,15 +195,12 @@ private:
     //       ref: https://github.com/ggml-org/llama.cpp/issues/13694#issuecomment-2983871762
     const uint32_t n_pos_per_embd;
 
-    const bool allow_mixed;
-
     uint32_t n_embd;
     uint32_t n_seq_max;
     uint32_t n_outputs;
 
     std::vector<llama_token>    token_vec;    // owned token IDs built from llama_batch_ext
     std::vector<float>          embd_vec;     // owned embeddings built from llama_batch_ext
-    std::vector<int8_t>         is_embd_vec;  // mixed batch only (= 1 if embd, 0 if text token)
     std::vector<llama_seq_id>   seq_id_data;  // flat storage for seq_id pointers below
 
     std::vector<llama_pos>      pos;

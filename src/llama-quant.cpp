@@ -400,6 +400,16 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
 static ggml_type tensor_type_fallback(quantize_state_impl & qs, const ggml_tensor * t, const ggml_type target_type) {
     ggml_type return_type = target_type;
 
+    // RQ4 kernels take 2-D weights with ncols % 1024 (super block) and nrows % 128 (GEMM row tile)
+    if ((return_type == GGML_TYPE_RQ4_G128 || return_type == GGML_TYPE_RQ4_G64 ||
+         return_type == GGML_TYPE_RQ4NL_G128 || return_type == GGML_TYPE_RQ4NL_G64) &&
+            (t->ne[2] != 1 || t->ne[3] != 1 || t->ne[0] % 1024 != 0 || t->ne[1] % 128 != 0)) {
+        LLAMA_LOG_WARN("warning: %-36s - cannot use %s (needs 2D tensor, ncols %% 1024 == 0, nrows %% 128 == 0) -> IQ4_XS\n",
+                       t->name, ggml_type_name(return_type));
+        ++qs.n_fallback;
+        return tensor_type_fallback(qs, t, GGML_TYPE_IQ4_XS);
+    }
+
     const int64_t ncols = t->ne[0];
     const int64_t qk_k = ggml_blck_size(target_type);
 
@@ -801,9 +811,25 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, const llama_mod
             }
         }
 
+        // RQ4 ftypes follow the IQ4_XS mixture rules and swap the IQ4_XS tensors for RQ4 (matched-size comparison)
+        ggml_type rq4_type = GGML_TYPE_COUNT;
+        switch (params->ftype) {
+            case LLAMA_FTYPE_MOSTLY_RQ4_G128:   rq4_type = GGML_TYPE_RQ4_G128;   break;
+            case LLAMA_FTYPE_MOSTLY_RQ4_G64:    rq4_type = GGML_TYPE_RQ4_G64;    break;
+            case LLAMA_FTYPE_MOSTLY_RQ4NL_G128: rq4_type = GGML_TYPE_RQ4NL_G128; break;
+            case LLAMA_FTYPE_MOSTLY_RQ4NL_G64:  rq4_type = GGML_TYPE_RQ4NL_G64;  break;
+            default: break;
+        }
+        const bool rq4_ftype = rq4_type != GGML_TYPE_COUNT;
+
         // if not manual - use the standard logic for choosing the quantization type based on the selected mixture
         if (!manual && !params->pure) {
-            new_type = llama_tensor_get_type_impl(qs, new_type, tensor, params->ftype, tm.category);
+            new_type = llama_tensor_get_type_impl(qs, new_type, tensor,
+                                                  rq4_ftype ? LLAMA_FTYPE_MOSTLY_IQ4_XS : params->ftype, tm.category);
+        }
+        if (!manual && rq4_ftype && new_type == GGML_TYPE_IQ4_XS && tm.category != tensor_category::TOKEN_EMBD &&
+                std::strstr(tensor->name, "embed_tokens") == nullptr) {   // GET_ROWS tables (incl. nextn.embed_tokens) stay IQ4_XS
+            new_type = rq4_type;
         }
 
         // Qwen4-Exp's hyper-connection injection matrices decide how the token embedding enters
@@ -983,6 +1009,10 @@ ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_IQ1_M:   return GGML_TYPE_IQ1_M;
         case LLAMA_FTYPE_MOSTLY_IQ4_NL:  return GGML_TYPE_IQ4_NL;
         case LLAMA_FTYPE_MOSTLY_IQ4_XS:  return GGML_TYPE_IQ4_XS;
+        case LLAMA_FTYPE_MOSTLY_RQ4_G128:
+        case LLAMA_FTYPE_MOSTLY_RQ4_G64:
+        case LLAMA_FTYPE_MOSTLY_RQ4NL_G128:
+        case LLAMA_FTYPE_MOSTLY_RQ4NL_G64: return GGML_TYPE_IQ4_XS;   // mixture rules run as IQ4_XS, see llama_tensor_get_type
         case LLAMA_FTYPE_MOSTLY_IQ3_S:
         case LLAMA_FTYPE_MOSTLY_IQ3_M:   return GGML_TYPE_IQ3_S;
 

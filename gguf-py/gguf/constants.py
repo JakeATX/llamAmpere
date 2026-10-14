@@ -224,8 +224,6 @@ class Keys:
         RECURRENT_LAYERS             = "{arch}.attention.recurrent_layers"
         TEMPERATURE_SCALE            = "{arch}.attention.temperature_scale"
         ROPE_PATTERN                 = "{arch}.attention.rope_pattern"
-        VALUE_EXPERT_COUNT           = "{arch}.attention.value_expert_count"
-        VALUE_EXPERT_USED_COUNT      = "{arch}.attention.value_expert_used_count"
 
         class Indexer:
             HEAD_COUNT = "{arch}.attention.indexer.head_count"
@@ -409,7 +407,6 @@ class Keys:
         BLOCK_COUNT           = "clip.vision.block_count"
         IMAGE_MEAN            = "clip.vision.image_mean"
         IMAGE_STD             = "clip.vision.image_std"
-        IMAGE_RESIZE_ALGO     = "clip.vision.image_resize_algo"
         SPATIAL_MERGE_SIZE    = "clip.vision.spatial_merge_size"
         SWIGLU_CLAMP          = "clip.vision.swiglu_clamp"
         EXPERT_COUNT_PER_LAYER = "clip.vision.expert_count_per_layer" # dots3note pyramid MoE, 0 = dense layer
@@ -563,7 +560,6 @@ class MODEL_ARCH(IntEnum):
     GEMMA4           = auto()
     GEMMA4_ASSISTANT = auto()
     GEMMA_EMBEDDING  = auto()
-    GEMMA_EMBEDDING2 = auto()
     STARCODER2       = auto()
     RWKV6            = auto()
     RWKV6QWEN2       = auto()
@@ -662,7 +658,6 @@ class MODEL_ARCH(IntEnum):
     NANBEIGE         = auto()
     QWEN3TTS         = auto()
     POCKETTTS        = auto()
-    K2HORIZON        = auto()
 
 
 class VISION_PROJECTOR_TYPE(IntEnum):
@@ -949,8 +944,6 @@ class MODEL_TENSOR(IntEnum):
     INDEXER_COMPRESSOR_NORM = auto()
     INDEXER_KPOOL_GATE   = auto()
     INDEXER_KPOOL_APE    = auto()
-    ATTN_V_GATE          = auto() # k2-horizon MoVA router
-    ATTN_V_EXP           = auto() # k2-horizon MoVA value experts
     # vision
     V_MMPROJ             = auto()
     V_MMPROJ_FC          = auto()
@@ -1352,7 +1345,6 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.GEMMA4:           "gemma4",
     MODEL_ARCH.GEMMA4_ASSISTANT: "gemma4-assistant",
     MODEL_ARCH.GEMMA_EMBEDDING:  "gemma-embedding",
-    MODEL_ARCH.GEMMA_EMBEDDING2: "gemma-embedding2",
     MODEL_ARCH.STARCODER2:       "starcoder2",
     MODEL_ARCH.RWKV6:            "rwkv6",
     MODEL_ARCH.RWKV6QWEN2:       "rwkv6qwen2",
@@ -1452,7 +1444,6 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.NANBEIGE:         "nanbeige",
     MODEL_ARCH.QWEN3TTS:         "qwen3tts",
     MODEL_ARCH.POCKETTTS:        "pockettts",
-    MODEL_ARCH.K2HORIZON:        "k2-horizon",
 }
 
 VISION_PROJECTOR_TYPE_NAMES: dict[VISION_PROJECTOR_TYPE, str] = {
@@ -2079,8 +2070,6 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.DFLASH_SELECTOR_NEXT:      "selector_successor",
     MODEL_TENSOR.DFLASH_SELECTOR_HIDDEN:    "selector_hidden",
     MODEL_TENSOR.D2T:                       "d2t",
-    MODEL_TENSOR.ATTN_V_GATE:               "blk.{bid}.attn_v_gate",
-    MODEL_TENSOR.ATTN_V_EXP:                "blk.{bid}.attn_v_exps",
 }
 
 MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
@@ -3498,30 +3487,6 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.ATTN_POST_NORM,
         MODEL_TENSOR.FFN_PRE_NORM,
         MODEL_TENSOR.FFN_POST_NORM,
-    ],
-    MODEL_ARCH.GEMMA_EMBEDDING2: [
-        MODEL_TENSOR.TOKEN_EMBD,
-        MODEL_TENSOR.OUTPUT,
-        MODEL_TENSOR.OUTPUT_NORM,
-        MODEL_TENSOR.ATTN_Q,
-        MODEL_TENSOR.ATTN_Q_NORM,
-        MODEL_TENSOR.ATTN_K,
-        MODEL_TENSOR.ATTN_K_NORM,
-        MODEL_TENSOR.ATTN_V,
-        MODEL_TENSOR.ATTN_OUT,
-        MODEL_TENSOR.FFN_GATE,
-        MODEL_TENSOR.FFN_DOWN,
-        MODEL_TENSOR.FFN_UP,
-        MODEL_TENSOR.ATTN_NORM,
-        MODEL_TENSOR.ATTN_POST_NORM,
-        MODEL_TENSOR.FFN_PRE_NORM,
-        MODEL_TENSOR.FFN_POST_NORM,
-        MODEL_TENSOR.LAYER_OUT_SCALE,
-        MODEL_TENSOR.PER_LAYER_MODEL_PROJ,
-        MODEL_TENSOR.PER_LAYER_INP_GATE,
-        MODEL_TENSOR.PER_LAYER_PROJ,
-        MODEL_TENSOR.PER_LAYER_PROJ_NORM,
-        MODEL_TENSOR.PER_LAYER_POST_NORM,
     ],
     MODEL_ARCH.STARCODER2: [
         MODEL_TENSOR.TOKEN_EMBD,
@@ -5182,10 +5147,6 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.ATTN_OUT,
         MODEL_TENSOR.OUTPUT,
         MODEL_TENSOR.DENSE_2_OUT, # LFM2-ColBert-350M
-        MODEL_TENSOR.TOKEN_TYPES, # decision head
-        MODEL_TENSOR.CLS,
-        MODEL_TENSOR.CLS_NORM,
-        MODEL_TENSOR.CLS_OUT,
     ],
     MODEL_ARCH.LFM2MOE: [
         MODEL_TENSOR.TOKEN_EMBD,
@@ -5816,33 +5777,6 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_DOWN,
         MODEL_TENSOR.FFN_UP,
     ],
-    MODEL_ARCH.K2HORIZON: [
-        MODEL_TENSOR.TOKEN_EMBD,
-        MODEL_TENSOR.OUTPUT_NORM,
-        MODEL_TENSOR.OUTPUT,
-        MODEL_TENSOR.ATTN_NORM,
-        MODEL_TENSOR.ATTN_Q,
-        MODEL_TENSOR.ATTN_Q_NORM,
-        MODEL_TENSOR.ATTN_K,
-        MODEL_TENSOR.ATTN_K_NORM,
-        MODEL_TENSOR.ATTN_V,
-        MODEL_TENSOR.ATTN_V_GATE,
-        MODEL_TENSOR.ATTN_V_EXP,
-        MODEL_TENSOR.ATTN_OUT,
-        MODEL_TENSOR.ATTN_GATE,
-        MODEL_TENSOR.FFN_NORM,
-        MODEL_TENSOR.FFN_GATE,
-        MODEL_TENSOR.FFN_UP,
-        MODEL_TENSOR.FFN_DOWN,
-        MODEL_TENSOR.FFN_GATE_INP,
-        MODEL_TENSOR.FFN_EXP_PROBS_B,
-        MODEL_TENSOR.FFN_GATE_EXP,
-        MODEL_TENSOR.FFN_UP_EXP,
-        MODEL_TENSOR.FFN_DOWN_EXP,
-        MODEL_TENSOR.FFN_GATE_SHEXP,
-        MODEL_TENSOR.FFN_UP_SHEXP,
-        MODEL_TENSOR.FFN_DOWN_SHEXP,
-    ],
 }
 
 # tensors that will not be serialized
@@ -5998,6 +5932,24 @@ class GGMLQuantizationType(IntEnum):
     EXL3_6  = 55
     EXL3_7  = 56
     EXL3_8  = 57
+    AI4     = 70  # Ampere INT4 trellis (ggml-ai4.h)
+    D2      = 70  # alias: the name before the 2026-10-07 rename (same id, same bytes)
+    AI4_U   = 71  # AI+ unit-128 layout at the AI4 rate (ggml-ai4.h)
+    AI3_U   = 72  # AI+ unit-128 layout at rate 3 (ggml-ai4.h)
+    AI2_U   = 73  # AI+ unit-128 layout at rate 2 (ggml-ai4.h)
+    AI5_U   = 74  # AI+ unit-128 layout at rate 5 (ggml-ai4.h)
+    AI6_U   = 75  # AI+ unit-128 layout at rate 6 (ggml-ai4.h), trellis constant 0xA1EEE321
+    AI6_UO  = 86  # private A/B control (k 6, AI4 constant), do not ship
+    AI5_UN  = 87  # private A/B control (k 5, alternate constant), do not ship
+    AI2_S   = 96  # AI+ span-1024 layout (one scale per row and 1024 K) at rate 2 (ggml-ai4.h)
+    AI3_S   = 97  # AI+ span-1024 layout at rate 3
+    AI4_S   = 98  # AI+ span-1024 layout at rate 4
+    AI5_S   = 99  # AI+ span-1024 layout at rate 5
+    AI6_S   = 100 # AI+ span-1024 layout at rate 6, trellis constant 0xA1EEE321
+    RQ4NL_G128 = 62
+    RQ4NL_G64  = 63
+    RQ4_G128 = 64
+    RQ4_G64  = 65
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -6063,6 +6015,12 @@ class LlamaFileType(IntEnum):
     MOSTLY_TQ4_1S        = 44  # except 1d tensors
     MOSTLY_Q5_CR         = 45  # except 1d tensors, ConvRot-rotated Q5_0
     MOSTLY_Q6_CR         = 46  # except 1d tensors, ConvRot-rotated Q6_K
+    MOSTLY_EXL3          = 47  # exllamav3 trellis weights (EXL3_2..8), except 1d tensors
+    MOSTLY_RQ4_G128      = 48  # IQ4_XS mixture, IQ4_XS tensors -> RQ4_G128
+    MOSTLY_RQ4_G64       = 49  # IQ4_XS mixture, IQ4_XS tensors -> RQ4_G64
+    MOSTLY_RQ4NL_G128    = 50  # IQ4_XS mixture, IQ4_XS tensors -> RQ4NL_G128
+    MOSTLY_RQ4NL_G64     = 51  # IQ4_XS mixture, IQ4_XS tensors -> RQ4NL_G64
+    MOSTLY_AI4           = 52  # AI4 (Ampere INT4) trellis in place of the template's IQ4_XS tensors (llama-ai4-quantize)
 
     GUESSED              = 1024  # not specified in the model file
 
@@ -6111,9 +6069,6 @@ class DecisionType:
     KEV     = "kev"      # dot product of the hidden states of the last token and of one end token per option
     NIMBLE  = "nimble"   # same as openjev, the prompt lists all the questions of the request
     CLEF    = "clef"     # joint head over all questions, one score per option
-    PPLX_DECIDER = "pplx-decider"  # same as openjev, label codes of 1 or 2 letters
-    LFM2_D1 = "lfm2-d1"  # same as openjev, the labels depend on the question type
-    LFM2_D1_OMNI = "lfm2-d1-omni"  # same head as laya on a bidirectional LFM2 trunk, other prompt layout
 
 
 class VisionProjectorType:
@@ -6174,9 +6129,6 @@ class VisionProjectorType:
     MIMO_AUDIO     = "mimo_audio"
     GRANITE4_VISION = "granite4_vision"
     MUSE_GLIMMER   = "muse-glimmer"
-    COHERE2V       = "cohere2v"
-    D1OMNI_V       = "d1omni_v"  # lfm2 vision, without separator tokens
-    D1OMNI_A       = "d1omni_a"  # lfm2a audio, with a residual block after the projector
 
 
 # Items here are (block size, type size)
@@ -6236,6 +6188,24 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.EXL3_6:  (256, 32 * 6),
     GGMLQuantizationType.EXL3_7:  (256, 32 * 7),
     GGMLQuantizationType.EXL3_8:  (256, 32 * 8),
+    GGMLQuantizationType.AI4:     (1024, 528),
+    GGMLQuantizationType.AI4_U:   (128, 66),
+    GGMLQuantizationType.AI3_U:   (128, 50),
+    GGMLQuantizationType.AI2_U:   (128, 34),
+    GGMLQuantizationType.AI5_U:   (128, 82),
+    GGMLQuantizationType.AI6_U:   (128, 98),
+    GGMLQuantizationType.AI6_UO:  (128, 98),
+    GGMLQuantizationType.AI5_UN:  (128, 82),
+    GGMLQuantizationType.AI2_S:   (1024, 258),
+    GGMLQuantizationType.AI3_S:   (1024, 386),
+    GGMLQuantizationType.AI4_S:   (1024, 514),
+    GGMLQuantizationType.AI5_S:   (1024, 642),
+    GGMLQuantizationType.AI6_S:   (1024, 770),
+    # RQ4: Hadamard-256-rotated 4-bit weights, 1024-weight super block = fp16 scales + 512 nibble bytes
+    GGMLQuantizationType.RQ4_G128: (1024, 2 * 8 + 512),
+    GGMLQuantizationType.RQ4_G64:  (1024, 2 * 16 + 512),
+    GGMLQuantizationType.RQ4NL_G128: (1024, 2 * 8 + 512),
+    GGMLQuantizationType.RQ4NL_G64:  (1024, 2 * 16 + 512),
 }
 
 

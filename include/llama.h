@@ -43,10 +43,10 @@
 #define LLAMA_FILE_MAGIC_GGSQ 0x67677371u // 'ggsq'
 
 #define LLAMA_SESSION_MAGIC   LLAMA_FILE_MAGIC_GGSN
-#define LLAMA_SESSION_VERSION 11
+#define LLAMA_SESSION_VERSION 10
 
 #define LLAMA_STATE_SEQ_MAGIC   LLAMA_FILE_MAGIC_GGSQ
-#define LLAMA_STATE_SEQ_VERSION 4
+#define LLAMA_STATE_SEQ_VERSION 3
 
 #ifdef __cplusplus
 extern "C" {
@@ -78,7 +78,6 @@ extern "C" {
         LLAMA_VOCAB_TYPE_RWKV   = 5, // RWKV tokenizer based on greedy tokenization
         LLAMA_VOCAB_TYPE_PLAMO2 = 6, // PLaMo-2 tokenizer based on Aho-Corasick with dynamic programming
         LLAMA_VOCAB_TYPE_TEST   = 7, // Dummy tokenizer for testing: rolling hash of fixed-size chunks -> tokens, tokens -> hex
-        LLAMA_VOCAB_TYPE_PLAMO3 = 8, // PLaMo-3 tokenizer with pre-segmentation and dynamic programming
     };
 
     enum llama_rope_type {
@@ -167,6 +166,11 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_Q5_CR         = 45, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q6_CR         = 46, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_EXL3          = 47, // exllamav3 trellis weights (GGML_TYPE_EXL3_2..8), except 1d tensors
+        LLAMA_FTYPE_MOSTLY_RQ4_G128      = 48, // IQ4_XS mixture with RQ4_G128 wherever IQ4_XS lands and the shape fits
+        LLAMA_FTYPE_MOSTLY_RQ4_G64       = 49, // IQ4_XS mixture with RQ4_G64 wherever IQ4_XS lands and the shape fits
+        LLAMA_FTYPE_MOSTLY_RQ4NL_G128    = 50, // same, RQ4NL_G128 (IQ4_NL value table instead of the uniform grid)
+        LLAMA_FTYPE_MOSTLY_RQ4NL_G64     = 51, // same, RQ4NL_G64
+        LLAMA_FTYPE_MOSTLY_AI4           = 52, // AI4 (Ampere INT4) trellis wherever the IQ4_XS template had IQ4_XS; written by llama-ai4-quantize
 
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };
@@ -416,7 +420,6 @@ extern "C" {
 
         enum llama_moe_cache_mode moe_cache_mode; // runtime MoE expert cache mode
         size_t moe_cache_budget_mib;               // 0 uses the provider's available-memory budget
-        size_t moe_cache_size; // device cache in bytes for the experts kept in host memory, 0 = disabled [EXPERIMENTAL]
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
@@ -439,7 +442,6 @@ extern "C" {
         uint32_t sj_kvarn_edge_bits_v;
         enum ggml_type sj_kvarn_edge_body_type; // edge-tier codec: COUNT = auto (trellis only for a trellis pair when sj_kvarn_body_type is trellis/auto), F32 scalar, I16 trellis
         uint32_t sj_kvarn_flush_chunk; // adaptive tail: max groups sealed per small (decode) ubatch; 0 = whole flush at once
-        const char * sj_kvarn_transform; // EXPERIMENTAL (arXiv 2609.38121 WUSH-KV): per-layer K/V transform file replacing the Hadamard; NULL = off
 
         // Keep the booleans together and at the end of the struct to avoid misalignment during copy-by-value.
         bool embeddings;  // if true, extract embeddings (together with logits)
@@ -893,55 +895,16 @@ extern "C" {
 
     // Exclusive end of the sealed SJ-KVaRN body, or -1 if this cache is not SJ-KVaRN.
     // Removing a nonempty prefix below this boundary requires clearing the cache.
-    // With several sequences (--parallel N) this is the largest sealed end over all sequences; use
-    // llama_sj_kvarn_seq_sealed_end for one sequence.
     LLAMA_API int32_t llama_sj_kvarn_sealed_end(struct llama_context * ctx);
-
-    // Unsealed positions one SJ-KVaRN sequence can hold beside the record pool (sink + ring rows), or -1 if this
-    // cache is not SJ-KVaRN. Under --kv-unified all sequences together hold at most n_ctx + n_seq * this.
-    LLAMA_API int32_t llama_sj_kvarn_seq_unsealed_max(struct llama_context * ctx);
-
-    // Exclusive end of the sealed SJ-KVaRN body of one sequence, or -1 (not SJ-KVaRN, or seq_id out of range).
-    LLAMA_API int32_t llama_sj_kvarn_seq_sealed_end(struct llama_context * ctx, llama_seq_id seq_id);
 
     // Compress an adaptive SJ-KVaRN tail during an idle period. Does not evaluate model layers.
     // accepted_pos_end is the exclusive end of accepted, materialized positions.
     // The caller must resolve speculative rollback and discard checkpoints before calling.
-    // Works per sequence (its own stream). Returns 1 if compressed, 0 if no work, -1 on failure.
+    // Supports a single sequence. Returns 1 if compressed, 0 if no work, -1 on failure.
     LLAMA_API int32_t llama_sj_kvarn_compress_idle(
             struct llama_context * ctx,
                     llama_seq_id   seq_id,
                        llama_pos   accepted_pos_end);
-
-    // Like llama_sj_kvarn_compress_idle, but leaves keep_from and the tail positions behind it unsealed: the turn the
-    // next request is likely to re-render (from keep_from on) stays exact, and a re-prefill from there keeps the same
-    // exact window as a fresh prefill. keep_from < 0 = no bound.
-    LLAMA_API int32_t llama_sj_kvarn_compress_idle_keep(
-            struct llama_context * ctx,
-                    llama_seq_id   seq_id,
-                       llama_pos   accepted_pos_end,
-                       llama_pos   keep_from);
-
-    // Largest position <= pos that llama_memory_seq_rm(mem, seq, p, -1) can truncate the SJ-KVaRN cache to. Sealed
-    // groups whose staging rows are still in the ring are reopened (any pos works); below that only whole groups can
-    // be dropped, so pos rounds down to a group boundary. Kept records stay bit-identical, nothing is re-quantised.
-    // Returns pos when the context has no SJ-KVaRN cache.
-    LLAMA_API llama_pos llama_sj_kvarn_rm_floor(struct llama_context * ctx, llama_seq_id seq_id, llama_pos pos);
-
-    // The SJ-KVaRN group boundary at or below pos (pos itself when pos <= sink or the context has no SJ-KVaRN cache).
-    // A checkpoint taken at a boundary stays reachable by seq_rm after the rows behind it are sealed.
-    LLAMA_API llama_pos llama_sj_kvarn_group_floor(struct llama_context * ctx, llama_pos pos);
-
-    // The prompt-checkpoint boundary at or below pos: the group floor of the seal-grid (n_ubatch) point at or below pos
-    // when the grid schedule is on (default), else the group floor. A prefill that breaks only on these points has the
-    // same ubatch boundaries cold and after a checkpoint restore, so the restored turn computes bit-identically.
-    LLAMA_API llama_pos llama_sj_kvarn_ckpt_floor(struct llama_context * ctx, llama_pos pos);
-
-    // Call before re-prefilling seq_id from pos (a prompt restored from the prompt cache or a context checkpoint, pos on
-    // the seal grid, see llama_sj_kvarn_ckpt_floor): puts the SJ-KVaRN cache into the state a cold prefill of [0, pos)
-    // has there (reopens groups sealed after that point, drops an unfinished decode flush), so the re-prefill computes
-    // bit-identically to a cold one. No-op (false) off the grid, without SJ-KVaRN, or when nothing changes.
-    LLAMA_API bool llama_sj_kvarn_prefill_cut(struct llama_context * ctx, llama_seq_id seq_id, llama_pos pos);
 
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);

@@ -154,6 +154,22 @@ GGML_API void quantize_row_tq3_1s_ref(const float * GGML_RESTRICT x, block_tq3_1
 GGML_API void dequantize_row_tq3_1s(const block_tq3_1s * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API size_t quantize_tq3_1s(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
 
+// RQ4 (ggml-rq4.c): Hadamard-rotated 4-bit weights for the W4A8 int8 MMA path
+#define RQ4_SB 1024
+GGML_API void quantize_row_rq4_g128_ref(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
+GGML_API void quantize_row_rq4_g64_ref (const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
+GGML_API void dequantize_row_rq4_g128(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+GGML_API void dequantize_row_rq4_g64 (const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+GGML_API size_t quantize_rq4_g128(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
+GGML_API size_t quantize_rq4_g64 (const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
+// RQ4NL: same layout, nibbles index the IQ4_NL value table (ggml-rq4.h)
+GGML_API void quantize_row_rq4nl_g128_ref(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
+GGML_API void quantize_row_rq4nl_g64_ref (const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
+GGML_API void dequantize_row_rq4nl_g128(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+GGML_API void dequantize_row_rq4nl_g64 (const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+GGML_API size_t quantize_rq4nl_g128(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
+GGML_API size_t quantize_rq4nl_g64 (const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
+
 // TQ4_1S: WHT-rotated 4-bit weight quantization (16-level Lloyd-Max)
 GGML_API void quantize_row_tq4_1s_ref(const float * GGML_RESTRICT x, block_tq4_1s * GGML_RESTRICT y, int64_t k);
 GGML_API void dequantize_row_tq4_1s(const block_tq4_1s * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);

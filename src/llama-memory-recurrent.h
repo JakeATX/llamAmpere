@@ -132,10 +132,6 @@ public:
     // not a materialized rolled-back state), cleared by consume_replay().
     std::vector<uint8_t> s_stale;
 
-    // gdn_replay state blobs: top bit of a cell's serialized span = its s_l row is the logical
-    // state (writer had no pending rollback and s_l was not stale)
-    static constexpr uint32_t REPLAY_SPAN_S_EXACT = 0x80000000u;
-
     // gdn_replay: the span the ring holds behind the checkpoint after a ubatch of n_seq_tokens
     // tokens per seq -- the accepted prefix (ckpt_span - replay_len) plus the new tokens, capped
     // at the ring capacity. The graph input and replay_split::advance() both use it.

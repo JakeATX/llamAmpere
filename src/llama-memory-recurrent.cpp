@@ -299,10 +299,6 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
             // partial rollback via per-token snapshot index (bounded by n_rs_seq), or (gdn_replay)
             // via a pending replay of the last `rollback` ingredient-ring steps.
             if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
-                // a cell shared by several sequences cannot move back for only one of them
-                if (cell.seq_id.size() > 1) {
-                    return false;
-                }
                 // the filter kept no layer (e.g. an MTP draft context), so only the position moves back
                 if (is_empty()) {
                     cell.pos = p0 - 1;
@@ -1085,10 +1081,6 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
             ++cell_count;
             uint32_t rs_idx_cur = 0;
             uint32_t span_cur   = 0;
-            // gdn_replay: s_l of this cell already holds the logical state (no rollback pending,
-            // not stale), so a reader can resume from it instead of rebuilding s_ckpt + ring --
-            // with a 16-bit state the rebuild rounds a second time and is not bit-exact
-            bool     s_exact    = true;
 
             if (n_rs_seq != 0) {
                 // under gdn_replay a pending rollback lives in replay_len, and the logical conv
@@ -1099,7 +1091,6 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
                     rs_idx_cur = group_of[seq_id];
                     if (gdn_replay) {
                         span_cur = ckpt_span[seq_id] - std::min(ckpt_span[seq_id], replay_len[seq_id]);
-                        s_exact  = replay_len[seq_id] == 0 && !s_stale[seq_id];
                     }
                 } else {
                     bool has_rs_idx = false;
@@ -1108,7 +1099,6 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
 
                         const uint32_t seq_rs_idx = group_of[cell_seq_id];
                         const uint32_t seq_span   = gdn_replay ? ckpt_span[cell_seq_id] - std::min(ckpt_span[cell_seq_id], replay_len[cell_seq_id]) : 0;
-                        s_exact = s_exact && gdn_replay && replay_len[cell_seq_id] == 0 && !s_stale[cell_seq_id];
                         if (!has_rs_idx) {
                             rs_idx_cur = seq_rs_idx;
                             span_cur   = seq_span;
@@ -1136,7 +1126,7 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
             } else {
                 cell_ranges_data_s.back().second++;
             }
-            cell_spans.push_back(span_cur | (gdn_replay && s_exact ? REPLAY_SPAN_S_EXACT : 0u));
+            cell_spans.push_back(span_cur);
 
             if (cell_range_begin == size) {
                 cell_range_begin = i;
@@ -1243,8 +1233,7 @@ bool llama_memory_recurrent::state_read_replay(llama_io_read_i & io, uint32_t ce
     uint32_t n_rs_seq_ref;
     io.read(&marker,       sizeof(marker));
     io.read(&n_rs_seq_ref, sizeof(n_rs_seq_ref));
-    const bool has_exact_bit = marker == 0x52504C32; // 'RPL2'
-    if (marker != 0x52504C59 && !has_exact_bit) {
+    if (marker != 0x52504C59) {
         LLAMA_LOG_ERROR("%s: state blob has no gdn_replay section (written without --gdn-replay?)\n", __func__);
         return false;
     }
@@ -1257,10 +1246,6 @@ bool llama_memory_recurrent::state_read_replay(llama_io_read_i & io, uint32_t ce
     for (uint32_t i = 0; i < cell_count; ++i) {
         uint32_t span;
         io.read(&span, sizeof(span));
-        const bool s_exact = has_exact_bit && (span & REPLAY_SPAN_S_EXACT);
-        if (has_exact_bit) {
-            span &= ~REPLAY_SPAN_S_EXACT;
-        }
         if (span > n_rs_seq) {
             LLAMA_LOG_ERROR("%s: invalid checkpoint span %u > n_rs_seq %u\n", __func__, span, n_rs_seq);
             return false;
@@ -1269,11 +1254,9 @@ bool llama_memory_recurrent::state_read_replay(llama_io_read_i & io, uint32_t ce
             if (seq >= 0 && (size_t) seq < ckpt_span.size()) {
                 ckpt_span[seq]  = span;
                 replay_len[seq] = 0;
-                // s_l now holds the state the writer had. Unless the writer flagged it as the
-                // logical state (no rollback pending), the logical state is s_ckpt + ring[0, span)
-                // and must be rebuilt on the next decode. Resuming from an exact s_l keeps a
-                // 16-bit state bit-identical to the uninterrupted sequence.
-                s_stale[seq]    = s_exact ? 0 : 1;
+                // s_l now holds the optimistic state the writer had; the logical state is
+                // s_ckpt + ring[0, span) and must be rebuilt on the next decode.
+                s_stale[seq]    = 1;
             }
         }
     }
@@ -1421,9 +1404,7 @@ void llama_memory_recurrent::state_write_replay(llama_io_write_i & io, const std
     // section header: a marker so a non-replay reader fails on a size mismatch rather than
     // misparsing, the ring capacity, then the per-cell span of the logical state behind the
     // checkpoint (s_ckpt + ring[0, span) == the state the blob represents).
-    // 'RPL2': the span's top bit (REPLAY_SPAN_S_EXACT) says the s_l row is the logical state.
-    // 'RPLY' (older writers) had no such bit, so its reader always rebuilt.
-    const uint32_t marker = 0x52504C32; // 'RPL2'
+    const uint32_t marker = 0x52504C59; // 'RPLY'
     io.write(&marker,   sizeof(marker));
     io.write(&n_rs_seq, sizeof(n_rs_seq));
     for (const uint32_t span : cell_spans) {
@@ -1935,16 +1916,6 @@ static bool rs_ring_needs_older(const llama_memory_recurrent * mem, uint32_t cel
     return src0 >= 0 && (uint32_t) src0 != cell && src0 != mem->rs_z;
 }
 
-// PCRAM1: an extra cell (inside [head, head + n_rs) but holding a sequence that is not in this
-// ubatch, typically one find_slot swapped out of the way) is re-based to plane 0 by build_rs's
-// extra-state copy. Its K - 1 older groups must travel with it, plane for plane, or that
-// sequence loses its rollback history in the middle of a speculative round (the server then
-// aborts in seq_rm on the bystander's next partial rejection). Moved or not, the base changes.
-static bool rs_ring_extra_needs_older(const llama_memory_recurrent * mem, uint32_t cell) {
-    const int32_t src0 = mem->cells[cell].src0;
-    return mem->n_rs_seq > 0 && !mem->cells[cell].seq_id.empty() && src0 >= 0 && src0 != mem->rs_z;
-}
-
 uint32_t llama_memory_recurrent_context::get_n_older() const {
     if (!get_rs_ring()) {
         return 0;
@@ -1952,17 +1923,13 @@ uint32_t llama_memory_recurrent_context::get_n_older() const {
     const llama_ubatch & ubatch = get_ubatch();
     const uint32_t K = mem->n_rs_seq + 1;
     const uint32_t n = ubatch.n_seq_tokens;
-    uint32_t rows = 0;
-    if (n < K) {
-        for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
-            if (rs_ring_needs_older(mem, mem->head + s)) {
-                rows += K - n;
-            }
-        }
+    if (n >= K) {
+        return 0;
     }
-    for (uint32_t s = ubatch.n_seqs; s < get_n_rs(); ++s) {
-        if (rs_ring_extra_needs_older(mem, mem->head + s)) {
-            rows += K - 1;
+    uint32_t rows = 0;
+    for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
+        if (rs_ring_needs_older(mem, mem->head + s)) {
+            rows += K - n;
         }
     }
     return rows;
@@ -1980,11 +1947,6 @@ void llama_memory_recurrent_context::fill_rs_ring(int32_t * copy, int32_t * wr, 
     const bool     older     = n < K;
     GGML_ASSERT(n_written == 0 || (wr != nullptr && wr_conv != nullptr));
 
-    // PCRAM1: read every source base from the bases as they were before this ubatch. The loop
-    // re-bases each destination cell as it goes, and a later cell's source can be an earlier
-    // cell's destination (a bystander swapped out of a cell the ubatch now uses).
-    const std::vector<uint32_t> base_before = mem->rs_base;
-
     uint32_t k_old = 0;
     for (uint32_t i = 0; i < n_rs; ++i) {
         const uint32_t cell = mem->head + i;
@@ -1999,26 +1961,16 @@ void llama_memory_recurrent_context::fill_rs_ring(int32_t * copy, int32_t * wr, 
                 mem->rs_idx[seq] = 0; // consumed, like s_copy()
             }
         }
-        const uint32_t b = base_before[src0];
+        const uint32_t b = mem->rs_base[src0];
         copy[i] = (int32_t) (((b + r) % K) * size + src0);
 
         if (i >= n_seqs) {
-            // extra cell: build_rs copies its logical plane to plane 0 of its new home; the older
-            // groups follow at planes 1..K-1 (gathered before that copy, scattered after it), so
-            // the new base is 0 and rs_valid still holds. A cell with nothing to carry (empty, or a
-            // fresh seq sourced from rs_z) keeps the old honest answer: no history.
+            // extra cell: build_rs copies its logical plane to plane 0 of its new home and its
+            // older groups do not travel -- say so, instead of letting a later rollback read them
             mem->rs_base[cell] = 0;
-            if (rs_ring_extra_needs_older(mem, cell)) {
-                for (uint32_t g = 1; g < K; ++g) {
-                    old_src[k_old] = (int32_t) (((b + r + g) % K) * size + src0);
-                    old_dst[k_old] = (int32_t) (g * size + cell);
-                    ++k_old;
-                }
-            } else {
-                for (const llama_seq_id seq : mem->cells[cell].seq_id) {
-                    if (seq >= 0 && (size_t) seq < mem->rs_valid.size()) {
-                        mem->rs_valid[seq] = 0;
-                    }
+            for (const llama_seq_id seq : mem->cells[cell].seq_id) {
+                if (seq >= 0 && (size_t) seq < mem->rs_valid.size()) {
+                    mem->rs_valid[seq] = 0;
                 }
             }
             continue;

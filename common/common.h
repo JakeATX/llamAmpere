@@ -550,9 +550,6 @@ struct common_moe_cache_params {
     bool fit_selected          = false;
 };
 
-// --cache-ram not given: pick the prompt-cache RAM budget from the host's memory at startup
-#define COMMON_CACHE_RAM_AUTO (-2)
-
 struct common_params {
     int32_t n_predict             =    -1; // max. number of new tokens to predict, -1 == no limit
     int32_t n_ctx                 =     0; // context size, 0 == context the model was trained with
@@ -693,7 +690,6 @@ struct common_params {
     bool no_extra_bufts    = false; // disable extra buffer types (used for weight repacking)
     common_moe_cache_params moe_cache;
     bool no_host           = false; // bypass host buffer allowing extra buffers to be used
-    bool load_mtp          = false; // load MTP/NextN layers
 
     bool single_turn       = false; // single turn chat conversation
 
@@ -715,11 +711,8 @@ struct common_params {
     uint32_t sj_kvarn_edge_layers = 0; // tiered body: first/last N cache layers sealed at sj_kvarn_edge_bits_k/v
     uint32_t sj_kvarn_edge_bits_k = 4;
     uint32_t sj_kvarn_edge_bits_v = 4;
-    std::string sj_kvarn_transform;  // EXPERIMENTAL WUSH-KV transform file (--sjkvarn-transform)
     uint32_t sj_kvarn_flush_chunk = 0; // groups per decode step while an adaptive-tail flush drains (0 = one flush)
     ggml_type cache_type_s = GGML_TYPE_F32; // recurrent (gated delta-net) state cache data type
-
-    size_t moe_cache_size = 0; // GPU cache size in bytes for the MoE experts kept in the CPU
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 
@@ -766,14 +759,9 @@ struct common_params {
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
-    int32_t cache_ram_mib       = COMMON_CACHE_RAM_AUTO; // auto = sized from host RAM (see common_prompt_cache_ram_auto_mib),
-                                                             // -1 = half of the free host memory, 0 = disable, N = N MiB
-    bool        cache_disk      = true;  // prompt-cache disk tier (--no-cache-disk turns it off)
-    std::string cache_disk_path;         // disk tier directory (empty = common_prompt_cache_default_dir())
-    int32_t cache_disk_mib      = 16384; // disk tier size limit in MiB, -1 = no limit (free-space guard only), 0 = disable
-    int32_t cache_disk_min_free_mib = -1; // [#187] free space the disk tier leaves on its filesystem in MiB (-1 = max(10%, 8 GiB))
-    float   cache_disk_min_free_pct = -1.0f; // ... or as a percentage of the filesystem (-1 = unset; set by --cache-disk-min-free N%)
-    int32_t cache_ram_ckpt      = 4;     // RAM tier: newest context checkpoints kept per entry (+ log-spaced older), 0 = all
+    int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
+    std::string cache_disk_path;         // spill prompt-cache entries evicted from RAM to this directory (empty = off)
+    int32_t cache_disk_mib      = 0;     // disk tier size limit in MiB, 0 = no limit
 
     std::string public_path   = "";                                                                         // NOLINT
     std::string api_prefix    = "";                                                                         // NOLINT
@@ -865,11 +853,10 @@ struct common_params {
     int32_t i_chunk     =  0; // start processing from this chunk
     int8_t  imat_dat    =  0; // whether the legacy imatrix.dat format should be output (gguf <= 0 < dat)
 
-    bool process_output         = false; // collect data for the output tensor
-    bool compute_ppl            = true;  // whether to compute perplexity
-    bool show_statistics        = false; // show imatrix statistics per tensor
-    bool activation_statistics  = false; // generate data to calculate activation based statistics
-    bool parse_special          = false; // whether to parse special tokens during imatrix tokenization
+    bool process_output  = false; // collect data for the output tensor
+    bool compute_ppl     = true;  // whether to compute perplexity
+    bool show_statistics = false; // show imatrix statistics per tensor
+    bool parse_special   = false; // whether to parse special tokens during imatrix tokenization
 
     // cvector-generator params
     int n_pca_batch = 100;
@@ -1070,25 +1057,15 @@ inline bool common_create_directories(const std::filesystem::path & path, std::e
 
 std::filesystem::path fs_get_cache_directory();
 std::filesystem::path fs_get_cache_file(const std::string & filename);
-
-//
-// Prompt-cache defaults (llama-server)
-//
-
-// total and available host memory in bytes (MemTotal / MemAvailable on Linux); false if unknown
-bool common_host_memory(uint64_t & total, uint64_t & available);
-
-// RAM budget of the prompt cache when --cache-ram is not given, from the host's total memory:
-//   < 16 GB -> 2048 MiB, >= 16 -> 4096, >= 32 -> 8192, >= 64 -> 12288, >= 96 -> 16384, >= 128 -> 20480
-// A machine sold as N GB reports a little less than N GiB (firmware and iGPU reservations), so a tier is
-// reached once total memory is within 10% below its nominal size. The result is clamped to half of the
-// available memory. `why` receives a one-line explanation for the log.
-int32_t common_prompt_cache_ram_auto_mib(uint64_t total, uint64_t available, std::string & why);
-
-// default disk-tier directory: $XDG_CACHE_HOME/llamampere/prompt-cache, else ~/.cache/llamampere/prompt-cache
-// (~/Library/Caches/llamampere/prompt-cache on macOS, %LOCALAPPDATA%\llamampere\prompt-cache on Windows)
-std::filesystem::path common_prompt_cache_default_dir();
 std::filesystem::path fs_get_config_directory();
+
+struct common_file_info {
+    std::string path;
+    std::string name;
+    size_t      size = 0; // in bytes
+    bool        is_dir = false;
+};
+std::vector<common_file_info> fs_list(const std::string & path, bool include_directories);
 
 void fs_write_atomic(const std::filesystem::path & path, const std::string & data);
 
@@ -1098,7 +1075,6 @@ void fs_write_atomic(const std::filesystem::path & path, const std::string & dat
 
 // Auto-detect if colors can be enabled based on terminal and environment
 bool tty_can_use_colors();
-bool tty_enable_ansi(); // false when stdout or stderr is a console that cannot render ANSI sequences
 
 // Check if the given file is attached to a terminal
 bool common_is_tty(FILE * file);
@@ -1118,17 +1094,10 @@ enum common_decision_type {
     COMMON_DECISION_TYPE_NIMBLE,  // same as openjev, the prompt lists all the questions of the request
     COMMON_DECISION_TYPE_LAYA,    // score of one marker token per option, read from the embeddings output
     COMMON_DECISION_TYPE_CLEF,    // all questions in one prompt, score of option i read from the embeddings output at row i
-    COMMON_DECISION_TYPE_PPLX_DECIDER, // same as openjev, label codes of 1 or 2 letters
-    COMMON_DECISION_TYPE_LFM2_D1, // same as openjev, the labels depend on the question type
-    COMMON_DECISION_TYPE_LFM2_D1_OMNI, // same as laya, other prompt layout
     COMMON_DECISION_TYPE_UNKNOWN, // a decision model of a type that is not supported
 };
 
 common_decision_type common_get_decision_type(const struct llama_model * model);
-
-// same as above, but reads a GGUF file; it does not load the model
-// returns COMMON_DECISION_TYPE_UNKNOWN if the file is missing, unreadable, or invalid
-common_decision_type common_get_decision_type(const std::string & fname);
 
 // note: defines the model, context, samplers, ets. lifetimes
 struct common_init_result {
@@ -1463,13 +1432,10 @@ struct common_prompt_checkpoint {
             llama_pos pos_min,
             llama_pos pos_max);
 
-    // spare: an optional buffer of an erased checkpoint; when it fits, it takes the place of a fresh allocation
-    // (a fresh 150 MiB buffer costs ~60 ms of page faults and zero fill before the copy even starts)
     void update_tgt(
             llama_context * ctx,
             llama_seq_id seq_id,
-            llama_state_seq_flags flags,
-            std::vector<uint8_t> * spare = nullptr);
+            llama_state_seq_flags flags);
 
     void update_dft(
             llama_context * ctx,

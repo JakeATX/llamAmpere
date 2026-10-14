@@ -40,8 +40,6 @@ struct llama_model;
 struct llama_layer;
 struct llama_prec_policy;
 
-class llama_moe_cache;
-
 struct llama_memory_context_i;
 
 class llama_kv_cache_context;
@@ -157,14 +155,8 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override;
 
-    ggml_tensor * tokens       = nullptr; // I32 [n_batch]
-    ggml_tensor * embd         = nullptr; // F32 [n_embd, n_batch]
-    ggml_tensor * mixed_tokens = nullptr; // I32 [n_tok_rows], mixed path: ids of the token rows
-    ggml_tensor * mixed_slots  = nullptr; // I64 [n_tok_rows], mixed path: batch index of the token rows
-    ggml_tensor * mixed_embd   = nullptr; // F32 [n_embd, n_batch], mixed path: embd rows, token rows are overwritten
-    ggml_tensor * scale_rows   = nullptr; // F32 [1, n_batch], per-row scale: scale_tok for token rows, 1 for embd rows
-
-    float scale_tok = 1.0f;
+    ggml_tensor * tokens = nullptr; // I32 [n_batch]
+    ggml_tensor * embd   = nullptr; // F32 [n_embd, n_batch]
 
     const int64_t n_embd = 0;
 };
@@ -421,8 +413,6 @@ public:
     // SJ-KVaRN: I32 region descriptor (sink/ring/body bounds for this ubatch), nullptr unless the cache is SJ-KVaRN
     ggml_tensor * self_sj_kvarn_desc = nullptr;
     ggml_tensor * self_sj_kvarn_desc_edge = nullptr; // tiered body: descriptor of the edge tier (nullptr unless edge layers exist)
-    // multi-stream SJ-KVaRN: attended (padded) position count per stream of the ubatch; one FA node per stream
-    std::vector<uint32_t> sj_kvarn_n_kv_streams;
 
     // note: these have to be copies because in order to be able to reuse a graph, its inputs
     //       need to carry these parameters with them. otherwise, they can point to freed
@@ -883,7 +873,6 @@ struct llm_graph_params {
     const llama_cross            * cross;
     const llama_hadamard_rotations * hadamard_rotations;
     const llama_hadamard_rotations * hadamard_inverses;
-    const llama_moe_cache        * moe_cache;
 
     const llama_prec_policy * prec_policy = nullptr;
 
@@ -927,11 +916,6 @@ struct llm_graph_params {
     // owning model (EXL3 side tensors for build_lora_mm); may be null for graphs that carry no EXL3 weights
     const llama_model * model = nullptr;
 
-    // true for a graph built only to reserve compute buffers (llama_context::graph_reserve): its output rows are
-    // placeholders and may sit on sequences that have no backend sampler (none is attached yet at context creation)
-    // set after construction, so it stays last
-    bool is_reserve = false;
-
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -942,7 +926,6 @@ struct llm_graph_params {
             ubatch.n_seq_tokens == other.ubatch.n_seq_tokens &&
             ubatch.n_seqs       == other.ubatch.n_seqs &&
             ubatch.n_seqs_unq   == other.ubatch.n_seqs_unq &&
-            ubatch.is_mixed()   == other.ubatch.is_mixed() &&
             (
                 (!ubatch.token && !other.ubatch.token) ||
                 (!ubatch.embd  && !other.ubatch.embd)  ||
@@ -1158,7 +1141,6 @@ struct llm_graph_context {
     const llama_cross            * cross;
     const llama_hadamard_rotations * hadamard_rotations;
     const llama_hadamard_rotations * hadamard_inverses;
-    const llama_moe_cache        * moe_cache;
 
     const llama_prec_policy * prec_policy;
 
@@ -1168,7 +1150,6 @@ struct llm_graph_context {
     ggml_tensor       * draft_vocab_compact;     // see llm_graph_params
     const ggml_tensor * draft_vocab_compact_src; // see llm_graph_params
     std::atomic<uint32_t> * draft_vocab_warned; // see llm_graph_params
-    const bool is_reserve; // see llm_graph_params
     const std::vector<float> * mtp_chain_samp; // see llm_graph_params
 
     // [#81] logits of the compact draft head for `cur` [n_embd, n], [n_sel, n]: plain mul_mat on the activation the
@@ -1197,29 +1178,12 @@ struct llm_graph_context {
         int32_t bits_k = 0;
         int32_t bits_v = 0;
         bool fused_rot = false; // Q/output rotation inside the FA node (ggml_sj_kvarn_fused_rot_enabled)
-        const std::vector<uint32_t> * n_kv_streams = nullptr; // multi-stream: per-stream n_kv (see llm_graph_input_attn_kv)
-        ggml_tensor * wush_ao = nullptr; // EXPERIMENTAL WUSH-KV: output transform replacing the inverse Hadamard
     } sj_kvarn_pending;
-    // multi-stream SJ-KVaRN: per-stream mask views cut to the stream's own n_kv are not contiguous when the ubatch
-    // has more than one token row, and FA needs a contiguous mask; the contiguous copies are made once per graph
-    // (the mask is shared by every layer)
-    mutable ggml_tensor * sj_kvarn_mask_src = nullptr;
-    mutable std::vector<ggml_tensor *> sj_kvarn_mask_s;
 
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;
 
     void cb(ggml_tensor * cur, const char * name, int il) const;
-
-    // true when the last layer must be narrowed to the output rows before the nextn hidden state is captured
-    bool crop_before_nextn(const ggml_tensor * inp_out_ids) const {
-        return inp_out_ids != nullptr && (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked);
-    }
-
-    // true when the nextn hidden state must be narrowed to the output rows after it is captured
-    bool crop_after_nextn(const ggml_tensor * inp_out_ids) const {
-        return inp_out_ids != nullptr && cparams.embeddings_nextn && !cparams.embeddings_nextn_masked;
-    }
 
     //
     // common
@@ -1236,13 +1200,11 @@ struct llm_graph_context {
               ggml_tensor * w_s = nullptr) const;
 
     // do mat_mul_id, while optionally apply lora and per-expert scale
-    // if slots is set, the experts are read from the MoE cache at these slots (see build_moe_cache_slots)
     ggml_tensor * build_lora_mm_id(
               ggml_tensor * w,   // ggml_tensor * as
               ggml_tensor * cur, // ggml_tensor * b
               ggml_tensor * ids,
-              ggml_tensor * w_s   = nullptr,
-              ggml_tensor * slots = nullptr) const;
+              ggml_tensor * w_s = nullptr) const;
 
     ggml_tensor * build_norm(
              ggml_tensor * cur,
@@ -1338,22 +1300,11 @@ struct llm_graph_context {
              ggml_tensor * gate_exps_s = nullptr,
              ggml_tensor * down_exps_s = nullptr,
              ggml_tensor * selected_experts_in = nullptr) const;
-
-    // the slots of the selected experts in the MoE cache, nullptr if the experts of the layer are not read from the cache
-    ggml_tensor * build_moe_cache_slots(
-             ggml_tensor * selected_experts,
-             ggml_tensor * up_exps,
-             ggml_tensor * gate_exps,
-             ggml_tensor * down_exps,
-             ggml_tensor * gate_up_exps,
-                     int   il) const;
-
     //
     // inputs
     //
 
-    // tok_scale: applied to token rows only
-    ggml_tensor * build_inp_embd(ggml_tensor * tok_embd, float tok_scale = 1.0f) const;
+    ggml_tensor * build_inp_embd(ggml_tensor * tok_embd) const;
     ggml_tensor * build_hadamard_inverse(ggml_tensor * table, ggml_tensor * cur) const;
     ggml_tensor * build_inp_pos() const;
     ggml_tensor * build_inp_attn_scale() const;

@@ -845,6 +845,112 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = NULL, // not row-addressable: ggml_exl3_dequantize_row_group
         .from_float_ref           = NULL,
     },
+    [GGML_TYPE_AI4] = {
+        .type_name                = "ai4", // "d2" before the 2026-10-07 rename; GGUF stores the id (70), not this name
+        .blck_size                = 1024,
+        .type_size                = 528,
+        .is_quantized             = true,
+        .to_float                 = NULL, // not row-addressable: 16-row slabs (ggml-ai4.h)
+        .from_float_ref           = NULL,
+    },
+    [GGML_TYPE_AI4_U] = {
+        .type_name                = "ai4u",
+        .blck_size                = 128,
+        .type_size                = 66,   // per row and 128 K (fp16 scale + 128 x 4 bits), stored as 16-row units
+        .is_quantized             = true,
+        .to_float                 = NULL, // not row-addressable: 16-row units (ggml-ai4.h)
+        .from_float_ref           = NULL,
+    },
+    [GGML_TYPE_AI5_U] = {
+        .type_name                = "ai5u",
+        .blck_size                = 128,
+        .type_size                = 82,   // per row and 128 K (fp16 scale + 128 x 5 bits), stored as 16-row units
+        .is_quantized             = true,
+        .to_float                 = NULL, // not row-addressable: 16-row units (ggml-ai4.h)
+        .from_float_ref           = NULL,
+    },
+    [GGML_TYPE_AI3_U] = {
+        .type_name                = "ai3u",
+        .blck_size                = 128,
+        .type_size                = 50,   // fp16 scale + 128 x 3 bits
+        .is_quantized             = true,
+        .to_float                 = NULL, // not row-addressable: 16-row units (ggml-ai4.h)
+        .from_float_ref           = NULL,
+    },
+    [GGML_TYPE_AI2_U] = {
+        .type_name                = "ai2u",
+        .blck_size                = 128,
+        .type_size                = 34,   // fp16 scale + 128 x 2 bits
+        .is_quantized             = true,
+        .to_float                 = NULL, // not row-addressable: 16-row units (ggml-ai4.h)
+        .from_float_ref           = NULL,
+    },
+    [GGML_TYPE_AI6_U] = {
+        .type_name                = "ai6u",
+        .blck_size                = 128,
+        .type_size                = 98,   // fp16 scale + 128 x 6 bits
+        .is_quantized             = true,
+        .to_float                 = NULL, // not row-addressable: 16-row units (ggml-ai4.h)
+        .from_float_ref           = NULL,
+    },
+    // private A/B controls, do not ship
+    [GGML_TYPE_AI6_UO] = {
+        .type_name                = "ai6uo",
+        .blck_size                = 128,
+        .type_size                = 98,
+        .is_quantized             = true,
+        .to_float                 = NULL,
+        .from_float_ref           = NULL,
+    },
+    [GGML_TYPE_AI5_UN] = {
+        .type_name                = "ai5un",
+        .blck_size                = 128,
+        .type_size                = 82,
+        .is_quantized             = true,
+        .to_float                 = NULL,
+        .from_float_ref           = NULL,
+    },
+    // AI+ span layout: one fp16 scale per row and 1024 K, so type_size = 128 * k + 2 per row and 1024 weights
+    [GGML_TYPE_AI2_S] = {
+        .type_name                = "ai2s",
+        .blck_size                = 1024,
+        .type_size                = 258,  // 2 + 128 * 2
+        .is_quantized             = true,
+        .to_float                 = NULL, // not row-addressable: 16-row x 1024-K spans (ggml-ai4.h)
+        .from_float_ref           = NULL,
+    },
+    [GGML_TYPE_AI3_S] = {
+        .type_name                = "ai3s",
+        .blck_size                = 1024,
+        .type_size                = 386,  // 2 + 128 * 3
+        .is_quantized             = true,
+        .to_float                 = NULL,
+        .from_float_ref           = NULL,
+    },
+    [GGML_TYPE_AI4_S] = {
+        .type_name                = "ai4s",
+        .blck_size                = 1024,
+        .type_size                = 514,  // 2 + 128 * 4
+        .is_quantized             = true,
+        .to_float                 = NULL,
+        .from_float_ref           = NULL,
+    },
+    [GGML_TYPE_AI5_S] = {
+        .type_name                = "ai5s",
+        .blck_size                = 1024,
+        .type_size                = 642,  // 2 + 128 * 5
+        .is_quantized             = true,
+        .to_float                 = NULL,
+        .from_float_ref           = NULL,
+    },
+    [GGML_TYPE_AI6_S] = {
+        .type_name                = "ai6s",
+        .blck_size                = 1024,
+        .type_size                = 770,  // 2 + 128 * 6
+        .is_quantized             = true,
+        .to_float                 = NULL,
+        .from_float_ref           = NULL,
+    },
     [GGML_TYPE_MXFP4] = {
         .type_name                = "mxfp4",
         .blck_size                = QK_MXFP4,
@@ -908,6 +1014,38 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .is_quantized             = true,
         .to_float                 = (ggml_to_float_t) dequantize_row_tq3_1s,
         .from_float_ref           = (ggml_from_float_t) quantize_row_tq3_1s_ref,
+    },
+    [GGML_TYPE_RQ4_G128] = {
+        .type_name                = "rq4_g128",
+        .blck_size                = RQ4_SB,
+        .type_size                = 528,
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_rq4_g128,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_rq4_g128_ref,
+    },
+    [GGML_TYPE_RQ4_G64] = {
+        .type_name                = "rq4_g64",
+        .blck_size                = RQ4_SB,
+        .type_size                = 544,
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_rq4_g64,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_rq4_g64_ref,
+    },
+    [GGML_TYPE_RQ4NL_G128] = {
+        .type_name                = "rq4nl_g128",
+        .blck_size                = RQ4_SB,
+        .type_size                = 528,
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_rq4nl_g128,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_rq4nl_g128_ref,
+    },
+    [GGML_TYPE_RQ4NL_G64] = {
+        .type_name                = "rq4nl_g64",
+        .blck_size                = RQ4_SB,
+        .type_size                = 544,
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_rq4nl_g64,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_rq4nl_g64_ref,
     },
     [GGML_TYPE_TQ4_1S] = {
         .type_name                = "tq4_1s",
@@ -1519,6 +1657,79 @@ bool ggml_is_quantized(enum ggml_type type) {
 
 int ggml_exl3_bits(enum ggml_type type) {
     return (type >= GGML_TYPE_EXL3_2 && type <= GGML_TYPE_EXL3_8) ? 2 + (int) (type - GGML_TYPE_EXL3_2) : 0;
+}
+
+// ---- AI+ (ggml-ai4.h): rate, layout and the per-type decoder constant / encoder scale seed ----
+int ggml_ai4_rate(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_AI4:     return 4;   // 1024 slab layout
+        case GGML_TYPE_AI4_U:   return 4;
+        case GGML_TYPE_AI3_U:   return 3;
+        case GGML_TYPE_AI2_U:   return 2;
+        case GGML_TYPE_AI5_U:   return 5;
+        case GGML_TYPE_AI6_U:   return 6;
+        case GGML_TYPE_AI6_UO:  return 6;   // private control
+        case GGML_TYPE_AI5_UN:  return 5;   // private control
+        case GGML_TYPE_AI2_S:   return 2;   // span layout (one scale per row and 1024 K)
+        case GGML_TYPE_AI3_S:   return 3;
+        case GGML_TYPE_AI4_S:   return 4;
+        case GGML_TYPE_AI5_S:   return 5;
+        case GGML_TYPE_AI6_S:   return 6;
+        default:                return 0;
+    }
+}
+
+// true for the scale-free span layout (AIk_S): 16 rows x 1024 K blocks, one fp16 scale per row and span
+bool ggml_ai4_is_span(enum ggml_type type) {
+    return type >= GGML_TYPE_AI2_S && type <= GGML_TYPE_AI6_S;
+}
+
+// true only for the unit-128 layout (AIk_U): the span types carry a scale per 1024 K, the AI4 slab one per 128 K
+bool ggml_ai4_is_unit(enum ggml_type type) {
+    return ggml_ai4_rate(type) != 0 && type != GGML_TYPE_AI4 && !ggml_ai4_is_span(type);
+}
+
+// 0 = AI4 1024-slab, 1 = AIk_U unit-128, 2 = AIk_S span-1024; the three byte layouts a decoder must tell apart
+int ggml_ai4_layout(enum ggml_type type) {
+    if (ggml_ai4_rate(type) == 0) { return -1; }
+    return ggml_ai4_is_span(type) ? 2 : (type == GGML_TYPE_AI4 ? 0 : 1);
+}
+
+// the AIk_U type with the same rate and constant as an AIk_S type (the repack source), or GGML_TYPE_COUNT
+enum ggml_type ggml_ai4_span_to_unit(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_AI2_S:   return GGML_TYPE_AI2_U;
+        case GGML_TYPE_AI3_S:   return GGML_TYPE_AI3_U;
+        case GGML_TYPE_AI4_S:   return GGML_TYPE_AI4_U;
+        case GGML_TYPE_AI5_S:   return GGML_TYPE_AI5_U;
+        case GGML_TYPE_AI6_S:   return GGML_TYPE_AI6_U;
+        default:                return GGML_TYPE_COUNT;
+    }
+}
+
+// The level of a 16-bit state is ((bytesum(state * C) + 2) >> 2) - 128, so C is part of the type.
+uint32_t ggml_ai4_trellis_mul(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_AI6_U:   return 0xA1EEE321u;   // held-out constant search: -3.0% weight error at k = 6
+        case GGML_TYPE_AI6_S:   return 0xA1EEE321u;   // same trellis as AI6_U
+        case GGML_TYPE_AI5_UN:  return 0x9C971CDDu;   // private control: an alternate constant at k = 5
+        default:                return ggml_ai4_rate(type) ? 0x83DCD12Du : 0u;
+    }
+}
+
+// Encoder scale seed = group rms / level rms * this (per-rate probe value; the encoder, not the decoder, uses it).
+float ggml_ai4_scale_mul(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_AI2_U:
+        case GGML_TYPE_AI2_S:   return 1.00f;
+        case GGML_TYPE_AI3_U:
+        case GGML_TYPE_AI3_S:   return 1.07f;
+        case GGML_TYPE_AI6_U:
+        case GGML_TYPE_AI6_S:   return 1.15f;
+        case GGML_TYPE_AI6_UO:  return 1.17f;   // private control
+        case GGML_TYPE_AI5_UN:  return 1.10f;   // private control
+        default:                return ggml_ai4_rate(type) ? 1.10f : 0.0f;
+    }
 }
 
 const char * ggml_op_name(enum ggml_op op) {
@@ -8510,6 +8721,10 @@ size_t ggml_quantize_chunk(
         case GGML_TYPE_TQ5_0:   result = quantize_tq5_0  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_TQ3_1S:  result = quantize_tq3_1s(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_TQ4_1S:  result = quantize_tq4_1s(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_RQ4_G128: result = quantize_rq4_g128(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_RQ4_G64:  result = quantize_rq4_g64 (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_RQ4NL_G128: result = quantize_rq4nl_g128(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_RQ4NL_G64:  result = quantize_rq4nl_g64 (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_F16:
             {
                 size_t elemsize = sizeof(ggml_fp16_t);

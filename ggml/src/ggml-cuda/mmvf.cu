@@ -4,7 +4,6 @@
 #include "mmvf.cuh"
 
 #include <cstdlib>
-#include "mmf.cuh"
 #include "convert.cuh"
 
 template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false>
@@ -852,7 +851,7 @@ static bool ggml_cuda_mmvf_weight_is_narrow(const int cc, const enum ggml_type t
     return ne01 >= band.min && ne01 <= band.max;
 }
 
-bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const int64_t * src0_ne, const size_t * src0_nb, int64_t ne11) {
+bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0_ne, const size_t * src0_nb, int64_t ne11) {
     if (src0_ne[0] % 2 != 0) {
         return false;
     }
@@ -891,16 +890,12 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const
                     }
                     return ne11 <= 3;
                 }
-                return ne11 <= MMVF_MAX_BATCH_SIZE;
+                return ne11 <= 8;
             }
-            return ne11 <= MMVF_MAX_BATCH_SIZE;
+            return ne11 <= 8;
         case GGML_TYPE_F16:
             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
                 const bool src0_small = (src0_ne[1] <= 512 || src0_ne[2]*src0_ne[3] == 1);
-                // MMF needs full row tiles, for other row counts MMVF still beats cuBLAS at small batch size
-                if (src0_small && !ggml_cuda_should_use_mmf(type, cc, warp_size, src0_ne, src0_nb, ne11, /*mul_mat_id =*/ false)) {
-                    return ne11 <= MMVF_MAX_BATCH_SIZE;
-                }
                 if (ampere_mma_available(cc)) {
                     return src0_small && ne11 == 1;
                 }
@@ -910,11 +905,8 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const
                 if (fp16_mma_hardware_available(cc)) {
                     return src0_small && ne11 <= 3;
                 }
-                return ne11 <= MMVF_MAX_BATCH_SIZE;
+                return ne11 <= 8;
             } else if (GGML_CUDA_CC_IS_AMD(cc)) {
-                if (GGML_CUDA_CC_IS_RDNA(cc) && !ggml_cuda_should_use_mmf(type, cc, warp_size, src0_ne, src0_nb, ne11, /*mul_mat_id =*/ false)) {
-                    return ne11 <= MMVF_MAX_BATCH_SIZE;
-                }
                 if (fp16_mma_hardware_available(cc)) {
                     // Same narrow-weight case as F32 and BF16. The per-architecture limits below
                     // are tuned for weights wide enough to fill the GEMM; a narrow one has no rows
@@ -931,16 +923,12 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const
                     }
                     return ne11 <= 2;
                 }
-                return ne11 <= MMVF_MAX_BATCH_SIZE;
+                return ne11 <= 8;
             }
-            return ne11 <= MMVF_MAX_BATCH_SIZE;
+            return ne11 <= 8;
         case GGML_TYPE_BF16:
             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
                 const bool src0_small = (src0_ne[1] <= 512 || src0_ne[2]*src0_ne[3] == 1);
-                // MMF needs full row tiles, for other row counts MMVF still beats cuBLAS at small batch size
-                if (src0_small && !ggml_cuda_should_use_mmf(type, cc, warp_size, src0_ne, src0_nb, ne11, /*mul_mat_id =*/ false)) {
-                    return ne11 <= MMVF_MAX_BATCH_SIZE;
-                }
                 if (ampere_mma_available(cc)) {
                     return src0_small && ne11 == 1;
                 }
@@ -950,11 +938,8 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const
                 if (bf16_mma_hardware_available(cc)) {
                     return src0_small && ne11 <= 3;
                 }
-                return ne11 <= MMVF_MAX_BATCH_SIZE;
+                return ne11 <= 8;
             } else if (GGML_CUDA_CC_IS_AMD(cc)) {
-                if (GGML_CUDA_CC_IS_RDNA(cc) && !ggml_cuda_should_use_mmf(type, cc, warp_size, src0_ne, src0_nb, ne11, /*mul_mat_id =*/ false)) {
-                    return ne11 <= MMVF_MAX_BATCH_SIZE;
-                }
                 if (bf16_mma_hardware_available(cc)) {
                     // Same narrow-weight case as F32 above, and worse here: on CDNA2 mmf refuses
                     // BF16 outright, so above this limit there is no vector path left and the op
@@ -966,9 +951,9 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const
                     }
                     return ne11 <= 3;
                 }
-                return ne11 <= MMVF_MAX_BATCH_SIZE;
+                return ne11 <= 8;
             }
-            return ne11 <= MMVF_MAX_BATCH_SIZE;
+            return ne11 <= 8;
         default:
             return false;
     }

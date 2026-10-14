@@ -87,73 +87,6 @@ void ggml_cuda_lowbits_prefill_case(ggml_backend_cuda_context & ctx, ggml_tensor
 }
 
 
-// [TRPF] Trellis body expand for the prefill path (fattn-sjkvarn-prefill.cu): every sealed record of the visible body is
-// decoded ONCE per attention call into the f16 K/V scratch ([head][n_kv][128 half2], row = position), which the plain f16
-// MMA kernel then shares across all query tiles. The values come from flash_attn_ext_sj_kvarn_load_tile, the same loader
-// (word-load decode, staged codebooks, same half2 affine) the fused low-bit kernel runs per tile, so they are bit-identical
-// to what that kernel feeds its MMAs. Rows outside [S, B) are written by fattn_sj_kvarn_expand_prefill (skip_body).
-// One CTA = 64 positions (4 strips of 16) of one KV head; strips outside the body are skipped individually.
-template<int bits_k, int bits_v>
-static __global__ void __launch_bounds__(256) fattn_sj_kvarn_trellis_expand_body_kernel(
-        const char * __restrict__ body, const int32_t * __restrict__ desc,
-        const size_t k_head_stride, const size_t v_head_stride,
-        half2 * __restrict__ K_out, half2 * __restrict__ V_out, const int n_out, const int p_begin, const int head_first) {
-    constexpr int D2   = 128;
-    constexpr int rows = 16;
-    constexpr int per_block = 64;
-    __shared__ __align__(16) half2 tile_K[rows*D2];
-    __shared__ __align__(16) half2 tile_V[rows*D2];
-    const int head = head_first + blockIdx.y;
-    const fattn_sj_kvarn_lowbits_ctx kv = fattn_sj_kvarn_lowbits_make_ctx(body, desc, head, 2*D2, bits_k | 8, bits_v, k_head_stride, v_head_stride);
-    const int pb = p_begin + blockIdx.x*per_block; // positions [p_begin, p_begin + n_out) -> rows [0, n_out)
-    if (pb + per_block <= kv.S || pb >= kv.B) {
-        return; // block-uniform: before the staging barrier
-    }
-    fattn_sj_kvarn_trellis_cb_stage<bits_k, bits_v>();
-    const int tid = threadIdx.y*32 + threadIdx.x;
-#pragma unroll 1
-    for (int p0 = pb; p0 < pb + per_block; p0 += rows) {
-        if (p0 < kv.S || p0 >= kv.B) {
-            continue; // block-uniform
-        }
-        const int group = (p0 - kv.S)/kv.G;
-        const int token = (p0 - kv.S)%kv.G;
-        const char * rec = fattn_sj_kvarn_rec(kv, group);
-        flash_attn_ext_sj_kvarn_load_tile<D2, false, rows, 256, D2, false, false>(rec, token, kv, tile_K, rows);
-        flash_attn_ext_sj_kvarn_load_tile<D2, false, rows, 256, D2, false, true >(rec, token, kv, tile_V, rows);
-        __syncthreads();
-        const size_t out_offset = ((size_t) blockIdx.y*n_out + (p0 - p_begin))*D2;
-        const uint4 * sk = (const uint4 *) tile_K;
-        const uint4 * sv = (const uint4 *) tile_V;
-        uint4 * gk = (uint4 *) (K_out + out_offset);
-        uint4 * gv = (uint4 *) (V_out + out_offset);
-        for (int i = tid; i < rows*D2/4; i += 256) {
-            gk[i] = sk[i];
-            gv[i] = sv[i];
-        }
-        __syncthreads();
-    }
-}
-
-void ggml_cuda_sj_kvarn_trellis_expand_body(const int bits_pair, const char * body, const int32_t * desc,
-        const size_t k_head_stride, const size_t v_head_stride, half2 * K_out, half2 * V_out, const int n_out, const int p_begin,
-        const int heads, const int head_first, cudaStream_t stream) {
-    ggml_cuda_sj_kvarn_trellis_cb_init();
-    GGML_ASSERT(n_out % 64 == 0 && p_begin % 64 == 0);
-    const dim3 blocks(n_out/64, heads, 1);
-    const dim3 threads(32, 8, 1);
-    switch (bits_pair) {
-        case (3 << 8) | 3: fattn_sj_kvarn_trellis_expand_body_kernel<3,3><<<blocks, threads, 0, stream>>>(body, desc, k_head_stride, v_head_stride, K_out, V_out, n_out, p_begin, head_first); break;
-        case (3 << 8) | 2: fattn_sj_kvarn_trellis_expand_body_kernel<3,2><<<blocks, threads, 0, stream>>>(body, desc, k_head_stride, v_head_stride, K_out, V_out, n_out, p_begin, head_first); break;
-        case (2 << 8) | 2: fattn_sj_kvarn_trellis_expand_body_kernel<2,2><<<blocks, threads, 0, stream>>>(body, desc, k_head_stride, v_head_stride, K_out, V_out, n_out, p_begin, head_first); break;
-        default: GGML_ABORT("SJ-KVaRN trellis expand: unsupported pair %d/%d", bits_pair >> 8, bits_pair & 0xFF);
-    }
-    CUDA_CHECK(cudaGetLastError());
-}
-
-bool ggml_cuda_flash_attn_ext_sj_kvarn_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * dst);         // fattn-sjkvarn-prefill.cu
-bool ggml_cuda_flash_attn_ext_sj_kvarn_prefill_applies(int device, const ggml_tensor * dst);              // fattn-sjkvarn-prefill.cu
-
 // GGML_SJKVARN_NO_DIRECT=1 (same switch as the 4/4 path): every width through the tile loader, so a scalar arm can be
 // compared with a trellis arm on one decoder
 static bool sj_kvarn_lowbits_no_direct() {
@@ -189,12 +122,6 @@ static void ggml_cuda_lowbits_case(ggml_backend_cuda_context & ctx, ggml_tensor 
         // trellis-coded body: the stream kernel has no codebook path, the tile loader decodes every width from the
         // codebooks staged in shared memory (#126). Only 3/3, 3/2 and 2/2 seal a 2/3-bit trellis body (llama-context.cpp).
         if constexpr (bits_k <= 3 && bits_v <= 3) {
-            if constexpr (!rot) {
-                // [TRPF] n_q >= 128: expand each record once into f16, then the plain f16 MMA kernel (fattn-sjkvarn-prefill.cu)
-                if (ggml_cuda_flash_attn_ext_sj_kvarn_prefill(ctx, dst)) {
-                    return;
-                }
-            }
             ggml_cuda_sj_kvarn_trellis_cb_init();
             if (sj_kvarn_trellis_words()) {
                 sj_kvarn_trellis_words_note();
@@ -235,9 +162,6 @@ static void ggml_cuda_lowbits_case_rot(ggml_backend_cuda_context & ctx, ggml_ten
         (!trellis || sj_kvarn_trellis_words());
     if constexpr (bits_k == 4 && bits_v == 4) {
         in_kernel = false;
-    }
-    if (trellis && ggml_cuda_flash_attn_ext_sj_kvarn_prefill_applies(ggml_cuda_get_device(), dst)) {
-        in_kernel = false; // [TRPF] the expand path runs plain f16 attention: separate rotation passes around it
     }
     if (!in_kernel) {
         ggml_cuda_flash_attn_ext_sj_kvarn_rot_unfused(ctx, dst, ggml_cuda_flash_attn_sj_kvarn_lowbits);

@@ -14,10 +14,6 @@ on:
             - 'docs/ops/**'
             - 'scripts/create_ops_docs.py'
 
-cache-mode: none
-permissions:
-  contents: read
-
 jobs:
     update-ops-docs:
         runs-on: ubuntu-slim

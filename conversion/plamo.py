@@ -64,7 +64,7 @@ class Plamo2Model(TextModel):
     model_arch = gguf.MODEL_ARCH.PLAMO2
 
     def set_vocab(self):
-        self._set_vocab_plamo(eot_token="<|plamo:op|>")
+        self._set_vocab_plamo()
 
     def set_gguf_parameters(self):
         hparams = self.hparams
@@ -170,10 +170,7 @@ class Plamo3Model(TextModel):
             })
 
     def set_vocab(self):
-        self._set_vocab_plamo(
-            eot_token="<|plamo:tag|>",
-            normal_tokens=("<|plamo:begin_", "<|plamo:end_", ":plamo|>"),
-        )
+        self._set_vocab_plamo()
 
         tokenizer_config_path = self.dir_model / "tokenizer_config.json"
         tokenizer_config = {}

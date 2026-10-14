@@ -42,7 +42,6 @@ int llama_server(int argc, char ** argv);
 
 // to be used via CLI (argc / argv are used by router mode only)
 int llama_server(common_params & params, int argc, char ** argv);
-int llama_server(common_params & params, int argc, char ** argv, server_child & child);
 void llama_server_terminate();
 void llama_server_terminate() {
     if (shutdown_handler) {
@@ -92,8 +91,6 @@ static server_http_context::handler_t ex_wrapper(server_http_context::handler_t 
 }
 
 int llama_server(int argc, char ** argv) {
-    server_child child;
-
     std::setlocale(LC_NUMERIC, "C");
 
 #ifndef _WIN32
@@ -119,17 +116,12 @@ int llama_server(int argc, char ** argv) {
     llama_backend_init();
     llama_numa_init(params.numa);
 
-    const int result = llama_server(params, argc, argv, child);
+    const int result = llama_server(params, argc, argv);
     common_log_flush(common_log_main());
     return result;
 }
 
 int llama_server(common_params & params, int argc, char ** argv) {
-    server_child child;
-    return llama_server(params, argc, argv, child);
-}
-
-int llama_server(common_params & params, int argc, char ** argv, server_child & child) {
     bool is_run_by_cli = (argv == nullptr);
 
     common_models_handler models_handler;
@@ -203,6 +195,7 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
     //
 
     // register API routes
+    server_child child; // only used in non-router mode
     server_routes routes(params, ctx_server);
     server_tools tools;
 

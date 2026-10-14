@@ -28,7 +28,6 @@
 #include "llama-mtp-vocab-builtin.h"
 #include "llama-draft-vocab-compact.h"
 #include "llama-mtp-chain-sample.h"
-#include "llama-moe-cache.h"
 #include "llama-ext.h"
 #include "llama-sampler.h"
 #include "llama.h"
@@ -183,9 +182,7 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
     model(model),
     cvec(std::make_unique<llama_adapter_cvec>()),
     loras(std::make_unique<llama_adapter_loras>()),
-    // MTP uses the embd input for the hidden state
-    balloc(std::make_unique<llama_batch_allocr>(model.hparams.n_pos_per_embd(),
-                llm_arch_supports_mixed_batch(model.arch) && params.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT)) {
+    balloc(std::make_unique<llama_batch_allocr>(model.hparams.n_pos_per_embd())) {
     // TODO warning when creating llama_context with awkward ctx size that is not a power of 2,
     //     may need to be backend-dependent
     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
@@ -425,19 +422,8 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
         }
     }
 
-    cparams.op_offload     = params.op_offload;
-    cparams.kv_unified     = params.kv_unified;
-    cparams.moe_cache_size = params.moe_cache_size;
-
-    // SJ-KVaRN keeps one sink/ring stream per sequence in every mode; --kv-unified shares the sealed-record
-    // pool between them instead (every sequence may address the whole context), so the rest of the context
-    // runs the per-sequence-stream path: unified off, n_ctx_seq = n_ctx
-    const bool sj_kvarn_shared_pool = params.sj_kvarn_bits_k > 0 && params.sj_kvarn_bits_v > 0 &&
-        params.kv_unified && params.n_seq_max > 1;
-    if (sj_kvarn_shared_pool) {
-        cparams.kv_unified = false;
-        LLAMA_LOG_INFO("%s: SJ-KVaRN with kv_unified: per-sequence streams over one shared record pool\n", __func__);
-    }
+    cparams.op_offload = params.op_offload;
+    cparams.kv_unified = params.kv_unified;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -455,7 +441,7 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
     // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
     cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256);
 
-    if (cparams.kv_unified || sj_kvarn_shared_pool) {
+    if (cparams.kv_unified) {
         cparams.n_ctx_seq = cparams.n_ctx;
     } else {
         cparams.n_ctx_seq = cparams.n_ctx / cparams.n_seq_max;
@@ -860,8 +846,6 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
                 /*.edge_bits_v =*/ params.sj_kvarn_edge_bits_v,
                 /*.edge_body_type =*/ params.sj_kvarn_edge_body_type,
                 /*.flush_chunk =*/ params.sj_kvarn_flush_chunk,
-                /*.shared_pool =*/ sj_kvarn_shared_pool,
-                /*.transform   =*/ params.sj_kvarn_transform ? params.sj_kvarn_transform : "",
             },
         };
 
@@ -951,22 +935,6 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
                 LLAMA_LOG_INFO("%s: MTP context will share the target context's compute buffers\n", __func__);
             }
         }
-        if (cparams.moe_cache_size > 0) {
-            if (cparams.pipeline_parallel || model.n_devices() > 1) {
-                throw std::runtime_error("MoE cache does not support multiple devices");
-            }
-            for (size_t i = 0; i < backend_ptrs.size(); ++i) {
-                const auto type = ggml_backend_dev_type(ggml_backend_get_device(backend_ptrs[i]));
-                if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
-                    moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs[i], backend_buft[i], cparams.moe_cache_size);
-                    break;
-                }
-            }
-            if (!moe_cache) {
-                throw std::runtime_error("MoE cache requires a GPU backend");
-            }
-        }
-
         sched_reserve();
 
         if (!cparams.flash_attn) {
@@ -1674,7 +1642,6 @@ void llama_context::sched_reserve() {
     ggml_backend_sched_set_moe_cache(
             sched.get(), moe_cache_mode,
             cparams.moe_cache_budget_mib);
-    ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -1881,7 +1848,6 @@ void llama_context::sched_reserve() {
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
                                                    max_nodes, false, cparams.op_offload));
-                ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
                 ggml_backend_sched_set_moe_cache(sched.get(), moe_cache_mode, cparams.moe_cache_budget_mib);
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
@@ -2157,11 +2123,11 @@ bool llama_context::maintain_sj_kvarn() {
     return kv->maintain_sj_kvarn(this);
 }
 
-int32_t llama_context::compress_sj_kvarn_idle(llama_seq_id seq_id, llama_pos accepted_end, llama_pos keep_from) {
+int32_t llama_context::compress_sj_kvarn_idle(llama_seq_id seq_id, llama_pos accepted_end) {
     auto * kv = llama_sj_kvarn_cache(memory.get());
     if (!kv || !kv->is_sj_kvarn()) { return -1; }
     if (compute_peer && compute_peer->sched) { ggml_backend_sched_synchronize(compute_peer->sched.get()); }
-    return kv->compress_sj_kvarn_idle(this, seq_id, accepted_end, keep_from);
+    return kv->compress_sj_kvarn_idle(this, seq_id, accepted_end);
 }
 
 int32_t llama_sj_kvarn_sealed_end(llama_context * ctx) {
@@ -2169,54 +2135,8 @@ int32_t llama_sj_kvarn_sealed_end(llama_context * ctx) {
     return kv && kv->is_sj_kvarn() ? (int32_t) kv->get_sj_kvarn_sealed_end() : -1;
 }
 
-int32_t llama_sj_kvarn_seq_unsealed_max(llama_context * ctx) {
-    auto * kv = ctx ? llama_sj_kvarn_cache(ctx->get_memory()) : nullptr;
-    return kv && kv->is_sj_kvarn() ? (int32_t) (kv->get_sj_kvarn_sink() + kv->get_sj_kvarn_capacity()) : -1;
-}
-
-int32_t llama_sj_kvarn_seq_sealed_end(llama_context * ctx, llama_seq_id seq_id) {
-    auto * kv = ctx ? llama_sj_kvarn_cache(ctx->get_memory()) : nullptr;
-    if (!kv || !kv->is_sj_kvarn() || seq_id < 0 || (uint32_t) seq_id >= kv->get_n_stream()) {
-        return -1;
-    }
-    return (int32_t) kv->get_sj_kvarn_sealed_end(seq_id);
-}
-
 int32_t llama_sj_kvarn_compress_idle(llama_context * ctx, llama_seq_id seq_id, llama_pos accepted_end) {
     return ctx ? ctx->compress_sj_kvarn_idle(seq_id, accepted_end) : -1;
-}
-
-int32_t llama_sj_kvarn_compress_idle_keep(llama_context * ctx, llama_seq_id seq_id, llama_pos accepted_end, llama_pos keep_from) {
-    return ctx ? ctx->compress_sj_kvarn_idle(seq_id, accepted_end, keep_from) : -1;
-}
-
-llama_pos llama_sj_kvarn_rm_floor(llama_context * ctx, llama_seq_id seq_id, llama_pos pos) {
-    auto * kv = ctx ? llama_sj_kvarn_cache(ctx->get_memory()) : nullptr;
-    return kv && kv->is_sj_kvarn() ? kv->sj_kvarn_rm_floor(seq_id, pos) : pos;
-}
-
-llama_pos llama_sj_kvarn_group_floor(llama_context * ctx, llama_pos pos) {
-    auto * kv = ctx ? llama_sj_kvarn_cache(ctx->get_memory()) : nullptr;
-    if (!kv || !kv->is_sj_kvarn() || pos < 0) { return pos; }
-    const auto & c = kv->get_sj_kvarn();
-    if ((uint32_t) pos <= c.sink) { return pos; }
-    return (llama_pos) (c.sink + c.group*(((uint32_t) pos - c.sink)/c.group));
-}
-
-bool llama_sj_kvarn_prefill_cut(llama_context * ctx, llama_seq_id seq_id, llama_pos pos) {
-    auto * kv = ctx ? llama_sj_kvarn_cache(ctx->get_memory()) : nullptr;
-    if (!kv || !kv->is_sj_kvarn() || pos <= 0) { return false; }
-    return kv->sj_kvarn_prefill_cut(seq_id, pos);
-}
-
-llama_pos llama_sj_kvarn_ckpt_floor(llama_context * ctx, llama_pos pos) {
-    auto * kv = ctx ? llama_sj_kvarn_cache(ctx->get_memory()) : nullptr;
-    if (!kv || !kv->is_sj_kvarn() || pos < 0) { return pos; }
-    const uint32_t grid = kv->get_sj_kvarn_pos_grid();
-    if (grid > 0) {
-        pos -= pos % (llama_pos) grid;
-    }
-    return llama_sj_kvarn_group_floor(ctx, pos);
 }
 
 enum ggml_type llama_context::get_kv_type_k() const {
@@ -2621,11 +2541,6 @@ void llama_context::set_embeddings(bool value) {
 
 void llama_context::set_embeddings_nextn(bool value, bool masked) {
     LLAMA_LOG_DEBUG("%s: value = %d, masked = %d\n", __func__, value, masked);
-
-    if (cparams.embeddings_nextn != value || cparams.embeddings_nextn_masked != masked) {
-        // these flags change the graph shape
-        sched_need_reserve = true;
-    }
 
     cparams.embeddings_nextn        = value;
     cparams.embeddings_nextn_masked = masked;
@@ -4219,8 +4134,7 @@ ggml_cgraph * llama_context::graph_reserve(
 
     auto * res = gf_res_reserve.get();
 
-    auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
-    gparams.is_reserve = true;
+    const auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
 
     res->reset();
 
@@ -4269,7 +4183,6 @@ llm_graph_params llama_context::graph_params(llm_graph_result *             res,
         /*.cross       =*/ &cross,
         /*.hadamard_rotations =*/ &model.hadamard_rotations,
         /*.hadamard_inverses  =*/ &model.hadamard_inverses,
-        /*.moe_cache   =*/ moe_cache.get(),
         /*.prec_policy =*/ &model.prec_policy,
         /*.samplers    =*/ sampling.samplers,
         /*.draft_vocab =*/ draft_vocab.ids,
@@ -4302,8 +4215,6 @@ ggml_status llama_context::graph_compute(ggml_cgraph * gf, bool batched) {
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
     }
 
-    copy_experts.reset();
-
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
@@ -4312,90 +4223,6 @@ ggml_status llama_context::graph_compute(ggml_cgraph * gf, bool batched) {
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
 
     return status;
-}
-
-bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
-    auto * lctx = static_cast<llama_context *>(user_data);
-
-    // the slot maps of the MoE cache
-    if (lctx->moe_cache && lctx->moe_cache->copy(backend, src, dst, graph)) {
-        return true;
-    }
-
-    auto & st = lctx->copy_experts;
-
-    // the ids must be computed before the split starts, so only the first node of the split is considered
-    if (ggml_graph_n_nodes(graph) == 0) {
-        return false;
-    }
-    const ggml_tensor * node = ggml_graph_node(graph, 0);
-    if (node->op != GGML_OP_MUL_MAT_ID || node->src[0] != dst) {
-        return false;
-    }
-
-    const ggml_tensor * ids = node->src[2];
-    if (ggml_nelements(ids) == 0) {
-        return true;
-    }
-
-    const int64_t n_expert    = src->ne[2];
-    const size_t  expert_size = src->nb[2];
-
-    if (ids != st.ids || (int64_t) st.used.size() != n_expert) {
-        st.ids_data.resize(ggml_nbytes(ids)/sizeof(int32_t));
-        ggml_backend_tensor_get_async(backend, ids, st.ids_data.data(), 0, ggml_nbytes(ids));
-        ggml_backend_synchronize(backend);
-
-        st.used.assign(n_expert, false);
-        for (int64_t i1 = 0; i1 < ids->ne[1]; i1++) {
-            for (int64_t i0 = 0; i0 < ids->ne[0]; i0++) {
-                const int32_t id = st.ids_data[i1*ids->nb[1]/sizeof(int32_t) + i0*ids->nb[0]/sizeof(int32_t)];
-                GGML_ASSERT(id >= 0 && id < n_expert);
-                st.used[id] = true;
-            }
-        }
-
-        st.ids = ids;
-    }
-
-    // group consecutive experts and copy them together
-    for (int64_t first = 0; first < n_expert; ) {
-        if (!st.used[first]) {
-            first++;
-            continue;
-        }
-        int64_t last = first;
-        while (last + 1 < n_expert && st.used[last + 1]) {
-            last++;
-        }
-
-        // the experts in the MoE cache are copied from device memory, the others are uploaded
-        int64_t next = first;
-        for (int64_t e = first; e <= last && lctx->moe_cache; ) {
-            const int64_t n = lctx->moe_cache->copy_experts(backend, src, dst, e, last);
-            if (n == 0) {
-                e++;
-                continue;
-            }
-            if (next < e) {
-                ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + next*expert_size, next*expert_size, (e - next)*expert_size);
-            }
-            e   += n;
-            next = e;
-        }
-
-        // copy a bit extra to ensure there are no NaNs in the padding of the last expert, this is necessary for MMQ in the CUDA backend
-        const size_t offset  = next*expert_size;
-        const size_t padding = last < n_expert - 1 ? std::min<size_t>(expert_size, 512) : 0;
-        const size_t size    = (last + 1 - next)*expert_size + padding;
-        if (size > 0) {
-            ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + offset, offset, size);
-        }
-
-        first = last + 1;
-    }
-
-    return true;
 }
 
 llm_graph_cb llama_context::graph_get_cb() const {
@@ -5276,11 +5103,6 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
             ret[buft].context += size;
         }
     }
-    if (moe_cache) {
-        for (const auto & [buft, size] : moe_cache->memory_breakdown()) {
-            ret[buft].context += size;
-        }
-    }
     if (model.hparams.no_alloc) {
         for (size_t i = 0; i < backends.size(); ++i) {
             ggml_backend_t             backend = backends[i].get();
@@ -5485,7 +5307,6 @@ void llama_context::opt_epoch_iter(ggml_opt_dataset_t               dataset,
                                             sizeof(float));
                 }
             }
-            copy_experts.reset();
             ggml_opt_eval(opt_ctx, result);
             if (callback) {
                 callback(train, opt_ctx, dataset, result, idata_in_loop + (pos_ctx + pos_batch) / n_ubatch + 1,
@@ -5583,7 +5404,6 @@ llama_context_params llama_context_default_params() {
         /*.type_s                      =*/ GGML_TYPE_F32,
         /*.moe_cache_mode              =*/ LLAMA_MOE_CACHE_MODE_UNSPECIFIED,
         /*.moe_cache_budget_mib        =*/ 0,
-        /*.moe_cache_size              =*/ 0,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.sj_kvarn_bits_k                =*/ 0,
@@ -5599,7 +5419,6 @@ llama_context_params llama_context_default_params() {
         /*.sj_kvarn_edge_bits_v           =*/ 4,
         /*.sj_kvarn_edge_body_type        =*/ GGML_TYPE_COUNT,
         /*.sj_kvarn_flush_chunk           =*/ 0,
-        /*.sj_kvarn_transform             =*/ nullptr,
         /*.embeddings                  =*/ false,
         /*.offload_kqv                 =*/ true,
         /*.no_perf                     =*/ true,
@@ -5753,6 +5572,10 @@ llama_context * llama_init_from_model(llama_model * model, llama_context_params 
             return nullptr;
         }
         params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        if (params.n_seq_max != 1) {
+            LLAMA_LOG_ERROR("%s: SJ-KVaRN cache supports a single sequence (n_seq_max = %u)\n", __func__, params.n_seq_max);
+            return nullptr;
+        }
         if (params.sj_kvarn_tail_max != 0 && (params.sj_kvarn_tail_max < params.sj_kvarn_tail || params.sj_kvarn_tail_max % 128 != 0)) {
             LLAMA_LOG_ERROR("%s: SJ-KVaRN tail-max must be aligned to 128 and >= tail\n", __func__);
             return nullptr;

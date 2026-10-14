@@ -78,7 +78,6 @@ llama_memory_hybrid::llama_memory_hybrid(
 llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     do {
         balloc.split_reset();
-        balloc.set_split_pos_grid(mem_attn->get_sj_kvarn_split_grid()); // [#197] full grid mode only
 
         // [TAG_GDN_REPLAY_SPLIT]
         auto rsplit = mem_recr->make_replay_split(balloc);

@@ -24,10 +24,6 @@ on:
       'ggml/src/ggml-cuda/**'
     ]
 
-cache-mode: none
-permissions:
-  contents: read
-
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
   cancel-in-progress: true
@@ -59,7 +55,7 @@ jobs:
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.24
         with:
-          restore: false
+          key: cuda-ubuntu-24.04-cuda
           save: false
 
       - name: ccache-buckets-restore
@@ -153,7 +149,7 @@ jobs:
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.24
         with:
-          restore: false
+          key: cuda-ubuntu-22.04-hip
           save: false
 
       - name: ccache-buckets-restore
@@ -204,7 +200,7 @@ jobs:
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.24
         with:
-          restore: false
+          key: cuda-ubuntu-22.04-musa
           save: false
 
       - name: ccache-buckets-restore

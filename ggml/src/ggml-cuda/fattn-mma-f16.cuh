@@ -1890,7 +1890,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 const int g  = (p0 - kv.S) / kv.G;
                 const int t0 = (p0 - kv.S) - g*kv.G;
                 flash_attn_ext_sj_kvarn_load_tile<stride_tile_K, swz, nbatch_fa, nthreads_kv, DKQ/2, oob_check, false>
-                    (fattn_sj_kvarn_rec(kv, g), t0, kv, tile_K, k_VKQ_sup);
+                    (kv.body + (size_t) g*kv.rec_stride, t0, kv, tile_K, k_VKQ_sup);
             } else {
                 const int row0 = p0 < kv.S ? p0 : kv.S + (p0 - kv.S) % kv.cap;
                 if (p0 < kv.S && kv.sink_type == GGML_TYPE_F16) {
@@ -2329,7 +2329,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 const int g  = (p0 - kv.S) / kv.G;
                 const int t0 = (p0 - kv.S) - g*kv.G;
                 flash_attn_ext_sj_kvarn_load_tile<stride_tile_V, swz, nbatch_fa, nthreads_kv, DV/2, oob_check, true>
-                    (fattn_sj_kvarn_rec(kv, g), t0, kv, tile_V, k_VKQ_sup);
+                    (kv.body + (size_t) g*kv.rec_stride, t0, kv, tile_V, k_VKQ_sup);
             } else {
                 const int row0 = p0 < kv.S ? p0 : kv.S + (p0 - kv.S) % kv.cap;
                 if (p0 < kv.S && kv.sink_type == GGML_TYPE_F16) {
@@ -3090,11 +3090,6 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                 if (np*cols_per_warp >= warp_size || threadIdx.x < np*cols_per_warp) {
                     // Combined KQ max scale + rowsum.
                     meta_ptr[imeta * warp_size * tile_stride/2] = make_float2(KQ_cms[imeta], KQ_crs);
-                    if constexpr (output_partial) {
-                        // Partial outputs are scaled to the combined max KQ_cmn, so the exported
-                        // meta must carry KQ_cmn (not the per-warp scale). Second free float2 of the row padding.
-                        meta_ptr[imeta * warp_size * tile_stride/2 + 1] = make_float2(KQ_cmn, KQ_crs);
-                    }
                 }
             }
 
@@ -3228,7 +3223,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                             }
                         } else if (k00 == 0 && k == 0) {
                             const int row = (jt*ncols1 + j_dst)*ne02 + c_dst;
-                            dstk_fixup[row] = make_float2(np == 1 ? meta_j[0] : meta_j[2], meta_j[1]);
+                            dstk_fixup[row] = make_float2(meta_j[0], meta_j[1]);
                         }
 
                         if (is_fixup) {
@@ -3614,10 +3609,9 @@ static void ggml_cuda_flash_attn_ext_mma_f16_case_impl(
         }
     }
 
-    const bool async_kv_preload = nstages == 2 && !use_sparse;
     launch_fattn<DV, ncols1, ncols2>
         (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa, true, true, !output_partial, use_sparse, warp_size_host,
-         partial_dst, partial_meta, 0, async_kv_preload);
+         partial_dst, partial_meta);
 }
 
 template <int DKQ, int DV, int ncols1, int ncols2, bool output_partial>

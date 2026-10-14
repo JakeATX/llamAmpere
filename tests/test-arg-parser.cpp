@@ -290,40 +290,6 @@ static void test(void) {
     assert(params.n_predict == 6789);
     assert(params.n_batch == 9090);
 
-    printf("test-arg-parser: test --cache-disk-min-free units\n\n");
-    {
-        struct mf_case { const char * v; bool ok; int32_t mib; float pct; };
-        const mf_case cases[] = {
-            { "2048",   true,  2048,  -1.0f }, // plain number = MiB (unchanged meaning)
-            { "-1",     true,  -1,    -1.0f },
-            { "0",      true,  0,     -1.0f },
-            { "20G",    true,  20480, -1.0f },
-            { "1.5GiB", true,  1536,  -1.0f },
-            { "512M",   true,  512,   -1.0f },
-            { "5%",     true,  -1,    5.0f  },
-            { "0%",     true,  -1,    0.0f  },
-            { "101%",   false, 0,     0.0f  },
-            { "-2",     false, 0,     0.0f  },
-            { "-1G",    false, 0,     0.0f  },
-            { "abc",    false, 0,     0.0f  },
-            { "10X",    false, 0,     0.0f  },
-        };
-        for (const auto & c : cases) {
-            common_params mf;
-            argv = {"binary_name", "--cache-disk-min-free", c.v};
-            const bool ok = common_params_parse(argv.size(), list_str_to_char(argv).data(), mf, LLAMA_EXAMPLE_SERVER);
-            if (ok != c.ok || (ok && (mf.cache_disk_min_free_mib != c.mib || mf.cache_disk_min_free_pct != c.pct))) {
-                fprintf(stderr, "--cache-disk-min-free %s: ok=%d mib=%d pct=%g\n", c.v, ok, mf.cache_disk_min_free_mib, mf.cache_disk_min_free_pct);
-                assert(false);
-            }
-        }
-        // the later of two settings wins, whichever unit
-        common_params mf;
-        argv = {"binary_name", "--cache-disk-min-free", "5%", "--cache-disk-min-free", "100"};
-        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), mf, LLAMA_EXAMPLE_SERVER));
-        assert(mf.cache_disk_min_free_mib == 100 && mf.cache_disk_min_free_pct < 0.0f);
-    }
-
     printf("test-arg-parser: test KV cache type names and aliases\n\n");
     {
         const std::vector<std::pair<std::string, ggml_type>> names = {

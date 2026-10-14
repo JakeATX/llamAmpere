@@ -56,9 +56,15 @@ void llama_model_deepseek2::load_arch_tensors(llama_model_loader & ml) {
     LLAMA_LOAD_LOCALS;
     const int64_t n_expert_shared = hparams.n_expert_shared;
 
-    const auto nf = nextn_flags(ml);
-    const int trunk_flags = nf.trunk;
-    const int mtp_flags   = nf.mtp;
+    const bool mtp_only = (hparams.n_layer_nextn > 0) && (ml.get_weight("blk.0.attn_norm.weight") == nullptr);
+    const std::string mtp_probe = "blk." + std::to_string(n_layer) + ".nextn.eh_proj.weight";
+    const bool trunk_only = (hparams.n_layer_nextn > 0) && (ml.get_weight(mtp_probe.c_str()) == nullptr);
+    const int trunk_flags = mtp_only  ? TENSOR_NOT_REQUIRED : 0;
+    int       mtp_flags   = trunk_only ? TENSOR_NOT_REQUIRED : 0;
+
+    if (!ml.load_mtp) {
+        mtp_flags |= TENSOR_SKIP;
+    }
 
     const bool is_mla = hparams.is_mla();
 
@@ -215,7 +221,6 @@ llama_model_deepseek2::graph_mtp::graph_mtp(const llama_model & model, const llm
     ggml_set_input(inp->embd);
 
     ggml_tensor * tok_embd;
-    ASSERT_EMBD_OR_TOKEN(ubatch);
     if (ubatch.token) {
         ggml_tensor * tok_embd_w = layer.nextn.embed_tokens
                 ? layer.nextn.embed_tokens
@@ -628,7 +633,7 @@ llama_model_deepseek2::graph::graph(const llama_model & model, const llm_graph_p
                             Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
             }
         }
-        if (il == n_layer - 1 && crop_before_nextn(inp_out_ids)) {
+        if (il == n_layer - 1 && inp_out_ids && (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked)) {
             cur   = ggml_get_rows(ctx0, cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
@@ -691,7 +696,7 @@ llama_model_deepseek2::graph::graph(const llama_model & model, const llm_graph_p
     cb(cur, "h_nextn", -1);
     res->t_h_nextn = cur;
 
-    if (crop_after_nextn(inp_out_ids)) {
+    if (cparams.embeddings_nextn && !cparams.embeddings_nextn_masked && inp_out_ids) {
         cur = ggml_get_rows(ctx0, cur, inp_out_ids);
     }
 

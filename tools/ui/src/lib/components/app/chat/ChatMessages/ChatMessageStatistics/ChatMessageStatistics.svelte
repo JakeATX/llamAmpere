@@ -124,11 +124,6 @@
 	);
 
 	let formattedAgenticTotalTime = $derived(formatPerformanceTime(agenticTotalTimeMs));
-
-	const fixedFormatter = new Intl.NumberFormat(undefined, {
-		maximumFractionDigits: 2,
-		minimumFractionDigits: 2
-	});
 </script>
 
 {#snippet viewButton(opts: {
@@ -228,14 +223,14 @@
 				class="bg-transparent"
 				icon={Gauge}
 				tooltipLabel="Generation speed"
-				value="{fixedFormatter.format(tokensPerSecond)} t/s"
+				value="{tokensPerSecond.toFixed(2)} t/s"
 			/>
 		{:else if activeView === ChatMessageStatsView.TOOLS && hasAgenticStats}
 			<ChatMessageStatisticsBadge
 				class="bg-transparent"
 				icon={Wrench}
 				tooltipLabel="Tool calls executed"
-				value="{agenticTimings!.toolCallsCount.toLocaleString()} calls"
+				value="{agenticTimings!.toolCallsCount} calls"
 			/>
 
 			<ChatMessageStatisticsBadge
@@ -249,14 +244,14 @@
 				class="bg-transparent"
 				icon={Gauge}
 				tooltipLabel="Tool execution rate"
-				value="{fixedFormatter.format(agenticToolsPerSecond)} calls/s"
+				value="{agenticToolsPerSecond.toFixed(2)} calls/s"
 			/>
 		{:else if activeView === ChatMessageStatsView.SUMMARY && hasAgenticStats}
 			<ChatMessageStatisticsBadge
 				class="bg-transparent"
 				icon={Layers}
 				tooltipLabel="Agentic turns (LLM calls)"
-				value="{agenticTimings!.turns.toLocaleString()} turns"
+				value="{agenticTimings!.turns} turns"
 			/>
 
 			<ChatMessageStatisticsBadge
@@ -277,7 +272,7 @@
 				class="bg-transparent"
 				icon={WholeWord}
 				tooltipLabel="Prompt tokens"
-				value="{promptTokens?.toLocaleString()} tokens"
+				value="{promptTokens} tokens"
 			/>
 
 			<ChatMessageStatisticsBadge
@@ -291,7 +286,7 @@
 				class="bg-transparent"
 				icon={Gauge}
 				tooltipLabel="Prompt processing speed"
-				value="{fixedFormatter.format(promptTokensPerSecond!)} tokens/s"
+				value="{promptTokensPerSecond!.toFixed(2)} tokens/s"
 			/>
 		{/if}
 	</div>

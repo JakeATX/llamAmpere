@@ -5960,6 +5960,24 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_I64:
             // nothing to validate
             break;
+        case GGML_TYPE_RQ4_G128:
+        case GGML_TYPE_RQ4_G64:
+        case GGML_TYPE_RQ4NL_G128:
+        case GGML_TYPE_RQ4NL_G64:
+            {
+                // fp16 scale header at the start of every 1024-weight super block
+                const bool   g128 = type == GGML_TYPE_RQ4_G128 || type == GGML_TYPE_RQ4NL_G128;
+                const int    ng   = g128 ? 8 : 16;
+                const size_t sbb  = g128 ? 528 : 544;
+                for (size_t i = 0; i < nb; ++i) {
+                    const ggml_fp16_t * d = (const ggml_fp16_t *) ((const uint8_t *) data + i*sbb);
+                    for (int g = 0; g < ng; ++g) {
+                        if (!validate_fp16(d[g], i)) {
+                            return false;
+                        }
+                    }
+                }
+            } break;
         case GGML_TYPE_TQ3_1S:
         case GGML_TYPE_TQ4_1S:
         case GGML_TYPE_TURBO3_0:
@@ -5967,6 +5985,19 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_TURBO2_0:
         case GGML_TYPE_TQ6_0:
         case GGML_TYPE_TQ5_0:
+        case GGML_TYPE_AI4:
+        case GGML_TYPE_AI4_U:
+        case GGML_TYPE_AI3_U:
+        case GGML_TYPE_AI2_U:
+        case GGML_TYPE_AI5_U:
+        case GGML_TYPE_AI6_U:
+        case GGML_TYPE_AI6_UO:
+        case GGML_TYPE_AI5_UN:
+        case GGML_TYPE_AI2_S:
+        case GGML_TYPE_AI3_S:
+        case GGML_TYPE_AI4_S:
+        case GGML_TYPE_AI5_S:
+        case GGML_TYPE_AI6_S:
             // WHT-rotated / TurboQuant types: no scalar-domain validation.
             break;
         default:

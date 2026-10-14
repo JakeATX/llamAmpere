@@ -70,18 +70,8 @@ struct fattn_sj_kvarn_ctx {
     int64_t sink_head_delta_k, sink_head_delta_v;
     int body_type;
     int rec_stride;      // n_head_kv * rec_bytes
-    const int32_t * table; // paged pool (multi-sequence cache): group g sits at record table[g]; nullptr = identity
     int k_scale, k_zero, k_tok, v_payload, v_ch, v_scale, v_zero;
 };
-
-// record of group g of this stream: g itself, or the paged-pool slot of a multi-sequence cache (desc[GGML_SJKVARN_DESC_TABLE])
-#ifndef FATTN_SJKVARN_REC_DEFINED
-#define FATTN_SJKVARN_REC_DEFINED
-template <typename ctx_t>
-static __device__ __forceinline__ const char * fattn_sj_kvarn_rec(const ctx_t & kv, const int g) {
-    return kv.body + (size_t) (kv.table ? kv.table[g] : g)*kv.rec_stride;
-}
-#endif
 
 static __device__ __forceinline__ fattn_sj_kvarn_ctx fattn_sj_kvarn_make_ctx(
         const char * body, const int32_t * desc, const int z_KV, const int D, const int bits_k, const int bits_v, const size_t k_head_stride, const size_t v_head_stride) {
@@ -100,7 +90,6 @@ static __device__ __forceinline__ fattn_sj_kvarn_ctx fattn_sj_kvarn_make_ctx(
     c.sink_head_delta_k = (int64_t) z_KV*((int64_t) D*sizeof(half) - (int64_t) k_head_stride);
     c.sink_head_delta_v = (int64_t) z_KV*((int64_t) D*sizeof(half) - (int64_t) v_head_stride);
     c.rec_stride = desc[GGML_SJKVARN_DESC_HKV] * rec_bytes;
-    c.table      = desc[GGML_SJKVARN_DESC_TABLE] ? desc + GGML_SJKVARN_DESC_N_ENTRIES : nullptr;
     c.body       = body + (size_t) z_KV * rec_bytes;
     const int k_row = D*bits_k/8;
     const int v_row = D*bits_v/8;
@@ -1675,7 +1664,7 @@ void launch_fattn(
     const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const bool use_sparse,
     const int warp_size = WARP_SIZE,
     float * partial_dst = nullptr, float2 * partial_meta = nullptr,
-    const int parallel_blocks_override = 0, const bool async_kv_preload = false
+    const int parallel_blocks_override = 0
 ) {
     if constexpr (compact_q5g6) {
         GGML_ASSERT(stream_k && !use_sparse && dst->src[0]->ne[1] == 5 && dst->src[0]->ne[3] == 1);
@@ -1857,8 +1846,7 @@ void launch_fattn(
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths.
-    const bool scan_mask = !use_sparse && !is_sj_kvarn && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1);
-    if (scan_mask) {
+    if (!use_sparse && !is_sj_kvarn && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1)) {
         const int64_t s31 = mask->nb[1] / sizeof(half2);
         const int64_t s33 = mask->nb[3] / sizeof(half2);
 
@@ -1885,16 +1873,10 @@ void launch_fattn(
 
     dim3 blocks_num;
     if (stream_k) {
-        // Stream-K splits the work before the mask scan is applied, so skipped KV tiles make the blocks uneven.
-        const bool prefer_whole_tiles = GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_DGX_SPARK && async_kv_preload && scan_mask;
-
-        auto should_use_stream_k = [prefer_whole_tiles](const int cc, const int ntiles_dst, const int max_blocks, const int DKQ) {
+        auto should_use_stream_k = [](const int cc, const int ntiles_dst, const int max_blocks, const int DKQ) {
             const int tiles_nwaves             = (ntiles_dst + max_blocks - 1) / max_blocks;
             const int tiles_efficiency_percent = 100 * ntiles_dst / (max_blocks*tiles_nwaves);
 
-            if (prefer_whole_tiles && tiles_efficiency_percent >= 75) {
-                return false;
-            }
             if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_ADA_LOVELACE) {
                 return true;
             }

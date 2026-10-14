@@ -17,10 +17,6 @@ on:
       'scripts/sync_vendor.py'
     ]
 
-cache-mode: none
-permissions:
-  contents: read
-
 jobs:
   check-vendor:
     runs-on: ubuntu-slim

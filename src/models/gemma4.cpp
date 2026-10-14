@@ -159,8 +159,10 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
     ggml_tensor * cur;
     ggml_tensor * inpL;
 
+    inpL = build_inp_embd(model.tok_embd);
+
     // important: do not normalize weights for raw embeddings input (i.e. encoded image emdeddings)
-    inpL = build_inp_embd(model.tok_embd, sqrtf(n_embd));
+    inpL = ggml_scale(ctx0, inpL, ubatch.token ? sqrtf(n_embd) : 1.0f);
     cb(inpL, "inp_scaled", -1);
 
     // inp_pos - contains the positions
@@ -274,7 +276,7 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
 
         // TODO @ngxson : strip unused token right after the last KV layer to speed up prompt processing
         // keep all rows when extracting unmasked nextn embeddings (MTP target needs the hidden state for every token)
-        if (il == n_layer - 1 && crop_before_nextn(inp_out_ids)) {
+        if (il == n_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked) {
             cur  = ggml_get_rows(ctx0,  cur, inp_out_ids);
             inpL = ggml_get_rows(ctx0, inpL, inp_out_ids);
         }
@@ -374,7 +376,7 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
             ggml_tensor * inp_this_layer = gemma4_view_2d_slice(ctx0, inp_per_layer, il); // [n_embd_per_layer, n_tokens]
 
             // TODO @ngxson : improve this
-            if (il == n_layer - 1 && crop_before_nextn(inp_out_ids)) {
+            if (il == n_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked) {
                 inp_this_layer = ggml_get_rows(ctx0, inp_this_layer, inp_out_ids);
             }
 
@@ -412,7 +414,7 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
     cb(cur, "h_nextn", -1);
     res->t_h_nextn = cur;
 
-    if (crop_after_nextn(inp_out_ids)) {
+    if (!cparams.embeddings_nextn_masked && inp_out_ids) {
         cur = ggml_get_rows(ctx0, cur, inp_out_ids);
     }
 
@@ -471,7 +473,6 @@ ggml_tensor * llama_model_gemma4::graph::build_inp_per_layer() {
 
     ggml_tensor * inp_per_layer;
     float tok_embd_scale = sqrtf((float) n_embd_per_layer);
-    // mixed ubatch: embd rows have token id 0, same padding row as below
     if (ubatch.token) {
         inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
         ggml_set_input(inp->tokens);

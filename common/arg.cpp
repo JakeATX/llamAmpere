@@ -32,7 +32,6 @@
 #include <cmath>
 #include <cstdarg>
 #include <cstdlib>
-#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <list>
@@ -593,15 +592,6 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
         task.opts       = opts;
         tasks.push_back(task);
     }
-    // an SJ-KVaRN transform given as a URL (e.g. a Hugging Face resolve link) is downloaded to the cache like --mmproj-url
-    if (params.sj_kvarn_transform.rfind("https://", 0) == 0 || params.sj_kvarn_transform.rfind("http://", 0) == 0) {
-        common_download_task task;
-        task.url        = params.sj_kvarn_transform;
-        task.local_path = get_default_local_path(task.url);
-        task.opts       = opts;
-        params.sj_kvarn_transform = task.local_path;
-        tasks.push_back(task);
-    }
     bool had_spec_url = false;
     if (!params.speculative.draft.mparams.url.empty()) {
         common_download_task task;
@@ -777,10 +767,7 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
             // if HF repo is a preset repo, we simply run server in router mode with the preset.ini file
             params.models_preset_hf = params.model.hf_repo; // only for showing a warning
             params.models_preset    = hf_cache::finalize_file(plan.preset);
-            // clear the model so the server starts in router mode
-            params.model.path.clear();
-            params.model.hf_repo.clear();
-            params.model.docker_repo.clear();
+            params.model = common_params_model{}; // make sure to clear model, so server starts in router mode
         });
     }
 
@@ -1850,130 +1837,30 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"-cram", "--cache-ram"}, "N",
-        "maximum RAM size of the prompt cache in MiB (default: sized from total host RAM: <16 GB 2048, 16 GB 4096, "
-        "32 GB 8192, 64 GB 12288, 96 GB 16384, 128 GB+ 20480, at most half of the available memory at startup; "
-        "-1 = half of the free host memory at startup, 0 = disable)"
-        "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)",
+        string_format("set the maximum cache size in MiB (default: %d, -1 - half of the free host memory at startup, 0 - disable)"
+            "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)", params.cache_ram_mib),
         [](common_params & params, int value) {
-            if (value < -1) {
-                throw std::invalid_argument("cache-ram must be -1, 0 or a size in MiB");
-            }
             params.cache_ram_mib = value;
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
         {"--cache-disk-path"}, "PATH",
-        "directory of the prompt-cache disk tier: entries evicted from the RAM cache (and the cache at shutdown) are "
-        "written here and restored on a later cache miss or after a restart instead of re-processing the prompt; "
-        "created if missing (default: $XDG_CACHE_HOME/llamampere/prompt-cache, else ~/.cache/llamampere/prompt-cache)",
+        "directory for a disk tier of the prompt cache: entries evicted from the RAM cache are written here and "
+        "restored on a later cache miss instead of re-processing the prompt (default: disabled)",
         [](common_params & params, const std::string & value) {
             params.cache_disk_path = value;
-            params.cache_disk      = true;
+            if (!fs_is_directory(params.cache_disk_path)) {
+                throw std::invalid_argument("cache-disk-path must be an existing directory");
+            }
         }
     ).set_env("LLAMA_ARG_CACHE_DISK_PATH").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--cache-disk-limit"}, "N",
-        string_format("size limit of the prompt-cache disk tier in MiB; the oldest-written entries are deleted first, "
-            "and writes are skipped while the filesystem has less than max(10%%, 8 GiB) free "
-            "(default: %d, -1 = no limit, the free-space guard still applies, 0 = disable the disk tier)", params.cache_disk_mib),
+        string_format("size limit of the prompt-cache disk tier in MiB (default: %d, 0 = no limit)", params.cache_disk_mib),
         [](common_params & params, int value) {
-            if (value < -1) {
-                throw std::invalid_argument("cache-disk-limit must be -1, 0 or a size in MiB");
-            }
             params.cache_disk_mib = value;
         }
     ).set_env("LLAMA_ARG_CACHE_DISK_LIMIT").set_examples({LLAMA_EXAMPLE_SERVER}));
-    add_opt(common_arg(
-        {"--cache-disk-min-free"}, "N",
-        "free space the prompt-cache disk tier leaves on its filesystem; writes are skipped (with a warning, and "
-        "counted in /metrics) below it. N = MiB, NG = GiB, N% = percent of the filesystem "
-        "(default: -1 = max(10% of the filesystem, 8 GiB))",
-        [](common_params & params, const std::string & value) {
-            const auto bad = []() {
-                return std::invalid_argument("cache-disk-min-free must be -1, a size in MiB, NG (GiB) or N% (0-100)");
-            };
-            std::string v = value;
-            while (!v.empty() && isspace((unsigned char) v.back())) {
-                v.pop_back();
-            }
-            double mul = 1.0;
-            bool   pct = false;
-            if (!v.empty() && v.back() == '%') {
-                pct = true;
-                v.pop_back();
-            } else {
-                std::string lo;
-                for (char c : v) {
-                    lo += (char) tolower((unsigned char) c);
-                }
-                for (const char * suf : { "gib", "gb", "g" }) {
-                    const size_t n = strlen(suf);
-                    if (lo.size() > n && lo.compare(lo.size() - n, n, suf) == 0) {
-                        mul = 1024.0;
-                        v.resize(v.size() - n);
-                        break;
-                    }
-                }
-                if (mul == 1.0) {
-                    for (const char * suf : { "mib", "mb", "m" }) {
-                        const size_t n = strlen(suf);
-                        if (lo.size() > n && lo.compare(lo.size() - n, n, suf) == 0) {
-                            v.resize(v.size() - n);
-                            break;
-                        }
-                    }
-                }
-            }
-            size_t pos = 0;
-            double x   = 0.0;
-            try {
-                x = std::stod(v, &pos);
-            } catch (const std::exception &) {
-                throw bad();
-            }
-            if (pos != v.size()) {
-                throw bad();
-            }
-            if (pct) {
-                if (x < 0.0 || x > 100.0) {
-                    throw bad();
-                }
-                params.cache_disk_min_free_pct = (float) x;
-                params.cache_disk_min_free_mib = -1;
-                return;
-            }
-            if (x == -1.0 && mul == 1.0) {
-                params.cache_disk_min_free_mib = -1;
-                params.cache_disk_min_free_pct = -1.0f;
-                return;
-            }
-            const double mib = x * mul;
-            if (x < 0.0 || mib > (double) INT32_MAX) {
-                throw bad();
-            }
-            params.cache_disk_min_free_mib = (int32_t) mib;
-            params.cache_disk_min_free_pct = -1.0f;
-        }
-    ).set_env("LLAMA_ARG_CACHE_DISK_MIN_FREE").set_examples({LLAMA_EXAMPLE_SERVER}));
-    add_opt(common_arg(
-        {"--cache-ram-checkpoints"}, "N",
-        string_format("RAM prompt cache: context checkpoints (hybrid/recurrent models) kept per cached entry: the N newest "
-            "plus one each time the distance from the end doubles; an edit between two kept checkpoints re-processes "
-            "from the earlier one. The active slot keeps all of its checkpoints. 0 = all (default: %d)", params.cache_ram_ckpt),
-        [](common_params & params, int value) {
-            if (value < 0) {
-                throw std::invalid_argument("cache-ram-checkpoints must be >= 0");
-            }
-            params.cache_ram_ckpt = value;
-        }
-    ).set_env("LLAMA_ARG_CACHE_RAM_CHECKPOINTS").set_examples({LLAMA_EXAMPLE_SERVER}));
-    add_opt(common_arg(
-        {"--no-cache-disk"},
-        "disable the prompt-cache disk tier (RAM cache only)",
-        [](common_params & params) {
-            params.cache_disk = false;
-        }
-    ).set_env("LLAMA_ARG_NO_CACHE_DISK").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
@@ -2865,15 +2752,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_SJKVARN_FLUSH_CHUNK"));
     add_opt(common_arg(
-        {"--sjkvarn-transform"}, "FILE|URL",
-        "SJ-KVaRN cache: per-layer, per-KV-head K/V transform file (SJWU format, calibrated for one model) applied in place "
-        "of the Hadamard on the layers it lists; an http(s) URL is downloaded to the cache; disables the fused write "
-        "rotation on those layers; saved states record its hash (default: none)",
-        [](common_params & params, const std::string & value) {
-            params.sj_kvarn_transform = value;
-        }
-    ).set_env("LLAMA_ARG_SJKVARN_TRANSFORM"));
-    add_opt(common_arg(
         {"--sjkvarn-sink"}, "N",
         string_format("SJ-KVaRN cache: number of leading positions kept unsealed (multiple of 64, default: %u)", params.sj_kvarn_sink),
         [](common_params & params, int value) {
@@ -3230,16 +3108,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_env("LLAMA_ARG_MOE_CACHE"));
-    add_opt(common_arg(
-        {"--moe-cache-mib"}, "N",
-        "GPU cache size in MiB for the MoE experts kept in the CPU (default: 0, disabled)",
-        [](common_params & params, int value) {
-            if (value < 0) {
-                throw std::invalid_argument("invalid value");
-            }
-            params.moe_cache_size = (size_t) value*1024*1024;
-        }
-    ).set_env("LLAMA_ARG_MOE_CACHE_MIB"));
     add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"
@@ -3645,13 +3513,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("collect data for the output tensor (default: %s)", params.process_output ? "true" : "false"),
         [](common_params & params) {
             params.process_output = true;
-        }
-    ).set_examples({LLAMA_EXAMPLE_IMATRIX}));
-    add_opt(common_arg(
-        {"--nextn"},
-        string_format("collect data for MTP/NextN layers (default: %s)", params.load_mtp ? "true" : "false"),
-        [](common_params & params) {
-            params.load_mtp = true;
         }
     ).set_examples({LLAMA_EXAMPLE_IMATRIX}));
     add_opt(common_arg(
@@ -4635,7 +4496,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V"));
     add_opt(common_arg(
         {"--spec-draft-sjkvarn"},
-        "inherit the trunk's SJ-KVaRN body, sink, staging and tail for MTP (one stream per --parallel slot) (incompatible with -ctkd/-ctvd)",
+        "inherit the trunk's SJ-KVaRN body, sink, staging and tail for single-sequence MTP (incompatible with -ctkd/-ctvd)",
         [](common_params & params) {
             params.speculative.draft.sj_kvarn = true;
         }
@@ -4894,7 +4755,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.mparams.path = value;
             params.speculative.draft.mparams.hf_file = value; // will be used if --spec-draft-hf is set
         }
-    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_IMATRIX}).set_env("LLAMA_ARG_SPEC_DRAFT_MODEL"));
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_MODEL"));
     add_opt(common_arg(
         {"--spec-type"}, common_speculative_all_types_str(),
         string_format("comma-separated list of types of speculative decoding to use (default: auto, i.e. the model's "
