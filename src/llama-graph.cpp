@@ -411,8 +411,14 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
 }
 
 void llm_graph_input_rs::fill_s_copy(const llama_memory_recurrent_context * m) {
-    // a layer-range graph (LLAMA_B1) without a recurrent layer leaves s_copy unallocated
+    // a layer-range graph (LLAMA_B1) without a recurrent layer leaves s_copy unallocated. It still consumes the pending
+    // rollback groups, as any graph of its ubatch does in the normal order (B1 restores them before each layer range)
     if (!s_copy || !s_copy->buffer) {
+        if (s_copy && m->b1_has_views() && !m->get_rs_ring()) {
+            for (uint32_t i = 0; i < m->get_n_rs(); ++i) {
+                (void) m->s_copy((int) i);
+            }
+        }
         return;
     }
     GGML_ASSERT(ggml_backend_buffer_is_host(s_copy->buffer));

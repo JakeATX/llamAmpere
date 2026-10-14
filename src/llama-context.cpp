@@ -4440,7 +4440,15 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
     // expert bytes as the normal path but overlaps the copies with compute (the server sends the last n_ubatch + 4
     // prompt tokens as their own calls for its context checkpoints)
     const int64_t min_tok = b1_ctx_env("LLAMA_B1_MIN_TOKENS", 4096);
-    if (sizes.empty() || (int64_t) n_tokens_all < min_tok || !mctx->b1_supported()) {
+    if (sizes.empty() || (int64_t) n_tokens_all < min_tok) {
+        return normal();
+    }
+    if (!mctx->b1_supported()) {
+        if (!b1_off_logged) {
+            b1_off_logged = true;
+            LLAMA_LOG_WARN("%s: [B1] prompts take the normal path: the memory cannot replay its ubatches layer by layer "
+                "(rollback ring, --gdn-replay, KV block streaming or a full cache)\n", __func__);
+        }
         return normal();
     }
 

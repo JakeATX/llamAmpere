@@ -1767,8 +1767,11 @@ bool llama_memory_recurrent_context::apply() {
 }
 
 bool llama_memory_recurrent_context::b1_supported() const {
+    // the shift rollback layout (n_rs_seq > 0, used by MTP drafting) replays like the plain one: every layer range
+    // writes the same snapshot planes for each ubatch, and the views carry the pending rollback group (rs_idx). The
+    // ring layout and gdn_replay change per-cell state while the inputs are set (rs_base, replay_len), so they stay off.
     return status == LLAMA_MEMORY_STATUS_SUCCESS && !is_full && !ubatches.empty() &&
-           mem->n_rs_seq == 0 && !mem->rs_ring && !mem->gdn_replay;
+           !mem->rs_ring && !mem->gdn_replay;
 }
 
 void llama_memory_recurrent_context::b1_save() {
@@ -1781,6 +1784,24 @@ void llama_memory_recurrent_context::b1_save() {
     v.used  = mem->used;
     v.rs_z  = mem->rs_z;
     v.cells = mem->cells;
+    // s_copy() reads a sequence's pending rollback group in the first ubatch that uses its cell and clears it, so in
+    // the normal order ubatch 0 reads the pending group and later ubatches read group 0. Every layer range sets the
+    // inputs of every ubatch again, so each view keeps the rs_idx its ubatch sees in the normal order.
+    if (i_next == 0) {
+        v.rs_idx = mem->rs_idx;
+    } else {
+        const auto & p = b1_views[i_next - 1];
+        v.rs_idx = p.rs_idx;
+        for (uint32_t i = 0; i < p.n; ++i) {
+            const auto & cell = p.cells[p.head + i];
+            if (!cell.seq_id.empty()) {
+                const llama_seq_id seq = *cell.seq_id.begin();
+                if (seq >= 0 && (size_t) seq < v.rs_idx.size()) {
+                    v.rs_idx[seq] = 0;
+                }
+            }
+        }
+    }
 }
 
 bool llama_memory_recurrent_context::b1_seek(size_t i) {
@@ -1793,6 +1814,7 @@ bool llama_memory_recurrent_context::b1_seek(size_t i) {
     mem->used  = v.used;
     mem->rs_z  = v.rs_z;
     mem->cells = v.cells;
+    mem->rs_idx = v.rs_idx;
     i_next = i;
     return true;
 }

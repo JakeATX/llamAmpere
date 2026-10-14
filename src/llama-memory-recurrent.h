@@ -279,11 +279,12 @@ public:
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
 
-    // [B1] layer-major prefill: find_slot()'s metadata (head, n, used, rs_z, cells) per ubatch. Only without the
-    // rollback snapshots (n_rs_seq == 0), the ring and gdn_replay, whose inputs have side effects per ubatch.
+    // [B1] layer-major prefill: find_slot()'s metadata (head, n, used, rs_z, cells) and the pending rollback groups
+    // (rs_idx) per ubatch. Not with the rollback ring or gdn_replay, whose inputs have other side effects per ubatch.
     bool b1_supported() const override;
     void b1_save() override;
     bool b1_seek(size_t i) override;
+    bool b1_has_views() const { return !b1_views.empty(); }
 
     //
     // llama_memory_recurrent_context specific API
@@ -373,6 +374,7 @@ private:
         uint32_t used = 0;
         int32_t  rs_z = -1;
         std::vector<llama_memory_recurrent::mem_cell> cells;
+        std::vector<uint32_t> rs_idx; // pending rollback group per sequence, as the normal order's ubatch sees it
     };
     std::vector<b1_view> b1_views;
 };
