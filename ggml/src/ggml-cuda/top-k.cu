@@ -119,6 +119,13 @@ static __global__ void topk_unmap(const int * cand_idx, const int * order, int *
     }
 }
 
+// true when ggml_cuda_top_k_tiled takes the row (narrow rows go to the bitonic sort, wide ones with a large k to the
+// sort fallback)
+static bool ggml_cuda_top_k_tiled_fits(const int64_t ncols, const int64_t k) {
+    const int64_t tile = ncols >= 65536 ? TOPK_TILE_WIDE : TOPK_TILE;
+    return ncols > TOPK_CAND && ((ncols + tile - 1) / tile) * k <= TOPK_CAND;
+}
+
 static bool ggml_cuda_top_k_tiled(ggml_cuda_pool & pool, const float * src, int * dst,
                                   const int ncols, const int nrows, const int k,
                                   cudaStream_t stream) {
@@ -126,7 +133,7 @@ static bool ggml_cuda_top_k_tiled(ggml_cuda_pool & pool, const float * src, int 
     const int tile   = ncols >= 65536 ? TOPK_TILE_WIDE : TOPK_TILE;
     const int ntiles = (ncols + tile - 1) / tile;
     const int ncand  = ntiles * k;
-    if (ncols <= TOPK_CAND || ncand > TOPK_CAND) {
+    if (!ggml_cuda_top_k_tiled_fits(ncols, k)) {
         return false;
     }
 
@@ -546,13 +553,17 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t    k     = dst->ne[0];
     ggml_cuda_pool & pool  = ctx.pool();
 
-    // fork: opt-in radix select for wide rows with a large k, where the tiling runs k block-wide reductions per tile
-    // and the fallback sorts whole rows. 2 = also run the default path and count rows whose live sets differ.
+    // fork: opt-in radix select for wide rows with a large k, where the fallback sorts whole rows. It keeps the set the
+    // stable sort fallback keeps, so 1 uses it only for rows the default path sends to that fallback: the tiled path
+    // breaks ties across tiles in a different order, so rows it takes stay on it and the result is unchanged.
+    // 2 = like 1, and also run the default path and count rows whose live sets differ. 3 = select for every row it
+    // can take, the tiled ones too (faster below 8,192 columns at k 512, but ties at the k-th value may differ).
     static const int select_mode = [] {
         const char * value = getenv("GGML_CUDA_TOPK_SELECT");
         return value != nullptr ? atoi(value) : 0;
     }();
-    if (select_mode > 0 && ncols > 1024 && k >= 64 && k <= ncols && nrows <= INT_MAX) {
+    if (select_mode > 0 && ncols > 1024 && k >= 64 && k <= ncols && nrows <= INT_MAX &&
+            (select_mode == 3 || !ggml_cuda_top_k_tiled_fits(ncols, k))) {
         topk_select_rows<TOPK_SEL_BLOCK><<<nrows, TOPK_SEL_BLOCK, 0, stream>>>(src0_d, dst_d, ncols, k);
         CUDA_CHECK(cudaGetLastError());
         if (select_mode == 2) {
