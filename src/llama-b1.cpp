@@ -46,6 +46,48 @@ static bool b1_read_file(int fd, void * dst, size_t offs, size_t len) {
 #endif
 }
 
+// RAM the page cache can still use, in bytes (MemAvailable; LLAMA_B1_RAM_AVAIL_MIB overrides it). -1 if unknown.
+static int64_t b1_ram_available() {
+    const int64_t fake = b1_env_int("LLAMA_B1_RAM_AVAIL_MIB", -1);
+    if (fake >= 0) {
+        return fake << 20;
+    }
+    int64_t avail = -1;
+    if (FILE * f = fopen("/proc/meminfo", "r")) {
+        char line[256];
+        long long kb = 0;
+        while (fgets(line, sizeof(line), f)) {
+            if (sscanf(line, "MemAvailable: %lld kB", &kb) == 1) {
+                avail = (int64_t) kb << 10;
+                break;
+            }
+        }
+        fclose(f);
+    }
+    return avail;
+}
+
+// true when the address lies in a file mapping (mmap'd model pages live in the page cache); true when unknown
+static bool b1_file_backed(const void * p) {
+    bool res = true;
+    if (FILE * f = fopen("/proc/self/maps", "r")) {
+        char line[512];
+        const unsigned long long a = (unsigned long long) (uintptr_t) p;
+        while (fgets(line, sizeof(line), f)) {
+            unsigned long long lo = 0, hi = 0, off = 0, inode = 0;
+            unsigned dmaj = 0, dmin = 0;
+            char perms[8];
+            if (sscanf(line, "%llx-%llx %7s %llx %x:%x %llu", &lo, &hi, perms, &off, &dmaj, &dmin, &inode) == 7 &&
+                    a >= lo && a < hi) {
+                res = inode != 0;
+                break;
+            }
+        }
+        fclose(f);
+    }
+    return res;
+}
+
 llama_b1::llama_b1(const llama_model & model, ggml_backend_t backend_gpu) : model(model), backend_gpu(backend_gpu) {
     dev = ggml_backend_get_device(backend_gpu);
     if (dev == nullptr || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
@@ -312,6 +354,30 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
     const size_t keep = (size_t) std::max<int64_t>(0, b1_env_int("LLAMA_B1_KEEP_FREE_MIB", 1536)) << 20;
     const size_t fresh_avail = free_mem > keep ? free_mem - keep : 0;
 
+    // page-cache budget: every pass reads the streamed experts in the same fixed order, the experts kept in RAM from
+    // the mmap and the lent layers from the file. When that loop is larger than the RAM free for the page cache,
+    // almost every read misses and goes to the disk. So lend only what fits next to the experts kept in RAM (they
+    // count only when they are mmap'd file pages). If even those do not fit, the loop misses anyway and fewer passes
+    // read less, so there is no cap. LLAMA_B1_RAM_MARGIN_MIB < 0 turns this off.
+    const int64_t ram_margin = b1_env_int("LLAMA_B1_RAM_MARGIN_MIB", 2048);
+    const int64_t ram_avail  = ram_margin >= 0 ? b1_ram_available() : -1;
+    int64_t ram_cap = -1;
+    if (ram_avail >= 0) {
+        int64_t host_bytes = 0;
+        int     paged      = -1; // all host experts come from the same loader: test the first one only
+        for (const auto & e : exps) {
+            if (!e.resident) {
+                paged = paged < 0 ? (int) b1_file_backed(e.home_data) : paged;
+                host_bytes += paged ? (int64_t) e.nbytes : 0;
+            }
+        }
+        const int64_t room = ram_avail - (ram_margin << 20) - host_bytes;
+        if (room >= 0) {
+            ram_cap  = room;
+            lend_cap = std::min(lend_cap, (size_t) room);
+        }
+    }
+
     // lendable resident layers, highest first; a layer still holding borrowed data is always lent
     std::vector<int> forced;
     std::vector<int> order;
@@ -563,10 +629,10 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
 
     LLAMA_LOG_WARN("%s: [B1] plan: %zu ubatches (max %u tokens), largest fitting group %zu (asked %zu) -> %zu passes "
             "of g = %zu, %zu layer streams, lent %zu layers (%.1f MiB, cap %.1f MiB), fresh %.1f MiB, carry %.1f MiB, "
-            "free before %.1f MiB\n", __func__,
+            "free before %.1f MiB, RAM free %.1f MiB, RAM lend cap %.1f MiB\n", __func__,
             nub, max_tok, g_fit, g_max, n_grp, g_sel, steps.size(), lent_sel.size(), st.bytes_lent/1048576.0,
             lend_cap == SIZE_MAX ? -1.0 : lend_cap/1048576.0, fresh_sel/1048576.0, st.bytes_carry/1048576.0,
-            free_mem/1048576.0);
+            free_mem/1048576.0, ram_avail < 0 ? -1.0 : ram_avail/1048576.0, ram_cap < 0 ? -1.0 : ram_cap/1048576.0);
 
     stop     = false;
     io_error = false;
