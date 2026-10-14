@@ -42,8 +42,17 @@ public:
     bool ok() const { return init_ok; }
 
     // plan one decode call: ub_tokens are the ubatch sizes, group_ub the wanted ubatches per group (0 = all),
-    // lend_cap the most resident expert bytes it may borrow. Returns false when even one ubatch per group does not fit.
-    bool begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub, size_t lend_cap);
+    // lend_cap the most resident expert bytes it may borrow. final_home: the last layer's experts that live in RAM
+    // stay there (its FFN sees only the output rows, which the normal path computes on the CPU when they are few).
+    // Returns false when even one ubatch per group does not fit.
+    bool begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub, size_t lend_cap, bool final_home = false);
+
+    // would the normal path run an expert op with this many rows on the GPU when its weights are in RAM? The
+    // scheduler copies such weights to the GPU only for batches the device takes (op offload: 32 rows on CUDA)
+    bool host_rows_on_gpu(int64_t rows) const;
+    // for one ubatch of the current layer il: point its streamed experts that live in RAM back home (true), so the
+    // scheduler makes the same CPU choice as the normal path, or back at the slot (false)
+    void ubatch_home(int il, bool home);
 
     size_t n_ub()     const { return ub_n.size(); }
     size_t n_groups() const { return grp_first.size(); }
@@ -140,6 +149,7 @@ private:
     ggml_context * ctx_meta = nullptr;
     std::vector<ggml_tensor *> carries; // per ubatch of the call
     std::vector<bool> lent_layer;
+    bool final_home_ = false; // see begin()
     std::vector<bool> verified;        // exps index: device bytes checked against the file once
     std::vector<bool> dirty_flag;      // exps index: home VRAM holds borrowed data
     std::vector<int>  dirty_tensors;   // exps indices whose home VRAM holds borrowed data

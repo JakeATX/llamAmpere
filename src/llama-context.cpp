@@ -3441,7 +3441,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     };
 
     // [B1] layer-major prefill: plan the call and apply every ubatch up front, or give lent experts back first
-    const int b1_mode = b1_prepare(mctx.get(), batch_inp, n_tokens_all);
+    const int b1_mode = b1_prepare(mctx.get(), batch_inp, n_tokens_all, n_outputs_all);
     if (b1_mode < 0) {
         return b1_mode;
     }
@@ -3510,7 +3510,19 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         ggml_status status;
 
+        // [B1] the last range holds a streamed layer only when it is the last layer; match the normal path's CPU
+        // choice for an ubatch whose last-layer FFN rows are too few to offload
+        const bool b1_home = b1_mode == 1 && b1->layer_streamed(b1_final_l0) &&
+            !b1->host_rows_on_gpu(b1_final_rows(n_outputs, ubatch.n_tokens));
+        if (b1_home) {
+            b1->ubatch_home(b1_final_l0, true);
+        }
+
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+
+        if (b1_home) {
+            b1->ubatch_home(b1_final_l0, false);
+        }
 
         if (b1_mode == 1) {
             b1_cur = {};
@@ -4329,7 +4341,7 @@ static int64_t b1_ctx_env(const char * name, int64_t def) {
     return e && *e ? atoll(e) : def;
 }
 
-int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_ext & batch_inp, uint32_t n_tokens_all) {
+int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_ext & batch_inp, uint32_t n_tokens_all, int64_t n_outputs_all) {
     if (!b1_tried) {
         b1_tried = true;
         b1_env   = b1_ctx_env("LLAMA_B1", 0) != 0;
@@ -4350,6 +4362,8 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
                 why = "it needs exactly one GPU";
             } else if (cparams.embeddings) {
                 why = "the context computes embeddings";
+            } else if (!cparams.op_offload) {
+                why = "op offload is off, so the normal path computes the experts in RAM on the CPU";
             }
             if (why) {
                 LLAMA_LOG_WARN("%s: [B1] LLAMA_B1 is set but layer-major prefill is off: %s\n", __func__, why);
@@ -4424,7 +4438,11 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
         group_ub = (uint32_t) std::max<int64_t>(1, (s_tok + cparams.n_ubatch/2)/cparams.n_ubatch);
     }
 
-    if (!b1->begin(sizes, group_ub, lend_cap)) {
+    // the last layer is cropped to the output rows before its FFN; when even all outputs together are too few for the
+    // scheduler to copy RAM experts to the GPU, the normal path computes that layer's RAM experts on the CPU in every
+    // ubatch, so B1 leaves them home (same result, one layer less to stream). Otherwise ubatch_home() matches it per ubatch.
+    const bool final_home = !b1->host_rows_on_gpu(b1_final_rows(n_outputs_all, n_tokens_all));
+    if (!b1->begin(sizes, group_ub, lend_cap, final_home)) {
         return normal();
     }
 
@@ -4466,6 +4484,11 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
     return 1;
 }
 
+int64_t llama_context::b1_final_rows(int64_t n_out, int64_t n_tok) const {
+    // the graph crops the last layer to the output rows before its FFN unless the nextn hidden state needs every row
+    return !cparams.embeddings_nextn || cparams.embeddings_nextn_masked ? n_out : n_tok;
+}
+
 bool llama_context::b1_run_prefix(llama_memory_context_i * mctx, size_t ub0, ggml_status & status) {
     const int32_t l_final = b1->final_l0();
     const size_t  ub1     = b1->group_end(ub0);
@@ -4484,7 +4507,15 @@ bool llama_context::b1_run_prefix(llama_memory_context_i * mctx, size_t ub0, ggm
             }
             n_outputs = 0;
             b1_cur = { true, l0, l1, b1->carry(u) };
+            // a short ubatch: the normal path computes the RAM experts of this layer on the CPU, so B1 does too
+            const bool home = b1->layer_streamed(l0) && !b1->host_rows_on_gpu(mctx->get_ubatch().n_tokens);
+            if (home) {
+                b1->ubatch_home(l0, true);
+            }
             const auto * res = process_ubatch(mctx->get_ubatch(), gtype, mctx, status);
+            if (home) {
+                b1->ubatch_home(l0, false);
+            }
             b1_cur = {};
             if (!res) {
                 return false;

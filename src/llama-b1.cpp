@@ -292,6 +292,7 @@ void llama_b1::release_plan() {
     carries.clear();
     steps.clear();
     lent_layer.assign(n_layer, false);
+    final_home_ = false;
     queue.clear();
     queue_head      = 0;
     pieces_left     = 0;
@@ -331,11 +332,12 @@ static std::vector<size_t> b1_pack(const std::vector<size_t> & items, size_t ali
     return left;
 }
 
-bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_req, size_t lend_cap) {
+bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_req, size_t lend_cap, bool final_home) {
     GGML_ASSERT(init_ok);
     stop_threads();
     release_plan();
     st = {};
+    final_home_ = final_home;
 
     ub_n = ub_tokens;
     const size_t nub = ub_n.size();
@@ -615,7 +617,7 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
     for (size_t g = 0; g < n_grp; ++g) {
         grp_first.push_back(g*g_sel);
         for (int il = 0; il < n_layer; ++il) {
-            if (!layers[il].tensors.empty() && (!layers[il].resident || lent_layer[il])) {
+            if (layer_streamed(il)) {
                 steps.push_back({ il, (int) (steps.size() % 2) });
             }
         }
@@ -629,10 +631,11 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
 
     LLAMA_LOG_WARN("%s: [B1] plan: %zu ubatches (max %u tokens), largest fitting group %zu (asked %zu) -> %zu passes "
             "of g = %zu, %zu layer streams, lent %zu layers (%.1f MiB, cap %.1f MiB), fresh %.1f MiB, carry %.1f MiB, "
-            "free before %.1f MiB, RAM free %.1f MiB, RAM lend cap %.1f MiB\n", __func__,
+            "free before %.1f MiB, RAM free %.1f MiB, RAM lend cap %.1f MiB, last layer %s\n", __func__,
             nub, max_tok, g_fit, g_max, n_grp, g_sel, steps.size(), lent_sel.size(), st.bytes_lent/1048576.0,
             lend_cap == SIZE_MAX ? -1.0 : lend_cap/1048576.0, fresh_sel/1048576.0, st.bytes_carry/1048576.0,
-            free_mem/1048576.0, ram_avail < 0 ? -1.0 : ram_avail/1048576.0, ram_cap < 0 ? -1.0 : ram_cap/1048576.0);
+            free_mem/1048576.0, ram_avail < 0 ? -1.0 : ram_avail/1048576.0, ram_cap < 0 ? -1.0 : ram_cap/1048576.0,
+            layer_streamed(n_layer - 1) ? "streamed" : "not streamed");
 
     stop     = false;
     io_error = false;
@@ -645,7 +648,57 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
 }
 
 bool llama_b1::layer_streamed(int il) const {
-    return il >= 0 && il < n_layer && !layers[il].tensors.empty() && (!layers[il].resident || lent_layer[il]);
+    if (il < 0 || il >= n_layer || layers[il].tensors.empty()) {
+        return false;
+    }
+    if (lent_layer[il]) {
+        return true;
+    }
+    // the last layer's FFN runs on the output rows only; with few of them the normal path computes its RAM experts
+    // on the CPU, so they stay home and the layer is not streamed
+    return !layers[il].resident && !(final_home_ && il == n_layer - 1);
+}
+
+bool llama_b1::host_rows_on_gpu(int64_t rows) const {
+    for (const auto & e : exps) {
+        if (e.resident) {
+            continue;
+        }
+        // the batch size the device's offload test reads from a MUL_MAT_ID node: ne[2] rows
+        ggml_tensor op = {};
+        op.op     = GGML_OP_MUL_MAT_ID;
+        op.type   = GGML_TYPE_F32;
+        op.ne[0]  = e.t->ne[1];
+        op.ne[1]  = 1;
+        op.ne[2]  = rows;
+        op.ne[3]  = 1;
+        op.src[0] = e.t;
+        return ggml_backend_dev_offload_op(dev, &op);
+    }
+    return true;
+}
+
+void llama_b1::ubatch_home(int il, bool home) {
+    if (cur_step < 0 || steps[cur_step].il != il) {
+        return;
+    }
+    const int    slot    = steps[cur_step].slot;
+    const size_t n_roles = roles.size();
+    for (int ti : layers[il].tensors) {
+        auto & e = exps[ti];
+        // a lent tensor's home VRAM holds scratch now; its slot copy runs the same kernels the home copy would
+        if (e.resident) {
+            continue;
+        }
+        if (home) {
+            e.t->buffer = e.home_buf;
+            e.t->data   = e.home_data;
+        } else {
+            const placement & p = slot_place[slot*n_roles + e.role];
+            e.t->buffer = regions[p.region].buf;
+            e.t->data   = regions[p.region].base + p.offs;
+        }
+    }
 }
 
 int32_t llama_b1::final_l0() const {

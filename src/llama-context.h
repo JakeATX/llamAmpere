@@ -522,10 +522,11 @@ private:
 
     // returns 1 when this decode call runs layer-major (every ubatch applied and saved, the plan made),
     // 0 for the normal path, < 0 for a decode error code
-    int  b1_prepare(llama_memory_context_i * mctx, const llama_batch_ext & batch_inp, uint32_t n_tokens_all);
+    int  b1_prepare(llama_memory_context_i * mctx, const llama_batch_ext & batch_inp, uint32_t n_tokens_all, int64_t n_outputs_all);
     // runs layers [0, n_layer - 1) of every ubatch of the group that starts at ub0, then seeks back to ub0 with
     // the last layer's experts ready; false on failure (status set)
     bool b1_run_prefix(llama_memory_context_i * mctx, size_t ub0, ggml_status & status);
+    int64_t b1_final_rows(int64_t n_out, int64_t n_tok) const;
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
