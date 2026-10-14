@@ -589,6 +589,9 @@ server_task_result_ptr server_response_reader::next(const std::function<bool()> 
             }
             if (result->is_stop()) {
                 received_count++;
+                if (on_stop) {
+                    on_stop(*result);
+                }
             }
             return result;
         }

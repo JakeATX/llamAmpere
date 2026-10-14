@@ -3,6 +3,7 @@
 #include "server-task.h"
 
 #include <condition_variable>
+#include <functional>
 #include <deque>
 #include <exception>
 #include <mutex>
@@ -216,6 +217,10 @@ struct server_response_reader {
     // tracking generation state and partial tool calls
     // only used by streaming completions
     std::vector<task_result_state> states;
+
+    // optional hook, called in the reading thread for every stop (final) result
+    // after its state update (used by --warm-prefill)
+    std::function<void(server_task_result &)> on_stop;
 
     // should_stop function will be called each polling_interval_seconds
     server_response_reader(server_queue & queue_tasks, server_response & queue_results, int polling_interval_seconds)

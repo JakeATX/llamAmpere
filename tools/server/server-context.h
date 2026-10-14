@@ -116,6 +116,7 @@ struct server_context {
 
 // forward declarations
 struct server_res_generator;
+struct server_warm_worker;
 
 struct server_routes {
     server_routes(const common_params & params, server_context & ctx_server);
@@ -166,7 +167,8 @@ private:
             server_task_type type,
             const json & data,
             const std::vector<raw_buffer> & files,
-            task_response_type res_type);
+            task_response_type res_type,
+            std::shared_ptr<const json> warm_src = nullptr);
     std::unique_ptr<server_res_generator> handle_slots_save(const server_http_req & req, int id_slot);
     std::unique_ptr<server_res_generator> handle_slots_restore(const server_http_req & req, int id_slot);
     std::unique_ptr<server_res_generator> handle_slots_erase(const server_http_req &, int id_slot);
@@ -192,4 +194,9 @@ private:
     bool           should_reset_buckets = false;
     // call right before sleep to update the cached responses
     void update_cached_responses(bool is_sleeping);
+
+    // --warm-prefill: renders the next turn's known prefix off the request path and posts it
+    std::shared_ptr<server_warm_worker> warm_worker;
+    std::shared_ptr<const json> warm_source(const json & body) const;
+    void warm_build_and_post(const json & body, const json & reply, int id_slot, int id_task);
 };

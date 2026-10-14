@@ -2015,6 +2015,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_IDLE_SLOTS").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--warm-prefill"},
+        {"--no-warm-prefill"},
+        "after a chat reply, prefill the part of the next request that is already known (history + reply + start of the next user turn) "
+        "in the background on the same slot; any new request stops it at the next ubatch boundary (default: disabled)",
+        [](common_params & params, bool value) {
+            params.warm_prefill = value;
+        }
+    ).set_env("LLAMA_ARG_WARM_PREFILL").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--context-shift"},
         {"--no-context-shift"},
         string_format("whether to use context shift on infinite text generation (default: %s)", params.ctx_shift ? "enabled" : "disabled"),

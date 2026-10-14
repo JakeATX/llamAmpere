@@ -44,6 +44,10 @@ extern "C" {
 #include <utility>
 #include <chrono>
 #include <fstream>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -920,6 +924,9 @@ struct server_slot {
     // state a cold prefill has at that token, so it continues from there without a context checkpoint
     bool eval_cache_restored = false;
 
+    // id of the last task this slot finished (used to reject stale warm-prefill tasks)
+    int id_last_task = -1;
+
     stop_type stop;
 
     std::string stopping_word;
@@ -1346,6 +1353,8 @@ struct server_slot {
             state = SLOT_STATE_IDLE;
 
             ckpt_spare = {};
+
+            id_last_task = task->id;
 
             // do not keep context of the child slots - the parent's context is enough
             if (task->is_child()) {
@@ -4435,6 +4444,48 @@ private:
                 cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024, (ggml_time_us() - t_ckpt_us) / 1000.0, reused ? ", reused buffer" : "");
     }
 
+    // --warm-prefill: release every slot that is running a background warm task. The tokens
+    // it already processed stay in the slot's cache (prompt tokens and memory agree at every
+    // batch boundary), so a following request that extends them reuses them as usual.
+    void stop_warm_slots(const char * reason) {
+        for (auto & slot : slots) {
+            if (slot.is_processing() && slot.task && slot.task->params.warm) {
+                SLT_INF(slot, "warm prefill stopped (%s) at n_tokens = %d of %d\n", reason, slot.prompt.n_tokens(), slot.task->n_tokens());
+                slot.release();
+                slot.i_batch = -1;
+            }
+        }
+    }
+
+    void launch_warm_task(server_task && task) {
+        server_slot * slot = task.id_slot >= 0 ? get_slot_by_id(task.id_slot) : nullptr;
+        if (slot == nullptr) {
+            SRV_INF("warm prefill dropped: no slot %d\n", task.id_slot);
+            return;
+        }
+        // run only when the whole server is idle: warm work must never compete with a request
+        for (auto & other : slots) {
+            if (other.is_processing()) {
+                SLT_INF(*slot, "%s", "warm prefill dropped: server busy\n");
+                return;
+            }
+        }
+        // the slot must still hold the conversation whose reply we are warming
+        if (slot->id_last_task != task.params.warm_src_task) {
+            SLT_INF(*slot, "warm prefill dropped: slot moved on (last task %d, warm source %d)\n", slot->id_last_task, task.params.warm_src_task);
+            return;
+        }
+        const size_t n_common = slot->prompt.tokens.get_common_prefix(task.tokens);
+        if (n_common >= task.tokens.size()) {
+            SLT_INF(*slot, "%s", "warm prefill dropped: already cached\n");
+            return;
+        }
+        SLT_INF(*slot, "warm prefill: %zu tokens, %zu already cached\n", task.tokens.size(), n_common);
+        if (!launch_slot_with_task(*slot, std::move(task))) {
+            SLT_WRN(*slot, "%s", "warm prefill: failed to launch\n");
+        }
+    }
+
     // returns false to decline the task, it is offered again after the decode is done
     bool process_single_task(server_task && task, bool is_yielding) {
         // while yielding, an encode / decode is running and only reading the server state is safe
@@ -4459,6 +4510,15 @@ private:
                     }
 
                     const int id_task = task.id;
+
+                    if (task.params.warm) {
+                        launch_warm_task(std::move(task));
+                        break;
+                    }
+
+                    // any foreground request stops background warm prefill first, so it never waits
+                    // for more than the ubatch that is already in flight
+                    stop_warm_slots("new request");
 
                     server_slot * slot = get_available_slot(task);
 
@@ -4622,6 +4682,7 @@ private:
                 } break;
             case SERVER_TASK_TYPE_SLOT_SAVE:
                 {
+                    stop_warm_slots("slot save");
                     const int id_slot = task.slot_action.id_slot;
                     server_slot * slot = get_slot_by_id(id_slot);
                     if (slot == nullptr) {
@@ -4693,6 +4754,7 @@ private:
                 } break;
             case SERVER_TASK_TYPE_SLOT_RESTORE:
                 {
+                    stop_warm_slots("slot restore");
                     const int id_slot = task.slot_action.id_slot;
                     server_slot * slot = get_slot_by_id(id_slot);
                     if (slot == nullptr) {
@@ -4809,6 +4871,7 @@ private:
                 } break;
             case SERVER_TASK_TYPE_SLOT_ERASE:
                 {
+                    stop_warm_slots("slot erase");
                     const int id_slot = task.slot_action.id_slot;
                     server_slot * slot = get_slot_by_id(id_slot);
                     if (slot == nullptr) {
@@ -6010,6 +6073,12 @@ private:
 
                     // add prompt tokens for processing in the current batch
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                        // warm prefill adds at most one ubatch per iteration, so a request that
+                        // arrives meanwhile waits for at most one ubatch
+                        if (slot.task->params.warm && batch.size() - n_tokens_prev >= n_ubatch) {
+                            break;
+                        }
+
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
@@ -6634,6 +6703,14 @@ private:
                     return;
                 }
 
+                if (slot.task->params.warm) {
+                    // background warm prefill done: keep the cache, sample nothing, send nothing
+                    SLT_INF(slot, "warm prefill done, n_tokens = %d\n", slot.prompt.n_tokens());
+                    slot.release();
+                    slot.i_batch = -1;
+                    return;
+                }
+
                 GGML_ASSERT(slot.task->need_sampling());
 
                 // prompt evaluated for next-token prediction
@@ -7143,12 +7220,180 @@ void server_context::set_state_callback(server_state_callback_t callback) {
 // server_routes
 //
 
+//
+// --warm-prefill worker
+//
+// After a chat reply, the start of the next request is already known: the history, the reply as
+// the chat template will render it (which can differ from the generated tokens, e.g. a stripped
+// <think> block), and the opening of the next user/tool turn. The worker renders that next request
+// with a few different placeholder turns, keeps the token prefix they all share, and posts it as a
+// background prompt-only task on the slot that served the reply. Rendering and tokenizing run on
+// this thread, not on the request path and not on the inference loop.
+//
+struct server_warm_worker {
+    struct job {
+        json body;  // the request body in OAI chat form, before template parsing
+        json reply; // the assistant message as returned to the client
+        int  id_slot;
+        int  id_task;
+    };
+
+    std::mutex              mtx;
+    std::condition_variable cv;
+    std::deque<job>         jobs;
+    bool                    stopping = false;
+    std::thread             th;
+
+    explicit server_warm_worker(std::function<void(const job &)> fn) {
+        th = std::thread([this, fn = std::move(fn)]() {
+            while (true) {
+                job j;
+                {
+                    std::unique_lock<std::mutex> lock(mtx);
+                    cv.wait(lock, [this] { return stopping || !jobs.empty(); });
+                    if (stopping) {
+                        return;
+                    }
+                    j = std::move(jobs.front());
+                    jobs.pop_front();
+                }
+                try {
+                    fn(j);
+                } catch (const std::exception & e) {
+                    SRV_WRN("warm prefill: skipped (%s)\n", e.what());
+                }
+            }
+        });
+    }
+
+    ~server_warm_worker() {
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            stopping = true;
+        }
+        cv.notify_all();
+        if (th.joinable()) {
+            th.join();
+        }
+    }
+
+    void push(job && j) {
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            // a newer reply makes any queued older one stale
+            jobs.clear();
+            jobs.push_back(std::move(j));
+        }
+        cv.notify_one();
+    }
+};
+
+std::shared_ptr<const json> server_routes::warm_source(const json & body) const {
+    if (!warm_worker || ctx_server.mctx != nullptr || !body.contains("messages") || !body.at("messages").is_array()) {
+        return nullptr;
+    }
+    return std::make_shared<const json>(body);
+}
+
+void server_routes::warm_build_and_post(const json & body, const json & reply, int id_slot, int id_task) {
+    const int64_t t_start = ggml_time_us();
+
+    // the next turn: a tool result after a tool call, otherwise a user message. Two placeholder
+    // contents; their shared prefix is what any real next turn of that kind starts with. (Some
+    // templates render the reply differently depending on what follows, e.g. Qwen keeps the
+    // reasoning of an assistant turn that comes after the last user message, so the kinds are not mixed.)
+    std::vector<json> next_turns;
+    if (reply.contains("tool_calls") && reply.at("tool_calls").is_array() && !reply.at("tool_calls").empty()) {
+        const json & tc = reply.at("tool_calls").at(0);
+        for (const char * content : {"A", "B"}) {
+            json tool_msg = {{"role", "tool"}, {"content", content}};
+            if (tc.contains("id")) {
+                tool_msg["tool_call_id"] = tc.at("id");
+            }
+            if (tc.contains("function") && tc.at("function").contains("name")) {
+                tool_msg["name"] = tc.at("function").at("name");
+            }
+            next_turns.push_back(std::move(tool_msg));
+        }
+    } else {
+        next_turns.push_back(json {{"role", "user"}, {"content", "A"}});
+        next_turns.push_back(json {{"role", "user"}, {"content", "B"}});
+    }
+
+    json parsed_first;
+    llama_tokens prefix;
+    bool first = true;
+    for (const auto & next : next_turns) {
+        json b = body;
+        b["messages"].push_back(reply);
+        b["messages"].push_back(next);
+        b["stream"] = false;
+        std::vector<raw_buffer> files;
+        json parsed;
+        try {
+            parsed = oaicompat_chat_params_parse(b, meta->chat_params, files);
+        } catch (const std::exception & e) {
+            SRV_WRN("warm prefill: next turn does not render (%s)\n", e.what());
+            return;
+        }
+        if (!files.empty()) {
+            return;
+        }
+        auto inputs = tokenize_input_prompts(ctx_server.vocab, nullptr, parsed.at("prompt"), true, true, ctx_server.init_opt);
+        if (inputs.size() != 1) {
+            return;
+        }
+        const llama_tokens toks = inputs[0].get_text_tokens();
+        if (first) {
+            prefix       = toks;
+            parsed_first = std::move(parsed);
+            first        = false;
+        } else {
+            size_t n = 0;
+            while (n < prefix.size() && n < toks.size() && prefix[n] == toks[n]) {
+                n++;
+            }
+            prefix.resize(n);
+        }
+    }
+
+    // keep one token of margin: the last shared token may merge differently with the real next turn
+    if (prefix.size() < 2) {
+        return;
+    }
+    prefix.pop_back();
+
+    server_task task(SERVER_TASK_TYPE_COMPLETION);
+    task.id     = queue_tasks.get_new_id();
+    task.index  = 0;
+    task.tokens = server_tokens(prefix, false);
+    task.params = server_schema::eval_llama_cmpl_schema(ctx_server.vocab, params, meta->logit_bias_eog, parsed_first);
+
+    auto delimiters = common_chat_msg_delimiters_parse(json_value(parsed_first, "message_delimiters", json::array()));
+    delimiters.tokenize(ctx_server.vocab);
+    task.params.message_spans = task.tokens.find_message_spans(delimiters);
+
+    task.params.stream        = false;
+    task.params.n_cmpl        = 1;
+    task.params.res_type      = TASK_RESPONSE_TYPE_NONE;
+    task.params.warm          = true;
+    task.params.warm_src_task = id_task;
+    task.id_slot              = id_slot;
+
+    SRV_INF("warm prefill: posting %zu-token prefix for slot %d (render %.1f ms)\n",
+            prefix.size(), id_slot, (ggml_time_us() - t_start) / 1e3);
+
+    // nobody waits on this task id, so its results (if any) are dropped by server_response::send()
+    queue_tasks.post(std::move(task));
+}
+
 std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             const server_http_req & req,
             server_task_type type,
             const json & data,
             const std::vector<raw_buffer> & files,
-            task_response_type res_type) {
+            task_response_type res_type,
+            std::shared_ptr<const json> warm_src) {
     GGML_ASSERT(type == SERVER_TASK_TYPE_COMPLETION || type == SERVER_TASK_TYPE_INFILL);
 
     auto res = create_response();
@@ -7226,6 +7471,23 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             }
 
             tasks.push_back(std::move(task));
+        }
+
+        // --warm-prefill: once the reply is final, warm the next turn in the background
+        if (warm_src && warm_worker && type == SERVER_TASK_TYPE_COMPLETION &&
+                tasks.size() == 1 && !tasks[0].is_parent()) {
+            rd.on_stop = [ww = std::weak_ptr<server_warm_worker>(warm_worker), warm_src](server_task_result & r) {
+                auto w = ww.lock();
+                if (!w) {
+                    return;
+                }
+                auto * fin = dynamic_cast<server_task_result_cmpl_final *>(&r);
+                if (fin == nullptr || !fin->is_updated) {
+                    return;
+                }
+                json reply = fin->oaicompat_msg.to_json_oaicompat();
+                w->push({ *warm_src, std::move(reply), fin->id_slot, fin->id });
+            };
         }
 
         rd.post_tasks(std::move(tasks));
@@ -7449,6 +7711,11 @@ server_routes::server_routes(const common_params & params, server_context & ctx_
           ctx_server(*ctx_server.impl),
           queue_tasks(ctx_server.impl->queue_tasks),
           queue_results(ctx_server.impl->queue_results) {
+    if (params.warm_prefill) {
+        warm_worker = std::make_shared<server_warm_worker>([this](const server_warm_worker::job & j) {
+            warm_build_and_post(j.body, j.reply, j.id_slot, j.id_task);
+        });
+    }
     init_routes();
 
     // note: this must be registered before load_model()
@@ -7860,6 +8127,7 @@ void server_routes::init_routes() {
         auto res = create_response();
         std::vector<raw_buffer> files;
         json body = json::parse(req.body);
+        auto warm_src = warm_source(body); // copy before parsing, which edits body
         json body_parsed = oaicompat_chat_params_parse(
             body,
             meta->chat_params,
@@ -7869,7 +8137,8 @@ void server_routes::init_routes() {
             SERVER_TASK_TYPE_COMPLETION,
             body_parsed,
             files,
-            TASK_RESPONSE_TYPE_OAI_CHAT);
+            TASK_RESPONSE_TYPE_OAI_CHAT,
+            warm_src);
     };
 
     this->post_chat_completions_tok = [this](const server_http_req & req) {
@@ -7919,6 +8188,7 @@ void server_routes::init_routes() {
         json body = server_chat_convert_responses_to_chatcmpl(json::parse(req.body));
         SRV_DBG("%s\n", "Request converted: OpenAI Responses -> OpenAI Chat Completions");
         SRV_DBG("converted request: %s\n", body.dump().c_str());
+        auto warm_src = warm_source(body); // copy before parsing, which edits body
         json body_parsed = oaicompat_chat_params_parse(
             body,
             meta->chat_params,
@@ -7928,7 +8198,8 @@ void server_routes::init_routes() {
             SERVER_TASK_TYPE_COMPLETION,
             body_parsed,
             files,
-            TASK_RESPONSE_TYPE_OAI_RESP);
+            TASK_RESPONSE_TYPE_OAI_RESP,
+            warm_src);
     };
 
     this->post_responses_tok_oai = [this](const server_http_req & req) {
@@ -7969,6 +8240,7 @@ void server_routes::init_routes() {
         json body = server_chat_convert_anthropic_to_oai(json::parse(req.body));
         SRV_DBG("%s\n", "Request converted: Anthropic -> OpenAI Chat Completions");
         SRV_DBG("converted request: %s\n", body.dump().c_str());
+        auto warm_src = warm_source(body); // copy before parsing, which edits body
         json body_parsed = oaicompat_chat_params_parse(
             body,
             meta->chat_params,
@@ -7978,7 +8250,8 @@ void server_routes::init_routes() {
             SERVER_TASK_TYPE_COMPLETION,
             body_parsed,
             files,
-            TASK_RESPONSE_TYPE_ANTHROPIC);
+            TASK_RESPONSE_TYPE_ANTHROPIC,
+            warm_src);
     };
 
     this->post_anthropic_count_tokens = [this](const server_http_req & req) {
