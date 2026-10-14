@@ -259,6 +259,8 @@ int main(int argc, char ** argv) {
         return 1;
     }
     const int stride = integer_env("KLD_STRIDE", 1);
+    // KLD_OUTPUTS_MAX: cap the logits rows reserved per batch (default n_batch), for large batches with a sparse score mask
+    params.n_outputs_max = integer_env("KLD_OUTPUTS_MAX", 0, 0);
     const std::vector<int> bins = parse_bins(env_bins);
     const int idle_every = integer_env("KLD_SJKVARN_IDLE_EVERY", 0, 0);
     if (idle_every && (params.n_batch <= 0 || idle_every % params.n_batch != 0)) {

@@ -1349,10 +1349,41 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
+    // --n-cpu-moe auto (#224): let the fit place the layers (whole layers on the GPU front to back, the routed experts
+    // of the remaining layers in the CPU) instead of the user's -ngl, and without the MoE-cache placement candidate,
+    // so spare VRAM holds resident expert layers rather than a hot-expert cache
+    bool ncmoe_auto = params.n_cpu_moe_auto;
+    auto ncmoe_all_cpu = [&]() {
+        // fallback = --cpu-moe with the user's -ngl
+        params.tensor_buft_overrides[0] = llm_ffn_exps_cpu_override();
+        params.tensor_buft_overrides[1] = {nullptr, nullptr};
+        mparams.n_gpu_layers          = params.n_gpu_layers;
+        mparams.tensor_buft_overrides = params.tensor_buft_overrides.data();
+    };
+    if (ncmoe_auto) {
+        if (!params.tensor_buft_overrides.empty() && params.tensor_buft_overrides[0].pattern != nullptr) {
+            throw std::invalid_argument("--n-cpu-moe auto cannot be combined with -ot/--cpu-moe/--n-cpu-moe N");
+        }
+        if (params.tensor_buft_overrides.size() < 2) {
+            params.tensor_buft_overrides.resize(llama_max_tensor_buft_overrides(), {nullptr, nullptr});
+            mparams.tensor_buft_overrides = nullptr;
+        }
+        if (params.kv_stream_arena_mib != 0) {
+            COM_WRN("%s", "--n-cpu-moe auto needs the device-memory fit, which a shared KV/compute arena disables: keeping all experts in the CPU\n");
+            ncmoe_all_cpu();
+            ncmoe_auto = false;
+        } else {
+            if (params.n_gpu_layers != -1) {
+                COM_INF("--n-cpu-moe auto: -ngl %d is replaced by the fitted layer count\n", params.n_gpu_layers);
+            }
+            mparams.n_gpu_layers = -1;
+        }
+    }
+
     if (params.fit_params && !common_params_should_fit_device_memory(params)) {
         COM_INF("%s", "skipping device-memory auto-fit because a shared KV/compute arena is explicitly configured\n");
     }
-    if (common_params_should_fit_device_memory(params)) {
+    if (common_params_should_fit_device_memory(params) || ncmoe_auto) {
         COM_TRC("%s", "fitting params to device memory ...\n");
         COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
         // Snapshot the pre-fit state so a failed fit can be rolled back to a
@@ -1402,7 +1433,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.model.path.c_str(), &mparams, &cparams,
             params.tensor_split,
             params.tensor_buft_overrides.data(),
-            &params.moe_cache,
+            ncmoe_auto ? nullptr : &params.moe_cache,
             params.fit_params_target.data(),
             params.fit_params_min_ctx,
             has_draft || spec_mtp ? &extra : nullptr,
@@ -1422,6 +1453,20 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             mparams.tensor_split = params.tensor_split;
             mparams.tensor_buft_overrides = params.tensor_buft_overrides.empty()
                 ? nullptr : params.tensor_buft_overrides.data();
+            if (ncmoe_auto) {
+                COM_WRN("%s", "--n-cpu-moe auto: no fitted placement, keeping all experts in the CPU (as --cpu-moe)\n");
+                ncmoe_all_cpu();
+            }
+        } else if (ncmoe_auto) {
+            int n_cpu_layers = 0;
+            for (const auto & tbo : params.tensor_buft_overrides) {
+                if (tbo.pattern == nullptr) {
+                    break;
+                }
+                n_cpu_layers++;
+            }
+            COM_INF("--n-cpu-moe auto: fitted -ngl %d (-1 = all layers), %d of those layers keep (part of) their FFN/experts in the CPU\n",
+                mparams.n_gpu_layers, n_cpu_layers);
         }
     }
 

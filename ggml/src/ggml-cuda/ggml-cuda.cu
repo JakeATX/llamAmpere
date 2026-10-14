@@ -9323,6 +9323,28 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_unregister_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_unregister_host_buffer;
     }
+    // [FNSTRATA] page-lock an existing writable host range (anonymous memory: the read-only registration of a mapped
+    // file is unsupported on some drivers) for direct copies; no env switch here: the caller's own opt-in decides (the
+    // expert streamer uses it for GGML_SCHED_XSTREAM_PIN_MIB)
+    if (strcmp(name, "ggml_backend_cuda_host_pin") == 0) {
+        return (void *) +[](void * ptr, size_t size) -> bool {
+            cudaError_t err = cudaHostRegister(ptr, size, cudaHostRegisterPortable);
+            if (err != cudaSuccess) {
+                (void) cudaGetLastError();
+                GGML_LOG_WARN("%s: failed to page-lock %.1f MiB: %s\n", "ggml_backend_cuda_host_pin", size/1048576.0,
+                    cudaGetErrorString(err));
+                return false;
+            }
+            return true;
+        };
+    }
+    if (strcmp(name, "ggml_backend_cuda_host_unpin") == 0) {
+        return (void *) +[](void * ptr) {
+            if (cudaHostUnregister(ptr) != cudaSuccess) {
+                (void) cudaGetLastError();
+            }
+        };
+    }
     if (strcmp(name, "ggml_backend_cuda_phase_arena_new_for_device") == 0) {
         return (void *) +[](ggml_backend_dev_t dev, size_t size) -> void * {
             if (dev == nullptr || dev->iface.get_name != ggml_backend_cuda_device_get_name) {
