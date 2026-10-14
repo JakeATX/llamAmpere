@@ -848,7 +848,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     //  - the final slot indices (the last reads of the score) are queued before the n_kv-wide buffers exist;
     //  - the causal mask is added in place, so the selection stays a row-strided view of mask_all instead of a
     //    second n_kv x n_tokens buffer
-    static const bool sel_inplace = [] { const char * e = getenv("LLAMA_QSA_SEL_INPLACE"); return e && atoi(e) != 0; }();
+    // LLAMA_QSA_SEL_DIRECT=1 (opt-in, implies the in-place ordering and padded rows) passes the selection to attention
+    // without adding the causal mask, same values: every live selected cell is already visible to its token (a pool is
+    // live only when it belongs to the token's sequence and ends at or before it, a tail cell is the token's own or an
+    // earlier position of its sequence, and every dead slot goes to a dump row outside the n_kv-wide view), so the add
+    // only ever adds 0 to 0 or something to -inf. Nothing then reads the n_kv x n_tokens causal mask, so it is never
+    // filled on the host, uploaded or kept in the compute buffer (3 GiB at ub 12288 and 128K context)
+    static const bool sel_direct  = [] { const char * e = getenv("LLAMA_QSA_SEL_DIRECT"); return e && atoi(e) != 0; }();
+    static const bool sel_inplace = sel_direct || [] { const char * e = getenv("LLAMA_QSA_SEL_INPLACE"); return e && atoi(e) != 0; }();
 
     // scatter zeros for the selected cells into an all -inf row, each dead slot into its own dump row n_kv + slot
     // seeding from sel_idx ties the scatter storage lifetime to this layer
@@ -896,7 +903,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     const size_t row = sel->nb[2];
     sel = ggml_view_4d(ctx0, sel, n_kv, kq_mask->ne[1], kq_mask->ne[2], kq_mask->ne[3],
             row, row*kq_mask->ne[1], row*kq_mask->ne[1]*kq_mask->ne[2], 0);
-    sel = sel_inplace ? ggml_add_inplace(ctx0, sel, kq_mask) : ggml_add(ctx0, sel, kq_mask);
+    if (!sel_direct) {
+        sel = sel_inplace ? ggml_add_inplace(ctx0, sel, kq_mask) : ggml_add(ctx0, sel, kq_mask);
+    }
     cb(sel, "indexer_sel", il);
 
     return sel;
