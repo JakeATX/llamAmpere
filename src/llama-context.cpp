@@ -2540,6 +2540,22 @@ bool llama_sj_kvarn_prefill_cut(llama_context * ctx, llama_seq_id seq_id, llama_
     return kv->sj_kvarn_prefill_cut(seq_id, pos);
 }
 
+int32_t llama_sj_kvarn_ckpt_sealed_end(const uint8_t * data, size_t size, llama_pos * pos_end) {
+    // trailer of the exact section (llama_kv_cache::state_write_sj_ckpt): sealed end, position, magic
+    uint32_t t[3];
+    if (data == nullptr || size < sizeof(t)) {
+        return -1;
+    }
+    memcpy(t, data + size - sizeof(t), sizeof(t));
+    if (t[2] != LLAMA_SJ_KVARN_CKPT_END_MAGIC || t[0] > t[1]) {
+        return -1;
+    }
+    if (pos_end) {
+        *pos_end = (llama_pos) t[1];
+    }
+    return (int32_t) t[0];
+}
+
 llama_pos llama_sj_kvarn_ckpt_floor(llama_context * ctx, llama_pos pos) {
     auto * kv = ctx ? llama_sj_kvarn_cache(ctx->get_memory()) : nullptr;
     if (!kv || !kv->is_sj_kvarn() || pos < 0) { return pos; }
@@ -7432,6 +7448,10 @@ class llama_io_read_host : public llama_io_read_i {
 
     size_t n_bytes() override {
         return size_read;
+    }
+
+    size_t n_left() override {
+        return buf_size;
     }
 
   private:

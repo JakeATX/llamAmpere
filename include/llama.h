@@ -951,6 +951,11 @@ extern "C" {
     // bit-identically to a cold one. No-op (false) off the grid, without SJ-KVaRN, or when nothing changes.
     LLAMA_API bool llama_sj_kvarn_prefill_cut(struct llama_context * ctx, llama_seq_id seq_id, llama_pos pos);
 
+    // [#240] For a state blob saved with LLAMA_STATE_SEQ_FLAGS_SJ_EXACT: the sealed end it restores (written in its last
+    // bytes) and, in *pos_end, its position n. -1 when the blob carries no SJ-KVaRN exact section. The restore needs the
+    // live cache to still hold the sealed records below that end (llama_sj_kvarn_seq_sealed_end() >= the result).
+    LLAMA_API int32_t llama_sj_kvarn_ckpt_sealed_end(const uint8_t * data, size_t size, llama_pos * pos_end);
+
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
 
@@ -1071,6 +1076,13 @@ extern "C" {
 // continuation on sliding-window models). Both the save and the load must use it; the data is not compatible with
 // states saved without it.
 #define LLAMA_STATE_SEQ_FLAGS_KEEP_LAYOUT 4
+
+// [#240] SJ-KVaRN exact checkpoint: with PARTIAL_ONLY, a hybrid model's SJ-KVaRN attention cache adds a section with
+// its seal state and the open staging rows [sealed end, n) to the partial state, so a restore puts the attention cache
+// back exactly as it was at n (any n, not only the seal grid). The load needs no flag: the section is a suffix that
+// is read when present (older checkpoints without it load as before). On a plain SJ-KVaRN cache (no recurrent part)
+// the flag saves/loads that section alone. See llama_sj_kvarn_ckpt_sealed_end().
+#define LLAMA_STATE_SEQ_FLAGS_SJ_EXACT 8
 
     typedef uint32_t llama_state_seq_flags;
 

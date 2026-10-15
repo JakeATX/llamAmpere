@@ -1,6 +1,7 @@
 #include "llama-memory-hybrid.h"
 
 #include "llama-impl.h"
+#include "llama-io.h"
 #include "llama-model.h"
 #include "llama-context.h"
 
@@ -217,6 +218,22 @@ void llama_memory_hybrid::state_write(llama_io_write_i & io, llama_seq_id seq_id
         mem_attn->state_write(io, seq_id, flags);
     }
     mem_recr->state_write(io, seq_id, flags);
+    state_write_sj_exact(io, seq_id, flags);
+}
+
+void llama_memory_hybrid::state_write_sj_exact(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+    // [#240] SJ-KVaRN exact checkpoint: a suffix behind the recurrent state (see LLAMA_STATE_SEQ_FLAGS_SJ_EXACT)
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) && (flags & LLAMA_STATE_SEQ_FLAGS_SJ_EXACT) && mem_attn->is_sj_kvarn()) {
+        mem_attn->state_write_sj_ckpt(io, seq_id);
+    }
+}
+
+void llama_memory_hybrid::state_read_sj_exact(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    // [#240] read the suffix when the blob has one: checkpoints saved without it (older builds, sidecar files of
+    // v0.5.4) end with the recurrent state and load as before
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) && io.n_left() > 0 && mem_attn->is_sj_kvarn()) {
+        mem_attn->state_read_sj_ckpt(io, seq_id);
+    }
 }
 
 void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
@@ -228,6 +245,7 @@ void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
 
     try {
         mem_recr->state_read(io, seq_id, flags);
+        state_read_sj_exact(io, seq_id, flags);
     } catch (...) {
         // the attention part is already restored - undo it
         if (read_attn) {

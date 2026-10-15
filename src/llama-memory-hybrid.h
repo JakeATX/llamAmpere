@@ -91,6 +91,10 @@ public:
     llama_kv_cache * get_mem_attn() const;
     llama_memory_recurrent * get_mem_recr() const;
 
+    // [#240] SJ-KVaRN exact checkpoint suffix of a PARTIAL_ONLY state (LLAMA_STATE_SEQ_FLAGS_SJ_EXACT)
+    void state_write_sj_exact(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const;
+    void state_read_sj_exact (llama_io_read_i  & io, llama_seq_id seq_id, llama_state_seq_flags flags);
+
 private:
     const llama_hparams & hparams;
 

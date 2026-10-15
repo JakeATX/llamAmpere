@@ -241,6 +241,58 @@ static int run_cfg(llama_model * model, const sj_cfg & c, llama_pos N, const std
     return n_diff;
 }
 
+// [#240] exact checkpoints (LLAMA_STATE_SEQ_FLAGS_SJ_EXACT): a checkpoint at any position c (the server puts them
+// where the f16 cache does: 4 and 4 + n_ubatch before the prompt end) stores the seal state and the open ring rows.
+// After a long answer past c (the ring wraps, B and an idle seal run past c), optionally a full state save/load (the
+// RAM/disk prompt cache), the restore + cut at c + re-prefill of [c, N) must give the same logits as the run that
+// made the checkpoint ([0, c) then [c, N)), bit for bit. Returns the number of differing variants.
+static int run_exact(llama_model * model, const sj_cfg & c, llama_pos N, const std::vector<llama_pos> & cuts) {
+    int n_diff = 0;
+    llama_context * ctx = make_ctx(model, c);
+    require(ctx != nullptr, "context");
+    const llama_state_seq_flags fl = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_SJ_EXACT;
+    for (llama_pos cut : cuts) {
+        llama_memory_clear(llama_get_memory(ctx), true);
+        prefill(ctx, 0, cut);
+        const std::vector<float> ref = decode(ctx, cut, N, (int) g_ub);
+        for (int mode = 0; mode < 2; ++mode) {
+            llama_memory_clear(llama_get_memory(ctx), true);
+            prefill(ctx, 0, cut);
+            std::vector<uint8_t> ck(llama_state_seq_get_size_ext(ctx, 0, fl));
+            require(!ck.empty() && llama_state_seq_get_data_ext(ctx, ck.data(), ck.size(), 0, fl) == ck.size(), "exact ckpt save");
+            llama_pos ck_end = -1;
+            const int32_t ck_B = llama_sj_kvarn_ckpt_sealed_end(ck.data(), ck.size(), &ck_end);
+            require(ck_B >= 0 && ck_end == cut && ck_B <= cut, "exact ckpt trailer");
+            // a long answer past the cut: prompt rows, then decode steps, then more rows until the ring has wrapped
+            const llama_pos e = std::min<llama_pos>(cut + 300, 3900);
+            prefill(ctx, cut, e, 7);
+            decode(ctx, e, e + 40, 1, 9);
+            const llama_pos e2 = std::min<llama_pos>(e + 40 + 1800, 4090);
+            decode(ctx, e + 40, e2, (int) g_ub, 11);
+            llama_sj_kvarn_compress_idle(ctx, 0, e2);
+            if (mode == 1) { // RAM/disk prompt cache: the whole sequence state goes out and comes back
+                std::vector<uint8_t> buf(llama_state_seq_get_size(ctx, 0));
+                require(llama_state_seq_get_data(ctx, buf.data(), buf.size(), 0) == buf.size(), "state save");
+                llama_memory_clear(llama_get_memory(ctx), true);
+                require(llama_state_seq_set_data(ctx, buf.data(), buf.size(), 0) == buf.size(), "state load");
+            }
+            const int32_t B_live = llama_sj_kvarn_seq_sealed_end(ctx, 0);
+            require(B_live >= ck_B, "live sealed end covers the checkpoint");
+            require(llama_state_seq_set_data_ext(ctx, ck.data(), ck.size(), 0, fl) == ck.size(), "exact ckpt load");
+            require(llama_sj_kvarn_seq_sealed_end(ctx, 0) == ck_B, "sealed end restored");
+            require(!llama_sj_kvarn_prefill_cut(ctx, 0, cut), "prefill_cut keeps an exact restore");
+            require(llama_memory_seq_rm(llama_get_memory(ctx), 0, cut, -1), "seq_rm at the checkpoint");
+            const std::vector<float> got = decode(ctx, cut, N, (int) g_ub);
+            const bool same = got.size() == ref.size() && memcmp(got.data(), ref.data(), got.size()*sizeof(float)) == 0;
+            n_diff += !same;
+            printf("%-22s   exact%s %4d: %s max|d| = %.3g  ckpt B=%d (live B %d before restore), %zu bytes\n", c.name,
+                    mode ? "+state" : "      ", (int) cut, same ? "identical" : "DIFFERS  ", max_diff(got, ref), ck_B, B_live, ck.size());
+        }
+    }
+    llama_free(ctx);
+    return n_diff;
+}
+
 int main(int argc, char ** argv) {
     (void) argc; (void) argv;
     if (getenv("SJ_TEST_UB")) { g_ub = (uint32_t) atoi(getenv("SJ_TEST_UB")); }
@@ -286,8 +338,23 @@ int main(int argc, char ** argv) {
     }
     int n_bad_plain = 0, n_bad_sj = 0;
     for (const auto & c : cfgs) {
+        if (getenv("SJ_TEST_EXACT_ONLY")) { break; } // [#240] only the exact-checkpoint cases
         const int d = run_cfg(model, c, N, cuts);
         (c.plain ? n_bad_plain : n_bad_sj) += d;
+    }
+    // [#240] exact checkpoints at the f16 spots (4 and 4 + n_ubatch before the end, both off the grid); more cuts
+    // (e.g. 1000,1024 for a grid line) with SJ_TEST_EXACT_CUTS
+    {
+        std::vector<llama_pos> ecuts = { N - 4, N - 4 - (llama_pos) g_ub };
+        if (getenv("SJ_TEST_EXACT_CUTS")) {
+            ecuts.clear();
+            for (const char * q = getenv("SJ_TEST_EXACT_CUTS"); *q; ) { ecuts.push_back(atoi(q)); while (*q && *q != ',') ++q; if (*q) ++q; }
+        }
+        for (const auto & c : cfgs) {
+            if (!c.plain) {
+                n_bad_sj += run_exact(model, c, N, ecuts);
+            }
+        }
     }
     // the plain caches are controls only: their split (in)dependence is the backend's attention kernel (e.g. the CPU
     // f16 flash-attention path is not split-independent), outside SJ-KVaRN

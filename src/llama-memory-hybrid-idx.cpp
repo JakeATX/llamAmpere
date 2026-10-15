@@ -325,6 +325,7 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
         }
 
         get_mem_recr()->state_read(io, seq_id, flags);
+        state_read_sj_exact(io, seq_id, flags); // [#240] PARTIAL_ONLY only, so never together with the indexer section
 
         // [TAG_HYBRID_IDX_STATE] must mirror the write order in state_write
         if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {

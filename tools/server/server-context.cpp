@@ -4312,7 +4312,39 @@ private:
     // a prompt checkpoint restores the state at max(pos_min + 1, pos_max); it is usable only if seq_rm can reach it
     bool sj_kvarn_ckpt_reachable(llama_seq_id seq_id, const common_prompt_checkpoint & cur) const {
         const llama_pos p = std::max(cur.pos_min + 1, cur.pos_max);
+        // [#240] an exact checkpoint brings its own seal state and open rows: it needs the live cache to still hold
+        // the sealed records below its sealed end (seal ends only grow until a cut, and a cut erases the checkpoints
+        // above it, so this nearly always holds)
+        const int32_t b_tgt = llama_sj_kvarn_ckpt_sealed_end(cur.data_tgt.data(), cur.data_tgt.size(), nullptr);
+        if (b_tgt >= 0) {
+            if (llama_sj_kvarn_seq_sealed_end(ctx_tgt, seq_id) < b_tgt) {
+                return false;
+            }
+            if (!ctx_dft || !params_base.speculative.draft.sj_kvarn) {
+                return true;
+            }
+            const int32_t b_dft = llama_sj_kvarn_ckpt_sealed_end(cur.data_dft.data(), cur.data_dft.size(), nullptr);
+            if (b_dft >= 0) {
+                return llama_sj_kvarn_seq_sealed_end(ctx_dft, seq_id) >= b_dft;
+            }
+            // a drafter cache that is not in the checkpoint is cut back live
+            return llama_sj_kvarn_rm_floor(ctx_dft, seq_id, p) == p;
+        }
         return sj_kvarn_rm_floor(seq_id, p) == p;
+    }
+
+    // [#240] LLAMA_SJKVARN_EXACT_CKPT=1: SJ-KVaRN prompt checkpoints carry the seal state and the open staging rows
+    // (LLAMA_STATE_SEQ_FLAGS_SJ_EXACT) and go where the f16 cache puts them (4 and 4 + n_ubatch tokens before the
+    // end, the last user message), instead of on the seal grid. A repeated prompt then resumes 4 tokens before its end
+    // and computes bit-identically to the first run; a different follow-up prompt resumed there computes like an f16
+    // cache resumed at that spot (not bit-identical to a cold prefill of it). Off (default): the grid rules of #197.
+    bool sj_exact_ckpt() const {
+        static const bool on = [] { const char * e = getenv("LLAMA_SJKVARN_EXACT_CKPT"); return e && e[0] == '1'; }();
+        return on && (params_base.sj_kvarn_bits_k > 0 || params_base.speculative.draft.sj_kvarn);
+    }
+
+    llama_state_seq_flags ckpt_flags() const {
+        return LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | (sj_exact_ckpt() ? LLAMA_STATE_SEQ_FLAGS_SJ_EXACT : 0);
     }
 
     // SJ-KVaRN group boundary at or below n (n when SJ-KVaRN is off)
@@ -4430,10 +4462,12 @@ private:
         llama_synchronize(ctx_tgt); // (update_tgt syncs anyway) keep the previous batch's compute out of the copy time
         const int64_t t_ckpt_us = ggml_time_us();
         const bool had_spare = !slot.ckpt_spare.empty();
-        cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, &slot.ckpt_spare);
+        cur.update_tgt(ctx_tgt, slot.id, ckpt_flags(), &slot.ckpt_spare);
         const bool reused = had_spare && slot.ckpt_spare.empty();
         if (ckpt_needs_dft()) {
-            cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            // [#240] the exact section rides on a hybrid drafter's recurrent state; a plain-KV drafter checkpoint
+            // (LLAMA_CKPT_DFT_KV=1) keeps the whole cache as before
+            cur.update_dft(ctx_dft, slot.id, ctx_dft_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART ? ckpt_flags() : LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         }
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
@@ -6004,7 +6038,8 @@ private:
                     // SJ-KVaRN: prompt checkpoints go on group boundaries only, at the boundary below each usual
                     // spot (last user message, 4 + n_ubatch and 4 tokens before the end), so an edit that reaches
                     // sealed rows restores the recurrent state where seq_rm can cut the sealed body
-                    const bool sj_align = params_base.sj_kvarn_bits_k > 0 || params_base.speculative.draft.sj_kvarn;
+                    // [#240] exact checkpoints (LLAMA_SJKVARN_EXACT_CKPT=1) use the f16 spots instead
+                    const bool sj_align = (params_base.sj_kvarn_bits_k > 0 || params_base.speculative.draft.sj_kvarn) && !sj_exact_ckpt();
                     const int64_t n_task = slot.task->n_tokens();
                     const int64_t ckpt_call0 = slot.prompt.n_tokens();
                     const bool ckpt_mtp_ranges = common_speculative_supports_process_range(spec.get());

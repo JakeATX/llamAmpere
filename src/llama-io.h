@@ -34,5 +34,8 @@ public:
     // bytes read so far
     virtual size_t n_bytes() = 0;
 
+    // bytes left to read, when the reader knows (0 otherwise): an optional suffix section is read only when present
+    virtual size_t n_left() { return 0; }
+
     void read_string(std::string & str);
 };

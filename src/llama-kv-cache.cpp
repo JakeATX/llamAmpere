@@ -2274,6 +2274,7 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
             GGML_ASSERT((st.B_pending - sj_kvarn.sink)/sj_kvarn.group <= sj_kvarn_n_groups_seq);
 
             st.N = N;
+            st.exact_at = -1;
             if (N > sj_kvarn_cap) {
                 // position p's ring row now holds p + cap
                 st.ring_lo = std::max(st.ring_lo, N - sj_kvarn_cap);
@@ -3310,6 +3311,7 @@ void llama_kv_cache::sj_kvarn_reset_stream(uint32_t strm) {
     st.draining = false;
     st.N = 0;
     st.ring_lo = 0;
+    st.exact_at = -1;
 }
 
 ggml_tensor * llama_kv_cache::build_sj_kvarn_seal(ggml_context * ctx, ggml_tensor * k_store, ggml_tensor * v_store, ggml_tensor * desc, int32_t il) const {
@@ -3725,8 +3727,19 @@ bool llama_kv_cache::sj_kvarn_prefill_cut(llama_seq_id seq_id, llama_pos p0) {
     // same values. Seals that ran ahead of that point (later prompt ubatches, decode, idle seals) are reopened from
     // the ring rows (they re-seal from the same rows into the same records), and an unfinished decode flush is
     // dropped (a cold prefill has none in flight at a grid line).
-    if (!sj_kvarn.enabled() || sj_kvarn_grid == 0 || p0 <= 0 || p0 % (llama_pos) sj_kvarn_grid != 0 ||
-            seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
+    if (!sj_kvarn.enabled() || seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
+        return false;
+    }
+    {
+        // [#240] an exact checkpoint restored this stream at p0: it already is the state the prefill had there
+        auto & se = sj_kvarn_st[seq_to_stream[seq_id]];
+        const bool exact = se.exact_at == (int64_t) p0;
+        se.exact_at = -1;
+        if (exact) {
+            return false;
+        }
+    }
+    if (sj_kvarn_grid == 0 || p0 <= 0 || p0 % (llama_pos) sj_kvarn_grid != 0) {
         return false;
     }
     const uint32_t strm = seq_to_stream[seq_id];
@@ -4466,7 +4479,10 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
     }
 
     if (sj_kvarn.enabled()) {
-        GGML_UNUSED(flags);
+        if (flags & LLAMA_STATE_SEQ_FLAGS_SJ_EXACT) {
+            state_write_sj_ckpt(io, seq_id); // [#240] the exact checkpoint section alone
+            return;
+        }
         state_write_sj_kvarn(io, seq_id);
         return;
     }
@@ -4558,7 +4574,10 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
                 "llama_state_*: loading KV cache state is not supported while block KV "
                 "streaming is active (--kv-stream-arena-mib)");
         }
-        GGML_UNUSED(flags);
+        if (flags & LLAMA_STATE_SEQ_FLAGS_SJ_EXACT) {
+            state_read_sj_ckpt(io, seq_id); // [#240]
+            return;
+        }
         state_read_sj_kvarn(io, seq_id);
         return;
     }
@@ -5179,6 +5198,125 @@ uint32_t llama_kv_cache::state_read_sj_kvarn(llama_io_read_i & io, llama_seq_id 
     LLAMA_LOG_DEBUG("%s: restored %u cells, sealed end %u (%u groups), tail %u rows\n", __func__, n, B, n_rec, n - std::min(n, B));
 
     return n;
+}
+
+//
+// [#240] SJ-KVaRN exact checkpoint section. A prompt checkpoint of a hybrid model holds the recurrent state at n; the
+// attention cache stays live in the slot and is cut back to n. Without this section an SJ-KVaRN cut can only resume
+// where a cold prefill's sealed state is known (the restore grid, llama_sj_kvarn_prefill_cut()). With it, the
+// checkpoint also stores the seal state at n and the staging (ring) rows of [B, n), so a restore puts the attention
+// cache back exactly as it was at n: B and the drain flag as saved, the records of groups at or above B dropped (they
+// re-seal later from the same rows), the ring rows rewritten (they may have been overwritten by a long answer). The
+// records below B are taken from the live cache, which must still hold them (sealed end >= B; checked here and by
+// the server through llama_sj_kvarn_ckpt_sealed_end()).
+//   u32 magic "SJCK", u32 version 1, u32 n, B, B_prev, B_pending, draining, n_layers, per layer u64 k_row, v_row,
+//   per layer: K rows [max(B, sink), n), V rows [max(B, sink), n) (ring order),
+//   trailer: u32 B, u32 n, u32 magic "SJCE"
+//
+void llama_kv_cache::state_write_sj_ckpt(llama_io_write_i & io, llama_seq_id seq_id) const {
+    GGML_ASSERT(sj_kvarn.enabled());
+    if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
+        throw std::runtime_error("SJ-KVaRN exact checkpoint: needs one sequence");
+    }
+    const uint32_t strm = seq_to_stream[seq_id];
+    const auto & st = sj_kvarn_st[strm];
+    const auto & cells = v_cells[strm];
+    const uint32_t n = cells.used_max_p1();
+    const uint32_t S = sj_kvarn.sink;
+    if (st.B > S && st.B > n) {
+        throw std::runtime_error("SJ-KVaRN exact checkpoint: sealed end lies beyond the sequence");
+    }
+    const uint32_t lo = std::max(st.B, S);
+    if (n > lo && (n - lo > sj_kvarn_cap || lo < std::max(st.ring_lo, S))) {
+        throw std::runtime_error("SJ-KVaRN exact checkpoint: the ring no longer holds the open rows");
+    }
+    const uint32_t hdr[8] = { LLAMA_SJ_KVARN_CKPT_MAGIC, 1u, n, st.B, st.B_prev, st.B_pending, st.draining ? 1u : 0u, (uint32_t) layers.size() };
+    io.write(hdr, sizeof(hdr));
+    for (const auto & layer : layers) {
+        const uint64_t rows[2] = { (uint64_t) layer.k->nb[1], (uint64_t) layer.v->nb[1] };
+        io.write(rows, sizeof(rows));
+    }
+    for (const auto & layer : layers) {
+        for (int is_v = 0; is_v < 2; ++is_v) {
+            ggml_tensor * t = is_v ? layer.v : layer.k;
+            const size_t r = t->nb[1], o = (size_t) strm*t->nb[2];
+            for (uint32_t p = lo; p < n;) {
+                const uint32_t row = sj_kvarn_ring_row(p);
+                const uint32_t m   = std::min(n - p, S + sj_kvarn_cap - row);
+                io.write_tensor(t, o + (size_t) row*r, (size_t) m*r);
+                p += m;
+            }
+        }
+    }
+    const uint32_t trl[3] = { st.B, n, LLAMA_SJ_KVARN_CKPT_END_MAGIC };
+    io.write(trl, sizeof(trl));
+}
+
+void llama_kv_cache::state_read_sj_ckpt(llama_io_read_i & io, llama_seq_id seq_id) {
+    GGML_ASSERT(sj_kvarn.enabled());
+    if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
+        throw std::runtime_error("SJ-KVaRN exact checkpoint: needs one sequence");
+    }
+    const uint32_t strm = seq_to_stream[seq_id];
+    auto & st = sj_kvarn_st[strm];
+    uint32_t hdr[8];
+    io.read(hdr, sizeof(hdr));
+    const uint32_t n = hdr[2], B = hdr[3], B_prev = hdr[4], B_pending = hdr[5], n_layers = hdr[7];
+    const uint32_t S = sj_kvarn.sink, G = sj_kvarn.group;
+    if (hdr[0] != LLAMA_SJ_KVARN_CKPT_MAGIC || hdr[1] != 1u) {
+        throw std::runtime_error("SJ-KVaRN exact checkpoint: unknown section format");
+    }
+    if (n_layers != layers.size()) {
+        throw std::runtime_error("SJ-KVaRN exact checkpoint: saved from a cache with a different layer count");
+    }
+    for (const auto & layer : layers) {
+        uint64_t rows[2];
+        io.read(rows, sizeof(rows));
+        if (rows[0] != (uint64_t) layer.k->nb[1] || rows[1] != (uint64_t) layer.v->nb[1]) {
+            throw std::runtime_error("SJ-KVaRN exact checkpoint: saved from a cache with a different row layout");
+        }
+    }
+    const uint32_t lo = std::max(B, S);
+    if (B < S || (B - S) % G != 0 || (B > S && B > n) || B_prev > B || B_pending < B || B_pending > n ||
+            (n > lo && n - lo > sj_kvarn_cap)) {
+        throw std::runtime_error("SJ-KVaRN exact checkpoint: corrupt section (sealed end " + std::to_string(B) + ", n " + std::to_string(n) + ")");
+    }
+    // the live cache supplies the records below B and the cells of [0, n)
+    if (st.B_pending != st.B || st.B < B || v_cells[strm].used_max_p1() < n) {
+        throw std::runtime_error("SJ-KVaRN exact checkpoint: the live cache no longer holds the sealed records below " +
+                std::to_string(B) + " (sealed end " + std::to_string(st.B) + ", " + std::to_string(v_cells[strm].used_max_p1()) + " cells)");
+    }
+    for (const auto & layer : layers) {
+        for (int is_v = 0; is_v < 2; ++is_v) {
+            ggml_tensor * t = is_v ? layer.v : layer.k;
+            const size_t r = t->nb[1], o = (size_t) strm*t->nb[2];
+            for (uint32_t p = lo; p < n;) {
+                const uint32_t row = sj_kvarn_ring_row(p);
+                const uint32_t m   = std::min(n - p, S + sj_kvarn_cap - row);
+                io.read_tensor(t, o + (size_t) row*r, (size_t) m*r);
+                p += m;
+            }
+        }
+    }
+    uint32_t trl[3];
+    io.read(trl, sizeof(trl));
+    if (trl[0] != B || trl[1] != n || trl[2] != LLAMA_SJ_KVARN_CKPT_END_MAGIC) {
+        io.discard();
+        throw std::runtime_error("SJ-KVaRN exact checkpoint: corrupt section trailer");
+    }
+    if (sj_kvarn_paged) {
+        sj_kvarn_release_groups(strm, (B - S)/G); // groups at or above B re-seal later from the restored rows
+    }
+    // ring rows still valid: [B, n) were just rewritten; below B the live rows of [ring_lo, B) survive unless one of
+    // the rewritten rows held them (positions below n - cap)
+    st.ring_lo  = std::min(lo, std::max(st.ring_lo, n > sj_kvarn_cap ? n - sj_kvarn_cap : 0u));
+    st.B        = B;
+    st.B_prev   = B_prev;
+    st.B_pending = B_pending;
+    st.draining = hdr[6] != 0;
+    st.N        = n;
+    st.exact_at = n;
+    LLAMA_LOG_DEBUG("%s: stream %u restored at %u: sealed end %u, %u open rows\n", __func__, strm, n, B, n - std::min(n, lo));
 }
 
 void llama_kv_cache::state_write_meta(llama_io_write_i & io, const cell_ranges_t & cr, llama_seq_id seq_id) const {

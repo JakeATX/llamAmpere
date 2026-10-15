@@ -44,6 +44,10 @@ ggml_type llama_kv_cache_turbo_layer_adaptive_type_v(
 // llama_kv_cache
 //
 
+// [#240] SJ-KVaRN exact checkpoint section (llama_kv_cache::state_write_sj_ckpt): header magic, trailer magic
+static constexpr uint32_t LLAMA_SJ_KVARN_CKPT_MAGIC     = 0x4b434a53u; // "SJCK"
+static constexpr uint32_t LLAMA_SJ_KVARN_CKPT_END_MAGIC = 0x45434a53u; // "SJCE"
+
 class llama_kv_cache : public llama_memory_i {
 public:
     struct stream_copy_info {
@@ -441,6 +445,8 @@ private:
         // positions [ring_lo, N) still hold their ring rows (lower ones were overwritten by p + cap or never
         // restored); a body truncation may reopen sealed groups there
         uint32_t ring_lo   = 0;
+        // [#240] an exact checkpoint restored the stream at this position: the next prefill_cut there keeps it as is
+        int64_t  exact_at  = -1;
         // paged pool only: logical group g of this stream lives in pool record table[g] (-1: not allocated).
         // Groups [0, (B - sink)/group) are allocated, the rest are not.
         std::vector<int32_t> table;
@@ -653,6 +659,11 @@ private:
     // SJ-KVaRN sequence state (format: see the comment above state_write_sj_kvarn in llama-kv-cache.cpp)
     void state_write_sj_kvarn(llama_io_write_i & io, llama_seq_id seq_id) const;
     uint32_t state_read_sj_kvarn (llama_io_read_i  & io, llama_seq_id seq_id); // returns the cells restored
+public:
+    // [#240] exact checkpoint section (LLAMA_STATE_SEQ_FLAGS_SJ_EXACT): seal state + open ring rows of one sequence
+    void state_write_sj_ckpt(llama_io_write_i & io, llama_seq_id seq_id) const;
+    void state_read_sj_ckpt (llama_io_read_i  & io, llama_seq_id seq_id);
+private:
 };
 
 class llama_kv_cache_context : public llama_memory_context_i {
