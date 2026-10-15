@@ -1207,8 +1207,11 @@ extern "C" {
 
     // Describes the role of subsequent llama_decode() batches for
     // phase-specialized memory allocators. It does not change model math.
+    // LLAMA_DECODE_PHASE_UNKNOWN is 0, the same value as AUTOMATIC. The one-shot
+    // tag llama_set_next_decode_phase() (llama-ext.h) uses UNKNOWN for "no tag".
     enum llama_decode_phase {
         LLAMA_DECODE_PHASE_AUTOMATIC  = 0,
+        LLAMA_DECODE_PHASE_UNKNOWN    = LLAMA_DECODE_PHASE_AUTOMATIC,
         LLAMA_DECODE_PHASE_PROMPT     = 1,
         LLAMA_DECODE_PHASE_GENERATION = 2,
     };

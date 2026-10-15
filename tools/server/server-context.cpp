@@ -14,6 +14,7 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "src/llama-ext.h"
 #include "log.h"
 #include "ngram-cache.h"
 #include "sampling.h"
@@ -6490,6 +6491,23 @@ private:
             for (auto & slot : slots) { slot.spec_clock.mark(server_bookkeep_clock::BATCH); }
             const int64_t t_decode_start = ggml_time_us();
             queue_tasks.yield_to_queue([&]() {
+                // #217 trunk keep is lossy, so it may run only when every row is a sampled
+                // token or a speculative verify row. Any prompt row (a one-token tail, cache
+                // catch-up, checkpoint re-prefill, or a slot still prefilling beside another
+                // slot's sample) keeps this call exact. The tag is cleared when decode returns.
+                enum llama_decode_phase batch_phase = LLAMA_DECODE_PHASE_GENERATION;
+                const int32_t n_view = batch.view.size();
+                if (n_view <= 0) {
+                    batch_phase = LLAMA_DECODE_PHASE_UNKNOWN;
+                } else {
+                    for (int32_t i = off; i < off + n_view; ++i) {
+                        if (batch.tokens[i].is_prompt) {
+                            batch_phase = LLAMA_DECODE_PHASE_PROMPT;
+                            break;
+                        }
+                    }
+                }
+                llama_set_next_decode_phase(ctx_tgt, batch_phase);
                 ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
                 if (ret == 0 && has_output) {
                     llama_synchronize(ctx_tgt);

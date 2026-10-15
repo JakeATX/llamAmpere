@@ -1110,6 +1110,7 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
     return all_ok ? 0 : 1;
 }
 
+#ifndef LLAMA_ARCH_FIXTURE_ONLY
 int main(int argc, char ** argv) {
     // init the logger at max verbosity. filter with a custom callback respecting the user-configure verbosity
     common_log_set_verbosity_thold(LOG_LEVEL_DEBUG);
@@ -1212,3 +1213,4 @@ int main(int argc, char ** argv) {
         return -1;
     }
 }
+#endif

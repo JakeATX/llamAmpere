@@ -387,6 +387,21 @@ static void llama_sched_apply_moe_keep(ggml_backend_sched_t sched, const llama_c
             (int32_t) cparams.moe_keep_layer.size());
 }
 
+void llama_context::sync_moe_keep() {
+    if (!sched) {
+        return;
+    }
+    // MTP draft keep is lossless and ignores the tag. A trunk map is lossy, so it is
+    // installed only for a GENERATION call. Reserve and encode run with the tag clear.
+    const bool trunk = cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP &&
+            (cparams.moe_keep_default >= 0 || !cparams.moe_keep_layer.empty());
+    if (trunk && decode_call_phase != LLAMA_DECODE_PHASE_GENERATION) {
+        ggml_backend_sched_set_moe_expert_keep(sched.get(), -1, nullptr, 0);
+        return;
+    }
+    llama_sched_apply_moe_keep(sched.get(), cparams);
+}
+
 llama_context::llama_context(const llama_model & model, llama_context_params params) :
     model(model),
     cvec(std::make_unique<llama_adapter_cvec>()),
@@ -1860,7 +1875,7 @@ bool llama_context::kv_stream_switch_phase(bool decode, uint32_t active_tokens) 
         LLAMA_LOG_ERROR("%s: failed to recreate scheduler\n", __func__);
         return false;
     }
-    llama_sched_apply_moe_keep(sched.get(), cparams);
+    sync_moe_keep();
 
     auto reserve_mctx = memory->init_full();
     if (!reserve_mctx) {
@@ -2054,7 +2069,7 @@ void llama_context::sched_reserve() {
         ggml_backend_sched_set_moe_cache(sched.get(), moe_cache_mode, cparams.moe_cache_budget_mib);
         ggml_backend_sched_moe_cache_prefetch_configure(sched.get(), cparams.moe_prefetch);
     }
-    llama_sched_apply_moe_keep(sched.get(), cparams);
+    sync_moe_keep();
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
     if (mtp_prefill_async || mtp_scratch_enabled) {
         ggml_backend_sched_set_input_copy_callback(sched.get(), sched_copy_mtp_inputs, this);
@@ -2300,7 +2315,7 @@ void llama_context::sched_reserve() {
                 }
                 ggml_backend_sched_set_moe_cache(sched.get(), moe_cache_mode, cparams.moe_cache_budget_mib);
                 ggml_backend_sched_moe_cache_prefetch_configure(sched.get(), cparams.moe_prefetch);
-                llama_sched_apply_moe_keep(sched.get(), cparams);
+                sync_moe_keep();
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
@@ -3181,6 +3196,14 @@ void llama_context::set_decode_phase(enum llama_decode_phase phase) {
             return;
     }
     decode_phase = LLAMA_DECODE_PHASE_AUTOMATIC;
+}
+
+void llama_context::set_next_decode_phase(enum llama_decode_phase phase) {
+    if (phase == LLAMA_DECODE_PHASE_PROMPT || phase == LLAMA_DECODE_PHASE_GENERATION) {
+        next_decode_phase = phase;
+        return;
+    }
+    next_decode_phase = LLAMA_DECODE_PHASE_UNKNOWN;
 }
 
 void llama_context::set_abort_callback(bool (*abort_callback)(void * data), void * abort_callback_data) {
@@ -4879,6 +4902,16 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {
+    // one-shot tag: read on entry, clear on every return, including the encode fallback and errors
+    const enum llama_decode_phase tagged =
+            (next_decode_phase == LLAMA_DECODE_PHASE_PROMPT || next_decode_phase == LLAMA_DECODE_PHASE_GENERATION)
+                    ? next_decode_phase
+                    : LLAMA_DECODE_PHASE_UNKNOWN;
+    struct decode_phase_reset {
+        llama_context * ctx;
+        ~decode_phase_reset() { ctx->next_decode_phase = LLAMA_DECODE_PHASE_UNKNOWN; }
+    } phase_reset{this};
+
     vf_scope vf_scope_(vf_stats_for(this, (uint32_t) batch_inp.tokens.size()));
     if (!mtp_feedback.active) {
         mtp_feedback.valid = false;
@@ -4887,6 +4920,17 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
     }
+
+    decode_call_phase = tagged;
+    struct moe_keep_reset {
+        llama_context * ctx;
+        ~moe_keep_reset() {
+            ctx->decode_call_phase = LLAMA_DECODE_PHASE_UNKNOWN;
+            // drop a trunk map so a later encode, or the next untagged call, cannot see it
+            ctx->sync_moe_keep();
+        }
+    } keep_reset{this};
+    sync_moe_keep();
 
     // in-call checkpoints: a request is for this call only; an older one's copies are dropped here
     if (!ckpt_armed) {
@@ -5150,6 +5194,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         b1_seq = *batch_inp.tokens[0].seq_ids.begin();
         b1_pos0 = balloc->seq_pos_min(b1_seq);
         b1_final_l0 = b1->final_l0();
+        // B1 is a prompt path. Its ubatches can be narrower than the 64-row keep guard,
+        // so the tag is forced before any of those ubatches are computed.
+        decode_call_phase = LLAMA_DECODE_PHASE_PROMPT;
+        sync_moe_keep();
     }
     // on a failure every ubatch of the call is incomplete: drop the whole batch from the memory
     auto b1_fail = [&](ggml_status st) -> int {
@@ -9219,6 +9267,10 @@ void llama_set_n_threads(llama_context * ctx, int32_t n_threads, int32_t n_threa
 
 void llama_set_decode_phase(llama_context * ctx, enum llama_decode_phase phase) {
     ctx->set_decode_phase(phase);
+}
+
+void llama_set_next_decode_phase(llama_context * ctx, enum llama_decode_phase phase) {
+    ctx->set_next_decode_phase(phase);
 }
 
 int32_t llama_n_threads(llama_context * ctx) {

@@ -486,6 +486,7 @@ llama_build(test-moe-prefetch-model.cpp)
 
 llama_build_and_test(test-moe-cache-fit.cpp)
 llama_build_and_test(test-moe-expert-keep.cpp) # [#215/#217] CPU-only expert keep policy
+llama_build_and_test(test-decode-phase.cpp)     # one-shot decode tag gates the #217 trunk keep map
 llama_build_and_test(test-fit-extra.cpp)
 
 llama_build_and_test(test-tiled-mulmat.cpp)

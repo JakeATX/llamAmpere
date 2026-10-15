@@ -150,6 +150,7 @@ struct llama_context {
 
     void set_n_threads(int32_t n_threads, int32_t n_threads_batch);
     void set_decode_phase(enum llama_decode_phase phase);
+    void set_next_decode_phase(enum llama_decode_phase phase);
 
     void set_abort_callback(bool (*abort_callback)(void * data), void * abort_callback_data);
 
@@ -736,8 +737,20 @@ private:
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
 
+    // sticky KV-stream phase (llama_set_decode_phase). Does not change model math.
     enum llama_decode_phase decode_phase =
         LLAMA_DECODE_PHASE_AUTOMATIC;
+
+    // one-shot tag for the next decode, and the tag of the decode in progress
+    enum llama_decode_phase next_decode_phase = LLAMA_DECODE_PHASE_UNKNOWN;
+    enum llama_decode_phase decode_call_phase = LLAMA_DECODE_PHASE_UNKNOWN;
+
+    // #217 trunk map is lossy: install it only while decode_call_phase is GENERATION.
+    // Prompt, untagged, and encode calls clear it. #215 draft keep (MTP) stays installed.
+    // compute_splits copies the scheduler policy into thread-local storage on every
+    // compute, and the CPU MUL_MAT_ID mask is rebuilt from that. The policy is not part
+    // of the ggml graph or the CUDA graph key, so a reused graph cannot carry an old tag.
+    void sync_moe_keep();
 
     // perf
     mutable int64_t t_start_us  = 0;

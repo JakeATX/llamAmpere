@@ -1,4 +1,7 @@
 // Expert keep policy (#215 MTP draft, #217 lossy trunk map), CPU-only checks.
+// llama_decode applies the #217 map only when the call is tagged GENERATION
+// (tests/test-decode-phase.cpp). This file sets the scheduler policy directly.
+// A node wider than 64 routed rows still skips the mask, on top of that tag.
 //
 // With no MoE cache provider nothing is resident, so keep(L) = k leaves out every routed row at route rank >= k.
 // Checked here:

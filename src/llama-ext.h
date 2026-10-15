@@ -290,6 +290,13 @@ struct llama_sampler_child_perf {
     uint64_t calls;
 };
 LLAMA_API std::vector<llama_sampler_child_perf> llama_perf_sampler_children(const struct llama_sampler * sampler);
+// One-shot tag for the next llama_decode() on ctx. The call reads it on entry and
+// resets it to LLAMA_DECODE_PHASE_UNKNOWN when it returns, including on error.
+// UNKNOWN (0, same value as LLAMA_DECODE_PHASE_AUTOMATIC) means no tag. Encoder
+// entry points ignore it. This does not change llama_set_decode_phase().
+// The #217 trunk keep map is applied only when the tag is GENERATION.
+LLAMA_API void llama_set_next_decode_phase(struct llama_context * ctx, enum llama_decode_phase phase);
+
 // Expert keep map parser (#217, --moe-keep-map): "N" (every layer) or a comma list of "L:N", "A-B:N", "*:N".
 // keep_layer is empty when no explicit layer is listed; otherwise it has n_layer entries (-1 = keep every expert).
 // Returns false and sets error on bad input.
