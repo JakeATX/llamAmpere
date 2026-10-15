@@ -288,6 +288,47 @@ llama_kv_cache::llama_kv_cache(
         // cell behind and a decode/verify ubatch (kept whole) may cross a grid line: one more group of rows
         sj_kvarn_cap           = GGML_PAD(std::max(sj_kvarn.tail, sj_kvarn.tail_max) + sj_kvarn.group + 2*sj_kvarn.n_ubatch +
                                           (sj_kvarn_split_grid ? sj_kvarn.group : 0), 128); // see apply_ubatch
+        // [NOSEAL] LLAMA_SJKVARN_NOSEAL: "all", a comma list of model layers / ranges (e.g. "3,7,11-23"), or "none"
+        // (no layer: only the whole-context ring, the control for the ring size)
+        if (const char * e = getenv("LLAMA_SJKVARN_NOSEAL"); e && *e) {
+            const std::string spec = e;
+            const uint32_t n_layer_model = hparams.n_layer();
+            std::vector<bool> on(n_layer_model, false);
+            if (spec == "all") {
+                std::fill(on.begin(), on.end(), true);
+            } else if (spec != "none") {
+                size_t i = 0;
+                while (i < spec.size()) {
+                    size_t j = spec.find(',', i);
+                    if (j == std::string::npos) {
+                        j = spec.size();
+                    }
+                    const std::string tok = spec.substr(i, j - i);
+                    const size_t dash = tok.find('-');
+                    const int a = atoi(tok.substr(0, dash).c_str());
+                    const int b = dash == std::string::npos ? a : atoi(tok.substr(dash + 1).c_str());
+                    if (tok.empty() || a < 0 || b < a) {
+                        throw std::runtime_error("LLAMA_SJKVARN_NOSEAL: bad layer list '" + spec + "'");
+                    }
+                    // layers past this model's trunk are ignored (a draft model's own cache has fewer layers)
+                    for (int l = a; l <= b && (uint32_t) l < n_layer_model; ++l) {
+                        on[l] = true;
+                    }
+                    i = j + 1;
+                }
+            }
+            for (uint32_t l = 0; l < n_layer_model; ++l) {
+                if (on[l]) {
+                    sj_kvarn_noseal_il.push_back((int32_t) l);
+                }
+            }
+            if (sj_kvarn.edge_layers > 0) {
+                throw std::runtime_error("LLAMA_SJKVARN_NOSEAL cannot be combined with --sjkvarn-edge-layers");
+            }
+            sj_kvarn_noseal = true;
+            // every position stays in its own ring row: [sink, kv_size) never wraps
+            sj_kvarn_cap = GGML_PAD(std::max(sj_kvarn_cap, kv_size), 128);
+        }
         // Records the pool can ever hold: every seal target is sink + group*floor((end - tail - sink)/group) with
         // end <= kv_size (apply_ubatch: end = pos0 < kv_size; compress_sj_kvarn_idle: end = accepted_end <= kv_size),
         // so the newest `tail` positions never reach the body. Sizing for kv_size - sink kept `tail` positions'
@@ -320,6 +361,17 @@ llama_kv_cache::llama_kv_cache(
         }
         LLAMA_LOG_INFO("%s: %s cache: K%u/V%u records, sink %u (%s), tail %u, group %u, ring %u rows (%s), pool %u groups/head\n",
                 __func__, sj_kvarn.body_type == GGML_TYPE_TURBO4_0 ? "Tiered TQ" : sj_kvarn.body_type == GGML_TYPE_I16 ? "SJ-KVaRN (trellis body)" : "SJ-KVaRN", sj_kvarn.bits_k, sj_kvarn.bits_v, sj_kvarn.sink, ggml_type_name(sj_kvarn.sink_type == GGML_TYPE_COUNT ? type_k : sj_kvarn.sink_type), sj_kvarn.tail, sj_kvarn.group, sj_kvarn_cap, ggml_type_name(type_k), sj_kvarn_n_groups);
+        if (sj_kvarn_noseal) {
+            std::string l;
+            for (int32_t il : sj_kvarn_noseal_il) {
+                l += (l.empty() ? "" : ",") + std::to_string(il);
+            }
+            if (l.empty()) {
+                l = "(none)";
+            }
+            LLAMA_LOG_WARN("%s: [NOSEAL] SJ-KVaRN never-seal model layers %s (those that hold KV keep every position in the ring; "
+                    "ring %u rows for all layers)\n", __func__, l.c_str(), sj_kvarn_cap);
+        }
         if (sj_kvarn.edge_layers > 0) {
             LLAMA_LOG_INFO("%s: SJ-KVaRN tiered body: KV layers within the first %u and last %u model layers seal at K%u/V%u (%s), interior at K%u/V%u (%s)\n",
                     __func__, sj_kvarn.edge_layers, sj_kvarn.edge_layers, sj_kvarn.edge_bits_k, sj_kvarn.edge_bits_v, sj_kvarn.edge_body_type == GGML_TYPE_I16 ? "trellis" : "scalar",
@@ -850,7 +902,10 @@ llama_kv_cache::llama_kv_cache(
             GGML_ASSERT(hparams.n_embd_head_v(il) == D && n_embd_k_gqa_eff == n_embd_k_gqa && n_embd_v_gqa_eff == n_embd_v_gqa);
             // tier: a KV-bearing layer inside the first or last edge_layers model layers is the edge tier
             const bool edge = sj_kvarn.edge_layers > 0 && (il < sj_kvarn.edge_layers || il + sj_kvarn.edge_layers >= sj_kvarn_n_layers_model);
-            layer_new.sj_kvarn_tier      = edge ? 1 : 0;
+            // [NOSEAL] a never-seal layer is tier 1 with the interior codec (its records are never written or read)
+            const bool noseal = sj_kvarn_noseal &&
+                std::find(sj_kvarn_noseal_il.begin(), sj_kvarn_noseal_il.end(), (int32_t) il) != sj_kvarn_noseal_il.end();
+            layer_new.sj_kvarn_tier      = edge || noseal ? 1 : 0;
             layer_new.sj_kvarn_bits_k    = edge ? sj_kvarn.edge_bits_k : sj_kvarn.bits_k;
             layer_new.sj_kvarn_bits_v    = edge ? sj_kvarn.edge_bits_v : sj_kvarn.bits_v;
             layer_new.sj_kvarn_body_type = edge ? sj_kvarn.edge_body_type : sj_kvarn.body_type;
@@ -860,7 +915,7 @@ llama_kv_cache::llama_kv_cache(
                 sj_kvarn_rec_bytes[layer_new.sj_kvarn_tier] = rb;
             }
             GGML_ASSERT(rb == sj_kvarn_rec_bytes[layer_new.sj_kvarn_tier] && "SJ-KVaRN cache: head size must be constant across layers");
-            if (edge) {
+            if (edge || noseal) {
                 sj_kvarn_n_layers_edge++;
             }
             // the CUDA kernels of the low-bit pairs (every pair but 4/4) serve GQA ratios 5..8 only; at other ratios that
@@ -3225,6 +3280,12 @@ void llama_kv_cache::set_input_sj_kvarn_desc(ggml_tensor * dst, const llama_ubat
         d[GGML_SJKVARN_DESC_TYPE_K]   = (int32_t) layers[0].k->type;
         d[GGML_SJKVARN_DESC_TYPE_V]   = (int32_t) layers[0].v->type;
         d[GGML_SJKVARN_DESC_SINK_TYPE] = sj_kvarn.sink_type == GGML_TYPE_F16 ? GGML_TYPE_F16 : 0;
+        if (tier == 1 && sj_kvarn_noseal) {
+            // [NOSEAL] nothing of this layer is sealed: positions [sink, N) are all ring rows (the ring never wraps)
+            d[GGML_SJKVARN_DESC_B]     = (int32_t) sj_kvarn.sink;
+            d[GGML_SJKVARN_DESC_B_OLD] = (int32_t) sj_kvarn.sink;
+            d[GGML_SJKVARN_DESC_BODY_TYPE] = sj_kvarn.body_type;
+        }
         if (n_stream > 1) {
             d[GGML_SJKVARN_DESC_TABLE] = 1;
             // every sealed group must map to a live pool record: the kernels index the body with it unchecked
@@ -3431,9 +3492,12 @@ bool llama_kv_cache::maintain_sj_kvarn_stream(llama_context * lctx, uint32_t str
         for (auto & job : graphs) {
             for (int tier = 0; tier < 2; ++tier) {
                 d[GGML_SJKVARN_DESC_RECBYTES] = sj_kvarn_rec_bytes[tier];
-                d[GGML_SJKVARN_DESC_BODY_TYPE] = tier == 1 ? sj_kvarn.edge_body_type : sj_kvarn.body_type;
+                d[GGML_SJKVARN_DESC_BODY_TYPE] = tier == 1 && !sj_kvarn_noseal ? sj_kvarn.edge_body_type : sj_kvarn.body_type;
+                // [NOSEAL] an empty seal range for the never-seal layers
+                d[GGML_SJKVARN_DESC_B_OLD] = tier == 1 && sj_kvarn_noseal ? end : old;
                 ggml_backend_tensor_set(job.desc[tier], d.data(), 0, d.size()*sizeof(int32_t));
             }
+            d[GGML_SJKVARN_DESC_B_OLD] = old;
             success = ggml_backend_graph_compute(job.backend, job.graph) == GGML_STATUS_SUCCESS && success;
         }
         if (!success) {
@@ -4824,6 +4888,10 @@ void llama_kv_cache::state_write_sj_kvarn(llama_io_write_i & io, llama_seq_id se
     GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()));
     if (seq_id == -1 && n_stream > 1) {
         throw std::runtime_error("SJ-KVaRN cache: with several sequences (--parallel > 1) the state is saved per sequence");
+    }
+    if (sj_kvarn_noseal) {
+        // the never-seal layers keep [sink, sealed end) in ring rows that the saved state does not carry
+        throw std::runtime_error("SJ-KVaRN cache: cannot save state with LLAMA_SJKVARN_NOSEAL (an investigation switch)");
     }
 
     // one sequence per stream: its stream holds exactly that sequence

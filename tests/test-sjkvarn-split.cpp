@@ -293,6 +293,44 @@ static int run_exact(llama_model * model, const sj_cfg & c, llama_pos N, const s
     return n_diff;
 }
 
+// [NOSEAL] #239 investigation switch LLAMA_SJKVARN_NOSEAL (read when a cache is built). Prefill N, then 200 decode steps
+// (seals run during both), compare the last logits bit for bit:
+//   "none" (whole-context ring, every layer still seals) == the production cache (the ring size alone changes nothing)
+//   "all" == a tail long enough that nothing seals (every position read from tq6_0 staging rows either way)
+//   "0-3" (every layer of this model, as a range) == "all"
+//   "1" (one layer) differs from both production and "all" (only that layer stops sealing)
+// Returns the number of failed checks.
+static int run_noseal(llama_model * model, const sj_cfg & base, llama_pos N) {
+    auto run = [&](const sj_cfg & c, const char * spec) {
+        if (spec) { setenv("LLAMA_SJKVARN_NOSEAL", spec, 1); } else { unsetenv("LLAMA_SJKVARN_NOSEAL"); }
+        llama_context * ctx = make_ctx(model, c);
+        unsetenv("LLAMA_SJKVARN_NOSEAL");
+        require(ctx != nullptr, "context");
+        decode(ctx, 0, N, (int) g_ub);
+        std::vector<float> l = decode(ctx, N, N + 200, 1, 3);
+        llama_free(ctx);
+        return l;
+    };
+    sj_cfg fixed = base; fixed.tail = 256; fixed.tail_max = 0;
+    sj_cfg open  = base; open.tail = 2560; open.tail_max = 0; // N + 200 < sink + tail: nothing seals
+    const auto prod = run(fixed, nullptr), none = run(fixed, "none"), all = run(fixed, "all"), rng = run(fixed, "0-3"),
+               one = run(fixed, "1"), unsealed = run(open, nullptr);
+    auto same = [](const std::vector<float> & a, const std::vector<float> & b) {
+        return a.size() == b.size() && memcmp(a.data(), b.data(), a.size()*sizeof(float)) == 0;
+    };
+    int bad = 0;
+    auto check = [&](const char * what, bool ok, float d) {
+        printf("%-22s noseal %-34s %s (max|d| = %.3g)\n", base.name, what, ok ? "ok" : "FAILED", d);
+        bad += !ok;
+    };
+    check("none == production", same(none, prod), max_diff(none, prod));
+    check("all == nothing sealed", same(all, unsealed), max_diff(all, unsealed));
+    check("0-3 == all", same(rng, all), max_diff(rng, all));
+    check("1 differs from production", !same(one, prod), max_diff(one, prod));
+    check("1 differs from all", !same(one, all), max_diff(one, all));
+    return bad;
+}
+
 int main(int argc, char ** argv) {
     (void) argc; (void) argv;
     if (getenv("SJ_TEST_UB")) { g_ub = (uint32_t) atoi(getenv("SJ_TEST_UB")); }
@@ -338,13 +376,13 @@ int main(int argc, char ** argv) {
     }
     int n_bad_plain = 0, n_bad_sj = 0;
     for (const auto & c : cfgs) {
-        if (getenv("SJ_TEST_EXACT_ONLY")) { break; } // [#240] only the exact-checkpoint cases
+        if (getenv("SJ_TEST_EXACT_ONLY") || getenv("SJ_TEST_NOSEAL_ONLY")) { break; } // [#240] exact-checkpoint cases only; [NOSEAL] never-seal checks only
         const int d = run_cfg(model, c, N, cuts);
         (c.plain ? n_bad_plain : n_bad_sj) += d;
     }
     // [#240] exact checkpoints at the f16 spots (4 and 4 + n_ubatch before the end, both off the grid); more cuts
     // (e.g. 1000,1024 for a grid line) with SJ_TEST_EXACT_CUTS
-    {
+    if (!getenv("SJ_TEST_NOSEAL_ONLY")) {
         std::vector<llama_pos> ecuts = { N - 4, N - 4 - (llama_pos) g_ub };
         if (getenv("SJ_TEST_EXACT_CUTS")) {
             ecuts.clear();
@@ -355,6 +393,14 @@ int main(int argc, char ** argv) {
                 n_bad_sj += run_exact(model, c, N, ecuts);
             }
         }
+    }
+    // [NOSEAL] the #239 investigation switch, per body codec
+    for (const auto & base : { s44, s33t, s32t }) {
+        if (getenv("SJ_TEST_EXACT_ONLY")) { break; } // [#240] exact-checkpoint cases only
+        if (getenv("SJ_TEST_FILTER") && !strstr(base.name, getenv("SJ_TEST_FILTER"))) {
+            continue;
+        }
+        n_bad_sj += run_noseal(model, base, N);
     }
     // the plain caches are controls only: their split (in)dependence is the backend's attention kernel (e.g. the CPU
     // f16 flash-attention path is not split-independent), outside SJ-KVaRN

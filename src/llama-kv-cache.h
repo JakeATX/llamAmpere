@@ -435,6 +435,11 @@ private:
     uint64_t sj_wush_hash = 0;                 // FNV-1a 64 of the transform file (0 = off)
     size_t   sj_kvarn_rec_bytes[2]  = {0, 0}; // per tier (0 interior, 1 edge)
     uint32_t sj_kvarn_n_layers_edge = 0;      // cache layers on tier 1 (first + last edge_layers)
+    // [NOSEAL] investigation switch LLAMA_SJKVARN_NOSEAL=<model layers>: those layers never seal (tier 1 with the
+    // interior codec; their descriptor keeps the sealed end at the sink, so every position past the sink is read from the
+    // ring), and the ring is sized to the whole context so no ring row is ever overwritten. Off (unset) by default.
+    std::vector<int32_t> sj_kvarn_noseal_il;
+    bool sj_kvarn_noseal = false;              // the switch is set (ring sized to the context), possibly with no layer
     // per-stream bookkeeping (one stream per sequence; a single-sequence cache has exactly one)
     struct sj_kvarn_stream {
         uint32_t B         = 0;     // sealed end
