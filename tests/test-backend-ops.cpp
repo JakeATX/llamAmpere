@@ -11611,6 +11611,139 @@ struct test_lightning_indexer_range : public test_lightning_indexer {
     }
 };
 
+// Constant Q/K/W and a chosen mask. The f32 range cases above never build an f16 or bf16 K, a fully
+// masked row, an all-open mask (so the NMSE is a real number), a batch below the tile, or 32 heads.
+// mask_mode: 0 partial f16 ((i+r+s)%3 == 0 is -inf), 1 all -inf, 2 all open, 3 I32 range [0, kv/2).
+struct test_lightning_indexer_maskw : public test_lightning_indexer {
+    const float q_value;
+    const float k_value;
+    const float w_value;
+    const int mask_mode;
+
+    test_lightning_indexer_maskw(ggml_type type_K, int64_t nh, int64_t kv, int64_t nb, int64_t ns, int64_t nm,
+            float q_value, float k_value, float w_value, int mask_mode)
+        : test_lightning_indexer(128, nh, kv, nb, ns, nm, type_K),
+          q_value(q_value), k_value(k_value), w_value(w_value), mask_mode(mask_mode) {}
+
+    std::string vars() override {
+        return test_lightning_indexer::vars() + "," + VARS_TO_STR4(q_value, k_value, w_value, mask_mode);
+    }
+
+    // Same as the range-mask cases: -inf against -inf must not poison the NMSE of the finite scores.
+    double err(const float * a, const float * b, size_t n) override {
+        double mse_a_b = 0.0;
+        double mse_a_0 = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            if (!std::isfinite(a[i]) || !std::isfinite(b[i])) {
+                continue;
+            }
+            mse_a_b += ((double) a[i] - b[i])*((double) a[i] - b[i]);
+            mse_a_0 += (double) a[i]*a[i];
+        }
+        return mse_a_0 > 0.0 ? mse_a_b/mse_a_0 : mse_a_b;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsk, nh, nb, ns);
+        ggml_set_param(q);
+        ggml_set_name(q, "q");
+
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, type_K, hsk, 1, kv, ns);
+        ggml_set_param(k);
+        ggml_set_name(k, "k");
+
+        ggml_tensor * w = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, nh, nb, 1, ns);
+        ggml_set_param(w);
+        ggml_set_name(w, "w");
+
+        ggml_tensor * m = mask_mode == 3
+            ? ggml_new_tensor_4d(ctx, GGML_TYPE_I32, 2, nb, 1, nm)
+            : ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, nm);
+        ggml_set_param(m);
+        ggml_set_name(m, "m");
+
+        ggml_tensor * out = ggml_lightning_indexer(ctx, q, k, w, m);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src == nullptr) {
+                init_tensor_uniform(t);
+            }
+        }
+        const auto write_const = [](ggml_tensor * t, float value) {
+            const size_t es = ggml_type_size(t->type);
+            const int64_t n_blocks = t->ne[0] / ggml_blck_size(t->type);
+            std::vector<uint8_t> row((size_t) n_blocks * es);
+            if (t->type == GGML_TYPE_F32) {
+                for (int64_t i = 0; i < t->ne[0]; ++i) {
+                    ((float *) row.data())[i] = value;
+                }
+            } else if (t->type == GGML_TYPE_F16) {
+                const ggml_fp16_t h = ggml_fp32_to_fp16(value);
+                for (int64_t i = 0; i < t->ne[0]; ++i) {
+                    ((ggml_fp16_t *) row.data())[i] = h;
+                }
+            } else if (t->type == GGML_TYPE_BF16) {
+                const ggml_bf16_t b = ggml_fp32_to_bf16(value);
+                for (int64_t i = 0; i < t->ne[0]; ++i) {
+                    ((ggml_bf16_t *) row.data())[i] = b;
+                }
+            } else if (t->type == GGML_TYPE_Q8_0) {
+                // Scale 65504 and quant 2: f32 magnitude 131008, which is inf once narrowed to f16.
+                const size_t blk = sizeof(ggml_fp16_t) + 32;
+                GGML_ASSERT(row.size() % blk == 0);
+                const ggml_fp16_t d = ggml_fp32_to_fp16(65504.0f);
+                for (size_t off = 0; off < row.size(); off += blk) {
+                    std::memcpy(row.data() + off, &d, sizeof(d));
+                    for (size_t i = 0; i < 32; ++i) {
+                        row[off + sizeof(d) + i] = 2;
+                    }
+                }
+            } else {
+                GGML_ABORT("lightning indexer maskw: unsupported type");
+            }
+            for (int64_t s = 0; s < t->ne[3]; ++s) {
+                for (int64_t r = 0; r < t->ne[2]; ++r) {
+                    for (int64_t h = 0; h < t->ne[1]; ++h) {
+                        ggml_backend_tensor_set(t, row.data(), s*t->nb[3] + r*t->nb[2] + h*t->nb[1], row.size());
+                    }
+                }
+            }
+        };
+        write_const(ggml_get_tensor(ctx, "q"), q_value);
+        write_const(ggml_get_tensor(ctx, "k"), k_value);
+        write_const(ggml_get_tensor(ctx, "w"), w_value);
+
+        ggml_tensor * m = ggml_get_tensor(ctx, "m");
+        if (mask_mode == 3) {
+            const int32_t pair[2] = { 0, (int32_t) (kv/2) };
+            for (int64_t s = 0; s < nm; ++s) {
+                for (int64_t r = 0; r < nb; ++r) {
+                    ggml_backend_tensor_set(m, pair, s*m->nb[3] + r*m->nb[1], sizeof(pair));
+                }
+            }
+            return;
+        }
+        std::vector<ggml_fp16_t> mask(kv);
+        for (int64_t s = 0; s < nm; ++s) {
+            for (int64_t r = 0; r < nb; ++r) {
+                for (int64_t i = 0; i < kv; ++i) {
+                    float mv = 0.0f;
+                    if (mask_mode == 1 || (mask_mode == 0 && (i + r + s) % 3 == 0)) {
+                        mv = -INFINITY;
+                    }
+                    mask[i] = ggml_fp32_to_fp16(mv);
+                }
+                ggml_backend_tensor_set(m, mask.data(), s*m->nb[3] + r*m->nb[1], kv*sizeof(ggml_fp16_t));
+            }
+        }
+    }
+};
+
 // GGML_OP_LIGHTNING_INDEXER with a range mask (fork): I32 [2, nb, 1, nm], keys [lo, hi) get 0 and the others -inf
 struct test_lightning_indexer_rmask : public test_lightning_indexer {
     test_lightning_indexer_rmask(int64_t hsk, int64_t nh, int64_t kv, int64_t nb, int64_t ns, int64_t nm, ggml_type type_K)
@@ -15789,6 +15922,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    // paths the eight cases above do not build: f16 K with zero weights, a fully masked row, an all-open
+    // mask (finite NMSE), the vector kernel (batch < 8), 32-head queries, bf16 keys, and an I32 range
+    test_cases.emplace_back(new test_lightning_indexer_maskw(GGML_TYPE_F16,  4, 65, 9, 2, 2, 0.001f, 0.001f,    0.0f, 0));
+    test_cases.emplace_back(new test_lightning_indexer_maskw(GGML_TYPE_F16,  4, 65, 3, 1, 1, 0.001f, 0.001f,    0.0f, 0));
+    test_cases.emplace_back(new test_lightning_indexer_maskw(GGML_TYPE_F32,  4, 65, 9, 2, 2, 0.001f, 100000.0f, 1.0f, 1));
+    test_cases.emplace_back(new test_lightning_indexer_maskw(GGML_TYPE_F32,  4, 65, 9, 2, 2, 0.001f, 100000.0f, 1.0f, 2));
+    test_cases.emplace_back(new test_lightning_indexer_maskw(GGML_TYPE_F32,  4, 65, 3, 1, 1, 0.001f, 100000.0f, 1.0f, 2));
+    test_cases.emplace_back(new test_lightning_indexer_maskw(GGML_TYPE_F32,  4, 65, 9, 2, 2, 0.001f, 100000.0f, 0.0f, 3));
+    test_cases.emplace_back(new test_lightning_indexer_maskw(GGML_TYPE_F16, 32, 65, 4, 1, 1, 100000.0f, 0.001f, 0.0f, 0));
+    test_cases.emplace_back(new test_lightning_indexer_maskw(GGML_TYPE_F16, 32, 65, 4, 1, 1, 100000.0f, 0.001f, 1.0f, 2));
+    test_cases.emplace_back(new test_lightning_indexer_maskw(GGML_TYPE_Q8_0, 32, 65, 4, 1, 1, 0.001f, 131008.0f, 0.0f, 0));
+    test_cases.emplace_back(new test_lightning_indexer_maskw(GGML_TYPE_BF16, 4, 65, 9, 1, 1, 0.001f, 100000.0f, 1.0f, 2));
     // Flash-Next indexer (4 heads, float32 keys): key and token counts off the register-blocked tile edges
     test_cases.emplace_back(new test_lightning_indexer(128, 4, 1000, 77, 1, 1, GGML_TYPE_F32));
     test_cases.emplace_back(new test_lightning_indexer(128, 4, 4133, 300, 2, 1, GGML_TYPE_F32));
