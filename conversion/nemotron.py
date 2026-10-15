@@ -692,8 +692,8 @@ class NemotronHModel(GraniteHybridModel):
                 return
 
             if name.find("mixer.experts") != -1:
-                n_experts = self.hparams["n_routed_experts"]
                 assert bid is not None
+                n_experts = self.n_routed_experts_of(bid)
 
                 if self._experts is None:
                     self._experts = [{} for _ in range(self.block_count)]
@@ -720,6 +720,9 @@ class NemotronHModel(GraniteHybridModel):
 
         yield from super().modify_tensors(data_torch, name, bid)
 
+    def n_routed_experts_of(self, bid: int) -> int:
+        return self.hparams["n_routed_experts"]
+
     def prepare_tensors(self):
         super().prepare_tensors()
 
@@ -745,6 +748,21 @@ class NemotronHPuzzleModel(NemotronHModel):
 
     def __init__(self, dir_model: "Path", *args, **kwargs):
         hparams = dict(kwargs.pop("hparams", None) or ModelBase.load_hparams(dir_model, self.is_mistral_format))
+        # VL checkpoints (Nemotron 3.5 Bolt BF16: NemotronH_Omni_Reasoning_V3) nest the Puzzle text config
+        # under llm_config (load_hparams exposes it as text_config); lift it to the top level
+        if "block_configs" not in hparams and "block_configs" in hparams.get("text_config", {}):
+            hparams = {**hparams, **hparams["text_config"]}
+        # Bolt's text config says hidden_act relu2 (the MoE activation, implied by nemotron_h_moe); the
+        # hybrid base only accepts silu/None there, which describes the Mamba path (mamba_hidden_act)
+        if hparams.get("hidden_act") == "relu2" and hparams.get("mlp_hidden_act", "relu2") == "relu2":
+            hparams.pop("hidden_act")
+            if "text_config" in hparams:  # ModelBase merges text_config over the top level again
+                hparams["text_config"] = {k: v for k, v in hparams["text_config"].items() if k != "hidden_act"}
+        # Bolt (Star Elastic) gives every MoE block its own routed-expert count; the GGUF expert_count is
+        # the largest, the loader reads each layer's count from its router tensor
+        per_block = [bc["n_routed_experts"] for bc in hparams["block_configs"] if bc.get("n_routed_experts")]
+        if per_block and "n_routed_experts" not in hparams:
+            hparams["n_routed_experts"] = max(per_block)
 
         self.block_configs: list[dict] = hparams["block_configs"]
         self.n_layer_trunk = len(self.block_configs)
@@ -793,6 +811,9 @@ class NemotronHPuzzleModel(NemotronHModel):
         self.gguf_writer.add_expert_weights_scale(self.hparams["routed_scaling_factor"])
         self.gguf_writer.add_expert_group_count(self.hparams["n_group"])
         self.gguf_writer.add_moe_latent_size(self.hparams["moe_latent_size"])
+
+    def n_routed_experts_of(self, bid: int) -> int:
+        return self.block_configs[bid].get("n_routed_experts") or self.hparams["n_routed_experts"]
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         # The official BF16 checkpoint (NVIDIA-Nemotron-Labs-3-Puzzle-75B-A9B-BF16)
