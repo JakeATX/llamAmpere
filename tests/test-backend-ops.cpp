@@ -19,6 +19,7 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
+#include "nmse-masked-inf.h"
 
 #include <algorithm>
 #include <atomic>
@@ -11497,6 +11498,11 @@ struct test_lightning_indexer : public test_case {
         return 1e-6;
     }
 
+    // masked keys are -inf. nmse() is NaN there, and NaN > max_err never fails.
+    double err(const float * a, const float * b, size_t n) override {
+        return nmse_masked_inf(a, b, n);
+    }
+
     uint64_t op_flops(ggml_tensor * t) override {
         GGML_UNUSED(t);
         return ((2 * hsk + 2) * nh + 1) * kv * nb * ns;
@@ -11612,21 +11618,6 @@ struct test_lightning_indexer_rmask : public test_lightning_indexer {
 
     std::string vars() override {
         return test_lightning_indexer::vars() + ",mask=range";
-    }
-
-    // the caller already checked that the -inf outputs sit at the same places; the NMSE is taken over the finite
-    // outputs (the plain nmse() would be NaN here and never fail)
-    double err(const float * a, const float * b, size_t n) override {
-        double mse_a_b = 0.0;
-        double mse_a_0 = 0.0;
-        for (size_t i = 0; i < n; ++i) {
-            if (!std::isfinite(a[i]) || !std::isfinite(b[i])) {
-                continue;
-            }
-            mse_a_b += ((double) a[i] - b[i])*((double) a[i] - b[i]);
-            mse_a_0 += (double) a[i]*a[i];
-        }
-        return mse_a_0 > 0.0 ? mse_a_b/mse_a_0 : mse_a_b;
     }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
