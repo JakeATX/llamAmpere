@@ -10,6 +10,9 @@
 //   - Q: quantized to int8 per (query, head) row inside the kernel, softmax scale folded into the row scale;
 //   - QK^T on IMMA m16n8k32 s8 with int32 accumulation, dequantized by the outer product of the row/token scales;
 //   - online softmax in f32, P in f16, PV on f16 MMA m16n8k16 with f32 accumulation (V stays f16).
+// Opt-in variants on top of the switch (fattn-i8qk.cu, i8qk_modes): GGML_CUDA_FA_I8QK_PV16=1 (f16 P.V accumulator),
+// GGML_CUDA_FA_I8QK_KCB=1 (codebook-direct int8 K for tq5_0/tq6_0), GGML_CUDA_FA_I8QK_QH=1 (Q scale per 128-dim half),
+// GGML_CUDA_FA_I8QK_Q2L=1 (two-limb Q), GGML_CUDA_FA_I8QK_KBLK=0|n (no K smoothing / block-frozen K offsets).
 // Unset or any other value: unchanged routes. Quantized K and V caches only (q8_0, turbo2/3/4, tq5_0, tq6_0). No new
 // VRAM: the int8 K and the f16 V reuse the f16 K/V reservation the allocator already made for the f16 route behind dst
 // (bounded prefill workspace or the generic f16 copies); without that reservation the op keeps the f16 route.
@@ -20,6 +23,14 @@ bool ggml_cuda_fattn_i8qk_enabled();
 
 // Shape/type gate of the int8-QK route (the caller also checks that the op would take the f16 MMA route).
 bool ggml_cuda_fattn_i8qk_applies(int cc, const ggml_tensor * dst);
+
+// [I8SJ] the same gate for f16 K and V read in place (no f16 K/V reservation behind dst): only for callers that pass
+// their own int8 K workspace, i.e. the SJ-KVaRN prefill (fattn-sjkvarn-prefill.cu) on its expanded f16 K/V scratch.
+bool ggml_cuda_fattn_i8qk_applies_f16kv(int cc, const ggml_tensor * dst);
+
+// [I8SJ] planning predicate on the original SJ-KVaRN node (switch on, SM80+, D 256, wide query, no sinks / bias /
+// softcap, one mask plane): the SJ-KVaRN prefill plan then reserves n_kv*256 bytes of int8 K per KV head of a group.
+bool ggml_cuda_fattn_i8qk_sj_kvarn_wanted(int cc, const ggml_tensor * dst);
 
 // Run KV heads [first, first + heads) of dst. ws_k: >= n_kv*D*heads bytes for the int8 K; ws_v: >= n_kv*D*heads halves
 // for the f16 K staging and then the f16 V (both required).
