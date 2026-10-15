@@ -2247,7 +2247,10 @@ static void ggml_compute_forward_mul_mat_id_impl(
 
                 assert(i02 >= 0 && i02 < n_as);
 
-                if (keep_skip & (UINT64_C(1) << logical_row)) {
+                // keep_skip is zero unless this node has at most 64 routed rows. A wider prefill
+                // must not shift by logical_row (that shift is undefined at 64 and above).
+                if (keep_skip != 0 && (unsigned) logical_row < 64 &&
+                        (keep_skip & (UINT64_C(1) << logical_row))) {
                     memset((char *) dst->data + iid1*nb2 + id*nb1, 0, ne0*sizeof(float));
                     continue;
                 }
