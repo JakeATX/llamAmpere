@@ -1,7 +1,7 @@
 #pragma once
 #include "common.cuh"
 
-// AI4 (Ampere INT4, formerly D2) weights: whole-tensor reconstruct to f32 (original basis) + cuBLAS SGEMM on the backend's
+// AI4 (Ampere INT4, formerly D2) weights: row-slab reconstruct to f32 (original basis) + cuBLAS SGEMM on the backend's
 // handle (TF32 math). The matching weight-only control for a quantized type is GGML_CUDA_FORCE_CUBLAS_RT=1 plus
 // GGML_CUDA_CUBLAS_COMPUTE_TYPE=f32 (dequant to f32 + the same cublasSgemm); without the second flag sm_86 runs the
 // quantized cuBLAS path in fp16 compute. No mmvq/mmq/mmf.

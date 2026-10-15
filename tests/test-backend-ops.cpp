@@ -6316,6 +6316,9 @@ static void add_ai4_cases(std::vector<std::unique_ptr<test_case>> & cases, bool 
     cases.emplace_back(new test_mul_mat_ai4(400, 600, 3072));
     cases.emplace_back(new test_mul_mat_ai4(128, 8, 17408));
     cases.emplace_back(new test_mul_mat_ai4(128, 5, 6144));
+    // 592 = 16*37 rows. With GGML_CUDA_AI4_REF=1 and SLAB_ROWS=48 the fallback path runs 12 slabs of 48 and a 16-row tail.
+    cases.emplace_back(new test_mul_mat_ai4(592, 1, 1024));
+    cases.emplace_back(new test_mul_mat_ai4(592, 5, 1024));
 }
 
 enum class cr_activation_pattern {
@@ -6911,6 +6914,9 @@ static void add_ai4u_cases(std::vector<std::unique_ptr<test_case>> & cases, bool
     cases.emplace_back(new test_mul_mat_ai4(17408, 1, 5120, U));     // Qwen3.8-27B
     cases.emplace_back(new test_mul_mat_ai4(5120,  8, 17408, U));
     cases.emplace_back(new test_mul_mat_ai4(6144, 70, 5120, U));
+    // 592 = 16*37, K = 1024. SLAB_ROWS=48 (and AI4_REF=1, this type has a kernel) is 12 full slabs plus a 16-row tail.
+    cases.emplace_back(new test_mul_mat_ai4(592, 1, 1024, U));
+    cases.emplace_back(new test_mul_mat_ai4(592, 5, 1024, U));
     // MUL_MAT_ID: Flash-Next n_expert 512 / top 10 (gate/up with broadcast src1, down with per-slot src1)
     for (int n : {1, 2, 4, 8, 9, 32, 200}) {
         cases.emplace_back(new test_mul_mat_id_ai4(U, 512, 10, true,  640,  n, 2560));
@@ -6971,6 +6977,9 @@ static void add_ai5u_cases(std::vector<std::unique_ptr<test_case>> & cases, bool
     cases.emplace_back(new test_mul_mat_ai4(5120,  8, 17408, U5));
     cases.emplace_back(new test_mul_mat_ai4(10240, 4, 5120, U5));
     cases.emplace_back(new test_mul_mat_ai4(6144, 70, 5120, U5));
+    // 592 = 16*37. AI5_REF=1 takes the reference slabs; AI4_REF=1 takes the fallback slabs. Tail is 16 rows at SLAB_ROWS=48.
+    cases.emplace_back(new test_mul_mat_ai4(592, 1, 1024, U5));
+    cases.emplace_back(new test_mul_mat_ai4(592, 5, 1024, U5));
     // MUL_MAT_ID: Flash-Next n_expert 512 / top 10, small expert counts, repeated ids
     for (int n : {1, 2, 4, 8, 9, 32, 200}) {
         cases.emplace_back(new test_mul_mat_id_ai4(U5, 512, 10, true,  640,  n, 2560));
@@ -7003,6 +7012,10 @@ static void add_aik_cases(std::vector<std::unique_ptr<test_case>> & cases, bool 
         cases.emplace_back(new test_mul_mat_ai4(48,   7, 384,  t));
         cases.emplace_back(new test_mul_mat_ai4(144, 37, 1152, t));
         cases.emplace_back(new test_mul_mat_ai4(400, 130, 3072, t));
+        // 592 = 16*37 rows, K = 1024. Always built; GGML_CUDA_AI4_REF_SLAB_ROWS=48 makes 12 slabs of 48 and a 16-row tail
+        // (n = 1 and n = 5: T = 1, and T > 1 so the column stride ldc = M is checked). The case does not read the env.
+        cases.emplace_back(new test_mul_mat_ai4(592, 1, 1024, t));
+        cases.emplace_back(new test_mul_mat_ai4(592, 5, 1024, t));
         for (int n : {1, 4, 33}) {                                    // MUL_MAT_ID through the same reference path
             cases.emplace_back(new test_mul_mat_id_ai4(t, 4, 2, false, 32, n, 256));
             cases.emplace_back(new test_mul_mat_id_ai4(t, 8, 8, true,  48, n, 384));
@@ -7045,6 +7058,9 @@ static void add_ai4s_cases(std::vector<std::unique_ptr<test_case>> & cases, bool
         cases.emplace_back(new test_mul_mat_ai4(5120,  8, 17408, t));
         cases.emplace_back(new test_mul_mat_ai4(10240, 4, 5120, t));
         cases.emplace_back(new test_mul_mat_ai4(6144, 70, 5120, t));
+        // 592 = 16*37. Span layout, K % 1024 == 0. SLAB_ROWS=48 plus AI4_REF=1: ragged 16-row tail on the fallback path.
+        cases.emplace_back(new test_mul_mat_ai4(592, 1, 1024, t));
+        cases.emplace_back(new test_mul_mat_ai4(592, 5, 1024, t));
         for (int n : {1, 2, 4, 8, 9, 32, 200}) {                       // MUL_MAT_ID: Flash-Next 512 / top 10
             cases.emplace_back(new test_mul_mat_id_ai4(t, 512, 10, true,  640,  n, 2048));
             cases.emplace_back(new test_mul_mat_id_ai4(t, 512, 10, false, 2560, n, 1024));
@@ -7067,6 +7083,9 @@ static void add_ai4s_cases(std::vector<std::unique_ptr<test_case>> & cases, bool
         cases.emplace_back(new test_mul_mat_ai4(16,   1, 1024, t));
         cases.emplace_back(new test_mul_mat_ai4(144, 37, 2048, t));
         cases.emplace_back(new test_mul_mat_ai4(400, 130, 3072, t));
+        // 592 = 16*37, K = 1024 (one span per 16 rows). SLAB_ROWS=48: 12 slabs of 48 and a 16-row tail. No env at compile time.
+        cases.emplace_back(new test_mul_mat_ai4(592, 1, 1024, t));
+        cases.emplace_back(new test_mul_mat_ai4(592, 5, 1024, t));
         for (int n : {1, 4, 33}) {
             cases.emplace_back(new test_mul_mat_id_ai4(t, 4, 2, false, 32, n, 1024));
             cases.emplace_back(new test_mul_mat_id_ai4(t, 8, 8, true,  48, n, 2048));

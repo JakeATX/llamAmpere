@@ -9,7 +9,11 @@
 #include <vector>
 
 // Kernel selection (read once per process), for A/B runs:
-//   GGML_CUDA_AI4_REF=1        reference path: whole-tensor reconstruct to f32 + cuBLAS SGEMM (the D-003 KL path)
+//   GGML_CUDA_AI4_REF=1        reference path: reconstruct to f32 + cuBLAS SGEMM (the D-003 KL path)
+//   GGML_CUDA_AI4_REF_SLAB_MIB=n   cap in MiB of that f32 buffer (default 256). Rows are reconstructed and multiplied
+//                             in slabs of a multiple of 16. 0 or negative: one slab, the whole matrix (the old buffer).
+//   GGML_CUDA_AI4_REF_SLAB_ROWS=n  test only. Slab height in rows; a positive value overrides the MiB cap. Rounded
+//                             down to a multiple of 16 (the storage unit). Not a runtime tuning knob.
 //   GGML_CUDA_AI4_BN128_MIN=n  N at which the GEMM switches from 64- to 128-wide token tiles (default 512)
 //   GGML_CUDA_AI4_MMV_STAGES=2|3|4  cp.async ring depth of the N <= 8 kernel (default 2: AI4@s2 is the configuration
 //                             that passed the D-008 ship gate and was fastest of 2/3/4 at verify widths 5-8 in D-007)
@@ -158,6 +162,89 @@ static bool ai4_fast_ok(const ggml_backend_cuda_context & ctx) {
     return !ai4_ref() && GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE;
 }
 
+// Largest multiple of 16 rows whose f32 image fits in the cap, in [16, M]. SLAB_ROWS wins over the MiB cap.
+// SLAB_MIB <= 0 (or K == 0) is the old whole-tensor buffer. A reconstruct launch puts one 16-row group on
+// gridDim.y, so a slab is also clamped to 65535 groups; the whole-tensor A/B path is not.
+static int64_t ai4_ref_slab_rows(int64_t M, int64_t K) {
+    static const int rows = ai4_env_int("GGML_CUDA_AI4_REF_SLAB_ROWS", nullptr, 0);
+    static const int mib  = ai4_env_int("GGML_CUDA_AI4_REF_SLAB_MIB", nullptr, 256);
+    const int64_t grid_max = (int64_t) 65535 * 16;
+    if (rows > 0) {
+        const int64_t r = ((int64_t) rows / 16) * 16;
+        if (r >= 16) {
+            return std::min<int64_t>(r, std::min<int64_t>(M, grid_max));
+        }
+    }
+    if (mib <= 0 || K <= 0 || K > INT64_MAX / (int64_t) sizeof(float)) {
+        return M;
+    }
+    const int64_t cap = (int64_t) mib << 20;
+    const int64_t nb  = K * (int64_t) sizeof(float);
+    int64_t n = (cap / nb) / 16 * 16;
+    if (n < 16) {
+        n = 16;
+    }
+    return std::min<int64_t>(n, std::min<int64_t>(M, grid_max));
+}
+
+// Reference SGEMM in row slabs so the f32 reconstruct buffer is one slab, not M*K. The pool keeps its high-water
+// mark, and a whole output head (M ~ 2.5e5, K = 5120) was ~4.8 GiB. xe (T x K), when used, is built once.
+// Weights are consecutive 16-row slabs (ggml-ai4.h); rotation is along K inside a row, so it does not cross a
+// slab boundary. Byte offset m0 * ggml_row_size is therefore exactly rows [m0, m0+mm). dst is column-major
+// M x T: ldc stays M and the C pointer moves by m0 elements. use_any: the final fallback's ai4_reconstruct_any
+// (AI4 / AI4_U kernels). Ref-only types always go through aik_reconstruct_rate, including the unrotated A/B.
+static void ai4_ref_gemm(ggml_backend_cuda_context & ctx, const ggml_tensor * src0,
+                         const float * X, float * Y, int64_t M, int64_t T, int64_t K, bool emul, bool use_any) {
+    if (M == 0 || T == 0) {
+        return;
+    }
+    GGML_ASSERT(M > 0 && T > 0 && K >= 0);
+    GGML_ASSERT(M <= (int64_t) INT32_MAX && T <= (int64_t) INT32_MAX && K <= (int64_t) INT32_MAX);   // cuBLAS takes int
+    GGML_ASSERT(!(use_any && emul));
+    const int64_t rows = ai4_ref_slab_rows(M, K);
+    GGML_ASSERT(rows >= 16 && rows % 16 == 0 && K <= INT64_MAX / rows);
+    GGML_ASSERT(!emul || K <= 0 || T <= INT64_MAX / K);
+    const int id = ggml_cuda_get_device();
+    cudaStream_t stream = ctx.stream();
+    // One buffer, live for the whole loop. Same stream: slab i's SGEMM is queued before slab i+1 overwrites it.
+    const int64_t nw = rows * K > 0 ? rows * K : (int64_t) 1;   // K == 0: keep the pool off a zero-byte alloc
+    const int64_t nx = emul && K > 0 ? T * K : (int64_t) 1;
+    GGML_ASSERT((uint64_t) nw <= SIZE_MAX / sizeof(float) && (uint64_t) nx <= SIZE_MAX / sizeof(float));
+    ggml_cuda_pool_alloc<float> w(ctx.pool(id), (size_t) nw);
+    ggml_cuda_pool_alloc<float> xe(ctx.pool(id), (size_t) nx);
+    if (emul) {
+        aik_act_emul_launch(X, xe.get(), K, T, stream);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    const float * B = emul ? xe.get() : X;
+    const float alpha = 1.0f;
+    const float beta  = 0.0f;
+    CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(), stream));
+    const int64_t row_bytes = (int64_t) ggml_row_size(src0->type, K);
+    GGML_ASSERT(row_bytes == (int64_t) src0->nb[1]);   // contiguous: nominal row size is the slab stride / 16
+    GGML_ASSERT(row_bytes <= 0 || M <= INT64_MAX / row_bytes);
+    const uint8_t * base = (const uint8_t *) src0->data;
+    for (int64_t m0 = 0; m0 < M; ) {
+        const int64_t mm = std::min<int64_t>(rows, M - m0);
+        GGML_ASSERT(mm > 0 && mm % 16 == 0);   // last slab may be shorter than rows, still a whole number of groups
+        const void * src = base + (size_t) (m0 * row_bytes);
+        if (use_any) {
+            ai4_reconstruct_any(src, w.get(), K, mm, stream, src0->type);
+        } else {
+            GGML_ASSERT(aik_reconstruct_rate<float>(ggml_ai4_rate(src0->type), src, w.get(), K, mm, !emul, stream,
+                                                    ggml_ai4_trellis_mul(src0->type), ggml_ai4_is_span(src0->type)));
+        }
+        // C(mm x T) at row m0 of the M x T result. ldc = M, so column t lands at Y[t*M + m0].
+        CUBLAS_CHECK(cublasSgemm(ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N,
+                                 (int) mm, (int) T, (int) K,
+                                 &alpha, w.get(), (int) K,
+                                         B, (int) K,
+                                 &beta,  Y + m0, (int) M));
+        m0 += mm;
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
 bool ggml_cuda_ai4_id_needs_sync(int cc, ggml_type t) {
     return ai4_ref() || ai4_ref_only_type(t) || !GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_AMPERE;
 }
@@ -194,29 +281,10 @@ void ggml_cuda_mul_mat_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     GGML_ASSERT(src1->ne[0] == K && dst->ne[0] == M);
     const int64_t T = src1->ne[1] * src1->ne[2] * src1->ne[3];
 
-    const int id = ggml_cuda_get_device();
-    cudaStream_t stream = ctx.stream();
-
     if (ai4_ref_only_type(src0->type)) {
         // rate-k reference: rotated-basis reconstruct x int8-emulated rotated activations (the W4A8 path's arithmetic up to
-        // summation order); GGML_CUDA_AI4_REF=1: original basis x f32 activations
-        const bool emul = !ai4_ref();
-        ggml_cuda_pool_alloc<float> w(ctx.pool(id), M * K);
-        ggml_cuda_pool_alloc<float> xe(ctx.pool(id), emul ? T * K : 1);
-        GGML_ASSERT(aik_reconstruct_rate<float>(ggml_ai4_rate(src0->type), src0->data, w.get(), K, M, !emul, stream,
-                                                ggml_ai4_trellis_mul(src0->type), ggml_ai4_is_span(src0->type)));
-        if (emul) {
-            aik_act_emul_launch((const float *) src1->data, xe.get(), K, T, stream);
-        }
-        CUDA_CHECK(cudaGetLastError());
-        const float alpha = 1.0f;
-        const float beta  = 0.0f;
-        CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(), stream));
-        CUBLAS_CHECK(cublasSgemm(ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N,
-                                 (int) M, (int) T, (int) K,
-                                 &alpha, w.get(), (int) K,
-                                         emul ? xe.get() : (const float *) src1->data, (int) K,
-                                 &beta,  (float *) dst->data, (int) M));
+        // summation order); GGML_CUDA_AI4_REF=1: original basis x f32 activations. Slabbed so the f32 buffer stays bounded.
+        ai4_ref_gemm(ctx, src0, (const float *) src1->data, (float *) dst->data, M, T, K, !ai4_ref(), false);
         return;
     }
 
@@ -233,19 +301,8 @@ void ggml_cuda_mul_mat_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor * 
         return;
     }
 
-    ggml_cuda_pool_alloc<float> w(ctx.pool(id), M * K);
-    ai4_reconstruct_any(src0->data, w.get(), K, M, stream, src0->type);
-    CUDA_CHECK(cudaGetLastError());
-
-    // y[M x T] = W[M x K] . X[K x T]
-    const float alpha = 1.0f;
-    const float beta  = 0.0f;
-    CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(), stream));
-    CUBLAS_CHECK(cublasSgemm(ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N,
-                             (int) M, (int) T, (int) K,
-                             &alpha, w.get(), (int) K,
-                                     (const float *) src1->data, (int) K,
-                             &beta,  (float *) dst->data, (int) M));
+    // pre-Ampere, or GGML_CUDA_AI4_REF=1 on a type that has kernels: original-basis reconstruct + SGEMM, same slabs
+    ai4_ref_gemm(ctx, src0, (const float *) src1->data, (float *) dst->data, M, T, K, false, true);
 }
 
 template <int LAY, int XSH>
