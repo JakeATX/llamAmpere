@@ -5109,7 +5109,22 @@ ggml_tensor * llm_graph_context::build_draft_vocab_logits(
     ggml_tensor * rows = ggml_reshape_3d(ctx0, head_w, head_w->ne[0], 1, head_w->ne[1]);
 
     ggml_tensor * logits = nullptr;
-    for (int64_t i = 0; i < n_outputs; ++i) {
+    // [PARW] several drafting slots: one MUL_MAT_ID over all outputs with the id list broadcast (row stride 0), so
+    // the CUDA indexed-rows kernel reads each shortlist row once instead of once per slot. LLAMA_DRAFT_VOCAB_BATCHED=0
+    // keeps the per-output loop.
+    static const bool batched = [] {
+        const char * env = getenv("LLAMA_DRAFT_VOCAB_BATCHED");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    if (batched && n_outputs > 1 && n_outputs <= 8 && ggml_is_contiguous(cur)) {
+        ggml_tensor * ids_b = ggml_view_2d(ctx0, draft_vocab_ids, n_sel, 1, draft_vocab_ids->nb[1], 0);
+        ids_b->ne[1] = n_outputs; // broadcast view: every output reads the same id list
+        ids_b->nb[1] = 0;
+        ggml_tensor * x3 = ggml_reshape_3d(ctx0, cur, cur->ne[0], 1, n_outputs);
+        logits = ggml_reshape_2d(ctx0, ggml_mul_mat_id(ctx0, rows, x3, ids_b), n_sel, n_outputs);
+    }
+    const int64_t n_loop = logits == nullptr ? n_outputs : 0;
+    for (int64_t i = 0; i < n_loop; ++i) {
         ggml_tensor * h_i = n_outputs == 1 ? cur : ggml_view_2d(ctx0, cur, cur->ne[0], 1, cur->nb[1], i*cur->nb[1]);
         ggml_tensor * l_i = ggml_mul_mat_id(ctx0, rows, h_i, draft_vocab_ids); // [1, n_sel, 1]
         l_i = ggml_reshape_2d(ctx0, l_i, n_sel, 1);

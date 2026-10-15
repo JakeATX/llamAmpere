@@ -6405,6 +6405,21 @@ struct test_mul_mat_ai4 : public test_mul_mat {
     }
 };
 
+// [PARW] IQ4_XS at the multi-slot verify widths 9..32 (the int8 tensor-core path, GGML_CUDA_IQ4XS_WIDE): row counts that
+// pick each row tiling (16 / 32 / 64 rows per block), padded weight row strides, partial column tiles, and the shapes that
+// must fall back to MMQ (rows not a multiple of 16, batched, n = 33)
+static void add_iq4xs_wide_cases(std::vector<std::unique_ptr<test_case>> & cases) {
+    for (int64_t n : {9, 10, 12, 15, 16, 17, 18, 20, 23, 24, 25, 31, 32, 33}) {
+        cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, 16,  n, 256,  {1, 1}, {1, 1}));
+        cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, 48,  n, 1280, {1, 1}, {1, 1}));
+        cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, 64,  n, 2048, {1, 1}, {1, 1}));
+        cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, 256, n, 5120, {1, 1}, {1, 1}));
+        cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, 32,  n, 768,  {1, 1}, {1, 1}, {0, 1, 2, 3}, 1024));
+        cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, 17,  n, 256,  {1, 1}, {1, 1}));
+        cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, 16,  n, 256,  {2, 1}, {1, 1}));
+    }
+}
+
 enum class cr_activation_pattern {
     RANDOM,
     ZERO,
@@ -7063,6 +7078,33 @@ struct test_mul_mat_id_onerow : public test_mul_mat_id {
         }
         const double floor_a_0 = double(n_vals) * double(k) * double(amax) * double(amax) / 9.0;
         return mse_a_b / std::max(mse_a_0, floor_a_0);
+    }
+};
+
+// [PARW] Batched indexed draft head: one-row experts, n activation columns (one per drafting slot) sharing ONE id
+// list through a broadcast ids view (row stride 0), as build_draft_vocab_logits builds it for several outputs.
+struct test_mul_mat_id_onerow_bcast : public test_mul_mat_id_onerow {
+    using test_mul_mat_id_onerow::test_mul_mat_id_onerow;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_ONEROW_BCAST";
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * as = ggml_new_tensor_3d(ctx, type_a, k, 1, n_mats);
+        ggml_set_name(as, "as");
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, 1);
+        ggml_set_name(ids, "ids");
+        ggml_tensor * ids_b = ggml_view_2d(ctx, ids, n_used, 1, ids->nb[1], 0);
+        ids_b->ne[1] = n;
+        ids_b->nb[1] = 0;
+        ggml_set_name(ids_b, "bcast_ids");
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, type_b, k, 1, n);
+        ggml_set_name(x, "b");
+        ggml_tensor * out = ggml_mul_mat_id(ctx, as, x, ids_b);
+        ggml_set_name(out, "out");
+        return out;
     }
 };
 
@@ -12208,6 +12250,14 @@ static const ggml_type other_types[] = {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     add_iq4xs_k4_cases(test_cases, false);
+    add_iq4xs_wide_cases(test_cases);
+    // [PARW] few-tile long-K MMQ (stream-k CTA cap): the 48-row GDN gates and small matrices at widths 9..32
+    for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_Q5_0, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS}) {
+        for (int64_t n : {9, 16, 20, 24, 32}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 48, n, 5120, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 200, n, 2048, {1, 1}, {1, 1}));
+        }
+    }
 
     // Public AI+ layouts: decode, GEMM, H128 tails, and routed expert reads.
     for (ggml_type type : {GGML_TYPE_AI4, GGML_TYPE_AI4_U, GGML_TYPE_AI2_U, GGML_TYPE_AI3_U,
@@ -13995,6 +14045,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS}) {
         for (int n_used : {1, 3, 17}) {
             test_cases.emplace_back(new test_mul_mat_id_onerow(type, GGML_TYPE_F32, 17, n_used, true, 1, 1, 512));
+        }
+        for (int n : {2, 3, 4, 5, 8}) {
+            for (int n_used : {3, 17}) {
+                test_cases.emplace_back(new test_mul_mat_id_onerow_bcast(type, GGML_TYPE_F32, 17, n_used, true, 1, n, 512));
+            }
         }
     }
 
@@ -15859,6 +15914,41 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (ggml_type type_a : all_types) {
             for (ggml_type type_b : {GGML_TYPE_F32}) {
                 test_cases.emplace_back(new test_mul_mat(type_a, type_b, 4096, bs, 14336, {1,  1}, {1, 1}));
+            }
+        }
+    }
+
+    // [PARW] Swift 1.5 (Qwen3.8-27B IQ4_XS-M) projection shapes (m = N out, k = K in) at the batched-verify widths
+    // N x (depth+1): GGML_PARW_BENCH=1 every type/shape, =head adds the Q6_K output head, =<type> one type only
+    if (const char * pb = getenv("GGML_PARW_BENCH"); pb != nullptr) {
+        const std::string sel = pb;
+        const std::array<std::array<int64_t, 2>, 7> body = {{
+            {17408, 5120}, {5120, 17408}, {10240, 5120}, {6144, 5120}, {5120, 6144}, {12288, 5120}, {1024, 5120}}};
+        std::vector<int64_t> widths = {1, 2, 3, 4, 5, 6, 8, 9, 10, 12, 15, 16, 18, 20, 24};
+        if (const char * pw = getenv("GGML_PARW_WIDTHS"); pw != nullptr) {
+            widths.clear();
+            std::stringstream ss(pw);
+            for (std::string w; std::getline(ss, w, ',');) {
+                widths.push_back(std::stoll(w));
+            }
+        }
+        for (int64_t n : widths) {
+            for (ggml_type type_a : {GGML_TYPE_IQ4_XS, GGML_TYPE_Q5_0, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}) {
+                if (sel != "1" && sel != "head" && sel != ggml_type_name(type_a)) {
+                    continue;
+                }
+                for (const auto & mk : body) {
+                    if ((type_a == GGML_TYPE_Q6_K || type_a == GGML_TYPE_Q8_0) && mk[0] != 1024) {
+                        continue; // Swift: Q6_K / Q8_0 only on attn_k / attn_v
+                    }
+                    test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, mk[0], n, mk[1], {1, 1}, {1, 1}));
+                }
+                if (type_a == GGML_TYPE_Q8_0) {
+                    test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 48, n, 5120, {1, 1}, {1, 1})); // ssm_alpha/beta
+                }
+            }
+            if (sel == "1" || sel == "head") {
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 248320, n, 5120, {1, 1}, {1, 1}));
             }
         }
     }

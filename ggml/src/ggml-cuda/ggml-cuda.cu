@@ -3283,6 +3283,10 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         return;
     }
     if (route == GGML_CUDA_MM_ROUTE_MMQ) {
+        // [PARW] multi-slot verify widths (9..32) of IQ4_XS: int8 tensor-core matvec instead of an MMQ tile
+        if (ggml_cuda_mul_mat_iq4xs_wide_try(ctx, src0, src1, dst)) {
+            return;
+        }
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
         return;
     }

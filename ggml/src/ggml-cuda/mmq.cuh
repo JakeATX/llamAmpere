@@ -1486,6 +1486,14 @@ static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const i
     return nbs_ids + nbs_x + GGML_PAD(nbs_y, config.nthreads*sizeof(int));
 }
 
+static int ggml_cuda_mmq_sk_min_iters() {
+    static const int value = [] {
+        const char * env = getenv("GGML_CUDA_MMQ_SK_MIN_ITERS");
+        return env == nullptr ? 2 : std::max(0, atoi(env));
+    }();
+    return value;
+}
+
 template <ggml_type type, int J, bool fallback, ggml_prec prec_src1 = GGML_PREC_Q8>
 static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     const int id = ggml_cuda_get_device();
@@ -1556,7 +1564,17 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const int ntiles_dst = ntx_launch * nty * ntzw;
     const int tiles_nwaves = (ntiles_dst + nsm - 1) / nsm;
     const int tiles_efficiency_percent = 100 * ntiles_dst / (nsm*tiles_nwaves);
-    const dim3 block_nums_stream_k(GGML_CUDA_CC_IS_NVIDIA(cc) && tiles_efficiency_percent >= 90 ? ntiles_dst : nsm, 1, 1);
+    int nblocks_stream_k = GGML_CUDA_CC_IS_NVIDIA(cc) && tiles_efficiency_percent >= 90 ? ntiles_dst : nsm;
+    // [PARW] a few output tiles over a long K (the 48-row GDN gate projections at verify widths 9..32 are ONE tile):
+    // nsm CTAs leave most of them without a K iteration and the fixup's last CTA walks every earlier CTA serially
+    // (~16 us per call vs ~5 us of math). Give each CTA at least GGML_CUDA_MMQ_SK_MIN_ITERS (default 2, 0 = off)
+    // K iterations; the fixup chain shrinks with it. Only fewer tiles than SMs and 9..32 columns: single-slot verify
+    // (widths <= 8, which reach MMQ for some types) and prefill keep their partition and stay bit-identical.
+    if (const int min_iters = ggml_cuda_mmq_sk_min_iters(); min_iters > 0 && nblocks_stream_k == nsm && ntiles_dst < nsm && args.ncols_max > 8 && args.ncols_max <= 32) {
+        const int64_t iters_total = (int64_t) ntiles_dst * (args.ncols_x / config.K_vram);
+        nblocks_stream_k = (int) std::max<int64_t>(ntiles_dst, std::min<int64_t>(nsm, iters_total / min_iters));
+    }
+    const dim3 block_nums_stream_k(nblocks_stream_k, 1, 1);
     GGML_ASSERT(jt_stride == 0 || (int) block_nums_stream_k.x == ntiles_dst);
 
     GGML_ASSERT(ntiles_dst * blocks_per_ne00_fd.z < (1 << 30)); // Assert that variable kbc will not overflow.

@@ -16,6 +16,11 @@ bool   ggml_cuda_q8_cacheable(const ggml_backend_cuda_context & ctx, size_t q8_b
 char * ggml_cuda_q8_cache_claim(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, ggml_type type_src0,
                                 size_t q8_bytes, int64_t ne10_padded);
 
+// [PARW] IQ4_XS x f32 at 9..32 columns (multi-slot speculative verify) on the int8 tensor-core path; returns false
+// (caller keeps MMQ) when the shape, layout, device or GGML_CUDA_IQ4XS_WIDE=0 rules it out.
+bool ggml_cuda_mul_mat_iq4xs_wide_try(ggml_backend_cuda_context & ctx,
+    const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
+
 void ggml_cuda_mul_mat_vec_q(ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
     const ggml_cuda_mm_fusion_args_host * fusion = nullptr, bool convrot = false);

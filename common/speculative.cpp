@@ -1504,7 +1504,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     bool adaptive = false;
     std::vector<int> n_cap;   // [n_seq] effective draft cap for the current draft() call
     std::vector<int> n_last;  // [n_seq] drafts attempted in the most recent draft() call
+    // [PARW] the seq's own draft cap in the most recent draft() call, before the multi-seq equal-depth lift
+    // (n_cap can be raised to the round's deepest cap); the adaptive controller is fed at this depth
+    std::vector<int> n_own;
     std::vector<common_speculative_adaptive> adaptive_ctrl; // [n_seq] per-seq adaptive depth controller
+
+    static bool equal_depth_enabled() {
+        static const bool on = [] {
+            const char * e = getenv("LLAMA_SPEC_EQUAL_DEPTH");
+            return e == nullptr || e[0] != '0';
+        }();
+        return on;
+    }
 
     int32_t defer_capacity() const {
         const int32_t draft_rows = std::max(this->params.n_max, (int32_t) n_seq);
@@ -1528,6 +1539,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         this->adaptive = adaptive;
         // n_cap/n_last are written by the shared draft loop in both modes
         n_cap.assign(n_seq, 0);
+        n_own.assign(n_seq, 0);
         n_last.assign(n_seq, 0);
 
         SPC_TRC("%s", "adding speculative implementation 'draft-mtp'\n");
@@ -2369,6 +2381,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 if (dp.n_max > 0 && dp.n_max < n_cap[seq_one]) {
                     n_cap[seq_one] = dp.n_max;
                 }
+                n_own[seq_one] = n_cap[seq_one];
                 const int n_chain = n_cap[seq_one];
 
                 // deferred rows at or past n_past hold candidates the verify
@@ -2615,6 +2628,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 n_cap[seq_id] = dp.n_max;
             }
 
+            n_own[seq_id] = n_cap[seq_id];
+
             common_batch_add(batch, dp.id_last, dp.pos0, { seq_id }, true);
             std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[seq_id].data(), row_bytes);
 
@@ -2622,6 +2637,27 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             if (chain_heads) {
                 chain_h[seq_id].assign(pending_h[seq_id].begin(), pending_h[seq_id].end());
+            }
+        }
+
+        // [PARW] equal-depth multi-seq drafting: the target verifies every slot in one batch, and a hybrid/recurrent
+        // target splits that batch into one ubatch (a full pass over the weights) per distinct draft length
+        // (llama_batch_allocr::split_equal). With per-slot adaptive depths (3 vs 4) --parallel 4 ran 2-4 weight passes
+        // per round. Draft every seq to the round's deepest cap (each still bounded by its own context limit dp.n_max);
+        // the extra tokens are verified like any draft (lossless), and the adaptive controller still sees only the
+        // seq's own depth (accept()). LLAMA_SPEC_EQUAL_DEPTH=0 turns it off.
+        if (n_drafting > 1 && equal_depth_enabled()) {
+            int c_max = 0;
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (drafting[seq_id]) {
+                    c_max = std::max(c_max, n_cap[seq_id]);
+                }
+            }
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (drafting[seq_id]) {
+                    const int bound = dparams[seq_id].n_max > 0 ? dparams[seq_id].n_max : c_max;
+                    n_cap[seq_id] = std::max(n_cap[seq_id], std::min(c_max, bound));
+                }
             }
         }
 
@@ -2797,7 +2833,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // accepted draft; on is_other the stats belong to a different speculator
         if (adaptive && !is_other) {
             const int depth_before = adaptive_ctrl[seq_id].n_cur;
-            adaptive_ctrl[seq_id].update(n_last[seq_id], n_accepted, params.n_max, params.n_min_adaptive);
+            // [PARW] judge the controller at the seq's own depth: tokens drafted past it (equal-depth lift) are a
+            // bonus the controller did not ask for, and verification is sequential, so the accepted prefix within
+            // the own depth is what a draft of that depth would have returned
+            const int own   = n_own[seq_id] > 0 ? std::min(n_last[seq_id], n_own[seq_id]) : n_last[seq_id];
+            const int n_acc = std::min<int>(n_accepted, own);
+            adaptive_ctrl[seq_id].update(own, n_acc, params.n_max, params.n_min_adaptive);
             if (adaptive_ctrl[seq_id].n_cur != depth_before) {
                 SPC_DBG("adaptive draft depth seq %d: %d -> %d (n_draft=%d, n_accepted=%d)\n",
                         (int) seq_id, depth_before, adaptive_ctrl[seq_id].n_cur, n_last[seq_id], n_accepted);
