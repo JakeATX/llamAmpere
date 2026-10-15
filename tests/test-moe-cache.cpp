@@ -1673,6 +1673,59 @@ static bool run_repeated_lifecycle(
     return output_ok && cache_ok;
 }
 
+// B1's opt-in suspend (LLAMA_B1_MOE_CACHE_SUSPEND=1): the scheduler frees its session and pool, computes without
+// a cache, and resume makes a new session that fills again; output stays correct throughout.
+static bool run_suspend_resume(
+        ggml_backend_t gpu,
+        ggml_backend_t cpu,
+        stress_fixture & fixture,
+        log_capture & capture) {
+    configure_cache(nullptr);
+    capture.clear();
+    ggml_backend_sched_t scheduler = make_scheduler(
+            "cache-suspend", gpu, cpu, fixture.graph);
+    if (!scheduler) {
+        printf("cache-suspend: FAIL\n");
+        return false;
+    }
+    constexpr int steps = 65;
+    bool ok = true;
+    int  step = 0;
+    for (int i = 0; i < steps && ok; i++) {
+        ok = compute_matches("cache-suspend", scheduler, fixture.graph, fixture.reference, step++);
+    }
+    const size_t pools_before = count_occurrences(capture.get(), " pool[");
+    const bool s1 = ok && ggml_backend_sched_moe_cache_suspend(scheduler);
+    const bool s2 = ggml_backend_sched_moe_cache_suspend(scheduler); // already suspended: no-op
+    if (!s1 || s2) {
+        fprintf(stderr, "cache-suspend: suspend returned %d then %d (want 1 then 0)\n", (int) s1, (int) s2);
+        ok = false;
+    }
+    for (int i = 0; i < 4 && ok; i++) {
+        ok = compute_matches("cache-suspend", scheduler, fixture.graph, fixture.reference, step++);
+    }
+    ggml_backend_sched_moe_cache_resume(scheduler);
+    ggml_backend_sched_moe_cache_resume(scheduler); // not suspended: no-op
+    for (int i = 0; i < steps && ok; i++) {
+        ok = compute_matches("cache-suspend", scheduler, fixture.graph, fixture.reference, step++);
+    }
+    const size_t pools_after = count_occurrences(capture.get(), " pool[");
+    if (ok && pools_after <= pools_before) {
+        fprintf(stderr, "cache-suspend: no new pool after resume (%zu -> %zu)\n%s",
+                pools_before, pools_after, capture.get().c_str());
+        ok = false;
+    }
+    // a second cycle on the made-again session
+    if (ok && !ggml_backend_sched_moe_cache_suspend(scheduler)) {
+        fprintf(stderr, "cache-suspend: second suspend found no session\n");
+        ok = false;
+    }
+    ggml_backend_sched_moe_cache_resume(scheduler);
+    ggml_backend_sched_free(scheduler);
+    printf("cache-suspend: %s\n", ok ? "OK" : "FAIL");
+    return ok;
+}
+
 static bool run_fill_invalidation(
         ggml_backend_t gpu,
         ggml_backend_t cpu,
@@ -3361,6 +3414,7 @@ int main() {
         ok &= run_concurrent_sessions(
                 provider_device, gpu, cpu, stress, capture);
         ok &= run_repeated_lifecycle(gpu, cpu, stress, capture);
+        ok &= run_suspend_resume(gpu, cpu, stress, capture);
         ok &= run_fill_invalidation(gpu, cpu, stress, capture);
     }
     free_stress_fixture(stress);

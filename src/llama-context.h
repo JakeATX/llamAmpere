@@ -513,6 +513,7 @@ private:
     std::unique_ptr<llama_b1> b1;
     bool b1_env   = false; // LLAMA_B1 set
     bool b1_tried = false; // b1 construction attempted
+    bool b1_mc_suspended = false; // this call freed the MoE expert cache's pool (made again in b1_end)
     struct {
         bool          active = false;   // the graph being built is a B1 graph (memory already applied)
         int32_t       il0    = 0;
@@ -526,6 +527,8 @@ private:
     // runs layers [0, n_layer - 1) of every ubatch of the group that starts at ub0, then seeks back to ub0 with
     // the last layer's experts ready; false on failure (status set)
     bool b1_run_prefix(llama_memory_context_i * mctx, size_t ub0, ggml_status & status);
+    // ends the B1 call (b1->end) and gives the MoE expert cache back if the call suspended it
+    void b1_end(bool failed);
     int64_t b1_final_rows(int64_t n_out, int64_t n_tok) const;
 
     // host buffer for the model output (logits and embeddings)
