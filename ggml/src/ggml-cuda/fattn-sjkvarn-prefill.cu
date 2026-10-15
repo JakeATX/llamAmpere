@@ -2,6 +2,7 @@
 #include "fattn-common.cuh"
 #include "fattn-mma-f16.cuh"
 #include "fattn-i8qk.cuh"
+#include "fattn-prefill-policy.h"
 
 #include <cstdlib>
 
@@ -500,9 +501,18 @@ bool ggml_cuda_flash_attn_ext_sj_kvarn_prefill(ggml_backend_cuda_context & ctx, 
             }
         }
 
+        // [HQ4] the GQA-packing probe of the generic D256 route (GGML_CUDA_FA_PREFILL_NCOLS2, fattn-prefill-policy.h)
+        // also picks this expand-once route's tile: 2 = 32 queries x 2 heads, exact for GQA 6 (no padded heads);
+        // 1 = 64 queries x 1 head. Unset (or 8, or an arm that does not divide the GQA ratio) = the rule below.
+        const int hq4 = ggml_cuda_fa_prefill_ncols2_pick(ggml_cuda_fa_prefill_ncols2_env(), ggml_cuda_info().devices[ctx.device].cc,
+            256, 256, Q->ne[1], gqa, Q->ne[3] == 1, true);
         if (plan.i8qk && ggml_cuda_fattn_i8qk_applies_f16kv(ggml_cuda_info().devices[ctx.device].cc, &out)) {
             // [I8SJ] int8 Q.K on the expanded f16 K (v1 K prep: mean smoothing + per-token scale), f16 V read in place
             ggml_cuda_flash_attn_ext_i8qk(ctx, &out, 0, heads, (char *) scratch_ptr + plan.i8qk_offset, (half *) v.data);
+        } else if (hq4 == 2) {
+            ggml_cuda_flash_attn_ext_mma_f16_case<256, 256, 32, 2>(ctx, &out);
+        } else if (hq4 == 1) {
+            ggml_cuda_flash_attn_ext_mma_f16_case<256, 256, 64, 1>(ctx, &out);
         } else if (gqa > 4) {
             ggml_cuda_flash_attn_ext_mma_f16_case<256, 256, 8, 8>(ctx, &out);
         } else if (gqa > 2) {
