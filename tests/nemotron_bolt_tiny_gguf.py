@@ -8,7 +8,7 @@ loader, graph, KV-cache types, offload and slot save/restore paths can be
 tested on CPU without the 20 GB checkpoint.
 
 usage: nemotron_bolt_tiny_gguf.py OUT.gguf [--vocab-from REAL_BOLT.gguf] [--seed N]
-Without --vocab-from it writes a small byte-level BPE vocab (256 tokens).
+Without --vocab-from it writes a small byte-level BPE vocab (256 bytes, 3 merges, 3 specials).
 """
 import argparse, os, sys
 import numpy as np
@@ -58,10 +58,13 @@ def byte_vocab():
         if b not in bs:
             bs.append(b); cs.append(256 + n); n += 1
     toks = [chr(c) for c in cs]
+    # a few merges: the gpt2 tokenizer loader requires a non-empty merge list
+    merges = ["\u0120 t", "h e", "e r"]
+    toks += ["\u0120t", "he", "er"]
     toks += ["<unk>", "<s>", "</s>"]
-    types = [1] * 256 + [3, 3, 3]
-    return {"tokenizer.ggml.tokens": toks, "tokenizer.ggml.merges": [], "tokenizer.ggml.token_type": types,
-            "pre": "default", "eos": 258, "bos": 257, "chat_template": None}
+    types = [1] * 259 + [3, 3, 3]
+    return {"tokenizer.ggml.tokens": toks, "tokenizer.ggml.merges": merges, "tokenizer.ggml.token_type": types,
+            "pre": "default", "eos": 261, "bos": 260, "chat_template": None}
 
 
 def main():
