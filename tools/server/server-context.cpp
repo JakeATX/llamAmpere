@@ -4335,8 +4335,8 @@ private:
 
     // [#240] LLAMA_SJKVARN_EXACT_CKPT=1: SJ-KVaRN prompt checkpoints carry the seal state and the open staging rows
     // (LLAMA_STATE_SEQ_FLAGS_SJ_EXACT) and go where the f16 cache puts them (4 and 4 + n_ubatch tokens before the
-    // end, the last user message), instead of on the seal grid. A repeated prompt then resumes 4 tokens before its end
-    // and computes bit-identically to the first run; a different follow-up prompt resumed there computes like an f16
+    // end), on top of the plain grid checkpoints (kept for rollbacks into the middle of a long prompt). A repeated
+    // prompt then resumes 4 tokens before its end and computes bit-identically to the first run; a different follow-up prompt resumed there computes like an f16
     // cache resumed at that spot (not bit-identical to a cold prefill of it). Off (default): the grid rules of #197.
     bool sj_exact_ckpt() const {
         static const bool on = [] { const char * e = getenv("LLAMA_SJKVARN_EXACT_CKPT"); return e && e[0] == '1'; }();
@@ -4396,13 +4396,15 @@ private:
         return f;
     }
 
-    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
-        create_checkpoint_at(slot, slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
+    // [#240] exact = false: a plain grid checkpoint even when LLAMA_SJKVARN_EXACT_CKPT=1 (the long-prompt grid that keeps
+    // rollbacks into the middle of a prompt reachable)
+    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max, bool exact = true) {
+        create_checkpoint_at(slot, slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max, exact);
     }
 
     // a checkpoint of the first n_tokens_new tokens of the slot's prompt, from the live memory (or from an in-call
     // capture selected with llama_state_seq_capture_select)
-    void create_checkpoint_at(server_slot & slot, const int64_t n_tokens_new, llama_pos pos_min, llama_pos pos_max) {
+    void create_checkpoint_at(server_slot & slot, const int64_t n_tokens_new, llama_pos pos_min, llama_pos pos_max, bool exact = true) {
         // Slot restore can synthesize a checkpoint without an active inference task.
         const int id_task = slot.task ? slot.task->id : -1;
 
@@ -4462,12 +4464,13 @@ private:
         llama_synchronize(ctx_tgt); // (update_tgt syncs anyway) keep the previous batch's compute out of the copy time
         const int64_t t_ckpt_us = ggml_time_us();
         const bool had_spare = !slot.ckpt_spare.empty();
-        cur.update_tgt(ctx_tgt, slot.id, ckpt_flags(), &slot.ckpt_spare);
+        const llama_state_seq_flags flags = exact ? ckpt_flags() : LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+        cur.update_tgt(ctx_tgt, slot.id, flags, &slot.ckpt_spare);
         const bool reused = had_spare && slot.ckpt_spare.empty();
         if (ckpt_needs_dft()) {
             // [#240] the exact section rides on a hybrid drafter's recurrent state; a plain-KV drafter checkpoint
             // (LLAMA_CKPT_DFT_KV=1) keeps the whole cache as before
-            cur.update_dft(ctx_dft, slot.id, ctx_dft_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART ? ckpt_flags() : LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            cur.update_dft(ctx_dft, slot.id, ctx_dft_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART ? flags : LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         }
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
@@ -6038,8 +6041,11 @@ private:
                     // SJ-KVaRN: prompt checkpoints go on group boundaries only, at the boundary below each usual
                     // spot (last user message, 4 + n_ubatch and 4 tokens before the end), so an edit that reaches
                     // sealed rows restores the recurrent state where seq_rm can cut the sealed body
-                    // [#240] exact checkpoints (LLAMA_SJKVARN_EXACT_CKPT=1) use the f16 spots instead
-                    const bool sj_align = (params_base.sj_kvarn_bits_k > 0 || params_base.speculative.draft.sj_kvarn) && !sj_exact_ckpt();
+                    // [#240] exact checkpoints (LLAMA_SJKVARN_EXACT_CKPT=1) add the f16 spots (4 and 4 + n_ubatch
+                    // tokens before the end) on top of the grid, which stays (plain checkpoints) so that a rollback
+                    // into the middle of a long prompt still finds a checkpoint
+                    const bool sj_align = params_base.sj_kvarn_bits_k > 0 || params_base.speculative.draft.sj_kvarn;
+                    const bool sj_exact = sj_exact_ckpt();
                     const int64_t n_task = slot.task->n_tokens();
                     const int64_t ckpt_call0 = slot.prompt.n_tokens();
                     const bool ckpt_mtp_ranges = common_speculative_supports_process_range(spec.get());
@@ -6056,6 +6062,10 @@ private:
                             }
                         }
                         return f;
+                    };
+                    auto sj_exact_spot = [&](int64_t n) {
+                        return sj_exact && n > 0 && n < n_task &&
+                            (n == n_task - std::min<int64_t>(n_batch, 4) || n == n_task - std::min<int64_t>(n_batch, 4 + n_ubatch));
                     };
                     auto sj_ckpt_target = [&](int64_t n) {
                         if (n <= 0 || n >= n_task || sj_kvarn_ckpt_floor((llama_pos) n) != n) {
@@ -6178,7 +6188,7 @@ private:
                         //  - 4 + n_ubatch
                         //  - 4
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
-                        if (do_checkpoint && !sj_align) {
+                        if (do_checkpoint && (!sj_align || sj_exact)) {
                             static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
 
                             bool should_break = false;
@@ -6249,13 +6259,17 @@ private:
                     // do not checkpoint after mtmd chunks
                     do_checkpoint = do_checkpoint && !has_mtmd;
 
-                    if (sj_align) {
+                    bool ckpt_exact = true;
+                    if (sj_align && sj_exact_spot(n_tokens_start)) {
+                        // [#240] exact spot (seal state + open rows in the checkpoint)
+                    } else if (sj_align) {
                         // boundary checkpoints: the targeted spots, plus one per min step along a long prompt
                         do_checkpoint = do_checkpoint && n_tokens_start > 0 &&
                             sj_kvarn_ckpt_floor((llama_pos) n_tokens_start) == n_tokens_start && (
                                 sj_ckpt_target(n_tokens_start) ||
                                 slot.prompt.checkpoints.empty() ||
                                 n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
+                        ckpt_exact = false;
                     } else {
                         // no need to create checkpoints that are too close together, unless it's the last user message
                         do_checkpoint = do_checkpoint && (
@@ -6285,7 +6299,7 @@ private:
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
                     //       yet processed and therefore it is not part of the checkpoint.
                     if (do_checkpoint) {
-                        create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
+                        create_checkpoint(slot, n_tokens_cur, pos_min, pos_max, ckpt_exact);
                     }
                 }
 
@@ -6602,7 +6616,7 @@ private:
                     }
                     spec_processed = end;
                 }
-                create_checkpoint_at(*cslot, batch.ckpt_spots[k], p_min, p_max);
+                create_checkpoint_at(*cslot, batch.ckpt_spots[k], p_min, p_max, /*exact=*/ false); // [#240] in-call spots are seal-grid spots: plain
                 if (spot_handed && !cslot->prompt.checkpoints.empty()) {
                     cslot->prompt.checkpoints.back().data_spec = handoff.spot_state[k];
                 }
