@@ -555,7 +555,7 @@ class ModelBase:
                     pass
                 else:
                     raise NotImplementedError(f"Quant format {quant_format!r} for method {quant_method!r} is not yet supported")
-            elif quant_method == "modelopt":
+            elif quant_method in ("modelopt", "modelopt_mixed"):
                 # Mixed-precision ModelOpt models: NVFP4 tensors are handled by
                 # _generate_nvfp4_tensors; FP8 tensors have 1D weight_scale and
                 # are dequantized here. k/v scale tensors are unused.
