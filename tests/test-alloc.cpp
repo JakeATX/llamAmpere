@@ -725,7 +725,7 @@ static ggml_status scheduler_copy_graph_compute(ggml_backend_t backend, ggml_cgr
     state.queued.clear();
     for (int i = 0; i < graph->n_nodes; ++i) {
         ggml_tensor * node = graph->nodes[i];
-        if (ggml_is_view_op(node->op) || node->op == GGML_OP_NONE) {
+        if (ggml_is_view(node) || node->op == GGML_OP_NONE) {
             continue;
         }
         GGML_ASSERT(node->type == GGML_TYPE_F32);
@@ -758,7 +758,7 @@ static bool scheduler_copy_input(ggml_backend_t, const ggml_tensor * src, ggml_t
     state.queued.push_back({ dst, snapshot.data(), snapshot.size() });
     // Reuse the CPU input before the queued destination upload consumes its snapshot.
     const float overwritten[] = { -1000, -1000, -1000, -1000 };
-    ggml_backend_tensor_set((ggml_tensor *) src, overwritten, 0, sizeof(overwritten));
+    ggml_backend_tensor_set(src == state.input ? state.input : state.activation, overwritten, 0, sizeof(overwritten));
     return true;
 }
 
