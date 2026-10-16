@@ -5944,6 +5944,16 @@ private:
                         const int64_t n_end = std::min<int64_t>(slot.task->n_tokens(), ckpt_call0 + n_batch);
                         return ckpt_min_tail >= 0 && (n - ckpt_call0) % n_ubatch == 0 && n_end - n >= ckpt_min_tail;
                     };
+                    int64_t eval_cache_end = 0;
+                    if (eval_cache && eval_cache->writable && slot.task->params.eval_cache_save_at > 0 &&
+                            slot.task->type == SERVER_TASK_TYPE_COMPLETION && !input_tokens.has_mtmd && slot.prompt.n_tokens() == 0) {
+                        // Leave a logits tail and keep the cold prefill's physical batch and record boundaries.
+                        const int64_t at = std::min<int64_t>(slot.task->params.eval_cache_save_at, n_task - 1);
+                        eval_cache_end = sj_kvarn_ckpt_floor(at - at % n_ubatch);
+                        if (eval_cache_end > 0 && eval_cache->find(input_tokens.get_text_tokens(), eval_cache_end - 1) >= 0) {
+                            eval_cache_end = 0;
+                        }
+                    }
 
                     // add prompt tokens for processing in the current batch
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
@@ -5983,6 +5993,10 @@ private:
                             batch.set_decision_order(batch.size() - 1, slot.task->decision.order[slot.prompt.n_tokens()]);
                         }
                         slot.prompt.tokens.push_back(cur_tok);
+
+                        if (eval_cache_end > 0 && slot.prompt.n_tokens() == eval_cache_end) {
+                            break;
+                        }
 
                         if (do_checkpoint && sj_align) {
                             if (sj_ckpt_target(slot.prompt.n_tokens())) {
