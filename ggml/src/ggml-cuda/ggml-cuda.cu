@@ -5427,6 +5427,12 @@ static bool ggml_cuda_conv_ring_match_at(const ggml_cgraph * cgraph, int conv_id
     if (n_t < 1 || n_t > GGML_CUDA_CONV_RING_MAX_T) {
         return refuse("width");  // prefill ubatches: the unfused nodes
     }
+    // [#110 SF fold 2] Bound the byte strides passed as int to the conv kernels before multiplying dimensions.
+    const int64_t max_bytes     = std::numeric_limits<int>::max();
+    const int64_t channel_bytes = (d_conv - 1 + n_t) * sizeof(float);
+    if (ch <= 0 || ch > max_bytes / channel_bytes || n_s <= 0 || n_s > max_bytes / (channel_bytes * ch)) {
+        return refuse("size");
+    }
     if (ch % 128 != 0 || weight->ne[1] != ch || weight->nb[0] != sizeof(float) || weight->nb[1] % sizeof(float) != 0 ||
         conv->nb[0] != sizeof(float)) {
         return refuse("layout");
@@ -5438,6 +5444,13 @@ static bool ggml_cuda_conv_ring_match_at(const ggml_cgraph * cgraph, int conv_id
     if (!std::equal(ne_c.begin(), ne_c.end(), concat->ne) || !std::equal(ne_k.begin(), ne_k.end(), keep->ne) ||
         !std::equal(ne_x.begin(), ne_x.end(), xnew->ne) || keep->nb[0] != sizeof(float)) {
         return refuse("shape");
+    }
+    // Qwen supplies a dense transpose of [channels, tokens, sequences]. Other strided inputs fall back.
+    const bool x_transposed = xnew->nb[1] == sizeof(float) && xnew->nb[0] == ch * sizeof(float) &&
+                              xnew->nb[2] == n_t * ch * sizeof(float);
+    if (!ggml_is_contiguous(keep) || (!ggml_is_contiguous(xnew) && !x_transposed) ||
+        !ggml_is_contiguous(concat) || !ggml_is_contiguous(conv) || !ggml_is_contiguous(weight)) {
+        return refuse("non-dense operands");
     }
     if ((concat->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_cuda_gdn_state_read_uses(cgraph, concat) < 1) {
         return refuse("concat is an output / no use counts");
@@ -5493,7 +5506,8 @@ static bool ggml_cuda_conv_ring_match_at(const ggml_cgraph * cgraph, int conv_id
         if (n->op == GGML_OP_CPY && col >= 0) {
             const ggml_tensor * d = n->src[1];
             if (d->type != GGML_TYPE_F32 || d->ne[0] != row_count || d->ne[1] != n_s || d->ne[2] != 1 ||
-                d->ne[3] != 1 || d->nb[0] != sizeof(float) || d->nb[1] % sizeof(float) != 0 || !sink(n)) {
+                d->ne[3] != 1 || d->nb[0] != sizeof(float) || d->nb[1] < row_count * sizeof(float) ||
+                d->nb[1] % sizeof(float) != 0 || !sink(n)) {
                 return refuse("window copy layout");
             }
             if (m.n_win == GGML_CUDA_CONV_RING_MAX_WIN) {
@@ -5519,8 +5533,8 @@ static bool ggml_cuda_conv_ring_match_at(const ggml_cgraph * cgraph, int conv_id
             if (it != conts.end()) {
                 const ggml_tensor * a    = n->src[2];
                 const ggml_tensor * rows = n->src[1];
-                if (a->type != GGML_TYPE_F32 || a->ne[0] != row_count || a->ne[2] != 1 || a->ne[3] != 1 ||
-                    a->nb[0] != sizeof(float) || a->nb[1] % sizeof(float) != 0 ||
+                if (a->type != GGML_TYPE_F32 || a->ne[0] != row_count || a->ne[1] < 1 || a->ne[2] != 1 || a->ne[3] != 1 ||
+                    a->nb[0] != sizeof(float) || a->nb[1] < row_count * sizeof(float) || a->nb[1] % sizeof(float) != 0 ||
                     rows->type != GGML_TYPE_I32 || rows->ne[0] != n_s || rows->ne[1] != 1 || rows->ne[2] != 1 ||
                     rows->ne[3] != 1 || rows->nb[0] != sizeof(int32_t) || !sink(n)) {
                     return refuse("window set_rows layout");
@@ -5543,13 +5557,12 @@ static bool ggml_cuda_conv_ring_match_at(const ggml_cgraph * cgraph, int conv_id
     if (ggml_cuda_gdn_state_read_uses(cgraph, concat) != n_views + 1 || n_views != m.n_win) {
         return refuse("concat has other readers");
     }
-
     m.last_idx = conv_idx;
     if (conv_idx + 1 < cgraph->n_nodes) {
         const ggml_tensor * n1 = cgraph->nodes[conv_idx + 1];
         if (n1->op == GGML_OP_UNARY && ggml_get_unary_op(n1) == GGML_UNARY_OP_SILU && n1->src[0] == conv) {
             m.last_idx = conv_idx + 1;
-        } else if (n1->op == GGML_OP_ADD && conv_idx + 2 < cgraph->n_nodes) {
+        } else if (n1->op == GGML_OP_ADD && (n1->src[0] == conv || n1->src[1] == conv) && conv_idx + 2 < cgraph->n_nodes) {
             const ggml_tensor * n2 = cgraph->nodes[conv_idx + 2];
             if (n2->op == GGML_OP_UNARY && ggml_get_unary_op(n2) == GGML_UNARY_OP_SILU && n2->src[0] == n1) {
                 m.last_idx = conv_idx + 2;
@@ -5565,6 +5578,10 @@ static bool ggml_cuda_conv_ring_check(const ggml_cgraph * cgraph, int conv_idx, 
     const ggml_tensor * conv = cgraph->nodes[conv_idx];
     std::vector<const ggml_tensor *> reads  = { m.concat->src[0], m.concat->src[1], conv->src[1] };
     std::vector<const ggml_tensor *> writes;
+    if (m.last_idx == conv_idx + 2) {
+        const ggml_tensor * add = cgraph->nodes[conv_idx + 1];
+        reads.push_back(add->src[0] == conv ? add->src[1] : add->src[0]);
+    }
     for (int k = 0; k < m.n_win; ++k) {
         writes.push_back(m.win[k].dst);
         if (m.win[k].rows != nullptr) {
@@ -5591,9 +5608,18 @@ static bool ggml_cuda_conv_ring_check(const ggml_cgraph * cgraph, int conv_idx, 
             return false;
         }
     }
+    for (size_t k = 0; k < writes.size(); ++k) {
+        for (size_t j = 0; j < k; ++j) {
+            if (ggml_cuda_gdn_state_read_overlap(writes[k], writes[j]) &&
+                (conv->ne[2] != 1 || writes[k]->data != writes[j]->data || writes[k]->nb[1] != writes[j]->nb[1])) {
+                m.why = "windows overlap across channels or sequences";
+                return false;
+            }
+        }
+    }
     for (int j = conv_idx; j <= m.last_idx; ++j) {
         const ggml_tensor * out = cgraph->nodes[j];
-        if (out->data == nullptr || any_overlap(out, reads) || any_overlap(out, writes)) {
+        if (!ggml_is_contiguous(out) || out->data == nullptr || any_overlap(out, reads) || any_overlap(out, writes)) {
             m.why = "ssm_conv output overlaps its operands";
             return false;
         }

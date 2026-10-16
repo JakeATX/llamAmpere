@@ -6043,9 +6043,10 @@ struct test_gated_delta_net_state_read : public test_case {
 // reads the two CONCAT operands and writes the windows itself (counter "conv_ring"). The graph also carries an
 // unfused copy of the same pattern on its own cache (its CONCAT is a graph output, which refuses the fold), and the
 // checked nodes are the differences fused - unfused of the conv output and of the whole cache after both wrote it:
-// each must be exactly zero (byte identity on the tested backend), next to the usual CPU comparison of the output.
+// each must be exactly zero (exact finite values on the tested backend), next to the usual CPU comparison of the output.
 struct test_conv_ring : public test_case {
     enum window_mode { WM_RING = 0, WM_STATIC = 1 };
+    enum guard_mode { GM_NONE = 0, GM_PADDED_INPUT, GM_EXTRA_READER, GM_CACHE_BIAS, GM_SHIFTED_WINDOWS };
 
     const int64_t channels;
     const int64_t n_t;
@@ -6057,6 +6058,7 @@ struct test_conv_ring : public test_case {
     const std::vector<int32_t> dst_rows;  // WM_RING: cache row per (window, sequence), window-major; WM_STATIC: { kv_head }
     const bool    reader_between;      // a GET_ROWS of the cache between the windows and the ssm_conv (must refuse)
     const bool    expect_fusion;
+    const int     guard;
 
     static constexpr int64_t d_conv   = 4;
     static constexpr int64_t mem_size = 4;  // cache rows per plane
@@ -6075,15 +6077,15 @@ struct test_conv_ring : public test_case {
 
     std::string vars() override {
         return VARS_TO_STR8(channels, n_t, n_s, K, wmode, rollback, reader_between, expect_fusion) +
-               ",src_rows=" + rows_str(src_rows) + ",dst_rows=" + rows_str(dst_rows);
+               ",src_rows=" + rows_str(src_rows) + ",dst_rows=" + rows_str(dst_rows) + "," + VAR_TO_STR(guard);
     }
 
     test_conv_ring(int64_t channels, int64_t n_t, int64_t n_s, int64_t K, int wmode, int64_t rollback,
                    std::vector<int32_t> src_rows, std::vector<int32_t> dst_rows,
-                   bool reader_between = false, bool expect_fusion = true)
+                   bool reader_between = false, bool expect_fusion = true, int guard = GM_NONE)
         : channels(channels), n_t(n_t), n_s(n_s), K(K), wmode(wmode), rollback(rollback),
           src_rows(std::move(src_rows)), dst_rows(std::move(dst_rows)),
-          reader_between(reader_between), expect_fusion(expect_fusion) {}
+          reader_between(reader_between), expect_fusion(expect_fusion), guard(guard) {}
 
     int64_t n_written() const { return std::min<int64_t>(n_t, K); }
 
@@ -6116,7 +6118,8 @@ struct test_conv_ring : public test_case {
                 const int64_t s_slot = K - t;
                 ggml_tensor * win = ggml_view_3d(ctx, conv_input, d_conv - 1, channels, n_s,
                                                  conv_input->nb[1], conv_input->nb[2], ggml_row_size(GGML_TYPE_F32, s_idx));
-                ggml_tensor * upd = ggml_view_2d(ctx, all, row_count, n_s, all->nb[1], (s_slot * mem_size + kv_head) * row_size);
+                const size_t offset = guard == GM_SHIFTED_WINDOWS ? (size_t) s_slot * sizeof(float) : s_slot * mem_size * row_size;
+                ggml_tensor * upd = ggml_view_2d(ctx, all, row_count, n_s, all->nb[1], kv_head * row_size + offset);
                 ggml_build_forward_expand(gf, ggml_cpy(ctx, win, upd));
             }
         }
@@ -6129,7 +6132,22 @@ struct test_conv_ring : public test_case {
             ggml_build_forward_expand(gf, *reader_out);
         }
 
-        return ggml_silu(ctx, ggml_ssm_conv(ctx, conv_input, weight));
+        if (guard == GM_EXTRA_READER) {
+            ggml_tensor * reader = ggml_sum(ctx, conv_input);
+            ggml_set_output(reader);
+            ggml_build_forward_expand(gf, reader);
+            check_nodes.push_back(reader);
+        }
+        ggml_tensor * bias = nullptr;
+        if (guard == GM_CACHE_BIAS) {
+            bias = ggml_view_1d(ctx, all, channels, dst_rows[0] * row_size);
+            ggml_build_forward_expand(gf, bias);
+        }
+        ggml_tensor * out = ggml_ssm_conv(ctx, conv_input, weight);
+        if (bias != nullptr) {
+            out = ggml_add(ctx, out, bias);
+        }
+        return ggml_silu(ctx, out);
     }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
@@ -6147,8 +6165,11 @@ struct test_conv_ring : public test_case {
         ggml_set_name(cache_ref, "conv_cache_ref");
         ggml_tensor * s_copy = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_s);
         ggml_set_name(s_copy, "s_copy");
-        ggml_tensor * qkv = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, channels, n_t, n_s);
+        ggml_tensor * qkv = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, channels + (guard == GM_PADDED_INPUT ? 128 : 0), n_t, n_s);
         ggml_set_name(qkv, "qkv");
+        if (guard == GM_PADDED_INPUT) {
+            qkv = ggml_view_3d(ctx, qkv, channels, n_t, n_s, qkv->nb[1], qkv->nb[2], 0);
+        }
         ggml_tensor * weight = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, channels);
         ggml_set_name(weight, "conv_weight");
         std::vector<ggml_tensor *> rows;
@@ -6209,7 +6230,7 @@ struct test_conv_ring : public test_case {
     const char * forbidden_fusion() override { return expect_fusion && conv_ring_on() ? nullptr : "conv_ring"; }
 
     // the diff nodes are exactly zero on the reference backend: any nonzero (or NaN) element on the tested one
-    // is a byte mismatch between the fused and the unfused path and counts as an error
+    // is a value mismatch between the fused and the unfused path and counts as an error
     double err(const float * a, const float * b, size_t n) override {
         bool ref_zero = true;
         for (size_t i = 0; i < n && ref_zero; ++i) {
@@ -16134,7 +16155,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // [#110] conv ring read in place (GGML_VL_SF_CONVRING=1 folds CONCAT + windows into the ssm_conv on CUDA).
-    // cache: K planes of 4 cells, row = plane * 4 + cell; checks fused == unfused bytes for output and cache.
+    // cache: K planes of 4 cells, row = plane * 4 + cell; checks exact finite output and cache values.
     {
         using t = test_conv_ring;
         // production shape (10240 channels, K 5): w1 on the ring, w5 static (slot 0 is the source row)
@@ -16145,7 +16166,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         // in place: the w1 window rewrites the row the gather read
         test_cases.emplace_back(new t(256, 1, 1, 5, t::WM_RING, 0, { 1 }, { 1 }));
         // two sequences whose rows swap
-        test_cases.emplace_back(new t(256, 2, 2, 5, t::WM_RING, 0, { 2, 1 }, { 1, 2, 6, 5 }));
+        test_cases.emplace_back(new t(256, 2, 2, 5, t::WM_RING, 0, { 2, 1 }, { 1, 2, 6, 5 }, false, false));
         test_cases.emplace_back(new t(256, 4, 2, 5, t::WM_STATIC, 0, { 3, 2 }, { 2 }));
         // widest ubatch (8 windows at K 8), K 1 (n_rs_seq 0: one window at column n_t)
         test_cases.emplace_back(new t(256, 8, 1, 8, t::WM_STATIC, 0, { 1 }, { 1 }));
@@ -16153,6 +16174,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         // guards: a cache reader between the windows and the ssm_conv, and a 9-token ubatch, must refuse
         test_cases.emplace_back(new t(256, 1, 1, 5, t::WM_RING, 0, { 1 }, { 5 }, true, false));
         test_cases.emplace_back(new t(256, 9, 1, 5, t::WM_STATIC, 0, { 1 }, { 1 }, false, false));
+        // [#110 SF fold 2] Each scatter has unique rows, but successive windows swap sequence ownership.
+        test_cases.emplace_back(new t(256, 2, 2, 5, t::WM_RING, 0, { 2, 1 }, { 5, 6, 6, 5 }, false, false));
+        test_cases.emplace_back(new t(256, 1, 2, 5, t::WM_RING, 0, { 2, 1 }, { 5, 6 }));
+        test_cases.emplace_back(new t(256, 2, 1, 5, t::WM_RING, 0, { 1 }, { 5, 9 }, false, false, t::GM_PADDED_INPUT));
+        test_cases.emplace_back(new t(256, 1, 1, 5, t::WM_RING, 0, { 1 }, { 5 }, false, false, t::GM_EXTRA_READER));
+        test_cases.emplace_back(new t(256, 1, 1, 5, t::WM_RING, 0, { 1 }, { 5 }, false, false, t::GM_CACHE_BIAS));
+        test_cases.emplace_back(new t(256, 2, 1, 5, t::WM_STATIC, 0, { 1 }, { 1 }, false, false, t::GM_SHIFTED_WINDOWS));
     }
 
 #if 0
