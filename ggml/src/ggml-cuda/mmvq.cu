@@ -3348,3 +3348,128 @@ void ggml_cuda_moe_cache_mmv_fused(
     }
 #undef MOE_CACHE_MMV_FUSED_CASE
 }
+
+// fork: keep the ordinary MMVQ lane partition and reductions when the expert outputs stay in shared memory.
+template <ggml_type type>
+static __global__ void mul_mat_vec_q_moe_sum(
+        const void * matrix, const block_q8_1 * activation, const int32_t * ids,
+        const float * weights, const float * scales, float * dst,
+        const int ncols, const int nrows, const int nexperts, const int nselected,
+        const int64_t stride_row, const int64_t stride_expert, const int stride_activation) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps = calc_nwarps(type, 1, MMVQ_PARAMETERS_GENERIC);
+    constexpr int rows = 4;
+    constexpr int parallel = 2;
+    constexpr int qk = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr = get_vdr_mmvq(type);
+    constexpr int blocks_per_iter = vdr * nwarps * warp_size / qi;
+    constexpr auto vec_dot = get_vec_dot_q_cuda(type);
+    const int slot_local = threadIdx.y / nwarps;
+    const int warp = threadIdx.y % nwarps;
+    const int tid = warp * warp_size + threadIdx.x;
+    const int row0 = blockIdx.x * rows;
+    __shared__ float partial[parallel][nwarps - 1 > 0 ? nwarps - 1 : 1][rows][warp_size];
+    __shared__ float weighted[32][rows];
+
+    for (int slot0 = 0; slot0 < nselected; slot0 += parallel) {
+        const int slot = slot0 + slot_local;
+        const int expert = slot < nselected ? ids[slot] : -1;
+        float sums[rows] = {};
+        if (expert >= 0 && expert < nexperts) {
+            const block_q8_1 * y = activation + slot * stride_activation;
+            for (int kbx = tid / (qi / vdr); kbx < ncols / qk; kbx += blocks_per_iter) {
+                const int kby = kbx * (qk / QK8_1);
+                const int kqs = vdr * (tid % (qi / vdr));
+#pragma unroll
+                for (int row = 0; row < rows; ++row) {
+                    if (row0 + row < nrows) {
+                        sums[row] += vec_dot(matrix, y + kby,
+                                expert * stride_expert + (row0 + row) * stride_row + kbx, kqs);
+                    }
+                }
+            }
+        }
+        if (warp > 0) {
+#pragma unroll
+            for (int row = 0; row < rows; ++row) {
+                partial[slot_local][warp - 1][row][threadIdx.x] = sums[row];
+            }
+        }
+        __syncthreads();
+        if (warp == 0) {
+#pragma unroll
+            for (int row = 0; row < rows; ++row) {
+#pragma unroll
+                for (int w = 0; w < nwarps - 1; ++w) {
+                    sums[row] += partial[slot_local][w][row][threadIdx.x];
+                }
+                const float value = warp_reduce_sum<warp_size>(sums[row]);
+                if (threadIdx.x == 0 && slot < nselected) {
+                    const float scaled = scales ? __fmul_rn(value, scales[slot]) : value;
+                    weighted[slot][row] = __fmul_rn(scaled, weights[slot]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+    if (threadIdx.y == 0) {
+#pragma unroll
+        for (int row = 0; row < rows; ++row) {
+            // SUM_ROWS assigns one selected expert to each lane for top-k <= 32.
+            float value = threadIdx.x < nselected ? __fadd_rn(0.0f, weighted[threadIdx.x][row]) : 0.0f;
+            value = warp_reduce_sum<warp_size>(value);
+            if (threadIdx.x == 0 && row0 + row < nrows) {
+                dst[row0 + row] = value;
+            }
+        }
+    }
+}
+
+bool ggml_cuda_moe_sum_type_supported(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q2_0:
+        case GGML_TYPE_PQ2_0:
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ2_S:
+            return true;
+        default:
+            return false;
+    }
+}
+
+void ggml_cuda_mul_mat_vec_q_moe_sum(ggml_backend_cuda_context & ctx,
+        const ggml_tensor * matrix, const ggml_tensor * activation, const ggml_tensor * ids,
+        const ggml_tensor * weights, const ggml_tensor * scales, ggml_tensor * dst) {
+    const int64_t padded = GGML_PAD(activation->ne[0], MATRIX_ROW_PADDING);
+    const size_t q8_bytes = padded * activation->ne[1] * sizeof(block_q8_1) / QK8_1;
+    ggml_cuda_pool_alloc<char> q8(ctx.pool(), q8_bytes);
+    quantize_row_q8_1_cuda((const float *) activation->data, nullptr, q8.get(), matrix->type,
+            activation->ne[0], activation->nb[1] / sizeof(float), activation->nb[2] / sizeof(float),
+            activation->nb[3] / sizeof(float), padded, activation->ne[1], 1, 1, ctx.stream());
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    GGML_ASSERT(cc == 800 || cc == 860);
+    const dim3 blocks((matrix->ne[1] + 3) / 4);
+#define MOE_SUM_CASE(type_name) \
+    case type_name: { \
+        const dim3 threads(ggml_cuda_info().devices[ctx.device].warp_size, 2 * calc_nwarps(type_name, 1, MMVQ_PARAMETERS_GENERIC)); \
+        mul_mat_vec_q_moe_sum<type_name><<<blocks, threads, 0, ctx.stream()>>>( \
+            matrix->data, (const block_q8_1 *) q8.get(), (const int32_t *) ids->data, \
+            (const float *) weights->data, scales ? (const float *) scales->data : nullptr, (float *) dst->data, \
+            matrix->ne[0], matrix->ne[1], matrix->ne[2], ids->ne[0], \
+            matrix->nb[1] / ggml_type_size(type_name), matrix->nb[2] / ggml_type_size(type_name), padded / QK8_1); \
+        break; \
+    }
+    switch (matrix->type) {
+        MOE_SUM_CASE(GGML_TYPE_Q2_0)
+        MOE_SUM_CASE(GGML_TYPE_PQ2_0)
+        MOE_SUM_CASE(GGML_TYPE_Q2_K)
+        MOE_SUM_CASE(GGML_TYPE_IQ2_XXS)
+        MOE_SUM_CASE(GGML_TYPE_IQ2_XS)
+        MOE_SUM_CASE(GGML_TYPE_IQ2_S)
+        default: GGML_ABORT("unsupported MoE reduction type");
+    }
+#undef MOE_SUM_CASE
+}

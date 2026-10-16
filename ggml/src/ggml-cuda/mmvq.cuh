@@ -74,3 +74,9 @@ bool ggml_cuda_moe_table_mmv_grouped_try(ggml_backend_cuda_context & ctx,
         const void * const * table, const void * const * gate_table, ggml_type type,
         const char * act_q8, const int32_t * ids, float * dst,
         int64_t n_in, int64_t n_out, int64_t n_ids, int64_t n_tokens, int64_t channels, int64_t ids_stride);
+// Selected-expert decode down projection and router-weighted reduction.
+bool ggml_cuda_moe_sum_type_supported(ggml_type type);
+
+void ggml_cuda_mul_mat_vec_q_moe_sum(ggml_backend_cuda_context & ctx,
+    const ggml_tensor * matrix, const ggml_tensor * activation, const ggml_tensor * ids,
+    const ggml_tensor * weights, const ggml_tensor * scales, ggml_tensor * dst);

@@ -1749,6 +1749,7 @@ struct test_case {
         ggml_context_ptr ctx_weights(use_weights ? ggml_init(params) : nullptr);
         GGML_ASSERT(!use_weights || ctx_weights);
 
+        gf = ggml_new_graph_custom(ctx.get(), graph_nodes, false);
         ggml_tensor * out             = build_graph(ctx.get(), ctx_weights.get());
         current_op_name               = op_desc(out);
         if (!matches_filter(out, op_names_filter)) {
@@ -1792,7 +1793,6 @@ struct test_case {
         }
 
         // build graph
-        ggml_cgraph * gf = ggml_new_graph_custom(ctx.get(), graph_nodes, false);
         ggml_build_forward_expand(gf, out);
         if (perf_whole_graph()) {
             static std::atomic<uint64_t> next_uid { 1ULL << 63 };
@@ -1823,6 +1823,9 @@ struct test_case {
             const size_t target_size_gpu = 32 * GB;
             size_t target_size = is_cpu ? target_size_cpu : target_size_gpu;
             n_runs = (int)std::min<int64_t>(ggml_graph_size(gf) - ggml_graph_n_nodes(gf), target_size / op_size(out)) + 1;
+        }
+        if (run_whole_graph()) {
+            n_runs = 1;
         }
 
         if (perf_whole_graph() || !perf_repeats_output()) {
@@ -5309,6 +5312,134 @@ struct test_ssm_conv_bias_silu : public test_case {
 
         ggml_set_name(out, "out");
         return out;
+    }
+};
+
+// Nemotron-H decode graph, including writes to the existing recurrent cache layout.
+struct test_nemotron_ssm_decode : public test_case {
+    const int64_t d_state;
+    const int64_t n_seqs;
+    const bool with_bias;
+    const bool cache_same_row;
+    const bool expose_scan;
+    static constexpr int64_t head_dim = 64;
+    static constexpr int64_t n_head = 128;
+    static constexpr int64_t n_group = 8;
+    static constexpr int64_t d_inner = head_dim * n_head;
+    static constexpr int64_t state_slots = 4;
+    std::vector<ggml_tensor *> checked;
+
+    test_nemotron_ssm_decode(int64_t d_state, int64_t n_seqs, bool with_bias, bool cache_same_row = false, bool expose_scan = false)
+        : d_state(d_state), n_seqs(n_seqs), with_bias(with_bias), cache_same_row(cache_same_row), expose_scan(expose_scan) {}
+
+    std::string vars() override { return VARS_TO_STR5(d_state, n_seqs, with_bias, cache_same_row, expose_scan); }
+    std::string op_desc(ggml_tensor *) override { return "NEMOTRON_SSM_DECODE"; }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 2e-7; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return checked; }
+
+    bool fusion_enabled() const {
+        const char * env = getenv("GGML_CUDA_NEMOTRON_SSM");
+        return env != nullptr && strcmp(env, "1") == 0;
+    }
+    const char * required_fusion() override { return n_seqs == 1 && !expose_scan && fusion_enabled() ? "nemotron_ssm" : nullptr; }
+    const char * forbidden_fusion() override { return n_seqs != 1 || expose_scan || !fusion_enabled() ? "nemotron_ssm" : nullptr; }
+
+    size_t op_size(ggml_tensor *) override {
+        return 2 * sizeof(float) * n_seqs * (d_state * d_inner + 3 * (d_inner + 2 * n_group * d_state));
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        checked.clear();
+        const int64_t channels = d_inner + 2 * n_group * d_state;
+        const int64_t conv_rows = 3 * channels;
+        const int64_t state_rows = d_state * d_inner;
+        const int64_t proj_rows = 2 * d_inner + 2 * n_group * d_state + n_head;
+        ggml_tensor * conv_cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, conv_rows, state_slots);
+        ggml_tensor * ssm_cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, state_rows, state_slots);
+        ggml_tensor * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seqs);
+        ggml_set_name(conv_cache, "nemotron_conv_cache");
+        ggml_set_name(ssm_cache, "nemotron_ssm_cache");
+        ggml_set_name(ids, "nemotron_state_ids");
+
+        ggml_tensor * conv = ggml_reshape_3d(ctx, ggml_get_rows(ctx, conv_cache, ids), 3, channels, n_seqs);
+        ggml_tensor * proj = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, proj_rows, 1, n_seqs);
+        ggml_tensor * z = ggml_view_4d(ctx, proj, head_dim, n_head, 1, n_seqs,
+                                      head_dim * proj->nb[0], proj->nb[1], proj->nb[2], 0);
+        ggml_tensor * xbc = ggml_view_3d(ctx, proj, channels, 1, n_seqs, proj->nb[1], proj->nb[2], d_inner * sizeof(float));
+        ggml_tensor * dt = ggml_view_3d(ctx, proj, n_head, 1, n_seqs, proj->nb[1], proj->nb[2], (d_inner + channels) * sizeof(float));
+        ggml_tensor * conv_x = ggml_concat(ctx, conv, ggml_transpose(ctx, xbc), 0);
+        ggml_tensor * last_conv = ggml_view_3d(ctx, conv_x, 3, channels, n_seqs, conv_x->nb[1], conv_x->nb[2], sizeof(float));
+        ggml_tensor * conv_dst = ggml_view_2d(ctx, conv_cache, conv_rows, n_seqs, conv_cache->nb[1], conv_cache->nb[1]);
+        ggml_tensor * conv_cpy = ggml_cpy(ctx, last_conv, conv_dst);
+        ggml_build_forward_expand(gf, conv_cpy);
+        checked.push_back(conv_cpy);
+
+        ggml_tensor * conv_w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, channels);
+        xbc = ggml_ssm_conv(ctx, conv_x, conv_w);
+        if (with_bias) {
+            xbc = ggml_add(ctx, xbc, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, channels));
+        }
+        xbc = ggml_silu(ctx, xbc);
+        ggml_tensor * x = ggml_view_4d(ctx, xbc, head_dim, n_head, 1, n_seqs,
+                                      head_dim * xbc->nb[0], xbc->nb[1], xbc->nb[2], 0);
+        ggml_tensor * B = ggml_view_4d(ctx, xbc, d_state, n_group, 1, n_seqs,
+                                      d_state * xbc->nb[0], xbc->nb[1], xbc->nb[2], d_inner * sizeof(float));
+        ggml_tensor * C = ggml_view_4d(ctx, xbc, d_state, n_group, 1, n_seqs,
+                                      d_state * xbc->nb[0], xbc->nb[1], xbc->nb[2], (d_inner + n_group * d_state) * sizeof(float));
+        dt = ggml_add(ctx, ggml_cont(ctx, dt), ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_head));
+        ggml_tensor * A = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, n_head);
+        ggml_tensor * D = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, n_head);
+        ggml_set_name(A, "nemotron_A");
+        ggml_tensor * state = ggml_reshape_4d(ctx, ssm_cache, d_state, head_dim, n_head, state_slots);
+        ggml_tensor * scan = ggml_ssm_scan(ctx, state, x, dt, A, B, C, ids, 1);
+        if (expose_scan) {
+            ggml_set_output(scan);
+            checked.push_back(scan);
+        }
+        ggml_tensor * last_ssm = ggml_view_3d(ctx, scan, state_rows, n_seqs, 1,
+                                            state_rows * sizeof(float), state_rows * n_seqs * sizeof(float), d_inner * n_seqs * sizeof(float));
+        ggml_tensor * ssm_dst = ggml_view_3d(ctx, ssm_cache, state_rows, n_seqs, 1,
+                                           ssm_cache->nb[1], state_slots * ssm_cache->nb[1], ssm_cache->nb[1]);
+        ggml_tensor * ssm_cpy = ggml_cpy(ctx, last_ssm, ssm_dst);
+        ggml_build_forward_expand(gf, ssm_cpy);
+        checked.push_back(ssm_cpy);
+        ggml_tensor * y = ggml_view_4d(ctx, scan, head_dim, n_head, 1, n_seqs,
+                                      head_dim * sizeof(float), d_inner * sizeof(float), d_inner * sizeof(float), 0);
+        y = ggml_add(ctx, y, ggml_mul(ctx, x, D));
+        y = ggml_swiglu_split(ctx, ggml_cont(ctx, z), y);
+        checked.push_back(y);
+        y = ggml_reshape_4d(ctx, y, d_inner / n_group, n_group, 1, n_seqs);
+        y = ggml_mul(ctx, ggml_rms_norm(ctx, y, 1e-5f), ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_inner / n_group, n_group));
+        checked.push_back(y);
+        if (mode != MODE_PERF) {
+            ggml_build_forward_expand(gf, y);
+            for (ggml_tensor * cache : {conv_cache, ssm_cache}) {
+                ggml_tensor * snapshot = ggml_dup(ctx, cache);
+                ggml_build_forward_expand(gf, snapshot);
+                checked.push_back(snapshot);
+            }
+        }
+        return y;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) {
+                continue;
+            }
+            if (strcmp(t->name, "nemotron_state_ids") == 0) {
+                std::vector<int32_t> ids(n_seqs);
+                for (int64_t i = 0; i < n_seqs; ++i) {
+                    ids[i] = (cache_same_row ? 1 : 2) + i;
+                }
+                ggml_backend_tensor_set(t, ids.data(), 0, ids.size() * sizeof(int32_t));
+            } else if (strcmp(t->name, "nemotron_A") == 0) {
+                init_tensor_uniform(t, -1.0f, -0.5f);
+            } else {
+                init_tensor_uniform(t, -0.5f, 0.5f);
+            }
+        }
     }
 };
 
@@ -10565,6 +10696,164 @@ struct test_moe_reduce_fusion : public test_case {
     }
 };
 
+struct test_nemotron_moe_decode : public test_case {
+    const ggml_type type;
+    const int64_t n_ff;
+    const int64_t n_out;
+    const int64_t n_used;
+    const int64_t n_tokens;
+    const bool with_scale;
+    const bool with_shared;
+    const bool expose_down;
+    static constexpr int64_t n_expert = 512;
+    std::vector<ggml_tensor *> checked;
+
+    test_nemotron_moe_decode(ggml_type type, int64_t n_ff, int64_t n_out, int64_t n_used,
+                            int64_t n_tokens = 1, bool with_scale = false, bool with_shared = false, bool expose_down = false)
+        : type(type), n_ff(n_ff), n_out(n_out), n_used(n_used), n_tokens(n_tokens),
+          with_scale(with_scale), with_shared(with_shared), expose_down(expose_down) {}
+
+    std::string vars() override { return VARS_TO_STR8(type, n_ff, n_out, n_used, n_tokens, with_scale, with_shared, expose_down); }
+    std::string op_desc(ggml_tensor *) override { return "NEMOTRON_MOE_DECODE"; }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return checked; }
+    uint64_t op_flops(ggml_tensor *) override { return 2 * n_ff * n_out * n_used * n_tokens; }
+    size_t op_size(ggml_tensor *) override { return ggml_row_size(type, n_ff) * n_out * n_used; }
+
+    bool fusion_expected() const {
+        const char * env = getenv("GGML_CUDA_NEMOTRON_MOE");
+        return env != nullptr && strcmp(env, "1") == 0 && type != GGML_TYPE_F32 && n_tokens == 1 && !expose_down;
+    }
+    const char * required_fusion() override { return fusion_expected() ? "nemotron_moe" : nullptr; }
+    const char * forbidden_fusion() override { return fusion_expected() ? nullptr : "nemotron_moe"; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        checked.clear();
+        ggml_tensor * logits = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_expert, n_tokens);
+        ggml_tensor * bias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_expert);
+        ggml_tensor * probs = ggml_sigmoid(ctx, logits);
+        ggml_tensor * selected = ggml_argsort_top_k(ctx, ggml_add(ctx, probs, bias), n_used);
+        ggml_tensor * weights = ggml_get_rows(ctx, ggml_reshape_3d(ctx, probs, 1, n_expert, n_tokens), selected);
+        weights = ggml_reshape_2d(ctx, weights, n_used, n_tokens);
+        weights = ggml_div(ctx, weights, ggml_clamp(ctx, ggml_sum_rows(ctx, weights), 6.103515625e-5f, INFINITY));
+        weights = ggml_scale(ctx, ggml_reshape_3d(ctx, weights, 1, n_used, n_tokens), 5.0f);
+        ggml_build_forward_expand(gf, weights);
+        checked.push_back(selected);
+        checked.push_back(weights);
+
+        ggml_tensor * scales = nullptr;
+        if (with_scale) {
+            ggml_tensor * s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_expert);
+            scales = ggml_get_rows(ctx, ggml_repeat_4d(ctx, ggml_reshape_3d(ctx, s, 1, n_expert, 1), 1, n_expert, n_tokens, 1), selected);
+            ggml_build_forward_expand(gf, scales);
+        }
+        // The input is the selected experts' RELU_SQR activation, after the grouped up projection.
+        ggml_tensor * activation = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_ff, n_used, n_tokens);
+        activation = ggml_sqr(ctx, ggml_relu(ctx, activation));
+        ggml_tensor * down_w = ggml_new_tensor_3d(ctx, type, n_ff, n_out, n_expert);
+        ggml_set_name(down_w, "nemotron_down_weights");
+        ggml_tensor * down = ggml_mul_mat_id(ctx, down_w, activation, selected);
+        if (expose_down) {
+            ggml_set_output(down);
+            checked.push_back(down);
+        }
+        if (scales != nullptr) {
+            down = ggml_mul(ctx, down, scales);
+        }
+        ggml_tensor * experts = ggml_mul(ctx, down, weights);
+        ggml_tensor * out;
+        if (n_tokens == 1) {
+            out = ggml_cont(ctx, ggml_permute(ctx, experts, 1, 0, 2, 3));
+            out = ggml_reshape_2d(ctx, ggml_sum_rows(ctx, out), n_out, n_tokens);
+        } else {
+            out = ggml_view_2d(ctx, experts, n_out, n_tokens, experts->nb[2], 0);
+            for (int64_t i = 1; i < n_used; ++i) {
+                out = ggml_add(ctx, out, ggml_view_2d(ctx, experts, n_out, n_tokens, experts->nb[2], i * experts->nb[1]));
+            }
+        }
+        checked.push_back(out);
+        if (with_shared) {
+            ggml_tensor * latent_up = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_out, 4096);
+            ggml_tensor * shared = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4096, n_tokens);
+            out = ggml_add(ctx, ggml_mul_mat(ctx, latent_up, out), shared);
+            checked.push_back(out);
+        }
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) {
+                continue;
+            }
+            if (strcmp(t->name, "nemotron_down_weights") != 0) {
+                init_tensor_uniform(t, -0.5f, 0.5f);
+                continue;
+            }
+            // Distinct expert rows with bounded scratch, including the full 512-expert perf fixtures.
+            const size_t row_size = ggml_row_size(type, n_ff);
+            std::vector<float> rows(n_expert * n_ff);
+            uint32_t rng = 12345;
+            for (float & v : rows) {
+                rng = rng * 1664525u + 1013904223u;
+                v = (float(rng >> 8) / 16777216.0f - 0.5f) * 0.25f;
+            }
+            std::vector<float> imatrix(n_ff, 1.0f);
+            std::vector<uint8_t> packed(n_expert * row_size);
+            ggml_quantize_chunk(type, rows.data(), packed.data(), 0, n_expert, n_ff, imatrix.data());
+            std::vector<uint8_t> expert(n_out * row_size);
+            for (int64_t e = 0; e < n_expert; ++e) {
+                for (int64_t r = 0; r < n_out; ++r) {
+                    const int64_t src = (31 * e + r) % n_expert;
+                    memcpy(expert.data() + r * row_size, packed.data() + src * row_size, row_size);
+                }
+                ggml_backend_tensor_set(t, expert.data(), e * t->nb[2], expert.size());
+            }
+        }
+    }
+};
+
+static void add_nemotron_decode_cases(std::vector<std::unique_ptr<test_case>> & cases, bool perf) {
+    const char * env = getenv("GGML_TEST_NEMOTRON_DECODE");
+    if (env == nullptr || atoi(env) == 0) {
+        return;
+    }
+    for (bool with_bias : {false, true}) {
+        cases.emplace_back(new test_nemotron_ssm_decode(96, 1, with_bias));
+        if (!perf) {
+            cases.emplace_back(new test_nemotron_ssm_decode(96, 2, with_bias));
+        }
+    }
+    cases.emplace_back(new test_nemotron_ssm_decode(128, 1, true));
+    if (!perf) {
+        cases.emplace_back(new test_nemotron_ssm_decode(96, 1, true, true));
+        cases.emplace_back(new test_nemotron_ssm_decode(96, 1, true, false, true));
+    }
+    // The public Puzzle checkpoint uses these per-layer (expert width, selected experts) pairs.
+    const std::array<int64_t, 2> shapes[] = {
+        {1280, 4}, {1280, 8}, {1280, 10}, {1280, 12}, {1280, 14}, {1280, 16},
+        {1536, 10}, {1536, 12}, {1536, 14}, {1792, 12}, {1792, 14}, {1792, 18}, {2048, 18}, {2688, 12},
+    };
+    for (ggml_type type : {GGML_TYPE_Q2_0, GGML_TYPE_PQ2_0, GGML_TYPE_Q2_K, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S}) {
+        for (const auto & shape : shapes) {
+            if (shape[0] % ggml_blck_size(type) == 0) {
+                cases.emplace_back(new test_nemotron_moe_decode(type, shape[0], perf ? 1024 : 64, shape[1]));
+            }
+        }
+        if (!perf) {
+            cases.emplace_back(new test_nemotron_moe_decode(type, 1280, 1024, 4));
+            cases.emplace_back(new test_nemotron_moe_decode(type, 1280, 64, 4, 1, true));
+            cases.emplace_back(new test_nemotron_moe_decode(type, 1280, 64, 4, 1, false, true));
+            cases.emplace_back(new test_nemotron_moe_decode(type, 1280, 64, 4, 1, false, false, true));
+            cases.emplace_back(new test_nemotron_moe_decode(type, 1280, 64, 4, 2));
+        }
+    }
+    if (!perf) {
+        cases.emplace_back(new test_nemotron_moe_decode(GGML_TYPE_F32, 1280, 64, 4));
+    }
+}
+
 struct test_moe_reduce : public test_case {
     const int64_t n_embd;
     const int64_t n_expert_used;
@@ -13864,6 +14153,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     add_sj_fill_cases(test_cases, false);
     add_exl3_cpu_cases(test_cases, false);
     add_mmq_prefill_cases(test_cases, false);
+    add_nemotron_decode_cases(test_cases, false);
 
     test_cases.emplace_back(new test_generic_init(GGML_OP_GET_ROWS));
     test_cases.emplace_back(new test_generic_init(GGML_OP_SET_ROWS));
@@ -17391,6 +17681,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     add_sj_fill_cases(test_cases, true);
     add_exl3_cpu_cases(test_cases, true);
     add_mmq_prefill_cases(test_cases, true);
+    add_nemotron_decode_cases(test_cases, true);
 
     // Decode/verify attention bandwidth at GQA 6, with q8_0 as a control.
     for (int64_t kv : {32768, 102400}) {

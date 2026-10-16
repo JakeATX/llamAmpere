@@ -42,6 +42,8 @@
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
+#include "ggml-cuda/nemotron-moe.cuh"
+#include "ggml-cuda/nemotron-ssm.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
 #include "ggml-cuda/opt-step-sgd.cuh"
@@ -5378,6 +5380,9 @@ static void ggml_cuda_gdn_state_read_finish(ggml_backend_cuda_context * cuda_ctx
 // its channel's operands before it writes, so the rollback rows the ring keeps are bit copies of what the CPY /
 // SET_ROWS nodes wrote.
 static bool ggml_cuda_conv_ring_enabled() {
+    if (ggml_cuda_nemotron_ssm_enabled()) {
+        return false;
+    }
     static const bool enabled = [] {
         const char * e = getenv("GGML_VL_SF_CONVRING");
         if (e != nullptr) {
@@ -7433,6 +7438,23 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // fork: optional single-token recurrent and routed-expert fusions.
+    if (node->op == GGML_OP_CONCAT) {
+        const int n_skip = ggml_cuda_fuse_nemotron_ssm(*cuda_ctx, cgraph, i);
+        if (n_skip >= 0) {
+            cuda_ctx->fusion_stats.nemotron_ssm++;
+            return n_skip;
+        }
+    }
+
+    if (node->op == GGML_OP_MUL_MAT_ID) {
+        const int n_skip = ggml_cuda_fuse_nemotron_moe(*cuda_ctx, cgraph, i);
+        if (n_skip >= 0) {
+            cuda_ctx->fusion_stats.nemotron_moe++;
+            return n_skip;
+        }
+    }
+
     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
             ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&
             ggml_cuda_should_fuse_mul_mat_vec_q(cgraph->nodes[i + 2]->src[1])) {
@@ -8732,6 +8754,10 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
+
+    if (!disable_fusion) {
+        ggml_cuda_nemotron_ssm_prepare(cgraph, params);
+    }
 
     auto add_alloc_deps = [&](size_t start, size_t last_node) {
 
@@ -10195,6 +10221,12 @@ int64_t ggml_backend_cuda_fusion_count(ggml_backend_t backend, const char * name
     }
     if (strcmp(name, "conv_ring") == 0) {
         return ctx->fusion_stats.conv_ring;
+    }
+    if (strcmp(name, "nemotron_ssm") == 0) {
+        return ctx->fusion_stats.nemotron_ssm;
+    }
+    if (strcmp(name, "nemotron_moe") == 0) {
+        return ctx->fusion_stats.nemotron_moe;
     }
     if (strcmp(name, "add_rms") == 0) {
         return ctx->fusion_stats.add_rms;

@@ -1655,6 +1655,8 @@ struct ggml_backend_cuda_context {
         int64_t add_rms_q8    = 0;   // ... of which also prefilled the q8_1 cache for the next MMVQ consumer
         int64_t exl3_ffn_bridge = 0; // EXL3 gate/up -> SwiGLU -> down runs through ggml_cuda_exl3_ffn_bridge [#74]
         int64_t conv_ring     = 0;   // ssm_conv launches that read the CONCAT operands and wrote the windows [#110]
+        int64_t nemotron_ssm  = 0;
+        int64_t nemotron_moe  = 0;
     } fusion_stats;
     // Landing slots for paged-in experts. One slab per expert tensor, n_slots experts wide; the
     // address table is pointed at a slot instead of at the expert's home address once it is copied.
