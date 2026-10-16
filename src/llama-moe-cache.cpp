@@ -6,6 +6,8 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <unordered_map>
 #include <vector>
@@ -224,10 +226,13 @@ struct llama_moe_cache::impl {
         }
 
         // only cache layers that keep all of their experts in host memory
+        const char * cpu_exl3 = getenv("GGML_CPU_EXL3");
+        const bool native_cpu_exl3 = cpu_exl3 && strcmp(cpu_exl3, "1") == 0;
         size_t host_bytes = 0;
         for (size_t il = 0; il < model.layers.size(); ++il) {
             auto experts = llama_moe_cache_layer_experts(model.layers[il]);
             if (experts.empty() || model.dev_layer(il) != dev ||
+                (native_cpu_exl3 && std::any_of(experts.begin(), experts.end(), [](const ggml_tensor * t) { return ggml_exl3_bits(t->type) != 0; })) ||
                 !std::all_of(experts.begin(), experts.end(), llama_moe_cache_is_host_weight)) {
                 continue;
             }

@@ -7094,6 +7094,62 @@ struct test_mul_mat_exl3 : public test_mul_mat {
     }
 };
 
+static void init_tensor_exl3_cpu_weights(ggml_tensor * t) {
+    GGML_ASSERT(ggml_exl3_bits(t->type) != 0 && ggml_is_contiguous(t));
+    std::vector<uint32_t> words(t->nb[2] / sizeof(uint32_t));
+    for (int64_t expert = 0; expert < t->ne[2]; ++expert) {
+        std::mt19937 rng(0x45584c33u + uint32_t(expert)*2654435761u + ggml_exl3_bits(t->type));
+        for (uint32_t & word : words) {
+            word = rng();
+        }
+        ggml_backend_tensor_set(t, words.data(), expert*t->nb[2], t->nb[2]);
+    }
+}
+
+static double exl3_cpu_error(const float * actual, const float * reference, size_t count) {
+    double diff2 = 0.0;
+    double ref2 = 0.0;
+    double peak_diff = 0.0;
+    double peak_ref = 1.0;
+    for (size_t i = 0; i < count; ++i) {
+        if (!std::isfinite(actual[i]) || !std::isfinite(reference[i])) {
+            return INFINITY;
+        }
+        const double diff = double(actual[i]) - reference[i];
+        diff2 += diff*diff;
+        ref2 += double(reference[i])*reference[i];
+        peak_diff = std::max(peak_diff, std::abs(diff));
+        peak_ref = std::max(peak_ref, std::abs(double(reference[i])));
+    }
+    // Enforce relative L2 <= 1e-4 and normalized maximum absolute error <= 1e-3.
+    return std::max(sqrt(diff2 / std::max(ref2, 1e-24)), 0.1*peak_diff / peak_ref);
+}
+
+struct test_mul_mat_exl3_cpu : public test_mul_mat_exl3 {
+    using test_mul_mat_exl3::test_mul_mat_exl3;
+
+    std::string vars() override {
+        return test_mul_mat_exl3::vars() + ",cpu_exl3=1";
+    }
+
+    double err(const float * actual, const float * reference, size_t count) override {
+        return exl3_cpu_error(actual, reference, count);
+    }
+
+    double max_err() override { return 1e-4; }
+    double max_err(ggml_backend_t) override { return max_err(); }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_exl3_bits(t->type)) {
+                init_tensor_exl3_cpu_weights(t);
+            } else {
+                init_tensor_uniform(t, 0.25f, 1.0f);
+            }
+        }
+    }
+};
+
 // [#74] the dense FFN of an EXL3 decoder layer as llama build_ffn + build_lora_mm build it: gate = W_gate x and
 // up = W_up x with suh/svh glue, h = swiglu_split(gate, up), out = W_down h. Run as a whole graph so the CUDA
 // backend's FFN bridge (GGML_CUDA_EXL3_FFN_BRIDGE, on by default) replaces gate/up glue_out + SwiGLU + down glue_in,
@@ -7515,6 +7571,170 @@ struct test_mul_mat_id_skew : public test_mul_mat_id {
         }
     }
 };
+struct test_mul_mat_id_exl3_cpu : public test_mul_mat_id {
+    const bool glue;
+    const bool strided;
+    const bool repeated;
+    const ggml_type side_type;
+    const cr_activation_pattern pattern;
+    int perf_offset = 0;
+
+    test_mul_mat_id_exl3_cpu(ggml_type type, int64_t m, int64_t n, int64_t k, int n_mats, int n_used,
+            bool broadcast, bool glue, bool strided = false, bool repeated = true,
+            ggml_type side_type = GGML_TYPE_F32, cr_activation_pattern pattern = cr_activation_pattern::RANDOM)
+        : test_mul_mat_id(type, GGML_TYPE_F32, n_mats, n_used, broadcast, m, n, k),
+          glue(glue), strided(strided), repeated(repeated), side_type(side_type), pattern(pattern) {}
+
+    std::string vars() override {
+        return test_mul_mat_id::vars() + ",cpu_exl3=1," + VARS_TO_STR4(glue, strided, repeated, side_type) +
+            ",pattern=" + cr_activation_pattern_name(pattern);
+    }
+
+    double err(const float * actual, const float * reference, size_t count) override {
+        return exl3_cpu_error(actual, reference, count);
+    }
+
+    double max_err() override { return 1e-4; }
+    double max_err(ggml_backend_t) override { return max_err(); }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * as = ggml_new_tensor_3d(ctx, type_a, k, m + (strided ? 16 : 0), n_mats);
+        ggml_set_name(as, "cpu_exl3_weights");
+        if (strided) {
+            as = ggml_view_3d(ctx, as, k, m, n_mats, as->nb[1], as->nb[2], 0);
+        }
+
+        ggml_tensor * ids;
+        if (strided) {
+            ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n + 3, n_used);
+            ggml_set_name(ids, "cpu_exl3_ids");
+            ids = ggml_transpose(ctx, ggml_view_2d(ctx, ids, n, n_used, ids->nb[1], 0));
+        } else {
+            ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n);
+            ggml_set_name(ids, "cpu_exl3_ids");
+        }
+
+        const int64_t routes = b ? 1 : n_used;
+        ggml_tensor * acts = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k + (strided ? 32 : 0), routes + (strided ? 1 : 0), n);
+        ggml_set_name(acts, "cpu_exl3_acts");
+        if (strided) {
+            acts = ggml_view_3d(ctx, acts, k, routes, n, acts->nb[1], acts->nb[2], 0);
+        }
+
+        ggml_tensor * out = ggml_mul_mat_id(ctx, as, acts, ids);
+        if (glue) {
+            for (int which = 0; which < 2; ++which) {
+                const int64_t length = which == 0 ? k : m;
+                ggml_tensor * side = ggml_new_tensor_2d(ctx, side_type, length + (strided ? 5 : 0), n_mats);
+                ggml_set_name(side, which == 0 ? "cpu_exl3_suh" : "cpu_exl3_svh");
+                if (strided) {
+                    side = ggml_view_2d(ctx, side, length, n_mats, side->nb[1], 0);
+                }
+                out->src[3 + which] = side;
+            }
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_ids(ggml_context * ctx) {
+        ggml_tensor * ids = ggml_get_tensor(ctx, "cpu_exl3_ids");
+        std::vector<int32_t> values(ggml_nelements(ids), 0);
+        for (int64_t token = 0; token < n; ++token) {
+            for (int route = 0; route < n_used; ++route) {
+                const int expert = (5*route + (repeated ? 0 : 3*token) + 1 + perf_offset) % n_mats;
+                values[strided ? route*ids->ne[0] + token : token*n_used + route] = expert;
+            }
+        }
+        ggml_backend_tensor_set(ids, values.data(), 0, ggml_nbytes(ids));
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        perf_offset = 0;
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op) || strcmp(t->name, "cpu_exl3_ids") == 0) {
+                continue;
+            }
+            if (ggml_exl3_bits(t->type)) {
+                init_tensor_exl3_cpu_weights(t);
+            } else if (strcmp(t->name, "cpu_exl3_acts") == 0) {
+                std::vector<float> values(ggml_nelements(t));
+                for (int64_t row = 0; row < ggml_nrows(t); ++row) {
+                    for (int64_t i = 0; i < t->ne[0]; ++i) {
+                        float value = float((17*i + 13*row) % 251 - 125) / 128.0f;
+                        switch (pattern) {
+                            case cr_activation_pattern::RANDOM: break;
+                            case cr_activation_pattern::ZERO: value = 0.0f; break;
+                            case cr_activation_pattern::IMPULSE: value = i == row % k ? 1.0f : 0.0f; break;
+                            case cr_activation_pattern::ALTERNATING: value = i & 1 ? -1.0f : 1.0f; break;
+                            case cr_activation_pattern::OUTLIER: value = i == k/2 ? 128.0f : 1e-3f; break;
+                            case cr_activation_pattern::CANCELLATION: value = i % 4 < 2 ? 1.0f : -1.0f; break;
+                        }
+                        values[row*t->ne[0] + i] = value;
+                    }
+                }
+                ggml_backend_tensor_set(t, values.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "cpu_exl3_suh") == 0 || strcmp(t->name, "cpu_exl3_svh") == 0) {
+                std::vector<float> values(ggml_nelements(t));
+                for (int64_t expert = 0; expert < t->ne[1]; ++expert) {
+                    for (int64_t i = 0; i < t->ne[0]; ++i) {
+                        values[expert*t->ne[0] + i] = 0.5f + float((7*i + 19*expert) % 97) / 128.0f;
+                    }
+                }
+                if (t->type == GGML_TYPE_F16) {
+                    std::vector<ggml_fp16_t> half(values.size());
+                    ggml_fp32_to_fp16_row(values.data(), half.data(), half.size());
+                    ggml_backend_tensor_set(t, half.data(), 0, ggml_nbytes(t));
+                } else {
+                    ggml_backend_tensor_set(t, values.data(), 0, ggml_nbytes(t));
+                }
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+        initialize_ids(ctx);
+    }
+
+    void reinit_perf_iter(ggml_context * ctx) override {
+        perf_offset = (perf_offset + 17) % n_mats;
+        initialize_ids(ctx);
+    }
+};
+
+static void add_exl3_cpu_cases(std::vector<std::unique_ptr<test_case>> & cases, bool perf) {
+    if (perf) {
+        for (ggml_type type : {GGML_TYPE_EXL3_3, GGML_TYPE_EXL3_4}) {
+            for (auto shape : {std::array<int64_t, 2>{2048, 5120}, {5120, 2048}}) {
+                for (int64_t rows : {1, 9, 64}) {
+                    cases.emplace_back(new test_mul_mat_exl3_cpu(type, shape[0], rows, shape[1], true));
+                    cases.emplace_back(new test_mul_mat_id_exl3_cpu(type, shape[0], rows, shape[1], 8, 4, true, true));
+                }
+            }
+        }
+        // 512 MiB of expert weights; rotating routes cover the DRAM working set.
+        cases.emplace_back(new test_mul_mat_id_exl3_cpu(GGML_TYPE_EXL3_4, 2048, 64, 4096, 128, 4, true, true, false, false));
+        return;
+    }
+
+    for (ggml_type type : {GGML_TYPE_EXL3_2, GGML_TYPE_EXL3_3, GGML_TYPE_EXL3_4, GGML_TYPE_EXL3_5,
+                          GGML_TYPE_EXL3_6, GGML_TYPE_EXL3_7, GGML_TYPE_EXL3_8}) {
+        int index = 0;
+        for (int64_t rows : {1, 2, 3, 4, 8, 9, 16, 21, 64}) {
+            const int topk = 1 << (index % 4);
+            for (bool glue : {false, true}) {
+                cases.emplace_back(new test_mul_mat_id_exl3_cpu(type, glue ? 128 : 144, rows, 512, 8, topk,
+                        index % 2 == 0, glue, index % 3 == 0));
+            }
+            ++index;
+        }
+        cases.emplace_back(new test_mul_mat_id_exl3_cpu(type, 256, 9, 768, 8, 4, false, true, true, false, GGML_TYPE_F16));
+    }
+    for (cr_activation_pattern pattern : {cr_activation_pattern::ZERO, cr_activation_pattern::IMPULSE,
+            cr_activation_pattern::ALTERNATING, cr_activation_pattern::OUTLIER, cr_activation_pattern::CANCELLATION}) {
+        cases.emplace_back(new test_mul_mat_id_exl3_cpu(GGML_TYPE_EXL3_3, 128, 3, 512, 8, 4,
+                false, true, true, false, GGML_TYPE_F32, pattern));
+    }
+}
 
 // FP4 W4A8 path on the MoE path (GGML_PREC_Q8 on src1 disallows 4-bit activations)
 struct test_mul_mat_id_w4a8 : public test_mul_mat_id {
@@ -13498,6 +13718,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     add_sj_fill_cases(test_cases, false);
+    add_exl3_cpu_cases(test_cases, false);
 
     test_cases.emplace_back(new test_generic_init(GGML_OP_GET_ROWS));
     test_cases.emplace_back(new test_generic_init(GGML_OP_SET_ROWS));
@@ -14885,8 +15106,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // EXL3 trellis weights (m = N outputs, n = T activation columns, k = K). CUDA routes T <= 16 to the trellis
     // GEMV (T = 1: HFMA2, T >= 2: mma; 3/4-bit at T = 2..8 take the #73 weight-major mma unless
     // GGML_CUDA_EXL3_WEIGHT_MAJOR=0) and T > 16 to the #13 trellis-direct GEMM (reconstruct + cuBLAS with
-    // GGML_CUDA_EXL3_GEMM=0). No MUL_MAT_ID: the CUDA backend
-    // declines EXL3 experts (supports_op), and the CPU backend has no EXL3 vec_dot for the ID path.
+    // GGML_CUDA_EXL3_GEMM=0). CPU-only indexed cases are added by add_exl3_cpu_cases.
     {
         const ggml_type exl3_types[] = {
             GGML_TYPE_EXL3_2, GGML_TYPE_EXL3_3, GGML_TYPE_EXL3_4, GGML_TYPE_EXL3_5,
@@ -17024,6 +17244,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
     add_parwrev_cases(test_cases, true);
     add_sj_fill_cases(test_cases, true);
+    add_exl3_cpu_cases(test_cases, true);
 
     // Decode/verify attention bandwidth at GQA 6, with q8_0 as a control.
     for (int64_t kv : {32768, 102400}) {

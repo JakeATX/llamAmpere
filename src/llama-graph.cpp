@@ -1903,6 +1903,15 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
         ggml_mul_mat_id(ctx0, w, cur_mm, ids) :
         ggml_mul_mat_id(ctx0, moe_cache->get_experts(w), cur_mm, slots);
 
+    // fork: native CPU experts use logical IDs for both compressed weights and side vectors.
+    const char * cpu_exl3 = getenv("GGML_CPU_EXL3");
+    if (cpu_exl3 && strcmp(cpu_exl3, "1") == 0 && ggml_exl3_bits(w->type)) {
+        const llama_model::exl3_side * side = model_ref ? model_ref->exl3_side_of(w) : nullptr;
+        GGML_ASSERT(slots == nullptr && side != nullptr);
+        res->src[3] = side->suh;
+        res->src[4] = side->svh;
+    }
+
     if (prec_policy) {
         prec_policy->apply(res);
     }

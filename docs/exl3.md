@@ -50,6 +50,30 @@ GGUF metadata written by the converter: `<arch>.exl3.codebook` (only `mul1` is i
 `<arch>.exl3.quant_version` and `<arch>.exl3.hadamard_block` (128). The file also carries
 `exl3_had128.weight`, a 64 KB f32 Sylvester Hadamard matrix used only by the generic-op A/B path below.
 
+## Experimental CPU expert kernel
+
+`GGML_CPU_EXL3=1` opts into the storage-order AVX2/FMA/F16C multiply and native CPU `MUL_MAT_ID`. It is off by default. Each weight keeps the scalar decoder's FP16 rounding; split-K F32 accumulation can differ from the dense reference within the tested error bounds. A fixed piece size gives bit-identical results across worker counts.
+
+`GGML_CPU_EXL3_PIECE=128|256|512` selects the input piece length (default 256). `GGML_CPU_EXL3_BATCH=1|2|3` selects how many rows for the same expert share a tile decode (default 3). These are host CPU knobs on every GPU model. Start with 128 and 256 for decode; benchmark 512 and different batch sizes for larger route groups. The fast path uses at most 64 MiB of graph scratch, then falls back to the scalar/reference path. No expanded weight copy is retained.
+
+Indexed weights have shape `[K,N,E]`, activations `[K,B,T]`, and IDs `[R,T]`, where `R % B == 0`. Input and output side vectors have shape `[K,E]` and `[N,E]`, with F16 or F32 elements. The graph attaches them as `src[3]` and `src[4]`; `src[2]` contains logical expert IDs. Expert, activation, ID, and side-vector outer strides are honored. The compressed K/N image must be contiguous within each expert, K must be divisible by 256, and N by 16 (128 with side transforms). Unsupported layouts are declined by CPU support checks. Builds without AVX2/FMA/F16C use the indexed reference.
+
+The loader registers side vectors for gate/up/down and combined gate/up experts when the switch is set. The normal `--n-cpu-moe` placement can then keep these native experts in RAM. This requires an export with the indexed native tile layout and side-vector shapes above; the current dense EXL3 converter does not produce that export. Real-model execution has not been verified. CUDA indexed EXL3 and GPU expert-cache metadata are still unsupported. EXL3 layers are excluded from cache-slot rewriting to retain logical expert IDs. There is no new CPU/GPU overlap or cross-projection readiness pipeline in this stage.
+
+CPU checks and synthetic microbenchmarks:
+
+```bash
+cmake -S . -B build-exl3-cpu -DGGML_CUDA=OFF -DGGML_NATIVE=ON -DLLAMA_BUILD_TESTS=ON
+cmake --build build-exl3-cpu --target test-exl3-cpu test-backend-ops -j8
+build-exl3-cpu/bin/test-exl3-cpu
+GGML_CPU_EXL3=1 build-exl3-cpu/bin/test-backend-ops test -b CPU -o MUL_MAT_ID -p cpu_exl3=1
+build-exl3-cpu/bin/test-exl3-cpu --bench 8
+build-exl3-cpu/bin/test-exl3-cpu --bench 8 down
+build-exl3-cpu/bin/test-exl3-cpu --bench-stream 8
+```
+
+The microbench alternates five measured reference/candidate runs after warmup. `--bench-stream` rotates sixteen distinct matrices (510 MiB at three bits, 680 MiB at four bits) per pass to exceed the 5800X3D's L3. It measures CPU matmul time, not model tokens/s or storage streaming.
+
 ## Converting an exllamav3 checkpoint
 
 `scripts/exl3/convert_exl3_to_gguf.py` repacks a checkpoint. It re-quantizes nothing: every

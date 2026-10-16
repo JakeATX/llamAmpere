@@ -2083,8 +2083,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
         }
     }
-    // EXL3 (exllamav3 trellis) side tensors: every EXL3 weight W[K, N] carries .suh (K) and .svh (N) f32 vectors,
-    // and the file carries one shared 128x128 Hadamard (exl3_had128.weight). See build_lora_mm.
+    // fork: EXL3 W[K,N,E] carries F16/F32 side tensors .suh[K,E] and .svh[N,E].
+    // The file also carries the shared 128x128 Hadamard exl3_had128.weight. See build_lora_mm.
     {
         auto exl3_side_tensors = [&](ggml_tensor * w, llm_tensor t, int bid) {
             // decide from the FILE, not the field: a weight this context skips (e.g. the nextn layer in the main
@@ -2095,14 +2095,14 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
             if (!w) {
                 const int skip = TENSOR_NOT_REQUIRED | TENSOR_SKIP;
-                create_tensor(tn(t, "suh", bid), {meta->ne[0]}, skip);
-                create_tensor(tn(t, "svh", bid), {meta->ne[1]}, skip);
+                create_tensor(tn(t, "suh", bid), {meta->ne[0], meta->ne[2]}, skip);
+                create_tensor(tn(t, "svh", bid), {meta->ne[1], meta->ne[2]}, skip);
                 return;
             }
             GGML_ASSERT(ggml_exl3_bits(w->type) != 0);
             exl3_side side;
-            side.suh = create_tensor(tn(t, "suh", bid), {w->ne[0]}, 0);
-            side.svh = create_tensor(tn(t, "svh", bid), {w->ne[1]}, 0);
+            side.suh = create_tensor(tn(t, "suh", bid), {w->ne[0], w->ne[2]}, 0);
+            side.svh = create_tensor(tn(t, "svh", bid), {w->ne[1], w->ne[2]}, 0);
             exl3_sides[w] = side;
         };
         exl3_side_tensors(output, LLM_TENSOR_OUTPUT, -1);
@@ -2117,6 +2117,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             exl3_side_tensors(layer.ffn_gate,  LLM_TENSOR_FFN_GATE,  i);
             exl3_side_tensors(layer.ffn_up,    LLM_TENSOR_FFN_UP,    i);
             exl3_side_tensors(layer.ffn_down,  LLM_TENSOR_FFN_DOWN,  i);
+            const char * cpu_exl3 = getenv("GGML_CPU_EXL3");
+            if (cpu_exl3 && strcmp(cpu_exl3, "1") == 0) {
+                exl3_side_tensors(layer.ffn_gate_exps,    LLM_TENSOR_FFN_GATE_EXPS,    i);
+                exl3_side_tensors(layer.ffn_up_exps,      LLM_TENSOR_FFN_UP_EXPS,      i);
+                exl3_side_tensors(layer.ffn_down_exps,    LLM_TENSOR_FFN_DOWN_EXPS,    i);
+                exl3_side_tensors(layer.ffn_gate_up_exps, LLM_TENSOR_FFN_GATE_UP_EXPS, i);
+            }
             exl3_side_tensors(layer.ssm_in,    LLM_TENSOR_SSM_IN,    i);
             exl3_side_tensors(layer.ssm_out,   LLM_TENSOR_SSM_OUT,   i);
             exl3_side_tensors(layer.ssm_alpha, LLM_TENSOR_SSM_ALPHA, i);

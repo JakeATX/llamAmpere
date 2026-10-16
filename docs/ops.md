@@ -2,6 +2,8 @@
 
 List of GGML operations and backend support status.
 
+Native EXL3 CPU `MUL_MAT_ID` is experimental and requires `GGML_CPU_EXL3=1`; see [CPU expert support](exl3.md#experimental-cpu-expert-kernel). CPU.csv records marked `cpu_exl3=1` were collected with this switch enabled. CUDA indexed EXL3 remains unsupported.
+
 ## How to add a backend to this table:
 
 1. Run `test-backend-ops support --output csv` with your backend name and redirect output to a csv file in `docs/ops/` (e.g., `docs/ops/CUDA.csv`)

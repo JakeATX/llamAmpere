@@ -18,6 +18,7 @@
 #include "common.h"
 #include "ggml-ai4.h"
 #include "tiled/tiled.h"
+#include "exl3.h"
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #include <malloc.h> // using malloc.h with MSC/MINGW
@@ -1710,6 +1711,15 @@ void ggml_compute_forward_mul_mat(
         return;
     }
     if (ggml_exl3_bits(src0->type)) {
+        if (ggml_cpu_exl3_mul_mat(params, dst)) {
+            return;
+        }
+        if (ggml_cpu_exl3_enabled() && ggml_cpu_exl3_supported(dst) &&
+            ((dst->src[2] && dst->src[2]->type == GGML_TYPE_F16) ||
+             (dst->src[3] && dst->src[3]->type == GGML_TYPE_F16))) {
+            ggml_cpu_exl3_mul_mat_ref(params, dst);
+            return;
+        }
         ggml_compute_forward_mul_mat_exl3(params, dst);
         return;
     }
@@ -2425,6 +2435,13 @@ static void ggml_compute_forward_mul_mat_id(
               struct ggml_tensor * dst) {
     if (ggml_ai4_rate(dst->src[0]->type) != 0) {
         ggml_compute_forward_mul_mat_id_ai4(params, dst);
+        return;
+    }
+    // fork: EXL3 has no row-dot trait; indexed sides occupy src[3] and src[4].
+    if (ggml_exl3_bits(dst->src[0]->type)) {
+        if (!ggml_cpu_exl3_mul_mat(params, dst)) {
+            ggml_cpu_exl3_mul_mat_ref(params, dst);
+        }
         return;
     }
     ggml_compute_forward_mul_mat_id_impl(params, dst, 0, false, true, false);
@@ -3617,6 +3634,9 @@ struct ggml_cplan ggml_graph_plan(
                             if (node->src[2] != NULL) {
                                 cur += (size_t) ggml_nelements(node->src[1]) * sizeof(float);
                             }
+                            if (ggml_cpu_exl3_enabled() && ggml_cpu_exl3_supported(node)) {
+                                cur = MAX(cur, ggml_cpu_exl3_work_size(node, n_tasks));
+                            }
                         } else if (node->src[1]->type != vec_dot_type) {
                             cur = ggml_row_size(vec_dot_type, ggml_nelements(node->src[1]));
                         }
@@ -3626,6 +3646,10 @@ struct ggml_cplan ggml_graph_plan(
                     } break;
                 case GGML_OP_MUL_MAT_ID:
                     {
+                        if (ggml_exl3_bits(node->src[0]->type)) {
+                            cur = ggml_cpu_exl3_work_size(node, n_tasks);
+                            break;
+                        }
                         cur = 0;
                         if (ggml_ai4_rate(node->src[0]->type) != 0) {
                             cur = (size_t) n_tasks * 16 * node->src[0]->ne[0] * sizeof(float);
@@ -3815,6 +3839,7 @@ static bool ggml_cpu_disable_fusion = false;  // initialized once in ggml_cpu_in
 
 static bool ggml_moe_cache_weight_is_eligible(const struct ggml_tensor * weight) {
     if (!weight || weight->op != GGML_OP_NONE || !weight->data ||
+        (ggml_cpu_exl3_enabled() && ggml_exl3_bits(weight->type) != 0) ||
         weight->ne[0] <= 0 || weight->ne[1] <= 0 || weight->ne[2] <= 0 ||
         weight->nb[0] != ggml_type_size(weight->type)) {
         return false;

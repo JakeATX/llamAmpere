@@ -1,6 +1,7 @@
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
 #include "ggml-cpu.h"
+#include "exl3.h"
 #include "repack.h"
 #include "traits.h"
 #include "ggml-impl.h"
@@ -440,6 +441,11 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
     }
 
     switch (op->op) {
+        case GGML_OP_MUL_MAT_ID:
+            if (ggml_exl3_bits(src0->type)) {
+                return ggml_cpu_exl3_enabled() && ggml_cpu_exl3_supported(op);
+            }
+            return true;
         case GGML_OP_CPY:
         case GGML_OP_SET_ROWS:
             return

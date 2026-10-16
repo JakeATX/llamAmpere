@@ -445,6 +445,13 @@ llama_build_and_test(test-hc-norm-fuse.cpp) # [HCPN] skips without a GPU backend
 llama_build_and_test(test-exl3-ffn-bridge.cpp) # [#74] skips without a GPU backend
 llama_build_and_test(test-exl3-weight-major.cpp) # [#73] skips without a GPU backend
 llama_build_and_test(test-exl3-decode.cpp) # [#41] skips without a GPU backend
+if (NOT GGML_BACKEND_DL AND GGML_CPU)
+    add_executable(test-exl3-cpu test-exl3-cpu.cpp)
+    target_link_libraries(test-exl3-cpu PRIVATE ggml ggml-cpu)
+    llama_test(test-exl3-cpu)
+    target_include_directories(test-exl3-cpu PRIVATE ../ggml/src ../ggml/src/ggml-cpu)
+    set_tests_properties(test-exl3-cpu PROPERTIES SKIP_RETURN_CODE 77)
+endif()
 add_executable(test-fattn-mma-config test-fattn-mma-config.cpp)
 target_include_directories(test-fattn-mma-config PRIVATE ${PROJECT_SOURCE_DIR}/ggml/include)
 llama_test(test-fattn-mma-config)
