@@ -90,10 +90,11 @@ struct contexts {
     common_speculative * spec = nullptr;
 
     contexts(llama_model * model, const cache_config & config, uint32_t batch_size = 128,
-            common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE) {
+            common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE, uint32_t ubatch_size = 0) {
         llama_context_params cp = llama_context_default_params();
         cp.n_ctx = 2048;
-        cp.n_batch = cp.n_ubatch = batch_size;
+        cp.n_batch = batch_size;
+        cp.n_ubatch = ubatch_size ? ubatch_size : batch_size;
         cp.n_seq_max = 2;
         cp.kv_unified = false;
         cp.n_rs_seq = 4;
@@ -283,6 +284,92 @@ static schedule generate(contexts & ctx, llama_seq_id seq, llama_pos & pos, int 
     return result;
 }
 
+static void run_prefill_identity(llama_model * model, const cache_config & config) {
+    struct env_restore {
+        std::string saved = common_get_env("GGML_MTP_PREFILL_OVERLAP");
+        ~env_restore() { common_set_env("GGML_MTP_PREFILL_OVERLAP", saved); }
+    } env;
+
+    common_set_env("GGML_MTP_PREFILL_OVERLAP", "");
+    contexts reference(model, config, 128, COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE, 32);
+    common_set_env("GGML_MTP_PREFILL_OVERLAP", "1");
+    contexts coalesced(model, config, 128, COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE, 32);
+
+    auto check_state = [&](llama_seq_id seq) {
+        const snapshot a = save(reference, seq);
+        const snapshot b = save(coalesced, seq);
+        require(a.tgt == b.tgt, "overlap on/off target state is bit-identical");
+        require(a.dft == b.dft, "overlap on/off drafter KV is bit-identical");
+        require(a.spec == b.spec, "overlap on/off carry and deferred state is bit-identical");
+    };
+    auto process_pair = [&](common_batch & batch) {
+        for (contexts * ctx : { &reference, &coalesced }) {
+            common_batch input(ctx->tgt);
+            input.tokens = batch.tokens;
+            require(llama_process(ctx->tgt, LLAMA_PROCESS_TYPE_DECODE, input.get()) == 0, "identity target decode");
+            require(common_speculative_process(ctx->spec, input), "identity MTP process");
+        }
+        if (std::any_of(batch.tokens.begin(), batch.tokens.end(), [](const common_batch::token & t) { return t.output; })) {
+            require(std::memcmp(llama_get_logits_ith(reference.tgt, -1), llama_get_logits_ith(coalesced.tgt, -1),
+                        n_vocab * sizeof(float)) == 0, "overlap on/off target logits are bit-identical");
+        }
+    };
+
+    llama_pos pos[2] = {};
+    // Cross target/draft ubatches and the deferred-row limit, including one-token prompt tails.
+    for (int width : { 128, 67, 3, 1, 127 }) {
+        for (llama_seq_id seq = 0; seq < 2; ++seq) {
+            common_batch batch(reference.tgt);
+            for (int i = 0; i < width; ++i) {
+                batch.add(token_at(pos[seq]), pos[seq], seq, width != 128 && i == width - 1);
+                ++pos[seq];
+            }
+            process_pair(batch);
+            check_state(0);
+            check_state(1);
+        }
+    }
+
+    // Unequal sequence spans exercise dense-row reordering with sparse logits.
+    common_batch batch(reference.tgt);
+    for (llama_seq_id seq : { 1, 0 }) {
+        const int width = seq == 1 ? 17 : 80;
+        for (int i = 0; i < width; ++i) {
+            batch.add(token_at(pos[seq]), pos[seq], seq, i == width - 1);
+            ++pos[seq];
+        }
+    }
+    process_pair(batch);
+    check_state(0);
+    check_state(1);
+
+    const snapshot cached = save(coalesced, 0);
+    common_set_env("GGML_MTP_PREFILL_OVERLAP", "0");
+    contexts resumed(model, config, 128, COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE, 32);
+    restore(resumed, cached, 1);
+    common_speculative_begin(resumed.spec, 1, llama_tokens(pos[0], 0));
+    llama_pos pos_restored = pos[0];
+    const schedule restored = generate(resumed, 1, pos_restored, 0, 8);
+    common_set_env("GGML_MTP_PREFILL_OVERLAP", "1");
+    contexts resumed_on(model, config, 128, COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE, 32);
+    restore(resumed_on, save(reference, 0), 1);
+    common_speculative_begin(resumed_on.spec, 1, llama_tokens(pos[0], 0));
+    pos_restored = pos[0];
+    require_schedule(generate(resumed_on, 1, pos_restored, 0, 8), restored, "off prompt snapshot restores with switch on into another sequence");
+    for (llama_seq_id seq = 0; seq < 2; ++seq) {
+        common_speculative_begin(reference.spec, seq, llama_tokens(pos[seq], 0));
+        common_speculative_begin(coalesced.spec, seq, llama_tokens(pos[seq], 0));
+        llama_pos pos_ref = pos[seq], pos_got = pos[seq];
+        const schedule expected = generate(reference, seq, pos_ref, 0, 8);
+        require_schedule(generate(coalesced, seq, pos_got, 0, 8), expected, "overlap on/off draft tokens and widths");
+        if (seq == 0) {
+            require_schedule(restored, expected, "overlap prompt snapshot restores with switch off into another sequence");
+        }
+        check_state(seq);
+    }
+    printf("PASS %s: overlap on/off bit-identical target, draft KV, carry, deferred rows, logits and 16 draft rounds; cache restore in both directions\n", config.name);
+}
+
 static void run_case(llama_model * model, const cache_config & config, bool deferred) {
     contexts reference(model, config);
     const llama_pos boundary = 512 + (deferred ? 3 : 0);
@@ -457,6 +544,12 @@ int main(int argc, char ** argv) {
             { "SJ-KVaRN 3/2t", GGML_TYPE_F16, GGML_TYPE_F16, 3, 2, GGML_TYPE_I16 },
         };
         for (const auto & config : configs) {
+            try {
+                run_prefill_identity(model, config);
+            } catch (const std::exception & error) {
+                fprintf(stderr, "FAIL %s (prefill identity): %s\n", config.name, error.what());
+                ++failed;
+            }
             for (bool deferred : { false, true }) {
                 try {
                     run_case(model, config, deferred);

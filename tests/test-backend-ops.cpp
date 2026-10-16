@@ -12321,7 +12321,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t t : {1, 4}) {
         test_cases.emplace_back(new test_elem_chain_cont_head(128, 4, t));
     }
-    for (int64_t t : {1, 4}) {
+    // MTP prompt catch-up uses the same input graph at prefill widths and at a short final ubatch.
+    for (int64_t t : {1, 4, 17, 128, 1024}) {
         test_cases.emplace_back(new test_norm_pair_concat(256, t));
         test_cases.emplace_back(new test_norm_pair_concat(5120, t));
     }
@@ -15651,6 +15652,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (ggml_type t : {GGML_TYPE_IQ4_NL, GGML_TYPE_Q2_0}) {
             test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 512, 10, false, 2560, n, 640));
         }
+    }
+    for (int64_t t : {17, 128, 512, 1024}) {
+        test_cases.emplace_back(new test_norm_pair_concat(5120, t));
     }
 
     // Decode/verify attention bandwidth at GQA 6, with q8_0 as a control.

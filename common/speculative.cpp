@@ -1447,6 +1447,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     int32_t n_embd = 0;
     int32_t batch_capacity = 0;
     int32_t ubatch_capacity = 0;
+    bool prefill_overlap = false;
 
     // One MTP draft driver, three modes (set once in the ctor):
     //   is_mem_shared (gemma4): shares the target KV, runs all heads in one graph.
@@ -1554,6 +1555,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         ubatch_capacity = (int32_t) llama_n_ubatch(ctx_dft);
         batch_capacity = std::min<int32_t>(llama_n_batch(ctx_dft), std::max<int32_t>(ubatch_capacity, n_seq * (this->params.n_max + 1)));
+        const char * overlap = std::getenv("GGML_MTP_PREFILL_OVERLAP");
+        prefill_overlap = overlap && std::strcmp(overlap, "1") == 0;
+        if (prefill_overlap) {
+            SPC_INF("%s", "GGML_MTP_PREFILL_OVERLAP=1: coalescing target hidden-state reads\n");
+        }
         batch = llama_batch_init(/*n_tokens=*/ batch_capacity, /*embd=*/ n_embd, /*n_seq_max=*/ 1);
         // llama_batch_init allocates only one of token/embd; MTP needs both.
         // TODO: fix, how to call without malloc
@@ -2194,6 +2200,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
+        // The target's NextN rows are unmasked and reordered by the bulk getter. Avoid one backend sync per token while the draft runs.
+        const float * h_bulk = prefill_overlap ? llama_get_embeddings_nextn(ctx_tgt) : nullptr;
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_batch_end[seq_id] < 0) {
                 continue;
