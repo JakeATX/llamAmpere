@@ -1140,6 +1140,9 @@ struct ggml_backend_sched {
     ggml_backend_sched_copy_callback callback_copy;
     void * callback_copy_user_data;
 
+    ggml_backend_sched_input_copy_callback callback_input_copy;
+    void * callback_input_copy_user_data;
+
     char * context_buffer;
     size_t context_buffer_size;
 
@@ -2792,6 +2795,14 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
     ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, input);
     struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
 
+    if (sched->callback_input_copy != NULL && input_backend != NULL &&
+            ggml_backend_dev_type(ggml_backend_get_device(input_backend)) == GGML_BACKEND_DEVICE_TYPE_CPU &&
+            input->buffer != NULL && ggml_backend_buffer_is_host(input->buffer) &&
+            !ggml_backend_sched_is_host_weight(input) &&
+            sched->callback_input_copy(split_backend, input, input_cpy, sched->callback_input_copy_user_data)) {
+        return;
+    }
+
     if (input->flags & GGML_TENSOR_FLAG_INPUT) {
         // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
@@ -3375,6 +3386,12 @@ void ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(sched);
     sched->callback_copy = callback;
     sched->callback_copy_user_data = user_data;
+}
+
+void ggml_backend_sched_set_input_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_input_copy_callback callback, void * user_data) {
+    GGML_ASSERT(sched);
+    sched->callback_input_copy = callback;
+    sched->callback_input_copy_user_data = user_data;
 }
 
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {

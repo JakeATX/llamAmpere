@@ -326,6 +326,10 @@ extern "C" {
     // `graph` is the compute graph of the split
     typedef bool (*ggml_backend_sched_copy_callback)(ggml_backend_t backend, const struct ggml_tensor * src, struct ggml_tensor * dst, struct ggml_cgraph * graph, void * user_data);
 
+    // Optional copy handler for non-weight host inputs from a completed CPU backend.
+    // On true, src must be copied or snapshotted; queued uploads must retain their data and order destination reuse.
+    typedef bool (*ggml_backend_sched_input_copy_callback)(ggml_backend_t backend, const struct ggml_tensor * src, struct ggml_tensor * dst, void * user_data);
+
     // Initialize a backend scheduler, backends with low index are given priority over backends with high index
     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload);
     GGML_API void                 ggml_backend_sched_free(ggml_backend_sched_t sched);
@@ -371,6 +375,7 @@ extern "C" {
 
     // Set a callback to be called when the inputs weights of a split are being copied
     GGML_API void                 ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data);
+    GGML_API void                 ggml_backend_sched_set_input_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_input_copy_callback callback, void * user_data);
 
     //
     // Meta backend

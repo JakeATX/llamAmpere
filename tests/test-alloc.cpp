@@ -677,6 +677,159 @@ static void test_graph_optimize_alloc_dep() {
     GGML_ASSERT(!graph_reuses_allocation(true));
 }
 
+static ggml_backend_buffer_t scheduler_copy_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    auto * data = new std::vector<uint8_t>(size);
+    ggml_backend_buffer_i iface{};
+    iface.free_buffer = [](ggml_backend_buffer_t buffer) {
+        delete (std::vector<uint8_t> *) buffer->context;
+    };
+    iface.get_base = [](ggml_backend_buffer_t buffer) -> void * {
+        return ((std::vector<uint8_t> *) buffer->context)->data();
+    };
+    iface.set_tensor = [](ggml_backend_buffer_t, ggml_tensor * tensor, const void * src, size_t offset, size_t size) {
+        memcpy((char *) tensor->data + offset, src, size);
+    };
+    iface.get_tensor = [](ggml_backend_buffer_t, const ggml_tensor * tensor, void * dst, size_t offset, size_t size) {
+        memcpy(dst, (char *) tensor->data + offset, size);
+    };
+    iface.clear = [](ggml_backend_buffer_t buffer, uint8_t value) {
+        auto & data = *(std::vector<uint8_t> *) buffer->context;
+        std::fill(data.begin(), data.end(), value);
+    };
+    return ggml_backend_buffer_init(buft, iface, data, size);
+}
+
+struct scheduler_copy_state {
+    struct copy {
+        ggml_tensor * dst;
+        const void * data;
+        size_t size;
+    };
+    ggml_tensor * input = nullptr;
+    ggml_tensor * activation = nullptr;
+    ggml_tensor * weight = nullptr;
+    std::vector<std::vector<uint8_t>> snapshots;
+    std::vector<copy> queued;
+    int mode = 0;
+    int input_calls = 0;
+    int weight_calls = 0;
+    int consumed = 0;
+};
+
+static ggml_status scheduler_copy_graph_compute(ggml_backend_t backend, ggml_cgraph * graph) {
+    auto & state = *(scheduler_copy_state *) backend->context;
+    for (const auto & copy : state.queued) {
+        ggml_backend_tensor_set(copy.dst, copy.data, 0, copy.size);
+        ++state.consumed;
+    }
+    state.queued.clear();
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        ggml_tensor * node = graph->nodes[i];
+        if (ggml_is_view_op(node->op) || node->op == GGML_OP_NONE) {
+            continue;
+        }
+        GGML_ASSERT(node->type == GGML_TYPE_F32);
+        auto * dst = (float *) node->data;
+        const auto * src = (const float *) node->src[0]->data;
+        for (int64_t j = 0; j < ggml_nelements(node); ++j) {
+            if (node->op == GGML_OP_SCALE) {
+                dst[j] = src[j] * ggml_get_op_params_f32(node, 0);
+            } else {
+                GGML_ASSERT(node->op == GGML_OP_ADD);
+                dst[j] = src[j] + ((const float *) node->src[1]->data)[j];
+            }
+        }
+    }
+    return GGML_STATUS_SUCCESS;
+}
+
+static bool scheduler_copy_input(ggml_backend_t, const ggml_tensor * src, ggml_tensor * dst, void * user_data) {
+    auto & state = *(scheduler_copy_state *) user_data;
+    GGML_ASSERT(src == state.input || src == state.activation);
+    GGML_ASSERT(ggml_backend_buffer_get_usage(src->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    GGML_ASSERT(state.weight_calls == 0);
+    ++state.input_calls;
+    if (state.mode == 1) {
+        return false;
+    }
+    state.snapshots.emplace_back(ggml_nbytes(src));
+    auto & snapshot = state.snapshots.back();
+    ggml_backend_tensor_get(src, snapshot.data(), 0, snapshot.size());
+    state.queued.push_back({ dst, snapshot.data(), snapshot.size() });
+    // Reuse the CPU input before the queued destination upload consumes its snapshot.
+    const float overwritten[] = { -1000, -1000, -1000, -1000 };
+    ggml_backend_tensor_set((ggml_tensor *) src, overwritten, 0, sizeof(overwritten));
+    return true;
+}
+
+static bool scheduler_copy_weight(ggml_backend_t, const ggml_tensor * src, ggml_tensor *, ggml_cgraph *, void * user_data) {
+    auto & state = *(scheduler_copy_state *) user_data;
+    GGML_ASSERT(src == state.weight);
+    GGML_ASSERT(ggml_backend_buffer_get_usage(src->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    GGML_ASSERT(state.input_calls == (state.mode == 0 ? 0 : 2));
+    ++state.weight_calls;
+    return false;
+}
+
+static void test_scheduler_input_copy() {
+    // Exclusive dummy buffer types force transfers that two ordinary CPU backends elide.
+    dummy_backend source = dummy_backend_init(SIZE_MAX);
+    dummy_backend destination = dummy_backend_init(SIZE_MAX);
+    scheduler_copy_state state;
+    for (dummy_backend * backend : { &source, &destination }) {
+        backend->buffer_type.iface.alloc_buffer = scheduler_copy_alloc_buffer;
+        backend->context->backend.iface.graph_compute = scheduler_copy_graph_compute;
+        backend->context->backend.context = &state;
+    }
+    auto [ctx, graph, ctx_ptr] = make_context();
+    state.input = make_input_1d(ctx, 4);
+    state.activation = ggml_scale(ctx, state.input, 2.0f);
+    state.weight = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4);
+    ggml_tensor * combined = ggml_add(ctx, state.weight, state.activation);
+    ggml_tensor * out = ggml_add(ctx, combined, state.input);
+    ggml_set_output(out);
+    ggml_build_forward_expand(graph, out);
+
+    ggml_backend_buffer_ptr weights(ggml_backend_buft_alloc_buffer(&source.buffer_type, ggml_nbytes(state.weight)));
+    ggml_tallocr allocator = ggml_tallocr_new(weights.get());
+    ggml_tallocr_alloc(&allocator, state.weight);
+    ggml_backend_buffer_set_usage(weights.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    const float weight[] = { 3, 5, 7, 11 };
+    ggml_backend_tensor_set(state.weight, weight, 0, sizeof(weight));
+
+    ggml_backend_t backends[] = { &destination.context->backend, &source.context->backend };
+    ggml_backend_buffer_type_t bufts[] = { &destination.buffer_type, &source.buffer_type };
+    ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends, bufts, 2, 48, false, false));
+    for (ggml_tensor * tensor : { state.input, state.activation, state.weight }) {
+        ggml_backend_sched_set_tensor_backend(sched.get(), tensor, backends[1]);
+    }
+    for (ggml_tensor * tensor : { combined, out }) {
+        ggml_backend_sched_set_tensor_backend(sched.get(), tensor, backends[0]);
+    }
+    GGML_ASSERT(ggml_backend_dev_type(ggml_backend_get_device(backends[1])) == GGML_BACKEND_DEVICE_TYPE_CPU);
+    ggml_backend_sched_set_copy_callback(sched.get(), scheduler_copy_weight, &state);
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), graph));
+    GGML_ASSERT(ggml_backend_sched_get_n_splits(sched.get()) == 2);
+    for (int mode : { 0, 1, 2, 0 }) {
+        state.mode = mode;
+        state.input_calls = state.weight_calls = state.consumed = 0;
+        state.snapshots.clear();
+        ggml_backend_sched_set_input_copy_callback(sched.get(), mode ? scheduler_copy_input : nullptr, &state);
+        const float input[] = { 1.0f + mode, 2.0f + mode, 3.0f + mode, 4.0f + mode };
+        ggml_backend_tensor_set(state.input, input, 0, sizeof(input));
+        GGML_ASSERT(ggml_backend_sched_graph_compute(sched.get(), graph) == GGML_STATUS_SUCCESS);
+        float actual[4];
+        ggml_backend_tensor_get(out, actual, 0, sizeof(actual));
+        for (int i = 0; i < 4; ++i) {
+            GGML_ASSERT(actual[i] == 3 * input[i] + weight[i]);
+        }
+        GGML_ASSERT(state.input_calls == (mode == 0 ? 0 : 2));
+        GGML_ASSERT(state.weight_calls == 1);
+        GGML_ASSERT(state.consumed == (mode == 2 ? 2 : 0));
+        GGML_ASSERT(state.queued.empty());
+    }
+}
+
 // Check that the size reported by ggml_backend_alloc_ctx_tensors_from_buft_size
 // matches the actual size of the buffer allocated for the ctx tensors
 static ggml_backend_buffer_ptr check_size_matches(ggml_backend_buffer_type_t buft, ggml_context * ctx) {
@@ -1121,6 +1274,7 @@ int main() {
     run("test_buffer_size_zero", test_buffer_size_zero);
     run("test_reallocation", test_reallocation);
     run("test_graph_optimize_alloc_dep", test_graph_optimize_alloc_dep);
+    run("test_scheduler_input_copy", test_scheduler_input_copy);
     run("test_buft_alloc_buffer_n_single_buffer", test_buft_alloc_buffer_n_single_buffer);
     run("test_buft_alloc_buffer_n_multi_buffer", test_buft_alloc_buffer_n_multi_buffer);
     run("test_buft_alloc_buffer_n_zero_size", test_buft_alloc_buffer_n_zero_size);
