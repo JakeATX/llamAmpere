@@ -160,7 +160,7 @@ struct fattn_sj_kvarn_prefill_plan {
     int    work_q           = 0;
     size_t parts_bytes      = 0;     // work_q*n_head*256 floats
     size_t meta_bytes       = 0;     // work_q*n_head float2
-    // [I8SJ] GGML_CUDA_FA_I8QK=1: the group's attention runs the int8-QK kernel (fattn-i8qk.cu) on the expanded f16 K/V
+    // [I8SJ] unless GGML_CUDA_FA_I8QK=0, the group's attention runs the int8-QK kernel (fattn-i8qk.cu) on the expanded f16 K/V
     // (not chunked plans: the int8 kernel writes no partials). Its int8 K takes n_kv*256 bytes per KV head of the group
     // behind the output temporary; the head grouping counts those bytes, so the scratch stays within the same budget.
     bool   i8qk             = false;

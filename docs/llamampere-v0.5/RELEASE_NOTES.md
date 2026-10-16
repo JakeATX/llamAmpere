@@ -340,8 +340,7 @@ New flags:
 - **Prompt cache:** `--cache-disk-path`, `--cache-disk-limit`, `--no-cache-disk`.
 - **Small cards:** `--cache-type-s`, `--spec-draft-window`.
 
-**Opt-in, off by default.** `GGML_CUDA_FA_I8QK=1` gives faster prefill at a small KL cost (+0.0013 nats). It is not in
-any recommended command.
+**I8QK default update.** I8QK was opt-in in v0.5; current builds enable int8 QK prefill with PV16 and KCB by default. Set `GGML_CUDA_FA_I8QK=0` to disable I8QK, or `GGML_CUDA_FA_I8QK_PV16=0` / `GGML_CUDA_FA_I8QK_KCB=0` to disable each option.
 
 ## Bug fixes
 

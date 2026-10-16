@@ -4082,7 +4082,7 @@ static void ggml_cuda_flash_attn_ext_bounded_prefill(
     }
 }
 
-// [I8QK] opt-in int8-QK prefill route (GGML_CUDA_FA_I8QK=1, fattn-i8qk.cu). Takes only ops that would run the f16 MMA
+// [I8QK] default-on int8-QK prefill route (GGML_CUDA_FA_I8QK=0 opts out, fattn-i8qk.cu). Takes only ops that would run the f16 MMA
 // kernel (generic or bounded prefill route) and reuses the reservation the allocator made for that route: the f16 K
 // region holds the int8 K, the f16 V region first stages the f16 K, then holds the f16 V. No new reservation.
 static bool ggml_cuda_flash_attn_ext_i8qk_route(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

@@ -17,7 +17,7 @@ static constexpr int i8qk_nthreads = I8QK_NW*WARP_SIZE;
 bool ggml_cuda_fattn_i8qk_enabled() {
     static const bool v = [] {
         const char * e = getenv("GGML_CUDA_FA_I8QK");
-        return e != nullptr && e[0] == '1' && e[1] == '\0';
+        return e == nullptr || (e[0] == '1' && e[1] == '\0');
     }();
     return v;
 }
@@ -31,7 +31,7 @@ static int ggml_cuda_fattn_i8qk_min_q() {
     return v;
 }
 
-// [I8QK v2] opt-in variants of the route (each read once; unset = the v1 kernel, bit-identical):
+// [I8QK v2] route variants (each read once; PV16 and KCB default on, =0 opts out; other variants stay opt-in):
 //   GGML_CUDA_FA_I8QK_PV16=1  (#151) P.V on f16 MMA with an f16 accumulator (the f16 route's own V.KQ numerics on Ampere,
 //                             twice the f32-accumulate MMA rate on GA10x), O rescaled in half2;
 //   GGML_CUDA_FA_I8QK_KCB=1   (#152) codebook-direct int8 K for tq5_0 / tq6_0 K caches: K is decoded from the codes
@@ -54,16 +54,16 @@ struct i8qk_modes {
     int  kblk; // -1 = global mean (v1), 0 = none, n = block-frozen mean per n tokens
 };
 
-static bool i8qk_env_on(const char * name) {
+static bool i8qk_env_on(const char * name, const bool default_on = false) {
     const char * e = getenv(name);
-    return e != nullptr && e[0] == '1' && e[1] == '\0';
+    return e == nullptr ? default_on : e[0] == '1' && e[1] == '\0';
 }
 
 static const i8qk_modes & ggml_cuda_fattn_i8qk_modes() {
     static const i8qk_modes m = [] {
         i8qk_modes r = {
-            i8qk_env_on("GGML_CUDA_FA_I8QK_PV16"),
-            i8qk_env_on("GGML_CUDA_FA_I8QK_KCB"),
+            i8qk_env_on("GGML_CUDA_FA_I8QK_PV16", true),
+            i8qk_env_on("GGML_CUDA_FA_I8QK_KCB", true),
             i8qk_env_on("GGML_CUDA_FA_I8QK_QH"),
             i8qk_env_on("GGML_CUDA_FA_I8QK_Q2L"),
             -1,
