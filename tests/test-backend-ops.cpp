@@ -5725,6 +5725,195 @@ struct test_gated_delta_net_tc : public test_case {
     }
 };
 
+// Opt-in long recurrence tests also serve as kernel-only performance cases.
+struct test_gated_delta_net_range : public test_gated_delta_net {
+    const std::string profile;
+    const int layout; // 0 contiguous, 1 permuted, 2 offset V, 3 odd V stride, 4 padded aligned V
+
+    test_gated_delta_net_range(int64_t tokens, std::string profile = "mild", int64_t heads = 16,
+                              int64_t seqs = 1, int64_t slots = 1, int32_t emit = 0, int layout = 0)
+        : test_gated_delta_net(GGML_TYPE_F32, heads, 128, tokens, seqs, 3, false, false, slots, emit),
+          profile(std::move(profile)), layout(layout) {}
+
+    std::string vars() override {
+        return test_gated_delta_net::vars() + ",profile=" + profile + ",layout=" + std::to_string(layout);
+    }
+
+    std::string op_desc(ggml_tensor *) override { return "GATED_DELTA_NET_RANGE"; }
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto vector = [&](int64_t heads, int64_t seqs, const char * name) {
+            ggml_tensor * t;
+            if (layout == 1) {
+                t = ggml_new_tensor_4d(ctx, type, head_size, n_seq_tokens, heads, seqs);
+                ggml_set_name(t, name);
+                t = ggml_permute(ctx, t, 0, 2, 1, 3);
+            } else if (name[0] == 'v' && layout >= 2) {
+                const int64_t stride = head_size + (layout == 3 ? 1 : layout == 4 ? 2 : 0);
+                t = ggml_new_tensor_1d(ctx, type, stride * heads * n_seq_tokens * seqs + 1);
+                ggml_set_name(t, name);
+                t = ggml_view_4d(ctx, t, head_size, heads, n_seq_tokens, seqs,
+                    stride * sizeof(float), stride * heads * sizeof(float),
+                    stride * heads * n_seq_tokens * sizeof(float), layout == 2 ? sizeof(float) : 0);
+            } else {
+                t = ggml_new_tensor_4d(ctx, type, head_size, heads, n_seq_tokens, seqs);
+                ggml_set_name(t, name);
+            }
+            return t;
+        };
+        // Broadcast Q/K over both the three V heads and all sequences.
+        ggml_tensor * q = vector(head_count, 1, "q");
+        ggml_tensor * k = vector(head_count, 1, "k");
+        ggml_tensor * v = vector(head_count * v_repeat, n_seqs, "v");
+        ggml_tensor * g = ggml_new_tensor_4d(ctx, type, 1, head_count * v_repeat, n_seq_tokens, n_seqs);
+        ggml_tensor * b = ggml_dup_tensor(ctx, g);
+        ggml_tensor * s = ggml_new_tensor_4d(ctx, type, head_size, head_size, head_count * v_repeat, n_seqs);
+        ggml_set_name(g, "g");
+        ggml_set_name(b, "beta");
+        ggml_set_name(s, "state");
+        return ggml_gated_delta_net(ctx, q, k, v, g, b, s, K, emit_mode);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) { continue; }
+            const std::string name = t->name;
+            if (name == "q" || name == "k") {
+                init_tensor_uniform(t);
+                std::vector<float> data(ggml_nelements(t));
+                ggml_backend_tensor_get(t, data.data(), 0, ggml_nbytes(t));
+                for (size_t row = 0; row < data.size(); row += head_size) {
+                    double ss = 0.0;
+                    for (int i = 0; i < head_size; ++i) { ss += (double) data[row + i] * data[row + i]; }
+                    const float scale = 1.0 / sqrt(ss);
+                    for (int i = 0; i < head_size; ++i) { data[row + i] *= scale; }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else if (name == "g") {
+                init_tensor_uniform(t, profile == "strong" ? -20.0f : -0.02f,
+                                       profile == "strong" ? -4.0f : -0.001f);
+                if (profile == "mixed") {
+                    std::vector<float> data(ggml_nelements(t));
+                    for (size_t i = 0; i < data.size(); ++i) {
+                        data[i] = (i / (head_count * v_repeat)) % 2 ? -12.0f : -1e-5f;
+                    }
+                    ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+                }
+            } else if (name == "beta") {
+                init_tensor_uniform(t, 0.5f, 1.0f);
+            } else if (name == "v" || name == "state") {
+                const float mag = profile == "large" ? 1e12f : 1.0f;
+                init_tensor_uniform(t, -mag, mag);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    uint64_t op_flops(ggml_tensor *) override {
+        return (7 * head_size * head_size + 4 * head_size) * head_count * v_repeat * n_seq_tokens * n_seqs;
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        const size_t output = head_size * head_count * v_repeat * n_seq_tokens * n_seqs;
+        const size_t state = head_size * head_size * head_count * v_repeat * n_seqs;
+        const size_t ingr = emit_mode ? ggml_gated_delta_net_ingr_region(
+            head_size, 1, head_count * v_repeat, n_seqs, K, emit_mode) : 0;
+        const size_t packed = emit_mode ? ggml_gated_delta_net_ingr_width(head_size, 1, emit_mode) *
+            head_count * v_repeat * n_seqs * K : K * state;
+        const size_t expected = output + (emit_mode ? ingr + state * (1 + (n_seq_tokens > K)) : packed);
+        if (n != expected) { return INFINITY; }
+        const char * write_dir = getenv("GGML_TEST_GDN_BASELINE_WRITE");
+        const char * read_dir = getenv("GGML_TEST_GDN_BASELINE_READ");
+        if ((write_dir || read_dir) && (!getenv("GGML_TEST_SEED") || (write_dir && read_dir))) {
+            fprintf(stderr, "GDN baseline requires GGML_TEST_SEED and exactly one READ/WRITE directory\n");
+            return INFINITY;
+        }
+        const std::string key = vars() + (getenv("GGML_TEST_SEED") ? getenv("GGML_TEST_SEED") : "");
+        const std::string id = std::to_string(tbo_fnv1a(key.data(), key.size()));
+        double worst = 0.0;
+        auto check = [&](const char * part, size_t offset, size_t count) {
+            double diff_cpu = 0.0, norm_cpu = 0.0, diff_old = 0.0, norm_old = 0.0;
+            // Limit baseline files to 4 MiB, including the long production shape.
+            constexpr size_t chunk = 1024 * 1024;
+            std::vector<float> old(std::min(chunk, count));
+            for (size_t start = 0; start < count; start += chunk) {
+                const size_t len = std::min(chunk, count - start);
+                const std::string file = "/" + id + "-" + part + "-" + std::to_string(start / chunk) + ".bin";
+                if (write_dir) {
+                    std::ofstream f(std::string(write_dir) + file, std::ios::binary);
+                    f.write((const char *) (a + offset + start), len * sizeof(float));
+                    if (!f) {
+                        fprintf(stderr, "GDN baseline write failed: %s%s\n", write_dir, file.c_str());
+                        worst = INFINITY;
+                    }
+                }
+                if (read_dir) {
+                    std::ifstream f(std::string(read_dir) + file, std::ios::binary);
+                    f.read((char *) old.data(), len * sizeof(float));
+                    if (!f || f.peek() != std::char_traits<char>::eof()) {
+                        fprintf(stderr, "GDN baseline read failed: %s%s\n", read_dir, file.c_str());
+                        worst = INFINITY;
+                    }
+                }
+                for (size_t j = 0; j < len; ++j) {
+                    const double x = a[offset + start + j], y = b[offset + start + j];
+                    if (!std::isfinite(x) || !std::isfinite(y) || (read_dir && !std::isfinite(old[j]))) {
+                        worst = INFINITY;
+                        continue;
+                    }
+                    diff_cpu += (x - y) * (x - y);
+                    norm_cpu += y * y;
+                    if (read_dir) {
+                        diff_old += (x - old[j]) * (x - old[j]);
+                        norm_old += (double) old[j] * old[j];
+                    }
+                }
+            }
+            const double cpu = diff_cpu / std::max(norm_cpu, DBL_MIN);
+            printf("GDN_RANGE %s %s nmse_cpu=%.9e", vars().c_str(), part, cpu);
+            worst = std::max(worst, cpu);
+            if (read_dir) {
+                const double baseline = diff_old / std::max(norm_old, DBL_MIN);
+                printf(" nmse_baseline=%.9e", baseline);
+                worst = std::max(worst, baseline);
+            }
+            printf("\n");
+        };
+        check("output", 0, output);
+        check(emit_mode ? "ingredients" : "snapshots", output, packed);
+        if (emit_mode) {
+            check("final", output + ingr, state);
+            if (n_seq_tokens > K) { check("checkpoint", output + ingr + state, state); }
+        }
+        return worst;
+    }
+};
+
+static void add_gated_delta_net_range_cases(std::vector<std::unique_ptr<test_case>> & cases, bool perf) {
+    if (!perf) {
+        for (int emit : {0, 1, 2}) {
+            cases.emplace_back(new test_gated_delta_net_range(33, "mild", 2, 2, 4, emit, 1));
+            cases.emplace_back(new test_gated_delta_net_range(4, "large", 2, 1, 4, emit));
+            cases.emplace_back(new test_gated_delta_net_range(2, "strong", 2, 1, 1, emit));
+        }
+        for (int layout : {2, 3, 4}) {
+            cases.emplace_back(new test_gated_delta_net_range(33, "mixed", 2, 2, 1, 0, layout));
+        }
+    }
+    if (getenv("GGML_TEST_GDN_RANGE")) {
+        for (int64_t tokens : {512, 4096, 32768}) {
+            for (const char * profile : {"mild", "strong", "large", "mixed"}) {
+                cases.emplace_back(new test_gated_delta_net_range(tokens, profile));
+            }
+            for (int emit : {0, 1, 2}) {
+                cases.emplace_back(new test_gated_delta_net_range(tokens, "mild", 16, 1, 4, emit));
+            }
+        }
+    }
+}
+
 // GGML_OP_GATED_DELTA_NET + GGML_OP_CPY (recurrent cache fusion)
 struct test_gated_delta_net_cache_fusion : public test_case {
     const ggml_type type;
@@ -15978,6 +16167,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_moe_reduce(2048, 15, 40, false, true));
     test_cases.emplace_back(new test_moe_reduce(2048, 16, 32, false, true));
 
+    add_gated_delta_net_range_cases(test_cases, false);
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 65, 1, 3, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
     // Qwen3.8-27B production GDN shape: 16 key heads broadcast to 48 value heads, head size 128,
     // multi-token prefill with ragged lengths, snapshot slots, and permuted (view) inputs.
@@ -16152,6 +16343,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new t(4, 32, 2, 1, 2, t::CW_SET_ROWS, { 3 }, { 7, 11 }));
         test_cases.emplace_back(new t(4, 64, 2, 2, 1, t::CW_NONE, { 3, 0 }, {}, false, true));
         test_cases.emplace_back(new t(4, 64, 4, 1, 4, t::CW_NONE, { 3 }, {}, false, false, 1));
+        test_cases.emplace_back(new t(4, 128, 65, 2, 4, t::CW_NONE, { 3, 0 }, {}, false, false, 1));
+        test_cases.emplace_back(new t(4, 128, 65, 2, 4, t::CW_NONE, { 3, 0 }, {}, false, false, 2));
     }
 
     // [#110] conv ring read in place (GGML_VL_SF_CONVRING=1 folds CONCAT + windows into the ssm_conv on CUDA).
@@ -16933,6 +17126,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 2, 3}, {256, 16, 2, 3}, 1));
     test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 2, 3}, {128, 16, 2, 3}, 2));
     test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 2, 3}, {64, 16, 2, 3}, 3));
+
+    add_gated_delta_net_range_cases(test_cases, true);
 
     // GATED_DELTA_NET: realistic model configurations
     // TG: n_seq_tokens=1 (autoregressive)
