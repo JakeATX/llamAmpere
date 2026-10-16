@@ -7,6 +7,7 @@
 #include "turbo-quant.cuh"
 #include "fattn-query-layout.cuh"
 #include "fattn-sjkvarn-rot.cuh"
+#include "fattn-sjkvarn-fill.h"
 
 #include <cstdint>
 
@@ -1696,7 +1697,7 @@ void launch_fattn(
     const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const bool use_sparse,
     const int warp_size = WARP_SIZE,
     float * partial_dst = nullptr, float2 * partial_meta = nullptr,
-    const int parallel_blocks_override = 0, const bool async_kv_preload = false
+    const int parallel_blocks_override = 0, const bool async_kv_preload = false, const int sj_fill_kv_splits = 0
 ) {
     if constexpr (compact_q5g6) {
         GGML_ASSERT(stream_k && !use_sparse && dst->src[0]->ne[1] == 5 && dst->src[0]->ne[3] == 1);
@@ -1968,6 +1969,15 @@ void launch_fattn(
             // SJ-KVaRN stream kernels pick their own KV split (never together with output_partial)
             GGML_ASSERT(!output_partial);
             parallel_blocks = std::min(parallel_blocks_override, ntiles_KV);
+        }
+
+        // fork: only the scalar 4/4 stream launcher supplies its intra-block KV split count.
+        static const bool sj_fill = [] { const char * e = getenv("GGML_CUDA_SJ_FILL"); return e && strcmp(e, "1") == 0; }();
+        if (sj_fill && sj_fill_kv_splits > 0 && !output_partial && parallel_blocks_override == 0 &&
+            (cc == 800 || cc == 860) && is_sj_kvarn && ggml_get_op_params_i32(KQV, 5) == ((4 << 8) | 4) &&
+            ggml_get_op_params_i32(KQV, 7) == GGML_TYPE_F32 && K->type == GGML_TYPE_TQ6_0 && V->type == GGML_TYPE_TQ6_0) {
+            parallel_blocks = ggml_cuda_sj_fill_split(nsm, max_blocks_per_sm, ntiles_dst, ntiles_KV,
+                                                     n_kv, sj_fill_kv_splits, ggml_nrows(KQV));
         }
 
         if (output_partial) {
