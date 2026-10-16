@@ -2242,7 +2242,7 @@ static void mul_mat_vec_q_switch_type(
 bool ggml_cuda_q8_cacheable(const ggml_backend_cuda_context & ctx, size_t q8_bytes) {
     static const bool q8_cache_disabled = getenv("GGML_CUDA_Q8CACHE") != nullptr && atoi(getenv("GGML_CUDA_Q8CACHE")) == 0;
     // Main stream only: a sibling stream could consume the buffer with no cross-stream ordering.
-    return !q8_cache_disabled && q8_bytes <= (1u << 20) && ctx.curr_stream_no == 0;
+    return !ctx.scratch_borrowed && !q8_cache_disabled && q8_bytes <= (1u << 20) && ctx.curr_stream_no == 0;
 }
 
 // The q8_1 layout depends on the weight type only through the IQ4_XS swizzle (quantize_row_q8_1_cuda), so the

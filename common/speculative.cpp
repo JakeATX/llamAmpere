@@ -1558,6 +1558,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         batch_capacity = std::min<int32_t>(llama_n_batch(ctx_dft), std::max<int32_t>(ubatch_capacity, n_seq * (this->params.n_max + 1)));
         const char * overlap = std::getenv("GGML_MTP_PREFILL_OVERLAP");
         prefill_overlap = overlap && std::strcmp(overlap, "1") == 0;
+        const char * scratch = getenv("LLAMA_MTP_PREFILL_SCRATCH");
+        prefill_overlap = prefill_overlap || (scratch && std::strcmp(scratch, "1") == 0);
         if (prefill_overlap) {
             SPC_INF("%s", "GGML_MTP_PREFILL_OVERLAP=1: coalescing target hidden-state reads\n");
         }

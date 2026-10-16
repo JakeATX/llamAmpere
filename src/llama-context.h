@@ -23,6 +23,7 @@ class llama_moe_cache;
 class llama_b1;
 class llama_ple_prefetch;
 struct llama_moe_output;
+class llama_kv_cache;
 
 class llama_io_read_i;
 class llama_io_write_i;
@@ -492,6 +493,17 @@ private:
 
     // fork: Private MTP storage permits target/draft stream overlap without sharing scratch allocations.
     bool mtp_prefill_async = false;
+    bool mtp_reserve_tight = false;
+    bool mtp_scratch_enabled = false;
+    bool mtp_scratch_active = false;
+    llama_context * mtp_scratch_target = nullptr;
+    std::vector<llama_context *> mtp_scratch_clients;
+    llama_kv_cache * mtp_scratch_cache = nullptr;
+    ggml_backend_t mtp_scratch_backend = nullptr;
+    std::vector<ggml_backend_buffer_ptr> mtp_scratch_views;
+    void mtp_scratch_prepare(bool kv_only);
+    void mtp_scratch_end();
+    bool compute_is_shared() const;
     struct {
         bool enabled = false;
         ggml_context_ptr ctx;

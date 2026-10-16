@@ -147,7 +147,7 @@ public:
                           size_t kv_stream_maximum_pool_bytes = 0,
            llama_sj_kvarn_config   sj_kvarn = llama_sj_kvarn_config());
 
-    ~llama_kv_cache() = default;
+    ~llama_kv_cache() { scratch_cancel(); }
 
     //
     // llama_memory_i
@@ -196,6 +196,12 @@ public:
     ggml_tensor * get_k_storage(int32_t il) const;
     ggml_tensor * get_v_storage(int32_t il) const;
     bool get_v_transposed() const;
+
+    // Borrow unused cache bytes until the consumer is synchronized and releases them.
+    std::vector<ggml_backend_buffer_ptr> scratch_borrow(ggml_backend_buffer_type_t buft, size_t chunk_bytes, size_t max_chunks, size_t min_free_bytes, uint32_t guard_tokens, void (*cancel)(void *), void * user);
+    bool scratch_safe(uint32_t n_tokens) const;
+    void scratch_release();
+    void scratch_cancel();
 
     bool kv_stream_adapt(uint32_t active_tokens, uint32_t query_tokens);
     bool kv_stream_resize_pool(
@@ -445,6 +451,17 @@ private:
     uint32_t sj_kvarn_kv_rows      = 0;     // rows per stream of the K/V tensors (sink + ring + f16 sink rows)
     std::vector<int32_t>  sj_kvarn_free;    // free pool records (stack)
     std::vector<uint16_t> sj_kvarn_ref;     // per pool record reference count
+    struct {
+        void (*cancel)(void *) = nullptr;
+        void * user = nullptr;
+        std::vector<uint32_t> limits;
+        std::vector<int32_t> records;
+        uint32_t first_group = UINT32_MAX;
+        uint32_t guard_tokens = 0;
+        size_t min_free_bytes = 0;
+        size_t record_bytes = 0;
+        ggml_backend_buffer_type_t buft = nullptr;
+    } scratch;
     void     sj_kvarn_reset_stream(uint32_t strm);              // drop all records and state of one stream
     void     sj_kvarn_release_groups(uint32_t strm, uint32_t g0); // drop the stream's records of groups >= g0
     bool     sj_kvarn_alloc_groups(uint32_t strm, uint32_t g0, uint32_t g1); // allocate records for groups [g0, g1)

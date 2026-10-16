@@ -5086,13 +5086,13 @@ ggml_tensor * llm_graph_context::build_draft_vocab_logits(
             return draft_vocab_fallback(DRAFT_VOCAB_FALLBACK_HEAD_LAYOUT, why);
         }
     }
-    // the compact logits never reach the host: every output row must be consumed by a backend sampler
+    // fork: Reserve graphs precede sampler setup; real compact output rows need a backend sampler.
     for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
         if (!ubatch.output[i]) {
             continue;
         }
         for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
-            if (samplers.find(ubatch.seq_id[i][j]) == samplers.end()) {
+            if (!is_reserve && samplers.find(ubatch.seq_id[i][j]) == samplers.end()) {
                 return draft_vocab_fallback(DRAFT_VOCAB_FALLBACK_NO_BACKEND_SAMPLER, "an output row has no backend sampler");
             }
         }

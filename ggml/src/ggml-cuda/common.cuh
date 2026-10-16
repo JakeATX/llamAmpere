@@ -1537,6 +1537,8 @@ struct ggml_backend_cuda_context {
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
     void * cublas_workspaces[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
     size_t cublas_workspace_sizes[GGML_CUDA_MAX_DEVICES] = {0};
+    bool scratch_borrowed = false;
+    void * borrowed_blas_workspace = nullptr;
 
     int curr_stream_no = 0;
 
@@ -1747,6 +1749,8 @@ struct ggml_backend_cuda_context {
 
     ~ggml_backend_cuda_context();
 
+    void release_scratch(bool preserve_blas = false);
+
     cudaStream_t stream(int device, int stream) {
         if (streams[device][stream] == nullptr) {
             ggml_cuda_set_device(device);
@@ -1761,6 +1765,7 @@ struct ggml_backend_cuda_context {
 
     cublasHandle_t cublas_handle() {
         if (cublas_handles[device][curr_stream_no] == nullptr) {
+            GGML_ASSERT(!scratch_borrowed);
             ggml_cuda_set_device(device);
             CUBLAS_CHECK(cublasCreate(&cublas_handles[device][curr_stream_no]));
             CUBLAS_CHECK(cublasSetMathMode(cublas_handles[device][curr_stream_no], CUBLAS_TF32_TENSOR_OP_MATH));
