@@ -184,6 +184,13 @@ struct llama_context {
     int encode(const llama_batch & batch_inp);
     int decode(const llama_batch & batch_inp);
 
+    bool mtp_prefill_init();
+    void mtp_prefill_reset(llama_seq_id seq);
+    int mtp_prefill_decode(llama_context & target, llama_batch batch, const float * const * carry, uint32_t n_seq);
+    void mtp_prefill_capture(ggml_tensor * hidden, const llama_ubatch & ubatch);
+    void mtp_prefill_input(llm_graph_input_embd_h & input, const llama_ubatch & ubatch);
+    void mtp_prefill_place(llm_graph_result & res);
+
     //
     // state save/load
     //
@@ -323,6 +330,7 @@ private:
 
     // ggml_backend_sched copy callback, copies only the experts used by MUL_MAT_ID and updates the MoE cache
     static bool sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
+    static bool sched_copy_mtp_inputs(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, void * user_data);
 
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
     // that differs from the layer it belongs to (usually due to missing backend support)
@@ -481,6 +489,26 @@ private:
     // another context of the same model whose compute buffers this context shares (target <-> MTP);
     // the two never compute at the same time, each synchronizes the other before computing
     llama_context * compute_peer = nullptr;
+
+    // fork: Private MTP storage permits target/draft stream overlap without sharing scratch allocations.
+    bool mtp_prefill_async = false;
+    struct {
+        bool enabled = false;
+        ggml_context_ptr ctx;
+        ggml_backend_buffer_ptr buf;
+        ggml_tensor * rows = nullptr;
+        ggml_backend_t backend = nullptr;
+        ggml_backend_event_ptr ready;
+        ggml_backend_event_ptr consumed;
+        bool consuming = false;
+        std::vector<bool> captured;
+        std::vector<llama_pos> carry_pos;
+    } mtp_hidden;
+    llama_context * mtp_hidden_source = nullptr; // scoped to mtp_prefill_decode
+    std::vector<int32_t> mtp_hidden_rows;
+    std::vector<ggml_backend_buffer_ptr> mtp_input_uploads;
+    size_t mtp_input_upload_next = 0;
+    ggml_backend_event_ptr mtp_input_upload_done;
 
     bool sched_need_reserve = true;
     // fork: limit only the reserved graph, not the caller's physical batch size.

@@ -9,6 +9,12 @@
 #include <cstdint>
 #include <map>
 
+// fork: Opt-in logical-batch MTP hidden staging. Returns -4 when the ordinary input path is required.
+LLAMA_API bool llama_mtp_prefill_init(struct llama_context * target);
+LLAMA_API void llama_mtp_prefill_reset(struct llama_context * target, llama_seq_id seq);
+LLAMA_API int llama_mtp_prefill_decode(struct llama_context * draft, struct llama_context * target,
+        struct llama_batch batch, const float * const * carry, uint32_t n_seq);
+
 // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
 LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         struct llama_context * ctx,

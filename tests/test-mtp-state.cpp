@@ -10,6 +10,7 @@
 #include "llama.h"
 
 #include "../src/llama-arch.h"
+#include "../src/llama-ext.h"
 #include "../src/llama-model.h"
 #include "../src/llama-model-saver.h"
 
@@ -40,7 +41,7 @@ static void tensor_data(ggml_tensor * tensor, void *) {
     ggml_backend_tensor_set(tensor, data.data(), 0, ggml_nbytes(tensor));
 }
 
-static llama_model * make_model() {
+static llama_model * make_model(bool no_alloc = false) {
     gguf_context * meta = gguf_init_empty();
     llama_model_saver ms(LLM_ARCH_QWEN35, meta);
     ms.add_kv(LLM_KV_GENERAL_ARCHITECTURE, llm_arch_name(LLM_ARCH_QWEN35));
@@ -71,6 +72,7 @@ static llama_model * make_model() {
     ggml_backend_dev_t devices[] = { nullptr };
     mp.devices = devices;
     mp.load_mtp = true;
+    mp.no_alloc = no_alloc;
     llama_model * model = llama_model_init_from_user(meta, tensor_data, nullptr, mp);
     gguf_free(meta);
     require(model != nullptr, "create fixture model");
@@ -286,32 +288,74 @@ static schedule generate(contexts & ctx, llama_seq_id seq, llama_pos & pos, int 
 
 static void run_prefill_identity(llama_model * model, const cache_config & config) {
     struct env_restore {
-        std::string saved = common_get_env("GGML_MTP_PREFILL_OVERLAP");
-        ~env_restore() { common_set_env("GGML_MTP_PREFILL_OVERLAP", saved); }
+        std::string overlap = common_get_env("GGML_MTP_PREFILL_OVERLAP");
+        std::string async = common_get_env("GGML_MTP_PREFILL_ASYNC");
+        std::string device = common_get_env("GGML_MTP_PREFILL_DEVICE");
+
+        ~env_restore() {
+            common_set_env("GGML_MTP_PREFILL_OVERLAP", overlap);
+            common_set_env("GGML_MTP_PREFILL_ASYNC", async);
+            common_set_env("GGML_MTP_PREFILL_DEVICE", device);
+        }
+
+        void set(bool use_overlap, bool use_async, bool use_device) {
+            common_set_env("GGML_MTP_PREFILL_OVERLAP", use_overlap ? "1" : "0");
+            common_set_env("GGML_MTP_PREFILL_ASYNC", use_async ? "1" : "0");
+            common_set_env("GGML_MTP_PREFILL_DEVICE", use_device ? "1" : "0");
+        }
     } env;
 
-    common_set_env("GGML_MTP_PREFILL_OVERLAP", "");
+    env.set(false, false, false);
     contexts reference(model, config, 128, COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE, 32);
-    common_set_env("GGML_MTP_PREFILL_OVERLAP", "1");
+    env.set(true, false, false);
     contexts coalesced(model, config, 128, COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE, 32);
+    env.set(false, true, false);
+    contexts asynchronous(model, config, 128, COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE, 32);
+    env.set(false, false, true);
+    contexts device(model, config, 128, COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE, 32);
+    env.set(false, true, true);
+    contexts combined(model, config, 128, COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE, 32);
 
+    struct arm {
+        const char * name;
+        contexts * ctx;
+        bool overlap, async, device;
+    };
+    std::vector<arm> arms {
+        { "legacy", &reference, false, false, false },
+        { "overlap", &coalesced, true, false, false },
+        { "async", &asynchronous, false, true, false },
+        { "device", &device, false, false, true },
+        { "async+device", &combined, false, true, true },
+    };
+    auto check = [](bool condition, const arm & variant, const char * message) {
+        if (!condition) {
+            throw std::runtime_error(std::string(variant.name) + ": " + message);
+        }
+    };
     auto check_state = [&](llama_seq_id seq) {
         const snapshot a = save(reference, seq);
-        const snapshot b = save(coalesced, seq);
-        require(a.tgt == b.tgt, "overlap on/off target state is bit-identical");
-        require(a.dft == b.dft, "overlap on/off drafter KV is bit-identical");
-        require(a.spec == b.spec, "overlap on/off carry and deferred state is bit-identical");
+        for (size_t i = 1; i < arms.size(); ++i) {
+            const auto & variant = arms[i];
+            const snapshot b = save(*variant.ctx, seq);
+            check(a.tgt == b.tgt, variant, "target state is bit-identical");
+            check(a.dft == b.dft, variant, "drafter KV is bit-identical");
+            check(a.spec == b.spec, variant, "carry and deferred state is bit-identical");
+        }
     };
-    auto process_pair = [&](common_batch & batch) {
-        for (contexts * ctx : { &reference, &coalesced }) {
-            common_batch input(ctx->tgt);
+    auto process_all = [&](common_batch & batch) {
+        for (const auto & variant : arms) {
+            env.set(variant.overlap, variant.async, variant.device);
+            common_batch input(variant.ctx->tgt);
             input.tokens = batch.tokens;
-            require(llama_process(ctx->tgt, LLAMA_PROCESS_TYPE_DECODE, input.get()) == 0, "identity target decode");
-            require(common_speculative_process(ctx->spec, input), "identity MTP process");
+            require(llama_process(variant.ctx->tgt, LLAMA_PROCESS_TYPE_DECODE, input.get()) == 0, "identity target decode");
+            require(common_speculative_process(variant.ctx->spec, input), "identity MTP process");
         }
         if (std::any_of(batch.tokens.begin(), batch.tokens.end(), [](const common_batch::token & t) { return t.output; })) {
-            require(std::memcmp(llama_get_logits_ith(reference.tgt, -1), llama_get_logits_ith(coalesced.tgt, -1),
-                        n_vocab * sizeof(float)) == 0, "overlap on/off target logits are bit-identical");
+            for (size_t i = 1; i < arms.size(); ++i) {
+                check(std::memcmp(llama_get_logits_ith(reference.tgt, -1), llama_get_logits_ith(arms[i].ctx->tgt, -1),
+                            n_vocab * sizeof(float)) == 0, arms[i], "target logits are bit-identical");
+            }
         }
     };
 
@@ -324,7 +368,7 @@ static void run_prefill_identity(llama_model * model, const cache_config & confi
                 batch.add(token_at(pos[seq]), pos[seq], seq, width != 128 && i == width - 1);
                 ++pos[seq];
             }
-            process_pair(batch);
+            process_all(batch);
             check_state(0);
             check_state(1);
         }
@@ -339,35 +383,68 @@ static void run_prefill_identity(llama_model * model, const cache_config & confi
             ++pos[seq];
         }
     }
-    process_pair(batch);
+    process_all(batch);
     check_state(0);
     check_state(1);
 
-    const snapshot cached = save(coalesced, 0);
-    common_set_env("GGML_MTP_PREFILL_OVERLAP", "0");
-    contexts resumed(model, config, 128, COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE, 32);
-    restore(resumed, cached, 1);
-    common_speculative_begin(resumed.spec, 1, llama_tokens(pos[0], 0));
-    llama_pos pos_restored = pos[0];
-    const schedule restored = generate(resumed, 1, pos_restored, 0, 8);
-    common_set_env("GGML_MTP_PREFILL_OVERLAP", "1");
-    contexts resumed_on(model, config, 128, COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE, 32);
-    restore(resumed_on, save(reference, 0), 1);
-    common_speculative_begin(resumed_on.spec, 1, llama_tokens(pos[0], 0));
-    pos_restored = pos[0];
-    require_schedule(generate(resumed_on, 1, pos_restored, 0, 8), restored, "off prompt snapshot restores with switch on into another sequence");
+    std::vector<snapshot> cached;
+    for (const auto & variant : arms) {
+        cached.push_back(save(*variant.ctx, 0));
+    }
+    schedule expected[2];
     for (llama_seq_id seq = 0; seq < 2; ++seq) {
-        common_speculative_begin(reference.spec, seq, llama_tokens(pos[seq], 0));
-        common_speculative_begin(coalesced.spec, seq, llama_tokens(pos[seq], 0));
-        llama_pos pos_ref = pos[seq], pos_got = pos[seq];
-        const schedule expected = generate(reference, seq, pos_ref, 0, 8);
-        require_schedule(generate(coalesced, seq, pos_got, 0, 8), expected, "overlap on/off draft tokens and widths");
-        if (seq == 0) {
-            require_schedule(restored, expected, "overlap prompt snapshot restores with switch off into another sequence");
+        for (size_t i = 0; i < arms.size(); ++i) {
+            const auto & variant = arms[i];
+            env.set(variant.overlap, variant.async, variant.device);
+            common_speculative_begin(variant.ctx->spec, seq, llama_tokens(pos[seq], 0));
+            llama_pos pos_got = pos[seq];
+            const schedule got = generate(*variant.ctx, seq, pos_got, 0, 8);
+            if (i == 0) {
+                expected[seq] = got;
+            } else {
+                require_schedule(got, expected[seq], variant.name);
+            }
         }
         check_state(seq);
     }
-    printf("PASS %s: overlap on/off bit-identical target, draft KV, carry, deferred rows, logits and 16 draft rounds; cache restore in both directions\n", config.name);
+    for (size_t i = 1; i < arms.size(); ++i) {
+        const auto & variant = arms[i];
+        env.set(false, false, false);
+        contexts resumed(model, config, 128, COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE, 32);
+        restore(resumed, cached[i], 1);
+        common_speculative_begin(resumed.spec, 1, llama_tokens(pos[0], 0));
+        llama_pos pos_restored = pos[0];
+        require_schedule(generate(resumed, 1, pos_restored, 0, 8), expected[0], "optimized prompt snapshot restores with switches off into another sequence");
+        env.set(variant.overlap, variant.async, variant.device);
+        contexts resumed_on(model, config, 128, COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE, 32);
+        restore(resumed_on, cached[0], 1);
+        common_speculative_begin(resumed_on.spec, 1, llama_tokens(pos[0], 0));
+        pos_restored = pos[0];
+        require_schedule(generate(resumed_on, 1, pos_restored, 0, 8), expected[0], "legacy prompt snapshot restores with switch on into another sequence");
+    }
+
+    // Reuse one slot at position zero while another slot retains its generated target state.
+    std::vector<snapshot> other;
+    for (const auto & variant : arms) {
+        other.push_back(save(*variant.ctx, 1));
+        require(llama_memory_seq_rm(llama_get_memory(variant.ctx->tgt), 0, -1, -1), "clear restarted target sequence");
+        require(llama_memory_seq_rm(llama_get_memory(variant.ctx->dft), 0, -1, -1), "clear restarted draft sequence");
+    }
+    llama_pos restarted = 0;
+    for (int width : { 128, 3 }) {
+        common_batch input(reference.tgt);
+        for (int i = 0; i < width; ++i) {
+            input.add(token_at(restarted), restarted, 0, i == width - 1);
+            ++restarted;
+        }
+        process_all(input);
+        check_state(0);
+        check_state(1);
+    }
+    for (size_t i = 0; i < other.size(); ++i) {
+        check(save(arms[i].ctx->tgt, 1) == other[i].tgt, arms[i], "restarted slot preserves the other target sequence");
+    }
+    printf("PASS %s: overlap, async, device and async+device match legacy target, draft KV, carry, deferred rows, logits and 16 draft rounds; cross-switch cache restore and slot restart\n", config.name);
 }
 
 static void run_case(llama_model * model, const cache_config & config, bool deferred) {
@@ -487,6 +564,35 @@ static void run_deferred_overflow(llama_model * model, const cache_config & conf
     printf("PASS %s: two restored 60-row deferred states with a 64-row decode capacity, 16 matching draft rounds plus two simultaneous drafts\n", config.name);
 }
 
+static void run_prefill_async_noalloc(llama_model * model) {
+    struct env_restore {
+        std::string async = common_get_env("GGML_MTP_PREFILL_ASYNC");
+        std::string kv_only = common_get_env("LLAMA_MTP_UPDATE_KV_ONLY");
+        ~env_restore() {
+            common_set_env("GGML_MTP_PREFILL_ASYNC", async);
+            common_set_env("LLAMA_MTP_UPDATE_KV_ONLY", kv_only);
+        }
+    } env;
+    common_set_env("GGML_MTP_PREFILL_ASYNC", "1");
+    common_set_env("LLAMA_MTP_UPDATE_KV_ONLY", "1");
+    llama_model_ptr measured_model(make_model(true));
+    const cache_config config { "async no_alloc", GGML_TYPE_Q8_0, GGML_TYPE_Q8_0 };
+    contexts measured(measured_model.get(), config, 128, COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE, 32);
+    contexts allocated(model, config, 128, COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE, 32);
+    auto compute_bytes = [](const llama_context * ctx) {
+        size_t result = 0;
+        for (const auto & entry : llama_get_memory_breakdown(ctx)) {
+            result += entry.second.compute;
+        }
+        return result;
+    };
+    const size_t expected = compute_bytes(measured.dft);
+    const size_t actual = compute_bytes(allocated.dft);
+    printf("ASYNC no_alloc draft compute: measured %zu bytes, allocated %zu bytes\n", expected, actual);
+    require(actual > 0 && expected >= actual, "async no_alloc measurement covers catch-up and generation compute buffers");
+    printf("PASS ASYNC: no_alloc compute measurement covers the allocated draft scheduler\n");
+}
+
 static void run_eagle_boundary_restore(llama_model * model) {
     // Only exercise EAGLE's boundary serializer with the hybrid fixture; no EAGLE graph is decoded.
     model->target_layer_ids = { 0, 1, 2 };
@@ -564,6 +670,12 @@ int main(int argc, char ** argv) {
                 fprintf(stderr, "FAIL %s (deferred overflow): %s\n", config.name, error.what());
                 ++failed;
             }
+        }
+        try {
+            run_prefill_async_noalloc(model);
+        } catch (const std::exception & error) {
+            fprintf(stderr, "FAIL ASYNC no_alloc: %s\n", error.what());
+            ++failed;
         }
         try {
             run_eagle_boundary_restore(model);

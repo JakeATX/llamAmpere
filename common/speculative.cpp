@@ -1448,6 +1448,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     int32_t batch_capacity = 0;
     int32_t ubatch_capacity = 0;
     bool prefill_overlap = false;
+    bool prefill_device = false;
 
     // One MTP draft driver, three modes (set once in the ctor):
     //   is_mem_shared (gemma4): shares the target KV, runs all heads in one graph.
@@ -1596,6 +1597,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         same_position_draft = is_mem_shared && llama_model_uses_shared_position_draft(llama_get_model(ctx_dft));
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
         chain_graph   = !is_mem_shared && !chain_heads && chain_enabled && llama_model_supports_mtp_chain(llama_get_model(ctx_dft));
+
+        // fork: Stage prompt hidden rows once, then feed the logical catch-up batch by backend copies.
+        prefill_device = !is_mem_shared && !chain_heads && llama_mtp_prefill_init(ctx_tgt);
+        prefill_overlap = prefill_overlap || prefill_device;
+        if (prefill_device) {
+            std::memset(batch.embd, 0, (size_t) batch_capacity * n_embd * sizeof(float));
+        }
 
         if (chain_enabled && !is_mem_shared && !chain_heads && !chain_graph) {
             SPC_WRN("%s", "chained MTP is not supported for this model; using sequential MTP\n");
@@ -1885,6 +1893,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         drop_deferred_from(seq_id, 0);
+        llama_mtp_prefill_reset(params.ctx_tgt, seq_id);
         std::memcpy(pending_h[seq_id].data(), data.data() + sizeof(header), row_bytes);
         if (adaptive) {
             adaptive_ctrl[seq_id].n_cur   = header[3];

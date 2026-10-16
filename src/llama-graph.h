@@ -183,6 +183,7 @@ public:
     ggml_tensor * tokens = nullptr; // I32 [n_batch]
     ggml_tensor * embd   = nullptr; // F32 [n_embd, n_batch]
     ggml_tensor * h      = nullptr; // F32 [n_embd, n_batch]
+    bool h_device = false; // fork: the context supplies hidden rows by backend copy
 
     const int64_t n_embd = 0;
 };
@@ -424,6 +425,7 @@ public:
     ggml_tensor * self_sj_kvarn_desc_edge = nullptr; // tiered body: descriptor of the edge tier (nullptr unless edge layers exist)
     // multi-stream SJ-KVaRN: attended (padded) position count per stream of the ubatch; one FA node per stream
     std::vector<uint32_t> sj_kvarn_n_kv_streams;
+    bool skip_unused = false; // fork: KV-only device-input graphs do not consume attention geometry
 
     // note: these have to be copies because in order to be able to reuse a graph, its inputs
     //       need to carry these parameters with them. otherwise, they can point to freed
@@ -1123,6 +1125,7 @@ public:
     std::map<llama_seq_id, ggml_tensor *> t_sampled_probs;
 
     std::vector<llm_graph_input_ptr> inputs;
+    bool mtp_device_input = false; // fork: device-input and host-input allocations cannot share a graph
 
     ggml_context_ptr ctx_compute;
 
