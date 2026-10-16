@@ -77,6 +77,10 @@ GGML_API size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_i
 // Only valid when the two allocators' graphs never execute concurrently (the caller must synchronize).
 GGML_API void ggml_gallocr_set_donor(ggml_gallocr_t galloc, ggml_gallocr_t donor);
 GGML_API bool ggml_gallocr_shares_buffer(ggml_gallocr_t galloc, int buffer_id);
+// Bind caller-owned compute storage. Discard prior graph tensors and synchronize their work before changing the binding.
+// Oversized graphs fail; NULL restores normal allocation. The buffer must outlive the binding.
+GGML_API bool ggml_gallocr_set_buffer(ggml_gallocr_t galloc, int buffer_id, ggml_backend_buffer_t buffer);
+GGML_API bool ggml_gallocr_set_buffers(ggml_gallocr_t galloc, int buffer_id, ggml_backend_buffer_t * buffers, int n_buffers);
 // Incremented when a recipient grows this (donor) allocator's buffers: graphs it allocated before are stale and must be
 // allocated again (ggml_gallocr_alloc_graph) before they are computed.
 GGML_API uint64_t ggml_gallocr_get_epoch(ggml_gallocr_t galloc);

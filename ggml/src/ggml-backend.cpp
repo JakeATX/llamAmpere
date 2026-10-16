@@ -490,6 +490,61 @@ void ggml_backend_buffer_reset(ggml_backend_buffer_t buffer) {
     }
 }
 
+struct ggml_backend_buffer_view_context {
+    ggml_backend_buffer_t parent;
+    size_t offset;
+};
+
+static void ggml_backend_buffer_view_free(ggml_backend_buffer_t buffer) {
+    delete static_cast<ggml_backend_buffer_view_context *>(buffer->context);
+}
+
+static void * ggml_backend_buffer_view_base(ggml_backend_buffer_t buffer) {
+    auto * ctx = static_cast<ggml_backend_buffer_view_context *>(buffer->context);
+    return static_cast<char *>(ggml_backend_buffer_get_base(ctx->parent)) + ctx->offset;
+}
+
+static ggml_status ggml_backend_buffer_view_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
+    auto * ctx = static_cast<ggml_backend_buffer_view_context *>(buffer->context);
+    // Backend kernels need the parent's buffer context, including device and tensor metadata.
+    tensor->buffer = ctx->parent;
+    return ggml_backend_buffer_init_tensor(ctx->parent, tensor);
+}
+
+static void ggml_backend_buffer_view_clear(ggml_backend_buffer_t buffer, uint8_t value) {
+    auto * ctx = static_cast<ggml_backend_buffer_view_context *>(buffer->context);
+    ggml_tensor tensor = {};
+    tensor.type = GGML_TYPE_I8;
+    tensor.ne[0] = buffer->size;
+    tensor.nb[0] = 1;
+    for (int i = 1; i < GGML_MAX_DIMS; i++) {
+        tensor.ne[i] = 1;
+        tensor.nb[i] = buffer->size;
+    }
+    tensor.data = ggml_backend_buffer_view_base(buffer);
+    tensor.buffer = ctx->parent;
+    ctx->parent->iface.memset_tensor(ctx->parent, &tensor, value, 0, buffer->size);
+}
+
+ggml_backend_buffer_t ggml_backend_buffer_view(ggml_backend_buffer_t parent, size_t offset, size_t size) {
+    if (!parent || offset > parent->size || size > parent->size - offset || size > INT64_MAX ||
+            !parent->iface.get_base || !parent->iface.memset_tensor || ggml_backend_buffer_is_meta(parent)) {
+        return nullptr;
+    }
+    void * base = ggml_backend_buffer_get_base(parent);
+    const size_t alignment = ggml_backend_buffer_get_alignment(parent);
+    if (!base || (reinterpret_cast<uintptr_t>(base) + offset) % alignment != 0) {
+        return nullptr;
+    }
+    ggml_backend_buffer_i iface = {};
+    iface.free_buffer = ggml_backend_buffer_view_free;
+    iface.get_base = ggml_backend_buffer_view_base;
+    iface.init_tensor = ggml_backend_buffer_view_init_tensor;
+    iface.clear = ggml_backend_buffer_view_clear;
+    auto * ctx = new ggml_backend_buffer_view_context{parent, offset};
+    return ggml_backend_buffer_init(parent->buft, iface, ctx, size);
+}
+
 bool ggml_backend_buffer_copy_tensor(const struct ggml_tensor * src, struct ggml_tensor * dst) {
     ggml_backend_buffer_t dst_buf = dst->view_src ? dst->view_src->buffer : dst->buffer;
     if (dst_buf->iface.cpy_tensor) {
@@ -3441,6 +3496,22 @@ bool ggml_backend_sched_set_donor(ggml_backend_sched_t sched, ggml_backend_sched
     }
     ggml_gallocr_set_donor(sched->galloc, donor->galloc);
     return true;
+}
+
+bool ggml_backend_sched_set_buffer(ggml_backend_sched_t sched, ggml_backend_t backend, ggml_backend_buffer_t buffer) {
+    return ggml_backend_sched_set_buffers(sched, backend, buffer ? &buffer : nullptr, buffer ? 1 : 0);
+}
+
+bool ggml_backend_sched_set_buffers(ggml_backend_sched_t sched, ggml_backend_t backend, ggml_backend_buffer_t * buffers, int n_buffers) {
+    if (!sched || !sched->is_reset || sched->is_alloc) {
+        return false;
+    }
+    const int backend_index = ggml_backend_sched_backend_id(sched, backend);
+    if (backend_index < 0 || backend_index >= sched->n_backends) {
+        return false;
+    }
+    ggml_backend_sched_synchronize(sched);
+    return ggml_gallocr_set_buffers(sched->galloc, backend_index, buffers, n_buffers);
 }
 
 uint64_t ggml_backend_sched_get_alloc_epoch(ggml_backend_sched_t sched) {
