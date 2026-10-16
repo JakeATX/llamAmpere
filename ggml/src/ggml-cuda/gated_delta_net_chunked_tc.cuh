@@ -8,12 +8,13 @@ namespace {
 constexpr int GDN_TC_CHUNK = 32;
 constexpr int GDN_TC_COLS = 32;
 constexpr int GDN_TC_LD = GDN_TC_COLS;
+constexpr int GDN_TC_SOLVE_LD = GDN_TC_CHUNK + 1;
 constexpr int GDN_TC_THREADS = 128;
 constexpr int GDN_TC_PACK = 32 * 128 / 2;
 constexpr int GDN_TC_FLOATS = 4 * GDN_TC_CHUNK * GDN_TC_COLS + 2 * GDN_TC_CHUNK;
 constexpr int GDN_TC_SHARED = 4 * GDN_TC_PACK * sizeof(nv_bfloat162) +
                              GDN_TC_FLOATS * sizeof(float) + GDN_TC_CHUNK * sizeof(double);
-static_assert(GDN_TC_SHARED <= 49 * 1024, "GDN TC needs two CTAs per sm_86 SM");
+static_assert(GDN_TC_SHARED <= 49 * 1024, "GDN TC shared-memory budget exceeded");
 
 static __device__ __forceinline__ void gdn_tc_pack_pair(
         nv_bfloat162 * hi, nv_bfloat162 * lo, int r, int c, int ld, float x, float y) {
@@ -53,7 +54,7 @@ static __device__ __forceinline__ void gdn_tc_load_b(
 template <int M, int N, int K>
 static __device__ __forceinline__ void gdn_tc_mm(
         const nv_bfloat162 * ahs, const nv_bfloat162 * als,
-        const nv_bfloat162 * bhs, const nv_bfloat162 * bls, float * c, int cr) {
+        const nv_bfloat162 * bhs, const nv_bfloat162 * bls, float * c, int cr, int products) {
 #if defined(AMPERE_MMA_AVAILABLE)
     using namespace ggml_cuda_mma;
     const int warp = threadIdx.y;
@@ -64,14 +65,18 @@ static __device__ __forceinline__ void gdn_tc_mm(
         for (int p = 0; p < K; p += 16) {
             tile<16, 8, nv_bfloat162> ah, al;
             load_ldmatrix<true>(ah, ahs, row, p / 2, K / 2);
-            load_ldmatrix<true>(al, als, row, p / 2, K / 2);
+            if (products == 3) {
+                load_ldmatrix<true>(al, als, row, p / 2, K / 2);
+            }
 #pragma unroll
             for (int n = 0; n < 2; ++n) {
                 tile<8, 8, nv_bfloat162> bh, bl;
                 gdn_tc_load_b(bh, bhs, col + n * 8, p, K / 2);
-                gdn_tc_load_b(bl, bls, col + n * 8, p, K / 2);
-                mma(sum[n], al, bh);
-                mma(sum[n], ah, bl);
+                if (products == 3) {
+                    gdn_tc_load_b(bl, bls, col + n * 8, p, K / 2);
+                    mma(sum[n], al, bh);
+                    mma(sum[n], ah, bl);
+                }
                 mma(sum[n], ah, bh);
             }
         }
@@ -85,11 +90,12 @@ static __device__ __forceinline__ void gdn_tc_mm(
     }
     __syncthreads();
 #else
-    GGML_UNUSED_VARS(ahs, als, bhs, bls, c, cr);
+    GGML_UNUSED_VARS(ahs, als, bhs, bls, c, cr, products);
     NO_DEVICE_CODE;
 #endif
 }
 
+template <int precision>
 __global__ void __launch_bounds__(GDN_TC_THREADS) gated_delta_net_chunked_tc(
         const float * q, const float * k, const float * v, const float * g, const float * beta,
         const float * input_state, float * output, float * state,
@@ -98,7 +104,7 @@ __global__ void __launch_bounds__(GDN_TC_THREADS) gated_delta_net_chunked_tc(
         int64_t sb1, int64_t sb2, int64_t sb3, uint3 neqk1_magic, uint3 rq3_magic,
         float scale, const int32_t * slot_rows, ggml_cuda_gated_delta_net_state_src state_src) {
 #if defined(AMPERE_MMA_AVAILABLE)
-    extern __shared__ float smem[];
+    extern __shared__ __align__(16) float smem[];
     __shared__ int fallback;
     nv_bfloat162 * ah = reinterpret_cast<nv_bfloat162 *>(smem);
     nv_bfloat162 * al = ah + GDN_TC_PACK;
@@ -118,6 +124,8 @@ __global__ void __launch_bounds__(GDN_TC_THREADS) gated_delta_net_chunked_tc(
     const int col0 = blockIdx.z * GDN_TC_COLS;
     const int iq1 = fastmodulo(h, neqk1_magic);
     const int iq3 = fastdiv(seq, rq3_magic);
+    constexpr int state_products = precision == 1 ? 1 : 3;
+    constexpr int output_products = precision == 3 ? 3 : 1;
     const int64_t D = H * 128 * 128;
     ggml_cuda_pdl_sync();
     const int64_t src_row = state_src.rows ? (int64_t) state_src.rows[seq] * state_src.row_stride : seq * D;
@@ -213,7 +221,7 @@ __global__ void __launch_bounds__(GDN_TC_THREADS) gated_delta_net_chunked_tc(
         const float * kc = k + iq3 * sq3 + t0 * sq2 + iq1 * sq1;
         const float * qc = q + iq3 * sq3 + t0 * sq2 + iq1 * sq1;
         gdn_tc_pack<GDN_TC_CHUNK, 128>(ah, al, kc, sq2, 1, count);
-        gdn_tc_mm<GDN_TC_CHUNK, GDN_TC_CHUNK, 128>(ah, al, ah, al, lower, GDN_TC_CHUNK);
+        gdn_tc_mm<GDN_TC_CHUNK, GDN_TC_CHUNK, 128>(ah, al, ah, al, lower, GDN_TC_CHUNK, state_products);
 #pragma unroll
         for (int j = 0; j < 128 * GDN_TC_COLS / GDN_TC_THREADS; ++j) {
             const int col = threadIdx.y * 8 + j / 4;
@@ -224,11 +232,11 @@ __global__ void __launch_bounds__(GDN_TC_THREADS) gated_delta_net_chunked_tc(
             }
         }
         __syncthreads();
-        gdn_tc_mm<GDN_TC_CHUNK, GDN_TC_COLS, 128>(ah, al, bh, bl, delta, GDN_TC_LD);
+        gdn_tc_mm<GDN_TC_CHUNK, GDN_TC_COLS, 128>(ah, al, bh, bl, delta, GDN_TC_LD, state_products);
         gdn_tc_pack<GDN_TC_CHUNK, 128>(ah, al, qc, sq2, 1, count);
-        gdn_tc_mm<GDN_TC_CHUNK, GDN_TC_COLS, 128>(ah, al, bh, bl, base, GDN_TC_LD);
+        gdn_tc_mm<GDN_TC_CHUNK, GDN_TC_COLS, 128>(ah, al, bh, bl, base, GDN_TC_LD, output_products);
         gdn_tc_pack<GDN_TC_CHUNK, 128>(bh, bl, kc, sq2, 1, count);
-        gdn_tc_mm<GDN_TC_CHUNK, GDN_TC_CHUNK, 128>(ah, al, bh, bl, attn, GDN_TC_CHUNK);
+        gdn_tc_mm<GDN_TC_CHUNK, GDN_TC_CHUNK, 128>(ah, al, bh, bl, attn, GDN_TC_CHUNK, state_products);
         float * lower_t = reinterpret_cast<float *>(ah);
         float * rhs_t = reinterpret_cast<float *>(al);
         for (int e = tid; e < GDN_TC_CHUNK * GDN_TC_CHUNK; e += GDN_TC_THREADS) {
@@ -236,24 +244,24 @@ __global__ void __launch_bounds__(GDN_TC_THREADS) gated_delta_net_chunked_tc(
             const int j = e % GDN_TC_CHUNK;
             // Mask before exp: the upper triangle can overflow under strong decay.
             const float d = i >= j ? expf((float) (prefix[i] - prefix[j])) : 0.0f;
-            lower_t[j * GDN_TC_CHUNK + i] = i > j ? lower[e] * betas[i] * d : 0.0f;
+            lower_t[j * GDN_TC_SOLVE_LD + i] = i > j ? lower[e] * betas[i] * d : 0.0f;
             attn[e] = i >= j ? attn[e] * d : 0.0f;
         }
         for (int e = tid; e < GDN_TC_CHUNK * GDN_TC_COLS; e += GDN_TC_THREADS) {
             const int r = e / GDN_TC_COLS;
             const int c = e % GDN_TC_COLS;
             const float value = r < count ? v[seq * sv3 + (t0 + r) * sv2 + h * sv1 + col0 + c] : 0.0f;
-            rhs_t[c * GDN_TC_CHUNK + r] = betas[r] * (value - decay[r] * delta[r * GDN_TC_LD + c]);
+            rhs_t[c * GDN_TC_SOLVE_LD + r] = betas[r] * (value - decay[r] * delta[r * GDN_TC_LD + c]);
         }
         __syncthreads();
         // Each warp owns eight RHS columns; lanes own token rows.
         float solved[8];
 #pragma unroll
         for (int c = 0; c < 8; ++c) {
-            solved[c] = rhs_t[(threadIdx.y * 8 + c) * GDN_TC_CHUNK + threadIdx.x];
+            solved[c] = rhs_t[(threadIdx.y * 8 + c) * GDN_TC_SOLVE_LD + threadIdx.x];
         }
         for (int j = 0; j < count; ++j) {
-            const float coefficient = lower_t[j * GDN_TC_CHUNK + threadIdx.x];
+            const float coefficient = lower_t[j * GDN_TC_SOLVE_LD + threadIdx.x];
 #pragma unroll
             for (int c = 0; c < 8; ++c) {
                 const float pivot = __shfl_sync(0xffffffff, solved[c], j);
@@ -273,7 +281,7 @@ __global__ void __launch_bounds__(GDN_TC_THREADS) gated_delta_net_chunked_tc(
         __syncthreads();
         gdn_tc_pack<GDN_TC_CHUNK, GDN_TC_CHUNK>(ah, al, attn, GDN_TC_CHUNK, 1);
         // The solve coefficients are dead; reuse them for the intra-chunk output.
-        gdn_tc_mm<GDN_TC_CHUNK, GDN_TC_COLS, GDN_TC_CHUNK>(ah, al, bh, bl, lower, GDN_TC_LD);
+        gdn_tc_mm<GDN_TC_CHUNK, GDN_TC_COLS, GDN_TC_CHUNK>(ah, al, bh, bl, lower, GDN_TC_LD, output_products);
         for (int e = tid; e < count * GDN_TC_COLS; e += GDN_TC_THREADS) {
             const int r = e / GDN_TC_COLS;
             const int c = e % GDN_TC_COLS;
@@ -293,7 +301,7 @@ __global__ void __launch_bounds__(GDN_TC_THREADS) gated_delta_net_chunked_tc(
         }
         __syncthreads();
         // All four FP32 matrices are dead once delta is packed in bh/bl.
-        gdn_tc_mm<128, GDN_TC_COLS, GDN_TC_CHUNK>(ah, al, bh, bl, lower, GDN_TC_LD);
+        gdn_tc_mm<128, GDN_TC_COLS, GDN_TC_CHUNK>(ah, al, bh, bl, lower, GDN_TC_LD, state_products);
         const float carry = decay[count - 1];
 #pragma unroll
         for (int j = 0; j < 128 * GDN_TC_COLS / GDN_TC_THREADS; ++j) {
@@ -326,6 +334,16 @@ static bool ggml_cuda_gdn_tc_enabled() {
         return value != nullptr && atoi(value) == 1;
     }();
     return enabled;
+}
+
+static int ggml_cuda_gdn_tc_precision() {
+    static const int precision = [] {
+        const char * value = getenv("GGML_CUDA_GDN_TC_PRECISION");
+        const int mode = value ? atoi(value) : 3;
+        // Modes 1 (all single) and 2 (single QS and intra-chunk output) are error-budget experiments.
+        return mode == 1 || mode == 2 ? mode : 3;
+    }();
+    return precision;
 }
 
 } // namespace

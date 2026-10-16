@@ -776,9 +776,11 @@ static void ggml_cuda_op_gated_delta_net_impl(
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     if (ggml_cuda_gdn_tc_enabled() && (cc == 800 || cc == 860) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_AMPERE &&
             S_v == 128 && n_tokens >= 512 && !kda && !keep_rs && state_type == GGML_TYPE_F32) {
-        CUDA_SET_SHARED_MEMORY_LIMIT(gated_delta_net_chunked_tc, GDN_TC_SHARED);
+        const int precision = ggml_cuda_gdn_tc_precision();
+        const auto kernel = precision == 1 ? gated_delta_net_chunked_tc<1> : precision == 2 ? gated_delta_net_chunked_tc<2> : gated_delta_net_chunked_tc<3>;
+        CUDA_SET_SHARED_MEMORY_LIMIT(kernel, GDN_TC_SHARED);
         const ggml_cuda_kernel_launch_params params(dim3(H, n_seqs, 128 / GDN_TC_COLS), dim3(WARP_SIZE, 4), GDN_TC_SHARED, stream);
-        ggml_cuda_kernel_launch(gated_delta_net_chunked_tc, params,
+        ggml_cuda_kernel_launch(kernel, params,
             q_d, k_d, v_d, g_d, b_d, s_d, dst_d, (float *) state_d, H, n_tokens, n_seqs,
             sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, init_fastdiv_values(neqk1), init_fastdiv_values(rq3),
             scale, slot_rows, state_src);

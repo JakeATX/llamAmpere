@@ -14868,6 +14868,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
         test_cases.emplace_back(new t(512, 16, 3));
+        if (atoi(gdn_tc_tests) > 1) {
+            for (int64_t n : { 512, 4096, 32768 }) {
+                for (int range : { t::RANGE_MILD, t::RANGE_CORRELATED, t::RANGE_LARGE, t::RANGE_STRONG, t::RANGE_LARGE_MIXED }) {
+                    if (n != 512 || range != t::RANGE_MILD) {
+                        test_cases.emplace_back(new t(n, 16, 3, 1, false, range));
+                    }
+                }
+            }
+        }
         test_cases.emplace_back(new t(513, 1, 3, 2, true, t::RANGE_CORRELATED));
         test_cases.emplace_back(new t(4097, 1, 3, 2, false, t::RANGE_LARGE_MIXED, true));
 
