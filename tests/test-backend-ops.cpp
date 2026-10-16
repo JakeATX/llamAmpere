@@ -5344,7 +5344,7 @@ struct test_gated_delta_net : public test_case {
 
 // fork: Ampere chunked prefill checks output and final state against separate CPU error budgets.
 struct test_gated_delta_net_tc : public test_case {
-    enum input_range { RANGE_MILD, RANGE_STRONG, RANGE_LARGE, RANGE_MIXED, RANGE_CARRY, RANGE_POSITIVE };
+    enum input_range { RANGE_MILD, RANGE_STRONG, RANGE_LARGE, RANGE_MIXED, RANGE_CARRY, RANGE_POSITIVE, RANGE_CORRELATED, RANGE_LARGE_STRONG, RANGE_LARGE_MIXED };
 
     const int64_t head_count;
     const int64_t head_size = 128;
@@ -5361,7 +5361,7 @@ struct test_gated_delta_net_tc : public test_case {
           permuted(permuted), broadcast_qk(broadcast_qk), range(range) {}
 
     std::string vars() override {
-        const char * input_range = range == RANGE_STRONG ? "strong" : range == RANGE_LARGE ? "large" : range == RANGE_MIXED ? "mixed" : range == RANGE_CARRY ? "carry" : range == RANGE_POSITIVE ? "positive" : "mild";
+        const char * input_range = range == RANGE_STRONG ? "strong" : range == RANGE_LARGE ? "large" : range == RANGE_MIXED ? "mixed" : range == RANGE_CARRY ? "carry" : range == RANGE_POSITIVE ? "positive" : range == RANGE_CORRELATED ? "correlated" : range == RANGE_LARGE_STRONG ? "large_strong" : range == RANGE_LARGE_MIXED ? "large_mixed" : "mild";
         return "tc=1,range=" + std::string(input_range) + "," +
                VARS_TO_STR7(head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, broadcast_qk);
     }
@@ -5423,16 +5423,16 @@ struct test_gated_delta_net_tc : public test_case {
 
     uint64_t op_flops(ggml_tensor * t) override {
         GGML_UNUSED(t);
-        return (6ull * head_size * head_size + 4ull * head_size) * head_count * v_repeat * n_seq_tokens * n_seqs;
+        return (7ull * head_size * head_size + 4ull * head_size) * head_count * v_repeat * n_seq_tokens * n_seqs;
     }
 
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
             if (ggml_is_view_op(t->op)) { continue; }
             if (strcmp(t->name, "g") == 0) {
-                if (range == RANGE_STRONG) {
+                if (range == RANGE_STRONG || range == RANGE_LARGE_STRONG) {
                     init_tensor_uniform(t, -90.0f, -20.0f);
-                } else if (range == RANGE_MIXED || range == RANGE_CARRY || range == RANGE_POSITIVE) {
+                } else if (range == RANGE_MIXED || range == RANGE_CARRY || range == RANGE_POSITIVE || range == RANGE_LARGE_MIXED) {
                     std::vector<float> gates(ggml_nelements(t));
                     for (size_t i = 0; i < gates.size(); ++i) {
                         const int64_t token = (i / (head_count * v_repeat)) % n_seq_tokens;
@@ -5450,10 +5450,22 @@ struct test_gated_delta_net_tc : public test_case {
                     init_tensor_uniform(t, -0.001f, -0.00001f);
                 }
             } else if (strcmp(t->name, "beta") == 0) {
-                init_tensor_uniform(t, 0.0f, range == RANGE_CARRY ? 0.0f : 1.0f);
+                init_tensor_uniform(t, range == RANGE_CORRELATED ? 0.9f : 0.0f, range == RANGE_CARRY ? 0.0f : 1.0f);
             } else if (strcmp(t->name, "v") == 0 || strcmp(t->name, "state") == 0) {
-                const float magnitude = range == RANGE_CARRY ? (strcmp(t->name, "state") == 0 ? 1e30f : 0.0f) : range == RANGE_LARGE ? 100000.0f : 1.0f;
+                const bool large = range == RANGE_LARGE || range == RANGE_LARGE_STRONG || range == RANGE_LARGE_MIXED;
+                const float magnitude = range == RANGE_CARRY ? (strcmp(t->name, "state") == 0 ? 1e30f : 0.0f) : large ? 100000.0f : 1.0f;
                 init_tensor_uniform(t, -magnitude, magnitude);
+            } else if (range == RANGE_CORRELATED && (strcmp(t->name, "q") == 0 || strcmp(t->name, "k") == 0)) {
+                // Nearly parallel keys make the triangular recurrence sensitive to BF16 product error.
+                std::vector<float> values(ggml_nelements(t));
+                for (size_t i = 0; i < values.size(); ++i) {
+                    const int64_t d = i % head_size;
+                    const int64_t row = i / head_size;
+                    const int64_t token = permuted ? row % n_seq_tokens : (row / head_count) % n_seq_tokens;
+                    const int64_t head = permuted ? (row / n_seq_tokens) % head_count : row % head_count;
+                    values[i] = ((d * 17 + head * 11) % 31 - 15) / 16.0f + ((d * 3 + token * 7) % 19 - 9) * 0.001f;
+                }
+                ggml_backend_tensor_set(t, values.data(), 0, ggml_nbytes(t));
             } else {
                 init_tensor_uniform(t);
             }
@@ -14851,10 +14863,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new t(n, 1, 3, 2, true,  range));
                 test_cases.emplace_back(new t(n, 1, 3, 2, false, range, true));
             }
+            for (int range : { t::RANGE_CORRELATED, t::RANGE_LARGE_STRONG, t::RANGE_LARGE_MIXED, t::RANGE_CARRY, t::RANGE_POSITIVE }) {
+                test_cases.emplace_back(new t(n, 1, 1, 1, false, range));
+            }
         }
         test_cases.emplace_back(new t(512, 16, 3));
-        test_cases.emplace_back(new t(512, 1, 1, 1, false, t::RANGE_CARRY));
-        test_cases.emplace_back(new t(512, 1, 1, 1, false, t::RANGE_POSITIVE));
+        test_cases.emplace_back(new t(513, 1, 3, 2, true, t::RANGE_CORRELATED));
+        test_cases.emplace_back(new t(4097, 1, 3, 2, false, t::RANGE_LARGE_MIXED, true));
 
         // KDA, full snapshots and both ingredient formats must keep the sequential fallback.
         test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 2, 128, 512, 2, 1, false, true));
@@ -15677,11 +15692,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1024, 1)); // 4h PP-1024
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64
 
-    // fork: Swift prefill timing uses the same scalar-gate fixtures as the CPU comparisons.
+    // fork: prefill timing uses the same scalar-gate fixtures as the CPU comparisons.
     const char * gdn_tc_tests = getenv("GGML_TEST_GDN_TC");
     if (gdn_tc_tests != nullptr && atoi(gdn_tc_tests) != 0) {
         for (int64_t n : { 512, 4096, 32768 }) {
-            test_cases.emplace_back(new test_gated_delta_net_tc(n, 16, 3));
+            using t = test_gated_delta_net_tc;
+            for (int range : { t::RANGE_MILD, t::RANGE_CORRELATED, t::RANGE_STRONG, t::RANGE_LARGE_MIXED }) {
+                test_cases.emplace_back(new t(n, 16, 3, 1, false, range));
+            }
+            test_cases.emplace_back(new t(n + 1, 16, 3));
         }
     }
 
