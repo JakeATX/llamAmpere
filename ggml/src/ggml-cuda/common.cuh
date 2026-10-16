@@ -1,5 +1,7 @@
 #pragma once
 
+#include "autofuse.cuh"
+
 #include "ggml.h"
 #include "ggml-impl.h"
 #include "ggml-cuda.h"
@@ -1608,11 +1610,14 @@ struct ggml_backend_cuda_context {
     // captured graph can keep referencing it.
     const void ** moe_expert_table_get(const ggml_tensor * src0, int64_t nb_expert, cudaStream_t stream);
 
+    std::vector<ggml_cuda_autofuse_plan> autofuse_plans;
+
     uint64_t graph_epoch = 1;
 
     // Fusion hit counters. Read through ggml_backend_cuda_fusion_count(); test-backend-ops uses
     // them to check that a fusion actually fired, not only that the fused result is right.
     struct {
+        int64_t autofuse      = 0;
         int64_t elem_chain    = 0;   // elementwise chains launched (ggml_cuda_fuse_elem_chain)
         int64_t q8_cache_hits = 0;   // mmvq shared-quantize cache hits
         int64_t fused_add     = 0;   // tuned multi-ADD runs (ggml_cuda_op_fused_add)

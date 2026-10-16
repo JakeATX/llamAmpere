@@ -20,6 +20,7 @@
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
 #include "nmse-masked-inf.h"
+#include "../ggml/src/ggml-impl.h"
 
 #include <algorithm>
 #include <atomic>
@@ -1359,6 +1360,9 @@ struct test_case {
 
     virtual bool run_whole_graph() { return false; }
     virtual bool replay_inputs() { return false; }
+    virtual int graph_replays() { return 1; }
+    virtual bool verify_backend_result(ggml_backend_t backend) { GGML_UNUSED(backend); return true; }
+    virtual bool perf_whole_graph() { return false; }
     virtual std::vector<ggml_tensor *> fusion_test_nodes() { return {}; }
     // Name of a backend fusion counter (see ggml_backend_cuda_fusion_count) that must advance while
     // the graph runs on the tested backend. Backends without the counter are not checked.
@@ -1666,7 +1670,7 @@ struct test_case {
         }
 
         bool cmp_ok = true;
-        for (int round = 0; round < (replay ? 4 : 1); ++round) {
+        for (int round = 0; round < std::max(replay ? 4 : 1, graph_replays()); ++round) {
             // Keep graph shapes and pointers fixed while changing inputs between replays.
             if (round > 0) {
                 initialize_tensors(ctx.get());
@@ -1674,6 +1678,7 @@ struct test_case {
             cmp_ok = ggml_backend_compare_graph_backend(backend1, backend2, gf, callback, &ud,
                                                         run_whole_graph() || replay ? fused_nodes_to_verify.data() : nullptr,
                                                         fused_nodes_to_verify.size()) && cmp_ok;
+            cmp_ok = verify_backend_result(backend1) && cmp_ok;
         }
         bool        fusion_ok = true;
         std::string fusion_err;
@@ -1786,6 +1791,10 @@ struct test_case {
         // build graph
         ggml_cgraph * gf = ggml_new_graph_custom(ctx.get(), graph_nodes, false);
         ggml_build_forward_expand(gf, out);
+        if (perf_whole_graph()) {
+            static std::atomic<uint64_t> next_uid { 1ULL << 63 };
+            gf->uid = next_uid.fetch_add(1);
+        }
 
         // warmup run
         ggml_status status = ggml_backend_graph_compute(backend, gf);
@@ -1811,6 +1820,10 @@ struct test_case {
             const size_t target_size_gpu = 32 * GB;
             size_t target_size = is_cpu ? target_size_cpu : target_size_gpu;
             n_runs = (int)std::min<int64_t>(ggml_graph_size(gf) - ggml_graph_n_nodes(gf), target_size / op_size(out)) + 1;
+        }
+
+        if (perf_whole_graph()) {
+            n_runs = 1;
         }
 
         // duplicate the op
@@ -9652,6 +9665,324 @@ struct test_elem_chain_fusion : public test_case {
     }
 };
 
+// fork: Compare an eligible chain with a copy whose outputs force every intermediate to be stored.
+struct test_autofuse : public test_case {
+    const int length;
+    const ggml_type intermediate;
+    const int layout;
+    const int seed;
+    const std::string barrier;
+    const int64_t width;
+    const int64_t rows;
+    const ggml_glu_op glu;
+    int replay = 0;
+    std::vector<std::pair<ggml_tensor *, ggml_tensor *>> exact_pairs;
+    std::vector<ggml_tensor *> check_nodes;
+
+    test_autofuse(int length, ggml_type intermediate, int layout, int seed,
+                  std::string barrier = "", int64_t width = 257, int64_t rows = 3, ggml_glu_op glu = GGML_GLU_OP_COUNT)
+        : length(length), intermediate(intermediate), layout(layout), seed(seed),
+          barrier(std::move(barrier)), width(width), rows(rows), glu(glu) {}
+
+    std::string op_desc(ggml_tensor *) override { return "AUTOFUSE"; }
+    std::string vars() override { return VARS_TO_STR7(length, intermediate, layout, seed, barrier, width, rows) + ",glu=" + (glu == GGML_GLU_OP_COUNT ? "none" : ggml_glu_op_name(glu)); }
+    double max_nmse_err() override { return intermediate == GGML_TYPE_BF16 ? 1e-4 : intermediate == GGML_TYPE_F16 ? 1e-6 : 1e-7; }
+    bool run_whole_graph() override { return true; }
+    bool perf_whole_graph() override { return true; }
+    int graph_replays() override { return 3; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return check_nodes; }
+
+    static bool enabled() {
+        const char * e = getenv("GGML_CUDA_AUTOFUSE");
+        const char * disabled = getenv("GGML_CUDA_DISABLE_FUSION");
+        return e != nullptr && strcmp(e, "1") == 0 && (disabled == nullptr || atoi(disabled) == 0);
+    }
+    const char * required_fusion() override { return enabled() && length >= 2 && barrier.empty() && width * rows >= 256 ? "autofuse" : nullptr; }
+    const char * forbidden_fusion() override { return enabled() && length >= 2 && barrier.empty() && width * rows >= 256 ? nullptr : "autofuse"; }
+
+    ggml_tensor * input(ggml_context * ctx, const char * name, bool reference, bool row) {
+        ggml_tensor * t;
+        if (row && layout == 2) {
+            t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2, width);
+        } else if (row) {
+            t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, 1);
+        } else if (layout == 1) {
+            t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width + 7, rows);
+        } else {
+            t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, rows);
+        }
+        ggml_set_name(t, (std::string(name) + (reference ? "_ref" : "")).c_str());
+        if (!row && layout == 1) {
+            t = ggml_view_2d(ctx, t, width, rows, t->nb[1], 3 * sizeof(float));
+        } else if (row && layout == 2) {
+            t = ggml_transpose(ctx, ggml_view_2d(ctx, t, 1, width, t->nb[1], 0));
+        }
+        return t;
+    }
+
+    virtual ggml_tensor * chain(ggml_context * ctx, bool reference, std::vector<ggml_tensor *> & observed) {
+        ggml_tensor * cur = input(ctx, "autofuse_x", reference, false);
+        ggml_tensor * row = input(ctx, "autofuse_row", reference, true);
+        ggml_tensor * side = nullptr;
+        ggml_tensor * gate = nullptr;
+        if (glu != GGML_GLU_OP_COUNT) {
+            gate = input(ctx, "autofuse_gate", reference, false);
+            if (intermediate != GGML_TYPE_F32) {
+                cur = ggml_cast(ctx, cur, intermediate);
+                gate = ggml_cast(ctx, gate, intermediate);
+                ggml_set_output(cur);
+                ggml_set_output(gate);
+            }
+        }
+        std::mt19937 rng(seed);
+        bool nonnegative = false;
+        for (int i = 0; i < length; ++i) {
+            if (i == 0 && glu != GGML_GLU_OP_COUNT) {
+                cur = ggml_glu_split(ctx, cur, gate, glu);
+            } else if (glu != GGML_GLU_OP_COUNT) {
+                cur = ggml_sub(ctx, cur, row);
+            } else if (i == 0) {
+                cur = barrier == "inplace" ? ggml_sub_inplace(ctx, cur, row) : ggml_sub(ctx, cur, row);
+            } else if (!barrier.empty()) {
+                cur = ggml_sqr(ctx, cur);
+            } else if (intermediate != GGML_TYPE_F32 && i == 1) {
+                cur = ggml_cast(ctx, cur, intermediate);
+            } else if (intermediate != GGML_TYPE_F32 && i == 2) {
+                cur = ggml_add(ctx, cur, row);
+            } else if (intermediate != GGML_TYPE_F32 && i == 3) {
+                cur = ggml_cast(ctx, cur, GGML_TYPE_F32);
+            } else {
+                switch (rng() % 16) {
+                    case  0: cur = ggml_add(ctx, cur, row); break;
+                    case  1: cur = ggml_sub(ctx, cur, row); nonnegative = false; break;
+                    case  2: cur = ggml_mul(ctx, cur, row); break;
+                    case  3: cur = ggml_div(ctx, cur, row); break;
+                    case  4: cur = ggml_scale_bias(ctx, cur, 0.5f, 0.03125f); break;
+                    case  5: cur = ggml_sqr(ctx, cur); nonnegative = true; break;
+                    case  6: cur = nonnegative ? ggml_sqrt(ctx, cur) : ggml_abs(ctx, cur); nonnegative = true; break;
+                    case  7: cur = ggml_silu(ctx, cur); break;
+                    case  8: cur = ggml_gelu(ctx, cur); break;
+                    case  9: cur = ggml_sigmoid(ctx, cur); nonnegative = true; break;
+                    case 10: cur = ggml_tanh(ctx, cur); break;
+                    case 11: cur = ggml_clamp(ctx, cur, -0.75f, 0.75f); break;
+                    case 12: cur = ggml_neg(ctx, cur); nonnegative = false; break;
+                    case 13: cur = ggml_relu(ctx, cur); nonnegative = true; break;
+                    case 14: cur = i < 3 ? ggml_exp(ctx, cur) : ggml_abs(ctx, cur); nonnegative = true; break;
+                    case 15: cur = ggml_softplus(ctx, cur); nonnegative = true; break;
+                }
+            }
+            if (reference || (i == 0 && barrier == "output")) {
+                ggml_set_output(cur);
+            }
+            if (i == 0 && (barrier == "consumer" || barrier == "view" || barrier == "split")) {
+                ggml_tensor * src = barrier == "view" ? ggml_view_tensor(ctx, cur) : cur;
+                side = ggml_sum(ctx, src);
+            } else if (i == 0 && barrier == "cpy") {
+                ggml_tensor * state = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, rows);
+                side = ggml_cpy(ctx, cur, state);
+                if (mode == MODE_TEST) {
+                    ggml_build_forward_expand(gf, side);
+                }
+            }
+        }
+        if (mode == MODE_TEST) {
+            ggml_build_forward_expand(gf, cur);
+            if (side != nullptr) {
+                ggml_build_forward_expand(gf, side);
+                observed.push_back(side);
+            }
+        }
+        observed.push_back(cur);
+        return cur;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        exact_pairs.clear();
+        check_nodes.clear();
+        replay = 0;
+        std::vector<ggml_tensor *> observed;
+        ggml_tensor * out = chain(ctx, false, observed);
+        check_nodes = observed;
+        if (mode != MODE_TEST) {
+            return out;
+        }
+        std::vector<ggml_tensor *> reference;
+        ggml_tensor * out_ref = chain(ctx, true, reference);
+        GGML_ASSERT(reference.size() == observed.size());
+        for (size_t i = 0; i < observed.size(); ++i) {
+            exact_pairs.emplace_back(observed[i], reference[i]);
+            check_nodes.push_back(reference[i]);
+        }
+        if ((seed & 1) == 0) {
+            static std::atomic<uint64_t> next_uid { 1 };
+            gf->uid = next_uid.fetch_add(1);
+        }
+        return ggml_concat(ctx, out, out_ref, 0);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(seed + replay++ * 997);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE) {
+                continue;
+            }
+            if (strncmp(t->name, "autofuse_", 9) == 0) {
+                std::mt19937 input_rng(seed + replay * 997 + (strstr(t->name, "row") != nullptr ? 12345 : strstr(t->name, "gate") != nullptr ? 67890 : 0));
+                std::vector<float> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); ++i) {
+                    data[i] = 0.125f + float(input_rng() & 65535) / 262144.0f;
+                    if (strstr(t->name, "negative") != nullptr) {
+                        data[i] = -data[i];
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else {
+                std::vector<float> data(ggml_nelements(t));
+                for (float & v : data) {
+                    v = float(rng() & 65535) / 65536.0f;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            }
+        }
+    }
+
+    bool verify_backend_result(ggml_backend_t backend) override {
+        if (barrier == "split") {
+            ggml_cgraph split = ggml_graph_view(gf, 0, 2);
+            if (ggml_backend_graph_compute(backend, &split) != GGML_STATUS_SUCCESS) {
+                return false;
+            }
+        }
+        for (const auto & pair : exact_pairs) {
+            std::vector<uint8_t> actual(ggml_nbytes(pair.first));
+            std::vector<uint8_t> expected(ggml_nbytes(pair.second));
+            ggml_backend_tensor_get(pair.first, actual.data(), 0, actual.size());
+            ggml_backend_tensor_get(pair.second, expected.data(), 0, expected.size());
+            if (actual != expected) {
+                printf("AUTOFUSE fused/unfused byte mismatch (replay %d) ", replay);
+                return false;
+            }
+        }
+        return true;
+    }
+};
+
+struct test_autofuse_unary : public test_autofuse {
+    const ggml_op op;
+    const ggml_unary_op unary;
+
+    test_autofuse_unary(ggml_type type, ggml_op op, ggml_unary_op unary = GGML_UNARY_OP_COUNT)
+        : test_autofuse(2, type, 0, 37), op(op), unary(unary) {}
+
+    std::string vars() override {
+        return test_autofuse::vars() + ",op=" + ggml_op_name(op) + ",unary=" +
+            (unary == GGML_UNARY_OP_COUNT ? "none" : ggml_unary_op_name(unary));
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_autofuse::initialize_tensors(ctx);
+        if (op != GGML_OP_UNARY || (unary != GGML_UNARY_OP_NEG && unary != GGML_UNARY_OP_ABS)) {
+            return;
+        }
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op == GGML_OP_NONE && strncmp(t->name, "autofuse_", 9) == 0) {
+                float zeros[2] = { -0.0f, 0.0f };
+                if (strstr(t->name, "row") != nullptr) {
+                    std::swap(zeros[0], zeros[1]);
+                }
+                ggml_backend_tensor_set(t, zeros, 0, sizeof(zeros));
+            }
+        }
+    }
+
+    ggml_tensor * chain(ggml_context * ctx, bool reference, std::vector<ggml_tensor *> & observed) override {
+        ggml_tensor * cur = input(ctx, "autofuse_x", reference, false);
+        if (intermediate != GGML_TYPE_F32) {
+            cur = ggml_cast(ctx, cur, intermediate);
+        } else if (op == GGML_OP_SQRT) {
+            cur = ggml_abs(ctx, cur);
+        } else {
+            cur = ggml_sub(ctx, cur, input(ctx, "autofuse_row", reference, true));
+        }
+        if (reference) {
+            ggml_set_output(cur);
+        }
+        switch (op) {
+            case GGML_OP_UNARY: cur = ggml_unary(ctx, cur, unary); break;
+            case GGML_OP_SQR:   cur = ggml_sqr(ctx, cur); break;
+            case GGML_OP_SQRT:  cur = ggml_sqrt(ctx, cur); break;
+            case GGML_OP_CLAMP: cur = ggml_clamp(ctx, cur, -0.3333f, 0.2777f); break;
+            case GGML_OP_SCALE: cur = ggml_scale_bias(ctx, cur, 0.75f, 0.017f); break;
+            default: GGML_ABORT("invalid autofuse unary test");
+        }
+        if (reference) {
+            ggml_set_output(cur);
+        }
+        if (mode == MODE_TEST) {
+            ggml_build_forward_expand(gf, cur);
+        }
+        observed.push_back(cur);
+        return cur;
+    }
+};
+
+struct test_autofuse_broadcast : public test_autofuse {
+    const int pattern;
+
+    test_autofuse_broadcast(int pattern) : test_autofuse(pattern == 3 ? 3 : 2, GGML_TYPE_F32, 0, 48), pattern(pattern) {}
+    std::string vars() override { return test_autofuse::vars() + ",broadcast_pattern=" + std::to_string(pattern); }
+
+    ggml_tensor * chain(ggml_context * ctx, bool reference, std::vector<ggml_tensor *> & observed) override {
+        const char * suffix = reference ? "_ref" : "";
+        ggml_tensor * a;
+        ggml_tensor * b;
+        if (pattern == 0) {
+            a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 32, 6, 4, 2);
+            b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 8, 2, 2, 1);
+        } else if (pattern == 3) {
+            a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 257, 1);
+            b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 257, 1);
+        } else {
+            a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 257, 3);
+            b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 257, 3);
+        }
+        ggml_set_name(a, (std::string("autofuse_x") + suffix).c_str());
+        ggml_set_name(b, (std::string(pattern == 3 || pattern == 0 ? "autofuse_row" : "autofuse_negative") + suffix).c_str());
+        ggml_tensor * cur;
+        if (pattern == 3) {
+            a = ggml_transpose(ctx, a);
+            b = ggml_transpose(ctx, b);
+            cur = ggml_cast(ctx, a, GGML_TYPE_F16);
+            if (reference) {
+                ggml_set_output(cur);
+            }
+            cur = ggml_cast(ctx, cur, GGML_TYPE_F32);
+        } else {
+            cur = ggml_sub(ctx, a, b);
+        }
+        if (reference) {
+            ggml_set_output(cur);
+        }
+        if (pattern == 0) {
+            cur = ggml_div(ctx, cur, b);
+        } else if (pattern == 1) {
+            cur = ggml_sub(ctx, b, cur);
+        } else if (pattern == 2) {
+            cur = ggml_div(ctx, b, cur);
+        } else {
+            cur = ggml_sub(ctx, cur, b);
+        }
+        if (reference) {
+            ggml_set_output(cur);
+        }
+        if (mode == MODE_TEST) {
+            ggml_build_forward_expand(gf, cur);
+        }
+        observed.push_back(cur);
+        return cur;
+    }
+};
+
 // CONT of the gate half of a joint Q+gate projection, then SIGMOID and MUL (the Qwen3.5 attention
 // gate): the chain must read the strided view in place of the CONT output.
 struct test_elem_chain_cont_head : public test_case {
@@ -13013,6 +13344,41 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 7, 3, 1024, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 48, 5, 1024, {2, 3}, {2, 1}));
     }
+    for (int length = 2; length <= 8; ++length) {
+        for (ggml_type intermediate : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16 }) {
+            for (int layout : { 0, 1, 2 }) {
+                test_cases.emplace_back(new test_autofuse(length, intermediate, layout, 73 + length * 7 + layout));
+            }
+        }
+    }
+    for (ggml_glu_op glu : { GGML_GLU_OP_REGLU, GGML_GLU_OP_GEGLU, GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU_ERF, GGML_GLU_OP_GEGLU_QUICK }) {
+        for (ggml_type intermediate : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16 }) {
+            test_cases.emplace_back(new test_autofuse(2, intermediate, 0, 43, "", 257, 3, glu));
+        }
+    }
+    for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16 }) {
+        for (ggml_unary_op unary : { GGML_UNARY_OP_SILU, GGML_UNARY_OP_GELU, GGML_UNARY_OP_SIGMOID, GGML_UNARY_OP_EXP,
+                                    GGML_UNARY_OP_TANH, GGML_UNARY_OP_RELU, GGML_UNARY_OP_NEG, GGML_UNARY_OP_ABS, GGML_UNARY_OP_SOFTPLUS }) {
+            test_cases.emplace_back(new test_autofuse_unary(type, GGML_OP_UNARY, unary));
+        }
+        test_cases.emplace_back(new test_autofuse_unary(type, GGML_OP_SQR));
+        test_cases.emplace_back(new test_autofuse_unary(type, GGML_OP_SQRT));
+        if (type != GGML_TYPE_BF16) {
+            test_cases.emplace_back(new test_autofuse_unary(type, GGML_OP_CLAMP));
+        }
+        if (type != GGML_TYPE_F16) {
+            test_cases.emplace_back(new test_autofuse_unary(type, GGML_OP_SCALE));
+        }
+    }
+    for (int pattern = 0; pattern < 4; ++pattern) {
+        test_cases.emplace_back(new test_autofuse_broadcast(pattern));
+    }
+    for (const char * barrier : { "output", "consumer", "view", "cpy", "inplace", "split" }) {
+        test_cases.emplace_back(new test_autofuse(2, GGML_TYPE_F32, 0, 29, barrier));
+    }
+    test_cases.emplace_back(new test_autofuse(2, GGML_TYPE_F32, 0, 29, "", 17, 1));
+    test_cases.emplace_back(new test_autofuse(1, GGML_TYPE_F32, 0, 29));
+
     test_cases.emplace_back(new test_elem_chain_fusion({256, 4, 2, 1}, false));
     test_cases.emplace_back(new test_elem_chain_fusion({256, 4, 2, 1}, true));
     test_cases.emplace_back(new test_elem_chain_fusion({256, 4, 2, 1}, false, true));
@@ -16498,6 +16864,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                 test_cases.emplace_back(new test_flash_attn_ext_causal(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, types.first, types.second, {0, 2, 1, 3}, false));
             }
         }
+    }
+
+    for (int64_t width : { 5120, 17408, 262144 }) {
+        for (int length : { 2, 4, 8 }) {
+            test_cases.emplace_back(new test_autofuse(length, GGML_TYPE_F32, 0, 29, "", width, 1));
+            test_cases.emplace_back(new test_autofuse(length, GGML_TYPE_F16, 0, 29, "", width, 1));
+        }
+    }
+
+    for (ggml_glu_op glu : { GGML_GLU_OP_REGLU, GGML_GLU_OP_GEGLU, GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU_ERF, GGML_GLU_OP_GEGLU_QUICK }) {
+        test_cases.emplace_back(new test_autofuse(2, GGML_TYPE_F32, 0, 43, "", 17408, 1, glu));
+    }
+
+    for (int pattern = 0; pattern < 4; ++pattern) {
+        test_cases.emplace_back(new test_autofuse_broadcast(pattern));
     }
 
     // elementwise chain vs the tuned multi-ADD kernel (GGML_CUDA_FUSE_CHAIN=0 to compare)

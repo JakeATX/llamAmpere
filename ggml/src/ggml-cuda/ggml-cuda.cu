@@ -8284,6 +8284,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             }
 
             g_hc_pre_xn_pending.clear();
+            ggml_cuda_autofuse_plan * autofuse = ggml_cuda_autofuse_enabled() && !ggml_cuda_fusion_disabled() && stream_ctx.concurrent_events.empty() ?
+                ggml_cuda_autofuse_prepare(*cuda_ctx, cgraph) : nullptr;
+
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (is_concurrent_event_active) {
@@ -8340,6 +8343,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
 
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+                if (nodes_to_skip == 0 && autofuse) {
+                    nodes_to_skip = ggml_cuda_autofuse_launch(*cuda_ctx, cgraph, i, *autofuse);
+                }
 
                 if (nodes_to_skip != 0) {
 #ifdef GGML_CUDA_DEBUG
@@ -8404,6 +8410,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             }
             // [HCPN] every queued hc_pre must have run: its xn was never written
             GGML_ASSERT(g_hc_pre_xn_pending.empty() && "GGML_CUDA_HC_PRE_XN: a queued hc_pre was not reached");
+            if (autofuse) {
+                ggml_cuda_autofuse_report(*cuda_ctx, *autofuse);
+            }
             for (auto * runtime : kv_stream_runtimes) {
                 ggml_cuda_kv_stream_graph_end(runtime->transfer_ring, cuda_ctx->stream());
             }
@@ -10009,6 +10018,9 @@ int64_t ggml_backend_cuda_fusion_count(ggml_backend_t backend, const char * name
         return -1;
     }
     const ggml_backend_cuda_context * ctx = (const ggml_backend_cuda_context *) backend->context;
+    if (strcmp(name, "autofuse") == 0) {
+        return ctx->fusion_stats.autofuse;
+    }
     if (strcmp(name, "elem_chain") == 0) {
         return ctx->fusion_stats.elem_chain;
     }
