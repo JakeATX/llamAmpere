@@ -1342,6 +1342,9 @@ struct test_case {
         GGML_UNUSED(ctx);
     }
 
+    virtual bool perf_repeats_output() { return true; }
+    virtual bool replay_graph() { return false; }
+
     virtual size_t op_size(ggml_tensor * t) {
         size_t size = ggml_nbytes(t);
         // add source tensors
@@ -1635,7 +1638,7 @@ struct test_case {
         }
         const bool pair_replay = op_desc(out) == "MMQ_PAIR";
         const bool replay = replay_inputs() ||
-            ((out->op == GGML_OP_FLASH_ATTN_EXT || pair_replay) &&
+            ((out->op == GGML_OP_FLASH_ATTN_EXT || pair_replay || replay_graph()) &&
              getenv("GGML_TEST_BACKEND_REPLAY") != nullptr);
         if (replay) {
             if (!pair_replay) {
@@ -1822,7 +1825,7 @@ struct test_case {
             n_runs = (int)std::min<int64_t>(ggml_graph_size(gf) - ggml_graph_n_nodes(gf), target_size / op_size(out)) + 1;
         }
 
-        if (perf_whole_graph()) {
+        if (perf_whole_graph() || !perf_repeats_output()) {
             n_runs = 1;
         }
 
@@ -6779,6 +6782,147 @@ static void add_iq4xs_k4_cases(std::vector<std::unique_ptr<test_case>> & cases, 
             cases.emplace_back(new test_mul_mat_iq4xs_k4(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, 16, n, 256, {2, 1}, {1, 1}));
         }
         cases.emplace_back(new test_mul_mat_iq4xs_k4(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, 16, 9, 256, {1, 1}, {1, 1}));
+    }
+}
+
+// fork: opt-in cases also verify dispatch counters so a fallback cannot hide missing coverage.
+struct test_mul_mat_mmq_prefill : public test_mul_mat {
+    const bool q8_exact;
+    const char * suite;
+
+    test_mul_mat_mmq_prefill(ggml_type type, int64_t m, int64_t n, int64_t k, bool q8_exact, const char * suite,
+            std::array<int64_t, 2> bs = {1, 1}, std::array<int64_t, 2> nr = {1, 1}, int64_t k_v = 0,
+            int64_t m_v = 0, int64_t pad = 0)
+        : test_mul_mat(type, GGML_TYPE_F32, m, n, k, bs, nr, {0, 1, 2, 3}, k_v, 1, false, m_v, pad),
+          q8_exact(q8_exact), suite(suite) {}
+
+    std::string vars() override {
+        return test_mul_mat::vars() + ",mmq_prefill=1,suite=" + suite + ",q8_exact=" + (q8_exact ? "1" : "0");
+    }
+
+    double max_nmse_err() override {
+        return q8_exact ? 1e-6 : test_mul_mat::max_nmse_err();
+    }
+
+    const char * required_fusion() override {
+        const char * master = getenv("GGML_CUDA_MMQ_PREFILL");
+        const char * require = getenv("GGML_TEST_MMQ_PREFILL_REQUIRE_KERNEL");
+        const bool eligible = (strcmp(suite, "swift") == 0 || strcmp(suite, "boundary") == 0) &&
+            n >= 256 && k%256 == 0 && bs[0] == 1 && bs[1] == 1 && nr[0] == 1 && nr[1] == 1 && k_v == 0 && m_v == 0 && pad == 0;
+        return eligible && master != nullptr && strcmp(master, "1") == 0 && require != nullptr && atoi(require) != 0 ? "mmq_prefill" : nullptr;
+    }
+
+    double err(const float * a, const float * b, size_t n_values) override {
+        const char * hash = getenv("GGML_TEST_MMQ_PREFILL_HASH");
+        if (hash != nullptr && atoi(hash) != 0) {
+            std::lock_guard<std::mutex> guard(g_test_output_mutex);
+            printf("MMQ_PREFILL_HASH %s values=%zu hash=%016" PRIx64 "\n", vars().c_str(), n_values, tbo_fnv1a(a, n_values*sizeof(float)));
+        }
+        return test_mul_mat::err(a, b, n_values);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (!q8_exact || strcmp(t->name, "b") != 0) {
+                init_tensor_uniform(t);
+                continue;
+            }
+
+            // CPU q8_K/q8_0 and CUDA q8_1 represent these values exactly, including zero groups.
+            std::vector<float> row(t->ne[0]);
+            for (int64_t r = 0; r < ggml_nrows(t); ++r) {
+                for (int64_t i = 0; i < t->ne[0]; ++i) {
+                    const int group = (i/256 + r)%7;
+                    const float scale = group == 0 ? 0.0f : float(1 << group)*0.125f;
+                    row[i] = scale*(i%32 == 0 ? -127.0f : float((17*i + 13*r)%255 - 127));
+                }
+                const int64_t i3 = r/(t->ne[1]*t->ne[2]);
+                const int64_t i2 = (r/t->ne[1])%t->ne[2];
+                const int64_t i1 = r%t->ne[1];
+                ggml_backend_tensor_set(t, row.data(), i1*t->nb[1] + i2*t->nb[2] + i3*t->nb[3], row.size()*sizeof(float));
+            }
+        }
+    }
+};
+
+struct test_mul_mat_mmq_prefill_norm : public test_mul_mat_mmq_prefill {
+    test_mul_mat_mmq_prefill_norm(ggml_type type, int64_t m, int64_t n, int64_t k)
+        : test_mul_mat_mmq_prefill(type, m, n, k, false, "norm") {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, type_a, k, m);
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_tensor * gamma = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k);
+        ggml_set_name(a, "a");
+        ggml_set_name(b, "b");
+        ggml_set_name(gamma, "gamma");
+        ggml_tensor * norm = ggml_rms_norm(ctx, b, 1e-6f);
+        ggml_tensor * scaled = ggml_mul(ctx, norm, gamma);
+        ggml_tensor * out = ggml_mul_mat(ctx, a, scaled);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    bool run_whole_graph() override { return true; }
+    bool replay_graph() override { return true; }
+    bool perf_repeats_output() override { return false; }
+
+    const char * required_fusion() override {
+        const char * master = getenv("GGML_CUDA_MMQ_PREFILL");
+        const char * q8 = getenv("GGML_CUDA_MMQ_PREFILL_Q8");
+        const char * require = getenv("GGML_TEST_MMQ_PREFILL_REQUIRE_Q8");
+        return master != nullptr && strcmp(master, "1") == 0 && q8 != nullptr && strcmp(q8, "1") == 0 && require != nullptr && atoi(require) != 0 ? "mmq_prefill_q8_hits" : nullptr;
+    }
+
+    void reinit_perf_iter(ggml_context * ctx) override {
+        initialize_tensors(ctx);
+    }
+};
+
+static void add_mmq_prefill_cases(std::vector<std::unique_ptr<test_case>> & cases, bool perf) {
+    const char * enabled = getenv("GGML_TEST_MMQ_PREFILL");
+    if (enabled == nullptr || atoi(enabled) == 0) {
+        return;
+    }
+
+    for (ggml_type type : {GGML_TYPE_IQ4_XS, GGML_TYPE_Q5_0}) {
+        // Swift Qwen3.8-27B projections, in (K, M) order; include the MTP input projection.
+        for (const auto & shape : {std::array<int64_t, 2>{5120, 17408}, {17408, 5120}, {5120, 10240},
+                                  {5120, 6144}, {6144, 5120}, {5120, 12288}, {10240, 5120}}) {
+            for (int64_t n : {512, 2048, 4096}) {
+                cases.emplace_back(new test_mul_mat_mmq_prefill(type, shape[1], n, shape[0], false, "swift"));
+                if (perf) {
+                    cases.emplace_back(new test_mul_mat_mmq_prefill_norm(type, shape[1], n, shape[0]));
+                }
+            }
+        }
+        if (perf) {
+            continue;
+        }
+        for (int64_t k : {256, 512, 5120}) {
+            cases.emplace_back(new test_mul_mat_mmq_prefill_norm(type, 129, 256, k));
+            cases.emplace_back(new test_mul_mat_mmq_prefill_norm(type, 129, 257, k));
+        }
+
+        for (bool exact : {false, true}) {
+            for (int64_t n : {1, 8, 9, 16, 17, 63, 64, 65, 127, 128, 129, 255, 256, 257, 511, 512, 513}) {
+                cases.emplace_back(new test_mul_mat_mmq_prefill(type, 129, n, 768, exact, "boundary"));
+            }
+            // Wide M covers large-grid indexing and partial rows with each tile size.
+            for (int64_t n : {255, 256, 257, 511, 512, 513}) {
+                cases.emplace_back(new test_mul_mat_mmq_prefill(type, 6913, n, 256, exact, "boundary"));
+            }
+            for (int64_t k : {256, 512, 1280}) {
+                cases.emplace_back(new test_mul_mat_mmq_prefill(type, 129, 257, k, exact, "boundary"));
+            }
+            cases.emplace_back(new test_mul_mat_mmq_prefill(type, 129, 257, 768, exact, "view", std::array<int64_t, 2>{1, 1}, std::array<int64_t, 2>{1, 1}, 1024));
+            cases.emplace_back(new test_mul_mat_mmq_prefill(type, 33, 257, 256, exact, "batch", std::array<int64_t, 2>{2, 2}, std::array<int64_t, 2>{2, 1}));
+            cases.emplace_back(new test_mul_mat_mmq_prefill(type, 33, 257, 256, exact, "view", std::array<int64_t, 2>{2, 1}, std::array<int64_t, 2>{1, 1}, 0, 35, 16));
+            if (type == GGML_TYPE_Q5_0) {
+                cases.emplace_back(new test_mul_mat_mmq_prefill(type, 129, 257, 32, exact, "boundary"));
+                cases.emplace_back(new test_mul_mat_mmq_prefill(type, 129, 257, 288, exact, "boundary"));
+            }
+        }
     }
 }
 
@@ -13719,6 +13863,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     add_sj_fill_cases(test_cases, false);
     add_exl3_cpu_cases(test_cases, false);
+    add_mmq_prefill_cases(test_cases, false);
 
     test_cases.emplace_back(new test_generic_init(GGML_OP_GET_ROWS));
     test_cases.emplace_back(new test_generic_init(GGML_OP_SET_ROWS));
@@ -17245,6 +17390,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     add_parwrev_cases(test_cases, true);
     add_sj_fill_cases(test_cases, true);
     add_exl3_cpu_cases(test_cases, true);
+    add_mmq_prefill_cases(test_cases, true);
 
     // Decode/verify attention bandwidth at GQA 6, with q8_0 as a control.
     for (int64_t kv : {32768, 102400}) {

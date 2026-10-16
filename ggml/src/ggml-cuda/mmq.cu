@@ -1,6 +1,7 @@
 #include "common.cuh"
 #include "convrot.cuh"
 #include "mmq.cuh"
+#include "mmq-prefill.cuh"
 #include "quantize.cuh"
 #include "mmid.cuh"
 
@@ -253,13 +254,35 @@ static void ggml_cuda_mul_mat_q_impl(
     if (!ids) {
         const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * y_block_size/y_values_per_block +
             quant_guard_bytes(ne11);
-        ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
+        ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
         ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
+
+        const int64_t s12 = use_native_fp4 ?
+                                ne11 * ne10_padded * sizeof(block_fp4_mmq) / (QK_FP4_MMQ * sizeof(int)) :
+                                ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
+        const int64_t s13 = ne12*s12;
+        mmq_args args = {
+            src0_d, src0->type, nullptr, nullptr, nullptr, dst_d, nullptr,
+            ne00, ne01, ne1, s01, ne11, s1,
+            ne02, ne12, s02, s12, s2,
+            ne03, ne13, s03, s13, s3,
+            ne1, ne1};
+        // fork: prefill can consume a swizzled producer buffer without quantizing it again.
+        // fork: a paired product (paired_src0) reads the same q8_1 buffer in the default layout, so it keeps the default path.
+        const bool use_mmq_prefill = !convrot && !use_native_fp4 && !paired_src0 && ggml_cuda_should_use_mmq_prefill(args);
+        const char * prequantized = use_mmq_prefill ? ggml_cuda_mmq_prefill_q8_lookup(ctx, src1, dst, ne10_padded) : nullptr;
+        if (prequantized == nullptr) {
+            src1_q8_1.alloc(nbytes_src1_q8_1);
+        }
         if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4) {
             src1_scale.alloc(ne13*ne12*ne11);
         }
+        args.y = (const int *) src1_q8_1.ptr;
+        args.y_scale = src0->type == GGML_TYPE_NVFP4 && use_native_fp4 ? src1_scale.ptr : nullptr;
 
-        {
+        if (prequantized != nullptr) {
+            args.y = (const int *) prequantized;
+        } else {
             const int64_t s11 = src1->nb[1] / ts_src1;
             const int64_t s12 = src1->nb[2] / ts_src1;
             const int64_t s13 = src1->nb[3] / ts_src1;
@@ -276,25 +299,17 @@ static void ggml_cuda_mul_mat_q_impl(
 
             } else {
                 quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
-                                       ne11, ne12, ne13, stream);
+                                       ne11, ne12, ne13, stream, use_mmq_prefill);
             }
             CUDA_CHECK(cudaGetLastError());
         }
 
-        // Stride depends on quantization format
-        const int64_t s12 = use_native_fp4 ?
-                                ne11 * ne10_padded * sizeof(block_fp4_mmq) / (QK_FP4_MMQ * sizeof(int)) :
-                                ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
-        const int64_t s13 = ne12*s12;
-
-        const mmq_args args = {
-            src0_d, src0->type, (const int *) src1_q8_1.ptr, nullptr, nullptr, dst_d,
-            src0->type == GGML_TYPE_NVFP4 && use_native_fp4 ? src1_scale.ptr : nullptr,
-            ne00, ne01, ne1, s01, ne11, s1,
-            ne02, ne12, s02, s12, s2,
-            ne03, ne13, s03, s13, s3,
-            ne1, ne1};
-        launch_products(args);
+        if (use_mmq_prefill) {
+            ggml_cuda_mul_mat_q_prefill(args, stream);
+            ctx.fusion_stats.mmq_prefill++;
+        } else {
+            launch_products(args);
+        }
         return;
     }
 

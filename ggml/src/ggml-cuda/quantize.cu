@@ -97,6 +97,7 @@ static __global__ void quantize_q8_1(
     const float  d = amax / 127.0f;
     const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
 
+    // fork: the direct MMQ kernel consumes K pairs from both nibble planes.
     if constexpr (swizzle_iq4) {
         y[ib].qs[2*(iqs % 16) + iqs/16] = q;
     } else {
@@ -464,11 +465,13 @@ static __global__ void quantize_mmq_mxfp4(const float * __restrict__ x,
 }
 
 // scatter: grid over tokens, quantize once, write to all the token's compact rows
-template <mmq_q8_1_ds_layout ds_layout, bool scatter>
+template <mmq_q8_1_ds_layout ds_layout, bool scatter, bool swizzle_iq4 = false>
 static __global__ void quantize_mmq_q8_1(
         const float * __restrict__ x, const int32_t * __restrict__ ids, void * __restrict__ vy,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
         const int64_t ne0, const int ne1, const int ne2, const int n_expert_used) {
+
+    static_assert(!swizzle_iq4 || ds_layout == MMQ_Q8_1_DS_LAYOUT_D4, "IQ4_XS MMQ needs D4 scales");
 
     constexpr int vals_per_scale = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 64 : 32;
     constexpr int vals_per_sum   = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 16 : 32;
@@ -522,13 +525,23 @@ static __global__ void quantize_mmq_q8_1(
         }
     }
 
-    const float d_inv = 127.0f / amax;
+    const float d_inv = swizzle_iq4 && amax == 0.0f ? 0.0f : 127.0f / amax;
     char4 q;
     q.x = roundf(xi.x*d_inv);
     q.y = roundf(xi.y*d_inv);
     q.z = roundf(xi.z*d_inv);
     q.w = roundf(xi.w*d_inv);
-    const float d = 1.0f / d_inv;
+    const float d = swizzle_iq4 && amax == 0.0f ? 0.0f : 1.0f / d_inv;
+
+    if constexpr (swizzle_iq4) {
+        int packed;
+        memcpy(&packed, &q, sizeof(packed));
+        const int t = threadIdx.x%8;
+        const int lo = __shfl_sync(0xFFFFFFFF, packed, t/2, 8);
+        const int hi = __shfl_sync(0xFFFFFFFF, packed, t/2 + 4, 8);
+        const int permuted = __byte_perm(lo, hi, t%2 ? 0x7362 : 0x5140);
+        memcpy(&q, &permuted, sizeof(q));
+    }
 
     // write the block once (normal) or to each of the token's compact rows (scatter)
     const int nwrite = scatter ? n_expert_used : 1;
@@ -588,7 +601,7 @@ void quantize_row_q8_1_cuda(
 void quantize_mmq_q8_1_cuda(
         const float * x, const int32_t * ids, void * vy, const ggml_type type_src0,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
-        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream, bool swizzle_iq4) {
     GGML_ASSERT(ne00 % 4 == 0);
     GGML_ASSERT(ne0 % QK8_1_MMQ == 0);
 
@@ -596,6 +609,12 @@ void quantize_mmq_q8_1_cuda(
     const int64_t block_num_y = (ne0 + 4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) / (4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
     const dim3 num_blocks(ne1, block_num_y, ne2*ne3);
     const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
+    if (swizzle_iq4) {
+        GGML_ASSERT((type_src0 == GGML_TYPE_IQ4_XS || type_src0 == GGML_TYPE_Q5_0) && !ids);
+        quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4, false, true>
+            <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
+        return;
+    }
     switch (mmq_get_q8_1_ds_layout(type_src0)) {
         case MMQ_Q8_1_DS_LAYOUT_D4:
             quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4, false>

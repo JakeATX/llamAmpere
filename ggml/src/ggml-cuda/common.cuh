@@ -1578,6 +1578,23 @@ struct ggml_backend_cuda_context {
         std::vector<retired_buf> retired;        // outgrown buffers, freed at teardown (captured graphs may still use them)
     } q8_cache;
 
+    // fork: one-shot MMQ activation handoff from a producer to its next graph node.
+    struct {
+        char *              ptr = nullptr;
+        size_t              cap = 0;
+        int                 dev = -1;
+        const ggml_tensor * src1 = nullptr;
+        const ggml_tensor * consumer = nullptr;
+        const void *        data = nullptr;
+        uint64_t            epoch = 0;
+        int64_t             ne[GGML_MAX_DIMS] = {};
+        size_t              nb[GGML_MAX_DIMS] = {};
+        int64_t             ne10_padded = 0;
+        int                 layout = 0;
+        cudaStream_t        stream = nullptr;
+        std::vector<retired_buf> retired;
+    } mmq_prefill_cache;
+
     // Same idea for the TQ activation pre-rotation (forward block WHT + q8_1 quantize): the MoE
     // gate and up projections consume the same normed activation, so the rotation ran twice per
     // layer. Keyed by tensor identity, data pointer, size and graph-eval epoch; main-stream only.
@@ -1620,6 +1637,9 @@ struct ggml_backend_cuda_context {
         int64_t autofuse      = 0;
         int64_t elem_chain    = 0;   // elementwise chains launched (ggml_cuda_fuse_elem_chain)
         int64_t q8_cache_hits = 0;   // mmvq shared-quantize cache hits
+        int64_t mmq_prefill = 0;
+        int64_t mmq_prefill_q8 = 0;
+        int64_t mmq_prefill_q8_hits = 0;
         int64_t fused_add     = 0;   // tuned multi-ADD runs (ggml_cuda_op_fused_add)
         int64_t fused_mul     = 0;   // tuned multi-MUL runs (ggml_cuda_op_fused_mul)
         int64_t mul_mat_bias  = 0;   // ADD epilogues folded into mul_mat_vec (bias or a full
@@ -1807,6 +1827,9 @@ struct ggml_backend_cuda_context {
         return pool(device);
     }
 };
+
+char * ggml_cuda_mmq_prefill_q8_lookup(ggml_backend_cuda_context & ctx, const ggml_tensor * src1,
+                                       const ggml_tensor * consumer, int64_t ne10_padded);
 
 struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * x_bias = nullptr;

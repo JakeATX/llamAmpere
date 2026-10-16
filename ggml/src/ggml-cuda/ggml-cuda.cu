@@ -37,6 +37,7 @@
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
+#include "ggml-cuda/mmq-prefill.cuh"
 #include "ggml-cuda/mmv-cr.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
@@ -933,6 +934,10 @@ void ggml_backend_cuda_context::release_scratch(bool preserve_blas) {
     for (const auto & r : q8_cache.retired) {
         free_buf(r.ptr, r.dev);
     }
+    free_buf(mmq_prefill_cache.ptr, mmq_prefill_cache.dev);
+    for (const auto & r : mmq_prefill_cache.retired) {
+        free_buf(r.ptr, r.dev);
+    }
     free_buf(tq_rot_cache.ptr, tq_rot_cache.dev);
     for (const auto & r : tq_rot_cache.retired) {
         free_buf(r.ptr, r.dev);
@@ -955,6 +960,7 @@ void ggml_backend_cuda_context::release_scratch(bool preserve_blas) {
     }
 
     q8_cache = {};
+    mmq_prefill_cache = {};
     tq_rot_cache = {};
     moe_tables.clear();
     moe_tables_retired.clear();
@@ -7084,6 +7090,125 @@ static ggml_type ggml_cuda_add_rms_q8_consumer_type(const ggml_backend_cuda_cont
     return GGML_TYPE_COUNT;
 }
 
+// fork: a producer may hand one swizzled D4 activation to its immediate MMQ consumer.
+static constexpr int GGML_CUDA_MMQ_PREFILL_D4_SWIZZLED = 1;
+
+char * ggml_cuda_mmq_prefill_q8_lookup(ggml_backend_cuda_context & ctx, const ggml_tensor * src1,
+                                       const ggml_tensor * consumer, int64_t ne10_padded) {
+    auto & e = ctx.mmq_prefill_cache;
+    if (ctx.curr_stream_no != 0 || e.epoch != ctx.graph_epoch || e.dev != ctx.device ||
+            e.src1 != src1 || e.data != src1->data || e.consumer != consumer ||
+            e.ne10_padded != ne10_padded || e.layout != GGML_CUDA_MMQ_PREFILL_D4_SWIZZLED || e.stream != ctx.stream()) {
+        return nullptr;
+    }
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        if (e.ne[d] != src1->ne[d] || e.nb[d] != src1->nb[d]) {
+            return nullptr;
+        }
+    }
+    e.epoch = 0;
+    ctx.fusion_stats.mmq_prefill_q8_hits++;
+    return e.ptr;
+}
+
+static bool ggml_cuda_try_rms_norm_mmq(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
+    static const bool enabled = [] {
+        const char * mmq = getenv("GGML_CUDA_MMQ_PREFILL");
+        const char * q8  = getenv("GGML_CUDA_MMQ_PREFILL_Q8");
+        return mmq != nullptr && strcmp(mmq, "1") == 0 && q8 != nullptr && strcmp(q8, "1") == 0;
+    }();
+    if (!enabled || i + 2 >= cgraph->n_nodes || ctx.curr_stream_no != 0 ||
+            !ctx.stream_context().concurrent_events.empty()) {
+        return false;
+    }
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if (cc != 800 && cc != 860) {
+        return false;
+    }
+    ggml_tensor * norm = cgraph->nodes[i];
+    ggml_tensor * mul  = cgraph->nodes[i + 1];
+    ggml_tensor * mm   = cgraph->nodes[i + 2];
+    if (mm->op != GGML_OP_MUL_MAT || mm->src[1] != mul || mm->src[0] == nullptr ||
+            (mm->src[0]->type != GGML_TYPE_IQ4_XS && mm->src[0]->type != GGML_TYPE_Q5_0)) {
+        return false;
+    }
+    const ggml_tensor * gamma = mul->src[0] == norm ? mul->src[1] : mul->src[0];
+    const ggml_tensor * x = norm->src[0];
+    if (gamma == nullptr || x == nullptr || mul->ne[0] <= 0 || mul->ne[0] % 256 != 0 ||
+            mul->ne[0] > std::numeric_limits<int>::max() - MATRIX_ROW_PADDING - 1024 || mul->ne[1] < 256 ||
+            mul->ne[1] > std::numeric_limits<int>::max() || gamma->ne[0] != mul->ne[0] ||
+            ggml_nrows(gamma) != 1 || !ggml_are_same_shape(x, mul) || !ggml_are_same_shape(norm, mul) ||
+            mm->src[0]->ne[0] != mul->ne[0] || mm->src[0]->ne[1] > std::numeric_limits<int>::max()) {
+        return false;
+    }
+    const ggml_backend_dev_t dev = ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), ctx.device);
+    const ggml_tensor * tensors[] = { x, gamma, norm, mul, mm, mm->src[0] };
+    for (const ggml_tensor * t : tensors) {
+        if ((t != mm->src[0] && t->type != GGML_TYPE_F32) || !ggml_is_contiguous(t) || t->ne[2] != 1 ||
+                t->ne[3] != 1 || t->buffer == nullptr || !ggml_backend_buft_is_cuda(t->buffer->buft) ||
+                t->buffer->buft->device != dev) {
+            return false;
+        }
+    }
+    const ggml_tensor * w = mm->src[0];
+    if (ggml_cuda_mul_mat_route(w, mul, mm, cc, ggml_cuda_info().devices[ctx.device].warp_size) != GGML_CUDA_MM_ROUTE_MMQ) {
+        return false;
+    }
+    mmq_args args{};
+    args.x = (const char *) w->data;
+    args.type_x = w->type;
+    args.dst = (float *) mm->data;
+    args.ncols_x = mul->ne[0];
+    args.nrows_x = w->ne[1];
+    args.ncols_dst = args.ncols_y = args.ncols_max = mul->ne[1];
+    args.stride_row_x = w->nb[1]/ggml_type_size(w->type);
+    args.nrows_dst = mm->nb[1]/sizeof(float);
+    args.nchannels_x = args.nchannels_y = args.nsamples_x = args.nsamples_y = 1;
+    if (!ggml_cuda_should_use_mmq_prefill(args)) {
+        return false;
+    }
+    const uintptr_t g0 = (uintptr_t) gamma->data;
+    const uintptr_t m0 = (uintptr_t) mul->data;
+    if ((g0 <= m0 && m0 - g0 < ggml_nbytes(gamma)) || (m0 < g0 && g0 - m0 < ggml_nbytes(mul))) {
+        return false;
+    }
+    const uintptr_t x0 = (uintptr_t) x->data;
+    if (x0 != m0 && ((x0 < m0 && m0 - x0 < ggml_nbytes(x)) || (m0 < x0 && x0 - m0 < ggml_nbytes(mul)))) {
+        return false;
+    }
+    const int outputs[] = { i + 1 };
+    if (!ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, outputs, 1)) {
+        return false;
+    }
+    const int64_t padded = GGML_PAD(mul->ne[0], MATRIX_ROW_PADDING);
+    const size_t blocks = padded/QK8_1_MMQ;
+    if ((size_t) mul->ne[1] > std::numeric_limits<size_t>::max()/sizeof(block_q8_1_mmq)/blocks) {
+        return false;
+    }
+    const size_t bytes = blocks*mul->ne[1]*sizeof(block_q8_1_mmq);
+    auto & e = ctx.mmq_prefill_cache;
+    if (e.dev != ctx.device || e.cap < bytes) {
+        if (e.ptr != nullptr) {
+            e.retired.push_back({ e.ptr, e.cap, e.dev });
+        }
+        CUDA_CHECK(ggml_cuda_device_malloc((void **) &e.ptr, bytes, ctx.device));
+        e.cap = bytes;
+        e.dev = ctx.device;
+    }
+    e.src1 = mul;
+    e.consumer = mm;
+    e.data = mul->data;
+    e.epoch = ctx.graph_epoch;
+    memcpy(e.ne, mul->ne, sizeof(e.ne));
+    memcpy(e.nb, mul->nb, sizeof(e.nb));
+    e.ne10_padded = padded;
+    e.layout = GGML_CUDA_MMQ_PREFILL_D4_SWIZZLED;
+    e.stream = ctx.stream();
+    ggml_cuda_op_rms_norm_mmq_fused(ctx, norm, mul, e.ptr, padded);
+    ctx.fusion_stats.mmq_prefill_q8++;
+    return true;
+}
+
 // [#46] ADD -> RMS_NORM -> MUL(gamma) at nodes i..i+2 (the pre-norm residual of every layer): one kernel writes the
 // residual sum and the normed activation, and prefills the MMVQ q8_1 cache for the first consumer. Opt-in with
 // GGML_CUDA_ADD_RMS_Q8=1 (bit-identical to the unfused path, see tests/test-add-rms-q8.cpp). Returns nodes to skip.
@@ -8122,7 +8247,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
-        ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        if (!ggml_cuda_try_rms_norm_mmq(*cuda_ctx, cgraph, i)) {
+            ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        }
         return 1;
     }
 
@@ -10026,6 +10153,15 @@ int64_t ggml_backend_cuda_fusion_count(ggml_backend_t backend, const char * name
     }
     if (strcmp(name, "q8_cache_hits") == 0) {
         return ctx->fusion_stats.q8_cache_hits;
+    }
+    if (strcmp(name, "mmq_prefill") == 0) {
+        return ctx->fusion_stats.mmq_prefill;
+    }
+    if (strcmp(name, "mmq_prefill_q8") == 0) {
+        return ctx->fusion_stats.mmq_prefill_q8;
+    }
+    if (strcmp(name, "mmq_prefill_q8_hits") == 0) {
+        return ctx->fusion_stats.mmq_prefill_q8_hits;
     }
     if (strcmp(name, "fused_add") == 0) {
         return ctx->fusion_stats.fused_add;

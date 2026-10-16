@@ -1,5 +1,6 @@
 #include "norm.cuh"
 #include "convert.cuh"
+#include "mmq.cuh"
 #include <cstdint>
 #include <climits>
 
@@ -297,6 +298,47 @@ static __global__ void add_rms_norm_mul_f32(const float * a,
             if (lane == 0) {
                 y[ib].ds = make_half2(d, d * qsum);
             }
+        }
+    }
+}
+
+// fork: keep the RMS reduction order and emit the swizzled MMQ D4 activation beside the float output.
+template <int block_size>
+static __global__ void rms_norm_mul_mmq_f32(const float * x, const float * gamma, float * dst,
+                                            block_q8_1_mmq * q8, const int ncols, const int ncols_padded,
+                                            const float eps) {
+    ggml_cuda_pdl_lc();
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int lane = tid % QK8_1;
+    x   += (int64_t) row*ncols;
+    dst += (int64_t) row*ncols;
+
+    float tmp = 0.0f;
+    ggml_cuda_pdl_sync();
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = x[col];
+        tmp += xi * xi;
+    }
+    extern __shared__ float s_sum[];
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+    const float mean = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+
+    for (int col = tid; col - lane < ncols_padded; col += block_size) {
+        float xi = 0.0f;
+        if (col < ncols) {
+            xi = scale * x[col] * gamma[col];
+            dst[col] = xi;
+        }
+        const float amax = warp_reduce_max<QK8_1>(fabsf(xi));
+        const float d_inv = 127.0f / amax;
+        const int8_t q = amax == 0.0f ? 0 : roundf(xi*d_inv);
+        const int64_t ib = (int64_t) (col/QK8_1_MMQ)*gridDim.x + row;
+        const int is = col % QK8_1_MMQ / QK8_1;
+        q8[ib].qs[is*QK8_1 + 2*(lane % 16) + lane/16] = q;
+        if (lane == 0) {
+            q8[ib].d4[is] = 1.0f / d_inv;
         }
     }
 }
@@ -755,6 +797,25 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
                           /*add_s00*/ 0, 0, 0,
                           0, 0, 0, 0,
                           eps, stream);
+}
+
+void ggml_cuda_op_rms_norm_mmq_fused(ggml_backend_cuda_context & ctx, ggml_tensor * norm, ggml_tensor * mul,
+                                     void * q8_dst, int64_t ncols_padded) {
+    const ggml_tensor * gamma = mul->src[0] == norm ? mul->src[1] : mul->src[0];
+    float eps;
+    memcpy(&eps, norm->op_params, sizeof(eps));
+    GGML_ASSERT(eps >= 0.0f);
+    const int ncols = mul->ne[0];
+    const dim3 blocks_num(mul->ne[1], 1, 1);
+    const dim3 block_dims(ncols < 1024 ? 256 : 1024, 1, 1);
+    const ggml_cuda_kernel_launch_params params = { blocks_num, block_dims, 32*sizeof(float), ctx.stream() };
+    if (ncols < 1024) {
+        ggml_cuda_kernel_launch(rms_norm_mul_mmq_f32<256>, params, (const float *) norm->src[0]->data,
+            (const float *) gamma->data, (float *) mul->data, (block_q8_1_mmq *) q8_dst, ncols, (int) ncols_padded, eps);
+    } else {
+        ggml_cuda_kernel_launch(rms_norm_mul_mmq_f32<1024>, params, (const float *) norm->src[0]->data,
+            (const float *) gamma->data, (float *) mul->data, (block_q8_1_mmq *) q8_dst, ncols, (int) ncols_padded, eps);
+    }
 }
 
 void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
