@@ -2941,6 +2941,10 @@ void llama_context::mtp_scratch_end() {
     ggml_backend_sched_reset(sched.get());
     GGML_ASSERT(mtp_reset_backend_scratch(mtp_scratch_backend));
     GGML_ASSERT(ggml_backend_sched_set_buffer(sched.get(), mtp_scratch_backend, nullptr));
+    // Attention can read masked padding before it applies the mask. Remove scratch NaNs from unused KV.
+    for (auto & view : mtp_scratch_views) {
+        ggml_backend_buffer_clear(view.get(), 0);
+    }
     const char * shared = getenv("LLAMA_SHARED_POOL");
     if (compute_peer && (!shared || shared[0] != '0')) {
         auto * dev = ggml_backend_get_device(mtp_scratch_backend);

@@ -20,6 +20,7 @@
 #include "../src/llama-graph.h"
 #include "../src/llama-kv-cache.h"
 #include "../src/llama-memory.h"
+#include "../src/llama-memory-hybrid.h"
 #include "../src/llama-model.h"
 #include "../src/llama-model-saver.h"
 
@@ -746,6 +747,83 @@ static void run_scratch_empty_region(llama_model * model) {
     printf("PASS scratch bounds: an empty unaligned KV suffix cannot be borrowed\n");
 }
 
+static void run_scratch_clear(llama_model * model) {
+    prefill_env_restore env;
+    env.set(false, false, false);
+    const cache_config config { "scratch clear", GGML_TYPE_Q8_0, GGML_TYPE_Q8_0 };
+    contexts reference(model, config, 128, COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE, 32);
+    prefill(reference, 0, 128, 0);
+    env.set(false, false, false, false, true);
+    contexts borrowed(model, config, 128, COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE, 32);
+    auto * hybrid = dynamic_cast<llama_memory_hybrid *>(llama_get_memory(borrowed.tgt));
+    require(hybrid != nullptr, "scratch clear fixture has hybrid target memory");
+    auto * cache = hybrid->get_mem_attn();
+    std::vector<ggml_tensor *> storage_tensors;
+    for (auto il : cache->get_layer_ids()) {
+        storage_tensors.push_back(cache->get_k_storage(il));
+        storage_tensors.push_back(cache->get_v_storage(il));
+    }
+    for (auto * storage : storage_tensors) {
+        std::vector<uint8_t> bytes(ggml_nbytes(storage));
+        ggml_backend_tensor_get(storage, bytes.data(), 0, bytes.size());
+        require(std::all_of(bytes.begin(), bytes.end(), [](uint8_t value) { return value == 0; }), "plain KV starts zero");
+    }
+    const size_t loans = scratch_borrows;
+    prefill(borrowed, 0, 128, 0);
+    require(scratch_borrows > loans, "scratch clear fixture acquired a KV loan");
+    llama_synchronize(borrowed.dft);
+    struct poisoned_range { ggml_tensor * tensor; size_t offset, size; };
+    std::vector<poisoned_range> ranges;
+    for (auto * storage : storage_tensors) {
+        const size_t alignment = ggml_backend_buffer_get_alignment(storage->buffer);
+        require(alignment && alignment <= 256, "scratch clear fixture uses bounded CPU alignment");
+        std::vector<uint8_t> bytes(ggml_nbytes(storage));
+        ggml_backend_tensor_get(storage, bytes.data(), 0, bytes.size());
+        size_t count = 0;
+        for (size_t offset = 0; offset + alignment <= bytes.size() && count < 4; offset += alignment) {
+            if (offset % storage->nb[2] / storage->nb[1] >= 640 &&
+                    std::any_of(bytes.begin() + offset, bytes.begin() + offset + alignment, [](uint8_t value) { return value != 0; })) {
+                // Only the loan wrote these unused rows; a whole alignment block stays inside its borrowed view.
+                ranges.push_back({ storage, offset, alignment });
+                ++count;
+            }
+        }
+    }
+    require(!ranges.empty(), "MTP scratch wrote into unwritten target KV rows");
+    std::vector<uint8_t> poison(256, 0xff);
+    for (const auto & range : ranges) {
+        ggml_backend_tensor_set(range.tensor, poison.data(), range.offset, range.size);
+    }
+    const size_t releases = scratch_releases;
+    common_params_sampling sampling;
+    sampling.temp = 0.0f;
+    llama_tokens expected, actual, prompt;
+    auto draft = [&](contexts & ctx, llama_tokens & tokens) {
+        common_speculative_begin(ctx.spec, 0, llama_tokens(128, 0));
+        auto & dp = common_speculative_get_draft_params(ctx.spec, 0);
+        dp = {};
+        dp.drafting = true;
+        dp.pos0 = 128;
+        dp.id_last = token_at(128);
+        dp.prompt = &prompt;
+        dp.result = &tokens;
+        dp.sampling = &sampling;
+        common_speculative_draft(ctx.spec);
+    };
+    draft(reference, expected);
+    draft(borrowed, actual);
+    require(!actual.empty() && actual == expected, "draft tokens survive poisoned scratch release");
+    require(scratch_releases > releases, "generation released poisoned KV scratch");
+    for (const auto & range : ranges) {
+        std::vector<uint8_t> bytes(range.size);
+        ggml_backend_tensor_get(range.tensor, bytes.data(), range.offset, range.size);
+        require(std::all_of(bytes.begin(), bytes.end(), [](uint8_t value) { return value == 0; }),
+                "released scratch bytes are zero before target attention can read padded KV");
+    }
+    require(save(reference.tgt, 0) == save(borrowed.tgt, 0), "scratch clear preserves written target KV");
+    printf("PASS scratch clear: %zu NaN-poisoned borrowed KV ranges are zero after generation releases the loan; tokens and written KV match legacy\n", ranges.size());
+}
+
 static void run_prefill_async_noalloc(llama_model * model) {
     struct env_restore {
         std::string async = common_get_env("GGML_MTP_PREFILL_ASYNC");
@@ -1036,6 +1114,12 @@ int main(int argc, char ** argv) {
             run_scratch_empty_region(model);
         } catch (const std::exception & error) {
             fprintf(stderr, "FAIL scratch empty region: %s\n", error.what());
+            ++failed;
+        }
+        try {
+            run_scratch_clear(model);
+        } catch (const std::exception & error) {
+            fprintf(stderr, "FAIL scratch clear: %s\n", error.what());
             ++failed;
         }
         try {
