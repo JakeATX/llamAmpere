@@ -71,6 +71,7 @@ __global__ void __launch_bounds__(GDN_TC_THREADS) gated_delta_net_chunked_tc(
         float scale, const int32_t * slot_rows, ggml_cuda_gated_delta_net_state_src state_src) {
 #if defined(AMPERE_MMA_AVAILABLE)
     extern __shared__ float smem[];
+    __shared__ int fallback;
     float * qs = smem;
     float * ks = qs + GDN_TC_CHUNK * GDN_TC_QK_LD;
     float * ss = ks + GDN_TC_CHUNK * GDN_TC_QK_LD;
@@ -139,11 +140,12 @@ __global__ void __launch_bounds__(GDN_TC_THREADS) gated_delta_net_chunked_tc(
                 total += prefix[i];
                 prefix[i] = total;
             }
-            decay[0] = unsafe || total < -80.0 ? 1.0f : 0.0f;
+            fallback = unsafe || total < -80.0;
         }
         __syncthreads();
         // Avoid factoring a decay that can underflow before it multiplies a large state.
-        if (decay[0] != 0.0f) {
+        // The flag stays live until every warp reaches the end-of-chunk barrier.
+        if (fallback) {
             for (int t = 0; t < count; ++t) {
                 const int64_t off = iq3 * sq3 + (t0 + t) * sq2 + iq1 * sq1;
                 const int64_t gb = seq * sb3 + (t0 + t) * sb2 + h * sb1;
