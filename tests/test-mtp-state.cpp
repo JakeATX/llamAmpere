@@ -9,6 +9,7 @@
 // --qwen4exp-pool-only checks incremental pool metadata with the differential validator enabled.
 // --qwen4exp-pool-store[-cuda]-only checks specialized KV-only pool inputs and full-graph continuation.
 // --qwen4exp-full-head[-cuda]-only checks batched full-head proposals and exact sequential suffix repair.
+// --tail-chunks checks ragged prefill and restoration; add --device CUDA0 to run that matrix on CUDA.
 
 #include "common.h"
 #include "log.h"
@@ -229,7 +230,8 @@ struct contexts {
     contexts(llama_model * model, const cache_config & config, uint32_t batch_size = 128,
             common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE, uint32_t ubatch_size = 0, uint32_t parallel = 2, uint32_t context_per_seq = 4096, llama_model * draft_model = nullptr,
             const char * draft_vocab_map = nullptr, bool backend_sampling = true,
-            ggml_backend_sched_eval_callback eval_callback = nullptr, void * eval_user_data = nullptr, int draft_max = 4) {
+            ggml_backend_sched_eval_callback eval_callback = nullptr, void * eval_user_data = nullptr, int draft_max = 4,
+            bool tail_chunks = false) {
         llama_context_params cp = llama_context_default_params();
         cp.cb_eval = eval_callback;
         cp.cb_eval_user_data = eval_user_data;
@@ -238,7 +240,7 @@ struct contexts {
         cp.n_seq_max = parallel;
         cp.n_ctx = context_per_seq * parallel;
         cp.kv_unified = false;
-        cp.n_rs_seq = 4;
+        cp.n_rs_seq = tail_chunks ? 8 : 4;
         cp.n_threads = cp.n_threads_batch = 2;
         cp.offload_kqv = model->n_devices() > 0;
         cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
@@ -251,8 +253,8 @@ struct contexts {
             cp.sj_kvarn_staging_type = GGML_TYPE_TQ6_0;
             cp.sj_kvarn_sink_type = GGML_TYPE_F16;
             cp.sj_kvarn_sink = 128;
-            cp.sj_kvarn_tail = 128;
-            cp.sj_kvarn_tail_max = 256;
+            cp.sj_kvarn_tail = tail_chunks ? 4096 : 128;
+            cp.sj_kvarn_tail_max = tail_chunks ? 8192 : 256;
         }
         tgt = llama_init_from_model(model, cp);
         require(tgt != nullptr, "create target context");
@@ -260,6 +262,9 @@ struct contexts {
         cp.ctx_other = tgt;
         cp.draft_vocab_map = draft_vocab_map;
         cp.n_rs_seq = 0;
+        if (tail_chunks) {
+            cp.n_outputs_max = 8;
+        }
         cp.sj_kvarn_bits_k = cp.sj_kvarn_bits_v = 0;
         if (config.sj_k) {
             cp.type_k = COMMON_SJKVARN_MTP_DRAFT_KV[0];
@@ -272,9 +277,9 @@ struct contexts {
         params.draft.ctx_tgt = tgt;
         params.draft.ctx_dft = dft;
         params.draft.n_max = draft_max;
-        params.draft.n_min_adaptive = 3;
+        params.draft.n_min_adaptive = tail_chunks ? 8 : 3;
         params.draft.p_min = 0.0f;
-        params.draft.chain = !bookkeep_sequential;
+        params.draft.chain = tail_chunks || !bookkeep_sequential;
         params.draft.backend_sampling = backend_sampling;
         spec = common_speculative_init(params, parallel);
         require(spec != nullptr, "create MTP driver");
@@ -291,10 +296,10 @@ static llama_token token_at(llama_pos pos) {
     return (pos * 7 + 3) % n_vocab;
 }
 
-static void process(contexts & ctx, const llama_tokens & tokens, llama_pos pos, llama_seq_id seq) {
+static void process(contexts & ctx, const llama_tokens & tokens, llama_pos pos, llama_seq_id seq, bool all_outputs = true) {
     common_batch batch(ctx.tgt);
-    for (llama_token token : tokens) {
-        batch.add(token, pos++, seq, true);
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        batch.add(tokens[i], pos++, seq, all_outputs || i + 1 == tokens.size());
     }
     require(llama_process(ctx.tgt, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0, "target decode");
     require(common_speculative_process(ctx.spec, batch), "MTP process");
@@ -3020,6 +3025,120 @@ static void run_weight_borrow(llama_model * source, bool cuda = false, bool pin_
     printf("PASS %s separate-file weight borrowing, unequal-byte fallback, allocator replacement, donor lifetime\n", cuda ? "CUDA" : "CPU");
 }
 
+struct tail_result {
+    std::vector<std::vector<float>> logits;
+    llama_tokens tokens;
+    schedule drafts;
+};
+
+static void prefill_tail(contexts & ctx, llama_pos from, llama_pos to) {
+    while (from < to) {
+        const llama_pos end = std::min(from + (llama_pos) llama_n_batch(ctx.tgt), to);
+        llama_tokens tokens;
+        for (llama_pos pos = from; pos < end; ++pos) {
+            tokens.push_back(token_at(pos));
+        }
+        // Explicit calls preserve the ragged tail even when the recurrent splitter rebalances a logical batch.
+        process(ctx, tokens, from, 0, false);
+        require(llama_memory_seq_pos_max(llama_get_memory(ctx.tgt), 0) == end - 1, "prefill stores the final target position");
+        from = end;
+    }
+}
+
+static tail_result continue_tail(contexts & ctx, llama_pos pos) {
+    tail_result result;
+    common_speculative_begin(ctx.spec, 0, llama_tokens(pos, 0));
+    for (int i = 0; i <= 16; ++i) {
+        const float * logits = llama_get_logits_ith(ctx.tgt, -1);
+        require(logits != nullptr, "final-position logits exist");
+        result.logits.emplace_back(logits, logits + n_vocab);
+        for (float value : result.logits.back()) {
+            require(std::isfinite(value), "finite final-position logits");
+        }
+        if (i == 16) {
+            break;
+        }
+        const llama_token token = std::max_element(logits, logits + n_vocab) - logits;
+        result.tokens.push_back(token);
+        process(ctx, { token }, pos++, 0);
+        require(llama_memory_seq_pos_max(llama_get_memory(ctx.tgt), 0) == pos - 1, "continuation stores the final target position");
+    }
+    result.drafts = generate(ctx, 0, pos, 6, 2);
+    require(result.drafts.widths == std::vector<size_t>({ 8, 8 }), "exercise full-depth MTP verification after prefill");
+    return result;
+}
+
+static float compare_tail(const tail_result & got, const tail_result & ref, float atol = 1e-3f, float rtol = 1e-3f) {
+    require(got.tokens == ref.tokens, "sixteen greedy continuation tokens match");
+    require_schedule(got.drafts, ref.drafts, "MTP drafts after greedy continuation match");
+    float max_error = 0.0f;
+    require(got.logits.size() == ref.logits.size(), "all continuation logits exist");
+    for (size_t step = 0; step < ref.logits.size(); ++step) {
+        for (size_t token = 0; token < n_vocab; ++token) {
+            const float expected = ref.logits[step][token];
+            const float actual = got.logits[step][token];
+            require(std::isfinite(expected) && std::isfinite(actual), "finite comparison logits");
+            const float error = std::abs(actual - expected);
+            max_error = std::max(max_error, error);
+            if (error > atol + rtol * std::abs(expected)) {
+                fprintf(stderr, "logit mismatch: step=%zu token=%zu expected=%g actual=%g error=%g\n", step, token, expected, actual, error);
+                require(false, "final-position and continuation logits match within tolerance");
+            }
+        }
+    }
+    return max_error;
+}
+
+static void run_tail_chunks(llama_model * model, const cache_config & config, uint32_t ub, llama_pos remainder) {
+    const llama_pos boundary = 512;
+    const llama_pos end = boundary + remainder;
+    contexts whole(model, config, 1024, COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE, 0, 1, 2048, nullptr, nullptr, true, nullptr, nullptr, 8, true);
+    prefill_tail(whole, 0, end);
+    const tail_result expected = continue_tail(whole, end);
+
+    contexts split(model, config, ub, COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE, 0, 1, 2048, nullptr, nullptr, true, nullptr, nullptr, 8, true);
+    prefill_tail(split, 0, boundary);
+    const snapshot prefix = save(split, 0);
+    prefill_tail(split, boundary, end);
+    const tail_result cold = continue_tail(split, end);
+    tail_result first_tail;
+    first_tail.logits.push_back(cold.logits.front());
+    llama_tokens tail;
+    for (llama_pos pos = boundary; pos < end; ++pos) {
+        tail.push_back(token_at(pos));
+    }
+    // Repeated all-output and final-output-only batches at the same positions exercise graph reuse and transitions.
+    for (int repeat = 0; repeat < 3; ++repeat) {
+        restore(split, prefix, 0);
+        process(split, tail, boundary, 0);
+        const float * logits = llama_get_logits_ith(split.tgt, -1);
+        require(logits != nullptr, "all-output tail logits exist");
+        tail_result current;
+        current.logits.emplace_back(logits, logits + n_vocab);
+        compare_tail(current, first_tail);
+    }
+    for (int repeat = 0; repeat < 3; ++repeat) {
+        restore(split, prefix, 0);
+        prefill_tail(split, boundary, end);
+        const float * logits = llama_get_logits_ith(split.tgt, -1);
+        require(logits != nullptr, "tail logits exist on repeated evaluation");
+        tail_result current;
+        current.logits.emplace_back(logits, logits + n_vocab);
+        compare_tail(current, first_tail, 1e-6f, 1e-6f);
+    }
+
+    contexts resumed(model, config, ub, COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE, 0, 1, 2048, nullptr, nullptr, true, nullptr, nullptr, 8, true);
+    restore(resumed, prefix, 0);
+    require(llama_memory_seq_pos_max(llama_get_memory(resumed.tgt), 0) == boundary - 1, "restore prefix position");
+    prefill_tail(resumed, boundary, end);
+    const tail_result cached = continue_tail(resumed, end);
+    const float cold_error = compare_tail(cold, expected);
+    compare_tail(cached, expected);
+    const float cache_error = compare_tail(cached, cold, 1e-6f, 1e-6f);
+    printf("PASS tail %s ub=%u k=%u r=%d: 17 logit rows, greedy16, two depth-8 MTP rounds; max_abs split_vs_whole=%g restored_vs_cold=%g\n",
+            config.name, ub, boundary / ub, remainder, cold_error, cache_error);
+}
+
 int main(int argc, char ** argv) {
     const bool reserve_probe = (argc == 4 || argc == 5) && std::strcmp(argv[1], "--reserve-probe") == 0;
     common_log_set_verbosity_thold(LOG_LEVEL_ERROR);
@@ -3061,6 +3180,36 @@ int main(int argc, char ** argv) {
     int failed = 0;
     llama_model * model = nullptr;
     try {
+        if (argc >= 2 && std::strcmp(argv[1], "--tail-chunks") == 0) {
+            ggml_backend_dev_t device = nullptr;
+            if (argc == 4 && std::strcmp(argv[2], "--device") == 0) {
+                ggml_backend_load_all();
+                device = ggml_backend_dev_by_name(argv[3]);
+                require(device != nullptr && ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_GPU, "requested GPU device exists");
+            } else {
+                require(argc == 2, "usage: --tail-chunks [--device CUDA0]");
+            }
+            model = make_model(false, {}, LLM_ARCH_QWEN35, device);
+            const cache_config configs[] = {
+                { "f16/f16", GGML_TYPE_F16, GGML_TYPE_F16 },
+                { "SJ-KVaRN 4/4", GGML_TYPE_F16, GGML_TYPE_F16, 4, 4 },
+            };
+            for (const auto & config : configs) {
+                for (uint32_t ub : { 64, 32 }) {
+                    for (llama_pos remainder = 1; remainder <= 9; ++remainder) {
+                        try {
+                            run_tail_chunks(model, config, ub, remainder);
+                        } catch (const std::exception & error) {
+                            fprintf(stderr, "FAIL tail %s ub=%u r=%d: %s\n", config.name, ub, remainder, error.what());
+                            ++failed;
+                        }
+                    }
+                }
+            }
+            llama_model_free(model);
+            llama_backend_free();
+            return failed ? 1 : 0;
+        }
         if (reserve_probe) {
             run_reserve_probe(std::stoul(argv[2]), std::stoul(argv[3]), argc == 5 ? argv[4] : nullptr);
             llama_backend_free();

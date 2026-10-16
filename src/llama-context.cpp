@@ -5980,7 +5980,10 @@ ggml_cgraph * llama_context::graph_reserve(
     llama_ubatch       ubatch = balloc.ubatch_reserve(n_tokens / n_seqs, n_seqs);
 
     ubatch_prepare_reserve(ubatch, n_outputs, sampling.samplers, cparams.n_outputs_max_per_seq);
-    if (qwen_chain) {
+    // fork: ARG2 (bl/arg2-tailchunk 410568fae) - every arch's chained MTP batch puts catch-up rows before the
+    // output chain (Qwen35 too, not only Qwen4exp); a generic outputs-first mask made Qwen35 reserve all rows
+    // as chain steps after a restored prompt tail and exhausted graph metadata.
+    if (qwen_chain || (cparams.mtp_chain && n_seqs == 1)) {
         // fork: Chain outputs follow the catch-up prefix, unlike generic reserve outputs.
         for (uint32_t i = 0; i < n_tokens; ++i) {
             ubatch.output[i] = i >= n_tokens - n_outputs;
