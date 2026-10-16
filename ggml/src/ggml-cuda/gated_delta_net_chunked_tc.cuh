@@ -229,34 +229,49 @@ __global__ void __launch_bounds__(GDN_TC_THREADS) gated_delta_net_chunked_tc(
         gdn_tc_mm<GDN_TC_CHUNK, GDN_TC_COLS, 128>(ah, al, bh, bl, base, GDN_TC_LD);
         gdn_tc_pack<GDN_TC_CHUNK, 128>(bh, bl, kc, sq2, 1, count);
         gdn_tc_mm<GDN_TC_CHUNK, GDN_TC_CHUNK, 128>(ah, al, bh, bl, attn, GDN_TC_CHUNK);
+        float * lower_t = reinterpret_cast<float *>(ah);
+        float * rhs_t = reinterpret_cast<float *>(al);
         for (int e = tid; e < GDN_TC_CHUNK * GDN_TC_CHUNK; e += GDN_TC_THREADS) {
             const int i = e / GDN_TC_CHUNK;
             const int j = e % GDN_TC_CHUNK;
             // Mask before exp: the upper triangle can overflow under strong decay.
             const float d = i >= j ? expf((float) (prefix[i] - prefix[j])) : 0.0f;
-            lower[e] = i > j ? lower[e] * betas[i] * d : 0.0f;
+            lower_t[j * GDN_TC_CHUNK + i] = i > j ? lower[e] * betas[i] * d : 0.0f;
             attn[e] = i >= j ? attn[e] * d : 0.0f;
         }
         for (int e = tid; e < GDN_TC_CHUNK * GDN_TC_COLS; e += GDN_TC_THREADS) {
             const int r = e / GDN_TC_COLS;
             const int c = e % GDN_TC_COLS;
             const float value = r < count ? v[seq * sv3 + (t0 + r) * sv2 + h * sv1 + col0 + c] : 0.0f;
-            delta[r * GDN_TC_LD + c] = betas[r] * (value - decay[r] * delta[r * GDN_TC_LD + c]);
+            rhs_t[c * GDN_TC_CHUNK + r] = betas[r] * (value - decay[r] * delta[r * GDN_TC_LD + c]);
         }
         __syncthreads();
-        // Forward substitution of (I + lower) delta = beta (v - decay K S).
+        // Each warp owns eight RHS columns; lanes own token rows.
+        float solved[8];
+#pragma unroll
+        for (int c = 0; c < 8; ++c) {
+            solved[c] = rhs_t[(threadIdx.y * 8 + c) * GDN_TC_CHUNK + threadIdx.x];
+        }
         for (int j = 0; j < count; ++j) {
-            for (int e = tid; e < GDN_TC_CHUNK * GDN_TC_COLS; e += GDN_TC_THREADS) {
-                const int i = e / GDN_TC_COLS;
-                const int c = e % GDN_TC_COLS;
-                if (i > j) {
-                    delta[i * GDN_TC_LD + c] -= lower[i * GDN_TC_CHUNK + j] * delta[j * GDN_TC_LD + c];
+            const float coefficient = lower_t[j * GDN_TC_CHUNK + threadIdx.x];
+#pragma unroll
+            for (int c = 0; c < 8; ++c) {
+                const float pivot = __shfl_sync(0xffffffff, solved[c], j);
+                if (threadIdx.x > j) {
+                    solved[c] -= coefficient * pivot;
                 }
             }
-            __syncthreads();
         }
+#pragma unroll
+        for (int c = 0; c < 8; ++c) {
+            const float next = __shfl_down_sync(0xffffffff, solved[c], 1);
+            if (threadIdx.x % 2 == 0) {
+                gdn_tc_pack_pair(bh, bl, threadIdx.y * 8 + c, threadIdx.x / 2, GDN_TC_CHUNK / 2, solved[c], next);
+            }
+        }
+        // All warps must release the coefficient/RHS workspace before packing attention.
+        __syncthreads();
         gdn_tc_pack<GDN_TC_CHUNK, GDN_TC_CHUNK>(ah, al, attn, GDN_TC_CHUNK, 1);
-        gdn_tc_pack<GDN_TC_COLS, GDN_TC_CHUNK>(bh, bl, delta, 1, GDN_TC_LD);
         // The solve coefficients are dead; reuse them for the intra-chunk output.
         gdn_tc_mm<GDN_TC_CHUNK, GDN_TC_COLS, GDN_TC_CHUNK>(ah, al, bh, bl, lower, GDN_TC_LD);
         for (int e = tid; e < count * GDN_TC_COLS; e += GDN_TC_THREADS) {
