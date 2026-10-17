@@ -254,7 +254,7 @@ private:
 
     // Make sure enough space is available for outputs.
     // Returns max number of outputs for which space was reserved.
-    uint32_t output_reserve(int32_t n_outputs);
+    uint32_t output_reserve(int32_t n_outputs, int32_t n_tokens = 0);
 
     // re-run the reservation for the rows reserved so far, so that a configuration change
     // (e.g. enabling nextn embeddings) grows the pinned buffers at setup time, not inside a request

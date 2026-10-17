@@ -2642,8 +2642,7 @@ void llama_context::set_embeddings_nextn(bool value, bool masked) {
     cparams.embeddings_nextn        = value;
     cparams.embeddings_nextn_masked = masked;
 
-    // grow the pinned output buffer now (this is called at speculative-decoding setup) instead of inside the
-    // first prefill; the unmasked nextn block is n_embd_out x n_batch floats (80 MiB at n_batch 4096).
+    // Reserve the initial nextn output. Decode grows it to the input row count.
     // note: like any reservation this invalidates the outputs of the previous batch
     output_reserve_grow();
 }
@@ -3013,7 +3012,7 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
     n_queued_tokens += n_tokens;
 
     // reserve output buffer
-    if (output_reserve(n_tokens) < n_tokens) {
+    if (output_reserve(n_tokens, n_tokens) < n_tokens) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %u outputs\n", __func__, n_tokens);
         return -2;
     };
@@ -3461,7 +3460,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     }
 
     // reserve output buffer
-    if (output_reserve(n_outputs_all) < n_outputs_all) {
+    if (output_reserve(n_outputs_all, n_tokens_all) < n_outputs_all) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
         return -2;
     };
@@ -3847,7 +3846,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 // output
 //
 
-uint32_t llama_context::output_reserve(int32_t n_outputs) {
+uint32_t llama_context::output_reserve(int32_t n_outputs, int32_t n_tokens) {
     const auto & hparams = model.hparams;
     const auto & vocab   = model.vocab;
 
@@ -3875,14 +3874,15 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     size_t backend_token_count        = 0;
     size_t embd_layer_inp_float_count = 0;
 
+    const size_t nextn_rows = std::max<size_t>(std::max(n_tokens, 1), output_buffer_reuse ? embd_nextn.size / n_embd_out : 0);
+
     logits.size     = has_logits ? n_vocab * n_outputs_max : 0;
     embd.size       = has_embd ? n_embd_out * n_outputs_max : 0;
     embd_nextn.size = has_embd_nextn ? n_embd_out * n_outputs_max : 0;
 
     if (has_embd_nextn && !cparams.embeddings_nextn_masked) {
-        // unmasked: nextn row exists for every token in the batch, not just
-        // those flagged via batch.logits[i] -> size by token count instead.
-        embd_nextn.size = (size_t) n_embd_out * n_batch;
+        // Unmasked nextn needs every input row, including rows without logits.
+        embd_nextn.size = (size_t) n_embd_out * nextn_rows;
     }
 
     for (bool enabled : cparams.embeddings_layer_inp) {
@@ -5982,7 +5982,7 @@ void llama_context::opt_epoch_iter(ggml_opt_dataset_t               dataset,
         }
 
         // reserve output buffer
-        if (output_reserve(n_outputs_all) < n_outputs_all) {
+        if (output_reserve(n_outputs_all, n_tokens_all) < n_outputs_all) {
             LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
             GGML_ABORT("TODO: handle this error");
         };
