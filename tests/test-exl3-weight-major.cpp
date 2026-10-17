@@ -46,7 +46,7 @@ struct test_case_def {
 static std::vector<test_case_def> cases() {
     std::vector<test_case_def> out;
     // every bit width at the GEMV widths; 3/4-bit with and without the glue
-    for (ggml_type type : { GGML_TYPE_EXL3_2, GGML_TYPE_EXL3_3, GGML_TYPE_EXL3_4, GGML_TYPE_EXL3_5,
+    for (ggml_type type : { GGML_TYPE_EXL3_1, GGML_TYPE_EXL3_2, GGML_TYPE_EXL3_3, GGML_TYPE_EXL3_4, GGML_TYPE_EXL3_5,
                             GGML_TYPE_EXL3_6, GGML_TYPE_EXL3_7, GGML_TYPE_EXL3_8 }) {
         const int bits = ggml_exl3_bits(type);
         for (int64_t T : { 1, 2, 3, 4, 5, 6, 7, 8, 12, 16 }) {

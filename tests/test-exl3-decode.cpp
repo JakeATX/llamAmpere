@@ -46,7 +46,7 @@ struct test_case_def {
 
 static std::vector<test_case_def> cases() {
     std::vector<test_case_def> out;
-    const ggml_type all_types[] = { GGML_TYPE_EXL3_2, GGML_TYPE_EXL3_3, GGML_TYPE_EXL3_4, GGML_TYPE_EXL3_5,
+    const ggml_type all_types[] = { GGML_TYPE_EXL3_1, GGML_TYPE_EXL3_2, GGML_TYPE_EXL3_3, GGML_TYPE_EXL3_4, GGML_TYPE_EXL3_5,
                                     GGML_TYPE_EXL3_6, GGML_TYPE_EXL3_7, GGML_TYPE_EXL3_8 };
     // every bit width at every GEMV width, small (one item per block) and split-K with several items per block
     for (ggml_type type : all_types) {
