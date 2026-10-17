@@ -377,6 +377,7 @@ struct common_params_speculative_draft {
     bool    dflash                = false; // use DFlash speculative decoding
     bool    dflash_defer_injection = true;  // defer encoder KV injection to draft time (set false for higher acceptance on some models)
     int32_t n_ctx                 = 0;     // draft context size
+    int32_t n_ubatch              = -1;    // MTP draft physical microbatch: -1 = auto (2048 for an MTP draft file loaded with -md), 0 = main's -ub, N > 0 = at most N
 
     // MTP drafter attention window (default off)
     int32_t attn_window = 0;     // > 0: the MTP drafter attends only to its last attn_window positions (+ sinks)

@@ -3723,6 +3723,13 @@ common_params common_base_params_to_speculative(const common_params & params) {
     result.embedding    = false;
     result.pooling_type = LLAMA_POOLING_TYPE_UNSPECIFIED;
 
+    // an MTP draft's prompt pass is split by llama_decode into ubatches of the draft's own size, so a smaller draft ubatch
+    // only shrinks its compute buffer (about 0.8 MiB per row for Flash-Next); a separate MTP draft file defaults to 2048 rows
+    const int32_t ub_cap = params_spec.n_ubatch >= 0 ? params_spec.n_ubatch : (spec_mtp && has_draft ? 2048 : 0);
+    if (spec_mtp && ub_cap > 0) {
+        result.n_ubatch = std::min(params.n_ubatch == 0 ? params.n_batch : params.n_ubatch, ub_cap);
+    }
+
     const char * lean = std::getenv("LLAMA_MTP_DRAFT_COMPUTE_LEAN");
     if (lean && std::strcmp(lean, "1") == 0 && spec_mtp && !has_draft && params.n_parallel == 1) {
         // Catch-up still needs the full logical batch; decode splits it into smaller microbatches.
