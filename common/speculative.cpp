@@ -230,6 +230,11 @@ struct common_speculative_impl {
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
     virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
+
+    // Slot resume is separate from partial checkpoints: adding carryover must not
+    // change whether the server can capture an in-call prompt checkpoint.
+    virtual bool get_resume_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const { return get_state(seq_id, data); }
+    virtual bool set_resume_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) { set_state(seq_id, data); return !data.empty(); }
 };
 
 struct common_speculative_impl_draft_simple : public common_speculative_impl {
@@ -1769,6 +1774,74 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         defer.embd.resize(w * (size_t) n_embd);
 
         return dropped;
+    }
+
+    bool get_resume_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq || n_embd <= 0 || n_embd > 65536) { return false; }
+        uint32_t n_rows = 0;
+        for (auto seq : defer.seq) { n_rows += seq == seq_id; }
+        if (n_rows > defer_max) { return false; }
+        const uint32_t hdr[] = { 0x4d545052, 1, (uint32_t) n_embd, (uint32_t) n_mtp_layers, n_rows };
+        const size_t row_bytes = (size_t) n_embd * sizeof(float);
+        data.resize(sizeof(hdr) + row_bytes + n_rows * (sizeof(llama_token) + sizeof(llama_pos) + row_bytes));
+        uint8_t * out = data.data();
+        auto put = [&](const void * src, size_t n) { std::memcpy(out, src, n); out += n; };
+        put(hdr, sizeof(hdr));
+        put(pending_h[seq_id].data(), row_bytes);
+        for (size_t i = 0; i < defer.seq.size(); ++i) {
+            if (defer.seq[i] != seq_id) { continue; }
+            put(&defer.tok[i], sizeof(llama_token));
+            put(&defer.pos[i], sizeof(llama_pos));
+            put(defer.embd.data() + i * n_embd, row_bytes);
+        }
+        return true;
+    }
+
+    bool set_resume_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) { return false; }
+        if (data.empty()) {
+            std::fill(pending_h[seq_id].begin(), pending_h[seq_id].end(), 0.0f);
+            drop_deferred_from(seq_id, 0);
+            verify_h_rows[seq_id] = 0;
+            verify_h_beg[seq_id] = -1;
+            return true;
+        }
+        if (data.size() < 5 * sizeof(uint32_t)) { return false; }
+        uint32_t hdr[5];
+        std::memcpy(hdr, data.data(), sizeof(hdr));
+        if (hdr[0] != 0x4d545052 || hdr[1] != 1 || hdr[2] != (uint32_t) n_embd ||
+                hdr[3] != (uint32_t) n_mtp_layers || hdr[4] > defer_max || n_embd <= 0 || n_embd > 65536) { return false; }
+        const size_t row_bytes = (size_t) n_embd * sizeof(float);
+        const size_t row_size = sizeof(llama_token) + sizeof(llama_pos) + row_bytes;
+        if (data.size() != sizeof(hdr) + row_bytes + hdr[4] * row_size) { return false; }
+        size_t other_rows = 0;
+        for (auto seq : defer.seq) { other_rows += seq != seq_id; }
+        if (other_rows > defer_max || hdr[4] > defer_max - other_rows ||
+                other_rows + hdr[4] > (size_t) std::min(batch_capacity, ubatch_capacity)) { return false; }
+        // Validate every row before mutating the live carryover.
+        for (uint32_t i = 0; i < hdr[4]; ++i) {
+            const uint8_t * row = data.data() + sizeof(hdr) + row_bytes + i * row_size;
+            llama_token tok; llama_pos pos;
+            std::memcpy(&tok, row, sizeof(tok));
+            std::memcpy(&pos, row + sizeof(tok), sizeof(pos));
+            if (tok < 0 || tok >= llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(params.ctx_dft))) || pos < 0) { return false; }
+        }
+        drop_deferred_from(seq_id, 0);
+        const size_t k0 = defer.tok.size();
+        defer.tok.resize(k0 + hdr[4]); defer.pos.resize(k0 + hdr[4]); defer.seq.resize(k0 + hdr[4]);
+        defer.embd.resize((k0 + hdr[4]) * (size_t) n_embd);
+        std::memcpy(pending_h[seq_id].data(), data.data() + sizeof(hdr), row_bytes);
+        for (uint32_t i = 0; i < hdr[4]; ++i) {
+            const uint8_t * row = data.data() + sizeof(hdr) + row_bytes + i * row_size;
+            std::memcpy(&defer.tok[k0 + i], row, sizeof(llama_token));
+            std::memcpy(&defer.pos[k0 + i], row + sizeof(llama_token), sizeof(llama_pos));
+            defer.seq[k0 + i] = seq_id;
+            std::memcpy(defer.embd.data() + (k0 + i) * n_embd, row + sizeof(llama_token) + sizeof(llama_pos), row_bytes);
+        }
+        // These indices reference target output buffers, which are not restored.
+        verify_h_rows[seq_id] = 0;
+        verify_h_beg[seq_id] = -1;
+        return true;
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
@@ -4426,6 +4499,18 @@ void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id
     for (auto & impl : spec->impls) {
         impl->set_state(seq_id, data);
     }
+}
+
+bool common_speculative_get_resume_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data) {
+    data.clear();
+    if (spec) { for (auto & impl : spec->impls) { if (impl->get_resume_state(seq_id, data)) { return true; } } }
+    return false;
+}
+
+bool common_speculative_set_resume_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data) {
+    bool restored = false;
+    if (spec) { for (auto & impl : spec->impls) { restored = impl->set_resume_state(seq_id, data) || restored; } }
+    return restored;
 }
 
 void common_speculative_print_stats(const common_speculative * spec) {

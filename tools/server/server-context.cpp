@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <cinttypes>
@@ -3515,6 +3516,43 @@ private:
         return true;
     }
 
+    // The draft KV sidecar does not include MTP's pending hidden row or deferred
+    // catch-up inputs. Keep those separate from partial context checkpoints.
+    bool slot_resume_sidecar(server_slot & slot, const std::string & path, bool save) {
+        const std::string key = prompt_cache_key();
+        uint64_t hdr[4] = { 0x5350454352455331ull, (uint64_t) slot.prompt.tokens.size(),
+                           server_prompt_disk_hash(key.data(), key.size()), 0 };
+        std::vector<uint8_t> data;
+        if (save && !common_speculative_get_resume_state(spec.get(), slot.id, data)) {
+            std::remove(path.c_str()); // do not leave an older carryover attached to a new state
+            return true;
+        }
+        if (!save) {
+            // Missing or incompatible sidecars must never retain another turn's hidden row.
+            common_speculative_set_resume_state(spec.get(), slot.id, {});
+        }
+        FILE * f = fopen(path.c_str(), save ? "wb" : "rb");
+        if (!f) { return false; }
+        bool ok;
+        if (save) {
+            hdr[3] = data.size();
+            ok = fwrite(hdr, sizeof(hdr), 1, f) == 1 &&
+                 fwrite(data.data(), 1, data.size(), f) == data.size();
+        } else {
+            uint64_t got[4];
+            ok = fread(got, sizeof(got), 1, f) == 1 && got[0] == hdr[0] && got[1] == hdr[1] &&
+                 got[2] == hdr[2] && got[3] > 0 && got[3] <= 32 * 1024 * 1024;
+            if (ok) {
+                data.resize(got[3]);
+                ok = fread(data.data(), 1, data.size(), f) == data.size() && fgetc(f) == EOF;
+                if (ok) { ok = common_speculative_set_resume_state(spec.get(), slot.id, data); }
+            }
+        }
+        ok = fclose(f) == 0 && ok;
+        if (save && !ok) { std::remove(path.c_str()); }
+        return ok;
+    }
+
     // context checkpoints exist only in process memory and are not part of the
     // llama_state_seq file format. persist them in a sidecar file so that
     // action=restore in a fresh process can roll back mid-prompt (e.g. after a
@@ -3990,6 +4028,10 @@ private:
                         }
                     }
 
+                    if (spec && !slot_resume_sidecar(*slot, filepath + ".spec", true)) {
+                        SLT_WRN(*slot, "failed to write speculative host-state sidecar %s\n", (filepath + ".spec").c_str());
+                    }
+
                     // persist context checkpoints alongside the state file so that a
                     // restore in a fresh process can roll back mid-prompt (see restore path)
                     if (!slot->prompt.checkpoints.empty()) {
@@ -4079,6 +4121,15 @@ private:
                         } else {
                             llama_memory_seq_rm(llama_get_memory(ctx_dft), slot->id, -1, -1);
                             SLT_WRN(*slot, "no drafter sidecar %s: drafter memory of the slot cleared\n", path_dft.c_str());
+                        }
+                    }
+
+                    if (spec) {
+                        if (slot_resume_sidecar(*slot, filepath + ".spec", false)) {
+                            SLT_INF(*slot, "restored speculative host carryover from %s\n", (filepath + ".spec").c_str());
+                        } else {
+                            SLT_WRN(*slot, "missing or incompatible speculative host-state sidecar %s: carryover cleared; draft acceptance may change\n",
+                                    (filepath + ".spec").c_str());
                         }
                     }
 
