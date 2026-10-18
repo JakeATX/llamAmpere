@@ -1017,7 +1017,7 @@ static __global__ void mul_mat_q(
         const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const uint3 ntx) {
+        const uint3 ntx, const int jt_stride) {
 
     // Skip unused template specializations for faster compilation:
     if (ggml_cuda_mmq_get_config(type, J, fallback, prec_src1).type == GGML_TYPE_COUNT) {
@@ -1209,6 +1209,34 @@ static __global__ void mul_mat_q(
             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
              stride_row_x, ncols_y, stride_col_dst,
              tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
+
+        // MoE launch with a capped tile grid (pure tiling only, see launch_mul_mat_q): this block also covers
+        // column tiles jt + jt_stride, jt + 2*jt_stride, ... of the same expert. Each tile is computed exactly as it
+        // would be by its own block, so results are bit-identical to the uncapped grid.
+        if constexpr (type != GGML_TYPE_NVFP4) {
+            if (jt_stride > 0 && ids_dst) {
+                for (int jt2 = jt + jt_stride; jt2*J < col_diff; jt2 += jt_stride) {
+                    __syncthreads();
+#pragma unroll
+                    for (int j0 = 0; j0 < J; j0 += nwarps*warp_size) {
+                        const int j = j0 + threadIdx.y*warp_size + threadIdx.x;
+
+                        if (j0 + nwarps*warp_size > J && j >= J) {
+                            break;
+                        }
+
+                        ids_dst_shared[j] = ids_dst[col_low + jt2*J + j];
+                    }
+                    __syncthreads();
+
+                    mul_mat_q_process_tile<type, J, fallback, fixup, prec_src1>
+                        (x, offset_x, y + (col_low + jt2*J)*(sizeof(block_q8_1_mmq)/sizeof(int)), ids_dst_shared,
+                         dst + it*I, tmp_fixup, nullptr,
+                         stride_row_x, ncols_y, stride_col_dst,
+                         tile_x_max_i, col_diff - jt2*J - 1, kb0_start, kb0_stop);
+                }
+            }
+        }
 
         kbc += blocks_per_ne00.z;
         kbc -= fastmodulo(kbc, blocks_per_ne00);
@@ -1433,6 +1461,14 @@ static __global__ void mul_mat_q_stream_k_fixup(
     }
 }
 
+static int ggml_cuda_mmq_id_cap() {
+    static const int cap = [] {
+        const char * e = getenv("GGML_CUDA_MMQ_ID_CAP");
+        return e ? atoi(e) : 0;
+    }();
+    return cap;
+}
+
 struct mmq_args {
     const char * x; ggml_type type_x; const int * y; const int32_t * ids_dst; const int32_t * expert_bounds; float * dst;
     const float * y_scale;
@@ -1490,16 +1526,38 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-             ntx_fd);
+             ntx_fd, 0);
         return;
     }
 
     // For the stream-k kernel it is possible to run it with tiling by setting the number of CUDA blocks equal to the number of tiles.
     // This is worthwhile if the efficiency of tiling is high and skipping the fixup kernel is more important.
-    const int ntiles_dst = ntx * nty * ntzw;
+    int ntx_launch = ntx;
+    int jt_stride  = 0;
+    {
+        // Opt-in (GGML_CUDA_MMQ_ID_CAP=m): for MoE the uncapped grid sizes every expert for ncols_max columns, so at large
+        // batches nearly all blocks find no columns and exit. Cap the column-tile grid at m times the average columns
+        // per expert and let each block loop over the extra tiles of its expert (only valid with pure tiling).
+        const int cap_mult = ggml_cuda_mmq_id_cap();
+        if (cap_mult > 0 && args.expert_bounds && type != GGML_TYPE_NVFP4 && GGML_CUDA_CC_IS_NVIDIA(cc)) {
+            const int64_t avg_cols = (args.ncols_y + args.nchannels_y - 1) / args.nchannels_y;
+            for (int ntx_cap = (int) std::max<int64_t>(1, (cap_mult*avg_cols + config.J - 1) / config.J); ntx_cap < ntx; ++ntx_cap) {
+                const int nt  = ntx_cap * nty * ntzw;
+                const int nw  = (nt + nsm - 1) / nsm;
+                if (100 * nt / (nsm*nw) >= 90) {
+                    ntx_launch = ntx_cap;
+                    jt_stride  = ntx_cap;
+                    break;
+                }
+            }
+        }
+    }
+    const uint3 ntx_launch_fd = init_fastdiv_values(ntx_launch);
+    const int ntiles_dst = ntx_launch * nty * ntzw;
     const int tiles_nwaves = (ntiles_dst + nsm - 1) / nsm;
     const int tiles_efficiency_percent = 100 * ntiles_dst / (nsm*tiles_nwaves);
     const dim3 block_nums_stream_k(GGML_CUDA_CC_IS_NVIDIA(cc) && tiles_efficiency_percent >= 90 ? ntiles_dst : nsm, 1, 1);
+    GGML_ASSERT(jt_stride == 0 || (int) block_nums_stream_k.x == ntiles_dst);
 
     GGML_ASSERT(ntiles_dst * blocks_per_ne00_fd.z < (1 << 30)); // Assert that variable kbc will not overflow.
 
@@ -1519,7 +1577,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
          blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
          channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
          sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-         ntx_fd);
+         ntx_launch_fd, jt_stride);
 
     if (!fixup_needed) {
         return;
@@ -1529,7 +1587,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     mul_mat_q_stream_k_fixup<type, J, fallback, prec_src1><<<block_nums_fixup, block_dims_fixup, 0, stream>>>
         (args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr, blocks_per_ne00_fd, args.nrows_x, args.ncols_dst,
          args.nrows_dst, nchannels_y_fd, args.stride_channel_dst, nsamples_y_fd, args.stride_sample_dst,
-         ntx_fd);
+         ntx_launch_fd);
 }
 
 template <ggml_type type, bool fallback, ggml_prec prec_src1 = GGML_PREC_Q8>

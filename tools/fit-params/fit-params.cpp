@@ -30,9 +30,13 @@ int llama_fit_params(int argc, char ** argv) {
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
+    if (params.n_cpu_moe_auto) {
+        mparams.n_gpu_layers = -1; // --n-cpu-moe auto: the fit picks the layers, no MoE-cache placement (as common_init_result)
+    }
+
     if (!params.fit_params_print) {
         const common_params_fit_status status = common_fit_params(params.model.path.c_str(), &mparams, &cparams,
-                params.tensor_split, params.tensor_buft_overrides.data(), &params.moe_cache,
+                params.tensor_split, params.tensor_buft_overrides.data(), params.n_cpu_moe_auto ? nullptr : &params.moe_cache,
                 params.fit_params_target.data(), params.fit_params_min_ctx,
                 nullptr,
                 params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);

@@ -3089,6 +3089,192 @@ bool llama_kv_cache::maintain_sj_kvarn_stream(llama_context * lctx, uint32_t str
     return true;
 }
 
+//
+// [B1] SJ-KVaRN under layer-major prefill
+//
+// The normal order runs, per ubatch c: apply (proposes the sealed end B_c), seal [B_{c-1}, B_c) in every layer, then
+// the graph (store c into the ring, attend). Layer-major order runs layer L for chunks 0..c-1 before chunk c, but
+// before any later layer sees chunk 0. Every layer has its own ring rows and records, and a seal of layer L reads
+// only layer L's ring rows of positions below the start of chunk c, which chunks < c wrote at layer L. So sealing
+// layer L for chunk c right before the slice that stores chunk c at layer L leaves layer L in exactly the state the
+// normal order has there, and the slice sees the same bookkeeping (restored per ubatch). The seal kernel encodes
+// each group from that group's rows alone, so per-layer launches produce the same bytes as the all-layer graph.
+//
+void llama_kv_cache::b1_sj_begin(llama_seq_id seq_id) {
+    if (!sj_kvarn.enabled()) {
+        return;
+    }
+    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+    b1_sj_strm = seq_to_stream[seq_id];
+    b1_sj_pre  = sj_kvarn_st[b1_sj_strm];
+    b1_sj.clear();
+    b1_sj_new.clear();
+    b1_sj_bad = false;
+}
+
+void llama_kv_cache::b1_sj_save(size_t i) {
+    if (!sj_kvarn.enabled()) {
+        return;
+    }
+    auto & st = sj_kvarn_st[b1_sj_strm];
+    if (b1_sj.size() <= i) {
+        b1_sj.resize(i + 1);
+    }
+    // apply() set B_prev = B (the sealed end after the previous ubatch) and proposed B_pending
+    b1_sj[i] = { st.B, st.B_pending, st.N, st.ring_lo, st.draining };
+    if (st.B_pending > st.B) {
+        if (sj_kvarn_paged) {
+            // the normal order takes these records from the free list in its maintenance right after this apply,
+            // before the next apply: same order, so the same records
+            const uint32_t g0 = (st.B - sj_kvarn.sink)/sj_kvarn.group, g1 = (st.B_pending - sj_kvarn.sink)/sj_kvarn.group;
+            std::vector<uint32_t> fresh;
+            for (uint32_t g = g0; g < g1; ++g) {
+                if (st.table[g] < 0) { fresh.push_back(g); }
+            }
+            if (!sj_kvarn_alloc_groups(b1_sj_strm, g0, g1)) {
+                LLAMA_LOG_ERROR("%s: [B1] SJ-KVaRN record pool exhausted (B %u -> %u)\n", __func__, st.B, st.B_pending);
+                b1_sj_bad = true;
+                return;
+            }
+            b1_sj_new.insert(b1_sj_new.end(), fresh.begin(), fresh.end());
+        }
+        ++sj_kvarn_maintenance_count;
+        sj_kvarn_maintenance_groups += (st.B_pending - st.B)/sj_kvarn.group;
+    }
+    st.B = st.B_pending; // the next apply starts from this ubatch's sealed end, as after its maintenance
+}
+
+bool llama_kv_cache::b1_sj_seek(size_t i) {
+    if (!sj_kvarn.enabled()) {
+        return true;
+    }
+    if (b1_sj_bad || i >= b1_sj.size()) {
+        return false;
+    }
+    auto & st = sj_kvarn_st[b1_sj_strm];
+    const auto & v = b1_sj[i];
+    st.B_prev    = v.B_old;
+    st.B         = v.B;
+    st.B_pending = v.B;
+    st.N         = v.N;
+    st.ring_lo   = v.ring_lo;
+    st.draining  = v.draining;
+    b1_sj_cur    = i;
+    return true;
+}
+
+void llama_kv_cache::b1_sj_rewind() {
+    if (!sj_kvarn.enabled()) {
+        return;
+    }
+    // apply() only moved bookkeeping and cell metadata; nothing was sealed or stored yet. Give back the records this
+    // call took, newest first, so the free list is back in its old order.
+    auto & st = sj_kvarn_st[b1_sj_strm];
+    for (auto it = b1_sj_new.rbegin(); it != b1_sj_new.rend(); ++it) {
+        const int32_t r = st.table[*it];
+        GGML_ASSERT(r >= 0 && sj_kvarn_ref[r] == 1);
+        sj_kvarn_ref[r] = 0;
+        sj_kvarn_free.push_back(r);
+        st.table[*it] = -1;
+    }
+    std::vector<int32_t> table = std::move(st.table);
+    st = b1_sj_pre;
+    st.table = std::move(table);
+    b1_sj.clear();
+    b1_sj_new.clear();
+}
+
+bool llama_kv_cache::b1_sj_seal(llama_context * lctx, int32_t il0, int32_t il1) {
+    if (!sj_kvarn.enabled() || b1_sj_cur >= b1_sj.size()) {
+        return true;
+    }
+    const auto & v = b1_sj[b1_sj_cur];
+    if (v.B <= v.B_old) {
+        return true;
+    }
+    const uint32_t strm = b1_sj_strm;
+    const auto & st = sj_kvarn_st[strm];
+    const int32_t hi = il1 < 0 ? std::numeric_limits<int32_t>::max() : il1;
+    // multi-stream: the descriptor carries the stream's group table behind the fixed entries
+    const int64_t desc_n = GGML_SJKVARN_DESC_N_ENTRIES + (sj_kvarn_paged ? (int64_t) sj_kvarn_n_groups_seq : 0);
+    if (b1_sj_graphs.size() < sj_kvarn_st.size()) {
+        b1_sj_graphs.resize(sj_kvarn_st.size());
+    }
+    auto & graphs = b1_sj_graphs[strm];
+    if (graphs.size() < layers.size()) {
+        graphs.resize(layers.size());
+    }
+    std::vector<int32_t> d(desc_n, 0);
+    if (sj_kvarn_paged) {
+        // the records of this ubatch's groups were taken in b1_sj_save; later ubatches' records are taken too, but
+        // the seal reads only the entries of [B_old, B)
+        d[GGML_SJKVARN_DESC_TABLE] = 1;
+        for (uint32_t g = 0; g < sj_kvarn_n_groups_seq; ++g) {
+            d[GGML_SJKVARN_DESC_N_ENTRIES + g] = std::max<int32_t>(0, st.table[g]);
+        }
+    }
+    bool synced = false;
+    for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
+        const auto & layer = layers[ikv];
+        if ((int32_t) layer.il < il0 || (int32_t) layer.il >= hi) {
+            continue;
+        }
+        auto & job = graphs[ikv];
+        if (!job.graph) {
+            job.backend = lctx->sj_kvarn_backend(layer.body->buffer);
+            if (!job.backend) {
+                return false;
+            }
+            const size_t nodes = 16;
+            ggml_init_params ip = {nodes*ggml_tensor_overhead() + ggml_graph_overhead_custom(nodes, false), nullptr, true};
+            job.ctx.reset(ggml_init(ip));
+            if (!job.ctx) { LLAMA_LOG_ERROR("%s: ggml_init failed\n", __func__); return false; }
+            job.desc[0] = ggml_new_tensor_1d(job.ctx.get(), GGML_TYPE_I32, desc_n);
+            ggml_set_input(job.desc[0]);
+            ggml_tensor * graph_seal = ggml_sj_kvarn_seal_dyn(job.ctx.get(), layer.body, layer.k_stream[strm], layer.v_stream[strm], job.desc[0],
+                hparams.n_embd_head_k(layer.il), sj_kvarn.group, layer.sj_kvarn_bits_k, layer.sj_kvarn_bits_v, 16, sj_kvarn_n_groups_seal);
+            if (!ggml_backend_supports_op(job.backend, graph_seal)) {
+                LLAMA_LOG_ERROR("%s: backend %s does not support the seal op (layer %d)\n", __func__, ggml_backend_name(job.backend), layer.il);
+                return false;
+            }
+            ggml_cgraph * gf = ggml_new_graph_custom(job.ctx.get(), nodes, false);
+            ggml_build_forward_expand(gf, graph_seal);
+            job.buffer.reset(ggml_backend_alloc_ctx_tensors(job.ctx.get(), job.backend));
+            if (!job.buffer) { LLAMA_LOG_ERROR("%s: seal buffer allocation failed\n", __func__); return false; }
+            job.graph = gf;
+        }
+        if (!synced) {
+            // this layer's ring rows were written by the previous slice, which may still be computing
+            ggml_backend_sched_synchronize(lctx->get_sched());
+            synced = true;
+        }
+        const int tier = layer.sj_kvarn_tier;
+        // the same bounded chunks and descriptor as maintain_sj_kvarn_stream
+        for (uint32_t old = v.B_old; old < v.B;) {
+            const uint32_t end = std::min(v.B, old + sj_kvarn.group*sj_kvarn_n_groups_seal);
+            d[GGML_SJKVARN_DESC_S]         = sj_kvarn.sink;
+            d[GGML_SJKVARN_DESC_CAP]       = sj_kvarn_cap;
+            d[GGML_SJKVARN_DESC_B_OLD]     = old;
+            d[GGML_SJKVARN_DESC_B]         = end;
+            d[GGML_SJKVARN_DESC_N]         = v.N;
+            d[GGML_SJKVARN_DESC_G]         = sj_kvarn.group;
+            d[GGML_SJKVARN_DESC_D]         = hparams.n_embd_head_k(layers[0].il);
+            d[GGML_SJKVARN_DESC_HKV]       = hparams.n_head_kv(layers[0].il);
+            d[GGML_SJKVARN_DESC_TYPE_K]    = layers[0].k->type;
+            d[GGML_SJKVARN_DESC_TYPE_V]    = layers[0].v->type;
+            d[GGML_SJKVARN_DESC_RECBYTES]  = sj_kvarn_rec_bytes[tier];
+            d[GGML_SJKVARN_DESC_BODY_TYPE] = tier == 1 ? sj_kvarn.edge_body_type : sj_kvarn.body_type;
+            ggml_backend_tensor_set(job.desc[0], d.data(), 0, d.size()*sizeof(int32_t));
+            if (ggml_backend_graph_compute(job.backend, job.graph) != GGML_STATUS_SUCCESS) {
+                LLAMA_LOG_ERROR("%s: seal of layer %d failed\n", __func__, layer.il);
+                return false;
+            }
+            old = end;
+        }
+    }
+    return true;
+}
+
 int32_t llama_kv_cache::compress_sj_kvarn_idle(llama_context * lctx, llama_seq_id seq_id, llama_pos accepted_end, llama_pos keep_from) {
     if (!sj_kvarn.enabled() || sj_kvarn.tail_max == 0 || seq_id < 0 || accepted_end < 0 ||
         (size_t) seq_id >= seq_to_stream.size()) {
@@ -5301,6 +5487,31 @@ bool llama_kv_cache_context::apply() {
     }
 
     return true;
+}
+
+bool llama_kv_cache_context::b1_supported() const {
+    // block streaming switches phases inside apply(), which is not a pure function of the ubatch. SJ-KVaRN keeps its
+    // seal bookkeeping per ubatch (b1_sj_*).
+    return status == LLAMA_MEMORY_STATUS_SUCCESS && !ubatches.empty() && !has_kv_stream_targets();
+}
+
+void llama_kv_cache_context::b1_save() {
+    if (b1_n_kv.size() <= i_cur) {
+        b1_n_kv.resize(i_cur + 1, 0);
+    }
+    b1_n_kv[i_cur] = n_kv;
+    kv->b1_sj_save(i_cur);
+}
+
+bool llama_kv_cache_context::b1_seek(size_t i) {
+    if (i >= b1_n_kv.size() || i >= ubatches.size()) {
+        return false;
+    }
+    // the cells of later ubatches stay stored: they hold larger positions than every token of ubatch i, so the
+    // causal rule hides them exactly like the empty cells the normal order would see
+    i_cur = i;
+    n_kv  = b1_n_kv[i];
+    return kv->b1_sj_seek(i);
 }
 
 llama_memory_status llama_kv_cache_context::get_status() const {

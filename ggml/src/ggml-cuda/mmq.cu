@@ -287,7 +287,7 @@ void ggml_cuda_mul_mat_q(
         const int sis1 = nb12 / nb11;
 
         ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
-            ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast, stream);
+            ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast, stream, &ctx.pool());
         CUDA_CHECK(cudaGetLastError());
     }
 
@@ -335,8 +335,10 @@ void ggml_cuda_mul_mat_q(
 
     // Each expert only sees ne12*n_expert_used/ne02 tokens on average.
     // On RDNA3 and RDNA4 it is faster to pick the tile size against this value instead of ne12.
+    // Opt-in GGML_CUDA_MMQ_ID_JAVG=1 does the same on NVIDIA (pair with GGML_CUDA_MMQ_ID_CAP to bound the grid).
+    static const bool javg = [] { const char * e = getenv("GGML_CUDA_MMQ_ID_JAVG"); return e && atoi(e) > 0; }();
     int64_t ncols_opt = ne12;
-    if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
+    if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc) || javg) {
         ncols_opt = (ne12*n_expert_used + ne02 - 1) / ne02;
     }
 

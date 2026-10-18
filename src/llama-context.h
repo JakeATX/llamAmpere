@@ -20,12 +20,15 @@
 struct llama_model;
 class llama_batch_allocr;
 class llama_moe_cache;
+class llama_b1;
+class llama_ple_prefetch;
 
 class llama_io_read_i;
 class llama_io_write_i;
 
 // "memory" as in abstract memory for the context
 struct llama_memory_i;
+class  llama_memory_recurrent;
 struct llama_memory_context_i;
 
 // stores copy of the memory in device buffer. used for fast state save/load
@@ -62,6 +65,7 @@ struct llama_context {
     void synchronize();
     ggml_backend_t sj_kvarn_backend(ggml_backend_buffer_t buffer) const;
     bool maintain_sj_kvarn();
+    bool b1_seal_sj_kvarn(int32_t il0, int32_t il1); // [B1] seal the current ubatch's groups in layers [il0, il1) only
     int32_t compress_sj_kvarn_idle(llama_seq_id seq_id, llama_pos accepted_end, llama_pos keep_from = -1);
 
 
@@ -252,7 +256,7 @@ private:
 
     // Make sure enough space is available for outputs.
     // Returns max number of outputs for which space was reserved.
-    uint32_t output_reserve(int32_t n_outputs);
+    uint32_t output_reserve(int32_t n_outputs, int32_t n_tokens = 0);
 
     // re-run the reservation for the rows reserved so far, so that a configuration change
     // (e.g. enabling nextn embeddings) grows the pinned buffers at setup time, not inside a request
@@ -507,6 +511,66 @@ private:
     llm_graph_result * gf_res_prev_active = nullptr;
     uint64_t           gf_res_prev_epoch  = 0; // ggml_backend_sched_get_alloc_epoch when gf_res_prev_active was allocated
     uint64_t           backend_buf_exp_epoch = 0; // ggml_backend_sched_get_alloc_epoch when backend_buf_exp_size was taken
+
+    // [B1] layer-major prefill (LLAMA_B1=1, opt-in; see llama-b1.h). Declared after the backends so it is
+    // destroyed first; the destructor also resets it explicitly.
+    std::unique_ptr<llama_b1> b1;
+    // [PLEPF] PLE page prefetch (LLAMA_PLE_PREFETCH=<threads>, opt-in; see llama-ple-prefetch.h)
+    std::unique_ptr<llama_ple_prefetch> ple_pf;
+    bool ple_pf_tried = false;
+    bool b1_env   = false; // LLAMA_B1 set
+    bool b1_tried = false; // b1 construction attempted
+    bool b1_off_logged = false; // the once-per-context note on why B1 is not used was printed
+    struct {
+        bool          active = false;   // the graph being built is a B1 graph (memory already applied)
+        int32_t       il0    = 0;
+        int32_t       il1    = -1;
+        ggml_tensor * carry  = nullptr;
+    } b1_cur;
+
+    // returns 1 when this decode call runs layer-major (every ubatch applied and saved, the plan made),
+    // 0 for the normal path, < 0 for a decode error code
+    int  b1_prepare(llama_memory_context_i * mctx, const llama_batch_ext & batch_inp, uint32_t n_tokens_all, int64_t n_outputs_all);
+    // runs layers [0, n_layer - 1) of every ubatch of the group that starts at ub0, then seeks back to ub0 with
+    // the last layer's experts ready; false on failure (status set)
+    bool b1_run_prefix(llama_memory_context_i * mctx, size_t ub0, ggml_status & status);
+    int64_t b1_final_rows(int64_t n_out, int64_t n_tok) const;
+
+public:
+    // in-call checkpoints (llama_state_seq_capture_arm)
+    struct ckpt_write {
+        ggml_tensor * t;
+        size_t        offset;   // in the tensor
+        size_t        size;
+        size_t        blob_off; // in the blob
+        int32_t       il;       // layer of the tensor
+    };
+    struct ckpt_capture {
+        llama_pos n_tokens = 0; // copied after the ubatch whose last position is n_tokens - 1
+        llama_pos pos_min  = -1;
+        llama_pos pos_max  = -1;
+        std::vector<uint8_t>    blob;   // the bytes state_seq_get_data(PARTIAL_ONLY) would write at that spot
+        std::vector<ckpt_write> writes; // where the blob's tensor rows come from
+        std::vector<uint8_t>    layer_done;
+        bool laid_out = false;
+        bool failed   = false;
+    };
+
+    int32_t capture_arm(llama_seq_id seq_id, const llama_pos * n_tokens, int32_t n);
+    int32_t capture_min_tail() const;
+    bool    capture_select(int32_t k, llama_pos * pos_min, llama_pos * pos_max);
+
+private:
+    llama_seq_id              ckpt_seq   = -1;
+    bool                      ckpt_armed = false; // set by capture_arm, consumed by the next decode
+    int32_t                   ckpt_sel   = -1;
+    std::vector<ckpt_capture> ckpt_caps;
+
+    // the recurrent memory whose PARTIAL_ONLY state the captures copy, nullptr when unsupported
+    const llama_memory_recurrent * capture_mem() const;
+    // after a ubatch graph over layers [il0, il1) (il1 < 0: to the last layer) ran: copy the rows of a capture
+    // whose spot this ubatch ends
+    void capture_ubatch(const llama_ubatch & ubatch, int32_t il0, int32_t il1);
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;

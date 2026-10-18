@@ -116,6 +116,8 @@ The trained trellis codebooks are compiled into the binary (`ggml/src/ggml-sjkva
 
 `LLAMA_MTP_DRAFT_COMPUTE_LEAN=1` caps a single-sequence MTP draft context's physical microbatch at 64 rows. The logical batch stays unchanged, so prompt catch-up is split by the existing decoder. This reduces the full-context attention mask and intermediate graph storage. The switch is off by default; prefill geometry changes, so fixed-seed draft acceptance and output identity still require validation. Separate draft models and multiple sequences keep their existing microbatch size.
 
+`--spec-draft-ubatch N` (`-ubd`, env `LLAMA_ARG_SPEC_DRAFT_UBATCH`) sets the physical microbatch of an MTP draft loaded from its own file (`-md` with `--spec-type draft-mtp` or `draft-mtp-adaptive`). The default, -1, caps it at 2,048 rows; 0 keeps the main `-ub`; N caps it at N. The draft's compute buffer grows with its microbatch (on Flash-Next about 0.8 MiB per row: 1,672 MiB at 2,048 and 6,634 MiB at 8,192), and the fit counts it, so with a large main `-ub` an uncapped draft buffer pushes layers off the GPU. The cap only changes how the draft's prompt pass is split; decode-time draft calls work on a few rows at a time (at most 64 deferred catch-up rows) and stay below it.
+
 `--spec-draft-sjkvarn` gives the MTP context its own SJ-KVaRN cache with the trunk's body bits, body codec, sink, staging type and tail policy. It requires a SJ-KVaRN trunk, one sequence, and no separate draft model or explicit `-ctkd`/`-ctvd`. The draft layer uses the trunk's main body precision, without trunk edge tiers. Existing SJ-KVaRN head-dimension and flash-attention restrictions apply. For example:
 
 ```bash

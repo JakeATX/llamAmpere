@@ -1450,7 +1450,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     // Hidden rows from the most recent target verification batch, grouped by seq.
     // Row 0 corresponds to the sampled token, row N to the Nth accepted draft token.
-    std::vector<std::vector<float>> verify_h;
+    std::vector<int32_t> verify_h_beg;
     std::vector<int32_t> verify_h_rows;
 
     std::vector<int>                i_last;
@@ -1496,8 +1496,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 ctx_dft ? "yes" : "no",
                 common_speculative_get_devices_str(this->params.devices).c_str());
 
-        batch_capacity = (int32_t) llama_n_batch(ctx_dft);
         ubatch_capacity = (int32_t) llama_n_ubatch(ctx_dft);
+        batch_capacity = std::min<int32_t>(llama_n_batch(ctx_dft), std::max<int32_t>(ubatch_capacity, n_seq * (this->params.n_max + 1)));
         batch = llama_batch_init(/*n_tokens=*/ batch_capacity, /*embd=*/ n_embd, /*n_seq_max=*/ 1);
         // llama_batch_init allocates only one of token/embd; MTP needs both.
         // TODO: fix, how to call without malloc
@@ -1607,7 +1607,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         i_batch_beg.assign(n_seq, -1);
         i_batch_end.assign(n_seq, -1);
 
-        verify_h.assign(n_seq, {});
+        verify_h_beg.assign(n_seq, 0);
         verify_h_rows.assign(n_seq, 0);
     }
 
@@ -2004,56 +2004,42 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 return false;
             }
 
-            common_batch_clear(batch);
-
-            for (int k = 0; k < n_tokens; ++k) {
-                common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { batch_in.seq_id[k][0] }, 0);
-            }
-
-            // shift the tgt embeddings to the right by one position
-            // assumes that the tokens in the batch are sequential for each sequence
-            // i.e. we cannot have seq_id like this: [0, 0, 0, 1, 1, 0, 1, 1]
-            //                                                       ^--- this is a problem
-            // TODO:this is generally true, but would be nice to assert it
-            {
-                const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
-                std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
-            }
-
-            // fill the pending embeddings from a previous run
-            auto set_h = [&](int idx, const float * h_row) {
-                std::memcpy(batch.embd + (size_t) idx * n_embd, h_row, row_bytes);
-            };
-
-            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-                if (i_batch_beg[seq_id] < 0) {
-                    continue;
-                }
-
-                set_h(i_batch_beg[seq_id], pending_h[seq_id].data());
-            }
-
+            const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
             auto * mem_dft = llama_get_memory(ctx_dft);
 
             bool ok = true;
-            for (int head = 0; head < n_mtp_layers; ++head) {
+            for (int head = 0; head < n_mtp_layers && ok; ++head) {
                 if (chain_heads) {
-                    // ref: https://github.com/ggml-org/llama.cpp/pull/24340/changes#r3413498544
                     for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-                        if (i_batch_beg[seq_id] < 0) {
-                            continue;
+                        if (i_batch_beg[seq_id] >= 0) {
+                            llama_memory_seq_rm(mem_dft, seq_id, batch_in.pos[i_batch_beg[seq_id]], -1);
                         }
-                        llama_memory_seq_rm(mem_dft, seq_id, batch_in.pos[i_batch_beg[seq_id]], -1);
                     }
                     llama_set_nextn_layer_offset(ctx_dft, head);
                 }
 
-                const int32_t rc = llama_decode(ctx_dft, batch);
-                if (rc != 0) {
-                    SPC_ERR("llama_decode(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
-                            head, (int) rc, (int) batch_in.pos[0]);
-                    ok = false;
-                    break;
+                for (int32_t first = 0; first < n_tokens; first += batch_capacity) {
+                    const int32_t count = std::min(batch_capacity, n_tokens - first);
+                    common_batch_clear(batch);
+                    for (int32_t i = 0; i < count; ++i) {
+                        const int32_t k = first + i;
+                        common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { batch_in.seq_id[k][0] }, 0);
+                    }
+                    const int32_t skip = first == 0 ? 1 : 0;
+                    std::memcpy(batch.embd + (size_t) skip * n_embd,
+                            h_tgt + (size_t) (first + skip - 1) * n_embd, row_bytes * (count - skip));
+                    for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                        const int32_t i = i_batch_beg[seq_id] - first;
+                        if (i >= 0 && i < count) {
+                            std::memcpy(batch.embd + (size_t) i * n_embd, pending_h[seq_id].data(), row_bytes);
+                        }
+                    }
+                    const int32_t rc = llama_decode(ctx_dft, batch);
+                    if (rc != 0) {
+                        SPC_ERR("llama_decode(ctx_dft) head=%d failed rc=%d (pos=%d)\n", head, (int) rc, (int) batch.pos[0]);
+                        ok = false;
+                        break;
+                    }
                 }
             }
 
@@ -2071,16 +2057,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
 
             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+            // Target outputs remain valid until the next target decode. Accept reads one row.
             verify_h_rows[seq_id] = n_rows;
-            verify_h[seq_id].resize((size_t) n_rows * n_embd);
-
-            for (int32_t i = 0; i < n_rows; ++i) {
-                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
-                std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
-            }
+            verify_h_beg[seq_id] = i_batch_beg[seq_id];
 
             std::memcpy(pending_h[seq_id].data(),
-                    verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
+                    llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_end[seq_id]), row_bytes);
         }
 
         return true;
@@ -2683,7 +2665,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
-        std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
+        std::memcpy(pending_h[seq_id].data(), llama_get_embeddings_nextn_ith(params.ctx_tgt, verify_h_beg[seq_id] + i_h), row_bytes);
     }
 };
 
@@ -3718,6 +3700,13 @@ common_params common_base_params_to_speculative(const common_params & params) {
 
     result.embedding    = false;
     result.pooling_type = LLAMA_POOLING_TYPE_UNSPECIFIED;
+
+    // an MTP draft's prompt pass is split by llama_decode into ubatches of the draft's own size, so a smaller draft ubatch
+    // only shrinks its compute buffer (about 0.8 MiB per row for Flash-Next); a separate MTP draft file defaults to 2048 rows
+    const int32_t ub_cap = params_spec.n_ubatch >= 0 ? params_spec.n_ubatch : (spec_mtp && has_draft ? 2048 : 0);
+    if (spec_mtp && ub_cap > 0) {
+        result.n_ubatch = std::min(params.n_ubatch == 0 ? params.n_batch : params.n_ubatch, ub_cap);
+    }
 
     const char * lean = std::getenv("LLAMA_MTP_DRAFT_COMPUTE_LEAN");
     if (lean && std::strcmp(lean, "1") == 0 && spec_mtp && !has_draft && params.n_parallel == 1) {

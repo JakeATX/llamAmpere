@@ -16188,6 +16188,10 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 if (!ggml_vk_lightning_indexer_k_type_supported(k->type) || !device->fp16) {
                     return false;
                 }
+                // ggml_lightning_indexer() also accepts an I32 range mask (fork), which this shader does not read
+                if (m->type != GGML_TYPE_F16) {
+                    return false;
+                }
 
                 // the shader block size is hardcoded to head size 128
                 if (q->ne[0] != 128) {

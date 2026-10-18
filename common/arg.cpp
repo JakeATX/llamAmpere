@@ -1042,6 +1042,10 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         params.cors_origins = "localhost";
     }
 
+    if (params.n_cpu_moe_auto && !params.tensor_buft_overrides.empty()) {
+        throw std::invalid_argument("--n-cpu-moe auto cannot be combined with -ot/--cpu-moe/--n-cpu-moe N");
+    }
+
     // pad tensor_buft_overrides for llama_params_fit:
     const size_t ntbo = llama_max_tensor_buft_overrides();
     while (params.tensor_buft_overrides.size() < ntbo) {
@@ -3203,13 +3207,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CPU_MOE"));
     add_opt(common_arg(
-        {"-ncmoe", "--n-cpu-moe"}, "N",
-        "keep the Mixture of Experts (MoE) weights of the first N layers in the CPU",
-        [](common_params & params, int value) {
-            if (value < 0) {
+        {"-ncmoe", "--n-cpu-moe"}, "N|auto",
+        "keep the Mixture of Experts (MoE) weights of the first N layers in the CPU\n"
+        "'auto': keep as many expert layers on the GPU as fit next to the KV cache and the compute buffers of the\n"
+        "chosen -c/-ub (per --fit-target margin), the rest in the CPU; replaces -ngl and the MoE cache placement",
+        [](common_params & params, const std::string & value) {
+            if (value == "auto") {
+                params.n_cpu_moe_auto = true;
+                return;
+            }
+            const int n = std::stoi(value);
+            if (n < 0) {
                 throw std::invalid_argument("invalid value");
             }
-            llm_add_n_cpu_ffn_overrides(value, LLM_FFN_EXPS_REGEX, params.tensor_buft_overrides);
+            llm_add_n_cpu_ffn_overrides(n, LLM_FFN_EXPS_REGEX, params.tensor_buft_overrides);
         }
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
     add_opt(common_arg(
@@ -4699,6 +4710,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.n_ctx = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_CTX"));
+    add_opt(common_arg(
+        {"--spec-draft-ubatch", "-ubd", "--ubatch-size-draft"}, "N",
+        "physical batch size of an MTP draft context; the prompt pass is split into pieces of at most N tokens, which shrinks the draft's\n"
+        "compute buffer (default: -1 = 2048 for an MTP draft loaded with -md, the main -ub otherwise; 0 = always the main -ub)",
+        [](common_params & params, int value) {
+            if (value < -1) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.speculative.draft.n_ubatch = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_UBATCH"));
 
     add_opt(common_arg(
         {"--spec-draft-n-max"}, "N",

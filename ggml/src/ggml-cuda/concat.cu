@@ -1,5 +1,6 @@
 #include "concat.cuh"
 
+#include <climits>
 #include <stdint.h>
 
 // contiguous kernels
@@ -205,6 +206,74 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
                                  nb10, nb11, nb12, nb13, nb0, nb1, nb2, nb3, i0, i1, i2, i3);
 }
 
+// dim-0 concat whose src1 is a transposed view (the GDN conv input: conv state ++ transpose(qkv)). The kernels above
+// run threads along dst's i0, which reads src1 with a row stride per thread (one 32-byte sector per 4-byte element).
+// Here a block reads a 32 x 32 tile along src1's contiguous i1 into shared memory and writes it along dst's contiguous
+// i0. Same element mapping (i0 < ne00 from src0, the rest from src1), so the output bytes are unchanged.
+// Opt-in: GGML_CUDA_CONCAT_TILE=1.
+#define CUDA_CONCAT_TILE      32
+#define CUDA_CONCAT_TILE_ROWS 8
+
+static bool concat_tile_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_CUDA_CONCAT_TILE");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return enabled;
+}
+
+template <typename T>
+static __global__ void __launch_bounds__(CUDA_CONCAT_TILE*CUDA_CONCAT_TILE_ROWS)
+    concat_dim0_tile(
+        const char * src0,
+        const char * src1,
+              char * dst,
+           int64_t   ne00,
+           int64_t   ne0,
+           int64_t   ne1,
+           int64_t   ne2,
+          uint64_t   nb00,
+          uint64_t   nb01,
+          uint64_t   nb02,
+          uint64_t   nb03,
+          uint64_t   nb10,
+          uint64_t   nb11,
+          uint64_t   nb12,
+          uint64_t   nb13,
+          uint64_t   nb0,
+          uint64_t   nb1,
+          uint64_t   nb2,
+          uint64_t   nb3) {
+    __shared__ T tile[CUDA_CONCAT_TILE][CUDA_CONCAT_TILE + 1];
+
+    const int64_t i3  = blockIdx.z / ne2;
+    const int64_t i2  = blockIdx.z - i3*ne2;
+    const int64_t i0b = (int64_t) blockIdx.x*CUDA_CONCAT_TILE;
+    const int64_t i1b = (int64_t) blockIdx.y*CUDA_CONCAT_TILE;
+
+    // read: threadIdx.x along i1
+    const int64_t i1 = i1b + threadIdx.x;
+    for (int r = threadIdx.y; r < CUDA_CONCAT_TILE; r += CUDA_CONCAT_TILE_ROWS) {
+        const int64_t i0 = i0b + r;
+        if (i0 < ne0 && i1 < ne1) {
+            const char * x = i0 < ne00 ? src0 + i3*nb03 + i2*nb02 + i1*nb01 + i0*nb00
+                                       : src1 + i3*nb13 + i2*nb12 + i1*nb11 + (i0 - ne00)*nb10;
+            tile[r][threadIdx.x] = *(const T *) x;
+        }
+    }
+
+    __syncthreads();
+
+    // write: threadIdx.x along i0
+    const int64_t j0 = i0b + threadIdx.x;
+    for (int r = threadIdx.y; r < CUDA_CONCAT_TILE; r += CUDA_CONCAT_TILE_ROWS) {
+        const int64_t j1 = i1b + r;
+        if (j0 < ne0 && j1 < ne1) {
+            *(T *)(dst + i3*nb3 + i2*nb2 + j1*nb1 + j0*nb0) = tile[threadIdx.x][r];
+        }
+    }
+}
+
 template <typename T>
 static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, int dim, cudaStream_t stream) {
     if (dim != 3 && ggml_is_contiguous_to_3(src0) && ggml_is_contiguous_to_3(src1)) {
@@ -230,6 +299,22 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
         GGML_ASSERT(!ggml_is_quantized(src0->type));
 
         const bool flat = dst->ne[0] < CUDA_CONCAT_BLOCK_SIZE;
+
+        // a transposed 4-byte src1 (contiguous along i1, strided along i0) with rows long enough for the tile kernel
+        const int64_t n_tile0 = (dst->ne[0] + CUDA_CONCAT_TILE - 1) / CUDA_CONCAT_TILE;
+        const int64_t n_tile1 = (dst->ne[1] + CUDA_CONCAT_TILE - 1) / CUDA_CONCAT_TILE;
+        if (dim == 0 && !flat && sizeof(T) == 4 && concat_tile_enabled() && src1->nb[1] == sizeof(T) && src1->nb[0] > sizeof(T) &&
+            n_tile0 <= INT_MAX && n_tile1 <= 65535 && dst->ne[2]*dst->ne[3] <= 65535) {
+            const dim3 grid_tile((unsigned) n_tile0, (unsigned) n_tile1, (unsigned) (dst->ne[2]*dst->ne[3]));
+            const dim3 block_tile(CUDA_CONCAT_TILE, CUDA_CONCAT_TILE_ROWS, 1);
+            concat_dim0_tile<T><<<grid_tile, block_tile, 0, stream>>>(
+                (const char *) src0->data, (const char *) src1->data, (char *) dst->data,
+                src0->ne[0], dst->ne[0], dst->ne[1], dst->ne[2],
+                src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3],
+                src1->nb[0], src1->nb[1], src1->nb[2], src1->nb[3],
+                dst->nb[0], dst->nb[1], dst->nb[2], dst->nb[3]);
+            return;
+        }
         const int64_t n_flat = (dst->ne[0]*dst->ne[1] + CUDA_CONCAT_BLOCK_SIZE - 1) / CUDA_CONCAT_BLOCK_SIZE;
         const dim3 grid_dim((unsigned) (flat ? n_flat : dst->ne[1]), (unsigned) dst->ne[2], (unsigned) dst->ne[3]);
         auto launch_kernel = [&](auto dim) {

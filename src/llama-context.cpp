@@ -29,6 +29,8 @@
 #include "llama-draft-vocab-compact.h"
 #include "llama-mtp-chain-sample.h"
 #include "llama-moe-cache.h"
+#include "llama-b1.h"
+#include "llama-ple-prefetch.h"
 #include "llama-ext.h"
 #include "llama-sampler.h"
 #include "llama.h"
@@ -990,6 +992,10 @@ llama_context::~llama_context() {
     }
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+
+    // [B1] give lent expert layers back to the model before the backends go away
+    b1.reset();
+    ple_pf.reset();
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
@@ -2148,6 +2154,12 @@ bool llama_context::maintain_sj_kvarn() {
     return kv->maintain_sj_kvarn(this);
 }
 
+bool llama_context::b1_seal_sj_kvarn(int32_t il0, int32_t il1) {
+    auto * kv = llama_sj_kvarn_cache(memory.get());
+    if (!kv || !kv->is_sj_kvarn()) { return true; }
+    return kv->b1_sj_seal(this, il0, il1);
+}
+
 int32_t llama_context::compress_sj_kvarn_idle(llama_seq_id seq_id, llama_pos accepted_end, llama_pos keep_from) {
     auto * kv = llama_sj_kvarn_cache(memory.get());
     if (!kv || !kv->is_sj_kvarn()) { return -1; }
@@ -2621,8 +2633,7 @@ void llama_context::set_embeddings_nextn(bool value, bool masked) {
     cparams.embeddings_nextn        = value;
     cparams.embeddings_nextn_masked = masked;
 
-    // grow the pinned output buffer now (this is called at speculative-decoding setup) instead of inside the
-    // first prefill; the unmasked nextn block is n_embd_out x n_batch floats (80 MiB at n_batch 4096).
+    // Reserve the initial nextn output. Decode grows it to the input row count.
     // note: like any reservation this invalidates the outputs of the previous batch
     output_reserve_grow();
 }
@@ -2813,13 +2824,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
                                                  llm_graph_type           gtype,
                                                  llama_memory_context_i * mctx,
                                                  ggml_status &            ret) {
-    if (mctx && !mctx->apply()) {
+    // [B1] the layer-major prefill applied every ubatch up front and seeks between their saved views
+    if (mctx && !b1_cur.active && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
 
-    if (!maintain_sj_kvarn()) {
+    // [B1] a layer slice seals its own layers for its ubatch (the bookkeeping was advanced when it was applied)
+    if (b1_cur.active ? !b1_seal_sj_kvarn(b1_cur.il0, b1_cur.il1) : !maintain_sj_kvarn()) {
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
@@ -2869,8 +2882,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
     // a peer context that grew the shared compute buffer (ggml_gallocr donor) invalidates this context's allocated graph
-    if (!graph_reuse_disable && gf_res_prev_active == res && gf_res_prev_epoch == ggml_backend_sched_get_alloc_epoch(sched.get()) &&
-            res->can_reuse(gparams)) {
+    if (!graph_reuse_disable && !b1_cur.active && gf_res_prev_active == res &&
+            gf_res_prev_epoch == ggml_backend_sched_get_alloc_epoch(sched.get()) && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -2910,7 +2923,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
             return nullptr;
         }
 
-        gf_res_prev_active = res;
+        // [B1] a layer-range graph is never reused: its carry, KV views and expert slots change every call
+        gf_res_prev_active = b1_cur.active ? nullptr : res;
         gf_res_prev_epoch  = ggml_backend_sched_get_alloc_epoch(sched.get());
     }
 
@@ -2989,7 +3003,7 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
     n_queued_tokens += n_tokens;
 
     // reserve output buffer
-    if (output_reserve(n_tokens) < n_tokens) {
+    if (output_reserve(n_tokens, n_tokens) < n_tokens) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %u outputs\n", __func__, n_tokens);
         return -2;
     };
@@ -3266,6 +3280,13 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         return encode(batch_inp);
     }
 
+    // in-call checkpoints: a request is for this call only; an older one's copies are dropped here
+    if (!ckpt_armed) {
+        ckpt_caps.clear();
+    }
+    ckpt_armed = false;
+    ckpt_sel   = -1;
+
     if (batch_inp.tokens.empty()) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
@@ -3325,6 +3346,23 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
     const uint32_t n_outputs_all = balloc->get_n_outputs();
+
+    // [PLEPF] start reading the PLE pages of a prompt call; stopped when the call returns
+    if (!ple_pf_tried) {
+        ple_pf_tried = true;
+        ple_pf = llama_ple_prefetch::create(model, cparams.n_ubatch);
+    }
+    struct ple_pf_guard {
+        llama_ple_prefetch * p = nullptr;
+        ~ple_pf_guard() {
+            if (p) {
+                p->stop();
+            }
+        }
+    } ple_pf_g;
+    if (ple_pf && ple_pf->start(batch_inp, balloc->get_batch().pos[0])) {
+        ple_pf_g.p = ple_pf.get();
+    }
 
     if (output_all) {
         // require that all tokens are output
@@ -3413,9 +3451,40 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     }
 
     // reserve output buffer
-    if (output_reserve(n_outputs_all) < n_outputs_all) {
+    if (output_reserve(n_outputs_all, n_tokens_all) < n_outputs_all) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
         return -2;
+    };
+
+    // [B1] layer-major prefill: plan the call and apply every ubatch up front, or give lent experts back first
+    const int b1_mode = b1_prepare(mctx.get(), batch_inp, n_tokens_all, n_outputs_all);
+    if (b1_mode < 0) {
+        return b1_mode;
+    }
+    llama_seq_id b1_seq      = -1;
+    llama_pos    b1_pos0     = 0;
+    int32_t      b1_final_l0 = 0;
+    size_t       b1_i        = 0;
+    if (b1_mode == 1) {
+        b1_seq = *batch_inp.tokens[0].seq_ids.begin();
+        b1_pos0 = balloc->seq_pos_min(b1_seq);
+        b1_final_l0 = b1->final_l0();
+    }
+    // on a failure every ubatch of the call is incomplete: drop the whole batch from the memory
+    auto b1_fail = [&](ggml_status st) -> int {
+        b1_cur = {};
+        b1->end(true);
+        // SJ-KVaRN: layers stopped at different ubatches, so ring rows below b1_pos0 may already be overwritten in
+        // some layers and sealed groups disagree between layers; only a full clear of the sequence is exact
+        const bool sj_on = llama_sj_kvarn_cache(memory.get()) && llama_sj_kvarn_cache(memory.get())->is_sj_kvarn();
+        const llama_pos rm0 = sj_on ? -1 : b1_pos0;
+        LLAMA_LOG_WARN("%s: [B1] removing memory module entries for seq_id = %d, pos = [%d, +inf)\n", __func__, b1_seq, std::max<llama_pos>(0, rm0));
+        memory->seq_rm(b1_seq, rm0, -1);
+        switch (st) {
+            case GGML_STATUS_ABORTED:      return 2;
+            case GGML_STATUS_ALLOC_FAILED: return -2;
+            default:                       return -3;
+        }
     };
 
     // start a new sampling transaction for this logical batch
@@ -3427,6 +3496,16 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     int64_t n_tokens_prev  = 0;
 
     do {
+        if (b1_mode == 1) {
+            if (b1->is_group_first(b1_i)) {
+                ggml_status st_pre = GGML_STATUS_SUCCESS;
+                if (!b1_run_prefix(mctx.get(), b1_i, st_pre)) {
+                    return b1_fail(st_pre);
+                }
+            }
+            b1_cur = { true, b1_final_l0, -1, b1_final_l0 > 0 ? b1->carry(b1_i) : nullptr };
+        }
+
         const auto & ubatch = mctx->get_ubatch();
 
         // count the outputs in this ubatch
@@ -3447,7 +3526,29 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         ggml_status status;
 
+        // [B1] the last range holds a streamed layer only when it is the last layer; match the normal path's CPU
+        // choice for an ubatch whose last-layer FFN rows are too few to offload
+        const bool b1_home = b1_mode == 1 && b1->layer_streamed(b1_final_l0) &&
+            !b1->host_rows_on_gpu(b1_final_rows(n_outputs, ubatch.n_tokens));
+        if (b1_home) {
+            b1->ubatch_home(b1_final_l0, true);
+        }
+
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+
+        if (b1_home) {
+            b1->ubatch_home(b1_final_l0, false);
+        }
+
+        if (b1_mode == 1) {
+            b1_cur = {};
+            if (!res) {
+                return b1_fail(status);
+            }
+            if (b1->is_group_last(b1_i)) {
+                b1->layer_end(b1_final_l0);
+            }
+        }
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
@@ -3484,6 +3585,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                     GGML_ABORT("should not happen");
             }
         }
+
+        // in-call checkpoints: the normal path ran every layer, B1's last range the layers from b1_final_l0 on
+        capture_ubatch(ubatch, b1_mode == 1 ? b1_final_l0 : 0, -1);
 
         // plot the computation graph in dot format (for debugging purposes)
         //if (n_past%100 == 0) {
@@ -3666,7 +3770,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         n_outputs_prev += n_outputs;
         n_tokens_prev += ubatch.n_tokens;
-    } while (mctx->next());
+    } while (b1_mode == 1 ? (++b1_i < b1->n_ub() && mctx->b1_seek(b1_i)) : mctx->next());
+
+    if (b1_mode == 1) {
+        GGML_ASSERT(b1_i == b1->n_ub());
+        b1->end(false);
+    }
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     n_outputs = n_outputs_all;
@@ -3728,7 +3837,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 // output
 //
 
-uint32_t llama_context::output_reserve(int32_t n_outputs) {
+uint32_t llama_context::output_reserve(int32_t n_outputs, int32_t n_tokens) {
     const auto & hparams = model.hparams;
     const auto & vocab   = model.vocab;
 
@@ -3756,14 +3865,15 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     size_t backend_token_count        = 0;
     size_t embd_layer_inp_float_count = 0;
 
+    const size_t nextn_rows = std::max<size_t>(std::max(n_tokens, 1), output_buffer_reuse ? embd_nextn.size / n_embd_out : 0);
+
     logits.size     = has_logits ? n_vocab * n_outputs_max : 0;
     embd.size       = has_embd ? n_embd_out * n_outputs_max : 0;
     embd_nextn.size = has_embd_nextn ? n_embd_out * n_outputs_max : 0;
 
     if (has_embd_nextn && !cparams.embeddings_nextn_masked) {
-        // unmasked: nextn row exists for every token in the batch, not just
-        // those flagged via batch.logits[i] -> size by token count instead.
-        embd_nextn.size = (size_t) n_embd_out * n_batch;
+        // Unmasked nextn needs every input row, including rows without logits.
+        embd_nextn.size = (size_t) n_embd_out * nextn_rows;
     }
 
     for (bool enabled : cparams.embeddings_layer_inp) {
@@ -4242,11 +4352,230 @@ ggml_cgraph * llama_context::graph_reserve(
     return gf;
 }
 
+//
+// [B1] layer-major prefill
+//
+
+static int64_t b1_ctx_env(const char * name, int64_t def) {
+    const char * e = getenv(name);
+    return e && *e ? atoll(e) : def;
+}
+
+int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_ext & batch_inp, uint32_t n_tokens_all, int64_t n_outputs_all) {
+    if (!b1_tried) {
+        b1_tried = true;
+        b1_env   = b1_ctx_env("LLAMA_B1", 0) != 0;
+        if (b1_env) {
+            const char * why = nullptr;
+            ggml_backend_t gpu = nullptr;
+            int n_gpu = 0;
+            for (auto & be : backends) {
+                ggml_backend_dev_t d = ggml_backend_get_device(be.get());
+                if (d && ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                    ++n_gpu;
+                    gpu = be.get();
+                }
+            }
+            if (model.arch != LLM_ARCH_QWEN4EXP) {
+                why = "only qwen4exp builds layer-range graphs";
+            } else if (cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT) {
+                why = "this is a draft (MTP) context; only the main context reads prompts layer-major";
+            } else if (n_gpu != 1) {
+                why = "it needs exactly one GPU";
+            } else if (cparams.embeddings) {
+                why = "the context computes embeddings";
+            } else if (!cparams.op_offload) {
+                why = "op offload is off, so the normal path computes the experts in RAM on the CPU";
+            }
+            if (why) {
+                LLAMA_LOG_WARN("%s: [B1] LLAMA_B1 is set but layer-major prefill is off: %s\n", __func__, why);
+            } else {
+                b1 = std::make_unique<llama_b1>(model, gpu);
+                if (!b1->ok()) {
+                    b1.reset();
+                }
+            }
+        }
+    }
+    if (!b1) {
+        return 0;
+    }
+
+    auto normal = [&]() -> int {
+        if (b1->dirty() && !b1->refill()) {
+            LLAMA_LOG_ERROR("%s: [B1] cannot restore the lent expert layers\n", __func__);
+            return -3;
+        }
+        return 0;
+    };
+
+    // per call: the conditions another component may have changed since construction
+    if (moe_cache || compute_peer || std::any_of(cparams.embeddings_layer_inp.begin(), cparams.embeddings_layer_inp.end(),
+                [](bool b) { return b; })) {
+        if (!b1_off_logged) {
+            b1_off_logged = true;
+            LLAMA_LOG_WARN("%s: [B1] prompts take the normal path: %s\n", __func__,
+                moe_cache ? "the MoE cache is on (--moe-cache off enables B1)" :
+                compute_peer ? "an MTP context of the same model shares the compute buffers (LLAMA_SHARED_COMPUTE=0 enables B1)" :
+                "layer inputs are being extracted");
+        }
+        return normal();
+    }
+
+    // one sequence; batches that mix slots take the normal path
+    llama_seq_id seq = -1;
+    for (const auto & tok : batch_inp.tokens) {
+        if (tok.seq_ids.size() != 1) {
+            return normal();
+        }
+        const llama_seq_id s = *tok.seq_ids.begin();
+        if (seq < 0) {
+            seq = s;
+        } else if (s != seq) {
+            return normal();
+        }
+    }
+
+    const std::vector<uint32_t> sizes = mctx->b1_ubatch_sizes();
+    // auto threshold: shorter calls take the normal path. A one-ubatch call also runs layer-major: it moves the same
+    // expert bytes as the normal path but overlaps the copies with compute (the server sends the last n_ubatch + 4
+    // prompt tokens as their own calls for its context checkpoints)
+    const int64_t min_tok = b1_ctx_env("LLAMA_B1_MIN_TOKENS", 4096);
+    if (sizes.empty() || (int64_t) n_tokens_all < min_tok) {
+        return normal();
+    }
+    if (!mctx->b1_supported()) {
+        if (!b1_off_logged) {
+            b1_off_logged = true;
+            LLAMA_LOG_WARN("%s: [B1] prompts take the normal path: the memory cannot replay its ubatches layer by layer "
+                "(rollback ring, --gdn-replay, KV block streaming or a full cache)\n", __func__);
+        }
+        return normal();
+    }
+
+    // lend the whole expert cache when this is the only sequence; when other sequences hold memory (other slots
+    // that decode between calls), lend at most LLAMA_B1_LEND_PAR_MIB so they find most experts resident
+    bool others = false;
+    for (llama_seq_id s = 0; s < (llama_seq_id) n_seq_max() && !others; ++s) {
+        others = s != seq && memory->seq_pos_max(s) >= 0;
+    }
+    size_t lend_cap = SIZE_MAX;
+    if (others) {
+        lend_cap = (size_t) std::max<int64_t>(0, b1_ctx_env("LLAMA_B1_LEND_PAR_MIB", 3072)) << 20;
+    }
+    const int64_t lend_mib = b1_ctx_env("LLAMA_B1_LEND_MIB", -1);
+    if (lend_mib >= 0) {
+        lend_cap = std::min(lend_cap, (size_t) lend_mib << 20);
+    }
+
+    // tokens per group (S): 0 = the whole call
+    const int64_t s_tok = b1_ctx_env("LLAMA_B1_GROUP", 0);
+    uint32_t group_ub = 0;
+    if (s_tok > 0) {
+        group_ub = (uint32_t) std::max<int64_t>(1, (s_tok + cparams.n_ubatch/2)/cparams.n_ubatch);
+    }
+
+    // the last layer is cropped to the output rows before its FFN; when even all outputs together are too few for the
+    // scheduler to copy RAM experts to the GPU, the normal path computes that layer's RAM experts on the CPU in every
+    // ubatch, so B1 leaves them home (same result, one layer less to stream). Otherwise ubatch_home() matches it per ubatch.
+    const bool final_home = !b1->host_rows_on_gpu(b1_final_rows(n_outputs_all, n_tokens_all));
+    if (!b1->begin(sizes, group_ub, lend_cap, final_home)) {
+        return normal();
+    }
+
+    // apply every ubatch now, saving each memory view
+    auto * sj = llama_sj_kvarn_cache(memory.get());
+    if (sj && !sj->is_sj_kvarn()) {
+        sj = nullptr;
+    }
+    if (sj) {
+        sj->b1_sj_begin(seq);
+    }
+    size_t n_applied = 0;
+    do {
+        if (!mctx->apply()) {
+            LLAMA_LOG_ERROR("%s: [B1] failed to apply memory context of ubatch %zu\n", __func__, n_applied);
+            b1->end(true);
+            if (sj) {
+                sj->b1_sj_rewind();
+            }
+            memory->seq_rm(seq, balloc->seq_pos_min(seq), -1);
+            return -3;
+        }
+        mctx->b1_save();
+        ++n_applied;
+    } while (mctx->next());
+
+    if (n_applied != sizes.size() || !mctx->b1_seek(0)) {
+        LLAMA_LOG_ERROR("%s: [B1] the memory context did not keep its ubatch views\n", __func__);
+        b1->end(true);
+        if (sj) {
+            sj->b1_sj_rewind();
+        }
+        memory->seq_rm(seq, balloc->seq_pos_min(seq), -1);
+        return -3;
+    }
+
+    LLAMA_LOG_WARN("%s: [B1] layer-major prefill of %u tokens: %zu ubatches, %zu groups of %zu, %s\n", __func__,
+            n_tokens_all, sizes.size(), b1->n_groups(), b1->group_ub(), others ? "other sequences present" : "alone");
+    return 1;
+}
+
+int64_t llama_context::b1_final_rows(int64_t n_out, int64_t n_tok) const {
+    // the graph crops the last layer to the output rows before its FFN unless the nextn hidden state needs every row
+    return !cparams.embeddings_nextn || cparams.embeddings_nextn_masked ? n_out : n_tok;
+}
+
+bool llama_context::b1_run_prefix(llama_memory_context_i * mctx, size_t ub0, ggml_status & status) {
+    const int32_t l_final = b1->final_l0();
+    const size_t  ub1     = b1->group_end(ub0);
+    const llm_graph_type gtype = ctx_type_to_graph_type(cparams.ctx_type);
+
+    status = GGML_STATUS_FAILED;
+    for (int32_t l0 = 0; l0 < l_final; ) {
+        const int32_t l1 = b1->range_end(l0);
+        if (!b1->layer_begin(l0)) {
+            return false;
+        }
+        for (size_t u = ub0; u < ub1; ++u) {
+            if (!mctx->b1_seek(u)) {
+                LLAMA_LOG_ERROR("%s: [B1] cannot seek to ubatch %zu\n", __func__, u);
+                return false;
+            }
+            n_outputs = 0;
+            b1_cur = { true, l0, l1, b1->carry(u) };
+            // a short ubatch: the normal path computes the RAM experts of this layer on the CPU, so B1 does too
+            const bool home = b1->layer_streamed(l0) && !b1->host_rows_on_gpu(mctx->get_ubatch().n_tokens);
+            if (home) {
+                b1->ubatch_home(l0, true);
+            }
+            const auto * res = process_ubatch(mctx->get_ubatch(), gtype, mctx, status);
+            if (home) {
+                b1->ubatch_home(l0, false);
+            }
+            b1_cur = {};
+            if (!res) {
+                return false;
+            }
+            capture_ubatch(mctx->get_ubatch(), l0, l1);
+        }
+        b1->layer_end(l0);
+        l0 = l1;
+    }
+
+    if (!mctx->b1_seek(ub0) || !b1->layer_begin(l_final)) {
+        status = GGML_STATUS_FAILED;
+        return false;
+    }
+    status = GGML_STATUS_SUCCESS;
+    return true;
+}
+
 llm_graph_params llama_context::graph_params(llm_graph_result *             res,
                                              const llama_ubatch &           ubatch,
                                              const llama_memory_context_i * mctx,
                                              llm_graph_type                 gtype) const {
-    return {
+    llm_graph_params p = {
         /*.arch        =*/ model.arch,
         /*.hparams     =*/ model.hparams,
         /*.cparams     =*/ cparams,
@@ -4273,6 +4602,13 @@ llm_graph_params llama_context::graph_params(llm_graph_result *             res,
         /*.res         =*/ res,
         /*.model       =*/ &model,
     };
+    p.ple_pf = ple_pf.get();
+    if (b1_cur.active) {
+        p.b1_il0   = b1_cur.il0;
+        p.b1_il1   = b1_cur.il1;
+        p.b1_carry = b1_cur.carry;
+    }
+    return p;
 }
 
 ggml_status llama_context::graph_compute(ggml_cgraph * gf, bool batched) {
@@ -4947,6 +5283,10 @@ size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
 static constexpr uint32_t io_magic = 0xaf143cd8;
 
 size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_flags flags) {
+    if (ckpt_sel >= 0 && seq_id == ckpt_seq && flags == LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) {
+        return ckpt_caps[ckpt_sel].blob.size();
+    }
+
     llama_io_write_dummy io(flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
     try {
         io.write(&io_magic, sizeof(io_magic));
@@ -4960,6 +5300,16 @@ size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_fl
 }
 
 size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_state_seq_flags flags) {
+    if (ckpt_sel >= 0 && seq_id == ckpt_seq && flags == LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) {
+        const auto & blob = ckpt_caps[ckpt_sel].blob;
+        if (size < blob.size()) {
+            LLAMA_LOG_ERROR("%s: error saving state: unexpectedly reached end of buffer\n", __func__);
+            return 0;
+        }
+        memcpy(dst, blob.data(), blob.size());
+        return blob.size();
+    }
+
     std::unique_ptr<llama_io_write_i> io;
     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
         io = std::make_unique<llama_io_write_device>(dst, size, mem_storage[seq_id]);
@@ -4975,6 +5325,213 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error saving state: %s\n", __func__, err.what());
         return 0;
+    }
+}
+
+// in-call checkpoints: lays out the PARTIAL_ONLY state like llama_io_write_host would write it, without reading the
+// tensors (fill), or checks that a later layout is the same one (check)
+class llama_io_write_layout : public llama_io_write_i {
+  public:
+    llama_io_write_layout(std::vector<uint8_t> & blob, std::vector<llama_context::ckpt_write> & writes, bool check) :
+        blob(blob), writes(writes), check(check) {}
+
+    void write(const void * src, size_t size) override {
+        if (check) {
+            same = same && off + size <= blob.size() && memcmp(blob.data() + off, src, size) == 0;
+        } else {
+            blob.insert(blob.end(), (const uint8_t *) src, (const uint8_t *) src + size);
+        }
+        off += size;
+    }
+
+    void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        if (check) {
+            same = same && iw < writes.size() && writes[iw].t == tensor && writes[iw].offset == offset &&
+                writes[iw].size == size && writes[iw].blob_off == off;
+            ++iw;
+        } else {
+            writes.push_back({ tensor, offset, size, off, -1 });
+            blob.resize(blob.size() + size);
+        }
+        off += size;
+    }
+
+    size_t n_bytes() override { return off; }
+
+    // check mode: the layout matched the earlier one exactly
+    bool matched() const { return same && iw == writes.size() && off == blob.size(); }
+
+  private:
+    std::vector<uint8_t> &                   blob;
+    std::vector<llama_context::ckpt_write> & writes;
+    const bool check;
+
+    size_t off  = 0;
+    size_t iw   = 0;
+    bool   same = true;
+};
+
+const llama_memory_recurrent * llama_context::capture_mem() const {
+    // PARTIAL_ONLY is exactly the recurrent state for these memories (the hybrid ones skip their attention cache and
+    // indexer); a replay ring travels in an extra section the copy does not keep
+    const llama_memory_recurrent * mem_recr = nullptr;
+    if (const auto * hyb = dynamic_cast<const llama_memory_hybrid *>(memory.get())) {
+        mem_recr = hyb->get_mem_recr();
+    } else {
+        mem_recr = dynamic_cast<const llama_memory_recurrent *>(memory.get());
+    }
+    if (mem_recr == nullptr || mem_recr->gdn_replay) {
+        return nullptr;
+    }
+    return mem_recr;
+}
+
+int32_t llama_context::capture_arm(llama_seq_id seq_id, const llama_pos * n_tokens, int32_t n) {
+    ckpt_caps.clear();
+    ckpt_sel   = -1;
+    ckpt_armed = false;
+    ckpt_seq   = -1;
+    if (n <= 0) {
+        return 0;
+    }
+    if (capture_mem() == nullptr || seq_id < 0) {
+        return -1;
+    }
+    ckpt_seq = seq_id;
+    ckpt_caps.resize(n);
+    for (int32_t i = 0; i < n; ++i) {
+        ckpt_caps[i].n_tokens = n_tokens[i];
+    }
+    ckpt_armed = true;
+    return 0;
+}
+
+int32_t llama_context::capture_min_tail() const {
+    const auto * mem_recr = capture_mem();
+    if (mem_recr == nullptr) {
+        return -1;
+    }
+    // split_equal keeps the last n_rs_seq + 1 tokens of a sequence in one ubatch
+    return mem_recr->n_rs_seq > 0 ? (int32_t) mem_recr->n_rs_seq + 1 : 1;
+}
+
+bool llama_context::capture_select(int32_t k, llama_pos * pos_min, llama_pos * pos_max) {
+    ckpt_sel = -1;
+    if (k < 0 || k >= (int32_t) ckpt_caps.size()) {
+        return false;
+    }
+    const auto & c = ckpt_caps[k];
+    if (c.failed || !c.laid_out) {
+        return false;
+    }
+    for (size_t il = 0; il < c.layer_done.size(); ++il) {
+        if (!c.layer_done[il]) {
+            return false;
+        }
+    }
+    ckpt_sel = k;
+    if (pos_min) {
+        *pos_min = c.pos_min;
+    }
+    if (pos_max) {
+        *pos_max = c.pos_max;
+    }
+    return true;
+}
+
+void llama_context::capture_ubatch(const llama_ubatch & ubatch, int32_t il0, int32_t il1) {
+    if (ckpt_caps.empty() || ubatch.n_tokens == 0) {
+        return;
+    }
+
+    // the token count this ubatch ends at; a ubatch of another sequence fails the request
+    llama_pos p_end = -1;
+    bool      other = false;
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        if (ubatch.n_seq_id[i] != 1 || ubatch.seq_id[i][0] != ckpt_seq) {
+            other = true;
+        } else {
+            p_end = std::max<llama_pos>(p_end, ubatch.pos[i] + 1);
+        }
+    }
+
+    const auto * mem_recr = capture_mem();
+    const int32_t n_layer = (int32_t) mem_recr->r_l.size();
+    if (il1 < 0 || il1 > n_layer) {
+        il1 = n_layer;
+    }
+
+    for (auto & c : ckpt_caps) {
+        if (c.failed) {
+            continue;
+        }
+        if (other) {
+            LLAMA_LOG_WARN("%s: in-call checkpoint at %d dropped: a ubatch holds another sequence\n", __func__, c.n_tokens);
+            c.failed = true;
+            continue;
+        }
+        if (c.n_tokens != p_end) {
+            continue;
+        }
+
+        // the rows are written by the graph that just ran
+        ggml_backend_sched_synchronize(sched.get());
+
+        // the memory's bookkeeping is now that of the ubatch just computed, so it lays out the state the way a call
+        // ending here would write it; every later layer range must find the same layout
+        {
+            llama_io_write_layout io(c.blob, c.writes, c.laid_out);
+            try {
+                io.write(&io_magic, sizeof(io_magic));
+                io.write(&ckpt_seq, sizeof(ckpt_seq));
+                state_seq_write_data(io, ckpt_seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            } catch (const std::exception & err) {
+                LLAMA_LOG_WARN("%s: in-call checkpoint at %d dropped: %s\n", __func__, c.n_tokens, err.what());
+                c.failed = true;
+                continue;
+            }
+            if (c.laid_out && !io.matched()) {
+                LLAMA_LOG_WARN("%s: in-call checkpoint at %d dropped: the state layout changed between layer ranges\n", __func__, c.n_tokens);
+                c.failed = true;
+                continue;
+            }
+        }
+        if (!c.laid_out) {
+            c.laid_out = true;
+            c.pos_min  = memory->seq_pos_min(ckpt_seq);
+            c.pos_max  = memory->seq_pos_max(ckpt_seq);
+            c.layer_done.assign(n_layer, 1);
+            for (int32_t il = 0; il < n_layer; ++il) {
+                if (mem_recr->r_l[il] || mem_recr->s_l[il] || mem_recr->p_l[il]) {
+                    c.layer_done[il] = 0;
+                }
+            }
+            for (auto & w : c.writes) {
+                for (int32_t il = 0; il < n_layer && w.il < 0; ++il) {
+                    if (w.t == mem_recr->r_l[il] || w.t == mem_recr->s_l[il] || w.t == mem_recr->p_l[il]) {
+                        w.il = il;
+                    }
+                }
+                if (w.il < 0) {
+                    LLAMA_LOG_WARN("%s: in-call checkpoint at %d dropped: a state row is not a layer's\n", __func__, c.n_tokens);
+                    c.failed = true;
+                    break;
+                }
+            }
+            if (c.failed) {
+                continue;
+            }
+        }
+
+        // copy the rows of the layers this graph computed
+        for (const auto & w : c.writes) {
+            if (w.il >= il0 && w.il < il1) {
+                ggml_backend_tensor_get(w.t, c.blob.data() + w.blob_off, w.offset, w.size);
+            }
+        }
+        for (int32_t il = il0; il < il1; ++il) {
+            c.layer_done[il] = 1;
+        }
     }
 }
 
@@ -5418,7 +5975,7 @@ void llama_context::opt_epoch_iter(ggml_opt_dataset_t               dataset,
         }
 
         // reserve output buffer
-        if (output_reserve(n_outputs_all) < n_outputs_all) {
+        if (output_reserve(n_outputs_all, n_tokens_all) < n_outputs_all) {
             LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
             GGML_ABORT("TODO: handle this error");
         };
@@ -6341,6 +6898,18 @@ size_t llama_state_seq_get_data_ext(llama_context *       ctx,
     ctx->synchronize();
 
     return ctx->state_seq_get_data(seq_id, dst, size, flags);
+}
+
+int32_t llama_state_seq_capture_arm(llama_context * ctx, llama_seq_id seq_id, const llama_pos * n_tokens, int32_t n) {
+    return ctx->capture_arm(seq_id, n_tokens, n);
+}
+
+int32_t llama_state_seq_capture_min_tail(llama_context * ctx) {
+    return ctx->capture_min_tail();
+}
+
+bool llama_state_seq_capture_select(llama_context * ctx, int32_t k, llama_pos * pos_min, llama_pos * pos_max) {
+    return ctx->capture_select(k, pos_min, pos_max);
 }
 
 size_t llama_state_seq_set_data_ext(llama_context *       ctx,

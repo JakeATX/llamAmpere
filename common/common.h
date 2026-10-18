@@ -377,6 +377,7 @@ struct common_params_speculative_draft {
     bool    dflash                = false; // use DFlash speculative decoding
     bool    dflash_defer_injection = true;  // defer encoder KV injection to draft time (set false for higher acceptance on some models)
     int32_t n_ctx                 = 0;     // draft context size
+    int32_t n_ubatch              = -1;    // MTP draft physical microbatch: -1 = auto (2048 for an MTP draft file loaded with -md), 0 = main's -ub, N > 0 = at most N
 
     // MTP drafter attention window (default off)
     int32_t attn_window = 0;     // > 0: the MTP drafter attends only to its last attn_window positions (+ sinks)
@@ -584,6 +585,7 @@ struct common_params {
     int32_t main_gpu           = 0;     // the GPU that is used for scratch and small tensors
     float   tensor_split[128]  = {0};   // how split tensors should be distributed across GPUs
     bool    fit_params         = true;  // whether to fit unset model/context parameters to free device memory
+    bool    n_cpu_moe_auto     = false; // --n-cpu-moe auto: fit resident expert layers into free VRAM (#224)
     bool    fit_params_print   = false; // print the estimated required memory to run the model
     int32_t fit_params_min_ctx = 4096;  // minimum context size to set when trying to reduce memory use
 

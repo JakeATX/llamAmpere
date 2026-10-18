@@ -41,6 +41,7 @@ struct llama_layer;
 struct llama_prec_policy;
 
 class llama_moe_cache;
+class llama_ple_prefetch;
 
 struct llama_memory_context_i;
 
@@ -927,6 +928,16 @@ struct llm_graph_params {
     // owning model (EXL3 side tensors for build_lora_mm); may be null for graphs that carry no EXL3 weights
     const llama_model * model = nullptr;
 
+    // [B1] layer-major prefill (LLAMA_B1, qwen4exp): build only the layers [b1_il0, b1_il1) (b1_il1 < 0: to the end).
+    // A range that starts above layer 0 reads the hidden state from b1_carry, a range that stops before the last layer
+    // writes it back there and builds no output. Set after construction.
+    int32_t       b1_il0   = 0;
+    int32_t       b1_il1   = -1;
+    ggml_tensor * b1_carry = nullptr;
+
+    // [PLEPF] the context's PLE page prefetch (null when off); set after construction
+    llama_ple_prefetch * ple_pf = nullptr;
+
     // true for a graph built only to reserve compute buffers (llama_context::graph_reserve): its output rows are
     // placeholders and may sit on sequences that have no backend sampler (none is attached yet at context creation)
     // set after construction, so it stays last
@@ -991,6 +1002,10 @@ struct llm_graph_params {
 
         // TODO: https://github.com/ggml-org/llama.cpp/pull/24340#discussion_r3448035248
         if (cparams.nextn_layer_offset != other.cparams.nextn_layer_offset) {
+            return false;
+        }
+
+        if (b1_il0 != other.b1_il0 || b1_il1 != other.b1_il1 || b1_carry != other.b1_carry) {
             return false;
         }
 
@@ -1170,6 +1185,10 @@ struct llm_graph_context {
     std::atomic<uint32_t> * draft_vocab_warned; // see llm_graph_params
     const bool is_reserve; // see llm_graph_params
     const std::vector<float> * mtp_chain_samp; // see llm_graph_params
+    const int32_t       b1_il0;   // see llm_graph_params
+    const int32_t       b1_il1;   // see llm_graph_params (-1 = n_layer)
+    ggml_tensor * const b1_carry; // see llm_graph_params
+    llama_ple_prefetch * const ple_pf; // see llm_graph_params
 
     // [#81] logits of the compact draft head for `cur` [n_embd, n], [n_sel, n]: plain mul_mat on the activation the
     // head consumes (EXL3: x_rot = H128(suh * cur), the fused kernel's input glue built from generic ops)

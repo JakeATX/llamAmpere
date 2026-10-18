@@ -272,6 +272,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--spec-draft-n-cpu-moe, --spec-draft-ncmoe, -ncmoed, --n-cpu-moe-draft N` | keep the Mixture of Experts (MoE) weights of the first N layers in the CPU for the draft model<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_CPU_MOE) |
 | `--spec-draft-n-max N` | number of tokens to draft for speculative decoding (default: 3)<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_MAX) |
 | `--spec-draft-n-min N` | minimum number of draft tokens to use for speculative decoding (default: 0)<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_MIN) |
+| `--spec-draft-ubatch, -ubd, --ubatch-size-draft N` | physical batch size of an MTP draft context; the prompt pass is split into pieces of at most N tokens, which shrinks the draft's compute buffer (default: -1 = 2048 for an MTP draft loaded with -md, the main -ub otherwise; 0 = always the main -ub)<br/>(env: LLAMA_ARG_SPEC_DRAFT_UBATCH) |
 | `--spec-draft-n-min-adaptive N` | minimum adaptive MTP draft depth; the depth starts here and never drops below it (default: 3)<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_MIN_ADAPTIVE) |
 | `--spec-chain 0\|1\|N` | chained MTP drafting: all draft tokens in one GPU decode (default: off). Use --spec-chain N to enable and set depth (e.g. --spec-chain 8).<br/>(env: LLAMA_ARG_SPEC_CHAIN) |
 | `--spec-synth-len L` | target mean synthetic acceptance length, including the target token (benchmarking only)<br/>(env: LLAMA_ARG_SPEC_SYNTH_LEN) |

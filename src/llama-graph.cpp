@@ -212,7 +212,8 @@ bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
 }
 
 void llm_graph_input_pos::set_input(const llama_ubatch * ubatch) {
-    if (ubatch->pos && pos) {
+    // a layer-range graph (LLAMA_B1) without a positional op leaves pos unallocated
+    if (ubatch->pos && pos && pos->buffer) {
         const int64_t n_tokens = ubatch->n_tokens;
 
         ggml_backend_tensor_set(pos, ubatch->pos, 0, n_tokens*n_pos_per_embd*ggml_element_size(pos));
@@ -408,7 +409,14 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
 }
 
 void llm_graph_input_rs::fill_s_copy(const llama_memory_recurrent_context * m) {
-    if (!s_copy) {
+    // a layer-range graph (LLAMA_B1) without a recurrent layer leaves s_copy unallocated. It still consumes the pending
+    // rollback groups, as any graph of its ubatch does in the normal order (B1 restores them before each layer range)
+    if (!s_copy || !s_copy->buffer) {
+        if (s_copy && m->b1_has_views() && !m->get_rs_ring()) {
+            for (uint32_t i = 0; i < m->get_n_rs(); ++i) {
+                (void) m->s_copy((int) i);
+            }
+        }
         return;
     }
     GGML_ASSERT(ggml_backend_buffer_is_host(s_copy->buffer));
@@ -1253,10 +1261,18 @@ void llm_graph_input_attn_cross::set_input(const llama_ubatch * ubatch) {
 }
 
 void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
-    mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
-    mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
+    // a graph can leave these unallocated: qwen4exp's direct QSA selection never reads the causal mask, and a
+    // layer-range graph (LLAMA_B1) without an attention layer writes no K/V
+    if (inp_attn->self_k_idxs && inp_attn->self_k_idxs->buffer) {
+        mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
+    }
+    if (inp_attn->self_v_idxs && inp_attn->self_v_idxs->buffer) {
+        mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
+    }
 
-    mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    if (inp_attn->self_kq_mask && inp_attn->self_kq_mask->buffer) {
+        mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    }
 
     if (inp_attn->self_k_rot) {
         mctx->get_attn()->set_input_k_rot(inp_attn->self_k_rot);
@@ -1696,6 +1712,10 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     draft_vocab_warned(params.draft_vocab_warned),
     is_reserve       (params.is_reserve),
     mtp_chain_samp   (params.mtp_chain_samp),
+    b1_il0           (params.b1_il0),
+    b1_il1           (params.b1_il1),
+    b1_carry         (params.b1_carry),
+    ple_pf           (params.ple_pf),
     cb_func          (params.cb),
     res              (params.res),
     model_ref        (params.model),

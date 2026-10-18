@@ -102,6 +102,29 @@ static __global__ void k_get_rows_float(
 }
 
 template<typename dst_t>
+static __global__ void k_get_rows_float_narrow(
+        const dst_t * src0, const int32_t * src1, dst_t * dst,
+        const uint32_t n_elements, const uint3 ne00_fdv, const uint3 ne10_fdv, const uint3 ne11_fdv,
+        const size_t s1, const size_t s2, const size_t s3,
+        const size_t nb01, const size_t nb02, const size_t nb03,
+        const size_t s10, const size_t s11, const size_t s12) {
+    ggml_cuda_pdl_lc();
+    ggml_cuda_pdl_sync();
+    for (uint32_t i = blockIdx.x*blockDim.x + threadIdx.x; i < n_elements; i += gridDim.x*blockDim.x) {
+        const uint2 col_row = fast_div_modulo(i, ne00_fdv);
+        const uint2 row_batch = fast_div_modulo(col_row.x, ne10_fdv);
+        const uint2 batch = fast_div_modulo(row_batch.x, ne11_fdv);
+        const uint32_t i00 = col_row.y;
+        const uint32_t i10 = row_batch.y;
+        const uint32_t i11 = batch.y;
+        const uint32_t i12 = batch.x;
+        const int i01 = src1[i10*s10 + i11*s11 + i12*s12];
+        const dst_t * src_row = (const dst_t *) ((const char *) src0 + i01*nb01 + i11*nb02 + i12*nb03);
+        dst[i00 + i10*s1 + i11*s2 + i12*s3] = src_row[i00];
+    }
+}
+
+template<typename dst_t>
 static __global__ void k_get_rows_float_vec(
         const dst_t * src0_ptr, const int32_t * src1_ptr, dst_t * dst_ptr,
         const int64_t ne00v,
@@ -255,6 +278,23 @@ static void get_rows_cuda_float(
     const uint3 ne12_fdv = init_fastdiv_values(ne12);
 
     if constexpr (std::is_same<src0_t, dst_t>::value) {
+        static const bool narrow_enabled = [] {
+            const char * e = getenv("GGML_CUDA_GET_ROWS_NARROW");
+            return e != nullptr && atoi(e) != 0;
+        }();
+        const int64_t n_batch = ne11*ne12;
+        // Pack small rows into one block instead of launching a block per value.
+        if (sizeof(dst_t) == 4 && narrow_enabled && ne00 > 0 && ne00 <= 4 && ne10 > 0 && n_batch > 0 &&
+            ne10 <= INT32_MAX / ne00 / n_batch && ne10*n_batch >= 128) {
+            const uint32_t n_elements = ne00*ne10*n_batch;
+            const dim3 grid(MIN((n_elements + CUDA_GET_ROWS_BLOCK_SIZE - 1) / CUDA_GET_ROWS_BLOCK_SIZE, UINT16_MAX));
+            const ggml_cuda_kernel_launch_params launch_params = {grid, block_dims, 0, stream};
+            ggml_cuda_kernel_launch(k_get_rows_float_narrow<dst_t>, launch_params,
+                src0_d, src1_d, dst_d, n_elements,
+                init_fastdiv_values(ne00), init_fastdiv_values(ne10), init_fastdiv_values(ne11),
+                s1, s2, s3, nb01, nb02, nb03, s10, s11, s12);
+            return;
+        }
         constexpr int VEC = 16 / sizeof(dst_t);
         const int64_t ne00v = ne00 / VEC;
         const int64_t vec_block_num_y = (ne00v + CUDA_GET_ROWS_BLOCK_SIZE - 1) / CUDA_GET_ROWS_BLOCK_SIZE;

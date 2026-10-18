@@ -10,6 +10,7 @@
 #include <array>
 #include <cinttypes>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <future>
 #include <regex>
@@ -1266,7 +1267,31 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                 if (std::regex_search(tensor_name, pattern)) {
                     if (overrides->buft == ggml_backend_cpu_buffer_type()) {
                         // when overriding to a CPU buffer, consider the extra buffer types
-                        buft = select_weight_buft(hparams, t_meta, op, buft_list_cpu);
+                        // (#201) ... unless this layer otherwise lives on a GPU: the scheduler then op-offloads large
+                        // batches of this weight to the GPU, which needs a host-layout buffer. A repacked (non-host)
+                        // buffer silently pins those matmuls to the CPU, so skip the extra types there.
+                        // LLAMA_OFFLOAD_KEEP_REPACK=1 restores the old choice.
+                        const bool layer_on_gpu = buft_list != buft_list_cpu && !buft_list->empty() &&
+                            ggml_backend_dev_type(buft_list->front().first) != GGML_BACKEND_DEVICE_TYPE_CPU;
+                        static const bool keep_repack = [] {
+                            const char * e = getenv("LLAMA_OFFLOAD_KEEP_REPACK");
+                            return e != nullptr && atoi(e) != 0;
+                        }();
+                        if (layer_on_gpu && !keep_repack) {
+                            buft_list_t host_only;
+                            for (const auto & cur : *buft_list_cpu) {
+                                if (ggml_backend_buft_is_host(cur.second)) {
+                                    host_only.push_back(cur);
+                                }
+                            }
+                            buft = host_only.empty() ? nullptr : select_weight_buft(hparams, t_meta, op, &host_only);
+                            if (buft != nullptr && buft != select_weight_buft(hparams, t_meta, op, buft_list_cpu)) {
+                                n_offload_repack_skipped++;
+                            }
+                        }
+                        if (buft == nullptr) {
+                            buft = select_weight_buft(hparams, t_meta, op, buft_list_cpu);
+                        }
                         if (use_mmap) {
                             static std::once_flag once;
                             std::call_once(once, [] {
@@ -1426,6 +1451,10 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
         }
         LLAMA_LOG_INFO("%s: partial load — used %d of %d tensors in the file (rest belong to a sibling model on the same .gguf)\n",
                 __func__, n_created, n_tensors);
+    }
+    if (n_offload_repack_skipped > 0) {
+        LLAMA_LOG_INFO("%s: %zu CPU-overridden weights on GPU layers kept unrepacked so the GPU can offload their large batches (LLAMA_OFFLOAD_KEEP_REPACK=1 to repack)\n",
+            __func__, n_offload_repack_skipped);
     }
     if (n_tensors_moved > 0) {
         LLAMA_LOG_DEBUG("%s: tensor '%s' (%s) (and %zu others) cannot be used with preferred buffer type %s, using %s instead\n",
