@@ -376,6 +376,31 @@ def stream_protocol(arm, request):
     return {'final': final, 'content': ''.join(contents), 'tokens': tokens}, first
 
 
+def teacher_kl(arm, request, baseline):
+    tokens = baseline.get('tokens', [])
+    require(len(tokens) == 8 and all(type(token) is int for token in tokens), 'teacher response must contain 8 token IDs')
+    rows, samples, timings = [], [], []
+    first = None
+    for step, token in enumerate(tokens):
+        current = dict(request, prompt=request['prompt'] + tokens[:step], n_predict=1, cache_prompt=True, id_slot=0)
+        response = arm.http('/completion', current)
+        write_json(arm.output / f'teacher-step-{step}.json', response)
+        require(len(response.get('completion_probabilities', [])) == 1, f'teacher step {step}: distribution missing')
+        require(len(response.get('tokens', [])) == 1, f'teacher step {step}: sampled token missing')
+        row = response['completion_probabilities'][0]
+        rows.append({'id': token, 'sampled_id': response['tokens'][0], 'top_logprobs': row.get('top_logprobs', [])})
+        samples.extend(response['tokens'])
+        timings.append(response.get('timings', {}))
+        if first is None:
+            first = response
+        else:
+            require(0 < timings[-1].get('prompt_n', 0) <= 2, f'teacher step {step}: saved prefix was reprocessed')
+    result = dict(first)
+    result.update(tokens=tokens, completion_probabilities=rows, teacher_sampled_ids=samples, teacher_step_timings=timings,
+                  teacher_forced_prefix=True, teacher_note='Row id is the baseline comparison token; sampled_id is the candidate argmax.')
+    return result
+
+
 def memory_snapshot(arm, context):
     gpu = subprocess.check_output(
         ['nvidia-smi', '--query-gpu=memory.used,memory.free,memory.total,power.draw,power.limit',
@@ -442,6 +467,11 @@ def run(args):
             if args.mode == 'protocol':
                 response, result['ttft_s'] = stream_protocol(arm, request)
                 final = response['final']
+            elif args.mode == 'kl' and args.teacher_response:
+                response = teacher_kl(arm, request, json.loads(args.teacher_response.read_text()))
+                result['teacher_response_sha256'] = hashlib.sha256(args.teacher_response.read_bytes()).hexdigest()
+                result['teacher_forced_prefix'] = True
+                final = response
             else:
                 response = arm.http('/completion', request)
                 final = response
@@ -491,6 +521,8 @@ def main():
             command.add_argument('--cache-budget-mib', type=int, default=0, help='0 selects --moe-cache auto')
         command.add_argument('--port', type=int, default=8095)
         command.add_argument('--reserve-mib', type=int, default=3072, help='fixed auto-cache reserve for both comparison arms')
+        if mode == 'kl':
+            command.add_argument('--teacher-response', type=Path, help='baseline response.json: compare matched prefixes even if argmax tokens change')
         command.add_argument('--timeout', type=float, default=1500 if mode == 'protocol' else 600)
     command = commands.add_parser('compare')
     command.add_argument('baseline', type=Path)
