@@ -196,19 +196,25 @@ def validate_arm(data, response, request, expected_request, resident, parent_uni
 
 def analyze(pairs):
     evidence = maximum = 1.0
+    slowdown_evidence = slowdown_maximum = 1.0
     rows = []
     for index, pair in enumerate(pairs):
         baseline, candidate = pair['baseline'], pair['candidate']
         delta = candidate['decode_tok_s'] - baseline['decode_tok_s']
         evidence *= 1.9 if delta > 0 else 0.1 if delta < 0 else 1.0
         maximum = max(maximum, evidence)
+        slowdown_evidence *= 1.9 if delta < 0 else 0.1 if delta > 0 else 1.0
+        slowdown_maximum = max(slowdown_maximum, slowdown_evidence)
         rows.append({'pair': index, **pair, 'decode_win': delta > 0, 'decode_tie': delta == 0,
                      'decode_gain_tok_s': delta, 'decode_ratio': candidate['decode_tok_s'] / baseline['decode_tok_s'],
                      'prefill_ratio': candidate['prefill_tok_s'] / baseline['prefill_tok_s'],
                      'ttc_ratio': candidate['ttc_s'] / baseline['ttc_s'], 'e_value': evidence,
-                     'max_e_value': maximum, 'one_sided_anytime_p_bound': min(1.0, 1.0 / maximum)})
+                     'max_e_value': maximum, 'one_sided_anytime_p_bound': min(1.0, 1.0 / maximum),
+                     'slowdown_e_value': slowdown_evidence, 'max_slowdown_e_value': slowdown_maximum,
+                     'one_sided_slowdown_p_bound': min(1.0, 1.0 / slowdown_maximum)})
     mean_gain = statistics.mean(row['decode_gain_tok_s'] for row in rows) if rows else None
     bound = min(1.0, 1.0 / maximum)
+    slowdown_bound = min(1.0, 1.0 / slowdown_maximum)
     aggregates = {}
     for label in ('baseline', 'candidate'):
         if rows:
@@ -218,9 +224,12 @@ def analyze(pairs):
     return {'pairs': rows, 'completed_pairs': len(rows), 'one_sided_anytime_p_bound': bound,
             'e_value': evidence, 'max_e_value': maximum, 'mean_paired_decode_gain_tok_s': mean_gain,
             'accepted_faster': bool(rows and bound <= 0.01 and mean_gain > 0), 'aggregates': aggregates,
+            'one_sided_slowdown_p_bound': slowdown_bound,
+            'slowdown_e_value': slowdown_evidence, 'max_slowdown_e_value': slowdown_maximum,
+            'detected_slower': bool(rows and slowdown_bound <= 0.01 and mean_gain < 0),
             'absolute_ship_targets_met_by_candidate_means': bool(rows and aggregates['candidate']['decode_tok_s'] >= 143 and aggregates['candidate']['prefill_tok_s'] >= 3170),
-            'assumption': 'Under the null, each next untied decode sign has conditional win probability at most 0.5; ties multiply evidence by 1.',
-            'method': 'Fixed alternative 0.95 versus null 0.5, with Ville bound 1/max(E), including initial E=1.'}
+            'assumption': 'Each directional null bounds the conditional probability of its next untied decode sign by 0.5; ties multiply evidence by 1.',
+            'method': 'Separate directional tests: fixed alternative 0.95 versus null 0.5, with Ville bound 1/max(E), including initial E=1. Only the faster test permits promotion.'}
 
 
 def process_info(pid):
@@ -355,7 +364,7 @@ def run(args):
               **{label: str(out / f'pair-{index:02d}-{label}') for label in binaries}} for index in range(args.max_pairs)]
     plan = {'order_seed': args.order_seed, 'pairs': pairs, 'max_pairs': args.max_pairs, 'primary_metric': 'decode_tok_s',
             'null_win_probability': 0.5, 'alternative_win_probability': 0.95, 'p_bound_threshold': 0.01,
-            'stopping_rule': 'p_bound <= 0.01 and positive mean paired decode gain, using only complete pairs',
+            'stopping_rule': 'Directional p_bound <= 0.01 with matching mean paired decode sign, using only complete pairs; slowdown stops without promotion',
             'prompt_tokens': 100000, 'generated_tokens': 5120, 'temperature': 1.0, 'sampling_seed': 11,
             'prompt_sha256': expected_prompt_hash, 'correctness_evidence': evidence, 'runtime': runtimes,
             'binaries': {label: str(binary) for label, binary in binaries.items()}, 'resident_cells': {'baseline': 0, 'candidate': 32768},
@@ -400,10 +409,16 @@ def run(args):
             completed.append(metrics)
             result = {**analyze(completed), 'status': 'complete' if len(completed) == args.max_pairs else 'running'}
             bench.write_json(out / 'comparison.json', result)
-            print(json.dumps({'completed_pairs': len(completed), 'p_bound': result['one_sided_anytime_p_bound'], 'mean_decode_gain_tok_s': result['mean_paired_decode_gain_tok_s']}), flush=True)
+            print(json.dumps({'completed_pairs': len(completed), 'p_bound': result['one_sided_anytime_p_bound'],
+                              'slowdown_p_bound': result['one_sided_slowdown_p_bound'],
+                              'mean_decode_gain_tok_s': result['mean_paired_decode_gain_tok_s']}), flush=True)
             if result['accepted_faster']:
                 result['status'] = 'complete'
                 result['stop_reason'] = 'predeclared anytime bound reached with positive measured decode gain'
+                break
+            if result['detected_slower']:
+                result['status'] = 'complete'
+                result['stop_reason'] = 'predeclared slowdown bound reached with negative measured decode gain; candidate not promoted'
                 break
         result.setdefault('stop_reason', 'maximum planned pairs reached')
     except Exception as error:
