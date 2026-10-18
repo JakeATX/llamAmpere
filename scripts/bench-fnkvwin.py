@@ -79,6 +79,13 @@ def available_bytes():
     raise RuntimeError('MemAvailable unavailable')
 
 
+def cpu_accounting():
+    relative = Path('/proc/self/cgroup').read_text().strip().split('::', 1)[1]
+    directory = Path('/sys/fs/cgroup') / relative.lstrip('/')
+    return {'unit': directory.name, **{name: (directory / name).read_text().strip()
+            for name in ('cpu.weight', 'cpu.max', 'cpu.stat', 'cpu.pressure')}}
+
+
 def probability_rows(response, n_vocab):
     rows = response.get('completion_probabilities', [])
     require(len(rows) == 8, f'expected 8 distributions, received {len(rows)}')
@@ -463,6 +470,9 @@ def run(args):
                 result['n_vocab'] = models['data'][0]['meta']['n_vocab']
                 require(result['n_vocab'] <= request['n_probs'], 'n_probs does not cover the full vocabulary')
             arm.phase = 'inference'
+            result['cpu_inference_before'] = cpu_accounting()
+            if args.mode == 'protocol':
+                require(result['cpu_inference_before']['cpu.weight'] == '100', 'protocol unit must use normal CPUWeight=100')
             started = time.monotonic()
             if args.mode == 'protocol':
                 response, result['ttft_s'] = stream_protocol(arm, request)
@@ -476,6 +486,7 @@ def run(args):
                 response = arm.http('/completion', request)
                 final = response
             result['ttc_s'] = time.monotonic() - started
+            result['cpu_inference_after'] = cpu_accounting()
             arm.phase = 'complete'
             write_json(args.out / 'response.json', response)
             result['timings'] = final.get('timings', {})
