@@ -2703,6 +2703,14 @@ void llama_context::set_decode_phase(enum llama_decode_phase phase) {
             if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT) {
                 b1_cache_warm();
             } else if (b1_cache_needs_refresh) {
+                // Restore resets scheduler metadata, including rewritten source copies.
+                // A prior graph must be rebuilt before that arena is reused.
+                for (auto & res : gf_res_prev) {
+                    if (res) {
+                        res->reset();
+                    }
+                }
+                gf_res_prev_active = nullptr;
                 ggml_backend_sched_moe_cache_restore(sched.get());
                 b1_cache_needs_refresh = false;
             }
@@ -5117,6 +5125,16 @@ void llama_context::b1_cache_warm() {
         if (b1_cache_counts.empty()) {
             return;
         }
+        // Restore resets the scheduler even when it returns no bytes. Its
+        // rewritten cross-backend source tensors live in that reset arena,
+        // so reuse requires a fresh model graph on both legacy and device paths.
+        synchronize();
+        for (auto & res : gf_res_prev) {
+            if (res) {
+                res->reset();
+            }
+        }
+        gf_res_prev_active = nullptr;
         const size_t returned = ggml_backend_sched_moe_cache_restore(sched.get());
         LLAMA_LOG_INFO("%s: returned %.2f MiB to runtime expert cache\n", __func__, returned / 1048576.0);
         std::vector<ggml_moe_cache_tensor_desc> tensors;
