@@ -1815,7 +1815,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             adaptive_ctrl[seq_id].n_drop  = header[5];
         }
         n_last[seq_id] = header[6];
-        verify_h[seq_id].clear();
+        verify_h_beg[seq_id] = 0;
         verify_h_rows[seq_id] = 0;
 
         off = sizeof(header) + row_bytes;
