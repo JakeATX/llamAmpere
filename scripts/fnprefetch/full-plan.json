@@ -1,0 +1,20 @@
+{
+  "declared_utc": "2026-10-18T22:02:55.775264+00:00",
+  "prompt_tokens": 100000,
+  "generated_tokens": 5120,
+  "temperature": 1,
+  "kv": "SJ-KVaRN 4/4",
+  "power_limit_w": 350,
+  "paired_order": "AB, BA, repeating",
+  "acceptance": "one-sided anytime paired sign p-bound <= 0.01, decode improvement; no prefill regression",
+  "coin_bet": [
+    0.9,
+    0.5
+  ],
+  "maximum_pairs": 12,
+  "futility": "stop after two completed pairs if neither decode pair improves",
+  "selection": "choose depth on separate short diagnostics before any full comparison; freeze flags and loaded library hashes per arm",
+  "baseline": "current gated fn/ship frozen build available at first full run",
+  "full_context_reserve_mib": 1024,
+  "reserve_gate": "100K+128 development gate with single-pass B1 required, whole-card VRAM <=23552MiB; all short model/reload gates retain2560MiB. Matched full arms use the same passing reserve."
+}

@@ -1,0 +1,11 @@
+# FNPREFETCH validation on the shared home card
+
+These runners target the authorized `/mnt/models/fnprefetch` worktree and keep artifacts beneath its `protocol`, `logs`, and `cache` directories. They require the active system guard. They never stop another unit. Build the `test-moe-cache`, `test-backend-ops`, `test-moe-prefetch-model`, and `llama-server` targets before freezing a release.
+
+`launch.py` takes the shared card lock before creating an owned `llama.cpp-fnprefetch-*` systemd unit. Set `FN_RUNNER` to the desired gate and pass a unique cell label. Development windows default to 580 seconds. Full arms use 1,480 seconds plus bounded cleanup, at most 25 minutes total. Resource monitoring stops an owned run below 10 GiB available RAM, above 23,552 MiB whole-card VRAM, or below the required disk floors.
+
+Run `followup-gate.py` first. It checks CUDA operators and staging, compares full-vocabulary fixed-token logits with current frozen ship, requires consumed predictions in both dispatch paths, and checks state reload. The fixed fixture must exist at `protocol/golden-ids.bin`; the current baseline helper must be built against the baseline's public/common headers and DSOs. Use `prepare-baseline.sh` inside the normal locked build unit to create this helper and fixed fixture. Its live libraries are verified rather than inferred from the executable path. Partial gate artifacts are retained and do not count as completion.
+
+After correctness, run `selection-gate.py` in a separate development lease, then `preflight-gate.py` for matched 100K capacity. `run-pairs.py` admits one full arm at a time with alternating AB/BA order. `summarize.py` refuses incomplete arms, changed binaries/settings/profile, overlapping arms, and wrong prompt/output counts. Acceptance uses the predeclared anytime paired sign bound in `full-plan.json`; short diagnostics and synthetic harness checks are never speed evidence.
+
+The profile is copied into this worktree and hashed. Both arms must load it with sampled model-weight identity verification at generation handoff and keep its bytes unchanged. Prefetch defaults off. All output uses temperature 1.0, the same input IDs and sampling settings, the MTP head, and SJ-KVaRN 4/4 for full comparisons.
