@@ -3787,7 +3787,11 @@ private:
             cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         }
         // stash the draft's speculative state with the checkpoint
-        common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
+        if (common_speculative_supports_process_range(spec.get())) {
+            common_speculative_get_resume_state(spec.get(), slot.id, cur.data_spec);
+        } else {
+            common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
+        }
 
         SLT_TRC(slot,
                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB, %.2f ms%s)\n",
@@ -4299,6 +4303,10 @@ private:
 #endif
 
     void update_slots() {
+        llama_set_decode_phase(ctx_tgt, LLAMA_DECODE_PHASE_AUTOMATIC);
+        if (ctx_dft) {
+            llama_set_decode_phase(ctx_dft, LLAMA_DECODE_PHASE_AUTOMATIC);
+        }
         // [#47] the time since the previous pass ended is "outside"; whatever this pass does after its last mark is "post"
         g_host_phases.mark(server_host_phase_clock::OUTSIDE);
         g_host_phases.n_pass += g_host_phases.on ? 1 : 0;
@@ -5003,7 +5011,7 @@ private:
                                         it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                                         it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                                         // restore the draft's speculative state
-                                        common_speculative_set_state(spec.get(), slot.id, it->data_spec);
+                                        common_speculative_set_resume_state(spec.get(), slot.id, it->data_spec);
 
                                         pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                         n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
@@ -5240,6 +5248,22 @@ private:
                     // sealed rows restores the recurrent state where seq_rm can cut the sealed body
                     const bool sj_align = params_base.sj_kvarn_bits_k > 0 || params_base.speculative.draft.sj_kvarn;
                     const int64_t n_task = slot.task->n_tokens();
+                    const int64_t ckpt_call0 = slot.prompt.n_tokens();
+                    const bool ckpt_mtp_ranges = common_speculative_supports_process_range(spec.get());
+                    auto ckpt_target_floor = [&](int64_t q) {
+                        llama_pos f = sj_kvarn_ckpt_floor((llama_pos) q);
+                        if (ckpt_in_call_enabled() && ckpt_call0 < f) {
+                            // fork: keep the checkpoint on both the seal grid and an actual ubatch end.
+                            while (f > ckpt_call0) {
+                                const llama_pos next = sj_kvarn_ckpt_floor((llama_pos) (ckpt_call0 + ((f - ckpt_call0) / n_ubatch) * n_ubatch));
+                                if (next == f) {
+                                    break;
+                                }
+                                f = next;
+                            }
+                        }
+                        return f;
+                    };
                     auto sj_ckpt_target = [&](int64_t n) {
                         if (n <= 0 || n >= n_task || sj_kvarn_ckpt_floor((llama_pos) n) != n) {
                             return false;
@@ -5250,7 +5274,7 @@ private:
                             n_task - std::min<int64_t>(n_batch, 4 + n_ubatch),
                         };
                         for (int64_t q : spots) {
-                            if (q > 0 && sj_kvarn_ckpt_floor((llama_pos) q) == n) {
+                            if (q > 0 && ckpt_target_floor(q) == n) {
                                 return true;
                             }
                         }
@@ -5261,15 +5285,18 @@ private:
                     // spot ends one of its ubatches, i.e. it is a whole number of ubatches from the batch start and at
                     // least min_tail tokens before the batch end (the ubatch split keeps that many trailing tokens
                     // together). The drafter must not need a checkpoint of its own, nor keep speculative state in one.
-                    const int64_t ckpt_call0 = slot.prompt.n_tokens();
                     int32_t ckpt_min_tail = -1;
                     if (do_checkpoint && sj_align && ckpt_in_call_enabled() && n_tokens_prev == 0 && !has_mtmd && !input_tokens.has_mtmd &&
                             alora_scale <= 0.0f && slot.task->decision.order.empty() && n_decision_first < 0 &&
-                            !wait_shared && !ckpt_needs_dft()) {
+                            !wait_shared && (!ckpt_needs_dft() || ckpt_mtp_ranges)) {
                         std::vector<uint8_t> spec_state;
-                        if (!common_speculative_get_state(spec.get(), slot.id, spec_state) && spec_state.empty()) {
+                        if (ckpt_mtp_ranges || (!common_speculative_get_state(spec.get(), slot.id, spec_state) && spec_state.empty())) {
                             ckpt_min_tail = llama_state_seq_capture_min_tail(ctx_tgt);
                         }
+                    }
+                    if (do_checkpoint && ckpt_in_call_enabled()) {
+                        SLT_INF(slot, "B1 checkpoint plan: start %" PRId64 ", batch %d, ubatch %d, tail %d, draft state %d\n",
+                                ckpt_call0, n_batch, n_ubatch, ckpt_min_tail, (int) ckpt_needs_dft());
                     }
                     auto ckpt_in_call = [&](int64_t n) {
                         const int64_t n_end = std::min<int64_t>(slot.task->n_tokens(), ckpt_call0 + n_batch);
@@ -5619,7 +5646,21 @@ private:
             metrics_post_decode(off, batch.view.size(), has_output);
         }
 
-        // in-call checkpoints: made in spot order, as the batches that would have started at each spot make them
+        // fork: grow draft scratch only for a large prompt, then return it before generation.
+        if (ctx_dft && batch.view.size() > 3072 &&
+                std::all_of(batch.view.tokens.begin(), batch.view.tokens.end(), [&](const auto & token) {
+                    return token.seq_ids_extra.empty() && token.seq_id == batch.view.tokens.front().seq_id;
+                }) && std::any_of(slots.begin(), slots.end(), [](const server_slot & slot) {
+                    return slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT;
+                }) && std::none_of(slots.begin(), slots.end(), [](const server_slot & slot) {
+                    return slot.state == SLOT_STATE_GENERATING;
+                })) {
+            llama_set_decode_phase(ctx_dft, LLAMA_DECODE_PHASE_PROMPT);
+        }
+
+        // in-call checkpoints: catch the hybrid draft up to each captured target boundary before saving it.
+        int32_t spec_processed = 0;
+        const bool spec_ranges = ckpt_armed && common_speculative_supports_process_range(spec.get());
         if (ckpt_armed) {
             server_slot * cslot = nullptr;
             for (auto & s : slots) {
@@ -5633,6 +5674,18 @@ private:
                 if (!llama_state_seq_capture_select(ctx_tgt, (int32_t) k, &p_min, &p_max) || p_min < 0) {
                     SLT_WRN(*cslot, "in-call checkpoint at n_tokens = %d was not captured\n", batch.ckpt_spots[k]);
                     continue;
+                }
+                if (spec_ranges) {
+                    const int32_t end = batch.ckpt_spots[k] - batch.view.tokens.front().pos[0];
+                    bool ok = false;
+                    queue_tasks.yield_to_queue([&]() {
+                        ok = common_speculative_process_range(spec.get(), batch.view, spec_processed, end - spec_processed);
+                    });
+                    if (!ok) {
+                        llama_state_seq_capture_select(ctx_tgt, -1, nullptr, nullptr);
+                        throw std::runtime_error("failed to process speculative checkpoint range");
+                    }
+                    spec_processed = end;
                 }
                 create_checkpoint_at(*cslot, batch.ckpt_spots[k], p_min, p_max);
                 llama_state_seq_capture_select(ctx_tgt, -1, nullptr, nullptr);
@@ -5648,7 +5701,9 @@ private:
         if (spec) {
             bool ok = true;
             queue_tasks.yield_to_queue([&]() {
-                ok = common_speculative_process(spec.get(), batch.view);
+                ok = spec_ranges
+                    ? common_speculative_process_range(spec.get(), batch.view, spec_processed, batch.view.size() - spec_processed)
+                    : common_speculative_process(spec.get(), batch.view);
             });
 
             if (!ok) {
@@ -5657,6 +5712,22 @@ private:
                 // TODO: handle error
                 throw std::runtime_error("failed to process speculative batch");
             }
+        }
+
+        // fork: finish draft catch-up before returning scratch to the response cache.
+        const bool prompt_done = std::any_of(slots.begin(), slots.end(), [](const server_slot & slot) {
+            return slot.state == SLOT_STATE_DONE_PROMPT;
+        });
+        const bool other_work = std::any_of(slots.begin(), slots.end(), [](const server_slot & slot) {
+            return slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_GENERATING;
+        });
+        if (prompt_done && !other_work) {
+            queue_tasks.yield_to_queue([&]() {
+                if (ctx_dft) {
+                    llama_set_decode_phase(ctx_dft, LLAMA_DECODE_PHASE_GENERATION);
+                }
+                llama_set_decode_phase(ctx_tgt, LLAMA_DECODE_PHASE_GENERATION);
+            });
         }
 
         // handle `n_cmpl > 1` tasks - when the main prompt is processed, activate all child tasks too

@@ -103,7 +103,24 @@ struct ggml_moe_cache_api {
 
     // Host buffer mutation or teardown notification. Sessions cancel or finish any fill that still reads the supplied range before this call returns.
     void (*invalidate)(const void * base, size_t size);
+
+    // Fill free slots from ranked prompt usage without adding synthetic decode observations.
+    int (*warm)(void * session, const struct ggml_moe_cache_tensor_desc * tensors,
+                const uint64_t * const * counts, int n_tensors);
+
+    // Idle-turn lending only: release low-use slots, then restore capacity after prompt scratch is freed.
+    size_t (*trim)(void * session, size_t bytes);
+    size_t (*restore)(void * session);
 };
+
+GGML_API int ggml_backend_sched_moe_cache_warm(ggml_backend_sched_t sched,
+        const struct ggml_moe_cache_tensor_desc * tensors,
+        const uint64_t * const * counts, int n_tensors);
+
+// The caller must discard graph results and captured backend graphs before resetting compute storage.
+GGML_API bool ggml_backend_sched_reset_compute(ggml_backend_sched_t sched);
+GGML_API size_t ggml_backend_sched_moe_cache_trim(ggml_backend_sched_t sched, size_t bytes);
+GGML_API size_t ggml_backend_sched_moe_cache_restore(ggml_backend_sched_t sched);
 
 // Canonical expert weight type set for the MoE cache. Every provider
 // (CUDA/HIP, Vulkan, Metal) must accept exactly this set in query_shape and

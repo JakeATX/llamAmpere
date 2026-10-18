@@ -3051,6 +3051,60 @@ void ggml_backend_sched_set_moe_cache(
     }
 }
 
+// fork: warm the serving cache without synthetic decode plans or calibration samples.
+int ggml_backend_sched_moe_cache_warm(
+        ggml_backend_sched_t sched, const ggml_moe_cache_tensor_desc * tensors,
+        const uint64_t * const * counts, int n_tensors) {
+    if (!sched || !sched->moe_cache_session || !sched->moe_cache_api.warm ||
+        !tensors || n_tensors <= 0) {
+        return 0;
+    }
+    ggml_backend_sched_synchronize(sched);
+    try {
+        return sched->moe_cache_api.warm(sched->moe_cache_session, tensors, counts, n_tensors);
+    } catch (const std::bad_alloc &) {
+        GGML_LOG_WARN("[moe-cache] warm skipped after host allocation failure\n");
+        return 0;
+    }
+}
+
+bool ggml_backend_sched_reset_compute(ggml_backend_sched_t sched) {
+    if (!sched) {
+        return false;
+    }
+    ggml_backend_sched_synchronize(sched);
+    ggml_gallocr_t replacement = ggml_gallocr_new_n(sched->bufts, sched->n_backends);
+    if (!replacement) {
+        return false;
+    }
+    ggml_backend_sched_reset(sched);
+    ggml_gallocr_free(sched->galloc);
+    sched->galloc = replacement;
+    sched->n_splits = 0;
+    sched->debug_prev_graph_size = 0;
+    return true;
+}
+
+size_t ggml_backend_sched_moe_cache_trim(ggml_backend_sched_t sched, size_t bytes) {
+    if (!sched || !sched->moe_cache_session || !sched->moe_cache_api.trim || !bytes) {
+        return 0;
+    }
+    ggml_backend_sched_synchronize(sched);
+    const size_t released = sched->moe_cache_api.trim(sched->moe_cache_session, bytes);
+    ggml_backend_sched_reset(sched);
+    return released;
+}
+
+size_t ggml_backend_sched_moe_cache_restore(ggml_backend_sched_t sched) {
+    if (!sched || !sched->moe_cache_session || !sched->moe_cache_api.restore) {
+        return 0;
+    }
+    ggml_backend_sched_synchronize(sched);
+    const size_t restored = sched->moe_cache_api.restore(sched->moe_cache_session);
+    ggml_backend_sched_reset(sched);
+    return restored;
+}
+
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;

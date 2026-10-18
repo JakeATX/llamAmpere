@@ -1384,6 +1384,13 @@ void llama_batch_compat::init(llama_batch_ext & dst, const llama_batch & batch_i
     const bool has_token = batch_inp.token != nullptr;
     const bool has_embd  = batch_inp.embd  != nullptr;
 
+    if (batch_inp.n_tokens > 0) {
+        batch_ext->tokens.reserve(batch_ext->tokens.size() + (size_t) batch_inp.n_tokens);
+        if (has_embd) {
+            batch_ext->embd.reserve(batch_ext->embd.size() + (size_t) batch_inp.n_tokens * n_embd_row);
+        }
+    }
+
     static const llama_seq_id default_seq_id    = 0;
     static const int32_t      default_n_seq_id  = 1;
 

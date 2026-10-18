@@ -25,7 +25,10 @@
 
 #include "llama-model.h"
 
+struct llm_b1_ffn;
+
 struct llama_b1_stats {
+    double   t_copy_submit_ms = 0.0; // overlapped copy pipeline host wall time
     double   t_wait_ms    = 0.0; // compute thread waiting on the copy thread (host side)
     uint64_t bytes_h2d    = 0;   // expert bytes streamed to the GPU in this decode call
     uint64_t bytes_lent   = 0;   // resident expert bytes borrowed
@@ -40,12 +43,27 @@ public:
     ~llama_b1();
 
     bool ok() const { return init_ok; }
+    void set_ffn_enabled(bool enabled) { ffn_requested = enabled; }
+    bool ffn_enabled() const { return !ffn_views.empty(); }
+    llm_b1_ffn * ffn(size_t ub);
+    llm_b1_ffn * ffn_group() { return ffn_all.get(); }
+    bool ffn_gather();
+    void ffn_release();
+    size_t scratch_bytes(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub) const;
+    void pass_begin(size_t ub);
+    void pass_compute(size_t ub, int64_t host_us);
+    void pass_end(size_t ub);
 
     // plan one decode call: ub_tokens are the ubatch sizes, group_ub the wanted ubatches per group (0 = all),
     // lend_cap the most resident expert bytes it may borrow. final_home: the last layer's experts that live in RAM
     // stay there (its FFN sees only the output rows, which the normal path computes on the CPU when they are few).
     // Returns false when even one ubatch per group does not fit.
-    bool begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub, size_t lend_cap, bool final_home = false);
+    bool begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub, size_t lend_cap, bool final_home = false, size_t * borrow_bytes = nullptr, bool defer_streaming = false);
+    // A deferred plan owns real carry/slot storage but has no workers or transfers.
+    // Bind one layer only for graph-size measurement, then restore it before starting.
+    void reserve_layer_bind(int il);
+    void reserve_layer_restore();
+    void start_streaming();
 
     // would the normal path run an expert op with this many rows on the GPU when its weights are in RAM? The
     // scheduler copies such weights to the GPU only for batches the device takes (op offload: 32 rows on CUDA)
@@ -148,6 +166,10 @@ private:
     std::vector<placement> carry_place; // [ubatch index within the group]
     ggml_context * ctx_meta = nullptr;
     std::vector<ggml_tensor *> carries; // per ubatch of the call
+    bool ffn_requested = false;
+    std::vector<ggml_backend_buffer_t> ffn_buffers;
+    std::unique_ptr<llm_b1_ffn> ffn_all;
+    std::vector<std::unique_ptr<llm_b1_ffn>> ffn_views;
     std::vector<bool> lent_layer;
     bool final_home_ = false; // see begin()
     std::vector<bool> verified;        // exps index: device bytes checked against the file once
@@ -156,6 +178,7 @@ private:
     std::vector<step> steps;
     size_t step_next_begin = 0; // next step layer_begin expects
     int    cur_step  = -1;
+    int    reserve_layer = -1;
 
     // copy pipeline
     struct staging {
@@ -197,6 +220,9 @@ private:
 
     llama_b1_stats st;
     int64_t t_first_begin_us = 0;
+    std::vector<int64_t> pass_start_us, pass_wall_us, pass_compute_us;
+    std::vector<double> pass_copy_ms, pass_wait_ms;
+    std::vector<uint64_t> pass_bytes;
 
     void coordinator();
     void worker(int w);

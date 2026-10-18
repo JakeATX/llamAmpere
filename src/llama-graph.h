@@ -865,6 +865,33 @@ using llm_graph_cb = std::function<void(const llama_ubatch & ubatch, ggml_tensor
 
 class llm_graph_result;
 
+// fork: prompt routing is packed across all ubatches before the expert GEMMs.
+struct llm_b1_ffn_bucket {
+    struct span { size_t offset; size_t count; };
+    std::vector<int32_t> rows;
+    std::vector<int32_t> experts;
+    std::vector<float> weights;
+    // Each span belongs to one expert and therefore has unique token rows.
+    std::vector<span> spans;
+};
+
+struct llm_b1_ffn {
+    ggml_tensor * input = nullptr;
+    ggml_tensor * output = nullptr;
+    ggml_tensor * inject = nullptr;
+    ggml_tensor * ids = nullptr;
+    ggml_tensor * weights = nullptr;
+    std::vector<std::vector<int32_t>> expert_rows;
+    std::vector<std::vector<float>> expert_weights;
+    uint32_t max_rows = 8192;
+    size_t piece_first = 0;
+    size_t piece_count = 64; // Bound graph metadata independently of routing skew and the row dial.
+    bool grouped_mmid = false;
+    uint32_t routed_rows = 32768;
+    size_t bucket_index = 0;
+    std::vector<llm_b1_ffn_bucket> buckets;
+};
+
 struct llm_graph_params {
     llm_arch arch = LLM_ARCH_UNKNOWN;
 
@@ -942,6 +969,9 @@ struct llm_graph_params {
     // placeholders and may sit on sequences that have no backend sampler (none is attached yet at context creation)
     // set after construction, so it stays last
     bool is_reserve = false;
+    const llm_b1_ffn * b1_ffn = nullptr;
+    int b1_ffn_phase = 0; // 1: attention/router, 2: packed experts, 3: residual combine
+
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
@@ -1005,7 +1035,7 @@ struct llm_graph_params {
             return false;
         }
 
-        if (b1_il0 != other.b1_il0 || b1_il1 != other.b1_il1 || b1_carry != other.b1_carry) {
+        if (b1_il0 != other.b1_il0 || b1_il1 != other.b1_il1 || b1_carry != other.b1_carry || b1_ffn != other.b1_ffn || b1_ffn_phase != other.b1_ffn_phase) {
             return false;
         }
 
@@ -1043,6 +1073,8 @@ public:
     ggml_context * get_ctx() const { return ctx_compute.get(); }
 
     int64_t get_max_nodes() const;
+    const llm_b1_ffn * get_b1_ffn() const { return params.b1_ffn; }
+    int get_b1_ffn_phase() const { return params.b1_ffn_phase; }
 
     void reset();
 

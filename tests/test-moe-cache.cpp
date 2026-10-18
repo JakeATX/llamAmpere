@@ -22,6 +22,10 @@
 #include <string>
 #include <thread>
 #include <vector>
+#if defined(__linux__)
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 namespace {
 
@@ -61,7 +65,10 @@ struct log_capture {
 };
 
 static void log_callback(enum ggml_log_level level, const char * text, void * user_data) {
-    (void) level;
+    if (level == GGML_LOG_LEVEL_ERROR) {
+        std::fputs(text, stderr);
+        std::fflush(stderr);
+    }
     log_capture & capture = *static_cast<log_capture *>(user_data);
     {
         std::lock_guard<std::mutex> lock(capture.mutex);
@@ -3033,6 +3040,226 @@ static bool run_admission_policy(
     return ok;
 }
 
+static bool run_prompt_warm(
+        ggml_backend_t gpu, ggml_backend_t cpu, ggml_tensor * weights,
+        test_graph & graph, const std::vector<float> & reference, log_capture & capture) {
+    configure_cache(nullptr);
+    set_env("GGML_CUDA_MOE_CACHE_OVERLAP_CPU_ROWS", nullptr);
+    capture.clear();
+    const auto & api = active_api();
+    void * session = create_direct_session(gpu, cpu);
+    if (!session || !api.warm) {
+        if (session) {
+            api.session_destroy(session);
+        }
+        fprintf(stderr, "cache-prompt-warm: missing session or warm callback\n");
+        return false;
+    }
+    const ggml_moe_cache_tensor_desc descriptor = {
+        weights->name, weights->data, weights->nb[2], weights->ne[0], weights->ne[1], weights->ne[2], (int32_t) weights->type,
+    };
+    std::vector<uint64_t> usage(weights->ne[2], 0);
+    usage[0] = 100;
+    usage[1] = 50;
+    const uint64_t * counts[] = {usage.data()};
+    bool ok = true;
+    for (int field = 0; field < 5; ++field) {
+        auto invalid = descriptor;
+        switch (field) {
+            case 0: invalid.name = nullptr; break;
+            case 1: invalid.data = nullptr; break;
+            case 2: invalid.n_in = 0; break;
+            case 3: invalid.type = GGML_TYPE_F32; break;
+            case 4: invalid.expert_size++; break;
+        }
+        ok &= api.warm(session, &invalid, counts, 1) == 0;
+    }
+    const uint64_t * missing_counts[] = {nullptr};
+    ok &= api.warm(session, &descriptor, missing_counts, 1) == 0;
+    ok &= api.warm(session, &descriptor, counts, 1) == 2;
+    const std::string warm_log = capture.get();
+    ok &= warm_log.find("hits=") == std::string::npos &&
+        warm_log.find("cpu-overlap calibration:") == std::string::npos;
+    api.session_enter(session);
+    ok &= direct_plan_one(descriptor.name, descriptor.data, descriptor.expert_size,
+            descriptor.n_in, descriptor.n_out, descriptor.type, descriptor.n_expert, 0) == 1;
+    ok &= direct_plan_one(descriptor.name, descriptor.data, descriptor.expert_size,
+            descriptor.n_in, descriptor.n_out, descriptor.type, descriptor.n_expert, 1) == 1;
+    ok &= ggml_backend_graph_compute(cpu, graph.graph) == GGML_STATUS_SUCCESS;
+    std::vector<float> actual(reference.size());
+    ggml_backend_tensor_get(graph.out, actual.data(), 0, actual.size() * sizeof(float));
+    ok &= compare_output(reference, actual, 5e-4);
+    api.session_leave(session);
+    api.session_destroy(session);
+    ok &= max_field_value(capture.get(), "dispatch-fail=") == 0 &&
+        max_field_value(capture.get(), "collect-fail=") == 0;
+    printf("cache-prompt-warm: %s\n", ok ? "OK" : "FAIL");
+    if (!ok) {
+        fprintf(stderr, "%s", capture.get().c_str());
+    }
+    return ok;
+}
+
+static bool run_prompt_warm_ranking(ggml_backend_t gpu, ggml_backend_t cpu, log_capture & capture) {
+    configure_cache(nullptr);
+    set_env("GGML_CUDA_MOE_CACHE_BUDGET_MB", "8");
+    set_env("GGML_CUDA_MOE_CACHE_THROTTLE", "8");
+    capture.clear();
+    const auto & api = active_api();
+    void * session = create_direct_session(gpu, cpu);
+    if (!session || !api.warm) {
+        if (session) {
+            api.session_destroy(session);
+        }
+        return false;
+    }
+    constexpr int64_t shape_in = 1024;
+    constexpr int64_t shape_out = 206;
+    constexpr int64_t experts = 65;
+    const size_t expert_bytes = ggml_row_size(GGML_TYPE_Q4_0, shape_in) * shape_out;
+    std::vector<uint8_t> data(expert_bytes * experts);
+    std::vector<uint64_t> usage(experts);
+    for (size_t expert = 0; expert < usage.size(); ++expert) {
+        usage[expert] = expert + 1;
+    }
+    const ggml_moe_cache_tensor_desc descriptor = {
+        "blk.5.ffn_up_exps.weight", data.data(), expert_bytes, shape_in, shape_out, experts, GGML_TYPE_Q4_0,
+    };
+    const uint64_t * counts[] = {usage.data()};
+    bool ok = api.warm(session, &descriptor, counts, 1) == 64;
+    ok &= api.warm(session, &descriptor, counts, 1) == 0;
+    api.session_enter(session);
+    // The hottest entries are at the end of the input, and must survive the excess cold entry.
+    ok &= direct_plan_one(descriptor.name, data.data(), expert_bytes,
+            shape_in, shape_out, GGML_TYPE_Q4_0, experts, 64) == 1;
+    ok &= direct_plan_one(descriptor.name, data.data(), expert_bytes,
+            shape_in, shape_out, GGML_TYPE_Q4_0, experts, 1) == 1;
+    ok &= direct_plan_one(descriptor.name, data.data(), expert_bytes,
+            shape_in, shape_out, GGML_TYPE_Q4_0, experts, 0) == 0;
+    api.session_leave(session);
+    api.session_destroy(session);
+    const std::string log = capture.get();
+    ok &= max_field_value(log, "slots=") == 64 && max_field_value(log, "evictions=") == 0;
+    printf("cache-prompt-warm-ranking: %s\n", ok ? "OK" : "FAIL");
+    if (!ok) {
+        fprintf(stderr, "%s", log.c_str());
+    }
+    return ok;
+}
+
+static bool run_prompt_warm_decode_heat(ggml_backend_t gpu, ggml_backend_t cpu, log_capture & capture) {
+    configure_cache(nullptr);
+    set_env("GGML_CUDA_MOE_CACHE_BUDGET_MB", "8");
+    const char * previous_hot = getenv("GGML_CUDA_MOE_CACHE_HOT_USES");
+    const bool had_hot = previous_hot != nullptr;
+    const std::string saved_hot = previous_hot ? previous_hot : "";
+    set_env("GGML_CUDA_MOE_CACHE_HOT_USES", "4");
+    capture.clear();
+    const auto & api = active_api();
+    void * session = create_direct_session(gpu, cpu);
+    if (!session || !api.warm) {
+        if (session) {
+            api.session_destroy(session);
+        }
+        set_env("GGML_CUDA_MOE_CACHE_HOT_USES", had_hot ? saved_hot.c_str() : nullptr);
+        return false;
+    }
+    constexpr int64_t shape_in = 1024, shape_out = 206, experts = 66;
+    const size_t expert_bytes = ggml_row_size(GGML_TYPE_Q4_0, shape_in) * shape_out;
+    std::vector<uint8_t> data(expert_bytes * experts);
+    std::vector<uint64_t> usage(experts, 1000);
+    usage[0] = usage[65] = 0;
+    const ggml_moe_cache_tensor_desc descriptor = {
+        "blk.5.ffn_up_exps.weight", data.data(), expert_bytes, shape_in, shape_out, experts, GGML_TYPE_Q4_0,
+    };
+    const uint64_t * counts[] = {usage.data()};
+    bool ok = api.warm(session, &descriptor, counts, 1) == 64;
+    api.session_enter(session);
+    auto plan = [&](int32_t expert) {
+        return direct_plan_one(descriptor.name, data.data(), expert_bytes,
+                shape_in, shape_out, GGML_TYPE_Q4_0, experts, expert);
+    };
+    auto admit = [&](int32_t expert) {
+        if (plan(expert) != 0) {
+            return false;
+        }
+        for (int attempt = 0; attempt < 200; ++attempt) {
+            if (plan(expert) == 1) {
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        return false;
+    };
+    ok &= admit(0);
+    ok &= admit(65);
+    // A first decode hit must survive the next admission despite large prompt counts.
+    ok &= plan(0) == 1;
+    // Actual decode hits can then mature the new expert beyond the hot threshold.
+    for (int hit = 0; hit < 4; ++hit) {
+        ok &= plan(0) == 1;
+    }
+    api.session_leave(session);
+    api.session_destroy(session);
+    const std::string log = capture.get();
+    ok &= max_field_value(log, "slots=") == 64 &&
+        max_field_value(log, "evictions=") == 2 && max_field_value(log, "heat=") == 0;
+    set_env("GGML_CUDA_MOE_CACHE_HOT_USES", had_hot ? saved_hot.c_str() : nullptr);
+    printf("cache-prompt-warm-decode-heat: %s\n", ok ? "OK" : "FAIL");
+    if (!ok) {
+        fprintf(stderr, "%s", log.c_str());
+    }
+    return ok;
+}
+
+static bool run_prompt_cache_lending(ggml_backend_t gpu, ggml_backend_t cpu, log_capture & capture) {
+    configure_cache(nullptr);
+    set_env("GGML_CUDA_MOE_CACHE_BUDGET_MB", "8");
+    capture.clear();
+    const auto & api = active_api();
+    void * session = create_direct_session(gpu, cpu);
+    if (!session || !api.warm || !api.trim || !api.restore) {
+        if (session) {
+            api.session_destroy(session);
+        }
+        return false;
+    }
+    constexpr int64_t shape_in = 1024, shape_out = 206, experts = 65;
+    const size_t expert_bytes = ggml_row_size(GGML_TYPE_Q4_0, shape_in) * shape_out;
+    std::vector<uint8_t> data(expert_bytes * experts);
+    std::vector<uint64_t> usage(experts);
+    for (size_t expert = 0; expert < usage.size(); ++expert) {
+        usage[expert] = expert + 1;
+    }
+    const ggml_moe_cache_tensor_desc descriptor = {
+        "blk.5.ffn_up_exps.weight", data.data(), expert_bytes, shape_in, shape_out, experts, GGML_TYPE_Q4_0,
+    };
+    const uint64_t * counts[] = {usage.data()};
+    bool ok = api.warm(session, &descriptor, counts, 1) == 64;
+    ok &= api.trim(session, 2 * expert_bytes) == 2 * expert_bytes;
+    api.session_enter(session);
+    ok &= direct_plan_one(descriptor.name, data.data(), expert_bytes,
+            shape_in, shape_out, GGML_TYPE_Q4_0, experts, 64) == 1;
+    ok &= direct_plan_one(descriptor.name, data.data(), expert_bytes,
+            shape_in, shape_out, GGML_TYPE_Q4_0, experts, 1) == 0;
+    api.session_leave(session);
+    ok &= api.restore(session) >= 2 * expert_bytes;
+    ok &= api.warm(session, &descriptor, counts, 1) >= 2;
+    // A new prompt's hottest expert must replace a cold resident without a saved profile.
+    usage[0] = 1000;
+    ok &= api.warm(session, &descriptor, counts, 1) == 1;
+    api.session_enter(session);
+    ok &= direct_plan_one(descriptor.name, data.data(), expert_bytes,
+            shape_in, shape_out, GGML_TYPE_Q4_0, experts, 0) == 1;
+    api.session_leave(session);
+    api.session_destroy(session);
+    printf("cache-prompt-lending: %s\n", ok ? "OK" : "FAIL");
+    if (!ok) {
+        fprintf(stderr, "%s", capture.get().c_str());
+    }
+    return ok;
+}
+
 // Run a test only when the provider supports the behavior it checks; on
 // other providers print a skip line so CI shows the coverage gap explicitly.
 static bool run_optional(
@@ -3258,6 +3485,18 @@ int main() {
 
     bool ok = run_capability_queries(provider_device, cpu);
     ok &= run_invalidation_hook_coverage(cpu);
+    ok &= run_optional(provider_is_cuda, "cache-prompt-warm", [&] {
+        return run_prompt_warm(gpu, cpu, weights, graph, reference, capture);
+    });
+    ok &= run_optional(provider_is_cuda, "cache-prompt-warm-ranking", [&] {
+        return run_prompt_warm_ranking(gpu, cpu, capture);
+    });
+    ok &= run_optional(provider_is_cuda, "cache-prompt-warm-decode-heat", [&] {
+        return run_prompt_warm_decode_heat(gpu, cpu, capture);
+    });
+    ok &= run_optional(provider_is_cuda, "cache-prompt-lending", [&] {
+        return run_prompt_cache_lending(gpu, cpu, capture);
+    });
     ok &= run_scenario("cache-hit", nullptr, gpu, cpu, graph, reference, capture);
     ok &= run_scenario(
             "cache-generic-mmv", nullptr, gpu, cpu, graph, reference,

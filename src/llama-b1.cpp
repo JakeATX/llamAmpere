@@ -1,4 +1,6 @@
 #include "llama-b1.h"
+#include "llama-graph.h"
+#include <cmath>
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -278,6 +280,8 @@ llama_b1::~llama_b1() {
 }
 
 void llama_b1::release_plan() {
+    reserve_layer_restore();
+    ffn_release();
     if (fresh_buf) {
         ggml_backend_buffer_free(fresh_buf);
         fresh_buf = nullptr;
@@ -332,8 +336,31 @@ static std::vector<size_t> b1_pack(const std::vector<size_t> & items, size_t ali
     return left;
 }
 
-bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_req, size_t lend_cap, bool final_home) {
+size_t llama_b1::scratch_bytes(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub) const {
+    if (ub_tokens.empty()) {
+        return 0;
+    }
+    const size_t align = std::max<size_t>(256, ggml_backend_buft_get_alignment(buft_dev));
+    const size_t group = group_ub ? std::min<size_t>(group_ub, ub_tokens.size()) : ub_tokens.size();
+    size_t bytes = 0;
+    for (size_t lane = 0; lane < group; ++lane) {
+        uint32_t tokens = 0;
+        for (size_t u = lane; u < ub_tokens.size(); u += group) {
+            tokens = std::max(tokens, ub_tokens[u]);
+        }
+        bytes += b1_align_up((size_t) tokens * n_embd * n_hc * sizeof(float), align);
+    }
+    for (size_t role : role_max) {
+        bytes += 2 * b1_align_up(role, align);
+    }
+    return bytes;
+}
+
+bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_req, size_t lend_cap, bool final_home, size_t * borrow_bytes, bool defer_streaming) {
     GGML_ASSERT(init_ok);
+    if (borrow_bytes) {
+        *borrow_bytes = 0;
+    }
     stop_threads();
     release_plan();
     st = {};
@@ -353,7 +380,20 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
     size_t free_mem = 0;
     size_t total_mem = 0;
     ggml_backend_dev_memory(dev, &free_mem, &total_mem);
-    const size_t keep = (size_t) std::max<int64_t>(0, b1_env_int("LLAMA_B1_KEEP_FREE_MIB", 1536)) << 20;
+    size_t phase_scratch = ffn_requested ? (size_t) 4096 << 20 : 0;
+    if (ffn_requested && b1_env_int("LLAMA_B1_FFN_MMID", 1) != 0) {
+        const size_t rows = (size_t) std::clamp<int64_t>(b1_env_int("LLAMA_B1_FFN_ROUTED_ROWS", 32768), 8192, 65536);
+        uint32_t hidden = 0;
+        for (int il = 0; il < n_layer; ++il) {
+            hidden = std::max(hidden, model.hparams.n_ff_exp(il));
+        }
+        // Bound gathered input/output, transform copies, gate/up/GLU temporaries,
+        // scalar scales and MMQ quantization storage before borrowing the cache.
+        phase_scratch = std::max(phase_scratch, rows * (4*n_embd + 8*hidden + 512) * sizeof(float));
+    }
+    const size_t keep_default = ffn_requested ? phase_scratch >> 20 : 1536;
+    const size_t keep = std::max(phase_scratch, (size_t) std::max<int64_t>(0,
+            b1_env_int("LLAMA_B1_KEEP_FREE_MIB", keep_default)) << 20);
     const size_t fresh_avail = free_mem > keep ? free_mem - keep : 0;
 
     // page-cache budget: every pass reads the streamed experts in the same fixed order, the experts kept in RAM from
@@ -413,6 +453,7 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
     std::vector<std::pair<int, size_t>> place_sel; // per item: (region, offs); region == n_lent_regions -> fresh
     std::vector<std::pair<char *, std::pair<ggml_backend_buffer_t, size_t>>> regs_sel; // base, (buf, size)
     size_t fresh_sel = 0;
+    size_t minimum_fresh = SIZE_MAX;
 
     // the smallest lend (fewest layers, highest first) that fits g ubatches per group; false when none does
     auto try_group = [&](size_t g) -> bool {
@@ -423,7 +464,21 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
             }
         }
         for (size_t j = 0; j < g; ++j) {
-            items.push_back(carry_bytes);
+            uint32_t tokens = 0;
+            for (size_t u = j; u < nub; u += g) {
+                tokens = std::max(tokens, ub_n[u]);
+            }
+            items.push_back(b1_align_up((size_t) tokens * n_embd * n_hc * sizeof(float), align));
+        }
+
+        size_t ffn_bytes = 0;
+        if (ffn_requested && g == nub) {
+            size_t tokens = 0;
+            for (uint32_t n : ub_n) {
+                tokens += n;
+            }
+            ffn_bytes = 2 * b1_align_up(tokens * n_embd * sizeof(float), align) +
+                b1_align_up(tokens * (n_hc + 2 * model.hparams.n_expert_used()) * sizeof(float), align);
         }
 
         for (size_t k = 0; k <= order.size(); ++k) {
@@ -478,7 +533,8 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
                 fresh = b1_align_up(fresh + items[i], align);
             }
 
-            if (fresh <= fresh_avail) {
+            minimum_fresh = std::min(minimum_fresh, fresh + ffn_bytes);
+            if (fresh <= fresh_avail && ffn_bytes <= fresh_avail - fresh) {
                 g_sel     = g;
                 lent_sel  = lent;
                 place_sel = place;
@@ -495,6 +551,11 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
         if (try_group(g)) {
             g_fit = g;
             break;
+        }
+        // fork: ask the cache only for space the full group cannot borrow from resident weights.
+        if (borrow_bytes && g == g_max && minimum_fresh != SIZE_MAX && minimum_fresh > fresh_avail) {
+            *borrow_bytes = minimum_fresh - fresh_avail;
+            return false;
         }
     }
     size_t passes = 0;
@@ -551,7 +612,7 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
     const size_t n_regions = regs_sel.size() + (fresh_buf ? 1 : 0);
 
     ggml_init_params ip = {
-        /*.mem_size   =*/ (n_regions + nub + 4) * ggml_tensor_overhead(),
+        /*.mem_size   =*/ (n_regions + 7*nub + 20) * ggml_tensor_overhead(),
         /*.mem_buffer =*/ nullptr,
         /*.no_alloc   =*/ true,
     };
@@ -584,7 +645,7 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
         GGML_ASSERT(p.region >= 0 && (size_t) p.region < regions.size());
         if (i < 2*n_roles) {
             slot_place[i] = p;
-        } else {
+        } else if (i < 2*n_roles + g_sel) {
             carry_place[i - 2*n_roles] = p;
         }
     }
@@ -599,6 +660,63 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
         carries[u] = t;
     }
 
+    if (ffn_requested && g_sel == nub) {
+        uint32_t tokens = 0;
+        for (uint32_t n : ub_n) {
+            tokens += n;
+        }
+        const uint32_t used = model.hparams.n_expert_used();
+        const size_t sizes[] = {
+            b1_align_up((size_t) tokens * n_embd * sizeof(float), align),
+            b1_align_up((size_t) tokens * n_embd * sizeof(float), align),
+            b1_align_up((size_t) tokens * (n_hc + 2*used) * sizeof(float), align),
+        };
+        for (size_t bytes : sizes) {
+            auto * buf = ggml_backend_buft_alloc_buffer(buft_dev, bytes);
+            if (!buf) {
+                LLAMA_LOG_WARN("%s: [B1] packed FFN allocation failed; use normal prefill\n", __func__);
+                release_plan();
+                return false;
+            }
+            ffn_buffers.push_back(buf);
+            st.bytes_fresh += bytes;
+        }
+        ffn_all = std::make_unique<llm_b1_ffn>();
+        auto make = [&](ggml_type type, int64_t d0, int64_t d1, size_t item, size_t offset) {
+            auto * t = ggml_new_tensor_2d(ctx_meta, type, d0, d1);
+            t->buffer = ffn_buffers[item];
+            t->data = (char *) ggml_backend_buffer_get_base(t->buffer) + offset;
+            return t;
+        };
+        ffn_all->input = make(GGML_TYPE_F32, n_embd, tokens, 0, 0);
+        ffn_all->output = make(GGML_TYPE_F32, n_embd, tokens, 1, 0);
+        ffn_all->inject = make(GGML_TYPE_F32, n_hc, tokens, 2, 0);
+        ffn_all->ids = make(GGML_TYPE_I32, used, tokens, 2, (size_t) tokens * n_hc * sizeof(float));
+        ffn_all->weights = make(GGML_TYPE_F32, used, tokens, 2, (size_t) tokens * (n_hc + used) * sizeof(float));
+        ffn_all->max_rows = (uint32_t) std::clamp<int64_t>(b1_env_int("LLAMA_B1_FFN_MAX_ROWS", 8192), 256, 16384);
+        ffn_all->grouped_mmid = b1_env_int("LLAMA_B1_FFN_MMID", 1) != 0 && model.hparams.n_expert <= 1024;
+        ffn_all->routed_rows = (uint32_t) std::clamp<int64_t>(b1_env_int("LLAMA_B1_FFN_ROUTED_ROWS", 32768), 8192, 65536);
+        uint32_t offset = 0;
+        for (uint32_t n : ub_n) {
+            auto view = std::make_unique<llm_b1_ffn>();
+            auto slice = [&](ggml_tensor * base) {
+                auto * t = ggml_new_tensor_2d(ctx_meta, base->type, base->ne[0], n);
+                t->buffer = base->buffer;
+                t->data = (char *) base->data + offset * base->nb[1];
+                return t;
+            };
+            view->input = slice(ffn_all->input);
+            view->output = slice(ffn_all->output);
+            view->inject = slice(ffn_all->inject);
+            view->ids = slice(ffn_all->ids);
+            view->weights = slice(ffn_all->weights);
+            ffn_views.push_back(std::move(view));
+            offset += n;
+        }
+        LLAMA_LOG_INFO("%s: [B1] whole-prompt expert GEMMs enabled: %u tokens, %.1f MiB routing scratch, max %u rows per expert piece\n",
+                __func__, tokens, (double) tokens * (2*n_embd + n_hc + 2*used) * sizeof(float) / 1048576.0, ffn_all->max_rows);
+    }
+
     lent_layer.assign(n_layer, false);
     for (int il : lent_sel) {
         lent_layer[il] = true;
@@ -610,8 +728,14 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
             st.bytes_lent += exps[ti].alloc;
         }
     }
-    st.bytes_fresh = fresh_sel;
-    st.bytes_carry = g_sel*carry_bytes;
+    st.bytes_fresh += fresh_sel;
+    for (size_t j = 0; j < g_sel; ++j) {
+        uint32_t tokens = 0;
+        for (size_t u = j; u < nub; u += g_sel) {
+            tokens = std::max(tokens, ub_n[u]);
+        }
+        st.bytes_carry += b1_align_up((size_t) tokens * n_embd * n_hc * sizeof(float), align);
+    }
 
     // the streamed layers in call order
     const size_t n_grp = (nub + g_sel - 1)/g_sel;
@@ -639,14 +763,52 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
             free_mem/1048576.0, ram_avail < 0 ? -1.0 : ram_avail/1048576.0, ram_cap < 0 ? -1.0 : ram_cap/1048576.0,
             layer_streamed(n_layer - 1) ? "streamed" : "not streamed");
 
-    stop     = false;
+    pass_start_us.assign(n_grp, 0);
+    pass_wall_us.assign(n_grp, 0);
+    pass_compute_us.assign(n_grp, 0);
+    pass_copy_ms.assign(n_grp, 0);
+    pass_wait_ms.assign(n_grp, 0);
+    pass_bytes.assign(n_grp, 0);
+    if (!defer_streaming) {
+        start_streaming();
+    }
+    return true;
+}
+
+void llama_b1::start_streaming() {
+    GGML_ASSERT(reserve_layer < 0 && cur_step < 0 && workers.empty() && !coord.joinable());
+    GGML_ASSERT(!steps.empty());
+    stop = false;
     io_error = false;
     for (int w = 0; w < n_workers; ++w) {
         workers.emplace_back(&llama_b1::worker, this, w);
     }
     coord = std::thread(&llama_b1::coordinator, this);
+}
 
-    return true;
+void llama_b1::reserve_layer_bind(int il) {
+    GGML_ASSERT(il >= 0 && il < n_layer && reserve_layer < 0 && cur_step < 0);
+    GGML_ASSERT(workers.empty() && !coord.joinable());
+    reserve_layer = il;
+    for (int ti : layers[il].tensors) {
+        auto & e = exps[ti];
+        if (tensor_streamed(il, e) && layer_streamed(il)) {
+            const placement & p = slot_place[e.role]; // real slot zero, contents are never read
+            e.t->buffer = regions[p.region].buf;
+            e.t->data = regions[p.region].base + p.offs;
+        }
+    }
+}
+
+void llama_b1::reserve_layer_restore() {
+    if (reserve_layer >= 0) {
+        for (int ti : layers[reserve_layer].tensors) {
+            auto & e = exps[ti];
+            e.t->buffer = e.home_buf;
+            e.t->data = e.home_data;
+        }
+        reserve_layer = -1;
+    }
 }
 
 bool llama_b1::layer_streamed(int il) const {
@@ -712,7 +874,7 @@ int32_t llama_b1::final_l0() const {
 }
 
 int32_t llama_b1::range_end(int32_t l0) const {
-    if (layer_streamed(l0)) {
+    if (ffn_enabled() || layer_streamed(l0)) {
         return l0 + 1;
     }
     const int32_t lf = final_l0();
@@ -785,6 +947,11 @@ void llama_b1::coordinator() {
             const placement & p = slot_place[slot*n_roles + e.role];
             push_tensor_pieces(ps, e, &regions[p.region], p.offs, lent_layer[il]);
         }
+        const size_t pass = k / (steps.size() / grp_first.size());
+        for (const auto & piece : ps) {
+            pass_bytes[pass] += piece.len;
+        }
+        const int64_t t_copy0 = ggml_time_us();
         if (!run_pieces(std::move(ps))) {
             std::lock_guard<std::mutex> lk(mtx);
             io_error = true;
@@ -792,6 +959,9 @@ void llama_b1::coordinator() {
             return;
         }
 
+        const double copy_ms = (ggml_time_us() - t_copy0) / 1000.0;
+        st.t_copy_submit_ms += copy_ms;
+        pass_copy_ms[pass] += copy_ms;
         {
             std::lock_guard<std::mutex> ls(mtx_stream);
             for (int ti : layers[il].tensors) {
@@ -901,7 +1071,9 @@ bool llama_b1::layer_begin(int il) {
             return false;
         }
     }
-    st.t_wait_ms += (ggml_time_us() - t0)/1000.0;
+    const double wait_ms = (ggml_time_us() - t0)/1000.0;
+    st.t_wait_ms += wait_ms;
+    pass_wait_ms[k / (steps.size() / grp_first.size())] += wait_ms;
 
     ggml_backend_event_wait(backend_gpu, ev_ready[slot]);
 
@@ -945,6 +1117,19 @@ void llama_b1::layer_end(int il) {
     cur_step = -1;
 }
 
+void llama_b1::pass_begin(size_t ub) {
+    pass_start_us[ub / g_ub] = ggml_time_us();
+}
+
+void llama_b1::pass_compute(size_t ub, int64_t host_us) {
+    pass_compute_us[ub / g_ub] += host_us;
+}
+
+void llama_b1::pass_end(size_t ub) {
+    ggml_backend_synchronize(backend_gpu);
+    pass_wall_us[ub / g_ub] = ggml_time_us() - pass_start_us[ub / g_ub];
+}
+
 void llama_b1::end(bool failed) {
     if (cur_step >= 0) {
         restore_step(cur_step);
@@ -961,6 +1146,20 @@ void llama_b1::end(bool failed) {
             grp_first.size(), g_ub, st.bytes_h2d/1073741824.0, s > 0 ? st.bytes_h2d/1e9/s : 0.0, s, st.t_wait_ms,
             st.bytes_lent/1048576.0, st.bytes_fresh/1048576.0, st.bytes_carry/1048576.0);
 
+    LLAMA_LOG_INFO("%s: [B1] pass timing: pipeline wall %.3f ms, overlapped copy submission %.3f ms, exposed host copy waits %.3f ms; overlapping times are not additive\n",
+            __func__, st.t_stream_us / 1000.0, st.t_copy_submit_ms, st.t_wait_ms);
+    for (size_t pass = 0; pass < grp_first.size(); ++pass) {
+        uint64_t tokens = 0;
+        const size_t first = grp_first[pass], last = group_end(first);
+        for (size_t u = first; u < last; ++u) {
+            tokens += ub_n[u];
+        }
+        LLAMA_LOG_INFO("%s: [B1] pass %zu/%zu: %llu tokens, %zu ubatches, %.3f GiB streamed; start_us=%lld end_us=%lld, pipeline wall %.3f ms, graph-call host %.3f ms, copy-pipeline host %.3f ms, exposed copy wait %.3f ms; overlap is not additive, graph-call time is not pure GPU compute\n",
+                __func__, pass + 1, grp_first.size(), (unsigned long long) tokens, last - first,
+                pass_bytes[pass] / 1073741824.0, (long long) pass_start_us[pass], (long long) (pass_start_us[pass] + pass_wall_us[pass]),
+                pass_wall_us[pass] / 1000.0, pass_compute_us[pass] / 1000.0,
+                pass_copy_ms[pass], pass_wait_ms[pass]);
+    }
     release_plan();
 }
 
@@ -1033,4 +1232,76 @@ bool llama_b1::refill() {
     dirty_tensors.clear();
     release_plan();
     return true;
+}
+
+llm_b1_ffn * llama_b1::ffn(size_t ub) {
+    return ub < ffn_views.size() ? ffn_views[ub].get() : nullptr;
+}
+
+bool llama_b1::ffn_gather() {
+    if (!ffn_all) {
+        return false;
+    }
+    ggml_backend_synchronize(backend_gpu);
+    const uint32_t tokens = (uint32_t) ffn_all->ids->ne[1];
+    const uint32_t used = (uint32_t) ffn_all->ids->ne[0];
+    const uint32_t experts = model.hparams.n_expert;
+    std::vector<int32_t> ids((size_t) tokens * used);
+    std::vector<float> weights(ids.size());
+    ggml_backend_tensor_get(ffn_all->ids, ids.data(), 0, ids.size() * sizeof(int32_t));
+    ggml_backend_tensor_get(ffn_all->weights, weights.data(), 0, weights.size() * sizeof(float));
+    ffn_all->expert_rows.assign(experts, {});
+    ffn_all->expert_weights.assign(experts, {});
+    for (uint32_t t = 0; t < tokens; ++t) {
+        for (uint32_t k = 0; k < used; ++k) {
+            const size_t i = (size_t) t * used + k;
+            const int32_t e = ids[i];
+            if (e < 0 || (uint32_t) e >= experts || !std::isfinite(weights[i])) {
+                return false;
+            }
+            // Each token may select an expert at most once; SET_ROWS relies on unique row indices.
+            for (uint32_t j = 0; j < k; ++j) {
+                if (ids[(size_t) t * used + j] == e) {
+                    return false;
+                }
+            }
+            ffn_all->expert_rows[e].push_back((int32_t) t);
+            ffn_all->expert_weights[e].push_back(weights[i]);
+        }
+    }
+    ffn_all->buckets.clear();
+    if (ffn_all->grouped_mmid) {
+        const size_t cap = ffn_all->routed_rows;
+        for (size_t e = 0; e < experts; ++e) {
+            const auto & rows = ffn_all->expert_rows[e];
+            const auto & weights = ffn_all->expert_weights[e];
+            for (size_t offset = 0; offset < rows.size(); ) {
+                const size_t count = std::min(cap, rows.size() - offset);
+                if (ffn_all->buckets.empty() || ffn_all->buckets.back().rows.size() + count > cap ||
+                        ffn_all->buckets.back().spans.size() >= 256) {
+                    ffn_all->buckets.emplace_back();
+                }
+                auto & bucket = ffn_all->buckets.back();
+                bucket.spans.push_back({bucket.rows.size(), count});
+                bucket.rows.insert(bucket.rows.end(), rows.begin() + offset, rows.begin() + offset + count);
+                bucket.weights.insert(bucket.weights.end(), weights.begin() + offset, weights.begin() + offset + count);
+                bucket.experts.insert(bucket.experts.end(), count, (int32_t) e);
+                offset += count;
+            }
+        }
+    }
+    return true;
+}
+
+void llama_b1::ffn_release() {
+    if (ffn_buffers.empty()) {
+        return;
+    }
+    ggml_backend_synchronize(backend_gpu);
+    ffn_views.clear();
+    ffn_all.reset();
+    for (auto * buffer : ffn_buffers) {
+        ggml_backend_buffer_free(buffer);
+    }
+    ffn_buffers.clear();
 }

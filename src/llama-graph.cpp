@@ -1759,8 +1759,14 @@ ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * cur,
           ggml_tensor * w_s) const {
     ggml_tensor * cur_mm = cur;
+    const ggml_tensor * transform_weight = w;
+    if (res->get_b1_ffn_phase() == 2) {
+        while (transform_weight->view_src) {
+            transform_weight = transform_weight->view_src;
+        }
+    }
     if (hadamard_rotations) {
-        const auto it = hadamard_rotations->find(w);
+        const auto it = hadamard_rotations->find(transform_weight);
         if (it != hadamard_rotations->end()) {
             const auto & t = it->second;
             // another folded weight on this same activation already built the transform
@@ -1856,8 +1862,16 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * w_s,
           ggml_tensor * slots) const {
     ggml_tensor * cur_mm = cur;
+    // A packed B1 bucket may view only the contiguous expert interval it
+    // uses. The folded input transform still belongs to the original bank.
+    const ggml_tensor * transform_weight = w;
+    if (res->get_b1_ffn_phase() == 2) {
+        while (transform_weight->view_src) {
+            transform_weight = transform_weight->view_src;
+        }
+    }
     if (hadamard_rotations) {
-        const auto it = hadamard_rotations->find(w);
+        const auto it = hadamard_rotations->find(transform_weight);
         if (it != hadamard_rotations->end()) {
             const auto & t = it->second;
             // another folded weight on this same activation already built the transform
@@ -2516,6 +2530,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
+
+    const auto * b1_ffn = res->get_b1_ffn();
+    if (res->get_b1_ffn_phase() == 1 && b1_ffn) {
+        GGML_ASSERT(selected_experts->type == GGML_TYPE_I32 && weights->type == GGML_TYPE_F32);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, selected_experts, b1_ffn->ids));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens), b1_ffn->weights));
+        return nullptr;
+    }
 
     // the experts of host-resident layers may be read from the MoE cache
     ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il);

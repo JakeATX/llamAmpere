@@ -343,12 +343,23 @@ void ggml_cuda_launch_mm_ids_helper(
         const int n_experts, const int n_tokens, const int n_expert_used, const int nchannels_y, const int si1, const int sis1, const bool write_inverse, cudaStream_t stream,
         ggml_cuda_pool * pool) {
     static const int par_mode = [] { const char * e = getenv("GGML_CUDA_MMID_PAR"); return e ? atoi(e) : 0; }();
-    if (par_mode > 0 && pool != nullptr && n_expert_used == 10 && n_tokens >= 64*MMID_PAR_WARPS) {
+    const size_t smpbo = ggml_cuda_info().devices[ggml_cuda_get_device()].smpbo;
+    const bool reference_fits = (size_t) n_tokens * sizeof(mm_ids_helper_store) <= smpbo;
+    if (pool != nullptr && (n_expert_used == 1 || n_expert_used == 10) &&
+            ((par_mode > 0 && n_tokens >= 64*MMID_PAR_WARPS) || !reference_fits)) {
+        // A routed-row bucket uses one expert per gathered row. The existing
+        // stable counting sort also handles that shape without O(tokens) shared
+        // storage, so large buckets work even when the reference cannot launch.
+        const auto launch = [&]() {
+            return n_expert_used == 1 ?
+                launch_mm_ids_par<1>(*pool, ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, nchannels_y, si1, sis1, write_inverse, stream) :
+                launch_mm_ids_par<10>(*pool, ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, nchannels_y, si1, sis1, write_inverse, stream);
+        };
         bool ok = false;
-        if (par_mode == 2) {
+        if (par_mode == 2 && reference_fits) {
             const int64_t ne = (int64_t) n_tokens*n_expert_used;
             ggml_cuda_pool_alloc<int32_t> r_src1(*pool, ne), r_dst(*pool, ne), r_bounds(*pool, n_experts + 1);
-            ok = launch_mm_ids_par<10>(*pool, ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, nchannels_y, si1, sis1, write_inverse, stream);
+            ok = launch();
             if (ok) {
                 ggml_cuda_launch_mm_ids_helper_ref(ids, r_src1.get(), r_dst.get(), r_bounds.get(), n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
                 ggml_cuda_pool_alloc<unsigned long long> nd(*pool, 3);
@@ -370,7 +381,7 @@ void ggml_cuda_launch_mm_ids_helper(
                 }
             }
         } else {
-            ok = launch_mm_ids_par<10>(*pool, ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, nchannels_y, si1, sis1, write_inverse, stream);
+            ok = launch();
         }
         if (ok) {
             return;
@@ -383,6 +394,9 @@ static void ggml_cuda_launch_mm_ids_helper_ref(
         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
         const int n_experts, const int n_tokens, const int n_expert_used, const int nchannels_y, const int si1, const int sis1, const bool write_inverse, cudaStream_t stream) {
     switch (n_expert_used) {
+        case  1:
+            launch_mm_ids_helper< 1>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
+            break;
         case  2:
             launch_mm_ids_helper< 2>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
             break;

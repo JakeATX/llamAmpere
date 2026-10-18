@@ -467,6 +467,16 @@ private:
     llama_context * compute_peer = nullptr;
 
     bool sched_need_reserve = true;
+    // fork: limit only the reserved graph, not the caller's physical batch size.
+    uint32_t sched_reserve_tokens = 0;
+    // The scheduler owns expert residency independently of its compute allocator.
+    // Reuse it for graph-shape changes while its fixed capacity/configuration fits.
+    size_t sched_node_capacity = 0;
+    int sched_cache_mode = -1;
+    size_t sched_cache_budget_mib = 0;
+    bool sched_pipeline_parallel = false;
+    bool sched_op_offload = false;
+    bool prompt_buffers_resize(uint32_t n_tokens, const llama_batch_ext * batch);
 
     // state of sched_copy_experts, reset before each graph compute
     struct copy_experts_info {
@@ -518,21 +528,38 @@ private:
     bool ple_pf_tried = false;
     bool b1_env   = false; // LLAMA_B1 set
     bool b1_tried = false; // b1 construction attempted
+    bool b1_ffn_scratch_active = false;
+    bool b1_layer_scratch_active = false;
     bool b1_off_logged = false; // the once-per-context note on why B1 is not used was printed
     struct {
         bool          active = false;   // the graph being built is a B1 graph (memory already applied)
         int32_t       il0    = 0;
         int32_t       il1    = -1;
         ggml_tensor * carry  = nullptr;
+        const llm_b1_ffn * ffn = nullptr;
+        int ffn_phase = 0;
     } b1_cur;
 
     // returns 1 when this decode call runs layer-major (every ubatch applied and saved, the plan made),
     // 0 for the normal path, < 0 for a decode error code
     int  b1_prepare(llama_memory_context_i * mctx, const llama_batch_ext & batch_inp, uint32_t n_tokens_all, int64_t n_outputs_all);
+    bool b1_reserve_legacy_layers(const std::vector<uint32_t> & sizes, int64_t n_outputs_all);
     // runs layers [0, n_layer - 1) of every ubatch of the group that starts at ub0, then seeks back to ub0 with
     // the last layer's experts ready; false on failure (status set)
     bool b1_run_prefix(llama_memory_context_i * mctx, size_t ub0, ggml_status & status);
     int64_t b1_final_rows(int64_t n_out, int64_t n_tok) const;
+
+    // fork: opt-in prompt routing counts use layer IDs, never temporary B1 weight addresses.
+    bool b1_cache_warm_enabled = false;
+    bool b1_cache_collect = false;
+    bool b1_cache_needs_refresh = false;
+    void b1_cache_begin();
+    ggml_tensor * b1_cache_user_node = nullptr;
+    std::vector<std::vector<uint64_t>> b1_cache_counts;
+    uint64_t b1_cache_readbacks = 0;
+    int64_t b1_compute_submit_us = 0;
+    static bool b1_cache_eval(ggml_tensor * tensor, bool ask, void * user_data);
+    void b1_cache_warm();
 
 public:
     // in-call checkpoints (llama_state_seq_capture_arm)

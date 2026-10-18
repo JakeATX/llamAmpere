@@ -570,6 +570,26 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
         granularity(ggml_cuda_info().devices[device].vmm_granularity) {
     }
 
+    // A CUDA graph can retain pool addresses after its temporary handles are
+    // destroyed. The caller must discard graphs and quiesce this backend first.
+    size_t trim_unused() {
+        if (pool_used != 0 || pool_size == 0) {
+            return 0;
+        }
+        const size_t released = pool_size;
+        ggml_cuda_set_device(device);
+#if defined(GGML_USE_HIP)
+        for (const auto & mapping : mappings) {
+            CU_CHECK(cuMemUnmap(mapping.first, mapping.second));
+        }
+        mappings.clear();
+#else
+        CU_CHECK(cuMemUnmap(pool_addr, pool_size));
+#endif
+        pool_size = 0;
+        return released;
+    }
+
     ~ggml_cuda_pool_vmm() {
         if (pool_addr != 0) {
 #if defined(GGML_USE_HIP)
@@ -578,7 +598,9 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
                 CU_CHECK(cuMemUnmap(mapping.first, mapping.second));
             }
 #else
-            CU_CHECK(cuMemUnmap(pool_addr, pool_size));
+            if (pool_size != 0) {
+                CU_CHECK(cuMemUnmap(pool_addr, pool_size));
+            }
 #endif
             CU_CHECK(cuMemAddressFree(pool_addr, CUDA_POOL_VMM_MAX_SIZE));
         }
@@ -4218,6 +4240,63 @@ bool ggml_backend_cuda_graph_reset(ggml_backend_t backend) {
 #endif
     cuda_ctx->stream_context().reset();
     return true;
+}
+
+// Optional backend proc used only at an idle prompt-to-generation transition.
+// It deliberately keeps shared pools: a peer's captured graphs may still hold
+// their addresses even when no C++ allocation handle is currently outstanding.
+size_t ggml_backend_cuda_pool_trim(ggml_backend_t backend) {
+    if (!ggml_backend_is_cuda(backend)) {
+        return 0;
+    }
+    auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
+    std::unique_lock<std::mutex> lock(ggml_cuda_lock);
+    ggml_cuda_lock_cv.wait(lock, [] {
+        return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0;
+    });
+#ifdef USE_CUDA_GRAPH
+    if (!cuda_ctx->cuda_graphs.empty()) {
+        GGML_LOG_WARN("%s: retained CUDA graphs; trim skipped\n", __func__);
+        return 0;
+    }
+#endif
+    ggml_cuda_set_device(cuda_ctx->device);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    size_t free_before = 0, total = 0;
+    CUDA_CHECK(cudaMemGetInfo(&free_before, &total));
+    size_t released = 0;
+    size_t active_pools = 0;
+    size_t shared_pools = 0;
+    for (int dev = 0; dev < GGML_CUDA_MAX_DEVICES; ++dev) {
+        for (int stream = 0; stream < GGML_CUDA_MAX_STREAMS; ++stream) {
+            ggml_cuda_pool * pool = cuda_ctx->pools[dev][stream].get();
+            if (!pool) {
+                continue;
+            }
+            if (dynamic_cast<ggml_cuda_pool_shared_ref *>(pool)) {
+                ++shared_pools;
+                continue;
+            }
+            if (auto * legacy = dynamic_cast<ggml_cuda_pool_leg *>(pool)) {
+                const size_t before = legacy->pool_size;
+                legacy->clear_pool(); // Only cached, unused blocks are in buffer_pool.
+                released += before - legacy->pool_size;
+                active_pools += legacy->pool_size != 0;
+            }
+#if defined(GGML_USE_VMM)
+            else if (auto * vmm = dynamic_cast<ggml_cuda_pool_vmm *>(pool)) {
+                active_pools += vmm->pool_used != 0;
+                released += vmm->trim_unused(); // Refuses every outstanding allocation.
+            }
+#endif
+        }
+    }
+    ggml_cuda_set_device(cuda_ctx->device);
+    size_t free_after = 0;
+    CUDA_CHECK(cudaMemGetInfo(&free_after, &total));
+    GGML_LOG_INFO("%s: CUDA temporary pool return bytes: released=%zu free_before=%zu free_after=%zu active_pools=%zu shared_pools=%zu\n",
+            __func__, released, free_before, free_after, active_pools, shared_pools);
+    return released;
 }
 
 static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
@@ -9447,6 +9526,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_graph_reset") == 0) {
         return (void *) ggml_backend_cuda_graph_reset;
+    }
+    if (strcmp(name, "ggml_backend_cuda_pool_trim") == 0) {
+        return (void *) ggml_backend_cuda_pool_trim;
     }
     if (strcmp(name, "ggml_backend_cuda_kv_stream_type_pair_supported") == 0) {
         return (void *) +[](ggml_type type_k, ggml_type type_v) {

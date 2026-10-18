@@ -222,6 +222,7 @@ struct common_speculative_impl {
     virtual void begin(llama_seq_id seq_id, const llama_tokens & prompt) = 0;
 
     virtual bool process(const llama_batch & batch) = 0;
+    virtual bool process_range(const llama_batch & batch, int32_t output_offset) { return output_offset == 0 && process(batch); }
 
     virtual void draft(common_speculative_draft_params_vec & dparams) = 0;
 
@@ -1895,6 +1896,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     bool process(const llama_batch & batch_in) override {
+        return process_range(batch_in, 0);
+    }
+
+    bool process_range(const llama_batch & batch_in, int32_t output_offset) override {
         if (batch_in.n_tokens <= 0) {
             return true;
         }
@@ -1982,7 +1987,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             defer.seq.resize(k0 + n_tokens);
             defer.embd.resize((k0 + n_tokens) * (size_t) n_embd);
 
-            const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+            const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt) + (size_t) output_offset * n_embd;
             for (int k = 0; k < n_tokens; ++k) {
                 defer.tok[k0 + k] = batch_in.token[k];
                 defer.pos[k0 + k] = batch_in.pos[k];
@@ -2003,7 +2008,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 return false;
             }
 
-            const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+            const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt) + (size_t) output_offset * n_embd;
             auto * mem_dft = llama_get_memory(ctx_dft);
 
             bool ok = true;
@@ -2058,10 +2063,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
             // Target outputs remain valid until the next target decode. Accept reads one row.
             verify_h_rows[seq_id] = n_rows;
-            verify_h_beg[seq_id] = i_batch_beg[seq_id];
+            verify_h_beg[seq_id] = output_offset + i_batch_beg[seq_id];
 
             std::memcpy(pending_h[seq_id].data(),
-                    llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_end[seq_id]), row_bytes);
+                    llama_get_embeddings_nextn_ith(ctx_tgt, output_offset + i_batch_end[seq_id]), row_bytes);
         }
 
         return true;
@@ -4348,6 +4353,35 @@ bool common_speculative_process(common_speculative * spec, const common_batch & 
     }
 
     return result;
+}
+
+bool common_speculative_supports_process_range(const common_speculative * spec) {
+    return spec && !spec->impls.empty() && std::all_of(spec->impls.begin(), spec->impls.end(), [](const auto & impl) {
+        return impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE;
+    });
+}
+
+bool common_speculative_process_range(common_speculative * spec, const common_batch & batch, int32_t first, int32_t count) {
+    if (!common_speculative_supports_process_range(spec) || first < 0 || count < 0 || first > batch.size() - count || !batch.has_token() || batch.has_embd()) {
+        return false;
+    }
+    if (count == 0) {
+        return true;
+    }
+    static thread_local spec_batch_view view;
+    llama_batch b = view.render(batch);
+    b.n_tokens = count;
+    b.token += first;
+    b.pos += first;
+    b.n_seq_id += first;
+    b.seq_id += first;
+    b.logits += first;
+    for (auto & impl : spec->impls) {
+        if (!impl->process_range(b, first)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 void common_speculative_draft(common_speculative * spec) {
