@@ -6377,6 +6377,19 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
     if (ggml_cuda_moe_cache_device_supports(node, cuda_ctx->device)) {
+        if (cuda_ctx->stream_context().concurrent_events.empty() && i + 2 < cgraph->n_nodes) {
+            ggml_tensor * glu = cgraph->nodes[i + 2];
+            const int outputs[] = {i + 2};
+            if (glu->op == GGML_OP_GLU &&
+                    ((glu->src[0] == node && glu->src[1] == cgraph->nodes[i + 1]) ||
+                     (glu->src[1] == node && glu->src[0] == cgraph->nodes[i + 1])) &&
+                    ggml_can_fuse_subgraph(cgraph, i, {GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU}, {i + 2}) &&
+                    ggml_cuda_check_fusion_memory_ranges(cgraph, i, 3, outputs, 1) &&
+                    ggml_cuda_moe_cache_device_fused_compute(*cuda_ctx, glu->src[1], glu->src[0], glu)) {
+                cuda_ctx->fusion_stats.mul_mat_glu++;
+                return 2;
+            }
+        }
         return 0;
     }
 
