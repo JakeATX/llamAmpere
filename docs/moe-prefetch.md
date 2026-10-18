@@ -1,15 +1,50 @@
-# Decode expert prefetch validation
+# GPU expert prefetch
 
-The code uses GPU matrix multiplication, the model's gate activation and bias, and GPU top-k sorting. Only ranked expert IDs return to the host. It never changes routing IDs used by the model, drops experts, changes weights, or runs router prediction on the CPU.
+`--moe-prefetch off|auto|1|2|3` controls speculative expert copies for
+DeepSeek4 decode. The default is `off`. `LLAMA_ARG_MOE_PREFETCH` accepts the
+same values. This option requires the CUDA expert cache; it does not enable
+expert skipping or change router choices.
 
-`--moe-prefetch off|auto|1|2|3` defaults to `off`. `auto` evaluates up to three later routers, then admits the shortest measured lead that covers a complete expert transfer. Fixed depths consider every later layer up to that depth. The graph hook covers trunk decode and MTP verification batches of up to eight tokens. Verification batches rank the maximum candidate score across their tokens on the GPU. Larger prompt batches keep their regular graphs.
+After attention, the current layer's normalized FFN input is evaluated by
+the next one to three routers on the GPU. Each router produces up to 32
+ranked candidates. For verification batches of up to eight tokens, ranking
+uses each expert's largest score across the batch. The draft context and
+larger batches do not predict.
 
-Admission waits for measured layer intervals and at least four completed demand transfers. The transfer rate includes RAM-to-pinned staging and completion of the card copy. A 25% deadline margin and a 16 MiB per-issue cap bound traffic. Already resident or copying entries are skipped. Queued demand fills precede predictions; a demand for a queued prediction promotes it. A transfer already in flight completes before the worker takes the next job.
+The copy worker admits only uncached candidates, in descending router
+order. Its byte allowance uses observed layer intervals and completed
+host-to-device copy throughput, with 25% time headroom and a 16 MiB limit.
+`auto` selects the shortest lead that can cover a complete expert. No copies
+are admitted before timing samples exist. Real demand work takes priority;
+queued predictions are canceled when demand arrives or their deadline
+expires. An already running transfer completes normally.
 
-Up to four slots per format pool serve as staging. They use the cache's existing slab, generations, source invalidation, and reader pins. Reserving staging can displace cold demand entries once. Predictions reuse only closed, unpinned staging entries. Legacy cache results are counted as used after successful collection; device dispatch records use after successful kernel submission. Staging entries are released after their target layer, once readers have finished. Logs include issue, start, completion, target entry, actual selection, cancellation, and used/wasted outcomes. Canceled work has `done_us=-1`; it did not complete a card transfer.
+Copies use at most four reserved slots per format pool inside the cache's
+existing allocation. Demand eviction cannot overwrite these slots. Device
+dispatch publishes a completed staging address only after the real router
+selects that expert. The address is restored before the slot is reused.
+Legacy dispatch pins the staged entry through its normal collection path.
+Both paths retire speculative entries at the end of the graph scope.
 
-`test-moe-cache --prefetch-policy-only` runs deterministic CPU budget checks. `--prefetch-cpu-only` also checks router graphs on the CPU. The normal test checks exact top-32 IDs on CPU and CUDA for sigmoid, softmax, and square-root softplus routers, plus staging copy, publication, retirement, exact device replay, and the existing cache tests.
+Each `[moe-prefetch]` log row describes one tensor projection copy:
+`source`, `target`, `expert`, `rank`, `bytes`, `issue_us`, `start_us`,
+`done_us`, `target_start_us`, `selected`, `canceled`, and `outcome`.
+Times use the process monotonic clock in microseconds. A canceled copy has
+`done_us=-1`. `outcome=used` means an expert kernel consumed the copied
+weights; selection alone does not count as use. Gate, up, and down copies
+are logged separately.
 
-The manual `test-moe-prefetch-model` harness feeds identical token IDs, writes all vocabulary logits for 32 decode positions, and checks exact state-save/state-restore bytes. `/mnt/models/fnprefetch/compare-golden.py` reports full-distribution KL for each flag mode against `off`. The guarded runners require the shared GPU lock and active system guard. Full speed acceptance still requires interleaved 100K + 5,120-token runs at temperature 1.0 against the current committed baseline.
+The backend interface appends `prefetch_configure`, `prefetch`, and
+`prefetch_observe` to `ggml_moe_cache_api`. Configuration happens before
+pool sizing. A null observation ID array marks layer entry; real routed
+IDs mark selection. Prediction IDs are side outputs and never feed model
+math. Prefetch has no serialized state and is drained before cache reset
+or source-buffer teardown.
 
-With `GGML_MOE_CACHE_DEVICE=1`, a separate device pointer overlay is reserved before cache pools are built. Base tables exclude staging slots. Completed predictions publish only when the real GPU router selects the same expert; the overlay is restored before staging can be recycled. Every kernel still reads the same expert bytes, and cached CUDA graphs retain a stable table address. This overlay and the four-slot staging reserve are available for FNMISS integration; its demand-miss planner must preserve the prefetch queue priority and generation checks.
+`test-moe-cache --prefetch-cpu-only` checks budget arithmetic and router
+ranking without discovering a GPU. The normal cache test also checks CUDA
+ranking and two rounds of copy, use, and retirement for both dispatch paths.
+`test-moe-prefetch-model` is a manual model gate: set `FN_GOLDEN_IDS` to
+2,080 fixed int32 token IDs and `FN_GOLDEN_LOGITS` to an output path. It
+writes 32 full-vocabulary logit rows and checks an exact saved-state round
+trip. Model and full-protocol performance acceptance are separate gates.
