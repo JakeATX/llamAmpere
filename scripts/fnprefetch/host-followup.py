@@ -2,7 +2,7 @@ import json,os,subprocess,time
 from pathlib import Path
 R=Path('/mnt/models/fnprefetch');S=Path(__file__).resolve().parent
 assert os.environ['PARENT_HOLDS_GPU_LOCK']=='1'
-frozen=Path((R/'logs/frozen-bin.txt').read_text().strip());tag=frozen.parent.name
+frozen=Path(os.environ.get('FN_GATE_BIN',str(R/'releases/d8f23ede0/bin')));tag=frozen.parent.name
 gates=json.loads((R/'logs'/('operators-'+tag)/'gates.json').read_text())
 assert len(gates)==3 and all(g['rc']==0 for g in gates)
 label='device0-'+tag;golden=R/'logs'/label
