@@ -50,3 +50,8 @@ void ggml_cuda_moe_table_mmv(const void * const * table, ggml_type type,
         const char * act_q8, const int32_t * ids, float * dst,
         int64_t n_in, int64_t n_out, int64_t n_ids, int64_t n_tokens,
         int64_t act_channels, int64_t ids_stride, cudaStream_t stream);
+
+void ggml_cuda_moe_table_mmv_fused(const void * const * up_table, const void * const * gate_table, ggml_type type,
+        const char * act_q8, const int32_t * ids, float * dst,
+        int64_t n_in, int64_t n_out, int64_t n_ids, int64_t n_tokens,
+        int64_t act_channels, int64_t ids_stride, cudaStream_t stream);

@@ -11,6 +11,7 @@ uint64_t ggml_cuda_moe_cache_device_capture_generation(int) { return 0; }
 void ggml_cuda_moe_cache_device_graph_record(int, bool) {}
 bool ggml_cuda_moe_cache_device_supports(const ggml_tensor *, int) { return false; }
 bool ggml_cuda_moe_cache_device_compute(ggml_backend_cuda_context &, ggml_tensor *) { return false; }
+bool ggml_cuda_moe_cache_device_fused_compute(ggml_backend_cuda_context &, ggml_tensor *, ggml_tensor *, ggml_tensor *) { return false; }
 
 static void moe_cache_register_stub(const void * owner) {
     (void) owner;
@@ -5272,6 +5273,50 @@ bool ggml_cuda_moe_cache_device_compute(ggml_backend_cuda_context & ctx, ggml_te
             }
         }
     }
+    return true;
+}
+
+// fork: one activation quantization and one MMV retain both exact expert projections.
+bool ggml_cuda_moe_cache_device_fused_compute(ggml_backend_cuda_context & ctx,
+        ggml_tensor * up, ggml_tensor * gate, ggml_tensor * glu) {
+    const char * enabled = getenv("GGML_MOE_CACHE_DEVICE_FUSED");
+    if (!enabled || strcmp(enabled, "1") != 0 || g_session_stack.empty() || !g_session_stack.back().active ||
+            !up || !gate || !glu || glu->op != GGML_OP_GLU ||
+            ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || ggml_get_op_params_i32(glu, 1) != 0 ||
+            glu->src[0] != gate || glu->src[1] != up ||
+            !moe_cache_device_op_fits(*g_session_stack.back().active, up, ctx.device) ||
+            !moe_cache_device_op_fits(*g_session_stack.back().active, gate, ctx.device) ||
+            up->src[0]->type != gate->src[0]->type || up->src[1] != gate->src[1] || up->src[2] != gate->src[2] ||
+            !ggml_are_same_shape(up, gate) || !ggml_are_same_shape(up, glu) ||
+            glu->type != GGML_TYPE_F32 || !ggml_is_contiguous(glu)) {
+        return false;
+    }
+    auto & session = *g_session_stack.back().active;
+    const auto & up_table = session.device_tables.at(up->src[0]->data);
+    const auto & gate_table = session.device_tables.at(gate->src[0]->data);
+    const ggml_tensor * a = up->src[1];
+    const ggml_tensor * ids = up->src[2];
+    session.device_dispatches.fetch_add(2, std::memory_order_relaxed);
+    if (session.device_expert_counts) {
+        const int n = (int)(ids->ne[0] * ids->ne[1]);
+        for (const auto * table : {&up_table, &gate_table}) {
+            moe_cache_count_routes<<<(n + 127) / 128, 128, 0, ctx.stream()>>>(
+                    (const int32_t *)ids->data, table->hot, session.device_route_counts,
+                    session.device_expert_counts + table->count_offset, n, table->desc.n_expert,
+                    (int)ids->ne[0], (int)(ids->nb[1] / sizeof(int32_t)));
+        }
+    }
+    const int64_t padded = GGML_PAD(a->ne[0], MATRIX_ROW_PADDING);
+    const size_t q8_bytes = (size_t)(padded / QK8_1) * a->ne[1] * a->ne[2] * sizeof(block_q8_1);
+    ggml_cuda_pool_alloc<char> q8(ctx.pool());
+    char * quantized = q8.alloc(q8_bytes);
+    quantize_row_q8_1_cuda((const float *)a->data, nullptr, quantized, (ggml_type)up_table.desc.type,
+            a->ne[0], a->nb[1] / sizeof(float), a->nb[2] / sizeof(float), a->nb[3] / sizeof(float),
+            padded, a->ne[1], a->ne[2], 1, ctx.stream());
+    ggml_cuda_moe_table_mmv_fused(up_table.device, gate_table.device, (ggml_type)up_table.desc.type, quantized,
+            (const int32_t *)ids->data, (float *)glu->data, a->ne[0], glu->ne[0], ids->ne[0], ids->ne[1],
+            a->ne[1], ids->nb[1] / sizeof(int32_t), ctx.stream());
+    CUDA_CHECK(cudaGetLastError());
     return true;
 }
 
