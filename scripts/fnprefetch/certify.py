@@ -7,6 +7,8 @@ frozen=Path(os.environ['FN_GATE_BIN']).resolve();baseline=Path(os.environ['FN_BA
 assert frozen.parent.parent==R/'releases'
 assert baseline.parent.parent==Path('/mnt/models/fnship/releases')
 tag=frozen.parent.name;baseline_tag=baseline.parent.name
+for commit in (tag,baseline_tag):
+ assert subprocess.run(['git','-C',str(R),'merge-base','--is-ancestor','5c7567cea',commit]).returncode==0,'both builds must include the shared restore fix'
 stage=sys.argv[2] if len(sys.argv)>2 else 'model'
 assert stage in ('model','reload')
 def identity(directory):
