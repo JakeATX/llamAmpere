@@ -79,7 +79,7 @@ static void test_ram_tiers() {
 
 struct entry_data {
     llama_tokens tokens;
-    std::vector<uint8_t> main, drft;
+    std::vector<uint8_t> main, drft, spec;
     std::list<common_prompt_checkpoint> ckpts;
 };
 
@@ -96,6 +96,7 @@ static entry_data make_entry(int id, size_t n_tokens, size_t main_bytes, int n_c
     for (size_t i = 0; i < e.drft.size(); ++i) {
         e.drft[i] = (uint8_t) (i * 7 + id);
     }
+    e.spec = std::vector<uint8_t>(31, (uint8_t) id);
     for (int c = 0; c < n_ckpt; ++c) {
         common_prompt_checkpoint ck;
         ck.n_tokens = 10 + c;
@@ -104,14 +105,14 @@ static entry_data make_entry(int id, size_t n_tokens, size_t main_bytes, int n_c
         ck.pos_max  = 100 + c;
         ck.data_tgt = std::vector<uint8_t>(1000 + c, (uint8_t) (id + c));
         ck.data_dft = std::vector<uint8_t>(17, (uint8_t) c);
-        ck.data_spec = {};
+        ck.data_spec = std::vector<uint8_t>(13 + c, (uint8_t) (id + c));
         e.ckpts.push_back(std::move(ck));
     }
     return e;
 }
 
 static bool write_entry(server_prompt_disk_tier & t, const entry_data & e) {
-    return t.write(e.tokens, e.main, e.drft, e.ckpts);
+    return t.write(e.tokens, e.main, e.drft, e.ckpts, e.spec);
 }
 
 static server_prompt_disk_tier make_tier(const std::string & dir, const std::string & key, size_t limit) {
@@ -137,7 +138,7 @@ static std::list<server_prompt_disk_entry>::iterator find_entry(server_prompt_di
 }
 
 static bool same(const server_prompt_disk_record & r, const entry_data & e) {
-    if (r.tokens != e.tokens || r.main != e.main || r.drft != e.drft || r.checkpoints.size() != e.ckpts.size()) {
+    if (r.tokens != e.tokens || r.main != e.main || r.drft != e.drft || r.spec != e.spec || r.checkpoints.size() != e.ckpts.size()) {
         return false;
     }
     auto a = r.checkpoints.begin();
@@ -710,19 +711,62 @@ static void test_mtmd_text_only_spills(const std::string & root) {
     p.tokens = server_tokens(make_entry(3, 300, 0).tokens, /* has_mtmd = */ true);
     CHECK(p.tokens.has_mtmd && !p.tokens.has_media());
 
-    auto * e = pc.alloc(p, 1*MiB, 0);
+    auto * e = pc.alloc(p, 1*MiB, 0, nullptr, 31);
     CHECK(e != nullptr && e->prompt.tokens.has_mtmd);
+    e->data.spec.assign(31, 42);
+    CHECK(e->size() == 1*MiB + 31);
     pc.flush_to_disk();
     CHECK(pc.disk.n_match() == 1);
+    server_prompt_disk_record record;
+    CHECK(pc.disk.read(pc.disk.entries.begin(), record));
+    CHECK(record.spec == e->data.spec);
 
     // over the RAM limit: staged for the disk tier instead of skipped
     server_prompt q;
     q.tokens = server_tokens(make_entry(4, 300, 0).tokens, /* has_mtmd = */ true);
     pc.limit_size = 1*MiB;
-    auto * st = pc.alloc(q, 2*MiB, 0);
+    auto * st = pc.alloc(q, 2*MiB, 0, nullptr, 17);
     CHECK(st != nullptr && pc.staging_pending);
+    st->data.spec.assign(17, 7);
     pc.update();
     CHECK(!pc.staging_pending && pc.disk.n_match() == 2);
+    CHECK(pc.disk.read(find_entry(pc.disk, q.tokens.get_text_tokens()), record));
+    CHECK(record.spec == std::vector<uint8_t>(17, 7));
+}
+
+// a cache entry keeps the adapter scales its KV state was computed with: in RAM, through the staging area, and on disk
+static void test_lora_scales(const std::string & root) {
+    const std::string dir = root + "/lora";
+    server_prompt_cache pc(1024, 0);
+    pc.disk = make_tier(dir, "k", 0);
+
+    server_prompt p;
+    p.tokens      = server_tokens(make_entry(5, 300, 0).tokens, false);
+    p.lora_scales = {0.0f, 0.5f};
+
+    auto * e = pc.alloc(p, 1*MiB, 0);
+    CHECK(e != nullptr && e->prompt.lora_scales == p.lora_scales);
+    CHECK(e->prompt.clone().lora_scales == p.lora_scales);
+    pc.flush_to_disk();
+
+    server_prompt q;
+    q.tokens      = server_tokens(make_entry(6, 300, 0).tokens, false);
+    q.lora_scales = {1.0f};
+    pc.limit_size = 1*MiB;
+    auto * st = pc.alloc(q, 2*MiB, 0);
+    CHECK(st != nullptr && pc.staging_pending && st->prompt.lora_scales == q.lora_scales);
+    pc.update();
+
+    server_prompt_disk_tier t = make_tier(dir, "k", 0);
+    CHECK(t.n_match() == 2);
+    server_prompt_disk_record r;
+    CHECK(t.read(find_entry(t, p.tokens.get_text_tokens()), r) && r.lora_scales == p.lora_scales);
+    CHECK(t.read(find_entry(t, q.tokens.get_text_tokens()), r) && r.lora_scales == q.lora_scales);
+
+    // no adapters: an empty list round-trips
+    const entry_data n = make_entry(8, 50, 4096);
+    CHECK(write_entry(t, n));
+    CHECK(t.read(find_entry(t, n.tokens), r) && r.lora_scales.empty() && same(r, n));
 }
 
 int main() {
@@ -741,6 +785,7 @@ int main() {
     test_hand_over();
     test_ram_ckpt_keep();
     test_mtmd_text_only_spills(root);
+    test_lora_scales(root);
 
     std::error_code ec;
     fs::remove_all(root, ec);

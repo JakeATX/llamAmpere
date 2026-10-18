@@ -30,11 +30,6 @@ static void ggml_cuda_flash_attn_ext_mma_turbo_case_impl(ggml_backend_cuda_conte
 
     constexpr int ncols = ncols1 * ncols2;
     constexpr bool preserve_cand = ggml_cuda_fattn_mma_cand_pair(type_K, type_V);
-    if constexpr (preserve_cand && ggml_cuda_fattn_mma_cand_shape(DKQ, DV, ncols)) {
-        if (ampere_mma_available(cc)) {
-            ggml_cuda_fattn_mma_note_cand(DKQ, ncols);
-        }
-    }
 
     const int  nthreads       = ggml_cuda_fattn_mma_get_nthreads<preserve_cand>      (DKQ, DV, ncols, cc);
     const int  nbatch_fa      = ggml_cuda_fattn_mma_get_nbatch_fa<preserve_cand>     (DKQ, DV, ncols, type_K, cc); // [#39] per K type
@@ -84,9 +79,6 @@ static void ggml_cuda_flash_attn_ext_mma_turbo_case_impl(ggml_backend_cuda_conte
 
     float logit_softcap;
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
-    if constexpr (early_v) {
-        ggml_ledger_addf("cuda.fattn.early_v", 1, "cols=%dx%d,compact=%d,softcap=%d", ncols1, ncols2, compact_q5g6, logit_softcap != 0.0f);
-    }
 
 #if defined(GGML_USE_HIP)
     using fattn_kernel_ptr_t = const void*;

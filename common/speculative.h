@@ -115,6 +115,9 @@ bool common_speculative_get_resume_state(common_speculative * spec, llama_seq_id
 bool common_speculative_set_resume_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);
 
 
+// Restore a snapshot only if the current implementation accepts its complete state.
+bool common_speculative_restore_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);
+
 // print statistics about the speculative decoding
 void common_speculative_print_stats(const common_speculative * spec);
 

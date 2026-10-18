@@ -5,7 +5,6 @@
 #include "vecdotq.cuh"
 #include "turbo-quant.cuh"
 #include "fattn-query-layout.cuh"
-#include "ledger.cuh"
 #include "fattn-sjkvarn-rot.cuh"
 
 #include <cstdint>
@@ -1749,20 +1748,6 @@ void launch_fattn(
         }
     }
 
-    if ((need_f16_K && K->type != GGML_TYPE_F16) || (need_f16_V && V->type != GGML_TYPE_F16)) {
-        // fallback ledger: a quantized K/V cache converted to a full f16 copy before the kernel
-        const ggml_type Kc = need_f16_K ? K->type : GGML_TYPE_F16;
-        const ggml_type Vc = need_f16_V && !V_is_K_view ? V->type : GGML_TYPE_F16;
-        const uint64_t id = ggml_cuda_ledger_mix(ggml_cuda_ledger_mix(ggml_cuda_ledger_mix(
-            (uint64_t) Kc, (uint64_t) Vc), (uint64_t) ggml_cuda_ledger_width_bucket(Q->ne[1])), (uint64_t) (f16_extra.K != 0 || f16_extra.V != 0));
-        ggml_cuda_ledger_count("cuda.fattn", id, [&](char * buf, size_t size) {
-            char w[16];
-            ggml_cuda_ledger_width_str(Q->ne[1], w, sizeof(w));
-            snprintf(buf, size, "f16_convert K=%s V=%s n_q=%s scratch=%s", ggml_type_name(Kc), ggml_type_name(Vc), w,
-                f16_extra.K != 0 || f16_extra.V != 0 ? "reserved" : "pool");
-        });
-    }
-
     if (need_f16_K && K->type != GGML_TYPE_F16) {
         const size_t bs = ggml_blck_size(K->type);
         const size_t ts = ggml_type_size(K->type);
@@ -2040,9 +2025,6 @@ void launch_fattn(
             const dim3 block_dim_combine(DV, 1, 1);
             const dim3 blocks_num_combine = {(unsigned)ntiles_dst, ncols1, ncols2};
 
-            if constexpr (compact_q5g6) {
-                ggml_ledger_add("cuda.fattn.fixup", "q5g6_uniform", 1);
-            }
             flash_attn_stream_k_fixup_uniform<DV, ncols1, ncols2, compact_q5g6>
                 <<<blocks_num_combine, block_dim_combine, 0, main_stream>>>
                 ((float *) KQV->data, dst_tmp_meta.ptr,
@@ -2060,9 +2042,6 @@ void launch_fattn(
             const dim3 block_dim_combine(DV, 1, 1);
             const dim3 blocks_num_combine = {blocks_num.x, ncols1, ncols2};
 
-            if constexpr (compact_q5g6) {
-                ggml_ledger_add("cuda.fattn.fixup", "q5g6_general", 1);
-            }
             flash_attn_stream_k_fixup_general<DV, ncols1, ncols2, compact_q5g6>
                 <<<blocks_num_combine, block_dim_combine, 0, main_stream>>>
                 ((float *) KQV->data, dst_tmp_meta.ptr,

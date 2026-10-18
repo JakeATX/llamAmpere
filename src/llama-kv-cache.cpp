@@ -7,7 +7,6 @@
 #include "llama-context.h"
 
 #include <algorithm>
-#include <atomic>
 #include <cassert>
 #include <cmath>
 #include <cstdlib>
@@ -3756,32 +3755,6 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
 
     //const int64_t t_start = ggml_time_us();
 
-    // LLAMA_KQ_MASK_FAST_VERIFY=1: rebuild every fast mask with the general loop and abort on any difference, and
-    // report (at WARN, so the server prints it) how many masks took the fast path and why any did not
-    static const bool fast_verify = [] {
-        const char * e = getenv("LLAMA_KQ_MASK_FAST_VERIFY");
-        return e != nullptr && atoi(e) != 0;
-    }();
-    static std::atomic<uint64_t> n_fast_checked{0};
-    static std::atomic<uint64_t> n_fast_fallback{0};
-
-    if (fast_verify && kq_mask_fast_enabled()) {
-        const bool shape_ok = n_stream == 1 && causal_attn && swa_type == LLAMA_SWA_TYPE_NONE && !hparams.use_alibi && n_tokens > 0;
-        bool owns = false;
-        if (shape_ok) {
-            const auto & c = v_cells.at(seq_to_stream[ubatch->seq_id[0][0]]);
-            owns = c.seq_covers_used(ubatch->seq_id[0][0]);
-        }
-        if (!shape_ok || !owns) {
-            const uint64_t n = ++n_fast_fallback;
-            if (n <= 8 || (n & (n - 1)) == 0) {
-                LLAMA_LOG_WARN("%s: KQ mask general path #%llu: n_stream = %lld, causal = %d, swa = %d, alibi = %d, n_tokens = %u, n_kv = %lld, seq owns used cells = %d\n",
-                        __func__, (unsigned long long) n, (long long) n_stream, (int) causal_attn, (int) swa_type, (int) hparams.use_alibi,
-                        n_tokens, (long long) n_kv, (int) owns);
-            }
-        }
-    }
-
     if (n_stream == 1 && causal_attn && swa_type == LLAMA_SWA_TYPE_NONE && !hparams.use_alibi && n_tokens > 0 &&
             kq_mask_fast_enabled()) {
         const llama_seq_id seq_id = ubatch->seq_id[0][0];
@@ -3798,28 +3771,6 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
                 set_input_kq_mask_seq_prefix<float>(cells, ubatch, n_kv, (float *) dst->data);
             }
 
-            if (fast_verify) {
-                const size_t nbytes = ggml_nbytes(dst);
-                std::vector<uint8_t> fast((const uint8_t *) dst->data, (const uint8_t *) dst->data + nbytes);
-                const args_set_input_kq_mask args = { hparams, ubatch, v_cells, seq_to_stream, n_swa, swa_type, n_kv, n_stream, n_tps };
-                if (dst->type == GGML_TYPE_F16) {
-                    set_input_kq_mask_impl<ggml_fp16_t>(args, (ggml_fp16_t *) dst->data, causal_attn);
-                } else {
-                    set_input_kq_mask_impl<float>(args, (float *) dst->data, causal_attn);
-                }
-                const size_t nrow = (size_t) n_kv*ggml_element_size(dst);
-                for (uint32_t i = 0; i < n_tokens; ++i) {
-                    if (memcmp(fast.data() + i*nrow, (const uint8_t *) dst->data + i*nrow, nrow) != 0) {
-                        GGML_ABORT("KQ mask fast path differs from the general loop (row %u of %u, n_kv = %lld, pos = %d)",
-                                i, n_tokens, (long long) n_kv, ubatch->pos[i]);
-                    }
-                }
-                const uint64_t n = ++n_fast_checked;
-                if ((n & (n - 1)) == 0) {
-                    LLAMA_LOG_WARN("%s: KQ mask fast path verified identical on %llu ubatches (this one: n_kv = %lld, n_tokens = %u; general-path masks so far: %llu)\n",
-                            __func__, (unsigned long long) n, (long long) n_kv, n_tokens, (unsigned long long) n_fast_fallback.load());
-                }
-            }
             return;
         }
     }
@@ -4156,7 +4107,10 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
         return;
     }
 
-    GGML_UNUSED(flags);
+    // [EVALFLAG] keep the cell layout of the sequence: masked SWA cells are saved too, and each cell's index and the
+    // stream head follow the cell count, so the load puts every cell back where it was and attention sums over the
+    // cells in the same order as before the save
+    const bool keep_layout = (flags & LLAMA_STATE_SEQ_FLAGS_KEEP_LAYOUT) && seq_id != -1;
 
     io.write(&n_stream, sizeof(n_stream));
 
@@ -4178,7 +4132,7 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
             add_cell = add_cell && (seq_id == -1 || cells.seq_has(i, seq_id));
 
             // check the cell is not SWA-masked
-            if (add_cell && seq_id != -1) {
+            if (add_cell && seq_id != -1 && !keep_layout) {
                 const bool is_masked = cells.pos_get(i) >= (llama_pos) n_swa_sink &&
                     llama_hparams::is_masked_swa(n_swa, swa_type, cells.pos_get(i), cells.seq_pos_max(seq_id));
 
@@ -4214,6 +4168,16 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
         // skip empty streams
         if (cell_count == 0) {
             continue;
+        }
+
+        if (keep_layout) {
+            const uint32_t head_w = v_heads[s];
+            io.write(&head_w, sizeof(head_w));
+            for (const auto & range : cr.data) {
+                for (uint32_t i = range.first; i < range.second; ++i) {
+                    io.write(&i, sizeof(i));
+                }
+            }
         }
 
         state_write_meta(io, cr, seq_id);
@@ -4256,8 +4220,6 @@ const slot_info_vec_t *   sinfos_in) {
             "streaming is active (--kv-stream-arena-mib)");
     }
 
-    GGML_UNUSED(flags);
-
     if (sj_kvarn.enabled()) {
         if (sinfos_in) {
             throw std::runtime_error("SJ-KVaRN cache: an SJ-KVaRN cache cannot mirror another cache's restored layout");
@@ -4296,8 +4258,16 @@ const slot_info_vec_t *   sinfos_in) {
 
     uint32_t n_stream_cur;
     io.read(&n_stream_cur, sizeof(n_stream_cur));
-    if (n_stream_cur != n_stream) {
+    // [EVALFLAG] a single sequence goes to its own stream whatever stream it was saved from, so its state also loads
+    // into a cache with another stream count (another --parallel / --kv-unified); a whole-context restore still needs
+    // the same layout. A mirrored pair (indexer cache) keys its slot infos by the stream the sequence lands in, so
+    // both caches of the pair agree for any saved stream count
+    const bool single_seq = seq_id != -1;
+    if (n_stream_cur != n_stream && !single_seq) {
         throw std::runtime_error("n_stream mismatch");
+    }
+    if (n_stream_cur == 0 || n_stream_cur > LLAMA_MAX_SEQ) {
+        throw std::runtime_error("failed to restore kv cache: bad stream count");
     }
 
     // a whole-context restore replaces every stream, so the cache is emptied once here. clear()
@@ -4309,26 +4279,40 @@ const slot_info_vec_t *   sinfos_in) {
 
     // the mirrored layout is keyed by the stream the cells land in (for one sequence: that sequence's stream,
     // whichever stream the file held it in), so the two caches agree even when the file came from another sequence
+    // or from a server with another stream count
     bool mirror_used = false;
 
-    for (uint32_t s = 0; s < n_stream; ++s) {
+    for (uint32_t s = 0; s < n_stream_cur; ++s) {
         uint32_t cell_count;
         io.read(&cell_count, sizeof(cell_count));
 
+        const uint32_t strm = seq_id == -1 ? s : seq_to_stream[seq_id];
+
         if (cell_count == 0) {
             // a mirrored cache must be empty here as well, or the two no longer agree cell for cell
-            if (seq_id == -1 && sinfos_in && !(*sinfos_in)[s].empty()) {
+            // (one sequence: the other streams of the file are empty, checked after the loop instead)
+            if (seq_id == -1 && sinfos_in && !(*sinfos_in)[strm].empty()) {
                 throw std::runtime_error("failed to restore kv cache: mirrored cache holds cells this one does not");
             }
             continue;
         }
 
-        const uint32_t strm = seq_id == -1 ? s : seq_to_stream[seq_id];
-
         slot_info sinfo;
 
+        // [EVALFLAG] the saved cell layout (see state_write)
+        std::vector<uint32_t> layout;
+        uint32_t layout_head = 0;
+        if ((flags & LLAMA_STATE_SEQ_FLAGS_KEEP_LAYOUT) && seq_id != -1) {
+            io.read(&layout_head, sizeof(layout_head));
+            layout.resize(cell_count);
+            for (uint32_t i = 0; i < cell_count; ++i) {
+                io.read(&layout[i], sizeof(layout[i]));
+            }
+        }
+
         bool res = true;
-        res = res && state_read_meta(io, strm, cell_count, sinfo, seq_id, sinfos_in ? &(*sinfos_in)[strm] : nullptr);
+        res = res && state_read_meta(io, strm, cell_count, sinfo, seq_id, sinfos_in ? &(*sinfos_in)[strm] : nullptr,
+                layout.empty() ? nullptr : &layout, layout_head);
         mirror_used = true;
 
         try {
@@ -4696,7 +4680,7 @@ uint32_t llama_kv_cache::state_read_sj_kvarn(llama_io_read_i & io, llama_seq_id 
     const uint32_t B = st[0], B_prev = st[1], sj_N = st[2];
     const bool draining = st[3] != 0;
     const uint32_t R = version >= 2 ? st[4] : B; // first saved ring position
-    if (B < S || (B - S) % G != 0 || (B > S && B > n) || B_prev < S || B_prev > B ||
+    if (B < S || (B - S) % G != 0 || (B > S && B > n) || B_prev < S || B_prev > B || (B_prev - S) % G != 0 || sj_N > cells.size() || st[3] > 1 ||
             R > B || (R < B && (R < S || (R - S) % G != 0))) {
         throw std::runtime_error("SJ-KVaRN cache: corrupt state (sealed end " + std::to_string(B) + ", " + std::to_string(n) + " cells)");
     }
@@ -4939,7 +4923,8 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
     }
 }
 
-bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id, const slot_info * sinfo_in) {
+bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id, const slot_info * sinfo_in,
+        const std::vector<uint32_t> * layout, uint32_t layout_head) {
     auto & cells = v_cells[strm];
     auto & head  = v_heads[strm];
 
@@ -5030,7 +5015,26 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
                 }
             }
         } else {
-            sinfo = find_slot(ubatch, false);
+            // [EVALFLAG] put the cells back at their saved indices when all of them are free in this stream
+            bool use_layout = layout != nullptr && layout->size() == cell_count && layout_head <= cells.size();
+            for (uint32_t i = 0; use_layout && i < cell_count; ++i) {
+                const uint32_t idx = (*layout)[i];
+                use_layout = idx < cells.size() && cells.is_empty(idx) && (i == 0 || idx > (*layout)[i - 1]);
+            }
+
+            if (use_layout) {
+                sinfo = {};
+                sinfo.s0 = strm;
+                sinfo.s1 = strm;
+                sinfo.resize(1);
+                sinfo.strm[0] = strm;
+                sinfo.idxs[0] = *layout;
+            } else {
+                if (layout != nullptr) {
+                    LLAMA_LOG_WARN("%s: the saved cell layout does not fit this cache, the cells are placed anew\n", __func__);
+                }
+                sinfo = find_slot(ubatch, false);
+            }
             if (sinfo.empty()) {
                 LLAMA_LOG_ERROR("%s: failed to find %d available cells in kv cache\n", __func__,  cell_count);
                 return false;
@@ -5048,6 +5052,10 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
         // is what the whole-context path below already does.
         for (uint32_t i = 0; i < (uint32_t) exts.size(); ++i) {
             cells.ext_set(sinfo.idxs[0][i], exts[i]);
+        }
+
+        if (layout != nullptr && layout_head <= cells.size() && sinfo.idxs[0] == *layout) {
+            head = layout_head;
         }
 
         LLAMA_LOG_DEBUG("%s: cell_count = %d, dest_seq_id = %d\n", __func__, cell_count, dest_seq_id);

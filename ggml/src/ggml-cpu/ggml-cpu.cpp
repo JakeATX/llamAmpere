@@ -451,6 +451,11 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
                 op->type != GGML_TYPE_IQ1_S   &&
                 op->type != GGML_TYPE_IQ1_M; // missing type_traits.from_float
         case GGML_OP_MUL_MAT:
+            if (ggml_ai4_rate(src0->type) != 0) {
+                // reference path only (slab dequantize + f32 dot): 2-D weights, f32 activations
+                return src1->type == GGML_TYPE_F32 && src0->ne[2] == 1 && src0->ne[3] == 1 &&
+                       src0->ne[0] % (ggml_ai4_is_unit(src0->type) ? 128 : 1024) == 0 && src0->ne[1] % 16 == 0;
+            }
             if (ggml_get_op_params_i32(op, 1) == GGML_HINT_SRC0_IS_HADAMARD &&
                 src0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32) {
                 return src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16;
@@ -459,6 +464,13 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
             return src1->type == GGML_TYPE_F32 ||
                    src1->type == ggml_get_type_traits_cpu(src0->type)->vec_dot_type ||
                    (src1->type == GGML_TYPE_BF16 && ggml_get_type_traits_cpu(src0->type)->vec_dot_type == GGML_TYPE_F32);
+        case GGML_OP_MUL_MAT_ID:
+            if (ggml_ai4_rate(src0->type) != 0) {
+                // slab reference path: 3-D expert stack, f32 activations
+                return src1->type == GGML_TYPE_F32 && src0->ne[3] == 1 &&
+                       src0->ne[0] % (ggml_ai4_is_unit(src0->type) ? 128 : 1024) == 0 && src0->ne[1] % 16 == 0;
+            }
+            return true;
         case GGML_OP_SOFT_MAX_BACK: {
             if (op->src[0]->type != GGML_TYPE_F32 || op->src[1]->type != GGML_TYPE_F32) {
                 return false;

@@ -20,8 +20,6 @@
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
-#include "ggml-ledger.h"
-
 #include <cassert>
 #include <cmath>
 #include <cstdlib>
@@ -5023,12 +5021,10 @@ static const char * draft_vocab_fallback_name(int reason) {
 ggml_tensor * llm_graph_context::draft_vocab_fallback(int reason, const char * detail) const {
     // a reserve graph places its output rows on placeholder sequences, and the draft's backend sampler is attached
     // only after the context (and its first reserve) exists: a missing sampler there says nothing about decode,
-    // so it is neither counted as a fallback nor warned about. A real decode graph without a sampler still warns.
+    // so it is not warned about. A real decode graph without a sampler still warns.
     if (is_reserve && reason == DRAFT_VOCAB_FALLBACK_NO_BACKEND_SAMPLER) {
-        ggml_ledger_addf("llama.draft_vocab", 1, "reserve_full_head reason=%s", draft_vocab_fallback_name(reason));
         return nullptr;
     }
-    ggml_ledger_addf("llama.draft_vocab", 1, "full_head reason=%s", draft_vocab_fallback_name(reason));
     const uint32_t bit = 1u << reason;
     if (draft_vocab_warned == nullptr || (draft_vocab_warned->fetch_or(bit) & bit) == 0) {
         LLAMA_LOG_WARN("%s: draft vocabulary shortlist not applied (%s%s%s), the draft scores the full head; "
@@ -5044,7 +5040,6 @@ ggml_tensor * llm_graph_context::build_draft_vocab_compact(
         ggml_tensor * cur) const {
     const int64_t n_sel = draft_vocab_compact->ne[1];
     GGML_ASSERT(n_sel == draft_vocab_ids->ne[0] && draft_vocab_compact->ne[0] == head_w->ne[0]);
-    ggml_ledger_addf("llama.draft_vocab", 1, "compact type=%s n_sel=%lld", ggml_type_name(draft_vocab_compact->type), (long long) n_sel);
 
     ggml_tensor * x = cur;
     if (ggml_exl3_bits(head_w->type) != 0) {
@@ -5109,7 +5104,6 @@ ggml_tensor * llm_graph_context::build_draft_vocab_logits(
     }
 
     const int64_t n_sel = draft_vocab_ids->ne[0];
-    ggml_ledger_addf("llama.draft_vocab", 1, "shortlist n_sel=%lld", (long long) n_sel);
 
     // each vocabulary row is a one-row expert of the existing head: no second weight matrix
     ggml_tensor * rows = ggml_reshape_3d(ctx0, head_w, head_w->ne[0], 1, head_w->ne[1]);
@@ -5162,7 +5156,6 @@ ggml_tensor * llm_graph_context::build_draft_vocab_logits_chain(
     }
 
     const int64_t n_sel = draft_vocab_ids->ne[0];
-    ggml_ledger_addf("llama.draft_vocab", 1, "chain_shortlist n_sel=%lld", (long long) n_sel);
 
     ggml_tensor * rows   = ggml_reshape_3d(ctx0, head_w, head_w->ne[0], 1, head_w->ne[1]);
     ggml_tensor * logits = ggml_reshape_2d(ctx0, ggml_mul_mat_id(ctx0, rows, cur, draft_vocab_ids), n_sel, 1);

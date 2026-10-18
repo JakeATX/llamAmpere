@@ -181,6 +181,9 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-prompt-cache-disk.cpp)
     target_include_directories(test-prompt-cache-disk PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-prompt-cache-disk PRIVATE server-context)
+    llama_build_and_test(test-eval-cache.cpp)
+    target_include_directories(test-eval-cache PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+    target_link_libraries(test-eval-cache PRIVATE server-context)
     llama_build_and_test(test-json-schema-to-grammar.cpp)
 
     if (NOT GGML_BACKEND_DL)
@@ -211,6 +214,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # llama_build_and_test(test-double-float.cpp) # SLOW
 
     llama_build(test-llama-archs.cpp)
+    llama_build_and_test(test-mtp-state.cpp)
 
     set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
     file(MAKE_DIRECTORY "${MODEL_DIR}")

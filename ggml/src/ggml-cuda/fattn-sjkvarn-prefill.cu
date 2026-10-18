@@ -312,10 +312,6 @@ bool ggml_cuda_flash_attn_ext_sj_kvarn_prefill(ggml_backend_cuda_context & ctx, 
         scratch_pool.alloc(2*kv_elements + output_bytes/sizeof(half));
 
     float * output = grouped ? (float *) (scratch_ptr + 2*kv_elements) : (float *) dst->data;
-    static const bool trace = [] {
-        const char * value = getenv("GGML_SJKVARN_PREFILL_TRACE");
-        return value != nullptr && value[0] == '1';
-    }();
 
     if (plan.chunked) {
         // [TRPF] KV chunks: expand positions [c0, c0 + cn) of every KV head, run the f16 MMA kernel in partial mode on
@@ -331,10 +327,6 @@ bool ggml_cuda_flash_attn_ext_sj_kvarn_prefill(ggml_backend_cuda_context & ctx, 
         float2 * acc_meta = (float2 *) (tail + GGML_PAD(plan.parts_bytes, 128) + GGML_PAD(plan.meta_bytes, 128));
         float  * acc      = (float *) dst->data;
         const ggml_tensor * mask = dst->src[3];
-        if (trace) {
-            GGML_LOG_INFO("SJ-KVaRN prefill: queries=%lld positions=%d kv_heads=%d chunk=%d work_q=%d scratch=%zu KiB chunked%s\n",
-                (long long) Q->ne[1], n_kv, heads, chunk_kv, plan.work_q, plan.scratch_bytes/1024, reserved ? " reserved" : " pool");
-        }
         for (int c0 = 0; c0 < n_kv; c0 += chunk_kv) {
             const int cn = std::min(chunk_kv, n_kv - c0);
             const size_t elements = size_t(cn)*256*heads;
@@ -467,11 +459,6 @@ bool ggml_cuda_flash_attn_ext_sj_kvarn_prefill(ggml_backend_cuda_context & ctx, 
             }
         }
 
-        if (trace) {
-            GGML_LOG_INFO("SJ-KVaRN prefill: queries=%lld positions=%d kv_heads=%d first_head=%d scratch=%zu KiB%s%s\n",
-                (long long) Q->ne[1], n_kv, heads, head_first,
-                (2*kv_elements*sizeof(half) + output_bytes)/1024, grouped ? " grouped" : "", reserved ? " reserved" : " pool");
-        }
         if (gqa > 4) {
             ggml_cuda_flash_attn_ext_mma_f16_case<256, 256, 8, 8>(ctx, &out);
         } else if (gqa > 2) {

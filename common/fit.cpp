@@ -31,6 +31,11 @@ class common_params_fit_exception : public std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
+// no placement can fit: even with no layers on a device, its compute buffers and caches exceed its free memory
+class common_params_fit_no_room : public std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
 const char * common_moe_cache_tensor_override_pattern() {
     return "blk\\.\\d+\\.ffn_(up|down|gate_up|gate)_(ch|)exps";
 }
@@ -1150,6 +1155,11 @@ static void common_params_fit_impl(
         LOG_TRC(
             "%s:   - %s: %2" PRIu32 " layers, %6" PRId64 " MiB used, %6" PRId64 " MiB free\n",
             __func__, dev_names[id].c_str(), ngl_per_device[id].n_layer, mem[id]/MiB, projected_margin/MiB);
+        if (ngl_per_device[id].n_layer == 0 && projected_margin < 0) {
+            throw common_params_fit_no_room(dev_names[id] + " would need " + std::to_string(mem[id]/MiB) +
+                " MiB with every layer's weights in system memory, but has " + std::to_string(dmds_full[id].free/MiB) +
+                " MiB free: the compute buffers and caches alone do not fit (a draft or MTP model counts too); lower -ub, -b or -c");
+        }
     }
 
     if (hp_nex > 0 && global_surplus_cpu_moe > 0 && moe_cache &&
@@ -1555,6 +1565,9 @@ enum common_params_fit_status common_fit_params(
     try {
             common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, moe_cache, margins, n_ctx_min, extra, log_level);
         LOG_TRC("%s: successfully fit params to free device memory\n", __func__);
+    } catch (const common_params_fit_no_room & e) {
+        LOG_ERR("%s: no placement fits in device memory: %s\n", __func__, e.what());
+        status = COMMON_PARAMS_FIT_STATUS_NO_ROOM;
     } catch (const common_params_fit_exception & e) {
         LOG_WRN("%s: failed to fit params to free device memory: %s\n", __func__, e.what());
         status = COMMON_PARAMS_FIT_STATUS_FAILURE;

@@ -59,6 +59,9 @@ enum ggml_moe_cache_mode {
 struct ggml_moe_cache_api {
     const void * owner;
 
+    // Read-only startup status; returns 1 for an active session, 0 for dormant.
+    int (*session_status)(void * session, size_t * allocated_bytes);
+
     int (*query_config)(int automatic, size_t budget_mib, struct ggml_moe_cache_config * config);
     int (*query_device)(void * device, const struct ggml_moe_cache_config * config, struct ggml_moe_cache_device_caps * caps);
     int (*query_shape)(int wtype, int64_t n_in, int64_t n_out, int64_t n_expert, size_t expert_size, struct ggml_moe_cache_shape_caps * caps);
@@ -191,6 +194,7 @@ GGML_API struct ggml_moe_cache_api ggml_moe_cache_get(const void * owner);
 // executes a graph with a cache session; falls back to the first registered
 // provider for direct CPU users.
 GGML_API struct ggml_moe_cache_api ggml_moe_cache_active(void);
+GGML_API int ggml_backend_sched_moe_cache_status(ggml_backend_sched_t sched, size_t * allocated_bytes);
 GGML_API void ggml_backend_sched_set_moe_cache(
         ggml_backend_sched_t sched, enum ggml_moe_cache_mode mode, size_t budget_mib);
 

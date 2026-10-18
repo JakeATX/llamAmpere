@@ -1442,6 +1442,10 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             throw std::runtime_error(
                 "failed to fit parameters to device memory (hard error); retry with -fit off");
         }
+        if (fit_status == COMMON_PARAMS_FIT_STATUS_NO_ROOM) {
+            throw std::runtime_error(
+                "not enough device memory for these settings, even with every layer in system memory (see the fit message above)");
+        }
         if (fit_status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
             COM_ERR("%s", "fit could not prove a viable placement; restoring the pre-fit parameters\n");
             mparams = mparams_before;
