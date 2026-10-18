@@ -3207,6 +3207,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
     add_opt(common_arg(
+        {"--moe-prefetch"}, "off|auto|1|2|3",
+        "predict future MoE routes on the GPU and stage uncached experts behind demand copies (default: off)",
+        [](common_params & params, const std::string & value) {
+            if (value == "off") {
+                params.moe_prefetch = 0;
+            } else if (value == "auto") {
+                params.moe_prefetch = -1;
+            } else if (value == "1" || value == "2" || value == "3") {
+                params.moe_prefetch = value[0] - '0';
+            } else {
+                throw std::invalid_argument("moe-prefetch must be off, auto, 1, 2, or 3");
+            }
+        }
+    ).set_env("LLAMA_ARG_MOE_PREFETCH"));
+    add_opt(common_arg(
         {"--moe-cache"}, "MODE",
         "adaptively cache the hottest CPU-resident MoE experts in spare VRAM "
         "(default: auto; auto = preserve weight repacking; on = automatic budget without weight repacking; "

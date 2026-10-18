@@ -1,7 +1,9 @@
 #include "ggml.h"
 #include "ggml-backend.h"
+#include "ggml-cpu.h"
 #include "../ggml/src/ggml-backend-impl.h"
 #include "../ggml/src/ggml-backend-moe-cache.h"
+#include "../ggml/src/ggml-moe-prefetch.h"
 
 #ifdef GGML_CUDA
 #include <cuda_runtime.h>
@@ -3462,6 +3464,62 @@ static bool run_prompt_cache_lending(ggml_backend_t gpu, ggml_backend_t cpu, log
     return ok;
 }
 
+static bool run_prefetch_router(ggml_backend_t gpu, ggml_backend_t cpu) {
+    bool ok = true;
+    for (int activation = 0; activation < 3; ++activation) {
+        std::vector<int32_t> reference;
+        for (auto backend : {cpu, gpu}) {
+            ggml_init_params params = {64 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true};
+            auto * ctx = ggml_init(params);
+            auto * router = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 256, 512);
+            auto * hidden = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 256, 1);
+            auto * bias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 512);
+            auto * scores = ggml_mul_mat(ctx, router, hidden);
+            if (activation == 0) {
+                scores = ggml_sigmoid(ctx, scores);
+            } else if (activation == 1) {
+                scores = ggml_soft_max(ctx, scores);
+            } else {
+                scores = ggml_sqrt(ctx, ggml_softplus(ctx, scores));
+            }
+            scores = ggml_add(ctx, scores, bias);
+            auto * ids = ggml_cont(ctx, ggml_argsort_top_k(ctx, scores, 32));
+            auto * graph = ggml_new_graph(ctx);
+            ggml_build_forward_expand(graph, ids);
+            auto buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+            if (!buffer) {
+                ggml_free(ctx);
+                return false;
+            }
+            std::vector<float> weights(256 * 512);
+            for (int expert = 0; expert < 512; ++expert) {
+                std::fill(weights.begin() + expert * 256, weights.begin() + (expert + 1) * 256,
+                          (expert - 256) / 256.0f);
+            }
+            std::vector<float> input(256, 1.0f / 256.0f);
+            std::vector<float> correction(512, 0.0f);
+            ggml_backend_tensor_set(router, weights.data(), 0, weights.size() * sizeof(float));
+            ggml_backend_tensor_set(hidden, input.data(), 0, input.size() * sizeof(float));
+            ggml_backend_tensor_set(bias, correction.data(), 0, correction.size() * sizeof(float));
+            ok &= ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS;
+            std::vector<int32_t> actual(32);
+            ggml_backend_tensor_get(ids, actual.data(), 0, actual.size() * sizeof(int32_t));
+            for (int rank = 0; rank < 32; ++rank) {
+                ok &= actual[rank] == 511 - rank;
+            }
+            if (backend == cpu) {
+                reference = actual;
+            } else {
+                ok &= actual == reference;
+            }
+            ggml_backend_buffer_free(buffer);
+            ggml_free(ctx);
+        }
+    }
+    printf("cache-prefetch-router: %s\n", ok ? "OK" : "FAIL");
+    return ok;
+}
+
 // Run a test only when the provider supports the behavior it checks; on
 // other providers print a skip line so CI shows the coverage gap explicitly.
 static bool run_optional(
@@ -3475,7 +3533,34 @@ static bool run_optional(
 
 } // namespace
 
-int main() {
+static bool test_prefetch_budget() {
+    bool ok = ggml_moe_prefetch_budget(100.0, 20.0, 25000.0) == 1500000;
+    ok &= ggml_moe_prefetch_budget(100.0, 100.0, 25000.0) == 0;
+    ok &= ggml_moe_prefetch_budget(100.0, 101.0, 25000.0) == 0;
+    ok &= ggml_moe_prefetch_budget(100.0, 0.0, 0.0) == 0;
+    ok &= ggml_moe_prefetch_budget(100.0, -1.0, 25000.0) == 0;
+    ok &= ggml_moe_prefetch_budget(std::numeric_limits<double>::infinity(), 0.0, 1.0) == 0;
+    ok &= ggml_moe_prefetch_budget(100.0, 0.0, std::numeric_limits<double>::quiet_NaN()) == 0;
+    ok &= ggml_moe_prefetch_budget(1e100, 0.0, 1e100) == (16u << 20);
+    printf("cache-prefetch-budget: %s\n", ok ? "OK" : "FAIL");
+    return ok;
+}
+
+int main(int argc, char ** argv) {
+    if (!test_prefetch_budget()) {
+        return 1;
+    }
+    if (argc == 2 && strcmp(argv[1], "--prefetch-policy-only") == 0) {
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--prefetch-cpu-only") == 0) {
+        auto cpu = ggml_backend_cpu_init();
+        const bool ok = cpu && run_prefetch_router(cpu, cpu);
+        if (cpu) {
+            ggml_backend_free(cpu);
+        }
+        return ok ? 0 : 1;
+    }
     log_capture capture;
     ggml_log_set(log_callback, &capture);
 
@@ -3502,6 +3587,11 @@ int main() {
         if (cpu) {
             ggml_backend_free(cpu);
         }
+        return 1;
+    }
+    if (!run_prefetch_router(gpu, cpu)) {
+        ggml_backend_free(gpu);
+        ggml_backend_free(cpu);
         return 1;
     }
     ggml_init_params static_params = {
