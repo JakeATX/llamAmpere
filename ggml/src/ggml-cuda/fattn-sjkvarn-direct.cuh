@@ -914,7 +914,8 @@ inline bool ggml_cuda_flash_attn_ext_sj_kvarn_direct_supported_impl(const ggml_t
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
     // The stream pipeline preloads every body strip; split bodies use the mask-gated MMA loader.
-    if (dst->src[5] && dst->src[5]->buffer && ggml_cuda_qsa_resident_is_buft(dst->src[5]->buffer->buft)) {
+    if (dst->src[5] && dst->src[5]->buffer &&
+        ggml_cuda_qsa_resident_is_buft(ggml_backend_buffer_get_type(dst->src[5]->buffer))) {
         return false;
     }
     if (sinks != nullptr || mask == nullptr || Q->ne[1] < 1 || Q->ne[1] > 8 || Q->ne[3] != 1) {
