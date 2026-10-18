@@ -89,6 +89,12 @@ if env.get('GGML_MOE_CACHE_PROFILE_LOAD'):
  profile_copy=O/'expert-profile-input.bin';profile_copy.write_bytes(profile_bytes)
  env.pop('GGML_MOE_CACHE_PROFILE_LOAD',None)
  base+=['--moe-profile',str(profile_copy)]
+if os.environ.get('ARENA_BASELINE')=='1':
+ assert os.environ.get('ARENA_MODE')=='off', 'baseline arena must be off'
+ for flag in ('--moe-arena','--moe-profile'):
+  index=base.index(flag)
+  if flag=='--moe-profile':env['GGML_MOE_CACHE_PROFILE_LOAD']=base[index+1]
+  del base[index:index+2]
 (O/'command.json').write_text(json.dumps(dict(source_commit=build_commit,worktree_commit=worktree_commit,server_sha256=hashlib.sha256(Path(base[0]).read_bytes()).hexdigest(),profile_sha256=profile_sha256,argv=base,env={k:v for k,v in env.items() if k.startswith(('GGML_','LLAMA_','LD_LIBRARY_PATH'))}),indent=2))
 def launch(tag):
  global process,logfile,phase,server_term_sent
@@ -134,6 +140,7 @@ def digest(path):
  with path.open('rb') as f:
   for chunk in iter(lambda:f.read(1024*1024),b''):h.update(chunk)
  return h.hexdigest()
+class QualityComplete(Exception):pass
 try:
  prerequisites=R/'artifacts/gate-prerequisites.json'
  result['prerequisites']=[]
@@ -150,6 +157,12 @@ try:
   assert json.loads((required.parent/'request.json').read_text())['prompt']==json.loads(Path('/mnt/models/stratamatch-home/prompt-ids.json').read_text())[:prompt_n],'prerequisite prompt differs'
   result['prerequisites'].append(dict(result=str(required),sha256=hashlib.sha256(required.read_bytes()).hexdigest()))
  check();launch('cold')
+ if os.environ.get('ARENA_TEACHER')=='1':
+  from quality import measure
+  phase='quality'
+  result.update(measure(post,O,prompt_n))
+  result['status']='passed'
+  raise QualityComplete()
  ids=json.loads(Path('/mnt/models/stratamatch-home/prompt-ids.json').read_text())[:prompt_n];assert len(ids)==prompt_n
  request=dict(id_slot=0,prompt=ids,n_predict=predict_n,temperature=1.0,seed=11,ignore_eos=True,cache_prompt=True,stream=True,return_tokens=True,top_k=40,top_p=.95,min_p=0,repeat_penalty=1.0,samplers=['top_k','top_p','temperature'])
  if arm=='flashnext':request['logit_bias']=[[248044,False],[248046,False],[248063,False],[248064,False],[248065,False]]
@@ -238,6 +251,7 @@ try:
   result['final_valid_restore']=action('restore')[1]
   assert {p.name:dict(bytes=p.stat().st_size,sha256=digest(p)) for p in C.iterdir()}==hashes,'saved files changed'
  result['status']='passed'
+except QualityComplete:pass
 except Exception as e:
  result.update(status='failed',error=repr(e))
  if 'request_start_s' in result:result['partial_request_end_s']=time.monotonic()-start

@@ -32,7 +32,6 @@
   "LLAMA_MTP_UBATCH_REUSE": "0",
   "LLAMA_MTP_CPU_TIMING": "0",
   "LLAMA_CACHE_PHASE_STATS": "0",
-  "LD_LIBRARY_PATH": "/mnt/models/fnship/releases/3f372a1ba/bin",
   "GGML_MOE_CACHE_DEVICE_FUSED": "0",
   "GGML_MOE_CACHE_SKIP_TAIL": "0"
 }

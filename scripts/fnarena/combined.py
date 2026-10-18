@@ -6,7 +6,8 @@ import subprocess
 import sys
 import time
 
-root = Path(__file__).resolve().parents[2]
+root = Path('/mnt/models/fnarena')
+harness = Path(__file__).resolve().parent
 bundle = Path(sys.argv[1]).resolve()
 cell = sys.argv[2]
 assert cell.replace('-', '').isalnum()
@@ -20,8 +21,8 @@ environment = dict(os.environ, SHIP_SERVER=str(bundle / 'bin/llama.cpp-server'),
                    SHIP_RELOAD='1', SHIP_CELL=cell + '-model', SHIP_RESERVE_MB='2560')
 try:
     for name, command in (
-        ('operators', [sys.executable, str(root / 'scripts/fnarena/operators.py'), str(bundle), str(output / 'operators')]),
-        ('model', [sys.executable, str(root / 'scripts/fnarena/gate.py'), 'flashnext']),
+        ('operators', [sys.executable, str(harness / 'operators.py'), str(bundle), str(output / 'operators')]),
+        ('model', [sys.executable, str(harness / 'gate.py'), 'flashnext']),
     ):
         remaining = int(580 - (time.monotonic() - started))
         assert remaining >= 30, 'insufficient lease for next gate'
