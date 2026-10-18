@@ -33,6 +33,20 @@ FAST_ENV = ('LLAMA_B1 LLAMA_QSA_SEL_DIRECT GGML_CUDA_MMQ_ID_CAP '
             'GGML_CUDA_MMID_PAR LLAMA_HC_BF16_ONCE GGML_CUDA_GDN_R16 '
             'GGML_CUDA_CONCAT_TILE GGML_CUDA_NORM_CAST').split()
 
+EXPERT_PROFILE = Path('/mnt/models/fnkvwin/profiles/usage-c11-from-handoff5.bin')
+EXPERT_PROFILE_SHA256 = 'c8c7e08a9330a8ef4c29fbe20994c095ee2907b02050f25bb6ce898a4a574648'
+INFERENCE_ENV = {
+    'LLAMA_MOE_CACHE_RELEASE_PROMPT': '1', 'LLAMA_B1_CACHE_WARM': '1',
+    'LLAMA_B1_LAYER_RESERVE': '1', 'LLAMA_B1_FFN': '0', 'LLAMA_SHARED_COMPUTE': '0',
+    'LLAMA_MTP_DRAFT_COMPUTE_LEAN': '1', 'LLAMA_MTP_OUTPUT_SHRINK': '1',
+    'LLAMA_MTP_EH_BATCH': '1', 'LLAMA_MTP_COMPAT_REUSE': '1',
+    'LLAMA_MTP_UPDATE_KV_ONLY': '1', 'LLAMA_MTP_UBATCH_REUSE': '0',
+    'GGML_CUDA_GDN_R16_COLS': '2', 'GGML_CUDA_GDN_R16_WARPS': '2',
+    'LLAMA_QSA_POOL_RANGE': '1', 'GGML_CUDA_MMQ_ID_CAP': '2',
+    'GGML_CUDA_NORM_CAST_B1_256': '0', 'LLAMA_CACHE_PHASE_STATS': '1',
+    'GGML_MOE_CACHE_DEVICE': '0', 'GGML_MOE_CACHE_DEVICE_FUSED': '0',
+}
+
 
 def model_environment(args, memory_only):
     env = {key: value for key, value in os.environ.items()
@@ -43,8 +57,10 @@ def model_environment(args, memory_only):
                     LD_LIBRARY_PATH=str(args.server.resolve().parent))
     if not memory_only:
         # Return prompt scratch before warming the decode expert cache, in both arms.
-        settings.update(LLAMA_MOE_CACHE_RELEASE_PROMPT='1', LLAMA_B1_CACHE_WARM='1',
-                        LLAMA_B1_LAYER_RESERVE='1')
+        require(hashlib.sha256(EXPERT_PROFILE.read_bytes()).hexdigest() == EXPERT_PROFILE_SHA256,
+                'accepted expert usage profile changed')
+        settings.update(INFERENCE_ENV)
+        settings['GGML_MOE_CACHE_PROFILE_LOAD'] = str(EXPERT_PROFILE)
     env.update(settings)
     return env, settings
 
@@ -262,7 +278,10 @@ class ServerArm:
             command += ['--spec-type', 'none']
         command += getattr(self.args, 'extra_server_args', [])
         env, settings = model_environment(self.args, memory_only)
-        write_json(self.output / 'command.json', {'argv': command, 'environment': settings})
+        metadata = {'argv': command, 'environment': settings}
+        if not memory_only:
+            metadata['expert_usage_profile'] = {'path': str(EXPERT_PROFILE), 'sha256': EXPERT_PROFILE_SHA256}
+        write_json(self.output / 'command.json', metadata)
         self.log = (self.output / 'server.log').open('w')
         self.process = subprocess.Popen(command, env=env, stdout=self.log, stderr=subprocess.STDOUT, start_new_session=True)
         self.thread = threading.Thread(target=self.monitor, daemon=True)
@@ -277,6 +296,10 @@ class ServerArm:
                 pass
             require(time.monotonic() < self.deadline, 'server startup deadline exceeded')
             self.stop.wait(0.5)
+        if not memory_only:
+            startup_log = (self.output / 'server.log').read_text(errors='replace')
+            require('profile loaded:' in startup_log and 'profile rejected:' not in startup_log,
+                    'accepted expert usage profile was not loaded by the runtime')
         write_json(self.output / 'runtime.json', runtime_identity(self.process, self.args.server))
         return time.monotonic() - self.started
 
