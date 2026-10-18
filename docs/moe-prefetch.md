@@ -1,12 +1,12 @@
 # GPU expert prefetch
 
 `--moe-prefetch off|auto|1|2|3` controls speculative expert copies for
-DeepSeek4 decode. The default is `off`. `LLAMA_ARG_MOE_PREFETCH` accepts the
+Qwen4Exp decode. The default is `off`. `LLAMA_ARG_MOE_PREFETCH` accepts the
 same values. This option requires the CUDA expert cache; it does not enable
 expert skipping or change router choices.
 
-After attention, the current layer's normalized FFN input is evaluated by
-the next one to three routers on the GPU. Each router produces up to 32
+After attention, the current layer's mixed FFN input is evaluated by
+the next one to three routers on the GPU. Routers use the model’s softmax activation and produce up to 32
 ranked candidates. For verification batches of up to eight tokens, ranking
 uses each expert's largest score across the batch. The draft context and
 larger batches do not predict.

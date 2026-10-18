@@ -5041,7 +5041,7 @@ bool llama_context::b1_cache_eval(ggml_tensor * tensor, bool ask, void * user_da
     parsed = 0;
     int observed_layer = -1;
     const bool entry = ctx.cparams.moe_prefetch != 0 &&
-        sscanf(tensor->name, "hc_attn_pre-%d%n", &observed_layer, &parsed) == 1 &&
+        sscanf(tensor->name, "moe_prefetch_layer_start-%d%n", &observed_layer, &parsed) == 1 &&
         parsed > 0 && tensor->name[parsed] == '\0' && tensor->ne[1] > 0 && tensor->ne[1] <= 8;
     parsed = 0;
     const size_t max_bytes = 64u << 20;

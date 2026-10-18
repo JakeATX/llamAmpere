@@ -1281,47 +1281,6 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
         cur = build_norm(cur, model.layers[il].ffn_norm, nullptr, LLM_NORM_RMS, il);
         cb(cur, "ffn_norm", il);
 
-        // fork: predictions are side outputs and never feed the model result.
-        if (cparams.moe_prefetch != 0 && n_tokens > 0 && n_tokens <= 8 &&
-                cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT &&
-                strncmp(ggml_backend_dev_name(model.dev_layer(il)), "CUDA", 4) == 0) {
-            const int lead = cparams.moe_prefetch < 0 ? 3 : cparams.moe_prefetch;
-            for (int d = 1; d <= lead && il + d < n_layer; ++d) {
-                const auto & future = model.layers[il + d];
-                if ((uint32_t) (il + d) < hparams.dsv4_hash_layer_count || !future.ffn_gate_inp) {
-                    continue;
-                }
-                auto gpu = [&](ggml_tensor * t) {
-                    cb(t, "moe_prefetch_gpu", il);
-                    return t;
-                };
-                ggml_tensor * scores = gpu(build_lora_mm(future.ffn_gate_inp, cur));
-                switch (hparams.expert_gating_func) {
-                    case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX:
-                        scores = gpu(ggml_soft_max(ctx0, scores)); break;
-                    case LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID:
-                        scores = gpu(ggml_sigmoid(ctx0, scores)); break;
-                    case LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS:
-                        scores = gpu(ggml_sqrt(ctx0, gpu(ggml_softplus(ctx0, scores)))); break;
-                    default: break;
-                }
-                if (future.ffn_exp_probs_b) {
-                    scores = gpu(ggml_add(ctx0, scores, future.ffn_exp_probs_b));
-                }
-                if (n_tokens > 1) {
-                    // Rank each expert's strongest score across the verification batch.
-                    scores = gpu(ggml_cont(ctx0, ggml_transpose(ctx0, scores)));
-                    scores = gpu(ggml_pool_2d(ctx0, scores, GGML_OP_POOL_MAX,
-                            n_tokens, 1, n_tokens, 1, 0, 0));
-                    scores = ggml_reshape_1d(ctx0, scores, n_expert);
-                }
-                ggml_tensor * ids = gpu(ggml_cont(ctx0, gpu(ggml_argsort_top_k(ctx0, scores, std::min<int64_t>(32, n_expert)))));
-                ggml_format_name(ids, "moe_prefetch-%d-%d", il, il + d);
-                ggml_set_output(ids);
-                ggml_build_forward_expand(gf, ids);
-            }
-        }
-
         const auto & layer = model.layers[il];
         ggml_tensor * selected_experts = nullptr;
         ggml_tensor * exp_probs_b = layer.ffn_exp_probs_b;
