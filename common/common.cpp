@@ -1496,7 +1496,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     pimpl->model.reset(model);
 
     if (llama_model_moe_arena_size(model) && !std::getenv("GGML_CUDA_MOE_CACHE_RESERVE_MB")) {
-        common_set_env("GGML_CUDA_MOE_CACHE_RESERVE_MB", "1536");
+        common_set_env("GGML_CUDA_MOE_CACHE_RESERVE_MB", "2560");
     }
     if (llama_model_moe_arena_size(model) && !std::getenv("GGML_CUDA_MOE_CACHE_MIN_EXPERT_KB")) {
         common_set_env("GGML_CUDA_MOE_CACHE_MIN_EXPERT_KB", "1");
