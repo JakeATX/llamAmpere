@@ -4291,6 +4291,19 @@ static bool run_arena_stride(ggml_backend_t gpu, ggml_backend_t cpu,
     ok &= actual == reference;
     ok &= run_prompt_warm(gpu, cpu, weights, graph, reference, capture);
     ok &= run_scenario("cache-arena-stride", nullptr, gpu, cpu, graph, reference, capture);
+#ifdef GGML_CUDA
+    const bool registered = cudaHostRegister(arena, arena_size,
+            cudaHostRegisterPortable | cudaHostRegisterMapped) == cudaSuccess;
+    ok &= registered;
+    if (registered) {
+        ok &= run_device_tables_case(gpu, cpu, weights, capture);
+        unsigned int flags = 0;
+        // Cache/table teardown must leave the model-owned registration alive.
+        ok &= cudaHostGetFlags(&flags, arena) == cudaSuccess;
+        ok &= capture.get().find("new_copy_bytes=0 new_registered_bytes=0") != std::string::npos;
+        ok &= cudaHostUnregister(arena) == cudaSuccess;
+    }
+#endif
     for (int64_t e = 0; e < weights->ne[2]; ++e) {
         for (size_t i = 2 * bytes; i < stride; ++i) { ok &= arena[e * stride + i] == 0xa5; }
     }

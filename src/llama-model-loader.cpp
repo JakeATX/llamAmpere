@@ -1975,13 +1975,20 @@ std::unique_ptr<llama_moe_arena> llama_model_loader::load_moe_arena(llama_progre
                 if (check_tensors && !ggml_validate_row_data(t->type, dst, bytes)) {
                     throw std::runtime_error(format("expert arena tensor '%s' has invalid data", t->name));
                 }
+                // Bound live file pages without leaving one mapped boundary
+                // page per expert or repeatedly scanning a fragmented mapping.
+                constexpr int64_t release_group = 16;
+                if ((e + 1) % release_group == 0 || e + 1 == t->ne[2]) {
 #ifndef _WIN32
-                const size_t first = w.offs + (size_t) e * bytes;
-                if (use_mmap) { mappings.at(w.idx)->unmap_fragment(first, first + bytes); }
-                posix_fadvise(files.at(w.idx)->file_id(), first, bytes, POSIX_FADV_DONTNEED);
+                    const int64_t first_expert = e - e % release_group;
+                    const size_t first = w.offs + (size_t)first_expert * bytes;
+                    const size_t count = (size_t)(e - first_expert + 1) * bytes;
+                    if (use_mmap) { mappings.at(w.idx)->unmap_fragment(first, first + count); }
+                    posix_fadvise(files.at(w.idx)->file_id(), first, count, POSIX_FADV_DONTNEED);
 #endif
-                if (llama_moe_arena::available_memory() < (10ull << 30)) {
-                    throw std::runtime_error("expert arena stopped: less than 10 GiB MemAvailable");
+                    if (llama_moe_arena::available_memory() < (10ull << 30)) {
+                        throw std::runtime_error("expert arena stopped: less than 10 GiB MemAvailable");
+                    }
                 }
             }
             t->nb[2] = stride;
