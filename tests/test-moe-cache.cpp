@@ -4125,6 +4125,133 @@ static bool run_device_argsort_view(ggml_backend_t gpu, ggml_backend_t cpu,
     return ok;
 }
 
+// fork: exercise independent hot/cold gate and up tables through actual CUDA graph replay.
+static bool run_device_fused_tables(ggml_backend_t gpu, ggml_backend_t cpu, log_capture & capture) {
+    auto fusion_count = (int64_t (*)(ggml_backend_t, const char *)) ggml_backend_reg_get_proc_address(
+            ggml_backend_dev_backend_reg(ggml_backend_get_device(gpu)), "ggml_backend_cuda_fusion_count");
+    if (!fusion_count) {
+        return false;
+    }
+    bool ok = true;
+    std::vector<float> importance(n_in, 1.0f);
+    for (const auto type : ggml_moe_cache_types) {
+        if (type == GGML_TYPE_IQ1_M) {
+            continue;
+        }
+        ggml_init_params weight_params = {2 * ggml_tensor_overhead(), nullptr, true};
+        ggml_context * weights_ctx = ggml_init(weight_params);
+        ggml_tensor * weights[] = {
+            ggml_new_tensor_3d(weights_ctx, type, n_in, n_out, n_expert),
+            ggml_new_tensor_3d(weights_ctx, type, n_in, n_out, n_expert),
+        };
+        ggml_set_name(weights[0], "blk.7.ffn_up_exps.weight");
+        ggml_set_name(weights[1], "blk.7.ffn_gate_exps.weight");
+        ggml_backend_buffer_t weights_buffer = ggml_backend_alloc_ctx_tensors(weights_ctx, cpu);
+        ggml_backend_buffer_set_usage(weights_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        std::vector<float> values(n_in * n_out * n_expert);
+        for (int bank = 0; bank < 2; ++bank) {
+            for (size_t i = 0; i < values.size(); ++i) {
+                values[i] = 0.15f * std::sin((float)(i % 997) * (0.017f + bank * 0.013f));
+            }
+            std::vector<uint8_t> quantized(ggml_nbytes(weights[bank]));
+            const float * imatrix = ggml_quantize_requires_imatrix(type) ? importance.data() : nullptr;
+            const size_t bytes = ggml_quantize_chunk(type, values.data(), quantized.data(),
+                    0, n_out * n_expert, n_in, imatrix);
+            ok &= bytes == quantized.size();
+            ggml_backend_tensor_set(weights[bank], quantized.data(), 0, quantized.size());
+        }
+        for (int tokens : {1, 4}) {
+            for (int channels : {1, 2}) {
+                configure_cache(nullptr, "8");
+                set_env("GGML_MOE_CACHE_DEVICE", "1");
+                set_env("GGML_MOE_CACHE_DEVICE_STATS", "1");
+                set_env("GGML_MOE_CACHE_DEVICE_CAPTURE", "1");
+                set_env("GGML_MOE_CACHE_DEVICE_FUSED", "1");
+                capture.clear();
+                ggml_init_params params = {12 * ggml_tensor_overhead(), nullptr, true};
+                ggml_context * input_ctx[] = {ggml_init(params), ggml_init(params)};
+                ggml_backend_t backends[] = {cpu, gpu};
+                ggml_tensor * acts[2];
+                ggml_tensor * ids[2];
+                ggml_backend_buffer_t buffers[2];
+                std::vector<float> activations(n_in * channels * tokens);
+                for (size_t i = 0; i < activations.size(); ++i) {
+                    activations[i] = 0.2f * std::cos((float)i * 0.019f);
+                }
+                std::vector<int32_t> routing(512 * tokens, 63);
+                for (int t = 0; t < tokens; ++t) {
+                    routing[512*t] = t % 3;
+                    routing[512*t + 1] = (t + 1) % 3;
+                }
+                for (int i = 0; i < 2; ++i) {
+                    acts[i] = ggml_new_tensor_3d(input_ctx[i], GGML_TYPE_F32, n_in, channels, tokens);
+                    ggml_tensor * storage = ggml_new_tensor_2d(input_ctx[i], GGML_TYPE_I32, 512, tokens);
+                    ids[i] = ggml_view_2d(input_ctx[i], storage, 2, tokens, storage->nb[1], 0);
+                    buffers[i] = ggml_backend_alloc_ctx_tensors(input_ctx[i], backends[i]);
+                    ggml_backend_tensor_set(acts[i], activations.data(), 0, activations.size() * sizeof(float));
+                    ggml_backend_tensor_set(storage, routing.data(), 0, routing.size() * sizeof(int32_t));
+                }
+                test_graph reference = make_fused_graph(cpu, weights[0], weights[1], acts[0], ids[0]);
+                test_graph candidate = make_fused_graph(gpu, weights[0], weights[1], acts[1], ids[1]);
+                ok &= ggml_backend_graph_compute(cpu, reference.graph) == GGML_STATUS_SUCCESS;
+                std::vector<float> expected(ggml_nelements(reference.out)), actual(expected.size()), first;
+                ggml_backend_tensor_get(reference.out, expected.data(), 0, expected.size() * sizeof(float));
+                const auto api = active_api();
+                void * session = create_direct_session(gpu, cpu);
+                ggml_moe_cache_tensor_desc descriptors[2];
+                std::vector<uint64_t> usage[2] = {std::vector<uint64_t>(n_expert, 0), std::vector<uint64_t>(n_expert, 0)};
+                const uint64_t * counts[] = {usage[0].data(), usage[1].data()};
+                for (int i = 0; i < 2; ++i) {
+                    auto * w = weights[i];
+                    descriptors[i] = {w->name, w->data, w->nb[2], n_in, n_out, n_expert, (int32_t)type};
+                    usage[i][i] = 100;
+                }
+                bool prepared = session && api.warm(session, descriptors, counts, 2) == 2 &&
+                        api.device_prepare(session, descriptors, 2) == 1;
+                ok &= prepared;
+                const int64_t before = fusion_count(gpu, "mul_mat_glu");
+                if (prepared) {
+                    for (int run = 0; run < 80; ++run) {
+                        api.session_enter(session);
+                        ok &= ggml_backend_graph_compute(gpu, candidate.graph) == GGML_STATUS_SUCCESS;
+                        api.session_leave(session);
+                        ggml_backend_tensor_get(candidate.out, actual.data(), 0, actual.size() * sizeof(float));
+                        ok &= compare_output(expected, actual, 5e-4);
+                        if (run == 0) {
+                            first = actual;
+                        } else {
+                            ok &= first == actual;
+                        }
+                    }
+                    ok &= fusion_count(gpu, "mul_mat_glu") > before;
+                }
+                if (session) {
+                    api.session_destroy(session);
+                }
+                const std::string log = capture.get();
+                ok &= max_field_value(log, "dispatches=") == 160;
+                ok &= max_field_value(log, "replays=") >= 8;
+                if (!ok) {
+                    fprintf(stderr, "fused device type=%s tokens=%d channels=%d\n%s", ggml_type_name(type), tokens, channels, log.c_str());
+                }
+                free_graph(candidate);
+                free_graph(reference);
+                for (int i = 0; i < 2; ++i) {
+                    ggml_backend_buffer_free(buffers[i]);
+                    ggml_free(input_ctx[i]);
+                }
+            }
+        }
+        printf("cache-device-fused type=%s: %s\n", ggml_type_name(type), ok ? "OK" : "FAIL");
+        ggml_backend_buffer_free(weights_buffer);
+        ggml_free(weights_ctx);
+    }
+    for (const char * name : {"GGML_MOE_CACHE_DEVICE", "GGML_MOE_CACHE_DEVICE_STATS", "GGML_MOE_CACHE_DEVICE_CAPTURE", "GGML_MOE_CACHE_DEVICE_FUSED"}) {
+        set_env(name, nullptr);
+    }
+    return ok;
+}
+
 // Cover every arithmetic specialization used by the cache table dispatch.
 static bool run_device_tables(ggml_backend_t gpu, ggml_backend_t cpu,
         ggml_tensor * initial_weights, log_capture & capture) {
@@ -4474,6 +4601,9 @@ int main(int argc, char ** argv) {
     ok &= run_invalidation_hook_coverage(cpu);
     ok &= run_optional(provider_is_cuda, "cache-device-tables", [&] {
         return run_device_tables(gpu, cpu, weights, capture);
+    });
+    ok &= run_optional(provider_is_cuda, "cache-device-fused", [&] {
+        return run_device_fused_tables(gpu, cpu, capture);
     });
     ok &= run_optional(provider_is_cuda, "cache-device-host-budget", [&] {
         return run_device_host_budget();

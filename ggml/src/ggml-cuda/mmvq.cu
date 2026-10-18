@@ -1344,7 +1344,7 @@ static __global__ void mul_mat_vec_q_moe(
         const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
         const uint32_t ncols_dst, const uint32_t ids_stride,
         const float up_min, const float up_max, const float gate_min, const float gate_max,
-        const void * const * expert_table) {
+        const void * const * expert_table, const void * const * gate_table) {
     const void    * GGML_CUDA_RESTRICT vx  = vx_ptr;
     const void    * GGML_CUDA_RESTRICT vy  = vy_ptr;
     const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
@@ -1414,7 +1414,12 @@ static __global__ void mul_mat_vec_q_moe(
         vx = expert_table[channel_x];
     }
     const int kbx_offset  = (expert_table && !shared_expert ? 0 : channel_x*stride_channel_x) + row0*stride_row_x;
-    const int gate_kbx_offset = channel_gate*stride_channel_x + row0*stride_row_x;
+    if constexpr (has_fusion) {
+        if (gate_table && !shared_expert) {
+            vgate = gate_table[channel_gate];
+        }
+    }
+    const int gate_kbx_offset = (gate_table && !shared_expert ? 0 : channel_gate*stride_channel_x) + row0*stride_row_x;
 
     // partial sum for each thread
     float tmp[c_rows_per_block] = {0.0f};
@@ -1613,7 +1618,7 @@ static void mul_mat_vec_q_moe_launch(
         const uint32_t ncols_dst, const uint32_t ids_stride,
         const int warp_size, const int nchannels_dst,
         const float up_min, const float up_max, const float gate_min,
-        const float gate_max, cudaStream_t stream, const void * const * expert_table = nullptr) {
+        const float gate_max, cudaStream_t stream, const void * const * expert_table = nullptr, const void * const * gate_table = nullptr) {
 
     constexpr int rows_per_block = 2; // 2 gives best perf based on tuning
     const int64_t nblocks_rows = (nrows_x + rows_per_block - 1) / rows_per_block;
@@ -1625,7 +1630,7 @@ static void mul_mat_vec_q_moe_launch(
         vx, vy, ids, act_ids, gate_ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
         stride_row_x, stride_col_y, stride_col_dst,
         stride_channel_x, stride_channel_y, stride_channel_dst,
-        ncols_dst, ids_stride, up_min, up_max, gate_min, gate_max, expert_table);
+        ncols_dst, ids_stride, up_min, up_max, gate_min, gate_max, expert_table, gate_table);
 }
 
 // Indexed vocabulary rows share one activation vector and never read padded rows.
@@ -2629,6 +2634,58 @@ void ggml_cuda_moe_table_mmv(const void * const * table, ggml_type type,
         default: GGML_ABORT("unsupported mapped expert type");
     }
 #undef MOE_TABLE_CASE
+}
+
+// fork: gate and up keep independent resident/mapped expert address tables.
+template <ggml_type type>
+static void ggml_cuda_moe_table_mmv_fused_t(const void * const * up_table, const void * const * gate_table,
+        const char * act_q8, const int32_t * ids, float * dst,
+        int64_t n_in, int64_t n_out, int64_t n_ids, int64_t n_tokens,
+        int64_t act_channels, int64_t ids_stride, cudaStream_t stream) {
+    ggml_cuda_mm_fusion_args_device fusion{};
+    fusion.gate = gate_table;
+    fusion.glu_op = GGML_GLU_OP_SWIGLU;
+    const int64_t s11 = GGML_PAD(n_in, MATRIX_ROW_PADDING) / QK8_1;
+    mul_mat_vec_q_moe_launch<type, true>(nullptr, act_q8, ids, nullptr, nullptr, fusion, dst,
+            n_in, init_fastdiv_values(act_channels), n_out,
+            ggml_row_size(type, n_in) / ggml_type_size(type), act_channels*s11, n_ids*n_out,
+            0, s11, n_out, n_tokens, ids_stride,
+            ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size, n_ids,
+            0.0f, 0.0f, 0.0f, 0.0f, stream, up_table, gate_table);
+}
+
+void ggml_cuda_moe_table_mmv_fused(const void * const * up_table, const void * const * gate_table, ggml_type type,
+        const char * act_q8, const int32_t * ids, float * dst,
+        int64_t n_in, int64_t n_out, int64_t n_ids, int64_t n_tokens,
+        int64_t act_channels, int64_t ids_stride, cudaStream_t stream) {
+#define MOE_TABLE_FUSED_CASE(T) case T: ggml_cuda_moe_table_mmv_fused_t<T>(up_table, gate_table, act_q8, ids, dst, n_in, n_out, n_ids, n_tokens, act_channels, ids_stride, stream); break
+    switch (type) {
+        MOE_TABLE_FUSED_CASE(GGML_TYPE_Q1_0);
+        MOE_TABLE_FUSED_CASE(GGML_TYPE_Q2_0);
+        MOE_TABLE_FUSED_CASE(GGML_TYPE_Q4_0);
+        MOE_TABLE_FUSED_CASE(GGML_TYPE_Q4_1);
+        MOE_TABLE_FUSED_CASE(GGML_TYPE_Q5_0);
+        MOE_TABLE_FUSED_CASE(GGML_TYPE_Q5_1);
+        MOE_TABLE_FUSED_CASE(GGML_TYPE_Q8_0);
+        MOE_TABLE_FUSED_CASE(GGML_TYPE_MXFP4);
+        MOE_TABLE_FUSED_CASE(GGML_TYPE_NVFP4);
+        MOE_TABLE_FUSED_CASE(GGML_TYPE_Q2_K);
+        MOE_TABLE_FUSED_CASE(GGML_TYPE_Q3_K);
+        MOE_TABLE_FUSED_CASE(GGML_TYPE_Q4_K);
+        MOE_TABLE_FUSED_CASE(GGML_TYPE_Q5_K);
+        MOE_TABLE_FUSED_CASE(GGML_TYPE_Q6_K);
+        MOE_TABLE_FUSED_CASE(GGML_TYPE_IQ2_XXS);
+        MOE_TABLE_FUSED_CASE(GGML_TYPE_IQ2_XS);
+        MOE_TABLE_FUSED_CASE(GGML_TYPE_IQ2_S);
+        MOE_TABLE_FUSED_CASE(GGML_TYPE_IQ3_XXS);
+        MOE_TABLE_FUSED_CASE(GGML_TYPE_IQ3_S);
+        MOE_TABLE_FUSED_CASE(GGML_TYPE_IQ1_S);
+        MOE_TABLE_FUSED_CASE(GGML_TYPE_IQ1_M);
+        MOE_TABLE_FUSED_CASE(GGML_TYPE_IQ4_NL);
+        MOE_TABLE_FUSED_CASE(GGML_TYPE_IQ4_XS);
+        default: GGML_ABORT("unsupported fused mapped expert type");
+    }
+#undef MOE_TABLE_FUSED_CASE
 }
 
 template <ggml_type type>
