@@ -2,6 +2,7 @@
 
 #include "ggml.h"
 #include "ggml-cpu.h"
+#include "../ggml/src/ggml-cpu/quants.h"
 
 #undef NDEBUG
 #include <assert.h>
@@ -9,6 +10,7 @@
 #include <cmath>
 #include <math.h>
 #include <stdio.h>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -328,6 +330,85 @@ static int test_quantize_imatrix_degenerate(bool verbose) {
     return num_failed;
 }
 
+static int test_iq_grouped(bool verbose) {
+    int failed = 0;
+    int checked = 0;
+    uint32_t rng = 1234567;
+    for (ggml_type type : {GGML_TYPE_IQ2_XS, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL}) {
+        const auto * cpu = ggml_get_type_traits_cpu(type);
+        for (int n : {256, 512, 4096, 32, 96, 288}) {
+            if (n % ggml_blck_size(type) != 0) {
+                continue;
+            }
+            std::vector<uint8_t> weights(ggml_row_size(type, n));
+            std::vector<float> input(n);
+            std::vector<uint8_t> inputs[8];
+            const void * rows[8];
+            for (int trial = 0; trial < 16; ++trial) {
+                for (uint8_t & byte : weights) {
+                    rng = 1664525*rng + 1013904223;
+                    byte = rng >> 24;
+                }
+                for (int block = 0; block < n / ggml_blck_size(type); ++block) {
+                    const ggml_fp16_t d = ggml_fp32_to_fp16(0.01f*(trial - 7));
+                    std::memcpy(weights.data() + block*ggml_type_size(type), &d, sizeof(d));
+                }
+                for (int t = 0; t < 8; ++t) {
+                    for (float & value : input) {
+                        rng = 1664525*rng + 1013904223;
+                        value = trial == 0 ? 0.0f : (int(rng >> 16) - 32768)*0.0001f;
+                    }
+                    inputs[t].resize(ggml_row_size(cpu->vec_dot_type, n));
+                    ggml_get_type_traits_cpu(cpu->vec_dot_type)->from_float(input.data(), inputs[t].data(), n);
+                    if (trial == 15) {
+                        if (cpu->vec_dot_type == GGML_TYPE_Q8_K) {
+                            auto * blocks = reinterpret_cast<block_q8_K *>(inputs[t].data());
+                            for (int block = 0; block < n / QK_K; ++block) {
+                                blocks[block].qs[0] = -128;
+                                blocks[block].qs[31] = 127;
+                                for (int j = 0; j < QK_K / 16; ++j) {
+                                    int sum = 0;
+                                    for (int k = 0; k < 16; ++k) { sum += blocks[block].qs[16*j + k]; }
+                                    blocks[block].bsums[j] = sum;
+                                }
+                            }
+                        } else {
+                            auto * blocks = reinterpret_cast<block_q8_0 *>(inputs[t].data());
+                            for (int block = 0; block < n / QK8_0; ++block) {
+                                blocks[block].qs[0] = -128;
+                                blocks[block].qs[31] = 127;
+                            }
+                        }
+                    }
+                    rows[t] = inputs[t].data();
+                }
+                for (int nr = 1; nr <= 8; ++nr) {
+                    float grouped[8];
+                    if (!ggml_vec_dot_iq_grouped(type, n, weights.data(), rows, grouped, nr)) {
+                        if (verbose) {
+                            printf("Grouped IQ dots unavailable on this architecture\n");
+                        }
+                        return 0;
+                    }
+                    for (int t = 0; t < nr; ++t) {
+                        float stock;
+                        cpu->vec_dot(n, &stock, 0, weights.data(), 0, rows[t], 0, 1);
+                        ++checked;
+                        if (std::memcmp(&stock, grouped + t, sizeof(float)) != 0) {
+                            if (failed < 8) {
+                                printf("Grouped %s n=%d nr=%d trial=%d row=%d: stock=%a grouped=%a FAILED\n", ggml_type_name(type), n, nr, trial, t, stock, grouped[t]);
+                            }
+                            ++failed;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    printf("Grouped IQ dots: %d byte-exact comparisons, %d failed\n", checked, failed);
+    return failed;
+}
+
 int main(int argc, char * argv[]) {
     bool verbose = false;
 
@@ -351,6 +432,7 @@ int main(int argc, char * argv[]) {
     num_failed += test_vec_dot_q(verbose);
     num_failed += test_prism_ternary(verbose);
     num_failed += test_quantize_imatrix_degenerate(verbose);
+    num_failed += test_iq_grouped(verbose);
 
     if (num_failed || verbose) {
         printf("%d tests failed\n", num_failed);
