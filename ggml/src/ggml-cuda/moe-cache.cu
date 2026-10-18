@@ -4403,12 +4403,13 @@ static void moe_prefetch_finish(moe_cache_session & session, moe_prefetch_copy &
             copy.expert >= 0 && (size_t) copy.expert < found->second.addresses.size()) {
         auto & table = found->second;
         ggml_cuda_set_device(device.logical);
-        CUDA_CHECK(cudaMemcpy(table.staging_device + copy.expert, &table.addresses[copy.expert],
-                sizeof(void *), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpyAsync(table.staging_device + copy.expert, &table.addresses[copy.expert],
+                sizeof(void *), cudaMemcpyHostToDevice, nullptr));
+        const uint8_t hot = table.addresses[copy.expert] != table.fallback[copy.expert];
         if (table.hot) {
-            const uint8_t hot = table.addresses[copy.expert] != table.fallback[copy.expert];
-            CUDA_CHECK(cudaMemcpy(table.hot + copy.expert, &hot, sizeof(hot), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpyAsync(table.hot + copy.expert, &hot, sizeof(hot), cudaMemcpyHostToDevice, nullptr));
         }
+        CUDA_CHECK(cudaStreamSynchronize(nullptr));
     }
     if (copy.pool >= 0 && copy.pool < (int) device.pools.size()) {
         auto & pool = *device.pools[copy.pool];
@@ -4433,7 +4434,7 @@ static void moe_cache_prefetch_observe(void * opaque, int layer, const int32_t *
         return;
     }
     std::lock_guard<std::mutex> lock(session->mu);
-    if (session->active_scopes != 1) {
+    if (!session->prefetch_enabled || session->active_scopes != 1) {
         return;
     }
     const int64_t now = ggml_time_us();
@@ -4460,7 +4461,7 @@ static void moe_cache_prefetch_observe(void * opaque, int layer, const int32_t *
             copy->target_start = now;
         } else {
             copy->selected = std::find(ids, ids + n_ids, copy->expert) != ids + n_ids;
-            if (copy->selected && copy->done > 0 && !copy->published && session->device_ready && !session->devices.empty()) {
+            if (!copy->closed && copy->selected && copy->done > 0 && !copy->published && session->device_ready && !session->devices.empty()) {
                 auto & device = *session->devices[0];
                 if (copy->physical != device.physical) {
                     continue;
@@ -4482,11 +4483,12 @@ static void moe_cache_prefetch_observe(void * opaque, int layer, const int32_t *
                 auto & table = found->second;
                 const void * address = pool.slab + (size_t) copy->slot * pool.expert_size;
                 ggml_cuda_set_device(device.logical);
-                CUDA_CHECK(cudaMemcpy(table.staging_device + copy->expert, &address, sizeof(address), cudaMemcpyHostToDevice));
+                CUDA_CHECK(cudaMemcpyAsync(table.staging_device + copy->expert, &address, sizeof(address), cudaMemcpyHostToDevice, nullptr));
+                const uint8_t hot = 1;
                 if (table.hot) {
-                    const uint8_t hot = 1;
-                    CUDA_CHECK(cudaMemcpy(table.hot + copy->expert, &hot, sizeof(hot), cudaMemcpyHostToDevice));
+                    CUDA_CHECK(cudaMemcpyAsync(table.hot + copy->expert, &hot, sizeof(hot), cudaMemcpyHostToDevice, nullptr));
                 }
+                CUDA_CHECK(cudaStreamSynchronize(nullptr));
                 slot.readers++;
                 copy->published = true;
             }
@@ -4543,7 +4545,8 @@ static void moe_cache_prefetch(void * opaque, const ggml_moe_cache_tensor_desc *
         return;
     }
     std::lock_guard<std::mutex> lock(session->mu);
-    if (session->stopping || session->dormant || session->active_scopes != 1 || session->predictions.size() >= 1024) {
+    if (!session->prefetch_enabled || session->stopping || session->dormant ||
+            session->active_scopes != 1 || session->predictions.size() >= 1024) {
         return;
     }
     const int64_t now = ggml_time_us();

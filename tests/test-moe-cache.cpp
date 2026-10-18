@@ -3470,61 +3470,64 @@ static bool run_prompt_cache_lending(ggml_backend_t gpu, ggml_backend_t cpu, log
 static bool run_prefetch_router(ggml_backend_t gpu, ggml_backend_t cpu) {
     bool ok = true;
     for (int tokens : {1, 4}) {
-    for (int activation = 0; activation < 3; ++activation) {
-        std::vector<int32_t> reference;
-        for (auto backend : {cpu, gpu}) {
-            ggml_init_params params = {64 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true};
-            auto * ctx = ggml_init(params);
-            auto * router = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 256, 512);
-            auto * hidden = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 256, tokens);
-            auto * bias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 512);
-            auto * scores = ggml_mul_mat(ctx, router, hidden);
-            if (activation == 0) {
-                scores = ggml_sigmoid(ctx, scores);
-            } else if (activation == 1) {
-                scores = ggml_soft_max(ctx, scores);
-            } else {
-                scores = ggml_sqrt(ctx, ggml_softplus(ctx, scores));
-            }
-            scores = ggml_add(ctx, scores, bias);
-            if (tokens > 1) {
-                scores = ggml_cont(ctx, ggml_transpose(ctx, scores));
-                scores = ggml_pool_2d(ctx, scores, GGML_OP_POOL_MAX, tokens, 1, tokens, 1, 0, 0);
-                scores = ggml_reshape_1d(ctx, scores, 512);
-            }
-            auto * ids = ggml_cont(ctx, ggml_argsort_top_k(ctx, scores, 32));
-            auto * graph = ggml_new_graph(ctx);
-            ggml_build_forward_expand(graph, ids);
-            auto buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
-            if (!buffer) {
+        for (int activation = 0; activation < 3; ++activation) {
+            std::vector<int32_t> reference;
+            for (auto backend : {cpu, gpu}) {
+                ggml_init_params params = {64 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true};
+                auto * ctx = ggml_init(params);
+                auto * router = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 256, 512);
+                auto * hidden = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 256, tokens);
+                auto * bias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 512);
+                auto * scores = ggml_mul_mat(ctx, router, hidden);
+                if (activation == 0) {
+                    scores = ggml_sigmoid(ctx, scores);
+                } else if (activation == 1) {
+                    scores = ggml_soft_max(ctx, scores);
+                } else {
+                    scores = ggml_sqrt(ctx, ggml_softplus(ctx, scores));
+                }
+                scores = ggml_add(ctx, scores, bias);
+                if (tokens > 1) {
+                    scores = ggml_cont(ctx, ggml_transpose(ctx, scores));
+                    scores = ggml_pool_2d(ctx, scores, GGML_OP_POOL_MAX, tokens, 1, tokens, 1, 0, 0);
+                    scores = ggml_reshape_1d(ctx, scores, 512);
+                }
+                auto * ids = ggml_cont(ctx, ggml_argsort_top_k(ctx, scores, 32));
+                auto * graph = ggml_new_graph(ctx);
+                ggml_build_forward_expand(graph, ids);
+                auto buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+                if (!buffer) {
+                    ggml_free(ctx);
+                    return false;
+                }
+                std::vector<float> weights(256 * 512);
+                for (int expert = 0; expert < 512; ++expert) {
+                    std::fill(weights.begin() + expert * 256, weights.begin() + (expert + 1) * 256,
+                              (expert - 256) / 256.0f);
+                }
+                std::vector<float> input(256 * tokens, 1.0f / 256.0f);
+                if (tokens > 1) {
+                    std::fill(input.end() - 256, input.end(), -2.0f / 256.0f);
+                }
+                std::vector<float> correction(512, 0.0f);
+                ggml_backend_tensor_set(router, weights.data(), 0, weights.size() * sizeof(float));
+                ggml_backend_tensor_set(hidden, input.data(), 0, input.size() * sizeof(float));
+                ggml_backend_tensor_set(bias, correction.data(), 0, correction.size() * sizeof(float));
+                ok &= ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS;
+                std::vector<int32_t> actual(32);
+                ggml_backend_tensor_get(ids, actual.data(), 0, actual.size() * sizeof(int32_t));
+                for (int rank = 0; rank < 32; ++rank) {
+                    ok &= actual[rank] == (tokens == 1 ? 511 - rank : rank);
+                }
+                if (backend == cpu) {
+                    reference = actual;
+                } else {
+                    ok &= actual == reference;
+                }
+                ggml_backend_buffer_free(buffer);
                 ggml_free(ctx);
-                return false;
             }
-            std::vector<float> weights(256 * 512);
-            for (int expert = 0; expert < 512; ++expert) {
-                std::fill(weights.begin() + expert * 256, weights.begin() + (expert + 1) * 256,
-                          (expert - 256) / 256.0f);
-            }
-            std::vector<float> input(256 * tokens, 1.0f / 256.0f);
-            std::vector<float> correction(512, 0.0f);
-            ggml_backend_tensor_set(router, weights.data(), 0, weights.size() * sizeof(float));
-            ggml_backend_tensor_set(hidden, input.data(), 0, input.size() * sizeof(float));
-            ggml_backend_tensor_set(bias, correction.data(), 0, correction.size() * sizeof(float));
-            ok &= ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS;
-            std::vector<int32_t> actual(32);
-            ggml_backend_tensor_get(ids, actual.data(), 0, actual.size() * sizeof(int32_t));
-            for (int rank = 0; rank < 32; ++rank) {
-                ok &= actual[rank] == 511 - rank;
-            }
-            if (backend == cpu) {
-                reference = actual;
-            } else {
-                ok &= actual == reference;
-            }
-            ggml_backend_buffer_free(buffer);
-            ggml_free(ctx);
         }
-    }
     }
     printf("cache-prefetch-router: %s\n", ok ? "OK" : "FAIL");
     return ok;
