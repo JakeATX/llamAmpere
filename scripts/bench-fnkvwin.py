@@ -51,6 +51,27 @@ def write_json(path, data):
         handle.write('\n')
 
 
+def runtime_identity(process, executable):
+    directory = executable.resolve().parent
+    paths = {executable.resolve()}
+    for line in Path(f'/proc/{process.pid}/maps').read_text().splitlines():
+        fields = line.split(maxsplit=5)
+        if len(fields) == 6 and fields[5].startswith('/'):
+            path = Path(fields[5])
+            if path.name.startswith(('libllama', 'libggml', 'libmtmd')):
+                require(path.parent.resolve() == directory, f'project library loaded outside selected build: {path}')
+                paths.add(path.resolve(strict=True))
+    require(any(path.name.startswith('libllama') for path in paths), 'loaded llama library identity unavailable')
+    records = []
+    for path in sorted(paths):
+        digest = hashlib.sha256()
+        with path.open('rb') as handle:
+            for chunk in iter(lambda: handle.read(2**20), b''):
+                digest.update(chunk)
+        records.append({'path': str(path), 'sha256': digest.hexdigest(), 'bytes': path.stat().st_size})
+    return records
+
+
 def available_bytes():
     for line in Path('/proc/meminfo').read_text().splitlines():
         if line.startswith('MemAvailable:'):
@@ -214,9 +235,10 @@ class ServerArm:
         env['LLAMA_PREFETCH_THREADS'] = '8'
         env['LD_LIBRARY_PATH'] = str(self.args.server.resolve().parent)
         env['GGML_CUDA_MOE_CACHE_STATS'] = '4096'
+        env['GGML_CUDA_MOE_CACHE_RESERVE_MB'] = str(self.args.reserve_mib)
         # Record only known performance settings, not the inherited environment.
         write_json(self.output / 'command.json', {'argv': command, 'environment':
-                   {key: env[key] for key in [*FAST_ENV, 'LLAMA_PREFETCH_THREADS', 'GGML_CUDA_MOE_CACHE_STATS', 'LD_LIBRARY_PATH']}})
+                   {key: env[key] for key in [*FAST_ENV, 'LLAMA_PREFETCH_THREADS', 'GGML_CUDA_MOE_CACHE_STATS', 'GGML_CUDA_MOE_CACHE_RESERVE_MB', 'LD_LIBRARY_PATH']}})
         self.log = (self.output / 'server.log').open('w')
         self.process = subprocess.Popen(command, env=env, stdout=self.log, stderr=subprocess.STDOUT, start_new_session=True)
         self.thread = threading.Thread(target=self.monitor, daemon=True)
@@ -231,6 +253,7 @@ class ServerArm:
                 pass
             require(time.monotonic() < self.deadline, 'server startup deadline exceeded')
             self.stop.wait(0.5)
+        write_json(self.output / 'runtime.json', runtime_identity(self.process, self.args.server))
         return time.monotonic() - self.started
 
     def http(self, route, data=None, timeout=None):
@@ -466,6 +489,7 @@ def main():
         else:
             command.add_argument('--cache-budget-mib', type=int, default=0, help='0 selects --moe-cache auto')
         command.add_argument('--port', type=int, default=8095)
+        command.add_argument('--reserve-mib', type=int, default=3072, help='fixed auto-cache reserve for both comparison arms')
         command.add_argument('--timeout', type=float, default=1500 if mode == 'protocol' else 600)
     command = commands.add_parser('compare')
     command.add_argument('baseline', type=Path)
@@ -477,6 +501,7 @@ def main():
         return 0
     require(0 < args.timeout <= (1500 if args.mode == 'protocol' else 600), 'timeout exceeds the mode limit')
     require(args.cache_budget_mib >= 0, 'cache budget must be nonnegative')
+    require(args.reserve_mib >= 0, 'cache reserve must be nonnegative')
     require(1 <= args.port <= 65535, 'invalid port')
     return run(args)
 
