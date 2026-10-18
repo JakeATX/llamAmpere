@@ -27,7 +27,7 @@
 +        GGML_ASSERT(previous > 0);
 +    }
 +}
- 
+
  static std::mutex g_registry_mu;
  static std::unordered_set<moe_cache_session *> g_sessions;
 @@ -2926,6 +2942,7 @@
@@ -72,7 +72,7 @@
 +        if (!ok) { (void)cudaStreamSynchronize(device.miss_stream); }
 +        moe_cache_urgent_end(*node);
 +    }
- 
+
      if (ok) {
          for (int index = 0; index < n_hits; index++) {
 @@ -3428,10 +3458,13 @@
@@ -85,7 +85,7 @@
 +        }
          node->stage->busy = false;
      }
- 
+
 +    moe_cache_urgent_end(*node);
      moe_cache_session & session = *node->session;
      const bool trim = node->device->dead.load();
