@@ -114,6 +114,8 @@ def compare(args):
     candidate = json.loads((args.candidate / 'result.json').read_text())
     require(baseline['status'] == candidate['status'] == 'complete', 'both KL arms must complete')
     require(baseline['mode'] == candidate['mode'] == 'kl', 'comparison requires KL arms')
+    require(baseline['timings'].get('prompt_n') == candidate['timings'].get('prompt_n') == PROMPT_N,
+            'KL comparison requires full 100000-token prompts')
     require(baseline['prompt_sha256'] == candidate['prompt_sha256'], 'prompt token IDs differ')
     require(baseline['n_vocab'] == candidate['n_vocab'], 'vocabulary sizes differ')
     response_p = json.loads((args.baseline / 'response.json').read_text())
@@ -139,7 +141,10 @@ def compare(args):
                       'infinite_kl': zero_support, 'baseline_mass': mass_p, 'candidate_mass': mass_q})
     finite = [step['kl_nats'] for step in steps if not step['infinite_kl']]
     result = {'direction': 'KL(baseline || candidate)', 'normalization': 'full-vocabulary log probabilities normalized by measured mass',
-              'matched_tokens': True, 'n_vocab': baseline['n_vocab'], 'steps': steps,
+              'matched_tokens': True, 'prompt_tokens': PROMPT_N, 'prompt_sha256': baseline['prompt_sha256'],
+              'baseline_runtime_identity': json.loads((args.baseline / 'runtime.json').read_text()),
+              'candidate_runtime_identity': json.loads((args.candidate / 'runtime.json').read_text()),
+              'n_vocab': baseline['n_vocab'], 'steps': steps,
               'mean_kl_nats': statistics.mean(finite) if len(finite) == len(steps) else None,
               'max_kl_nats': max(finite) if len(finite) == len(steps) else None,
               'infinite_kl': len(finite) != len(steps)}
