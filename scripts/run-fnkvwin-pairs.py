@@ -146,7 +146,8 @@ def bind_evidence(kind, path, data, expected, binary):
     for source, identity in identities:
         bench.require(isinstance(identity, list) and identity, f'invalid gate runtime identity: {source}')
         libraries = [item for item in identity if Path(item['path']).name.startswith(('libllama', 'libggml', 'libmtmd'))]
-        bench.require(any(Path(item['path']).name.startswith('libllama') for item in libraries), f'gate has no llama-library identity: {source}')
+        required_library = 'libggml' if kind == 'operator' and operator_executables.get(source) == 'test-moe-cache' else 'libllama'
+        bench.require(any(Path(item['path']).name.startswith(required_library) for item in libraries), f'gate has no {required_library} identity: {source}')
         for item in libraries:
             bench.require(current_libraries.get(Path(item['path']).name) == item['sha256'], f'{kind} gate used different candidate library: {item["path"]}')
         executable_match = None
@@ -183,6 +184,7 @@ def validate_arm(data, response, request, expected_request, resident, parent_uni
     decode = positive(data.get('decode_tok_s'), 'decode speed')
     bench.require(prefill == positive(timings.get('prompt_per_second'), 'prompt timing') and decode == positive(timings.get('predicted_per_second'), 'decode timing'), 'reported speeds disagree with native timings')
     hits = data.get('expert_cache_last_log_stats', [])
+    bench.require(hits, 'expert-cache hit counters were not recorded')
     for entry in hits:
         bench.require(0 <= entry['hits'] <= entry['requests'] and entry['requests'] > 0 and 0 <= entry['hit_percent'] <= 100, 'invalid expert-cache counter')
     return {'prefill_tok_s': prefill, 'decode_tok_s': decode, 'ttc_s': positive(data.get('ttc_s'), 'TTC'),

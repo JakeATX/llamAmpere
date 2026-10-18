@@ -82,7 +82,8 @@ def write_json(path, data):
         handle.write('\n')
 
 
-def runtime_identity(process, executable):
+def runtime_identity(process, executable, required_library='libllama'):
+    require(required_library in ('libllama', 'libggml'), 'unsupported runtime library requirement')
     directory = executable.resolve().parent
     paths = {executable.resolve()}
     for line in Path(f'/proc/{process.pid}/maps').read_text().splitlines():
@@ -92,7 +93,7 @@ def runtime_identity(process, executable):
             if path.name.startswith(('libllama', 'libggml', 'libmtmd')):
                 require(path.parent.resolve() == directory, f'project library loaded outside selected build: {path}')
                 paths.add(path.resolve(strict=True))
-    require(any(path.name.startswith('libllama') for path in paths), 'loaded llama library identity unavailable')
+    require(any(path.name.startswith(required_library) for path in paths), f'loaded {required_library} identity unavailable')
     records = []
     for path in sorted(paths):
         digest = hashlib.sha256()
@@ -304,7 +305,7 @@ class ServerArm:
                    '--parallel', '1', '-b', batch, '-ub', ubatch, '-t', '8', '-ngl', '999',
                    '-fa', 'on', '--cpu-moe', '-fitt', '1536', '--moe-cache', cache,
                    '-ctk', 'sjkvarn4', '-ctv', 'sjkvarn4',
-                   '--host', '127.0.0.1', '--port', str(self.args.port), '--no-webui', '--no-cache-disk']
+                   '--host', '127.0.0.1', '--port', str(self.args.port), '-lv', '4', '--no-webui', '--no-cache-disk']
         if memory_only:
             command += ['--no-warmup']
         if self.args.resident:
