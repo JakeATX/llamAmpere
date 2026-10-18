@@ -61,7 +61,6 @@ Set these before process startup; values are cached. These controls select imple
 | Variable | Default | Effect |
 | --- | --- | --- |
 | `GGML_SJKVARN_PREFILL_MIB` | `256` | Expansion scratch cap in MiB; `0` disables reuse. Accepted range is 0 through 16384; invalid input uses the default. |
-| `GGML_SJKVARN_PREFILL_TRACE` | unset | `1` logs each expanded prefill's query count, position count, KV heads, and scratch size. |
 | `GGML_SJKVARN_PREFILL_HEAD_GROUPS` | `1` | `0` disables grouped expansion above the scratch cap, restoring packed fallback there. The all-head path is unaffected. |
 | `GGML_SJKVARN_NO_DIRECT` | unset | Any defined value disables direct decode, including `0`. It does not disable prefill reuse. |
 | `GGML_SJKVARN_DIRECT_STREAM_MAX` | `8` | Largest direct-decode width using half-MMA streaming. `4` selects the legacy integer windowed path for widths 5 through 8; `0` selects it for all direct widths. |

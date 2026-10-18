@@ -1226,7 +1226,7 @@ struct llm_graph_context {
     // head consumes (EXL3: x_rot = H128(suh * cur), the fused kernel's input glue built from generic ops)
     ggml_tensor * build_draft_vocab_compact(ggml_tensor * head_w, ggml_tensor * head_s, ggml_tensor * cur) const;
 
-    // full-head fallback of build_draft_vocab_logits: counts the reason in the fallback ledger, warns once per context
+    // full-head fallback of build_draft_vocab_logits: warns once per context
     ggml_tensor * draft_vocab_fallback(int reason, const char * detail) const;
 
     // Shared transforms are valid for one graph build only.

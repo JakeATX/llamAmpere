@@ -86,9 +86,6 @@ The v0.1 release branches (`perf/qwen38-sm86-decode-product`, `perf/qwen38-sm86-
 `research/qwen38-sm86-*` experiment branches and the `archive/*` rejected experiments live on
 [llama-cpp-qwen-ampere](https://github.com/JakeATX/llama-cpp-qwen-ampere).
 
-The experiment log, with hypotheses, results, and what did not work, is
-`QWEN38_SM86_FRONTIER_HANDOVER.md` in this tree.
-
 ## Run (v0.3)
 
 ### v0.3 command and notes (previous release)

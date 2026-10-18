@@ -190,7 +190,6 @@ static std::vector<uint8_t> run_child(arm_t arm) {
             setenv("GGML_CUDA_EXL3_WEIGHT_MAJOR", (arm == ARM_DECXA || arm == ARM_OLDXA) ? "0" : "1", 1);
             unsetenv("GGML_CUDA_EXL3_FUSED");    // the cooperative fused GEMV keeps the old kernel
             unsetenv("GGML_CUDA_EXL3_GEMV");     // =0 would send every width to reconstruct + cuBLAS
-            unsetenv("GGML_CUDA_EXL3_ENVELOPE");
         }
         std::vector<uint8_t> blob;
         run_all(arm, blob);

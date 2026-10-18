@@ -935,12 +935,6 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
         {
             const char * env = getenv("LLAMA_SHARED_COMPUTE");
             const bool enabled = env == nullptr || env[0] != '0';
-            if (getenv("LLAMA_SHARED_COMPUTE_DEBUG") != nullptr) {
-                fprintf(stderr, "shared-compute: enabled=%d ctx_type=%d ctx_other=%p same_model=%d n_devices=%zu other_peer=%p\n",
-                    (int) enabled, (int) cparams.ctx_type, (void *) params.ctx_other,
-                    params.ctx_other ? (int) (&params.ctx_other->get_model() == &model) : -1, model.n_devices(),
-                    params.ctx_other ? (void *) params.ctx_other->compute_peer : nullptr);
-            }
             // not with a tensor split: the meta backend keeps per-device tensor mappings in its compute buffer that
             // the donor's graph allocation resets while the MTP context still reuses its graph (each context gets
             // its own compute buffers instead)
@@ -2218,6 +2212,11 @@ static llama_kv_cache * llama_sj_kvarn_cache(llama_memory_i * memory) {
     if (auto * kv = dynamic_cast<llama_kv_cache *>(memory)) { return kv; }
     if (auto * hy = dynamic_cast<llama_memory_hybrid *>(memory)) { return hy->get_mem_attn(); }
     return nullptr;
+}
+
+const llama_sj_kvarn_config * llama_context::get_sj_kvarn() const {
+    const auto * kv = llama_sj_kvarn_cache(memory.get());
+    return kv && kv->is_sj_kvarn() ? &kv->get_sj_kvarn() : nullptr;
 }
 
 ggml_backend_t llama_context::sj_kvarn_backend(ggml_backend_buffer_t buffer) const {
@@ -6365,7 +6364,8 @@ size_t llama_context::state_seq_load_file(llama_seq_id  seq_id,
                                           const char *  filepath,
                                           llama_token * tokens_out,
                                           size_t        n_token_capacity,
-                                          size_t *      n_token_count_out) {
+                                          size_t *      n_token_count_out,
+                                   llama_state_seq_flags flags) {
     llama_file file(filepath, "rb");
 
     // version checks
@@ -6406,16 +6406,19 @@ size_t llama_context::state_seq_load_file(llama_seq_id  seq_id,
     }
 
     // restore the context state
-    {
-        const size_t       state_size = file.size() - file.tell();
+    try {
+        const size_t state_size = file.size() - file.tell();
         llama_io_read_file io(&file);
-        const size_t       nread = state_seq_read_data(io, seq_id, 0);
-        if (!nread) {
-            LLAMA_LOG_ERROR("%s: failed to restore sequence state\n", __func__);
-            return 0;
+        const size_t nread = state_seq_read_data(io, seq_id, flags);
+        if (nread == 0 || nread != state_size) {
+            throw std::runtime_error("invalid sequence state length");
         }
-        GGML_ASSERT(nread <= state_size);
-        GGML_ASSERT(nread + sizeof(uint32_t) * 3 + sizeof(llama_token) * *n_token_count_out == file.tell());
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: failed to restore sequence state: %s\n", __func__, err.what());
+        if (memory) {
+            memory->seq_rm(seq_id, -1, -1);
+        }
+        return 0;
     }
 
     return file.tell();
@@ -6424,7 +6427,8 @@ size_t llama_context::state_seq_load_file(llama_seq_id  seq_id,
 size_t llama_context::state_seq_save_file(llama_seq_id        seq_id,
                                           const char *        filepath,
                                           const llama_token * tokens,
-                                          size_t              n_token_count) {
+                                          size_t              n_token_count,
+                                          llama_state_seq_flags flags) {
     llama_file file(filepath, "wb");
 
     file.write_u32(LLAMA_STATE_SEQ_MAGIC);
@@ -6436,7 +6440,7 @@ size_t llama_context::state_seq_save_file(llama_seq_id        seq_id,
 
     // save the context state using stream saving
     llama_io_write_file io(&file);
-    state_seq_write_data(io, seq_id, 0);
+    state_seq_write_data(io, seq_id, flags);
 
     const size_t res = file.tell();
     GGML_ASSERT(res == sizeof(uint32_t) * 3 + sizeof(llama_token) * n_token_count + io.n_bytes());
@@ -7663,6 +7667,39 @@ size_t llama_state_seq_load_file(llama_context * ctx,
 
     try {
         return ctx->state_seq_load_file(dest_seq_id, filepath, tokens_out, n_token_capacity, n_token_count_out);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error loading sequence state file: %s\n", __func__, err.what());
+        return 0;
+    }
+}
+
+size_t llama_state_seq_save_file_ext(llama_context *       ctx,
+                                     const char *          filepath,
+                                     llama_seq_id          seq_id,
+                                     const llama_token *   tokens,
+                                     size_t                n_token_count,
+                                     llama_state_seq_flags flags) {
+    ctx->synchronize();
+
+    try {
+        return ctx->state_seq_save_file(seq_id, filepath, tokens, n_token_count, flags);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error saving sequence state file: %s\n", __func__, err.what());
+        return 0;
+    }
+}
+
+size_t llama_state_seq_load_file_ext(llama_context *       ctx,
+                                     const char *          filepath,
+                                     llama_seq_id          dest_seq_id,
+                                     llama_token *         tokens_out,
+                                     size_t                n_token_capacity,
+                                     size_t *              n_token_count_out,
+                                     llama_state_seq_flags flags) {
+    ctx->synchronize();
+
+    try {
+        return ctx->state_seq_load_file(dest_seq_id, filepath, tokens_out, n_token_capacity, n_token_count_out, flags);
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error loading sequence state file: %s\n", __func__, err.what());
         return 0;

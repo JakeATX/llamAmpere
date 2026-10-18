@@ -73,6 +73,14 @@ struct llama_context {
     const llama_cparams & get_cparams() const;
 
     ggml_backend_sched_t get_sched() const;
+    int b1_status() const {
+        if (!b1_tried) { return -1; }
+        if (!b1 || moe_cache || compute_peer) { return 0; }
+        for (bool extract : cparams.embeddings_layer_inp) {
+            if (extract) { return 0; }
+        }
+        return 1;
+    }
 
     uint32_t n_ctx()     const;
     uint32_t n_ctx_seq() const;
@@ -84,6 +92,7 @@ struct llama_context {
     uint32_t n_threads_batch() const;
 
     llama_memory_t get_memory() const;
+    const llama_sj_kvarn_config * get_sj_kvarn() const;
 
     // return the *effective* K/V cache tensor types currently in use by the memory object.
     // this can differ from what was requested via llama_context_params.type_k/type_v because
@@ -203,13 +212,15 @@ struct llama_context {
             const char * filepath,
            llama_token * tokens_out,
                 size_t   n_token_capacity,
-                size_t * n_token_count_out);
+                size_t * n_token_count_out,
+ llama_state_seq_flags   flags = 0);
 
     size_t state_seq_save_file(
           llama_seq_id   seq_id,
             const char * filepath,
      const llama_token * tokens,
-                size_t   n_token_count);
+                size_t   n_token_count,
+ llama_state_seq_flags   flags = 0);
 
     //
     // perf

@@ -188,7 +188,7 @@ constexpr int NSTATE = NWIN >> 4; // states
 constexpr int NBR    = 16;        // branches per state (the new nibble)
 static_assert(L >= 8 && L <= 12, "trellis window length 8..12");
 // host codebooks (fp16 bits, y units): the header defaults, or the file named by GGML_SJKVARN_TRELLIS_CB
-// (uint16 K[NWIN] then V[NWIN], as written by gate_trellis2.py --save-codebook) loaded once per translation unit
+// (uint16 K[NWIN] then V[NWIN]) loaded once per translation unit
 inline const uint16_t * cb(bool is_V) {
     static uint16_t k[NWIN] = SJKVARN_CB_K_INIT;
     static uint16_t v[NWIN] = SJKVARN_CB_V_INIT;

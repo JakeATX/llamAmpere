@@ -167,6 +167,7 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_Q5_CR         = 45, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q6_CR         = 46, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_EXL3          = 47, // exllamav3 trellis weights (GGML_TYPE_EXL3_2..8), except 1d tensors
+        LLAMA_FTYPE_MOSTLY_AI4           = 52, // AI+ trellis weights, except 1d tensors
 
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };
@@ -1057,6 +1058,13 @@ extern "C" {
 // Getting the state for a seq_id with this flag invalidates all prior states gotten for that seq_id with this flag.
 #define LLAMA_STATE_SEQ_FLAGS_ON_DEVICE 2
 
+// [EVALFLAG] save every cell of the sequence (also SWA-masked ones) with its cell index and the cache head, and on
+// load put each cell back at the same index when that cell is free. A sequence restored into a clean slot then has
+// the same cell layout as the prefill that produced it, so attention adds its terms in the same order (byte-identical
+// continuation on sliding-window models). Both the save and the load must use it; the data is not compatible with
+// states saved without it.
+#define LLAMA_STATE_SEQ_FLAGS_KEEP_LAYOUT 4
+
     typedef uint32_t llama_state_seq_flags;
 
     LLAMA_API size_t llama_state_seq_get_size_ext(
@@ -1078,6 +1086,23 @@ extern "C" {
                     llama_seq_id   dest_seq_id,
            llama_state_seq_flags   flags);
 
+    // llama_state_seq_save_file / llama_state_seq_load_file with state flags
+    LLAMA_API size_t llama_state_seq_save_file_ext(
+            struct llama_context * ctx,
+                      const char * filepath,
+                    llama_seq_id   seq_id,
+               const llama_token * tokens,
+                          size_t   n_token_count,
+           llama_state_seq_flags   flags);
+
+    LLAMA_API size_t llama_state_seq_load_file_ext(
+            struct llama_context * ctx,
+                      const char * filepath,
+                    llama_seq_id   dest_seq_id,
+                     llama_token * tokens_out,
+                          size_t   n_token_capacity,
+                          size_t * n_token_count_out,
+           llama_state_seq_flags   flags);
     // In-call checkpoints: copy the partial state (LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) of seq_id as it stands after
     // the first n_tokens[i] tokens, while the next llama_decode runs, so one call can hold the prompt checkpoints that
     // would otherwise each end a call. Each n_tokens[i] must end a ubatch of that call and the batch must hold seq_id
