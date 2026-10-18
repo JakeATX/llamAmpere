@@ -230,6 +230,7 @@ class ServerArm:
                         '--spec-draft-n-max', '4', '--spec-draft-ubatch', '2048']
         else:
             command += ['--spec-type', 'none']
+        command += getattr(self.args, 'extra_server_args', [])
         env = os.environ.copy()
         env.update({key: '1' for key in FAST_ENV})
         env['LLAMA_PREFETCH_THREADS'] = '8'
