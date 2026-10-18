@@ -5967,6 +5967,17 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_TURBO2_0:
         case GGML_TYPE_TQ6_0:
         case GGML_TYPE_TQ5_0:
+        case GGML_TYPE_AI4:
+        case GGML_TYPE_AI4_U:
+        case GGML_TYPE_AI3_U:
+        case GGML_TYPE_AI2_U:
+        case GGML_TYPE_AI5_U:
+        case GGML_TYPE_AI6_U:
+        case GGML_TYPE_AI2_S:
+        case GGML_TYPE_AI3_S:
+        case GGML_TYPE_AI4_S:
+        case GGML_TYPE_AI5_S:
+        case GGML_TYPE_AI6_S:
             // WHT-rotated / TurboQuant types: no scalar-domain validation.
             break;
         default:

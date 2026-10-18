@@ -452,6 +452,36 @@ extern "C" {
         GGML_TYPE_EXL3_8  = 57,
         GGML_TYPE_TQ6_0   = 58, // TurboQuant 6-bit KV cache: WHT + 6-bit PolarQuant (runtime-only KV type)
         GGML_TYPE_TQ5_0   = 59, // TurboQuant 5-bit KV cache: WHT + 5-bit PolarQuant (runtime-only KV type)
+        // AI4 (Ampere INT4, formerly D2): 4-bit tail-biting bitshift trellis with s8 levels in RQ4's rotated basis (see
+        // ggml/src/ggml-ai4.h). Whole-tensor type like EXL3: slabs of 16 rows x 1024 K, 528 B per 1024 weights
+        // (4.125 bpw); NOT row-addressable (to_float NULL), so only the CUDA whole-tensor mul_mat exists.
+        // Id 70 is clear of track B's RQ4 ids (62-65); it is unchanged by the 2026-10-07 D2 -> AI4 rename, so D2 GGUFs load.
+        GGML_TYPE_AI4     = 70,
+        // AI4_U: the AI4 trellis/levels/scales in a unit-128 K layout (any K % 128 == 0, e.g. MoE experts with K = 2560
+        // or 640): 16 rows x 128 K = fp16 d[16] + 16 tiles of 64 B = 1056 B, 66 B per 128 weights (4.125 bpw), rotation
+        // H256 when K % 256 == 0 (same values as AI4) else H128. 2-D and 3-D (expert stack) tensors; MUL_MAT and MUL_MAT_ID.
+        // The rate k (bits per trellis step) is a layout parameter (unit 32 + 256k bytes): 72 = AI3_U (k = 3),
+        // 73 = AI2_U (k = 2), 74 = AI5_U (k = 5), 75 = AI6_U (k = 6, test candidate vs Q6_K). AI+ = the AI2..AI6 family.
+        GGML_TYPE_AI4_U   = 71,
+        // AI3_U / AI2_U: the AI4_U layout at rate k = 3 / 2 (ggml-ai4.h, "AI+ unit layout at rate k"): unit 800 / 544 B,
+        // 50 / 34 B per 128 weights (3.125 / 2.125 bpw). Same 16-bit state, level hash, rotation and fp16 group scales.
+        GGML_TYPE_AI3_U   = 72,
+        GGML_TYPE_AI2_U   = 73,
+        // AI5_U: the AI4_U layout at rate k = 5: unit 1312 B, 82 B per 128 weights (5.125 bpw).
+        GGML_TYPE_AI5_U   = 74,
+        // AI6_U: rate k = 6, unit 1568 B, 98 B per 128 weights (6.125 bpw). Its trellis constant is 0xA1EEE321, not the
+        // AI4 0x83DCD12D (a held-out constant search found -3.0% weight error at k = 6).
+        GGML_TYPE_AI6_U   = 75,
+        // AI+ scale-free span layout (AIk_S, k = 2..6): the AIk_U trellis, levels, rotation and per-type constant with one
+        // fp16 scale per row and 1024 K instead of one per 128 K. Block = 16 rows x 1024 K = [fp16 d[16]] [8 units' 16 tiles
+        // each, no per-unit header] = 32 + 2048*k bytes, so 128*k + 2 bytes per row and 1024 weights (k + 0.0156 bpw) and
+        // K % 1024 == 0 is required. The bytes of a row- or span-scaled AIk_U tensor repack into AIk_S losslessly
+        // (llama-ai4-quantize --repack-s). Ids 88-95 are taken by the Mirai branches, so this family starts at 96.
+        GGML_TYPE_AI2_S   = 96,
+        GGML_TYPE_AI3_S   = 97,
+        GGML_TYPE_AI4_S   = 98,
+        GGML_TYPE_AI5_S   = 99,
+        GGML_TYPE_AI6_S   = 100,
         GGML_TYPE_PQ2_0   = 142, // Prism group-128 ternary weights
         GGML_TYPE_PTQ1_0  = 143, // Prism packed group-128 ternary weights
         GGML_TYPE_COUNT   = 144,
@@ -806,6 +836,19 @@ extern "C" {
     GGML_API size_t  ggml_element_size(const struct ggml_tensor * tensor);
 
     GGML_API bool    ggml_is_quantized(enum ggml_type type);
+    // AI+ (ggml-ai4.h): trellis rate k for GGML_TYPE_AI4 / AI2_U..AI6_U / AI2_S..AI6_S, 0 otherwise. ggml_ai4_is_unit:
+    // unit-128 layout (AIk_U only). ggml_ai4_is_span: span-1024 layout (AIk_S). ggml_ai4_layout: 0 = AI4 slab,
+    // 1 = unit-128, 2 = span-1024, -1 = not AI+. ggml_ai4_span_to_unit: the AIk_U type an AIk_S repacks from.
+    // ggml_ai4_trellis_mul / ggml_ai4_scale_mul: the type's decoder constant and the encoder's scale-seed
+    // multiplier (0 for non-AI+ types).
+    GGML_API int      ggml_ai4_rate       (enum ggml_type type);
+    GGML_API bool     ggml_ai4_is_unit    (enum ggml_type type);
+    GGML_API bool     ggml_ai4_is_span    (enum ggml_type type);
+    GGML_API int      ggml_ai4_layout     (enum ggml_type type);
+    GGML_API enum ggml_type ggml_ai4_span_to_unit(enum ggml_type type);
+    GGML_API uint32_t ggml_ai4_trellis_mul(enum ggml_type type);
+    GGML_API float    ggml_ai4_scale_mul  (enum ggml_type type);
+
     GGML_API int     ggml_exl3_bits   (enum ggml_type type); // bits/weight for GGML_TYPE_EXL3_*, 0 otherwise
     // EXL3 reference decode of trellis rows 16*g .. 16*g+15 of a [K, N] EXL3 tensor (bits 2..8) into y[16][K]
     // (row-major, y[col*K + k]); the rows stay in the trellis domain (suh/svh and both Hadamards not applied)

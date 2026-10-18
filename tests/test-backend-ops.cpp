@@ -6223,6 +6223,55 @@ static void add_iq4xs_k4_cases(std::vector<std::unique_ptr<test_case>> & cases, 
     }
 }
 
+static bool is_ai4_family(ggml_type t) {
+    return ggml_ai4_rate(t) != 0;
+}
+
+static void init_tensor_ai4_random(ggml_tensor * t, const std::vector<bool> * used = nullptr) {
+    const bool unit = ggml_ai4_is_unit(t->type);
+    const bool span = ggml_ai4_is_span(t->type);
+    GGML_ASSERT(is_ai4_family(t->type) && ggml_is_contiguous(t) && t->ne[0] % (unit ? 128 : 1024) == 0 && t->ne[1] % 16 == 0);
+    std::random_device rd;
+    std::mt19937 rng(rd());
+    std::uniform_real_distribution<float> ud(0.002f, 0.02f);
+    std::vector<uint8_t> buf(ggml_nbytes(t));
+    const size_t bb  = span ? (size_t) (32 + 2048*ggml_ai4_rate(t->type))
+                            : (unit ? (size_t) (32 + 256*ggml_ai4_rate(t->type)) : 8448);
+    const size_t nsc = (unit || span) ? 16 : 128;
+    const size_t nblk = buf.size() / bb;
+    for (size_t b = 0; b < nblk; ++b) {
+        uint8_t * blk = buf.data() + b * bb;
+        if (used && !(*used)[(b * bb) / t->nb[2]]) {
+            memset(blk, 0xFF, bb);
+            continue;
+        }
+        ggml_fp16_t * d = (ggml_fp16_t *) blk;
+        for (size_t i = 0; i < nsc; ++i) {
+            d[i] = ggml_fp32_to_fp16(ud(rng));
+        }
+        uint32_t * w = (uint32_t *) (blk + 2 * nsc);
+        for (size_t i = 0; i < (bb - 2 * nsc) / 4; ++i) {
+            w[i] = (uint32_t) rng();
+        }
+    }
+    ggml_backend_tensor_set(t, buf.data(), 0, buf.size());
+}
+
+struct test_mul_mat_ai4 : public test_mul_mat {
+    test_mul_mat_ai4(int64_t m, int64_t n, int64_t k, ggml_type type = GGML_TYPE_AI4)
+        : test_mul_mat(type, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}) {}
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (is_ai4_family(t->type)) {
+                init_tensor_ai4_random(t);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 enum class cr_activation_pattern {
     RANDOM,
     ZERO,
@@ -6727,6 +6776,54 @@ struct test_mul_mat_id : public test_case {
         init_mul_mat_id_tensors(ctx, n_mats, amax);
     }
 
+    void reinit_perf_iter(ggml_context * ctx) override {
+        init_mul_mat_id_ids(ctx, n_mats);
+    }
+};
+
+struct test_mul_mat_id_ai4 : public test_mul_mat_id {
+    const bool dup;
+
+    test_mul_mat_id_ai4(ggml_type type_a, int n_mats, int n_used, bool b, int64_t m, int64_t n, int64_t k, bool dup = false)
+        : test_mul_mat_id(type_a, GGML_TYPE_F32, n_mats, n_used, b, m, n, k), dup(dup) {}
+
+    std::string vars() override {
+        return test_mul_mat_id::vars() + (dup ? ",dup=1" : "");
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_ids(ctx, n_mats);
+        std::vector<bool> used(n_mats, false);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32 && !ggml_is_view_op(t->op)) {
+                std::vector<int32_t> v(ggml_nelements(t));
+                ggml_backend_tensor_get(t, v.data(), 0, ggml_nbytes(t));
+                if (dup) {
+                    GGML_ASSERT(n_mats >= 3);
+                    for (int64_t r = 0; r < t->ne[1]; ++r) {
+                        for (int64_t i = 0; i < n_used; ++i) {
+                            v[r * t->ne[0] + i] = i < n_used - 1 ? 1 : (r % 2 == 0 ? 0 : 2);
+                        }
+                    }
+                    ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+                }
+                for (int64_t r = 0; r < t->ne[1]; ++r) {
+                    for (int64_t i = 0; i < n_used; ++i) {
+                        used[v[r * t->ne[0] + i]] = true;
+                    }
+                }
+            }
+        }
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (is_ai4_family(t->type)) {
+                init_tensor_ai4_random(t, &used);
+            } else if (t->type != GGML_TYPE_I32) {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    // perf iterations draw new ids: keep every expert valid there
     void reinit_perf_iter(ggml_context * ctx) override {
         init_mul_mat_id_ids(ctx, n_mats);
     }
@@ -11960,6 +12057,24 @@ static const ggml_type other_types[] = {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     add_iq4xs_k4_cases(test_cases, false);
+
+    // Public AI+ layouts: decode, GEMM, H128 tails, and routed expert reads.
+    for (ggml_type type : {GGML_TYPE_AI4, GGML_TYPE_AI4_U, GGML_TYPE_AI2_U, GGML_TYPE_AI3_U,
+                          GGML_TYPE_AI5_U, GGML_TYPE_AI6_U, GGML_TYPE_AI2_S, GGML_TYPE_AI3_S,
+                          GGML_TYPE_AI4_S, GGML_TYPE_AI5_S, GGML_TYPE_AI6_S}) {
+        for (int64_t n : {1, 9, 512}) {
+            test_cases.emplace_back(new test_mul_mat_ai4(48, n, 1024, type));
+        }
+    }
+    for (ggml_type type : {GGML_TYPE_AI4_U, GGML_TYPE_AI5_U}) {
+        test_cases.emplace_back(new test_mul_mat_ai4(48, 5, 384, type));
+    }
+    for (ggml_type type : {GGML_TYPE_AI4_U, GGML_TYPE_AI4_S, GGML_TYPE_AI6_S}) {
+        for (int64_t n : {1, 9}) {
+            test_cases.emplace_back(new test_mul_mat_id_ai4(type, 4, 3, false, 32, n, 1024, true));
+        }
+    }
+
 
     test_cases.emplace_back(new test_generic_init(GGML_OP_GET_ROWS));
     test_cases.emplace_back(new test_generic_init(GGML_OP_SET_ROWS));
