@@ -80,6 +80,12 @@
 #endif // __has_feature
 
 #define UNUSED GGML_UNUSED
+
+static bool ggml_cpu_expert_reuse = false;
+static bool ggml_cpu_expert_schedule = false;
+static bool ggml_cpu_expert_q8_reuse = false;
+static bool ggml_cpu_expert_cpumask[GGML_MAX_N_THREADS];
+static int ggml_cpu_expert_n_threads = 0;
 #define SWAP(x, y, T) do { T SWAP = x; (x) = y; (y) = SWAP; } while (0)
 
 // precomputed f32 table for f16 (256 KB) (simd-mappings.h)
@@ -720,6 +726,7 @@ struct ggml_threadpool {
     int          n_threads;   // Number of threads in the pool
     int32_t      prio;        // Scheduling priority
     uint32_t     poll;        // Polling level (0 - no polling)
+    bool expert_pinned;
 
     enum ggml_status ec;
 };
@@ -1941,7 +1948,8 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
     const struct mmid_row_mapping * matrix_rows,
     const size_t row_size,
     const bool src1_cont,
-    const void * wdata) {
+    const void * wdata,
+    const bool reuse) {
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -1949,6 +1957,39 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
 
     ggml_vec_dot_t    const vec_dot      = type_traits_cpu[type].vec_dot;
     enum ggml_type    const vec_dot_type = type_traits_cpu[type].vec_dot_type;
+
+    if (reuse && ir1_end - ir1_start >= 2 &&
+        (type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ3_XXS ||
+         type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ4_NL)) {
+        for (int64_t first = ir1_start; first < ir1_end; first += 8) {
+            const int nr = MIN(8, ir1_end - first);
+            const void * inputs[8];
+            float * outputs[8];
+            for (int t = 0; t < nr; ++t) {
+                const struct mmid_row_mapping row = MMID_MATRIX_ROW(cur_a, first + t);
+                const int64_t i11 = row.i1 % ne11;
+                inputs[t] = (const char *) wdata + (src1_cont || src1->type != vec_dot_type
+                    ? (i11 + row.i2*ne11)*row_size : i11*nb11 + row.i2*nb12);
+                outputs[t] = (float *) ((char *) dst->data + row.i1*nb1 + row.i2*nb2);
+            }
+            for (int64_t row = ir0_start; row < ir0_end; ++row) {
+                if (nr == 1) {
+                    vec_dot(ne00, outputs[0] + row, 0, src0_cur + row*nb01, 0, inputs[0], 0, 1);
+                    continue;
+                }
+                float values[8];
+                if (!ggml_vec_dot_iq_grouped(type, ne00, src0_cur + row*nb01, inputs, values, nr)) {
+                    goto stock;
+                }
+                for (int t = 0; t < nr; ++t) {
+                    outputs[t][row] = values[t];
+                }
+            }
+        }
+        return;
+    }
+
+stock:;
 
     const int64_t blck_0 = 16;
     const int64_t blck_1 = 16;
@@ -2003,7 +2044,8 @@ static void ggml_compute_forward_mul_mat_id_impl(
               struct ggml_tensor * dst,
                             uint64_t row_mask,
                                 bool use_row_mask,
-                                bool allow_moe_cache) {
+                                bool allow_moe_cache,
+                                bool reuse_src1) {
 
     if (use_row_mask && row_mask == 0) {
         return;
@@ -2076,7 +2118,7 @@ static void ggml_compute_forward_mul_mat_id_impl(
 
     GGML_ASSERT(params->wsize >= (size_t)((char *) wdata_cur - (char *) params->wdata));
 
-    if (src1->type != vec_dot_type) {
+    if (src1->type != vec_dot_type && !reuse_src1) {
         char * wdata = params->wdata;
 
         const size_t nbw0 = ggml_type_size(vec_dot_type);
@@ -2195,14 +2237,47 @@ static void ggml_compute_forward_mul_mat_id_impl(
         }
     }
 
-    // reset current_chunk
-    for (int cur_a = ith; cur_a < n_as; cur_a += nth) {
-        atomic_int * current_chunk_ctr = (atomic_int *)(atomic_current_chunk + cur_a);
-        *current_chunk_ctr = nth;
+    const bool schedule = ggml_cpu_expert_schedule && !params->use_ref && ids->ne[1] <= 8 && ne01 <= INT_MAX / MAX(1, n_as);
+    if (schedule) {
+        if (ith == 0) {
+            ggml_threadpool_chunk_set(params->threadpool, nth);
+        }
+    } else {
+        for (int cur_a = ith; cur_a < n_as; cur_a += nth) {
+            atomic_int * current_chunk_ctr = (atomic_int *)(atomic_current_chunk + cur_a);
+            *current_chunk_ctr = nth;
+        }
     }
 
     ggml_barrier(params->threadpool);
 
+    if (schedule) {
+        const int64_t rows_per_chunk = 32;
+        const int64_t chunks_per_expert = (ne01 + rows_per_chunk - 1) / rows_per_chunk;
+        const void * wdata = src1->type == vec_dot_type ? src1->data : params->wdata;
+        const size_t row_size = ggml_row_size(vec_dot_type, ne10);
+        int64_t task = ith;
+        int64_t first_task = 0;
+        int expert = 0;
+        for (;;) {
+            while (expert < n_as && (matrix_row_counts[expert] == 0 || task >= first_task + chunks_per_expert)) {
+                if (matrix_row_counts[expert] != 0) {
+                    first_task += chunks_per_expert;
+                }
+                ++expert;
+            }
+            if (expert == n_as) {
+                break;
+            }
+            const int64_t row = (task - first_task)*rows_per_chunk;
+            ggml_compute_forward_mul_mat_id_one_chunk(
+                dst, src0, src1, ids, expert, row, MIN(row + rows_per_chunk, ne01),
+                0, matrix_row_counts[expert], (const char *) src0->data + expert*nb02,
+                matrix_rows, row_size, src1_cont, wdata, ggml_cpu_expert_reuse);
+            task = ggml_threadpool_chunk_add(params->threadpool, 1);
+        }
+        goto collect_cache;
+    }
     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
         const int64_t cne1 = matrix_row_counts[cur_a];
 
@@ -2258,7 +2333,7 @@ static void ggml_compute_forward_mul_mat_id_impl(
             ggml_compute_forward_mul_mat_id_one_chunk(
                 dst, src0, src1, ids, cur_a,
                 ir0_start, ir0_end, ir1_start, ir1_end,
-                src0_cur, matrix_rows, row_size, src1_cont, wdata
+                src0_cur, matrix_rows, row_size, src1_cont, wdata, ggml_cpu_expert_reuse && !params->use_ref
             );
 
             if (nth >= nchunk0 * nchunk1) {
@@ -2269,6 +2344,7 @@ static void ggml_compute_forward_mul_mat_id_impl(
         }
     }
 
+collect_cache:
     if (ith == 0 && moe_cache_node) {
         const struct ggml_moe_cache_api moe_cache = ggml_moe_cache_active();
         if (!moe_cache.collect(moe_cache_node, moe_cache_n_hits, moe_cache_rows, ne0)) {
@@ -2283,7 +2359,7 @@ static void ggml_compute_forward_mul_mat_id_impl(
                     dst, src0, src1, ids, expert,
                     0, ne01, row, row + 1,
                     (const char *) src0->data + expert * nb02,
-                    matrix_rows, row_size, src1_cont, wdata);
+                    matrix_rows, row_size, src1_cont, wdata, ggml_cpu_expert_reuse && !params->use_ref);
             }
         }
         moe_cache.end(moe_cache_node);
@@ -2297,7 +2373,7 @@ static void ggml_compute_forward_mul_mat_id(
         ggml_compute_forward_mul_mat_id_ai4(params, dst);
         return;
     }
-    ggml_compute_forward_mul_mat_id_impl(params, dst, 0, false, true);
+    ggml_compute_forward_mul_mat_id_impl(params, dst, 0, false, true, false);
 }
 
 struct moe_cache_fused_state {
@@ -3409,6 +3485,9 @@ struct ggml_cplan ggml_graph_plan(
     if (n_threads <= 0) {
         n_threads = threadpool ? threadpool->n_threads : GGML_DEFAULT_N_THREADS;
     }
+    if (ggml_cpu_expert_n_threads > 0 && (!threadpool || threadpool->expert_pinned)) {
+        n_threads = MIN(n_threads, ggml_cpu_expert_n_threads);
+    }
 
 #if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
     // Emscripten without pthreads support can only use a single thread
@@ -3960,10 +4039,10 @@ static int ggml_cpu_try_fuse_moe_cache(
     const uint64_t miss_mask = valid_mask & ~state->hit_mask;
 
     ggml_compute_forward_mul_mat_id_impl(
-            &sub_params, up, miss_mask, true, false);
+            &sub_params, up, miss_mask, true, false, false);
     ggml_barrier(params->threadpool);
     ggml_compute_forward_mul_mat_id_impl(
-            &sub_params, gate, miss_mask, true, false);
+            &sub_params, gate, miss_mask, true, false, ggml_cpu_expert_q8_reuse);
     ggml_barrier(params->threadpool);
 
     ggml_compute_forward_swiglu_masked(
@@ -3980,10 +4059,10 @@ static int ggml_cpu_try_fuse_moe_cache(
 
     if (!state->collect_ok) {
         ggml_compute_forward_mul_mat_id_impl(
-                &sub_params, up, state->hit_mask, true, false);
+                &sub_params, up, state->hit_mask, true, false, false);
         ggml_barrier(params->threadpool);
         ggml_compute_forward_mul_mat_id_impl(
-                &sub_params, gate, state->hit_mask, true, false);
+                &sub_params, gate, state->hit_mask, true, false, ggml_cpu_expert_q8_reuse);
         ggml_barrier(params->threadpool);
         ggml_compute_forward_swiglu_masked(
                 params, gate, up, glu, state->hit_mask, false,
@@ -3992,6 +4071,49 @@ static int ggml_cpu_try_fuse_moe_cache(
     }
 
     return fusion.skipped;
+}
+
+static int ggml_cpu_try_share_expert_input(
+        const struct ggml_cgraph * cgraph,
+        int node_n,
+        const struct ggml_compute_params * params) {
+    if (!ggml_cpu_expert_q8_reuse || node_n + 1 >= cgraph->n_nodes) {
+        return 0;
+    }
+    struct ggml_tensor * first = cgraph->nodes[node_n];
+    int next = node_n + 1;
+    struct ggml_tensor * clamp = NULL;
+    if (cgraph->nodes[next]->op == GGML_OP_CLAMP &&
+        cgraph->nodes[next]->src[0] == first && next + 1 < cgraph->n_nodes) {
+        clamp = cgraph->nodes[next++];
+    }
+    struct ggml_tensor * second = cgraph->nodes[next];
+    if (second->op != GGML_OP_MUL_MAT_ID ||
+        first->src[1] != second->src[1] || first->src[2] != second->src[2] ||
+        first->src[1]->type != GGML_TYPE_F32 ||
+        first->src[0]->extra || second->src[0]->extra ||
+        type_traits_cpu[first->src[0]->type].vec_dot_type != GGML_TYPE_Q8_K ||
+        type_traits_cpu[second->src[0]->type].vec_dot_type != GGML_TYPE_Q8_K ||
+        !(second->flags & GGML_TENSOR_FLAG_COMPUTE) ||
+        (clamp && (!(clamp->flags & GGML_TENSOR_FLAG_COMPUTE) || clamp->type != GGML_TYPE_F32))) {
+        return 0;
+    }
+    for (int i = 0; i < 2; ++i) {
+        const struct ggml_tensor * weight = (i == 0 ? first : second)->src[0];
+        ggml_backend_buffer_t buffer = weight->view_src ? weight->view_src->buffer : weight->buffer;
+        if (!buffer || !ggml_backend_buffer_is_host(buffer)) {
+            return 0;
+        }
+    }
+    ggml_compute_forward_mul_mat_id_impl(params, first, 0, false, true, false);
+    ggml_barrier(params->threadpool);
+    if (clamp) {
+        struct ggml_compute_params clamp_params = *params;
+        ggml_compute_forward(&clamp_params, clamp);
+        ggml_barrier(params->threadpool);
+    }
+    ggml_compute_forward_mul_mat_id_impl(params, second, 0, false, true, true);
+    return next - node_n;
 }
 
 static int ggml_cpu_try_fuse_ops(
@@ -4011,6 +4133,7 @@ static int ggml_cpu_try_fuse_ops(
         if (fused > 0) {
             return fused;
         }
+        return ggml_cpu_try_share_expert_input(cgraph, node_n, params);
     }
 
     if (node->op == GGML_OP_RMS_NORM) {
@@ -4253,6 +4376,16 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
                struct ggml_cgraph * cgraph,
                 struct ggml_cplan * cplan) {
 
+    ggml_cpu_init();
+    struct ggml_threadpool_params pinned = *tpp;
+    const bool expert_pinned = ggml_cpu_expert_n_threads > 0 && !ggml_thread_cpumask_is_valid(tpp->cpumask);
+    if (expert_pinned) {
+        memcpy(pinned.cpumask, ggml_cpu_expert_cpumask, sizeof(pinned.cpumask));
+        pinned.strict_cpu = true;
+        pinned.n_threads = MIN(pinned.n_threads, ggml_cpu_expert_n_threads);
+        tpp = &pinned;
+    }
+
     struct ggml_threadpool * threadpool =
         ggml_aligned_malloc(sizeof(struct ggml_threadpool));
     {
@@ -4270,6 +4403,7 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
         threadpool->poll             = tpp->poll;
         threadpool->prio             = tpp->prio;
         threadpool->ec               = GGML_STATUS_SUCCESS;
+        threadpool->expert_pinned    = expert_pinned;
     }
 
     // Allocate and init workers state
@@ -4351,6 +4485,10 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         threadpool->current_chunk    = 0;
         threadpool->abort            = -1;
         threadpool->ec               = GGML_STATUS_SUCCESS;
+    }
+
+    if (threadpool->expert_pinned) {
+        n_threads = MIN(n_threads, threadpool->n_threads);
     }
 
 #ifdef GGML_USE_OPENMP
@@ -4986,6 +5124,63 @@ int ggml_cpu_has_sme2(void) {
 #endif
 }
 
+static void ggml_cpu_init_expert_affinity(void) {
+#if defined(__linux__)
+    const char * env = getenv("GGML_CPU_EXPERT_PIN");
+    if (!env || strcmp(env, "1") != 0) {
+        return;
+    }
+    cpu_set_t allowed;
+    if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) {
+        return;
+    }
+    int cores[GGML_MAX_N_THREADS], packages[GGML_MAX_N_THREADS], cpus[GGML_MAX_N_THREADS];
+    int count = 0;
+    for (int cpu = 0; cpu < GGML_MAX_N_THREADS && cpu < CPU_SETSIZE; ++cpu) {
+        if (!CPU_ISSET(cpu, &allowed)) {
+            continue;
+        }
+        char path[128];
+        int core, package;
+        snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/topology/core_id", cpu);
+        FILE * file = fopen(path, "r");
+        if (!file) {
+            return;
+        }
+        const int core_ok = fscanf(file, "%d", &core);
+        fclose(file);
+        snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/topology/physical_package_id", cpu);
+        file = fopen(path, "r");
+        if (!file) {
+            return;
+        }
+        const int package_ok = fscanf(file, "%d", &package);
+        fclose(file);
+        if (core_ok != 1 || package_ok != 1) {
+            return;
+        }
+        bool duplicate = false;
+        for (int i = 0; i < count; ++i) {
+            duplicate |= cores[i] == core && packages[i] == package;
+        }
+        if (!duplicate) {
+            cores[count] = core;
+            packages[count] = package;
+            cpus[count++] = cpu;
+        }
+    }
+    if (count <= 1) {
+        return;
+    }
+    // Leave one physical core for host and GPU coordination.
+    for (int i = 1; i < count; ++i) {
+        ggml_cpu_expert_cpumask[cpus[i]] = true;
+    }
+    ggml_cpu_expert_n_threads = MAX(0, count - 1);
+    GGML_LOG_INFO("ggml-cpu: expert affinity allows %d physical workers, reserves one core\n", ggml_cpu_expert_n_threads);
+#endif
+}
+
 void ggml_cpu_init(void) {
     // needed to initialize ggml_time
     {
@@ -5057,6 +5252,13 @@ void ggml_cpu_init(void) {
         {
             const char * env = getenv("GGML_CPU_DISABLE_FUSION");
             ggml_cpu_disable_fusion = (env != NULL && atoi(env) == 1);
+            env = getenv("GGML_CPU_EXPERT_REUSE");
+            ggml_cpu_expert_reuse = env && strcmp(env, "1") == 0;
+            env = getenv("GGML_CPU_EXPERT_SCHEDULE");
+            ggml_cpu_expert_schedule = env && strcmp(env, "1") == 0;
+            env = getenv("GGML_CPU_EXPERT_Q8_REUSE");
+            ggml_cpu_expert_q8_reuse = env && strcmp(env, "1") == 0;
+            ggml_cpu_init_expert_affinity();
         }
         is_first_call = false;
     }

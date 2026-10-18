@@ -12,6 +12,12 @@ extern "C" {
 #endif
 
 // Quantization
+// One weight row, up to eight independent activation rows. Returns false if unavailable.
+bool ggml_vec_dot_iq_grouped(enum ggml_type type, int n, const void * vx, const void * const * vy, float * s, int nr);
+#if defined(__AVX2__)
+bool ggml_vec_dot_iq_grouped_avx2(enum ggml_type type, int n, const void * vx, const void * const * vy, float * s, int nr);
+#endif
+
 void quantize_row_q1_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
 void quantize_row_q2_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
 void quantize_row_pq2_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);

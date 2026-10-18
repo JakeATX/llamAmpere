@@ -2,11 +2,14 @@
 
 #include "ggml.h"
 #include "ggml-cpu.h"
+#include "../ggml/src/ggml-cpu/quants.h"
 
 #undef NDEBUG
 #include <algorithm>
 #include <assert.h>
 #include <functional>
+#include <cstring>
+#include <cmath>
 #include <math.h>
 #include <memory>
 #include <stdio.h>
@@ -37,6 +40,7 @@ struct quantize_perf_params {
     bool op_dequantize_row_q = false;
     bool op_quantize_row_q_dot = false;
     bool op_vec_dot_q = false;
+    bool op_iq_grouped = false;
     int64_t iterations = ITERATIONS;
 };
 
@@ -118,7 +122,7 @@ static void usage(char * argv[]) {
     printf("  -3                    use size as L1, L2, L3 sizes (L1:%d L2:%d L3:%d)\n", L1_SIZE, L2_SIZE, L3_SIZE);
     printf("  -4                    use size as L1, L2, L3, MEM sizes (L1:%d L2:%d L3:%d MEM:%d)\n", L1_SIZE, L2_SIZE, L3_SIZE, MEM_SIZE);
     printf("  --op OP               set test operation as quantize_row_q_reference, quantize_row_q, dequantize_row_q,\n");
-    printf("                        quantize_row_q_dot, vec_dot_q (all)\n");
+    printf("                        quantize_row_q_dot, vec_dot_q (all), iq_grouped (opt-in)\n");
     printf("  --type TYPE           set test type as");
     for (int i = 0; i < GGML_TYPE_COUNT; i++) {
         ggml_type type = (ggml_type) i;
@@ -135,6 +139,84 @@ static void usage(char * argv[]) {
     printf("                        set alignment offset as OFFSET (0)\n");
     printf("  -i NUM, --iterations NUM\n");
     printf("                        set test iteration number (%d)\n", ITERATIONS);
+}
+
+static int benchmark_iq_grouped(const quantize_perf_params & params) {
+    if (params.iterations < 1) {
+        return 1;
+    }
+    ggml_cpu_init();
+    constexpr int rows = 256;
+    uint32_t rng = 1234567;
+    volatile float checksum = 0;
+    printf("type,k,rows,tokens,stock_us,grouped_us,speedup\n");
+    for (ggml_type type : {GGML_TYPE_IQ2_XS, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL}) {
+        if (!params.include_types.empty() && std::find(params.include_types.begin(), params.include_types.end(), ggml_type_name(type)) == params.include_types.end()) {
+            continue;
+        }
+        const auto * cpu = ggml_get_type_traits_cpu(type);
+        for (size_t k : params.test_sizes) {
+            if (k > INT32_MAX || k % ggml_blck_size(type) != 0) {
+                return 1;
+            }
+            const size_t stride = ggml_row_size(type, k);
+            std::vector<uint8_t> weights(rows*stride);
+            for (uint8_t & byte : weights) {
+                rng = 1664525*rng + 1013904223;
+                byte = rng >> 24;
+            }
+            for (size_t block = 0; block < rows*k / ggml_blck_size(type); ++block) {
+                const ggml_fp16_t d = ggml_fp32_to_fp16(0.01f);
+                std::memcpy(weights.data() + block*ggml_type_size(type), &d, sizeof(d));
+            }
+            std::vector<float> input(k);
+            std::vector<uint8_t> inputs[8];
+            const void * activations[8];
+            for (int t = 0; t < 8; ++t) {
+                generate_data(t, k, input.data());
+                inputs[t].resize(ggml_row_size(cpu->vec_dot_type, k));
+                ggml_get_type_traits_cpu(cpu->vec_dot_type)->from_float(input.data(), inputs[t].data(), k);
+                activations[t] = inputs[t].data();
+            }
+            for (int nr = 1; nr <= 8; ++nr) {
+                float out[8];
+                if (!ggml_vec_dot_iq_grouped(type, k, weights.data(), activations, out, nr)) {
+                    fprintf(stderr, "Grouped IQ dots unavailable\n");
+                    return 1;
+                }
+                std::vector<int64_t> stock, grouped;
+                for (int sample = -2; sample < params.iterations; ++sample) {
+                    for (int arm = 0; arm < 2; ++arm) {
+                        const bool reuse = arm == (sample & 1);
+                        const int64_t start = ggml_time_us();
+                        for (int repeat = 0; repeat < 4; ++repeat) {
+                            for (int row = 0; row < rows; ++row) {
+                                const void * weight = weights.data() + row*stride;
+                                if (reuse) {
+                                    ggml_vec_dot_iq_grouped(type, k, weight, activations, out, nr);
+                                } else {
+                                    for (int t = 0; t < nr; ++t) {
+                                        cpu->vec_dot(k, out + t, 0, weight, 0, activations[t], 0, 1);
+                                    }
+                                }
+                            }
+                            checksum = checksum + out[0];
+                        }
+                        const int64_t elapsed = ggml_time_us() - start;
+                        if (sample >= 0) {
+                            (reuse ? grouped : stock).push_back(elapsed);
+                        }
+                    }
+                }
+                std::sort(stock.begin(), stock.end());
+                std::sort(grouped.begin(), grouped.end());
+                const double stock_us = stock[stock.size()/2] / 4.0;
+                const double grouped_us = grouped[grouped.size()/2] / 4.0;
+                printf("%s,%zu,%d,%d,%.2f,%.2f,%.3f\n", ggml_type_name(type), k, rows, nr, stock_us, grouped_us, stock_us / grouped_us);
+            }
+        }
+    }
+    return !std::isfinite(checksum);
 }
 
 int main(int argc, char * argv[]) {
@@ -186,6 +268,8 @@ int main(int argc, char * argv[]) {
                 params.op_quantize_row_q_dot = true;
             } else if (op == "vec_dot_q") {
                 params.op_vec_dot_q = true;
+            } else if (op == "iq_grouped") {
+                params.op_iq_grouped = true;
             } else {
                 invalid_param = true;
                 break;
@@ -235,6 +319,9 @@ int main(int argc, char * argv[]) {
 
     if (params.test_sizes.empty()) {
         params.test_sizes.push_back(L1_SIZE);
+    }
+    if (params.op_iq_grouped) {
+        return benchmark_iq_grouped(params);
     }
     if (!(params.op_quantize_row_q_reference || params.op_quantize_row_q || params.op_dequantize_row_q || params.op_quantize_row_q_dot || params.op_vec_dot_q)) {
         params.op_quantize_row_q_reference = params.op_quantize_row_q = params.op_dequantize_row_q = params.op_quantize_row_q_dot = params.op_vec_dot_q = true;
