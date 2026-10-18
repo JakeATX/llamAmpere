@@ -280,6 +280,8 @@ struct moe_cache_device {
     bool worker_started = false;
     bool inflight = false;
     bool inflight_prefetch = false;
+    // Complete-layer and legacy miss streams raise this before staging real misses.
+    std::atomic<unsigned> urgent_transfers{0};
     const void * inflight_source = nullptr;
     size_t inflight_bytes = 0;
     std::thread worker;
@@ -1310,7 +1312,8 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
         bool expired = false;
         {
             std::lock_guard<std::mutex> lock(session->mu);
-            expired = job.prediction && (job.prediction->closed || job.prediction->target_start != 0 ||
+            expired = job.prediction && (device->urgent_transfers.load(std::memory_order_acquire) != 0 ||
+                job.prediction->closed || job.prediction->target_start != 0 ||
                 (double) (job.prediction->deadline - copy_start) * device->copy_bytes_per_us < job.bytes || std::any_of(device->queue.begin(), device->queue.end(),
                     [](const moe_cache_job & queued) { return !queued.prediction; }));
         }
@@ -1358,7 +1361,8 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
             if (job.prediction) {
                 std::lock_guard<std::mutex> lock(session->mu);
                 job.prediction->start = ggml_time_us();
-                expired |= !stage || stage_capacity < job.bytes || job.prediction->closed ||
+                expired |= device->urgent_transfers.load(std::memory_order_acquire) != 0 ||
+                    !stage || stage_capacity < job.bytes || job.prediction->closed ||
                     job.prediction->target_start != 0 ||
                     (double) (job.prediction->deadline - ggml_time_us()) * device->copy_bytes_per_us < job.bytes ||
                     std::any_of(device->queue.begin(), device->queue.end(),
@@ -4568,7 +4572,8 @@ static void moe_cache_prefetch(void * opaque, const ggml_moe_cache_tensor_desc *
     }
     for (auto & device_ptr : session->devices) {
         auto & device = *device_ptr;
-        if (device.dead || device.copy_samples < 4 || device.copy_bytes_per_us <= 0.0 ||
+        if (device.dead || device.urgent_transfers.load(std::memory_order_acquire) != 0 ||
+                device.copy_samples < 4 || device.copy_bytes_per_us <= 0.0 ||
                 (device.inflight && !device.inflight_prefetch) ||
                 std::any_of(device.queue.begin(), device.queue.end(),
                     [](const moe_cache_job & job) { return !job.prediction; })) {
