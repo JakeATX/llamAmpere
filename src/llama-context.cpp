@@ -1,4 +1,5 @@
 #include "llama-context.h"
+#include "llama-moe-arena.h"
 #include "llama-sampler.h"
 
 // minimum number of output rows reserved at context creation (covers MTP verification widths)
@@ -2480,12 +2481,14 @@ float * llama_context::get_embeddings_seq(llama_seq_id seq_id) {
 
 float * llama_context::get_embeddings_nextn() {
     output_reorder();
+    if (output_file) { output_file->flush(); }
 
     return embd_nextn.data;
 }
 
 float * llama_context::get_embeddings_nextn_ith(int32_t i) {
     output_reorder();
+    if (output_file) { output_file->flush(); }
 
     try {
         if (embd_nextn.data == nullptr) {
@@ -4217,14 +4220,29 @@ uint32_t llama_context::output_reserve(int32_t n_outputs, int32_t n_tokens) {
             }
         }
 
-        buf_output.reset(ggml_backend_buft_alloc_buffer(buft, new_size));
+        output_file.reset();
+        const char * output_directory = std::getenv("LLAMA_MOE_ARENA_OUTPUT_DIR");
+        if (model.moe_arena_size() && has_embd_nextn && !cparams.embeddings_nextn_masked &&
+                new_size >= (256ull << 20) && output_directory && output_directory[0]) {
+            try {
+                output_file = std::make_unique<llama_moe_output>(new_size, output_directory);
+                buf_output.reset(ggml_backend_cpu_buffer_from_ptr(output_file->data, new_size));
+                LLAMA_LOG_INFO("%s: MoE temporary output %.2f MiB, file-backed original floats\n", __func__, new_size / 1048576.0);
+            } catch (const std::exception & e) {
+                LLAMA_LOG_ERROR("%s: %s\n", __func__, e.what());
+                return 0;
+            }
+        } else {
+            buf_output.reset(ggml_backend_buft_alloc_buffer(buft, new_size));
+        }
         if (buf_output == nullptr) {
             LLAMA_LOG_ERROR("%s: failed to allocate output buffer of size %.2f MiB\n", __func__,
                             new_size / (1024.0 * 1024.0));
             return 0;
         }
-        ggml_backend_buffer_clear(buf_output.get(), 0);
+        if (!output_file) { ggml_backend_buffer_clear(buf_output.get(), 0); }
     }
+    if (output_file && n_tokens > 0) { output_file->dirty = true; }
 
     // the backend sampling outputs live in their own (small) pinned buffer: samplers are installed and removed
     // per request, and their layout (compact greedy vs full chain) must not reallocate the logits block above

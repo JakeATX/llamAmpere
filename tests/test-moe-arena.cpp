@@ -1,11 +1,58 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
+#include "../src/llama-moe-arena.h"
+#include <stdexcept>
+#ifndef _WIN32
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <string>
 #include <cstring>
 #include <vector>
+
+static bool test_reclaimable_output() {
+#ifndef _WIN32
+    const char * temporary = std::getenv("TMPDIR");
+    std::string name = std::string(temporary ? temporary : ".") + "/llama-moe-output-test-XXXXXX";
+    std::vector<char> path(name.begin(), name.end());
+    path.push_back(0);
+    const char * directory = path.data();
+    if (!mkdtemp(path.data())) { return false; }
+    bool ok = true;
+    {
+        constexpr size_t bytes = 16ull << 20;
+        llama_moe_output output(bytes, directory);
+        auto * data = static_cast<uint32_t *>(output.data);
+        for (size_t i = 0; i < bytes / sizeof(*data); ++i) { ok &= data[i] == 0; }
+        // Cover arbitrary float bit patterns, including NaNs, without arithmetic.
+        for (size_t i = 0; i < bytes / sizeof(*data); ++i) { data[i] = uint32_t(i * 2654435761u); }
+        output.flush();
+        ok &= !output.dirty;
+        ok &= madvise(data, bytes, MADV_DONTNEED) == 0;
+        for (size_t i = 0; i < bytes / sizeof(*data); ++i) { ok &= data[i] == uint32_t(i * 2654435761u); }
+        data[0] = 0x7fc12345;
+        output.dirty = true;
+        output.flush();
+        ok &= madvise(data, bytes, MADV_DONTNEED) == 0;
+        ok &= data[0] == 0x7fc12345;
+    }
+    // The mapped file was unlinked immediately; destruction leaves no artifact.
+    ok &= rmdir(directory) == 0;
+    bool rejected = false;
+    try { llama_moe_output invalid(4096, "/directory-that-does-not-exist/fnarena"); }
+    catch (const std::runtime_error &) { rejected = true; }
+    ok &= rejected;
+    printf("reclaimable MTP original float bytes: %s\n", ok ? "OK" : "FAIL");
+    return ok;
+#else
+    return true;
+#endif
+}
 
 // Exercise the original mixed IQ blocks with the arena's gate/up/down stride.
 int main() {
@@ -27,7 +74,7 @@ int main() {
     auto * arena = static_cast<uint8_t *>(ggml_backend_buffer_get_base(arena_buf));
     ggml_tensor * weights[2][3], * outputs[2][3];
     size_t bank_offset = 0, role_offset = 0;
-    bool ok = true;
+    bool ok = test_reclaimable_output();
     for (int role = 0; role < 3; ++role) {
         for (size_t i = 0; i < values.size(); ++i) { values[i] = 0.2f * sinf(float(i + role * 17) * 0.013f); }
         const size_t written = ggml_quantize_chunk(types[role], values.data(), packed + bank_offset,

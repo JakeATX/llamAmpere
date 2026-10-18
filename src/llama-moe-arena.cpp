@@ -5,9 +5,55 @@
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
+#include <vector>
 #ifndef _WIN32
+#include <fcntl.h>
 #include <sys/mman.h>
+#include <unistd.h>
 #endif
+
+llama_moe_output::llama_moe_output(size_t bytes, const char * directory) : size(bytes) {
+#ifndef _WIN32
+    std::string name = std::string(directory) + "/llama-moe-output-XXXXXX";
+    std::vector<char> path(name.begin(), name.end());
+    path.push_back(0);
+    const int fd = mkstemp(path.data());
+    if (fd < 0) { throw std::runtime_error("cannot create MoE temporary output file"); }
+    unlink(path.data());
+    bool reserved = bytes && bytes <= (size_t) INT64_MAX;
+#ifdef __linux__
+    reserved = reserved && posix_fallocate(fd, 0, bytes) == 0;
+#else
+    reserved = reserved && ftruncate(fd, bytes) == 0;
+#endif
+    if (!reserved) {
+        close(fd);
+        throw std::runtime_error("cannot reserve MoE temporary output file space");
+    }
+    data = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+    if (data == MAP_FAILED) { data = nullptr; throw std::runtime_error("cannot map MoE temporary output file"); }
+    madvise(data, size, MADV_SEQUENTIAL);
+#else
+    (void)directory;
+    throw std::runtime_error("MoE temporary output file requires mmap");
+#endif
+}
+
+void llama_moe_output::flush() {
+#ifndef _WIN32
+    if (dirty && msync(data, size, MS_SYNC) != 0) {
+        throw std::runtime_error("cannot flush MoE temporary output file");
+    }
+    dirty = false;
+#endif
+}
+
+llama_moe_output::~llama_moe_output() {
+#ifndef _WIN32
+    if (data) { munmap(data, size); }
+#endif
+}
 
 bool llama_moe_arena::is_expert(const char * name) {
     const char * suffixes[] = { ".ffn_gate_exps.weight", ".ffn_up_exps.weight", ".ffn_down_exps.weight" };

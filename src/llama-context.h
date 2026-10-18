@@ -22,6 +22,7 @@ class llama_batch_allocr;
 class llama_moe_cache;
 class llama_b1;
 class llama_ple_prefetch;
+struct llama_moe_output;
 
 class llama_io_read_i;
 class llama_io_write_i;
@@ -615,6 +616,7 @@ private:
     void capture_ubatch(const llama_ubatch & ubatch, int32_t il0, int32_t il1);
 
     // host buffer for the model output (logits and embeddings)
+    std::unique_ptr<llama_moe_output> output_file;
     ggml_backend_buffer_ptr buf_output;
 
     // host buffer for the backend sampling outputs (sampled ids, and the optional logits/probs/candidates)
