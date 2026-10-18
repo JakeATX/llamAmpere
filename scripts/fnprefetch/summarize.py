@@ -29,7 +29,7 @@ for label in sys.argv[1:]:
         argv = command['argv']
         assert argv[argv.index('--spec-type') + 1] == 'draft-mtp-adaptive' and '-md' in argv
         assert argv[argv.index('-ctk') + 1] == argv[argv.index('-ctv') + 1] == 'sjkvarn4'
-        assert all(lib['mapped_inode_matches'] for lib in result['binary_provenance']['libraries'].values())
+        assert result['binary_provenance']['libraries'] and all(lib['mapped_inode_matches'] for lib in result['binary_provenance']['libraries'].values())
         samples = [json.loads(line) for line in (cell / 'samples.jsonl').read_text().splitlines()]
         request_samples = [sample for sample in samples if result['request_start_monotonic_s'] <= sample['t'] <= result['request_end_monotonic_s']]
         decode = [sample for sample in request_samples if sample['phase'] == 'decode']
@@ -53,7 +53,10 @@ for label in sys.argv[1:]:
             h, m = map(int, device_hits[-1]); hit_rate = h / (h + m) if h + m else None
         elif hits:
             h, n = map(int, hits[-1]); hit_rate = h / n if n else None
+        assert hit_rate is not None and 0 <= hit_rate <= 1, 'missing or invalid expert-hit counters'
         timings = final['timings']
+        assert all(math.isfinite(timings[k]) and timings[k]>0 for k in ('prompt_per_second','predicted_per_second'))
+        assert (log.count('outcome=used')>0) if arm=='prefetch' else ('[moe-prefetch]' not in log), 'inactive prefetch or active off arm'
         arms[arm] = {
             'prefill_tokens_per_second': timings['prompt_per_second'],
             'decode_tokens_per_second': timings['predicted_per_second'],
@@ -77,6 +80,11 @@ for label in sys.argv[1:]:
     if pairs:
         assert base_first != pairs[-1]['baseline_first'], 'alternate AB / BA order'
     assert reference['off']['request'] == reference['prefetch']['request'], 'sampling or input differs'
+    assert reference['off']['argv'][1:]==reference['prefetch']['argv'][1:], 'model arguments differ between arms'
+    base_env=dict(reference['off']['env']);candidate_env=dict(reference['prefetch']['env'])
+    assert base_env.pop('LLAMA_ARG_MOE_PREFETCH')=='off'
+    assert candidate_env.pop('LLAMA_ARG_MOE_PREFETCH') in ('1','2','3','auto')
+    assert base_env==candidate_env, 'runtime settings differ between arms'
     arms['baseline_first'] = base_first
     for metric, ev in evidence.items():
         ev['log_e'] += math.log(1.8 if arms['prefetch'][metric] > arms['off'][metric] else .2)
