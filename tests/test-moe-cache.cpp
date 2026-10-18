@@ -4568,7 +4568,9 @@ int main(int argc, char ** argv) {
             clamped_fused_graph.out, clamped_fused_reference.data(), 0,
             clamped_fused_reference.size() * sizeof(float));
 
-    bool ok = run_arena_stride(gpu, cpu, weights, gate_weights, graph, reference, capture);
+    bool ok = run_optional(provider_is_cuda, "cache-arena-stride", [&] {
+        return run_arena_stride(gpu, cpu, weights, gate_weights, graph, reference, capture);
+    });
     ok &= run_capability_queries(provider_device, cpu);
     ok &= run_invalidation_hook_coverage(cpu);
     ok &= run_optional(provider_is_cuda, "cache-device-tables", [&] {
