@@ -1,0 +1,3 @@
+{
+  "env": {"LLAMA_MOE_ARENA_OUTPUT_DIR": "/mnt/models/fnarena/output"}
+}

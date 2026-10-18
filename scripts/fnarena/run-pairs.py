@@ -34,7 +34,7 @@ def arm(label, bundle, options, full=False):
                 'SHIP_CELL': series + '-' + label, 'SHIP_PROFILE': str(root / 'data/moe/flash-next.profile'),
                 'SHIP_PROMPT': '100000' if full else '2048', 'SHIP_PREDICT': '5120' if full else '32',
                 'SHIP_RELOAD': '0', 'SHIP_LIMIT': str(seconds - 10), 'SHIP_RESERVE_MB': '1024' if full else '2560',
-                'PARENT_HOLDS_GPU_LOCK': '1', **options}
+                'PARENT_HOLDS_GPU_LOCK': '1', 'SHIP_CONFIG': str(harness / 'output-file.json'), **options}
     command = ['flock', '/home/jake-k/qwen38-bench/.locks/gpu.lock', 'systemd-run', '--user', '--wait',
                '--unit=llama.cpp-fnarena-' + series + '-' + label, '-p', 'CPUWeight=100' if full else 'CPUWeight=10',
                '-p', 'MemoryMax=50G', '-p', 'TimeoutStopSec=10', '-p', 'LimitCORE=0', 'env',

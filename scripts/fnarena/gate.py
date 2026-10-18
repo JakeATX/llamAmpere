@@ -60,7 +60,7 @@ model='/mnt/models/aiplus_run/finish/AI_N.gguf' if arm=='swift27b' else '/mnt/mo
 base=[str(R/'bin/llama.cpp-server'),'-m',model,'--load-mode','mmap','-ngl','999','-c','110592','--parallel','1','-b','131072','-ub','2048' if arm=='swift27b' else '12288','-t','8','-tb','8','-lv','4','-fa','on','-ctk','sjkvarn4','-ctv','sjkvarn4','--cache-ram','0','--no-cache-disk','--no-webui','--host','127.0.0.1','--port',str(port),'--slot-save-path',str(C),'--spec-type','draft-mtp-adaptive','--spec-draft-n-max','4','--spec-draft-ubatch','2048','--ctx-checkpoints','4']
 if arm=='flashnext':
  base+=['-md','/mnt/models/flash-next/mtp-Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS.gguf','--cpu-moe','-fitt','1536','--moe-cache','on','--moe-arena',os.environ.get('ARENA_MODE','on')]
- env.update(json.loads((R/'scripts/fnarena/settings.json').read_text()))
+ env.update(json.loads(Path(__file__).with_name('settings.json').read_text()))
 if arm=='flashnext':
  env['GGML_CUDA_MOE_CACHE_RESERVE_MB']=os.environ.get('SHIP_RESERVE_MB','2560')
  env['GGML_MOE_CACHE_PROFILE_LOAD']=os.environ.get('SHIP_PROFILE',str(R/'data/moe/flash-next.profile'))

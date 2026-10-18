@@ -17,8 +17,10 @@ output = root / 'artifacts' / cell
 output.mkdir(parents=True, exist_ok=False)
 steps = []
 environment = dict(os.environ, SHIP_SERVER=str(bundle / 'bin/llama.cpp-server'),
-                   SHIP_LIB=str(bundle / 'bin'), SHIP_PROMPT='2048', SHIP_PREDICT='32',
-                   SHIP_RELOAD='1', SHIP_CELL=cell + '-model', SHIP_RESERVE_MB='2560')
+                   SHIP_LIB=str(bundle / 'bin'), SHIP_PROMPT=os.environ.get('SHIP_PROMPT', '2048'),
+                   SHIP_PREDICT=os.environ.get('SHIP_PREDICT', '32'),
+                   SHIP_RELOAD='1', SHIP_CELL=cell + '-model',
+                   SHIP_RESERVE_MB=os.environ.get('SHIP_RESERVE_MB', '2560'))
 try:
     for name, command in (
         ('operators', [sys.executable, str(harness / 'operators.py'), str(bundle), str(output / 'operators')]),
