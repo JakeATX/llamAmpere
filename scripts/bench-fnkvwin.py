@@ -223,6 +223,7 @@ class ServerArm:
         require(available_bytes() >= MIN_AVAILABLE, 'MemAvailable below 10 GiB before launch')
         disk_check()
         with socket.socket() as probe:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             probe.bind(('127.0.0.1', self.args.port))
         executable = self.output / 'llama.cpp-fnkvwin-server'
         executable.symlink_to(self.args.server.resolve(strict=True))
