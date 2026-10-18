@@ -843,8 +843,10 @@ llama_kv_cache::llama_kv_cache(
                         "kernels serve 5 to 8, so this attention runs on the CPU (it works, but much slower). Use -ctk sjkvarn4 "
                         "-ctv sjkvarn4 on this model.\n", __func__, layer_new.sj_kvarn_bits_k, layer_new.sj_kvarn_bits_v, gqa);
             }
+            // fork: split only CUDA QSA sealed bodies; exact ring storage remains on its layer backend.
             ggml_context * body_ctx = ctx;
-            if (sj_kvarn.resident_cells && hparams.dsv4_compress_ratios[il] > 0 && offload) {
+            if (sj_kvarn.resident_cells && hparams.dsv4_compress_ratios[il] > 0 && offload &&
+                ggml_backend_dev_type(model.dev_layer(il)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
                 if (n_stream != 1 || D != 256 || layer_new.sj_kvarn_bits_k != 4 || layer_new.sj_kvarn_bits_v != 4 ||
                     layer_new.sj_kvarn_body_type != GGML_TYPE_F32) {
                     throw std::runtime_error("--kv-resident requires single-stream scalar SJ-KVaRN 4/4 with 256-channel QSA heads");

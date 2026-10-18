@@ -5727,7 +5727,7 @@ class llama_io_write_device : public llama_io_write_i {
                 if (!mbuf_cur.buf || mbuf_cur.total_size != mbuf.total_size) {
                     mbuf_cur = std::move(mbuf);
 
-                    // A split QSA checkpoint needs authoritative RAM bytes, not a second card window.
+                    // fork: a split QSA checkpoint needs authoritative RAM bytes, not a second card window.
                     auto * copy_buft = strncmp(ggml_backend_buft_name(buft), "CUDA_QSA_Resident_", 18) == 0 ? ggml_backend_cpu_buffer_type() : buft;
                     mbuf_cur.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(mbuf_cur.ctx.get(), copy_buft));
 

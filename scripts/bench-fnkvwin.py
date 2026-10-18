@@ -191,12 +191,17 @@ class ServerArm:
             probe.bind(('127.0.0.1', self.args.port))
         executable = self.output / 'llama.cpp-fnkvwin-server'
         executable.symlink_to(self.args.server.resolve(strict=True))
-        command = [str(executable), '-m', str(MODEL), '--load-mode', 'mmap', '-c', '131072',
-                   '--parallel', '1', '-b', '131072', '-ub', '12288', '-t', '8', '-ngl', '999',
-                   '-fa', 'on', '--cpu-moe', '-fitt', '1536', '--moe-cache',
-                   str(self.args.cache_budget_mib) if self.args.cache_budget_mib else 'auto',
+        memory_only = self.args.mode == 'memory'
+        context = str(self.args.context) if memory_only else '131072'
+        batch, ubatch = ('512', '512') if memory_only else ('131072', '12288')
+        cache = 'off' if memory_only else (str(self.args.cache_budget_mib) if self.args.cache_budget_mib else 'auto')
+        command = [str(executable), '-m', str(MODEL), '--load-mode', 'mmap', '-c', context,
+                   '--parallel', '1', '-b', batch, '-ub', ubatch, '-t', '8', '-ngl', '999',
+                   '-fa', 'on', '--cpu-moe', '-fitt', '1536', '--moe-cache', cache,
                    '-ctk', 'sjkvarn4', '-ctv', 'sjkvarn4',
                    '--host', '127.0.0.1', '--port', str(self.args.port), '--no-webui', '--no-cache-disk']
+        if memory_only:
+            command += ['--no-warmup']
         if self.args.resident:
             command += ['--kv-resident', str(self.args.resident)]
         if self.args.mode == 'protocol':
@@ -207,10 +212,11 @@ class ServerArm:
         env = os.environ.copy()
         env.update({key: '1' for key in FAST_ENV})
         env['LLAMA_PREFETCH_THREADS'] = '8'
+        env['LD_LIBRARY_PATH'] = str(self.args.server.resolve().parent)
         env['GGML_CUDA_MOE_CACHE_STATS'] = '4096'
         # Record only known performance settings, not the inherited environment.
         write_json(self.output / 'command.json', {'argv': command, 'environment':
-                   {key: env[key] for key in [*FAST_ENV, 'LLAMA_PREFETCH_THREADS', 'GGML_CUDA_MOE_CACHE_STATS']}})
+                   {key: env[key] for key in [*FAST_ENV, 'LLAMA_PREFETCH_THREADS', 'GGML_CUDA_MOE_CACHE_STATS', 'LD_LIBRARY_PATH']}})
         self.log = (self.output / 'server.log').open('w')
         self.process = subprocess.Popen(command, env=env, stdout=self.log, stderr=subprocess.STDOUT, start_new_session=True)
         self.thread = threading.Thread(target=self.monitor, daemon=True)
@@ -346,6 +352,38 @@ def stream_protocol(arm, request):
     return {'final': final, 'content': ''.join(contents), 'tokens': tokens}, first
 
 
+def memory_snapshot(arm, context):
+    gpu = subprocess.check_output(
+        ['nvidia-smi', '--query-gpu=memory.used,memory.free,memory.total,power.draw,power.limit',
+         '--format=csv,noheader,nounits'], text=True, timeout=5).strip().splitlines()
+    require(len(gpu) == 1, 'expected the single home GPU')
+    used, free, total, power, limit = [float(value.strip()) for value in gpu[0].split(',')]
+    require(used <= MAX_VRAM_MIB, 'whole-GPU VRAM exceeds 23552 MiB at memory snapshot')
+    require(available_bytes() >= MIN_AVAILABLE, 'MemAvailable below 10 GiB at memory snapshot')
+    require(limit == 350.0, 'home GPU power limit must be 350 W')
+    text = (arm.output / 'server.log').read_text(errors='replace')
+    memory_lines = [line for line in text.splitlines() if re.search(r'memory|buffer|QSA layer|MiB|GiB', line, re.IGNORECASE)]
+    layers = []
+    pattern = (r'QSA layer (\d+): (\d+) resident body groups plus (\d+) staging rows, '
+               r'([\d.]+) MiB pinned body, ([\d.]+) MiB VRAM freed for expert cache')
+    for layer, groups, staging, pinned, freed in re.findall(pattern, text):
+        layers.append({'layer': int(layer), 'resident_body_groups': int(groups), 'staging_rows': int(staging),
+                       'pinned_body_mib_logged': float(pinned), 'body_vram_freed_mib_logged': float(freed)})
+    require(not arm.args.resident or layers, 'resident allocation did not produce QSA allocation logs')
+    configs = [{'device': int(device), 'group_stride_bytes': int(stride), 'resident_groups': int(groups)}
+               for device, stride, groups in sorted(set(re.findall(r'CUDA_QSA_Resident_(\d+)_(\d+)_(\d+)', text)))]
+    # MiB messages are rounded. Only derive exact card bytes when one buffer geometry covers every QSA layer.
+    card_bytes = None
+    if len(configs) == 1 and layers and all(layer['resident_body_groups'] <= configs[0]['resident_groups'] for layer in layers):
+        card_bytes = sum(layer['resident_body_groups'] * configs[0]['group_stride_bytes'] for layer in layers)
+    return {'context_cells': context, 'load_only': True, 'inference_run': False, 'expert_cache': 'off',
+            'loaded_gpu': {'used_mib': used, 'free_mib': free, 'total_mib': total, 'power_w': power, 'power_limit_w': limit},
+            'qsa_layers': layers, 'resident_buffer_configs': configs,
+            'qsa_body_card_bytes_from_log_geometry': card_bytes, 'qsa_body_ram_bytes_exact': None,
+            'body_accounting_note': 'Pinned body and VRAM savings are rounded MiB log values; exact RAM bytes are not logged.',
+            'server_memory_log_lines': memory_lines}
+
+
 def run(args):
     require(args.out.resolve().is_relative_to(GATES.resolve()), 'artifacts must be under /mnt/models/fnkvwin/gates')
     require(os.environ.get('PARENT_HOLDS_GPU_LOCK') == '1', 'parent must hold gpu.lock and set PARENT_HOLDS_GPU_LOCK=1')
@@ -358,44 +396,47 @@ def run(args):
     result = {'mode': args.mode, 'resident_cells': args.resident, 'status': 'failed'}
     try:
         result['load_s'] = arm.start()
-        if args.mode == 'niah':
-            ids, construction = niah_prompt(arm)
-            write_json(args.out / 'niah-prompt.json', construction)
+        if args.mode == 'memory':
+            result.update(memory_snapshot(arm, args.context))
         else:
-            ids = json.loads(PROMPT_IDS.read_text())
-        require(len(ids) == PROMPT_N and all(type(t) is int for t in ids), 'prompt must contain exactly 100000 token IDs')
-        result['prompt_sha256'] = hashlib.sha256(json.dumps(ids, separators=(',', ':')).encode()).hexdigest()
-        request = payload(ids, args.mode)
-        write_json(args.out / 'request.json', request)
-        if args.mode == 'kl':
-            models = arm.http('/v1/models')
-            write_json(args.out / 'models.json', models)
-            result['n_vocab'] = models['data'][0]['meta']['n_vocab']
-            require(result['n_vocab'] <= request['n_probs'], 'n_probs does not cover the full vocabulary')
-        arm.phase = 'inference'
-        started = time.monotonic()
-        if args.mode == 'protocol':
-            response, result['ttft_s'] = stream_protocol(arm, request)
-            final = response['final']
-        else:
-            response = arm.http('/completion', request)
-            final = response
-        result['ttc_s'] = time.monotonic() - started
-        arm.phase = 'complete'
-        write_json(args.out / 'response.json', response)
-        result['timings'] = final.get('timings', {})
-        result['prefill_tok_s'] = result['timings'].get('prompt_per_second')
-        result['decode_tok_s'] = result['timings'].get('predicted_per_second')
-        require(result['timings'].get('prompt_n') == PROMPT_N, 'server did not evaluate the full 100000-token prompt')
-        require(result['timings'].get('cache_n', 0) == 0, 'prompt cache was reused')
-        if args.mode == 'kl':
-            probability_rows(response, result['n_vocab'])
-            require(len(response['tokens']) == 8, 'KL arm did not generate exactly 8 tokens')
-        elif args.mode == 'niah':
-            result['needle_matches'] = {name: code in final.get('content', '') for name, code in construction['needles'].items()}
-            require(all(result['needle_matches'].values()), 'one or more retrieval codes are missing')
-        else:
-            require(final.get('tokens_predicted') == 5120, 'protocol must generate exactly 5120 tokens')
+            if args.mode == 'niah':
+                ids, construction = niah_prompt(arm)
+                write_json(args.out / 'niah-prompt.json', construction)
+            else:
+                ids = json.loads(PROMPT_IDS.read_text())
+            require(len(ids) == PROMPT_N and all(type(t) is int for t in ids), 'prompt must contain exactly 100000 token IDs')
+            result['prompt_sha256'] = hashlib.sha256(json.dumps(ids, separators=(',', ':')).encode()).hexdigest()
+            request = payload(ids, args.mode)
+            write_json(args.out / 'request.json', request)
+            if args.mode == 'kl':
+                models = arm.http('/v1/models')
+                write_json(args.out / 'models.json', models)
+                result['n_vocab'] = models['data'][0]['meta']['n_vocab']
+                require(result['n_vocab'] <= request['n_probs'], 'n_probs does not cover the full vocabulary')
+            arm.phase = 'inference'
+            started = time.monotonic()
+            if args.mode == 'protocol':
+                response, result['ttft_s'] = stream_protocol(arm, request)
+                final = response['final']
+            else:
+                response = arm.http('/completion', request)
+                final = response
+            result['ttc_s'] = time.monotonic() - started
+            arm.phase = 'complete'
+            write_json(args.out / 'response.json', response)
+            result['timings'] = final.get('timings', {})
+            result['prefill_tok_s'] = result['timings'].get('prompt_per_second')
+            result['decode_tok_s'] = result['timings'].get('predicted_per_second')
+            require(result['timings'].get('prompt_n') == PROMPT_N, 'server did not evaluate the full 100000-token prompt')
+            require(result['timings'].get('cache_n', 0) == 0, 'prompt cache was reused')
+            if args.mode == 'kl':
+                probability_rows(response, result['n_vocab'])
+                require(len(response['tokens']) == 8, 'KL arm did not generate exactly 8 tokens')
+            elif args.mode == 'niah':
+                result['needle_matches'] = {name: code in final.get('content', '') for name, code in construction['needles'].items()}
+                require(all(result['needle_matches'].values()), 'one or more retrieval codes are missing')
+            else:
+                require(final.get('tokens_predicted') == 5120, 'protocol must generate exactly 5120 tokens')
         require(not arm.failure, arm.failure)
         result['status'] = 'complete'
     except Exception as error:
@@ -414,12 +455,16 @@ def run(args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest='mode', required=True)
-    for mode in ('kl', 'niah', 'protocol'):
+    for mode in ('kl', 'niah', 'protocol', 'memory'):
         command = commands.add_parser(mode)
         command.add_argument('--server', type=Path, required=True)
         command.add_argument('--resident', type=int, choices=(0, 32768), required=True)
         command.add_argument('--out', type=Path, required=True)
-        command.add_argument('--cache-budget-mib', type=int, default=0, help='0 selects --moe-cache auto')
+        if mode == 'memory':
+            command.add_argument('--context', type=int, choices=(100096, 262144), default=100096)
+            command.set_defaults(cache_budget_mib=0)
+        else:
+            command.add_argument('--cache-budget-mib', type=int, default=0, help='0 selects --moe-cache auto')
         command.add_argument('--port', type=int, default=8095)
         command.add_argument('--timeout', type=float, default=1500 if mode == 'protocol' else 600)
     command = commands.add_parser('compare')
