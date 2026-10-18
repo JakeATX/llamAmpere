@@ -22,6 +22,15 @@
 
 #define UNUSED GGML_UNUSED
 
+bool ggml_vec_dot_iq_grouped(enum ggml_type type, int n, const void * vx, const void * const * vy, float * s, int nr) {
+#if defined(__AVX2__)
+    return ggml_vec_dot_iq_grouped_avx2(type, n, vx, vy, s, nr);
+#else
+    UNUSED(type); UNUSED(n); UNUSED(vx); UNUSED(vy); UNUSED(s); UNUSED(nr);
+    return false;
+#endif
+}
+
 void quantize_row_q1_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     quantize_row_q1_0_ref(x, y, k);
 }

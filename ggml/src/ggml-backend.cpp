@@ -2857,13 +2857,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     if (sched->moe_cache_device_graph) {
         for (int i = 0; i < sched->n_splits; ++i) {
             const auto & split = splits[i];
-            if (ggml_backend_dev_type(ggml_backend_get_device(sched->backends[split.backend_id])) == GGML_BACKEND_DEVICE_TYPE_CPU) {
-                continue;
-            }
             for (int j = 0; j < split.graph.n_nodes; ++j) {
                 const ggml_tensor * node = split.graph.nodes[j];
                 if (node->op == GGML_OP_MUL_MAT_ID && ggml_backend_sched_is_host_weight(node->src[0]) &&
-                        !ggml_backend_sched_moe_device_supports(sched, node, split.backend_id)) {
+                        !ggml_backend_sched_moe_device_supports(sched, node, split.backend_id) &&
+                        ggml_backend_dev_type(ggml_backend_get_device(sched->backends[split.backend_id])) != GGML_BACKEND_DEVICE_TYPE_CPU) {
                     GGML_LOG_ERROR("[moe-cache] device expert mapping invalidated; rebuild scheduler and graph before compute\n");
                     return GGML_STATUS_FAILED;
                 }
