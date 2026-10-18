@@ -4303,9 +4303,6 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
         ggml_tensor * node = cgraph->nodes[i];
         const bool device_cache = ggml_cuda_moe_cache_device_supports(node, ggml_cuda_get_device());
         if (device_cache && !device_cache_capture) {
-            if (why_node) {
-                *why_node = node;
-            }
             return false;
         }
 
