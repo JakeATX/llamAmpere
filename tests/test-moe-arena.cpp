@@ -15,7 +15,7 @@
 #include <cstring>
 #include <vector>
 
-static bool test_reclaimable_output() {
+static bool test_reclaimable_output(bool cuda = false) {
 #ifndef _WIN32
     const char * temporary = std::getenv("TMPDIR");
     std::string name = std::string(temporary ? temporary : ".") + "/llama-moe-output-test-XXXXXX";
@@ -31,6 +31,24 @@ static bool test_reclaimable_output() {
         for (size_t i = 0; i < bytes / sizeof(*data); ++i) { ok &= data[i] == 0; }
         // Cover arbitrary float bit patterns, including NaNs, without arithmetic.
         for (size_t i = 0; i < bytes / sizeof(*data); ++i) { data[i] = uint32_t(i * 2654435761u); }
+        if (cuda) {
+            ggml_backend_load_all();
+            ggml_backend_t backend = ggml_backend_init_by_name("CUDA0", nullptr);
+            if (!backend) { return false; }
+            ggml_init_params params = { ggml_tensor_overhead(), nullptr, true };
+            ggml_context * ctx = ggml_init(params);
+            ggml_tensor * tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, bytes / sizeof(float));
+            ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+            if (!buffer) { ggml_free(ctx); ggml_backend_free(backend); return false; }
+            ggml_backend_tensor_set(tensor, data, 0, bytes);
+            memset(data, 0, bytes);
+            // Match the context's pageable D2H output copy and completion boundary.
+            ggml_backend_tensor_get_async(backend, tensor, data, 0, bytes);
+            ggml_backend_synchronize(backend);
+            ggml_backend_buffer_free(buffer);
+            ggml_free(ctx);
+            ggml_backend_free(backend);
+        }
         output.flush();
         ok &= !output.dirty;
         ok &= madvise(data, bytes, MADV_DONTNEED) == 0;
@@ -47,15 +65,17 @@ static bool test_reclaimable_output() {
     try { llama_moe_output invalid(4096, "/directory-that-does-not-exist/fnarena"); }
     catch (const std::runtime_error &) { rejected = true; }
     ok &= rejected;
-    printf("reclaimable MTP original float bytes: %s\n", ok ? "OK" : "FAIL");
+    printf("reclaimable MTP original float bytes%s: %s\n", cuda ? " CUDA D2H" : "", ok ? "OK" : "FAIL");
     return ok;
 #else
-    return true;
+    return !cuda;
 #endif
 }
 
 // Exercise the original mixed IQ blocks with the arena's gate/up/down stride.
-int main() {
+int main(int argc, char ** argv) {
+    if (argc == 2 && strcmp(argv[1], "--cuda-output") == 0) { return test_reclaimable_output(true) ? 0 : 1; }
+    if (argc != 1) { return 2; }
     constexpr int64_t n_in = 256, n_out = 32, n_experts = 3;
     const ggml_type types[] = { GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ4_NL };
     size_t bytes[3], stride = 0;

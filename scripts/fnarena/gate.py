@@ -187,6 +187,8 @@ try:
  if os.environ.get('SHIP_CONFIG'):
   for pattern in config.get('required_log_patterns',[]):
    assert isinstance(pattern,str) and re.search(pattern,generation_log),'required model path did not run: '+str(pattern)
+ if env.get('LLAMA_MOE_ARENA_OUTPUT_DIR') and os.environ.get('ARENA_MODE','on') == 'on' and prompt_n >= 8192:
+  assert 'file-backed original floats' in generation_log,'large MTP output storage path did not run'
  host_stats=re.findall(r'\[moe-cache\] CUDA0 hits=(\d+)/(\d+) \(([^)]+)\)',generation_log)
  device_stats=re.findall(r'\[moe-cache\] device routes: hits=(\d+) misses=(\d+) dispatches=(\d+)',generation_log)
  result['expert_cache_counters']=dict(host=host_stats[-1] if host_stats else None,device=device_stats[-1] if device_stats else None,coverage='last logged snapshot before generation completed; cumulative within this process')

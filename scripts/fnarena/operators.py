@@ -14,12 +14,13 @@ output = Path(sys.argv[2]).resolve()
 output.mkdir(parents=True, exist_ok=False)
 assert os.environ.get('PARENT_HOLDS_GPU_LOCK') == '1'
 assert subprocess.check_output(['systemctl', '--user', 'is-active', 'llama.cpp-sysguard'], text=True).strip() == 'active'
-environment = dict(os.environ, LD_LIBRARY_PATH=str(bundle / 'bin'), GGML_MOE_CACHE_TEST_TMPDIR=str(output))
+environment = dict(os.environ, LD_LIBRARY_PATH=str(bundle / 'bin'), GGML_MOE_CACHE_TEST_TMPDIR=str(output), TMPDIR=str(output))
 manifest = json.loads((bundle / 'manifest.json').read_text())
 for name, record in manifest['libraries'].items():
     with (bundle / 'bin' / name).open('rb') as stream:
         assert hashlib.file_digest(stream, 'sha256').hexdigest() == record['sha256'], name
-command = [str(bundle / 'bin/llama.cpp-test-moe-cache')]
+command = ['/bin/bash', '-c', 'set -e; "$1"; "$2" --cuda-output', 'arena-operators',
+           str(bundle / 'bin/llama.cpp-test-moe-cache'), str(bundle / 'bin/llama.cpp-test-moe-arena')]
 started = time.monotonic()
 reason = None
 samples = []
@@ -48,7 +49,7 @@ with (output / 'test.log').open('w') as log:
                 os.killpg(process.pid, signal.SIGKILL)
                 process.wait()
 text = (output / 'test.log').read_text(errors='replace')
-passed = process.returncode == 0 and reason is None and 'cache-arena-stride: OK' in text
+passed = process.returncode == 0 and reason is None and 'cache-arena-stride: OK' in text and 'reclaimable MTP original float bytes CUDA D2H: OK' in text
 result = {'status': 'passed' if passed else 'failed', 'source_commit': manifest['source_commit'], 'returncode': process.returncode, 'guard': reason, 'samples': samples, 'command': command}
 (output / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
 print(json.dumps({key: value for key, value in result.items() if key != 'samples'}))
