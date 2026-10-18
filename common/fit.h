@@ -56,6 +56,7 @@ enum common_params_fit_status {
     COMMON_PARAMS_FIT_STATUS_SUCCESS = 0, // found allocations that are projected to fit
     COMMON_PARAMS_FIT_STATUS_FAILURE = 1, // could not find allocations that are projected to fit
     COMMON_PARAMS_FIT_STATUS_ERROR   = 2, // a hard error occurred, e.g. because no model could be found at the specified path
+    COMMON_PARAMS_FIT_STATUS_NO_ROOM = 3, // no allocation can fit, even with every layer's weights in system memory
 };
 
 // a second model that shares the devices of the main model, e.g. a draft model

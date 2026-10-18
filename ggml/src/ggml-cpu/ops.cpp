@@ -13,7 +13,6 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
-#include <mutex>
 
 extern "C" {
 // Declaration only. The definition lives in ggml-turbo-quant.c (libggml-base).
@@ -12061,29 +12060,6 @@ void ggml_compute_forward_dsv4_hc_post(
     }
 }
 
-// GGML_SJKVARN_DUMP=<path>: append the fp16 rows every sealed (group, head) sees, for offline codec studies.
-// Record: int32 magic 'KVD1', D, G, head; char name[64]; K [G][D] fp16; V [G][D] fp16.
-static void ggml_sj_kvarn_dump_group(const ggml_fp16_t * K, const ggml_fp16_t * V, size_t row_stride, int D, int G, int64_t head, const char * name) {
-    static const char * path = getenv("GGML_SJKVARN_DUMP");
-    if (path == nullptr) {
-        return;
-    }
-    static std::mutex m;
-    std::lock_guard<std::mutex> lock(m);
-    FILE * f = fopen(path, "ab");
-    if (f == nullptr) {
-        return;
-    }
-    const int32_t hdr[4] = { 0x31445643, D, G, (int32_t) head };
-    fwrite(hdr, sizeof(int32_t), 4, f);
-    char nm[64] = { 0 };
-    strncpy(nm, name, 63);
-    fwrite(nm, 1, 64, f);
-    for (int t = 0; t < G; ++t) fwrite(K + (size_t) t*row_stride, sizeof(ggml_fp16_t), D, f);
-    for (int t = 0; t < G; ++t) fwrite(V + (size_t) t*row_stride, sizeof(ggml_fp16_t), D, f);
-    fclose(f);
-}
-
 // ggml_compute_forward_sj_kvarn_seal
 
 void ggml_compute_forward_sj_kvarn_seal(
@@ -12129,7 +12105,6 @@ void ggml_compute_forward_sj_kvarn_seal(
             return;
         }
         if (k->type == GGML_TYPE_F16) {
-            ggml_sj_kvarn_dump_group((const ggml_fp16_t *) kp, (const ggml_fp16_t *) vp, row_stride, D, G, head, k->name);
             ggml_sj_kvarn::seal_group((const ggml_fp16_t *) kp, (const ggml_fp16_t *) vp, row_stride, l, iters, record, trellis_body);
             return;
         }
@@ -12139,7 +12114,6 @@ void ggml_compute_forward_sj_kvarn_seal(
             ggml_get_type_traits(v->type)->to_float(vp + t*v->nb[1], row.data(), D);
             ggml_fp32_to_fp16_row(row.data(), vstage.data() + t*D, D);
         }
-        ggml_sj_kvarn_dump_group(kstage.data(), vstage.data(), D, D, G, head, k->name);
         ggml_sj_kvarn::seal_group(kstage.data(), vstage.data(), D, l, iters, record, trellis_body);
     };
 

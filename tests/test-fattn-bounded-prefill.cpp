@@ -19,8 +19,7 @@
 //   tolerance 8,192 KV / 128 Q, the same pairs, GQA 6 and 4, plus a sinks case. The f16 copies are 32 MiB, so
 //             budgets 1/20/27 give 1/2/3 KV heads per group, and 256/272/410 fit the full copies (plan off, output
 //             identical). f64 reference on every 4th query row plus the last.
-//   excluded  ALiBi (max_bias 8), D 128, and a single KV head (8,192 / 128). Gate: identical to "off" and no bounded
-//             ledger row.
+//   excluded  ALiBi (max_bias 8), D 128, and a single KV head (8,192 / 128). Gate: identical to "off".
 // Gates for every bounded case. The bounded route runs the unbounded kernel once per group with fewer KV heads, so only
 // the grid differs. Whether that changes the summation order is decided by mma_grid() below, which mirrors the
 // stream-k choice in launch_fattn:
@@ -30,23 +29,18 @@
 //     b: max |bounded - unbounded| <= max |unbounded - ref| + 5e-3 * R
 //   The CASE line prints max |bounded - unbounded| (all rows and reference rows), both errors vs the reference, and R.
 // dst view: the first tolerance case with dst as a view of a plain tensor. Gate: identical to the reserved run in the
-// same child, and the ledger shows scratch=bounded-pool.
-// For every bounded case the fallback ledger ("cuda.fattn" f16_convert rows) must show exactly one live bounded row,
-// counted once, with "heads=h/n" equal to the expected heads per group (computed independently below) and the case's
-// KV head count, and no full-copy row. Ledger slots outlive ggml_ledger_reset (it zeroes the counts), so rows with
-// count 0 belong to earlier cases and are skipped. Arm "off" must show no bounded row.
+// same child.
 // PLAN lines: ggml_backend_buft_get_alloc_size for the ATX FLASH_ATTN_EXT shape (24 query heads, 4 KV heads, D 256,
 // n_q 1,024, tq5_0 K / turbo4 V) at n_kv 100,352 / 131,072 / 245,760 / 262,144. For bounded arms the size must equal
 // pad128(nbytes(dst)) + max(heads * (2 * kv_per_head + out_per_head), budget).
 // Graph arms (CUDA graphs on): the same 8,192 / 128 q8_0 graph computed 4 times. With the env 0 (off), and unset (the
-// 256 MiB default, which the 32 MiB f16 copies fit), a capture must happen.
-// With budget 1 the graph must stay eager with the ledger outcome "eager:incompatible_fattn_bounded_prefill".
+// 256 MiB default, which the 32 MiB f16 copies fit), the output must equal arm "off" (eager) byte for byte; with
+// budget 1 (bounded) the comparison is reported.
 // Needs a GPU backend; skips (exit 0) without one, and on Windows (no fork).
 
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
-#include "ggml-ledger.h"
 
 #include <algorithm>
 #include <atomic>
@@ -388,50 +382,6 @@ static void build_inputs(const case_def & c, case_data & d, uint32_t seed) {
 // ---------------------------------------------------------------------------------------------------------------------
 // child side
 
-struct ledger_counts {
-    int64_t bounded_reserved = 0;
-    int64_t bounded_pool     = 0;
-    int64_t full_reserved    = 0;
-    int64_t full_pool        = 0;
-    int     heads            = -1; // from the bounded row's "heads=h/nh": h
-    int     heads_nkv        = -1; // nh
-    int     heads_rows       = 0;  // live bounded keys seen
-    int64_t heads_count      = 0;  // bounded launches counted on those keys
-    std::map<std::string, int64_t> graph; // cuda.graph outcome -> count
-};
-
-static void ledger_cb(const char * site, const char * key, int64_t count, void * user_data) {
-    ledger_counts * c = (ledger_counts *) user_data;
-    if (count == 0) {
-        return; // a slot from an earlier case: ggml_ledger_reset zeroes counts but keeps the slots
-    }
-    if (strcmp(site, "cuda.graph") == 0) {
-        const char * sp = strchr(key, ' ');
-        c->graph[sp ? std::string(key, sp - key) : std::string(key)] += count;
-        return;
-    }
-    if (strcmp(site, "cuda.fattn") != 0 || strncmp(key, "f16_convert ", 12) != 0) {
-        return;
-    }
-    if (strstr(key, "scratch=bounded-reserved") != nullptr) {
-        c->bounded_reserved += count;
-    } else if (strstr(key, "scratch=bounded-pool") != nullptr) {
-        c->bounded_pool += count;
-    } else if (strstr(key, "scratch=reserved") != nullptr) {
-        c->full_reserved += count;
-    } else if (strstr(key, "scratch=pool") != nullptr) {
-        c->full_pool += count;
-    }
-    const char * h = strstr(key, "scratch=bounded-") != nullptr ? strstr(key, "heads=") : nullptr;
-    if (h != nullptr) {
-        if (sscanf(h + 6, "%d/%d", &c->heads, &c->heads_nkv) != 2) {
-            c->heads = c->heads_nkv = -1;
-        }
-        c->heads_rows++;
-        c->heads_count += count;
-    }
-}
-
 struct built_graph {
     ggml_context *        ctx_in  = nullptr;
     ggml_context *        ctx     = nullptr;
@@ -498,15 +448,12 @@ static built_graph build_graph(ggml_backend_t backend, const case_def & c, const
 }
 
 static void run_case(ggml_backend_t backend, const case_def & c, const case_data & d, bool dst_view,
-                     std::vector<float> & out, ledger_counts & l) {
-    ggml_ledger_reset();
+                     std::vector<float> & out) {
     built_graph g = build_graph(backend, c, d, dst_view);
     GGML_ASSERT(ggml_backend_graph_compute(backend, g.gf) == GGML_STATUS_SUCCESS);
     out.resize(size_t(ggml_nelements(g.out)));
     ggml_backend_tensor_get(g.out, out.data(), 0, ggml_nbytes(g.out));
     g.release();
-    l = ledger_counts();
-    ggml_ledger_foreach(ledger_cb, &l);
 }
 
 static double max_abs_diff(const std::vector<float> & a, const std::vector<float> & b) {
@@ -624,9 +571,8 @@ static int child_main(const arm_def & arm, int out_fd) {
     if (arm.graphs) {
         unsetenv("GGML_CUDA_DISABLE_GRAPHS");
     } else {
-        setenv("GGML_CUDA_DISABLE_GRAPHS", "1", 1); // every compute launches on the host so the ledger counts it
+        setenv("GGML_CUDA_DISABLE_GRAPHS", "1", 1); // eager launches
     }
-    ggml_ledger_set_enabled(true);
 
     ggml_backend_load_all();
     ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
@@ -642,7 +588,6 @@ static int child_main(const arm_def & arm, int out_fd) {
         const size_t ci = first_tolerance_case();
         const case_def & c = g_cases[ci];
         const bool bounded = expected_heads(c, arm.mib) > 0;
-        ggml_ledger_reset();
         built_graph g = build_graph(backend, c, g_data[ci], false);
         for (int it = 0; it < 4; ++it) {
             GGML_ASSERT(ggml_backend_graph_compute(backend, g.gf) == GGML_STATUS_SUCCESS);
@@ -650,30 +595,14 @@ static int child_main(const arm_def & arm, int out_fd) {
         std::vector<float> out(size_t(ggml_nelements(g.out)));
         ggml_backend_tensor_get(g.out, out.data(), 0, ggml_nbytes(g.out));
         g.release();
-        ledger_counts l;
-        ggml_ledger_foreach(ledger_cb, &l);
-        int64_t captures = 0;
-        int64_t incompat = 0;
-        std::string outcomes;
-        for (const auto & kv : l.graph) {
-            outcomes += " " + kv.first + "=" + std::to_string(kv.second);
-            captures += kv.first.rfind("capture:", 0) == 0 ? kv.second : 0;
-            incompat += kv.first == "eager:incompatible_fattn_bounded_prefill" ? kv.second : 0;
-        }
-        std::string why;
-        if (l.graph.empty()) {
-            why = " no_cuda_graph_rows(graphs_not_compiled?)";
-        } else if (bounded) {
-            if (captures != 0 || incompat == 0) {
-                why = " bounded_graph_captured_or_not_marked";
-            }
-        } else if (captures == 0) {
-            why = " control_never_captured";
-        }
         const bool same = out.size() == g_ref_out[ci].size() && memcmp(out.data(), g_ref_out[ci].data(), out.size()*sizeof(float)) == 0;
-        printf("GRAPH arm=%-11s K=%s V=%s n_kv=%lld n_q=%lld outcomes:%s  bounded_rows=%lld  vs_off_eager=%s  %s%s\n",
-               arm.name, ggml_type_name(c.tk), ggml_type_name(c.tv), (long long) c.n_kv, (long long) c.n_q, outcomes.c_str(),
-               (long long) (l.bounded_reserved + l.bounded_pool), bounded ? (same ? "identical" : "differs(reported)") : "n/a",
+        std::string why;
+        if (!bounded && !same) {
+            why = " differs_from_off_eager";
+        }
+        printf("GRAPH arm=%-11s K=%s V=%s n_kv=%lld n_q=%lld  vs_off_eager=%s  %s%s\n",
+               arm.name, ggml_type_name(c.tk), ggml_type_name(c.tv), (long long) c.n_kv, (long long) c.n_q,
+               same ? "identical" : (bounded ? "differs(reported)" : "differs"),
                why.empty() ? "OK" : "FAIL:", why.c_str());
         n_fail += !why.empty();
         ggml_backend_free(backend);
@@ -693,14 +622,13 @@ static int child_main(const arm_def & arm, int out_fd) {
         const case_data & d = g_data[ci];
         const int h = expected_heads(c, arm.mib);
         std::vector<float> out;
-        ledger_counts l;
-        run_case(backend, c, d, false, out, l);
+        run_case(backend, c, d, false, out);
 
         std::string why;
         std::string info;
         char buf[256];
         if (arm.mib == 0) {
-            // control arm: send outputs to the parent; must never take the bounded route
+            // control arm: send outputs to the parent
             const size_t bytes = out.size() * sizeof(float);
             size_t off = 0;
             while (off < bytes) {
@@ -711,16 +639,9 @@ static int child_main(const arm_def & arm, int out_fd) {
                 }
                 off += size_t(w);
             }
-            if (l.bounded_reserved + l.bounded_pool != 0) {
-                why += " off_took_bounded";
-            }
-            if (c.kind != KIND_EXCLUDED && l.full_reserved == 0) {
-                why += " no_full_f16_copy(route_changed?)";
-            }
             if (c.kind == KIND_IDENTITY) {
                 std::vector<float> again;
-                ledger_counts l2;
-                run_case(backend, c, d, false, again, l2);
+                run_case(backend, c, d, false, again);
                 const bool rep = memcmp(again.data(), out.data(), out.size()*sizeof(float)) == 0;
                 info += rep ? " unbounded_repeatable" : " unbounded_NOT_repeatable";
             }
@@ -734,26 +655,11 @@ static int child_main(const arm_def & arm, int out_fd) {
             const bool same = memcmp(ref.data(), out.data(), out.size()*sizeof(float)) == 0;
             const double dmax = same ? 0.0 : max_abs_diff(out, ref);
             if (h == 0) {
-                if (l.bounded_reserved + l.bounded_pool != 0) {
-                    why += " bounded_row_on_excluded_or_fitting_shape";
-                }
                 if (!same) {
                     snprintf(buf, sizeof(buf), " differs_from_off(max %.3e)", dmax);
                     why += buf;
                 }
             } else {
-                if (l.bounded_reserved == 0) {
-                    why += " no_bounded_reserved_row";
-                }
-                if (l.bounded_pool != 0 || l.full_reserved != 0 || l.full_pool != 0) {
-                    why += " unexpected_scratch_rows";
-                }
-                // one live bounded row, counted once, naming this plan's heads per group and the case's KV heads
-                if (l.heads_rows != 1 || l.heads_count != 1 || l.heads != h || l.heads_nkv != c.n_head_kv) {
-                    snprintf(buf, sizeof(buf), " heads=%d/%d(rows %d, launches %lld)!=expected_%d/%lld", l.heads, l.heads_nkv,
-                             l.heads_rows, (long long) l.heads_count, h, (long long) c.n_head_kv);
-                    why += buf;
-                }
                 std::string order;
                 const bool order_same = same_order(c, h, n_sm, order);
                 const double e_b   = max_abs_vs_ref(c, d, out);
@@ -774,26 +680,22 @@ static int child_main(const arm_def & arm, int out_fd) {
                         why += " gate_b(bounded_unbounded>unbounded_ref+5e-3*R)";
                     }
                 }
-                // dst as a view: the executor must fall back to the pool and give the same bytes
+                // dst as a view: the executor falls back to the pool and must give the same bytes
                 if (ci == first_tolerance_case()) {
                     std::vector<float> outv;
-                    ledger_counts lv;
-                    run_case(backend, c, d, true, outv, lv);
+                    run_case(backend, c, d, true, outv);
                     const bool vsame = memcmp(outv.data(), out.data(), out.size()*sizeof(float)) == 0;
-                    snprintf(buf, sizeof(buf), " dst_view:%s pool_rows=%lld reserved_rows=%lld",
-                             vsame ? "identical" : "differs", (long long) lv.bounded_pool, (long long) lv.bounded_reserved);
-                    info += buf;
-                    if (!vsame || lv.bounded_pool == 0 || lv.bounded_reserved != 0) {
+                    info += vsame ? " dst_view:identical" : " dst_view:differs";
+                    if (!vsame) {
                         why += " dst_view";
                     }
                 }
             }
         }
-        printf("CASE arm=%-5s %-16s K=%-8s V=%-8s D=%lld n_kv=%lld n_q=%lld n_head=%lld n_head_kv=%lld expect_heads=%d "
-               "rows[bres=%lld bpool=%lld full_res=%lld full_pool=%lld]%s  %s%s\n",
+        printf("CASE arm=%-5s %-16s K=%-8s V=%-8s D=%lld n_kv=%lld n_q=%lld n_head=%lld n_head_kv=%lld expect_heads=%d"
+               "%s  %s%s\n",
                arm.name, c.what, ggml_type_name(c.tk), ggml_type_name(c.tv), (long long) c.D, (long long) c.n_kv,
-               (long long) c.n_q, (long long) c.n_head, (long long) c.n_head_kv, h, (long long) l.bounded_reserved,
-               (long long) l.bounded_pool, (long long) l.full_reserved, (long long) l.full_pool, info.c_str(),
+               (long long) c.n_q, (long long) c.n_head, (long long) c.n_head_kv, h, info.c_str(),
                why.empty() ? "OK" : "FAIL:", why.c_str());
         fflush(stdout);
         n_fail += !why.empty();

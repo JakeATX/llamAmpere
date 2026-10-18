@@ -8,7 +8,6 @@
 #include "llama.h"
 #include "sampling.h"
 #include "speculative.h"
-#include "ggml-ledger.h"
 #include "server-common.h"
 
 #include <sstream>
@@ -1643,30 +1642,6 @@ std::string server_task_result_metrics::to_metrics() {
         }
     }
 
-    // fallback ledger (GGML_LEDGER=1 or --fallback-ledger): which route each op took and why a fast path was skipped
-    if (ggml_ledger_enabled()) {
-        prometheus << "# HELP llamacpp:fallback_ledger_total Route and fallback counters from the fallback ledger\n"
-                   << "# TYPE llamacpp:fallback_ledger_total counter\n";
-        ggml_ledger_foreach([](const char * site, const char * key, int64_t count, void * user_data) {
-            auto & os = *(std::stringstream *) user_data;
-            auto esc = [](const char * v) {
-                std::string out;
-                for (const char * c = v; *c; ++c) {
-                    if (*c == '\\' || *c == '"') {
-                        out += '\\';
-                        out += *c;
-                    } else if (*c == '\n') {
-                        out += "\\n";
-                    } else {
-                        out += *c;
-                    }
-                }
-                return out;
-            };
-            os << "llamacpp:fallback_ledger_total{site=\"" << esc(site) << "\",key=\"" << esc(key) << "\"} " << count << "\n";
-        }, &prometheus);
-    }
-
     return prometheus.str();
 }
 
@@ -1772,7 +1747,7 @@ bool server_prompt_cache::holds(const server_prompt_cache_state * state) const {
 }
 
 server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft,
-        std::list<common_prompt_checkpoint> * hand_over) {
+        std::list<common_prompt_checkpoint> * hand_over, size_t state_size_spec) {
     // first check if the current state is contained fully in the cache
     for (auto it = states.begin(); it != states.end(); ++it) {
         const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
@@ -1795,7 +1770,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         checkpoints_size_all += ckpt.size();
     }
 
-    const size_t state_size_new = state_size_tgt + state_size_dft + checkpoints_size;
+    const size_t state_size_new = state_size_tgt + state_size_dft + state_size_spec + checkpoints_size;
 
     // skip over-limit entries to avoid disturbing the cache; with a disk tier they go straight to disk instead
     if (limit_size > 0 && state_size_new > limit_size) {
@@ -1806,8 +1781,10 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             try {
                 staging.prompt.tokens      = prompt.tokens.clone();
                 staging.prompt.checkpoints = prompt.checkpoints;
+                staging.prompt.lora_scales = prompt.lora_scales;
                 staging.data.main.resize(state_size_tgt);
                 staging.data.drft.resize(state_size_dft);
+                staging.data.spec.resize(state_size_spec);
             } catch (const std::bad_alloc & e) {
                 SRV_ERR("failed to allocate memory for the staged prompt state: %s\n", e.what());
                 staging = server_prompt_cache_state();
@@ -1855,6 +1832,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
 
     std::vector<uint8_t> state_data_tgt;
     std::vector<uint8_t> state_data_dft;
+    std::vector<uint8_t> state_data_spec;
     std::list<common_prompt_checkpoint> checkpoints_ram;
 
     // check if we can allocate enough memory for the new state
@@ -1867,6 +1845,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         }
         state_data_tgt = take_buffer(state_size_tgt);
         state_data_dft = take_buffer(state_size_dft);
+        state_data_spec.resize(state_size_spec);
         trim_spare(state_size_new);
     } catch (const std::bad_alloc & e) {
         SRV_ERR("failed to allocate memory for prompt cache state: %s\n", e.what());
@@ -1891,10 +1870,12 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         /*.prompt =*/ {
             /*.tokens      =*/ prompt.tokens.clone(),
             /*.checkpoints =*/ ckpt_thin ? std::move(checkpoints_ram) : hand_over ? std::move(*hand_over) : prompt.checkpoints,
+            /*.lora_scales =*/ prompt.lora_scales,
         },
         /*.data   =*/ {
             /*.main =*/ std::move(state_data_tgt),
             /*.drft =*/ std::move(state_data_dft),
+            /*.spec =*/ std::move(state_data_spec),
         },
     });
     if (hand_over && !ckpt_thin) {
@@ -1904,7 +1885,11 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     return &states.back();
 }
 
-bool server_prompt_cache::restore(server_prompt_cache_state & state, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+bool server_prompt_cache::restore(server_prompt_cache_state & state, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, common_speculative * spec) {
+    if (!common_speculative_restore_state(spec, id_slot, state.data.spec)) {
+        SRV_WRN("%s", "failed to restore speculative prompt state\n");
+        return false;
+    }
     {
         auto & data = state.data.main;
 
@@ -1937,10 +1922,11 @@ bool server_prompt_cache::restore(server_prompt_cache_state & state, llama_conte
         }
     }
 
+    state.data.spec.clear();
     return true;
 }
 
-bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, common_speculative * spec) {
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
@@ -2025,7 +2011,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     if (use_staging) {
         SRV_INF(" - found better prompt in the disk-tier staging area with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 
-        const bool ok = restore(staging, ctx_tgt, ctx_dft, id_slot);
+        const bool ok = restore(staging, ctx_tgt, ctx_dft, id_slot, spec);
 
         server_prompt staged = std::move(staging.prompt);
         staging = server_prompt_cache_state();
@@ -2058,10 +2044,12 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         // keep the server's projector flag, so media chunks can still follow the restored text prefix
         state.prompt.tokens      = server_tokens(rec.tokens, tokens_new.has_mtmd);
         state.prompt.checkpoints = std::move(rec.checkpoints);
+        state.prompt.lora_scales = std::move(rec.lora_scales);
         state.data.main          = std::move(rec.main);
         state.data.drft          = std::move(rec.drft);
+        state.data.spec          = std::move(rec.spec);
 
-        if (!restore(state, ctx_tgt, ctx_dft, id_slot)) {
+        if (!restore(state, ctx_tgt, ctx_dft, id_slot, spec)) {
             SRV_WRN("%s", " - failed to restore prompt from the disk tier\n");
 
             return false;
@@ -2078,7 +2066,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         const int64_t t_start = ggml_time_us();
         const size_t  n_bytes = it_best->size(); // restore() may release the state buffers
 
-        if (!restore(*it_best, ctx_tgt, ctx_dft, id_slot)) {
+        if (!restore(*it_best, ctx_tgt, ctx_dft, id_slot, spec)) {
             return false;
         }
 
@@ -2280,7 +2268,7 @@ bool server_prompt_cache::disk_spill(const server_prompt_cache_state & state) {
         return false;
     }
 
-    return disk.write(state.prompt.tokens.get_text_tokens(), state.data.main, state.data.drft, state.prompt.checkpoints);
+    return disk.write(state.prompt.tokens.get_text_tokens(), state.data.main, state.data.drft, state.prompt.checkpoints, state.data.spec, state.prompt.lora_scales);
 }
 
 void server_prompt_cache::flush_to_disk() {

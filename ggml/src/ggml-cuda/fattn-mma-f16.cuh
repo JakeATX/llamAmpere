@@ -5,7 +5,6 @@
 #include "mma.cuh"
 #include "fattn-common.cuh"
 #include "fattn-mma-config.h"
-#include "ledger.cuh"
 #include "fattn-query-layout.cuh"
 
 using namespace ggml_cuda_mma;
@@ -3499,13 +3498,6 @@ static __global__ void flash_attn_ext_f16(
 
 bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_tensor * dst, const int ncols1, const int ncols2);
 
-static void ggml_cuda_fattn_mma_note_cand(const int DKQ, const int ncols) {
-    const uint64_t id = (uint64_t(DKQ) << 32) | uint64_t(ncols);
-    ggml_cuda_ledger_count("cuda.fattn.cand_tile", id, [&](char * buf, size_t size) {
-        snprintf(buf, size, "D=%d ncols=%d", DKQ, ncols);
-    });
-}
-
 template <int DKQ, int DV, int ncols1, int ncols2, bool output_partial, bool preserve_cand = false>
 static void ggml_cuda_flash_attn_ext_mma_f16_case_impl(
         ggml_backend_cuda_context & ctx, ggml_tensor * dst,
@@ -3515,11 +3507,6 @@ static void ggml_cuda_flash_attn_ext_mma_f16_case_impl(
     const int cc = ggml_cuda_info().devices[id].cc;
 
     constexpr int ncols = ncols1 * ncols2;
-    if constexpr (preserve_cand && ggml_cuda_fattn_mma_cand_shape(DKQ, DV, ncols)) {
-        if (ampere_mma_available(cc)) {
-            ggml_cuda_fattn_mma_note_cand(DKQ, ncols);
-        }
-    }
 
     // [#39] The kernels below are instantiated with these K/V types (launch_fattn converts quantized K/V to f16 first),
     // so the host nbatch_fa reads the same typed helper as flash_attn_ext_f16<..., type_K, type_V> does on the device.

@@ -1,6 +1,5 @@
 // Trellis codebooks for the sjkvarn4t body (fp16 bits, window length L = 10), see ggml-sjkvarn.h (namespace trellis).
 // PLACEHOLDER: identity codebook cb[w] = w >> (L-4), which makes the trellis coder reproduce scalar RTN codes exactly.
-// Regenerate with frontier/SJKVARN_TCQ/gate_trellis.py --save-codebook <this file> once trained on real sealed tiles.
 #pragma once
 #define SJKVARN_TRELLIS_CB_L 10
 #define SJKVARN_TRELLIS_CB_SOURCE "placeholder identity"

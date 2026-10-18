@@ -3197,6 +3197,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
                     (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE ||
                      arch == LLM_ARCH_BAILINGMOE3);
+                // qwen4exp is not in this list: its MTP graph (graph_mtp) reads a hybrid memory, built below with
+                // filters that keep only the MTP block's attention and indexer (a plain KV cache crashes in build_inp_mem_hybrid)
 
                 const bool mtp_on_hybrid_nemotron =
                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_NEMOTRON_H_MOE;

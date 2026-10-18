@@ -163,7 +163,7 @@ public:
         llama_batch_allocr::seq_compat_fn fn() const;
     };
 
-    // counts (ledger "llama.recurrent") and logs once when the batch's seqs disagree
+    // logs once when the batch's seqs disagree
     replay_split make_replay_split(const llama_batch_allocr & balloc) const;
 
     // computed before each graph build
