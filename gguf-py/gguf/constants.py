@@ -5998,6 +5998,17 @@ class GGMLQuantizationType(IntEnum):
     EXL3_6  = 55
     EXL3_7  = 56
     EXL3_8  = 57
+    AI4     = 70
+    AI4_U   = 71
+    AI3_U   = 72
+    AI2_U   = 73
+    AI5_U   = 74
+    AI6_U   = 75
+    AI2_S   = 96
+    AI3_S   = 97
+    AI4_S   = 98
+    AI5_S   = 99
+    AI6_S   = 100
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -6063,6 +6074,7 @@ class LlamaFileType(IntEnum):
     MOSTLY_TQ4_1S        = 44  # except 1d tensors
     MOSTLY_Q5_CR         = 45  # except 1d tensors, ConvRot-rotated Q5_0
     MOSTLY_Q6_CR         = 46  # except 1d tensors, ConvRot-rotated Q6_K
+    MOSTLY_AI4           = 52  # AI+ trellis weights, except 1d tensors
 
     GUESSED              = 1024  # not specified in the model file
 
@@ -6236,6 +6248,17 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.EXL3_6:  (256, 32 * 6),
     GGMLQuantizationType.EXL3_7:  (256, 32 * 7),
     GGMLQuantizationType.EXL3_8:  (256, 32 * 8),
+    GGMLQuantizationType.AI4: (1024, 528),
+    GGMLQuantizationType.AI4_U: (128, 66),
+    GGMLQuantizationType.AI3_U: (128, 50),
+    GGMLQuantizationType.AI2_U: (128, 34),
+    GGMLQuantizationType.AI5_U: (128, 82),
+    GGMLQuantizationType.AI6_U: (128, 98),
+    GGMLQuantizationType.AI2_S: (1024, 258),
+    GGMLQuantizationType.AI3_S: (1024, 386),
+    GGMLQuantizationType.AI4_S: (1024, 514),
+    GGMLQuantizationType.AI5_S: (1024, 642),
+    GGMLQuantizationType.AI6_S: (1024, 770),
 }
 
 

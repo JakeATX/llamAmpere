@@ -732,6 +732,10 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
     res->t_h_nextn= cur;
 
     cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    // fork: Keep masked MTP carries aligned with the selected draft output rows.
+    if (cparams.embeddings_nextn_masked) {
+        res->t_h_nextn = cur;
+    }
     cb(cur, "mtp_shared_head_norm", -1);
 
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;

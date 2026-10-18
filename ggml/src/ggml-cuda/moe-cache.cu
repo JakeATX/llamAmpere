@@ -4029,10 +4029,22 @@ static int moe_cache_warm(void * opaque, const ggml_moe_cache_tensor_desc * tens
     return queued;
 }
 
+static int moe_cache_session_status(void * opaque, size_t * allocated_bytes) {
+    auto & session = *static_cast<moe_cache_session *>(opaque);
+    std::lock_guard<std::mutex> lock(session.mu);
+    *allocated_bytes = 0;
+    if (session.dormant || session.stopping) { return 0; }
+    for (const auto & device : session.devices) {
+        if (!device->dead.load()) { *allocated_bytes += device->allocated_bytes; }
+    }
+    return 1;
+}
+
 static void moe_cache_register(const void * owner) {
     g_moe_cache_owner = owner;
     ggml_moe_cache_api api = {};
     api.owner = owner;
+    api.session_status = moe_cache_session_status;
     api.query_config = moe_cache_query_config;
     api.query_device = moe_cache_query_device;
     api.query_shape = moe_cache_query_shape;

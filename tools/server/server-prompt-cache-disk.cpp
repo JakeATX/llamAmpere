@@ -21,11 +21,12 @@ static int pc_getpid() { return (int) getpid(); }
 namespace fs = std::filesystem;
 
 static const char     PC_MAGIC[4] = {'L', 'C', 'P', 'C'};
-static const uint32_t PC_VERSION  = 2;
+static const uint32_t PC_VERSION  = 4;
 
 static constexpr uint64_t PC_MAX_KEY_LEN  = 1u << 20;
 static constexpr uint64_t PC_MAX_N_TOKENS = 1u << 26;
 static constexpr uint32_t PC_MAX_N_CKPT   = 1u << 16;
+static constexpr uint32_t PC_MAX_N_LORA   = 1u << 16;
 
 // word-wise FNV-1a: 8 bytes per multiply, so hashing a multi-GiB entry costs a fraction of writing it
 struct pc_hasher {
@@ -267,7 +268,7 @@ bool server_prompt_disk_tier::parse_header(const std::string & file, server_prom
     f.read(magic, 4);
     f.read((char *) &version, sizeof(version));
     if (!f || memcmp(magic, PC_MAGIC, 4) != 0 || version != PC_VERSION) {
-        bad = true; // includes v1 files: they carry no model/KV key and can never be restored safely
+        bad = true; // includes v1 files (no model/KV key) and v2/v3 files (no lora scales)
         return false;
     }
 
@@ -501,7 +502,9 @@ bool server_prompt_disk_tier::guard_allows(uint64_t need) {
 bool server_prompt_disk_tier::write(const llama_tokens & tokens,
                                     const std::vector<uint8_t> & main,
                                     const std::vector<uint8_t> & drft,
-                                    const std::list<common_prompt_checkpoint> & checkpoints) {
+                                    const std::list<common_prompt_checkpoint> & checkpoints,
+                                    const std::vector<uint8_t> & spec,
+                                    const std::vector<float> & lora_scales) {
     if (!enabled() || tokens.empty() || main.empty()) {
         return false;
     }
@@ -514,10 +517,11 @@ bool server_prompt_disk_tier::write(const llama_tokens & tokens,
         }
     }
 
-    uint64_t payload = 8 + main.size() + 8 + drft.size() + 4;
+    uint64_t payload = 8 + main.size() + 8 + drft.size() + 8 + spec.size() + 4;
     for (const auto & c : checkpoints) {
         payload += 8 + 4 + 4 + 4 + 8 + c.data_tgt.size() + 8 + c.data_dft.size() + 8 + c.data_spec.size();
     }
+    payload += 4 + lora_scales.size() * sizeof(float);
     const uint64_t header = 4 + 4 + 8 + 4 + key.size() + 8 + tokens.size() * sizeof(llama_token) + 8;
     const uint64_t total  = header + payload + 8;
 
@@ -572,6 +576,7 @@ bool server_prompt_disk_tier::write(const llama_tokens & tokens,
     w.val<uint64_t>(payload);
     w.blob(main);
     w.blob(drft);
+    w.blob(spec);
     w.val<uint32_t>((uint32_t) checkpoints.size());
     for (const auto & c : checkpoints) {
         w.val<int64_t>(c.n_tokens);
@@ -582,6 +587,8 @@ bool server_prompt_disk_tier::write(const llama_tokens & tokens,
         w.blob(c.data_dft);
         w.blob(c.data_spec);
     }
+    w.val<uint32_t>((uint32_t) lora_scales.size());
+    w.bytes(lora_scales.data(), lora_scales.size() * sizeof(float));
     const uint64_t checksum = w.hs.final();
     if (w.ok && fwrite(&checksum, 1, sizeof(checksum), f) != sizeof(checksum)) {
         w.ok = false;
@@ -680,7 +687,7 @@ bool server_prompt_disk_tier::read(std::list<server_prompt_disk_entry>::iterator
     }
 
     uint32_t n_ckpt = 0;
-    if (!why && (!r.blob(out.main) || !r.blob(out.drft) || !r.val(n_ckpt) || n_ckpt > PC_MAX_N_CKPT)) {
+    if (!why && (!r.blob(out.main) || !r.blob(out.drft) || !r.blob(out.spec) || !r.val(n_ckpt) || n_ckpt > PC_MAX_N_CKPT)) {
         why = "truncated state";
     }
 
@@ -693,6 +700,17 @@ bool server_prompt_disk_tier::read(std::list<server_prompt_disk_entry>::iterator
             break;
         }
         out.checkpoints.push_back(std::move(c));
+    }
+
+    uint32_t n_lora = 0;
+    if (!why && (!r.val(n_lora) || n_lora > PC_MAX_N_LORA)) {
+        why = "truncated lora scales";
+    }
+    if (!why) {
+        out.lora_scales.resize(n_lora);
+        if (!r.bytes(out.lora_scales.data(), n_lora * sizeof(float))) {
+            why = "truncated lora scales";
+        }
     }
 
     if (!why) {

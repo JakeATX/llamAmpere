@@ -1049,6 +1049,10 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     if (inp_out_ids) {
         cur = ggml_get_rows(ctx0, cur, inp_out_ids);
     }
+    // fork: Masked MTP carries must select the draft rows, not preceding catch-up rows.
+    if (cparams.embeddings_nextn_masked) {
+        res->t_h_nextn = cur;
+    }
     cb(cur, "mtp_shared_head_norm", -1);
 
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;

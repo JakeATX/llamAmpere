@@ -64,6 +64,10 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
         ->add_alias("n") // alias "n" as fallback (OpenAI completions API)
         ->set_desc("Number of completions to generate. If the input has multiple prompts, total outputs will be N prompts times n_cmpl"));
 
+    add((new field_num("eval_cache_save_at", params.eval_cache_save_at))
+        ->set_hard_limits(0, INT32_MAX)
+        ->set_desc("Eval-cache builder only (server started with --eval-cache-build): store the prompt state at the start of the prompt batch that contains this many tokens in the --eval-cache folder. Use the prompt length to store the whole prompt"));
+
     add((new field_num("n_cache_reuse", params.n_cache_reuse))
         ->set_hard_limits(0, INT32_MAX)
         ->set_desc("Min chunk size to attempt reusing from the cache via KV shifting. See --cache-reuse arg"));

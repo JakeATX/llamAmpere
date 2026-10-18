@@ -1,7 +1,6 @@
 #include "llama-memory-recurrent.h"
 
 #include "ggml-backend.h"
-#include "ggml-ledger.h"
 #include "llama-impl.h"
 #include "llama-io.h"
 #include "llama-batch.h"
@@ -645,7 +644,7 @@ llama_memory_recurrent::replay_split llama_memory_recurrent::make_replay_split(c
     rs.ckpt_span  = ckpt_span;
     rs.s_stale    = s_stale;
 
-    // is anything kept apart in this batch? only for the log and the ledger
+    // is anything kept apart in this batch? only for the log
     const llama_batch & batch = balloc.get_batch();
     llama_seq_id first = -1;
     bool disagree = false;
@@ -661,7 +660,6 @@ llama_memory_recurrent::replay_split llama_memory_recurrent::make_replay_split(c
         }
     }
     if (disagree) {
-        ggml_ledger_add("llama.recurrent", "replay_split lanes_disagree", 1);
         static bool logged = false;
         if (!logged) {
             logged = true;
@@ -1905,7 +1903,6 @@ uint32_t llama_memory_recurrent_context::get_ckpt_span() const {
     }
     if (disagree) {
         // init_batch keeps such lanes apart ([TAG_GDN_REPLAY_SPLIT]); reaching this is a bug
-        ggml_ledger_add("llama.recurrent", "replay_lanes_disagree_in_ubatch", 1);
         static bool warned = false;
         if (!warned) {
             warned = true;

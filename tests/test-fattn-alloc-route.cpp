@@ -6,19 +6,16 @@
 // allocation covers it and into the pool otherwise. Each case runs one FLASH_ATTN_EXT twice on the same inputs:
 //   arm 1: dst allocated normally (ggml_backend_alloc_ctx_tensors -> the buffer type's alloc size), reserved region;
 //   arm 2: dst is a view of a plain f32 tensor (dst->view_src != nullptr), so launch_fattn takes the pool.
-// Pass: the two outputs are memcmp-equal, and the fallback ledger's "cuda.fattn" f16_convert counter shows
-// scratch=reserved only in arm 1 and scratch=pool only in arm 2 for the converting pair, and no conversion at all for
-// the f16/f16 control. K q4_0 / V q8_0 converts at every width here on SM86: widths 4 and 8 route to MMA (always f16
-// K/V), width 1 routes to VEC, which has no q4_0-q8_0 instance in the default GGML_CUDA_FA_QUANTS list and falls
-// back to f16. A build that compiles that instance fails width 1 with "did not convert".
-// test-backend-ops compares a backend against the CPU and cannot read the ledger, hence this file.
-// CUDA graphs are off (GGML_CUDA_DISABLE_GRAPHS) so every compute launches on the host and is counted.
+// Pass: the two outputs are memcmp-equal. K q4_0 / V q8_0 converts at every width here on SM86: widths 4 and 8 route
+// to MMA (always f16 K/V), width 1 routes to VEC, which has no q4_0-q8_0 instance in the default GGML_CUDA_FA_QUANTS
+// list and falls back to f16; the f16/f16 pair is the control. test-backend-ops compares a backend against the CPU
+// within a tolerance, not two allocations of the same backend byte for byte, hence this file.
+// CUDA graphs are off (GGML_CUDA_DISABLE_GRAPHS) so both arms launch the same way.
 // Needs a GPU backend; skips (exit 0) without one.
 
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
-#include "ggml-ledger.h"
 
 #include <cmath>
 #include <cstdio>
@@ -34,7 +31,7 @@ struct test_case_def {
     int64_t   D;
     int64_t   n_kv;
     int64_t   n_q;
-    bool      converts; // the case must go through the f16 conversion
+    bool      converts; // the case goes through the f16 conversion
 };
 
 static constexpr int64_t n_head    = 8;
@@ -56,23 +53,6 @@ static std::vector<test_case_def> cases() {
         }
     }
     return out;
-}
-
-struct ledger_counts {
-    int64_t reserved = 0;
-    int64_t pool     = 0;
-};
-
-static void ledger_cb(const char * site, const char * key, int64_t count, void * user_data) {
-    ledger_counts * c = (ledger_counts *) user_data;
-    if (strcmp(site, "cuda.fattn") != 0 || strncmp(key, "f16_convert ", 12) != 0) {
-        return;
-    }
-    if (strstr(key, "scratch=reserved") != nullptr) {
-        c->reserved += count;
-    } else if (strstr(key, "scratch=pool") != nullptr) {
-        c->pool += count;
-    }
 }
 
 static void set_quantized(ggml_tensor * t, std::mt19937 & rng) {
@@ -157,13 +137,11 @@ static void run_arm(ggml_backend_t backend, const test_case_def & c, bool as_vie
 }
 
 int main() {
-    // every compute must launch on the host so the ledger sees it (a CUDA graph replay would not count)
 #ifdef _WIN32
     _putenv_s("GGML_CUDA_DISABLE_GRAPHS", "1");
 #else
     setenv("GGML_CUDA_DISABLE_GRAPHS", "1", 1);
 #endif
-    ggml_ledger_set_enabled(true);
 
     ggml_backend_load_all();
     ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
@@ -178,15 +156,8 @@ int main() {
     const std::vector<test_case_def> all = cases();
     for (const test_case_def & c : all) {
         std::vector<uint8_t> out1, out2;
-        ledger_counts l1, l2;
-
-        ggml_ledger_reset();
         run_arm(backend, c, false, out1);
-        ggml_ledger_foreach(ledger_cb, &l1);
-
-        ggml_ledger_reset();
         run_arm(backend, c, true, out2);
-        ggml_ledger_foreach(ledger_cb, &l2);
 
         std::string why;
         const bool equal = out1.size() == out2.size() && memcmp(out1.data(), out2.data(), out1.size()) == 0;
@@ -196,24 +167,9 @@ int main() {
             run_arm(backend, c, false, out1b);
             why += out1b == out1 ? " bytes_differ" : " bytes_differ(arm1_not_repeatable)";
         }
-        if (c.converts) {
-            if (l1.reserved == 0 && l1.pool == 0 && l2.reserved == 0 && l2.pool == 0) {
-                why += " did_not_convert";
-            } else {
-                if (l1.reserved == 0 || l1.pool != 0) {
-                    why += " arm1_not_reserved";
-                }
-                if (l2.pool == 0 || l2.reserved != 0) {
-                    why += " arm2_not_pool";
-                }
-            }
-        } else if (l1.reserved != 0 || l1.pool != 0 || l2.reserved != 0 || l2.pool != 0) {
-            why += " control_converted";
-        }
 
-        printf("K=%-5s V=%-5s D=%3lld n_kv=%4lld n_q=%lld  arm1 reserved=%lld pool=%lld  arm2 reserved=%lld pool=%lld  %s%s\n",
+        printf("K=%-5s V=%-5s D=%3lld n_kv=%4lld n_q=%lld  %s%s\n",
                ggml_type_name(c.type_K), ggml_type_name(c.type_V), (long long) c.D, (long long) c.n_kv, (long long) c.n_q,
-               (long long) l1.reserved, (long long) l1.pool, (long long) l2.reserved, (long long) l2.pool,
                why.empty() ? "OK" : "FAIL:", why.c_str());
         n_fail += !why.empty();
     }

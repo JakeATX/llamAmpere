@@ -16,6 +16,7 @@
 #include "ops.h"
 #include "ggml.h"
 #include "common.h"
+#include "ggml-ai4.h"
 #include "tiled/tiled.h"
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
@@ -350,6 +351,72 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     [GGML_TYPE_Q6_CR] = {
         .from_float               = (ggml_from_float_t) quantize_row_q6_cr_ref,
         .vec_dot                  = ggml_vec_dot_q6_cr_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_AI4] = {
+        .from_float               = NULL,
+        .vec_dot                  = NULL, // CUDA whole-tensor path only
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_AI4_U] = {
+        .from_float               = NULL,
+        .vec_dot                  = NULL, // slab reference path: ggml_compute_forward_mul_mat(_id)_ai4
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_AI5_U] = {
+        .from_float               = NULL,
+        .vec_dot                  = NULL, // slab reference path: ggml_compute_forward_mul_mat(_id)_ai4
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_AI3_U] = {
+        .from_float               = NULL,
+        .vec_dot                  = NULL, // slab reference path: ggml_compute_forward_mul_mat(_id)_ai4
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_AI2_U] = {
+        .from_float               = NULL,
+        .vec_dot                  = NULL,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_AI6_U] = {
+        .from_float               = NULL,
+        .vec_dot                  = NULL,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_AI2_S] = {    // span layout: slab reference path: ggml_compute_forward_mul_mat(_id)_ai4
+        .from_float               = NULL,
+        .vec_dot                  = NULL,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_AI3_S] = {
+        .from_float               = NULL,
+        .vec_dot                  = NULL,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_AI4_S] = {
+        .from_float               = NULL,
+        .vec_dot                  = NULL,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_AI5_S] = {
+        .from_float               = NULL,
+        .vec_dot                  = NULL,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_AI6_S] = {
+        .from_float               = NULL,
+        .vec_dot                  = NULL,
         .vec_dot_type             = GGML_TYPE_F32,
         .nrows                    = 1,
     },
@@ -1519,6 +1586,110 @@ static void ggml_compute_forward_mul_mat_exl3(
     }
 }
 
+// AI4 (Ampere INT4, formerly D2; whole-tensor 16-row slab type, ggml-ai4.h): reference path, one slab at a time dequantized to f32 in the
+// original basis (the CUDA backend's reconstruct reference), then f32 dot products. Same scratch as EXL3 (16 x K).
+static void ggml_compute_forward_mul_mat_ai4(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * dst) {
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int      lay  = ggml_ai4_layout(src0->type);   // 0 = AI4 slab, 1 = AIk_U unit-128, 2 = AIk_S span-1024
+    const int      aik  = ggml_ai4_rate(src0->type);
+    const uint32_t aimul = ggml_ai4_trellis_mul(src0->type);
+    GGML_ASSERT(ne02 == 1 && ne03 == 1);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(nb10 == sizeof(float) && nb0 == sizeof(float));
+    GGML_ASSERT(ne00 % (lay == 1 ? AI4U_UK : AI4_SB) == 0 && ne01 % AI4_TR == 0 && ne00 == ne10 && ne01 == ne0);
+
+    const int64_t K  = ne00;
+    const int64_t ng = ne01 / AI4_TR;
+    GGML_ASSERT(params->wsize >= (size_t) nth * 16 * K * sizeof(float));
+    float * wbuf = (float *) params->wdata + (size_t) ith * 16 * K;
+
+    for (int64_t g = ith; g < ng; g += nth) {
+        ai4x_dequantize_slab_lkc(lay, aik, aimul, (const uint8_t *) src0->data + g * ai4x_slab_bytes_lk(lay, K, aik), wbuf, K);
+        for (int64_t i13 = 0; i13 < ne13; ++i13) {
+            for (int64_t i12 = 0; i12 < ne12; ++i12) {
+                for (int64_t i11 = 0; i11 < ne11; ++i11) {
+                    const float * x = (const float *) ((const char *) src1->data + i11*nb11 + i12*nb12 + i13*nb13);
+                    float * d = (float *) ((char *) dst->data + i11*nb1 + i12*nb2 + i13*nb3) + g*16;
+                    for (int r = 0; r < 16; ++r) {
+                        ggml_vec_dot_f32((int) K, &d[r], 0, wbuf + (size_t) r * K, 0, x, 0, 1);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// AI4 / AI4_U MUL_MAT_ID reference: src0 [K, M, n_expert] (expert e at e*nb02), src1 [K, ne11 (1 or n_used), n_tokens],
+// ids [n_used, n_tokens], dst [M, n_used, n_tokens]. Threads split the slabs; for every expert that some (slot, token)
+// selects, each thread dequantizes its slabs of that expert once and serves all pairs routed to it. Experts no pair
+// selects are never read.
+static void ggml_compute_forward_mul_mat_id_ai4(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * dst) {
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+    const struct ggml_tensor * ids  = dst->src[2];
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int      lay  = ggml_ai4_layout(src0->type);   // 0 = AI4 slab, 1 = AIk_U unit-128, 2 = AIk_S span-1024
+    const int      aik  = ggml_ai4_rate(src0->type);
+    const uint32_t aimul = ggml_ai4_trellis_mul(src0->type);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(nb10 == sizeof(float) && nb0 == sizeof(float) && ne03 == 1);
+    GGML_ASSERT(ne00 % (lay == 1 ? AI4U_UK : AI4_SB) == 0 && ne01 % AI4_TR == 0 && ne00 == ne10 && ne01 == ne0);
+
+    const int64_t K     = ne00;
+    const int64_t ng    = ne01 / AI4_TR;
+    const int64_t n_ids = ids->ne[0];
+    const int64_t n_tok = ids->ne[1];
+    GGML_ASSERT(params->wsize >= (size_t) nth * 16 * K * sizeof(float));
+    float * wbuf = (float *) params->wdata + (size_t) ith * 16 * K;
+
+    for (int64_t e = 0; e < ne02; ++e) {
+        bool used = false;
+        for (int64_t t = 0; t < n_tok && !used; ++t) {
+            for (int64_t s = 0; s < n_ids; ++s) {
+                if (*(const int32_t *) ((const char *) ids->data + s*ids->nb[0] + t*ids->nb[1]) == e) {
+                    used = true;
+                    break;
+                }
+            }
+        }
+        if (!used) {
+            continue;
+        }
+        const uint8_t * w = (const uint8_t *) src0->data + e*nb02;
+        for (int64_t g = ith; g < ng; g += nth) {
+            ai4x_dequantize_slab_lkc(lay, aik, aimul, w + g * ai4x_slab_bytes_lk(lay, K, aik), wbuf, K);
+            for (int64_t t = 0; t < n_tok; ++t) {
+                for (int64_t s = 0; s < n_ids; ++s) {
+                    if (*(const int32_t *) ((const char *) ids->data + s*ids->nb[0] + t*ids->nb[1]) != e) {
+                        continue;
+                    }
+                    const float * x = (const float *) ((const char *) src1->data + (s % ne11)*nb11 + t*nb12);
+                    float * d = (float *) ((char *) dst->data + s*nb1 + t*nb2) + g*16;
+                    for (int r = 0; r < 16; ++r) {
+                        ggml_vec_dot_f32((int) K, &d[r], 0, wbuf + (size_t) r * K, 0, x, 0, 1);
+                    }
+                }
+            }
+        }
+    }
+}
+
 void ggml_compute_forward_mul_mat(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
@@ -1533,6 +1704,10 @@ void ggml_compute_forward_mul_mat(
     }
     if (ggml_exl3_bits(src0->type)) {
         ggml_compute_forward_mul_mat_exl3(params, dst);
+        return;
+    }
+    if (ggml_ai4_rate(src0->type) != 0) {
+        ggml_compute_forward_mul_mat_ai4(params, dst);
         return;
     }
 
@@ -2118,6 +2293,10 @@ static void ggml_compute_forward_mul_mat_id_impl(
 static void ggml_compute_forward_mul_mat_id(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
+    if (ggml_ai4_rate(dst->src[0]->type) != 0) {
+        ggml_compute_forward_mul_mat_id_ai4(params, dst);
+        return;
+    }
     ggml_compute_forward_mul_mat_id_impl(params, dst, 0, false, true);
 }
 
@@ -3295,7 +3474,9 @@ struct ggml_cplan ggml_graph_plan(
                     {
                         const enum ggml_type vec_dot_type = type_traits_cpu[node->src[0]->type].vec_dot_type;
 
-                        if (ggml_exl3_bits(node->src[0]->type)) {
+                        if (ggml_ai4_rate(node->src[0]->type) != 0) {
+                            cur = (size_t) n_tasks * 16 * node->src[0]->ne[0] * sizeof(float);
+                        } else if (ggml_exl3_bits(node->src[0]->type)) {
                             // per-thread [16][K] f32 row-group scratch (ggml_compute_forward_mul_mat_exl3),
                             // plus a shared [T][K] x' when the node carries the suh/svh glue (src[2])
                             cur = (size_t) n_tasks * 16 * node->src[0]->ne[0] * sizeof(float);
@@ -3312,6 +3493,10 @@ struct ggml_cplan ggml_graph_plan(
                 case GGML_OP_MUL_MAT_ID:
                     {
                         cur = 0;
+                        if (ggml_ai4_rate(node->src[0]->type) != 0) {
+                            cur = (size_t) n_tasks * 16 * node->src[0]->ne[0] * sizeof(float);
+                            break;
+                        }
                         const struct ggml_tensor * src0 = node->src[0];
                         const struct ggml_tensor * src1 = node->src[1];
                         const struct ggml_tensor * ids = node->src[2];
@@ -3525,6 +3710,10 @@ static bool ggml_moe_cache_can_fuse(
     const struct ggml_moe_cache_api moe_cache = ggml_moe_cache_active();
     if (!moe_cache.fused_begin || !moe_cache.collect ||
         !moe_cache.end) {
+        return false;
+    }
+
+    if (cgraph->nodes[node_n]->src[0] && ggml_ai4_rate(cgraph->nodes[node_n]->src[0]->type) != 0) {
         return false;
     }
 

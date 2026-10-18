@@ -1,4 +1,4 @@
-> **llamAmpere v0.5.4**: a llama.cpp fork tuned for the RTX 3090 / 3090 Ti (Ampere, SM86), running Qwen3.8-27B with its MTP draft head.
+> **llamAmpere v0.5.5**: a llama.cpp fork tuned for the RTX 3090 / 3090 Ti (Ampere, SM86), running Qwen3.8-27B with its MTP draft head.
 
 ## What's new in v0.5
 
@@ -23,6 +23,11 @@
   RTX 50-series cards. [Release notes](docs/llamampere-v0.5.3/RELEASE_NOTES.md).
 - **New in v0.5.4:** a crash fix. With `--parallel 3` or more and the MTP drafter on, the server no longer stops
   with `failed to remove sequence N`. No speed change. [Release notes](docs/llamampere-v0.5.4/RELEASE_NOTES.md).
+- **New in v0.5.5:** `--eval-cache DIR`, an opt-in, read-only prompt cache on disk for eval and benchmark prompts.
+  Long prompts that an eval sends on every run load from a prebuilt folder instead of being read again, with the
+  same output at temperature 0. Ready-made folders for Swift 1.5:
+  [jakeatx/llamampere-evalcache](https://huggingface.co/datasets/jakeatx/llamampere-evalcache). Also bug fixes for
+  the MTP drafter state, `id_slot` and the automatic fit. [Release notes](docs/llamampere-v0.5.5/RELEASE_NOTES.md).
 - **Coming next:** a Swift 1.5 EXL3 4.0 bpw model.
 - **Read more:** the [SJ-KVaRN paper](https://huggingface.co/spaces/jakeatx/sj-kvarn-paper) and the standalone codec,
   [JakeATX/sj-kvarn-codec](https://github.com/JakeATX/sj-kvarn-codec) (MIT).

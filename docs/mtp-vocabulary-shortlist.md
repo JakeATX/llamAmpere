@@ -115,8 +115,6 @@ So the guidance is: **keep the shipped default at `0`**; a rag-only deployment i
 real reason to raise it. Do not describe `p_min` as a throughput win — on the ship mix it is a wash,
 and on the two heaviest-weighted fixtures it is slightly negative.
 
-Full write-up: `kernel_cache_investigation/frontier/H2_h1_acceptance_recovery/RESULT.md`.
-
 ## Memory
 
 Indexed rows add only the map (<= 256 KiB) plus the smaller compact logits/sampler buffers. A packed
