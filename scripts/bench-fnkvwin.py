@@ -140,11 +140,47 @@ def probability_rows(response, n_vocab):
     return result
 
 
+def kl_configuration(command, resident):
+    argv = command.get('argv', [])
+    settings = command.get('environment', {})
+    require(isinstance(argv, list) and argv and all(isinstance(arg, str) for arg in argv), 'KL command is missing')
+    require(isinstance(settings, dict) and settings, 'KL environment is missing')
+    required = {'-m': str(MODEL), '--load-mode': 'mmap', '-c': '131072', '-b': '131072', '-ub': '12288',
+                '-ctk': 'sjkvarn4', '-ctv': 'sjkvarn4', '--spec-type': 'none'}
+    for flag, value in required.items():
+        require(argv.count(flag) == 1 and argv.index(flag) + 1 < len(argv) and argv[argv.index(flag) + 1] == value,
+                f'wrong KL option: {flag}')
+    normalized = argv[1:]
+    if resident:
+        require(normalized.count('--kv-resident') == 1, 'KL candidate resident flag missing')
+        offset = normalized.index('--kv-resident')
+        require(normalized[offset + 1:offset + 2] == [str(resident)], 'wrong KL resident window')
+        normalized = normalized[:offset] + normalized[offset + 2:]
+    else:
+        require('--kv-resident' not in normalized, 'KL baseline unexpectedly uses a resident window')
+    require(normalized.count('--port') == 1, 'KL server port missing')
+    offset = normalized.index('--port')
+    require(offset + 1 < len(normalized), 'KL server port value missing')
+    normalized = normalized[:offset] + normalized[offset + 2:]
+    for key, value in INFERENCE_ENV.items():
+        require(settings.get(key) == value, f'KL inference setting changed: {key}')
+    profile = {'path': str(EXPERT_PROFILE), 'sha256': EXPERT_PROFILE_SHA256}
+    require(command.get('expert_usage_profile') == profile and settings.get('GGML_MOE_CACHE_PROFILE_LOAD') == profile['path'],
+            'KL expert usage profile changed or is missing')
+    return {'argv': normalized, 'environment': {key: value for key, value in settings.items() if key != 'LD_LIBRARY_PATH'},
+            'expert_usage_profile': profile}
+
+
 def compare(args):
     baseline = json.loads((args.baseline / 'result.json').read_text())
     candidate = json.loads((args.candidate / 'result.json').read_text())
     require(baseline['status'] == candidate['status'] == 'complete', 'both KL arms must complete')
     require(baseline['mode'] == candidate['mode'] == 'kl', 'comparison requires KL arms')
+    require(baseline.get('resident_cells') == 0 and candidate.get('resident_cells') == 32768,
+            'KL requires resident0 baseline and resident32768 candidate')
+    baseline_command = json.loads((args.baseline / 'command.json').read_text())
+    candidate_command = json.loads((args.candidate / 'command.json').read_text())
+    require(kl_configuration(baseline_command, 0) == kl_configuration(candidate_command, 32768), 'KL arm settings differ')
     require(baseline['timings'].get('prompt_n') == candidate['timings'].get('prompt_n') == PROMPT_N,
             'KL comparison requires full 100000-token prompts')
     require(baseline['prompt_sha256'] == candidate['prompt_sha256'], 'prompt token IDs differ')
@@ -173,6 +209,8 @@ def compare(args):
     finite = [step['kl_nats'] for step in steps if not step['infinite_kl']]
     result = {'direction': 'KL(baseline || candidate)', 'normalization': 'full-vocabulary log probabilities normalized by measured mass',
               'matched_tokens': True, 'prompt_tokens': PROMPT_N, 'prompt_sha256': baseline['prompt_sha256'],
+              'resident_cells': {'baseline': 0, 'candidate': 32768},
+              'baseline_command': baseline_command, 'candidate_command': candidate_command,
               'baseline_runtime_identity': json.loads((args.baseline / 'runtime.json').read_text()),
               'candidate_runtime_identity': json.loads((args.candidate / 'runtime.json').read_text()),
               'n_vocab': baseline['n_vocab'], 'steps': steps,

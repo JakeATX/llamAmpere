@@ -44,22 +44,36 @@ def positive(value, name):
     return float(value)
 
 
+def required_operator_commands(data):
+    commands = data.get('commands', [])
+    bench.require(commands and all(command.get('returncode') == 0 for command in commands), 'operator run-unit did not complete successfully')
+    required = []
+    for executable, mode in (('test-sjkvarn-attn', '--resident'), ('test-sjkvarn-attn', '--resident-tq6'), ('test-sjkvarn-state', '--resident')):
+        matches = []
+        for index, command in enumerate(commands):
+            argv = command.get('command', [])
+            if argv and Path(argv[0]).name == executable and mode in argv[1:]:
+                if executable == 'test-sjkvarn-attn' and set(argv[1:]) & {'--resident', '--resident-tq6'} != {mode}:
+                    continue
+                matches.append(index)
+        bench.require(matches, f'operator evidence lacks {executable} {mode}')
+        required.extend(matches)
+    return sorted(set(required))
+
+
 def validate_gate(kind, data):
     status = data.get('status')
     if status is not None:
         bench.require(status in ('complete', 'passed', 'pass'), f'{kind} gate did not pass')
     bench.require(not data.get('error') and not data.get('guard_failure') and not data.get('stop_reason'), f'{kind} gate reports a failure')
     if kind == 'operator':
-        commands = data.get('commands', [])
-        summary = data.get('test_summary', {})
-        if commands:
-            bench.require(status is not None and all(command.get('returncode') == 0 for command in commands), 'operator run-unit did not complete successfully')
-            for executable in ('test-sjkvarn-attn', 'test-sjkvarn-state'):
-                bench.require(any(executable in ' '.join(command.get('command', [])) and '--resident' in command.get('command', []) for command in commands), f'operator evidence lacks the resident {executable} gate')
-        else:
-            bench.require(status is not None and summary.get('executed', 0) > 0 and summary.get('passed') == summary['executed'], 'operator evidence has zero or missing executed cases')
+        bench.require(status is not None, 'operator status is missing')
+        required_operator_commands(data)
     elif kind == 'kl':
         bench.require(data.get('prompt_tokens') == 100000, 'KL evidence is not a recorded 100K comparison')
+        bench.require(data.get('resident_cells') == {'baseline': 0, 'candidate': 32768}, 'KL evidence does not compare resident0 versus resident32768')
+        bench.require(bench.kl_configuration(data.get('baseline_command', {}), 0) == bench.kl_configuration(data.get('candidate_command', {}), 32768), 'KL arm settings differ')
+        bench.require(data.get('baseline_runtime_identity'), 'KL comparison lacks baseline runtime identity')
         bench.require(data.get('matched_tokens') is True and data.get('infinite_kl') is False, 'KL evidence lacks matched finite distributions')
         bench.require(type(data.get('n_vocab')) is int and data['n_vocab'] > 0 and len(data.get('steps', [])) == 8, 'KL evidence lacks eight full-vocabulary steps')
         for field in ('mean_kl_nats', 'max_kl_nats'):
@@ -100,6 +114,7 @@ def validate_runtime(actual, expected, binary):
 
 def bind_evidence(kind, path, data, expected, binary):
     identities = []
+    operator_executables = {}
     runtime = data.get('runtime_identity')
     candidate = data.get('candidate_runtime_identity') or (runtime.get('candidate') if isinstance(runtime, dict) else None)
     if candidate:
@@ -108,16 +123,22 @@ def bind_evidence(kind, path, data, expected, binary):
     if kind != 'kl' and isinstance(runtime, list):
         identities.append(('runtime_identity', runtime))
     if kind == 'operator':
+        required = required_operator_commands(data)
         for index, command in enumerate(data.get('commands', [])):
+            bench.require(index not in required or command.get('runtime_identity'), f'operator command {index} lacks runtime identity')
             if command.get('runtime_identity'):
-                identities.append((f'commands[{index}].runtime_identity', command['runtime_identity']))
+                source = f'commands[{index}].runtime_identity'
+                identities.append((source, command['runtime_identity']))
+                operator_executables[source] = Path(command['command'][0]).name
     runtime_files = []
     relatives = ['cold/runtime.json', 'reload/runtime.json'] if kind == 'cache' else ['runtime.json'] if kind in ('operator', 'niah') else []
     for relative in relatives:
         sibling = path.parent / relative
+        bench.require(kind != 'cache' or sibling.is_file(), f'cache gate lacks process identity: {relative}')
         if sibling.is_file():
             identities.append((str(sibling), read_json(sibling)))
             runtime_files.append({'path': str(sibling), 'sha256': sha256(sibling)})
+    bench.require(identities, f'{kind} gate lacks runtime identity')
     current_libraries = {Path(item['path']).name: item['sha256'] for item in expected
                          if Path(item['path']).name.startswith(('libllama', 'libggml', 'libmtmd'))}
     executable_hash = next(item['sha256'] for item in expected if item['path'] == str(binary))
@@ -125,17 +146,20 @@ def bind_evidence(kind, path, data, expected, binary):
     for source, identity in identities:
         bench.require(isinstance(identity, list) and identity, f'invalid gate runtime identity: {source}')
         libraries = [item for item in identity if Path(item['path']).name.startswith(('libllama', 'libggml', 'libmtmd'))]
-        bench.require(libraries, f'gate has no project-library identity: {source}')
+        bench.require(any(Path(item['path']).name.startswith('libllama') for item in libraries), f'gate has no llama-library identity: {source}')
         for item in libraries:
             bench.require(current_libraries.get(Path(item['path']).name) == item['sha256'], f'{kind} gate used different candidate library: {item["path"]}')
         executable_match = None
+        executables = [item for item in identity if item not in libraries]
+        bench.require(len(executables) == 1, f'gate lacks one process executable identity: {source}')
+        if source in operator_executables:
+            bench.require(Path(executables[0]['path']).name == operator_executables[source], f'operator process identity differs from command: {source}')
         if kind != 'operator':
-            executables = [item for item in identity if item not in libraries]
-            bench.require(len(executables) == 1 and executables[0]['sha256'] == executable_hash, f'{kind} gate candidate executable differs from --candidate')
+            bench.require(executables[0]['sha256'] == executable_hash, f'{kind} gate candidate executable differs from --candidate')
             executable_match = True
         bindings.append({'source': source, 'project_libraries_matched': len(libraries), 'candidate_executable_matches': executable_match})
     return {'runtime_bindings': bindings, 'related_runtime_files': runtime_files,
-            'runtime_binding_note': 'Candidate hashes checked wherever emitted; operator test executable may differ; baseline identity is not compared.'}
+            'runtime_binding_note': 'Required processes are bound to candidate library hashes; operator test executable may differ; baseline hashes are not compared.'}
 
 
 def validate_arm(data, response, request, expected_request, resident, parent_unit):
