@@ -859,7 +859,28 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     e_norm = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, e_norm, n_embd, 1, n_tokens), n_embd, hc, n_tokens, 1);
     cb(e_norm, "mtp_enorm", il);
 
-    ggml_tensor * res_hc = build_lora_mm(layer.nextn.eh_proj, ggml_concat(ctx0, e_norm, h_norm, 0)); // [n_embd, hc, n_tokens]
+    ggml_tensor * eh_input = ggml_concat(ctx0, e_norm, h_norm, 0);
+    // The original [2*n_embd, hc, n_tokens] shape dispatches a separate
+    // hc-column projection per token. Flattening the contiguous token/HC
+    // columns lets prompt catch-up reuse the same weights in a large GEMM.
+    // Keep sampling and the default path unchanged until this shape is gated.
+    static const bool batch_eh = [] {
+        const char * value = std::getenv("LLAMA_MTP_EH_BATCH");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    const bool eh_batched = batch_eh && kv_only && n_tokens > 1;
+    if (eh_batched) {
+        GGML_ASSERT(ggml_is_contiguous(eh_input));
+        eh_input = ggml_reshape_2d(ctx0, eh_input, 2*n_embd, hc*n_tokens);
+        static std::atomic_flag noted = ATOMIC_FLAG_INIT;
+        if (!noted.test_and_set()) {
+            LLAMA_LOG_INFO("%s: MTP catch-up EH projection batches HC/token columns (LLAMA_MTP_EH_BATCH=1)\n", __func__);
+        }
+    }
+    ggml_tensor * res_hc = build_lora_mm(layer.nextn.eh_proj, eh_input);
+    if (eh_batched) {
+        res_hc = ggml_reshape_3d(ctx0, res_hc, n_embd, hc, n_tokens);
+    }
     cb(res_hc, "mtp_eh_proj", il);
 
     ggml_tensor * inject = nullptr;

@@ -4105,8 +4105,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs, int32_t n_tokens) {
     const auto & hparams = model.hparams;
     const auto & vocab   = model.vocab;
 
-    // never shrink the row reservation: the buffers are pinned and a later growth costs a
-    // cudaFreeHost/cudaMallocHost pair (15 + 44 ms at ~90 MiB) in the middle of a request
+    // Keep the logits row reservation: small sampling changes must not churn pinned memory.
     const int64_t n_outputs_max = std::max<int64_t>({(int64_t) n_outputs, (int64_t) n_seq_max(),
                                                   output_buffer_reuse ? (int64_t) n_outputs_reserved : 0});
 
@@ -4129,7 +4128,20 @@ uint32_t llama_context::output_reserve(int32_t n_outputs, int32_t n_tokens) {
     size_t backend_token_count        = 0;
     size_t embd_layer_inp_float_count = 0;
 
-    const size_t nextn_rows = std::max<size_t>(std::max(n_tokens, 1), output_buffer_reuse ? embd_nextn.size / n_embd_out : 0);
+    // A real target batch invalidates its previous outputs. The MTP helper has already
+    // copied pending/deferred hidden rows before the next target decode starts. Setter
+    // calls use n_tokens == 0 and must retain those still-live outputs and their layout.
+    // Keep this scoped to unmasked target hidden output; draft, embedding, training and
+    // layer-extraction contexts retain their existing allocation policy.
+    const char * shrink_env = std::getenv("LLAMA_MTP_OUTPUT_SHRINK");
+    const bool shrink_nextn = (!shrink_env || std::strcmp(shrink_env, "0") != 0) &&
+            output_buffer_reuse && n_tokens > 0 && has_embd_nextn &&
+            !cparams.embeddings_nextn_masked && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT &&
+            cparams.causal_attn && !cparams.training && !has_embd &&
+            std::none_of(cparams.embeddings_layer_inp.begin(), cparams.embeddings_layer_inp.end(),
+                    [](bool enabled) { return enabled; });
+    const size_t nextn_rows = std::max<size_t>(std::max(n_tokens, 1),
+            output_buffer_reuse && !shrink_nextn ? embd_nextn.size / n_embd_out : 0);
 
     logits.size     = has_logits ? n_vocab * n_outputs_max : 0;
     embd.size       = has_embd ? n_embd_out * n_outputs_max : 0;
@@ -4180,12 +4192,16 @@ uint32_t llama_context::output_reserve(int32_t n_outputs, int32_t n_tokens) {
         buft = output_dev_host_buft;
     }
 
-    // alloc only when more than the current capacity is required
-    // TODO: also consider shrinking the buffer
-    if (!buf_output || prev_size < new_size) {
+    // Return a prompt-sized hidden arena only if it saves at least 256 MiB and
+    // halves the allocation, avoiding pinned reallocations
+    // for ordinary changes in speculative batch size. Reuse the synchronized free
+    // and complete view rebind used by growth; previous outputs expire at this call.
+    constexpr size_t shrink_min_bytes = (size_t) 256 * 1024 * 1024;
+    const bool shrink_output = shrink_nextn && new_size <= prev_size / 2 &&
+            prev_size - new_size >= shrink_min_bytes;
+    if (!buf_output || prev_size < new_size || shrink_output) {
         if (buf_output) {
-            // a pinned reallocation costs a cudaFreeHost/cudaMallocHost pair (~60 ms at 90 MiB); it should
-            // only happen at context setup, never inside a request, so it is logged at info level
+            // Pinned reallocations can be costly, so log both growth and substantial shrink.
             LLAMA_LOG_INFO("%s: reallocating output buffer from size %.02f MiB to %.02f MiB "
                     "(n_outputs = %d, n_outputs_max = %" PRId64 ", logits = %zu, embd = %zu, embd_nextn = %zu, layer_inp = %zu)\n",
                     __func__, prev_size / 1024.0 / 1024.0, new_size / 1024.0 / 1024.0,
@@ -4692,9 +4708,10 @@ bool llama_context::b1_reserve_legacy_layers(const std::vector<uint32_t> & sizes
         // allocated. Re-probe physical free after each trim; a logical slot shrink
         // may need another bounded trim to cross the physical allocation boundary.
         constexpr int max_layer_loan_attempts = 4;
+        size_t retry_loan_floor = 0;
         for (int attempt = 1; attempt <= max_layer_loan_attempts && need > free; ++attempt) {
             const size_t free_before = free;
-            const size_t requested = need - free;
+            const size_t requested = std::max(need - free, retry_loan_floor);
             b1_cache_needs_refresh = true;
             const size_t released = ggml_backend_sched_moe_cache_trim(sched.get(), requested);
             LLAMA_LOG_INFO("%s: [B1] legacy layer scratch borrowed %.2f MiB (requested %.2f MiB)\n", __func__,
@@ -4702,6 +4719,8 @@ bool llama_context::b1_reserve_legacy_layers(const std::vector<uint32_t> & sizes
             ggml_backend_dev_memory(dev, &free, &total);
             LLAMA_LOG_INFO("%s: [B1] legacy loan probe attempt=%d requested_bytes=%zu released_bytes=%zu free_before=%zu free_after=%zu actual_free_gain_bytes=%zu actual_free_loss_bytes=%zu remaining_bytes=%zu fit=%d\n",
                     __func__, attempt, requested, released, free_before, free, free > free_before ? free - free_before : 0, free_before > free ? free_before - free : 0, need > free ? need - free : 0, need <= free);
+            // fork: a logical shrink may stay inside one physical allocation.
+            retry_loan_floor = released > 0 && free <= free_before ? (size_t) 2 << 20 : 0;
             if (need > free && released == 0 && free <= free_before) {
                 LLAMA_LOG_WARN("%s: [B1] legacy cache loan made no logical or physical progress\n", __func__);
                 break;
@@ -4730,14 +4749,17 @@ bool llama_context::b1_reserve_legacy_layers(const std::vector<uint32_t> & sizes
         LLAMA_LOG_INFO("%s: [B1] legacy post-allocation fit: free_bytes=%zu keep_bytes=%zu remaining_bytes=%zu fit=%d\n",
                 __func__, free, keep, keep > free ? keep - free : 0, keep <= free);
         constexpr int max_post_alloc_loan_attempts = 4;
+        size_t post_alloc_retry_loan_floor = 0;
         for (int attempt = 1; attempt <= max_post_alloc_loan_attempts && keep > free; ++attempt) {
             const size_t free_before = free;
-            const size_t requested = keep - free;
+            const size_t requested = std::max(keep - free, post_alloc_retry_loan_floor);
             b1_cache_needs_refresh = true;
             const size_t released = ggml_backend_sched_moe_cache_trim(sched.get(), requested);
             ggml_backend_dev_memory(dev, &free, &total);
             LLAMA_LOG_INFO("%s: [B1] legacy post-allocation loan probe attempt=%d requested_bytes=%zu released_bytes=%zu free_before=%zu free_after=%zu actual_free_gain_bytes=%zu actual_free_loss_bytes=%zu remaining_bytes=%zu fit=%d\n",
                     __func__, attempt, requested, released, free_before, free, free > free_before ? free - free_before : 0, free_before > free ? free_before - free : 0, keep > free ? keep - free : 0, keep <= free);
+            // fork: a logical shrink may stay inside one physical allocation.
+            post_alloc_retry_loan_floor = released > 0 && free <= free_before ? (size_t) 2 << 20 : 0;
             if (keep > free && released == 0 && free <= free_before) {
                 LLAMA_LOG_WARN("%s: [B1] legacy post-allocation cache loan made no logical or physical progress\n", __func__);
                 break;
@@ -4906,16 +4928,19 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
         // granularity. Allow bounded logical progress across that boundary, and
         // re-probe the full group, never a smaller post-loan plan.
         constexpr int max_loan_attempts = 4;
+        size_t retry_loan_floor = 0;
         for (int attempt = 1; attempt <= max_loan_attempts && !planned && borrow > 0; ++attempt) {
             size_t free_before = 0, free_after = 0, total = 0;
             ggml_backend_dev_memory(loan_device, &free_before, &total);
-            const size_t requested = borrow;
+            const size_t requested = std::max(borrow, retry_loan_floor);
             const size_t released = ggml_backend_sched_moe_cache_trim(sched.get(), requested);
             ggml_backend_dev_memory(loan_device, &free_after, &total);
             LLAMA_LOG_INFO("%s: B1 scratch borrowed %.2f MiB from runtime experts (requested %.2f MiB)\n", __func__, released / 1048576.0, requested / 1048576.0);
             planned = b1->begin(sizes, group_ub, lend_cap, final_home, &borrow, lean_legacy);
             LLAMA_LOG_INFO("%s: [B1] loan probe attempt=%d requested_bytes=%zu released_bytes=%zu free_before=%zu free_after=%zu actual_free_gain_bytes=%zu actual_free_loss_bytes=%zu remaining_bytes=%zu fit=%d\n",
                     __func__, attempt, requested, released, free_before, free_after, free_after > free_before ? free_after - free_before : 0, free_before > free_after ? free_before - free_after : 0, borrow, planned);
+            // fork: a logical shrink may stay inside one physical allocation.
+            retry_loan_floor = released > 0 && free_after <= free_before ? (size_t) 2 << 20 : 0;
             if (!planned && borrow > 0 && released == 0 && free_after <= free_before) {
                 LLAMA_LOG_WARN("%s: [B1] cache loan made no logical or physical progress; using normal prefill\n", __func__);
                 break;
@@ -7652,6 +7677,24 @@ int llama_context::encode(const llama_batch & batch_inp) {
 }
 
 int llama_context::decode(const llama_batch & batch_inp) {
+    static const bool reuse_enabled = [] {
+        const char * value = std::getenv("LLAMA_MTP_COMPAT_REUSE");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    if (reuse_enabled && cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
+            !cparams.training && !cparams.embeddings && !cparams.mtp_chain && !ple_pf &&
+            llama_batch_compat::can_reuse_mtp(batch_inp, cparams.n_batch, model.hparams.n_embd_out())) {
+        if (!mtp_compat_reuse) {
+            mtp_compat_reuse = std::make_unique<llama_batch_ext>(this);
+            LLAMA_LOG_INFO("%s: bounded MTP catch-up compatibility reuse enabled\n", __func__);
+        }
+        // The compatibility vectors are read only on the host by decode/allocr.
+        // balloc owns a deep copy before any graph input upload, and graph/memory
+        // snapshots own their separate llama_ubatch::data. No GPU fence is needed
+        // to clear this independent translation buffer after the prior call.
+        llama_batch_compat::reset(*mtp_compat_reuse, batch_inp);
+        return decode(*mtp_compat_reuse);
+    }
     llama_batch_compat compat(this, batch_inp);
     return decode(*compat.batch_ext);
 }

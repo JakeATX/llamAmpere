@@ -1170,6 +1170,183 @@ static void test_mtp_embd_width(testing & t) {
     });
 }
 
+// Catch-up compatibility storage is independent from the allocator's owned batches.
+static void test_mtp_compat_reuse(testing & t) {
+    struct input {
+        std::vector<llama_token> token;
+        std::vector<float> embd;
+        std::vector<llama_pos> pos;
+        std::vector<int32_t> n_seq_id;
+        std::vector<llama_seq_id> seq_id;
+        std::vector<llama_seq_id *> seq_ptr;
+        std::vector<int8_t> output;
+        llama_batch batch = {};
+
+        input(int n, int salt) : token(n), embd(n*8), pos(n), n_seq_id(n, 1),
+                seq_id(n, 0), seq_ptr(n), output(n, 0) {
+            for (int i = 0; i < n; ++i) {
+                token[i] = (i + salt) % 64;
+                pos[i] = i + salt*100;
+                seq_ptr[i] = &seq_id[i];
+                for (int j = 0; j < 8; ++j) {
+                    embd[i*8+j] = float(i*100 + j + salt);
+                }
+            }
+            batch.n_tokens = n;
+            batch.token = token.data();
+            batch.embd = embd.data();
+            batch.pos = pos.data();
+            batch.n_seq_id = n_seq_id.data();
+            batch.seq_id = seq_ptr.data();
+            batch.logits = output.data();
+        }
+    };
+    auto equal_ext = [](testing & t, const llama_batch_ext & a, const llama_batch_ext & b) {
+        t.assert_equal(a.n_embd, b.n_embd);
+        t.assert_equal(a.tokens.size(), b.tokens.size());
+        t.assert_true("hidden values", a.embd == b.embd);
+        for (size_t i = 0; i < a.tokens.size() && i < b.tokens.size(); ++i) {
+            const auto & x = a.tokens[i];
+            const auto & y = b.tokens[i];
+            t.assert_equal(x.id, y.id);
+            t.assert_equal(x.has_embd, y.has_embd);
+            t.assert_equal(x.embd_off, y.embd_off);
+            t.assert_equal(x.output, y.output);
+            t.assert_equal(x.decision_order, y.decision_order);
+            t.assert_true("sequence IDs", x.seq_ids == y.seq_ids);
+            t.assert_true("positions", x.pos == y.pos);
+        }
+    };
+    // Copy semantic values from the caller BEFORE translation. These expected
+    // values never depend on an allocator or on the reusable translation buffer.
+    struct expected_ub {
+        std::vector<llama_token> token;
+        std::vector<float> embd;
+        std::vector<llama_pos> pos;
+        std::vector<llama_seq_id> seq_id;
+        std::vector<int8_t> output;
+        explicit expected_ub(const input & in)
+            : token(in.token.begin(), in.token.begin() + 16),
+              embd(in.embd.begin(), in.embd.begin() + 16*8),
+              pos(in.pos.begin(), in.pos.begin() + 16),
+              seq_id(in.seq_id.begin(), in.seq_id.begin() + 16),
+              output(in.output.begin(), in.output.begin() + 16) {}
+    };
+    auto equal_ub = [](testing & t, const llama_ubatch & a, const expected_ub & b) {
+        t.assert_equal(16u, a.n_tokens);
+        t.assert_equal(1u, a.n_pos);
+        t.assert_true("owned data retained", a.data != nullptr);
+        t.assert_true("all accessor arrays retained", a.token && a.embd && a.pos && a.output && a.n_seq_id && a.seq_id);
+        if (!a.data || !a.token || !a.embd || !a.pos || !a.output || !a.n_seq_id || !a.seq_id) { return; }
+        t.assert_true("owned token IDs", a.data->token == b.token);
+        t.assert_true("owned hidden rows", a.data->embd == b.embd);
+        t.assert_true("owned positions", a.data->pos == b.pos);
+        t.assert_true("owned output flags", a.data->output == b.output);
+        for (uint32_t i = 0; i < a.n_tokens && i < 16; ++i) {
+            t.assert_equal(b.token[i], a.token[i]);
+            t.assert_equal(b.pos[i], a.pos[i]);
+            t.assert_equal(b.output[i], a.output[i]);
+            t.assert_equal(1, a.n_seq_id[i]);
+            t.assert_true("sequence pointer retained", a.seq_id[i] != nullptr);
+            if (a.n_seq_id[i] == 1 && a.seq_id[i]) {
+                t.assert_equal(b.seq_id[i], a.seq_id[i][0]);
+            }
+            for (int j = 0; j < 8; ++j) {
+                t.assert_equal(b.embd[i*8+j], a.embd[i*8+j]);
+            }
+        }
+    };
+
+    t.test("bounded_eligibility", [&](testing & t) {
+        input in(32, 1);
+        t.assert_true(llama_batch_compat::can_reuse_mtp(in.batch, 64, 8));
+        t.assert_true(!llama_batch_compat::can_reuse_mtp(in.batch, 16, 8));
+        t.assert_true(!llama_batch_compat::can_reuse_mtp(in.batch, 64, 0));
+        t.assert_true(!llama_batch_compat::can_reuse_mtp(in.batch, 64, size_t(-1)));
+        in.output[7] = 1;
+        t.assert_true(!llama_batch_compat::can_reuse_mtp(in.batch, 64, 8));
+        in.output[7] = 0;
+        for (int n : {-1, 0, 15, 8193}) {
+            in.batch.n_tokens = n;
+            t.assert_true(!llama_batch_compat::can_reuse_mtp(in.batch, 16384, 8));
+        }
+        in.batch.n_tokens = 32;
+        auto missing = in.batch;
+        missing.token = nullptr;
+        t.assert_true(!llama_batch_compat::can_reuse_mtp(missing, 64, 8));
+        missing = in.batch;
+        missing.embd = nullptr;
+        t.assert_true(!llama_batch_compat::can_reuse_mtp(missing, 64, 8));
+        missing = in.batch;
+        missing.logits = nullptr;
+        t.assert_true(!llama_batch_compat::can_reuse_mtp(missing, 64, 8));
+        // Eligibility reads only output flags, not the hypothetical hidden payload.
+        in.output.resize(8192, 0);
+        in.batch.logits = in.output.data();
+        in.batch.n_tokens = 8192;
+        t.assert_true("inclusive row/payload bounds", llama_batch_compat::can_reuse_mtp(in.batch, 8192, 4096));
+        t.assert_true("payload overflow", !llama_batch_compat::can_reuse_mtp(in.batch, 8192, 4097));
+    });
+
+    t.test("grow_shrink_and_retained_ownership", [&](testing & t) {
+        llama_vocab vocab;
+        batch_builder cached(8, nullptr, 4, 1, 100);
+        llama_batch_allocr ba(1);
+        std::vector<llama_ubatch> retained;
+        std::vector<expected_ub> expected;
+        size_t capacity = 0;
+        const float * previous = nullptr;
+        for (int n : {16, 32, 16, 64, 17, 48, 16}) {
+            input in(n, n);
+            expected.emplace_back(in); // independent copy of the first16 rows
+            batch_builder fresh(8, nullptr, 4, 1, 100);
+            llama_batch_compat::init(fresh.b, in.batch);
+            llama_batch_compat::reset(cached.b, in.batch);
+            equal_ext(t, fresh.b, cached.b);
+            t.assert_true("capacity retained", cached.b.embd.capacity() >= capacity);
+            if (capacity >= size_t(n*8)) {
+                t.assert_true("no reallocation while shrinking", previous == cached.b.embd.data());
+            }
+            capacity = cached.b.embd.capacity();
+            previous = cached.b.embd.data();
+            t.assert_true(ba.init(cached.b, vocab, false));
+            retained.push_back(ba.split_simple(16));
+            std::fill(in.embd.begin(), in.embd.end(), -1.0f);
+            std::fill(in.token.begin(), in.token.end(), -1);
+            std::fill(in.pos.begin(), in.pos.end(), -1);
+            std::fill(cached.b.embd.begin(), cached.b.embd.end(), -2.0f);
+            cached.b.clear();
+            fresh.b.clear();
+            for (size_t i = 0; i < retained.size(); ++i) {
+                equal_ub(t, retained[i], expected[i]);
+            }
+        }
+        input bad(32, 1);
+        bad.token[0] = 101;
+        llama_batch_compat::reset(cached.b, bad.batch);
+        t.assert_true("invalid input rejected", !ba.init(cached.b, vocab, false));
+        bad.token[0] = 1;
+        llama_batch_compat::reset(cached.b, bad.batch);
+        t.assert_true("valid input recovers", ba.init(cached.b, vocab, false));
+        for (size_t i = 0; i < retained.size(); ++i) {
+            equal_ub(t, retained[i], expected[i]);
+        }
+    });
+
+    t.test("ineligible_uses_ordinary_translation", [&](testing & t) {
+        input in(17, 1);
+        in.batch.token = nullptr;
+        in.batch.logits = nullptr;
+        in.batch.pos = nullptr;
+        t.assert_true(!llama_batch_compat::can_reuse_mtp(in.batch, 64, 8));
+        batch_builder fresh(8), reset(8);
+        llama_batch_compat::init(fresh.b, in.batch);
+        llama_batch_compat::reset(reset.b, in.batch);
+        equal_ext(t, fresh.b, reset.b);
+        t.assert_true("default last output preserved", fresh.b.tokens.back().output);
+    });
+}
+
 int main(int argc, char ** argv) {
     testing t;
 
@@ -1189,6 +1366,7 @@ int main(int argc, char ** argv) {
     t.test("content_types",  test_content_types);
     t.test("mixed",          test_mixed);
     t.test("compat",         test_compat);
+    t.test("mtp_compat_reuse", test_mtp_compat_reuse);
     t.test("split",          test_split);
     t.test("keep_tail",      test_keep_tail);
     t.test("mrope",          test_mrope);

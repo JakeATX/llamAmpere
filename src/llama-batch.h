@@ -274,4 +274,12 @@ struct llama_batch_compat {
     // fill an existing llama_batch_ext from a llama_batch (old API)
     // note: this is called directly by the tests, skipping llama_context creation
     static void init(llama_batch_ext & batch_ext, const llama_batch & batch_inp, size_t n_embd_row = 0);
+
+    // Bounded opt-in MTP token+hidden catch-up only. Ordinary/mixed/new-API batches
+    // retain their current paths. Explicit output flags must all be zero.
+    static bool can_reuse_mtp(const llama_batch & batch, size_t n_tokens_max, size_t n_embd_row);
+
+    // Reset an owned translation buffer, retaining vector capacity. No graph owns
+    // this storage: batch_allocr::init deep-copies all fields before submission.
+    static void reset(llama_batch_ext & batch_ext, const llama_batch & batch_inp, size_t n_embd_row = 0);
 };

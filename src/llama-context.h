@@ -448,6 +448,10 @@ private:
     // reuse the batch_allocr to avoid unnecessary memory allocations
     std::unique_ptr<llama_batch_allocr> balloc;
 
+    // Opt-in MTP catch-up translation storage, at most128MiB hidden payload.
+    // Independent from ubatch/output memory; decode's allocr copies its contents.
+    std::unique_ptr<llama_batch_ext> mtp_compat_reuse;
+
     uint32_t n_input_tensors = 0; // number of tensors marked as input during the last graph reserve
     uint32_t n_outputs = 0; // number of actually-used outputs in the current ubatch or last logical batch
 
