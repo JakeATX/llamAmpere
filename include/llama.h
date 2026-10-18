@@ -439,6 +439,7 @@ extern "C" {
         uint32_t sj_kvarn_edge_bits_v;
         enum ggml_type sj_kvarn_edge_body_type; // edge-tier codec: COUNT = auto (trellis only for a trellis pair when sj_kvarn_body_type is trellis/auto), F32 scalar, I16 trellis
         uint32_t sj_kvarn_flush_chunk; // adaptive tail: max groups sealed per small (decode) ubatch; 0 = whole flush at once
+        uint32_t kv_resident; // fork: QSA resident KV cells with SJ-KVaRN; 0 = keep the full body on device
         const char * sj_kvarn_transform; // EXPERIMENTAL (arXiv 2609.38121 WUSH-KV): per-layer K/V transform file replacing the Hadamard; NULL = off
 
         // Keep the booleans together and at the end of the struct to avoid misalignment during copy-by-value.
