@@ -4177,6 +4177,8 @@ static int moe_cache_warm(void * opaque, const ggml_moe_cache_tensor_desc * tens
     std::vector<candidate> ranked;
     ranked.reserve(entries);
     for (int i = 0; i < n_tensors; ++i) {
+        long double observed_total = 0;
+        for (int32_t e = 0; e < tensors[i].n_expert; ++e) { observed_total += counts[i][e]; }
         for (int32_t e = 0; e < tensors[i].n_expert; ++e) {
             const moe_cache_key key{tensors[i].data, e};
             if (loading && counts[i][e]) {
@@ -4185,7 +4187,10 @@ static int moe_cache_warm(void * opaque, const ggml_moe_cache_tensor_desc * tens
             int layer = 0;
             moe_cache_layer_number(tensors[i].name, layer);
             const size_t bytes = ggml_row_size((ggml_type)tensors[i].type, tensors[i].n_in) * (size_t)tensors[i].n_out;
-            const long double priority = ((long double)counts[i][e] + 1) * (1 + 4.0L / (layer + 1)) / bytes;
+            // Output pruning can observe fewer tokens in the last layer. Compare
+            // conditional use rates, preserving the original counts on disk.
+            const long double rate = counts[i][e] / std::max(1.0L, observed_total);
+            const long double priority = rate * (1 + 4.0L / (layer + 1)) / bytes;
             if (counts[i][e] || loading) {
                 ranked.push_back({i, e, counts[i][e], !loading, priority});
             } else if (!loading) {

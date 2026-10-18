@@ -47,13 +47,16 @@ def main():
         actual = ((actual ^ byte) * 1099511628211) & ((1 << 64) - 1)
     assert actual == checksum
     counts = struct.unpack_from('=' + str(entries) + 'Q', data, 40)
-    assert sum(counts) == len(tokens) * 48 * 3 * 10, 'unexpected measured prompt route count'
+    totals = [sum(counts[i:i + 512]) for i in range(0, len(counts), 512)]
+    # The final layer may compute only output positions after row pruning.
+    assert all(0 < total <= len(tokens) * 10 and total % 10 == 0 for total in totals)
+    assert totals.count(len(tokens) * 10) >= 141, 'incomplete prompt route observations'
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_bytes(data)
     provenance = {'fixtures_sha256': hashlib.sha256(args.fixtures.read_bytes()).hexdigest(),
                   'categories': [r['category'] for r in records], 'prompt_tokens': len(tokens),
                   'tensors': tensors, 'entries': entries, 'signature': hex(signature),
-                  'count_sum': sum(counts), 'positive_entries': sum(c > 0 for c in counts),
+                  'count_sum': sum(counts), 'tensor_route_totals': totals, 'positive_entries': sum(c > 0 for c in counts),
                   'profile_sha256': hashlib.sha256(data).hexdigest(), 'completion_timings': result.get('timings'),
                   'math': 'original quantized weights; only routing counts are persisted'}
     args.output.with_suffix(args.output.suffix + '.json').write_text(json.dumps(provenance, indent=2) + '\n')

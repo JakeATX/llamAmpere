@@ -188,6 +188,7 @@ endif()
 target_link_libraries(${TARGET} PUBLIC llama Threads::Threads)
 
 # The profile retains the existing model identity/checksum checks in the provider.
+include(GNUInstallDirs)
 target_compile_definitions(${TARGET} PRIVATE
     LLAMA_MOE_PROFILE_SOURCE="${PROJECT_SOURCE_DIR}/data/moe/flash-next.profile"
     LLAMA_MOE_PROFILE_INSTALL="${CMAKE_INSTALL_FULL_DATADIR}/llama/moe/flash-next.profile")
