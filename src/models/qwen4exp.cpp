@@ -741,7 +741,9 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
                 if (!future.ffn_gate_inp) {
                     continue;
                 }
+                bool supported = true;
                 auto gpu = [&](ggml_tensor * t) {
+                    supported &= ggml_backend_dev_supports_op(model.dev_layer(il), t);
                     cb(t, "moe_prefetch_gpu", il);
                     return t;
                 };
@@ -754,6 +756,10 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
                     scores = ggml_reshape_1d(ctx0, scores, n_expert);
                 }
                 ggml_tensor * ids = gpu(ggml_cont(ctx0, gpu(ggml_argsort_top_k(ctx0, scores, std::min<int64_t>(32, n_expert)))));
+                // An unsupported predictor must not fall back to CPU execution.
+                if (!supported) {
+                    continue;
+                }
                 ggml_format_name(ids, "moe_prefetch-%d-%d", il, il + d);
                 ggml_set_output(ids);
                 ggml_build_forward_expand(gf, ids);

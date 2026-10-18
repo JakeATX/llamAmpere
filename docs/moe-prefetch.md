@@ -9,7 +9,8 @@ After attention, the current layer's mixed FFN input is evaluated by
 the next one to three routers on the GPU. Routers use the model’s softmax activation and produce up to 32
 ranked candidates. For verification batches of up to eight tokens, ranking
 uses each expert's largest score across the batch. The draft context and
-larger batches do not predict.
+larger batches do not predict. Unsupported CUDA prediction operators skip
+that prediction instead of running on the CPU.
 
 The copy worker admits only uncached candidates, in descending router
 order. Its byte allowance uses observed layer intervals and completed
