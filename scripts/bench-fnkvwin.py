@@ -218,6 +218,8 @@ class ServerArm:
         unit = Path(Path('/proc/self/cgroup').read_text().strip().split('::', 1)[1]).name
         require(unit.startswith('llama.cpp-') and unit.endswith(('.service', '.scope')),
                 'parent must run this harness in a llama.cpp-* systemd unit for sysguard coverage')
+        require(subprocess.check_output(['systemctl', '--user', 'is-active', 'llama.cpp-sysguard'],
+                                        text=True, timeout=5).strip() == 'active', 'llama.cpp-sysguard must be active')
         require(available_bytes() >= MIN_AVAILABLE, 'MemAvailable below 10 GiB before launch')
         disk_check()
         with socket.socket() as probe:
