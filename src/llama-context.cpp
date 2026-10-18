@@ -4967,16 +4967,19 @@ size_t llama_context::state_seq_load_file(llama_seq_id  seq_id,
     }
 
     // restore the context state
-    {
-        const size_t       state_size = file.size() - file.tell();
+    try {
+        const size_t state_size = file.size() - file.tell();
         llama_io_read_file io(&file);
-        const size_t       nread = state_seq_read_data(io, seq_id, 0);
-        if (!nread) {
-            LLAMA_LOG_ERROR("%s: failed to restore sequence state\n", __func__);
-            return 0;
+        const size_t nread = state_seq_read_data(io, seq_id, 0);
+        if (nread == 0 || nread != state_size) {
+            throw std::runtime_error("invalid sequence state length");
         }
-        GGML_ASSERT(nread <= state_size);
-        GGML_ASSERT(nread + sizeof(uint32_t) * 3 + sizeof(llama_token) * *n_token_count_out == file.tell());
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: failed to restore sequence state: %s\n", __func__, err.what());
+        if (memory) {
+            memory->seq_rm(seq_id, -1, -1);
+        }
+        return 0;
     }
 
     return file.tell();

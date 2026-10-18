@@ -607,10 +607,12 @@ struct server_prompt {
     server_tokens tokens;
 
     std::list<common_prompt_checkpoint> checkpoints;
+    std::vector<uint8_t> data_spec;
 
     void clear() {
         tokens.clear();
         checkpoints.clear();
+        data_spec.clear();
     }
 
     int n_tokens() const {
@@ -621,6 +623,7 @@ struct server_prompt {
         return server_prompt {
             tokens.clone(),
             checkpoints,
+            data_spec,
         };
     }
 };
@@ -639,7 +642,7 @@ struct server_prompt_cache_state {
     server_prompt_data data;
 
     size_t size() const {
-        size_t res = data.size();
+        size_t res = data.size() + prompt.data_spec.size();
 
         for (const auto & ckpt : prompt.checkpoints) {
             res += ckpt.size();
@@ -694,7 +697,7 @@ struct server_prompt_cache {
 
     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
 
-    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, bool * state_restored = nullptr);
 
     void update();
 

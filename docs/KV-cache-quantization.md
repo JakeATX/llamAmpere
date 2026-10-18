@@ -126,7 +126,7 @@ LLAMA_MTP_DRAFT_COMPUTE_LEAN=1 llama-server -m model.gguf -c 204800 -ngl 99 -fa 
     --spec-type draft-mtp-adaptive --spec-draft-n-max 4 --spec-draft-sjkvarn
 ```
 
-The tail must exceed the maximum draft width so speculative rollback stays in unsealed rows. The server reprocesses an edited prompt if it reaches sealed rows in either context. Draft sealing runs during decode; server idle compression still applies only to the trunk. State serialization retains the existing SJ-KVaRN restrictions. Cache compression changes draft probabilities and needs acceptance/quality validation separately from the lean microbatch switch.
+The tail must exceed the maximum draft width so speculative rollback stays in unsealed rows. The server reprocesses an edited prompt if it reaches sealed rows in either context. Draft sealing runs during decode; server idle compression still applies only to the trunk. State save and restore support a contiguous single-sequence prefix, including sealed records, sink rows, and ring tail rows. The server saves MTP draft memory and boundary hidden values in a `.draft` sidecar beside a slot file; keep both files together. The `.draft` and optional `.ckpt` sidecars are bound to the main file by SHA-256. Missing or invalid draft state clears the slot so the next request can reprocess the prompt. Invalid checkpoints fall back to prompt processing. The automatic RAM and disk prompt caches also retain the MTP boundary values. Cache compression changes draft probabilities and needs acceptance/quality validation separately from the lean microbatch switch.
 
 ### Small-card overhead switches
 

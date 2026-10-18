@@ -524,6 +524,9 @@ private:
         std::vector<std::pair<uint32_t, uint32_t>> data; // ranges, from inclusive, to exclusive
     };
 
+    void state_write_sj_kvarn(llama_io_write_i & io, llama_seq_id seq_id) const;
+    void state_read_sj_kvarn(llama_io_read_i & io, llama_seq_id seq_id);
+
     void state_write_meta(llama_io_write_i & io, const cell_ranges_t & cr, llama_seq_id seq_id = -1) const;
     void state_write_data(llama_io_write_i & io, const cell_ranges_t & cr) const;
 

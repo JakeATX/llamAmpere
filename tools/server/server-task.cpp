@@ -1908,7 +1908,10 @@ bool server_prompt_cache::restore(server_prompt_cache_state & state, llama_conte
     return true;
 }
 
-bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, bool * state_restored) {
+    if (state_restored) {
+        *state_restored = false;
+    }
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
@@ -1999,6 +2002,9 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         }
 
         prompt = std::move(staged);
+        if (state_restored) {
+            *state_restored = true;
+        }
 
         return true;
     }
@@ -2025,6 +2031,9 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         SRV_INF(" - restored prompt from disk in %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
 
         prompt = std::move(state.prompt);
+        if (state_restored) {
+            *state_restored = true;
+        }
 
         return true;
     }
@@ -2037,6 +2046,9 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         }
 
         prompt = std::move(it_best->prompt);
+        if (state_restored) {
+            *state_restored = true;
+        }
 
         states.erase(it_best);
     }
@@ -2094,11 +2106,11 @@ void server_prompt_cache::update() {
 // prompt cache disk tier
 //
 // file layout (little-endian): magic "LCPC", u32 version, u64 n_tokens, i32 tokens[n_tokens],
-//   u64 main_len, bytes, u64 drft_len, bytes, u32 n_checkpoints, then per checkpoint:
+//   u64 main_len, bytes, u64 drft_len, bytes, u64 spec_len, bytes, u32 n_checkpoints, then per checkpoint:
 //   i64 n_tokens, i32 id_task, i32 pos_min, i32 pos_max, u64 len_tgt, bytes, u64 len_dft, bytes, u64 len_spec, bytes
 //
 static const char     PROMPT_CACHE_DISK_MAGIC[4] = {'L', 'C', 'P', 'C'};
-static const uint32_t PROMPT_CACHE_DISK_VERSION  = 1;
+static const uint32_t PROMPT_CACHE_DISK_VERSION  = 2;
 
 template <typename T> static void pc_write(std::ofstream & f, const T & v) { f.write((const char *) &v, sizeof(T)); }
 template <typename T> static bool pc_read (std::ifstream & f, T & v)       { f.read((char *) &v, sizeof(T)); return (bool) f; }
@@ -2113,6 +2125,16 @@ static void pc_write_bytes(std::ofstream & f, const std::vector<uint8_t> & v) {
 static bool pc_read_bytes(std::ifstream & f, std::vector<uint8_t> & v, size_t max_len) {
     uint64_t n = 0;
     if (!pc_read(f, n) || n > max_len) {
+        return false;
+    }
+    const auto offset = f.tellg();
+    if (offset < 0) {
+        return false;
+    }
+    f.seekg(0, std::ios::end);
+    const auto end = f.tellg();
+    f.seekg(offset);
+    if (end < offset || n > (uint64_t) (end - offset)) {
         return false;
     }
     v.resize(n);
@@ -2174,6 +2196,7 @@ bool server_prompt_cache::disk_spill(const server_prompt_cache_state & state) {
     }
     pc_write_bytes(f, state.data.main);
     pc_write_bytes(f, state.data.drft);
+    pc_write_bytes(f, state.prompt.data_spec);
     pc_write<uint32_t>(f, (uint32_t) state.prompt.checkpoints.size());
     for (const auto & ckpt : state.prompt.checkpoints) {
         pc_write<int64_t>(f, ckpt.n_tokens);
@@ -2223,6 +2246,9 @@ bool server_prompt_cache::disk_read(const server_prompt_cache_disk_entry & entry
         return false;
     }
 
+    if (entry.size < 16 || n_tokens > (entry.size - 16)/sizeof(llama_token)) {
+        return false;
+    }
     llama_tokens tokens(n_tokens);
     if (n_tokens > 0) {
         f.read((char *) tokens.data(), n_tokens * sizeof(llama_token));
@@ -2231,7 +2257,7 @@ bool server_prompt_cache::disk_read(const server_prompt_cache_disk_entry & entry
     const size_t max_len = entry.size + 1;
 
     uint32_t n_ckpt = 0;
-    if (!f || !pc_read_bytes(f, out.data.main, max_len) || !pc_read_bytes(f, out.data.drft, max_len) || !pc_read(f, n_ckpt)) {
+    if (!f || !pc_read_bytes(f, out.data.main, max_len) || !pc_read_bytes(f, out.data.drft, max_len) || !pc_read_bytes(f, out.prompt.data_spec, max_len) || !pc_read(f, n_ckpt)) {
         SRV_ERR(" - %s is truncated\n", entry.file.c_str());
 
         return false;

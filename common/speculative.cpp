@@ -1771,6 +1771,92 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         return dropped;
     }
 
+    bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return false;
+        }
+        uint32_t rows = 0;
+        for (const auto id : defer.seq) {
+            rows += id == seq_id;
+        }
+        const uint32_t header[4] = { 0x5350544d, 1, (uint32_t) n_embd, rows }; // "MTPS"
+        const size_t row_bytes = (size_t) n_embd*sizeof(float);
+        data.resize(sizeof(header) + row_bytes + rows*(sizeof(llama_token) + sizeof(llama_pos) + row_bytes));
+        uint8_t * dst = data.data();
+        auto put = [&](const void * src, size_t size) {
+            std::memcpy(dst, src, size);
+            dst += size;
+        };
+        put(header, sizeof(header));
+        put(pending_h[seq_id].data(), row_bytes);
+        for (size_t i = 0; i < defer.seq.size(); ++i) {
+            if (defer.seq[i] != seq_id) {
+                continue;
+            }
+            put(&defer.tok[i], sizeof(llama_token));
+            put(&defer.pos[i], sizeof(llama_pos));
+            put(defer.embd.data() + i*(size_t) n_embd, row_bytes);
+        }
+        return true;
+    }
+
+    void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            throw std::runtime_error("MTP state has an invalid sequence");
+        }
+        uint32_t header[4];
+        if (data.size() < sizeof(header)) {
+            throw std::runtime_error("MTP state header is truncated");
+        }
+        std::memcpy(header, data.data(), sizeof(header));
+        const size_t row_bytes = (size_t) n_embd*sizeof(float);
+        const uint32_t rows = header[3];
+        const size_t retained = std::count_if(defer.seq.begin(), defer.seq.end(), [seq_id](llama_seq_id id) { return id != seq_id; });
+        if (header[0] != 0x5350544d || header[1] != 1 || header[2] != (uint32_t) n_embd ||
+                retained + rows > (size_t) defer_capacity() || (rows > 0 && !defer_enabled) ||
+                data.size() != sizeof(header) + row_bytes + rows*(sizeof(llama_token) + sizeof(llama_pos) + row_bytes)) {
+            throw std::runtime_error("MTP state layout mismatch");
+        }
+        const uint8_t * src = data.data() + sizeof(header);
+        auto get = [&](void * dst, size_t size) {
+            std::memcpy(dst, src, size);
+            src += size;
+        };
+        std::vector<float> hidden(n_embd), embeddings((size_t) rows*n_embd);
+        std::vector<llama_token> tokens(rows);
+        std::vector<llama_pos> positions(rows);
+        get(hidden.data(), row_bytes);
+        const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(params.ctx_dft)));
+        for (uint32_t i = 0; i < rows; ++i) {
+            get(&tokens[i], sizeof(llama_token));
+            get(&positions[i], sizeof(llama_pos));
+            get(embeddings.data() + (size_t) i*n_embd, row_bytes);
+            if (tokens[i] < 0 || tokens[i] >= n_vocab || positions[i] < 0 ||
+                    (uint32_t) positions[i] >= llama_n_ctx(params.ctx_dft) ||
+                    (i > 0 && positions[i] != positions[i - 1] + 1)) {
+                throw std::runtime_error("MTP state contains an invalid deferred row");
+            }
+        }
+        for (const auto v : hidden) {
+            if (!std::isfinite(v)) {
+                throw std::runtime_error("MTP state contains a nonfinite hidden value");
+            }
+        }
+        for (const auto v : embeddings) {
+            if (!std::isfinite(v)) {
+                throw std::runtime_error("MTP state contains a nonfinite deferred value");
+            }
+        }
+        drop_deferred_from(seq_id, 0);
+        pending_h[seq_id] = std::move(hidden);
+        defer.tok.insert(defer.tok.end(), tokens.begin(), tokens.end());
+        defer.pos.insert(defer.pos.end(), positions.begin(), positions.end());
+        defer.embd.insert(defer.embd.end(), embeddings.begin(), embeddings.end());
+        defer.seq.insert(defer.seq.end(), rows, seq_id);
+        verify_h[seq_id].clear();
+        verify_h_rows[seq_id] = 0;
+    }
+
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
         // note: the server calls begin() after the prefill decode, so stale defer
         // rows are already handled by the position-rewind trim in process(). Rows
