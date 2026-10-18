@@ -3027,6 +3027,11 @@ private:
         }
 
         if (incomplete) {
+            // Send the token ID now; its text waits for a complete character.
+            if (slot.task->params.stream) {
+                result.text_to_send.clear();
+                send_partial_response(slot, result, false);
+            }
             slot.has_next_token = true;
         }
 
