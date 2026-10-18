@@ -1123,6 +1123,7 @@ struct ggml_backend_sched {
 
     struct ggml_context * ctx;
     void * moe_cache_session;
+    bool moe_cache_device_graph;
     // The provider table selected for this session. Copied at creation so a
     // later registration change cannot alter the session's callbacks.
     struct ggml_moe_cache_api moe_cache_api;
@@ -2000,6 +2001,16 @@ static char causes[GGML_DEFAULT_GRAPH_SIZE*16 + GGML_SCHED_MAX_SPLITS_DEBUG*GGML
 #define GET_CAUSE(node) ""
 #endif
 
+// fork: a prepared cache keeps host expert sources out of scheduler copies.
+static bool ggml_backend_sched_moe_device_supports(ggml_backend_sched_t sched,
+        const ggml_tensor * node, int backend_id) {
+    const bool supported = sched->moe_cache_session && sched->moe_cache_api.device_supports &&
+        sched->moe_cache_api.device_supports(sched->moe_cache_session,
+                sched->backends[backend_id], node);
+    sched->moe_cache_device_graph |= supported;
+    return supported;
+}
+
 // returns the backend that should be used for the node based on the current locations
 static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, struct ggml_tensor * tensor) {
     // assign pre-allocated nodes to their backend
@@ -2029,6 +2040,15 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
         cur_backend_id = sched->n_backends - 1; // last backend (assumed CPU)
         SET_CAUSE(tensor, "1.inp");
         return cur_backend_id;
+    }
+
+    if (tensor->op == GGML_OP_MUL_MAT_ID) {
+        for (int b = 0; b < sched->n_backends; ++b) {
+            if (ggml_backend_sched_moe_device_supports(sched, tensor, b)) {
+                SET_CAUSE(tensor, "1.moe-device");
+                return b;
+            }
+        }
     }
 
     // operations with weights are preferably run on the same backend as the weights
@@ -2148,6 +2168,7 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
 void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     // reset splits
+    sched->moe_cache_device_graph = false;
     sched->n_splits = 0;
     sched->n_graph_inputs = 0;
     sched->is_reset = false;
@@ -2416,7 +2437,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     // by starting a new split, the memory of the previously offloaded weights can be reused
                     if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
                         int src_backend_id = tensor_backend_id(src);
-                        if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
+                        if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id) &&
+                            !(j == 0 && ggml_backend_sched_moe_device_supports(sched, node, cur_backend_id))) {
                             need_new_split = true;
                             break;
                         }
@@ -2455,7 +2477,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 const int src_backend_id = sched->hv_tensor_backend_ids[src_id];
                 GGML_ASSERT(src_backend_id != -1); // all inputs should be assigned by now
 
-                if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
+                if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id) &&
+                    !(j == 0 && ggml_backend_sched_moe_device_supports(sched, node, cur_backend_id))) {
                     // create a copy of the input in the split's backend
                     if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
                         ggml_backend_t backend = sched->backends[cur_backend_id];
@@ -2825,6 +2848,23 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                   sched->moe_cache_api.session_leave,
                   sched->moe_cache_api);
 
+    if (sched->moe_cache_device_graph) {
+        for (int i = 0; i < sched->n_splits; ++i) {
+            const auto & split = splits[i];
+            if (ggml_backend_dev_type(ggml_backend_get_device(sched->backends[split.backend_id])) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                continue;
+            }
+            for (int j = 0; j < split.graph.n_nodes; ++j) {
+                const ggml_tensor * node = split.graph.nodes[j];
+                if (node->op == GGML_OP_MUL_MAT_ID && ggml_backend_sched_is_host_weight(node->src[0]) &&
+                        !ggml_backend_sched_moe_device_supports(sched, node, split.backend_id)) {
+                    GGML_LOG_ERROR("[moe-cache] device expert mapping invalidated; rebuild scheduler and graph before compute\n");
+                    return GGML_STATUS_FAILED;
+                }
+            }
+        }
+    }
+
     int prev_backend_id = -1;
 
     ggml_sched_xs_begin(sched);
@@ -3079,6 +3119,25 @@ int ggml_backend_sched_moe_cache_warm(
     }
 }
 
+int ggml_backend_sched_moe_cache_device_prepare(ggml_backend_sched_t sched,
+        const ggml_moe_cache_tensor_desc * tensors, int n_tensors) {
+    if (!sched || !sched->moe_cache_session || !sched->moe_cache_api.device_prepare ||
+            n_tensors < 0 || (n_tensors > 0 && !tensors)) {
+        return 0;
+    }
+    ggml_backend_sched_synchronize(sched);
+    return sched->moe_cache_api.device_prepare(sched->moe_cache_session, tensors, n_tensors);
+}
+
+void ggml_backend_sched_moe_cache_print_stats(ggml_backend_sched_t sched) {
+    if (!sched || !sched->moe_cache_session || !sched->moe_cache_api.print_stats) {
+        GGML_LOG_INFO("[moe-cache] phase snapshot unavailable: reason=no-provider\n");
+        return;
+    }
+    ggml_backend_sched_synchronize(sched);
+    sched->moe_cache_api.print_stats(sched->moe_cache_session);
+}
+
 bool ggml_backend_sched_reset_compute(ggml_backend_sched_t sched) {
     if (!sched) {
         return false;
@@ -3091,6 +3150,7 @@ bool ggml_backend_sched_reset_compute(ggml_backend_sched_t sched) {
     ggml_backend_sched_reset(sched);
     ggml_gallocr_free(sched->galloc);
     sched->galloc = replacement;
+    sched->moe_cache_device_graph = false;
     sched->n_splits = 0;
     sched->debug_prev_graph_size = 0;
     return true;
