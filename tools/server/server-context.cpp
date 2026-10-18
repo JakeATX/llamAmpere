@@ -2471,6 +2471,26 @@ private:
         model_aliases = params_base.model_alias;
         model_tags    = params_base.model_tags;
 
+        // Startup ranking must see the real free memory after target, draft/MTP, multimedia,
+        // speculative helpers, and slot state have all been fitted and allocated. Restore the
+        // draft's response scratch first, then let only the target prefill its expert cache.
+        if (const char * profile = getenv("GGML_MOE_CACHE_PROFILE_LOAD"); profile && profile[0]) {
+            SRV_INF("%s", "all model and context allocations ready; loading expert usage profile\n");
+            try {
+                if (ctx_dft) {
+                    llama_set_decode_phase(ctx_dft, LLAMA_DECODE_PHASE_GENERATION);
+                }
+                llama_set_decode_phase(ctx_tgt, LLAMA_DECODE_PHASE_GENERATION);
+                if (ctx_dft) {
+                    llama_set_decode_phase(ctx_dft, LLAMA_DECODE_PHASE_AUTOMATIC);
+                }
+                llama_set_decode_phase(ctx_tgt, LLAMA_DECODE_PHASE_AUTOMATIC);
+            } catch (const std::exception & e) {
+                SRV_ERR("failed to prepare startup expert cache: %s\n", e.what());
+                return false;
+            }
+        }
+
         // propagate new defaults back to the initial caller
         if (!is_resume) {
             params = params_base;

@@ -2709,6 +2709,9 @@ void llama_context::set_decode_phase(enum llama_decode_phase phase) {
             }
         }
     }
+    if (phase == LLAMA_DECODE_PHASE_GENERATION) {
+        b1_cache_profile_load();
+    }
     switch (phase) {
         case LLAMA_DECODE_PHASE_AUTOMATIC:
         case LLAMA_DECODE_PHASE_PROMPT:
@@ -4685,13 +4688,24 @@ bool llama_context::b1_reserve_legacy_layers(const std::vector<uint32_t> & sizes
                 (size_t) std::max<int64_t>(1536, b1_ctx_env("LLAMA_B1_KEEP_FREE_MIB", 1536)) << 20,
                 total > card_limit ? total - card_limit + (64u << 20) : 0);
         const size_t need = maximum[gpu_index] + keep;
-        if (need > free) {
+        // The layer graph needs a second loan after carries/expert slots are
+        // allocated. Re-probe physical free after each trim; a logical slot shrink
+        // may need another bounded trim to cross the physical allocation boundary.
+        constexpr int max_layer_loan_attempts = 4;
+        for (int attempt = 1; attempt <= max_layer_loan_attempts && need > free; ++attempt) {
+            const size_t free_before = free;
             const size_t requested = need - free;
             b1_cache_needs_refresh = true;
             const size_t released = ggml_backend_sched_moe_cache_trim(sched.get(), requested);
             LLAMA_LOG_INFO("%s: [B1] legacy layer scratch borrowed %.2f MiB (requested %.2f MiB)\n", __func__,
                     released / 1048576.0, requested / 1048576.0);
             ggml_backend_dev_memory(dev, &free, &total);
+            LLAMA_LOG_INFO("%s: [B1] legacy loan probe attempt=%d requested_bytes=%zu released_bytes=%zu free_before=%zu free_after=%zu actual_free_gain_bytes=%zu actual_free_loss_bytes=%zu remaining_bytes=%zu fit=%d\n",
+                    __func__, attempt, requested, released, free_before, free, free > free_before ? free - free_before : 0, free_before > free ? free_before - free : 0, need > free ? need - free : 0, need <= free);
+            if (need > free && released == 0 && free <= free_before) {
+                LLAMA_LOG_WARN("%s: [B1] legacy cache loan made no logical or physical progress\n", __func__);
+                break;
+            }
         }
         LLAMA_LOG_INFO("%s: [B1] legacy layer fit: range [%d,%d), compute %.2f MiB, free %.2f MiB, keep %.2f MiB\n",
                 __func__, worst_l0, worst_l1, maximum[gpu_index] / 1048576.0, free / 1048576.0, keep / 1048576.0);
@@ -4709,6 +4723,26 @@ bool llama_context::b1_reserve_legacy_layers(const std::vector<uint32_t> & sizes
         }
         backend_buf_exp_epoch = ggml_backend_sched_get_alloc_epoch(sched.get());
         ggml_backend_dev_memory(dev, &free, &total);
+        // Allocator padding and physical pool growth are only known after the
+        // real reserve. Keep its live compute buffers, and lend only the measured
+        // remaining deficit before any worker, input upload or state apply. Logical
+        // slot progress permits a bounded retry across allocation granularity.
+        LLAMA_LOG_INFO("%s: [B1] legacy post-allocation fit: free_bytes=%zu keep_bytes=%zu remaining_bytes=%zu fit=%d\n",
+                __func__, free, keep, keep > free ? keep - free : 0, keep <= free);
+        constexpr int max_post_alloc_loan_attempts = 4;
+        for (int attempt = 1; attempt <= max_post_alloc_loan_attempts && keep > free; ++attempt) {
+            const size_t free_before = free;
+            const size_t requested = keep - free;
+            b1_cache_needs_refresh = true;
+            const size_t released = ggml_backend_sched_moe_cache_trim(sched.get(), requested);
+            ggml_backend_dev_memory(dev, &free, &total);
+            LLAMA_LOG_INFO("%s: [B1] legacy post-allocation loan probe attempt=%d requested_bytes=%zu released_bytes=%zu free_before=%zu free_after=%zu actual_free_gain_bytes=%zu actual_free_loss_bytes=%zu remaining_bytes=%zu fit=%d\n",
+                    __func__, attempt, requested, released, free_before, free, free > free_before ? free - free_before : 0, free_before > free ? free_before - free : 0, keep > free ? keep - free : 0, keep <= free);
+            if (keep > free && released == 0 && free <= free_before) {
+                LLAMA_LOG_WARN("%s: [B1] legacy post-allocation cache loan made no logical or physical progress\n", __func__);
+                break;
+            }
+        }
         if (free < keep) { return false; }
         success = true;
         return true;
@@ -4846,11 +4880,13 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
     bool planned = b1->begin(sizes, group_ub, lend_cap, final_home, rotating ? &borrow : nullptr, lean_legacy);
     if (!planned && borrow > 0) {
         synchronize();
+        ggml_backend_dev_t loan_device = nullptr;
         for (ggml_backend_t backend : backend_ptrs) {
             auto dev = ggml_backend_get_device(backend);
             if (!dev || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
                 continue;
             }
+            loan_device = dev;
             using reset_fn = bool (*)(ggml_backend_t);
             auto reset = (reset_fn) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), "ggml_backend_cuda_graph_reset");
             if (!reset || !reset(backend)) {
@@ -4864,10 +4900,27 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
         }
         gf_res_prev_active = nullptr;
         ggml_backend_sched_reset(sched.get());
+        if (!loan_device) { return normal(); }
         b1_cache_needs_refresh = true;
-        const size_t released = ggml_backend_sched_moe_cache_trim(sched.get(), borrow);
-        LLAMA_LOG_INFO("%s: B1 scratch borrowed %.2f MiB from runtime experts (requested %.2f MiB)\n", __func__, released / 1048576.0, borrow / 1048576.0);
-        planned = b1->begin(sizes, group_ub, lend_cap, final_home, nullptr, lean_legacy);
+        // Loaned slot bytes and physical free VRAM can differ at allocation
+        // granularity. Allow bounded logical progress across that boundary, and
+        // re-probe the full group, never a smaller post-loan plan.
+        constexpr int max_loan_attempts = 4;
+        for (int attempt = 1; attempt <= max_loan_attempts && !planned && borrow > 0; ++attempt) {
+            size_t free_before = 0, free_after = 0, total = 0;
+            ggml_backend_dev_memory(loan_device, &free_before, &total);
+            const size_t requested = borrow;
+            const size_t released = ggml_backend_sched_moe_cache_trim(sched.get(), requested);
+            ggml_backend_dev_memory(loan_device, &free_after, &total);
+            LLAMA_LOG_INFO("%s: B1 scratch borrowed %.2f MiB from runtime experts (requested %.2f MiB)\n", __func__, released / 1048576.0, requested / 1048576.0);
+            planned = b1->begin(sizes, group_ub, lend_cap, final_home, &borrow, lean_legacy);
+            LLAMA_LOG_INFO("%s: [B1] loan probe attempt=%d requested_bytes=%zu released_bytes=%zu free_before=%zu free_after=%zu actual_free_gain_bytes=%zu actual_free_loss_bytes=%zu remaining_bytes=%zu fit=%d\n",
+                    __func__, attempt, requested, released, free_before, free_after, free_after > free_before ? free_after - free_before : 0, free_before > free_after ? free_before - free_after : 0, borrow, planned);
+            if (!planned && borrow > 0 && released == 0 && free_after <= free_before) {
+                LLAMA_LOG_WARN("%s: [B1] cache loan made no logical or physical progress; using normal prefill\n", __func__);
+                break;
+            }
+        }
     }
     if (!planned) {
         return normal();
@@ -4998,6 +5051,37 @@ bool llama_context::b1_cache_eval(ggml_tensor * tensor, bool ask, void * user_da
         return ctx.cparams.cb_eval(tensor, false, ctx.cparams.cb_eval_user_data);
     }
     return true;
+}
+
+// Explicit GENERATION is the application handoff after all peer contexts have been allocated.
+// A target constructor/reserve must never spend the draft model's still-free card memory.
+void llama_context::b1_cache_profile_load() {
+    const char * profile = getenv("GGML_MOE_CACHE_PROFILE_LOAD");
+    if (b1_cache_profile_attempted || cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT ||
+            model.hparams.no_alloc || !profile || !profile[0]) {
+        return;
+    }
+    b1_cache_profile_attempted = true;
+    synchronize();
+    try {
+        std::vector<ggml_moe_cache_tensor_desc> tensors;
+        for (const auto & entry : model.tensors_by_name) {
+            int layer = -1;
+            int parsed = 0;
+            ggml_tensor * tensor = entry.second;
+            if (sscanf(entry.first.c_str(), "blk.%d.%n", &layer, &parsed) != 1 || parsed <= 0 ||
+                    entry.first.find("_exps") == std::string::npos || layer < 0 || (uint32_t) layer >= model.hparams.n_layer() ||
+                    !tensor->buffer || !ggml_backend_buffer_is_host(tensor->buffer) || !tensor->data ||
+                    tensor->ne[2] != model.hparams.n_expert || tensor->ne[3] != 1 || !ggml_is_contiguous(tensor) ||
+                    !ggml_moe_cache_wtype_supported(tensor->type)) {
+                continue;
+            }
+            tensors.push_back({tensor->name, tensor->data, tensor->nb[2], tensor->ne[0], tensor->ne[1], tensor->ne[2], (int32_t) tensor->type});
+        }
+        ggml_backend_sched_moe_cache_warm(sched.get(), tensors.data(), nullptr, (int) tensors.size());
+    } catch (const std::bad_alloc &) {
+        LLAMA_LOG_WARN("%s: profile warm skipped after host allocation failure\n", __func__);
+    }
 }
 
 void llama_context::b1_cache_warm() {

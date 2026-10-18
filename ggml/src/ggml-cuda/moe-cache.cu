@@ -293,6 +293,8 @@ struct moe_cache_session {
     std::atomic<bool> enabled_announced{false};
     std::atomic<bool> batch_bypass_announced{false};
     std::atomic<bool> row_bypass_announced{false};
+    bool profile_load_attempted = false;
+    std::unordered_map<moe_cache_key, uint64_t, moe_cache_key_hash> profile_counts;
     int active_scopes = 0;
     int active_nodes = 0;
     struct active_source {
@@ -3325,6 +3327,13 @@ static void moe_cache_invalidate_session(
         moe_cache_session & session, const void * base, size_t size) {
     std::unique_lock<std::mutex> lock(session.mu);
     session.tensor_devices.erase(base);
+    for (auto it = session.profile_counts.begin(); it != session.profile_counts.end();) {
+        if (moe_cache_ranges_overlap(it->first.tensor, 1, base, size)) {
+            it = session.profile_counts.erase(it);
+        } else {
+            ++it;
+        }
+    }
     for (auto & device_ptr : session.devices) {
         moe_cache_cancel_queue_locked(*device_ptr, base, size, false);
     }
@@ -3473,7 +3482,86 @@ extern "C" size_t ggml_moe_cache_trim(int device) {
     return freed;
 }
 
-// Wait for all cache users before resizing or replacing resident entries.
+// fork: profile files contain bounded usage counts, never expert weights or pointers.
+static uint64_t moe_cache_profile_hash(uint64_t hash, const void * data, size_t size) {
+    const auto * bytes = (const unsigned char *) data;
+    for (size_t i = 0; i < size; ++i) {
+        hash = (hash ^ bytes[i]) * UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+static uint64_t moe_cache_profile_signature(const ggml_moe_cache_tensor_desc * tensors, int n_tensors) {
+    uint64_t hash = UINT64_C(14695981039346656037);
+    for (int i = 0; i < n_tensors; ++i) {
+        const auto & t = tensors[i];
+        hash = moe_cache_profile_hash(hash, t.name, strlen(t.name) + 1);
+        const uint64_t shape[] = {(uint64_t) t.expert_size, (uint64_t) t.n_in,
+            (uint64_t) t.n_out, (uint64_t) t.n_expert, (uint64_t) t.type};
+        hash = moe_cache_profile_hash(hash, shape, sizeof(shape));
+        const size_t bytes = t.expert_size * (size_t) t.n_expert;
+        const size_t sample = std::min<size_t>(bytes, 64);
+        // Sample across each tensor so equal-shaped models do not share a profile by accident.
+        for (size_t j = 0; j < 64; ++j) {
+            const size_t offset = ((bytes - sample) / 63) * j;
+            hash = moe_cache_profile_hash(hash, (const char *) t.data + offset, sample);
+        }
+    }
+    return hash;
+}
+
+static bool moe_cache_profile_load(const char * path, uint64_t signature, size_t entries,
+        const ggml_moe_cache_tensor_desc * tensors, int n_tensors,
+        std::vector<std::vector<uint64_t>> & storage, std::vector<const uint64_t *> & counts) {
+    std::unique_ptr<FILE, int (*)(FILE *)> file(fopen(path, "rb"), fclose);
+    uint64_t header[5] = {};
+    const uint64_t magic = UINT64_C(0x31464f5250454f4d); // MOEPROF1, native uint64_t format
+    if (!file || fread(header, sizeof(header), 1, file.get()) != 1 ||
+            header[0] != magic || header[1] != (uint64_t) n_tensors ||
+            header[2] != entries || header[3] != signature) {
+        return false;
+    }
+    uint64_t checksum = UINT64_C(14695981039346656037);
+    storage.resize(n_tensors);
+    counts.reserve(n_tensors);
+    for (int i = 0; i < n_tensors; ++i) {
+        storage[i].resize(tensors[i].n_expert);
+        const size_t bytes = storage[i].size() * sizeof(uint64_t);
+        if (fread(storage[i].data(), 1, bytes, file.get()) != bytes) {
+            return false;
+        }
+        checksum = moe_cache_profile_hash(checksum, storage[i].data(), bytes);
+        counts.push_back(storage[i].data());
+    }
+    return checksum == header[4] && fgetc(file.get()) == EOF && !ferror(file.get());
+}
+
+static bool moe_cache_profile_save(const char * path, uint64_t signature, size_t entries,
+        const ggml_moe_cache_tensor_desc * tensors, const uint64_t * const * counts, int n_tensors) {
+    uint64_t checksum = UINT64_C(14695981039346656037);
+    for (int i = 0; i < n_tensors; ++i) {
+        checksum = moe_cache_profile_hash(checksum, counts[i], (size_t) tensors[i].n_expert * sizeof(uint64_t));
+    }
+    const uint64_t header[] = {UINT64_C(0x31464f5250454f4d), (uint64_t) n_tensors, entries, signature, checksum};
+    const std::string temporary = std::string(path) + ".tmp";
+    std::unique_ptr<FILE, int (*)(FILE *)> file(fopen(temporary.c_str(), "wb"), fclose);
+    if (!file) {
+        return false;
+    }
+    bool ok = fwrite(header, sizeof(header), 1, file.get()) == 1;
+    for (int i = 0; ok && i < n_tensors; ++i) {
+        const size_t bytes = (size_t) tensors[i].n_expert * sizeof(uint64_t);
+        ok = fwrite(counts[i], 1, bytes, file.get()) == bytes;
+    }
+    ok = fclose(file.release()) == 0 && ok;
+    if (ok && rename(temporary.c_str(), path) == 0) {
+        return true;
+    }
+    remove(temporary.c_str());
+    return false;
+}
+
+// fork: a saved ranking is a startup hint; current prompt observations replace it.
 static bool moe_cache_profile_rerank(moe_cache_session & session,
         std::chrono::steady_clock::time_point deadline) {
     std::unique_lock<std::mutex> lock(session.mu);
@@ -3753,7 +3841,7 @@ static size_t moe_cache_return(void * opaque) {
 static int moe_cache_warm(void * opaque, const ggml_moe_cache_tensor_desc * tensors,
         const uint64_t * const * counts, int n_tensors) {
     auto * session = (moe_cache_session *)opaque;
-    if (!session || !counts || !tensors || n_tensors < 1 || n_tensors > 4096 || session->dormant) {
+    if (!session || !tensors || n_tensors < 1 || n_tensors > 4096 || session->dormant) {
         return 0;
     }
     size_t entries = 0;
@@ -3771,9 +3859,47 @@ static int moe_cache_warm(void * opaque, const ggml_moe_cache_tensor_desc * tens
         }
         entries += tensors[i].n_expert;
     }
+    const bool loading = !counts;
+    bool observed = false;
+    if (counts) {
+        for (int i = 0; i < n_tensors && !observed; ++i) {
+            for (int32_t e = 0; e < tensors[i].n_expert; ++e) {
+                if (counts[i][e]) {
+                    observed = true;
+                    break;
+                }
+            }
+        }
+    }
+    if (loading) {
+        std::lock_guard<std::mutex> lock(session->mu);
+        if (session->profile_load_attempted) {
+            return 0;
+        }
+        session->profile_load_attempted = true;
+    }
+    std::vector<std::vector<uint64_t>> loaded_storage;
+    std::vector<const uint64_t *> loaded_counts;
+    const char * path = getenv(loading ? "GGML_MOE_CACHE_PROFILE_LOAD" : "GGML_MOE_CACHE_PROFILE_SAVE");
+    if (path && path[0] && (loading || observed)) {
+        const uint64_t signature = moe_cache_profile_signature(tensors, n_tensors);
+        if (loading) {
+            if (!moe_cache_profile_load(path, signature, entries, tensors, n_tensors, loaded_storage, loaded_counts)) {
+                MOE_CACHE_LOG("[moe-cache] profile rejected: %s (missing, mismatched, or corrupt)\n", path);
+                return 0;
+            }
+            counts = loaded_counts.data();
+            MOE_CACHE_LOG("[moe-cache] profile loaded: %s, %zu ranked entries; sampled weight identity verified\n", path, entries);
+        } else {
+            const bool saved = moe_cache_profile_save(path, signature, entries, tensors, counts, n_tensors);
+            MOE_CACHE_LOG("[moe-cache] profile %s: %s, %zu usage counts\n", saved ? "saved" : "save failed", path, entries);
+        }
+    } else if (loading) {
+        return 0;
+    }
     const auto start = std::chrono::steady_clock::now();
     const auto deadline = start + std::chrono::seconds(30);
-    if (!moe_cache_profile_rerank(*session, deadline)) {
+    if (!loading && !moe_cache_profile_rerank(*session, deadline)) {
         return 0;
     }
     moe_cache_session_enter(session);
@@ -3792,17 +3918,29 @@ static int moe_cache_warm(void * opaque, const ggml_moe_cache_tensor_desc * tens
             moe_cache_end(begin(i));
         }
     }
-    struct candidate { int tensor; int32_t expert; uint64_t count; };
+    struct candidate { int tensor; int32_t expert; uint64_t count; bool current; };
     std::vector<candidate> ranked;
     ranked.reserve(entries);
     for (int i = 0; i < n_tensors; ++i) {
         for (int32_t e = 0; e < tensors[i].n_expert; ++e) {
+            const moe_cache_key key{tensors[i].data, e};
+            if (loading && counts[i][e]) {
+                session->profile_counts[key] = counts[i][e];
+            }
             if (counts[i][e]) {
-                ranked.push_back({i, e, counts[i][e]});
+                ranked.push_back({i, e, counts[i][e], !loading});
+            } else if (!loading) {
+                const auto previous = session->profile_counts.find(key);
+                if (previous != session->profile_counts.end()) {
+                    ranked.push_back({i, e, previous->second, false});
+                }
             }
         }
     }
     std::stable_sort(ranked.begin(), ranked.end(), [](const candidate & a, const candidate & b) {
+        if (a.current != b.current) {
+            return a.current > b.current;
+        }
         return a.count > b.count;
     });
     std::unordered_map<moe_cache_key, size_t, moe_cache_key_hash> ranks;
@@ -3887,7 +4025,7 @@ static int moe_cache_warm(void * opaque, const ggml_moe_cache_tensor_desc * tens
         });
     }
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
-    MOE_CACHE_LOG("[moe-cache] %s warm: %d queued of %zu touched entries, %.3f ms; decode lookup counters unchanged\n", "prompt", queued, ranked.size(), ms);
+    MOE_CACHE_LOG("[moe-cache] %s warm: %d queued of %zu touched entries, %.3f ms; decode lookup counters unchanged\n", loading ? "profile" : "prompt", queued, ranked.size(), ms);
     return queued;
 }
 

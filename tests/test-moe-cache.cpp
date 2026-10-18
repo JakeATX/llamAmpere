@@ -3063,6 +3063,25 @@ static bool run_prompt_warm(
     usage[1] = 50;
     const uint64_t * counts[] = {usage.data()};
     bool ok = true;
+#if defined(__linux__)
+    const char * previous_save = getenv("GGML_MOE_CACHE_PROFILE_SAVE");
+    const bool had_save = previous_save != nullptr;
+    const std::string saved_path = previous_save ? previous_save : "";
+    std::string invalid_profile;
+    if (const char * directory = getenv("GGML_MOE_CACHE_TEST_TMPDIR")) {
+        const std::string path = std::string(directory) + "/moe-invalid-profile-XXXXXX";
+        std::vector<char> filename(path.begin(), path.end());
+        filename.push_back('\0');
+        const int fd = mkstemp(filename.data());
+        ok &= fd >= 0;
+        if (fd >= 0) {
+            close(fd);
+            unlink(filename.data());
+            invalid_profile = filename.data();
+            set_env("GGML_MOE_CACHE_PROFILE_SAVE", invalid_profile.c_str());
+        }
+    }
+#endif
     for (int field = 0; field < 5; ++field) {
         auto invalid = descriptor;
         switch (field) {
@@ -3074,6 +3093,20 @@ static bool run_prompt_warm(
         }
         ok &= api.warm(session, &invalid, counts, 1) == 0;
     }
+#if defined(__linux__)
+    if (!invalid_profile.empty()) {
+        // Reject shapes before sampling weights or writing a profile.
+        ok &= capture.get().find("[moe-cache] profile ") == std::string::npos;
+        FILE * file = fopen(invalid_profile.c_str(), "rb");
+        ok &= file == nullptr;
+        if (file) {
+            fclose(file);
+        }
+        remove(invalid_profile.c_str());
+        remove((invalid_profile + ".tmp").c_str());
+        set_env("GGML_MOE_CACHE_PROFILE_SAVE", had_save ? saved_path.c_str() : nullptr);
+    }
+#endif
     const uint64_t * missing_counts[] = {nullptr};
     ok &= api.warm(session, &descriptor, missing_counts, 1) == 0;
     ok &= api.warm(session, &descriptor, counts, 1) == 2;
@@ -3210,6 +3243,175 @@ static bool run_prompt_warm_decode_heat(ggml_backend_t gpu, ggml_backend_t cpu, 
         fprintf(stderr, "%s", log.c_str());
     }
     return ok;
+}
+
+static bool run_profile_persistence(ggml_backend_t gpu, ggml_backend_t cpu, log_capture & capture) {
+#if defined(__linux__)
+    const char * directory = getenv("GGML_MOE_CACHE_TEST_TMPDIR");
+    if (!directory) {
+        printf("cache-profile-persistence: SKIP (set GGML_MOE_CACHE_TEST_TMPDIR)\n");
+        return true;
+    }
+    const auto & api = active_api();
+    if (!api.warm) {
+        return false;
+    }
+    configure_cache(nullptr);
+    set_env("GGML_CUDA_MOE_CACHE_BUDGET_MB", "8");
+    set_env("GGML_CUDA_MOE_CACHE_THROTTLE", "8");
+    const std::string pattern = std::string(directory) + "/moe-profile-XXXXXX";
+    std::vector<char> filename(pattern.begin(), pattern.end());
+    filename.push_back('\0');
+    const int fd = mkstemp(filename.data());
+    if (fd < 0) {
+        return false;
+    }
+    close(fd);
+    const std::string path = filename.data();
+    const char * previous_save = getenv("GGML_MOE_CACHE_PROFILE_SAVE");
+    const bool had_save = previous_save != nullptr;
+    const std::string saved_path = previous_save ? previous_save : "";
+    const char * previous_load = getenv("GGML_MOE_CACHE_PROFILE_LOAD");
+    const bool had_load = previous_load != nullptr;
+    const std::string loaded_path = previous_load ? previous_load : "";
+    set_env("GGML_MOE_CACHE_PROFILE_LOAD", nullptr);
+    set_env("GGML_MOE_CACHE_PROFILE_SAVE", path.c_str());
+    constexpr int64_t shape_in = 1024, shape_out = 206, experts = 65;
+    const size_t expert_bytes = ggml_row_size(GGML_TYPE_Q4_0, shape_in) * shape_out;
+    std::vector<uint8_t> data(expert_bytes * experts);
+    for (size_t i = 0; i < data.size(); ++i) {
+        data[i] = (uint8_t)(i % 251);
+    }
+    std::vector<uint64_t> usage(experts);
+    for (size_t e = 0; e < usage.size(); ++e) {
+        usage[e] = e + 1;
+    }
+    const uint64_t * counts[] = {usage.data()};
+    const ggml_moe_cache_tensor_desc descriptor = {
+        "blk.5.ffn_up_exps.weight", data.data(), expert_bytes, shape_in, shape_out, experts, GGML_TYPE_Q4_0,
+    };
+    auto read_file = [&]() {
+        std::vector<uint8_t> bytes;
+        FILE * file = fopen(path.c_str(), "rb");
+        if (file) {
+            if (fseek(file, 0, SEEK_END) == 0) {
+                const long size = ftell(file);
+                if (size > 0 && size <= 1048576 && fseek(file, 0, SEEK_SET) == 0) {
+                    bytes.resize((size_t)size);
+                    if (fread(bytes.data(), 1, bytes.size(), file) != bytes.size()) {
+                        bytes.clear();
+                    }
+                }
+            }
+            fclose(file);
+        }
+        return bytes;
+    };
+    auto write_file = [&](const std::vector<uint8_t> & bytes) {
+        FILE * file = fopen(path.c_str(), "wb");
+        if (!file) {
+            return false;
+        }
+        const bool written = fwrite(bytes.data(), 1, bytes.size(), file) == bytes.size();
+        return fclose(file) == 0 && written;
+    };
+    bool ok = true;
+    std::vector<uint8_t> first;
+    for (int repetition = 0; repetition < 2; ++repetition) {
+        void * session = create_direct_session(gpu, cpu);
+        if (!session) {
+            ok = false;
+            break;
+        }
+        ok &= api.warm(session, &descriptor, counts, 1) == 64;
+        api.session_destroy(session);
+        const auto bytes = read_file();
+        ok &= !bytes.empty();
+        if (repetition == 0) {
+            first = bytes;
+        } else {
+            // The second save must reproduce the complete file, not just its counts.
+            ok &= first == bytes;
+        }
+    }
+    const auto original = read_file();
+    ok &= !original.empty();
+    set_env("GGML_MOE_CACHE_PROFILE_SAVE", nullptr);
+    set_env("GGML_MOE_CACHE_PROFILE_LOAD", path.c_str());
+    // A fresh allocation proves that profile identity does not depend on host addresses.
+    std::vector<uint8_t> relocated = data;
+    auto loaded = descriptor;
+    loaded.data = relocated.data();
+    void * reader = create_direct_session(gpu, cpu);
+    if (reader) {
+        capture.clear();
+        ok &= api.warm(reader, &loaded, nullptr, 1) == 64;
+        ok &= capture.get().find("profile loaded:") != std::string::npos;
+        std::vector<uint64_t> zeros(experts, 0);
+        const uint64_t * zero_counts[] = {zeros.data()};
+        set_env("GGML_MOE_CACHE_PROFILE_SAVE", path.c_str());
+        ok &= api.warm(reader, &loaded, zero_counts, 1) == 0;
+        ok &= original == read_file();
+        set_env("GGML_MOE_CACHE_PROFILE_SAVE", nullptr);
+        api.session_enter(reader);
+        ok &= direct_plan_one(loaded.name, loaded.data, expert_bytes,
+                shape_in, shape_out, GGML_TYPE_Q4_0, experts, 64) == 1;
+        ok &= direct_plan_one(loaded.name, loaded.data, expert_bytes,
+                shape_in, shape_out, GGML_TYPE_Q4_0, experts, 1) == 1;
+        ok &= direct_plan_one(loaded.name, loaded.data, expert_bytes,
+                shape_in, shape_out, GGML_TYPE_Q4_0, experts, 0) == 0;
+        api.session_leave(reader);
+        api.session_destroy(reader);
+        ok &= max_field_value(capture.get(), "slots=") == 64;
+    } else {
+        ok = false;
+    }
+    auto rejected = [&](const ggml_moe_cache_tensor_desc & candidate) {
+        void * session = create_direct_session(gpu, cpu);
+        if (!session) {
+            return false;
+        }
+        capture.clear();
+        const bool failed = api.warm(session, &candidate, nullptr, 1) == 0 &&
+            capture.get().find("profile rejected:") != std::string::npos;
+        api.session_destroy(session);
+        return failed;
+    };
+    auto wrong_shape = loaded;
+    wrong_shape.n_in /= 2;
+    wrong_shape.n_out *= 2;
+    ok &= rejected(wrong_shape);
+    auto wrong_type = loaded;
+    wrong_type.type = GGML_TYPE_IQ4_NL;
+    ok &= rejected(wrong_type);
+    relocated[0] ^= 1;
+    ok &= rejected(loaded);
+    relocated[0] ^= 1;
+    if (!original.empty()) {
+        auto corrupt = original;
+        corrupt.back() ^= 1;
+        ok &= write_file(corrupt) && rejected(loaded);
+        auto truncated = original;
+        truncated.pop_back();
+        ok &= write_file(truncated) && rejected(loaded);
+        auto extended = original;
+        extended.push_back(0);
+        ok &= write_file(extended) && rejected(loaded);
+        ok &= write_file(original);
+    }
+    remove(path.c_str());
+    remove((path + ".tmp").c_str());
+    set_env("GGML_MOE_CACHE_PROFILE_SAVE", had_save ? saved_path.c_str() : nullptr);
+    set_env("GGML_MOE_CACHE_PROFILE_LOAD", had_load ? loaded_path.c_str() : nullptr);
+    printf("cache-profile-persistence: %s\n", ok ? "OK" : "FAIL");
+    return ok;
+#else
+    GGML_UNUSED(gpu);
+    GGML_UNUSED(cpu);
+    GGML_UNUSED(capture);
+    printf("cache-profile-persistence: SKIP (requires Linux temporary files)\n");
+    return true;
+#endif
 }
 
 static bool run_prompt_cache_lending(ggml_backend_t gpu, ggml_backend_t cpu, log_capture & capture) {
@@ -3493,6 +3695,9 @@ int main() {
     });
     ok &= run_optional(provider_is_cuda, "cache-prompt-warm-decode-heat", [&] {
         return run_prompt_warm_decode_heat(gpu, cpu, capture);
+    });
+    ok &= run_optional(provider_is_cuda, "cache-profile-persistence", [&] {
+        return run_profile_persistence(gpu, cpu, capture);
     });
     ok &= run_optional(provider_is_cuda, "cache-prompt-lending", [&] {
         return run_prompt_cache_lending(gpu, cpu, capture);

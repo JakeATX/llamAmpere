@@ -104,7 +104,7 @@ struct ggml_moe_cache_api {
     // Host buffer mutation or teardown notification. Sessions cancel or finish any fill that still reads the supplied range before this call returns.
     void (*invalidate)(const void * base, size_t size);
 
-    // Fill free slots from ranked prompt usage without adding synthetic decode observations.
+    // Fill free slots from ranked prompt usage without adding synthetic decode observations. NULL counts loads an optional provider profile.
     int (*warm)(void * session, const struct ggml_moe_cache_tensor_desc * tensors,
                 const uint64_t * const * counts, int n_tensors);
 

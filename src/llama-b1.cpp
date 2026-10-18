@@ -26,6 +26,15 @@ static size_t b1_align_up(size_t x, size_t a) {
     return (x + a - 1) / a * a;
 }
 
+// Saturate the final loan, not free-minus-keep: a full expert cache may
+// leave less free memory than the reserve before any prompt scratch exists.
+static size_t b1_borrow_deficit(size_t required, size_t keep, size_t free_mem) {
+    const size_t available = free_mem > keep ? free_mem - keep : 0;
+    const size_t scratch_shortfall = required > available ? required - available : 0;
+    const size_t keep_shortfall = keep > free_mem ? keep - free_mem : 0;
+    return scratch_shortfall > SIZE_MAX - keep_shortfall ? SIZE_MAX : scratch_shortfall + keep_shortfall;
+}
+
 static bool b1_read_file(int fd, void * dst, size_t offs, size_t len) {
 #ifndef _WIN32
     char * p = (char *) dst;
@@ -553,9 +562,11 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
             break;
         }
         // fork: ask the cache only for space the full group cannot borrow from resident weights.
-        if (borrow_bytes && g == g_max && minimum_fresh != SIZE_MAX && minimum_fresh > fresh_avail) {
-            *borrow_bytes = minimum_fresh - fresh_avail;
-            return false;
+        if (borrow_bytes && g == g_max && minimum_fresh != SIZE_MAX) {
+            *borrow_bytes = b1_borrow_deficit(minimum_fresh, keep, free_mem);
+            if (*borrow_bytes > 0) {
+                return false;
+            }
         }
     }
     size_t passes = 0;
