@@ -278,6 +278,7 @@ struct moe_cache_device {
     size_t queued_bytes = 0;
     bool worker_started = false;
     bool inflight = false;
+    bool inflight_prefetch = false;
     const void * inflight_source = nullptr;
     size_t inflight_bytes = 0;
     std::thread worker;
@@ -1299,6 +1300,7 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
             device->queued_bytes = job.bytes <= device->queued_bytes
                 ? device->queued_bytes - job.bytes : 0;
             device->inflight = true;
+            device->inflight_prefetch = (bool) job.prediction;
             device->inflight_source = job.source;
             device->inflight_bytes = job.bytes;
         }
@@ -1393,6 +1395,7 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
                 moe_prefetch_log(*job.prediction);
             }
             device->inflight = false;
+            device->inflight_prefetch = false;
             device->inflight_source = nullptr;
             device->inflight_bytes = 0;
 
@@ -4564,10 +4567,15 @@ static void moe_cache_prefetch(void * opaque, const ggml_moe_cache_tensor_desc *
     }
     for (auto & device_ptr : session->devices) {
         auto & device = *device_ptr;
-        if (device.dead || device.copy_samples < 4 || device.copy_bytes_per_us <= 0.0 || device.inflight || !device.queue.empty()) {
+        if (device.dead || device.copy_samples < 4 || device.copy_bytes_per_us <= 0.0 ||
+                (device.inflight && !device.inflight_prefetch) ||
+                std::any_of(device.queue.begin(), device.queue.end(),
+                    [](const moe_cache_job & job) { return !job.prediction; })) {
             continue;
         }
-        size_t budget = ggml_moe_prefetch_budget(lead_us, elapsed_us, device.copy_bytes_per_us);
+        // Farther layers may queue behind earlier guesses, but all pending bytes consume lead time.
+        const size_t pending = device.queued_bytes + (device.inflight ? device.inflight_bytes : 0);
+        size_t budget = ggml_moe_prefetch_budget(lead_us, elapsed_us, device.copy_bytes_per_us, pending);
         // Auto selects the shortest lead that covers one complete expert at measured speed.
         size_t whole_expert = 0;
         for (int t = 0; t < n_tensors; ++t) {
@@ -4582,7 +4590,7 @@ static void moe_cache_prefetch(void * opaque, const ggml_moe_cache_tensor_desc *
         }
         if (automatic && target_layer - source_layer > 1) {
             const double shorter = available_us - 0.75 * session->layer_time_us[target_layer - 1];
-            if (shorter * device.copy_bytes_per_us >= whole_expert) {
+            if (shorter * device.copy_bytes_per_us >= (double) whole_expert + pending) {
                 continue;
             }
         }

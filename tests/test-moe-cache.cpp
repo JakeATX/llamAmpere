@@ -4433,6 +4433,9 @@ static bool run_optional(
 
 static bool test_prefetch_budget() {
     bool ok = ggml_moe_prefetch_budget(100.0, 20.0, 25000.0) == 1500000;
+    ok &= ggml_moe_prefetch_budget(100.0, 20.0, 25000.0, 500000) == 1000000;
+    ok &= ggml_moe_prefetch_budget(100.0, 20.0, 25000.0, 1500000) == 0;
+    ok &= ggml_moe_prefetch_budget(100.0, 20.0, 25000.0, SIZE_MAX) == 0;
     ok &= ggml_moe_prefetch_budget(100.0, 100.0, 25000.0) == 0;
     ok &= ggml_moe_prefetch_budget(100.0, 101.0, 25000.0) == 0;
     ok &= ggml_moe_prefetch_budget(100.0, 0.0, 0.0) == 0;
