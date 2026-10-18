@@ -4173,7 +4173,7 @@ static int moe_cache_warm(void * opaque, const ggml_moe_cache_tensor_desc * tens
             moe_cache_end(begin(i));
         }
     }
-    struct candidate { int tensor; int32_t expert; uint64_t count; bool current; long double startup_score; };
+    struct candidate { int tensor; int32_t expert; uint64_t count; bool current; long double startup_score; bool first_layer; };
     std::vector<candidate> ranked;
     ranked.reserve(entries);
     for (int i = 0; i < n_tensors; ++i) {
@@ -4192,16 +4192,17 @@ static int moe_cache_warm(void * opaque, const ggml_moe_cache_tensor_desc * tens
             const long double rate = counts[i][e] / std::max(1.0L, observed_total);
             const long double priority = rate * (1 + 4.0L / (layer + 1)) / bytes;
             if (counts[i][e] || loading) {
-                ranked.push_back({i, e, counts[i][e], !loading, priority});
+                ranked.push_back({i, e, counts[i][e], !loading, priority, layer == 0});
             } else if (!loading) {
                 const auto previous = session->profile_counts.find(key);
                 if (previous != session->profile_counts.end()) {
-                    ranked.push_back({i, e, previous->second, false, priority});
+                    ranked.push_back({i, e, previous->second, false, priority, layer == 0});
                 }
             }
         }
     }
     std::stable_sort(ranked.begin(), ranked.end(), [loading](const candidate & a, const candidate & b) {
+        if (loading && a.first_layer != b.first_layer) { return a.first_layer > b.first_layer; }
         if (loading && a.startup_score != b.startup_score) { return a.startup_score > b.startup_score; }
         if (a.current != b.current) {
             return a.current > b.current;

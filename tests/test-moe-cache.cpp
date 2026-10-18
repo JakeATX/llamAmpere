@@ -3418,6 +3418,37 @@ static bool run_profile_persistence(ggml_backend_t gpu, ggml_backend_t cpu, log_
         ok &= write_file(extended) && rejected(loaded);
         ok &= write_file(original);
     }
+    // Unobserved first-layer experts precede a hot later layer at startup.
+    ggml_moe_cache_tensor_desc layers[] = {descriptor, descriptor};
+    layers[0].name = "blk.0.ffn_up_exps.weight";
+    layers[0].n_expert = 64;
+    layers[1].data = data.data() + 64 * expert_bytes;
+    layers[1].n_expert = 1;
+    std::vector<uint64_t> early_counts(64, 0);
+    const uint64_t later_count = 100;
+    const uint64_t * layer_counts[] = {early_counts.data(), &later_count};
+    set_env("GGML_MOE_CACHE_PROFILE_LOAD", nullptr);
+    set_env("GGML_MOE_CACHE_PROFILE_SAVE", path.c_str());
+    void * writer = create_direct_session(gpu, cpu);
+    if (writer) {
+        ok &= api.warm(writer, layers, layer_counts, 2) == 1;
+        api.session_destroy(writer);
+    } else { ok = false; }
+    set_env("GGML_MOE_CACHE_PROFILE_SAVE", nullptr);
+    set_env("GGML_MOE_CACHE_PROFILE_LOAD", path.c_str());
+    reader = create_direct_session(gpu, cpu);
+    if (reader) {
+        ok &= api.warm(reader, layers, nullptr, 2) == 64;
+        api.session_enter(reader);
+        for (int32_t e : {0, 63}) {
+            ok &= direct_plan_one(layers[0].name, layers[0].data, expert_bytes,
+                    shape_in, shape_out, GGML_TYPE_Q4_0, 64, e) == 1;
+        }
+        ok &= direct_plan_one(layers[1].name, layers[1].data, expert_bytes,
+                shape_in, shape_out, GGML_TYPE_Q4_0, 1, 0) == 0;
+        api.session_leave(reader);
+        api.session_destroy(reader);
+    } else { ok = false; }
     remove(path.c_str());
     remove((path + ".tmp").c_str());
     set_env("GGML_MOE_CACHE_PROFILE_SAVE", had_save ? saved_path.c_str() : nullptr);
