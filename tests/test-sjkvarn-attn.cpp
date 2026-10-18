@@ -6,6 +6,7 @@
 //   test-sjkvarn-attn            runs the built-in cases, then the seq_rm gate
 //   test-sjkvarn-attn n_q N n_groups cap [nh hkv]
 //   test-sjkvarn-attn --resident   CUDA resident/RAM body parity and byte round trips
+//   test-sjkvarn-attn --resident-tq6   same CUDA parity with TQ6 staging and an independent F16 sink
 //   test-sjkvarn-attn --seq-rm [out.gguf]   seq_rm against the sealed boundary on a generated CPU model
 
 #include "ggml.h"
@@ -74,9 +75,31 @@ static int run_resident_graph(ggml_tensor * source, int n_groups, size_t record_
         ggml_context * body_ctx = ggml_init({ ggml_tensor_overhead(), nullptr, true });
         GGML_ASSERT(ctx && body_ctx);
         ggml_tensor * inputs[7] = {};
+        ggml_tensor * upload_targets[7] = {};
+        const ggml_tensor * upload_sources[7] = {};
         for (int i : { 0, 1, 2, 3, 5, 6 }) {
-            GGML_ASSERT(ggml_is_contiguous(source->src[i]));
-            inputs[i] = ggml_dup_tensor(ctx, source->src[i]);
+            const ggml_tensor * original = source->src[i];
+            if ((i == 1 || i == 2) && original->view_src) {
+                // Preserve interleaved head strides and the independent F16 sink sidecar.
+                const ggml_tensor * storage = original;
+                size_t offset = 0;
+                while (storage->view_src) {
+                    offset += storage->view_offs;
+                    storage = storage->view_src;
+                }
+                GGML_ASSERT(ggml_is_contiguous(storage));
+                upload_sources[i] = storage;
+                upload_targets[i] = ggml_dup_tensor(ctx, storage);
+                inputs[i] = ggml_view_4d(ctx, upload_targets[i], original->ne[0], original->ne[1],
+                                        original->ne[2], original->ne[3], original->nb[1],
+                                        original->nb[2], original->nb[3], offset);
+                GGML_ASSERT(inputs[i]->nb[0] == original->nb[0]);
+            } else {
+                GGML_ASSERT(ggml_is_contiguous(original));
+                inputs[i] = ggml_dup_tensor(ctx, original);
+                upload_targets[i] = inputs[i];
+                upload_sources[i] = original;
+            }
         }
         auto make_output = [&](ggml_tensor * body) {
             ggml_tensor * out = ggml_flash_attn_ext(ctx, inputs[0], inputs[1], inputs[2], inputs[3],
@@ -96,7 +119,7 @@ static int run_resident_graph(ggml_tensor * source, int n_groups, size_t record_
         ggml_backend_buffer_t body_buffer = buft ? ggml_backend_alloc_ctx_tensors_from_buft(body_ctx, buft) : nullptr;
         GGML_ASSERT(buffer && body_buffer);
         for (int i : { 0, 1, 2, 3, 5, 6 }) {
-            ggml_backend_tensor_set(inputs[i], source->src[i]->data, 0, ggml_nbytes(inputs[i]));
+            ggml_backend_tensor_set(upload_targets[i], upload_sources[i]->data, 0, ggml_nbytes(upload_sources[i]));
         }
         ggml_backend_tensor_set(body_split, saved.data(), 0, saved.size());
         std::vector<float> expected(ggml_nelements(reference)), actual(expected.size());
@@ -1114,8 +1137,9 @@ int main(int argc, char ** argv) {
         return run_maintenance(argv[2], argc > 3 ? atoi(argv[3]) : 99);
     }
     std::vector<cfg> cases;
-    const bool resident = argc == 2 && strcmp(argv[1], "--resident") == 0;
-    const bool f16_sink = argc == 2 && strcmp(argv[1], "--tq6-f16-sink") == 0;
+    const bool resident_tq6 = argc == 2 && strcmp(argv[1], "--resident-tq6") == 0;
+    const bool resident = resident_tq6 || (argc == 2 && strcmp(argv[1], "--resident") == 0);
+    const bool f16_sink = resident_tq6 || (argc == 2 && strcmp(argv[1], "--tq6-f16-sink") == 0);
     const bool tq6_attn = f16_sink || (argc == 2 && strcmp(argv[1], "--tq6-attn") == 0);
     if (resident) {
         cases = {
