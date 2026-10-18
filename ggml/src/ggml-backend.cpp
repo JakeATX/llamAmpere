@@ -3310,6 +3310,13 @@ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
     }
 }
 
+void ggml_backend_sched_moe_cache_prefetch_configure(ggml_backend_sched_t sched, int mode) {
+    GGML_ASSERT(sched);
+    if (sched->moe_cache_session && sched->moe_cache_api.prefetch_configure) {
+        sched->moe_cache_api.prefetch_configure(sched->moe_cache_session, mode);
+    }
+}
+
 void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data) {
     GGML_ASSERT(sched);
     sched->callback_eval = callback;

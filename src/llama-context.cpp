@@ -222,7 +222,7 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
     if (params.moe_prefetch < -1 || params.moe_prefetch > 3) {
         throw std::invalid_argument("moe_prefetch must be -1..3");
     }
-    cparams.moe_prefetch = params.moe_prefetch;
+    cparams.moe_prefetch = params.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT ? params.moe_prefetch : 0;
     cparams.moe_cache_mode       = params.moe_cache_mode;
     cparams.moe_cache_budget_mib = params.moe_cache_budget_mib;
     cparams.yarn_ext_factor      = params.yarn_ext_factor >= 0.0f ? params.yarn_ext_factor : hparams.yarn_ext_factor;
@@ -1730,6 +1730,7 @@ void llama_context::sched_reserve() {
     }
     if (!preserve_cache) {
         ggml_backend_sched_set_moe_cache(sched.get(), moe_cache_mode, cparams.moe_cache_budget_mib);
+        ggml_backend_sched_moe_cache_prefetch_configure(sched.get(), cparams.moe_prefetch);
     }
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
 
@@ -1967,6 +1968,7 @@ void llama_context::sched_reserve() {
                 sched_pipeline_parallel = false;
                 ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
                 ggml_backend_sched_set_moe_cache(sched.get(), moe_cache_mode, cparams.moe_cache_budget_mib);
+                ggml_backend_sched_moe_cache_prefetch_configure(sched.get(), cparams.moe_prefetch);
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
@@ -5040,7 +5042,7 @@ bool llama_context::b1_cache_eval(ggml_tensor * tensor, bool ask, void * user_da
     int observed_layer = -1;
     const bool entry = ctx.cparams.moe_prefetch != 0 &&
         sscanf(tensor->name, "hc_attn_pre-%d%n", &observed_layer, &parsed) == 1 &&
-        parsed > 0 && tensor->name[parsed] == '\0' && tensor->ne[1] == 1;
+        parsed > 0 && tensor->name[parsed] == '\0' && tensor->ne[1] > 0 && tensor->ne[1] <= 8;
     parsed = 0;
     const size_t max_bytes = 64u << 20;
     const bool valid_shape = tensor->ne[0] > 0 && tensor->ne[1] > 0 &&
@@ -5056,16 +5058,17 @@ bool llama_context::b1_cache_eval(ggml_tensor * tensor, bool ask, void * user_da
         if (user_need) {
             ctx.b1_cache_user_node = tensor;
         }
-        return (routed && (ctx.b1_cache_collect || (ctx.cparams.moe_prefetch != 0 && tensor->ne[1] == 1))) || predicted || entry || user_need;
+        return (routed && (ctx.b1_cache_collect || (ctx.cparams.moe_prefetch != 0 && tensor->ne[1] <= 8))) || predicted || entry || user_need;
     }
     if (ctx.cparams.moe_prefetch != 0) {
         const auto api = ggml_moe_cache_active();
         if (entry && api.prefetch_observe) {
             api.prefetch_observe(nullptr, observed_layer, nullptr, 0);
         }
-        if ((predicted || (routed && tensor->ne[1] == 1)) && tensor->ne[0] <= 64) {
-            int32_t ids[64];
-            ggml_backend_tensor_get(tensor, ids, 0, tensor->ne[0] * sizeof(int32_t));
+        if ((predicted || (routed && tensor->ne[1] <= 8)) && tensor->ne[0] <= 64) {
+            int32_t ids[512];
+            const size_t row_bytes = tensor->ne[0] * sizeof(int32_t);
+            ggml_backend_tensor_get_2d(tensor, ids, 0, row_bytes, tensor->ne[1], tensor->nb[1], row_bytes);
             if (predicted && api.prefetch && tensor->buffer && !ggml_backend_buffer_is_host(tensor->buffer)) {
                 const auto & future = ctx.model.layers[target_layer];
                 ggml_moe_cache_tensor_desc descs[3] = {};
@@ -5079,7 +5082,7 @@ bool llama_context::b1_cache_eval(ggml_tensor * tensor, bool ask, void * user_da
                 }
                 api.prefetch(nullptr, descs, count, ids, (int) tensor->ne[0], source_layer, target_layer, ctx.cparams.moe_prefetch < 0);
             } else if (routed && api.prefetch_observe) {
-                api.prefetch_observe(nullptr, layer, ids, (int) tensor->ne[0]);
+                api.prefetch_observe(nullptr, layer, ids, (int) (tensor->ne[0] * tensor->ne[1]));
             }
         }
     }
