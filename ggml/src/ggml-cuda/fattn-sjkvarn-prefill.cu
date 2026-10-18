@@ -13,7 +13,8 @@ static __global__ void fattn_sj_kvarn_expand_prefill(
         const char * K, const char * V, const char * body, const int32_t * desc,
         const size_t k_row_stride, const size_t k_head_stride,
         const size_t v_row_stride, const size_t v_head_stride,
-        half2 * K_out, half2 * V_out, const int n_out, const int p_begin, const int head_first, const bool skip_body) {
+        half2 * K_out, half2 * V_out, const int n_out, const int p_begin, const int head_first, const bool skip_body,
+        const char * mask, const size_t mask_pitch, const int mask_queries) {
     constexpr int D2 = 128;
     constexpr int rows = 16;
     extern __shared__ half2 tile[];
@@ -26,6 +27,24 @@ static __global__ void fattn_sj_kvarn_expand_prefill(
     if (p0 >= kv.S && p0 < kv.B) {
         if (skip_body) {
             return; // trellis body: ggml_cuda_sj_kvarn_trellis_expand_body (fattn-sjkvarn-lowbits.cu) writes these rows
+        }
+        if ((reinterpret_cast<uintptr_t>(body) & 1) && mask) {
+            bool visible = false;
+            for (int q0 = 0; q0 < mask_queries; q0 += 16) {
+                const int q = q0 + tid/rows;
+                const bool live = q < mask_queries && __half2float(reinterpret_cast<const half *>(mask + q*mask_pitch)[p0 + tid%rows]) > -CUDART_INF_F;
+                if (__syncthreads_or(live)) {
+                    visible = true;
+                    break;
+                }
+            }
+            if (!visible) {
+                for (int i = tid; i < rows*D2; i += 256) {
+                    K_out[out_offset + i] = make_half2(0.0f, 0.0f);
+                    V_out[out_offset + i] = make_half2(0.0f, 0.0f);
+                }
+                return;
+            }
         }
         const int group = (p0 - kv.S)/kv.G;
         const int token = (p0 - kv.S)%kv.G;
@@ -333,11 +352,13 @@ bool ggml_cuda_flash_attn_ext_sj_kvarn_prefill(ggml_backend_cuda_context & ctx, 
             const ggml_cuda_kernel_launch_params launch_params(dim3(cn/16, heads, 1), dim3(32, 8, 1), 16*128*sizeof(half2), ctx.stream());
             ggml_cuda_kernel_launch(fattn_sj_kvarn_expand_prefill, launch_params,
                 (const char *) K->data, (const char *) V->data,
-                (const char *) dst->src[5]->data, (const int32_t *) dst->src[6]->data,
+                ggml_cuda_qsa_resident_body(dst->src[5]), (const int32_t *) dst->src[6]->data,
                 K->nb[1], K->nb[2], V->nb[1], V->nb[2],
-                (half2 *) K_chunk, (half2 *) (K_chunk + elements), cn, c0, 0, true);
+                (half2 *) K_chunk, (half2 *) (K_chunk + elements), cn, c0, 0, true,
+                dst->src[3] && dst->src[3]->ne[2] == 1 && dst->src[3]->ne[3] == 1 ? (const char *) dst->src[3]->data : nullptr,
+                dst->src[3] ? dst->src[3]->nb[1] : 0, Q->ne[1]);
             CUDA_CHECK(cudaGetLastError());
-            ggml_cuda_sj_kvarn_trellis_expand_body(ggml_get_op_params_i32(dst, 5), (const char *) dst->src[5]->data,
+            ggml_cuda_sj_kvarn_trellis_expand_body(ggml_get_op_params_i32(dst, 5), ggml_cuda_qsa_resident_body(dst->src[5]),
                 (const int32_t *) dst->src[6]->data, K->nb[2], V->nb[2],
                 (half2 *) K_chunk, (half2 *) (K_chunk + elements), cn, c0, heads, 0, ctx.stream());
 
@@ -404,12 +425,14 @@ bool ggml_cuda_flash_attn_ext_sj_kvarn_prefill(ggml_backend_cuda_context & ctx, 
         const ggml_cuda_kernel_launch_params launch_params(blocks, threads, 16*128*sizeof(half2), ctx.stream());
         ggml_cuda_kernel_launch(fattn_sj_kvarn_expand_prefill, launch_params,
             (const char *) K->data, (const char *) V->data,
-            (const char *) dst->src[5]->data, (const int32_t *) dst->src[6]->data,
+            ggml_cuda_qsa_resident_body(dst->src[5]), (const int32_t *) dst->src[6]->data,
             K->nb[1], K->nb[2], V->nb[1], V->nb[2],
-            (half2 *) scratch_ptr, (half2 *) (scratch_ptr + elements), n_kv, 0, head_first, trellis);
+            (half2 *) scratch_ptr, (half2 *) (scratch_ptr + elements), n_kv, 0, head_first, trellis,
+            dst->src[3] && dst->src[3]->ne[2] == 1 && dst->src[3]->ne[3] == 1 ? (const char *) dst->src[3]->data : nullptr,
+            dst->src[3] ? dst->src[3]->nb[1] : 0, Q->ne[1]);
         CUDA_CHECK(cudaGetLastError());
         if (trellis) {
-            ggml_cuda_sj_kvarn_trellis_expand_body(ggml_get_op_params_i32(dst, 5), (const char *) dst->src[5]->data,
+            ggml_cuda_sj_kvarn_trellis_expand_body(ggml_get_op_params_i32(dst, 5), ggml_cuda_qsa_resident_body(dst->src[5]),
                 (const int32_t *) dst->src[6]->data, K->nb[2], V->nb[2],
                 (half2 *) scratch_ptr, (half2 *) (scratch_ptr + elements), n_kv, 0, heads, head_first, ctx.stream());
         }

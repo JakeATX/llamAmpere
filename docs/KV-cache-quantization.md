@@ -88,7 +88,7 @@ Each 128-value TQ6 block occupies 98 bytes, including its FP16 norm; a 256-chann
 
 ## SJ-KVaRN low-bit bodies and the trellis codec
 
-`--kv-resident 32768` opts QSA layers into a resident window of 32,768 KV cells, with sealed SJ-KVaRN body blocks in pinned RAM and selected blocks fetched for attention. Dense and linear layers keep their existing allocation. The feature is off by default; `--kv-resident 0` disables it. `LLAMA_ARG_KV_RESIDENT` sets the same cell count.
+`--kv-resident 32768` opts QSA layers into a resident window of 32,768 KV cells, with sealed SJ-KVaRN body blocks in pinned RAM and selected blocks fetched for attention. Dense and linear layers keep their existing allocation. The feature is off by default; `--kv-resident 0` disables it. `LLAMA_ARG_KV_RESIDENT` sets the same cell count. N reserves the sink and maximum live tail first, then divides the remaining cells into 128-cell sealed body groups. The existing extra staging space for prefill batches stays on the card. The current CUDA implementation supports a single stream, 256-channel QSA heads, and scalar SJ-KVaRN 4/4. Saved states retain the same logical sealed bytes and can move between split and full-card caches.
 
 Three SJ-KVaRN body configurations are the production paths, all with the staged sink (`--sjkvarn-sink 128`) and the
 adaptive tq6_0 tail (`--sjkvarn-tail 4096 --sjkvarn-tail-max 8192`). The adaptive tail is the default for every SJ-KVaRN body (`--sjkvarn-tail 4096 --sjkvarn-tail-max 8192`); `--sjkvarn-tail-max 0` selects a fixed tail. A larger `--sjkvarn-tail` without `--sjkvarn-tail-max` raises the ceiling to match:

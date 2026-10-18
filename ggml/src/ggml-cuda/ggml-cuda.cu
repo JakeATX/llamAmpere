@@ -1,4 +1,5 @@
 #include "ggml-cuda.h"
+#include "qsa-resident.cuh"
 #include "ggml-cuda-kv-stream-testing.h"
 #include "moe-devsort.cuh"
 #include "ggml-impl.h"
@@ -4419,9 +4420,6 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     if (moe_cache_changed) {
         graph->moe_cache_generation = moe_cache_generation;
         res = true;
-        if (change) {
-            change->what = "moe_cache_generation";
-        }
     }
 
     // A live tensor can only reference a KV streaming runtime by holding a
@@ -7431,7 +7429,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 const ggml_backend_dev_t expected_dev =
                     ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), cuda_ctx->device);
                 assert(((ggml_backend_buft_is_cuda(node->buffer->buft) ||
-                         ggml_backend_buft_is_cuda_kv_stream(node->buffer->buft)) &&
+                         ggml_backend_buft_is_cuda_kv_stream(node->buffer->buft) ||
+                         ggml_cuda_qsa_resident_is_buft(node->buffer->buft)) &&
                         node->buffer->buft->device == expected_dev) ||
                        ((integrated || ggml_cuda_host_weights_enabled()) &&
                         ggml_backend_buft_is_cuda_host(node->buffer->buft)));
@@ -7439,7 +7438,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     if (node->src[j] != nullptr) {
                         assert(node->src[j]->buffer);
                         assert(((ggml_backend_buft_is_cuda(node->src[j]->buffer->buft) ||
-                                 ggml_backend_buft_is_cuda_kv_stream(node->src[j]->buffer->buft)) &&
+                                 ggml_backend_buft_is_cuda_kv_stream(node->src[j]->buffer->buft) ||
+                                 ggml_cuda_qsa_resident_is_buft(node->src[j]->buffer->buft)) &&
                                 node->src[j]->buffer->buft->device == expected_dev) ||
                                ((integrated || ggml_cuda_host_weights_enabled()) &&
                                 ggml_backend_buft_is_cuda_host(node->src[j]->buffer->buft)));
@@ -8343,6 +8343,16 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         }
     }
 
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        const auto * src = op->src[i];
+        if (src && src->buffer && ggml_cuda_qsa_resident_is_buft(src->buffer->buft)) {
+            if (src->buffer->buft->device != dev ||
+                !((op->op == GGML_OP_FLASH_ATTN_EXT && i == 5) || op->op == GGML_OP_SJKVARN_SEAL)) {
+                return false;
+            }
+        }
+    }
+
     // check if all the sources are allocated on this device
     for (int i = 0; i < GGML_MAX_SRC; i++) {
         if (op->src[i] && op->src[i]->buffer && ggml_backend_buft_is_cuda(op->src[i]->buffer->buft)) {
@@ -8909,6 +8919,7 @@ static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_
     // the ones that would be ruinous. Select tensors deliberately with --override-tensor.
     return (ggml_backend_buft_is_cuda(buft) && buft->device == dev)
         || (ggml_backend_buft_is_cuda_kv_stream(buft) && buft->device == dev)
+        || (ggml_cuda_qsa_resident_is_buft(buft) && buft->device == dev)
         || ((integrated || ggml_cuda_host_weights_enabled()) && ggml_backend_buft_is_cuda_host(buft));
 }
 
@@ -9173,6 +9184,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
         return (void *)ggml_backend_cuda_comm_allreduce_tensor;
+    }
+    if (strcmp(name, "ggml_backend_cuda_qsa_resident_device_bytes") == 0) {
+        return (void *) ggml_backend_cuda_qsa_resident_device_bytes;
+    }
+    if (strcmp(name, "ggml_backend_cuda_qsa_resident_buffer_type") == 0) {
+        return (void *) ggml_backend_cuda_qsa_resident_buffer_type;
     }
     if (strcmp(name, "ggml_backend_register_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_register_host_buffer;

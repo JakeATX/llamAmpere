@@ -13,6 +13,7 @@
 //      plain cache) fails and leaves the target cache untouched.
 //
 //   test-sjkvarn-state          all cases
+//   test-sjkvarn-state --resident [tmp_dir]   CUDA split-body state round trips
 
 #include "ggml.h"
 #include "ggml-cpu.h"
@@ -26,6 +27,7 @@
 #include "../src/llama-context.h"
 #include "../src/llama-arch.h"
 #include "../src/llama-model-saver.h"
+#include "../src/llama-model.h"
 
 #include <cmath>
 #include <cstdio>
@@ -55,7 +57,7 @@ static void tensor_data(ggml_tensor * tensor, void * /*userdata*/) {
     ggml_backend_tensor_set(tensor, tmp.data(), 0, ggml_nbytes(tensor));
 }
 
-static llama_model * make_model() {
+static llama_model * make_model(bool resident = false) {
     gguf_context * meta = gguf_init_empty();
     {
         llama_model_saver ms(LLM_ARCH_LLAMA, meta);
@@ -76,11 +78,19 @@ static llama_model * make_model() {
     }
     llama_model_params mp = llama_model_default_params();
     ggml_backend_dev_t no_devices[] = { nullptr };
-    if (!getenv("SJ_TEST_GPU")) {
+    if (resident) {
+        mp.n_gpu_layers = 99;
+    } else if (!getenv("SJ_TEST_GPU")) {
         mp.devices = no_devices; // CPU only, also in a CUDA build (SJ_TEST_GPU=1: default devices, all layers offloaded)
     }
     llama_model * model = llama_model_init_from_user(meta, tensor_data, nullptr, mp);
     gguf_free(meta);
+    if (model && resident) {
+        // The cache reads QSA eligibility from these per-layer values; the LLAMA graph ignores them.
+        model->hparams.dsv4_compress_ratios.fill(0);
+        model->hparams.dsv4_compress_ratios[0] = 16;
+        model->hparams.dsv4_compress_ratios[2] = 16;
+    }
     return model;
 }
 
@@ -95,6 +105,7 @@ struct sj_cfg {
     ggml_type edge_body = GGML_TYPE_F32;
     bool      plain = false;        // plain f16 cache (no SJ-KVaRN)
     const char * transform = nullptr; // EXPERIMENTAL WUSH-KV transform file (--sjkvarn-transform)
+    uint32_t resident = 0;
 };
 
 static llama_context * make_ctx(llama_model * model, const sj_cfg & c, uint32_t n_seq = 1, bool unified = false) {
@@ -123,8 +134,36 @@ static llama_context * make_ctx(llama_model * model, const sj_cfg & c, uint32_t 
         cp.sj_kvarn_edge_bits_v = c.edge_bits_v;
         cp.sj_kvarn_edge_body_type = c.edge_body;
         cp.sj_kvarn_transform = c.transform;
+        cp.kv_resident = c.resident;
     }
-    return llama_init_from_model(model, cp);
+    llama_context * ctx = llama_init_from_model(model, cp);
+    if (ctx && c.resident && !c.plain) {
+        try {
+            auto * cache = dynamic_cast<llama_kv_cache *>(llama_get_memory(ctx));
+            require(cache != nullptr, "resident test uses llama_kv_cache");
+            uint32_t n_split = 0, n_full = 0;
+            for (uint32_t il = 0; il < n_layer; ++il) {
+                require(model->hparams.n_embd_head_k(il) == 256, "resident test has 256-channel heads");
+                const ggml_tensor * body = cache->get_sj_kvarn_body(il);
+                require(body && body->buffer, "resident body allocated");
+                const auto buft = ggml_backend_buffer_get_type(body->buffer);
+                const bool split = strstr(ggml_backend_buft_name(buft), "CUDA_QSA_Resident_") != nullptr;
+                require(split == (model->hparams.dsv4_compress_ratios[il] > 0), "only eligible QSA layers use split bodies");
+                require(ggml_backend_buft_get_device(buft) == model->dev_layer(il), "body stays on the model layer device");
+                require(ggml_backend_dev_type(model->dev_layer(il)) == GGML_BACKEND_DEVICE_TYPE_GPU, "resident state test runs on GPU");
+                if (split) {
+                    ++n_split;
+                } else {
+                    ++n_full;
+                }
+            }
+            require(n_split == 2 && n_full == 2, "resident state test has two split and two full bodies");
+        } catch (...) {
+            llama_free(ctx);
+            throw;
+        }
+    }
+    return ctx;
 }
 
 static llama_token token_at(llama_pos p, int salt) { return (llama_token) ((p*37 + salt*11 + 5) % n_vocab); }
@@ -283,6 +322,20 @@ static int run_case(llama_model * model, const sj_cfg & c, const std::vector<sj_
         const auto blob = seq_state(src);
         const live_cache before = snapshot(src);
         const auto rec_before = records(src, n_groups_pool);
+        if (c.resident) {
+            const auto device_blob = seq_state(src, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+            decode(src, N0, N0 + 256, 128, 9);
+            require(llama_state_seq_set_data_ext(src, device_blob.data(), device_blob.size(), 0,
+                    LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) == device_blob.size(), "on-device snapshot restores after further seals");
+            require(seq_state(src) == blob, "on-device restore produces identical host state bytes");
+            require(records(src, n_groups_pool) == rec_before, "on-device restore preserves split and full body bytes");
+            const auto device_blob_reused = seq_state(src, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+            llama_memory_clear(llama_get_memory(src), true);
+            require(llama_state_seq_set_data_ext(src, device_blob_reused.data(), device_blob_reused.size(), 0,
+                    LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) == device_blob_reused.size(), "reused on-device snapshot restores after clear");
+            require(seq_state(src) == blob, "reused on-device snapshot keeps identical host state bytes");
+            require(records(src, n_groups_pool) == rec_before, "reused on-device snapshot keeps sealed body bytes");
+        }
 
         dst = make_ctx(model, c);
         require(dst != nullptr, "destination context");
@@ -727,19 +780,39 @@ static std::string write_transform(const char * dir, const char * name, uint32_t
 }
 
 int main(int argc, char ** argv) {
-    const char * tmp_dir = argc > 1 ? argv[1] : (getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
+    const bool resident = argc > 1 && strcmp(argv[1], "--resident") == 0;
+    const int tmp_arg = resident ? 2 : 1;
+    const char * tmp_dir = argc > tmp_arg ? argv[tmp_arg] : (getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
     ggml_backend_load_all();
     llama_backend_init();
     llama_log_set([](ggml_log_level level, const char * text, void *) {
         if (level == GGML_LOG_LEVEL_ERROR) g_last_error = text;
     }, nullptr);
-    llama_model * model = make_model();
+    llama_model * model = make_model(resident);
     if (!model) {
         fprintf(stderr, "model init failed\n");
         return 1;
     }
 
     const sj_cfg s44  = { "4/4",        4, 4, GGML_TYPE_F32 };
+    if (resident) {
+        int fails = 0;
+        try {
+            for (uint32_t cells : { 768u, 1024u }) {
+                sj_cfg c = s44;
+                c.name = cells == 768 ? "4/4 resident768" : "4/4 resident1024";
+                c.resident = cells;
+                fails += run_case(model, c, {}, tmp_dir);
+            }
+        } catch (const std::exception & e) {
+            fprintf(stderr, "resident state: FAIL: %s\n", e.what());
+            ++fails;
+        }
+        printf("%s: resident state round trips, split2/full2, GPU seals and continuation\n", fails ? "FAIL" : "OK");
+        llama_model_free(model);
+        llama_backend_free();
+        return fails ? 1 : 0;
+    }
     const sj_cfg s33  = { "3/3",        3, 3, GGML_TYPE_F32 };
     const sj_cfg s33t = { "3/3t",       3, 3, GGML_TYPE_I16 };
     const sj_cfg s32t = { "3/2t",       3, 2, GGML_TYPE_I16 };
