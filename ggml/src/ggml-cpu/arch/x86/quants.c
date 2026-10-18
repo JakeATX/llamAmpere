@@ -4226,27 +4226,13 @@ static void ggml_vec_dot_iq4_nl_grouped(int n, const block_iq4_nl * x, const voi
     }
 }
 
-bool ggml_vec_dot_iq_grouped_avx2(enum ggml_type type, int n, const void * vx, const void * const * vy, float * s, int nr) {
-    if (nr < 1 || nr > 8 || n <= 0) {
-        return false;
-    }
-    if (type == GGML_TYPE_IQ4_NL) {
-        if (n % QK4_NL != 0) {
-            return false;
-        }
-        if (nr == 2) {
-            ggml_vec_dot_iq4_nl_grouped(n, vx, vy, s, 2);
-        } else if (nr == 3) {
-            ggml_vec_dot_iq4_nl_grouped(n, vx, vy, s, 3);
-        } else {
-            ggml_vec_dot_iq4_nl_grouped(n, vx, vy, s, nr);
-        }
-        return true;
-    }
-    if ((type != GGML_TYPE_IQ2_XS && type != GGML_TYPE_IQ3_XXS && type != GGML_TYPE_IQ3_S) || n % QK_K != 0) {
-        return false;
-    }
-
+// fork: constant small groups keep integer and float accumulators in registers.
+#if defined(_MSC_VER)
+static __forceinline void
+#else
+static inline __attribute__((always_inline)) void
+#endif
+ggml_vec_dot_iq23_grouped(enum ggml_type type, int n, const void * vx, const void * const * vy, float * s, int nr) {
     const uint64_t * signs64 = (const uint64_t *) keven_signs_q2xs;
     const __m256i one = _mm256_set1_epi8(1);
     const __m256i sign_shuffle = _mm256_set_epi64x(0x0303030303030303LL, 0x0202020202020202LL,
@@ -4261,7 +4247,7 @@ bool ggml_vec_dot_iq_grouped_avx2(enum ggml_type type, int n, const void * vx, c
     for (int ib = 0; ib < n / QK_K; ++ib) {
         const void * block = (const char *) vx + ib*block_size;
         const float dx = GGML_CPU_FP16_TO_FP32(*(const ggml_fp16_t *) block);
-        __m256i sums[8];
+        __m256i sums[8], grids[8], sign_vectors[8], scale_vectors[8];
         for (int t = 0; t < nr; ++t) {
             sums[t] = _mm256_setzero_si256();
         }
@@ -4298,11 +4284,30 @@ bool ggml_vec_dot_iq_grouped_avx2(enum ggml_type type, int n, const void * vx, c
                 signs = _mm256_or_si256(mask, one);
                 scales = _mm256_set1_epi16(2*((x->scales[j/2] >> (4*(j%2))) & 15) + 1);
             }
+            if (nr > 3) {
+                grids[j] = grid;
+                sign_vectors[j] = signs;
+                scale_vectors[j] = scales;
+                continue;
+            }
             for (int t = 0; t < nr; ++t) {
                 const block_q8_K * y = (const block_q8_K *) vy[t] + ib;
                 const __m256i q8 = _mm256_loadu_si256((const __m256i *) (y->qs + 32*j));
                 const __m256i dot = _mm256_maddubs_epi16(grid, _mm256_sign_epi8(q8, signs));
                 sums[t] = _mm256_add_epi32(sums[t], _mm256_madd_epi16(dot, scales));
+            }
+        }
+        // Larger groups use one integer accumulator at a time to avoid spills.
+        if (nr > 3) {
+            for (int t = 0; t < nr; ++t) {
+                const block_q8_K * y = (const block_q8_K *) vy[t] + ib;
+                __m256i sum = _mm256_setzero_si256();
+                for (int j = 0; j < 8; ++j) {
+                    const __m256i q8 = _mm256_loadu_si256((const __m256i *) (y->qs + 32*j));
+                    const __m256i dot = _mm256_maddubs_epi16(grids[j], _mm256_sign_epi8(q8, sign_vectors[j]));
+                    sum = _mm256_add_epi32(sum, _mm256_madd_epi16(dot, scale_vectors[j]));
+                }
+                sums[t] = sum;
             }
         }
         for (int t = 0; t < nr; ++t) {
@@ -4314,6 +4319,47 @@ bool ggml_vec_dot_iq_grouped_avx2(enum ggml_type type, int n, const void * vx, c
         const float value = hsum_float_8(accum[t]);
         s[t] = type == GGML_TYPE_IQ2_XS ? 0.125f*value : type == GGML_TYPE_IQ3_XXS ? 0.25f*value : value;
     }
+}
+
+bool ggml_vec_dot_iq_grouped_avx2(enum ggml_type type, int n, const void * vx, const void * const * vy, float * s, int nr) {
+    if (nr < 1 || nr > 8 || n <= 0) {
+        return false;
+    }
+    if (type == GGML_TYPE_IQ4_NL) {
+        if (n % QK4_NL != 0) {
+            return false;
+        }
+        if (nr == 2) {
+            ggml_vec_dot_iq4_nl_grouped(n, vx, vy, s, 2);
+        } else if (nr == 3) {
+            ggml_vec_dot_iq4_nl_grouped(n, vx, vy, s, 3);
+        } else {
+            ggml_vec_dot_iq4_nl_grouped(n, vx, vy, s, nr);
+        }
+        return true;
+    }
+    if ((type != GGML_TYPE_IQ2_XS && type != GGML_TYPE_IQ3_XXS && type != GGML_TYPE_IQ3_S) || n % QK_K != 0) {
+        return false;
+    }
+
+    switch (type) {
+#define GGML_IQ_SMALL_GROUP(TYPE) \
+        case TYPE: \
+            if (nr == 2) { \
+                ggml_vec_dot_iq23_grouped(TYPE, n, vx, vy, s, 2); \
+            } else if (nr == 3) { \
+                ggml_vec_dot_iq23_grouped(TYPE, n, vx, vy, s, 3); \
+            } else { \
+                ggml_vec_dot_iq23_grouped(TYPE, n, vx, vy, s, nr); \
+            } \
+            break;
+        GGML_IQ_SMALL_GROUP(GGML_TYPE_IQ2_XS)
+        GGML_IQ_SMALL_GROUP(GGML_TYPE_IQ3_XXS)
+        GGML_IQ_SMALL_GROUP(GGML_TYPE_IQ3_S)
+#undef GGML_IQ_SMALL_GROUP
+        default: return false;
+    }
     return true;
 }
+
 #endif
