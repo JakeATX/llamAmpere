@@ -5650,10 +5650,13 @@ class llama_io_read_file : public llama_io_read_i {
     std::vector<uint8_t> temp_buffer;
 };
 
-// element count of a byte range of t: block types (q8_0 KV/state caches) hold blck_size elements per type_size bytes
-static int64_t llama_io_n_elements(const ggml_tensor * t, size_t size) {
-    GGML_ASSERT(size % ggml_type_size(t->type) == 0);
-    return (int64_t) (size / ggml_type_size(t->type)) * ggml_blck_size(t->type);
+// Packed caches can contain F16 sink bytes inside a quantized staging tensor.
+static ggml_tensor * llama_io_view_bytes(ggml_context * ctx, ggml_tensor * tensor, size_t offset, size_t size) {
+    GGML_ASSERT(offset <= ggml_nbytes(tensor) && size <= ggml_nbytes(tensor) - offset);
+    auto * view = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, size);
+    view->view_src = tensor;
+    view->view_offs = offset;
+    return view;
 }
 
 class llama_io_write_device : public llama_io_write_i {
@@ -5689,12 +5692,10 @@ class llama_io_write_device : public llama_io_write_i {
         for (const auto & winfo : winfos) {
             auto * buft = ggml_backend_buffer_get_type(winfo.tensor->buffer);
 
-            const int64_t n = llama_io_n_elements(winfo.tensor, winfo.size);
-
             auto & mbuf = mbufs_new[buft];
 
-            mbuf.org.push_back(ggml_view_1d(mbuf.ctx.get(), winfo.tensor, n, winfo.offset));
-            mbuf.cpy.push_back(ggml_new_tensor_1d(mbuf.ctx.get(), winfo.tensor->type, n));
+            mbuf.org.push_back(llama_io_view_bytes(mbuf.ctx.get(), winfo.tensor, winfo.offset, winfo.size));
+            mbuf.cpy.push_back(ggml_new_tensor_1d(mbuf.ctx.get(), GGML_TYPE_I8, winfo.size));
         }
 
         for (auto & [buft, mbuf] : mbufs_new) {
@@ -5824,11 +5825,9 @@ class llama_io_read_device : public llama_io_read_i {
         for (const auto & rinfo : rinfos) {
             auto * buft = ggml_backend_buffer_get_type(rinfo.tensor->buffer);
 
-            const int64_t n = llama_io_n_elements(rinfo.tensor, rinfo.size);
-
             auto & mbuf = mbufs_new[buft];
 
-            mbuf.org.push_back(ggml_view_1d(mbuf.ctx.get(), rinfo.tensor, n, rinfo.offset));
+            mbuf.org.push_back(llama_io_view_bytes(mbuf.ctx.get(), rinfo.tensor, rinfo.offset, rinfo.size));
 
             ggml_backend_view_init(mbuf.org.back());
         }
@@ -5891,11 +5890,9 @@ class llama_io_read_device : public llama_io_read_i {
 
                 const size_t n_copy = std::min(src_size - src_off, dst_size - dst_off);
 
-                const int64_t n_el = llama_io_n_elements(src_t, n_copy);
-
-                auto * src_v = ggml_view_1d(ctx_scratch, src_t, n_el, src_off);
+                auto * src_v = llama_io_view_bytes(ctx_scratch, src_t, src_off, n_copy);
                 ggml_backend_view_init(src_v);
-                auto * dst_v = ggml_view_1d(ctx_scratch, dst_t, n_el, dst_off);
+                auto * dst_v = llama_io_view_bytes(ctx_scratch, dst_t, dst_off, n_copy);
                 ggml_backend_view_init(dst_v);
 
                 ggml_backend_tensor_copy(src_v, dst_v);

@@ -15,6 +15,7 @@
 //   test-sjkvarn-state          all cases
 //   test-sjkvarn-state --scalar-only [tmp_dir]   native scalar 4/4 state and multi-sequence checks
 //   test-sjkvarn-state --resident [tmp_dir]   CUDA split-body state round trips
+//   test-sjkvarn-state --device-bytes   CPU device-snapshot packed-byte regression
 
 #include "ggml.h"
 #include "ggml-cpu.h"
@@ -294,6 +295,31 @@ static std::vector<uint8_t> seq_state(llama_context * ctx, llama_state_seq_flags
     std::vector<uint8_t> buf(n);
     require(llama_state_seq_get_data_ext(ctx, buf.data(), n, 0, flags) == n, "llama_state_seq_get_data");
     return buf;
+}
+
+static void device_bytes_case(llama_model * model) {
+    const sj_cfg cfg = { "4/4 device bytes", 4, 4, GGML_TYPE_F32 };
+    llama_context * ctx = make_ctx(model, cfg);
+    require(ctx != nullptr, "device-byte context");
+    try {
+        decode(ctx, 0, 129, 128);
+        const auto host = seq_state(ctx);
+        for (int reuse = 0; reuse < 2; ++reuse) {
+            const auto device = seq_state(ctx, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+            decode(ctx, 129, 146, 17, 9);
+            require(llama_state_seq_set_data_ext(ctx, device.data(), device.size(), 0,
+                    LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) == device.size(), "restore packed-byte snapshot");
+            require(seq_state(ctx) == host, "packed-byte snapshot matches host state");
+            llama_memory_clear(llama_get_memory(ctx), true);
+            require(llama_state_seq_set_data_ext(ctx, device.data(), device.size(), 0,
+                    LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) == device.size(), "restore packed-byte snapshot after clear");
+            require(seq_state(ctx) == host, "packed-byte snapshot survives clear");
+        }
+    } catch (...) {
+        llama_free(ctx);
+        throw;
+    }
+    llama_free(ctx);
 }
 
 static bool same_logits(const std::vector<float> & a, const std::vector<float> & b) {
@@ -783,6 +809,7 @@ static std::string write_transform(const char * dir, const char * name, uint32_t
 int main(int argc, char ** argv) {
     const bool resident = argc > 1 && strcmp(argv[1], "--resident") == 0;
     const bool scalar_only = argc > 1 && strcmp(argv[1], "--scalar-only") == 0;
+    const bool device_bytes = argc > 1 && strcmp(argv[1], "--device-bytes") == 0;
     const int tmp_arg = resident || scalar_only ? 2 : 1;
     const char * tmp_dir = argc > tmp_arg ? argv[tmp_arg] : (getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
     ggml_backend_load_all();
@@ -797,6 +824,19 @@ int main(int argc, char ** argv) {
     }
 
     const sj_cfg s44  = { "4/4",        4, 4, GGML_TYPE_F32 };
+    if (device_bytes) {
+        int result = 0;
+        try {
+            device_bytes_case(model);
+            printf("OK: packed TQ6/F16 sink device snapshot, reuse and clear, exact host bytes\n");
+        } catch (const std::exception & e) {
+            fprintf(stderr, "device bytes: FAIL: %s\n", e.what());
+            result = 1;
+        }
+        llama_model_free(model);
+        llama_backend_free();
+        return result;
+    }
     if (resident) {
         int fails = 0;
         try {
