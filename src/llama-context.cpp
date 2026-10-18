@@ -2131,6 +2131,11 @@ static llama_kv_cache * llama_sj_kvarn_cache(llama_memory_i * memory) {
     return nullptr;
 }
 
+const llama_sj_kvarn_config * llama_context::get_sj_kvarn() const {
+    const auto * kv = llama_sj_kvarn_cache(memory.get());
+    return kv && kv->is_sj_kvarn() ? &kv->get_sj_kvarn() : nullptr;
+}
+
 ggml_backend_t llama_context::sj_kvarn_backend(ggml_backend_buffer_t buffer) const {
     const auto buft = ggml_backend_buffer_get_type(buffer);
     const auto device = ggml_backend_buft_get_device(buft);

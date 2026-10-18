@@ -3006,6 +3006,17 @@ ggml_backend_sched_t ggml_backend_sched_new(
     return sched;
 }
 
+int ggml_backend_sched_moe_cache_status(ggml_backend_sched_t sched, size_t * allocated_bytes) {
+    *allocated_bytes = 0;
+    if (!sched || !sched->moe_cache_session) {
+        return 0;
+    }
+    if (!sched->moe_cache_api.session_status) {
+        return -1;
+    }
+    return sched->moe_cache_api.session_status(sched->moe_cache_session, allocated_bytes);
+}
+
 void ggml_backend_sched_set_moe_cache(
         ggml_backend_sched_t sched, enum ggml_moe_cache_mode mode, size_t budget_mib) {
     GGML_ASSERT(sched);

@@ -8,6 +8,7 @@
 #include "server-queue.h"
 #include "server-schema.h"
 #include "server-stream.h"
+#include "server-setup.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -2459,6 +2460,8 @@ private:
 
         model_aliases = params_base.model_alias;
         model_tags    = params_base.model_tags;
+
+        server_setup_report(params_base, ctx_tgt, ctx_dft);
 
         // propagate new defaults back to the initial caller
         if (!is_resume) {
