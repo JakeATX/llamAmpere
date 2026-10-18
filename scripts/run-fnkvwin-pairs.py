@@ -297,6 +297,8 @@ def validate_command(command, resident, args):
     else:
         bench.require('--kv-resident' not in normalized, 'baseline unexpectedly uses a resident window')
     bench.require(env.get('GGML_CUDA_MOE_CACHE_RESERVE_MB') == str(args.reserve_mib), 'cache reserve changed')
+    for flag in ('LLAMA_MOE_CACHE_RELEASE_PROMPT', 'LLAMA_B1_CACHE_WARM', 'LLAMA_B1_LAYER_RESERVE'):
+        bench.require(env.get(flag) == '1', f'protocol phase setting missing: {flag}')
     environment = {key: value for key, value in env.items() if key != 'LD_LIBRARY_PATH'}
     return {'argv': normalized, 'environment': environment}
 

@@ -34,6 +34,21 @@ FAST_ENV = ('LLAMA_B1 LLAMA_QSA_SEL_DIRECT GGML_CUDA_MMQ_ID_CAP '
             'GGML_CUDA_CONCAT_TILE GGML_CUDA_NORM_CAST').split()
 
 
+def model_environment(args, memory_only):
+    env = {key: value for key, value in os.environ.items()
+           if not key.startswith(('GGML_', 'LLAMA_', 'LD_LIBRARY_PATH'))}
+    settings = {key: '1' for key in FAST_ENV}
+    settings.update(LLAMA_PREFETCH_THREADS='8', GGML_CUDA_MOE_CACHE_STATS='4096',
+                    GGML_CUDA_MOE_CACHE_RESERVE_MB=str(args.reserve_mib),
+                    LD_LIBRARY_PATH=str(args.server.resolve().parent))
+    if not memory_only:
+        # Return prompt scratch before warming the decode expert cache, in both arms.
+        settings.update(LLAMA_MOE_CACHE_RELEASE_PROMPT='1', LLAMA_B1_CACHE_WARM='1',
+                        LLAMA_B1_LAYER_RESERVE='1')
+    env.update(settings)
+    return env, settings
+
+
 def require(condition, message):
     if not condition:
         raise RuntimeError(message)
@@ -246,15 +261,8 @@ class ServerArm:
         else:
             command += ['--spec-type', 'none']
         command += getattr(self.args, 'extra_server_args', [])
-        env = os.environ.copy()
-        env.update({key: '1' for key in FAST_ENV})
-        env['LLAMA_PREFETCH_THREADS'] = '8'
-        env['LD_LIBRARY_PATH'] = str(self.args.server.resolve().parent)
-        env['GGML_CUDA_MOE_CACHE_STATS'] = '4096'
-        env['GGML_CUDA_MOE_CACHE_RESERVE_MB'] = str(self.args.reserve_mib)
-        # Record only known performance settings, not the inherited environment.
-        write_json(self.output / 'command.json', {'argv': command, 'environment':
-                   {key: env[key] for key in [*FAST_ENV, 'LLAMA_PREFETCH_THREADS', 'GGML_CUDA_MOE_CACHE_STATS', 'GGML_CUDA_MOE_CACHE_RESERVE_MB', 'LD_LIBRARY_PATH']}})
+        env, settings = model_environment(self.args, memory_only)
+        write_json(self.output / 'command.json', {'argv': command, 'environment': settings})
         self.log = (self.output / 'server.log').open('w')
         self.process = subprocess.Popen(command, env=env, stdout=self.log, stderr=subprocess.STDOUT, start_new_session=True)
         self.thread = threading.Thread(target=self.monitor, daemon=True)
