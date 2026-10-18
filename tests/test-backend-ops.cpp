@@ -6829,6 +6829,14 @@ struct test_mul_mat_id_ai4 : public test_mul_mat_id {
     }
 };
 
+struct test_mul_mat_id_cpu_grouped : public test_mul_mat_id {
+    using test_mul_mat_id::test_mul_mat_id;
+
+    double max_nmse_err(ggml_backend_t backend) override {
+        return strcmp(ggml_backend_name(backend), "CPU") == 0 ? 0.0 : test_mul_mat_id::max_nmse_err(backend);
+    }
+};
+
 // MUL_MAT_ID with skewed routing: 3 of 4 rows pick the same n_used experts, so those experts get far more columns than
 // the average (covers MMQ launches that size the column grid from the average, e.g. GGML_CUDA_MMQ_ID_CAP)
 struct test_mul_mat_id_skew : public test_mul_mat_id {
@@ -7006,12 +7014,13 @@ struct test_mul_mat_id_fusion : public test_case {
 struct test_mul_mat_id_shared : public test_case {
     const ggml_type type;
     const int64_t n;
+    const bool clamped;
     ggml_tensor * routed = nullptr;
     ggml_tensor * shared = nullptr;
 
-    test_mul_mat_id_shared(ggml_type type, int64_t n) : type(type), n(n) {}
+    test_mul_mat_id_shared(ggml_type type, int64_t n, bool clamped = false) : type(type), n(n), clamped(clamped) {}
 
-    std::string vars() override { return VARS_TO_STR2(type, n); }
+    std::string vars() override { return VARS_TO_STR3(type, n, clamped); }
     std::string op_desc(ggml_tensor *) override { return "MUL_MAT_ID_SHARED"; }
     bool run_whole_graph() override { return true; }
     double max_nmse_err() override { return 5e-4; }
@@ -7026,7 +7035,13 @@ struct test_mul_mat_id_shared : public test_case {
         ggml_tensor * gate = ggml_new_tensor_3d(ctx, type, 512, 128, 8);
         ggml_tensor * shared_up = ggml_new_tensor_2d(ctx, type, 512, 128);
         ggml_tensor * shared_gate = ggml_new_tensor_2d(ctx, type, 512, 128);
-        routed = ggml_swiglu_split(ctx, ggml_mul_mat_id(ctx, gate, input_ids, ids), ggml_mul_mat_id(ctx, up, input_ids, ids));
+        ggml_tensor * gate_out = ggml_mul_mat_id(ctx, gate, input_ids, ids);
+        ggml_tensor * up_out = ggml_mul_mat_id(ctx, up, input_ids, ids);
+        if (clamped) {
+            gate_out = ggml_clamp(ctx, gate_out, -5.0f, 5.0f);
+            up_out = ggml_clamp(ctx, up_out, -5.0f, 5.0f);
+        }
+        routed = ggml_swiglu_split(ctx, gate_out, up_out);
         shared = ggml_swiglu_split(ctx, ggml_mul_mat(ctx, shared_gate, input), ggml_mul_mat(ctx, shared_up, input));
         return ggml_add(ctx, routed, ggml_reshape_3d(ctx, shared, 128, 1, n));
     }
@@ -13677,9 +13692,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (ggml_type type_a : {GGML_TYPE_IQ2_XS, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL}) {
         for (int n = 1; n <= 8; n++) {
             for (bool broadcast : {false, true}) {
-                test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 4, broadcast, 65, n, 512));
-                test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 4, broadcast, 65, n, 512, 1.0f, 80));
+                test_cases.emplace_back(new test_mul_mat_id_cpu_grouped(type_a, GGML_TYPE_F32, 4, 4, broadcast, 65, n, 512));
+                test_cases.emplace_back(new test_mul_mat_id_cpu_grouped(type_a, GGML_TYPE_F32, 4, 4, broadcast, 65, n, 512, 1.0f, 80));
+                test_cases.emplace_back(new test_mul_mat_id_cpu_grouped(type_a, GGML_TYPE_F32, 16, 10, broadcast, 65, n, 512, 1.0f, 80));
+                test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, GGML_TYPE_F32, 4, 4, broadcast, 65, n, 512, 2));
             }
+            test_cases.emplace_back(new test_mul_mat_id_shared(type_a, n));
+            test_cases.emplace_back(new test_mul_mat_id_shared(type_a, n, true));
         }
     }
 
