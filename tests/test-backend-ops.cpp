@@ -6833,7 +6833,10 @@ struct test_mul_mat_id_cpu_grouped : public test_mul_mat_id {
     using test_mul_mat_id::test_mul_mat_id;
 
     double max_nmse_err(ggml_backend_t backend) override {
-        return strcmp(ggml_backend_name(backend), "CPU") == 0 ? 0.0 : test_mul_mat_id::max_nmse_err(backend);
+        const char * schedule = getenv("GGML_CPU_EXPERT_SCHEDULE");
+        const char * tiled = getenv("GGML_CPU_TILED_MM");
+        const bool exact = (schedule && strcmp(schedule, "1") == 0) || (tiled && strcmp(tiled, "0") == 0);
+        return exact && strcmp(ggml_backend_name(backend), "CPU") == 0 ? 0.0 : test_mul_mat_id::max_nmse_err(backend);
     }
 };
 

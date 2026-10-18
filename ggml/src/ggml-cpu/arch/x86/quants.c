@@ -4206,10 +4206,22 @@ static void ggml_vec_dot_iq4_nl_grouped(int n, const block_iq4_nl * x, const voi
     }
     for (int t = 0; t < nr; ++t) {
         s[t] = hsum_float_8(_mm256_add_ps(accum1[t], accum2[t]));
-        if (ib < n / QK4_NL) {
-            float tail;
-            ggml_vec_dot_iq4_nl_q8_0(QK4_NL, &tail, 0, x + ib, 0, (const block_q8_0 *) vy[t] + ib, 0, 1);
-            s[t] += tail;
+    }
+    if (ib < n / QK4_NL) {
+        const __m128i bits = _mm_loadu_si128((const __m128i *) x[ib].qs);
+        const __m256i q = MM256_SET_M128I(_mm_shuffle_epi8(values, _mm_and_si128(_mm_srli_epi16(bits, 4), mask)),
+                                        _mm_shuffle_epi8(values, _mm_and_si128(bits, mask)));
+        int8_t decoded[QK4_NL];
+        _mm256_storeu_si256((__m256i *) decoded, q);
+        const float dx = GGML_CPU_FP16_TO_FP32(x[ib].d);
+        for (int t = 0; t < nr; ++t) {
+            const block_q8_0 * y = (const block_q8_0 *) vy[t] + ib;
+            int sum = 0;
+            for (int j = 0; j < QK4_NL; ++j) {
+                sum += decoded[j] * y->qs[j];
+            }
+            const float d = GGML_CPU_FP16_TO_FP32(y->d) * dx;
+            s[t] += d * sum;
         }
     }
 }
@@ -4222,7 +4234,13 @@ bool ggml_vec_dot_iq_grouped_avx2(enum ggml_type type, int n, const void * vx, c
         if (n % QK4_NL != 0) {
             return false;
         }
-        ggml_vec_dot_iq4_nl_grouped(n, vx, vy, s, nr);
+        if (nr == 2) {
+            ggml_vec_dot_iq4_nl_grouped(n, vx, vy, s, 2);
+        } else if (nr == 3) {
+            ggml_vec_dot_iq4_nl_grouped(n, vx, vy, s, 3);
+        } else {
+            ggml_vec_dot_iq4_nl_grouped(n, vx, vy, s, nr);
+        }
         return true;
     }
     if ((type != GGML_TYPE_IQ2_XS && type != GGML_TYPE_IQ3_XXS && type != GGML_TYPE_IQ3_S) || n % QK_K != 0) {
@@ -4238,58 +4256,58 @@ bool ggml_vec_dot_iq_grouped_avx2(enum ggml_type type, int n, const void * vx, c
     for (int t = 0; t < nr; ++t) {
         accum[t] = _mm256_setzero_ps();
     }
+    const size_t block_size = type == GGML_TYPE_IQ2_XS ? sizeof(block_iq2_xs) :
+                              type == GGML_TYPE_IQ3_XXS ? sizeof(block_iq3_xxs) : sizeof(block_iq3_s);
     for (int ib = 0; ib < n / QK_K; ++ib) {
-        __m256i grid[8], signs[8], scales[8];
-        float dx;
-        if (type == GGML_TYPE_IQ2_XS) {
-            const block_iq2_xs * x = (const block_iq2_xs *) vx + ib;
-            dx = GGML_CPU_FP16_TO_FP32(x->d);
-            for (int j = 0; j < 8; ++j) {
+        const void * block = (const char *) vx + ib*block_size;
+        const float dx = GGML_CPU_FP16_TO_FP32(*(const ggml_fp16_t *) block);
+        __m256i sums[8];
+        for (int t = 0; t < nr; ++t) {
+            sums[t] = _mm256_setzero_si256();
+        }
+        for (int j = 0; j < 8; ++j) {
+            __m256i grid, signs, scales;
+            if (type == GGML_TYPE_IQ2_XS) {
+                const block_iq2_xs * x = block;
                 const uint16_t * q = x->qs + 4*j;
-                grid[j] = _mm256_set_epi64x(iq2xs_grid[q[3] & 511], iq2xs_grid[q[2] & 511], iq2xs_grid[q[1] & 511], iq2xs_grid[q[0] & 511]);
-                signs[j] = _mm256_set_epi64x(signs64[q[3] >> 9], signs64[q[2] >> 9], signs64[q[1] >> 9], signs64[q[0] >> 9]);
+                grid = _mm256_set_epi64x(iq2xs_grid[q[3] & 511], iq2xs_grid[q[2] & 511], iq2xs_grid[q[1] & 511], iq2xs_grid[q[0] & 511]);
+                signs = _mm256_set_epi64x(signs64[q[3] >> 9], signs64[q[2] >> 9], signs64[q[1] >> 9], signs64[q[0] >> 9]);
                 const int lo = 2*(x->scales[j] & 15) + 1;
                 const int hi = 2*(x->scales[j] >> 4) + 1;
-                scales[j] = MM256_SET_M128I(_mm_set1_epi16(hi), _mm_set1_epi16(lo));
-            }
-        } else if (type == GGML_TYPE_IQ3_XXS) {
-            const block_iq3_xxs * x = (const block_iq3_xxs *) vx + ib;
-            dx = GGML_CPU_FP16_TO_FP32(x->d);
-            for (int j = 0; j < 8; ++j) {
+                scales = MM256_SET_M128I(_mm_set1_epi16(hi), _mm_set1_epi16(lo));
+            } else if (type == GGML_TYPE_IQ3_XXS) {
+                const block_iq3_xxs * x = block;
                 const uint8_t * q = x->qs + 8*j;
                 uint32_t gas;
                 memcpy(&gas, x->qs + QK_K/4 + 4*j, sizeof(gas));
-                grid[j] = _mm256_set_epi32(iq3xxs_grid[q[7]], iq3xxs_grid[q[6]], iq3xxs_grid[q[5]], iq3xxs_grid[q[4]],
-                                          iq3xxs_grid[q[3]], iq3xxs_grid[q[2]], iq3xxs_grid[q[1]], iq3xxs_grid[q[0]]);
-                signs[j] = _mm256_set_epi64x(signs64[(gas >> 21) & 127], signs64[(gas >> 14) & 127], signs64[(gas >> 7) & 127], signs64[gas & 127]);
-                scales[j] = _mm256_set1_epi16(2*(gas >> 28) + 1);
-            }
-        } else {
-            const block_iq3_s * x = (const block_iq3_s *) vx + ib;
-            dx = GGML_CPU_FP16_TO_FP32(x->d);
-            for (int j = 0; j < 8; ++j) {
+                grid = _mm256_set_epi32(iq3xxs_grid[q[7]], iq3xxs_grid[q[6]], iq3xxs_grid[q[5]], iq3xxs_grid[q[4]],
+                                        iq3xxs_grid[q[3]], iq3xxs_grid[q[2]], iq3xxs_grid[q[1]], iq3xxs_grid[q[0]]);
+                signs = _mm256_set_epi64x(signs64[(gas >> 21) & 127], signs64[(gas >> 14) & 127], signs64[(gas >> 7) & 127], signs64[gas & 127]);
+                scales = _mm256_set1_epi16(2*(gas >> 28) + 1);
+            } else {
+                const block_iq3_s * x = block;
                 const uint8_t * q = x->qs + 8*j;
                 const int h = x->qh[j];
-                grid[j] = _mm256_set_epi32(iq3s_grid[q[7] | ((h << 1) & 256)], iq3s_grid[q[6] | ((h << 2) & 256)],
-                                          iq3s_grid[q[5] | ((h << 3) & 256)], iq3s_grid[q[4] | ((h << 4) & 256)],
-                                          iq3s_grid[q[3] | ((h << 5) & 256)], iq3s_grid[q[2] | ((h << 6) & 256)],
-                                          iq3s_grid[q[1] | ((h << 7) & 256)], iq3s_grid[q[0] | ((h << 8) & 256)]);
+                grid = _mm256_set_epi32(iq3s_grid[q[7] | ((h << 1) & 256)], iq3s_grid[q[6] | ((h << 2) & 256)],
+                                        iq3s_grid[q[5] | ((h << 3) & 256)], iq3s_grid[q[4] | ((h << 4) & 256)],
+                                        iq3s_grid[q[3] | ((h << 5) & 256)], iq3s_grid[q[2] | ((h << 6) & 256)],
+                                        iq3s_grid[q[1] | ((h << 7) & 256)], iq3s_grid[q[0] | ((h << 8) & 256)]);
                 uint32_t bits;
                 memcpy(&bits, x->signs + 4*j, sizeof(bits));
                 const __m256i mask = _mm256_cmpeq_epi8(_mm256_and_si256(_mm256_shuffle_epi8(_mm256_set1_epi32(bits), sign_shuffle), sign_bits), sign_bits);
-                signs[j] = _mm256_or_si256(mask, one);
-                scales[j] = _mm256_set1_epi16(2*((x->scales[j/2] >> (4*(j%2))) & 15) + 1);
+                signs = _mm256_or_si256(mask, one);
+                scales = _mm256_set1_epi16(2*((x->scales[j/2] >> (4*(j%2))) & 15) + 1);
+            }
+            for (int t = 0; t < nr; ++t) {
+                const block_q8_K * y = (const block_q8_K *) vy[t] + ib;
+                const __m256i q8 = _mm256_loadu_si256((const __m256i *) (y->qs + 32*j));
+                const __m256i dot = _mm256_maddubs_epi16(grid, _mm256_sign_epi8(q8, signs));
+                sums[t] = _mm256_add_epi32(sums[t], _mm256_madd_epi16(dot, scales));
             }
         }
         for (int t = 0; t < nr; ++t) {
             const block_q8_K * y = (const block_q8_K *) vy[t] + ib;
-            __m256i sum = _mm256_setzero_si256();
-            for (int j = 0; j < 8; ++j) {
-                const __m256i q8 = _mm256_loadu_si256((const __m256i *) (y->qs + 32*j));
-                const __m256i dot = _mm256_maddubs_epi16(grid[j], _mm256_sign_epi8(q8, signs[j]));
-                sum = _mm256_add_epi32(sum, _mm256_madd_epi16(dot, scales[j]));
-            }
-            accum[t] = _mm256_fmadd_ps(_mm256_set1_ps(dx * y->d), _mm256_cvtepi32_ps(sum), accum[t]);
+            accum[t] = _mm256_fmadd_ps(_mm256_set1_ps(dx * y->d), _mm256_cvtepi32_ps(sums[t]), accum[t]);
         }
     }
     for (int t = 0; t < nr; ++t) {
