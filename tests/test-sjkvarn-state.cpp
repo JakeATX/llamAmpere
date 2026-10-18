@@ -297,6 +297,39 @@ static int run_case(llama_model * model, const sj_cfg & c, const std::vector<sj_
         require(after.tail_k == before.tail_k && after.tail_v == before.tail_v, "tail rows byte-identical");
         require(descriptor(kv_dst, N0) == descriptor(kv_src, N0), "descriptor identical");
         require(seq_state(dst) == blob, "re-saved state byte-identical");
+
+        if (std::string(c.name) == "4/4") {
+            // The synthetic llama has one sequence per cell and no cell extensions.
+            size_t off = 4*sizeof(uint32_t) + (size_t) N0*(sizeof(llama_pos) + sizeof(uint32_t) + sizeof(llama_seq_id));
+            auto read_u32 = [&]() {
+                require(off <= blob.size() && blob.size() - off >= sizeof(uint32_t), "state header fits");
+                uint32_t value;
+                std::memcpy(&value, blob.data() + off, sizeof(value));
+                off += sizeof(value);
+                return value;
+            };
+            require(read_u32() == 0x564b4a53u && read_u32() == 2, "SJ-KVaRN v2 state header");
+            const uint32_t n_cfg = read_u32();
+            off += (size_t) n_cfg*sizeof(int64_t);
+            const uint32_t n_info = read_u32();
+            off += (size_t) n_info*sizeof(int64_t);
+            require(off <= blob.size() && blob.size() - off >= 5*sizeof(uint32_t), "SJ-KVaRN state fields fit");
+            const struct { uint32_t field, value; const char * name; } corruptions[] = {
+                { 1, S + 1, "misaligned previous sealed end" },
+                { 2, kv_dst->get_size() + 1, "visible end beyond cache" },
+                { 3, 2, "invalid draining flag" },
+            };
+            for (const auto & corruption : corruptions) {
+                auto invalid = blob;
+                std::memcpy(invalid.data() + off + corruption.field*sizeof(uint32_t), &corruption.value, sizeof(uint32_t));
+                g_last_error.clear();
+                require(llama_state_seq_set_data(dst, invalid.data(), invalid.size(), 0) == 0, std::string(corruption.name) + " refused");
+                require(g_last_error.find("corrupt state") != std::string::npos, std::string(corruption.name) + " rejected by header validation");
+                require(seq_state(dst) == blob, std::string(corruption.name) + " leaves the cache unchanged");
+            }
+            printf("%-14s OK: three corrupt state headers refused without changing the cache\n", c.name);
+        }
+
         size_t tail_bytes = 0, rec_bytes = 0;
         for (uint32_t il = 0; il < n_layer; ++il) {
             tail_bytes += before.tail_k[il].size() + before.tail_v[il].size() + before.sink_k[il].size() + before.sink_v[il].size() +

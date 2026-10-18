@@ -1777,6 +1777,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         std::memcpy(header, data.data(), sizeof(header));
         const uint32_t flags = (adaptive ? 1u : 0u) | (defer_enabled ? 2u : 0u);
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
+        const size_t retained = std::count_if(defer.seq.begin(), defer.seq.end(), [seq_id](llama_seq_id id) { return id != seq_id; });
+        if (retained + header[2] > (size_t) defer_capacity()) {
+            return;
+        }
         if (header[0] != 0x3150544d || header[1] != (uint32_t) n_embd || header[2] > (uint32_t) defer_max || header[7] != flags ||
                 header[6] > (uint32_t) params.n_max ||
                 data.size() != sizeof(header) + row_bytes + header[2] * (sizeof(llama_token) + sizeof(llama_pos) + row_bytes)) {
@@ -1795,15 +1799,27 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         // Validate the complete snapshot before changing this sequence or its deferred rows.
         size_t off = sizeof(header) + row_bytes;
+        auto finite_row = [&](size_t start) {
+            for (int32_t i = 0; i < n_embd; ++i) {
+                float value;
+                std::memcpy(&value, data.data() + start + (size_t) i*sizeof(value), sizeof(value));
+                if (!std::isfinite(value)) { return false; }
+            }
+            return true;
+        };
+        if (!finite_row(sizeof(header))) { return; }
+        llama_pos prev_pos = -1;
         const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(params.ctx_dft)));
         for (uint32_t i = 0; i < header[2]; ++i) {
             llama_token tok;
             llama_pos pos;
             std::memcpy(&tok, data.data() + off, sizeof(tok));
             std::memcpy(&pos, data.data() + off + sizeof(tok), sizeof(pos));
-            if (tok < 0 || tok >= n_vocab || pos < 0) {
+            if (tok < 0 || tok >= n_vocab || pos < 0 || (uint32_t) pos >= llama_n_ctx(params.ctx_dft) ||
+                    (i > 0 && pos != prev_pos + 1) || !finite_row(off + sizeof(tok) + sizeof(pos))) {
                 return;
             }
+            prev_pos = pos;
             off += sizeof(tok) + sizeof(pos) + row_bytes;
         }
 

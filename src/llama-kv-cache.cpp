@@ -4680,7 +4680,7 @@ uint32_t llama_kv_cache::state_read_sj_kvarn(llama_io_read_i & io, llama_seq_id 
     const uint32_t B = st[0], B_prev = st[1], sj_N = st[2];
     const bool draining = st[3] != 0;
     const uint32_t R = version >= 2 ? st[4] : B; // first saved ring position
-    if (B < S || (B - S) % G != 0 || (B > S && B > n) || B_prev < S || B_prev > B ||
+    if (B < S || (B - S) % G != 0 || (B > S && B > n) || B_prev < S || B_prev > B || (B_prev - S) % G != 0 || sj_N > cells.size() || st[3] > 1 ||
             R > B || (R < B && (R < S || (R - S) % G != 0))) {
         throw std::runtime_error("SJ-KVaRN cache: corrupt state (sealed end " + std::to_string(B) + ", " + std::to_string(n) + " cells)");
     }
