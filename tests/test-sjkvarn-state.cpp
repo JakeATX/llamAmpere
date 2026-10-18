@@ -13,6 +13,7 @@
 //      plain cache) fails and leaves the target cache untouched.
 //
 //   test-sjkvarn-state          all cases
+//   test-sjkvarn-state --scalar-only [tmp_dir]   native scalar 4/4 state and multi-sequence checks
 //   test-sjkvarn-state --resident [tmp_dir]   CUDA split-body state round trips
 
 #include "ggml.h"
@@ -781,7 +782,8 @@ static std::string write_transform(const char * dir, const char * name, uint32_t
 
 int main(int argc, char ** argv) {
     const bool resident = argc > 1 && strcmp(argv[1], "--resident") == 0;
-    const int tmp_arg = resident ? 2 : 1;
+    const bool scalar_only = argc > 1 && strcmp(argv[1], "--scalar-only") == 0;
+    const int tmp_arg = resident || scalar_only ? 2 : 1;
     const char * tmp_dir = argc > tmp_arg ? argv[tmp_arg] : (getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
     ggml_backend_load_all();
     llama_backend_init();
@@ -849,20 +851,30 @@ int main(int argc, char ** argv) {
         { fixed, { s44 } },
     };
     int fails = 0;
+    int cases_run = 0;
     const bool multi_only = getenv("SJ_TEST_MULTI_ONLY") != nullptr; // debugging: only the multi-sequence checks
     for (const auto & c : cases) {
         if (multi_only) { break; }
+        if (scalar_only && strcmp(c.first.name, s44.name) != 0) { continue; }
         if (getenv("SJ_TEST_CASE") && strcmp(getenv("SJ_TEST_CASE"), c.first.name) != 0) { continue; } // debugging
+        ++cases_run;
         fails += run_case(model, c.first, c.second, tmp_dir);
     }
     if (!multi_only) { plain_mixed_control(model); }
     int fails_multi = 0;
+    int multi_run = 0;
     for (const auto & c : { s44, s33t, s32t }) {
+        if (scalar_only && c.body != GGML_TYPE_F32) { continue; }
+        ++multi_run;
         fails_multi += run_multi(model, c, false);
     }
+    ++multi_run;
     fails_multi += run_multi(model, s44, true);
-    fails_multi += run_multi(model, w1t, false); // transform with one FA node per stream
-    printf("%s: %d/%zu cases passed, multi-sequence %d/5\n", fails || fails_multi ? "FAIL" : "OK", (int) (cases.size() - fails), cases.size(), 5 - fails_multi);
+    if (!scalar_only) {
+        ++multi_run;
+        fails_multi += run_multi(model, w1t, false); // transform with one FA node per stream
+    }
+    printf("%s: %d/%d cases passed, multi-sequence %d/%d\n", fails || fails_multi ? "FAIL" : "OK", cases_run - fails, cases_run, multi_run - fails_multi, multi_run);
     fails += fails_multi;
     llama_model_free(model);
     llama_backend_free();
