@@ -1882,7 +1882,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 const int row = x/nbatch_fa;
                 const int key = x%nbatch_fa;
                 if ((!oob_check || key < k_VKQ_sup) &&
-                        __half2float(tile_mask[row*(nbatch_fa + 8) + key]) != -CUDART_INF_F) {
+                        __half2float(tile_mask[row*(nbatch_fa + 8) + key]) != -INFINITY) {
                     live = true;
                 }
             }

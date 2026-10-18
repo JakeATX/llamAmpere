@@ -32,7 +32,7 @@ static __global__ void fattn_sj_kvarn_expand_prefill(
             bool visible = false;
             for (int q0 = 0; q0 < mask_queries; q0 += 16) {
                 const int q = q0 + tid/rows;
-                const bool live = q < mask_queries && __half2float(reinterpret_cast<const half *>(mask + q*mask_pitch)[p0 + tid%rows]) > -CUDART_INF_F;
+                const bool live = q < mask_queries && __half2float(reinterpret_cast<const half *>(mask + q*mask_pitch)[p0 + tid%rows]) > -INFINITY;
                 if (__syncthreads_or(live)) {
                     visible = true;
                     break;

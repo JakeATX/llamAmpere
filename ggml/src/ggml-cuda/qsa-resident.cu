@@ -241,7 +241,7 @@ static __global__ void qsa_resident_fetch(ggml_cuda_qsa_resident_map m, const in
         bool live = false;
         for (int j = threadIdx.x; j < G*nqueries; j += blockDim.x) {
             const int pos = S + g*G + j%G;
-            if (pos < mask_n) live |= __half2float(reinterpret_cast<const half *>(mask + (j/G)*mask_pitch)[pos]) > -CUDART_INF_F;
+            if (pos < mask_n) live |= __half2float(reinterpret_cast<const half *>(mask + (j/G)*mask_pitch)[pos]) > -INFINITY;
         }
         if (__syncthreads_or(live)) {
             selected = record;
