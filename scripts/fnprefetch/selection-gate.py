@@ -3,7 +3,7 @@ from pathlib import Path
 R=Path('/mnt/models/fnprefetch');P=R/'protocol'
 assert os.environ['PARENT_HOLDS_GPU_LOCK']=='1'
 gate=json.loads((R/'logs/followup-gate-complete.json').read_text())
-frozen=Path(gate['frozen']); baseline=Path('/mnt/models/fnship/releases/3f372a1ba/bin')
+frozen=Path(gate['frozen']); baseline=Path(gate['baseline'])
 plan=R/'protocol/selection-plan.json'
 assert not plan.exists(),'selection already started; use its saved outcome'
 settings=json.loads(Path('/mnt/models/fnfast/ship-d28/bench-env.json').read_text())
