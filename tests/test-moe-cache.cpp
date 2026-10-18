@@ -3604,8 +3604,9 @@ static bool run_prefetch_staging(ggml_backend_t gpu, ggml_backend_t cpu,
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
         bool completed = false;
         do {
-            api.print_stats(session);
-            completed = max_field_value(capture.get(), "filled=") >= 9 + round;
+            // Planning also exercises promotion when demand reaches a queued prediction.
+            completed = direct_plan_one(desc.name, desc.data, desc.expert_size,
+                    desc.n_in, desc.n_out, desc.type, desc.n_expert, 63) == 1;
             if (!completed) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
