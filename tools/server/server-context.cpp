@@ -35,6 +35,7 @@ extern "C" {
 #include <condition_variable>
 #include <exception>
 #include <memory>
+#include <limits>
 #include <filesystem>
 #include <random>
 #include <thread>
@@ -3754,7 +3755,7 @@ private:
             std::vector<uint8_t> & spec, const std::string & filepath,
             const std::array<uint8_t, SHA256_DIGEST_SIZE> & digest,
             const std::array<uint8_t, SHA256_DIGEST_SIZE> & draft_digest,
-            bool require_bound, const std::array<uint64_t, 3> & limits, uint32_t max_checkpoints) {
+            bool require_bound, const std::array<uint64_t, 3> & limits, uint32_t max_checkpoints, size_t max_tokens) {
         FILE * f = fopen(filepath.c_str(), "rb");
         if (f == nullptr) {
             return false;
@@ -3800,7 +3801,10 @@ private:
                 const size_t metadata_size = sizeof(cur.n_tokens) + sizeof(cur.pos_min) + sizeof(cur.pos_max);
                 ok = remaining >= metadata_size && fread(&cur.n_tokens, sizeof(cur.n_tokens), 1, f) == 1 &&
                      fread(&cur.pos_min,  sizeof(cur.pos_min),  1, f) == 1 &&
-                     fread(&cur.pos_max,  sizeof(cur.pos_max),  1, f) == 1;
+                     fread(&cur.pos_max,  sizeof(cur.pos_max),  1, f) == 1 &&
+                     cur.n_tokens >= 0 && (uint64_t) cur.n_tokens <= max_tokens &&
+                     cur.pos_min >= 0 && cur.pos_max >= cur.pos_min &&
+                     cur.pos_max < std::numeric_limits<llama_pos>::max();
                 if (ok) {
                     remaining -= metadata_size;
                     ok = blob(cur.data_tgt, limits[0]) && blob(cur.data_dft, limits[1]) && blob(cur.data_spec, limits[2]);
@@ -4295,7 +4299,7 @@ private:
                     };
                     const bool has_sidecar = state_file_digest(filepath, digest) &&
                             (!ctx_dft || state_file_digest(filepath + ".dft", draft_digest)) &&
-                            checkpoints_load_sidecar(slot->prompt.checkpoints, spec_state, filepath + ".ckpt", digest, draft_digest, ctx_dft != nullptr, limits, std::max(0, params_base.n_ctx_checkpoints));
+                            checkpoints_load_sidecar(slot->prompt.checkpoints, spec_state, filepath + ".ckpt", digest, draft_digest, ctx_dft != nullptr, limits, std::max(0, params_base.n_ctx_checkpoints), slot->prompt.n_tokens());
                     bool has_dft_state = ctx_dft == nullptr;
                     if (ctx_dft && has_sidecar) {
                         const std::string path_dft = filepath + ".dft";
