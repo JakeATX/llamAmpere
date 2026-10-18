@@ -1312,6 +1312,7 @@ struct llama_model::impl {
 
     // model memory mapped files
     llama_mmaps mappings;
+    std::unique_ptr<llama_moe_arena> moe_arena;
 
     // objects representing data potentially being locked in memory
     llama_mlocks mlock_bufs;
@@ -2129,6 +2130,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
+    pimpl->moe_arena = ml.load_moe_arena(params.progress_callback, params.progress_callback_user_data);
 
     // create the backend buffers
     std::vector<std::pair<ggml_context *, llama_buf_map>> ctx_buf_maps;
@@ -2144,6 +2146,15 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
         // skip contexts without tensors
         if (ggml_get_first_tensor(ctx) == nullptr) {
+            continue;
+        }
+        bool allocated = true;
+        for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            allocated = allocated && t->data != nullptr;
+        }
+        if (allocated) {
+            pimpl->ctxs_bufs.emplace_back(std::move(ctx_ptr), std::vector<ggml_backend_buffer_ptr>{});
+            ctx_buf_maps.emplace_back(ctx, llama_buf_map{});
             continue;
         }
 
@@ -2523,6 +2534,9 @@ llama_split_mode llama_model::split_mode() const {
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
+    if (pimpl->moe_arena) {
+        ret[ggml_backend_buffer_get_type(pimpl->moe_arena->buffer.get())] += pimpl->moe_arena->size;
+    }
     for (const auto & [ctx, bufs] : pimpl->ctxs_bufs) {
         if (hparams.no_alloc) {
             GGML_ASSERT(bufs.size() == 1);
@@ -3908,6 +3922,14 @@ int32_t llama_model_desc(const llama_model * model, char * buf, size_t buf_size)
 
 llama_ftype llama_model_ftype(const llama_model * model) {
     return model->ftype();
+}
+
+size_t llama_model::moe_arena_size() const {
+    return pimpl->moe_arena ? pimpl->moe_arena->size : 0;
+}
+
+uint64_t llama_model_moe_arena_size(const llama_model * model) {
+    return model ? model->moe_arena_size() : 0;
 }
 
 uint64_t llama_model_size(const llama_model * model) {

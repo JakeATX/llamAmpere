@@ -31,6 +31,7 @@ set(LLAMA_CORE_SOURCES
     llama-kv-stream-plan.cpp
     llama-memory.cpp
     llama-moe-cache.cpp
+    llama-moe-arena.cpp
     llama-b1.cpp
     llama-ple-prefetch.cpp
     llama-memory-hybrid.cpp

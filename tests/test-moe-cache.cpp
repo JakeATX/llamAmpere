@@ -1,5 +1,6 @@
 #include "ggml.h"
 #include "ggml-backend.h"
+#include "ggml-cpu.h"
 #include "../ggml/src/ggml-backend-impl.h"
 #include "../ggml/src/ggml-impl.h"
 #include "../ggml/src/ggml-backend-moe-cache.h"
@@ -3369,6 +3370,21 @@ static bool run_profile_persistence(ggml_backend_t gpu, ggml_backend_t cpu, log_
     } else {
         ok = false;
     }
+    // The same profile must load against an interleaved expert arena.
+    std::vector<uint8_t> interleaved(expert_bytes * experts * 3, 0xa5);
+    for (int64_t e = 0; e < experts; ++e) {
+        memcpy(interleaved.data() + (size_t)e * expert_bytes * 3, data.data() + (size_t)e * expert_bytes, expert_bytes);
+    }
+    auto arena_descriptor = loaded;
+    arena_descriptor.data = interleaved.data();
+    arena_descriptor.expert_size = expert_bytes * 3;
+    void * arena_reader = create_direct_session(gpu, cpu);
+    if (arena_reader) {
+        capture.clear();
+        ok &= api.warm(arena_reader, &arena_descriptor, nullptr, 1) == 64;
+        ok &= capture.get().find("profile loaded:") != std::string::npos;
+        api.session_destroy(arena_reader);
+    } else { ok = false; }
     auto rejected = [&](const ggml_moe_cache_tensor_desc & candidate) {
         void * session = create_direct_session(gpu, cpu);
         if (!session) {
@@ -4249,6 +4265,42 @@ static bool run_optional(
     return test();
 }
 
+static bool run_arena_stride(ggml_backend_t gpu, ggml_backend_t cpu,
+        ggml_tensor * weights, ggml_tensor * gate, test_graph & graph,
+        const std::vector<float> & reference, log_capture & capture) {
+    const ggml_tensor original = *weights, gate_original = *gate;
+    const size_t bytes = weights->nb[2], stride = 3 * bytes;
+    const size_t arena_size = stride * (size_t)weights->ne[2];
+    auto * buffer = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), arena_size);
+    auto * arena = static_cast<uint8_t *>(ggml_backend_buffer_get_base(buffer));
+    memset(arena, 0xa5, arena_size);
+    for (int64_t e = 0; e < weights->ne[2]; ++e) {
+        memcpy(arena + e * stride, (const char *)weights->data + e * bytes, bytes);
+        memcpy(arena + e * stride + bytes, (const char *)gate->data + e * bytes, bytes);
+    }
+    ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    weights->buffer = gate->buffer = buffer;
+    weights->data = arena;
+    gate->data = arena + bytes;
+    weights->nb[2] = gate->nb[2] = stride;
+    weights->nb[3] = gate->nb[3] = stride * weights->ne[2];
+    set_env("GGML_CUDA_MOE_CACHE", "0");
+    bool ok = ggml_backend_graph_compute(cpu, graph.graph) == GGML_STATUS_SUCCESS;
+    std::vector<float> actual(reference.size());
+    ggml_backend_tensor_get(graph.out, actual.data(), 0, actual.size() * sizeof(float));
+    ok &= actual == reference;
+    ok &= run_prompt_warm(gpu, cpu, weights, graph, reference, capture);
+    ok &= run_scenario("cache-arena-stride", nullptr, gpu, cpu, graph, reference, capture);
+    for (int64_t e = 0; e < weights->ne[2]; ++e) {
+        for (size_t i = 2 * bytes; i < stride; ++i) { ok &= arena[e * stride + i] == 0xa5; }
+    }
+    *weights = original;
+    *gate = gate_original;
+    ggml_backend_buffer_free(buffer);
+    printf("cache-arena-stride: %s\n", ok ? "OK" : "FAIL");
+    return ok;
+}
+
 } // namespace
 
 int main(int argc, char ** argv) {
@@ -4470,7 +4522,8 @@ int main(int argc, char ** argv) {
             clamped_fused_graph.out, clamped_fused_reference.data(), 0,
             clamped_fused_reference.size() * sizeof(float));
 
-    bool ok = run_capability_queries(provider_device, cpu);
+    bool ok = run_arena_stride(gpu, cpu, weights, gate_weights, graph, reference, capture);
+    ok &= run_capability_queries(provider_device, cpu);
     ok &= run_invalidation_hook_coverage(cpu);
     ok &= run_optional(provider_is_cuda, "cache-device-tables", [&] {
         return run_device_tables(gpu, cpu, weights, capture);

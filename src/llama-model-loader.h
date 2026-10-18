@@ -6,6 +6,7 @@
 #include "llama-arch.h"
 #include "llama-hparams.h"
 #include "llama-mmap.h"
+#include "llama-moe-arena.h"
 
 #include "ggml-cpp.h"
 
@@ -83,6 +84,9 @@ struct llama_model_loader {
     bool check_tensors;
     bool no_alloc;
     bool load_mtp;
+    bool use_moe_arena = false;
+    std::set<const ggml_tensor *> arena_tensors;
+    std::unique_ptr<llama_moe_arena> load_moe_arena(llama_progress_callback callback, void * user_data);
 
     // handle TENSOR_READ_LAZY
     // use case: keep PLE / engrams embd tensors on disk, read them on demand

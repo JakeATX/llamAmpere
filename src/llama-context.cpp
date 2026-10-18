@@ -5096,7 +5096,7 @@ void llama_context::b1_cache_profile_load() {
             if (sscanf(entry.first.c_str(), "blk.%d.%n", &layer, &parsed) != 1 || parsed <= 0 ||
                     entry.first.find("_exps") == std::string::npos || layer < 0 || (uint32_t) layer >= model.hparams.n_layer() ||
                     !tensor->buffer || !ggml_backend_buffer_is_host(tensor->buffer) || !tensor->data ||
-                    tensor->ne[2] != model.hparams.n_expert || tensor->ne[3] != 1 || !ggml_is_contiguous(tensor) ||
+                    tensor->ne[2] != model.hparams.n_expert || tensor->ne[3] != 1 || (!ggml_is_contiguous_2(tensor) || tensor->nb[1] != ggml_row_size(tensor->type, tensor->ne[0])) ||
                     !ggml_moe_cache_wtype_supported(tensor->type)) {
                 continue;
             }
@@ -5129,7 +5129,7 @@ void llama_context::b1_cache_warm() {
                 entry.first.find("_exps") == std::string::npos || layer < 0 || (size_t) layer >= b1_cache_counts.size() ||
                 !tensor->buffer || !ggml_backend_buffer_is_host(tensor->buffer) || !tensor->data ||
                 tensor->ne[2] != (int64_t) b1_cache_counts[layer].size() || tensor->ne[3] != 1 ||
-                !ggml_is_contiguous(tensor) || !ggml_moe_cache_wtype_supported(tensor->type)) {
+                (!ggml_is_contiguous_2(tensor) || tensor->nb[1] != ggml_row_size(tensor->type, tensor->ne[0])) || !ggml_moe_cache_wtype_supported(tensor->type)) {
                 continue;
             }
             tensors.push_back({tensor->name, tensor->data, tensor->nb[2], tensor->ne[0], tensor->ne[1], tensor->ne[2], (int32_t) tensor->type});
@@ -5360,6 +5360,41 @@ ggml_status llama_context::graph_compute(ggml_cgraph * gf, bool batched) {
 
 bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
     auto * lctx = static_cast<llama_context *>(user_data);
+
+    // fork: pack arena expert planes without copying the intervening roles.
+    const size_t expert_bytes = src->nb[1] * src->ne[1];
+    if (src->ne[3] == 1 && src->nb[2] != dst->nb[2] && dst->nb[2] == expert_bytes &&
+            strstr(src->name, "_exps.weight") && ggml_is_contiguous_2(src) &&
+            src->nb[1] == ggml_row_size(src->type, src->ne[0])) {
+        std::vector<bool> used((size_t)src->ne[2], true);
+        const auto * node = ggml_graph_n_nodes(graph) ? ggml_graph_node(graph, 0) : nullptr;
+        if (node && node->op == GGML_OP_MUL_MAT_ID && node->src[0] == dst) {
+            const auto * ids = node->src[2];
+            std::vector<int32_t> data(ggml_nbytes(ids) / sizeof(int32_t));
+            ggml_backend_tensor_get_async(backend, ids, data.data(), 0, ggml_nbytes(ids));
+            ggml_backend_synchronize(backend);
+            std::fill(used.begin(), used.end(), false);
+            for (int64_t token = 0; token < ids->ne[1]; ++token) {
+                for (int64_t rank = 0; rank < ids->ne[0]; ++rank) {
+                    const int32_t id = data[(token * ids->nb[1] + rank * ids->nb[0]) / sizeof(int32_t)];
+                    GGML_ASSERT(id >= 0 && id < src->ne[2]);
+                    used[id] = true;
+                }
+            }
+        }
+        for (int64_t e = 0; e < src->ne[2]; ++e) {
+            if (used[e]) {
+                ggml_backend_tensor_set_async(backend, dst, (const char *)src->data + e * src->nb[2],
+                        e * dst->nb[2], expert_bytes);
+                if (e + 1 < src->ne[2]) {
+                    static const uint8_t padding[512] = {};
+                    ggml_backend_tensor_set_async(backend, dst, padding, (e + 1) * dst->nb[2],
+                            std::min(expert_bytes, sizeof(padding)));
+                }
+            }
+        }
+        return true;
+    }
 
     // the slot maps of the MoE cache
     if (lctx->moe_cache && lctx->moe_cache->copy(backend, src, dst, graph)) {

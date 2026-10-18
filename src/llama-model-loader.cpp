@@ -3,6 +3,7 @@
 #include "ggml-alloc.h"
 #include "ggml.h"
 #include "gguf.h"
+#include "../ggml/src/ggml-backend-moe-cache.h"
 #include "llama-hparams.h"
 #include "llama.h"
 
@@ -14,6 +15,12 @@
 #include <cstring>
 #include <future>
 #include <regex>
+#include <fstream>
+#ifndef _WIN32
+#include <sys/mman.h>
+#include <unistd.h>
+#include <fcntl.h>
+#endif
 
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
@@ -875,6 +882,40 @@ llama_model_loader::llama_model_loader(
     this->check_tensors = check_tensors;
     this->no_alloc = no_alloc;
     this->load_mtp = load_mtp;
+    // fork: reserve host headroom before changing expert placement, including fit-only loads.
+    const char * arena = getenv("LLAMA_MOE_ARENA");
+    if (!load_mtp && !files.empty() && (!arena || strcmp(arena, "off") != 0)) {
+        size_t bytes = 0;
+        bool supported = true;
+        std::map<int, int> roles;
+        uint32_t n_layers = 0, n_nextn = 0;
+        get_key(LLM_KV_BLOCK_COUNT, n_layers, false);
+        get_key(LLM_KV_NEXTN_PREDICT_LAYERS, n_nextn, false);
+        for (const auto & entry : weights_map) {
+            const auto * t = entry.second.tensor;
+            if (!llama_moe_arena::is_expert(t->name)) { continue; }
+            int layer = -1;
+            if (sscanf(t->name, "blk.%d.", &layer) != 1 || layer < 0 || n_nextn > n_layers) { supported = false; break; }
+            if ((uint32_t)layer >= n_layers - n_nextn) { continue; }
+            roles[layer]++;
+            if (!ggml_moe_cache_wtype_supported(t->type)) { supported = false; break; }
+            if (t->ne[2] <= 1 || t->ne[3] != 1 || ggml_nbytes(t) > SIZE_MAX - bytes) {
+                supported = false;
+                break;
+            }
+            bytes += ggml_nbytes(t);
+        }
+        for (const auto & role : roles) { supported = supported && role.second == 3; }
+        const size_t available = llama_moe_arena::available_memory();
+        const size_t reserve = 12ull << 30;
+        use_moe_arena = supported && bytes && available > reserve && bytes <= available - reserve &&
+            llama_moe_arena::pin_supported();
+        LLAMA_LOG_INFO("%s: expert arena %s: %.2f GiB experts, %.2f GiB available, 12 GiB startup headroom\n",
+                __func__, use_moe_arena ? "enabled" : "disabled", bytes / double(GiB), available / double(GiB));
+        if (arena && strcmp(arena, "on") == 0 && !use_moe_arena) {
+            throw std::runtime_error("--moe-arena on cannot fit the pinned experts with 12 GiB startup headroom, or pinning is unavailable");
+        }
+    }
 }
 
 std::string llama_model_loader::get_arch_name() const {
@@ -1331,6 +1372,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             }
         }
 
+        if (use_moe_arena && llama_moe_arena::is_expert(t_meta->name)) {
+            buft = lazy_read::buft();
+        }
+
         // avoid using a host buffer when using mmap
         auto * buft_dev = ggml_backend_buft_get_device(buft);
         if (use_mmap && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev)) {
@@ -1495,7 +1540,7 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
                 }
             }
 
-            const size_t prefetch_size = prefetch && use_mmap ? -1 : 0;
+            const size_t prefetch_size = prefetch && use_mmap && !use_moe_arena ? -1 : 0;
 
             std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch_size, is_numa,
                     lazy.for_file(idx));
@@ -1524,7 +1569,7 @@ void llama_model_loader::get_mapping_range(size_t * first, size_t * last, void *
     *addr = mapping->addr();
     for (ggml_tensor * tensor = ggml_get_first_tensor(ctx); tensor; tensor = ggml_get_next_tensor(ctx, tensor)) {
         const auto * weight = get_weight(ggml_get_name(tensor));
-        if (!weight || weight->idx != idx) {
+        if (!weight || weight->idx != idx || arena_tensors.count(tensor)) {
             continue;
         }
         *first = std::min(*first, weight->offs);
@@ -1703,6 +1748,7 @@ bool llama_model_loader::load_all_data(
             }
         }
 
+        if (arena_tensors.count(cur)) { continue; }
         size_t n_size = ggml_nbytes(cur);
 
         const bool from_mapping = use_mmap || lazy.has(cur);
@@ -1876,4 +1922,82 @@ void llama_model_loader::print_info() const {
     } else {
         LLAMA_LOG_INFO("%s: file size   = %.2f GiB (%.2f BPW) \n", __func__, n_bytes/1024.0/1024.0/1024.0, n_bytes*8.0/n_elements);
     }
+}
+
+std::unique_ptr<llama_moe_arena> llama_model_loader::load_moe_arena(llama_progress_callback callback, void * user_data) {
+    if (!use_moe_arena || no_alloc) { return nullptr; }
+    std::map<int, std::vector<ggml_tensor *>> layers;
+    for (const auto & entry : ctx_map) {
+        for (auto * t = ggml_get_first_tensor(entry.second.get()); t; t = ggml_get_next_tensor(entry.second.get(), t)) {
+            int layer = -1;
+            if (llama_moe_arena::is_expert(t->name) && sscanf(t->name, "blk.%d.", &layer) == 1) {
+                layers[layer].push_back(t);
+            }
+        }
+    }
+    size_t total = 0;
+    for (auto & entry : layers) {
+        auto & ts = entry.second;
+        if (ts.size() != 3) { throw std::runtime_error("expert arena requires gate/up/down triples"); }
+        std::sort(ts.begin(), ts.end(), [](const auto * a, const auto * b) {
+            auto role = [](const char * n) { return strstr(n, "gate") ? 0 : strstr(n, "up") ? 1 : 2; };
+            return role(a->name) < role(b->name);
+        });
+        for (auto * t : ts) {
+            if (!ggml_is_contiguous(t) || t->ne[2] != ts[0]->ne[2] || ggml_nbytes(t) > SIZE_MAX - total) {
+                throw std::runtime_error("unsupported expert arena layout");
+            }
+            total += ggml_nbytes(t);
+        }
+    }
+    const size_t available = llama_moe_arena::available_memory();
+    if (available < (12ull << 30) || total > available - (12ull << 30)) {
+        throw std::runtime_error("expert arena no longer fits with 12 GiB startup headroom");
+    }
+    auto arena = std::make_unique<llama_moe_arena>(total);
+    size_t base = 0;
+    for (const auto & entry : layers) {
+        const auto & ts = entry.second;
+        size_t stride = 0;
+        for (auto * t : ts) { stride += t->nb[2]; }
+        size_t role_offset = 0;
+        for (auto * t : ts) {
+            const auto & w = require_weight(t->name);
+            const size_t bytes = t->nb[2];
+            const size_t original_size = ggml_nbytes(t);
+            for (int64_t e = 0; e < t->ne[2]; ++e) {
+                if (callback && !callback(float(size_done + (size_t)e * bytes) / size_data, user_data)) {
+                    throw std::runtime_error("expert arena loading canceled");
+                }
+                void * dst = (char *) arena->data + base + role_offset + (size_t) e * stride;
+                const void * src = load_data_range(w, (size_t) e * bytes, bytes, dst);
+                if (src != dst) { memcpy(dst, src, bytes); }
+                if (check_tensors && !ggml_validate_row_data(t->type, dst, bytes)) {
+                    throw std::runtime_error(format("expert arena tensor '%s' has invalid data", t->name));
+                }
+#ifndef _WIN32
+                const size_t first = w.offs + (size_t) e * bytes;
+                if (use_mmap) { mappings.at(w.idx)->unmap_fragment(first, first + bytes); }
+                posix_fadvise(files.at(w.idx)->file_id(), first, bytes, POSIX_FADV_DONTNEED);
+#endif
+                if (llama_moe_arena::available_memory() < (10ull << 30)) {
+                    throw std::runtime_error("expert arena stopped: less than 10 GiB MemAvailable");
+                }
+            }
+            t->nb[2] = stride;
+            t->nb[3] = stride * (size_t) t->ne[2];
+            if (ggml_backend_tensor_alloc(arena->buffer.get(), t, (char *) arena->data + base + role_offset) != GGML_STATUS_SUCCESS) {
+                throw std::runtime_error("expert arena tensor allocation failed");
+            }
+            arena_tensors.insert(t);
+            size_done += original_size;
+            role_offset += bytes;
+        }
+        base += stride * (size_t) ts[0]->ne[2];
+        LLAMA_LOG_INFO("%s: layer %d copied, %.2f GiB MemAvailable\n", __func__, entry.first,
+                llama_moe_arena::available_memory() / double(GiB));
+    }
+    arena->pin();
+    LLAMA_LOG_INFO("%s: %.2f GiB pinned, gate/up/down grouped by expert, original weight blocks preserved\n", __func__, total / double(GiB));
+    return arena;
 }

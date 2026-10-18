@@ -107,6 +107,7 @@ private:
         ggml_tensor *         t       = nullptr;
         int                   role    = -1;   // index into roles
         size_t                nbytes  = 0;
+        size_t                home_nb2 = 0;
         size_t                alloc   = 0;    // device alloc size (with the tail pad)
         ggml_backend_buffer_t home_buf  = nullptr;
         void *                home_data = nullptr;

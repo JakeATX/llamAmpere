@@ -724,6 +724,8 @@ extern "C" {
 
     // Returns the total size of all the tensors in the model in bytes
     LLAMA_API uint64_t llama_model_size(const struct llama_model * model);
+    // Resident pinned expert storage, excluded from prompt-cache RAM budgets.
+    LLAMA_API uint64_t llama_model_moe_arena_size(const struct llama_model * model);
 
     // Get the default chat template. Returns nullptr if not available
     // If name is NULL, returns the default chat template

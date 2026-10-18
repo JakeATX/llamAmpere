@@ -222,6 +222,7 @@ struct moe_cache_device {
     std::vector<std::unique_ptr<moe_cache_pool>> pools;
     std::vector<moe_cache_shape> shapes;
     std::unordered_map<const void *, moe_cache_seen_tensor> seen_tensors;
+    std::unordered_map<const void *, size_t> host_strides;
     std::unordered_map<moe_cache_key, moe_cache_demand, moe_cache_key_hash> demand_count;
     size_t visits_since_new_tensor = 0;
     bool budget_ready = false;
@@ -298,7 +299,9 @@ struct moe_cache_mapped_range {
 };
 
 struct moe_cache_device_table {
-    ggml_moe_cache_tensor_desc desc{};
+    ggml_moe_cache_tensor_desc desc{}; // compact expert bytes
+    size_t host_stride = 0;
+    const void * borrowed = nullptr; // model-owned registered arena; never unregistered here
     const void ** device = nullptr;
     uint8_t * hot = nullptr;
     std::vector<const void *> addresses;
@@ -392,6 +395,11 @@ struct moe_cache_pin {
     moe_cache_pool * pool = nullptr;
     int slot = -1;
 };
+
+static size_t moe_cache_host_stride(const moe_cache_device & device, const void * base, size_t bytes) {
+    const auto it = device.host_strides.find(base);
+    return it == device.host_strides.end() ? bytes : it->second;
+}
 
 struct moe_cache_node {
     moe_cache_session * session = nullptr;
@@ -1185,7 +1193,8 @@ static int moe_cache_query_shape(
 
     const size_t row_size = ggml_row_size((ggml_type)wtype, n_in);
     if (row_size == 0 || (uint64_t)n_out > SIZE_MAX / row_size ||
-        expert_size != (size_t)n_out * row_size ||
+        expert_size < (size_t)n_out * row_size ||
+        (expert_size != (size_t)n_out * row_size && expert_size % GGML_MEM_ALIGN != 0) ||
         expert_size > SIZE_MAX / moe_cache_pool_slots_min) {
         return 0;
     }
@@ -1195,6 +1204,7 @@ static int moe_cache_query_shape(
         return 0;
     }
     const size_t scratch_bytes = moe_cache_scratch_total(scratch);
+    expert_size = (size_t)n_out * row_size;
     const size_t pool_bytes = expert_size * moe_cache_pool_slots_min;
     if (scratch_bytes == SIZE_MAX || pool_bytes > SIZE_MAX - scratch_bytes) {
         return 0;
@@ -2328,12 +2338,15 @@ static void * moe_cache_begin(
 
     const size_t row_size = ggml_row_size((ggml_type)wtype, n_in);
     if (row_size == 0 || (uint64_t)n_out > SIZE_MAX / row_size ||
-        expert_size != (size_t)n_out * row_size ||
+        expert_size < (size_t)n_out * row_size ||
+        (expert_size != (size_t)n_out * row_size && expert_size % GGML_MEM_ALIGN != 0) ||
         (uint64_t)n_expert > SIZE_MAX / expert_size ||
         expert_size > SIZE_MAX / moe_cache_pool_slots_min) {
         return nullptr;
     }
-    const size_t tensor_size = (size_t)n_expert * expert_size;
+    const size_t host_stride = expert_size;
+    expert_size = (size_t)n_out * row_size;
+    const size_t tensor_size = (size_t)(n_expert - 1) * host_stride + expert_size;
     moe_cache_scratch scratch_requirements;
     if (!moe_cache_scratch_requirements(
             n_in, n_out, scratch_requirements)) {
@@ -2538,6 +2551,7 @@ static void * moe_cache_begin(
                 selected->scratch_reserve.out, scratch_requirements.out);
 
         try {
+            selected->host_strides[host_base] = host_stride;
             pool_index = moe_cache_discover_pool(
                     *session, *selected, host_base, tensor_size, expert_size, wtype, n_expert);
         } catch (...) {
@@ -2749,7 +2763,7 @@ static int moe_cache_lookup_or_queue_locked(
         }
 
         const void * source =
-            (const char *)host_base + (size_t)expert * expert_size;
+            (const char *)host_base + (size_t)expert * moe_cache_host_stride(device, host_base, expert_size);
         device.queue.push_back({
                 pool_index, slot_index, slot.generation,
                 key, source, expert_size});
@@ -3228,13 +3242,24 @@ static void * moe_cache_fused_begin(
         return nullptr;
     }
 
+    const size_t up_stride = up->expert_size;
+    const size_t gate_stride = gate->expert_size;
     const size_t row_size = ggml_row_size((ggml_type)up->type, up->n_in);
-    if (row_size == 0 || (uint64_t)up->n_out > SIZE_MAX / row_size ||
-        up->expert_size != (size_t)up->n_out * row_size ||
-        (uint64_t)up->n_expert > SIZE_MAX / up->expert_size) {
+    if (row_size == 0 || (uint64_t)up->n_out > SIZE_MAX / row_size) {
         return nullptr;
     }
-    const size_t tensor_size = (size_t)up->n_expert * up->expert_size;
+    const size_t expert_bytes = row_size * (size_t)up->n_out;
+    if (up_stride < expert_bytes || gate_stride < expert_bytes ||
+        (up_stride != expert_bytes && up_stride % GGML_MEM_ALIGN != 0) ||
+        (gate_stride != expert_bytes && gate_stride % GGML_MEM_ALIGN != 0) ||
+        (uint64_t)up->n_expert > SIZE_MAX / std::max(up_stride, gate_stride)) {
+        return nullptr;
+    }
+    ggml_moe_cache_tensor_desc up_compact = *up, gate_compact = *gate;
+    up_compact.expert_size = gate_compact.expert_size = expert_bytes;
+    up = &up_compact;
+    gate = &gate_compact;
+    const size_t tensor_size = (size_t)(up->n_expert - 1) * std::max(up_stride, gate_stride) + expert_bytes;
 
     int up_layer = -1;
     int gate_layer = -1;
@@ -3281,6 +3306,8 @@ static void * moe_cache_fused_begin(
         if (!selected || selected->dead.load()) {
             return nullptr;
         }
+        selected->host_strides[up->data] = up_stride;
+        selected->host_strides[gate->data] = gate_stride;
         pool_index = moe_cache_find_pool(
                 *selected, up->expert_size, up->type);
         if (pool_index < 0 || pool_index >= (int)selected->pools.size()) {
@@ -3553,7 +3580,7 @@ static void moe_cache_invalidate_session(
                 moe_cache_slot & slot = pool.slots[index];
                 const void * source = slot.key.expert >= 0
                     ? (const char *)slot.key.tensor +
-                        (size_t)slot.key.expert * pool.expert_size
+                        (size_t)slot.key.expert * moe_cache_host_stride(device, slot.key.tensor, pool.expert_size)
                     : nullptr;
                 if (slot.state != moe_cache_slot_state::free &&
                     moe_cache_ranges_overlap(source, pool.expert_size, base, size)) {
@@ -3590,7 +3617,7 @@ static void moe_cache_invalidate_session(
         for (auto it = device.demand_count.begin(); it != device.demand_count.end();) {
             const void * source = it->first.expert >= 0
                 ? (const char *)it->first.tensor +
-                    (size_t)it->first.expert * it->second.expert_size
+                    (size_t)it->first.expert * moe_cache_host_stride(device, it->first.tensor, it->second.expert_size)
                 : nullptr;
             if (moe_cache_ranges_overlap(
                     source, it->second.expert_size, base, size)) {
@@ -3598,6 +3625,10 @@ static void moe_cache_invalidate_session(
             } else {
                 ++it;
             }
+        }
+        for (auto it = device.host_strides.begin(); it != device.host_strides.end();) {
+            if (moe_cache_ranges_overlap(it->first, 1, base, size)) { it = device.host_strides.erase(it); }
+            else { ++it; }
         }
     }
 }
@@ -3689,15 +3720,23 @@ static uint64_t moe_cache_profile_signature(const ggml_moe_cache_tensor_desc * t
     for (int i = 0; i < n_tensors; ++i) {
         const auto & t = tensors[i];
         hash = moe_cache_profile_hash(hash, t.name, strlen(t.name) + 1);
-        const uint64_t shape[] = {(uint64_t) t.expert_size, (uint64_t) t.n_in,
+        const size_t expert_bytes = ggml_row_size((ggml_type)t.type, t.n_in) * (size_t)t.n_out;
+        const uint64_t shape[] = {(uint64_t) expert_bytes, (uint64_t) t.n_in,
             (uint64_t) t.n_out, (uint64_t) t.n_expert, (uint64_t) t.type};
         hash = moe_cache_profile_hash(hash, shape, sizeof(shape));
-        const size_t bytes = t.expert_size * (size_t) t.n_expert;
+        const size_t bytes = expert_bytes * (size_t) t.n_expert;
         const size_t sample = std::min<size_t>(bytes, 64);
         // Sample across each tensor so equal-shaped models do not share a profile by accident.
         for (size_t j = 0; j < 64; ++j) {
             const size_t offset = ((bytes - sample) / 63) * j;
-            hash = moe_cache_profile_hash(hash, (const char *) t.data + offset, sample);
+            size_t remaining = sample, logical = offset;
+            while (remaining) {
+                const size_t part = std::min(remaining, expert_bytes - logical % expert_bytes);
+                const size_t physical = (logical / expert_bytes) * t.expert_size + logical % expert_bytes;
+                hash = moe_cache_profile_hash(hash, (const char *)t.data + physical, part);
+                logical += part;
+                remaining -= part;
+            }
         }
     }
     return hash;
@@ -3911,12 +3950,13 @@ static bool moe_cache_resize_pool(moe_cache_device & device, moe_cache_pool & po
     pool.lru_tail = (int)retained.size() - 1;
     for (size_t i = 0; i < retained.size();) {
         size_t end = i + 1;
-        while (end < retained.size() && retained[end].key.tensor == retained[i].key.tensor &&
+        while (moe_cache_host_stride(device, retained[i].key.tensor, pool.expert_size) == pool.expert_size &&
+                end < retained.size() && retained[end].key.tensor == retained[i].key.tensor &&
                 retained[end].key.expert == retained[i].key.expert + (int32_t)(end - i)) {
             ++end;
         }
         const void * source = (const char *)retained[i].key.tensor +
-            (size_t)retained[i].key.expert * pool.expert_size;
+            (size_t)retained[i].key.expert * moe_cache_host_stride(device, retained[i].key.tensor, pool.expert_size);
         if (!moe_cache_cuda_ok(device, cudaMemcpy(pool.slab + i * pool.expert_size,
                 source, (end - i) * pool.expert_size, cudaMemcpyHostToDevice), "lend survivor refill", false)) {
             for (int j = 0; j < (int)retained.size(); ++j) {
@@ -4133,7 +4173,7 @@ static int moe_cache_warm(void * opaque, const ggml_moe_cache_tensor_desc * tens
             moe_cache_end(begin(i));
         }
     }
-    struct candidate { int tensor; int32_t expert; uint64_t count; bool current; };
+    struct candidate { int tensor; int32_t expert; uint64_t count; bool current; long double startup_score; };
     std::vector<candidate> ranked;
     ranked.reserve(entries);
     for (int i = 0; i < n_tensors; ++i) {
@@ -4142,17 +4182,22 @@ static int moe_cache_warm(void * opaque, const ggml_moe_cache_tensor_desc * tens
             if (loading && counts[i][e]) {
                 session->profile_counts[key] = counts[i][e];
             }
-            if (counts[i][e]) {
-                ranked.push_back({i, e, counts[i][e], !loading});
+            int layer = 0;
+            moe_cache_layer_number(tensors[i].name, layer);
+            const size_t bytes = ggml_row_size((ggml_type)tensors[i].type, tensors[i].n_in) * (size_t)tensors[i].n_out;
+            const long double priority = ((long double)counts[i][e] + 1) * (1 + 4.0L / (layer + 1)) / bytes;
+            if (counts[i][e] || loading) {
+                ranked.push_back({i, e, counts[i][e], !loading, priority});
             } else if (!loading) {
                 const auto previous = session->profile_counts.find(key);
                 if (previous != session->profile_counts.end()) {
-                    ranked.push_back({i, e, previous->second, false});
+                    ranked.push_back({i, e, previous->second, false, priority});
                 }
             }
         }
     }
-    std::stable_sort(ranked.begin(), ranked.end(), [](const candidate & a, const candidate & b) {
+    std::stable_sort(ranked.begin(), ranked.end(), [loading](const candidate & a, const candidate & b) {
+        if (loading && a.startup_score != b.startup_score) { return a.startup_score > b.startup_score; }
         if (a.current != b.current) {
             return a.current > b.current;
         }
@@ -4460,7 +4505,7 @@ static bool moe_cache_device_fallback(moe_cache_session & session,
         return false;
     }
     moe_cache_mapped_range range;
-    range.begin = (uintptr_t)table.desc.data + (size_t)expert * bytes;
+    range.begin = (uintptr_t)table.desc.data + (size_t)expert * table.host_stride;
     range.end = range.begin + bytes;
     if (cudaHostAlloc(&range.staging, bytes, cudaHostAllocPortable | cudaHostAllocMapped) != cudaSuccess) {
         (void) cudaGetLastError();
@@ -4631,7 +4676,7 @@ static void moe_cache_device_adapt(moe_cache_session & session) {
             if (source) {
                 pinned_source_bytes += pool.expert_size;
             } else {
-                source = (const char *)key.tensor + (size_t)key.expert * pool.expert_size;
+                source = (const char *)key.tensor + (size_t)key.expert * c.table->host_stride;
                 original_source_bytes += pool.expert_size;
             }
             const cudaError_t error = cudaMemcpy(destination, source, pool.expert_size, cudaMemcpyHostToDevice);
@@ -4747,7 +4792,8 @@ static bool moe_cache_device_op_fits(const moe_cache_session & session, const gg
     }
     const auto & d = found->second.desc;
     return w->type == d.type && w->ne[0] == d.n_in && w->ne[1] == d.n_out &&
-        w->ne[2] == d.n_expert && w->ne[3] == 1 && ggml_is_contiguous(w) &&
+        w->ne[2] == d.n_expert && w->ne[3] == 1 && ggml_is_contiguous_2(w) &&
+        w->nb[1] == ggml_row_size(w->type, w->ne[0]) && w->nb[2] == found->second.host_stride &&
         a->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32 && op->type == GGML_TYPE_F32 &&
         ggml_is_contiguous(a) && ggml_is_contiguous(op) &&
         ids->nb[0] == sizeof(int32_t) && ids->nb[1] % sizeof(int32_t) == 0 &&
@@ -4964,13 +5010,24 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
                 return fail();
             }
             const uintptr_t base = (uintptr_t) d.data;
-            const size_t bytes = d.expert_size * (size_t) d.n_expert;
+            const size_t expert_bytes = ggml_row_size((ggml_type)d.type, d.n_in) * (size_t)d.n_out;
+            const size_t bytes = d.expert_size * (size_t)(d.n_expert - 1) + expert_bytes;
             if (base > UINTPTR_MAX - bytes || base + bytes > UINTPTR_MAX - page ||
                     session->device_tables.count(d.data)) {
                 return fail();
             }
             moe_cache_device_table table;
             table.desc = d;
+            table.desc.expert_size = expert_bytes;
+            table.host_stride = d.expert_size;
+            cudaPointerAttributes attributes{};
+            if (cudaPointerGetAttributes(&attributes, d.data) == cudaSuccess && attributes.type == cudaMemoryTypeHost) {
+                void * alias = nullptr;
+                if (cudaHostGetDevicePointer(&alias, const_cast<void *>(d.data), 0) == cudaSuccess) {
+                    table.borrowed = alias;
+                }
+            }
+            (void)cudaGetLastError();
             table.addresses.resize(d.n_expert);
             table.fallback.resize(d.n_expert);
             table.copy_source.resize(d.n_expert);
@@ -4979,23 +5036,24 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
             for (int32_t e = 0; e < d.n_expert; ++e) {
                 const void * address = nullptr;
                 for (const auto & pool : device.pools) {
-                    if (pool->expert_size != d.expert_size || pool->wtype != d.type) {
+                    if (pool->expert_size != expert_bytes || pool->wtype != d.type) {
                         continue;
                     }
                     const auto found = pool->map.find({d.data, e});
                     if (found != pool->map.end() && pool->slots[found->second].state == moe_cache_slot_state::valid) {
-                        address = pool->slab + (size_t) found->second * d.expert_size;
-                        hot_bytes += d.expert_size;
+                        address = pool->slab + (size_t) found->second * expert_bytes;
+                        hot_bytes += expert_bytes;
                         break;
                     }
                 }
                 const uintptr_t begin = base + (size_t)e * d.expert_size;
                 size_t source_range = 0;
-                table.fallback[e] = mappings.find(begin, d.expert_size, &source_range);
-                if (!address && table.fallback[e]) { retained_needed[source_range] = 1; }
+                table.fallback[e] = table.borrowed ? (const char *)table.borrowed + (size_t)e * table.host_stride :
+                    mappings.find(begin, expert_bytes, &source_range);
+                if (!table.borrowed && !address && table.fallback[e]) { retained_needed[source_range] = 1; }
                 if (!address && !table.fallback[e]) {
                     pending_ranges.push_back({begin & ~(page - 1),
-                            (begin + d.expert_size + page - 1) & ~(page - 1), nullptr, nullptr, false});
+                            (begin + expert_bytes + page - 1) & ~(page - 1), nullptr, nullptr, false});
                 }
                 table.addresses[e] = address;
             }
@@ -5065,7 +5123,7 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
                 new_bytes += (resident & 1) ? 0 : page;
             }
         }
-        const size_t margin = 2ull << 30;
+        const size_t margin = ranges.empty() ? 0 : 2ull << 30;
         const size_t floor = 10ull << 30;
         const size_t available = moe_cache_mem_available();
         MOE_CACHE_LOG("[moe-cache] device preflight: hot=%zu MiB map=%zu MiB nonresident=%zu MiB ranges=%zu available=%zu MiB\n",
@@ -5138,7 +5196,7 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
             for (const auto & entry : session->device_tables) {
                 const auto & d = entry.second.desc;
                 const uintptr_t bank_begin = (uintptr_t)d.data;
-                const size_t bank_bytes = d.expert_size * (size_t)d.n_expert;
+                const size_t bank_bytes = entry.second.host_stride * (size_t)(d.n_expert - 1) + d.expert_size;
                 if (range.begin >= bank_begin && range.end - bank_begin <= bank_bytes) {
                     contained = true;
                     break;
@@ -5226,11 +5284,12 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
                 }
             }
             for (size_t e = 0; e < table.addresses.size(); ++e) {
-                const uintptr_t host = (uintptr_t)table.desc.data + e * table.desc.expert_size;
+                const uintptr_t host = (uintptr_t)table.desc.data + e * table.host_stride;
                 size_t source_range = 0;
-                table.fallback[e] = mappings.find(host, table.desc.expert_size, &source_range);
-                table.copy_source[e] = nullptr;
-                if (table.fallback[e]) {
+                table.fallback[e] = table.borrowed ? (const char *)table.borrowed + e * table.host_stride :
+                    mappings.find(host, table.desc.expert_size, &source_range);
+                table.copy_source[e] = table.borrowed ? (const void *)host : nullptr;
+                if (table.fallback[e] && !table.borrowed) {
                     // find() proved complete containment in this descriptor-bound
                     // retained range. Never use its CUDA alias as a host pointer.
                     const auto & range = session->mapped_ranges[source_range];

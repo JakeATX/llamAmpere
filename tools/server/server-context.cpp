@@ -2437,6 +2437,12 @@ private:
                 common_host_memory(total_host, avail_host);
                 std::string why;
                 cache_ram_mib = common_prompt_cache_ram_auto_mib(total_host, avail_host, why);
+                if (llama_model_moe_arena_size(model_tgt) > 0) {
+                    const uint64_t reserve = 11ull << 30;
+                    const uint64_t spare = avail_host > reserve ? avail_host - reserve : 0;
+                    cache_ram_mib = (int32_t)std::min<uint64_t>(cache_ram_mib, spare >> 20);
+                    why += ", expert arena keeps 11 GiB host headroom";
+                }
                 SRV_INF("prompt cache RAM tier: %d MiB (auto: %s; set --cache-ram N to override, 0 disables the prompt cache)\n",
                         cache_ram_mib, why.c_str());
             } else if (cache_ram_mib < 0) {

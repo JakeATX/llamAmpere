@@ -9185,7 +9185,7 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     // expert streamer uses it for GGML_SCHED_XSTREAM_PIN_MIB)
     if (strcmp(name, "ggml_backend_cuda_host_pin") == 0) {
         return (void *) +[](void * ptr, size_t size) -> bool {
-            cudaError_t err = cudaHostRegister(ptr, size, cudaHostRegisterPortable);
+            cudaError_t err = cudaHostRegister(ptr, size, cudaHostRegisterPortable | cudaHostRegisterMapped);
             if (err != cudaSuccess) {
                 (void) cudaGetLastError();
                 GGML_LOG_WARN("%s: failed to page-lock %.1f MiB: %s\n", "ggml_backend_cuda_host_pin", size/1048576.0,
