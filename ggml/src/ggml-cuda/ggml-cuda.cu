@@ -3889,7 +3889,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_mul_mat(ctx, dst->src[0], dst->src[1], dst);
             break;
         case GGML_OP_MUL_MAT_ID:
-            ggml_cuda_mul_mat_id(ctx, dst);
+            if (!ggml_cuda_moe_cache_device_compute(ctx, dst)) {
+                ggml_cuda_mul_mat_id(ctx, dst);
+            }
             break;
         case GGML_OP_OUT_PROD:
             ggml_cuda_out_prod(ctx, dst);
@@ -4293,10 +4295,18 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
     bool use_cuda_graph = true;
+    const bool device_cache_capture = ggml_cuda_moe_cache_device_capture_generation(ggml_cuda_get_device()) != 0;
     // Loop over nodes in GGML graph to obtain info needed for CUDA graph
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
+        const bool device_cache = ggml_cuda_moe_cache_device_supports(node, ggml_cuda_get_device());
+        if (device_cache && !device_cache_capture) {
+            if (why_node) {
+                *why_node = node;
+            }
+            return false;
+        }
 
         if (ggml_cuda_is_view_or_noop(node)) {
             continue;
@@ -4340,7 +4350,7 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
         if (node->op == GGML_OP_MUL_MAT_ID) {
             const bool is_tq_w = (node->src[0]->type == GGML_TYPE_TQ4_1S || node->src[0]->type == GGML_TYPE_TQ3_1S);
             const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-            if (ggml_cuda_mul_mat_id_needs_sync(node, cc)) {
+            if (!device_cache && ggml_cuda_mul_mat_id_needs_sync(node, cc)) {
                 // the mul_mat_id fallback path synchronizes the stream, so we cannot use CUDA graphs
                 // ref: https://github.com/ggml-org/llama.cpp/pull/18958
                 use_cuda_graph = false;
@@ -4402,6 +4412,18 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     const uint64_t graph_key = ggml_cuda_graph_get_key(cgraph);
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
+    // This must precede the graph-uid shortcut: tensor pointers and uid may
+    // survive cache release, reprepare, or a switch to another active session.
+    const uint64_t moe_cache_generation = ggml_cuda_moe_cache_device_capture_generation(cuda_ctx->device);
+    const bool moe_cache_changed = graph->moe_cache_generation != moe_cache_generation;
+    if (moe_cache_changed) {
+        graph->moe_cache_generation = moe_cache_generation;
+        res = true;
+        if (change) {
+            change->what = "moe_cache_generation";
+        }
+    }
+
     // A live tensor can only reference a KV streaming runtime by holding a
     // reference to its buffer, which in turn holds a reference to the
     // runtime (see ggml_backend_cuda_kv_stream_buffer_free) - so no live
@@ -4429,7 +4451,7 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
         }
     }
 
-    if (cgraph->uid != 0 &&
+    if (!moe_cache_changed && cgraph->uid != 0 &&
         cgraph->uid == graph->uid &&
         kv_stream_generation == previous_kv_stream_generation) {
         GGML_LOG_DEBUG("CUDA Graph id %zu reused\n", cgraph->uid);
@@ -5589,6 +5611,11 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
                                int                                       node_idx,
                                std::initializer_list<enum ggml_op>       ops,
                                std::initializer_list<enum ggml_unary_op> unary_ops) {
+    for (size_t j = 0; j < ops.size() && node_idx + j < (size_t) cgraph->n_nodes; ++j) {
+        if (ggml_cuda_moe_cache_device_supports(cgraph->nodes[node_idx + j], ggml_cuda_get_device())) {
+            return false;
+        }
+    }
 #ifndef NDEBUG
     const size_t num_unary = std::count(ops.begin(), ops.end(), GGML_OP_UNARY);
     GGML_ASSERT(unary_ops.size() == num_unary);
@@ -6354,6 +6381,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+    if (ggml_cuda_moe_cache_device_supports(node, cuda_ctx->device)) {
+        return 0;
+    }
 
     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
             ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&
@@ -7467,6 +7497,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         }
         // Launch graph
         CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+        ggml_cuda_moe_cache_device_graph_record(cuda_ctx->device, cuda_graph_update_required);
 #else
         GGML_UNUSED(graph_key);
         graph_evaluated_or_captured = true;
@@ -8274,6 +8305,9 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_host_buffer_type(
 // TODO: move these functions here
 static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
+    if (ggml_cuda_moe_cache_device_supports(op, dev_ctx->device)) {
+        return true;
+    }
     bool uses_streamed_kv = false;
 
     // A source in pinned host memory is addressable but only at PCIe speed, measured here at

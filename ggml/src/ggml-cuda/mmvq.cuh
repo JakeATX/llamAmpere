@@ -44,3 +44,9 @@ void ggml_cuda_moe_cache_mmv_fused(
     int64_t slot_stride_bytes, int64_t n_hits, int64_t act_rows,
     float up_min, float up_max, float gate_min, float gate_max,
     cudaStream_t stream);
+
+// fork: fixed addresses preserve device routing for cached and mapped experts.
+void ggml_cuda_moe_table_mmv(const void * const * table, ggml_type type,
+        const char * act_q8, const int32_t * ids, float * dst,
+        int64_t n_in, int64_t n_out, int64_t n_ids, int64_t n_tokens,
+        int64_t act_channels, int64_t ids_stride, cudaStream_t stream);
