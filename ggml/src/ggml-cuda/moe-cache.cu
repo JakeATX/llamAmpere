@@ -8,7 +8,7 @@ extern "C" size_t ggml_moe_cache_trim(int device) {
 }
 
 uint64_t ggml_cuda_moe_cache_device_capture_generation(int) { return 0; }
-void ggml_cuda_moe_cache_device_graph_record(int, bool) {}
+void ggml_cuda_moe_cache_device_graph_record(int, bool, const ggml_cgraph *) {}
 bool ggml_cuda_moe_cache_device_supports(const ggml_tensor *, int) { return false; }
 bool ggml_cuda_moe_cache_device_compute(ggml_backend_cuda_context &, ggml_tensor *) { return false; }
 bool ggml_cuda_moe_cache_device_fused_compute(ggml_backend_cuda_context &, ggml_tensor *, ggml_tensor *, ggml_tensor *) { return false; }
@@ -4855,12 +4855,29 @@ uint64_t ggml_cuda_moe_cache_device_capture_generation(int logical) {
     return session->device_capture_generation;
 }
 
-void ggml_cuda_moe_cache_device_graph_record(int logical, bool captured) {
+void ggml_cuda_moe_cache_device_graph_record(int logical, bool captured, const ggml_cgraph * graph) {
     if (!ggml_cuda_moe_cache_device_capture_generation(logical)) {
         return;
     }
     auto * session = g_session_stack.back().active;
     (captured ? session->device_captures : session->device_replays).fetch_add(1, std::memory_order_relaxed);
+    if (session->prefetch_enabled && graph) {
+        // Replay bypasses the host dispatch hooks. Only count staged projections
+        // present in this successfully launched graph, including fused gate/up.
+        std::lock_guard<std::mutex> lock(session->mu);
+        for (const auto & copy : session->predictions) {
+            if (!copy->published || copy->used) {
+                continue;
+            }
+            for (int i = 0; i < graph->n_nodes; ++i) {
+                const auto * node = graph->nodes[i];
+                if (node->op == GGML_OP_MUL_MAT_ID && node->src[0] && node->src[0]->data == copy->tensor) {
+                    copy->used = true;
+                    break;
+                }
+            }
+        }
+    }
 }
 
 // Initial resident experts need no host pin. Before evicting one, retain an

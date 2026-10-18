@@ -3541,6 +3541,7 @@ static bool run_prefetch_staging(ggml_backend_t gpu, ggml_backend_t cpu,
     set_env("GGML_MOE_CACHE_DEVICE", device_mode ? "1" : nullptr);
     set_env("GGML_MOE_CACHE_DEVICE_CAPTURE", device_mode ? "1" : nullptr);
     set_env("GGML_MOE_CACHE_DEVICE_FUSED", gate_weights ? "1" : nullptr);
+    set_env("GGML_MOE_CACHE_DEVICE_STATS", device_mode ? "1" : nullptr);
     capture.clear();
     const auto api = active_api();
     if (!api.prefetch || !api.prefetch_observe || !api.prefetch_configure) {
@@ -3603,7 +3604,7 @@ static bool run_prefetch_staging(ggml_backend_t gpu, ggml_backend_t cpu,
             ok &= first == actual;
         }
     };
-    for (int round = 0; round < 2 && ok; ++round) {
+    for (int round = 0; round < 4 && ok; ++round) {
         api.session_enter(session);
         api.prefetch_observe(session, 0, nullptr, 0);
         // Establish a generous real interval; completion is polled, not assumed.
@@ -3645,8 +3646,11 @@ static bool run_prefetch_staging(ggml_backend_t gpu, ggml_backend_t cpu,
     }
     api.session_destroy(session);
     const std::string log = capture.get();
-    ok &= count_occurrences(log, "[moe-prefetch] ") == 2 * banks;
-    ok &= count_occurrences(log, "outcome=used") == 2 * banks;
+    ok &= count_occurrences(log, "[moe-prefetch] ") == 4 * banks;
+    ok &= count_occurrences(log, "outcome=used") == 4 * banks;
+    if (device_mode) {
+        ok &= max_field_value(log, "replays=") > 0;
+    }
     ok &= log.find("expert=0 ") == std::string::npos;
     ok &= max_field_value(log, "fill-fail=") == 0;
     free_graph(candidate);
@@ -3658,6 +3662,7 @@ static bool run_prefetch_staging(ggml_backend_t gpu, ggml_backend_t cpu,
     set_env("GGML_MOE_CACHE_DEVICE", nullptr);
     set_env("GGML_MOE_CACHE_DEVICE_CAPTURE", nullptr);
     set_env("GGML_MOE_CACHE_DEVICE_FUSED", nullptr);
+    set_env("GGML_MOE_CACHE_DEVICE_STATS", nullptr);
     printf("cache-prefetch-staging-%s: %s\n", gate_weights ? "fused" : device_mode ? "device" : "legacy", ok ? "OK" : "FAIL");
     if (!ok) {
         fprintf(stderr, "%s", log.c_str());
