@@ -4419,9 +4419,6 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     if (moe_cache_changed) {
         graph->moe_cache_generation = moe_cache_generation;
         res = true;
-        if (change) {
-            change->what = "moe_cache_generation";
-        }
     }
 
     // A live tensor can only reference a KV streaming runtime by holding a
