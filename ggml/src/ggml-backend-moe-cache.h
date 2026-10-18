@@ -42,6 +42,7 @@ struct ggml_moe_cache_shape_caps {
 struct ggml_moe_cache_tensor_desc {
     const char * name;
     const void * data;
+    // Host byte stride between experts; device storage uses the compact row bytes.
     size_t expert_size;
     int64_t n_in;
     int64_t n_out;

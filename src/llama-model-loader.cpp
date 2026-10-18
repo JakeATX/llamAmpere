@@ -2005,6 +2005,9 @@ std::unique_ptr<llama_moe_arena> llama_model_loader::load_moe_arena(llama_progre
                 llama_moe_arena::available_memory() / double(GiB));
     }
     arena->pin();
+    if (llama_moe_arena::available_memory() < (10ull << 30)) {
+        throw std::runtime_error("expert arena pinning left less than 10 GiB MemAvailable");
+    }
     LLAMA_LOG_INFO("%s: %.2f GiB pinned, gate/up/down grouped by expert, original weight blocks preserved\n", __func__, total / double(GiB));
     return arena;
 }
