@@ -4297,6 +4297,8 @@ static bool run_arena_stride(ggml_backend_t gpu, ggml_backend_t cpu,
     ok &= registered;
     if (registered) {
         ok &= run_device_tables_case(gpu, cpu, weights, capture);
+        // The second projection starts inside the same registered allocation.
+        ok &= run_device_tables_case(gpu, cpu, gate, capture);
         unsigned int flags = 0;
         // Cache/table teardown must leave the model-owned registration alive.
         ok &= cudaHostGetFlags(&flags, arena) == cudaSuccess;
