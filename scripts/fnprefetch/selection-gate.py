@@ -27,8 +27,8 @@ def run(label,device,mode,binary):
  row={'label':label,'device':device,'mode':mode,'decode_tokens_per_second':result['final']['timings']['predicted_per_second'],'copies_used':log.count('outcome=used'),'path':str(path)}
  results.append(row); print(json.dumps(row),flush=True)
  return row
-controls=[run('select-off-device'+str(d),d,'off',baseline) for d in (0,1)]
-device=max(controls,key=lambda r:r['decode_tokens_per_second'])['device']
+device=0 # Accepted host provider; optional device provider has separate readiness gates.
+run('select-off-device0',device,'off',baseline)
 for mode in ('1','2','3','auto'):run('select-prefetch-'+mode,device,mode,frozen)
 choices=[r for r in results if r['mode']!='off' and r['copies_used']>0]
 assert choices,'no consumed prefetch copies in depth selection'

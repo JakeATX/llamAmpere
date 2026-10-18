@@ -1,5 +1,5 @@
 # Adapted from the ship integration cache gate, using this task's binary and paths.
-import os,sys,json,time,subprocess,signal,threading,hashlib,struct,shutil,re
+import os,sys,json,time,subprocess,signal,threading,hashlib,struct,shutil,re,runpy
 from pathlib import Path
 import requests
 R=Path('/mnt/models/fnprefetch'); arm='flashnext'; (R/'artifacts').mkdir(exist_ok=True); O=R/'artifacts'/os.environ.get('FN_RELOAD_CELL',sys.argv[1]);O.mkdir(exist_ok=False); C=O/'cache';C.mkdir(); port=18147; prompt_n=int(os.environ.get('FN_RELOAD_PROMPT','8192')); predict_n=int(os.environ.get('FN_RELOAD_PREDICT','128')); limit=int(os.environ.get('FN_RELOAD_LIMIT','550'))
@@ -52,6 +52,8 @@ if arm=='flashnext':
  env['LLAMA_B1_CACHE_WARM']='1'
  env['GGML_MOE_CACHE_DEVICE']=os.environ.get('FN_RELOAD_DEVICE','0')
  env['GGML_MOE_CACHE_DEVICE_CAPTURE']=os.environ.get('FN_RELOAD_DEVICE','0')
+ env['GGML_MOE_CACHE_DEVICE_STATS']=os.environ.get('FN_RELOAD_DEVICE','0')
+ env['GGML_MOE_CACHE_DEVICE_FUSED']='0'
  env['GGML_MOE_CACHE_PROFILE_LOAD']=os.environ.get('FN_RELOAD_PROFILE','')
 if os.environ.get('FN_RELOAD_SERVER'):
  base[0]=os.environ['FN_RELOAD_SERVER']
@@ -143,6 +145,9 @@ try:
  phase='live-continuation';result['live_continuation']=post('/completion',continuation)[1]
  (O/'live-continuation.json').write_text(json.dumps(result['live_continuation']))
  assert result['live_continuation']['tokens_predicted']==64 and len(result['live_continuation']['tokens'])==64,'live continuation count'
+ if env.get('GGML_MOE_CACHE_DEVICE')=='1':
+  audit=runpy.run_path(str(Path(__file__).resolve().with_name('device-evidence.py')))['device_evidence']
+  result['cold_device_evidence']=audit((O/'cold.server.log').read_text())
  launch('restart');phase='restore';result['restore']=action('restore')[1]
  assert result['save']['n_saved']==result['restore']['n_restored'],'restored count'
  result['resave']=post('/slots/0?action=save',{'filename':'roundtrip.bin'})[1]
@@ -153,6 +158,7 @@ try:
  (O/'reload-continuation.json').write_text(json.dumps(result['reload_continuation']))
  assert result['reload_continuation']['tokens_predicted']==64 and len(result['reload_continuation']['tokens'])==64,'reload continuation count'
  result['reload_tokens_exact']=result['live_continuation']['tokens']==result['reload_continuation']['tokens']
+ if env.get('GGML_MOE_CACHE_DEVICE')=='1':result['restart_device_evidence']=audit((O/'restart.server.log').read_text())
  # CPU/GPU rounding may change sampled words; report the comparison without rejecting valid math.
  assert result['reload_continuation']['timings']['prompt_n'] <= len(continuation['prompt'])-result['save']['n_saved']+1,'saved prefix reprocessed'
  # Corrupt only our sidecar. Both binding and MTP payload errors must reject the restore without stopping the server.

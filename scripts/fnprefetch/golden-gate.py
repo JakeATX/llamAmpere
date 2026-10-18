@@ -1,4 +1,4 @@
-import hashlib, json, os, shutil, signal, subprocess, time
+import hashlib, json, os, runpy, shutil, signal, subprocess, time
 from pathlib import Path
 root=Path('/mnt/models/fnprefetch')
 assert os.environ.get('PARENT_HOLDS_GPU_LOCK')=='1'
@@ -27,6 +27,9 @@ for mode in modes:
  assert mode in ('off','1','2','3','auto','baseline')
  env=dict(os.environ,**config['env'], FN_GOLDEN_IDS=str(root/'protocol/golden-ids.bin'),FN_GOLDEN_LOGITS=str(mode_dir/f'golden-{mode}.f32'),CUDA_CACHE_PATH=str(root/'cuda-cache'),TMPDIR=str(root/'tmp-build'), LD_LIBRARY_PATH=str(lib))
  env['GGML_MOE_CACHE_DEVICE']=os.environ.get('FN_GOLDEN_DEVICE','0')
+ env['GGML_MOE_CACHE_DEVICE_CAPTURE']=env['GGML_MOE_CACHE_DEVICE']
+ env['GGML_MOE_CACHE_DEVICE_STATS']=env['GGML_MOE_CACHE_DEVICE']
+ env['GGML_MOE_CACHE_DEVICE_FUSED']='0'
  env['LLAMA_B1_CACHE_WARM']='1'
  env['GGML_CUDA_MOE_CACHE_RESERVE_MB']='2560'
  with (mode_dir/f'golden-{mode}.log').open('w') as log:
@@ -53,4 +56,7 @@ for mode in modes:
  assert process.returncode==0,(mode,process.returncode)
  assert runtime,'loaded CUDA project libraries were not verified'
  assert 'roundtrip=exact' in (mode_dir/f'golden-{mode}.log').read_text()
+ if env['GGML_MOE_CACHE_DEVICE']=='1':
+  evidence=runpy.run_path(str(Path(__file__).resolve().with_name('device-evidence.py')))['device_evidence']((mode_dir/f'golden-{mode}.log').read_text())
+  (mode_dir/f'golden-{mode}.device.json').write_text(json.dumps(evidence,indent=2))
 print('Fixed-token logits and exact saved-state round trips completed: '+','.join(modes),flush=True)

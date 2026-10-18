@@ -16,5 +16,7 @@
   "selection": "choose depth on separate short diagnostics before any full comparison; freeze flags and loaded library hashes per arm",
   "baseline": "current gated fn/ship frozen build available at first full run",
   "full_context_reserve_mib": 1024,
-  "reserve_gate": "100K+128 development gate with single-pass B1 required, whole-card VRAM <=23552MiB; all short model/reload gates retain2560MiB. Matched full arms use the same passing reserve."
+  "reserve_gate": "100K+128 development gate with single-pass B1 required, whole-card VRAM <=23552MiB; all short model/reload gates retain2560MiB. Matched full arms use the same passing reserve.",
+  "provider": "accepted host cache, GGML_MOE_CACHE_DEVICE=0 and FUSED=0 in both arms",
+  "provider_revision": "2026-10-18 23:40Z, before any full arm: optional device provider has unresolved active-after-warm certification; retained as a separate correctness gate"
 }
