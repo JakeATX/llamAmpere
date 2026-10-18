@@ -3535,11 +3535,12 @@ static bool run_prefetch_router(ggml_backend_t gpu, ggml_backend_t cpu) {
 
 // Exercise actual copies, selected publication, retirement, and same-graph reuse.
 static bool run_prefetch_staging(ggml_backend_t gpu, ggml_backend_t cpu,
-        ggml_tensor * weights, log_capture & capture, bool device_mode) {
+        ggml_tensor * weights, log_capture & capture, bool device_mode, ggml_tensor * gate_weights = nullptr) {
     configure_cache(nullptr, "8");
     set_env("GGML_CUDA_MOE_CACHE_BUDGET_MB", "16");
     set_env("GGML_MOE_CACHE_DEVICE", device_mode ? "1" : nullptr);
     set_env("GGML_MOE_CACHE_DEVICE_CAPTURE", device_mode ? "1" : nullptr);
+    set_env("GGML_MOE_CACHE_DEVICE_FUSED", gate_weights ? "1" : nullptr);
     capture.clear();
     const auto api = active_api();
     if (!api.prefetch || !api.prefetch_observe || !api.prefetch_configure) {
@@ -3550,16 +3551,21 @@ static bool run_prefetch_staging(ggml_backend_t gpu, ggml_backend_t cpu,
         return false;
     }
     api.prefetch_configure(session, 1);
-    const ggml_moe_cache_tensor_desc desc = {"blk.1.ffn_up_exps.weight", weights->data,
-        weights->nb[2], weights->ne[0], weights->ne[1], weights->ne[2], (int32_t) weights->type};
+    ggml_moe_cache_tensor_desc descriptors[2] = {};
+    const int banks = gate_weights ? 2 : 1;
+    for (int i = 0; i < banks; ++i) {
+        auto * w = i ? gate_weights : weights;
+        descriptors[i] = {i ? "blk.1.ffn_gate_exps.weight" : "blk.1.ffn_up_exps.weight", w->data,
+            w->nb[2], w->ne[0], w->ne[1], w->ne[2], (int32_t) w->type};
+    }
     std::vector<uint64_t> usage(weights->ne[2], 0);
     for (int i = 0; i < 8; ++i) {
         usage[i] = 100;
     }
-    const uint64_t * counts[] = {usage.data()};
-    bool ok = api.warm(session, &desc, counts, 1) == 8;
+    const uint64_t * counts[] = {usage.data(), usage.data()};
+    bool ok = api.warm(session, descriptors, counts, banks) == 8 * banks;
     if (device_mode) {
-        ok &= api.device_prepare(session, &desc, 1) == 1;
+        ok &= api.device_prepare(session, descriptors, banks) == 1;
     }
     ggml_init_params params = {4 * ggml_tensor_overhead(), nullptr, true};
     ggml_context * host = ggml_init(params);
@@ -3576,9 +3582,14 @@ static bool run_prefetch_staging(ggml_backend_t gpu, ggml_backend_t cpu,
     ggml_backend_tensor_set(card_acts, values.data(), 0, values.size() * sizeof(float));
     ggml_backend_tensor_set(host_ids, route, 0, sizeof(route));
     ggml_backend_tensor_set(card_ids, route, 0, sizeof(route));
-    test_graph reference = make_graph(cpu, weights, host_acts, host_ids);
-    test_graph candidate = make_graph(device_mode ? gpu : cpu, weights,
-            device_mode ? card_acts : host_acts, device_mode ? card_ids : host_ids);
+    test_graph reference = gate_weights ? make_fused_graph(cpu, weights, gate_weights, host_acts, host_ids) :
+            make_graph(cpu, weights, host_acts, host_ids);
+    test_graph candidate = gate_weights ? make_fused_graph(gpu, weights, gate_weights, card_acts, card_ids) :
+            make_graph(device_mode ? gpu : cpu, weights,
+                    device_mode ? card_acts : host_acts, device_mode ? card_ids : host_ids);
+    auto fusion_count = (int64_t (*)(ggml_backend_t, const char *)) ggml_backend_reg_get_proc_address(
+            ggml_backend_dev_backend_reg(ggml_backend_get_device(gpu)), "ggml_backend_cuda_fusion_count");
+    const int64_t fused_before = gate_weights && fusion_count ? fusion_count(gpu, "mul_mat_glu") : 0;
     ok &= ggml_backend_graph_compute(cpu, reference.graph) == GGML_STATUS_SUCCESS;
     std::vector<float> expected(ggml_nelements(reference.out)), actual(expected.size()), first;
     ggml_backend_tensor_get(reference.out, expected.data(), 0, expected.size() * sizeof(float));
@@ -3600,13 +3611,17 @@ static bool run_prefetch_staging(ggml_backend_t gpu, ggml_backend_t cpu,
         api.prefetch_observe(session, 1, nullptr, 0);
         api.prefetch_observe(session, 0, nullptr, 0);
         const int32_t ranked[] = {0, 63}; // Resident expert must not be copied.
-        api.prefetch(session, &desc, 1, ranked, 2, 0, 1, 0);
+        api.prefetch(session, descriptors, banks, ranked, 2, 0, 1, 0);
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
         bool completed = false;
         do {
             // Planning also exercises promotion when demand reaches a queued prediction.
-            completed = direct_plan_one(desc.name, desc.data, desc.expert_size,
-                    desc.n_in, desc.n_out, desc.type, desc.n_expert, 63) == 1;
+            completed = true;
+            for (int i = 0; i < banks; ++i) {
+                const auto & desc = descriptors[i];
+                completed &= direct_plan_one(desc.name, desc.data, desc.expert_size,
+                        desc.n_in, desc.n_out, desc.type, desc.n_expert, 63) == 1;
+            }
             if (!completed) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
@@ -3625,10 +3640,13 @@ static bool run_prefetch_staging(ggml_backend_t gpu, ggml_backend_t cpu,
         }
         api.session_leave(session);
     }
+    if (gate_weights) {
+        ok &= fusion_count && fusion_count(gpu, "mul_mat_glu") > fused_before;
+    }
     api.session_destroy(session);
     const std::string log = capture.get();
-    ok &= count_occurrences(log, "[moe-prefetch] ") == 2;
-    ok &= count_occurrences(log, "outcome=used") == 2;
+    ok &= count_occurrences(log, "[moe-prefetch] ") == 2 * banks;
+    ok &= count_occurrences(log, "outcome=used") == 2 * banks;
     ok &= log.find("expert=0 ") == std::string::npos;
     ok &= max_field_value(log, "fill-fail=") == 0;
     free_graph(candidate);
@@ -3639,7 +3657,8 @@ static bool run_prefetch_staging(ggml_backend_t gpu, ggml_backend_t cpu,
     ggml_free(host);
     set_env("GGML_MOE_CACHE_DEVICE", nullptr);
     set_env("GGML_MOE_CACHE_DEVICE_CAPTURE", nullptr);
-    printf("cache-prefetch-staging-%s: %s\n", device_mode ? "device" : "legacy", ok ? "OK" : "FAIL");
+    set_env("GGML_MOE_CACHE_DEVICE_FUSED", nullptr);
+    printf("cache-prefetch-staging-%s: %s\n", gate_weights ? "fused" : device_mode ? "device" : "legacy", ok ? "OK" : "FAIL");
     if (!ok) {
         fprintf(stderr, "%s", log.c_str());
     }
@@ -4819,6 +4838,9 @@ int main(int argc, char ** argv) {
     });
     ok &= run_optional(provider_is_cuda, "cache-prefetch-staging-device", [&] {
         return run_prefetch_staging(gpu, cpu, weights, capture, true);
+    });
+    ok &= run_optional(provider_is_cuda, "cache-prefetch-staging-fused", [&] {
+        return run_prefetch_staging(gpu, cpu, weights, capture, true, gate_weights);
     });
     ok &= run_optional(provider_is_cuda, "cache-device-tables", [&] {
         return run_device_tables(gpu, cpu, weights, capture);

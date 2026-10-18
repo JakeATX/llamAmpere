@@ -24,7 +24,8 @@ existing allocation. Demand eviction cannot overwrite these slots. Device
 dispatch publishes a completed staging address only after the real router
 selects that expert. The address is restored before the slot is reused.
 Legacy dispatch pins the staged entry through its normal collection path.
-Both paths retire speculative entries at the end of the graph scope.
+Both paths retire speculative entries at the end of the graph scope. The optional
+fused gate/up provider uses both staging tables and accounts for each copy.
 
 Each `[moe-prefetch]` log row describes one tensor projection copy:
 `source`, `target`, `expert`, `rank`, `bytes`, `issue_us`, `start_us`,
@@ -43,7 +44,8 @@ or source-buffer teardown.
 
 `test-moe-cache --prefetch-cpu-only` checks budget arithmetic and router
 ranking without discovering a GPU. The normal cache test also checks CUDA
-ranking and two rounds of copy, use, and retirement for both dispatch paths.
+ranking and two rounds of copy, use, and retirement for legacy, device, and
+fused device dispatch.
 `test-moe-prefetch-model` is a manual model gate: set `FN_GOLDEN_IDS` to
 2,080 fixed int32 token IDs and `FN_GOLDEN_LOGITS` to an output path. It
 writes 32 full-vocabulary logit rows and checks an exact saved-state round

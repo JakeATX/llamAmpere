@@ -5313,10 +5313,19 @@ bool ggml_cuda_moe_cache_device_fused_compute(ggml_backend_cuda_context & ctx,
     quantize_row_q8_1_cuda((const float *)a->data, nullptr, quantized, (ggml_type)up_table.desc.type,
             a->ne[0], a->nb[1] / sizeof(float), a->nb[2] / sizeof(float), a->nb[3] / sizeof(float),
             padded, a->ne[1], a->ne[2], 1, ctx.stream());
-    ggml_cuda_moe_table_mmv_fused(up_table.device, gate_table.device, (ggml_type)up_table.desc.type, quantized,
+    ggml_cuda_moe_table_mmv_fused(up_table.staging_device ? up_table.staging_device : up_table.device,
+            gate_table.staging_device ? gate_table.staging_device : gate_table.device, (ggml_type)up_table.desc.type, quantized,
             (const int32_t *)ids->data, (float *)glu->data, a->ne[0], glu->ne[0], ids->ne[0], ids->ne[1],
             a->ne[1], ids->nb[1] / sizeof(int32_t), ctx.stream());
     CUDA_CHECK(cudaGetLastError());
+    if (up_table.staging_device || gate_table.staging_device) {
+        std::lock_guard<std::mutex> lock(session.mu);
+        for (const auto & copy : session.predictions) {
+            if (copy->published && (copy->tensor == up->src[0]->data || copy->tensor == gate->src[0]->data)) {
+                copy->used = true;
+            }
+        }
+    }
     return true;
 }
 
