@@ -1074,11 +1074,14 @@ static bool ggml_gallocr_reserve_n_impl(
         }
     }
 
-    if (!no_alloc) {
-        for (int i = 0; i < galloc->n_buffers; i++) {
-            if (!ggml_gallocr_external_fits(galloc, i)) {
-                return false;
-            }
+    // A size query must leave existing backing buffers intact, including when
+    // the measured graph is larger and a later real reserve will grow them.
+    if (no_alloc) {
+        return true;
+    }
+    for (int i = 0; i < galloc->n_buffers; i++) {
+        if (!ggml_gallocr_external_fits(galloc, i)) {
+            return false;
         }
     }
 
@@ -1119,7 +1122,7 @@ static bool ggml_gallocr_reserve_n_impl(
 #endif
             ggml_vbuffer_free(galloc->buffers[i]);
             galloc->buffers[i] = NULL;
-            if (!no_alloc && galloc->donor != NULL && galloc->donor->buffers[i] != NULL && !galloc->donor->buffers[i]->borrowed) {
+            if (galloc->donor != NULL && galloc->donor->buffers[i] != NULL && !galloc->donor->buffers[i]->borrowed) {
                 // adopt the donor's buffer when every chunk is large enough (the graphs never run concurrently)
                 struct vbuffer * db = galloc->donor->buffers[i];
                 bool fits = true;
@@ -1173,9 +1176,7 @@ static bool ggml_gallocr_reserve_n_impl(
                     }
                 }
             }
-            if (no_alloc) {
-                galloc->buffers[i] = NULL;
-            } else if (galloc->buffers[i] == NULL) {
+            if (galloc->buffers[i] == NULL) {
                 galloc->buffers[i] = ggml_vbuffer_alloc(galloc->bufts[i], galloc->buf_tallocs[i], GGML_BACKEND_BUFFER_USAGE_COMPUTE);
                 if (galloc->buffers[i] == NULL) {
                     GGML_LOG_ERROR("%s: failed to allocate %s buffer of size %zu\n", __func__, ggml_backend_buft_name(galloc->bufts[i]), new_size);
