@@ -129,3 +129,28 @@ def activation_device_copies(log, start, end, total, output_dir):
     return dict(activation_device_copy_bytes=observed, positive_calls=calls, remaining_read_bytes=total-observed,
                 intervals=[(tid, begin, finish) for tid, spans in windows.items() for begin, finish in spans],
                 scope='Successful CUDA device-to-owned-output copies only; exact device source checked before I/O counters, no context synchronization or host callback.')
+
+
+def activation_layout(log, start, end, total, output_dir):
+    """Count only pure checkpoint metadata operations with verified operands."""
+    if 'FNARENA_LAYOUT_IO_ERROR' in log:
+        raise ValueError('layout operand or counter unavailable')
+    pattern = re.compile(r'^FNARENA_LAYOUT_IO op=(write|compare) start=([0-9.]+) end=([0-9.]+) tid=([0-9]+) read_bytes=([0-9]+) offset=([0-9]+) bytes=([0-9]+) path=(.+)$')
+    translated = []
+    marker = 'FNARENA_LAYOUT_IO '
+    if log and not log.endswith('\n'):
+        tail = log.rsplit('\n', 1)[-1]
+        if tail and ('FNARENA_LAYOUT_IO' in tail or 'FNARENA_LAYOUT_IO'.startswith(tail)):
+            raise ValueError('incomplete layout trace')
+    for line in log.splitlines():
+        if not line.startswith(marker):
+            continue
+        match = pattern.fullmatch(line)
+        if not match:
+            raise ValueError('invalid layout trace')
+        op, begin, finish, tid, count, offset, size, path = match.groups()
+        translated.append(f'FNARENA_ACTIVATION_IO start={begin} end={finish} tid={tid} read_bytes={count} offset={offset} bytes={size} scope=owned_output_memcpy path={path}')
+    result = activation_copies('\n'.join(translated), start, end, total, output_dir)
+    result['activation_layout_bytes'] = result.pop('activation_copy_bytes')
+    result['scope'] = 'Only pure checkpoint layout memcpy/memcmp with a verified owned output mapping and an anonymous metadata operand; no flush, synchronization or model-file operand.'
+    return result

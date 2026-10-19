@@ -6965,13 +6965,15 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
 // tensors (fill), or checks that a later layout is the same one (check)
 class llama_io_write_layout : public llama_io_write_i {
   public:
-    llama_io_write_layout(uint8_t * blob, size_t capacity, std::vector<llama_context::ckpt_write> & writes, bool check) :
-        blob(blob), capacity(capacity), writes(writes), check(check) {}
+    llama_io_write_layout(uint8_t * blob, size_t capacity, std::vector<llama_context::ckpt_write> & writes, bool check, bool file_backed) :
+        blob(blob), capacity(capacity), writes(writes), check(check), file_backed(file_backed) {}
 
     void write(const void * src, size_t size) override {
         if (off > capacity || size > capacity - off) { throw std::runtime_error("checkpoint layout exceeds size pass"); }
         if (check) {
-            same = same && memcmp(blob + off, src, size) == 0;
+            same = same && (file_backed ? llama_compare_moe_output(blob + off, src, size) : memcmp(blob + off, src, size)) == 0;
+        } else if (file_backed) {
+            llama_write_moe_output(blob + off, src, size);
         } else {
             memcpy(blob + off, src, size);
         }
@@ -7000,6 +7002,7 @@ class llama_io_write_layout : public llama_io_write_i {
     const size_t                            capacity;
     std::vector<llama_context::ckpt_write> & writes;
     const bool check;
+    const bool file_backed;
 
     size_t off  = 0;
     size_t iw   = 0;
@@ -7129,7 +7132,7 @@ void llama_context::capture_ubatch(const llama_ubatch & ubatch, int32_t il0, int
                         c.blob.resize(bytes);
                     }
                 }
-                llama_io_write_layout io(c.blob_data(), c.blob_size(), c.writes, c.laid_out);
+                llama_io_write_layout io(c.blob_data(), c.blob_size(), c.writes, c.laid_out, c.blob_file != nullptr);
                 io.write(&io_magic, sizeof(io_magic));
                 io.write(&ckpt_seq, sizeof(ckpt_seq));
                 state_seq_write_data(io, ckpt_seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
