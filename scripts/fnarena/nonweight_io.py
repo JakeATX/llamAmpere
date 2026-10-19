@@ -39,28 +39,35 @@ def activation_copies(log, start, end, total, output_dir):
     if observed > total:
         raise ValueError('activation attribution exceeds process reads')
     return dict(activation_copy_bytes=observed, positive_calls=calls, remaining_read_bytes=total-observed,
+                intervals=[(tid, begin, finish) for tid, spans in windows.items() for begin, finish in spans],
                 scope='Only pure llama_copy_moe_output memcpy from the verified owned activation-file mapping, after context synchronization; no model-weight reads exempted.')
 
 
 def activation_metadata(log, start, end, total, output_dir):
     if type(total) is not int or total < 0 or not math.isfinite(start) or not math.isfinite(end) or end < start:
         raise ValueError('invalid request I/O interval or counter')
-    own_path = re.compile(re.escape(str(Path(output_dir).resolve())) + r'/llama-moe-output-[A-Za-z0-9]{6} \(deleted\)$')
-    pattern = re.compile(r'^FNARENA_META_IO op=posix_fallocate start=([0-9.]+) end=([0-9.]+) tid=([0-9]+) result=0 read_bytes=([0-9]+) path=(.+)$')
+    own_path = re.escape(str(Path(output_dir).resolve())) + r'/llama-moe-output-[A-Za-z0-9]{6}'
+    pattern = re.compile(r'^FNARENA_META_IO op=(posix_fallocate|mkstemp) start=([0-9.]+) end=([0-9.]+) tid=([0-9]+) result=(-?[0-9]+) read_bytes=([0-9]+) path=(.+)$')
     windows = {}
     observed = 0
     for line in log.splitlines():
         match = pattern.fullmatch(line)
-        if not match or not own_path.fullmatch(match[5]):
+        if not match:
             continue
-        begin, finish = float(match[1]), float(match[2])
+        op, result = match[1], int(match[5])
+        # mkstemp creates a new empty file with O_EXCL. It cannot read a model
+        # tensor. Allocation is scoped separately to the subsequently unlinked file.
+        suffix = r' \(deleted\)' if op == 'posix_fallocate' else ''
+        if not re.fullmatch(own_path + suffix, match[7]) or (result != 0 if op == 'posix_fallocate' else result < 0):
+            continue
+        begin, finish = float(match[2]), float(match[3])
         if not math.isfinite(begin) or not math.isfinite(finish) or finish < begin:
             raise ValueError('invalid metadata trace interval')
         if finish < start or begin > end:
             continue
         if not start <= begin <= finish <= end:
             raise ValueError('metadata interval crosses request boundary')
-        tid, count = int(match[3]), int(match[4])
+        tid, count = int(match[4]), int(match[6])
         if tid <= 0 or count <= 0:
             raise ValueError('invalid metadata thread or byte count')
         if any(begin <= previous_end and finish >= previous_begin for previous_begin, previous_end in windows.get(tid, [])):
@@ -70,4 +77,5 @@ def activation_metadata(log, start, end, total, output_dir):
     if observed > total:
         raise ValueError('metadata attribution exceeds process reads')
     return dict(activation_metadata_bytes=observed, remaining_read_bytes=total-observed,
-                scope='Only successful, fully contained posix_fallocate calls for this run owned deleted activation files; no model/activation payload reads exempted.')
+                intervals=[(tid, begin, finish) for tid, spans in windows.items() for begin, finish in spans],
+                scope='Only successful, fully contained creation of new empty owned activation files and allocation of owned deleted activation files; no model/activation payload reads exempted.')

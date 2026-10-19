@@ -15,3 +15,10 @@ No helper head or decode is skipped or reordered. Later heads and verification m
 The generated-model `test-mtp-state` suite covers helper batch boundaries, deferred staging, per-sequence carries, acceptance, and saved-state restoration. Its QWEN35 model supports one MTP head and ordinary output buffers; it does not exercise multihead refaults or establish the file-backed helper's memory peak.
 
 For request I/O accounting, `llama_copy_embeddings_nextn` synchronizes the context before staging. Its entire duration must **not** be attributed to activation reads. Only the separate exported `llama_copy_moe_output` function performs the pure `memcpy`, after synchronization, output reordering, flushing, and source-range validation. The optional preload tracer verifies the entire source span in `/proc/self/maps` against the canonical owned output directory and deleted activation filename before sampling per-thread `read_bytes`. The parser requires that same directory and rejects unknown sources, malformed/overlapping intervals, boundary crossings, and nonconserving counts. The cold-file fixture proves reads performed before this narrow boundary remain unattributed. This does not retroactively identify any old request's unknown bytes.
+
+The separate metadata parser counts successful `mkstemp` calls only for a new
+empty activation file in the canonical owned output directory, and successful
+`posix_fallocate` calls only for its deleted-file name. Creation cannot read model
+tensor payload. Both scopes expose their thread intervals so a combined harness
+can reject overlap with tensor or activation-copy attribution. Unknown request
+bytes still reject acceptance; a parser fix is not a new model measurement.
