@@ -109,7 +109,7 @@ try:
     quality = json.loads(candidate_quality.read_text())['kl_previous_to_current']
     # Full 100K+5120 arms are timed speed runs. The owner rule is that those
     # use BEST_CONFIG.md, which this frozen arena bundle does not. Zero skips them.
-    full_pairs = int(os.environ.get('ARENA_FULL_PAIRS', '16'))
+    full_pairs = int(os.environ.get('ARENA_FULL_PAIRS', '0'))
     assert full_pairs in (0, 8, 16), 'planned looks are 8 and 16, or 0 for quality only'
     for index in range(full_pairs):
         pair = {}
