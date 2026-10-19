@@ -67,6 +67,13 @@ try:
         assert subprocess.run(['git', '-C', str(root), 'merge-base', '--is-ancestor',
                                '5c7567cea674855f5aff801bc4bc06e37e779837', revision]).returncode == 0, 'known-broken scheduler baseline refused'
     assert gate['source_commit'] == manifest['source_commit']
+    cache_result = root / 'artifacts' / (prerequisite.parent.name + '-model') / 'result.json'
+    cache = json.loads(cache_result.read_text())
+    assert cache['status'] == 'passed' and cache['reload_checked'] and not cache['violations']
+    for name in ('prompt.bin', 'prompt.bin.ckpt', 'prompt.bin.dft'):
+        assert cache['saved_files'][name]['bytes'] > 0, 'missing main/MTP/checkpoint cache evidence'
+        assert cache['serialized_bytes_equal'][name], 'MTP cache bytes differ'
+    (output / 'cache-proof.json').write_text(json.dumps({'result': str(cache_result), 'sha256': hashlib.sha256(cache_result.read_bytes()).hexdigest()}, indent=2) + '\n')
     for name, digest in json.loads((harness / 'manifest.json').read_text()).items():
         assert hashlib.sha256((harness / name).read_bytes()).hexdigest() == digest, name
     baseline_quality = arm('quality-previous', previous, {'ARENA_BASELINE': '1', 'ARENA_MODE': 'off', 'ARENA_TEACHER': '1'})

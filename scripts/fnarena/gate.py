@@ -211,6 +211,8 @@ try:
  result['reload_checked']=os.environ.get('SHIP_RELOAD','1')!='0'
  if result['reload_checked']:
   phase='save';result['save']=action('save')[1]
+  required=['prompt.bin','prompt.bin.ckpt'] + (['prompt.bin.dft'] if arm=='flashnext' else [])
+  assert all((C/name).is_file() and (C/name).stat().st_size for name in required),'missing main/MTP/checkpoint cache file'
   hashes={p.name:dict(bytes=p.stat().st_size,sha256=digest(p)) for p in C.iterdir()};result['saved_files']=hashes
   continuation=dict(request,prompt=ids+generated,n_predict=64,temperature=0,stream=False)
   phase='live-continuation';result['live_continuation']=post('/completion',continuation)[1]
