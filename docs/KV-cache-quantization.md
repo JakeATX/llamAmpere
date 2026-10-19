@@ -92,6 +92,8 @@ Each 128-value TQ6 block occupies 98 bytes, including its FP16 norm; a 256-chann
 
 The existing `--moe-cache auto` uses the free CUDA memory after this allocation; keep the same cache reserve and do not subtract the KV saving a second time. Matched load-only tests on an RTX 3090 Ti with Swift Flash-Next IQ3_XXS, SJ-KVaRN 4/4, and 12 QSA layers measured 432 MiB less whole-card memory at 100,096 context cells and 1,446 MiB less at 262,144 cells. These tests disabled the expert cache to isolate the allocation change. The sealed-body allocation calculation saves 447.92 MiB and 1,464.18 MiB respectively; driver allocation and mapping overhead reduce the measured headroom. Pinned body storage is 601.25 MiB and 1,617.51 MiB respectively. These are memory measurements, not inference speed results.
 
+`test-sjkvarn-attn --resident` and `--resident-tq6` compare split and full-card attention exactly, including cold and warm selected blocks. `test-sjkvarn-state --resident` checks split/full state transfers and continuation. The guarded `scripts/gate-fnkvwin-cache.py --mtp` model gate checks a 100,000-token prefix across a cold server restart: the main state, `.ckpt` checkpoint sidecar, and `.dft` MTP draft state must all retain the same size and SHA-256 hash. Restored continuation must reuse the saved prefix.
+
 Three SJ-KVaRN body configurations are the production paths, all with the staged sink (`--sjkvarn-sink 128`) and the
 adaptive tq6_0 tail (`--sjkvarn-tail 4096 --sjkvarn-tail-max 8192`). The adaptive tail is the default for every SJ-KVaRN body (`--sjkvarn-tail 4096 --sjkvarn-tail-max 8192`); `--sjkvarn-tail-max 0` selects a fixed tail. A larger `--sjkvarn-tail` without `--sjkvarn-tail-max` raises the ceiling to match:
 
