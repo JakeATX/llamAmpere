@@ -24,7 +24,7 @@ pairs = []
 
 
 def persist(status, **extra):
-    (output / 'result.json').write_text(json.dumps({'status': status, 'steps': steps, 'pairs': pairs, **extra}, indent=2) + '\n')
+    (output / 'result.json').write_text(json.dumps({'status': status, 'steps': steps, 'pairs': pairs, 'runner_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(), **extra}, indent=2) + '\n')
 
 
 def arm(label, bundle, options, full=False):
@@ -58,7 +58,14 @@ try:
         time.sleep(5)
     gate = json.loads(prerequisite.read_text())
     assert gate['status'] == 'passed', 'arena operator/load/restart prerequisite failed'
+    while not (previous / 'manifest.json').exists():
+        persist('waiting-for-fixed-baseline', previous=str(previous))
+        time.sleep(5)
     manifest = json.loads((candidate / 'manifest.json').read_text())
+    for bundle in (candidate, previous):
+        revision = json.loads((bundle / 'manifest.json').read_text())['source_commit']
+        assert subprocess.run(['git', '-C', str(root), 'merge-base', '--is-ancestor',
+                               '5c7567cea674855f5aff801bc4bc06e37e779837', revision]).returncode == 0, 'known-broken scheduler baseline refused'
     assert gate['source_commit'] == manifest['source_commit']
     for name, digest in json.loads((harness / 'manifest.json').read_text()).items():
         assert hashlib.sha256((harness / name).read_bytes()).hexdigest() == digest, name
