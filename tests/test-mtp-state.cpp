@@ -22,6 +22,7 @@
 #include "../src/llama-memory.h"
 #include "../src/llama-memory-hybrid.h"
 #include "../src/llama-model.h"
+#include "../src/llama-mmap.h"
 #include "../src/llama-model-saver.h"
 
 #include <algorithm>
@@ -31,9 +32,13 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#ifndef _WIN32
+#include <sys/resource.h>
+#endif
 
 static constexpr uint32_t n_vocab = 32, n_embd = 256;
 static size_t scratch_borrows = 0, scratch_releases = 0, scratch_fallbacks = 0, compute_shares = 0;
+static size_t borrowed_host_pins = 0, borrowed_host_pin_failures = 0;
 
 static void require(bool condition, const char * message) {
     if (!condition) {
@@ -1060,7 +1065,7 @@ static void run_failed_helper(llama_model * model) {
 }
 
 // The second GGUF must reuse identical storage and retain it after the donor model is freed.
-static void run_weight_borrow(llama_model * source, bool cuda = false) {
+static void run_weight_borrow(llama_model * source, bool cuda = false, bool pin_host = false) {
     const auto close_file = [](FILE * f) { fclose(f); };
     std::unique_ptr<FILE, decltype(close_file)> file(tmpfile(), close_file);
     require(file != nullptr, "create borrowed-weight fixture file");
@@ -1081,10 +1086,36 @@ static void run_weight_borrow(llama_model * source, bool cuda = false) {
     llama_model_ptr donor(cuda ? llama_model_load_from_file_ptr(file.get(), mp) : make_model());
     require(donor != nullptr, "load donor fixture");
     mp.tensor_borrow_from = donor.get();
+#ifndef _WIN32
+    if (pin_host && !cuda) {
+        llama_mlock overflow;
+        overflow.init(donor->tok_embd->data);
+        overflow.grow_to(SIZE_MAX);
+        require(overflow.locked_size() == 0, "overflowing lock size is refused");
+        struct rlimit original;
+        require(getrlimit(RLIMIT_MEMLOCK, &original) == 0, "read lock limit");
+        auto denied = original;
+        denied.rlim_cur = 0;
+        require(setrlimit(RLIMIT_MEMLOCK, &denied) == 0, "deny host locking");
+        rewind(file.get());
+        llama_model_ptr failed(llama_model_load_from_file_ptr(file.get(), mp));
+        const int restored = setrlimit(RLIMIT_MEMLOCK, &original);
+        require(restored == 0, "restore host lock limit");
+        require(!failed && borrowed_host_pin_failures > 0, "failed pin refuses helper loading");
+    }
+#endif
+    const size_t pins_before = borrowed_host_pins;
     rewind(file.get());
     llama_model_ptr borrower(llama_model_load_from_file_ptr(file.get(), mp));
     require(borrower != nullptr, "load borrower fixture");
     require(borrower->output == donor->output && borrower->tok_embd == donor->tok_embd, "identical weights share tensor and storage");
+    if (pin_host) {
+        require(borrowed_host_pins > pins_before, "host storage was pinned during helper load");
+        const size_t pins_after = borrowed_host_pins;
+        rewind(file.get());
+        llama_model_ptr repeated(llama_model_load_from_file_ptr(file.get(), mp));
+        require(repeated && borrowed_host_pins == pins_after, "repeated borrowing reuses donor lock");
+    }
     {
         prefill_env_restore env;
         common_set_env("LLAMA_SHARED_COMPUTE", "1");
@@ -1124,6 +1155,8 @@ int main(int argc, char ** argv) {
     const bool reserve_probe = (argc == 4 || argc == 5) && std::strcmp(argv[1], "--reserve-probe") == 0;
     common_log_set_verbosity_thold(LOG_LEVEL_ERROR);
     llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
+        if (std::strstr(text, "pinned borrowed host ") != nullptr) { ++borrowed_host_pins; }
+        if (std::strstr(text, "cannot pin borrowed host tensor ") != nullptr) { ++borrowed_host_pin_failures; }
         if (std::strstr(text, "MTP context will share the target context's compute buffers") != nullptr) {
             ++compute_shares;
         }
@@ -1140,7 +1173,9 @@ int main(int argc, char ** argv) {
             fputs(text, stderr);
         }
     }, reserve_probe ? &argc : nullptr);
-    const bool cuda_sharing = argc == 2 && std::strcmp(argv[1], "--cuda-sharing-only") == 0;
+    const bool pin_host = argc == 2 && (std::strcmp(argv[1], "--host-pin-only") == 0 || std::strcmp(argv[1], "--host-pin-cuda-only") == 0);
+    const bool cuda_sharing = argc == 2 && (std::strcmp(argv[1], "--cuda-sharing-only") == 0 || std::strcmp(argv[1], "--host-pin-cuda-only") == 0);
+    if (pin_host) { common_set_env("LLAMA_MTP_PIN_BORROWED_HOST", "1"); }
     if (cuda_sharing) { ggml_backend_load_all(); }
     llama_backend_init();
     int failed = 0;
@@ -1171,8 +1206,8 @@ int main(int argc, char ** argv) {
             return 0;
         }
         if (cuda_sharing) { require(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU) != nullptr, "CUDA backend is available"); }
-        run_weight_borrow(model, cuda_sharing);
-        if (cuda_sharing || (argc == 2 && std::strcmp(argv[1], "--weight-borrow-only") == 0)) {
+        run_weight_borrow(model, cuda_sharing, pin_host);
+        if (pin_host || cuda_sharing || (argc == 2 && std::strcmp(argv[1], "--weight-borrow-only") == 0)) {
             llama_model_free(model);
             llama_backend_free();
             return 0;

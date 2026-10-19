@@ -810,6 +810,11 @@ struct llama_mlock::impl {
             return;
         }
         size_t granularity = lock_granularity();
+        if (granularity == 0 || target_size > SIZE_MAX - (granularity - 1)) {
+            LLAMA_LOG_WARN("warning: mlock size alignment overflows\n");
+            failed_already = true;
+            return;
+        }
         target_size = (target_size + granularity - 1) & ~(granularity - 1);
         if (target_size > size) {
             if (raw_lock((uint8_t *) addr + size, target_size - size)) {
@@ -831,6 +836,7 @@ llama_mlock::~llama_mlock() = default;
 
 void llama_mlock::init(void * ptr) { pimpl->init(ptr); }
 void llama_mlock::grow_to(size_t target_size) { pimpl->grow_to(target_size); }
+size_t llama_mlock::locked_size() const { return pimpl->size; }
 
 #if defined(_POSIX_MEMLOCK_RANGE) || defined(_WIN32)
 const bool llama_mlock::SUPPORTED = true;
