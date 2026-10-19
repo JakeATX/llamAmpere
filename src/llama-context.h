@@ -566,6 +566,8 @@ private:
     bool b1_run_prefix(llama_memory_context_i * mctx, size_t ub0, ggml_status & status);
     // ends the B1 call (b1->end) and gives the MoE expert cache back if the call suspended it
     void b1_end(bool failed);
+    bool b1_cache_graph_reset();
+    void b1_cache_resume();
     int64_t b1_final_rows(int64_t n_out, int64_t n_tok) const;
 
     // fork: opt-in prompt routing counts use layer IDs, never temporary B1 weight addresses.

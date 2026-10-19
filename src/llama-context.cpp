@@ -4848,10 +4848,7 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
     }
 
     auto normal = [&]() -> int {
-        if (b1_mc_suspended) {
-            ggml_backend_sched_moe_cache_resume(sched.get());
-            b1_mc_suspended = false;
-        }
+        b1_cache_resume();
         if (b1->dirty() && !b1->refill()) {
             LLAMA_LOG_ERROR("%s: [B1] cannot restore the lent expert layers\n", __func__);
             return -3;
@@ -4933,7 +4930,7 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
     // other sequence decodes from it; b1_end makes it again and it refills from decode. Off by default because the
     // refilled pool serves different experts than a pool that stayed warm, so later steps can differ in rounding.
     b1_mc_suspended = !others && b1_ctx_env("LLAMA_B1_MOE_CACHE_SUSPEND", 0) != 0 &&
-                      ggml_backend_sched_moe_cache_suspend(sched.get());
+                      b1_cache_graph_reset() && ggml_backend_sched_moe_cache_suspend(sched.get());
     if (b1_mc_suspended) {
         b1_cache_needs_refresh = true;
         LLAMA_LOG_WARN("%s: [B1] MoE expert cache suspended for this call\n", __func__);
@@ -5251,10 +5248,40 @@ int64_t llama_context::b1_final_rows(int64_t n_out, int64_t n_tok) const {
 
 void llama_context::b1_end(bool failed) {
     b1->end(failed);
-    if (b1_mc_suspended) {
-        ggml_backend_sched_moe_cache_resume(sched.get());
-        b1_mc_suspended = false;
+    b1_cache_resume();
+}
+
+bool llama_context::b1_cache_graph_reset() {
+    synchronize();
+    // Cached CUDA graphs can retain pool addresses even after model graph metadata is discarded.
+    for (ggml_backend_t backend : backend_ptrs) {
+        auto dev = ggml_backend_get_device(backend);
+        if (!dev || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+            continue;
+        }
+        using reset_fn = bool (*)(ggml_backend_t);
+        auto reset = (reset_fn) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), "ggml_backend_cuda_graph_reset");
+        if (!reset || !reset(backend)) {
+            return false;
+        }
     }
+    for (auto & res : gf_res_prev) {
+        if (res) {
+            res->reset();
+        }
+    }
+    gf_res_prev_active = nullptr;
+    return true;
+}
+
+void llama_context::b1_cache_resume() {
+    if (!b1_mc_suspended) {
+        return;
+    }
+    // Suspension required this hook, so it must remain available until the session is restored.
+    GGML_ASSERT(b1_cache_graph_reset());
+    ggml_backend_sched_moe_cache_resume(sched.get());
+    b1_mc_suspended = false;
 }
 
 bool llama_context::b1_run_prefix(llama_memory_context_i * mctx, size_t ub0, ggml_status & status) {
