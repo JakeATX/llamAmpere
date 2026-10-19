@@ -3239,6 +3239,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_PREFETCH"));
     add_opt(common_arg(
+        {"--moe-arena"}, "on|off",
+        "store expert gate/up/down blocks together in pinned RAM (default: on when it fits with 10 GiB startup headroom)",
+        [](common_params &, const std::string & value) {
+            if (value != "on" && value != "off") { throw std::invalid_argument("expected on or off"); }
+            common_set_env("LLAMA_MOE_ARENA", value);
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-profile"}, "FILE",
+        "warm the startup card hot set from measured expert usage (fn/fast profile format)",
+        [](common_params &, const std::string & value) { common_set_env("GGML_MOE_CACHE_PROFILE_LOAD", value); }
+    ));
+    add_opt(common_arg(
         {"--moe-cache"}, "MODE",
         "adaptively cache the hottest CPU-resident MoE experts in spare VRAM "
         "(default: auto; auto = preserve weight repacking; on = automatic budget without weight repacking; "

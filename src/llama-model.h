@@ -821,6 +821,7 @@ struct llama_model {
     llama_ftype ftype() const;
 
     size_t size() const; // file size
+    size_t moe_arena_size() const;
     size_t n_tensors() const;
     size_t n_devices() const;
     const float * tensor_split() const;

@@ -239,8 +239,9 @@ struct llama_moe_cache::impl {
             }
             it->layers.push_back(il);
             for (const ggml_tensor * t : experts) {
-                it->host_bytes += ggml_nbytes(t);
-                host_bytes     += ggml_nbytes(t);
+                const size_t bytes = t->nb[1] * t->ne[1] * t->ne[2];
+                it->host_bytes += bytes;
+                host_bytes     += bytes;
             }
         }
         if (groups.empty()) {
@@ -253,7 +254,7 @@ struct llama_moe_cache::impl {
         auto alloc_size = [&](const group & g, int32_t n_slots) {
             size_t res = 0;
             for (const ggml_tensor * t : g.ref) {
-                res += GGML_PAD(t->nb[2]*(n_slots + 1), alignment);
+                res += GGML_PAD((t->nb[1]*t->ne[1])*(n_slots + 1), alignment);
             }
             return res;
         };
@@ -307,7 +308,7 @@ struct llama_moe_cache::impl {
             }
             for (const ggml_tensor * t : g.ref) {
                 ggml_tensor * bank = ggml_new_tensor_3d(ctx.get(), t->type, t->ne[0], t->ne[1], g.n_slots + 1);
-                GGML_ASSERT(bank->nb[2] == t->nb[2]);
+                GGML_ASSERT(bank->nb[2] == t->nb[1] * t->ne[1]);
                 ggml_format_name(bank, "moe_cache.%zu.%s", ig, t->name);
                 g.banks.push_back(bank);
             }
@@ -472,13 +473,13 @@ struct llama_moe_cache::impl {
         for (size_t ip = 0; ip < l.experts.size(); ++ip) {
             const ggml_tensor * w    = l.experts[ip];
             ggml_tensor       * bank = g.banks[ip];
-            const size_t expert_size = w->nb[2];
+            const size_t expert_size = bank->nb[2];
             for (size_t i = 0; i < fills.size();) {
                 size_t n = 1;
-                while (i + n < fills.size() && fills[i + n].expert == fills[i].expert + (int32_t) n && fills[i + n].slot == fills[i].slot + (int32_t) n) {
+                while (w->nb[2] == expert_size && i + n < fills.size() && fills[i + n].expert == fills[i].expert + (int32_t) n && fills[i + n].slot == fills[i].slot + (int32_t) n) {
                     n++;
                 }
-                ggml_backend_tensor_set_async(backend, bank, (const uint8_t *) w->data + fills[i].expert*expert_size, fills[i].slot*expert_size, n*expert_size);
+                ggml_backend_tensor_set_async(backend, bank, (const uint8_t *) w->data + fills[i].expert*w->nb[2], fills[i].slot*expert_size, n*expert_size);
                 bytes += n*expert_size;
                 i += n;
             }

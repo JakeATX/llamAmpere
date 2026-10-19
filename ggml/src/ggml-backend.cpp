@@ -2484,6 +2484,12 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                         ggml_backend_t backend = sched->backends[cur_backend_id];
                         for (int c = 0; c < sched->n_copies; c++) {
                             struct ggml_tensor * tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
+                            // fork: arena expert planes use a host stride; device copies are packed.
+                            if (sched->callback_copy && strstr(src->name, "_exps.weight") &&
+                                    (ggml_is_contiguous_2(src) && src->nb[1] == ggml_row_size(src->type, src->ne[0])) && src->ne[3] == 1) {
+                                tensor_copy->nb[2] = src->nb[1] * src->ne[1];
+                                tensor_copy->nb[3] = tensor_copy->nb[2] * src->ne[2];
+                            }
                             ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
                             if (sched->n_copies > 1) {
                                 ggml_set_input(tensor_copy);

@@ -3371,6 +3371,21 @@ static bool run_profile_persistence(ggml_backend_t gpu, ggml_backend_t cpu, log_
     } else {
         ok = false;
     }
+    // The same profile must load against an interleaved expert arena.
+    std::vector<uint8_t> interleaved(expert_bytes * experts * 3, 0xa5);
+    for (int64_t e = 0; e < experts; ++e) {
+        memcpy(interleaved.data() + (size_t)e * expert_bytes * 3, data.data() + (size_t)e * expert_bytes, expert_bytes);
+    }
+    auto arena_descriptor = loaded;
+    arena_descriptor.data = interleaved.data();
+    arena_descriptor.expert_size = expert_bytes * 3;
+    void * arena_reader = create_direct_session(gpu, cpu);
+    if (arena_reader) {
+        capture.clear();
+        ok &= api.warm(arena_reader, &arena_descriptor, nullptr, 1) == 64;
+        ok &= capture.get().find("profile loaded:") != std::string::npos;
+        api.session_destroy(arena_reader);
+    } else { ok = false; }
     auto rejected = [&](const ggml_moe_cache_tensor_desc & candidate) {
         void * session = create_direct_session(gpu, cpu);
         if (!session) {
@@ -3404,6 +3419,37 @@ static bool run_profile_persistence(ggml_backend_t gpu, ggml_backend_t cpu, log_
         ok &= write_file(extended) && rejected(loaded);
         ok &= write_file(original);
     }
+    // Unobserved first-layer experts precede a hot later layer at startup.
+    ggml_moe_cache_tensor_desc layers[] = {descriptor, descriptor};
+    layers[0].name = "blk.0.ffn_up_exps.weight";
+    layers[0].n_expert = 64;
+    layers[1].data = data.data() + 64 * expert_bytes;
+    layers[1].n_expert = 1;
+    std::vector<uint64_t> early_counts(64, 0);
+    const uint64_t later_count = 100;
+    const uint64_t * layer_counts[] = {early_counts.data(), &later_count};
+    set_env("GGML_MOE_CACHE_PROFILE_LOAD", nullptr);
+    set_env("GGML_MOE_CACHE_PROFILE_SAVE", path.c_str());
+    void * writer = create_direct_session(gpu, cpu);
+    if (writer) {
+        ok &= api.warm(writer, layers, layer_counts, 2) == 1;
+        api.session_destroy(writer);
+    } else { ok = false; }
+    set_env("GGML_MOE_CACHE_PROFILE_SAVE", nullptr);
+    set_env("GGML_MOE_CACHE_PROFILE_LOAD", path.c_str());
+    reader = create_direct_session(gpu, cpu);
+    if (reader) {
+        ok &= api.warm(reader, layers, nullptr, 2) == 64;
+        api.session_enter(reader);
+        for (int32_t e : {0, 63}) {
+            ok &= direct_plan_one(layers[0].name, layers[0].data, expert_bytes,
+                    shape_in, shape_out, GGML_TYPE_Q4_0, 64, e) == 1;
+        }
+        ok &= direct_plan_one(layers[1].name, layers[1].data, expert_bytes,
+                shape_in, shape_out, GGML_TYPE_Q4_0, 1, 0) == 0;
+        api.session_leave(reader);
+        api.session_destroy(reader);
+    } else { ok = false; }
     remove(path.c_str());
     remove((path + ".tmp").c_str());
     set_env("GGML_MOE_CACHE_PROFILE_SAVE", had_save ? saved_path.c_str() : nullptr);
@@ -4580,6 +4626,57 @@ static bool run_optional(
     return test();
 }
 
+static bool run_arena_stride(ggml_backend_t gpu, ggml_backend_t cpu,
+        ggml_tensor * weights, ggml_tensor * gate, test_graph & graph,
+        const std::vector<float> & reference, log_capture & capture) {
+    const ggml_tensor original = *weights, gate_original = *gate;
+    const size_t bytes = weights->nb[2], stride = 3 * bytes;
+    const size_t arena_size = stride * (size_t)weights->ne[2];
+    auto * buffer = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), arena_size);
+    auto * arena = static_cast<uint8_t *>(ggml_backend_buffer_get_base(buffer));
+    memset(arena, 0xa5, arena_size);
+    for (int64_t e = 0; e < weights->ne[2]; ++e) {
+        memcpy(arena + e * stride, (const char *)weights->data + e * bytes, bytes);
+        memcpy(arena + e * stride + bytes, (const char *)gate->data + e * bytes, bytes);
+    }
+    ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    weights->buffer = gate->buffer = buffer;
+    weights->data = arena;
+    gate->data = arena + bytes;
+    weights->nb[2] = gate->nb[2] = stride;
+    weights->nb[3] = gate->nb[3] = stride * weights->ne[2];
+    set_env("GGML_CUDA_MOE_CACHE", "0");
+    bool ok = ggml_backend_graph_compute(cpu, graph.graph) == GGML_STATUS_SUCCESS;
+    std::vector<float> actual(reference.size());
+    ggml_backend_tensor_get(graph.out, actual.data(), 0, actual.size() * sizeof(float));
+    ok &= actual == reference;
+    ok &= run_prompt_warm(gpu, cpu, weights, graph, reference, capture);
+    ok &= run_scenario("cache-arena-stride", nullptr, gpu, cpu, graph, reference, capture);
+#ifdef GGML_CUDA
+    const bool registered = cudaHostRegister(arena, arena_size,
+            cudaHostRegisterPortable | cudaHostRegisterMapped) == cudaSuccess;
+    ok &= registered;
+    if (registered) {
+        ok &= run_device_tables_case(gpu, cpu, weights, capture);
+        // The second projection starts inside the same registered allocation.
+        ok &= run_device_tables_case(gpu, cpu, gate, capture);
+        unsigned int flags = 0;
+        // Cache/table teardown must leave the model-owned registration alive.
+        ok &= cudaHostGetFlags(&flags, arena) == cudaSuccess;
+        ok &= capture.get().find("new_copy_bytes=0 new_registered_bytes=0") != std::string::npos;
+        ok &= cudaHostUnregister(arena) == cudaSuccess;
+    }
+#endif
+    for (int64_t e = 0; e < weights->ne[2]; ++e) {
+        for (size_t i = 2 * bytes; i < stride; ++i) { ok &= arena[e * stride + i] == 0xa5; }
+    }
+    *weights = original;
+    *gate = gate_original;
+    ggml_backend_buffer_free(buffer);
+    printf("cache-arena-stride: %s\n", ok ? "OK" : "FAIL");
+    return ok;
+}
+
 } // namespace
 
 static bool test_prefetch_budget() {
@@ -4836,7 +4933,10 @@ int main(int argc, char ** argv) {
             clamped_fused_graph.out, clamped_fused_reference.data(), 0,
             clamped_fused_reference.size() * sizeof(float));
 
-    bool ok = run_capability_queries(provider_device, cpu);
+    bool ok = run_optional(provider_is_cuda, "cache-arena-stride", [&] {
+        return run_arena_stride(gpu, cpu, weights, gate_weights, graph, reference, capture);
+    });
+    ok &= run_capability_queries(provider_device, cpu);
     ok &= run_invalidation_hook_coverage(cpu);
     ok &= run_optional(provider_is_cuda, "cache-prefetch-staging-legacy", [&] {
         return run_prefetch_staging(gpu, cpu, weights, capture, false);

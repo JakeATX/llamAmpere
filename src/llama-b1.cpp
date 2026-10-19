@@ -137,8 +137,12 @@ llama_b1::llama_b1(const llama_model & model, ggml_backend_t backend_gpu) : mode
 
         exps_tensor e;
         e.t         = t;
-        e.nbytes    = ggml_nbytes(t);
-        e.alloc     = ggml_backend_buft_get_alloc_size(buft_dev, t);
+        e.home_nb2  = t->nb[2];
+        ggml_tensor compact = *t;
+        compact.nb[2] = compact.nb[1] * compact.ne[1];
+        compact.nb[3] = compact.nb[2] * compact.ne[2];
+        e.nbytes    = ggml_nbytes(&compact);
+        e.alloc     = ggml_backend_buft_get_alloc_size(buft_dev, &compact);
         e.home_buf  = buf;
         e.home_data = t->data;
         e.resident  = !ggml_backend_buffer_is_host(buf) && ggml_backend_buffer_get_type(buf) == buft_dev;
@@ -807,6 +811,8 @@ void llama_b1::reserve_layer_bind(int il) {
             const placement & p = slot_place[e.role]; // real slot zero, contents are never read
             e.t->buffer = regions[p.region].buf;
             e.t->data = regions[p.region].base + p.offs;
+            e.t->nb[2] = e.t->nb[1] * e.t->ne[1];
+            e.t->nb[3] = e.t->nb[2] * e.t->ne[2];
         }
     }
 }
@@ -817,6 +823,8 @@ void llama_b1::reserve_layer_restore() {
             auto & e = exps[ti];
             e.t->buffer = e.home_buf;
             e.t->data = e.home_data;
+            e.t->nb[2] = e.home_nb2;
+            e.t->nb[3] = e.home_nb2 * e.t->ne[2];
         }
         reserve_layer = -1;
     }
@@ -868,10 +876,14 @@ void llama_b1::ubatch_home(int il, bool home) {
         if (home) {
             e.t->buffer = e.home_buf;
             e.t->data   = e.home_data;
+            e.t->nb[2] = e.home_nb2;
+            e.t->nb[3] = e.home_nb2 * e.t->ne[2];
         } else {
             const placement & p = slot_place[slot*n_roles + e.role];
             e.t->buffer = regions[p.region].buf;
             e.t->data   = regions[p.region].base + p.offs;
+            e.t->nb[2] = e.t->nb[1] * e.t->ne[1];
+            e.t->nb[3] = e.t->nb[2] * e.t->ne[2];
         }
     }
 }
@@ -906,15 +918,20 @@ bool llama_b1::tensor_streamed(int il, const exps_tensor & e) const {
 }
 
 void llama_b1::push_tensor_pieces(std::vector<piece> & ps, const exps_tensor & e, region * dst, size_t dst_offs, bool from_file) const {
-    for (size_t off = 0; off < e.nbytes; off += piece_bytes) {
+    const size_t expert_bytes = e.t->nb[1] * e.t->ne[1];
+    for (size_t off = 0; off < e.nbytes;) {
         piece p;
-        p.src_host = from_file ? nullptr : (const char *) e.home_data + off;
+        const bool strided = !from_file && e.home_nb2 != expert_bytes;
+        const size_t source_off = strided ? (off / expert_bytes) * e.home_nb2 + off % expert_bytes : off;
+        p.src_host = from_file ? nullptr : (const char *) e.home_data + source_off;
         p.fd       = e.src.fd;
         p.src_offs = e.src.offs + off;
         p.dst      = dst;
         p.dst_offs = dst_offs + off;
         p.len      = std::min(piece_bytes, e.nbytes - off);
+        if (strided) { p.len = std::min(p.len, expert_bytes - off % expert_bytes); }
         ps.push_back(p);
+        off += p.len;
     }
 }
 
@@ -1097,6 +1114,8 @@ bool llama_b1::layer_begin(int il) {
         const placement & p = slot_place[slot*n_roles + e.role];
         e.t->buffer = regions[p.region].buf;
         e.t->data   = regions[p.region].base + p.offs;
+        e.t->nb[2] = e.t->nb[1] * e.t->ne[1];
+        e.t->nb[3] = e.t->nb[2] * e.t->ne[2];
     }
     cur_step = (int) k;
     return true;
@@ -1108,6 +1127,8 @@ void llama_b1::restore_step(int k) {
         auto & e = exps[ti];
         e.t->buffer = e.home_buf;
         e.t->data   = e.home_data;
+        e.t->nb[2] = e.home_nb2;
+        e.t->nb[3] = e.home_nb2 * e.t->ne[2];
     }
 }
 
