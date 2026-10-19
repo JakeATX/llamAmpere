@@ -121,6 +121,8 @@ struct tallocr_chunk {
 struct ggml_dyn_tallocr {
     size_t alignment;
     size_t max_chunk_size;
+    size_t chunk_limits[GGML_VBUFFER_MAX_CHUNKS];
+    int n_chunk_limits;
     struct tallocr_chunk * chunks[GGML_VBUFFER_MAX_CHUNKS];
     int n_chunks;
     // fork: Opt-in allocation logs expose reserve liveness without backend execution.
@@ -170,7 +172,7 @@ static int ggml_dyn_tallocr_new_chunk(struct ggml_dyn_tallocr * alloc, size_t mi
     // 1. a single tensor exceeds the maximum, and cannot fit any other way
     // 2. we are running out of chunks
     // backends will either manage to allocate the larger size, or report an error.
-    chunk->free_blocks[0].size = MAX(min_size, alloc->max_chunk_size);
+    chunk->free_blocks[0].size = alloc->n_chunk_limits ? SIZE_MAX/2 : MAX(min_size, alloc->max_chunk_size);
     if (alloc->n_chunks == GGML_VBUFFER_MAX_CHUNKS - 1) {
         chunk->free_blocks[0].size = SIZE_MAX/2;
     }
@@ -368,6 +370,13 @@ static void ggml_dyn_tallocr_reset(struct ggml_dyn_tallocr * alloc) {
         alloc->chunks[i] = NULL;
     }
     alloc->n_chunks = 0;
+    // fork: seed each borrowed chunk with its own capacity. An extra virtual chunk reports overflow without writes.
+    for (int i = 0; i < alloc->n_chunk_limits; ++i) {
+        struct tallocr_chunk * chunk = calloc(1, sizeof(struct tallocr_chunk));
+        chunk->n_free_blocks = 1;
+        chunk->free_blocks[0].size = i == GGML_VBUFFER_MAX_CHUNKS - 1 ? SIZE_MAX/2 : alloc->chunk_limits[i];
+        alloc->chunks[alloc->n_chunks++] = chunk;
+    }
 
 #ifdef GGML_ALLOCATOR_DEBUG
     for (int i = 0; i < 1024; i++) {
@@ -383,6 +392,8 @@ static struct ggml_dyn_tallocr * ggml_dyn_tallocr_new(size_t alignment, size_t m
     *alloc = (struct ggml_dyn_tallocr) {
         /*.alignment      = */ alignment,
         /*.max_chunk_size = */ MIN(max_buffer_size, SIZE_MAX/2), // clamp to avoid overflows
+        /*.chunk_limits   = */ {0},
+        /*.n_chunk_limits = */ 0,
         /*.chunks         = */ {NULL},
         /*.n_chunks       = */ 0,
         /*.trace          = */ trace != NULL && strcmp(trace, "1") == 0,
@@ -711,7 +722,12 @@ bool ggml_gallocr_set_buffers(ggml_gallocr_t galloc, int buffer_id, ggml_backend
             galloc->external_buffers[i] = n_buffers > 0 ? buffers[0] : NULL;
         }
     }
-    galloc->buf_tallocs[buffer_id]->max_chunk_size = max_chunk_size < SIZE_MAX/2 ? max_chunk_size : SIZE_MAX/2;
+    struct ggml_dyn_tallocr * talloc = galloc->buf_tallocs[buffer_id];
+    talloc->max_chunk_size = max_chunk_size < SIZE_MAX/2 ? max_chunk_size : SIZE_MAX/2;
+    talloc->n_chunk_limits = n_buffers;
+    for (int i = 0; i < n_buffers; ++i) {
+        talloc->chunk_limits[i] = ggml_backend_buffer_get_size(buffers[i]);
+    }
     galloc->n_nodes = 0;
     galloc->n_leafs = 0;
     galloc->epoch++;
