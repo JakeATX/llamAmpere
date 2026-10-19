@@ -334,6 +334,9 @@ struct moe_cache_session {
     uint64_t device_adapt_scopes = 0;
     uint64_t device_adapt_interval = 64;
     size_t device_adapt_copy_cap = 64u << 20;
+    // One stream for idle-boundary expert copies. Payloads finish before the
+    // address tables are published and before the next graph is launched.
+    cudaStream_t device_adapt_stream = nullptr;
     size_t device_fallback_staging_bytes = 0;
     unsigned long long * device_route_counts = nullptr;
     // Diagnostic only; guarded by mu and unused without DEVICE_STATS.
@@ -4576,6 +4579,18 @@ static void moe_cache_device_adapt(moe_cache_session & session) {
         for (auto & pool : device.pools) {
             pool->free_slots.reserve(pool->n_slots);
         }
+        struct pending_fill {
+            moe_cache_pool * pool;
+            int index;
+            moe_cache_device_table * table;
+            moe_cache_key key;
+            uint32_t uses;
+            char * destination;
+            const void * source;
+            size_t bytes;
+        };
+        std::vector<pending_fill> queued;
+        queued.reserve(256);
         auto mark_changed = [&](moe_cache_device_table * table) {
             if (std::find(changed.begin(), changed.end(), table) == changed.end()) {
                 changed.push_back(table);
@@ -4635,25 +4650,74 @@ static void moe_cache_device_adapt(moe_cache_session & session) {
                 source = (const char *)key.tensor + (size_t)key.expert * pool.expert_size;
                 original_source_bytes += pool.expert_size;
             }
-            const cudaError_t error = cudaMemcpy(destination, source, pool.expert_size, cudaMemcpyHostToDevice);
-            copied += pool.expert_size;
-            if (error != cudaSuccess) {
+            // Publish this slot only after the whole batch has landed. One
+            // synchronous copy per expert measured about 2 ms, far below the
+            // link, because each call waited before the next began.
+            try {
+                queued.push_back({&pool, index, c.table, key,
+                        (uint32_t) std::min<uint64_t>(c.count, UINT32_MAX),
+                        destination, source, pool.expert_size});
+            } catch (const std::bad_alloc &) {
                 pool.map.erase(key);
                 pool.free_slots.push_back(index);
-                device.fill_failures++;
-                (void) cudaGetLastError();
-                continue;
+                break;
             }
-            slot.key = key;
-            slot.generation++;
-            slot.uses = (uint32_t)std::min<uint64_t>(c.count, UINT32_MAX);
-            slot.state = moe_cache_slot_state::valid;
-            moe_cache_lru_push_back(pool, index);
-            c.table->addresses[c.expert] = destination;
-            mark_changed(c.table);
-            device.fills++;
-            device.inserts++;
-            fills++;
+            copied += pool.expert_size;
+        }
+        if (!queued.empty()) {
+            if (!session.device_adapt_stream) {
+                ggml_cuda_set_device(device.logical);
+                if (cudaStreamCreateWithFlags(&session.device_adapt_stream, cudaStreamNonBlocking) != cudaSuccess) {
+                    session.device_adapt_stream = nullptr;
+                    (void) cudaGetLastError();
+                }
+            }
+            cudaError_t copy_error = cudaSuccess;
+            if (!session.device_adapt_stream) {
+                for (const auto & fill : queued) {
+                    copy_error = cudaMemcpy(fill.destination, fill.source, fill.bytes, cudaMemcpyHostToDevice);
+                    if (copy_error != cudaSuccess) {
+                        break;
+                    }
+                }
+            } else {
+                for (const auto & fill : queued) {
+                    copy_error = cudaMemcpyAsync(fill.destination, fill.source, fill.bytes,
+                            cudaMemcpyHostToDevice, session.device_adapt_stream);
+                    if (copy_error != cudaSuccess) {
+                        break;
+                    }
+                }
+                if (copy_error == cudaSuccess) {
+                    copy_error = cudaStreamSynchronize(session.device_adapt_stream);
+                }
+            }
+            if (copy_error != cudaSuccess) {
+                MOE_CACHE_LOG("[moe-cache] device adaptation batched copy failed: %s\n", cudaGetErrorString(copy_error));
+                if (session.device_adapt_stream) {
+                    (void) cudaStreamSynchronize(session.device_adapt_stream);
+                }
+                (void) cudaGetLastError();
+                for (const auto & fill : queued) {
+                    fill.pool->map.erase(fill.key);
+                    fill.pool->free_slots.push_back(fill.index);
+                    device.fill_failures++;
+                }
+            } else {
+                for (const auto & fill : queued) {
+                    auto & filled = fill.pool->slots[fill.index];
+                    filled.key = fill.key;
+                    filled.generation++;
+                    filled.uses = fill.uses;
+                    filled.state = moe_cache_slot_state::valid;
+                    moe_cache_lru_push_back(*fill.pool, fill.index);
+                    fill.table->addresses[fill.key.expert] = fill.destination;
+                    mark_changed(fill.table);
+                    device.fills++;
+                    device.inserts++;
+                    fills++;
+                }
+            }
         }
         for (auto * table : changed) {
             // Captured graphs retain this allocation; only its entries change.
@@ -4677,6 +4741,13 @@ static void moe_cache_device_adapt(moe_cache_session & session) {
 
 static void moe_cache_device_release(moe_cache_session & session, bool retain_sources) {
     session.device_ready.store(false);
+    if (session.device_adapt_stream) {
+        if (!session.devices.empty()) {
+            ggml_cuda_set_device(session.devices[0]->logical);
+        }
+        (void) cudaStreamDestroy(session.device_adapt_stream);
+        session.device_adapt_stream = nullptr;
+    }
     const uint64_t capture_generation = session.device_capture_generation;
     session.device_capture_generation = 0;
     const uint64_t captures = session.device_captures.exchange(0);
@@ -5207,7 +5278,24 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
                 }
                 continue;
             }
+            {
+                static int registration_failures_logged = 0;
+                if (registration_failures_logged < 1) {
+                    registration_failures_logged++;
+                    MOE_CACHE_LOG("[moe-cache] mapped registration failed: %s bytes=%zu; a private writable file view is required to pin in place\n",
+                            cudaGetErrorString(err), bytes);
+                }
+            }
             (void) cudaGetLastError();
+            // Read-only file maps cannot be registered on this driver. A small
+            // pinned copy is exact. Copying the whole cold expert set (tens of
+            // GiB) is slower than the legacy cache, so refuse that and keep it.
+            const size_t staging_cap = 1ull << 30;
+            if (bytes > staging_cap || staging_bytes - retained_staging > staging_cap - bytes) {
+                MOE_CACHE_LOG("[moe-cache] mapped staging refused: next copy would exceed the %zu MiB fallback cap after %zu MiB; legacy exact cache remains\n",
+                        staging_cap >> 20, (staging_bytes - retained_staging) >> 20);
+                return fail();
+            }
             // Read-only file maps cannot be registered on some drivers. Keep a bounded pinned copy of missing experts.
             if (moe_cache_mem_available() < bytes + floor + margin ||
                     !moe_cache_cgroup_headroom(bytes + margin, registered_bytes, &peak_service_current)) {
