@@ -11,3 +11,10 @@ The MTP driver's `process_range` also releases consumed rows after all helper he
 `test-moe-arena` covers exact arbitrary float bits after unaligned release, empty and invalid ranges, subsequent writes, and absence of resident file pages before refault. `test-moe-arena --cuda-output` additionally covers asynchronous CUDA output copying and completion before release. These operator checks do not establish full-model quality, saved-cache reload, memory fit, or speed.
 
 For request I/O accounting, `llama_copy_embeddings_nextn` synchronizes the context before staging. Its entire duration must **not** be attributed to activation reads. Only the separate exported `llama_copy_moe_output` function performs the pure `memcpy`, after synchronization, output reordering, flushing, and source-range validation. The optional preload tracer verifies the entire source span in `/proc/self/maps` against the canonical owned output directory and deleted activation filename before sampling per-thread `read_bytes`. The parser requires that same directory and rejects unknown sources, malformed/overlapping intervals, boundary crossings, and nonconserving counts. The cold-file fixture proves reads performed before this narrow boundary remain unattributed. This does not retroactively identify any old request's unknown bytes.
+
+The separate metadata parser counts successful `mkstemp` calls only for a new
+empty activation file in the canonical owned output directory, and successful
+`posix_fallocate` calls only for its deleted-file name. Creation cannot read model
+tensor payload. Both scopes expose their thread intervals so a combined harness
+can reject overlap with tensor or activation-copy attribution. Unknown request
+bytes still reject acceptance; a parser fix is not a new model measurement.
