@@ -21,7 +21,7 @@ for i in range(8):
         run.mkdir()
         for name in ('result.json', 'request.json', 'command.json', 'cold.libraries.json',
                      'cpu-accounting-start.json', 'cpu-accounting-generation-start.json',
-                     'cpu-accounting-generation-end.json', 'cpu-accounting-end.json'):
+                     'cpu-accounting-generation-end.json', 'cpu-accounting-end.json', 'runner.py'):
             shutil.copyfile(source / name, run / name)
         shutil.copyfile(source / 'expert-profile-input.bin', run / 'expert-profile-input.bin')
         command = json.loads((run / 'command.json').read_text())
@@ -75,6 +75,14 @@ changed_json(first / 'command.json', lambda x: x['argv'].extend(['--moe-skip-tai
 changed_json(first / 'command.json', lambda x: x['env'].update(LLAMA_MOE_SKIP_TAIL='1'), 'lossy env')
 changed_json(first / 'command.json', lambda x: x.update(profile_sha256='0'*64), 'changed profile')
 changed_json(first / 'cpu-accounting-generation-start.json', lambda x: x.update({'cpu.weight': '10'}), 'low CPU weight')
+changed_json(first / 'cpu-accounting-generation-end.json', lambda x: x.update({'cpu.max': '100000 100000'}), 'CPU quota')
+runner = first / 'runner.py'
+original_runner = runner.read_bytes()
+runner.write_bytes(original_runner + b'\n# Changed measurement implementation\n')
+try:
+    invoke('changed measurement runner', False)
+finally:
+    runner.write_bytes(original_runner)
 changed_json(first / 'lease.json', lambda x: x.update(start_unix_s=999), 'overlapping lease')
 changed_json(path, lambda x: x['pairs'][1].update(candidate=x['pairs'][0]['candidate']), 'reused run')
 
