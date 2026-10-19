@@ -6934,8 +6934,12 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
             LLAMA_LOG_ERROR("%s: error saving state: unexpectedly reached end of buffer\n", __func__);
             return 0;
         }
-        if (capture.blob_file) { capture.blob_file->flush(); }
-        memcpy(dst, capture.blob_data(), capture.blob_size());
+        if (capture.blob_file) {
+            capture.blob_file->flush();
+            llama_copy_moe_output(dst, capture.blob_data(), capture.blob_size());
+        } else {
+            memcpy(dst, capture.blob_data(), capture.blob_size());
+        }
         return capture.blob_size();
     }
 
