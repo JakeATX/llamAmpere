@@ -843,7 +843,34 @@ llama_kv_cache::llama_kv_cache(
                         "kernels serve 5 to 8, so this attention runs on the CPU (it works, but much slower). Use -ctk sjkvarn4 "
                         "-ctv sjkvarn4 on this model.\n", __func__, layer_new.sj_kvarn_bits_k, layer_new.sj_kvarn_bits_v, gqa);
             }
-            body = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, (int64_t) rb * hparams.n_head_kv(il) * sj_kvarn_n_groups);
+            // fork: split only CUDA QSA sealed bodies; exact ring storage remains on its layer backend.
+            ggml_context * body_ctx = ctx;
+            if (sj_kvarn.resident_cells && hparams.dsv4_compress_ratios[il] > 0 && offload &&
+                ggml_backend_dev_type(model.dev_layer(il)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                if (n_stream != 1 || D != 256 || layer_new.sj_kvarn_bits_k != 4 || layer_new.sj_kvarn_bits_v != 4 ||
+                    layer_new.sj_kvarn_body_type != GGML_TYPE_F32) {
+                    throw std::runtime_error("--kv-resident requires single-stream scalar SJ-KVaRN 4/4 with 256-channel QSA heads");
+                }
+                const uint32_t exact_cells = sj_kvarn.sink + std::max(sj_kvarn.tail, sj_kvarn.tail_max);
+                if (sj_kvarn.resident_cells < exact_cells + sj_kvarn.group) {
+                    throw std::runtime_error(format("--kv-resident must be at least %u cells for this sink and tail", exact_cells + sj_kvarn.group));
+                }
+                auto * dev = model.dev_layer(il);
+                using resident_type_fn = ggml_backend_buffer_type_t (*)(ggml_backend_dev_t, size_t, uint32_t);
+                auto * get_type = reinterpret_cast<resident_type_fn>(ggml_backend_reg_get_proc_address(
+                    ggml_backend_dev_backend_reg(dev), "ggml_backend_cuda_qsa_resident_buffer_type"));
+                const uint32_t resident_groups = (sj_kvarn.resident_cells - exact_cells)/sj_kvarn.group;
+                auto * resident_buft = get_type ? get_type(dev, rb*hparams.n_head_kv(il), resident_groups) : nullptr;
+                if (!resident_buft) {
+                    throw std::runtime_error("--kv-resident requires the CUDA QSA resident backend");
+                }
+                body_ctx = ctx_for_buft(resident_buft);
+                const size_t groups_card = std::min(resident_groups, sj_kvarn_n_groups);
+                const size_t bytes_freed = (sj_kvarn_n_groups - groups_card)*rb*hparams.n_head_kv(il);
+                LLAMA_LOG_INFO("%s: QSA layer %u: %zu resident body groups plus %u staging rows, %.2f MiB pinned body, %.2f MiB VRAM freed for expert cache\n",
+                    __func__, il, groups_card, kv_rows, (double) sj_kvarn_n_groups*rb*hparams.n_head_kv(il)/(1024*1024), (double) bytes_freed/(1024*1024));
+            }
+            body = ggml_new_tensor_1d(body_ctx, GGML_TYPE_I8, (int64_t) rb * hparams.n_head_kv(il) * sj_kvarn_n_groups);
             body->op_params[7] = layer_new.sj_kvarn_body_type;
             ggml_format_name(body, "cache_%ssj_kvarn_l%d", name_tag, il);
             layer_new.body = body;
@@ -1562,7 +1589,18 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() 
     for (const auto & [ctx, buf] : ctxs_bufs) {
         ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf.get());
 
-        if (hparams.no_alloc) {
+        if (strncmp(ggml_backend_buft_name(buft), "CUDA_QSA_Resident_", 18) == 0) {
+            auto * dev = ggml_backend_buft_get_device(buft);
+            using bytes_fn = size_t (*)(ggml_backend_buffer_type_t, const ggml_tensor *);
+            auto * device_bytes = reinterpret_cast<bytes_fn>(ggml_backend_reg_get_proc_address(
+                ggml_backend_dev_backend_reg(dev), "ggml_backend_cuda_qsa_resident_device_bytes"));
+            GGML_ASSERT(device_bytes);
+            ret[ggml_backend_cpu_buffer_type()] += hparams.no_alloc ?
+                ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft) : ggml_backend_buffer_get_size(buf.get());
+            for (auto * t = ggml_get_first_tensor(ctx.get()); t; t = ggml_get_next_tensor(ctx.get(), t)) {
+                if (!t->view_src) ret[ggml_backend_dev_buffer_type(dev)] += device_bytes(buft, t);
+            }
+        } else if (hparams.no_alloc) {
             GGML_ASSERT(ggml_backend_buffer_get_base(buf.get()) == nullptr);
             ret[buft] += ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft);
         } else {

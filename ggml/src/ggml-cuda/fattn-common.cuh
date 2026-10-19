@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common.cuh"
+#include "qsa-resident.cuh"
 #include "convert.cuh"
 #include "vecdotq.cuh"
 #include "turbo-quant.cuh"
@@ -68,10 +69,24 @@ struct fattn_sj_kvarn_ctx {
     int sink_type, sink_stride;
     int64_t sink_head_delta_k, sink_head_delta_v;
     int body_type;
+    const char * resident = nullptr;
+    const int32_t * resident_tags = nullptr;
+    uint32_t resident_slots = 0;
     int rec_stride;      // n_head_kv * rec_bytes
     const int32_t * table; // paged pool (multi-sequence cache): group g sits at record table[g]; nullptr = identity
     int k_scale, k_zero, k_tok, v_payload, v_ch, v_scale, v_zero;
 };
+
+static __device__ __forceinline__ const char * fattn_sj_kvarn_rec(const fattn_sj_kvarn_ctx & kv, const int g) {
+    const int record = kv.table ? kv.table[g] : g;
+    if (kv.resident_slots) {
+        const uint32_t slot = record % kv.resident_slots;
+        if (kv.resident_tags[slot] == record) {
+            return kv.resident + (size_t) slot*kv.rec_stride;
+        }
+    }
+    return kv.body + (size_t) record*kv.rec_stride;
+}
 
 // record of group g of this stream: g itself, or the paged-pool slot of a multi-sequence cache (desc[GGML_SJKVARN_DESC_TABLE])
 #ifndef FATTN_SJKVARN_REC_DEFINED
@@ -100,6 +115,13 @@ static __device__ __forceinline__ fattn_sj_kvarn_ctx fattn_sj_kvarn_make_ctx(
     c.sink_head_delta_v = (int64_t) z_KV*((int64_t) D*sizeof(half) - (int64_t) v_head_stride);
     c.rec_stride = desc[GGML_SJKVARN_DESC_HKV] * rec_bytes;
     c.table      = desc[GGML_SJKVARN_DESC_TABLE] ? desc + GGML_SJKVARN_DESC_N_ENTRIES : nullptr;
+    if (reinterpret_cast<uintptr_t>(body) & 1) {
+        const auto * map = reinterpret_cast<const ggml_cuda_qsa_resident_map *>(reinterpret_cast<uintptr_t>(body) & ~uintptr_t(1));
+        c.resident = map->card + (size_t) z_KV*rec_bytes;
+        c.resident_tags = map->tags;
+        c.resident_slots = map->slots;
+        body = map->host;
+    }
     c.body       = body + (size_t) z_KV * rec_bytes;
     const int k_row = D*bits_k/8;
     const int v_row = D*bits_v/8;
@@ -2007,7 +2029,7 @@ void launch_fattn(
         nb21, nb22, nb23,
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
         mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
-        is_sj_kvarn ? (const char    *) KQV->src[5]->data : nullptr,
+        is_sj_kvarn ? ggml_cuda_qsa_resident_body(KQV->src[5]) : nullptr,
         is_sj_kvarn ? (const int32_t *) KQV->src[6]->data : nullptr
     );
     CUDA_CHECK(cudaGetLastError());

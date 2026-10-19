@@ -1,4 +1,5 @@
 #include "sjkvarn-seal.cuh"
+#include "qsa-resident.cuh"
 #include "turbo-quant.cuh"
 #include "../ggml-sjkvarn.h"
 
@@ -727,6 +728,7 @@ bool ggml_cuda_sj_kvarn_seal_supported(const ggml_tensor * op) {
 }
 
 void ggml_cuda_sj_kvarn_seal(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    ggml_cuda_qsa_resident_invalidate(ctx, dst);
     const ggml_tensor * k = dst->src[0];
     const ggml_tensor * v = dst->src[1];
     GGML_ASSERT(ggml_cuda_sj_kvarn_seal_supported(dst));

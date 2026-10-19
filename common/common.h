@@ -719,6 +719,7 @@ struct common_params {
     uint32_t sj_kvarn_edge_bits_v = 4;
     std::string sj_kvarn_transform;  // EXPERIMENTAL WUSH-KV transform file (--sjkvarn-transform)
     uint32_t sj_kvarn_flush_chunk = 0; // groups per decode step while an adaptive-tail flush drains (0 = one flush)
+    uint32_t kv_resident = 0; // fork: QSA resident KV cells; 0 = keep the full body on device
     ggml_type cache_type_s = GGML_TYPE_F32; // recurrent (gated delta-net) state cache data type
 
     size_t moe_cache_size = 0; // GPU cache size in bytes for the MoE experts kept in the CPU
