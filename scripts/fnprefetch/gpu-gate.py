@@ -26,6 +26,9 @@ for i,cmd in enumerate(commands):
  text=(output_dir/f'gate-{i}.log').read_text()
  if Path(cmd[0]).name=='test-moe-cache':
   assert 'cache-prefetch-router: OK' in text and 'FAIL' not in text
+  assert 'cache-arena-stride: OK' in text, 'real padded-stride fixture did not run'
+  for kind in ('legacy','device','fused'):
+   assert text.count('cache-prefetch-staging-'+kind+': OK')==2, 'both packed and strided staging paths must pass'
  else:
   import re
   counts=re.findall(r'(\d+)/(\d+) tests passed',text)

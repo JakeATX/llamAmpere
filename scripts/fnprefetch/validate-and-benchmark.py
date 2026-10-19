@@ -9,12 +9,15 @@ assert os.environ.get('PARENT_HOLDS_GPU_LOCK')!='1','controller must wait outsid
 completion=R/'logs'/('chain-'+tag+'.json')
 assert not completion.exists(),'use a new exact-build chain after a failure; preserve its evidence'
 record={'candidate':str(candidate),'baseline':str(baseline),'steps':[],'status':'waiting for prerequisites'}
+def read_json(path):
+ try:return json.loads(path.read_text())
+ except (FileNotFoundError,json.JSONDecodeError):return None
 def save():completion.write_text(json.dumps(record,indent=2))
 save();deadline=time.monotonic()+10800
 try:
  while True:
   gates=R/'logs'/('operators-'+tag)/'gates.json'
-  tests=json.loads(gates.read_text()) if gates.exists() else []
+  tests=read_json(gates) or []
   assert not any(t['rc']!=0 for t in tests),'operator failure'
   if len(tests)==3 and (R/'protocol'/('llama.cpp-prefetch-baseline-'+baseline_tag)).is_file():break
   assert time.monotonic()<deadline,'prerequisite wait exhausted'
@@ -30,8 +33,8 @@ try:
  regression_path=Path(os.environ['FN_BASELINE_REGRESSION'])
  guard_path=regression_path.parent.parent/(regression_path.parent.name+'-guard.json')
  while True:
-  regression=json.loads(regression_path.read_text()) if regression_path.exists() else None
-  guard=json.loads(guard_path.read_text()) if guard_path.exists() else None
+  regression=read_json(regression_path)
+  guard=read_json(guard_path)
   if regression:
    assert regression['source_commit'].startswith(baseline_tag) and regression['status']=='passed',regression
   if guard:assert guard['returncode']==0 and guard['guard'] is None,guard
