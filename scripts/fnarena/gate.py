@@ -46,10 +46,15 @@ def monitor():
    except Exception as e:
     if isinstance(e,GuardViolation):f.write(json.dumps(dict(e.row,guard_violation=True))+'\n');f.flush()
     violation.append(str(e))
-    if process and process.poll() is None:
+    guarded_process=process
+    if guarded_process and guarded_process.poll() is None:
      try:
       server_term_sent=True
-      os.killpg(process.pid,signal.SIGTERM)
+      os.killpg(guarded_process.pid,signal.SIGTERM)
+      try:guarded_process.wait(timeout=1)
+      except subprocess.TimeoutExpired:
+       os.killpg(guarded_process.pid,signal.SIGKILL)
+       guarded_process.wait(timeout=5)
      except ProcessLookupError:pass
     return
 thread=threading.Thread(target=monitor);thread.start()

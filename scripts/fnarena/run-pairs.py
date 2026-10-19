@@ -21,10 +21,11 @@ harness = candidate / 'harness'
 environment = dict(os.environ, XDG_RUNTIME_DIR='/run/user/1000', DBUS_SESSION_BUS_ADDRESS='unix:path=/run/user/1000/bus')
 steps = []
 pairs = []
+runner_sha256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
 
 def persist(status, **extra):
-    (output / 'result.json').write_text(json.dumps({'status': status, 'steps': steps, 'pairs': pairs, 'runner_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(), **extra}, indent=2) + '\n')
+    (output / 'result.json').write_text(json.dumps({'status': status, 'steps': steps, 'pairs': pairs, 'runner_sha256': runner_sha256, **extra}, indent=2) + '\n')
 
 
 def arm(label, bundle, options, full=False):
@@ -62,6 +63,22 @@ try:
         persist('waiting-for-fixed-baseline', previous=str(previous))
         time.sleep(5)
     manifest = json.loads((candidate / 'manifest.json').read_text())
+    baseline_revision = json.loads((previous / 'manifest.json').read_text())['source_commit']
+    while True:
+        try:
+            baseline_gates = json.loads((previous / 'gates.json').read_text())
+        except (FileNotFoundError, json.JSONDecodeError):
+            baseline_gates = {}
+        assert baseline_gates.get('source_commit', baseline_revision) == baseline_revision, 'wrong baseline proof'
+        if baseline_gates.get('probability_requests_100k') == 16:
+            assert baseline_gates['saved_cache_bytes_exact'] and baseline_gates['flash_8192_128_reload'] == 'passed'
+            assert baseline_gates['targeted_cuda_cases'] >= 163
+            for evidence in baseline_gates['evidence']:
+                assert hashlib.sha256(Path(evidence['path']).read_bytes()).hexdigest() == evidence['sha256']
+            break
+        persist('waiting-for-baseline-regression', previous=str(previous))
+        time.sleep(5)
+    (output / 'baseline-proof.json').write_text(json.dumps(baseline_gates, indent=2) + '\n')
     for bundle in (candidate, previous):
         revision = json.loads((bundle / 'manifest.json').read_text())['source_commit']
         assert subprocess.run(['git', '-C', str(root), 'merge-base', '--is-ancestor',

@@ -214,6 +214,15 @@ llama_b1::llama_b1(const llama_model & model, ggml_backend_t backend_gpu) : mode
 
     n_workers   = (int) std::clamp<int64_t>(b1_env_int("LLAMA_B1_THREADS", 8), 1, 64);
     piece_bytes = (size_t) std::clamp<int64_t>(b1_env_int("LLAMA_B1_PIECE_MIB", 16), 1, 256) << 20;
+    if (model.moe_arena_size()) {
+        // Arena uploads stop at each expert's role boundary. Reserving a full
+        // 16 MiB per staging slot wastes pinned RAM when no piece can use it.
+        size_t largest_role = 0;
+        for (const auto & e : exps) {
+            largest_role = std::max(largest_role, e.t->nb[1] * e.t->ne[1]);
+        }
+        piece_bytes = std::min(piece_bytes, largest_role);
+    }
 
     stg.resize(n_workers);
     for (auto & w : stg) {
@@ -249,8 +258,8 @@ llama_b1::llama_b1(const llama_model & model, ggml_backend_t backend_gpu) : mode
         slot_bytes += role_max[r];
     }
     LLAMA_LOG_WARN("%s: [B1] layer-major prefill ready: %zu expert tensors in %zu roles, %d of %d layers resident, "
-            "slot %.1f MiB, %d copy threads x 2 x %zu MiB pinned, %zu resident tensors lendable\n", __func__,
-            exps.size(), roles.size(), n_res, n_layer, slot_bytes/1048576.0, n_workers, piece_bytes >> 20,
+            "slot %.1f MiB, %d copy threads x 2 x %.2f MiB pinned, %zu resident tensors lendable\n", __func__,
+            exps.size(), roles.size(), n_res, n_layer, slot_bytes/1048576.0, n_workers, piece_bytes/1048576.0,
             (size_t) std::count_if(exps.begin(), exps.end(), [](const exps_tensor & e) { return e.resident && e.src.fd >= 0; }));
 
     init_ok = true;

@@ -593,6 +593,10 @@ public:
         llama_pos pos_min  = -1;
         llama_pos pos_max  = -1;
         std::vector<uint8_t>    blob;   // the bytes state_seq_get_data(PARTIAL_ONLY) would write at that spot
+        std::unique_ptr<llama_moe_output> blob_file;
+        uint8_t * blob_data();
+        const uint8_t * blob_data() const;
+        size_t blob_size() const;
         std::vector<ckpt_write> writes; // where the blob's tensor rows come from
         std::vector<uint8_t>    layer_done;
         bool laid_out = false;

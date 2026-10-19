@@ -6070,9 +6070,21 @@ size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
 
 static constexpr uint32_t io_magic = 0xaf143cd8;
 
+uint8_t * llama_context::ckpt_capture::blob_data() {
+    return blob_file ? static_cast<uint8_t *>(blob_file->data) : blob.data();
+}
+
+const uint8_t * llama_context::ckpt_capture::blob_data() const {
+    return blob_file ? static_cast<const uint8_t *>(blob_file->data) : blob.data();
+}
+
+size_t llama_context::ckpt_capture::blob_size() const {
+    return blob_file ? blob_file->size : blob.size();
+}
+
 size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_flags flags) {
     if (ckpt_sel >= 0 && seq_id == ckpt_seq && flags == LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) {
-        return ckpt_caps[ckpt_sel].blob.size();
+        return ckpt_caps[ckpt_sel].blob_size();
     }
 
     llama_io_write_dummy io(flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
@@ -6089,13 +6101,14 @@ size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_fl
 
 size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_state_seq_flags flags) {
     if (ckpt_sel >= 0 && seq_id == ckpt_seq && flags == LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) {
-        const auto & blob = ckpt_caps[ckpt_sel].blob;
-        if (size < blob.size()) {
+        const auto & capture = ckpt_caps[ckpt_sel];
+        if (size < capture.blob_size()) {
             LLAMA_LOG_ERROR("%s: error saving state: unexpectedly reached end of buffer\n", __func__);
             return 0;
         }
-        memcpy(dst, blob.data(), blob.size());
-        return blob.size();
+        if (capture.blob_file) { capture.blob_file->flush(); }
+        memcpy(dst, capture.blob_data(), capture.blob_size());
+        return capture.blob_size();
     }
 
     std::unique_ptr<llama_io_write_i> io;
@@ -6120,26 +6133,27 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
 // tensors (fill), or checks that a later layout is the same one (check)
 class llama_io_write_layout : public llama_io_write_i {
   public:
-    llama_io_write_layout(std::vector<uint8_t> & blob, std::vector<llama_context::ckpt_write> & writes, bool check) :
-        blob(blob), writes(writes), check(check) {}
+    llama_io_write_layout(uint8_t * blob, size_t capacity, std::vector<llama_context::ckpt_write> & writes, bool check) :
+        blob(blob), capacity(capacity), writes(writes), check(check) {}
 
     void write(const void * src, size_t size) override {
+        if (off > capacity || size > capacity - off) { throw std::runtime_error("checkpoint layout exceeds size pass"); }
         if (check) {
-            same = same && off + size <= blob.size() && memcmp(blob.data() + off, src, size) == 0;
+            same = same && memcmp(blob + off, src, size) == 0;
         } else {
-            blob.insert(blob.end(), (const uint8_t *) src, (const uint8_t *) src + size);
+            memcpy(blob + off, src, size);
         }
         off += size;
     }
 
     void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        if (off > capacity || size > capacity - off) { throw std::runtime_error("checkpoint tensor exceeds size pass"); }
         if (check) {
             same = same && iw < writes.size() && writes[iw].t == tensor && writes[iw].offset == offset &&
                 writes[iw].size == size && writes[iw].blob_off == off;
             ++iw;
         } else {
             writes.push_back({ tensor, offset, size, off, -1 });
-            blob.resize(blob.size() + size);
         }
         off += size;
     }
@@ -6147,10 +6161,11 @@ class llama_io_write_layout : public llama_io_write_i {
     size_t n_bytes() override { return off; }
 
     // check mode: the layout matched the earlier one exactly
-    bool matched() const { return same && iw == writes.size() && off == blob.size(); }
+    bool matched() const { return same && iw == writes.size() && off == capacity; }
 
   private:
-    std::vector<uint8_t> &                   blob;
+    uint8_t * const                         blob;
+    const size_t                            capacity;
     std::vector<llama_context::ckpt_write> & writes;
     const bool check;
 
@@ -6268,18 +6283,32 @@ void llama_context::capture_ubatch(const llama_ubatch & ubatch, int32_t il0, int
         // the memory's bookkeeping is now that of the ubatch just computed, so it lays out the state the way a call
         // ending here would write it; every later layer range must find the same layout
         {
-            llama_io_write_layout io(c.blob, c.writes, c.laid_out);
             try {
+                if (!c.laid_out) {
+                    // Size first: vector growth otherwise doubles large recurrent
+                    // states and touches rows that later layer ranges will fill.
+                    const size_t bytes = state_seq_get_size(ckpt_seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    const char * directory = std::getenv("LLAMA_MOE_ARENA_OUTPUT_DIR");
+                    if (model.moe_arena_size() && directory && bytes >= (64ull << 20)) {
+                        c.blob_file = std::make_unique<llama_moe_output>(bytes, directory);
+                        LLAMA_LOG_INFO("%s: MoE checkpoint at %d: %.2f MiB file-backed, original state bytes\n",
+                                __func__, c.n_tokens, bytes/1048576.0);
+                    } else {
+                        c.blob.resize(bytes);
+                    }
+                }
+                llama_io_write_layout io(c.blob_data(), c.blob_size(), c.writes, c.laid_out);
                 io.write(&io_magic, sizeof(io_magic));
                 io.write(&ckpt_seq, sizeof(ckpt_seq));
                 state_seq_write_data(io, ckpt_seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                if (io.n_bytes() != c.blob_size()) {
+                    throw std::runtime_error("checkpoint layout disagrees with size pass");
+                }
+                if (c.laid_out && !io.matched()) {
+                    throw std::runtime_error("the state layout changed between layer ranges");
+                }
             } catch (const std::exception & err) {
                 LLAMA_LOG_WARN("%s: in-call checkpoint at %d dropped: %s\n", __func__, c.n_tokens, err.what());
-                c.failed = true;
-                continue;
-            }
-            if (c.laid_out && !io.matched()) {
-                LLAMA_LOG_WARN("%s: in-call checkpoint at %d dropped: the state layout changed between layer ranges\n", __func__, c.n_tokens);
                 c.failed = true;
                 continue;
             }
@@ -6314,7 +6343,8 @@ void llama_context::capture_ubatch(const llama_ubatch & ubatch, int32_t il0, int
         // copy the rows of the layers this graph computed
         for (const auto & w : c.writes) {
             if (w.il >= il0 && w.il < il1) {
-                ggml_backend_tensor_get(w.t, c.blob.data() + w.blob_off, w.offset, w.size);
+                ggml_backend_tensor_get(w.t, c.blob_data() + w.blob_off, w.offset, w.size);
+                if (c.blob_file) { c.blob_file->dirty = true; }
             }
         }
         for (int32_t il = il0; il < il1; ++il) {
