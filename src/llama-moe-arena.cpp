@@ -3,6 +3,7 @@
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include <cstring>
+#include <cstdio>
 #include <fstream>
 #include <stdexcept>
 #include <vector>
@@ -63,6 +64,12 @@ bool llama_moe_arena::is_expert(const char * name) {
         if (length >= n && strcmp(name + length - n, suffix) == 0) { return true; }
     }
     return false;
+}
+
+bool llama_moe_arena::is_trunk_expert(const char * name, uint32_t trunk_layers) {
+    int layer = -1;
+    return is_expert(name) && sscanf(name, "blk.%d.", &layer) == 1 &&
+            layer >= 0 && (uint32_t) layer < trunk_layers;
 }
 
 size_t llama_moe_arena::available_memory() {

@@ -884,19 +884,20 @@ llama_model_loader::llama_model_loader(
     this->load_mtp = load_mtp;
     // fork: reserve host headroom before changing expert placement, including fit-only loads.
     const char * arena = getenv("LLAMA_MOE_ARENA");
-    if (!load_mtp && !files.empty() && (!arena || strcmp(arena, "off") != 0)) {
+    if (!files.empty() && (!arena || strcmp(arena, "off") != 0)) {
         size_t bytes = 0;
         bool supported = true;
         std::map<int, int> roles;
         uint32_t n_layers = 0, n_nextn = 0;
         get_key(LLM_KV_BLOCK_COUNT, n_layers, false);
         get_key(LLM_KV_NEXTN_PREDICT_LAYERS, n_nextn, false);
+        moe_arena_trunk_layers = n_nextn <= n_layers ? n_layers - n_nextn : 0;
         for (const auto & entry : weights_map) {
             const auto * t = entry.second.tensor;
             if (!llama_moe_arena::is_expert(t->name)) { continue; }
             int layer = -1;
             if (sscanf(t->name, "blk.%d.", &layer) != 1 || layer < 0 || n_nextn > n_layers) { supported = false; break; }
-            if ((uint32_t)layer >= n_layers - n_nextn) { continue; }
+            if (!llama_moe_arena::is_trunk_expert(t->name, moe_arena_trunk_layers)) { continue; }
             roles[layer]++;
             if (!ggml_moe_cache_wtype_supported(t->type)) { supported = false; break; }
             if (t->ne[2] <= 1 || t->ne[3] != 1 || ggml_nbytes(t) > SIZE_MAX - bytes) {
@@ -912,7 +913,7 @@ llama_model_loader::llama_model_loader(
             llama_moe_arena::pin_supported();
         LLAMA_LOG_INFO("%s: expert arena %s: %.2f GiB experts, %.2f GiB available, 10 GiB startup headroom\n",
                 __func__, use_moe_arena ? "enabled" : "disabled", bytes / double(GiB), available / double(GiB));
-        if (arena && strcmp(arena, "on") == 0 && !use_moe_arena) {
+        if (arena && strcmp(arena, "on") == 0 && !roles.empty() && !use_moe_arena) {
             throw std::runtime_error("--moe-arena on cannot fit the pinned experts with 10 GiB startup headroom, or pinning is unavailable");
         }
     }
@@ -1372,7 +1373,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             }
         }
 
-        if (use_moe_arena && llama_moe_arena::is_expert(t_meta->name)) {
+        if (use_moe_arena && llama_moe_arena::is_trunk_expert(t_meta->name, moe_arena_trunk_layers)) {
             buft = lazy_read::buft();
         }
 
@@ -1930,7 +1931,7 @@ std::unique_ptr<llama_moe_arena> llama_model_loader::load_moe_arena(llama_progre
     for (const auto & entry : ctx_map) {
         for (auto * t = ggml_get_first_tensor(entry.second.get()); t; t = ggml_get_next_tensor(entry.second.get(), t)) {
             int layer = -1;
-            if (llama_moe_arena::is_expert(t->name) && sscanf(t->name, "blk.%d.", &layer) == 1) {
+            if (llama_moe_arena::is_trunk_expert(t->name, moe_arena_trunk_layers) && sscanf(t->name, "blk.%d.", &layer) == 1) {
                 layers[layer].push_back(t);
             }
         }
@@ -1984,7 +1985,9 @@ std::unique_ptr<llama_moe_arena> llama_model_loader::load_moe_arena(llama_progre
                     const size_t first = w.offs + (size_t)first_expert * bytes;
                     const size_t count = (size_t)(e - first_expert + 1) * bytes;
                     if (use_mmap) { mappings.at(w.idx)->unmap_fragment(first, first + count); }
+#ifdef __linux__
                     posix_fadvise(files.at(w.idx)->file_id(), first, count, POSIX_FADV_DONTNEED);
+#endif
 #endif
                     if (llama_moe_arena::available_memory() < (10ull << 30)) {
                         throw std::runtime_error("expert arena stopped: less than 10 GiB MemAvailable");

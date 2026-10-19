@@ -95,6 +95,13 @@ int main(int argc, char ** argv) {
     ggml_tensor * weights[2][3], * outputs[2][3];
     size_t bank_offset = 0, role_offset = 0;
     bool ok = test_reclaimable_output();
+    // Loading MTP layers is allowed for a trunk model. MTP-only expert banks
+    // must not enter the trunk arena or make --moe-arena on reject the draft.
+    ok &= llama_moe_arena::is_trunk_expert("blk.0.ffn_gate_exps.weight", 48);
+    ok &= llama_moe_arena::is_trunk_expert("blk.47.ffn_down_exps.weight", 48);
+    ok &= !llama_moe_arena::is_trunk_expert("blk.48.ffn_up_exps.weight", 48);
+    ok &= !llama_moe_arena::is_trunk_expert("blk.0.ffn_gate.weight", 48);
+    ok &= !llama_moe_arena::is_trunk_expert("blk.-1.ffn_gate_exps.weight", 48);
     for (int role = 0; role < 3; ++role) {
         for (size_t i = 0; i < values.size(); ++i) { values[i] = 0.2f * sinf(float(i + role * 17) * 0.013f); }
         const size_t written = ggml_quantize_chunk(types[role], values.data(), packed + bank_offset,

@@ -85,6 +85,7 @@ struct llama_model_loader {
     bool no_alloc;
     bool load_mtp;
     bool use_moe_arena = false;
+    uint32_t moe_arena_trunk_layers = 0;
     std::set<const ggml_tensor *> arena_tensors;
     std::unique_ptr<llama_moe_arena> load_moe_arena(llama_progress_callback callback, void * user_data);
 

@@ -2,6 +2,7 @@
 
 #include "ggml-cpp.h"
 #include <cstddef>
+#include <cstdint>
 
 // fork: reclaimable storage for a large, temporary MTP output, with unchanged floats.
 struct llama_moe_output {
@@ -18,6 +19,7 @@ struct llama_moe_output {
 // fork: one physical allocation, with strided views of unchanged expert blocks.
 struct llama_moe_arena {
     static bool is_expert(const char * name);
+    static bool is_trunk_expert(const char * name, uint32_t trunk_layers);
     static size_t available_memory();
     static bool pin_supported();
 
