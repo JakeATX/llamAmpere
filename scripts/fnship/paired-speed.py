@@ -21,6 +21,7 @@ def checked(path,arm):
  for name in ('start','generation-start','generation-end','end'):
   accounting=json.loads((root/('cpu-accounting-'+name+'.json')).read_text())
   assert accounting['cpu.weight']=='100','full arm did not use CPUWeight100'
+  assert accounting['cpu.max'].split()[0]=='max','full arm had a CPU quota'
  request=json.loads((root/'request.json').read_text())
  assert request['temperature']==1.0 and request['n_predict']==5120 and len(request['prompt'])==100000
  command=json.loads((root/'command.json').read_text())
@@ -45,7 +46,8 @@ def checked(path,arm):
  if profile:assert Path(profile).resolve()==root/'expert-profile-input.bin','profile was not frozen per run'
  normalized_env=command['env'].copy()
  if profile:normalized_env['GGML_MOE_CACHE_PROFILE_LOAD']='<frozen-profile>'
- identity=dict(source=command['source_commit'],server=command['server_sha256'],argv=argv,env=normalized_env,profile_hash=profile_hash)
+ runner_hash=hashlib.sha256((root/'runner.py').read_bytes()).hexdigest()
+ identity=dict(runner_sha256=runner_hash,source=command['source_commit'],server=command['server_sha256'],argv=argv,env=normalized_env,profile_hash=profile_hash)
  if arm in identities:assert identity==identities[arm],arm+' changed during comparison'
  else:identities[arm]=identity
  # Filesystem mtime cannot prove nonoverlapping GPU leases; use recorded UTC starts.
@@ -66,6 +68,7 @@ for index,pair in enumerate(pairs):
   candidate_absolute[key].append(candidate['final']['timings'][field])
  metrics['ttc'].append(previous['generation_wall_s']/candidate['generation_wall_s'])
 assert identities['previous']['profile_hash']==identities['candidate']['profile_hash'],'arms used different warm profiles'
+assert identities['previous']['runner_sha256']==identities['candidate']['runner_sha256'],'arms used different measurement runners'
 result={'pairs':n,'primary_metric':'request TTC; predeclared before model pairs',
         'test':'one-sided exact sign; 2 planned looks, Bonferroni adjusted','identities':identities}
 for key,ratios in metrics.items():
