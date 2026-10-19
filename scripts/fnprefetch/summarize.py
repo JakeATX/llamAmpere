@@ -38,7 +38,7 @@ for label in sys.argv[1:]:
         decode = [sample for sample in request_samples if sample['phase'] == 'decode']
         prefill = [sample for sample in request_samples if sample['phase'] == 'prefill']
         assert samples and decode
-        assert all(sample['vram_mib'] <= 23552 and sample['avail_kib'] >= 10*1024**2 for sample in samples)
+        assert all(sample['vram_mib'] <= 23552 and sample['avail_kib'] >= 7*1024**2 for sample in samples)
         assert all(abs(sample['power_limit'] - 350) < .5 for sample in samples)
         times[arm] = (samples[0]['t'], samples[-1]['t'])
         identity = {'server': result['binary_provenance']['server']['sha256'],

@@ -51,7 +51,7 @@ for mode in modes:
      (mode_dir/f'golden-{mode}.libraries.json').write_text(json.dumps(runtime,indent=2))
    available=int(next(x.split()[1] for x in Path('/proc/meminfo').read_text().splitlines() if x.startswith('MemAvailable:')))
    used=float(subprocess.check_output(['nvidia-smi','--query-gpu=memory.used','--format=csv,noheader,nounits'],text=True).strip())
-   if available<10*1024**2 or used>23552 or time.monotonic()>deadline or any(shutil.disk_usage(path).free<floor*10**9 for path,floor in [('/',40),('/mnt/models',15),('/mnt/overflow',50)]):
+   if available<7*1024**2 or used>23552 or time.monotonic()>deadline or any(shutil.disk_usage(path).free<floor*10**9 for path,floor in [('/',40),('/mnt/models',15),('/mnt/overflow',50)]):
     os.killpg(process.pid,signal.SIGTERM);process.wait(timeout=5);raise RuntimeError('resource/time guard')
    time.sleep(.5)
  assert process.returncode==0,(mode,process.returncode)

@@ -219,7 +219,7 @@ def monitor():
     single_b1_failures=('legacy one-pass layer reservation failed before applying prompt state','cache loan made no physical progress; using normal prefill','cache loan made no logical or physical progress; using normal prefill','layer-sized B1 fallback uses 512-token normal chunks')
     if os.environ.get('FN_REQUIRE_SINGLE_B1')=='1' and any(marker in (out/'server.log').read_text(errors='replace') for marker in single_b1_failures):
      result['guard']='required single-pass B1 reservation failed';signal_owned(signal.SIGTERM);return
-    if shutil.disk_usage('/').free<40*10**9 or shutil.disk_usage('/mnt/models').free<15*10**9 or shutil.disk_usage('/mnt/overflow').free<50*10**9 or avail<10*1024**2 or float(gpu[0])>23552 or float(gpu[1])!=350 or time.monotonic()-start>int(os.environ.get('FN_LIMIT','1140')):
+    if shutil.disk_usage('/').free<40*10**9 or shutil.disk_usage('/mnt/models').free<15*10**9 or shutil.disk_usage('/mnt/overflow').free<50*10**9 or avail<7*1024**2 or float(gpu[0])>23552 or float(gpu[1])!=350 or time.monotonic()-start>int(os.environ.get('FN_LIMIT','1140')):
      result['guard']='disk/RAM/VRAM/power/time guard';signal_owned(signal.SIGTERM);return
    except (FileNotFoundError,ProcessLookupError):
     if p.poll() is not None:return

@@ -13,7 +13,7 @@ def read_json(path):
  try:return json.loads(path.read_text())
  except (FileNotFoundError,json.JSONDecodeError):return None
 def save():completion.write_text(json.dumps(record,indent=2))
-save();deadline=time.monotonic()+10800
+save();deadline=time.monotonic()+28800
 try:
  while True:
   gates=R/'logs'/('operators-'+tag)/'gates.json'

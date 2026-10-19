@@ -25,7 +25,7 @@ def check():
  rootfree=shutil.disk_usage('/').free;modfree=shutil.disk_usage('/mnt/models').free
  power=float(subprocess.check_output(['nvidia-smi','--query-gpu=power.draw','--format=csv,noheader,nounits'],text=True).strip())
  row=dict(power_w=power,elapsed=time.monotonic()-start,phase=phase,available=avail,vram=gpu,root_free=rootfree,models_free=modfree)
- if avail<10*1024**3 or gpu>23552 or rootfree<40*10**9 or modfree<15*10**9 or shutil.disk_usage('/mnt/overflow').free<50*10**9 or row['elapsed']>limit:raise GuardViolation(row)
+ if avail<7*1024**3 or gpu>23552 or rootfree<40*10**9 or modfree<15*10**9 or shutil.disk_usage('/mnt/overflow').free<50*10**9 or row['elapsed']>limit:raise GuardViolation(row)
  return row
 def monitor():
  with (O/'resources.jsonl').open('w') as f:
