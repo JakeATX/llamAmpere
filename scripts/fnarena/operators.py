@@ -31,7 +31,7 @@ with (output / 'test.log').open('w') as log:
             available = int(next(line.split()[1] for line in Path('/proc/meminfo').read_text().splitlines() if line.startswith('MemAvailable:'))) * 1024
             used, limit = map(float, subprocess.check_output(['nvidia-smi', '--query-gpu=memory.used,power.limit', '--format=csv,noheader,nounits'], text=True).strip().split(','))
             samples.append({'elapsed_s': time.monotonic() - started, 'available_bytes': available, 'vram_mib': used})
-            if available < 10 * 2**30 or used > 23552 or limit != 350:
+            if available < 7 * 2**30 or used > 23552 or limit != 350:
                 reason = 'host/card/power limit'
             if any(shutil.disk_usage(path).free < floor * 10**9 for path, floor in (('/', 40), ('/mnt/models', 15), ('/mnt/overflow', 50))):
                 reason = 'disk floor'
