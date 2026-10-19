@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -10,6 +11,15 @@
 #include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
+static pthread_once_t initialized = PTHREAD_ONCE_INIT;
+static int (*real_allocate)(int,off_t,off_t);
+static int (*real_temporary)(char *);
+static int (*real_unlink)(const char *);
+static void resolve_calls(void) {
+    real_allocate = dlsym(RTLD_NEXT,"posix_fallocate");
+    real_temporary = dlsym(RTLD_NEXT,"mkstemp");
+    real_unlink = dlsym(RTLD_NEXT,"unlink");
+}
 static uint64_t io_bytes(void) {
     char data[1024];
     int fd = open("/proc/thread-self/io", O_RDONLY | O_CLOEXEC);
@@ -29,27 +39,27 @@ static void emit(const char * op, const char * path, uint64_t before, struct tim
     errno = saved;
 }
 int posix_fallocate(int fd, off_t offset, off_t length) {
-    static int (*real_call)(int,off_t,off_t);
-    if (!real_call) real_call = dlsym(RTLD_NEXT,"posix_fallocate");
+    const int entry_errno = errno;
+    pthread_once(&initialized, resolve_calls);
     char link[64], path[4096]; snprintf(link,sizeof(link),"/proc/self/fd/%d",fd);
     ssize_t n=readlink(link,path,sizeof(path)-1);
     if(n<0)n=0;
     path[n]=0;
     struct timespec start;clock_gettime(CLOCK_REALTIME,&start);
-    uint64_t before=io_bytes();int result=real_call(fd,offset,length);
-    emit("posix_fallocate",path,before,start,result);return result;
+    uint64_t before=io_bytes();errno=entry_errno;int result=real_allocate(fd,offset,length);
+    emit("posix_fallocate",path,before,start,result);errno=entry_errno;return result;
 }
 int mkstemp(char * path) {
-    static int (*real_call)(char *);
-    if (!real_call) real_call = dlsym(RTLD_NEXT,"mkstemp");
+    const int entry_errno = errno;
+    pthread_once(&initialized, resolve_calls);
     struct timespec start;clock_gettime(CLOCK_REALTIME,&start);
-    uint64_t before=io_bytes();int result=real_call(path);
+    uint64_t before=io_bytes();errno=entry_errno;int result=real_temporary(path);
     emit("mkstemp",path,before,start,result);return result;
 }
 int unlink(const char * path) {
-    static int (*real_call)(const char *);
-    if (!real_call) real_call = dlsym(RTLD_NEXT,"unlink");
+    const int entry_errno = errno;
+    pthread_once(&initialized, resolve_calls);
     struct timespec start;clock_gettime(CLOCK_REALTIME,&start);
-    uint64_t before=io_bytes();int result=real_call(path);
+    uint64_t before=io_bytes();errno=entry_errno;int result=real_unlink(path);
     emit("unlink",path,before,start,result);return result;
 }
