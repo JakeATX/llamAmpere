@@ -2148,11 +2148,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 defer.tok[k0 + k] = batch_in.token[k];
                 defer.pos[k0 + k] = batch_in.pos[k];
                 defer.seq[k0 + k] = batch_in.seq_id[k][0];
-                // shift the tgt embeddings to the right by one position (see the non-deferred path)
-                if (k > 0) {
-                    if (!llama_copy_embeddings_nextn(ctx_tgt, defer.embd.data() + (k0 + k) * (size_t) n_embd,
-                                output_offset + k - 1, 1)) { return false; }
-                }
+            }
+            // Shift the target rows right by one. The deferred buffer owns this
+            // bounded copy; subsequent helper decodes no longer need its source pages.
+            if (n_tokens > 1 &&
+                    (!llama_copy_embeddings_nextn(ctx_tgt, defer.embd.data() + (k0 + 1) * (size_t) n_embd,
+                            output_offset, n_tokens - 1) ||
+                     !llama_release_embeddings_nextn(ctx_tgt, output_offset, n_tokens - 1))) {
+                return false;
             }
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 if (i_batch_beg[seq_id] < 0) {
@@ -2186,8 +2189,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                         common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { batch_in.seq_id[k][0] }, 0);
                     }
                     const int32_t skip = first == 0 ? 1 : 0;
-                    if (count > skip && !llama_copy_embeddings_nextn(ctx_tgt, batch.embd + (size_t) skip * n_embd,
-                                output_offset + first + skip - 1, count - skip)) { return false; }
+                    // Each helper batch owns a copy of the preceding target rows.
+                    // Release those file-backed pages before decoding this batch,
+                    // rather than retaining every refault across the whole prompt.
+                    // Later heads and accept() can refault the original bytes.
+                    if (count > skip &&
+                            (!llama_copy_embeddings_nextn(ctx_tgt, batch.embd + (size_t) skip * n_embd,
+                                    output_offset + first + skip - 1, count - skip) ||
+                             !llama_release_embeddings_nextn(ctx_tgt, output_offset + first + skip - 1, count - skip))) {
+                        ok = false;
+                        break;
+                    }
                     for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                         const int32_t i = i_batch_beg[seq_id] - first;
                         if (i >= 0 && i < count) {
@@ -2228,9 +2240,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             verify_h_rows[seq_id] = n_rows;
             verify_h_beg[seq_id] = output_offset + i_batch_beg[seq_id];
 
-            if (!llama_copy_embeddings_nextn(ctx_tgt, pending_h[seq_id].data(), output_offset + i_batch_end[seq_id], 1)) { return false; }
+            if (!llama_copy_embeddings_nextn(ctx_tgt, pending_h[seq_id].data(), output_offset + i_batch_end[seq_id], 1) ||
+                    !llama_release_embeddings_nextn(ctx_tgt, output_offset + i_batch_end[seq_id], 1)) { return false; }
         }
 
+        // Also release untouched boundary rows and the shared-KV path's rows.
         return llama_release_embeddings_nextn(ctx_tgt, output_offset, n_tokens);
     }
 
