@@ -40,6 +40,8 @@ def manifest(arm, directory, prefix):
                 size += len(chunk)
         result[path.name[len(prefix):]] = {'bytes': size, 'sha256': digest.hexdigest()}
     bench.require('' in result and '.ckpt' in result, 'saved cache bundle lacks main state or checkpoint sidecar')
+    if arm.args.mtp:
+        bench.require('.dft' in result, 'MTP cache bundle lacks draft state')
     bench.require(all(record['bytes'] > 0 for record in result.values()), 'saved cache file is empty')
     return result
 
@@ -82,7 +84,7 @@ def run(args):
     started = time.monotonic()
     deadline = started + args.timeout
     result = {'mode': 'cache', 'status': 'failed', 'resident_cells': args.resident, 'prompt_tokens': bench.PROMPT_N,
-              'diagnostic_tokens': 8, 'mtp': False, 'cold_process_restart': True, 'reserve_mib': args.reserve_mib,
+              'diagnostic_tokens': 8, 'mtp': args.mtp, 'cold_process_restart': True, 'reserve_mib': args.reserve_mib,
               'timeout_s': args.timeout, 'arms': []}
     arm = None
 
@@ -169,6 +171,7 @@ def main():
     parser.add_argument('--port', type=int, default=8095)
     parser.add_argument('--cache-budget-mib', type=int, default=0, help='0 selects --moe-cache auto')
     parser.add_argument('--reserve-mib', type=int, default=3072)
+    parser.add_argument('--mtp', action='store_true', help='round-trip target, MTP draft, and checkpoint sidecar bytes')
     parser.add_argument('--timeout', type=float, default=600, help='shared deadline for both server processes, at most 600 seconds')
     args = parser.parse_args()
     bench.require(0 < args.timeout <= 600, 'timeout must be positive and at most 600 seconds')

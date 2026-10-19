@@ -91,6 +91,7 @@ def validate_gate(kind, data):
         bench.require(status is not None and data.get('mode') == 'cache' and data.get('resident_cells') == 32768, 'cache evidence is not a resident gate')
         bench.require(data.get('prompt_tokens') == 100000 and data.get('serialized_bytes_equal') is True, 'cache gate lacks exact 100K saved bytes')
         bench.require(data.get('saved_files') and data['saved_files'] == data.get('roundtrip_files'), 'cache file manifests differ or are missing')
+        bench.require(data.get('mtp') is True and '.dft' in data['saved_files'], 'full MTP protocol requires exact draft cache bytes')
         bench.require(data.get('save', {}).get('n_saved', 0) >= 100000 and data.get('restore', {}).get('n_restored') == data['save']['n_saved'], 'cache gate restored the wrong token count')
     return 'complete'
 

@@ -310,7 +310,7 @@ class ServerArm:
             command += ['--no-warmup']
         if self.args.resident:
             command += ['--kv-resident', str(self.args.resident)]
-        if self.args.mode == 'protocol':
+        if self.args.mode == 'protocol' or getattr(self.args, 'mtp', False):
             command += ['-md', str(MTP), '--cpu-moe-draft', '--spec-type', 'draft-mtp-adaptive',
                         '--spec-draft-n-max', '4', '--spec-draft-ubatch', '2048']
         else:
