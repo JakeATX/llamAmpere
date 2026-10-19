@@ -33,7 +33,7 @@
 #include <vector>
 
 static constexpr uint32_t n_vocab = 32, n_embd = 256;
-static size_t scratch_borrows = 0, scratch_releases = 0;
+static size_t scratch_borrows = 0, scratch_releases = 0, compute_shares = 0;
 
 static void require(bool condition, const char * message) {
     if (!condition) {
@@ -113,7 +113,7 @@ struct contexts {
     common_speculative * spec = nullptr;
 
     contexts(llama_model * model, const cache_config & config, uint32_t batch_size = 128,
-            common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE, uint32_t ubatch_size = 0, uint32_t parallel = 2, uint32_t context_per_seq = 4096) {
+            common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE, uint32_t ubatch_size = 0, uint32_t parallel = 2, uint32_t context_per_seq = 4096, llama_model * draft_model = nullptr) {
         llama_context_params cp = llama_context_default_params();
         cp.n_batch = batch_size;
         cp.n_ubatch = ubatch_size ? ubatch_size : batch_size;
@@ -122,7 +122,7 @@ struct contexts {
         cp.kv_unified = false;
         cp.n_rs_seq = 4;
         cp.n_threads = cp.n_threads_batch = 2;
-        cp.offload_kqv = false;
+        cp.offload_kqv = model->n_devices() > 0;
         cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
         cp.type_k = config.k;
         cp.type_v = config.v;
@@ -146,7 +146,7 @@ struct contexts {
             cp.type_k = COMMON_SJKVARN_MTP_DRAFT_KV[0];
             cp.type_v = COMMON_SJKVARN_MTP_DRAFT_KV[1];
         }
-        dft = llama_init_from_model(model, cp);
+        dft = llama_init_from_model(draft_model ? draft_model : model, cp);
         require(dft != nullptr, "create draft context");
         common_params_speculative params;
         params.types = { type };
@@ -942,7 +942,7 @@ static void run_reserve_probe(uint32_t context_size, uint32_t parallel, const ch
     cp.n_rs_seq = 4;
     cp.kv_unified = true;
     cp.n_threads = cp.n_threads_batch = 2;
-    cp.offload_kqv = false;
+    cp.offload_kqv = model->n_devices() > 0;
     cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
     cp.type_k = cp.type_v = GGML_TYPE_TQ6_0;
     cp.sj_kvarn_bits_k = cp.sj_kvarn_bits_v = 4;
@@ -1024,10 +1024,74 @@ static void run_reserve_probe(uint32_t context_size, uint32_t parallel, const ch
     printf("PASS RESERVE_PROBE: real CPU no_alloc model graph and allocator measurements; no CUDA execution\n");
 }
 
+// The second GGUF must reuse identical storage and retain it after the donor model is freed.
+static void run_weight_borrow(llama_model * source, bool cuda = false) {
+    const auto close_file = [](FILE * f) { fclose(f); };
+    std::unique_ptr<FILE, decltype(close_file)> file(tmpfile(), close_file);
+    require(file != nullptr, "create borrowed-weight fixture file");
+    llama_model_saver saver(source);
+    saver.add_kv_from_model();
+    saver.add_tensors_from_model();
+    const bool recurrent[] = { true, false, false };
+    gguf_set_arr_data(saver.gguf_ctx, saver.llm_kv(LLM_KV_ATTENTION_RECURRENT_LAYERS).c_str(), GGUF_TYPE_BOOL, recurrent, 3);
+    saver.save(file.get());
+    fflush(file.get());
+    llama_model_params mp = llama_model_default_params();
+    ggml_backend_dev_t devices[] = { nullptr };
+    mp.devices = cuda ? nullptr : devices;
+    mp.n_gpu_layers = cuda ? 999 : 0;
+    mp.load_mode = LLAMA_LOAD_MODE_MMAP;
+    mp.load_mtp = true;
+    rewind(file.get());
+    llama_model_ptr donor(cuda ? llama_model_load_from_file_ptr(file.get(), mp) : make_model());
+    require(donor != nullptr, "load donor fixture");
+    mp.tensor_borrow_from = donor.get();
+    rewind(file.get());
+    llama_model_ptr borrower(llama_model_load_from_file_ptr(file.get(), mp));
+    require(borrower != nullptr, "load borrower fixture");
+    require(borrower->output == donor->output && borrower->tok_embd == donor->tok_embd, "identical weights share tensor and storage");
+    {
+        prefill_env_restore env;
+        common_set_env("LLAMA_SHARED_COMPUTE", "1");
+        const cache_config config { "separate-file q8", GGML_TYPE_Q8_0, GGML_TYPE_Q8_0 };
+        const size_t before = compute_shares;
+        contexts reference(donor.get(), config);
+        contexts separate(donor.get(), config, 128, COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE, 0, 2, 4096, borrower.get());
+        require(compute_shares >= before + 2, "same-device contexts activate serialized compute sharing");
+        prefill(reference, 0, 128, 0);
+        prefill(separate, 0, 128, 0);
+        separate.tgt->set_embeddings_nextn(false, false);
+        separate.tgt->set_embeddings_nextn(true, false);
+        separate.tgt->sched_reserve();
+        prefill(reference, 128, 256, 0);
+        prefill(separate, 128, 256, 0);
+        const auto a = save(reference, 0), b = save(separate, 0);
+        require(a.tgt == b.tgt && a.dft == b.dft && a.spec == b.spec, "separate-file state survives donor allocator reset");
+    }
+    float expected = 0;
+    ggml_backend_tensor_get(donor->output, &expected, 0, sizeof(expected));
+    const float changed = expected + 1.0f;
+    ggml_backend_tensor_set(donor->output, &changed, 0, sizeof(changed));
+    rewind(file.get());
+    llama_model_ptr different(llama_model_load_from_file_ptr(file.get(), mp));
+    require(different != nullptr && different->output != donor->output, "different bytes refuse weight sharing");
+    require(different->tok_embd == donor->tok_embd, "other identical weight can still share");
+    float actual = 0;
+    ggml_backend_tensor_get(different->output, &actual, 0, sizeof(actual));
+    require(actual == expected, "fallback loads helper bytes");
+    donor.reset();
+    ggml_backend_tensor_get(borrower->output, &actual, 0, sizeof(actual));
+    require(actual == changed, "borrowed weight survives donor model destruction");
+    printf("PASS %s separate-file weight borrowing, unequal-byte fallback, allocator replacement, donor lifetime\n", cuda ? "CUDA" : "CPU");
+}
+
 int main(int argc, char ** argv) {
     const bool reserve_probe = (argc == 4 || argc == 5) && std::strcmp(argv[1], "--reserve-probe") == 0;
     common_log_set_verbosity_thold(LOG_LEVEL_ERROR);
     llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
+        if (std::strstr(text, "MTP context will share the target context's compute buffers") != nullptr) {
+            ++compute_shares;
+        }
         if (std::strstr(text, "MTP prefill compute =") != nullptr) {
             ++scratch_borrows;
         }
@@ -1038,6 +1102,8 @@ int main(int argc, char ** argv) {
             fputs(text, stderr);
         }
     }, reserve_probe ? &argc : nullptr);
+    const bool cuda_sharing = argc == 2 && std::strcmp(argv[1], "--cuda-sharing-only") == 0;
+    if (cuda_sharing) { ggml_backend_load_all(); }
     llama_backend_init();
     int failed = 0;
     llama_model * model = nullptr;
@@ -1056,6 +1122,13 @@ int main(int argc, char ** argv) {
             const bool recurrent[] = { true, false, false };
             gguf_set_arr_data(saver.gguf_ctx, saver.llm_kv(LLM_KV_ATTENTION_RECURRENT_LAYERS).c_str(), GGUF_TYPE_BOOL, recurrent, 3);
             saver.save(argv[2]);
+            llama_model_free(model);
+            llama_backend_free();
+            return 0;
+        }
+        if (cuda_sharing) { require(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU) != nullptr, "CUDA backend is available"); }
+        run_weight_borrow(model, cuda_sharing);
+        if (cuda_sharing || (argc == 2 && std::strcmp(argv[1], "--weight-borrow-only") == 0)) {
             llama_model_free(model);
             llama_backend_free();
             return 0;

@@ -4309,9 +4309,13 @@ size_t ggml_backend_cuda_pool_trim(ggml_backend_t backend) {
             if (!pool) {
                 continue;
             }
-            if (dynamic_cast<ggml_cuda_pool_shared_ref *>(pool)) {
-                ++shared_pools;
-                continue;
+            if (auto * ref = dynamic_cast<ggml_cuda_pool_shared_ref *>(pool)) {
+                if (ref->pool.use_count() > 1) {
+                    ++shared_pools;
+                    continue;
+                }
+                // The peer detached and cleared its graphs; this context is the only remaining owner.
+                pool = ref->pool.get();
             }
             if (auto * legacy = dynamic_cast<ggml_cuda_pool_leg *>(pool)) {
                 const size_t before = legacy->pool_size;
@@ -4353,7 +4357,8 @@ static bool ggml_backend_cuda_reset_scratch(ggml_backend_t backend) {
 static constexpr size_t GGML_CUDA_BORROWED_BLAS_BYTES = 4ull * 1024 * 1024;
 
 static bool ggml_cuda_borrowed_weight_type(ggml_type type) {
-    return type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_Q5_0 || type == GGML_TYPE_Q8_0 ||
+    return type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_IQ3_S || type == GGML_TYPE_Q5_0 || type == GGML_TYPE_Q8_0 ||
+           type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K ||
            type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16;
 }
 
@@ -4392,6 +4397,10 @@ static bool ggml_cuda_borrowed_plan(ggml_backend_cuda_context & ctx, const ggml_
             case GGML_OP_CONCAT:
             case GGML_OP_ROPE:
             case GGML_OP_TURBO_WHT:
+            case GGML_OP_REPEAT:
+            case GGML_OP_FILL:
+            case GGML_OP_UNARY:
+            case GGML_OP_DSV4_HC_PRE:
                 break;
             case GGML_OP_GET_ROWS:
                 if (!ggml_cuda_borrowed_weight_type(node->src[0]->type) &&
@@ -4415,10 +4424,9 @@ static bool ggml_cuda_borrowed_plan(ggml_backend_cuda_context & ctx, const ggml_
                 const ggml_tensor * w = node->src[0];
                 const ggml_tensor * x = node->src[1];
                 if (!w->buffer || w->buffer->buft != ggml_backend_cuda_buffer_type(ctx.device) ||
-                        !ggml_cuda_borrowed_weight_type(w->type) || x->type != GGML_TYPE_F32 || node->type != GGML_TYPE_F32 ||
+                        !ggml_cuda_borrowed_weight_type(w->type) || (x->type != GGML_TYPE_F32 && x->type != GGML_TYPE_BF16) || node->type != GGML_TYPE_F32 ||
                         w->ne[2] != 1 || w->ne[3] != 1 || x->ne[2] != 1 || x->ne[3] != 1 ||
-                        x->ne[1] < 1 || x->ne[1] > 1024 || !ggml_is_contiguous(w) || !ggml_is_contiguous(x) || !ggml_is_contiguous(node) ||
-                        !((w->ne[0] == 10240 && w->ne[1] == 5120) || (w->ne[0] == 5120 && w->ne[1] == 1024))) {
+                        x->ne[1] < 1 || x->ne[1] > 8192 || !ggml_is_contiguous(w) || !ggml_is_contiguous(x) || !ggml_is_contiguous(node)) {
                     return false;
                 }
                 const auto route = ggml_cuda_mul_mat_route(w, x, node, cc, warp_size);
@@ -4441,7 +4449,7 @@ static bool ggml_cuda_borrowed_plan(ggml_backend_cuda_context & ctx, const ggml_
                     if (x->type != type) {
                         allocs.push_back(ggml_nelements(x) * ts);
                     }
-                    if (type == GGML_TYPE_F16) {
+                    if (type != GGML_TYPE_F32) {
                         allocs.push_back(ggml_nelements(node) * ts);
                     }
                 }

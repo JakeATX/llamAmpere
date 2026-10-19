@@ -63,6 +63,7 @@ struct llama_context {
     //   - changing attention type
     //   - etc.
     void sched_reserve();
+    void detach_compute_borrower();
 
     void synchronize();
     ggml_backend_t sj_kvarn_backend(ggml_backend_buffer_t buffer) const;
@@ -77,7 +78,7 @@ struct llama_context {
     ggml_backend_sched_t get_sched() const;
     int b1_status() const {
         if (!b1_tried) { return -1; }
-        if (!b1 || moe_cache || compute_peer) { return 0; }
+        if (!b1 || moe_cache) { return 0; }
         for (bool extract : cparams.embeddings_layer_inp) {
             if (extract) { return 0; }
         }

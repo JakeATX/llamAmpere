@@ -21,6 +21,7 @@
 #include "llama-kv-stream-config.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-hybrid.h"
+#include "llama-memory-hybrid-idx.h"
 #include "llama-memory-recurrent.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
@@ -947,8 +948,9 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
         ggml_backend_dev_get_props(model.dev_output(), &mtp_props);
         mtp_scratch_enabled = mtp_scratch && strcmp(mtp_scratch, "1") == 0 &&
             (!kv_only || strcmp(kv_only, "0") != 0) && cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
-            model.arch == LLM_ARCH_QWEN35 && model.hparams.n_layer_nextn == 1 && params.ctx_other &&
-            &params.ctx_other->get_model() == &model && model.n_devices() <= 1 &&
+            (model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN4EXP) && model.hparams.n_layer_nextn == 1 && params.ctx_other &&
+            model.dev_output() == params.ctx_other->model.dev_output() && model.n_devices() <= 1 &&
+            params.ctx_other->model.n_devices() <= 1 && params.ctx_other->model.split_mode() != LLAMA_SPLIT_MODE_TENSOR &&
             model.split_mode() != LLAMA_SPLIT_MODE_TENSOR &&
             (mtp_props.type == GGML_BACKEND_DEVICE_TYPE_CPU || mtp_props.caps.events);
         if (mtp_scratch_enabled) {
@@ -957,7 +959,7 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
         }
         mtp_reserve_tight = mtp_tight && strcmp(mtp_tight, "1") == 0 &&
             (!kv_only || strcmp(kv_only, "0") != 0) && cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
-            model.arch == LLM_ARCH_QWEN35 && model.hparams.n_layer_nextn == 1;
+            (model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN4EXP) && model.hparams.n_layer_nextn == 1;
         mtp_reserve_tight = mtp_reserve_tight || mtp_scratch_enabled;
         if (mtp_reserve_tight) {
             LLAMA_LOG_INFO("%s: LLAMA_MTP_RESERVE_TIGHT=1: reserve KV-only prefill and deferred generation rows\n", __func__);
@@ -971,7 +973,7 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
             LLAMA_LOG_INFO("%s: GGML_MTP_PREFILL_ASYNC=1: private MTP compute and scratch buffers\n", __func__);
         }
 
-        // share the target's compute buffers with an MTP context of the same model (default on,
+        // share the target's compute buffers with an MTP context on the same device (default on,
         // LLAMA_SHARED_COMPUTE=0 disables): the two graphs never run at the same time
         {
             const char * env = getenv("LLAMA_SHARED_COMPUTE");
@@ -980,8 +982,11 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
             // the donor's graph allocation resets while the MTP context still reuses its graph (each context gets
             // its own compute buffers instead)
             if (enabled && !mtp_prefill_async && cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && params.ctx_other != nullptr &&
-                    &params.ctx_other->get_model() == &model && model.n_devices() == 1 &&
+                    model.n_devices() <= 1 && params.ctx_other->model.n_devices() <= 1 &&
+                    model.dev_output() == params.ctx_other->model.dev_output() &&
+                    params.ctx_other->model.split_mode() != LLAMA_SPLIT_MODE_TENSOR &&
                     model.split_mode() != LLAMA_SPLIT_MODE_TENSOR &&
+                    backend_buft == params.ctx_other->backend_buft &&
                     params.ctx_other->compute_peer == nullptr) {
                 compute_peer = params.ctx_other;
                 compute_peer->compute_peer = this;
@@ -1042,6 +1047,8 @@ llama_context::~llama_context() {
         clients.erase(std::remove(clients.begin(), clients.end(), this), clients.end());
     }
     if (compute_peer != nullptr) {
+        compute_peer->synchronize();
+        if (compute_peer->sched) { ggml_backend_sched_set_donor(compute_peer->sched.get(), nullptr); }
         if (compute_peer->compute_peer == this) {
             compute_peer->compute_peer = nullptr;
         }
@@ -1646,15 +1653,37 @@ bool llama_context::kv_stream_switch_phase(bool decode, uint32_t active_tokens) 
     return true;
 }
 
+void llama_context::detach_compute_borrower() {
+    for (auto * client : mtp_scratch_clients) { client->mtp_scratch_end(); }
+    // fork: Replacing the target allocator must not leave the helper's donor pointer stale.
+    if (compute_peer && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && compute_peer->sched) {
+        compute_peer->synchronize();
+        ggml_backend_sched_set_donor(compute_peer->sched.get(), nullptr);
+        for (auto & backend : compute_peer->backends) {
+            auto * dev = ggml_backend_get_device(backend.get());
+            using reset_fn = bool (*)(ggml_backend_t);
+            auto reset = (reset_fn) ggml_backend_reg_get_proc_address(
+                    ggml_backend_dev_backend_reg(dev), "ggml_backend_cuda_reset_scratch");
+            if (reset && !reset(backend.get())) {
+                throw std::runtime_error("failed to reset helper CUDA scratch before target reserve");
+            }
+        }
+        for (auto & res : compute_peer->gf_res_prev) { res.reset(); }
+        compute_peer->gf_res_prev_active = nullptr;
+        if (!ggml_backend_sched_reset_compute(compute_peer->sched.get())) {
+            throw std::runtime_error("failed to release helper compute before target reserve");
+        }
+        compute_peer->sched_need_reserve = true;
+    }
+}
+
 void llama_context::sched_reserve() {
     if (!sched_need_reserve) {
         return;
     }
 
-    for (auto * client : mtp_scratch_clients) {
-        client->mtp_scratch_end();
-    }
     mtp_scratch_end();
+    detach_compute_borrower();
     sched_need_reserve = false;
 
     LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
@@ -1760,7 +1789,7 @@ void llama_context::sched_reserve() {
     if (getenv("LLAMA_SHARED_COMPUTE_DEBUG") != nullptr) {
         fprintf(stderr, "shared-compute: sched_reserve peer=%p peer_sched=%p\n", (void *) compute_peer, compute_peer ? (void *) compute_peer->sched.get() : nullptr);
     }
-    if (compute_peer != nullptr && compute_peer->sched) {
+    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && compute_peer != nullptr && compute_peer->sched) {
         if (!ggml_backend_sched_set_donor(sched.get(), compute_peer->sched.get())) {
             LLAMA_LOG_WARN("%s: could not share compute buffers with the peer context\n", __func__);
         } else if (const char * env = getenv("LLAMA_SHARED_POOL"); env == nullptr || env[0] != '0') {
@@ -3048,8 +3077,21 @@ void llama_context::mtp_scratch_prepare(bool kv_only) {
     const size_t floor = type == GGML_BACKEND_DEVICE_TYPE_CPU ? 0 : 500ull * 1024 * 1024;
     ggml_backend_sched_synchronize(mtp_scratch_target->sched.get());
     auto views = cache->scratch_borrow(buft, chunk_bytes, chunks, floor,
-            mtp_scratch_target->cparams.n_batch + 2 * mtp_scratch_target->cparams.n_ubatch,
+            2 * mtp_scratch_target->cparams.n_ubatch,
             [](void * user) { static_cast<llama_context *>(user)->mtp_scratch_end(); }, this);
+    // A resident QSA body is host-backed. Its indexer has an ordinary device KV suffix instead.
+    if (views.size() < chunks) {
+        cache->scratch_release();
+        views.clear();
+        if (auto * hybrid = dynamic_cast<llama_memory_hybrid_idx *>(mtp_scratch_target->memory.get())) {
+            cache = hybrid->get_mem_idx();
+            if (cache) {
+                views = cache->scratch_borrow(buft, chunk_bytes, chunks, floor,
+                        2 * mtp_scratch_target->cparams.n_ubatch,
+                        [](void * user) { static_cast<llama_context *>(user)->mtp_scratch_end(); }, this);
+            }
+        }
+    }
     if (views.empty()) {
         return;
     }
@@ -3930,7 +3972,7 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_ext * batch) {
     const char * rotate = getenv("LLAMA_MOE_CACHE_RELEASE_PROMPT");
     if (!rotate || rotate[0] != '1' || cparams.warmup || !cparams.causal_attn || cparams.training ||
-            cparams.embeddings || compute_peer || kv_stream_phase_arena.configured || cparams.n_ubatch <= 512) {
+            cparams.embeddings || kv_stream_phase_arena.configured || cparams.n_ubatch <= 512) {
         return true;
     }
     bool alone = batch != nullptr;
@@ -4108,6 +4150,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     if (auto * kv = llama_sj_kvarn_cache(memory.get()); kv && !kv->scratch_safe(n_tokens_all)) {
         kv->scratch_cancel();
+    }
+    if (auto * hybrid = dynamic_cast<llama_memory_hybrid_idx *>(memory.get())) {
+        if (auto * kv = hybrid->get_mem_idx(); kv && !kv->scratch_safe(n_tokens_all)) {
+            kv->scratch_cancel();
+        }
     }
 
     if (output_all) {
@@ -5384,13 +5431,12 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
     };
 
     // per call: the conditions another component may have changed since construction
-    if (moe_cache || compute_peer || std::any_of(cparams.embeddings_layer_inp.begin(), cparams.embeddings_layer_inp.end(),
+    if (moe_cache || std::any_of(cparams.embeddings_layer_inp.begin(), cparams.embeddings_layer_inp.end(),
                 [](bool b) { return b; })) {
         if (!b1_off_logged) {
             b1_off_logged = true;
             LLAMA_LOG_WARN("%s: [B1] prompts take the normal path: %s\n", __func__,
                 moe_cache ? "the MoE cache is on (--moe-cache off enables B1)" :
-                compute_peer ? "an MTP context of the same model shares the compute buffers (LLAMA_SHARED_COMPUTE=0 enables B1)" :
                 "layer inputs are being extracted");
         }
         return normal();
@@ -5470,6 +5516,7 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
         model.hparams.n_embd <= 65536 && model.hparams.n_expert <= 4096 && model.hparams.n_expert_used() <= 128;
     b1->set_ffn_enabled(packed_ffn);
     const bool lean_legacy = b1_layer_scratch_active && !packed_ffn;
+    detach_compute_borrower();
     bool planned = b1->begin(sizes, group_ub, lend_cap, final_home, rotating ? &borrow : nullptr, lean_legacy);
     if (!planned && borrow > 0) {
         synchronize();

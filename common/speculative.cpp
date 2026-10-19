@@ -1849,7 +1849,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const uint32_t flags = (adaptive ? 1u : 0u) | (defer_enabled ? 2u : 0u);
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
         const size_t retained = std::count_if(defer.seq.begin(), defer.seq.end(), [seq_id](llama_seq_id id) { return id != seq_id; });
-        if (retained + header[2] > (size_t) defer_capacity()) {
+        // Each restored sequence may carry a full deferred tail; flush_deferred splits the combined rows.
+        if (retained + header[2] > (size_t) n_seq * defer_max) {
             return;
         }
         if (header[0] != 0x3150544d || header[1] != (uint32_t) n_embd || header[2] > (uint32_t) defer_max || header[7] != flags ||
@@ -2194,7 +2195,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                             std::memcpy(batch.embd + (size_t) i * n_embd, pending_h[seq_id].data(), row_bytes);
                         }
                     }
-                    const int32_t rc = llama_decode(ctx_dft, batch);
+                    int32_t rc = -4;
+                    if (prefill_device && !chain_heads && first == 0 && count == n_tokens && output_offset == 0) {
+                        std::vector<const float *> carry(n_seq);
+                        for (uint32_t seq = 0; seq < n_seq; ++seq) { carry[seq] = pending_h[seq].data(); }
+                        rc = llama_mtp_prefill_decode(ctx_dft, ctx_tgt, batch, carry.data(), n_seq);
+                    }
+                    if (rc == -4) { rc = llama_decode(ctx_dft, batch); }
                     if (rc != 0) {
                         SPC_ERR("llama_decode(ctx_dft) head=%d failed rc=%d (pos=%d)\n", head, (int) rc, (int) batch.pos[0]);
                         ok = false;
@@ -2212,7 +2219,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         // The target's NextN rows are unmasked and reordered by the bulk getter. Avoid one backend sync per token while the draft runs.
-        const float * h_bulk = prefill_overlap ? llama_get_embeddings_nextn(ctx_tgt) : nullptr;
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_batch_end[seq_id] < 0) {
                 continue;
@@ -4116,6 +4122,10 @@ common_speculative_init_result::common_speculative_init_result(
         model_path = params.speculative.draft.mparams.path;
         LOG_INF("%s: loading draft model '%s'\n", __func__, model_path.c_str());
 
+        if (spec_mtp) {
+            const char * borrow = getenv("LLAMA_MTP_BORROW_WEIGHTS");
+            if (!borrow || strcmp(borrow, "0") != 0) { mparams.tensor_borrow_from = model_tgt; }
+        }
         llama_model * model_dft = llama_model_load_from_file(model_path.c_str(), mparams);
         if (model_dft == NULL) {
             LOG_ERR("%s: failed to load draft model, '%s'\n", __func__, model_path.c_str());

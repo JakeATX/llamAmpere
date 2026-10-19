@@ -1500,6 +1500,39 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     return tensor;
 }
 
+bool llama_model_loader::try_borrow_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, ggml_tensor * donor) {
+    const auto * meta = get_tensor_meta(tn.str().c_str());
+    if (no_alloc || files.empty() || !meta || !donor || !donor->buffer || !donor->data || strcmp(meta->name, donor->name) != 0 ||
+            meta->type != donor->type || !ggml_are_same_shape(meta, donor) || !ggml_is_contiguous(donor) ||
+            ggml_exl3_bits(donor->type) || donor->type == GGML_TYPE_NVFP4 ||
+            ggml_backend_buft_get_alloc_size(ggml_backend_buffer_get_type(donor->buffer), donor) != ggml_nbytes(donor)) {
+        return false;
+    }
+    check_tensor_dims(tn.str(), std::vector<int64_t>(ne), true, false);
+    const auto & weight = require_weight(tn.str().c_str());
+    if (files.at(weight.idx)->read_alignment() != 1) { return false; }
+    const size_t bytes = ggml_nbytes(meta);
+    // Compare before mapping/loading the helper; keep host scratch bounded to two MiB.
+    std::vector<uint8_t> file_bytes(1 << 20), donor_bytes(1 << 20);
+    for (size_t offset = 0; offset < bytes; ) {
+        const size_t count = std::min(file_bytes.size(), bytes - offset);
+        auto & file = files.at(weight.idx);
+        file->seek(weight.offs + offset, SEEK_SET);
+        file->read_raw(file_bytes.data(), count);
+        ggml_backend_tensor_get(donor, donor_bytes.data(), offset, count);
+        if (memcmp(file_bytes.data(), donor_bytes.data(), count) != 0) {
+            LLAMA_LOG_INFO("%s: %s differs from target; loading its own storage\n", __func__, meta->name);
+            return false;
+        }
+        offset += count;
+    }
+    ++n_created;
+    size_data -= bytes;
+    LLAMA_LOG_INFO("%s: borrowing target %s (%s, %.2f MiB); no second weight allocation\n", __func__,
+            donor->name, ggml_type_name(donor->type), bytes / 1048576.0);
+    return true;
+}
+
 void llama_model_loader::done_getting_tensors(bool partial) const {
     if (n_created > n_tensors) {
         throw std::runtime_error(format("%s: too many tensors created; expected %d, got %d", __func__, n_tensors, n_created));

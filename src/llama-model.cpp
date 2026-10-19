@@ -1299,6 +1299,8 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
 }
 
 struct llama_model::impl {
+    std::shared_ptr<impl> tensor_donor;
+
     impl() = default;
     ~impl() = default;
 
@@ -1388,7 +1390,10 @@ void llama_prec_policy::load(llama_model_loader & ml, const llama_model & model)
     }
 }
 
-llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
+llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_shared<impl>()) {
+    if (params.tensor_borrow_from) {
+        pimpl->tensor_donor = params.tensor_borrow_from->pimpl;
+    }
     if (params.tensor_split != nullptr) {
         // llama_model_params stores tensor_split as a borrowed pointer, but the model
         // may need it later for tensor-parallel KV-cache split metadata.
@@ -2473,6 +2478,17 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 }
 
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
+    // fork: Reuse only dense, byte-identical tensors. The donor retains their buffers and metadata.
+    if (params.tensor_borrow_from && n_devices() <= 1 && params.tensor_borrow_from->n_devices() <= 1 &&
+            dev_output() == params.tensor_borrow_from->dev_output() && split_mode() != LLAMA_SPLIT_MODE_TENSOR &&
+            params.tensor_borrow_from->split_mode() != LLAMA_SPLIT_MODE_TENSOR && !(flags & (TENSOR_SKIP | TENSOR_DUPLICATED | TENSOR_ALLOW_RESHAPE)) &&
+            (tn.tensor == LLM_TENSOR_OUTPUT || tn.tensor == LLM_TENSOR_TOKEN_EMBD)) {
+        auto * donor = tn.tensor == LLM_TENSOR_OUTPUT ? params.tensor_borrow_from->output : params.tensor_borrow_from->tok_embd;
+        if (donor && ml.try_borrow_tensor(tn, ne, donor)) {
+            tensors_by_name.emplace_back(donor->name, donor);
+            return donor;
+        }
+    }
     const buft_list_t * buft_list_layer = nullptr;
     if (tn.bid != -1) {
         // blocks that are not model layers (e.g. the blocks of a head) go with the output
@@ -3560,6 +3576,7 @@ llama_model_params llama_model_default_params() {
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
+        /*.tensor_borrow_from          =*/ nullptr,
         /*.vocab_only                  =*/ false,
         /*.check_tensors               =*/ false,
         /*.use_extra_bufts             =*/ true,
