@@ -50,6 +50,7 @@ public:
     llm_b1_ffn * ffn_group() { return ffn_all.get(); }
     bool ffn_gather();
     void ffn_release();
+    const std::vector<uint32_t> & ubatch_sizes() const { return ub_n; }
     size_t scratch_bytes(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub) const;
     void pass_begin(size_t ub);
     void pass_compute(size_t ub, int64_t host_us);

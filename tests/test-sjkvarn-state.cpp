@@ -22,6 +22,7 @@
 #include "ggml-sjkvarn.h"
 #include "ggml-backend.h"
 #include "llama.h"
+#include "llama-cpp.h"
 
 #include "gguf.h"
 
@@ -806,7 +807,80 @@ static std::string write_transform(const char * dir, const char * name, uint32_t
     return path;
 }
 
+static void scratch_views_case(llama_model * model, sj_cfg cfg) {
+    llama_context_ptr ctx(make_ctx(model, cfg));
+    require(ctx != nullptr, "scratch context created");
+    auto * kv = cache_of(ctx.get());
+    auto * buft = ggml_backend_buffer_get_type(kv->get_k_storage(0)->buffer);
+    if (getenv("SJ_TEST_GPU")) {
+        auto * device = ggml_backend_buft_get_device(buft);
+        require(device && ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_GPU,
+                "scratch views must use the requested GPU");
+    }
+    printf("scratch-views: %s buffer=%s\n", cfg.plain ? "plain" : "SJ-KVaRN", ggml_backend_buft_name(buft));
+    constexpr uint32_t prompt_limit = 512;
+    uint32_t protected_cells = prompt_limit;
+    if (cfg.plain) {
+        // A cold sequence in a reused cache need not occupy cells starting at zero.
+        // Place a low logical position beyond the token-count loan boundary.
+        llama_pos pos = 0;
+        int32_t n_seq_id = 1;
+        llama_seq_id seq_id = 0;
+        llama_seq_id * seq_ids = &seq_id;
+        llama_ubatch ubatch = {};
+        ubatch.n_tokens = ubatch.n_seq_tokens = ubatch.n_seqs = ubatch.n_seqs_unq = ubatch.n_pos = 1;
+        ubatch.pos = &pos;
+        ubatch.n_seq_id = &n_seq_id;
+        ubatch.seq_id = &seq_ids;
+        llama_kv_cache::slot_info slot = {};
+        slot.strm = {0};
+        slot.idxs = {{768}};
+        kv->apply_ubatch(slot, ubatch);
+        require(kv->get_cells(0).used_max_p1() == 769, "offset physical cell fixture applied");
+        protected_cells = kv->get_n_kv(slot);
+        require(protected_cells == 1024, "masked attention pads beyond occupied physical cells");
+    }
+    for (int32_t first_unused : {2, 4}) {
+        for (int32_t il = 0; il < 4; ++il) {
+            for (auto * t : {kv->get_k_storage(il), kv->get_v_storage(il), cfg.plain ? nullptr : kv->get_sj_kvarn_body(il)}) {
+                if (!t) { continue; }
+                ggml_backend_tensor_memset(t, 0xa5, 0, ggml_nbytes(t));
+            }
+        }
+        auto views = kv->b1_scratch_views(buft, first_unused, prompt_limit);
+        require(!views.empty(), "scratch views exist");
+        for (auto & view : views) { ggml_backend_buffer_clear(view.get(), 0x3c); }
+        size_t touched = 0;
+        for (int32_t il = 0; il < 4; ++il) {
+            for (auto * t : {kv->get_k_storage(il), kv->get_v_storage(il), cfg.plain ? nullptr : kv->get_sj_kvarn_body(il)}) {
+                if (!t) { continue; }
+                std::vector<uint8_t> bytes(ggml_nbytes(t));
+                ggml_backend_tensor_get(t, bytes.data(), 0, bytes.size());
+                size_t protected_end = bytes.size();
+                if (il >= first_unused) {
+                    protected_end = 0;
+                } else if (cfg.plain) {
+                    protected_end = protected_cells * t->nb[1];
+                } else if (t == kv->get_sj_kvarn_body(il)) {
+                    // 512 cells: 128 sink cells followed by three sealed groups of 128.
+                    protected_end = 3 * ggml_sj_kvarn_rec_bytes(256, 128, 4, 4) * 2;
+                }
+                for (size_t i = 0; i < bytes.size(); ++i) {
+                    if (i < protected_end) { require(bytes[i] == 0xa5, "live KV bytes were preserved"); }
+                    else if (bytes[i] == 0x3c) { ++touched; }
+                    else { require(bytes[i] == 0xa5, "untouched padding preserved"); }
+                }
+            }
+        }
+        require(touched > 0, "borrowed views were written");
+    }
+    llama_context_ptr multi(make_ctx(model, cfg, 2));
+    require(multi != nullptr, "multi scratch context created");
+    require(cache_of(multi.get())->b1_scratch_views(buft, 0, 512).empty(), "multiple streams refuse borrowing");
+}
+
 int main(int argc, char ** argv) {
+    const bool scratch_views = argc > 1 && strcmp(argv[1], "--scratch-views") == 0;
     const bool resident = argc > 1 && strcmp(argv[1], "--resident") == 0;
     const bool scalar_only = argc > 1 && strcmp(argv[1], "--scalar-only") == 0;
     const bool device_bytes = argc > 1 && strcmp(argv[1], "--device-bytes") == 0;
@@ -824,6 +898,22 @@ int main(int argc, char ** argv) {
     }
 
     const sj_cfg s44  = { "4/4",        4, 4, GGML_TYPE_F32 };
+    if (scratch_views) {
+        int result = 0;
+        try {
+            scratch_views_case(model, s44);
+            sj_cfg plain = s44;
+            plain.plain = true;
+            scratch_views_case(model, plain);
+            printf("OK: empty future layers and unused cell suffixes preserve live bytes; multiple streams refuse borrowing\n");
+        } catch (const std::exception & e) {
+            fprintf(stderr, "scratch views: FAIL: %s\n", e.what());
+            result = 1;
+        }
+        llama_model_free(model);
+        llama_backend_free();
+        return result;
+    }
     if (device_bytes) {
         int result = 0;
         try {

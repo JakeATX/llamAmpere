@@ -149,6 +149,9 @@ struct ggml_moe_cache_api {
     void (*prefetch_observe)(void * session, int layer, const int32_t * ids, int n_ids);
     void (*prefetch_configure)(void * session, int mode);
 
+    // A prompt returned a suspended pool; the replacement session is past startup.
+    void (*prompt_resume)(void * session);
+
 };
 
 GGML_API void ggml_backend_sched_moe_cache_prefetch_configure(ggml_backend_sched_t sched, int mode);

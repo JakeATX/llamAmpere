@@ -2457,6 +2457,73 @@ ggml_tensor * llama_kv_cache::get_v_storage(int32_t il) const {
     return layers[ikv].v;
 }
 
+std::vector<ggml_backend_buffer_ptr> llama_kv_cache::b1_scratch_views(
+        ggml_backend_buffer_type_t buft, int32_t first_unused_layer, uint32_t prompt_cells) const {
+    std::vector<ggml_backend_buffer_ptr> result;
+    if (!buft || n_stream != 1 || n_swa || other || kv_stream_runtime.runtime || get_has_shift() || !sc_info.empty()) {
+        return result;
+    }
+    const size_t alignment = ggml_backend_buft_get_alignment(buft);
+    if (!alignment) { return result; }
+    // B1 has applied every ubatch's cell metadata before borrowing. A reused plain
+    // cache can place a cold sequence beyond cell zero; token count alone does not
+    // bound those physical writes. Attention can read masked padding too: protect
+    // the same padded frontier as get_n_kv(), not only the occupied cells.
+    const uint32_t cell_pad = std::max(n_pad, 256u);
+    const uint32_t occupied_end = std::min(v_cells[0].size(),
+            std::max(cell_pad, GGML_PAD(v_cells[0].used_max_p1(), cell_pad)));
+    const uint32_t protected_cells = std::max(prompt_cells, occupied_end);
+    struct span { ggml_backend_buffer_t parent; size_t offset; size_t size; };
+    std::vector<span> spans;
+    auto add = [&](ggml_tensor * t, size_t offset) {
+        if (!t || !t->buffer || !t->data || ggml_backend_buffer_get_type(t->buffer) != buft || offset >= ggml_nbytes(t)) { return; }
+        auto * parent = t->buffer;
+        const size_t base = (char *) t->data - (char *) ggml_backend_buffer_get_base(parent);
+        const size_t size = ggml_nbytes(t) - offset;
+        const size_t begin = base + offset;
+        const size_t pad = (alignment - begin % alignment) % alignment;
+        if (pad >= size) { return; }
+        const size_t length = (size - pad) / alignment * alignment;
+        if (length) { spans.push_back({parent, begin + pad, length}); }
+    };
+    for (const auto & layer : layers) {
+        if ((int32_t) layer.il >= first_unused_layer) {
+            add(layer.k, 0);
+            add(layer.v, 0);
+            add(layer.body, 0);
+        } else if (!sj_kvarn.enabled()) {
+            for (auto * t : {layer.k, v_trans ? nullptr : layer.v}) {
+                if (t && protected_cells < t->ne[1]) { add(t, (size_t) protected_cells * t->nb[1]); }
+            }
+        } else if (!sj_kvarn_paged && layer.body) {
+            const uint64_t end = prompt_cells > sj_kvarn.sink ? prompt_cells - sj_kvarn.sink : 0;
+            const uint64_t groups = (end + sj_kvarn.group - 1) / sj_kvarn.group;
+            if (groups < sj_kvarn_n_groups) {
+                add(layer.body, (size_t) groups * layer.sj_kvarn_rec_bytes * hparams.n_head_kv(layer.il));
+            }
+        }
+    }
+    std::sort(spans.begin(), spans.end(), [](const span & a, const span & b) {
+        if (a.parent != b.parent) { return std::less<ggml_backend_buffer_t>{}(a.parent, b.parent); }
+        return a.offset < b.offset;
+    });
+    std::vector<span> merged;
+    for (const auto & span : spans) {
+        if (!merged.empty() && merged.back().parent == span.parent &&
+                span.offset <= merged.back().offset + merged.back().size) {
+            const size_t end = std::max(merged.back().offset + merged.back().size, span.offset + span.size);
+            merged.back().size = end - merged.back().offset;
+        } else {
+            merged.push_back(span);
+        }
+    }
+    for (const auto & span : merged) {
+        ggml_backend_buffer_ptr view(ggml_backend_buffer_view(span.parent, span.offset, span.size));
+        if (view) { result.push_back(std::move(view)); }
+    }
+    return result;
+}
+
 bool llama_kv_cache::get_v_transposed() const {
     return v_trans;
 }
