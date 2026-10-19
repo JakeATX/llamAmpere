@@ -54,6 +54,16 @@ static void check_builtins() {
         has_64k |= b->tok_fp == b0->tok_fp && b->n_vocab == b0->n_vocab && std::strcmp(b->arch, b0->arch) == 0 && b->n_sel == 65536;
     }
     GGML_ASSERT(!has_64k || pick->n_sel == 65536);
+
+    // Flash-Next (qwen4exp) shares tokenizer fingerprint 4f951848e41f4b37 with Qwen3.8-27B.
+    // auto must pick the 65,536 list for qwen4exp and must not hand that row to qwen35.
+    const llama_mtp_vocab_builtin * flash = llama_mtp_vocab_builtin_find(0x4f951848e41f4b37ULL, 248320, "qwen4exp", 0);
+    GGML_ASSERT(flash != nullptr && std::strcmp(flash->arch, "qwen4exp") == 0 && flash->n_sel == 65536);
+    const llama_mtp_vocab_builtin * q35 = llama_mtp_vocab_builtin_find(0x4f951848e41f4b37ULL, 248320, "qwen35", 0);
+    GGML_ASSERT(q35 != nullptr && std::strcmp(q35->arch, "qwen35") == 0 && q35->n_sel == 65536);
+    GGML_ASSERT(flash != q35);
+    const llama_mtp_vocab_builtin * flash32 = llama_mtp_vocab_builtin_find(0x4f951848e41f4b37ULL, 248320, "qwen4exp", 32768);
+    GGML_ASSERT(flash32 != nullptr && flash32->n_sel == 32768 && std::strcmp(flash32->arch, "qwen4exp") == 0);
 }
 
 int main(int argc, char ** argv) {

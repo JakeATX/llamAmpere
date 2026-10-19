@@ -868,7 +868,7 @@ protected:
     llama_model_params params;
 
     struct impl;
-    std::unique_ptr<impl> pimpl;
+    std::shared_ptr<impl> pimpl;
 };
 
 llama_model * llama_model_create(llm_arch arch, const llama_model_params & params);

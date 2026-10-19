@@ -23,6 +23,7 @@ class llama_moe_cache;
 class llama_b1;
 class llama_ple_prefetch;
 struct llama_moe_output;
+class llama_kv_cache;
 
 class llama_io_read_i;
 class llama_io_write_i;
@@ -62,6 +63,7 @@ struct llama_context {
     //   - changing attention type
     //   - etc.
     void sched_reserve();
+    void detach_compute_borrower();
 
     void synchronize();
     ggml_backend_t sj_kvarn_backend(ggml_backend_buffer_t buffer) const;
@@ -76,7 +78,7 @@ struct llama_context {
     ggml_backend_sched_t get_sched() const;
     int b1_status() const {
         if (!b1_tried) { return -1; }
-        if (!b1 || moe_cache || compute_peer) { return 0; }
+        if (!b1 || moe_cache) { return 0; }
         for (bool extract : cparams.embeddings_layer_inp) {
             if (extract) { return 0; }
         }
@@ -183,6 +185,13 @@ struct llama_context {
     // compat version
     int encode(const llama_batch & batch_inp);
     int decode(const llama_batch & batch_inp);
+
+    bool mtp_prefill_init();
+    void mtp_prefill_reset(llama_seq_id seq);
+    int mtp_prefill_decode(llama_context & target, llama_batch batch, const float * const * carry, uint32_t n_seq);
+    void mtp_prefill_capture(ggml_tensor * hidden, const llama_ubatch & ubatch);
+    void mtp_prefill_input(llm_graph_input_embd_h & input, const llama_ubatch & ubatch);
+    void mtp_prefill_place(llm_graph_result & res);
 
     //
     // state save/load
@@ -323,6 +332,7 @@ private:
 
     // ggml_backend_sched copy callback, copies only the experts used by MUL_MAT_ID and updates the MoE cache
     static bool sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
+    static bool sched_copy_mtp_inputs(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, void * user_data);
 
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
     // that differs from the layer it belongs to (usually due to missing backend support)
@@ -482,6 +492,37 @@ private:
     // the two never compute at the same time, each synchronizes the other before computing
     llama_context * compute_peer = nullptr;
 
+    // fork: Private MTP storage permits target/draft stream overlap without sharing scratch allocations.
+    bool mtp_prefill_async = false;
+    bool mtp_reserve_tight = false;
+    bool mtp_scratch_enabled = false;
+    bool mtp_scratch_active = false;
+    llama_context * mtp_scratch_target = nullptr;
+    std::vector<llama_context *> mtp_scratch_clients;
+    llama_kv_cache * mtp_scratch_cache = nullptr;
+    ggml_backend_t mtp_scratch_backend = nullptr;
+    std::vector<ggml_backend_buffer_ptr> mtp_scratch_views;
+    void mtp_scratch_prepare(bool kv_only, const llama_memory_context_i * mctx = nullptr, const llama_ubatch * ubatch = nullptr);
+    void mtp_scratch_end();
+    bool compute_is_shared() const;
+    struct {
+        bool enabled = false;
+        ggml_context_ptr ctx;
+        ggml_backend_buffer_ptr buf;
+        ggml_tensor * rows = nullptr;
+        ggml_backend_t backend = nullptr;
+        ggml_backend_event_ptr ready;
+        ggml_backend_event_ptr consumed;
+        bool consuming = false;
+        std::vector<bool> captured;
+        std::vector<llama_pos> carry_pos;
+    } mtp_hidden;
+    llama_context * mtp_hidden_source = nullptr; // scoped to mtp_prefill_decode
+    std::vector<int32_t> mtp_hidden_rows;
+    std::vector<ggml_backend_buffer_ptr> mtp_input_uploads;
+    size_t mtp_input_upload_next = 0;
+    ggml_backend_event_ptr mtp_input_upload_done;
+
     bool sched_need_reserve = true;
     // fork: limit only the reserved graph, not the caller's physical batch size.
     uint32_t sched_reserve_tokens = 0;
@@ -547,6 +588,7 @@ private:
     bool b1_ffn_scratch_active = false;
     bool b1_layer_scratch_active = false;
     bool b1_off_logged = false; // the once-per-context note on why B1 is not used was printed
+    bool b1_mc_suspended = false; // this call freed the MoE expert cache's pool (made again in b1_end)
     struct {
         bool          active = false;   // the graph being built is a B1 graph (memory already applied)
         int32_t       il0    = 0;
@@ -563,6 +605,10 @@ private:
     // runs layers [0, n_layer - 1) of every ubatch of the group that starts at ub0, then seeks back to ub0 with
     // the last layer's experts ready; false on failure (status set)
     bool b1_run_prefix(llama_memory_context_i * mctx, size_t ub0, ggml_status & status);
+    // ends the B1 call (b1->end) and gives the MoE expert cache back if the call suspended it
+    void b1_end(bool failed);
+    bool b1_cache_graph_reset();
+    void b1_cache_resume();
     int64_t b1_final_rows(int64_t n_out, int64_t n_tok) const;
 
     // fork: opt-in prompt routing counts use layer IDs, never temporary B1 weight addresses.
@@ -570,6 +616,7 @@ private:
     bool b1_cache_collect = false;
     bool b1_cache_needs_refresh = false;
     bool b1_cache_profile_attempted = false;
+    bool b1_cache_device_pending = false;
     void b1_cache_begin();
     ggml_tensor * b1_cache_user_node = nullptr;
     std::vector<std::vector<uint64_t>> b1_cache_counts;
@@ -578,6 +625,7 @@ private:
     static bool b1_cache_eval(ggml_tensor * tensor, bool ask, void * user_data);
     void b1_cache_profile_load();
     void b1_cache_warm();
+    void b1_cache_device_prepare();
 
 public:
     // in-call checkpoints (llama_state_seq_capture_arm)

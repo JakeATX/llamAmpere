@@ -1160,6 +1160,7 @@ llama_kv_cache::llama_kv_cache(
 }
 
 void llama_kv_cache::clear(bool data) {
+    scratch_cancel();
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].reset();
         v_heads[s] = 0;
@@ -1321,6 +1322,7 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 }
 
 void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+    scratch_cancel();
     if (kv_stream_runtime.runtime != nullptr) {
         throw std::runtime_error("seq_cp is not supported while block KV streaming is active");
     }
@@ -1669,6 +1671,9 @@ llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool 
     GGML_UNUSED(optimize);
 
     bool do_shift = get_has_shift();
+    if (do_shift || !sc_info.empty()) {
+        scratch_cancel();
+    }
 
     return std::make_unique<llama_kv_cache_context>(this, lctx, do_shift, std::move(sc_info));
 }
@@ -2030,6 +2035,9 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
                     }
                 }
 
+                if (!scratch.limits.empty() && idx >= scratch.limits[seq_to_stream[seq_id]]) {
+                    can_use = false;
+                }
                 if (can_use) {
                     res.idxs[s].push_back(idx);
                 } else {
@@ -2451,6 +2459,197 @@ ggml_tensor * llama_kv_cache::get_v_storage(int32_t il) const {
 
 bool llama_kv_cache::get_v_transposed() const {
     return v_trans;
+}
+
+void llama_kv_cache::scratch_cancel() {
+    if (scratch.cancel) {
+        auto cancel = scratch.cancel;
+        auto user = scratch.user;
+        scratch.cancel = nullptr;
+        cancel(user);
+    }
+}
+
+void llama_kv_cache::scratch_release() {
+    for (int32_t record : scratch.records) {
+        GGML_ASSERT(sj_kvarn_ref[record] == 0);
+    }
+    sj_kvarn_free.insert(sj_kvarn_free.begin(), scratch.records.begin(), scratch.records.end());
+    scratch = {};
+}
+
+bool llama_kv_cache::scratch_safe(uint32_t n_tokens) const {
+    if (!scratch.user) {
+        return true;
+    }
+    if (get_has_shift() || !sc_info.empty()) {
+        return false;
+    }
+    const uint64_t guard = (uint64_t) n_tokens + scratch.guard_tokens;
+    if (sj_kvarn_paged) {
+        return sj_kvarn_free.size() >= (guard / sj_kvarn.group + n_stream + 1) &&
+                (sj_kvarn_free.size() + scratch.records.size()) * scratch.record_bytes >= scratch.min_free_bytes;
+    }
+    size_t free_bytes = 0;
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        const uint64_t end = v_cells[s].used_max_p1() + guard;
+        if (sj_kvarn.enabled()) {
+            if (end > (uint64_t) sj_kvarn.sink + (uint64_t) scratch.first_group * sj_kvarn.group) {
+                return false;
+            }
+            const uint64_t groups = std::min<uint64_t>(sj_kvarn_n_groups, (end + sj_kvarn.group - 1) / sj_kvarn.group);
+            free_bytes += (sj_kvarn_n_groups - groups) * scratch.record_bytes;
+        } else if (!scratch.limits.empty() && end > scratch.limits[s]) {
+            return false;
+        }
+    }
+    if (!sj_kvarn.enabled() && scratch.min_free_bytes) {
+        for (const auto & layer : layers) {
+            for (auto * tensor : {layer.k, v_trans ? nullptr : layer.v}) {
+                if (!tensor || !tensor->buffer || ggml_backend_buffer_get_type(tensor->buffer) != scratch.buft) {
+                    continue;
+                }
+                for (uint32_t s = 0; s < n_stream; ++s) {
+                    const uint64_t end = std::min<uint64_t>(tensor->ne[1], v_cells[s].used_max_p1() + guard);
+                    free_bytes += (tensor->ne[1] - end) * tensor->nb[1];
+                }
+            }
+        }
+    }
+    return free_bytes >= scratch.min_free_bytes;
+}
+
+std::vector<ggml_backend_buffer_ptr> llama_kv_cache::scratch_borrow(
+        ggml_backend_buffer_type_t buft, size_t chunk_bytes, size_t max_chunks, size_t min_free_bytes,
+        uint32_t guard_tokens, void (*cancel)(void *), void * user) {
+    std::vector<ggml_backend_buffer_ptr> result;
+    if (scratch.user || !cancel || !user || chunk_bytes == 0 || max_chunks == 0 || max_chunks > 16 ||
+            other || kv_stream_runtime.runtime || n_swa || get_has_shift() || !sc_info.empty()) {
+        return result;
+    }
+    const size_t alignment = ggml_backend_buft_get_alignment(buft);
+    if (chunk_bytes > SIZE_MAX - alignment || guard_tokens > UINT32_MAX - 512) {
+        return result;
+    }
+    chunk_bytes = GGML_PAD(chunk_bytes, alignment);
+    const uint64_t guard = (uint64_t) guard_tokens + 512;
+    struct region {
+        ggml_tensor * tensor;
+        size_t offset;
+        size_t size;
+        uint32_t stream;
+        uint32_t first_group;
+    };
+    std::vector<region> regions;
+    size_t free_bytes = 0;
+    size_t record_bytes = 0;
+    uint32_t group_first = sj_kvarn_n_groups;
+    if (sj_kvarn.enabled()) {
+        if (sj_kvarn_paged) {
+            // All layers use the same physical record IDs. Borrow one free suffix across those layers.
+            while (group_first && sj_kvarn_ref[group_first - 1] == 0) {
+                --group_first;
+            }
+        } else {
+            const uint64_t end = v_cells[0].used_max_p1() + guard;
+            const uint64_t groups = (end + sj_kvarn.group - 1) / sj_kvarn.group;
+            group_first = (uint32_t) std::min<uint64_t>(groups, sj_kvarn_n_groups);
+        }
+        for (const auto & layer : layers) {
+            auto * tensor = layer.body;
+            if (!tensor || !tensor->buffer || ggml_backend_buffer_get_type(tensor->buffer) != buft) {
+                continue;
+            }
+            const size_t stride = (size_t) hparams.n_head_kv(layer.il) * layer.sj_kvarn_rec_bytes;
+            record_bytes += stride;
+            const size_t size = (sj_kvarn_n_groups - group_first) * stride;
+            regions.push_back({tensor, group_first * stride, size, 0, group_first});
+            free_bytes += size;
+        }
+    } else {
+        for (const auto & layer : layers) {
+            // A transposed V tensor has no contiguous position suffix.
+            for (auto * tensor : {layer.k, v_trans ? nullptr : layer.v}) {
+                if (!tensor || !tensor->buffer || ggml_backend_buffer_get_type(tensor->buffer) != buft) {
+                    continue;
+                }
+                for (uint32_t s = 0; s < n_stream; ++s) {
+                    const uint64_t first = std::min<uint64_t>(tensor->ne[1], v_cells[s].used_max_p1() + guard);
+                    const size_t size = (tensor->ne[1] - first) * tensor->nb[1];
+                    regions.push_back({tensor, s * tensor->nb[2] + first * tensor->nb[1], size, s, UINT32_MAX});
+                    free_bytes += size;
+                }
+            }
+        }
+    }
+    if (free_bytes < min_free_bytes) {
+        return result;
+    }
+    std::vector<uint32_t> limits(n_stream, UINT32_MAX);
+    uint32_t reserved_first = sj_kvarn_n_groups;
+    // Spread chunks across layers before taking a second chunk from any region.
+    for (size_t pass = 0; result.size() < max_chunks; ++pass) {
+        bool found = false;
+        for (const auto & region : regions) {
+            auto * tensor = region.tensor;
+            auto * parent = tensor->buffer;
+            const size_t base = (char *) tensor->data - (char *) ggml_backend_buffer_get_base(parent);
+            const size_t end = base + region.offset + region.size;
+            const size_t aligned_end = end - end % alignment;
+            if (aligned_end <= base + region.offset ||
+                    pass >= (aligned_end - (base + region.offset)) / chunk_bytes) {
+                continue;
+            }
+            const size_t start = aligned_end - (pass + 1) * chunk_bytes;
+            ggml_backend_buffer_ptr view(ggml_backend_buffer_view(parent, start, chunk_bytes));
+            if (!view) {
+                continue;
+            }
+            result.push_back(std::move(view));
+            if (sj_kvarn.enabled()) {
+                const size_t stride = (size_t) ggml_nbytes(tensor) / sj_kvarn_n_groups;
+                reserved_first = std::min<uint32_t>(reserved_first, (start - base) / stride);
+            } else {
+                limits[region.stream] = std::min<uint32_t>(limits[region.stream],
+                        (start - base - region.stream * tensor->nb[2]) / tensor->nb[1]);
+            }
+            found = true;
+            if (result.size() == max_chunks) {
+                break;
+            }
+        }
+        if (!found) {
+            break;
+        }
+    }
+    if (result.empty()) {
+        return result;
+    }
+    scratch.cancel = cancel;
+    scratch.user = user;
+    scratch.guard_tokens = guard_tokens + 512;
+    scratch.min_free_bytes = min_free_bytes;
+    scratch.record_bytes = record_bytes;
+    scratch.buft = buft;
+    if (sj_kvarn.enabled()) {
+        scratch.first_group = reserved_first;
+        if (sj_kvarn_paged) {
+            auto & free = sj_kvarn_free;
+            for (auto it = free.begin(); it != free.end();) {
+                if ((uint32_t) *it >= reserved_first) {
+                    scratch.records.push_back(*it);
+                    it = free.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+    } else {
+        scratch.limits = std::move(limits);
+    }
+    LLAMA_LOG_INFO("%s: borrowed %zu x %.3f MiB from unused KV (%.3f MiB free, floor %.3f MiB)\n", __func__,
+            result.size(), chunk_bytes / 1048576.0, free_bytes / 1048576.0, min_free_bytes / 1048576.0);
+    return result;
 }
 
 const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
@@ -4224,6 +4423,7 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
 }
 
 void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    scratch_cancel();
     if (sj_kvarn.enabled() && !other) {
         // see the matching refusal in state_read_sinfo (block KV streaming is refused at construction anyway)
         if (kv_stream_runtime.runtime != nullptr) {
@@ -4244,6 +4444,7 @@ void llama_kv_cache::state_read_sinfo(
   llama_state_seq_flags   flags,
       slot_info_vec_t *   sinfos_out,
 const slot_info_vec_t *   sinfos_in) {
+    scratch_cancel();
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;

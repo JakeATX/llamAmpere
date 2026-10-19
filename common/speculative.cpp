@@ -1447,6 +1447,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     int32_t n_embd = 0;
     int32_t batch_capacity = 0;
     int32_t ubatch_capacity = 0;
+    bool prefill_overlap = false;
+    bool prefill_device = false;
 
     // One MTP draft driver, three modes (set once in the ctor):
     //   is_mem_shared (gemma4): shares the target KV, runs all heads in one graph.
@@ -1504,7 +1506,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     bool adaptive = false;
     std::vector<int> n_cap;   // [n_seq] effective draft cap for the current draft() call
     std::vector<int> n_last;  // [n_seq] drafts attempted in the most recent draft() call
+    // [PARW] the seq's own draft cap in the most recent draft() call, before the multi-seq equal-depth lift
+    // (n_cap can be raised to the round's deepest cap); the adaptive controller is fed at this depth
+    std::vector<int> n_own;
     std::vector<common_speculative_adaptive> adaptive_ctrl; // [n_seq] per-seq adaptive depth controller
+
+    static bool equal_depth_enabled() {
+        static const bool on = [] {
+            const char * e = getenv("LLAMA_SPEC_EQUAL_DEPTH");
+            return e == nullptr || e[0] != '0';
+        }();
+        return on;
+    }
 
     int32_t defer_capacity() const {
         const int32_t draft_rows = std::max(this->params.n_max, (int32_t) n_seq);
@@ -1528,6 +1541,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         this->adaptive = adaptive;
         // n_cap/n_last are written by the shared draft loop in both modes
         n_cap.assign(n_seq, 0);
+        n_own.assign(n_seq, 0);
         n_last.assign(n_seq, 0);
 
         SPC_TRC("%s", "adding speculative implementation 'draft-mtp'\n");
@@ -1542,6 +1556,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         ubatch_capacity = (int32_t) llama_n_ubatch(ctx_dft);
         batch_capacity = std::min<int32_t>(llama_n_batch(ctx_dft), std::max<int32_t>(ubatch_capacity, n_seq * (this->params.n_max + 1)));
+        const char * overlap = std::getenv("GGML_MTP_PREFILL_OVERLAP");
+        prefill_overlap = overlap && std::strcmp(overlap, "1") == 0;
+        const char * scratch = getenv("LLAMA_MTP_PREFILL_SCRATCH");
+        prefill_overlap = prefill_overlap || (scratch && std::strcmp(scratch, "1") == 0);
+        if (prefill_overlap) {
+            SPC_INF("%s", "GGML_MTP_PREFILL_OVERLAP=1: coalescing target hidden-state reads\n");
+        }
         batch = llama_batch_init(/*n_tokens=*/ batch_capacity, /*embd=*/ n_embd, /*n_seq_max=*/ 1);
         // llama_batch_init allocates only one of token/embd; MTP needs both.
         // TODO: fix, how to call without malloc
@@ -1578,6 +1599,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         same_position_draft = is_mem_shared && llama_model_uses_shared_position_draft(llama_get_model(ctx_dft));
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
         chain_graph   = !is_mem_shared && !chain_heads && chain_enabled && llama_model_supports_mtp_chain(llama_get_model(ctx_dft));
+
+        // fork: Stage prompt hidden rows once, then feed the logical catch-up batch by backend copies.
+        prefill_device = !is_mem_shared && !chain_heads && llama_mtp_prefill_init(ctx_tgt);
+        prefill_overlap = prefill_overlap || prefill_device;
+        if (prefill_device) {
+            std::memset(batch.embd, 0, (size_t) batch_capacity * n_embd * sizeof(float));
+        }
 
         if (chain_enabled && !is_mem_shared && !chain_heads && !chain_graph) {
             SPC_WRN("%s", "chained MTP is not supported for this model; using sequential MTP\n");
@@ -1821,7 +1849,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const uint32_t flags = (adaptive ? 1u : 0u) | (defer_enabled ? 2u : 0u);
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
         const size_t retained = std::count_if(defer.seq.begin(), defer.seq.end(), [seq_id](llama_seq_id id) { return id != seq_id; });
-        if (retained + header[2] > (size_t) defer_capacity()) {
+        // Each restored sequence may carry a full deferred tail; flush_deferred splits the combined rows.
+        if (retained + header[2] > (size_t) n_seq * defer_max) {
             return;
         }
         if (header[0] != 0x3150544d || header[1] != (uint32_t) n_embd || header[2] > (uint32_t) defer_max || header[7] != flags ||
@@ -1867,6 +1896,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         drop_deferred_from(seq_id, 0);
+        llama_mtp_prefill_reset(params.ctx_tgt, seq_id);
         std::memcpy(pending_h[seq_id].data(), data.data() + sizeof(header), row_bytes);
         if (adaptive) {
             adaptive_ctrl[seq_id].n_cur   = header[3];
@@ -2165,7 +2195,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                             std::memcpy(batch.embd + (size_t) i * n_embd, pending_h[seq_id].data(), row_bytes);
                         }
                     }
-                    const int32_t rc = llama_decode(ctx_dft, batch);
+                    int32_t rc = -4;
+                    if (prefill_device && !chain_heads && first == 0 && count == n_tokens && output_offset == 0) {
+                        std::vector<const float *> carry(n_seq);
+                        for (uint32_t seq = 0; seq < n_seq; ++seq) { carry[seq] = pending_h[seq].data(); }
+                        rc = llama_mtp_prefill_decode(ctx_dft, ctx_tgt, batch, carry.data(), n_seq);
+                    }
+                    if (rc == -4) { rc = llama_decode(ctx_dft, batch); }
                     if (rc != 0) {
                         SPC_ERR("llama_decode(ctx_dft) head=%d failed rc=%d (pos=%d)\n", head, (int) rc, (int) batch.pos[0]);
                         ok = false;
@@ -2182,6 +2218,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
+        // The target's NextN rows are unmasked and reordered by the bulk getter. Avoid one backend sync per token while the draft runs.
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_batch_end[seq_id] < 0) {
                 continue;
@@ -2369,6 +2406,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 if (dp.n_max > 0 && dp.n_max < n_cap[seq_one]) {
                     n_cap[seq_one] = dp.n_max;
                 }
+                n_own[seq_one] = n_cap[seq_one];
                 const int n_chain = n_cap[seq_one];
 
                 // deferred rows at or past n_past hold candidates the verify
@@ -2615,6 +2653,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 n_cap[seq_id] = dp.n_max;
             }
 
+            n_own[seq_id] = n_cap[seq_id];
+
             common_batch_add(batch, dp.id_last, dp.pos0, { seq_id }, true);
             std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[seq_id].data(), row_bytes);
 
@@ -2622,6 +2662,27 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             if (chain_heads) {
                 chain_h[seq_id].assign(pending_h[seq_id].begin(), pending_h[seq_id].end());
+            }
+        }
+
+        // [PARW] equal-depth multi-seq drafting: the target verifies every slot in one batch, and a hybrid/recurrent
+        // target splits that batch into one ubatch (a full pass over the weights) per distinct draft length
+        // (llama_batch_allocr::split_equal). With per-slot adaptive depths (3 vs 4) --parallel 4 ran 2-4 weight passes
+        // per round. Draft every seq to the round's deepest cap (each still bounded by its own context limit dp.n_max);
+        // the extra tokens are verified like any draft (lossless), and the adaptive controller still sees only the
+        // seq's own depth (accept()). LLAMA_SPEC_EQUAL_DEPTH=0 turns it off.
+        if (n_drafting > 1 && equal_depth_enabled()) {
+            int c_max = 0;
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (drafting[seq_id]) {
+                    c_max = std::max(c_max, n_cap[seq_id]);
+                }
+            }
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (drafting[seq_id]) {
+                    const int bound = dparams[seq_id].n_max > 0 ? dparams[seq_id].n_max : c_max;
+                    n_cap[seq_id] = std::max(n_cap[seq_id], std::min(c_max, bound));
+                }
             }
         }
 
@@ -2797,7 +2858,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // accepted draft; on is_other the stats belong to a different speculator
         if (adaptive && !is_other) {
             const int depth_before = adaptive_ctrl[seq_id].n_cur;
-            adaptive_ctrl[seq_id].update(n_last[seq_id], n_accepted, params.n_max, params.n_min_adaptive);
+            // [PARW] judge the controller at the seq's own depth: tokens drafted past it (equal-depth lift) are a
+            // bonus the controller did not ask for, and verification is sequential, so the accepted prefix within
+            // the own depth is what a draft of that depth would have returned
+            const int own   = n_own[seq_id] > 0 ? std::min(n_last[seq_id], n_own[seq_id]) : n_last[seq_id];
+            const int n_acc = std::min<int>(n_accepted, own);
+            adaptive_ctrl[seq_id].update(own, n_acc, params.n_max, params.n_min_adaptive);
             if (adaptive_ctrl[seq_id].n_cur != depth_before) {
                 SPC_DBG("adaptive draft depth seq %d: %d -> %d (n_draft=%d, n_accepted=%d)\n",
                         (int) seq_id, depth_before, adaptive_ctrl[seq_id].n_cur, n_last[seq_id], n_accepted);
@@ -3891,10 +3957,13 @@ common_params common_base_params_to_speculative(const common_params & params) {
     // A SJ-KVaRN trunk cannot be inherited (see below) and would leave the drafter on the plain F16 cache, so an unset
     // draft type defaults to COMMON_SJKVARN_MTP_DRAFT_KV there (tq5_0 K / turbo4 V: the fused attention path at every
     // MTP width 1-8; tq6_0/tq6_0 at width 5 takes the slow f16-convert route unless GGML_SLOWKV is set).
-    // MTP drafter only (no separate draft model): the fused tq5_0/turbo4 route needs D = 256, and a -md / EAGLE3 /
-    // DFlash draft model of another head size keeps the plain cache. A trunk that is SJ-KVaRN on one side only fails
-    // the SJ-KVaRN pair check before this runs.
-    const bool sj_kvarn_mtp_default = !has_draft;
+    // The fused route needs D = 256. A built-in MTP head has that size, and so does a separate MTP file
+    // (-md plus draft-mtp / draft-mtp-adaptive: that context is LLAMA_CONTEXT_TYPE_MTP). Flash-Next loads the
+    // head as -md, so has_draft is true and the old !has_draft test left the draft cache at the plain f16
+    // -ctk sjkvarnN stores. A non-MTP separate draft (EAGLE3 / DFlash, or -md with no MTP type) keeps the plain
+    // cache, because its head size may not be 256. A trunk that is SJ-KVaRN on one side only fails the pair
+    // check before this runs.
+    const bool sj_kvarn_mtp_default = spec_mtp || !has_draft;
     if (sj_kvarn_mtp_default && params.sj_kvarn_bits_k > 0 && params_spec.cache_type_k == GGML_TYPE_COUNT) {
         result.cache_type_k = COMMON_SJKVARN_MTP_DRAFT_KV[0];
         result.speculative.draft.cache_type_sj_kvarn_default = true;
@@ -3902,6 +3971,16 @@ common_params common_base_params_to_speculative(const common_params & params) {
     if (sj_kvarn_mtp_default && params.sj_kvarn_bits_v > 0 && params_spec.cache_type_v == GGML_TYPE_COUNT) {
         result.cache_type_v = COMMON_SJKVARN_MTP_DRAFT_KV[1];
         result.speculative.draft.cache_type_sj_kvarn_default = true;
+    }
+    // A quantized trunk must not leave an unset draft cache at f16 (q8_0/q8_0 trunk -> q8_0 draft).
+    // Inheritance above already copies that trunk type. This is the backstop if a later default wrote f16.
+    // Explicit -ctkd/-ctvd f16 still wins (the flag is not GGML_TYPE_COUNT). SJ-KVaRN's plain trunk type is
+    // f16, and ggml_is_quantized(F16) is false, so this does not replace the tq5_0/turbo4 default.
+    if (params_spec.cache_type_k == GGML_TYPE_COUNT && result.cache_type_k == GGML_TYPE_F16 && ggml_is_quantized(params.cache_type_k)) {
+        result.cache_type_k = params.cache_type_k;
+    }
+    if (params_spec.cache_type_v == GGML_TYPE_COUNT && result.cache_type_v == GGML_TYPE_F16 && ggml_is_quantized(params.cache_type_v)) {
+        result.cache_type_v = params.cache_type_v;
     }
     // The first block-streaming implementation owns only the target cache.
     // MTP keeps its ordinary cache until both contexts can share one pool.
@@ -4043,6 +4122,10 @@ common_speculative_init_result::common_speculative_init_result(
         model_path = params.speculative.draft.mparams.path;
         LOG_INF("%s: loading draft model '%s'\n", __func__, model_path.c_str());
 
+        if (spec_mtp) {
+            const char * borrow = getenv("LLAMA_MTP_BORROW_WEIGHTS");
+            if (!borrow || strcmp(borrow, "0") != 0) { mparams.tensor_borrow_from = model_tgt; }
+        }
         llama_model * model_dft = llama_model_load_from_file(model_path.c_str(), mparams);
         if (model_dft == NULL) {
             LOG_ERR("%s: failed to load draft model, '%s'\n", __func__, model_path.c_str());

@@ -2,6 +2,7 @@
 #include "../ggml/src/ggml-backend-impl.h"
 #include "ggml-cpp.h"
 #include "../ggml/src/ggml-impl.h"
+#include "../ggml/src/ggml-alloc-impl.h"
 #include "ggml.h"
 
 #include <algorithm>
@@ -642,6 +643,37 @@ static void test_reallocation() {
     }
 }
 
+// A size-only query must not certify tensor assignments whose backing buffers
+// have never been allocated (or are still sized for a previous graph).
+static void test_measure_then_allocate() {
+    for (bool preallocate : { false, true }) {
+        dummy_backend backend = dummy_backend_init(SIZE_MAX);
+        ggml_gallocr_ptr galloc(ggml_gallocr_new(&backend.buffer_type));
+        if (preallocate) {
+            auto [ctx, graph, ctx_ptr] = make_context();
+            auto * x = make_input_with_size(ctx, 16);
+            auto * y = ggml_scale(ctx, x, 2.0f);
+            ggml_set_output(y);
+            ggml_build_forward_expand(graph, y);
+            GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), graph));
+        }
+        const size_t before = backend.context->allocated_total();
+        auto [ctx, graph, ctx_ptr] = make_context();
+        auto * x = make_input_with_size(ctx, 128);
+        auto * y = ggml_scale(ctx, x, 2.0f);
+        ggml_set_output(y);
+        ggml_build_forward_expand(graph, y);
+        assign_names(ctx);
+        size_t measured = 0;
+        ggml_gallocr_reserve_n_size(galloc.get(), graph, nullptr, nullptr, &measured);
+        GGML_ASSERT(measured > before);
+        GGML_ASSERT(backend.context->allocated_total() == before);
+        GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), graph));
+        check_all_allocated(graph);
+        GGML_ASSERT(backend.context->allocated_total() >= measured);
+    }
+}
+
 static void test_backend_graph_optimize(ggml_backend_t /*backend*/, ggml_cgraph * graph, ggml_backend_graph_optimize_params * params) {
     GGML_ASSERT(graph->n_nodes == 3);
     params->add_alloc_dep(params->user_data, graph->nodes[0], graph->nodes[2]);
@@ -675,6 +707,332 @@ static bool graph_reuses_allocation(bool add_alloc_dep) {
 static void test_graph_optimize_alloc_dep() {
     GGML_ASSERT(graph_reuses_allocation(false));
     GGML_ASSERT(!graph_reuses_allocation(true));
+}
+
+static ggml_backend_buffer_t scheduler_copy_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    auto * data = new std::vector<uint8_t>(size);
+    ggml_backend_buffer_i iface{};
+    iface.free_buffer = [](ggml_backend_buffer_t buffer) {
+        delete (std::vector<uint8_t> *) buffer->context;
+    };
+    iface.get_base = [](ggml_backend_buffer_t buffer) -> void * {
+        return ((std::vector<uint8_t> *) buffer->context)->data();
+    };
+    iface.memset_tensor = [](ggml_backend_buffer_t, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
+        memset((char *) tensor->data + offset, value, size);
+    };
+    iface.set_tensor = [](ggml_backend_buffer_t, ggml_tensor * tensor, const void * src, size_t offset, size_t size) {
+        memcpy((char *) tensor->data + offset, src, size);
+    };
+    iface.get_tensor = [](ggml_backend_buffer_t, const ggml_tensor * tensor, void * dst, size_t offset, size_t size) {
+        memcpy(dst, (char *) tensor->data + offset, size);
+    };
+    iface.clear = [](ggml_backend_buffer_t buffer, uint8_t value) {
+        auto & data = *(std::vector<uint8_t> *) buffer->context;
+        std::fill(data.begin(), data.end(), value);
+    };
+    return ggml_backend_buffer_init(buft, iface, data, size);
+}
+
+struct scheduler_copy_state {
+    struct copy {
+        ggml_tensor * dst;
+        const void * data;
+        size_t size;
+    };
+    ggml_tensor * input = nullptr;
+    ggml_tensor * activation = nullptr;
+    ggml_tensor * weight = nullptr;
+    std::vector<std::vector<uint8_t>> snapshots;
+    std::vector<copy> queued;
+    int mode = 0;
+    int input_calls = 0;
+    int weight_calls = 0;
+    int consumed = 0;
+};
+
+static ggml_status scheduler_copy_graph_compute(ggml_backend_t backend, ggml_cgraph * graph) {
+    auto & state = *(scheduler_copy_state *) backend->context;
+    for (const auto & copy : state.queued) {
+        ggml_backend_tensor_set(copy.dst, copy.data, 0, copy.size);
+        ++state.consumed;
+    }
+    state.queued.clear();
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        ggml_tensor * node = graph->nodes[i];
+        if (ggml_is_view(node) || node->op == GGML_OP_NONE) {
+            continue;
+        }
+        GGML_ASSERT(node->type == GGML_TYPE_F32);
+        auto * dst = (float *) node->data;
+        const auto * src = (const float *) node->src[0]->data;
+        for (int64_t j = 0; j < ggml_nelements(node); ++j) {
+            if (node->op == GGML_OP_SCALE) {
+                dst[j] = src[j] * ggml_get_op_params_f32(node, 0);
+            } else {
+                GGML_ASSERT(node->op == GGML_OP_ADD);
+                dst[j] = src[j] + ((const float *) node->src[1]->data)[j];
+            }
+        }
+    }
+    return GGML_STATUS_SUCCESS;
+}
+
+static void test_borrowed_arena() {
+    alignas(128) char first[384] = {};
+    alignas(128) char second[256] = {};
+    ggml_borrowed_arena arena({{first, sizeof(first)}, {second, sizeof(second)}});
+    size_t a_size = 0, b_size = 0, c_size = 0;
+    void * a = arena.alloc(129, &a_size);
+    void * b = arena.alloc(128, &b_size);
+    void * c = arena.alloc(129, &c_size);
+    GGML_ASSERT(a == first && a_size == 256);
+    GGML_ASSERT(b == first + 256 && b_size == 128);
+    GGML_ASSERT(c == second && c_size == 256);
+    size_t size = 0;
+    GGML_ASSERT(!arena.alloc(1, &size));
+    GGML_ASSERT(!arena.alloc(SIZE_MAX, &size));
+    GGML_ASSERT(!arena.free(a, a_size));
+    GGML_ASSERT(!arena.free(c, 128));
+    GGML_ASSERT(arena.free(c, c_size));
+    GGML_ASSERT(arena.free(b, b_size));
+    GGML_ASSERT(arena.free(a, a_size));
+    GGML_ASSERT(arena.empty());
+    GGML_ASSERT(!arena.alloc(385, &size));
+    GGML_ASSERT(arena.alloc(384, &size) == first && size == 384);
+    auto probe = arena;
+    GGML_ASSERT(probe.alloc(256, &size) == second);
+    GGML_ASSERT(!probe.alloc(1, &size));
+    GGML_ASSERT(arena.free(first, 384));
+    GGML_ASSERT(arena.empty());
+}
+
+static void test_scheduler_borrowed_buffer() {
+    dummy_backend backend = dummy_backend_init(SIZE_MAX);
+    backend.buffer_type.iface.alloc_buffer = scheduler_copy_alloc_buffer;
+    backend.context->backend.iface.graph_compute = scheduler_copy_graph_compute;
+    scheduler_copy_state state;
+    backend.context->backend.context = &state;
+    ggml_backend_t backend_ptr = &backend.context->backend;
+    ggml_backend_buffer_type_t buft = &backend.buffer_type;
+    ggml_backend_buffer_ptr parent(ggml_backend_buft_alloc_buffer(buft, 4096));
+    auto & data = *(std::vector<uint8_t> *) parent->context;
+    std::fill(data.begin(), data.end(), 0xa5);
+    ggml_backend_buffer_ptr view(ggml_backend_buffer_view(parent.get(), 128, 512));
+    GGML_ASSERT(view);
+    GGML_ASSERT(!ggml_backend_buffer_view(parent.get(), 1, 512));
+    GGML_ASSERT(!ggml_backend_buffer_view(parent.get(), 4096, 1));
+    GGML_ASSERT(!ggml_backend_buffer_view(parent.get(), SIZE_MAX, 1));
+    GGML_ASSERT(!ggml_backend_buffer_view(parent.get(), 128, SIZE_MAX));
+    ggml_backend_buffer_clear(view.get(), 0x3c);
+    for (size_t i = 0; i < data.size(); ++i) {
+        GGML_ASSERT(data[i] == (i >= 128 && i < 640 ? 0x3c : 0xa5));
+    }
+    ggml_backend_sched_ptr sched(ggml_backend_sched_new(&backend_ptr, &buft, 1, 48, false, false));
+    uint64_t epoch = ggml_backend_sched_get_alloc_epoch(sched.get());
+    GGML_ASSERT(ggml_backend_sched_set_buffer(sched.get(), backend_ptr, view.get()));
+    GGML_ASSERT(ggml_backend_sched_get_alloc_epoch(sched.get()) != epoch);
+    {
+        auto [ctx, graph, ctx_ptr] = make_context();
+        ggml_tensor * input = make_input_1d(ctx, 16);
+        ggml_tensor * output = ggml_scale(ctx, input, 3.0f);
+        ggml_set_output(output);
+        ggml_build_forward_expand(graph, output);
+        GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), graph));
+        GGML_ASSERT(!ggml_backend_sched_set_buffer(sched.get(), backend_ptr, nullptr));
+        GGML_ASSERT(ggml_backend_sched_get_buffer_size(sched.get(), backend_ptr) == 512);
+        for (ggml_tensor * tensor : { input, output }) {
+            GGML_ASSERT(tensor->buffer == parent.get());
+            GGML_ASSERT((uint8_t *) tensor->data >= data.data() + 128);
+            GGML_ASSERT((uint8_t *) tensor->data + ggml_nbytes(tensor) <= data.data() + 640);
+        }
+        float values[16];
+        for (int i = 0; i < 16; ++i) {
+            values[i] = i + 1;
+        }
+        ggml_backend_tensor_set(input, values, 0, sizeof(values));
+        GGML_ASSERT(ggml_backend_sched_graph_compute(sched.get(), graph) == GGML_STATUS_SUCCESS);
+        float actual[16];
+        ggml_backend_tensor_get(output, actual, 0, sizeof(actual));
+        for (int i = 0; i < 16; ++i) {
+            GGML_ASSERT(actual[i] == 3.0f * values[i]);
+        }
+    }
+    ggml_backend_sched_reset(sched.get());
+    ggml_backend_buffer_ptr view_second(ggml_backend_buffer_view(parent.get(), 768, 512));
+    GGML_ASSERT(view_second);
+    ggml_backend_buffer_t chunks[] = { view.get(), view_second.get() };
+    GGML_ASSERT(ggml_backend_sched_set_buffers(sched.get(), backend_ptr, chunks, 2));
+    chunks[1] = view.get();
+    GGML_ASSERT(!ggml_backend_sched_set_buffers(sched.get(), backend_ptr, chunks, 2));
+    {
+        auto [ctx, graph, ctx_ptr] = make_context();
+        ggml_tensor * input_a = make_input_1d(ctx, 96);
+        ggml_tensor * input_b = make_input_1d(ctx, 96);
+        ggml_tensor * output = ggml_add(ctx, input_a, input_b);
+        ggml_set_output(output);
+        ggml_build_forward_expand(graph, output);
+        GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), graph));
+        GGML_ASSERT(ggml_backend_sched_get_buffer_size(sched.get(), backend_ptr) == 1024);
+        GGML_ASSERT(input_a->data != input_b->data);
+        for (ggml_tensor * tensor : { input_a, input_b, output }) {
+            const uint8_t * base = (uint8_t *) tensor->data;
+            const uint8_t * end = base + ggml_nbytes(tensor);
+            GGML_ASSERT(tensor->buffer == parent.get());
+            GGML_ASSERT((base >= data.data() + 128 && end <= data.data() + 640) ||
+                        (base >= data.data() + 768 && end <= data.data() + 1280));
+        }
+        float values[96];
+        for (int i = 0; i < 96; ++i) {
+            values[i] = i + 1;
+        }
+        ggml_backend_tensor_set(input_a, values, 0, sizeof(values));
+        ggml_backend_tensor_set(input_b, values, 0, sizeof(values));
+        GGML_ASSERT(ggml_backend_sched_graph_compute(sched.get(), graph) == GGML_STATUS_SUCCESS);
+        float actual[96];
+        ggml_backend_tensor_get(output, actual, 0, sizeof(actual));
+        for (int i = 0; i < 96; ++i) {
+            GGML_ASSERT(actual[i] == 2.0f * values[i]);
+        }
+    }
+    ggml_backend_sched_reset(sched.get());
+    ggml_backend_buffer_ptr small(ggml_backend_buffer_view(parent.get(), 128, 128));
+    ggml_backend_buffer_t uneven[] = {small.get(), view_second.get()};
+    GGML_ASSERT(ggml_backend_sched_set_buffers(sched.get(), backend_ptr, uneven, 2));
+    {
+        auto [ctx, graph, ctx_ptr] = make_context();
+        ggml_tensor * input = make_input_1d(ctx, 96);
+        ggml_tensor * output = ggml_scale(ctx, input, 3.0f);
+        ggml_set_output(output);
+        ggml_build_forward_expand(graph, output);
+        GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), graph));
+        GGML_ASSERT((uint8_t *) input->data >= data.data() + 768);
+        GGML_ASSERT((uint8_t *) input->data + ggml_nbytes(input) <= data.data() + 1280);
+        float values[96];
+        std::fill(values, values + 96, 2.0f);
+        ggml_backend_tensor_set(input, values, 0, sizeof(values));
+        GGML_ASSERT(ggml_backend_sched_graph_compute(sched.get(), graph) == GGML_STATUS_SUCCESS);
+        ggml_backend_tensor_get(output, values, 0, sizeof(values));
+        for (float value : values) { GGML_ASSERT(value == 6.0f); }
+    }
+    ggml_backend_sched_reset(sched.get());
+    GGML_ASSERT(ggml_backend_sched_set_buffer(sched.get(), backend_ptr, view.get()));
+    {
+        auto [ctx, graph, ctx_ptr] = make_context();
+        ggml_tensor * input = make_input_1d(ctx, 512);
+        ggml_tensor * output = ggml_scale(ctx, input, 3.0f);
+        ggml_set_output(output);
+        ggml_build_forward_expand(graph, output);
+        size_t measured = 0;
+        ggml_backend_sched_reserve_size(sched.get(), graph, &measured);
+        GGML_ASSERT(measured > 512);
+        GGML_ASSERT(!ggml_backend_sched_alloc_graph(sched.get(), graph));
+        GGML_ASSERT(!input->data && !output->data);
+        ggml_backend_sched_reset(sched.get());
+        GGML_ASSERT(ggml_backend_sched_set_buffer(sched.get(), backend_ptr, nullptr));
+        GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), graph));
+        GGML_ASSERT(input->buffer != parent.get());
+        GGML_ASSERT(output->buffer != parent.get());
+        ggml_backend_buffer_ptr owned_view(ggml_backend_buffer_view(input->buffer, 0, 512));
+        GGML_ASSERT(owned_view);
+        ggml_backend_sched_reset(sched.get());
+        GGML_ASSERT(!ggml_backend_sched_set_buffer(sched.get(), backend_ptr, owned_view.get()));
+    }
+    sched.reset();
+    view.reset();
+    view_second.reset();
+    for (size_t i = 0; i < data.size(); ++i) {
+        if ((i < 128 || i >= 640) && (i < 768 || i >= 1280)) {
+            GGML_ASSERT(data[i] == 0xa5);
+        }
+    }
+}
+
+static bool scheduler_copy_input(ggml_backend_t, const ggml_tensor * src, ggml_tensor * dst, void * user_data) {
+    auto & state = *(scheduler_copy_state *) user_data;
+    GGML_ASSERT(src == state.input || src == state.activation);
+    GGML_ASSERT(ggml_backend_buffer_get_usage(src->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    GGML_ASSERT(state.weight_calls == 0);
+    ++state.input_calls;
+    if (state.mode == 1) {
+        return false;
+    }
+    state.snapshots.emplace_back(ggml_nbytes(src));
+    auto & snapshot = state.snapshots.back();
+    ggml_backend_tensor_get(src, snapshot.data(), 0, snapshot.size());
+    state.queued.push_back({ dst, snapshot.data(), snapshot.size() });
+    // Reuse the CPU input before the queued destination upload consumes its snapshot.
+    const float overwritten[] = { -1000, -1000, -1000, -1000 };
+    ggml_backend_tensor_set(src == state.input ? state.input : state.activation, overwritten, 0, sizeof(overwritten));
+    return true;
+}
+
+static bool scheduler_copy_weight(ggml_backend_t, const ggml_tensor * src, ggml_tensor *, ggml_cgraph *, void * user_data) {
+    auto & state = *(scheduler_copy_state *) user_data;
+    GGML_ASSERT(src == state.weight);
+    GGML_ASSERT(ggml_backend_buffer_get_usage(src->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    GGML_ASSERT(state.input_calls == (state.mode == 0 ? 0 : 2));
+    ++state.weight_calls;
+    return false;
+}
+
+static void test_scheduler_input_copy() {
+    // Exclusive dummy buffer types force transfers that two ordinary CPU backends elide.
+    dummy_backend source = dummy_backend_init(SIZE_MAX);
+    dummy_backend destination = dummy_backend_init(SIZE_MAX);
+    scheduler_copy_state state;
+    for (dummy_backend * backend : { &source, &destination }) {
+        backend->buffer_type.iface.alloc_buffer = scheduler_copy_alloc_buffer;
+        backend->context->backend.iface.graph_compute = scheduler_copy_graph_compute;
+        backend->context->backend.context = &state;
+    }
+    auto [ctx, graph, ctx_ptr] = make_context();
+    state.input = make_input_1d(ctx, 4);
+    state.activation = ggml_scale(ctx, state.input, 2.0f);
+    state.weight = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4);
+    ggml_tensor * combined = ggml_add(ctx, state.weight, state.activation);
+    ggml_tensor * out = ggml_add(ctx, combined, state.input);
+    ggml_set_output(out);
+    ggml_build_forward_expand(graph, out);
+
+    ggml_backend_buffer_ptr weights(ggml_backend_buft_alloc_buffer(&source.buffer_type, ggml_nbytes(state.weight)));
+    ggml_tallocr allocator = ggml_tallocr_new(weights.get());
+    ggml_tallocr_alloc(&allocator, state.weight);
+    ggml_backend_buffer_set_usage(weights.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    const float weight[] = { 3, 5, 7, 11 };
+    ggml_backend_tensor_set(state.weight, weight, 0, sizeof(weight));
+
+    ggml_backend_t backends[] = { &destination.context->backend, &source.context->backend };
+    ggml_backend_buffer_type_t bufts[] = { &destination.buffer_type, &source.buffer_type };
+    ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends, bufts, 2, 48, false, false));
+    for (ggml_tensor * tensor : { state.input, state.activation, state.weight }) {
+        ggml_backend_sched_set_tensor_backend(sched.get(), tensor, backends[1]);
+    }
+    for (ggml_tensor * tensor : { combined, out }) {
+        ggml_backend_sched_set_tensor_backend(sched.get(), tensor, backends[0]);
+    }
+    GGML_ASSERT(ggml_backend_dev_type(ggml_backend_get_device(backends[1])) == GGML_BACKEND_DEVICE_TYPE_CPU);
+    ggml_backend_sched_set_copy_callback(sched.get(), scheduler_copy_weight, &state);
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), graph));
+    GGML_ASSERT(ggml_backend_sched_get_n_splits(sched.get()) == 2);
+    for (int mode : { 0, 1, 2, 0 }) {
+        state.mode = mode;
+        state.input_calls = state.weight_calls = state.consumed = 0;
+        state.snapshots.clear();
+        ggml_backend_sched_set_input_copy_callback(sched.get(), mode ? scheduler_copy_input : nullptr, &state);
+        const float input[] = { 1.0f + mode, 2.0f + mode, 3.0f + mode, 4.0f + mode };
+        ggml_backend_tensor_set(state.input, input, 0, sizeof(input));
+        GGML_ASSERT(ggml_backend_sched_graph_compute(sched.get(), graph) == GGML_STATUS_SUCCESS);
+        float actual[4];
+        ggml_backend_tensor_get(out, actual, 0, sizeof(actual));
+        for (int i = 0; i < 4; ++i) {
+            GGML_ASSERT(actual[i] == 3 * input[i] + weight[i]);
+        }
+        GGML_ASSERT(state.input_calls == (mode == 0 ? 0 : 2));
+        GGML_ASSERT(state.weight_calls == 1);
+        GGML_ASSERT(state.consumed == (mode == 2 ? 2 : 0));
+        GGML_ASSERT(state.queued.empty());
+    }
 }
 
 // Check that the size reported by ggml_backend_alloc_ctx_tensors_from_buft_size
@@ -1120,7 +1478,11 @@ int main() {
     run("test_multiple_buffer_types", test_multiple_buffer_types);
     run("test_buffer_size_zero", test_buffer_size_zero);
     run("test_reallocation", test_reallocation);
+    run("test_measure_then_allocate", test_measure_then_allocate);
     run("test_graph_optimize_alloc_dep", test_graph_optimize_alloc_dep);
+    run("test_scheduler_input_copy", test_scheduler_input_copy);
+    run("test_scheduler_borrowed_buffer", test_scheduler_borrowed_buffer);
+    run("test_borrowed_arena", test_borrowed_arena);
     run("test_buft_alloc_buffer_n_single_buffer", test_buft_alloc_buffer_n_single_buffer);
     run("test_buft_alloc_buffer_n_multi_buffer", test_buft_alloc_buffer_n_multi_buffer);
     run("test_buft_alloc_buffer_n_zero_size", test_buft_alloc_buffer_n_zero_size);

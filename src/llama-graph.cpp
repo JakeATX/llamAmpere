@@ -194,7 +194,7 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
     // TODO: extend llama_ubatch to differentiate between token embeddings and hidden states
     //       for now, we assume that the hidden state is always provided as an embedding
     //       ref: https://github.com/ggml-org/llama.cpp/pull/23643
-    if (ubatch->embd) {
+    if (ubatch->embd && !h_device) {
         GGML_ASSERT(n_embd == h->ne[0]);
 
         ggml_backend_tensor_set(h, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(h));
@@ -664,9 +664,11 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
     res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
-    res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+    if (!skip_unused || (self_kq_mask && self_kq_mask->buffer)) {
+        res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+    }
 
-    if (self_sj_kvarn_desc) {
+    if (self_sj_kvarn_desc && (!skip_unused || self_sj_kvarn_desc->buffer)) {
         res &= sj_kvarn_n_kv_streams == mctx->get_sj_kvarn_n_kv_streams();
     }
 
@@ -1568,6 +1570,7 @@ void llm_graph_result::reset() {
     params = {};
 
     inputs.clear();
+    mtp_device_input = false;
     fused_nodes.clear();
 
     buf_compute_meta.resize(ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false));
@@ -5083,13 +5086,13 @@ ggml_tensor * llm_graph_context::build_draft_vocab_logits(
             return draft_vocab_fallback(DRAFT_VOCAB_FALLBACK_HEAD_LAYOUT, why);
         }
     }
-    // the compact logits never reach the host: every output row must be consumed by a backend sampler
+    // fork: Reserve graphs precede sampler setup; real compact output rows need a backend sampler.
     for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
         if (!ubatch.output[i]) {
             continue;
         }
         for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
-            if (samplers.find(ubatch.seq_id[i][j]) == samplers.end()) {
+            if (!is_reserve && samplers.find(ubatch.seq_id[i][j]) == samplers.end()) {
                 return draft_vocab_fallback(DRAFT_VOCAB_FALLBACK_NO_BACKEND_SAMPLER, "an output row has no backend sampler");
             }
         }
@@ -5109,7 +5112,22 @@ ggml_tensor * llm_graph_context::build_draft_vocab_logits(
     ggml_tensor * rows = ggml_reshape_3d(ctx0, head_w, head_w->ne[0], 1, head_w->ne[1]);
 
     ggml_tensor * logits = nullptr;
-    for (int64_t i = 0; i < n_outputs; ++i) {
+    // [PARW] several drafting slots: one MUL_MAT_ID over all outputs with the id list broadcast (row stride 0), so
+    // the CUDA indexed-rows kernel reads each shortlist row once instead of once per slot. LLAMA_DRAFT_VOCAB_BATCHED=0
+    // keeps the per-output loop.
+    static const bool batched = [] {
+        const char * env = getenv("LLAMA_DRAFT_VOCAB_BATCHED");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    if (batched && n_outputs > 1 && n_outputs <= 8 && ggml_is_contiguous(cur)) {
+        ggml_tensor * ids_b = ggml_view_2d(ctx0, draft_vocab_ids, n_sel, 1, draft_vocab_ids->nb[1], 0);
+        ids_b->ne[1] = n_outputs; // broadcast view: every output reads the same id list
+        ids_b->nb[1] = 0;
+        ggml_tensor * x3 = ggml_reshape_3d(ctx0, cur, cur->ne[0], 1, n_outputs);
+        logits = ggml_reshape_2d(ctx0, ggml_mul_mat_id(ctx0, rows, x3, ids_b), n_sel, n_outputs);
+    }
+    const int64_t n_loop = logits == nullptr ? n_outputs : 0;
+    for (int64_t i = 0; i < n_loop; ++i) {
         ggml_tensor * h_i = n_outputs == 1 ? cur : ggml_view_2d(ctx0, cur, cur->ne[0], 1, cur->nb[1], i*cur->nb[1]);
         ggml_tensor * l_i = ggml_mul_mat_id(ctx0, rows, h_i, draft_vocab_ids); // [1, n_sel, 1]
         l_i = ggml_reshape_2d(ctx0, l_i, n_sel, 1);

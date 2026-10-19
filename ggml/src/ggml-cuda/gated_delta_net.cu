@@ -1,6 +1,7 @@
 #include "gated_delta_net.cuh"
 #include "ggml-cuda/common.cuh"
 #include "convert.cuh"
+#include "gated_delta_net_chunked_tc.cuh"
 
 #include <cstdlib>
 #include <algorithm>
@@ -841,7 +842,6 @@ static void launch_gated_delta_net(
         int64_t neqk1, int64_t rq3,
         float scale, int64_t state_slot_stride, int K, const int32_t * slot_rows,
         int ingr_w, int64_t ingr_region, const ggml_cuda_gated_delta_net_state_src state_src, cudaStream_t stream) {
-    //TODO: Add chunked kernel for even faster pre-fill
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     const int num_warps = 4;
     dim3      grid_dims(H, n_seqs, (S_v + num_warps - 1) / num_warps);
@@ -1181,6 +1181,22 @@ static void ggml_cuda_op_gated_delta_net_impl(
         state_slot_stride = cache->slot_stride;
         slot_rows         = cache->slot_rows;
     }
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (ggml_cuda_gdn_tc_enabled() && (cc == 800 || cc == 860) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_AMPERE &&
+            S_v == 128 && n_tokens >= 512 && !kda && !keep_rs && state_type == GGML_TYPE_F32) {
+        const int precision = ggml_cuda_gdn_tc_precision();
+        const auto kernel = precision == 1 ? gated_delta_net_chunked_tc<1> : precision == 2 ? gated_delta_net_chunked_tc<2> : gated_delta_net_chunked_tc<3>;
+        CUDA_SET_SHARED_MEMORY_LIMIT(kernel, GDN_TC_SHARED);
+        const ggml_cuda_kernel_launch_params params(dim3(H, n_seqs, 128 / GDN_TC_COLS), dim3(WARP_SIZE, 4), GDN_TC_SHARED, stream);
+        ggml_cuda_kernel_launch(kernel, params,
+            q_d, k_d, v_d, g_d, b_d, s_d, dst_d, (float *) state_d, H, n_tokens, n_seqs,
+            sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, init_fastdiv_values(neqk1), init_fastdiv_values(rq3),
+            scale, slot_rows, state_src);
+        return;
+    }
+#endif
 
 #define GDN_DISPATCH(T_) \
     gated_delta_net_dispatch<T_>(kda, keep_rs, emit_ingr, q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, \

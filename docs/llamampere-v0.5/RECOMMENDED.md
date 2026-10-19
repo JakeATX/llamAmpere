@@ -183,9 +183,10 @@ v0.5 builds in these defaults:
 - the fused SJ-KVaRN write path;
 - 256 MiB bounded-prefill workspaces.
 
-Two items are off by default:
+Current builds enable I8QK int8 QK prefill with PV16 and KCB by default (`GGML_CUDA_FA_I8QK`, `GGML_CUDA_FA_I8QK_PV16`, `GGML_CUDA_FA_I8QK_KCB`); set any one to `0` to disable that option.
 
-- int8 Q·K attention for prefill (`GGML_CUDA_FA_I8QK=1` turns it on);
+Off by default:
+
 - the fused-rotation SJ-KVaRN kernels (CMake option `GGML_SJKVARN_FUSED_ROT`).
 
 None of these need an environment variable. With tq5_0/turbo4, v0.5 measured +8.41% ± 5.76% G over v0.4 on the ship

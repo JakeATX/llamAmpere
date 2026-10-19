@@ -69,6 +69,9 @@ extern "C" {
     GGML_API ggml_backend_buffer_type_t     ggml_backend_buffer_get_type      (ggml_backend_buffer_t buffer);
     GGML_API void                           ggml_backend_buffer_reset         (ggml_backend_buffer_t buffer);
 
+    // A non-owning range of a buffer. The parent must outlive the view and its tensors.
+    GGML_API ggml_backend_buffer_t ggml_backend_buffer_view(ggml_backend_buffer_t parent, size_t offset, size_t size);
+
     // tensor copy between different backends
     GGML_API void ggml_backend_tensor_copy(const struct ggml_tensor * src, struct ggml_tensor * dst);
 
@@ -326,6 +329,10 @@ extern "C" {
     // `graph` is the compute graph of the split
     typedef bool (*ggml_backend_sched_copy_callback)(ggml_backend_t backend, const struct ggml_tensor * src, struct ggml_tensor * dst, struct ggml_cgraph * graph, void * user_data);
 
+    // Optional copy handler for non-weight host inputs from a completed CPU backend.
+    // On true, src must be copied or snapshotted; queued uploads must retain their data and order destination reuse.
+    typedef bool (*ggml_backend_sched_input_copy_callback)(ggml_backend_t backend, const struct ggml_tensor * src, struct ggml_tensor * dst, void * user_data);
+
     // Initialize a backend scheduler, backends with low index are given priority over backends with high index
     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload);
     GGML_API void                 ggml_backend_sched_free(ggml_backend_sched_t sched);
@@ -345,6 +352,11 @@ extern "C" {
     GGML_API size_t                     ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend);
     // Adopt the donor scheduler's compute buffers (same backends and buffer types); the two schedulers must never compute concurrently
     GGML_API bool                       ggml_backend_sched_set_donor(ggml_backend_sched_t sched, ggml_backend_sched_t donor);
+    // Bind caller-owned compute storage after reset. Oversized graphs fail; NULL restores normal allocation.
+    // The buffer and its parent must outlive the binding and all submitted work.
+    GGML_API bool                       ggml_backend_sched_set_buffer(ggml_backend_sched_t sched, ggml_backend_t backend, ggml_backend_buffer_t buffer);
+    // Up to 16 borrowed chunks; no tensor spans chunks. A zero count restores normal allocation.
+    GGML_API bool                       ggml_backend_sched_set_buffers(ggml_backend_sched_t sched, ggml_backend_t backend, ggml_backend_buffer_t * buffers, int n_buffers);
     // Changes when a recipient scheduler grew this scheduler's compute buffers (see ggml_gallocr_get_epoch): a graph
     // allocated under an older value must go through ggml_backend_sched_alloc_graph again before it is computed
     GGML_API uint64_t                   ggml_backend_sched_get_alloc_epoch(ggml_backend_sched_t sched);
@@ -371,6 +383,7 @@ extern "C" {
 
     // Set a callback to be called when the inputs weights of a split are being copied
     GGML_API void                 ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data);
+    GGML_API void                 ggml_backend_sched_set_input_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_input_copy_callback callback, void * user_data);
 
     //
     // Meta backend

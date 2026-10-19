@@ -46,5 +46,9 @@ static const char * const k_bitmap_1[] = {
 static const llama_mtp_vocab_builtin k_builtins[] = {
     { "qwen3.8-27b-65536", "Qwen3.8-27B", "qwen35", 0x4f951848e41f4b37ULL, 248320, 65536, k_bitmap_0 },
     { "qwen3.8-27b-32768", "Qwen3.8-27B", "qwen35", 0x4f951848e41f4b37ULL, 248320, 32768, k_bitmap_1 },
+    // Flash-Next is arch qwen4exp with this same tokenizer fingerprint, so auto missed the qwen35 rows.
+    // The bitmaps are the published 27B lists (same token strings and BPE merges). auto prefers 65536.
+    { "flash-next-65536", "Qwen3.8-Flash-Next", "qwen4exp", 0x4f951848e41f4b37ULL, 248320, 65536, k_bitmap_0 },
+    { "flash-next-32768", "Qwen3.8-Flash-Next", "qwen4exp", 0x4f951848e41f4b37ULL, 248320, 32768, k_bitmap_1 },
     { nullptr, nullptr, nullptr, 0, 0, 0, nullptr },
 };

@@ -490,6 +490,61 @@ void ggml_backend_buffer_reset(ggml_backend_buffer_t buffer) {
     }
 }
 
+struct ggml_backend_buffer_view_context {
+    ggml_backend_buffer_t parent;
+    size_t offset;
+};
+
+static void ggml_backend_buffer_view_free(ggml_backend_buffer_t buffer) {
+    delete static_cast<ggml_backend_buffer_view_context *>(buffer->context);
+}
+
+static void * ggml_backend_buffer_view_base(ggml_backend_buffer_t buffer) {
+    auto * ctx = static_cast<ggml_backend_buffer_view_context *>(buffer->context);
+    return static_cast<char *>(ggml_backend_buffer_get_base(ctx->parent)) + ctx->offset;
+}
+
+static ggml_status ggml_backend_buffer_view_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
+    auto * ctx = static_cast<ggml_backend_buffer_view_context *>(buffer->context);
+    // Backend kernels need the parent's buffer context, including device and tensor metadata.
+    tensor->buffer = ctx->parent;
+    return ggml_backend_buffer_init_tensor(ctx->parent, tensor);
+}
+
+static void ggml_backend_buffer_view_clear(ggml_backend_buffer_t buffer, uint8_t value) {
+    auto * ctx = static_cast<ggml_backend_buffer_view_context *>(buffer->context);
+    ggml_tensor tensor = {};
+    tensor.type = GGML_TYPE_I8;
+    tensor.ne[0] = buffer->size;
+    tensor.nb[0] = 1;
+    for (int i = 1; i < GGML_MAX_DIMS; i++) {
+        tensor.ne[i] = 1;
+        tensor.nb[i] = buffer->size;
+    }
+    tensor.data = ggml_backend_buffer_view_base(buffer);
+    tensor.buffer = ctx->parent;
+    ctx->parent->iface.memset_tensor(ctx->parent, &tensor, value, 0, buffer->size);
+}
+
+ggml_backend_buffer_t ggml_backend_buffer_view(ggml_backend_buffer_t parent, size_t offset, size_t size) {
+    if (!parent || offset > parent->size || size > parent->size - offset || size > INT64_MAX ||
+            !parent->iface.get_base || !parent->iface.memset_tensor || ggml_backend_buffer_is_meta(parent)) {
+        return nullptr;
+    }
+    void * base = ggml_backend_buffer_get_base(parent);
+    const size_t alignment = ggml_backend_buffer_get_alignment(parent);
+    if (!base || (reinterpret_cast<uintptr_t>(base) + offset) % alignment != 0) {
+        return nullptr;
+    }
+    ggml_backend_buffer_i iface = {};
+    iface.free_buffer = ggml_backend_buffer_view_free;
+    iface.get_base = ggml_backend_buffer_view_base;
+    iface.init_tensor = ggml_backend_buffer_view_init_tensor;
+    iface.clear = ggml_backend_buffer_view_clear;
+    auto * ctx = new ggml_backend_buffer_view_context{parent, offset};
+    return ggml_backend_buffer_init(parent->buft, iface, ctx, size);
+}
+
 bool ggml_backend_buffer_copy_tensor(const struct ggml_tensor * src, struct ggml_tensor * dst) {
     ggml_backend_buffer_t dst_buf = dst->view_src ? dst->view_src->buffer : dst->buffer;
     if (dst_buf->iface.cpy_tensor) {
@@ -1127,12 +1182,21 @@ struct ggml_backend_sched {
     // The provider table selected for this session. Copied at creation so a
     // later registration change cannot alter the session's callbacks.
     struct ggml_moe_cache_api moe_cache_api;
+    // how the session was made (0 none, 1 default at creation, 2 set_moe_cache), so a suspended session can be
+    // made again the same way
+    int                      moe_cache_made;
+    enum ggml_moe_cache_mode moe_cache_mode_last;
+    size_t                   moe_cache_budget_last;
+    bool                     moe_cache_suspended;
 
     ggml_backend_sched_eval_callback callback_eval;
     void * callback_eval_user_data;
 
     ggml_backend_sched_copy_callback callback_copy;
     void * callback_copy_user_data;
+
+    ggml_backend_sched_input_copy_callback callback_input_copy;
+    void * callback_input_copy_user_data;
 
     char * context_buffer;
     size_t context_buffer_size;
@@ -2786,6 +2850,14 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
     ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, input);
     struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
 
+    if (sched->callback_input_copy != NULL && input_backend != NULL &&
+            ggml_backend_dev_type(ggml_backend_get_device(input_backend)) == GGML_BACKEND_DEVICE_TYPE_CPU &&
+            input->buffer != NULL && ggml_backend_buffer_is_host(input->buffer) &&
+            !ggml_backend_sched_is_host_weight(input) &&
+            sched->callback_input_copy(split_backend, input, input_cpy, sched->callback_input_copy_user_data)) {
+        return;
+    }
+
     if (input->flags & GGML_TENSOR_FLAG_INPUT) {
         // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
@@ -2961,6 +3033,24 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     return GGML_STATUS_SUCCESS;
 }
 
+// the session a new scheduler gets when nobody sets a mode: the first provider that accepts the default config
+static void ggml_sched_moe_cache_default(ggml_backend_sched_t sched) {
+    void * cache_backends[GGML_SCHED_MAX_BACKENDS];
+    for (int b = 0; b < sched->n_backends; b++) {
+        cache_backends[b] = sched->backends[b];
+    }
+    for (const ggml_moe_cache_api & api :
+            ggml_moe_cache_provider_candidates(cache_backends, sched->n_backends)) {
+        void * session = api.session_create(cache_backends, sched->n_backends, nullptr);
+        if (session) {
+            sched->moe_cache_session = session;
+            sched->moe_cache_api     = api;
+            sched->moe_cache_made    = 1;
+            break;
+        }
+    }
+}
+
 ggml_backend_sched_t ggml_backend_sched_new(
         ggml_backend_t * backends,
         ggml_backend_buffer_type_t * bufts,
@@ -3025,21 +3115,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
         }
     }
 
-    {
-        void * cache_backends[GGML_SCHED_MAX_BACKENDS];
-        for (int b = 0; b < n_backends; b++) {
-            cache_backends[b] = backends[b];
-        }
-        for (const ggml_moe_cache_api & api :
-                ggml_moe_cache_provider_candidates(cache_backends, n_backends)) {
-            void * session = api.session_create(cache_backends, n_backends, nullptr);
-            if (session) {
-                sched->moe_cache_session = session;
-                sched->moe_cache_api = api;
-                break;
-            }
-        }
-    }
+    ggml_sched_moe_cache_default(sched);
 
     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
     sched->op_offload = op_offload;
@@ -3073,9 +3149,14 @@ void ggml_backend_sched_set_moe_cache(
     }
     sched->moe_cache_session = nullptr;
     sched->moe_cache_api = ggml_moe_cache_api{};
+    sched->moe_cache_made = 0;
+    sched->moe_cache_suspended = false;
     if (mode == GGML_MOE_CACHE_MODE_OFF) {
         return;
     }
+    sched->moe_cache_made        = 2;
+    sched->moe_cache_mode_last   = mode;
+    sched->moe_cache_budget_last = budget_mib;
 
     void * cache_backends[GGML_SCHED_MAX_BACKENDS];
     for (int index = 0; index < sched->n_backends; index++) {
@@ -3178,6 +3259,35 @@ size_t ggml_backend_sched_moe_cache_restore(ggml_backend_sched_t sched) {
     const size_t restored = sched->moe_cache_api.restore(sched->moe_cache_session);
     ggml_backend_sched_reset(sched);
     return restored;
+}
+
+bool ggml_backend_sched_moe_cache_suspend(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    if (!sched->moe_cache_session || sched->moe_cache_suspended || !sched->moe_cache_api.session_destroy) {
+        return false;
+    }
+    ggml_backend_sched_synchronize(sched);
+    sched->moe_cache_api.session_destroy(sched->moe_cache_session);
+    sched->moe_cache_session   = nullptr;
+    sched->moe_cache_suspended = true;
+    sched->moe_cache_device_graph = false;
+    ggml_backend_sched_reset(sched);
+    return true;
+}
+
+void ggml_backend_sched_moe_cache_resume(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    if (!sched->moe_cache_suspended) {
+        return;
+    }
+    sched->moe_cache_suspended = false;
+    if (sched->moe_cache_made == 2) {
+        ggml_backend_sched_set_moe_cache(sched, sched->moe_cache_mode_last, sched->moe_cache_budget_last);
+    } else {
+        sched->moe_cache_api = ggml_moe_cache_api{};
+        ggml_sched_moe_cache_default(sched);
+    }
+    ggml_backend_sched_reset(sched);
 }
 
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {
@@ -3333,6 +3443,12 @@ void ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backe
     sched->callback_copy_user_data = user_data;
 }
 
+void ggml_backend_sched_set_input_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_input_copy_callback callback, void * user_data) {
+    GGML_ASSERT(sched);
+    sched->callback_input_copy = callback;
+    sched->callback_input_copy_user_data = user_data;
+}
+
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     return sched->n_splits;
@@ -3380,6 +3496,22 @@ bool ggml_backend_sched_set_donor(ggml_backend_sched_t sched, ggml_backend_sched
     }
     ggml_gallocr_set_donor(sched->galloc, donor->galloc);
     return true;
+}
+
+bool ggml_backend_sched_set_buffer(ggml_backend_sched_t sched, ggml_backend_t backend, ggml_backend_buffer_t buffer) {
+    return ggml_backend_sched_set_buffers(sched, backend, buffer ? &buffer : nullptr, buffer ? 1 : 0);
+}
+
+bool ggml_backend_sched_set_buffers(ggml_backend_sched_t sched, ggml_backend_t backend, ggml_backend_buffer_t * buffers, int n_buffers) {
+    if (!sched || !sched->is_reset || sched->is_alloc) {
+        return false;
+    }
+    const int backend_index = ggml_backend_sched_backend_id(sched, backend);
+    if (backend_index < 0 || backend_index >= sched->n_backends) {
+        return false;
+    }
+    ggml_backend_sched_synchronize(sched);
+    return ggml_gallocr_set_buffers(sched->galloc, backend_index, buffers, n_buffers);
 }
 
 uint64_t ggml_backend_sched_get_alloc_epoch(ggml_backend_sched_t sched) {

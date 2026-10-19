@@ -5,6 +5,7 @@
 #include "vecdotq.cuh"
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 #include "mmvq-iq4xs-k4.cuh"
+#include "mmvq-iq4xs-wide.cuh"
 #endif
 
 #include <cstdint>
@@ -1639,10 +1640,13 @@ static void mul_mat_vec_q_moe_launch(
 }
 
 // Indexed vocabulary rows share one activation vector and never read padded rows.
-template <ggml_type type>
+// [PARW] ncols > 1: several activation columns (one per drafting slot) share one id list (ids broadcast, stride 0),
+// so each weight row is read once for all columns. Each column's sum keeps the single-column order (bit-identical).
+template <ggml_type type, int ncols>
 static __global__ void mul_mat_vec_q_indexed_rows(
         const void * vx, const block_q8_1 * y, const int32_t * ids, float * dst,
-        const int ncols, const int count, const int64_t row_bytes, const int dst_stride) {
+        const int ncols_x, const int count, const int64_t row_bytes, const int dst_stride,
+        const int stride_col_y, const int stride_col_dst) {
     constexpr int qk = ggml_cuda_type_traits<type>::qk;
     constexpr int qi = ggml_cuda_type_traits<type>::qi;
     constexpr int vdr = get_vdr_mmvq(type);
@@ -1653,12 +1657,23 @@ static __global__ void mul_mat_vec_q_indexed_rows(
     if (row >= count) { return; }
     const void * weights = (const char *) vx + (int64_t) ids[row] * row_bytes;
     const int lane = threadIdx.x;
-    float sum = 0.0f;
-    for (int k = lane / (qi / vdr); k < ncols / qk; k += vdr * warp_size / qi) {
-        sum += vec_dot(weights, y + k * (qk / QK8_1), k, vdr * (lane % (qi / vdr)));
+    float sum[ncols] = {0.0f};
+    for (int k = lane / (qi / vdr); k < ncols_x / qk; k += vdr * warp_size / qi) {
+#pragma unroll
+        for (int j = 0; j < ncols; ++j) {
+            sum[j] += vec_dot(weights, y + j * stride_col_y + k * (qk / QK8_1), k, vdr * (lane % (qi / vdr)));
+        }
     }
-    sum = warp_reduce_sum<warp_size>(sum);
-    if (lane == 0) { dst[row * dst_stride] = sum; }
+#pragma unroll
+    for (int j = 0; j < ncols; ++j) {
+        sum[j] = warp_reduce_sum<warp_size>(sum[j]);
+    }
+    if (lane == 0) {
+#pragma unroll
+        for (int j = 0; j < ncols; ++j) {
+            dst[j * stride_col_dst + row * dst_stride] = sum[j];
+        }
+    }
 }
 
 // [#45] Thin launch for matrices with few rows at verify widths 2..8. The GDN gate projections ssm_alpha and
@@ -1803,16 +1818,29 @@ static void mul_mat_vec_q_switch_ncols_dst(
 
     const bool has_ids = ids != nullptr;
 
-    if (has_ids && nrows_x == 1 && ncols_dst == 1 && nchannels_y == 1 &&
+    if (has_ids && nrows_x == 1 && (ncols_dst == 1 || ids_stride == 0) && nchannels_y == 1 &&
             nsamples_x == 1 && nsamples_dst == 1 && !fusion.gate && !fusion.x_bias &&
             !fusion.gate_bias && !fusion.x_scale && !fusion.gate_scale) {
         const dim3 blocks((nchannels_dst + 3) / 4);
         const dim3 threads(warp_size, 4);
         const ggml_cuda_kernel_launch_params launch(blocks, threads, 0, stream);
-        ggml_cuda_kernel_launch(mul_mat_vec_q_indexed_rows<type>, launch,
-                vx, (const block_q8_1 *) vy, ids, dst, ncols_x, nchannels_dst,
-                (int64_t) stride_channel_x * ggml_type_size(type), stride_channel_dst);
-        return;
+        const int64_t row_bytes = (int64_t) stride_channel_x * ggml_type_size(type);
+#define MMVQ_INDEXED_CASE(n) \
+        case n: ggml_cuda_kernel_launch(mul_mat_vec_q_indexed_rows<type, n>, launch, \
+                vx, (const block_q8_1 *) vy, ids, dst, ncols_x, nchannels_dst, row_bytes, stride_channel_dst, \
+                stride_col_y, stride_col_dst); return;
+        switch (ncols_dst) {
+            MMVQ_INDEXED_CASE(1)
+            MMVQ_INDEXED_CASE(2)
+            MMVQ_INDEXED_CASE(3)
+            MMVQ_INDEXED_CASE(4)
+            MMVQ_INDEXED_CASE(5)
+            MMVQ_INDEXED_CASE(6)
+            MMVQ_INDEXED_CASE(7)
+            MMVQ_INDEXED_CASE(8)
+            default: GGML_ABORT("fatal error");
+        }
+#undef MMVQ_INDEXED_CASE
     }
 
     // How the K loop divides up at the baseline block width, both decisions below use these.
@@ -2214,7 +2242,7 @@ static void mul_mat_vec_q_switch_type(
 bool ggml_cuda_q8_cacheable(const ggml_backend_cuda_context & ctx, size_t q8_bytes) {
     static const bool q8_cache_disabled = getenv("GGML_CUDA_Q8CACHE") != nullptr && atoi(getenv("GGML_CUDA_Q8CACHE")) == 0;
     // Main stream only: a sibling stream could consume the buffer with no cross-stream ordering.
-    return !q8_cache_disabled && q8_bytes <= (1u << 20) && ctx.curr_stream_no == 0;
+    return !ctx.scratch_borrowed && !q8_cache_disabled && q8_bytes <= (1u << 20) && ctx.curr_stream_no == 0;
 }
 
 // The q8_1 layout depends on the weight type only through the IQ4_XS swizzle (quantize_row_q8_1_cuda), so the
@@ -2274,6 +2302,41 @@ char * ggml_cuda_q8_cache_claim(ggml_backend_cuda_context & ctx, const ggml_tens
     qe->ne10_padded = ne10_padded;
     qe->swizzle_iq4 = ggml_cuda_q8_cache_swizzle(type_src0);
     return qe->ptr;
+}
+
+bool ggml_cuda_mul_mat_iq4xs_wide_try(ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (src0->type != GGML_TYPE_IQ4_XS || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+            ggml_cuda_iq4xs_wide_mr() == 0) {
+        return false;
+    }
+    const int64_t ne00 = src0->ne[0], ne01 = src0->ne[1], ne11 = src1->ne[1];
+    if (ne11 < IQ4XS_WIDE_MIN_N || ne11 > IQ4XS_WIDE_MAX_N ||
+            src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 ||
+            ne00 <= 0 || ne00 % QK_K != 0 || ne00 > std::numeric_limits<int>::max() || src1->ne[0] != ne00 ||
+            ne01 <= 0 || ne01 % 16 != 0 || ne01 > std::numeric_limits<int>::max() ||
+            src0->nb[1] % ggml_type_size(src0->type) != 0 || src1->nb[0] != sizeof(float) || src1->nb[1] % sizeof(float) != 0 ||
+            dst->nb[0] != sizeof(float) || dst->nb[1] % sizeof(float) != 0 ||
+            (uintptr_t) src0->data % alignof(uint2) != 0 || src0->nb[1] % alignof(uint2) != 0) {
+        return false;
+    }
+    // 21-32 columns with a long K (the FFN down projection): MMQ measured equal or faster (102 vs 108 us at 5120x17408, w24)
+    if (ne11 > 20 && ne00 >= 16384) {
+        return false;
+    }
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_AMPERE) {
+        return false;
+    }
+    ggml_cuda_mul_mat_iq4xs_wide(ctx, src0->data, (const float *) src1->data, (float *) dst->data,
+                                 (int) ne00, (int) ne01, (int) ne11,
+                                 src0->nb[1] / ggml_type_size(src0->type), src1->nb[1] / sizeof(float), dst->nb[1] / sizeof(float));
+    return true;
+#else
+    GGML_UNUSED_VARS(ctx, src0, src1, dst);
+    return false;
+#endif
 }
 
 void ggml_cuda_mul_mat_vec_q(
