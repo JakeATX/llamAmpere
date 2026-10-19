@@ -64,13 +64,16 @@ void llama_moe_output::release(size_t offset, size_t bytes) {
     const long page_size = sysconf(_SC_PAGESIZE);
     if (page_size <= 0) { throw std::runtime_error("cannot query page size"); }
     const size_t page = (size_t) page_size;
-    const size_t begin = offset - offset % page;
-    const size_t end = offset + bytes;
-    const size_t padding = end % page ? page - end % page : 0;
-    if (padding > SIZE_MAX - end || end + padding > (size_t) INT64_MAX) {
+    const size_t padding = offset % page ? page - offset % page : 0;
+    if (padding >= bytes) { return; }
+    const size_t begin = offset + padding;
+    const size_t end = offset + bytes - (offset + bytes) % page;
+    if (end <= begin) { return; }
+    if (end > (size_t) INT64_MAX) {
         throw std::out_of_range("MoE temporary output page range overflow");
     }
-    const size_t length = end + padding - begin;
+    const size_t length = end - begin;
+    // Boundary pages can contain live logits or neighboring activation rows.
     // Call only after the backend has completed all writes to these pages.
     if (msync((char *) data + begin, length, MS_SYNC) != 0 ||
             madvise((char *) data + begin, length, MADV_DONTNEED) != 0) {
