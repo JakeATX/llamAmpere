@@ -79,3 +79,53 @@ def activation_metadata(log, start, end, total, output_dir):
     return dict(activation_metadata_bytes=observed, remaining_read_bytes=total-observed,
                 intervals=[(tid, begin, finish) for tid, spans in windows.items() for begin, finish in spans],
                 scope='Only successful, fully contained creation of new empty owned activation files and allocation of owned deleted activation files; no model/activation payload reads exempted.')
+
+
+def activation_device_copies(log, start, end, total, output_dir):
+    """Account exact device-to-owned-output operations from the verified CUDA probe."""
+    from bisect import bisect_left
+    if type(total) is not int or total < 0 or not math.isfinite(start) or not math.isfinite(end) or end < start:
+        raise ValueError('invalid device output interval or counter')
+    if 'FNSHIP_NONWEIGHT_PROBE_ERROR' in log:
+        raise ValueError('device output counter unavailable')
+    own_path = re.compile(re.escape(str(Path(output_dir).resolve())) + r'/llama-moe-output-[A-Za-z0-9]{6} \(deleted\)$')
+    pattern = re.compile(r'^FNSHIP_NONWEIGHT_PROBE op=(cuda_d2h_owned|cuda_d2h_async_owned|cuda_d2h_2d_owned|cuda_d2h_2d_async_owned) start=([0-9.]+) end=([0-9.]+) tid=([0-9]+) result=0 read_bytes=([0-9]+) path=(.+)$')
+    observed = 0
+    windows = {}
+    calls = 0
+    marker = 'FNSHIP_NONWEIGHT_PROBE '
+    if log and not log.endswith('\n'):
+        tail = log.rsplit('\n', 1)[-1]
+        if tail and (marker in tail or marker.startswith(tail)):
+            raise ValueError('incomplete device output trace')
+    for line in log.splitlines():
+        if not line.startswith(marker):
+            continue
+        operation = line[len(marker):].split(' ', 1)[0]
+        if operation not in ('op=cuda_d2h_owned', 'op=cuda_d2h_async_owned', 'op=cuda_d2h_2d_owned', 'op=cuda_d2h_2d_async_owned'):
+            continue
+        match = pattern.fullmatch(line)
+        if not match or not own_path.fullmatch(match[6]):
+            raise ValueError('invalid device output source or trace')
+        begin, finish = float(match[2]), float(match[3])
+        if not math.isfinite(begin) or not math.isfinite(finish) or finish < begin:
+            raise ValueError('invalid device output trace interval')
+        if finish < start or begin > end:
+            continue
+        if not start <= begin <= finish <= end:
+            raise ValueError('device output trace crosses request boundary')
+        tid, count = int(match[4]), int(match[5])
+        if tid <= 0 or count <= 0:
+            raise ValueError('invalid device output thread or count')
+        spans = windows.setdefault(tid, [])
+        index = bisect_left(spans, (begin,))
+        if ((index and begin <= spans[index-1][1]) or (index < len(spans) and finish >= spans[index][0])):
+            raise ValueError('duplicate or overlapping device output attribution')
+        spans.insert(index, (begin, finish))
+        observed += count
+        calls += 1
+    if observed > total:
+        raise ValueError('device output attribution exceeds process reads')
+    return dict(activation_device_copy_bytes=observed, positive_calls=calls, remaining_read_bytes=total-observed,
+                intervals=[(tid, begin, finish) for tid, spans in windows.items() for begin, finish in spans],
+                scope='Successful CUDA device-to-owned-output copies only; exact device source checked before I/O counters, no context synchronization or host callback.')
