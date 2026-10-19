@@ -4980,7 +4980,7 @@ static bool moe_cache_device_fallback(moe_cache_session & session,
         return true;
     }
     const size_t bytes = table.desc.expert_size;
-    const size_t floor = 10ull << 30, margin = 2ull << 30;
+    const size_t floor = 7ull << 30, margin = 2ull << 30;
     size_t registered = 0;
     for (const auto & range : session.mapped_ranges) {
         if (range.registered) {

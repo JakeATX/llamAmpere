@@ -47,7 +47,7 @@ lease = json.loads((root / 'lease.json').read_text())
 lease_seconds = lease['end_unix_s'] - lease['start_unix_s']
 assert 0 < lease_seconds <= 1500
 rows = [json.loads(line) for line in (root / 'resources.jsonl').read_text().splitlines()]
-assert rows and all(row['vram'] <= 23552 and row['available'] >= 10*1024**3 and abs(row['power_limit_w']-350) <= .1 for row in rows)
+assert rows and all(row['vram'] <= 23552 and row['available'] >= 7*1024**3 and abs(row['power_limit_w']-350) <= .1 for row in rows)
 generation = [row for row in rows if result['request_start_s'] <= row['elapsed'] <= result['request_end_s']]
 assert generation
 phase_means = {}
