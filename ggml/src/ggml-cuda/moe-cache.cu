@@ -5754,7 +5754,7 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
             }
         }
         const size_t margin = ranges.empty() ? 0 : 2ull << 30;
-        const size_t floor = 10ull << 30;
+        const size_t floor = 7ull << 30;
         const size_t available = moe_cache_mem_available();
         MOE_CACHE_LOG("[moe-cache] device preflight: hot=%zu MiB map=%zu MiB nonresident=%zu MiB ranges=%zu available=%zu MiB\n",
                 hot_bytes >> 20, pin_bytes >> 20, new_bytes >> 20, ranges.size(), available >> 20);
