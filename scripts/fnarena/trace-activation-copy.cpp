@@ -17,7 +17,14 @@
 using copy_fn = void (*)(void *, const void *, size_t);
 static pthread_once_t initialized = PTHREAD_ONCE_INIT;
 static copy_fn real_copy;
-static void resolve() { real_copy = (copy_fn) dlsym(RTLD_NEXT, "llama_copy_moe_output"); }
+static copy_fn real_write;
+using compare_fn = int (*)(const void *, const void *, size_t);
+static compare_fn real_compare;
+static void resolve() {
+    real_copy = (copy_fn) dlsym(RTLD_NEXT, "llama_copy_moe_output");
+    real_write = (copy_fn) dlsym(RTLD_NEXT, "llama_write_moe_output");
+    real_compare = (compare_fn) dlsym(RTLD_NEXT, "llama_compare_moe_output");
+}
 static uint64_t io_bytes() {
     char data[1024];
     int fd = (int) syscall(SYS_openat, AT_FDCWD, "/proc/thread-self/io", O_RDONLY | O_CLOEXEC, 0);
@@ -89,4 +96,68 @@ extern "C" void llama_copy_moe_output(void * dst, const void * src, size_t bytes
                 syscall(SYS_gettid), after - before, offset, bytes, path);
     }
     errno = result_errno;
+}
+
+// Layout operands contain serialized metadata. Reject any file-backed second operand.
+static bool anonymous_operand(const void * ptr, size_t bytes) {
+    FILE * maps = fopen("/proc/self/maps", "r");
+    if (!maps) { return false; }
+    char line[PATH_MAX + 256];
+    bool found = false;
+    while (fgets(line, sizeof(line), maps)) {
+        uintptr_t begin, end;
+        uint64_t offset, inode;
+        char permissions[5];
+        int n = 0;
+        if (sscanf(line, "%" SCNxPTR "-%" SCNxPTR " %4s %" SCNx64 " %*s %" SCNu64 " %n",
+                   &begin, &end, permissions, &offset, &inode, &n) != 5 || !n) { continue; }
+        const uintptr_t address = (uintptr_t) ptr;
+        if (address >= begin && address < end && bytes <= end - address) {
+            found = permissions[0] == 'r' && inode == 0;
+            break;
+        }
+    }
+    fclose(maps);
+    return found;
+}
+static int layout_operation(void * owned, const void * metadata, size_t bytes, bool compare) {
+    const int saved_errno = errno;
+    pthread_once(&initialized, resolve);
+    if ((compare && !real_compare) || (!compare && !real_write)) { _exit(126); }
+    if (!bytes) {
+        errno = saved_errno;
+        if (compare) { return real_compare(owned, metadata, bytes); }
+        real_write(owned, metadata, bytes);
+        return 0;
+    }
+    char path[PATH_MAX] = {};
+    uint64_t offset = 0;
+    const bool valid = source_mapping(owned, bytes, path, offset) && anonymous_operand(metadata, bytes);
+    timespec start{}, end{};
+    clock_gettime(CLOCK_REALTIME, &start);
+    const uint64_t before = io_bytes();
+    errno = saved_errno;
+    int result = 0;
+    if (compare) { result = real_compare(owned, metadata, bytes); }
+    else { real_write(owned, metadata, bytes); }
+    const int result_errno = errno;
+    const uint64_t after = io_bytes();
+    clock_gettime(CLOCK_REALTIME, &end);
+    if (before == UINT64_MAX || after == UINT64_MAX || after < before) {
+        fprintf(stderr, "FNARENA_LAYOUT_IO_ERROR tid=%ld reason=counter\n", syscall(SYS_gettid));
+    } else if (after > before && !valid) {
+        fprintf(stderr, "FNARENA_LAYOUT_IO_ERROR tid=%ld reason=operand\n", syscall(SYS_gettid));
+    } else if (after > before) {
+        fprintf(stderr, "FNARENA_LAYOUT_IO op=%s start=%lld.%09ld end=%lld.%09ld tid=%ld read_bytes=%" PRIu64 " offset=%" PRIu64 " bytes=%zu path=%s\n",
+                compare ? "compare" : "write", (long long) start.tv_sec, start.tv_nsec, (long long) end.tv_sec, end.tv_nsec,
+                syscall(SYS_gettid), after - before, offset, bytes, path);
+    }
+    errno = result_errno;
+    return result;
+}
+extern "C" void llama_write_moe_output(void * dst, const void * src, size_t bytes) {
+    layout_operation(dst, src, bytes, false);
+}
+extern "C" int llama_compare_moe_output(const void * lhs, const void * rhs, size_t bytes) {
+    return layout_operation(const_cast<void *>(lhs), rhs, bytes, true);
 }

@@ -18,6 +18,14 @@ void llama_copy_moe_output(void * dst, const void * src, size_t bytes) {
     memcpy(dst, src, bytes);
 }
 
+void llama_write_moe_output(void * dst, const void * src, size_t bytes) {
+    memcpy(dst, src, bytes);
+}
+
+int llama_compare_moe_output(const void * lhs, const void * rhs, size_t bytes) {
+    return memcmp(lhs, rhs, bytes);
+}
+
 llama_moe_output::llama_moe_output(size_t bytes, const char * directory) : size(bytes) {
 #ifndef _WIN32
     std::string name = std::string(directory) + "/llama-moe-output-XXXXXX";

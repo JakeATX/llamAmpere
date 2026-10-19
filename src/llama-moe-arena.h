@@ -9,6 +9,8 @@
 
 // Pure copy boundary for tracing only owned output-file refaults, after synchronization.
 extern "C" LLAMA_API void llama_copy_moe_output(void * dst, const void * src, size_t bytes);
+extern "C" LLAMA_API void llama_write_moe_output(void * dst, const void * src, size_t bytes);
+extern "C" LLAMA_API int llama_compare_moe_output(const void * lhs, const void * rhs, size_t bytes);
 
 // fork: reclaimable storage for a large, temporary MTP output, with unchanged floats.
 struct llama_moe_output {
