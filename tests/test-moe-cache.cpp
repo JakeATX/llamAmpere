@@ -4506,9 +4506,12 @@ static bool run_permanent_device_table(ggml_backend_t gpu, ggml_backend_t cpu, l
     // The permanent prefix ends partway through a cold registered page. A direct
     // D2H restore to its final expert would cross mixed registration boundaries.
     const size_t hole_bytes = 9 * descriptor.expert_size / page * page;
-    const bool registered = cudaHostRegister((char *)mapping + hole_bytes, mapping_bytes - hole_bytes, cudaHostRegisterMapped) == cudaSuccess;
+    auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(gpu));
+    auto pin = (bool (*)(void *, size_t))ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_host_pin");
+    auto unpin = (void (*)(void *))ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_host_unpin");
+    const bool registered = pin && unpin && pin((char *)mapping + hole_bytes, mapping_bytes - hole_bytes);
     require(registered, __LINE__);
-    struct restore_state { void * hole; size_t bytes; int count; bool registered; } state{mapping, hole_bytes, 0, false};
+    struct restore_state { void * hole; size_t bytes; int count; bool registered; bool (*pin)(void *, size_t); } state{mapping, hole_bytes, 0, false, pin};
     ggml_backend_t backends[] = {gpu, cpu};
     auto scheduler = ggml_backend_sched_new(backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, false);
     std::vector<uint64_t> warm(experts, 1000);
@@ -4521,7 +4524,7 @@ static bool run_permanent_device_table(ggml_backend_t gpu, ggml_backend_t cpu, l
         api.resident_spans(resident, spans.data(), count);
         api.resident_dropped(resident, +[](void * p) {
             auto & restored = *(restore_state *)p;
-            restored.registered = cudaHostRegister(restored.hole, restored.bytes, cudaHostRegisterMapped) == cudaSuccess;
+            restored.registered = restored.pin(restored.hole, restored.bytes);
             ++restored.count;
             return restored.registered ? 1 : 0;
         }, &state);
@@ -4539,7 +4542,7 @@ static bool run_permanent_device_table(ggml_backend_t gpu, ggml_backend_t cpu, l
             require(ggml_backend_sched_alloc_graph(scheduler, candidate.graph), __LINE__);
             require(ggml_backend_sched_get_tensor_backend(scheduler, candidate.out) == gpu, __LINE__);
         };
-        auto replay = [&](int phase, int iterations) {
+        auto replay = [&](int phase, int iterations, int expected_restores = 0) {
             std::vector<int32_t> route(routes);
             for (int i = 0; i < routes; ++i) { route[i] = (phase ? 0 : 64) + i; }
             ggml_backend_tensor_set(ids, route.data(), 0, route.size() * sizeof(int32_t));
@@ -4549,7 +4552,7 @@ static bool run_permanent_device_table(ggml_backend_t gpu, ggml_backend_t cpu, l
                 ggml_backend_tensor_get(candidate.out, actual.data(), 0, actual.size() * sizeof(float));
                 require(compare_output(expected[phase], actual, 5e-4), __LINE__);
             }
-            require(state.count == 0, __LINE__);
+            require(state.count == expected_restores, __LINE__);
         };
         prepare();
         replay(0, 128);
@@ -4568,13 +4571,76 @@ static bool run_permanent_device_table(ggml_backend_t gpu, ggml_backend_t cpu, l
         require(ggml_moe_cache_resident_lookup(weights->data, descriptor.expert_size, ggml_backend_get_device(gpu)) != nullptr, __LINE__);
         require(state.count == 0, __LINE__);
         require(max_field_value(capture.get(), "replays=") > 64, __LINE__);
-        ggml_moe_cache_host_restore(weights->data, ggml_nbytes(weights));
-        require(state.count == 1 && memcmp(weights->data, quantized.data(), quantized.size()) == 0, __LINE__);
+        // A generic fallback copies the whole object, crossing the separately
+        // registered cold range and restored hole. Expert-sized D2D checks alone
+        // do not cover this multi-turn path.
+        auto * upload_ctx = ggml_init(params);
+        auto * uploaded = ggml_dup_tensor(upload_ctx, weights);
+        auto * upload_buffer = ggml_backend_alloc_ctx_tensors(upload_ctx, gpu);
+        require(upload_buffer != nullptr, __LINE__);
+        if (upload_buffer) {
+            auto raw_upload = [&](const char * label) {
+                const cudaError_t direct = cudaMemcpyAsync(uploaded->data, weights->data, quantized.size(),
+                        cudaMemcpyHostToDevice, cudaStreamPerThread);
+                printf("permanent-%s-whole-object-raw-H2D: %s\n", label, cudaGetErrorString(direct));
+                require(direct == cudaSuccess || direct == cudaErrorInvalidValue, __LINE__);
+                if (direct == cudaSuccess) { require(cudaStreamSynchronize(cudaStreamPerThread) == cudaSuccess, __LINE__); }
+                else { (void)cudaGetLastError(); }
+            };
+            raw_upload("sparse");
+            // This call must restore the original host bytes before enqueueing
+            // the full-object H2D copy, just as the multi-turn scheduler does.
+            ggml_backend_tensor_set_async(gpu, uploaded, weights->data, 0, quantized.size());
+            ggml_backend_synchronize(gpu);
+            require(state.count == 1 && memcmp(weights->data, quantized.data(), quantized.size()) == 0, __LINE__);
+            std::vector<uint8_t> copied(quantized.size());
+            ggml_backend_tensor_get(uploaded, copied.data(), 0, copied.size());
+            require(copied == quantized, __LINE__);
+            raw_upload("restored");
+            // Non-page-aligned offsets must split at registration boundaries,
+            // not at arbitrary fixed chunk lengths.
+            ggml_backend_tensor_set_async(gpu, uploaded, (const char *)weights->data + 37, 37, quantized.size() - 74);
+            ggml_backend_synchronize(gpu);
+            ggml_backend_tensor_get(uploaded, copied.data(), 0, copied.size());
+            require(copied == quantized && state.count == 1, __LINE__);
+            ggml_backend_tensor_set(uploaded, weights->data, 0, quantized.size());
+            ggml_backend_tensor_get(uploaded, copied.data(), 0, copied.size());
+            require(copied == quantized, __LINE__);
+            // Both 2D entry points must preserve each row's source/destination
+            // strides, including a row crossing the restored/cold boundary.
+            const size_t source = hole_bytes - page + 37;
+            const size_t width_bytes = 2 * page + 11, height = 3;
+            const size_t source_stride = width_bytes + 127, target_stride = width_bytes + 97;
+            std::vector<uint8_t> expected_upload = quantized;
+            for (size_t row = 0; row < height; ++row) {
+                memcpy(expected_upload.data() + 13 + row * target_stride,
+                        quantized.data() + source + row * source_stride, width_bytes);
+            }
+            ggml_backend_tensor_set_2d_async(gpu, uploaded, (const char *)weights->data + source,
+                    13, width_bytes, height, target_stride, source_stride);
+            ggml_backend_synchronize(gpu);
+            ggml_backend_tensor_get(uploaded, copied.data(), 0, copied.size());
+            require(copied == expected_upload, __LINE__);
+            for (size_t row = 0; row < height; ++row) {
+                memcpy(expected_upload.data() + 19 + row * target_stride,
+                        quantized.data() + source + row * source_stride, width_bytes);
+            }
+            ggml_backend_tensor_set_2d(uploaded, (const char *)weights->data + source,
+                    19, width_bytes, height, target_stride, source_stride);
+            ggml_backend_tensor_get(uploaded, copied.data(), 0, copied.size());
+            require(copied == expected_upload, __LINE__);
+        }
+        ggml_backend_buffer_free(upload_buffer);
+        ggml_free(upload_ctx);
+        // Generic host restoration must leave already published cold aliases
+        // and permanent addresses usable by the existing graph as well.
+        replay(0, 4, 1);
+        replay(1, 4, 1);
     }
     ggml_backend_sched_free(scheduler);
     if (resident) { api.resident_destroy(resident); }
-    if (registered) { require(cudaHostUnregister((char *)mapping + hole_bytes) == cudaSuccess, __LINE__); }
-    if (state.registered) { require(cudaHostUnregister(mapping) == cudaSuccess, __LINE__); }
+    if (registered) { unpin((char *)mapping + hole_bytes); }
+    if (state.registered) { unpin(mapping); }
     set_env("GGML_MOE_CACHE_PROFILE_LOAD", old_path ? saved_path.c_str() : nullptr);
     unlink(path);
     free_graph(candidate); free_graph(reference);

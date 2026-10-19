@@ -96,6 +96,7 @@
 #include <cstdint>
 #include <cfloat>
 #include <initializer_list>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <memory>
@@ -108,6 +109,105 @@
 #include <vector>
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
+
+// Keep the boundaries of registrations made by the writable-host pin API.
+// Sparse expert arenas retain those registrations across host restoration so
+// published device aliases stay valid. A CUDA host copy must not straddle them.
+static std::mutex ggml_cuda_host_pin_mutex;
+static std::map<uintptr_t, size_t> ggml_cuda_host_pins;
+
+static bool ggml_cuda_host_pin(void * ptr, size_t size) {
+    const uintptr_t begin = (uintptr_t)ptr;
+    if (!ptr || !size || size > UINTPTR_MAX - begin) { return false; }
+    std::lock_guard<std::mutex> lock(ggml_cuda_host_pin_mutex);
+    const auto next = ggml_cuda_host_pins.lower_bound(begin);
+    if ((next != ggml_cuda_host_pins.end() && next->first < begin + size) ||
+            (next != ggml_cuda_host_pins.begin() && std::prev(next)->first + std::prev(next)->second > begin)) {
+        return false;
+    }
+    // Reserve bookkeeping before publishing a successful CUDA registration.
+    try {
+        if (!ggml_cuda_host_pins.emplace(begin, size).second) { return false; }
+    } catch (...) { return false; }
+    const cudaError_t err = cudaHostRegister(ptr, size, cudaHostRegisterPortable | cudaHostRegisterMapped);
+    if (err != cudaSuccess) {
+        ggml_cuda_host_pins.erase(begin);
+        (void)cudaGetLastError();
+        GGML_LOG_WARN("%s: failed to page-lock %.1f MiB: %s\n", __func__, size / 1048576.0, cudaGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+static void ggml_cuda_host_unpin(void * ptr) {
+    std::lock_guard<std::mutex> lock(ggml_cuda_host_pin_mutex);
+    if (cudaHostUnregister(ptr) == cudaSuccess) { ggml_cuda_host_pins.erase((uintptr_t)ptr); }
+    else { (void)cudaGetLastError(); }
+}
+
+// Caller holds the registry lock through enqueue, excluding concurrent changes
+// to the source's registration boundaries. The owner's usual async source
+// lifetime (including completion before unpin) is unchanged.
+static cudaError_t ggml_cuda_memcpy_h2d_locked(void * dst, const void * src, size_t bytes, cudaStream_t stream) {
+    uintptr_t begin = (uintptr_t)src;
+    if (bytes > UINTPTR_MAX - begin || bytes > UINTPTR_MAX - (uintptr_t)dst) { return cudaErrorInvalidValue; }
+    const uintptr_t end = begin + bytes;
+    auto next = ggml_cuda_host_pins.upper_bound(begin);
+    if (next != ggml_cuda_host_pins.begin()) {
+        auto previous = std::prev(next);
+        if (begin - previous->first < previous->second) { next = previous; }
+    }
+    while (begin < end) {
+        uintptr_t stop = end;
+        if (next != ggml_cuda_host_pins.end()) {
+            if (begin < next->first) { stop = std::min(end, next->first); }
+            else { stop = std::min(end, next->first + next->second); ++next; }
+        }
+        const size_t part = stop - begin;
+        const cudaError_t err = cudaMemcpyAsync(dst, (const void *)begin, part, cudaMemcpyHostToDevice, stream);
+        if (err != cudaSuccess) {
+            GGML_LOG_ERROR("%s: source=%p destination=%p fragment_bytes=%zu: %s\n",
+                    __func__, (const void *)begin, dst, part, cudaGetErrorString(err));
+            return err;
+        }
+        dst = (char *)dst + part;
+        begin = stop;
+    }
+    return cudaSuccess;
+}
+
+static cudaError_t ggml_cuda_memcpy_h2d_async(void * dst, const void * src, size_t bytes, cudaStream_t stream) {
+    std::lock_guard<std::mutex> lock(ggml_cuda_host_pin_mutex);
+    return ggml_cuda_memcpy_h2d_locked(dst, src, bytes, stream);
+}
+
+static cudaError_t ggml_cuda_memcpy_h2d_2d_async(void * dst, size_t dst_pitch, const void * src, size_t src_pitch,
+        size_t width, size_t height, cudaStream_t stream) {
+    if (!width || !height) { return cudaSuccess; }
+    if (width > src_pitch || width > dst_pitch ||
+            (src_pitch && height - 1 > (SIZE_MAX - width) / src_pitch) ||
+            (dst_pitch && height - 1 > (SIZE_MAX - width) / dst_pitch)) { return cudaErrorInvalidValue; }
+    const size_t extent = (height - 1) * src_pitch + width;
+    const uintptr_t begin = (uintptr_t)src;
+    if (extent > UINTPTR_MAX - begin || (height - 1) * dst_pitch + width > UINTPTR_MAX - (uintptr_t)dst) {
+        return cudaErrorInvalidValue;
+    }
+    std::lock_guard<std::mutex> lock(ggml_cuda_host_pin_mutex);
+    auto next = ggml_cuda_host_pins.upper_bound(begin);
+    bool split = next != ggml_cuda_host_pins.end() && next->first < begin + extent;
+    if (next != ggml_cuda_host_pins.begin()) {
+        const auto previous = std::prev(next);
+        split = split || (begin - previous->first < previous->second &&
+                extent > previous->second - (begin - previous->first));
+    }
+    if (!split) { return cudaMemcpy2DAsync(dst, dst_pitch, src, src_pitch, width, height, cudaMemcpyHostToDevice, stream); }
+    for (size_t row = 0; row < height; ++row) {
+        const cudaError_t err = ggml_cuda_memcpy_h2d_locked((char *)dst + row * dst_pitch,
+                (const char *)src + row * src_pitch, width, stream);
+        if (err != cudaSuccess) { return err; }
+    }
+    return cudaSuccess;
+}
 
 #define GGML_LOG_WARN_ONCE(str) \
     { static std::once_flag warn_flag; std::call_once(warn_flag, []() { GGML_LOG_WARN(str); }); }
@@ -1033,7 +1133,7 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
         // Upload TQ4_1S to a temp GPU buffer
         void * tmp_tq4;
         CUDA_CHECK(cudaMalloc(&tmp_tq4, size));
-        CUDA_CHECK(cudaMemcpyAsync(tmp_tq4, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
+        CUDA_CHECK(ggml_cuda_memcpy_h2d_async(tmp_tq4, data, size, cudaStreamPerThread));
 
         // Convert TQ4_1S (tmp) → q8_0 (tensor->data, which has q8_0-sized allocation)
         ggml_cuda_convert_tq4_1s_to_q8_0(tmp_tq4, tensor->data, n_elements, cudaStreamPerThread);
@@ -1053,7 +1153,7 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
         return;
     }
 
-    CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
+    CUDA_CHECK(ggml_cuda_memcpy_h2d_async((char *) tensor->data + offset, data, size, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
@@ -1070,8 +1170,8 @@ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
-    CUDA_CHECK(cudaMemcpy2DAsync(
-        (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cudaStreamPerThread));
+    CUDA_CHECK(ggml_cuda_memcpy_h2d_2d_async(
+        (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
@@ -4145,7 +4245,7 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
         static_cast<ggml_backend_cuda_buffer_context *>(buf->context)->device == cuda_ctx->device &&
         "unsupported buffer type");
 
-    CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+    CUDA_CHECK(ggml_cuda_memcpy_h2d_async((char *) tensor->data + offset, data, size, cuda_ctx->stream()));
 }
 
 static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -4168,8 +4268,8 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
         static_cast<ggml_backend_cuda_buffer_context *>(buf->context)->device == cuda_ctx->device &&
         "unsupported buffer type");
 
-    CUDA_CHECK(cudaMemcpy2DAsync(
-        (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+    CUDA_CHECK(ggml_cuda_memcpy_h2d_2d_async(
+        (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cuda_ctx->stream()));
 }
 
 static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const struct ggml_tensor * tensor, void * data,
@@ -9486,23 +9586,10 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     // file is unsupported on some drivers) for direct copies; no env switch here: the caller's own opt-in decides (the
     // expert streamer uses it for GGML_SCHED_XSTREAM_PIN_MIB)
     if (strcmp(name, "ggml_backend_cuda_host_pin") == 0) {
-        return (void *) +[](void * ptr, size_t size) -> bool {
-            cudaError_t err = cudaHostRegister(ptr, size, cudaHostRegisterPortable | cudaHostRegisterMapped);
-            if (err != cudaSuccess) {
-                (void) cudaGetLastError();
-                GGML_LOG_WARN("%s: failed to page-lock %.1f MiB: %s\n", "ggml_backend_cuda_host_pin", size/1048576.0,
-                    cudaGetErrorString(err));
-                return false;
-            }
-            return true;
-        };
+        return (void *)ggml_cuda_host_pin;
     }
     if (strcmp(name, "ggml_backend_cuda_host_unpin") == 0) {
-        return (void *) +[](void * ptr) {
-            if (cudaHostUnregister(ptr) != cudaSuccess) {
-                (void) cudaGetLastError();
-            }
-        };
+        return (void *)ggml_cuda_host_unpin;
     }
     if (strcmp(name, "ggml_backend_cuda_phase_arena_new_for_device") == 0) {
         return (void *) +[](ggml_backend_dev_t dev, size_t size) -> void * {
