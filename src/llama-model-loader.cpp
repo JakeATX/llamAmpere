@@ -908,13 +908,14 @@ llama_model_loader::llama_model_loader(
         }
         for (const auto & role : roles) { supported = supported && role.second == 3; }
         const size_t available = llama_moe_arena::available_memory();
-        const size_t reserve = 10ull << 30;
+        // Owner floor is 7 GiB, the same line Strata ran under at home.
+        const size_t reserve = 7ull << 30;
         use_moe_arena = supported && bytes && available > reserve && bytes <= available - reserve &&
             llama_moe_arena::pin_supported();
-        LLAMA_LOG_INFO("%s: expert arena %s: %.2f GiB experts, %.2f GiB available, 10 GiB startup headroom\n",
+        LLAMA_LOG_INFO("%s: expert arena %s: %.2f GiB experts, %.2f GiB available, 7 GiB startup headroom\n",
                 __func__, use_moe_arena ? "enabled" : "disabled", bytes / double(GiB), available / double(GiB));
         if (arena && strcmp(arena, "on") == 0 && !roles.empty() && !use_moe_arena) {
-            throw std::runtime_error("--moe-arena on cannot fit the pinned experts with 10 GiB startup headroom, or pinning is unavailable");
+            throw std::runtime_error("--moe-arena on cannot fit the pinned experts with 7 GiB startup headroom, or pinning is unavailable");
         }
     }
 }
@@ -1952,8 +1953,8 @@ std::unique_ptr<llama_moe_arena> llama_model_loader::load_moe_arena(llama_progre
         }
     }
     const size_t available = llama_moe_arena::available_memory();
-    if (available < (10ull << 30) || total > available - (10ull << 30)) {
-        throw std::runtime_error("expert arena no longer fits with 10 GiB startup headroom");
+    if (available < (7ull << 30) || total > available - (7ull << 30)) {
+        throw std::runtime_error("expert arena no longer fits with 7 GiB startup headroom");
     }
     auto arena = std::make_unique<llama_moe_arena>(total);
     size_t base = 0;
@@ -1989,8 +1990,8 @@ std::unique_ptr<llama_moe_arena> llama_model_loader::load_moe_arena(llama_progre
                     posix_fadvise(files.at(w.idx)->file_id(), first, count, POSIX_FADV_DONTNEED);
 #endif
 #endif
-                    if (llama_moe_arena::available_memory() < (10ull << 30)) {
-                        throw std::runtime_error("expert arena stopped: less than 10 GiB MemAvailable");
+                    if (llama_moe_arena::available_memory() < (7ull << 30)) {
+                        throw std::runtime_error("expert arena stopped: less than 7 GiB MemAvailable");
                     }
                 }
             }
@@ -2008,8 +2009,8 @@ std::unique_ptr<llama_moe_arena> llama_model_loader::load_moe_arena(llama_progre
                 llama_moe_arena::available_memory() / double(GiB));
     }
     arena->pin();
-    if (llama_moe_arena::available_memory() < (10ull << 30)) {
-        throw std::runtime_error("expert arena pinning left less than 10 GiB MemAvailable");
+    if (llama_moe_arena::available_memory() < (7ull << 30)) {
+        throw std::runtime_error("expert arena pinning left less than 7 GiB MemAvailable");
     }
     LLAMA_LOG_INFO("%s: %.2f GiB pinned, gate/up/down grouped by expert, original weight blocks preserved\n", __func__, total / double(GiB));
     return arena;

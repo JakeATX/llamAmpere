@@ -21,7 +21,7 @@ def compare(pairs):
         value = json.loads(path.read_text())
         assert value['status'] == 'passed' and not value['violations']
         assert value['final']['tokens_evaluated'] == 100000 and value['final']['tokens_predicted'] == 5120
-        assert value['resources']['peak_vram_mib'] <= 23552 and value['resources']['min_available_bytes'] >= 10 * 2**30
+        assert value['resources']['peak_vram_mib'] <= 23552 and value['resources']['min_available_bytes'] >= 7 * 2**30
         assert value['expert_cache_counters']['host'], 'missing expert-hit evidence'
         request = json.loads((root / 'request.json').read_text())
         assert request['temperature'] == 1.0 and request['n_predict'] == 5120 and len(request['prompt']) == 100000

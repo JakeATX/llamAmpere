@@ -36,7 +36,7 @@ def check():
   try:status={x.split(':',1)[0]:x.split(':',1)[1].strip() for x in Path(f'/proc/{process.pid}/status').read_text().splitlines() if x.startswith(('VmRSS:','RssAnon:','RssFile:','VmLck:'))}
   except FileNotFoundError:pass
  row=dict(process_memory=status,power_w=power,power_limit_w=power_limit,temperature_c=temperature,gpu_util_percent=gpu_util,elapsed=time.monotonic()-start,phase=phase,available=avail,vram=gpu,root_free=rootfree,models_free=modfree)
- if avail<10*1024**3 or gpu>23552 or abs(power_limit-350)>0.1 or rootfree<40*10**9 or modfree<15*10**9 or shutil.disk_usage('/mnt/overflow').free<50*10**9 or row['elapsed']>limit:raise GuardViolation(row)
+ if avail<7*1024**3 or gpu>23552 or abs(power_limit-350)>0.1 or rootfree<40*10**9 or modfree<15*10**9 or shutil.disk_usage('/mnt/overflow').free<50*10**9 or row['elapsed']>limit:raise GuardViolation(row)
  return row
 def monitor():
  global server_term_sent
@@ -104,7 +104,7 @@ if os.environ.get('ARENA_BASELINE')=='1':
 def launch(tag):
  global process,logfile,phase,server_term_sent
  stop_server();server_term_sent=False;check();phase='load-'+tag
- logfile=(O/(tag+'.server.log')).open('w');process=subprocess.Popen(base,stdout=logfile,stderr=logfile,env=env,start_new_session=True)
+ logfile=(O/(tag+'.server.log')).open('w');process=subprocess.Popen(['stdbuf','-oL','-eL',*base],stdout=logfile,stderr=logfile,env=env,start_new_session=True)
  for _ in range(420):
   if violation:raise RuntimeError(violation[0])
   if process.poll() is not None:raise RuntimeError('server exited '+str(process.returncode))
