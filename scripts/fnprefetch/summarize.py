@@ -17,6 +17,9 @@ for label in sys.argv[1:]:
         assert result['status'] == 'complete'
         assert final['tokens_evaluated'] == 100000 and final['tokens_predicted'] == 5120
         assert abs(final['generation_settings']['temperature'] - 1) < 1e-6
+        limits=result['cpu_limits']
+        assert limits['start']==limits['end'] and limits['start'][0]['cpu.weight']=='100'
+        assert all(row['cpu.max'] is None or row['cpu.max'].split()[0]=='max' for row in limits['start'])
         command = json.loads((cell / 'command.json').read_text())
         request = json.loads((cell / 'request.json').read_text())
         assert result['profile_provenance']==command['profile_provenance']

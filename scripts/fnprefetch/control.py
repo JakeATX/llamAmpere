@@ -96,6 +96,24 @@ if os.environ.get('FN_PROFILE'):
  env['FN_EXPERT_PROFILE']='1'
  env['TMPDIR']='/mnt/models/fnprefetch/tmp-build';Path(env['TMPDIR']).mkdir(exist_ok=True)
  launch=[nsys,'launch','--session-new=fnfast-'+cell,'--trace=cuda,nvtx','--resolve-symbols=false','--cuda-graph-trace=node','--wait=primary']+cmd
+def cpu_limit_chain():
+ root=Path('/sys/fs/cgroup')
+ group=root/Path('/proc/self/cgroup').read_text().strip().split('::')[1].lstrip('/')
+ chain=[]
+ while True:
+  row={'cgroup':str(group)}
+  for field in ('cpu.max','cpu.weight'):
+   path=group/field
+   row[field]=path.read_text().strip() if path.exists() else None
+  assert row['cpu.max'] is not None or group==root, 'missing non-root CPU quota'
+  assert row['cpu.max'] is None or row['cpu.max'].split()[0]=='max', 'CPU quota would bias benchmark: '+repr(row)
+  chain.append(row)
+  if group==root:break
+  group=group.parent
+ assert chain[0]['cpu.weight']=='100', 'benchmark unit CPUWeight must be 100'
+ return chain
+cpu_limits_start=cpu_limit_chain()
+(out/'cpu-limits-start.json').write_text(json.dumps(cpu_limits_start,indent=2))
 log=(out/'server.log').open('w');p=subprocess.Popen(launch,env=env,stdout=log,stderr=log,start_new_session=True,preexec_fn=lambda:ctypes.CDLL(None).prctl(0x59616d61,ctypes.c_ulong(-1).value,0,0,0))
 # A profiler may put the actual server in a new process group. The systemd cell
 # cgroup, not the wrapper's process group, is the ownership boundary.
@@ -188,6 +206,7 @@ def monitor():
    try:
     avail=int(next(l.split()[1] for l in Path('/proc/meminfo').read_text().splitlines() if l.startswith('MemAvailable:')))
     gpu=subprocess.check_output(['nvidia-smi','--query-gpu=memory.used,power.limit,power.draw','--format=csv,noheader,nounits'],text=True).strip().split(',')
+    if cpu_limit_chain()!=cpu_limits_start:raise RuntimeError('CPU quota or weight changed during benchmark')
     actual_engine=server_pid()
     engine=actual_engine if actual_engine is not None else p.pid
     rss=int(next(l.split()[1] for l in Path(f'/proc/{engine}/status').read_text().splitlines() if l.startswith('VmRSS:')))
@@ -348,6 +367,11 @@ finally:
  if 'request_start_monotonic_s' in result:result.setdefault('request_end_monotonic_s',time.monotonic())
  if profile_thread is not None:profile_thread.join(55)
  stop.set();thread.join()
+ try:
+  cpu_limits_end=cpu_limit_chain()
+  result['cpu_limits']={'start':cpu_limits_start,'end':cpu_limits_end}
+  if cpu_limits_end!=cpu_limits_start:result.update(status='failed',guard='CPU quota or weight changed during benchmark')
+ except (OSError,AssertionError) as exc:result.update(status='failed',guard='CPU limit verification: '+repr(exc))
  memory_boundaries['before_cleanup']=memory_snapshot(cell_cgroup,server_pid())
  result['memory_measurement']={'boundaries':memory_boundaries,'intervals':{name:memory_interval(memory_boundaries[left],memory_boundaries[right]) for name,left,right in [('startup','load_start','before_request'),('prompt','before_request','first_token'),('response','first_token','before_cleanup'),('whole_cell','load_start','before_cleanup')] if left in memory_boundaries and right in memory_boundaries},'note':'Cgroup event/PSI/fault counters are cumulative; intervals use boundary differences. Streaming first-token boundary includes network buffering. Response runs through controller cleanup and includes any auxiliary reload requests. Periodic samples preserve progression.'}
  try:
