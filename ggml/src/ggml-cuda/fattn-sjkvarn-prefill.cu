@@ -443,7 +443,10 @@ bool ggml_cuda_flash_attn_ext_sj_kvarn_prefill(ggml_backend_cuda_context & ctx, 
             ggml_cuda_qsa_resident_body(dst->src[5]), (const int32_t *) dst->src[6]->data,
             K->nb[1], K->nb[2], V->nb[1], V->nb[2],
             (half2 *) scratch_ptr, (half2 *) (scratch_ptr + elements), n_kv, 0, head_first, trellis,
-            dst->src[3] && dst->src[3]->ne[2] == 1 && dst->src[3]->ne[3] == 1 ? (const char *) dst->src[3]->data : nullptr,
+            // Int8 K smoothing averages every expanded row, including masked ones.
+            // Match the full-body path: zeroing resident-only masked tiles changes
+            // that mean and therefore the quantization of visible keys.
+            !plan.i8qk && dst->src[3] && dst->src[3]->ne[2] == 1 && dst->src[3]->ne[3] == 1 ? (const char *) dst->src[3]->data : nullptr,
             dst->src[3] ? dst->src[3]->nb[1] : 0, Q->ne[1]);
         CUDA_CHECK(cudaGetLastError());
         if (trellis) {
