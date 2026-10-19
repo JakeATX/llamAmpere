@@ -700,6 +700,10 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
                 model.layers[il].hc_attn_inject,
                 &inject, il);
 
+        if (cparams.moe_prefetch != 0 && b1_full && n_tokens > 0 && n_tokens <= 8 &&
+                cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT) {
+            cb(cur, "moe_prefetch_layer_start", il);
+        }
         ggml_build_forward_expand(gf, cur);
 
         if (hparams.is_recr(il)) {
@@ -726,6 +730,41 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
                 model.layers[il].hc_ffn_up,
                 model.layers[il].hc_ffn_inject,
                 &inject, il);
+
+        // Predictions use this layer's post-attention FFN input and never feed model math.
+        if (cparams.moe_prefetch != 0 && b1_full && n_tokens > 0 && n_tokens <= 8 &&
+                cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT &&
+                strncmp(ggml_backend_dev_name(model.dev_layer(il)), "CUDA", 4) == 0) {
+            const int lead = cparams.moe_prefetch < 0 ? 3 : cparams.moe_prefetch;
+            for (int d = 1; d <= lead && il + d < n_layer; ++d) {
+                const auto & future = model.layers[il + d];
+                if (!future.ffn_gate_inp) {
+                    continue;
+                }
+                bool supported = true;
+                auto gpu = [&](ggml_tensor * t) {
+                    supported &= ggml_backend_dev_supports_op(model.dev_layer(il), t);
+                    cb(t, "moe_prefetch_gpu", il);
+                    return t;
+                };
+                // Qwen4Exp routes with softmax and has no routing bias.
+                ggml_tensor * scores = gpu(ggml_soft_max(ctx0, gpu(build_lora_mm(future.ffn_gate_inp, cur))));
+                if (scores->ne[1] > 1) {
+                    const int64_t tokens = scores->ne[1];
+                    scores = gpu(ggml_cont(ctx0, ggml_transpose(ctx0, scores)));
+                    scores = gpu(ggml_pool_2d(ctx0, scores, GGML_OP_POOL_MAX, tokens, 1, tokens, 1, 0, 0));
+                    scores = ggml_reshape_1d(ctx0, scores, n_expert);
+                }
+                ggml_tensor * ids = gpu(ggml_cont(ctx0, gpu(ggml_argsort_top_k(ctx0, scores, std::min<int64_t>(32, n_expert)))));
+                // An unsupported predictor must not fall back to CPU execution.
+                if (!supported) {
+                    continue;
+                }
+                ggml_format_name(ids, "moe_prefetch-%d-%d", il, il + d);
+                ggml_set_output(ids);
+                ggml_build_forward_expand(gf, ids);
+            }
+        }
 
         if (b1_ffn_phase == 1 && b1_ffn) {
             GGML_ASSERT(b1_l1 == b1_l0 + 1 && il == b1_l0);

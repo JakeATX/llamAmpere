@@ -474,6 +474,9 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
     set_tests_properties(test-moe-cache PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
 endif()
 
+# Manual fixed-token model gate; needs model paths and input IDs supplied by the caller.
+llama_build(test-moe-prefetch-model.cpp)
+
 llama_build_and_test(test-moe-cache-fit.cpp)
 llama_build_and_test(test-fit-extra.cpp)
 

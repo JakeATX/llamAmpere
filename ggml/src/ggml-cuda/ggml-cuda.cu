@@ -7507,7 +7507,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         }
         // Launch graph
         CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
-        ggml_cuda_moe_cache_device_graph_record(cuda_ctx->device, cuda_graph_update_required);
+        ggml_cuda_moe_cache_device_graph_record(cuda_ctx->device, cuda_graph_update_required, cgraph);
 #else
         GGML_UNUSED(graph_key);
         graph_evaluated_or_captured = true;

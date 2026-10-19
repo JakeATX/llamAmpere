@@ -122,8 +122,17 @@ struct ggml_moe_cache_api {
     // Idle-turn lending only: release low-use slots, then restore capacity after prompt scratch is freed.
     size_t (*trim)(void * session, size_t bytes);
     size_t (*restore)(void * session);
+
+    // Experimental decode prefetch. IDs arrive in GPU score order. No math is skipped.
+    void (*prefetch)(void * session, const struct ggml_moe_cache_tensor_desc * tensors, int n_tensors,
+                     const int32_t * ids, int n_ids, int source_layer, int target_layer, int automatic);
+    // Called at layer entry and after real routing; ids == NULL marks layer entry.
+    void (*prefetch_observe)(void * session, int layer, const int32_t * ids, int n_ids);
+    void (*prefetch_configure)(void * session, int mode);
+
 };
 
+GGML_API void ggml_backend_sched_moe_cache_prefetch_configure(ggml_backend_sched_t sched, int mode);
 GGML_API int ggml_backend_sched_moe_cache_warm(ggml_backend_sched_t sched,
         const struct ggml_moe_cache_tensor_desc * tensors,
         const uint64_t * const * counts, int n_tensors);

@@ -694,6 +694,7 @@ struct common_params {
     bool no_op_offload     = false; // globally disable offload host tensor operations to device
     bool no_extra_bufts    = false; // disable extra buffer types (used for weight repacking)
     common_moe_cache_params moe_cache;
+    int moe_prefetch = 0; // 0 off, -1 auto, 1..3 future layers
     bool no_host           = false; // bypass host buffer allowing extra buffers to be used
     bool load_mtp          = false; // load MTP/NextN layers
 
