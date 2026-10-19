@@ -3728,6 +3728,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     }
     if (b1_mode == 0 && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && n_tokens_all <= 8) {
         b1_cache_warm();
+        b1_cache_device_prepare();
     }
     llama_seq_id b1_seq      = -1;
     llama_pos    b1_pos0     = 0;
@@ -5188,6 +5189,8 @@ void llama_context::b1_cache_profile_load() {
             tensors.push_back({tensor->name, tensor->data, tensor->nb[2], tensor->ne[0], tensor->ne[1], tensor->ne[2], (int32_t) tensor->type});
         }
         ggml_backend_sched_moe_cache_warm(sched.get(), tensors.data(), nullptr, (int) tensors.size());
+        const char * device = getenv("GGML_MOE_CACHE_DEVICE");
+        b1_cache_device_pending = device && strcmp(device, "1") == 0;
     } catch (const std::bad_alloc &) {
         LLAMA_LOG_WARN("%s: profile warm skipped after host allocation failure\n", __func__);
     }
@@ -5231,6 +5234,10 @@ void llama_context::b1_cache_warm() {
             counts.push_back(b1_cache_counts[layer].data());
         }
         const int queued = ggml_backend_sched_moe_cache_warm(sched.get(), tensors.data(), counts.data(), (int) tensors.size());
+        // Defer table publication until the prompt outputs have been consumed
+        // and the next generation decode has resized its output buffer.
+        const char * device = getenv("GGML_MOE_CACHE_DEVICE");
+        b1_cache_device_pending = device && strcmp(device, "1") == 0;
         LLAMA_LOG_INFO("%s: [B1] cache warm: %zu tensors, %llu synchronized routing readbacks, %d fills queued\n", __func__,
                        tensors.size(), (unsigned long long) b1_cache_readbacks, queued);
     } catch (...) {
@@ -5239,6 +5246,51 @@ void llama_context::b1_cache_warm() {
     b1_cache_counts.clear();
     b1_cache_readbacks = 0;
     b1_cache_needs_refresh = false;
+}
+
+// This generation-sized decode has already consumed the prompt outputs and
+// resized its output arena. Pin exact cold weights only now, before its graph.
+void llama_context::b1_cache_device_prepare() {
+    if (!b1_cache_device_pending || cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT) {
+        return;
+    }
+    b1_cache_device_pending = false;
+    const char * enabled = getenv("GGML_MOE_CACHE_DEVICE");
+    if (!enabled || strcmp(enabled, "1") != 0) {
+        return;
+    }
+    try {
+        // Both captured CUDA graphs and cached model graphs can retain old
+        // cache addresses. Refuse activation unless all can be invalidated.
+        if (!b1_cache_graph_reset()) {
+            LLAMA_LOG_WARN("%s: device prepare skipped: graph reset unavailable\n", __func__);
+            return;
+        }
+        ggml_backend_sched_reset(sched.get());
+        std::vector<ggml_moe_cache_tensor_desc> tensors;
+        for (const auto & entry : model.tensors_by_name) {
+            int layer = -1;
+            int parsed = 0;
+            ggml_tensor * tensor = entry.second;
+            if (sscanf(entry.first.c_str(), "blk.%d.%n", &layer, &parsed) != 1 || parsed <= 0 ||
+                    entry.first.find("_exps") == std::string::npos || layer < 0 || (uint32_t)layer >= model.hparams.n_layer() ||
+                    !tensor->buffer || !ggml_backend_buffer_is_host(tensor->buffer) || !tensor->data ||
+                    tensor->ne[2] != model.hparams.n_expert || tensor->ne[3] != 1 || (!ggml_is_contiguous_2(tensor) || tensor->nb[1] != ggml_row_size(tensor->type, tensor->ne[0])) ||
+                    !ggml_moe_cache_wtype_supported(tensor->type)) {
+                continue;
+            }
+            tensors.push_back({tensor->name, tensor->data, tensor->nb[2], tensor->ne[0], tensor->ne[1], tensor->ne[2], (int32_t)tensor->type});
+        }
+        const int64_t started = ggml_time_us();
+        const int ready = ggml_backend_sched_moe_cache_device_prepare(sched.get(), tensors.data(), (int)tensors.size());
+        LLAMA_LOG_INFO("%s: deferred device expert prepare: tensors=%zu ready=%d elapsed_ms=%.3f phase=post-output-reserve-pregraph\n",
+                __func__, tensors.size(), ready, (ggml_time_us() - started) / 1000.0);
+        if (ready > 0) {
+            LLAMA_LOG_INFO("%s: device expert dispatch activated; response graphs invalidated\n", __func__);
+        }
+    } catch (const std::bad_alloc &) {
+        LLAMA_LOG_WARN("%s: deferred device prepare skipped after host allocation failure\n", __func__);
+    }
 }
 
 int64_t llama_context::b1_final_rows(int64_t n_out, int64_t n_tok) const {

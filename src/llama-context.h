@@ -575,6 +575,7 @@ private:
     bool b1_cache_collect = false;
     bool b1_cache_needs_refresh = false;
     bool b1_cache_profile_attempted = false;
+    bool b1_cache_device_pending = false;
     void b1_cache_begin();
     ggml_tensor * b1_cache_user_node = nullptr;
     std::vector<std::vector<uint64_t>> b1_cache_counts;
@@ -583,6 +584,7 @@ private:
     static bool b1_cache_eval(ggml_tensor * tensor, bool ask, void * user_data);
     void b1_cache_profile_load();
     void b1_cache_warm();
+    void b1_cache_device_prepare();
 
 public:
     // in-call checkpoints (llama_state_seq_capture_arm)
