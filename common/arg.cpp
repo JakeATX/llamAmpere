@@ -2888,7 +2888,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--kv-resident"}, "N",
         "QSA layers with SJ-KVaRN: keep N KV cells on device and sealed body blocks in pinned RAM; "
-        "0 = disabled (default), recommended: 32768",
+        "0 = disabled, default: 32768",
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("resident KV cell count must be nonnegative");
@@ -3234,6 +3234,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             llm_add_n_cpu_ffn_overrides(n, LLM_FFN_EXPS_REGEX, params.tensor_buft_overrides);
         }
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
+    add_opt(common_arg(
+        {"--moe-prefetch"}, "off|auto|1|2|3",
+        "predict future MoE routes on the GPU and stage uncached experts behind demand copies (default: off)",
+        [](common_params & params, const std::string & value) {
+            if (value == "off") {
+                params.moe_prefetch = 0;
+            } else if (value == "auto") {
+                params.moe_prefetch = -1;
+            } else if (value == "1" || value == "2" || value == "3") {
+                params.moe_prefetch = value[0] - '0';
+            } else {
+                throw std::invalid_argument("moe-prefetch must be off, auto, 1, 2, or 3");
+            }
+        }
+    ).set_env("LLAMA_ARG_MOE_PREFETCH"));
     add_opt(common_arg(
         {"--moe-arena"}, "on|off",
         "store expert gate/up/down blocks together in pinned RAM (default: on when it fits with 7 GiB startup headroom)",

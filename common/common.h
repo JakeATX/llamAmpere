@@ -694,6 +694,7 @@ struct common_params {
     bool no_op_offload     = false; // globally disable offload host tensor operations to device
     bool no_extra_bufts    = false; // disable extra buffer types (used for weight repacking)
     common_moe_cache_params moe_cache;
+    int moe_prefetch = 0; // 0 off, -1 auto, 1..3 future layers
     bool no_host           = false; // bypass host buffer allowing extra buffers to be used
     bool load_mtp          = false; // load MTP/NextN layers
 
@@ -719,7 +720,7 @@ struct common_params {
     uint32_t sj_kvarn_edge_bits_v = 4;
     std::string sj_kvarn_transform;  // EXPERIMENTAL WUSH-KV transform file (--sjkvarn-transform)
     uint32_t sj_kvarn_flush_chunk = 0; // groups per decode step while an adaptive-tail flush drains (0 = one flush)
-    uint32_t kv_resident = 0; // fork: QSA resident KV cells; 0 = keep the full body on device
+    uint32_t kv_resident = 32768; // fork: QSA resident KV cells; 0 = keep the full body on device
     ggml_type cache_type_s = GGML_TYPE_F32; // recurrent (gated delta-net) state cache data type
 
     size_t moe_cache_size = 0; // GPU cache size in bytes for the MoE experts kept in the CPU

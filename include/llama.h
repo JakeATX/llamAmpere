@@ -416,6 +416,7 @@ extern "C" {
         enum ggml_type type_s; // data type for the gated delta-net recurrent state cache: f32 (default), bf16, f16 or q8_0 [EXPERIMENTAL]
 
         enum llama_moe_cache_mode moe_cache_mode; // runtime MoE expert cache mode
+        int32_t moe_prefetch;                     // experimental: 0 off, -1 auto, 1..3 future layers
         size_t moe_cache_budget_mib;               // 0 uses the provider's available-memory budget
         size_t moe_cache_size; // device cache in bytes for the experts kept in host memory, 0 = disabled [EXPERIMENTAL]
 

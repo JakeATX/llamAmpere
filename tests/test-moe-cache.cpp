@@ -4,6 +4,7 @@
 #include "../ggml/src/ggml-backend-impl.h"
 #include "../ggml/src/ggml-impl.h"
 #include "../ggml/src/ggml-backend-moe-cache.h"
+#include "../ggml/src/ggml-moe-prefetch.h"
 
 #ifdef GGML_CUDA
 #include <cuda_runtime.h>
@@ -3512,7 +3513,220 @@ static bool run_prompt_cache_lending(ggml_backend_t gpu, ggml_backend_t cpu, log
     return ok;
 }
 
-// fork: exercise scheduler placement and both VRAM and mapped expert addresses.
+static bool run_prefetch_router(ggml_backend_t gpu, ggml_backend_t cpu) {
+    bool ok = true;
+    for (int tokens : {1, 4}) {
+        for (int activation = 0; activation < 3; ++activation) {
+            std::vector<int32_t> reference;
+            for (auto backend : {cpu, gpu}) {
+                ggml_init_params params = {64 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true};
+                auto * ctx = ggml_init(params);
+                auto * router = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 256, 512);
+                auto * hidden = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 256, tokens);
+                auto * bias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 512);
+                auto * scores = ggml_mul_mat(ctx, router, hidden);
+                if (activation == 0) {
+                    scores = ggml_sigmoid(ctx, scores);
+                } else if (activation == 1) {
+                    scores = ggml_soft_max(ctx, scores);
+                } else {
+                    scores = ggml_sqrt(ctx, ggml_softplus(ctx, scores));
+                }
+                scores = ggml_add(ctx, scores, bias);
+                if (tokens > 1) {
+                    scores = ggml_cont(ctx, ggml_transpose(ctx, scores));
+                    scores = ggml_pool_2d(ctx, scores, GGML_OP_POOL_MAX, tokens, 1, tokens, 1, 0, 0);
+                    scores = ggml_reshape_1d(ctx, scores, 512);
+                }
+                auto * ids = ggml_cont(ctx, ggml_argsort_top_k(ctx, scores, 32));
+                auto * graph = ggml_new_graph(ctx);
+                ggml_build_forward_expand(graph, ids);
+                auto buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+                if (!buffer) {
+                    ggml_free(ctx);
+                    return false;
+                }
+                std::vector<float> weights(256 * 512);
+                for (int expert = 0; expert < 512; ++expert) {
+                    std::fill(weights.begin() + expert * 256, weights.begin() + (expert + 1) * 256,
+                              (expert - 256) / 256.0f);
+                }
+                std::vector<float> input(256 * tokens, 1.0f / 256.0f);
+                if (tokens > 1) {
+                    std::fill(input.end() - 256, input.end(), -2.0f / 256.0f);
+                }
+                std::vector<float> correction(512, 0.0f);
+                ggml_backend_tensor_set(router, weights.data(), 0, weights.size() * sizeof(float));
+                ggml_backend_tensor_set(hidden, input.data(), 0, input.size() * sizeof(float));
+                ggml_backend_tensor_set(bias, correction.data(), 0, correction.size() * sizeof(float));
+                ok &= ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS;
+                std::vector<int32_t> actual(32);
+                ggml_backend_tensor_get(ids, actual.data(), 0, actual.size() * sizeof(int32_t));
+                for (int rank = 0; rank < 32; ++rank) {
+                    ok &= actual[rank] == (tokens == 1 ? 511 - rank : rank);
+                }
+                if (backend == cpu) {
+                    reference = actual;
+                } else {
+                    ok &= actual == reference;
+                }
+                ggml_backend_buffer_free(buffer);
+                ggml_free(ctx);
+            }
+        }
+    }
+    printf("cache-prefetch-router: %s\n", ok ? "OK" : "FAIL");
+    return ok;
+}
+
+// Exercise actual copies, selected publication, retirement, and same-graph reuse.
+static bool run_prefetch_staging(ggml_backend_t gpu, ggml_backend_t cpu,
+        ggml_tensor * weights, log_capture & capture, bool device_mode, ggml_tensor * gate_weights = nullptr) {
+    configure_cache(nullptr, "8");
+    set_env("GGML_CUDA_MOE_CACHE_BUDGET_MB", "16");
+    set_env("GGML_MOE_CACHE_DEVICE", device_mode ? "1" : nullptr);
+    set_env("GGML_MOE_CACHE_DEVICE_CAPTURE", device_mode ? "1" : nullptr);
+    set_env("GGML_MOE_CACHE_DEVICE_FUSED", gate_weights ? "1" : nullptr);
+    set_env("GGML_MOE_CACHE_DEVICE_STATS", device_mode ? "1" : nullptr);
+    capture.clear();
+    const auto api = active_api();
+    if (!api.prefetch || !api.prefetch_observe || !api.prefetch_configure) {
+        return false;
+    }
+    void * session = create_direct_session(gpu, cpu);
+    if (!session) {
+        return false;
+    }
+    api.prefetch_configure(session, 1);
+    ggml_moe_cache_tensor_desc descriptors[2] = {};
+    const int banks = gate_weights ? 2 : 1;
+    for (int i = 0; i < banks; ++i) {
+        auto * w = i ? gate_weights : weights;
+        descriptors[i] = {i ? "blk.1.ffn_gate_exps.weight" : "blk.1.ffn_up_exps.weight", w->data,
+            w->nb[2], w->ne[0], w->ne[1], w->ne[2], (int32_t) w->type};
+    }
+    std::vector<uint64_t> usage(weights->ne[2], 0);
+    for (int i = 0; i < 8; ++i) {
+        usage[i] = 100;
+    }
+    const uint64_t * counts[] = {usage.data(), usage.data()};
+    bool ok = api.warm(session, descriptors, counts, banks) == 8 * banks;
+    if (device_mode) {
+        ok &= api.device_prepare(session, descriptors, banks) == 1;
+    }
+    ggml_init_params params = {4 * ggml_tensor_overhead(), nullptr, true};
+    ggml_context * host = ggml_init(params);
+    ggml_context * card = ggml_init(params);
+    ggml_tensor * host_acts = ggml_new_tensor_3d(host, GGML_TYPE_F32, weights->ne[0], 1, 1);
+    ggml_tensor * host_ids = ggml_new_tensor_2d(host, GGML_TYPE_I32, 2, 1);
+    ggml_tensor * card_acts = ggml_new_tensor_3d(card, GGML_TYPE_F32, weights->ne[0], 1, 1);
+    ggml_tensor * card_ids = ggml_new_tensor_2d(card, GGML_TYPE_I32, 2, 1);
+    auto host_buffer = ggml_backend_alloc_ctx_tensors(host, cpu);
+    auto card_buffer = ggml_backend_alloc_ctx_tensors(card, gpu);
+    std::vector<float> values(weights->ne[0], 0.125f);
+    const int32_t route[] = {63, 63};
+    ggml_backend_tensor_set(host_acts, values.data(), 0, values.size() * sizeof(float));
+    ggml_backend_tensor_set(card_acts, values.data(), 0, values.size() * sizeof(float));
+    ggml_backend_tensor_set(host_ids, route, 0, sizeof(route));
+    ggml_backend_tensor_set(card_ids, route, 0, sizeof(route));
+    test_graph reference = gate_weights ? make_fused_graph(cpu, weights, gate_weights, host_acts, host_ids) :
+            make_graph(cpu, weights, host_acts, host_ids);
+    test_graph candidate = gate_weights ? make_fused_graph(gpu, weights, gate_weights, card_acts, card_ids) :
+            make_graph(device_mode ? gpu : cpu, weights,
+                    device_mode ? card_acts : host_acts, device_mode ? card_ids : host_ids);
+    auto fusion_count = (int64_t (*)(ggml_backend_t, const char *)) ggml_backend_reg_get_proc_address(
+            ggml_backend_dev_backend_reg(ggml_backend_get_device(gpu)), "ggml_backend_cuda_fusion_count");
+    const int64_t fused_before = gate_weights && fusion_count ? fusion_count(gpu, "mul_mat_glu") : 0;
+    ok &= ggml_backend_graph_compute(cpu, reference.graph) == GGML_STATUS_SUCCESS;
+    std::vector<float> expected(ggml_nelements(reference.out)), actual(expected.size()), first;
+    ggml_backend_tensor_get(reference.out, expected.data(), 0, expected.size() * sizeof(float));
+    auto compute = [&]() {
+        ok &= ggml_backend_graph_compute(device_mode ? gpu : cpu, candidate.graph) == GGML_STATUS_SUCCESS;
+        ggml_backend_tensor_get(candidate.out, actual.data(), 0, actual.size() * sizeof(float));
+        ok &= compare_output(expected, actual, 5e-4);
+        if (first.empty()) {
+            first = actual;
+        } else if (device_mode) {
+            ok &= first == actual;
+        }
+    };
+    for (int round = 0; round < 4 && ok; ++round) {
+        api.session_enter(session);
+        api.prefetch_observe(session, 0, nullptr, 0);
+        // Establish a generous real interval; completion is polled, not assumed.
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        api.prefetch_observe(session, 1, nullptr, 0);
+        api.prefetch_observe(session, 0, nullptr, 0);
+        const int32_t ranked[] = {0, 63}; // Resident expert must not be copied.
+        api.prefetch(session, descriptors, banks, ranked, 2, 0, 1, 0);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        bool completed = false;
+        do {
+            // Planning also exercises promotion when demand reaches a queued prediction.
+            completed = true;
+            for (int i = 0; i < banks; ++i) {
+                const auto & desc = descriptors[i];
+                completed &= direct_plan_one(desc.name, desc.data, desc.expert_size,
+                        desc.n_in, desc.n_out, desc.type, desc.n_expert, 63) == 1;
+            }
+            if (!completed) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        } while (!completed && std::chrono::steady_clock::now() < deadline);
+        ok &= completed;
+        api.prefetch_observe(session, 1, nullptr, 0);
+        api.prefetch_observe(session, 1, route, 2);
+        compute();
+        api.prefetch_observe(session, 2, nullptr, 0);
+        if (!device_mode) {
+            api.session_enter(nullptr);
+        }
+        compute(); // Device graph remains exact after overlay retirement.
+        if (!device_mode) {
+            api.session_leave(nullptr);
+        }
+        api.session_leave(session);
+    }
+    if (gate_weights) {
+        ok &= fusion_count && fusion_count(gpu, "mul_mat_glu") > fused_before;
+    }
+    api.session_destroy(session);
+    const std::string log = capture.get();
+    ok &= count_occurrences(log, "[moe-prefetch] ") == 4 * banks;
+    ok &= count_occurrences(log, "outcome=used") == 4 * banks;
+    const size_t logical_bytes = ggml_row_size(weights->type, weights->ne[0]) * weights->ne[1];
+    const std::string copy_bytes = " bytes=" + std::to_string(logical_bytes) + " issue_us=";
+    ok &= count_occurrences(log, copy_bytes.c_str()) == 4 * banks;
+    for (size_t pos = log.find("[moe-prefetch]"); pos != std::string::npos;
+            pos = log.find("[moe-prefetch]", pos + 1)) {
+        const size_t stamp = log.find("issue_us=", pos);
+        long long issue = 0, start = 0, done = 0;
+        ok &= stamp != std::string::npos && sscanf(log.c_str() + stamp,
+                "issue_us=%lld start_us=%lld done_us=%lld", &issue, &start, &done) == 3 &&
+                issue > 0 && start >= issue && done >= start;
+    }
+    if (device_mode) {
+        ok &= max_field_value(log, "replays=") > 0;
+    }
+    ok &= log.find("expert=0 ") == std::string::npos;
+    ok &= max_field_value(log, "fill-fail=") == 0;
+    free_graph(candidate);
+    free_graph(reference);
+    ggml_backend_buffer_free(card_buffer);
+    ggml_backend_buffer_free(host_buffer);
+    ggml_free(card);
+    ggml_free(host);
+    set_env("GGML_MOE_CACHE_DEVICE", nullptr);
+    set_env("GGML_MOE_CACHE_DEVICE_CAPTURE", nullptr);
+    set_env("GGML_MOE_CACHE_DEVICE_FUSED", nullptr);
+    set_env("GGML_MOE_CACHE_DEVICE_STATS", nullptr);
+    printf("cache-prefetch-staging-%s: %s\n", gate_weights ? "fused" : device_mode ? "device" : "legacy", ok ? "OK" : "FAIL");
+    if (!ok) {
+        fprintf(stderr, "%s", log.c_str());
+    }
+    return ok;
+}
+
 static bool run_device_tables_case(ggml_backend_t gpu, ggml_backend_t cpu,
         ggml_tensor * weights, log_capture & capture, float * neighbor_output = nullptr) {
     if (!active_api().device_prepare || !active_api().device_supports) {
@@ -4457,6 +4671,10 @@ static bool run_arena_stride(ggml_backend_t gpu, ggml_backend_t cpu,
         ok &= run_device_tables_case(gpu, cpu, weights, capture);
         // The second projection starts inside the same registered allocation.
         ok &= run_device_tables_case(gpu, cpu, gate, capture);
+        // Actual padded tensors, pinned by the model owner: all paths must copy and consume.
+        ok &= run_prefetch_staging(gpu, cpu, weights, capture, false);
+        ok &= run_prefetch_staging(gpu, cpu, weights, capture, true);
+        ok &= run_prefetch_staging(gpu, cpu, weights, capture, true, gate);
         unsigned int flags = 0;
         // Cache/table teardown must leave the model-owned registration alive.
         ok &= cudaHostGetFlags(&flags, arena) == cudaSuccess;
@@ -4476,7 +4694,37 @@ static bool run_arena_stride(ggml_backend_t gpu, ggml_backend_t cpu,
 
 } // namespace
 
+static bool test_prefetch_budget() {
+    bool ok = ggml_moe_prefetch_budget(100.0, 20.0, 25000.0) == 1500000;
+    ok &= ggml_moe_prefetch_budget(100.0, 20.0, 25000.0, 500000) == 1000000;
+    ok &= ggml_moe_prefetch_budget(100.0, 20.0, 25000.0, 1500000) == 0;
+    ok &= ggml_moe_prefetch_budget(100.0, 20.0, 25000.0, SIZE_MAX) == 0;
+    ok &= ggml_moe_prefetch_budget(100.0, 100.0, 25000.0) == 0;
+    ok &= ggml_moe_prefetch_budget(100.0, 101.0, 25000.0) == 0;
+    ok &= ggml_moe_prefetch_budget(100.0, 0.0, 0.0) == 0;
+    ok &= ggml_moe_prefetch_budget(100.0, -1.0, 25000.0) == 0;
+    ok &= ggml_moe_prefetch_budget(std::numeric_limits<double>::infinity(), 0.0, 1.0) == 0;
+    ok &= ggml_moe_prefetch_budget(100.0, 0.0, std::numeric_limits<double>::quiet_NaN()) == 0;
+    ok &= ggml_moe_prefetch_budget(1e100, 0.0, 1e100) == (16u << 20);
+    printf("cache-prefetch-budget: %s\n", ok ? "OK" : "FAIL");
+    return ok;
+}
+
 int main(int argc, char ** argv) {
+    if (!test_prefetch_budget()) {
+        return 1;
+    }
+    if (argc == 2 && strcmp(argv[1], "--prefetch-policy-only") == 0) {
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--prefetch-cpu-only") == 0) {
+        auto cpu = ggml_backend_cpu_init();
+        const bool ok = cpu && run_prefetch_router(cpu, cpu);
+        if (cpu) {
+            ggml_backend_free(cpu);
+        }
+        return ok ? 0 : 1;
+    }
 #ifdef GGML_CUDA
     // Pure host-budget fixtures need no CUDA device or GPU lock.
     if (argc == 2 && strcmp(argv[1], "--host-budget-only") == 0) {
@@ -4512,6 +4760,11 @@ int main(int argc, char ** argv) {
         if (cpu) {
             ggml_backend_free(cpu);
         }
+        return 1;
+    }
+    if (!run_prefetch_router(gpu, cpu)) {
+        ggml_backend_free(gpu);
+        ggml_backend_free(cpu);
         return 1;
     }
     ggml_init_params static_params = {
@@ -4700,6 +4953,15 @@ int main(int argc, char ** argv) {
     });
     ok &= run_capability_queries(provider_device, cpu);
     ok &= run_invalidation_hook_coverage(cpu);
+    ok &= run_optional(provider_is_cuda, "cache-prefetch-staging-legacy", [&] {
+        return run_prefetch_staging(gpu, cpu, weights, capture, false);
+    });
+    ok &= run_optional(provider_is_cuda, "cache-prefetch-staging-device", [&] {
+        return run_prefetch_staging(gpu, cpu, weights, capture, true);
+    });
+    ok &= run_optional(provider_is_cuda, "cache-prefetch-staging-fused", [&] {
+        return run_prefetch_staging(gpu, cpu, weights, capture, true, gate_weights);
+    });
     ok &= run_optional(provider_is_cuda, "cache-device-tables", [&] {
         return run_device_tables(gpu, cpu, weights, capture);
     });

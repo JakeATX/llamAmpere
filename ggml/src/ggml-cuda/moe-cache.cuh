@@ -33,10 +33,11 @@ static inline bool ggml_cuda_moe_cache_host_merge(uintptr_t begin, uintptr_t end
 }
 
 struct ggml_tensor;
+struct ggml_cgraph;
 struct ggml_backend_cuda_context;
 // A nonzero token requires an active prepared session and opt-in capture.
 uint64_t ggml_cuda_moe_cache_device_capture_generation(int device);
-void ggml_cuda_moe_cache_device_graph_record(int device, bool captured);
+void ggml_cuda_moe_cache_device_graph_record(int device, bool captured, const ggml_cgraph * graph);
 bool ggml_cuda_moe_cache_device_supports(const ggml_tensor * op, int device);
 bool ggml_cuda_moe_cache_device_compute(ggml_backend_cuda_context & ctx, ggml_tensor * op);
 bool ggml_cuda_moe_cache_device_fused_compute(ggml_backend_cuda_context & ctx,

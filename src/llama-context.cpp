@@ -220,6 +220,10 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
 
     cparams.n_threads            = params.n_threads;
     cparams.n_threads_batch      = params.n_threads_batch;
+    if (params.moe_prefetch < -1 || params.moe_prefetch > 3) {
+        throw std::invalid_argument("moe_prefetch must be -1..3");
+    }
+    cparams.moe_prefetch = params.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT ? params.moe_prefetch : 0;
     cparams.moe_cache_mode       = params.moe_cache_mode;
     cparams.moe_cache_budget_mib = params.moe_cache_budget_mib;
     cparams.yarn_ext_factor      = params.yarn_ext_factor >= 0.0f ? params.yarn_ext_factor : hparams.yarn_ext_factor;
@@ -1728,6 +1732,7 @@ void llama_context::sched_reserve() {
     }
     if (!preserve_cache) {
         ggml_backend_sched_set_moe_cache(sched.get(), moe_cache_mode, cparams.moe_cache_budget_mib);
+        ggml_backend_sched_moe_cache_prefetch_configure(sched.get(), cparams.moe_prefetch);
     }
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
 
@@ -1965,6 +1970,7 @@ void llama_context::sched_reserve() {
                 sched_pipeline_parallel = false;
                 ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
                 ggml_backend_sched_set_moe_cache(sched.get(), moe_cache_mode, cparams.moe_cache_budget_mib);
+                ggml_backend_sched_moe_cache_prefetch_configure(sched.get(), cparams.moe_prefetch);
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
@@ -3037,8 +3043,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
-        ggml_backend_sched_set_eval_callback(sched.get(), b1_cache_collect ? b1_cache_eval : cparams.cb_eval,
-                                             b1_cache_collect ? this : cparams.cb_eval_user_data);
+        const bool cache_eval = b1_cache_collect || cparams.moe_prefetch != 0;
+        ggml_backend_sched_set_eval_callback(sched.get(), cache_eval ? b1_cache_eval : cparams.cb_eval,
+                                             cache_eval ? this : cparams.cb_eval_user_data);
 
         //const auto t_start_us = ggml_time_us();
 
@@ -5050,13 +5057,27 @@ bool llama_context::b1_cache_eval(ggml_tensor * tensor, bool ask, void * user_da
     auto & ctx = *static_cast<llama_context *>(user_data);
     int layer = -1;
     int parsed = 0;
+    int source_layer = -1;
+    int target_layer = -1;
+    const bool predicted = ctx.cparams.moe_prefetch != 0 &&
+        sscanf(tensor->name, "moe_prefetch-%d-%d%n", &source_layer, &target_layer, &parsed) == 2 &&
+        parsed > 0 && tensor->name[parsed] == '\0' && source_layer >= 0 && target_layer > source_layer &&
+        target_layer - source_layer <= 3 && (size_t) target_layer < ctx.model.layers.size() &&
+        tensor->type == GGML_TYPE_I32 && tensor->ne[0] > 0 && tensor->ne[0] <= 32 &&
+        tensor->ne[1] == 1 && tensor->ne[2] == 1 && tensor->ne[3] == 1 && ggml_is_contiguous(tensor);
+    parsed = 0;
+    int observed_layer = -1;
+    const bool entry = ctx.cparams.moe_prefetch != 0 &&
+        sscanf(tensor->name, "moe_prefetch_layer_start-%d%n", &observed_layer, &parsed) == 1 &&
+        parsed > 0 && tensor->name[parsed] == '\0' && tensor->ne[1] > 0 && tensor->ne[1] <= 8;
+    parsed = 0;
     const size_t max_bytes = 64u << 20;
     const bool valid_shape = tensor->ne[0] > 0 && tensor->ne[1] > 0 &&
         (uint64_t) tensor->ne[0] <= max_bytes / sizeof(int32_t) &&
         tensor->nb[1] >= (size_t) tensor->ne[0] * sizeof(int32_t) && tensor->nb[1] <= max_bytes &&
         (uint64_t) tensor->ne[1] <= max_bytes / tensor->nb[1];
     const bool routed = valid_shape && sscanf(tensor->name, "ffn_moe_topk-%d%n", &layer, &parsed) == 1 &&
-        parsed > 0 && tensor->name[parsed] == '\0' && layer >= 0 && (size_t) layer < ctx.b1_cache_counts.size() &&
+        parsed > 0 && tensor->name[parsed] == '\0' && layer >= 0 && (size_t) layer < ctx.model.layers.size() &&
         tensor->type == GGML_TYPE_I32 && tensor->nb[0] == sizeof(int32_t) && tensor->ne[2] == 1 && tensor->ne[3] == 1 &&
         ggml_nbytes(tensor) <= (64u << 20);
     if (ask) {
@@ -5064,9 +5085,35 @@ bool llama_context::b1_cache_eval(ggml_tensor * tensor, bool ask, void * user_da
         if (user_need) {
             ctx.b1_cache_user_node = tensor;
         }
-        return (routed && ctx.b1_cache_collect) || user_need;
+        return (routed && (ctx.b1_cache_collect || (ctx.cparams.moe_prefetch != 0 && tensor->ne[1] <= 8))) || predicted || entry || user_need;
     }
-    if (routed && ctx.b1_cache_collect) {
+    if (ctx.cparams.moe_prefetch != 0) {
+        const auto api = ggml_moe_cache_active();
+        if (entry && api.prefetch_observe) {
+            api.prefetch_observe(nullptr, observed_layer, nullptr, 0);
+        }
+        if ((predicted || (routed && tensor->ne[1] <= 8)) && tensor->ne[0] <= 64) {
+            int32_t ids[512];
+            const size_t row_bytes = tensor->ne[0] * sizeof(int32_t);
+            ggml_backend_tensor_get_2d(tensor, ids, 0, row_bytes, tensor->ne[1], tensor->nb[1], row_bytes);
+            if (predicted && api.prefetch && tensor->buffer && !ggml_backend_buffer_is_host(tensor->buffer)) {
+                const auto & future = ctx.model.layers[target_layer];
+                ggml_moe_cache_tensor_desc descs[3] = {};
+                ggml_tensor * weights[] = {future.ffn_up_exps, future.ffn_gate_exps, future.ffn_down_exps};
+                int count = 0;
+                for (auto * w : weights) {
+                    if (!w || !w->buffer || !ggml_backend_buffer_is_host(w->buffer)) {
+                        continue;
+                    }
+                    descs[count++] = {w->name, w->data, w->nb[2], w->ne[0], w->ne[1], w->ne[2], (int32_t) w->type};
+                }
+                api.prefetch(nullptr, descs, count, ids, (int) tensor->ne[0], source_layer, target_layer, ctx.cparams.moe_prefetch < 0);
+            } else if (routed && api.prefetch_observe) {
+                api.prefetch_observe(nullptr, layer, ids, (int) (tensor->ne[0] * tensor->ne[1]));
+            }
+        }
+    }
+    if (routed && ctx.b1_cache_collect && (size_t) layer < ctx.b1_cache_counts.size()) {
         try {
             // argsort_top_k is normally a ten-row view of the full expert
             // sort. Its token stride still covers every expert. Read only
@@ -5520,6 +5567,16 @@ llm_graph_cb llama_context::graph_get_cb() const {
             ggml_format_name(cur, "%s-%d", name, il);
         } else {
             ggml_set_name(cur, name);
+        }
+
+        if (strcmp(name, "moe_prefetch_gpu") == 0 && il >= 0) {
+            for (const auto & backend : backends) {
+                if (ggml_backend_get_device(backend.get()) == model.dev_layer(il) &&
+                        ggml_backend_supports_op(backend.get(), cur)) {
+                    ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend.get());
+                    break;
+                }
+            }
         }
 
         // - norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
@@ -6953,6 +7010,7 @@ llama_context_params llama_context_default_params() {
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.type_s                      =*/ GGML_TYPE_F32,
         /*.moe_cache_mode              =*/ LLAMA_MOE_CACHE_MODE_UNSPECIFIED,
+        /*.moe_prefetch                =*/ 0,
         /*.moe_cache_budget_mib        =*/ 0,
         /*.moe_cache_size              =*/ 0,
         /*.abort_callback              =*/ nullptr,
