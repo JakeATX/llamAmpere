@@ -68,8 +68,12 @@ int main(int argc, char ** argv) {
         ok &= rejected && table->data == source && table->ne[1] == n_rows;
     }
     write_profile("1\n8\n999\n");
+    const std::string missed = profile + ".miss";
+    setenv("LLAMA_PLE_MISS_PROFILE", missed.c_str(), 1);
     auto cache = llama_ple_cache::load(table, profile.c_str(), cuda);
+    unsetenv("LLAMA_PLE_MISS_PROFILE");
     ok &= cache->size() == 3 * row_bytes && table->ne[1] == n_rows && table->data == source;
+    auto * original_table = table;
     table = cache->tensor;
     ok &= table->ne[1] == 3;
     const int32_t original[] = { 999, 1, 8, 1 };
@@ -79,6 +83,21 @@ int main(int argc, char ** argv) {
     const int32_t unchanged[] = { 1, -1, 1000, 7 };
     ok &= !cache->remap(absent, 4) && memcmp(absent, unchanged, sizeof(absent)) == 0;
     ok &= cache->lookups == 8 && cache->misses == 3;
+    {
+        std::ifstream saved(missed);
+        std::string magic;
+        int64_t saved_type, saved_width, saved_rows, saved_bytes, saved_count;
+        saved >> magic >> saved_type >> saved_width >> saved_rows >> saved_bytes >> saved_count;
+        std::vector<int32_t> exported;
+        int32_t row;
+        while (saved >> row) { exported.push_back(row); }
+        ok &= magic == "LLAMA_PLE_ROWS_V1" && saved_type == type && saved_width == width &&
+              saved_rows == n_rows && saved_bytes == (int64_t) row_bytes && saved_count == 4 &&
+              exported == std::vector<int32_t>({1, 7, 8, 999});
+        auto expanded = llama_ple_cache::load(original_table, missed.c_str(), false);
+        int32_t replay[] = {7, 999, 8, 1};
+        ok &= expanded->remap(replay, 4) && replay[0] == 1 && expanded->misses == 0;
+    }
     ok &= mprotect(source, bytes, PROT_NONE) == 0;
     // IQ4_NL rows of width 160 gather on CPU, then the consumer runs on CUDA.
     auto * cpu = cuda ? ggml_backend_cpu_init() : backend;
@@ -107,6 +126,7 @@ int main(int argc, char ** argv) {
     ggml_backend_buffer_free(source_buffer);
     munmap(source, bytes);
     unlink(profile.c_str());
+    unlink(missed.c_str());
     ggml_free(ctx);
     ggml_backend_free(backend);
     printf("PLE startup bytes, protected source, gather, misses and malformed profiles %s: %s\n", cuda ? "CUDA" : "CPU", ok ? "PASS" : "FAIL");
