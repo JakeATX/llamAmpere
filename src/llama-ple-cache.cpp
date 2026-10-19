@@ -4,7 +4,9 @@
 
 #include <algorithm>
 #include <cstring>
+#include <cstdlib>
 #include <fstream>
+#include <iterator>
 #include <stdexcept>
 
 #ifndef _WIN32
@@ -41,6 +43,10 @@ std::unique_ptr<llama_ple_cache> llama_ple_cache::load(const ggml_tensor * tenso
     if (available && (available <= reserve || bytes > available - reserve ||
             (uint64_t) n_rows * sizeof(int32_t) > available - reserve - bytes)) {
         throw std::runtime_error("PLE row cache would cross the seven GiB RAM floor");
+    }
+    cache->full_rows = full_rows;
+    if (const char * path = getenv("LLAMA_PLE_MISS_PROFILE"); path && *path) {
+        cache->miss_profile = path;
     }
     cache->rows.reserve(n_rows);
     for (int64_t i = 0; i < n_rows; ++i) {
@@ -100,6 +106,31 @@ std::unique_ptr<llama_ple_cache> llama_ple_cache::load(const ggml_tensor * tenso
     return cache;
 }
 
+void llama_ple_cache::save_miss_profile(const int32_t * indices, size_t count) const {
+    if (miss_profile.empty()) { return; }
+    std::lock_guard<std::mutex> lock(miss_mutex);
+    std::vector<int32_t> additional;
+    for (size_t i = 0; i < count; ++i) {
+        if (indices[i] >= 0 && indices[i] < full_rows && !std::binary_search(rows.begin(), rows.end(), indices[i])) {
+            additional.push_back(indices[i]);
+        }
+    }
+    std::sort(additional.begin(), additional.end());
+    additional.erase(std::unique(additional.begin(), additional.end()), additional.end());
+    const size_t expanded_count = rows.size() + additional.size();
+    std::ofstream output(miss_profile);
+    output << "LLAMA_PLE_ROWS_V1 " << int(tensor->type) << ' ' << tensor->ne[0] << ' ' << full_rows << ' '
+           << tensor->nb[1] << ' ' << expanded_count << '\n';
+    std::merge(rows.begin(), rows.end(), additional.begin(), additional.end(), std::ostream_iterator<int32_t>(output, "\n"));
+    output.close();
+    if (!output) {
+        LLAMA_LOG_ERROR("%s: cannot save PLE miss profile to %s\n", __func__, miss_profile.c_str());
+    } else {
+        LLAMA_LOG_INFO("%s: saved %zu startup rows to %s; includes this failed batch, not future coverage\n",
+                __func__, expanded_count, miss_profile.c_str());
+    }
+}
+
 bool llama_ple_cache::remap(int32_t * indices, size_t count) const {
     std::vector<int32_t> mapped(count);
     uint64_t missing = 0;
@@ -114,6 +145,7 @@ bool llama_ple_cache::remap(int32_t * indices, size_t count) const {
     lookups.fetch_add(count, std::memory_order_relaxed);
     misses.fetch_add(missing, std::memory_order_relaxed);
     if (missing) {
+        save_miss_profile(indices, count);
         LLAMA_LOG_ERROR("%s: PLE RAM cache misses=%llu/%zu cumulative_misses=%llu; no weight reads attempted\n",
                 __func__, (unsigned long long) missing, count, (unsigned long long) misses.load());
         return false;
