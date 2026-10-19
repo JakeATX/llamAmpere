@@ -181,6 +181,11 @@ int main() {
     memcpy(data, original.data(), bytes);
     if (getenv("BAD_OPERAND")) { llama_compare_moe_output(data, other_data, bytes); }
     if (getenv("BAD_OWNED")) { llama_compare_moe_output(other_data, original.data(), bytes); }
+    if (getenv("COLD_MAGIC")) {
+        evict();
+        llama_write_moe_output(data, &magic, sizeof(magic));
+        if (memcmp(data, &magic_copy, sizeof(magic))) { return 12; }
+    }
     printf("{\"compare_reads\":%llu,\"write_reads\":%llu,\"exact\":true}\n", (unsigned long long)compare_reads, (unsigned long long)write_reads);
     munmap(data, bytes); munmap(other_data, bytes); close(fd); close(other_fd);
 }
@@ -189,17 +194,25 @@ int main() {
     subprocess.run(['g++', '-shared', '-fPIC', '-O2', str(work / 'operations.cpp'), '-o', str(work / 'liboperations.so')], check=True)
     subprocess.run(['g++', '-Wall', '-Wextra', '-Werror', '-O2', str(work / 'driver.cpp'), '-L' + str(work), '-loperations', '-Wl,-rpath,' + str(work), '-o', str(work / 'llama.cpp-layout-fixture')], check=True)
     evidence = {}
-    for mode in ['raw', 'traced', 'bad', 'bad_owned']:
+    for mode in ['raw', 'traced', 'bad', 'bad_owned', 'cold_magic']:
         env = dict(os.environ, LD_PRELOAD=str(tracer), LLAMA_MOE_ARENA_OUTPUT_DIR=str(work))
         if mode == 'raw': env['RAW_LAYOUT'] = '1'
         if mode == 'bad': env['BAD_OPERAND'] = '1'
         if mode == 'bad_owned': env['BAD_OWNED'] = '1'
+        if mode == 'cold_magic': env['COLD_MAGIC'] = '1'
         start = time.time()
         proc = subprocess.run([str(work / 'llama.cpp-layout-fixture')], cwd=work, env=env, text=True, capture_output=True, check=True)
         end = time.time()
         values = json.loads(proc.stdout)
-        if mode in ['bad', 'bad_owned']:
+        if mode in ['bad', 'bad_owned', 'cold_magic']:
             assert 'FNARENA_LAYOUT_IO_ERROR' in proc.stderr
+            errors = [line for line in proc.stderr.splitlines() if 'FNARENA_LAYOUT_IO_ERROR' in line]
+            expected = {
+                'bad': ('op=compare', 'owned_valid=1 metadata_anonymous=0', 'metadata_path=' + str(work) + '/model-operand-'),
+                'bad_owned': ('op=compare', 'owned_valid=0 metadata_anonymous=1', 'metadata_path='),
+                'cold_magic': ('op=write', 'bytes=4 owned_valid=1 metadata_anonymous=0', 'metadata_path=' + str(work / 'llama.cpp-layout-fixture')),
+            }[mode]
+            assert any(all(field in line for field in expected) for line in errors), proc.stderr
             try: activation_layout(proc.stderr, start, end, 8 << 20, work)
             except ValueError: pass
             else: raise AssertionError('file-backed metadata accepted')
