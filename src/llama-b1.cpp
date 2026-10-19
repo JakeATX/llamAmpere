@@ -4,6 +4,7 @@
 
 #include "llama-impl.h"
 #include "llama-model.h"
+#include "../ggml/src/ggml-backend-moe-cache.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -931,6 +932,7 @@ void llama_b1::push_tensor_pieces(std::vector<piece> & ps, const exps_tensor & e
     for (size_t off = 0; off < e.nbytes;) {
         piece p;
         const bool strided = !from_file && e.home_nb2 != expert_bytes;
+        const bool permanent = !from_file && ggml_moe_cache_has_residents();
         const size_t source_off = strided ? (off / expert_bytes) * e.home_nb2 + off % expert_bytes : off;
         p.src_host = from_file ? nullptr : (const char *) e.home_data + source_off;
         p.fd       = e.src.fd;
@@ -938,7 +940,7 @@ void llama_b1::push_tensor_pieces(std::vector<piece> & ps, const exps_tensor & e
         p.dst      = dst;
         p.dst_offs = dst_offs + off;
         p.len      = std::min(piece_bytes, e.nbytes - off);
-        if (strided) { p.len = std::min(p.len, expert_bytes - off % expert_bytes); }
+        if (strided || permanent) { p.len = std::min(p.len, expert_bytes - off % expert_bytes); }
         ps.push_back(p);
         off += p.len;
     }
@@ -1034,6 +1036,16 @@ void llama_b1::worker(int w) {
             p = queue[queue_head++];
         }
 
+        if (p.src_host) {
+            std::lock_guard<std::mutex> ls(mtx_stream);
+            if (ggml_moe_cache_resident_copy(backend_copy, p.dst->raw, p.dst_offs, p.src_host, p.len)) {
+                std::lock_guard<std::mutex> lk(mtx);
+                st.bytes_d2d += p.len;
+                if (--pieces_left == 0) { cv.notify_all(); }
+                continue;
+            }
+        }
+
         auto & s = stg[w][b];
         b ^= 1;
         if (s.used) {
@@ -1042,6 +1054,7 @@ void llama_b1::worker(int w) {
 
         bool ok = true;
         if (p.src_host) {
+            ggml_moe_cache_host_restore(p.src_host, p.len);
             memcpy(s.data, p.src_host, p.len);
         } else {
             ok = p.fd >= 0 && b1_read_file(p.fd, s.data, p.src_offs, p.len);
@@ -1187,6 +1200,8 @@ void llama_b1::end(bool failed) {
             grp_first.size(), g_ub, st.bytes_h2d/1073741824.0, s > 0 ? st.bytes_h2d/1e9/s : 0.0, s, st.t_wait_ms,
             st.bytes_lent/1048576.0, st.bytes_fresh/1048576.0, st.bytes_carry/1048576.0);
 
+    LLAMA_LOG_INFO("%s: [B1] permanent expert copies: D2D_bytes=%llu H2D_bytes=%llu\n", __func__,
+            (unsigned long long)st.bytes_d2d, (unsigned long long)st.bytes_h2d);
     LLAMA_LOG_INFO("%s: [B1] pass timing: pipeline wall %.3f ms, overlapped copy submission %.3f ms, exposed host copy waits %.3f ms; overlapping times are not additive\n",
             __func__, st.t_stream_us / 1000.0, st.t_copy_submit_ms, st.t_wait_ms);
     for (size_t pass = 0; pass < grp_first.size(); ++pass) {

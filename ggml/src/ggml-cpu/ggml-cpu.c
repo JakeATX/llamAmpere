@@ -4165,6 +4165,23 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     const struct ggml_cgraph * cgraph = tp->cgraph;
     const struct ggml_cplan  * cplan  = tp->cplan;
 
+    if (ggml_moe_cache_has_residents()) {
+        if (state->ith == 0) {
+            for (int i = 0; i < cgraph->n_nodes; ++i) {
+                const struct ggml_tensor * node = cgraph->nodes[i];
+                if (ggml_op_is_empty(node->op) || !(node->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+                    continue;
+                }
+                for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                    if (node->src[j]) {
+                        ggml_moe_cache_host_restore(node->src[j]->data, ggml_nbytes(node->src[j]));
+                    }
+                }
+            }
+        }
+        ggml_barrier(tp);
+    }
+
 #ifdef GGML_USE_CPU_RISCV64_SPACEMIT
     ggml_backend_cpu_riscv64_spacemit_set_numa_thread_affinity(state->ith);
 #else

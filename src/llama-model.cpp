@@ -25,6 +25,7 @@
 
 #include "ggml.h"
 #include "ggml-cpp.h"
+#include "../ggml/src/ggml-backend-moe-cache.h"
 
 #include <algorithm>
 #include <cassert>
@@ -44,6 +45,8 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <mutex>
+#include <cerrno>
 
 #ifndef _WIN32
 #include <unistd.h>
@@ -1313,7 +1316,9 @@ struct llama_model::impl {
     std::shared_ptr<impl> tensor_donor;
 
     impl() = default;
-    ~impl() = default;
+    ~impl() {
+        if (moe_resident) { moe_resident_api.resident_destroy(moe_resident); }
+    }
 
     uint64_t n_elements = 0;
 
@@ -1326,6 +1331,10 @@ struct llama_model::impl {
     // model memory mapped files
     llama_mmaps mappings;
     std::unique_ptr<llama_moe_arena> moe_arena;
+    std::mutex moe_resident_mutex;
+    ggml_moe_cache_api moe_resident_api = {};
+    void * moe_resident = nullptr;
+    bool moe_resident_attempted = false;
 
     // objects representing data potentially being locked in memory
     llama_mlocks mlock_bufs;
@@ -4004,6 +4013,71 @@ llama_ftype llama_model_ftype(const llama_model * model) {
 
 size_t llama_model::moe_arena_size() const {
     return pimpl->moe_arena ? pimpl->moe_arena->size : 0;
+}
+
+void llama_model::moe_resident_init(ggml_backend_dev_t device, const ggml_moe_cache_tensor_desc * tensors, int count) const {
+    const char * setting = getenv("LLAMA_MOE_PERMANENT_MIB");
+    if (!setting || !*setting || strcmp(setting, "0") == 0) { return; }
+    std::lock_guard<std::mutex> lock(pimpl->moe_resident_mutex);
+    if (pimpl->moe_resident_attempted) { return; }
+    pimpl->moe_resident_attempted = true;
+    char * end = nullptr;
+    errno = 0;
+    const unsigned long long mib = strtoull(setting, &end, 10);
+    if (errno || !end || *end || !mib || mib > 3072) {
+        throw std::runtime_error("LLAMA_MOE_PERMANENT_MIB must be in [1,3072]");
+    }
+    auto * arena = pimpl->moe_arena.get();
+    if (!arena || !device || !tensors || count <= 0) {
+        throw std::runtime_error("permanent experts require a pinned model arena and GPU");
+    }
+    const auto api = ggml_moe_cache_get(ggml_backend_dev_backend_reg(device));
+    if (!api.resident_create || !api.resident_destroy || !api.resident_spans || !api.resident_dropped || !api.host_restore) {
+        throw std::runtime_error("permanent expert provider is unavailable");
+    }
+    void * resident = api.resident_create(device, tensors, count, (size_t) mib << 20);
+    if (!resident) { throw std::runtime_error("cannot create permanent profile expert storage"); }
+    pimpl->moe_resident_api = api;
+    pimpl->moe_resident = resident;
+    try {
+        const size_t n = api.resident_spans(resident, nullptr, 0);
+        if (!n || n > (size_t) count * hparams.n_expert) {
+            throw std::runtime_error("invalid permanent expert span count");
+        }
+        std::vector<ggml_moe_resident_span> spans(n);
+        if (api.resident_spans(resident, spans.data(), n) != n) {
+            throw std::runtime_error("permanent expert spans changed at startup");
+        }
+        std::vector<std::pair<size_t, size_t>> covered;
+        covered.reserve(n);
+        const uintptr_t base = (uintptr_t) arena->data;
+        for (const auto & span : spans) {
+            const uintptr_t host = (uintptr_t) span.host;
+            if (host < base || host - base > arena->size || span.size > arena->size - (host - base) || !span.device) {
+                throw std::runtime_error("permanent expert span is outside its model arena");
+            }
+            covered.emplace_back(host - base, span.size);
+        }
+        api.resident_dropped(resident, +[](void * opaque) -> int {
+            try { static_cast<llama_moe_arena *>(opaque)->pin_restored(); return 1; }
+            catch (const std::exception & error) {
+                LLAMA_LOG_ERROR("permanent expert host restore failed: %s\n", error.what());
+                return 0;
+            }
+        }, arena);
+        const size_t released = arena->discard(covered);
+        if (!released) { throw std::runtime_error("permanent experts did not release any host pages"); }
+        LLAMA_LOG_INFO("%s: permanent expert host pages released=%zu bytes (%.2f MiB), original GPU spans=%zu arena_base=%p arena_bytes=%zu\n",
+                __func__, released, released / 1048576.0, n, arena->data, arena->size);
+    } catch (...) {
+        // A partial discard must restore bytes before an outer caller can recover.
+        if (!api.host_restore(arena->data, arena->size)) {
+            GGML_ABORT("cannot restore permanent expert host pages after startup failure");
+        }
+        api.resident_destroy(resident);
+        pimpl->moe_resident = nullptr;
+        throw;
+    }
 }
 
 uint64_t llama_model_moe_arena_size(const llama_model * model) {

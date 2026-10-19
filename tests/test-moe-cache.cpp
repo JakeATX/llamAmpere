@@ -118,6 +118,169 @@ static void test_provider_session_destroy(void * session) { (void) session; }
 static void test_provider_session_enter(void * session) { (void) session; }
 static void test_provider_session_leave(void * session) { (void) session; }
 
+static void * resident_test_host = nullptr;
+static std::vector<float> resident_test_original;
+static int resident_test_restores = 0;
+
+static int resident_test_restore(const void * data, size_t size) {
+    const uintptr_t begin = (uintptr_t)data;
+    const uintptr_t base = (uintptr_t)resident_test_host;
+    const size_t bytes = resident_test_original.size() * sizeof(float);
+    if (size && size <= UINTPTR_MAX - begin && begin < base + bytes && base < begin + size) {
+        memcpy(resident_test_host, resident_test_original.data(), bytes);
+        ++resident_test_restores;
+    }
+    return 1;
+}
+
+static bool run_resident_host_barriers(ggml_backend_t cpu) {
+    ggml_init_params params{16 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true};
+    auto * ctx = ggml_init(params);
+    if (!ctx) { return false; }
+    auto * weight = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 16);
+    auto * destination = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 16);
+    auto * result = ggml_scale(ctx, weight, 2.0f);
+    auto * metadata = ggml_view_1d(ctx, weight, 16, 0);
+    auto * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, result);
+    auto * buffer = ggml_backend_alloc_ctx_tensors(ctx, cpu);
+    if (!buffer) { ggml_free(ctx); return false; }
+    static int owner;
+    ggml_moe_cache_api api{};
+    api.owner = &owner;
+    api.session_create = test_provider_session_create;
+    api.session_destroy = test_provider_session_destroy;
+    api.session_enter = test_provider_session_enter;
+    api.session_leave = test_provider_session_leave;
+    api.host_restore = resident_test_restore;
+    ggml_moe_cache_register(&api);
+    ggml_moe_cache_resident_notify(true);
+    resident_test_host = weight->data;
+    resident_test_original.assign(16, 1.25f);
+    resident_test_restores = 0;
+    auto discard = [&] { memset(weight->data, 0, ggml_nbytes(weight)); };
+    bool ok = true;
+    std::vector<float> output(16);
+    discard();
+    ggml_backend_tensor_get(weight, output.data(), 0, ggml_nbytes(weight));
+    ok &= output == resident_test_original;
+    discard();
+    ggml_backend_tensor_set_async(cpu, destination, weight->data, 0, ggml_nbytes(weight));
+    ggml_backend_synchronize(cpu);
+    ggml_backend_tensor_get(destination, output.data(), 0, ggml_nbytes(destination));
+    ok &= output == resident_test_original;
+    discard();
+    ggml_backend_tensor_copy(weight, destination);
+    ggml_backend_tensor_get(destination, output.data(), 0, ggml_nbytes(destination));
+    ok &= output == resident_test_original;
+    discard();
+    ggml_backend_tensor_get_2d_async(cpu, weight, output.data(), 0, 4 * sizeof(float), 4,
+            4 * sizeof(float), 4 * sizeof(float));
+    ggml_backend_synchronize(cpu);
+    ok &= output == resident_test_original;
+    discard();
+    // Metadata nodes and unused leafs must not restore released source pages.
+    ggml_cgraph metadata_graph = *graph;
+    metadata_graph.n_nodes = 1;
+    metadata_graph.nodes = &metadata;
+    const int before_metadata = resident_test_restores;
+    ok &= ggml_backend_graph_compute(cpu, &metadata_graph) == GGML_STATUS_SUCCESS;
+    ok &= resident_test_restores == before_metadata;
+    ggml_backend_cpu_set_n_threads(cpu, 2);
+    ok &= ggml_backend_graph_compute(cpu, graph) == GGML_STATUS_SUCCESS;
+    ggml_backend_tensor_get(result, output.data(), 0, ggml_nbytes(result));
+    ok &= output == std::vector<float>(16, 2.5f);
+    ok &= resident_test_restores >= 5;
+    ggml_moe_cache_resident_notify(false);
+    ggml_moe_cache_unregister(&owner);
+    resident_test_host = nullptr;
+    resident_test_original.clear();
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    printf("permanent-host-read-barriers: %s\n", ok ? "OK" : "FAIL");
+    return ok;
+}
+
+#if defined(GGML_CUDA) && defined(__linux__)
+static uint64_t resident_test_hash(uint64_t hash, const void * data, size_t size) {
+    const auto * bytes = (const uint8_t *)data;
+    for (size_t i = 0; i < size; ++i) { hash = (hash ^ bytes[i]) * UINT64_C(1099511628211); }
+    return hash;
+}
+
+static bool run_permanent_original_copy(ggml_backend_t gpu, ggml_backend_t cpu) {
+    auto api = ggml_moe_cache_get(ggml_backend_dev_backend_reg(ggml_backend_get_device(gpu)));
+    if (!api.resident_create || !api.resident_dropped || !api.resident_spans || !api.resident_destroy) { return false; }
+    ggml_init_params params{8 * ggml_tensor_overhead(), nullptr, true};
+    auto * ctx = ggml_init(params);
+    auto * a = ggml_new_tensor_3d(ctx, GGML_TYPE_Q4_0, n_in, n_out, n_expert);
+    auto * b = ggml_new_tensor_3d(ctx, GGML_TYPE_Q4_0, n_in, n_out, n_expert);
+    auto * host_buffer = ggml_backend_alloc_ctx_tensors(ctx, cpu);
+    if (!host_buffer) { ggml_free(ctx); return false; }
+    std::vector<uint8_t> original(ggml_nbytes(a));
+    for (size_t i = 0; i < original.size(); ++i) { original[i] = (uint8_t)(i * 13 + i / 997); }
+    memcpy(a->data, original.data(), original.size());
+    memcpy(b->data, original.data(), original.size());
+    ggml_moe_cache_tensor_desc descs[] = {
+        {"blk.0.ffn_up_exps.weight", a->data, a->nb[2], n_in, n_out, n_expert, GGML_TYPE_Q4_0},
+        {"blk.1.ffn_up_exps.weight", b->data, b->nb[2], n_in, n_out, n_expert, GGML_TYPE_Q4_0},
+    };
+    uint64_t signature = UINT64_C(14695981039346656037);
+    for (const auto & d : descs) {
+        signature = resident_test_hash(signature, d.name, strlen(d.name) + 1);
+        const uint64_t shape[] = {d.expert_size, n_in, n_out, n_expert, GGML_TYPE_Q4_0};
+        signature = resident_test_hash(signature, shape, sizeof(shape));
+        for (size_t j = 0; j < 64; ++j) {
+            signature = resident_test_hash(signature, (const char *)d.data + ((original.size() - 64) / 63) * j, 64);
+        }
+    }
+    std::vector<uint64_t> counts(2 * n_expert, 1);
+    const uint64_t checksum = resident_test_hash(UINT64_C(14695981039346656037), counts.data(), counts.size() * sizeof(uint64_t));
+    const uint64_t header[] = {UINT64_C(0x31464f5250454f4d), 2, 2 * n_expert, signature, checksum};
+    char path[] = "/tmp/llama-permanent-profile-XXXXXX";
+    int fd = mkstemp(path);
+    FILE * file = fd >= 0 ? fdopen(fd, "wb") : nullptr;
+    bool ok = file && fwrite(header, sizeof(header), 1, file) == 1 &&
+        fwrite(counts.data(), sizeof(uint64_t), counts.size(), file) == counts.size();
+    if (file) { ok &= fclose(file) == 0; }
+    const char * old_path = getenv("GGML_MOE_CACHE_PROFILE_LOAD");
+    const std::string saved = old_path ? old_path : "";
+    set_env("GGML_MOE_CACHE_PROFILE_LOAD", path);
+    void * resident = ok ? api.resident_create(ggml_backend_get_device(gpu), descs, 2, 1u << 20) : nullptr;
+    ok &= resident != nullptr;
+    if (resident) {
+        const size_t count = api.resident_spans(resident, nullptr, 0);
+        std::vector<ggml_moe_resident_span> spans(count);
+        api.resident_spans(resident, spans.data(), spans.size());
+        auto * output = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, a->nb[2]);
+        auto * device_buffer = ggml_backend_alloc_buffer(gpu, a->nb[2]);
+        ggml_backend_tensor_alloc(device_buffer, output, ggml_backend_buffer_get_base(device_buffer));
+        int restores = 0;
+        api.resident_dropped(resident, +[](void * data) { ++*(int *)data; return 1; }, &restores);
+        for (const auto & span : spans) { memset(const_cast<void *>(span.host), 0, span.size); }
+        std::vector<uint8_t> got(a->nb[2]);
+        for (const auto & span : spans) {
+            ok &= ggml_moe_cache_resident_copy(gpu, output, 0, span.host, span.size);
+            ggml_backend_synchronize(gpu);
+            ggml_backend_tensor_get(output, got.data(), 0, span.size);
+            const size_t offset = (uintptr_t)span.host - (uintptr_t)a->data;
+            ok &= memcmp(got.data(), original.data() + offset, span.size) == 0;
+        }
+        ok &= restores == 0;
+        ggml_moe_cache_host_restore(a->data, ggml_nbytes(a));
+        ok &= restores == 1 && memcmp(a->data, original.data(), original.size()) == 0;
+        api.resident_destroy(resident);
+        ggml_backend_buffer_free(device_buffer);
+    }
+    set_env("GGML_MOE_CACHE_PROFILE_LOAD", old_path ? saved.c_str() : nullptr);
+    unlink(path);
+    ggml_backend_buffer_free(host_buffer);
+    ggml_free(ctx);
+    printf("permanent-original-D2D-and-host-restore: %s\n", ok ? "OK" : "FAIL");
+    return ok;
+}
+#endif
+
 // The tests exercise the selected device's provider directly, so a machine
 // with several providers (CUDA + Vulkan, say) always tests a consistent
 // pair of session creator and session callbacks. Populated in main().
@@ -4269,6 +4432,162 @@ static bool run_device_adaptation(ggml_backend_t gpu, ggml_backend_t cpu, log_ca
     return ok;
 }
 
+#if defined(GGML_CUDA) && defined(__linux__)
+static bool run_permanent_device_table(ggml_backend_t gpu, ggml_backend_t cpu, log_capture & capture) {
+    configure_cache(nullptr, "8");
+    set_env("GGML_CUDA_MOE_CACHE_BUDGET_MB", "8");
+    set_env("GGML_MOE_CACHE_DEVICE", "1");
+    set_env("GGML_MOE_CACHE_DEVICE_CAPTURE", "1");
+    set_env("GGML_MOE_CACHE_DEVICE_STATS", "1");
+    set_env("GGML_MOE_CACHE_DEVICE_ADAPT_INTERVAL", "2");
+    set_env("GGML_MOE_CACHE_DEVICE_ADAPT_MB", "1");
+    capture.clear();
+    constexpr int64_t width = 1024, rows = 206, experts = 80, routes = 16;
+    ggml_init_params params{8 * ggml_tensor_overhead(), nullptr, true};
+    auto * ctx = ggml_init(params);
+    auto * inputs = ggml_init(params);
+    auto * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_Q4_0, width, rows, experts);
+    // An unnumbered fixture bank has no output-only last layer to exclude.
+    ggml_set_name(weights, "permanent.ffn_up_exps.weight");
+    auto * acts = ggml_new_tensor_3d(inputs, GGML_TYPE_F32, width, 1, 1);
+    auto * ids = ggml_new_tensor_2d(inputs, GGML_TYPE_I32, routes, 1);
+    const size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    const size_t mapping_bytes = (ggml_nbytes(weights) + page - 1) / page * page;
+    void * mapping = mmap(nullptr, mapping_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mapping == MAP_FAILED) { ggml_free(inputs); ggml_free(ctx); return false; }
+    auto * buffer = ggml_backend_cpu_buffer_from_ptr(mapping, mapping_bytes);
+    const bool allocated = buffer && ggml_backend_tensor_alloc(buffer, weights, mapping) == GGML_STATUS_SUCCESS;
+    auto * input_buffer = ggml_backend_alloc_ctx_tensors(inputs, cpu);
+    ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    bool ok = allocated && input_buffer;
+    auto require = [&](bool value, int line) {
+        if (!value) { fprintf(stderr, "permanent table assertion failed: line=%d\n", line); }
+        ok &= value;
+    };
+    std::vector<float> values(width * rows * experts);
+    for (size_t i = 0; i < values.size(); ++i) { values[i] = 0.2f * std::sin((float)(i % 10007) * 0.013f); }
+    std::vector<uint8_t> quantized(ggml_nbytes(weights));
+    require(ggml_quantize_chunk(GGML_TYPE_Q4_0, values.data(), quantized.data(), 0, rows * experts, width, nullptr) == quantized.size(), __LINE__);
+    ggml_backend_tensor_set(weights, quantized.data(), 0, quantized.size());
+    ggml_backend_tensor_set(acts, values.data(), 0, width * sizeof(float));
+    auto reference = make_graph(cpu, weights, acts, ids);
+    auto candidate = make_graph(gpu, weights, acts, ids);
+    std::vector<std::vector<float>> expected(2, std::vector<float>(rows * routes));
+    for (int phase = 0; phase < 2; ++phase) {
+        std::vector<int32_t> route(routes);
+        for (int i = 0; i < routes; ++i) { route[i] = (phase ? 0 : 64) + i; }
+        ggml_backend_tensor_set(ids, route.data(), 0, route.size() * sizeof(int32_t));
+        require(ggml_backend_graph_compute(cpu, reference.graph) == GGML_STATUS_SUCCESS, __LINE__);
+        ggml_backend_tensor_get(reference.out, expected[phase].data(), 0, expected[phase].size() * sizeof(float));
+    }
+    const ggml_moe_cache_tensor_desc descriptor{weights->name, weights->data, weights->nb[2], width, rows, experts, GGML_TYPE_Q4_0};
+    uint64_t signature = UINT64_C(14695981039346656037);
+    signature = resident_test_hash(signature, descriptor.name, strlen(descriptor.name) + 1);
+    const uint64_t shape[] = {descriptor.expert_size, width, rows, experts, GGML_TYPE_Q4_0};
+    signature = resident_test_hash(signature, shape, sizeof(shape));
+    for (size_t j = 0; j < 64; ++j) {
+        signature = resident_test_hash(signature, quantized.data() + ((quantized.size() - 64) / 63) * j, 64);
+    }
+    std::vector<uint64_t> usage(experts, 1);
+    for (int i = 0; i < 9; ++i) { usage[i] = 10000; }
+    const uint64_t checksum = resident_test_hash(UINT64_C(14695981039346656037), usage.data(), usage.size() * sizeof(uint64_t));
+    const uint64_t header[] = {UINT64_C(0x31464f5250454f4d), 1, experts, signature, checksum};
+    char path[] = "/tmp/llama-permanent-table-XXXXXX";
+    int fd = mkstemp(path);
+    FILE * file = fd >= 0 ? fdopen(fd, "wb") : nullptr;
+    require(file && fwrite(header, sizeof(header), 1, file) == 1 && fwrite(usage.data(), sizeof(uint64_t), usage.size(), file) == usage.size(), __LINE__);
+    if (file) { require(fclose(file) == 0, __LINE__); }
+    const char * old_path = getenv("GGML_MOE_CACHE_PROFILE_LOAD");
+    const std::string saved_path = old_path ? old_path : "";
+    set_env("GGML_MOE_CACHE_PROFILE_LOAD", path);
+    auto & api = active_api();
+    void * resident = ok ? api.resident_create(ggml_backend_get_device(gpu), &descriptor, 1, 9 * descriptor.expert_size) : nullptr;
+    require(resident != nullptr, __LINE__);
+    // The permanent prefix ends partway through a cold registered page. A direct
+    // D2H restore to its final expert would cross mixed registration boundaries.
+    const size_t hole_bytes = 9 * descriptor.expert_size / page * page;
+    const bool registered = cudaHostRegister((char *)mapping + hole_bytes, mapping_bytes - hole_bytes, cudaHostRegisterMapped) == cudaSuccess;
+    require(registered, __LINE__);
+    struct restore_state { void * hole; size_t bytes; int count; bool registered; } state{mapping, hole_bytes, 0, false};
+    ggml_backend_t backends[] = {gpu, cpu};
+    auto scheduler = ggml_backend_sched_new(backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, false);
+    std::vector<uint64_t> warm(experts, 1000);
+    for (int i = 64; i < experts; ++i) { warm[i] = 0; }
+    const uint64_t * counts[] = {warm.data()};
+    if (resident && registered) {
+        const size_t count = api.resident_spans(resident, nullptr, 0);
+        require(count == 9, __LINE__);
+        std::vector<ggml_moe_resident_span> spans(count);
+        api.resident_spans(resident, spans.data(), count);
+        api.resident_dropped(resident, +[](void * p) {
+            auto & restored = *(restore_state *)p;
+            restored.registered = cudaHostRegister(restored.hole, restored.bytes, cudaHostRegisterMapped) == cudaSuccess;
+            ++restored.count;
+            return restored.registered ? 1 : 0;
+        }, &state);
+        for (const auto & span : spans) { memset(const_cast<void *>(span.host), 0, span.size); }
+        require(madvise(mapping, hole_bytes, MADV_DONTNEED) == 0, __LINE__);
+        std::vector<unsigned char> pages(hole_bytes / page);
+        require(mincore(mapping, hole_bytes, pages.data()) == 0, __LINE__);
+        for (unsigned char present : pages) { require(!(present & 1), __LINE__); }
+        auto prepare = [&] {
+            candidate.out->src[0] = weights;
+            candidate.out->src[1] = acts;
+            candidate.out->src[2] = ids;
+            require(ggml_backend_sched_moe_cache_warm(scheduler, &descriptor, counts, 1) >= 0, __LINE__);
+            require(ggml_backend_sched_moe_cache_device_prepare(scheduler, &descriptor, 1) == 1, __LINE__);
+            require(ggml_backend_sched_alloc_graph(scheduler, candidate.graph), __LINE__);
+            require(ggml_backend_sched_get_tensor_backend(scheduler, candidate.out) == gpu, __LINE__);
+        };
+        auto replay = [&](int phase, int iterations) {
+            std::vector<int32_t> route(routes);
+            for (int i = 0; i < routes; ++i) { route[i] = (phase ? 0 : 64) + i; }
+            ggml_backend_tensor_set(ids, route.data(), 0, route.size() * sizeof(int32_t));
+            std::vector<float> actual(expected[phase].size());
+            for (int i = 0; i < iterations; ++i) {
+                require(ggml_backend_sched_graph_compute(scheduler, candidate.graph) == GGML_STATUS_SUCCESS, __LINE__);
+                ggml_backend_tensor_get(candidate.out, actual.data(), 0, actual.size() * sizeof(float));
+                require(compare_output(expected[phase], actual, 5e-4), __LINE__);
+            }
+            require(state.count == 0, __LINE__);
+        };
+        prepare();
+        replay(0, 128);
+        replay(1, 128);
+        require(max_field_value(capture.get(), " copied_bytes=") > 0, __LINE__);
+        ggml_backend_sched_reset(scheduler);
+        require(ggml_backend_sched_moe_cache_trim(scheduler, 2 * descriptor.expert_size) > 0, __LINE__);
+        prepare(); replay(1, 4);
+        ggml_backend_sched_reset(scheduler);
+        require(ggml_backend_sched_moe_cache_restore(scheduler) > 0, __LINE__);
+        prepare(); replay(1, 4);
+        ggml_backend_sched_reset(scheduler);
+        require(ggml_backend_sched_moe_cache_suspend(scheduler), __LINE__);
+        ggml_backend_sched_moe_cache_resume(scheduler);
+        prepare(); replay(1, 4);
+        require(ggml_moe_cache_resident_lookup(weights->data, descriptor.expert_size, ggml_backend_get_device(gpu)) != nullptr, __LINE__);
+        require(state.count == 0, __LINE__);
+        require(max_field_value(capture.get(), "replays=") > 64, __LINE__);
+        ggml_moe_cache_host_restore(weights->data, ggml_nbytes(weights));
+        require(state.count == 1 && memcmp(weights->data, quantized.data(), quantized.size()) == 0, __LINE__);
+    }
+    ggml_backend_sched_free(scheduler);
+    if (resident) { api.resident_destroy(resident); }
+    if (registered) { require(cudaHostUnregister((char *)mapping + hole_bytes) == cudaSuccess, __LINE__); }
+    if (state.registered) { require(cudaHostUnregister(mapping) == cudaSuccess, __LINE__); }
+    set_env("GGML_MOE_CACHE_PROFILE_LOAD", old_path ? saved_path.c_str() : nullptr);
+    unlink(path);
+    free_graph(candidate); free_graph(reference);
+    ggml_backend_buffer_free(input_buffer); ggml_free(inputs);
+    ggml_backend_buffer_free(buffer); ggml_free(ctx);
+    require(munmap(mapping, mapping_bytes) == 0, __LINE__);
+    for (const char * key : {"GGML_MOE_CACHE_DEVICE", "GGML_MOE_CACHE_DEVICE_CAPTURE", "GGML_MOE_CACHE_DEVICE_STATS", "GGML_MOE_CACHE_DEVICE_ADAPT_INTERVAL", "GGML_MOE_CACHE_DEVICE_ADAPT_MB"}) { set_env(key, nullptr); }
+    printf("permanent-device-table-adapt-trim-suspend: %s\n", ok ? "OK" : "FAIL");
+    if (!ok) { fprintf(stderr, "%s", capture.get().c_str()); }
+    return ok;
+}
+#endif
+
 static bool run_device_adaptation_starvation(ggml_backend_t gpu, ggml_backend_t cpu, log_capture & capture) {
     struct saved_env {
         const char * name;
@@ -4930,6 +5249,12 @@ int main(int argc, char ** argv) {
     if (!test_prefetch_budget()) {
         return 1;
     }
+    if (argc == 2 && strcmp(argv[1], "--permanent-host-only") == 0) {
+        auto * cpu = ggml_backend_cpu_init();
+        const bool ok = cpu && run_resident_host_barriers(cpu);
+        if (cpu) { ggml_backend_free(cpu); }
+        return ok ? 0 : 1;
+    }
     if (argc == 2 && strcmp(argv[1], "--prefetch-policy-only") == 0) {
         return 0;
     }
@@ -4978,6 +5303,15 @@ int main(int argc, char ** argv) {
         }
         return 1;
     }
+#if defined(GGML_CUDA) && defined(__linux__)
+    if (argc == 2 && strcmp(argv[1], "--permanent-residency-only") == 0) {
+        bool ok = provider_is_cuda && run_permanent_original_copy(gpu, cpu);
+        ok &= provider_is_cuda && run_permanent_device_table(gpu, cpu, capture);
+        ggml_backend_free(gpu);
+        ggml_backend_free(cpu);
+        return !provider_is_cuda ? 77 : ok ? 0 : 1;
+    }
+#endif
     if (argc == 2 && strcmp(argv[1], "--device-publish-async-only") == 0) {
         const char * previous = getenv("GGML_MOE_CACHE_DEVICE_PUBLISH_ASYNC");
         const std::string saved = previous ? previous : "";

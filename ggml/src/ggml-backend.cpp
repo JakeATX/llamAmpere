@@ -85,6 +85,45 @@ ggml_moe_cache_api ggml_moe_cache_active(void) {
     return ggml_moe_cache_api{};
 }
 
+static std::atomic<size_t> g_moe_resident_count{0};
+bool ggml_moe_cache_has_residents(void) { return g_moe_resident_count.load(std::memory_order_acquire) != 0; }
+void ggml_moe_cache_resident_notify(bool created) {
+    if (created) { g_moe_resident_count.fetch_add(1, std::memory_order_release); }
+    else { g_moe_resident_count.fetch_sub(1, std::memory_order_release); }
+}
+
+// fork: restoration cannot depend on the scheduler's active or suspended session.
+void ggml_moe_cache_host_restore(const void * data, size_t size) {
+    if (!data || !size || !ggml_moe_cache_has_residents()) { return; }
+    std::lock_guard<std::mutex> lock(g_moe_cache_registry_mu);
+    for (const auto & api : g_moe_cache_providers) {
+        if (api.host_restore && !api.host_restore(data, size)) {
+            GGML_ABORT("cannot restore permanent expert host bytes");
+        }
+    }
+}
+
+bool ggml_moe_cache_resident_copy(ggml_backend_t backend, struct ggml_tensor * dst, size_t offset, const void * host, size_t size) {
+    if (!ggml_moe_cache_has_residents()) { return false; }
+    std::lock_guard<std::mutex> lock(g_moe_cache_registry_mu);
+    for (const auto & api : g_moe_cache_providers) {
+        if (api.resident_copy && api.resident_copy(backend, dst, offset, host, size)) { return true; }
+    }
+    return false;
+}
+
+const void * ggml_moe_cache_resident_lookup(const void * data, size_t size, ggml_backend_dev_t device) {
+    if (!data || !size || !device || !ggml_moe_cache_has_residents()) { return nullptr; }
+    std::lock_guard<std::mutex> lock(g_moe_cache_registry_mu);
+    for (const auto & api : g_moe_cache_providers) {
+        if (api.resident_lookup) {
+            const void * result = api.resident_lookup(data, size, device);
+            if (result) { return result; }
+        }
+    }
+    return nullptr;
+}
+
 // Providers whose backend owns at least one device in the scheduler set, in
 // registration order. Returns copies: the scheduler keeps the selected copy
 // with its session so later registration changes cannot alter the callbacks.
@@ -546,6 +585,7 @@ ggml_backend_buffer_t ggml_backend_buffer_view(ggml_backend_buffer_t parent, siz
 }
 
 bool ggml_backend_buffer_copy_tensor(const struct ggml_tensor * src, struct ggml_tensor * dst) {
+    ggml_moe_cache_host_restore(src->data, ggml_nbytes(src));
     ggml_backend_buffer_t dst_buf = dst->view_src ? dst->view_src->buffer : dst->buffer;
     if (dst_buf->iface.cpy_tensor) {
         ggml_backend_moe_cache_invalidate_buffer(
@@ -597,6 +637,7 @@ size_t ggml_backend_get_max_size(ggml_backend_t backend) {
 }
 
 void ggml_backend_tensor_set_async(ggml_backend_t backend, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    ggml_moe_cache_host_restore(data, size);
     GGML_ASSERT(backend);
     GGML_ASSERT(tensor);
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
@@ -614,6 +655,7 @@ void ggml_backend_tensor_set_async(ggml_backend_t backend, struct ggml_tensor * 
 }
 
 void ggml_backend_tensor_get_async(ggml_backend_t backend, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    ggml_moe_cache_host_restore((const char *) tensor->data + offset, size);
     GGML_ASSERT(backend);
     GGML_ASSERT(tensor);
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
@@ -632,6 +674,12 @@ void ggml_backend_tensor_set_2d_async(ggml_backend_t backend, struct ggml_tensor
     GGML_ASSERT(backend);
     GGML_ASSERT(tensor);
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
+
+    if (ggml_moe_cache_has_residents()) {
+        for (size_t i = 0; i < n_copies; ++i) {
+            ggml_moe_cache_host_restore((const char *) data + i * stride_data, size);
+        }
+    }
 
     if (n_copies <= 1 || backend->iface.set_tensor_2d_async == NULL) {
         for (size_t i = 0; i < n_copies; i++) {
@@ -658,6 +706,12 @@ void ggml_backend_tensor_get_2d_async(ggml_backend_t backend, const struct ggml_
     GGML_ASSERT(tensor);
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
 
+    if (ggml_moe_cache_has_residents()) {
+        for (size_t i = 0; i < n_copies; ++i) {
+            ggml_moe_cache_host_restore((const char *) tensor->data + offset + i * stride_tensor, size);
+        }
+    }
+
     if (n_copies <= 1 || backend->iface.get_tensor_2d_async == NULL) {
         for (size_t i = 0; i < n_copies; i++) {
             ggml_backend_tensor_get_async(backend, tensor, (char *) data + i*stride_data, offset + i*stride_tensor, size);
@@ -674,6 +728,7 @@ void ggml_backend_tensor_get_2d_async(ggml_backend_t backend, const struct ggml_
 }
 
 void ggml_backend_tensor_set(struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    ggml_moe_cache_host_restore(data, size);
     GGML_ASSERT(tensor);
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
     GGML_ASSERT(buf != NULL && "tensor buffer not set");
@@ -691,6 +746,7 @@ void ggml_backend_tensor_set(struct ggml_tensor * tensor, const void * data, siz
 }
 
 void ggml_backend_tensor_get(const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    ggml_moe_cache_host_restore((const char *) tensor->data + offset, size);
     GGML_ASSERT(tensor);
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
     GGML_ASSERT(buf != NULL && "tensor buffer not set");
@@ -710,6 +766,12 @@ void ggml_backend_tensor_set_2d(struct ggml_tensor * tensor, const void * data, 
     GGML_ASSERT(tensor);
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
     GGML_ASSERT(buf != NULL && "tensor buffer not set");
+
+    if (ggml_moe_cache_has_residents()) {
+        for (size_t i = 0; i < n_copies; ++i) {
+            ggml_moe_cache_host_restore((const char *) data + i * stride_data, size);
+        }
+    }
 
     if (n_copies <= 1 || buf->iface.set_tensor_2d == NULL) {
         for (size_t i = 0; i < n_copies; i++) {
@@ -735,6 +797,12 @@ void ggml_backend_tensor_get_2d(const struct ggml_tensor * tensor, void * data, 
     GGML_ASSERT(tensor);
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
     GGML_ASSERT(buf != NULL && "tensor buffer not set");
+
+    if (ggml_moe_cache_has_residents()) {
+        for (size_t i = 0; i < n_copies; ++i) {
+            ggml_moe_cache_host_restore((const char *) tensor->data + offset + i * stride_tensor, size);
+        }
+    }
 
     if (n_copies <= 1 || buf->iface.get_tensor_2d == NULL) {
         for (size_t i = 0; i < n_copies; i++) {
@@ -834,6 +902,7 @@ ggml_backend_dev_t ggml_backend_get_device(ggml_backend_t backend) {
 // backend copy
 
 void ggml_backend_tensor_copy(const struct ggml_tensor * src, struct ggml_tensor * dst) {
+    ggml_moe_cache_host_restore(src->data, ggml_nbytes(src));
     GGML_ASSERT(ggml_are_same_layout(src, dst) && "cannot copy tensors with different layouts");
 
     if (src == dst) {
@@ -861,6 +930,7 @@ void ggml_backend_tensor_copy(const struct ggml_tensor * src, struct ggml_tensor
 }
 
 void ggml_backend_tensor_copy_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const struct ggml_tensor * src, struct ggml_tensor * dst) {
+    ggml_moe_cache_host_restore(src->data, ggml_nbytes(src));
     GGML_ASSERT(ggml_are_same_layout(src, dst) && "cannot copy tensors with different layouts");
 
     if (src == dst) {
