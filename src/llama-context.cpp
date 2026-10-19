@@ -3591,6 +3591,7 @@ build_graph:
 
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             if (mtp_scratch_active) {
+                LLAMA_LOG_INFO("%s: MTP KV scratch no longer fits; retrying with serialized compute\n", __func__);
                 mtp_scratch_end();
                 goto build_graph;
             }
@@ -3609,6 +3610,7 @@ build_graph:
         auto preflight = (preflight_fn_t) ggml_backend_reg_get_proc_address(
                 ggml_backend_dev_backend_reg(ggml_backend_get_device(mtp_scratch_backend)), "ggml_backend_cuda_scratch_preflight");
         if (!preflight || !preflight(mtp_scratch_backend, gf)) {
+            LLAMA_LOG_INFO("%s: MTP KV scratch preflight refused; retrying with serialized compute\n", __func__);
             mtp_scratch_end();
             goto build_graph;
         }

@@ -33,7 +33,7 @@
 #include <vector>
 
 static constexpr uint32_t n_vocab = 32, n_embd = 256;
-static size_t scratch_borrows = 0, scratch_releases = 0, compute_shares = 0;
+static size_t scratch_borrows = 0, scratch_releases = 0, scratch_fallbacks = 0, compute_shares = 0;
 
 static void require(bool condition, const char * message) {
     if (!condition) {
@@ -363,6 +363,7 @@ static void run_prefill_identity(llama_model * model, const cache_config & confi
         bool overlap, async, device;
         bool tight = false, scratch = false;
         size_t borrowed = 0;
+        size_t fallbacks = 0;
     };
     std::vector<arm> arms {
         { "legacy", &reference, false, false, false },
@@ -396,8 +397,10 @@ static void run_prefill_identity(llama_model * model, const cache_config & confi
             input.tokens = batch.tokens;
             require(llama_process(variant.ctx->tgt, LLAMA_PROCESS_TYPE_DECODE, input.get()) == 0, "identity target decode");
             const size_t borrowed_before = scratch_borrows;
+            const size_t fallbacks_before = scratch_fallbacks;
             require(common_speculative_process(variant.ctx->spec, input), "identity MTP process");
             variant.borrowed += scratch_borrows - borrowed_before;
+            variant.fallbacks += scratch_fallbacks - fallbacks_before;
         }
         if (std::any_of(batch.tokens.begin(), batch.tokens.end(), [](const common_batch::token & t) { return t.output; })) {
             for (size_t i = 1; i < arms.size(); ++i) {
@@ -468,7 +471,11 @@ static void run_prefill_identity(llama_model * model, const cache_config & confi
     check_state(1);
     for (const auto & variant : arms) {
         if (variant.scratch) {
-            check((variant.borrowed > 0) == borrow, variant, "prefill exercised the expected KV scratch loan or fallback");
+            // Applied-batch plans can fit short tails even in the small cache.
+            // That case must either decline all loans or exercise the real
+            // retry when a subsequent graph outgrows its borrowed chunks.
+            check(borrow ? variant.borrowed > 0 : (variant.borrowed == 0 || variant.fallbacks > 0),
+                    variant, "prefill exercised the expected KV scratch loan or fallback");
         }
     }
 
@@ -530,7 +537,7 @@ static void run_prefill_identity(llama_model * model, const cache_config & confi
     for (size_t i = 0; i < other.size(); ++i) {
         check(save(arms[i].ctx->tgt, 1) == other[i].tgt, arms[i], "restarted slot preserves the other target sequence");
     }
-    printf("PASS %s (%u slots, scratch %s): overlap, async, device, async+device, tight, scratch and tight+scratch match legacy target, draft KV, carry, deferred rows, logits and %u draft rounds; seq_cp, cross-switch cache restore and slot restart\n", config.name, parallel, borrow ? "loan" : "fallback", parallel * 8);
+    printf("PASS %s (%u slots, scratch %s): overlap, async, device, async+device, tight, scratch and tight+scratch match legacy target, draft KV, carry, deferred rows, logits and %u draft rounds; seq_cp, cross-switch cache restore and slot restart\n", config.name, parallel, borrow ? "loan" : "small-cache fallback", parallel * 8);
 }
 
 static void run_case(llama_model * model, const cache_config & config, bool deferred) {
@@ -1097,6 +1104,9 @@ int main(int argc, char ** argv) {
         }
         if (std::strstr(text, "released MTP KV scratch;") != nullptr) {
             ++scratch_releases;
+        }
+        if (std::strstr(text, "retrying with serialized compute") != nullptr) {
+            ++scratch_fallbacks;
         }
         if (level >= (user_data ? GGML_LOG_LEVEL_INFO : GGML_LOG_LEVEL_ERROR)) {
             fputs(text, stderr);
