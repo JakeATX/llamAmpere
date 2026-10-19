@@ -1,4 +1,5 @@
 #include "llama-model.h"
+#include "llama-ple-cache.h"
 
 #include "llama-arch.h"
 #include "llama-ext.h"
@@ -2284,6 +2285,14 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
             return false;
         }
+    }
+
+    if (const char * profile = getenv("LLAMA_PLE_PROFILE"); profile && *profile && per_layer_tok_embd) {
+        if (arch != LLM_ARCH_QWEN4EXP || !can_prefetch.count(per_layer_tok_embd)) {
+            throw std::runtime_error("PLE RAM profile requires a lazily mapped qwen4exp table");
+        }
+        ple_cache = llama_ple_cache::load(per_layer_tok_embd, profile);
+        can_prefetch.erase(per_layer_tok_embd);
     }
 
     // [B1] remember where the expert tensors live in the files, so the layer-major prefill can copy borrowed resident
