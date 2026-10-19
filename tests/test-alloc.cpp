@@ -799,26 +799,6 @@ static void test_scheduler_borrowed_buffer() {
     }
     ggml_backend_sched_ptr sched(ggml_backend_sched_new(&backend_ptr, &buft, 1, 48, false, false));
     uint64_t epoch = ggml_backend_sched_get_alloc_epoch(sched.get());
-    ggml_backend_buffer_ptr small(ggml_backend_buffer_view(parent.get(), 128, 128));
-    ggml_backend_buffer_t uneven[] = {small.get(), view_second.get()};
-    GGML_ASSERT(ggml_backend_sched_set_buffers(sched.get(), backend_ptr, uneven, 2));
-    {
-        auto [ctx, graph, ctx_ptr] = make_context();
-        ggml_tensor * input = make_input_1d(ctx, 96);
-        ggml_tensor * output = ggml_scale(ctx, input, 3.0f);
-        ggml_set_output(output);
-        ggml_build_forward_expand(graph, output);
-        GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), graph));
-        GGML_ASSERT((uint8_t *) input->data >= data.data() + 768);
-        GGML_ASSERT((uint8_t *) input->data + ggml_nbytes(input) <= data.data() + 1280);
-        float values[96];
-        std::fill(values, values + 96, 2.0f);
-        ggml_backend_tensor_set(input, values, 0, sizeof(values));
-        GGML_ASSERT(ggml_backend_sched_graph_compute(sched.get(), graph) == GGML_STATUS_SUCCESS);
-        ggml_backend_tensor_get(output, values, 0, sizeof(values));
-        for (float value : values) { GGML_ASSERT(value == 6.0f); }
-    }
-    ggml_backend_sched_reset(sched.get());
     GGML_ASSERT(ggml_backend_sched_set_buffer(sched.get(), backend_ptr, view.get()));
     GGML_ASSERT(ggml_backend_sched_get_alloc_epoch(sched.get()) != epoch);
     {
@@ -883,6 +863,26 @@ static void test_scheduler_borrowed_buffer() {
         for (int i = 0; i < 96; ++i) {
             GGML_ASSERT(actual[i] == 2.0f * values[i]);
         }
+    }
+    ggml_backend_sched_reset(sched.get());
+    ggml_backend_buffer_ptr small(ggml_backend_buffer_view(parent.get(), 128, 128));
+    ggml_backend_buffer_t uneven[] = {small.get(), view_second.get()};
+    GGML_ASSERT(ggml_backend_sched_set_buffers(sched.get(), backend_ptr, uneven, 2));
+    {
+        auto [ctx, graph, ctx_ptr] = make_context();
+        ggml_tensor * input = make_input_1d(ctx, 96);
+        ggml_tensor * output = ggml_scale(ctx, input, 3.0f);
+        ggml_set_output(output);
+        ggml_build_forward_expand(graph, output);
+        GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), graph));
+        GGML_ASSERT((uint8_t *) input->data >= data.data() + 768);
+        GGML_ASSERT((uint8_t *) input->data + ggml_nbytes(input) <= data.data() + 1280);
+        float values[96];
+        std::fill(values, values + 96, 2.0f);
+        ggml_backend_tensor_set(input, values, 0, sizeof(values));
+        GGML_ASSERT(ggml_backend_sched_graph_compute(sched.get(), graph) == GGML_STATUS_SUCCESS);
+        ggml_backend_tensor_get(output, values, 0, sizeof(values));
+        for (float value : values) { GGML_ASSERT(value == 6.0f); }
     }
     ggml_backend_sched_reset(sched.get());
     GGML_ASSERT(ggml_backend_sched_set_buffer(sched.get(), backend_ptr, view.get()));
