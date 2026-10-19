@@ -32,8 +32,8 @@ llama_moe_output::llama_moe_output(size_t bytes, const char * directory) : size(
         throw std::runtime_error("cannot reserve MoE temporary output file space");
     }
     data = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    close(fd);
-    if (data == MAP_FAILED) { data = nullptr; throw std::runtime_error("cannot map MoE temporary output file"); }
+    if (data == MAP_FAILED) { close(fd); data = nullptr; throw std::runtime_error("cannot map MoE temporary output file"); }
+    file = fd;
     madvise(data, size, MADV_SEQUENTIAL);
 #else
     (void)directory;
@@ -50,9 +50,39 @@ void llama_moe_output::flush() {
 #endif
 }
 
+void llama_moe_output::release(size_t offset, size_t bytes) {
+    if (offset > size || bytes > size - offset) {
+        throw std::out_of_range("MoE temporary output release exceeds allocation");
+    }
+    if (!bytes) { return; }
+#ifndef _WIN32
+    const long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) { throw std::runtime_error("cannot query page size"); }
+    const size_t page = (size_t) page_size;
+    const size_t begin = offset - offset % page;
+    const size_t end = offset + bytes;
+    const size_t padding = end % page ? page - end % page : 0;
+    if (padding > SIZE_MAX - end || end + padding > (size_t) INT64_MAX) {
+        throw std::out_of_range("MoE temporary output page range overflow");
+    }
+    const size_t length = end + padding - begin;
+    // Call only after the backend has completed all writes to these pages.
+    if (msync((char *) data + begin, length, MS_SYNC) != 0 ||
+            madvise((char *) data + begin, length, MADV_DONTNEED) != 0) {
+        throw std::runtime_error("cannot release completed MoE output pages");
+    }
+#ifdef __linux__
+    if (posix_fadvise(file, begin, length, POSIX_FADV_DONTNEED) != 0) {
+        throw std::runtime_error("cannot release MoE output file cache");
+    }
+#endif
+#endif
+}
+
 llama_moe_output::~llama_moe_output() {
 #ifndef _WIN32
     if (data) { munmap(data, size); }
+    if (file >= 0) { close(file); }
 #endif
 }
 

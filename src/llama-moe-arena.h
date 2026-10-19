@@ -11,9 +11,12 @@ struct llama_moe_output {
     llama_moe_output(const llama_moe_output &) = delete;
     llama_moe_output & operator=(const llama_moe_output &) = delete;
     void flush();
+    void release(size_t offset, size_t bytes);
     void * data = nullptr;
     size_t size = 0;
     bool dirty = true;
+private:
+    int file = -1;
 };
 
 // fork: one physical allocation, with strided views of unchanged expert blocks.

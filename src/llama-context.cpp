@@ -4560,6 +4560,14 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
                 GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
                 ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
+                const char * reclaim = getenv("LLAMA_MOE_OUTPUT_RECLAIM");
+                if (output_file && reclaim && strcmp(reclaim, "1") == 0) {
+                    ggml_backend_sched_synchronize(sched.get());
+                    const size_t begin = (const char *) embd_nextn_out - (const char *) output_file->data;
+                    output_file->release(begin, (size_t) n_rows * n_embd * sizeof(float));
+                    LLAMA_LOG_DEBUG("%s: released completed MTP output offset=%zu bytes=%zu\n", __func__,
+                            begin, (size_t) n_rows * n_embd * sizeof(float));
+                }
                 extract_all_idxs = extract_all_idxs || !masked;
             }
         }
