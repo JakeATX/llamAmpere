@@ -2602,6 +2602,38 @@ float * llama_context::get_embeddings_nextn() {
     return embd_nextn.data;
 }
 
+bool llama_context::copy_embeddings_nextn(float * dst, int32_t first, int32_t count) {
+    const size_t width = model.hparams.n_embd_out();
+    if (cparams.embeddings_nextn_masked || first < 0 || count < 0 || !width || !embd_nextn.data ||
+            (count && !dst) || (size_t) first > embd_nextn.size / width ||
+            (size_t) count > embd_nextn.size / width - first) { return false; }
+    const float * data = get_embeddings_nextn();
+    if (count) { memcpy(dst, data + (size_t) first * width, (size_t) count * width * sizeof(float)); }
+    return true;
+}
+
+bool llama_context::release_embeddings_nextn(int32_t first, int32_t count) {
+    const char * reclaim = getenv("LLAMA_MOE_OUTPUT_RECLAIM");
+    if (!output_file || !reclaim || strcmp(reclaim, "1") != 0) { return true; }
+    const size_t width = model.hparams.n_embd_out();
+    if (cparams.embeddings_nextn_masked || first < 0 || count < 0 || !width ||
+            (size_t) first > embd_nextn.size / width || (size_t) count > embd_nextn.size / width - first) {
+        LLAMA_LOG_ERROR("%s: invalid unmasked output range\n", __func__);
+        return false;
+    }
+    synchronize();
+    output_reorder();
+    try {
+        const size_t begin = (const char *) (embd_nextn.data + (size_t) first * width) - (const char *) output_file->data;
+        output_file->release(begin, (size_t) count * width * sizeof(float));
+        LLAMA_LOG_DEBUG("%s: released consumed MTP output rows=%d bytes=%zu\n", __func__, count, (size_t) count * width * sizeof(float));
+        return true;
+    } catch (const std::exception & error) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, error.what());
+        return false;
+    }
+}
+
 float * llama_context::get_embeddings_nextn_ith(int32_t i) {
     output_reorder();
     if (output_file) { output_file->flush(); }
@@ -8212,6 +8244,16 @@ float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {
     ctx->synchronize();
 
     return ctx->get_embeddings_nextn_ith(i);
+}
+
+bool llama_release_embeddings_nextn(llama_context * ctx, int32_t first, int32_t count) {
+    return ctx && ctx->release_embeddings_nextn(first, count);
+}
+
+bool llama_copy_embeddings_nextn(llama_context * ctx, float * dst, int32_t first, int32_t count) {
+    if (!ctx) { return false; }
+    ctx->synchronize();
+    return ctx->copy_embeddings_nextn(dst, first, count);
 }
 
 float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {

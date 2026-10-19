@@ -2144,14 +2144,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             defer.seq.resize(k0 + n_tokens);
             defer.embd.resize((k0 + n_tokens) * (size_t) n_embd);
 
-            const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt) + (size_t) output_offset * n_embd;
             for (int k = 0; k < n_tokens; ++k) {
                 defer.tok[k0 + k] = batch_in.token[k];
                 defer.pos[k0 + k] = batch_in.pos[k];
                 defer.seq[k0 + k] = batch_in.seq_id[k][0];
                 // shift the tgt embeddings to the right by one position (see the non-deferred path)
                 if (k > 0) {
-                    std::memcpy(defer.embd.data() + (k0 + k) * (size_t) n_embd, h_tgt + (size_t) (k - 1) * n_embd, row_bytes);
+                    if (!llama_copy_embeddings_nextn(ctx_tgt, defer.embd.data() + (k0 + k) * (size_t) n_embd,
+                                output_offset + k - 1, 1)) { return false; }
                 }
             }
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
@@ -2165,7 +2165,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 return false;
             }
 
-            const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt) + (size_t) output_offset * n_embd;
             auto * mem_dft = llama_get_memory(ctx_dft);
 
             bool ok = true;
@@ -2187,8 +2186,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                         common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { batch_in.seq_id[k][0] }, 0);
                     }
                     const int32_t skip = first == 0 ? 1 : 0;
-                    std::memcpy(batch.embd + (size_t) skip * n_embd,
-                            h_tgt + (size_t) (first + skip - 1) * n_embd, row_bytes * (count - skip));
+                    if (count > skip && !llama_copy_embeddings_nextn(ctx_tgt, batch.embd + (size_t) skip * n_embd,
+                                output_offset + first + skip - 1, count - skip)) { return false; }
                     for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                         const int32_t i = i_batch_beg[seq_id] - first;
                         if (i >= 0 && i < count) {
@@ -2229,11 +2228,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             verify_h_rows[seq_id] = n_rows;
             verify_h_beg[seq_id] = output_offset + i_batch_beg[seq_id];
 
-            std::memcpy(pending_h[seq_id].data(),
-                    llama_get_embeddings_nextn_ith(ctx_tgt, output_offset + i_batch_end[seq_id]), row_bytes);
+            if (!llama_copy_embeddings_nextn(ctx_tgt, pending_h[seq_id].data(), output_offset + i_batch_end[seq_id], 1)) { return false; }
         }
 
-        return true;
+        return llama_release_embeddings_nextn(ctx_tgt, output_offset, n_tokens);
     }
 
     // [#72] LLAMA_SPEC_DRAFT_TEMP_MULT=<x>: the p/q drafter samples at x times the request's temperature (default 1).
@@ -2876,8 +2874,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
-        const size_t row_bytes = (size_t) n_embd * sizeof(float);
-        std::memcpy(pending_h[seq_id].data(), llama_get_embeddings_nextn_ith(params.ctx_tgt, verify_h_beg[seq_id] + i_h), row_bytes);
+        GGML_ASSERT(llama_copy_embeddings_nextn(params.ctx_tgt, pending_h[seq_id].data(), verify_h_beg[seq_id] + i_h, 1));
     }
 };
 
