@@ -539,6 +539,11 @@ static __global__ void lightning_indexer_kernel_vec(
     }
 }
 
+// fork: retain finite float keys that cannot be represented by the tile's half storage.
+static __device__ __forceinline__ float lightning_indexer_key_f32(float value) {
+    return fabsf(value) <= 65504.0f ? __half2float(__float2half(value)) : value;
+}
+
 // one block scores a tile of K_VECS_PER_BLOCK keys against TOKENS_PER_BLOCK tokens: the keys are
 // staged in half precision and the queries of every head in float, each thread owns KEYS_PER_THREAD
 // keys for one token, a warp shares its token so the query reads are broadcasts, and every key
@@ -576,6 +581,8 @@ static __global__ void lightning_indexer_kernel_tile(
     __shared__ float2 q_shared[HEADS_PER_PASS][TOKENS_PER_BLOCK][N_EMBD_H2];
     __shared__ float w_shared[N_HEAD][TOKENS_PER_BLOCK];
 
+    bool key_overflow = false;
+
     // phase 1 - stage the key tile four elements at a time, rows past n_kv are zero
 
 #pragma unroll
@@ -594,6 +601,8 @@ static __global__ void lightning_indexer_kernel_tile(
                 float4 v;
                 if constexpr (TYPE_K == GGML_TYPE_F32) {
                     v = ((const float4 *) k_row)[c4];
+                    key_overflow |= !(fabsf(v.x) <= 65504.0f && fabsf(v.y) <= 65504.0f &&
+                                      fabsf(v.z) <= 65504.0f && fabsf(v.w) <= 65504.0f);
                 } else {
                     constexpr dequantize_V_t dequantize_k = get_dequantize_V<TYPE_K, float, 4>();
                     dequantize_k(k_row, &v, c4 * 4);
@@ -615,6 +624,7 @@ static __global__ void lightning_indexer_kernel_tile(
         w_shared[h][r] = start_batch + r < n_batch ?
             ((const float *) ((const char *) W + (start_batch + r)*nbw1 + i_stream*nbw3))[h] : 0.0f;
     }
+
 
     const int kl = tid % KEY_LANES;
     const int tl = tid / KEY_LANES;
@@ -645,7 +655,35 @@ static __global__ void lightning_indexer_kernel_tile(
             q_shared[h][r][2*c4 + 1] = make_float2(v.z, v.w);
         }
 
-        __syncthreads();
+        if constexpr (TYPE_K == GGML_TYPE_F32) {
+            // fork: only exceptional tiles read keys directly; preserve normal half rounding in mixed tiles.
+            if (__syncthreads_or(key_overflow)) {
+                for (int i = tid; i < TOKENS_PER_BLOCK * K_VECS_PER_BLOCK; i += THREADS_PER_BLOCK) {
+                    const int token = i / K_VECS_PER_BLOCK;
+                    const int i_batch = start_batch + token;
+                    const int i_kv = start_kv + i % K_VECS_PER_BLOCK;
+                    if (i_batch >= n_batch || i_kv >= n_kv) {
+                        continue;
+                    }
+                    const float * k_row = (const float *) (K + i_kv*nbk2 + i_stream*nbk3);
+                    float score = 0.0f;
+                    for (int h = 0; h < N_HEAD; ++h) {
+                        const float * q_row = (const float *) ((const char *) Q + h*nbq1 + i_batch*nbq2 + i_stream*nbq3);
+                        float dot = 0.0f;
+                        for (int c = 0; c < N_EMBD; ++c) {
+                            dot = fmaf(lightning_indexer_key_f32(k_row[c]), q_row[c], dot);
+                        }
+                        score += fmaxf(dot, 0.0f) * w_shared[h][token];
+                    }
+                    const half * mask = (const half *) ((const char *) M + i_batch*nbm1 + (i_stream%nem3)*nbm3);
+                    float * out = (float *) ((char *) dst + i_batch*nb1 + i_stream*nb3);
+                    out[i_kv] = score + lightning_indexer_mask(mask, i_kv, mrange);
+                }
+                return;
+            }
+        } else {
+            __syncthreads();
+        }
 
         // phase 4 - float products of the widened keys for the heads of this pass
 
@@ -698,7 +736,7 @@ static __global__ void lightning_indexer_kernel_tile(
 }
 
 // fork (opt-in GGML_CUDA_LID_EXACT=1): the tile kernel's arithmetic for float32 keys in a register-blocked layout.
-// Same numbers bit for bit: each key element is rounded to half and widened back, each query-head-key product is
+// Same numbers bit for bit: representable key elements are rounded to half and widened back, each query-head-key product is
 // one fmaf chain over the 128 elements in order, and the ReLU-weight sum and mask add are the same expressions.
 // A block scores 32 tokens x 128 keys and each thread 2 tokens x 4 heads x 8 keys, so one shared load feeds
 // 16 products (the tile kernel: 2-4) and each key tile is read once per 32 tokens (the tile kernel: per 8).
@@ -763,10 +801,10 @@ static __global__ void __launch_bounds__(256, 2) lightning_indexer_kernel_exact(
             if (start_kv + r < n_kv) {
                 kv = *(const float4 *) (K + stream*nbk3 + (start_kv + r)*nbk2 + (e0 + c)*sizeof(float));
             }
-            k_s[c + 0][r] = __half2float(__float2half(kv.x));
-            k_s[c + 1][r] = __half2float(__float2half(kv.y));
-            k_s[c + 2][r] = __half2float(__float2half(kv.z));
-            k_s[c + 3][r] = __half2float(__float2half(kv.w));
+            k_s[c + 0][r] = lightning_indexer_key_f32(kv.x);
+            k_s[c + 1][r] = lightning_indexer_key_f32(kv.y);
+            k_s[c + 2][r] = lightning_indexer_key_f32(kv.z);
+            k_s[c + 3][r] = lightning_indexer_key_f32(kv.w);
         }
         __syncthreads();
 
