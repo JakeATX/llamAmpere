@@ -4,6 +4,13 @@ R=Path('/mnt/models/fnprefetch');P=R/'protocol'
 assert os.environ['PARENT_HOLDS_GPU_LOCK']=='1'
 gate=json.loads((R/'logs/followup-gate-complete.json').read_text())
 frozen=Path(gate['frozen']); baseline=Path(gate['baseline'])
+baseline_regression=Path(os.environ.get('FN_BASELINE_REGRESSION','/mnt/models/fnship/artifacts/fix-41-regression-r1/result.json'))
+regression=json.loads(baseline_regression.read_text())
+assert regression['status']=='passed' and regression['source_commit'].startswith(baseline.parent.name)
+assert regression['steps'] and all(step['returncode']==0 for step in regression['steps'])
+baseline_guard=baseline_regression.parent.parent/(baseline_regression.parent.name+'-guard.json')
+guard=json.loads(baseline_guard.read_text());assert guard['returncode']==0 and guard['guard'] is None
+baseline_proof={str(p):hashlib.file_digest(p.open('rb'),'sha256').hexdigest() for p in (baseline_regression,baseline_guard)}
 plan=R/'protocol/selection-plan.json'
 assert not plan.exists(),'selection already started; use its saved outcome'
 settings=json.loads(Path('/mnt/models/fnfast/ship-d28/bench-env.json').read_text())
@@ -12,7 +19,7 @@ shutil.copy2('/mnt/models/fnfast/cache/usage-c11-from-handoff5.bin',profile)
 settings.update(FN_PROFILE_LOAD=str(profile),FN_RUNNER=str(Path(__file__).resolve().parent/'control.py'),FN_CELL_TIMEOUT='580',FN_LIMIT='530',FN_TOKENS='128',FN_TEMP='1',FN_RESERVE_MB='2560',FN_STACKS='0',FN_DEVICE_FUSED='0',FN_REQUIRE_SINGLE_B1='0')
 runner=R/'protocol/frozen-selection-control.py'
 shutil.copy2(Path(__file__).resolve().parent/'control.py',runner)
-manifest={'candidate':str(frozen),'baseline':str(baseline),'runner_sha256':hashlib.file_digest(runner.open('rb'),'sha256').hexdigest(),'profile_sha256':hashlib.file_digest(profile.open('rb'),'sha256').hexdigest(),'settings':settings,'prompt_tokens':4096,'generated_tokens':128,'purpose':'development selection only; no full speed claim'}
+manifest={'candidate':str(frozen),'baseline':str(baseline),'runner_sha256':hashlib.file_digest(runner.open('rb'),'sha256').hexdigest(),'profile_sha256':hashlib.file_digest(profile.open('rb'),'sha256').hexdigest(),'settings':settings,'prompt_tokens':4096,'generated_tokens':128,'purpose':'development selection only; no full speed claim','baseline_regression':baseline_proof}
 plan.write_text(json.dumps(manifest,indent=2)); deadline=time.monotonic()+540
 results=[]
 def run(label,device,mode,binary):
