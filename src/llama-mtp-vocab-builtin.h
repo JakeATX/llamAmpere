@@ -10,8 +10,9 @@
 // A list is ranked on one base model's generations, but the draft head it indexes is a row set of the
 // tokenizer, so every quantization and fine-tune of that base shares it. The match is on the tokenizer
 // itself (fingerprint of every token string and every BPE merge, in order) plus the architecture, never
-// on the file name or `general.name`: quantizers rename models freely, and a different model class with
-// the same tokenizer was not ranked by this list.
+// on the file name or `general.name`: quantizers rename models freely, and a different architecture does
+// not match by fingerprint alone. Flash-Next (qwen4exp) uses the Qwen3.8-27B tokenizer, so its rows
+// point at those bitmaps under arch qwen4exp.
 //
 // Fingerprint: FNV-1a 64 over each token text followed by a NUL byte (ids 0..n_vocab-1), one 0x01 byte,
 // then each merge ("left right", rank order, empty string for a rank with no merge) followed by a NUL.

@@ -4672,7 +4672,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format(
             "KV cache data type for K for the draft model\n"
             "allowed values: %s\n"
-            "(default: the main model's K cache type from -ctk; %s for an MTP drafter over a SJ-KVaRN trunk; pass f16 to force f16)",
+            "(default: the main model's K cache type from -ctk; %s for an MTP drafter over a SJ-KVaRN trunk, including a separate MTP draft file; a quantized trunk is copied instead of f16; pass f16 to force f16)",
             get_all_kv_cache_types().c_str(), ggml_type_name(COMMON_SJKVARN_MTP_DRAFT_KV[0])
         ),
         [](common_params & params, const std::string & value) {
@@ -4684,7 +4684,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format(
             "KV cache data type for V for the draft model\n"
             "allowed values: %s\n"
-            "(default: the main model's V cache type from -ctv; %s for an MTP drafter over a SJ-KVaRN trunk; pass f16 to force f16)",
+            "(default: the main model's V cache type from -ctv; %s for an MTP drafter over a SJ-KVaRN trunk, including a separate MTP draft file; a quantized trunk is copied instead of f16; pass f16 to force f16)",
             get_all_kv_cache_types().c_str(), ggml_type_name(COMMON_SJKVARN_MTP_DRAFT_KV[1])
         ),
         [](common_params & params, const std::string & value) {

@@ -3891,10 +3891,13 @@ common_params common_base_params_to_speculative(const common_params & params) {
     // A SJ-KVaRN trunk cannot be inherited (see below) and would leave the drafter on the plain F16 cache, so an unset
     // draft type defaults to COMMON_SJKVARN_MTP_DRAFT_KV there (tq5_0 K / turbo4 V: the fused attention path at every
     // MTP width 1-8; tq6_0/tq6_0 at width 5 takes the slow f16-convert route unless GGML_SLOWKV is set).
-    // MTP drafter only (no separate draft model): the fused tq5_0/turbo4 route needs D = 256, and a -md / EAGLE3 /
-    // DFlash draft model of another head size keeps the plain cache. A trunk that is SJ-KVaRN on one side only fails
-    // the SJ-KVaRN pair check before this runs.
-    const bool sj_kvarn_mtp_default = !has_draft;
+    // The fused route needs D = 256. A built-in MTP head has that size, and so does a separate MTP file
+    // (-md plus draft-mtp / draft-mtp-adaptive: that context is LLAMA_CONTEXT_TYPE_MTP). Flash-Next loads the
+    // head as -md, so has_draft is true and the old !has_draft test left the draft cache at the plain f16
+    // -ctk sjkvarnN stores. A non-MTP separate draft (EAGLE3 / DFlash, or -md with no MTP type) keeps the plain
+    // cache, because its head size may not be 256. A trunk that is SJ-KVaRN on one side only fails the pair
+    // check before this runs.
+    const bool sj_kvarn_mtp_default = spec_mtp || !has_draft;
     if (sj_kvarn_mtp_default && params.sj_kvarn_bits_k > 0 && params_spec.cache_type_k == GGML_TYPE_COUNT) {
         result.cache_type_k = COMMON_SJKVARN_MTP_DRAFT_KV[0];
         result.speculative.draft.cache_type_sj_kvarn_default = true;
@@ -3902,6 +3905,16 @@ common_params common_base_params_to_speculative(const common_params & params) {
     if (sj_kvarn_mtp_default && params.sj_kvarn_bits_v > 0 && params_spec.cache_type_v == GGML_TYPE_COUNT) {
         result.cache_type_v = COMMON_SJKVARN_MTP_DRAFT_KV[1];
         result.speculative.draft.cache_type_sj_kvarn_default = true;
+    }
+    // A quantized trunk must not leave an unset draft cache at f16 (q8_0/q8_0 trunk -> q8_0 draft).
+    // Inheritance above already copies that trunk type. This is the backstop if a later default wrote f16.
+    // Explicit -ctkd/-ctvd f16 still wins (the flag is not GGML_TYPE_COUNT). SJ-KVaRN's plain trunk type is
+    // f16, and ggml_is_quantized(F16) is false, so this does not replace the tq5_0/turbo4 default.
+    if (params_spec.cache_type_k == GGML_TYPE_COUNT && result.cache_type_k == GGML_TYPE_F16 && ggml_is_quantized(params.cache_type_k)) {
+        result.cache_type_k = params.cache_type_k;
+    }
+    if (params_spec.cache_type_v == GGML_TYPE_COUNT && result.cache_type_v == GGML_TYPE_F16 && ggml_is_quantized(params.cache_type_v)) {
+        result.cache_type_v = params.cache_type_v;
     }
     // The first block-streaming implementation owns only the target cache.
     // MTP keeps its ordinary cache until both contexts can share one pool.
