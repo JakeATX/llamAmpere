@@ -381,6 +381,7 @@ struct moe_cache_session {
     uint64_t device_adapt_scopes = 0;
     uint64_t device_adapt_interval = 64;
     size_t device_adapt_copy_cap = 64u << 20;
+    bool device_publish_async = false;
     // One stream for idle-boundary expert copies. Payloads finish before the
     // address tables are published and before the next graph is launched.
     cudaStream_t device_adapt_stream = nullptr;
@@ -5108,7 +5109,7 @@ static void moe_cache_device_adapt(moe_cache_session & session) {
         for (const auto & entry : session.device_tables) {
             max_experts = std::max(max_experts, entry.second.addresses.size());
         }
-        std::vector<uint8_t> hot(max_experts);
+        std::vector<uint8_t> hot(session.device_publish_async ? recent.size() : max_experts);
         for (auto & pool : device.pools) {
             pool->free_slots.reserve(pool->n_slots);
         }
@@ -5252,25 +5253,36 @@ static void moe_cache_device_adapt(moe_cache_session & session) {
                 }
             }
         }
+        const bool publish_async = session.device_publish_async && session.device_adapt_stream;
+        auto publish = [&](void * destination, const void * source, size_t bytes) {
+            if (publish_async) {
+                CUDA_CHECK(cudaMemcpyAsync(destination, source, bytes, cudaMemcpyHostToDevice, session.device_adapt_stream));
+            } else {
+                CUDA_CHECK(cudaMemcpy(destination, source, bytes, cudaMemcpyHostToDevice));
+            }
+        };
         for (auto * table : changed) {
             // Captured graphs retain this allocation; only its entries change.
-            CUDA_CHECK(cudaMemcpy(table->device, table->addresses.data(),
-                    table->addresses.size() * sizeof(void *), cudaMemcpyHostToDevice));
+            publish(table->device, table->addresses.data(), table->addresses.size() * sizeof(void *));
             if (table->staging_device) {
-                CUDA_CHECK(cudaMemcpy(table->staging_device, table->addresses.data(),
-                        table->addresses.size() * sizeof(void *), cudaMemcpyHostToDevice));
+                publish(table->staging_device, table->addresses.data(), table->addresses.size() * sizeof(void *));
             }
             if (table->hot) {
+                uint8_t * table_hot = hot.data() + (publish_async ? table->count_offset : 0);
                 for (size_t e = 0; e < table->addresses.size(); ++e) {
-                    hot[e] = table->addresses[e] != table->fallback[e];
+                    table_hot[e] = table->addresses[e] != table->fallback[e];
                 }
-                CUDA_CHECK(cudaMemcpy(table->hot, hot.data(), table->addresses.size(), cudaMemcpyHostToDevice));
+                publish(table->hot, table_hot, table->addresses.size());
             }
         }
-        MOE_CACHE_LOG("[moe-cache] device adaptation: scopes=%llu counter_bytes=%zu fills=%d copied_bytes=%zu cap_bytes=%zu fallback_staging_bytes=%zu fallback_skips=%d pinned_source_bytes=%zu original_source_bytes=%zu elapsed_ms=%.3f; stable tables\n",
+        // All host rows and slot addresses stay live until publication finishes.
+        if (publish_async) {
+            CUDA_CHECK(cudaStreamSynchronize(session.device_adapt_stream));
+        }
+        MOE_CACHE_LOG("[moe-cache] device adaptation: scopes=%llu counter_bytes=%zu fills=%d copied_bytes=%zu cap_bytes=%zu fallback_staging_bytes=%zu fallback_skips=%d pinned_source_bytes=%zu original_source_bytes=%zu elapsed_ms=%.3f; stable tables publish_async=%d\n",
                 (unsigned long long)session.device_adapt_scopes,
                 recent.size() * sizeof(recent[0]), fills, copied, copy_limit,
-                session.device_fallback_staging_bytes, fallback_skips, pinned_source_bytes, original_source_bytes, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+                session.device_fallback_staging_bytes, fallback_skips, pinned_source_bytes, original_source_bytes, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(), publish_async);
     } catch (const std::bad_alloc &) {
         MOE_CACHE_LOG("[moe-cache] device adaptation skipped: host allocation failed\n");
     }
@@ -5569,6 +5581,7 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
     if (moe_cache_env_i64("GGML_MOE_CACHE_DEVICE_ADAPT_MB", 1, 1024, adaptation_value)) {
         session->device_adapt_copy_cap = (size_t) adaptation_value << 20;
     }
+    session->device_publish_async = moe_cache_env_i64("GGML_MOE_CACHE_DEVICE_PUBLISH_ASYNC", 0, 1, adaptation_value) && adaptation_value;
     MOE_CACHE_LOG("[moe-cache] device adaptation policy: interval_scopes=%llu cap_bytes=%zu; recent-generation-counts only\n",
             (unsigned long long) session->device_adapt_interval, session->device_adapt_copy_cap);
     auto & device = *session->devices[0];

@@ -4978,6 +4978,18 @@ int main(int argc, char ** argv) {
         }
         return 1;
     }
+    if (argc == 2 && strcmp(argv[1], "--device-publish-async-only") == 0) {
+        const char * previous = getenv("GGML_MOE_CACHE_DEVICE_PUBLISH_ASYNC");
+        const std::string saved = previous ? previous : "";
+        set_env("GGML_MOE_CACHE_DEVICE_PUBLISH_ASYNC", "1");
+        bool ok = provider_is_cuda && run_device_adaptation(gpu, cpu, capture, true, false, true);
+        ok &= capture.get().find("publish_async=1") != std::string::npos;
+        ok &= provider_is_cuda && run_device_adaptation_starvation(gpu, cpu, capture);
+        set_env("GGML_MOE_CACHE_DEVICE_PUBLISH_ASYNC", previous ? saved.c_str() : nullptr);
+        ggml_backend_free(gpu);
+        ggml_backend_free(cpu);
+        return !provider_is_cuda ? 77 : ok ? 0 : 1;
+    }
     if (argc == 2 && strcmp(argv[1], "--device-adaptation-starvation-only") == 0) {
         const bool ok = provider_is_cuda && run_device_adaptation_starvation(gpu, cpu, capture);
         ggml_backend_free(gpu);
