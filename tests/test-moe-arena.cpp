@@ -65,7 +65,15 @@ static bool test_reclaimable_output(bool cuda = false) {
         ok &= mincore(data, bytes, resident.data()) == 0;
         for (unsigned char page : resident) { ok &= (page & 1) == 0; }
         ok &= madvise(data, bytes, MADV_DONTNEED) == 0;
-        for (size_t i = 0; i < bytes / sizeof(*data); ++i) { ok &= data[i] == uint32_t(i * 2654435761u); }
+        constexpr size_t chunk = 1ull << 20;
+        for (size_t begin = 0; begin < bytes; begin += chunk) {
+            for (size_t i = begin / 4; i < (begin + chunk) / 4; ++i) { ok &= data[i] == uint32_t(i * 2654435761u); }
+            output.release(begin, chunk);
+        }
+        ok &= mincore(data, bytes, resident.data()) == 0;
+        for (unsigned char page : resident) { ok &= (page & 1) == 0; }
+        // A later verification row remains exact after the helper consumed its chunk.
+        ok &= data[12345] == uint32_t(12345u * 2654435761u);
         data[0] = 0x7fc12345;
         output.dirty = true;
         output.release(0, sizeof(*data));

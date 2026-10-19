@@ -169,6 +169,12 @@ LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
 // LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
 LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int32_t i);
 
+// Release completed file-backed rows from RAM; later getters retain the original bytes.
+extern "C" LLAMA_API bool llama_release_embeddings_nextn(struct llama_context * ctx, int32_t first, int32_t count);
+
+// Copy unmasked rows without exposing the backing storage to the MTP driver.
+extern "C" LLAMA_API bool llama_copy_embeddings_nextn(struct llama_context * ctx, float * dst, int32_t first, int32_t count);
+
 // Set whether the context outputs the input embeddings of a specific layer
 LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);
 

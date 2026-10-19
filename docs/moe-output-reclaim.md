@@ -6,4 +6,6 @@ After each batch's device-to-host copy, the scheduler is synchronized before any
 
 Partial pages can overlap adjacent output rows. All scheduled writes finish before the page-aligned flush and release, so neighboring bytes are preserved. The usual final output flush remains in place. The opt-in is off by default, and allocations smaller than the existing file-backed threshold are unchanged.
 
+The MTP driver's `process_range` also releases consumed rows after all helper heads and carry copies complete. This bounds refaulted activation pages during helper prefill. The verification indices remain valid: a later accept reads the same bytes from the retained file mapping.
+
 `test-moe-arena` covers exact arbitrary float bits after unaligned release, empty and invalid ranges, subsequent writes, and absence of resident file pages before refault. `test-moe-arena --cuda-output` additionally covers asynchronous CUDA output copying and completion before release. These operator checks do not establish full-model quality, saved-cache reload, memory fit, or speed.

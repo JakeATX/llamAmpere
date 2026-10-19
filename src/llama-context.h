@@ -121,6 +121,8 @@ struct llama_context {
 
     float * get_embeddings_nextn();
     float * get_embeddings_nextn_ith(int32_t i);
+    bool copy_embeddings_nextn(float * dst, int32_t first, int32_t count);
+    bool release_embeddings_nextn(int32_t first, int32_t count);
 
     float * get_embeddings_layer_inp(uint32_t lid);
 
