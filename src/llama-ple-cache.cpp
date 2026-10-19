@@ -6,6 +6,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <fstream>
+#include <iterator>
 #include <stdexcept>
 
 #ifndef _WIN32
@@ -108,22 +109,25 @@ std::unique_ptr<llama_ple_cache> llama_ple_cache::load(const ggml_tensor * tenso
 void llama_ple_cache::save_miss_profile(const int32_t * indices, size_t count) const {
     if (miss_profile.empty()) { return; }
     std::lock_guard<std::mutex> lock(miss_mutex);
-    auto expanded = rows;
+    std::vector<int32_t> additional;
     for (size_t i = 0; i < count; ++i) {
-        if (indices[i] >= 0 && indices[i] < full_rows) { expanded.push_back(indices[i]); }
+        if (indices[i] >= 0 && indices[i] < full_rows && !std::binary_search(rows.begin(), rows.end(), indices[i])) {
+            additional.push_back(indices[i]);
+        }
     }
-    std::sort(expanded.begin(), expanded.end());
-    expanded.erase(std::unique(expanded.begin(), expanded.end()), expanded.end());
+    std::sort(additional.begin(), additional.end());
+    additional.erase(std::unique(additional.begin(), additional.end()), additional.end());
+    const size_t expanded_count = rows.size() + additional.size();
     std::ofstream output(miss_profile);
     output << "LLAMA_PLE_ROWS_V1 " << int(tensor->type) << ' ' << tensor->ne[0] << ' ' << full_rows << ' '
-           << tensor->nb[1] << ' ' << expanded.size() << '\n';
-    for (int32_t row : expanded) { output << row << '\n'; }
+           << tensor->nb[1] << ' ' << expanded_count << '\n';
+    std::merge(rows.begin(), rows.end(), additional.begin(), additional.end(), std::ostream_iterator<int32_t>(output, "\n"));
     output.close();
     if (!output) {
         LLAMA_LOG_ERROR("%s: cannot save PLE miss profile to %s\n", __func__, miss_profile.c_str());
     } else {
         LLAMA_LOG_INFO("%s: saved %zu startup rows to %s; includes this failed batch, not future coverage\n",
-                __func__, expanded.size(), miss_profile.c_str());
+                __func__, expanded_count, miss_profile.c_str());
     }
 }
 
