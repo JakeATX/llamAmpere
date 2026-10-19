@@ -5,6 +5,8 @@
 //
 //   test-sjkvarn-attn            runs the built-in cases, then the seq_rm gate
 //   test-sjkvarn-attn n_q N n_groups cap [nh hkv]
+//   test-sjkvarn-attn --resident   CUDA resident/RAM body parity and byte round trips
+//   test-sjkvarn-attn --resident-tq6   same CUDA parity with TQ6 staging and an independent F16 sink
 //   test-sjkvarn-attn --seq-rm [out.gguf]   seq_rm against the sealed boundary on a generated CPU model
 
 #include "ggml.h"
@@ -34,7 +36,174 @@
 
 struct cfg { int n_q, N, n_groups, cap, nh, hkv; };
 
-static int run_case(const cfg & c, uint32_t seed, ggml_type staging_type = GGML_TYPE_F16, bool f16_sink = false) {
+static int run_resident_graph(ggml_tensor * source, int n_groups, size_t record_bytes) {
+    using resident_buft_fn = ggml_backend_buffer_type_t (*)(ggml_backend_dev_t, size_t, uint32_t);
+    ggml_backend_load_all();
+    ggml_backend_dev_t device = nullptr;
+    resident_buft_fn resident_buft = nullptr;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t candidate = ggml_backend_dev_get(i);
+        auto fn = reinterpret_cast<resident_buft_fn>(ggml_backend_reg_get_proc_address(
+                ggml_backend_dev_backend_reg(candidate), "ggml_backend_cuda_qsa_resident_buffer_type"));
+        if (fn) {
+            device = candidate;
+            resident_buft = fn;
+            break;
+        }
+    }
+    if (!resident_buft) {
+        fprintf(stderr, "FAIL: CUDA QSA resident buffer procedure unavailable\n");
+        return 1;
+    }
+    ggml_backend_t backend = ggml_backend_dev_init(device, nullptr);
+    if (!backend) {
+        fprintf(stderr, "FAIL: initialize CUDA backend\n");
+        return 1;
+    }
+    const size_t group_bytes = record_bytes*source->src[1]->ne[2];
+    const size_t body_bytes = ggml_nbytes(source->src[5]);
+    const std::vector<uint8_t> saved(static_cast<uint8_t *>(source->src[5]->data),
+                                    static_cast<uint8_t *>(source->src[5]->data) + body_bytes);
+    int failures = 0;
+    if (resident_buft(device, group_bytes, 0) != nullptr) {
+        fprintf(stderr, "FAIL: resident buffer accepts zero resident groups\n");
+        ++failures;
+    }
+    for (uint32_t capacity : { 1u, 3u, static_cast<uint32_t>(n_groups) }) {
+        ggml_init_params ip = { 24*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
+        ggml_context * ctx = ggml_init(ip);
+        ggml_context * body_ctx = ggml_init({ ggml_tensor_overhead(), nullptr, true });
+        GGML_ASSERT(ctx && body_ctx);
+        ggml_tensor * inputs[7] = {};
+        ggml_tensor * upload_targets[7] = {};
+        const ggml_tensor * upload_sources[7] = {};
+        for (int i : { 0, 1, 2, 3, 5, 6 }) {
+            const ggml_tensor * original = source->src[i];
+            if ((i == 1 || i == 2) && original->view_src) {
+                // Preserve interleaved head strides and the independent F16 sink sidecar.
+                const ggml_tensor * storage = original;
+                size_t offset = 0;
+                while (storage->view_src) {
+                    offset += storage->view_offs;
+                    storage = storage->view_src;
+                }
+                GGML_ASSERT(ggml_is_contiguous(storage));
+                upload_sources[i] = storage;
+                upload_targets[i] = ggml_dup_tensor(ctx, storage);
+                inputs[i] = ggml_view_4d(ctx, upload_targets[i], original->ne[0], original->ne[1],
+                                        original->ne[2], original->ne[3], original->nb[1],
+                                        original->nb[2], original->nb[3], offset);
+                GGML_ASSERT(inputs[i]->nb[0] == original->nb[0]);
+            } else {
+                GGML_ASSERT(ggml_is_contiguous(original));
+                inputs[i] = ggml_dup_tensor(ctx, original);
+                upload_targets[i] = inputs[i];
+                upload_sources[i] = original;
+            }
+        }
+        auto make_output = [&](ggml_tensor * body) {
+            ggml_tensor * out = ggml_flash_attn_ext(ctx, inputs[0], inputs[1], inputs[2], inputs[3],
+                                                   1.0f/sqrtf(static_cast<float>(inputs[0]->ne[0])), 0.0f, 0.0f);
+            ggml_flash_attn_ext_set_sj_kvarn(out, body, inputs[6], 4, 4, ggml_get_op_params_i32(source, 6));
+            ggml_prec_set_acc(out, GGML_PREC_F32);
+            return out;
+        };
+        ggml_tensor * body_split = ggml_dup_tensor(body_ctx, source->src[5]);
+        ggml_tensor * reference = make_output(inputs[5]);
+        ggml_tensor * split = make_output(body_split);
+        ggml_cgraph * graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, reference);
+        ggml_build_forward_expand(graph, split);
+        ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+        ggml_backend_buffer_type_t buft = resident_buft(device, group_bytes, capacity);
+        ggml_backend_buffer_t body_buffer = buft ? ggml_backend_alloc_ctx_tensors_from_buft(body_ctx, buft) : nullptr;
+        GGML_ASSERT(buffer && body_buffer);
+        for (int i : { 0, 1, 2, 3, 5, 6 }) {
+            ggml_backend_tensor_set(upload_targets[i], upload_sources[i]->data, 0, ggml_nbytes(upload_sources[i]));
+        }
+        ggml_backend_tensor_set(body_split, saved.data(), 0, saved.size());
+        std::vector<float> expected(ggml_nelements(reference)), actual(expected.size());
+        auto compare = [&](const char * stage) {
+            if (!ggml_backend_supports_op(backend, reference) || !ggml_backend_supports_op(backend, split) ||
+                ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) {
+                fprintf(stderr, "FAIL: resident=%u stage=%s CUDA attention execution\n", capacity, stage);
+                ++failures;
+                return;
+            }
+            ggml_backend_tensor_get(reference, expected.data(), 0, expected.size()*sizeof(float));
+            ggml_backend_tensor_get(split, actual.data(), 0, actual.size()*sizeof(float));
+            bool finite = true;
+            for (size_t i = 0; i < actual.size(); ++i) {
+                finite = finite && std::isfinite(actual[i]) && std::isfinite(expected[i]);
+            }
+            const bool same = finite && memcmp(expected.data(), actual.data(), actual.size()*sizeof(float)) == 0;
+            printf("  resident=%u stage=%s bit-exact=%s\n", capacity, stage, same ? "OK" : "FAIL");
+            failures += !same;
+        };
+        auto check_bytes = [&](const std::vector<uint8_t> & bytes, const char * stage) {
+            std::vector<uint8_t> restored(bytes.size());
+            ggml_backend_tensor_get(body_split, restored.data(), 0, restored.size());
+            const bool same = bytes == restored;
+            printf("  resident=%u stage=%s bytes=%s\n", capacity, stage, same ? "OK" : "FAIL");
+            failures += !same;
+        };
+        compare("dense-cold");
+        compare("dense-warm");
+        check_bytes(saved, "save");
+        const int32_t * desc = static_cast<int32_t *>(source->src[6]->data);
+        const int sink = desc[GGML_SJKVARN_DESC_S];
+        const int sealed = desc[GGML_SJKVARN_DESC_B];
+        const int group = desc[GGML_SJKVARN_DESC_G];
+        const int visible = desc[GGML_SJKVARN_DESC_N];
+        const size_t mask_count = ggml_nelements(inputs[3]);
+        std::vector<ggml_fp16_t> mask(mask_count);
+        for (int turn = 0; turn < 3; ++turn) {
+            for (size_t i = 0; i < mask.size(); ++i) {
+                const int p = i % inputs[3]->ne[0];
+                const int g = (p - sink)/group;
+                const bool selected = p < sink || p >= sealed || g == turn || g == n_groups - turn - 1;
+                const bool causal = static_cast<ggml_fp16_t *>(source->src[3]->data)[i] != ggml_fp32_to_fp16(-INFINITY);
+                mask[i] = ggml_fp32_to_fp16(p < visible && selected && causal ? 0.0f : -INFINITY);
+            }
+            ggml_backend_tensor_set(inputs[3], mask.data(), 0, ggml_nbytes(inputs[3]));
+            ggml_flash_attn_ext_set_n_kv_max(reference, visible);
+            ggml_flash_attn_ext_set_n_kv_max(split, visible);
+            compare("sparse-select");
+            compare("sparse-warm");
+        }
+        // Replace one head record inside a hot group, then restore in chunks that cross group boundaries.
+        const std::vector<float> before_write = expected;
+        std::vector<uint8_t> changed = saved;
+        const size_t offset = (n_groups - 3)*group_bytes + record_bytes;
+        memcpy(changed.data() + offset, saved.data() + record_bytes, record_bytes);
+        ggml_backend_tensor_set(inputs[5], changed.data() + offset, offset, record_bytes);
+        ggml_backend_tensor_set(body_split, changed.data() + offset, offset, record_bytes);
+        compare("partial-write");
+        if (memcmp(before_write.data(), expected.data(), expected.size()*sizeof(float)) == 0) {
+            fprintf(stderr, "FAIL: overwritten selected record did not change reference output\n");
+            ++failures;
+        }
+        check_bytes(changed, "partial-write");
+        ggml_backend_buffer_clear(body_buffer, 0);
+        check_bytes(std::vector<uint8_t>(saved.size(), 0), "clear");
+        const size_t chunk = group_bytes + 37;
+        for (size_t offset_restore = 0; offset_restore < saved.size(); offset_restore += chunk) {
+            const size_t size = std::min(chunk, saved.size() - offset_restore);
+            ggml_backend_tensor_set(body_split, saved.data() + offset_restore, offset_restore, size);
+        }
+        ggml_backend_tensor_set(inputs[5], saved.data(), 0, saved.size());
+        check_bytes(saved, "reload");
+        compare("reload");
+        ggml_backend_buffer_free(body_buffer);
+        ggml_backend_buffer_free(buffer);
+        ggml_free(body_ctx);
+        ggml_free(ctx);
+    }
+    ggml_backend_free(backend);
+    return failures;
+}
+
+static int run_case(const cfg & c, uint32_t seed, ggml_type staging_type = GGML_TYPE_F16, bool f16_sink = false, bool resident = false) {
     const int D = 256, S = 128, G = 128;
     const int nh = c.nh, hkv = c.hkv, n_q = c.n_q, N = c.N, cap = c.cap;
     const int B = S + c.n_groups*G;
@@ -188,8 +357,9 @@ static int run_case(const cfg & c, uint32_t seed, ggml_type staging_type = GGML_
     const bool ok = nmse < 1e-4 && maxabs < 5e-2;
     printf("  staging=%s sink=%s n_q=%d N=%d B=%d cap=%d nh=%d hkv=%d qpos0=%d: nmse=%.3e maxabs=%.3e (q %ld head %ld pos %d) %s\n",
            ggml_type_name(staging_type), f16_sink ? "f16" : "staging", n_q, N, B, cap, nh, hkv, qpos0, nmse, maxabs, (long) w_q, (long) w_head, qpos0 + (int) w_q, ok ? "OK" : "FAIL");
+    const int resident_failures = resident ? run_resident_graph(out, c.n_groups, l.bytes) : 0;
     ggml_free(ctx);
-    return ok ? 0 : 1;
+    return ok && resident_failures == 0 ? 0 : 1;
 }
 
 // Optional model-backed maintenance gates; the normal CPU oracle needs no model.
@@ -967,9 +1137,17 @@ int main(int argc, char ** argv) {
         return run_maintenance(argv[2], argc > 3 ? atoi(argv[3]) : 99);
     }
     std::vector<cfg> cases;
-    const bool f16_sink = argc == 2 && strcmp(argv[1], "--tq6-f16-sink") == 0;
+    const bool resident_tq6 = argc == 2 && strcmp(argv[1], "--resident-tq6") == 0;
+    const bool resident = resident_tq6 || (argc == 2 && strcmp(argv[1], "--resident") == 0);
+    const bool f16_sink = resident_tq6 || (argc == 2 && strcmp(argv[1], "--tq6-f16-sink") == 0);
     const bool tq6_attn = f16_sink || (argc == 2 && strcmp(argv[1], "--tq6-attn") == 0);
-    if (tq6_attn) {
+    if (resident) {
+        cases = {
+            { 1, 1379, 8, 384, 24, 2 },
+            { 5, 1379, 8, 384, 24, 2 },
+            { 129, 1379, 8, 384, 24, 2 },
+        };
+    } else if (tq6_attn) {
         cases = {
             { 1, 1152, 0, 2048, 24, 4 },
             { 3, 1536, 3, 2048, 24, 4 },
@@ -991,7 +1169,7 @@ int main(int argc, char ** argv) {
         };
     }
     int fails = 0;
-    for (size_t i = 0; i < cases.size(); ++i) fails += run_case(cases[i], 1234 + (uint32_t) i, tq6_attn ? GGML_TYPE_TQ6_0 : GGML_TYPE_F16, f16_sink);
+    for (size_t i = 0; i < cases.size(); ++i) fails += run_case(cases[i], 1234 + (uint32_t) i, tq6_attn ? GGML_TYPE_TQ6_0 : GGML_TYPE_F16, f16_sink, resident);
     printf("%s: %d/%zu cases passed\n", fails ? "FAIL" : "OK", (int) (cases.size() - fails), cases.size());
     if (argc == 1 && run_seq_rm(nullptr) != 0) {
         return 1; // the built-in run (ctest) also gates seq_rm on the generated CPU model

@@ -1872,6 +1872,26 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         }
     }
 
+    if constexpr (is_sj_kvarn) {
+        if (kv.resident_slots && mask_h && k_VKQ_0 >= kv.S && k_VKQ_0 < kv.B) {
+            // fork: do not read RAM records when every query masks this body tile.
+            __syncthreads();
+            bool live = false;
+            const int tid = threadIdx.y*warp_size + threadIdx.x;
+            for (int x = tid; x < query_layout::mask_rows*nbatch_fa; x += nwarps*warp_size) {
+                const int row = x/nbatch_fa;
+                const int key = x%nbatch_fa;
+                if ((!oob_check || key < k_VKQ_sup) &&
+                        __half2float(tile_mask[row*(nbatch_fa + 8) + key]) != -INFINITY) {
+                    live = true;
+                }
+            }
+            if (!__syncthreads_or(live)) {
+                return;
+            }
+        }
+    }
+
     // For MLA K and V have the same data.
     // Therefore, iterate over K in reverse and later re-use the data if possible.
 #pragma unroll

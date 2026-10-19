@@ -2886,6 +2886,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_SJKVARN_FLUSH_CHUNK"));
     add_opt(common_arg(
+        {"--kv-resident"}, "N",
+        "QSA layers with SJ-KVaRN: keep N KV cells on device and sealed body blocks in pinned RAM; "
+        "0 = disabled (default), recommended: 32768",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("resident KV cell count must be nonnegative");
+            }
+            params.kv_resident = (uint32_t) value;
+        }
+    ).set_env("LLAMA_ARG_KV_RESIDENT"));
+    add_opt(common_arg(
         {"--sjkvarn-transform"}, "FILE|URL",
         "SJ-KVaRN cache: per-layer, per-KV-head K/V transform file (SJWU format, calibrated for one model) applied in place "
         "of the Hadamard on the layers it lists; an http(s) URL is downloaded to the cache; disables the fused write "

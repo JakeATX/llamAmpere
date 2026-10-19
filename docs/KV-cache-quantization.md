@@ -88,6 +88,14 @@ Each 128-value TQ6 block occupies 98 bytes, including its FP16 norm; a 256-chann
 
 ## SJ-KVaRN low-bit bodies and the trellis codec
 
+`--kv-resident 32768` opts QSA layers into a resident window of 32,768 KV cells, with sealed SJ-KVaRN body blocks in pinned RAM and selected blocks fetched for attention. Dense and linear layers keep their existing allocation. The feature is off by default; `--kv-resident 0` disables it. `LLAMA_ARG_KV_RESIDENT` sets the same cell count. N reserves the sink and maximum live tail first, then divides the remaining cells into 128-cell sealed body groups. The existing extra staging space for prefill batches stays on the card. The current CUDA implementation supports a single stream, 256-channel QSA heads, and scalar SJ-KVaRN 4/4. Saved states retain the same logical sealed bytes and can move between split and full-card caches.
+
+The existing `--moe-cache auto` uses the free CUDA memory after this allocation; keep the same cache reserve and do not subtract the KV saving a second time. Matched load-only tests on an RTX 3090 Ti with Swift Flash-Next IQ3_XXS, SJ-KVaRN 4/4, and 12 QSA layers measured 432 MiB less whole-card memory at 100,096 context cells and 1,446 MiB less at 262,144 cells. These tests disabled the expert cache to isolate the allocation change. The sealed-body allocation calculation saves 447.92 MiB and 1,464.18 MiB respectively; driver allocation and mapping overhead reduce the measured headroom. Pinned body storage is 601.25 MiB and 1,617.51 MiB respectively. These are memory measurements, not inference speed results.
+
+In matched 100,000-token inference checks with 131,072 cells allocated and the same 3,072 MiB reserve, the expert allocator received 626.25 MiB more with the split. This uses the existing free-minus-reserve policy; no new expert-cache budget flag or manual credit is needed.
+
+`test-sjkvarn-attn --resident` and `--resident-tq6` compare split and full-card attention exactly, including cold and warm selected blocks. `test-sjkvarn-state --resident` checks split/full state transfers and continuation. The guarded `scripts/gate-fnkvwin-cache.py --mtp` model gate checks a 100,000-token prefix across a cold server restart: the main state, `.ckpt` checkpoint sidecar, and `.dft` MTP draft state must all retain the same size and SHA-256 hash. Restored continuation must reuse the saved prefix.
+
 Three SJ-KVaRN body configurations are the production paths, all with the staged sink (`--sjkvarn-sink 128`) and the
 adaptive tq6_0 tail (`--sjkvarn-tail 4096 --sjkvarn-tail-max 8192`). The adaptive tail is the default for every SJ-KVaRN body (`--sjkvarn-tail 4096 --sjkvarn-tail-max 8192`); `--sjkvarn-tail-max 0` selects a fixed tail. A larger `--sjkvarn-tail` without `--sjkvarn-tail-max` raises the ceiling to match:
 
