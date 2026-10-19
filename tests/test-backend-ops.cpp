@@ -11402,13 +11402,14 @@ struct test_lightning_indexer_range : public test_lightning_indexer {
     const bool large_q;
     const bool zero_weight;
     const bool strided;
+    const bool mixed_keys;
 
-    test_lightning_indexer_range(bool large_q, bool zero_weight, bool strided)
+    test_lightning_indexer_range(bool large_q, bool zero_weight, bool strided, bool mixed_keys = false)
         : test_lightning_indexer(128, 4, 65, 9, 2, 2, GGML_TYPE_F32),
-          large_q(large_q), zero_weight(zero_weight), strided(strided) {}
+          large_q(large_q), zero_weight(zero_weight), strided(strided), mixed_keys(mixed_keys) {}
 
     std::string vars() override {
-        return test_lightning_indexer::vars() + "," + VARS_TO_STR3(large_q, zero_weight, strided);
+        return test_lightning_indexer::vars() + "," + VARS_TO_STR4(large_q, zero_weight, strided, mixed_keys);
     }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
@@ -11437,6 +11438,11 @@ struct test_lightning_indexer_range : public test_lightning_indexer {
         for (auto [name, value] : { std::pair{"q", q_value}, std::pair{"k", k_value}, std::pair{"w", zero_weight ? 0.0f : 1.0f} }) {
             ggml_tensor * t = ggml_get_tensor(ctx, name);
             std::vector<float> row(t->ne[0], value);
+            if (mixed_keys && strcmp(name, "k") == 0) {
+                for (int64_t i = 0; i < t->ne[0]; ++i) {
+                    row[i] = i % 8 == 0 ? -value : i % 8 == 1 ? 0.3333f : value;
+                }
+            }
             for (int64_t s = 0; s < t->ne[3]; ++s) {
                 for (int64_t r = 0; r < t->ne[2]; ++r) {
                     for (int64_t h = 0; h < t->ne[1]; ++h) {
@@ -15602,6 +15608,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (bool zero_weight : { false, true }) {
             for (bool strided : { false, true }) {
                 test_cases.emplace_back(new test_lightning_indexer_range(large_q, zero_weight, strided));
+                if (!large_q) {
+                    test_cases.emplace_back(new test_lightning_indexer_range(large_q, zero_weight, strided, true));
+                }
             }
         }
     }

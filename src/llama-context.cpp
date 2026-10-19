@@ -989,7 +989,6 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
                     backend_buft == params.ctx_other->backend_buft &&
                     params.ctx_other->compute_peer == nullptr) {
                 compute_peer = params.ctx_other;
-                compute_peer->compute_peer = this;
                 LLAMA_LOG_INFO("%s: MTP context will share the target context's compute buffers\n", __func__);
             }
         }
@@ -1029,6 +1028,10 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
     }
     if (mtp_scratch_target) {
         mtp_scratch_target->mtp_scratch_clients.push_back(this);
+    }
+    // Publish the backlink only after all throwing initialization has completed.
+    if (compute_peer) {
+        compute_peer->compute_peer = this;
     }
 }
 

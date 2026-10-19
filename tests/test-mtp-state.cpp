@@ -1031,6 +1031,34 @@ static void run_reserve_probe(uint32_t context_size, uint32_t parallel, const ch
     printf("PASS RESERVE_PROBE: real CPU no_alloc model graph and allocator measurements; no CUDA execution\n");
 }
 
+static void run_failed_helper(llama_model * model) {
+    prefill_env_restore env;
+    common_set_env("LLAMA_SHARED_COMPUTE", "1");
+    llama_model_ptr helper_model(make_model());
+    auto cp = llama_context_default_params();
+    cp.n_ctx = 512;
+    cp.n_batch = cp.n_ubatch = 32;
+    cp.n_threads = cp.n_threads_batch = 2;
+    cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    llama_context_ptr target(llama_init_from_model(model, cp));
+    require(target != nullptr, "create failed-helper target");
+    cp.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+    cp.ctx_other = target.get();
+    // The CPU-only fixture rejects a device cache after selecting its compute donor.
+    cp.moe_cache_size = 1;
+    const size_t before = compute_shares;
+    require(llama_init_from_model(helper_model.get(), cp) == nullptr, "helper initialization fails after donor selection");
+    require(compute_shares == before + 1, "failed helper reached donor selection");
+    cp.moe_cache_size = 0;
+    llama_context_ptr helper(llama_init_from_model(helper_model.get(), cp));
+    require(helper != nullptr, "retry helper initialization");
+    require(compute_shares == before + 2, "target accepts shared helper after initialization failure");
+    target->sched_reserve();
+    helper.reset();
+    target->sched_reserve();
+    printf("PASS failed helper initialization, shared retry, target reserve and teardown\n");
+}
+
 // The second GGUF must reuse identical storage and retain it after the donor model is freed.
 static void run_weight_borrow(llama_model * source, bool cuda = false) {
     const auto close_file = [](FILE * f) { fclose(f); };
@@ -1136,6 +1164,12 @@ int main(int argc, char ** argv) {
             llama_backend_free();
             return 0;
         }
+        if (argc == 2 && std::strcmp(argv[1], "--failed-helper-only") == 0) {
+            run_failed_helper(model);
+            llama_model_free(model);
+            llama_backend_free();
+            return 0;
+        }
         if (cuda_sharing) { require(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU) != nullptr, "CUDA backend is available"); }
         run_weight_borrow(model, cuda_sharing);
         if (cuda_sharing || (argc == 2 && std::strcmp(argv[1], "--weight-borrow-only") == 0)) {
@@ -1143,6 +1177,7 @@ int main(int argc, char ** argv) {
             llama_backend_free();
             return 0;
         }
+        run_failed_helper(model);
         const cache_config configs[] = {
             { "q8_0/q8_0", GGML_TYPE_Q8_0, GGML_TYPE_Q8_0 },
             { "tq5_0/turbo4", GGML_TYPE_TQ5_0, GGML_TYPE_TURBO4_0 },
