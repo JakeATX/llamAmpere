@@ -1,8 +1,12 @@
 #pragma once
 
 #include "ggml-cpp.h"
+#include "../include/llama.h"
 #include <cstddef>
 #include <cstdint>
+
+// Pure copy boundary for tracing only owned output-file refaults, after synchronization.
+extern "C" LLAMA_API void llama_copy_moe_output(void * dst, const void * src, size_t bytes);
 
 // fork: reclaimable storage for a large, temporary MTP output, with unchanged floats.
 struct llama_moe_output {

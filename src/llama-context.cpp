@@ -2608,7 +2608,20 @@ bool llama_context::copy_embeddings_nextn(float * dst, int32_t first, int32_t co
             (count && !dst) || (size_t) first > embd_nextn.size / width ||
             (size_t) count > embd_nextn.size / width - first) { return false; }
     const float * data = get_embeddings_nextn();
-    if (count) { memcpy(dst, data + (size_t) first * width, (size_t) count * width * sizeof(float)); }
+    if (count) {
+        const auto * src = data + (size_t) first * width;
+        const size_t bytes = (size_t) count * width * sizeof(float);
+        if (output_file) {
+            const uintptr_t base = (uintptr_t) output_file->data;
+            const uintptr_t begin = (uintptr_t) src;
+            if (begin < base || begin - base > output_file->size || bytes > output_file->size - (begin - base)) {
+                return false;
+            }
+            llama_copy_moe_output(dst, src, bytes);
+        } else {
+            memcpy(dst, src, bytes);
+        }
+    }
     return true;
 }
 
