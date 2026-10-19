@@ -51,10 +51,24 @@ static bool test_reclaimable_output(bool cuda = false) {
         }
         output.flush();
         ok &= !output.dirty;
+        // Unaligned completed ranges may share pages. All bytes must survive refault.
+        output.release(17, bytes / 2);
+        output.release(bytes / 2, bytes - bytes / 2);
+        output.release(bytes, 0);
+        for (const auto & range : std::vector<std::pair<size_t, size_t>>{{bytes + 1, 0}, {bytes, 1}, {1, SIZE_MAX}}) {
+            bool rejected_range = false;
+            try { output.release(range.first, range.second); }
+            catch (const std::out_of_range &) { rejected_range = true; }
+            ok &= rejected_range;
+        }
+        std::vector<unsigned char> resident(bytes / (size_t) sysconf(_SC_PAGESIZE));
+        ok &= mincore(data, bytes, resident.data()) == 0;
+        for (unsigned char page : resident) { ok &= (page & 1) == 0; }
         ok &= madvise(data, bytes, MADV_DONTNEED) == 0;
         for (size_t i = 0; i < bytes / sizeof(*data); ++i) { ok &= data[i] == uint32_t(i * 2654435761u); }
         data[0] = 0x7fc12345;
         output.dirty = true;
+        output.release(0, sizeof(*data));
         output.flush();
         ok &= madvise(data, bytes, MADV_DONTNEED) == 0;
         ok &= data[0] == 0x7fc12345;
