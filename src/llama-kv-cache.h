@@ -196,6 +196,9 @@ public:
     ggml_tensor * get_k_storage(int32_t il) const;
     ggml_tensor * get_v_storage(int32_t il) const;
     bool get_v_transposed() const;
+    // Caller synchronizes and releases these views before the next layer or any cache mutation.
+    std::vector<ggml_backend_buffer_ptr> b1_scratch_views(ggml_backend_buffer_type_t buft, int32_t first_unused_layer, uint32_t prompt_cells) const;
+
 
     // Borrow unused cache bytes until the consumer is synchronized and releases them.
     std::vector<ggml_backend_buffer_ptr> scratch_borrow(ggml_backend_buffer_type_t buft, size_t chunk_bytes, size_t max_chunks, size_t min_free_bytes, uint32_t guard_tokens, void (*cancel)(void *), void * user);

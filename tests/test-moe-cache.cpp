@@ -118,6 +118,47 @@ static void test_provider_session_destroy(void * session) { (void) session; }
 static void test_provider_session_enter(void * session) { (void) session; }
 static void test_provider_session_leave(void * session) { (void) session; }
 
+static bool run_resume_lifecycle_cpu() {
+    auto cpu = ggml_backend_cpu_init();
+    if (!cpu) { return false; }
+    static int created, destroyed, resumed;
+    ggml_moe_cache_api api = {};
+    api.owner = ggml_backend_dev_backend_reg(ggml_backend_get_device(cpu));
+    const auto previous_api = ggml_moe_cache_get(api.owner);
+    api.session_create = [](void * const *, int, const ggml_moe_cache_config *) -> void * {
+        ++created;
+        return &created;
+    };
+    api.session_destroy = [](void *) { ++destroyed; };
+    api.session_enter = test_provider_session_enter;
+    api.session_leave = test_provider_session_leave;
+    api.prompt_resume = [](void *) { ++resumed; };
+    bool ok = true;
+    for (bool hook : {true, false}) {
+        created = destroyed = resumed = 0;
+        if (!hook) { api.prompt_resume = nullptr; }
+        ggml_moe_cache_register(&api);
+        auto sched = ggml_backend_sched_new(&cpu, nullptr, 1, 32, false, true);
+        ok &= created == 1 && resumed == 0;
+        ggml_backend_sched_moe_cache_resume(sched);
+        ok &= resumed == 0;
+        for (int cycle = 0; cycle < 2; ++cycle) {
+            ok &= ggml_backend_sched_moe_cache_suspend(sched);
+            ok &= !ggml_backend_sched_moe_cache_suspend(sched);
+            ggml_backend_sched_moe_cache_resume(sched);
+            ggml_backend_sched_moe_cache_resume(sched);
+            ok &= created == cycle + 2 && destroyed == cycle + 1 && resumed == (hook ? cycle + 1 : 0);
+        }
+        ggml_backend_sched_free(sched);
+        ok &= destroyed == created;
+    }
+    ggml_moe_cache_unregister(api.owner);
+    if (previous_api.owner) { ggml_moe_cache_register(&previous_api); }
+    ggml_backend_free(cpu);
+    printf("cache-resume-lifecycle-cpu: %s\n", ok ? "OK" : "FAIL");
+    return ok;
+}
+
 static void * resident_test_host = nullptr;
 static std::vector<float> resident_test_original;
 static int resident_test_restores = 0;
@@ -1854,8 +1895,13 @@ static bool run_suspend_resume(
         ggml_backend_t gpu,
         ggml_backend_t cpu,
         stress_fixture & fixture,
-        log_capture & capture) {
+        log_capture & capture,
+        bool return_reserve = false) {
     configure_cache(nullptr);
+    if (return_reserve) {
+        set_env("GGML_CUDA_MOE_CACHE_RESERVE_MB", "3072");
+        set_env("GGML_CUDA_MOE_CACHE_RETURN_RESERVE_MB", "2560");
+    }
     capture.clear();
     ggml_backend_sched_t scheduler = make_scheduler(
             "cache-suspend", gpu, cpu, fixture.graph);
@@ -1869,6 +1915,10 @@ static bool run_suspend_resume(
     for (int i = 0; i < steps && ok; i++) {
         ok = compute_matches("cache-suspend", scheduler, fixture.graph, fixture.reference, step++);
     }
+    if (return_reserve) {
+        (void) ggml_backend_sched_moe_cache_restore(scheduler);
+        ok &= capture.get().find("prompt-return reserve bytes:") == std::string::npos;
+    }
     const size_t pools_before = count_occurrences(capture.get(), " pool[");
     const bool s1 = ok && ggml_backend_sched_moe_cache_suspend(scheduler);
     const bool s2 = ggml_backend_sched_moe_cache_suspend(scheduler); // already suspended: no-op
@@ -1881,6 +1931,12 @@ static bool run_suspend_resume(
     }
     ggml_backend_sched_moe_cache_resume(scheduler);
     ggml_backend_sched_moe_cache_resume(scheduler); // not suspended: no-op
+    if (return_reserve) {
+        (void) ggml_backend_sched_moe_cache_restore(scheduler);
+        const std::string log = capture.get();
+        ok &= count_occurrences(log, "prompt-return reserve bytes:") == 1 &&
+            log.find("decode=2684354560") != std::string::npos;
+    }
     for (int i = 0; i < steps && ok; i++) {
         ok = compute_matches("cache-suspend", scheduler, fixture.graph, fixture.reference, step++);
     }
@@ -1896,6 +1952,11 @@ static bool run_suspend_resume(
         ok = false;
     }
     ggml_backend_sched_moe_cache_resume(scheduler);
+    if (return_reserve) {
+        (void) ggml_backend_sched_moe_cache_restore(scheduler);
+        ok &= count_occurrences(capture.get(), "prompt-return reserve bytes:") == 2;
+        set_env("GGML_CUDA_MOE_CACHE_RETURN_RESERVE_MB", nullptr);
+    }
     ggml_backend_sched_free(scheduler);
     printf("cache-suspend: %s\n", ok ? "OK" : "FAIL");
     return ok;
@@ -2927,10 +2988,38 @@ static bool run_shared_budget(
             direct_n_in, direct_n_out, GGML_TYPE_Q4_0, direct_n_expert);
     active_api().session_leave(second);
 
+    const std::string shared_log = capture.get();
+    bool return_reserve_ok = true;
+    if (free_mib >= 1600 && active_api().restore) {
+        const std::string decode_reserve = std::to_string(free_mib - 48);
+        set_env("GGML_CUDA_MOE_CACHE_RETURN_RESERVE_MB", decode_reserve.c_str());
+        capture.clear();
+        (void) active_api().restore(first);
+        const std::string startup_return = capture.get();
+        return_reserve_ok &= startup_return.find("prompt-return reserve bytes:") == std::string::npos;
+        return_reserve_ok &= active_api().trim && active_api().trim(first, 2 * expert_size) > 0;
+        capture.clear();
+        (void) active_api().restore(first);
+        const std::string first_return = capture.get();
+        // The second session's larger live reservation must still win.
+        return_reserve_ok &= first_return.find("prompt-return reserve bytes:") != std::string::npos &&
+            first_return.find("reserve=" + std::to_string((free_mib - 24) << 20)) != std::string::npos;
+        return_reserve_ok &= active_api().trim && active_api().trim(second, 2 * expert_size) > 0;
+        capture.clear();
+        (void) active_api().restore(second);
+        const std::string second_return = capture.get();
+        return_reserve_ok &= second_return.find("prompt-return reserve bytes:") != std::string::npos &&
+            second_return.find("reserve=" + std::to_string((free_mib - 48) << 20)) != std::string::npos;
+        if (!return_reserve_ok) {
+            fprintf(stderr, "cache-shared-budget: prompt-return reserve failed\n%s%s", first_return.c_str(), second_return.c_str());
+        }
+        set_env("GGML_CUDA_MOE_CACHE_RETURN_RESERVE_MB", nullptr);
+    } else {
+        printf("cache-prompt-return-reserve: SKIP (needs 1600 MiB free and restore API)\n");
+    }
     active_api().session_destroy(second);
     active_api().session_destroy(first);
 
-    const std::string shared_log = capture.get();
     const bool divided = count_field_at_least(shared_log, "granted=", 8) == 2 &&
         max_field_value(shared_log, "granted=") <= 16;
 
@@ -2987,7 +3076,7 @@ static bool run_shared_budget(
         count_field_at_least(reserve_log, "granted=", 8) == 2;
     configure_cache(nullptr);
 
-    const bool ok = first_ready && second_ready && divided &&
+    const bool ok = first_ready && second_ready && divided && return_reserve_ok &&
         replacement_ready && released && reserve_lowered;
     if (!ok) {
         fprintf(stderr, "cache-shared-budget: unexpected claim behavior\n%s%s%s",
@@ -5324,6 +5413,9 @@ int main(int argc, char ** argv) {
     if (argc == 2 && strcmp(argv[1], "--prefetch-policy-only") == 0) {
         return 0;
     }
+    if (argc == 2 && strcmp(argv[1], "--resume-lifecycle-cpu-only") == 0) {
+        return run_resume_lifecycle_cpu() ? 0 : 1;
+    }
     if (argc == 2 && strcmp(argv[1], "--prefetch-cpu-only") == 0) {
         auto cpu = ggml_backend_cpu_init();
         const bool ok = cpu && run_prefetch_router(cpu, cpu);
@@ -5368,6 +5460,21 @@ int main(int argc, char ** argv) {
             ggml_backend_free(cpu);
         }
         return 1;
+    }
+    if (argc == 2 && strcmp(argv[1], "--shared-budget-only") == 0) {
+        const bool ok = run_shared_budget(gpu, cpu, capture);
+        ggml_backend_free(gpu);
+        ggml_backend_free(cpu);
+        return ok ? 0 : 1;
+    }
+    if (argc == 2 && strcmp(argv[1], "--suspend-reserve-only") == 0) {
+        stress_fixture fixture;
+        const bool ok = provider_is_cuda && init_stress_fixture(fixture, cpu) &&
+            run_suspend_resume(gpu, cpu, fixture, capture, true);
+        free_stress_fixture(fixture);
+        ggml_backend_free(gpu);
+        ggml_backend_free(cpu);
+        return ok ? 0 : 1;
     }
 #if defined(GGML_CUDA) && defined(__linux__)
     if (argc == 2 && strcmp(argv[1], "--permanent-residency-only") == 0) {

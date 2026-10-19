@@ -589,6 +589,16 @@ private:
     bool b1_tried = false; // b1 construction attempted
     bool b1_ffn_scratch_active = false;
     bool b1_layer_scratch_active = false;
+    bool b1_kv_scratch_enabled = false;
+    uint32_t b1_kv_prompt_cells = 0;
+    uint32_t b1_kv_outputs = 1;
+    ggml_backend_t b1_kv_backend = nullptr;
+    std::vector<size_t> b1_layer_compute_bytes;
+    std::vector<ggml_backend_buffer_ptr> b1_kv_views;
+    ggml_backend_buffer_ptr b1_kv_owned;
+    bool b1_kv_scratch_release();
+    bool b1_kv_scratch_bind(int32_t l0, int32_t l1);
+
     bool b1_off_logged = false; // the once-per-context note on why B1 is not used was printed
     bool b1_mc_suspended = false; // this call freed the MoE expert cache's pool (made again in b1_end)
     struct {

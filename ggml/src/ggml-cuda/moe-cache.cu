@@ -391,6 +391,8 @@ struct moe_cache_session {
     // Diagnostic only; guarded by mu and unused without DEVICE_STATS.
     uint64_t device_stats_scopes = 0;
     std::atomic<uint64_t> device_dispatches{0};
+    // Guarded by mu: startup restores must retain space for the not-yet-created helper.
+    bool prompt_loaned = false;
     bool profile_load_attempted = false;
     std::unordered_map<moe_cache_key, uint64_t, moe_cache_key_hash> profile_counts;
     bool prefetch_enabled = false;
@@ -4454,9 +4456,17 @@ static size_t moe_cache_lend(void * opaque, size_t bytes) {
             freed += before - (size_t)pool->n_slots * pool->expert_size;
         }
     }
+    if (freed) { session->prompt_loaned = true; }
     MOE_CACHE_LOG("[moe-cache] lent %zu MiB requested=%zu MiB; least-use eviction and exact survivor refill %.3f ms\n",
             freed >> 20, bytes >> 20, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
     return freed;
+}
+
+static void moe_cache_prompt_resume(void * opaque) {
+    auto * session = (moe_cache_session *) opaque;
+    if (!session) { return; }
+    std::lock_guard<std::mutex> lock(session->mu);
+    session->prompt_loaned = true;
 }
 
 static size_t moe_cache_return(void * opaque) {
@@ -4479,6 +4489,31 @@ static size_t moe_cache_return(void * opaque) {
         }
         if (!device->budget_ready) {
             moe_cache_prepare_budget(*session, *device);
+        }
+        // A real prompt loan distinguishes this return from startup warmup restores.
+        int64_t return_reserve_mb = 0;
+        if (session->prompt_loaned && device->budget_registered && moe_cache_env_i64("GGML_CUDA_MOE_CACHE_RETURN_RESERVE_MB",
+                    1536, (int64_t) session->config.reserve_mb, return_reserve_mb)) {
+            const size_t reserve_bytes = (size_t) return_reserve_mb << 20;
+            if (reserve_bytes < device->budget_reserve_bytes) {
+                std::lock_guard<std::mutex> budget_lock(g_budget_mu);
+                auto found = g_physical_budgets.find(device->physical);
+                if (found != g_physical_budgets.end()) {
+                    auto & reserves = found->second.reserves;
+                    auto previous = reserves.find(device->budget_reserve_bytes);
+                    if (previous != reserves.end()) {
+                        try {
+                            reserves.insert(reserve_bytes);
+                            reserves.erase(previous);
+                            MOE_CACHE_LOG("[moe-cache] CUDA%d prompt-return reserve bytes: startup=%zu previous=%zu decode=%zu\n",
+                                    device->physical, session->config.reserve_mb << 20, device->budget_reserve_bytes, reserve_bytes);
+                            device->budget_reserve_bytes = reserve_bytes;
+                        } catch (const std::bad_alloc &) {
+                            MOE_CACHE_LOG("[moe-cache] CUDA%d keeping startup reserve after allocation failure\n", device->physical);
+                        }
+                    }
+                }
+            }
         }
         if (!device->budget_claimed || !moe_cache_reserve_table_arena(*session, *device) ||
                 !moe_cache_refresh_budget(*session, *device, "return prompt scratch")) {
@@ -4514,6 +4549,10 @@ static size_t moe_cache_return(void * opaque) {
             }
             weights -= weight;
         }
+        size_t slots = 0;
+        for (const auto & pool : device->pools) { slots += pool->n_slots; }
+        MOE_CACHE_LOG("[moe-cache] CUDA%d prompt-return capacity bytes: expert_slots=%zu expert_bytes=%zu grant=%zu reserve=%zu\n",
+                device->physical, slots, device->allocated_bytes, device->budget_limit, device->budget_reserve_bytes);
     }
     MOE_CACHE_LOG("[moe-cache] returned %zu MiB to expert slots; exact survivor refill %.3f ms\n",
             restored >> 20, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
@@ -6347,6 +6386,7 @@ static void moe_cache_register(const void * owner) {
     api.device_supports = moe_cache_device_supports;
     api.trim = moe_cache_lend;
     api.restore = moe_cache_return;
+    api.prompt_resume = moe_cache_prompt_resume;
     ggml_moe_cache_register(&api);
 }
 

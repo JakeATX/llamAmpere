@@ -3357,6 +3357,9 @@ void ggml_backend_sched_moe_cache_resume(ggml_backend_sched_t sched) {
         sched->moe_cache_api = ggml_moe_cache_api{};
         ggml_sched_moe_cache_default(sched);
     }
+    if (sched->moe_cache_session && sched->moe_cache_api.prompt_resume) {
+        sched->moe_cache_api.prompt_resume(sched->moe_cache_session);
+    }
     ggml_backend_sched_reset(sched);
 }
 
