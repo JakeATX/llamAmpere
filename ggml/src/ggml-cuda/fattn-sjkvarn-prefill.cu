@@ -1,6 +1,7 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
 #include "fattn-mma-f16.cuh"
+#include "fattn-i8qk.cuh"
 
 #include <cstdlib>
 
@@ -178,6 +179,11 @@ struct fattn_sj_kvarn_prefill_plan {
     int    work_q           = 0;
     size_t parts_bytes      = 0;     // work_q*n_head*256 floats
     size_t meta_bytes       = 0;     // work_q*n_head float2
+    // [I8SJ] unless GGML_CUDA_FA_I8QK=0, the group's attention runs the int8-QK kernel (fattn-i8qk.cu) on the expanded f16 K/V
+    // (not chunked plans: the int8 kernel writes no partials). Its int8 K takes n_kv*256 bytes per KV head of the group
+    // behind the output temporary; the head grouping counts those bytes, so the scratch stays within the same budget.
+    bool   i8qk             = false;
+    size_t i8qk_offset      = 0;     // bytes from the scratch start to the int8 K
 };
 
 static fattn_sj_kvarn_prefill_plan fattn_sj_kvarn_prefill_make_plan(const int cc, const ggml_tensor * dst) {
@@ -207,7 +213,11 @@ static fattn_sj_kvarn_prefill_plan fattn_sj_kvarn_prefill_make_plan(const int cc
     const size_t kv_bytes_per_head = 2*kv_elements_per_head*sizeof(half);
     const size_t output_elements_per_head = size_t(Q->ne[1])*gqa*256;
     const size_t output_bytes_per_head = output_elements_per_head*sizeof(float);
-    const bool grouped = size_t(K->ne[2]) > budget/kv_bytes_per_head;
+    const bool i8qk = ggml_cuda_fattn_i8qk_sj_kvarn_wanted(cc, dst);
+    const size_t i8qk_bytes_per_head = i8qk ? kv_elements_per_head : 0; // int8 K
+    // the trellis chunk decision keeps the f16-only test; the int8 K bytes only regroup the expanded (unchunked) plan
+    const bool grouped_f16 = size_t(K->ne[2]) > budget/kv_bytes_per_head;
+    const bool grouped = size_t(K->ne[2]) > budget/(kv_bytes_per_head + i8qk_bytes_per_head);
     int heads_per_group = K->ne[2];
     static const bool kv_chunks = [] {
         const char * value = getenv("GGML_SJKVARN_PREFILL_KV_CHUNKS");
@@ -220,7 +230,7 @@ static fattn_sj_kvarn_prefill_plan fattn_sj_kvarn_prefill_make_plan(const int cc
         const int v = value ? atoi(value) : 0;
         return v >= 256 && v % 256 == 0 ? v : 0;
     }();
-    if ((grouped || force_chunk_kv > 0) && trellis && kv_chunks && dst->src[3] != nullptr && dst->src[3]->ne[2] == 1 && dst->src[3]->ne[3] == 1 &&
+    if ((grouped_f16 || force_chunk_kv > 0) && trellis && kv_chunks && dst->src[3] != nullptr && dst->src[3]->ne[2] == 1 && dst->src[3]->ne[3] == 1 &&
             Q->ne[2] % K->ne[2] == 0 && gqa <= 8 && ggml_is_contiguous(dst)) {
         // [TRPF] KV chunks: K/V chunk (all heads) + one launch's partials + metas + the running (max, sum) per row
         const size_t n_head = Q->ne[2];
@@ -261,7 +271,7 @@ static fattn_sj_kvarn_prefill_plan fattn_sj_kvarn_prefill_make_plan(const int cc
         if (!head_groups || dst->src[3] == nullptr || dst->src[3]->ne[2] != 1) {
             return p;
         }
-        heads_per_group = std::min(size_t(K->ne[2]), budget/(kv_bytes_per_head + output_bytes_per_head));
+        heads_per_group = std::min(size_t(K->ne[2]), budget/(kv_bytes_per_head + output_bytes_per_head + i8qk_bytes_per_head));
         if (heads_per_group == 0) {
             return p;
         }
@@ -276,6 +286,11 @@ static fattn_sj_kvarn_prefill_plan fattn_sj_kvarn_prefill_make_plan(const int cc
     p.kv_elements = kv_elements_per_head*heads_per_group;
     p.output_bytes = grouped ? output_bytes_per_head*heads_per_group : 0;
     p.scratch_bytes = 2*p.kv_elements*sizeof(half) + p.output_bytes;
+    if (i8qk) {
+        p.i8qk = true;
+        p.i8qk_offset = GGML_PAD(p.scratch_bytes, 128);
+        p.scratch_bytes = p.i8qk_offset + i8qk_bytes_per_head*heads_per_group;
+    }
     return p;
 }
 
@@ -292,7 +307,7 @@ size_t ggml_cuda_flash_attn_ext_sj_kvarn_prefill_alloc_size(const int device, co
     const size_t n_head_kv = dst->src[1]->ne[2];
     const size_t budget = fattn_sj_kvarn_prefill_trellis(dst) ? fattn_sj_kvarn_prefill_trellis_budget() : fattn_sj_kvarn_prefill_budget();
     const size_t bound = std::max(p.scratch_bytes,
-        std::min(budget, n_head_kv*2*size_t(ggml_get_op_params_i32(dst, 6))*256*sizeof(half)));
+        std::min(budget, n_head_kv*(2*sizeof(half) + (p.i8qk ? 1 : 0))*size_t(ggml_get_op_params_i32(dst, 6))*256));
     return GGML_PAD(ggml_nbytes(dst), 128) + bound;
 }
 
@@ -328,7 +343,7 @@ bool ggml_cuda_flash_attn_ext_sj_kvarn_prefill(ggml_backend_cuda_context & ctx, 
         offset + plan.scratch_bytes <= ggml_backend_buffer_get_alloc_size(dst->buffer, dst);
     ggml_cuda_pool_alloc<half> scratch_pool(ctx.pool());
     half * scratch_ptr = reserved ? (half *) ((char *) dst->data + offset) :
-        scratch_pool.alloc(2*kv_elements + output_bytes/sizeof(half));
+        scratch_pool.alloc(plan.i8qk ? (plan.scratch_bytes + sizeof(half) - 1)/sizeof(half) : 2*kv_elements + output_bytes/sizeof(half));
 
     float * output = grouped ? (float *) (scratch_ptr + 2*kv_elements) : (float *) dst->data;
 
@@ -482,7 +497,10 @@ bool ggml_cuda_flash_attn_ext_sj_kvarn_prefill(ggml_backend_cuda_context & ctx, 
             }
         }
 
-        if (gqa > 4) {
+        if (plan.i8qk && ggml_cuda_fattn_i8qk_applies_f16kv(ggml_cuda_info().devices[ctx.device].cc, &out)) {
+            // [I8SJ] int8 Q.K on the expanded f16 K (v1 K prep: mean smoothing + per-token scale), f16 V read in place
+            ggml_cuda_flash_attn_ext_i8qk(ctx, &out, 0, heads, (char *) scratch_ptr + plan.i8qk_offset, (half *) v.data);
+        } else if (gqa > 4) {
             ggml_cuda_flash_attn_ext_mma_f16_case<256, 256, 8, 8>(ctx, &out);
         } else if (gqa > 2) {
             ggml_cuda_flash_attn_ext_mma_f16_case<256, 256, 16, 4>(ctx, &out);

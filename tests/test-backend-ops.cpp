@@ -14628,8 +14628,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // [I8QK] prefill shapes (>= 64 queries) for the opt-in int8-QK route (GGML_CUDA_FA_I8QK=1, fattn-i8qk.cu); without
-    // the switch they cover the f16 MMA prefill route. Production head dims 256 (Qwen3.8, GQA 6) and 128, the production
+    // [I8QK] prefill shapes (>= 64 queries) for the default-on int8-QK route (fattn-i8qk.cu); GGML_CUDA_FA_I8QK=0 covers the f16 MMA prefill route.
+    // Production head dims 256 (Qwen3.8, GQA 6) and 128, the production
     // KV pairs, causal / random / no mask, permuted Q, a partial query tile (200), a single KV head and large logits
     // (q_range 20: peaked softmax, online rescaling). F16/F16 checks the fallback (f16 caches keep the f16 route).
     // GGML_CUDA_PREFILL_KV_MIB=1 sends the D 256 cases through the bounded per-KV-head-group branch (first > 0).
@@ -14929,6 +14929,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(257, 24, 4, 3, 300, true, true));
     // A 21 MiB prefill cap exercises two KV heads followed by one, including sink slicing and output scatter.
     test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(257, 24, 3, 60, 300, true, true));
+    // [I8SJ] SJ-KVaRN prefill shapes the int8-QK route takes by default (D 256, no sinks/softcap; path
+    // key i8qk_sjkvarn): production ubatch 512 at GQA 6 over f16 / q8_0 / tq6_0 staging with and without an f16 sink, a
+    // partial query tile, GQA 4 and 1, and head groups (60 records: two KV heads then one under a 21 MiB cap).
+    // With GGML_CUDA_FA_I8QK=0 they are more f16 MMA prefill cases.
+    test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(512, 24, 4, 16, 1100, true));
+    test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(512, 24, 4, 16, 1100, true, false, GGML_TYPE_Q8_0, 256));
+    test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(512, 24, 4, 16, 1100, true, false, GGML_TYPE_TQ6_0, 128, true));
+    test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(200, 24, 4,  8,  700, true, false, GGML_TYPE_TQ6_0, 128));
+    test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(128, 16, 4,  8,  300, true));
+    test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(128,  4, 4,  8,  300, true));
+    test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(512, 24, 3, 60,  600, true, false, GGML_TYPE_TQ6_0, 128));
 
     test_cases.emplace_back(new test_sj_kvarn_seal(256, 128, 4, 2, 4, 4, 16, false));
     test_cases.emplace_back(new test_sj_kvarn_seal(256, 128, 2, 1, 4, 4, 16, true));
