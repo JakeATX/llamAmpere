@@ -5809,6 +5809,13 @@ void llama_context::b1_cache_profile_load() {
             }
             tensors.push_back({tensor->name, tensor->data, tensor->nb[2], tensor->ne[0], tensor->ne[1], tensor->ne[2], (int32_t) tensor->type});
         }
+        for (ggml_backend_t backend : backend_ptrs) {
+            auto * device = ggml_backend_get_device(backend);
+            if (device && ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                model.moe_resident_init(device, tensors.data(), (int) tensors.size());
+                break;
+            }
+        }
         ggml_backend_sched_moe_cache_warm(sched.get(), tensors.data(), nullptr, (int) tensors.size());
         const char * device = getenv("GGML_MOE_CACHE_DEVICE");
         b1_cache_device_pending = device && strcmp(device, "1") == 0;

@@ -346,6 +346,7 @@ struct moe_cache_device_table {
     ggml_moe_cache_tensor_desc desc{}; // compact expert bytes
     size_t host_stride = 0;
     const void * borrowed = nullptr; // model-owned registered arena; never unregistered here
+    bool permanent_sources = false;
     const void ** device = nullptr;
     const void ** staging_device = nullptr;
     uint8_t * hot = nullptr;
@@ -1200,6 +1201,134 @@ static int moe_cache_query_config(
 // moe_cache_register; query_device matches it against the device's backend.
 static const void * g_moe_cache_owner = nullptr;
 
+// fork: these original bytes belong to the model, never to a lendable cache session.
+struct moe_resident {
+    int device = -1;
+    void * slab = nullptr;
+    size_t bytes = 0;
+    uint64_t signature = 0;
+    std::vector<ggml_moe_cache_tensor_desc> tensors;
+    std::vector<ggml_moe_resident_span> spans;
+    std::vector<uint8_t> restore_stage;
+    bool dropped = false;
+    int (*on_restore)(void *) = nullptr;
+    void * user_data = nullptr;
+};
+
+static std::mutex g_resident_mu;
+static std::vector<moe_resident *> g_residents;
+
+static const void * moe_resident_lookup_device(const void * host, size_t bytes, int device) {
+    const uintptr_t begin = (uintptr_t) host;
+    if (!bytes || bytes > UINTPTR_MAX - begin) { return nullptr; }
+    std::lock_guard<std::mutex> lock(g_resident_mu);
+    for (const auto * resident : g_residents) {
+        if (resident->device != device) { continue; }
+        for (const auto & span : resident->spans) {
+            const uintptr_t base = (uintptr_t) span.host;
+            if (begin >= base && begin - base <= span.size && bytes <= span.size - (begin - base)) {
+                return (const char *) span.device + (begin - base);
+            }
+        }
+    }
+    return nullptr;
+}
+
+static int moe_resident_host_restore(const void * host, size_t bytes) {
+    const uintptr_t begin = (uintptr_t) host;
+    if (!bytes || bytes > UINTPTR_MAX - begin) { return bytes == 0; }
+    std::lock_guard<std::mutex> lock(g_resident_mu);
+    for (auto * resident : g_residents) {
+        if (!resident->dropped) { continue; }
+        bool overlaps = false;
+        for (const auto & span : resident->spans) {
+            const uintptr_t base = (uintptr_t) span.host;
+            overlaps = overlaps || (begin < base + span.size && base < begin + bytes);
+        }
+        if (!overlaps) { continue; }
+        ggml_cuda_set_device(resident->device);
+        for (const auto & span : resident->spans) {
+            for (size_t offset = 0; offset < span.size;) {
+                const size_t part = std::min(span.size - offset, resident->restore_stage.size());
+                if (!part || cudaMemcpy(resident->restore_stage.data(), (const char *)span.device + offset,
+                            part, cudaMemcpyDeviceToHost) != cudaSuccess) { return 0; }
+                // A hot span may cross registered cold pages and unregistered holes.
+                // CUDA cannot use that mixed host range as one D2H destination.
+                memcpy((char *)const_cast<void *>(span.host) + offset, resident->restore_stage.data(), part);
+                offset += part;
+            }
+        }
+        if (!resident->on_restore || !resident->on_restore(resident->user_data)) { return 0; }
+        resident->dropped = false;
+        MOE_CACHE_LOG("[moe-cache] permanent host restore: bytes=%zu reason=host-source-read copied_from=GPU disk_bytes=0\n", resident->bytes);
+    }
+    return 1;
+}
+
+static bool moe_resident_tensor(const void * host, int device) {
+    std::lock_guard<std::mutex> lock(g_resident_mu);
+    for (const auto * resident : g_residents) {
+        if (resident->device != device) { continue; }
+        for (const auto & tensor : resident->tensors) {
+            if (tensor.data == host) { return true; }
+        }
+    }
+    return false;
+}
+
+static const void * moe_resident_lookup(const void * host, size_t bytes, void * device) {
+    if (!device || ggml_backend_dev_backend_reg((ggml_backend_dev_t)device) != g_moe_cache_owner) { return nullptr; }
+    auto * reg = ggml_backend_dev_backend_reg((ggml_backend_dev_t)device);
+    for (size_t i = 0; i < ggml_backend_reg_dev_count(reg); ++i) {
+        if (ggml_backend_reg_dev_get(reg, i) == device) { return moe_resident_lookup_device(host, bytes, (int)i); }
+    }
+    return nullptr;
+}
+
+static int moe_resident_copy(void * opaque, ggml_tensor * dst, size_t offset, const void * host, size_t size) {
+    auto * backend = (ggml_backend_t)opaque;
+    if (!backend || !dst || !dst->buffer || offset > ggml_nbytes(dst) || size > ggml_nbytes(dst) - offset ||
+            ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)) != g_moe_cache_owner ||
+            ggml_backend_buffer_is_host(dst->buffer) ||
+            ggml_backend_buft_get_device(ggml_backend_buffer_get_type(dst->buffer)) != ggml_backend_get_device(backend)) { return 0; }
+    const void * source = moe_resident_lookup(host, size, ggml_backend_get_device(backend));
+    if (!source) { return 0; }
+    auto * ctx = (ggml_backend_cuda_context *)backend->context;
+    ggml_cuda_set_device(ctx->device);
+    if (cudaMemcpyAsync((char *)dst->data + offset, source, size, cudaMemcpyDeviceToDevice, ctx->stream()) != cudaSuccess) {
+        GGML_ABORT("permanent expert device copy failed");
+    }
+    return 1;
+}
+
+static size_t moe_resident_spans(void * opaque, ggml_moe_resident_span * spans, size_t capacity) {
+    const auto * resident = (const moe_resident *) opaque;
+    if (!resident) { return 0; }
+    if (spans && capacity >= resident->spans.size()) {
+        std::copy(resident->spans.begin(), resident->spans.end(), spans);
+    }
+    return resident->spans.size();
+}
+
+static void moe_resident_dropped(void * opaque, int (*on_restore)(void *), void * user_data) {
+    auto * resident = (moe_resident *) opaque;
+    std::lock_guard<std::mutex> lock(g_resident_mu);
+    resident->on_restore = on_restore;
+    resident->user_data = user_data;
+    resident->dropped = true;
+}
+
+static void moe_resident_destroy(void * opaque) {
+    auto * resident = (moe_resident *) opaque;
+    if (!resident) { return; }
+    std::lock_guard<std::mutex> lock(g_resident_mu);
+    g_residents.erase(std::remove(g_residents.begin(), g_residents.end(), resident), g_residents.end());
+    ggml_cuda_set_device(resident->device);
+    if (resident->slab) { (void) cudaFree(resident->slab); }
+    ggml_moe_cache_resident_notify(false);
+    delete resident;
+}
+
 static int moe_cache_query_device(
         void * opaque, const ggml_moe_cache_config * config,
         ggml_moe_cache_device_caps * result) {
@@ -1381,6 +1510,9 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
                     (double) (job.prediction->deadline - ggml_time_us()) * device->copy_bytes_per_us < job.bytes ||
                     std::any_of(device->queue.begin(), device->queue.end(),
                         [](const moe_cache_job & queued) { return !queued.prediction; });
+            }
+            if (!expired && error == cudaSuccess && !moe_resident_host_restore(job.source, job.bytes)) {
+                error = cudaErrorInvalidValue;
             }
             if (!expired && error == cudaSuccess && stage && stage_capacity >= job.bytes) {
                 memcpy(stage, job.source, job.bytes);
@@ -2798,6 +2930,8 @@ static int moe_cache_lookup_or_queue_locked(
         moe_cache_pool & pool, int pool_index, const void * host_base,
         int32_t expert, size_t expert_size, int & inserts_left,
         bool & wake_worker) {
+    const size_t stride = moe_cache_host_stride(device, host_base, expert_size);
+    if (moe_resident_lookup_device((const char *)host_base + (size_t)expert * stride, expert_size, device.logical)) { return -1; }
     const moe_cache_key key{host_base, expert};
     auto found = pool.map.find(key);
     if (found != pool.map.end()) {
@@ -3780,6 +3914,16 @@ static void moe_cache_invalidate_session(
 }
 
 static void moe_cache_invalidate(const void * base, size_t size) {
+    if (base && size && ggml_moe_cache_has_residents()) {
+        std::lock_guard<std::mutex> lock(g_resident_mu);
+        for (const auto * resident : g_residents) {
+            for (const auto & span : resident->spans) {
+                if (moe_cache_ranges_overlap(base, size, span.host, span.size)) {
+                    GGML_ABORT("permanent expert storage is immutable; unload it before changing weights");
+                }
+            }
+        }
+    }
     if (!base || size == 0 ||
         g_session_count.load(std::memory_order_acquire) == 0) {
         return;
@@ -3862,6 +4006,21 @@ static uint64_t moe_cache_profile_hash(uint64_t hash, const void * data, size_t 
 }
 
 static uint64_t moe_cache_profile_signature(const ggml_moe_cache_tensor_desc * tensors, int n_tensors) {
+    {
+        std::lock_guard<std::mutex> lock(g_resident_mu);
+        for (const auto * resident : g_residents) {
+            if (resident->tensors.size() != (size_t)n_tensors) { continue; }
+            bool same = true;
+            for (int i = 0; i < n_tensors; ++i) {
+                const auto & a = tensors[i];
+                const auto & b = resident->tensors[i];
+                same = same && a.data == b.data && a.expert_size == b.expert_size &&
+                    a.type == b.type && a.n_in == b.n_in && a.n_out == b.n_out && a.n_expert == b.n_expert &&
+                    strcmp(a.name, b.name) == 0;
+            }
+            if (same) { return resident->signature; }
+        }
+    }
     uint64_t hash = UINT64_C(14695981039346656037);
     for (int i = 0; i < n_tensors; ++i) {
         const auto & t = tensors[i];
@@ -3872,6 +4031,9 @@ static uint64_t moe_cache_profile_signature(const ggml_moe_cache_tensor_desc * t
         hash = moe_cache_profile_hash(hash, shape, sizeof(shape));
         const size_t bytes = expert_bytes * (size_t) t.n_expert;
         const size_t sample = std::min<size_t>(bytes, 64);
+        if (!moe_resident_host_restore(t.data, t.expert_size * (size_t)t.n_expert)) {
+            GGML_ABORT("cannot restore permanent experts for profile identity");
+        }
         // Sample across each tensor so equal-shaped models do not share a profile by accident.
         for (size_t j = 0; j < 64; ++j) {
             const size_t offset = ((bytes - sample) / 63) * j;
@@ -3937,6 +4099,125 @@ static bool moe_cache_profile_save(const char * path, uint64_t signature, size_t
     }
     remove(temporary.c_str());
     return false;
+}
+
+static void * moe_resident_create(void * device, const ggml_moe_cache_tensor_desc * tensors, int n_tensors, size_t budget) {
+#if !defined(__linux__)
+    GGML_UNUSED_VARS(device, tensors, n_tensors, budget);
+    return nullptr;
+#else
+    const char * profile = getenv("GGML_MOE_CACHE_PROFILE_LOAD");
+    if (!device || !tensors || n_tensors <= 0 || n_tensors > 4096 || !profile || !*profile ||
+            budget < (1u << 20) || budget > (4ull << 30) ||
+            ggml_backend_dev_backend_reg((ggml_backend_dev_t)device) != g_moe_cache_owner) { return nullptr; }
+    ggml_moe_cache_config config{};
+    ggml_moe_cache_device_caps caps{};
+    config.min_compute_capability = moe_cache_cc_forced_min;
+    if (!moe_cache_query_device(device, &config, &caps)) { return nullptr; }
+    std::unique_ptr<moe_resident> resident(new moe_resident);
+    resident->device = caps.logical_device;
+    size_t entries = 0;
+    for (int i = 0; i < n_tensors; ++i) {
+        const auto & t = tensors[i];
+        if (!t.name || !t.data || !ggml_moe_cache_wtype_supported(t.type) ||
+                t.n_in <= 0 || t.n_in > INT_MAX || t.n_out <= 0 || t.n_out > INT_MAX || t.n_expert <= 0 || t.n_expert > 4096 ||
+                t.n_in % ggml_blck_size((ggml_type)t.type)) { return nullptr; }
+        const size_t row = ggml_row_size((ggml_type)t.type, t.n_in);
+        if (!row || (uint64_t)t.n_out > SIZE_MAX / row) { return nullptr; }
+        const size_t bytes = row * (size_t)t.n_out;
+        if (t.expert_size < bytes || (uint64_t)t.n_expert > SIZE_MAX / t.expert_size ||
+                (size_t)t.n_expert * t.expert_size > UINTPTR_MAX - (uintptr_t)t.data ||
+                (size_t)t.n_expert > SIZE_MAX - entries) { return nullptr; }
+        entries += (size_t)t.n_expert;
+    }
+    resident->signature = moe_cache_profile_signature(tensors, n_tensors);
+    std::vector<std::vector<uint64_t>> storage;
+    std::vector<const uint64_t *> counts;
+    if (!moe_cache_profile_load(profile, resident->signature, entries, tensors, n_tensors, storage, counts)) {
+        MOE_CACHE_LOG("[moe-cache] permanent residency refused: invalid profile\n");
+        return nullptr;
+    }
+    struct candidate { const void * host; size_t bytes; long double priority; };
+    std::vector<candidate> ranked;
+    ranked.reserve(entries);
+    int last_layer = -1;
+    for (int i = 0; i < n_tensors; ++i) {
+        int layer = -1;
+        if (moe_cache_layer_number(tensors[i].name, layer)) { last_layer = std::max(last_layer, layer); }
+    }
+    for (int i = 0; i < n_tensors; ++i) {
+        const auto & t = tensors[i];
+        const size_t bytes = ggml_row_size((ggml_type)t.type, t.n_in) * (size_t)t.n_out;
+        long double total = 0;
+        for (int64_t e = 0; e < t.n_expert; ++e) { total += counts[i][e]; }
+        int layer = 0;
+        moe_cache_layer_number(t.name, layer);
+        if (layer == last_layer) { continue; }
+        for (int64_t e = 0; e < t.n_expert; ++e) {
+            if (!counts[i][e]) { continue; }
+            ranked.push_back({(const char *)t.data + (size_t)e * t.expert_size, bytes,
+                    counts[i][e] / std::max(1.0L, total) * (1 + 4.0L / (1.0L + layer)) / bytes});
+        }
+    }
+    std::stable_sort(ranked.begin(), ranked.end(), [](const candidate & a, const candidate & b) { return a.priority > b.priority; });
+    std::vector<candidate> selected;
+    for (const auto & c : ranked) {
+        if (c.bytes <= budget - resident->bytes) {
+            selected.push_back(c);
+            resident->bytes += c.bytes;
+        }
+    }
+    // A profile with too little coverage cannot silently turn the requested RAM cut into a smaller one.
+    if (resident->bytes < budget - std::min<size_t>(16u << 20, budget / 16)) { return nullptr; }
+    ggml_cuda_set_device(resident->device);
+    size_t free = 0, total = 0;
+    const size_t card_cap = 23552ull << 20;
+    if (cudaMemGetInfo(&free, &total) != cudaSuccess || total < free ||
+            free < resident->bytes + (1ull << 30) ||
+            total - free > card_cap || resident->bytes > card_cap - (total - free)) {
+        MOE_CACHE_LOG("[moe-cache] permanent residency refused: VRAM capacity\n");
+        return nullptr;
+    }
+    resident->tensors.assign(tensors, tensors + n_tensors);
+    resident->spans.reserve(selected.size());
+    size_t restore_bytes = 0;
+    for (const auto & c : selected) { restore_bytes = std::max(restore_bytes, c.bytes); }
+    resident->restore_stage.resize(std::min<size_t>(restore_bytes, 8u << 20));
+    if (cudaMalloc(&resident->slab, resident->bytes) != cudaSuccess) { return nullptr; }
+    size_t offset = 0;
+    for (const auto & c : selected) {
+        void * destination = (char *)resident->slab + offset;
+        if (cudaMemcpy(destination, c.host, c.bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+            (void) cudaFree(resident->slab);
+            return nullptr;
+        }
+        resident->spans.push_back({c.host, destination, c.bytes});
+        offset += c.bytes;
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_resident_mu);
+        for (const auto * other : g_residents) {
+            for (const auto & t : other->tensors) {
+                for (int i = 0; i < n_tensors; ++i) {
+                    if (t.data == tensors[i].data) {
+                        (void) cudaFree(resident->slab);
+                        return nullptr;
+                    }
+                }
+            }
+        }
+        try {
+            g_residents.push_back(resident.get());
+        } catch (...) {
+            (void) cudaFree(resident->slab);
+            throw;
+        }
+        ggml_moe_cache_resident_notify(true);
+    }
+    MOE_CACHE_LOG("[moe-cache] permanent residency: original_bytes=%zu experts=%zu restore_staging_bytes=%zu profile_identity=verified lifetime=model\n",
+            resident->bytes, resident->spans.size(), resident->restore_stage.size());
+    return resident.release();
+#endif
 }
 
 // fork: a saved ranking is a startup hint; current prompt observations replace it.
@@ -4374,6 +4655,8 @@ static int moe_cache_warm(void * opaque, const ggml_moe_cache_tensor_desc * tens
         if (!node) {
             continue;
         }
+        if (moe_resident_lookup_device((const char *)node->host_base + (size_t)c.expert *
+                moe_cache_host_stride(*node->device, node->host_base, node->expert_size), node->expert_size, node->device->logical)) { continue; }
         bool wake = false;
         {
             std::unique_lock<std::mutex> lock(session->mu);
@@ -4693,6 +4976,8 @@ static void moe_cache_prefetch(void * opaque, const ggml_moe_cache_tensor_desc *
         for (int rank = 0; rank < n_ids && budget > 0; ++rank) {
             for (int t = 0; t < n_tensors; ++t) {
                 const auto & desc = tensors[t];
+                if (ids[rank] >= 0 && ids[rank] < desc.n_expert && desc.data &&
+                        moe_resident_lookup_device((const char *)desc.data + (size_t)ids[rank] * source_strides[t], desc.expert_size, device.logical)) { continue; }
                 if (ids[rank] < 0 || ids[rank] >= desc.n_expert || !desc.data || desc.expert_size > budget) {
                     continue;
                 }
@@ -5093,6 +5378,8 @@ static void moe_cache_device_adapt(moe_cache_session & session) {
             }
             for (int32_t e = 0; e < table.desc.n_expert; ++e) {
                 const uint64_t used = recent[table.count_offset + e];
+                if (moe_resident_lookup_device((const char *)table.desc.data + (size_t)e * table.host_stride,
+                        table.desc.expert_size, device.logical)) { continue; }
                 if (used >= (uint64_t)std::max(1, session.config.readmit_after) &&
                         pool->map.find({table.desc.data, e}) == pool->map.end()) {
                     missing.push_back({&table, pool, e, used});
@@ -5665,8 +5952,9 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
             table.desc = d;
             table.desc.expert_size = expert_bytes;
             table.host_stride = d.expert_size;
+            table.permanent_sources = moe_resident_tensor(d.data, device.logical);
             cudaPointerAttributes attributes{};
-            if (cudaPointerGetAttributes(&attributes, d.data) == cudaSuccess && attributes.type == cudaMemoryTypeHost) {
+            if (!table.permanent_sources && cudaPointerGetAttributes(&attributes, d.data) == cudaSuccess && attributes.type == cudaMemoryTypeHost) {
                 void * alias = nullptr;
                 if (cudaHostGetDevicePointer(&alias, const_cast<void *>(d.data), 0) == cudaSuccess) {
                     table.borrowed = alias;
@@ -5679,8 +5967,12 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
             table.count_offset = count_entries;
             count_entries += d.n_expert;
             for (int32_t e = 0; e < d.n_expert; ++e) {
-                const void * address = nullptr;
+                const void * permanent = moe_resident_lookup_device((const char *)d.data + (size_t)e * d.expert_size,
+                        expert_bytes, device.logical);
+                const void * address = permanent;
+                if (permanent) { hot_bytes += expert_bytes; }
                 for (const auto & pool : device.pools) {
+                    if (permanent) { break; }
                     if (pool->expert_size != expert_bytes || pool->wtype != d.type) {
                         continue;
                     }
@@ -5694,9 +5986,20 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
                 }
                 const uintptr_t begin = base + (size_t)e * d.expert_size;
                 size_t source_range = 0;
-                table.fallback[e] = table.borrowed ? (const char *)table.borrowed + (size_t)e * table.host_stride :
-                    mappings.find(begin, expert_bytes, &source_range);
-                if (!table.borrowed && !address && table.fallback[e]) { retained_needed[source_range] = 1; }
+                if (table.permanent_sources) {
+                    if (!permanent) {
+                        void * alias = nullptr;
+                        void * last = nullptr;
+                        if (cudaHostGetDevicePointer(&alias, (void *)begin, 0) != cudaSuccess ||
+                                cudaHostGetDevicePointer(&last, (void *)(begin + expert_bytes - 1), 0) != cudaSuccess ||
+                                (const char *)last != (const char *)alias + expert_bytes - 1) { return fail(); }
+                        table.fallback[e] = alias;
+                    }
+                } else {
+                    table.fallback[e] = table.borrowed ? (const char *)table.borrowed + (size_t)e * table.host_stride :
+                        mappings.find(begin, expert_bytes, &source_range);
+                }
+                if (!table.permanent_sources && !table.borrowed && !address && table.fallback[e]) { retained_needed[source_range] = 1; }
                 if (!address && !table.fallback[e]) {
                     pending_ranges.push_back({begin & ~(page - 1),
                             (begin + expert_bytes + page - 1) & ~(page - 1), nullptr, nullptr, false});
@@ -5950,10 +6253,12 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
             for (size_t e = 0; e < table.addresses.size(); ++e) {
                 const uintptr_t host = (uintptr_t)table.desc.data + e * table.host_stride;
                 size_t source_range = 0;
-                table.fallback[e] = table.borrowed ? (const char *)table.borrowed + e * table.host_stride :
-                    mappings.find(host, table.desc.expert_size, &source_range);
-                table.copy_source[e] = table.borrowed ? (const void *)host : nullptr;
-                if (table.fallback[e] && !table.borrowed) {
+                if (!table.permanent_sources) {
+                    table.fallback[e] = table.borrowed ? (const char *)table.borrowed + e * table.host_stride :
+                        mappings.find(host, table.desc.expert_size, &source_range);
+                }
+                table.copy_source[e] = table.borrowed || (table.permanent_sources && table.fallback[e]) ? (const void *)host : nullptr;
+                if (table.fallback[e] && !table.borrowed && !table.permanent_sources) {
                     // find() proved complete containment in this descriptor-bound
                     // retained range. Never use its CUDA alias as a host pointer.
                     const auto & range = session->mapped_ranges[source_range];
@@ -6011,6 +6316,13 @@ static void moe_cache_register(const void * owner) {
     g_moe_cache_owner = owner;
     ggml_moe_cache_api api = {};
     api.owner = owner;
+    api.resident_create = moe_resident_create;
+    api.resident_destroy = moe_resident_destroy;
+    api.resident_spans = moe_resident_spans;
+    api.resident_dropped = moe_resident_dropped;
+    api.host_restore = moe_resident_host_restore;
+    api.resident_lookup = moe_resident_lookup;
+    api.resident_copy = moe_resident_copy;
     api.session_status = moe_cache_session_status;
     api.query_config = moe_cache_query_config;
     api.query_device = moe_cache_query_device;

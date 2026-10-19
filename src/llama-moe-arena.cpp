@@ -7,6 +7,7 @@
 #include <fstream>
 #include <stdexcept>
 #include <vector>
+#include <algorithm>
 #ifndef _WIN32
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -140,18 +141,94 @@ llama_moe_arena::llama_moe_arena(size_t bytes) : size(bytes) {
 }
 
 void llama_moe_arena::pin() {
+    pin_ranges.reserve(1);
     auto * reg = arena_cuda_reg();
-    auto pin_fn = (bool (*)(void *, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_host_pin");
+    pin_range = (bool (*)(void *, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_host_pin");
     unpin = (void (*)(void *)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_host_unpin");
-    if (!pin_fn || !unpin || !pin_fn(data, size)) {
+    if (!pin_ranges.empty() || !pin_range || !unpin || !pin_range(data, size)) {
         throw std::runtime_error("expert arena CUDA host registration failed");
     }
-    pinned = true;
+    pin_ranges.emplace_back(0, size);
+}
+
+size_t llama_moe_arena::discard(const std::vector<std::pair<size_t, size_t>> & ranges) {
+#ifndef _WIN32
+    if (pin_ranges.size() != 1 || pin_ranges[0] != std::make_pair(size_t(0), size) || !missing_ranges.empty()) {
+        throw std::runtime_error("expert arena discard requires its original full registration");
+    }
+    const long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) { throw std::runtime_error("cannot query arena page size"); }
+    const size_t page = (size_t) page_size;
+    std::vector<std::pair<size_t, size_t>> covered;
+    for (const auto & range : ranges) {
+        if (range.first > size || range.second > size - range.first) {
+            throw std::out_of_range("resident expert span exceeds arena");
+        }
+        if (range.second) { covered.emplace_back(range.first, range.first + range.second); }
+    }
+    std::sort(covered.begin(), covered.end());
+    std::vector<std::pair<size_t, size_t>> merged;
+    for (const auto & range : covered) {
+        if (!merged.empty() && range.first <= merged.back().second) {
+            merged.back().second = std::max(merged.back().second, range.second);
+        } else {
+            merged.push_back(range);
+        }
+    }
+    std::vector<std::pair<size_t, size_t>> holes, cold;
+    size_t cursor = 0, dropped = 0;
+    for (const auto & range : merged) {
+        const size_t padding = range.first % page ? page - range.first % page : 0;
+        if (padding > range.second - range.first) { continue; }
+        const size_t begin = range.first + padding;
+        const size_t end = range.second - range.second % page;
+        if (begin >= end) { continue; }
+        if (cursor < begin) { cold.emplace_back(cursor, begin - cursor); }
+        holes.emplace_back(begin, end - begin);
+        dropped += end - begin;
+        cursor = end;
+    }
+    if (!dropped) { return 0; }
+    if (cursor < size) { cold.emplace_back(cursor, size - cursor); }
+    pin_ranges.reserve(cold.size() + holes.size());
+    // The GPU owner must preserve every covered byte before this transition.
+    unpin(data);
+    pin_ranges.clear();
+    for (const auto & range : cold) {
+        if (!pin_range((char *) data + range.first, range.second)) {
+            for (const auto & pinned : pin_ranges) { unpin((char *) data + pinned.first); }
+            pin_ranges.clear();
+            if (pin_range(data, size)) { pin_ranges.emplace_back(0, size); }
+            throw std::runtime_error("cannot pin cold arena pages; no expert bytes discarded");
+        }
+        pin_ranges.push_back(range);
+    }
+    missing_ranges = std::move(holes);
+    for (const auto & range : missing_ranges) {
+        if (madvise((char *) data + range.first, range.second, MADV_DONTNEED) != 0) {
+            throw std::runtime_error("cannot discard GPU-backed arena pages");
+        }
+    }
+    return dropped;
+#else
+    (void) ranges;
+    throw std::runtime_error("expert arena discard requires mmap");
+#endif
+}
+
+void llama_moe_arena::pin_restored() {
+    for (const auto & range : missing_ranges) {
+        if (!pin_range((char *) data + range.first, range.second)) {
+            throw std::runtime_error("cannot pin restored arena pages");
+        }
+        pin_ranges.push_back(range);
+    }
+    missing_ranges.clear();
 }
 
 llama_moe_arena::~llama_moe_arena() {
     buffer.reset();
-    if (pinned) { unpin(data); }
+    for (const auto & range : pin_ranges) { unpin((char *) data + range.first); }
 #ifndef _WIN32
     if (data) { munmap(data, size); }
 #endif

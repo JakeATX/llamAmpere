@@ -50,6 +50,13 @@ struct ggml_moe_cache_tensor_desc {
     int32_t type;
 };
 
+// fork: immutable model-owned original expert copies, independent of scheduler sessions.
+struct ggml_moe_resident_span {
+    const void * host;
+    const void * device;
+    size_t size;
+};
+
 enum ggml_moe_cache_mode {
     GGML_MOE_CACHE_MODE_UNSPECIFIED = -1,
     GGML_MOE_CACHE_MODE_OFF = 0,
@@ -59,6 +66,18 @@ enum ggml_moe_cache_mode {
 
 struct ggml_moe_cache_api {
     const void * owner;
+
+    // fork: startup-only permanent residency. Creation requires a valid saved profile.
+    void * (*resident_create)(void * device, const struct ggml_moe_cache_tensor_desc * tensors, int n_tensors, size_t budget);
+    void (*resident_destroy)(void * resident);
+    size_t (*resident_spans)(void * resident, struct ggml_moe_resident_span * spans, size_t capacity);
+    // Mark only after an idle caller has safely discarded covered anonymous host pages.
+    void (*resident_dropped)(void * resident, int (*on_restore)(void *), void * user_data);
+    // Restore all missing host bytes that overlap a read, from the permanent GPU copy.
+    int (*host_restore)(const void * data, size_t size);
+    // Exact original bytes, on this device, or NULL. The model owns the result's lifetime.
+    int (*resident_copy)(void * backend, struct ggml_tensor * dst, size_t offset, const void * host, size_t size);
+    const void * (*resident_lookup)(const void * data, size_t size, void * device);
 
     // Read-only startup status; returns 1 for an active session, 0 for dormant.
     int (*session_status)(void * session, size_t * allocated_bytes);
@@ -198,6 +217,14 @@ static inline int ggml_moe_cache_wtype_supported(int wtype) {
     }
     return 0;
 }
+
+GGML_API bool ggml_moe_cache_has_residents(void);
+GGML_API void ggml_moe_cache_resident_notify(bool created);
+
+// Read barriers are independent of thread-local cache suspension.
+GGML_API void ggml_moe_cache_host_restore(const void * data, size_t size);
+GGML_API bool ggml_moe_cache_resident_copy(ggml_backend_t backend, struct ggml_tensor * dst, size_t offset, const void * host, size_t size);
+GGML_API const void * ggml_moe_cache_resident_lookup(const void * data, size_t size, ggml_backend_dev_t device);
 
 GGML_API void ggml_moe_cache_register(const struct ggml_moe_cache_api * api);
 GGML_API void ggml_moe_cache_unregister(const void * owner);

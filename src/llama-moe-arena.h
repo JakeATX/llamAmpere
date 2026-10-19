@@ -3,6 +3,8 @@
 #include "ggml-cpp.h"
 #include <cstddef>
 #include <cstdint>
+#include <utility>
+#include <vector>
 
 // fork: reclaimable storage for a large, temporary MTP output, with unchanged floats.
 struct llama_moe_output {
@@ -29,11 +31,15 @@ struct llama_moe_arena {
     explicit llama_moe_arena(size_t bytes);
     ~llama_moe_arena();
     void pin();
+    size_t discard(const std::vector<std::pair<size_t, size_t>> & ranges);
+    void pin_restored();
 
     void * data = nullptr;
     size_t size = 0;
     ggml_backend_buffer_ptr buffer;
 private:
-    bool pinned = false;
+    std::vector<std::pair<size_t, size_t>> pin_ranges;
+    std::vector<std::pair<size_t, size_t>> missing_ranges;
+    bool (*pin_range)(void *, size_t) = nullptr;
     void (*unpin)(void *) = nullptr;
 };

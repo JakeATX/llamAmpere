@@ -19,6 +19,7 @@ struct llama_ubatch;
 struct llama_ple_cache;
 struct llama_model_loader;
 struct llama_model;
+struct ggml_moe_cache_tensor_desc;
 
 // available models
 enum llm_type {
@@ -824,6 +825,7 @@ struct llama_model {
 
     size_t size() const; // file size
     size_t moe_arena_size() const;
+    void moe_resident_init(ggml_backend_dev_t device, const ggml_moe_cache_tensor_desc * tensors, int count) const;
     size_t n_tensors() const;
     size_t n_devices() const;
     const float * tensor_split() const;

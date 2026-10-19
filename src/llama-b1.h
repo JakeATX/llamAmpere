@@ -31,6 +31,7 @@ struct llama_b1_stats {
     double   t_copy_submit_ms = 0.0; // overlapped copy pipeline host wall time
     double   t_wait_ms    = 0.0; // compute thread waiting on the copy thread (host side)
     uint64_t bytes_h2d    = 0;   // expert bytes streamed to the GPU in this decode call
+    uint64_t bytes_d2d    = 0;   // original permanent expert bytes copied within the GPU
     uint64_t bytes_lent   = 0;   // resident expert bytes borrowed
     uint64_t bytes_fresh  = 0;   // free VRAM allocated
     uint64_t bytes_carry  = 0;

@@ -94,9 +94,61 @@ static bool test_reclaimable_output(bool cuda = false) {
 #endif
 }
 
+static bool test_sparse_arena() {
+#ifndef _WIN32
+    ggml_backend_load_all();
+    ggml_backend_t backend = ggml_backend_init_by_name("CUDA0", nullptr);
+    if (!backend) { return false; }
+    const size_t page = (size_t) sysconf(_SC_PAGESIZE), bytes = 32 * page;
+    llama_moe_arena arena(bytes);
+    auto * data = static_cast<uint32_t *>(arena.data);
+    for (size_t i = 0; i < bytes / sizeof(*data); ++i) { data[i] = uint32_t(i * 2654435761u); }
+    arena.pin();
+    ggml_init_params params = { ggml_tensor_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(params);
+    ggml_tensor * tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, bytes / sizeof(float));
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buffer) { ggml_free(ctx); ggml_backend_free(backend); return false; }
+    ggml_backend_tensor_set(tensor, data, 0, bytes);
+    bool ok = true;
+    for (const auto & range : std::vector<std::pair<size_t, size_t>>{{bytes + 1, 0}, {bytes, 1}, {1, SIZE_MAX}}) {
+        bool rejected = false;
+        try { arena.discard({range}); } catch (const std::out_of_range &) { rejected = true; }
+        ok &= rejected;
+    }
+    // The first two adjacent ranges jointly cover full pages; tiny tails do not.
+    const size_t dropped = arena.discard({{10 * page + 1, 4 * page}, {page + 1, page},
+                                         {2 * page + 1, 2 * page - 1}, {20 * page + 1, 1}});
+    ok &= dropped == 5 * page;
+    std::vector<unsigned char> resident(bytes / page);
+    ok &= mincore(data, bytes, resident.data()) == 0;
+    for (size_t p = 0; p < resident.size(); ++p) {
+        const bool hole = (p >= 2 && p < 4) || (p >= 11 && p < 14);
+        ok &= bool(resident[p] & 1) == !hole;
+        if (!hole) {
+            for (size_t i = p * page / 4; i < (p + 1) * page / 4; ++i) { ok &= data[i] == uint32_t(i * 2654435761u); }
+        }
+    }
+    // CUDA rejects destinations that cross registered and unregistered pages.
+    std::vector<uint32_t> staging(bytes / sizeof(*data));
+    ggml_backend_tensor_get(tensor, staging.data(), 0, bytes);
+    memcpy(data, staging.data(), bytes);
+    arena.pin_restored();
+    for (size_t i = 0; i < bytes / sizeof(*data); ++i) { ok &= data[i] == uint32_t(i * 2654435761u); }
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+    printf("sparse expert arena exact cold pages and GPU restore: %s\n", ok ? "OK" : "FAIL");
+    return ok;
+#else
+    return false;
+#endif
+}
+
 // Exercise the original mixed IQ blocks with the arena's gate/up/down stride.
 int main(int argc, char ** argv) {
     if (argc == 2 && strcmp(argv[1], "--cuda-output") == 0) { return test_reclaimable_output(true) ? 0 : 1; }
+    if (argc == 2 && strcmp(argv[1], "--cuda-arena") == 0) { return test_sparse_arena() ? 0 : 1; }
     if (argc != 1) { return 2; }
     constexpr int64_t n_in = 256, n_out = 32, n_experts = 3;
     const ggml_type types[] = { GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ4_NL };
