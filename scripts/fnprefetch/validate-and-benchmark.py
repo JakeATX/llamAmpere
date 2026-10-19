@@ -26,6 +26,18 @@ try:
   record['steps'].append(name);save()
  stage('model','certify.py',('model',))
  stage('reload','certify.py',('reload',))
+ record['status']='waiting for matching ship regression';save()
+ regression_path=Path(os.environ['FN_BASELINE_REGRESSION'])
+ guard_path=regression_path.parent.parent/(regression_path.parent.name+'-guard.json')
+ while True:
+  regression=json.loads(regression_path.read_text()) if regression_path.exists() else None
+  guard=json.loads(guard_path.read_text()) if guard_path.exists() else None
+  if regression:
+   assert regression['source_commit'].startswith(baseline_tag) and regression['status']=='passed',regression
+  if guard:assert guard['returncode']==0 and guard['guard'] is None,guard
+  if regression and guard:break
+  assert time.monotonic()<deadline,'baseline certification wait exhausted'
+  time.sleep(15)
  stage('selection','selection-gate.py')
  stage('capacity','preflight-gate.py')
  record['status']='full paired protocol';save()
