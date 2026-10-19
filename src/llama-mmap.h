@@ -57,6 +57,7 @@ struct llama_mmap {
     void * addr() const;
 
     void unmap_fragment(size_t first, size_t last);
+    void remap_private_writable(struct llama_file * file, size_t first, size_t last);
 
     static const bool SUPPORTED;
 

@@ -1556,7 +1556,7 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
     }
 }
 
-void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps) {
+void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps, bool private_dense) {
     // note: read_lazy also requires mmap; this condition make sure it's usable even when --load-mode is not set to mmap
     if (use_mmap || lazy.any()) {
         mappings.reserve(files.size());
@@ -1579,6 +1579,16 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
 
             std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch_size, is_numa,
                     lazy.for_file(idx));
+            if (private_dense) {
+                for (const char * name : { "token_embd.weight", "output.weight" }) {
+                    auto found = weights_map.find(name);
+                    if (found != weights_map.end() && found->second.idx == idx) {
+                        const auto & weight = found->second;
+                        mapping->remap_private_writable(file.get(), weight.offs, weight.offs + ggml_nbytes(weight.tensor));
+                        LLAMA_LOG_INFO("%s: private dense mapping %s for borrowed CUDA host residency; file unchanged\n", __func__, name);
+                    }
+                }
+            }
             mmaps_used.emplace_back(mapping->size(), 0);
             if (mlock_mmaps) {
                 std::unique_ptr<llama_mlock> mlock_mmap(new llama_mlock());

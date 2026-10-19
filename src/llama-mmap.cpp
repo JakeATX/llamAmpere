@@ -689,6 +689,26 @@ void * llama_mmap::addr() const { return pimpl->addr; }
 
 void llama_mmap::unmap_fragment(size_t first, size_t last) { pimpl->unmap_fragment(first, last); }
 
+void llama_mmap::remap_private_writable(llama_file * file, size_t first, size_t last) {
+#ifdef _POSIX_MAPPED_FILES
+    const size_t page = sysconf(_SC_PAGESIZE);
+    if (first >= last || last > size() || last > SIZE_MAX - (page - 1)) {
+        throw std::runtime_error("invalid private tensor mapping range");
+    }
+    first &= ~(page - 1);
+    last = (last + page - 1) & ~(page - 1);
+    void * target = (char *) addr() + first;
+    if (mmap(target, last - first, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_PRIVATE, file->file_id(), first) == MAP_FAILED) {
+        throw std::runtime_error(format("private tensor remap failed: %s", strerror(errno)));
+    }
+#else
+    GGML_UNUSED(file);
+    GGML_UNUSED(first);
+    GGML_UNUSED(last);
+    throw std::runtime_error("private tensor remap unsupported on this platform");
+#endif
+}
+
 #if defined(_POSIX_MEMLOCK_RANGE) || defined(_WIN32)
 const bool llama_mmap::SUPPORTED  = true;
 #else
