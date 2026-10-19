@@ -39,6 +39,9 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
+#include <cstdlib>
+
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -47,6 +50,10 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 
 //
 // llama_context
@@ -183,6 +190,32 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
             return LLM_GRAPH_TYPE_DECODER_MTP;
     }
     throw std::runtime_error("Unsupported ctx type");
+}
+
+// fork: free allocator pages between B1 layers; live buffers remain allocated.
+static void b1_memory_trim(const char * phase) {
+#if defined(__GLIBC__)
+    const int saved_errno = errno;
+    const char * enabled = std::getenv("LLAMA_B1_MALLOC_TRIM");
+    if (!enabled || strcmp(enabled, "1") != 0) { errno = saved_errno; return; }
+#if __GLIBC_PREREQ(2, 33)
+    const auto before = mallinfo2();
+#endif
+    const int64_t started = ggml_time_us();
+    const int released = malloc_trim(0);
+    const int64_t elapsed = ggml_time_us() - started;
+#if __GLIBC_PREREQ(2, 33)
+    const auto after = mallinfo2();
+    LLAMA_LOG_INFO("%s: phase=%s released=%d time_us=%" PRId64 " arena_before=%zu arena_after=%zu used_before=%zu used_after=%zu free_before=%zu free_after=%zu mmap_before=%zu mmap_after=%zu\n",
+            __func__, phase, released, elapsed, before.arena, after.arena, before.uordblks, after.uordblks,
+            before.fordblks, after.fordblks, before.hblkhd, after.hblkhd);
+#else
+    LLAMA_LOG_INFO("%s: phase=%s released=%d time_us=%" PRId64 "\n", __func__, phase, released, elapsed);
+#endif
+    errno = saved_errno;
+#else
+    (void) phase;
+#endif
 }
 
 llama_context::llama_context(const llama_model & model, llama_context_params params) :
@@ -5812,6 +5845,7 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
 
     LLAMA_LOG_WARN("%s: [B1] layer-major prefill of %u tokens: %zu ubatches, %zu groups of %zu, %s\n", __func__,
             n_tokens_all, sizes.size(), b1->n_groups(), b1->group_ub(), others ? "other sequences present" : "alone");
+    b1_memory_trim("B1 prepared");
     return 1;
 }
 
@@ -6234,6 +6268,7 @@ bool llama_context::b1_run_prefix(llama_memory_context_i * mctx, size_t ub0, ggm
             }
         }
         b1->layer_end(l0);
+        b1_memory_trim("B1 layer complete");
         l0 = l1;
     }
 
