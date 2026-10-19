@@ -37,6 +37,7 @@
 #include <cmath>
 #include <functional>
 #include <map>
+#include <mutex>
 #include <numeric>
 #include <regex>
 #include <sstream>
@@ -1323,6 +1324,8 @@ struct llama_model::impl {
 
     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
+    std::mutex borrowed_host_mutex;
+    std::map<const ggml_tensor *, std::unique_ptr<llama_mlock>> borrowed_host_locks;
 
     buft_list_t cpu_buft_list;
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
@@ -2486,6 +2489,25 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     return true;
 }
 
+void llama_model::pin_borrowed_host_tensor(ggml_tensor * tensor) const {
+    if (!ggml_backend_buffer_is_host(tensor->buffer)) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(pimpl->borrowed_host_mutex);
+    if (pimpl->borrowed_host_locks.count(tensor)) {
+        return;
+    }
+    const size_t bytes = ggml_nbytes(tensor);
+    auto pinned = std::make_unique<llama_mlock>();
+    pinned->init(tensor->data);
+    pinned->grow_to(bytes);
+    if (pinned->locked_size() < bytes) {
+        throw std::runtime_error(format("cannot pin borrowed host tensor %s; request-time weight residency is required", tensor->name));
+    }
+    pimpl->borrowed_host_locks.emplace(tensor, std::move(pinned));
+    LLAMA_LOG_INFO("%s: pinned borrowed host %s (%.2f MiB); donor-owned, no second weight allocation\n", __func__, tensor->name, bytes / 1048576.0);
+}
+
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     // fork: Reuse only dense, byte-identical tensors. The donor retains their buffers and metadata.
     if (params.tensor_borrow_from && n_devices() <= 1 && params.tensor_borrow_from->n_devices() <= 1 &&
@@ -2494,6 +2516,10 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
             (tn.tensor == LLM_TENSOR_OUTPUT || tn.tensor == LLM_TENSOR_TOKEN_EMBD)) {
         auto * donor = tn.tensor == LLM_TENSOR_OUTPUT ? params.tensor_borrow_from->output : params.tensor_borrow_from->tok_embd;
         if (donor && ml.try_borrow_tensor(tn, ne, donor)) {
+            // fork: Keep shared CPU weights resident without locking the PLE table.
+            if (const char * pin = std::getenv("LLAMA_MTP_PIN_BORROWED_HOST"); pin && std::atoi(pin) != 0) {
+                params.tensor_borrow_from->pin_borrowed_host_tensor(donor);
+            }
             tensors_by_name.emplace_back(donor->name, donor);
             return donor;
         }
