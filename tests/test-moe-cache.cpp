@@ -3424,6 +3424,22 @@ static bool run_profile_persistence(ggml_backend_t gpu, ggml_backend_t cpu, log_
     } else {
         ok = false;
     }
+    // A resumed session receives prompt counts before an explicit profile load.
+    reader = create_direct_session(gpu, cpu);
+    if (reader) {
+        capture.clear();
+        std::vector<uint64_t> zeros(experts, 0);
+        const uint64_t * zero_counts[] = {zeros.data()};
+        ok &= api.warm(reader, &loaded, zero_counts, 1) == 0;
+        ok &= capture.get().find("profile loaded:") != std::string::npos;
+        api.session_enter(reader);
+        ok &= direct_plan_one(loaded.name, loaded.data, expert_bytes,
+                shape_in, shape_out, GGML_TYPE_Q4_0, experts, 64) == 1;
+        ok &= direct_plan_one(loaded.name, loaded.data, expert_bytes,
+                shape_in, shape_out, GGML_TYPE_Q4_0, experts, 0) == 0;
+        api.session_leave(reader);
+        api.session_destroy(reader);
+    } else { ok = false; }
     // The same profile must load against an interleaved expert arena.
     std::vector<uint8_t> interleaved(expert_bytes * experts * 3, 0xa5);
     for (int64_t e = 0; e < experts; ++e) {
