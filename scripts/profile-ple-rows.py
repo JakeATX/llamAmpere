@@ -76,6 +76,15 @@ def main():
         lookup_misses += len(absent)
         tokens_with_misses += bool(absent)
         missing.update(absent)
+    # The server runs BOS/EOS warmup before accepting requests. Keep its rows
+    # separate from prompt coverage so startup does not alter held-out counts.
+    warmup = [reader.fields[key].contents() for key in
+              ('tokenizer.ggml.bos_token_id', 'tokenizer.ggml.eos_token_id') if key in reader.fields]
+    if not warmup:
+        warmup = [0]
+    warmup_rows = set()
+    for rows in ple_rows(warmup, meta):
+        warmup_rows.update(rows)
     args.out.mkdir(parents=True, exist_ok=True)
     def write_profile(name, rows):
         path = args.out / name
@@ -93,6 +102,9 @@ def main():
                             'unique_missing_rows': len(missing), 'tokens_with_misses': tokens_with_misses},
               'prompt_profile': write_profile('prompt.rows', profile),
               'replay_profile': write_profile('replay.rows', profile | missing),
+              'warmup': {'tokens': warmup, 'rows': len(warmup_rows)},
+              'startup_prompt_profile': write_profile('startup-prompt.rows', profile | warmup_rows),
+              'startup_replay_profile': write_profile('startup-replay.rows', profile | missing | warmup_rows),
               'replay_warning': 'Replay includes known generated IDs; zero misses by construction, not evidence of future coverage. MTP rejected draft tokens may require additional rows.'}
     (args.out / 'coverage.json').write_text(json.dumps(result, indent=2) + '\n')
     print(json.dumps(result, indent=2))
