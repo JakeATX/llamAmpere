@@ -11,6 +11,7 @@
 //   4. round-trips the whole-context state and a state file,
 //   5. checks that restoring into a cache with a different SJ-KVaRN config (body type, bits, tail, staging,
 //      plain cache) fails and leaves the target cache untouched.
+// A generated qwen2vl (M-RoPE) model checks image prompts, whose tokens share a position (run_mrope).
 //
 //   test-sjkvarn-state          all cases
 
@@ -55,11 +56,11 @@ static void tensor_data(ggml_tensor * tensor, void * /*userdata*/) {
     ggml_backend_tensor_set(tensor, tmp.data(), 0, ggml_nbytes(tensor));
 }
 
-static llama_model * make_model() {
+static llama_model * make_model(llm_arch arch = LLM_ARCH_LLAMA) {
     gguf_context * meta = gguf_init_empty();
     {
-        llama_model_saver ms(LLM_ARCH_LLAMA, meta);
-        ms.add_kv(LLM_KV_GENERAL_ARCHITECTURE,         llm_arch_name(LLM_ARCH_LLAMA));
+        llama_model_saver ms(arch, meta);
+        ms.add_kv(LLM_KV_GENERAL_ARCHITECTURE,         llm_arch_name(arch));
         ms.add_kv(LLM_KV_VOCAB_SIZE,                   n_vocab);
         ms.add_kv(LLM_KV_CONTEXT_LENGTH,               uint32_t(8192));
         ms.add_kv(LLM_KV_EMBEDDING_LENGTH,             n_embd);
@@ -68,6 +69,10 @@ static llama_model * make_model() {
         ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT,         uint32_t(2));
         ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV,      uint32_t(2));
         ms.add_kv(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,  1e-5f);
+        if (arch == LLM_ARCH_QWEN2VL) {
+            const int32_t sections[4] = { 32, 48, 48, 0 }; // M-RoPE: time, y, x
+            gguf_set_arr_data(meta, (std::string(llm_arch_name(arch)) + ".rope.dimension_sections").c_str(), GGUF_TYPE_INT32, sections, 4);
+        }
         std::vector<std::string> tokens(n_vocab);
         for (uint32_t i = 0; i < n_vocab; ++i) tokens[i] = "tok_" + std::to_string(i);
         ms.add_kv(LLM_KV_TOKENIZER_MODEL,  "test");
@@ -659,6 +664,111 @@ static int run_multi(llama_model * model, const sj_cfg & c, bool unified) {
     return result;
 }
 
+// decode an image of nx x ny embeddings at position p0 as mtmd does for M-RoPE (positions p0, p0 + y, p0 + x, 0), in chunks of `width`
+static void decode_image(llama_context * ctx, llama_pos p0, int nx, int ny, int width, int salt) {
+    const int n = nx*ny;
+    std::vector<float> embd((size_t) n*n_embd);
+    std::mt19937 gen(salt);
+    std::normal_distribution<float> dis(0.0f, 0.1f);
+    for (auto & v : embd) v = dis(gen);
+    for (int i0 = 0; i0 < n; i0 += width) {
+        const int m = std::min(width, n - i0);
+        std::vector<llama_pos> pos((size_t) 4*m);
+        std::vector<int32_t> n_seq_id(m, 1);
+        llama_seq_id seq = 0;
+        std::vector<llama_seq_id *> seq_id(m, &seq);
+        std::vector<int8_t> logits(m, 0);
+        for (int j = 0; j < m; ++j) {
+            const int i = i0 + j;
+            pos[j]       = p0;
+            pos[j + m]   = p0 + i/nx;
+            pos[j + 2*m] = p0 + i%nx;
+            pos[j + 3*m] = 0;
+        }
+        llama_batch batch = { m, nullptr, embd.data() + (size_t) i0*n_embd, pos.data(), n_seq_id.data(), seq_id.data(), logits.data() };
+        require(llama_decode(ctx, batch) == 0, "image decode");
+    }
+}
+
+// M-RoPE image prompt: the image tokens share one position and the text after the image goes on max(nx, ny) positions later.
+// The cache must match a plain f16 cache, and save/restore, rollback and a cut at rm_floor inside the image must keep two caches identical.
+// p_img < 128: the image starts in the sink; p_img > 128: in the sealed body, off a group boundary, so rm_floor goes below the image.
+static int run_mrope(llama_model * model, const sj_cfg & c, llama_pos p_img) {
+    const std::string name = std::string(c.name) + " M-RoPE " + std::to_string(p_img);
+    sj_cfg pc = c;
+    pc.plain = true;
+    llama_context * src = make_ctx(model, c);
+    llama_context * ref = make_ctx(model, pc);
+    llama_context * dst = nullptr;
+    int result = 0;
+    try {
+        require(src && ref, "contexts");
+        llama_kv_cache * kv = cache_of(src);
+        require(kv->is_sj_kvarn(), "SJ-KVaRN cache");
+        const uint32_t S = 128, G = 128;
+        const int nx = 16, ny = 12;              // 192 tokens: two ubatches of 128
+        const llama_pos p_txt = p_img + nx;      // max(nx, ny) positions after the image
+        const uint32_t  c_txt = p_img + nx*ny;   // first cell after the image
+
+        // before any seal: close to a plain f16 cache (the rotated rows round differently: max|d| < 1e-3 here; ring rows taken by position give ~0.1)
+        for (llama_context * x : { src, ref }) {
+            decode(x, 0, p_img, 50);
+            decode_image(x, p_img, nx, ny, 128, 1);
+        }
+        const float d_img = max_diff(decode(src, p_txt, p_txt + 240, 128), decode(ref, p_txt, p_txt + 240, 128));
+        require(kv->get_sj_kvarn_sealed_end() == S, "nothing sealed yet");
+        require(llama_memory_seq_pos_max(llama_get_memory(src), 0) == p_txt + 239, "last position");
+        require(kv->get_cells(0).used_max_p1() == c_txt + 240, "one cell per token");
+        require(d_img < 0.02f, "image prompt vs plain f16 cache (max|d| " + std::to_string(d_img) + ")");
+
+        // seal past the image cells
+        decode(src, p_txt + 240, p_txt + 1000, 128);
+        const llama_pos n0 = p_txt + 1000;
+        require(kv->get_sj_kvarn_sealed_end() > c_txt, "image cells sealed");
+
+        // save, restore into a context that holds other data, continue both
+        const auto blob = seq_state(src);
+        dst = make_ctx(model, c);
+        require(dst != nullptr, "destination context");
+        decode(dst, 0, 300, 128, 7);
+        require(llama_state_seq_set_data(dst, blob.data(), blob.size(), 0) == blob.size(), "restore");
+        require(seq_state(dst) == blob, "re-saved state byte-identical");
+        for (llama_pos p = n0; p < n0 + 20; ++p) {
+            require(same_logits(decode(src, p, p + 1, 1), decode(dst, p, p + 1, 1)), "identical logits at step " + std::to_string(p));
+        }
+        const llama_pos n1 = n0 + 20;
+        require(llama_sj_kvarn_compress_idle(src, 0, n1) >= 0 && llama_sj_kvarn_compress_idle(dst, 0, n1) >= 0, "idle seal");
+        require(kv->get_sj_kvarn_sealed_end() == cache_of(dst)->get_sj_kvarn_sealed_end(), "same sealed end");
+
+        // rollback above the sealed end
+        require(llama_memory_seq_rm(llama_get_memory(src), 0, n1 - 9, -1) && llama_memory_seq_rm(llama_get_memory(dst), 0, n1 - 9, -1), "rollback");
+        require(same_logits(decode(src, n1 - 9, n1 + 100, 128, 3), decode(dst, n1 - 9, n1 + 100, 128, 3)), "identical logits after the rollback");
+
+        // the first text cell after the image is sealed, below the ring and not on a group boundary: a cut there cannot split the image,
+        // so rm_floor goes to the image start, or below it to the group boundary when the image starts inside the body
+        const llama_pos want = p_img <= (llama_pos) S ? p_img : (llama_pos) (S + G*((p_img - S)/G));
+        const llama_pos f = llama_sj_kvarn_rm_floor(src, 0, p_txt);
+        require(f == want && llama_sj_kvarn_rm_floor(dst, 0, p_txt) == want, "rm_floor " + std::to_string(want) + " (got " + std::to_string(f) + ")");
+        require(!llama_memory_seq_rm(llama_get_memory(src), 0, p_txt, -1), "unaligned cut in the sealed body refused");
+        require(llama_memory_seq_rm(llama_get_memory(src), 0, f, -1) && llama_memory_seq_rm(llama_get_memory(dst), 0, f, -1), "cut at rm_floor");
+        require(kv->get_cells(0).used_max_p1() == (uint32_t) f, "cut removes the whole image");
+        for (llama_context * x : { src, dst }) {
+            if (f < p_img) {
+                decode(x, f, p_img, 50);
+            }
+            decode_image(x, p_img, nx, ny, 128, 1);
+        }
+        require(same_logits(decode(src, p_txt, p_txt + 400, 128, 5), decode(dst, p_txt, p_txt + 400, 128, 5)), "identical logits after the cut and re-prefill");
+        printf("%-18s OK: max|d| vs plain f16 %g, sealed end %u, restore, rollback, rm_floor at the image start\n",
+               name.c_str(), d_img, kv->get_sj_kvarn_sealed_end());
+    } catch (const std::exception & e) {
+        fprintf(stderr, "%-18s FAIL: %s\n", name.c_str(), e.what());
+        result = 1;
+    }
+    for (auto * x : { src, ref, dst }) { if (x) llama_free(x); }
+    return result;
+}
+
 // EXPERIMENTAL WUSH-KV transform file: per layer AK = Had D_k, AQ = AK^-T = Had D_k^-1, AV = Had D_v, AO = AV^-1 = D_v^-1 Had
 // (Had = normalized 256-pt Sylvester Hadamard, D = positive diagonal), so q.k and the attention output are preserved exactly.
 static std::string write_transform(const char * dir, const char * name, uint32_t seed) {
@@ -756,8 +866,19 @@ int main(int argc, char ** argv) {
     }
     fails_multi += run_multi(model, s44, true);
     fails_multi += run_multi(model, w1t, false); // transform with one FA node per stream
-    printf("%s: %d/%zu cases passed, multi-sequence %d/5\n", fails || fails_multi ? "FAIL" : "OK", (int) (cases.size() - fails), cases.size(), 5 - fails_multi);
-    fails += fails_multi;
+    int fails_mrope = 0;
+    llama_model * model_mrope = make_model(LLM_ARCH_QWEN2VL);
+    if (!model_mrope) {
+        fprintf(stderr, "M-RoPE model init failed\n");
+        fails_mrope = 2;
+    } else {
+        fails_mrope += run_mrope(model_mrope, s44, 100);
+        fails_mrope += run_mrope(model_mrope, f16, 200);
+        llama_model_free(model_mrope);
+    }
+    printf("%s: %d/%zu cases passed, multi-sequence %d/5, M-RoPE %d/2\n", fails || fails_multi || fails_mrope ? "FAIL" : "OK",
+           (int) (cases.size() - fails), cases.size(), 5 - fails_multi, 2 - fails_mrope);
+    fails += fails_multi + fails_mrope;
     llama_model_free(model);
     llama_backend_free();
     return fails ? 1 : 0;

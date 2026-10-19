@@ -607,6 +607,10 @@ private:
     uint32_t sj_kvarn_reopen_lo(uint32_t s) const;
     bool     sj_kvarn_truncate_target(uint32_t s, uint32_t p0, uint32_t & B_new) const;
     bool     sj_kvarn_truncate_body(uint32_t s, uint32_t p0);
+    // SJ-KVaRN addresses cells, not positions (M-RoPE image tokens share a position): map the callers' positions to cells
+    uint32_t  sj_kvarn_cell_of(uint32_t s, llama_pos p) const; // first cell with a position >= p
+    llama_pos sj_kvarn_pos_of(uint32_t s, uint32_t c) const;
+    uint32_t  sj_kvarn_rm_floor_cell(uint32_t s, uint32_t c) const;
 
     // SJ-KVaRN sequence state (format: see the comment above state_write_sj_kvarn in llama-kv-cache.cpp)
     void state_write_sj_kvarn(llama_io_write_i & io, llama_seq_id seq_id) const;

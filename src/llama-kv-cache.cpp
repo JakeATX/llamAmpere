@@ -1206,34 +1206,37 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
         for (uint32_t strm = s_beg; strm < s_end; ++strm) {
             const auto & st = sj_kvarn_st[strm];
             const uint32_t n_present = v_cells[strm].used_max_p1();
-            if (p0 == 0 && (uint32_t) p1 >= n_present) {
+            // the rules count cells: positions [p0, p1) are the cells [c0, c1)
+            const uint32_t c0 = sj_kvarn_cell_of(strm, p0);
+            const uint32_t c1 = sj_kvarn_cell_of(strm, p1);
+            if (c0 == 0 && c1 >= n_present) {
                 s_reset.push_back(strm);
-            } else if ((uint32_t) p0 < n_present && (uint32_t) p1 < n_present) {
-                LLAMA_LOG_WARN("%s: SJ-KVaRN cache: cannot remove positions [%d, %d): positions [%d, %u) would remain behind a hole\n",
-                        __func__, p0, p1, p1, n_present);
+            } else if (c0 < n_present && c1 < n_present) {
+                LLAMA_LOG_WARN("%s: SJ-KVaRN cache: cannot remove positions [%d, %d): cells [%u, %u) would remain behind a hole\n",
+                        __func__, p0, p1, c1, n_present);
                 return false;
-            } else if (st.B > sj_kvarn.sink && (uint32_t) p0 < n_present &&
-                       ((uint32_t) p0 < st.B || (sj_kvarn_split_grid && sj_kvarn_replay_B((uint32_t) p0) < st.B))) {
+            } else if (st.B > sj_kvarn.sink && c0 < n_present &&
+                       (c0 < st.B || (sj_kvarn_split_grid && sj_kvarn_replay_B(c0) < st.B))) {
                 // [#197] full grid schedule (restore grid: llama_sj_kvarn_prefill_cut()): a cut at or above B also reopens the groups a prefill of [0, p0) would not
                 // have sealed yet (B ran ahead on the removed positions), so the re-prefill matches a cold one
                 // a suffix below B goes through sj_kvarn_truncate_body(): groups whose staging rows are still in the
                 // ring are reopened, below them only a cut on a group boundary works (whole records are dropped)
                 uint32_t B_new = 0;
-                const bool tgt = sj_kvarn_truncate_target(strm, (uint32_t) p0, B_new);
-                if (!tgt && (uint32_t) p0 >= st.B) {
+                const bool tgt = sj_kvarn_truncate_target(strm, c0, B_new);
+                if (!tgt && c0 >= st.B) {
                     continue; // [#197] grid reopen above B is best effort: the old suffix rule (B unchanged) applies
                 }
                 if (!tgt) {
-                    LLAMA_LOG_WARN("%s: SJ-KVaRN cache: cannot remove positions [%d, %d): positions below %u are sealed, the ring no "
-                            "longer holds the rows below %d and %d is not on a group boundary (truncate at llama_sj_kvarn_rm_floor())\n",
-                            __func__, p0, p1, st.B, p0, p0);
+                    LLAMA_LOG_WARN("%s: SJ-KVaRN cache: cannot remove positions [%d, %d): cells below %u are sealed, the ring no "
+                            "longer holds the rows below cell %u and it is not on a group boundary (truncate at llama_sj_kvarn_rm_floor())\n",
+                            __func__, p0, p1, st.B, c0);
                     return false;
                 }
                 s_trunc.push_back(strm);
             }
         }
         for (uint32_t strm : s_trunc) {
-            const bool ok = sj_kvarn_truncate_body(strm, (uint32_t) p0);
+            const bool ok = sj_kvarn_truncate_body(strm, sj_kvarn_cell_of(strm, p0));
             GGML_ASSERT(ok);
         }
         for (uint32_t strm : s_reset) {
@@ -1247,7 +1250,10 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 
         uint32_t new_head = cells.size();
 
-        for (uint32_t i = 0; i < cells.size(); ++i) {
+        // fork: SJ-KVaRN positions never decrease along the cells, so only the cells [cell_of(p0), cell_of(p1)) can match
+        const uint32_t i_beg = sj_kvarn.enabled() ? sj_kvarn_cell_of(seq_to_stream[seq_id], p0) : 0;
+        const uint32_t i_end = sj_kvarn.enabled() ? sj_kvarn_cell_of(seq_to_stream[seq_id], p1) : cells.size();
+        for (uint32_t i = i_beg; i < i_end; ++i) {
             if (!cells.pos_in(i, p0, p1)) {
                 continue;
             }
@@ -1271,7 +1277,9 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 
             uint32_t new_head = cells.size();
 
-            for (uint32_t i = 0; i < cells.size(); ++i) {
+            const uint32_t i_beg = sj_kvarn.enabled() ? sj_kvarn_cell_of(s, p0) : 0; // fork: SJ-KVaRN, see above
+            const uint32_t i_end = sj_kvarn.enabled() ? sj_kvarn_cell_of(s, p1) : cells.size();
+            for (uint32_t i = i_beg; i < i_end; ++i) {
                 if (!cells.pos_in(i, p0, p1)) {
                     continue;
                 }
@@ -1912,19 +1920,27 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
         const auto & cells = v_cells[seq_to_stream[seq_id]];
 
         if (sj_kvarn.enabled()) {
-            // SJ-KVaRN: ring rows and sealed records are addressed by position, so a cell sits at its position and a
-            // sequence only grows at its end. A ubatch that does not continue its sequence (for example tokens of a
-            // slot the server purged after building the batch) cannot be placed: fail the slot search (decode
-            // returns 1) instead of reaching the cell == position assert in apply_ubatch.
-            const llama_pos p_next = cells.seq_pos_max(seq_id) + 1; // 0 for an empty sequence
+            // SJ-KVaRN: ring rows and sealed records are addressed by cell, and a sequence only grows at its end, so the ubatch takes the cells after the last one.
+            // The positions must continue the sequence: +1 per text token; M-RoPE image tokens share a position, and the token after an image jumps ahead.
+            // A ubatch that does not continue its sequence (for example tokens of a slot the server purged after building the batch) fails the slot search (decode returns 1).
+            const uint32_t c_next = cells.used_max_p1();
+            llama_pos p_prev    = cells.seq_pos_max(seq_id); // -1 for an empty sequence
+            bool      prev_embd = c_next > 0 && ubatch.is_pos_2d() && cells.ext_get(c_next - 1).tok == LLAMA_TOKEN_NULL;
             for (uint32_t ii = 0; ii < n_tokens; ++ii) {
-                const llama_pos pos = ubatch.pos[s*n_tokens + ii];
-                if (pos != p_next + (llama_pos) ii || pos < 0 || (uint32_t) pos >= cells.size() || !cells.is_empty(pos)) {
+                const uint32_t  i    = s*n_tokens + ii;
+                const llama_pos pos  = ubatch.pos[i];
+                const uint32_t  idx  = c_next + ii;
+                const bool      embd = !ubatch.token || (ubatch.is_mixed() && ubatch.type[i]);
+                const bool ok = pos >= 0 && idx < cells.size() && cells.is_empty(idx) &&
+                    (pos == p_prev + 1 || (prev_embd && (embd ? pos >= p_prev : pos > p_prev)));
+                if (!ok) {
                     LLAMA_LOG_WARN("%s: SJ-KVaRN cache: sequence %d: ubatch position %d does not continue the sequence (next %d)\n",
-                            __func__, seq_id, pos, p_next + (llama_pos) ii);
+                            __func__, seq_id, pos, p_prev + 1);
                     return { };
                 }
-                res.idxs[s].push_back((uint32_t) pos);
+                res.idxs[s].push_back(idx);
+                p_prev    = pos;
+                prev_embd = embd && ubatch.is_pos_2d();
             }
             continue;
         }
@@ -2128,13 +2144,14 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
             const uint32_t nt   = sinfo.size(); // tokens of this stream (a multi-stream ubatch is stream-major)
             auto & st = sj_kvarn_st[strm];
 
-            // ring rows and sealed records are addressed by position, so a cell must sit at its position
+            // ring rows and sealed records are addressed by cell: the ubatch fills the cells after the last one (find_slot)
             for (uint32_t ii = 0; ii < nt; ++ii) {
-                GGML_ASSERT(sinfo.idxs[s][ii] == (uint32_t) ubatch.pos[s*nt + ii] && "SJ-KVaRN cache: cell index must equal position");
+                GGML_ASSERT(sinfo.idxs[s][ii] == sinfo.idxs[s][0] + ii && "SJ-KVaRN cache: a ubatch must fill consecutive cells");
             }
 
             const uint32_t N    = v_cells[strm].used_max_p1();
-            const uint32_t pos0 = (uint32_t) ubatch.pos[s*nt]; // positions present before this ubatch
+            const uint32_t pos0 = sinfo.idxs[s][0]; // cells present before this ubatch
+            GGML_ASSERT(N == pos0 + nt && "SJ-KVaRN cache: a ubatch must continue at the end of its stream");
 
             // The sealed boundary advances from the ubatch START, so every query row keeps at least `tail` exact
             // positions behind it (a boundary set from the ubatch end would leave the first rows of a large prefill
@@ -2742,7 +2759,7 @@ void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ub
     if (sj_kvarn.enabled()) {
         if (n_stream == 1) {
             for (uint32_t i = 0; i < n_tokens; ++i) {
-                data[i] = sj_kvarn_ring_row((uint32_t) ubatch->pos[i]);
+                data[i] = sj_kvarn_ring_row(sinfo.idxs[0][i]);
             }
             return;
         }
@@ -2750,7 +2767,7 @@ void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ub
             const int64_t offs = (int64_t) sinfo.strm[s]*sj_kvarn_kv_rows;
             for (uint32_t i = 0; i < sinfo.size(); ++i) {
                 const uint32_t j = s*sinfo.size() + i;
-                data[j] = offs + sj_kvarn_ring_row((uint32_t) ubatch->pos[j]);
+                data[j] = offs + sj_kvarn_ring_row(sinfo.idxs[s][i]);
             }
         }
         return;
@@ -2782,7 +2799,7 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
     if (sj_kvarn.enabled()) {
         if (n_stream == 1) {
             for (uint32_t i = 0; i < n_tokens; ++i) {
-                data[i] = sj_kvarn_ring_row((uint32_t) ubatch->pos[i]);
+                data[i] = sj_kvarn_ring_row(sinfo.idxs[0][i]);
             }
             return;
         }
@@ -2790,7 +2807,7 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
             const int64_t offs = (int64_t) sinfo.strm[s]*sj_kvarn_kv_rows;
             for (uint32_t i = 0; i < sinfo.size(); ++i) {
                 const uint32_t j = s*sinfo.size() + i;
-                data[j] = offs + sj_kvarn_ring_row((uint32_t) ubatch->pos[j]);
+                data[j] = offs + sj_kvarn_ring_row(sinfo.idxs[s][i]);
             }
         }
         return;
@@ -2837,7 +2854,7 @@ void llama_kv_cache::set_input_sj_kvarn_desc(ggml_tensor * dst, const llama_ubat
     GGML_ASSERT(dst->ne[0] >= GGML_SJKVARN_DESC_N_ENTRIES);
 
     const int64_t row = dst->ne[0];
-    const uint32_t nt = sinfo.size();
+    GGML_UNUSED(ubatch);
     GGML_ASSERT(n_stream == 1 || (dst->ne[1] == (int64_t) sinfo.n_stream() && row == GGML_SJKVARN_DESC_N_ENTRIES + (int64_t) sj_kvarn_n_groups_seq));
 
     for (uint32_t s = 0; s < (n_stream == 1 ? 1u : sinfo.n_stream()); ++s) {
@@ -2850,7 +2867,7 @@ void llama_kv_cache::set_input_sj_kvarn_desc(ggml_tensor * dst, const llama_ubat
         d[GGML_SJKVARN_DESC_CAP]      = (int32_t) sj_kvarn_cap;
         d[GGML_SJKVARN_DESC_B]        = (int32_t) st.B;
         d[GGML_SJKVARN_DESC_N]        = (int32_t) st.N;
-        d[GGML_SJKVARN_DESC_QPOS0]    = (int32_t) ubatch->pos[n_stream == 1 ? 0 : s*nt];
+        d[GGML_SJKVARN_DESC_QPOS0]    = (int32_t) sinfo.idxs[s][0]; // cell of the first query row
         d[GGML_SJKVARN_DESC_G]        = (int32_t) sj_kvarn.group;
         d[GGML_SJKVARN_DESC_D]        = (int32_t) hparams.n_embd_head_k(layers[0].il);
         d[GGML_SJKVARN_DESC_RECBYTES] = (int32_t) sj_kvarn_rec_bytes[tier];
@@ -3101,17 +3118,19 @@ int32_t llama_kv_cache::compress_sj_kvarn_idle(llama_context * lctx, llama_seq_i
     }
     if (accepted_end == 0 && v_cells[strm].used_max_p1() == 0) { return 0; }
     // The caller resolved speculation. Refuse stale frontiers and an unremoved written suffix.
-    if ((uint32_t) accepted_end != v_cells[strm].used_max_p1() ||
-        seq_pos_max(seq_id) < 0 || seq_pos_max(seq_id) + 1 != accepted_end) { return -1; }
-    const uint32_t end = accepted_end;
+    // (the frontier one past the last position is the cell count)
+    if (seq_pos_max(seq_id) < 0 || seq_pos_max(seq_id) + 1 != accepted_end ||
+        sj_kvarn_cell_of(strm, accepted_end) != v_cells[strm].used_max_p1()) { return -1; }
+    const uint32_t end = v_cells[strm].used_max_p1();
     if (end <= sj_kvarn.sink + sj_kvarn.tail) { return 0; }
     uint32_t target = sj_kvarn.sink + sj_kvarn.group*((end - sj_kvarn.tail - sj_kvarn.sink)/sj_kvarn.group);
     if (keep_from >= 0) {
         // keep_from and the `tail` positions behind it stay exact: a re-prefill from keep_from then sees the same
         // exact window as a fresh prefill would
-        const uint32_t keep = sj_kvarn_grid ? sj_kvarn_replay_B((uint32_t) keep_from) : // [#197]
-            (uint32_t) keep_from <= sj_kvarn.sink + sj_kvarn.tail ? sj_kvarn.sink :
-            sj_kvarn_floor_g((uint32_t) keep_from - sj_kvarn.tail);
+        const uint32_t keep_c = sj_kvarn_cell_of(strm, keep_from);
+        const uint32_t keep = sj_kvarn_grid ? sj_kvarn_replay_B(keep_c) : // [#197]
+            keep_c <= sj_kvarn.sink + sj_kvarn.tail ? sj_kvarn.sink :
+            sj_kvarn_floor_g(keep_c - sj_kvarn.tail);
         target = std::min(target, keep);
     }
     if (target <= st.B) { if (keep_from < 0) { st.draining = false; } return 0; }
@@ -3175,13 +3194,14 @@ bool llama_kv_cache::sj_kvarn_prefill_cut(llama_seq_id seq_id, llama_pos p0) {
     // same values. Seals that ran ahead of that point (later prompt ubatches, decode, idle seals) are reopened from
     // the ring rows (they re-seal from the same rows into the same records), and an unfinished decode flush is
     // dropped (a cold prefill has none in flight at a grid line).
-    if (!sj_kvarn.enabled() || sj_kvarn_grid == 0 || p0 <= 0 || p0 % (llama_pos) sj_kvarn_grid != 0 ||
+    if (!sj_kvarn.enabled() || sj_kvarn_grid == 0 || p0 <= 0 ||
             seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
         return false;
     }
     const uint32_t strm = seq_to_stream[seq_id];
     auto & st = sj_kvarn_st[strm];
-    if ((uint32_t) p0 >= v_cells[strm].used_max_p1() || st.B_pending != st.B) {
+    const uint32_t c0 = sj_kvarn_cell_of(strm, p0); // the grid and the seal schedule count cells
+    if (c0 % sj_kvarn_grid != 0 || c0 >= v_cells[strm].used_max_p1() || st.B_pending != st.B) {
         return false;
     }
     bool changed = false;
@@ -3191,12 +3211,12 @@ bool llama_kv_cache::sj_kvarn_prefill_cut(llama_seq_id seq_id, llama_pos p0) {
         // the cut reopens what the ring still holds, the re-prefill is close to a cold one but not identical
         LLAMA_LOG_WARN("%s: SJ-KVaRN cut at %d: the ring reaches back to %u, a cold prefill keeps rows from %u exact; "
                 "the re-prefill will not be bit-identical to a cold one\n", __func__, (int) p0,
-                sj_kvarn_reopen_lo(strm), sj_kvarn_replay_B((uint32_t) p0));
+                sj_kvarn_reopen_lo(strm), sj_kvarn_replay_B(c0));
     }
-    if (st.B > sj_kvarn.sink && sj_kvarn_replay_B((uint32_t) p0) < st.B) {
+    if (st.B > sj_kvarn.sink && sj_kvarn_replay_B(c0) < st.B) {
         uint32_t B_new = 0;
-        if (sj_kvarn_truncate_target(strm, (uint32_t) p0, B_new) && B_new < st.B) {
-            const bool ok = sj_kvarn_truncate_body(strm, (uint32_t) p0);
+        if (sj_kvarn_truncate_target(strm, c0, B_new) && B_new < st.B) {
+            const bool ok = sj_kvarn_truncate_body(strm, c0);
             GGML_ASSERT(ok);
             changed = true;
         }
@@ -3213,14 +3233,15 @@ bool llama_kv_cache::sj_kvarn_cut_in_reach(llama_seq_id seq_id, llama_pos p0) co
         return true;
     }
     const uint32_t strm = seq_to_stream[seq_id];
-    const uint32_t want = sj_kvarn_replay_B((uint32_t) p0);
+    const uint32_t c0   = sj_kvarn_cell_of(strm, p0);
+    const uint32_t want = sj_kvarn_replay_B(c0);
     if (sj_kvarn_st[strm].B <= want) {
         return true;
     }
     // the reopen stops at the ring's lower bound; groups below it stay sealed. That only matters when the first
     // re-prefill ubatch (at p0) would not seal them anyway: compare the sealed end both caches have at that ubatch.
     const uint32_t B_got = std::min(sj_kvarn_st[strm].B, std::max(sj_kvarn_reopen_lo(strm), want));
-    return sj_kvarn_next_B(B_got, (uint32_t) p0) == sj_kvarn_next_B(want, (uint32_t) p0);
+    return sj_kvarn_next_B(B_got, c0) == sj_kvarn_next_B(want, c0);
 }
 
 uint32_t llama_kv_cache::sj_kvarn_seq_stream(llama_seq_id seq_id) const {
@@ -3232,15 +3253,56 @@ uint32_t llama_kv_cache::sj_kvarn_reopen_lo(uint32_t s) const {
     return sj_kvarn.sink + sj_kvarn.group*((lo - sj_kvarn.sink + sj_kvarn.group - 1)/sj_kvarn.group);
 }
 
+uint32_t llama_kv_cache::sj_kvarn_cell_of(uint32_t s, llama_pos p) const {
+    const auto & cells = v_cells[s];
+    if (p <= 0) {
+        return 0;
+    }
+    // lower bound: positions never decrease along the cells of a stream (find_slot)
+    uint32_t lo = 0, hi = cells.used_max_p1();
+    while (lo < hi) {
+        const uint32_t mid = lo + (hi - lo)/2;
+        if (cells.pos_get(mid) < p) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
+llama_pos llama_kv_cache::sj_kvarn_pos_of(uint32_t s, uint32_t c) const {
+    const auto & cells = v_cells[s];
+    const uint32_t n = cells.used_max_p1();
+    if (c < n) {
+        return cells.pos_get(c);
+    }
+    return (n > 0 ? cells.pos_get(n - 1) + 1 : 0) + (llama_pos) (c - n); // past the last cell, positions go up by 1
+}
+
+uint32_t llama_kv_cache::sj_kvarn_rm_floor_cell(uint32_t s, uint32_t c) const {
+    if (c >= sj_kvarn_st[s].B || c <= sj_kvarn.sink || c >= sj_kvarn_reopen_lo(s)) {
+        return c;
+    }
+    return sj_kvarn_floor_g(c);
+}
+
 llama_pos llama_kv_cache::sj_kvarn_rm_floor(llama_seq_id seq_id, llama_pos pos) const {
     if (!sj_kvarn.enabled() || pos < 0) {
         return pos;
     }
     const uint32_t s = sj_kvarn_seq_stream(seq_id);
-    if ((uint32_t) pos >= sj_kvarn_st[s].B || (uint32_t) pos <= sj_kvarn.sink || (uint32_t) pos >= sj_kvarn_reopen_lo(s)) {
-        return pos;
+    // seq_rm(p) removes the cells from cell_of(p). A floor cell inside an image (cells with one position) cannot be cut by position: take the floor again from the image start.
+    llama_pos p = pos;
+    uint32_t  c = sj_kvarn_cell_of(s, p);
+    for (;;) {
+        const uint32_t f = sj_kvarn_rm_floor_cell(s, c);
+        if (f == c) {
+            return p;
+        }
+        p = sj_kvarn_pos_of(s, f);
+        c = sj_kvarn_cell_of(s, p); // <= f, so the loop stops at cell 0 at the latest
     }
-    return (llama_pos) sj_kvarn_floor_g((uint32_t) pos);
 }
 
 bool llama_kv_cache::sj_kvarn_truncate_target(uint32_t s, uint32_t p0, uint32_t & B_new) const {
@@ -4240,13 +4302,14 @@ void llama_kv_cache::state_write_sj_kvarn(llama_io_write_i & io, llama_seq_id se
 
     const auto & cells = v_cells[strm];
 
-    // the sequence must hold exactly positions [0, n) at cells [0, n), and nothing may lie above it
+    // the sequence must hold exactly the cells [0, n) with positions from 0 that never decrease (position i at cell i without M-RoPE), and nothing may lie above it
     uint32_t n = 0;
     for (uint32_t i = 0; i < cells.size(); ++i) {
         if (cells.is_empty(i) || (seq_id != -1 && !cells.seq_has(i, seq_id))) {
             continue;
         }
-        if (i != n || cells.pos_get(i) != (llama_pos) i) {
+        const llama_pos pos = cells.pos_get(i);
+        if (i != n || (i == 0 ? pos != 0 : pos < cells.pos_get(i - 1)) || (!has_cell_ext() && pos != (llama_pos) i)) {
             throw std::runtime_error("SJ-KVaRN cache: cannot save state: the sequence does not hold a contiguous prefix [0, n)");
         }
         ++n;
@@ -4392,15 +4455,18 @@ uint32_t llama_kv_cache::state_read_sj_kvarn(llama_io_read_i & io, llama_seq_id 
 
     // per-cell meta (state_write_meta)
     std::vector<llama_kv_cell_ext> exts(has_cell_ext() ? n : 0);
+    std::vector<llama_pos> poss(n);
     std::vector<std::vector<llama_seq_id>> seqs(n);
     for (uint32_t i = 0; i < n; ++i) {
         llama_pos pos;
         uint32_t  n_seq_id;
         io.read(&pos,      sizeof(pos));
         io.read(&n_seq_id, sizeof(n_seq_id));
-        if (pos != (llama_pos) i) {
+        // as saved: positions from 0 that never decrease (position i at cell i without M-RoPE)
+        if (i == 0 ? pos != 0 : (pos < poss[i - 1] || (!has_cell_ext() && pos != (llama_pos) i))) {
             throw std::runtime_error("SJ-KVaRN cache: state cell " + std::to_string(i) + " holds position " + std::to_string(pos));
         }
+        poss[i] = pos;
         if (has_cell_ext()) {
             io.read(&exts[i], sizeof(exts[i]));
         }
@@ -4527,7 +4593,7 @@ uint32_t llama_kv_cache::state_read_sj_kvarn(llama_io_read_i & io, llama_seq_id 
 
     try {
         for (uint32_t i = 0; i < n; ++i) {
-            cells.pos_set(i, (llama_pos) i);
+            cells.pos_set(i, poss[i]);
             if (has_cell_ext()) {
                 cells.ext_set(i, exts[i]);
             }
