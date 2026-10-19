@@ -2995,7 +2995,7 @@ void llama_context::mtp_scratch_end() {
     LLAMA_LOG_INFO("%s: released MTP KV scratch; shared serialized compute restored\n", __func__);
 }
 
-void llama_context::mtp_scratch_prepare(bool kv_only) {
+void llama_context::mtp_scratch_prepare(bool kv_only, const llama_memory_context_i * mctx, const llama_ubatch * ubatch) {
     kv_only = kv_only && !cparams.embeddings && !cparams.mtp_chain && cparams.embeddings_nextn_masked;
     if (mtp_scratch_active && (!kv_only || sched_need_reserve)) {
         mtp_scratch_end();
@@ -3006,7 +3006,7 @@ void llama_context::mtp_scratch_prepare(bool kv_only) {
     }
     if (!mtp_scratch_enabled || mtp_scratch_active || !kv_only || cparams.embeddings || cparams.mtp_chain ||
             !cparams.embeddings_nextn_masked || model.hparams.no_alloc || !mtp_scratch_target ||
-            (compute_peer && compute_peer != mtp_scratch_target)) {
+            (compute_peer && compute_peer != mtp_scratch_target) || !mctx || !ubatch) {
         return;
     }
     auto * cache = llama_sj_kvarn_cache(mtp_scratch_target->memory.get());
@@ -3042,10 +3042,11 @@ void llama_context::mtp_scratch_prepare(bool kv_only) {
             return;
         }
     }
-    auto mctx = memory->init_full();
-    const uint32_t rows = std::min(cparams.n_ctx, cparams.n_ubatch);
+    // The full-cache reserve repools every indexer block. Size loans after apply(), for this actual batch.
+    const uint32_t rows = ubatch->n_tokens;
+    const uint32_t n_seqs = ubatch->n_seqs;
     std::vector<size_t> sizes(backends.size());
-    auto * gf = graph_reserve(rows, cparams.n_seq_max, 0, mctx.get(), true, sizes.data());
+    auto * gf = graph_reserve(rows, n_seqs, 0, mctx, true, sizes.data());
     if (!gf || !sizes[index]) {
         return;
     }
@@ -3110,7 +3111,7 @@ void llama_context::mtp_scratch_prepare(bool kv_only) {
     if (!mtp_reset_backend_scratch(backend) ||
             (set_pool && !set_pool(backend, buffers.data() + compute_chunks, pool_chunks)) ||
             !ggml_backend_sched_set_buffers(sched.get(), backend, buffers.data(), compute_chunks) ||
-            !graph_reserve(rows, cparams.n_seq_max, 0, mctx.get())) {
+            !graph_reserve(rows, n_seqs, 0, mctx)) {
         mtp_scratch_end();
         return;
     }
@@ -3535,6 +3536,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
             (void) active_target.cache->kv_stream_adapt(active_target.n_kv, ubatch.n_tokens);
         }
     }
+
+    mtp_scratch_prepare(n_outputs == 0, mctx, &ubatch);
 
 build_graph:
     auto * res = get_gf_res_prev();

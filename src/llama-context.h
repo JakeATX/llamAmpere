@@ -502,7 +502,7 @@ private:
     llama_kv_cache * mtp_scratch_cache = nullptr;
     ggml_backend_t mtp_scratch_backend = nullptr;
     std::vector<ggml_backend_buffer_ptr> mtp_scratch_views;
-    void mtp_scratch_prepare(bool kv_only);
+    void mtp_scratch_prepare(bool kv_only, const llama_memory_context_i * mctx = nullptr, const llama_ubatch * ubatch = nullptr);
     void mtp_scratch_end();
     bool compute_is_shared() const;
     struct {
