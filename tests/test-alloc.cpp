@@ -643,6 +643,37 @@ static void test_reallocation() {
     }
 }
 
+// A size-only query must not certify tensor assignments whose backing buffers
+// have never been allocated (or are still sized for a previous graph).
+static void test_measure_then_allocate() {
+    for (bool preallocate : { false, true }) {
+        dummy_backend backend = dummy_backend_init(SIZE_MAX);
+        ggml_gallocr_ptr galloc(ggml_gallocr_new(&backend.buffer_type));
+        if (preallocate) {
+            auto [ctx, graph, ctx_ptr] = make_context();
+            auto * x = make_input_with_size(ctx, 16);
+            auto * y = ggml_scale(ctx, x, 2.0f);
+            ggml_set_output(y);
+            ggml_build_forward_expand(graph, y);
+            GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), graph));
+        }
+        const size_t before = backend.context->allocated_total();
+        auto [ctx, graph, ctx_ptr] = make_context();
+        auto * x = make_input_with_size(ctx, 128);
+        auto * y = ggml_scale(ctx, x, 2.0f);
+        ggml_set_output(y);
+        ggml_build_forward_expand(graph, y);
+        assign_names(ctx);
+        size_t measured = 0;
+        ggml_gallocr_reserve_n_size(galloc.get(), graph, nullptr, nullptr, &measured);
+        GGML_ASSERT(measured > before);
+        GGML_ASSERT(backend.context->allocated_total() == before);
+        GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), graph));
+        check_all_allocated(graph);
+        GGML_ASSERT(backend.context->allocated_total() >= measured);
+    }
+}
+
 static void test_backend_graph_optimize(ggml_backend_t /*backend*/, ggml_cgraph * graph, ggml_backend_graph_optimize_params * params) {
     GGML_ASSERT(graph->n_nodes == 3);
     params->add_alloc_dep(params->user_data, graph->nodes[0], graph->nodes[2]);
@@ -1447,6 +1478,7 @@ int main() {
     run("test_multiple_buffer_types", test_multiple_buffer_types);
     run("test_buffer_size_zero", test_buffer_size_zero);
     run("test_reallocation", test_reallocation);
+    run("test_measure_then_allocate", test_measure_then_allocate);
     run("test_graph_optimize_alloc_dep", test_graph_optimize_alloc_dep);
     run("test_scheduler_input_copy", test_scheduler_input_copy);
     run("test_scheduler_borrowed_buffer", test_scheduler_borrowed_buffer);

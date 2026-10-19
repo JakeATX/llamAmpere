@@ -1197,6 +1197,11 @@ void ggml_gallocr_reserve_n_size(
             sizes[i] += galloc->buf_tallocs[i]->chunks[c]->max_size;
         }
     }
+    // Measuring replaces the tensor assignments but does not allocate their
+    // backing buffers. Do not let alloc_graph reuse this unbacked plan merely
+    // because the next graph has the same topology and tensor sizes.
+    galloc->n_nodes = 0;
+    galloc->n_leafs = 0;
 }
 
 bool ggml_gallocr_reserve_n(ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids) {
