@@ -27,6 +27,10 @@
 #include <stdexcept>
 #include <vector>
 
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
+
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267) // possible loss of data
 #endif
@@ -440,6 +444,32 @@ static struct llama_model * llama_model_load_from_file_impl(
         }
         return nullptr;
     }
+
+#if defined(__GLIBC__)
+    const char * trim = getenv("LLAMA_MALLOC_TRIM");
+    if (trim && strcmp(trim, "1") == 0) {
+        // The loader and its temporary metadata have been destroyed here.
+        auto resident_kib = []() -> size_t {
+            size_t result = 0;
+#if defined(__linux__)
+            FILE * file = fopen("/proc/self/smaps_rollup", "r");
+            if (file) {
+                char line[256];
+                while (fgets(line, sizeof(line), file)) {
+                    if (sscanf(line, "Rss: %zu kB", &result) == 1) { break; }
+                }
+                fclose(file);
+            }
+#endif
+            return result;
+        };
+        const size_t before = resident_kib();
+        const int released = malloc_trim(0);
+        const size_t after = resident_kib();
+        LLAMA_LOG_INFO("%s: malloc_trim after load: released=%d RSS_before=%zu KiB RSS_after=%zu KiB decrease=%zu KiB\n",
+                __func__, released, before, after, before > after ? before - after : 0);
+    }
+#endif
 
     return model;
 }

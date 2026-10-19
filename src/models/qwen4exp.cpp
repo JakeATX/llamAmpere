@@ -3,6 +3,7 @@
 #include "llama-memory-hybrid-idx.h"
 #include "llama-memory-recurrent.h"
 #include "llama-ple-prefetch.h"
+#include "llama-ple-cache.h"
 
 #include <algorithm>
 #include <atomic>
@@ -1720,6 +1721,10 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
         }
     }
 
+    if (model.ple_cache && !model.ple_cache->remap(idx.data(), idx.size())) {
+        GGML_ABORT("PLE startup profile is incomplete; stopping before the gather");
+    }
+
     {
         ggml_tensor * ple = model.per_layer_tok_embd;
 
@@ -1819,7 +1824,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
     res->add_input(std::move(ple_inp));
 
     // gather then flatten the heads: get_rows lays the head dimension out slowest, as the reference does
-    ggml_tensor * emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, rows);
+    ggml_tensor * table = model.ple_cache ? model.ple_cache->tensor : model.per_layer_tok_embd;
+    ggml_tensor * emb = ggml_get_rows(ctx0, table, rows);
     emb = ggml_reshape_2d(ctx0, emb, hparams.ple_head_dim * n_heads, n_tokens);
     cb(emb, "ple_embd", -1);
 

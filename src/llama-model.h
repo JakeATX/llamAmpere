@@ -16,6 +16,7 @@
 
 struct llama_cparams;
 struct llama_ubatch;
+struct llama_ple_cache;
 struct llama_model_loader;
 struct llama_model;
 
@@ -733,6 +734,7 @@ struct llama_model {
     struct ggml_tensor * altup_proj           = nullptr;
     struct ggml_tensor * altup_unembd_proj    = nullptr;
     struct ggml_tensor * per_layer_tok_embd   = nullptr;
+    std::unique_ptr<llama_ple_cache> ple_cache;
     struct ggml_tensor * per_layer_model_proj = nullptr;
     struct ggml_tensor * per_layer_proj_norm  = nullptr;
 

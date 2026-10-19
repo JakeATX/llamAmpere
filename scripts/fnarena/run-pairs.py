@@ -36,14 +36,25 @@ def arm(label, bundle, options, full=False):
                 'SHIP_PROMPT': '100000' if full else '2048', 'SHIP_PREDICT': '5120' if full else '32',
                 'SHIP_RELOAD': '0', 'SHIP_LIMIT': str(seconds - 10), 'SHIP_RESERVE_MB': '1024' if full else '2560',
                 'PARENT_HOLDS_GPU_LOCK': '1', 'SHIP_CONFIG': str(harness / 'output-file.json'), **options}
-    command = ['flock', '/home/jake-k/qwen38-bench/.locks/gpu.lock', 'systemd-run', '--user', '--wait',
+    # Frozen e8 still refuses to pin unless 10 GiB will remain. A 2K arena arm
+    # that starts below about 52 GiB repeats the gate7 miss. Recheck after the lock.
+    arena_on = options.get('ARENA_MODE', 'on') != 'off'
+    need_kib = str(52 * 1024 * 1024) if arena_on else '0'
+    command = ['bash', str(root / 'scripts/fnarena/ram-locked-run.sh'), need_kib,
+               'systemd-run', '--user', '--wait', '--collect',
                '--unit=llama.cpp-fnarena-' + series + '-' + label, '-p', 'CPUWeight=100' if full else 'CPUWeight=10',
                '-p', 'MemoryMax=50G', '-p', 'TimeoutStopSec=10', '-p', 'LimitCORE=0', 'env',
                'XDG_RUNTIME_DIR=/run/user/1000', 'DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus',
                *[key + '=' + value for key, value in settings.items()],
                'timeout', '--signal=TERM', '--kill-after=10', str(seconds), sys.executable, str(harness / 'gate.py'), 'flashnext']
-    with (output / (label + '.unit.log')).open('w') as log:
-        completed = subprocess.run(command, env=environment, stdout=log, stderr=log)
+    while True:
+        with (output / (label + '.unit.log')).open('w') as log:
+            completed = subprocess.run(command, env=environment, stdout=log, stderr=log)
+        if completed.returncode == 75 and arena_on:
+            persist('waiting-for-ram', label=label)
+            time.sleep(5)
+            continue
+        break
     result_path = root / 'artifacts' / (series + '-' + label) / 'result.json'
     steps.append({'label': label, 'command': command, 'unit_returncode': completed.returncode, 'result': str(result_path)})
     persist('running')
@@ -96,7 +107,11 @@ try:
     baseline_quality = arm('quality-previous', previous, {'ARENA_BASELINE': '1', 'ARENA_MODE': 'off', 'ARENA_TEACHER': '1'})
     candidate_quality = arm('quality-candidate', candidate, {'ARENA_MODE': 'on', 'ARENA_TEACHER': '1', 'SHIP_PREVIOUS_KL': str(baseline_quality.parent / 'logprobs.npy')})
     quality = json.loads(candidate_quality.read_text())['kl_previous_to_current']
-    for index in range(16):
+    # Full 100K+5120 arms are timed speed runs. The owner rule is that those
+    # use BEST_CONFIG.md, which this frozen arena bundle does not. Zero skips them.
+    full_pairs = int(os.environ.get('ARENA_FULL_PAIRS', '0'))
+    assert full_pairs in (0, 8, 16), 'planned looks are 8 and 16, or 0 for quality only'
+    for index in range(full_pairs):
         pair = {}
         order = ('previous', 'candidate') if index % 2 == 0 else ('candidate', 'previous')
         for side in order:
@@ -109,7 +124,10 @@ try:
             persist('running', quality=quality, comparison=comparison)
             if comparison['relative_speed_passed']:
                 break
-    persist('complete', quality=quality, comparison=compare(pairs))
+    if full_pairs:
+        persist('complete', quality=quality, comparison=compare(pairs))
+    else:
+        persist('complete', quality=quality)
 except Exception as error:
     persist('failed', error=repr(error))
     raise

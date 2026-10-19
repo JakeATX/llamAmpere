@@ -559,6 +559,10 @@ if (TARGET gguf-model-data)
 endif()
 
 if (NOT LLAMA_USE_SYSTEM_GGML)
+    add_executable(test-ple-cache test-ple-cache.cpp ../src/llama-ple-cache.cpp ../src/llama-moe-arena.cpp)
+    target_link_libraries(test-ple-cache PRIVATE llama ggml ggml-cpu ggml-base)
+    llama_test(test-ple-cache LABEL "main;cpu")
+
     add_executable(test-moe-arena test-moe-arena.cpp ../src/llama-moe-arena.cpp)
     target_link_libraries(test-moe-arena PRIVATE ggml ggml-cpu ggml-base)
     llama_test(test-moe-arena LABEL "main;cpu")

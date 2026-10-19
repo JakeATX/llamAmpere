@@ -908,6 +908,7 @@ llama_model_loader::llama_model_loader(
         }
         for (const auto & role : roles) { supported = supported && role.second == 3; }
         const size_t available = llama_moe_arena::available_memory();
+        // Owner floor is 7 GiB, the same line Strata ran under at home.
         const size_t reserve = 7ull << 30;
         use_moe_arena = supported && bytes && available > reserve && bytes <= available - reserve &&
             llama_moe_arena::pin_supported();
