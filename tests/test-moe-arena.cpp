@@ -51,9 +51,26 @@ static bool test_reclaimable_output(bool cuda = false) {
         }
         output.flush();
         ok &= !output.dirty;
+        const size_t page_size = (size_t) sysconf(_SC_PAGESIZE);
+        std::vector<unsigned char> resident(bytes / page_size);
+        // Neighboring live rows must not refault when a completed range shares their page.
+        output.release(page_size + 17, 3 * page_size);
+        ok &= mincore(data, bytes, resident.data()) == 0;
+        ok &= (resident[1] & 1) != 0 && (resident[4] & 1) != 0;
+        ok &= (resident[2] & 1) == 0 && (resident[3] & 1) == 0;
+        const bool boundary_resident = (resident[1] & 1) != 0 && (resident[4] & 1) != 0;
+        printf("shared MTP boundary pages remain resident: %s\n", boundary_resident ? "OK" : "FAIL");
+        output.release(6 * page_size + 17, 1);
+        ok &= mincore(data, bytes, resident.data()) == 0;
+        ok &= (resident[6] & 1) != 0;
+        // A partial allocation tail remains resident, too.
+        output.release(bytes - page_size + 17, page_size - 17);
+        ok &= mincore(data, bytes, resident.data()) == 0;
+        ok &= (resident.back() & 1) != 0;
         // Unaligned completed ranges may share pages. All bytes must survive refault.
         output.release(17, bytes / 2);
         output.release(bytes / 2, bytes - bytes / 2);
+        output.release(0, bytes);
         output.release(bytes, 0);
         for (const auto & range : std::vector<std::pair<size_t, size_t>>{{bytes + 1, 0}, {bytes, 1}, {1, SIZE_MAX}}) {
             bool rejected_range = false;
@@ -61,7 +78,6 @@ static bool test_reclaimable_output(bool cuda = false) {
             catch (const std::out_of_range &) { rejected_range = true; }
             ok &= rejected_range;
         }
-        std::vector<unsigned char> resident(bytes / (size_t) sysconf(_SC_PAGESIZE));
         ok &= mincore(data, bytes, resident.data()) == 0;
         for (unsigned char page : resident) { ok &= (page & 1) == 0; }
         ok &= madvise(data, bytes, MADV_DONTNEED) == 0;
