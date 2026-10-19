@@ -34,6 +34,8 @@
 #include <vector>
 #ifndef _WIN32
 #include <sys/resource.h>
+#include <sys/mman.h>
+#include <unistd.h>
 #endif
 
 static constexpr uint32_t n_vocab = 32, n_embd = 256;
@@ -1065,6 +1067,35 @@ static void run_failed_helper(llama_model * model) {
 }
 
 // The second GGUF must reuse identical storage and retain it after the donor model is freed.
+static void run_cuda_readonly_pin() {
+#ifndef _WIN32
+    constexpr size_t bytes = 32 * 1024 * 1024;
+    auto reg = ggml_backend_reg_by_name("CUDA");
+    require(reg != nullptr, "CUDA registration backend exists");
+    auto pin = (bool (*)(void *, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_host_pin");
+    auto unpin = (void (*)(void *)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_host_unpin");
+    require(pin && unpin, "read-only host registration entry points exist");
+    FILE * file = tmpfile();
+    require(file != nullptr, "create large read-only mapping fixture");
+    require(ftruncate(fileno(file), bytes) == 0, "size large read-only mapping fixture");
+    llama_file source(file);
+    {
+        llama_mmap mapped(&source, 0);
+        mapped.remap_private_writable(&source, 0, bytes);
+        auto * data = (unsigned char *) mapped.addr();
+        data[0] = 123;
+        const bool pinned = pin(data, bytes);
+        if (pinned) { unpin(data); }
+        require(pinned, "register 32 MiB private file mapping without a second tensor allocation");
+        require(data[0] == 123, "registration preserves private tensor contents");
+        rewind(file);
+        require(fgetc(file) == 0, "private mapped writes do not change model file");
+    }
+    fclose(file);
+    printf("PASS CUDA registration of 32 MiB private dense mapping; model file unchanged\n");
+#endif
+}
+
 static void run_weight_borrow(llama_model * source, bool cuda = false, bool pin_host = false) {
     const auto close_file = [](FILE * f) { fclose(f); };
     std::unique_ptr<FILE, decltype(close_file)> file(tmpfile(), close_file);
@@ -1206,6 +1237,7 @@ int main(int argc, char ** argv) {
             return 0;
         }
         if (cuda_sharing) { require(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU) != nullptr, "CUDA backend is available"); }
+        if (cuda_sharing && pin_host) { run_cuda_readonly_pin(); }
         run_weight_borrow(model, cuda_sharing, pin_host);
         if (pin_host || cuda_sharing || (argc == 2 && std::strcmp(argv[1], "--weight-borrow-only") == 0)) {
             llama_model_free(model);

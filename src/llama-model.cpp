@@ -1300,6 +1300,15 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
     return buft_list;
 }
 
+struct llama_borrowed_host_pin {
+    std::unique_ptr<llama_mlock> locked;
+    void * data = nullptr;
+    void (*unpin)(void *) = nullptr;
+    ~llama_borrowed_host_pin() {
+        if (unpin) { unpin(data); }
+    }
+};
+
 struct llama_model::impl {
     std::shared_ptr<impl> tensor_donor;
 
@@ -1325,7 +1334,7 @@ struct llama_model::impl {
     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
     std::mutex borrowed_host_mutex;
-    std::map<const ggml_tensor *, std::unique_ptr<llama_mlock>> borrowed_host_locks;
+    std::map<const ggml_tensor *, std::unique_ptr<llama_borrowed_host_pin>> borrowed_host_locks;
 
     buft_list_t cpu_buft_list;
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
@@ -2137,7 +2146,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // per-tensor activation precision policy
     prec_policy.load(ml, *this);
 
-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    const char * pin_borrowed = std::getenv("LLAMA_MTP_PIN_BORROWED_HOST");
+    const bool private_dense = pin_borrowed && std::strcmp(pin_borrowed, "1") == 0 && !devices.empty() &&
+        std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(devices.front().dev)), "CUDA") == 0;
+    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr, private_dense);
     pimpl->mappings.reserve(ml.mappings.size());
     pimpl->moe_arena = ml.load_moe_arena(params.progress_callback, params.progress_callback_user_data);
 
@@ -2498,14 +2510,28 @@ void llama_model::pin_borrowed_host_tensor(ggml_tensor * tensor) const {
         return;
     }
     const size_t bytes = ggml_nbytes(tensor);
-    auto pinned = std::make_unique<llama_mlock>();
-    pinned->init(tensor->data);
-    pinned->grow_to(bytes);
-    if (pinned->locked_size() < bytes) {
-        throw std::runtime_error(format("cannot pin borrowed host tensor %s; request-time weight residency is required", tensor->name));
+    auto pinned = std::make_unique<llama_borrowed_host_pin>();
+    const char * method = "mlock";
+    if (!devices.empty() && std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(devices.front().dev)), "CUDA") == 0) {
+        auto reg = ggml_backend_dev_backend_reg(devices.front().dev);
+        auto pin = (bool (*)(void *, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_host_pin");
+        auto unpin = (void (*)(void *)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_host_unpin");
+        if (!pin || !unpin || !pin(tensor->data, bytes)) {
+            throw std::runtime_error(format("cannot pin borrowed host tensor %s via CUDA; request-time weight residency is required", tensor->name));
+        }
+        pinned->data = tensor->data;
+        pinned->unpin = unpin;
+        method = "CUDA host registration (private dense pages)";
+    } else {
+        pinned->locked = std::make_unique<llama_mlock>();
+        pinned->locked->init(tensor->data);
+        pinned->locked->grow_to(bytes);
+        if (pinned->locked->locked_size() < bytes) {
+            throw std::runtime_error(format("cannot pin borrowed host tensor %s; request-time weight residency is required", tensor->name));
+        }
     }
     pimpl->borrowed_host_locks.emplace(tensor, std::move(pinned));
-    LLAMA_LOG_INFO("%s: pinned borrowed host %s (%.2f MiB); donor-owned, no second weight allocation\n", __func__, tensor->name, bytes / 1048576.0);
+    LLAMA_LOG_INFO("%s: pinned borrowed host %s (%.2f MiB) via %s; donor-owned, no second weight allocation\n", __func__, tensor->name, bytes / 1048576.0, method);
 }
 
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
