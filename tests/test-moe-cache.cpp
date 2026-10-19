@@ -4269,6 +4269,153 @@ static bool run_device_adaptation(ggml_backend_t gpu, ggml_backend_t cpu, log_ca
     return ok;
 }
 
+static bool run_device_adaptation_starvation(ggml_backend_t gpu, ggml_backend_t cpu, log_capture & capture) {
+    struct saved_env {
+        const char * name;
+        std::string value;
+        bool present;
+    };
+    std::vector<saved_env> saved;
+    for (const char * name : {"GGML_CUDA_MOE_CACHE_BUDGET_MB", "GGML_MOE_CACHE_DEVICE",
+            "GGML_MOE_CACHE_DEVICE_STATS", "GGML_MOE_CACHE_DEVICE_CAPTURE",
+            "GGML_MOE_CACHE_DEVICE_ADAPT_INTERVAL", "GGML_MOE_CACHE_DEVICE_ADAPT_MB",
+            "GGML_MOE_CACHE_PROFILE_LOAD", "GGML_MOE_CACHE_PROFILE_SAVE"}) {
+        const char * value = getenv(name);
+        saved.push_back({name, value ? value : "", value != nullptr});
+    }
+    configure_cache(nullptr, "8");
+    set_env("GGML_CUDA_MOE_CACHE_BUDGET_MB", "16");
+    set_env("GGML_MOE_CACHE_DEVICE", "1");
+    set_env("GGML_MOE_CACHE_DEVICE_STATS", "1");
+    set_env("GGML_MOE_CACHE_DEVICE_CAPTURE", nullptr);
+    set_env("GGML_MOE_CACHE_DEVICE_ADAPT_INTERVAL", "1");
+    set_env("GGML_MOE_CACHE_DEVICE_ADAPT_MB", "1");
+    set_env("GGML_MOE_CACHE_PROFILE_LOAD", nullptr);
+    set_env("GGML_MOE_CACHE_PROFILE_SAVE", nullptr);
+    capture.clear();
+    const auto & api = active_api();
+    constexpr int64_t width = 1024, banks = 2;
+    const int64_t rows[] = {206, 104}, experts[] = {512, 256}, routes[] = {64, 1};
+    ggml_init_params params = {8 * ggml_tensor_overhead(), nullptr, true};
+    auto * weights_ctx = ggml_init(params);
+    auto * inputs_ctx = ggml_init(params);
+    ggml_tensor * weights[banks], * acts[banks], * ids[banks];
+    ggml_moe_cache_tensor_desc descriptors[banks];
+    std::vector<uint64_t> usage[banks];
+    const uint64_t * counts[banks];
+    for (int bank = 0; bank < banks; ++bank) {
+        weights[bank] = ggml_new_tensor_3d(weights_ctx, GGML_TYPE_Q4_0, width, rows[bank], experts[bank]);
+        ggml_set_name(weights[bank], bank ? "blk.1.ffn_up_exps.weight" : "blk.0.ffn_up_exps.weight");
+        acts[bank] = ggml_new_tensor_3d(inputs_ctx, GGML_TYPE_F32, width, 1, 1);
+        ids[bank] = ggml_new_tensor_2d(inputs_ctx, GGML_TYPE_I32, routes[bank], 1);
+    }
+    auto weights_buffer = ggml_backend_alloc_ctx_tensors(weights_ctx, cpu);
+    auto inputs_buffer = ggml_backend_alloc_ctx_tensors(inputs_ctx, gpu);
+    ggml_backend_buffer_set_usage(weights_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    bool ok = true;
+    auto require = [&](bool passed, int line) {
+        if (!passed) {
+            fprintf(stderr, "device adaptation starvation assertion failed: line=%d\n", line);
+        }
+        ok &= passed;
+    };
+    test_graph graphs[banks];
+    for (int bank = 0; bank < banks; ++bank) {
+        std::vector<float> values(width * rows[bank]);
+        for (size_t i = 0; i < values.size(); ++i) {
+            values[i] = 0.2f * std::sin((float)(i % 997) * 0.017f);
+        }
+        std::vector<uint8_t> quantized(weights[bank]->nb[2]);
+        require(ggml_quantize_chunk(GGML_TYPE_Q4_0, values.data(), quantized.data(),
+                0, rows[bank], width, nullptr) == quantized.size(), __LINE__);
+        for (int expert = 0; expert < experts[bank]; ++expert) {
+            ggml_backend_tensor_set(weights[bank], quantized.data(), expert * quantized.size(), quantized.size());
+        }
+        values.resize(width);
+        ggml_backend_tensor_set(acts[bank], values.data(), 0, values.size() * sizeof(float));
+        descriptors[bank] = {weights[bank]->name, weights[bank]->data, weights[bank]->nb[2],
+                width, rows[bank], experts[bank], GGML_TYPE_Q4_0};
+        usage[bank].assign(experts[bank], 1000);
+        counts[bank] = usage[bank].data();
+        graphs[bank] = make_graph(gpu, weights[bank], acts[bank], ids[bank]);
+    }
+    auto * reference_ctx = ggml_init(params);
+    auto * reference_acts = ggml_new_tensor_3d(reference_ctx, GGML_TYPE_F32, width, 1, 1);
+    auto * reference_ids = ggml_new_tensor_2d(reference_ctx, GGML_TYPE_I32, 1, 1);
+    auto reference_buffer = ggml_backend_alloc_ctx_tensors(reference_ctx, cpu);
+    std::vector<float> activation(width);
+    ggml_backend_tensor_get(acts[1], activation.data(), 0, activation.size() * sizeof(float));
+    ggml_backend_tensor_set(reference_acts, activation.data(), 0, activation.size() * sizeof(float));
+    const int32_t target = 255;
+    ggml_backend_tensor_set(reference_ids, &target, 0, sizeof(target));
+    test_graph reference = make_graph(cpu, weights[1], reference_acts, reference_ids);
+    require(ggml_backend_graph_compute(cpu, reference.graph) == GGML_STATUS_SUCCESS, __LINE__);
+    std::vector<float> expected(rows[1]);
+    ggml_backend_tensor_get(reference.out, expected.data(), 0, expected.size() * sizeof(float));
+    void * session = create_direct_session(gpu, cpu);
+    require(session != nullptr, __LINE__);
+    if (session) {
+        require(api.warm(session, descriptors, counts, banks) >= 128, __LINE__);
+        const bool prepared = api.device_prepare(session, descriptors, banks) == 1;
+        require(prepared, __LINE__);
+        if (prepared) {
+            require(api.device_supports(session, gpu, graphs[0].out) == 1, __LINE__);
+            require(api.device_supports(session, gpu, graphs[1].out) == 1, __LINE__);
+            api.session_enter(session);
+            // Both pools are full. Every large-pool resident and miss gets two uses,
+            // so at least 371 higher-count misses cannot replace any resident.
+            for (int repeat = 0; repeat < 2; ++repeat) {
+                for (int first = 0; first < experts[0]; first += routes[0]) {
+                    int32_t route[64];
+                    for (int i = 0; i < routes[0]; ++i) { route[i] = first + i; }
+                    ggml_backend_tensor_set(ids[0], route, 0, sizeof(route));
+                    require(ggml_backend_graph_compute(gpu, graphs[0].graph) == GGML_STATUS_SUCCESS, __LINE__);
+                    ggml_backend_synchronize(gpu);
+                }
+            }
+            ggml_backend_tensor_set(ids[1], &target, 0, sizeof(target));
+            require(ggml_backend_graph_compute(gpu, graphs[1].graph) == GGML_STATUS_SUCCESS, __LINE__);
+            api.session_leave(session);
+            const std::string first_log = capture.get();
+            require(first_log.find("fills=1 copied_bytes=" + std::to_string(descriptors[1].expert_size)) !=
+                    std::string::npos, __LINE__);
+            api.print_stats(session);
+            const std::string before = capture.get();
+            const long long hits = max_field_value(before, "hits=");
+            const long long misses = max_field_value(before, "misses=");
+            const size_t checkpoint = before.size();
+            std::vector<float> initial(rows[1]), actual(rows[1]);
+            ggml_backend_tensor_get(graphs[1].out, initial.data(), 0, initial.size() * sizeof(float));
+            require(compare_output(expected, initial, 5e-4), __LINE__);
+            api.session_enter(session);
+            require(ggml_backend_graph_compute(gpu, graphs[1].graph) == GGML_STATUS_SUCCESS, __LINE__);
+            api.session_leave(session);
+            ggml_backend_tensor_get(graphs[1].out, actual.data(), 0, actual.size() * sizeof(float));
+            require(actual == initial, __LINE__);
+            api.print_stats(session);
+            const std::string after = capture.get().substr(checkpoint);
+            require(max_field_value(after, "hits=") == hits + 1, __LINE__);
+            require(max_field_value(after, "misses=") == misses, __LINE__);
+            require(max_field_value(after, "dispatches=") == 18, __LINE__);
+        }
+        api.session_destroy(session);
+    }
+    free_graph(reference);
+    ggml_backend_buffer_free(reference_buffer);
+    ggml_free(reference_ctx);
+    for (auto & graph : graphs) { free_graph(graph); }
+    ggml_backend_buffer_free(inputs_buffer);
+    ggml_backend_buffer_free(weights_buffer);
+    ggml_free(inputs_ctx);
+    ggml_free(weights_ctx);
+    for (const auto & value : saved) {
+        set_env(value.name, value.present ? value.value.c_str() : nullptr);
+    }
+    printf("cache-device-adaptation-starvation: %s\n", ok ? "OK" : "FAIL");
+    if (!ok) { fprintf(stderr, "%s", capture.get().c_str()); }
+    return ok;
+}
+
 // Keep all tensor addresses and a nonzero graph uid unchanged across cache
 // session switches and release/reprepare. Only the cache generation can detect
 // that a captured executable contains stale tables or routing counters.
@@ -4831,6 +4978,12 @@ int main(int argc, char ** argv) {
         }
         return 1;
     }
+    if (argc == 2 && strcmp(argv[1], "--device-adaptation-starvation-only") == 0) {
+        const bool ok = provider_is_cuda && run_device_adaptation_starvation(gpu, cpu, capture);
+        ggml_backend_free(gpu);
+        ggml_backend_free(cpu);
+        return !provider_is_cuda ? 77 : ok ? 0 : 1;
+    }
     if (!run_prefetch_router(gpu, cpu)) {
         ggml_backend_free(gpu);
         ggml_backend_free(cpu);
@@ -5045,6 +5198,9 @@ int main(int argc, char ** argv) {
     });
     ok &= run_optional(provider_is_cuda, "cache-device-adaptation-tuning", [&] {
         return run_device_adaptation(gpu, cpu, capture, true, false, true);
+    });
+    ok &= run_optional(provider_is_cuda, "cache-device-adaptation-starvation", [&] {
+        return run_device_adaptation_starvation(gpu, cpu, capture);
     });
     ok &= run_optional(provider_is_cuda, "cache-device-capture", [&] {
         return run_device_adaptation(gpu, cpu, capture, true);

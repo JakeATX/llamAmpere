@@ -5033,7 +5033,7 @@ static void moe_cache_device_adapt(moe_cache_session & session) {
     const auto start = std::chrono::steady_clock::now();
     const size_t copy_limit = session.device_adapt_copy_cap;
     size_t copied = 0, pinned_source_bytes = 0, original_source_bytes = 0;
-    int fills = 0, fallback_skips = 0, attempts = 0;
+    int fills = 0, fallback_skips = 0;
     try {
         std::vector<unsigned long long> counts(session.device_previous_counts.size());
         ggml_cuda_set_device(device.logical);
@@ -5130,7 +5130,7 @@ static void moe_cache_device_adapt(moe_cache_session & session) {
             }
         };
         for (const auto & c : missing) {
-            if (++attempts > 256) {
+            if (queued.size() == 256) {
                 break;
             }
             auto & pool = *c.pool;
