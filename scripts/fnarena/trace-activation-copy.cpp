@@ -99,7 +99,7 @@ extern "C" void llama_copy_moe_output(void * dst, const void * src, size_t bytes
 }
 
 // Layout operands contain serialized metadata. Reject any file-backed second operand.
-static bool anonymous_operand(const void * ptr, size_t bytes) {
+static bool anonymous_operand(const void * ptr, size_t bytes, char * path) {
     FILE * maps = fopen("/proc/self/maps", "r");
     if (!maps) { return false; }
     char line[PATH_MAX + 256];
@@ -113,6 +113,9 @@ static bool anonymous_operand(const void * ptr, size_t bytes) {
                    &begin, &end, permissions, &offset, &inode, &n) != 5 || !n) { continue; }
         const uintptr_t address = (uintptr_t) ptr;
         if (address >= begin && address < end && bytes <= end - address) {
+            char * name = line + n;
+            name[strcspn(name, "\n")] = 0;
+            if (strlen(name) < PATH_MAX) { strcpy(path, *name ? name : "[anonymous]"); }
             found = permissions[0] == 'r' && inode == 0;
             break;
         }
@@ -131,8 +134,11 @@ static int layout_operation(void * owned, const void * metadata, size_t bytes, b
         return 0;
     }
     char path[PATH_MAX] = {};
+    char metadata_path[PATH_MAX] = {};
     uint64_t offset = 0;
-    const bool valid = source_mapping(owned, bytes, path, offset) && anonymous_operand(metadata, bytes);
+    const bool owned_valid = source_mapping(owned, bytes, path, offset);
+    const bool metadata_anonymous = anonymous_operand(metadata, bytes, metadata_path);
+    const bool valid = owned_valid && metadata_anonymous;
     timespec start{}, end{};
     clock_gettime(CLOCK_REALTIME, &start);
     const uint64_t before = io_bytes();
@@ -146,7 +152,9 @@ static int layout_operation(void * owned, const void * metadata, size_t bytes, b
     if (before == UINT64_MAX || after == UINT64_MAX || after < before) {
         fprintf(stderr, "FNARENA_LAYOUT_IO_ERROR tid=%ld reason=counter\n", syscall(SYS_gettid));
     } else if (after > before && !valid) {
-        fprintf(stderr, "FNARENA_LAYOUT_IO_ERROR tid=%ld reason=operand\n", syscall(SYS_gettid));
+        fprintf(stderr, "FNARENA_LAYOUT_IO_ERROR tid=%ld reason=operand op=%s owned=%p metadata=%p bytes=%zu owned_valid=%d metadata_anonymous=%d metadata_path=%s\n",
+                syscall(SYS_gettid), compare ? "compare" : "write", owned, metadata, bytes,
+                owned_valid, metadata_anonymous, *metadata_path ? metadata_path : "[unresolved]");
     } else if (after > before) {
         fprintf(stderr, "FNARENA_LAYOUT_IO op=%s start=%lld.%09ld end=%lld.%09ld tid=%ld read_bytes=%" PRIu64 " offset=%" PRIu64 " bytes=%zu path=%s\n",
                 compare ? "compare" : "write", (long long) start.tv_sec, start.tv_nsec, (long long) end.tv_sec, end.tv_nsec,
