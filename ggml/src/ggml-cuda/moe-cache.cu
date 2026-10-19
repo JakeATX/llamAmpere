@@ -1404,6 +1404,9 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
             if (!job.prediction && pool && job.slot >= 0 && job.slot < pool->n_slots &&
                     pool->slots[job.slot].generation == job.generation) {
                 job.prediction = pool->slots[job.slot].prediction;
+                if (job.prediction && job.prediction->start == 0) {
+                    job.prediction->start = copy_start; // A queued prediction promoted to demand.
+                }
             }
             if (job.prediction) {
                 job.prediction->done = expired || error != cudaSuccess ? -1 : finished;
@@ -4603,6 +4606,34 @@ static void moe_cache_prefetch(void * opaque, const ggml_moe_cache_tensor_desc *
             source_layer < 0 || target_layer <= source_layer || target_layer - source_layer > 3 || target_layer >= 1024) {
         return;
     }
+    // Descriptors retain physical bank stride; pools and link budgets count packed bytes.
+    ggml_moe_cache_tensor_desc packed[3];
+    size_t source_strides[3];
+    for (int t = 0; t < n_tensors; ++t) {
+        const auto & desc = tensors[t];
+        if (!desc.data || desc.n_in <= 0 || desc.n_out <= 0 || desc.n_expert <= 0 ||
+                !moe_cache_type_supported((ggml_type) desc.type) ||
+                desc.n_in % ggml_blck_size((ggml_type) desc.type) != 0) {
+            return;
+        }
+        if ((uint64_t) (desc.n_in / ggml_blck_size((ggml_type) desc.type)) >
+                SIZE_MAX / ggml_type_size((ggml_type) desc.type)) {
+            return;
+        }
+        const size_t row = ggml_row_size((ggml_type) desc.type, desc.n_in);
+        if (row == 0 || (uint64_t) desc.n_out > SIZE_MAX / row) {
+            return;
+        }
+        const size_t bytes = row * (size_t) desc.n_out;
+        if (desc.expert_size < bytes ||
+                (uint64_t) (desc.n_expert - 1) > (SIZE_MAX - bytes) / desc.expert_size) {
+            return;
+        }
+        packed[t] = desc;
+        packed[t].expert_size = bytes;
+        source_strides[t] = desc.expert_size;
+    }
+    tensors = packed;
     std::lock_guard<std::mutex> lock(session->mu);
     if (!session->prefetch_enabled || session->stopping || session->dormant ||
             session->active_scopes != 1 || session->predictions.size() >= 1024) {
@@ -4659,7 +4690,8 @@ static void moe_cache_prefetch(void * opaque, const ggml_moe_cache_tensor_desc *
                 }
                 // Only known host tensors and already allocated pools are eligible. No speculative allocation.
                 const auto seen = device.seen_tensors.find(desc.data);
-                if (seen == device.seen_tensors.end() || seen->second.expert_size != desc.expert_size || seen->second.wtype != desc.type || seen->second.n_expert != desc.n_expert) {
+                if (seen == device.seen_tensors.end() || seen->second.expert_size != desc.expert_size || seen->second.wtype != desc.type || seen->second.n_expert != desc.n_expert ||
+                        moe_cache_host_stride(device, desc.data, desc.expert_size) != source_strides[t]) {
                     continue;
                 }
                 const auto route = session->layer_devices.find(target_layer);
@@ -4702,7 +4734,7 @@ static void moe_cache_prefetch(void * opaque, const ggml_moe_cache_tensor_desc *
                     try {
                         pool.map.emplace(key, index);
                         device.queue.push_back({p, index, slot.generation + 1, key,
-                            (const char *) desc.data + (size_t) ids[rank] * desc.expert_size, desc.expert_size, copy});
+                            (const char *) desc.data + (size_t) ids[rank] * source_strides[t], desc.expert_size, copy});
                         session->predictions.push_back(copy);
                     } catch (...) {
                         pool.map.erase(key);

@@ -40,6 +40,7 @@ def monitor():
     return
 thread=threading.Thread(target=monitor);thread.start()
 env={k:v for k,v in os.environ.items() if not k.startswith(('GGML_','LLAMA_','LD_LIBRARY_PATH'))}
+env['LLAMA_MOE_ARENA']='off'
 env.update(TMPDIR=str(R/'tmp-build'),CUDA_CACHE_PATH=str(R/'cuda-cache'),LD_LIBRARY_PATH=(R/'logs/frozen-bin.txt').read_text().strip())
 model='/mnt/models/aiplus_run/finish/AI_N.gguf' if arm=='swift27b' else '/mnt/models/flash-next/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf'
 base=[str(R/'llama.cpp-server'),'-m',model,'--load-mode','mmap','-ngl','999','-c','110592','--parallel','1','-b','131072','-ub','2048' if arm=='swift27b' else '12288','-t','8','-tb','8','-lv','4','-fa','on','-ctk','sjkvarn4','-ctv','sjkvarn4','--cache-ram','0','--no-cache-disk','--no-webui','--host','127.0.0.1','--port',str(port),'--slot-save-path',str(C),'--spec-type','draft-mtp-adaptive','--spec-draft-n-max','4','--spec-draft-ubatch','2048','--ctx-checkpoints','4']

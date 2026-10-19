@@ -3694,6 +3694,17 @@ static bool run_prefetch_staging(ggml_backend_t gpu, ggml_backend_t cpu,
     const std::string log = capture.get();
     ok &= count_occurrences(log, "[moe-prefetch] ") == 4 * banks;
     ok &= count_occurrences(log, "outcome=used") == 4 * banks;
+    const size_t logical_bytes = ggml_row_size(weights->type, weights->ne[0]) * weights->ne[1];
+    const std::string copy_bytes = " bytes=" + std::to_string(logical_bytes) + " issue_us=";
+    ok &= count_occurrences(log, copy_bytes.c_str()) == 4 * banks;
+    for (size_t pos = log.find("[moe-prefetch]"); pos != std::string::npos;
+            pos = log.find("[moe-prefetch]", pos + 1)) {
+        const size_t stamp = log.find("issue_us=", pos);
+        long long issue = 0, start = 0, done = 0;
+        ok &= stamp != std::string::npos && sscanf(log.c_str() + stamp,
+                "issue_us=%lld start_us=%lld done_us=%lld", &issue, &start, &done) == 3 &&
+                issue > 0 && start >= issue && done >= start;
+    }
     if (device_mode) {
         ok &= max_field_value(log, "replays=") > 0;
     }
@@ -4660,6 +4671,10 @@ static bool run_arena_stride(ggml_backend_t gpu, ggml_backend_t cpu,
         ok &= run_device_tables_case(gpu, cpu, weights, capture);
         // The second projection starts inside the same registered allocation.
         ok &= run_device_tables_case(gpu, cpu, gate, capture);
+        // Actual padded tensors, pinned by the model owner: all paths must copy and consume.
+        ok &= run_prefetch_staging(gpu, cpu, weights, capture, false);
+        ok &= run_prefetch_staging(gpu, cpu, weights, capture, true);
+        ok &= run_prefetch_staging(gpu, cpu, weights, capture, true, gate);
         unsigned int flags = 0;
         // Cache/table teardown must leave the model-owned registration alive.
         ok &= cudaHostGetFlags(&flags, arena) == cudaSuccess;

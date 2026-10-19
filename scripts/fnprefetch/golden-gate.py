@@ -31,6 +31,7 @@ for mode in modes:
  env['GGML_MOE_CACHE_DEVICE_STATS']=env['GGML_MOE_CACHE_DEVICE']
  env['GGML_MOE_CACHE_DEVICE_FUSED']='0'
  env['LLAMA_B1_CACHE_WARM']='1'
+ env['LLAMA_MOE_ARENA']='off'
  env['GGML_CUDA_MOE_CACHE_RESERVE_MB']='2560'
  with (mode_dir/f'golden-{mode}.log').open('w') as log:
   command=base+([] if mode=='baseline' else ['--moe-prefetch',mode])

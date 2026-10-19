@@ -20,6 +20,12 @@ are admitted before timing samples exist. Real demand work takes priority;
 queued predictions are canceled when demand arrives or their deadline
 expires. An already running transfer completes normally.
 
+Arena descriptors retain the physical stride between experts. Prefetch derives
+logical projection bytes for pool lookup, copy length, and link budgets, and uses
+the physical stride only for the source offset. Pinned sources remain owned by
+the model. The padded-stride fixture requires real consumed copies in legacy,
+device, and fused dispatch and verifies untouched padding and registration.
+
 Copies use at most four reserved slots per format pool inside the cache's
 existing allocation. Demand eviction cannot overwrite these slots. Device
 dispatch publishes a completed staging address only after the real router
