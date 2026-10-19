@@ -3741,7 +3741,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     // on a failure every ubatch of the call is incomplete: drop the whole batch from the memory
     auto b1_fail = [&](ggml_status st) -> int {
         b1_cur = {};
-        b1->end(true);
+        b1_end(true);
         b1_cache_counts.clear();
         b1_cache_readbacks = 0;
         // SJ-KVaRN: layers stopped at different ubatches, so ring rows below b1_pos0 may already be overwritten in
@@ -4054,7 +4054,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     if (b1_mode == 1) {
         GGML_ASSERT(b1_i == b1->n_ub());
-        b1->end(false);
+        b1_end(false);
         LLAMA_LOG_INFO("%s: [B1] graph compute calls host wall %.3f ms (includes routing readbacks; overlaps expert copies)\n",
                 __func__, b1_compute_submit_us / 1000.0);
     }
@@ -4848,6 +4848,10 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
     }
 
     auto normal = [&]() -> int {
+        if (b1_mc_suspended) {
+            ggml_backend_sched_moe_cache_resume(sched.get());
+            b1_mc_suspended = false;
+        }
         if (b1->dirty() && !b1->refill()) {
             LLAMA_LOG_ERROR("%s: [B1] cannot restore the lent expert layers\n", __func__);
             return -3;
@@ -4924,6 +4928,16 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
     // scheduler to copy RAM experts to the GPU, the normal path computes that layer's RAM experts on the CPU in every
     // ubatch, so B1 leaves them home (same result, one layer less to stream). Otherwise ubatch_home() matches it per ubatch.
     const bool final_home = !b1->host_rows_on_gpu(b1_final_rows(n_outputs_all, n_tokens_all));
+    // the MoE expert cache (--moe-cache) keeps the free VRAM above its reserve once it has run, which leaves B1 no
+    // room when the experts are in RAM. Opt-in (LLAMA_B1_MOE_CACHE_SUSPEND=1): free its pool for this call when no
+    // other sequence decodes from it; b1_end makes it again and it refills from decode. Off by default because the
+    // refilled pool serves different experts than a pool that stayed warm, so later steps can differ in rounding.
+    b1_mc_suspended = !others && b1_ctx_env("LLAMA_B1_MOE_CACHE_SUSPEND", 0) != 0 &&
+                      ggml_backend_sched_moe_cache_suspend(sched.get());
+    if (b1_mc_suspended) {
+        b1_cache_needs_refresh = true;
+        LLAMA_LOG_WARN("%s: [B1] MoE expert cache suspended for this call\n", __func__);
+    }
     const char * rotate = getenv("LLAMA_MOE_CACHE_RELEASE_PROMPT");
     size_t borrow = 0;
     const bool rotating = rotate && rotate[0] == '1';
@@ -4986,7 +5000,7 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
     if (lean_legacy) {
         if (b1->n_groups() != 1 || !b1_reserve_legacy_layers(sizes, n_outputs_all)) {
             LLAMA_LOG_WARN("%s: [B1] legacy one-pass layer reservation failed before applying prompt state\n", __func__);
-            b1->end(true);
+            b1_end(true);
             return normal();
         }
         b1->start_streaming();
@@ -5004,7 +5018,7 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
     do {
         if (!mctx->apply()) {
             LLAMA_LOG_ERROR("%s: [B1] failed to apply memory context of ubatch %zu\n", __func__, n_applied);
-            b1->end(true);
+            b1_end(true);
             if (sj) {
                 sj->b1_sj_rewind();
             }
@@ -5017,7 +5031,7 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
 
     if (n_applied != sizes.size() || !mctx->b1_seek(0)) {
         LLAMA_LOG_ERROR("%s: [B1] the memory context did not keep its ubatch views\n", __func__);
-        b1->end(true);
+        b1_end(true);
         if (sj) {
             sj->b1_sj_rewind();
         }
@@ -5233,6 +5247,14 @@ void llama_context::b1_cache_warm() {
 int64_t llama_context::b1_final_rows(int64_t n_out, int64_t n_tok) const {
     // the graph crops the last layer to the output rows before its FFN unless the nextn hidden state needs every row
     return !cparams.embeddings_nextn || cparams.embeddings_nextn_masked ? n_out : n_tok;
+}
+
+void llama_context::b1_end(bool failed) {
+    b1->end(failed);
+    if (b1_mc_suspended) {
+        ggml_backend_sched_moe_cache_resume(sched.get());
+        b1_mc_suspended = false;
+    }
 }
 
 bool llama_context::b1_run_prefix(llama_memory_context_i * mctx, size_t ub0, ggml_status & status) {

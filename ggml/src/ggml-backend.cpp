@@ -1127,6 +1127,12 @@ struct ggml_backend_sched {
     // The provider table selected for this session. Copied at creation so a
     // later registration change cannot alter the session's callbacks.
     struct ggml_moe_cache_api moe_cache_api;
+    // how the session was made (0 none, 1 default at creation, 2 set_moe_cache), so a suspended session can be
+    // made again the same way
+    int                      moe_cache_made;
+    enum ggml_moe_cache_mode moe_cache_mode_last;
+    size_t                   moe_cache_budget_last;
+    bool                     moe_cache_suspended;
 
     ggml_backend_sched_eval_callback callback_eval;
     void * callback_eval_user_data;
@@ -2961,6 +2967,24 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     return GGML_STATUS_SUCCESS;
 }
 
+// the session a new scheduler gets when nobody sets a mode: the first provider that accepts the default config
+static void ggml_sched_moe_cache_default(ggml_backend_sched_t sched) {
+    void * cache_backends[GGML_SCHED_MAX_BACKENDS];
+    for (int b = 0; b < sched->n_backends; b++) {
+        cache_backends[b] = sched->backends[b];
+    }
+    for (const ggml_moe_cache_api & api :
+            ggml_moe_cache_provider_candidates(cache_backends, sched->n_backends)) {
+        void * session = api.session_create(cache_backends, sched->n_backends, nullptr);
+        if (session) {
+            sched->moe_cache_session = session;
+            sched->moe_cache_api     = api;
+            sched->moe_cache_made    = 1;
+            break;
+        }
+    }
+}
+
 ggml_backend_sched_t ggml_backend_sched_new(
         ggml_backend_t * backends,
         ggml_backend_buffer_type_t * bufts,
@@ -3025,21 +3049,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
         }
     }
 
-    {
-        void * cache_backends[GGML_SCHED_MAX_BACKENDS];
-        for (int b = 0; b < n_backends; b++) {
-            cache_backends[b] = backends[b];
-        }
-        for (const ggml_moe_cache_api & api :
-                ggml_moe_cache_provider_candidates(cache_backends, n_backends)) {
-            void * session = api.session_create(cache_backends, n_backends, nullptr);
-            if (session) {
-                sched->moe_cache_session = session;
-                sched->moe_cache_api = api;
-                break;
-            }
-        }
-    }
+    ggml_sched_moe_cache_default(sched);
 
     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
     sched->op_offload = op_offload;
@@ -3073,9 +3083,14 @@ void ggml_backend_sched_set_moe_cache(
     }
     sched->moe_cache_session = nullptr;
     sched->moe_cache_api = ggml_moe_cache_api{};
+    sched->moe_cache_made = 0;
+    sched->moe_cache_suspended = false;
     if (mode == GGML_MOE_CACHE_MODE_OFF) {
         return;
     }
+    sched->moe_cache_made        = 2;
+    sched->moe_cache_mode_last   = mode;
+    sched->moe_cache_budget_last = budget_mib;
 
     void * cache_backends[GGML_SCHED_MAX_BACKENDS];
     for (int index = 0; index < sched->n_backends; index++) {
@@ -3178,6 +3193,35 @@ size_t ggml_backend_sched_moe_cache_restore(ggml_backend_sched_t sched) {
     const size_t restored = sched->moe_cache_api.restore(sched->moe_cache_session);
     ggml_backend_sched_reset(sched);
     return restored;
+}
+
+bool ggml_backend_sched_moe_cache_suspend(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    if (!sched->moe_cache_session || sched->moe_cache_suspended || !sched->moe_cache_api.session_destroy) {
+        return false;
+    }
+    ggml_backend_sched_synchronize(sched);
+    sched->moe_cache_api.session_destroy(sched->moe_cache_session);
+    sched->moe_cache_session   = nullptr;
+    sched->moe_cache_suspended = true;
+    sched->moe_cache_device_graph = false;
+    ggml_backend_sched_reset(sched);
+    return true;
+}
+
+void ggml_backend_sched_moe_cache_resume(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    if (!sched->moe_cache_suspended) {
+        return;
+    }
+    sched->moe_cache_suspended = false;
+    if (sched->moe_cache_made == 2) {
+        ggml_backend_sched_set_moe_cache(sched, sched->moe_cache_mode_last, sched->moe_cache_budget_last);
+    } else {
+        sched->moe_cache_api = ggml_moe_cache_api{};
+        ggml_sched_moe_cache_default(sched);
+    }
+    ggml_backend_sched_reset(sched);
 }
 
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {

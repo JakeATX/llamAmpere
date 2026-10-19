@@ -212,6 +212,10 @@ GGML_API struct ggml_moe_cache_api ggml_moe_cache_active(void);
 GGML_API int ggml_backend_sched_moe_cache_status(ggml_backend_sched_t sched, size_t * allocated_bytes);
 GGML_API void ggml_backend_sched_set_moe_cache(
         ggml_backend_sched_t sched, enum ggml_moe_cache_mode mode, size_t budget_mib);
+// Frees the session and its VRAM pool until resume; false when there is none (or it is already suspended).
+// Resume makes it again the way it was made; the new pool fills from the experts decode asks for.
+GGML_API bool ggml_backend_sched_moe_cache_suspend(ggml_backend_sched_t sched);
+GGML_API void ggml_backend_sched_moe_cache_resume(ggml_backend_sched_t sched);
 
 #ifdef __cplusplus
 }

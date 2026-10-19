@@ -547,6 +547,7 @@ private:
     bool b1_ffn_scratch_active = false;
     bool b1_layer_scratch_active = false;
     bool b1_off_logged = false; // the once-per-context note on why B1 is not used was printed
+    bool b1_mc_suspended = false; // this call freed the MoE expert cache's pool (made again in b1_end)
     struct {
         bool          active = false;   // the graph being built is a B1 graph (memory already applied)
         int32_t       il0    = 0;
@@ -563,6 +564,8 @@ private:
     // runs layers [0, n_layer - 1) of every ubatch of the group that starts at ub0, then seeks back to ub0 with
     // the last layer's experts ready; false on failure (status set)
     bool b1_run_prefix(llama_memory_context_i * mctx, size_t ub0, ggml_status & status);
+    // ends the B1 call (b1->end) and gives the MoE expert cache back if the call suspended it
+    void b1_end(bool failed);
     int64_t b1_final_rows(int64_t n_out, int64_t n_tok) const;
 
     // fork: opt-in prompt routing counts use layer IDs, never temporary B1 weight addresses.
