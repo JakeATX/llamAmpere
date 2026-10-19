@@ -4260,6 +4260,10 @@ static int moe_cache_warm(void * opaque, const ggml_moe_cache_tensor_desc * tens
         entries += tensors[i].n_expert;
     }
     const bool loading = !counts;
+    if (!loading && getenv("GGML_MOE_CACHE_PROFILE_LOAD")) {
+        // Suspension creates a new session. Restore its saved fallback rankings before prompt reranking.
+        moe_cache_warm(opaque, tensors, nullptr, n_tensors);
+    }
     bool observed = false;
     if (counts) {
         for (int i = 0; i < n_tensors && !observed; ++i) {
