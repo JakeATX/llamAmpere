@@ -3981,19 +3981,21 @@ static bool run_prefetch_staging(ggml_backend_t gpu, ggml_backend_t cpu,
         const int32_t ranked[] = {0, 63}; // Resident expert must not be copied.
         api.prefetch(session, descriptors, banks, ranked, 2, 0, 1, 0);
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-        bool completed = false;
-        do {
-            // Planning also exercises promotion when demand reaches a queued prediction.
-            completed = true;
-            for (int i = 0; i < banks; ++i) {
-                const auto & desc = descriptors[i];
-                completed &= direct_plan_one(desc.name, desc.data, desc.expert_size,
+        bool completed = true;
+        for (int i = 0; i < banks; ++i) {
+            const auto & desc = descriptors[i];
+            bool bank_completed = false;
+            do {
+                // Planning can promote a queued prediction to demand. Finish this
+                // bank before promoting another, which would preempt its copy.
+                bank_completed = direct_plan_one(desc.name, desc.data, desc.expert_size,
                         desc.n_in, desc.n_out, desc.type, desc.n_expert, 63) == 1;
-            }
-            if (!completed) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            }
-        } while (!completed && std::chrono::steady_clock::now() < deadline);
+                if (!bank_completed) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+            } while (!bank_completed && std::chrono::steady_clock::now() < deadline);
+            completed &= bank_completed;
+        }
         ok &= completed;
         api.prefetch_observe(session, 1, nullptr, 0);
         api.prefetch_observe(session, 1, route, 2);
