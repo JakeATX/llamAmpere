@@ -223,6 +223,8 @@ llama_b1::llama_b1(const llama_model & model, ggml_backend_t backend_gpu) : mode
             largest_role = std::max(largest_role, e.t->nb[1] * e.t->ne[1]);
         }
         piece_bytes = std::min(piece_bytes, largest_role);
+        direct       = b1_env_int("LLAMA_B1_DIRECT", 0) != 0;
+        direct_piece = (size_t) std::clamp<int64_t>(b1_env_int("LLAMA_B1_DIRECT_PIECE_MIB", 64), 1, 1024) << 20;
     }
 
     stg.resize(n_workers);
@@ -259,8 +261,9 @@ llama_b1::llama_b1(const llama_model & model, ggml_backend_t backend_gpu) : mode
         slot_bytes += role_max[r];
     }
     LLAMA_LOG_WARN("%s: [B1] layer-major prefill ready: %zu expert tensors in %zu roles, %d of %d layers resident, "
-            "slot %.1f MiB, %d copy threads x 2 x %.2f MiB pinned, %zu resident tensors lendable\n", __func__,
+            "slot %.1f MiB, %d copy threads x 2 x %.2f MiB pinned%s, %zu resident tensors lendable\n", __func__,
             exps.size(), roles.size(), n_res, n_layer, slot_bytes/1048576.0, n_workers, piece_bytes/1048576.0,
+            direct ? " (arena pieces copied direct, LLAMA_B1_DIRECT)" : "",
             (size_t) std::count_if(exps.begin(), exps.end(), [](const exps_tensor & e) { return e.resident && e.src.fd >= 0; }));
 
     init_ok = true;
@@ -939,7 +942,7 @@ void llama_b1::push_tensor_pieces(std::vector<piece> & ps, const exps_tensor & e
         p.src_offs = e.src.offs + off;
         p.dst      = dst;
         p.dst_offs = dst_offs + off;
-        p.len      = std::min(piece_bytes, e.nbytes - off);
+        p.len      = std::min(direct && !from_file ? direct_piece : piece_bytes, e.nbytes - off);
         if (strided || permanent) { p.len = std::min(p.len, expert_bytes - off % expert_bytes); }
         ps.push_back(p);
         off += p.len;
@@ -1044,6 +1047,19 @@ void llama_b1::worker(int w) {
                 if (--pieces_left == 0) { cv.notify_all(); }
                 continue;
             }
+        }
+
+        if (p.src_host && direct) {
+            // the arena is registered with CUDA: the DMA engine reads it in place
+            ggml_moe_cache_host_restore(p.src_host, p.len);
+            {
+                std::lock_guard<std::mutex> ls(mtx_stream);
+                ggml_backend_tensor_set_async(backend_copy, p.dst->raw, p.src_host, p.dst_offs, p.len);
+            }
+            std::lock_guard<std::mutex> lk(mtx);
+            st.bytes_h2d += p.len;
+            if (--pieces_left == 0) { cv.notify_all(); }
+            continue;
         }
 
         auto & s = stg[w][b];

@@ -2652,6 +2652,16 @@ bool llama_context::copy_embeddings_nextn(float * dst, int32_t first, int32_t co
             if (begin < base || begin - base > output_file->size || bytes > output_file->size - (begin - base)) {
                 return false;
             }
+            static const bool readahead = [] {
+                const char * v = getenv("LLAMA_MOE_OUTPUT_READAHEAD");
+                return v && atoi(v) != 0;
+            }();
+            if (readahead) {
+                const size_t offset = begin - base;
+                // current range first (no-op when cached), then the next chunk of the same size
+                output_file->readahead(offset, bytes);
+                output_file->readahead(offset + bytes, bytes);
+            }
             llama_copy_moe_output(dst, src, bytes);
         } else {
             memcpy(dst, src, bytes);

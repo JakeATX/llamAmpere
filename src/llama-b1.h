@@ -201,6 +201,10 @@ private:
 
     size_t piece_bytes = 16u << 20;
     int    n_workers   = 8;
+    // [PREFILLFAST] LLAMA_B1_DIRECT=1: the pinned expert arena is already page-locked, so arena pieces go straight
+    // to the copy stream (no memcpy into a staging buffer, no staging event wait); direct_piece caps those pieces
+    bool   direct       = false;
+    size_t direct_piece = 64u << 20;
     std::vector<std::vector<staging>> stg; // [worker][2]
     ggml_backend_buffer_t zero_buf = nullptr;
     char * zero_data = nullptr;

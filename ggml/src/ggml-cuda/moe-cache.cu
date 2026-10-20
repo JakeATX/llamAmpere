@@ -1461,6 +1461,12 @@ static bool moe_cache_grow_host(
     return true;
 }
 
+// [PREFILLFAST] opt-in switch helper.
+static bool moe_cache_env_on(const char * name) {
+    const char * value = getenv(name);
+    return value && atoi(value) != 0;
+}
+
 static void moe_cache_worker(moe_cache_session * session, moe_cache_device * device, cudaStream_t stream) {
     char * stage = nullptr;
     size_t stage_capacity = 0;
@@ -1551,7 +1557,16 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
             if (!expired && error == cudaSuccess && !moe_resident_host_restore(job.source, job.bytes)) {
                 error = cudaErrorInvalidValue;
             }
-            if (!expired && error == cudaSuccess && stage && stage_capacity >= job.bytes) {
+            // [PREFILLFAST] GGML_MOE_CACHE_FILL_DIRECT=1: copy the host source straight to the slot.
+            // Arena sources are page-locked, so this skips one host memcpy per fill; a pageable
+            // source still works (the driver stages it). Off by default.
+            static const bool fill_direct = moe_cache_env_on("GGML_MOE_CACHE_FILL_DIRECT");
+            if (!expired && error == cudaSuccess && fill_direct) {
+                error = cudaMemcpyAsync(destination, job.source, job.bytes, cudaMemcpyHostToDevice, stream);
+                if (error == cudaSuccess) {
+                    error = cudaStreamSynchronize(stream);
+                }
+            } else if (!expired && error == cudaSuccess && stage && stage_capacity >= job.bytes) {
                 memcpy(stage, job.source, job.bytes);
                 error = cudaMemcpyAsync(
                         destination, stage, job.bytes, cudaMemcpyHostToDevice, stream);
@@ -4598,6 +4613,12 @@ static size_t moe_cache_return(void * opaque) {
     return restored;
 }
 
+// [PREFILLFAST] GGML_MOE_CACHE_WARM_SINGLE=1: a prompt warm restores the saved profile ranks first.
+// With this switch that nested restore only records the ranks; the prompt warm then fills every
+// slot once in its own rank order, instead of filling all slots from the profile and replacing
+// most of them right away. Off by default.
+static thread_local bool g_warm_rank_only = false;
+
 static int moe_cache_warm(void * opaque, const ggml_moe_cache_tensor_desc * tensors,
         const uint64_t * const * counts, int n_tensors) {
     auto * session = (moe_cache_session *)opaque;
@@ -4622,7 +4643,10 @@ static int moe_cache_warm(void * opaque, const ggml_moe_cache_tensor_desc * tens
     const bool loading = !counts;
     if (!loading && getenv("GGML_MOE_CACHE_PROFILE_LOAD")) {
         // Suspension creates a new session. Restore its saved fallback rankings before prompt reranking.
+        static const bool rank_only = moe_cache_env_on("GGML_MOE_CACHE_WARM_SINGLE");
+        g_warm_rank_only = rank_only;
         moe_cache_warm(opaque, tensors, nullptr, n_tensors);
+        g_warm_rank_only = false;
     }
     bool observed = false;
     if (counts) {
@@ -4709,6 +4733,10 @@ static int moe_cache_warm(void * opaque, const ggml_moe_cache_tensor_desc * tens
                 }
             }
         }
+    }
+    if (loading && g_warm_rank_only) {
+        MOE_CACHE_LOG("[moe-cache] profile ranks restored for %zu entries; fills left to the prompt warm (GGML_MOE_CACHE_WARM_SINGLE)\n", ranked.size());
+        return 0;
     }
     std::stable_sort(ranked.begin(), ranked.end(), [loading](const candidate & a, const candidate & b) {
         if (loading && a.first_layer != b.first_layer) { return a.first_layer > b.first_layer; }

@@ -15456,9 +15456,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new sr(2, 128, n, 1, 1, sr::CW_CPY,  { 2 },    { 2 }));
         }
         test_cases.emplace_back(new sr(2, 128, 513, 1, 4, sr::CW_SET_ROWS, { 7 },    { 7, 11, 15, 19 }));
-        // The old final-only ring writer ignores slot_rows; check this path only with the new dispatch.
+        // The old final-only ring writer ignores slot_rows; check this path only with a chunked dispatch
+        // (#112 GGML_CUDA_GDN_TC=1 or the Argon kernel GGML_CUDA_GDN_CHUNKED=1).
         const char * gdn_tc_enabled = getenv("GGML_CUDA_GDN_TC");
-        if (gdn_tc_enabled != nullptr && atoi(gdn_tc_enabled) == 1) {
+        const char * gdn_chunked_env = getenv("GGML_CUDA_GDN_CHUNKED");
+        if ((gdn_tc_enabled != nullptr && atoi(gdn_tc_enabled) == 1) || (gdn_chunked_env != nullptr && atoi(gdn_chunked_env) != 0)) {
             test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 2, 128, 513, 2, 1, GGML_TYPE_F32, true));
             for (int64_t n : { 512, 4096, 32768 }) {
                 test_cases.emplace_back(new sr(2, 128, n, 1, 1, sr::CW_SET_ROWS, { 7 }, { 7 }));

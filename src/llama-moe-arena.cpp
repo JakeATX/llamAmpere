@@ -95,6 +95,20 @@ void llama_moe_output::release(size_t offset, size_t bytes) {
 #endif
 }
 
+// [PREFILLFAST] LLAMA_MOE_OUTPUT_READAHEAD=1: B1 writes each ubatch of hidden rows to this file and
+// drops the pages, so the MTP catch-up reads every chunk back from disk on page faults. A
+// WILLNEED hint on the next chunk lets the kernel read it while the current chunk computes.
+// Advisory only: it never changes the bytes read.
+void llama_moe_output::readahead(size_t offset, size_t bytes) {
+#ifdef __linux__
+    if (file < 0 || offset >= size) { return; }
+    bytes = std::min(bytes, size - offset);
+    if (bytes) { (void) posix_fadvise(file, (off_t) offset, (off_t) bytes, POSIX_FADV_WILLNEED); }
+#else
+    (void) offset; (void) bytes;
+#endif
+}
+
 llama_moe_output::~llama_moe_output() {
 #ifndef _WIN32
     if (data) { munmap(data, size); }
