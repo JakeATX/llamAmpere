@@ -8,6 +8,13 @@
 #include <stdexcept>
 #include <vector>
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cerrno>
+#include <cstdlib>
+#include <mutex>
+#include <string>
+#include <thread>
 #ifndef _WIN32
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -114,6 +121,173 @@ llama_moe_output::~llama_moe_output() {
     if (data) { munmap(data, size); }
     if (file >= 0) { close(file); }
 #endif
+}
+
+#ifndef _WIN32
+static size_t arena_env_size(const char * name, size_t fallback, size_t lo, size_t hi) {
+    const char * v = getenv(name);
+    if (!v || !*v) { return fallback; }
+    const long long n = atoll(v);
+    return n < (long long) lo ? lo : (size_t) n > hi ? hi : (size_t) n;
+}
+#endif
+
+void llama_moe_arena_parallel_load(const std::vector<llama_moe_arena_copy> & copies,
+        bool (*progress)(size_t done, void * user), void * user, size_t ram_floor,
+        llama_moe_arena_load_stats & stats) {
+#ifndef _WIN32
+    const auto start = std::chrono::steady_clock::now();
+    constexpr size_t align = 4096; // covers the logical block size of NVMe/SATA filesystems
+    const size_t chunk = arena_env_size("LLAMA_MOE_ARENA_CHUNK_MIB", 8, 1, 256) << 20;
+    const int threads = (int) arena_env_size("LLAMA_MOE_ARENA_THREADS", 8, 1, 64);
+    const bool want_direct = arena_env_size("LLAMA_MOE_ARENA_DIRECT", 1, 0, 1) != 0;
+
+    // One direct descriptor per distinct buffered descriptor, opened through /proc so the
+    // loader's own file stays untouched; -1 means buffered reads for that file.
+    std::vector<std::pair<int, int>> direct_fd; // (buffered, direct)
+    auto direct_of = [&](int fd) {
+        for (const auto & p : direct_fd) { if (p.first == fd) { return p.second; } }
+        int d = -1;
+#ifdef O_DIRECT
+        if (want_direct) {
+            const std::string path = "/proc/self/fd/" + std::to_string(fd);
+            d = open(path.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
+        }
+#endif
+        direct_fd.emplace_back(fd, d);
+        return d;
+    };
+    struct item { int copy; size_t first, last; }; // aligned file byte range [first, last)
+    std::vector<item> items;
+    size_t total = 0;
+    for (int i = 0; i < (int) copies.size(); ++i) {
+        const auto & c = copies[i];
+        direct_of(c.fd);
+        const size_t bytes = c.expert_bytes * (size_t) c.n_expert;
+        total += bytes;
+        const size_t first = c.src_offset & ~(align - 1);
+        const size_t last = (c.src_offset + bytes + align - 1) & ~(align - 1);
+        for (size_t a = first; a < last; a += chunk) {
+            items.push_back({ i, a, std::min(last, a + chunk) });
+        }
+    }
+    std::atomic<size_t> next{0}, done{0}, read_total{0};
+    std::atomic<bool> stop{false};
+    std::mutex error_mu;
+    std::string error;
+    std::atomic<int> direct_failed{0};
+    auto fail = [&](const std::string & what) {
+        std::lock_guard<std::mutex> lock(error_mu);
+        if (error.empty()) { error = what; }
+        stop = true;
+    };
+    auto worker = [&]() {
+        void * raw = nullptr;
+        if (posix_memalign(&raw, align, chunk) != 0 || !raw) { fail("cannot allocate arena read buffer"); return; }
+        char * buf = (char *) raw;
+        while (!stop.load(std::memory_order_relaxed)) {
+            const size_t k = next.fetch_add(1);
+            if (k >= items.size()) { break; }
+            const auto & it = items[k];
+            const auto & c = copies[it.copy];
+            const size_t bytes = c.expert_bytes * (size_t) c.n_expert;
+            const size_t need_end = std::min(it.last, c.src_offset + bytes);
+            int fd = direct_of(c.fd);
+            const bool direct = fd >= 0;
+            if (!direct) { fd = c.fd; }
+            size_t got = 0;
+            const size_t len = it.last - it.first;
+            while (got < len) {
+                const ssize_t r = pread(fd, buf + got, len - got, (off_t) (it.first + got));
+                if (r < 0 && errno == EINTR) { continue; }
+                if (r < 0 && direct && errno == EINVAL && got == 0) {
+                    // the filesystem refused this direct read: use buffered reads for it
+                    direct_failed = 1;
+                    fd = c.fd;
+                    continue;
+                }
+                if (r <= 0) { break; }
+                got += (size_t) r;
+            }
+            if (it.first + got < need_end) {
+                fail("short read while loading the expert arena");
+                break;
+            }
+            read_total += got;
+            const size_t s0 = std::max(it.first, c.src_offset);
+            for (size_t s = s0; s < need_end;) {
+                const size_t rel = s - c.src_offset;
+                const size_t e = rel / c.expert_bytes, w = rel % c.expert_bytes;
+                const size_t n = std::min(c.expert_bytes - w, need_end - s);
+                memcpy(c.dst + e * c.dst_stride + w, buf + (s - it.first), n);
+                s += n;
+            }
+            if (fd == c.fd) {
+#ifdef __linux__
+                posix_fadvise(c.fd, (off_t) it.first, (off_t) got, POSIX_FADV_DONTNEED);
+#endif
+            }
+            done += need_end - s0;
+        }
+        free(buf);
+    };
+    // the direct descriptors are all opened above, so workers only read direct_fd
+    std::vector<std::thread> pool;
+    pool.reserve(threads);
+    for (int i = 0; i < threads; ++i) { pool.emplace_back(worker); }
+    std::string stop_reason;
+    for (;;) {
+        bool finished = done.load() >= total || stop.load();
+        if (!finished) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        if (progress && !progress(done.load(), user)) { stop_reason = "expert arena loading canceled"; stop = true; }
+        if (llama_moe_arena::available_memory() < ram_floor) {
+            stop_reason = "expert arena stopped: less than the RAM floor of MemAvailable"; stop = true;
+        }
+        if (finished || stop.load()) { break; }
+    }
+    for (auto & t : pool) { t.join(); }
+    for (const auto & p : direct_fd) { if (p.second >= 0) { close(p.second); } }
+    if (!stop_reason.empty()) { throw std::runtime_error(stop_reason); }
+    if (!error.empty()) { throw std::runtime_error(error); }
+    if (done.load() != total) { throw std::runtime_error("expert arena load incomplete"); }
+    bool any_direct = false;
+    for (const auto & p : direct_fd) { any_direct = any_direct || p.second >= 0; }
+    stats.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    stats.bytes_read = read_total.load();
+    stats.threads = threads;
+    stats.chunk = chunk;
+    stats.direct = any_direct && !direct_failed.load();
+#else
+    (void) copies; (void) progress; (void) user; (void) ram_floor; (void) stats;
+    throw std::runtime_error("parallel expert arena load requires POSIX");
+#endif
+}
+
+uint64_t llama_moe_arena_checksum(const void * data, size_t bytes) {
+    // FNV-style mix over 8-byte words per 64 MiB piece, pieces combined in order
+    const size_t piece = (size_t) 64 << 20;
+    const size_t n = (bytes + piece - 1) / piece;
+    std::vector<uint64_t> part(n, 0);
+    std::atomic<size_t> next{0};
+    auto worker = [&]() {
+        for (size_t k = next++; k < n; k = next++) {
+            const size_t a = k * piece, len = std::min(piece, bytes - a);
+            const unsigned char * p = (const unsigned char *) data + a;
+            uint64_t h = 1469598103934665603ull ^ k;
+            size_t i = 0;
+            for (; i + 8 <= len; i += 8) { uint64_t w; memcpy(&w, p + i, 8); h = (h ^ w) * 1099511628211ull; }
+            for (; i < len; ++i) { h = (h ^ p[i]) * 1099511628211ull; }
+            part[k] = h;
+        }
+    };
+    std::vector<std::thread> pool;
+    for (int i = 0; i < 8; ++i) { pool.emplace_back(worker); }
+    for (auto & t : pool) { t.join(); }
+    uint64_t h = 0;
+    for (uint64_t v : part) { h = (h ^ v) * 1099511628211ull + 0x9e3779b97f4a7c15ull; }
+    return h;
 }
 
 bool llama_moe_arena::is_expert(const char * name) {

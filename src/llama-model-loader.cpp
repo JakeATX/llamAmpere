@@ -9,6 +9,10 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <cerrno>
+#include <chrono>
+#include <thread>
 #include <cinttypes>
 #include <cstdint>
 #include <cstdlib>
@@ -1767,6 +1771,50 @@ bool llama_model_loader::load_all_data(
         tensors.push_back(cur);
     }
 
+    const auto load_start = std::chrono::steady_clock::now();
+    double preread_seconds = 0;
+    size_t preread_bytes = 0, upload_bytes = 0;
+#ifdef __linux__
+    // LOADFAST (opt-in LLAMA_LOAD_PREREAD=1): tensors copied from the mapping into device buffers
+    // are read single-threaded through page faults below. Read their file ranges into the page
+    // cache first with parallel reads so the copies below find the bytes in RAM. Bytes unchanged.
+    if (const char * pre = getenv("LLAMA_LOAD_PREREAD"); pre && atoi(pre) != 0 && use_mmap) {
+        const auto pre_start = std::chrono::steady_clock::now();
+        struct range { int fd; size_t first, last; };
+        std::vector<range> ranges;
+        for (auto * cur : tensors) {
+            const auto * weight = get_weight(ggml_get_name(cur));
+            if (!weight || arena_tensors.count(cur) || lazy.has(cur) || !cur->buffer || ggml_backend_buffer_is_host(cur->buffer)) { continue; }
+            const int fd = files.at(weight->idx)->file_id();
+            const size_t chunk = (size_t) 8 << 20;
+            for (size_t a = weight->offs; a < weight->offs + ggml_nbytes(cur); a += chunk) {
+                ranges.push_back({ fd, a, std::min(weight->offs + ggml_nbytes(cur), a + chunk) });
+            }
+        }
+        std::atomic<size_t> next{0}, got_total{0};
+        auto worker = [&]() {
+            std::vector<char> scratch((size_t) 8 << 20);
+            for (size_t k = next++; k < ranges.size(); k = next++) {
+                const auto & r = ranges[k];
+                size_t got = 0;
+                while (got < r.last - r.first) {
+                    const ssize_t n = pread(r.fd, scratch.data(), std::min(scratch.size(), r.last - r.first - got), (off_t) (r.first + got));
+                    if (n < 0 && errno == EINTR) { continue; }
+                    if (n <= 0) { break; }
+                    got += (size_t) n;
+                }
+                got_total += got;
+            }
+        };
+        std::vector<std::thread> pool;
+        const int n_threads = ranges.size() > 1 ? 8 : 0;
+        for (int i = 0; i < n_threads; ++i) { pool.emplace_back(worker); }
+        for (auto & t : pool) { t.join(); }
+        preread_bytes = got_total.load();
+        preread_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - pre_start).count();
+    }
+#endif
+
     // without mmap, tensors in non-host buffers are staged through a temporary buffer sized like the tensor
     // load them biggest-first so the largest staging buffer is allocated while the fewest weights are resident
     if (!use_mmap) {
@@ -1827,6 +1875,7 @@ bool llama_model_loader::load_all_data(
                 mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
             } else {
                 ggml_backend_tensor_set(cur, data, 0, n_size);
+                upload_bytes += n_size;
             }
         } else {
             const auto & file = files.at(weight->idx);
@@ -1914,6 +1963,11 @@ bool llama_model_loader::load_all_data(
         ggml_backend_event_synchronize(event);
         ggml_backend_event_free(event);
     }
+    if (upload_bytes || preread_bytes) {
+        LLAMA_LOG_INFO("%s: [LOADFAST] copied %.2f MiB from the mapping into device buffers in %.2f s (parallel pre-read %.2f MiB in %.2f s)\n",
+                __func__, upload_bytes / 1048576.0, std::chrono::duration<double>(std::chrono::steady_clock::now() - load_start).count(),
+                preread_bytes / 1048576.0, preread_seconds);
+    }
     for (auto * buf : host_buffers) {
         ggml_backend_buffer_free(buf);
     }
@@ -2000,6 +2054,102 @@ std::unique_ptr<llama_moe_arena> llama_model_loader::load_moe_arena(llama_progre
         throw std::runtime_error("expert arena no longer fits with 7 GiB startup headroom");
     }
     auto arena = std::make_unique<llama_moe_arena>(total);
+#ifdef __linux__
+    // LOADFAST: parallel direct reads (opt-in). Same arena layout and bytes as the loop below.
+    if (const char * fast = getenv("LLAMA_MOE_ARENA_FASTLOAD"); fast && atoi(fast) != 0) {
+        struct placed { ggml_tensor * t; const llama_tensor_weight * w; size_t offset, stride; };
+        std::vector<placed> order;
+        std::vector<llama_moe_arena_copy> copies;
+        size_t fast_base = 0;
+        for (const auto & entry : layers) {
+            const auto & ts = entry.second;
+            size_t stride = 0;
+            for (auto * t : ts) { stride += t->nb[2]; }
+            size_t role_offset = 0;
+            for (auto * t : ts) {
+                const auto & w = require_weight(t->name);
+                llama_moe_arena_copy c;
+                c.fd = files.at(w.idx)->file_id();
+                c.src_offset = w.offs;
+                c.expert_bytes = t->nb[2];
+                c.n_expert = t->ne[2];
+                c.dst = (char *) arena->data + fast_base + role_offset;
+                c.dst_stride = stride;
+                copies.push_back(c);
+                order.push_back({ t, &w, fast_base + role_offset, stride });
+                role_offset += t->nb[2];
+            }
+            fast_base += stride * (size_t) ts[0]->ne[2];
+        }
+        struct progress_state { llama_progress_callback cb; void * ud; size_t done0, size_data; } ps{ callback, user_data, size_done, size_data };
+        llama_moe_arena_load_stats stats;
+        // The one whole-arena CUDA registration runs beside the reads (it faults in and locks the
+        // pages; the readers then fill the same pages), so its cost hides under the disk time.
+        const char * pin_early_env = getenv("LLAMA_MOE_ARENA_PIN_EARLY");
+        const bool pin_early = !pin_early_env || atoi(pin_early_env) != 0;
+        std::atomic<int> pin_result{0};
+        double pin_seconds = 0;
+        struct pin_thread {
+            std::thread t;
+            ~pin_thread() { if (t.joinable()) { t.join(); } }
+        } pinner;
+        const auto pin_start = std::chrono::steady_clock::now();
+        if (pin_early) {
+            pinner.t = std::thread([&]() {
+                try { arena->pin(); pin_result = 1; } catch (...) { pin_result = -1; }
+                pin_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - pin_start).count();
+            });
+        }
+        llama_moe_arena_parallel_load(copies, [](size_t done, void * u) {
+            auto * p = (progress_state *) u;
+            return !p->cb || p->cb(float(p->done0 + done) / p->size_data, p->ud);
+        }, &ps, 7ull << 30, stats);
+        for (const auto & p : order) {
+            auto * t = p.t;
+            const size_t bytes = t->nb[2];
+            if (check_tensors) {
+                for (int64_t e = 0; e < t->ne[2]; ++e) {
+                    if (!ggml_validate_row_data(t->type, (char *) arena->data + p.offset + (size_t) e * p.stride, bytes)) {
+                        throw std::runtime_error(format("expert arena tensor '%s' has invalid data", t->name));
+                    }
+                }
+            }
+            // the file pages were never touched; drop the mapped range like the copy loop does
+            if (use_mmap) { mappings.at(p.w->idx)->unmap_fragment(p.w->offs, p.w->offs + ggml_nbytes(t)); }
+            const size_t original_size = ggml_nbytes(t);
+            t->nb[2] = p.stride;
+            t->nb[3] = p.stride * (size_t) t->ne[2];
+            if (ggml_backend_tensor_alloc(arena->buffer.get(), t, (char *) arena->data + p.offset) != GGML_STATUS_SUCCESS) {
+                throw std::runtime_error("expert arena tensor allocation failed");
+            }
+            arena_tensors.insert(t);
+            size_done += original_size;
+        }
+        LLAMA_LOG_INFO("%s: [LOADFAST] copied %.2f GiB in %.2f s (%.2f GiB/s), %d threads, %zu MiB reads, %s, read %.2f GiB, %.2f GiB MemAvailable\n",
+                __func__, total / double(GiB), stats.seconds, total / double(GiB) / std::max(stats.seconds, 1e-9), stats.threads,
+                stats.chunk >> 20, stats.direct ? "direct (page cache bypassed)" : "buffered (pages dropped after use)",
+                stats.bytes_read / double(GiB), llama_moe_arena::available_memory() / double(GiB));
+        if (const char * h = getenv("LLAMA_MOE_ARENA_HASH"); h && atoi(h) != 0) {
+            LLAMA_LOG_INFO("%s: [LOADFAST] arena checksum %016llx over %zu bytes\n", __func__,
+                    (unsigned long long) llama_moe_arena_checksum(arena->data, total), total);
+        }
+        if (pin_early) {
+            pinner.t.join();
+            if (pin_result.load() != 1) { throw std::runtime_error("expert arena CUDA host registration failed"); }
+        } else {
+            const auto late_start = std::chrono::steady_clock::now();
+            arena->pin();
+            pin_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - late_start).count();
+        }
+        if (llama_moe_arena::available_memory() < (7ull << 30)) {
+            throw std::runtime_error("expert arena pinning left less than 7 GiB MemAvailable");
+        }
+        LLAMA_LOG_INFO("%s: %.2f GiB pinned (%s, registration took %.2f s), load+pin %.2f s, gate/up/down grouped by expert, original weight blocks preserved\n",
+                __func__, total / double(GiB), pin_early ? "registered beside the reads" : "registered after the reads", pin_seconds,
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - pin_start).count());
+        return arena;
+    }
+#endif
     size_t base = 0;
     for (const auto & entry : layers) {
         const auto & ts = entry.second;
@@ -2070,6 +2220,10 @@ std::unique_ptr<llama_moe_arena> llama_model_loader::load_moe_arena(llama_progre
         base += stride * (size_t) ts[0]->ne[2];
         LLAMA_LOG_INFO("%s: layer %d copied, %.2f GiB MemAvailable\n", __func__, entry.first,
                 llama_moe_arena::available_memory() / double(GiB));
+    }
+    if (const char * h = getenv("LLAMA_MOE_ARENA_HASH"); h && atoi(h) != 0) {
+        LLAMA_LOG_INFO("%s: [LOADFAST] arena checksum %016llx over %zu bytes\n", __func__,
+                (unsigned long long) llama_moe_arena_checksum(arena->data, total), total);
     }
     arena->pin();
     if (llama_moe_arena::available_memory() < (7ull << 30)) {

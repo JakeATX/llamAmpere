@@ -5442,6 +5442,101 @@ static int moe_cache_warm(void * opaque, const ggml_moe_cache_tensor_desc * tens
     for (size_t i = 0; i < ranked.size(); ++i) {
         ranks.emplace(moe_cache_key{tensors[ranked[i].tensor].data, ranked[i].expert}, i);
     }
+    // LOADFAST (opt-in GGML_MOE_CACHE_WARM_BATCH=1, startup profile only): the slot choice below is
+    // unchanged, but each fill it queues is taken back from the worker queue and copied here in
+    // batches of async copies straight from the (pinned) source, one wait per batch, two batches
+    // in flight, instead of the worker's stage memcpy + copy + wait per expert.
+    struct warm_fill { moe_cache_device * device; moe_cache_job job; char * destination; };
+    struct warm_batch { std::vector<warm_fill> fills; size_t bytes = 0; cudaEvent_t done = nullptr; bool issued = false; };
+    const char * warm_batch_env = getenv("GGML_MOE_CACHE_WARM_BATCH");
+    const bool batch_warm = loading && warm_batch_env && atoi(warm_batch_env) != 0;
+    const size_t batch_bytes_max = (size_t) 256 << 20;
+    std::vector<std::pair<moe_cache_device *, cudaStream_t>> warm_streams;
+    warm_batch batches[2];
+    int filling = 0;
+    size_t batch_copies = 0, batch_count = 0;
+    auto warm_stream = [&](moe_cache_device * device) -> cudaStream_t {
+        for (const auto & s : warm_streams) { if (s.first == device) { return s.second; } }
+        cudaStream_t stream = nullptr;
+        ggml_cuda_set_device(device->logical);
+        if (cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess) { (void) cudaGetLastError(); stream = nullptr; }
+        warm_streams.emplace_back(device, stream);
+        return stream;
+    };
+    // Same slot bookkeeping as the worker after a copy.
+    auto warm_finish = [&](warm_batch & batch, bool copied) {
+        std::lock_guard<std::mutex> lock(session->mu);
+        for (auto & f : batch.fills) {
+            auto * device = f.device;
+            if (f.job.pool < 0 || f.job.pool >= (int) device->pools.size()) { continue; }
+            auto & pool = *device->pools[f.job.pool];
+            if (f.job.slot < 0 || f.job.slot >= pool.n_slots) { continue; }
+            moe_cache_slot & slot = pool.slots[f.job.slot];
+            if (slot.state != moe_cache_slot_state::copying || slot.generation != f.job.generation || !(slot.key == f.job.key)) { continue; }
+            if (copied && (!slot.prediction || !slot.prediction->closed)) {
+                slot.state = moe_cache_slot_state::valid;
+                moe_cache_lru_push_back(pool, f.job.slot);
+                device->demand_count.erase(f.job.key);
+                device->fills++;
+            } else {
+                moe_cache_slot_reset(pool, f.job.slot, true);
+                device->fill_failures++;
+            }
+        }
+        batch.fills.clear();
+        batch.bytes = 0;
+        batch.issued = false;
+        session->idle_cv.notify_all();
+    };
+    auto warm_wait = [&](warm_batch & batch) {
+        if (!batch.issued) { return; }
+        bool ok = true;
+        if (batch.done) {
+            ok = cudaEventSynchronize(batch.done) == cudaSuccess;
+        } else {
+            for (const auto & s : warm_streams) { if (s.second) { ok = cudaStreamSynchronize(s.second) == cudaSuccess && ok; } }
+        }
+        if (!ok) { (void) cudaGetLastError(); }
+        warm_finish(batch, ok);
+    };
+    auto warm_issue = [&](warm_batch & batch) {
+        if (batch.fills.empty()) { return; }
+        bool ok = true;
+        std::unique_lock<std::mutex> fill_lock(session->fill_mu, std::defer_lock);
+        if (session->config.serial_fill) { fill_lock.lock(); }
+        cudaStream_t last = nullptr;
+        for (auto & f : batch.fills) {
+            cudaStream_t stream = warm_stream(f.device);
+            ggml_cuda_set_device(f.device->logical);
+            ok = ok && !f.device->dead.load() && !moe_cache_fail(*session, "insert") &&
+                    moe_resident_host_restore(f.job.source, f.job.bytes) &&
+                    cudaMemcpyAsync(f.destination, f.job.source, f.job.bytes, cudaMemcpyHostToDevice, stream) == cudaSuccess;
+            last = stream;
+            ++batch_copies;
+        }
+        ++batch_count;
+        // one device in practice; with several, wait on every warm stream instead of one event
+        if (ok && warm_streams.size() == 1 && last) {
+            if (!batch.done && cudaEventCreateWithFlags(&batch.done, cudaEventDisableTiming) != cudaSuccess) { batch.done = nullptr; }
+            if (batch.done && cudaEventRecord(batch.done, last) != cudaSuccess) { ok = false; }
+        } else if (batch.done) {
+            (void) cudaEventDestroy(batch.done);
+            batch.done = nullptr;
+        }
+        batch.issued = true;
+        if (!ok) {
+            (void) cudaGetLastError();
+            for (const auto & s : warm_streams) { if (s.second) { (void) cudaStreamSynchronize(s.second); } }
+            warm_finish(batch, false);
+        }
+    };
+    auto warm_flush = [&]() {
+        auto & current = batches[filling];
+        auto & other = batches[1 - filling];
+        warm_wait(other);       // keep at most two batches in flight
+        warm_issue(current);
+        filling = 1 - filling;
+    };
     int queued = 0;
     std::unordered_set<moe_cache_pool *> settled;
     for (const auto & c : ranked) {
@@ -5502,12 +5597,36 @@ static int moe_cache_warm(void * opaque, const ggml_moe_cache_tensor_desc * tens
                     if (inserted != pool.map.end()) {
                         pool.slots[inserted->second].warm_uses = (uint32_t)std::min<uint64_t>(c.count, UINT32_MAX);
                     }
+                    if (batch_warm && inserts_left == 0) {
+                        // take the fill just queued back from the worker (it has not seen it: we hold mu)
+                        const auto job = std::find_if(device.queue.begin(), device.queue.end(),
+                                [&](const moe_cache_job & j) { return j.key == key && !j.prediction; });
+                        if (job != device.queue.end() && pool.slab && job->slot >= 0 && job->slot < pool.n_slots) {
+                            batches[filling].fills.push_back({ &device, *job, pool.slab + (size_t) job->slot * pool.expert_size });
+                            batches[filling].bytes += job->bytes;
+                            device.queued_bytes = job->bytes <= device.queued_bytes ? device.queued_bytes - job->bytes : 0;
+                            device.queue.erase(job);
+                            if (device.queue.empty()) { wake = false; }
+                        }
+                    }
                 }
             }
         }
         if (wake) {
             session->cv.notify_all();
         }
+        if (batch_warm && batches[filling].bytes >= batch_bytes_max) {
+            warm_flush();
+        }
+    }
+    if (batch_warm) {
+        warm_flush();
+        warm_wait(batches[0]);
+        warm_wait(batches[1]);
+        for (auto & b : batches) { if (b.done) { (void) cudaEventDestroy(b.done); } }
+        for (const auto & s : warm_streams) { if (s.second) { (void) cudaStreamDestroy(s.second); } }
+        MOE_CACHE_LOG("[moe-cache] [LOADFAST] profile warm batched: %zu copies in %zu batches (direct from host source, one wait per batch)\n",
+                batch_copies, batch_count);
     }
     {
         std::unique_lock<std::mutex> lock(session->mu);
