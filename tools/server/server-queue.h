@@ -16,6 +16,7 @@ struct server_queue {
 private:
     int id = 0;
     bool running  = false;
+    bool stopped  = false; // set by terminate(); unlike running, never false before start_loop()
     bool sleeping = false;
     bool req_stop_sleeping = false;
     int64_t time_last_task = 0;
@@ -48,6 +49,10 @@ private:
 
 public:
     ~server_queue() { worker_stop(); }
+
+    // true once terminate() was called: readers waiting on results return an error instead of waiting for
+    // their client to disconnect (otherwise a shutdown with a request in flight hangs in ctx_http.join())
+    bool is_terminated();
 
     // Add a new task to the end of the queue
     int post(server_task && task, bool front = false);
