@@ -2010,7 +2010,27 @@ std::unique_ptr<llama_moe_arena> llama_model_loader::load_moe_arena(llama_progre
             const auto & w = require_weight(t->name);
             const size_t bytes = t->nb[2];
             const size_t original_size = ggml_nbytes(t);
+            // Startup speed: the copy below is single-threaded and reads the file through page
+            // faults, and the loop drops each finished group from the page cache. Ask the kernel
+            // to read the next groups ahead of the copy so the disk and the copy overlap.
+            // Pure hint: it never changes which bytes are copied. LLAMA_MOE_ARENA_READAHEAD=0 turns it off.
+            constexpr int64_t arena_group = 16;
+            static const int64_t arena_ahead = [] {
+                const char * v = getenv("LLAMA_MOE_ARENA_READAHEAD");
+                return v ? (int64_t) atoll(v) : (int64_t) 24;
+            }();
+            int64_t arena_hinted = 0;
             for (int64_t e = 0; e < t->ne[2]; ++e) {
+#if defined(__linux__)
+                if (arena_ahead > 0 && e % arena_group == 0) {
+                    const int64_t want = std::min<int64_t>(t->ne[2], e + arena_group * arena_ahead);
+                    if (want > arena_hinted) {
+                        posix_fadvise(files.at(w.idx)->file_id(), w.offs + (size_t) arena_hinted * bytes,
+                                (size_t) (want - arena_hinted) * bytes, POSIX_FADV_WILLNEED);
+                        arena_hinted = want;
+                    }
+                }
+#endif
                 if (callback && !callback(float(size_done + (size_t)e * bytes) / size_data, user_data)) {
                     throw std::runtime_error("expert arena loading canceled");
                 }
