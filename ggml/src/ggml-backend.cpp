@@ -2966,6 +2966,13 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
         return;
     }
 
+    // fork: immutable host weights can combine permanent GPU spans and cold RAM.
+    const char * resident_upload = getenv("GGML_MOE_RESIDENT_UPLOAD");
+    if (resident_upload && strcmp(resident_upload, "1") == 0 && ggml_backend_sched_is_host_weight(input) &&
+            ggml_moe_cache_resident_copy(split_backend, input_cpy, 0, input->data, ggml_nbytes(input))) {
+        return;
+    }
+
     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {

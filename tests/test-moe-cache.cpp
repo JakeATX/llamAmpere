@@ -4737,6 +4737,21 @@ static bool run_permanent_device_table(ggml_backend_t gpu, ggml_backend_t cpu, l
             ggml_backend_synchronize(gpu);
             ggml_backend_tensor_get(uploaded, copied.data(), 0, copied.size());
             require(copied == quantized && state.count == 0, __LINE__);
+            auto * copy_ctx = ggml_init({8 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true});
+            auto * duplicate = ggml_dup(copy_ctx, weights);
+            auto * copy_graph = ggml_new_graph(copy_ctx);
+            ggml_build_forward_expand(copy_graph, duplicate);
+            auto copy_sched = ggml_backend_sched_new(backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, false);
+            ggml_backend_sched_set_tensor_backend(copy_sched, duplicate, gpu);
+            require(ggml_backend_sched_alloc_graph(copy_sched, copy_graph), __LINE__);
+            require(ggml_backend_sched_get_tensor_backend(copy_sched, duplicate) == gpu, __LINE__);
+            require(ggml_backend_sched_graph_compute(copy_sched, copy_graph) == GGML_STATUS_SUCCESS, __LINE__);
+            ggml_backend_tensor_get(duplicate, copied.data(), 0, copied.size());
+            require(copied == quantized && state.count == 0, __LINE__);
+            ggml_backend_sched_free(copy_sched);
+            ggml_free(copy_ctx);
+            require(mincore(mapping, hole_bytes, pages.data()) == 0, __LINE__);
+            for (unsigned char present : pages) { require(!(present & 1), __LINE__); }
             // Keep the original fallback coverage independent of the option.
             set_env("GGML_MOE_RESIDENT_UPLOAD", "0");
             raw_upload("sparse");
