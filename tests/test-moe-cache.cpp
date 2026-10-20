@@ -174,7 +174,8 @@ static int resident_test_restore(const void * data, size_t size) {
     return 1;
 }
 
-static bool run_resident_scheduler_cpu(ggml_backend_t cpu) {
+static bool run_resident_scheduler_cpu(ggml_backend_t cpu, bool events = false) {
+    struct event_state { int records = 0; };
     struct upload_state {
         ggml_backend_t cpu;
         ggml_backend_buffer_type_t buft;
@@ -182,6 +183,12 @@ static bool run_resident_scheduler_cpu(ggml_backend_t cpu) {
         int copies = 0;
         int waits = 0;
         bool ordered = true;
+        int event_waits = 0;
+        int event_reuses = 0;
+        int event_syncs = 0;
+        int event_records = 0;
+        int event_created = 0;
+        int event_freed = 0;
     } state{cpu, nullptr, true};
     // Separate buffer types force real scheduler copies without a GPU.
     auto buft = *ggml_backend_cpu_buffer_type();
@@ -204,6 +211,30 @@ static bool run_resident_scheduler_cpu(ggml_backend_t cpu) {
     };
     backend.iface.synchronize = +[](ggml_backend_t stream) { ++((upload_state *)stream->context)->waits; };
     backend.iface.cpy_tensor_async = nullptr;
+    if (events) {
+        device.iface.event_new = +[](ggml_backend_dev_t dev) {
+            ++((upload_state *)dev->context)->event_created;
+            return new ggml_backend_event{dev, new event_state};
+        };
+        device.iface.event_free = +[](ggml_backend_dev_t dev, ggml_backend_event_t event) {
+            ++((upload_state *)dev->context)->event_freed;
+            delete (event_state *)event->context;
+            delete event;
+        };
+        device.iface.event_synchronize = +[](ggml_backend_dev_t dev, ggml_backend_event_t) {
+            ++((upload_state *)dev->context)->event_syncs;
+        };
+        backend.iface.event_wait = +[](ggml_backend_t stream, ggml_backend_event_t event) {
+            auto & test = *(upload_state *)stream->context;
+            ++test.waits;
+            ++test.event_waits;
+            if (((event_state *)event->context)->records > 0) { ++test.event_reuses; }
+        };
+        backend.iface.event_record = +[](ggml_backend_t stream, ggml_backend_event_t event) {
+            ++((upload_state *)stream->context)->event_records;
+            ++((event_state *)event->context)->records;
+        };
+    }
     static int owner;
     ggml_moe_cache_api api{};
     api.owner = &owner;
@@ -240,7 +271,7 @@ static bool run_resident_scheduler_cpu(ggml_backend_t cpu) {
         auto * graph = ggml_new_graph(ctx);
         ggml_build_forward_expand(graph, duplicate);
         ggml_backend_t backends[] = {&backend, cpu};
-        auto sched = ggml_backend_sched_new(backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, false);
+        auto sched = ggml_backend_sched_new(backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, events, false);
         ggml_backend_sched_set_moe_cache(sched, GGML_MOE_CACHE_MODE_OFF, 0);
         ggml_backend_sched_set_tensor_backend(sched, duplicate, &backend);
         const bool allocated = ggml_backend_sched_alloc_graph(sched, graph);
@@ -250,6 +281,8 @@ static bool run_resident_scheduler_cpu(ggml_backend_t cpu) {
         resident_test_original.assign(16, 1.25f);
         resident_test_restores = 0;
         state.copies = 0;
+        state.ordered = true;
+        state.event_waits = state.event_reuses = state.event_syncs = state.event_records = 0;
         const bool direct = test == 1;
         for (int replay = 0; allocated && replay < 2; ++replay) {
             const int before_restore = resident_test_restores;
@@ -265,9 +298,14 @@ static bool run_resident_scheduler_cpu(ggml_backend_t cpu) {
                 case_ok &= std::all_of((float *)weight->data, (float *)weight->data + 16, [](float v) { return v == 0.0f; });
             }
         }
-        printf("permanent-scheduler-cpu-case-%d: %s\n", test, case_ok ? "OK" : "FAIL");
-        ok &= case_ok;
+        if (events) {
+            case_ok &= state.event_records >= 2;
+            case_ok &= test == 5 ? state.event_syncs >= 2 : state.event_waits >= 2 && state.event_reuses >= 1;
+        }
         ggml_backend_sched_free(sched);
+        case_ok &= state.event_created == state.event_freed && state.ordered;
+        printf("permanent-scheduler%s-cpu-case-%d: %s\n", events ? "-events" : "", test, case_ok ? "OK" : "FAIL");
+        ok &= case_ok;
         ggml_backend_buffer_free(buffer);
         ggml_free(ctx);
     }
@@ -277,7 +315,7 @@ static bool run_resident_scheduler_cpu(ggml_backend_t cpu) {
     ggml_moe_cache_unregister(&owner);
     resident_test_host = nullptr;
     resident_test_original.clear();
-    printf("permanent-scheduler-cpu: %s\n", ok ? "OK" : "FAIL");
+    printf("permanent-scheduler%s-cpu: %s\n", events ? "-events" : "", ok ? "OK" : "FAIL");
     return ok;
 }
 
@@ -5588,6 +5626,12 @@ static bool test_prefetch_budget() {
 int main(int argc, char ** argv) {
     if (!test_prefetch_budget()) {
         return 1;
+    }
+    if (argc == 2 && strcmp(argv[1], "--permanent-scheduler-events-cpu-only") == 0) {
+        auto * cpu = ggml_backend_cpu_init();
+        const bool ok = cpu && run_resident_scheduler_cpu(cpu, true);
+        if (cpu) { ggml_backend_free(cpu); }
+        return ok ? 0 : 1;
     }
     if (argc == 2 && strcmp(argv[1], "--permanent-scheduler-cpu-only") == 0) {
         auto * cpu = ggml_backend_cpu_init();
