@@ -111,6 +111,76 @@ struct ring_buffer {
     std::vector<T> data;
 };
 
+// The same result as llama_sampler_top_k (std::partial_sort with comp a.logit > b.logit over the full
+// {id, logit, 0} array), ids and order included for equal logits: the heap select is replayed step by step
+// (libstdc++ __heap_select / __adjust_heap / __push_heap), and a block of 32 logits is skipped only when none of
+// them beats the heap top, which is exactly when the heap select would leave every one of them out.
+void common_sampler_topk_exact(const float * logits, int32_t n, int32_t k, std::vector<llama_token_data> & cur) {
+    static const auto comp = [](const llama_token_data & a, const llama_token_data & b) {
+        return a.logit > b.logit;
+    };
+    cur.resize(k);
+    llama_token_data * h = cur.data();
+    for (int32_t i = 0; i < k; ++i) {
+        h[i] = llama_token_data{i, logits[i], 0.0f};
+    }
+    std::make_heap(h, h + k, comp);
+
+    // replace the heap top by v and restore the heap, as libstdc++ __pop_heap(first, middle, i) does
+    const auto replace_top = [&](const llama_token_data & v) {
+        const int64_t len = k;
+        int64_t hole = 0;
+        int64_t child = 0;
+        while (child < (len - 1) / 2) {
+            child = 2 * (child + 1);
+            if (comp(h[child], h[child - 1])) {
+                child--;
+            }
+            h[hole] = h[child];
+            hole = child;
+        }
+        if ((len & 1) == 0 && child == (len - 2) / 2) {
+            child = 2 * (child + 1);
+            h[hole] = h[child - 1];
+            hole = child - 1;
+        }
+        int64_t parent = (hole - 1) / 2;
+        while (hole > 0 && comp(h[parent], v)) {
+            h[hole] = h[parent];
+            hole = parent;
+            parent = (hole - 1) / 2;
+        }
+        h[hole] = v;
+    };
+
+    constexpr int32_t B = 32;
+    int32_t i = k;
+    while (i < n) {
+        if (i + B <= n) {
+            const float t = h[0].logit;
+            int c = 0;
+            for (int32_t j = 0; j < B; ++j) {
+                c += logits[i + j] > t ? 1 : 0;
+            }
+            if (c == 0) {
+                i += B;
+                continue;
+            }
+            for (const int32_t end = i + B; i < end; ++i) {
+                if (logits[i] > h[0].logit) {
+                    replace_top(llama_token_data{i, logits[i], 0.0f});
+                }
+            }
+        } else {
+            if (logits[i] > h[0].logit) {
+                replace_top(llama_token_data{i, logits[i], 0.0f});
+            }
+            ++i;
+        }
+    }
+    std::sort_heap(h, h + k, comp);
+}
+
 struct common_sampler {
     common_params_sampling params;
 
@@ -158,6 +228,13 @@ struct common_sampler {
         } else {
             const auto * logits = llama_get_logits_ith(ctx, idx);
             GGML_ASSERT(logits != nullptr);
+            if (fused_top_k > 0 && fused_top_k < n_vocab && grmr == nullptr && rbudget == nullptr) {
+                // [DRAFTFAST] the chain starts with top-k: select those k straight from the logits, in exactly the
+                // order the chain's top-k would leave them, and skip the n_vocab-entry candidate array
+                common_sampler_topk_exact(logits, n_vocab, fused_top_k, cur);
+                cur_p = { cur.data(), cur.size(), -1, true };
+                return;
+            }
             cur.resize(n_vocab);
             for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
                 cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
@@ -166,6 +243,11 @@ struct common_sampler {
 
         cur_p = { cur.data(), cur.size(), -1, false };
     }
+
+    // LLAMA_SAMPLER_TOPK_FUSED=1: k of the chain's leading top-k sampler (0 = off). Only k <= 128 qualifies: that is
+    // the range where top-k runs std::partial_sort over the whole array, which topk_fused reproduces exactly.
+    int32_t fused_top_k = 0;
+
 
     common_time_meas tm() {
         return common_time_meas(t_total_us, params.no_perf);
@@ -463,6 +545,17 @@ struct common_sampler * common_sampler_init(
         result->pq_rng.seed(seed ^ 0x5bd1e995u);
     }
 
+    {
+        static const bool topk_fused_env = [] {
+            const char * e = getenv("LLAMA_SAMPLER_TOPK_FUSED");
+            return e && atoi(e) != 0;
+        }();
+        if (topk_fused_env && params.top_k > 0 && params.top_k <= 128 && llama_sampler_chain_n(chain) > 0 &&
+                strcmp(llama_sampler_name(llama_sampler_chain_get(chain, 0)), "top-k") == 0) {
+            result->fused_top_k = params.top_k;
+        }
+    }
+
     return result;
 }
 
@@ -548,6 +641,7 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .rng     = */ gsmpl->rng,
     };
     result->t_total_us = gsmpl->t_total_us;
+    result->fused_top_k = gsmpl->fused_top_k;
     result->pq_rng     = gsmpl->pq_rng;   // a restored clone must replay the same accept decisions
     result->pq_stats   = gsmpl->pq_stats;
     return result;
@@ -572,6 +666,7 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
     dst->cur_p.data = src->cur_p.data ? dst->cur.data() : nullptr; // re-point to dst's buffer
     dst->rng        = src->rng;
     dst->t_total_us = src->t_total_us;
+    dst->fused_top_k = src->fused_top_k;
 }
 
 void common_perf_print(const struct llama_context * ctx, const struct common_sampler * gsmpl) {
