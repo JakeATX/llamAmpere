@@ -2641,14 +2641,18 @@ static void moe_cache_session_leave(void * opaque) {
         // neither performs a host routing round trip at every layer.
         if (active->device_route_counts && active->device_ready.load()) {
             const uint64_t scopes = ++active->device_stats_scopes;
-            if (scopes == 1 || scopes % 64 == 0) {
+            // fork (cachehit): GGML_MOE_CACHE_DEVICE_STATS_EVERY=N (default 64) sets the snapshot
+            // interval; 0 keeps the counters and resident mask (MISSJOIN) but never syncs here.
+            static const int64_t stats_every = [] { int64_t v = 64; moe_cache_env_i64("GGML_MOE_CACHE_DEVICE_STATS_EVERY", 0, 1 << 30, v); return v; }();
+            if (stats_every > 0 && (scopes == 1 || scopes % (uint64_t) stats_every == 0)) {
                 ggml_cuda_set_device(active->devices[0]->logical);
                 unsigned long long counts[3] = {};
+                const int64_t t_sync = ggml_time_us();
                 if (cudaDeviceSynchronize() == cudaSuccess &&
                         cudaMemcpy(counts, active->device_route_counts, sizeof(counts), cudaMemcpyDeviceToHost) == cudaSuccess) {
-                    MOE_CACHE_LOG("[moe-cache] device routes: hits=%llu misses=%llu dispatches=%llu; graph snapshot scopes=%llu (diagnostic sync)\n",
+                    MOE_CACHE_LOG("[moe-cache] device routes: hits=%llu misses=%llu dispatches=%llu; graph snapshot scopes=%llu (diagnostic sync) sync_us=%lld\n",
                             counts[0], counts[1], counts[2],
-                            (unsigned long long)scopes);
+                            (unsigned long long)scopes, (long long)(ggml_time_us() - t_sync));
                     moe_missjoin_log("graph snapshot");
                 } else {
                     MOE_CACHE_LOG("[moe-cache] device route snapshot unavailable\n");
@@ -5539,13 +5543,13 @@ static void moe_cache_device_adapt(moe_cache_session & session) {
             }
             for (int32_t e = 0; e < table.desc.n_expert; ++e) {
                 const uint64_t used = recent[table.count_offset + e];
-                // fork (cachehit): the permanent mask was filled by the same lookup at prepare;
-                // rescanning every span here cost ~220 ms per adaptation.
+                // fork (cachehit): cheap count test first; the permanent mask was filled by the
+                // same lookup at prepare, so rescanning every span here (~220 ms/update) is gone.
+                if (used < (uint64_t)std::max(1, session.config.readmit_after)) { continue; }
                 if (e < (int32_t) table.permanent.size() ? table.permanent[e] != 0 :
                         moe_resident_lookup_device((const char *)table.desc.data + (size_t)e * table.host_stride,
                         table.desc.expert_size, device.logical) != nullptr) { continue; }
-                if (used >= (uint64_t)std::max(1, session.config.readmit_after) &&
-                        pool->map.find({table.desc.data, e}) == pool->map.end()) {
+                if (pool->map.find({table.desc.data, e}) == pool->map.end()) {
                     missing.push_back({&table, pool, e, used});
                 }
             }
