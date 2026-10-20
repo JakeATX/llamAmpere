@@ -975,7 +975,12 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    // draft-only vocabulary shortlist (when the context carries a map, e.g. the built-in flash-next-65536):
+    // score only the shortlisted head rows; the backend sampler maps its picks back to token ids.
+    // model.output_s is null except for an NVFP4 head; both calls accept a null scale.
+    // (ported from bl/grok-242 cbafc8c3f; before this the map was loaded but the draft scored all 248,320 rows)
+    ggml_tensor * logits = build_draft_vocab_logits(model.output, model.output_s, cur);
+    cur = logits ? logits : build_lora_mm(model.output, cur, model.output_s);
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 
