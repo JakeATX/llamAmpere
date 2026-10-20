@@ -2611,7 +2611,17 @@ static void moe_cache_session_leave(void * opaque) {
             if (std::any_of(active->predictions.begin(), active->predictions.end(),
                     [](const std::shared_ptr<moe_prefetch_copy> & copy) { return copy->published; })) {
                 ggml_cuda_set_device(active->devices[0]->logical);
-                CUDA_CHECK(cudaDeviceSynchronize());
+                // fork (cachehit): staged slots are read only by compute streams. With swaps on,
+                // wait for those streams, not for the swap copy stream (a whole-device sync here
+                // would stall every scope on the next round's fills).
+                const int n_streams = active->swap_enabled ? active->swap_n_streams.load(std::memory_order_acquire) : 0;
+                if (n_streams > 0 && !active->swap_stream_overflow.load()) {
+                    for (int i = 0; i < n_streams; ++i) {
+                        CUDA_CHECK(cudaStreamSynchronize(active->swap_streams[i]));
+                    }
+                } else {
+                    CUDA_CHECK(cudaDeviceSynchronize());
+                }
             }
             for (const auto & copy : active->predictions) {
                 moe_prefetch_finish(*active, *copy);
@@ -5120,8 +5130,15 @@ static void moe_cache_prefetch(void * opaque, const ggml_moe_cache_tensor_desc *
         for (int rank = 0; rank < n_ids && budget > 0; ++rank) {
             for (int t = 0; t < n_tensors; ++t) {
                 const auto & desc = tensors[t];
-                if (ids[rank] >= 0 && ids[rank] < desc.n_expert && desc.data &&
-                        moe_resident_lookup_device((const char *)desc.data + (size_t)ids[rank] * source_strides[t], desc.expert_size, device.logical)) { continue; }
+                if (ids[rank] >= 0 && ids[rank] < desc.n_expert && desc.data) {
+                    // fork (cachehit): the device table's permanent mask came from the same lookup; the span
+                    // scan costs ~3 us per call and runs for every rank and projection of every layer.
+                    const auto known = session->device_tables.find(desc.data);
+                    const bool permanent = known != session->device_tables.end() && (size_t) ids[rank] < known->second.permanent.size() ?
+                        known->second.permanent[ids[rank]] != 0 :
+                        moe_resident_lookup_device((const char *)desc.data + (size_t)ids[rank] * source_strides[t], desc.expert_size, device.logical) != nullptr;
+                    if (permanent) { continue; }
+                }
                 if (ids[rank] < 0 || ids[rank] >= desc.n_expert || !desc.data || desc.expert_size > budget) {
                     continue;
                 }
@@ -5522,8 +5539,11 @@ static void moe_cache_device_adapt(moe_cache_session & session) {
             }
             for (int32_t e = 0; e < table.desc.n_expert; ++e) {
                 const uint64_t used = recent[table.count_offset + e];
-                if (moe_resident_lookup_device((const char *)table.desc.data + (size_t)e * table.host_stride,
-                        table.desc.expert_size, device.logical)) { continue; }
+                // fork (cachehit): the permanent mask was filled by the same lookup at prepare;
+                // rescanning every span here cost ~220 ms per adaptation.
+                if (e < (int32_t) table.permanent.size() ? table.permanent[e] != 0 :
+                        moe_resident_lookup_device((const char *)table.desc.data + (size_t)e * table.host_stride,
+                        table.desc.expert_size, device.logical) != nullptr) { continue; }
                 if (used >= (uint64_t)std::max(1, session.config.readmit_after) &&
                         pool->map.find({table.desc.data, e}) == pool->map.end()) {
                     missing.push_back({&table, pool, e, used});
@@ -5832,6 +5852,10 @@ static bool moe_cache_swap_launch(moe_cache_session & session, const std::vector
 static void moe_swap_push_address(std::vector<moe_swap_write> & writes, moe_cache_device_table & table, int32_t expert,
         const void * address) {
     writes.push_back({(unsigned long long)(uintptr_t)(table.device + expert), (unsigned long long)(uintptr_t)address, 8, 0});
+    if (table.staging_device) {
+        // With prefetch the kernels read the staging copy; it must never keep a victim's slot.
+        writes.push_back({(unsigned long long)(uintptr_t)(table.staging_device + expert), (unsigned long long)(uintptr_t)address, 8, 0});
+    }
     if (table.hot) {
         writes.push_back({(unsigned long long)(uintptr_t)(table.hot + expert),
                 (unsigned long long)(address != table.fallback[expert]), 1, 0});
@@ -5975,7 +5999,7 @@ static void moe_cache_swap_decide(moe_cache_session & session) {
         auto & slot = pool.slots[p.slot];
         if (p.free) {
             const auto it = std::find(pool.free_slots.begin(), pool.free_slots.end(), p.slot);
-            if (it == pool.free_slots.end() || slot.state != moe_cache_slot_state::free) {
+            if (it == pool.free_slots.end() || slot.state != moe_cache_slot_state::free || slot.staging) {
                 continue;
             }
             pool.free_slots.erase(it);
@@ -6817,8 +6841,8 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
     }
     session->device_publish_async = moe_cache_env_i64("GGML_MOE_CACHE_DEVICE_PUBLISH_ASYNC", 0, 1, adaptation_value) && adaptation_value;
     // fork CACHEHIT: decayed-score swap policy with no host stall. Default off.
-    session->swap_enabled = moe_cache_env_i64("GGML_MOE_CACHE_SWAP", 0, 1, adaptation_value) && adaptation_value &&
-            !session->prefetch_enabled;
+    // With prefetch on, swaps also rewrite the staging tables and never touch staging slots.
+    session->swap_enabled = moe_cache_env_i64("GGML_MOE_CACHE_SWAP", 0, 1, adaptation_value) && adaptation_value;
     if (session->swap_enabled) {
         if (moe_cache_env_i64("GGML_MOE_CACHE_SWAP_INTERVAL", 1, 1024, adaptation_value)) { session->swap_interval = (int)adaptation_value; }
         if (moe_cache_env_i64("GGML_MOE_CACHE_SWAP_MAX", 1, 4096, adaptation_value)) { session->swap_max = (int)adaptation_value; }
