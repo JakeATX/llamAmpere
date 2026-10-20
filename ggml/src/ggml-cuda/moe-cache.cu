@@ -414,11 +414,11 @@ struct moe_cache_session {
     // swap_streams, which only the compute thread appends to.
     bool swap_enabled = false;
     bool swap_broken = false;
-    int swap_interval = 4;
-    int swap_max = 128;
+    int swap_interval = 1;
+    int swap_max = 256;
     size_t swap_cap_bytes = 96u << 20;
-    float swap_decay = 0.7f;
-    float swap_hyst = 0.25f;
+    float swap_decay = 0.95f;
+    float swap_hyst = 0.1f;
     float swap_margin = 2.0f;
     uint64_t swap_scopes = 0;
     cudaStream_t swap_streams[4] = {};
@@ -6029,6 +6029,7 @@ static void moe_cache_swap_step(moe_cache_session & session) {
         return;
     }
     const uint64_t scope = ++session.swap_scopes;
+    // 1) Publish fills whose bytes landed (normally during the graph just enqueued).
     if (!session.swap_inflight.empty()) {
         const cudaError_t q = cudaEventQuery(session.swap_copy_event);
         if (q == cudaSuccess) {
@@ -6044,23 +6045,20 @@ static void moe_cache_swap_step(moe_cache_session & session) {
             return;
         }
     }
-    if (!session.swap_inflight.empty()) {
-        return;
-    }
-    if (session.swap_counts_pending) {
+    // 2) Decide from the counters read back at an earlier scope.
+    if (session.swap_counts_pending && session.swap_inflight.empty()) {
         const cudaError_t q = cudaEventQuery(session.swap_counts_event);
-        if (q == cudaErrorNotReady) {
-            return;
+        if (q != cudaErrorNotReady) {
+            session.swap_counts_pending = false;
+            if (q == cudaSuccess) {
+                moe_cache_swap_decide(session);
+            } else {
+                (void) cudaGetLastError();
+            }
         }
-        session.swap_counts_pending = false;
-        if (q != cudaSuccess) {
-            (void) cudaGetLastError();
-            return;
-        }
-        moe_cache_swap_decide(session);
-        return;
     }
-    if (scope % (uint64_t)session.swap_interval == 0) {
+    // 3) Read back this scope's counters for the next decision (async, compute stream).
+    if (!session.swap_counts_pending && scope % (uint64_t)session.swap_interval == 0) {
         cudaStream_t main = session.swap_streams[0];
         if (cudaMemcpyAsync(session.swap_counts_host, session.device_expert_counts,
                     session.swap_prev.size() * sizeof(unsigned long long), cudaMemcpyDeviceToHost, main) == cudaSuccess &&
