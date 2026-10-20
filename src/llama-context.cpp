@@ -3648,7 +3648,13 @@ build_graph:
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
-        const bool cache_eval = b1_cache_collect || cparams.moe_prefetch != 0;
+        // fork PREFETCHFIX: the asynchronous prefetch reads its predictions on the device, so it
+        // needs no per-node host callback (which would split graphs and disable CUDA graphs).
+        static const bool prefetch_async = [] {
+            const char * v = getenv("GGML_MOE_PREFETCH_ASYNC");
+            return v && (strcmp(v, "1") == 0 || strcmp(v, "2") == 0);
+        }();
+        const bool cache_eval = b1_cache_collect || (cparams.moe_prefetch != 0 && !prefetch_async);
         ggml_backend_sched_set_eval_callback(sched.get(), cache_eval ? b1_cache_eval : cparams.cb_eval,
                                              cache_eval ? this : cparams.cb_eval_user_data);
 

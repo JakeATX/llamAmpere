@@ -42,4 +42,8 @@ bool ggml_cuda_moe_cache_device_supports(const ggml_tensor * op, int device);
 bool ggml_cuda_moe_cache_device_compute(ggml_backend_cuda_context & ctx, ggml_tensor * op);
 bool ggml_cuda_moe_cache_device_fused_compute(ggml_backend_cuda_context & ctx,
         ggml_tensor * up, ggml_tensor * gate, ggml_tensor * glu);
+// fork PREFETCHFIX (GGML_MOE_PREFETCH_ASYNC): turns a "moe_prefetch-<src>-<target>" id list into
+// an on-device prediction record; the copy engine is fed from it without stalling the stream.
+bool ggml_cuda_moe_cache_prefetch_async_active(void);
+void ggml_cuda_moe_cache_device_predict(ggml_backend_cuda_context & ctx, const ggml_tensor * node);
 #endif
