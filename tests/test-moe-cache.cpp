@@ -232,6 +232,49 @@ static bool run_resident_host_barriers(ggml_backend_t cpu) {
     ggml_backend_tensor_get(result, output.data(), 0, ggml_nbytes(result));
     ok &= output == std::vector<float>(16, 2.5f);
     ok &= resident_test_restores >= 5;
+
+    const char * old_upload = getenv("GGML_MOE_RESIDENT_UPLOAD");
+    const std::string saved_upload = old_upload ? old_upload : "";
+    auto upload_backend = *cpu;
+    upload_backend.iface.set_tensor_async = +[](ggml_backend_t, ggml_tensor * dst, const void * data, size_t offset, size_t size) {
+        memcpy((char *)dst->data + offset, data, size);
+    };
+    int uploads = 0;
+    api.resident_copy = +[](void * opaque, ggml_tensor * dst, size_t offset, const void * data, size_t size) {
+        if (data != resident_test_host || size != resident_test_original.size() * sizeof(float)) { return 0; }
+        ++*(int *)((ggml_backend_t)opaque)->context;
+        memcpy((char *)dst->data + offset, resident_test_original.data(), size);
+        return 1;
+    };
+    upload_backend.context = &uploads;
+    ggml_moe_cache_register(&api);
+    for (const char * mode : {"0", "1", "invalid"}) {
+        set_env("GGML_MOE_RESIDENT_UPLOAD", mode);
+        discard();
+        const int before = resident_test_restores;
+        ggml_backend_tensor_set_async(&upload_backend, destination, weight->data, 0, ggml_nbytes(weight));
+        ggml_backend_tensor_get(destination, output.data(), 0, ggml_nbytes(destination));
+        ok &= output == resident_test_original;
+        ok &= resident_test_restores == before + (strcmp(mode, "1") == 0 ? 0 : 1);
+        if (strcmp(mode, "1") == 0) {
+            ok &= std::all_of((float *)weight->data, (float *)weight->data + 16, [](float v) { return v == 0.0f; });
+        }
+    }
+    ok &= uploads == 1;
+    // Refused partial uploads must still restore the host source before reading.
+    set_env("GGML_MOE_RESIDENT_UPLOAD", "1");
+    discard();
+    const int before_refusal = resident_test_restores;
+    ggml_backend_tensor_set_async(&upload_backend, destination, (const char *)weight->data + sizeof(float), 0, 15 * sizeof(float));
+    ok &= resident_test_restores == before_refusal + 1 && uploads == 1;
+    ggml_backend_tensor_get(destination, output.data(), 0, ggml_nbytes(destination));
+    ok &= output == resident_test_original;
+    discard();
+    const int before_copy = resident_test_restores;
+    ggml_backend_tensor_copy_async(cpu, &upload_backend, weight, destination);
+    ggml_backend_tensor_get(destination, output.data(), 0, ggml_nbytes(destination));
+    ok &= output == resident_test_original && uploads == 2 && resident_test_restores == before_copy;
+    set_env("GGML_MOE_RESIDENT_UPLOAD", old_upload ? saved_upload.c_str() : nullptr);
     ggml_moe_cache_resident_notify(false);
     ggml_moe_cache_unregister(&owner);
     resident_test_host = nullptr;
@@ -4676,13 +4719,32 @@ static bool run_permanent_device_table(ggml_backend_t gpu, ggml_backend_t cpu, l
                 if (direct == cudaSuccess) { require(cudaStreamSynchronize(cudaStreamPerThread) == cudaSuccess, __LINE__); }
                 else { (void)cudaGetLastError(); }
             };
+            const char * old_upload = getenv("GGML_MOE_RESIDENT_UPLOAD");
+            const std::string saved_upload = old_upload ? old_upload : "";
+            set_env("GGML_MOE_RESIDENT_UPLOAD", "1");
+            std::vector<uint8_t> copied(quantized.size());
+            ggml_backend_tensor_set_async(gpu, uploaded, weights->data, 0, quantized.size());
+            ggml_backend_synchronize(gpu);
+            ggml_backend_tensor_get(uploaded, copied.data(), 0, copied.size());
+            require(copied == quantized && state.count == 0, __LINE__);
+            require(mincore(mapping, hole_bytes, pages.data()) == 0, __LINE__);
+            for (unsigned char present : pages) { require(!(present & 1), __LINE__); }
+            ggml_backend_tensor_set_async(gpu, uploaded, (const char *)weights->data + 37, 37, quantized.size() - 74);
+            ggml_backend_synchronize(gpu);
+            ggml_backend_tensor_get(uploaded, copied.data(), 0, copied.size());
+            require(copied == quantized && state.count == 0, __LINE__);
+            ggml_backend_tensor_copy_async(cpu, gpu, weights, uploaded);
+            ggml_backend_synchronize(gpu);
+            ggml_backend_tensor_get(uploaded, copied.data(), 0, copied.size());
+            require(copied == quantized && state.count == 0, __LINE__);
+            // Keep the original fallback coverage independent of the option.
+            set_env("GGML_MOE_RESIDENT_UPLOAD", "0");
             raw_upload("sparse");
             // This call must restore the original host bytes before enqueueing
             // the full-object H2D copy, just as the multi-turn scheduler does.
             ggml_backend_tensor_set_async(gpu, uploaded, weights->data, 0, quantized.size());
             ggml_backend_synchronize(gpu);
             require(state.count == 1 && memcmp(weights->data, quantized.data(), quantized.size()) == 0, __LINE__);
-            std::vector<uint8_t> copied(quantized.size());
             ggml_backend_tensor_get(uploaded, copied.data(), 0, copied.size());
             require(copied == quantized, __LINE__);
             raw_upload("restored");
@@ -4710,6 +4772,7 @@ static bool run_permanent_device_table(ggml_backend_t gpu, ggml_backend_t cpu, l
             ggml_backend_synchronize(gpu);
             ggml_backend_tensor_get(uploaded, copied.data(), 0, copied.size());
             require(copied == expected_upload, __LINE__);
+            set_env("GGML_MOE_RESIDENT_UPLOAD", old_upload ? saved_upload.c_str() : nullptr);
             for (size_t row = 0; row < height; ++row) {
                 memcpy(expected_upload.data() + 19 + row * target_stride,
                         quantized.data() + source + row * source_stride, width_bytes);

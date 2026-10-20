@@ -637,19 +637,26 @@ size_t ggml_backend_get_max_size(ggml_backend_t backend) {
 }
 
 void ggml_backend_tensor_set_async(ggml_backend_t backend, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
-    ggml_moe_cache_host_restore(data, size);
     GGML_ASSERT(backend);
     GGML_ASSERT(tensor);
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
-    GGML_ASSERT(offset + size <= ggml_nbytes(tensor) && "tensor write out of bounds");
+    GGML_ASSERT(offset <= ggml_nbytes(tensor) && size <= ggml_nbytes(tensor) - offset && "tensor write out of bounds");
 
     if (backend->iface.set_tensor_async == NULL) {
+        ggml_moe_cache_host_restore(data, size);
         ggml_backend_synchronize(backend);
         ggml_backend_tensor_set(tensor, data, offset, size);
     } else {
         ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
         ggml_backend_moe_cache_invalidate_buffer(
                 buf, (const char *) tensor->data + offset, size);
+        // fork: copy permanent bytes without repopulating released host pages.
+        const char * resident_upload = getenv("GGML_MOE_RESIDENT_UPLOAD");
+        if (resident_upload && strcmp(resident_upload, "1") == 0 &&
+                ggml_moe_cache_resident_copy(backend, tensor, offset, data, size)) {
+            return;
+        }
+        ggml_moe_cache_host_restore(data, size);
         backend->iface.set_tensor_async(backend, tensor, data, offset, size);
     }
 }
@@ -930,7 +937,6 @@ void ggml_backend_tensor_copy(const struct ggml_tensor * src, struct ggml_tensor
 }
 
 void ggml_backend_tensor_copy_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const struct ggml_tensor * src, struct ggml_tensor * dst) {
-    ggml_moe_cache_host_restore(src->data, ggml_nbytes(src));
     GGML_ASSERT(ggml_are_same_layout(src, dst) && "cannot copy tensors with different layouts");
 
     if (src == dst) {
@@ -938,6 +944,15 @@ void ggml_backend_tensor_copy_async(ggml_backend_t backend_src, ggml_backend_t b
     }
 
     GGML_ASSERT(backend_dst);
+    const char * resident_upload = getenv("GGML_MOE_RESIDENT_UPLOAD");
+    ggml_backend_buffer_t src_buf = src->view_src ? src->view_src->buffer : src->buffer;
+    if (resident_upload && strcmp(resident_upload, "1") == 0 && ggml_moe_cache_has_residents() &&
+            ggml_backend_buffer_is_host(src_buf) && backend_dst->iface.set_tensor_async) {
+        ggml_backend_synchronize(backend_src);
+        ggml_backend_tensor_set_async(backend_dst, dst, src->data, 0, ggml_nbytes(src));
+        return;
+    }
+    ggml_moe_cache_host_restore(src->data, ggml_nbytes(src));
     if (backend_dst->iface.cpy_tensor_async != NULL) {
         ggml_backend_buffer_t dst_buf = dst->view_src ? dst->view_src->buffer : dst->buffer;
         ggml_backend_moe_cache_invalidate_buffer(

@@ -1293,6 +1293,49 @@ static int moe_resident_copy(void * opaque, ggml_tensor * dst, size_t offset, co
             ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)) != g_moe_cache_owner ||
             ggml_backend_buffer_is_host(dst->buffer) ||
             ggml_backend_buft_get_device(ggml_backend_buffer_get_type(dst->buffer)) != ggml_backend_get_device(backend)) { return 0; }
+    const char * upload = getenv("GGML_MOE_RESIDENT_UPLOAD");
+    if (upload && strcmp(upload, "1") == 0) {
+        const uintptr_t begin = (uintptr_t)host;
+        if (!host || !size || size > UINTPTR_MAX - begin || !backend->iface.set_tensor_async) { return 0; }
+        const uintptr_t end = begin + size;
+        struct copy_span { uintptr_t begin, end; const char * device; };
+        std::vector<copy_span> spans;
+        auto * ctx = (ggml_backend_cuda_context *)backend->context;
+        std::lock_guard<std::mutex> lock(g_resident_mu);
+        for (const auto * resident : g_residents) {
+            for (const auto & span : resident->spans) {
+                const uintptr_t base = (uintptr_t)span.host;
+                if (span.size > UINTPTR_MAX - base) { return 0; }
+                const uintptr_t first = std::max(begin, base);
+                const uintptr_t last = std::min(end, base + span.size);
+                if (first >= last) { continue; }
+                if (resident->device != ctx->device) { return 0; }
+                spans.push_back({first, last, (const char *)span.device + (first - base)});
+            }
+        }
+        if (spans.empty()) { return 0; }
+        std::sort(spans.begin(), spans.end(), [](const copy_span & a, const copy_span & b) { return a.begin < b.begin; });
+        for (size_t i = 1; i < spans.size(); ++i) {
+            if (spans[i].begin < spans[i - 1].end) { return 0; }
+        }
+        ggml_cuda_set_device(ctx->device);
+        uintptr_t cursor = begin;
+        for (const auto & span : spans) {
+            if (cursor < span.begin) {
+                backend->iface.set_tensor_async(backend, dst, (const void *)cursor,
+                        offset + (cursor - begin), span.begin - cursor);
+            }
+            if (cudaMemcpyAsync((char *)dst->data + offset + (span.begin - begin), span.device,
+                        span.end - span.begin, cudaMemcpyDeviceToDevice, ctx->stream()) != cudaSuccess) {
+                GGML_ABORT("permanent expert device upload failed");
+            }
+            cursor = span.end;
+        }
+        if (cursor < end) {
+            backend->iface.set_tensor_async(backend, dst, (const void *)cursor, offset + (cursor - begin), end - cursor);
+        }
+        return 1;
+    }
     const void * source = moe_resident_lookup(host, size, ggml_backend_get_device(backend));
     if (!source) { return 0; }
     auto * ctx = (ggml_backend_cuda_context *)backend->context;
