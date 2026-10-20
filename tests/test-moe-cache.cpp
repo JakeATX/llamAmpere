@@ -174,6 +174,113 @@ static int resident_test_restore(const void * data, size_t size) {
     return 1;
 }
 
+static bool run_resident_scheduler_cpu(ggml_backend_t cpu) {
+    struct upload_state {
+        ggml_backend_t cpu;
+        ggml_backend_buffer_type_t buft;
+        bool accept;
+        int copies = 0;
+        int waits = 0;
+        bool ordered = true;
+    } state{cpu, nullptr, true};
+    // Separate buffer types force real scheduler copies without a GPU.
+    auto buft = *ggml_backend_cpu_buffer_type();
+    auto device = *ggml_backend_get_device(cpu);
+    auto backend = *cpu;
+    state.buft = &buft;
+    buft.device = &device;
+    buft.iface.is_host = +[](ggml_backend_buffer_type_t) { return false; };
+    device.context = &state;
+    device.iface.get_type = +[](ggml_backend_dev_t) { return GGML_BACKEND_DEVICE_TYPE_GPU; };
+    device.iface.get_buffer_type = +[](ggml_backend_dev_t dev) { return ((upload_state *)dev->context)->buft; };
+    device.iface.supports_buft = +[](ggml_backend_dev_t dev, ggml_backend_buffer_type_t type) {
+        return type == ((upload_state *)dev->context)->buft;
+    };
+    backend.device = &device;
+    backend.context = &state;
+    backend.iface.graph_compute = +[](ggml_backend_t stream, ggml_cgraph * graph) {
+        auto * original = ((upload_state *)stream->context)->cpu;
+        return original->iface.graph_compute(original, graph);
+    };
+    backend.iface.synchronize = +[](ggml_backend_t stream) { ++((upload_state *)stream->context)->waits; };
+    backend.iface.cpy_tensor_async = nullptr;
+    static int owner;
+    ggml_moe_cache_api api{};
+    api.owner = &owner;
+    api.session_create = test_provider_session_create;
+    api.session_destroy = test_provider_session_destroy;
+    api.session_enter = test_provider_session_enter;
+    api.session_leave = test_provider_session_leave;
+    api.host_restore = resident_test_restore;
+    api.resident_copy = +[](void * opaque, ggml_tensor * dst, size_t offset, const void * data, size_t size) {
+        auto & test = *(upload_state *)((ggml_backend_t)opaque)->context;
+        if (!test.accept || data != resident_test_host || size != resident_test_original.size() * sizeof(float)) { return 0; }
+        test.ordered &= test.waits > 0;
+        ++test.copies;
+        memcpy((char *)dst->data + offset, resident_test_original.data(), size);
+        return 1;
+    };
+    ggml_moe_cache_register(&api);
+    ggml_moe_cache_resident_notify(true);
+    const char * old_upload = getenv("GGML_MOE_RESIDENT_UPLOAD");
+    const std::string saved_upload = old_upload ? old_upload : "";
+    bool ok = true;
+    for (int test = 0; test < 6; ++test) {
+        bool case_ok = true;
+        set_env("GGML_MOE_RESIDENT_UPLOAD", test == 0 ? "0" : test == 2 ? "invalid" : "1");
+        state.accept = test != 3;
+        auto * ctx = ggml_init({16 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true});
+        if (!ctx) { ok = false; break; }
+        auto * weight = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 16);
+        auto * buffer = ggml_backend_alloc_ctx_tensors(ctx, cpu);
+        if (!buffer) { ggml_free(ctx); ok = false; break; }
+        if (test != 4) { ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS); }
+        if (test == 5) { ggml_set_input(weight); }
+        auto * duplicate = ggml_dup(ctx, weight);
+        auto * graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, duplicate);
+        ggml_backend_t backends[] = {&backend, cpu};
+        auto sched = ggml_backend_sched_new(backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, false);
+        ggml_backend_sched_set_moe_cache(sched, GGML_MOE_CACHE_MODE_OFF, 0);
+        ggml_backend_sched_set_tensor_backend(sched, duplicate, &backend);
+        const bool allocated = ggml_backend_sched_alloc_graph(sched, graph);
+        case_ok &= allocated;
+        case_ok &= ggml_backend_sched_get_tensor_backend(sched, duplicate) == &backend;
+        resident_test_host = weight->data;
+        resident_test_original.assign(16, 1.25f);
+        resident_test_restores = 0;
+        state.copies = 0;
+        const bool direct = test == 1;
+        for (int replay = 0; allocated && replay < 2; ++replay) {
+            const int before_restore = resident_test_restores;
+            memset(weight->data, 0, ggml_nbytes(weight));
+            state.waits = 0;
+            case_ok &= ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS;
+            std::vector<float> output(16);
+            ggml_backend_tensor_get(duplicate, output.data(), 0, ggml_nbytes(duplicate));
+            case_ok &= output == resident_test_original;
+            case_ok &= direct ? resident_test_restores == before_restore : resident_test_restores > before_restore;
+            case_ok &= state.copies == (direct ? replay + 1 : 0);
+            if (direct) {
+                case_ok &= std::all_of((float *)weight->data, (float *)weight->data + 16, [](float v) { return v == 0.0f; });
+            }
+        }
+        printf("permanent-scheduler-cpu-case-%d: %s\n", test, case_ok ? "OK" : "FAIL");
+        ok &= case_ok;
+        ggml_backend_sched_free(sched);
+        ggml_backend_buffer_free(buffer);
+        ggml_free(ctx);
+    }
+    ok &= state.ordered;
+    set_env("GGML_MOE_RESIDENT_UPLOAD", old_upload ? saved_upload.c_str() : nullptr);
+    ggml_moe_cache_resident_notify(false);
+    ggml_moe_cache_unregister(&owner);
+    resident_test_host = nullptr;
+    resident_test_original.clear();
+    printf("permanent-scheduler-cpu: %s\n", ok ? "OK" : "FAIL");
+    return ok;
+}
+
 static bool run_resident_host_barriers(ggml_backend_t cpu) {
     ggml_init_params params{16 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true};
     auto * ctx = ggml_init(params);
@@ -5481,6 +5588,12 @@ static bool test_prefetch_budget() {
 int main(int argc, char ** argv) {
     if (!test_prefetch_budget()) {
         return 1;
+    }
+    if (argc == 2 && strcmp(argv[1], "--permanent-scheduler-cpu-only") == 0) {
+        auto * cpu = ggml_backend_cpu_init();
+        const bool ok = cpu && run_resident_scheduler_cpu(cpu);
+        if (cpu) { ggml_backend_free(cpu); }
+        return ok ? 0 : 1;
     }
     if (argc == 2 && strcmp(argv[1], "--permanent-host-only") == 0) {
         auto * cpu = ggml_backend_cpu_init();
