@@ -28,6 +28,7 @@ static void moe_cache_register_stub(const void * owner) {
 #include "../ggml-moe-prefetch.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -61,6 +62,16 @@ static void moe_cache_register_stub(const void * owner) {
 // fork (missjoin): device counters for opt-in miss staging; see moe_missjoin_stage_kernel.
 static unsigned long long * g_missjoin_counts = nullptr;
 static constexpr int moe_missjoin_count_entries = 8;
+// Overlap mode: persistent per-projection scratch and table copies, filled on a side
+// stream so each projection's matrix-vector pass waits only for its own copies.
+static cudaStream_t g_mj_side = nullptr;
+static cudaEvent_t g_mj_fork = nullptr;
+static cudaEvent_t g_mj_done[3] = {};
+static char * g_mj_scratch = nullptr;
+static const void ** g_mj_eff = nullptr;
+static size_t g_mj_stride = 0;
+static int64_t g_mj_experts = 0;
+static int g_mj_slots = 0;
 static void moe_missjoin_log(const char * when) {
     if (!g_missjoin_counts) {
         return;
@@ -371,6 +382,9 @@ struct moe_cache_device_table {
     // Host addresses are distinct from the CUDA aliases in fallback.
     std::vector<const void *> copy_source;
     size_t count_offset = 0;
+    // fork (missjoin): layer and projection (0 up, 1 gate, 2 down) parsed from the tensor name.
+    int mj_layer = -1;
+    int mj_kind = -1;
 };
 
 struct moe_cache_session {
@@ -424,6 +438,11 @@ struct moe_cache_session {
     // Host-source mappings survive table/slab reranks, until source invalidation.
     std::unordered_map<const void *, ggml_moe_cache_tensor_desc> mapped_sources;
     std::unordered_map<const void *, moe_cache_device_table> device_tables;
+    // fork (missjoin overlap): per-layer up/gate/down tables and the group staged last.
+    std::vector<std::array<const moe_cache_device_table *, 3>> mj_groups;
+    int mj_group = -1;
+    const void * mj_ids = nullptr;
+    unsigned mj_pending = 0;
     int active_scopes = 0;
     int active_nodes = 0;
     struct active_source {
@@ -2542,6 +2561,9 @@ static void moe_cache_session_leave(void * opaque) {
             active->last_layer = -1;
             std::fill(std::begin(active->layer_start), std::end(active->layer_start), 0);
         }
+        active->mj_group = -1;
+        active->mj_ids = nullptr;
+        active->mj_pending = 0;
         moe_cache_calibration_on_leave(*active);
         // This is outside CUDA graph capture/replay. The opt-in aggregate
         // diagnostic is separate from the default bounded adaptation below;
@@ -5929,6 +5951,129 @@ static __global__ void moe_missjoin_stage_kernel(const void * const * table, con
     }
 }
 
+static bool moe_missjoin_overlap_enabled() {
+    static const bool on = [] {
+        const char * v = getenv("GGML_MOE_MISSJOIN_OVERLAP");
+        return v && strcmp(v, "1") == 0;
+    }();
+    return on && moe_missjoin_mode() == 1;
+}
+
+static size_t moe_missjoin_copy_bytes(const moe_cache_device_table & t) {
+    return (size_t) t.desc.n_out * ggml_row_size((ggml_type) t.desc.type, t.desc.n_in);
+}
+
+// Called at the end of device preparation, outside graph capture.
+static void moe_missjoin_overlap_prepare(moe_cache_session & session) {
+    session.mj_groups.clear();
+    session.mj_group = -1;
+    session.mj_ids = nullptr;
+    session.mj_pending = 0;
+    if (!moe_missjoin_overlap_enabled()) {
+        return;
+    }
+    size_t stride = 0;
+    int64_t experts = 0;
+    for (auto & entry : session.device_tables) {
+        auto & t = entry.second;
+        t.mj_layer = -1;
+        t.mj_kind = -1;
+        int layer = -1;
+        char kind[16] = {};
+        if (!t.desc.name || sscanf(t.desc.name, "blk.%d.ffn_%15[a-z]_exps", &layer, kind) != 2 || layer < 0 || layer >= 1024) {
+            continue;
+        }
+        const int k = strcmp(kind, "up") == 0 ? 0 : strcmp(kind, "gate") == 0 ? 1 : strcmp(kind, "down") == 0 ? 2 : -1;
+        const size_t bytes = moe_missjoin_copy_bytes(t);
+        if (k < 0 || !t.hot || bytes % 16 != 0 || t.desc.n_expert > INT_MAX) {
+            continue;
+        }
+        if ((int) session.mj_groups.size() <= layer) {
+            session.mj_groups.resize(layer + 1, {nullptr, nullptr, nullptr});
+        }
+        if (session.mj_groups[layer][k]) {
+            continue;
+        }
+        session.mj_groups[layer][k] = &t;
+        t.mj_layer = layer;
+        t.mj_kind = k;
+        stride = std::max(stride, (size_t) GGML_PAD(bytes, 256));
+        experts = std::max(experts, t.desc.n_expert);
+    }
+    const int slots = moe_missjoin_slots();
+    bool ok = !session.mj_groups.empty();
+    if (ok && !g_mj_side) {
+        ok = cudaStreamCreateWithFlags(&g_mj_side, cudaStreamNonBlocking) == cudaSuccess &&
+             cudaEventCreateWithFlags(&g_mj_fork, cudaEventDisableTiming) == cudaSuccess;
+        for (int k = 0; ok && k < 3; ++k) {
+            ok = cudaEventCreateWithFlags(&g_mj_done[k], cudaEventDisableTiming) == cudaSuccess;
+        }
+    }
+    if (ok && !g_mj_scratch) {
+        ok = cudaMalloc((void **) &g_mj_scratch, 3 * (size_t) slots * stride) == cudaSuccess &&
+             cudaMalloc((void **) &g_mj_eff, 3 * (size_t) experts * sizeof(void *)) == cudaSuccess;
+        if (ok) {
+            g_mj_stride = stride;
+            g_mj_experts = experts;
+            g_mj_slots = slots;
+        }
+    }
+    ok = ok && stride <= g_mj_stride && experts <= g_mj_experts && slots <= g_mj_slots;
+    if (!ok) {
+        (void) cudaGetLastError();
+        session.mj_groups.clear();
+        for (auto & entry : session.device_tables) { entry.second.mj_layer = -1; entry.second.mj_kind = -1; }
+    }
+    size_t complete = 0;
+    for (const auto & g : session.mj_groups) { complete += g[0] && g[1] && g[2]; }
+    MOE_CACHE_LOG("[moe-cache] missjoin overlap: %s, %zu complete layers, scratch=%zu MiB\n",
+            ok ? "on" : "off (setup failed)", complete, ok ? (3 * (size_t) g_mj_slots * g_mj_stride) >> 20 : 0);
+}
+
+// Stages all three projections of a layer on the side stream; returns the table copy for this one.
+static const void * const * moe_missjoin_overlap_table(ggml_backend_cuda_context & ctx, moe_cache_session & session,
+        const moe_cache_device_table & table, const ggml_tensor * ids) {
+    if (table.mj_layer < 0 || table.mj_layer >= (int) session.mj_groups.size()) {
+        return nullptr;
+    }
+    const auto & group = session.mj_groups[table.mj_layer];
+    if (!group[0] || !group[1] || !group[2]) {
+        return nullptr;
+    }
+    const int routes = (int)(ids->ne[0] * ids->ne[1]);
+    if (routes > MOE_MISSJOIN_MAX_ROUTES) {
+        return nullptr;
+    }
+    const int k = table.mj_kind;
+    cudaStream_t main = ctx.stream();
+    if (!(session.mj_group == table.mj_layer && session.mj_ids == ids->data && (session.mj_pending >> k & 1u))) {
+        // Join any copies a previous group left unconsumed before reusing the buffers.
+        for (int j = 0; j < 3; ++j) {
+            if (session.mj_pending >> j & 1u) {
+                CUDA_CHECK(cudaStreamWaitEvent(main, g_mj_done[j], 0));
+            }
+        }
+        CUDA_CHECK(cudaEventRecord(g_mj_fork, main));
+        CUDA_CHECK(cudaStreamWaitEvent(g_mj_side, g_mj_fork, 0));
+        for (int j = 0; j < 3; ++j) {
+            const auto & m = *group[j];
+            moe_missjoin_stage_kernel<<<moe_missjoin_blocks(ctx.device), 256, 0, g_mj_side>>>(
+                    m.staging_device ? m.staging_device : m.device, m.hot, (const int32_t *) ids->data,
+                    (int) ids->ne[0], routes, (int)(ids->nb[1] / sizeof(int32_t)), (int) m.desc.n_expert,
+                    g_mj_eff + (size_t) j * g_mj_experts, g_mj_scratch + (size_t) j * g_mj_slots * g_mj_stride,
+                    g_mj_stride, moe_missjoin_copy_bytes(m), g_mj_slots, 0, g_missjoin_counts);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaEventRecord(g_mj_done[j], g_mj_side));
+        }
+        session.mj_group = table.mj_layer;
+        session.mj_ids = ids->data;
+        session.mj_pending = 7u;
+    }
+    CUDA_CHECK(cudaStreamWaitEvent(main, g_mj_done[k], 0));
+    session.mj_pending &= ~(1u << k);
+    return g_mj_eff + (size_t) k * g_mj_experts;
+}
+
 bool ggml_cuda_moe_cache_device_compute(ggml_backend_cuda_context & ctx, ggml_tensor * op) {
     if (g_session_stack.empty() || !g_session_stack.back().active ||
             !moe_cache_device_op_fits(*g_session_stack.back().active, op, ctx.device)) {
@@ -5959,7 +6104,11 @@ bool ggml_cuda_moe_cache_device_compute(ggml_backend_cuda_context & ctx, ggml_te
     const int mj_mode = moe_missjoin_mode();
     const int mj_routes = (int)(ids->ne[0] * ids->ne[1]);
     const size_t mj_bytes = (size_t) op->ne[0] * ggml_row_size((ggml_type) table.desc.type, a->ne[0]);
-    if (mj_mode && table.hot && mj_routes <= MOE_MISSJOIN_MAX_ROUTES && mj_bytes % 16 == 0 &&
+    const void * const * mj_overlap = moe_missjoin_overlap_enabled() && !session.mj_groups.empty() ?
+            moe_missjoin_overlap_table(ctx, session, table, ids) : nullptr;
+    if (mj_overlap) {
+        mmv_table = mj_overlap;
+    } else if (mj_mode && table.hot && mj_routes <= MOE_MISSJOIN_MAX_ROUTES && mj_bytes % 16 == 0 &&
             table.desc.n_expert <= INT_MAX) {
         const int slots = moe_missjoin_slots();
         const size_t stride = GGML_PAD(mj_bytes, 256);
@@ -6535,6 +6684,7 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
         MOE_CACHE_LOG("[moe-cache] host staging bytes: copied=%zu registered=%zu chunk_cap=%zu peak_service_current=%llu available=%zu\n",
                 staging_bytes, registered_bytes, staging_chunk_cap,
                 (unsigned long long) peak_service_current, moe_cache_mem_available());
+        moe_missjoin_overlap_prepare(*session);
         session->mapped_sources.clear();
         for (int i = 0; i < n_tensors; ++i) { session->mapped_sources.emplace(tensors[i].data, tensors[i]); }
         session->device_capture_generation = g_moe_cache_capture_generation.fetch_add(1, std::memory_order_relaxed);
