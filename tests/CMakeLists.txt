@@ -568,3 +568,8 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
     target_link_libraries(test-moe-arena PRIVATE ggml ggml-cpu ggml-base)
     llama_test(test-moe-arena LABEL "main;cpu")
 endif()
+
+if (UNIX)
+    add_executable(test-moe-generation-profile test-moe-generation-profile.cpp)
+    llama_test(test-moe-generation-profile LABEL "main")
+endif()

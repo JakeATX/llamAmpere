@@ -30,6 +30,7 @@ static void moe_cache_register_stub(const void * owner) {
 #include "ggml-cuda.h"
 #include "../ggml-backend-moe-cache.h"
 #include "../ggml-moe-prefetch.h"
+#include "../ggml-moe-generation-profile.h"
 
 #if !defined(GGML_USE_HIP)
 #include <cuda/atomic>
@@ -566,6 +567,10 @@ struct moe_cache_session {
     unsigned long long * device_expert_counts = nullptr;
     std::vector<unsigned long long> device_previous_counts;
     uint64_t device_adapt_scopes = 0;
+    std::string device_profile_path;
+    uint64_t device_profile_signature = 0;
+    std::vector<ggml_moe_cache_tensor_desc> device_profile_tensors;
+    std::vector<ggml_moe_generation_profile_slice> device_profile_slices;
     uint64_t device_adapt_interval = 64;
     size_t device_adapt_copy_cap = 64u << 20;
     bool device_publish_async = false;
@@ -2830,6 +2835,17 @@ static void * moe_cache_session_create(
             return nullptr;
         }
 
+        const char * device_profile = getenv("GGML_MOE_CACHE_DEVICE_PROFILE_SAVE");
+        if (device_profile && *device_profile) {
+            const char * profile_load = getenv("GGML_MOE_CACHE_PROFILE_LOAD");
+            const char * profile_save = getenv("GGML_MOE_CACHE_PROFILE_SAVE");
+            if (!ggml_moe_generation_profile_same_file(device_profile, profile_load) &&
+                    !ggml_moe_generation_profile_same_file(device_profile, profile_save)) {
+                session->device_profile_path = device_profile;
+            } else {
+                MOE_CACHE_LOG("[moe-cache] device profile export refused: output aliases a startup profile\n");
+            }
+        }
         session->phase_stats_id = g_phase_stats_session_id.fetch_add(1, std::memory_order_relaxed);
         moe_cache_session * result = session.get();
         try {
@@ -5329,6 +5345,10 @@ static int moe_cache_warm(void * opaque, const ggml_moe_cache_tensor_desc * tens
                 MOE_CACHE_LOG("[moe-cache] profile rejected: %s (missing, mismatched, or corrupt)\n", path);
                 return 0;
             }
+            if (!session->device_profile_path.empty()) {
+                session->device_profile_signature = signature;
+                session->device_profile_tensors.assign(tensors, tensors + n_tensors);
+            }
             counts = loaded_counts.data();
             MOE_CACHE_LOG("[moe-cache] profile loaded: %s, %zu ranked entries; sampled weight identity verified\n", path, entries);
         } else {
@@ -6321,6 +6341,13 @@ static void moe_cache_device_adapt(moe_cache_session & session) {
             recent[i] = counts[i] - session.device_previous_counts[i];
         }
         session.device_previous_counts.swap(counts);
+        if (!session.device_profile_slices.empty()) {
+            const bool saved = ggml_moe_generation_profile_write(session.device_profile_path, session.device_profile_signature,
+                    session.device_profile_slices, session.device_previous_counts,
+                    session.device_capture_generation, session.device_adapt_scopes);
+            MOE_CACHE_LOG("[moe-cache] device profile %s: scopes=%llu tail_incomplete=1\n",
+                    saved ? "saved" : "save failed", (unsigned long long) session.device_adapt_scopes);
+        }
         struct candidate {
             moe_cache_device_table * table;
             moe_cache_pool * pool;
@@ -7546,6 +7573,7 @@ static void moe_cache_device_release(moe_cache_session & session, bool retain_so
         session.device_expert_counts = nullptr;
     }
     session.device_previous_counts.clear();
+    session.device_profile_slices.clear();
     session.device_adapt_scopes = 0;
     session.device_fallback_staging_bytes = 0;
     session.device_stats_scopes = 0;
@@ -9579,6 +9607,21 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
         moe_table_prefetch_prepare(*session);
         session->mapped_sources.clear();
         for (int i = 0; i < n_tensors; ++i) { session->mapped_sources.emplace(tensors[i].data, tensors[i]); }
+        if (!session->device_profile_path.empty() && session->device_profile_tensors.size() == (size_t) n_tensors) {
+            bool same = true;
+            for (int i = 0; i < n_tensors; ++i) {
+                const auto & a = tensors[i];
+                const auto & b = session->device_profile_tensors[i];
+                same = same && a.data == b.data && a.expert_size == b.expert_size && a.type == b.type &&
+                    a.n_in == b.n_in && a.n_out == b.n_out && a.n_expert == b.n_expert && strcmp(a.name, b.name) == 0;
+            }
+            if (same) {
+                for (int i = 0; i < n_tensors; ++i) {
+                    const auto & table = session->device_tables.at(tensors[i].data);
+                    session->device_profile_slices.push_back({table.count_offset, (size_t) tensors[i].n_expert});
+                }
+            }
+        }
         session->device_capture_generation = g_moe_cache_capture_generation.fetch_add(1, std::memory_order_relaxed);
         GGML_ASSERT(session->device_capture_generation != 0);
         session->device_ready.store(true, std::memory_order_release);
