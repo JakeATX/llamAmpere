@@ -5963,8 +5963,9 @@ bool ggml_cuda_moe_cache_device_compute(ggml_backend_cuda_context & ctx, ggml_te
             table.desc.n_expert <= INT_MAX) {
         const int slots = moe_missjoin_slots();
         const size_t stride = GGML_PAD(mj_bytes, 256);
-        const void ** eff = mj_eff.alloc((size_t) table.desc.n_expert);
+        // The pool requires releases in reverse allocation order: q8, scratch, eff.
         char * scratch = mj_mode == 1 ? mj_scratch.alloc(stride * (size_t) slots) : nullptr;
+        const void ** eff = mj_eff.alloc((size_t) table.desc.n_expert);
         moe_missjoin_stage_kernel<<<mj_mode == 1 ? moe_missjoin_blocks(ctx.device) : 1, 256, 0, ctx.stream()>>>(
                 mmv_table, table.hot, (const int32_t *) ids->data, (int) ids->ne[0], mj_routes,
                 (int)(ids->nb[1] / sizeof(int32_t)), (int) table.desc.n_expert, eff, scratch, stride, mj_bytes,
