@@ -1648,6 +1648,19 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
+        // [DRAFTFAST] LLAMA_SPEC_DEFER_CATCHUP=1: the sequential drafter also absorbs the verified catch-up rows
+        // into its first draft decode, the way the chain decode does: one helper decode (and one helper graph
+        // build) fewer per round. The first draft batch changes shape, so the draft's own numbers can move by
+        // rounding; the verifier still checks every draft token against the target, so the output distribution
+        // is unchanged. Off by default.
+        if (!chain_graph && !is_mem_shared && !chain_heads) {
+            const char * env_d = getenv("LLAMA_SPEC_DEFER_CATCHUP");
+            if (env_d != nullptr && atoi(env_d) != 0) {
+                defer_enabled = true;
+                SPC_INF("%s", "sequential MTP: catch-up rows ride along with the first draft decode (LLAMA_SPEC_DEFER_CATCHUP)\n");
+            }
+        }
+
         if (chain_heads) {
             this->params.n_max = std::min(this->params.n_max, n_mtp_layers);
 
