@@ -7833,6 +7833,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
                 GGML_ASSERT(ok);
+                // fork PREFETCHFIX: a look-ahead id list becomes an on-device prediction record.
+                if (node->name[0] == 'm' && ggml_cuda_moe_cache_prefetch_async_active() &&
+                        strncmp(node->name, "moe_prefetch-", 13) == 0) {
+                    ggml_cuda_moe_cache_device_predict(*cuda_ctx, node);
+                }
 
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
