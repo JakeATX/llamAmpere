@@ -5734,7 +5734,8 @@ static bool run_device_fused_missjoin(ggml_backend_t gpu, ggml_backend_t cpu, lo
     unsigned long long copied_bytes = 0, bypassed_experts = 0, bypassed_bytes = 0;
     const char * reuse_env = getenv("GGML_MOE_MISSJOIN_REUSE_ONLY");
     const bool reuse_only = !retain && reuse_env && strcmp(reuse_env, "1") == 0;
-    const int64_t input_width = large_copy ? 2560 : grouped ? 5120 : n_in;
+    // At 65 rows, IQ3_S needs 40 quant blocks per row to keep expert images 16-byte aligned.
+    const int64_t input_width = large_copy ? 2560 : grouped ? 10240 : n_in;
     const int64_t output_rows = large_copy ? 640 : grouped ? 65 : n_out;
     std::vector<float> importance(input_width, 1.0f);
     bool ok = true;
