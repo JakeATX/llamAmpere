@@ -34,12 +34,32 @@
 
 struct common_sampler;
 
+// Diagnostic intervals overlap: fused_topk_us is inside prepare_us. Disabled
+// unless LLAMA_BOOKKEEP_TIMING is set; neither counter changes sampler state.
+struct common_sampler_prep_perf {
+    uint64_t prepare_calls = 0;
+    int64_t prepare_us = 0;
+    uint64_t fused_topk_calls = 0;
+    int64_t fused_topk_us = 0;
+};
+common_sampler_prep_perf common_sampler_get_prep_perf(const struct common_sampler * gsmpl);
+
 // llama_sampler API overloads
 
 // note: can mutate params in some cases
 // [DRAFTFAST] the top k of n logits as {id, logit, 0}, in exactly the order llama_sampler_top_k leaves them for
 // k <= 128 (std::partial_sort over the full array, equal logits included), without building the n-entry array.
 void common_sampler_topk_exact(const float * logits, int32_t n, int32_t k, std::vector<llama_token_data> & out);
+
+// Only repeated -INFINITY bans preserve full-vocabulary and compact-candidate semantics for duplicate ids.
+bool common_sampler_topk_biases_supported(const std::vector<llama_logit_bias> & biases);
+
+// Select using supported biases, but leave raw logits for the leading bias sampler to apply once.
+// Invalid token ids are ignored, as in the full-vocabulary bias sampler. Scratch is reused between calls.
+// Returns false without changing the candidates if a ban would produce a NaN; use the full candidate path.
+bool common_sampler_topk_exact_biased(
+        const float * logits, int32_t n, int32_t k, const std::vector<llama_logit_bias> & biases,
+        std::vector<float> & scratch, std::vector<llama_token_data> & out);
 
 struct common_sampler * common_sampler_init(
         const struct llama_model * model,

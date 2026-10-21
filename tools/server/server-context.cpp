@@ -635,6 +635,136 @@ struct server_host_phase_clock {
 
 static server_host_phase_clock g_host_phases;
 
+static bool server_bookkeep_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_BOOKKEEP_SERVER");
+        return e && atoi(e) != 0;
+    }();
+    return on;
+}
+
+struct server_bookkeep_clock {
+    enum phase { OUTSIDE, PREP, PROMPT, DRAFT, CKPT, BATCH, VERIFY, CATCHUP, CATCHUP_QUEUE, POST, CLONE, SAMPLE, ACCEPT, KV, OUTPUT, N_PHASE };
+    using times = std::array<uint64_t, N_PHASE>;
+    using context_times = std::array<std::array<uint64_t, 14>, 2>;
+
+    static bool enabled() {
+        static const bool on = [] {
+            const char * e = getenv("LLAMA_BOOKKEEP_TIMING");
+            return e && atoi(e) != 0;
+        }();
+        return on;
+    }
+
+    int64_t last = 0;
+    times pending = {};
+    std::vector<times> by_width;
+    std::array<const llama_context *, 2> contexts = {};
+    context_times cursor = {}, pending_context = {};
+    std::vector<context_times> by_width_context;
+    uint64_t checkpoint_saves = 0, checkpoint_loads = 0;
+
+    void checkpoint(bool save) {
+        if (enabled() && last != 0) {
+            (save ? checkpoint_saves : checkpoint_loads) += 1;
+        }
+    }
+
+    context_times context_snapshot() const {
+        context_times result = {};
+        for (size_t c = 0; c < contexts.size(); ++c) {
+            const auto p = llama_perf_bookkeep_context(contexts[c]);
+            result[c] = { p.sync_calls, p.sync_host_us, p.copy_calls, p.copy_bytes,
+                          p.copy_host_us, p.release_calls, p.release_host_us,
+                          p.memory_init_layout_host_us, p.graph_prepare_host_us,
+                          p.set_inputs_host_us, p.peer_sync_host_us, p.graph_submit_host_us,
+                          p.graph_rebuild_calls, p.graph_reuse_calls };
+        }
+        return result;
+    }
+
+    void mark(phase p, int64_t now = 0) {
+        if (!enabled() || last == 0) {
+            return;
+        }
+        if (now == 0) {
+            now = ggml_time_us();
+        }
+        pending[p] += now - last;
+        last = now;
+        const auto next = context_snapshot();
+        if (p != DRAFT && p != VERIFY) {
+            for (size_t c = 0; c < cursor.size(); ++c) {
+                for (size_t i = 0; i < cursor[c].size(); ++i) {
+                    pending_context[c][i] += next[c][i] - cursor[c][i];
+                }
+            }
+        }
+        cursor = next;
+    }
+
+    void start(int64_t now) {
+        if (enabled()) {
+            last = now;
+            pending = {};
+            cursor = context_snapshot();
+            pending_context = {};
+        }
+    }
+
+    void finish(size_t width, int64_t now) {
+        if (!enabled()) {
+            return;
+        }
+        if (last != 0) {
+            mark(ACCEPT, now);
+            if (by_width.size() <= width) {
+                by_width.resize(width + 1);
+                by_width_context.resize(width + 1);
+            }
+            for (int p = 0; p < N_PHASE; ++p) {
+                by_width[width][p] += pending[p];
+            }
+            for (size_t c = 0; c < cursor.size(); ++c) {
+                for (size_t i = 0; i < cursor[c].size(); ++i) {
+                    by_width_context[width][c][i] += pending_context[c][i];
+                }
+            }
+        }
+        start(now);
+    }
+
+    std::string summary(size_t width, uint64_t rounds, int64_t other_us) const {
+        static const char * names[] = { "outside", "prep", "prompt_copy", "draft", "draft_trim_ckpt", "batch", "verify", "catchup", "catchup_queue", "post", "sampler_clone", "sample", "accept", "prompt_kv", "output" };
+        std::string result;
+        int64_t measured = 0;
+        for (int p = 0; p < N_PHASE; ++p) {
+            if (p == DRAFT || p == VERIFY) {
+                continue;
+            }
+            measured += by_width[width][p];
+            result += string_format("%s%s %.4f", result.empty() ? "" : ", ", names[p], by_width[width][p] / (1000.0 * rounds));
+        }
+        result += string_format(", remainder %.4f", (other_us - measured) / (1000.0 * rounds));
+        return result;
+    }
+
+    std::string context_summary(size_t width, size_t c, uint64_t rounds) const {
+        const auto & p = by_width_context[width][c];
+        return string_format("sync %.3f calls/round %.4f ms/round, nextn_copy %.3f calls/round %.0f bytes/round %.4f ms/round, reclaim %.3f calls/round %.4f ms/round",
+                p[0] / double(rounds), p[1] / (1000.0 * rounds), p[2] / double(rounds),
+                p[3] / double(rounds), p[4] / (1000.0 * rounds), p[5] / double(rounds), p[6] / (1000.0 * rounds));
+    }
+
+    std::string context_detail_summary(size_t width, size_t c, uint64_t rounds) const {
+        const auto & p = by_width_context[width][c];
+        return string_format("memory_init_layout %.4f ms/round, graph_prepare %.4f ms/round, set_inputs %.4f ms/round, peer_sync %.4f ms/round, graph_submit %.4f ms/round, graph_rebuild %.3f calls/round, graph_reuse %.3f calls/round",
+                p[7] / (1000.0 * rounds), p[8] / (1000.0 * rounds), p[9] / (1000.0 * rounds),
+                p[10] / (1000.0 * rounds), p[11] / (1000.0 * rounds),
+                p[12] / double(rounds), p[13] / double(rounds));
+    }
+};
+
 struct server_slot {
     int id;
 
@@ -860,6 +990,7 @@ struct server_slot {
     int64_t               spec_draft_us_pending = 0;
     std::vector<uint64_t> spec_draft_us_by_w;
     std::vector<uint64_t> spec_verify_us_by_w;
+    server_bookkeep_clock spec_clock;
     // rounds that ended in a checkpoint restore (partial acceptance the context cannot roll back in place):
     // their verify decode, the state load and the replay decode of the accepted tokens are not bucketed
     // above, they land in the next bucketed round's "other". Counted here so that cost stays visible.
@@ -913,6 +1044,7 @@ struct server_slot {
         spec_draft_us_pending = 0;
         spec_draft_us_by_w.clear();
         spec_verify_us_by_w.clear();
+        spec_clock = {};
         spec_restore_rounds = 0;
         spec_restore_us = 0;
         spec_adapt = {};
@@ -1271,6 +1403,34 @@ struct server_slot {
                 }
                 SLT_INF(*this,
                         " round cost by draft width = (%s)\n", per_width.c_str());
+                for (size_t w = 0; w < spec_clock.by_width.size(); ++w) {
+                    if (w < spec_rounds_by_w.size() && spec_rounds_by_w[w] > 0) {
+                        const int64_t other = (int64_t) spec_round_us_by_w[w] - spec_draft_us_by_w[w] - spec_verify_us_by_w[w];
+                        SLT_INF(*this, " bookkeeping w%zu: %" PRIu64 " rounds, ms/round: %s\n", w, spec_rounds_by_w[w], spec_clock.summary(w, spec_rounds_by_w[w], other).c_str());
+                        for (size_t c = 0; c < spec_clock.contexts.size(); ++c) {
+                            SLT_INF(*this, " bookkeeping nested w%zu %s outside draft/verify: %s\n", w,
+                                    c == 0 ? "target" : "draft", spec_clock.context_summary(w, c, spec_rounds_by_w[w]).c_str());
+                            SLT_INF(*this, " bookkeeping nested detail w%zu %s outside draft/verify: %s\n", w,
+                                    c == 0 ? "target" : "draft", spec_clock.context_detail_summary(w, c, spec_rounds_by_w[w]).c_str());
+                        }
+                    }
+                }
+                if (server_bookkeep_clock::enabled()) {
+                    SLT_INF(*this, " bookkeeping generation checkpoint calls: saves %" PRIu64 ", loads %" PRIu64 "\n",
+                            spec_clock.checkpoint_saves, spec_clock.checkpoint_loads);
+                    uint64_t rounds = 0;
+                    for (uint64_t r : spec_rounds_by_w) {
+                        rounds += r;
+                    }
+                    for (const auto & p : llama_perf_sampler_children(common_sampler_get(smpl.get()))) {
+                        SLT_INF(*this, " sampler detail %s: %" PRIu64 " calls, %.3f ms total, %.4f ms/round\n", p.name, p.calls, p.time_us / 1000.0, p.time_us / (1000.0 * rounds));
+                    }
+                    const auto prep = common_sampler_get_prep_perf(smpl.get());
+                    SLT_INF(*this, " sampler detail candidate-prepare(inclusive): %" PRIu64 " calls, %.3f ms total, %.4f ms/round\n",
+                            prep.prepare_calls, prep.prepare_us / 1000.0, prep.prepare_us / (1000.0 * rounds));
+                    SLT_INF(*this, " sampler detail fused-topk-select(nested): %" PRIu64 " calls, %.3f ms total, %.4f ms/round\n",
+                            prep.fused_topk_calls, prep.fused_topk_us / 1000.0, prep.fused_topk_us / (1000.0 * rounds));
+                }
             }
             if (spec_restore_rounds > 0) {
                 SLT_INF(*this,
@@ -4583,11 +4743,13 @@ private:
         }
         // [#47] the time since the previous pass ended is "outside"; whatever this pass does after its last mark is "post"
         g_host_phases.mark(server_host_phase_clock::OUTSIDE);
+        for (auto & slot : slots) { slot.spec_clock.mark(server_bookkeep_clock::OUTSIDE); }
         g_host_phases.n_pass += g_host_phases.on ? 1 : 0;
         // once every slot is idle the wait for the next request is not a pass gap: drop it
         struct host_phase_pass_end {
-            const std::vector<server_slot> & slots;
+            std::vector<server_slot> & slots;
             ~host_phase_pass_end() {
+                for (auto & slot : slots) { slot.spec_clock.mark(server_bookkeep_clock::POST); }
                 g_host_phases.mark(server_host_phase_clock::POST);
                 if (std::none_of(slots.begin(), slots.end(), [](const server_slot & s) { return s.is_processing(); })) {
                     g_host_phases.t_last = 0;
@@ -4883,9 +5045,19 @@ private:
 
                         if (use_ckpt_dft) {
                             slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                            slot.spec_clock.checkpoint(true);
                         }
 
-                        slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
+                        slot.spec_clock.mark(server_bookkeep_clock::PREP);
+                        // fork: pure text already has the contiguous prompt the drafter needs.
+                        const llama_tokens * spec_prompt;
+                        if (server_bookkeep_enabled() && !slot.prompt.tokens.has_mtmd) {
+                            spec_prompt = &slot.prompt.tokens.get_tokens();
+                        } else {
+                            slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
+                            spec_prompt = &slot.spec_prompt;
+                        }
+                        slot.spec_clock.mark(server_bookkeep_clock::PROMPT);
 
                         int n_draft_req = n_draft_max;
                         if (spec_adapt_ctrl::enabled()) {
@@ -4903,7 +5075,7 @@ private:
                             /* .n_max    = */ n_draft_req,
                             /* .pos0     = */ slot.prompt.tokens.pos_next(),
                             /* .id_last  = */ slot.sampled,
-                            /* .prompt   = */ &slot.spec_prompt,
+                            /* .prompt   = */ spec_prompt,
                             /* .result   = */ &slot.spec_draft,
                             /* .sampling = */ &slot.task->params.sampling,
                             /* .result_q = */ &slot.spec_draft_q,
@@ -4918,6 +5090,7 @@ private:
         });
 
         g_host_phases.mark(server_host_phase_clock::PREP);
+        for (auto & slot : slots) { slot.spec_clock.mark(server_bookkeep_clock::PREP); }
 
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
@@ -4932,6 +5105,7 @@ private:
         }
 
         g_host_phases.mark(server_host_phase_clock::DRAFT);
+        for (auto & slot : slots) { slot.spec_clock.mark(server_bookkeep_clock::DRAFT); }
 
         // make checkpoints if needed
         iterate(drafting, [&](server_slot & slot) {
@@ -4946,6 +5120,7 @@ private:
             if (ctx_dft) {
                 if (use_ckpt_dft) {
                     ckpt.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    slot.spec_clock.checkpoint(false);
                 }
 
                 if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, ckpt.pos_max + 1, -1)) {
@@ -4965,6 +5140,7 @@ private:
                     //const int64_t t_start = ggml_time_us();
 
                     ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    slot.spec_clock.checkpoint(true);
 
                     //const int64_t t_total = ggml_time_us() - t_start;
                     //printf("checkpoint total: %f ms\n", t_total / 1000.0);
@@ -4977,11 +5153,13 @@ private:
 
                 if (use_ckpt_dft) {
                     ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    slot.spec_clock.checkpoint(true);
                 }
             }
         });
 
         g_host_phases.mark(server_host_phase_clock::CKPT);
+        for (auto & slot : slots) { slot.spec_clock.mark(server_bookkeep_clock::CKPT); }
 
         // update the batch with the sampled/drafted tokens
         iterate(generating, [&](server_slot & slot) {
@@ -5888,6 +6066,7 @@ private:
         int ret = 0;
         {
             g_host_phases.mark(server_host_phase_clock::BATCH);
+            for (auto & slot : slots) { slot.spec_clock.mark(server_bookkeep_clock::BATCH); }
             const int64_t t_decode_start = ggml_time_us();
             queue_tasks.yield_to_queue([&]() {
                 ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
@@ -5897,6 +6076,7 @@ private:
             });
             t_decode_pass += ggml_time_us() - t_decode_start;
             g_host_phases.mark(server_host_phase_clock::VERIFY);
+            for (auto & slot : slots) { slot.spec_clock.mark(server_bookkeep_clock::VERIFY); }
         }
 
         if (ckpt_armed && ret != 0) {
@@ -6012,11 +6192,14 @@ private:
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
         if (spec) {
+            for (auto & slot : slots) { slot.spec_clock.mark(server_bookkeep_clock::POST); }
             bool ok = true;
             queue_tasks.yield_to_queue([&]() {
+                for (auto & slot : slots) { slot.spec_clock.mark(server_bookkeep_clock::CATCHUP_QUEUE); }
                 ok = spec_ranges
                     ? common_speculative_process_range(spec.get(), batch.view, spec_processed, batch.view.size() - spec_processed)
                     : common_speculative_process(spec.get(), batch.view);
+                for (auto & slot : slots) { slot.spec_clock.mark(server_bookkeep_clock::CATCHUP); }
             });
 
             if (!ok) {
@@ -6025,6 +6208,7 @@ private:
                 // TODO: handle error
                 throw std::runtime_error("failed to process speculative batch");
             }
+            for (auto & slot : slots) { slot.spec_clock.mark(server_bookkeep_clock::CATCHUP_QUEUE); }
         }
 
         // fork: finish draft catch-up before returning scratch to the response cache.
@@ -6165,6 +6349,8 @@ private:
             // drafters that only draft on a match (n-gram) would have the plain steps in between folded into
             // "round cost by draft width"
             slot.t_spec_round_last = t_now;
+            slot.spec_clock.contexts = { ctx_tgt, ctx_dft };
+            slot.spec_clock.start(t_now);
 
             slot.stats.n_gen += 1;
 
@@ -6212,7 +6398,12 @@ private:
             // verify and try to accept the draft
             {
                 g_host_phases.mark(server_host_phase_clock::POST);
-                common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
+                slot.spec_clock.mark(server_bookkeep_clock::POST);
+                // fork: a sampler snapshot is used only when this round can require checkpoint replay.
+                const bool may_replay = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_draft > llama_n_rs_seq(ctx_tgt));
+                common_sampler_ptr smpl_save(!server_bookkeep_enabled() || may_replay ? common_sampler_clone(slot.smpl.get()) : nullptr);
+                slot.spec_clock.mark(server_bookkeep_clock::CLONE);
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 GGML_ASSERT(slot.spec_draft_q.empty() || (slot.spec_draft_q.size() == slot.spec_draft.size()));
@@ -6225,6 +6416,7 @@ private:
                         ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft)
                         : common_sampler_sample_and_accept_n_pq(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, slot.spec_draft_q, false, slot.spec_is_replay));
                 g_host_phases.mark(server_host_phase_clock::SAMPLE); // includes the sampler clone above
+                slot.spec_clock.mark(server_bookkeep_clock::SAMPLE);
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
@@ -6257,14 +6449,17 @@ private:
                         const int64_t t_restore0 = ggml_time_us();
 
                         ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                        slot.spec_clock.checkpoint(false);
 
                         if (slot.ctx_dft) {
                             ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                            slot.spec_clock.checkpoint(false);
                         }
 
                         slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
 
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
+                        GGML_ASSERT(smpl_save);
                         common_sampler_copy(smpl_save.get(), slot.smpl.get());
 
                         slot.spec_restore_rounds += 1;
@@ -6302,6 +6497,7 @@ private:
                 // round cost by draft width: the interval between consecutive accept events on this slot covers
                 // the draft, the verify decode and the sampling of one round (the first round has no interval).
                 const int64_t t_now = ggml_time_us();
+                slot.spec_clock.finish(n_draft, t_now);
                 if (slot.t_spec_round_last > 0) {
                     const size_t w = n_draft;
                     if (slot.spec_rounds_by_w.size() <= w) {
@@ -6343,6 +6539,7 @@ private:
             if (llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id) + 1 == slot.prompt.tokens.pos_next()) {
                 slot.sj_kvarn_accepted_end = slot.prompt.tokens.pos_next();
             }
+            slot.spec_clock.mark(server_bookkeep_clock::KV);
 
             for (size_t i = 0; i < ids.size(); ++i) {
                 completion_token_output result;
@@ -6365,6 +6562,8 @@ private:
             }
 
             slot.print_timings_tg();
+
+            slot.spec_clock.mark(server_bookkeep_clock::OUTPUT);
 
             SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) n_accepted, (int) n_draft, slot.prompt.n_tokens());
         });

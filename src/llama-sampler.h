@@ -3,6 +3,7 @@
 #include "llama.h"
 
 #include <vector>
+#include <utility>
 
 struct llama_vocab;
 struct llama_grammar;
@@ -33,6 +34,8 @@ struct llama_sampler_chain {
     mutable int64_t t_sample_us;
 
     mutable int32_t n_sample;
+
+    std::vector<std::pair<int64_t, uint64_t>> child_perf;
 };
 
 uint32_t llama_sampler_backend_n_nodes(const llama_sampler * sampler);

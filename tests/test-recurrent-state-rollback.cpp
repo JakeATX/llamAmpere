@@ -6,6 +6,7 @@
 #include "../src/llama-context.h"
 #include "../src/llama-io.h"
 #include "../src/llama-memory.h"
+#include "../src/llama-memory-hybrid-idx.h"
 
 #include <algorithm>
 #include <clocale>
@@ -1220,6 +1221,41 @@ static int test_rollback(const common_params & params, llama_model * model, uint
             fprintf(stderr, "%s : dirty-ctx logits mismatch at position %d, first token %d, nmse %g\n",
                     __func__, pos, token_first, nmse_dirty);
             return 1;
+        }
+    }
+
+    // fork (bookkeep): no-op suffix removals preserve pooled keys and the next decode.
+    if (auto * idx = dynamic_cast<llama_memory_hybrid_idx *>(llama_get_memory(ctx_src))) {
+        if (idx->get_mem_idx() && idx->get_kpool() > 0) {
+            llama_pos pos = n_tokens;
+            const llama_pos pooled_end = std::max<llama_pos>(pos, 2*idx->get_kpool() + 3);
+            const bool optimized = common_get_env("LLAMA_BOOKKEEP_KV") == "1";
+            for (; pos < pooled_end + 4; ++pos) {
+                if (pos >= pooled_end) {
+                    const auto stale_before = idx->mem_idx_stale_get();
+                    const auto & cells = idx->get_mem_idx()->get_cells(0);
+                    const auto positions_before = cells.seq_pos_get(0);
+                    const llama_pos p0 = pos + (pos - pooled_end);
+                    if (!llama_memory_seq_rm(llama_get_memory(ctx_src), 0, p0, -1) ||
+                            cells.seq_pos_get(0) != positions_before ||
+                            (optimized && idx->mem_idx_stale_get() != stale_before)) {
+                        fprintf(stderr, "%s : no-op suffix removal changed indexer metadata at %d\n", __func__, pos);
+                        return 1;
+                    }
+                }
+                const llama_token token = tokens[(size_t) pos % tokens.size()];
+                if (!decode_one(ctx_src, token, pos) || !decode_one(ctx_dst, token, pos)) {
+                    fprintf(stderr, "%s : no-op suffix continuation decode failed at %d\n", __func__, pos);
+                    return 1;
+                }
+                const float * a = llama_get_logits_ith(ctx_src, 0);
+                const float * b = llama_get_logits_ith(ctx_dst, 0);
+                if (!a || !b || nmse(a, b, n_vocab) != 0.0) {
+                    fprintf(stderr, "%s : no-op suffix changed next-decode logits at %d\n", __func__, pos);
+                    return 1;
+                }
+            }
+            fprintf(stderr, "%s : no-op indexer suffix removals preserve next-decode logits after two full pools\n", __func__);
         }
     }
 
