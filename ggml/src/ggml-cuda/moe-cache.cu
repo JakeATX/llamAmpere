@@ -1878,9 +1878,16 @@ static bool moe_cache_slab_preserves_reserve(
 }
 
 // Device table arena begin: this mandatory allocation precedes expert pools.
+static int moe_missjoin_mode();
+
 static bool moe_cache_table_stats_enabled() {
     const char * value = getenv("GGML_MOE_CACHE_DEVICE_STATS");
     return value && strcmp(value, "1") == 0;
+}
+
+static bool moe_cache_table_mask_enabled() {
+    const char * mask = getenv("GGML_MOE_MISSJOIN_MASK");
+    return moe_cache_table_stats_enabled() || (mask && strcmp(mask, "1") == 0 && moe_missjoin_mode());
 }
 
 static bool moe_cache_table_bytes_add(size_t & total, size_t bytes) {
@@ -1903,12 +1910,13 @@ static bool moe_cache_reserve_table_arena(moe_cache_session & session, moe_cache
     }
     size_t required = 0, entries = 0;
     const bool stats = moe_cache_table_stats_enabled();
+    const bool mask = moe_cache_table_mask_enabled();
     for (const auto & entry : device.seen_tensors) {
         const size_t count = (size_t)entry.second.n_expert;
         if (count > SIZE_MAX / sizeof(void *) || count > SIZE_MAX - entries ||
                 !moe_cache_table_bytes_add(required, count * sizeof(void *)) ||
                 (session.prefetch_enabled && !moe_cache_table_bytes_add(required, count * sizeof(void *))) ||
-                (stats && !moe_cache_table_bytes_add(required, count))) {
+                (mask && !moe_cache_table_bytes_add(required, count))) {
             return false;
         }
         entries += count;
@@ -7030,7 +7038,7 @@ static const void * const * moe_missjoin_overlap_table(ggml_backend_cuda_context
                     m.staging_device ? m.staging_device : m.device, m.hot, (const int32_t *) ids->data,
                     (int) ids->ne[0], routes, (int)(ids->nb[1] / sizeof(int32_t)), (int) m.desc.n_expert,
                     g_mj_eff + (size_t) j * g_mj_experts, g_mj_scratch + (size_t) j * g_mj_slots * g_mj_stride,
-                    g_mj_stride, moe_missjoin_copy_bytes(m), g_mj_slots, 0, g_missjoin_counts);
+                    g_mj_stride, moe_missjoin_copy_bytes(m), g_mj_slots, 0, session.device_route_counts ? g_missjoin_counts : nullptr);
             CUDA_CHECK(cudaGetLastError());
             CUDA_CHECK(cudaEventRecord(g_mj_done[j], g_mj_side));
         }
@@ -7585,6 +7593,61 @@ void ggml_cuda_moe_cache_device_predict(ggml_backend_cuda_context & ctx, const g
     CUDA_CHECK(cudaGetLastError());
 }
 
+// fork: each projection keeps its effective table and payload alive through its last reader.
+struct moe_cache_effective_table {
+    ggml_cuda_pool_alloc<char> pf_mem;
+    ggml_cuda_pool_alloc<char> mj_scratch;
+    ggml_cuda_pool_alloc<const void *> mj_eff;
+    bool pf_marked = false;
+
+    explicit moe_cache_effective_table(ggml_cuda_pool & pool) : pf_mem(pool), mj_scratch(pool), mj_eff(pool) {}
+};
+
+static const void * const * moe_cache_resolve_table(ggml_backend_cuda_context & ctx, moe_cache_session & session,
+        const moe_cache_device_table & table, const ggml_tensor * ids, moe_cache_effective_table & mem) {
+    const void * const * mmv_table = table.staging_device ? table.staging_device : table.device;
+    const int mj_mode = moe_missjoin_mode();
+    const int mj_routes = (int)(ids->ne[0] * ids->ne[1]);
+    const size_t mj_bytes = moe_missjoin_copy_bytes(table);
+    const bool mj_overlap_on = moe_missjoin_overlap_enabled() && !session.mj_groups.empty();
+    const uint8_t * stage_hot = table.hot;
+    // fork PREFETCHFIX: substitute tagged prefetched copies for host reads (a per-dispatch table copy).
+    if (!mj_overlap_on && table.pf_layer >= 1 && table.pf_layer < g_pf.n_layers && table.hot &&
+            mj_routes <= MOE_MISSJOIN_MAX_ROUTES && g_pf.active.load(std::memory_order_relaxed) &&
+            ctx.device == g_pf.device && table.desc.n_expert == g_pf.n_expert) {
+        const size_t n_e = (size_t) table.desc.n_expert;
+        char * m = mem.pf_mem.alloc(n_e * sizeof(void *) + GGML_PAD(n_e, 16));
+        const void ** pf_table = (const void **) m;
+        uint8_t * pf_hot = (uint8_t *) (m + n_e * sizeof(void *));
+        const int set = table.pf_layer % g_pf.sets;
+        moe_pf_resolve_kernel<<<1, 256, 0, ctx.stream()>>>(mmv_table, table.hot, (const int32_t *) ids->data,
+                (int) ids->ne[0], mj_routes, (int)(ids->nb[1] / sizeof(int32_t)), (int) n_e, table.pf_layer, table.pf_kind,
+                g_pf.d_stamp, g_pf.d_pred_stamp, g_pf.d_pred, MOE_PF_MAX_K, g_pf.d_tags + (size_t) set * g_pf.kpf, g_pf.kpf,
+                g_pf.d_buf ? g_pf.d_buf + (size_t) set * g_pf.kpf * g_pf.slot_stride : nullptr, g_pf.slot_stride,
+                g_pf.kind_off[table.pf_kind], pf_table, pf_hot, g_pf.d_stats,
+                g_pf.yield ? g_pf.d_mark : nullptr, g_pf.d_mark_seq);
+        mmv_table = pf_table;
+        stage_hot = pf_hot;
+        mem.pf_marked = g_pf.yield;
+    }
+    const void * const * mj_overlap = mj_overlap_on ? moe_missjoin_overlap_table(ctx, session, table, ids) : nullptr;
+    if (mj_overlap) {
+        mmv_table = mj_overlap;
+    } else if (mj_mode && table.hot && mj_routes <= MOE_MISSJOIN_MAX_ROUTES && mj_bytes % 16 == 0 &&
+            table.desc.n_expert <= INT_MAX) {
+        const int slots = moe_missjoin_slots();
+        const size_t stride = GGML_PAD(mj_bytes, 256);
+        char * scratch = mj_mode == 1 ? mem.mj_scratch.alloc(stride * (size_t) slots) : nullptr;
+        const void ** eff = mem.mj_eff.alloc((size_t) table.desc.n_expert);
+        moe_missjoin_stage_kernel<<<mj_mode == 1 ? moe_missjoin_blocks(ctx.device) : 1, 256, 0, ctx.stream()>>>(
+                mmv_table, stage_hot, (const int32_t *) ids->data, (int) ids->ne[0], mj_routes,
+                (int)(ids->nb[1] / sizeof(int32_t)), (int) table.desc.n_expert, eff, scratch, stride, mj_bytes,
+                slots, mj_mode == 2, session.device_route_counts ? g_missjoin_counts : nullptr);
+        mmv_table = eff;
+    }
+    return mmv_table;
+}
+
 bool ggml_cuda_moe_cache_device_compute(ggml_backend_cuda_context & ctx, ggml_tensor * op) {
     if (g_session_stack.empty() || !g_session_stack.back().active ||
             !moe_cache_device_op_fits(*g_session_stack.back().active, op, ctx.device)) {
@@ -7609,62 +7672,13 @@ bool ggml_cuda_moe_cache_device_compute(ggml_backend_cuda_context & ctx, ggml_te
     quantize_row_q8_1_cuda((const float *) a->data, nullptr, quantized, (ggml_type) table.desc.type,
             a->ne[0], a->nb[1] / sizeof(float), a->nb[2] / sizeof(float), a->nb[3] / sizeof(float),
             padded, a->ne[1], a->ne[2], 1, ctx.stream());
-    const void * const * mmv_table = table.staging_device ? table.staging_device : table.device;
-    // Allocated after q8 so the pool sees last-in first-out releases.
-    ggml_cuda_pool_alloc<char> pf_mem(ctx.pool());
-    ggml_cuda_pool_alloc<char> mj_scratch(ctx.pool());
-    ggml_cuda_pool_alloc<const void *> mj_eff(ctx.pool());
-    const int mj_mode = moe_missjoin_mode();
-    const int mj_routes = (int)(ids->ne[0] * ids->ne[1]);
-    const size_t mj_bytes = (size_t) op->ne[0] * ggml_row_size((ggml_type) table.desc.type, a->ne[0]);
-    const bool mj_overlap_on = moe_missjoin_overlap_enabled() && !session.mj_groups.empty();
-    const uint8_t * stage_hot = table.hot;
-    bool pf_marked = false;
-    // fork PREFETCHFIX: substitute tagged prefetched copies for host reads (a per-dispatch table copy).
-    if (!mj_overlap_on && table.pf_layer >= 1 && table.pf_layer < g_pf.n_layers && table.hot &&
-            mj_routes <= MOE_MISSJOIN_MAX_ROUTES && g_pf.active.load(std::memory_order_relaxed) &&
-            ctx.device == g_pf.device && table.desc.n_expert == g_pf.n_expert) {
-        const size_t n_e = (size_t) table.desc.n_expert;
-        char * m = pf_mem.alloc(n_e * sizeof(void *) + GGML_PAD(n_e, 16));
-        const void ** pf_table = (const void **) m;
-        uint8_t * pf_hot = (uint8_t *) (m + n_e * sizeof(void *));
-        const int set = table.pf_layer % g_pf.sets;
-        moe_pf_resolve_kernel<<<1, 256, 0, ctx.stream()>>>(mmv_table, table.hot, (const int32_t *) ids->data,
-                (int) ids->ne[0], mj_routes, (int)(ids->nb[1] / sizeof(int32_t)), (int) n_e, table.pf_layer, table.pf_kind,
-                g_pf.d_stamp, g_pf.d_pred_stamp, g_pf.d_pred, MOE_PF_MAX_K, g_pf.d_tags + (size_t) set * g_pf.kpf, g_pf.kpf,
-                g_pf.d_buf ? g_pf.d_buf + (size_t) set * g_pf.kpf * g_pf.slot_stride : nullptr, g_pf.slot_stride,
-                g_pf.kind_off[table.pf_kind], pf_table, pf_hot, g_pf.d_stats,
-                g_pf.yield ? g_pf.d_mark : nullptr, g_pf.d_mark_seq);
-        mmv_table = pf_table;
-        stage_hot = pf_hot;
-        pf_marked = g_pf.yield;
-    }
-    const void * const * mj_overlap = mj_overlap_on ? moe_missjoin_overlap_table(ctx, session, table, ids) : nullptr;
-    if (mj_overlap) {
-        mmv_table = mj_overlap;
-    } else if (mj_mode && table.hot && mj_routes <= MOE_MISSJOIN_MAX_ROUTES && mj_bytes % 16 == 0 &&
-            table.desc.n_expert <= INT_MAX) {
-        const int slots = moe_missjoin_slots();
-        const size_t stride = GGML_PAD(mj_bytes, 256);
-        // The pool requires releases in reverse allocation order: q8, scratch, eff.
-        char * scratch = mj_mode == 1 ? mj_scratch.alloc(stride * (size_t) slots) : nullptr;
-        const void ** eff = mj_eff.alloc((size_t) table.desc.n_expert);
-        moe_missjoin_stage_kernel<<<mj_mode == 1 ? moe_missjoin_blocks(ctx.device) : 1, 256, 0, ctx.stream()>>>(
-                mmv_table, stage_hot, (const int32_t *) ids->data, (int) ids->ne[0], mj_routes,
-                (int)(ids->nb[1] / sizeof(int32_t)), (int) table.desc.n_expert, eff, scratch, stride, mj_bytes,
-                slots, mj_mode == 2, g_missjoin_counts);
-        mmv_table = eff;
-        if (pf_marked && mj_mode == 1) {
-            // Staged: the matrix-vector pass below reads only device memory.
-            moe_pf_mark_end_kernel<<<1, 1, 0, ctx.stream()>>>(g_pf.d_mark_seq, g_pf.d_mark);
-            pf_marked = false;
-        }
-    }
+    moe_cache_effective_table effective(ctx.pool());
+    const void * const * mmv_table = moe_cache_resolve_table(ctx, session, table, ids, effective);
     ggml_cuda_moe_table_mmv(mmv_table, (ggml_type) table.desc.type, quantized,
             (const int32_t *) ids->data, (float *) op->data,
             a->ne[0], op->ne[0], ids->ne[0], ids->ne[1], a->ne[1], ids->nb[1] / sizeof(int32_t), ctx.stream());
     CUDA_CHECK(cudaGetLastError());
-    if (pf_marked) {
+    if (effective.pf_marked) {
         moe_pf_mark_end_kernel<<<1, 1, 0, ctx.stream()>>>(g_pf.d_mark_seq, g_pf.d_mark);
     }
     if (table.staging_device) {
@@ -7716,11 +7730,19 @@ bool ggml_cuda_moe_cache_device_fused_compute(ggml_backend_cuda_context & ctx,
     quantize_row_q8_1_cuda((const float *)a->data, nullptr, quantized, (ggml_type)up_table.desc.type,
             a->ne[0], a->nb[1] / sizeof(float), a->nb[2] / sizeof(float), a->nb[3] / sizeof(float),
             padded, a->ne[1], a->ne[2], 1, ctx.stream());
-    ggml_cuda_moe_table_mmv_fused(up_table.staging_device ? up_table.staging_device : up_table.device,
-            gate_table.staging_device ? gate_table.staging_device : gate_table.device, (ggml_type)up_table.desc.type, quantized,
+    // Keep both projections in allocation order; the pool releases them in reverse order.
+    moe_cache_effective_table up_effective(ctx.pool());
+    moe_cache_effective_table gate_effective(ctx.pool());
+    const void * const * up_mmv_table = moe_cache_resolve_table(ctx, session, up_table, ids, up_effective);
+    const void * const * gate_mmv_table = moe_cache_resolve_table(ctx, session, gate_table, ids, gate_effective);
+    ggml_cuda_moe_table_mmv_fused(up_mmv_table, gate_mmv_table, (ggml_type)up_table.desc.type, quantized,
             (const int32_t *)ids->data, (float *)glu->data, a->ne[0], glu->ne[0], ids->ne[0], ids->ne[1],
             a->ne[1], ids->nb[1] / sizeof(int32_t), ctx.stream());
     CUDA_CHECK(cudaGetLastError());
+    if (up_effective.pf_marked || gate_effective.pf_marked) {
+        // Overflow and unaligned misses can still read host memory after staging.
+        moe_pf_mark_end_kernel<<<1, 1, 0, ctx.stream()>>>(g_pf.d_mark_seq, g_pf.d_mark);
+    }
     if (up_table.staging_device || gate_table.staging_device) {
         std::lock_guard<std::mutex> lock(session.mu);
         for (const auto & copy : session.predictions) {
@@ -7861,6 +7883,8 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
         std::vector<moe_cache_mapped_range> pending_ranges;
         const char * stats_env = getenv("GGML_MOE_CACHE_DEVICE_STATS");
         const bool route_stats = stats_env && strcmp(stats_env, "1") == 0;
+        const bool resident_mask = moe_cache_table_mask_enabled();
+        const bool mask_only = resident_mask && !route_stats;
         size_t table_bytes = route_stats ? 3 * sizeof(unsigned long long) : 0, hot_bytes = 0;
         size_t count_entries = 0, arena_bytes = 0;
         for (int i = 0; i < n_tensors; ++i) {
@@ -7944,10 +7968,10 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
                 }
                 table.addresses[e] = address;
             }
-            table_bytes += (size_t) d.n_expert * (sizeof(void *) * (session->prefetch_enabled ? 2 : 1) + sizeof(unsigned long long) + (route_stats ? sizeof(uint8_t) : 0));
+            table_bytes += (size_t) d.n_expert * (sizeof(void *) * (session->prefetch_enabled ? 2 : 1) + sizeof(unsigned long long) + (resident_mask ? sizeof(uint8_t) : 0));
             if (!moe_cache_table_bytes_add(arena_bytes, (size_t)d.n_expert * sizeof(void *)) ||
                     (session->prefetch_enabled && !moe_cache_table_bytes_add(arena_bytes, (size_t)d.n_expert * sizeof(void *))) ||
-                    (route_stats && !moe_cache_table_bytes_add(arena_bytes, (size_t)d.n_expert))) {
+                    (resident_mask && !moe_cache_table_bytes_add(arena_bytes, (size_t)d.n_expert))) {
                 return fail();
             }
             session->device_tables.emplace(d.data, std::move(table));
@@ -8177,20 +8201,23 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
             }
         }
         if (moe_missjoin_mode() && !g_missjoin_counts) {
-            if (cudaMalloc((void **) &g_missjoin_counts, moe_missjoin_count_entries * sizeof(unsigned long long)) != cudaSuccess ||
-                    cudaMemset(g_missjoin_counts, 0, moe_missjoin_count_entries * sizeof(unsigned long long)) != cudaSuccess) {
+            if (!mask_only && (cudaMalloc((void **) &g_missjoin_counts, moe_missjoin_count_entries * sizeof(unsigned long long)) != cudaSuccess ||
+                    cudaMemset(g_missjoin_counts, 0, moe_missjoin_count_entries * sizeof(unsigned long long)) != cudaSuccess)) {
                 g_missjoin_counts = nullptr;
                 (void) cudaGetLastError();
             }
             MOE_CACHE_LOG("[moe-cache] missjoin mode=%s slots=%d%s\n", moe_missjoin_mode() == 1 ? "stage" : "diag_hot",
                     moe_missjoin_slots(), moe_missjoin_mode() == 2 ? " (DIAGNOSTIC, LOSSY: misses redirected)" : "");
-            if (!route_stats) {
-                MOE_CACHE_LOG("[moe-cache] missjoin needs GGML_MOE_CACHE_DEVICE_STATS=1 for the resident mask; inactive\n");
+            if (!resident_mask) {
+                MOE_CACHE_LOG("[moe-cache] missjoin needs GGML_MOE_MISSJOIN_MASK=1 or GGML_MOE_CACHE_DEVICE_STATS=1; inactive\n");
             }
+        }
+        if (mask_only) {
+            MOE_CACHE_LOG("[moe-cache] missjoin resident_mask=1 route_stats=0\n");
         }
         for (auto & entry : session->device_tables) {
             auto & table = entry.second;
-            if (route_stats) {
+            if (resident_mask) {
                 std::vector<uint8_t> hot(table.addresses.size());
                 for (size_t e = 0; e < hot.size(); ++e) {
                     hot[e] = table.addresses[e] != nullptr;
