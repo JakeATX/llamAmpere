@@ -330,6 +330,7 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
         if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
             if (mem_idx) {
                 mem_idx->state_read_sinfo(io, seq_id, flags, nullptr, &sinfos_attn);
+                mem_idx->state_mirror_cell_ext(*get_mem_attn(), sinfos_attn);
                 // the restore rewrites the cells behind the pool layout's back
                 mem_idx_stale_set(seq_id, 0);
             }

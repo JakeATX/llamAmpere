@@ -4565,6 +4565,30 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
     state_read_sinfo(io, seq_id, flags, nullptr, nullptr);
 }
 
+void llama_kv_cache::state_mirror_cell_ext(const llama_kv_cache & source, const slot_info_vec_t & slots) {
+    // Raw indexer keys disable RoPE in their cache hparams, so their legacy
+    // state section omits x/y. The attention section owns those positions.
+    // Recover them after restoring the shared layout, without changing the
+    // serialized format or touching unrelated cells.
+    if (!source.has_cell_ext()) {
+        return;
+    }
+    GGML_ASSERT(v_cells.size() == source.v_cells.size() && slots.size() == v_cells.size());
+    for (const auto & slot : slots) {
+        for (size_t s = 0; s < slot.n_stream(); ++s) {
+            const uint32_t stream = slot.strm[s];
+            GGML_ASSERT(stream < v_cells.size());
+            auto & dst = v_cells[stream];
+            const auto & src = source.v_cells[stream];
+            for (uint32_t cell : slot.idxs[s]) {
+                GGML_ASSERT(cell < dst.size() && cell < src.size());
+                GGML_ASSERT(!dst.is_empty(cell) && !src.is_empty(cell) && dst.pos_get(cell) == src.pos_get(cell));
+                dst.ext_set(cell, src.ext_get(cell));
+            }
+        }
+    }
+}
+
 void llama_kv_cache::state_read_sinfo(
         llama_io_read_i & io,
            llama_seq_id   seq_id,

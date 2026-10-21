@@ -1251,6 +1251,23 @@ static void prime_full_head_eval_counter(contexts & ctx) {
     require(llama_state_seq_set_data_ext(ctx.dft, state.data(), state.size(), 0,
                 LLAMA_STATE_SEQ_FLAGS_KEEP_LAYOUT) == state.size(), "restore helper after counter prime");
     require(llama_memory_seq_pos_max(memory, 0) == original_max, "counter prime restores the original helper extent");
+    if (auto * hybrid = dynamic_cast<llama_memory_hybrid_idx *>(memory)) {
+        if (hybrid->get_mem_idx()) {
+            const auto & attention = hybrid->get_mem_attn()->get_cells(0);
+            const auto & indexer = hybrid->get_mem_idx()->get_cells(0);
+            size_t checked = 0;
+            for (uint32_t cell = 0; cell < attention.size(); ++cell) {
+                if (!attention.seq_has(cell, 0)) { continue; }
+                require(indexer.seq_has(cell, 0) && indexer.pos_get(cell) == attention.pos_get(cell),
+                        "restored indexer mirrors occupied attention cells");
+                const auto a = attention.ext_get(cell), b = indexer.ext_get(cell);
+                require(a.x == b.x && a.y == b.y && a.tok == b.tok,
+                        "restored indexer preserves attention M-RoPE metadata");
+                ++checked;
+            }
+            require(original_max < 0 || checked > 0, "filled restore checks real mirrored metadata");
+        }
+    }
 }
 
 static full_head_round draft_full_head_round(contexts & ctx, llama_pos pos, const common_params_sampling & sampling, int depth) {
@@ -1374,6 +1391,15 @@ static void run_qwen4exp_full_head(bool cuda) {
                     actual.tokens.size(), actual.q.size());
         }
     };
+    // Materialize a filled helper, then restore it without changing its saved
+    // M-RoPE positions. The raw-key indexer has RoPE disabled internally.
+    {
+        contexts roundtrip(model.get(), config, 16, COMMON_SPECULATIVE_TYPE_DRAFT_MTP, 16, 1, 512, helper.get(), "none");
+        prefill(roundtrip, 0, prompt_size, 0);
+        (void) draft_full_head_round(roundtrip, prompt_size, sampling, depth);
+        prime_full_head_eval_counter(roundtrip);
+        printf("FULL_HEAD_RESTORE_MROPE %s filled=1 metadata=exact\n", cuda ? "GPU" : "CPU");
+    }
     const int accepted[rounds] = { depth, 1, depth };
     std::vector<full_head_round> expected;
     // Prime every helper while empty, before prefill or prompt restore. Priming

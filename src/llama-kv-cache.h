@@ -235,6 +235,9 @@ public:
           slot_info_vec_t *   sinfos_out,
      const slot_info_vec_t *   sinfos_in);
 
+    // Restore metadata omitted by a raw-key mirror from its owning attention cache.
+    void state_mirror_cell_ext(const llama_kv_cache & source, const slot_info_vec_t & slots);
+
     // undo a state_read() of seq_id (-1 for the whole cache) that another memory module failed to complete
     void state_clear(llama_seq_id seq_id);
 
