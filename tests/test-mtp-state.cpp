@@ -1174,7 +1174,7 @@ struct full_head_f16_output {
 };
 
 struct full_head_graph_stats {
-    size_t batched = 0, provisional = 0;
+    size_t batched = 0, provisional = 0, scalar = 0;
 };
 
 static bool full_head_fixture_eval(ggml_tensor * tensor, bool ask, void * user_data) {
@@ -1183,10 +1183,17 @@ static bool full_head_fixture_eval(ggml_tensor * tensor, bool ask, void * user_d
     const bool provisional = tensor->op == GGML_OP_MUL_MAT && tensor->ne[0] == n_vocab / 2 && tensor->ne[1] == 1 &&
             tensor->src[0] && tensor->src[0]->ne[0] == n_embd && tensor->src[0]->ne[1] == n_vocab / 2 &&
             std::strstr(tensor->src[0]->name, "draft_vocab_compact") != nullptr;
-    if (ask) { return batched || provisional; }
+    // This fixture installs an F16 full head without output scaling or LoRA, so the
+    // ordinary helper projection is this exact named MUL_MAT, not a provisional head.
+    const bool scalar = tensor->op == GGML_OP_MUL_MAT && tensor->ne[0] == n_vocab && tensor->ne[1] == 1 &&
+            tensor->src[0] && tensor->src[0]->type == GGML_TYPE_F16 &&
+            tensor->src[0]->ne[0] == n_embd && tensor->src[0]->ne[1] == n_vocab &&
+            std::strcmp(tensor->name, "result_output") == 0;
+    if (ask) { return batched || provisional || scalar; }
     auto & stats = *static_cast<full_head_graph_stats *>(user_data);
     stats.batched += batched;
     stats.provisional += provisional;
+    stats.scalar += scalar;
     return true;
 }
 
@@ -1496,14 +1503,42 @@ static void run_qwen4exp_full_head(bool cuda) {
             prefill(fallback, 0, prompt_size, 0);
             prime_full_head_eval_counter(fallback);
             llama_pos pos = prompt_size;
+            int scalar_eval_work = 0, reference_scalar_eval_work = 0;
             for (int round = 0; round < rounds; ++round) {
                 const auto graph_before = fallback_stats;
                 const auto actual = draft_full_head_round(fallback, pos, fallback_sampling, case_depth);
                 require_full_head_round(actual, fallback_expected[round], cuda, -3 - unsupported, round);
-                report_counter_mismatch("fallback", -3 - unsupported, round, actual, case_depth,
-                        fallback_expected[round].n_p_eval, fallback_sampling, backend_sampling);
+                // Widths up to four enter chain mode and defer the seven prompt rows.
+                // Rejecting the sampler flushes those rows, then queues query zero before
+                // llama_synchronize(): the perf API classifies the combined eight rows as
+                // prompt work. The other three scalar queries count as n_eval. This one-row
+                // reclassification persists in the absolute prompt count on later rounds.
+                // Cap five is rejected by the constructor, so it never defers the prompt.
+                const bool deferred_prompt = unsupported != 3;
+                const int expected_scalar = case_depth - int(deferred_prompt && round == 0);
+                const int expected_prompt = fallback_expected[round].n_p_eval + int(deferred_prompt);
+                report_counter_mismatch("fallback", -3 - unsupported, round, actual, expected_scalar,
+                        expected_prompt, fallback_sampling, backend_sampling);
                 require_full_head_graph(graph_before, fallback_stats, cuda, "fallback", -3 - unsupported, round, false);
-                require(actual.n_eval == case_depth, "unsupported sampled request or cap really uses full-head sequential fallback");
+                const size_t scalar_steps = fallback_stats.scalar - graph_before.scalar;
+                if (scalar_steps != size_t(case_depth)) {
+                    fprintf(stderr, "FULL_HEAD_SCALAR_GRAPH_FAILURE %s fault=%d round=%d scalar=%zu expected=%d\n",
+                            cuda ? "GPU" : "CPU", -3 - unsupported, round, scalar_steps, case_depth);
+                }
+                require(scalar_steps == size_t(case_depth),
+                        "unsupported sampled request or cap executes every actual full-head scalar projection");
+                require(actual.n_eval == expected_scalar && actual.n_p_eval == expected_prompt,
+                        "sequential fallback accounts for exactly the deferred prompt and scalar queries");
+                require(fallback_expected[round].n_eval == case_depth,
+                        "unmapped sequential reference accounts for every scalar query");
+                scalar_eval_work += actual.n_eval;
+                reference_scalar_eval_work += fallback_expected[round].n_eval;
+                require(scalar_eval_work + actual.n_p_eval ==
+                        reference_scalar_eval_work + fallback_expected[round].n_p_eval,
+                        "fallback and reference perform identical cumulative prompt plus scalar work");
+                printf("FULL_HEAD_FALLBACK %s unsupported=%d round=%d scalar_projections=%zu n_eval=%d n_p_eval=%d cumulative_work=%d\n",
+                        cuda ? "GPU" : "CPU", unsupported, round, scalar_steps, actual.n_eval, actual.n_p_eval,
+                        scalar_eval_work + actual.n_p_eval);
                 finish_full_head_round(fallback, pos, actual, accepted[round]);
             }
         }
