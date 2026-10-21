@@ -504,6 +504,51 @@ struct server_batch {
     }
 };
 
+// [D56] Depth-mix diagnostic (opt-in: LLAMA_SPEC_DEPTH_MIX=4:5): every round draws its draft depth uniformly from the
+// list (each capped by the drafter's n_max; RNG seed LLAMA_SPEC_DEPTH_MIX_SEED, default 1). Several depths then share
+// one text and one mix of round starts, so their per-position acceptance can be compared without text-to-text spread.
+// Exact p/q verification keeps the output distribution for any per-round depth; with LLAMA_TRACE=1 the
+// "accepted k/n draft tokens" lines carry each round's depth n.
+struct spec_depth_mix {
+    std::vector<int> depths;
+    std::mt19937     rng;
+
+    static spec_depth_mix & get() {
+        static spec_depth_mix m = [] {
+            spec_depth_mix r;
+            if (const char * e = getenv("LLAMA_SPEC_DEPTH_MIX")) {
+                // any non-digit separates entries (4,5 or 4:5 or 4/5/6)
+                int d = 0;
+                for (const char * c = e; ; ++c) {
+                    if (*c >= '0' && *c <= '9') {
+                        d = d * 10 + (*c - '0');
+                        continue;
+                    }
+                    if (d > 0) {
+                        r.depths.push_back(d);
+                    }
+                    d = 0;
+                    if (*c == '\0') {
+                        break;
+                    }
+                }
+            }
+            const char * se = getenv("LLAMA_SPEC_DEPTH_MIX_SEED");
+            r.rng.seed(se ? (uint32_t) strtoul(se, nullptr, 10) : 1u);
+            return r;
+        }();
+        return m;
+    }
+
+    int pick() {
+        if (depths.empty()) {
+            return 0;
+        }
+        std::uniform_int_distribution<size_t> u(0, depths.size() - 1);
+        return depths[u(rng)];
+    }
+};
+
 // BL6a: expected-throughput draft depth controller (opt-in: LLAMA_SPEC_ADAPT_COST=1).
 // Keeps EWMAs of the conditional acceptance at each draft position and of the wall cost of a
 // speculative round per draft width (draft + verify + sampling), then picks the depth d that
@@ -1427,8 +1472,13 @@ struct server_slot {
             SLT_INF(*this,
                     "draft acceptance = %0.5f (%5d accepted / %5d generated), mean len = %5.2f\n",
                     draft_ratio, n_draft_accepted, n_draft_total, mean_acc_len);
-            SLT_TRC(*this,
-                    "     acc per pos = (%s)\n", acceptance_rates_per_pos.c_str());
+            // [D56] LLAMA_SPEC_ACCPOS=1 prints the per-position acceptance at info level (no -lv 4 needed)
+            static const bool accpos_inf = getenv("LLAMA_SPEC_ACCPOS") != nullptr && strcmp(getenv("LLAMA_SPEC_ACCPOS"), "0") != 0;
+            if (accpos_inf) {
+                SLT_INF(*this, "     acc per pos = (%s)\n", acceptance_rates_per_pos.c_str());
+            } else {
+                SLT_TRC(*this, "     acc per pos = (%s)\n", acceptance_rates_per_pos.c_str());
+            }
 
             if (!spec_rounds_by_w.empty()) {
                 std::string per_width;
@@ -5223,6 +5273,9 @@ private:
                             if (d > 0) {
                                 n_draft_req = std::min(n_draft_req, d);
                             }
+                        }
+                        if (const int dm = spec_depth_mix::get().pick(); dm > 0) {
+                            n_draft_req = std::min(n_draft_req, dm);
                         }
 
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
