@@ -5693,7 +5693,8 @@ static bool run_device_missjoin_retain_lifecycle(ggml_backend_t gpu, ggml_backen
 
 // fork: compare staging against the same fused CUDA kernels with no resident mask.
 static bool run_device_fused_missjoin(ggml_backend_t gpu, ggml_backend_t cpu, log_capture & capture,
-        bool overlap, bool mask_only, bool retain = false, bool fused = true, bool grouped = false) {
+        bool overlap, bool mask_only, bool retain = false, bool fused = true, bool grouped = false,
+        bool large_copy = false) {
     auto fusion_count = (int64_t (*)(ggml_backend_t, const char *)) ggml_backend_reg_get_proc_address(
             ggml_backend_dev_backend_reg(ggml_backend_get_device(gpu)), "ggml_backend_cuda_fusion_count");
     const auto api = active_api();
@@ -5726,8 +5727,9 @@ static bool run_device_fused_missjoin(ggml_backend_t gpu, ggml_backend_t cpu, lo
         {0, 0, 0, 0, 0, 0, 0, 0},
     };
     std::vector<unsigned long long> totals(6, 0);
-    const int64_t input_width = grouped ? 5120 : n_in;
-    const int64_t output_rows = grouped ? 65 : n_out;
+    unsigned long long copied_bytes = 0;
+    const int64_t input_width = large_copy ? 2560 : grouped ? 5120 : n_in;
+    const int64_t output_rows = large_copy ? 640 : grouped ? 65 : n_out;
     std::vector<float> importance(input_width, 1.0f);
     bool ok = true;
     bool saw_retained_eviction = false;
@@ -5764,7 +5766,7 @@ static bool run_device_fused_missjoin(ggml_backend_t gpu, ggml_backend_t cpu, lo
             }
             ggml_backend_tensor_set(w, quantized.data(), 0, quantized.size());
         }
-        for (int tokens : (retain || grouped) ? std::vector<int>{1, 3, 4, 5} : std::vector<int>{1, 3, 4}) {
+        for (int tokens : (retain || grouped || large_copy) ? std::vector<int>{1, 3, 4, 5} : std::vector<int>{1, 3, 4}) {
             for (int channels : grouped ? std::vector<int>{1, 2, used} : std::vector<int>{1, 2}) {
                 ggml_init_params params = {8 * ggml_tensor_overhead(), nullptr, true};
                 ggml_context * input_ctx[] = {ggml_init(params), ggml_init(params)};
@@ -5868,6 +5870,7 @@ static bool run_device_fused_missjoin(ggml_backend_t gpu, ggml_backend_t cpu, lo
                                     totals[3] += copied;
                                     totals[4] += miss_routes;
                                     totals[5] += misses - copied;
+                                    copied_bytes += copied * weights[bank]->nb[2];
                                 }
                             }
                         }
@@ -5886,6 +5889,15 @@ static bool run_device_fused_missjoin(ggml_backend_t gpu, ggml_backend_t cpu, lo
                         ok &= pos != std::string::npos && sscanf(log.c_str() + pos,
                                 "[moe-cache] missjoin final: dispatches=%llu distinct_experts=%llu distinct_misses=%llu staged=%llu miss_routes=%llu unstaged=%llu",
                                 &got[0], &got[1], &got[2], &got[3], &got[4], &got[5]) == 6 && got == totals;
+                        if (large_copy && getenv("GGML_MOE_MISSJOIN_EXPERT_CTA") &&
+                                strcmp(getenv("GGML_MOE_MISSJOIN_EXPERT_CTA"), "1") == 0) {
+                            unsigned long long dispatches = 0, bytes = 0;
+                            const size_t copy_pos = log.rfind("[moe-cache] missjoin copy layout final: ");
+                            ok &= copy_pos != std::string::npos && sscanf(log.c_str() + copy_pos,
+                                    "[moe-cache] missjoin copy layout final: expert_cta_dispatches=%llu staged_bytes=%llu",
+                                    &dispatches, &bytes) == 2 && dispatches == totals[0] &&
+                                    bytes == copied_bytes && bytes > 0;
+                        }
                     }
                     if (staged && retain) {
                         unsigned long long got[7] = {};
@@ -5922,6 +5934,10 @@ static bool run_device_fused_missjoin(ggml_backend_t gpu, ggml_backend_t cpu, lo
     }
     set_env("GGML_MOE_MMV_GROUPED", nullptr);
     ok &= !retain || saw_retained_eviction;
+    if (large_copy) {
+        printf("missjoin-copy: 24 shapes, 288 staged graph runs, dispatches=%llu staged_bytes=%llu: %s\n",
+                totals[0], copied_bytes, ok ? "OK" : "FAIL");
+    }
     printf("cache-device%s-missjoin%s%s%s%s: %s\n", fused ? "-fused" : "", overlap ? "-overlap" : "", mask_only ? "-mask" : "", retain ? "-retain" : "", grouped ? "-grouped" : "", ok ? "OK" : "FAIL");
     return ok;
 }
@@ -6242,6 +6258,7 @@ int main(int argc, char ** argv) {
         return !provider_is_cuda ? 77 : ok ? 0 : 1;
     }
     if (argc == 2 && (strcmp(argv[1], "--device-fused-missjoin-only") == 0 ||
+            strcmp(argv[1], "--device-missjoin-copy-only") == 0 ||
             strcmp(argv[1], "--device-fused-missjoin-overlap-only") == 0 ||
             strcmp(argv[1], "--device-fused-missjoin-retain-only") == 0 ||
             strcmp(argv[1], "--device-fused-missjoin-grouped-only") == 0 ||
@@ -6249,6 +6266,7 @@ int main(int argc, char ** argv) {
             strcmp(argv[1], "--device-missjoin-retain-only") == 0 ||
             strcmp(argv[1], "--device-fused-missjoin-mask-only") == 0)) {
         const bool overlap = strcmp(argv[1], "--device-fused-missjoin-overlap-only") == 0;
+        const bool large_copy = strcmp(argv[1], "--device-missjoin-copy-only") == 0;
         const bool mask_only = strcmp(argv[1], "--device-fused-missjoin-mask-only") == 0;
         const bool grouped = strcmp(argv[1], "--device-fused-missjoin-grouped-only") == 0 ||
                 strcmp(argv[1], "--device-missjoin-grouped-only") == 0;
@@ -6257,7 +6275,7 @@ int main(int argc, char ** argv) {
         const bool retain = strcmp(argv[1], "--device-missjoin-retain-only") == 0 ||
                 strcmp(argv[1], "--device-fused-missjoin-retain-only") == 0 ||
                 (grouped && getenv("GGML_MOE_MISSJOIN_RETAIN") && atoi(getenv("GGML_MOE_MISSJOIN_RETAIN")) > 0);
-        const bool ok = provider_is_cuda && run_device_fused_missjoin(gpu, cpu, capture, overlap, mask_only, retain, fused, grouped);
+        const bool ok = provider_is_cuda && run_device_fused_missjoin(gpu, cpu, capture, overlap, mask_only, retain, fused, grouped, large_copy);
         ggml_backend_free(gpu);
         ggml_backend_free(cpu);
         return !provider_is_cuda ? 77 : ok ? 0 : 1;

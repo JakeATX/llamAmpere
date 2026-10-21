@@ -46,6 +46,7 @@ static void moe_cache_register_stub(const void * owner) {
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <type_traits>
 #include <new>
 #include <set>
 #include <string>
@@ -158,6 +159,10 @@ static void moe_missjoin_log(const char * when) {
     }
     MOE_CACHE_LOG("[moe-cache] missjoin %s: dispatches=%llu distinct_experts=%llu distinct_misses=%llu staged=%llu miss_routes=%llu unstaged=%llu\n",
             when, c[0], c[1], c[2], c[3], c[4], c[5]);
+    if (c[6]) {
+        MOE_CACHE_LOG("[moe-cache] missjoin copy layout %s: expert_cta_dispatches=%llu staged_bytes=%llu\n",
+                when, c[6], c[7]);
+    }
 }
 
 static constexpr int    moe_cache_cc_forced_min               = 700;
@@ -6835,6 +6840,14 @@ static int moe_missjoin_blocks(int device) {
     return blocks;
 }
 
+static bool moe_missjoin_expert_cta() {
+    static const bool enabled = [] {
+        const char * value = getenv("GGML_MOE_MISSJOIN_EXPERT_CTA");
+        return value && strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
 static constexpr int MOE_MISSJOIN_RETAIN_MAX = 8;
 
 struct moe_missjoin_retained_state {
@@ -6979,7 +6992,9 @@ static __global__ void moe_missjoin_retained_copy_kernel(const moe_missjoin_reta
 
 // counts: 0 dispatches, 1 distinct experts, 2 distinct misses, 3 staged,
 //         4 miss routes (with duplicates), 5 unstaged misses (overflow or unaligned).
+// 6 expert-CTA dispatches, 7 bytes staged by that copy layout.
 // Retained hits are counted separately and do not increment staged or unstaged.
+template <bool expert_cta>
 static __global__ void moe_missjoin_stage_kernel(const void * const * table, const uint8_t * hot,
         const int32_t * ids, int n_ids, int n_routes, int ids_stride, int n_expert,
         const void ** eff, char * scratch, size_t stride, size_t copy_bytes, int slots, int diag,
@@ -7060,12 +7075,48 @@ static __global__ void moe_missjoin_stage_kernel(const void * const * table, con
             atomicAdd(counts + 3, diag ? 0ULL : (unsigned long long) n_stage);
             atomicAdd(counts + 4, mroutes);
             atomicAdd(counts + 5, diag ? 0ULL : dmiss - (unsigned long long) n_stage);
+            if constexpr (expert_cta) {
+                if (!diag) {
+                    atomicAdd(counts + 6, 1ULL);
+                    atomicAdd(counts + 7, (unsigned long long) n_stage * copy_bytes);
+                }
+            }
         }
     }
     if (diag || n_stage == 0) {
         return;
     }
     const size_t chunks = copy_bytes / 16;
+    if constexpr (expert_cta) {
+        // A block stays within one expert image, eliminating division by the
+        // runtime image size from every vector copy. Distribute all blocks
+        // evenly, including nondivisible grids and grids smaller than n_stage.
+        const int groups = min(n_stage, (int) gridDim.x);
+        const int group = blockIdx.x % groups;
+        const int block = blockIdx.x / groups;
+        const int blocks = ((int) gridDim.x - 1 - group) / groups + 1;
+        const size_t step = (size_t) blocks * blockDim.x;
+        for (int r = group; r < n_stage; r += groups) {
+            const int4 * source = (const int4 *) table[s_stage[r]];
+            int4 * destination = (int4 *) (scratch + (size_t) r * stride);
+            size_t c = (size_t) block * blockDim.x + threadIdx.x;
+            for (; c + 3 * step < chunks; c += 4 * step) {
+                int4 values[4];
+#pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    values[k] = __ldcs(source + c + k * step);
+                }
+#pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    destination[c + k * step] = values[k];
+                }
+            }
+            for (; c < chunks; c += step) {
+                destination[c] = __ldcs(source + c);
+            }
+        }
+        return;
+    }
     const size_t total = chunks * (size_t) n_stage;
     const size_t step = (size_t) gridDim.x * blockDim.x;
     size_t c = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -7089,6 +7140,23 @@ static __global__ void moe_missjoin_stage_kernel(const void * const * table, con
         const size_t r = c / chunks;
         const size_t o = c - r * chunks;
         ((int4 *) (scratch + r * stride))[o] = __ldcs((const int4 *) table[s_stage[r]] + o);
+    }
+}
+
+static void moe_missjoin_stage(const void * const * table, const uint8_t * hot,
+        const int32_t * ids, int n_ids, int n_routes, int ids_stride, int n_expert,
+        const void ** eff, char * scratch, size_t stride, size_t copy_bytes, int slots, int diag,
+        unsigned long long * counts, int blocks, cudaStream_t stream) {
+    auto launch = [&](auto tag) {
+        constexpr bool expert_cta = decltype(tag)::value;
+        moe_missjoin_stage_kernel<expert_cta><<<blocks, 256, 0, stream>>>(
+                table, hot, ids, n_ids, n_routes, ids_stride, n_expert,
+                eff, scratch, stride, copy_bytes, slots, diag, counts);
+    };
+    if (moe_missjoin_expert_cta()) {
+        launch(std::true_type{});
+    } else {
+        launch(std::false_type{});
     }
 }
 
@@ -7273,11 +7341,12 @@ static const void * const * moe_missjoin_overlap_table(ggml_backend_cuda_context
         CUDA_CHECK(cudaStreamWaitEvent(g_mj_side, g_mj_fork, 0));
         for (int j = 0; j < 3; ++j) {
             const auto & m = *group[j];
-            moe_missjoin_stage_kernel<<<moe_missjoin_blocks(ctx.device), 256, 0, g_mj_side>>>(
+            moe_missjoin_stage(
                     m.staging_device ? m.staging_device : m.device, m.hot, (const int32_t *) ids->data,
                     (int) ids->ne[0], routes, (int)(ids->nb[1] / sizeof(int32_t)), (int) m.desc.n_expert,
                     g_mj_eff + (size_t) j * g_mj_experts, g_mj_scratch + (size_t) j * g_mj_slots * g_mj_stride,
-                    g_mj_stride, moe_missjoin_copy_bytes(m), g_mj_slots, 0, session.device_route_counts ? g_missjoin_counts : nullptr);
+                    g_mj_stride, moe_missjoin_copy_bytes(m), g_mj_slots, 0, session.device_route_counts ? g_missjoin_counts : nullptr,
+                    moe_missjoin_blocks(ctx.device), g_mj_side);
             CUDA_CHECK(cudaGetLastError());
             CUDA_CHECK(cudaEventRecord(g_mj_done[j], g_mj_side));
         }
@@ -7887,10 +7956,11 @@ static const void * const * moe_cache_resolve_table(ggml_backend_cuda_context & 
             CUDA_CHECK(cudaGetLastError());
             moe_missjoin_retained_copy_kernel<<<moe_missjoin_blocks(ctx.device), 256, 0, ctx.stream()>>>(table.mj_retained, mj_bytes);
         } else {
-            moe_missjoin_stage_kernel<<<mj_mode == 1 ? moe_missjoin_blocks(ctx.device) : 1, 256, 0, ctx.stream()>>>(
+            moe_missjoin_stage(
                     mmv_table, stage_hot, (const int32_t *) ids->data, (int) ids->ne[0], mj_routes,
                     (int)(ids->nb[1] / sizeof(int32_t)), (int) table.desc.n_expert, eff, scratch, stride, mj_bytes,
-                    slots, mj_mode == 2, session.device_route_counts ? g_missjoin_counts : nullptr);
+                    slots, mj_mode == 2, session.device_route_counts ? g_missjoin_counts : nullptr,
+                    mj_mode == 1 ? moe_missjoin_blocks(ctx.device) : 1, ctx.stream());
         }
         mmv_table = eff;
     }
