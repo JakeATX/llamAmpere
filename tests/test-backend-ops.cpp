@@ -35,6 +35,7 @@
 #include <future>
 #include <fstream>
 #include <memory>
+#include <limits>
 #include <mutex>
 #include <random>
 #include <regex>
@@ -10466,6 +10467,8 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
     // llama-graph: one FA node per stream on k/v/q/mask/desc-row views, joined with ggml_concat on dim 3.
     // Stream s sees n_ring - 37*s ring positions; logical groups map to shuffled pool records.
     const int ns;
+    const int mask_mode; // 1 = empty body partitions, 2 = sparse body tiles and query-dependent boundaries
+    const int data_case; // nonzero cases are CUDA differential checks over exceptional Q/K/V data
     static constexpr int64_t D = 256, G = 128;
     const int64_t cap;
     int64_t n_streams() const { return ns > 0 ? ns : 1; }
@@ -10490,10 +10493,16 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
         if (ns != 0) {
             result += ",ns=" + std::to_string(ns);
         }
+        if (mask_mode != 0) {
+            result += ",mask_mode=" + std::to_string(mask_mode);
+        }
+        if (data_case != 0) {
+            result += ",data_case=" + std::to_string(data_case);
+        }
         return result;
     }
 
-    bool run_whole_graph() override { return rot == 2; }
+    bool run_whole_graph() override { return rot == 2 || data_case != 0; }
 
     double err(const float * a, const float * b, size_t n) override {
         if (rot != 2) {
@@ -10507,6 +10516,9 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
     }
 
     std::string op_desc(ggml_tensor * t) override {
+        if (data_case != 0) {
+            return "FLASH_ATTN_EXT_SJKVARN_MASK_CHECK";
+        }
         if (rot == 2) {
             return "FLASH_ATTN_EXT_SJKVARN_ROT_EXACT";
         }
@@ -10520,11 +10532,14 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
         return rot == 2 ? 0.0 : 5e-4;
     }
 
-    test_flash_attn_ext_sj_kvarn(int64_t n_q = 1, int64_t nh = 16, int64_t hkv = 2, int64_t n_groups = 3, int64_t n_ring = 300, bool row_mask = false, bool attn_options = false, ggml_type staging_type = GGML_TYPE_F16, int64_t S = 128, bool f16_sink = false, ggml_type body_type = GGML_TYPE_F32, int bits_k = 4, int bits_v = 4, int rot = 0, int ns = 0)
-        : n_q(n_q), nh(nh), hkv(hkv), n_groups(n_groups), n_ring(n_ring), row_mask(row_mask), attn_options(attn_options), staging_type(staging_type), body_type(body_type), bits_k(bits_k), bits_v(bits_v), S(S), f16_sink(f16_sink), rot(rot), ns(ns),
+    test_flash_attn_ext_sj_kvarn(int64_t n_q = 1, int64_t nh = 16, int64_t hkv = 2, int64_t n_groups = 3, int64_t n_ring = 300, bool row_mask = false, bool attn_options = false, ggml_type staging_type = GGML_TYPE_F16, int64_t S = 128, bool f16_sink = false, ggml_type body_type = GGML_TYPE_F32, int bits_k = 4, int bits_v = 4, int rot = 0, int ns = 0, int mask_mode = 0, int data_case = 0)
+        : n_q(n_q), nh(nh), hkv(hkv), n_groups(n_groups), n_ring(n_ring), row_mask(row_mask), attn_options(attn_options), staging_type(staging_type), body_type(body_type), bits_k(bits_k), bits_v(bits_v), S(S), f16_sink(f16_sink), rot(rot), ns(ns), mask_mode(mask_mode), data_case(data_case),
           cap(std::max<int64_t>(1280, ((n_ring + G - 1)/G)*G)) {
         GGML_ASSERT(n_ring <= cap && n_ring - 37*(n_streams() - 1) >= n_q);
         GGML_ASSERT(ns == 0 || rot == 0);
+        GGML_ASSERT(mask_mode >= 0 && mask_mode <= 2);
+        GGML_ASSERT(data_case >= 0 && data_case <= 15);
+        GGML_ASSERT(data_case == 0 || (hkv == 2 && ns == 0 && rot == 0 && mask_mode == 2));
     }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
@@ -10603,6 +10618,11 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
             ggml_tensor * ref = ggml_turbo_wht(ctx, fa(q_rot), 1, 256, nullptr);
             out = ggml_sub(ctx, out, ref);
         }
+        if (data_case != 0) {
+            // The CUDA mode2 check compares the entire FA output, including NaN payloads and signed zeros.
+            // Return the last query of an unaffected KV head for the separate CPU-reference check.
+            out = ggml_cont(ctx, ggml_view_1d(ctx, out, D, (n_q*nh - 1)*D*sizeof(float)));
+        }
         ggml_set_name(out, "out");
         return out;
     }
@@ -10614,7 +10634,12 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
             if (t->view_src != nullptr) {
                 continue; // per-stream q/k/v/mask/desc views (ns > 0), the ring views, the permuted q: their storage is set below
             }
-            if (strcmp(t->name, "m") == 0) {
+            if (strcmp(t->name, "q") == 0 && (data_case == 1 || data_case == 2)) {
+                std::vector<float> values(ggml_nelements(t));
+                for (auto & value : values) { value = uni(-1.0f, 1.0f); }
+                values[0] = data_case == 1 ? std::numeric_limits<float>::quiet_NaN() : 70000.0f;
+                ggml_backend_tensor_set(t, values.data(), 0, values.size()*sizeof(float));
+            } else if (strcmp(t->name, "m") == 0) {
                 std::vector<ggml_fp16_t> mask((size_t) n_kv_pad() * n_q * n_streams());
                 for (int64_t s = 0; s < n_streams(); ++s) {
                     const int64_t Ns = ns > 0 ? N_s(s) : N();
@@ -10624,6 +10649,16 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
                             float value = p <= pos && p < Ns ? 0.0f : -INFINITY;
                             if (row_mask && p >= S && p < B()) {
                                 value = (p / 16 + j + s) % 3 == 0 ? -INFINITY : -0.25f * (float) ((p + 3*j) % 11);
+                            }
+                            if (mask_mode != 0 && p >= S && p < B()) {
+                                const int64_t body_pos = p - S;
+                                const int64_t within = body_pos % 512;
+                                const bool live = mask_mode == 2 && (body_pos < 4 ||
+                                    (within >= 32 + 4*j && within < 36 + 4*j) || p == B() - 1 - j);
+                                value = live ? 0.0f : -INFINITY;
+                            }
+                            if (data_case == 8 && j == 0 && p == S + 95) {
+                                value = std::numeric_limits<float>::quiet_NaN();
                             }
                             mask[(s*n_q + j)*n_kv_pad() + p] = ggml_fp32_to_fp16(value);
                         }
@@ -10698,6 +10733,24 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
                         put(rec, k_tok   + 2*t2, uni(0.5f, 1.5f));
                         put(rec, v_scale + 2*t2, uni(0.02f, 0.08f));
                         put(rec, v_zero  + 2*t2, uni(-0.6f, -0.2f));
+                    }
+                    if (r == 0) {
+                        if (data_case == 3) { put(rec, k_scale, std::numeric_limits<float>::quiet_NaN()); }
+                        if (data_case == 4) { put(rec, k_scale, 65504.0f); put(rec, k_zero, 65504.0f); }
+                        if (data_case == 5) { put(rec, v_scale, std::numeric_limits<float>::quiet_NaN()); }
+                        if (data_case == 6) { put(rec, v_scale, 65504.0f); put(rec, v_zero, 65504.0f); }
+                        if (data_case == 7) { put(rec, v_ch, -0.0f); }
+                        if (data_case == 9) { put(rec, k_tok + 2*95, std::numeric_limits<float>::infinity()); }
+                        if (data_case == 10) { put(rec, k_scale, 1024.0f); put(rec, k_zero, 0.0f); put(rec, k_tok + 2*95, 8.0f); }
+                        if (data_case == 11) { put(rec, v_scale + 2*95, std::numeric_limits<float>::quiet_NaN()); }
+                        if (data_case == 12) { put(rec, v_scale + 2*95, 65504.0f); put(rec, v_zero + 2*95, 65504.0f); }
+                        if (data_case >= 13) {
+                            const float kscale = data_case == 13 ? 2048.0f : data_case == 14 ? 1024.0f : 0x1p-24f;
+                            const float kzero = data_case == 15 ? -0.0f : kscale;
+                            const float ktok = data_case == 13 ? 0.5f : data_case == 14 ? 2.0f : 0x1p-24f;
+                            for (int64_t d = 0; d < D; ++d) { put(rec, k_scale + 2*d, kscale); put(rec, k_zero + 2*d, kzero); }
+                            for (int64_t t2 = 0; t2 < G; ++t2) { put(rec, k_tok + 2*t2, ktok); }
+                        }
                     }
                 }
                 ggml_backend_tensor_set(t, buf.data(), 0, buf.size());
@@ -15395,6 +15448,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // f16 sink, 4/4 scalar body): decode and MTP widths, prefill ubatches, and two sequences (--parallel 2)
     for (int64_t n_q : {1, 2, 4, 5, 8, 64, 257, 1024}) {
         test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 2, 5, 4096, true, false, GGML_TYPE_TQ6_0, 128, true));
+    }
+    // An ordinary body tensor has no resident-map pointer tag: these exercise resident_slots == 0 in the MMA path.
+    // Keep exact sink/ring positions live while checking empty stream-K partitions, sparse 4-cell pools, query-specific
+    // tile edges, the final body tile, a wrapped ring and a ragged padded tail.
+    for (int64_t n_q : {1, 4, 5}) {
+        for (int mask_mode : {1, 2}) {
+            test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 2, 32, 1153, false, false,
+                GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_F32, 4, 4, 0, 0, mask_mode));
+        }
+    }
+    const char * mask_skip_check = getenv("GGML_SJKVARN_MMA_MASK_SKIP");
+    if (mask_skip_check && strcmp(mask_skip_check, "2") == 0) {
+        for (int64_t n_q : {4, 5}) {
+            for (int data_case = 1; data_case <= 15; ++data_case) {
+                test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 2, 9, 257, false, false,
+                    GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_F32, 4, 4, 0, 0, 2, data_case));
+            }
+        }
     }
     for (int64_t n_q : {1, 5, 257}) {
         test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 2, 5, 400, true, false, GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_F32, 4, 4, 0, 2));

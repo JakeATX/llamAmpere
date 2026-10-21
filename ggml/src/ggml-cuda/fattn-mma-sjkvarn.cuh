@@ -13,6 +13,15 @@
 #include "fattn-mma-f16.cuh"
 #include "sjkvarn-seal.cuh"
 
+static __global__ void fattn_sj_masked_kq_check(const uint32_t * a, const uint32_t * b, const int64_t n) {
+    for (int64_t i = int64_t(blockIdx.x)*blockDim.x + threadIdx.x; i < n; i += int64_t(gridDim.x)*blockDim.x) {
+        if (a[i] != b[i]) {
+            printf("SJ masked KQ check: word %lld differs: %08x vs %08x\n", (long long) i, a[i], b[i]);
+            __trap();
+        }
+    }
+}
+
 template <int DKQ, int DV, int ncols1, int ncols2>
 void ggml_cuda_flash_attn_ext_mma_sj_kvarn_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(!ggml_cuda_fattn_sj_kvarn_rot(dst)); // [#139] no in-kernel rotation: fattn.cu runs it in separate passes
@@ -68,34 +77,66 @@ void ggml_cuda_flash_attn_ext_mma_sj_kvarn_case(ggml_backend_cuda_context & ctx,
     using fattn_kernel_ptr_t = fattn_kernel_t;
 #endif // defined(GGML_USE_HIP)
     fattn_kernel_t fattn_kernel;
+    fattn_kernel_t reference_kernel;
+    // fork: 1 enables guarded KQ skipping; 2 also compares every output bit with the original path.
+    static const int mask_skip_mode = [] {
+        const char * value = getenv("GGML_SJKVARN_MMA_MASK_SKIP");
+        return value && strcmp(value, "1") == 0 ? 1 : value && strcmp(value, "2") == 0 ? 2 : 0;
+    }();
     if (logit_softcap == 0.0f) {
         constexpr bool use_logit_softcap = false;
-        fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, /* use_sparse */ false, type_K, type_V>;
+        reference_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, false, type_K, type_V>;
+        fattn_kernel = mask_skip_mode ?
+            flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, false, type_K, type_V, false, false, false, false, true> :
+            reference_kernel;
 
 #if !defined(GGML_USE_MUSA)
         static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
         if (!shared_memory_limit_raised[id]) {
             CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
+            if (mask_skip_mode == 2) {
+                CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(reference_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
+            }
             shared_memory_limit_raised[id] = true;
         }
 #endif // !defined(GGML_USE_MUSA)
     } else {
         constexpr bool use_logit_softcap = true;
-        fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, /* use_sparse */ false, type_K, type_V>;
+        reference_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, false, type_K, type_V>;
+        fattn_kernel = mask_skip_mode ?
+            flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, false, type_K, type_V, false, false, false, false, true> :
+            reference_kernel;
 
 #if !defined(GGML_USE_MUSA)
         static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
         if (!shared_memory_limit_raised[id]) {
             CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
+            if (mask_skip_mode == 2) {
+                CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(reference_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
+            }
             shared_memory_limit_raised[id] = true;
         }
 #endif // !defined(GGML_USE_MUSA)
+    }
+
+    ggml_cuda_pool_alloc<uint32_t> reference(ctx.pool());
+    if (mask_skip_mode == 2) {
+        reference.alloc(ggml_nelements(dst));
+        launch_fattn<DV, ncols1, ncols2>
+            (ctx, dst, reference_kernel, nwarps, nbytes_shared_total, nbatch_fa,
+             false, false, true, false, warp_size_host);
+        CUDA_CHECK(cudaMemcpyAsync(reference.get(), dst->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, ctx.stream()));
     }
 
     // K/V stay in their ring storage format; only shared tiles are decoded. stream_k = true.
     launch_fattn<DV, ncols1, ncols2>
         (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa,
          /*need_f16_K=*/false, /*need_f16_V=*/false, /*stream_k=*/true, /*use_sparse=*/false, warp_size_host);
+    if (mask_skip_mode == 2) {
+        const int blocks = std::min<int64_t>((ggml_nelements(dst) + 255)/256, 1024);
+        fattn_sj_masked_kq_check<<<blocks, 256, 0, ctx.stream()>>>(reference.get(), (const uint32_t *) dst->data, ggml_nelements(dst));
+        CUDA_CHECK(cudaGetLastError());
+    }
 }
 
 #define DECL_FATTN_MMA_SJKVARN_CASE(DKQ, DV, ncols1, ncols2)                          \
