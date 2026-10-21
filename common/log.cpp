@@ -552,7 +552,9 @@ void common_log_default_callback(enum ggml_log_level level, const char * text, v
     if (level == GGML_LOG_LEVEL_INFO && strncmp(text, "[moe-cache] ", 12) == 0) {
         const char * message = text + 12;
         static std::atomic<bool> reported_swap{false};
-        const bool summary = strncmp(message, "device tables active:", 21) == 0 ||
+        const bool summary = strncmp(message, "whole swap initial:", 19) == 0 ||
+                             strncmp(message, "global profile same-session replan:", 35) == 0 ||
+                             strncmp(message, "device tables active:", 21) == 0 ||
                              strncmp(message, "device routes:", 14) == 0 ||
                              strncmp(message, "missjoin final:", 15) == 0;
         const bool swap = strncmp(message, "swap update:", 12) == 0 &&
