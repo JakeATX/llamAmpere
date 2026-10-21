@@ -962,6 +962,12 @@ void ggml_backend_cuda_context::release_scratch(bool preserve_blas) {
 }
 
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+    const char * verifyrw_stats = getenv("GGML_CUDA_VERIFYRW_STATS");
+    if (verifyrw_stats && atoi(verifyrw_stats) != 0) {
+        GGML_LOG_INFO("verifyrw CUDA dispatch: device=%d mmq_pair=%lld sj_compact=%lld sj_mask_kq=%lld mmf_split=%lld\n",
+            device, (long long) fusion_stats.mmq_pair, (long long) fusion_stats.sj_compact,
+            (long long) fusion_stats.sj_mask_kq, (long long) fusion_stats.mmf_split);
+    }
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
@@ -9952,6 +9958,15 @@ int64_t ggml_backend_cuda_fusion_count(ggml_backend_t backend, const char * name
     }
     if (strcmp(name, "mmq_pair") == 0) {
         return ctx->fusion_stats.mmq_pair;
+    }
+    if (strcmp(name, "sj_compact") == 0) {
+        return ctx->fusion_stats.sj_compact;
+    }
+    if (strcmp(name, "sj_mask_kq") == 0) {
+        return ctx->fusion_stats.sj_mask_kq;
+    }
+    if (strcmp(name, "mmf_split") == 0) {
+        return ctx->fusion_stats.mmf_split;
     }
     if (strcmp(name, "norm_pair_concat") == 0) {
         return ctx->fusion_stats.norm_pair_concat;

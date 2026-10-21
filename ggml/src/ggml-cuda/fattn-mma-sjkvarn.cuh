@@ -128,6 +128,9 @@ void ggml_cuda_flash_attn_ext_mma_sj_kvarn_case(ggml_backend_cuda_context & ctx,
         CUDA_CHECK(cudaMemcpyAsync(reference.get(), dst->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, ctx.stream()));
     }
 
+    if (mask_skip_mode != 0) {
+        ++ctx.fusion_stats.sj_mask_kq;
+    }
     // K/V stay in their ring storage format; only shared tiles are decoded. stream_k = true.
     launch_fattn<DV, ncols1, ncols2>
         (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa,

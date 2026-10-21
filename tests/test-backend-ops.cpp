@@ -6480,6 +6480,20 @@ struct test_mul_mat_mmf_split_k : public test_mul_mat {
 
     bool run_whole_graph() override { return true; }
     bool replay_inputs() override { return true; }
+    bool split_expected() const {
+        return (type_a == GGML_TYPE_BF16 || type_a == GGML_TYPE_F32) &&
+               n <= 8 && k_v == 0 && bs == std::array<int64_t, 2>{1, 1} &&
+               nr == std::array<int64_t, 2>{1, 1} &&
+               ((type_a == GGML_TYPE_BF16 && k == 10240) || (type_a == GGML_TYPE_F32 && k == 2560));
+    }
+    const char * required_fusion() override {
+        const char * mode = getenv("GGML_CUDA_MMF_SPLIT_K");
+        return split_expected() && mode && (strcmp(mode, "1") == 0 || strcmp(mode, "2") == 0) ? "mmf_split" : nullptr;
+    }
+    const char * forbidden_fusion() override {
+        // A padded source may use the original cuBLAS dispatch; keep it as numeric coverage.
+        return !split_expected() && k_v == 0 ? "mmf_split" : nullptr;
+    }
 };
 
 static void add_mmf_split_k_cases(std::vector<std::unique_ptr<test_case>> & cases, bool perf) {
@@ -10581,6 +10595,7 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
     const int mask_mode; // 1 = empty body partitions, 2 = sparse body tiles and query-dependent boundaries
     const int data_case; // nonzero cases are CUDA differential checks over exceptional Q/K/V data
     const int compact_bound;
+    unsigned init_epoch = 0; // changed device inputs at fixed captured pointers on replay
     static constexpr int64_t D = 256, G = 128;
     const int64_t cap;
     int64_t n_streams() const { return ns > 0 ? ns : 1; }
@@ -10618,6 +10633,15 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
     }
 
     bool run_whole_graph() override { return rot == 2 || data_case != 0; }
+    const char * required_fusion() override {
+        const char * compact = getenv("GGML_SJKVARN_COMPACT");
+        if (compact_bound != 0 && compact && (strcmp(compact, "1") == 0 || strcmp(compact, "2") == 0)) {
+            return "sj_compact";
+        }
+        const char * skip = getenv("GGML_SJKVARN_MMA_MASK_SKIP");
+        return mask_mode != 0 && compact_bound == 0 && skip &&
+               (strcmp(skip, "1") == 0 || strcmp(skip, "2") == 0) ? "sj_mask_kq" : nullptr;
+    }
 
     double err(const float * a, const float * b, size_t n) override {
         if (rot != 2) {
@@ -10746,7 +10770,10 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-        std::mt19937 rng(1234);
+        // The CPU comparison receives these same tensors. Change sparse support and paged
+        // descriptors along with Q/K/V across fixed-shape CUDA graph replays.
+        const unsigned epoch = mask_mode != 0 ? init_epoch++ : 0;
+        std::mt19937 rng(1234 + epoch);
         auto uni = [&](float lo, float hi) { return lo + (hi - lo) * (float) (rng() / 4294967296.0); };
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (t->view_src != nullptr) {
@@ -10772,7 +10799,7 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
                                 const int64_t body_pos = p - S;
                                 const int64_t within = body_pos % 512;
                                 const bool live = mask_mode == 2 && (body_pos < 4 ||
-                                    (within >= 32 + 4*j && within < 36 + 4*j) || p == B() - 1 - j);
+                                    (within >= 32 + 4*j + 16*(epoch%4) && within < 36 + 4*j + 16*(epoch%4)) || p == B() - 1 - j);
                                 value = live ? 0.0f : -INFINITY;
                                 if (compact_bound != 0 && live) {
                                     value = -0.25f*float((p + 3*j)%11);
@@ -10790,7 +10817,7 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
                 // pool records handed out in a scrambled order: stream s group g -> record perm[s*n_groups + g]
                 std::vector<int32_t> perm(n_rec_pool());
                 for (size_t i = 0; i < perm.size(); ++i) perm[i] = (int32_t) i;
-                std::shuffle(perm.begin(), perm.end(), std::mt19937(77));
+                std::shuffle(perm.begin(), perm.end(), std::mt19937(77 + epoch));
                 std::vector<int32_t> dd((size_t) desc_n()*n_streams(), 0);
                 for (int64_t s = 0; s < n_streams(); ++s) {
                     int32_t * d = dd.data() + s*desc_n();

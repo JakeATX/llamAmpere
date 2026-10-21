@@ -341,6 +341,7 @@ bool ggml_cuda_flash_attn_ext_sj_kvarn_compact(ggml_backend_cuda_context & ctx, 
         fattn_sj_compact_compare<<<1, 256, 0, ctx.stream()>>>(reference.ptr, (const float *) dst->data, int(ggml_nelements(dst)));
         CUDA_CHECK(cudaGetLastError());
     }
+    ++ctx.fusion_stats.sj_compact;
     return true;
 #endif
 }

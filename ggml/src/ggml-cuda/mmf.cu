@@ -215,6 +215,7 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
             mul_mat_f_split_warps_cols<nv_bfloat162>(ctx, (const nv_bfloat162 *) src0->data, src1_d, dst_d,
                 ne00/2, ne01, ncols_dst, s01/2, stride_col_y/2, stride_col_dst, split_mode == 2);
         }
+        ++ctx.fusion_stats.mmf_split;
         return;
     }
 
