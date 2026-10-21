@@ -5766,7 +5766,8 @@ static bool run_device_fused_missjoin(ggml_backend_t gpu, ggml_backend_t cpu, lo
             }
             ggml_backend_tensor_set(w, quantized.data(), 0, quantized.size());
         }
-        for (int tokens : (retain || grouped || large_copy) ? std::vector<int>{1, 3, 4, 5} : std::vector<int>{1, 3, 4}) {
+        for (int tokens : large_copy ? std::vector<int>{1, 3, 4, 5, 8} :
+                (retain || grouped) ? std::vector<int>{1, 3, 4, 5} : std::vector<int>{1, 3, 4}) {
             for (int channels : grouped ? std::vector<int>{1, 2, used} : std::vector<int>{1, 2}) {
                 ggml_init_params params = {8 * ggml_tensor_overhead(), nullptr, true};
                 ggml_context * input_ctx[] = {ggml_init(params), ggml_init(params)};
@@ -5793,7 +5794,14 @@ static bool run_device_fused_missjoin(ggml_backend_t gpu, ggml_backend_t cpu, lo
                 for (int phase = 0; phase < phases; ++phase) {
                     for (int t = 0; t < tokens; ++t) {
                         for (int rank = 0; rank < used; ++rank) {
-                            routing[phase][512 * t + rank] = patterns[(phase + t) % phases][rank];
+                            if (large_copy && (phase == 1 || phase == 2)) {
+                                // Up to 64 distinct routes: exercise many expert groups,
+                                // slot overflow, and several experts per small-grid CTA.
+                                const int e = (used * t + rank) % n_expert;
+                                routing[phase][512 * t + rank] = phase == 1 ? e : n_expert - 1 - e;
+                            } else {
+                                routing[phase][512 * t + rank] = patterns[(phase + t) % phases][rank];
+                            }
                         }
                     }
                     ggml_backend_tensor_set(storage[0], routing[phase].data(), 0, routing[phase].size() * sizeof(int32_t));
@@ -5935,7 +5943,7 @@ static bool run_device_fused_missjoin(ggml_backend_t gpu, ggml_backend_t cpu, lo
     set_env("GGML_MOE_MMV_GROUPED", nullptr);
     ok &= !retain || saw_retained_eviction;
     if (large_copy) {
-        printf("missjoin-copy: 24 shapes, 288 staged graph runs, dispatches=%llu staged_bytes=%llu: %s\n",
+        printf("missjoin-copy: 30 shapes, 360 staged graph runs, dispatches=%llu staged_bytes=%llu: %s\n",
                 totals[0], copied_bytes, ok ? "OK" : "FAIL");
     }
     printf("cache-device%s-missjoin%s%s%s%s: %s\n", fused ? "-fused" : "", overlap ? "-overlap" : "", mask_only ? "-mask" : "", retain ? "-retain" : "", grouped ? "-grouped" : "", ok ? "OK" : "FAIL");
