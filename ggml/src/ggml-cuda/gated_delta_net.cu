@@ -1,7 +1,6 @@
 #include "gated_delta_net.cuh"
 #include "ggml-cuda/common.cuh"
 #include "convert.cuh"
-#include "cp-async.cuh"
 #include "gated_delta_net_chunked_tc.cuh"
 
 #include <cstdlib>
