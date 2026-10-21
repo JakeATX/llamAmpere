@@ -5702,6 +5702,10 @@ static bool run_device_fused_missjoin(ggml_backend_t gpu, ggml_backend_t cpu, lo
         return false;
     }
     configure_cache(nullptr, "8");
+    if (large_copy || grouped) {
+        // Each weight bank needs at least 64 resident slots, even when only one expert is warm.
+        set_env("GGML_CUDA_MOE_CACHE_BUDGET_MB", large_copy ? "256" : "64");
+    }
     set_env("GGML_MOE_CACHE_DEVICE", "1");
     set_env("GGML_MOE_CACHE_DEVICE_CAPTURE", "1");
     set_env("GGML_MOE_CACHE_DEVICE_FUSED", fused ? "1" : nullptr);
