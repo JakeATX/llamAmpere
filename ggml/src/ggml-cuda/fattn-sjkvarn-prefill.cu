@@ -509,6 +509,16 @@ bool ggml_cuda_flash_attn_ext_sj_kvarn_prefill(ggml_backend_cuda_context & ctx, 
         if (plan.i8qk && ggml_cuda_fattn_i8qk_applies_f16kv(ggml_cuda_info().devices[ctx.device].cc, &out)) {
             // [I8SJ] int8 Q.K on the expanded f16 K (v1 K prep: mean smoothing + per-token scale), f16 V read in place
             ggml_cuda_flash_attn_ext_i8qk(ctx, &out, 0, heads, (char *) scratch_ptr + plan.i8qk_offset, (half *) v.data);
+        } else if (gqa > 8 && gqa <= 16 && ggml_cuda_fa_sparse_g16() != 0 && out.src[0]->ne[1] > 4 &&
+                ggml_cuda_info().devices[ctx.device].cc >= GGML_CUDA_CC_AMPERE &&
+                ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ggml_cuda_info().devices[ctx.device].cc, &out, ggml_cuda_fa_sparse_g16(), 16)) {
+            // [G16] all heads of 4 (or 2) queries share one sparse tile, K/V gathered once per KV head
+            ggml_cuda_fa_sparse_g16_note("sjkvarn_prefill", ggml_cuda_fa_sparse_g16());
+            if (ggml_cuda_fa_sparse_g16() == 4) {
+                ggml_cuda_flash_attn_ext_mma_f16_case<256, 256, 4, 16>(ctx, &out);
+            } else {
+                ggml_cuda_flash_attn_ext_mma_f16_case<256, 256, 2, 16>(ctx, &out);
+            }
         } else if (hq4 == 2) {
             ggml_cuda_flash_attn_ext_mma_f16_case<256, 256, 32, 2>(ctx, &out);
         } else if (hq4 == 1) {

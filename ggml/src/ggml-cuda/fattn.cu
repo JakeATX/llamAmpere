@@ -2463,10 +2463,12 @@ void ggml_cuda_flash_attn_ext_compact_mask(
     const dim3 block_dim(256, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params(blocks_num, block_dim, 0, stream);
     // the last group of queries is partial only if ncols1 does not divide n_queries
-    GGML_ASSERT(ncols1 == 1 || ncols1 == 8);
-    const auto kernel = ncols1 == 1       ? flash_attn_mask_to_sparse_indices<1, false> :
-                        n_queries % 8 != 0 ? flash_attn_mask_to_sparse_indices<8, true>  :
-                                             flash_attn_mask_to_sparse_indices<8, false>;
+    GGML_ASSERT(ncols1 == 1 || ncols1 == 2 || ncols1 == 4 || ncols1 == 8); // 2/4: [G16]
+    const bool oob = n_queries % ncols1 != 0;
+    const auto kernel = ncols1 == 1 ? flash_attn_mask_to_sparse_indices<1, false> :
+                        ncols1 == 2 ? (oob ? flash_attn_mask_to_sparse_indices<2, true> : flash_attn_mask_to_sparse_indices<2, false>) :
+                        ncols1 == 4 ? (oob ? flash_attn_mask_to_sparse_indices<4, true> : flash_attn_mask_to_sparse_indices<4, false>) :
+                                      (oob ? flash_attn_mask_to_sparse_indices<8, true> : flash_attn_mask_to_sparse_indices<8, false>);
     ggml_cuda_kernel_launch(kernel, launch_params,
         (const half *) mask->data, indices, counts, int(mask->ne[0]), n_queries, n_kv_max, s31, s33);
     CUDA_CHECK(cudaGetLastError());
@@ -2490,7 +2492,9 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
     const int32_t n_kv_max = ggml_get_op_params_i32(dst, 4);
 
     // the dense kernel handles up to 64/ncols2 queries per K/V pass, the single-query gather has to beat that
-    const int64_t n_gather = (ncols1 == 1 ? std::min<int64_t>(Q->ne[1], 64/ncols2) : ncols1) * (int64_t) n_kv_max;
+    // [G16] the (4,16)/(2,16) tiles replace the (8,8) tile for the same heads, keep its depth threshold
+    const int ncols1_gather = (ncols1 > 1 && ncols2 == 16 && K->ne[0] == 256) ? 8 : ncols1;
+    const int64_t n_gather = (ncols1_gather == 1 ? std::min<int64_t>(Q->ne[1], 64/ncols2) : ncols1_gather) * (int64_t) n_kv_max;
 
     return GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) &&
         mask != nullptr && n_kv_max > 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
@@ -2590,6 +2594,23 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
             }
         }
     }
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    // [G16] opt-in: sparse GQA 9..16 as (4,16)/(2,16) tiles instead of two (8,8) head groups
+    if constexpr (DKQ == 256 && DV == 256) {
+        const int g16 = ggml_cuda_fa_sparse_g16();
+        if (g16 != 0 && use_gqa_opt && gqa_ratio > 8 && gqa_ratio <= 16 && GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE &&
+                Q->ne[1] > 4 && ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst, g16, 16)) {
+            ggml_cuda_fa_sparse_g16_note("switch_ncols2", g16);
+            if (g16 == 4) {
+                ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 4, 16>(ctx, dst, preserve_cand);
+            } else {
+                ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 2, 16>(ctx, dst, preserve_cand);
+            }
+            return;
+        }
+    }
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
     // On Volta the GQA optimizations aren't as impactful vs. minimizing wasted compute:
     if (cc == GGML_CUDA_CC_VOLTA) {
