@@ -1045,14 +1045,18 @@ gdn_tc_carry_kernel(
     }
 
     if constexpr (!keep_rs_t) {
+        // Final-only writes use the selected cache row just like retained snapshots.
+        const int64_t final_out_e = slot_rows == nullptr ? state_out_e
+            : (int64_t) slot_rows[sequence] * (H * GDNA_S_V * GDNA_S_V)
+                + h_idx * (GDNA_S_V * GDNA_S_V);
 #pragma unroll
         for (int kd = 0; kd < 8; ++kd) {
             const int d0 = kd * 16 + g_lane;
             const int d1 = d0 + 8;
-            gdn_store_state<state_t, WARP_SIZE>(state, state_out_e + (col0 + 0) * GDNA_S_V + d0, s_frag[kd].x[0]);
-            gdn_store_state<state_t, WARP_SIZE>(state, state_out_e + (col0 + 1) * GDNA_S_V + d0, s_frag[kd].x[1]);
-            gdn_store_state<state_t, WARP_SIZE>(state, state_out_e + (col0 + 0) * GDNA_S_V + d1, s_frag[kd].x[2]);
-            gdn_store_state<state_t, WARP_SIZE>(state, state_out_e + (col0 + 1) * GDNA_S_V + d1, s_frag[kd].x[3]);
+            gdn_store_state<state_t, WARP_SIZE>(state, final_out_e + (col0 + 0) * GDNA_S_V + d0, s_frag[kd].x[0]);
+            gdn_store_state<state_t, WARP_SIZE>(state, final_out_e + (col0 + 1) * GDNA_S_V + d0, s_frag[kd].x[1]);
+            gdn_store_state<state_t, WARP_SIZE>(state, final_out_e + (col0 + 0) * GDNA_S_V + d1, s_frag[kd].x[2]);
+            gdn_store_state<state_t, WARP_SIZE>(state, final_out_e + (col0 + 1) * GDNA_S_V + d1, s_frag[kd].x[3]);
         }
     }
 #else
