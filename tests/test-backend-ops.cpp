@@ -10580,6 +10580,7 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
     const int ns;
     const int mask_mode; // 1 = empty body partitions, 2 = sparse body tiles and query-dependent boundaries
     const int data_case; // nonzero cases are CUDA differential checks over exceptional Q/K/V data
+    const int compact_bound;
     static constexpr int64_t D = 256, G = 128;
     const int64_t cap;
     int64_t n_streams() const { return ns > 0 ? ns : 1; }
@@ -10609,6 +10610,9 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
         }
         if (data_case != 0) {
             result += ",data_case=" + std::to_string(data_case);
+        }
+        if (compact_bound != 0) {
+            result += ",compact_bound=" + std::to_string(compact_bound);
         }
         return result;
     }
@@ -10643,14 +10647,15 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
         return rot == 2 ? 0.0 : 5e-4;
     }
 
-    test_flash_attn_ext_sj_kvarn(int64_t n_q = 1, int64_t nh = 16, int64_t hkv = 2, int64_t n_groups = 3, int64_t n_ring = 300, bool row_mask = false, bool attn_options = false, ggml_type staging_type = GGML_TYPE_F16, int64_t S = 128, bool f16_sink = false, ggml_type body_type = GGML_TYPE_F32, int bits_k = 4, int bits_v = 4, int rot = 0, int ns = 0, int mask_mode = 0, int data_case = 0)
-        : n_q(n_q), nh(nh), hkv(hkv), n_groups(n_groups), n_ring(n_ring), row_mask(row_mask), attn_options(attn_options), staging_type(staging_type), body_type(body_type), bits_k(bits_k), bits_v(bits_v), S(S), f16_sink(f16_sink), rot(rot), ns(ns), mask_mode(mask_mode), data_case(data_case),
+    test_flash_attn_ext_sj_kvarn(int64_t n_q = 1, int64_t nh = 16, int64_t hkv = 2, int64_t n_groups = 3, int64_t n_ring = 300, bool row_mask = false, bool attn_options = false, ggml_type staging_type = GGML_TYPE_F16, int64_t S = 128, bool f16_sink = false, ggml_type body_type = GGML_TYPE_F32, int bits_k = 4, int bits_v = 4, int rot = 0, int ns = 0, int mask_mode = 0, int data_case = 0, int compact_bound = 0)
+        : n_q(n_q), nh(nh), hkv(hkv), n_groups(n_groups), n_ring(n_ring), row_mask(row_mask), attn_options(attn_options), staging_type(staging_type), body_type(body_type), bits_k(bits_k), bits_v(bits_v), S(S), f16_sink(f16_sink), rot(rot), ns(ns), mask_mode(mask_mode), data_case(data_case), compact_bound(compact_bound),
           cap(std::max<int64_t>(1280, ((n_ring + G - 1)/G)*G)) {
         GGML_ASSERT(n_ring <= cap && n_ring - 37*(n_streams() - 1) >= n_q);
         GGML_ASSERT(ns == 0 || rot == 0);
         GGML_ASSERT(mask_mode >= 0 && mask_mode <= 2);
         GGML_ASSERT(data_case >= 0 && data_case <= 15);
         GGML_ASSERT(data_case == 0 || (hkv == 2 && ns == 0 && rot == 0 && mask_mode == 2));
+        GGML_ASSERT(compact_bound >= 0);
     }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
@@ -10699,6 +10704,7 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
             ggml_tensor * o = ggml_flash_attn_ext(ctx, qq, k, v, m, 1.0f/sqrtf((float) D), 0.0f, attn_options ? 2.0f : 0.0f);
             ggml_flash_attn_ext_add_sinks(o, sinks);
             ggml_flash_attn_ext_set_sj_kvarn(o, body, desc, bits_k, bits_v, (int32_t) n_kv_pad());
+            ggml_flash_attn_ext_set_n_kv_max(o, compact_bound);
             ggml_prec_set_acc(o, GGML_PREC_F32);
             return o;
         };
@@ -10714,6 +10720,7 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
                 ggml_tensor * o = ggml_flash_attn_ext(ctx, qs, ks, vs, ms, 1.0f/sqrtf((float) D), 0.0f, attn_options ? 2.0f : 0.0f);
                 ggml_flash_attn_ext_add_sinks(o, sinks);
                 ggml_flash_attn_ext_set_sj_kvarn(o, body, ds, bits_k, bits_v, (int32_t) n_kv_pad());
+                ggml_flash_attn_ext_set_n_kv_max(o, compact_bound);
                 ggml_prec_set_acc(o, GGML_PREC_F32);
                 out = out ? ggml_concat(ctx, out, o, 3) : o;
             }
@@ -10767,6 +10774,9 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
                                 const bool live = mask_mode == 2 && (body_pos < 4 ||
                                     (within >= 32 + 4*j && within < 36 + 4*j) || p == B() - 1 - j);
                                 value = live ? 0.0f : -INFINITY;
+                                if (compact_bound != 0 && live) {
+                                    value = -0.25f*float((p + 3*j)%11);
+                                }
                             }
                             if (data_case == 8 && j == 0 && p == S + 95) {
                                 value = std::numeric_limits<float>::quiet_NaN();
@@ -15679,6 +15689,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 3, 4096, true, false, GGML_TYPE_TQ6_0, 128, true));
     }
     test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(257, 24, 3, 60, 300, true, true, GGML_TYPE_TQ6_0, 128, true));
+    // fork: compact main-model attention, with a wrapped ring, sparse union, finite mask bias and padded tail.
+    for (int64_t n_q : {1, 4, 5}) {
+        for (int mask_mode : {1, 2}) {
+            test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 2, 69, 257, false, false,
+                GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_F32, 4, 4, 0, 0, mask_mode, 0, 512));
+        }
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(4, 24, 2, 69, 257, false, true,
+        GGML_TYPE_Q8_0, 128, true, GGML_TYPE_F32, 4, 4, 0, 1, 2, 0, 512));
+    test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(5, 24, 2, 69, 257, false, false,
+        GGML_TYPE_F16, 128, true, GGML_TYPE_F32, 4, 4, 1, 0, 2, 0, 512));
     // [KVRP] tq6 ring at 1024/4096/8192 rows with the f16 sink: the cp.async-pipelined exact strips
     for (int64_t n_ring : {1024, 4096, 8192}) {
         for (int64_t n_q : {1, 4, 5, 8}) {
