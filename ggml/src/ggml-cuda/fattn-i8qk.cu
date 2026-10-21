@@ -22,6 +22,33 @@ bool ggml_cuda_fattn_i8qk_enabled() {
     return v;
 }
 
+// [SPQ] a sparse-attention (QSA) prompt at long context: op param 4 carries the per-query selected-cell count, and once
+// the f16 MMA route would gather only the selected cells (fattn.cu shall_use_sparse, the (256, 256, 8, 8) case the SJ-KVaRN
+// prefill launches for GQA > 4) the int8-QK kernel, which skips only fully masked 128x64 tiles, does several times more
+// work. GGML_CUDA_FA_SPARSE_FIRST=1 lets the gather take those calls (shorter contexts and dense models keep int8 QK).
+bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_tensor * dst, const int ncols1, const int ncols2);
+
+static bool ggml_cuda_fattn_i8qk_sparse_first() {
+    static const bool v = [] {
+        const char * e = getenv("GGML_CUDA_FA_SPARSE_FIRST");
+        return e != nullptr && e[0] == '1' && e[1] == '\0';
+    }();
+    return v;
+}
+
+static bool ggml_cuda_fattn_i8qk_yields_to_sparse(int cc, const ggml_tensor * dst) {
+    if (!ggml_cuda_fattn_i8qk_sparse_first() || ggml_get_op_params_i32(dst, 4) <= 0) {
+        return false;
+    }
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    if (Q->ne[0] != 256 || V->ne[0] != 256 || K->ne[2] < 1 || Q->ne[2] % K->ne[2] != 0 || Q->ne[2]/K->ne[2] <= 4) {
+        return false;
+    }
+    return ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst, 8, 8);
+}
+
 static int ggml_cuda_fattn_i8qk_min_q() {
     static const int v = [] {
         const char * e = getenv("GGML_CUDA_FA_I8QK_MIN_Q");
@@ -117,7 +144,7 @@ static bool i8qk_kv_type_ok(const ggml_tensor * t, const bool f16_ok = false) {
 }
 
 static bool i8qk_applies_impl(int cc, const ggml_tensor * dst, const bool f16_kv) {
-    if (!ggml_cuda_fattn_i8qk_enabled()) {
+    if (!ggml_cuda_fattn_i8qk_enabled() || ggml_cuda_fattn_i8qk_yields_to_sparse(cc, dst)) {
         return false;
     }
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
@@ -194,7 +221,8 @@ bool ggml_cuda_fattn_i8qk_applies_f16kv(int cc, const ggml_tensor * dst) {
 }
 
 bool ggml_cuda_fattn_i8qk_sj_kvarn_wanted(int cc, const ggml_tensor * dst) {
-    if (!ggml_cuda_fattn_i8qk_enabled() || !GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_AMPERE) {
+    if (!ggml_cuda_fattn_i8qk_enabled() || !GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_AMPERE ||
+            ggml_cuda_fattn_i8qk_yields_to_sparse(cc, dst)) {
         return false;
     }
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
