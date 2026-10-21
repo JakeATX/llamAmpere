@@ -1025,6 +1025,9 @@ bool common_sampler_greedy_backend_ready(const struct common_sampler * gsmpl) {
 }
 
 bool common_sampler_supports_backend_verify(const common_params_sampling & params) {
+    if (params.spec_lossy) {
+        return false; // [LA3] beat needs the target probabilities and residual draw on the CPU (from 1559f5410)
+    }
     if (params.temp <= 0.0f) {
         return false; // greedy chains use common_sampler_get_greedy_backend
     }
