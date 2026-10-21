@@ -1585,8 +1585,7 @@ static __global__ void mul_mat_vec_q_moe(
         const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
         const uint32_t ncols_dst, const uint32_t ids_stride,
         const float up_min, const float up_max, const float gate_min, const float gate_max,
-        const void * const * expert_table, const void * const * gate_table, const bool rank_major,
-        const uint32_t dedup_nch) {
+        const void * const * expert_table, const void * const * gate_table, const bool rank_major) {
     // [VFLOOR] rank_major (GGML_MOE_MMV_RANK_MAJOR=1): the grid is (ranks, row blocks) instead of (row blocks, ranks),
     // so the blocks of every rank for one row block run together and tokens that share an expert read its rows from L2.
     // Every output keeps the same arithmetic (bit-identical); only the block order changes.
@@ -1642,48 +1641,13 @@ static __global__ void mul_mat_vec_q_moe(
     const int      blocks_per_row_x = ncols_x / qk;
     constexpr int  blocks_per_iter  = vdr * warp_size / qi;
 
-    uint32_t channel_dst = shared_expert ? 0 : blk_rank;
+    const uint32_t channel_dst = shared_expert ? 0 : blk_rank;
 
     if (token_idx >= ncols_dst) {
         return;
     }
 
     ggml_cuda_pdl_sync();
-    // [VBEAT] dedup schedule (GGML_MOE_MMV_DEDUP=1): grid.y has one block per (token, rank) pair, pair p = t*dedup_nch + k.
-    // Only the first pair that selects an expert keeps its block; that block's warps then take every later pair of the same
-    // expert (warp t takes token t's matching ranks), so all tokens that share an expert run in one block and its weight
-    // rows are fetched from DRAM once. Each (token, rank) output is computed by one warp with exactly the plain kernel's
-    // arithmetic below (same lanes, same order), so results are bit-identical; only which block runs it changes.
-    uint32_t dedup_mask = 0;
-    if (dedup_nch != 0 && !shared_expert) {
-        const uint32_t t0 = blk_rank / dedup_nch;
-        const uint32_t k0 = blk_rank - t0*dedup_nch;
-        const int32_t  e  = ids[k0 + t0*ids_stride];
-        const bool hit = threadIdx.x < dedup_nch && ids[threadIdx.x + token_idx*ids_stride] == e;
-        uint32_t m = __ballot_sync(0xFFFFFFFF, hit);
-        const uint32_t before = token_idx < t0 ? m : token_idx == t0 ? (m & ((1u << k0) - 1u)) : 0u;
-        if (__syncthreads_or(threadIdx.x == 0 && before != 0)) {
-            ggml_cuda_pdl_lc();
-            return; // an earlier pair owns this expert
-        }
-        if (token_idx < t0) {
-            ggml_cuda_pdl_lc();
-            return;
-        }
-        if (token_idx == t0) {
-            m &= ~((1u << k0) - 1u);
-        }
-        if (m == 0) {
-            ggml_cuda_pdl_lc();
-            return;
-        }
-        dedup_mask = m;
-    }
-    do {
-    if (dedup_mask != 0) {
-        channel_dst = __ffs(dedup_mask) - 1;
-        dedup_mask &= dedup_mask - 1;
-    }
     const uint32_t channel_x = shared_expert ? 0 : ids[channel_dst + token_idx * ids_stride];
     // the fork MoE slot cache keeps the gate weights in a separate pool with their own slot ids;
     // upstream fusion keeps the gate in the same expert layout, so fall back to channel_x there.
@@ -1799,7 +1763,6 @@ static __global__ void mul_mat_vec_q_moe(
     } else if constexpr (type != GGML_TYPE_NVFP4) {
         GGML_UNUSED_VARS(x_scale, gate_scale);
     }
-    } while (dedup_mask != 0);
 }
 
 template<ggml_type type>
@@ -1961,37 +1924,20 @@ static void mul_mat_vec_q_moe_launch(
         const float up_min, const float up_max, const float gate_min,
         const float gate_max, cudaStream_t stream, const void * const * expert_table = nullptr, const void * const * gate_table = nullptr) {
 
-    // [VBEAT] GGML_MOE_MMV_ROWS=2|4|8 (default 2): weight rows per warp. Every row keeps its own lanes and sum order,
-    // so the result is bit-identical; more rows give each warp more independent loads in flight.
-    static const int rows_env = [] { const char * e = getenv("GGML_MOE_MMV_ROWS"); const int r = e ? atoi(e) : 2; return r == 4 || r == 8 ? r : 2; }();
-    const int rows_per_block = rows_env;
+    constexpr int rows_per_block = 2; // 2 gives best perf based on tuning
     const int64_t nblocks_rows = (nrows_x + rows_per_block - 1) / rows_per_block;
     static const bool rank_major_env = [] { const char * e = getenv("GGML_MOE_MMV_RANK_MAJOR"); return e && atoi(e) != 0; }();
-    // [VBEAT] GGML_MOE_MMV_DEDUP=1: one block per distinct expert (see the kernel); bit-identical schedule change.
-    static const bool dedup_env = [] { const char * e = getenv("GGML_MOE_MMV_DEDUP"); return e && atoi(e) != 0; }();
-    const bool dedup = dedup_env && ids != nullptr && ncols_dst >= 2 && nchannels_dst >= 1 && nchannels_dst <= 32 &&
-                       (int64_t) nchannels_dst * ncols_dst <= 65535;
-    const int64_t nranks = (dedup ? (int64_t) nchannels_dst * ncols_dst : nchannels_dst) + (fusion.shared_up != nullptr);
+    const int64_t nranks = nchannels_dst + (fusion.shared_up != nullptr);
     const bool rank_major = rank_major_env && nblocks_rows <= 65535;
     const dim3 block_nums = rank_major ? dim3(nranks, nblocks_rows) : dim3(nblocks_rows, nranks);
     const dim3 block_dims(warp_size, ncols_dst);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
 
-#define MOE_MMV_ROWS_LAUNCH(R) \
-    ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, R, has_fusion, has_clamp>, launch_params, \
-        vx, vy, ids, act_ids, gate_ids, fusion, dst, ncols_x, nchannels_y, nrows_x, \
-        stride_row_x, stride_col_y, stride_col_dst, \
-        stride_channel_x, stride_channel_y, stride_channel_dst, \
-        ncols_dst, ids_stride, up_min, up_max, gate_min, gate_max, expert_table, gate_table, rank_major, \
-        dedup ? (uint32_t) nchannels_dst : 0u)
-    if (rows_per_block == 8) {
-        MOE_MMV_ROWS_LAUNCH(8);
-    } else if (rows_per_block == 4) {
-        MOE_MMV_ROWS_LAUNCH(4);
-    } else {
-        MOE_MMV_ROWS_LAUNCH(2);
-    }
-#undef MOE_MMV_ROWS_LAUNCH
+    ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, has_fusion, has_clamp>, launch_params,
+        vx, vy, ids, act_ids, gate_ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
+        stride_row_x, stride_col_y, stride_col_dst,
+        stride_channel_x, stride_channel_y, stride_channel_dst,
+        ncols_dst, ids_stride, up_min, up_max, gate_min, gate_max, expert_table, gate_table, rank_major);
 }
 
 // Indexed vocabulary rows share one activation vector and never read padded rows.
