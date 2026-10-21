@@ -1629,10 +1629,14 @@ struct test_case {
         if (fused_nodes_to_verify.size() == 0 && run_whole_graph()) {
             fused_nodes_to_verify.push_back(out);
         }
+        const bool pair_replay = op_desc(out) == "MMQ_PAIR";
         const bool replay = replay_inputs() ||
-            (out->op == GGML_OP_FLASH_ATTN_EXT && getenv("GGML_TEST_BACKEND_REPLAY") != nullptr);
+            ((out->op == GGML_OP_FLASH_ATTN_EXT || pair_replay) &&
+             getenv("GGML_TEST_BACKEND_REPLAY") != nullptr);
         if (replay) {
-            fused_nodes_to_verify = {out};
+            if (!pair_replay) {
+                fused_nodes_to_verify = {out};
+            }
             fused_nodes_to_verify.insert(fused_nodes_to_verify.end(), sentinels.begin(), sentinels.end());
         }
 
@@ -9231,6 +9235,71 @@ struct test_mul_mat_shared_src1 : public test_case {
     }
 };
 
+// Prompt preparation reuse. Mode 2 additionally compares each product bit for
+// bit with an independent invocation of the original CUDA MMQ implementation.
+struct test_mmq_pair : public test_case {
+    const ggml_type type_a;
+    const ggml_type type_b;
+    const int64_t n;
+    const int n_used; // zero = dense MUL_MAT
+    const bool broadcast;
+    const int guard;  // 1: different layout, 2: different activation, 3: different IDs
+    ggml_tensor * first = nullptr;
+    ggml_tensor * second = nullptr;
+    ggml_tensor * result = nullptr;
+
+    test_mmq_pair(ggml_type type_a, ggml_type type_b, int64_t n, int n_used = 0,
+                  bool broadcast = true, int guard = 0)
+        : type_a(type_a), type_b(type_b), n(n), n_used(n_used), broadcast(broadcast), guard(guard) {}
+
+    std::string vars() override { return VARS_TO_STR6(type_a, type_b, n, n_used, broadcast, guard); }
+    std::string op_desc(ggml_tensor *) override { return "MMQ_PAIR"; }
+    double max_nmse_err() override { return 5e-4; }
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return {first, second, result}; }
+    static bool pair_on() {
+        const char * e = getenv("GGML_CUDA_MMQ_PAIR");
+        return e && (strcmp(e, "1") == 0 || strcmp(e, "2") == 0);
+    }
+    const char * required_fusion() override { return pair_on() && n >= 128 && guard == 0 ? "mmq_pair" : nullptr; }
+    const char * forbidden_fusion() override { return n < 128 || guard != 0 ? "mmq_pair" : nullptr; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        constexpr int64_t k = 256;
+        constexpr int64_t m = 128;
+        constexpr int n_mats = 16;
+        ggml_tensor * a = ggml_new_tensor_3d(ctx, type_a, k, m, n_used ? n_mats : 1);
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, type_b, k, m, n_used ? n_mats : 1);
+        ggml_tensor * input = n_used ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, broadcast ? 1 : n_used, n) :
+                                      ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_tensor * input_b = guard == 2 ? ggml_dup_tensor(ctx, input) : input;
+        ggml_set_name(a, "pair_gate");
+        ggml_set_name(b, "pair_up");
+        ggml_set_name(input, "pair_input");
+        if (n_used) {
+            ggml_tensor * all_ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+            ggml_tensor * ids = ggml_view_2d(ctx, all_ids, n_used, n, all_ids->nb[1], 0);
+            ggml_tensor * ids_b = ids;
+            if (guard == 3) {
+                ggml_tensor * all_ids_b = ggml_dup_tensor(ctx, all_ids);
+                ids_b = ggml_view_2d(ctx, all_ids_b, n_used, n, all_ids_b->nb[1], 0);
+            }
+            first = ggml_mul_mat_id(ctx, a, input, ids);
+            second = ggml_mul_mat_id(ctx, b, input_b, ids_b);
+        } else {
+            first = ggml_mul_mat(ctx, a, input);
+            second = ggml_mul_mat(ctx, b, input_b);
+        }
+        result = ggml_add(ctx, first, second);
+        ggml_set_name(first, "pair_first");
+        ggml_set_name(second, "pair_second");
+        ggml_set_name(result, "out");
+        return result;
+    }
+    void initialize_tensors(ggml_context * ctx) override { init_mul_mat_id_tensors(ctx, 16); }
+    void reinit_perf_iter(ggml_context * ctx) override { init_mul_mat_id_ids(ctx, 16); }
+};
+
 // [#46] Pre-norm residual block: s = a + b, y = rms_norm(s) * gamma, then two quantized matvecs on y (weight types
 // type1, type2) and the residual s. With GGML_CUDA_ADD_RMS_Q8=1 the CUDA backend runs ADD + RMS_NORM + MUL as one
 // kernel that also prefills the q8_1 cache for the first matvec; a wrong prefill layout breaks the matvec result.
@@ -12609,6 +12678,23 @@ static const ggml_type other_types[] = {
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    // MMQ_PAIR: native IQ expert formats, dense/ID, broadcast/nonbroadcast,
+    // mixed compatible formats, partial column tile, parallel-ID threshold,
+    // and explicit fallback guards. CUDA mode 2 proves exactness separately
+    // from the usual CPU-reference numerical comparison.
+    for (ggml_type type : {GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S,
+                          GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S}) {
+        test_cases.emplace_back(new test_mmq_pair(type, type, 128, 10));
+    }
+    for (int n_used : {0, 2, 10}) {
+        test_cases.emplace_back(new test_mmq_pair(GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS, 129, n_used));
+        test_cases.emplace_back(new test_mmq_pair(GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, 128, n_used, false));
+    }
+    test_cases.emplace_back(new test_mmq_pair(GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_S, 512, 10));
+    test_cases.emplace_back(new test_mmq_pair(GGML_TYPE_Q4_K, GGML_TYPE_IQ3_S, 128, 10, true, 1));
+    test_cases.emplace_back(new test_mmq_pair(GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_S, 128, 10, true, 2));
+    test_cases.emplace_back(new test_mmq_pair(GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_S, 128, 10, true, 3));
+    test_cases.emplace_back(new test_mmq_pair(GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_S, 127, 10));
     add_iq4xs_k4_cases(test_cases, false);
     add_mmf_split_k_cases(test_cases, false);
     add_iq4xs_wide_cases(test_cases);

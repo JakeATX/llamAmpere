@@ -7142,6 +7142,72 @@ static bool ggml_cuda_fusion_disabled() {
     return disable_fusion;
 }
 
+// Reuse only prompt MMQ preparation. Both products remain graph outputs and
+// retain their original MMQ dispatch, reduction partition, and write-back.
+static bool ggml_cuda_try_mmq_pair(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
+    if (!ggml_cuda_mmq_pair_enabled() || i + 1 >= cgraph->n_nodes ||
+            !ctx.stream_context().concurrent_events.empty()) {
+        return false;
+    }
+    ggml_tensor * a = cgraph->nodes[i];
+    ggml_tensor * b = cgraph->nodes[i + 1];
+    if ((a->op != GGML_OP_MUL_MAT && a->op != GGML_OP_MUL_MAT_ID) || b->op != a->op ||
+            a->src[1] != b->src[1] || a->src[2] != b->src[2] ||
+            ggml_cuda_moe_cache_device_supports(b, ctx.device)) {
+        return false;
+    }
+    const bool with_ids = a->op == GGML_OP_MUL_MAT_ID;
+    const int64_t tokens = a->src[1]->ne[with_ids ? 2 : 1];
+    if (tokens < 128) {
+        return false;
+    }
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
+    const auto local = [&](const ggml_tensor * t) {
+        return t && t->buffer && ggml_backend_buffer_is_cuda(t->buffer) &&
+            static_cast<ggml_backend_cuda_buffer_context *>(t->buffer->context)->device == ctx.device;
+    };
+    const auto overlaps = [](const ggml_tensor * x, const ggml_tensor * y) {
+        const uintptr_t xp = reinterpret_cast<uintptr_t>(x->data);
+        const uintptr_t yp = reinterpret_cast<uintptr_t>(y->data);
+        return xp < yp + ggml_nbytes(y) && yp < xp + ggml_nbytes(x);
+    };
+    for (ggml_tensor * dst : {a, b}) {
+        if (!local(dst) || !local(dst->src[0]) || !local(dst->src[1]) || (with_ids && !local(dst->src[2]))) {
+            return false;
+        }
+        const ggml_tensor * w = dst->src[0];
+        // Moving a temporary weight's padding clear before the shared prepare
+        // could touch another live tensor. Leave that case on its original path.
+        if (ggml_backend_buffer_get_usage(w->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+                ggml_nbytes(w) != ggml_backend_buffer_get_alloc_size(w->buffer, w)) {
+            return false;
+        }
+        if (!with_ids) {
+            if (ggml_get_op_params_i32(dst, 1) == GGML_HINT_SRC0_IS_HADAMARD ||
+                    ggml_cuda_mul_mat_route(w, dst->src[1], dst, cc, warp_size) != GGML_CUDA_MM_ROUTE_MMQ) {
+                return false;
+            }
+        } else if (!ggml_cuda_should_use_mmq(w->type, cc, tokens, w->ne[2])) {
+            return false;
+        }
+        // Include leaf inputs, which the generic fusion range check omits.
+        for (const ggml_tensor * product : {a, b}) {
+            for (int s = 0; s < (with_ids ? 3 : 2); ++s) {
+                if (overlaps(dst, product->src[s])) {
+                    return false;
+                }
+            }
+        }
+    }
+    const int outputs[] = {i, i + 1};
+    if (overlaps(a, b) || !ggml_can_fuse_subgraph(cgraph, i, {a->op, a->op}, {i, i + 1}) ||
+            !ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, outputs, 2)) {
+        return false;
+    }
+    return ggml_cuda_mul_mat_q_pair(ctx, a, b);
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     if (ggml_cuda_fusion_disabled()) {
@@ -7164,6 +7230,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             }
         }
         return 0;
+    }
+
+    if (ggml_cuda_try_mmq_pair(*cuda_ctx, cgraph, i)) {
+        return 1;
     }
 
     // [HCPN] ahead of the other RMS_NORM fusions: HC_PRE_XN supersedes NORM_CAST at the norms it applies to
@@ -9879,6 +9949,9 @@ int64_t ggml_backend_cuda_fusion_count(ggml_backend_t backend, const char * name
     }
     if (strcmp(name, "mul_mat_glu") == 0) {
         return ctx->fusion_stats.mul_mat_glu;
+    }
+    if (strcmp(name, "mmq_pair") == 0) {
+        return ggml_cuda_mmq_pair_count(ctx->device);
     }
     if (strcmp(name, "norm_pair_concat") == 0) {
         return ctx->fusion_stats.norm_pair_concat;
