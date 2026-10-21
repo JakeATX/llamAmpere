@@ -37,6 +37,10 @@ struct common_sampler;
 // llama_sampler API overloads
 
 // note: can mutate params in some cases
+// [DRAFTFAST] the top k of n logits as {id, logit, 0}, in exactly the order llama_sampler_top_k leaves them for
+// k <= 128 (std::partial_sort over the full array, equal logits included), without building the n-entry array.
+void common_sampler_topk_exact(const float * logits, int32_t n, int32_t k, std::vector<llama_token_data> & out);
+
 struct common_sampler * common_sampler_init(
         const struct llama_model * model,
         struct common_params_sampling & params);

@@ -29,11 +29,18 @@
 //     mul_mat(head, x) on the backend gathered at the selected ids. Bound = the (c) bound of the compact type widened
 //     to at least rel 2e-2 / NMSE 2e-4 for the reference's own activation quantization (measured for the byte-exact
 //     f32 compact rows on the 3090 Ti box: rel 5.0e-3..8.3e-3, NMSE 2.5e-5..4.9e-5, CPU and CUDA, T = 1..8).
+// (e) an AI+ head (AI6_S, the AI+ output head type; random span bytes = a valid AI+ tensor, as test-backend-ops
+//     init_tensor_ai4_random builds them): (d) with the rows of ggml_ai4_dequantize_slab (whole-slab decode, original
+//     basis) as the reference, then (c) and (c2). On CUDA (c2) is the independent check: the full-head mul_mat runs
+//     the rate-6 IMMA kernel on the ROTATED weights with H256-rotated int8 activations, so a compact head built in the
+//     wrong basis, or a wrong slab/row order, misses it. Its bound is widened to rel 3e-2 / NMSE 5e-4 (the
+//     test-backend-ops MUL_MAT bound) for the kernel's per-256 int8 activations.
 // Every measured value is printed; the process exits 1 on any bound miss.
 
 #include "../src/llama-draft-vocab-compact.h"
 
 #include "ggml.h"
+#include "ggml-ai4-decode.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 
@@ -156,6 +163,37 @@ static head_case make_plain(ggml_type type, int64_t K, int64_t N, int64_t n_sel,
     return h;
 }
 
+static head_case make_ai(ggml_type type, int64_t K, int64_t N, int64_t n_sel, uint32_t seed) {
+    head_case h;
+    h.type = type;
+    h.name = std::string("ai_") + ggml_type_name(type);
+    h.K = K; h.N = N;
+    GGML_ASSERT(ggml_ai4_is_span(type) && K % 1024 == 0 && N % 16 == 0);
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<float> ud(0.002f, 0.02f);
+    h.data.resize(ggml_row_size(type, K) * N);
+    const size_t span = 32 + 2048 * (size_t) ggml_ai4_rate(type);   // [fp16 d[16]][128 tiles of 16k bytes]
+    GGML_ASSERT(h.data.size() % span == 0 && ggml_ai4_slab_nbytes(type, K) == span * (size_t) (K / 1024));
+    for (size_t b = 0; b < h.data.size(); b += span) {
+        ggml_fp16_t * d = (ggml_fp16_t *) (h.data.data() + b);
+        for (int r = 0; r < 16; ++r) d[r] = ggml_fp32_to_fp16(ud(rng));
+        for (size_t i = 32; i < span; i += 4) {
+            const uint32_t u = (uint32_t) rng();
+            memcpy(h.data.data() + b + i, &u, 4);
+        }
+    }
+    h.ids = make_ids(N, n_sel, rng);
+    std::vector<float> W((size_t) N * K);
+    for (int64_t g = 0; g < N / 16; ++g) {
+        GGML_ASSERT(ggml_ai4_dequantize_slab(type, h.data.data(), K, g, W.data() + (size_t) g * 16 * K));
+    }
+    h.ref.resize((size_t) n_sel * K);
+    for (int64_t i = 0; i < n_sel; ++i) {
+        memcpy(h.ref.data() + (size_t) i * K, W.data() + (size_t) h.ids[i] * K, (size_t) K * sizeof(float));
+    }
+    return h;
+}
+
 static std::vector<uint8_t> build(const head_case & h, ggml_type qt) {
     llama_draft_compact_src src;
     src.data = h.data.data();
@@ -207,6 +245,13 @@ static double logit_nmse_bound(ggml_type t) {
 // (c2) plain heads vs the backend's full-head mul_mat, whose x is quantized (q8_K CPU / q8_1 CUDA)
 static double backend_rel_bound(ggml_type t)  { return std::max(logit_rel_bound(t),  2e-2); }
 static double backend_nmse_bound(ggml_type t) { return std::max(logit_nmse_bound(t), 2e-4); }
+// (e) AI+ heads: the backend full-head path quantizes x to int8 per 256 K after the H256 rotation (CUDA IMMA kernels)
+static double backend_rel_bound_h(ggml_type head, ggml_type t)  {
+    return ggml_ai4_rate(head) ? std::max(logit_rel_bound(t), 3e-2) : backend_rel_bound(t);
+}
+static double backend_nmse_bound_h(ggml_type head, ggml_type t) {
+    return ggml_ai4_rate(head) ? std::max(logit_nmse_bound(t), 5e-4) : backend_nmse_bound(t);
+}
 
 // (c)/(d) logits on one backend: every compact type (+ the negative control for EXL3) at widths 1..8
 static void run_logits(ggml_backend_t be, const head_case & h,
@@ -313,11 +358,11 @@ static void run_logits(ggml_backend_t be, const head_case & h,
             check(ok, "logits bound");
             if (!exl3) {
                 const err e2 = compare(yv.data(), ysel.data(), yv.size());
-                const bool ok2 = e2.rel_max <= backend_rel_bound(qt) && e2.nmse <= backend_nmse_bound(qt) &&
-                        std::isfinite(e2.nmse);
+                const double rb = backend_rel_bound_h(h.type, qt), nb = backend_nmse_bound_h(h.type, qt);
+                const bool ok2 = e2.rel_max <= rb && e2.nmse <= nb && std::isfinite(e2.nmse);
                 printf("  (c2) %-6s %-10s T=%lld %-7s rel %.3e (<= %.0e)  nmse %.3e (<= %.0e)  vs backend full-head mul_mat  %s\n",
-                        bname, h.name.c_str(), (long long) T, ggml_type_name(qt), e2.rel_max, backend_rel_bound(qt),
-                        e2.nmse, backend_nmse_bound(qt), ok2 ? "ok" : "FAIL");
+                        bname, h.name.c_str(), (long long) T, ggml_type_name(qt), e2.rel_max, rb,
+                        e2.nmse, nb, ok2 ? "ok" : "FAIL");
                 check(ok2, "(c2) backend full-head logits bound");
             }
         }
@@ -351,7 +396,8 @@ static void run_head(const head_case & h, const std::vector<ggml_backend_t> & ba
             check(ok, "(a) domain");
         } else {
             const bool ok = memcmp(f.data(), h.ref.data(), f.size()) == 0;
-            printf("  (d) f32 rows byte-equal to to_float of the head rows: %s\n", ok ? "ok" : "FAIL");
+            printf("  (d) f32 rows byte-equal to the decoded head rows (%s): %s\n",
+                    ggml_ai4_rate(h.type) ? "ggml_ai4_dequantize_slab" : "to_float", ok ? "ok" : "FAIL");
             check(ok, "(d) plain rows");
         }
         compact.emplace_back(GGML_TYPE_F32, std::move(f));
@@ -392,6 +438,9 @@ int main() {
     run_head(make_exl3(6, 1024, 2048, 333, 8101), backends); // the 27B head is EXL3_6
     run_head(make_exl3(3, 1024, 2048, 333, 8102), backends);
     run_head(make_plain(GGML_TYPE_Q6_K, 1024, 2048, 333, 8103), backends);
+    // (e) K = 2048 (2 spans), N = 2048 (128 slabs)
+    run_head(make_ai(GGML_TYPE_AI6_S, 2048, 2048, 333, 8104), backends); // the AI+ 27B head is AI6_S
+    run_head(make_ai(GGML_TYPE_AI4_S, 2048, 2048, 333, 8105), backends);
 
     for (ggml_backend_t be : backends) ggml_backend_free(be);
     printf("%s: %d failing checks\n", g_fail == 0 ? "PASS" : "FAIL", g_fail);

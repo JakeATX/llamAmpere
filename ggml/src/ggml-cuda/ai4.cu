@@ -19,6 +19,8 @@
 //                             that passed the D-008 ship gate and was fastest of 2/3/4 at verify widths 5-8 in D-007)
 //   GGML_CUDA_AI4_MMV_XSMEM=1  N <= 8 kernel stages the activations in shared memory (first version, 3 stages) instead
 //                             of reading them into registers
+//   GGML_CUDA_AI6_REF=1        AI6_S takes the rate-k reference path (reconstruct + SGEMM) instead of its rate-6 IMMA
+//                             kernels (an A/B check of those kernels, like GGML_CUDA_AI5_REF for rate 5)
 // The pre-rename GGML_CUDA_D2_* spellings (the format was called D2 until 2026-10-07) are still read when the AI4
 // name is unset, so older run scripts keep selecting the same kernels.
 static int ai4_env_int(const char * name, const char * legacy_name, int def) {
@@ -79,12 +81,12 @@ static void ai4_mm_kernels(const uint8_t * W, const int8_t * q, const float * s,
     }
 }
 
-// ai4-kern LAY for a type with IMMA kernels (AI4 / AI4_U / AI5_U / AI4_S / AI5_S); xsh = 1 unless the unit-128 layout
-// has K % 256 != 0. The span layouts need K % 1024 == 0, so they are always xsh = 1.
+// ai4-kern LAY for a type with IMMA kernels (AI4 / AI4_U / AI5_U / AI4_S / AI5_S / AI6_S); xsh = 1 unless the unit-128
+// layout has K % 256 != 0. The span layouts need K % 1024 == 0, so they are always xsh = 1.
 static int ai4_lay_of(ggml_type t) {
     const int lay = ggml_ai4_layout(t), rate = ggml_ai4_rate(t);
     if (lay == 2) {
-        return rate == 5 ? ai4k::LAY_S5 : ai4k::LAY_S;
+        return rate == 6 ? ai4k::LAY_S6 : rate == 5 ? ai4k::LAY_S5 : ai4k::LAY_S;
     }
     if (lay == 0) {
         return ai4k::LAY_SB;
@@ -106,6 +108,9 @@ static void ai4_mul_mat_fast(ggml_backend_cuda_context & ctx, ggml_type t, const
             break;
         case ai4k::LAY_S5:
             ai4_mm_kernels<ai4k::LAY_S5, 1>(W, q.get(), s.get(), Y, M, N, K, stream);
+            break;
+        case ai4k::LAY_S6:
+            ai4_mm_kernels<ai4k::LAY_S6, 1>(W, q.get(), s.get(), Y, M, N, K, stream);
             break;
         case ai4k::LAY_U5:
             if (xsh) {
@@ -133,14 +138,19 @@ static bool ai4_is_type(ggml_type t) {
 
 // Types that have no IMMA kernels: the rate-k reference path (rotated-basis reconstruct x int8-emulated activations +
 // SGEMM) is always taken for them. AI5_U / AI5_S have rate-5 kernels, so they only take the reference path under
-// GGML_CUDA_AI5_REF=1 (an A/B check of those kernels). The span types follow their rate: k = 4 and k = 5 have kernels.
+// GGML_CUDA_AI5_REF=1 (an A/B check of those kernels). The span types follow their rate: k = 4 and k = 5 have kernels;
+// AI6_S (k = 6 span, the AI+ output head) has rate-6 kernels and takes the reference path only under GGML_CUDA_AI6_REF=1.
 static bool ai4_ref_only_type(ggml_type t) {
     static const bool v = ai4_env_int("GGML_CUDA_AI5_REF", nullptr, 0) != 0;
+    static const bool v6 = ai4_env_int("GGML_CUDA_AI6_REF", nullptr, 0) != 0;
     if (t == GGML_TYPE_AI5_U || t == GGML_TYPE_AI5_S) {
         return v;
     }
+    if (t == GGML_TYPE_AI6_S) {
+        return v6;
+    }
     return t == GGML_TYPE_AI3_U || t == GGML_TYPE_AI2_U || t == GGML_TYPE_AI6_U ||
-           t == GGML_TYPE_AI2_S || t == GGML_TYPE_AI3_S || t == GGML_TYPE_AI6_S;
+           t == GGML_TYPE_AI2_S || t == GGML_TYPE_AI3_S;
 }
 
 static void ai4_reconstruct_any(const void * src, float * W, int64_t K, int64_t M, cudaStream_t stream, ggml_type t) {
@@ -395,6 +405,9 @@ void ggml_cuda_mul_mat_id_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor
             break;
         case ai4k::LAY_S5:
             ai4_mm_id_kernels<ai4k::LAY_S5, 1>(W, q.get(), s.get(), Y, M, K, n_tok, n_expert, n_pairs, idm, bn, max_tiles, stream);
+            break;
+        case ai4k::LAY_S6:
+            ai4_mm_id_kernels<ai4k::LAY_S6, 1>(W, q.get(), s.get(), Y, M, K, n_tok, n_expert, n_pairs, idm, bn, max_tiles, stream);
             break;
         case ai4k::LAY_U5:
             if (xsh) {

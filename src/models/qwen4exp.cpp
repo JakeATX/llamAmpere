@@ -733,11 +733,29 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
                 &inject, il);
 
         // Predictions use this layer's post-attention FFN input and never feed model math.
+        // fork PREFETCHFIX: LLAMA_MOE_PREFETCH_AFTER_FFN=1 schedules them after this layer's experts,
+        // so their copies never compete with this layer's own miss reads.
+        static const bool prefetch_after_ffn = [] {
+            const char * v = getenv("LLAMA_MOE_PREFETCH_AFTER_FFN");
+            return v && strcmp(v, "1") == 0;
+        }();
+        std::vector<ggml_tensor *> prefetch_pending;
         if (cparams.moe_prefetch != 0 && b1_full && n_tokens > 0 && n_tokens <= 8 &&
                 cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT &&
                 strncmp(ggml_backend_dev_name(model.dev_layer(il)), "CUDA", 4) == 0) {
-            const int lead = cparams.moe_prefetch < 0 ? 3 : cparams.moe_prefetch;
-            for (int d = 1; d <= lead && il + d < n_layer; ++d) {
+            // fork PREFETCHFIX: the asynchronous path predicts one distance only (--moe-prefetch N, -1 = 1)
+            // with LLAMA_MOE_PREFETCH_K candidates (default 32, at most 64).
+            static const bool prefetch_async = [] {
+                const char * v = getenv("GGML_MOE_PREFETCH_ASYNC");
+                return v && (strcmp(v, "1") == 0 || strcmp(v, "2") == 0);
+            }();
+            static const int64_t prefetch_k = [] {
+                const char * v = getenv("LLAMA_MOE_PREFETCH_K");
+                const int k = v ? atoi(v) : 32;
+                return (int64_t) std::max(1, std::min(k, 64));
+            }();
+            const int lead = cparams.moe_prefetch < 0 ? (prefetch_async ? 1 : 3) : cparams.moe_prefetch;
+            for (int d = prefetch_async ? lead : 1; d <= lead && il + d < n_layer; ++d) {
                 const auto & future = model.layers[il + d];
                 if (!future.ffn_gate_inp) {
                     continue;
@@ -756,14 +774,18 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
                     scores = gpu(ggml_pool_2d(ctx0, scores, GGML_OP_POOL_MAX, tokens, 1, tokens, 1, 0, 0));
                     scores = ggml_reshape_1d(ctx0, scores, n_expert);
                 }
-                ggml_tensor * ids = gpu(ggml_cont(ctx0, gpu(ggml_argsort_top_k(ctx0, scores, std::min<int64_t>(32, n_expert)))));
+                ggml_tensor * ids = gpu(ggml_cont(ctx0, gpu(ggml_argsort_top_k(ctx0, scores, std::min<int64_t>(prefetch_async ? prefetch_k : 32, n_expert)))));
                 // An unsupported predictor must not fall back to CPU execution.
                 if (!supported) {
                     continue;
                 }
                 ggml_format_name(ids, "moe_prefetch-%d-%d", il, il + d);
                 ggml_set_output(ids);
-                ggml_build_forward_expand(gf, ids);
+                if (prefetch_after_ffn) {
+                    prefetch_pending.push_back(ids);
+                } else {
+                    ggml_build_forward_expand(gf, ids);
+                }
             }
         }
 
@@ -780,6 +802,12 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
 
         cur = build_layer_ffn(cur, il);
         cb(cur, "ffn_out", il);
+        if (!prefetch_pending.empty()) {
+            ggml_build_forward_expand(gf, cur);
+            for (ggml_tensor * ids : prefetch_pending) {
+                ggml_build_forward_expand(gf, ids);
+            }
+        }
 
         res_hc = build_hc_combine(res_hc, cur, inject, il);
 
@@ -975,7 +1003,12 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    // draft-only vocabulary shortlist (when the context carries a map, e.g. the built-in flash-next-65536):
+    // score only the shortlisted head rows; the backend sampler maps its picks back to token ids.
+    // model.output_s is null except for an NVFP4 head; both calls accept a null scale.
+    // (ported from bl/grok-242 cbafc8c3f; before this the map was loaded but the draft scored all 248,320 rows)
+    ggml_tensor * logits = build_draft_vocab_logits(model.output, model.output_s, cur);
+    cur = logits ? logits : build_lora_mm(model.output, cur, model.output_s);
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 
