@@ -40,6 +40,7 @@
 #include "ggml-cuda/mmv-cr.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
+#include "ggml-cuda/mmvq-kq-tc.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
@@ -3450,6 +3451,10 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // TQ weight types use the fused dp4a path (decode) or runtime q8_0 conversion + cuBLAS (prefill),
     // never mmvq/mmq (mmvq's type switch has no TQ cases and aborts).
     const bool is_tq_weight = (src0->type == GGML_TYPE_TQ4_1S || src0->type == GGML_TYPE_TQ3_1S);
+    // [KQTC] K-quant / IQ3_S at 2..8 columns on int8 tensor cores (GGML_CUDA_KQ_TC, default off)
+    if ((route == GGML_CUDA_MM_ROUTE_MMVQ || route == GGML_CUDA_MM_ROUTE_MMQ) && ggml_cuda_mul_mat_kq_tc_try(ctx, src0, src1, dst)) {
+        return;
+    }
     if (route == GGML_CUDA_MM_ROUTE_MMVQ) {
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
         return;

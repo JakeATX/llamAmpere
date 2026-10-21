@@ -6635,8 +6635,9 @@ struct test_conv_ring : public test_case {
         if (e != nullptr) {
             return atoi(e) != 0;
         }
+        // default on since DEFFLIP (540c4da98), same rule as ggml_cuda_conv_ring_enabled
         const char * u = getenv("GGML_VL_SF");
-        return u != nullptr && atoi(u) != 0;
+        return u == nullptr || atoi(u) != 0;
     }
     const char * required_fusion() override { return expect_fusion && conv_ring_on() ? "conv_ring" : nullptr; }
     const char * forbidden_fusion() override { return expect_fusion && conv_ring_on() ? nullptr : "conv_ring"; }
@@ -13552,6 +13553,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mmq_pair(GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_S, 128, 10, true, 3));
     test_cases.emplace_back(new test_mmq_pair(GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_S, 127, 10));
     add_iq4xs_k4_cases(test_cases, false);
+
+    // [KQTC] K-quant / IQ3_S int8 tensor-core path at 2..8 columns (compare GGML_CUDA_KQ_TC=0/1): split K blocks over
+    // the warps (1, 3 and 17 blocks), a padded row stride, and the routes it must refuse (17 rows, batched, 9 columns)
+    for (ggml_type type : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ3_S }) {
+        for (int64_t n = 1; n <= 8; ++n) {
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 16, n, 256, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 48, n, 768, {1, 1}, {1, 1}, {0, 1, 2, 3}, 1024));
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 32, n, 4352, {1, 1}, {1, 1}));
+        }
+        test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 17, 5, 256, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 16, 5, 256, {2, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 16, 9, 256, {1, 1}, {1, 1}));
+        if (getenv("GGML_TEST_VBEAT_DENSE") != nullptr) {
+            for (auto mk : std::vector<std::pair<int64_t, int64_t>>{ { 10240, 2560 }, { 6144, 2560 }, { 2560, 6144 }, { 640, 2560 } }) {
+                for (int64_t n : { 2, 4, 5, 8 }) {
+                    test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, mk.first, n, mk.second, {1, 1}, {1, 1}));
+                }
+            }
+        }
+    }
     add_mmf_split_k_cases(test_cases, false);
     add_iq4xs_wide_cases(test_cases);
     add_parwrev_cases(test_cases, false);
@@ -17116,7 +17137,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     if (getenv("GGML_TEST_VBEAT_DENSE") != nullptr) {
         for (ggml_type type : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL }) {
             for (auto mk : std::vector<std::pair<int64_t, int64_t>>{ { 10240, 2560 }, { 12288, 2560 }, { 6144, 2560 }, { 2560, 6144 }, { 640, 2560 }, { 2560, 640 } }) {
-                for (int64_t n : { 1, 4, 5, 8 }) {
+                for (int64_t n : { 1, 2, 4, 5, 8 }) {
                     test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, mk.first, n, mk.second, { 1, 1 }, { 1, 1 }));
                 }
             }
