@@ -183,6 +183,188 @@ static int resident_test_restore(const void * data, size_t size) {
     return 1;
 }
 
+static bool run_resident_scheduler_cpu(ggml_backend_t cpu, bool events = false, bool rotating = false) {
+    struct event_state { int records = 0; };
+    struct copy_slot { const void * data; ggml_backend_event_t event; };
+    struct upload_state {
+        ggml_backend_t cpu;
+        ggml_backend_buffer_type_t buft;
+        bool accept;
+        int copies = 0;
+        int waits = 0;
+        bool ordered = true;
+        int event_waits = 0;
+        int event_reuses = 0;
+        int event_syncs = 0;
+        int event_records = 0;
+        int event_created = 0;
+        int event_freed = 0;
+        bool rotating = false;
+        ggml_backend_event_t waited_event = nullptr;
+        std::vector<copy_slot> copy_slots{};
+    } state{cpu, nullptr, true};
+    state.rotating = rotating;
+    // Separate buffer types force real scheduler copies without a GPU.
+    auto buft = *ggml_backend_cpu_buffer_type();
+    auto device = *ggml_backend_get_device(cpu);
+    auto backend = *cpu;
+    state.buft = &buft;
+    buft.device = &device;
+    buft.iface.is_host = +[](ggml_backend_buffer_type_t) { return false; };
+    device.context = &state;
+    device.iface.get_type = +[](ggml_backend_dev_t) { return GGML_BACKEND_DEVICE_TYPE_GPU; };
+    device.iface.get_buffer_type = +[](ggml_backend_dev_t dev) { return ((upload_state *)dev->context)->buft; };
+    device.iface.supports_buft = +[](ggml_backend_dev_t dev, ggml_backend_buffer_type_t type) {
+        return type == ((upload_state *)dev->context)->buft;
+    };
+    backend.device = &device;
+    backend.context = &state;
+    backend.iface.graph_compute = +[](ggml_backend_t stream, ggml_cgraph * graph) {
+        auto * original = ((upload_state *)stream->context)->cpu;
+        return original->iface.graph_compute(original, graph);
+    };
+    backend.iface.synchronize = +[](ggml_backend_t stream) { ++((upload_state *)stream->context)->waits; };
+    backend.iface.cpy_tensor_async = nullptr;
+    if (events) {
+        device.iface.event_new = +[](ggml_backend_dev_t dev) {
+            ++((upload_state *)dev->context)->event_created;
+            return new ggml_backend_event{dev, new event_state};
+        };
+        device.iface.event_free = +[](ggml_backend_dev_t dev, ggml_backend_event_t event) {
+            ++((upload_state *)dev->context)->event_freed;
+            delete (event_state *)event->context;
+            delete event;
+        };
+        device.iface.event_synchronize = +[](ggml_backend_dev_t dev, ggml_backend_event_t) {
+            ++((upload_state *)dev->context)->event_syncs;
+        };
+        backend.iface.event_wait = +[](ggml_backend_t stream, ggml_backend_event_t event) {
+            auto & test = *(upload_state *)stream->context;
+            ++test.waits;
+            ++test.event_waits;
+            test.waited_event = event;
+            if (((event_state *)event->context)->records > 0) { ++test.event_reuses; }
+        };
+        backend.iface.event_record = +[](ggml_backend_t stream, ggml_backend_event_t event) {
+            ++((upload_state *)stream->context)->event_records;
+            ++((event_state *)event->context)->records;
+        };
+    }
+    static int owner;
+    ggml_moe_cache_api api{};
+    api.owner = &owner;
+    api.session_create = test_provider_session_create;
+    api.session_destroy = test_provider_session_destroy;
+    api.session_enter = test_provider_session_enter;
+    api.session_leave = test_provider_session_leave;
+    api.host_restore = resident_test_restore;
+    api.resident_copy = +[](void * opaque, ggml_tensor * dst, size_t offset, const void * data, size_t size) {
+        auto & test = *(upload_state *)((ggml_backend_t)opaque)->context;
+        if (!test.accept || data != resident_test_host || size != resident_test_original.size() * sizeof(float)) { return 0; }
+        test.ordered &= test.waits > 0;
+        if (test.rotating) {
+            test.ordered &= test.waited_event != nullptr;
+            bool found = false;
+            for (const auto & slot : test.copy_slots) {
+                if (slot.data == dst->data) {
+                    test.ordered &= slot.event == test.waited_event;
+                    found = true;
+                } else {
+                    test.ordered &= slot.event != test.waited_event;
+                }
+            }
+            if (!found) { test.copy_slots.push_back({dst->data, test.waited_event}); }
+        }
+        ++test.copies;
+        memcpy((char *)dst->data + offset, resident_test_original.data(), size);
+        return 1;
+    };
+    ggml_moe_cache_register(&api);
+    ggml_moe_cache_resident_notify(true);
+    const char * old_upload = getenv("GGML_MOE_RESIDENT_UPLOAD");
+    const std::string saved_upload = old_upload ? old_upload : "";
+    bool ok = true;
+    for (int test = 0; test < 6; ++test) {
+        bool case_ok = true;
+        set_env("GGML_MOE_RESIDENT_UPLOAD", test == 0 ? "0" : test == 2 ? "invalid" : "1");
+        state.accept = test != 3;
+        ggml_backend_t backends[] = {&backend, cpu};
+        auto sched = ggml_backend_sched_new(backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, events, false);
+        ggml_backend_sched_set_moe_cache(sched, GGML_MOE_CACHE_MODE_OFF, 0);
+        const int copies = ggml_backend_sched_get_n_copies(sched);
+        const int iterations = rotating ? 2 * copies + 1 : 2;
+        auto * ctx = ggml_init({(16 + iterations) * ggml_tensor_overhead() + iterations * ggml_graph_overhead(), nullptr, true});
+        if (!ctx) { ggml_backend_sched_free(sched); ok = false; break; }
+        auto * weight = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 16);
+        auto * buffer = ggml_backend_alloc_ctx_tensors(ctx, cpu);
+        if (!buffer) { ggml_free(ctx); ggml_backend_sched_free(sched); ok = false; break; }
+        if (test != 4) { ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS); }
+        if (test == 5) { ggml_set_input(weight); }
+        auto * duplicate = ggml_dup(ctx, weight);
+        auto * graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, duplicate);
+        ggml_backend_sched_set_tensor_backend(sched, duplicate, &backend);
+        const bool allocated = ggml_backend_sched_alloc_graph(sched, graph);
+        case_ok &= allocated;
+        case_ok &= ggml_backend_sched_get_tensor_backend(sched, duplicate) == &backend;
+        resident_test_host = weight->data;
+        resident_test_original.assign(16, 1.25f);
+        resident_test_restores = 0;
+        state.copies = 0;
+        state.ordered = true;
+        state.copy_slots.clear();
+        state.event_waits = state.event_reuses = state.event_syncs = state.event_records = 0;
+        const bool direct = test == 1;
+        for (int replay = 0; allocated && replay < iterations; ++replay) {
+            if (rotating && replay) {
+                ggml_backend_sched_reset(sched);
+                duplicate = ggml_dup(ctx, weight);
+                graph = ggml_new_graph(ctx);
+                ggml_build_forward_expand(graph, duplicate);
+                ggml_backend_sched_set_tensor_backend(sched, duplicate, &backend);
+                if (!ggml_backend_sched_alloc_graph(sched, graph)) { case_ok = false; break; }
+            }
+            const int before_restore = resident_test_restores;
+            memset(weight->data, 0, ggml_nbytes(weight));
+            state.waits = 0;
+            state.waited_event = nullptr;
+            case_ok &= (rotating ? ggml_backend_sched_graph_compute_async(sched, graph) :
+                    ggml_backend_sched_graph_compute(sched, graph)) == GGML_STATUS_SUCCESS;
+            std::vector<float> output(16);
+            ggml_backend_tensor_get(duplicate, output.data(), 0, ggml_nbytes(duplicate));
+            case_ok &= output == resident_test_original;
+            case_ok &= direct ? resident_test_restores == before_restore : resident_test_restores > before_restore;
+            case_ok &= state.copies == (direct ? replay + 1 : 0);
+            if (direct) {
+                case_ok &= std::all_of((float *)weight->data, (float *)weight->data + 16, [](float v) { return v == 0.0f; });
+            }
+        }
+        if (rotating && direct) {
+            case_ok &= copies > 1 && state.copy_slots.size() == (size_t)copies;
+            printf("permanent-scheduler-rotating-cpu-slots: %zu/%d iterations=%d\n", state.copy_slots.size(), copies, iterations);
+        }
+        if (events) {
+            case_ok &= state.event_records >= iterations;
+            case_ok &= test == 5 ? state.event_syncs >= iterations :
+                    state.event_waits >= iterations && state.event_reuses >= (rotating ? iterations - copies : 1);
+        }
+        ggml_backend_sched_free(sched);
+        case_ok &= state.event_created == state.event_freed && state.ordered;
+        printf("permanent-scheduler%s-cpu-case-%d: %s\n", rotating ? "-rotating" : events ? "-events" : "", test, case_ok ? "OK" : "FAIL");
+        ok &= case_ok;
+        ggml_backend_buffer_free(buffer);
+        ggml_free(ctx);
+    }
+    ok &= state.ordered;
+    set_env("GGML_MOE_RESIDENT_UPLOAD", old_upload ? saved_upload.c_str() : nullptr);
+    ggml_moe_cache_resident_notify(false);
+    ggml_moe_cache_unregister(&owner);
+    resident_test_host = nullptr;
+    resident_test_original.clear();
+    printf("permanent-scheduler%s-cpu: %s\n", rotating ? "-rotating" : events ? "-events" : "", ok ? "OK" : "FAIL");
+    return ok;
+}
+
 static bool run_resident_host_barriers(ggml_backend_t cpu) {
     ggml_init_params params{16 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true};
     auto * ctx = ggml_init(params);
@@ -241,6 +423,49 @@ static bool run_resident_host_barriers(ggml_backend_t cpu) {
     ggml_backend_tensor_get(result, output.data(), 0, ggml_nbytes(result));
     ok &= output == std::vector<float>(16, 2.5f);
     ok &= resident_test_restores >= 5;
+
+    const char * old_upload = getenv("GGML_MOE_RESIDENT_UPLOAD");
+    const std::string saved_upload = old_upload ? old_upload : "";
+    auto upload_backend = *cpu;
+    upload_backend.iface.set_tensor_async = +[](ggml_backend_t, ggml_tensor * dst, const void * data, size_t offset, size_t size) {
+        memcpy((char *)dst->data + offset, data, size);
+    };
+    int uploads = 0;
+    api.resident_copy = +[](void * opaque, ggml_tensor * dst, size_t offset, const void * data, size_t size) {
+        if (data != resident_test_host || size != resident_test_original.size() * sizeof(float)) { return 0; }
+        ++*(int *)((ggml_backend_t)opaque)->context;
+        memcpy((char *)dst->data + offset, resident_test_original.data(), size);
+        return 1;
+    };
+    upload_backend.context = &uploads;
+    ggml_moe_cache_register(&api);
+    for (const char * mode : {"0", "1", "invalid"}) {
+        set_env("GGML_MOE_RESIDENT_UPLOAD", mode);
+        discard();
+        const int before = resident_test_restores;
+        ggml_backend_tensor_set_async(&upload_backend, destination, weight->data, 0, ggml_nbytes(weight));
+        ggml_backend_tensor_get(destination, output.data(), 0, ggml_nbytes(destination));
+        ok &= output == resident_test_original;
+        ok &= resident_test_restores == before + (strcmp(mode, "1") == 0 ? 0 : 1);
+        if (strcmp(mode, "1") == 0) {
+            ok &= std::all_of((float *)weight->data, (float *)weight->data + 16, [](float v) { return v == 0.0f; });
+        }
+    }
+    ok &= uploads == 1;
+    // Refused partial uploads must still restore the host source before reading.
+    set_env("GGML_MOE_RESIDENT_UPLOAD", "1");
+    discard();
+    const int before_refusal = resident_test_restores;
+    ggml_backend_tensor_set_async(&upload_backend, destination, (const char *)weight->data + sizeof(float), 0, 15 * sizeof(float));
+    ok &= resident_test_restores == before_refusal + 1 && uploads == 1;
+    ggml_backend_tensor_get(destination, output.data(), 0, ggml_nbytes(destination));
+    ok &= output == resident_test_original;
+    discard();
+    const int before_copy = resident_test_restores;
+    ggml_backend_tensor_copy_async(cpu, &upload_backend, weight, destination);
+    ggml_backend_tensor_get(destination, output.data(), 0, ggml_nbytes(destination));
+    ok &= output == resident_test_original && uploads == 2 && resident_test_restores == before_copy;
+    set_env("GGML_MOE_RESIDENT_UPLOAD", old_upload ? saved_upload.c_str() : nullptr);
     ggml_moe_cache_resident_notify(false);
     ggml_moe_cache_unregister(&owner);
     resident_test_host = nullptr;
@@ -5138,13 +5363,47 @@ static bool run_permanent_device_table(ggml_backend_t gpu, ggml_backend_t cpu, l
                 if (direct == cudaSuccess) { require(cudaStreamSynchronize(cudaStreamPerThread) == cudaSuccess, __LINE__); }
                 else { (void)cudaGetLastError(); }
             };
+            const char * old_upload = getenv("GGML_MOE_RESIDENT_UPLOAD");
+            const std::string saved_upload = old_upload ? old_upload : "";
+            set_env("GGML_MOE_RESIDENT_UPLOAD", "1");
+            std::vector<uint8_t> copied(quantized.size());
+            ggml_backend_tensor_set_async(gpu, uploaded, weights->data, 0, quantized.size());
+            ggml_backend_synchronize(gpu);
+            ggml_backend_tensor_get(uploaded, copied.data(), 0, copied.size());
+            require(copied == quantized && state.count == 0, __LINE__);
+            require(mincore(mapping, hole_bytes, pages.data()) == 0, __LINE__);
+            for (unsigned char present : pages) { require(!(present & 1), __LINE__); }
+            ggml_backend_tensor_set_async(gpu, uploaded, (const char *)weights->data + 37, 37, quantized.size() - 74);
+            ggml_backend_synchronize(gpu);
+            ggml_backend_tensor_get(uploaded, copied.data(), 0, copied.size());
+            require(copied == quantized && state.count == 0, __LINE__);
+            ggml_backend_tensor_copy_async(cpu, gpu, weights, uploaded);
+            ggml_backend_synchronize(gpu);
+            ggml_backend_tensor_get(uploaded, copied.data(), 0, copied.size());
+            require(copied == quantized && state.count == 0, __LINE__);
+            auto * copy_ctx = ggml_init({8 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true});
+            auto * duplicate = ggml_dup(copy_ctx, weights);
+            auto * copy_graph = ggml_new_graph(copy_ctx);
+            ggml_build_forward_expand(copy_graph, duplicate);
+            auto copy_sched = ggml_backend_sched_new(backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, false);
+            ggml_backend_sched_set_tensor_backend(copy_sched, duplicate, gpu);
+            require(ggml_backend_sched_alloc_graph(copy_sched, copy_graph), __LINE__);
+            require(ggml_backend_sched_get_tensor_backend(copy_sched, duplicate) == gpu, __LINE__);
+            require(ggml_backend_sched_graph_compute(copy_sched, copy_graph) == GGML_STATUS_SUCCESS, __LINE__);
+            ggml_backend_tensor_get(duplicate, copied.data(), 0, copied.size());
+            require(copied == quantized && state.count == 0, __LINE__);
+            ggml_backend_sched_free(copy_sched);
+            ggml_free(copy_ctx);
+            require(mincore(mapping, hole_bytes, pages.data()) == 0, __LINE__);
+            for (unsigned char present : pages) { require(!(present & 1), __LINE__); }
+            // Keep the original fallback coverage independent of the option.
+            set_env("GGML_MOE_RESIDENT_UPLOAD", "0");
             raw_upload("sparse");
             // This call must restore the original host bytes before enqueueing
             // the full-object H2D copy, just as the multi-turn scheduler does.
             ggml_backend_tensor_set_async(gpu, uploaded, weights->data, 0, quantized.size());
             ggml_backend_synchronize(gpu);
             require(state.count == 1 && memcmp(weights->data, quantized.data(), quantized.size()) == 0, __LINE__);
-            std::vector<uint8_t> copied(quantized.size());
             ggml_backend_tensor_get(uploaded, copied.data(), 0, copied.size());
             require(copied == quantized, __LINE__);
             raw_upload("restored");
@@ -5172,6 +5431,7 @@ static bool run_permanent_device_table(ggml_backend_t gpu, ggml_backend_t cpu, l
             ggml_backend_synchronize(gpu);
             ggml_backend_tensor_get(uploaded, copied.data(), 0, copied.size());
             require(copied == expected_upload, __LINE__);
+            set_env("GGML_MOE_RESIDENT_UPLOAD", old_upload ? saved_upload.c_str() : nullptr);
             for (size_t row = 0; row < height; ++row) {
                 memcpy(expected_upload.data() + 19 + row * target_stride,
                         quantized.data() + source + row * source_stride, width_bytes);
@@ -6460,6 +6720,24 @@ int main(int argc, char ** argv) {
     const bool profile_warm_only = argc == 2 && strcmp(argv[1], "--profile-warm-only") == 0;
     if (!test_prefetch_budget()) {
         return 1;
+    }
+    if (argc == 2 && strcmp(argv[1], "--permanent-scheduler-rotating-cpu-only") == 0) {
+        auto * cpu = ggml_backend_cpu_init();
+        const bool ok = cpu && run_resident_scheduler_cpu(cpu, true, true);
+        if (cpu) { ggml_backend_free(cpu); }
+        return ok ? 0 : 1;
+    }
+    if (argc == 2 && strcmp(argv[1], "--permanent-scheduler-events-cpu-only") == 0) {
+        auto * cpu = ggml_backend_cpu_init();
+        const bool ok = cpu && run_resident_scheduler_cpu(cpu, true);
+        if (cpu) { ggml_backend_free(cpu); }
+        return ok ? 0 : 1;
+    }
+    if (argc == 2 && strcmp(argv[1], "--permanent-scheduler-cpu-only") == 0) {
+        auto * cpu = ggml_backend_cpu_init();
+        const bool ok = cpu && run_resident_scheduler_cpu(cpu);
+        if (cpu) { ggml_backend_free(cpu); }
+        return ok ? 0 : 1;
     }
     if (argc == 2 && strcmp(argv[1], "--permanent-host-only") == 0) {
         auto * cpu = ggml_backend_cpu_init();
