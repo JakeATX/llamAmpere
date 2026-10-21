@@ -35,6 +35,8 @@
 //   GGML_CUDA_AI23_TUNED=1   select measured rate-2/3 decode and tile defaults (default off)
 //   GGML_CUDA_AI23_MMVR_STAGES=4|8  deeper dense fixed-K four-warp weight prefetch (default 2)
 //   GGML_CUDA_AI23_MMVR_UNROLL=1|2|4|8  dense fixed-K loop unroll (tuned 8 at long K, 4 otherwise)
+//   GGML_CUDA_AI23_MMVR_SINGLE_N=1  omit unused odd-column accumulators for dense N=1 (default off)
+//   GGML_CUDA_AI23_MMVR_SINGLE_ID=1  omit unused odd-column accumulators for direct experts (default off)
 //   GGML_CUDA_AI23_SMALL_SPLIT=2|4  split small-width fixed-K dense products (default off)
 //   GGML_CUDA_AI23_FUSED_X=1  quantize activations inside direct one-token expert blocks (default off)
 //   GGML_CUDA_AI23_DIRECT=1..8  skip expert grouping through this token width in MMVR (default off)
@@ -372,17 +374,33 @@ constexpr bool ai4_mmvr_kt_ok() {
     else { return XSH == 1 ? KT % 256 == 0 : KT % 256 != 0; }
 }
 
-template <int LAY, int XSH, bool ID, int KT, int STAGES = 2, int WARPS = 4, int MINB = 6, bool DIRECT = false, bool FUSED_X = false>
+template <int LAY, int XSH, bool ID, int KT, int STAGES = 2, int WARPS = 4, int MINB = 6, bool DIRECT = false, bool FUSED_X = false, bool SINGLE_N = false>
 static void ai23_launch_mmvr(const uint8_t * W, const int8_t * q, const float * s, float * Y, int64_t ldy,
                              int M, int N, int K, cudaStream_t stream, const ai4k::idmap & idm, int max_tiles) {
+    static_assert(!SINGLE_N || !ID || DIRECT, "single-column dense or direct scope");
+    if constexpr (!ID && !SINGLE_N) {
+        static const bool single_n = ai4_env_int("GGML_CUDA_AI23_MMVR_SINGLE_N", nullptr, 0) != 0;
+        if (single_n && N == 1) {
+            ai23_launch_mmvr<LAY, XSH, ID, KT, STAGES, WARPS, MINB, DIRECT, FUSED_X, true>(W, q, s, Y, ldy, M, N, K, stream, idm, max_tiles);
+            return;
+        }
+    }
+    if constexpr (ID && DIRECT && !SINGLE_N) {
+        static const bool single_id = ai4_env_int("GGML_CUDA_AI23_MMVR_SINGLE_ID", nullptr, 0) != 0;
+        if (single_id) {
+            ai23_launch_mmvr<LAY, XSH, ID, KT, STAGES, WARPS, MINB, DIRECT, FUSED_X, true>(W, q, s, Y, ldy, M, N, K, stream, idm, max_tiles);
+            return;
+        }
+    }
+    if constexpr (SINGLE_N && !DIRECT) GGML_ASSERT(N == 1);
     if constexpr (!ID && WARPS == 4 && (KT == 5120 || KT == 17408)) {
         static const int stages = ai4_env_int("GGML_CUDA_AI23_MMVR_STAGES", nullptr, 2);
         if (stages == 4) {
-            ai4k::launch_mmvr<LAY, XSH, ID, KT, 4, WARPS, MINB, DIRECT, FUSED_X>(W, q, s, Y, ldy, M, N, K, stream, idm, max_tiles);
+            ai4k::launch_mmvr<LAY, XSH, ID, KT, 4, WARPS, MINB, DIRECT, FUSED_X, 1, 1, SINGLE_N>(W, q, s, Y, ldy, M, N, K, stream, idm, max_tiles);
             return;
         }
         if (stages == 8) {
-            ai4k::launch_mmvr<LAY, XSH, ID, KT, 8, WARPS, MINB, DIRECT, FUSED_X>(W, q, s, Y, ldy, M, N, K, stream, idm, max_tiles);
+            ai4k::launch_mmvr<LAY, XSH, ID, KT, 8, WARPS, MINB, DIRECT, FUSED_X, 1, 1, SINGLE_N>(W, q, s, Y, ldy, M, N, K, stream, idm, max_tiles);
             return;
         }
     }
@@ -390,19 +408,19 @@ static void ai23_launch_mmvr(const uint8_t * W, const int8_t * q, const float * 
                           ((WARPS == 8 || WARPS == 16) && KT == 17408))) {
         static const int unroll = ai4_env_int("GGML_CUDA_AI23_MMVR_UNROLL", nullptr, ai4_ai23_tuned() ? (KT == 17408 ? 8 : 4) : 1);
         if (unroll == 2) {
-            ai4k::launch_mmvr<LAY, XSH, ID, KT, STAGES, WARPS, MINB, DIRECT, FUSED_X, 1, 2>(W, q, s, Y, ldy, M, N, K, stream, idm, max_tiles);
+            ai4k::launch_mmvr<LAY, XSH, ID, KT, STAGES, WARPS, MINB, DIRECT, FUSED_X, 1, 2, SINGLE_N>(W, q, s, Y, ldy, M, N, K, stream, idm, max_tiles);
             return;
         }
         if (unroll == 4) {
-            ai4k::launch_mmvr<LAY, XSH, ID, KT, STAGES, WARPS, MINB, DIRECT, FUSED_X, 1, 4>(W, q, s, Y, ldy, M, N, K, stream, idm, max_tiles);
+            ai4k::launch_mmvr<LAY, XSH, ID, KT, STAGES, WARPS, MINB, DIRECT, FUSED_X, 1, 4, SINGLE_N>(W, q, s, Y, ldy, M, N, K, stream, idm, max_tiles);
             return;
         }
         if (unroll == 8) {
-            ai4k::launch_mmvr<LAY, XSH, ID, KT, STAGES, WARPS, MINB, DIRECT, FUSED_X, 1, 8>(W, q, s, Y, ldy, M, N, K, stream, idm, max_tiles);
+            ai4k::launch_mmvr<LAY, XSH, ID, KT, STAGES, WARPS, MINB, DIRECT, FUSED_X, 1, 8, SINGLE_N>(W, q, s, Y, ldy, M, N, K, stream, idm, max_tiles);
             return;
         }
     }
-    ai4k::launch_mmvr<LAY, XSH, ID, KT, STAGES, WARPS, MINB, DIRECT, FUSED_X>(W, q, s, Y, ldy, M, N, K, stream, idm, max_tiles);
+    ai4k::launch_mmvr<LAY, XSH, ID, KT, STAGES, WARPS, MINB, DIRECT, FUSED_X, 1, 1, SINGLE_N>(W, q, s, Y, ldy, M, N, K, stream, idm, max_tiles);
 }
 
 template <int LAY, int XSH, bool ID, int KT>

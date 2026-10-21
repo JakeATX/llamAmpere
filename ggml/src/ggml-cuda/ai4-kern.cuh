@@ -1055,10 +1055,11 @@ constexpr __host__ __device__ int64_t mmvr_soff(int c) {
     }
 }
 
-template <int LAY, int XSH, bool ID, int KT, int STAGES = 2, int WARPS = 4, int MINB = 6, bool DIRECT = false, bool FUSED_X = false, int SPLITS = 1, int LOOP_UNROLL = 1>
+template <int LAY, int XSH, bool ID, int KT, int STAGES = 2, int WARPS = 4, int MINB = 6, bool DIRECT = false, bool FUSED_X = false, int SPLITS = 1, int LOOP_UNROLL = 1, bool SINGLE_N = false>
 static __global__ void __launch_bounds__(WARPS*32, MINB) mmvr(
         const uint8_t * __restrict__ W, const int8_t * __restrict__ Xq, const float * __restrict__ Xs,
         float * __restrict__ Y, int64_t ldy, int M, int N, int Kr, const idmap idm) {
+    static_assert(!SINGLE_N || !ID || DIRECT, "single-column dense or direct scope");
     constexpr int KR = lay_rate<LAY>();
     static_assert(SPLITS == 1 || (!ID && WARPS == 4 && (KT == 5120 || KT == 17408)), "small split scope");
     static_assert(!FUSED_X || DIRECT, "fused activation needs direct ids");
@@ -1223,11 +1224,16 @@ static __global__ void __launch_bounds__(WARPS*32, MINB) mmvr(
         const float d0  = __half2float(sdw[g]);
         const float d1  = __half2float(sdw[g + 8]);
         const float dx0 = FUSED_X ? act_scale : sdx[2*t];
-        const float dx1 = FUSED_X ? act_scale : sdx[2*t + 1];
-        acc[0] += magic_i2f(p[0] + q[0]) * (d0*dx0);
-        acc[1] += magic_i2f(p[1] + q[1]) * (d0*dx1);
-        acc[2] += magic_i2f(p[2] + q[2]) * (d1*dx0);
-        acc[3] += magic_i2f(p[3] + q[3]) * (d1*dx1);
+        if constexpr (SINGLE_N) {
+            acc[0] += magic_i2f(p[0] + q[0]) * (d0*dx0);
+            acc[2] += magic_i2f(p[2] + q[2]) * (d1*dx0);
+        } else {
+            const float dx1 = FUSED_X ? act_scale : sdx[2*t + 1];
+            acc[0] += magic_i2f(p[0] + q[0]) * (d0*dx0);
+            acc[1] += magic_i2f(p[1] + q[1]) * (d0*dx1);
+            acc[2] += magic_i2f(p[2] + q[2]) * (d1*dx0);
+            acc[3] += magic_i2f(p[3] + q[3]) * (d1*dx1);
+        }
     };
 
 #pragma unroll
@@ -1278,11 +1284,11 @@ static __global__ void __launch_bounds__(WARPS*32, MINB) mmvr(
     }
     cp_async_wait<0>();
 
-    __shared__ float red[WARPS - 1][4][32];
+    __shared__ float red[WARPS - 1][SINGLE_N ? 2 : 4][32];
     if (warp > 0) {
 #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            red[warp - 1][i][lane] = acc[i];
+        for (int i = 0; i < (SINGLE_N ? 2 : 4); ++i) {
+            red[warp - 1][i][lane] = acc[SINGLE_N ? 2*i : i];
         }
     }
     __syncthreads();
@@ -1290,8 +1296,8 @@ static __global__ void __launch_bounds__(WARPS*32, MINB) mmvr(
 #pragma unroll
         for (int w = 0; w < WARPS - 1; ++w) {
 #pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                acc[i] += red[w][i][lane];
+            for (int i = 0; i < (SINGLE_N ? 2 : 4); ++i) {
+                acc[SINGLE_N ? 2*i : i] += red[w][i][lane];
             }
         }
         const int r = slab*16 + g;
@@ -1301,21 +1307,23 @@ static __global__ void __launch_bounds__(WARPS*32, MINB) mmvr(
             else if constexpr (ID) { return pcol[cc]; }
             else { return cc; }
         };
-        if (c < N) {
+        if (c < (SINGLE_N ? 1 : N)) {
             const int64_t y = ycol(c);
             Y[y*ldy + r]     = acc[0];
             Y[y*ldy + r + 8] = acc[2];
         }
-        if (c + 1 < N) {
-            const int64_t y = ycol(c + 1);
-            Y[y*ldy + r]     = acc[1];
-            Y[y*ldy + r + 8] = acc[3];
+        if constexpr (!SINGLE_N) {
+            if (c + 1 < N) {
+                const int64_t y = ycol(c + 1);
+                Y[y*ldy + r]     = acc[1];
+                Y[y*ldy + r + 8] = acc[3];
+            }
         }
     }
     (void) M;
 }
 
-template <int LAY, int XSH, bool ID, int KT, int STAGES = 2, int WARPS = 4, int MINB = 6, bool DIRECT = false, bool FUSED_X = false, int SPLITS = 1, int LOOP_UNROLL = 1>
+template <int LAY, int XSH, bool ID, int KT, int STAGES = 2, int WARPS = 4, int MINB = 6, bool DIRECT = false, bool FUSED_X = false, int SPLITS = 1, int LOOP_UNROLL = 1, bool SINGLE_N = false>
 static void launch_mmvr(const uint8_t * W, const int8_t * Xq, const float * Xs, float * Y, int64_t ldy,
                         int M, int N, int K, cudaStream_t stream, const idmap & idm = idmap{}, int max_experts = 1) {
     constexpr int smem = WARPS*STAGES*mmv_stage_bytes<true, LAY>();
@@ -1323,7 +1331,7 @@ static void launch_mmvr(const uint8_t * W, const int8_t * Xq, const float * Xs, 
     int dev = 0;
     CUDA_CHECK_AI4K(cudaGetDevice(&dev));
     if (!attr_set[dev & 63]) {
-        CUDA_CHECK_AI4K(cudaFuncSetAttribute(mmvr<LAY, XSH, ID, KT, STAGES, WARPS, MINB, DIRECT, FUSED_X, SPLITS, LOOP_UNROLL>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+        CUDA_CHECK_AI4K(cudaFuncSetAttribute(mmvr<LAY, XSH, ID, KT, STAGES, WARPS, MINB, DIRECT, FUSED_X, SPLITS, LOOP_UNROLL, SINGLE_N>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
         attr_set[dev & 63] = true;
     }
     // Direct routing has one slot and token per block; separate dimensions avoid device-side integer division.
@@ -1334,16 +1342,16 @@ static void launch_mmvr(const uint8_t * W, const int8_t * Xq, const float * Xs, 
     if (report && !reported[dev & 63]) {
         cudaFuncAttributes attr;
         int blocks = 0, reserved = 0, sm_shared = 0;
-        CUDA_CHECK_AI4K(cudaFuncGetAttributes(&attr, mmvr<LAY, XSH, ID, KT, STAGES, WARPS, MINB, DIRECT, FUSED_X, SPLITS, LOOP_UNROLL>));
-        CUDA_CHECK_AI4K(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, mmvr<LAY, XSH, ID, KT, STAGES, WARPS, MINB, DIRECT, FUSED_X, SPLITS, LOOP_UNROLL>, WARPS*32, smem));
+        CUDA_CHECK_AI4K(cudaFuncGetAttributes(&attr, mmvr<LAY, XSH, ID, KT, STAGES, WARPS, MINB, DIRECT, FUSED_X, SPLITS, LOOP_UNROLL, SINGLE_N>));
+        CUDA_CHECK_AI4K(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, mmvr<LAY, XSH, ID, KT, STAGES, WARPS, MINB, DIRECT, FUSED_X, SPLITS, LOOP_UNROLL, SINGLE_N>, WARPS*32, smem));
         CUDA_CHECK_AI4K(cudaDeviceGetAttribute(&reserved, cudaDevAttrReservedSharedMemoryPerBlock, dev));
         CUDA_CHECK_AI4K(cudaDeviceGetAttribute(&sm_shared, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev));
-        fprintf(stderr, "AI23 MMVR resource LAY=%d XSH=%d ID=%d KT=%d ST=%d WARPS=%d MINB=%d DIRECT=%d FUSED_X=%d SPLITS=%d UNROLL=%d REG=%d STATIC_SHARED=%zu DYNAMIC_SHARED=%d RESERVED_SHARED=%d SM_SHARED=%d LOCAL=%zu ACTIVE_BLOCKS=%d GRID=%u,%u,%u\n",
-                LAY, XSH, ID, KT, STAGES, WARPS, MINB, DIRECT, FUSED_X, SPLITS, LOOP_UNROLL,
+        fprintf(stderr, "AI23 MMVR resource LAY=%d XSH=%d ID=%d KT=%d ST=%d WARPS=%d MINB=%d DIRECT=%d FUSED_X=%d SPLITS=%d UNROLL=%d SINGLE_N=%d REG=%d STATIC_SHARED=%zu DYNAMIC_SHARED=%d RESERVED_SHARED=%d SM_SHARED=%d LOCAL=%zu ACTIVE_BLOCKS=%d GRID=%u,%u,%u\n",
+                LAY, XSH, ID, KT, STAGES, WARPS, MINB, DIRECT, FUSED_X, SPLITS, LOOP_UNROLL, SINGLE_N,
                 attr.numRegs, attr.sharedSizeBytes, smem, reserved, sm_shared, attr.localSizeBytes, blocks, grid.x, grid.y, grid.z);
         reported[dev & 63] = true;
     }
-    mmvr<LAY, XSH, ID, KT, STAGES, WARPS, MINB, DIRECT, FUSED_X, SPLITS, LOOP_UNROLL><<<grid, WARPS*32, smem, stream>>>(W, Xq, Xs, Y, ldy, M, N, K, idm);
+    mmvr<LAY, XSH, ID, KT, STAGES, WARPS, MINB, DIRECT, FUSED_X, SPLITS, LOOP_UNROLL, SINGLE_N><<<grid, WARPS*32, smem, stream>>>(W, Xq, Xs, Y, ldy, M, N, K, idm);
 }
 
 // ---------------------------------------------------------------------------------------------
