@@ -3798,6 +3798,34 @@ bool llama_context::set_adapter_cvec(const float * data, size_t len, int32_t n_e
     return res;
 }
 
+// [PREFILLFAST diag] LLAMA_DECODE_HOST_US=1: host time split of each helper (MTP) decode of >= 256 rows, one log line
+// per call. Diagnostic only (one clock read per mark); never set it on timed runs.
+static bool llama_decode_host_us_enabled() {
+    static const bool v = [] { const char * e = getenv("LLAMA_DECODE_HOST_US"); return e && e[0] == '1'; }();
+    return v;
+}
+struct llama_decode_host_us {
+    bool on = false;
+    int n = 0;
+    int64_t t_last = 0;
+    const char * name[32];
+    int64_t us[32];
+    void start(bool enable) { on = enable; n = 0; if (on) { t_last = ggml_time_us(); } }
+    void mark(const char * nm) {
+        if (!on || n >= 32) { return; }
+        const int64_t t = ggml_time_us();
+        name[n] = nm; us[n++] = t - t_last; t_last = t;
+    }
+    void print(uint32_t rows) {
+        if (!on) { return; }
+        on = false;
+        std::string line; char buf[64]; int64_t total = 0;
+        for (int i = 0; i < n; ++i) { snprintf(buf, sizeof(buf), " %s %.2f", name[i], us[i]/1000.0); line += buf; total += us[i]; }
+        LLAMA_LOG_WARN("decode host ms (helper, %u rows): total %.2f |%s\n", rows, total/1000.0, line.c_str());
+    }
+};
+static thread_local llama_decode_host_us g_decode_host_us;
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch,
                                                  llm_graph_type           gtype,
                                                  llama_memory_context_i * mctx,
@@ -3852,7 +3880,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
         }
     }
 
+    g_decode_host_us.mark("apply");
     mtp_scratch_prepare(n_outputs == 0, mctx, &ubatch);
+    g_decode_host_us.mark("scratch2");
 
 build_graph:
     auto * res = get_gf_res_prev();
@@ -3893,6 +3923,7 @@ build_graph:
         //const auto t_start_us = ggml_time_us();
 
         gf = model.build_graph(gparams);
+        g_decode_host_us.mark("build");
 
         if (gf && (!model.hadamard_rotations.empty() || !model.hadamard_inverses.empty())) {
             llama_verify_hadamard_graph(gf, model.hadamard_rotations, model.hadamard_inverses);
@@ -3921,6 +3952,7 @@ build_graph:
             return nullptr;
         }
 
+        g_decode_host_us.mark("alloc");
         // [B1] a layer-range graph is never reused: its carry, KV views and expert slots change every call
         gf_res_prev_active = b1_cur.active ? nullptr : res;
         gf_res_prev_epoch  = ggml_backend_sched_get_alloc_epoch(sched.get());
@@ -3959,12 +3991,15 @@ build_graph:
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    g_decode_host_us.mark("inputs");
     if (compute_is_shared() && compute_peer->sched) {
         // the peer's last graph may still be running on its own stream over the shared buffers
         ggml_backend_sched_synchronize(compute_peer->sched.get());
     }
+    g_decode_host_us.mark("peersync");
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    g_decode_host_us.mark("compute");
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -4402,6 +4437,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         return -1;
     }
 
+    g_decode_host_us.start(llama_decode_host_us_enabled() && cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && batch_inp.tokens.size() >= 256);
     if (batch_inp.n_embd > 0 && batch_inp.n_embd != batch_inp.n_embd_inp) {
         LLAMA_LOG_ERROR("%s: embd row width %zu does not match the decoder input %zu\n",
                 __func__, batch_inp.n_embd, batch_inp.n_embd_inp);
@@ -4454,6 +4490,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         return -1;
     }
 
+    g_decode_host_us.mark("balloc");
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
     const uint32_t n_outputs_all = balloc->get_n_outputs();
 
@@ -4505,14 +4542,16 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     }
     embd_seq.clear();
 
+    g_decode_host_us.mark("pre");
     if (!prompt_buffers_resize(n_tokens_all, &batch_inp)) {
         return -2;
     }
+    g_decode_host_us.mark("bufresize");
     b1_cache_collect = false;
     if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && n_tokens_all > 3072 &&
             (sched_reserve_tokens > 512 || b1_ffn_scratch_active || b1_layer_scratch_active)) {
         b1_cache_begin();
-        b1_cache_collect = b1_cache_warm_enabled;
+        b1_cache_collect = b1_cache_warm_enabled && b1_cache_collect_wanted();
     }
     struct cache_capture_guard {
         bool & active;
@@ -4538,12 +4577,15 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         mtp_scratch_end();
     }
     sched_reserve();
+    g_decode_host_us.mark("reserve");
     mtp_scratch_prepare(n_outputs_all == 0);
+    g_decode_host_us.mark("scratch");
 
     bool did_optimize = false;
 
     // handle any pending shifts/copies
     memory_update(false);
+    g_decode_host_us.mark("memupd");
 
     llama_memory_context_ptr mctx;
 
@@ -4594,6 +4636,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         break;
     }
 
+    g_decode_host_us.mark("initbatch");
     // reserve output buffer
     if (output_reserve(n_outputs_all, n_tokens_all) < n_outputs_all) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
@@ -4601,7 +4644,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     };
 
     // [B1] layer-major prefill: plan the call and apply every ubatch up front, or give lent experts back first
+    g_decode_host_us.mark("outres");
     const int b1_mode = b1_prepare(mctx.get(), batch_inp, n_tokens_all, n_outputs_all);
+    g_decode_host_us.mark("b1prep");
     if (b1_mode < 0) {
         b1_cache_counts.clear();
         b1_cache_readbacks = 0;
@@ -5048,6 +5093,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
 
+    g_decode_host_us.mark("tail");
+    g_decode_host_us.print(n_tokens_all);
     return 0;
 }
 
@@ -6107,12 +6154,28 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
 
     b1_compute_submit_us = 0;
     b1_cache_begin();
-    b1_cache_collect = b1_cache_warm_enabled;
+    b1_cache_collect = b1_cache_warm_enabled && b1_cache_collect_wanted();
 
     LLAMA_LOG_WARN("%s: [B1] layer-major prefill of %u tokens: %zu ubatches, %zu groups of %zu, %s\n", __func__,
             n_tokens_all, sizes.size(), b1->n_groups(), b1->group_ub(), others ? "other sequences present" : "alone");
     b1_memory_trim("B1 prepared");
     return 1;
+}
+
+// [PREFILLFAST] LLAMA_B1_CACHE_COLLECT=0: do not read back the prompt's expert routing during the
+// layer-major prefill. Collecting installs a per-node host callback for the whole prompt pass: every
+// ffn_moe_topk node splits the layer graph, waits for a read-back, and turns off CUDA graphs (~2.2 s
+// at 100K). With GGML_MOE_CACHE_PROFILE_GLOBAL=1 the post-prompt warm ranks experts by the saved
+// profile and ignores these counts, so the warm is the same. The split also stops the CUDA backend
+// fusing the routing ops across it, so collect-off runs the fused routing math that every other
+// decode uses; tokens then differ by rounding only (identical with GGML_CUDA_DISABLE_FUSION=1 in
+// both arms). Default: collect.
+bool llama_context::b1_cache_collect_wanted() {
+    static const bool wanted = [] {
+        const char * e = getenv("LLAMA_B1_CACHE_COLLECT");
+        return !(e && strcmp(e, "0") == 0);
+    }();
+    return wanted;
 }
 
 void llama_context::b1_cache_begin() {

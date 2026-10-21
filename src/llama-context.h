@@ -639,6 +639,7 @@ private:
     // fork: opt-in prompt routing counts use layer IDs, never temporary B1 weight addresses.
     bool b1_cache_warm_enabled = false;
     bool b1_cache_collect = false;
+    static bool b1_cache_collect_wanted();
     bool b1_cache_needs_refresh = false;
     bool b1_cache_profile_attempted = false;
     bool b1_cache_device_pending = false;
