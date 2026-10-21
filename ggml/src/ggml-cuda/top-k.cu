@@ -126,6 +126,10 @@ static bool ggml_cuda_top_k_tiled_fits(const int64_t ncols, const int64_t k) {
     return ncols > TOPK_CAND && ((ncols + tile - 1) / tile) * k <= TOPK_CAND;
 }
 
+// [PREFILLFAST] GGML_CUDA_TOPK_TILE_SELECT=1: the per-tile candidate pick by radix select (defined below)
+static bool topk_tile_select_launch(const float * src, float * cand_val, int * cand_idx, int ncols, int nrows, int ntiles,
+                                    int k, int tile, cudaStream_t stream);
+
 static bool ggml_cuda_top_k_tiled(ggml_cuda_pool & pool, const float * src, int * dst,
                                   const int ncols, const int nrows, const int k,
                                   cudaStream_t stream) {
@@ -141,7 +145,10 @@ static bool ggml_cuda_top_k_tiled(ggml_cuda_pool & pool, const float * src, int 
     ggml_cuda_pool_alloc<int>   cand_idx(pool, (size_t) nrows * ncand);
     ggml_cuda_pool_alloc<int>   order   (pool, (size_t) nrows * ncand);
 
-    if (tile == TOPK_TILE_WIDE) {
+    static const bool tile_select = [] { const char * e = getenv("GGML_CUDA_TOPK_TILE_SELECT"); return e && atoi(e) != 0; }();
+    if (tile_select && topk_tile_select_launch(src, cand_val.get(), cand_idx.get(), ncols, nrows, ntiles, k, tile, stream)) {
+        // same candidates in the same order as topk_tile
+    } else if (tile == TOPK_TILE_WIDE) {
         topk_tile<TOPK_TILE_WIDE, TOPK_BLOCK><<<nrows * ntiles, TOPK_BLOCK, 0, stream>>>(
                 src, cand_val.get(), cand_idx.get(), ncols, ntiles, k);
     } else {
@@ -553,6 +560,150 @@ static __global__ void __launch_bounds__(BLOCK) topk_select_rows_fast(const floa
         n_gt   -= __popc(bg);
         eq_off += __popc(be);
     }
+}
+
+// [PREFILLFAST] same candidates as topk_tile, by radix select: per tile the top k by the 64-bit key (value bits, then
+// the lower column first), written in descending key order. Keys are unique (the column is part of them), so the set and
+// the order are fully determined, and a tile with fewer than k columns ends with (-inf, 0) like topk_tile.
+template <int TILE, int BLOCK, int KMAX>
+static __global__ void __launch_bounds__(BLOCK) topk_tile_select(const float * src, float * cand_val, int * cand_idx,
+                                                                 const int ncols, const int ntiles, const int k) {
+    constexpr int PER = TILE / BLOCK;
+    constexpr int BPT = TOPK_SEL_BINS / BLOCK;
+    __shared__ int      hist[TOPK_SEL_BINS];
+    __shared__ int      s_warp[BLOCK/32];
+    __shared__ int      s_digit;
+    __shared__ int      s_rank;
+    __shared__ int      s_n;
+    __shared__ uint64_t s_keys[KMAX];
+    const int     row     = blockIdx.x / ntiles;
+    const int     tile    = blockIdx.x % ntiles;
+    const float * row_ptr = src + (size_t) row * ncols;
+    const int     tid     = threadIdx.x;
+    uint32_t hi[PER];
+    int n_valid = 0;
+#pragma unroll
+    for (int i = 0; i < PER; ++i) {
+        const int col = tile * TILE + tid + i * BLOCK;
+        uint32_t  b   = col < ncols ? __float_as_uint(row_ptr[col]) : 0;
+        b = (b & 0x80000000u) ? ~b : (b | 0x80000000u);
+        hi[i] = b;
+        n_valid += col < ncols;
+    }
+    // valid columns of this tile (a prefix of the tile, so the same for every thread layout)
+    const int tile_valid = min(TILE, ncols - tile * TILE);
+    const int want = min(k, tile_valid);
+
+    uint32_t prefix = 0, pmask = 0;
+    int rank = want;
+    if (want < tile_valid) {
+#pragma unroll 1
+        for (int pass = 0; pass < 3; ++pass) {
+            const int      shift = pass == 0 ? 21 : (pass == 1 ? 10 : 0);
+            const uint32_t dmask = pass == 2 ? 0x3FFu : 0x7FFu;
+            for (int i = tid; i < TOPK_SEL_BINS; i += BLOCK) hist[i] = 0;
+            __syncthreads();
+#pragma unroll
+            for (int i = 0; i < PER; ++i) {
+                const int col = tile * TILE + tid + i * BLOCK;
+                if (col < ncols && (hi[i] & pmask) == prefix) atomicAdd(&hist[(hi[i] >> shift) & dmask], 1);
+            }
+            __syncthreads();
+            int own = 0;
+#pragma unroll
+            for (int j = 0; j < BPT; ++j) own += hist[TOPK_SEL_BINS - 1 - BPT*tid - j];
+            int total;
+            int above = topk_sel_scan<BLOCK>(own, s_warp, &total);
+#pragma unroll
+            for (int j = 0; j < BPT; ++j) {
+                const int b = TOPK_SEL_BINS - 1 - BPT*tid - j;
+                const int h = hist[b];
+                if (above < rank && above + h >= rank) { s_digit = b; s_rank = rank - above; }
+                above += h;
+            }
+            __syncthreads();
+            prefix |= (uint32_t) s_digit << shift;
+            pmask  |= dmask << shift;
+            rank    = s_rank;
+            __syncthreads();
+        }
+    }
+    // selected: value key above the threshold, or equal to it and among the first `rank` such columns by column order
+    if (tid == 0) s_n = 0;
+    __syncthreads();
+    int n_eq_before = 0; // equal keys in earlier columns, counted in column order: i major, thread minor
+#pragma unroll
+    for (int i = 0; i < PER; ++i) {
+        const int  col = tile * TILE + tid + i * BLOCK;
+        const bool ok  = col < ncols;
+        bool sel;
+        bool eq = false;
+        if (want == tile_valid) {
+            sel = ok;
+        } else {
+            sel = ok && hi[i] > prefix;
+            eq  = ok && hi[i] == prefix;
+        }
+        int total;
+        const int excl = topk_sel_scan<BLOCK>(eq ? 1 : 0, s_warp, &total);
+        if (eq && n_eq_before + excl < rank) sel = true;
+        n_eq_before += total;
+        if (sel) {
+            const int p = atomicAdd(&s_n, 1);
+            s_keys[p] = ((uint64_t) hi[i] << 32) | (uint32_t) (ncols - 1 - col);
+        }
+    }
+    __syncthreads();
+    // pad to KMAX with 0 (sorts last), bitonic sort descending over KMAX keys
+    for (int i = want + tid; i < KMAX; i += BLOCK) s_keys[i] = 0;
+    __syncthreads();
+    for (int kk = 2; kk <= KMAX; kk *= 2) {
+        for (int j = kk / 2; j > 0; j /= 2) {
+            for (int c = tid; c < KMAX; c += BLOCK) {
+                const int x = c ^ j;
+                if (x > c) {
+                    const uint64_t a = s_keys[c], b = s_keys[x];
+                    const bool desc = (c & kk) == 0;
+                    if (desc ? a < b : a > b) { s_keys[c] = b; s_keys[x] = a; }
+                }
+            }
+            __syncthreads();
+        }
+    }
+    const size_t out = ((size_t) row * ntiles + tile) * k;
+    for (int j = tid; j < k; j += BLOCK) {
+        const uint64_t best = s_keys[j];
+        const int col = ncols - 1 - (int) (best & 0xFFFFFFFFu);
+        cand_val[out + j] = best ? row_ptr[col] : -INFINITY;
+        cand_idx[out + j] = best ? col : 0;
+    }
+}
+
+
+// topk_tile spends k block-wide max reductions per tile (about 60 ms for 12,288 rows of 6,144 columns at k 512 on a
+// 3090 Ti); this finds the same top k of the tile's unique (value, -column) keys with three histogram passes, then sorts
+// only those k. Same candidates, same order, so the argsort and the result are unchanged.
+static bool topk_tile_select_launch(const float * src, float * cand_val, int * cand_idx, int ncols, int nrows, int ntiles,
+                                    int k, int tile, cudaStream_t stream) {
+    if (k > 1024 || (tile != TOPK_TILE && tile != TOPK_TILE_WIDE)) {
+        return false;
+    }
+    const dim3 grid(nrows * ntiles);
+#define TOPK_TS_CASE(T, KM) topk_tile_select<T, TOPK_BLOCK, KM><<<grid, TOPK_BLOCK, 0, stream>>>(src, cand_val, cand_idx, ncols, ntiles, k)
+    if (tile == TOPK_TILE) {
+        if      (k <= 128) { TOPK_TS_CASE(TOPK_TILE, 128); }
+        else if (k <= 256) { TOPK_TS_CASE(TOPK_TILE, 256); }
+        else if (k <= 512) { TOPK_TS_CASE(TOPK_TILE, 512); }
+        else               { TOPK_TS_CASE(TOPK_TILE, 1024); }
+    } else {
+        if      (k <= 128) { TOPK_TS_CASE(TOPK_TILE_WIDE, 128); }
+        else if (k <= 256) { TOPK_TS_CASE(TOPK_TILE_WIDE, 256); }
+        else if (k <= 512) { TOPK_TS_CASE(TOPK_TILE_WIDE, 512); }
+        else               { TOPK_TS_CASE(TOPK_TILE_WIDE, 1024); }
+    }
+#undef TOPK_TS_CASE
+    CUDA_CHECK(cudaGetLastError());
+    return true;
 }
 
 static __device__ __forceinline__ unsigned long long topk_sel_mix(unsigned long long x) {
