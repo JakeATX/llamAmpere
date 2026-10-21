@@ -94,7 +94,7 @@ The existing `--moe-cache auto` uses the free CUDA memory after this allocation;
 
 In matched 100,000-token inference checks with 131,072 cells allocated and the same 3,072 MiB reserve, the expert allocator received 626.25 MiB more with the split. This uses the existing free-minus-reserve policy; no new expert-cache budget flag or manual credit is needed.
 
-`test-sjkvarn-attn --resident` and `--resident-tq6` compare split and full-card attention exactly, including cold and warm selected blocks. `test-sjkvarn-state --resident` checks split/full state transfers and continuation. The guarded `scripts/gate-fnkvwin-cache.py --mtp` model gate checks a 100,000-token prefix across a cold server restart: the main state, `.ckpt` checkpoint sidecar, and `.dft` MTP draft state must all retain the same size and SHA-256 hash. Restored continuation must reuse the saved prefix.
+`test-sjkvarn-attn --resident` and `--resident-tq6` compare split and full-card attention exactly, including cold and warm selected blocks. `test-sjkvarn-state --resident` checks split/full state transfers and continuation. A saved 100,000-token prefix must survive a cold server restart: the main state, `.ckpt` checkpoint sidecar, and `.dft` MTP draft state keep the same size and SHA-256 hash, and the restored continuation reuses the saved prefix.
 
 Three SJ-KVaRN body configurations are the production paths, all with the staged sink (`--sjkvarn-sink 128`) and the
 adaptive tq6_0 tail (`--sjkvarn-tail 4096 --sjkvarn-tail-max 8192`). The adaptive tail is the default for every SJ-KVaRN body (`--sjkvarn-tail 4096 --sjkvarn-tail-max 8192`); `--sjkvarn-tail-max 0` selects a fixed tail. A larger `--sjkvarn-tail` without `--sjkvarn-tail-max` raises the ceiling to match:
