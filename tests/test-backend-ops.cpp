@@ -13321,6 +13321,81 @@ static const ggml_type other_types[] = {
 #pragma optimize("", off)
 #endif
 
+// [v0.6/all] AI+ rates 2 and 3 parity matrix from aiplus/fastmath 8c4d63427 (correctness cases only; the perf list and
+// the private A/B types stay on that branch). Unit (AI2_U / AI3_U) and span (AI2_S / AI3_S) layouts; with
+// GGML_CUDA_AI23_FAST=1 these run the IMMA kernels, unset the rate-k reference path: mmv (n 1-8), GEMM BN64 / BN128,
+// H256 and H128 tails, partial 128-row CTAs, mmv-ID / GEMM-ID with 512 experts top 10, small expert counts, repeated ids.
+static void add_ai23_cases(std::vector<std::unique_ptr<test_case>> & cases) {
+    const ggml_type UT[] = { GGML_TYPE_AI2_U, GGML_TYPE_AI3_U };
+    const ggml_type ST[] = { GGML_TYPE_AI2_S, GGML_TYPE_AI3_S };
+    for (ggml_type t : {GGML_TYPE_AI2_U, GGML_TYPE_AI3_U, GGML_TYPE_AI2_S, GGML_TYPE_AI3_S}) {
+        for (int64_t k : {5120, 17408}) {
+            for (int64_t n : {1, 2, 4, 8, 9, 16, 17, 32, 33, 64}) {
+                cases.emplace_back(new test_mul_mat_ai4(144, n, k, t));
+            }
+        }
+    }
+    for (const ggml_type t : UT) {
+        for (int64_t n : {1, 2, 3, 4, 5, 6, 7, 8, 9, 16, 33, 64, 65, 511, 512, 600}) {
+            cases.emplace_back(new test_mul_mat_ai4(640,  n, 2560, t));   // H256
+            cases.emplace_back(new test_mul_mat_ai4(2560, n, 640,  t));   // H128
+        }
+        for (int64_t n : {1, 5, 8, 9, 130}) {
+            cases.emplace_back(new test_mul_mat_ai4(16,  n, 128,  t));
+            cases.emplace_back(new test_mul_mat_ai4(48,  n, 384,  t));
+            cases.emplace_back(new test_mul_mat_ai4(144, n, 1152, t));
+            cases.emplace_back(new test_mul_mat_ai4(400, n, 3072, t));    // partial 128-row CTA
+            cases.emplace_back(new test_mul_mat_ai4(592, n, 1024, t));
+        }
+        cases.emplace_back(new test_mul_mat_ai4(17408, 1, 5120, t));       // Qwen3.8-27B
+        cases.emplace_back(new test_mul_mat_ai4(5120,  8, 17408, t));
+        cases.emplace_back(new test_mul_mat_ai4(10240, 4, 5120, t));
+        cases.emplace_back(new test_mul_mat_ai4(6144, 70, 5120, t));
+        cases.emplace_back(new test_mul_mat_ai4(5120, 600, 17408, t));
+        for (int n : {1, 2, 4, 8, 9, 16, 32, 200, 600}) {
+            cases.emplace_back(new test_mul_mat_id_ai4(t, 512, 10, true,  640,  n, 2560));
+            cases.emplace_back(new test_mul_mat_id_ai4(t, 512, 10, false, 2560, n, 640));
+        }
+        for (int n : {1, 3, 8, 17, 129}) {
+            cases.emplace_back(new test_mul_mat_id_ai4(t, 4, 2, false, 32, n, 256));
+            cases.emplace_back(new test_mul_mat_id_ai4(t, 8, 8, true,  48, n, 384));
+            cases.emplace_back(new test_mul_mat_id_ai4(t, 6, 1, true,  16, n, 128));
+            cases.emplace_back(new test_mul_mat_id_ai4(t, 40, 8, false, 1536, n, 512));
+        }
+        for (int n : {1, 2, 5, 8, 9, 33}) {
+            cases.emplace_back(new test_mul_mat_id_ai4(t, 512, 10, true,  640,  n, 2560, true));
+            cases.emplace_back(new test_mul_mat_id_ai4(t, 512, 10, false, 2560, n, 640,  true));
+            cases.emplace_back(new test_mul_mat_id_ai4(t, 4, 3, false, 32, n, 256, true));
+        }
+    }
+    for (const ggml_type t : ST) {
+        for (int64_t n : {1, 2, 3, 4, 5, 6, 7, 8, 9, 33, 64, 65, 512, 600}) {
+            cases.emplace_back(new test_mul_mat_ai4(640,  n, 2048, t));
+            cases.emplace_back(new test_mul_mat_ai4(2560, n, 1024, t));
+        }
+        cases.emplace_back(new test_mul_mat_ai4(16,   1, 1024, t));
+        cases.emplace_back(new test_mul_mat_ai4(48,   7, 1024, t));
+        cases.emplace_back(new test_mul_mat_ai4(144, 37, 2048, t));
+        cases.emplace_back(new test_mul_mat_ai4(400, 130, 3072, t));
+        cases.emplace_back(new test_mul_mat_ai4(17408, 1, 5120, t));
+        cases.emplace_back(new test_mul_mat_ai4(5120,  8, 17408, t));
+        cases.emplace_back(new test_mul_mat_ai4(6144, 70, 5120, t));
+        cases.emplace_back(new test_mul_mat_ai4(592, 5, 1024, t));
+        for (int n : {1, 2, 4, 8, 9, 32, 200}) {
+            cases.emplace_back(new test_mul_mat_id_ai4(t, 512, 10, true,  640,  n, 2048));
+            cases.emplace_back(new test_mul_mat_id_ai4(t, 512, 10, false, 2560, n, 1024));
+        }
+        for (int n : {1, 3, 8, 17, 129}) {
+            cases.emplace_back(new test_mul_mat_id_ai4(t, 4, 2, false, 32, n, 1024));
+            cases.emplace_back(new test_mul_mat_id_ai4(t, 8, 8, true,  48, n, 2048));
+        }
+        for (int n : {1, 2, 5, 8, 9, 33}) {
+            cases.emplace_back(new test_mul_mat_id_ai4(t, 512, 10, true, 640, n, 2048, true));
+            cases.emplace_back(new test_mul_mat_id_ai4(t, 4, 3, false, 32, n, 1024, true));
+        }
+    }
+}
+
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
@@ -13353,6 +13428,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    add_ai23_cases(test_cases);
     // Public AI+ layouts: decode, GEMM, H128 tails, and routed expert reads.
     for (ggml_type type : {GGML_TYPE_AI4, GGML_TYPE_AI4_U, GGML_TYPE_AI2_U, GGML_TYPE_AI3_U,
                           GGML_TYPE_AI5_U, GGML_TYPE_AI6_U, GGML_TYPE_AI2_S, GGML_TYPE_AI3_S,
