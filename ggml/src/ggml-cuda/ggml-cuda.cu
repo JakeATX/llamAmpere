@@ -3092,7 +3092,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     return use_mul_mat_vec_f;
 }
 
-static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
+static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor, bool allow_batch_glu = false) {
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
@@ -3115,9 +3115,16 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     if (cc <= GGML_CUDA_CC_PASCAL) {
         return false;
     }
-    //we only support fusion for ncols_dst = 1
+    // fork: batch fusion is limited to plain GLU and the shared-expert formats.
     if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1) {
-        return false;
+        static const bool batch_glu = [] {
+            const char * value = getenv("GGML_CUDA_MMVQ_BATCH_GLU");
+            return value && strcmp(value, "1") == 0;
+        }();
+        const bool supported_type = src0->type == GGML_TYPE_IQ3_S || src0->type == GGML_TYPE_IQ4_XS || src0->type == GGML_TYPE_Q4_K;
+        if (!allow_batch_glu || !batch_glu || !supported_type || dst->ne[1] > 8) {
+            return false;
+        }
     }
 
     if (tensor->op == GGML_OP_MUL_MAT_ID && dst->ne[2] > get_mmvq_mmid_max_batch(src0->type, cc)) {
@@ -6765,11 +6772,18 @@ static int ggml_cuda_hc_post_norm_last(const ggml_cgraph * cgraph, int i) {
     return i + 2;
 }
 
-// GGML_LEDGER=1: why a candidate did not fuse, site cuda.hc_norm
-static int ggml_cuda_hc_norm_refuse(const char * key) {
-    if (ggml_ledger_enabled()) {
-        ggml_ledger_add("cuda.hc_norm", key, 1);
+static void ggml_cuda_hc_norm_note(const char * key) {
+    static const bool enabled = [] {
+        const char * value = getenv("GGML_CUDA_HC_NORM_STATS");
+        return value && strcmp(value, "1") == 0;
+    }();
+    if (enabled) {
+        GGML_LOG_INFO("cuda.hc_norm: %s\n", key);
     }
+}
+
+static int ggml_cuda_hc_norm_refuse(const char * key) {
+    ggml_cuda_hc_norm_note(key);
     return -1;
 }
 
@@ -6880,13 +6894,11 @@ static int ggml_cuda_fuse_hc_norm(ggml_backend_cuda_context & ctx, const ggml_cg
     if (hpost == nullptr && pre_idx < 0) {
         return -1;
     }
-    if (ggml_ledger_enabled()) {
-        if (hpost != nullptr) {
-            ggml_ledger_add("cuda.hc_norm", mul->data == res->data ? "post:fused xn_on_residual" : "post:fused", 1);
-        }
-        if (pre_idx >= 0) {
-            ggml_ledger_add("cuda.hc_norm", "xn:fused", 1);
-        }
+    if (hpost != nullptr) {
+        ggml_cuda_hc_norm_note(mul->data == res->data ? "post:fused xn_on_residual" : "post:fused");
+    }
+    if (pre_idx >= 0) {
+        ggml_cuda_hc_norm_note("xn:fused");
     }
     float * row_scale = pre_idx >= 0 ? (float *) mul->data : nullptr;
 
@@ -7764,7 +7776,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 break;
             }
 
-            if (ggml_cuda_should_fuse_mul_mat_vec_q(up)) {
+            if (ggml_cuda_should_fuse_mul_mat_vec_q(up, true)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate      = gate->src[0];
                 fusion_data.glu_op    = ggml_get_glu_op(glu);

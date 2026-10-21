@@ -1230,6 +1230,23 @@ static __global__ void mul_mat_vec_q(
                 for (int j = 0; j < ncols_dst; ++j) {
                     tmp[j][i] += dots[j];
                 }
+                if constexpr (has_fusion) {
+                    if (use_gate) {
+                        float gate_dots[ncols_dst];
+                        if constexpr (type == GGML_TYPE_IQ4_XS) {
+                            vec_dot_iq4_xs_q8_1_multi<ncols_dst>(
+                                vgate, y, stride_col_y, kby, kbx_offset + i*stride_row_x + kbx, kqs, gate_dots);
+                        } else {
+                            static_assert(type == GGML_TYPE_Q4_K, "unsupported fused weight reuse type");
+                            vec_dot_q4_K_q8_1_multi<ncols_dst>(
+                                vgate, y, stride_col_y, kby, kbx_offset + i*stride_row_x + kbx, kqs, gate_dots);
+                        }
+#pragma unroll
+                        for (int j = 0; j < ncols_dst; ++j) {
+                            tmp_gate[j][i] += gate_dots[j];
+                        }
+                    }
+                }
             }
         } else {
 #pragma unroll
@@ -1575,7 +1592,8 @@ static void mul_mat_vec_q_switch_fusion(
             iq3_smem = cc == 860 && use;
         }
 
-        if constexpr (c_ncols_dst == 1) {
+        if constexpr (c_ncols_dst == 1 || (c_ncols_dst <= 8 &&
+                (type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_Q4_K))) {
             if (has_fusion) {
                 const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
                 if constexpr (ggml_cuda_mmvq_smem_grid_type(type)) {
@@ -1587,6 +1605,18 @@ static void mul_mat_vec_q_switch_fusion(
                         return;
                     }
                 }
+                if constexpr ((type == GGML_TYPE_IQ4_XS && c_ncols_dst >= 2 && c_ncols_dst <= 5) ||
+                        (type == GGML_TYPE_Q4_K && c_ncols_dst >= 3 && c_ncols_dst <= 5)) {
+                    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+                    const bool reuse = type == GGML_TYPE_IQ4_XS ? ggml_cuda_sm86_iq4_reuse() : ggml_cuda_sm86_exact_reuse();
+                    if (cc == 860 && reuse) {
+                        ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters, true, nw1, false, check_rows>, launch_params,
+                            vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
+                            channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                            sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, nrows_x);
+                        return;
+                    }
+                }
                 ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters, false, nw1, false, check_rows>, launch_params,
                      vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
                      channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
@@ -1595,7 +1625,7 @@ static void mul_mat_vec_q_switch_fusion(
             }
         }
 
-        GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
+        GGML_ASSERT(!has_fusion && "unsupported batch fusion type");
 
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
         if constexpr (ggml_cuda_mmvq_smem_grid_type(type)) {
@@ -1631,7 +1661,7 @@ static void mul_mat_vec_q_switch_fusion(
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const int rows_per_block = calc_rows_per_block(type, c_ncols_dst, get_device_table_id(cc), small_k, block_dims.y);
-    // Full blocks need no row predicates in the inner dot-product loops.
+    // Keep partial-row guards; specialize complete row blocks before launch.
     if (nrows_x % rows_per_block == 0) {
         launch(std::false_type{});
     } else {
@@ -2400,7 +2430,9 @@ void ggml_cuda_mul_mat_vec_q(
     if (fusion) {
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
         GGML_ASSERT( !ids || dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc));
-        GGML_ASSERT(  ids || dst->ne[1] == 1);
+        GGML_ASSERT(ids || dst->ne[1] == 1 || (dst->ne[1] <= 8 && fusion->gate &&
+                !fusion->x_bias && !fusion->gate_bias && !fusion->x_scale && !fusion->gate_scale &&
+                (src0->type == GGML_TYPE_IQ3_S || src0->type == GGML_TYPE_IQ4_XS || src0->type == GGML_TYPE_Q4_K)));
         // Scale fusion is only allowed for NVFP4 currently as the cost of checking this at run-time in the prologue is
         // non-negligible for some models such as gpt-oss-20b
         GGML_ASSERT((fusion->x_scale == nullptr && fusion->gate_scale == nullptr) || src0->type == GGML_TYPE_NVFP4);
