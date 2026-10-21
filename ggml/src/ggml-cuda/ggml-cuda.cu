@@ -10219,6 +10219,10 @@ int64_t ggml_backend_cuda_fusion_count(ggml_backend_t backend, const char * name
     if (strcmp(name, "gdn_state_read") == 0) {
         return ctx->fusion_stats.gdn_state_read;
     }
+    if (strcmp(name, "gdn_khshare") == 0) {
+        extern int64_t ggml_cuda_gdn_khshare_count; // gated_delta_net.cu (#199)
+        return ggml_cuda_gdn_khshare_count;
+    }
     if (strcmp(name, "conv_ring") == 0) {
         return ctx->fusion_stats.conv_ring;
     }

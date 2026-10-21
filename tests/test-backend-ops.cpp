@@ -5670,6 +5670,25 @@ struct test_rwkv_wkv6 : public test_case {
     }
 };
 
+// [#199] key-head-shared prefill kernel (on by default; GGML_CUDA_GDN_KHSHARE=0 turns it off): shapes it must take
+// (S_v 128, scalar gate, full-state snapshots, >= GGML_CUDA_GDN_KHSHARE_MIN tokens, <= 4 value heads per key head)
+static const char * gdn_khshare_expected(int64_t head_size, int64_t n_tokens, bool kda, int32_t emit_mode, int64_t v_repeat) {
+    const char * on = getenv("GGML_CUDA_GDN_KHSHARE");
+    if (on != nullptr && atoi(on) == 0) {
+        return nullptr;
+    }
+    // the opt-in prompt kernels tried before it (Argon chunked, subwarp, R16) take these shapes first when switched on
+    for (const char * pre : { "GGML_CUDA_GDN_CHUNKED", "GGML_CUDA_GDN_SUBWARP", "GGML_CUDA_GDN_R16" }) {
+        const char * e = getenv(pre);
+        if (e != nullptr && atoi(e) != 0) {
+            return nullptr;
+        }
+    }
+    const char * mn = getenv("GGML_CUDA_GDN_KHSHARE_MIN");
+    const int64_t min_t = mn ? atoll(mn) : 64;
+    return head_size == 128 && !kda && emit_mode == 0 && n_tokens >= min_t && v_repeat >= 1 && v_repeat <= 4 ? "gdn_khshare" : nullptr;
+}
+
 // GGML_OP_GATED_DELTA_NET
 struct test_gated_delta_net : public test_case {
     const ggml_type type;
@@ -5693,6 +5712,10 @@ struct test_gated_delta_net : public test_case {
             int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1, int32_t emit_mode = 0)
         : type(type), head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs),
           v_repeat(v_repeat), permuted(permuted), kda(kda), K(K), emit_mode(emit_mode) {}
+
+    const char * required_fusion() override {
+        return gdn_khshare_expected(head_size, n_seq_tokens, kda, emit_mode, v_repeat);
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q;
@@ -6072,22 +6095,28 @@ struct test_gated_delta_net_cache_fusion : public test_case {
     const int64_t K; // snapshot slot count (>1)
     const ggml_type cache_type; // recurrent cache: F32, or BF16/F16/Q8_0 (--cache-type-s)
     const bool ring;            // set_rows into scattered cache rows ([TAG_RECURRENT_ROLLBACK_RING]) instead of a strided cpy
+    const int64_t v_repeat;     // value heads per key head (Qwen3.8: 3)
 
     ggml_tensor * cpy_node = nullptr;
 
     std::string vars() override {
-        return VARS_TO_STR8(type, head_count, head_size, n_seq_tokens, n_seqs, K, cache_type, ring);
+        std::string v = VARS_TO_STR8(type, head_count, head_size, n_seq_tokens, n_seqs, K, cache_type, ring);
+        return v_repeat == 1 ? v : v + ",v_repeat=" + std::to_string(v_repeat);
     }
 
     test_gated_delta_net_cache_fusion(ggml_type type = GGML_TYPE_F32,
             int64_t head_count = 4, int64_t head_size = 32, int64_t n_seq_tokens = 2, int64_t n_seqs = 1,
-            int64_t K = 2, ggml_type cache_type = GGML_TYPE_F32, bool ring = false)
+            int64_t K = 2, ggml_type cache_type = GGML_TYPE_F32, bool ring = false, int64_t v_repeat = 1)
         : type(type), head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), K(K),
-          cache_type(cache_type), ring(ring) {}
+          cache_type(cache_type), ring(ring), v_repeat(v_repeat) {}
+
+    const char * required_fusion() override {
+        return gdn_khshare_expected(head_size, n_seq_tokens, false, 0, v_repeat);
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t S_v = head_size;
-        const int64_t H_v = head_count;
+        const int64_t H_v = head_count * v_repeat;
         const int64_t H_k = head_count;
         const int64_t D   = S_v * S_v * H_v;
         const int64_t n_written = std::min<int64_t>(n_seq_tokens, K);
@@ -6174,7 +6203,7 @@ struct test_gated_delta_net_cache_fusion : public test_case {
     uint64_t op_flops(ggml_tensor * t) override {
         GGML_UNUSED(t);
         const uint64_t S_v = head_size;
-        const uint64_t H_v = head_count;
+        const uint64_t H_v = head_count * v_repeat;
         const uint64_t T   = n_seq_tokens;
         const uint64_t B   = n_seqs;
         return (4ull*S_v + 2ull*S_v*S_v) * H_v * T * B;
@@ -17392,6 +17421,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 5, 1, 3, false, false, 4));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 3, 1, 3, true, false, 4));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 128, 1, 3, false, false, 1));
+    // [#199] key-head-shared prefill kernel (default on): partial last tile, snapshots,
+    // permuted q/k/v, two sequences, 1/2/3/4 value heads per key head
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  70, 1, 3, false, false, 4));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  67, 2, 3, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  77, 2, 3, false, false, 5));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  64, 1, 2));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  8, 128,  72, 1, 4, false, false, 3));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  4, 128,  65, 1, 1));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 520, 1, 3, false, false, 4));
 
     // fork: long CPU reference runs are opt-in; tail cases straddle the 32-token chunk boundary.
     const char * gdn_tc_tests = getenv("GGML_TEST_GDN_TC");
@@ -17528,6 +17566,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   3, 1, 4, cache_type, true));
         test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 128,  5, 2, 5, cache_type, true));
         test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 128,  1, 1, 5, cache_type, true));
+        // [#199] Qwen3.8 head layout (16 key heads x 3) at prefill length: key-head-shared kernel (default on)
+        test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 70, 1, 4, cache_type, false, 3));
+        test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 69, 2, 4, cache_type, true, 3));
+        test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 66, 1, 1, cache_type, false, 3));
     }
 
     // [#87] GATED_DELTA_NET reading its state through s_copy (the GET_ROWS gather skipped on CUDA).
