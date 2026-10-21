@@ -1268,9 +1268,19 @@ static size_t moe_cache_allocation_headroom(moe_cache_device & device, const cha
     if (!moe_cache_memory_query(device, view)) {
         return 0;
     }
-    MOE_CACHE_LOG("[moe-cache] CUDA%d allocation bytes: operation=%s requested=%zu free=%zu total=%zu reserve=%zu other_outstanding=%zu headroom=%zu owned=%zu grant=%zu\n",
+    const char * trace = getenv("GGML_MOE_CACHE_MEMORY_COMPONENTS");
+    if (trace && strcmp(trace, "1") == 0) {
+        MOE_CACHE_LOG("[moe-cache] CUDA%d allocation bytes: operation=%s requested=%zu free=%zu total=%zu reserve=%zu other_outstanding=%zu headroom=%zu owned=%zu grant=%zu pool_bytes=%zu table_bytes=%zu input_bytes=%zu quant_bytes=%zu output_bytes=%zu\n",
+                device.physical, operation, requested, view.free, view.total, view.reserve, view.other_outstanding,
+                view.headroom, device.coordinator_allocated_bytes, device.budget_limit,
+                device.allocated_bytes, device.table_arena ? device.table_arena_cap : 0,
+                device.d_input ? device.d_input_cap : 0, device.d_act_q8 ? device.act_q8_cap : 0,
+                device.d_out ? device.d_out_cap : 0);
+    } else {
+        MOE_CACHE_LOG("[moe-cache] CUDA%d allocation bytes: operation=%s requested=%zu free=%zu total=%zu reserve=%zu other_outstanding=%zu headroom=%zu owned=%zu grant=%zu\n",
             device.physical, operation, requested, view.free, view.total, view.reserve, view.other_outstanding,
             view.headroom, device.coordinator_allocated_bytes, device.budget_limit);
+    }
     return view.headroom;
 }
 
@@ -1305,9 +1315,19 @@ static bool moe_cache_refresh_budget(
     headroom = std::min(headroom, SIZE_MAX - device.coordinator_allocated_bytes);
     device.budget_limit = device.coordinator_allocated_bytes + headroom;
     state.outstanding_bytes = other_outstanding + headroom;
-    MOE_CACHE_LOG("[moe-cache] CUDA%d budget refresh bytes: phase=%s old=%zu grant=%zu owned=%zu free=%zu total=%zu reserve=%zu other_outstanding=%zu participants=%d headroom=%zu\n",
+    const char * trace = getenv("GGML_MOE_CACHE_MEMORY_COMPONENTS");
+    if (trace && strcmp(trace, "1") == 0) {
+        MOE_CACHE_LOG("[moe-cache] CUDA%d budget refresh bytes: phase=%s old=%zu grant=%zu owned=%zu free=%zu total=%zu reserve=%zu other_outstanding=%zu participants=%d headroom=%zu pool_bytes=%zu table_bytes=%zu input_bytes=%zu quant_bytes=%zu output_bytes=%zu\n",
+                device.physical, phase, old_limit, device.budget_limit, device.coordinator_allocated_bytes,
+                view.free, view.total, view.reserve, other_outstanding, remaining_participants, headroom,
+                device.allocated_bytes, device.table_arena ? device.table_arena_cap : 0,
+                device.d_input ? device.d_input_cap : 0, device.d_act_q8 ? device.act_q8_cap : 0,
+                device.d_out ? device.d_out_cap : 0);
+    } else {
+        MOE_CACHE_LOG("[moe-cache] CUDA%d budget refresh bytes: phase=%s old=%zu grant=%zu owned=%zu free=%zu total=%zu reserve=%zu other_outstanding=%zu participants=%d headroom=%zu\n",
             device.physical, phase, old_limit, device.budget_limit, device.coordinator_allocated_bytes,
             view.free, view.total, view.reserve, other_outstanding, remaining_participants, headroom);
+    }
     return true;
 }
 
