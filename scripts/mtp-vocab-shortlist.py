@@ -5,9 +5,10 @@ Backlog #77. Only the GGUF's tokenizer arrays and tensor headers are read, never
 the token frequency of the corpora (per-domain mass), with the W3 hard-keep sets (control / user-defined
 tokens, byte pieces, ASCII singles, space+ASCII, whitespace pieces, short digit pieces) and a non-Latin
 reserve. Every size is a prefix of one ordering, so the smaller lists are subsets of the larger ones.
-Coverage is measured on held-out sources: expected acceptance loss of a restricted draft head is about the
-uncovered fraction (W3 CRITIC_REVIEW F1). Acceptance-weighted ranking needs verify traces from the model
-itself and is not done here.
+Coverage is measured on held-out sources. It measures final-token support, not acceptance on all drafted
+prefixes. Top-k refill, nucleus filtering, discarded draft tails and changed seeded trajectories require
+a matched-context proposal/target audit before attributing a whole-run acceptance change to coverage.
+Acceptance-weighted ranking needs verify traces from the model itself and is not done here.
 
     python scripts/mtp-vocab-shortlist.py --gguf Qwen3.8-27B-ATX-4-XS.gguf \\
         --tokenize-bin build/bin/llama-tokenize \\
@@ -385,6 +386,9 @@ def main():
             manifest.append({"domain": dom, "split": s, "source": source, "n": int(ids.size)})
     print("corpora:", {d: (int(sum(x.size for x in train[d])), int(sum(x.size for x in held[d]))) for d in sorted(set(train) | set(held))},
           "(train, held) tokens", f"{time.time() - t0:.0f}s", flush=True)
+    # Reporting a held-only domain above creates an empty defaultdict entry.
+    # Such a domain has no training mass and must not reach concatenate().
+    train = {d: arrs for d, arrs in train.items() if any(x.size for x in arrs)}
     if not train:
         raise SystemExit("no train tokens")
 
@@ -473,7 +477,7 @@ def main():
              f"arch {target.arch}, n_vocab {V}, tokenizer fingerprint {target.fp:016x}"
              + (f" (same tokenizer as built-in {', '.join(report['builtin_matches'])})" if report["builtin_matches"] else ""), "",
              "Train groups: " + ", ".join(f"{d} {g['tokens']:,} tokens / {g['unique']:,} ids, mass {g['mass']:.2f}" for d, g in groups.items()), "",
-             "## Held-out coverage % (expected acceptance loss ~ 100 - coverage)", "",
+             "## Held-out final-token coverage % (not a whole-run acceptance estimate)", "",
              "| domain | tokens | " + " | ".join(ks) + " |", "|---|---:|" + "---:|" * len(ks)]
     for d, row in report["held_by_domain"].items():
         lines.append(f"| {d} | {row[ks[0]]['n']:,} | " + " | ".join(f"{100 * row[k]['coverage']:.2f}" for k in ks) + " |")
