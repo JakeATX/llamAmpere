@@ -5101,6 +5101,102 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
     }
 };
 
+// [HCFUSED] Flash-Next hyper-connection mix, fused (DSV4_HC_DOWN + DSV4_HC_UP) or the unfused qwen4exp graph, chained
+// over n_layers mixes (each followed by the identity-comb hc_post the model runs) so perf runs see a layer-like stream.
+struct test_dsv4_hc_fused : public test_case {
+    const int64_t n_embd;
+    const int64_t R;
+    const int64_t n_tokens;
+    const bool    inject;
+    const bool    fused;
+    const int     n_layers;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DSV4_HC_FUSED";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR6(n_embd, R, n_tokens, inject, fused, n_layers);
+    }
+
+    bool run_whole_graph() override { return n_layers > 1 || !fused; }
+    bool perf_whole_graph() override { return true; }
+    double max_nmse_err() override { return fused ? 1e-7 : 5e-4; }
+
+    test_dsv4_hc_fused(int64_t n_embd = 2560, int64_t R = 320, int64_t n_tokens = 5, bool inject = true,
+                       bool fused = true, int n_layers = 1)
+        : n_embd(n_embd), R(R), n_tokens(n_tokens), inject(inject), fused(fused), n_layers(n_layers) {}
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            const std::string name = ggml_get_name(t);
+            if (name.rfind("w_norm", 0) == 0) {
+                init_tensor_uniform(t, 0.5f, 1.5f);
+            } else if (name.rfind("w_down", 0) == 0 || name.rfind("w_inject", 0) == 0) {
+                init_tensor_uniform(t, -0.02f, 0.02f);
+            } else if (name.rfind("w_up", 0) == 0) {
+                init_tensor_uniform(t, -0.1f, 0.1f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t hc     = 4;
+        const int64_t hc_dim = hc*n_embd;
+        const float   eps    = 1e-6f;
+
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * cur = nullptr;
+        for (int l = 0; l < n_layers; ++l) {
+            ggml_tensor * w_norm   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,  n_embd, hc);
+            ggml_tensor * w_down   = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, hc_dim, R);
+            ggml_tensor * w_up     = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, R, hc_dim);
+            ggml_tensor * w_inject = inject ? ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, hc_dim, hc) : nullptr;
+            ggml_format_name(w_norm, "w_norm%d", l);
+            ggml_format_name(w_down, "w_down%d", l);
+            ggml_format_name(w_up,   "w_up%d",   l);
+            if (w_inject) {
+                ggml_format_name(w_inject, "w_inject%d", l);
+            }
+
+            ggml_tensor * mixed = nullptr;
+            ggml_tensor * w     = nullptr;
+            if (fused) {
+                ggml_tensor * dn = ggml_dsv4_hc_down(ctx, x, w_norm, w_down, w_inject, eps, 1.0f/hc, 1.0f/hc);
+                mixed = ggml_dsv4_hc_up(ctx, x, w_norm, dn, w_up, 1.0f/hc);
+                if (inject) {
+                    w = ggml_view_2d(ctx, dn, hc, n_tokens, hc*sizeof(float), R*n_tokens*sizeof(float));
+                }
+            } else {
+                ggml_tensor * xn = ggml_mul(ctx, ggml_rms_norm(ctx, x, eps), w_norm);
+                xn = ggml_reshape_2d(ctx, xn, hc_dim, n_tokens);
+                ggml_tensor * lo   = ggml_silu(ctx, ggml_scale(ctx, ggml_mul_mat(ctx, w_down, xn), 1.0f/hc));
+                ggml_tensor * gate = ggml_mul_mat(ctx, w_up, lo);
+                mixed = ggml_dsv4_hc_pre_gated(ctx,
+                        ggml_reshape_3d(ctx, xn,   n_embd, hc, n_tokens),
+                        ggml_reshape_3d(ctx, gate, n_embd, hc, n_tokens), 1.0f/hc);
+                if (inject) {
+                    w = ggml_sigmoid(ctx, ggml_scale(ctx, ggml_mul_mat(ctx, w_inject, xn), 1.0f/hc));
+                    w = ggml_scale(ctx, w, 2.0f);
+                }
+            }
+            cur = mixed;
+            if (inject) {
+                x   = ggml_dsv4_hc_post(ctx, mixed, x, w, nullptr);
+                cur = x;
+            }
+        }
+        ggml_set_name(cur, "out");
+        return cur;
+    }
+};
+
+
 // [HCPN] One Flash-Next hyper-connection step as qwen4exp builds it: H = identity-comb hc_post (post_in) or an ADD (as
 // after a PLE block), xn = rms_norm(H) * gamma, its BF16 copy feeding both BF16 matmuls (cast, LLAMA_HC_BF16_ONCE),
 // the low-rank gate, the gated hc_pre and the next hc_post. GGML_CUDA_HC_POST_NORM=1 and GGML_CUDA_HC_PRE_XN=1 fuse
@@ -6246,6 +6342,120 @@ struct test_gated_delta_net_state_read : public test_case {
 // unfused copy of the same pattern on its own cache (its CONCAT is a graph output, which refuses the fold), and the
 // checked nodes are the differences fused - unfused of the conv output and of the whole cache after both wrote it:
 // each must be exactly zero (exact finite values on the tested backend), next to the usual CPU comparison of the output.
+// [GDNGATES] gated-delta-net gates as built by the Qwen3-Next style models:
+//   gate = softplus(W_alpha y + dt) * a,  beta = sigmoid(W_beta y)
+// with the model's reshapes. CUDA fuses both chains into one kernel with GGML_CUDA_GDN_GATES=1.
+struct test_gdn_gates : public test_case {
+    const int64_t K;
+    const int64_t rows;
+    const int64_t n_tokens;
+    const bool    gate_first;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GDN_GATES";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR4(K, rows, n_tokens, gate_first);
+    }
+
+    bool run_whole_graph() override { return true; }
+    bool perf_whole_graph() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
+
+    test_gdn_gates(int64_t K = 2560, int64_t rows = 48, int64_t n_tokens = 5, bool gate_first = true)
+        : K(K), rows(rows), n_tokens(n_tokens), gate_first(gate_first) {}
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            const std::string name = ggml_get_name(t);
+            if (name == "w_alpha" || name == "w_beta") {
+                init_tensor_uniform(t, -0.05f, 0.05f);
+            } else if (name == "a") {
+                init_tensor_uniform(t, -2.0f, -0.1f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * y       = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,  K, n_tokens);
+        ggml_tensor * w_alpha = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, K, rows);
+        ggml_tensor * w_beta  = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, K, rows);
+        ggml_tensor * dt      = ggml_new_tensor_1d(ctx, GGML_TYPE_F32,  rows);
+        ggml_tensor * a       = ggml_new_tensor_1d(ctx, GGML_TYPE_F32,  rows);
+        ggml_set_name(y, "y");
+        ggml_set_name(w_alpha, "w_alpha");
+        ggml_set_name(w_beta, "w_beta");
+        ggml_set_name(dt, "dt");
+        ggml_set_name(a, "a");
+
+        ggml_tensor * beta = ggml_mul_mat(ctx, w_beta, y);
+        beta = ggml_reshape_4d(ctx, beta, 1, rows, n_tokens, 1);
+        beta = ggml_sigmoid(ctx, beta);
+
+        ggml_tensor * alpha = ggml_mul_mat(ctx, w_alpha, y);
+        alpha = ggml_reshape_3d(ctx, alpha, rows, n_tokens, 1);
+        ggml_tensor * gate = ggml_mul(ctx, ggml_softplus(ctx, ggml_add(ctx, alpha, dt)), a);
+        gate = ggml_reshape_4d(ctx, gate, 1, rows, n_tokens, 1);
+
+        ggml_tensor * out = gate_first ? ggml_add(ctx, gate, beta) : ggml_add(ctx, beta, gate);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// [SHEXPGATE] shared-expert gate of the Qwen3-Next style FFN: out = other + x * sigmoid(w . y_t).
+// CUDA fuses the four ops with GGML_CUDA_SHEXP_GATE=1.
+struct test_shexp_gate : public test_case {
+    const int64_t K;
+    const int64_t E;
+    const int64_t n_tokens;
+    const bool    other_first;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SHEXP_GATE";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR4(K, E, n_tokens, other_first);
+    }
+
+    bool run_whole_graph() override { return true; }
+    bool perf_whole_graph() override { return true; }
+
+    test_shexp_gate(int64_t K = 2560, int64_t E = 2560, int64_t n_tokens = 5, bool other_first = true)
+        : K(K), E(E), n_tokens(n_tokens), other_first(other_first) {}
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (std::string(ggml_get_name(t)) == "w") {
+                init_tensor_uniform(t, -0.05f, 0.05f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * w     = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, K);
+        ggml_tensor * y     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, n_tokens);
+        ggml_tensor * x     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, E, n_tokens);
+        ggml_tensor * other = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, E, n_tokens);
+        ggml_set_name(w, "w");
+        ggml_set_name(y, "y");
+        ggml_set_name(x, "x");
+        ggml_set_name(other, "other");
+        ggml_tensor * gated = ggml_mul(ctx, x, ggml_sigmoid(ctx, ggml_mul_mat(ctx, w, y)));
+        ggml_tensor * out = other_first ? ggml_add(ctx, other, gated) : ggml_add(ctx, gated, other);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_conv_ring : public test_case {
     enum window_mode { WM_RING = 0, WM_STATIC = 1 };
     enum guard_mode { GM_NONE = 0, GM_PADDED_INPUT, GM_EXTRA_READER, GM_CACHE_BIAS, GM_SHIFTED_WINDOWS };
@@ -13555,6 +13765,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, true));
     test_cases.emplace_back(new test_dsv4_hc_post(4096, 21, true));
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, true, true));
+    // [HCFUSED] real Flash-Next shapes, every token count the kernels specialize, with and without the injection rows
+    for (int64_t nt = 1; nt <= 8; ++nt) {
+        test_cases.emplace_back(new test_dsv4_hc_fused(2560, 320, nt, true,  true, 1));
+        test_cases.emplace_back(new test_dsv4_hc_fused(2560, 320, nt, false, true, 1));
+    }
+    test_cases.emplace_back(new test_dsv4_hc_fused(512, 64, 3, true, true, 1));
+    test_cases.emplace_back(new test_dsv4_hc_fused(2560, 320, 5, true, true, 3));
+    // [GDNGATES] Flash-Next linear-attention gates at every token count the kernel specializes, both graph orders
+    for (int64_t nt = 1; nt <= 8; ++nt) {
+        test_cases.emplace_back(new test_gdn_gates(2560, 48, nt, true));
+        test_cases.emplace_back(new test_gdn_gates(2560, 48, nt, false));
+    }
+    test_cases.emplace_back(new test_gdn_gates(2048, 32, 3, true));
+    test_cases.emplace_back(new test_gdn_gates(2560, 48, 12, true));   // above the kernel's 8 tokens: not fused
+    // [SHEXPGATE] Flash-Next shared-expert gate, every token count, both add orders, and an odd size
+    for (int64_t nt = 1; nt <= 8; ++nt) {
+        test_cases.emplace_back(new test_shexp_gate(2560, 2560, nt, true));
+        test_cases.emplace_back(new test_shexp_gate(2560, 2560, nt, false));
+    }
+    test_cases.emplace_back(new test_shexp_gate(1000, 777, 3, true));
     test_cases.emplace_back(new test_dsv4_hc_post(2560, 21, true, true));
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, false, true));
     // [HCPN] the Flash-Next hyper-connection step, with and without the BF16 copy, the hc_post or the ADD as norm input,
@@ -16881,6 +17111,38 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     add_get_rows_narrow_cases(test_cases, true);
     add_iq4xs_k4_cases(test_cases, true);
     add_mmf_split_k_cases(test_cases, true);
+
+    // [VBEAT] Flash-Next dense shapes at verify widths (GGML_TEST_VBEAT_DENSE=1): MMVQ vs MMQ per type
+    if (getenv("GGML_TEST_VBEAT_DENSE") != nullptr) {
+        for (ggml_type type : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL }) {
+            for (auto mk : std::vector<std::pair<int64_t, int64_t>>{ { 10240, 2560 }, { 12288, 2560 }, { 6144, 2560 }, { 2560, 6144 }, { 640, 2560 }, { 2560, 640 } }) {
+                for (int64_t n : { 1, 4, 5, 8 }) {
+                    test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, mk.first, n, mk.second, { 1, 1 }, { 1, 1 }));
+                }
+            }
+        }
+        for (int64_t n : { 1, 4, 5, 8 }) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 512, n, 2560, { 1, 1 }, { 1, 1 }));
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 320, n, 10240, { 1, 1 }, { 1, 1 }));
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 512, n, 2560, { 1, 1 }, { 1, 1 }));
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 48, n, 2560, { 1, 1 }, { 1, 1 }));
+        }
+    }
+
+    // [HCFUSED] 16 chained Flash-Next mixes (+ identity-comb hc_post), fused vs the unfused graph, at verify widths
+    for (int64_t nt : { 1, 4, 5, 8 }) {
+        test_cases.emplace_back(new test_dsv4_hc_fused(2560, 320, nt, true, true,  16));
+        test_cases.emplace_back(new test_dsv4_hc_fused(2560, 320, nt, true, false, 16));
+    }
+
+    // [GDNGATES] gates at verify widths (compare GGML_CUDA_GDN_GATES=0/1)
+    for (int64_t nt : { 1, 4, 5, 8 }) {
+        test_cases.emplace_back(new test_gdn_gates(2560, 48, nt, true));
+    }
+    // [SHEXPGATE] shared-expert gate at verify widths (compare GGML_CUDA_SHEXP_GATE=0/1)
+    for (int64_t nt : { 1, 4, 5, 8 }) {
+        test_cases.emplace_back(new test_shexp_gate(2560, 2560, nt, true));
+    }
 
     // [HCPN] Flash-Next hyper-connection step (GGML_CUDA_HC_POST_NORM / GGML_CUDA_HC_PRE_XN)
     for (int64_t n_tokens : { 512, 12288 }) {
