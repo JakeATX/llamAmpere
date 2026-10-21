@@ -5007,11 +5007,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_SAMPLING"));
     add_opt(common_arg(
-        {"--spec-lossy"}, "off|beat",
-        "lossy MTP acceptance: beat keeps a rejected draft if p(draft) >= p(residual replacement); off is exact (default)",
+        {"--spec-lossy"}, "exact|beat",
+        "lossy MTP acceptance: exact is lossless (default); beat keeps a rejected draft if p(draft) >= p(residual replacement), excluding EOG and stop tokens",
         [](common_params & params, const std::string & value) {
-            if (value != "off" && value != "beat") {
-                throw std::invalid_argument("--spec-lossy must be off or beat");
+            if (value != "exact" && value != "beat") {
+                throw std::invalid_argument("--spec-lossy must be exact or beat");
             }
             params.sampling.spec_lossy = value == "beat";
         }

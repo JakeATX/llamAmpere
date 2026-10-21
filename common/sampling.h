@@ -4,6 +4,8 @@
 
 #include "common.h"
 
+#include <functional>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -161,12 +163,28 @@ struct common_sampler_pq_stats {
     double sum_min = 0; // sum of sum_x min(p(x), q(x)): the p/q acceptance probability
 };
 
+struct common_sampler_pq_result {
+    llama_token id;
+    llama_token replacement = LLAMA_TOKEN_NULL;
+    double p_replacement = -1.0;
+    bool accepted = false;
+    bool rescued = false;
+};
+
+// Verify one position from the already filtered target distribution. Does not apply samplers or copy data.
+common_sampler_pq_result common_sampler_verify_pq(const llama_token_data_array & p, const std::vector<llama_token_data> & q,
+        llama_token draft, llama_token target, std::mt19937 & rng, bool beat, common_sampler_pq_stats & stats,
+        const llama_vocab * vocab = nullptr, const std::function<bool(llama_token)> & is_stop = {});
+
+// Log only tokens actually processed by the server, including the stop token. No work when logging is disabled.
+void common_sampler_pq_commit(common_sampler * gsmpl, int32_t seq, int64_t at, llama_token token, bool eog = false);
+
 // true when the chain samples on the CPU at temperature > 0 without grammar, reasoning budget or mirostat
 bool common_sampler_pq_supported(const struct common_sampler * gsmpl);
 
-// replay: the draft is a previously verified result being re-decoded after a checkpoint restore, so a
-// rejection at its last position is the recorded outcome and the fresh token after it is still sampled
-std::vector<llama_token> common_sampler_sample_and_accept_n_pq(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q, bool grammar_first = false, bool replay = false);
+// The server re-decodes a verified prefix with a saved post-verification sampler; it does not re-decide tokens.
+std::vector<llama_token> common_sampler_sample_and_accept_n_pq(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q, bool grammar_first = false, bool replay = false, int32_t seq = -1, int64_t generated = -1,
+        const std::function<bool(llama_token, const llama_tokens &)> & is_stop = {});
 
 const common_sampler_pq_stats & common_sampler_get_pq_stats(const struct common_sampler * gsmpl);
 
