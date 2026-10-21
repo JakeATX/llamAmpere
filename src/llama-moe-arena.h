@@ -20,6 +20,7 @@ struct llama_moe_output {
     llama_moe_output & operator=(const llama_moe_output &) = delete;
     void flush();
     void release(size_t offset, size_t bytes);
+    void readahead(size_t offset, size_t bytes); // [PREFILLFAST] async page-cache readahead hint
     void * data = nullptr;
     size_t size = 0;
     bool dirty = true;

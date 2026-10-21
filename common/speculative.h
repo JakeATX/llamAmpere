@@ -100,6 +100,8 @@ bool common_speculative_process(common_speculative * spec, const common_batch & 
 // Process MTP prompt ranges while target hidden rows still cover the full batch.
 bool common_speculative_supports_process_range(const common_speculative * spec);
 bool common_speculative_process_range(common_speculative * spec, const common_batch & batch, int32_t first, int32_t count);
+// [PREFILLFAST] LLAMA_MTP_B1_HANDOFF=1: the MTP helper can catch up per ubatch from the target's device rows
+bool common_speculative_handoff_enabled(const common_speculative * spec);
 
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);

@@ -5883,6 +5883,74 @@ private:
             }
         }
 
+        // [PREFILLFAST] LLAMA_MTP_B1_HANDOFF=1: the helper catches up after each target ubatch from rows the target
+        // staged on its device, inside the decode call; in-call checkpoint spots stash the helper state there.
+        struct ubatch_handoff {
+            common_speculative * spec = nullptr;
+            llama_context * ctx_dft = nullptr;
+            const common_batch * view = nullptr;
+            llama_seq_id seq = -1;
+            int32_t done = 0;
+            bool failed = false;
+            bool phase_set = false;
+            std::vector<int32_t> spot_end;
+            std::vector<std::vector<uint8_t>> spot_state;
+            std::vector<bool> spot_have;
+            static void cb(void * user, int32_t first, int32_t count) {
+                auto * h = static_cast<ubatch_handoff *>(user);
+                if (h->failed) {
+                    return;
+                }
+                if (first != h->done) {
+                    h->failed = true;
+                    return;
+                }
+                try {
+                    if (!h->phase_set) {
+                        llama_set_decode_phase(h->ctx_dft, LLAMA_DECODE_PHASE_PROMPT);
+                        h->phase_set = true;
+                    }
+                    if (!common_speculative_process_range(h->spec, *h->view, first, count)) {
+                        h->failed = true;
+                        return;
+                    }
+                    h->done = first + count;
+                    for (size_t k = 0; k < h->spot_end.size(); ++k) {
+                        if (h->spot_end[k] == h->done) {
+                            h->spot_state[k].clear();
+                            common_speculative_get_state(h->spec, h->seq, h->spot_state[k]);
+                            h->spot_have[k] = true;
+                        }
+                    }
+                } catch (const std::exception & e) {
+                    SRV_ERR("ubatch handoff: %s\n", e.what());
+                    h->failed = true;
+                }
+            }
+        } handoff;
+        const bool handoff_on = spec && ctx_dft && common_speculative_handoff_enabled(spec.get()) && batch.view.size() > 3072 &&
+                std::all_of(batch.view.tokens.begin(), batch.view.tokens.end(), [&](const auto & token) {
+                    return token.seq_ids_extra.empty() && token.seq_id == batch.view.tokens.front().seq_id;
+                }) && std::any_of(slots.begin(), slots.end(), [](const server_slot & slot) {
+                    return slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT;
+                }) && std::none_of(slots.begin(), slots.end(), [](const server_slot & slot) {
+                    return slot.state == SLOT_STATE_GENERATING;
+                });
+        if (handoff_on) {
+            handoff.spec = spec.get();
+            handoff.ctx_dft = ctx_dft;
+            handoff.view = &batch.view;
+            handoff.seq = batch.view.tokens.front().seq_id;
+            if (ckpt_armed) {
+                for (const auto spot : batch.ckpt_spots) {
+                    handoff.spot_end.push_back(spot - batch.view.tokens.front().pos[0]);
+                }
+                handoff.spot_state.resize(handoff.spot_end.size());
+                handoff.spot_have.assign(handoff.spot_end.size(), false);
+            }
+            llama_set_ubatch_rows_callback(ctx_tgt, &ubatch_handoff::cb, &handoff);
+        }
+
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
@@ -5897,6 +5965,14 @@ private:
             });
             t_decode_pass += ggml_time_us() - t_decode_start;
             g_host_phases.mark(server_host_phase_clock::VERIFY);
+        }
+        if (handoff_on) {
+            llama_set_ubatch_rows_callback(ctx_tgt, nullptr, nullptr);
+            if (handoff.failed || (ret != 0 && handoff.done > 0)) {
+                SRV_ERR("ubatch handoff failed (done = %d, ret = %d)\n", handoff.done, ret);
+                throw std::runtime_error("MTP ubatch handoff failed");
+            }
+            SRV_WRN("ubatch handoff: helper caught up %d of %d rows during the decode\n", handoff.done, batch.view.size());
         }
 
         if (ckpt_armed && ret != 0) {
@@ -5988,12 +6064,19 @@ private:
                     SLT_WRN(*cslot, "in-call checkpoint at n_tokens = %d was not captured\n", batch.ckpt_spots[k]);
                     continue;
                 }
+                const bool spot_handed = handoff_on && k < handoff.spot_have.size() && handoff.spot_have[k];
                 if (spec_ranges) {
                     const int32_t end = batch.ckpt_spots[k] - batch.view.tokens.front().pos[0];
                     bool ok = false;
-                    queue_tasks.yield_to_queue([&]() {
-                        ok = common_speculative_process_range(spec.get(), batch.view, spec_processed, end - spec_processed);
-                    });
+                    if (spot_handed || (handoff_on && end <= handoff.done)) {
+                        // the helper already passed this spot inside the decode; its state there was stashed
+                        ok = spot_handed;
+                    } else {
+                        queue_tasks.yield_to_queue([&]() {
+                            ok = common_speculative_process_range(spec.get(), batch.view, std::max(spec_processed, handoff.done),
+                                    end - std::max(spec_processed, handoff.done));
+                        });
+                    }
                     if (!ok) {
                         llama_state_seq_capture_select(ctx_tgt, -1, nullptr, nullptr);
                         throw std::runtime_error("failed to process speculative checkpoint range");
@@ -6001,6 +6084,9 @@ private:
                     spec_processed = end;
                 }
                 create_checkpoint_at(*cslot, batch.ckpt_spots[k], p_min, p_max);
+                if (spot_handed && !cslot->prompt.checkpoints.empty()) {
+                    cslot->prompt.checkpoints.back().data_spec = handoff.spot_state[k];
+                }
                 llama_state_seq_capture_select(ctx_tgt, -1, nullptr, nullptr);
             }
             llama_state_seq_capture_arm(ctx_tgt, -1, nullptr, 0);
@@ -6014,8 +6100,9 @@ private:
         if (spec) {
             bool ok = true;
             queue_tasks.yield_to_queue([&]() {
-                ok = spec_ranges
-                    ? common_speculative_process_range(spec.get(), batch.view, spec_processed, batch.view.size() - spec_processed)
+                const int32_t from = std::max(spec_processed, handoff.done);
+                ok = (spec_ranges || handoff_on)
+                    ? common_speculative_process_range(spec.get(), batch.view, from, batch.view.size() - from)
                     : common_speculative_process(spec.get(), batch.view);
             });
 

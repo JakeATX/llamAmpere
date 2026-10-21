@@ -13,6 +13,10 @@
 #include <iterator>
 #include <stdexcept>
 
+void llama_pfdiag_kv_begin(uint32_t n);
+void llama_pfdiag_kv_mark(int which);
+void llama_pfdiag_kv_report(const char * tag, size_t n_ub);
+
 //
 // llama_memory_hybrid_idx
 //
@@ -85,6 +89,7 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
 
 llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     // note: repeats llama_memory_hybrid::init_batch, as the indexer needs the attention slot infos that the base context hides
+    llama_pfdiag_kv_begin(balloc.get_n_tokens());
     do {
         balloc.split_reset();
         balloc.set_split_pos_grid(get_mem_attn()->get_sj_kvarn_split_grid()); // [#197] full grid mode only
@@ -127,6 +132,7 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr 
             break;
         }
 
+        llama_pfdiag_kv_mark(0);
         // prepare the recurrent batches first
         if (!get_mem_recr()->prepare(ubatches)) {
             // TODO: will the recurrent cache be in an undefined context at this point?
@@ -134,6 +140,7 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr 
             return std::make_unique<llama_memory_hybrid_idx_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
         }
 
+        llama_pfdiag_kv_mark(1);
         // prepare the attention cache
         auto heads_attn = get_mem_attn()->prepare(ubatches);
         if (heads_attn.empty()) {
@@ -147,8 +154,12 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr 
             heads_idx = heads_attn;
         }
 
-        return std::make_unique<llama_memory_hybrid_idx_context>(
+        const size_t pf_n_ub = ubatches.size();
+        auto pf_res = std::make_unique<llama_memory_hybrid_idx_context>(
                 this, std::move(heads_attn), std::move(heads_idx), std::move(ubatches));
+        llama_pfdiag_kv_mark(5);
+        llama_pfdiag_kv_report("hybrid_idx", pf_n_ub);
+        return pf_res;
     } while(false);
 
     return std::make_unique<llama_memory_hybrid_idx_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);

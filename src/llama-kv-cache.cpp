@@ -16,6 +16,35 @@
 #include <map>
 #include <stdexcept>
 #include <unordered_map>
+#include <chrono>
+
+// [PFDIAG] host timing of init_batch pieces (LLAMA_DECODE_HOST_US=1, batches >= 256 tokens)
+namespace {
+struct kv_host_us {
+    bool on = false; std::chrono::steady_clock::time_point t;
+    double split = 0, find = 0, cp = 0, apply = 0, restore = 0, ctor = 0;
+    void begin(uint32_t n) {
+        static const bool en = [](){ const char * e = std::getenv("LLAMA_DECODE_HOST_US"); return e && e[0] == '1'; }();
+        on = en && n >= 256; split = find = cp = apply = restore = ctor = 0; t = std::chrono::steady_clock::now();
+    }
+    void add(double & acc) {
+        if (!on) return; auto n = std::chrono::steady_clock::now();
+        acc += std::chrono::duration<double, std::milli>(n - t).count(); t = n;
+    }
+};
+thread_local kv_host_us g_kv_host_us;
+}
+// [PFDIAG] hooks for the hybrid_idx wrapper (the MTP draft context's memory)
+void llama_pfdiag_kv_begin(uint32_t n) { g_kv_host_us.begin(n); }
+void llama_pfdiag_kv_mark(int which) {
+    double * f[] = { &g_kv_host_us.split, &g_kv_host_us.find, &g_kv_host_us.cp, &g_kv_host_us.apply, &g_kv_host_us.restore, &g_kv_host_us.ctor };
+    if (which >= 0 && which < 6) g_kv_host_us.add(*f[which]);
+}
+void llama_pfdiag_kv_report(const char * tag, size_t n_ub) {
+    if (!g_kv_host_us.on) return;
+    LLAMA_LOG_WARN("kv init_batch host ms [%s] (%zu ubatches): split %.2f recr+find %.2f cp %.2f apply %.2f restore %.2f ctor %.2f\n", tag, n_ub,
+        g_kv_host_us.split, g_kv_host_us.find, g_kv_host_us.cp, g_kv_host_us.apply, g_kv_host_us.restore, g_kv_host_us.ctor);
+}
 
 static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
@@ -1630,6 +1659,7 @@ llama_memory_context_ptr llama_kv_cache::init_batch(
             uint32_t n_ubatch,
             bool embd_all) {
     GGML_UNUSED(embd_all);
+    g_kv_host_us.begin(balloc.get_n_tokens());
 
     do {
         balloc.split_reset();
@@ -1651,13 +1681,22 @@ llama_memory_context_ptr llama_kv_cache::init_batch(
             break;
         }
 
+        g_kv_host_us.add(g_kv_host_us.split);
         auto sinfos = prepare(ubatches);
         if (sinfos.empty()) {
             break;
         }
 
-        return std::make_unique<llama_kv_cache_context>(
+        const size_t n_ub_diag = ubatches.size();
+        auto ctx_ret = std::make_unique<llama_kv_cache_context>(
                 this, std::move(sinfos), std::move(ubatches));
+        g_kv_host_us.add(g_kv_host_us.ctor);
+        if (g_kv_host_us.on) {
+            LLAMA_LOG_WARN("kv init_batch host ms (%u rows, %zu ubatches, %u cells, used %u): split %.2f find %.2f cp %.2f apply %.2f restore %.2f ctor %.2f\n",
+                    balloc.get_n_tokens(), n_ub_diag, get_size(), v_cells.empty() ? 0u : v_cells[0].get_used(),
+                    g_kv_host_us.split, g_kv_host_us.find, g_kv_host_us.cp, g_kv_host_us.apply, g_kv_host_us.restore, g_kv_host_us.ctor);
+        }
+        return ctx_ret;
     } while (false);
 
     return std::make_unique<llama_kv_cache_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
@@ -1705,7 +1744,9 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
 
     for (const auto & ubatch : ubatches) {
         // only find a suitable slot for the ubatch. don't modify the cells yet
+        g_kv_host_us.add(g_kv_host_us.apply);
         const auto sinfo_new = find_slot(ubatch, false);
+        g_kv_host_us.add(g_kv_host_us.find);
         if (sinfo_new.empty()) {
             success = false;
             break;
@@ -1726,6 +1767,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
 
             states.push_back(std::move(state));
         }
+        g_kv_host_us.add(g_kv_host_us.cp);
 
         // now emplace the ubatch
         apply_ubatch(sinfo_new, ubatch);
@@ -1743,6 +1785,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
     }
 
     GGML_ASSERT(!states.empty() || !success);
+    g_kv_host_us.add(g_kv_host_us.apply);
 
     // iterate backwards and restore the cells to their original state
     for (auto it = states.rbegin(); it != states.rend(); ++it) {
@@ -1757,6 +1800,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
         }
     }
 
+    g_kv_host_us.add(g_kv_host_us.restore);
     for (size_t i = 0; i < sj_kvarn_st.size(); ++i) {
         auto & st = sj_kvarn_st[i];
         const auto & o = sj_kvarn_old[i];

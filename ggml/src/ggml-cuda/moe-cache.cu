@@ -1621,9 +1621,134 @@ static bool moe_cache_grow_host(
     return true;
 }
 
+// [PREFILLFAST] opt-in switch helper.
+static bool moe_cache_env_on(const char * name) {
+    const char * value = getenv(name);
+    return value && atoi(value) != 0;
+}
+
+// [PREFILLFAST] GGML_MOE_CACHE_FILL_BATCH=N (2..256): the worker takes up to N queued demand fills
+// (no look-ahead prediction) at once, copies each host source straight to its slot on the fill stream
+// and waits once for the whole batch. The single-job path copies through a pinned stage and waits per
+// expert, which leaves the link about two thirds idle during the post-prompt cache warm. Same bytes,
+// same slots, same publication order; only the copy scheduling changes. Off by default.
+static int moe_cache_fill_batch_n() {
+    static const int n = [] { int64_t v = 0; moe_cache_env_i64("GGML_MOE_CACHE_FILL_BATCH", 0, 256, v); return (int) v; }();
+    return n;
+}
+
+static void moe_cache_worker_fill_batch(moe_cache_session * session, moe_cache_device * device, cudaStream_t stream,
+        std::vector<moe_cache_job> & jobs) {
+    const int64_t copy_start = ggml_time_us();
+    ggml_cuda_set_device(device->logical);
+    std::vector<char *> destinations(jobs.size(), nullptr);
+    std::vector<cudaError_t> errors(jobs.size(), cudaSuccess);
+    {
+        std::lock_guard<std::mutex> lock(session->mu);
+        for (size_t i = 0; i < jobs.size(); ++i) {
+            const auto & job = jobs[i];
+            if (job.pool >= 0 && job.pool < (int)device->pools.size()) {
+                moe_cache_pool * pool = device->pools[job.pool].get();
+                if (pool->slab && job.slot >= 0 && job.slot < pool->n_slots) {
+                    destinations[i] = pool->slab + (size_t)job.slot * pool->expert_size;
+                }
+            }
+        }
+    }
+    cudaError_t first_error = (device->dead.load() || moe_cache_fail(*session, "insert")) ? cudaErrorUnknown : cudaSuccess;
+    size_t copied_bytes = 0;
+    {
+        std::unique_lock<std::mutex> fill_lock(session->fill_mu, std::defer_lock);
+        if (session->config.serial_fill) {
+            fill_lock.lock();
+        }
+        for (size_t i = 0; i < jobs.size(); ++i) {
+            const auto & job = jobs[i];
+            if (first_error != cudaSuccess) {
+                errors[i] = first_error;
+                continue;
+            }
+            if (!destinations[i] || !moe_resident_host_restore(job.source, job.bytes)) {
+                errors[i] = first_error = cudaErrorInvalidValue;
+                continue;
+            }
+            errors[i] = cudaMemcpyAsync(destinations[i], job.source, job.bytes, cudaMemcpyHostToDevice, stream);
+            if (errors[i] != cudaSuccess) {
+                first_error = errors[i];
+            } else {
+                copied_bytes += job.bytes;
+            }
+        }
+        const cudaError_t sync_error = cudaStreamSynchronize(stream);
+        if (sync_error != cudaSuccess) {
+            for (auto & e : errors) {
+                if (e == cudaSuccess) {
+                    e = sync_error;
+                }
+            }
+            if (first_error == cudaSuccess) {
+                first_error = sync_error;
+            }
+            copied_bytes = 0;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(session->mu);
+        const int64_t finished = ggml_time_us();
+        if (copied_bytes > 0 && first_error == cudaSuccess && finished > copy_start) {
+            const double rate = (double) copied_bytes / (double) (finished - copy_start);
+            device->copy_bytes_per_us = device->copy_samples == 0 ? rate :
+                0.875 * device->copy_bytes_per_us + 0.125 * rate;
+            device->copy_samples++;
+        }
+        for (size_t i = 0; i < jobs.size(); ++i) {
+            auto & job = jobs[i];
+            moe_cache_pool * pool = job.pool >= 0 && job.pool < (int)device->pools.size() ? device->pools[job.pool].get() : nullptr;
+            if (!job.prediction && pool && job.slot >= 0 && job.slot < pool->n_slots &&
+                    pool->slots[job.slot].generation == job.generation) {
+                job.prediction = pool->slots[job.slot].prediction;
+                if (job.prediction && job.prediction->start == 0) {
+                    job.prediction->start = copy_start; // A queued prediction promoted to demand.
+                }
+            }
+            if (job.prediction) {
+                job.prediction->done = errors[i] != cudaSuccess ? -1 : finished;
+                moe_prefetch_log(*job.prediction);
+            }
+            if (pool && job.slot >= 0 && job.slot < pool->n_slots) {
+                moe_cache_slot & slot = pool->slots[job.slot];
+                if (slot.state == moe_cache_slot_state::copying &&
+                    slot.generation == job.generation && slot.key == job.key) {
+                    if (errors[i] == cudaSuccess && (!slot.prediction || !slot.prediction->closed)) {
+                        slot.state = moe_cache_slot_state::valid;
+                        moe_cache_lru_push_back(*pool, job.slot);
+                        device->demand_count.erase(job.key);
+                        device->fills++;
+                    } else {
+                        moe_cache_slot_reset(*pool, job.slot, true);
+                        if (errors[i] != cudaSuccess) {
+                            device->fill_failures++;
+                        }
+                    }
+                }
+            }
+        }
+        device->inflight = false;
+        device->inflight_prefetch = false;
+        device->inflight_source = nullptr;
+        device->inflight_bytes = 0;
+        session->idle_cv.notify_all();
+    }
+    if (first_error != cudaSuccess) {
+        moe_cache_cuda_ok(*device, first_error, "expert fill", true);
+        moe_cache_trim_session(*session, device->physical);
+    }
+}
+
 static void moe_cache_worker(moe_cache_session * session, moe_cache_device * device, cudaStream_t stream) {
     char * stage = nullptr;
     size_t stage_capacity = 0;
+    std::vector<moe_cache_job> batch;
 
     for (;;) {
         moe_cache_job job;
@@ -1646,7 +1771,30 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
             device->inflight_prefetch = (bool) job.prediction;
             device->inflight_source = job.source;
             device->inflight_bytes = job.bytes;
+            const int fill_batch = moe_cache_fill_batch_n();
+            if (fill_batch > 1 && !job.prediction && !device->queue.empty() && !device->queue.front().prediction) {
+                batch.clear();
+                batch.push_back(job);
+                uintptr_t lo = (uintptr_t) job.source, hi = lo + job.bytes;
+                while ((int) batch.size() < fill_batch && !device->queue.empty() && !device->queue.front().prediction) {
+                    const moe_cache_job & next = device->queue.front();
+                    lo = std::min(lo, (uintptr_t) next.source);
+                    hi = std::max(hi, (uintptr_t) next.source + next.bytes);
+                    device->queued_bytes = next.bytes <= device->queued_bytes ? device->queued_bytes - next.bytes : 0;
+                    batch.push_back(next);
+                    device->queue.pop_front();
+                }
+                // the source-release wait checks this span: cover every source of the batch
+                device->inflight_source = (const void *) lo;
+                device->inflight_bytes = hi - lo;
+            }
         }
+        if (batch.size() > 1) {
+            moe_cache_worker_fill_batch(session, device, stream, batch);
+            batch.clear();
+            continue;
+        }
+        batch.clear();
 
         const int64_t copy_start = ggml_time_us();
         bool expired = false;
@@ -1711,7 +1859,16 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
             if (!expired && error == cudaSuccess && !moe_resident_host_restore(job.source, job.bytes)) {
                 error = cudaErrorInvalidValue;
             }
-            if (!expired && error == cudaSuccess && stage && stage_capacity >= job.bytes) {
+            // [PREFILLFAST] GGML_MOE_CACHE_FILL_DIRECT=1: copy the host source straight to the slot.
+            // Arena sources are page-locked, so this skips one host memcpy per fill; a pageable
+            // source still works (the driver stages it). Off by default.
+            static const bool fill_direct = moe_cache_env_on("GGML_MOE_CACHE_FILL_DIRECT");
+            if (!expired && error == cudaSuccess && fill_direct) {
+                error = cudaMemcpyAsync(destination, job.source, job.bytes, cudaMemcpyHostToDevice, stream);
+                if (error == cudaSuccess) {
+                    error = cudaStreamSynchronize(stream);
+                }
+            } else if (!expired && error == cudaSuccess && stage && stage_capacity >= job.bytes) {
                 memcpy(stage, job.source, job.bytes);
                 error = cudaMemcpyAsync(
                         destination, stage, job.bytes, cudaMemcpyHostToDevice, stream);
@@ -2229,7 +2386,18 @@ static void moe_cache_build_pending(
         return lhs_weight > rhs_weight;
     });
 
-    if (moe_cache_build_global_profile(session, device, pending, remaining)) {
+    // [PREFILLFAST] GGML_MOE_CACHE_PLAN_GRANULE=1: cudaMalloc rounds each slab up to 2 MiB, so a plan
+    // that spends the whole budget leaves the last pool short; the prompt warm then replans at the
+    // allocated size and resizes several pools (~0.7 s at 100K). Planning 2 MiB per pool under the
+    // budget makes every slab fit as planned, and the replan reproduces the same plan (no resize).
+    // Changes which experts start cached by a few MiB, never the math. Off by default.
+    size_t plan_budget = remaining;
+    static const bool plan_granule = moe_cache_env_on("GGML_MOE_CACHE_PLAN_GRANULE");
+    if (plan_granule && !session.profile_global_tensors.empty()) {
+        const size_t pad = pending.size() * ((size_t)2 << 20);
+        plan_budget = remaining > pad ? remaining - pad : 0;
+    }
+    if (moe_cache_build_global_profile(session, device, pending, plan_budget)) {
         return;
     }
     if (!session.profile_global_tensors.empty()) {
@@ -4900,6 +5068,12 @@ static size_t moe_cache_return(void * opaque) {
     return restored;
 }
 
+// [PREFILLFAST] GGML_MOE_CACHE_WARM_SINGLE=1: a prompt warm restores the saved profile ranks first.
+// With this switch that nested restore only records the ranks; the prompt warm then fills every
+// slot once in its own rank order, instead of filling all slots from the profile and replacing
+// most of them right away. Off by default.
+static thread_local bool g_warm_rank_only = false;
+
 static int moe_cache_warm(void * opaque, const ggml_moe_cache_tensor_desc * tensors,
         const uint64_t * const * counts, int n_tensors) {
     auto * session = (moe_cache_session *)opaque;
@@ -4924,7 +5098,10 @@ static int moe_cache_warm(void * opaque, const ggml_moe_cache_tensor_desc * tens
     const bool loading = !counts;
     if (!loading && getenv("GGML_MOE_CACHE_PROFILE_LOAD")) {
         // Suspension creates a new session. Restore its saved fallback rankings before prompt reranking.
+        static const bool rank_only = moe_cache_env_on("GGML_MOE_CACHE_WARM_SINGLE");
+        g_warm_rank_only = rank_only;
         moe_cache_warm(opaque, tensors, nullptr, n_tensors);
+        g_warm_rank_only = false;
     }
     bool observed = false;
     if (counts) {
@@ -5088,6 +5265,10 @@ static int moe_cache_warm(void * opaque, const ggml_moe_cache_tensor_desc * tens
                 }
             }
         }
+    }
+    if (loading && g_warm_rank_only) {
+        MOE_CACHE_LOG("[moe-cache] profile ranks restored for %zu entries; fills left to the prompt warm (GGML_MOE_CACHE_WARM_SINGLE)\n", ranked.size());
+        return 0;
     }
     std::stable_sort(ranked.begin(), ranked.end(), [&](const candidate & a, const candidate & b) {
         if (global_profile) {

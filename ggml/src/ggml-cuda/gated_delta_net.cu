@@ -33,6 +33,8 @@ static __device__ __forceinline__ void gdn_store_state(void * state, const int64
     }
 }
 
+#include "gated_delta_net_chunked_argon.cuh"
+
 // emit_ingredients_t (only meaningful when keep_rs_t): write per-token (k,v,g,beta) ingredients
 // instead of a full [S_v,S_v] state snapshot per retained slot, plus one fixed-cost trailing
 // final-state block -- see ggml_gated_delta_net's emit_mode==1/2 contract (ggml.h) and the CPU
@@ -1046,6 +1048,25 @@ static void gated_delta_net_dispatch(
         int64_t neqk1, int64_t rq3,
         float scale, int64_t state_slot_stride, int K, const int32_t * slot_rows,
         int ingr_w, int64_t ingr_region, const ggml_cuda_gated_delta_net_state_src state_src, ggml_cuda_pool * pool, cudaStream_t stream) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    // [PREFILLFAST] GGML_CUDA_GDN_CHUNKED=1: Argon chunked tensor-core prompt kernel (valid math, not bit-identical);
+    // returns false (falls through to the kernels below) when the shape, arch or state type does not apply
+    if (!kda && pool != nullptr) {
+#define GDNA_TRY(KRS_, EMIT_) gdn_argon::launch_gated_delta_net_chunked_tc<KRS_, EMIT_, state_t>( \
+            *pool, q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, \
+            sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, slot_rows, ingr_w, ingr_region, state_src, stream)
+        if (emit_ingr) {
+            if constexpr (std::is_same_v<state_t, float>) {
+                if (GDNA_TRY(true, true)) { return; }
+            }
+        } else if (keep_rs) {
+            if (GDNA_TRY(true, false)) { return; }
+        } else {
+            if (GDNA_TRY(false, false)) { return; }
+        }
+#undef GDNA_TRY
+    }
+#endif
 #define GDN_ARGS q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, \
         S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, \
         sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, slot_rows
