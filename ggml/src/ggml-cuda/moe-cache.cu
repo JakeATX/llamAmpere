@@ -2244,7 +2244,18 @@ static void moe_cache_build_pending(
         return lhs_weight > rhs_weight;
     });
 
-    if (moe_cache_build_global_profile(session, device, pending, remaining)) {
+    // [PREFILLFAST] GGML_MOE_CACHE_PLAN_GRANULE=1: cudaMalloc rounds each slab up to 2 MiB, so a plan
+    // that spends the whole budget leaves the last pool short; the prompt warm then replans at the
+    // allocated size and resizes several pools (~0.7 s at 100K). Planning 2 MiB per pool under the
+    // budget makes every slab fit as planned, and the replan reproduces the same plan (no resize).
+    // Changes which experts start cached by a few MiB, never the math. Off by default.
+    size_t plan_budget = remaining;
+    static const bool plan_granule = moe_cache_env_on("GGML_MOE_CACHE_PLAN_GRANULE");
+    if (plan_granule && !session.profile_global_tensors.empty()) {
+        const size_t pad = pending.size() * ((size_t)2 << 20);
+        plan_budget = remaining > pad ? remaining - pad : 0;
+    }
+    if (moe_cache_build_global_profile(session, device, pending, plan_budget)) {
         return;
     }
     if (!session.profile_global_tensors.empty()) {
