@@ -665,6 +665,9 @@ private:
     ggml_tensor * b1_cache_user_node = nullptr;
     std::vector<std::vector<uint64_t>> b1_cache_counts;
     uint64_t b1_cache_readbacks = 0;
+    std::vector<uint64_t> b1_route_offsets;
+    uint32_t b1_route_epoch = 0;
+    const llama_ubatch * b1_route_ubatch = nullptr;
     int64_t b1_compute_submit_us = 0;
     static bool b1_cache_eval(ggml_tensor * tensor, bool ask, void * user_data);
     void b1_cache_profile_load();

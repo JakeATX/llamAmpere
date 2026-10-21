@@ -1260,6 +1260,7 @@ struct ggml_backend_sched {
     enum ggml_moe_cache_mode moe_cache_mode_last;
     size_t                   moe_cache_budget_last;
     bool                     moe_cache_suspended;
+    int                      moe_cache_prefetch_mode;
 
     ggml_backend_sched_eval_callback callback_eval;
     void * callback_eval_user_data;
@@ -3518,6 +3519,9 @@ void ggml_backend_sched_moe_cache_resume(ggml_backend_sched_t sched) {
     if (sched->moe_cache_session && sched->moe_cache_api.prompt_resume) {
         sched->moe_cache_api.prompt_resume(sched->moe_cache_session);
     }
+    // B1 destroys and recreates the cache session. Restore prediction settings
+    // on the new session as well as its prompt/profile state.
+    ggml_backend_sched_moe_cache_prefetch_configure(sched, sched->moe_cache_prefetch_mode);
     ggml_backend_sched_reset(sched);
 }
 
@@ -3662,6 +3666,7 @@ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
 
 void ggml_backend_sched_moe_cache_prefetch_configure(ggml_backend_sched_t sched, int mode) {
     GGML_ASSERT(sched);
+    sched->moe_cache_prefetch_mode = mode;
     if (sched->moe_cache_session && sched->moe_cache_api.prefetch_configure) {
         sched->moe_cache_api.prefetch_configure(sched->moe_cache_session, mode);
     }

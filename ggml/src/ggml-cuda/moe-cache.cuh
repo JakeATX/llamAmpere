@@ -169,4 +169,11 @@ bool ggml_cuda_moe_cache_device_fused_compute(ggml_backend_cuda_context & ctx,
 // an on-device prediction record; the copy engine is fed from it without stalling the stream.
 bool ggml_cuda_moe_cache_prefetch_async_active(void);
 void ggml_cuda_moe_cache_device_predict(ggml_backend_cuda_context & ctx, const ggml_tensor * node);
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+// Construction/eager-eval only. Cached graph replay must not invoke these host hooks.
+// Unsupported concurrent execution is rejected when an actual table dispatch occurs;
+// non-MoE/draft graphs may enter/end without issuing a table branch.
+void ggml_cuda_moe_cache_table_graph_begin(ggml_backend_cuda_context & ctx, bool allow_single_stream);
+void ggml_cuda_moe_cache_table_graph_end(ggml_backend_cuda_context & ctx);
+#endif
 #endif

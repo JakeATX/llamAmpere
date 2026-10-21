@@ -121,7 +121,7 @@ static void test_provider_session_leave(void * session) { (void) session; }
 static bool run_resume_lifecycle_cpu() {
     auto cpu = ggml_backend_cpu_init();
     if (!cpu) { return false; }
-    static int created, destroyed, resumed;
+    static int created, destroyed, resumed, configured, last_mode;
     ggml_moe_cache_api api = {};
     api.owner = ggml_backend_dev_backend_reg(ggml_backend_get_device(cpu));
     const auto previous_api = ggml_moe_cache_get(api.owner);
@@ -133,21 +133,30 @@ static bool run_resume_lifecycle_cpu() {
     api.session_enter = test_provider_session_enter;
     api.session_leave = test_provider_session_leave;
     api.prompt_resume = [](void *) { ++resumed; };
+    api.prefetch_configure = [](void *, int mode) { ++configured; last_mode = mode; };
     bool ok = true;
     for (bool hook : {true, false}) {
-        created = destroyed = resumed = 0;
+        created = destroyed = resumed = configured = 0;
+        last_mode = -99;
         if (!hook) { api.prompt_resume = nullptr; }
         ggml_moe_cache_register(&api);
         auto sched = ggml_backend_sched_new(&cpu, nullptr, 1, 32, false, true);
         ok &= created == 1 && resumed == 0;
         ggml_backend_sched_moe_cache_resume(sched);
         ok &= resumed == 0;
+        ggml_backend_sched_moe_cache_prefetch_configure(sched, 3);
+        ok &= configured == 1 && last_mode == 3;
         for (int cycle = 0; cycle < 2; ++cycle) {
             ok &= ggml_backend_sched_moe_cache_suspend(sched);
             ok &= !ggml_backend_sched_moe_cache_suspend(sched);
             ggml_backend_sched_moe_cache_resume(sched);
             ggml_backend_sched_moe_cache_resume(sched);
             ok &= created == cycle + 2 && destroyed == cycle + 1 && resumed == (hook ? cycle + 1 : 0);
+            ok &= configured == (cycle == 0 ? 2 : 4) && last_mode == (cycle == 0 ? 3 : 0);
+            if (cycle == 0) {
+                // A later explicit disable must also survive the next resume.
+                ggml_backend_sched_moe_cache_prefetch_configure(sched, 0);
+            }
         }
         ggml_backend_sched_free(sched);
         ok &= destroyed == created;

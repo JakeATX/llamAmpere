@@ -104,9 +104,25 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <unordered_set>
 #include <vector>
+
+// Environment is a startup-only setting; runtime reserve validates malformed modes.
+static bool ggml_cuda_moe_table_prefetch_enabled() {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    static const bool enabled = [] {
+        const char * mode = std::getenv("GGML_MOE_TABLE_PREFETCH");
+        return mode && (std::strcmp(mode, "pred") == 0 || std::strcmp(mode, "stub") == 0 ||
+                        std::strcmp(mode, "on") == 0 || std::strcmp(mode, "1") == 0 ||
+                        std::strcmp(mode, "2") == 0 || std::strcmp(mode, "3") == 0);
+    }();
+    return enabled;
+#else
+    return false;
+#endif
+}
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 
@@ -4895,6 +4911,21 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     return res;
 }
 
+static void ggml_cuda_graph_instantiate(ggml_cuda_graph * graph) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11070
+    if (ggml_cuda_moe_table_prefetch_enabled()) {
+        CUDA_CHECK(cudaGraphInstantiateWithFlags(&graph->instance, graph->graph,
+                                                 cudaGraphInstantiateFlagUseNodePriority));
+        return;
+    }
+#else
+    if (ggml_cuda_moe_table_prefetch_enabled()) {
+        GGML_ABORT("GGML_MOE_TABLE_PREFETCH requires CUDA >= 11.7 for captured node priorities");
+    }
+#endif
+    CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+}
+
 static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, uint64_t graph_key) {
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
@@ -4917,7 +4948,7 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
         (void)cudaGetLastError();
         CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
         graph->instance = nullptr;
-        CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+        ggml_cuda_graph_instantiate(graph);
     } else {
         GGML_ASSERT(stat == cudaSuccess);
     }
@@ -8202,6 +8233,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 stream_ctx.concurrent_events.clear();
             }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+            if (ggml_cuda_moe_table_prefetch_enabled()) {
+                ggml_cuda_moe_cache_table_graph_begin(*cuda_ctx,
+                    !should_launch_concurrent_events && cuda_ctx->curr_stream_no == 0);
+            }
+#endif
+
             // The graph order is now final. Build one shared deadline queue
             // per KV runtime before issuing any attention work.
             const auto kv_stream_runtimes = ggml_cuda_kv_stream_prepare_graph(
@@ -8346,6 +8384,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             ggml_cuda_gdn_state_read_finish(cuda_ctx);
             ggml_cuda_conv_ring_finish(cuda_ctx);
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+            if (ggml_cuda_moe_table_prefetch_enabled()) {
+                // The table copy branch rejoins here, before cudaStreamEndCapture.
+                ggml_cuda_moe_cache_table_graph_end(*cuda_ctx);
+            }
+#endif
         }
 
 #ifdef USE_CUDA_GRAPH
@@ -8371,7 +8415,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     if (use_cuda_graph) {
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         if (graph->instance == nullptr) { // Create executable graph from captured graph.
-            CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+            ggml_cuda_graph_instantiate(graph);
         }
         if (cuda_graph_update_required) { // Update graph executable
             ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
@@ -10516,6 +10560,16 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
         return nullptr;
     }
     ggml_cuda_apply_stack_limit(device);
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (ggml_cuda_moe_table_prefetch_enabled()) {
+        // Precreate only the main stream. The existing accessor retains it for
+        // this context's lifetime, including cached graph replay.
+        ggml_cuda_set_device(device);
+        int low, high;
+        CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&low, &high));
+        CUDA_CHECK(cudaStreamCreateWithPriority(&ctx->streams[device][0], cudaStreamNonBlocking, high));
+    }
+#endif
 
     ggml_backend_t cuda_backend = new ggml_backend {
         /* .guid    = */ ggml_backend_cuda_guid(),

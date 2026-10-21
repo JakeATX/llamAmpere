@@ -4114,6 +4114,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
     auto * bookkeep_perf = llama_bookkeep_context_bucket(cparams.ctx_type);
     llama_bookkeep_stage_timer bookkeep_stage(bookkeep_perf ? &bookkeep_perf->memory_init_layout_host_us : nullptr);
 
+    struct route_ubatch_guard {
+        const llama_ubatch * & current;
+        const llama_ubatch * previous;
+        ~route_ubatch_guard() { current = previous; }
+    } route_guard{b1_route_ubatch, b1_route_ubatch};
+    b1_route_ubatch = &ubatch;
     // [B1] the layer-major prefill applied every ubatch up front and seeks between their saved views
     if (mctx && !b1_cur.active && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
@@ -6559,6 +6565,10 @@ void llama_context::b1_cache_begin() {
         b1_ctx_env("LLAMA_MOE_CACHE_RELEASE_PROMPT", 0) != 0;
     const size_t n_layers = model.hparams.n_layer();
     const size_t n_experts = model.hparams.n_expert;
+    if (getenv("GGML_MOE_TABLE_ROUTE_TRACE")) {
+        b1_route_offsets.assign(n_layers, 0);
+        ++b1_route_epoch;
+    }
     if (b1_cache_warm_enabled && b1_cache_counts.empty()) {
         b1_cache_readbacks = 0;
         if (n_experts == 0 || n_experts > 4096 || n_layers > (1u << 20) / n_experts) {
@@ -6647,6 +6657,41 @@ bool llama_context::b1_cache_eval(ggml_tensor * tensor, bool ask, void * user_da
             std::vector<int32_t> ids((row_bytes / sizeof(int32_t)) * n_tokens);
             ggml_backend_tensor_get_2d(tensor, ids.data(), 0, row_bytes,
                     n_tokens, tensor->nb[1], row_bytes);
+            const char * trace = getenv("GGML_MOE_TABLE_ROUTE_TRACE");
+            if (trace && !(ctx.b1_cur.active && ctx.b1_cur.ffn_phase == 4)) {
+                // Reuse the prompt warm-up readback. Files are separate per context.
+                char suffix[80];
+                snprintf(suffix, sizeof(suffix), ".prompt.%p", (void *) &ctx);
+                const std::string path = std::string(trace) + suffix;
+                if ((size_t) layer >= ctx.b1_route_offsets.size()) {
+                    ctx.b1_route_offsets.resize(ctx.model.hparams.n_layer(), 0);
+                }
+                const uint64_t offset = ctx.b1_route_offsets[layer];
+                const auto * ub = ctx.b1_route_ubatch;
+                GGML_ASSERT(ub && ub->pos && ub->seq_id && ub->n_seq_id);
+                std::vector<int32_t> positions, sequences;
+                for (uint32_t row = 0; row < ub->n_tokens; ++row) {
+                    if (n_tokens != ub->n_tokens && (!ub->output || !ub->output[row])) { continue; }
+                    GGML_ASSERT(ub->n_seq_id[row] == 1);
+                    positions.push_back(ub->pos[row]);
+                    sequences.push_back(ub->seq_id[row][0]);
+                }
+                GGML_ASSERT(positions.size() == n_tokens);
+                const uint32_t header[] = {0x32545250, ctx.b1_route_epoch,
+                    (uint32_t) ctx.model.hparams.n_layer(), (uint32_t) ctx.model.hparams.n_expert,
+                    (uint32_t) layer, (uint32_t) tensor->ne[0], (uint32_t) n_tokens,
+                    (uint32_t) offset, (uint32_t) (offset >> 32)};
+                FILE * f = fopen(path.c_str(), "ab");
+                if (!f || fwrite(header, sizeof(header), 1, f) != 1 ||
+                        fwrite(positions.data(), sizeof(int32_t), n_tokens, f) != n_tokens ||
+                        fwrite(sequences.data(), sizeof(int32_t), n_tokens, f) != n_tokens ||
+                        fwrite(ids.data(), sizeof(int32_t), ids.size(), f) != ids.size()) {
+                    LLAMA_LOG_ERROR("%s: route trace write failed: %s\n", __func__, path.c_str());
+                    GGML_ABORT("prompt route trace write failed");
+                }
+                fclose(f);
+                ctx.b1_route_offsets[layer] += n_tokens;
+            }
             auto & counts = ctx.b1_cache_counts[layer];
             for (int64_t token = 0; token < tensor->ne[1]; ++token) {
                 for (int64_t rank = 0; rank < tensor->ne[0]; ++rank) {
