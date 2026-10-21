@@ -5313,7 +5313,23 @@ static void ggml_cuda_gdn_state_read_plan(ggml_backend_cuda_context * cuda_ctx, 
                          (ggml_is_contiguous(t) ? ", contig" : ", strided") + ")";
                 t = t->src[0];
             }
-            GGML_LOG_INFO("[gdn state read] %s refused: %s; src5%s\n", gdn->name, why, chain.c_str());
+            // consumers of the first GET_ROWS on the chain (the server log shows WARN, not INFO, from ggml)
+            const ggml_tensor * g = gdn->src[5];
+            for (int hop = 0; hop < 4 && g != nullptr && g->op != GGML_OP_GET_ROWS; ++hop) {
+                g = g->src[0];
+            }
+            std::string users;
+            if (g != nullptr && g->op == GGML_OP_GET_ROWS) {
+                for (int k = 0; k < cgraph->n_nodes; ++k) {
+                    const ggml_tensor * n = cgraph->nodes[k];
+                    for (int si = 0; si < GGML_MAX_SRC; ++si) {
+                        if (n->src[si] == g) {
+                            users += std::string(" ") + ggml_op_desc(n) + "(" + n->name + ", ne1 " + std::to_string(n->ne[1]) + ")";
+                        }
+                    }
+                }
+            }
+            GGML_LOG_WARN("[gdn state read] %s refused: %s; src5%s; get_rows users:%s\n", gdn->name, why, chain.c_str(), users.c_str());
         };
         if (G == nullptr) {
             refused("structural match");
@@ -5339,7 +5355,10 @@ static void ggml_cuda_gdn_state_read_plan(ggml_backend_cuda_context * cuda_ctx, 
         bool ok = true;
         for (int j = ri + 1; j < gi && ok; ++j) {
             const ggml_tensor * n = cgraph->nodes[j];
-            if (ggml_cuda_is_view_or_noop(n) || (n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            // [GDNGETTER] an empty node (the zero-row tail gather / extra-state copy of a one-sequence ubatch)
+            // writes nothing; opt-in GGML_CUDA_GDN_STATE_READ_SKIP_EMPTY=1 (default off) lets the check pass over it
+            static const bool skip_empty = [] { const char * e = getenv("GGML_CUDA_GDN_STATE_READ_SKIP_EMPTY"); return e != nullptr && atoi(e) != 0; }();
+            if (ggml_cuda_is_view_or_noop(n) || (n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || (skip_empty && ggml_is_empty(n))) {
                 continue;
             }
             ok = n->data != nullptr && !ggml_cuda_gdn_state_read_overlap(n, cache) &&
@@ -5704,7 +5723,7 @@ static void ggml_cuda_conv_ring_plan(ggml_backend_cuda_context * cuda_ctx, const
             if (dbg) {
                 static std::set<std::string> seen;
                 if (m.why != nullptr && seen.insert(m.why).second) {
-                    GGML_LOG_INFO("[conv ring] %s refused: %s (n_t %lld)\n", conv->name, m.why, (long long) conv->ne[1]);
+                    GGML_LOG_WARN("[conv ring] %s refused: %s (n_t %lld)\n", conv->name, m.why, (long long) conv->ne[1]);
                 }
             }
             continue;
@@ -5713,7 +5732,7 @@ static void ggml_cuda_conv_ring_plan(ggml_backend_cuda_context * cuda_ctx, const
             static const bool dbg = getenv("GGML_CUDA_CONV_RING_DEBUG") != nullptr && atoi(getenv("GGML_CUDA_CONV_RING_DEBUG")) != 0;
             static int64_t n_ok = 0;
             if (dbg && (n_ok++ % 4096) == 0) {
-                GGML_LOG_INFO("[conv ring] %s fused: %d windows (n_t %lld, %lld fused so far)\n", conv->name, m.n_win,
+                GGML_LOG_WARN("[conv ring] %s fused: %d windows (n_t %lld, %lld fused so far)\n", conv->name, m.n_win,
                               (long long) conv->ne[1], (long long) n_ok);
             }
         }
@@ -7414,7 +7433,7 @@ static int ggml_cuda_try_fuse_gdn_gates(ggml_backend_cuda_context & ctx, ggml_cg
                 ops += " ";
                 ops += ggml_op_desc(cgraph->nodes[k]);
             }
-            GGML_LOG_INFO("[gdn gates] %s refused: %s; next ops:%s\n", node->src[0]->name, why, ops.c_str());
+            GGML_LOG_WARN("[gdn gates] %s refused: %s; next ops:%s\n", node->src[0]->name, why, ops.c_str());
         }
         return -1;
     };
@@ -7489,7 +7508,7 @@ static int ggml_cuda_try_fuse_gdn_gates(ggml_backend_cuda_context & ctx, ggml_cg
     static bool logged_ok = false;
     if (dbg && !logged_ok) {
         logged_ok = true;
-        GGML_LOG_INFO("[gdn gates] fused %s + %s: %d nodes, %lld rows, %lld tokens\n", ca.mm->src[0]->name, cb.mm->src[0]->name,
+        GGML_LOG_WARN("[gdn gates] fused %s + %s: %d nodes, %lld rows, %lld tokens\n", ca.mm->src[0]->name, cb.mm->src[0]->name,
                       count, (long long) ca.mm->ne[0], (long long) y->ne[1]);
     }
     return count - 1;
@@ -7518,7 +7537,7 @@ static int ggml_cuda_try_fuse_shexp_gate(ggml_backend_cuda_context & ctx, ggml_c
                 ops += " ";
                 ops += ggml_op_desc(cgraph->nodes[k]);
             }
-            GGML_LOG_INFO("[shexp gate] %s refused: %s; next ops:%s\n", mm->src[0]->name, why, ops.c_str());
+            GGML_LOG_WARN("[shexp gate] %s refused: %s; next ops:%s\n", mm->src[0]->name, why, ops.c_str());
         }
         return -1;
     };
@@ -7578,7 +7597,7 @@ static int ggml_cuda_try_fuse_shexp_gate(ggml_backend_cuda_context & ctx, ggml_c
     static bool logged_ok = false;
     if (dbg && !logged_ok) {
         logged_ok = true;
-        GGML_LOG_INFO("[shexp gate] fused %s: %lld x %lld tokens\n", mm->src[0]->name, (long long) x->ne[0], (long long) y->ne[1]);
+        GGML_LOG_WARN("[shexp gate] fused %s: %lld x %lld tokens\n", mm->src[0]->name, (long long) x->ne[0], (long long) y->ne[1]);
     }
     return 3;
 }
