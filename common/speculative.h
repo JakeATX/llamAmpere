@@ -87,6 +87,12 @@ struct common_speculative_draft_params {
     // exact p/q path above (LLAMA_SPEC_PQ=1, `sampling`) is the sampled-draft implementation.
     float    temp = 1.0f;
     uint32_t seed = LLAMA_DEFAULT_SEED;
+
+    // fork: optional per-round confidence output, aligned with result; null unless logging is enabled.
+    std::vector<float> * conf_p1 = nullptr;
+    std::vector<float> * conf_p2 = nullptr;
+    int * conf_depth = nullptr;
+
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
@@ -106,6 +112,10 @@ void common_speculative_draft(common_speculative * spec);
 
 // informs the speculative context that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
+
+// target top-1 probabilities (request-matched) of the tokens one verify round committed; feeds the CDEPTH history.
+// Call once per verify round, not for the re-decode after a checkpoint restore. Unknown entries are negative.
+void common_speculative_note_target_conf(common_speculative * spec, llama_seq_id seq_id, const float * p, size_t n);
 
 // (optional) get/set internal state
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);

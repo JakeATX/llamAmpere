@@ -1417,6 +1417,9 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
         if (adaptive_mtp && (params.speculative.draft.n_min_adaptive < 1 || params.speculative.draft.n_min_adaptive > params.speculative.draft.n_max)) {
             throw std::invalid_argument("error: --spec-draft-n-min-adaptive must be in [1, --spec-draft-n-max]");
         }
+        if (params.speculative.draft.depth_policy == "cdepth" && !adaptive_mtp) {
+            throw std::invalid_argument("error: --spec-depth-policy cdepth needs --spec-type draft-mtp-adaptive");
+        }
 
         params.lr.init();
     } catch (const std::invalid_argument & ex) {
@@ -4820,6 +4823,38 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.user_set |= COMMON_PARAMS_SPECULATIVE_USER_DRAFT_N_MIN_ADAPTIVE;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MIN_ADAPTIVE"));
+
+    add_opt(common_arg(
+        {"--spec-depth-policy"}, "streak|cdepth",
+        "draft depth policy for --spec-type draft-mtp-adaptive: 'streak' = streak controller (default); "
+        "'cdepth' = per-token confidence rule between --spec-draft-n-min-adaptive and --spec-draft-n-max (lossless)",
+        [](common_params & params, const std::string & value) {
+            if (value != "streak" && value != "cdepth") {
+                throw std::invalid_argument("--spec-depth-policy must be 'streak' or 'cdepth'");
+            }
+            params.speculative.draft.depth_policy = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DEPTH_POLICY"));
+
+    add_opt(common_arg(
+        {"--spec-depth-model"}, "FILE",
+        "CDEPTH coefficient file written by tools/cdepth/cdepth_sim.py fit-causal (default: built-in table)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.depth_model = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DEPTH_MODEL"));
+
+    add_opt(common_arg(
+        {"--spec-depth-theta"}, "X",
+        string_format("CDEPTH: multiplier on the stop thresholds, above 1 stops earlier (default: %.2f)", (double) params.speculative.draft.depth_theta),
+        [](common_params & params, const std::string & value) {
+            const float x = std::stof(value);
+            if (!(x > 0.0f && x < 100.0f)) {
+                throw std::invalid_argument("--spec-depth-theta must be in (0, 100)");
+            }
+            params.speculative.draft.depth_theta = x;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DEPTH_THETA"));
 
     add_opt(common_arg(
         {"--spec-chain"}, "0|1|N",

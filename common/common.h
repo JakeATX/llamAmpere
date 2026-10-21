@@ -341,6 +341,12 @@ struct common_params_speculative_draft {
     int32_t n_min = 0; // minimum number of draft tokens to use for speculative decoding
     int32_t n_min_adaptive = 3; // minimum adaptive MTP draft depth (also the starting depth)
 
+    // CDEPTH (draft-mtp-adaptive only): "streak" = the streak controller (default); "cdepth" = per-token confidence
+    // rule inside each round between n_min_adaptive and n_max (see common/speculative-cdepth.h)
+    std::string depth_policy = "streak";
+    std::string depth_model;       // CDEPTH coefficient file ("" = built-in table)
+    float       depth_theta = 1.0f; // multiplier on the CDEPTH stop thresholds (>1 stops earlier)
+
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
 
