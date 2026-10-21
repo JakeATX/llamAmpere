@@ -1233,7 +1233,9 @@ static common_params_sampling full_head_sampling() {
 static void prime_full_head_eval_counter(contexts & ctx) {
     // Perf counts clamp zero to one. Seed the scalar counter without touching the driver's sampler or carry.
     const auto state = save(ctx.dft, 0);
-    const llama_pos pos = llama_memory_seq_pos_max(llama_get_memory(ctx.dft), 0) + 1;
+    auto * memory = llama_get_memory(ctx.dft);
+    const llama_pos original_max = llama_memory_seq_pos_max(memory, 0);
+    const llama_pos pos = original_max + 1;
     std::vector<float> zero(llama_model_n_embd_out(llama_get_model(ctx.dft)), 0.0f);
     common_batch batch(ctx.dft);
     const int row = batch.add(token_at(pos), pos, 0, true);
@@ -1241,8 +1243,14 @@ static void prime_full_head_eval_counter(contexts & ctx) {
     require(llama_process(ctx.dft, LLAMA_PROCESS_TYPE_DECODE,
                 checked_embedding_batch(batch, zero, zero.size())) == 0, "prime scalar eval counter");
     llama_synchronize(ctx.dft);
+    // Empty KEEP_LAYOUT sections skip cache metadata restoration. Explicitly
+    // remove the priming row before loading that empty state.
+    if (original_max < 0) {
+        require(llama_memory_seq_rm(memory, 0, -1, -1), "remove counter prime from originally empty helper");
+    }
     require(llama_state_seq_set_data_ext(ctx.dft, state.data(), state.size(), 0,
                 LLAMA_STATE_SEQ_FLAGS_KEEP_LAYOUT) == state.size(), "restore helper after counter prime");
+    require(llama_memory_seq_pos_max(memory, 0) == original_max, "counter prime restores the original helper extent");
 }
 
 static full_head_round draft_full_head_round(contexts & ctx, llama_pos pos, const common_params_sampling & sampling, int depth) {
@@ -1368,10 +1376,13 @@ static void run_qwen4exp_full_head(bool cuda) {
     };
     const int accepted[rounds] = { depth, 1, depth };
     std::vector<full_head_round> expected;
+    // Prime every helper while empty, before prefill or prompt restore. Priming
+    // a filled seven-row context completes an indexer pool and changes cache
+    // history, while the chain context still has its prompt deferred.
     {
         contexts reference(model.get(), config, 16, COMMON_SPECULATIVE_TYPE_DRAFT_MTP, 16, 1, 512, helper.get(), "none");
-        prefill(reference, 0, prompt_size, 0);
         prime_full_head_eval_counter(reference);
+        prefill(reference, 0, prompt_size, 0);
         llama_pos pos = prompt_size;
         for (int round = 0; round < rounds; ++round) {
             expected.push_back(draft_full_head_round(reference, pos, sampling, depth));
@@ -1417,9 +1428,9 @@ static void run_qwen4exp_full_head(bool cuda) {
                 helper.get(), map_path.c_str(), true, full_head_fixture_eval, &graph_stats);
         require(half_vocab_maps == maps_before + 1, "candidate really loaded the provisional map");
         require(half_vocab_compact_heads == compact_before + 1, "candidate really created its resident compact head");
+        prime_full_head_eval_counter(candidate);
         prefill(candidate, 0, prompt_size, 0);
         const snapshot cached = save(candidate, 0);
-        prime_full_head_eval_counter(candidate);
         llama_pos pos = prompt_size;
         for (int round = 0; round < rounds; ++round) {
             const auto graph_before = graph_stats;
@@ -1451,8 +1462,8 @@ static void run_qwen4exp_full_head(bool cuda) {
             contexts resumed(model.get(), config, 16, COMMON_SPECULATIVE_TYPE_DRAFT_MTP, 16, 1, 512,
                     helper.get(), map_path.c_str(), true, full_head_fixture_eval, &resumed_stats);
             require(half_vocab_compact_heads == compact_before + 1, "restored candidate really created its resident compact head");
-            restore(resumed, cached, 0);
             prime_full_head_eval_counter(resumed);
+            restore(resumed, cached, 0);
             llama_pos resumed_pos = prompt_size;
             for (int round = 0; round < rounds; ++round) {
                 const auto graph_before = resumed_stats;
@@ -1484,8 +1495,8 @@ static void run_qwen4exp_full_head(bool cuda) {
         {
             contexts reference(model.get(), config, 16, COMMON_SPECULATIVE_TYPE_DRAFT_MTP, 16, 1, 512,
                     helper.get(), "none", backend_sampling, nullptr, nullptr, case_depth);
-            prefill(reference, 0, prompt_size, 0);
             prime_full_head_eval_counter(reference);
+            prefill(reference, 0, prompt_size, 0);
             llama_pos pos = prompt_size;
             for (int round = 0; round < rounds; ++round) {
                 fallback_expected.push_back(draft_full_head_round(reference, pos, fallback_sampling, case_depth));
@@ -1500,8 +1511,8 @@ static void run_qwen4exp_full_head(bool cuda) {
                     helper.get(), map_path.c_str(), backend_sampling, full_head_fixture_eval, &fallback_stats, case_depth);
             require(half_vocab_maps == maps_before + 1, "fallback really loaded the provisional map");
             require(half_vocab_compact_heads == compact_before + 1, "fallback really created its resident compact head");
-            prefill(fallback, 0, prompt_size, 0);
             prime_full_head_eval_counter(fallback);
+            prefill(fallback, 0, prompt_size, 0);
             llama_pos pos = prompt_size;
             int scalar_eval_work = 0, reference_scalar_eval_work = 0;
             for (int round = 0; round < rounds; ++round) {
