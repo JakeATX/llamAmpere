@@ -708,12 +708,26 @@ struct common_sampler * common_sampler_init(
             const char * e = getenv("LLAMA_BOOKKEEP_SAMPLER");
             return e && atoi(e) != 0;
         }();
+        // LLAMA_HOSTCPU_TOPK_SKIP_EMPTY=1: disabled samplers ("?penalties", "?dry", "?top-n-sigma", ...: their
+        // apply and accept do nothing) may sit before top-k. The default sampler order puts three of them
+        // first, which kept the fused top-k off for every plain temp/top-k/top-p request.
+        static const bool hostcpu_skip_empty_env = [] {
+            const char * e = getenv("LLAMA_HOSTCPU_TOPK_SKIP_EMPTY");
+            return e && atoi(e) != 0;
+        }();
         if (topk_fused_env && params.top_k > 0 && params.top_k <= 128) {
-            const int top_k_idx = merged_bias.empty() ? 0 : 1;
+            const int bias_idx = merged_bias.empty() ? 0 : 1;
+            int top_k_idx = bias_idx;
+            if (hostcpu_skip_empty_env) {
+                while (top_k_idx < llama_sampler_chain_n(chain) &&
+                        llama_sampler_name(llama_sampler_chain_get(chain, top_k_idx))[0] == '?') {
+                    ++top_k_idx;
+                }
+            }
             // Repeated bans are exact; other duplicate biases differ after a candidate shuffle.
-            if ((top_k_idx == 0 || bookkeep_sampler_env) && common_sampler_topk_biases_supported(merged_bias) &&
+            if ((bias_idx == 0 || bookkeep_sampler_env) && common_sampler_topk_biases_supported(merged_bias) &&
                     llama_sampler_chain_n(chain) > top_k_idx &&
-                    (top_k_idx == 0 || strcmp(llama_sampler_name(llama_sampler_chain_get(chain, 0)), "logit-bias") == 0) &&
+                    (bias_idx == 0 || strcmp(llama_sampler_name(llama_sampler_chain_get(chain, 0)), "logit-bias") == 0) &&
                     strcmp(llama_sampler_name(llama_sampler_chain_get(chain, top_k_idx)), "top-k") == 0) {
                 result->fused_top_k = params.top_k;
                 result->fused_topk_bias = std::move(merged_bias);
