@@ -2,6 +2,7 @@
 #include "log.h"
 #include "json.h"
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdarg>
@@ -544,6 +545,34 @@ int common_log_get_verbosity(enum ggml_log_level level) {
 
 void common_log_default_callback(enum ggml_log_level level, const char * text, void * /*user_data*/) {
     auto verbosity = common_log_get_verbosity(level);
+    // Keep the small cache qualification record visible without enabling all
+    // backend trace logs. These messages report resolved state and counters,
+    // rather than requested environment switches. Only the first nonempty
+    // swap is needed; per-scope policy diagnostics remain at trace verbosity.
+    if (level == GGML_LOG_LEVEL_INFO && strncmp(text, "[moe-cache] ", 12) == 0) {
+        const char * message = text + 12;
+        if (strncmp(message, "CUDA", 4) == 0) {
+            const char * suffix = message + 4;
+            while (*suffix >= '0' && *suffix <= '9') {
+                ++suffix;
+            }
+            if (suffix != message + 4 && *suffix == ' ') {
+                message = suffix + 1;
+            }
+        }
+        static std::atomic<bool> reported_swap{false};
+        const bool summary = strncmp(message, "whole swap initial:", 19) == 0 ||
+                             strncmp(message, "global profile same-session replan:", 35) == 0 ||
+                             strncmp(message, "device tables active:", 21) == 0 ||
+                             strncmp(message, "device routes:", 14) == 0 ||
+                             strncmp(message, "missjoin final:", 15) == 0;
+        const bool swap = strncmp(message, "swap update:", 12) == 0 &&
+                          strstr(message, " swaps=0 ") == nullptr &&
+                          !reported_swap.exchange(true, std::memory_order_relaxed);
+        if (summary || swap) {
+            verbosity = LOG_LEVEL_INFO;
+        }
+    }
     if (verbosity <= common_log_verbosity_thold) {
         common_log_add(common_log_main(), level, "%s", text);
     }

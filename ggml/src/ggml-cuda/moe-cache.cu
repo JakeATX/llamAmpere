@@ -535,6 +535,10 @@ struct moe_cache_session {
     // swap_streams, which only the compute thread appends to.
     bool swap_enabled = false;
     bool swap_broken = false;
+    bool swap_whole = false;
+    bool swap_layer = false;
+    bool swap_decay_after = false;
+    std::vector<std::array<moe_cache_device_table *, 3>> swap_groups;
     int swap_interval = 1;
     int swap_max = 256;
     size_t swap_cap_bytes = 96u << 20;
@@ -2266,14 +2270,17 @@ static bool moe_cache_build_global_profile(moe_cache_session & session, moe_cach
         if (entries[p] != pending[p]->n_entries || tensor_counts[p] != (size_t)pending[p]->n_tensors) { return false; }
     }
     ggml_cuda_moe_profile_plan plan;
-    if (!ggml_cuda_moe_cache_profile_plan(items, caps, budget, moe_cache_pool_slots_min, plan)) { return false; }
+    int64_t density_value = 0;
+    const bool density = moe_cache_env_i64("GGML_MOE_CACHE_PROFILE_GLOBAL_DENSITY", 0, 1, density_value) && density_value;
+    if (!ggml_cuda_moe_cache_profile_plan(items, caps, budget, moe_cache_pool_slots_min, plan, density)) { return false; }
     device.profile_global_ranks.clear();
     for (size_t i = 0; i < keys.size(); ++i) { device.profile_global_ranks.emplace(keys[i], plan.ranks[i]); }
     device.profile_global_slots = plan.slots;
     device.profile_global_bytes = plan.bytes;
-    MOE_CACHE_LOG("[moe-cache] CUDA%d global profile plan: budget=%zu selected_bytes=%zu slack=%zu bundles=%zu slices=%zu minimum_slots=%d; raw bytes-weighted use, selected bundles first\n",
+    MOE_CACHE_LOG("[moe-cache] CUDA%d global profile plan: budget=%zu selected_bytes=%zu slack=%zu bundles=%zu slices=%zu minimum_slots=%d; %s, selected bundles first\n",
             device.physical, budget, plan.bytes, budget - plan.bytes, plan.bundles,
-            (size_t)std::count(plan.selected.begin(), plan.selected.end(), (uint8_t)1), moe_cache_pool_slots_min);
+            (size_t)std::count(plan.selected.begin(), plan.selected.end(), (uint8_t)1), moe_cache_pool_slots_min,
+            density ? "logical route count per real byte" : "raw bytes-weighted use");
     if (resize) {
         // Shrink every donor first; growth must never add a transient second grant.
         for (size_t p = 0; p < pending.size(); ++p) {
@@ -6292,6 +6299,48 @@ static void moe_cache_swap_free(moe_cache_session & session) {
     (void) cudaGetLastError();
 }
 
+static bool moe_cache_swap_groups(moe_cache_session & session) {
+    auto & groups = session.swap_groups;
+    groups.clear();
+    for (auto & entry : session.device_tables) {
+        auto & table = entry.second;
+        int layer = -1;
+        if (!table.desc.name || strncmp(table.desc.name, "blk.", 4) != 0 ||
+                !moe_cache_layer_number(table.desc.name, layer) || layer >= 1024) { return false; }
+        const char * suffix = strchr(table.desc.name + 4, '.');
+        if (!suffix) { return false; }
+        ++suffix;
+        const int k = strcmp(suffix, "ffn_up_exps.weight") == 0 ? 0 :
+            strcmp(suffix, "ffn_gate_exps.weight") == 0 ? 1 : strcmp(suffix, "ffn_down_exps.weight") == 0 ? 2 : -1;
+        if (k < 0) { return false; }
+        if (groups.size() <= (size_t) layer) { groups.resize(layer + 1, {nullptr, nullptr, nullptr}); }
+        if (groups[layer][k]) { return false; }
+        groups[layer][k] = &table;
+        for (auto & pool : session.devices[0]->pools) {
+            if (pool->slab && pool->expert_size == table.desc.expert_size && pool->wtype == table.desc.type) {
+                table.swap_pool = pool.get();
+                break;
+            }
+        }
+    }
+    size_t partial = 0, complete = 0;
+    for (const auto & group : groups) {
+        if (!group[0] && !group[1] && !group[2]) { continue; }
+        if (!group[0] || !group[1] || !group[2] || group[0]->desc.n_expert != group[1]->desc.n_expert ||
+                group[0]->desc.n_expert != group[2]->desc.n_expert) { return false; }
+        for (int32_t e = 0; e < group[0]->desc.n_expert; ++e) {
+            int resident = 0;
+            for (auto * table : group) {
+                resident += table->permanent[e] || (table->swap_pool && table->swap_pool->map.count({table->desc.data, e}));
+            }
+            partial += resident > 0 && resident < 3;
+            complete += resident == 3;
+        }
+    }
+    MOE_CACHE_LOG("[moe-cache] whole swap initial: complete=%zu partial=%zu layers=%zu\n", complete, partial, groups.size());
+    return !groups.empty() && partial == 0;
+}
+
 static bool moe_cache_swap_init(moe_cache_session & session) {
     if (session.swap_counts_host) {
         return true;
@@ -6311,6 +6360,11 @@ static bool moe_cache_swap_init(moe_cache_session & session) {
         MOE_CACHE_LOG("[moe-cache] swap policy disabled: stream/event/pinned allocation failed\n");
         moe_cache_swap_free(session);
         return false;
+    }
+    if (session.swap_whole && !moe_cache_swap_groups(session)) {
+        MOE_CACHE_LOG("[moe-cache] whole swap refused: incomplete projections, names or resident bundles; using slice policy\n");
+        session.swap_whole = false;
+        session.swap_groups.clear();
     }
     session.swap_writes_cap = writes_cap;
     session.swap_prev.assign(n, 0);
@@ -6423,12 +6477,105 @@ static void moe_cache_swap_commit(moe_cache_session & session, bool ok, bool pub
     }
 }
 
+struct moe_swap_pair {
+    float gain;
+    moe_cache_pool * pool;
+    int slot;
+    bool free;
+    moe_cache_device_table * table;
+    int32_t expert;
+};
+
+static std::vector<moe_swap_pair> moe_cache_swap_whole_pairs(moe_cache_session & session, size_t & n_cands) {
+    struct entry { float score; size_t layer; int32_t expert; std::array<int, 3> slots; };
+    struct batch { float gain; entry candidate; entry victim; bool free; };
+    const auto & groups = session.swap_groups;
+    std::vector<batch> batches;
+    std::unordered_map<moe_cache_pool *, size_t> free_used;
+    std::vector<bool> grouped(groups.size(), false);
+    auto compatible = [&](size_t a, size_t b) {
+        if (session.swap_layer && a != b) { return false; }
+        for (int k = 0; k < 3; ++k) {
+            const auto & x = groups[a][k]->desc;
+            const auto & y = groups[b][k]->desc;
+            if (x.type != y.type || x.expert_size != y.expert_size || x.n_in != y.n_in || x.n_out != y.n_out) { return false; }
+        }
+        return true;
+    };
+    auto order = [](const entry & a, const entry & b) {
+        return a.layer != b.layer ? a.layer < b.layer : a.expert < b.expert;
+    };
+    for (size_t base = 0; base < groups.size(); ++base) {
+        if (grouped[base] || !groups[base][0]) { continue; }
+        std::vector<entry> candidates, victims;
+        for (size_t layer = base; layer < groups.size(); ++layer) {
+            if (!groups[layer][0] || !compatible(base, layer)) { continue; }
+            grouped[layer] = true;
+            const auto & group = groups[layer];
+            for (int32_t e = 0; e < group[0]->desc.n_expert; ++e) {
+                entry item{0, layer, e, {-1, -1, -1}};
+                int present = 0;
+                bool usable = true;
+                for (int k = 0; k < 3; ++k) {
+                    auto & table = *group[k];
+                    item.score += session.swap_score[table.count_offset + e];
+                    auto * pool = table.swap_pool;
+                    if (!pool || table.permanent[e]) { usable = false; break; }
+                    const auto found = pool->map.find({table.desc.data, e});
+                    if (found != pool->map.end()) {
+                        const auto & slot = pool->slots[found->second];
+                        if (slot.state != moe_cache_slot_state::valid || slot.readers || slot.staging || !table.fallback[e]) { usable = false; break; }
+                        item.slots[k] = found->second;
+                        ++present;
+                    }
+                }
+                item.score /= 3.0f;
+                if (!usable) { continue; }
+                if (present == 3) { victims.push_back(item); }
+                else if (present == 0 && item.score >= 2.0f && item.score > session.swap_margin) { candidates.push_back(item); }
+            }
+        }
+        n_cands += candidates.size();
+        std::sort(candidates.begin(), candidates.end(), [&](const entry & a, const entry & b) { return a.score != b.score ? a.score > b.score : order(a, b); });
+        std::sort(victims.begin(), victims.end(), [&](const entry & a, const entry & b) { return a.score != b.score ? a.score < b.score : order(a, b); });
+        size_t victim = 0, admitted = 0;
+        for (const auto & candidate : candidates) {
+            entry free_slots{0, candidate.layer, -1, {-1, -1, -1}};
+            auto next_free = free_used;
+            bool free = true;
+            for (int k = 0; k < 3; ++k) {
+                auto * pool = groups[candidate.layer][k]->swap_pool;
+                size_t & used = next_free[pool];
+                if (used >= pool->free_slots.size()) { free = false; break; }
+                free_slots.slots[k] = pool->free_slots[pool->free_slots.size() - 1 - used++];
+            }
+            if (free) {
+                free_used = std::move(next_free);
+                batches.push_back({candidate.score, candidate, free_slots, true});
+            } else {
+                if (victim == victims.size() || candidate.score <= victims[victim].score * (1.0f + session.swap_hyst) + session.swap_margin) { break; }
+                batches.push_back({candidate.score - victims[victim].score, candidate, victims[victim++], false});
+            }
+            if (++admitted >= (size_t) session.swap_max / 3) { break; }
+        }
+    }
+    std::sort(batches.begin(), batches.end(), [&](const batch & a, const batch & b) { return a.gain != b.gain ? a.gain > b.gain : order(a.candidate, b.candidate); });
+    std::vector<moe_swap_pair> result;
+    for (const auto & batch : batches) {
+        for (int k = 0; k < 3; ++k) {
+            auto * table = groups[batch.candidate.layer][k];
+            result.push_back({batch.gain, table->swap_pool, batch.victim.slots[k], batch.free, table, batch.candidate.expert});
+        }
+    }
+    return result;
+}
+
 static void moe_cache_swap_decide(moe_cache_session & session) {
     auto & device = *session.devices[0];
     const auto start = std::chrono::steady_clock::now();
     const size_t n = session.swap_prev.size();
     const unsigned long long * counts = session.swap_counts_host;
-    const float decay = session.swap_decay;
+    const float decay = session.swap_decay_after ? 1.0f : session.swap_decay;
     if (session.swap_profile_strength > 0) {
         for (const auto & entry : session.device_tables) {
             const auto & table = entry.second;
@@ -6444,7 +6591,7 @@ static void moe_cache_swap_decide(moe_cache_session & session) {
             // causally; the profile's training corpus length is irrelevant.
             table_ema = calibrated ?
                 decay * table_ema + (float) recent_total :
-                (float) recent_total / (decay < 1 ? 1 - decay : 1);
+                (float) recent_total / (session.swap_decay < 1 ? 1 - session.swap_decay : 1);
             for (int32_t e = 0; e < table.desc.n_expert; ++e) {
                 const size_t index = table.count_offset + e;
                 const float recent = (float) (counts[index] - session.swap_prev[index]);
@@ -6469,31 +6616,33 @@ static void moe_cache_swap_decide(moe_cache_session & session) {
     }
     struct cand { float score; moe_cache_device_table * table; int32_t expert; };
     struct vict { float score; int slot; };
-    struct pair { float gain; moe_cache_pool * pool; int slot; bool free; moe_cache_device_table * table; int32_t expert; };
+    using pair = moe_swap_pair;
     std::unordered_map<moe_cache_pool *, std::vector<cand>> cands;
     size_t n_cands = 0;
-    for (auto & entry : session.device_tables) {
-        auto & table = entry.second;
-        if (!table.swap_pool) {
-            for (auto & p : device.pools) {
-                if (p->slab && p->expert_size == table.desc.expert_size && p->wtype == table.desc.type) {
-                    table.swap_pool = p.get();
-                    break;
+    if (!session.swap_whole) {
+        for (auto & entry : session.device_tables) {
+            auto & table = entry.second;
+            if (!table.swap_pool) {
+                for (auto & p : device.pools) {
+                    if (p->slab && p->expert_size == table.desc.expert_size && p->wtype == table.desc.type) {
+                        table.swap_pool = p.get();
+                        break;
+                    }
                 }
             }
-        }
-        if (!table.swap_pool) {
-            continue;
-        }
-        auto & pool = *table.swap_pool;
-        auto & list = cands[&pool];
-        for (int32_t e = 0; e < (int32_t)table.desc.n_expert; ++e) {
-            const float score = session.swap_score[table.count_offset + e];
-            if (score <= session.swap_margin || table.permanent[e] || pool.map.count({table.desc.data, e})) {
+            if (!table.swap_pool) {
                 continue;
             }
-            list.push_back({score, &table, e});
-            ++n_cands;
+            auto & pool = *table.swap_pool;
+            auto & list = cands[&pool];
+            for (int32_t e = 0; e < (int32_t)table.desc.n_expert; ++e) {
+                const float score = session.swap_score[table.count_offset + e];
+                if (score <= session.swap_margin || table.permanent[e] || pool.map.count({table.desc.data, e})) {
+                    continue;
+                }
+                list.push_back({score, &table, e});
+                ++n_cands;
+            }
         }
     }
     std::vector<pair> pairs;
@@ -6537,45 +6686,97 @@ static void moe_cache_swap_decide(moe_cache_session & session) {
             ++v;
         }
     }
-    std::stable_sort(pairs.begin(), pairs.end(), [](const pair & a, const pair & b) { return a.gain > b.gain; });
+    if (session.swap_whole) {
+        pairs = moe_cache_swap_whole_pairs(session, n_cands);
+    } else {
+        std::stable_sort(pairs.begin(), pairs.end(), [](const pair & a, const pair & b) { return a.gain > b.gain; });
+    }
+    if (session.swap_decay_after) {
+        for (auto & score : session.swap_score) { score *= session.swap_decay; }
+        for (auto & score : session.swap_observed_score) { score *= session.swap_decay; }
+        for (auto & score : session.swap_profile_seed) { score *= session.swap_decay; }
+        for (auto & entry : session.swap_profile_table_ema) { entry.second *= session.swap_decay; }
+    }
     std::vector<moe_swap_write> writes;
-    writes.reserve(limit * 2);
+    writes.reserve(limit * 3);
+    session.swap_inflight.reserve(limit);
     size_t bytes = 0;
     int evictions = 0;
-    for (const auto & p : pairs) {
-        if (session.swap_inflight.size() >= limit) {
-            break;
-        }
-        auto & pool = *p.pool;
-        if (pool.expert_size > session.swap_cap_bytes - bytes) {
-            continue;
-        }
-        auto & slot = pool.slots[p.slot];
-        if (p.free) {
-            const auto it = std::find(pool.free_slots.begin(), pool.free_slots.end(), p.slot);
-            if (it == pool.free_slots.end() || slot.state != moe_cache_slot_state::free || slot.staging) {
+    const size_t step = session.swap_whole ? 3 : 1;
+    for (size_t index = 0; index < pairs.size(); index += step) {
+        if (session.swap_whole) {
+            if (limit - session.swap_inflight.size() < 3) { break; }
+            size_t batch_bytes = 0;
+            bool valid = true;
+            for (size_t k = 0; k < 3; ++k) {
+                const auto & p = pairs[index + k];
+                auto & pool = *p.pool;
+                const auto & slot = pool.slots[p.slot];
+                if (pool.expert_size > session.swap_cap_bytes - bytes - batch_bytes) { valid = false; break; }
+                batch_bytes += pool.expert_size;
+                if (slot.staging || slot.readers || pool.map.count({p.table->desc.data, p.expert})) { valid = false; break; }
+                if (p.free) {
+                    if (slot.state != moe_cache_slot_state::free || std::find(pool.free_slots.begin(), pool.free_slots.end(), p.slot) == pool.free_slots.end()) { valid = false; break; }
+                } else {
+                    const auto found = session.device_tables.find(slot.key.tensor);
+                    if (slot.state != moe_cache_slot_state::valid || found == session.device_tables.end() ||
+                            found->second.permanent[slot.key.expert] || !found->second.fallback[slot.key.expert]) { valid = false; break; }
+                }
+            }
+            if (!valid) { continue; }
+            size_t inserted = 0;
+            try {
+                for (; inserted < 3; ++inserted) {
+                    const auto & p = pairs[index + inserted];
+                    if (!p.pool->map.emplace(moe_cache_key{p.table->desc.data, p.expert}, p.slot).second) { break; }
+                }
+            } catch (const std::bad_alloc &) {
+                // Roll back reservations before any resident slot or table changes.
+            }
+            if (inserted != 3) {
+                for (size_t k = 0; k < inserted; ++k) {
+                    const auto & p = pairs[index + k];
+                    p.pool->map.erase({p.table->desc.data, p.expert});
+                }
                 continue;
             }
-            pool.free_slots.erase(it);
-        } else {
-            auto & old_table = session.device_tables.at(slot.key.tensor);
-            const int32_t old_expert = slot.key.expert;
-            if (!old_table.fallback[old_expert]) {
-                continue; // keep a resident with no exact host fallback
-            }
-            old_table.addresses[old_expert] = old_table.fallback[old_expert];
-            moe_swap_push_address(writes, old_table, old_expert, old_table.fallback[old_expert]);
-            moe_cache_slot_reset(pool, p.slot, false);
-            device.evictions++;
-            ++evictions;
         }
-        const moe_cache_key key{p.table->desc.data, p.expert};
-        slot.key = key;
-        slot.state = moe_cache_slot_state::copying;
-        slot.uses = (uint32_t)std::min(p.gain, 4.0e9f);
-        pool.map[key] = p.slot;
-        session.swap_inflight.push_back({&pool, p.slot, p.table, p.expert, pool.slab + (size_t)p.slot * pool.expert_size});
-        bytes += pool.expert_size;
+        for (size_t k = 0; k < step; ++k) {
+            const auto & p = pairs[index + k];
+            if (session.swap_inflight.size() >= limit) {
+                break;
+            }
+            auto & pool = *p.pool;
+            if (pool.expert_size > session.swap_cap_bytes - bytes) {
+                continue;
+            }
+            auto & slot = pool.slots[p.slot];
+            if (p.free) {
+                const auto it = std::find(pool.free_slots.begin(), pool.free_slots.end(), p.slot);
+                if (it == pool.free_slots.end() || slot.state != moe_cache_slot_state::free || slot.staging) {
+                    continue;
+                }
+                pool.free_slots.erase(it);
+            } else {
+                auto & old_table = session.device_tables.at(slot.key.tensor);
+                const int32_t old_expert = slot.key.expert;
+                if (!old_table.fallback[old_expert]) {
+                    continue; // keep a resident with no exact host fallback
+                }
+                old_table.addresses[old_expert] = old_table.fallback[old_expert];
+                moe_swap_push_address(writes, old_table, old_expert, old_table.fallback[old_expert]);
+                moe_cache_slot_reset(pool, p.slot, false);
+                device.evictions++;
+                ++evictions;
+            }
+            const moe_cache_key key{p.table->desc.data, p.expert};
+            slot.key = key;
+            slot.state = moe_cache_slot_state::copying;
+            slot.uses = (uint32_t)std::min(p.gain, 4.0e9f);
+            pool.map[key] = p.slot;
+            session.swap_inflight.push_back({&pool, p.slot, p.table, p.expert, pool.slab + (size_t)p.slot * pool.expert_size});
+            bytes += pool.expert_size;
+        }
     }
     const double host_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
     session.swap_updates++;
@@ -6697,6 +6898,7 @@ static void moe_cache_swap_release(moe_cache_session & session) {
     }
     moe_cache_swap_commit(session, true, false);
     moe_cache_swap_free(session);
+    session.swap_groups.clear();
     session.swap_prev.clear();
     session.swap_score.clear();
     session.swap_observed_score.clear();
@@ -7984,6 +8186,11 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
         if (moe_cache_env_i64("GGML_MOE_CACHE_SWAP_DECAY_PCT", 0, 100, adaptation_value)) { session->swap_decay = (float)adaptation_value / 100.0f; }
         if (moe_cache_env_i64("GGML_MOE_CACHE_SWAP_HYST_PCT", 0, 1000, adaptation_value)) { session->swap_hyst = (float)adaptation_value / 100.0f; }
         if (moe_cache_env_i64("GGML_MOE_CACHE_SWAP_MARGIN", 0, 100000, adaptation_value)) { session->swap_margin = (float)adaptation_value; }
+        if (moe_cache_env_i64("GGML_MOE_CACHE_SWAP_MARGIN_MILLI", 0, 100000000, adaptation_value)) { session->swap_margin = (float) adaptation_value / 1000.0f; }
+        session->swap_whole = moe_cache_env_i64("GGML_MOE_CACHE_SWAP_WHOLE", 0, 1, adaptation_value) && adaptation_value;
+        session->swap_layer = moe_cache_env_i64("GGML_MOE_CACHE_SWAP_LAYER", 0, 1, adaptation_value) && adaptation_value;
+        session->swap_decay_after = moe_cache_env_i64("GGML_MOE_CACHE_SWAP_DECAY_AFTER", 0, 1, adaptation_value) && adaptation_value;
+        MOE_CACHE_LOG("[moe-cache] swap modes: whole=%d layer=%d decay_after=%d\n", session->swap_whole, session->swap_layer, session->swap_decay_after);
         MOE_CACHE_LOG("[moe-cache] swap policy: interval_scopes=%d max_swaps=%d cap_bytes=%zu decay=%.2f hyst=%.2f margin=%.1f; async publication, no device sync\n",
                 session->swap_interval, session->swap_max, session->swap_cap_bytes, session->swap_decay,
                 session->swap_hyst, session->swap_margin);
