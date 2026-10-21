@@ -9704,7 +9704,11 @@ struct test_mul_mat_vec_fusion : public test_case {
     // Each case builds exactly one epilogue; require the counter for the one it built.
     // CUDA fuses dense only at ncols_dst == 1 (ggml_cuda_should_fuse_mul_mat_vec_f/_q), mmid via mmvq up to the per-arch mmid max batch (>= 4).
     const char * required_fusion() override {
-        if (!(m == 1 || (use_id && ggml_is_quantized(type) && m <= 4))) {
+        const char * batch_glu = getenv("GGML_CUDA_MMVQ_BATCH_GLU");
+        const bool batch_gate = batch_glu && strcmp(batch_glu, "1") == 0 && !use_id && with_gate &&
+            !with_bias && !with_lane_scale && m <= 8 &&
+            (type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_Q4_K);
+        if (!(m == 1 || (use_id && ggml_is_quantized(type) && m <= 4) || batch_gate)) {
             return nullptr;
         }
         return with_gate ? "mul_mat_glu" : (with_bias ? "mul_mat_bias" : nullptr);
@@ -11629,18 +11633,8 @@ struct test_lightning_indexer_maskw : public test_lightning_indexer {
         return test_lightning_indexer::vars() + "," + VARS_TO_STR4(q_value, k_value, w_value, mask_mode);
     }
 
-    // Same as the range-mask cases: -inf against -inf must not poison the NMSE of the finite scores.
     double err(const float * a, const float * b, size_t n) override {
-        double mse_a_b = 0.0;
-        double mse_a_0 = 0.0;
-        for (size_t i = 0; i < n; ++i) {
-            if (!std::isfinite(a[i]) || !std::isfinite(b[i])) {
-                continue;
-            }
-            mse_a_b += ((double) a[i] - b[i])*((double) a[i] - b[i]);
-            mse_a_0 += (double) a[i]*a[i];
-        }
-        return mse_a_0 > 0.0 ? mse_a_b/mse_a_0 : mse_a_b;
+        return nmse_masked_inf(a, b, n);
     }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
@@ -15656,6 +15650,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (bool b : {false, true}) {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_IQ2_S, GGML_GLU_OP_SWIGLU_CLAMP, 1, 32, 256,
             true, 16, 8, b, false, true, false));
+    }
+
+    // The shared expert's four- and five-column verifies must exercise the batch GLU path,
+    // including the width-three boundary and the model's actual inner and output widths.
+    for (ggml_type type : {GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS, GGML_TYPE_Q4_K}) {
+        for (int64_t m_batch : {3, 4, 5}) {
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, m_batch, 640, 2560,
+                false, 16, 8, false, false, true, false, {1, 1}));
+        }
     }
 
     // Fused row-pair coverage: minimum rows, an even pair, and an odd tail.
