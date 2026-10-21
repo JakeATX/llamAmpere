@@ -2163,11 +2163,12 @@ std::unique_ptr<llama_moe_arena> llama_model_loader::load_moe_arena(llama_progre
             // Startup speed: the copy below is single-threaded and reads the file through page
             // faults, and the loop drops each finished group from the page cache. Ask the kernel
             // to read the next groups ahead of the copy so the disk and the copy overlap.
-            // Pure hint: it never changes which bytes are copied. LLAMA_MOE_ARENA_READAHEAD=0 turns it off.
+            // Pure hint: it never changes which bytes are copied. v0.6/all: opt-in (unmeasured), e.g.
+            // LLAMA_MOE_ARENA_READAHEAD=24; unset or 0 = off.
             constexpr int64_t arena_group = 16;
             static const int64_t arena_ahead = [] {
                 const char * v = getenv("LLAMA_MOE_ARENA_READAHEAD");
-                return v ? (int64_t) atoll(v) : (int64_t) 24;
+                return v ? (int64_t) atoll(v) : (int64_t) 0;
             }();
             int64_t arena_hinted = 0;
             for (int64_t e = 0; e < t->ne[2]; ++e) {
