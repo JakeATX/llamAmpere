@@ -6444,6 +6444,192 @@ static bool run_device_fused_missjoin(ggml_backend_t gpu, ggml_backend_t cpu, lo
     return ok;
 }
 
+// fork VFIXMISS: a full up/gate/swiglu/down layer with mixed resident and missed experts, replayed
+// with changing routes. The CPU result must match within rounding, replays of one graph must be
+// bit-identical to the first run, and (via GGML_MOE_CACHE_TEST_HF_DUMP) a run with
+// GGML_MOE_MISSJOIN_HITFIRST=1 must be bit-identical to a run without it.
+static bool run_hitfirst_layer(ggml_backend_t gpu, ggml_backend_t cpu, log_capture & capture) {
+    const char * dump_path = getenv("GGML_MOE_CACHE_TEST_HF_DUMP");
+    const bool hitfirst_requested = getenv("GGML_MOE_MISSJOIN_HITFIRST") &&
+            strcmp(getenv("GGML_MOE_MISSJOIN_HITFIRST"), "1") == 0;
+    std::vector<float> dump;
+    bool ok = true;
+    std::vector<float> importance(n_in, 1.0f);
+    const ggml_type types[] = {GGML_TYPE_Q4_0, GGML_TYPE_IQ4_XS, GGML_TYPE_Q4_K, GGML_TYPE_IQ3_S, GGML_TYPE_IQ2_XXS};
+    constexpr int k_used = 8;
+    constexpr int dim = 256; // square projections keep every quantization block size legal
+    long long hf_layers_total = 0;
+    for (const auto type : types) {
+        ggml_init_params weight_params = {4 * ggml_tensor_overhead(), nullptr, true};
+        ggml_context * weights_ctx = ggml_init(weight_params);
+        ggml_tensor * weights[3];
+        const char * names[3] = {"blk.7.ffn_up_exps.weight", "blk.7.ffn_gate_exps.weight", "blk.7.ffn_down_exps.weight"};
+        for (int bank = 0; bank < 3; ++bank) {
+            weights[bank] = ggml_new_tensor_3d(weights_ctx, type, dim, dim, n_expert);
+            ggml_set_name(weights[bank], names[bank]);
+        }
+        ggml_backend_buffer_t weights_buffer = ggml_backend_alloc_ctx_tensors(weights_ctx, cpu);
+        ggml_backend_buffer_set_usage(weights_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        std::vector<float> values((size_t) dim * dim * n_expert);
+        for (int bank = 0; bank < 3; ++bank) {
+            for (size_t i = 0; i < values.size(); ++i) {
+                values[i] = 0.15f * std::sin((float)(i % 997) * (0.017f + bank * 0.013f)) +
+                            0.05f * std::cos((float)(i % 431) * (0.031f + bank * 0.007f));
+            }
+            std::vector<uint8_t> quantized(ggml_nbytes(weights[bank]));
+            const float * imatrix = ggml_quantize_requires_imatrix(type) ? importance.data() : nullptr;
+            const size_t bytes = ggml_quantize_chunk(type, values.data(), quantized.data(),
+                    0, (int64_t) dim * n_expert, dim, imatrix);
+            ok &= bytes == quantized.size();
+            ggml_backend_tensor_set(weights[bank], quantized.data(), 0, quantized.size());
+        }
+        for (int tokens : {1, 4}) {
+            configure_cache(nullptr, "8");
+            set_env("GGML_CUDA_MOE_CACHE_BUDGET_MB", "16");
+            set_env("GGML_MOE_CACHE_DEVICE", "1");
+            set_env("GGML_MOE_CACHE_DEVICE_STATS", "1");
+            set_env("GGML_MOE_CACHE_DEVICE_CAPTURE", "1");
+            set_env("GGML_MOE_MISSJOIN", "stage");
+            capture.clear();
+            ggml_init_params params = {12 * ggml_tensor_overhead(), nullptr, true};
+            ggml_context * input_ctx[] = {ggml_init(params), ggml_init(params)};
+            ggml_backend_t backends[] = {cpu, gpu};
+            ggml_tensor * acts[2];
+            ggml_tensor * storage[2];
+            ggml_tensor * ids[2];
+            ggml_backend_buffer_t buffers[2];
+            std::vector<float> activations((size_t) dim * tokens);
+            for (size_t i = 0; i < activations.size(); ++i) {
+                activations[i] = 0.2f * std::cos((float)i * 0.019f);
+            }
+            for (int i = 0; i < 2; ++i) {
+                acts[i] = ggml_new_tensor_3d(input_ctx[i], GGML_TYPE_F32, dim, 1, tokens);
+                storage[i] = ggml_new_tensor_2d(input_ctx[i], GGML_TYPE_I32, 64, tokens);
+                ids[i] = ggml_view_2d(input_ctx[i], storage[i], k_used, tokens, storage[i]->nb[1], 0);
+                buffers[i] = ggml_backend_alloc_ctx_tensors(input_ctx[i], backends[i]);
+                ggml_backend_tensor_set(acts[i], activations.data(), 0, activations.size() * sizeof(float));
+            }
+            test_graph graphs[2];
+            for (int i = 0; i < 2; ++i) {
+                ggml_init_params gp = {24 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true};
+                graphs[i].ctx = ggml_init(gp);
+                ggml_context * c = graphs[i].ctx;
+                ggml_tensor * up = ggml_mul_mat_id(c, weights[0], acts[i], ids[i]);
+                ggml_tensor * gate = ggml_mul_mat_id(c, weights[1], acts[i], ids[i]);
+                ggml_tensor * mid = ggml_swiglu_split(c, gate, up);
+                graphs[i].out = ggml_mul_mat_id(c, weights[2], mid, ids[i]);
+                ggml_set_name(up, "moe_cache_hf_up");
+                ggml_set_name(gate, "moe_cache_hf_gate");
+                ggml_set_name(graphs[i].out, "moe_cache_hf_down");
+                graphs[i].graph = ggml_new_graph(c);
+                ggml_build_forward_expand(graphs[i].graph, graphs[i].out);
+                graphs[i].buffer = ggml_backend_alloc_ctx_tensors(c, backends[i]);
+            }
+            const auto api = active_api();
+            void * session = create_direct_session(gpu, cpu);
+            ggml_moe_cache_tensor_desc descriptors[3];
+            std::vector<uint64_t> usage[3];
+            const uint64_t * counts[3];
+            for (int i = 0; i < 3; ++i) {
+                auto * w = weights[i];
+                descriptors[i] = {w->name, w->data, w->nb[2], dim, dim, n_expert, (int32_t) type};
+                usage[i].assign(n_expert, 0);
+                for (int e = 0; e < 6; ++e) {
+                    usage[i][e] = 100; // experts 0..5 resident, everything else misses
+                }
+                counts[i] = usage[i].data();
+            }
+            const bool prepared = session && api.warm(session, descriptors, counts, 3) > 0 &&
+                    api.device_prepare(session, descriptors, 3) == 1;
+            ok &= prepared;
+            std::vector<float> expected(ggml_nelements(graphs[0].out)), actual(expected.size());
+            std::vector<std::vector<float>> first_by_route;
+            for (int run = 0; run < 24 && prepared; ++run) {
+                // Route patterns: all hits, all misses, mixed, duplicates, many distinct misses.
+                std::vector<int32_t> routing(64 * tokens, 63);
+                for (int t = 0; t < tokens; ++t) {
+                    for (int j = 0; j < k_used; ++j) {
+                        int e;
+                        switch ((run / 3) % 6) {
+                            case 0: e = (j + t) % 6; break;                       // all resident
+                            case 1: e = 20 + ((j * 3 + t * 5) % 40); break;       // all missed
+                            case 2: e = (j % 2) ? (j * 7 + t) % 6 : 10 + j + t; break; // mixed
+                            case 3: e = (j < 4) ? 33 : (j % 3); break;            // duplicate misses and hits
+                            case 4: e = (j * 8 + t * 3 + run) % n_expert; break;  // wide spread
+                            default: e = 12 + ((j + t) % 2); break;               // two misses reused
+                        }
+                        routing[64 * t + j] = e;
+                    }
+                }
+                for (int i = 0; i < 2; ++i) {
+                    ggml_backend_tensor_set(storage[i], routing.data(), 0, routing.size() * sizeof(int32_t));
+                }
+                ok &= ggml_backend_graph_compute(cpu, graphs[0].graph) == GGML_STATUS_SUCCESS;
+                ggml_backend_tensor_get(graphs[0].out, expected.data(), 0, expected.size() * sizeof(float));
+                api.session_enter(session);
+                ok &= ggml_backend_graph_compute(gpu, graphs[1].graph) == GGML_STATUS_SUCCESS;
+                api.session_leave(session);
+                ggml_backend_tensor_get(graphs[1].out, actual.data(), 0, actual.size() * sizeof(float));
+                ok &= compare_output(expected, actual, 5e-4);
+                dump.insert(dump.end(), actual.begin(), actual.end());
+                // Same route pattern (every 18 runs) must reproduce the same bits on a replayed graph.
+                const size_t slot = (size_t)(run % 18);
+                if (first_by_route.size() <= slot) {
+                    first_by_route.resize(slot + 1);
+                }
+                if (first_by_route[slot].empty()) {
+                    first_by_route[slot] = actual;
+                } else {
+                    ok &= first_by_route[slot] == actual;
+                }
+            }
+            if (session) {
+                api.session_destroy(session);
+            }
+            const std::string log = capture.get();
+            hf_layers_total += std::max<long long>(0, max_field_value(log, "hf_layers="));
+            if (!ok) {
+                fprintf(stderr, "hitfirst layer failed type=%s tokens=%d\n%s", ggml_type_name(type), tokens, log.c_str());
+            }
+            for (int i = 0; i < 2; ++i) {
+                free_graph(graphs[i]);
+                ggml_backend_buffer_free(buffers[i]);
+                ggml_free(input_ctx[i]);
+            }
+        }
+        printf("cache-hitfirst-layer type=%s hitfirst=%d: %s\n", ggml_type_name(type), hitfirst_requested ? 1 : 0, ok ? "OK" : "FAIL");
+        ggml_backend_buffer_free(weights_buffer);
+        ggml_free(weights_ctx);
+    }
+    for (const char * name : {"GGML_MOE_CACHE_DEVICE", "GGML_MOE_CACHE_DEVICE_STATS", "GGML_MOE_CACHE_DEVICE_CAPTURE", "GGML_MOE_MISSJOIN"}) {
+        set_env(name, nullptr);
+    }
+    // The path must actually have been taken (and must not be when off).
+    if (hitfirst_requested) {
+        ok &= hf_layers_total > 0;
+    } else {
+        ok &= hf_layers_total == 0;
+    }
+    printf("cache-hitfirst-layer hf_layers=%lld\n", hf_layers_total);
+    if (dump_path && ok) {
+        FILE * in = fopen(dump_path, "rb");
+        if (in) {
+            std::vector<float> baseline(dump.size());
+            const size_t got = fread(baseline.data(), sizeof(float), baseline.size(), in);
+            fclose(in);
+            const bool same = got == dump.size() && memcmp(baseline.data(), dump.data(), dump.size() * sizeof(float)) == 0;
+            printf("cache-hitfirst-vs-baseline bitwise (%zu floats): %s\n", dump.size(), same ? "IDENTICAL" : "DIFFERENT");
+            ok &= same;
+        } else if ((in = fopen(dump_path, "wb"))) {
+            fwrite(dump.data(), sizeof(float), dump.size(), in);
+            fclose(in);
+            printf("cache-hitfirst baseline written (%zu floats)\n", dump.size());
+        }
+    }
+    printf("cache-hitfirst-layer: %s\n", ok ? "OK" : "FAIL");
+    return ok;
+}
+
 // Cover every arithmetic specialization used by the cache table dispatch.
 static bool run_device_tables(ggml_backend_t gpu, ggml_backend_t cpu,
         ggml_tensor * initial_weights, log_capture & capture) {
@@ -7007,6 +7193,12 @@ int main(int argc, char ** argv) {
         ggml_backend_free(cpu);
         return !provider_is_cuda ? 77 : ok ? 0 : 1;
     }
+    if (argc == 2 && strcmp(argv[1], "--hitfirst-only") == 0) {
+        const bool ok = provider_is_cuda && run_hitfirst_layer(gpu, cpu, capture);
+        ggml_backend_free(gpu);
+        ggml_backend_free(cpu);
+        return !provider_is_cuda ? 77 : ok ? 0 : 1;
+    }
     if (argc == 2 && strcmp(argv[1], "--device-adaptation-starvation-only") == 0) {
         const bool ok = provider_is_cuda && run_device_adaptation_starvation(gpu, cpu, capture);
         ggml_backend_free(gpu);
@@ -7249,6 +7441,9 @@ int main(int argc, char ** argv) {
     });
     ok &= run_optional(provider_is_cuda, "cache-device-fused", [&] {
         return run_device_fused_tables(gpu, cpu, capture);
+    });
+    ok &= run_optional(provider_is_cuda, "cache-hitfirst-layer", [&] {
+        return run_hitfirst_layer(gpu, cpu, capture);
     });
     ok &= run_optional(provider_is_cuda, "cache-device-host-budget", [&] {
         return run_device_host_budget();

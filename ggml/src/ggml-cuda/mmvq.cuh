@@ -56,6 +56,14 @@ void ggml_cuda_moe_table_mmv(const void * const * table, ggml_type type,
         int64_t n_in, int64_t n_out, int64_t n_ids, int64_t n_tokens,
         int64_t act_channels, int64_t ids_stride, cudaStream_t stream);
 
+// fork (missjoin hit-first): launch only the routes whose expert has (route_want_hot=1) or lacks (0)
+// a resident copy per route_hot. Returns false, launching nothing, for types without an instantiation.
+bool ggml_cuda_moe_table_mmv_filtered_supported(ggml_type type);
+bool ggml_cuda_moe_table_mmv_filtered(const void * const * table, ggml_type type,
+        const char * act_q8, const int32_t * ids, float * dst,
+        int64_t n_in, int64_t n_out, int64_t n_ids, int64_t n_tokens,
+        int64_t act_channels, int64_t ids_stride, const uint8_t * route_hot, int route_want_hot, cudaStream_t stream);
+
 void ggml_cuda_moe_table_mmv_fused(const void * const * up_table, const void * const * gate_table, ggml_type type,
         const char * act_q8, const int32_t * ids, float * dst,
         int64_t n_in, int64_t n_out, int64_t n_ids, int64_t n_tokens,

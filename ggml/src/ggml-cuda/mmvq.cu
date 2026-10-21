@@ -1569,7 +1569,7 @@ static __global__ void moe_grouped_check(const uint32_t * reference, const uint3
 // Grid: (ceil(nrows_x / c_rows_per_block), nchannels_dst)
 // Block: (warp_size, ncols_dst) - each warp handles one token independently.
 // No shared memory reduction needed since each warp works alone.
-template <ggml_type type, int c_rows_per_block, bool has_fusion = false, bool has_clamp = false>
+template <ggml_type type, int c_rows_per_block, bool has_fusion = false, bool has_clamp = false, bool route_filter = false>
 __launch_bounds__(get_mmvq_mmid_max_batch_for_device<type>()*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q_moe(
         const void * vx_ptr, const void * vy_ptr,
@@ -1581,7 +1581,8 @@ static __global__ void mul_mat_vec_q_moe(
         const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
         const uint32_t ncols_dst, const uint32_t ids_stride,
         const float up_min, const float up_max, const float gate_min, const float gate_max,
-        const void * const * expert_table, const void * const * gate_table, const bool rank_major) {
+        const void * const * expert_table, const void * const * gate_table, const bool rank_major,
+        const uint8_t * route_hot, const int route_want_hot) {
     // [VFLOOR] rank_major (GGML_MOE_MMV_RANK_MAJOR=1): the grid is (ranks, row blocks) instead of (row blocks, ranks),
     // so the blocks of every rank for one row block run together and tokens that share an expert read its rows from L2.
     // Every output keeps the same arithmetic (bit-identical); only the block order changes.
@@ -1645,6 +1646,14 @@ static __global__ void mul_mat_vec_q_moe(
 
     ggml_cuda_pdl_sync();
     const uint32_t channel_x = shared_expert ? 0 : ids[channel_dst + token_idx * ids_stride];
+    if constexpr (route_filter) {
+        // fork (missjoin hit-first): a pass computes only the routes whose expert residency matches
+        // route_want_hot; the complementary pass computes the rest. Every route runs exactly once, in
+        // the same code with the same inputs, so the results are bit-identical.
+        if (!shared_expert && (route_hot[channel_x] != 0) != (route_want_hot != 0)) {
+            return;
+        }
+    }
     // the fork MoE slot cache keeps the gate weights in a separate pool with their own slot ids;
     // upstream fusion keeps the gate in the same expert layout, so fall back to channel_x there.
     const uint32_t channel_gate = shared_expert ? 0 : gate_ids ? gate_ids[channel_dst + token_idx * ids_stride] : channel_x;
@@ -1900,7 +1909,7 @@ static void mul_mat_vec_q5_K_batch_head_launch(
 }
 #endif
 
-template <ggml_type type, bool has_fusion = false, bool has_clamp = false>
+template <ggml_type type, bool has_fusion = false, bool has_clamp = false, bool route_filter = false>
 static void mul_mat_vec_q_moe_launch(
         const void * vx, const void * vy, const int32_t * ids,
         const int32_t * act_ids, const int32_t * gate_ids,
@@ -1911,7 +1920,8 @@ static void mul_mat_vec_q_moe_launch(
         const uint32_t ncols_dst, const uint32_t ids_stride,
         const int warp_size, const int nchannels_dst,
         const float up_min, const float up_max, const float gate_min,
-        const float gate_max, cudaStream_t stream, const void * const * expert_table = nullptr, const void * const * gate_table = nullptr) {
+        const float gate_max, cudaStream_t stream, const void * const * expert_table = nullptr, const void * const * gate_table = nullptr,
+        const uint8_t * route_hot = nullptr, const int route_want_hot = 0) {
 
     constexpr int rows_per_block = 2; // 2 gives best perf based on tuning
     const int64_t nblocks_rows = (nrows_x + rows_per_block - 1) / rows_per_block;
@@ -1922,11 +1932,11 @@ static void mul_mat_vec_q_moe_launch(
     const dim3 block_dims(warp_size, ncols_dst);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
 
-    ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, has_fusion, has_clamp>, launch_params,
+    ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, has_fusion, has_clamp, route_filter>, launch_params,
         vx, vy, ids, act_ids, gate_ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
         stride_row_x, stride_col_y, stride_col_dst,
         stride_channel_x, stride_channel_y, stride_channel_dst,
-        ncols_dst, ids_stride, up_min, up_max, gate_min, gate_max, expert_table, gate_table, rank_major);
+        ncols_dst, ids_stride, up_min, up_max, gate_min, gate_max, expert_table, gate_table, rank_major, route_hot, route_want_hot);
 }
 
 // Indexed vocabulary rows share one activation vector and never read padded rows.
@@ -3052,6 +3062,56 @@ static void ggml_cuda_moe_table_mmv_t(const void * const * table, const char * a
         0, s11, n_out, n_tokens, ids_stride,
         ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size, n_ids,
         0.0f, 0.0f, 0.0f, 0.0f, stream, table);
+}
+
+// fork (missjoin hit-first): the same launch restricted to routes whose expert residency flag matches.
+template <ggml_type type>
+static void ggml_cuda_moe_table_mmv_filtered_t(const void * const * table, const char * act_q8,
+        const int32_t * ids, float * dst, int64_t n_in, int64_t n_out,
+        int64_t n_ids, int64_t n_tokens, int64_t act_channels, int64_t ids_stride,
+        const uint8_t * route_hot, int route_want_hot, cudaStream_t stream) {
+    ggml_cuda_mm_fusion_args_device fusion{};
+    const int64_t s11 = GGML_PAD(n_in, MATRIX_ROW_PADDING) / QK8_1;
+    mul_mat_vec_q_moe_launch<type, false, false, true>(
+        nullptr, act_q8, ids, nullptr, nullptr, fusion, dst, n_in,
+        init_fastdiv_values(act_channels), n_out,
+        ggml_row_size(type, n_in) / ggml_type_size(type), act_channels*s11, n_ids*n_out,
+        0, s11, n_out, n_tokens, ids_stride,
+        ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size, n_ids,
+        0.0f, 0.0f, 0.0f, 0.0f, stream, table, nullptr, route_hot, route_want_hot);
+}
+
+// Types with a filtered instantiation (the measured model inventory plus the test fixture type).
+bool ggml_cuda_moe_table_mmv_filtered_supported(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q2_0: case GGML_TYPE_Q4_0: case GGML_TYPE_IQ2_XXS: case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ2_S: case GGML_TYPE_IQ3_XXS: case GGML_TYPE_IQ3_S: case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_IQ4_XS: case GGML_TYPE_Q4_K:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool ggml_cuda_moe_table_mmv_filtered(const void * const * table, ggml_type type,
+        const char * act_q8, const int32_t * ids, float * dst,
+        int64_t n_in, int64_t n_out, int64_t n_ids, int64_t n_tokens,
+        int64_t act_channels, int64_t ids_stride, const uint8_t * route_hot, int route_want_hot, cudaStream_t stream) {
+#define MOE_TABLE_FILTERED_CASE(T) case T: ggml_cuda_moe_table_mmv_filtered_t<T>(table, act_q8, ids, dst, n_in, n_out, n_ids, n_tokens, act_channels, ids_stride, route_hot, route_want_hot, stream); return true
+    switch (type) {
+        MOE_TABLE_FILTERED_CASE(GGML_TYPE_Q2_0);
+        MOE_TABLE_FILTERED_CASE(GGML_TYPE_Q4_0);
+        MOE_TABLE_FILTERED_CASE(GGML_TYPE_IQ2_XXS);
+        MOE_TABLE_FILTERED_CASE(GGML_TYPE_IQ2_XS);
+        MOE_TABLE_FILTERED_CASE(GGML_TYPE_IQ2_S);
+        MOE_TABLE_FILTERED_CASE(GGML_TYPE_IQ3_XXS);
+        MOE_TABLE_FILTERED_CASE(GGML_TYPE_IQ3_S);
+        MOE_TABLE_FILTERED_CASE(GGML_TYPE_IQ4_NL);
+        MOE_TABLE_FILTERED_CASE(GGML_TYPE_IQ4_XS);
+        MOE_TABLE_FILTERED_CASE(GGML_TYPE_Q4_K);
+        default: return false;
+    }
+#undef MOE_TABLE_FILTERED_CASE
 }
 
 void ggml_cuda_moe_table_mmv(const void * const * table, ggml_type type,

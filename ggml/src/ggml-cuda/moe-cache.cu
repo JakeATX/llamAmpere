@@ -83,6 +83,20 @@ static const void ** g_mj_eff = nullptr;
 static size_t g_mj_stride = 0;
 static int64_t g_mj_experts = 0;
 static int g_mj_slots = 0;
+// fork (missjoin hit-first, GGML_MOE_MISSJOIN_HITFIRST=1): one miss plan per layer on a high-priority side
+// stream, then one copy launch per projection; the resident routes of each projection compute while the
+// copies land. See moe_hf_begin.
+static cudaStream_t g_hf_side = nullptr;
+static cudaEvent_t g_hf_fork = nullptr;
+static cudaEvent_t g_hf_done[3] = {};
+static char * g_hf_scratch = nullptr;
+static const void ** g_hf_eff = nullptr;
+static const void ** g_hf_src = nullptr;
+static int * g_hf_nstage = nullptr;
+static size_t g_hf_stride = 0;
+static int64_t g_hf_experts = 0;
+static int g_hf_slots = 0;
+static std::atomic<unsigned long long> g_hf_layers{0};
 
 // fork PREFETCHFIX: asynchronous look-ahead prefetch (GGML_MOE_PREFETCH_ASYNC=1 copies,
 // =2 predicts and measures accuracy only). The graph writes each prediction into a ring in
@@ -175,6 +189,9 @@ static void moe_missjoin_log(const char * when) {
     if (c[8]) {
         MOE_CACHE_LOG("[moe-cache] missjoin reuse-only %s: bypassed_experts=%llu bypassed_bytes=%llu\n",
                 when, c[8], c[9]);
+    }
+    if (const unsigned long long hf = g_hf_layers.load(std::memory_order_relaxed)) {
+        MOE_CACHE_LOG("[moe-cache] missjoin hit-first %s: hf_layers=%llu\n", when, hf);
     }
 }
 
@@ -660,6 +677,10 @@ struct moe_cache_session {
     unsigned long long * mj_retained_counts = nullptr;
     cudaStream_t mj_retained_stream = nullptr;
     bool mj_retained_stream_set = false;
+    // fork (missjoin hit-first): the order projections are dispatched in per layer, learned at run time so
+    // the copies are issued in the order the math needs them.
+    std::vector<std::array<int8_t, 3>> hf_order;
+    std::vector<int8_t> hf_seq;
     int active_scopes = 0;
     int active_nodes = 0;
     struct active_source {
@@ -8177,6 +8198,40 @@ static bool moe_missjoin_overlap_enabled() {
     return on && moe_missjoin_mode() == 1;
 }
 
+// fork (missjoin hit-first): lossless scheduling variant of stage mode. Needs the stage mode, and refuses
+// the fused up/gate path and asynchronous prefetch, whose dispatch it does not reorder.
+static bool moe_missjoin_hitfirst_enabled() {
+    static const bool on = [] {
+        const char * v = getenv("GGML_MOE_MISSJOIN_HITFIRST");
+        if (!v || strcmp(v, "1") != 0) {
+            return false;
+        }
+        const char * fused = getenv("GGML_MOE_CACHE_DEVICE_FUSED");
+        const char * pf = getenv("GGML_MOE_PREFETCH_ASYNC");
+        const char * ov = getenv("GGML_MOE_MISSJOIN_OVERLAP");
+        return !(fused && strcmp(fused, "1") == 0) && !(pf && atoi(pf) != 0) && !(ov && strcmp(ov, "1") == 0);
+    }();
+    return on && moe_missjoin_mode() == 1;
+}
+
+static int moe_hf_slots() {
+    static const int slots = [] {
+        const char * v = getenv("GGML_MOE_MISSJOIN_SLOTS");
+        const int s = v ? atoi(v) : 32;
+        return std::max(1, std::min(s, MOE_MISSJOIN_MAX_SLOTS));
+    }();
+    return slots;
+}
+
+static int moe_hf_blocks() {
+    static const int blocks = [] {
+        const char * v = getenv("GGML_MOE_MISSJOIN_HF_BLOCKS");
+        const int b = v ? atoi(v) : 24;
+        return std::max(1, std::min(b, 4096));
+    }();
+    return blocks;
+}
+
 static size_t moe_missjoin_copy_bytes(const moe_cache_device_table & t) {
     return (size_t) t.desc.n_out * ggml_row_size((ggml_type) t.desc.type, t.desc.n_in);
 }
@@ -8262,7 +8317,10 @@ static void moe_missjoin_overlap_prepare(moe_cache_session & session) {
     session.mj_group = -1;
     session.mj_ids = nullptr;
     session.mj_pending = 0;
-    if (!moe_missjoin_overlap_enabled()) {
+    session.hf_order.clear();
+    session.hf_seq.clear();
+    const bool hitfirst = moe_missjoin_hitfirst_enabled();
+    if (!moe_missjoin_overlap_enabled() && !hitfirst) {
         return;
     }
     size_t stride = 0;
@@ -8292,6 +8350,44 @@ static void moe_missjoin_overlap_prepare(moe_cache_session & session) {
         t.mj_kind = k;
         stride = std::max(stride, (size_t) GGML_PAD(bytes, 256));
         experts = std::max(experts, t.desc.n_expert);
+    }
+    if (hitfirst) {
+        const int slots = moe_hf_slots();
+        bool ok = !session.mj_groups.empty();
+        if (ok && !g_hf_side) {
+            int least = 0, greatest = 0;
+            ok = cudaDeviceGetStreamPriorityRange(&least, &greatest) == cudaSuccess &&
+                 cudaStreamCreateWithPriority(&g_hf_side, cudaStreamNonBlocking, greatest) == cudaSuccess &&
+                 cudaEventCreateWithFlags(&g_hf_fork, cudaEventDisableTiming) == cudaSuccess;
+            for (int k = 0; ok && k < 3; ++k) {
+                ok = cudaEventCreateWithFlags(&g_hf_done[k], cudaEventDisableTiming) == cudaSuccess;
+            }
+        }
+        if (ok && !g_hf_scratch) {
+            ok = cudaMalloc((void **) &g_hf_scratch, 3 * (size_t) slots * stride) == cudaSuccess &&
+                 cudaMalloc((void **) &g_hf_eff, 3 * (size_t) experts * sizeof(void *)) == cudaSuccess &&
+                 cudaMalloc((void **) &g_hf_src, 3 * (size_t) slots * sizeof(void *)) == cudaSuccess &&
+                 cudaMalloc((void **) &g_hf_nstage, 3 * sizeof(int)) == cudaSuccess;
+            if (ok) {
+                g_hf_stride = stride;
+                g_hf_experts = experts;
+                g_hf_slots = slots;
+            }
+        }
+        ok = ok && stride <= g_hf_stride && experts <= g_hf_experts && slots <= g_hf_slots;
+        if (!ok) {
+            (void) cudaGetLastError();
+            session.mj_groups.clear();
+            for (auto & entry : session.device_tables) { entry.second.mj_layer = -1; entry.second.mj_kind = -1; }
+        } else {
+            session.hf_order.assign(session.mj_groups.size(), std::array<int8_t, 3>{-1, -1, -1});
+        }
+        size_t complete_hf = 0;
+        for (const auto & g : session.mj_groups) { complete_hf += g[0] && g[1] && g[2]; }
+        MOE_CACHE_LOG("[moe-cache] missjoin hit-first: %s, %zu complete layers, slots=%d, copy blocks=%d, arena=%zu MiB\n",
+                ok ? "on" : "off (setup failed)", complete_hf, slots, moe_hf_blocks(),
+                ok ? (3 * (size_t) g_hf_slots * g_hf_stride) >> 20 : 0);
+        return;
     }
     const int slots = moe_missjoin_slots();
     bool ok = !session.mj_groups.empty();
@@ -8366,6 +8462,243 @@ static const void * const * moe_missjoin_overlap_table(ggml_backend_cuda_context
     CUDA_CHECK(cudaStreamWaitEvent(main, g_mj_done[k], 0));
     session.mj_pending &= ~(1u << k);
     return g_mj_eff + (size_t) k * g_mj_experts;
+}
+
+// ---------------------------------------------------------------------------------------------
+// fork (missjoin hit-first): per-layer miss plan, per-projection copy, resident-first math.
+//
+// Order of work in one layer, for projections P1, P2, P3 in dispatch order (up, gate, down):
+//   main stream:  fork | q8(P1) | hit(P1) | wait copy(P1) | miss(P1) | q8(P2) | hit(P2) | wait copy(P2) | ...
+//   side stream:  plan(all three) | copy(P1) | copy(P2) | copy(P3)
+// The plan removes duplicate routes once for the layer and lists each projection's distinct missed
+// experts; each copy launch then moves exactly those experts. A projection's resident routes run while its
+// copy (and every later copy) is in flight; its missed routes run after its own event. Every route is
+// computed once by the same kernel from the same bytes, so results equal the serial staging path bit for bit.
+// Buffer lifetime: the next layer's plan is ordered after this layer's last miss pass (its fork event is
+// recorded on the main stream after it), so the persistent arena is never overwritten while read.
+
+struct moe_hf_plan_args {
+    const void * const * table[3];
+    const uint8_t * hot[3];
+    const void ** eff[3];
+    const void ** src[3];
+    int * nstage;
+    char * scratch;
+    size_t stride;
+};
+
+// counts: 0 dispatches, 1 distinct experts, 2 distinct misses, 3 staged, 4 miss routes, 5 unstaged misses
+// (the same meanings as moe_missjoin_stage_kernel, summed over the three projections of the layer).
+static __global__ void moe_hf_plan_kernel(const moe_hf_plan_args args, const int32_t * ids, int n_ids, int n_routes,
+        int ids_stride, int n_expert, int slots, unsigned aligned_mask, unsigned long long * counts) {
+    __shared__ int s_e[MOE_MISSJOIN_MAX_ROUTES];
+    __shared__ unsigned char s_first[MOE_MISSJOIN_MAX_ROUTES];
+    __shared__ unsigned char s_flag[3][MOE_MISSJOIN_MAX_ROUTES];
+    __shared__ int s_stage[3][MOE_MISSJOIN_MAX_SLOTS];
+    __shared__ int s_total[3];
+    for (int i = threadIdx.x; i < n_routes; i += blockDim.x) {
+        s_e[i] = ids[(i / n_ids) * ids_stride + i % n_ids];
+    }
+    __syncthreads();
+    // The duplicate removal happens once here for all three projections.
+    for (int i = threadIdx.x; i < n_routes; i += blockDim.x) {
+        const int e = s_e[i];
+        unsigned char first = 0;
+        if (e >= 0 && e < n_expert) {
+            first = 1;
+            for (int j = 0; j < i; ++j) {
+                if (s_e[j] == e) { first = 0; break; }
+            }
+        }
+        s_first[i] = first;
+    }
+    __syncthreads();
+    // bit0 distinct, bit1 miss, bit2 stageable (miss, 16-byte aligned source, copy size a multiple of 16)
+    for (int i = threadIdx.x; i < n_routes; i += blockDim.x) {
+        const int e = s_e[i];
+        for (int k = 0; k < 3; ++k) {
+            unsigned char f = 0;
+            if (s_first[i]) {
+                f |= 1;
+                if (!args.hot[k][e]) {
+                    f |= 2;
+                    if ((aligned_mask >> k & 1u) && ((uintptr_t) args.table[k][e] & 15) == 0) { f |= 4; }
+                }
+            }
+            s_flag[k][i] = f;
+        }
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < n_routes; i += blockDim.x) {
+        for (int k = 0; k < 3; ++k) {
+            if (s_flag[k][i] == 7) {
+                int rank = 0;
+                for (int j = 0; j < i; ++j) { rank += s_flag[k][j] == 7; }
+                if (rank < slots) { s_stage[k][rank] = s_e[i]; }
+            }
+        }
+    }
+    if (threadIdx.x < 3) {
+        int stageable = 0;
+        for (int i = 0; i < n_routes; ++i) { stageable += s_flag[threadIdx.x][i] == 7; }
+        s_total[threadIdx.x] = stageable;
+        args.nstage[threadIdx.x] = min(stageable, slots);
+    }
+    __syncthreads();
+    for (int k = 0; k < 3; ++k) {
+        for (int e = threadIdx.x; e < n_expert; e += blockDim.x) {
+            args.eff[k][e] = args.table[k][e];
+        }
+    }
+    __syncthreads();
+    for (int k = 0; k < 3; ++k) {
+        const int n_stage = min(s_total[k], slots);
+        for (int r = threadIdx.x; r < n_stage; r += blockDim.x) {
+            args.eff[k][s_stage[k][r]] = args.scratch + ((size_t) k * slots + r) * args.stride;
+            args.src[k][r] = args.table[k][s_stage[k][r]];
+        }
+    }
+    if (threadIdx.x == 0 && counts) {
+        unsigned long long distinct = 0, dmiss = 0, mroutes = 0, staged = 0;
+        for (int i = 0; i < n_routes; ++i) { distinct += s_first[i]; }
+        for (int k = 0; k < 3; ++k) {
+            staged += min(s_total[k], slots);
+            for (int i = 0; i < n_routes; ++i) {
+                dmiss += (s_flag[k][i] & 3) == 3;
+                // routes (with duplicates) whose expert is not resident
+                if (s_e[i] >= 0 && s_e[i] < n_expert && !args.hot[k][s_e[i]]) { ++mroutes; }
+            }
+        }
+        atomicAdd(counts + 0, 3ULL);
+        atomicAdd(counts + 1, 3 * distinct);
+        atomicAdd(counts + 2, dmiss);
+        atomicAdd(counts + 3, staged);
+        atomicAdd(counts + 4, mroutes);
+        atomicAdd(counts + 5, dmiss - staged);
+    }
+}
+
+// Copies the experts the plan listed for one projection into its scratch slots.
+static __global__ void moe_hf_copy_kernel(const void * const * src, const int * nstage, char * scratch,
+        size_t stride, size_t copy_bytes) {
+    const int n_stage = *nstage;
+    if (n_stage == 0) {
+        return;
+    }
+    const size_t chunks = copy_bytes / 16;
+    const size_t total = chunks * (size_t) n_stage;
+    const size_t step = (size_t) gridDim.x * blockDim.x;
+    size_t c = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    // Four loads in flight per thread before the stores keep the link busy.
+    for (; c + 3 * step < total; c += 4 * step) {
+        int4 v[4];
+        size_t r[4], o[4];
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const size_t ck = c + k * step;
+            r[k] = ck / chunks;
+            o[k] = ck - r[k] * chunks;
+            v[k] = __ldcs((const int4 *) src[r[k]] + o[k]);
+        }
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            ((int4 *) (scratch + r[k] * stride))[o[k]] = v[k];
+        }
+    }
+    for (; c < total; c += step) {
+        const size_t r = c / chunks;
+        const size_t o = c - r * chunks;
+        ((int4 *) (scratch + r * stride))[o] = __ldcs((const int4 *) src[r] + o);
+    }
+}
+
+// True when this dispatch takes the hit-first path. Forks the layer's plan and copies on the first
+// projection of a layer; later projections only join their own event (moe_hf_wait).
+static bool moe_hf_begin(ggml_backend_cuda_context & ctx, moe_cache_session & session,
+        const moe_cache_device_table & table, const ggml_tensor * ids) {
+    if (!moe_missjoin_hitfirst_enabled() || session.mj_groups.empty() || table.staging_device || !table.hot ||
+            table.mj_layer < 0 || table.mj_layer >= (int) session.mj_groups.size() || !g_hf_scratch ||
+            ids->type != GGML_TYPE_I32 || ids->nb[0] != sizeof(int32_t) || ids->nb[1] % sizeof(int32_t) != 0 ||
+            !ggml_cuda_moe_table_mmv_filtered_supported((ggml_type) table.desc.type)) {
+        return false;
+    }
+    const auto & group = session.mj_groups[table.mj_layer];
+    if (!group[0] || !group[1] || !group[2]) {
+        return false;
+    }
+    const int routes = (int)(ids->ne[0] * ids->ne[1]);
+    if (routes < 1 || routes > MOE_MISSJOIN_MAX_ROUTES || ids->ne[2] != 1) {
+        return false;
+    }
+    for (int j = 0; j < 3; ++j) {
+        if (!ggml_cuda_moe_table_mmv_filtered_supported((ggml_type) group[j]->desc.type) || group[j]->staging_device ||
+                group[j]->desc.n_expert != group[0]->desc.n_expert) {
+            return false;
+        }
+    }
+    const int k = table.mj_kind;
+    cudaStream_t main = ctx.stream();
+    if (session.mj_group == table.mj_layer && session.mj_ids == ids->data && (session.mj_pending >> k & 1u)) {
+        // Same layer, copy already issued by its first projection.
+        session.hf_seq.push_back((int8_t) k);
+        if (session.hf_seq.size() == 3) {
+            std::array<int8_t, 3> order{session.hf_seq[0], session.hf_seq[1], session.hf_seq[2]};
+            if (order[0] != order[1] && order[0] != order[2] && order[1] != order[2]) {
+                session.hf_order[table.mj_layer] = order;
+            }
+        }
+        return true;
+    }
+    // New layer: join copies a previous group left unconsumed, then fork.
+    for (int j = 0; j < 3; ++j) {
+        if (session.mj_pending >> j & 1u) {
+            CUDA_CHECK(cudaStreamWaitEvent(main, g_hf_done[j], 0));
+        }
+    }
+    CUDA_CHECK(cudaEventRecord(g_hf_fork, main));
+    CUDA_CHECK(cudaStreamWaitEvent(g_hf_side, g_hf_fork, 0));
+    const int slots = g_hf_slots;
+    moe_hf_plan_args args = {};
+    unsigned aligned = 0;
+    for (int j = 0; j < 3; ++j) {
+        const auto & m = *group[j];
+        args.table[j] = m.device;
+        args.hot[j] = m.hot;
+        args.eff[j] = g_hf_eff + (size_t) j * g_hf_experts;
+        args.src[j] = g_hf_src + (size_t) j * slots;
+        aligned |= (moe_missjoin_copy_bytes(m) % 16 == 0 ? 1u : 0u) << j;
+    }
+    args.nstage = g_hf_nstage;
+    args.scratch = g_hf_scratch;
+    args.stride = g_hf_stride;
+    const int n_expert = (int) group[0]->desc.n_expert;
+    moe_hf_plan_kernel<<<1, 256, 0, g_hf_side>>>(args, (const int32_t *) ids->data, (int) ids->ne[0], routes,
+            (int)(ids->nb[1] / sizeof(int32_t)), n_expert, slots, aligned, g_missjoin_counts);
+    CUDA_CHECK(cudaGetLastError());
+    std::array<int8_t, 3> order = session.hf_order[table.mj_layer];
+    if (order[0] < 0) { order = {0, 1, 2}; }
+    for (int idx = 0; idx < 3; ++idx) {
+        const int j = order[idx];
+        moe_hf_copy_kernel<<<moe_hf_blocks(), 256, 0, g_hf_side>>>(args.src[j], g_hf_nstage + j,
+                g_hf_scratch + (size_t) j * slots * g_hf_stride, g_hf_stride, moe_missjoin_copy_bytes(*group[j]));
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaEventRecord(g_hf_done[j], g_hf_side));
+    }
+    session.mj_group = table.mj_layer;
+    session.mj_ids = ids->data;
+    session.mj_pending = 7u;
+    session.hf_seq.assign(1, (int8_t) k);
+    g_hf_layers.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+// Joins this projection's copy and returns its table of effective expert addresses.
+static const void * const * moe_hf_wait(ggml_backend_cuda_context & ctx, moe_cache_session & session,
+        const moe_cache_device_table & table) {
+    const int k = table.mj_kind;
+    CUDA_CHECK(cudaStreamWaitEvent(ctx.stream(), g_hf_done[k], 0));
+    session.mj_pending &= ~(1u << k);
+    return g_hf_eff + (size_t) k * g_hf_experts;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -9018,6 +9351,9 @@ bool ggml_cuda_moe_cache_device_compute(ggml_backend_cuda_context & ctx, ggml_te
     const ggml_tensor * ids = op->src[2];
     session.device_dispatches.fetch_add(1, std::memory_order_relaxed);
     moe_cache_swap_note_stream(session, ctx);
+    // fork (missjoin hit-first): the first projection of a layer starts the layer's miss copies right here,
+    // before this dispatch's own work, so the link is busy while the resident math runs.
+    const bool hf_on = moe_hf_begin(ctx, session, table, ids);
     if (session.route_trace.host && table.route_trace_layer >= 0) {
         GGML_ASSERT(ids->ne[0] * ids->ne[1] <= 128);
         const int layer = table.route_trace_layer;
@@ -9050,6 +9386,23 @@ bool ggml_cuda_moe_cache_device_compute(ggml_backend_cuda_context & ctx, ggml_te
     quantize_row_q8_1_cuda((const float *) a->data, nullptr, quantized, (ggml_type) table.desc.type,
             a->ne[0], a->nb[1] / sizeof(float), a->nb[2] / sizeof(float), a->nb[3] / sizeof(float),
             padded, a->ne[1], a->ne[2], 1, ctx.stream());
+    if (hf_on) {
+        // Resident routes first, then the routes whose experts were just copied; together they compute
+        // every route exactly once with the same kernel.
+        const int64_t ids_stride = ids->nb[1] / sizeof(int32_t);
+        const bool hit_ok = ggml_cuda_moe_table_mmv_filtered(table.device, (ggml_type) table.desc.type, quantized,
+                (const int32_t *) ids->data, (float *) op->data, a->ne[0], op->ne[0], ids->ne[0], ids->ne[1], a->ne[1],
+                ids_stride, table.hot, 1, ctx.stream());
+        GGML_ASSERT(hit_ok);
+        CUDA_CHECK(cudaGetLastError());
+        const void * const * eff = moe_hf_wait(ctx, session, table);
+        const bool miss_ok = ggml_cuda_moe_table_mmv_filtered(eff, (ggml_type) table.desc.type, quantized,
+                (const int32_t *) ids->data, (float *) op->data, a->ne[0], op->ne[0], ids->ne[0], ids->ne[1], a->ne[1],
+                ids_stride, table.hot, 0, ctx.stream());
+        GGML_ASSERT(miss_ok);
+        CUDA_CHECK(cudaGetLastError());
+        return true;
+    }
     moe_cache_effective_table effective(ctx.pool());
     const void * const * mmv_table = moe_cache_resolve_table(ctx, session, table, ids, effective);
     if (!ggml_cuda_moe_table_mmv_grouped_try(ctx, mmv_table, nullptr, (ggml_type)table.desc.type, quantized,
