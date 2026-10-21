@@ -708,12 +708,13 @@ struct common_sampler * common_sampler_init(
             const char * e = getenv("LLAMA_BOOKKEEP_SAMPLER");
             return e && atoi(e) != 0;
         }();
-        // LLAMA_HOSTCPU_TOPK_SKIP_EMPTY=1: disabled samplers ("?penalties", "?dry", "?top-n-sigma", ...: their
+        // LLAMA_HOSTCPU_TOPK_SKIP_EMPTY (default on): disabled samplers ("?penalties", "?dry", "?top-n-sigma", ...: their
         // apply and accept do nothing) may sit before top-k. The default sampler order puts three of them
         // first, which kept the fused top-k off for every plain temp/top-k/top-p request.
+        // Default on (exact: the skipped samplers do nothing); LLAMA_HOSTCPU_TOPK_SKIP_EMPTY=0 turns it off.
         static const bool hostcpu_skip_empty_env = [] {
             const char * e = getenv("LLAMA_HOSTCPU_TOPK_SKIP_EMPTY");
-            return e && atoi(e) != 0;
+            return e == nullptr || atoi(e) != 0;
         }();
         if (topk_fused_env && params.top_k > 0 && params.top_k <= 128) {
             const int bias_idx = merged_bias.empty() ? 0 : 1;
