@@ -62,6 +62,8 @@ static void check_builtins() {
     const llama_mtp_vocab_builtin * q35 = llama_mtp_vocab_builtin_find(0x4f951848e41f4b37ULL, 248320, "qwen35", 0);
     GGML_ASSERT(q35 != nullptr && std::strcmp(q35->arch, "qwen35") == 0 && q35->n_sel == 65536);
     GGML_ASSERT(flash != q35);
+    // A shared tokenizer does not imply a shared generation/proposal ranking.
+    GGML_ASSERT(llama_mtp_vocab_builtin_ids(*flash) != llama_mtp_vocab_builtin_ids(*q35));
     const llama_mtp_vocab_builtin * flash32 = llama_mtp_vocab_builtin_find(0x4f951848e41f4b37ULL, 248320, "qwen4exp", 32768);
     GGML_ASSERT(flash32 != nullptr && flash32->n_sel == 32768 && std::strcmp(flash32->arch, "qwen4exp") == 0);
 }
