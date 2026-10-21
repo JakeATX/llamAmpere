@@ -15,6 +15,18 @@ LLAMA_API void llama_mtp_prefill_reset(struct llama_context * target, llama_seq_
 LLAMA_API int llama_mtp_prefill_decode(struct llama_context * draft, struct llama_context * target,
         struct llama_batch batch, const float * const * carry, uint32_t n_seq);
 
+// [PREFILLFAST] LLAMA_MTP_B1_HANDOFF=1: the target stages each ubatch's hidden rows on its device and calls
+// cb(user, first, count) after the ubatch (batch indices), so the helper can consume them before the next one.
+// While a callback is set, rows of a staged ubatch other than its last are not copied to the host, except in the
+// call's final ubatch; the callback must consume every staged range (llama_mtp_handoff_decode).
+LLAMA_API bool llama_mtp_handoff_init(struct llama_context * target);
+LLAMA_API void llama_set_ubatch_rows_callback(struct llama_context * target,
+        void (*cb)(void * user, int32_t first, int32_t count), void * user);
+LLAMA_API bool llama_mtp_handoff_ready(struct llama_context * target, int32_t first, int32_t count);
+// One sequence; token i reads the target row first + i - 1, token 0 reads carry when carry != NULL. -4 = use the host path.
+LLAMA_API int llama_mtp_handoff_decode(struct llama_context * draft, struct llama_context * target,
+        struct llama_batch batch, int32_t first, const float * carry);
+
 // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
 LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         struct llama_context * ctx,

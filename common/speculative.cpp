@@ -1449,6 +1449,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     int32_t ubatch_capacity = 0;
     bool prefill_overlap = false;
     bool prefill_device = false;
+    bool handoff = false; // [PREFILLFAST] LLAMA_MTP_B1_HANDOFF=1: per-ubatch device rows from the target decode
 
     // One MTP draft driver, three modes (set once in the ctor):
     //   is_mem_shared (gemma4): shares the target KV, runs all heads in one graph.
@@ -1602,6 +1603,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         // fork: Stage prompt hidden rows once, then feed the logical catch-up batch by backend copies.
         prefill_device = !is_mem_shared && !chain_heads && llama_mtp_prefill_init(ctx_tgt);
+        handoff = !is_mem_shared && !chain_heads && !prefill_device && llama_mtp_handoff_init(ctx_tgt);
         prefill_overlap = prefill_overlap || prefill_device;
         if (prefill_device) {
             std::memset(batch.embd, 0, (size_t) batch_capacity * n_embd * sizeof(float));
@@ -2140,9 +2142,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
+        // [PREFILLFAST] the target staged this range's hidden rows on its device during its decode; the host has
+        // only the range's last row (non-final ubatch), so every chunk must read the staged rows
+        bool one_seq = true;
+        for (int k = 1; k < n_tokens && one_seq; ++k) {
+            one_seq = batch_in.seq_id[k][0] == batch_in.seq_id[0][0];
+        }
+        const bool use_handoff = handoff && one_seq && llama_mtp_handoff_ready(ctx_tgt, output_offset, n_tokens);
+
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
         const int32_t defer_cap = defer_capacity();
-        if (!is_mem_shared && defer_enabled && n_tokens <= defer_cap) {
+        if (!is_mem_shared && defer_enabled && n_tokens <= defer_cap && !use_handoff) {
             // defer the catch-up rows; the first draft decode absorbs them, which saves
             // one eval per round. Flush first if rows from an undrafted round remain.
             if (!defer.tok.empty() && (int32_t) defer.tok.size() + n_tokens > defer_cap) {
@@ -2202,6 +2212,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                         common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { batch_in.seq_id[k][0] }, 0);
                     }
                     const int32_t skip = first == 0 ? 1 : 0;
+                    if (use_handoff) {
+                        const llama_seq_id s0 = batch_in.seq_id[0][0];
+                        const int32_t rc = llama_mtp_handoff_decode(ctx_dft, ctx_tgt, batch, output_offset + first,
+                                first == 0 ? pending_h[s0].data() : nullptr);
+                        if (rc != 0) {
+                            SPC_ERR("handoff llama_decode(ctx_dft) failed rc=%d (pos=%d)\n", (int) rc, (int) batch.pos[0]);
+                            ok = false;
+                            break;
+                        }
+                        continue;
+                    }
                     // Each helper batch owns a copy of the preceding target rows.
                     // Release those file-backed pages before decoding this batch,
                     // rather than retaining every refault across the whole prompt.
@@ -2253,10 +2274,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             verify_h_rows[seq_id] = n_rows;
             verify_h_beg[seq_id] = output_offset + i_batch_beg[seq_id];
 
+            if (use_handoff) {
+                // the target copied this row to the host and released its pages after the ubatch
+                if (!llama_copy_embeddings_nextn(ctx_tgt, pending_h[seq_id].data(), output_offset + i_batch_end[seq_id], 1)) { return false; }
+                continue;
+            }
             if (!llama_copy_embeddings_nextn(ctx_tgt, pending_h[seq_id].data(), output_offset + i_batch_end[seq_id], 1) ||
                     !llama_release_embeddings_nextn(ctx_tgt, output_offset + i_batch_end[seq_id], 1)) { return false; }
         }
 
+        if (use_handoff) {
+            return true;
+        }
         // Also release untouched boundary rows and the shared-KV path's rows.
         return llama_release_embeddings_nextn(ctx_tgt, output_offset, n_tokens);
     }
@@ -4529,6 +4558,16 @@ bool common_speculative_process(common_speculative * spec, const common_batch & 
 bool common_speculative_supports_process_range(const common_speculative * spec) {
     return spec && !spec->impls.empty() && std::all_of(spec->impls.begin(), spec->impls.end(), [](const auto & impl) {
         return impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE;
+    });
+}
+
+bool common_speculative_handoff_enabled(const common_speculative * spec) {
+    if (!common_speculative_supports_process_range(spec)) {
+        return false;
+    }
+    return std::all_of(spec->impls.begin(), spec->impls.end(), [](const auto & impl) {
+        const auto * mtp = dynamic_cast<const common_speculative_impl_draft_mtp *>(impl.get());
+        return mtp && mtp->handoff;
     });
 }
 

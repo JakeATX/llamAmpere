@@ -194,6 +194,15 @@ struct llama_context {
     void mtp_prefill_capture(ggml_tensor * hidden, const llama_ubatch & ubatch);
     void mtp_prefill_input(llm_graph_input_embd_h & input, const llama_ubatch & ubatch);
     void mtp_prefill_place(llm_graph_result & res);
+    // [PREFILLFAST] LLAMA_MTP_B1_HANDOFF=1: per-ubatch device handoff of the target's hidden rows to the helper
+    bool mtp_handoff_init();
+    void mtp_handoff_capture(ggml_tensor * hidden, const llama_ubatch & ubatch);
+    bool mtp_handoff_ready(int32_t first, int32_t count) const;
+    void mtp_handoff_release();
+    void set_ubatch_rows_callback(void (*cb)(void * user, int32_t first, int32_t count), void * user);
+    int mtp_handoff_decode(llama_context & target, llama_batch batch, int32_t first, const float * carry);
+    void (*ubatch_rows_cb)(void * user, int32_t first, int32_t count) = nullptr;
+    void * ubatch_rows_cb_user = nullptr;
 
     //
     // state save/load
@@ -518,6 +527,9 @@ private:
         bool consuming = false;
         std::vector<bool> captured;
         std::vector<llama_pos> carry_pos;
+        bool ring = false;        // [PREFILLFAST] handoff staging holds one ubatch (rows [0, n_ubatch) + one carry row per seq)
+        int64_t ring_first = -1;  // batch index of staged row 0, or -1
+        int32_t ring_rows = 0;
     } mtp_hidden;
     llama_context * mtp_hidden_source = nullptr; // scoped to mtp_prefill_decode
     std::vector<int32_t> mtp_hidden_rows;

@@ -3410,6 +3410,194 @@ int llama_context::mtp_prefill_decode(llama_context & target, llama_batch batch,
     return result;
 }
 
+// [PREFILLFAST] LLAMA_MTP_B1_HANDOFF=1: the target stages one ubatch of hidden rows on its device (plus one carry row) and
+// calls back after the ubatch, so the helper's catch-up reads them there instead of from the host output file.
+bool llama_context::mtp_handoff_init() {
+    const char * env = getenv("LLAMA_MTP_B1_HANDOFF");
+    if (!(env && strcmp(env, "1") == 0)) {
+        return false;
+    }
+    ggml_backend_dev_props props = {};
+    ggml_backend_dev_get_props(model.dev_output(), &props);
+    mtp_hidden.ring = !mtp_hidden.enabled && props.type != GGML_BACKEND_DEVICE_TYPE_CPU && props.caps.events &&
+        (model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN4EXP) &&
+        model.hparams.n_layer_nextn == 1 && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT &&
+        model.n_devices() <= 1 && model.split_mode() != LLAMA_SPLIT_MODE_TENSOR;
+    if (mtp_hidden.ring) {
+        LLAMA_LOG_INFO("%s: LLAMA_MTP_B1_HANDOFF=1: per-ubatch device handoff of hidden rows to the MTP helper\n", __func__);
+    }
+    return mtp_hidden.ring;
+}
+
+void llama_context::set_ubatch_rows_callback(void (*cb)(void * user, int32_t first, int32_t count), void * user) {
+    ubatch_rows_cb = mtp_hidden.ring ? cb : nullptr;
+    ubatch_rows_cb_user = mtp_hidden.ring ? user : nullptr;
+    if (!cb) {
+        const bool used = mtp_hidden.ring && mtp_hidden.buf != nullptr;
+        mtp_handoff_release();
+        if (used) {
+            // the helper reserved its graphs against this decode's allocator; make it reserve again
+            detach_compute_borrower();
+        }
+    }
+}
+
+void llama_context::mtp_handoff_release() {
+    auto & stage = mtp_hidden;
+    if (!stage.ring || !stage.buf) {
+        stage.ring_first = -1;
+        stage.ring_rows = 0;
+        return;
+    }
+    if (stage.consuming && stage.consumed) {
+        ggml_backend_event_synchronize(stage.consumed.get());
+    }
+    stage.consuming = false;
+    if (stage.backend) {
+        ggml_backend_synchronize(stage.backend);
+    }
+    stage.buf.reset();
+    stage.ctx.reset();
+    stage.rows = nullptr;
+    stage.ring_first = -1;
+    stage.ring_rows = 0;
+}
+
+void llama_context::mtp_handoff_capture(ggml_tensor * hidden, const llama_ubatch & ubatch) {
+    auto & stage = mtp_hidden;
+    auto * backend = ggml_backend_sched_get_tensor_backend(sched.get(), hidden);
+    GGML_ASSERT(backend && ubatch.data && hidden->ne[1] == ubatch.n_tokens && ubatch.n_tokens <= cparams.n_ubatch);
+    if (!stage.rows) {
+        stage.ctx.reset(ggml_init({ggml_tensor_overhead(), nullptr, true}));
+        if (!stage.ctx) {
+            throw std::runtime_error("failed to create MTP handoff staging context");
+        }
+        stage.rows = ggml_new_tensor_2d(stage.ctx.get(), GGML_TYPE_F32, hidden->ne[0], (int64_t) cparams.n_ubatch + 1);
+        stage.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(stage.ctx.get(), ggml_backend_get_default_buffer_type(backend)));
+        if (!stage.buf) {
+            throw std::runtime_error("failed to allocate MTP handoff staging buffer");
+        }
+        if (stage.backend != backend || !stage.ready || !stage.consumed) {
+            auto * dev = ggml_backend_get_device(backend);
+            stage.ready.reset(ggml_backend_event_new(dev));
+            stage.consumed.reset(ggml_backend_event_new(dev));
+        }
+        stage.backend = backend;
+        LLAMA_LOG_INFO("%s: MTP handoff staging = %.3f MiB\n", __func__,
+                ggml_backend_buffer_get_size(stage.buf.get()) / (1024.0 * 1024.0));
+    }
+    GGML_ASSERT(stage.backend == backend && stage.rows->ne[0] == hidden->ne[0]);
+    if (stage.consuming) {
+        if (stage.consumed) {
+            ggml_backend_event_wait(backend, stage.consumed.get());
+        }
+        stage.consuming = false;
+    }
+    auto src = mtp_row_view(hidden, 0, ubatch.n_tokens);
+    auto dst = mtp_row_view(stage.rows, 0, ubatch.n_tokens);
+    ggml_backend_tensor_copy_async(backend, backend, &src, &dst);
+    if (stage.ready) {
+        ggml_backend_event_record(stage.ready.get(), backend);
+    }
+    stage.ring_first = ubatch.data->batch_idxs[0];
+    stage.ring_rows = (int32_t) ubatch.n_tokens;
+}
+
+bool llama_context::mtp_handoff_ready(int32_t first, int32_t count) const {
+    const auto & stage = mtp_hidden;
+    return stage.ring && stage.rows && ubatch_rows_cb && stage.ring_first >= 0 && count > 0 &&
+        first >= stage.ring_first && (int64_t) first + count <= stage.ring_first + stage.ring_rows;
+}
+
+int llama_context::mtp_handoff_decode(llama_context & target, llama_batch batch, int32_t first, const float * carry) {
+    auto & source = target.mtp_hidden;
+    if (!source.ring || !source.rows || source.ring_first < 0 || cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP ||
+            cparams.embeddings || cparams.mtp_chain || !cparams.embeddings_nextn_masked ||
+            source.rows->ne[0] != (int64_t) model.hparams.n_embd_out() ||
+            batch.n_tokens <= 0 || batch.n_tokens > (int32_t) cparams.n_ubatch || !batch.token || !batch.embd || !batch.pos ||
+            !batch.n_seq_id || !batch.seq_id) {
+        return -4;
+    }
+    ggml_backend_t consumer = nullptr;
+    for (auto & backend : backends) {
+        if (ggml_backend_get_device(backend.get()) == model.dev_output()) {
+            consumer = backend.get();
+        }
+    }
+    if (!consumer || ggml_backend_get_device(consumer) != ggml_backend_get_device(source.backend)) {
+        return -4;
+    }
+    const int32_t carry_row = (int32_t) source.rows->ne[1] - 1;
+    mtp_hidden_rows.resize(batch.n_tokens);
+    for (int32_t i = 0; i < batch.n_tokens; ++i) {
+        if (batch.n_seq_id[i] != 1 || batch.seq_id[i] == nullptr || batch.seq_id[i][0] != batch.seq_id[0][0]) {
+            return -4;
+        }
+        if (i == 0 && carry) {
+            mtp_hidden_rows[i] = carry_row;
+            continue;
+        }
+        const int64_t row = (int64_t) first + i - 1 - source.ring_first;
+        if (row < 0 || row >= source.ring_rows) {
+            return -4;
+        }
+        mtp_hidden_rows[i] = (int32_t) row;
+    }
+    // the target's staging copies were queued on its stream; its decode loop synchronized before the callback
+    ggml_backend_sched_synchronize(target.sched.get());
+    if (mtp_input_upload_done) {
+        ggml_backend_event_synchronize(mtp_input_upload_done.get());
+    }
+    mtp_input_upload_next = 0;
+    if (carry) {
+        // the previous helper graph may still read the carry row
+        ggml_backend_synchronize(consumer);
+        ggml_backend_tensor_set(source.rows, carry, (size_t) carry_row * source.rows->nb[1], source.rows->nb[1]);
+    }
+    auto finish = [&]() {
+        if (source.consumed) {
+            ggml_backend_event_record(source.consumed.get(), consumer);
+            source.consuming = true;
+        }
+        if (!mtp_input_upload_done) {
+            mtp_input_upload_done.reset(ggml_backend_event_new(ggml_backend_get_device(consumer)));
+        }
+        if (mtp_input_upload_done) {
+            ggml_backend_event_record(mtp_input_upload_done.get(), consumer);
+        }
+    };
+    mtp_hidden_source = &target;
+    int result;
+    try {
+        result = decode(batch);
+    } catch (...) {
+        mtp_hidden_source = nullptr;
+        finish();
+        throw;
+    }
+    mtp_hidden_source = nullptr;
+    finish();
+    return result;
+}
+
+bool llama_mtp_handoff_init(llama_context * target) {
+    return target && target->mtp_handoff_init();
+}
+
+void llama_set_ubatch_rows_callback(llama_context * target, void (*cb)(void * user, int32_t first, int32_t count), void * user) {
+    if (target) {
+        target->set_ubatch_rows_callback(cb, user);
+    }
+}
+
+bool llama_mtp_handoff_ready(llama_context * target, int32_t first, int32_t count) {
+    return target && target->mtp_handoff_ready(first, count);
+}
+
+int llama_mtp_handoff_decode(llama_context * draft, llama_context * target, llama_batch batch, int32_t first, const float * carry) {
+    return draft && target ? draft->mtp_handoff_decode(*target, batch, first, carry) : -4;
+}
+
 bool llama_mtp_prefill_init(llama_context * target) {
     return target && target->mtp_prefill_init();
 }
@@ -4558,6 +4746,24 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         if (mtp_hidden.enabled && t_h_nextn && !cparams.embeddings_nextn_masked) {
             mtp_prefill_capture(t_h_nextn, ubatch);
         }
+        // [PREFILLFAST] LLAMA_MTP_B1_HANDOFF: stage this ubatch's rows for the helper when it is one contiguous run
+        bool handoff_ub = false;
+        if (mtp_hidden.ring && ubatch_rows_cb && t_h_nextn && !cparams.embeddings_nextn_masked && embd_nextn.data &&
+                cparams.pooling_type == LLAMA_POOLING_TYPE_NONE && ubatch.data && ubatch.n_tokens > 0 &&
+                ubatch.n_tokens <= cparams.n_ubatch && ubatch.data->batch_idxs.size() == ubatch.n_tokens &&
+                ubatch.data->batch_idxs[0] == n_tokens_prev) {
+            const auto & idxs = ubatch.data->batch_idxs;
+            handoff_ub = true;
+            for (uint32_t j = 1; j < ubatch.n_tokens && handoff_ub; ++j) {
+                handoff_ub = idxs[j] == idxs[0] + (int32_t) j;
+            }
+            if (handoff_ub) {
+                mtp_handoff_capture(t_h_nextn, ubatch);
+            }
+        }
+        // the helper reads the staged rows; the host keeps only each ubatch's last row (the next carry), and the
+        // call's final ubatch in full (later draft rounds read rows from it)
+        const bool handoff_last_only = handoff_ub && n_tokens_prev + (int64_t) ubatch.n_tokens < (int64_t) n_tokens_all;
 
         if (t_embd && res->get_embd_pooled()) {
             t_embd = res->get_embd_pooled();
@@ -4665,7 +4871,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 float *        embd_nextn_out = embd_nextn.data + offset * n_embd;
 
                 GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
-                ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
+                if (handoff_last_only && !masked) {
+                    ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out + (n_rows - 1)*n_embd,
+                            (size_t) (n_rows - 1)*n_embd*sizeof(float), n_embd*sizeof(float));
+                } else {
+                    ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
+                }
                 const char * reclaim = getenv("LLAMA_MOE_OUTPUT_RECLAIM");
                 if (output_file && reclaim && strcmp(reclaim, "1") == 0) {
                     ggml_backend_sched_synchronize(sched.get());
@@ -4741,6 +4952,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         n_tokens_prev += ubatch.n_tokens;
         if (b1_mode == 1 && b1->is_group_last(b1_i)) {
             b1->pass_end(b1_i);
+        }
+        if (handoff_ub) {
+            // every copy of this ubatch (staging, last host row, logits) must be complete before the helper runs
+            ggml_backend_sched_synchronize(sched.get());
+            ubatch_rows_cb(ubatch_rows_cb_user, (int32_t) (n_tokens_prev - ubatch.n_tokens), (int32_t) ubatch.n_tokens);
         }
     } while (b1_mode == 1 ? (++b1_i < b1->n_ub() && mctx->b1_seek(b1_i)) : mctx->next());
 
