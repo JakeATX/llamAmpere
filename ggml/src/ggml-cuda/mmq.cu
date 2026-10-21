@@ -6,7 +6,6 @@
 
 #include <cstdint>
 #include <cstdlib>
-#include <atomic>
 
 // Some opt-in callers bypass ggml_cuda_should_use_mmq() after doing their own
 // activation preparation. Check that the selected architecture actually has
@@ -406,12 +405,6 @@ bool ggml_cuda_mmq_pair_enabled() {
     return mmq_pair_mode() != 0;
 }
 
-static std::atomic<int64_t> mmq_pair_counts[GGML_CUDA_MAX_DEVICES]{};
-
-int64_t ggml_cuda_mmq_pair_count(int device) {
-    return mmq_pair_counts[device].load(std::memory_order_relaxed);
-}
-
 static bool mmq_pair_type(ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q1_0: case GGML_TYPE_Q2_0:
@@ -480,7 +473,7 @@ bool ggml_cuda_mul_mat_q_pair(ggml_backend_cuda_context & ctx, ggml_tensor * fir
         mmq_pair_check<<<(n + 255)/256, 256, 0, ctx.stream()>>>((const float *) second->data, reference_second.get(), n);
         CUDA_CHECK(cudaGetLastError());
     }
-    mmq_pair_counts[ctx.device].fetch_add(1, std::memory_order_relaxed);
+    ++ctx.fusion_stats.mmq_pair;
     return true;
 }
 

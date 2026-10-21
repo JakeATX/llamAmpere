@@ -9951,7 +9951,7 @@ int64_t ggml_backend_cuda_fusion_count(ggml_backend_t backend, const char * name
         return ctx->fusion_stats.mul_mat_glu;
     }
     if (strcmp(name, "mmq_pair") == 0) {
-        return ggml_cuda_mmq_pair_count(ctx->device);
+        return ctx->fusion_stats.mmq_pair;
     }
     if (strcmp(name, "norm_pair_concat") == 0) {
         return ctx->fusion_stats.norm_pair_concat;

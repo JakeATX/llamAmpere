@@ -1751,7 +1751,6 @@ void ggml_cuda_mul_mat_q(
 // Prompt-only preparation reuse; both original product kernels still run.
 bool ggml_cuda_mmq_pair_enabled();
 bool ggml_cuda_mul_mat_q_pair(ggml_backend_cuda_context & ctx, ggml_tensor * first, ggml_tensor * second);
-int64_t ggml_cuda_mmq_pair_count(int device);
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
 
