@@ -3526,6 +3526,10 @@ bool llama_context::mtp_handoff_row(float * dst, int32_t row) const {
 
 int llama_context::mtp_handoff_decode(llama_context & target, llama_batch batch, int32_t first, const float * carry) {
     auto & source = target.mtp_hidden;
+    // [PREFILLFAST] LLAMA_MTP_HANDOFF_NO_EMBD=1: the hidden rows come from the target's device ring (mtp_prefill_input),
+    // so the batch's host embd rows are never read; dropping them skips three copies of n_tokens x n_embd_out floats
+    // per helper call (batch conversion, batch allocator, ubatch), about 84 MB each at 2,048 rows.
+    static const bool no_embd = [] { const char * e = getenv("LLAMA_MTP_HANDOFF_NO_EMBD"); return e && strcmp(e, "1") == 0; }();
     if (!source.ring || !source.rows || source.ring_first < 0 || cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP ||
             cparams.embeddings || cparams.mtp_chain || !cparams.embeddings_nextn_masked ||
             source.rows->ne[0] != (int64_t) model.hparams.n_embd_out() ||
@@ -3582,6 +3586,9 @@ int llama_context::mtp_handoff_decode(llama_context & target, llama_batch batch,
         }
     };
     mtp_hidden_source = &target;
+    if (no_embd) {
+        batch.embd = nullptr;
+    }
     int result;
     try {
         result = decode(batch);
