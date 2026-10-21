@@ -34,12 +34,14 @@
 //   GGML_CUDA_AI23_MMVR=1    rate-2/3 decode with fixed stage offsets (default off)
 //   GGML_CUDA_AI23_TUNED=1   select measured rate-2/3 decode and tile defaults (default off)
 //   GGML_CUDA_AI23_MMVR_STAGES=4|8  deeper dense fixed-K four-warp weight prefetch (default 2)
-//   GGML_CUDA_AI23_MMVR_UNROLL=2|4  unroll dense decode without a deeper shared buffer (default 1)
+//   GGML_CUDA_AI23_MMVR_UNROLL=1|2|4|8  dense fixed-K loop unroll (tuned 8 at long K, 4 otherwise)
 //   GGML_CUDA_AI23_SMALL_SPLIT=2|4  split small-width fixed-K dense products (default off)
 //   GGML_CUDA_AI23_FUSED_X=1  quantize activations inside direct one-token expert blocks (default off)
 //   GGML_CUDA_AI23_DIRECT=1..8  skip expert grouping through this token width in MMVR (default off)
 //   GGML_CUDA_AI23_DENSE_TILE=1..29  dense shared-activation tile controls for 9..64 tokens (default off)
 //                             22/23 swap quantized activation halves to avoid LDS64 bank conflicts
+//   GGML_CUDA_AI23_PAIR_ACC=1  combine equal-scale adjacent span chunks before float updates (default off)
+//   GGML_CUDA_AI23_XPERM=1  vector activation loads for whole-row dense rate-2 kernels (default off)
 //   GGML_CUDA_AI23_RESOURCE=1   print CUDA kernel resource and occupancy queries once (diagnostics only)
 //   GGML_CUDA_AI23_SPLIT_K=2|4|8|16  split dense K chunks into partial tiles for 9..64 tokens (default off)
 //   GGML_CUDA_AI23_NARROW_WARPS=2|4|8  override narrow dense K parallelism (default automatic)
@@ -82,8 +84,69 @@ static int ai4_ampere_sms(const ggml_backend_cuda_context & ctx) {
     const auto & dev = ggml_cuda_info().devices[ctx.device];
     return dev.cc == 800 || dev.cc == 860 ? dev.nsm : 0;
 }
+// Keep explicit development controls exact. Automatic choices share one resolver so the
+// activation scratch layout and its consumer always agree.
+struct ai23_dense_policy {
+    int tile;
+    int narrow;
+    int splits;
+};
+static ai23_dense_policy ai23_dense_config(int M, int N, int K, int sms, int rate) {
+    static const int tile = ai4_env_int("GGML_CUDA_AI23_DENSE_TILE", nullptr, 0);
+    static const int narrow = ai4_env_int("GGML_CUDA_AI23_NARROW", nullptr, 0);
+    static const int splits = ai4_env_int("GGML_CUDA_AI23_SPLIT_K", nullptr, 0);
+    static const bool explicit_wide = getenv("GGML_CUDA_AI23_DENSE_TILE") ||
+                                      getenv("GGML_CUDA_AI23_NARROW") ||
+                                      getenv("GGML_CUDA_AI23_SPLIT_K");
+    ai23_dense_policy p{tile, narrow, splits};
+    if (!ai4_ai23_tuned() || explicit_wide || !sms || (rate != 2 && rate != 3) ||
+            N <= 8 || N > 64 || (K != 5120 && K != 17408)) {
+        return p;
+    }
+    // Eight-slab fixed-copy tiles cover 128 rows. The longest reduction needs
+    // additional K blocks; small short-K grids use one-slab decode through BN32.
+    const int blocks = (M + 127)/128;
+    p.tile = 24;
+    if (N > 32 || K == 17408) {
+        if (4*blocks < 3*sms) p.splits = 4;
+    } else if (N <= 16 || 4*blocks < 3*sms) {
+        p.tile = 0;
+        p.narrow = 2;
+        if (N <= 16 && rate == 3 && 4*blocks >= 3*sms) {
+            p.tile = 28;
+            p.narrow = 0;
+        }
+    }
+    return p;
+}
 static int ai4_ampere_bn(int N) {
     return N <= 8 ? 8 : N <= 16 ? 16 : N <= 32 ? 32 : 64;
+}
+
+// Only whole-row dense kernels consume the permuted activation scratch.
+template <int BN, int STAGES = 3, int NTB = 4, int LAY = ai4k::LAY_SB, int XSH = 1, bool ID = false, int N_WARPS = 1, int M_SLABS = ai4k::GEMM_SLABS, bool PREDECODED = false, int MINB = 1, bool STREAM_A = false, bool J_MAJOR = false, bool X8 = false, bool WHOLE = false, bool SPLIT = false, bool SWAP8 = false, bool FIXED_LOAD = false, bool XOR_X = false>
+static void ai23_launch_gemm(const uint8_t * W, const int8_t * Xq, const float * Xs, float * Y, int64_t ldy,
+                             int M, int N, int K, cudaStream_t stream, const ai4k::idmap & idm = ai4k::idmap{}, int max_experts = 0,
+                             const int8_t * decoded_weights = nullptr, int split_k = 1) {
+    if constexpr (J_MAJOR && !ID && XSH == 1 && ai4k::lay_span<LAY>() && (ai4k::lay_rate<LAY>() == 2 || ai4k::lay_rate<LAY>() == 3)) {
+        if (ai4_env_int("GGML_CUDA_AI23_PAIR_ACC", nullptr, 0)) {
+            if constexpr (WHOLE) {
+                if (ai4_env_int("GGML_CUDA_AI23_XPERM", nullptr, 0)) {
+                    ai4k::launch_gemm<BN, STAGES, NTB, LAY, XSH, ID, N_WARPS, M_SLABS, PREDECODED, MINB, STREAM_A, J_MAJOR, X8, WHOLE, SPLIT, SWAP8, FIXED_LOAD, true, true, XOR_X>(W, Xq, Xs, Y, ldy, M, N, K, stream, idm, max_experts, decoded_weights, split_k);
+                    return;
+                }
+            }
+            ai4k::launch_gemm<BN, STAGES, NTB, LAY, XSH, ID, N_WARPS, M_SLABS, PREDECODED, MINB, STREAM_A, J_MAJOR, X8, WHOLE, SPLIT, SWAP8, FIXED_LOAD, false, true, XOR_X>(W, Xq, Xs, Y, ldy, M, N, K, stream, idm, max_experts, decoded_weights, split_k);
+            return;
+        }
+    }
+    if constexpr (WHOLE && !ID) {
+        if (ai4_env_int("GGML_CUDA_AI23_XPERM", nullptr, 0)) {
+            ai4k::launch_gemm<BN, STAGES, NTB, LAY, XSH, ID, N_WARPS, M_SLABS, PREDECODED, MINB, STREAM_A, J_MAJOR, X8, WHOLE, SPLIT, SWAP8, FIXED_LOAD, true, false, XOR_X>(W, Xq, Xs, Y, ldy, M, N, K, stream, idm, max_experts, decoded_weights, split_k);
+            return;
+        }
+    }
+    ai4k::launch_gemm<BN, STAGES, NTB, LAY, XSH, ID, N_WARPS, M_SLABS, PREDECODED, MINB, STREAM_A, J_MAJOR, X8, WHOLE, SPLIT, SWAP8, FIXED_LOAD, false, false, XOR_X>(W, Xq, Xs, Y, ldy, M, N, K, stream, idm, max_experts, decoded_weights, split_k);
 }
 
 template <int BN, int LAY, int XSH, bool ID, int WARPS, int KT>
@@ -91,6 +154,12 @@ static void ai23_launch_narrow_kt(const uint8_t * W, const int8_t * q, const flo
                                  int M, int N, int K, cudaStream_t stream, const ai4k::idmap & idm, int max_tiles, bool perm) {
     if constexpr (ai4k::lay_rate<LAY>() == 2) {
         if (perm) {
+            if constexpr (!ID) {
+                if (ai4_env_int("GGML_CUDA_AI23_XPERM", nullptr, 0)) {
+                    ai4k::launch_ampere_mmv<BN, LAY, XSH, ID, WARPS, KT, true, true>(W, q, s, Y, M, M, N, K, stream, idm, max_tiles);
+                    return;
+                }
+            }
             ai4k::launch_ampere_mmv<BN, LAY, XSH, ID, WARPS, KT, true>(W, q, s, Y, M, M, N, K, stream, idm, max_tiles);
             return;
         }
@@ -100,9 +169,8 @@ static void ai23_launch_narrow_kt(const uint8_t * W, const int8_t * q, const flo
 
 template <int BN, int LAY, int XSH, bool ID, int WARPS>
 static void ai4_launch_ampere_w(const uint8_t * W, const int8_t * q, const float * s, float * Y,
-                               int M, int N, int K, cudaStream_t stream, const ai4k::idmap & idm, int max_tiles) {
+                               int M, int N, int K, cudaStream_t stream, const ai4k::idmap & idm, int max_tiles, int narrow) {
     if constexpr (ai4k::lay_rate<LAY>() == 2 || ai4k::lay_rate<LAY>() == 3) {
-        static const int narrow = ai4_env_int("GGML_CUDA_AI23_NARROW", nullptr, 0);
         if (narrow >= 2 && K == 5120) {
             ai23_launch_narrow_kt<BN, LAY, XSH, ID, WARPS, 5120>(W, q, s, Y, M, N, K, stream, idm, max_tiles, narrow >= 3);
             return;
@@ -119,27 +187,29 @@ template <int BN, int LAY, int XSH, bool ID>
 static void ai4_launch_ampere_mmv(const uint8_t * W, const int8_t * q, const float * s, float * Y,
                                   int M, int N, int K, int sms, cudaStream_t stream,
                                   const ai4k::idmap & idm, int max_tiles) {
+    const int narrow = ID ? ai4_env_int("GGML_CUDA_AI23_NARROW", nullptr, 0) :
+                            ai23_dense_config(M, N, K, sms, ai4k::lay_rate<LAY>()).narrow;
     if constexpr (ai4k::lay_rate<LAY>() == 2 || ai4k::lay_rate<LAY>() == 3) {
         static const int warps = ai4_env_int("GGML_CUDA_AI23_NARROW_WARPS", nullptr, 0);
         if (warps == 8) {
-            ai4_launch_ampere_w<BN, LAY, XSH, ID, 8>(W, q, s, Y, M, N, K, stream, idm, max_tiles);
+            ai4_launch_ampere_w<BN, LAY, XSH, ID, 8>(W, q, s, Y, M, N, K, stream, idm, max_tiles, narrow);
             return;
         }
         if (warps == 4) {
-            ai4_launch_ampere_w<BN, LAY, XSH, ID, 4>(W, q, s, Y, M, N, K, stream, idm, max_tiles);
+            ai4_launch_ampere_w<BN, LAY, XSH, ID, 4>(W, q, s, Y, M, N, K, stream, idm, max_tiles, narrow);
             return;
         }
         if (warps == 2) {
-            ai4_launch_ampere_w<BN, LAY, XSH, ID, 2>(W, q, s, Y, M, N, K, stream, idm, max_tiles);
+            ai4_launch_ampere_w<BN, LAY, XSH, ID, 2>(W, q, s, Y, M, N, K, stream, idm, max_tiles, narrow);
             return;
         }
     }
     if (sms >= 80 && BN == 8 && K >= 1024) {
-        ai4_launch_ampere_w<BN, LAY, XSH, ID, 8>(W, q, s, Y, M, N, K, stream, idm, max_tiles);
+        ai4_launch_ampere_w<BN, LAY, XSH, ID, 8>(W, q, s, Y, M, N, K, stream, idm, max_tiles, narrow);
     } else if (sms > 28 && BN <= 32) {
-        ai4_launch_ampere_w<BN, LAY, XSH, ID, 4>(W, q, s, Y, M, N, K, stream, idm, max_tiles);
+        ai4_launch_ampere_w<BN, LAY, XSH, ID, 4>(W, q, s, Y, M, N, K, stream, idm, max_tiles, narrow);
     } else {
-        ai4_launch_ampere_w<BN, LAY, XSH, ID, 2>(W, q, s, Y, M, N, K, stream, idm, max_tiles);
+        ai4_launch_ampere_w<BN, LAY, XSH, ID, 2>(W, q, s, Y, M, N, K, stream, idm, max_tiles, narrow);
     }
 }
 
@@ -254,15 +324,15 @@ static void ai4_launch_mmv_tuned(const uint8_t * W, const int8_t * q, const floa
 // Activations: rotate + int8-quantize X [N rows of K] once. XSH = 1: H256 and one scale per 256 (track B's kernel, used by
 // AI4 and by AI4_U with K % 256 == 0); XSH = 0: H128 and one scale per 128 (AI4_U with K % 256 != 0).
 // gridDim.y carries the rows (<= 65535), so longer inputs run in pieces.
-template <bool SWAP8 = false>
+template <bool SWAP8 = false, bool XPERM = false>
 static void ai4_quantize_x(const float * X, int64_t N, int K, int xsh, int8_t * q, float * s, cudaStream_t stream) {
     const int64_t ns = K >> (7 + xsh);
     for (int64_t r0 = 0; r0 < N; r0 += 65535) {
         const int nr = (int) std::min<int64_t>(65535, N - r0);
         if (xsh) {
-            rq4::launch_quantize_act<SWAP8>(X + r0*K, K, q + r0*K, s + r0*ns, K, nr, stream);
+            rq4::launch_quantize_act<SWAP8, XPERM>(X + r0*K, K, q + r0*K, s + r0*ns, K, nr, stream);
         } else {
-            ai4k::launch_quantize_act128<SWAP8>(X + r0*K, K, q + r0*K, s + r0*ns, K, nr, stream);
+            ai4k::launch_quantize_act128<SWAP8, XPERM>(X + r0*K, K, q + r0*K, s + r0*ns, K, nr, stream);
         }
     }
 }
@@ -318,13 +388,17 @@ static void ai23_launch_mmvr(const uint8_t * W, const int8_t * q, const float * 
     }
     if constexpr (!ID && ((WARPS == 4 && (KT == 5120 || KT == 17408)) ||
                           ((WARPS == 8 || WARPS == 16) && KT == 17408))) {
-        static const int unroll = ai4_env_int("GGML_CUDA_AI23_MMVR_UNROLL", nullptr, 1);
+        static const int unroll = ai4_env_int("GGML_CUDA_AI23_MMVR_UNROLL", nullptr, ai4_ai23_tuned() ? (KT == 17408 ? 8 : 4) : 1);
         if (unroll == 2) {
             ai4k::launch_mmvr<LAY, XSH, ID, KT, STAGES, WARPS, MINB, DIRECT, FUSED_X, 1, 2>(W, q, s, Y, ldy, M, N, K, stream, idm, max_tiles);
             return;
         }
         if (unroll == 4) {
             ai4k::launch_mmvr<LAY, XSH, ID, KT, STAGES, WARPS, MINB, DIRECT, FUSED_X, 1, 4>(W, q, s, Y, ldy, M, N, K, stream, idm, max_tiles);
+            return;
+        }
+        if (unroll == 8) {
+            ai4k::launch_mmvr<LAY, XSH, ID, KT, STAGES, WARPS, MINB, DIRECT, FUSED_X, 1, 8>(W, q, s, Y, ldy, M, N, K, stream, idm, max_tiles);
             return;
         }
     }
@@ -340,7 +414,12 @@ static bool ai4_mmvr_go(const uint8_t * W, const int8_t * q, const float * s, fl
         if (KT != 0 && K != KT) {
             return false;
         }
-        const int cfg = ai4_mmvr_cfg();
+        int cfg = ai4_mmvr_cfg();
+        if constexpr (!ID && (KT == 5120 || KT == 17408)) {
+            // Small dense grids need the four-block register limit at long K;
+            // shorter K keeps four warps and a larger block count.
+            if (cfg == 0 && ai4_ai23_tuned()) cfg = KT == 17408 ? 84 : 48;
+        }
         if constexpr (!ID && !ai4k::lay_span<LAY>() && KT == 17408) {
             if (cfg == 162) {
                 ai23_launch_mmvr<LAY, XSH, ID, KT, 2, 16, 2>(W, q, s, Y, M, M, N, K, stream, idm, max_tiles);
@@ -423,65 +502,65 @@ template <int BN, int LAY, int XSH>
 static void ai23_dense_tile(const uint8_t * W, const int8_t * q, const float * s, float * Y, int M, int N, int K,
                             cudaStream_t stream, int cfg) {
     switch (cfg) {
-        case 2: ai4k::launch_gemm<BN, 2, 1, LAY, XSH, false, 1, 4>(W, q, s, Y, M, M, N, K, stream); break;
-        case 3: ai4k::launch_gemm<BN, 2, 1, LAY, XSH, false, 2, 4>(W, q, s, Y, M, M, N, K, stream); break;
-        case 4: ai4k::launch_gemm<BN, 2, (BN <= 16 ? 1 : 2), LAY, XSH, false, 2, 4>(W, q, s, Y, M, M, N, K, stream); break;
+        case 2: ai23_launch_gemm<BN, 2, 1, LAY, XSH, false, 1, 4>(W, q, s, Y, M, M, N, K, stream); break;
+        case 3: ai23_launch_gemm<BN, 2, 1, LAY, XSH, false, 2, 4>(W, q, s, Y, M, M, N, K, stream); break;
+        case 4: ai23_launch_gemm<BN, 2, (BN <= 16 ? 1 : 2), LAY, XSH, false, 2, 4>(W, q, s, Y, M, M, N, K, stream); break;
         case 5:
-            if constexpr (BN >= 32) { ai4k::launch_gemm<BN, 2, 1, LAY, XSH, false, 4, 2>(W, q, s, Y, M, M, N, K, stream); }
-            else { ai4k::launch_gemm<BN, 2, 1, LAY, XSH, false, 2, 4>(W, q, s, Y, M, M, N, K, stream); }
+            if constexpr (BN >= 32) { ai23_launch_gemm<BN, 2, 1, LAY, XSH, false, 4, 2>(W, q, s, Y, M, M, N, K, stream); }
+            else { ai23_launch_gemm<BN, 2, 1, LAY, XSH, false, 2, 4>(W, q, s, Y, M, M, N, K, stream); }
             break;
         case 6:
-            if constexpr (BN >= 32) { ai4k::launch_gemm<BN, 2, 1, LAY, XSH, false, 4, 4, false, 2>(W, q, s, Y, M, M, N, K, stream); }
-            else { ai4k::launch_gemm<BN, 2, 1, LAY, XSH, false, 2, 4>(W, q, s, Y, M, M, N, K, stream); }
+            if constexpr (BN >= 32) { ai23_launch_gemm<BN, 2, 1, LAY, XSH, false, 4, 4, false, 2>(W, q, s, Y, M, M, N, K, stream); }
+            else { ai23_launch_gemm<BN, 2, 1, LAY, XSH, false, 2, 4>(W, q, s, Y, M, M, N, K, stream); }
             break;
-        case 8: ai4k::launch_gemm<BN, 2, 1, LAY, XSH, false, 2, 4, false, 1, true>(W, q, s, Y, M, M, N, K, stream); break;
+        case 8: ai23_launch_gemm<BN, 2, 1, LAY, XSH, false, 2, 4, false, 1, true>(W, q, s, Y, M, M, N, K, stream); break;
         case 9:
-            if constexpr (BN >= 32) { ai4k::launch_gemm<BN, 2, 1, LAY, XSH, false, 4, 4, false, 2, true>(W, q, s, Y, M, M, N, K, stream); }
-            else { ai4k::launch_gemm<BN, 2, 1, LAY, XSH, false, 2, 4, false, 1, true>(W, q, s, Y, M, M, N, K, stream); }
+            if constexpr (BN >= 32) { ai23_launch_gemm<BN, 2, 1, LAY, XSH, false, 4, 4, false, 2, true>(W, q, s, Y, M, M, N, K, stream); }
+            else { ai23_launch_gemm<BN, 2, 1, LAY, XSH, false, 2, 4, false, 1, true>(W, q, s, Y, M, M, N, K, stream); }
             break;
         case 10:
-            if constexpr (BN >= 32) { ai4k::launch_gemm<BN, 2, 1, LAY, XSH, false, 4, 2, false, 1, true>(W, q, s, Y, M, M, N, K, stream); }
-            else { ai4k::launch_gemm<BN, 2, 1, LAY, XSH, false, 2, 4, false, 1, true>(W, q, s, Y, M, M, N, K, stream); }
+            if constexpr (BN >= 32) { ai23_launch_gemm<BN, 2, 1, LAY, XSH, false, 4, 2, false, 1, true>(W, q, s, Y, M, M, N, K, stream); }
+            else { ai23_launch_gemm<BN, 2, 1, LAY, XSH, false, 2, 4, false, 1, true>(W, q, s, Y, M, M, N, K, stream); }
             break;
-        case 11: ai4k::launch_gemm<BN, 2, 1, LAY, XSH, false, 1, 8, false, 2, false, true>(W, q, s, Y, M, M, N, K, stream); break;
-        case 12: ai4k::launch_gemm<BN, 3, 1, LAY, XSH, false, 1, 8, false, 2, false, true>(W, q, s, Y, M, M, N, K, stream); break;
-        case 13: ai4k::launch_gemm<BN, 2, 1, LAY, XSH, false, 1, 4, false, 4, false, true>(W, q, s, Y, M, M, N, K, stream); break;
-        case 14: ai4k::launch_gemm<BN, 3, (BN <= 16 ? 2 : 4), LAY, XSH, false, 1, 8, false, 2>(W, q, s, Y, M, M, N, K, stream); break;
-        case 15: ai4k::launch_gemm<BN, 2, 1, LAY, XSH, false, 1, 8, false, 2>(W, q, s, Y, M, M, N, K, stream); break;
-        case 16: ai4k::launch_gemm<BN, 2, 1, LAY, XSH, false, 1, 8, false, 2, false, true, true>(W, q, s, Y, M, M, N, K, stream); break;
-        case 17: ai4k::launch_gemm<BN, 3, 1, LAY, XSH, false, 1, 8, false, 2, false, true, true>(W, q, s, Y, M, M, N, K, stream); break;
+        case 11: ai23_launch_gemm<BN, 2, 1, LAY, XSH, false, 1, 8, false, 2, false, true>(W, q, s, Y, M, M, N, K, stream); break;
+        case 12: ai23_launch_gemm<BN, 3, 1, LAY, XSH, false, 1, 8, false, 2, false, true>(W, q, s, Y, M, M, N, K, stream); break;
+        case 13: ai23_launch_gemm<BN, 2, 1, LAY, XSH, false, 1, 4, false, 4, false, true>(W, q, s, Y, M, M, N, K, stream); break;
+        case 14: ai23_launch_gemm<BN, 3, (BN <= 16 ? 2 : 4), LAY, XSH, false, 1, 8, false, 2>(W, q, s, Y, M, M, N, K, stream); break;
+        case 15: ai23_launch_gemm<BN, 2, 1, LAY, XSH, false, 1, 8, false, 2>(W, q, s, Y, M, M, N, K, stream); break;
+        case 16: ai23_launch_gemm<BN, 2, 1, LAY, XSH, false, 1, 8, false, 2, false, true, true>(W, q, s, Y, M, M, N, K, stream); break;
+        case 17: ai23_launch_gemm<BN, 3, 1, LAY, XSH, false, 1, 8, false, 2, false, true, true>(W, q, s, Y, M, M, N, K, stream); break;
         case 18:
             if constexpr (ai4k::lay_rate<LAY>() == 2) {
-                ai4k::launch_gemm<BN, 2, 1, LAY, XSH, false, 1, 8, false, 2, false, true, true, true>(W, q, s, Y, M, M, N, K, stream);
+                ai23_launch_gemm<BN, 2, 1, LAY, XSH, false, 1, 8, false, 2, false, true, true, true>(W, q, s, Y, M, M, N, K, stream);
             } else {
-                ai4k::launch_gemm<BN, 2, 1, LAY, XSH, false, 1, 8, false, 2, false, true, true>(W, q, s, Y, M, M, N, K, stream);
+                ai23_launch_gemm<BN, 2, 1, LAY, XSH, false, 1, 8, false, 2, false, true, true>(W, q, s, Y, M, M, N, K, stream);
             }
             break;
         case 19:
             if constexpr (ai4k::lay_rate<LAY>() == 2) {
-                ai4k::launch_gemm<BN, 3, 1, LAY, XSH, false, 1, 8, false, 2, false, true, true, true>(W, q, s, Y, M, M, N, K, stream);
+                ai23_launch_gemm<BN, 3, 1, LAY, XSH, false, 1, 8, false, 2, false, true, true, true>(W, q, s, Y, M, M, N, K, stream);
             } else {
-                ai4k::launch_gemm<BN, 3, 1, LAY, XSH, false, 1, 8, false, 2, false, true, true>(W, q, s, Y, M, M, N, K, stream);
+                ai23_launch_gemm<BN, 3, 1, LAY, XSH, false, 1, 8, false, 2, false, true, true>(W, q, s, Y, M, M, N, K, stream);
             }
             break;
-        case 20: ai4k::launch_gemm<BN, 2, 1, LAY, XSH, false, 1, 4, false, 4, false, true, true>(W, q, s, Y, M, M, N, K, stream); break;
+        case 20: ai23_launch_gemm<BN, 2, 1, LAY, XSH, false, 1, 4, false, 4, false, true, true>(W, q, s, Y, M, M, N, K, stream); break;
         case 21:
             if constexpr (ai4k::lay_rate<LAY>() == 2) {
-                ai4k::launch_gemm<BN, 2, 1, LAY, XSH, false, 1, 4, false, 4, false, true, true, true>(W, q, s, Y, M, M, N, K, stream);
+                ai23_launch_gemm<BN, 2, 1, LAY, XSH, false, 1, 4, false, 4, false, true, true, true>(W, q, s, Y, M, M, N, K, stream);
             } else {
-                ai4k::launch_gemm<BN, 2, 1, LAY, XSH, false, 1, 4, false, 4, false, true, true>(W, q, s, Y, M, M, N, K, stream);
+                ai23_launch_gemm<BN, 2, 1, LAY, XSH, false, 1, 4, false, 4, false, true, true>(W, q, s, Y, M, M, N, K, stream);
             }
             break;
-        case 22: ai4k::launch_gemm<BN, 2, 1, LAY, XSH, false, 1, 8, false, 2, false, true, false, false, false, true>(W, q, s, Y, M, M, N, K, stream); break;
-        case 23: ai4k::launch_gemm<BN, 2, 1, LAY, XSH, false, 1, 4, false, 4, false, true, false, false, false, true>(W, q, s, Y, M, M, N, K, stream); break;
-        case 24: ai4k::launch_gemm<BN, 2, 1, LAY, XSH, false, 1, 8, false, 2, false, true, false, false, false, false, true>(W, q, s, Y, M, M, N, K, stream); break;
-        case 25: ai4k::launch_gemm<BN, 2, 1, LAY, XSH, false, 1, 8, false, 2, false, true, false, false, false, true, true>(W, q, s, Y, M, M, N, K, stream); break;
-        case 26: ai4k::launch_gemm<BN, 2, 1, LAY, XSH, false, 1, 4, false, 4, false, true, false, false, false, false, true>(W, q, s, Y, M, M, N, K, stream); break;
-        case 27: ai4k::launch_gemm<BN, 2, 1, LAY, XSH, false, 1, 4, false, 4, false, true, false, false, false, true, true>(W, q, s, Y, M, M, N, K, stream); break;
-        case 28: ai4k::launch_gemm<BN, 2, 1, LAY, XSH, false, 1, 4, false, 4, false, true, false, false, false, false, true, true>(W, q, s, Y, M, M, N, K, stream); break;
-        case 29: ai4k::launch_gemm<BN, 2, 1, LAY, XSH, false, 1, 8, false, 2, false, true, false, false, false, false, true, true>(W, q, s, Y, M, M, N, K, stream); break;
-        case 7: ai4k::launch_gemm<BN, 2, 1, LAY, XSH>(W, q, s, Y, M, M, N, K, stream); break;
-        default: ai4k::launch_gemm<BN, 3, (BN <= 16 ? 2 : 4), LAY, XSH>(W, q, s, Y, M, M, N, K, stream); break;
+        case 22: ai23_launch_gemm<BN, 2, 1, LAY, XSH, false, 1, 8, false, 2, false, true, false, false, false, true>(W, q, s, Y, M, M, N, K, stream); break;
+        case 23: ai23_launch_gemm<BN, 2, 1, LAY, XSH, false, 1, 4, false, 4, false, true, false, false, false, true>(W, q, s, Y, M, M, N, K, stream); break;
+        case 24: ai23_launch_gemm<BN, 2, 1, LAY, XSH, false, 1, 8, false, 2, false, true, false, false, false, false, true>(W, q, s, Y, M, M, N, K, stream); break;
+        case 25: ai23_launch_gemm<BN, 2, 1, LAY, XSH, false, 1, 8, false, 2, false, true, false, false, false, true, true>(W, q, s, Y, M, M, N, K, stream); break;
+        case 26: ai23_launch_gemm<BN, 2, 1, LAY, XSH, false, 1, 4, false, 4, false, true, false, false, false, false, true>(W, q, s, Y, M, M, N, K, stream); break;
+        case 27: ai23_launch_gemm<BN, 2, 1, LAY, XSH, false, 1, 4, false, 4, false, true, false, false, false, true, true>(W, q, s, Y, M, M, N, K, stream); break;
+        case 28: ai23_launch_gemm<BN, 2, 1, LAY, XSH, false, 1, 4, false, 4, false, true, false, false, false, false, true, true>(W, q, s, Y, M, M, N, K, stream); break;
+        case 29: ai23_launch_gemm<BN, 2, 1, LAY, XSH, false, 1, 8, false, 2, false, true, false, false, false, false, true, true>(W, q, s, Y, M, M, N, K, stream); break;
+        case 7: ai23_launch_gemm<BN, 2, 1, LAY, XSH>(W, q, s, Y, M, M, N, K, stream); break;
+        default: ai23_launch_gemm<BN, 3, (BN <= 16 ? 2 : 4), LAY, XSH>(W, q, s, Y, M, M, N, K, stream); break;
     }
 }
 
@@ -504,14 +583,15 @@ static void ai4_mm_kernels(const uint8_t * W, const int8_t * q, const float * s,
         }
     }
     if constexpr (ai4k::lay_rate<LAY>() == 2 || ai4k::lay_rate<LAY>() == 3) {
-        static const int dense_tile = ai4_env_int("GGML_CUDA_AI23_DENSE_TILE", nullptr, 0);
+        const ai23_dense_policy policy = ai23_dense_config(M, N, K, sms, ai4k::lay_rate<LAY>());
+        const int dense_tile = policy.tile;
         if (dense_tile && N > 8 && N <= 64) {
             if (N <= 16) { ai23_dense_tile<16, LAY, XSH>(W, q, s, Y, M, N, K, stream, dense_tile); }
             else if (N <= 32) { ai23_dense_tile<32, LAY, XSH>(W, q, s, Y, M, N, K, stream, dense_tile); }
             else { ai23_dense_tile<64, LAY, XSH>(W, q, s, Y, M, N, K, stream, dense_tile); }
             return;
         }
-        static const bool narrow = ai4_env_int("GGML_CUDA_AI23_NARROW", nullptr, 0) != 0;
+        const bool narrow = policy.narrow != 0;
         if (sms && narrow && N > 8 && N <= 64) {
             ai4_ampere_width<LAY, XSH, false>(W, q, s, Y, M, N, K, ai4_ampere_bn(N), sms, stream);
             return;
@@ -546,9 +626,9 @@ static void ai4_mm_kernels(const uint8_t * W, const int8_t * q, const float * s,
             }
         }
     } else if (N >= ai4_bn128_min()) {
-        ai4k::launch_gemm<128, 3, 4, LAY, XSH>(W, q, s, Y, M, M, N, K, stream);
+        ai23_launch_gemm<128, 3, 4, LAY, XSH>(W, q, s, Y, M, M, N, K, stream);
     } else {
-        ai4k::launch_gemm<64, 3, 4, LAY, XSH>(W, q, s, Y, M, M, N, K, stream);
+        ai23_launch_gemm<64, 3, 4, LAY, XSH>(W, q, s, Y, M, M, N, K, stream);
     }
 }
 
@@ -575,36 +655,35 @@ static bool ai4_ai23_fast() {
 
 template <int BN, int LAY, int XSH>
 static void ai23_split_tile(const uint8_t * W, const int8_t * q, const float * s, float * partial,
-                             int M, int N, int K, int splits, cudaStream_t stream) {
-    static const int tile = ai4_env_int("GGML_CUDA_AI23_DENSE_TILE", nullptr, 0);
+                             int M, int N, int K, int splits, int tile, cudaStream_t stream) {
     constexpr bool RATE2 = ai4k::lay_rate<LAY>() == 2;
     if (tile >= 24 && tile <= 27) {
         if (tile == 25 || tile == 27) {
-            ai4k::launch_gemm<BN, 2, 1, LAY, XSH, false, 1, 8, false, 2, false, true, false, false, true, true, true>(W, q, s, partial, M, M, N, K, stream, ai4k::idmap{}, 0, nullptr, splits);
+            ai23_launch_gemm<BN, 2, 1, LAY, XSH, false, 1, 8, false, 2, false, true, false, false, true, true, true>(W, q, s, partial, M, M, N, K, stream, ai4k::idmap{}, 0, nullptr, splits);
         } else {
-            ai4k::launch_gemm<BN, 2, 1, LAY, XSH, false, 1, 8, false, 2, false, true, false, false, true, false, true>(W, q, s, partial, M, M, N, K, stream, ai4k::idmap{}, 0, nullptr, splits);
+            ai23_launch_gemm<BN, 2, 1, LAY, XSH, false, 1, 8, false, 2, false, true, false, false, true, false, true>(W, q, s, partial, M, M, N, K, stream, ai4k::idmap{}, 0, nullptr, splits);
         }
         return;
     }
     if (tile == 22 || tile == 23) {
-        ai4k::launch_gemm<BN, 2, 1, LAY, XSH, false, 1, 8, false, 2, false, true, false, false, true, true>(W, q, s, partial, M, M, N, K, stream, ai4k::idmap{}, 0, nullptr, splits);
+        ai23_launch_gemm<BN, 2, 1, LAY, XSH, false, 1, 8, false, 2, false, true, false, false, true, true>(W, q, s, partial, M, M, N, K, stream, ai4k::idmap{}, 0, nullptr, splits);
         return;
     }
     if constexpr (RATE2) {
         if (tile != 16 && tile != 17) {
-            ai4k::launch_gemm<BN, 2, 1, LAY, XSH, false, 1, 8, false, 2, false, true, true, true, true>(W, q, s, partial, M, M, N, K, stream, ai4k::idmap{}, 0, nullptr, splits);
+            ai23_launch_gemm<BN, 2, 1, LAY, XSH, false, 1, 8, false, 2, false, true, true, true, true>(W, q, s, partial, M, M, N, K, stream, ai4k::idmap{}, 0, nullptr, splits);
             return;
         }
     }
-    ai4k::launch_gemm<BN, 2, 1, LAY, XSH, false, 1, 8, false, 2, false, true, true, false, true>(W, q, s, partial, M, M, N, K, stream, ai4k::idmap{}, 0, nullptr, splits);
+    ai23_launch_gemm<BN, 2, 1, LAY, XSH, false, 1, 8, false, 2, false, true, true, false, true>(W, q, s, partial, M, M, N, K, stream, ai4k::idmap{}, 0, nullptr, splits);
 }
 
 template <int LAY, int XSH>
 static void ai23_split_width(const uint8_t * W, const int8_t * q, const float * s, float * partial,
-                              int M, int N, int K, int splits, cudaStream_t stream) {
-    if (N <= 16) { ai23_split_tile<16, LAY, XSH>(W, q, s, partial, M, N, K, splits, stream); }
-    else if (N <= 32) { ai23_split_tile<32, LAY, XSH>(W, q, s, partial, M, N, K, splits, stream); }
-    else { ai23_split_tile<64, LAY, XSH>(W, q, s, partial, M, N, K, splits, stream); }
+                              int M, int N, int K, int splits, int tile, cudaStream_t stream) {
+    if (N <= 16) { ai23_split_tile<16, LAY, XSH>(W, q, s, partial, M, N, K, splits, tile, stream); }
+    else if (N <= 32) { ai23_split_tile<32, LAY, XSH>(W, q, s, partial, M, N, K, splits, tile, stream); }
+    else { ai23_split_tile<64, LAY, XSH>(W, q, s, partial, M, N, K, splits, tile, stream); }
 }
 
 // W4A8 fast path: rotate+quantize the activations, then the AI4 decode-to-IMMA kernels
@@ -614,11 +693,19 @@ static void ai4_mul_mat_fast(ggml_backend_cuda_context & ctx, ggml_type t, const
     const int xsh = (!ggml_ai4_is_unit(t) || K % 256 == 0) ? 1 : 0;
     ggml_cuda_pool_alloc<int8_t> q(ctx.pool(), (size_t) N*K);
     ggml_cuda_pool_alloc<float>  s(ctx.pool(), (size_t) N*(K >> (7 + xsh)));
-    static const int tile = ai4_env_int("GGML_CUDA_AI23_DENSE_TILE", nullptr, 0);
+    const ai23_dense_policy policy = ai23_dense_config(M, N, K, ai4_ampere_sms(ctx), ggml_ai4_rate(t));
+    const int tile = policy.tile;
     const bool swap8 = (ggml_ai4_rate(t) == 2 || ggml_ai4_rate(t) == 3) && N > 8 && N <= 64 && (tile == 22 || tile == 23 || tile == 25 || tile == 27);
+    const int splits = policy.splits;
+    const int narrow = policy.narrow;
+    const bool split_active = splits == 2 || splits == 4 || splits == 8 || splits == 16;
+    const bool whole = split_active ? (tile != 16 && tile != 17 && !(tile >= 22 && tile <= 27)) :
+                       (tile == 18 || tile == 19 || tile == 21 || (!tile && narrow >= 3 && (K == 5120 || K == 17408) && ai4_ampere_sms(ctx)));
+    const bool xperm = ggml_ai4_rate(t) == 2 && N > 8 && N <= 64 && whole &&
+                       ai4_env_int("GGML_CUDA_AI23_XPERM", nullptr, 0);
     if (swap8) { ai4_quantize_x<true>(X, N, K, xsh, q.get(), s.get(), stream); }
+    else if (xperm) { ai4_quantize_x<false, true>(X, N, K, xsh, q.get(), s.get(), stream); }
     else { ai4_quantize_x(X, N, K, xsh, q.get(), s.get(), stream); }
-    static const int splits = ai4_env_int("GGML_CUDA_AI23_SPLIT_K", nullptr, 0);
     const int rate = ggml_ai4_rate(t);
     static const int small_splits = ai4_env_int("GGML_CUDA_AI23_SMALL_SPLIT", nullptr, 0);
     if ((rate == 2 || rate == 3) && N <= 8 && (K == 5120 || K == 17408) &&
@@ -654,14 +741,14 @@ static void ai4_mul_mat_fast(ggml_backend_cuda_context & ctx, ggml_type t, const
         switch (ai4_lay_of(t)) {
 #define AI23_SPLIT_U(L) \
             case L: \
-                if (xsh) { ai23_split_width<L, 1>(W, q.get(), s.get(), partial.get(), M, N, K, splits, stream); } \
-                else { ai23_split_width<L, 0>(W, q.get(), s.get(), partial.get(), M, N, K, splits, stream); } \
+                if (xsh) { ai23_split_width<L, 1>(W, q.get(), s.get(), partial.get(), M, N, K, splits, tile, stream); } \
+                else { ai23_split_width<L, 0>(W, q.get(), s.get(), partial.get(), M, N, K, splits, tile, stream); } \
                 break;
             AI23_SPLIT_U(ai4k::LAY_U2)
             AI23_SPLIT_U(ai4k::LAY_U3)
 #undef AI23_SPLIT_U
-            case ai4k::LAY_S2: ai23_split_width<ai4k::LAY_S2, 1>(W, q.get(), s.get(), partial.get(), M, N, K, splits, stream); break;
-            case ai4k::LAY_S3: ai23_split_width<ai4k::LAY_S3, 1>(W, q.get(), s.get(), partial.get(), M, N, K, splits, stream); break;
+            case ai4k::LAY_S2: ai23_split_width<ai4k::LAY_S2, 1>(W, q.get(), s.get(), partial.get(), M, N, K, splits, tile, stream); break;
+            case ai4k::LAY_S3: ai23_split_width<ai4k::LAY_S3, 1>(W, q.get(), s.get(), partial.get(), M, N, K, splits, tile, stream); break;
             default: GGML_ABORT("unsupported AI23 split layout");
         }
         ai4k::split_k_reduce<<<((int64_t) M*N + 255)/256, 256, 0, stream>>>(partial.get(), Y, (int64_t) M*N, splits);
@@ -959,9 +1046,9 @@ static void ai4_mm_id_kernels(const uint8_t * W, const int8_t * q, const float *
             ai4_launch_mmv_tuned<LAY, XSH, true>(W, q, s, Y, M, 0, K, stream, k.warps, k.minb, idm, max_tiles);
         }
     } else if (bn == 128) {
-        ai4k::launch_gemm<128, 3, 4, LAY, XSH, true>(W, q, s, Y, M, M, 0, K, stream, idm, max_tiles);
+        ai23_launch_gemm<128, 3, 4, LAY, XSH, true>(W, q, s, Y, M, M, 0, K, stream, idm, max_tiles);
     } else {
-        ai4k::launch_gemm<64, 3, 4, LAY, XSH, true>(W, q, s, Y, M, M, 0, K, stream, idm, max_tiles);
+        ai23_launch_gemm<64, 3, 4, LAY, XSH, true>(W, q, s, Y, M, M, 0, K, stream, idm, max_tiles);
     }
 }
 

@@ -51,7 +51,7 @@ constexpr __host__ __device__ int ampere_mmv_smem_bytes() {
 }
 
 // One slab per block keeps narrow batches distributed across the SMs. Each decoded A fragment serves all token groups.
-template <int BN, int LAY, int XSH, bool ID, int WARPS, int KT = 0, bool PERM = false>
+template <int BN, int LAY, int XSH, bool ID, int WARPS, int KT = 0, bool PERM = false, bool XPERM = false>
 static __global__ void __launch_bounds__(WARPS*32, 1) ampere_mmv(
         const uint8_t * __restrict__ W, const int8_t * __restrict__ Xq, const float * __restrict__ Xs,
         float * __restrict__ Y, int64_t ldy, int M, int N, int Kr, const idmap idm) {
@@ -59,6 +59,7 @@ static __global__ void __launch_bounds__(WARPS*32, 1) ampere_mmv(
     static_assert(WARPS == 2 || WARPS == 4 || WARPS == 8, "ai4 narrow warps");
     static_assert(LAY == LAY_SB || LAY == LAY_U || lay_rate<LAY>() == 2 || lay_rate<LAY>() == 3, "ai4 narrow layout");
     static_assert(!PERM || lay_rate<LAY>() == 2, "whole-row rate-2 decode");
+    static_assert(!XPERM || (PERM && !ID), "permuted dense activation scratch");
     const int K = KT > 0 ? KT : Kr;
     constexpr int NTI = BN/8;
     constexpr int CHB = ch_bytes<LAY>();
@@ -171,7 +172,7 @@ static __global__ void __launch_bounds__(WARPS*32, 1) ampere_mmv(
             uint32_t xv[8] = {};
             if (n0 + c < N) {
                 const int8_t * x = Xq + xrow(c)*K + kc*128;
-                if constexpr (PERM) {
+                if constexpr (PERM && !XPERM) {
                     x += 64*(t & 1) + 4*(t >> 1);
 #pragma unroll
                     for (int j = 0; j < 4; ++j) {
@@ -245,7 +246,7 @@ static __global__ void __launch_bounds__(WARPS*32, 1) ampere_mmv(
     (void) M;
 }
 
-template <int BN, int LAY = LAY_SB, int XSH = 1, bool ID = false, int WARPS = 4, int KT = 0, bool PERM = false>
+template <int BN, int LAY = LAY_SB, int XSH = 1, bool ID = false, int WARPS = 4, int KT = 0, bool PERM = false, bool XPERM = false>
 static void launch_ampere_mmv(const uint8_t * W, const int8_t * Xq, const float * Xs, float * Y, int64_t ldy,
                                int M, int N, int K, cudaStream_t stream, const idmap & idm = idmap{}, int max_tiles = 1) {
     constexpr int smem = ampere_mmv_smem_bytes<BN, LAY, WARPS>();
@@ -255,12 +256,12 @@ static void launch_ampere_mmv(const uint8_t * W, const int8_t * Xq, const float 
         int dev = 0;
         CUDA_CHECK_AI4K(cudaGetDevice(&dev));
         if (!attr_set[dev & 63]) {
-            CUDA_CHECK_AI4K(cudaFuncSetAttribute(ampere_mmv<BN, LAY, XSH, ID, WARPS, KT, PERM>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+            CUDA_CHECK_AI4K(cudaFuncSetAttribute(ampere_mmv<BN, LAY, XSH, ID, WARPS, KT, PERM, XPERM>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
             attr_set[dev & 63] = true;
         }
     }
     const dim3 grid(M/16, ID ? max_tiles : (N + BN - 1)/BN);
-    ampere_mmv<BN, LAY, XSH, ID, WARPS, KT, PERM><<<grid, WARPS*32, smem, stream>>>(W, Xq, Xs, Y, ldy, M, N, K, idm);
+    ampere_mmv<BN, LAY, XSH, ID, WARPS, KT, PERM, XPERM><<<grid, WARPS*32, smem, stream>>>(W, Xq, Xs, Y, ldy, M, N, K, idm);
 }
 
 } // namespace ai4k

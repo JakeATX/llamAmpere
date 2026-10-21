@@ -342,7 +342,7 @@ constexpr __host__ __device__ int gemm_stage_bytes() {
     return M_SLABS*((PREDECODED ? 2048 : ch_bytes<LAY>()) + GSC_BYTES) + BN*(XOR_X ? RQ4_CHUNK : X8 ? RQ4_CHUNK + 8 : PREDECODED ? RQ4_CHUNK : X_STRIDE) + BN*4;
 }
 
-template <int BN, int STAGES, int NTB, int LAY, int XSH, bool ID, int N_WARPS = 1, int M_SLABS = GEMM_SLABS, bool PREDECODED = false, int MINB = 1, bool STREAM_A = false, bool J_MAJOR = false, bool X8 = false, bool WHOLE = false, bool SPLIT = false, bool SWAP8 = false, bool FIXED_LOAD = false, bool XOR_X = false>
+template <int BN, int STAGES, int NTB, int LAY, int XSH, bool ID, int N_WARPS = 1, int M_SLABS = GEMM_SLABS, bool PREDECODED = false, int MINB = 1, bool STREAM_A = false, bool J_MAJOR = false, bool X8 = false, bool WHOLE = false, bool SPLIT = false, bool SWAP8 = false, bool FIXED_LOAD = false, bool XPERM = false, bool PAIR_ACC = false, bool XOR_X = false>
 static __global__ void __launch_bounds__(M_SLABS*N_WARPS*32, MINB) gemm(
         const uint8_t * __restrict__ W, const int8_t * __restrict__ Xq, const float * __restrict__ Xs,
         float * __restrict__ Y, int64_t ldy, int M, int N, int K, const idmap idm, const int8_t * __restrict__ decoded_weights, int split_k) {
@@ -356,6 +356,8 @@ static __global__ void __launch_bounds__(M_SLABS*N_WARPS*32, MINB) gemm(
     static_assert(!J_MAJOR || (!PREDECODED && N_WARPS == 1), "fragment-first decode");
     static_assert(!X8 || J_MAJOR, "eight-byte activation fragments");
     static_assert(!XOR_X || (J_MAJOR && !X8 && !WHOLE && !PREDECODED && !ID), "compact XOR activation scratch");
+    static_assert(!PAIR_ACC || (J_MAJOR && !ID && XSH == 1 && lay_span<LAY>()), "paired span scales");
+    static_assert(!XPERM || (WHOLE && !ID), "permuted dense activation scratch");
     static_assert(!WHOLE || (X8 && lay_rate<LAY>() == 2), "whole-row dense decode");
     static_assert(!SPLIT || !ID, "dense split K");
     static_assert(!SWAP8 || (J_MAJOR && !X8 && !WHOLE && !ID), "swapped dense activation halves");
@@ -497,6 +499,7 @@ static __global__ void __launch_bounds__(M_SLABS*N_WARPS*32, MINB) gemm(
         cp_async_commit();
     }
 
+    int paired_p[PAIR_ACC ? NTI : 1][4] = {};
     for (int kc = kc_begin; kc < kc_end; ++kc) {
         cp_async_wait<STAGES - 2>();
         __syncthreads();
@@ -512,7 +515,8 @@ static __global__ void __launch_bounds__(M_SLABS*N_WARPS*32, MINB) gemm(
         const float    * sxd = (const float *) (sx + BN*XS);
 
         if constexpr (J_MAJOR) {
-            int p[NTI][4] = {};
+            int local_p[PAIR_ACC ? 1 : NTI][4] = {};
+            int (*p)[4] = PAIR_ACC ? paired_p : local_p;
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
                 uint32_t a[4];
@@ -527,7 +531,7 @@ static __global__ void __launch_bounds__(M_SLABS*N_WARPS*32, MINB) gemm(
 #pragma unroll
                 for (int nt = 0; nt < NTI; ++nt) {
                     const int c = nt*8 + g;
-                    if constexpr (WHOLE) {
+                    if constexpr (WHOLE && !XPERM) {
                         const uint8_t * x = sx + c*XS + 64*(t & 1) + 4*(t >> 1) + j*8;
                         mma_s8(p[nt], a, *(const uint32_t *) x, *(const uint32_t *) (x + 32));
                     } else {
@@ -538,6 +542,9 @@ static __global__ void __launch_bounds__(M_SLABS*N_WARPS*32, MINB) gemm(
                     }
                 }
             }
+            // Span weight scales cover 1024 K; each activation scale covers 256 K.
+            // Odd starts and truncated split partitions flush their single edge chunk.
+            if (!PAIR_ACC || (kc & 1) || kc + 1 == kc_end) {
             const float d0 = __half2float(LAY != LAY_SB ? sd[g] : sd[2*g + (kc & 1)]);
             const float d1 = __half2float(LAY != LAY_SB ? sd[g + 8] : sd[2*(g + 8) + (kc & 1)]);
 #pragma unroll
@@ -548,6 +555,13 @@ static __global__ void __launch_bounds__(M_SLABS*N_WARPS*32, MINB) gemm(
                 acc[nt][1] += magic_i2f(p[nt][1]) * (d0*dx1);
                 acc[nt][2] += magic_i2f(p[nt][2]) * (d1*dx0);
                 acc[nt][3] += magic_i2f(p[nt][3]) * (d1*dx1);
+            }
+                if constexpr (PAIR_ACC) {
+#pragma unroll
+                    for (int nt = 0; nt < NTI; ++nt)
+#pragma unroll
+                        for (int i = 0; i < 4; ++i) paired_p[nt][i] = 0;
+                }
             }
         } else {
             uint32_t a[STREAM_A ? 1 : 4][4];
@@ -660,7 +674,7 @@ static __global__ void __launch_bounds__(M_SLABS*N_WARPS*32, MINB) gemm(
 }
 
 // ID = true: grid.y = max_tiles (an upper bound of the idmap's token tiles; blocks past hdr[1] exit), N unused
-template <int BN, int STAGES = 3, int NTB = 4, int LAY = LAY_SB, int XSH = 1, bool ID = false, int N_WARPS = 1, int M_SLABS = GEMM_SLABS, bool PREDECODED = false, int MINB = 1, bool STREAM_A = false, bool J_MAJOR = false, bool X8 = false, bool WHOLE = false, bool SPLIT = false, bool SWAP8 = false, bool FIXED_LOAD = false, bool XOR_X = false>
+template <int BN, int STAGES = 3, int NTB = 4, int LAY = LAY_SB, int XSH = 1, bool ID = false, int N_WARPS = 1, int M_SLABS = GEMM_SLABS, bool PREDECODED = false, int MINB = 1, bool STREAM_A = false, bool J_MAJOR = false, bool X8 = false, bool WHOLE = false, bool SPLIT = false, bool SWAP8 = false, bool FIXED_LOAD = false, bool XPERM = false, bool PAIR_ACC = false, bool XOR_X = false>
 static void launch_gemm(const uint8_t * W, const int8_t * Xq, const float * Xs, float * Y, int64_t ldy,
                         int M, int N, int K, cudaStream_t stream, const idmap & idm = idmap{}, int max_tiles = 0, const int8_t * decoded_weights = nullptr, int split_k = 1) {
     constexpr int decoded = N_WARPS > 1 ? M_SLABS*4*4*32*4 : 0;
@@ -669,7 +683,7 @@ static void launch_gemm(const uint8_t * W, const int8_t * Xq, const float * Xs, 
     int dev = 0;
     CUDA_CHECK_AI4K(cudaGetDevice(&dev));
     if (!attr_set[dev & 63]) {
-        CUDA_CHECK_AI4K(cudaFuncSetAttribute(gemm<BN, STAGES, NTB, LAY, XSH, ID, N_WARPS, M_SLABS, PREDECODED, MINB, STREAM_A, J_MAJOR, X8, WHOLE, SPLIT, SWAP8, FIXED_LOAD, XOR_X>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+        CUDA_CHECK_AI4K(cudaFuncSetAttribute(gemm<BN, STAGES, NTB, LAY, XSH, ID, N_WARPS, M_SLABS, PREDECODED, MINB, STREAM_A, J_MAJOR, X8, WHOLE, SPLIT, SWAP8, FIXED_LOAD, XPERM, PAIR_ACC, XOR_X>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
         attr_set[dev & 63] = true;
     }
     const dim3 grid((M/16 + M_SLABS - 1)/M_SLABS, ID ? max_tiles : (N + BN - 1)/BN, SPLIT ? split_k : 1);
@@ -678,15 +692,15 @@ static void launch_gemm(const uint8_t * W, const int8_t * Xq, const float * Xs, 
     if (report && !reported[dev & 63]) {
         cudaFuncAttributes attr;
         int blocks = 0, reserved = 0, sm_shared = 0;
-        CUDA_CHECK_AI4K(cudaFuncGetAttributes(&attr, gemm<BN, STAGES, NTB, LAY, XSH, ID, N_WARPS, M_SLABS, PREDECODED, MINB, STREAM_A, J_MAJOR, X8, WHOLE, SPLIT, SWAP8, FIXED_LOAD, XOR_X>));
-        CUDA_CHECK_AI4K(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, gemm<BN, STAGES, NTB, LAY, XSH, ID, N_WARPS, M_SLABS, PREDECODED, MINB, STREAM_A, J_MAJOR, X8, WHOLE, SPLIT, SWAP8, FIXED_LOAD, XOR_X>, M_SLABS*N_WARPS*32, smem));
+        CUDA_CHECK_AI4K(cudaFuncGetAttributes(&attr, gemm<BN, STAGES, NTB, LAY, XSH, ID, N_WARPS, M_SLABS, PREDECODED, MINB, STREAM_A, J_MAJOR, X8, WHOLE, SPLIT, SWAP8, FIXED_LOAD, XPERM, PAIR_ACC, XOR_X>));
+        CUDA_CHECK_AI4K(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, gemm<BN, STAGES, NTB, LAY, XSH, ID, N_WARPS, M_SLABS, PREDECODED, MINB, STREAM_A, J_MAJOR, X8, WHOLE, SPLIT, SWAP8, FIXED_LOAD, XPERM, PAIR_ACC, XOR_X>, M_SLABS*N_WARPS*32, smem));
         CUDA_CHECK_AI4K(cudaDeviceGetAttribute(&reserved, cudaDevAttrReservedSharedMemoryPerBlock, dev));
         CUDA_CHECK_AI4K(cudaDeviceGetAttribute(&sm_shared, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev));
-        fprintf(stderr, "AI23 resource BN=%d ST=%d LAY=%d NW=%d MS=%d MINB=%d J=%d X8=%d WHOLE=%d SPLIT=%d SWAP8=%d FIXED_LOAD=%d XOR_X=%d REG=%d STATIC_SHARED=%zu DYNAMIC_SHARED=%d RESERVED_SHARED=%d SM_SHARED=%d LOCAL=%zu ACTIVE_BLOCKS=%d GRID=%u,%u,%u\n",
-                BN, STAGES, LAY, N_WARPS, M_SLABS, MINB, J_MAJOR, X8, WHOLE, SPLIT, SWAP8, FIXED_LOAD, XOR_X, attr.numRegs, attr.sharedSizeBytes, smem, reserved, sm_shared, attr.localSizeBytes, blocks, grid.x, grid.y, grid.z);
+        fprintf(stderr, "AI23 resource BN=%d ST=%d LAY=%d NW=%d MS=%d MINB=%d J=%d X8=%d WHOLE=%d SPLIT=%d SWAP8=%d FIXED_LOAD=%d XPERM=%d PAIR_ACC=%d XOR_X=%d REG=%d STATIC_SHARED=%zu DYNAMIC_SHARED=%d RESERVED_SHARED=%d SM_SHARED=%d LOCAL=%zu ACTIVE_BLOCKS=%d GRID=%u,%u,%u\n",
+                BN, STAGES, LAY, N_WARPS, M_SLABS, MINB, J_MAJOR, X8, WHOLE, SPLIT, SWAP8, FIXED_LOAD, XPERM, PAIR_ACC, XOR_X, attr.numRegs, attr.sharedSizeBytes, smem, reserved, sm_shared, attr.localSizeBytes, blocks, grid.x, grid.y, grid.z);
         reported[dev & 63] = true;
     }
-    gemm<BN, STAGES, NTB, LAY, XSH, ID, N_WARPS, M_SLABS, PREDECODED, MINB, STREAM_A, J_MAJOR, X8, WHOLE, SPLIT, SWAP8, FIXED_LOAD, XOR_X><<<grid, M_SLABS*N_WARPS*32, smem, stream>>>(W, Xq, Xs, Y, ldy, M, N, K, idm, decoded_weights, split_k);
+    gemm<BN, STAGES, NTB, LAY, XSH, ID, N_WARPS, M_SLABS, PREDECODED, MINB, STREAM_A, J_MAJOR, X8, WHOLE, SPLIT, SWAP8, FIXED_LOAD, XPERM, PAIR_ACC, XOR_X><<<grid, M_SLABS*N_WARPS*32, smem, stream>>>(W, Xq, Xs, Y, ldy, M, N, K, idm, decoded_weights, split_k);
 }
 
 // Split-K partials keep float accumulation; only the final sum order changes.
@@ -1113,7 +1127,9 @@ static __global__ void __launch_bounds__(WARPS*32, MINB) mmvr(
     const int group_begin = SPLITS > 1 ? ((KT/(RQ4_CHUNK*WARPS*2))*(int) blockIdx.z/SPLITS)*2 : 0;
     const int group_end = SPLITS > 1 ? ((KT/(RQ4_CHUNK*WARPS*2))*((int) blockIdx.z + 1)/SPLITS)*2 : 0;
     const int nmy = SPLITS > 1 ? group_end - group_begin :
-                   KT > 0 && (KT/RQ4_CHUNK) % WARPS == 0 ? KT/(RQ4_CHUNK*WARPS) : (nk - warp + WARPS - 1)/WARPS;
+                   KT > 0 && (KT/RQ4_CHUNK) % WARPS == 0 ? KT/(RQ4_CHUNK*WARPS) :
+                   KT > 0 ? KT/(RQ4_CHUNK*WARPS) + (warp < (KT/RQ4_CHUNK) % WARPS) :
+                            (nk - warp + WARPS - 1)/WARPS;
     if constexpr (SPLITS > 1) {
         gt += mmvr_toff<LAY, WARPS>(group_begin);
         gs += mmvr_soff<LAY, WARPS>(group_begin);
@@ -1334,7 +1350,7 @@ static void launch_mmvr(const uint8_t * W, const int8_t * Xq, const float * Xs, 
 // Activations for H128 tensors (AI4_U with K % 256 != 0): rotate each 128 block by (1/sqrt(128)) H128 D (D = the first 128
 // sign bits), int8-quantize with one fp32 scale per (token, 128 K) at s[tok*(K/128) + block], bytes in the same fragment
 // order as rq4::quantize_act inside a 128 chunk. One half-warp per (token, 128 block); 4 warps = 8 blocks per CTA.
-template <bool SWAP8 = false>
+template <bool SWAP8 = false, bool XPERM = false>
 static __global__ void __launch_bounds__(128) quantize_act128(
         const float * __restrict__ x, int64_t sx, int8_t * __restrict__ q, float * __restrict__ s, int K, int N) {
     const int lane = threadIdx.x & 31;
@@ -1399,18 +1415,24 @@ static __global__ void __launch_bounds__(128) quantize_act128(
     const int j  = l >> 2;
     const int h  = (l & 3) >> 1;
     const int t0 = (l & 1)*2;
+    static_assert(!SWAP8 || !XPERM, "exclusive activation scratch layouts");
+    if constexpr (XPERM) {
+        int8_t * qr = q + (int64_t) tok*K + cb*128 + h*64 + (t0 >> 1)*32 + j*8;
+        *(uint2 *) qr = make_uint2(w[0], w[1]);
+    } else {
     int8_t * qr = q + (int64_t) tok*K + cb*128 + (j ^ (SWAP8 ? ((tok >> 1) & 1) : 0))*8 + h*4;
     *(uint32_t *) (qr + (t0 + 0)*32) = w[0];
     *(uint32_t *) (qr + (t0 + 1)*32) = w[1];
+    }
     if (l == 0) {
         s[(int64_t) tok*(K/128) + cb] = d;
     }
 }
 
-template <bool SWAP8 = false>
+template <bool SWAP8 = false, bool XPERM = false>
 static void launch_quantize_act128(const float * x, int64_t sx, int8_t * q, float * s, int K, int N, cudaStream_t stream) {
     const dim3 grid((K/128 + 7)/8, N);
-    quantize_act128<SWAP8><<<grid, 128, 0, stream>>>(x, sx, q, s, K, N);
+    quantize_act128<SWAP8, XPERM><<<grid, 128, 0, stream>>>(x, sx, q, s, K, N);
 }
 
 // ---------------------------------------------------------------------------------------------
