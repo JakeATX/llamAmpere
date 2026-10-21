@@ -5766,7 +5766,9 @@ static bool run_device_fused_missjoin(ggml_backend_t gpu, ggml_backend_t cpu, lo
             }
             ggml_backend_tensor_set(w, quantized.data(), 0, quantized.size());
         }
-        for (int tokens : large_copy ? std::vector<int>{1, 3, 4, 5, 8} :
+        // Ampere's mapped IQ3_S dispatch stops at six rows; the other
+        // copy formats also cover eight-row windows and 63 cold experts.
+        for (int tokens : large_copy ? std::vector<int>{1, 3, 4, 5, type == GGML_TYPE_IQ3_S ? 6 : 8} :
                 (retain || grouped) ? std::vector<int>{1, 3, 4, 5} : std::vector<int>{1, 3, 4}) {
             for (int channels : grouped ? std::vector<int>{1, 2, used} : std::vector<int>{1, 2}) {
                 ggml_init_params params = {8 * ggml_tensor_overhead(), nullptr, true};
