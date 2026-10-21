@@ -99,7 +99,14 @@ struct compact_state_probe {
         const int qpos = n - width - epoch%3;
         auto d = descriptor(cache, qpos);
         const int sink = d[GGML_SJKVARN_DESC_S], body_end = d[GGML_SJKVARN_DESC_B];
-        require(d[GGML_SJKVARN_DESC_N] == n && d[GGML_SJKVARN_DESC_G] == 128 &&
+        // A suffix removal above B changes the live cells immediately. The
+        // descriptor retains the last apply_ubatch frontier until the next
+        // decode; this probe runs between those operations. Only the exact
+        // three rejected rows may remain in that frontier during rollback.
+        const int frontier = d[GGML_SJKVARN_DESC_N];
+        require(frontier == n || (!strcmp(phase, "rollback-replay") && frontier == n + 3),
+                "compact state descriptor frontier matches live cells or the three rejected rows");
+        require(d[GGML_SJKVARN_DESC_G] == 128 &&
                 d[GGML_SJKVARN_DESC_D] == 256 && d[GGML_SJKVARN_DESC_HKV] == 2 &&
                 d[GGML_SJKVARN_DESC_BODY_TYPE] == GGML_TYPE_F32 && d[GGML_SJKVARN_DESC_TABLE] == 0,
                 "compact state descriptor has scalar single-stream D256/G128/2KV geometry");
