@@ -14,6 +14,23 @@
 
 static constexpr int IQ4XS_WIDE_MIN_N = MMVQ_MAX_BATCH_SIZE + 1;
 static constexpr int IQ4XS_WIDE_MAX_N = 32;
+static constexpr int IQ4XS_WIDE_MAX_N_EXT = 48;
+
+static bool ggml_cuda_iq4xs_wide_48_enabled() {
+    static const bool value = [] {
+        const char * env = getenv("GGML_CUDA_IQ4XS_WIDE_48");
+        return env != nullptr && env[0] == '1' && env[1] == '\0';
+    }();
+    return value;
+}
+
+static bool ggml_cuda_iq4xs_wide_stream_enabled() {
+    static const bool value = [] {
+        const char * env = getenv("GGML_CUDA_IQ4XS_WIDE_STREAM");
+        return env != nullptr && env[0] == '1' && env[1] == '\0';
+    }();
+    return value;
+}
 
 // 0 = off, else the row tiles per warp (1, 2 or 4); GGML_CUDA_IQ4XS_WIDE=0 restores MMQ for these widths
 static int ggml_cuda_iq4xs_wide_mr() {
@@ -55,7 +72,7 @@ static __global__ void quantize_iq4xs_wide_q8(
     }
 }
 
-template <int NT, int MR, int NW, int OCC>
+template <int NT, int MR, int NW, int OCC, bool STREAM = false>
 __launch_bounds__(32*NW, OCC)
 static __global__ void mul_mat_iq4_xs_q8_wide(
         const void * __restrict__ vx, const int8_t * __restrict__ yq, const float * __restrict__ yd, float * __restrict__ dst,
@@ -74,7 +91,8 @@ static __global__ void mul_mat_iq4_xs_q8_wide(
     const int row0 = blockIdx.x * ROWS;
     const int nsb  = ncols_x / QK_K;
 
-    __shared__ float red[nwarps][COLS][ROWS];
+    // Four padding words give each lane a distinct bank when columns differ by two.
+    __shared__ float red[nwarps][COLS][ROWS + (STREAM ? 4 : 0)];
 
     ggml_cuda_pdl_sync();
 
@@ -126,34 +144,45 @@ static __global__ void mul_mat_iq4_xs_q8_wide(
         // this lane's B fragments (16 ints) and the two columns' 8 sub-block scales, all vector loads
         int4   bq[NT][4];
         float4 s0[NT][2], s1[NT][2];
+        if constexpr (!STREAM) {
 #pragma unroll
-        for (int nt = 0; nt < NT; ++nt) {
-            const int4 * yb4 = (const int4 *) (yb[nt] + ((size_t) kb * 4 + t) * 64);
+            for (int nt = 0; nt < NT; ++nt) {
+                const int4 * yb4 = (const int4 *) (yb[nt] + ((size_t) kb * 4 + t) * 64);
 #pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                bq[nt][j] = hb[nt] ? yb4[j] : make_int4(0, 0, 0, 0);
+                for (int j = 0; j < 4; ++j) {
+                    bq[nt][j] = hb[nt] ? yb4[j] : make_int4(0, 0, 0, 0);
+                }
+                const float4 * q0 = (const float4 *) (ys0[nt] + kb*8);
+                const float4 * q1 = (const float4 *) (ys1[nt] + kb*8);
+                s0[nt][0] = h0[nt] ? q0[0] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                s0[nt][1] = h0[nt] ? q0[1] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                s1[nt][0] = h1[nt] ? q1[0] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                s1[nt][1] = h1[nt] ? q1[1] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
             }
-            const float4 * q0 = (const float4 *) (ys0[nt] + kb*8);
-            const float4 * q1 = (const float4 *) (ys1[nt] + kb*8);
-            s0[nt][0] = h0[nt] ? q0[0] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-            s0[nt][1] = h0[nt] ? q0[1] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-            s1[nt][0] = h1[nt] ? q1[0] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-            s1[nt][1] = h1[nt] ? q1[1] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
         }
 
-#pragma unroll
+#pragma unroll (STREAM ? 1 : 8)
         for (int sb = 0; sb < 8; ++sb) {
             int   b0[NT], b1[NT];
             float d0[NT], d1[NT];
 #pragma unroll
             for (int nt = 0; nt < NT; ++nt) {
-                const int4 v = bq[nt][sb/2];
-                b0[nt] = sb % 2 == 0 ? v.x : v.z;
-                b1[nt] = sb % 2 == 0 ? v.y : v.w;
-                const float4 e0 = s0[nt][sb/4];
-                const float4 e1 = s1[nt][sb/4];
-                d0[nt] = sb % 4 == 0 ? e0.x : sb % 4 == 1 ? e0.y : sb % 4 == 2 ? e0.z : e0.w;
-                d1[nt] = sb % 4 == 0 ? e1.x : sb % 4 == 1 ? e1.y : sb % 4 == 2 ? e1.z : e1.w;
+                if constexpr (STREAM) {
+                    const int2 * q = (const int2 *) (yb[nt] + ((size_t) kb * 4 + t) * 64);
+                    const int2 v = hb[nt] ? q[sb] : make_int2(0, 0);
+                    b0[nt] = v.x;
+                    b1[nt] = v.y;
+                    d0[nt] = h0[nt] ? ys0[nt][(size_t) kb*8 + sb] : 0.0f;
+                    d1[nt] = h1[nt] ? ys1[nt][(size_t) kb*8 + sb] : 0.0f;
+                } else {
+                    const int4 v = bq[nt][sb/2];
+                    b0[nt] = sb % 2 == 0 ? v.x : v.z;
+                    b1[nt] = sb % 2 == 0 ? v.y : v.w;
+                    const float4 e0 = s0[nt][sb/4];
+                    const float4 e1 = s1[nt][sb/4];
+                    d0[nt] = sb % 4 == 0 ? e0.x : sb % 4 == 1 ? e0.y : sb % 4 == 2 ? e0.z : e0.w;
+                    d1[nt] = sb % 4 == 0 ? e1.x : sb % 4 == 1 ? e1.y : sb % 4 == 2 ? e1.z : e1.w;
+                }
             }
 
 #pragma unroll
@@ -212,16 +241,28 @@ static __global__ void mul_mat_iq4_xs_q8_wide(
     }
 }
 
-template <int MR, int OCC>
+template <int MR, int OCC, bool STREAM = false>
 static void ggml_cuda_mul_mat_iq4xs_wide_launch(
         const int nt, const dim3 grid, cudaStream_t stream, const void * vx, const int8_t * yq, const float * yd, float * dst,
         const int ncols_x, const int ncols_dst, const size_t stride_row_x, const size_t stride_col_dst) {
     constexpr int NW = 4;
     const ggml_cuda_kernel_launch_params mat(grid, dim3(32*NW), 0, stream);
     switch (nt) {
-        case 2: ggml_cuda_kernel_launch(mul_mat_iq4_xs_q8_wide<2, MR, NW, OCC>, mat, vx, yq, yd, dst, ncols_x, ncols_dst, stride_row_x, stride_col_dst); break;
-        case 3: ggml_cuda_kernel_launch(mul_mat_iq4_xs_q8_wide<3, MR, NW, OCC>, mat, vx, yq, yd, dst, ncols_x, ncols_dst, stride_row_x, stride_col_dst); break;
-        case 4: ggml_cuda_kernel_launch(mul_mat_iq4_xs_q8_wide<4, MR, NW, OCC>, mat, vx, yq, yd, dst, ncols_x, ncols_dst, stride_row_x, stride_col_dst); break;
+        case 2: ggml_cuda_kernel_launch(mul_mat_iq4_xs_q8_wide<2, MR, NW, OCC, STREAM>, mat, vx, yq, yd, dst, ncols_x, ncols_dst, stride_row_x, stride_col_dst); break;
+        case 3: ggml_cuda_kernel_launch(mul_mat_iq4_xs_q8_wide<3, MR, NW, OCC, STREAM>, mat, vx, yq, yd, dst, ncols_x, ncols_dst, stride_row_x, stride_col_dst); break;
+        case 4: ggml_cuda_kernel_launch(mul_mat_iq4_xs_q8_wide<4, MR, NW, OCC, STREAM>, mat, vx, yq, yd, dst, ncols_x, ncols_dst, stride_row_x, stride_col_dst); break;
+        case 5:
+            if constexpr (STREAM) {
+                ggml_cuda_kernel_launch(mul_mat_iq4_xs_q8_wide<5, MR, NW, OCC, STREAM>, mat, vx, yq, yd, dst, ncols_x, ncols_dst, stride_row_x, stride_col_dst);
+                break;
+            }
+            GGML_ABORT("iq4xs wide: extended columns need streaming loads");
+        case 6:
+            if constexpr (STREAM && MR <= 2) {
+                ggml_cuda_kernel_launch(mul_mat_iq4_xs_q8_wide<6, MR, NW, OCC, STREAM>, mat, vx, yq, yd, dst, ncols_x, ncols_dst, stride_row_x, stride_col_dst);
+                break;
+            }
+            GGML_ABORT("iq4xs wide: 48 columns need streaming loads and MR <= 2");
         default: GGML_ABORT("iq4xs wide: bad column tile count %d", nt);
     }
 }
@@ -246,7 +287,19 @@ static void ggml_cuda_mul_mat_iq4xs_wide(
     while (mr > 1 && nrows_x % (16*mr) != 0) {
         mr /= 2;
     }
+    // MR=4 at NT=6 exceeds the 48 KiB static shared memory limit.
+    if (nt == 6 && mr == 4) {
+        mr = 2;
+    }
     const dim3 grid(nrows_x / (16*mr));
+    if (ncols_dst > IQ4XS_WIDE_MAX_N || ggml_cuda_iq4xs_wide_stream_enabled()) {
+        switch (mr) {
+            case 4: ggml_cuda_mul_mat_iq4xs_wide_launch<4, 2, true>(nt, grid, stream, vx, yq_d, yd_d, dst, ncols_x, ncols_dst, stride_row_x, stride_col_dst); break;
+            case 2: ggml_cuda_mul_mat_iq4xs_wide_launch<2, 2, true>(nt, grid, stream, vx, yq_d, yd_d, dst, ncols_x, ncols_dst, stride_row_x, stride_col_dst); break;
+            default: ggml_cuda_mul_mat_iq4xs_wide_launch<1, 2, true>(nt, grid, stream, vx, yq_d, yd_d, dst, ncols_x, ncols_dst, stride_row_x, stride_col_dst); break;
+        }
+        return;
+    }
     switch (mr) {
         case 4: ggml_cuda_mul_mat_iq4xs_wide_launch<4, 2>(nt, grid, stream, vx, yq_d, yd_d, dst, ncols_x, ncols_dst, stride_row_x, stride_col_dst); break;
         case 2: ggml_cuda_mul_mat_iq4xs_wide_launch<2, 2>(nt, grid, stream, vx, yq_d, yd_d, dst, ncols_x, ncols_dst, stride_row_x, stride_col_dst); break;

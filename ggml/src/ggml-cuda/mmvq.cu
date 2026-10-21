@@ -2668,7 +2668,8 @@ bool ggml_cuda_mul_mat_iq4xs_wide_try(ggml_backend_cuda_context & ctx,
         return false;
     }
     const int64_t ne00 = src0->ne[0], ne01 = src0->ne[1], ne11 = src1->ne[1];
-    if (ne11 < IQ4XS_WIDE_MIN_N || ne11 > IQ4XS_WIDE_MAX_N ||
+    const int max_n = ggml_cuda_iq4xs_wide_48_enabled() ? IQ4XS_WIDE_MAX_N_EXT : IQ4XS_WIDE_MAX_N;
+    if (ne11 < IQ4XS_WIDE_MIN_N || ne11 > max_n ||
             src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 ||
             ne00 <= 0 || ne00 % QK_K != 0 || ne00 > std::numeric_limits<int>::max() || src1->ne[0] != ne00 ||
             ne01 <= 0 || ne01 % 16 != 0 || ne01 > std::numeric_limits<int>::max() ||
@@ -2678,7 +2679,7 @@ bool ggml_cuda_mul_mat_iq4xs_wide_try(ggml_backend_cuda_context & ctx,
         return false;
     }
     // 21-32 columns with a long K (the FFN down projection): MMQ measured equal or faster (102 vs 108 us at 5120x17408, w24)
-    if (ne11 > 20 && ne00 >= 16384) {
+    if (ne11 > 20 && ne11 <= IQ4XS_WIDE_MAX_N && ne00 >= 16384) {
         return false;
     }
     const int cc = ggml_cuda_info().devices[ctx.device].cc;

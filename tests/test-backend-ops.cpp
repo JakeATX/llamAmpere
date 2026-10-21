@@ -6846,6 +6846,74 @@ static void add_iq4xs_wide_cases(std::vector<std::unique_ptr<test_case>> & cases
     }
 }
 
+struct test_mul_mat_parwrev : public test_mul_mat {
+    using test_mul_mat::test_mul_mat;
+
+    std::string vars() override {
+        return test_mul_mat::vars() + ",parwrev=1";
+    }
+};
+
+struct test_mul_mat_parwrev_zero : public test_mul_mat_parwrev {
+    using test_mul_mat_parwrev::test_mul_mat_parwrev;
+
+    double max_nmse_err() override {
+        return 0.0;
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        for (size_t i = 0; i < n; ++i) {
+            if (a[i] != b[i]) {
+                return 1.0;
+            }
+        }
+        return 0.0;
+    }
+
+    std::string vars() override {
+        return test_mul_mat_parwrev::vars() + ",zero=1";
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "b") == 0) {
+                init_tensor_uniform(t, 0.0f, 0.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+static void add_parwrev_cases(std::vector<std::unique_ptr<test_case>> & cases, bool perf) {
+    if (getenv("GGML_TEST_PARWREV") == nullptr) {
+        return;
+    }
+    for (int64_t n : {8, 14, 21, 28, 32, 33, 35, 36, 40, 41, 48, 49, 64}) {
+        // Swift's small GDN gates use Q8_0 and keep MMQ, including when the IQ4_XS wide path is enabled.
+        cases.emplace_back(new test_mul_mat_parwrev(GGML_TYPE_Q8_0, GGML_TYPE_F32, 48, n, 5120, {1, 1}, {1, 1}));
+        if (perf) {
+            for (const auto & shape : {std::array<int64_t, 2>{5120, 17408}, {17408, 5120}, {5120, 6144},
+                                      {5120, 1024}, {5120, 5120}, {5120, 48}}) {
+                cases.emplace_back(new test_mul_mat_parwrev(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, shape[1], n, shape[0], {1, 1}, {1, 1}));
+            }
+            cases.emplace_back(new test_mul_mat_parwrev(GGML_TYPE_Q6_K, GGML_TYPE_F32, 248320, n, 5120, {1, 1}, {1, 1}));
+            continue;
+        }
+        for (const auto & shape : {std::array<int64_t, 2>{17408, 32}, {5120, 64}, {256, 1024}, {5120, 48}}) {
+            cases.emplace_back(new test_mul_mat_parwrev(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, shape[1], n, shape[0], {1, 1}, {1, 1}));
+        }
+        cases.emplace_back(new test_mul_mat_parwrev_zero(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, 32, n, 256, {1, 1}, {1, 1}));
+        for (int64_t m : {16, 32, 48, 64, 17}) {
+            for (int64_t k : {256, 768}) {
+                cases.emplace_back(new test_mul_mat_parwrev(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+            }
+        }
+        cases.emplace_back(new test_mul_mat_parwrev(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, 32, n, 768, {1, 1}, {1, 1}, {0, 1, 2, 3}, 1024));
+        cases.emplace_back(new test_mul_mat_parwrev(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, 32, n, 256, {2, 1}, {1, 1}));
+    }
+}
+
 enum class cr_activation_pattern {
     RANDOM,
     ZERO,
@@ -13276,6 +13344,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     add_iq4xs_k4_cases(test_cases, false);
     add_mmf_split_k_cases(test_cases, false);
     add_iq4xs_wide_cases(test_cases);
+    add_parwrev_cases(test_cases, false);
     // [PARW] few-tile long-K MMQ (stream-k CTA cap): the 48-row GDN gates and small matrices at widths 9..32
     for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_Q5_0, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS}) {
         for (int64_t n : {9, 16, 20, 24, 32}) {
@@ -16831,6 +16900,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (int64_t t : {17, 128, 512, 1024}) {
         test_cases.emplace_back(new test_norm_pair_concat(5120, t));
     }
+    add_parwrev_cases(test_cases, true);
 
     // Decode/verify attention bandwidth at GQA 6, with q8_0 as a control.
     for (int64_t kv : {32768, 102400}) {
