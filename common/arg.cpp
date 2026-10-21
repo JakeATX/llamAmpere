@@ -4838,7 +4838,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
 
     add_opt(common_arg(
         {"--spec-depth-model"}, "FILE",
-        "CDEPTH coefficient file written by tools/cdepth/cdepth_sim.py fit-causal (default: built-in table)",
+        "CDEPTH coefficient file (default: built-in table)",
         [](common_params & params, const std::string & value) {
             params.speculative.draft.depth_model = value;
         }
