@@ -445,6 +445,7 @@ llama_build_and_test(test-hc-norm-fuse.cpp) # [HCPN] skips without a GPU backend
 llama_build_and_test(test-exl3-ffn-bridge.cpp) # [#74] skips without a GPU backend
 llama_build_and_test(test-exl3-weight-major.cpp) # [#73] skips without a GPU backend
 llama_build_and_test(test-exl3-decode.cpp) # [#41] skips without a GPU backend
+llama_build_and_test(test-exl3-glue-fold.cpp) # [#136] skips without a GPU backend
 if (NOT GGML_BACKEND_DL AND GGML_CPU)
     add_executable(test-exl3-cpu test-exl3-cpu.cpp)
     target_link_libraries(test-exl3-cpu PRIVATE ggml ggml-cpu)

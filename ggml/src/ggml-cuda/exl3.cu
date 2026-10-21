@@ -119,9 +119,14 @@ static __device__ __forceinline__ void exl3_sum_partials(const float * __restric
 }
 
 // y[T][N] = scale * svh * H128( sum_ks part[ks][T][N] )   (HAD)  |  scale * sum_ks part   (!HAD);  N % 128 == 0
-template <bool HAD>
-static __global__ void k_exl3_glue_out(const float * __restrict__ part, const float * __restrict__ svh, float * __restrict__ y,
-                                       const int N, const size_t n_chunks, const int ksplit, const size_t ks_stride, const float scale) {
+// [#136] RES: y = (that value) + res[T][N], the consumer's residual ADD folded in. The product is rounded first and the
+// add is __fadd_rn (never contracted into an FMA), so y is bit-identical to glue_out followed by the ADD node (a + b is
+// exact-commutative, so either ADD operand order matches). res may alias y exactly (each element is read by the thread
+// that writes it).
+template <bool HAD, bool RES = false>
+static __global__ void k_exl3_glue_out(const float * __restrict__ part, const float * __restrict__ svh, float * y,
+                                       const int N, const size_t n_chunks, const int ksplit, const size_t ks_stride, const float scale,
+                                       const float * res = nullptr) {
     const size_t c = (size_t) blockIdx.x * 4 + (threadIdx.x >> 5);
     if (c >= n_chunks) {
         return;
@@ -139,7 +144,12 @@ static __global__ void k_exl3_glue_out(const float * __restrict__ part, const fl
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
         const float m = HAD ? svh[nc + j * 32 + lane] : 1.0f;
-        y[base + j * 32 + lane] = v[j] * s * m;
+        if (RES) {
+            const float p = v[j] * s * m;
+            y[base + j * 32 + lane] = __fadd_rn(p, res[base + j * 32 + lane]);
+        } else {
+            y[base + j * 32 + lane] = v[j] * s * m;
+        }
     }
 }
 
@@ -217,6 +227,15 @@ void ggml_cuda_exl3_glue_in_f16(const float * x, const float * suh, half * out, 
     exl3_glue_in<half>(x, suh, out, K, T, scale, stream);
 }
 
+void ggml_cuda_exl3_glue_out_res(const float * part, const float * svh, const float * res, float * y, const int N, const int64_t T,
+                                 const int ksplit, cudaStream_t stream) {
+    GGML_ASSERT(svh != nullptr && res != nullptr && N % 128 == 0);
+    const size_t ks_stride = (size_t) T * N;
+    const size_t n_chunks  = (size_t) T * N / 128;
+    const int nb = (int) ((n_chunks + 3) / 4);
+    k_exl3_glue_out<true, true><<<nb, 128, 0, stream>>>(part, svh, y, N, n_chunks, ksplit, ks_stride, 1.0f, res);
+}
+
 void ggml_cuda_exl3_glue_out(const float * part, const float * svh, float * y, const int N, const int64_t T, const int ksplit, const float scale, cudaStream_t stream) {
     const size_t ks_stride = (size_t) T * N;
     if (svh == nullptr && N % 128 != 0) {   // no Hadamard: plain per-element split-K sum
@@ -241,10 +260,13 @@ void ggml_cuda_exl3_glue_out(const float * part, const float * svh, float * y, c
 // All three Hadamards are 128-block local and the down projection's K is the FFN width, so a chunk never leaves its
 // warp. Each step is the same float expression, in the same order, as the unfused kernels (glue_out -> f32 tensor ->
 // unary_gated_op_kernel -> f32 tensor -> glue_in), so the prepared fp16 input matches the unfused one.
+// [#136] ldp: row pitch of the partials (N for separate gate/up projections; 2N for the fused [gate | up] projection
+// of a --fuse GGUF, whose part_g/part_u/svh_g/svh_u then point at the two column halves). Same sums, same order.
 static __global__ void k_exl3_ffn_bridge(const float * __restrict__ part_g, const int ksplit_g, const float * __restrict__ svh_g,
                                          const float * __restrict__ part_u, const int ksplit_u, const float * __restrict__ svh_u,
                                          const float * __restrict__ suh_d, half * __restrict__ out,
-                                         const int N, const size_t n_chunks, const size_t ks_stride, const float x_scale) {
+                                         const int N, const size_t n_chunks, const size_t ks_stride, const float x_scale,
+                                         const int ldp) {
     const size_t c = (size_t) blockIdx.x * 4 + (threadIdx.x >> 5);
     if (c >= n_chunks) {
         return;
@@ -252,11 +274,12 @@ static __global__ void k_exl3_ffn_bridge(const float * __restrict__ part_g, cons
     const int lane = threadIdx.x & 31;
     const size_t base = c * 128;
     const int nc = (int) (base % (size_t) N);
+    const size_t base_p = (base / (size_t) N) * (size_t) ldp + (size_t) nc;   // == base when ldp == N
 
     float g[4];
     float u[4];
-    exl3_sum_partials(part_g, base, lane, ksplit_g, ks_stride, g);
-    exl3_sum_partials(part_u, base, lane, ksplit_u, ks_stride, u);
+    exl3_sum_partials(part_g, base_p, lane, ksplit_g, ks_stride, g);
+    exl3_sum_partials(part_u, base_p, lane, ksplit_u, ks_stride, u);
     exl3_wht128(g);
     exl3_wht128(u);
     float so = 1.0f;   // glue_out scale
@@ -284,13 +307,75 @@ static __global__ void k_exl3_ffn_bridge(const float * __restrict__ part_g, cons
 void ggml_cuda_exl3_ffn_bridge_f16(const float * part_gate, const int ksplit_gate, const float * svh_gate,
                                    const float * part_up, const int ksplit_up, const float * svh_up,
                                    const float * suh_down, half * out, const int N, const int64_t T, const float x_scale,
-                                   cudaStream_t stream) {
+                                   cudaStream_t stream, const int ldp) {
     GGML_ASSERT(N % 128 == 0);
+    const int    ld        = ldp > 0 ? ldp : N;
     const size_t n_chunks  = (size_t) T * N / 128;
-    const size_t ks_stride = (size_t) T * N;
+    const size_t ks_stride = (size_t) T * ld;
     const int nb = (int) ((n_chunks + 3) / 4);
     k_exl3_ffn_bridge<<<nb, 128, 0, stream>>>(part_gate, ksplit_gate, svh_gate, part_up, ksplit_up, svh_up, suh_down, out,
-                                              N, n_chunks, ks_stride, x_scale);
+                                              N, n_chunks, ks_stride, x_scale, ld);
+}
+
+// [#136] RMS_NORM -> MUL(gamma) with the glue_in of the EXL3 consumer folded in: one block per row writes the f32
+// normed row (dst, kept: other consumers may read it) and xh = x_scale * H128(suh * dst) in fp16. The reduction is
+// rms_norm_f32<block_size, true>'s (same loop, same block_reduce, same block size rule), the row value is the same
+// scale * x * gamma expression, and the glue is k_exl3_glue_in's, so both outputs are bit-identical to the fused
+// RMS_NORM/MUL kernel followed by glue_in. Contiguous rows, gamma one row of ncols, ncols % 128 == 0.
+template <int block_size>
+static __global__ void k_exl3_rms_norm_mul_glue(const float * x, const float * __restrict__ gamma,
+                                                float * dst, const float * __restrict__ suh, half * __restrict__ xh,
+                                                const int ncols, const float eps, const float x_scale) {
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    x   += (size_t) row * ncols;
+    dst += (size_t) row * ncols;
+    xh  += (size_t) row * ncols;
+
+    float tmp = 0.0f;
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = x[col];
+        tmp += xi * xi;
+    }
+    extern __shared__ float s_sum[];
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+    const float mean  = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int n_ch = ncols / 128;
+    for (int c = warp; c < n_ch; c += block_size / 32) {
+        float v[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int col = c * 128 + j * 32 + lane;
+            v[j] = scale * x[col] * gamma[col];
+            dst[col] = v[j];
+        }
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            v[j] *= suh[c * 128 + j * 32 + lane];
+        }
+        float s = x_scale;
+        exl3_wht128(v);
+        s *= EXL3_WHT128_SCALE;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            xh[c * 128 + j * 32 + lane] = __float2half_rn(v[j] * s);
+        }
+    }
+}
+
+void ggml_cuda_exl3_rms_norm_mul_glue(const float * x, const float * gamma, float * dst, const float * suh, half * xh,
+                                      const int ncols, const int nrows, const float eps, const float x_scale, cudaStream_t stream) {
+    GGML_ASSERT(ncols % 128 == 0);
+    if (ncols < 1024) {
+        k_exl3_rms_norm_mul_glue<256><<<nrows, 256, 32 * sizeof(float), stream>>>(x, gamma, dst, suh, xh, ncols, eps, x_scale);
+    } else {
+        k_exl3_rms_norm_mul_glue<1024><<<nrows, 1024, 32 * sizeof(float), stream>>>(x, gamma, dst, suh, xh, ncols, eps, x_scale);
+    }
 }
 
 void ggml_cuda_mul_mat_exl3(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {

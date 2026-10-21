@@ -1654,6 +1654,9 @@ struct ggml_backend_cuda_context {
         int64_t add_rms       = 0;   // fused ADD + RMS_NORM + MUL runs (ggml_cuda_op_add_rms_norm_mul) [#46]
         int64_t add_rms_q8    = 0;   // ... of which also prefilled the q8_1 cache for the next MMVQ consumer
         int64_t exl3_ffn_bridge = 0; // EXL3 gate/up -> SwiGLU -> down runs through ggml_cuda_exl3_ffn_bridge [#74]
+        int64_t exl3_fold_norm = 0;  // RMS_NORM+MUL that also wrote the EXL3 consumer's glued input [#136]
+        int64_t exl3_fold_add  = 0;  // EXL3 glue_outs that added the residual ADD [#136]
+        int64_t exl3_fold_gu   = 0;  // fused [gate | up] EXL3 FFNs through the bridge [#136]
         int64_t conv_ring     = 0;   // ssm_conv launches that read the CONCAT operands and wrote the windows [#110]
         int64_t nemotron_ssm  = 0;
         int64_t nemotron_moe  = 0;

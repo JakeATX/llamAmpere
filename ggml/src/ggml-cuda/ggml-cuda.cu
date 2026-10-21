@@ -995,6 +995,13 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
+    // [#136] fold (default on): how often each fold matched (graph builds/captures, not replays)
+    if (ggml_cuda_exl3_glue_fold_enabled() && fusion_stats.exl3_fold_norm + fusion_stats.exl3_fold_add + fusion_stats.exl3_fold_gu > 0) {
+        GGML_LOG_INFO("EXL3 glue fold: device %d: norm %lld, residual add %lld, fused gate|up %lld, #74 bridge %lld\n", device,
+                      (long long) fusion_stats.exl3_fold_norm, (long long) fusion_stats.exl3_fold_add,
+                      (long long) fusion_stats.exl3_fold_gu, (long long) fusion_stats.exl3_ffn_bridge);
+    }
+
     release_scratch();
 
     if (copy_event != nullptr) {
@@ -7331,6 +7338,149 @@ static int ggml_cuda_try_exl3_ffn_bridge(ggml_backend_cuda_context & ctx, ggml_c
     return 3;
 }
 
+// [#136] EXL3 glue folding, default on, GGML_CUDA_EXL3_GLUE_FOLD=0 turns it off (bit-identical; see ggml_cuda_exl3_glue_fold_enabled and
+// tests/test-exl3-glue-fold.cpp). At node i:
+//   [RMS_NORM, MUL(gamma)] -> EXL3 linear j: the norm kernel also writes the linear's glued fp16 input;
+//   linear j = MUL_MAT [gate|up], GLU swiglu (single source), MUL_MAT down: the bridge on the two column halves;
+//   linear j = MUL_MAT gate, MUL_MAT up, GLU swiglu_split, MUL_MAT down (#74 bridge, gate first when the norm folded);
+//   the last linear -> ADD(residual): its glue_out adds the residual.
+// Returns nodes to skip.
+
+// the ADD at node k + 1 that adds a same-shape f32 residual to the EXL3 linear at node k, or null
+static ggml_tensor * ggml_cuda_exl3_fold_res_add(ggml_cgraph * cgraph, const int k, const float ** res) {
+    if (k + 1 >= cgraph->n_nodes) {
+        return nullptr;
+    }
+    ggml_tensor * mm  = cgraph->nodes[k];
+    ggml_tensor * add = cgraph->nodes[k + 1];
+    if (add->op != GGML_OP_ADD) {
+        return nullptr;
+    }
+    const ggml_tensor * other = add->src[0] == mm ? add->src[1] : add->src[1] == mm ? add->src[0] : nullptr;
+    if (other == nullptr || other == mm || other->type != GGML_TYPE_F32 || add->type != GGML_TYPE_F32 ||
+            !ggml_is_contiguous(other) || !ggml_is_contiguous(add) || !ggml_are_same_shape(other, mm) ||
+            !ggml_are_same_shape(add, mm)) {
+        return nullptr;
+    }
+    // the residual may be the ADD's output exactly (in place), not a partial overlap
+    const char * a0 = (const char *) add->data;
+    const char * r0 = (const char *) other->data;
+    const size_t nb = ggml_nbytes(add);
+    if (!(a0 + nb <= r0 || r0 + nb <= a0 || a0 == r0)) {
+        return nullptr;
+    }
+    *res = (const float *) other->data;
+    return add;
+}
+
+static bool ggml_cuda_exl3_ffn_bridge_enabled();
+
+static int ggml_cuda_try_exl3_glue_fold(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, const int i) {
+    if (!ggml_cuda_exl3_glue_fold_enabled()) {
+        return 0;
+    }
+    ggml_tensor * node = cgraph->nodes[i];
+    const int n = cgraph->n_nodes;
+    int j = i;
+    ggml_cuda_pool_alloc<half> xh_buf(ctx.pool());
+    const half * xh = nullptr;
+
+    if (node->op == GGML_OP_RMS_NORM) {
+        if (i + 2 >= n) {
+            return 0;
+        }
+        ggml_tensor * mul = cgraph->nodes[i + 1];
+        ggml_tensor * mm  = cgraph->nodes[i + 2];
+        if (mul->op != GGML_OP_MUL || !ggml_cuda_exl3_fold_ok(mm) || mm->src[1] != mul) {
+            return 0;
+        }
+        const ggml_tensor * gamma = mul->src[0] == node ? mul->src[1] : mul->src[1] == node ? mul->src[0] : nullptr;
+        const ggml_tensor * x     = node->src[0];
+        if (gamma == nullptr || gamma == node || x->type != GGML_TYPE_F32 || node->type != GGML_TYPE_F32 ||
+                mul->type != GGML_TYPE_F32 || gamma->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) ||
+                !ggml_is_contiguous(mul) || !ggml_is_contiguous(gamma) || !ggml_are_same_shape(x, mul) ||
+                gamma->ne[0] != x->ne[0] || ggml_nrows(gamma) != 1 || x->ne[0] != mm->src[0]->ne[0] || x->ne[0] % 128 != 0) {
+            return 0;
+        }
+        if (!ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, { i + 1 })) {
+            return 0;
+        }
+        float eps = 0.0f;
+        memcpy(&eps, node->op_params, sizeof(float));
+        const int K = (int) x->ne[0];
+        const int nrows = (int) ggml_nrows(x);
+        xh = xh_buf.alloc((size_t) nrows * K);
+        ggml_cuda_exl3_rms_norm_mul_glue((const float *) x->data, (const float *) gamma->data, (float *) mul->data,
+                                         (const float *) mm->src[2]->data, xh_buf.get(), K, nrows, eps,
+                                         ggml_cuda_exl3_x_scale(), ctx.stream());
+        ctx.fusion_stats.exl3_fold_norm++;
+        j = i + 2;
+    } else if (!ggml_cuda_exl3_fold_ok(node)) {
+        return 0;
+    }
+    ggml_tensor * mm = cgraph->nodes[j];
+
+    // fused [gate | up] -> swiglu -> down (-> residual ADD)
+    if (j + 2 < n) {
+        ggml_tensor * glu  = cgraph->nodes[j + 1];
+        ggml_tensor * down = cgraph->nodes[j + 2];
+        if (glu->op == GGML_OP_GLU && ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU && glu->src[0] == mm && glu->src[1] == nullptr &&
+                glu->type == GGML_TYPE_F32 && ggml_is_contiguous(glu) && down->op == GGML_OP_MUL_MAT && down->src[1] == glu &&
+                ggml_can_fuse_subgraph(cgraph, j, { GGML_OP_MUL_MAT, GGML_OP_GLU, GGML_OP_MUL_MAT }, { j + 2 })) {
+            const float * res = nullptr;
+            ggml_tensor * add = ggml_cuda_exl3_fold_res_add(cgraph, j + 2, &res);
+            if (add != nullptr && !ggml_can_fuse_subgraph(cgraph, j, { GGML_OP_MUL_MAT, GGML_OP_GLU, GGML_OP_MUL_MAT, GGML_OP_ADD }, { j + 3 })) {
+                add = nullptr;
+                res = nullptr;
+            }
+            if (ggml_cuda_exl3_ffn_bridge_gu(ctx, mm, glu, down, xh, res, add ? (float *) add->data : nullptr)) {
+                ctx.fusion_stats.exl3_fold_gu++;
+                ctx.fusion_stats.exl3_fold_add += add != nullptr;
+                return (j - i) + 2 + (add != nullptr);
+            }
+        }
+    }
+
+    // separate gate, up -> swiglu_split -> down (#74), with the norm-glued input only for the gate in front
+    if (ggml_cuda_exl3_ffn_bridge_enabled() && j + 3 < n) {
+        ggml_tensor * b    = cgraph->nodes[j + 1];
+        ggml_tensor * glu  = cgraph->nodes[j + 2];
+        ggml_tensor * down = cgraph->nodes[j + 3];
+        if (b->op == GGML_OP_MUL_MAT && glu->op == GGML_OP_GLU && down->op == GGML_OP_MUL_MAT &&
+                ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU && glu->src[1] != nullptr && down->src[1] == glu &&
+                ((glu->src[0] == mm && glu->src[1] == b) || (xh == nullptr && glu->src[0] == b && glu->src[1] == mm)) &&
+                glu->type == GGML_TYPE_F32 && ggml_is_contiguous(glu) && ggml_are_same_shape(glu->src[0], glu->src[1]) &&
+                ggml_are_same_shape(glu, glu->src[0]) &&
+                ggml_can_fuse_subgraph(cgraph, j, { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU, GGML_OP_MUL_MAT }, { j + 3 })) {
+            const float * res = nullptr;
+            ggml_tensor * add = ggml_cuda_exl3_fold_res_add(cgraph, j + 3, &res);
+            if (add != nullptr && !ggml_can_fuse_subgraph(cgraph, j, { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU, GGML_OP_MUL_MAT, GGML_OP_ADD }, { j + 4 })) {
+                add = nullptr;
+                res = nullptr;
+            }
+            if (ggml_cuda_exl3_ffn_bridge(ctx, glu->src[0], glu->src[1], down, xh, res, add ? (float *) add->data : nullptr)) {
+                ctx.fusion_stats.exl3_ffn_bridge++;
+                ctx.fusion_stats.exl3_fold_add += add != nullptr;
+                return (j - i) + 3 + (add != nullptr);
+            }
+        }
+    }
+
+    // one linear (-> residual ADD)
+    const float * res = nullptr;
+    ggml_tensor * add = ggml_cuda_exl3_fold_res_add(cgraph, j, &res);
+    if (add != nullptr && !ggml_can_fuse_subgraph(cgraph, j, { GGML_OP_MUL_MAT, GGML_OP_ADD }, { j + 1 })) {
+        add = nullptr;
+        res = nullptr;
+    }
+    if (xh == nullptr && add == nullptr) {
+        return 0;
+    }
+    ggml_cuda_exl3_linear_fold(ctx, mm, xh, res, add ? (float *) add->data : nullptr);
+    ctx.fusion_stats.exl3_fold_add += add != nullptr;
+    return (j - i) + (add != nullptr);
+}
+
 static bool ggml_cuda_fusion_disabled() {
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
     return disable_fusion;
@@ -7489,6 +7639,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (node->op == GGML_OP_ADD) {
         const int n_skip = ggml_cuda_try_add_rms_norm_mul(*cuda_ctx, cgraph, i);
+        if (n_skip > 0) {
+            return n_skip;
+        }
+    }
+
+    if (node->op == GGML_OP_RMS_NORM || (node->op == GGML_OP_MUL_MAT && ggml_exl3_bits(node->src[0]->type) != 0)) {
+        const int n_skip = ggml_cuda_try_exl3_glue_fold(*cuda_ctx, cgraph, i);
         if (n_skip > 0) {
             return n_skip;
         }
@@ -10240,6 +10397,15 @@ int64_t ggml_backend_cuda_fusion_count(ggml_backend_t backend, const char * name
     }
     if (strcmp(name, "exl3_ffn_bridge") == 0) {
         return ctx->fusion_stats.exl3_ffn_bridge;
+    }
+    if (strcmp(name, "exl3_fold_norm") == 0) {
+        return ctx->fusion_stats.exl3_fold_norm;
+    }
+    if (strcmp(name, "exl3_fold_add") == 0) {
+        return ctx->fusion_stats.exl3_fold_add;
+    }
+    if (strcmp(name, "exl3_fold_gu") == 0) {
+        return ctx->fusion_stats.exl3_fold_gu;
     }
     // [HCPN] process-wide counts (not per context)
     if (strcmp(name, "hc_post_norm") == 0) {

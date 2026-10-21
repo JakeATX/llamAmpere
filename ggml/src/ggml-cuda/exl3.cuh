@@ -48,11 +48,33 @@ void ggml_cuda_exl3_glue_out_inplace(float * y, const float * svh, const int N, 
 void ggml_cuda_exl3_ffn_bridge_f16(const float * part_gate, const int ksplit_gate, const float * svh_gate,
                                    const float * part_up, const int ksplit_up, const float * svh_up,
                                    const float * suh_down, half * out, const int N, const int64_t T, const float x_scale,
-                                   cudaStream_t stream);
+                                   cudaStream_t stream, const int ldp = 0);
 // [#74] gate/up/down EXL3 projections with glu = swiglu_split(gate, up) between them, through the bridge above; the
 // gate and up outputs are never materialized. Returns false (nothing launched) when a precondition fails.
+// [#136] xh: the gate's glued fp16 input when the caller already has it (RMS_NORM fold), else null; res/y: the down
+// projection's residual ADD folded into its glue_out (y = down + res), or null/null for y = mm_down->data.
 bool ggml_cuda_exl3_ffn_bridge(ggml_backend_cuda_context & ctx, const ggml_tensor * mm_gate, const ggml_tensor * mm_up,
-                               ggml_tensor * mm_down);
+                               ggml_tensor * mm_down, const half * xh = nullptr, const float * res = nullptr, float * y = nullptr);
+
+// ---- [#136] EXL3 glue folding (GGML_CUDA_EXL3_GLUE_FOLD=1, bit-identical to the unfolded nodes) ----
+// y[T][N] = svh * H128(sum part) + res[T][N]  (glue_out with the consumer's residual ADD)
+void ggml_cuda_exl3_glue_out_res(const float * part, const float * svh, const float * res, float * y, const int N, const int64_t T,
+                                 const int ksplit, cudaStream_t stream);
+// dst = rms_norm(x) * gamma (f32, rows of ncols) and xh = x_scale * H128(suh * dst) (fp16)
+void ggml_cuda_exl3_rms_norm_mul_glue(const float * x, const float * gamma, float * dst, const float * suh, half * xh,
+                                      const int ncols, const int nrows, const float eps, const float x_scale, cudaStream_t stream);
+bool  ggml_cuda_exl3_glue_fold_enabled();
+float ggml_cuda_exl3_x_scale();
+// mm (EXL3 MUL_MAT with suh/svh) can take the folded split-glue GEMV path at its width
+bool ggml_cuda_exl3_fold_ok(const ggml_tensor * mm);
+// one EXL3 linear on the split-glue GEMV path: xh (prepared glued input) or null (glue_in here), y = mm + res (res may
+// be null), y defaults to mm->data
+void ggml_cuda_exl3_linear_fold(ggml_backend_cuda_context & ctx, const ggml_tensor * mm, const half * xh, const float * res, float * y);
+// fused [gate | up] projection mm_gu (a --fuse GGUF), glu = swiglu(mm_gu) (single source, swapped or not), down reads glu:
+// gate/up glue_out + SwiGLU + down glue_in in the bridge kernel. xh/res/y as above. Returns false (nothing launched)
+// when a precondition fails.
+bool ggml_cuda_exl3_ffn_bridge_gu(ggml_backend_cuda_context & ctx, const ggml_tensor * mm_gu, const ggml_tensor * glu,
+                                  ggml_tensor * mm_down, const half * xh, const float * res, float * y);
 
 // [#13] trellis-direct tensor-core GEMM for T > EXL3_GEMV_MAX_T (prefill); GGML_CUDA_EXL3_GEMM=0 forces the M1
 // reconstruct + cuBLAS path. suh/svh may be null.
