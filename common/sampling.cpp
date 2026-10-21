@@ -412,6 +412,10 @@ struct common_sampler {
     // proof needs untouched) and per-request counters
     std::mt19937 pq_rng{0x9e3779b9u};
     common_sampler_pq_stats pq_stats;
+
+    // target top-1 probability (request-matched distribution, after the sampler chain) of every position the last
+    // sample_and_accept_n_pq call looked at; a free by-product used by the CDEPTH draft-depth policy. -1 = unknown
+    std::vector<float> top1_trace;
 };
 
 std::string common_params_sampling::print() const {
@@ -1364,10 +1368,23 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_pq(struct common_sam
     auto & stats = gsmpl->pq_stats;
     std::uniform_real_distribution<double> uniform(0.0, 1.0);
 
+    // top-1 probability of the distribution just sampled from (cur_p holds p over the surviving candidates)
+    gsmpl->top1_trace.clear();
+    auto trace_top1 = [&]() {
+        float top = -1.0f;
+        if (llama_get_sampled_token_ith(ctx, idxs[std::min(gsmpl->top1_trace.size(), idxs.size() - 1)]) == LLAMA_TOKEN_NULL) {
+            for (size_t k = 0; k < gsmpl->cur_p.size; ++k) {
+                top = std::max(top, gsmpl->cur_p.data[k].p);
+            }
+        }
+        gsmpl->top1_trace.push_back(top);
+    };
+
     size_t i = 0;
     for (; i < draft.size(); i++) {
         // x ~ p, the target chain's own draw; it also leaves cur_p holding p over the surviving candidates
         const llama_token x = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        trace_top1();
         const llama_token d = draft[i];
 
         if (replay && i + 1 == draft.size()) {
@@ -1470,6 +1487,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_pq(struct common_sam
 
     if (i == draft.size()) {
         const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        trace_top1();
 
         common_sampler_accept(gsmpl, id, true);
 
@@ -1477,6 +1495,10 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_pq(struct common_sam
     }
 
     return result;
+}
+
+const std::vector<float> & common_sampler_get_top1_trace(const struct common_sampler * gsmpl) {
+    return gsmpl->top1_trace;
 }
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl) {

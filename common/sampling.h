@@ -169,6 +169,11 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_pq(struct common_sam
 
 const common_sampler_pq_stats & common_sampler_get_pq_stats(const struct common_sampler * gsmpl);
 
+// top-1 probability of the target distribution at each position the last common_sampler_sample_and_accept_n_pq
+// call sampled from (request-matched, after the sampler chain; -1 where the chain sampled on the backend).
+// Entries 0..accepted belong to the committed tokens; later entries do not exist (the call stops at a rejection).
+const std::vector<float> & common_sampler_get_top1_trace(const struct common_sampler * gsmpl);
+
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 
 // force the reasoning budget sampler (if any) to begin forcing its end sequence now.

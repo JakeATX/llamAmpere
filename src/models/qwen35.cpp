@@ -5,6 +5,16 @@
 #include "llama-mtp-chain-sample.h"
 
 #include <atomic>
+#include <cstdlib>
+
+// fork: keep this predicate in sync with the chain reader in common/speculative.cpp.
+static bool spec_conflog_enabled() {
+    static const bool on = []() {
+        const char * p = std::getenv("LLAMA_SPEC_CONFLOG");
+        return p != nullptr && p[0] != '\0';
+    }();
+    return on;
+}
 
 // Output-row gather indices, or nullptr when every row is an output (decode, speculative verify,
 // MTP drafts): the gather would then be an identity copy. The graph topology still depends only on
@@ -928,6 +938,17 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
                     : ggml_reshape_1d(ctx0, ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, id_map, 1, id_map->ne[0]), pos_j), 1);
                 ggml_tensor * id_f = ggml_cast(ctx0, ggml_reshape_2d(ctx0, id_j, 1, 1), GGML_TYPE_F32);
                 out_j = ggml_concat(ctx0, id_f, p_j, 0);
+                if (spec_conflog_enabled() && logits_j->ne[0] >= 2) {
+                    // Reuse the chain softmax for the second-best probability.
+                    ggml_tensor * top2 = ggml_argsort_top_k(ctx0, logits_j, 2);
+                    ggml_tensor * idx2 = ggml_view_1d(ctx0, top2, 1, top2->nb[0]);
+                    ggml_tensor * p2_j = ggml_get_rows(ctx0,
+                            ggml_reshape_2d(ctx0, probs_j, 1, probs_j->ne[0]), idx2);
+                    p2_j = ggml_reshape_2d(ctx0, p2_j, 1, 1);
+                    out_j = ggml_concat(ctx0, out_j, p2_j, 0);
+                } else if (spec_conflog_enabled()) {
+                    out_j = ggml_concat(ctx0, out_j, ggml_scale(ctx0, p_j, 0.0f), 0);
+                }
             }
 
             logits_all = logits_all == nullptr ? out_j : ggml_concat(ctx0, logits_all, out_j, 1);

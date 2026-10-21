@@ -10,6 +10,7 @@
 #include "ngram-mod.h"
 #include "sampling.h"
 #include "speculative-adaptive.h"
+#include "speculative-cdepth.h"
 
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
 #include "../src/llama-mtp-chain-sample.h" // [#69] sampled chain: host re-derivation
@@ -18,6 +19,7 @@
 #include <cassert>
 #include <cmath>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <iomanip>
 #include <map>
@@ -73,6 +75,115 @@ struct common_spec_host_phase_call {
 
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
 #define SPEC_VOCAB_CHECK_START_TOKEN_ID 5
+
+// fork: keep this predicate in sync with the chain graph in qwen35.cpp.
+static bool spec_conflog_enabled() {
+    static const bool on = []() {
+        const char * p = std::getenv("LLAMA_SPEC_CONFLOG");
+        return p != nullptr && p[0] != '\0';
+    }();
+    return on;
+}
+
+static void spec_conf_clear(common_speculative_draft_params & dp) {
+    if (dp.conf_p1) {
+        dp.conf_p1->clear();
+    }
+    if (dp.conf_p2) {
+        dp.conf_p2->clear();
+    }
+}
+
+static void spec_conf_push(common_speculative_draft_params & dp, float p1, float p2) {
+    if (!dp.conf_p1) {
+        return;
+    }
+    dp.conf_p1->push_back(p1);
+    if (dp.conf_p2) {
+        dp.conf_p2->push_back(p2);
+    }
+}
+
+// Used only when the sampler has logits but no stored probabilities.
+static void spec_conf_top2_from_row(const float * row, int32_t n, float & p1, float & p2) {
+    p1 = NAN;
+    p2 = NAN;
+    if (row == nullptr || n <= 0) {
+        return;
+    }
+    float m1 = -INFINITY;
+    float m2 = -INFINITY;
+    for (int32_t i = 0; i < n; ++i) {
+        const float z = row[i];
+        if (z > m1) {
+            m2 = m1;
+            m1 = z;
+        } else if (z > m2) {
+            m2 = z;
+        }
+    }
+    if (!std::isfinite(m1)) {
+        return;
+    }
+    double sum = 0.0;
+    for (int32_t i = 0; i < n; ++i) {
+        sum += std::exp((double) row[i] - (double) m1);
+    }
+    if (!(sum > 0.0) || !std::isfinite(sum)) {
+        return;
+    }
+    p1 = (float) (1.0 / sum);
+    p2 = 0.0f;
+    if (std::isfinite(m2)) {
+        p2 = (float) (std::exp((double) m2 - (double) m1) / sum);
+    }
+}
+
+static void spec_conf_top2_logits(llama_context * ctx, int32_t idx, float & p1, float & p2) {
+    p1 = NAN;
+    p2 = NAN;
+    if (ctx == nullptr || idx < 0) {
+        return;
+    }
+    const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+    // Sampled logits can be a short row; compact greedy can omit the raw row entirely.
+    const float * sampled = llama_get_sampled_logits_ith(ctx, idx);
+    if ((sampled && llama_get_sampled_logits_count_ith(ctx, idx) != (uint32_t) n_vocab) ||
+            (!sampled && llama_get_sampled_token_ith(ctx, idx) != LLAMA_TOKEN_NULL)) {
+        return;
+    }
+    spec_conf_top2_from_row(llama_get_logits_ith(ctx, idx), n_vocab, p1, p2);
+}
+
+// Reuse sampling probabilities. Only the logits-only path needs a softmax.
+static void spec_conf_push_candidates(common_speculative_draft_params & dp, const llama_token_data_array * cur,
+        llama_context * ctx, int32_t idx) {
+    if (!dp.conf_p1) {
+        return;
+    }
+    float p1 = 0.0f;
+    float p2 = 0.0f;
+    bool any = false;
+    if (cur != nullptr && cur->data != nullptr && cur->size > 0) {
+        for (size_t i = 0; i < cur->size; ++i) {
+            const float p = cur->data[i].p;
+            if (!(p > 0.0f)) {
+                continue;
+            }
+            any = true;
+            if (p > p1) {
+                p2 = p1;
+                p1 = p;
+            } else if (p > p2) {
+                p2 = p;
+            }
+        }
+    }
+    if (!any) {
+        spec_conf_top2_logits(ctx, idx, p1, p2);
+    }
+    spec_conf_push(dp, p1, p2);
+}
 
 const std::map<std::string, common_speculative_type> common_speculative_type_from_name_map = {
     {"none",          COMMON_SPECULATIVE_TYPE_NONE},
@@ -226,6 +337,9 @@ struct common_speculative_impl {
     virtual void draft(common_speculative_draft_params_vec & dparams) = 0;
 
     virtual void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) = 0;
+
+    // (optional) target top-1 probabilities of the tokens one verify round committed (CDEPTH history)
+    virtual void note_target_conf(llama_seq_id /*seq_id*/, const float * /*p*/, size_t /*n*/) {}
 
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
@@ -406,6 +520,9 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
                 auto & result = *dp.result;
 
                 result.push_back(id);
+                if (dp.conf_p1) {
+                    spec_conf_push_candidates(dp, cur_p, ctx_dft, i_batch - 1);
+                }
 
                 if ((params.n_max <= (int) result.size()) ||
                     (dp.n_max > 0 && dp.n_max <= (int) result.size())) {
@@ -438,6 +555,9 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
 
             if (dp.result->size() < (size_t) params.n_min) {
                 dp.result->clear();
+                if (dp.conf_p1) {
+                    spec_conf_clear(dp);
+                }
             }
         }
     }
@@ -868,6 +988,9 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
                 auto & result = *dp.result;
 
                 result.push_back(id);
+                if (dp.conf_p1) {
+                    spec_conf_push_candidates(dp, cur_p, ctx_dft, i_batch - 1);
+                }
 
                 if (params.n_max <= (int) result.size()) {
                     drafting[seq_id] = false;
@@ -900,6 +1023,9 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
 
             if (dp.result->size() < (size_t) params.n_min) {
                 dp.result->clear();
+                if (dp.conf_p1) {
+                    spec_conf_clear(dp);
+                }
             }
         }
     }
@@ -1353,10 +1479,20 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         }
                     }
                     result.push_back((llama_token) row[predecessor]);
+                    if (dp.conf_p1) {
+                        // selector scores are already on the host; softmax is over that short row only
+                        float p1 = 0.0f;
+                        float p2 = 0.0f;
+                        spec_conf_top2_from_row(scores, selector_top_k, p1, p2);
+                        spec_conf_push(dp, p1, p2);
+                    }
                 }
 
                 if (result.size() < (size_t) params.n_min) {
                     result.clear();
+                    if (dp.conf_p1) {
+                        spec_conf_clear(dp);
+                    }
                 }
                 continue;
             }
@@ -1388,6 +1524,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     common_sampler_accept(smpl, id, true);
 
                     result.push_back(id);
+                    if (dp.conf_p1) {
+                        spec_conf_push_candidates(dp, cur_p, ctx_dft, idx);
+                    }
                 }
             } else {
                 // greedily read the predicted block at this sequence's noise positions 1..n_block_tokens-1
@@ -1411,11 +1550,17 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     common_sampler_accept(smpl, id, true);
 
                     result.push_back(id);
+                    if (dp.conf_p1) {
+                        spec_conf_push_candidates(dp, cur_p, ctx_dft, beg + i);
+                    }
                 }
             }
 
             if (result.size() < (size_t) params.n_min) {
                 result.clear();
+                if (dp.conf_p1) {
+                    spec_conf_clear(dp);
+                }
             }
         }
     }
@@ -1518,6 +1663,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // (n_cap can be raised to the round's deepest cap); the adaptive controller is fed at this depth
     std::vector<int> n_own;
     std::vector<common_speculative_adaptive> adaptive_ctrl; // [n_seq] per-seq adaptive depth controller
+
+    // CDEPTH (--spec-depth-policy cdepth): per-token confidence stop rule between n_min_adaptive and n_max
+    bool cdepth = false;
+    common_speculative_cdepth_model cd_model;
+    std::vector<common_speculative_cdepth_state> cd_state; // [n_seq]
+    bool cd_chain_warned = false;
+
+    void note_target_conf(llama_seq_id seq_id, const float * p, size_t n) override {
+        if (cdepth && seq_id >= 0 && seq_id < (llama_seq_id) cd_state.size()) {
+            cd_state[seq_id].note_target(p, n, cd_model.window);
+        }
+    }
 
     static bool equal_depth_enabled() {
         static const bool on = [] {
@@ -1712,6 +1869,27 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 adaptive_ctrl[s].reset(this->params.n_max, this->params.n_min_adaptive);
             }
             SPC_TRC("%s", "adaptive draft depth enabled (draft-mtp-adaptive)\n");
+
+            if (this->params.depth_policy == "cdepth") {
+                std::string err;
+                bool ok;
+                if (this->params.depth_model.empty()) {
+                    std::istringstream builtin(common_speculative_cdepth_builtin_text());
+                    ok = cd_model.parse(builtin, err);
+                } else {
+                    ok = cd_model.load(this->params.depth_model, err);
+                }
+                if (!ok) {
+                    GGML_ABORT("%s: --spec-depth-policy cdepth: bad model (%s): %s", __func__,
+                            this->params.depth_model.empty() ? "built-in" : this->params.depth_model.c_str(), err.c_str());
+                }
+                cdepth = true;
+                cd_state.assign(n_seq, common_speculative_cdepth_state());
+                LOG_INF("%s: CDEPTH depth policy on: draft %d..%d tokens per round, window %d, stages %zu, theta x%.2f, model %s\n",
+                        __func__, this->params.n_min_adaptive, this->params.n_max, cd_model.window, cd_model.coef.size(),
+                        (double) this->params.depth_theta,
+                        this->params.depth_model.empty() ? "built-in" : this->params.depth_model.c_str());
+            }
         }
 
         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
@@ -2056,6 +2234,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (!carry) {
                 adaptive_ctrl[seq_id].reset(params.n_max, params.n_min_adaptive);
             }
+        }
+        if (cdepth && seq_id >= 0 && seq_id < (llama_seq_id) cd_state.size()) {
+            cd_state[seq_id].reset_history(); // the target-confidence history belongs to one request
         }
 
         const int32_t N = (int32_t) prompt.size();
@@ -2631,6 +2812,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 // effective draft cap: adaptive depth (or n_max), then clamped by the
                 // per-call context bound from the server (same as the sequential path)
                 n_cap[seq_one] = adaptive ? adaptive_ctrl[seq_one].n_cur : params.n_max;
+                if (cdepth && !cd_chain_warned) {
+                    cd_chain_warned = true;
+                    LOG_WRN("%s: --spec-depth-policy cdepth applies to the per-token draft loop; the chained-graph draft path keeps the streak controller\n", __func__);
+                }
                 if (dp.n_max > 0 && dp.n_max < n_cap[seq_one]) {
                     n_cap[seq_one] = dp.n_max;
                 }
@@ -2643,6 +2828,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     }
                     n_last[seq_one] = 0;
                     return;
+                }
+                if (dp.conf_depth) {
+                    *dp.conf_depth = n_chain;
                 }
 
                 // deferred rows at or past n_past hold candidates the verify
@@ -2817,6 +3005,19 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                         if (qwen_cpu_sampler) {
                             common_sampler_accept(qwen_cpu_sampler, id, true);
                         }
+                        if (dp.conf_p1) {
+                            float p1 = 0.0f;
+                            float p2 = 0.0f;
+                            for (const auto & c : q) {
+                                if (c.p > p1) {
+                                    p2 = p1;
+                                    p1 = c.p;
+                                } else if (c.p > p2) {
+                                    p2 = c.p;
+                                }
+                            }
+                            spec_conf_push(dp, p1, p2);
+                        }
                         dp.result_q->push_back(std::move(q));
                         chain_st.steps++;
 
@@ -2853,13 +3054,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     if (!adaptive && dp.result->size() < (size_t) params.n_min) {
                         dp.result->clear();
                         dp.result_q->clear();
+                        if (dp.conf_p1) {
+                            spec_conf_clear(dp);
+                        }
                     }
                     return;
                 }
 
+                const int stride = spec_conflog_enabled() ? 3 : 2;
                 for (int j = 0; j < n_chain; ++j) {
-                    const llama_token id = (llama_token) lp[2*j + 0];
-                    const float       p  =               lp[2*j + 1];
+                    const llama_token id = (llama_token) lp[stride*j + 0];
+                    const float       p  =               lp[stride*j + 1];
 
                     SPC_DBG(" - seq_id %d, chain candidate %3d: %6d (%8.3f) '%s'\n",
                             seq_one, j, id, p,
@@ -2870,6 +3075,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     }
 
                     result.push_back(id);
+                    if (dp.conf_p1) {
+                        spec_conf_push(dp, p, lp[stride*j + 2]);
+                    }
 
                     if ((int) result.size() >= n_chain) {
                         break;
@@ -2885,6 +3093,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 // draft cutoff does not apply to it
                 if (!adaptive && dp.result->size() < (size_t) params.n_min) {
                     dp.result->clear();
+                    if (dp.conf_p1) {
+                        spec_conf_clear(dp);
+                    }
                 }
                 return;
             }
@@ -2943,11 +3154,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             // effective draft cap for this step: adaptive depth (or the user n_max),
             // then clamped by the per-call context bound from the server
-            n_cap[seq_id] = adaptive ? adaptive_ctrl[seq_id].n_cur : params.n_max;
+            n_cap[seq_id] = (adaptive && !cdepth) ? adaptive_ctrl[seq_id].n_cur : params.n_max;
+            if (cdepth) {
+                cd_state[seq_id].begin_round();
+            }
             if (dp.n_max > 0 && dp.n_max < n_cap[seq_id]) {
                 n_cap[seq_id] = dp.n_max;
             }
 
+            if (dp.conf_depth) {
+                *dp.conf_depth = n_cap[seq_id];
+            }
             n_own[seq_id] = n_cap[seq_id];
 
             common_batch_add(batch, dp.id_last, dp.pos0, { seq_id }, true);
@@ -2977,6 +3194,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 if (drafting[seq_id]) {
                     const int bound = dparams[seq_id].n_max > 0 ? dparams[seq_id].n_max : c_max;
                     n_cap[seq_id] = std::max(n_cap[seq_id], std::min(c_max, bound));
+                    if (dparams[seq_id].conf_depth) {
+                        *dparams[seq_id].conf_depth = n_cap[seq_id];
+                    }
                 }
             }
         }
@@ -3084,6 +3304,20 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
 
                 result.push_back(id);
+                if (dp.conf_p1) {
+                    spec_conf_push_candidates(dp, cur_p, ctx_dft, i_last[seq_id]);
+                }
+
+                if (cdepth) {
+                    // CDEPTH: stop before the next draft step when one more token is not expected to pay for itself.
+                    // Uses only the helper's own distributions and already verified history (lossless).
+                    const float p1 = cur_p->data[0].p;
+                    const float p2 = cur_p->size > 1 ? cur_p->data[1].p : 0.0f;
+                    const bool go = cd_state[seq_id].keep_going(cd_model, (int) result.size(), params.n_min_adaptive, p1, p2, params.depth_theta);
+                    if (!go && n_cap[seq_id] > (int) result.size()) {
+                        n_cap[seq_id] = (int) result.size();
+                    }
+                }
 
                 if (n_cap[seq_id] <= (int) result.size()) {
                     drafting[seq_id] = false;
@@ -3142,6 +3376,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // draft cutoff does not apply to it
             if (!adaptive && dp.result->size() < (size_t) params.n_min) {
                 dp.result->clear();
+                if (dp.conf_p1) {
+                    spec_conf_clear(dp);
+                }
             }
         }
     }
@@ -4895,6 +5132,13 @@ void common_speculative_draft(common_speculative * spec) {
                     }
                 }
 
+                if (dp.conf_p1 && dp.conf_p1->size() > result.size()) {
+                    dp.conf_p1->resize(result.size());
+                }
+                if (dp.conf_p2 && dp.conf_p2->size() > result.size()) {
+                    dp.conf_p2->resize(result.size());
+                }
+
                 if (!result.empty()) {
                     SPC_DBG("called impl %s, hist size = %zu, call_count = %zu, gen = %zu\n",
                             common_speculative_type_to_str(impl.get()->type).c_str(), dp.prompt->size(),
@@ -4925,6 +5169,15 @@ void common_speculative_draft(common_speculative * spec) {
         if (dp.drafting) {
             dp.drafting = false;
         }
+    }
+}
+
+void common_speculative_note_target_conf(common_speculative * spec, llama_seq_id seq_id, const float * p, size_t n) {
+    if (spec == nullptr || p == nullptr || n == 0) {
+        return;
+    }
+    for (auto & impl : spec->impls) {
+        impl->note_target_conf(seq_id, p, n);
     }
 }
 

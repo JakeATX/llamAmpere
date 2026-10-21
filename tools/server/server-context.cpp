@@ -28,6 +28,7 @@ extern "C" {
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -73,6 +74,33 @@ static bool server_mtp_gpu_verify_enabled() {
 static bool server_mtp_gpu_verify_sampled_enabled() {
     const char * gpu_verify = std::getenv("LLAMA_MTP_GPU_VERIFY");
     return gpu_verify != nullptr && std::strcmp(gpu_verify, "1") == 0;
+}
+
+// fork: no confidence work or file access unless the path is nonempty.
+static const char * spec_conflog_path() {
+    static const char * path = std::getenv("LLAMA_SPEC_CONFLOG");
+    return path != nullptr && path[0] != '\0' ? path : nullptr;
+}
+
+static float spec_conflog_row_p1(llama_context * ctx, int32_t idx) {
+    const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+    // Backend verification can omit raw logits. Never scan its short candidate buffer.
+    if (llama_get_sampled_token_ith(ctx, idx) != LLAMA_TOKEN_NULL) {
+        return NAN;
+    }
+    const float * row = llama_get_logits_ith(ctx, idx);
+    if (row == nullptr || n_vocab <= 0) {
+        return NAN;
+    }
+    const float m = *std::max_element(row, row + n_vocab);
+    if (!std::isfinite(m)) {
+        return NAN;
+    }
+    double sum = 0.0;
+    for (int32_t i = 0; i < n_vocab; ++i) {
+        sum += std::exp((double) row[i] - (double) m);
+    }
+    return sum > 0.0 && std::isfinite(sum) ? (float) (1.0 / sum) : NAN;
 }
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
@@ -1003,6 +1031,14 @@ struct server_slot {
 
     spec_adapt_ctrl       spec_adapt; // BL6a controller (inactive unless LLAMA_SPEC_ADAPT_COST=1)
 
+    // fork: logging scratch only; no sampler, prompt-cache, or slot-state serialization.
+    std::vector<float> spec_conf_p1;
+    std::vector<float> spec_conf_p2;
+    int               spec_conf_depth = 0;
+    int64_t           spec_conf_start = 0;
+    llama_pos         spec_conf_pos = 0;
+    json              spec_conf_pending;
+
     std::function<void(int /* id_slot */)>   callback_on_release;
     std::function<void(const server_slot &)> callback_on_reset; // called before reset()
 
@@ -1029,6 +1065,13 @@ struct server_slot {
             spec_draft_q.clear();
             spec_i_batch.clear();
             spec_ckpt.clear();
+            if (spec_conflog_path()) {
+                spec_conf_p1.clear();
+                spec_conf_p2.clear();
+                spec_conf_depth = 0;
+                spec_conf_start = 0;
+                spec_conf_pending = nullptr;
+            }
         }
         generated_tokens.clear();
         generated_token_probs.clear();
@@ -1804,6 +1847,12 @@ private:
 
     bool sleeping = false;
 
+    // fork: append-only confidence log, serialized across slots.
+    FILE *     conflog_fp     = nullptr;
+    std::mutex conflog_mu;
+    bool       conflog_failed = false;
+    uint32_t   conflog_lines  = 0;
+
     int64_t t_last_load_progress_ms = 0;
 
     // stall detector (--slot-stall-timeout): the main loop records the progress of each busy slot around
@@ -2086,7 +2135,108 @@ private:
         prompt_cache->flush_to_disk();
     }
 
+    FILE * spec_conflog_open() {
+        const char * path = spec_conflog_path();
+        if (path == nullptr) {
+            return nullptr; // LLAMA_SPEC_CONFLOG_UNSET_NO_FILE
+        }
+        if (!conflog_fp && !conflog_failed) {
+            conflog_fp = std::fopen(path, "a");
+            if (!conflog_fp) {
+                conflog_failed = true;
+                SRV_ERR("LLAMA_SPEC_CONFLOG: failed to open '%s'\n", path);
+                return nullptr;
+            }
+            std::setvbuf(conflog_fp, nullptr, _IOFBF, 64 * 1024);
+            json header = {
+                {"event", "header"}, {"model", params_base.model.path},
+                {"n_max", params_base.speculative.draft.n_max},
+                {"n_min_adaptive", params_base.speculative.draft.n_min_adaptive},
+                {"spec_type", json::array()},
+            };
+            std::vector<std::string> types;
+            for (auto t : params_base.speculative.types) {
+                types.push_back(common_speculative_type_to_str(t));
+            }
+            header["spec_type"] = types;
+            spec_conflog_line(header);
+        }
+        return conflog_fp;
+    }
+
+    void spec_conflog_line(const json & record) {
+        const std::string line = record.dump() + "\n";
+        if (std::fwrite(line.data(), 1, line.size(), conflog_fp) != line.size() ||
+                (++conflog_lines % 64 == 0 && std::fflush(conflog_fp) != 0)) {
+            SRV_ERR("%s", "LLAMA_SPEC_CONFLOG: write failed\n");
+            conflog_failed = true;
+            std::fclose(conflog_fp);
+            conflog_fp = nullptr;
+        }
+    }
+
+    static json spec_conflog_farray(const std::vector<float> & src, size_t n) {
+        json a = json::array();
+        for (size_t i = 0; i < n; ++i) {
+            if (i < src.size() && std::isfinite(src[i])) {
+                a.push_back(src[i]);
+            } else {
+                a.push_back(nullptr);
+            }
+        }
+        return a;
+    }
+
+    void spec_conflog_capture(server_slot & slot, size_t n_draft, size_t n_accepted, int32_t off) {
+        std::vector<float> target_p1;
+        for (int32_t row : slot.spec_i_batch) {
+            target_p1.push_back(spec_conflog_row_p1(slot.ctx_tgt, row - off));
+        }
+        if (slot.spec_is_replay) {
+            if (!slot.spec_conf_pending.is_null()) {
+                slot.spec_conf_pending["committed_p1"] = spec_conflog_farray(target_p1, n_accepted + 1);
+            }
+            return;
+        }
+        slot.spec_conf_pending = {
+            {"slot", slot.id}, {"request", slot.task->id}, {"n_past", slot.spec_conf_pos},
+            {"depth", slot.spec_conf_depth > 0 ? slot.spec_conf_depth : (int) n_draft},
+            {"drafted", n_draft}, {"accepted", n_accepted},
+            {"draft_p1", spec_conflog_farray(slot.spec_conf_p1, n_draft)},
+            {"draft_p2", spec_conflog_farray(slot.spec_conf_p2, n_draft)},
+            {"target_p1", spec_conflog_farray(target_p1, target_p1.size())},
+            // request-matched (after the sampler chain) target top-1 of the committed rows: the free on-device feature
+            {"target_ps1", spec_conflog_farray(common_sampler_get_top1_trace(slot.smpl.get()),
+                                               common_sampler_get_top1_trace(slot.smpl.get()).size())},
+        };
+    }
+
+    void spec_conflog_write(server_slot & slot, size_t n_emitted) {
+        if (slot.spec_conf_pending.is_null()) {
+            return;
+        }
+        slot.spec_conf_pending["emitted"] = n_emitted;
+        slot.spec_conf_pending["t_round_ms"] = (ggml_time_us() - slot.spec_conf_start) / 1000.0;
+        std::lock_guard<std::mutex> lock(conflog_mu);
+        if (spec_conflog_open()) {
+            spec_conflog_line(slot.spec_conf_pending);
+        }
+        slot.spec_conf_pending = nullptr;
+    }
+
+    void spec_conflog_close() {
+        if (conflog_fp) {
+            std::lock_guard<std::mutex> lock(conflog_mu);
+            if (std::fclose(conflog_fp) != 0) {
+                SRV_ERR("%s", "LLAMA_SPEC_CONFLOG: close failed\n");
+            }
+            conflog_fp = nullptr;
+        }
+    }
+
     void destroy() {
+        spec_conflog_close();
+
         spec.reset();
         spec_init.reset();
 
@@ -3309,7 +3459,8 @@ private:
 
             llama_sampler * speculative_sampler = nullptr;
             bool speculative_sampled = false;
-            if (slot.can_speculate() && server_mtp_gpu_verify_enabled()) {
+            // Confidence logging needs the raw verify logits that backend sampling can omit.
+            if (slot.can_speculate() && server_mtp_gpu_verify_enabled() && !spec_conflog_path()) {
                 speculative_sampler = common_sampler_get_greedy_backend(slot.smpl.get(), model_tgt);
                 if (!speculative_sampler && server_mtp_gpu_verify_sampled_enabled()) {
                     speculative_sampler = common_sampler_get_backend_verify(slot.smpl.get());
@@ -5087,6 +5238,19 @@ private:
                             /* .seed     = */ slot.task->params.sampling.seed,
                         };
 
+                        if (spec_conflog_path()) {
+                            slot.spec_conf_p1.clear();
+                            slot.spec_conf_p2.clear();
+                            slot.spec_conf_pending = nullptr;
+                            slot.spec_conf_depth = 0;
+                            slot.spec_conf_pos = slot.prompt.tokens.pos_next();
+                            slot.spec_conf_start = ggml_time_us();
+                            auto & dp = common_speculative_get_draft_params(spec.get(), slot.id);
+                            dp.conf_p1 = &slot.spec_conf_p1;
+                            dp.conf_p2 = &slot.spec_conf_p2;
+                            dp.conf_depth = &slot.spec_conf_depth;
+                        }
+
                         drafting.push_back(&slot);
                     }
                 }
@@ -6508,9 +6672,18 @@ private:
                         : common_sampler_sample_and_accept_n_pq(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, slot.spec_draft_q, false, slot.spec_is_replay));
                 g_host_phases.mark(server_host_phase_clock::SAMPLE); // includes the sampler clone above
                 slot.spec_clock.mark(server_bookkeep_clock::SAMPLE);
-                slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
+                // Preserve the original verify rows across a checkpoint replay.
+                if (spec_conflog_path()) {
+                    spec_conflog_capture(slot, n_draft, accepted.size() - 1, off);
+                }
+                if (!slot.spec_is_replay && params_base.speculative.draft.depth_policy == "cdepth") {
+                    // CDEPTH history: target top-1 of the committed rows (the re-decode after a restore is not counted twice)
+                    const auto & top1 = common_sampler_get_top1_trace(slot.smpl.get());
+                    common_speculative_note_target_conf(spec.get(), slot.id, top1.data(), std::min(top1.size(), accepted.size()));
+                }
+                slot.spec_i_batch.clear();
 
                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
 
@@ -6617,6 +6790,10 @@ private:
             }
             for (size_t i = 0; i < n_accepted && i < n_accepted_per_pos.size(); ++i) {
                 n_accepted_per_pos[i]++;
+            }
+
+            if (spec_conflog_path()) {
+                spec_conflog_write(slot, ids.size());
             }
 
             // add accepted tokens to the prompt
