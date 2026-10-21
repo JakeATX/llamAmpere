@@ -1633,7 +1633,8 @@ static bool moe_cache_env_on(const char * name) {
 // expert, which leaves the link about two thirds idle during the post-prompt cache warm. Same bytes,
 // same slots, same publication order; only the copy scheduling changes. Off by default.
 static int moe_cache_fill_batch_n() {
-    static const int n = [] { int64_t v = 0; moe_cache_env_i64("GGML_MOE_CACHE_FILL_BATCH", 0, 256, v); return (int) v; }();
+    // default 64 (owner ruling 2026-10-21); GGML_MOE_CACHE_FILL_BATCH=0 turns it off
+    static const int n = [] { int64_t v = 64; moe_cache_env_i64("GGML_MOE_CACHE_FILL_BATCH", 0, 256, v); return (int) v; }();
     return n;
 }
 

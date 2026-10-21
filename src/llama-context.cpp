@@ -3413,8 +3413,9 @@ int llama_context::mtp_prefill_decode(llama_context & target, llama_batch batch,
 // [PREFILLFAST] LLAMA_MTP_B1_HANDOFF=1: the target stages one ubatch of hidden rows on its device (plus one carry row) and
 // calls back after the ubatch, so the helper's catch-up reads them there instead of from the host output file.
 bool llama_context::mtp_handoff_init() {
+    // default on (owner ruling 2026-10-21, PREFILLFAST/RESULT.md); LLAMA_MTP_B1_HANDOFF=0 turns it off
     const char * env = getenv("LLAMA_MTP_B1_HANDOFF");
-    if (!(env && strcmp(env, "1") == 0)) {
+    if (env && strcmp(env, "0") == 0) {
         return false;
     }
     ggml_backend_dev_props props = {};
@@ -3529,7 +3530,8 @@ int llama_context::mtp_handoff_decode(llama_context & target, llama_batch batch,
     // [PREFILLFAST] LLAMA_MTP_HANDOFF_NO_EMBD=1: the hidden rows come from the target's device ring (mtp_prefill_input),
     // so the batch's host embd rows are never read; dropping them skips three copies of n_tokens x n_embd_out floats
     // per helper call (batch conversion, batch allocator, ubatch), about 84 MB each at 2,048 rows.
-    static const bool no_embd = [] { const char * e = getenv("LLAMA_MTP_HANDOFF_NO_EMBD"); return e && strcmp(e, "1") == 0; }();
+    // default on (owner ruling 2026-10-21); LLAMA_MTP_HANDOFF_NO_EMBD=0 turns it off
+    static const bool no_embd = [] { const char * e = getenv("LLAMA_MTP_HANDOFF_NO_EMBD"); return !(e && strcmp(e, "0") == 0); }();
     if (!source.ring || !source.rows || source.ring_first < 0 || cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP ||
             cparams.embeddings || cparams.mtp_chain || !cparams.embeddings_nextn_masked ||
             source.rows->ne[0] != (int64_t) model.hparams.n_embd_out() ||
@@ -6169,11 +6171,17 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
 // profile and ignores these counts, so the warm is the same. The split also stops the CUDA backend
 // fusing the routing ops across it, so collect-off runs the fused routing math that every other
 // decode uses; tokens then differ by rounding only (identical with GGML_CUDA_DISABLE_FUSION=1 in
-// both arms). Default: collect.
+// both arms). Default (owner ruling 2026-10-21): no read-back when GGML_MOE_CACHE_PROFILE_GLOBAL=1, because the warm
+// then ignores the counts; without the global profile the warm still needs them, so collection stays on.
+// LLAMA_B1_CACHE_COLLECT=1 / =0 forces either way.
 bool llama_context::b1_cache_collect_wanted() {
     static const bool wanted = [] {
         const char * e = getenv("LLAMA_B1_CACHE_COLLECT");
-        return !(e && strcmp(e, "0") == 0);
+        if (e && e[0]) {
+            return strcmp(e, "0") != 0;
+        }
+        const char * g = getenv("GGML_MOE_CACHE_PROFILE_GLOBAL");
+        return !(g && strcmp(g, "1") == 0);
     }();
     return wanted;
 }

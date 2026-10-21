@@ -30,8 +30,9 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
 
 static bool ggml_cuda_fattn_i8qk_sparse_first() {
     static const bool v = [] {
+        // default on (owner ruling 2026-10-21); GGML_CUDA_FA_SPARSE_FIRST=0 turns it off
         const char * e = getenv("GGML_CUDA_FA_SPARSE_FIRST");
-        return e != nullptr && e[0] == '1' && e[1] == '\0';
+        return !(e != nullptr && e[0] == '0' && e[1] == '\0');
     }();
     return v;
 }
