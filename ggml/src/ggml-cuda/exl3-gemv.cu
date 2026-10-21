@@ -5,6 +5,7 @@
 // This file is an independent ggml/CUDA reimplementation written with the exllamav3 source as reference;
 // no QTIP code was used.
 #include "exl3.cuh"
+#include "rpb-knobs.h"
 
 #include <algorithm>
 #include <cstring>
@@ -53,6 +54,8 @@ namespace cg = cooperative_groups;
 #define LLAMAMPERE_EXL3_WEIGHT_MAJOR 1
 #endif
 #define EXL3_GEMV_NWARPS 4
+// GGML_CUDA_EXL3_GEMV_NWARPS = 2, 4, or 8 picks a pre-instantiated warp count for the
+// small-width kernels (T = 1 old kernel, T = 2..8 default decode kernel). Unset stays at 4.
 #define EXL3_GEMV_MAX_T  16
 #ifndef EXL3_GEMV_MMA_MIN_T
 #define EXL3_GEMV_MMA_MIN_T 2
@@ -73,6 +76,19 @@ template <int T> struct exl3_gemv_cfg {
     static constexpr int  KTILES_MAX = XROWS <= 2 ? 128 : (XROWS <= 8 ? 64 : 32);   // k-tiles per item (XROWS*KTILES_MAX*32 B)
 };
 
+// rpb_exl3_xrows / rpb_exl3_ktiles_max are the host copy of this cfg (MMA min T is 2).
+template <int T>
+constexpr bool exl3_rpb_cfg_match =
+    rpb_exl3_ktiles_max(T) == exl3_gemv_cfg<T>::KTILES_MAX &&
+    rpb_exl3_xrows(T) == exl3_gemv_cfg<T>::XROWS;
+static_assert(exl3_rpb_cfg_match<1> && exl3_rpb_cfg_match<2> && exl3_rpb_cfg_match<3> &&
+              exl3_rpb_cfg_match<4> && exl3_rpb_cfg_match<5> && exl3_rpb_cfg_match<6> &&
+              exl3_rpb_cfg_match<7> && exl3_rpb_cfg_match<8> && exl3_rpb_cfg_match<9> &&
+              exl3_rpb_cfg_match<10> && exl3_rpb_cfg_match<11> && exl3_rpb_cfg_match<12> &&
+              exl3_rpb_cfg_match<13> && exl3_rpb_cfg_match<14> && exl3_rpb_cfg_match<15> &&
+              exl3_rpb_cfg_match<16>,
+              "rpb exl3 cfg drifted from exl3_gemv_cfg");
+
 static __device__ __forceinline__ uint32_t exl3_h2u(const half2 v) { return *reinterpret_cast<const uint32_t *>(&v); }
 static __device__ __forceinline__ half2    exl3_u2h(const uint32_t v) { return *reinterpret_cast<const half2 *>(&v); }
 
@@ -82,7 +98,12 @@ static __device__ __forceinline__ void exl3_mma_f16(uint32_t (&d)[2], const uint
         : "+r"(d[0]), "+r"(d[1]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
 
-template <int BITS, int T, bool FUSED, bool WM = false>
+// Inside the two kernels the warp count is a template parameter (default 4) so the
+// bodies stay as written. Host code below this pair still sees the macro.
+#pragma push_macro("EXL3_GEMV_NWARPS")
+#undef EXL3_GEMV_NWARPS
+
+template <int BITS, int T, bool FUSED, bool WM = false, int EXL3_GEMV_NWARPS = 4>
 static __global__ void __launch_bounds__(32 * EXL3_GEMV_NWARPS)
 k_exl3_gemv(const uint32_t * __restrict__ trellis, half2 * __restrict__ x, float * __restrict__ y,
             const int kt, const int nt, const int K, const int N, const int ksplit, const int kpi,
@@ -506,7 +527,7 @@ k_exl3_gemv(const uint32_t * __restrict__ trellis, half2 * __restrict__ x, float
 // computed (before: 4 while 4). At T >= 5 the kernel runs fewer resident warps (shared memory per block grows with T),
 // so it needs more bytes in flight per warp to cover DRAM latency. Same tiles, same fold-every-4 schedule, same order
 // => same output bits. Opt-in, GGML_CUDA_EXL3_PF2=1 (measured no gain).
-template <int BITS, int T, bool WM, bool FR = false, bool PF2 = false>
+template <int BITS, int T, bool WM, bool FR = false, bool PF2 = false, int EXL3_GEMV_NWARPS = 4>
 static __global__ void __launch_bounds__(32 * EXL3_GEMV_NWARPS)
 k_exl3_gemv_dec(const uint32_t * __restrict__ trellis, const half2 * __restrict__ x, float * __restrict__ y,
                 const int kt, const int nt, const int K, const int N, const int ksplit, const int kpi, const int bpk) {
@@ -941,6 +962,9 @@ k_exl3_gemv_dec(const uint32_t * __restrict__ trellis, const half2 * __restrict_
     }
 }
 
+#pragma pop_macro("EXL3_GEMV_NWARPS")
+static_assert(EXL3_GEMV_NWARPS == 4, "EXL3_GEMV_NWARPS host macro must stay 4");
+
 static int exl3_gemv_bps_cap() {   // EXL3_GEMV_BPS: cap the cooperative grid at this many blocks per SM (0 = none)
     static const int cap = [] {
         const char * env = getenv("EXL3_GEMV_BPS");
@@ -1216,17 +1240,178 @@ static int exl3_gemv_ktiles_max(const int T) {
     return tab[T - 1];
 }
 
+// Read once. A value outside {2, 4, 8} warns once and uses 4. Unset is 4, and
+// that path does not touch the device or the other EXL3 env flags.
+static int exl3_gemv_nwarps_requested() {
+    static const int v = [] {
+        const char * env = getenv("GGML_CUDA_EXL3_GEMV_NWARPS");
+        char buf[64];
+        buf[0] = '\0';
+        const char * text = nullptr;
+        if (env != nullptr) {
+            std::strncpy(buf, env, sizeof(buf) - 1);
+            buf[sizeof(buf) - 1] = '\0';
+            text = buf;
+        }
+        bool rejected = false;
+        const int n = rpb_pick_env(text, rpb_exl3_nwarps_allowed, rpb_exl3_nwarps_n,
+                                   rpb_exl3_nwarps_default, &rejected);
+        if (rejected) {
+            GGML_LOG_WARN("GGML_CUDA_EXL3_GEMV_NWARPS='%s' is not one of 2, 4, 8; using %d\n",
+                          buf, rpb_exl3_nwarps_default);
+        }
+        return n;
+    }();
+    return v;
+}
+
+// nwarps 4 means the historical launcher. 2 or 8 is the alt kernel only for the
+// shapes that were instantiated (see exl3_gemv_launch_alt). Anything else warns
+// once and stays on 4 warps, including the k-split, so the split matches the kernel.
+static rpb_exl3_alt exl3_gemv_alt(int T, bool fused, int bits) {
+    const int req = exl3_gemv_nwarps_requested();
+    if (req == rpb_exl3_nwarps_default) {
+        return rpb_exl3_alt{req, false, false};
+    }
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const rpb_exl3_alt alt = rpb_exl3_resolve(
+        req, T, fused, bits,
+        exl3_gemv_dec_enabled(), exl3_gemv_dec_tmin(),
+        exl3_gemv_weight_major_env(), exl3_gemv_vw_enabled(), exl3_gemv_pf2_enabled(),
+        cc, LLAMAMPERE_EXL3_WEIGHT_MAJOR != 0);
+    static bool warned_ignored = false;
+    static bool warned_on = false;
+    if (alt.ignored) {
+        if (!warned_ignored) {
+            warned_ignored = true;
+            GGML_LOG_WARN("GGML_CUDA_EXL3_GEMV_NWARPS=%d has no pre-instantiated kernel for this shape; using %d\n",
+                          req, rpb_exl3_nwarps_default);
+        }
+    } else if (!warned_on) {
+        warned_on = true;
+        GGML_LOG_WARN("GGML_CUDA_EXL3_GEMV_NWARPS=%d engaged\n", alt.nwarps);
+    }
+    return alt;
+}
+
+// T = 1, not fused, not weight-major. Only instantiated for NWARPS in {2, 8}.
+template <int BITS, int NWARPS>
+static void exl3_gemv_launch_t1_nw(const exl3_gemv_args & a, cudaStream_t stream) {
+    static int grid_max = 0;
+    if (grid_max == 0) {
+        int nb = 0;
+        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &nb, k_exl3_gemv<BITS, 1, false, false, NWARPS>, 32 * NWARPS, 0));
+        nb = std::max(1, nb);
+        grid_max = nb * ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
+    }
+    const int kpi = (a.kt + a.ksplit - 1) / a.ksplit;
+    GGML_ASSERT(kpi <= exl3_gemv_cfg<1>::KTILES_MAX);
+    const int n_items = a.nt * a.ksplit;
+    const dim3 grid(std::min(n_items, grid_max));
+    const dim3 block(32 * NWARPS);
+    k_exl3_gemv<BITS, 1, false, false, NWARPS><<<grid, block, 0, stream>>>(
+        a.trellis, a.x, a.out, a.kt, a.nt, a.K, a.N, a.ksplit, kpi,
+        a.xf, a.suh, a.svh, a.yf, a.post ? 1 : 0);
+}
+
+// Default decode variant only: weight-major, fragment staging, prefetch depth 1.
+// T is 2..8. NWARPS is 2 or 8. Grid policy matches exl3_gemv_dec_launch_bt.
+template <int BITS, int T, int NWARPS>
+static void exl3_gemv_launch_dec_nw(const exl3_gemv_args & a, cudaStream_t stream) {
+    static int grid_max = 0;
+    if (grid_max == 0) {
+        int nb = 0;
+        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &nb, k_exl3_gemv_dec<BITS, T, true, true, false, NWARPS>, 32 * NWARPS, 0));
+        grid_max = std::max(1, nb) * ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
+    }
+    const int kpi = (a.kt + a.ksplit - 1) / a.ksplit;
+    GGML_ASSERT(kpi <= exl3_gemv_cfg<T>::KTILES_MAX);
+    const int n_items = a.nt * a.ksplit;
+    static const int grid_cap = [] {
+        const char * env = getenv("GGML_CUDA_EXL3_DEC_GRID");
+        return env ? std::max(0, atoi(env)) : 0;
+    }();
+    int grid = grid_cap > 0 ? std::min({n_items, grid_max, grid_cap}) : std::min(n_items, grid_max);
+    const int bpk = exl3_gemv_order_enabled() && grid >= a.ksplit ? grid / a.ksplit : 0;
+    if (bpk > 0) {
+        grid = bpk * a.ksplit;
+    }
+    k_exl3_gemv_dec<BITS, T, true, true, false, NWARPS><<<grid, 32 * NWARPS, 0, stream>>>(
+        a.trellis, a.x, a.out, a.kt, a.nt, a.K, a.N, a.ksplit, kpi, bpk);
+}
+
+template <int T, int NWARPS>
+static void exl3_gemv_launch_dec_nw_bits(const exl3_gemv_args & a, int bits, cudaStream_t stream) {
+    switch (bits) {
+        case 2: exl3_gemv_launch_dec_nw<2, T, NWARPS>(a, stream); break;
+        case 3: exl3_gemv_launch_dec_nw<3, T, NWARPS>(a, stream); break;
+        case 4: exl3_gemv_launch_dec_nw<4, T, NWARPS>(a, stream); break;
+        case 5: exl3_gemv_launch_dec_nw<5, T, NWARPS>(a, stream); break;
+        case 6: exl3_gemv_launch_dec_nw<6, T, NWARPS>(a, stream); break;
+        case 7: exl3_gemv_launch_dec_nw<7, T, NWARPS>(a, stream); break;
+        case 8: exl3_gemv_launch_dec_nw<8, T, NWARPS>(a, stream); break;
+        default: GGML_ABORT("exl3 gemv: unsupported bits");
+    }
+}
+
+// Both branches are instantiated. The asserts keep a bad call off a kernel we did not build.
+template <int NWARPS>
+static void exl3_gemv_launch_alt(const exl3_gemv_args & a, int bits, int T, bool use_dec, cudaStream_t stream) {
+    if (!use_dec) {
+        GGML_ASSERT(T == 1);
+        switch (bits) {
+            case 2: exl3_gemv_launch_t1_nw<2, NWARPS>(a, stream); break;
+            case 3: exl3_gemv_launch_t1_nw<3, NWARPS>(a, stream); break;
+            case 4: exl3_gemv_launch_t1_nw<4, NWARPS>(a, stream); break;
+            case 5: exl3_gemv_launch_t1_nw<5, NWARPS>(a, stream); break;
+            case 6: exl3_gemv_launch_t1_nw<6, NWARPS>(a, stream); break;
+            case 7: exl3_gemv_launch_t1_nw<7, NWARPS>(a, stream); break;
+            case 8: exl3_gemv_launch_t1_nw<8, NWARPS>(a, stream); break;
+            default: GGML_ABORT("exl3 gemv: unsupported bits");
+        }
+        return;
+    }
+    GGML_ASSERT(T >= 2 && T <= 8);
+    switch (T) {
+        case 2: exl3_gemv_launch_dec_nw_bits<2, NWARPS>(a, bits, stream); break;
+        case 3: exl3_gemv_launch_dec_nw_bits<3, NWARPS>(a, bits, stream); break;
+        case 4: exl3_gemv_launch_dec_nw_bits<4, NWARPS>(a, bits, stream); break;
+        case 5: exl3_gemv_launch_dec_nw_bits<5, NWARPS>(a, bits, stream); break;
+        case 6: exl3_gemv_launch_dec_nw_bits<6, NWARPS>(a, bits, stream); break;
+        case 7: exl3_gemv_launch_dec_nw_bits<7, NWARPS>(a, bits, stream); break;
+        case 8: exl3_gemv_launch_dec_nw_bits<8, NWARPS>(a, bits, stream); break;
+        default: GGML_ABORT("exl3 gemv: unsupported T");
+    }
+}
+
+static void exl3_gemv_dispatch(const exl3_gemv_args & a, int bits, int T, bool fused, cudaStream_t stream) {
+    const rpb_exl3_alt alt = exl3_gemv_alt(T, fused, bits);
+    if (alt.nwarps == 2) {
+        exl3_gemv_launch_alt<2>(a, bits, T, alt.use_dec, stream);
+        return;
+    }
+    if (alt.nwarps == 8) {
+        exl3_gemv_launch_alt<8>(a, bits, T, alt.use_dec, stream);
+        return;
+    }
+    if (fused) {
+        exl3_gemv_launch_t<true>(a, bits, T, stream);
+    } else {
+        exl3_gemv_launch_t<false>(a, bits, T, stream);
+    }
+}
+
+static int exl3_gemv_ksplit_for(int kt, int nt, int T, bool fused, int bits) {
+    const int nwarps = exl3_gemv_alt(T, fused, bits).nwarps;
+    return rpb_exl3_ksplit(kt, nt, exl3_gemv_ktiles_max(T), nwarps);
+}
+
 int ggml_cuda_exl3_gemv_ksplit(const int kt, const int nt, const int T) {
-    // enough work items to cover the SMs several times over, at most KTILES_MAX k-tiles per item (x is staged per
-    // item in shared memory), and >= 2 k-tiles per warp
-    const int ktiles_max = exl3_gemv_ktiles_max(T);
-    int ksplit = (1536 + nt - 1) / nt;
-    const int ksplit_max = kt / (2 * EXL3_GEMV_NWARPS);
-    if (ksplit > ksplit_max) ksplit = ksplit_max;
-    if (ksplit < 1) ksplit = 1;
-    // kpi = ceil(kt/ksplit) must fit the staging buffer
-    while ((kt + ksplit - 1) / ksplit > ktiles_max) ksplit++;
-    return ksplit;
+    // No bit width here. 4-bit weight-major is legal on every arch, and fused is off.
+    // The GEMV and the FFN bridge pass the real bits into exl3_gemv_ksplit_for.
+    return exl3_gemv_ksplit_for(kt, nt, T, false, 4);
 }
 
 // [#74] raw split-K partials out[ks][T][N] = W . xh for a glued, pre-scaled fp16 x (no svh, no Hadamard)
@@ -1236,7 +1421,7 @@ static void exl3_gemv_raw(const ggml_tensor * src0, const half * xh, float * out
     a.kt = (int) src0->ne[0] / 16; a.nt = (int) src0->ne[1] / 16; a.K = (int) src0->ne[0]; a.N = (int) src0->ne[1];
     a.ksplit = ksplit;
     a.xf = nullptr; a.suh = nullptr; a.svh = nullptr; a.yf = nullptr; a.post = true;
-    exl3_gemv_launch_t<false>(a, ggml_exl3_bits(src0->type), T, stream);
+    exl3_gemv_dispatch(a, ggml_exl3_bits(src0->type), T, false, stream);
 }
 
 static bool exl3_ffn_mm_ok(const ggml_tensor * mm, const int64_t T) {
@@ -1273,9 +1458,9 @@ bool ggml_cuda_exl3_ffn_bridge(ggml_backend_cuda_context & ctx, const ggml_tenso
 
     const int id = ggml_cuda_get_device();
     cudaStream_t stream = ctx.stream();
-    const int ks_g = ggml_cuda_exl3_gemv_ksplit(K / 16, NF / 16, (int) T);
-    const int ks_u = ggml_cuda_exl3_gemv_ksplit(K / 16, NF / 16, (int) T);
-    const int ks_d = ggml_cuda_exl3_gemv_ksplit(NF / 16, ND / 16, (int) T);
+    const int ks_g = exl3_gemv_ksplit_for(K / 16, NF / 16, (int) T, false, ggml_exl3_bits(wg->type));
+    const int ks_u = exl3_gemv_ksplit_for(K / 16, NF / 16, (int) T, false, ggml_exl3_bits(wu->type));
+    const int ks_d = exl3_gemv_ksplit_for(NF / 16, ND / 16, (int) T, false, ggml_exl3_bits(wd->type));
 
     // gate and up: glue_in (shared when both read the same x with the same suh) + raw partials
     const float * suh_g = (const float *) mm_gate->src[2]->data;
@@ -1314,16 +1499,17 @@ void ggml_cuda_exl3_gemv(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
     const int N  = (int) src0->ne[1];
     const int kt = K / 16;
     const int nt = N / 16;
-    const int ksplit = ggml_cuda_exl3_gemv_ksplit(kt, nt, (int) T);
+    // the fused phase 3 walks 128-chunks of [T][N]: without svh and N % 128 != 0 it would drop the T*N % 128 tail,
+    // so that shape takes the split glue (its glue_out has a per-element path). Fused is known before the
+    // k-split so a non-default warp count cannot split for a kernel this launch will not run.
+    const bool fused = exl3_gemv_fused_enabled() && (svh != nullptr || N % 128 == 0);
+    const int ksplit = exl3_gemv_ksplit_for(kt, nt, (int) T, fused, bits);
 
     const int id = ggml_cuda_get_device();
     cudaStream_t stream = ctx.stream();
 
     // x -> fp16 [T][K], pre-scaled (and suh * / Hadamard when fused)
     ggml_cuda_pool_alloc<half> xh(ctx.pool(id), (size_t) T * K);
-    // the fused phase 3 walks 128-chunks of [T][N]: without svh and N % 128 != 0 it would drop the T*N % 128 tail,
-    // so that shape takes the split glue (its glue_out has a per-element path)
-    const bool fused = exl3_gemv_fused_enabled() && (svh != nullptr || N % 128 == 0);
     if (!fused) {
         ggml_cuda_exl3_glue_in_f16((const float *) src1->data, suh, xh.get(), K, T, EXL3_GEMV_X_SCALE, stream);
     }
@@ -1336,12 +1522,8 @@ void ggml_cuda_exl3_gemv(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
     a.trellis = (const uint32_t *) src0->data; a.x = (half2 *) xh.get(); a.out = out;
     a.kt = kt; a.nt = nt; a.K = K; a.N = N; a.ksplit = ksplit;
     a.xf = (const float *) src1->data; a.suh = suh; a.svh = svh; a.yf = y; a.post = post;
-    if (fused) {
-        exl3_gemv_launch_t<true>(a, bits, (int) T, stream);
-    } else {
-        exl3_gemv_launch_t<false>(a, bits, (int) T, stream);
-        if (post) {
-            ggml_cuda_exl3_glue_out(out, svh, y, N, T, ksplit, 1.0f, stream);
-        }
+    exl3_gemv_dispatch(a, bits, (int) T, fused, stream);
+    if (!fused && post) {
+        ggml_cuda_exl3_glue_out(out, svh, y, N, T, ksplit, 1.0f, stream);
     }
 }

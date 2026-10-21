@@ -447,6 +447,10 @@ add_executable(test-fattn-mma-config test-fattn-mma-config.cpp)
 target_include_directories(test-fattn-mma-config PRIVATE ${PROJECT_SOURCE_DIR}/ggml/include)
 llama_test(test-fattn-mma-config)
 
+add_executable(test-rpb-knobs test-rpb-knobs.cpp)
+target_include_directories(test-rpb-knobs PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda)
+llama_test(test-rpb-knobs)
+
 llama_build_and_test(test-fattn-alloc-route.cpp) # [#64] skips without a GPU backend
 llama_build_and_test(test-fattn-bounded-prefill.cpp) # [#22/#29] forks one child per GGML_CUDA_PREFILL_KV_MIB arm; skips without a GPU backend
 llama_build_and_test(test-mtp-chain-sample.cpp) # [#69] CPU always, the GPU when present

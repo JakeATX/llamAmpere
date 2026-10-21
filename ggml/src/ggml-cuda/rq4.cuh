@@ -80,6 +80,9 @@ static __device__ __forceinline__ float magic_i2f(int x) {
 // x: [N][K] f32 with row stride sx (elements). q: [N][K] int8 (fragment byte order), s: [N][K/256].
 // One warp per (token, 256 block), 4 warps per CTA along K.
 
+// Optional scratch layout swaps the two 8-byte halves of each vector for token bit 1.
+// The default fragment layout remains unchanged.
+template <bool SWAP8 = false>
 static __global__ void __launch_bounds__(128) quantize_act(
         const float * __restrict__ x, int64_t sx, int8_t * __restrict__ q, float * __restrict__ s, int K, int N) {
     const int lane = threadIdx.x & 31;
@@ -143,7 +146,7 @@ static __global__ void __launch_bounds__(128) quantize_act(
     const int j  = (lane & 15) >> 2;
     const int h  = (lane & 3) >> 1;
     const int t0 = (lane & 1)*2;
-    int8_t * qr = q + (int64_t) tok*K + hb*RQ4_HB + c*RQ4_CHUNK + j*8 + h*4;
+    int8_t * qr = q + (int64_t) tok*K + hb*RQ4_HB + c*RQ4_CHUNK + (j ^ (SWAP8 ? ((tok >> 1) & 1) : 0))*8 + h*4;
     *(uint32_t *) (qr + (t0 + 0)*32) = w[0];
     *(uint32_t *) (qr + (t0 + 1)*32) = w[1];
     if (lane == 0) {
@@ -723,9 +726,10 @@ static void launch_mmv(const uint8_t * W, int64_t row_bytes, const int8_t * Xq, 
     mmv<Codec><<<M/16, MMV_WARPS*32, 0, stream>>>(W, row_bytes, Xq, Xs, Y, ldy, M, N, K);
 }
 
+template <bool SWAP8 = false>
 static void launch_quantize_act(const float * x, int64_t sx, int8_t * q, float * s, int K, int N, cudaStream_t stream) {
     const dim3 grid((K/RQ4_HB + 3)/4, N);
-    quantize_act<<<grid, 128, 0, stream>>>(x, sx, q, s, K, N);
+    quantize_act<SWAP8><<<grid, 128, 0, stream>>>(x, sx, q, s, K, N);
 }
 
 } // namespace rq4
