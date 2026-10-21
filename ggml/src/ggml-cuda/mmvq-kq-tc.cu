@@ -1,4 +1,5 @@
 #include "mmvq-kq-tc.cuh"
+#include "mmvq.cuh"
 #include "quantize.cuh"
 #include "vecdotq.cuh"
 
@@ -337,6 +338,8 @@ struct kqtc_config {
     bool any     = false;
     int  min_n   = 2;
     int  warps   = 0; // 0 = auto
+    bool q8_cache = true;
+    int64_t max_m = 0; // 0 = no limit
 };
 
 static const kqtc_config & kqtc_get_config() {
@@ -381,9 +384,15 @@ static const kqtc_config & kqtc_get_config() {
             const int v = atoi(w);
             c.warps = (v == 4 || v == 8) ? v : 0;
         }
-        GGML_LOG_WARN("[kqtc] on: q4_K %d q5_K %d q6_K %d iq3_s %d, min_n %d, warps %s\n",
+        if (const char * m = getenv("GGML_CUDA_KQ_TC_MAX_M")) {
+            c.max_m = atoll(m) > 0 ? atoll(m) : 0;
+        }
+        if (const char * q = getenv("GGML_CUDA_KQ_TC_Q8CACHE")) {
+            c.q8_cache = atoi(q) != 0;
+        }
+        GGML_LOG_WARN("[kqtc] on: q4_K %d q5_K %d q6_K %d iq3_s %d, min_n %d, warps %s, q8 cache %d, max rows %lld\n",
                       c.types[GGML_TYPE_Q4_K], c.types[GGML_TYPE_Q5_K], c.types[GGML_TYPE_Q6_K], c.types[GGML_TYPE_IQ3_S],
-                      c.min_n, c.warps == 0 ? "auto" : (c.warps == 4 ? "4" : "8"));
+                      c.min_n, c.warps == 0 ? "auto" : (c.warps == 4 ? "4" : "8"), c.q8_cache, (long long) c.max_m);
         return c;
     }();
     return cfg;
@@ -414,7 +423,7 @@ bool ggml_cuda_mul_mat_kq_tc_try(ggml_backend_cuda_context & ctx,
     const size_t  ts   = ggml_type_size(src0->type);
     // Q4_K / Q5_K blocks are read as int (144 / 176 bytes), Q6_K / IQ3_S as two halves (210 / 110 bytes)
     const size_t  align = (src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K) ? 4 : 2;
-    if (ne11 < cfg.min_n || ne11 > 8 ||
+    if (ne11 < cfg.min_n || ne11 > 8 || (cfg.max_m > 0 && src0->ne[1] > cfg.max_m) ||
             src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 ||
             dst->ne[2] != 1 || dst->ne[3] != 1 ||
             ne00 <= 0 || ne00 % QK_K != 0 || ne00 > std::numeric_limits<int>::max() || src1->ne[0] != ne00 ||
@@ -432,15 +441,35 @@ bool ggml_cuda_mul_mat_kq_tc_try(ggml_backend_cuda_context & ctx,
 
     cudaStream_t stream = ctx.stream();
     const int64_t ne10_padded = GGML_PAD(ne00, MATRIX_ROW_PADDING);
-    ggml_cuda_pool_alloc<char> q8(ctx.pool(), (size_t) ne11 * ne10_padded * sizeof(block_q8_1) / QK8_1);
-    const int64_t s11 = src1->nb[1] / sizeof(float);
-    quantize_row_q8_1_cuda((const float *) src1->data, nullptr, q8.get(), src0->type, ne00, s11, s11*ne11, s11*ne11,
-                           ne10_padded, ne11, 1, 1, stream);
+    const size_t q8_bytes = (size_t) ne11 * ne10_padded * sizeof(block_q8_1) / QK8_1;
+    // Same shared-quantize cache as MMVQ (q8_cache in common.cuh): the q8_1 layout here is MMVQ's plain layout (no
+    // IQ4_XS swizzle), so an activation already quantized for an MMVQ / fused-norm consumer of the same src1 in this
+    // graph eval is reused, and ours is left for the next one. Same quantizer either way, so the bytes are identical.
+    ggml_cuda_pool_alloc<char> q8_local(ctx.pool());
+    char * q8 = nullptr;
+    const bool cacheable = cfg.q8_cache && ggml_cuda_q8_cacheable(ctx, q8_bytes);
+    if (cacheable) {
+        for (auto & e : ctx.q8_cache.entries) {
+            if (e.epoch == ctx.graph_epoch && e.src1 == src1 && e.data == src1->data && e.size == q8_bytes &&
+                    e.ne10_padded == ne10_padded && !e.swizzle_iq4 && e.dev == ctx.device) {
+                e.last_use = ++ctx.q8_cache.tick;
+                ctx.fusion_stats.q8_cache_hits++;
+                q8 = e.ptr;
+                break;
+            }
+        }
+    }
+    if (q8 == nullptr) {
+        q8 = cacheable ? ggml_cuda_q8_cache_claim(ctx, src1, src0->type, q8_bytes, ne10_padded) : q8_local.alloc(q8_bytes);
+        const int64_t s11 = src1->nb[1] / sizeof(float);
+        quantize_row_q8_1_cuda((const float *) src1->data, nullptr, q8, src0->type, ne00, s11, s11*ne11, s11*ne11,
+                               ne10_padded, ne11, 1, 1, stream);
+    }
 
     const int nsb    = (int) (ne00 / QK_K);
     const int nwarps = cfg.warps != 0 ? cfg.warps : (nsb >= 16 ? 8 : 4);
     const char * vx = (const char *) src0->data;
-    const block_q8_1 * vy = (const block_q8_1 *) q8.get();
+    const block_q8_1 * vy = (const block_q8_1 *) q8;
     float * d = (float *) dst->data;
     const int stride_col_y   = (int) (ne10_padded / QK8_1);
     const int stride_col_dst = (int) (dst->nb[1] / sizeof(float));

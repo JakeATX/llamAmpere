@@ -17141,6 +17141,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                     test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, mk.first, n, mk.second, { 1, 1 }, { 1, 1 }));
                 }
             }
+            if (type == GGML_TYPE_Q5_K) {
+                // Flash-Next output head (248,320 x 2,560 Q5_K): MMQ already reads it at ~820 GB/s at 5 columns
+                for (int64_t n : { 4, 5 }) {
+                    test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 248320, n, 2560, { 1, 1 }, { 1, 1 }));
+                }
+            }
         }
         for (int64_t n : { 1, 4, 5, 8 }) {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 512, n, 2560, { 1, 1 }, { 1, 1 }));

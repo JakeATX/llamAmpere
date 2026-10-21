@@ -2,12 +2,13 @@
 // the model graph. The unfused graph runs rms_norm, mul, the W_down / W_inject matmuls, scale, silu, the W_up matmul
 // and the gated mean as separate kernels; at 1..8 tokens every one of them is launch- or occupancy-bound.
 //
-// Here it is three kernels:
+// Here it is two kernels (v2; three with GGML_CUDA_HC_FUSED_FINISH=0, which runs down_finish as its own launch):
 //   down_partial: split-K over 512-column chunks of the W_down and W_inject rows. Each CTA stages x*w_norm for its
 //                 chunk in shared memory (the per-stream rms scale r is a per-chunk constant, so it is applied after
-//                 the dot product), and CTAs of the first row block also write the chunk's sum of squares.
+//                 the dot product), and each row block writes the chunk's sum of squares.
 //   down_finish:  r from the chunk sums of squares, the chunk partials combined with r, then silu(lo_scale*v) for the
-//                 R low-rank rows and 2*sigmoid(inj_scale*v) for the injection rows.
+//                 R low-rank rows and 2*sigmoid(inj_scale*v) for the injection rows. In v2 the last CTA of each row
+//                 block to arrive does this for its own rows, with the same sums in the same order.
 //   up_gate:      one warp per embedding column i, eight lanes per stream; the W_up row of (stream, i) is dotted with
 //                 the activations, and the sigmoid gate, the xn product and the mean over the streams are applied in
 //                 registers.
@@ -15,6 +16,10 @@
 // unfused graph by rounding only.
 
 #include "hc-fused.cuh"
+
+#include <cstdlib>
+#include <mutex>
+#include <unordered_map>
 
 static constexpr int HCF_CHUNK      = 512;  // columns per split-K chunk; n_embd must be a multiple
 static constexpr int HCF_DOWN_WARPS = 8;
@@ -26,9 +31,19 @@ static constexpr int HCF_MAX_T      = 8;
 static __device__ __forceinline__ float hcf_bf16_lo(uint32_t v) { return __uint_as_float(v << 16); }
 static __device__ __forceinline__ float hcf_bf16_hi(uint32_t v) { return __uint_as_float(v & 0xFFFF0000u); }
 
+// [HCFUSED v2] Per-launch arrival counters for the fused finish. Each backend context gets its own slot of
+// HCF_CNT_RB counters (one per row block); the last CTA of a row block resets its counter, so they are zero
+// between launches and a captured graph can replay them. The mixes of one context run in stream order (each needs
+// the previous one's output), so one slot per context is enough.
+static constexpr int HCF_CNT_SLOTS = 16;
+static constexpr int HCF_CNT_RB    = 64;   // max row blocks: n_rows <= 64*32
+static __device__ unsigned int hcf_arrive[HCF_CNT_SLOTS*HCF_CNT_RB];
+
 // grid (ceil(n_rows/32), n_chunks), block 256
-// P   [n_chunks][n_rows][T] partial dot products (without r)
-// ssq [n_chunks][T]         partial sums of x^2
+// P   [n_chunks][n_rows][T]       partial dot products (without r)
+// ssq [row block][n_chunks][T]    partial sums of x^2 (only row block 0 when cnt == nullptr)
+// cnt != nullptr: the last CTA to finish a row block (over all chunks) also runs the finish for its 32 rows
+// (same sums in the same order as hcf_down_finish, so the result is bit-identical to the two-kernel path).
 template <int T>
 static __global__ void __launch_bounds__(HCF_DOWN_WARPS*WARP_SIZE)
 hcf_down_partial(
@@ -36,37 +51,22 @@ hcf_down_partial(
         const char * __restrict__ wd, const int64_t sd,
         const char * __restrict__ wi, const int64_t si,
         const int R, const int n_rows, const int hc_dim,
-        float * __restrict__ P, float * __restrict__ ssq) {
+        float * __restrict__ P, float * __restrict__ ssq,
+        const int cnt_off, const int n_embd, const float eps, const float lo_scale, const float inj_scale,
+        float * __restrict__ dst) {
     __shared__ float4 xs[T][HCF_CHUNK/4];
+    __shared__ float  rr[4][T];
+    __shared__ int    last_s;
 
     const int c    = blockIdx.y;
     const int j0   = c*HCF_CHUNK;
     const int warp = threadIdx.x / WARP_SIZE;
     const int lane = threadIdx.x % WARP_SIZE;
+    const int n_chunks = gridDim.y;
+    const bool fuse_finish = cnt_off >= 0;
 
-    for (int idx = threadIdx.x; idx < T*(HCF_CHUNK/4); idx += blockDim.x) {
-        const int t = idx / (HCF_CHUNK/4);
-        const int e = idx % (HCF_CHUNK/4);
-        const float4 xv = *((const float4 *) (x + (int64_t) t*hc_dim + j0) + e);
-        const float4 gv = *((const float4 *) (wn + j0) + e);
-        xs[t][e] = make_float4(xv.x*gv.x, xv.y*gv.y, xv.z*gv.z, xv.w*gv.w);
-    }
-
-    if (blockIdx.x == 0 && warp < T) {
-        const float4 * xr = (const float4 *) (x + (int64_t) warp*hc_dim + j0);
-        float s = 0.0f;
-#pragma unroll
-        for (int it = 0; it < HCF_CHUNK/4/WARP_SIZE; ++it) {
-            const float4 v = xr[it*WARP_SIZE + lane];
-            s += v.x*v.x + v.y*v.y + v.z*v.z + v.w*v.w;
-        }
-        s = warp_reduce_sum(s);
-        if (lane == 0) {
-            ssq[c*T + warp] = s;
-        }
-    }
-
-    // each lane covers 4 columns in each of 4 groups of 128 (8-byte loads, a 256-byte span per warp per group)
+    // each lane covers 4 columns in each of 4 groups of 128 (8-byte loads, a 256-byte span per warp per group);
+    // the weight loads go out first so their DRAM latency overlaps the activation staging below
     constexpr int NG = HCF_CHUNK/128;
     const int k_base = blockIdx.x*HCF_DOWN_RPB + warp*HCF_DOWN_ROWS;
 
@@ -86,6 +86,28 @@ hcf_down_partial(
             for (int g = 0; g < NG; ++g) {
                 w[q][g] = make_uint2(0, 0);
             }
+        }
+    }
+
+    for (int idx = threadIdx.x; idx < T*(HCF_CHUNK/4); idx += blockDim.x) {
+        const int t = idx / (HCF_CHUNK/4);
+        const int e = idx % (HCF_CHUNK/4);
+        const float4 xv = *((const float4 *) (x + (int64_t) t*hc_dim + j0) + e);
+        const float4 gv = *((const float4 *) (wn + j0) + e);
+        xs[t][e] = make_float4(xv.x*gv.x, xv.y*gv.y, xv.z*gv.z, xv.w*gv.w);
+    }
+
+    if ((fuse_finish || blockIdx.x == 0) && warp < T) {
+        const float4 * xr = (const float4 *) (x + (int64_t) warp*hc_dim + j0);
+        float s = 0.0f;
+#pragma unroll
+        for (int it = 0; it < HCF_CHUNK/4/WARP_SIZE; ++it) {
+            const float4 v = xr[it*WARP_SIZE + lane];
+            s += v.x*v.x + v.y*v.y + v.z*v.z + v.w*v.w;
+        }
+        s = warp_reduce_sum(s);
+        if (lane == 0) {
+            ssq[((int64_t) blockIdx.x*n_chunks + c)*T + warp] = s;
         }
     }
 
@@ -139,6 +161,69 @@ hcf_down_partial(
                 }
             }
         }
+    }
+
+    if (!fuse_finish) {
+        return;
+    }
+
+    // publish P / ssq, then count this CTA in; the last of the n_chunks CTAs of this row block does the finish
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const unsigned int prev = atomicAdd(&hcf_arrive[cnt_off + blockIdx.x], 1u);
+        last_s = prev == (unsigned int) (n_chunks - 1);
+    }
+    __syncthreads();
+    if (!last_s) {
+        return;
+    }
+    __threadfence();
+
+    constexpr int hc = 4;
+    const int cps = n_embd/HCF_CHUNK;  // chunks per stream
+    const float * ssq_rb = ssq + (int64_t) blockIdx.x*n_chunks*T;
+    if (threadIdx.x < hc*T) {
+        const int s = threadIdx.x / T;
+        const int t = threadIdx.x % T;
+        float sq = 0.0f;
+        for (int cc = 0; cc < cps; ++cc) {
+            sq += __ldcg(ssq_rb + (s*cps + cc)*T + t);
+        }
+        const float rv = rsqrtf(sq/n_embd + eps);
+        rr[s][t] = rv;
+        if (blockIdx.x == 0) {
+            dst[n_rows*T + t*hc + s] = rv;
+        }
+    }
+    __syncthreads();
+
+    for (int o = threadIdx.x; o < HCF_DOWN_RPB*T; o += blockDim.x) {
+        const int k = blockIdx.x*HCF_DOWN_RPB + o / T;
+        const int t = o % T;
+        if (k >= n_rows) {
+            continue;
+        }
+        float v = 0.0f;
+#pragma unroll
+        for (int s = 0; s < hc; ++s) {
+            float part = 0.0f;
+#pragma unroll 8
+            for (int cc = 0; cc < cps; ++cc) {
+                part += __ldcg(P + ((int64_t) (s*cps + cc)*n_rows + k)*T + t);
+            }
+            v += rr[s][t] * part;
+        }
+        if (k < R) {
+            const float a = lo_scale*v;
+            dst[t*R + k] = a/(1.0f + expf(-a));
+        } else {
+            dst[R*T + t*(n_rows - R) + (k - R)] = 2.0f/(1.0f + expf(-inj_scale*v));
+        }
+    }
+
+    if (threadIdx.x == 0) {
+        hcf_arrive[cnt_off + blockIdx.x] = 0u;
     }
 }
 
@@ -194,9 +279,14 @@ static __global__ void hcf_down_finish(
     }
 }
 
-// grid ceil(n_embd/16), block 512, dynamic shared R*T floats; hc == 4 (one 8-lane group per stream)
+// grid ceil(n_embd/16), block 512, dynamic shared R*T floats; hc == 4 (one 8-lane group per stream), R <= 64*HCF_UP_MAX_IT
+// The first HCF_UP_PRE passes of the W_up row (all of it for R <= 320) and the x / r / w_norm values are loaded before
+// the activations are staged, so a warp's global loads are in flight together (v1 issued one 16-byte weight load per
+// lane per loop pass); the sums are unchanged. Two CTAs per SM keep all 160 CTAs of n_embd = 2560 in one wave.
+static constexpr int HCF_UP_MAX_IT = 8;
+static constexpr int HCF_UP_PRE    = 5;
 template <int T>
-static __global__ void __launch_bounds__(HCF_UP_WARPS*WARP_SIZE)
+static __global__ void __launch_bounds__(HCF_UP_WARPS*WARP_SIZE, 2)
 hcf_up_gate(
         const float * __restrict__ x, const float * __restrict__ wn,
         const float * __restrict__ act, const float * __restrict__ r,
@@ -205,25 +295,42 @@ hcf_up_gate(
         float * __restrict__ dst) {
     extern __shared__ float act_s[];  // [T][R]
 
-    for (int idx = threadIdx.x; idx < T*R/4; idx += blockDim.x) {
-        ((float4 *) act_s)[idx] = ((const float4 *) act)[idx];
-    }
-    __syncthreads();
-
     const int warp = threadIdx.x / WARP_SIZE;
     const int lane = threadIdx.x % WARP_SIZE;
     const int i    = blockIdx.x*HCF_UP_WARPS + warp;
-    if (i >= n_embd) {
-        return;
-    }
+    const bool live = i < n_embd;
 
     constexpr int hc = 4;
     const int s  = lane / 8;
     const int l8 = lane % 8;
-    const int j  = s*n_embd + i;
+    const int j  = s*n_embd + (live ? i : 0);
 
     const uint4 * rp = (const uint4 * ) (wu + (int64_t) j*su);
     const int n_it = R/64;  // uint4 (8 values) per lane per pass, 8 lanes per row
+
+    uint4 wv[HCF_UP_PRE];
+#pragma unroll
+    for (int it = 0; it < HCF_UP_PRE; ++it) {
+        wv[it] = (live && it < n_it) ? rp[it*8 + l8] : make_uint4(0, 0, 0, 0);
+    }
+    float xn[T];
+    const float wnj = live ? wn[j] : 0.0f;
+#pragma unroll
+    for (int t = 0; t < T; ++t) {
+        xn[t] = live ? x[(int64_t) t*hc*n_embd + j] : 0.0f;
+    }
+    __shared__ float r_s[HCF_MAX_T*hc];
+    for (int idx = threadIdx.x; idx < T*R/4; idx += blockDim.x) {
+        ((float4 *) act_s)[idx] = ((const float4 *) act)[idx];
+    }
+    if (threadIdx.x < T*hc) {
+        r_s[threadIdx.x] = r[threadIdx.x];
+    }
+    __syncthreads();
+
+    if (!live) {
+        return;
+    }
 
     float g[T];
 #pragma unroll
@@ -231,11 +338,15 @@ hcf_up_gate(
         g[t] = 0.0f;
     }
 
-    for (int it = 0; it < n_it; ++it) {
+#pragma unroll
+    for (int it = 0; it < HCF_UP_MAX_IT; ++it) {
+        if (it >= n_it) {
+            break;
+        }
         const int    u  = it*8 + l8;
-        const uint4  wv = rp[u];
-        const float  w0 = hcf_bf16_lo(wv.x), w1 = hcf_bf16_hi(wv.x), w2 = hcf_bf16_lo(wv.y), w3 = hcf_bf16_hi(wv.y);
-        const float  w4 = hcf_bf16_lo(wv.z), w5 = hcf_bf16_hi(wv.z), w6 = hcf_bf16_lo(wv.w), w7 = hcf_bf16_hi(wv.w);
+        const uint4  q  = it < HCF_UP_PRE ? wv[it < HCF_UP_PRE ? it : 0] : rp[u];
+        const float  w0 = hcf_bf16_lo(q.x), w1 = hcf_bf16_hi(q.x), w2 = hcf_bf16_lo(q.y), w3 = hcf_bf16_hi(q.y);
+        const float  w4 = hcf_bf16_lo(q.z), w5 = hcf_bf16_hi(q.z), w6 = hcf_bf16_lo(q.w), w7 = hcf_bf16_hi(q.w);
 #pragma unroll
         for (int t = 0; t < T; ++t) {
             const float4 a0 = ((const float4 *) (act_s + t*R))[2*u + 0];
@@ -251,9 +362,8 @@ hcf_up_gate(
         gt += __shfl_xor_sync(0xFFFFFFFF, gt, 4);
         gt += __shfl_xor_sync(0xFFFFFFFF, gt, 2);
         gt += __shfl_xor_sync(0xFFFFFFFF, gt, 1);
-        const float xv = x[(int64_t) t*hc*n_embd + j];
-        const float xn = (xv*r[t*hc + s])*wn[j];
-        float v = xn*(1.0f/(1.0f + expf(-gt)));
+        const float xnv = (xn[t]*r_s[t*hc + s])*wnj;
+        float v = xnv*(1.0f/(1.0f + expf(-gt)));
         v += __shfl_xor_sync(0xFFFFFFFF, v, 8);
         v += __shfl_xor_sync(0xFFFFFFFF, v, 16);
         out[t] = v;
@@ -290,7 +400,31 @@ bool ggml_cuda_dsv4_hc_down_supported(const ggml_tensor * op) {
 bool ggml_cuda_dsv4_hc_up_supported(const ggml_tensor * op) {
     const ggml_tensor * x  = op->src[0];
     const ggml_tensor * wu = op->src[3];
-    return hcf_common_supported(x, op->src[1]) && hcf_weight_ok(wu) && wu->ne[0] % 64 == 0;
+    return hcf_common_supported(x, op->src[1]) && hcf_weight_ok(wu) && wu->ne[0] % 64 == 0 &&
+        wu->ne[0] <= 64*HCF_UP_MAX_IT;
+}
+
+// [HCFUSED v2] arrival-counter slot for this backend context (-1: none left, or GGML_CUDA_HC_FUSED_FINISH=0,
+// which keeps the separate finish kernel)
+static int hcf_cnt_slot(const ggml_backend_cuda_context & ctx) {
+    static const bool fuse = [] { const char * e = getenv("GGML_CUDA_HC_FUSED_FINISH"); return !e || atoi(e) != 0; }();
+    if (!fuse) {
+        return -1;
+    }
+    static std::mutex mtx;
+    static std::unordered_map<const void *, int> slots;
+    static int next = 0;  // one numbering for all devices: virtual devices may share a GPU (and its counters)
+    std::lock_guard<std::mutex> lock(mtx);
+    const auto it = slots.find(&ctx);
+    if (it != slots.end()) {
+        return it->second;
+    }
+    int slot = -1;
+    if (next < HCF_CNT_SLOTS) {
+        slot = next++;
+    }
+    slots[&ctx] = slot;
+    return slot;
 }
 
 template <int T>
@@ -311,24 +445,32 @@ static void hcf_down_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     const int R        = (int) wd->ne[1];
     const int n_rows   = R + hc_inj;
     const int n_chunks = hc_dim/HCF_CHUNK;
+    const int n_rb     = (n_rows + HCF_DOWN_RPB - 1)/HCF_DOWN_RPB;
 
     GGML_ASSERT(((uintptr_t) x->data) % 16 == 0 && ((uintptr_t) wn->data) % 16 == 0);
+    GGML_ASSERT(hc == 4);
 
     cudaStream_t stream = ctx.stream();
 
-    ggml_cuda_pool_alloc<float> P(ctx.pool(), (size_t) n_chunks*n_rows*T);
-    ggml_cuda_pool_alloc<float> ssq(ctx.pool(), (size_t) n_chunks*T);
+    const int slot    = n_rb <= HCF_CNT_RB ? hcf_cnt_slot(ctx) : -1;
+    const int cnt_off = slot >= 0 ? slot*HCF_CNT_RB : -1;
 
-    const dim3 grid((n_rows + HCF_DOWN_RPB - 1)/HCF_DOWN_RPB, n_chunks, 1);
+    ggml_cuda_pool_alloc<float> P(ctx.pool(), (size_t) n_chunks*n_rows*T);
+    ggml_cuda_pool_alloc<float> ssq(ctx.pool(), (size_t) (cnt_off >= 0 ? n_rb : 1)*n_chunks*T);
+
+    const dim3 grid(n_rb, n_chunks, 1);
     hcf_down_partial<T><<<grid, HCF_DOWN_WARPS*WARP_SIZE, 0, stream>>>(
         (const float *) x->data, (const float *) wn->data,
         (const char *) wd->data, wd->nb[1],
         wi ? (const char *) wi->data : nullptr, wi ? wi->nb[1] : 0,
-        R, n_rows, hc_dim, P.get(), ssq.get());
+        R, n_rows, hc_dim, P.get(), ssq.get(),
+        cnt_off, n_embd, eps, lo_scale, inj_scale, (float *) dst->data);
 
-    const int n_out = (n_rows + hc)*T;
-    hcf_down_finish<<<(n_out + 255)/256, 256, 0, stream>>>(
-        P.get(), ssq.get(), T, R, hc_inj, hc, n_embd, eps, lo_scale, inj_scale, (float *) dst->data);
+    if (cnt_off < 0) {
+        const int n_out = (n_rows + hc)*T;
+        hcf_down_finish<<<(n_out + 255)/256, 256, 0, stream>>>(
+            P.get(), ssq.get(), T, R, hc_inj, hc, n_embd, eps, lo_scale, inj_scale, (float *) dst->data);
+    }
 }
 
 template <int T>
