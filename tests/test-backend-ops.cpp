@@ -1358,6 +1358,7 @@ struct test_case {
     }
 
     virtual bool run_whole_graph() { return false; }
+    virtual bool replay_inputs() { return false; }
     virtual std::vector<ggml_tensor *> fusion_test_nodes() { return {}; }
     // Name of a backend fusion counter (see ggml_backend_cuda_fusion_count) that must advance while
     // the graph runs on the tested backend. Backends without the counter are not checked.
@@ -1628,7 +1629,8 @@ struct test_case {
         if (fused_nodes_to_verify.size() == 0 && run_whole_graph()) {
             fused_nodes_to_verify.push_back(out);
         }
-        const bool replay = out->op == GGML_OP_FLASH_ATTN_EXT && getenv("GGML_TEST_BACKEND_REPLAY") != nullptr;
+        const bool replay = replay_inputs() ||
+            (out->op == GGML_OP_FLASH_ATTN_EXT && getenv("GGML_TEST_BACKEND_REPLAY") != nullptr);
         if (replay) {
             fused_nodes_to_verify = {out};
             fused_nodes_to_verify.insert(fused_nodes_to_verify.end(), sentinels.begin(), sentinels.end());
@@ -6464,6 +6466,46 @@ struct test_mul_mat : public test_case {
         return ggml_op_name(GGML_OP_MUL_MAT);
     }
 };
+
+struct test_mul_mat_mmf_split_k : public test_mul_mat {
+    using test_mul_mat::test_mul_mat;
+
+    std::string vars() override {
+        return test_mul_mat::vars() + ",mmf_split_k=1";
+    }
+
+    bool run_whole_graph() override { return true; }
+    bool replay_inputs() override { return true; }
+};
+
+static void add_mmf_split_k_cases(std::vector<std::unique_ptr<test_case>> & cases, bool perf) {
+    if (getenv("GGML_TEST_MMF_SPLIT_K") == nullptr) {
+        return;
+    }
+    // Run CUDA with GGML_CUDA_MMF_SPLIT_K=2 for bitwise comparison against the
+    // original kernel on every launch, including four changed-input replays.
+    // Mode 1 is the two-launch implementation used for performance pairs.
+    for (int64_t n : {4, 5, 8}) {
+        cases.emplace_back(new test_mul_mat_mmf_split_k(
+            GGML_TYPE_BF16, GGML_TYPE_F32, 320, n, 10240, {1, 1}, {1, 1}));
+        cases.emplace_back(new test_mul_mat_mmf_split_k(
+            GGML_TYPE_F32, GGML_TYPE_F32, 512, n, 2560, {1, 1}, {1, 1}));
+    }
+    if (!perf) {
+        // Padded source strides still use the same interleaved K sequence.
+        cases.emplace_back(new test_mul_mat_mmf_split_k(
+            GGML_TYPE_BF16, GGML_TYPE_F32, 320, 5, 10240, {1, 1}, {1, 1}, {0, 1, 2, 3}, 10304));
+        // Guard cases: width > 8, original seven-warps selection, batched, F16.
+        cases.emplace_back(new test_mul_mat_mmf_split_k(
+            GGML_TYPE_BF16, GGML_TYPE_F32, 320, 9, 10240, {1, 1}, {1, 1}));
+        cases.emplace_back(new test_mul_mat_mmf_split_k(
+            GGML_TYPE_BF16, GGML_TYPE_F32, 320, 5, 2560, {1, 1}, {1, 1}));
+        cases.emplace_back(new test_mul_mat_mmf_split_k(
+            GGML_TYPE_F32, GGML_TYPE_F32, 512, 5, 2560, {2, 1}, {1, 1}));
+        cases.emplace_back(new test_mul_mat_mmf_split_k(
+            GGML_TYPE_F16, GGML_TYPE_F32, 320, 5, 10240, {1, 1}, {1, 1}));
+    }
+}
 
 struct test_mul_mat_iq4xs_k4 : public test_mul_mat {
     using test_mul_mat::test_mul_mat;
@@ -12568,6 +12610,7 @@ static const ggml_type other_types[] = {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     add_iq4xs_k4_cases(test_cases, false);
+    add_mmf_split_k_cases(test_cases, false);
     add_iq4xs_wide_cases(test_cases);
     // [PARW] few-tile long-K MMQ (stream-k CTA cap): the 48-row GDN gates and small matrices at widths 9..32
     for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_Q5_0, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS}) {
@@ -16045,6 +16088,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     add_get_rows_narrow_cases(test_cases, true);
     add_iq4xs_k4_cases(test_cases, true);
+    add_mmf_split_k_cases(test_cases, true);
 
     // [HCPN] Flash-Next hyper-connection step (GGML_CUDA_HC_POST_NORM / GGML_CUDA_HC_PRE_XN)
     for (int64_t n_tokens : { 512, 12288 }) {

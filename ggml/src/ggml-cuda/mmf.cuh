@@ -45,8 +45,8 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
 
 bool ggml_cuda_should_use_mmf(enum ggml_type type, int cc, int warp_size, const int64_t * scr0_ne, const size_t * src0_nb, const int src1_ncols, bool mul_mat_id);
 
-template <typename T, int rows_per_block, int cols_per_block, int nwarps, bool has_ids>
-__launch_bounds__(ggml_cuda_get_physical_warp_size()*nwarps, 1)
+template <typename T, int rows_per_block, int cols_per_block, int nwarps, bool has_ids, bool split_warps = false>
+__launch_bounds__(ggml_cuda_get_physical_warp_size()*(split_warps ? 1 : nwarps), 1)
 static __global__ void mul_mat_f(
         const T * __restrict__ x, const float * __restrict__ y, const int32_t * __restrict__ ids, float * __restrict__ dst,
         const int ncols, const int ncols_dst_total, const int nchannels_dst, const int stride_row, const int stride_col_y, const int stride_col_dst,
@@ -88,12 +88,16 @@ static __global__ void mul_mat_f(
     constexpr int ntA = rows_per_block / tile_A::I;
     constexpr int ntB = (cols_per_block + tile_B::I - 1) / tile_B::I;
 
+    static_assert(!split_warps || (!has_ids && rows_per_block == 32 && nwarps == 8),
+                  "split MMF must preserve the eight original warp partials");
+    static_assert(!split_warps || warp_size == 32, "split MMF is NVIDIA-only");
     const int row0        = blockIdx.x * rows_per_block;
+    const int logical_warp = split_warps ? blockIdx.y : threadIdx.y;
 
     int expert_idx = 0;
     [[maybe_unused]] int col_base = 0;
 
-    const int channel_dst = has_ids ? 0 : blockIdx.y;
+    const int channel_dst = (has_ids || split_warps) ? 0 : blockIdx.y;
 
     if constexpr (has_ids) {
         // experts + tiles of ncols_dst are packed in the y dimension
@@ -168,7 +172,7 @@ static __global__ void mul_mat_f(
     }
 
 
-    for (int col = threadIdx.y*warp_size + threadIdx.x; col < ncols; col += nwarps*warp_size) {
+    for (int col = logical_warp*warp_size + threadIdx.x; col < ncols; col += nwarps*warp_size) {
         tile_A A[ntA][warp_size / tile_A::J];
 #pragma unroll
         for (int itA = 0; itA < ntA; ++itA) {
@@ -227,6 +231,28 @@ static __global__ void mul_mat_f(
                 }
             }
         }
+    }
+
+    if constexpr (split_warps) {
+        // A CTA owns one of the original warp accumulators. Do not split K into
+        // contiguous ranges: its original interleaved K sequence is part of the
+        // bitwise contract. The FP32 store replaces the original shared store.
+        const int nrows = gridDim.x * rows_per_block;
+#pragma unroll
+        for (int itB = 0; itB < ntB; ++itB) {
+#pragma unroll
+            for (int itA = 0; itA < ntA; ++itA) {
+#pragma unroll
+                for (int l = 0; l < tile_C::ne; ++l) {
+                    const int i = row0 + itA*tile_C::I + tile_C::get_i(l);
+                    const int j = itB*tile_C::J + tile_C::get_j(l);
+                    if (j < cols_per_block) {
+                        dst[(j*nwarps + logical_warp)*nrows + i] = C[itA][itB].x[l];
+                    }
+                }
+            }
+        }
+        return;
     }
 
     float * buf_iw = (float *) compute_base;
@@ -635,6 +661,22 @@ static inline void mul_mat_f_switch_ids(
     }
 }
 
+// Keep this shared with the optional split-warp dispatch: selecting a different
+// number of logical warps changes both the K partition and the final sum order.
+static inline int64_t mmf_get_nwarps_best(const int64_t ncols_x, const int cc, const int warp_size) {
+    int64_t nwarps_best = 1;
+    int64_t niter_best = (ncols_x + warp_size*2 - 1) / (warp_size*2);
+    const int64_t max_block_size = mmf_get_max_block_size(cc);
+    for (int64_t nwarps = 2; nwarps <= max_block_size/warp_size; nwarps++) {
+        const int64_t niter = (ncols_x + nwarps*warp_size*2 - 1) / (nwarps*warp_size*2);
+        if (niter < niter_best) {
+            niter_best = niter;
+            nwarps_best = nwarps;
+        }
+    }
+    return nwarps_best;
+}
+
 template <typename T, int rows_per_block, int cols_per_block>
 void mul_mat_f_cuda(
         const T * x, const float * y, const int32_t * ids, float * dst,
@@ -662,16 +704,7 @@ void mul_mat_f_cuda(
     const int cc        = ggml_cuda_info().devices[device].cc;
     const int warp_size = ggml_cuda_info().devices[device].warp_size;
 
-    int64_t nwarps_best     = 1;
-    int64_t niter_best      = (ncols_x + warp_size*2 - 1) / (warp_size*2);
-    int64_t max_block_size  = mmf_get_max_block_size(cc);
-    for (int64_t nwarps = 2; nwarps <= max_block_size/warp_size; nwarps++) {
-        const int64_t niter = (ncols_x + nwarps*warp_size*2 - 1) / (nwarps*warp_size*2);
-        if (niter < niter_best) {
-            niter_best  = niter;
-            nwarps_best = nwarps;
-        }
-    }
+    const int64_t nwarps_best = mmf_get_nwarps_best(ncols_x, cc, warp_size);
 
     const int nbytes_shared_iter = nwarps_best * (volta_mma_available(cc) ? tile_A_32::I : tile_A_16::I) * (warp_size + mmf_get_padding(cc)) * 4;
     const int nbytes_cols_per_block_pad = (amd_wmma_available(cc) || amd_mfma_available(cc)) ? tile_B_16::I : tile_B_8::I;
