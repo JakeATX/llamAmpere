@@ -3511,6 +3511,19 @@ bool llama_context::mtp_handoff_ready(int32_t first, int32_t count) const {
         first >= stage.ring_first && (int64_t) first + count <= stage.ring_first + stage.ring_rows;
 }
 
+bool llama_context::mtp_handoff_row(float * dst, int32_t row) const {
+    // mid-decode the unmasked rows sit in batch order (the staged ubatch is one contiguous run from n_tokens_prev),
+    // so the row is read in place; output_reorder() would consume the decode's pending row map
+    const auto & stage = mtp_hidden;
+    const size_t width = model.hparams.n_embd_out();
+    if (!dst || !stage.ring || stage.ring_first < 0 || row < stage.ring_first || row >= stage.ring_first + stage.ring_rows ||
+            cparams.embeddings_nextn_masked || !embd_nextn.data || (size_t) (row + 1) * width > embd_nextn.size) {
+        return false;
+    }
+    std::memcpy(dst, embd_nextn.data + (size_t) row * width, width * sizeof(float));
+    return true;
+}
+
 int llama_context::mtp_handoff_decode(llama_context & target, llama_batch batch, int32_t first, const float * carry) {
     auto & source = target.mtp_hidden;
     if (!source.ring || !source.rows || source.ring_first < 0 || cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP ||
@@ -3594,6 +3607,10 @@ void llama_set_ubatch_rows_callback(llama_context * target, void (*cb)(void * us
 
 bool llama_mtp_handoff_ready(llama_context * target, int32_t first, int32_t count) {
     return target && target->mtp_handoff_ready(first, count);
+}
+
+bool llama_mtp_handoff_row(llama_context * target, float * dst, int32_t row) {
+    return target && target->mtp_handoff_row(dst, row);
 }
 
 int llama_mtp_handoff_decode(llama_context * draft, llama_context * target, llama_batch batch, int32_t first, const float * carry) {

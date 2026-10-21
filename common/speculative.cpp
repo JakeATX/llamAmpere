@@ -2276,7 +2276,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             if (use_handoff) {
                 // the target copied this row to the host and released its pages after the ubatch
-                if (!llama_copy_embeddings_nextn(ctx_tgt, pending_h[seq_id].data(), output_offset + i_batch_end[seq_id], 1)) { return false; }
+                if (!llama_mtp_handoff_row(ctx_tgt, pending_h[seq_id].data(), output_offset + i_batch_end[seq_id])) { return false; }
                 continue;
             }
             if (!llama_copy_embeddings_nextn(ctx_tgt, pending_h[seq_id].data(), output_offset + i_batch_end[seq_id], 1) ||

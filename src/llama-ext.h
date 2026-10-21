@@ -23,6 +23,8 @@ LLAMA_API bool llama_mtp_handoff_init(struct llama_context * target);
 LLAMA_API void llama_set_ubatch_rows_callback(struct llama_context * target,
         void (*cb)(void * user, int32_t first, int32_t count), void * user);
 LLAMA_API bool llama_mtp_handoff_ready(struct llama_context * target, int32_t first, int32_t count);
+// copy one host row of the staged ubatch without reordering outputs (safe inside the target's decode call)
+LLAMA_API bool llama_mtp_handoff_row(struct llama_context * target, float * dst, int32_t row);
 // One sequence; token i reads the target row first + i - 1, token 0 reads carry when carry != NULL. -4 = use the host path.
 LLAMA_API int llama_mtp_handoff_decode(struct llama_context * draft, struct llama_context * target,
         struct llama_batch batch, int32_t first, const float * carry);

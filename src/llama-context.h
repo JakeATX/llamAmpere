@@ -198,6 +198,7 @@ struct llama_context {
     bool mtp_handoff_init();
     void mtp_handoff_capture(ggml_tensor * hidden, const llama_ubatch & ubatch);
     bool mtp_handoff_ready(int32_t first, int32_t count) const;
+    bool mtp_handoff_row(float * dst, int32_t row) const;
     void mtp_handoff_release();
     void set_ubatch_rows_callback(void (*cb)(void * user, int32_t first, int32_t count), void * user);
     int mtp_handoff_decode(llama_context & target, llama_batch batch, int32_t first, const float * carry);
