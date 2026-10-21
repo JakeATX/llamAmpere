@@ -441,11 +441,6 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
     }
 
     switch (op->op) {
-        case GGML_OP_MUL_MAT_ID:
-            if (ggml_exl3_bits(src0->type)) {
-                return ggml_cpu_exl3_enabled() && ggml_cpu_exl3_supported(op);
-            }
-            return true;
         case GGML_OP_CPY:
         case GGML_OP_SET_ROWS:
             return
@@ -471,6 +466,10 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
                    src1->type == ggml_get_type_traits_cpu(src0->type)->vec_dot_type ||
                    (src1->type == GGML_TYPE_BF16 && ggml_get_type_traits_cpu(src0->type)->vec_dot_type == GGML_TYPE_F32);
         case GGML_OP_MUL_MAT_ID:
+            if (ggml_exl3_bits(src0->type)) {
+                // opt-in EXL3 expert matmul (GGML_CPU_EXL3=1)
+                return ggml_cpu_exl3_enabled() && ggml_cpu_exl3_supported(op);
+            }
             if (ggml_ai4_rate(src0->type) != 0) {
                 // slab reference path: 3-D expert stack, f32 activations
                 return src1->type == GGML_TYPE_F32 && src0->ne[3] == 1 &&

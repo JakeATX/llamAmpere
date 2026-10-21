@@ -1512,7 +1512,7 @@ bool ggml_cuda_exl3_glue_fold_enabled() {
         const char * e = getenv("GGML_CUDA_EXL3_GLUE_FOLD");
         return e == nullptr || atoi(e) != 0;
     }();
-    return enabled && !exl3_gemv_fused_enabled() && !exl3_envelope_enabled();
+    return enabled && !exl3_gemv_fused_enabled();
 }
 
 float ggml_cuda_exl3_x_scale() {
