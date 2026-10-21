@@ -7607,6 +7607,96 @@ static int ggml_cuda_try_fuse_shexp_gate(ggml_backend_cuda_context & ctx, ggml_c
     return 3;
 }
 
+// [HCPD] GGML_CUDA_HC_POST_DOWN=1 (opt-in): the identity-comb DSV4_HC_POST whose output is the next DSV4_HC_DOWN's
+// input (through RESHAPE/VIEW nodes) runs inside that down kernel (ggml_cuda_op_dsv4_hc_post_down in hc-fused.cu),
+// which writes the hc_post output too, so one launch and one read of it go away. Same values bit for bit.
+// GGML_CUDA_HC_POST_DOWN_DEBUG=1 logs the first refusal of each kind and the first fold.
+static bool ggml_cuda_hc_post_down_enabled() {
+    static const bool enabled = [] { const char * e = getenv("GGML_CUDA_HC_POST_DOWN"); return e != nullptr && atoi(e) != 0; }();
+    return enabled;
+}
+
+// the index of the DSV4_HC_DOWN that hc_post node i may fold into, or -1 (graph shape only)
+static int ggml_cuda_hc_post_down_target(const ggml_cgraph * cgraph, int i) {
+    const ggml_tensor * hpost = cgraph->nodes[i];
+    if (hpost->op != GGML_OP_DSV4_HC_POST || hpost->src[3] != nullptr || hpost->type != GGML_TYPE_F32) {
+        return -1;
+    }
+    int c = i + 1;
+    while (c < cgraph->n_nodes && c < i + 9 &&
+            (cgraph->nodes[c]->op == GGML_OP_RESHAPE || cgraph->nodes[c]->op == GGML_OP_VIEW)) {
+        ++c;
+    }
+    if (c >= cgraph->n_nodes || cgraph->nodes[c]->op != GGML_OP_DSV4_HC_DOWN) {
+        return -1;
+    }
+    const ggml_tensor * x = cgraph->nodes[c]->src[0];
+    if (x != hpost && !(x->view_src == hpost && x->view_offs == 0)) {
+        return -1;
+    }
+    return c;
+}
+
+static int ggml_cuda_try_fuse_hc_post_down(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
+    if (!ggml_cuda_hc_post_down_enabled() || cgraph->nodes[i]->op != GGML_OP_DSV4_HC_POST) {
+        return -1;
+    }
+    static const bool dbg = [] { const char * e = getenv("GGML_CUDA_HC_POST_DOWN_DEBUG"); return e != nullptr && atoi(e) != 0; }();
+    static std::set<std::string> seen;
+    const auto refuse = [&](const char * why) {
+        if (dbg && seen.insert(why).second) {
+            GGML_LOG_WARN("[hc post down] %s refused: %s\n", cgraph->nodes[i]->name, why);
+        }
+        return -1;
+    };
+    const int c = ggml_cuda_hc_post_down_target(cgraph, i);
+    if (c < 0) {
+        return refuse("not followed by an hc_down of its output");
+    }
+    if (!ctx.stream_context().concurrent_events.empty()) {
+        return refuse("concurrent streams");
+    }
+    ggml_tensor * hpost = cgraph->nodes[i];
+    ggml_tensor * down  = cgraph->nodes[c];
+    if (!ggml_cuda_dsv4_hc_post_down_supported(hpost, down)) {
+        return refuse("shapes, types or alignment");
+    }
+    const auto local = [&](const ggml_tensor * t) {
+        return t->buffer && ggml_backend_buffer_is_cuda(t->buffer) &&
+            static_cast<ggml_backend_cuda_buffer_context *>(t->buffer->context)->device == ctx.device;
+    };
+    const auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const char * ap = (const char *) a->data, * bp = (const char *) b->data;
+        return ap < bp + ggml_nbytes(b) && bp < ap + ggml_nbytes(a);
+    };
+    for (const ggml_tensor * t : { (const ggml_tensor *) hpost, (const ggml_tensor *) down,
+                                   (const ggml_tensor *) hpost->src[0], (const ggml_tensor *) hpost->src[1],
+                                   (const ggml_tensor *) hpost->src[2] }) {
+        if (!local(t)) {
+            return refuse("tensor not on this device");
+        }
+    }
+    // the down kernel reads the hc_post inputs in every row block while row block 0 writes h and every block writes dn
+    for (const ggml_tensor * out : { (const ggml_tensor *) hpost, (const ggml_tensor *) down }) {
+        for (int s = 0; s < 3; ++s) {
+            if (overlaps(out, hpost->src[s])) {
+                return refuse("an output overlaps an hc_post input");
+            }
+        }
+    }
+    if (overlaps(hpost, down)) {
+        return refuse("hc_post output overlaps the down output");
+    }
+    ggml_cuda_op_dsv4_hc_post_down(ctx, hpost, down);
+    static bool logged_ok = false;
+    if (dbg && !logged_ok) {
+        logged_ok = true;
+        GGML_LOG_WARN("[hc post down] folded %s into %s (%lld tokens, %d nodes)\n", hpost->name, down->name,
+                (long long) hpost->ne[2], c - i + 1);
+    }
+    return c - i;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     if (ggml_cuda_fusion_disabled()) {
@@ -7643,6 +7733,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         const int n_shg = ggml_cuda_try_fuse_shexp_gate(*cuda_ctx, cgraph, i);
         if (n_shg >= 0) {
             return n_shg;
+        }
+    }
+
+    {
+        const int n_hpd = ggml_cuda_try_fuse_hc_post_down(*cuda_ctx, cgraph, i);
+        if (n_hpd >= 0) {
+            return n_hpd;
         }
     }
 
@@ -9074,6 +9171,21 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 params->add_alloc_dep(params->user_data, hpost->src[s], cgraph->nodes[last]);
             }
             i = last;
+        }
+    }
+
+    // [HCPD] GGML_CUDA_HC_POST_DOWN: the down kernel reads the hc_post inputs, so they stay allocated until it has run
+    // (the down output could otherwise be placed over them; the fold still refuses any overlap at eval)
+    if (!disable_fusion && ggml_cuda_hc_post_down_enabled()) {
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            const int c = ggml_cuda_hc_post_down_target(cgraph, i);
+            if (c < 0) {
+                continue;
+            }
+            ggml_tensor * hpost = cgraph->nodes[i];
+            for (int s = 0; s < 3; ++s) {
+                params->add_alloc_dep(params->user_data, hpost->src[s], cgraph->nodes[c]);
+            }
         }
     }
 

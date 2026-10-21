@@ -14,6 +14,10 @@
 //                 registers.
 // Activations stay f32 throughout (the unfused mul_mat_f rounds them to BF16 first), so results differ from the
 // unfused graph by rounding only.
+// [HCPD] GGML_CUDA_HC_POST_DOWN=1 (opt-in; graph match ggml_cuda_try_fuse_hc_post_down in ggml-cuda.cu): the identity-
+// comb hc_post that produces the mix input (h = block_out*post + residual per stream) runs inside down_partial. Every
+// CTA computes the h values it stages from the hc_post inputs, row block 0 writes them to the hc_post output for
+// up_gate and the later readers, and the expression is dsv4_hc_post_f32<false>'s, so h is the same float bit for bit.
 
 #include "hc-fused.cuh"
 
@@ -39,12 +43,40 @@ static constexpr int HCF_CNT_SLOTS = 16;
 static constexpr int HCF_CNT_RB    = 64;   // max row blocks: n_rows <= 64*32
 static __device__ unsigned int hcf_arrive[HCF_CNT_SLOTS*HCF_CNT_RB];
 
+// [HCPD] hc_post inputs folded into down_partial: blk [n_embd, T] (row stride sb1), post [hc, T] (strides sp0, sp1),
+// residual and h contiguous [n_embd, hc, T] like x
+struct hcf_post_fold {
+    const float * blk;
+    const float * post;
+    const float * res;
+    float *       h;
+    int64_t       sb1;
+    int64_t       sp0;
+    int64_t       sp1;
+};
+
+// dsv4_hc_post_f32<false>'s value: its b*p + r compiles to one fused multiply-add (FFMA.FTZ in its SASS), so this
+// spells the same single rounding out instead of leaving it to contraction
+static __device__ __forceinline__ float hcf_post_val(const float b, const float p, const float r) {
+    return __fmaf_rn(b, p, r);
+}
+
+// four h values of token t at columns j..j+3 of stream s (i0 = j - s*n_embd), from the hc_post inputs
+static __device__ __forceinline__ float4 hcf_post_val4(const hcf_post_fold & pf, const int t, const int s, const int i0,
+        const int j, const int hc_dim) {
+    const float4 bv = *(const float4 *) (pf.blk + (int64_t) t*pf.sb1 + i0);
+    const float  pv = pf.post[s*pf.sp0 + t*pf.sp1];
+    const float4 rv = *(const float4 *) (pf.res + (int64_t) t*hc_dim + j);
+    return make_float4(hcf_post_val(bv.x, pv, rv.x), hcf_post_val(bv.y, pv, rv.y),
+                       hcf_post_val(bv.z, pv, rv.z), hcf_post_val(bv.w, pv, rv.w));
+}
+
 // grid (ceil(n_rows/32), n_chunks), block 256
 // P   [n_chunks][n_rows][T]       partial dot products (without r)
 // ssq [row block][n_chunks][T]    partial sums of x^2 (only row block 0 when cnt == nullptr)
 // cnt != nullptr: the last CTA to finish a row block (over all chunks) also runs the finish for its 32 rows
 // (same sums in the same order as hcf_down_finish, so the result is bit-identical to the two-kernel path).
-template <int T>
+template <int T, bool FOLD>
 static __global__ void __launch_bounds__(HCF_DOWN_WARPS*WARP_SIZE)
 hcf_down_partial(
         const float * __restrict__ x, const float * __restrict__ wn,
@@ -53,7 +85,7 @@ hcf_down_partial(
         const int R, const int n_rows, const int hc_dim,
         float * __restrict__ P, float * __restrict__ ssq,
         const int cnt_off, const int n_embd, const float eps, const float lo_scale, const float inj_scale,
-        float * __restrict__ dst) {
+        float * __restrict__ dst, const hcf_post_fold pf) {
     __shared__ float4 xs[T][HCF_CHUNK/4];
     __shared__ float  rr[4][T];
     __shared__ int    last_s;
@@ -89,10 +121,22 @@ hcf_down_partial(
         }
     }
 
+    // a chunk never straddles two streams (n_embd is a multiple of HCF_CHUNK)
+    const int s_c  = j0 / n_embd;
+    const int i0_c = j0 - s_c*n_embd;
+
     for (int idx = threadIdx.x; idx < T*(HCF_CHUNK/4); idx += blockDim.x) {
         const int t = idx / (HCF_CHUNK/4);
         const int e = idx % (HCF_CHUNK/4);
-        const float4 xv = *((const float4 *) (x + (int64_t) t*hc_dim + j0) + e);
+        float4 xv;
+        if constexpr (FOLD) {
+            xv = hcf_post_val4(pf, t, s_c, i0_c + 4*e, j0 + 4*e, hc_dim);
+            if (blockIdx.x == 0) {
+                *((float4 *) (pf.h + (int64_t) t*hc_dim + j0) + e) = xv;
+            }
+        } else {
+            xv = *((const float4 *) (x + (int64_t) t*hc_dim + j0) + e);
+        }
         const float4 gv = *((const float4 *) (wn + j0) + e);
         xs[t][e] = make_float4(xv.x*gv.x, xv.y*gv.y, xv.z*gv.z, xv.w*gv.w);
     }
@@ -102,7 +146,13 @@ hcf_down_partial(
         float s = 0.0f;
 #pragma unroll
         for (int it = 0; it < HCF_CHUNK/4/WARP_SIZE; ++it) {
-            const float4 v = xr[it*WARP_SIZE + lane];
+            float4 v;
+            if constexpr (FOLD) {
+                const int e = it*WARP_SIZE + lane;
+                v = hcf_post_val4(pf, warp, s_c, i0_c + 4*e, j0 + 4*e, hc_dim);
+            } else {
+                v = xr[it*WARP_SIZE + lane];
+            }
             s += v.x*v.x + v.y*v.y + v.z*v.z + v.w*v.w;
         }
         s = warp_reduce_sum(s);
@@ -428,7 +478,7 @@ static int hcf_cnt_slot(const ggml_backend_cuda_context & ctx) {
 }
 
 template <int T>
-static void hcf_down_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+static void hcf_down_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_tensor * hpost) {
     const ggml_tensor * x  = dst->src[0];
     const ggml_tensor * wn = dst->src[1];
     const ggml_tensor * wd = dst->src[2];
@@ -459,12 +509,24 @@ static void hcf_down_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     ggml_cuda_pool_alloc<float> ssq(ctx.pool(), (size_t) (cnt_off >= 0 ? n_rb : 1)*n_chunks*T);
 
     const dim3 grid(n_rb, n_chunks, 1);
-    hcf_down_partial<T><<<grid, HCF_DOWN_WARPS*WARP_SIZE, 0, stream>>>(
+    hcf_post_fold pf = {};
+    if (hpost != nullptr) {
+        pf.blk  = (const float *) hpost->src[0]->data;
+        pf.res  = (const float *) hpost->src[1]->data;
+        pf.post = (const float *) hpost->src[2]->data;
+        pf.h    = (float *) hpost->data;
+        pf.sb1  = hpost->src[0]->nb[1]/sizeof(float);
+        pf.sp0  = hpost->src[2]->nb[0]/sizeof(float);
+        pf.sp1  = hpost->src[2]->nb[1]/sizeof(float);
+        GGML_ASSERT(pf.h == x->data);
+    }
+    auto kernel = hpost != nullptr ? hcf_down_partial<T, true> : hcf_down_partial<T, false>;
+    kernel<<<grid, HCF_DOWN_WARPS*WARP_SIZE, 0, stream>>>(
         (const float *) x->data, (const float *) wn->data,
         (const char *) wd->data, wd->nb[1],
         wi ? (const char *) wi->data : nullptr, wi ? wi->nb[1] : 0,
         R, n_rows, hc_dim, P.get(), ssq.get(),
-        cnt_off, n_embd, eps, lo_scale, inj_scale, (float *) dst->data);
+        cnt_off, n_embd, eps, lo_scale, inj_scale, (float *) dst->data, pf);
 
     if (cnt_off < 0) {
         const int n_out = (n_rows + hc)*T;
@@ -514,7 +576,29 @@ static void hcf_up_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     }
 
 void ggml_cuda_op_dsv4_hc_down(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    HCF_DISPATCH(hcf_down_launch, (int) dst->src[0]->ne[2], ctx, dst);
+    HCF_DISPATCH(hcf_down_launch, (int) dst->src[0]->ne[2], ctx, dst, nullptr);
+}
+
+bool ggml_cuda_dsv4_hc_post_down_supported(const ggml_tensor * hpost, const ggml_tensor * down) {
+    const ggml_tensor * x   = down->src[0];
+    const ggml_tensor * blk = hpost->src[0];
+    const ggml_tensor * res = hpost->src[1];
+    const ggml_tensor * pw  = hpost->src[2];
+    const int64_t E = x->ne[0], hc = x->ne[1], T = x->ne[2];
+    const auto f32 = [](const ggml_tensor * t) { return t != nullptr && t->type == GGML_TYPE_F32 && t->nb[0] == sizeof(float); };
+    return ggml_cuda_dsv4_hc_down_supported(down) && hpost->src[3] == nullptr &&
+        f32(hpost) && f32(blk) && f32(res) && f32(pw) && x->data == hpost->data &&
+        ggml_is_contiguous(hpost) && ggml_nelements(hpost) == ggml_nelements(x) &&
+        hpost->ne[0] == E && hpost->ne[1] == hc && hpost->ne[2] == T && hpost->ne[3] == 1 &&
+        blk->ne[0] == E && blk->ne[1] == T && blk->ne[2] == 1 && blk->ne[3] == 1 && blk->nb[1] % 16 == 0 &&
+        ((uintptr_t) blk->data) % 16 == 0 &&
+        ggml_is_contiguous(res) && res->ne[0] == E && res->ne[1] == hc && res->ne[2] == T && res->ne[3] == 1 &&
+        ((uintptr_t) res->data) % 16 == 0 &&
+        pw->ne[0] == hc && pw->ne[1] == T && pw->ne[2] == 1 && pw->ne[3] == 1;
+}
+
+void ggml_cuda_op_dsv4_hc_post_down(ggml_backend_cuda_context & ctx, const ggml_tensor * hpost, ggml_tensor * down) {
+    HCF_DISPATCH(hcf_down_launch, (int) down->src[0]->ne[2], ctx, down, hpost);
 }
 
 void ggml_cuda_op_dsv4_hc_up(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
