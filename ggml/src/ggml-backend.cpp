@@ -20,6 +20,7 @@
 #include <condition_variable>
 #include <mutex>
 #include <thread>
+#include <string>
 #include <vector>
 
 #if defined(__linux__)
@@ -156,6 +157,7 @@ static std::vector<ggml_moe_cache_api> ggml_moe_cache_provider_candidates(
 #include <algorithm>
 #include <mutex>
 #include <unordered_map>
+#include <string>
 #include <vector>
 
 #ifdef __APPLE__
@@ -2964,7 +2966,110 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
     }
 }
 
+
+// [VFLOOR] GGML_SCHED_VF_TIMING=1: host time per scheduler phase and per split of small-batch graphs
+// (>1000 nodes, first GET_ROWS gathers <= 128 rows, i.e. decode/verify calls). Clock reads only.
+struct ggml_sched_vf_stats {
+    static constexpr int MAX_SPLITS = 16;
+    uint64_t calls = 0;
+    double enter = 0, devcheck = 0, xs = 0, leave = 0, total = 0;
+    double copy[MAX_SPLITS] = {}, comp[MAX_SPLITS] = {};
+    int    nodes[MAX_SPLITS] = {};
+    const char * name[MAX_SPLITS] = {};
+    const char * first[MAX_SPLITS] = {};
+    int n_splits = 0;
+    uint64_t slow_leave = 0; double slow_leave_ms = 0;
+};
+static bool ggml_sched_vf_timing() {
+    static const bool on = getenv("GGML_SCHED_VF_TIMING") != nullptr && atoi(getenv("GGML_SCHED_VF_TIMING")) != 0;
+    return on;
+}
+static thread_local ggml_sched_vf_stats * t_vf_cur = nullptr;
+static thread_local int64_t t_vf_mark = 0;
+static inline double ggml_sched_vf_lap() {
+    const int64_t now = ggml_time_us();
+    const double d = (now - t_vf_mark) / 1000.0;
+    t_vf_mark = now;
+    return d;
+}
+static ggml_sched_vf_stats * ggml_sched_vf_select(ggml_backend_sched_t sched) {
+    if (!ggml_sched_vf_timing()) {
+        return nullptr;
+    }
+    int total = 0;
+    const ggml_tensor * gr = nullptr;
+    for (int i = 0; i < sched->n_splits; ++i) {
+        total += sched->splits[i].graph.n_nodes;
+        for (int j = 0; !gr && j < sched->splits[i].graph.n_nodes; ++j) {
+            if (sched->splits[i].graph.nodes[j]->op == GGML_OP_GET_ROWS) {
+                gr = sched->splits[i].graph.nodes[j];
+            }
+        }
+    }
+    if (total <= 1000 || !gr || gr->ne[1] > 128) {
+        return nullptr;
+    }
+    static std::mutex mu;
+    static std::vector<std::pair<ggml_backend_sched_t, ggml_sched_vf_stats *>> all;
+    std::lock_guard<std::mutex> lock(mu);
+    for (auto & e : all) {
+        if (e.first == sched) {
+            return e.second;
+        }
+    }
+    all.emplace_back(sched, new ggml_sched_vf_stats());
+    return all.back().second;
+}
+static void ggml_sched_vf_report(ggml_backend_sched_t sched, ggml_sched_vf_stats & st) {
+    if (st.calls % 128 != 0) {
+        return;
+    }
+    const double n = (double) st.calls;
+    std::string line;
+    char buf[256];
+    snprintf(buf, sizeof(buf), "vfloor sched (GGML_SCHED_VF_TIMING) sched %p, %llu calls, ms/call: enter %.3f devcheck %.3f xs-begin %.3f leave %.3f (calls with leave>1ms: %llu, %.1f ms each) total %.3f; splits:",
+            (void *) sched, (unsigned long long) st.calls, st.enter/n, st.devcheck/n, st.xs/n, st.leave/n,
+            (unsigned long long) st.slow_leave, st.slow_leave ? st.slow_leave_ms/st.slow_leave : 0.0, st.total/n);
+    line += buf;
+    for (int i = 0; i < st.n_splits && i < ggml_sched_vf_stats::MAX_SPLITS; ++i) {
+        snprintf(buf, sizeof(buf), " [%d %s %d nodes from %.24s: copy %.3f compute %.3f]", i, st.name[i] ? st.name[i] : "?",
+                st.nodes[i], st.first[i] ? st.first[i] : "", st.copy[i]/n, st.comp[i]/n);
+        line += buf;
+    }
+    GGML_LOG_INFO("%s\n", line.c_str());
+}
+
+static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sched_t sched);
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
+    ggml_sched_vf_stats * vf = ggml_sched_vf_select(sched);
+    if (!vf) {
+        return ggml_backend_sched_compute_splits_impl(sched);
+    }
+    const int64_t t0 = ggml_time_us();
+    t_vf_cur = vf;
+    t_vf_mark = t0;
+    const enum ggml_status st = ggml_backend_sched_compute_splits_impl(sched);
+    const double leave = ggml_sched_vf_lap();   // the moe-cache scope destructor ran after the last mark
+    t_vf_cur = nullptr;
+    vf->leave += leave;
+    if (leave > 1.0) {
+        vf->slow_leave++;
+        vf->slow_leave_ms += leave;
+    }
+    vf->total += (ggml_time_us() - t0) / 1000.0;
+    vf->n_splits = sched->n_splits;
+    for (int i = 0; i < sched->n_splits && i < ggml_sched_vf_stats::MAX_SPLITS; ++i) {
+        vf->nodes[i] = sched->splits[i].graph.n_nodes;
+        vf->name[i] = ggml_backend_name(sched->backends[sched->splits[i].backend_id]);
+        vf->first[i] = sched->splits[i].graph.n_nodes > 0 ? sched->splits[i].graph.nodes[0]->name : "";
+    }
+    vf->calls++;
+    ggml_sched_vf_report(sched, *vf);
+    return st;
+}
+
+static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
 
@@ -2995,6 +3100,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                   sched->moe_cache_api.session_enter,
                   sched->moe_cache_api.session_leave,
                   sched->moe_cache_api);
+    if (t_vf_cur) { t_vf_cur->enter += ggml_sched_vf_lap(); }
 
     if (sched->moe_cache_device_graph) {
         for (int i = 0; i < sched->n_splits; ++i) {
@@ -3011,9 +3117,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
     }
 
+    if (t_vf_cur) { t_vf_cur->devcheck += ggml_sched_vf_lap(); }
     int prev_backend_id = -1;
 
     ggml_sched_xs_begin(sched);
+    if (t_vf_cur) { t_vf_cur->xs += ggml_sched_vf_lap(); }
     struct xs_scope {
         ggml_backend_sched_t sched;
         ~xs_scope() { ggml_sched_xs_end(sched); }
@@ -3050,6 +3158,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
             }
         }
+        if (t_vf_cur && split_id < ggml_sched_vf_stats::MAX_SPLITS) { t_vf_cur->copy[split_id] += ggml_sched_vf_lap(); }
 
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
@@ -3091,6 +3200,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         ggml_sched_xs_consumed(sched, split_id, split_backend);
+        if (t_vf_cur && split_id < ggml_sched_vf_stats::MAX_SPLITS) { t_vf_cur->comp[split_id] += ggml_sched_vf_lap(); }
 
         // record the event of this split
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {

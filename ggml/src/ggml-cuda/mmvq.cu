@@ -1358,7 +1358,13 @@ static __global__ void mul_mat_vec_q_moe(
         const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
         const uint32_t ncols_dst, const uint32_t ids_stride,
         const float up_min, const float up_max, const float gate_min, const float gate_max,
-        const void * const * expert_table, const void * const * gate_table) {
+        const void * const * expert_table, const void * const * gate_table, const bool rank_major) {
+    // [VFLOOR] rank_major (GGML_MOE_MMV_RANK_MAJOR=1): the grid is (ranks, row blocks) instead of (row blocks, ranks),
+    // so the blocks of every rank for one row block run together and tokens that share an expert read its rows from L2.
+    // Every output keeps the same arithmetic (bit-identical); only the block order changes.
+    const uint32_t blk_row  = rank_major ? blockIdx.y : blockIdx.x;
+    const uint32_t blk_rank = rank_major ? blockIdx.x : blockIdx.y;
+    const uint32_t n_rank   = rank_major ? gridDim.x  : gridDim.y;
     const void    * GGML_CUDA_RESTRICT vx  = vx_ptr;
     const void    * GGML_CUDA_RESTRICT vy  = vy_ptr;
     const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
@@ -1373,7 +1379,7 @@ static __global__ void mul_mat_vec_q_moe(
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
 
-    const bool shared_expert = has_fusion && fusion.shared_up && blockIdx.y == gridDim.y - 1;
+    const bool shared_expert = has_fusion && fusion.shared_up && blk_rank == n_rank - 1;
     if (shared_expert) {
         vx = fusion.shared_up;
         dst = fusion.shared_dst;
@@ -1404,11 +1410,11 @@ static __global__ void mul_mat_vec_q_moe(
     }
 
     const uint32_t token_idx   = threadIdx.y;
-    const int      row0        = c_rows_per_block*blockIdx.x;
+    const int      row0        = c_rows_per_block*blk_row;
     const int      blocks_per_row_x = ncols_x / qk;
     constexpr int  blocks_per_iter  = vdr * warp_size / qi;
 
-    const uint32_t channel_dst = shared_expert ? 0 : blockIdx.y;
+    const uint32_t channel_dst = shared_expert ? 0 : blk_rank;
 
     if (token_idx >= ncols_dst) {
         return;
@@ -1648,7 +1654,10 @@ static void mul_mat_vec_q_moe_launch(
 
     constexpr int rows_per_block = 2; // 2 gives best perf based on tuning
     const int64_t nblocks_rows = (nrows_x + rows_per_block - 1) / rows_per_block;
-    const dim3 block_nums(nblocks_rows, nchannels_dst + (fusion.shared_up != nullptr));
+    static const bool rank_major_env = [] { const char * e = getenv("GGML_MOE_MMV_RANK_MAJOR"); return e && atoi(e) != 0; }();
+    const int64_t nranks = nchannels_dst + (fusion.shared_up != nullptr);
+    const bool rank_major = rank_major_env && nblocks_rows <= 65535;
+    const dim3 block_nums = rank_major ? dim3(nranks, nblocks_rows) : dim3(nblocks_rows, nranks);
     const dim3 block_dims(warp_size, ncols_dst);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
 
@@ -1656,7 +1665,7 @@ static void mul_mat_vec_q_moe_launch(
         vx, vy, ids, act_ids, gate_ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
         stride_row_x, stride_col_y, stride_col_dst,
         stride_channel_x, stride_channel_y, stride_channel_dst,
-        ncols_dst, ids_stride, up_min, up_max, gate_min, gate_max, expert_table, gate_table);
+        ncols_dst, ids_stride, up_min, up_max, gate_min, gate_max, expert_table, gate_table, rank_major);
 }
 
 // Indexed vocabulary rows share one activation vector and never read padded rows.

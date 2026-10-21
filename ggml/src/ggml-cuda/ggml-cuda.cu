@@ -4662,6 +4662,28 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
 }
 
 #ifdef USE_CUDA_GRAPH
+// [VFLOOR] GGML_CUDA_VF_TIMING=1: host cost of the CUDA graph replay path for large graphs (> 1000 nodes, i.e.
+// the target verify), split into compatibility check, update check, cudaGraphLaunch and the moe-cache record.
+// Off by default; it only reads the clock. Printed every 128 launches.
+static bool ggml_cuda_vf_timing() {
+    static const bool v = [] { const char * e = getenv("GGML_CUDA_VF_TIMING"); return e && atoi(e) != 0; }();
+    return v;
+}
+static void ggml_cuda_vf_timing_add(const ggml_cgraph * cgraph, int phase, int64_t us) {
+    if (cgraph->n_nodes <= 1000) {
+        return;
+    }
+    static int64_t acc[4] = {};
+    static int64_t n[4] = {};
+    acc[phase] += us;
+    n[phase]++;
+    if (phase == 3 && n[3] % 128 == 0) {
+        GGML_LOG_INFO("vfloor cuda graph host (GGML_CUDA_VF_TIMING) %lld launches, ms/call: compat %.3f (n %lld) update-check %.3f (n %lld) cudaGraphLaunch %.3f moe-record %.3f\n",
+                (long long) n[3], acc[0] / 1e3 / std::max<int64_t>(1, n[0]), (long long) n[0], acc[1] / 1e3 / std::max<int64_t>(1, n[1]), (long long) n[1],
+                acc[2] / 1e3 / std::max<int64_t>(1, n[2]), (acc[3] - acc[2]) / 1e3 / std::max<int64_t>(1, n[3]));
+    }
+}
+
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
     bool use_cuda_graph = true;
@@ -7880,8 +7902,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
         }
         // Launch graph
+        const int64_t vf_t2 = ggml_cuda_vf_timing() ? ggml_time_us() : 0;
         CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+        if (vf_t2) {
+            ggml_cuda_vf_timing_add(cgraph, 2, ggml_time_us() - vf_t2);
+        }
         ggml_cuda_moe_cache_device_graph_record(cuda_ctx->device, cuda_graph_update_required, cgraph);
+        if (vf_t2) {
+            ggml_cuda_vf_timing_add(cgraph, 3, ggml_time_us() - vf_t2);
+        }
 #else
         GGML_UNUSED(graph_key);
         graph_evaluated_or_captured = true;
@@ -7931,9 +7960,17 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         if (graph->is_enabled()) {
+            const int64_t vf_t0 = ggml_cuda_vf_timing() ? ggml_time_us() : 0;
             const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
+            const int64_t vf_t1 = vf_t0 ? ggml_time_us() : 0;
+            if (vf_t0) {
+                ggml_cuda_vf_timing_add(cgraph, 0, vf_t1 - vf_t0);
+            }
             if (graph_compatible) {
                 const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
+                if (vf_t0) {
+                    ggml_cuda_vf_timing_add(cgraph, 1, ggml_time_us() - vf_t1);
+                }
 
                 if (!graph->warmup_complete) {
                     // Warmup: need at least 2 calls with no property change on the 2nd call
