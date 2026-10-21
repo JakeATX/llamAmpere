@@ -8,6 +8,7 @@
 #include "mmvq-iq4xs-wide.cuh"
 #endif
 
+#include <climits>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -1358,6 +1359,211 @@ static __global__ void mul_mat_vec_q(
         GGML_UNUSED_VARS(use_scale, use_gate_scale, x_scale, gate_scale, x_scales, gate_scales);
     }
 }
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+// fork: keep each route's DP4A sequence while sharing the weight decoder across routes.
+template<ggml_type type, int cols>
+static __device__ __forceinline__ void moe_grouped_dot(
+        const void * weights, const block_q8_1 * const (&y)[cols], const int kbx, const int iqs,
+        float (&dots)[cols]) {
+    int sumi[cols] = {};
+    if constexpr (type == GGML_TYPE_IQ3_S) {
+        const block_iq3_s * w = (const block_iq3_s *) weights + kbx;
+        const int2 packed = make_int2(get_int_b2(w->qs, iqs), get_int_b2(w->qs, iqs + 1));
+        const uint8_t * qs = (const uint8_t *) &packed;
+        const int qh = w->qh[iqs/2];
+        const int packed_signs = get_int_b2(w->signs, iqs/2);
+        const uint8_t * signs = (const uint8_t *) &packed_signs;
+#pragma unroll
+        for (int l = 0; l < 8; l += 2) {
+            const int lo = iq3s_grid[qs[l]     | ((qh << (8 - l)) & 0x100)];
+            const int hi = iq3s_grid[qs[l + 1] | ((qh << (7 - l)) & 0x100)];
+            const int s0 = __vcmpne4(((signs[l/2] & 0x03) << 7) | ((signs[l/2] & 0x0C) << 21), 0);
+            const int s1 = __vcmpne4(((signs[l/2] & 0x30) << 3) | ((signs[l/2] & 0xC0) << 17), 0);
+            const int v0 = __vsub4(lo ^ s0, s0);
+            const int v1 = __vsub4(hi ^ s1, s1);
+#pragma unroll
+            for (int col = 0; col < cols; ++col) {
+                sumi[col] = ggml_cuda_dp4a(v0, get_int_b4(y[col][iqs/2].qs, l), sumi[col]);
+                sumi[col] = ggml_cuda_dp4a(v1, get_int_b4(y[col][iqs/2].qs, l + 1), sumi[col]);
+            }
+        }
+        const int scale = 1 + 2*((w->scales[iqs/4] >> ((iqs << 1) & 0x04)) & 0x0F);
+#pragma unroll
+        for (int col = 0; col < cols; ++col) {
+            sumi[col] *= scale;
+            const float d = __half2float(w->d) * __low2float(y[col][iqs/2].ds);
+            dots[col] = d * sumi[col];
+        }
+    } else if constexpr (type == GGML_TYPE_IQ4_NL) {
+        const block_iq4_nl * w = (const block_iq4_nl *) weights + kbx;
+#pragma unroll
+        for (int l = 0; l < VDR_Q4_0_Q8_1_MMVQ; ++l) {
+            const int2 v = get_int_from_table_16(get_int_b2(w->qs, iqs + l), kvalues_iq4nl);
+#pragma unroll
+            for (int col = 0; col < cols; ++col) {
+                const int * q8 = (const int *) y[col]->qs + iqs;
+                sumi[col] = ggml_cuda_dp4a(v.x, q8[l], sumi[col]);
+                sumi[col] = ggml_cuda_dp4a(v.y, q8[l + 4], sumi[col]);
+            }
+        }
+#pragma unroll
+        for (int col = 0; col < cols; ++col) {
+            const float d = __half2float(w->d) * __low2float(y[col]->ds);
+            dots[col] = d * sumi[col];
+        }
+    } else {
+        static_assert(type == GGML_TYPE_Q2_0, "unsupported grouped MoE type");
+        const block_q2_0 * w = (const block_q2_0 *) weights + kbx;
+        const int16_t * qs = (const int16_t *) w->qs + iqs*4;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int q = qs[j];
+            const int qe = __byte_perm(0x020100FF, 0x020100FF, q);
+            const int qo = __byte_perm(0x020100FF, 0x020100FF, q >> 2);
+            const int qx = __byte_perm(qe, qo, 0x5140);
+            const int qy = __byte_perm(qe, qo, 0x7362);
+#pragma unroll
+            for (int col = 0; col < cols; ++col) {
+                sumi[col] = ggml_cuda_dp4a(get_int_b4(y[col][iqs].qs, 2*j), qx, sumi[col]);
+                sumi[col] = ggml_cuda_dp4a(get_int_b4(y[col][iqs].qs, 2*j + 1), qy, sumi[col]);
+            }
+        }
+        const float d2 = w->d;
+#pragma unroll
+        for (int col = 0; col < cols; ++col) {
+            const float d8 = __low2float(y[col][iqs].ds);
+            dots[col] = d2 * d8 * sumi[col];
+        }
+    }
+}
+
+template<ggml_type type, int cols, bool fused>
+static __device__ __forceinline__ void moe_grouped_rows(
+        const void * weights, const void * gate, const block_q8_1 * act, const int * members,
+        float * dst, const int n_in, const int n_out, const int n_ids, const int channels) {
+    constexpr int qk = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr = get_vdr_mmvq(type);
+    const int row0 = 8*blockIdx.x + 2*threadIdx.y;
+    const int stride_y = GGML_PAD(n_in, MATRIX_ROW_PADDING) / QK8_1;
+    const block_q8_1 * y[cols];
+#pragma unroll
+    for (int col = 0; col < cols; ++col) {
+        const int route = members[col];
+        y[col] = act + (int64_t)((route / n_ids)*channels + (route % n_ids) % channels)*stride_y;
+    }
+    float sums[2][cols] = {};
+    float gates[2][cols] = {};
+    for (int k = threadIdx.x / (qi/vdr); k < n_in/qk; k += vdr*32/qi) {
+        const block_q8_1 * yk[cols];
+#pragma unroll
+        for (int col = 0; col < cols; ++col) {
+            yk[col] = y[col] + k*(qk/QK8_1);
+        }
+#pragma unroll
+        for (int row = 0; row < 2; ++row) {
+            if (row0 + row < n_out) {
+                float dots[cols];
+                const int kbx = (row0 + row)*(n_in/qk) + k;
+                const int iqs = vdr*(threadIdx.x % (qi/vdr));
+                moe_grouped_dot<type, cols>(weights, yk, kbx, iqs, dots);
+#pragma unroll
+                for (int col = 0; col < cols; ++col) {
+                    sums[row][col] += dots[col];
+                }
+                if constexpr (fused) {
+                    moe_grouped_dot<type, cols>(gate, yk, kbx, iqs, dots);
+#pragma unroll
+                    for (int col = 0; col < cols; ++col) {
+                        gates[row][col] += dots[col];
+                    }
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int row = 0; row < 2; ++row) {
+#pragma unroll
+        for (int col = 0; col < cols; ++col) {
+            sums[row][col] = warp_reduce_sum<32>(sums[row][col]);
+            if constexpr (fused) {
+                gates[row][col] = warp_reduce_sum<32>(gates[row][col]);
+            }
+        }
+    }
+    if (threadIdx.x < 2 && row0 + (int)threadIdx.x < n_out) {
+#pragma unroll
+        for (int col = 0; col < cols; ++col) {
+            float result = sums[threadIdx.x][col];
+            if constexpr (fused) {
+                result *= ggml_cuda_op_silu_single(gates[threadIdx.x][col]);
+            }
+            dst[members[col]*n_out + row0 + threadIdx.x] = result;
+        }
+    }
+}
+
+template<ggml_type type, bool fused>
+__launch_bounds__(128, 1)
+static __global__ void mul_mat_vec_q_moe_grouped(
+        const void * const * table, const void * const * gate_table, const block_q8_1 * act,
+        const int32_t * ids, float * dst, const int n_in, const int n_out,
+        const int n_ids, const int tokens, const int channels, const int ids_stride) {
+    __shared__ int selected[320];
+    __shared__ int members[320];
+    __shared__ int count;
+    ggml_cuda_pdl_sync();
+    const int tid = threadIdx.y*32 + threadIdx.x;
+    const int routes = n_ids*tokens;
+    for (int r = tid; r < routes; r += 128) {
+        selected[r] = ids[(int64_t)(r / n_ids)*ids_stride + r % n_ids];
+    }
+    __syncthreads();
+    if (tid == 0) {
+        count = 0;
+        bool leader = true;
+        for (int r = 0; r < (int)blockIdx.y; ++r) {
+            leader &= selected[r] != selected[blockIdx.y];
+        }
+        if (leader) {
+            for (int r = blockIdx.y; r < routes; ++r) {
+                if (selected[r] == selected[blockIdx.y]) {
+                    members[count++] = r;
+                }
+            }
+        }
+    }
+    __syncthreads();
+    if (count == 0) {
+        ggml_cuda_pdl_lc();
+        return;
+    }
+    const void * weights = table[selected[blockIdx.y]];
+    const void * gate = fused ? gate_table[selected[blockIdx.y]] : nullptr;
+    for (int first = 0; first < count; first += 4) {
+        const int left = count - first;
+        if (left >= 4) {
+            moe_grouped_rows<type, 4, fused>(weights, gate, act, members + first, dst, n_in, n_out, n_ids, channels);
+        } else if (left == 3) {
+            moe_grouped_rows<type, 3, fused>(weights, gate, act, members + first, dst, n_in, n_out, n_ids, channels);
+        } else if (left == 2) {
+            moe_grouped_rows<type, 2, fused>(weights, gate, act, members + first, dst, n_in, n_out, n_ids, channels);
+        } else {
+            moe_grouped_rows<type, 1, fused>(weights, gate, act, members + first, dst, n_in, n_out, n_ids, channels);
+        }
+    }
+    ggml_cuda_pdl_lc();
+}
+
+static __global__ void moe_grouped_check(const uint32_t * reference, const uint32_t * actual, const int count) {
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i < count && reference[i] != actual[i]) {
+        printf("grouped MoE bit mismatch: index=%d reference=%08x actual=%08x\n", i, reference[i], actual[i]);
+        asm volatile("trap;");
+    }
+}
+#endif
 
 // Dedicated MoE multi-token kernel.
 // Grid: (ceil(nrows_x / c_rows_per_block), nchannels_dst)
@@ -2810,6 +3016,66 @@ void ggml_cuda_moe_table_mmv_fused(const void * const * up_table, const void * c
         default: GGML_ABORT("unsupported fused mapped expert type");
     }
 #undef MOE_TABLE_FUSED_CASE
+}
+
+// fork: off by default; check mode compares the actual independent-route kernel on the same stream.
+bool ggml_cuda_moe_table_mmv_grouped_try(ggml_backend_cuda_context & ctx,
+        const void * const * table, const void * const * gate_table, ggml_type type,
+        const char * act_q8, const int32_t * ids, float * dst,
+        int64_t n_in, int64_t n_out, int64_t n_ids, int64_t n_tokens, int64_t channels, int64_t ids_stride) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    const char * env = getenv("GGML_MOE_MMV_GROUPED");
+    const bool check = env && (strcmp(env, "check") == 0 || strcmp(env, "2") == 0);
+    if (!env || (!check && strcmp(env, "1") != 0) || ggml_cuda_info().devices[ctx.device].cc != 860 ||
+            (type != GGML_TYPE_IQ3_S && type != GGML_TYPE_IQ4_NL && type != GGML_TYPE_Q2_0) ||
+            n_tokens < 2 || n_tokens > 5 || n_ids < 1 || n_ids > 64 || channels < 1 || channels > n_ids ||
+            n_in < 1 || n_in > INT_MAX - MATRIX_ROW_PADDING || n_in % ggml_blck_size(type) != 0 ||
+            n_out < 1 || n_out > INT_MAX / (n_ids*n_tokens) || n_out > INT_MAX / (n_in / ggml_blck_size(type)) ||
+            ids_stride < n_ids || ids_stride > INT_MAX / n_tokens) {
+        return false;
+    }
+    ggml_cuda_pool_alloc<float> reference(ctx.pool());
+    if (check) {
+        float * ref = reference.alloc((size_t)(n_out*n_ids*n_tokens));
+        if (gate_table) {
+            ggml_cuda_moe_table_mmv_fused(table, gate_table, type, act_q8, ids, ref,
+                    n_in, n_out, n_ids, n_tokens, channels, ids_stride, ctx.stream());
+        } else {
+            ggml_cuda_moe_table_mmv(table, type, act_q8, ids, ref,
+                    n_in, n_out, n_ids, n_tokens, channels, ids_stride, ctx.stream());
+        }
+        GGML_LOG_INFO("[moe-cache] grouped MMV check: type=%s tokens=%lld channels=%lld fused=%d\n",
+                ggml_type_name(type), (long long)n_tokens, (long long)channels, gate_table != nullptr);
+    }
+    const ggml_cuda_kernel_launch_params params(dim3((n_out + 7)/8, n_ids*n_tokens), dim3(32, 4), 0, ctx.stream());
+#define MOE_GROUPED_CASE(T) \
+    case T: \
+        if (gate_table) { \
+            ggml_cuda_kernel_launch(mul_mat_vec_q_moe_grouped<T, true>, params, table, gate_table, \
+                    (const block_q8_1 *)act_q8, ids, dst, (int)n_in, (int)n_out, (int)n_ids, (int)n_tokens, (int)channels, (int)ids_stride); \
+        } else { \
+            ggml_cuda_kernel_launch(mul_mat_vec_q_moe_grouped<T, false>, params, table, gate_table, \
+                    (const block_q8_1 *)act_q8, ids, dst, (int)n_in, (int)n_out, (int)n_ids, (int)n_tokens, (int)channels, (int)ids_stride); \
+        } \
+        break
+    switch (type) {
+        MOE_GROUPED_CASE(GGML_TYPE_IQ3_S);
+        MOE_GROUPED_CASE(GGML_TYPE_IQ4_NL);
+        MOE_GROUPED_CASE(GGML_TYPE_Q2_0);
+        default: GGML_ABORT("unsupported grouped MoE type");
+    }
+#undef MOE_GROUPED_CASE
+    if (check) {
+        const int count = n_out*n_ids*n_tokens;
+        moe_grouped_check<<<(count + 255LL)/256, 256, 0, ctx.stream()>>>(
+                (const uint32_t *)reference.get(), (const uint32_t *)dst, count);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+#else
+    GGML_UNUSED_VARS(ctx, table, gate_table, type, act_q8, ids, dst, n_in, n_out, n_ids, n_tokens, channels, ids_stride);
+    return false;
+#endif
 }
 
 template <ggml_type type>

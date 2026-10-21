@@ -5463,7 +5463,7 @@ static bool run_device_fused_tables(ggml_backend_t gpu, ggml_backend_t cpu, log_
 
 // fork: compare staging against the same fused CUDA kernels with no resident mask.
 static bool run_device_fused_missjoin(ggml_backend_t gpu, ggml_backend_t cpu, log_capture & capture,
-        bool overlap, bool mask_only, bool retain = false, bool fused = true) {
+        bool overlap, bool mask_only, bool retain = false, bool fused = true, bool grouped = false) {
     auto fusion_count = (int64_t (*)(ggml_backend_t, const char *)) ggml_backend_reg_get_proc_address(
             ggml_backend_dev_backend_reg(ggml_backend_get_device(gpu)), "ggml_backend_cuda_fusion_count");
     const auto api = active_api();
@@ -5496,16 +5496,19 @@ static bool run_device_fused_missjoin(ggml_backend_t gpu, ggml_backend_t cpu, lo
         {0, 0, 0, 0, 0, 0, 0, 0},
     };
     std::vector<unsigned long long> totals(6, 0);
-    std::vector<float> importance(n_in, 1.0f);
+    const int64_t input_width = grouped ? 5120 : n_in;
+    const int64_t output_rows = grouped ? 65 : n_out;
+    std::vector<float> importance(input_width, 1.0f);
     bool ok = true;
     bool saw_retained_eviction = false;
-    for (const auto type : {GGML_TYPE_Q4_0, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL}) {
+    for (const auto type : grouped ? std::vector<ggml_type>{GGML_TYPE_Q4_0, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL, GGML_TYPE_Q2_0} :
+            std::vector<ggml_type>{GGML_TYPE_Q4_0, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL}) {
         ggml_init_params weight_params = {3 * ggml_tensor_overhead(), nullptr, true};
         auto * weights_ctx = ggml_init(weight_params);
         ggml_tensor * weights[3] = {
-            ggml_new_tensor_3d(weights_ctx, type, n_in, n_out, n_expert),
-            ggml_new_tensor_3d(weights_ctx, type, n_in, n_out, n_expert),
-            overlap ? ggml_new_tensor_3d(weights_ctx, GGML_TYPE_Q4_0, n_out, n_in, n_expert) : nullptr,
+            ggml_new_tensor_3d(weights_ctx, type, input_width, output_rows, n_expert),
+            ggml_new_tensor_3d(weights_ctx, type, input_width, output_rows, n_expert),
+            overlap ? ggml_new_tensor_3d(weights_ctx, GGML_TYPE_Q4_0, output_rows, input_width, n_expert) : nullptr,
         };
         ggml_set_name(weights[0], "blk.7.ffn_up_exps.weight");
         ggml_set_name(weights[1], "blk.7.ffn_gate_exps.weight");
@@ -5524,21 +5527,26 @@ static bool run_device_fused_missjoin(ggml_backend_t gpu, ggml_backend_t cpu, lo
             const float * imatrix = ggml_quantize_requires_imatrix(w->type) ? importance.data() : nullptr;
             ok &= ggml_quantize_chunk(w->type, values.data(), quantized.data(),
                     0, w->ne[1] * w->ne[2], w->ne[0], imatrix) == quantized.size();
+            if (grouped && bank == 0) {
+                // All tested formats keep d first; one selected expert has a NaN in the last partial row block.
+                const uint16_t nan_scale = 0x7e01;
+                memcpy(quantized.data() + (output_rows - 1)*ggml_row_size(type, input_width), &nan_scale, sizeof(nan_scale));
+            }
             ggml_backend_tensor_set(w, quantized.data(), 0, quantized.size());
         }
-        for (int tokens : retain ? std::vector<int>{1, 3, 4, 5} : std::vector<int>{1, 3, 4}) {
-            for (int channels : {1, 2}) {
+        for (int tokens : (retain || grouped) ? std::vector<int>{1, 3, 4, 5} : std::vector<int>{1, 3, 4}) {
+            for (int channels : grouped ? std::vector<int>{1, 2, used} : std::vector<int>{1, 2}) {
                 ggml_init_params params = {8 * ggml_tensor_overhead(), nullptr, true};
                 ggml_context * input_ctx[] = {ggml_init(params), ggml_init(params)};
                 ggml_backend_t backends[] = {cpu, gpu};
                 ggml_tensor * acts[2], * ids[2], * storage[2];
                 ggml_backend_buffer_t buffers[2];
-                std::vector<float> activations(n_in * channels * tokens);
+                std::vector<float> activations(input_width * channels * tokens);
                 for (size_t i = 0; i < activations.size(); ++i) {
                     activations[i] = 0.2f * std::cos((float)i * 0.019f);
                 }
                 for (int i = 0; i < 2; ++i) {
-                    acts[i] = ggml_new_tensor_3d(input_ctx[i], GGML_TYPE_F32, n_in, channels, tokens);
+                    acts[i] = ggml_new_tensor_3d(input_ctx[i], GGML_TYPE_F32, input_width, channels, tokens);
                     storage[i] = ggml_new_tensor_2d(input_ctx[i], GGML_TYPE_I32, 512, tokens);
                     ids[i] = ggml_view_2d(input_ctx[i], storage[i], used, tokens, storage[i]->nb[1], 0);
                     buffers[i] = ggml_backend_alloc_ctx_tensors(input_ctx[i], backends[i]);
@@ -5572,6 +5580,7 @@ static bool run_device_fused_missjoin(ggml_backend_t gpu, ggml_backend_t cpu, lo
                 }
                 for (int staged = 0; staged < 2; ++staged) {
                     unsigned long long selected_misses = 0;
+                    set_env("GGML_MOE_MMV_GROUPED", grouped && staged ? "check" : nullptr);
                     set_env("GGML_MOE_CACHE_DEVICE_STATS", staged && !mask_only ? "1" : nullptr);
                     set_env("GGML_MOE_MISSJOIN_MASK", staged && mask_only ? "1" : nullptr);
                     capture.clear();
@@ -5588,7 +5597,19 @@ static bool run_device_fused_missjoin(ggml_backend_t gpu, ggml_backend_t cpu, lo
                             ok &= ggml_backend_graph_compute(gpu, candidate.graph) == GGML_STATUS_SUCCESS;
                             api.session_leave(session);
                             ggml_backend_tensor_get(candidate.out, actual.data(), 0, actual.size() * sizeof(float));
-                            ok &= compare_output(expected[phase], actual, 5e-4);
+                            if (grouped) {
+                                auto finite_expected = expected[phase];
+                                auto finite_actual = actual;
+                                for (size_t i = 0; i < actual.size(); ++i) {
+                                    if (std::isnan(finite_expected[i])) {
+                                        ok &= std::isnan(finite_actual[i]);
+                                        finite_expected[i] = finite_actual[i] = 0.0f;
+                                    }
+                                }
+                                ok &= compare_output(finite_expected, finite_actual, 5e-4);
+                            } else {
+                                ok &= compare_output(expected[phase], actual, 5e-4);
+                            }
                             if (!staged && run < phases) {
                                 control[phase] = actual;
                             } else {
@@ -5627,6 +5648,8 @@ static bool run_device_fused_missjoin(ggml_backend_t gpu, ggml_backend_t cpu, lo
                     }
                     const std::string log = capture.get();
                     ok &= max_field_value(log, "replays=") > 0;
+                    const bool grouped_expected = grouped && staged && tokens > 1 && type != GGML_TYPE_Q4_0;
+                    ok &= (log.find("grouped MMV check:") != std::string::npos) == grouped_expected;
                     if (staged && !mask_only && !retain) {
                         std::vector<unsigned long long> got(6, 0);
                         const size_t pos = log.rfind("[moe-cache] missjoin final: ");
@@ -5667,8 +5690,9 @@ static bool run_device_fused_missjoin(ggml_backend_t gpu, ggml_backend_t cpu, lo
         ggml_backend_buffer_free(weights_buffer);
         ggml_free(weights_ctx);
     }
+    set_env("GGML_MOE_MMV_GROUPED", nullptr);
     ok &= !retain || saw_retained_eviction;
-    printf("cache-device%s-missjoin%s%s%s: %s\n", fused ? "-fused" : "", overlap ? "-overlap" : "", mask_only ? "-mask" : "", retain ? "-retain" : "", ok ? "OK" : "FAIL");
+    printf("cache-device%s-missjoin%s%s%s%s: %s\n", fused ? "-fused" : "", overlap ? "-overlap" : "", mask_only ? "-mask" : "", retain ? "-retain" : "", grouped ? "-grouped" : "", ok ? "OK" : "FAIL");
     return ok;
 }
 
@@ -5984,13 +6008,20 @@ int main(int argc, char ** argv) {
     if (argc == 2 && (strcmp(argv[1], "--device-fused-missjoin-only") == 0 ||
             strcmp(argv[1], "--device-fused-missjoin-overlap-only") == 0 ||
             strcmp(argv[1], "--device-fused-missjoin-retain-only") == 0 ||
+            strcmp(argv[1], "--device-fused-missjoin-grouped-only") == 0 ||
+            strcmp(argv[1], "--device-missjoin-grouped-only") == 0 ||
             strcmp(argv[1], "--device-missjoin-retain-only") == 0 ||
             strcmp(argv[1], "--device-fused-missjoin-mask-only") == 0)) {
         const bool overlap = strcmp(argv[1], "--device-fused-missjoin-overlap-only") == 0;
         const bool mask_only = strcmp(argv[1], "--device-fused-missjoin-mask-only") == 0;
-        const bool fused = strcmp(argv[1], "--device-missjoin-retain-only") != 0;
-        const bool retain = !fused || strcmp(argv[1], "--device-fused-missjoin-retain-only") == 0;
-        const bool ok = provider_is_cuda && run_device_fused_missjoin(gpu, cpu, capture, overlap, mask_only, retain, fused);
+        const bool grouped = strcmp(argv[1], "--device-fused-missjoin-grouped-only") == 0 ||
+                strcmp(argv[1], "--device-missjoin-grouped-only") == 0;
+        const bool fused = strcmp(argv[1], "--device-missjoin-retain-only") != 0 &&
+                strcmp(argv[1], "--device-missjoin-grouped-only") != 0;
+        const bool retain = strcmp(argv[1], "--device-missjoin-retain-only") == 0 ||
+                strcmp(argv[1], "--device-fused-missjoin-retain-only") == 0 ||
+                (grouped && getenv("GGML_MOE_MISSJOIN_RETAIN") && atoi(getenv("GGML_MOE_MISSJOIN_RETAIN")) > 0);
+        const bool ok = provider_is_cuda && run_device_fused_missjoin(gpu, cpu, capture, overlap, mask_only, retain, fused, grouped);
         ggml_backend_free(gpu);
         ggml_backend_free(cpu);
         return !provider_is_cuda ? 77 : ok ? 0 : 1;

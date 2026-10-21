@@ -7923,9 +7923,13 @@ bool ggml_cuda_moe_cache_device_compute(ggml_backend_cuda_context & ctx, ggml_te
             padded, a->ne[1], a->ne[2], 1, ctx.stream());
     moe_cache_effective_table effective(ctx.pool());
     const void * const * mmv_table = moe_cache_resolve_table(ctx, session, table, ids, effective);
-    ggml_cuda_moe_table_mmv(mmv_table, (ggml_type) table.desc.type, quantized,
-            (const int32_t *) ids->data, (float *) op->data,
-            a->ne[0], op->ne[0], ids->ne[0], ids->ne[1], a->ne[1], ids->nb[1] / sizeof(int32_t), ctx.stream());
+    if (!ggml_cuda_moe_table_mmv_grouped_try(ctx, mmv_table, nullptr, (ggml_type)table.desc.type, quantized,
+            (const int32_t *)ids->data, (float *)op->data, a->ne[0], op->ne[0], ids->ne[0], ids->ne[1],
+            a->ne[1], ids->nb[1] / sizeof(int32_t))) {
+        ggml_cuda_moe_table_mmv(mmv_table, (ggml_type)table.desc.type, quantized,
+                (const int32_t *)ids->data, (float *)op->data,
+                a->ne[0], op->ne[0], ids->ne[0], ids->ne[1], a->ne[1], ids->nb[1] / sizeof(int32_t), ctx.stream());
+    }
     CUDA_CHECK(cudaGetLastError());
     if (effective.pf_marked) {
         moe_pf_mark_end_kernel<<<1, 1, 0, ctx.stream()>>>(g_pf.d_mark_seq, g_pf.d_mark);
@@ -7984,9 +7988,13 @@ bool ggml_cuda_moe_cache_device_fused_compute(ggml_backend_cuda_context & ctx,
     moe_cache_effective_table gate_effective(ctx.pool());
     const void * const * up_mmv_table = moe_cache_resolve_table(ctx, session, up_table, ids, up_effective);
     const void * const * gate_mmv_table = moe_cache_resolve_table(ctx, session, gate_table, ids, gate_effective);
-    ggml_cuda_moe_table_mmv_fused(up_mmv_table, gate_mmv_table, (ggml_type)up_table.desc.type, quantized,
+    if (!ggml_cuda_moe_table_mmv_grouped_try(ctx, up_mmv_table, gate_mmv_table, (ggml_type)up_table.desc.type, quantized,
             (const int32_t *)ids->data, (float *)glu->data, a->ne[0], glu->ne[0], ids->ne[0], ids->ne[1],
-            a->ne[1], ids->nb[1] / sizeof(int32_t), ctx.stream());
+            a->ne[1], ids->nb[1] / sizeof(int32_t))) {
+        ggml_cuda_moe_table_mmv_fused(up_mmv_table, gate_mmv_table, (ggml_type)up_table.desc.type, quantized,
+                (const int32_t *)ids->data, (float *)glu->data, a->ne[0], glu->ne[0], ids->ne[0], ids->ne[1],
+                a->ne[1], ids->nb[1] / sizeof(int32_t), ctx.stream());
+    }
     CUDA_CHECK(cudaGetLastError());
     if (up_effective.pf_marked || gate_effective.pf_marked) {
         // Overflow and unaligned misses can still read host memory after staging.
