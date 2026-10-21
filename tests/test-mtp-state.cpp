@@ -18,6 +18,7 @@
 #include "../ggml/src/ggml-impl.h"
 #include "../ggml/src/ggml-backend-impl.h"
 #include "../src/llama-arch.h"
+#include "../src/llama-batch.h"
 #include "../src/llama-context.h"
 #include "../src/llama-ext.h"
 #include "../src/llama-graph.h"
@@ -54,6 +55,28 @@ static void require(bool condition, const char * message) {
     if (!condition) {
         throw std::runtime_error(message);
     }
+}
+
+// Check the rendered owning batch, rather than the source row buffer. This
+// catches borrowed-row reuse that otherwise changes inputs when batch width changes.
+static uint64_t check_teacher_batch(const llama_batch_ext & batch, size_t width, uint64_t digest) {
+    require(batch.n_embd == width, "teacher batch embedding width");
+    auto observe = [&](const void * data, size_t size) {
+        const auto * p = static_cast<const uint8_t *>(data);
+        for (size_t i = 0; i < size; ++i) { digest = (digest ^ p[i]) * UINT64_C(1099511628211); }
+    };
+    for (const auto & token : batch.tokens) {
+        require(token.has_embd && token.embd_off + width <= batch.embd.size(), "teacher row is retained");
+        const auto * row = batch.embd.data() + token.embd_off;
+        for (size_t j = 0; j < width; ++j) {
+            require(row[j] == float((int) ((j + token.pos[0]) % 19) - 9) / 19.0f,
+                    "serialized teacher row matches its logical position");
+        }
+        observe(&token.id, sizeof(token.id));
+        observe(token.pos.data(), sizeof(llama_pos) * token.pos.size());
+        observe(row, width * sizeof(float));
+    }
+    return digest;
 }
 
 static void tensor_data(ggml_tensor * tensor, void *) {
@@ -639,17 +662,20 @@ static void run_qwen4exp_pool(bool cuda = false, bool store_only = false) {
     };
     auto decode = [&](llama_context * ctx, llama_seq_id seq, llama_pos from, llama_pos to, bool output) {
         common_batch batch(ctx);
-        std::vector<float> hidden(width);
+        std::vector<float> hidden(width * (to - from));
         for (llama_pos pos = from; pos < to; ++pos) {
+            float * row_hidden = hidden.data() + width * (pos - from);
             for (size_t j = 0; j < width; ++j) {
-                hidden[j] = float((int) ((j + pos) % 19) - 9) / 19.0f;
+                row_hidden[j] = float((int) ((j + pos) % 19) - 9) / 19.0f;
             }
             const int row = batch.add(token_at(pos), pos, seq, output);
-            require(batch.set_embd(row, { hidden.data(), 1, width }), "attach deterministic pool helper input");
+            require(batch.set_embd(row, { row_hidden, 1, width }), "attach deterministic pool helper input");
         }
+        auto * rendered = batch.get();
+        check_teacher_batch(*rendered, width, UINT64_C(14695981039346656037));
         // fork: validation compares the new inputs byte-for-byte with the generic fill, including padded rows.
         const size_t before = pool_store_fills;
-        require(llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0, "decode pool helper");
+        require(llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, rendered) == 0, "decode pool helper");
         llama_synchronize(ctx);
         if (!output) {
             require(store_only && pool_store_fills > before, "no-output decode used and validated the specialized pool fill");
@@ -898,19 +924,39 @@ static void run_qwen4exp_defer_math(bool cuda = false, const char * model_path =
         llama_set_embeddings_nextn(ctx.get(), true, true);
         return ctx;
     };
+    auto reference = make_context();
+    auto merged = make_context();
+    const auto backend_before = llama_perf_bookkeep_context(reference.get());
+    uint64_t teacher_digest[2] = { UINT64_C(14695981039346656037), UINT64_C(14695981039346656037) };
+    std::array<std::array<std::array<uint64_t, 11>, 9>, 2> backend_cells{};
     const size_t width = llama_model_n_embd_out(model.get());
     auto decode = [&](llama_context * ctx, llama_pos from, int count, bool output) {
         common_batch batch(ctx);
-        std::vector<float> hidden(width);
+        // common_batch borrows each embedding until get()/decode. Retain a
+        // distinct stable row per logical position, identical across batchings.
+        std::vector<float> hidden(width * count);
         for (int i = 0; i < count; ++i) {
             const auto pos = from + i;
+            float * row_hidden = hidden.data() + width * i;
             for (size_t j = 0; j < width; ++j) {
-                hidden[j] = float((int) ((j + pos) % 19) - 9) / 19.0f;
+                row_hidden[j] = float((int) ((j + pos) % 19) - 9) / 19.0f;
             }
             const int row = batch.add(token_at(pos), pos, 0, output && i == count - 1);
-            require(batch.set_embd(row, { hidden.data(), 1, width }), "attach defer arithmetic teacher row");
+            require(batch.set_embd(row, { row_hidden, 1, width }), "attach defer arithmetic teacher row");
         }
-        require(llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0, "defer arithmetic decode");
+        auto * rendered = batch.get();
+        const int index = ctx == reference.get() ? 0 : 1;
+        require(ctx == reference.get() || ctx == merged.get(), "known teacher context");
+        teacher_digest[index] = check_teacher_batch(*rendered, width, teacher_digest[index]);
+        const auto before = llama_perf_bookkeep_context(ctx);
+        require(llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, rendered) == 0, "defer arithmetic decode");
+        const auto after = llama_perf_bookkeep_context(ctx);
+        require(count > 0 && count <= 8, "bounded teacher batch width");
+        auto & cell = backend_cells[output][count];
+        ++cell[0];
+        for (size_t i = 0; i < 10; ++i) {
+            cell[i + 1] += after.backend_submit[i] - before.backend_submit[i];
+        }
         if (!output) {
             llama_synchronize(ctx);
             return std::vector<float>();
@@ -919,9 +965,6 @@ static void run_qwen4exp_defer_math(bool cuda = false, const char * model_path =
         require(logits != nullptr, "defer arithmetic output row");
         return std::vector<float>(logits, logits + vocab_size);
     };
-    auto reference = make_context();
-    auto merged = make_context();
-    const auto backend_before = llama_perf_bookkeep_context(reference.get());
     llama_pos pos = 0;
     while (pos < 37) {
         const int count = std::min(8, 37 - pos);
@@ -971,6 +1014,9 @@ static void run_qwen4exp_defer_math(bool cuda = false, const char * model_path =
         ++pos;
     }
     require(rows == 24, "nonempty complete defer arithmetic cell");
+    require(teacher_digest[0] == teacher_digest[1], "separate and merged serialized teacher transcripts are identical");
+    printf("BOOKKEEP_DEFER_INPUTS separate=%016llx merged=%016llx identical=1\n",
+            (unsigned long long) teacher_digest[0], (unsigned long long) teacher_digest[1]);
     printf("BOOKKEEP_DEFER_MATH architecture=qwen4exp backend=%s dtype=%s kv=%s rows=%zu exact_rows=%zu exact_states=%zu/12 vocab=%d top1_equal=%zu/24 mean_kld=%.17g max_kld=%.17g max_logit_error=%.17g teacher=deterministic_synthetic quality_review_required=1\n",
             cuda ? "CUDA" : "CPU", model_path ? "GGUF" : "F32", f16_kv ? "F16" : "TQ5_0/TURBO4_0",
             rows, exact_rows, exact_states, vocab_size, same_top1, sum_kld/rows, max_kld, max_logit_error);
@@ -982,6 +1028,18 @@ static void run_qwen4exp_defer_math(bool cuda = false, const char * model_path =
         printf(" %s=%llu", names[i], (unsigned long long) (backend_after.backend_submit[i] - backend_before.backend_submit[i]));
     }
     printf("\n");
+    for (size_t output = 0; output < backend_cells.size(); ++output) {
+        for (size_t count = 1; count < backend_cells[output].size(); ++count) {
+            const auto & cell = backend_cells[output][count];
+            if (cell[0] == 0) { continue; }
+            printf("BOOKKEEP_DEFER_BACKEND_CELL output=%zu width=%zu calls=%llu", output, count,
+                    (unsigned long long) cell[0]);
+            for (size_t i = 0; i < 10; ++i) {
+                printf(" %s=%llu", names[i], (unsigned long long) cell[i + 1]);
+            }
+            printf("\n");
+        }
+    }
 }
 
 static void run_case(llama_model * model, const cache_config & config, bool deferred) {
