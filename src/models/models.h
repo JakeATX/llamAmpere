@@ -2545,6 +2545,8 @@ struct llama_model_qwen4exp : public llama_model_base {
 
     struct graph : public llm_build_delta_net_base {
         graph(const llama_model & model, const llm_graph_params & params);
+
+        LLAMA_API static ggml_tensor * build_qsa_gather_bytes(ggml_context * ctx, ggml_tensor * cache, ggml_tensor * ids);
     protected:
         // the helpers alone, graph_mtp builds its own body
         struct no_build {};
@@ -2583,12 +2585,14 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * k_cur,
                     ggml_tensor * v_cur,
                     ggml_tensor * sel,
+                    ggml_tensor * sel_ids,
                         int64_t   n_sel,
                           float   kq_scale,
                             int   il);
 
         // the QSA layers share one set of k-pool inputs, see llama_memory_hybrid_idx
         llm_graph_input_kpool * build_inp_kpool(const llama_memory_hybrid_idx_context * mctx_hyb, bool store_only = false);
+        llm_graph_input_kpool * build_inp_kpool_slice(llm_graph_input_kpool * source, int64_t row0, int64_t width);
 
         // Persist raw indexer keys and fresh pooled keys without computing a query.
         void build_qsa_store(
@@ -2605,6 +2609,7 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * cur,
                     ggml_tensor * inp_pos,
                     ggml_tensor * kq_mask,
+                    ggml_tensor ** sel_ids,
                             int * sections,
                             int   il);
 

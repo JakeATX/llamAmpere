@@ -139,6 +139,7 @@ public:
         ggml_tensor * gather_key_gate(ggml_tensor * idxs) const;
         ggml_tensor * scatter_pooled(ggml_tensor * values, ggml_tensor * idxs) const;
         ggml_tensor * gather_pooled(ggml_tensor * idxs) const;
+        int64_t get_n_cells() const { return key_gate->ne[1]; }
 
     private:
         friend class llama_memory_hybrid_idx_context;

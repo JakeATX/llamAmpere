@@ -22,6 +22,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <numeric>
 #include <random>
 #include <vector>
@@ -40,7 +41,6 @@ static const samp_def k_samps[] = {
 };
 
 static constexpr int32_t n_vocab_map = 300000; // id range of the map cases
-static constexpr int     n_trials    = 48;
 
 struct totals {
     int64_t trials   = 0;
@@ -48,7 +48,159 @@ struct totals {
     int64_t failures = 0;
 };
 
-static bool run_case(ggml_backend_t backend, int64_t n_v, int32_t k, const samp_def & sd, bool use_map, totals & tot) {
+// Preserve the actual CPU GGML_TOP_K order, including ties and its intentional first-two swap.
+// Compare the raw payload and core sampler/RNG against ordinary backend candidate ingestion.
+static bool run_qwen_cpu_reference(ggml_backend_t backend, bool use_map) {
+    constexpr int32_t n_vocab = 32;
+    constexpr int32_t k = 10;
+    constexpr int32_t cap = 7;
+    constexpr uint32_t seed = 1729u ^ 0x27d4eb2fu;
+    ggml_init_params pg = { ggml_tensor_overhead() * 128 + ggml_graph_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(pg);
+    ggml_tensor * logits = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_vocab, 1);
+    ggml_tensor * samp = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, LLAMA_MTP_CHAIN_SAMP_N);
+    ggml_tensor * u = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+    ggml_tensor * id_map = use_map ? ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_vocab) : nullptr;
+    for (ggml_tensor * tensor : { logits, samp, u, id_map }) {
+        if (tensor) {
+            ggml_set_input(tensor);
+        }
+    }
+    ggml_tensor * id_out = nullptr;
+    ggml_tensor * packed = llama_mtp_chain_sample_graph(ctx, logits, k, samp, u, id_map, &id_out, true);
+    ggml_tensor * raw_topk = ggml_top_k(ctx, logits, k);
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    for (ggml_tensor * tensor : { packed, id_out, raw_topk }) {
+        ggml_set_output(tensor);
+        ggml_build_forward_expand(gf, tensor);
+    }
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        GGML_ASSERT(ggml_backend_supports_op(backend, ggml_graph_node(gf, i)));
+    }
+    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    GGML_ASSERT(ggml_gallocr_alloc_graph(galloc, gf));
+    std::vector<int32_t> map(n_vocab), topk(k);
+    std::vector<float> vl(n_vocab);
+    for (int i = 0; i < n_vocab; ++i) {
+        map[i] = use_map ? (13*i + 7) % n_vocab : i;
+    }
+    bool ok = true;
+    for (const auto & sd : k_samps) {
+        for (const int32_t request_k : { 1, 5, 10, 40, 0 }) {
+            for (bool suppress : { false, true }) {
+                const auto make_sampler = [&] {
+                    auto * sampler = llama_sampler_chain_init(llama_sampler_chain_default_params());
+                    if (suppress) {
+                        const llama_logit_bias bias = { map[0], -INFINITY };
+                        llama_sampler_chain_add(sampler, llama_sampler_init_logit_bias(n_vocab, 1, &bias));
+                    }
+                    llama_sampler_chain_add(sampler, llama_sampler_init_top_k(request_k));
+                    llama_sampler_chain_add(sampler, llama_sampler_init_top_p(sd.top_p, 0));
+                    llama_sampler_chain_add(sampler, llama_sampler_init_min_p(sd.min_p, 0));
+                    llama_sampler_chain_add(sampler, llama_sampler_init_temp(sd.temp));
+                    llama_sampler_chain_add(sampler, llama_sampler_init_dist(seed));
+                    return sampler;
+                };
+                llama_sampler * compact = make_sampler();
+                llama_sampler * reference = make_sampler();
+                std::mt19937 mirror(seed), expected_rng(seed);
+                std::uniform_real_distribution<double> dist(0.0, 1.0);
+                std::vector<double> host_u;
+                std::vector<float> device_u;
+                std::vector<float> row(LLAMA_MTP_CHAIN_ROW(k), 0.0f);
+                std::vector<llama_token_data> candidates(k), q;
+                float sp[LLAMA_MTP_CHAIN_SAMP_N];
+                llama_mtp_chain_samp_pack(sd.temp, sd.top_p, sd.min_p, sp);
+                for (int round = 0; round < 21; ++round) {
+                    const auto initial = mirror;
+                    llama_mtp_chain_qwen_uniforms(mirror, cap, host_u, device_u);
+                    ok = ok && mirror == initial;
+                    const int consumed = 1 + round % cap;
+                    for (int j = 0; j < consumed; ++j) {
+                        const double expected_u = dist(expected_rng);
+                        ok = ok && host_u[j] == expected_u && device_u[j] == (float) expected_u;
+                        for (int i = 0; i < n_vocab; ++i) {
+                            const int rank = (13*i + 7*round + 3*j) % n_vocab;
+                            switch ((round + j) % 4) {
+                                case 0: vl[i] = 0.0f; break;
+                                case 1: vl[i] = 3.0f - (float) (rank / 4); break;
+                                case 2: vl[i] = rank < 12 ? 2.0f : -0.125f * rank; break;
+                                default: vl[i] = 3.0f - 0.075f * rank; break;
+                            }
+                        }
+                        ggml_backend_tensor_set(logits, vl.data(), 0, ggml_nbytes(logits));
+                        ggml_backend_tensor_set(samp, sp, 0, sizeof(sp));
+                        ggml_backend_tensor_set(u, &device_u[j], 0, sizeof(float));
+                        if (id_map) {
+                            ggml_backend_tensor_set(id_map, map.data(), 0, ggml_nbytes(id_map));
+                        }
+                        GGML_ASSERT(ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS);
+                        ggml_backend_tensor_get(packed, row.data(), 0, ggml_nbytes(packed));
+                        ggml_backend_tensor_get(raw_topk, topk.data(), 0, ggml_nbytes(raw_topk));
+                        int32_t gpu_id = -1;
+                        ggml_backend_tensor_get(id_out, &gpu_id, 0, sizeof(gpu_id));
+                        bool raw_match = row[0] == (float) gpu_id;
+                        for (int i = 0; i < k; ++i) {
+                            const int32_t pos = topk[i];
+                            GGML_ASSERT(pos >= 0 && pos < n_vocab);
+                            raw_match = raw_match && row[2 + i] == (float) map[pos] &&
+                                std::memcmp(&row[2 + k + i], &vl[pos], sizeof(float)) == 0;
+                            candidates[i] = { map[pos], vl[pos], 0.0f };
+                        }
+                        if (!raw_match) {
+                            printf("  FAIL Qwen CPU raw top10 order map=%d round=%d step=%d\n", use_map, round, j);
+                            ok = false;
+                        }
+                        if ((round + j) % 4 == 0) {
+                            const float saved = row[2 + k];
+                            row[2 + k] = NAN;
+                            ok = ok && llama_mtp_chain_rederive_qwen(row.data(), k, compact, n_vocab, q) == -1;
+                            row[2 + k] = saved;
+                        }
+                        llama_token_data_array ref = { candidates.data(), candidates.size(), -1, false };
+                        llama_sampler_apply(reference, &ref);
+                        const llama_token expected_id = ref.data[ref.selected].id;
+                        if (!ref.sorted) {
+                            std::sort(ref.data, ref.data + ref.size, [](const llama_token_data & a, const llama_token_data & b) {
+                                return a.p > b.p;
+                            });
+                        }
+                        const int32_t pick = llama_mtp_chain_rederive_qwen(row.data(), k, compact, n_vocab, q);
+                        bool match = pick >= 0 && (llama_token) row[2 + pick] == expected_id && q.size() == ref.size;
+                        for (size_t i = 0; match && i < q.size(); ++i) {
+                            match = q[i].id == ref.data[i].id &&
+                                std::memcmp(&q[i].logit, &ref.data[i].logit, sizeof(float)) == 0 &&
+                                std::memcmp(&q[i].p, &ref.data[i].p, sizeof(float)) == 0;
+                        }
+                        if (!match) {
+                            printf("  FAIL Qwen CPU raw reference map=%d suppress=%d k=%d temp=%.2f top_p=%.2f min_p=%.2f round=%d step=%d\n",
+                                   use_map, suppress, request_k, sd.temp, sd.top_p, sd.min_p, round, j);
+                            ok = false;
+                        }
+                        // Last row models confidence failure: sampled and consumed, omitted from the draft.
+                        if (j + 1 < consumed) {
+                            llama_sampler_accept(compact, expected_id);
+                            llama_sampler_accept(reference, expected_id);
+                        }
+                    }
+                    llama_mtp_chain_qwen_commit(mirror, consumed);
+                    ok = ok && mirror == expected_rng;
+                    auto next_rng = expected_rng;
+                    llama_mtp_chain_qwen_uniforms(mirror, 1, host_u, device_u);
+                    ok = ok && host_u[0] == dist(next_rng);
+                }
+                llama_sampler_free(reference);
+                llama_sampler_free(compact);
+            }
+        }
+    }
+    ggml_gallocr_free(galloc);
+    ggml_free(ctx);
+    printf("Qwen CPU raw top10 sampler/RNG differential map=%d: %s\n", use_map, ok ? "OK" : "FAILED");
+    return ok;
+}
+
+static bool run_case(ggml_backend_t backend, int64_t n_v, int32_t k, const samp_def & sd, bool use_map, totals & tot, int n_trials) {
     ggml_init_params pg = { ggml_tensor_overhead() * 96 + ggml_graph_overhead(), nullptr, true };
     ggml_context * ctx = ggml_init(pg);
 
@@ -201,7 +353,9 @@ static bool run_case(ggml_backend_t backend, int64_t n_v, int32_t k, const samp_
     return ok;
 }
 
-int main() {
+int main(int argc, char ** argv) {
+    const bool quick = argc == 2 && strcmp(argv[1], "--quick") == 0;
+    GGML_ASSERT(argc == 1 || quick);
     ggml_backend_load_all();
 
     std::vector<ggml_backend_t> backends;
@@ -210,12 +364,15 @@ int main() {
         backends.push_back(ggml_backend_dev_init(dev, nullptr));
     }
 
-    bool ok = true;
+    GGML_ASSERT(backends.front());
+    bool ok = run_qwen_cpu_reference(backends.front(), false);
+    ok = run_qwen_cpu_reference(backends.front(), true) && ok;
     for (ggml_backend_t backend : backends) {
         GGML_ASSERT(backend);
         totals tot;
-        for (int64_t n_v : { 50, 1000, 32768, 248320 }) {
-            for (int32_t k : { 1, 5, 20, 64 }) {
+        const std::vector<int64_t> vocab_sizes = quick ? std::vector<int64_t>{ 1000 } : std::vector<int64_t>{ 50, 1000, 32768, 248320 };
+        for (int64_t n_v : vocab_sizes) {
+            for (int32_t k : { 1, 5, 10, 20, 64 }) {
                 if (k > n_v) {
                     continue;
                 }
@@ -224,7 +381,7 @@ int main() {
                         if (use_map && n_v > 65536) {
                             continue; // maps are shortlists
                         }
-                        ok = run_case(backend, n_v, k, sd, use_map, tot) && ok;
+                        ok = run_case(backend, n_v, k, sd, use_map, tot, quick ? 8 : 48) && ok;
                     }
                 }
             }

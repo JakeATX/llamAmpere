@@ -4,12 +4,10 @@
 //
 // The chain decode drafts every depth in one graph. With sampling on, each step draws its token on the GPU
 // from the draft sampler chain top_k -> top_p -> min_p -> temperature, using a uniform the host drew before
-// the round (inverse CDF instead of the dist sampler's own RNG). The host then re-derives every step from
-// the emitted candidates in float64 with the sampler semantics of llama-sampler.cpp. It records the
-// distribution each token came from (exact p/q holds by construction) and cuts the chain at the first step
-// where the GPU disagreed, because later steps were conditioned on the GPU's token. The GPU draw therefore
-// only has to agree almost always, never exactly: float rounding at a top-p or CDF boundary costs a shorter
-// draft, not correctness.
+// the round (inverse CDF instead of the dist sampler's own RNG). Qwen3.5 re-derives sorted candidate rows
+// in float64 and cuts the chain on a disagreement. Qwen4exp preserves the backend top-k candidate order,
+// applies the ordinary CPU sampler and repairs the suffix after a different GPU conditioning token.
+// The verifier receives the actual CPU draw and its q in both cases.
 //
 // Header-only (ggml + llama types) so tests can build the graph on a backend and compare with the host.
 
@@ -18,14 +16,20 @@
 
 #include <cmath>
 #include <cstdint>
+#include <algorithm>
+#include <random>
 #include <vector>
 
 // one step's output row, F32: [0] drawn token id, [1] drawn position in the sorted candidates,
-// [2, 2+k) candidate token ids sorted by logit (descending), [2+k, 2+2k) their raw (pre-temperature) logits
+// [2, 2+k) candidate token ids, [2+k, 2+2k) their raw (pre-temperature) logits.
+// Candidates are sorted unless raw_candidates is set; [1] always indexes the internal sorted candidates.
 #define LLAMA_MTP_CHAIN_ROW(k) (2 + 2*(k))
 
 // candidates per step: the graph's top-k width; requests with a larger top_k draft serially
 #define LLAMA_MTP_CHAIN_TOP_K_MAX 64
+
+// fork: Bound Qwen4exp unrolling independently of the prompt batch capacity.
+#define LLAMA_MTP_QWEN4EXP_CHAIN_MAX 4
 
 // the [4] F32 sampling-parameter input
 enum llama_mtp_chain_samp_idx {
@@ -46,6 +50,7 @@ static inline void llama_mtp_chain_samp_pack(float temp, float top_p, float min_
 // samp:   F32 [LLAMA_MTP_CHAIN_SAMP_N], see llama_mtp_chain_samp_pack
 // u:      F32 [1], the step's uniform in [0, 1)
 // id_map: I32 [n_v] vocabulary ids of the logit positions, or nullptr when positions are token ids
+// raw_candidates: keep the backend top-k payload order for the CPU sampler, without changing the GPU draw
 // returns the step's output row F32 [LLAMA_MTP_CHAIN_ROW(k), 1]; *id_out is the drawn token id, I32 [1],
 // for the next step's token embedding
 static inline ggml_tensor * llama_mtp_chain_sample_graph(
@@ -55,7 +60,8 @@ static inline ggml_tensor * llama_mtp_chain_sample_graph(
         ggml_tensor  * samp,
         ggml_tensor  * u,
         ggml_tensor  * id_map,
-        ggml_tensor ** id_out) {
+        ggml_tensor ** id_out,
+        bool           raw_candidates = false) {
     const int64_t n_v = logits->ne[0];
     GGML_ASSERT(logits->ne[1] == 1 && k >= 1 && k <= n_v && k <= LLAMA_MTP_CHAIN_TOP_K_MAX);
 
@@ -95,9 +101,14 @@ static inline ggml_tensor * llama_mtp_chain_sample_graph(
     ggml_tensor * pick_i = ggml_reshape_1d(ctx, ggml_cast(ctx, pick, GGML_TYPE_I32), 1);
     ggml_tensor * id     = ggml_get_rows(ctx, ids, pick_i);                                   // I32 [1, 1]
 
-    ggml_tensor * idsf = ggml_reshape_2d(ctx, ggml_cast(ctx, ids, GGML_TYPE_F32), k, 1);
+    ggml_tensor * payload_ids = ids;
+    if (raw_candidates) {
+        payload_ids = id_map == nullptr ? cand : ggml_get_rows(ctx,
+                ggml_reshape_2d(ctx, id_map, 1, id_map->ne[0]), ggml_reshape_1d(ctx, cand, k));
+    }
+    ggml_tensor * idsf = ggml_reshape_2d(ctx, ggml_cast(ctx, payload_ids, GGML_TYPE_F32), k, 1);
     ggml_tensor * head = ggml_concat(ctx, ggml_cast(ctx, id, GGML_TYPE_F32), pick, 0);
-    ggml_tensor * row  = ggml_concat(ctx, head, ggml_concat(ctx, idsf, ls, 0), 0);          // F32 [2 + 2k, 1]
+    ggml_tensor * row  = ggml_concat(ctx, head, ggml_concat(ctx, idsf, raw_candidates ? lk : ls, 0), 0); // F32 [2 + 2k, 1]
 
     if (id_out) {
         *id_out = ggml_reshape_1d(ctx, id, 1);
@@ -178,4 +189,70 @@ static inline int32_t llama_mtp_chain_rederive(
     }
 
     return pick;
+}
+
+// Qwen4exp keeps the sequential CPU dist stream. Peek using a copy: graph rows beyond the confidence
+// cutoff or a GPU/CPU disagreement must not consume draws in the next round. Retain doubles for the
+// host; the graph only receives approximations and its conditioning is checked after the graph read.
+static inline void llama_mtp_chain_qwen_uniforms(
+        const std::mt19937 & rng, int32_t n, std::vector<double> & host, std::vector<float> & device) {
+    auto trial = rng;
+    std::uniform_real_distribution<double> dist(0.0, 1.0);
+    host.resize(n);
+    device.resize(n);
+    for (int32_t i = 0; i < n; ++i) {
+        host[i] = dist(trial);
+        device[i] = (float) host[i];
+    }
+}
+
+static inline void llama_mtp_chain_qwen_commit(std::mt19937 & rng, int32_t n) {
+    std::uniform_real_distribution<double> dist(0.0, 1.0);
+    for (int32_t i = 0; i < n; ++i) {
+        (void) dist(rng);
+    }
+}
+
+// Apply the actual sequential pq sampler, including dist, to the unordered backend candidate row. Its
+// float transforms, expf weights, double uniform/CDF, and recorded float q are therefore the core
+// sampler's own. It advances the real sampler once for every valid row, including confidence failures,
+// and keeps its state ready for sequential fallback. A malformed input advances neither sampler.
+// The returned pick addresses the graph's original candidate row, even if CPU transforms reorder it.
+static inline int32_t llama_mtp_chain_rederive_qwen(
+        const float * row, int32_t k, llama_sampler * sampler, int32_t n_vocab,
+        std::vector<llama_token_data> & q) {
+    q.clear();
+    if (row == nullptr || k <= 0 || sampler == nullptr) {
+        return -1;
+    }
+    const float * ids = row + 2;
+    const float * lg = ids + k;
+    for (int32_t i = 0; i < k; ++i) {
+        if (!std::isfinite(lg[i]) || !std::isfinite(ids[i]) || ids[i] < 0.0f || ids[i] >= (float) n_vocab ||
+                ids[i] != std::floor(ids[i])) {
+            return -1;
+        }
+    }
+    q.resize(k);
+    for (int32_t i = 0; i < k; ++i) {
+        q[i] = { (llama_token) ids[i], lg[i], 0.0f };
+    }
+    // The sequential backend candidate getter marks its candidates unsorted too.
+    llama_token_data_array cur = { q.data(), q.size(), -1, false };
+    llama_sampler_apply(sampler, &cur);
+    GGML_ASSERT(cur.selected >= 0 && (size_t) cur.selected < cur.size);
+    const llama_token id = cur.data[cur.selected].id;
+    GGML_ASSERT(cur.data == q.data());
+    q.resize(cur.size);
+    if (!cur.sorted) {
+        std::sort(q.begin(), q.end(), [](const llama_token_data & a, const llama_token_data & b) {
+            return a.p > b.p;
+        });
+    }
+    for (int32_t i = 0; i < k; ++i) {
+        if ((llama_token) ids[i] == id) {
+            return i;
+        }
+    }
+    GGML_ABORT("CPU draft sampler selected a token outside its candidate row");
 }

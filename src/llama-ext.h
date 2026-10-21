@@ -79,6 +79,10 @@ LLAMA_API bool llama_mtp_handoff_row(struct llama_context * target, float * dst,
 // One sequence; token i reads the target row first + i - 1, token 0 reads carry when carry != NULL. -4 = use the host path.
 LLAMA_API int llama_mtp_handoff_decode(struct llama_context * draft, struct llama_context * target,
         struct llama_batch batch, int32_t first, const float * carry);
+// fork: Sequential MTP feedback. Start each draft round with use_previous=false and the accepted target hidden row.
+// These calls keep helper hidden rows on device; get_embeddings_nextn does not return their output.
+LLAMA_API bool llama_mtp_device_feedback_init(struct llama_context * draft);
+LLAMA_API int llama_mtp_device_feedback_decode(struct llama_context * draft, struct llama_batch batch, bool use_previous);
 
 // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
 LLAMA_API struct ggml_cgraph * llama_graph_reserve(

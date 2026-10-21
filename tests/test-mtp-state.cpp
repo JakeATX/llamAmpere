@@ -4,6 +4,11 @@
 // --bookkeep-output-only checks the experimental sampler output snapshot using only the CPU fixture.
 // --bookkeep-sampler-only emits an exact common-sampler digest for fresh-process environment comparisons.
 // --reserve-probe CTX PARALLEL [MODEL] measures production graph geometry without allocating weights or running kernels.
+// --device-feedback[-cuda]-only and --qwen4exp-chain[-cuda]-only exercise the generated Qwen4exp helper.
+// --qwen4exp-compact[-cuda]-only additionally uses compact QSA and TQ5/TURBO4 helper KV.
+// --qwen4exp-pool-only checks incremental pool metadata with the differential validator enabled.
+// --qwen4exp-pool-store[-cuda]-only checks specialized KV-only pool inputs and full-graph continuation.
+// --qwen4exp-full-head[-cuda]-only checks batched full-head proposals and exact sequential suffix repair.
 
 #include "common.h"
 #include "log.h"
@@ -26,6 +31,7 @@
 #include "../src/llama-memory.h"
 #include "../src/llama-memory-hybrid.h"
 #include "../src/llama-memory-hybrid-idx.h"
+#include "../src/llama-mtp-chain-sample.h"
 #include "../src/llama-model.h"
 #include "../src/llama-mmap.h"
 #include "../src/llama-model-saver.h"
@@ -49,6 +55,8 @@ static constexpr uint32_t n_vocab = 32, n_embd = 256;
 static size_t scratch_borrows = 0, scratch_releases = 0, scratch_fallbacks = 0, compute_shares = 0;
 static size_t borrowed_host_pins = 0, borrowed_host_pin_failures = 0;
 static bool bookkeep_sequential = false;
+static size_t half_vocab_maps = 0;
+static size_t half_vocab_compact_heads = 0;
 static size_t pool_store_fills = 0;
 
 static void require(bool condition, const char * message) {
@@ -77,6 +85,59 @@ static uint64_t check_teacher_batch(const llama_batch_ext & batch, size_t width,
         observe(row, width * sizeof(float));
     }
     return digest;
+static void embedding_input_u64(std::vector<uint8_t> & bytes, uint64_t value) {
+    for (int j = 0; j < 8; ++j) { bytes.push_back(uint8_t(value >> (8*j))); }
+}
+
+static uint64_t embedding_input_digest(const std::vector<uint8_t> & bytes) {
+    uint64_t result = UINT64_C(14695981039346656037);
+    for (uint8_t value : bytes) { result = (result ^ value)*UINT64_C(1099511628211); }
+    return result;
+}
+
+// Check the rendered owning batch, not the non-owning common_batch row views.
+// The transcript contains actual row data and metadata without batch boundaries,
+// so concatenated singleton materializations compare exactly with merged rows.
+static llama_batch_ext * checked_embedding_batch(common_batch & input, const std::vector<float> & expected,
+        size_t width, std::vector<uint8_t> * transcript = nullptr, size_t transcript_rows = SIZE_MAX) {
+    const size_t rows = input.size();
+    require(width > 0 && expected.size() >= rows*width, "embedding oracle has every intended logical row");
+    auto * result = input.get();
+    require(result && result->tokens.size() == rows && result->n_embd == width && result->embd.size() == rows*width,
+            "rendered embedding batch owns the complete row matrix");
+    for (size_t row = 0; row < rows; ++row) {
+        const auto & want = input.tokens[row];
+        const auto & actual = result->tokens[row];
+        require(actual.has_embd && actual.embd_off == row*width && actual.embd_off + width <= result->embd.size(),
+                "rendered embedding row has its own bounded offset");
+        const float * data = result->embd.data() + actual.embd_off;
+        require(data != want.embd.data && std::memcmp(data, expected.data() + row*width, width*sizeof(float)) == 0,
+                "actual owning batch preserves every intended embedding bit after get");
+        std::vector<llama_seq_id> seq_ids(actual.seq_ids.begin(), actual.seq_ids.end());
+        std::sort(seq_ids.begin(), seq_ids.end());
+        std::vector<llama_seq_id> expected_seq_ids { want.seq_id };
+        expected_seq_ids.insert(expected_seq_ids.end(), want.seq_ids_extra.begin(), want.seq_ids_extra.end());
+        std::sort(expected_seq_ids.begin(), expected_seq_ids.end());
+        expected_seq_ids.erase(std::unique(expected_seq_ids.begin(), expected_seq_ids.end()), expected_seq_ids.end());
+        require(actual.id == want.id && actual.pos == want.pos && actual.output == want.output &&
+                    actual.decision_order == want.decision_order && seq_ids == expected_seq_ids,
+                "actual owning batch preserves token, position, sequence and output metadata");
+        if (transcript && row < transcript_rows) {
+            embedding_input_u64(*transcript, uint32_t(actual.id));
+            for (llama_pos pos : actual.pos) { embedding_input_u64(*transcript, uint32_t(pos)); }
+            embedding_input_u64(*transcript, actual.output);
+            embedding_input_u64(*transcript, uint32_t(actual.decision_order));
+            embedding_input_u64(*transcript, seq_ids.size());
+            for (llama_seq_id seq : seq_ids) { embedding_input_u64(*transcript, uint32_t(seq)); }
+            embedding_input_u64(*transcript, width);
+            for (size_t j = 0; j < width; ++j) {
+                uint32_t bits;
+                std::memcpy(&bits, data + j, sizeof(bits));
+                for (int k = 0; k < 4; ++k) { transcript->push_back(uint8_t(bits >> (8*k))); }
+            }
+        }
+    }
+    return result;
 }
 
 static void tensor_data(ggml_tensor * tensor, void *) {
@@ -166,8 +227,12 @@ struct contexts {
     common_speculative * spec = nullptr;
 
     contexts(llama_model * model, const cache_config & config, uint32_t batch_size = 128,
-            common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE, uint32_t ubatch_size = 0, uint32_t parallel = 2, uint32_t context_per_seq = 4096, llama_model * draft_model = nullptr) {
+            common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE, uint32_t ubatch_size = 0, uint32_t parallel = 2, uint32_t context_per_seq = 4096, llama_model * draft_model = nullptr,
+            const char * draft_vocab_map = nullptr, bool backend_sampling = true,
+            ggml_backend_sched_eval_callback eval_callback = nullptr, void * eval_user_data = nullptr, int draft_max = 4) {
         llama_context_params cp = llama_context_default_params();
+        cp.cb_eval = eval_callback;
+        cp.cb_eval_user_data = eval_user_data;
         cp.n_batch = batch_size;
         cp.n_ubatch = ubatch_size ? ubatch_size : batch_size;
         cp.n_seq_max = parallel;
@@ -193,6 +258,7 @@ struct contexts {
         require(tgt != nullptr, "create target context");
         cp.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
         cp.ctx_other = tgt;
+        cp.draft_vocab_map = draft_vocab_map;
         cp.n_rs_seq = 0;
         cp.sj_kvarn_bits_k = cp.sj_kvarn_bits_v = 0;
         if (config.sj_k) {
@@ -205,10 +271,11 @@ struct contexts {
         params.types = { type };
         params.draft.ctx_tgt = tgt;
         params.draft.ctx_dft = dft;
-        params.draft.n_max = 4;
+        params.draft.n_max = draft_max;
         params.draft.n_min_adaptive = 3;
         params.draft.p_min = 0.0f;
         params.draft.chain = !bookkeep_sequential;
+        params.draft.backend_sampling = backend_sampling;
         spec = common_speculative_init(params, parallel);
         require(spec != nullptr, "create MTP driver");
     }
@@ -330,12 +397,24 @@ static void require_schedule(const schedule & actual, const schedule & expected,
     require(false, message);
 }
 
-static schedule generate(contexts & ctx, llama_seq_id seq, llama_pos & pos, int first, int count) {
+static schedule generate(contexts & ctx, llama_seq_id seq, llama_pos & pos, int first, int count, bool sampled_chain = false,
+        bool require_chain_decode = true) {
     schedule result;
     common_params_sampling sampling;
-    sampling.temp = 0.0f;
+    sampling.temp = sampled_chain ? 1.0f : 0.0f;
+    if (sampled_chain) {
+        sampling.seed = 9127;
+        sampling.top_k = 10;
+        sampling.top_p = 0.95f;
+        sampling.min_p = 0.0f;
+        sampling.min_keep = 1;
+        sampling.dynatemp_range = 0.0f;
+        sampling.samplers = { COMMON_SAMPLER_TYPE_TOP_K, COMMON_SAMPLER_TYPE_TOP_P,
+            COMMON_SAMPLER_TYPE_MIN_P, COMMON_SAMPLER_TYPE_TEMPERATURE };
+    }
     for (int round = first; round < first + count; ++round) {
         llama_tokens prompt, draft;
+        std::vector<std::vector<llama_token_data>> proposal_q;
         auto & dp = common_speculative_get_draft_params(ctx.spec, seq);
         dp = {};
         dp.drafting = true;
@@ -344,8 +423,20 @@ static schedule generate(contexts & ctx, llama_seq_id seq, llama_pos & pos, int 
         dp.prompt = &prompt;
         dp.result = &draft;
         dp.sampling = &sampling;
+        dp.result_q = sampled_chain ? &proposal_q : nullptr;
+        llama_synchronize(ctx.dft);
+        const auto before = llama_perf_context(ctx.dft);
         common_speculative_draft(ctx.spec);
         require(!draft.empty(), "MTP drafted tokens");
+        if (sampled_chain) {
+            llama_synchronize(ctx.dft);
+            const auto after = llama_perf_context(ctx.dft);
+            require(!require_chain_decode || (after.n_eval == before.n_eval && after.n_p_eval >= before.n_p_eval + (int) draft.size()),
+                    "sampled chain drafts in one multi-token decode without sequential single-token evaluations");
+            require(proposal_q.size() == draft.size() &&
+                    std::all_of(proposal_q.begin(), proposal_q.end(), [](const std::vector<llama_token_data> & q) { return !q.empty(); }),
+                    "sampled chain returns a proposal distribution for every token");
+        }
         result.widths.push_back(draft.size());
         result.tokens.push_back(draft);
         llama_tokens verify { dp.id_last };
@@ -399,6 +490,1030 @@ struct prefill_env_restore {
         common_set_env("LLAMA_MTP_PREFILL_SCRATCH", use_scratch ? "1" : "0");
     }
 };
+
+struct feedback_env_restore {
+    std::string feedback = common_get_env("LLAMA_MTP_DEVICE_FEEDBACK");
+    std::string deferred = common_get_env("LLAMA_SPEC_DEFER_CATCHUP");
+    std::string chain = common_get_env("LLAMA_MTP_QWEN4EXP_CHAIN");
+    std::string compact = common_get_env("LLAMA_MTP_QSA_COMPACT");
+    std::string sampled = common_get_env("LLAMA_SPEC_CHAIN_SAMPLED");
+    std::string pq = common_get_env("LLAMA_SPEC_PQ");
+    std::string full_head = common_get_env("LLAMA_MTP_CHAIN_FULL_HEAD");
+    std::string test_ids = common_get_env("LLAMA_MTP_CHAIN_TEST_IDS");
+    std::string vocab = common_get_env("LLAMA_SPEC_DRAFT_VOCAB");
+    std::string compact_head = common_get_env("LLAMA_DRAFT_VOCAB_COMPACT");
+    std::string compact_head_type = common_get_env("LLAMA_DRAFT_VOCAB_COMPACT_TYPE");
+    std::string draft_temp_mult = common_get_env("LLAMA_SPEC_DRAFT_TEMP_MULT");
+    ~feedback_env_restore() {
+        common_set_env("LLAMA_MTP_DEVICE_FEEDBACK", feedback);
+        common_set_env("LLAMA_SPEC_DEFER_CATCHUP", deferred);
+        common_set_env("LLAMA_MTP_QWEN4EXP_CHAIN", chain);
+        common_set_env("LLAMA_MTP_QSA_COMPACT", compact);
+        common_set_env("LLAMA_SPEC_CHAIN_SAMPLED", sampled);
+        common_set_env("LLAMA_SPEC_PQ", pq);
+        common_set_env("LLAMA_MTP_CHAIN_FULL_HEAD", full_head);
+        common_set_env("LLAMA_MTP_CHAIN_TEST_IDS", test_ids);
+        common_set_env("LLAMA_SPEC_DRAFT_VOCAB", vocab);
+        common_set_env("LLAMA_DRAFT_VOCAB_COMPACT", compact_head);
+        common_set_env("LLAMA_DRAFT_VOCAB_COMPACT_TYPE", compact_head_type);
+        common_set_env("LLAMA_SPEC_DRAFT_TEMP_MULT", draft_temp_mult);
+    }
+};
+
+static void run_device_feedback(bool cuda) {
+    prefill_env_restore prefill_env;
+    prefill_env.set(false, false, false);
+    feedback_env_restore feedback_env;
+    common_set_env("LLAMA_SPEC_DEFER_CATCHUP", "0");
+    common_set_env("LLAMA_MTP_QWEN4EXP_CHAIN", "0");
+    auto * device = cuda ? ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU) : nullptr;
+    require(!cuda || device, "feedback GPU backend is available");
+    llama_model_ptr model(make_model(false, {}, LLM_ARCH_QWEN4EXP, device));
+    const cache_config config { "device feedback", GGML_TYPE_Q8_0, GGML_TYPE_Q8_0 };
+    {
+        common_set_env("LLAMA_MTP_DEVICE_FEEDBACK", "0");
+        contexts reference(model.get(), config, 8, COMMON_SPECULATIVE_TYPE_DRAFT_MTP, 8, 1, 512);
+        require(!llama_mtp_device_feedback_init(reference.dft), "feedback is opt-in");
+        common_set_env("LLAMA_MTP_DEVICE_FEEDBACK", "1");
+        contexts feedback(model.get(), config, 8, COMMON_SPECULATIVE_TYPE_DRAFT_MTP, 8, 1, 512);
+        require(llama_mtp_device_feedback_init(feedback.dft), "Qwen4exp backend supports feedback");
+        // This direct op comparison covers all vocabulary logits. The separate
+        // common-driver checks below retain real backend top-k sampling.
+        require(llama_set_sampler(reference.dft, 0, nullptr) && llama_set_sampler(feedback.dft, 0, nullptr),
+                "detach backend samplers for full-vocabulary feedback comparison");
+        const size_t width = llama_model_n_embd_out(model.get());
+        std::vector<float> hidden(width), poison(width, 1000.0f), saved_hidden;
+        for (size_t j = 0; j < width; ++j) {
+            hidden[j] = float((int) (j % 17) - 8) / 17.0f;
+        }
+        llama_token token = 0;
+        llama_pos pos = 0;
+        int32_t n_seq_id = 1;
+        llama_seq_id seq = 0;
+        llama_seq_id * seq_id = &seq;
+        int8_t output = 1;
+        llama_batch batch = { 1, &token, hidden.data(), &pos, &n_seq_id, &seq_id, &output };
+        require(llama_mtp_device_feedback_decode(feedback.dft, batch, true) == -4, "feedback rejects an unseeded previous row");
+        std::vector<uint8_t> reference_state, feedback_state;
+        for (int round = 0; round < 3; ++round) {
+            if (round == 2) {
+                require(llama_state_seq_set_data_ext(reference.dft, reference_state.data(), reference_state.size(), 0,
+                            LLAMA_STATE_SEQ_FLAGS_KEEP_LAYOUT) == reference_state.size(), "restore reference helper state");
+                require(llama_state_seq_set_data_ext(feedback.dft, feedback_state.data(), feedback_state.size(), 0,
+                            LLAMA_STATE_SEQ_FLAGS_KEEP_LAYOUT) == feedback_state.size(), "restore feedback helper state");
+                hidden = saved_hidden;
+            }
+            for (int step = 0; step < 4; ++step) {
+                pos = (round == 0 ? 0 : 4) + step;
+                token = token_at(pos);
+                batch.embd = hidden.data();
+                require(llama_decode(reference.dft, batch) == 0, "reference helper step");
+                const float * expected = llama_get_logits_ith(reference.dft, 0);
+                batch.embd = step == 0 ? hidden.data() : poison.data();
+                require(llama_mtp_device_feedback_decode(feedback.dft, batch, step > 0) == 0, "feedback helper step");
+                const float * actual = llama_get_logits_ith(feedback.dft, 0);
+                require(std::memcmp(expected, actual, n_vocab * sizeof(float)) == 0, "feedback logits are bit-identical with poisoned host continuation rows");
+                const float * next = llama_get_embeddings_nextn_ith(reference.dft, 0);
+                std::copy(next, next + width, hidden.begin());
+                pos += 2;
+                require(llama_mtp_device_feedback_decode(feedback.dft, batch, true) == -4, "feedback rejects a nonconsecutive position");
+            }
+            if (round == 0) {
+                reference_state = save(reference.dft, 0);
+                feedback_state = save(feedback.dft, 0);
+                saved_hidden = hidden;
+            }
+        }
+    }
+    common_set_env("LLAMA_MTP_DEVICE_FEEDBACK", "0");
+    contexts reference(model.get(), config, 16, COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE, 16, 1, 512);
+    common_set_env("LLAMA_MTP_DEVICE_FEEDBACK", "1");
+    contexts feedback(model.get(), config, 16, COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE, 16, 1, 512);
+    prefill(reference, 0, 8, 0);
+    prefill(feedback, 0, 8, 0);
+    llama_pos reference_pos = 8, feedback_pos = 8;
+    const schedule initial = generate(reference, 0, reference_pos, 0, 3);
+    require_schedule(generate(feedback, 0, feedback_pos, 0, 3), initial, "feedback preserves sequential proposal tokens");
+    const snapshot cached = save(feedback, 0);
+    require(cached.spec == save(reference, 0).spec, "feedback preserves the accepted-target hidden sidecar");
+    const schedule expected = generate(reference, 0, reference_pos, 3, 3);
+    contexts resumed(model.get(), config, 16, COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE, 16, 1, 512);
+    restore(resumed, cached, 0);
+    require_schedule(generate(resumed, 0, feedback_pos, 3, 3), expected, "feedback resumes from CPU sidecar without device carry state");
+    printf("PASS Qwen4exp %s sequential feedback: bit-identical logits, poisoned host continuation, repeated rounds, state restore, target sidecar, position guards\n", cuda ? "GPU" : "CPU");
+}
+
+static void run_qwen4exp_pool(bool cuda = false, bool store_only = false) {
+    require((common_get_env("LLAMA_MTP_POOL_INCREMENTAL") == "1" ||
+                (!store_only && common_get_env("LLAMA_MTP_POOL_INCREMENTAL") == "0")) &&
+                common_get_env("LLAMA_MTP_POOL_VALIDATE") == "1",
+            "pool regression requires explicit LLAMA_MTP_POOL_INCREMENTAL=0/1 and LLAMA_MTP_POOL_VALIDATE=1");
+    prefill_env_restore prefill_env;
+    prefill_env.set(false, false, false);
+    feedback_env_restore feedback_env;
+    // fork: set these before any model/context graph is made; both gates are cached per process.
+    common_set_env("LLAMA_MTP_UPDATE_KV_ONLY", "1");
+    common_set_env("LLAMA_MTP_POOL_STORE_ONLY", store_only ? "1" : "0");
+    common_set_env("LLAMA_MTP_EH_BATCH", "0");
+    common_set_env("LLAMA_MTP_DEVICE_FEEDBACK", "0");
+    common_set_env("LLAMA_MTP_QWEN4EXP_CHAIN", "0");
+    common_set_env("LLAMA_MTP_QSA_COMPACT", "0");
+    auto * device = cuda ? ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU) : nullptr;
+    require(!cuda || device, "pool GPU backend is available");
+    model_geometry geometry;
+    geometry.kpool = 4;
+    geometry.indexer_top_k = 8;
+    llama_model_ptr model(make_model(false, geometry, LLM_ARCH_QWEN4EXP, device));
+    auto make_context = [&](uint32_t batch_size = 8) {
+        auto cp = llama_context_default_params();
+        cp.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        cp.n_ctx = 128;
+        cp.n_batch = cp.n_ubatch = batch_size;
+        cp.n_seq_max = 2;
+        cp.kv_unified = true;
+        cp.n_threads = cp.n_threads_batch = 2;
+        cp.offload_kqv = cuda;
+        cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        cp.type_k = cp.type_v = GGML_TYPE_Q8_0;
+        llama_context_ptr ctx(llama_init_from_model(model.get(), cp));
+        require(ctx != nullptr, "create pool helper");
+        return ctx;
+    };
+    auto pool_memory = [](llama_context * ctx) {
+        auto * mem = dynamic_cast<llama_memory_hybrid_idx *>(llama_get_memory(ctx));
+        require(mem && mem->get_mem_idx() && mem->get_kpool() == 4 && mem->get_kpool_by_order(),
+                "Qwen4exp helper has pools of four cells in sequence order");
+        require(mem->get_mem_idx()->get_n_stream() == 1, "pool helper shares a unified indexer stream");
+        return mem;
+    };
+    const size_t width = llama_model_n_embd_out(model.get());
+    size_t store_decodes = 0;
+    uint64_t digest = UINT64_C(14695981039346656037);
+    auto observe = [&](const void * data, size_t size) {
+        // fork: all fresh-process modes record the same requested output/cache schedule.
+        // Include byte counts so missing rows or cache observations change the digest.
+        const uint64_t count = size;
+        const auto bytes = [&](const void * source, size_t n) {
+            const auto * value = (const uint8_t *) source;
+            for (size_t i = 0; i < n; ++i) {
+                digest = (digest ^ value[i])*UINT64_C(1099511628211);
+            }
+        };
+        bytes(&count, sizeof(count));
+        bytes(data, size);
+    };
+    auto decode = [&](llama_context * ctx, llama_seq_id seq, llama_pos from, llama_pos to, bool output) {
+        common_batch batch(ctx);
+        std::vector<float> hidden(size_t(to - from)*width);
+        for (llama_pos pos = from; pos < to; ++pos) {
+            float * hidden_row = hidden.data() + size_t(pos - from)*width;
+            for (size_t j = 0; j < width; ++j) {
+                hidden_row[j] = float((int) ((j + pos) % 19) - 9) / 19.0f;
+            }
+            const int row = batch.add(token_at(pos), pos, seq, output);
+            require(batch.set_embd(row, { hidden_row, 1, width }), "attach deterministic pool helper input");
+        }
+        std::vector<uint8_t> merged_input, scalar_input;
+        auto * rendered = checked_embedding_batch(batch, hidden, width, &merged_input);
+        // This is an input-materialization oracle; the pool test still decodes
+        // the original merged batch and retains all existing cache assertions.
+        for (llama_pos pos = from; pos < to; ++pos) {
+            const auto first = hidden.begin() + size_t(pos - from)*width;
+            const std::vector<float> row_hidden(first, first + width);
+            common_batch scalar(ctx);
+            const int row = scalar.add(token_at(pos), pos, seq, output);
+            require(scalar.set_embd(row, { row_hidden.data(), 1, width }), "attach scalar pool input oracle");
+            checked_embedding_batch(scalar, row_hidden, width, &scalar_input);
+        }
+        require(scalar_input == merged_input, "scalar and merged pool batches serialize identical logical inputs");
+        printf("DRAFTRW_POOL_INPUT seq=%d from=%d to=%d output=%d rows=%d scalar=%016llx merged=%016llx\n",
+                seq, from, to, int(output), to - from,
+                (unsigned long long) embedding_input_digest(scalar_input),
+                (unsigned long long) embedding_input_digest(merged_input));
+        // fork: validation compares the new inputs byte-for-byte with the generic fill, including padded rows.
+        const size_t before = pool_store_fills;
+        require(llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, rendered) == 0, "decode pool helper");
+        llama_synchronize(ctx);
+        if (!output) {
+            require(store_only && pool_store_fills > before, "no-output decode used and validated the specialized pool fill");
+            ++store_decodes;
+            return std::vector<float>();
+        }
+        require(pool_store_fills == before, "logits decode keeps the full pool inputs");
+        const float * logits = llama_get_logits(ctx);
+        require(logits != nullptr, "pool helper returns logits");
+        return std::vector<float>(logits, logits + (to - from)*n_vocab);
+    };
+    auto original = make_context();
+    const int64_t timing_started = ggml_time_us();
+    const auto timing_before = llama_perf_bookkeep_context(original.get());
+    // A logits-producing helper uses the generic full graph under the same static env settings.
+    llama_context_ptr reference = store_only ? make_context() : llama_context_ptr();
+    auto append = [&](llama_seq_id seq, llama_pos from, llama_pos to, bool want_logits) {
+        const bool output = !store_only || want_logits;
+        std::vector<float> expected;
+        if (reference) {
+            expected = decode(reference.get(), seq, from, to, true);
+        }
+        auto actual = decode(original.get(), seq, from, to, output);
+        if (reference) {
+            require(save(original.get(), seq) == save(reference.get(), seq),
+                    "KV-only pool writes preserve the full-graph helper cache bytes");
+            require(!output || (actual.size() == expected.size() &&
+                        std::memcmp(actual.data(), expected.data(), actual.size()*sizeof(float)) == 0),
+                    "KV-only catch-up preserves subsequent full-graph logits exactly");
+        }
+        if (want_logits) { observe(actual.data(), actual.size()*sizeof(float)); }
+        return actual;
+    };
+    auto * mem = pool_memory(original.get());
+    auto * idx = mem->get_mem_idx();
+    append(0, 0, 3, false);
+    append(0, 3, 4, true);
+    const int32_t reused = llama_perf_context(original.get()).n_reused;
+    append(0, 4, 6, false);
+    append(0, 6, 8, false);
+    require(!store_only || llama_perf_context(original.get()).n_reused > reused,
+            "specialized pool graph reuses its allocation across partial/complete boundaries");
+    const auto shared = idx->get_cells(0).seq_pos_get(0);
+    require(shared.size() == 8, "pool source has two complete pools");
+    llama_memory_seq_cp(mem, 0, 1, -1, -1);
+    if (reference) { llama_memory_seq_cp(llama_get_memory(reference.get()), 0, 1, -1, -1); }
+    require(idx->get_cells(1).seq_pos_get(1) == shared, "sequence copy shares the physical pool representatives");
+    append(0, 8, 9, true);
+    append(1, 8, 9, false);
+    require(llama_memory_seq_rm(mem, 1, -1, -1), "delete copied pool sequence");
+    if (reference) { require(llama_memory_seq_rm(llama_get_memory(reference.get()), 1, -1, -1), "delete copied reference sequence"); }
+    require(idx->get_cells(1).seq_pos_get(1).empty(), "copied pool sequence is empty");
+    append(0, 9, 11, false);
+    require(llama_memory_seq_rm(mem, 0, 6, -1), "rollback through a complete and partial pool");
+    if (reference) { require(llama_memory_seq_rm(llama_get_memory(reference.get()), 0, 6, -1), "rollback reference pools"); }
+    require(idx->get_cells(0).seq_pos_get(0).size() == 6 && llama_memory_seq_pos_max(mem, 0) == 5,
+            "pool rollback preserves the prefix");
+    append(0, 6, 8, false);
+    append(0, 8, 11, false);
+    const auto state = save(original.get(), 0);
+    observe(state.data(), state.size());
+    auto restore_pool = [&](llama_context * ctx, const std::vector<uint8_t> & data, llama_seq_id seq) {
+        require(llama_state_seq_set_data_ext(ctx, data.data(), data.size(), seq,
+                    LLAMA_STATE_SEQ_FLAGS_KEEP_LAYOUT) == data.size(), "restore pool cache bytes with the saved physical layout");
+    };
+    auto normalized_state = [&](llama_context * ctx, llama_seq_id seq) {
+        auto data = save(ctx, seq);
+        if (seq == 0) { return data; }
+        // Serialized sequence IDs differ. Normalize through the public state API, never by masking bytes.
+        auto normalized = make_context();
+        restore_pool(normalized.get(), data, 0);
+        return save(normalized.get(), 0);
+    };
+    auto resumed = make_context();
+    auto same_seq = make_context();
+    // Both restored trajectories start from the identical saved byte vector and use identical batch widths.
+    restore_pool(resumed.get(), state, 1);
+    restore_pool(same_seq.get(), state, 0);
+    auto * restored = pool_memory(resumed.get());
+    require(restored->get_mem_idx()->get_cells(0).seq_pos_get(0).empty(), "pool restore leaves the other sequence empty");
+    require(restored->get_mem_idx()->get_cells(1).seq_pos_get(1) == idx->get_cells(0).seq_pos_get(0),
+            "pool restore keeps the saved physical layout");
+    require(normalized_state(resumed.get(), 1) == state && save(same_seq.get(), 0) == state,
+            "same- and different-sequence pool restore round-trip every normalized cache byte exactly");
+    llama_context_ptr restored_reference = store_only ? make_context() : llama_context_ptr();
+    if (restored_reference) { restore_pool(restored_reference.get(), state, 0); }
+    size_t restore_rows = 0, restore_exact_rows = 0, restore_top1_equal = 0, restored_store_calls = 0;
+    double restore_kld_sum = 0.0, restore_kld_max = 0.0, restore_max_error = 0.0;
+    llama_pos from = 11;
+    for (llama_pos to : { 12, 15, 16, 20, 21, 24 }) {
+        const bool want_logits = to != 16 && to != 21;
+        const bool output = !store_only || want_logits;
+        const auto expected = append(0, from, to, want_logits);
+        const auto actual = decode(resumed.get(), 1, from, to, output);
+        const auto same_actual = decode(same_seq.get(), 0, from, to, output);
+        require(actual.size() == same_actual.size() && (actual.empty() ||
+                    std::memcmp(actual.data(), same_actual.data(), actual.size()*sizeof(float)) == 0),
+                "same- and different-sequence restored pool continuation logits are bit-identical");
+        const auto normalized = normalized_state(resumed.get(), 1);
+        require(normalized == save(same_seq.get(), 0),
+                "same-state restored trajectories preserve every normalized cache byte after continuation");
+        observe(normalized.data(), normalized.size());
+        // Keep the causal boundary strict: historical re-pooling may round differently after restore,
+        // but neither serialized physical membership nor any raw indexer key may change.
+        auto * restored_idx = pool_memory(same_seq.get())->get_mem_idx();
+        const auto & physical = idx->get_cells(0).seq_pos_get(0);
+        require(physical == restored_idx->get_cells(0).seq_pos_get(0),
+                "restored and unrestored pool continuation keeps the saved physical cells");
+        auto * keys = idx->get_k_storage(model->hparams.n_layer());
+        auto * restored_keys = restored_idx->get_k_storage(model->hparams.n_layer());
+        require(keys->type == restored_keys->type && keys->nb[1] == restored_keys->nb[1],
+                "restored indexer key geometry");
+        const size_t raw_bytes = ggml_row_size(keys->type, model->hparams.indexer_head_size);
+        require(keys->ne[0] == 2*model->hparams.indexer_head_size && restored_keys->ne[0] == keys->ne[0] &&
+                    raw_bytes > 0 && 2*raw_bytes == keys->nb[1], "packed raw and pooled indexer key rows");
+        std::vector<uint8_t> before_row(2*raw_bytes), after_row(2*raw_bytes);
+        size_t changed_pooled_rows = 0;
+        for (const auto & pc : physical) {
+            ggml_backend_tensor_get(keys, before_row.data(), pc.second*keys->nb[1], before_row.size());
+            ggml_backend_tensor_get(restored_keys, after_row.data(), pc.second*restored_keys->nb[1], after_row.size());
+            require(std::memcmp(before_row.data(), after_row.data(), raw_bytes) == 0,
+                    "restored continuation preserves every raw indexer key exactly");
+            changed_pooled_rows += std::memcmp(before_row.data() + raw_bytes, after_row.data() + raw_bytes, raw_bytes) != 0;
+        }
+        printf("DRAFTRW_POOL_RESTORE_CACHE to=%d cells=%zu raw_equal=1 pooled_changed=%zu\n",
+                to, physical.size(), changed_pooled_rows);
+        if (!output) { restored_store_calls += 2; }
+        if (restored_reference) {
+            const auto full = decode(restored_reference.get(), 0, from, to, true);
+            require(normalized == save(restored_reference.get(), 0),
+                    "restored store-only pool writes preserve restored full-graph cache bytes exactly");
+            require(!output || (same_actual.size() == full.size() &&
+                        std::memcmp(same_actual.data(), full.data(), full.size()*sizeof(float)) == 0),
+                    "restored store-only continuation matches restored full-graph logits exactly");
+        }
+        if (want_logits) {
+            observe(actual.data(), actual.size()*sizeof(float));
+            require(actual.size() == expected.size(), "restored pool output row count");
+            // fork: state_read invalidates historical pools; re-pooling at a different width changes legacy rounding.
+            // The KLD cell and exact cache/logit digest must match across fresh-process legacy/incremental/store-only runs.
+            for (size_t row = 0; row < actual.size()/n_vocab; ++row) {
+                const size_t first = row*n_vocab;
+                const auto pa = expected.begin() + first;
+                const auto qa = actual.begin() + first;
+                const double ma = *std::max_element(pa, pa + n_vocab);
+                const double mb = *std::max_element(qa, qa + n_vocab);
+                double za = 0.0, zb = 0.0, kld = 0.0, max_error = 0.0;
+                for (size_t j = first; j < first + n_vocab; ++j) {
+                    require(std::isfinite(expected[j]) && std::isfinite(actual[j]), "finite restored pool logits");
+                    max_error = std::max(max_error, std::abs(double(actual[j]) - expected[j]));
+                    za += std::exp(expected[j] - ma);
+                    zb += std::exp(actual[j] - mb);
+                }
+                for (size_t j = first; j < first + n_vocab; ++j) {
+                    const double logp = expected[j] - ma - std::log(za);
+                    const double logq = actual[j] - mb - std::log(zb);
+                    kld += std::exp(logp)*(logp - logq);
+                }
+                require(std::isfinite(kld) && kld >= -1e-12, "finite restored pool KLD");
+                const bool exact = std::memcmp(expected.data() + first, actual.data() + first, n_vocab*sizeof(float)) == 0;
+                const bool top1_equal = std::max_element(pa, pa + n_vocab) - pa == std::max_element(qa, qa + n_vocab) - qa;
+                ++restore_rows;
+                restore_exact_rows += exact;
+                restore_top1_equal += top1_equal;
+                restore_kld_sum += kld;
+                restore_kld_max = std::max(restore_kld_max, kld);
+                restore_max_error = std::max(restore_max_error, max_error);
+                printf("DRAFTRW_POOL_RESTORE_KLD pos=%d exact=%d top1_equal=%d kld=%.17g max_logit_error=%.17g\n",
+                        from + int(row), int(exact), int(top1_equal), kld, max_error);
+            }
+        }
+        from = to;
+    }
+    require(!store_only || restored_store_calls == 4,
+            "restored pool cache exercises two real no-output continuations before exact output checks");
+    require(!store_only || store_decodes >= 9, "store-only pool regression exercises real specialized fills throughout edits and restore");
+    // fork: one real prefill ubatch creates 17 pools, crossing the sparse marker's stack16/hash threshold.
+    // Repeated member marks also exercise hash deduplication.
+    auto large = make_context(80);
+    llama_context_ptr large_reference = store_only ? make_context(80) : llama_context_ptr();
+    std::vector<float> large_expected;
+    if (large_reference) { decode(large_reference.get(), 0, 0, 68, true); }
+    const size_t large_store_before = pool_store_fills;
+    decode(large.get(), 0, 0, 68, !store_only);
+    require(!store_only || pool_store_fills == large_store_before + 1, "large sparse-mark prefill executes as one store-only ubatch");
+    require(pool_memory(large.get())->get_mem_idx()->get_cells(0).seq_pos_get(0).size() == 68,
+            "large pool fixture prefills 17 complete pools in one ubatch");
+    if (large_reference) {
+        require(save(large.get(), 0) == save(large_reference.get(), 0),
+                "sparse hash marks preserve the generic full-graph prefill cache bytes");
+        large_expected = decode(large_reference.get(), 0, 68, 72, true);
+    }
+    const auto large_actual = decode(large.get(), 0, 68, 72, true);
+    observe(large_actual.data(), large_actual.size()*sizeof(float));
+    require(!large_reference || (large_actual.size() == large_expected.size() &&
+                std::memcmp(large_actual.data(), large_expected.data(), large_actual.size()*sizeof(float)) == 0),
+            "sparse hash prefill preserves subsequent full-graph logits exactly");
+    const char * timing = std::getenv("LLAMA_BOOKKEEP_TIMING");
+    if (timing && std::atoi(timing) != 0) {
+        const auto after = llama_perf_bookkeep_context(original.get());
+        const uint64_t detail_us =
+            after.memory_init_layout_host_us - timing_before.memory_init_layout_host_us +
+            after.graph_prepare_host_us - timing_before.graph_prepare_host_us +
+            after.set_inputs_host_us - timing_before.set_inputs_host_us +
+            after.peer_sync_host_us - timing_before.peer_sync_host_us +
+            after.graph_submit_host_us - timing_before.graph_submit_host_us;
+        require(after.graph_rebuild_calls + after.graph_reuse_calls >
+                timing_before.graph_rebuild_calls + timing_before.graph_reuse_calls,
+                "catch-up detail counts graph preparation attempts");
+        require(detail_us > 0 && detail_us <= uint64_t(ggml_time_us() - timing_started + 10),
+                "catch-up detail stages are active and do not overlap");
+        uint64_t backend_us = 0;
+        for (size_t i : { 0u, 1u, 2u, 4u, 5u, 6u }) {
+            require(after.backend_submit[i] >= timing_before.backend_submit[i], "backend counters are monotonic");
+            backend_us += after.backend_submit[i] - timing_before.backend_submit[i];
+        }
+        require(backend_us > 0 && backend_us <= uint64_t(ggml_time_us() - timing_started + 10),
+                "backend host intervals are active and do not overlap");
+        require(after.backend_submit[3] - timing_before.backend_submit[3] <=
+                after.backend_submit[2] - timing_before.backend_submit[2],
+                "user-input synchronization is nested in input copies");
+        require(after.backend_submit[cuda ? 8 : 7] > timing_before.backend_submit[cuda ? 8 : 7],
+                "backend counters execute the selected CPU or CUDA provider");
+    }
+    printf("DRAFTRW_POOL digest=%016llx\n", (unsigned long long) digest);
+    printf("DRAFTRW_POOL_RESTORE rows=%zu exact_rows=%zu top1_equal=%zu kld_mean=%.17g kld_max=%.17g max_logit_error=%.17g\n",
+            restore_rows, restore_exact_rows, restore_top1_equal, restore_kld_sum/restore_rows, restore_kld_max, restore_max_error);
+    printf("PASS Qwen4exp %s pool fixture%s: partial boundaries, suffix rollback/reappend, shared representatives, copied sequence deletion, normalized restore bytes, identical restored cache/logits, post-restore KV-only continuation, stack16/hash prefill; unrestored rounding is a separate KLD cell requiring fresh-process legacy comparison (%zu specialized fills)\n",
+            cuda ? "GPU" : "CPU", store_only ? " store-only" : "", store_decodes);
+}
+
+static void run_qwen4exp_chain(bool cuda, bool compact = false) {
+    prefill_env_restore prefill_env;
+    prefill_env.set(false, false, false);
+    feedback_env_restore feedback_env;
+    common_set_env("LLAMA_SPEC_DEFER_CATCHUP", "0");
+    common_set_env("LLAMA_MTP_DEVICE_FEEDBACK", "0");
+    common_set_env("LLAMA_MTP_QWEN4EXP_CHAIN", "0");
+    common_set_env("LLAMA_MTP_QSA_COMPACT", compact ? "1" : "0");
+    auto * device = cuda ? ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU) : nullptr;
+    require(!cuda || device, "chain GPU backend is available");
+    model_geometry geometry;
+    geometry.kpool = 4;
+    // Two selected pools force real ranking once catch-up plus depth completes the third pool.
+    geometry.indexer_top_k = 8;
+    llama_model_ptr model(make_model(false, geometry, LLM_ARCH_QWEN4EXP, device));
+    require(!llama_model_supports_mtp_chain(model.get()), "Qwen4exp chain is opt-in");
+    const cache_config config { "Qwen4exp chain", compact ? GGML_TYPE_TQ5_0 : GGML_TYPE_Q8_0,
+        compact ? GGML_TYPE_TURBO4_0 : GGML_TYPE_Q8_0 };
+    const int depth = 3, top_k = 10;
+    const float top_p = 0.95f;
+    const float uniforms[depth] = { 0.173f, 0.619f, 0.937f };
+    const size_t width = llama_model_n_embd_out(model.get());
+    for (int catchup : { 0, 2 }) {
+        common_set_env("LLAMA_MTP_QWEN4EXP_CHAIN", "0");
+        contexts reference(model.get(), config, 16, COMMON_SPECULATIVE_TYPE_DRAFT_MTP, 16, 1, 512);
+        contexts chained(model.get(), config, 16, COMMON_SPECULATIVE_TYPE_DRAFT_MTP, 16, 1, 512);
+        // The scalar oracle reads full raw logits. Backend top-k sampling skips
+        // that download, so detach it before any oracle decode.
+        require(llama_set_sampler(reference.dft, 0, nullptr), "detach raw-logit reference backend sampler");
+        // These direct graph calls use packed chain outputs, not the driver's
+        // single-row top-k backend sampler installed while chain mode was off.
+        require(llama_set_sampler(chained.dft, 0, nullptr), "detach direct-chain backend sampler");
+        prefill(reference, 0, 7, 0);
+        prefill(chained, 0, 7, 0);
+        std::vector<float> seed((catchup + 1) * width), poison(width, 1000.0f);
+        const float * last = llama_get_embeddings_nextn_ith(reference.tgt, 6);
+        std::copy(last, last + width, seed.begin());
+        if (catchup) {
+            common_batch target(reference.tgt);
+            for (int j = 0; j < catchup; ++j) {
+                target.add(token_at(7 + j), 7 + j, 0, true);
+            }
+            require(llama_process(reference.tgt, LLAMA_PROCESS_TYPE_DECODE, target.get()) == 0, "chain target catch-up residuals");
+            for (int j = 0; j < catchup; ++j) {
+                const float * row = llama_get_embeddings_nextn_ith(reference.tgt, j);
+                std::copy(row, row + width, seed.begin() + (j + 1) * width);
+            }
+        }
+        const auto reference_state = save(reference.dft, 0);
+        const auto chain_state = save(chained.dft, 0);
+        common_set_env("LLAMA_MTP_QWEN4EXP_CHAIN", "1");
+        require(llama_model_supports_mtp_chain(model.get()), "Qwen4exp chain capability is enabled");
+        for (int trial = 0; trial < 3; ++trial) {
+            std::vector<uint8_t> scalar_input, merged_input;
+            if (trial == 1) {
+                require(llama_memory_seq_rm(llama_get_memory(reference.dft), 0, 7, -1), "rollback sequential helper");
+                require(llama_memory_seq_rm(llama_get_memory(chained.dft), 0, 7, -1), "rollback chained helper");
+            } else if (trial == 2) {
+                require(llama_state_seq_set_data_ext(reference.dft, reference_state.data(), reference_state.size(), 0,
+                            LLAMA_STATE_SEQ_FLAGS_KEEP_LAYOUT) == reference_state.size(), "restore sequential helper");
+                require(llama_state_seq_set_data_ext(chained.dft, chain_state.data(), chain_state.size(), 0,
+                            LLAMA_STATE_SEQ_FLAGS_KEEP_LAYOUT) == chain_state.size(), "restore chained helper");
+            }
+            if (catchup) {
+                common_batch front(reference.dft);
+                for (int j = 0; j < catchup; ++j) {
+                    const int row = front.add(token_at(7 + j), 7 + j, 0, false);
+                    require(front.set_embd(row, { seed.data() + j * width, 1, width }), "attach catch-up residual");
+                }
+                require(llama_process(reference.dft, LLAMA_PROCESS_TYPE_DECODE,
+                            checked_embedding_batch(front, seed, width, &scalar_input)) == 0, "sequential KV-only catch-up");
+            }
+            std::vector<float> hidden(seed.end() - width, seed.end()), expected_logits(depth * n_vocab), expected_hidden(depth * width);
+            std::vector<llama_token> picks(depth);
+            llama_token token = token_at(7 + catchup);
+            for (int j = 0; j < depth; ++j) {
+                common_batch step(reference.dft);
+                const int row = step.add(token, 7 + catchup + j, 0, true);
+                require(step.set_embd(row, { hidden.data(), 1, width }), "attach sequential helper residual");
+                require(llama_process(reference.dft, LLAMA_PROCESS_TYPE_DECODE,
+                            checked_embedding_batch(step, hidden, width, j == 0 ? &scalar_input : nullptr)) == 0,
+                        "sequential reference step");
+                const float * logits = llama_get_logits(reference.dft);
+                std::copy(logits, logits + n_vocab, expected_logits.begin() + j * n_vocab);
+                std::vector<int> order(n_vocab);
+                for (uint32_t k = 0; k < n_vocab; ++k) { order[k] = k; }
+                std::sort(order.begin(), order.end(), [&](int a, int b) { return logits[a] > logits[b]; });
+                std::vector<float> candidate_row(LLAMA_MTP_CHAIN_ROW(top_k));
+                for (int k = 0; k < top_k; ++k) {
+                    candidate_row[2 + k] = order[k];
+                    candidate_row[2 + top_k + k] = logits[order[k]];
+                }
+                std::vector<llama_token_data> q;
+                const int pick = llama_mtp_chain_rederive(candidate_row.data(), top_k, 1.0f, top_p, 0.0f,
+                        uniforms[j], n_vocab, q);
+                require(pick >= 0, "sample the sequential reference with the chain uniform");
+                picks[j] = order[pick];
+                token = picks[j];
+                const float * next = llama_get_embeddings_nextn(reference.dft);
+                std::copy(next, next + width, hidden.begin());
+                std::copy(hidden.begin(), hidden.end(), expected_hidden.begin() + j * width);
+            }
+            common_batch batch(chained.dft);
+            std::vector<float> chain_input(size_t(catchup + depth)*width);
+            for (int j = 0; j < catchup + depth; ++j) {
+                const int row = batch.add(j <= catchup ? token_at(7 + j) : 0, 7 + j, 0, j >= catchup);
+                const float * h = j <= catchup ? seed.data() + j * width : poison.data();
+                std::copy(h, h + width, chain_input.begin() + size_t(j)*width);
+                require(batch.set_embd(row, { chain_input.data() + size_t(j)*width, 1, width }), "attach chain seed or poisoned placeholder");
+            }
+            llama_set_mtp_chain_sampling(chained.dft, top_k, 1.0f, top_p, 0.0f, uniforms, depth);
+            llama_set_mtp_chain(chained.dft, true);
+            // Later host rows are deliberately poisoned: the chain replaces
+            // them with feedback. Only catch-up plus the common seed is shared
+            // with the scalar input; every rendered row is still checked above.
+            auto * rendered = checked_embedding_batch(batch, chain_input, width, &merged_input, catchup + 1);
+            require(scalar_input == merged_input, "scalar and merged chain receive identical serialized catch-up and seed inputs");
+            printf("DRAFTRW_CHAIN_INPUT catchup=%d trial=%d rows=%d scalar=%016llx merged=%016llx\n",
+                    catchup, trial, catchup + 1, (unsigned long long) embedding_input_digest(scalar_input),
+                    (unsigned long long) embedding_input_digest(merged_input));
+            require(llama_process(chained.dft, LLAMA_PROCESS_TYPE_DECODE, rendered) == 0, "sampled Qwen4exp chain");
+            const float * rows = llama_get_logits(chained.dft);
+            const float * residuals = llama_get_embeddings_nextn(chained.dft);
+            for (int j = 0; j < depth; ++j) {
+                const float * row = rows + j * LLAMA_MTP_CHAIN_ROW(top_k);
+                const float * logits = expected_logits.data() + j * n_vocab;
+                std::vector<int> order(n_vocab);
+                for (uint32_t k = 0; k < n_vocab; ++k) { order[k] = k; }
+                std::sort(order.begin(), order.end(), [&](int a, int b) { return logits[a] > logits[b]; });
+                // Qwen payloads retain backend top-k order; the legacy graph-uniform
+                // reference operates on a sorted copy of those same candidates.
+                std::vector<int> candidate_order(top_k), actual_ids(top_k), expected_ids(order.begin(), order.begin() + top_k);
+                for (int k = 0; k < top_k; ++k) {
+                    const float id = row[2 + k];
+                    require(std::isfinite(id) && id >= 0 && id < n_vocab && id == std::floor(id),
+                            "chain candidate IDs are valid");
+                    candidate_order[k] = k;
+                    actual_ids[k] = (llama_token) id;
+                    require(cuda || row[2 + top_k + k] == logits[actual_ids[k]], "CPU chain candidate logits are bit-identical");
+                }
+                std::sort(actual_ids.begin(), actual_ids.end());
+                std::sort(expected_ids.begin(), expected_ids.end());
+                require(actual_ids == expected_ids, "chain top-k candidate set matches the sequential helper");
+                std::sort(candidate_order.begin(), candidate_order.end(), [&](int a, int b) {
+                    return row[2 + top_k + a] > row[2 + top_k + b];
+                });
+                std::vector<float> sorted_row(row, row + LLAMA_MTP_CHAIN_ROW(top_k));
+                for (int k = 0; k < top_k; ++k) {
+                    sorted_row[2 + k] = row[2 + candidate_order[k]];
+                    sorted_row[2 + top_k + k] = row[2 + top_k + candidate_order[k]];
+                }
+                std::vector<llama_token_data> q;
+                const int pick = llama_mtp_chain_rederive(sorted_row.data(), top_k, 1.0f, top_p, 0.0f, uniforms[j], n_vocab, q);
+                require(pick >= 0 && (llama_token) sorted_row[2 + pick] == (llama_token) row[0],
+                        "host re-derives the sampled chain token");
+                require((llama_token) row[0] == picks[j], "chain conditions on the sequential sampled token");
+                std::vector<float> reference_row(LLAMA_MTP_CHAIN_ROW(top_k));
+                for (int k = 0; k < top_k; ++k) {
+                    reference_row[2 + k] = order[k];
+                    reference_row[2 + top_k + k] = logits[order[k]];
+                }
+                std::vector<llama_token_data> reference_q;
+                const int reference_pick = llama_mtp_chain_rederive(reference_row.data(), top_k, 1.0f, top_p, 0.0f,
+                        uniforms[j], n_vocab, reference_q);
+                require(reference_pick >= 0 && reference_row[2 + reference_pick] == sorted_row[2 + pick],
+                        "reference and chain draw the same candidate");
+                require(reference_q.size() == q.size(), "chain preserves top-p support");
+                double kl = 0.0, error = 0.0, norm = 0.0;
+                for (size_t k = 0; k < q.size(); ++k) {
+                    require(reference_q[k].id == q[k].id, "chain preserves sampled proposal IDs");
+                    kl += reference_q[k].p * std::log(double(reference_q[k].p) / q[k].p);
+                }
+                for (size_t k = 0; k < width; ++k) {
+                    const double expected = expected_hidden[j * width + k], actual = residuals[j * width + k];
+                    error += (expected - actual) * (expected - actual);
+                    norm += expected * expected;
+                }
+                const double nmse = error / std::max(norm, 1e-30);
+                printf("CHAIN_KLD %s catchup=%d trial=%d step=%d kl=%.9g hidden_nmse=%.9g\n", cuda ? "GPU" : "CPU", catchup, trial, j, kl, nmse);
+                require(kl <= 1e-6 && nmse <= 1e-8, "chain preserves proposal math within the rounding budget");
+                require(cuda || error == 0.0, "CPU chain preserves the raw helper residual exactly");
+            }
+            llama_set_mtp_chain(chained.dft, false);
+            llama_set_mtp_chain_sampling(chained.dft, 0, 1.0f, 1.0f, 0.0f, nullptr, 0);
+        }
+        require(llama_perf_context(chained.dft).n_reused > 0, "chain graph is reused across rollback and restore");
+    }
+    // Separate model objects engage the production common-driver chain (ctx_other then shares no KV).
+    // Save before drafting so the prompt restore also covers target carry and deferred catch-up rows.
+    llama_model_ptr helper(make_model(false, geometry, LLM_ARCH_QWEN4EXP, device));
+    common_set_env("LLAMA_MTP_QWEN4EXP_CHAIN", "1");
+    common_set_env("LLAMA_SPEC_CHAIN_SAMPLED", "1");
+    common_set_env("LLAMA_SPEC_PQ", "1");
+    contexts original(model.get(), config, 16, COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE, 16, 1, 512, helper.get());
+    prefill(original, 0, 7, 0);
+    const snapshot cached = save(original, 0);
+    llama_pos original_pos = 7;
+    const schedule expected = generate(original, 0, original_pos, 0, 3, true);
+    contexts resumed(model.get(), config, 16, COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE, 16, 1, 512, helper.get());
+    restore(resumed, cached, 0);
+    llama_pos resumed_pos = 7;
+    require_schedule(generate(resumed, 0, resumed_pos, 0, 3, true), expected, "sampled common chain driver resumes prompt carry and deferred catch-up");
+    printf("PASS Qwen4exp %s sampled chain%s: k-pool boundaries/ranking, front-only catch-up, poisoned placeholders, nonzero uniforms/top-p, proposal KLD, raw residuals, rollback, restore, graph reuse\n", cuda ? "GPU" : "CPU", compact ? " compact TQ5/TURBO4" : "");
+}
+
+// The source head must have a row decoder for init_draft_vocab to build its compact copy.
+// F32 intentionally lacks to_float, so this generated fixture uses identical F16-rounded heads.
+// These owners are declared after the model owners and before all contexts: contexts die first,
+// then the original pointers are restored before the F16 buffers or models can be destroyed.
+struct full_head_f16_output {
+    llama_model & model;
+    ggml_tensor * original;
+    ggml_context_ptr ctx;
+    ggml_backend_buffer_ptr buffer;
+    ggml_tensor * head = nullptr;
+
+    full_head_f16_output(llama_model & model, const std::vector<ggml_fp16_t> & weights) :
+        model(model), original(model.output) {
+        require(original && original->type == GGML_TYPE_F32 && original->buffer &&
+                original != model.tok_embd && original->ne[2] == 1 && original->ne[3] == 1 &&
+                ggml_is_contiguous(original) && weights.size() == size_t(ggml_nelements(original)),
+                "generated fixture has a separate allocated full F32 output head");
+        require(ggml_get_type_traits(GGML_TYPE_F16)->to_float != nullptr,
+                "F16 fixture source head has a real compact-row decoder");
+        for (const auto & layer : model.layers) {
+            require(!layer.nextn.shared_head_head, "Qwen4exp fixture compact source is model.output");
+        }
+        ctx.reset(ggml_init({ ggml_tensor_overhead(), nullptr, true }));
+        require(ctx != nullptr, "allocate fixture F16 head metadata");
+        head = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F16, original->ne[0], original->ne[1]);
+        ggml_set_name(head, ggml_get_name(original));
+        buffer.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), ggml_backend_buffer_get_type(original->buffer)));
+        require(buffer != nullptr, "allocate fixture F16 head in original backend");
+        ggml_backend_buffer_set_usage(buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        ggml_backend_tensor_set(head, weights.data(), 0, ggml_nbytes(head));
+        for (auto & named : model.tensors_by_name) {
+            if (named.second == original) { named.second = head; }
+        }
+        model.output = head;
+    }
+
+    ~full_head_f16_output() {
+        model.output = original;
+        for (auto & named : model.tensors_by_name) {
+            if (named.second == head) { named.second = original; }
+        }
+    }
+};
+
+struct full_head_graph_stats {
+    size_t batched = 0, provisional = 0;
+};
+
+static bool full_head_fixture_eval(ggml_tensor * tensor, bool ask, void * user_data) {
+    const bool batched = tensor->op == GGML_OP_MUL_MAT && tensor->ne[0] == n_vocab && tensor->ne[1] == 4 &&
+            std::strncmp(tensor->name, "mtp_chain_full_logits", std::strlen("mtp_chain_full_logits")) == 0;
+    const bool provisional = tensor->op == GGML_OP_MUL_MAT && tensor->ne[0] == n_vocab / 2 && tensor->ne[1] == 1 &&
+            tensor->src[0] && tensor->src[0]->ne[0] == n_embd && tensor->src[0]->ne[1] == n_vocab / 2 &&
+            std::strstr(tensor->src[0]->name, "draft_vocab_compact") != nullptr;
+    if (ask) { return batched || provisional; }
+    auto & stats = *static_cast<full_head_graph_stats *>(user_data);
+    stats.batched += batched;
+    stats.provisional += provisional;
+    return true;
+}
+
+static void require_full_head_graph(const full_head_graph_stats & before, const full_head_graph_stats & after,
+        bool cuda, const char * phase, int fault, int round, bool enabled) {
+    const size_t batched = after.batched - before.batched, provisional = after.provisional - before.provisional;
+    const size_t expected_batched = enabled ? 1 : 0, expected_provisional = enabled ? 3 : 0;
+    if (batched != expected_batched || provisional != expected_provisional) {
+        fprintf(stderr, "FULL_HEAD_GRAPH_FAILURE %s phase=%s fault=%d round=%d batched=%zu expected_batched=%zu provisional=%zu expected_provisional=%zu\n",
+                cuda ? "GPU" : "CPU", phase, fault, round, batched, expected_batched, provisional, expected_provisional);
+    }
+    require(batched == expected_batched && provisional == expected_provisional,
+            "full-head fixture executes actual batched and compact provisional projections (or explicit sequential fallback)");
+}
+
+struct full_head_round {
+    llama_tokens tokens;
+    std::vector<std::vector<llama_token_data>> q;
+    int n_eval = 0;
+    int n_p_eval = 0;
+};
+
+static common_params_sampling full_head_sampling() {
+    common_params_sampling sampling;
+    sampling.seed = 9127;
+    sampling.temp = 1.0f;
+    sampling.top_k = 10;
+    sampling.top_p = 0.95f;
+    sampling.min_p = 0.0f;
+    sampling.min_keep = 1;
+    sampling.dynatemp_range = 0.0f;
+    sampling.samplers = { COMMON_SAMPLER_TYPE_TOP_K, COMMON_SAMPLER_TYPE_TOP_P,
+        COMMON_SAMPLER_TYPE_MIN_P, COMMON_SAMPLER_TYPE_TEMPERATURE };
+    return sampling;
+}
+
+static void prime_full_head_eval_counter(contexts & ctx) {
+    // Perf counts clamp zero to one. Seed the scalar counter without touching the driver's sampler or carry.
+    const auto state = save(ctx.dft, 0);
+    const llama_pos pos = llama_memory_seq_pos_max(llama_get_memory(ctx.dft), 0) + 1;
+    std::vector<float> zero(llama_model_n_embd_out(llama_get_model(ctx.dft)), 0.0f);
+    common_batch batch(ctx.dft);
+    const int row = batch.add(token_at(pos), pos, 0, true);
+    require(batch.set_embd(row, { zero.data(), 1, zero.size() }), "attach counter-prime residual");
+    require(llama_process(ctx.dft, LLAMA_PROCESS_TYPE_DECODE,
+                checked_embedding_batch(batch, zero, zero.size())) == 0, "prime scalar eval counter");
+    llama_synchronize(ctx.dft);
+    require(llama_state_seq_set_data_ext(ctx.dft, state.data(), state.size(), 0,
+                LLAMA_STATE_SEQ_FLAGS_KEEP_LAYOUT) == state.size(), "restore helper after counter prime");
+}
+
+static full_head_round draft_full_head_round(contexts & ctx, llama_pos pos, const common_params_sampling & sampling, int depth) {
+    full_head_round result;
+    llama_tokens prompt;
+    auto & dp = common_speculative_get_draft_params(ctx.spec, 0);
+    dp = {};
+    dp.drafting = true;
+    dp.n_max = depth;
+    dp.pos0 = pos;
+    dp.id_last = token_at(pos);
+    dp.prompt = &prompt;
+    dp.result = &result.tokens;
+    dp.result_q = &result.q;
+    dp.sampling = &sampling;
+    llama_synchronize(ctx.dft);
+    // Suffix repair detaches its temporary backend top-k sampler and requests a scheduler reserve.
+    // Drain that pending work outside chain mode: the generic reserve probes width one, whereas
+    // this fixture's immutable TEST_IDS list describes the four scored rows, not reserve probes.
+    // The following real draft still has to execute the audited width-four batched graph.
+    require(!ctx.dft->get_cparams().mtp_chain && ctx.dft->get_cparams().mtp_chain_top_k == 0,
+            "full-head fixture prepares the scheduler outside sampled chain mode");
+    ctx.dft->sched_reserve();
+    const auto before = llama_perf_context(ctx.dft);
+    common_speculative_draft(ctx.spec);
+    llama_synchronize(ctx.dft);
+    const auto after = llama_perf_context(ctx.dft);
+    result.n_eval = after.n_eval - before.n_eval;
+    result.n_p_eval = after.n_p_eval;
+    require(result.tokens.size() == (size_t) depth && result.q.size() == result.tokens.size(),
+            "full-head repair fills the entire requested draft cap");
+    for (size_t j = 0; j < result.q.size(); ++j) {
+        double total = 0.0;
+        bool selected = false;
+        require(!result.q[j].empty(), "full-head draft returns exact proposal q for every step");
+        for (const auto & candidate : result.q[j]) {
+            require(candidate.id >= 0 && candidate.id < (llama_token) n_vocab &&
+                    std::isfinite(candidate.p) && candidate.p > 0.0f, "valid full-vocabulary proposal candidate");
+            total += candidate.p;
+            selected = selected || candidate.id == result.tokens[j];
+        }
+        require(selected && std::fabs(total - 1.0) <= 1e-6, "proposal q is normalized and contains the sampled token");
+    }
+    return result;
+}
+
+static void finish_full_head_round(contexts & ctx, llama_pos & pos, const full_head_round & round, int accepted) {
+    llama_tokens verify { token_at(pos) };
+    verify.insert(verify.end(), round.tokens.begin(), round.tokens.end());
+    process(ctx, verify, pos, 0);
+    common_speculative_accept(ctx.spec, 0, accepted);
+    pos += accepted + 1;
+    require(llama_memory_seq_rm(llama_get_memory(ctx.tgt), 0, pos, -1), "full-head target rollback");
+    require(llama_memory_seq_rm(llama_get_memory(ctx.dft), 0, pos, -1), "full-head helper rollback");
+}
+
+static void require_full_head_round(const full_head_round & actual, const full_head_round & expected,
+        bool cuda, int fault, int round) {
+    require(actual.tokens == expected.tokens, "full-head repair preserves sampled tokens and RNG continuation");
+    require(actual.q.size() == expected.q.size(), "full-head repair preserves proposal row count");
+    for (size_t j = 0; j < expected.q.size(); ++j) {
+        float p[n_vocab] = {}, q[n_vocab] = {};
+        for (const auto & candidate : expected.q[j]) { p[candidate.id] = candidate.p; }
+        for (const auto & candidate : actual.q[j]) { q[candidate.id] = candidate.p; }
+        double kl = 0.0, max_error = 0.0;
+        for (uint32_t id = 0; id < n_vocab; ++id) {
+            require((p[id] > 0.0f) == (q[id] > 0.0f), "full-head repair preserves exact top-k/top-p support");
+            if (p[id] > 0.0f) { kl += p[id] * std::log(double(p[id]) / q[id]); }
+            max_error = std::max(max_error, std::fabs(double(p[id]) - q[id]));
+        }
+        printf("FULL_HEAD_KLD %s fault=%d round=%d step=%zu kl=%.9g max_p_error=%.9g\n",
+                cuda ? "GPU" : "CPU", fault, round, j, kl, max_error);
+        require(std::fabs(kl) <= 1e-6 && max_error <= 1e-5, "batched full-head proposal math stays within the rounding budget");
+    }
+}
+
+static void run_qwen4exp_full_head(bool cuda) {
+#ifndef _WIN32
+    prefill_env_restore prefill_env;
+    prefill_env.set(false, false, false);
+    feedback_env_restore env;
+    common_set_env("LLAMA_SPEC_DEFER_CATCHUP", "0");
+    common_set_env("LLAMA_MTP_DEVICE_FEEDBACK", "0");
+    common_set_env("LLAMA_MTP_QSA_COMPACT", "0");
+    common_set_env("LLAMA_SPEC_CHAIN_SAMPLED", "1");
+    common_set_env("LLAMA_SPEC_PQ", "1");
+    common_set_env("LLAMA_SPEC_DRAFT_TEMP_MULT", "1");
+    common_set_env("LLAMA_MTP_CHAIN_FULL_HEAD", "1");
+    common_set_env("LLAMA_MTP_CHAIN_TEST_IDS", "");
+    common_set_env("LLAMA_MTP_QWEN4EXP_CHAIN", "0");
+    common_set_env("LLAMA_DRAFT_VOCAB_COMPACT", "1");
+    common_set_env("LLAMA_DRAFT_VOCAB_COMPACT_TYPE", "f32");
+    auto * device = cuda ? ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU) : nullptr;
+    require(!cuda || device, "full-head repair GPU backend is available");
+    model_geometry geometry;
+    geometry.kpool = 4;
+    geometry.indexer_top_k = 8;
+    llama_model_ptr model(make_model(false, geometry, LLM_ARCH_QWEN4EXP, device));
+    llama_model_ptr helper(make_model(false, geometry, LLM_ARCH_QWEN4EXP, device));
+    require(model->output && helper->output && model->output->type == GGML_TYPE_F32 &&
+            helper->output->type == GGML_TYPE_F32 && ggml_nbytes(model->output) == ggml_nbytes(helper->output),
+            "full-head fixture models start with matching F32 head shapes");
+    std::vector<float> full_head_weights(ggml_nelements(model->output)), helper_head_weights(full_head_weights.size());
+    ggml_backend_tensor_get(model->output, full_head_weights.data(), 0, ggml_nbytes(model->output));
+    ggml_backend_tensor_get(helper->output, helper_head_weights.data(), 0, ggml_nbytes(helper->output));
+    require(full_head_weights == helper_head_weights, "target and helper generated full-head weights match exactly");
+    std::vector<ggml_fp16_t> rounded_head(full_head_weights.size());
+    ggml_fp32_to_fp16_row(full_head_weights.data(), rounded_head.data(), rounded_head.size());
+    full_head_f16_output model_head(*model, rounded_head), helper_head(*helper, rounded_head);
+    const cache_config config { "Qwen4exp full-head repair", GGML_TYPE_Q8_0, GGML_TYPE_Q8_0 };
+    const auto sampling = full_head_sampling();
+    constexpr int depth = 4, prompt_size = 7, rounds = 3;
+    const auto report_counter_mismatch = [cuda](const char * phase, int fault, int round,
+            const full_head_round & actual, int expected_repair, int expected_prompt,
+            const common_params_sampling & params, bool backend_sampling) {
+        if (actual.n_eval != expected_repair || actual.n_p_eval != expected_prompt) {
+            fprintf(stderr, "FULL_HEAD_COUNTER_FAILURE %s phase=%s fault=%d round=%d n_eval=%d expected_repair=%d n_p_eval=%d expected_prompt=%d backend_sampling=%d top_k=%d min_keep=%d top_p=%.9g min_p=%.9g temp=%.9g dynatemp_range=%.9g chain_optin=1 full_head=1 pq=1 sampled=1 n_seq=1 tokens=%zu q_rows=%zu\n",
+                    cuda ? "GPU" : "CPU", phase, fault, round, actual.n_eval, expected_repair,
+                    actual.n_p_eval, expected_prompt, int(backend_sampling), params.top_k, params.min_keep,
+                    double(params.top_p), double(params.min_p), double(params.temp), double(params.dynatemp_range),
+                    actual.tokens.size(), actual.q.size());
+        }
+    };
+    const int accepted[rounds] = { depth, 1, depth };
+    std::vector<full_head_round> expected;
+    {
+        contexts reference(model.get(), config, 16, COMMON_SPECULATIVE_TYPE_DRAFT_MTP, 16, 1, 512, helper.get(), "none");
+        prefill(reference, 0, prompt_size, 0);
+        prime_full_head_eval_counter(reference);
+        llama_pos pos = prompt_size;
+        for (int round = 0; round < rounds; ++round) {
+            expected.push_back(draft_full_head_round(reference, pos, sampling, depth));
+            finish_full_head_round(reference, pos, expected.back(), accepted[round]);
+        }
+    }
+
+    // Exclude every reference draw and scramble map positions to expose mapped IDs and renormalized q.
+    const auto close_file = [](FILE * file) { fclose(file); };
+    std::unique_ptr<FILE, decltype(close_file)> map(tmpfile(), close_file);
+    require(map != nullptr, "create provisional vocabulary fixture");
+    std::vector<llama_token> map_ids;
+    for (int id = n_vocab - 1; id >= 0 && map_ids.size() < n_vocab / 2; --id) {
+        bool drawn = false;
+        for (const auto & round : expected) {
+            drawn = drawn || std::find(round.tokens.begin(), round.tokens.end(), id) != round.tokens.end();
+        }
+        if (!drawn) { map_ids.push_back(id); }
+    }
+    require(map_ids.size() == n_vocab / 2, "fixture has enough unused tokens for its provisional map");
+    fprintf(map.get(), "llama-mtp-vocab-v1 %u %zu\n", n_vocab, map_ids.size());
+    for (llama_token id : map_ids) { fprintf(map.get(), "%d\n", id); }
+    require(fflush(map.get()) == 0, "flush provisional vocabulary fixture");
+    const std::string map_path = "/proc/self/fd/" + std::to_string(fileno(map.get()));
+    const auto in_map = [&](llama_token id) { return std::find(map_ids.begin(), map_ids.end(), id) != map_ids.end(); };
+    require(!in_map(expected[0].tokens[0]), "fixture full-head sample lies outside the provisional map");
+
+    // -2 uses the actual mapped provisional sampler; -1 forces a matching prefix; 0..3 force each first mismatch.
+    for (int fault : { -2, -1, 0, 1, 2, 3 }) {
+        std::string ids;
+        if (fault != -2) {
+            for (int j = 0; j < depth; ++j) {
+                const llama_token id = j == fault ? (expected[0].tokens[j] + 1) % n_vocab : expected[0].tokens[j];
+                if (j) { ids += ','; }
+                ids += std::to_string(id);
+            }
+        }
+        common_set_env("LLAMA_MTP_CHAIN_TEST_IDS", ids);
+        common_set_env("LLAMA_MTP_QWEN4EXP_CHAIN", "1");
+        const size_t maps_before = half_vocab_maps, compact_before = half_vocab_compact_heads;
+        full_head_graph_stats graph_stats;
+        contexts candidate(model.get(), config, 16, COMMON_SPECULATIVE_TYPE_DRAFT_MTP, 16, 1, 512,
+                helper.get(), map_path.c_str(), true, full_head_fixture_eval, &graph_stats);
+        require(half_vocab_maps == maps_before + 1, "candidate really loaded the provisional map");
+        require(half_vocab_compact_heads == compact_before + 1, "candidate really created its resident compact head");
+        prefill(candidate, 0, prompt_size, 0);
+        const snapshot cached = save(candidate, 0);
+        prime_full_head_eval_counter(candidate);
+        llama_pos pos = prompt_size;
+        for (int round = 0; round < rounds; ++round) {
+            const auto graph_before = graph_stats;
+            const auto actual = draft_full_head_round(candidate, pos, sampling, depth);
+            require_full_head_round(actual, expected[round], cuda, fault, round);
+            require(std::none_of(actual.tokens.begin(), actual.tokens.end(), in_map),
+                    "sequential suffix repair samples outside the loaded provisional map");
+            if (round == 0) {
+                const int repair = fault == -1 ? 0 : depth - (fault == -2 ? 0 : fault) - 1;
+                report_counter_mismatch("candidate", fault, round, actual, repair, prompt_size + depth, sampling, true);
+                require_full_head_graph(graph_before, graph_stats, cuda, "candidate", fault, round, true);
+                require(actual.n_eval == repair, "forced first mismatch performs exactly the required scalar suffix repairs");
+                // All seven prompt rows are deferred, including pos0 with its zero pending_h carry.
+                // Only the hidden copy is shifted; the final target hidden separately feeds query zero.
+                // The absolute counter avoids the API's zero-to-one prompt clamp: seven plus four = eleven.
+                require(actual.n_p_eval == prompt_size + depth, "full-head driver ran the multi-row chain with all deferred prompt rows");
+                require(!in_map(actual.tokens[0]), "loaded map does not truncate full-head proposals or repaired draws");
+                printf("FULL_HEAD_REPAIR %s fault=%d scalar_steps=%d chain_tokens=%d\n",
+                        cuda ? "GPU" : "CPU", fault, actual.n_eval, actual.n_p_eval);
+            } else {
+                require_full_head_graph(graph_before, graph_stats, cuda, "candidate", fault, round, true);
+            }
+            finish_full_head_round(candidate, pos, actual, accepted[round]);
+        }
+
+        if (fault == 0) {
+            const size_t compact_before = half_vocab_compact_heads;
+            full_head_graph_stats resumed_stats;
+            contexts resumed(model.get(), config, 16, COMMON_SPECULATIVE_TYPE_DRAFT_MTP, 16, 1, 512,
+                    helper.get(), map_path.c_str(), true, full_head_fixture_eval, &resumed_stats);
+            require(half_vocab_compact_heads == compact_before + 1, "restored candidate really created its resident compact head");
+            restore(resumed, cached, 0);
+            prime_full_head_eval_counter(resumed);
+            llama_pos resumed_pos = prompt_size;
+            for (int round = 0; round < rounds; ++round) {
+                const auto graph_before = resumed_stats;
+                const auto actual = draft_full_head_round(resumed, resumed_pos, sampling, depth);
+                require_full_head_round(actual, expected[round], cuda, fault, round);
+                if (round == 0) {
+                    report_counter_mismatch("restored", fault, round, actual, depth - 1, prompt_size + depth, sampling, true);
+                    require_full_head_graph(graph_before, resumed_stats, cuda, "restored", fault, round, true);
+                    require(actual.n_eval == depth - 1 && actual.n_p_eval == prompt_size + depth,
+                            "fresh prompt restore retains the real chain, catch-up, and suffix-repair paths");
+                } else {
+                    require_full_head_graph(graph_before, resumed_stats, cuda, "restored", fault, round, true);
+                }
+                finish_full_head_round(resumed, resumed_pos, actual, accepted[round]);
+            }
+        }
+    }
+
+    // Unsupported sampler shapes or caps above four must keep full-head sequential fallback despite the loaded map.
+    for (int unsupported : { 0, 1, 2, 3 }) {
+        auto fallback_sampling = sampling;
+        if (unsupported == 0) { fallback_sampling.min_keep = 2; }
+        if (unsupported == 1) { fallback_sampling.top_k = 5; }
+        const bool backend_sampling = unsupported != 2;
+        const int case_depth = unsupported == 3 ? 5 : depth;
+        std::vector<full_head_round> fallback_expected;
+        common_set_env("LLAMA_MTP_CHAIN_TEST_IDS", "");
+        common_set_env("LLAMA_MTP_QWEN4EXP_CHAIN", "0");
+        {
+            contexts reference(model.get(), config, 16, COMMON_SPECULATIVE_TYPE_DRAFT_MTP, 16, 1, 512,
+                    helper.get(), "none", backend_sampling, nullptr, nullptr, case_depth);
+            prefill(reference, 0, prompt_size, 0);
+            prime_full_head_eval_counter(reference);
+            llama_pos pos = prompt_size;
+            for (int round = 0; round < rounds; ++round) {
+                fallback_expected.push_back(draft_full_head_round(reference, pos, fallback_sampling, case_depth));
+                finish_full_head_round(reference, pos, fallback_expected.back(), accepted[round]);
+            }
+        }
+        common_set_env("LLAMA_MTP_QWEN4EXP_CHAIN", "1");
+        {
+            const size_t maps_before = half_vocab_maps, compact_before = half_vocab_compact_heads;
+            full_head_graph_stats fallback_stats;
+            contexts fallback(model.get(), config, 16, COMMON_SPECULATIVE_TYPE_DRAFT_MTP, 16, 1, 512,
+                    helper.get(), map_path.c_str(), backend_sampling, full_head_fixture_eval, &fallback_stats, case_depth);
+            require(half_vocab_maps == maps_before + 1, "fallback really loaded the provisional map");
+            require(half_vocab_compact_heads == compact_before + 1, "fallback really created its resident compact head");
+            prefill(fallback, 0, prompt_size, 0);
+            prime_full_head_eval_counter(fallback);
+            llama_pos pos = prompt_size;
+            for (int round = 0; round < rounds; ++round) {
+                const auto graph_before = fallback_stats;
+                const auto actual = draft_full_head_round(fallback, pos, fallback_sampling, case_depth);
+                require_full_head_round(actual, fallback_expected[round], cuda, -3 - unsupported, round);
+                report_counter_mismatch("fallback", -3 - unsupported, round, actual, case_depth,
+                        fallback_expected[round].n_p_eval, fallback_sampling, backend_sampling);
+                require_full_head_graph(graph_before, fallback_stats, cuda, "fallback", -3 - unsupported, round, false);
+                require(actual.n_eval == case_depth, "unsupported sampled request or cap really uses full-head sequential fallback");
+                finish_full_head_round(fallback, pos, actual, accepted[round]);
+            }
+        }
+    }
+    printf("PASS Qwen4exp %s batched full head: full-vocabulary q/KLD, actual mapped guesses, every repair depth, token identity, RNG continuation, deferred catch-up, partial rejection, fresh prompt restore\n", cuda ? "GPU" : "CPU");
+#else
+    (void) cuda;
+    require(false, "full-head fixture requires /proc/self/fd for its temporary vocabulary map");
+#endif
+}
 
 static void run_prefill_identity(llama_model * model, const cache_config & config, uint32_t parallel = 2, bool borrow = true) {
     const size_t releases_before = scratch_releases;
@@ -605,282 +1720,6 @@ static void run_prefill_identity(llama_model * model, const cache_config & confi
     printf("PASS %s (%u slots, scratch %s): overlap, async, device, async+device, tight, scratch and tight+scratch match legacy target, draft KV, carry, deferred rows, logits and %u draft rounds; seq_cp, cross-switch cache restore and slot restart\n", config.name, parallel, borrow ? "loan" : "small-cache fallback", parallel * 8);
 }
 
-static void run_qwen4exp_pool(bool cuda = false, bool store_only = false) {
-    require((common_get_env("LLAMA_MTP_POOL_INCREMENTAL") == "1" ||
-                (!store_only && common_get_env("LLAMA_MTP_POOL_INCREMENTAL") == "0")) &&
-                common_get_env("LLAMA_MTP_POOL_VALIDATE") == "1",
-            "pool regression requires explicit LLAMA_MTP_POOL_INCREMENTAL=0/1 and LLAMA_MTP_POOL_VALIDATE=1");
-    prefill_env_restore prefill_env;
-    prefill_env.set(false, false, false);
-    // fork: set these before any model/context graph is made; both gates are cached per process.
-    common_set_env("LLAMA_MTP_UPDATE_KV_ONLY", "1");
-    common_set_env("LLAMA_MTP_POOL_STORE_ONLY", store_only ? "1" : "0");
-    common_set_env("LLAMA_MTP_EH_BATCH", "0");
-    auto * device = cuda ? ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU) : nullptr;
-    require(!cuda || device, "pool GPU backend is available");
-    model_geometry geometry;
-    geometry.kpool = 4;
-    geometry.indexer_top_k = 8;
-    llama_model_ptr model(make_model(false, geometry, LLM_ARCH_QWEN4EXP, device));
-    auto make_context = [&](uint32_t batch_size = 8) {
-        auto cp = llama_context_default_params();
-        cp.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
-        cp.n_ctx = 128;
-        cp.n_batch = cp.n_ubatch = batch_size;
-        cp.n_seq_max = 2;
-        cp.kv_unified = true;
-        cp.n_threads = cp.n_threads_batch = 2;
-        cp.offload_kqv = cuda;
-        cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
-        cp.type_k = cp.type_v = GGML_TYPE_Q8_0;
-        llama_context_ptr ctx(llama_init_from_model(model.get(), cp));
-        require(ctx != nullptr, "create pool helper");
-        return ctx;
-    };
-    auto pool_memory = [](llama_context * ctx) {
-        auto * mem = dynamic_cast<llama_memory_hybrid_idx *>(llama_get_memory(ctx));
-        require(mem && mem->get_mem_idx() && mem->get_kpool() == 4 && mem->get_kpool_by_order(),
-                "Qwen4exp helper has pools of four cells in sequence order");
-        require(mem->get_mem_idx()->get_n_stream() == 1, "pool helper shares a unified indexer stream");
-        return mem;
-    };
-    const size_t width = llama_model_n_embd_out(model.get());
-    size_t store_decodes = 0;
-    uint64_t digest = UINT64_C(14695981039346656037);
-    auto observe = [&](const std::vector<float> & values) {
-        // Fresh-process legacy/incremental/store-only comparisons share this
-        // output schedule. Include sizes so an omitted row cannot pass.
-        const uint64_t size = values.size();
-        auto bytes = [&](const void * data, size_t count) {
-            const auto * p = static_cast<const uint8_t *>(data);
-            for (size_t i = 0; i < count; ++i) {
-                digest = (digest ^ p[i])*UINT64_C(1099511628211);
-            }
-        };
-        bytes(&size, sizeof(size));
-        bytes(values.data(), values.size()*sizeof(float));
-    };
-    auto decode = [&](llama_context * ctx, llama_seq_id seq, llama_pos from, llama_pos to, bool output) {
-        common_batch batch(ctx);
-        std::vector<float> hidden(width * (to - from));
-        for (llama_pos pos = from; pos < to; ++pos) {
-            float * row_hidden = hidden.data() + width * (pos - from);
-            for (size_t j = 0; j < width; ++j) {
-                row_hidden[j] = float((int) ((j + pos) % 19) - 9) / 19.0f;
-            }
-            const int row = batch.add(token_at(pos), pos, seq, output);
-            require(batch.set_embd(row, { row_hidden, 1, width }), "attach deterministic pool helper input");
-        }
-        auto * rendered = batch.get();
-        check_teacher_batch(*rendered, width, UINT64_C(14695981039346656037));
-        // fork: validation compares the new inputs byte-for-byte with the generic fill, including padded rows.
-        const size_t before = pool_store_fills;
-        require(llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, rendered) == 0, "decode pool helper");
-        llama_synchronize(ctx);
-        if (!output) {
-            require(store_only && pool_store_fills > before, "no-output decode used and validated the specialized pool fill");
-            ++store_decodes;
-            return std::vector<float>();
-        }
-        require(pool_store_fills == before, "logits decode keeps the full pool inputs");
-        const float * logits = llama_get_logits(ctx);
-        require(logits != nullptr, "pool helper returns logits");
-        return std::vector<float>(logits, logits + (to - from)*n_vocab);
-    };
-    auto original = make_context();
-    const int64_t timing_started = ggml_time_us();
-    const auto timing_before = llama_perf_bookkeep_context(original.get());
-    // A logits-producing helper uses the generic full graph under the same static env settings.
-    llama_context_ptr reference = store_only ? make_context() : llama_context_ptr();
-    auto append = [&](llama_seq_id seq, llama_pos from, llama_pos to, bool want_logits) {
-        const bool output = !store_only || want_logits;
-        std::vector<float> expected;
-        if (reference) {
-            expected = decode(reference.get(), seq, from, to, true);
-        }
-        auto actual = decode(original.get(), seq, from, to, output);
-        if (reference) {
-            require(save(original.get(), seq) == save(reference.get(), seq),
-                    "KV-only pool writes preserve the full-graph helper cache bytes");
-            require(!output || (actual.size() == expected.size() &&
-                        std::memcmp(actual.data(), expected.data(), actual.size()*sizeof(float)) == 0),
-                    "KV-only catch-up preserves subsequent full-graph logits exactly");
-        }
-        if (want_logits) { observe(actual); }
-        return actual;
-    };
-    auto * mem = pool_memory(original.get());
-    auto * idx = mem->get_mem_idx();
-    append(0, 0, 3, false);
-    append(0, 3, 4, true);
-    const int32_t reused = llama_perf_context(original.get()).n_reused;
-    append(0, 4, 6, false);
-    append(0, 6, 8, false);
-    require(!store_only || llama_perf_context(original.get()).n_reused > reused,
-            "specialized pool graph reuses its allocation across partial/complete boundaries");
-    const auto shared = idx->get_cells(0).seq_pos_get(0);
-    require(shared.size() == 8, "pool source has two complete pools");
-    llama_memory_seq_cp(mem, 0, 1, -1, -1);
-    if (reference) { llama_memory_seq_cp(llama_get_memory(reference.get()), 0, 1, -1, -1); }
-    require(idx->get_cells(1).seq_pos_get(1) == shared, "sequence copy shares the physical pool representatives");
-    append(0, 8, 9, true);
-    append(1, 8, 9, false);
-    require(llama_memory_seq_rm(mem, 1, -1, -1), "delete copied pool sequence");
-    if (reference) { require(llama_memory_seq_rm(llama_get_memory(reference.get()), 1, -1, -1), "delete copied reference sequence"); }
-    require(idx->get_cells(1).seq_pos_get(1).empty(), "copied pool sequence is empty");
-    append(0, 9, 11, false);
-    require(llama_memory_seq_rm(mem, 0, 6, -1), "rollback through a complete and partial pool");
-    if (reference) { require(llama_memory_seq_rm(llama_get_memory(reference.get()), 0, 6, -1), "rollback reference pools"); }
-    require(idx->get_cells(0).seq_pos_get(0).size() == 6 && llama_memory_seq_pos_max(mem, 0) == 5,
-            "pool rollback preserves the prefix");
-    append(0, 6, 8, false);
-    append(0, 8, 11, false);
-    const auto state = save(original.get(), 0);
-    auto resumed = make_context();
-    auto * restored = pool_memory(resumed.get());
-    require(llama_state_seq_set_data_ext(resumed.get(), state.data(), state.size(), 1,
-                LLAMA_STATE_SEQ_FLAGS_KEEP_LAYOUT) == state.size(), "restore pools into a fresh helper and different sequence");
-    require(restored->get_mem_idx()->get_cells(0).seq_pos_get(0).empty(), "pool restore leaves the other sequence empty");
-    require(restored->get_mem_idx()->get_cells(1).seq_pos_get(1) == idx->get_cells(0).seq_pos_get(0),
-            "pool restore keeps the saved physical layout");
-    // Sequence IDs are serialized too; normalize back to the source ID before byte comparison.
-    auto same_seq = make_context();
-    const auto remapped_state = save(resumed.get(), 1);
-    require(llama_state_seq_set_data_ext(same_seq.get(), remapped_state.data(), remapped_state.size(), 0,
-                LLAMA_STATE_SEQ_FLAGS_KEEP_LAYOUT) == remapped_state.size(), "normalize restored pool sequence ID");
-    require(save(same_seq.get(), 0) == state, "pool restore round-trips every serialized cache byte after ID normalization");
-    llama_context_ptr restored_reference = store_only ? make_context() : llama_context_ptr();
-    if (restored_reference) {
-        require(llama_state_seq_set_data_ext(restored_reference.get(), state.data(), state.size(), 0,
-                    LLAMA_STATE_SEQ_FLAGS_KEEP_LAYOUT) == state.size(), "restore full-graph pool reference");
-    }
-    size_t restore_rows = 0, restore_exact_rows = 0, restore_top1_equal = 0;
-    double restore_kld_sum = 0, restore_kld_max = 0, restore_max_error = 0;
-    llama_pos from = 11;
-    for (llama_pos to : { 12, 15, 16, 20, 21, 24 }) {
-        const bool want_logits = to != 16 && to != 21;
-        const bool output = !store_only || want_logits;
-        const auto expected = append(0, from, to, want_logits);
-        const auto actual = decode(resumed.get(), 1, from, to, output);
-        const auto same_actual = decode(same_seq.get(), 0, from, to, output);
-        require(actual.size() == same_actual.size() && (actual.empty() ||
-                    std::memcmp(actual.data(), same_actual.data(), actual.size()*sizeof(float)) == 0),
-                "same- and different-sequence restored pool continuation logits are bit-identical");
-        if (restored_reference) {
-            const auto full = decode(restored_reference.get(), 0, from, to, true);
-            require(save(same_seq.get(), 0) == save(restored_reference.get(), 0),
-                    "restored store-only pool writes preserve full-graph cache bytes");
-            require(!output || (same_actual.size() == full.size() &&
-                        std::memcmp(same_actual.data(), full.data(), full.size()*sizeof(float)) == 0),
-                    "restored store-only continuation matches restored full-graph logits exactly");
-        }
-        if (common_get_env("LLAMA_POOL_RESTORE_DIAGNOSTIC") == "1") {
-            auto * other_idx = pool_memory(same_seq.get())->get_mem_idx();
-            auto * a = idx->get_k_storage(model->hparams.n_layer());
-            auto * b = other_idx->get_k_storage(model->hparams.n_layer());
-            require(a->type == b->type && a->nb[1] == b->nb[1], "restored indexer diagnostic geometry");
-            const size_t half = ggml_row_size(a->type, model->hparams.indexer_head_size);
-            std::vector<uint8_t> aa(2*half), bb(2*half);
-            for (const auto & pc : idx->get_cells(0).seq_pos_get(0)) {
-                ggml_backend_tensor_get(a, aa.data(), pc.second*a->nb[1], aa.size());
-                ggml_backend_tensor_get(b, bb.data(), pc.second*b->nb[1], bb.size());
-                if (aa != bb) {
-                    fprintf(stderr, "POOL_RESTORE_INDEXER to=%d pos=%d cell=%u raw_equal=%d pooled_equal=%d\n",
-                            to, pc.first, pc.second, int(std::memcmp(aa.data(), bb.data(), half) == 0),
-                            int(std::memcmp(aa.data() + half, bb.data() + half, half) == 0));
-                }
-            }
-        }
-        if (want_logits) {
-            observe(actual);
-            require(actual.size() == expected.size(), "restored pool output row count");
-            // The legacy restore marks historical pooled keys stale and
-            // recomputes them at a different batch width. Record that existing
-            // arithmetic drift; fresh-process digests above qualify changes
-            // against the same legacy restored trajectory.
-            for (size_t row = 0; row < actual.size()/n_vocab; ++row) {
-                const auto first = row*n_vocab;
-                const double ma = *std::max_element(expected.begin() + first, expected.begin() + first + n_vocab);
-                const double mb = *std::max_element(actual.begin() + first, actual.begin() + first + n_vocab);
-                double za = 0, zb = 0, kld = 0;
-                for (size_t j = first; j < first + n_vocab; ++j) {
-                    require(std::isfinite(expected[j]) && std::isfinite(actual[j]), "finite restored pool logits");
-                    restore_max_error = std::max(restore_max_error, std::abs(double(actual[j]) - expected[j]));
-                    za += std::exp(expected[j] - ma);
-                    zb += std::exp(actual[j] - mb);
-                }
-                for (size_t j = first; j < first + n_vocab; ++j) {
-                    const double logp = expected[j] - ma - std::log(za);
-                    const double logq = actual[j] - mb - std::log(zb);
-                    kld += std::exp(logp)*(logp - logq);
-                }
-                require(std::isfinite(kld) && kld >= -1e-12, "finite restored pool KLD");
-                ++restore_rows;
-                restore_exact_rows += std::memcmp(expected.data() + first, actual.data() + first, n_vocab*sizeof(float)) == 0;
-                restore_top1_equal += std::max_element(expected.begin() + first, expected.begin() + first + n_vocab) - expected.begin() ==
-                                     std::max_element(actual.begin() + first, actual.begin() + first + n_vocab) - actual.begin();
-                restore_kld_sum += kld;
-                restore_kld_max = std::max(restore_kld_max, kld);
-                printf("POOL_RESTORE_KLD pos=%d kld=%.17g\n", from + int(row), kld);
-            }
-        }
-        from = to;
-    }
-    require(!store_only || store_decodes >= 9, "store-only pool regression exercises real specialized fills throughout edits and restore");
-    // fork: one real prefill ubatch creates 17 pools, crossing the sparse marker's stack16/hash threshold.
-    // Repeated member marks also exercise hash deduplication.
-    auto large = make_context(80);
-    llama_context_ptr large_reference = store_only ? make_context(80) : llama_context_ptr();
-    std::vector<float> large_expected;
-    if (large_reference) { decode(large_reference.get(), 0, 0, 68, true); }
-    const size_t large_store_before = pool_store_fills;
-    decode(large.get(), 0, 0, 68, !store_only);
-    require(!store_only || pool_store_fills == large_store_before + 1, "large sparse-mark prefill executes as one store-only ubatch");
-    require(pool_memory(large.get())->get_mem_idx()->get_cells(0).seq_pos_get(0).size() == 68,
-            "large pool fixture prefills 17 complete pools in one ubatch");
-    if (large_reference) {
-        require(save(large.get(), 0) == save(large_reference.get(), 0),
-                "sparse hash marks preserve the generic full-graph prefill cache bytes");
-        large_expected = decode(large_reference.get(), 0, 68, 72, true);
-    }
-    const auto large_actual = decode(large.get(), 0, 68, 72, true);
-    observe(large_actual);
-    require(!large_reference || (large_actual.size() == large_expected.size() &&
-                std::memcmp(large_actual.data(), large_expected.data(), large_actual.size()*sizeof(float)) == 0),
-            "sparse hash prefill preserves subsequent full-graph logits exactly");
-    const char * timing = std::getenv("LLAMA_BOOKKEEP_TIMING");
-    if (timing && std::atoi(timing) != 0) {
-        const auto after = llama_perf_bookkeep_context(original.get());
-        const uint64_t detail_us =
-            after.memory_init_layout_host_us - timing_before.memory_init_layout_host_us +
-            after.graph_prepare_host_us - timing_before.graph_prepare_host_us +
-            after.set_inputs_host_us - timing_before.set_inputs_host_us +
-            after.peer_sync_host_us - timing_before.peer_sync_host_us +
-            after.graph_submit_host_us - timing_before.graph_submit_host_us;
-        require(after.graph_rebuild_calls + after.graph_reuse_calls >
-                timing_before.graph_rebuild_calls + timing_before.graph_reuse_calls,
-                "catch-up detail counts graph preparation attempts");
-        require(detail_us > 0 && detail_us <= uint64_t(ggml_time_us() - timing_started + 10),
-                "catch-up detail stages are active and do not overlap");
-        uint64_t backend_us = 0;
-        for (size_t i : { 0u, 1u, 2u, 4u, 5u, 6u }) {
-            require(after.backend_submit[i] >= timing_before.backend_submit[i], "backend counters are monotonic");
-            backend_us += after.backend_submit[i] - timing_before.backend_submit[i];
-        }
-        require(backend_us > 0 && backend_us <= uint64_t(ggml_time_us() - timing_started + 10),
-                "backend host intervals are active and do not overlap");
-        require(after.backend_submit[3] - timing_before.backend_submit[3] <=
-                after.backend_submit[2] - timing_before.backend_submit[2],
-                "user-input synchronization is nested in input copies");
-        require(after.backend_submit[cuda ? 8 : 7] > timing_before.backend_submit[cuda ? 8 : 7],
-                "backend counters execute the selected CPU or CUDA provider");
-    }
-    printf("BOOKKEEP_POOL digest=%016llx\n", (unsigned long long) digest);
-    printf("BOOKKEEP_POOL_RESTORE rows=%zu exact_rows=%zu top1_equal=%zu kld_mean=%.17g kld_max=%.17g max_logit_error=%.17g\n",
-            restore_rows, restore_exact_rows, restore_top1_equal, restore_kld_sum/restore_rows, restore_kld_max, restore_max_error);
-    printf("PASS Qwen4exp %s incremental pools%s: partial boundaries, suffix rollback/reappend, shared representatives, copied sequence deletion, stack16/hash prefill, exact store/full cache and logits, exact same/different-sequence continuation, legacy restore KLD recorded (%zu specialized fills)\n",
-            cuda ? "GPU" : "CPU", store_only ? " store-only" : "", store_decodes);
-}
 
 
 // Diagnose the real architecture's KV-only + output call versus a merged
@@ -1226,13 +2065,14 @@ static void run_scratch_target_lifetime(llama_model * model) {
     ctx.tgt = nullptr;
     require(scratch_releases > released, "destroying target released its draft scratch loan");
     const size_t after_destroy = scratch_borrows;
-    std::vector<float> hidden(n_embd, 0.0f);
+    std::vector<float> hidden(32*n_embd, 0.0f);
     common_batch input(ctx.dft);
     for (llama_pos pos = 128; pos < 160; ++pos) {
         const int idx = input.add(token_at(pos), pos, 0, false);
-        require(input.set_embd(idx, { hidden.data(), 1, n_embd }), "attach draft hidden row");
+        require(input.set_embd(idx, { hidden.data() + size_t(pos - 128)*n_embd, 1, n_embd }), "attach draft hidden row");
     }
-    require(llama_process(ctx.dft, LLAMA_PROCESS_TYPE_DECODE, input.get()) == 0, "draft catch-up succeeds after target destruction");
+    require(llama_process(ctx.dft, LLAMA_PROCESS_TYPE_DECODE,
+                checked_embedding_batch(input, hidden, n_embd)) == 0, "draft catch-up succeeds after target destruction");
     require(llama_memory_seq_pos_max(llama_get_memory(ctx.dft), 0) == 159 && scratch_borrows == after_destroy,
             "draft uses private compute after its scratch target is destroyed");
     printf("PASS scratch lifetime: target destruction releases the active loan; the independent draft still decodes without shared compute\n");
@@ -2112,7 +2952,9 @@ int main(int argc, char ** argv) {
     const bool reserve_probe = (argc == 4 || argc == 5) && std::strcmp(argv[1], "--reserve-probe") == 0;
     common_log_set_verbosity_thold(LOG_LEVEL_ERROR);
     llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
-        if (std::strstr(text, "MTP pool store-only inputs validated") != nullptr) { ++pool_store_fills; }
+        if (std::strstr(text, "draft vocabulary shortlist: 16 of 32 tokens ") != nullptr) { ++half_vocab_maps; }
+        if (std::strstr(text, "compact draft head: type f32, n_sel 16,") != nullptr) { ++half_vocab_compact_heads; }
+        if (std::strstr(text, "MTP pool store-only inputs validated (") != nullptr) { ++pool_store_fills; }
         if (std::strstr(text, "pinned borrowed host ") != nullptr) { ++borrowed_host_pins; }
         if (std::strstr(text, "cannot pin borrowed host tensor ") != nullptr) { ++borrowed_host_pin_failures; }
         if (std::strstr(text, "MTP context will share the target context's compute buffers") != nullptr) {
@@ -2133,17 +2975,27 @@ int main(int argc, char ** argv) {
     }, reserve_probe ? &argc : nullptr);
     const bool pin_host = argc == 2 && (std::strcmp(argv[1], "--host-pin-only") == 0 || std::strcmp(argv[1], "--host-pin-cuda-only") == 0);
     const bool cuda_sharing = argc == 2 && (std::strcmp(argv[1], "--cuda-sharing-only") == 0 || std::strcmp(argv[1], "--host-pin-cuda-only") == 0);
-    if (pin_host) { common_set_env("LLAMA_MTP_PIN_BORROWED_HOST", "1"); }
+    const bool feedback_cuda = argc == 2 && std::strcmp(argv[1], "--device-feedback-cuda-only") == 0;
+    const bool chain_cuda = argc == 2 && std::strcmp(argv[1], "--qwen4exp-chain-cuda-only") == 0;
+    const bool compact_cuda = argc == 2 && std::strcmp(argv[1], "--qwen4exp-compact-cuda-only") == 0;
+    const bool full_head_cuda = argc == 2 && std::strcmp(argv[1], "--qwen4exp-full-head-cuda-only") == 0;
     const bool pool_store_cuda = argc == 2 && std::strcmp(argv[1], "--qwen4exp-pool-store-cuda-only") == 0;
+    if (pin_host) { common_set_env("LLAMA_MTP_PIN_BORROWED_HOST", "1"); }
     const bool pool_cuda = argc == 2 && std::strcmp(argv[1], "--qwen4exp-pool-cuda-only") == 0;
     const bool defer_math_cuda = argc == 3 && std::strcmp(argv[1], "--bookkeep-defer-math-cuda") == 0;
-    if (cuda_sharing || pool_store_cuda || pool_cuda || defer_math_cuda) { ggml_backend_load_all(); }
+    if (cuda_sharing || feedback_cuda || chain_cuda || compact_cuda || full_head_cuda || pool_store_cuda || pool_cuda ||
+            defer_math_cuda) { ggml_backend_load_all(); }
     llama_backend_init();
     int failed = 0;
     llama_model * model = nullptr;
     try {
         if (reserve_probe) {
             run_reserve_probe(std::stoul(argv[2]), std::stoul(argv[3]), argc == 5 ? argv[4] : nullptr);
+            llama_backend_free();
+            return 0;
+        }
+        if (feedback_cuda || (argc == 2 && std::strcmp(argv[1], "--device-feedback-only") == 0)) {
+            run_device_feedback(feedback_cuda);
             llama_backend_free();
             return 0;
         }
@@ -2155,6 +3007,21 @@ int main(int argc, char ** argv) {
         }
         if (defer_math_cuda || (argc == 2 && std::strcmp(argv[1], "--bookkeep-defer-math-only") == 0)) {
             run_qwen4exp_defer_math(defer_math_cuda, defer_math_cuda ? argv[2] : nullptr);
+            llama_backend_free();
+            return 0;
+        }
+        if (chain_cuda || (argc == 2 && std::strcmp(argv[1], "--qwen4exp-chain-only") == 0)) {
+            run_qwen4exp_chain(chain_cuda);
+            llama_backend_free();
+            return 0;
+        }
+        if (compact_cuda || (argc == 2 && std::strcmp(argv[1], "--qwen4exp-compact-only") == 0)) {
+            run_qwen4exp_chain(compact_cuda, true);
+            llama_backend_free();
+            return 0;
+        }
+        if (full_head_cuda || (argc == 2 && std::strcmp(argv[1], "--qwen4exp-full-head-only") == 0)) {
+            run_qwen4exp_full_head(full_head_cuda);
             llama_backend_free();
             return 0;
         }

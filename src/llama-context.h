@@ -206,6 +206,10 @@ struct llama_context {
     int mtp_handoff_decode(llama_context & target, llama_batch batch, int32_t first, const float * carry);
     void (*ubatch_rows_cb)(void * user, int32_t first, int32_t count) = nullptr;
     void * ubatch_rows_cb_user = nullptr;
+    bool mtp_device_feedback_init();
+    int mtp_device_feedback_decode(llama_batch batch, bool use_previous);
+    void mtp_device_feedback_capture(ggml_tensor * hidden, const llama_ubatch & ubatch);
+    void mtp_device_feedback_input(llm_graph_input_embd_h & input);
 
     //
     // state save/load
@@ -476,6 +480,7 @@ private:
 
     // [#69] sampled MTP chain inputs: the packed sampling params, then one uniform per chain step
     std::vector<float> mtp_chain_samp;
+    bool mtp_chain_qwen4exp_reserve = false;
 
     // sequence embeddings output (map of [n_embd] vectors)
     // populated only when pooling_type != LLAMA_POOLING_TYPE_NONE
@@ -536,6 +541,17 @@ private:
     } mtp_hidden;
     llama_context * mtp_hidden_source = nullptr; // scoped to mtp_prefill_decode
     std::vector<int32_t> mtp_hidden_rows;
+    // fork: Within-round helper carry only. The speculative sidecar keeps the accepted target hidden row.
+    struct {
+        ggml_context_ptr ctx;
+        ggml_backend_buffer_ptr buf;
+        ggml_tensor * rows = nullptr;
+        ggml_backend_t backend = nullptr;
+        llama_pos pos = -1;
+        bool valid = false;
+        bool active = false;
+        bool use_previous = false;
+    } mtp_feedback;
     std::vector<ggml_backend_buffer_ptr> mtp_input_uploads;
     size_t mtp_input_upload_next = 0;
     ggml_backend_event_ptr mtp_input_upload_done;

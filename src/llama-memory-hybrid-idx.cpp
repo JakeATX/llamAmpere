@@ -1140,12 +1140,13 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
                 }
             }
         }
-        // Start from bytes that differ everywhere from the reference. Otherwise
-        // an omitted optimized write can pass by retaining the reference fill.
+        // Poison from the captured reference only after all tensors have been saved, before the optimized fill.
         for (size_t i = 0; i < tensors.size(); ++i) {
-            auto * data = tensors[i] != nullptr ? (uint8_t *) tensors[i]->data : nullptr;
-            for (size_t j = 0; j < reference[i].size(); ++j) {
-                data[j] = (uint8_t) ~reference[i][j];
+            if (!reference[i].empty()) {
+                auto * data = (uint8_t *) tensors[i]->data;
+                for (size_t j = 0; j < reference[i].size(); ++j) {
+                    data[j] = (uint8_t) ~reference[i][j];
+                }
             }
         }
         set_input_kpool_impl(pool_cells, pool_idxs, pool_mask, tail_idxs, sel_mask, new_pool_idxs, new_pool_rep, ubatch, new_pool_pos, true);

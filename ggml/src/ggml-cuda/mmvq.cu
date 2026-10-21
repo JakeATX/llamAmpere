@@ -1875,6 +1875,31 @@ static void mul_mat_vec_q_switch_fusion(
     }
 }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+template <int ncols>
+static void mul_mat_vec_q5_K_batch_head_launch(
+        const void * vx, const block_q8_1 * y, float * dst, int nrows, cudaStream_t stream) {
+    const int device = ggml_cuda_get_device();
+    const int warp_size = ggml_cuda_info().devices[device].warp_size;
+    const auto dims = calc_launch_params<GGML_TYPE_Q5_K>(ncols, nrows, 1, 1, warp_size, MMVQ_PARAMETERS_GENERIC);
+    const ggml_cuda_kernel_launch_params launch(dims.first, dims.second, 0, stream);
+    const uint3 one = init_fastdiv_values(1);
+    const ggml_cuda_mm_fusion_args_device fusion{};
+    auto launch_rows = [&](auto check_rows_tag) {
+        constexpr bool check_rows = decltype(check_rows_tag)::value;
+        ggml_cuda_kernel_launch(mul_mat_vec_q<GGML_TYPE_Q5_K, ncols, false, false, false, true, false, false, check_rows>, launch,
+                vx, y, nullptr, fusion, dst, 2560, make_uint3(0, 0, 0), 10, 80, nrows,
+                one, 0, 0, 0, one, 0, 0, 0, nrows);
+    };
+    const int rows_per_block = calc_rows_per_block(GGML_TYPE_Q5_K, ncols, MMVQ_PARAMETERS_GENERIC, false, dims.second.y);
+    if (nrows % rows_per_block == 0) {
+        launch_rows(std::false_type{});
+    } else {
+        launch_rows(std::true_type{});
+    }
+}
+#endif
+
 template <ggml_type type, bool has_fusion = false, bool has_clamp = false>
 static void mul_mat_vec_q_moe_launch(
         const void * vx, const void * vy, const int32_t * ids,
@@ -2059,6 +2084,45 @@ static void mul_mat_vec_q_thin_launch(
 #undef MMVQ_THIN_CASE
 }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+// fork: retain the four-warp sum tree while each physical warp computes one head row.
+__launch_bounds__(4*ggml_cuda_get_physical_warp_size(), 1)
+static __global__ void mul_mat_vec_q5_K_head(
+        const void * vx, const block_q8_1 * y, float * dst,
+        const int ncols_x, const int nrows_x, const int stride_row_x) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int qi = ggml_cuda_type_traits<GGML_TYPE_Q5_K>::qi;
+    constexpr int vdr = VDR_Q5_K_Q8_1_MMVQ;
+    constexpr int blocks_per_iter = vdr * 4*warp_size / qi;
+    const uint32_t row = blockIdx.x * blockDim.y + threadIdx.y;
+    const int lane = threadIdx.x;
+
+    ggml_cuda_pdl_sync();
+    if (row >= (uint32_t) nrows_x) {
+        return;
+    }
+
+    const block_q5_K * weights = (const block_q5_K *) vx + (int64_t) row * stride_row_x;
+    const int kqs = vdr * (lane % (qi / vdr));
+    float sums[4] = { 0.0f };
+#pragma unroll
+    for (int w = 0; w < 4; ++w) {
+        for (int k = (w*warp_size + lane) / (qi / vdr); k < ncols_x / QK_K; k += blocks_per_iter) {
+            sums[w] += vec_dot_q5_K_q8_1(weights, y + k * (QK_K / QK8_1), k, kqs);
+        }
+    }
+
+    // The reference stores these partials in shared memory before the additions.
+    float sum = __fadd_rn(sums[0], sums[1]);
+    sum = __fadd_rn(sum, sums[2]);
+    sum = __fadd_rn(sum, sums[3]);
+    sum = warp_reduce_sum<warp_size>(sum);
+    if (lane == 0) {
+        dst[row] = sum;
+    }
+}
+#endif
+
 template <ggml_type type>
 static void mul_mat_vec_q_switch_ncols_dst(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
@@ -2215,6 +2279,33 @@ static void mul_mat_vec_q_switch_ncols_dst(
             return;
         }
     }
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if constexpr (type == GGML_TYPE_Q5_K &&
+                  calc_nwarps(type, 1, MMVQ_PARAMETERS_GENERIC) == 4 &&
+                  calc_rows_per_block(type, 1, MMVQ_PARAMETERS_GENERIC) == 1) {
+        const char * env = getenv("GGML_CUDA_MTP_Q5_HEAD");
+        if (env && strcmp(env, "1") == 0 && cc == 860 && !has_ids && ncols_x == 2560 &&
+                ncols_dst == 1 && nrows_x >= 65536 && stride_row_x == ncols_x / QK_K &&
+                stride_col_y == ncols_x / QK8_1 && stride_col_dst == nrows_x &&
+                nchannels_x == 1 && nchannels_y == 1 && nchannels_dst == 1 &&
+                nsamples_x == 1 && nsamples_dst == 1 &&
+                !fusion.gate && !fusion.x_bias && !fusion.gate_bias && !fusion.x_scale && !fusion.gate_scale &&
+                !fusion.shared_up && !fusion.shared_gate && !fusion.shared_dst) {
+            const char * audit = getenv("GGML_CUDA_MTP_Q5_HEAD_AUDIT");
+            if (audit && strcmp(audit, "1") == 0) {
+                GGML_LOG_INFO("mtp_q5_head_dispatch rows=%d k=%d cols=%d stride=%d\n",
+                        nrows_x, ncols_x, ncols_dst, stride_row_x);
+            }
+            const dim3 blocks(((uint32_t) nrows_x + 3) / 4);
+            const dim3 threads(warp_size, 4);
+            const ggml_cuda_kernel_launch_params launch(blocks, threads, 0, stream);
+            ggml_cuda_kernel_launch(mul_mat_vec_q5_K_head, launch,
+                    vx, (const block_q8_1 *) vy, dst, ncols_x, nrows_x, stride_row_x);
+            return;
+        }
+    }
+#endif
 
     switch (ncols_dst) {
         case 1: {
@@ -2790,6 +2881,36 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t stride_channel_y   = ids ? s11  : s12;
 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    // fork: restrict full-head column reuse to the helper graph's explicit output name.
+    constexpr bool batch_head_warps = calc_nwarps(GGML_TYPE_Q5_K, 1, MMVQ_PARAMETERS_GENERIC) == 4 &&
+                                     calc_nwarps(GGML_TYPE_Q5_K, 3, MMVQ_PARAMETERS_GENERIC) == 4 &&
+                                     calc_nwarps(GGML_TYPE_Q5_K, 4, MMVQ_PARAMETERS_GENERIC) == 4;
+    constexpr char batch_head_prefix[] = "mtp_chain_full_logits";
+    if (batch_head_warps && src0->type == GGML_TYPE_Q5_K && !ids && !fusion && !convrot &&
+            ne00 == 2560 && ne10 == 2560 && ne01 >= 65536 && ne01 <= std::numeric_limits<int>::max() / 10 &&
+            (ne11 == 3 || ne11 == 4) && ne1 == ne11 &&
+            ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 && ne2 == 1 && ne3 == 1 &&
+            ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst) &&
+            strncmp(dst->name, batch_head_prefix, sizeof(batch_head_prefix) - 1) == 0 &&
+            ggml_cuda_info().devices[ctx.device].cc == 860) {
+        const char * env = getenv("GGML_CUDA_MTP_Q5_BATCH_HEAD");
+        if (env && strcmp(env, "1") == 0) {
+            const char * audit = getenv("GGML_CUDA_MTP_Q5_BATCH_HEAD_AUDIT");
+            if (audit && strcmp(audit, "1") == 0) {
+                GGML_LOG_INFO("mtp_q5_batch_head_dispatch rows=%lld k=%lld cols=%lld name=%s\n",
+                        (long long) ne01, (long long) ne00, (long long) ne11, dst->name);
+            }
+            if (ne11 == 3) {
+                mul_mat_vec_q5_K_batch_head_launch<3>(src0->data, (const block_q8_1 *) src1_q8_1, dst_d, ne01, stream);
+            } else {
+                mul_mat_vec_q5_K_batch_head_launch<4>(src0->data, (const block_q8_1 *) src1_q8_1, dst_d, ne01, stream);
+            }
+            return;
+        }
+    }
+#endif
 
     mul_mat_vec_q_switch_type(
         src0->data, src0->type, src1_q8_1, ids_d, fusion_local, dst_d, ne00,
