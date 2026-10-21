@@ -646,7 +646,7 @@ static bool server_bookkeep_enabled() {
 struct server_bookkeep_clock {
     enum phase { OUTSIDE, PREP, PROMPT, DRAFT, CKPT, BATCH, VERIFY, CATCHUP, CATCHUP_QUEUE, POST, CLONE, SAMPLE, ACCEPT, KV, OUTPUT, N_PHASE };
     using times = std::array<uint64_t, N_PHASE>;
-    using context_times = std::array<std::array<uint64_t, 14>, 2>;
+    using context_times = std::array<std::array<uint64_t, 24>, 2>;
 
     static bool enabled() {
         static const bool on = [] {
@@ -679,6 +679,7 @@ struct server_bookkeep_clock {
                           p.memory_init_layout_host_us, p.graph_prepare_host_us,
                           p.set_inputs_host_us, p.peer_sync_host_us, p.graph_submit_host_us,
                           p.graph_rebuild_calls, p.graph_reuse_calls };
+            for (size_t i = 0; i < 10; ++i) { result[c][14 + i] = p.backend_submit[i]; }
         }
         return result;
     }
@@ -758,10 +759,13 @@ struct server_bookkeep_clock {
 
     std::string context_detail_summary(size_t width, size_t c, uint64_t rounds) const {
         const auto & p = by_width_context[width][c];
-        return string_format("memory_init_layout %.4f ms/round, graph_prepare %.4f ms/round, set_inputs %.4f ms/round, peer_sync %.4f ms/round, graph_submit %.4f ms/round, graph_rebuild %.3f calls/round, graph_reuse %.3f calls/round",
+        return string_format("memory_init_layout %.4f ms/round, graph_prepare %.4f ms/round, set_inputs %.4f ms/round, peer_sync %.4f ms/round, graph_submit %.4f ms/round, graph_rebuild %.3f calls/round, graph_reuse %.3f calls/round, backend_session %.4f ms/round, backend_transition %.4f ms/round, backend_input_copy %.4f ms/round, backend_user_input_sync_nested %.4f ms/round, backend_cpu_compute %.4f ms/round, backend_gpu_submit %.4f ms/round, backend_other_compute %.4f ms/round, backend_cpu_splits %.3f calls/round, backend_gpu_splits %.3f calls/round, backend_other_splits %.3f calls/round",
                 p[7] / (1000.0 * rounds), p[8] / (1000.0 * rounds), p[9] / (1000.0 * rounds),
                 p[10] / (1000.0 * rounds), p[11] / (1000.0 * rounds),
-                p[12] / double(rounds), p[13] / double(rounds));
+                p[12] / double(rounds), p[13] / double(rounds),
+                p[14] / (1000.0 * rounds), p[15] / (1000.0 * rounds), p[16] / (1000.0 * rounds),
+                p[17] / (1000.0 * rounds), p[18] / (1000.0 * rounds), p[19] / (1000.0 * rounds), p[20] / (1000.0 * rounds),
+                p[21] / double(rounds), p[22] / double(rounds), p[23] / double(rounds));
     }
 };
 

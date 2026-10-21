@@ -836,6 +836,18 @@ static void run_qwen4exp_pool(bool cuda = false, bool store_only = false) {
                 "catch-up detail counts graph preparation attempts");
         require(detail_us > 0 && detail_us <= uint64_t(ggml_time_us() - timing_started + 10),
                 "catch-up detail stages are active and do not overlap");
+        uint64_t backend_us = 0;
+        for (size_t i : { 0u, 1u, 2u, 4u, 5u, 6u }) {
+            require(after.backend_submit[i] >= timing_before.backend_submit[i], "backend counters are monotonic");
+            backend_us += after.backend_submit[i] - timing_before.backend_submit[i];
+        }
+        require(backend_us > 0 && backend_us <= uint64_t(ggml_time_us() - timing_started + 10),
+                "backend host intervals are active and do not overlap");
+        require(after.backend_submit[3] - timing_before.backend_submit[3] <=
+                after.backend_submit[2] - timing_before.backend_submit[2],
+                "user-input synchronization is nested in input copies");
+        require(after.backend_submit[cuda ? 8 : 7] > timing_before.backend_submit[cuda ? 8 : 7],
+                "backend counters execute the selected CPU or CUDA provider");
     }
     printf("BOOKKEEP_POOL digest=%016llx\n", (unsigned long long) digest);
     printf("BOOKKEEP_POOL_RESTORE rows=%zu exact_rows=%zu top1_equal=%zu kld_mean=%.17g kld_max=%.17g max_logit_error=%.17g\n",
@@ -868,6 +880,8 @@ static void run_qwen4exp_defer_math(bool cuda = false, const char * model_path =
             ggml_type_name(model->layers[model->hparams.n_layer()].nextn.eh_proj->type),
             ggml_type_name(model->output->type), llama_model_n_embd_out(model.get()),
             model_path ? model_path : "generated_f32");
+    const char * f16_kv_env = std::getenv("LLAMA_BOOKKEEP_DEFER_F16_KV");
+    const bool f16_kv = !model_path || (f16_kv_env && std::strcmp(f16_kv_env, "1") == 0);
     auto make_context = [&]() {
         auto cp = llama_context_default_params();
         cp.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
@@ -877,8 +891,8 @@ static void run_qwen4exp_defer_math(bool cuda = false, const char * model_path =
         cp.n_threads = cp.n_threads_batch = 2;
         cp.offload_kqv = cuda;
         cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
-        cp.type_k = model_path ? GGML_TYPE_TQ5_0 : GGML_TYPE_F16;
-        cp.type_v = model_path ? GGML_TYPE_TURBO4_0 : GGML_TYPE_F16;
+        cp.type_k = f16_kv ? GGML_TYPE_F16 : GGML_TYPE_TQ5_0;
+        cp.type_v = f16_kv ? GGML_TYPE_F16 : GGML_TYPE_TURBO4_0;
         llama_context_ptr ctx(llama_init_from_model(model.get(), cp));
         require(ctx != nullptr, "create defer arithmetic helper");
         llama_set_embeddings_nextn(ctx.get(), true, true);
@@ -907,6 +921,7 @@ static void run_qwen4exp_defer_math(bool cuda = false, const char * model_path =
     };
     auto reference = make_context();
     auto merged = make_context();
+    const auto backend_before = llama_perf_bookkeep_context(reference.get());
     llama_pos pos = 0;
     while (pos < 37) {
         const int count = std::min(8, 37 - pos);
@@ -957,8 +972,16 @@ static void run_qwen4exp_defer_math(bool cuda = false, const char * model_path =
     }
     require(rows == 24, "nonempty complete defer arithmetic cell");
     printf("BOOKKEEP_DEFER_MATH architecture=qwen4exp backend=%s dtype=%s kv=%s rows=%zu exact_rows=%zu exact_states=%zu/12 vocab=%d top1_equal=%zu/24 mean_kld=%.17g max_kld=%.17g max_logit_error=%.17g teacher=deterministic_synthetic quality_review_required=1\n",
-            cuda ? "CUDA" : "CPU", model_path ? "GGUF" : "F32", model_path ? "TQ5_0/TURBO4_0" : "F16",
+            cuda ? "CUDA" : "CPU", model_path ? "GGUF" : "F32", f16_kv ? "F16" : "TQ5_0/TURBO4_0",
             rows, exact_rows, exact_states, vocab_size, same_top1, sum_kld/rows, max_kld, max_logit_error);
+    const auto backend_after = llama_perf_bookkeep_context(reference.get());
+    static const char * names[] = { "session_us", "transition_us", "input_copy_us", "user_input_sync_nested_us",
+        "cpu_compute_us", "gpu_submit_us", "other_compute_us", "cpu_splits", "gpu_splits", "other_splits" };
+    printf("BOOKKEEP_DEFER_BACKEND");
+    for (size_t i = 0; i < 10; ++i) {
+        printf(" %s=%llu", names[i], (unsigned long long) (backend_after.backend_submit[i] - backend_before.backend_submit[i]));
+    }
+    printf("\n");
 }
 
 static void run_case(llama_model * model, const cache_config & config, bool deferred) {

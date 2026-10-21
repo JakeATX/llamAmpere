@@ -54,6 +54,9 @@ struct llama_bookkeep_context_perf {
     uint64_t graph_submit_host_us = 0;
     uint64_t graph_rebuild_calls = 0;
     uint64_t graph_reuse_calls = 0;
+    // session, transition, input-copy, nested user-input-sync, CPU/GPU/other
+    // compute host time (us), then CPU/GPU/other split counts.
+    uint64_t backend_submit[10] = {};
 };
 LLAMA_API llama_bookkeep_context_perf llama_perf_bookkeep_context(const struct llama_context * ctx);
 

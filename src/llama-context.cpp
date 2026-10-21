@@ -85,6 +85,7 @@ struct llama_bookkeep_context_counters {
     std::atomic<uint64_t> graph_submit_host_us{0};
     std::atomic<uint64_t> graph_rebuild_calls{0};
     std::atomic<uint64_t> graph_reuse_calls{0};
+    std::array<std::atomic<uint64_t>, 10> backend_submit{};
 };
 
 static_assert(std::atomic<uint64_t>::is_always_lock_free, "bookkeeping counters must be lock-free");
@@ -3863,6 +3864,24 @@ build_graph:
     }
 
     bookkeep_stage.next(bookkeep_perf ? &bookkeep_perf->graph_submit_host_us : nullptr);
+    // One bounded diagnostic snapshot, never enabled in timing claims. Scheduling
+    // assignment is inspected after allocation; no callback or extra device fence.
+    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && n_outputs == 0 && ubatch.n_tokens <= 8 &&
+            getenv("LLAMA_BOOKKEEP_SPLIT_DUMP") && std::atoi(getenv("LLAMA_BOOKKEEP_SPLIT_DUMP")) != 0) {
+        static std::atomic_flag dumped = ATOMIC_FLAG_INIT;
+        if (!dumped.test_and_set(std::memory_order_relaxed)) {
+            fprintf(stderr, "BOOKKEEP_GRAPH nodes=%d tokens=%u outputs=%d\n", ggml_graph_n_nodes(gf), ubatch.n_tokens, n_outputs);
+            for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+                auto * node = ggml_graph_node(gf, i);
+                if (node->op == GGML_OP_VIEW || node->op == GGML_OP_RESHAPE ||
+                        node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE) { continue; }
+                auto * backend = ggml_backend_sched_get_tensor_backend(sched.get(), node);
+                fprintf(stderr, "BOOKKEEP_GRAPH node=%d op=%s name=%s backend=%s shape=%lld,%lld,%lld,%lld\n",
+                        i, ggml_op_desc(node), node->name, backend ? ggml_backend_name(backend) : "none",
+                        (long long) node->ne[0], (long long) node->ne[1], (long long) node->ne[2], (long long) node->ne[3]);
+            }
+        }
+    }
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     bookkeep_stage.next(nullptr);
     if (status != GGML_STATUS_SUCCESS) {
@@ -6488,7 +6507,21 @@ ggml_status llama_context::graph_compute(ggml_cgraph * gf, bool batched) {
 
     copy_experts.reset();
 
+    auto * perf = llama_bookkeep_context_bucket(cparams.ctx_type);
+    const auto snapshot = [&]() -> std::array<uint64_t, 10> {
+        const auto p = ggml_backend_sched_get_bookkeep_perf(sched.get());
+        return { p.session_host_us, p.transition_host_us, p.input_copy_host_us,
+                 p.user_input_sync_host_us, p.cpu_compute_host_us, p.gpu_compute_host_us,
+                 p.other_compute_host_us, p.cpu_split_calls, p.gpu_split_calls, p.other_split_calls };
+    };
+    const auto before = perf ? snapshot() : std::array<uint64_t, 10>{};
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
+    if (perf) {
+        const auto after = snapshot();
+        for (size_t i = 0; i < before.size(); ++i) {
+            perf->backend_submit[i].fetch_add(after[i] - before[i], std::memory_order_relaxed);
+        }
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }
@@ -8689,6 +8722,9 @@ llama_bookkeep_context_perf llama_perf_bookkeep_context(const llama_context * ct
         result.graph_submit_host_us       = perf->graph_submit_host_us.load(std::memory_order_relaxed);
         result.graph_rebuild_calls        = perf->graph_rebuild_calls.load(std::memory_order_relaxed);
         result.graph_reuse_calls          = perf->graph_reuse_calls.load(std::memory_order_relaxed);
+        for (size_t i = 0; i < perf->backend_submit.size(); ++i) {
+            result.backend_submit[i] = perf->backend_submit[i].load(std::memory_order_relaxed);
+        }
     }
     return result;
 }
