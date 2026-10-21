@@ -19,6 +19,13 @@
 #include <utility>
 #include <vector>
 
+#if (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
+#include <immintrin.h>
+#define COMMON_TOPK_AVX2 1
+#else
+#define COMMON_TOPK_AVX2 0
+#endif
+
 // the ring buffer works similarly to std::deque, but with a fixed capacity
 // TODO: deduplicate with llama-impl.h
 template<typename T>
@@ -112,6 +119,26 @@ struct ring_buffer {
     std::vector<T> data;
 };
 
+// Inspect only complete blocks, stopping before the first block that can alter
+// the heap. The caller still visits every winning candidate in original ID order.
+#if COMMON_TOPK_AVX2
+__attribute__((target("avx2")))
+static int32_t common_sampler_topk_skip_avx2(const float * logits, int32_t i, int32_t end, float threshold) {
+    const __m256 t = _mm256_set1_ps(threshold);
+    while (end - i >= 32) {
+        const __m256 a = _mm256_cmp_ps(_mm256_loadu_ps(logits + i), t, _CMP_GT_OQ);
+        const __m256 b = _mm256_cmp_ps(_mm256_loadu_ps(logits + i + 8), t, _CMP_GT_OQ);
+        const __m256 c = _mm256_cmp_ps(_mm256_loadu_ps(logits + i + 16), t, _CMP_GT_OQ);
+        const __m256 d = _mm256_cmp_ps(_mm256_loadu_ps(logits + i + 24), t, _CMP_GT_OQ);
+        if (_mm256_movemask_ps(_mm256_or_ps(_mm256_or_ps(a, b), _mm256_or_ps(c, d)))) {
+            break;
+        }
+        i += 32;
+    }
+    return i;
+}
+#endif
+
 // The same result as llama_sampler_top_k (std::partial_sort with comp a.logit > b.logit over the full
 // {id, logit, 0} array), ids and order included for equal logits: the heap select is replayed step by step
 // (libstdc++ __heap_select / __adjust_heap / __push_heap). Banned ids are sorted, unique and in range;
@@ -160,12 +187,27 @@ static void common_sampler_topk_exact_impl(
         h[hole] = v;
     };
 
+#if COMMON_TOPK_AVX2
+    static const bool avx2 = [] {
+        const char * enabled = std::getenv("LLAMA_BOOKKEEP_TOPK_AVX2");
+        return enabled && std::atoi(enabled) != 0 && __builtin_cpu_supports("avx2");
+    }();
+#endif
     // A block is skipped only when none of its logits beats the current heap top.
     // Splitting at bans changes no heap operations: -inf never beats that top, even if it is NaN.
     const auto scan_range = [&](int32_t i, const int32_t end) {
         constexpr int32_t B = 32;
         while (i < end) {
-            if (i + B <= end) {
+#if COMMON_TOPK_AVX2
+            if (avx2) {
+                i = common_sampler_topk_skip_avx2(logits, i, end, h[0].logit);
+                if (i == end) { break; }
+            }
+#endif
+            if (end - i >= B) {
+#if COMMON_TOPK_AVX2
+                if (!avx2) {
+#endif
                 const float t = h[0].logit;
                 int c = 0;
                 for (int32_t j = 0; j < B; ++j) {
@@ -175,6 +217,9 @@ static void common_sampler_topk_exact_impl(
                     i += B;
                     continue;
                 }
+#if COMMON_TOPK_AVX2
+                }
+#endif
                 for (const int32_t block_end = i + B; i < block_end; ++i) {
                     if (logits[i] > h[0].logit) {
                         replace_top(llama_token_data{i, logits[i], 0.0f});
