@@ -56,7 +56,7 @@ struct ggml_cuda_moe_profile_plan {
 
 static inline bool ggml_cuda_moe_cache_profile_plan(const std::vector<ggml_cuda_moe_profile_item> & items,
         const std::vector<size_t> & caps, size_t budget, size_t minimum,
-        ggml_cuda_moe_profile_plan & output) {
+        ggml_cuda_moe_profile_plan & output, bool route_density = false) {
     if (items.empty() || caps.empty() || !minimum) {
         return false;
     }
@@ -95,7 +95,7 @@ static inline bool ggml_cuda_moe_cache_profile_plan(const std::vector<ggml_cuda_
         auto & b = bundles.back();
         if (item.bytes > SIZE_MAX - b.bytes) { return false; }
         b.bytes += item.bytes;
-        b.utility += (long double)item.count * item.bytes;
+        b.utility += route_density ? (long double) item.count : (long double) item.count * item.bytes;
         b.members.push_back(index);
         auto found = std::find_if(b.pools.begin(), b.pools.end(), [&](const std::pair<size_t, size_t> & p) {
             return p.first == item.pool;
@@ -109,6 +109,10 @@ static inline bool ggml_cuda_moe_cache_profile_plan(const std::vector<ggml_cuda_
     std::vector<size_t> ranked(bundles.size());
     for (size_t i = 0; i < ranked.size(); ++i) { ranked[i] = i; }
     std::stable_sort(ranked.begin(), ranked.end(), [&](size_t a, size_t b) {
+        if (route_density) {
+            return bundles[a].utility / bundles[a].members.size() / bundles[a].bytes >
+                bundles[b].utility / bundles[b].members.size() / bundles[b].bytes;
+        }
         return bundles[a].utility / bundles[a].bytes > bundles[b].utility / bundles[b].bytes;
     });
     ggml_cuda_moe_profile_plan plan;
