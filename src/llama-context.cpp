@@ -3423,9 +3423,10 @@ bool llama_context::mtp_handoff_init() {
         (model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN4EXP) &&
         model.hparams.n_layer_nextn == 1 && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT &&
         model.n_devices() <= 1 && model.split_mode() != LLAMA_SPLIT_MODE_TENSOR;
-    if (mtp_hidden.ring) {
-        LLAMA_LOG_INFO("%s: LLAMA_MTP_B1_HANDOFF=1: per-ubatch device handoff of hidden rows to the MTP helper\n", __func__);
-    }
+    LLAMA_LOG_WARN("%s: LLAMA_MTP_B1_HANDOFF=1: per-ubatch device handoff %s (staged %d, cpu %d, events %d, arch ok %d, nextn %u, type %d, devices %d)\n",
+            __func__, mtp_hidden.ring ? "on" : "off", (int) mtp_hidden.enabled, (int) (props.type == GGML_BACKEND_DEVICE_TYPE_CPU),
+            (int) props.caps.events, (int) (model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN4EXP),
+            model.hparams.n_layer_nextn, (int) cparams.ctx_type, (int) model.n_devices());
     return mtp_hidden.ring;
 }
 

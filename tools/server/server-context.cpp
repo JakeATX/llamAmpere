@@ -5972,7 +5972,7 @@ private:
                 SRV_ERR("ubatch handoff failed (done = %d, ret = %d)\n", handoff.done, ret);
                 throw std::runtime_error("MTP ubatch handoff failed");
             }
-            SRV_INF("ubatch handoff: helper caught up %d of %d rows during the decode\n", handoff.done, batch.view.size());
+            SRV_WRN("ubatch handoff: helper caught up %d of %d rows during the decode\n", handoff.done, batch.view.size());
         }
 
         if (ckpt_armed && ret != 0) {
