@@ -5419,12 +5419,24 @@ static int moe_cache_warm(void * opaque, const ggml_moe_cache_tensor_desc * tens
         entries += tensors[i].n_expert;
     }
     const bool loading = !counts;
+    // [PREFILLFAST] GGML_MOE_CACHE_FRESH_NO_REPLAN=1: when the profile load just below runs in this same call
+    // (a session rebuilt after B1 suspension), its global plan was made a moment ago from the same profile.
+    // The same-session replan then only re-fits the pools to allocator padding (a few slots per pool) at
+    // the cost of resizing every pool (about 0.66 s at 12.6 GB). Skip it in that case. Off by default.
+    bool fresh_profile_plan = false;
     if (!loading && getenv("GGML_MOE_CACHE_PROFILE_LOAD")) {
+        bool attempted_before = true;
+        {
+            std::lock_guard<std::mutex> lock(session->mu);
+            attempted_before = session->profile_load_attempted;
+        }
         // Suspension creates a new session. Restore its saved fallback rankings before prompt reranking.
         static const bool rank_only = moe_cache_env_on("GGML_MOE_CACHE_WARM_SINGLE");
         g_warm_rank_only = rank_only;
-        moe_cache_warm(opaque, tensors, nullptr, n_tensors);
+        const int profile_queued = moe_cache_warm(opaque, tensors, nullptr, n_tensors);
         g_warm_rank_only = false;
+        static const bool no_replan = moe_cache_env_on("GGML_MOE_CACHE_FRESH_NO_REPLAN");
+        fresh_profile_plan = no_replan && !rank_only && !attempted_before && profile_queued > 0;
     }
     bool observed = false;
     if (counts) {
@@ -5488,7 +5500,10 @@ static int moe_cache_warm(void * opaque, const ggml_moe_cache_tensor_desc * tens
     if (!loading && !moe_cache_profile_rerank(*session, deadline)) {
         return 0;
     }
-    if (!loading && !session->profile_global_tensors.empty()) {
+    if (fresh_profile_plan) {
+        MOE_CACHE_LOG("[moe-cache] global profile same-session replan skipped: plan made by this call's profile load (GGML_MOE_CACHE_FRESH_NO_REPLAN)\n");
+    }
+    if (!loading && !fresh_profile_plan && !session->profile_global_tensors.empty()) {
         std::lock_guard<std::mutex> lock(session->mu);
         if (!session->active_scopes && !session->active_nodes && !session->device_ready.load() && !session->device_frozen) {
             for (const auto & device : session->devices) {

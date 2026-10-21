@@ -2,6 +2,7 @@
 #include "llama-impl.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
+#include <cstdlib>
 #include <cstring>
 #include <cstdio>
 #include <fstream>
@@ -63,7 +64,14 @@ llama_moe_output::llama_moe_output(size_t bytes, const char * directory) : size(
 
 void llama_moe_output::flush() {
 #ifndef _WIN32
-    if (dirty && msync(data, size, MS_SYNC) != 0) {
+    // [PREFILLFAST] LLAMA_MOE_OUTPUT_NO_MSYNC=1: the file is unlinked and mapped MAP_SHARED in this process
+    // only, so every read of the mapping already sees the bytes the backend wrote. msync only forces them to
+    // disk (about 86 ms and 112.6 MiB of SSD writes per in-call checkpoint). Skipping it changes no data.
+    static const bool no_msync = [] {
+        const char * v = getenv("LLAMA_MOE_OUTPUT_NO_MSYNC");
+        return v && atoi(v) != 0;
+    }();
+    if (dirty && !no_msync && msync(data, size, MS_SYNC) != 0) {
         throw std::runtime_error("cannot flush MoE temporary output file");
     }
     dirty = false;
