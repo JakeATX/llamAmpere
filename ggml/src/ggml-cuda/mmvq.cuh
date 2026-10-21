@@ -60,3 +60,9 @@ void ggml_cuda_moe_table_mmv_fused(const void * const * up_table, const void * c
         const char * act_q8, const int32_t * ids, float * dst,
         int64_t n_in, int64_t n_out, int64_t n_ids, int64_t n_tokens,
         int64_t act_channels, int64_t ids_stride, cudaStream_t stream);
+
+// fork: exact route grouping for narrow table MMV; false keeps the independent-route kernel.
+bool ggml_cuda_moe_table_mmv_grouped_try(ggml_backend_cuda_context & ctx,
+        const void * const * table, const void * const * gate_table, ggml_type type,
+        const char * act_q8, const int32_t * ids, float * dst,
+        int64_t n_in, int64_t n_out, int64_t n_ids, int64_t n_tokens, int64_t channels, int64_t ids_stride);

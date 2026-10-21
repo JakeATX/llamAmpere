@@ -13,6 +13,28 @@ static __device__ __forceinline__ float lightning_indexer_mask(const half * m_ro
     return __half2float(m_row[i_kv]);
 }
 
+// Finite f16 ends at 65504. Narrowing a larger value, or a nonfinite one, becomes inf.
+static __device__ __forceinline__ bool lightning_indexer_f16_overflow(float v) {
+    return !(fabsf(v) <= 65504.0f);
+}
+
+static __device__ __forceinline__ bool lightning_indexer_f16_overflow(float4 v) {
+    return lightning_indexer_f16_overflow(v.x) || lightning_indexer_f16_overflow(v.y) ||
+           lightning_indexer_f16_overflow(v.z) || lightning_indexer_f16_overflow(v.w);
+}
+
+// Masked keys are -inf. score + -inf is NaN when the score is NaN or +inf, which a zero
+// head weight turns an overflowed dot into (0 * inf). A finite mask stays score + mask,
+// so an unmasked key keeps the bits it had.
+static __device__ __forceinline__ float lightning_indexer_add_mask(float score, float mask) {
+    return mask == -INFINITY ? mask : score + mask;
+}
+
+// In-range values keep the half round trip. Values that do not fit stay f32.
+static __device__ __forceinline__ float lightning_indexer_widen_f16(float v) {
+    return lightning_indexer_f16_overflow(v) ? v : __half2float(__float2half(v));
+}
+
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 #if defined(TURING_MMA_AVAILABLE)
 
@@ -24,6 +46,11 @@ typedef union {
 // TODO add support for AMD cards via rocWMMA
 #include <mma.h>
 namespace wmma = nvcuda::wmma;
+
+// A half that is already inf. Used where K is stored as half, so the float magnitude is gone.
+static __device__ __forceinline__ bool lightning_indexer_half_inf(const half2 h[2]) {
+    return __hisinf(h[0].x) || __hisinf(h[0].y) || __hisinf(h[1].x) || __hisinf(h[1].y);
+}
 
 template <int WARPS_PER_BLOCK, int K_VECS_PER_BLOCK, int64_t N_EMBD, int64_t N_HEAD, ggml_type TYPE_K>
 static __global__ void lightning_indexer_kernel_wmma(
@@ -68,11 +95,15 @@ static __global__ void lightning_indexer_kernel_wmma(
     // number of registers needed in each thread to store Q tile in thread block
     constexpr int N_Q_NEXT = (N_Q_TILE + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
 
+    // Queries that do not fit in f16. The tensor-core dot would be inf; the store recomputes those in f32.
+    bool q_big = false;
+
 #pragma unroll
     for (int i_q = tid; i_q < N_Q_TILE; i_q += THREADS_PER_BLOCK) {
         const int i_head = i_q / (N_EMBD / 4);
         const int i_embd = i_q % (N_EMBD / 4);
         const float4 q = *(const float4 *) (q_base + i_head*nbq1 + i_embd*sizeof(float4));
+        q_big = q_big || lightning_indexer_f16_overflow(q);
         half4 q_packed;
         q_packed.h2[0] = __float22half2_rn(make_float2(q.x, q.y));
         q_packed.h2[1] = __float22half2_rn(make_float2(q.z, q.w));
@@ -94,6 +125,7 @@ static __global__ void lightning_indexer_kernel_wmma(
             if (i_kv < n_kv) {
                 const int2 * k_base = (const int2 *) ((const char *) K + i_kv*nbk2 + i_stream*nbk3);
                 *(int2*) &k_shared_h[i_k_vec][i_embd] = k_base[i_embd];
+                q_big = q_big || lightning_indexer_half_inf(k_shared_h[i_k_vec][i_embd]);
             } else {
                 *(int2*) &k_shared_h[i_k_vec][i_embd] = make_int2(0, 0);
             }
@@ -108,6 +140,8 @@ static __global__ void lightning_indexer_kernel_wmma(
             if (i_kv < n_kv) {
                 const void * k_base = (const void *) ((const char *) K + i_kv*nbk2 + i_stream*nbk3);
                 dequantize_k(k_base, &k_shared_h[i_k_vec][i_embd][0], i_embd * 4);
+                // A fp16 scale times a quant can be finite in f32 and inf in f16. The recompute below uses the f32 value.
+                q_big = q_big || lightning_indexer_half_inf(k_shared_h[i_k_vec][i_embd]);
             } else {
                 *(int2*) &k_shared_h[i_k_vec][i_embd] = make_int2(0, 0);
             }
@@ -145,7 +179,9 @@ static __global__ void lightning_indexer_kernel_wmma(
             for (int i_q = tid, i_q_next = 0; i_q < N_Q_TILE; i_q += THREADS_PER_BLOCK) {
                 const int i_head = i_head_next + i_q / (N_EMBD / 4);
                 const int i_embd =               i_q % (N_EMBD / 4);
-                q_next[i_q_next++] = *(const float4 *) (q_base + i_head*nbq1 + i_embd*sizeof(float4));
+                q_next[i_q_next] = *(const float4 *) (q_base + i_head*nbq1 + i_embd*sizeof(float4));
+                q_big = q_big || lightning_indexer_f16_overflow(q_next[i_q_next]);
+                ++i_q_next;
             }
         }
 
@@ -210,12 +246,31 @@ static __global__ void lightning_indexer_kernel_wmma(
 
     // phase 4 - store output to VRAM
 
+    // Every thread participates. A query or key outside finite f16 makes the tensor-core score inf.
+    const int q_overflow = __syncthreads_or(q_big);
+
     if (tid < K_VECS_PER_BLOCK) {
         const int i_kv = start_kv + tid;
         if (i_kv < n_kv) {
+            if (q_overflow) {
+                // Same head order as the tensor-core path, but Q stays f32 and K is widened from its stored type.
+                const char * k_row = K + i_kv*nbk2 + i_stream*nbk3;
+                constexpr dequantize_V_t dequantize_k = get_dequantize_V<TYPE_K, float, 4>();
+                score_k = 0.0f;
+                for (int h = 0; h < N_HEAD; ++h) {
+                    const float * q_row = (const float *) (q_base + h*nbq1);
+                    float dot = 0.0f;
+                    for (int i = 0; i < N_EMBD; i += 4) {
+                        float4 kv;
+                        dequantize_k(k_row, &kv, i);
+                        dot += q_row[i]*kv.x + q_row[i + 1]*kv.y + q_row[i + 2]*kv.z + q_row[i + 3]*kv.w;
+                    }
+                    score_k += (dot > 0.0f ? dot : 0.0f) * w_shared[h];
+                }
+            }
             const half * m_base = (const half *) ((const char *) M + i_batch*nbm1 + (i_stream%nem3)*nbm3);
             float * dst_base = (float *) ((char *) dst + i_batch*nb1 + i_stream*nb3);
-            dst_base[i_kv] = score_k + lightning_indexer_mask(m_base, i_kv, mrange);
+            dst_base[i_kv] = lightning_indexer_add_mask(score_k, lightning_indexer_mask(m_base, i_kv, mrange));
         }
     }
 }
@@ -335,7 +390,7 @@ static __global__ void lightning_indexer_kernel_prefill(
             if (threadIdx.x == 0) {
                 const half * mask = (const half *) ((const char *) M + (stream % nem3) * nbm3 + query * nbm1);
                 float * out = (float *) ((char *) dst + stream * nb3 + query * nb1);
-                out[key] = score + lightning_indexer_mask(mask, key, mrange);
+                out[key] = lightning_indexer_add_mask(score, lightning_indexer_mask(mask, key, mrange));
             }
         }
         return;
@@ -370,7 +425,7 @@ static __global__ void lightning_indexer_kernel_prefill(
             }
             const half * mask = (const half *) ((const char *) M + (stream % nem3) * nbm3 + (q_start + query) * nbm1);
             float * out = (float *) ((char *) dst + stream * nb3 + (q_start + query) * nb1);
-            out[key_out] = score + lightning_indexer_mask(mask, key_out, mrange);
+            out[key_out] = lightning_indexer_add_mask(score, lightning_indexer_mask(mask, key_out, mrange));
         }
     }
 #else
@@ -534,14 +589,9 @@ static __global__ void lightning_indexer_kernel_vec(
         if (i_kv < n_kv) {
             const half * m_base = (const half *) ((const char *) M + i_batch*nbm1 + (i_stream%nem3)*nbm3);
             float * dst_base = (float *) ((char *) dst + i_batch*nb1 + i_stream*nb3);
-            dst_base[i_kv] = dst_shared[tid] + lightning_indexer_mask(m_base, i_kv, mrange);
+            dst_base[i_kv] = lightning_indexer_add_mask(dst_shared[tid], lightning_indexer_mask(m_base, i_kv, mrange));
         }
     }
-}
-
-// fork: retain finite float keys that cannot be represented by the tile's half storage.
-static __device__ __forceinline__ float lightning_indexer_key_f32(float value) {
-    return fabsf(value) <= 65504.0f ? __half2float(__float2half(value)) : value;
 }
 
 // one block scores a tile of K_VECS_PER_BLOCK keys against TOKENS_PER_BLOCK tokens: the keys are
@@ -581,9 +631,11 @@ static __global__ void lightning_indexer_kernel_tile(
     __shared__ float2 q_shared[HEADS_PER_PASS][TOKENS_PER_BLOCK][N_EMBD_H2];
     __shared__ float w_shared[N_HEAD][TOKENS_PER_BLOCK];
 
-    bool key_overflow = false;
-
     // phase 1 - stage the key tile four elements at a time, rows past n_kv are zero
+    // A value that does not fit in finite f16 would be stored as inf. The whole tile then
+    // rereads K as float, retaining the half round trip for each representable element.
+
+    bool k_big = false;
 
 #pragma unroll
     for (int i = tid; i < K_VECS_PER_BLOCK * (N_EMBD / 4); i += THREADS_PER_BLOCK) {
@@ -601,12 +653,11 @@ static __global__ void lightning_indexer_kernel_tile(
                 float4 v;
                 if constexpr (TYPE_K == GGML_TYPE_F32) {
                     v = ((const float4 *) k_row)[c4];
-                    key_overflow |= !(fabsf(v.x) <= 65504.0f && fabsf(v.y) <= 65504.0f &&
-                                      fabsf(v.z) <= 65504.0f && fabsf(v.w) <= 65504.0f);
                 } else {
                     constexpr dequantize_V_t dequantize_k = get_dequantize_V<TYPE_K, float, 4>();
                     dequantize_k(k_row, &v, c4 * 4);
                 }
+                k_big = k_big || lightning_indexer_f16_overflow(v);
                 lo = make_half2(v.x, v.y);
                 hi = make_half2(v.z, v.w);
             }
@@ -655,52 +706,88 @@ static __global__ void lightning_indexer_kernel_tile(
             q_shared[h][r][2*c4 + 1] = make_float2(v.z, v.w);
         }
 
-        if constexpr (TYPE_K == GGML_TYPE_F32) {
-            // fork: only exceptional tiles read keys directly; preserve normal half rounding in mixed tiles.
-            if (__syncthreads_or(key_overflow)) {
-                for (int i = tid; i < TOKENS_PER_BLOCK * K_VECS_PER_BLOCK; i += THREADS_PER_BLOCK) {
-                    const int token = i / K_VECS_PER_BLOCK;
-                    const int i_batch = start_batch + token;
-                    const int i_kv = start_kv + i % K_VECS_PER_BLOCK;
-                    if (i_batch >= n_batch || i_kv >= n_kv) {
-                        continue;
-                    }
-                    const float * k_row = (const float *) (K + i_kv*nbk2 + i_stream*nbk3);
-                    float score = 0.0f;
-                    for (int h = 0; h < N_HEAD; ++h) {
-                        const float * q_row = (const float *) ((const char *) Q + h*nbq1 + i_batch*nbq2 + i_stream*nbq3);
-                        float dot = 0.0f;
-                        for (int c = 0; c < N_EMBD; ++c) {
-                            dot = fmaf(lightning_indexer_key_f32(k_row[c]), q_row[c], dot);
-                        }
-                        score += fmaxf(dot, 0.0f) * w_shared[h][token];
-                    }
-                    const half * mask = (const half *) ((const char *) M + i_batch*nbm1 + (i_stream%nem3)*nbm3);
-                    float * out = (float *) ((char *) dst + i_batch*nb1 + i_stream*nb3);
-                    out[i_kv] = score + lightning_indexer_mask(mask, i_kv, mrange);
-                }
-                return;
-            }
+        bool k_overflow = false;
+        if constexpr (TYPE_K != GGML_TYPE_F16) {
+            k_overflow = __syncthreads_or(k_big);
         } else {
             __syncthreads();
         }
 
-        // phase 4 - float products of the widened keys for the heads of this pass
+        // phase 4 - float products of the widened keys for the heads of this pass.
+        // F16 keys, and every in-range tile, keep this half round trip so the products do not change by one bit.
 
+        if constexpr (TYPE_K != GGML_TYPE_F16) {
+            if (k_overflow) {
 #pragma unroll 8
-        for (int c = 0; c < N_EMBD_H2; ++c) {
-            float2 k_val[KEYS_PER_THREAD];
+                for (int c = 0; c < N_EMBD_H2; ++c) {
+                    float2 k_val[KEYS_PER_THREAD];
 #pragma unroll
-            for (int j = 0; j < KEYS_PER_THREAD; ++j) {
-                k_val[j] = __half22float2(k_shared[kl + j*KEY_LANES][c]);
+                    for (int j = 0; j < KEYS_PER_THREAD; ++j) {
+                        const int row = kl + j*KEY_LANES;
+                        const int i_kv = start_kv + row;
+                        if (i_kv < n_kv) {
+                            const char * k_row = K + i_kv*nbk2 + i_stream*nbk3;
+                            if constexpr (TYPE_K == GGML_TYPE_F32) {
+                                const float2 v = ((const float2 *) k_row)[c];
+                                k_val[j] = make_float2(lightning_indexer_widen_f16(v.x),
+                                                      lightning_indexer_widen_f16(v.y));
+                            } else {
+                                float4 v;
+                                constexpr dequantize_V_t dequantize_k = get_dequantize_V<TYPE_K, float, 4>();
+                                dequantize_k(k_row, &v, (c >> 1) * 4);
+                                const float2 k = (c & 1) ? make_float2(v.z, v.w) : make_float2(v.x, v.y);
+                                k_val[j] = make_float2(lightning_indexer_widen_f16(k.x),
+                                                      lightning_indexer_widen_f16(k.y));
+                            }
+                        } else {
+                            k_val[j] = make_float2(0.0f, 0.0f);
+                        }
+                    }
+#pragma unroll
+                    for (int h = 0; h < HEADS_PER_PASS; ++h) {
+                        const float2 q_val = q_shared[h][tl][c];
+#pragma unroll
+                        for (int j = 0; j < KEYS_PER_THREAD; ++j) {
+                            qk[h0 + h][j] = fmaf(k_val[j].x, q_val.x, qk[h0 + h][j]);
+                            qk[h0 + h][j] = fmaf(k_val[j].y, q_val.y, qk[h0 + h][j]);
+                        }
+                    }
+                }
+            } else {
+#pragma unroll 8
+                for (int c = 0; c < N_EMBD_H2; ++c) {
+                    float2 k_val[KEYS_PER_THREAD];
+#pragma unroll
+                    for (int j = 0; j < KEYS_PER_THREAD; ++j) {
+                        k_val[j] = __half22float2(k_shared[kl + j*KEY_LANES][c]);
+                    }
+#pragma unroll
+                    for (int h = 0; h < HEADS_PER_PASS; ++h) {
+                        const float2 q_val = q_shared[h][tl][c];
+#pragma unroll
+                        for (int j = 0; j < KEYS_PER_THREAD; ++j) {
+                            qk[h0 + h][j] = fmaf(k_val[j].x, q_val.x, qk[h0 + h][j]);
+                            qk[h0 + h][j] = fmaf(k_val[j].y, q_val.y, qk[h0 + h][j]);
+                        }
+                    }
+                }
             }
-#pragma unroll
-            for (int h = 0; h < HEADS_PER_PASS; ++h) {
-                const float2 q_val = q_shared[h][tl][c];
+        } else {
+#pragma unroll 8
+            for (int c = 0; c < N_EMBD_H2; ++c) {
+                float2 k_val[KEYS_PER_THREAD];
 #pragma unroll
                 for (int j = 0; j < KEYS_PER_THREAD; ++j) {
-                    qk[h0 + h][j] = fmaf(k_val[j].x, q_val.x, qk[h0 + h][j]);
-                    qk[h0 + h][j] = fmaf(k_val[j].y, q_val.y, qk[h0 + h][j]);
+                    k_val[j] = __half22float2(k_shared[kl + j*KEY_LANES][c]);
+                }
+#pragma unroll
+                for (int h = 0; h < HEADS_PER_PASS; ++h) {
+                    const float2 q_val = q_shared[h][tl][c];
+#pragma unroll
+                    for (int j = 0; j < KEYS_PER_THREAD; ++j) {
+                        qk[h0 + h][j] = fmaf(k_val[j].x, q_val.x, qk[h0 + h][j]);
+                        qk[h0 + h][j] = fmaf(k_val[j].y, q_val.y, qk[h0 + h][j]);
+                    }
                 }
             }
         }
@@ -730,7 +817,7 @@ static __global__ void lightning_indexer_kernel_tile(
     for (int j = 0; j < KEYS_PER_THREAD; ++j) {
         const int i_kv = start_kv + kl + j*KEY_LANES;
         if (i_kv < n_kv) {
-            dst_base[i_kv] = score[j] + lightning_indexer_mask(m_base, i_kv, mrange);
+            dst_base[i_kv] = lightning_indexer_add_mask(score[j], lightning_indexer_mask(m_base, i_kv, mrange));
         }
     }
 }
@@ -801,10 +888,10 @@ static __global__ void __launch_bounds__(256, 2) lightning_indexer_kernel_exact(
             if (start_kv + r < n_kv) {
                 kv = *(const float4 *) (K + stream*nbk3 + (start_kv + r)*nbk2 + (e0 + c)*sizeof(float));
             }
-            k_s[c + 0][r] = lightning_indexer_key_f32(kv.x);
-            k_s[c + 1][r] = lightning_indexer_key_f32(kv.y);
-            k_s[c + 2][r] = lightning_indexer_key_f32(kv.z);
-            k_s[c + 3][r] = lightning_indexer_key_f32(kv.w);
+            k_s[c + 0][r] = lightning_indexer_widen_f16(kv.x);
+            k_s[c + 1][r] = lightning_indexer_widen_f16(kv.y);
+            k_s[c + 2][r] = lightning_indexer_widen_f16(kv.z);
+            k_s[c + 3][r] = lightning_indexer_widen_f16(kv.w);
         }
         __syncthreads();
 
@@ -843,7 +930,7 @@ static __global__ void __launch_bounds__(256, 2) lightning_indexer_kernel_exact(
                 score += fmaxf(acc[4*t + h][j], 0.0f) * w_s[2*ty + t][h];
             }
             if (i_kv < n_kv) {
-                dst_base[i_kv] = score + lightning_indexer_mask(m_base, i_kv, mrange);
+                dst_base[i_kv] = lightning_indexer_add_mask(score, lightning_indexer_mask(m_base, i_kv, mrange));
             }
         }
     }

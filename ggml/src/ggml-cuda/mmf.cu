@@ -10,6 +10,105 @@ static __forceinline__ int mmf_get_rows_per_block(const int cc) {
     }
 }
 
+// Experimental, off by default. Mode 2 also computes the original MMF result
+// and asserts bitwise identity on device, including during CUDA graph replay.
+static int mmf_split_k_mode() {
+    static const int mode = [] {
+        const char * value = getenv("GGML_CUDA_MMF_SPLIT_K");
+        return value && strcmp(value, "1") == 0 ? 1 : value && strcmp(value, "2") == 0 ? 2 : 0;
+    }();
+    return mode;
+}
+
+template <int cols_per_block>
+static __global__ void mul_mat_f_merge_warps(
+        const float * partial, const float * reference, float * dst,
+        const int nrows, const int64_t stride_col_dst) {
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    const int j = blockIdx.y;
+    if (i >= nrows) {
+        return;
+    }
+
+    // Identical to mul_mat_f's shared-memory reduction: +0, then warp 0..7.
+    // There is no product here to contract, no atomic, and no reduction tree.
+    float sum = 0.0f;
+#pragma unroll
+    for (int warp = 0; warp < 8; ++warp) {
+        sum += partial[(j*8 + warp)*nrows + i];
+    }
+    if (reference != nullptr && __float_as_uint(sum) != __float_as_uint(reference[j*nrows + i])) {
+        // This validation must remain active in Release builds with NDEBUG.
+        // Dispatch is NVIDIA-only; the other device compilers never run it.
+#if defined(__CUDA_ARCH__) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        asm volatile("trap;");
+#endif
+    }
+    dst[j*stride_col_dst + i] = sum;
+}
+
+template <typename T, int cols_per_block>
+static void mul_mat_f_split_warps(
+        ggml_backend_cuda_context & ctx, const T * x, const float * y, float * dst,
+        const int ncols, const int nrows, const int stride_row, const int stride_col_y,
+        const int64_t stride_col_dst, const bool check) {
+    static_assert(cols_per_block >= 1 && cols_per_block <= 8, "split MMF is only for narrow batches");
+    constexpr int rows_per_block = 32;
+    constexpr int nwarps = 8;
+    constexpr int warp_size = 32;
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    GGML_ASSERT(mmf_get_nwarps_best(ncols, cc, warp_size) == nwarps);
+    GGML_ASSERT(ncols % 2 == 0 && stride_row % 2 == 0 && stride_col_y % 2 == 0);
+    GGML_ASSERT(nrows % rows_per_block == 0);
+
+    // The normal backend pool owns the allocation. Like the existing MMQ and
+    // attention scratch buffers, it is reused in stream order and retained by
+    // the pool after this scope; no cudaMalloc/free or host wait is introduced.
+    ggml_cuda_pool_alloc<float> partial(ctx.pool(), size_t(nrows)*cols_per_block*nwarps);
+    ggml_cuda_pool_alloc<float> reference(ctx.pool());
+    if (check) {
+        reference.alloc(size_t(nrows)*cols_per_block);
+        const int shared_iter = nwarps*16*(warp_size + mmf_get_padding(cc))*sizeof(T);
+        const int shared_combine = 8*(nwarps*rows_per_block + mmf_get_padding(cc))*sizeof(float);
+        mul_mat_f<T, rows_per_block, cols_per_block, nwarps, false>
+            <<<dim3(nrows/rows_per_block), dim3(warp_size, nwarps),
+               std::max(shared_iter, shared_combine), ctx.stream()>>>
+            (x, y, nullptr, reference.get(), ncols, cols_per_block, 1, stride_row, stride_col_y, nrows,
+             0, 0, 1, 0, 0, 0, 1, 0, 0, 0);
+    }
+
+    const int shared_split = 16*(warp_size + mmf_get_padding(cc))*sizeof(T);
+    mul_mat_f<T, rows_per_block, cols_per_block, nwarps, false, true>
+        <<<dim3(nrows/rows_per_block, nwarps), dim3(warp_size), shared_split, ctx.stream()>>>
+        (x, y, nullptr, partial.get(), ncols, cols_per_block, 1, stride_row, stride_col_y, nrows,
+         0, 0, 1, 0, 0, 0, 1, 0, 0, 0);
+    mul_mat_f_merge_warps<cols_per_block>
+        <<<dim3((nrows + 255)/256, cols_per_block), 256, 0, ctx.stream()>>>
+        (partial.get(), reference.get(), dst, nrows, stride_col_dst);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+template <typename T>
+static void mul_mat_f_split_warps_cols(
+        ggml_backend_cuda_context & ctx, const T * x, const float * y, float * dst,
+        const int ncols, const int nrows, const int ncols_dst, const int stride_row,
+        const int stride_col_y, const int64_t stride_col_dst, const bool check) {
+#define MMF_SPLIT_WARPS_CASE(N) \
+    case N: mul_mat_f_split_warps<T, N>(ctx, x, y, dst, ncols, nrows, stride_row, stride_col_y, stride_col_dst, check); break
+    switch (ncols_dst) {
+        MMF_SPLIT_WARPS_CASE(1);
+        MMF_SPLIT_WARPS_CASE(2);
+        MMF_SPLIT_WARPS_CASE(3);
+        MMF_SPLIT_WARPS_CASE(4);
+        MMF_SPLIT_WARPS_CASE(5);
+        MMF_SPLIT_WARPS_CASE(6);
+        MMF_SPLIT_WARPS_CASE(7);
+        MMF_SPLIT_WARPS_CASE(8);
+        default: GGML_ABORT("unsupported split MMF width: %d", ncols_dst);
+    }
+#undef MMF_SPLIT_WARPS_CASE
+}
+
 void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(!ids ||  ids->type == GGML_TYPE_I32);
@@ -99,6 +198,26 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
     const int device    = ggml_cuda_get_device();
     const int cc        = ggml_cuda_info().devices[device].cc;
     const int rows_per_block = mmf_get_rows_per_block(cc);
+
+    const int split_mode = mmf_split_k_mode();
+    const int vals_per_T = src0->type == GGML_TYPE_BF16 ? 2 : 1;
+    if (split_mode != 0 && !ids && GGML_CUDA_CC_IS_NVIDIA(cc) && ampere_mma_available(cc) &&
+            (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_BF16) &&
+            rows_per_block == 32 && ne00 >= 2048 && ne00 <= 32768 &&
+            ne01 >= 32 && ne01 <= 512 && ne01 % 32 == 0 &&
+            ncols_dst >= 1 && ncols_dst <= 8 && ne02 == 1 && ne03 == 1 &&
+            nchannels_dst == 1 && ne3 == 1 &&
+            mmf_get_nwarps_best(ne00/vals_per_T, cc, 32) == 8) {
+        if (src0->type == GGML_TYPE_F32) {
+            mul_mat_f_split_warps_cols<float>(ctx, (const float *) src0->data, src1_d, dst_d,
+                ne00, ne01, ncols_dst, s01, stride_col_y, stride_col_dst, split_mode == 2);
+        } else {
+            mul_mat_f_split_warps_cols<nv_bfloat162>(ctx, (const nv_bfloat162 *) src0->data, src1_d, dst_d,
+                ne00/2, ne01, ncols_dst, s01/2, stride_col_y/2, stride_col_dst, split_mode == 2);
+        }
+        ++ctx.fusion_stats.mmf_split;
+        return;
+    }
 
     switch (src0->type) {
         case GGML_TYPE_F32: {

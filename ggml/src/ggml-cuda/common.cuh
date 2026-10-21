@@ -1620,6 +1620,10 @@ struct ggml_backend_cuda_context {
         int64_t mul_mat_bias  = 0;   // ADD epilogues folded into mul_mat_vec (bias or a full
                                      // same-shape residual: both arrive as fusion x_bias)
         int64_t mul_mat_glu   = 0;   // GLU epilogues folded into mul_mat_vec
+        int64_t mmq_pair      = 0;   // prompt products reusing one activation/route preparation
+        int64_t sj_compact    = 0;   // SJ compact-gather attention dispatches
+        int64_t sj_mask_kq    = 0;   // SJ masked-KQ enabled kernel dispatches
+        int64_t mmf_split     = 0;   // narrow MMF split-warp dispatches
         int64_t norm_pair_concat = 0; // RMS_NORM+MUL pairs written straight into a CONCAT (ggml_cuda_fuse_norm_pair_concat)
         int64_t gdn_state_read = 0;  // gated_delta_net launches that read the state through s_copy (#87)
         int64_t add_rms       = 0;   // fused ADD + RMS_NORM + MUL runs (ggml_cuda_op_add_rms_norm_mul) [#46]

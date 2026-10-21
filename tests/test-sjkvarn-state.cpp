@@ -16,6 +16,7 @@
 //   test-sjkvarn-state --scalar-only [tmp_dir]   native scalar 4/4 state and multi-sequence checks
 //   test-sjkvarn-state --resident [tmp_dir]   CUDA split-body state round trips
 //   test-sjkvarn-state --device-bytes   CPU device-snapshot packed-byte regression
+//   test-sjkvarn-state --compact [tmp_dir]   CUDA compact attention on saved and truncated SJ state
 
 #include "ggml.h"
 #include "ggml-cpu.h"
@@ -111,10 +112,10 @@ struct sj_cfg {
     uint32_t resident = 0;
 };
 
-static llama_context * make_ctx(llama_model * model, const sj_cfg & c, uint32_t n_seq = 1, bool unified = false) {
+static llama_context * make_ctx(llama_model * model, const sj_cfg & c, uint32_t n_seq = 1, bool unified = false, uint32_t n_ctx = 4096) {
     llama_context_params cp = llama_context_default_params();
-    // several sequences: every sequence gets the same 4096-position stream a single-sequence context has
-    cp.n_ctx = unified ? 4096 : 4096*n_seq;
+    // Several sequences each get the same position budget as a single-sequence context.
+    cp.n_ctx = unified ? n_ctx : n_ctx*n_seq;
     cp.kv_unified = unified;
     cp.n_batch = 128;
     cp.n_ubatch = 128;
@@ -326,6 +327,8 @@ static void device_bytes_case(llama_model * model) {
 static bool same_logits(const std::vector<float> & a, const std::vector<float> & b) {
     return a.size() == b.size() && memcmp(a.data(), b.data(), a.size()*sizeof(float)) == 0;
 }
+
+#include "test-sjkvarn-compact-state.h"
 
 static int run_case(llama_model * model, const sj_cfg & c, const std::vector<sj_cfg> & mismatches, const char * tmp_dir) {
     llama_context * src = make_ctx(model, c);
@@ -884,7 +887,8 @@ int main(int argc, char ** argv) {
     const bool resident = argc > 1 && strcmp(argv[1], "--resident") == 0;
     const bool scalar_only = argc > 1 && strcmp(argv[1], "--scalar-only") == 0;
     const bool device_bytes = argc > 1 && strcmp(argv[1], "--device-bytes") == 0;
-    const int tmp_arg = resident || scalar_only ? 2 : 1;
+    const bool compact = argc > 1 && strcmp(argv[1], "--compact") == 0;
+    const int tmp_arg = resident || scalar_only || compact ? 2 : 1;
     const char * tmp_dir = argc > tmp_arg ? argv[tmp_arg] : (getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
     ggml_backend_load_all();
     llama_backend_init();
@@ -898,6 +902,18 @@ int main(int argc, char ** argv) {
     }
 
     const sj_cfg s44  = { "4/4",        4, 4, GGML_TYPE_F32 };
+    if (compact) {
+        int result = 0;
+        try {
+            compact_state_case(model, s44, tmp_dir);
+        } catch (const std::exception & e) {
+            fprintf(stderr, "compact state: FAIL: %s\n", e.what());
+            result = 1;
+        }
+        llama_model_free(model);
+        llama_backend_free();
+        return result;
+    }
     if (scratch_views) {
         int result = 0;
         try {

@@ -4194,6 +4194,8 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 }
 
 void ggml_cuda_flash_attn_sj_kvarn_lowbits(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+bool ggml_cuda_flash_attn_ext_sj_kvarn_compact(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+        void (*run_reference)(ggml_backend_cuda_context &, ggml_tensor *));
 
 // [#139] same predicate as the low-bit branch of ggml_cuda_flash_attn_ext below
 static bool ggml_cuda_fattn_sj_kvarn_is_lowbits(const ggml_tensor * dst) {
@@ -4234,6 +4236,10 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         // 4/4 token-axis trellis4 body (I16 under an explicit nonzero GGML_SJKVARN_TRELLIS_TOKENS; the low-bit token-axis default does not apply to 4/4): the low-bit tile loader
         if (ggml_get_op_params_i32(dst,5) != ((4 << 8) | 4) || (ggml_get_op_params_i32(dst,7) == GGML_TYPE_I16 && ggml_sj_kvarn::trellis3::tokens4())) {
             ggml_cuda_flash_attn_sj_kvarn_lowbits(ctx,dst);
+            return;
+        }
+        // fork: compact only the main model's sparse scalar4/4 verify rows; default dispatch stays unchanged.
+        if (ggml_cuda_flash_attn_ext_sj_kvarn_compact(ctx, dst, ggml_cuda_flash_attn_ext_mma_sj_kvarn_switch_ncols2<256, 256>)) {
             return;
         }
         ggml_cuda_flash_attn_ext_mma_sj_kvarn_switch_ncols2<256, 256>(ctx, dst);

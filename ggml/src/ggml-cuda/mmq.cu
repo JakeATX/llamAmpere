@@ -163,9 +163,9 @@ static ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_tensor * src0, const ggm
     return GGML_PREC_Q4;
 }
 
-void ggml_cuda_mul_mat_q(
+static void ggml_cuda_mul_mat_q_impl(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
-        const ggml_tensor * ids, ggml_tensor * dst, bool convrot) {
+        const ggml_tensor * ids, ggml_tensor * dst, bool convrot, ggml_tensor * paired_dst) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
@@ -189,15 +189,23 @@ void ggml_cuda_mul_mat_q(
     const float * src1_d = (const float *) src1->data;
     float       *  dst_d = (float       *)  dst->data;
 
-    // If src0 is a temporary compute buffer, clear any potential padding.
-    if (ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
-        const size_t size_data  = ggml_nbytes(src0);
-        const size_t size_alloc = ggml_backend_buffer_get_alloc_size(src0->buffer, src0);
-        if (size_alloc > size_data) {
-            GGML_ASSERT(ggml_is_contiguously_allocated(src0));
-            GGML_ASSERT(!src0->view_src);
-            CUDA_CHECK(cudaMemsetAsync((char *) src0->data + size_data, 0, size_alloc - size_data, stream));
+    const ggml_tensor * paired_src0 = paired_dst ? paired_dst->src[0] : nullptr;
+
+    // Preserve each original call's weight-padding contract.
+    const auto clear_padding = [&](const ggml_tensor * weight) {
+        if (ggml_backend_buffer_get_usage(weight->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+            const size_t size_data  = ggml_nbytes(weight);
+            const size_t size_alloc = ggml_backend_buffer_get_alloc_size(weight->buffer, weight);
+            if (size_alloc > size_data) {
+                GGML_ASSERT(ggml_is_contiguously_allocated(weight));
+                GGML_ASSERT(!weight->view_src);
+                CUDA_CHECK(cudaMemsetAsync((char *) weight->data + size_data, 0, size_alloc - size_data, stream));
+            }
         }
+    };
+    clear_padding(src0);
+    if (paired_src0) {
+        clear_padding(paired_src0);
     }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
@@ -217,9 +225,34 @@ void ggml_cuda_mul_mat_q(
     const size_t y_block_size       = use_native_fp4 ? sizeof(block_fp4_mmq) : sizeof(block_q8_1_mmq);
     const size_t y_values_per_block = use_native_fp4 ? QK_FP4_MMQ            : QK8_1_MMQ;
 
+    const auto quant_guard_bytes = [&](int64_t ncols) {
+        int J = ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ncols);
+        if (paired_src0) {
+            J = std::max(J, ggml_cuda_mmq_get_J_max(paired_src0->type, fallback, cc, ncols));
+        }
+        return J * sizeof(block_q8_1_mmq);
+    };
+    const auto launch_products = [&](const mmq_args & args) {
+        ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
+        if (paired_src0) {
+            mmq_args paired_args = args;
+            const size_t ts_pair = ggml_type_size(paired_src0->type);
+            paired_args.x                  = (const char *) paired_src0->data;
+            paired_args.type_x             = paired_src0->type;
+            paired_args.stride_row_x       = paired_src0->nb[1] / ts_pair;
+            paired_args.stride_channel_x   = paired_src0->nb[2] / ts_pair;
+            paired_args.stride_sample_x    = paired_src0->nb[3] / ts_pair;
+            paired_args.dst                = (float *) paired_dst->data;
+            paired_args.nrows_dst          = paired_dst->nb[1] / sizeof(float);
+            paired_args.stride_channel_dst = paired_dst->nb[2] / sizeof(float);
+            paired_args.stride_sample_dst  = paired_dst->nb[3] / sizeof(float);
+            ggml_cuda_mul_mat_q_switch_type(ctx, paired_args, stream, prec_src1);
+        }
+    };
+
     if (!ids) {
         const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * y_block_size/y_values_per_block +
-            ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11) * sizeof(block_q8_1_mmq);
+            quant_guard_bytes(ne11);
         ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
         ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
         if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4) {
@@ -261,7 +294,7 @@ void ggml_cuda_mul_mat_q(
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
             ne1, ne1};
-        ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
+        launch_products(args);
         return;
     }
 
@@ -292,7 +325,7 @@ void ggml_cuda_mul_mat_q(
     }
 
     const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * y_block_size/y_values_per_block +
-        ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne12) * sizeof(block_q8_1_mmq);
+        quant_guard_bytes(ne12);
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
     ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
     if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4) {
@@ -351,7 +384,97 @@ void ggml_cuda_mul_mat_q(
         ne03, ne13, s03, s13, s3,
         ne12, ncols_opt};
 
-    ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
+    launch_products(args);
+}
+
+void ggml_cuda_mul_mat_q(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+        const ggml_tensor * ids, ggml_tensor * dst, bool convrot) {
+    ggml_cuda_mul_mat_q_impl(ctx, src0, src1, ids, dst, convrot, nullptr);
+}
+
+static int mmq_pair_mode() {
+    static const int mode = [] {
+        const char * e = getenv("GGML_CUDA_MMQ_PAIR");
+        return e && strcmp(e, "1") == 0 ? 1 : e && strcmp(e, "2") == 0 ? 2 : 0;
+    }();
+    return mode;
+}
+
+bool ggml_cuda_mmq_pair_enabled() {
+    return mmq_pair_mode() != 0;
+}
+
+static bool mmq_pair_type(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q1_0: case GGML_TYPE_Q2_0:
+        case GGML_TYPE_Q4_0: case GGML_TYPE_Q4_1: case GGML_TYPE_Q5_0: case GGML_TYPE_Q5_1: case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q2_K: case GGML_TYPE_Q3_K: case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K: case GGML_TYPE_Q6_K:
+        case GGML_TYPE_IQ2_XXS: case GGML_TYPE_IQ2_XS: case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ3_XXS: case GGML_TYPE_IQ3_S: case GGML_TYPE_IQ4_XS: case GGML_TYPE_IQ4_NL:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static __global__ void mmq_pair_check(const float * actual, const float * reference, int64_t n) {
+    const int64_t i = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
+    if (i < n && __float_as_uint(actual[i]) != __float_as_uint(reference[i])) {
+#if defined(__CUDA_ARCH__) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        // Validation is active even in Release builds. No host synchronization.
+        asm volatile("trap;");
+#endif
+    }
+}
+
+bool ggml_cuda_mul_mat_q_pair(ggml_backend_cuda_context & ctx, ggml_tensor * first, ggml_tensor * second) {
+    if (!ggml_cuda_mmq_pair_enabled() || first->op != second->op ||
+            (first->op != GGML_OP_MUL_MAT && first->op != GGML_OP_MUL_MAT_ID) ||
+            first->src[1] != second->src[1] || first->src[2] != second->src[2] ||
+            first->type != GGML_TYPE_F32 || second->type != GGML_TYPE_F32 ||
+            first->src[1]->type != GGML_TYPE_F32 ||
+            !ggml_are_same_shape(first, second) || !ggml_is_contiguous(first) || !ggml_is_contiguous(second) ||
+            !ggml_are_same_shape(first->src[0], second->src[0]) ||
+            !mmq_pair_type(first->src[0]->type) || !mmq_pair_type(second->src[0]->type)) {
+        return false;
+    }
+    const ggml_tensor * a = first->src[0];
+    const ggml_tensor * b = second->src[0];
+    const ggml_tensor * input = first->src[1];
+    const ggml_tensor * ids = first->op == GGML_OP_MUL_MAT_ID ? first->src[2] : nullptr;
+    const int64_t tokens = ids ? input->ne[2] : input->ne[1];
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    // quantize_mmq_q8_1[_scatter] depends on weight type ONLY through this
+    // layout enum. Equal layouts have identical codes and metadata, even for
+    // different weight formats. Native FP4 and rotated formats are excluded.
+    if (tokens < 128 || !GGML_CUDA_CC_IS_NVIDIA(cc) ||
+            mmq_get_q8_1_ds_layout(a->type) != mmq_get_q8_1_ds_layout(b->type) ||
+            ggml_cuda_mmq_get_prec_src1(a, first, cc) != GGML_PREC_Q8 ||
+            ggml_cuda_mmq_get_prec_src1(b, second, cc) != GGML_PREC_Q8) {
+        return false;
+    }
+
+    ggml_cuda_pool_alloc<float> reference_first(ctx.pool());
+    ggml_cuda_pool_alloc<float> reference_second(ctx.pool());
+    const bool check = mmq_pair_mode() == 2;
+    if (check) {
+        ggml_tensor ref_first = *first;
+        ggml_tensor ref_second = *second;
+        ref_first.data = reference_first.alloc(ggml_nelements(first));
+        ref_second.data = reference_second.alloc(ggml_nelements(second));
+        ggml_cuda_mul_mat_q_impl(ctx, a, input, ids, &ref_first, false, nullptr);
+        ggml_cuda_mul_mat_q_impl(ctx, b, input, ids, &ref_second, false, nullptr);
+    }
+    ggml_cuda_mul_mat_q_impl(ctx, a, input, ids, first, false, second);
+    if (check) {
+        const int64_t n = ggml_nelements(first);
+        mmq_pair_check<<<(n + 255)/256, 256, 0, ctx.stream()>>>((const float *) first->data, reference_first.get(), n);
+        mmq_pair_check<<<(n + 255)/256, 256, 0, ctx.stream()>>>((const float *) second->data, reference_second.get(), n);
+        CUDA_CHECK(cudaGetLastError());
+    }
+    ++ctx.fusion_stats.mmq_pair;
+    return true;
 }
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {
