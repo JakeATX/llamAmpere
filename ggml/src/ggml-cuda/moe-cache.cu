@@ -64,7 +64,7 @@ static void moe_cache_register_stub(const void * owner) {
 
 // fork (missjoin): device counters for opt-in miss staging; see moe_missjoin_stage_kernel.
 static unsigned long long * g_missjoin_counts = nullptr;
-static constexpr int moe_missjoin_count_entries = 8;
+static constexpr int moe_missjoin_count_entries = 10;
 // Overlap mode: persistent per-projection scratch and table copies, filled on a side
 // stream so each projection's matrix-vector pass waits only for its own copies.
 static cudaStream_t g_mj_side = nullptr;
@@ -162,6 +162,10 @@ static void moe_missjoin_log(const char * when) {
     if (c[6]) {
         MOE_CACHE_LOG("[moe-cache] missjoin copy layout %s: expert_cta_dispatches=%llu staged_bytes=%llu\n",
                 when, c[6], c[7]);
+    }
+    if (c[8]) {
+        MOE_CACHE_LOG("[moe-cache] missjoin reuse-only %s: bypassed_experts=%llu bypassed_bytes=%llu\n",
+                when, c[8], c[9]);
     }
 }
 
@@ -7232,6 +7236,14 @@ static bool moe_missjoin_expert_cta() {
     return enabled;
 }
 
+static bool moe_missjoin_reuse_only() {
+    static const bool enabled = [] {
+        const char * value = getenv("GGML_MOE_MISSJOIN_REUSE_ONLY");
+        return value && strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
 static constexpr int MOE_MISSJOIN_RETAIN_MAX = 8;
 
 struct moe_missjoin_retained_state {
@@ -7375,10 +7387,11 @@ static __global__ void moe_missjoin_retained_copy_kernel(const moe_missjoin_reta
 }
 
 // counts: 0 dispatches, 1 distinct experts, 2 distinct misses, 3 staged,
-//         4 miss routes (with duplicates), 5 unstaged misses (overflow or unaligned).
+//         4 miss routes (with duplicates), 5 unstaged misses (overflow, unaligned, or bypassed).
 // 6 expert-CTA dispatches, 7 bytes staged by that copy layout.
+// 8 bypassed single-use images, 9 full-image bytes not staged for those images.
 // Retained hits are counted separately and do not increment staged or unstaged.
-template <bool expert_cta>
+template <bool expert_cta, bool reuse_only>
 static __global__ void moe_missjoin_stage_kernel(const void * const * table, const uint8_t * hot,
         const int32_t * ids, int n_ids, int n_routes, int ids_stride, int n_expert,
         const void ** eff, char * scratch, size_t stride, size_t copy_bytes, int slots, int diag,
@@ -7393,7 +7406,7 @@ static __global__ void moe_missjoin_stage_kernel(const void * const * table, con
     }
     if (threadIdx.x == 0) { s_sub = INT_MAX; }
     __syncthreads();
-    // bit0 first occurrence, bit1 miss, bit2 stageable (miss + 16-byte aligned source)
+    // bit0 first occurrence, bit1 miss, bit2 stageable, bit3 bypassed single-use image.
     for (int i = threadIdx.x; i < n_routes; i += blockDim.x) {
         const int e = s_e[i];
         unsigned char f = 0;
@@ -7406,6 +7419,15 @@ static __global__ void moe_missjoin_stage_kernel(const void * const * table, con
             if (!hot[e]) {
                 f |= 2;
                 if (((uintptr_t) table[e] & 15) == 0) { f |= 4; }
+            }
+        }
+        if constexpr (reuse_only) {
+            if (!diag && f == 7) {
+                bool reused = false;
+                for (int j = i + 1; j < n_routes; ++j) {
+                    if (s_e[j] == e) { reused = true; break; }
+                }
+                if (!reused) { f = (f & ~4) | 8; }
             }
         }
         s_flag[i] = f;
@@ -7447,11 +7469,12 @@ static __global__ void moe_missjoin_stage_kernel(const void * const * table, con
             }
         }
         if (threadIdx.x == 0 && counts) {
-            unsigned long long distinct = 0, dmiss = 0, mroutes = 0;
+            unsigned long long distinct = 0, dmiss = 0, mroutes = 0, bypassed = 0;
             for (int i = 0; i < n_routes; ++i) {
                 distinct += (s_flag[i] & 1) != 0;
                 dmiss += (s_flag[i] & 3) == 3;
                 mroutes += (s_flag[i] & 2) != 0;
+                if constexpr (reuse_only) { bypassed += (s_flag[i] & 8) != 0; }
             }
             atomicAdd(counts + 0, 1ULL);
             atomicAdd(counts + 1, distinct);
@@ -7459,6 +7482,12 @@ static __global__ void moe_missjoin_stage_kernel(const void * const * table, con
             atomicAdd(counts + 3, diag ? 0ULL : (unsigned long long) n_stage);
             atomicAdd(counts + 4, mroutes);
             atomicAdd(counts + 5, diag ? 0ULL : dmiss - (unsigned long long) n_stage);
+            if constexpr (reuse_only) {
+                if (bypassed) {
+                    atomicAdd(counts + 8, bypassed);
+                    atomicAdd(counts + 9, bypassed * copy_bytes);
+                }
+            }
             if constexpr (expert_cta) {
                 if (!diag) {
                     atomicAdd(counts + 6, 1ULL);
@@ -7531,16 +7560,25 @@ static void moe_missjoin_stage(const void * const * table, const uint8_t * hot,
         const int32_t * ids, int n_ids, int n_routes, int ids_stride, int n_expert,
         const void ** eff, char * scratch, size_t stride, size_t copy_bytes, int slots, int diag,
         unsigned long long * counts, int blocks, cudaStream_t stream) {
-    auto launch = [&](auto tag) {
-        constexpr bool expert_cta = decltype(tag)::value;
-        moe_missjoin_stage_kernel<expert_cta><<<blocks, 256, 0, stream>>>(
+    auto launch = [&](auto copy_tag, auto reuse_tag) {
+        constexpr bool expert_cta = decltype(copy_tag)::value;
+        constexpr bool reuse_only = decltype(reuse_tag)::value;
+        moe_missjoin_stage_kernel<expert_cta, reuse_only><<<blocks, 256, 0, stream>>>(
                 table, hot, ids, n_ids, n_routes, ids_stride, n_expert,
                 eff, scratch, stride, copy_bytes, slots, diag, counts);
     };
+    auto select_reuse = [&](auto copy_tag) {
+        // Retention has its own planner and keeps its existing placement policy.
+        if (moe_missjoin_reuse_only() && !moe_missjoin_retained_slots()) {
+            launch(copy_tag, std::true_type{});
+        } else {
+            launch(copy_tag, std::false_type{});
+        }
+    };
     if (moe_missjoin_expert_cta()) {
-        launch(std::true_type{});
+        select_reuse(std::true_type{});
     } else {
-        launch(std::false_type{});
+        select_reuse(std::false_type{});
     }
 }
 

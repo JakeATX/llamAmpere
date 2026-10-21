@@ -5926,7 +5926,9 @@ static bool run_device_fused_missjoin(ggml_backend_t gpu, ggml_backend_t cpu, lo
         {0, 0, 0, 0, 0, 0, 0, 0},
     };
     std::vector<unsigned long long> totals(6, 0);
-    unsigned long long copied_bytes = 0;
+    unsigned long long copied_bytes = 0, bypassed_experts = 0, bypassed_bytes = 0;
+    const char * reuse_env = getenv("GGML_MOE_MISSJOIN_REUSE_ONLY");
+    const bool reuse_only = !retain && reuse_env && strcmp(reuse_env, "1") == 0;
     // At 65 rows, IQ3_S needs 40 quant blocks per row to keep expert images 16-byte aligned.
     const int64_t input_width = large_copy ? 2560 : grouped ? 10240 : n_in;
     const int64_t output_rows = large_copy ? 640 : grouped ? 65 : n_out;
@@ -6059,20 +6061,27 @@ static bool run_device_fused_missjoin(ggml_backend_t gpu, ggml_backend_t cpu, lo
                             }
                             if (staged && !mask_only) {
                                 for (int bank = 0; bank < banks; ++bank) {
-                                    bool seen[n_expert] = {};
+                                    int uses[n_expert] = {};
                                     unsigned long long distinct = 0, misses = 0, miss_routes = 0;
                                     for (int t = 0; t < tokens; ++t) {
                                         for (int rank = 0; rank < used; ++rank) {
                                             const int e = routing[phase][512 * t + rank];
                                             miss_routes += e != bank;
-                                            if (!seen[e]) {
-                                                seen[e] = true;
+                                            if (uses[e]++ == 0) {
                                                 ++distinct;
                                                 misses += e != bank;
                                             }
                                         }
                                     }
-                                    const auto copied = std::min(misses, (unsigned long long)slots);
+                                    unsigned long long bypassed = 0;
+                                    if (reuse_only) {
+                                        for (int e = 0; e < n_expert; ++e) {
+                                            bypassed += e != bank && uses[e] == 1;
+                                        }
+                                    }
+                                    const auto copied = std::min(misses - bypassed, (unsigned long long)slots);
+                                    bypassed_experts += bypassed;
+                                    bypassed_bytes += bypassed * weights[bank]->nb[2];
                                     selected_misses += misses;
                                     ++totals[0];
                                     totals[1] += distinct;
@@ -6107,6 +6116,15 @@ static bool run_device_fused_missjoin(ggml_backend_t gpu, ggml_backend_t cpu, lo
                                     "[moe-cache] missjoin copy layout final: expert_cta_dispatches=%llu staged_bytes=%llu",
                                     &dispatches, &bytes) == 2 && dispatches == totals[0] &&
                                     bytes == copied_bytes && bytes > 0;
+                        }
+                        const size_t reuse_pos = log.rfind("[moe-cache] missjoin reuse-only final: ");
+                        if (bypassed_experts) {
+                            unsigned long long experts = 0, bytes = 0;
+                            ok &= reuse_pos != std::string::npos && sscanf(log.c_str() + reuse_pos,
+                                    "[moe-cache] missjoin reuse-only final: bypassed_experts=%llu bypassed_bytes=%llu",
+                                    &experts, &bytes) == 2 && experts == bypassed_experts && bytes == bypassed_bytes;
+                        } else {
+                            ok &= reuse_pos == std::string::npos;
                         }
                     }
                     if (staged && retain) {
@@ -6147,6 +6165,11 @@ static bool run_device_fused_missjoin(ggml_backend_t gpu, ggml_backend_t cpu, lo
     if (large_copy) {
         printf("missjoin-copy: 30 shapes, 360 staged graph runs, dispatches=%llu staged_bytes=%llu: %s\n",
                 totals[0], copied_bytes, ok ? "OK" : "FAIL");
+        if (reuse_only) {
+            ok &= bypassed_experts > 0 && copied_bytes > 0;
+            printf("missjoin-reuse-only: bypassed_experts=%llu bypassed_bytes=%llu: %s\n",
+                    bypassed_experts, bypassed_bytes, ok ? "OK" : "FAIL");
+        }
     }
     printf("cache-device%s-missjoin%s%s%s%s: %s\n", fused ? "-fused" : "", overlap ? "-overlap" : "", mask_only ? "-mask" : "", retain ? "-retain" : "", grouped ? "-grouped" : "", ok ? "OK" : "FAIL");
     return ok;
