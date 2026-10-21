@@ -12276,6 +12276,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (ggml_type type : {GGML_TYPE_AI4_U, GGML_TYPE_AI5_U}) {
         test_cases.emplace_back(new test_mul_mat_ai4(48, 5, 384, type));
     }
+    // rate-6 span kernels over several K spans (an output head is K = 5120 = 5 spans) at the decode/verify widths
+    for (ggml_type type : {GGML_TYPE_AI4_S, GGML_TYPE_AI6_S}) {
+        for (int64_t n : {1, 4, 5, 9, 33}) {
+            test_cases.emplace_back(new test_mul_mat_ai4(64, n, 5120, type));
+        }
+    }
     for (ggml_type type : {GGML_TYPE_AI4_U, GGML_TYPE_AI4_S, GGML_TYPE_AI6_S}) {
         for (int64_t n : {1, 9}) {
             test_cases.emplace_back(new test_mul_mat_id_ai4(type, 4, 3, false, 32, n, 1024, true));

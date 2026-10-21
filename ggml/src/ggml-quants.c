@@ -5,6 +5,8 @@
 #include "ggml-impl.h"
 #include "ggml-cpu/ggml-cpu-impl.h"
 #include "ggml-cpu.h"
+#include "ggml-ai4.h"
+#include "ggml-ai4-decode.h"
 
 #include <math.h>
 #include <string.h>
@@ -6002,6 +6004,25 @@ static inline float ggml_exl3_mul1_decode(uint32_t code) {
     const float h = GGML_FP16_TO_FP32((ggml_fp16_t) s);
     const float v = h * GGML_FP16_TO_FP32((ggml_fp16_t) 0x1eee) + GGML_FP16_TO_FP32((ggml_fp16_t) 0xc931); // exact in fp32
     return GGML_FP16_TO_FP32(GGML_FP32_TO_FP16(v));
+}
+
+// ---- AI+ host slab decoder (ggml-ai4-decode.h) ----
+size_t ggml_ai4_slab_nbytes(enum ggml_type type, int64_t K) {
+    const int lay = ggml_ai4_layout(type), k = ggml_ai4_rate(type);
+    if (lay < 0 || K <= 0 || K % (lay == 1 ? AI4U_UK : AI4_SB) != 0) {
+        return 0;
+    }
+    return (size_t) ai4x_slab_bytes_lk(lay, K, k);
+}
+
+bool ggml_ai4_dequantize_slab(enum ggml_type type, const void * data, int64_t K, int64_t g, float * y) {
+    const size_t sb = ggml_ai4_slab_nbytes(type, K);
+    if (sb == 0 || data == NULL || y == NULL || g < 0) {
+        return false;
+    }
+    ai4x_dequantize_slab_lkc(ggml_ai4_layout(type), ggml_ai4_rate(type), ggml_ai4_trellis_mul(type),
+                             (const uint8_t *) data + (size_t) g * sb, y, K);
+    return true;
 }
 
 void ggml_exl3_dequantize_row_group(const void * GGML_RESTRICT data, int64_t K, int64_t N, int bits, int64_t g, float * GGML_RESTRICT y) {

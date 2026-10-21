@@ -10,10 +10,14 @@
 //   row_eff[j] = svh[j] * sum_r had[j % 128][r] * W_trellis[128 * (j / 128) + r]        (r = 0..127)
 // so that  y[j] = row_eff[j] . x_rot  with  x_rot = H128(suh * x), the activation the EXL3 kernel consumes.
 // The rows are then quantized to a compact type; the graph scores them with one plain mul_mat on x_rot.
+// An AI+ head (ggml-ai4.h: AI4 / AIk_U / AIk_S) has no one-row path and no to_float either: its rows come in 16-row
+// trellis slabs. Its rows are decoded slab by slab in the ORIGINAL basis (ggml_ai4_dequantize_slab undoes the offline
+// rotation), so x_rot = x as for a plain head.
 // For any other head type (LLAMA_DRAFT_VOCAB_COMPACT=1 A/B) the rows are the head rows (to_float) and x_rot = x.
 // Header-only so tests/test-draft-vocab-compact.cpp can check it without a model.
 
 #include "ggml.h"
+#include "ggml-ai4-decode.h"
 
 #include <algorithm>
 #include <atomic>
@@ -57,8 +61,12 @@ inline bool llama_draft_compact_build(
     if (bits != 0 && (src.svh == nullptr || src.had == nullptr || K % 16 != 0 || N % 128 != 0)) {
         return false;
     }
+    const bool is_ai = ggml_ai4_rate(src.type) != 0;
+    if (is_ai && (N % 16 != 0 || ggml_ai4_slab_nbytes(src.type, K) == 0)) {
+        return false;
+    }
     const ggml_type_traits * tt = ggml_get_type_traits(src.type);
-    if (bits == 0 && (tt == nullptr || tt->to_float == nullptr)) {
+    if (bits == 0 && !is_ai && (tt == nullptr || tt->to_float == nullptr)) {
         return false;
     }
     for (int64_t i = 0; i < n_sel; ++i) {
@@ -81,6 +89,49 @@ inline bool llama_draft_compact_build(
     };
 
     n_threads = std::max(1, n_threads);
+
+    if (is_ai) {
+        // AI+: group the selected positions by 16-row slab, decode each slab that holds one once
+        const int64_t n_slab = N / 16;
+        std::vector<int64_t> slab_start(n_slab + 1, 0);
+        for (int64_t i = 0; i < n_sel; ++i) {
+            slab_start[ids[i] / 16 + 1]++;
+        }
+        for (int64_t b = 0; b < n_slab; ++b) {
+            slab_start[b + 1] += slab_start[b];
+        }
+        std::vector<int64_t> order(n_sel);
+        {
+            std::vector<int64_t> fill(slab_start.begin(), slab_start.end() - 1);
+            for (int64_t i = 0; i < n_sel; ++i) {
+                order[fill[ids[i] / 16]++] = i;
+            }
+        }
+        std::atomic<int64_t> next{0};
+        std::atomic<bool>    ok{true};
+        auto worker = [&]() {
+            std::vector<float> slab((size_t) 16 * K);
+            for (int64_t b; (b = next.fetch_add(1)) < n_slab; ) {
+                const int64_t s0 = slab_start[b], s1 = slab_start[b + 1];
+                if (s0 == s1) {
+                    continue;
+                }
+                if (!ggml_ai4_dequantize_slab(src.type, src.data, K, b, slab.data())) {
+                    ok = false;
+                    return;
+                }
+                for (int64_t q = s0; q < s1; ++q) {
+                    const int64_t pos = order[q];
+                    emit(pos, slab.data() + (size_t) (ids[pos] % 16) * K);
+                }
+            }
+        };
+        std::vector<std::thread> th;
+        for (int t = 1; t < n_threads; ++t) th.emplace_back(worker);
+        worker();
+        for (auto & t : th) t.join();
+        return ok;
+    }
 
     if (bits == 0) {
         // plain row-addressable head: rows are the head rows

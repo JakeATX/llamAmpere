@@ -26,6 +26,9 @@
 //   LAY = LAY_S  (3): AI4_S, spans of 16 x 1024 ([d 16][8 x 16 tiles], 8224 B); chunk kc at (kc>>3)*8224 + 32 + (kc&7)*1024,
 //                     scale = d[r] of the span (one per 1024 K, so the scale load repeats across the span's 8 chunks)
 //   LAY = LAY_U5 (2) / LAY_S5 (4): the same two layouts at rate 5 (20-word tiles: 1312 B units, 10272 B spans)
+//   LAY = LAY_U6 (5) / LAY_S6 (6): the same two layouts at rate 6 (24-word tiles: 1568 B units, 12320 B spans) under the
+//                     AI6 trellis constant 0xA1EEE321 (ggml_ai4_trellis_mul); a 4-symbol state window is 34 bits there, so
+//                     each A register reads a 64-bit window (k6_win / levels4_k6)
 //   XSH = 1: one activation scale per (token, 256 K) (rq4::quantize_act, H256), XSH = 0: per (token, 128 K) (quantize_act128, H128)
 //   ID  = true: MUL_MAT_ID; the grid's y index selects an (active expert, token tile) from idmap (built by ai4k::ids_helper),
 //         weights = W + expert*nb02, token c of the tile reads Xq row rows[c] and writes Y column cols[c]. Experts that no
@@ -50,6 +53,8 @@ constexpr int LAY_U  = 1;
 constexpr int LAY_U5 = 2;   // AI5_U: rate-5 units of 16 x 128 ([d 16][16 tiles x 20 words], 1312 B)
 constexpr int LAY_S  = 3;   // AI4_S: rate-4 spans of 16 x 1024 ([d 16][8 x 16 tiles], 8224 B), one scale per row and span
 constexpr int LAY_S5 = 4;   // AI5_S: rate-5 spans of 16 x 1024 ([d 16][8 x 16 tiles x 20 words], 10272 B)
+constexpr int LAY_U6 = 5;   // AI6_U: rate-6 units of 16 x 128 ([d 16][16 tiles x 24 words], 1568 B), constant 0xA1EEE321
+constexpr int LAY_S6 = 6;   // AI6_S: rate-6 spans of 16 x 1024 ([d 16][8 x 16 tiles x 24 words], 12320 B), constant 0xA1EEE321
 
 // mmv-ID columns per block: lanes g = 0..7 of the mmv kernel each own one token column
 constexpr int MMV_ID_BN = 8;
@@ -82,17 +87,19 @@ static __host__ __device__ __forceinline__ int64_t slab_bytes(int K) { return (i
 
 // rate-5 tile layout (LAY_U5 / LAY_S5) and the span layouts (LAY_S / LAY_S5: one scale per row and 1024 K)
 template <int LAY> constexpr __host__ __device__ bool lay_k5()  { return LAY == LAY_U5 || LAY == LAY_S5; }
-template <int LAY> constexpr __host__ __device__ bool lay_span() { return LAY == LAY_S  || LAY == LAY_S5; }
+template <int LAY> constexpr __host__ __device__ bool lay_k6()  { return LAY == LAY_U6 || LAY == LAY_S6; }
+template <int LAY> constexpr __host__ __device__ bool lay_span() { return LAY == LAY_S  || LAY == LAY_S5 || LAY == LAY_S6; }
 
 // per-layout chunk tile bytes (16 tiles), unit bytes and slab bytes (rate 5: tile = 128 x 5 bits = 20 words). The span
 // layouts have no per-unit header, so their "unit bytes" is the 128-K share of a span (ch_bytes + 32/8) and
 // slab_bytes_l stays (K/128)*u_bytes: 1028 B per 128 K at k = 4, 1284 at k = 5.
-template <int LAY> constexpr __host__ __device__ int ch_bytes() { return lay_k5<LAY>() ? 1280 : CH_BYTES; }
+template <int LAY> constexpr __host__ __device__ int ch_bytes() { return lay_k6<LAY>() ? 1536 : lay_k5<LAY>() ? 1280 : CH_BYTES; }
 template <int LAY> constexpr __host__ __device__ int u_bytes()  {
-    return lay_span<LAY>() ? ch_bytes<LAY>() + U_SC/8 : (LAY == LAY_U5 ? 1312 : U_BYTES);
+    return lay_span<LAY>() ? ch_bytes<LAY>() + U_SC/8 : (LAY == LAY_U5 ? 1312 : LAY == LAY_U6 ? 1568 : U_BYTES);
 }
 template <int LAY> constexpr __host__ __device__ int span_bytes() { return U_SC + 8*ch_bytes<LAY>(); }
 template <int LAY> static __host__ __device__ __forceinline__ int64_t slab_bytes_l(int K) { return (int64_t) (K/128)*u_bytes<LAY>(); }
+static_assert(span_bytes<LAY_S6>() == 12320 && u_bytes<LAY_U6>() == 1568 && u_bytes<LAY_S6>()*8 == 12320, "ai4k rate-6 sizes");
 
 // byte offset of chunk kc's 16 tiles inside a slab
 template <int LAY>
@@ -183,6 +190,49 @@ static __device__ __forceinline__ void a_regs_smem_k5(const uint32_t * __restric
     a[1] = levels4_k5(__funnelshift_l(ta[wb.w1], ta[wb.w0], wb.sh));
     a[2] = levels4_k5(__funnelshift_l(tb[wa.w1], tb[wa.w0], wa.sh));
     a[3] = levels4_k5(__funnelshift_l(tb[wb.w1], tb[wb.w0], wb.sh));
+}
+
+// Rate 6 (AI6_U / AI6_S). State of symbol n = the 16 stream bits ending at the end of symbol n (ggml-ai4.h aik_get_state),
+// so the 4 states of symbols n0..n0+3 (n0 = 8R + 4h) span the 16 + 3*6 = 34 bits that end at 6*(n0 + 4): more than one
+// 32-bit window. Take the 64 stream bits [6*(n0 + 4) - 64, 6*(n0 + 4)) (mod 768, tail-biting) = words w0, w1, w2 at bit
+// offset sh (per lane constant); hi:lo is that window, state of n0 + b = bits 6*(3 - b) .. +15 of it.
+struct k6win { int w0, w1, w2, sh; };
+static __device__ __forceinline__ k6win k6_win(int R, int h) {
+    int s = 48*R + 24*h - 40;   // 6*(8R + 4h + 4) - 64
+    s += s < 0 ? 768 : 0;
+    k6win r;
+    r.w0 = s >> 5; r.sh = s & 31;
+    r.w1 = r.w0 + 1 == 24 ? 0 : r.w0 + 1;
+    r.w2 = r.w1 + 1 == 24 ? 0 : r.w1 + 1;
+    return r;
+}
+// four s8 levels of the AI6 trellis (constant 0xA1EEE321) from the 64-bit window hi:lo (byte 0 = symbol n0)
+static __device__ __forceinline__ uint32_t levels4_k6(const uint32_t hi, const uint32_t lo) {
+    const uint32_t s0 = __funnelshift_r(lo, hi, 18) & 0xFFFFu;
+    const uint32_t s1 = (lo >> 12) & 0xFFFFu;
+    const uint32_t s2 = (lo >>  6) & 0xFFFFu;
+    const uint32_t s3 =  lo        & 0xFFFFu;
+    constexpr uint32_t C = 128u - 32768u;
+    const uint32_t r0 = __dp4a(s0*0xA1EEE321u, 0x40404040u, C);
+    const uint32_t r1 = __dp4a(s1*0xA1EEE321u, 0x40404040u, C);
+    const uint32_t r2 = __dp4a(s2*0xA1EEE321u, 0x40404040u, C);
+    const uint32_t r3 = __dp4a(s3*0xA1EEE321u, 0x40404040u, C);
+    const uint32_t lo2 = __byte_perm(r0, r1, 0x0051);
+    const uint32_t hi2 = __byte_perm(r2, r3, 0x0051);
+    return __byte_perm(lo2, hi2, 0x5410);
+}
+static __device__ __forceinline__ uint32_t k6_reg(const uint32_t * __restrict__ tile, const k6win & w) {
+    const uint32_t a = tile[w.w0], b = tile[w.w1], c = tile[w.w2];
+    return levels4_k6(__funnelshift_l(b, a, w.sh), __funnelshift_l(c, b, w.sh));
+}
+static __device__ __forceinline__ void a_regs_smem_k6(const uint32_t * __restrict__ tw, int j, int t, const k6win & wa, const k6win & wb,
+                                                      uint32_t (&a)[4]) {
+    const uint32_t * ta = tw + (4*j + (t >> 1))*24;
+    const uint32_t * tb = ta + 2*24;
+    a[0] = k6_reg(ta, wa);
+    a[1] = k6_reg(ta, wb);
+    a[2] = k6_reg(tb, wa);
+    a[3] = k6_reg(tb, wb);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -286,6 +336,8 @@ static __global__ void __launch_bounds__(GEMM_THREADS, 1) gemm(
 
     const k5win k5a = k5_win(g, t & 1), k5b = k5_win(g + 8, t & 1);
     (void) k5a; (void) k5b;
+    const k6win k6a = k6_win(g, t & 1), k6b = k6_win(g + 8, t & 1);
+    (void) k6a; (void) k6b;
 
     float acc[NTI][4];
 #pragma unroll
@@ -318,7 +370,9 @@ static __global__ void __launch_bounds__(GEMM_THREADS, 1) gemm(
         uint32_t a[4][4];
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
-            if constexpr (lay_k5<LAY>()) {
+            if constexpr (lay_k6<LAY>()) {
+                a_regs_smem_k6(tw, j, t, k6a, k6b, a[j]);
+            } else if constexpr (lay_k5<LAY>()) {
                 a_regs_smem_k5(tw, j, t, k5a, k5b, a[j]);
             } else {
                 a_regs_smem(tw, j, g, t, a[j]);
@@ -449,6 +503,8 @@ static __global__ void __launch_bounds__(MMV_WARPS*32, MINB) mmv(
     const uint8_t * ws = W + (int64_t) slab*slab_bytes_l<LAY>(K);
     const k5win k5a = k5_win(g, t & 1), k5b = k5_win(g + 8, t & 1);
     (void) k5a; (void) k5b;
+    const k6win k6a = k6_win(g, t & 1), k6b = k6_win(g + 8, t & 1);
+    (void) k6a; (void) k6b;
     uint8_t * ring = smem + warp*STAGES*ST;
 
     const bool has_n = g < N;
@@ -464,7 +520,8 @@ static __global__ void __launch_bounds__(MMV_WARPS*32, MINB) mmv(
         const uint8_t * tiles = ws + chunk_off<LAY>(kc);
         cp_async16(st + lane*16,       tiles + lane*16,       true);
         cp_async16(st + 512 + lane*16, tiles + 512 + lane*16, true);
-        if constexpr (CHB > 1024) {   // LAY_U5: 1280 B = 80 pieces
+        if constexpr (CHB > 1024) {   // rate 5: 1280 B = 80 pieces, rate 6: 1536 B = 96 pieces
+            static_assert(CHB <= 1536, "mmv tile load");
             if (lane < (CHB - 1024)/16) {
                 cp_async16(st + 1024 + lane*16, tiles + 1024 + lane*16, true);
             }
@@ -545,7 +602,9 @@ static __global__ void __launch_bounds__(MMV_WARPS*32, MINB) mmv(
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
             uint32_t a[4];
-            if constexpr (lay_k5<LAY>()) {
+            if constexpr (lay_k6<LAY>()) {
+                a_regs_smem_k6(tw, j, t, k6a, k6b, a);
+            } else if constexpr (lay_k5<LAY>()) {
                 a_regs_smem_k5(tw, j, t, k5a, k5b, a);
             } else {
                 a_regs_smem(tw, j, g, t, a);

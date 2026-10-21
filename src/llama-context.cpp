@@ -1201,17 +1201,20 @@ void llama_context::init_draft_vocab(const char * path, int32_t n_hot) {
                     n_hot, (long long) n_sel));
     }
 
-    // [#81] compact resident draft head: auto for EXL3 heads (no one-row path), LLAMA_DRAFT_VOCAB_COMPACT=1 forces it
-    // on any head (A/B), =0 keeps the full-head fallback; prism-rotated heads keep their fallback
+    // [#81] compact resident draft head: auto for EXL3 and AI+ heads (no one-row path), LLAMA_DRAFT_VOCAB_COMPACT=1
+    // forces it on any head (A/B), =0 keeps the full-head fallback; prism-rotated heads keep their fallback.
+    // Row type: iq4_xs from an EXL3 head, q6_K from an AI+ head (the AI+ output head is AI6_S, about 6 bits, and the
+    // IQ4_XS model's head is Q6_K: same draft-head precision class); LLAMA_DRAFT_VOCAB_COMPACT_TYPE overrides.
     ggml_type compact_type = GGML_TYPE_COUNT;
     {
         const char * env = getenv("LLAMA_DRAFT_VOCAB_COMPACT");
         const int force = env != nullptr && env[0] != '\0' ? atoi(env) : -1;
         const bool is_exl3 = ggml_exl3_bits(head->type) != 0;
+        const bool is_ai   = ggml_ai4_rate(head->type) != 0;
         const bool want = !model.hparams.no_alloc && !model.hadamard_rotations.count(head) &&
-                n_sel < head->ne[1] && (force == 1 || (force != 0 && is_exl3));
+                n_sel < head->ne[1] && (force == 1 || (force != 0 && (is_exl3 || is_ai)));
         if (want) {
-            compact_type = GGML_TYPE_IQ4_XS;
+            compact_type = is_ai ? GGML_TYPE_Q6_K : GGML_TYPE_IQ4_XS;
             if (const char * te = getenv("LLAMA_DRAFT_VOCAB_COMPACT_TYPE"); te != nullptr && te[0] != '\0') {
                 compact_type = GGML_TYPE_COUNT;
                 for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
@@ -1239,7 +1242,12 @@ void llama_context::init_draft_vocab(const char * path, int32_t n_hot) {
                 LLAMA_LOG_WARN("%s: EXL3 head %s has no .suh/.svh or no exl3_had128, no compact draft head\n",
                         __func__, ggml_get_name(head));
                 compact_type = GGML_TYPE_COUNT;
-            } else if (!is_exl3 && (ggml_get_type_traits(head->type)->to_float == nullptr || !ggml_is_contiguous(head))) {
+            } else if (is_ai && (head->ne[1] % 16 != 0 || ggml_ai4_slab_nbytes(head->type, head->ne[0]) == 0 ||
+                        !ggml_is_contiguous(head))) {
+                LLAMA_LOG_WARN("%s: AI+ head %s (%s) is not whole 16-row slabs, no compact draft head\n",
+                        __func__, ggml_get_name(head), ggml_type_name(head->type));
+                compact_type = GGML_TYPE_COUNT;
+            } else if (!is_exl3 && !is_ai && (ggml_get_type_traits(head->type)->to_float == nullptr || !ggml_is_contiguous(head))) {
                 LLAMA_LOG_WARN("%s: head %s (%s) has no row decoder, no compact draft head\n",
                         __func__, ggml_get_name(head), ggml_type_name(head->type));
                 compact_type = GGML_TYPE_COUNT;
