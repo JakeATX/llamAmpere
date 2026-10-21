@@ -628,7 +628,7 @@ private:
     std::vector<ggml_backend_buffer_ptr> b1_kv_views;
     ggml_backend_buffer_ptr b1_kv_owned;
     bool b1_kv_scratch_release();
-    bool b1_kv_scratch_bind(int32_t l0, int32_t l1);
+    bool b1_kv_scratch_bind(int32_t l0, int32_t l1, bool preflight = false);
 
     bool b1_off_logged = false; // the once-per-context note on why B1 is not used was printed
     bool b1_mc_suspended = false; // this call freed the MoE expert cache's pool (made again in b1_end)

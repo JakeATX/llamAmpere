@@ -25,6 +25,7 @@ struct dummy_backend_context {
 
     bool custom_alloc_buffer_n_called   = false;
     bool custom_get_alloc_size_n_called = false;
+    size_t alloc_buffer_calls = 0;
 
     size_t allocated_total() const {
         size_t n = 0;
@@ -948,6 +949,69 @@ static void test_scheduler_borrowed_buffer() {
     }
 }
 
+static void test_scheduler_borrowed_preflight() {
+    dummy_backend backend = dummy_backend_init(SIZE_MAX);
+    backend.buffer_type.iface.alloc_buffer = [](ggml_backend_buffer_type_t buft, size_t size) {
+        ++((dummy_backend_context *) buft->context)->alloc_buffer_calls;
+        return scheduler_copy_alloc_buffer(buft, size);
+    };
+    backend.context->backend.iface.graph_compute = scheduler_copy_graph_compute;
+    scheduler_copy_state state;
+    backend.context->backend.context = &state;
+    ggml_backend_t backend_ptr = &backend.context->backend;
+    ggml_backend_buffer_type_t buft = &backend.buffer_type;
+    ggml_backend_sched_ptr sched(ggml_backend_sched_new(&backend_ptr, &buft, 1, 48, false, false));
+    auto [ctx, graph, ctx_ptr] = make_context();
+    ggml_tensor * input_a = make_input_1d(ctx, 96);
+    ggml_tensor * input_b = make_input_1d(ctx, 96);
+    ggml_tensor * output = ggml_add(ctx, input_a, input_b);
+    ggml_set_output(output);
+    ggml_build_forward_expand(graph, output);
+    size_t measured = 0;
+    ggml_backend_sched_reserve_size(sched.get(), graph, &measured);
+    GGML_ASSERT(measured > 512 && backend.context->alloc_buffer_calls == 0);
+    ggml_backend_sched_reset(sched.get());
+
+    ggml_backend_buffer_ptr parent(ggml_backend_buft_alloc_buffer(buft, 4096));
+    ggml_backend_buffer_ptr owned(ggml_backend_buft_alloc_buffer(buft, 512));
+    ggml_backend_buffer_ptr first(ggml_backend_buffer_view(parent.get(), 128, 512));
+    ggml_backend_buffer_ptr second(ggml_backend_buffer_view(parent.get(), 768, 512));
+    ggml_backend_buffer_clear(parent.get(), 0xa5);
+    ggml_backend_buffer_t chunks[] = { first.get(), second.get(), owned.get() };
+    GGML_ASSERT(ggml_backend_sched_set_buffers(sched.get(), backend_ptr, chunks, 3));
+    GGML_ASSERT(ggml_backend_sched_reserve(sched.get(), graph));
+    GGML_ASSERT(backend.context->alloc_buffer_calls == 2);
+    auto & data = *(std::vector<uint8_t> *) parent->context;
+    for (uint8_t value : data) { GGML_ASSERT(value == 0xa5); }
+
+    // Return preflight views before any cache writer uses those cells.
+    ggml_backend_sched_reset(sched.get());
+    GGML_ASSERT(ggml_backend_sched_set_buffers(sched.get(), backend_ptr, nullptr, 0));
+    ggml_backend_buffer_clear(first.get(), 0x77);
+    first.reset();
+    owned.reset();
+    owned.reset(ggml_backend_buft_alloc_buffer(buft, 1024));
+    ggml_backend_buffer_t next[] = { second.get(), owned.get() };
+    GGML_ASSERT(ggml_backend_sched_set_buffers(sched.get(), backend_ptr, next, 2));
+    GGML_ASSERT(ggml_backend_sched_reserve(sched.get(), graph));
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), graph));
+    GGML_ASSERT(backend.context->alloc_buffer_calls == 3);
+    float values[96];
+    for (int i = 0; i < 96; ++i) { values[i] = i + 1; }
+    ggml_backend_tensor_set(input_a, values, 0, sizeof(values));
+    ggml_backend_tensor_set(input_b, values, 0, sizeof(values));
+    GGML_ASSERT(ggml_backend_sched_graph_compute(sched.get(), graph) == GGML_STATUS_SUCCESS);
+    float actual[96];
+    ggml_backend_tensor_get(output, actual, 0, sizeof(actual));
+    for (int i = 0; i < 96; ++i) { GGML_ASSERT(actual[i] == 2.0f * values[i]); }
+    ggml_backend_sched_reset(sched.get());
+    GGML_ASSERT(ggml_backend_sched_set_buffers(sched.get(), backend_ptr, nullptr, 0));
+    ggml_backend_buffer_clear(second.get(), 0);
+    for (size_t i = 0; i < data.size(); ++i) {
+        GGML_ASSERT(data[i] == (i >= 128 && i < 640 ? 0x77 : i >= 768 && i < 1280 ? 0 : 0xa5));
+    }
+}
+
 static bool scheduler_copy_input(ggml_backend_t, const ggml_tensor * src, ggml_tensor * dst, void * user_data) {
     auto & state = *(scheduler_copy_state *) user_data;
     GGML_ASSERT(src == state.input || src == state.activation);
@@ -1482,6 +1546,7 @@ int main() {
     run("test_graph_optimize_alloc_dep", test_graph_optimize_alloc_dep);
     run("test_scheduler_input_copy", test_scheduler_input_copy);
     run("test_scheduler_borrowed_buffer", test_scheduler_borrowed_buffer);
+    run("test_scheduler_borrowed_preflight", test_scheduler_borrowed_preflight);
     run("test_borrowed_arena", test_borrowed_arena);
     run("test_buft_alloc_buffer_n_single_buffer", test_buft_alloc_buffer_n_single_buffer);
     run("test_buft_alloc_buffer_n_multi_buffer", test_buft_alloc_buffer_n_multi_buffer);

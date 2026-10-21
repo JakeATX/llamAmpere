@@ -6066,7 +6066,7 @@ bool llama_context::b1_kv_scratch_release() {
     return true;
 }
 
-bool llama_context::b1_kv_scratch_bind(int32_t l0, int32_t l1) {
+bool llama_context::b1_kv_scratch_bind(int32_t l0, int32_t l1, bool preflight) {
     if (!b1_kv_scratch_enabled) { return true; }
     if (!b1_kv_scratch_release()) { return false; }
     size_t gpu = backend_ptrs.size();
@@ -6126,7 +6126,7 @@ bool llama_context::b1_kv_scratch_bind(int32_t l0, int32_t l1) {
         // Binding discards the previous owned compute buffer only after all its work is complete.
         if (!ggml_backend_sched_set_buffers(sched.get(), backend_ptrs[gpu], chunks.data(), chunks.size())) { return false; }
         b1_kv_backend = backend_ptrs[gpu];
-        // layer_begin has acquired the real layer slot; worker-owned metadata stays untouched.
+        // The caller owns the layer slot through layer_begin or reserve_layer_bind.
         b1_cur = {true, l0, l1, b1->carry(max_ub), nullptr, 0};
         auto * graph = graph_reserve(tokens, 1, std::min(tokens, b1_kv_outputs), reserve_mctx.get());
         b1_cur = {};
@@ -6141,8 +6141,8 @@ bool llama_context::b1_kv_scratch_bind(int32_t l0, int32_t l1) {
             backend_buf_exp_epoch = ggml_backend_sched_get_alloc_epoch(sched.get());
             size_t free = 0, total = 0;
             ggml_backend_dev_memory(ggml_backend_get_device(b1_kv_backend), &free, &total);
-            LLAMA_LOG_INFO("%s: [B1] empty KV range [%d,%d): borrowed_capacity_bytes=%zu owned_bytes=%zu measured_bytes=%zu owned_reduction_bytes=%zu chunks=%zu prompt_limit=%u free_bytes=%zu total_bytes=%zu\n",
-                    __func__, l0, l1, borrowed, bytes, need, need > bytes ? need - bytes : 0, b1_kv_views.size(), b1_kv_prompt_cells, free, total);
+            LLAMA_LOG_INFO("%s: [B1] empty KV %srange [%d,%d): borrowed_capacity_bytes=%zu owned_bytes=%zu measured_bytes=%zu owned_reduction_bytes=%zu chunks=%zu prompt_limit=%u free_bytes=%zu total_bytes=%zu\n",
+                    __func__, preflight ? "preflight " : "", l0, l1, borrowed, bytes, need, need > bytes ? need - bytes : 0, b1_kv_views.size(), b1_kv_prompt_cells, free, total);
             return true;
         }
     }
@@ -6159,11 +6159,15 @@ bool llama_context::b1_reserve_legacy_layers(const std::vector<uint32_t> & sizes
         ~probe_guard() {
             ctx->b1->reserve_layer_restore();
             ctx->b1_cur = {};
+            if (!ctx->b1_kv_scratch_release()) { GGML_ABORT("cannot return B1 preflight KV scratch"); }
             ctx->gf_res_reserve->reset();
             for (auto & res : ctx->gf_res_prev) { if (res) { res->reset(); } }
             ctx->gf_res_prev_active = nullptr;
             ggml_backend_sched_reset(ctx->sched.get());
-            if (!success) { ggml_backend_sched_reset_compute(ctx->sched.get()); }
+            if (!success) {
+                ctx->b1_kv_scratch_enabled = false;
+                ggml_backend_sched_reset_compute(ctx->sched.get());
+            }
         }
     } guard { this, success };
     try {
@@ -6241,7 +6245,11 @@ bool llama_context::b1_reserve_legacy_layers(const std::vector<uint32_t> & sizes
         if (need > free) { return false; }
         b1->reserve_layer_bind(worst_l0);
         b1_cur = { true, worst_l0, worst_l1, b1->carry(max_ub), nullptr, 0 };
-        if (!graph_reserve(tokens, 1, outputs, reserve_mctx.get())) { return false; }
+        if (b1_kv_scratch_enabled && b1_ctx_env("LLAMA_B1_KV_PREFLIGHT", 0) != 0) {
+            if (!b1_kv_scratch_bind(worst_l0, worst_l1, true)) { return false; }
+        }
+        // No offered views means that the ordinary physical preflight is still required.
+        if (!b1_kv_backend && !graph_reserve(tokens, 1, outputs, reserve_mctx.get())) { return false; }
         b1->reserve_layer_restore();
         b1_cur = {};
         for (size_t i = 0; i < maximum.size(); ++i) {
@@ -6475,11 +6483,6 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
         return normal();
     }
     if (lean_legacy) {
-        if (b1->n_groups() != 1 || !b1_reserve_legacy_layers(sizes, n_outputs_all)) {
-            LLAMA_LOG_WARN("%s: [B1] legacy one-pass layer reservation failed before applying prompt state\n", __func__);
-            b1_end(true);
-            return normal();
-        }
         // detach_compute_borrower() has synchronized the serialized helper, removed
         // its donor and invalidated its allocator. It cannot retain these views;
         // its next reserve runs only after this decode returns all B1 scratch.
@@ -6492,6 +6495,12 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
         b1_kv_scratch_enabled = kv_cold && peer_detached && mtp_scratch_clients.empty() && n_tokens_all <= UINT32_MAX - 512 && b1->n_groups() == 1 && b1_ctx_env("LLAMA_B1_KV_SCRATCH", 0) != 0;
         b1_kv_prompt_cells = n_tokens_all + 512;
         b1_kv_outputs = (uint32_t) std::max<int64_t>(1, std::min<int64_t>(n_tokens_all, n_outputs_all));
+        if (b1->n_groups() != 1 || !b1_reserve_legacy_layers(sizes, n_outputs_all)) {
+            b1_kv_scratch_enabled = false;
+            LLAMA_LOG_WARN("%s: [B1] legacy one-pass layer reservation failed before applying prompt state\n", __func__);
+            b1_end(true);
+            return normal();
+        }
         b1->start_streaming();
     }
 
