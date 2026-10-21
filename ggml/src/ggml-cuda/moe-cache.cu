@@ -294,6 +294,16 @@ struct moe_cache_shape {
     bool finished = false;
 };
 
+// fork: loaded profile ownership is independent of temporary warm count buffers.
+struct moe_cache_profile_global_tensor {
+    std::string name;
+    const void * data = nullptr;
+    size_t expert_size = 0;
+    size_t host_stride = 0;
+    int wtype = -1;
+    std::vector<uint64_t> counts;
+};
+
 struct moe_cache_seen_tensor {
     size_t bytes = 0;
     size_t expert_size = 0;
@@ -362,6 +372,9 @@ struct moe_cache_device {
 
     std::vector<std::unique_ptr<moe_cache_pool>> pools;
     std::vector<moe_cache_shape> shapes;
+    std::unordered_map<moe_cache_key, size_t, moe_cache_key_hash> profile_global_ranks;
+    std::vector<size_t> profile_global_slots;
+    size_t profile_global_bytes = 0;
     std::unordered_map<const void *, moe_cache_seen_tensor> seen_tensors;
     std::unordered_map<const void *, size_t> host_strides;
     std::unordered_map<moe_cache_key, moe_cache_demand, moe_cache_key_hash> demand_count;
@@ -545,6 +558,13 @@ struct moe_cache_session {
     int swap_writes_flip = 0;
     std::vector<unsigned long long> swap_prev;
     std::vector<float> swap_score;
+    std::vector<float> swap_observed_score;
+    std::vector<float> swap_profile_rate;
+    std::vector<float> swap_profile_seed;
+    std::unordered_map<const void *, float> swap_profile_table_ema;
+    std::unordered_set<const void *> swap_profile_calibrated_tables;
+    float swap_profile_strength = 0;
+    bool swap_profile_decay = false;
     std::vector<moe_swap_fill> swap_inflight;
     size_t swap_inflight_bytes = 0;
     uint64_t swap_updates = 0, swap_total = 0, swap_bytes_total = 0, swap_commits = 0;
@@ -561,6 +581,7 @@ struct moe_cache_session {
     bool prompt_loaned = false;
     bool profile_load_attempted = false;
     std::unordered_map<moe_cache_key, uint64_t, moe_cache_key_hash> profile_counts;
+    std::vector<moe_cache_profile_global_tensor> profile_global_tensors;
     bool prefetch_enabled = false;
     std::vector<std::shared_ptr<moe_prefetch_copy>> predictions;
     int64_t layer_start[1024] = {};
@@ -2027,6 +2048,109 @@ static bool moe_cache_allocate_pool(
     return true;
 }
 
+static bool moe_cache_resize_pool(moe_cache_device & device, moe_cache_pool & pool, int slots);
+
+static bool moe_cache_build_global_profile(moe_cache_session & session, moe_cache_device & device,
+        const std::vector<moe_cache_shape *> & pending, size_t budget, bool resize = false) {
+    if (session.profile_global_tensors.empty() || (!resize && !device.pools.empty()) || pending.empty()) {
+        return false;
+    }
+    if (resize) {
+        for (const auto * shape : pending) {
+            if (shape->pool < 0 || (size_t)shape->pool >= device.pools.size()) { return false; }
+        }
+    }
+    std::vector<size_t> tensors;
+    for (size_t i = 0; i < session.profile_global_tensors.size(); ++i) {
+        if (device.seen_tensors.count(session.profile_global_tensors[i].data)) { tensors.push_back(i); }
+    }
+    if (tensors.size() != device.seen_tensors.size()) { return false; }
+    auto layer = [&](size_t i) {
+        int value = INT_MAX;
+        moe_cache_layer_number(session.profile_global_tensors[i].name.c_str(), value);
+        return value;
+    };
+    std::stable_sort(tensors.begin(), tensors.end(), [&](size_t a, size_t b) {
+        return layer(a) < layer(b);
+    });
+    std::vector<size_t> caps, entries(pending.size(), 0), tensor_counts(pending.size(), 0);
+    for (const auto * shape : pending) {
+        const size_t block_bytes = ggml_type_size((ggml_type)shape->wtype);
+        if (!block_bytes || shape->expert_size % block_bytes) { return false; }
+        const size_t stride = shape->expert_size / block_bytes;
+        if (!stride) { return false; }
+        caps.push_back(std::min<size_t>((size_t)std::min<uint64_t>(shape->n_entries, INT_MAX), INT_MAX / stride));
+    }
+    std::vector<ggml_cuda_moe_profile_item> items;
+    std::vector<moe_cache_key> keys;
+    size_t group = 0, previous_tensor = SIZE_MAX;
+    for (size_t i : tensors) {
+        const auto & tensor = session.profile_global_tensors[i];
+        size_t pool = 0;
+        while (pool < pending.size() && (pending[pool]->expert_size != tensor.expert_size || pending[pool]->wtype != tensor.wtype)) { ++pool; }
+        if (pool == pending.size()) { return false; }
+        const auto seen = device.seen_tensors.find(tensor.data);
+        if (seen == device.seen_tensors.end() || seen->second.n_expert != (int64_t)tensor.counts.size() ||
+                tensor.counts.size() > SIZE_MAX - entries[pool]) { return false; }
+        entries[pool] += tensor.counts.size();
+        ++tensor_counts[pool];
+        if (previous_tensor != SIZE_MAX) {
+            if (layer(i) == INT_MAX || layer(i) != layer(previous_tensor)) { ++group; }
+            else if (tensor.counts.size() != session.profile_global_tensors[previous_tensor].counts.size()) { return false; }
+        }
+        for (size_t expert = 0; expert < tensor.counts.size(); ++expert) {
+            items.push_back({i, (int32_t)expert, group, pool, tensor.expert_size, tensor.counts[expert]});
+            keys.push_back({tensor.data, (int32_t)expert});
+        }
+        previous_tensor = i;
+    }
+    for (size_t p = 0; p < pending.size(); ++p) {
+        if (entries[p] != pending[p]->n_entries || tensor_counts[p] != (size_t)pending[p]->n_tensors) { return false; }
+    }
+    ggml_cuda_moe_profile_plan plan;
+    if (!ggml_cuda_moe_cache_profile_plan(items, caps, budget, moe_cache_pool_slots_min, plan)) { return false; }
+    device.profile_global_ranks.clear();
+    for (size_t i = 0; i < keys.size(); ++i) { device.profile_global_ranks.emplace(keys[i], plan.ranks[i]); }
+    device.profile_global_slots = plan.slots;
+    device.profile_global_bytes = plan.bytes;
+    MOE_CACHE_LOG("[moe-cache] CUDA%d global profile plan: budget=%zu selected_bytes=%zu slack=%zu bundles=%zu slices=%zu minimum_slots=%d; raw bytes-weighted use, selected bundles first\n",
+            device.physical, budget, plan.bytes, budget - plan.bytes, plan.bundles,
+            (size_t)std::count(plan.selected.begin(), plan.selected.end(), (uint8_t)1), moe_cache_pool_slots_min);
+    if (resize) {
+        // Shrink every donor first; growth must never add a transient second grant.
+        for (size_t p = 0; p < pending.size(); ++p) {
+            const int pool = pending[p]->pool;
+            if (pool < 0 || (size_t)pool >= device.pools.size()) { return false; }
+            if ((size_t)device.pools[pool]->n_slots > plan.slots[p]) {
+                if (!moe_cache_resize_pool(device, *device.pools[pool], (int)plan.slots[p])) {
+                    MOE_CACHE_LOG("[moe-cache] CUDA%d global profile replan stopped: donor pool resize failed; no recipient growth\n", device.physical);
+                    return true;
+                }
+            }
+        }
+    }
+    for (size_t p = 0; p < pending.size(); ++p) {
+        const size_t requested = plan.slots[p] * pending[p]->expert_size;
+        if (resize) {
+            auto & pool = *device.pools[pending[p]->pool];
+            if ((size_t)pool.n_slots < plan.slots[p]) {
+                const size_t current = (size_t)pool.n_slots * pool.expert_size;
+                const size_t other = device.allocated_bytes >= current ? device.allocated_bytes - current : 0;
+                const size_t room = other < budget ? budget - other : 0;
+                const size_t target = std::min(plan.slots[p], room / pool.expert_size);
+                if (target >= moe_cache_pool_slots_min) { moe_cache_resize_pool(device, pool, (int)target); }
+            }
+        } else {
+            moe_cache_allocate_pool(session, device, *pending[p], requested);
+        }
+        const int pool = pending[p]->pool;
+        const int actual = pool >= 0 ? device.pools[pool]->n_slots : 0;
+        MOE_CACHE_LOG("[moe-cache] CUDA%d global profile capacity: type=%s expert_bytes=%zu planned_slots=%zu actual_slots=%d\n",
+                device.physical, ggml_type_name((ggml_type)pending[p]->wtype), pending[p]->expert_size, plan.slots[p], actual);
+    }
+    return true;
+}
+
 static void moe_cache_build_pending(
         moe_cache_session & session, moe_cache_device & device) {
     if (!moe_cache_prepare_budget(session, device)) {
@@ -2104,6 +2228,14 @@ static void moe_cache_build_pending(
             (long double)rhs->expert_size * (long double)rhs->n_tensors;
         return lhs_weight > rhs_weight;
     });
+
+    if (moe_cache_build_global_profile(session, device, pending, remaining)) {
+        return;
+    }
+    if (!session.profile_global_tensors.empty()) {
+        MOE_CACHE_LOG("[moe-cache] CUDA%d global profile plan unavailable: tensors=%zu seen=%zu pending_shapes=%zu budget=%zu; fallback=fixed-pool-shares\n",
+                device.physical, session.profile_global_tensors.size(), device.seen_tensors.size(), pending.size(), remaining);
+    }
 
     auto weighted_share = [](size_t available, long double weight, long double total) {
         if (available == 0 || weight <= 0.0 || total <= 0.0) {
@@ -4023,6 +4155,17 @@ static void moe_cache_invalidate_session(
         }
     }
     session.tensor_devices.erase(base);
+    for (const auto & tensor : session.profile_global_tensors) {
+        if (moe_cache_ranges_overlap(tensor.data, tensor.host_stride * tensor.counts.size(), base, size)) {
+            session.profile_global_tensors.clear();
+            for (const auto & device : session.devices) {
+                device->profile_global_ranks.clear();
+                device->profile_global_slots.clear();
+                device->profile_global_bytes = 0;
+            }
+            break;
+        }
+    }
     for (auto it = session.profile_counts.begin(); it != session.profile_counts.end();) {
         if (moe_cache_ranges_overlap(it->first.tensor, 1, base, size)) {
             it = session.profile_counts.erase(it);
@@ -4420,7 +4563,7 @@ static void * moe_resident_create(void * device, const ggml_moe_cache_tensor_des
 #endif
 }
 
-// fork: a saved ranking is a startup hint; current prompt observations replace it.
+// fork: reranking after a prompt requires retiring every prepared address table.
 static bool moe_cache_profile_rerank(moe_cache_session & session,
         std::chrono::steady_clock::time_point deadline) {
     std::unique_lock<std::mutex> lock(session.mu);
@@ -4820,10 +4963,43 @@ static int moe_cache_warm(void * opaque, const ggml_moe_cache_tensor_desc * tens
     } else if (loading) {
         return 0;
     }
+    int64_t global_flag = 0;
+    if (loading && moe_cache_env_i64("GGML_MOE_CACHE_PROFILE_GLOBAL", 0, 1, global_flag) && global_flag == 1) {
+        std::lock_guard<std::mutex> lock(session->mu);
+        session->profile_global_tensors.clear();
+        session->profile_global_tensors.reserve(n_tensors);
+        for (int i = 0; i < n_tensors; ++i) {
+            moe_cache_profile_global_tensor tensor;
+            tensor.name = tensors[i].name;
+            tensor.data = tensors[i].data;
+            tensor.expert_size = ggml_row_size((ggml_type)tensors[i].type, tensors[i].n_in) * (size_t)tensors[i].n_out;
+            tensor.host_stride = tensors[i].expert_size;
+            tensor.wtype = tensors[i].type;
+            tensor.counts.assign(counts[i], counts[i] + tensors[i].n_expert);
+            session->profile_global_tensors.push_back(std::move(tensor));
+        }
+    }
     const auto start = std::chrono::steady_clock::now();
     const auto deadline = start + std::chrono::seconds(30);
     if (!loading && !moe_cache_profile_rerank(*session, deadline)) {
         return 0;
+    }
+    if (!loading && !session->profile_global_tensors.empty()) {
+        std::lock_guard<std::mutex> lock(session->mu);
+        if (!session->active_scopes && !session->active_nodes && !session->device_ready.load() && !session->device_frozen) {
+            for (const auto & device : session->devices) {
+                if (device->dead.load() || !device->queue.empty() || device->inflight) { continue; }
+                std::unique_lock<std::mutex> workspace_lock(device->dispatch_mu, std::try_to_lock);
+                if (!workspace_lock.owns_lock()) { continue; }
+                std::vector<moe_cache_shape *> shapes;
+                for (auto & shape : device->shapes) { if (shape.n_tensors > 0 && shape.pool >= 0) { shapes.push_back(&shape); } }
+                const size_t budget = device->allocated_bytes;
+                if (moe_cache_build_global_profile(*session, *device, shapes, budget, true)) {
+                    MOE_CACHE_LOG("[moe-cache] CUDA%d global profile same-session replan: budget=%zu actual_bytes=%zu; idle tables released, shrink before grow\n",
+                            device->physical, budget, device->allocated_bytes);
+                }
+            }
+        }
     }
     moe_cache_session_enter(session);
     struct scope_guard {
@@ -4841,16 +5017,50 @@ static int moe_cache_warm(void * opaque, const ggml_moe_cache_tensor_desc * tens
             moe_cache_end(begin(i));
         }
     }
+    std::unordered_map<moe_cache_key, size_t, moe_cache_key_hash> global_ranks;
+    {
+        std::lock_guard<std::mutex> lock(session->mu);
+        for (const auto & device : session->devices) {
+            global_ranks.insert(device->profile_global_ranks.begin(), device->profile_global_ranks.end());
+        }
+    }
+    const bool global_profile = global_ranks.size() == entries;
+    if (global_profile) {
+        MOE_CACHE_LOG("[moe-cache] global profile warm: pure saved-profile bundle order overrides prompt counts and PROFILE_BLEND_PCT; pool plan preserved\n");
+    }
+    else if (!session->profile_global_tensors.empty()) {
+        MOE_CACHE_LOG("[moe-cache] global profile warm unavailable: planned_entries=%zu expected=%zu; fallback=default-warm-ranking\n",
+                global_ranks.size(), entries);
+    }
     struct candidate { int tensor; int32_t expert; uint64_t count; bool current; long double startup_score; bool first_layer; };
     std::vector<candidate> ranked;
     ranked.reserve(entries);
+    int64_t blend_pct = 0;
+    const bool blending = !global_profile && !loading && !session->profile_counts.empty() &&
+        moe_cache_env_i64("GGML_MOE_CACHE_PROFILE_BLEND_PCT", 0, 100, blend_pct) && blend_pct > 0;
+    if (blending) {
+        MOE_CACHE_LOG("[moe-cache] post-prompt profile blend: profile_pct=%lld; normalized per tensor, decode swap scores unchanged\n",
+                (long long) blend_pct);
+    }
     for (int i = 0; i < n_tensors; ++i) {
         long double observed_total = 0;
         for (int32_t e = 0; e < tensors[i].n_expert; ++e) { observed_total += counts[i][e]; }
+        long double profile_total = 0;
+        if (blending) {
+            for (int32_t e = 0; e < tensors[i].n_expert; ++e) {
+                const auto prior = session->profile_counts.find({tensors[i].data, e});
+                if (prior != session->profile_counts.end()) { profile_total += prior->second; }
+            }
+        }
         for (int32_t e = 0; e < tensors[i].n_expert; ++e) {
             const moe_cache_key key{tensors[i].data, e};
             if (loading && counts[i][e]) {
                 session->profile_counts[key] = counts[i][e];
+            }
+            if (global_profile) {
+                const auto prior = session->profile_counts.find(key);
+                ranked.push_back({i, e, prior == session->profile_counts.end() ? 0 : prior->second, true, 0, false});
+                continue;
             }
             int layer = 0;
             moe_cache_layer_number(tensors[i].name, layer);
@@ -4859,6 +5069,16 @@ static int moe_cache_warm(void * opaque, const ggml_moe_cache_tensor_desc * tens
             // conditional use rates, preserving the original counts on disk.
             const long double rate = counts[i][e] / std::max(1.0L, observed_total);
             const long double priority = rate * (1 + 4.0L / (layer + 1)) / bytes;
+            if (blending) {
+                const auto prior = session->profile_counts.find(key);
+                const long double profile_rate = prior == session->profile_counts.end() ? 0 :
+                    prior->second / std::max(1.0L, profile_total);
+                const long double mixed = ((100 - blend_pct) * rate + blend_pct * profile_rate) / 100;
+                // Keep lending survivors in the same order as the normalized seed.
+                const uint64_t heat = (uint64_t) (mixed * 1000000000.0L);
+                ranked.push_back({i, e, heat, true, mixed, false});
+                continue;
+            }
             if (counts[i][e] || loading) {
                 ranked.push_back({i, e, counts[i][e], !loading, priority, layer == 0});
             } else if (!loading) {
@@ -4869,7 +5089,11 @@ static int moe_cache_warm(void * opaque, const ggml_moe_cache_tensor_desc * tens
             }
         }
     }
-    std::stable_sort(ranked.begin(), ranked.end(), [loading](const candidate & a, const candidate & b) {
+    std::stable_sort(ranked.begin(), ranked.end(), [&](const candidate & a, const candidate & b) {
+        if (global_profile) {
+            return global_ranks.at({tensors[a.tensor].data, a.expert}) < global_ranks.at({tensors[b.tensor].data, b.expert});
+        }
+        if (blending && a.startup_score != b.startup_score) { return a.startup_score > b.startup_score; }
         if (loading && a.first_layer != b.first_layer) { return a.first_layer > b.first_layer; }
         if (loading && a.startup_score != b.startup_score) { return a.startup_score > b.startup_score; }
         if (a.current != b.current) {
@@ -5909,6 +6133,33 @@ static bool moe_cache_swap_init(moe_cache_session & session) {
     session.swap_writes_cap = writes_cap;
     session.swap_prev.assign(n, 0);
     session.swap_score.assign(n, 0.0f);
+    int64_t prior_pct = 0;
+    if (!session.profile_counts.empty() &&
+            moe_cache_env_i64("GGML_MOE_CACHE_PROFILE_PRIOR_PCT", 0, 1000, prior_pct) && prior_pct > 0) {
+        session.swap_profile_strength = (float) prior_pct / 100;
+        const char * decay = getenv("GGML_MOE_CACHE_PROFILE_PRIOR_DECAY");
+        session.swap_profile_decay = decay && strcmp(decay, "1") == 0;
+        session.swap_observed_score.assign(n, 0.0f);
+        session.swap_profile_rate.assign(n, 0.0f);
+        session.swap_profile_seed.assign(n, 0.0f);
+        for (const auto & entry : session.device_tables) {
+            const auto & table = entry.second;
+            long double total = 0;
+            for (int32_t e = 0; e < table.desc.n_expert; ++e) {
+                const auto count = session.profile_counts.find({table.desc.data, e});
+                if (count != session.profile_counts.end()) { total += count->second; }
+            }
+            if (total == 0) { continue; }
+            for (int32_t e = 0; e < table.desc.n_expert; ++e) {
+                const auto count = session.profile_counts.find({table.desc.data, e});
+                if (count != session.profile_counts.end()) {
+                    session.swap_profile_rate[table.count_offset + e] = (float) (count->second / total);
+                }
+            }
+        }
+        MOE_CACHE_LOG("[moe-cache] swap profile prior: pct=%lld mode=%s; scale from first observed per-table route snapshot\n",
+                (long long) prior_pct, session.swap_profile_decay ? "decaying-seed" : "persistent");
+    }
     return true;
 }
 
@@ -5996,10 +6247,43 @@ static void moe_cache_swap_decide(moe_cache_session & session) {
     const size_t n = session.swap_prev.size();
     const unsigned long long * counts = session.swap_counts_host;
     const float decay = session.swap_decay;
-    for (size_t i = 0; i < n; ++i) {
-        const unsigned long long recent = counts[i] - session.swap_prev[i];
-        session.swap_prev[i] = counts[i];
-        session.swap_score[i] = session.swap_score[i] * decay + (float)recent;
+    if (session.swap_profile_strength > 0) {
+        for (const auto & entry : session.device_tables) {
+            const auto & table = entry.second;
+            long double recent_total = 0;
+            for (int32_t e = 0; e < table.desc.n_expert; ++e) {
+                const size_t index = table.count_offset + e;
+                recent_total += counts[index] - session.swap_prev[index];
+            }
+            auto & table_ema = session.swap_profile_table_ema[table.desc.data];
+            const bool calibrated = session.swap_profile_calibrated_tables.count(table.desc.data) != 0;
+            if (!calibrated && recent_total == 0) { continue; }
+            // Counts and the prior use the same steady EMA units. Calibrate
+            // causally; the profile's training corpus length is irrelevant.
+            table_ema = calibrated ?
+                decay * table_ema + (float) recent_total :
+                (float) recent_total / (decay < 1 ? 1 - decay : 1);
+            for (int32_t e = 0; e < table.desc.n_expert; ++e) {
+                const size_t index = table.count_offset + e;
+                const float recent = (float) (counts[index] - session.swap_prev[index]);
+                session.swap_prev[index] = counts[index];
+                session.swap_observed_score[index] = session.swap_observed_score[index] * decay + recent;
+                float prior = session.swap_profile_rate[index] * table_ema * session.swap_profile_strength;
+                if (session.swap_profile_decay) {
+                    session.swap_profile_seed[index] = calibrated ?
+                        session.swap_profile_seed[index] * decay : prior;
+                    prior = session.swap_profile_seed[index];
+                }
+                session.swap_score[index] = session.swap_observed_score[index] + prior;
+            }
+            session.swap_profile_calibrated_tables.insert(table.desc.data);
+        }
+    } else {
+        for (size_t i = 0; i < n; ++i) {
+            const unsigned long long recent = counts[i] - session.swap_prev[i];
+            session.swap_prev[i] = counts[i];
+            session.swap_score[i] = session.swap_score[i] * decay + (float)recent;
+        }
     }
     struct cand { float score; moe_cache_device_table * table; int32_t expert; };
     struct vict { float score; int slot; };
@@ -6233,6 +6517,12 @@ static void moe_cache_swap_release(moe_cache_session & session) {
     moe_cache_swap_free(session);
     session.swap_prev.clear();
     session.swap_score.clear();
+    session.swap_observed_score.clear();
+    session.swap_profile_rate.clear();
+    session.swap_profile_seed.clear();
+    session.swap_profile_table_ema.clear();
+    session.swap_profile_calibrated_tables.clear();
+    session.swap_profile_strength = 0;
     session.swap_scopes = 0;
     session.swap_broken = false;
 }
