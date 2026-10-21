@@ -5311,8 +5311,9 @@ static bool ggml_cuda_conv_ring_enabled() {
         if (e != nullptr) {
             return atoi(e) != 0;
         }
+        // default on (the ring keeps bit copies of what CPY / SET_ROWS wrote); GGML_VL_SF_CONVRING=0 turns it off
         const char * u = getenv("GGML_VL_SF");
-        return u != nullptr && atoi(u) != 0;
+        return u == nullptr || atoi(u) != 0;
     }();
     return enabled;
 }

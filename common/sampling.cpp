@@ -547,8 +547,9 @@ struct common_sampler * common_sampler_init(
 
     {
         static const bool topk_fused_env = [] {
+            // default on (exact: same kept set and order as the unfused top-k); LLAMA_SAMPLER_TOPK_FUSED=0 turns it off
             const char * e = getenv("LLAMA_SAMPLER_TOPK_FUSED");
-            return e && atoi(e) != 0;
+            return e == nullptr || atoi(e) != 0;
         }();
         if (topk_fused_env && params.top_k > 0 && params.top_k <= 128 && llama_sampler_chain_n(chain) > 0 &&
                 strcmp(llama_sampler_name(llama_sampler_chain_get(chain, 0)), "top-k") == 0) {
