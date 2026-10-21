@@ -16,10 +16,11 @@ static iq4xs_k4_variant ggml_cuda_iq4xs_k4_variant() {
         if (env && strcmp(env, "k4") == 0) {
             return IQ4XS_K4;
         }
-        if (env && strcmp(env, "k4a") == 0) {
-            return IQ4XS_K4A;
+        // default k4a (Ampere+, widths >= GGML_CUDA_IQ4XS_K4_MIN_N); GGML_CUDA_IQ4XS_K4=off (or 0) turns it off
+        if (env && (strcmp(env, "off") == 0 || strcmp(env, "0") == 0)) {
+            return IQ4XS_K4_OFF;
         }
-        return IQ4XS_K4_OFF;
+        return IQ4XS_K4A;
     }();
     return value;
 }
