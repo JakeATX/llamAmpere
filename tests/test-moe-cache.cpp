@@ -5461,6 +5461,236 @@ static bool run_device_fused_tables(ggml_backend_t gpu, ggml_backend_t cpu, log_
     return ok;
 }
 
+// fork: retain exact expert images across stable-table updates and source invalidation.
+static bool run_device_missjoin_retain_lifecycle(ggml_backend_t gpu, ggml_backend_t cpu, log_capture & capture) {
+    const auto api = active_api();
+    if (!api.warm || !api.device_prepare || !api.device_supports || !api.print_stats || !api.invalidate) {
+        return false;
+    }
+    configure_cache(nullptr, "8");
+    set_env("GGML_CUDA_MOE_CACHE_BUDGET_MB", "8");
+    set_env("GGML_MOE_CACHE_DEVICE", "1");
+    set_env("GGML_MOE_CACHE_DEVICE_CAPTURE", "1");
+    set_env("GGML_MOE_CACHE_DEVICE_STATS_EVERY", "0");
+    set_env("GGML_MOE_CACHE_DEVICE_FUSED", nullptr);
+    set_env("GGML_MOE_CACHE_DEVICE_ADAPT_MB", "1");
+    set_env("GGML_MOE_CACHE_SWAP", nullptr);
+    set_env("GGML_MOE_CACHE_PROFILE_LOAD", nullptr);
+    set_env("GGML_MOE_CACHE_PROFILE_SAVE", nullptr);
+    set_env("GGML_MOE_PREFETCH_ASYNC", nullptr);
+    set_env("GGML_MOE_MISSJOIN", "stage");
+    set_env("GGML_MOE_MISSJOIN_SLOTS", "1");
+    set_env("GGML_MOE_MISSJOIN_RETAIN", "1");
+    set_env("GGML_MOE_MISSJOIN_MASK", nullptr);
+    set_env("GGML_MOE_MISSJOIN_OVERLAP", nullptr);
+    set_env("GGML_MOE_MMV_GROUPED", nullptr);
+    if (!getenv("GGML_MOE_CACHE_DEVICE_PUBLISH_ASYNC")) {
+        set_env("GGML_MOE_CACHE_DEVICE_PUBLISH_ASYNC", "0");
+    }
+    capture.clear();
+    bool ok = true;
+    auto require = [&](bool passed, int line) {
+        if (!passed) {
+            fprintf(stderr, "retained lifecycle assertion failed: line=%d\n", line);
+        }
+        ok &= passed;
+    };
+    constexpr int64_t width = 1024, rows = 206, experts = 65;
+    ggml_init_params params = {8 * ggml_tensor_overhead(), nullptr, true};
+    auto * weights_ctx = ggml_init(params);
+    ggml_tensor * weights[] = {
+        ggml_new_tensor_3d(weights_ctx, GGML_TYPE_Q4_0, width, rows, experts),
+        ggml_new_tensor_3d(weights_ctx, GGML_TYPE_Q4_0, width, rows, 1),
+    };
+    ggml_set_name(weights[0], "blk.7.ffn_up_exps.weight");
+    ggml_set_name(weights[1], "blk.8.ffn_up_exps.weight");
+    auto weights_buffer = ggml_backend_alloc_ctx_tensors(weights_ctx, cpu);
+    ggml_backend_buffer_set_usage(weights_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    std::vector<uint8_t> quantized[2];
+    for (int bank = 0; bank < 2; ++bank) {
+        auto * w = weights[bank];
+        std::vector<float> values(ggml_nelements(w));
+        for (size_t i = 0; i < values.size(); ++i) {
+            values[i] = 0.2f * std::sin((float)(i % 10007) * (0.013f + bank * 0.007f));
+        }
+        quantized[bank].resize(ggml_nbytes(w));
+        require(ggml_quantize_chunk(w->type, values.data(), quantized[bank].data(),
+                0, w->ne[1] * w->ne[2], width, nullptr) == quantized[bank].size(), __LINE__);
+        ggml_backend_tensor_set(w, quantized[bank].data(), 0, quantized[bank].size());
+    }
+    ggml_context * input_ctx[] = {ggml_init(params), ggml_init(params)};
+    ggml_backend_t backends[] = {cpu, gpu};
+    ggml_tensor * acts[2], * ids[2][3];
+    ggml_backend_buffer_t input_buffers[2];
+    std::vector<float> activations(width);
+    for (size_t i = 0; i < activations.size(); ++i) {
+        activations[i] = 0.2f * std::cos((float)i * 0.019f);
+    }
+    std::vector<int32_t> heat(63);
+    for (int i = 0; i < 63; ++i) { heat[i] = i + 1; }
+    const int32_t target[] = {64, 64}, challenger[] = {0, 0};
+    for (int backend = 0; backend < 2; ++backend) {
+        acts[backend] = ggml_new_tensor_3d(input_ctx[backend], GGML_TYPE_F32, width, 1, 1);
+        ids[backend][0] = ggml_new_tensor_2d(input_ctx[backend], GGML_TYPE_I32, 2, 1);
+        ids[backend][1] = ggml_new_tensor_2d(input_ctx[backend], GGML_TYPE_I32, 63, 1);
+        ids[backend][2] = ggml_new_tensor_2d(input_ctx[backend], GGML_TYPE_I32, 2, 1);
+        input_buffers[backend] = ggml_backend_alloc_ctx_tensors(input_ctx[backend], backends[backend]);
+        ggml_backend_tensor_set(acts[backend], activations.data(), 0, activations.size() * sizeof(float));
+        ggml_backend_tensor_set(ids[backend][0], target, 0, sizeof(target));
+        ggml_backend_tensor_set(ids[backend][1], heat.data(), 0, heat.size() * sizeof(int32_t));
+        ggml_backend_tensor_set(ids[backend][2], challenger, 0, sizeof(challenger));
+    }
+    test_graph reference[3], candidate[3];
+    std::vector<float> expected[3], control[3];
+    for (int graph = 0; graph < 3; ++graph) {
+        auto * w = weights[graph == 2 ? 1 : 0];
+        reference[graph] = make_graph(cpu, w, acts[0], ids[0][graph]);
+        candidate[graph] = make_graph(gpu, w, acts[1], ids[1][graph]);
+        candidate[graph].graph->uid = UINT64_C(0x52455441494e0000) + graph;
+        expected[graph].resize(ggml_nelements(reference[graph].out));
+        require(ggml_backend_graph_compute(cpu, reference[graph].graph) == GGML_STATUS_SUCCESS, __LINE__);
+        ggml_backend_tensor_get(reference[graph].out, expected[graph].data(), 0, expected[graph].size() * sizeof(float));
+    }
+    ggml_moe_cache_tensor_desc descriptors[2];
+    std::vector<uint64_t> usage[] = {std::vector<uint64_t>(experts, 0), std::vector<uint64_t>(1, 0)};
+    for (int expert = 0; expert < 64; ++expert) { usage[0][expert] = 1000 - expert; }
+    const uint64_t * counts[] = {usage[0].data(), usage[1].data()};
+    for (int bank = 0; bank < 2; ++bank) {
+        auto * w = weights[bank];
+        descriptors[bank] = {w->name, w->data, w->nb[2], width, rows, w->ne[2], (int32_t)w->type};
+    }
+    void * session = create_direct_session(gpu, cpu);
+    require(session != nullptr, __LINE__);
+    auto prepare = [&](bool staged, int queued) {
+        set_env("GGML_MOE_CACHE_DEVICE_STATS", staged ? "1" : nullptr);
+        set_env("GGML_MOE_CACHE_DEVICE_ADAPT_INTERVAL", staged ? "1" : "1024");
+        const bool warmed = session && api.warm(session, descriptors, counts, 2) == queued;
+        require(warmed, __LINE__);
+        const bool prepared = warmed && api.device_prepare(session, descriptors, 2) == 1;
+        require(prepared, __LINE__);
+        if (prepared) {
+            for (const auto & graph : candidate) {
+                require(api.device_supports(session, gpu, graph.out) == 1, __LINE__);
+            }
+        }
+        return prepared;
+    };
+    auto run = [&](std::initializer_list<int> graphs, bool save_control) {
+        api.session_enter(session);
+        for (int graph : graphs) {
+            require(ggml_backend_graph_compute(gpu, candidate[graph].graph) == GGML_STATUS_SUCCESS, __LINE__);
+            std::vector<float> actual(expected[graph].size());
+            ggml_backend_tensor_get(candidate[graph].out, actual.data(), 0, actual.size() * sizeof(float));
+            require(compare_output(expected[graph], actual, 5e-4), __LINE__);
+            if (save_control) {
+                control[graph] = actual;
+            } else {
+                require(control[graph].size() == actual.size() &&
+                        memcmp(control[graph].data(), actual.data(), actual.size() * sizeof(float)) == 0, __LINE__);
+            }
+        }
+        api.session_leave(session);
+    };
+    auto snapshot = [&](unsigned long long hits, unsigned long long misses, unsigned long long dispatches) {
+        const size_t checkpoint = capture.get().size();
+        api.print_stats(session);
+        const std::string log = capture.get().substr(checkpoint);
+        const size_t pos = log.find("[moe-cache] phase snapshot: ");
+        unsigned long long id = 0, epoch = 0, got_hits = 0, got_misses = 0, got_dispatches = 0;
+        int device = -1;
+        const bool parsed = pos != std::string::npos && sscanf(log.c_str() + pos,
+                "[moe-cache] phase snapshot: session=%llu epoch=%llu device=%d hits=%llu misses=%llu dispatches=%llu kind=device",
+                &id, &epoch, &device, &got_hits, &got_misses, &got_dispatches) == 6;
+        require(parsed && id > 0 && epoch > 0 && device >= 0 && got_hits == hits && got_misses == misses &&
+                got_dispatches == dispatches, __LINE__);
+        return epoch;
+    };
+    auto retained = [&](const std::string & log, unsigned long long dispatches, unsigned long long hits,
+            unsigned long long copies) {
+        unsigned long long got[7] = {};
+        const size_t pos = log.rfind("[moe-cache] missjoin retain final: ");
+        const bool parsed = pos != std::string::npos && sscanf(log.c_str() + pos,
+                "[moe-cache] missjoin retain final: dispatches=%llu hit_experts=%llu hit_routes=%llu copies=%llu copy_bytes=%llu evictions=%llu fallback_misses=%llu",
+                &got[0], &got[1], &got[2], &got[3], &got[4], &got[5], &got[6]) == 7;
+        require(parsed && got[0] == dispatches && got[1] == hits && got[2] == 2 * hits && got[3] == copies &&
+                got[4] == copies * descriptors[0].expert_size && got[5] == 0 && got[6] == 0, __LINE__);
+        require(max_field_value(log, "captures=") > 0 && max_field_value(log, "replays=") > 0, __LINE__);
+    };
+    // The unmasked device-table control uses the identical MMV without staging.
+    if (prepare(false, 64)) {
+        run({0, 1, 2}, true);
+        if (prepare(true, 0)) {
+            const size_t lifecycle_checkpoint = capture.get().size();
+            const auto epoch = snapshot(0, 0, 0);
+            // The full pool's oldest zero-use slot is A0; retain A64 before promoting it.
+            run({0, 0}, false);
+            require(snapshot(0, 4, 2) == epoch, __LINE__);
+            // A64 gets two hits, A1..63 get three each, and B0 gets four misses.
+            // B has separate retained tags, so its admission cannot replace A64's retained bytes.
+            run({0, 1, 1, 1, 2, 2}, false);
+            require(snapshot(191, 8, 8) == epoch, __LINE__);
+            // B0 displaced A64. Both cold A64 dispatches must reuse its original retained image.
+            run({0, 0}, false);
+            require(snapshot(191, 12, 10) == epoch, __LINE__);
+            const size_t checkpoint = capture.get().size();
+            api.invalidate(weights[0]->data, ggml_nbytes(weights[0]));
+            api.invalidate(weights[1]->data, ggml_nbytes(weights[1]));
+            const std::string released = capture.get().substr(checkpoint);
+            retained(released, 10, 4, 2);
+            require(released.find("retained source mapping invalidated:") != std::string::npos, __LINE__);
+            const std::string lifecycle_log = capture.get().substr(lifecycle_checkpoint);
+            for (int scope : {1, 2, 3}) {
+                require(lifecycle_log.find("device adaptation: scopes=" + std::to_string(scope) +
+                        " counter_bytes=528 fills=1 copied_bytes=118656") != std::string::npos, __LINE__);
+            }
+            const int publish_async = atoi(getenv("GGML_MOE_CACHE_DEVICE_PUBLISH_ASYNC"));
+            require(lifecycle_log.find("; stable tables publish_async=" + std::to_string(publish_async)) !=
+                    std::string::npos, __LINE__);
+
+            // Reuse the source address and graph uid, but change the formerly retained expert.
+            std::vector<float> replacement(width * rows);
+            for (size_t i = 0; i < replacement.size(); ++i) {
+                replacement[i] = 0.3f * std::cos((float)i * 0.037f);
+            }
+            const size_t offset = 64 * descriptors[0].expert_size;
+            require(ggml_quantize_chunk(weights[0]->type, replacement.data(), quantized[0].data() + offset,
+                    0, rows, width, nullptr) == descriptors[0].expert_size, __LINE__);
+            ggml_backend_tensor_set(weights[0], quantized[0].data() + offset, offset, descriptors[0].expert_size);
+            require(ggml_backend_graph_compute(cpu, reference[0].graph) == GGML_STATUS_SUCCESS, __LINE__);
+            ggml_backend_tensor_get(reference[0].out, expected[0].data(), 0, expected[0].size() * sizeof(float));
+            const auto old_control = control[0];
+            if (prepare(false, 64)) {
+                run({0}, true);
+                require(memcmp(old_control.data(), control[0].data(), control[0].size() * sizeof(float)) != 0, __LINE__);
+                if (prepare(true, 0)) {
+                    const auto next_epoch = snapshot(0, 0, 0);
+                    require(next_epoch != epoch, __LINE__);
+                    // A fresh generation must copy changed bytes once, then hit on replay before promotion.
+                    run({0, 0, 0}, false);
+                    require(snapshot(0, 6, 3) == next_epoch, __LINE__);
+                    const size_t next_checkpoint = capture.get().size();
+                    api.invalidate(weights[0]->data, ggml_nbytes(weights[0]));
+                    retained(capture.get().substr(next_checkpoint), 3, 2, 1);
+                }
+            }
+        }
+    }
+    if (session) { api.session_destroy(session); }
+    if (!ok) { fprintf(stderr, "%s", capture.get().c_str()); }
+    for (int graph = 0; graph < 3; ++graph) {
+        free_graph(candidate[graph]);
+        free_graph(reference[graph]);
+    }
+    for (int backend = 0; backend < 2; ++backend) {
+        ggml_backend_buffer_free(input_buffers[backend]);
+        ggml_free(input_ctx[backend]);
+    }
+    ggml_backend_buffer_free(weights_buffer);
+    ggml_free(weights_ctx);
+    printf("cache-device-missjoin-retain-lifecycle: %s\n", ok ? "OK" : "FAIL");
+    return ok;
+}
+
 // fork: compare staging against the same fused CUDA kernels with no resident mask.
 static bool run_device_fused_missjoin(ggml_backend_t gpu, ggml_backend_t cpu, log_capture & capture,
         bool overlap, bool mask_only, bool retain = false, bool fused = true, bool grouped = false) {
@@ -6004,6 +6234,12 @@ int main(int argc, char ** argv) {
             ggml_backend_free(cpu);
         }
         return 1;
+    }
+    if (argc == 2 && strcmp(argv[1], "--device-missjoin-retain-lifecycle-only") == 0) {
+        const bool ok = provider_is_cuda && run_device_missjoin_retain_lifecycle(gpu, cpu, capture);
+        ggml_backend_free(gpu);
+        ggml_backend_free(cpu);
+        return !provider_is_cuda ? 77 : ok ? 0 : 1;
     }
     if (argc == 2 && (strcmp(argv[1], "--device-fused-missjoin-only") == 0 ||
             strcmp(argv[1], "--device-fused-missjoin-overlap-only") == 0 ||
