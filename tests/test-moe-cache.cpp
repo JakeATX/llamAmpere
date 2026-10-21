@@ -3563,7 +3563,7 @@ static bool run_profile_persistence(ggml_backend_t gpu, ggml_backend_t cpu, log_
         return true;
     }
     const auto & api = active_api();
-    if (!api.warm) {
+    if (!api.warm || !api.trim) {
         return false;
     }
     configure_cache(nullptr);
@@ -3584,6 +3584,14 @@ static bool run_profile_persistence(ggml_backend_t gpu, ggml_backend_t cpu, log_
     const char * previous_load = getenv("GGML_MOE_CACHE_PROFILE_LOAD");
     const bool had_load = previous_load != nullptr;
     const std::string loaded_path = previous_load ? previous_load : "";
+    const char * previous_blend = getenv("GGML_MOE_CACHE_PROFILE_BLEND_PCT");
+    const bool had_blend = previous_blend != nullptr;
+    const std::string saved_blend = previous_blend ? previous_blend : "";
+    const char * previous_global = getenv("GGML_MOE_CACHE_PROFILE_GLOBAL");
+    const bool had_global = previous_global != nullptr;
+    const std::string saved_global = previous_global ? previous_global : "";
+    set_env("GGML_MOE_CACHE_PROFILE_GLOBAL", nullptr);
+    set_env("GGML_MOE_CACHE_PROFILE_BLEND_PCT", nullptr);
     set_env("GGML_MOE_CACHE_PROFILE_LOAD", nullptr);
     set_env("GGML_MOE_CACHE_PROFILE_SAVE", path.c_str());
     constexpr int64_t shape_in = 1024, shape_out = 206, experts = 65;
@@ -3692,6 +3700,55 @@ static bool run_profile_persistence(ggml_backend_t gpu, ggml_backend_t cpu, log_
         api.session_leave(reader);
         api.session_destroy(reader);
     } else { ok = false; }
+    // Prompt and profile rank opposite ends of a full pool.
+    std::vector<uint64_t> prompt_usage(experts);
+    for (size_t e = 0; e < prompt_usage.size(); ++e) {
+        // Different profile/prompt corpus sizes must not change the mixture.
+        prompt_usage[e] = 1000 * (experts - e);
+    }
+    const uint64_t * prompt_counts[] = {prompt_usage.data()};
+    for (const char * blend : {"", "0", "75", "100"}) {
+        set_env("GGML_MOE_CACHE_PROFILE_BLEND_PCT", blend[0] ? blend : nullptr);
+        reader = create_direct_session(gpu, cpu);
+        bool blend_ok = reader != nullptr;
+        if (reader) {
+            capture.clear();
+            const bool profile_wins = strcmp(blend, "75") == 0 || strcmp(blend, "100") == 0;
+            blend_ok &= api.warm(reader, &loaded, prompt_counts, 1) == (profile_wins ? 0 : 1);
+            const std::string warm_log = capture.get();
+            blend_ok &= warm_log.find("profile loaded:") != std::string::npos;
+            blend_ok &= warm_log.find("decode lookup counters unchanged") != std::string::npos;
+            blend_ok &= warm_log.find("hits=") == std::string::npos;
+            blend_ok &= warm_log.find("cpu-overlap calibration:") == std::string::npos;
+            api.session_enter(reader);
+            blend_ok &= direct_plan_one(loaded.name, loaded.data, expert_bytes,
+                    shape_in, shape_out, GGML_TYPE_Q4_0, experts, profile_wins ? 64 : 0) == 1;
+            api.session_leave(reader);
+            if (strcmp(blend, "75") == 0) {
+                blend_ok &= api.trim(reader, 2 * expert_bytes) == 2 * expert_bytes;
+                api.session_enter(reader);
+                blend_ok &= direct_plan_one(loaded.name, loaded.data, expert_bytes,
+                        shape_in, shape_out, GGML_TYPE_Q4_0, experts, 64) == 1;
+                blend_ok &= direct_plan_one(loaded.name, loaded.data, expert_bytes,
+                        shape_in, shape_out, GGML_TYPE_Q4_0, experts, 1) == 0;
+                blend_ok &= direct_plan_one(loaded.name, loaded.data, expert_bytes,
+                        shape_in, shape_out, GGML_TYPE_Q4_0, experts, 2) == 0;
+                api.session_leave(reader);
+            }
+            api.session_enter(reader);
+            blend_ok &= direct_plan_one(loaded.name, loaded.data, expert_bytes,
+                    shape_in, shape_out, GGML_TYPE_Q4_0, experts, profile_wins ? 0 : 64) == 0;
+            api.session_leave(reader);
+            api.session_destroy(reader);
+            blend_ok &= original == read_file();
+        }
+        printf("cache-profile-prompt-blend pct=%s: %s\n", blend[0] ? blend : "unset", blend_ok ? "OK" : "FAIL");
+        if (!blend_ok) {
+            fprintf(stderr, "%s", capture.get().c_str());
+        }
+        ok &= blend_ok;
+        set_env("GGML_MOE_CACHE_PROFILE_BLEND_PCT", nullptr);
+    }
     // The same profile must load against an interleaved expert arena.
     std::vector<uint8_t> interleaved(expert_bytes * experts * 3, 0xa5);
     for (int64_t e = 0; e < experts; ++e) {
@@ -3700,13 +3757,31 @@ static bool run_profile_persistence(ggml_backend_t gpu, ggml_backend_t cpu, log_
     auto arena_descriptor = loaded;
     arena_descriptor.data = interleaved.data();
     arena_descriptor.expert_size = expert_bytes * 3;
-    void * arena_reader = create_direct_session(gpu, cpu);
-    if (arena_reader) {
-        capture.clear();
-        ok &= api.warm(arena_reader, &arena_descriptor, nullptr, 1) == 64;
-        ok &= capture.get().find("profile loaded:") != std::string::npos;
-        api.session_destroy(arena_reader);
-    } else { ok = false; }
+    for (bool global : {false, true}) {
+        set_env("GGML_MOE_CACHE_PROFILE_GLOBAL", global ? "1" : nullptr);
+        void * arena_reader = create_direct_session(gpu, cpu);
+        bool arena_ok = arena_reader != nullptr;
+        if (arena_reader) {
+            capture.clear();
+            arena_ok &= api.warm(arena_reader, &arena_descriptor, nullptr, 1) == 64;
+            arena_ok &= capture.get().find("profile loaded:") != std::string::npos;
+            if (global) {
+                arena_ok &= capture.get().find("global profile plan:") != std::string::npos;
+                arena_ok &= api.warm(arena_reader, &arena_descriptor, prompt_counts, 1) == 0;
+                arena_ok &= capture.get().find("global profile warm:") != std::string::npos;
+                api.session_enter(arena_reader);
+                arena_ok &= direct_plan_one(arena_descriptor.name, arena_descriptor.data,
+                        arena_descriptor.expert_size, shape_in, shape_out, GGML_TYPE_Q4_0, experts, 64) == 1;
+                arena_ok &= direct_plan_one(arena_descriptor.name, arena_descriptor.data,
+                        arena_descriptor.expert_size, shape_in, shape_out, GGML_TYPE_Q4_0, experts, 0) == 0;
+                api.session_leave(arena_reader);
+            }
+            api.session_destroy(arena_reader);
+        }
+        printf("cache-profile-arena global=%d: %s\n", (int)global, arena_ok ? "OK" : "FAIL");
+        ok &= arena_ok;
+    }
+    set_env("GGML_MOE_CACHE_PROFILE_GLOBAL", nullptr);
     auto rejected = [&](const ggml_moe_cache_tensor_desc & candidate) {
         void * session = create_direct_session(gpu, cpu);
         if (!session) {
@@ -3775,6 +3850,8 @@ static bool run_profile_persistence(ggml_backend_t gpu, ggml_backend_t cpu, log_
     remove((path + ".tmp").c_str());
     set_env("GGML_MOE_CACHE_PROFILE_SAVE", had_save ? saved_path.c_str() : nullptr);
     set_env("GGML_MOE_CACHE_PROFILE_LOAD", had_load ? loaded_path.c_str() : nullptr);
+    set_env("GGML_MOE_CACHE_PROFILE_BLEND_PCT", had_blend ? saved_blend.c_str() : nullptr);
+    set_env("GGML_MOE_CACHE_PROFILE_GLOBAL", had_global ? saved_global.c_str() : nullptr);
     printf("cache-profile-persistence: %s\n", ok ? "OK" : "FAIL");
     return ok;
 #else
@@ -3832,6 +3909,181 @@ static bool run_prompt_cache_lending(ggml_backend_t gpu, ggml_backend_t cpu, log
         fprintf(stderr, "%s", capture.get().c_str());
     }
     return ok;
+}
+
+// A profile must influence swap admission even when its predicted expert has
+// never appeared in decode. Placement and swap ordering must preserve the math.
+static bool run_profile_swap_prior(ggml_backend_t gpu, ggml_backend_t cpu, log_capture & capture) {
+#if defined(__linux__) && defined(GGML_CUDA)
+    const char * directory = getenv("GGML_MOE_CACHE_TEST_TMPDIR");
+    if (!directory || !active_api().warm || !active_api().device_prepare) {
+        fprintf(stderr, "cache-profile-swap-prior: missing temporary directory or device API\n");
+        return false;
+    }
+    struct saved_environment {
+        struct entry { const char * name; bool present; std::string value; };
+        std::vector<entry> entries;
+        saved_environment() {
+            for (const char * name : {
+                    "GGML_CUDA_MOE_CACHE", "GGML_CUDA_MOE_CACHE_MODE", "GGML_CUDA_MOE_CACHE_BUDGET_MB",
+                    "GGML_CUDA_MOE_CACHE_RESERVE_MB", "GGML_CUDA_MOE_CACHE_MIN_EXPERT_KB",
+                    "GGML_CUDA_MOE_CACHE_MAX_BATCH", "GGML_CUDA_MOE_CACHE_INSERTS",
+                    "GGML_CUDA_MOE_CACHE_ADMIT_AFTER", "GGML_CUDA_MOE_CACHE_THROTTLE",
+                    "GGML_CUDA_MOE_CACHE_QUEUE", "GGML_CUDA_MOE_CACHE_STATS", "GGML_CUDA_MOE_CACHE_NDEV",
+                    "GGML_CUDA_MOE_CACHE_MIN_CC", "GGML_CUDA_MOE_CACHE_SERIAL_FILL",
+                    "GGML_CUDA_MOE_CACHE_DEDICATED_MMV", "GGML_CUDA_MOE_CACHE_OVERLAP_CPU_ROWS",
+                    "GGML_CUDA_MOE_CACHE_FAIL", "GGML_MOE_CACHE_DEVICE", "GGML_MOE_CACHE_DEVICE_STATS",
+                    "GGML_MOE_CACHE_DEVICE_CAPTURE", "GGML_MOE_CACHE_PROFILE_SAVE",
+                    "GGML_MOE_CACHE_PROFILE_LOAD", "GGML_MOE_CACHE_PROFILE_BLEND_PCT",
+                    "GGML_MOE_CACHE_PROFILE_GLOBAL", "GGML_MOE_CACHE_PROFILE_PRIOR_PCT",
+                    "GGML_MOE_CACHE_PROFILE_PRIOR_DECAY", "GGML_MOE_CACHE_SWAP",
+                    "GGML_MOE_CACHE_SWAP_INTERVAL", "GGML_MOE_CACHE_SWAP_DECAY_PCT",
+                    "GGML_MOE_CACHE_SWAP_MARGIN", "GGML_MOE_CACHE_TRACE"}) {
+                const char * value = getenv(name);
+                entries.push_back({name, value != nullptr, value ? value : ""});
+            }
+        }
+        ~saved_environment() {
+            for (const auto & item : entries) {
+                set_env(item.name, item.present ? item.value.c_str() : nullptr);
+            }
+        }
+    } saved;
+    configure_cache(nullptr, "8");
+    set_env("GGML_CUDA_MOE_CACHE_BUDGET_MB", "8");
+    set_env("GGML_MOE_CACHE_PROFILE_LOAD", nullptr);
+    set_env("GGML_MOE_CACHE_PROFILE_BLEND_PCT", "0");
+    set_env("GGML_MOE_CACHE_PROFILE_GLOBAL", nullptr);
+    set_env("GGML_MOE_CACHE_DEVICE", nullptr);
+    set_env("GGML_MOE_CACHE_DEVICE_STATS", nullptr);
+    set_env("GGML_MOE_CACHE_SWAP", nullptr);
+    set_env("GGML_MOE_CACHE_TRACE", nullptr);
+    const std::string pattern = std::string(directory) + "/moe-swap-profile-XXXXXX";
+    std::vector<char> filename(pattern.begin(), pattern.end());
+    filename.push_back('\0');
+    const int fd = mkstemp(filename.data());
+    if (fd < 0) { return false; }
+    close(fd);
+    set_env("GGML_MOE_CACHE_PROFILE_SAVE", filename.data());
+
+    constexpr int64_t width = 1024, rows = 206, experts = 65;
+    ggml_init_params params = {8 * ggml_tensor_overhead(), nullptr, true};
+    ggml_context * ctx = ggml_init(params);
+    ggml_context * inputs = ggml_init(params);
+    auto * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_Q4_0, width, rows, experts);
+    ggml_set_name(weights, "blk.7.ffn_up_exps.weight");
+    auto * acts = ggml_new_tensor_3d(inputs, GGML_TYPE_F32, width, 1, 1);
+    auto * ids = ggml_new_tensor_2d(inputs, GGML_TYPE_I32, 2, 1);
+    auto buffer = ggml_backend_alloc_ctx_tensors(ctx, cpu);
+    auto input_buffer = ggml_backend_alloc_ctx_tensors(inputs, cpu);
+    bool ok = buffer && input_buffer;
+    if (ok) {
+        ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        std::vector<float> values(width * rows * experts);
+        for (size_t i = 0; i < values.size(); ++i) {
+            values[i] = 0.2f * std::sin((float)(i % 10007) * 0.013f);
+        }
+        std::vector<uint8_t> quantized(ggml_nbytes(weights));
+        ok &= ggml_quantize_chunk(GGML_TYPE_Q4_0, values.data(), quantized.data(),
+                0, rows * experts, width, nullptr) == quantized.size();
+        ggml_backend_tensor_set(weights, quantized.data(), 0, quantized.size());
+        values.resize(width);
+        ggml_backend_tensor_set(acts, values.data(), 0, width * sizeof(float));
+    }
+    // Swap victims need exact mapped fallback sources, including initially hot experts.
+    const bool registered = ok && cudaHostRegister(weights->data, ggml_nbytes(weights),
+            cudaHostRegisterPortable | cudaHostRegisterMapped) == cudaSuccess;
+    ok &= registered;
+    if (!registered) { (void)cudaGetLastError(); }
+    const ggml_moe_cache_tensor_desc descriptor = {weights->name, weights->data,
+        weights->nb[2], width, rows, experts, GGML_TYPE_Q4_0};
+    std::vector<uint64_t> profile(experts, 0), prompt(experts, 1000);
+    profile[64] = 1000000;
+    prompt[64] = 0;
+    const uint64_t * profile_counts[] = {profile.data()};
+    const uint64_t * prompt_counts[] = {prompt.data()};
+    void * writer = ok ? create_direct_session(gpu, cpu) : nullptr;
+    ok &= writer != nullptr;
+    if (writer) {
+        ok &= active_api().warm(writer, &descriptor, profile_counts, 1) == 1;
+        active_api().session_destroy(writer);
+    }
+    set_env("GGML_MOE_CACHE_PROFILE_SAVE", nullptr);
+    set_env("GGML_MOE_CACHE_PROFILE_LOAD", filename.data());
+    set_env("GGML_MOE_CACHE_DEVICE", "1");
+    set_env("GGML_MOE_CACHE_DEVICE_STATS", "1");
+    set_env("GGML_MOE_CACHE_DEVICE_CAPTURE", nullptr);
+    set_env("GGML_MOE_CACHE_SWAP", "1");
+    set_env("GGML_MOE_CACHE_SWAP_INTERVAL", "1");
+    set_env("GGML_MOE_CACHE_SWAP_DECAY_PCT", "95");
+    set_env("GGML_MOE_CACHE_SWAP_MARGIN", "2");
+    std::vector<std::vector<float>> control_outputs(2);
+    for (int mode = 0; mode < 4 && ok; ++mode) {
+        const int prior_pct = mode == 0 ? 0 : mode == 3 ? 200 : 100;
+        set_env("GGML_MOE_CACHE_PROFILE_PRIOR_PCT", mode == 0 ? "0" : mode == 3 ? "200" : "100");
+        set_env("GGML_MOE_CACHE_PROFILE_PRIOR_DECAY", mode == 2 ? "1" : nullptr);
+        // A nondecaying empirical score needs finite first-snapshot scaling.
+        // 200% makes its initial two routes exceed the admission margin.
+        set_env("GGML_MOE_CACHE_SWAP_DECAY_PCT", mode == 3 ? "100" : "95");
+        capture.clear();
+        test_graph reference = make_graph(cpu, weights, acts, ids);
+        test_graph candidate = make_graph(gpu, weights, acts, ids);
+        ggml_backend_t backends[] = {gpu, cpu};
+        auto scheduler = ggml_backend_sched_new(backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, false);
+        bool case_ok = scheduler && reference.buffer && candidate.buffer;
+        if (case_ok) {
+            case_ok &= ggml_backend_sched_moe_cache_warm(scheduler, &descriptor, prompt_counts, 1) >= 0;
+            case_ok &= ggml_backend_sched_moe_cache_device_prepare(scheduler, &descriptor, 1) == 1;
+            case_ok &= ggml_backend_sched_alloc_graph(scheduler, candidate.graph);
+            for (int phase = 0; phase < 2 && case_ok; ++phase) {
+                const int32_t route[] = {phase == 0 ? 0 : 64, phase == 0 ? 0 : 64};
+                ggml_backend_tensor_set(ids, route, 0, sizeof(route));
+                case_ok &= ggml_backend_graph_compute(cpu, reference.graph) == GGML_STATUS_SUCCESS;
+                std::vector<float> expected(ggml_nelements(reference.out)), actual(expected.size()), first;
+                ggml_backend_tensor_get(reference.out, expected.data(), 0, expected.size() * sizeof(float));
+                for (int replay = 0; replay < (phase == 0 ? 16 : 1) && case_ok; ++replay) {
+                    case_ok &= ggml_backend_sched_graph_compute(scheduler, candidate.graph) == GGML_STATUS_SUCCESS;
+                    ggml_backend_tensor_get(candidate.out, actual.data(), 0, actual.size() * sizeof(float));
+                    case_ok &= compare_output(expected, actual, 5e-4);
+                    if (replay == 0) { first = actual; }
+                    else { case_ok &= actual == first; }
+                    // Drain private swap/readback streams deterministically before the next decision.
+                    case_ok &= cudaDeviceSynchronize() == cudaSuccess;
+                }
+                if (mode == 0) { control_outputs[phase] = actual; }
+                else { case_ok &= actual == control_outputs[phase]; }
+            }
+        }
+        if (scheduler) { ggml_backend_sched_free(scheduler); }
+        const std::string log = capture.get();
+        case_ok &= log.find("newly_uncovered_bytes=0") != std::string::npos;
+        // Final teardown counters include the sole probe of the never-routed
+        // profile expert. Default cannot promote it before that first probe.
+        case_ok &= max_field_value(log, "dispatches=") == 17;
+        case_ok &= max_field_value(log, "misses=") == (mode == 0 ? 2 : 0);
+        case_ok &= max_field_value(log, "hits=") == (mode == 0 ? 32 : 34);
+        case_ok &= mode == 0 ? max_field_value(log, " swaps=") == 0 : max_field_value(log, " swaps=") >= 1;
+        case_ok &= mode == 0 ? log.find("swap profile prior:") == std::string::npos :
+            log.find(mode == 2 ? "mode=decaying-seed" : "mode=persistent") != std::string::npos;
+        printf("cache-profile-swap-prior pct=%d mode=%s counter_decay=%d: %s\n", prior_pct,
+                mode == 2 ? "decaying-seed" : "persistent", mode == 3 ? 100 : 95, case_ok ? "OK" : "FAIL");
+        if (!case_ok) { fprintf(stderr, "%s", log.c_str()); }
+        ok &= case_ok;
+        free_graph(candidate);
+        free_graph(reference);
+    }
+    if (registered) { ok &= cudaHostUnregister(weights->data) == cudaSuccess; }
+    ggml_backend_buffer_free(input_buffer);
+    ggml_backend_buffer_free(buffer);
+    ggml_free(inputs);
+    ggml_free(ctx);
+    unlink(filename.data());
+    return ok;
+#else
+    (void) gpu; (void) cpu; (void) capture;
+    printf("cache-profile-swap-prior: SKIP (requires CUDA and temporary-file support)\n");
+    return true;
+#endif
 }
 
 static bool run_prefetch_router(ggml_backend_t gpu, ggml_backend_t cpu) {
@@ -5402,7 +5654,58 @@ static bool test_prefetch_budget() {
     return ok;
 }
 
+// Pure planner fixtures do not initialize a CUDA provider or allocate weights.
+static bool test_profile_global_plan() {
+    using item = ggml_cuda_moe_profile_item;
+    ggml_cuda_moe_profile_plan plan;
+    std::vector<item> items;
+    for (int32_t expert = 0; expert < 8; ++expert) {
+        items.push_back({0, expert, 0, 0, 1, (uint64_t)(80 - expert)});
+        items.push_back({1, expert, 1, 1, 4, (uint64_t)(10 - expert)});
+    }
+    bool ok = ggml_cuda_moe_cache_profile_plan(items, {8, 8}, 20, 2, plan);
+    ok &= plan.bytes == 20 && plan.slots == std::vector<size_t>({8, 3});
+    ok &= plan.bundles == 11 && plan.ranks.size() == items.size();
+    const auto previous_slots = plan.slots;
+    ok &= !ggml_cuda_moe_cache_profile_plan(items, {8, 8}, 9, 2, plan);
+    ok &= plan.slots == previous_slots;
+
+    items.clear();
+    for (size_t layer = 0; layer < 2; ++layer) {
+        for (int32_t expert = 0; expert < 8; ++expert) {
+            const uint64_t count = (uint64_t)((layer ? 20 : 100) - expert);
+            items.push_back({layer * 3, expert, layer, 0, 1, count});
+            items.push_back({layer * 3 + 1, expert, layer, 0, 1, count});
+            items.push_back({layer * 3 + 2, expert, layer, 1, 4, count});
+        }
+    }
+    ok &= ggml_cuda_moe_cache_profile_plan(items, {32, 16}, 48, 2, plan);
+    ok &= plan.bytes == 48 && plan.slots == std::vector<size_t>({16, 8}) && plan.bundles == 8;
+    for (size_t i = 0; i < items.size(); i += 3) {
+        ok &= plan.selected[i] == plan.selected[i + 1] && plan.selected[i] == plan.selected[i + 2];
+        ok &= (plan.selected[i] != 0) == (items[i].group == 0);
+    }
+    const auto ranks = plan.ranks;
+    ok &= ggml_cuda_moe_cache_profile_plan(items, {32, 16}, 48, 2, plan) && plan.ranks == ranks;
+    for (auto & entry : items) { entry.count = 0; }
+    ok &= !ggml_cuda_moe_cache_profile_plan(items, {32, 16}, 48, 2, plan);
+    items = {{0, 0, 0, 0, SIZE_MAX, 1}, {1, 0, 0, 1, 1, 1}};
+    ok &= !ggml_cuda_moe_cache_profile_plan(items, {1, 1}, SIZE_MAX, 1, plan);
+
+    items.clear();
+    for (int32_t expert = 0; expert < 128; ++expert) { items.push_back({0, expert, 0, 0, 4, 1}); }
+    ok &= ggml_cuda_moe_cache_profile_plan(items, {128}, 256, 64, plan);
+    ok &= plan.bytes == 256 && plan.slots == std::vector<size_t>({64});
+    for (size_t i = 0; i < items.size(); ++i) { ok &= (plan.selected[i] != 0) == (i < 64); }
+    printf("cache-profile-global-plan: %s\n", ok ? "OK" : "FAIL");
+    return ok;
+}
+
 int main(int argc, char ** argv) {
+    if (argc == 2 && strcmp(argv[1], "--profile-global-plan-only") == 0) {
+        return test_profile_global_plan() ? 0 : 1;
+    }
+    const bool profile_warm_only = argc == 2 && strcmp(argv[1], "--profile-warm-only") == 0;
     if (!test_prefetch_budget()) {
         return 1;
     }
@@ -5505,7 +5808,13 @@ int main(int argc, char ** argv) {
         ggml_backend_free(cpu);
         return !provider_is_cuda ? 77 : ok ? 0 : 1;
     }
-    if (!run_prefetch_router(gpu, cpu)) {
+    if (profile_warm_only && (!provider_is_cuda || !getenv("GGML_MOE_CACHE_TEST_TMPDIR"))) {
+        fprintf(stderr, "--profile-warm-only requires CUDA and GGML_MOE_CACHE_TEST_TMPDIR\n");
+        ggml_backend_free(gpu);
+        ggml_backend_free(cpu);
+        return provider_is_cuda ? 1 : 77;
+    }
+    if (!profile_warm_only && !run_prefetch_router(gpu, cpu)) {
         ggml_backend_free(gpu);
         ggml_backend_free(cpu);
         return 1;
@@ -5629,6 +5938,23 @@ int main(int argc, char ** argv) {
     std::vector<float> reference(ggml_nelements(graph.out));
     ggml_backend_tensor_get(
             graph.out, reference.data(), 0, reference.size() * sizeof(float));
+
+    if (profile_warm_only) {
+        bool ok = run_prompt_warm(gpu, cpu, weights, graph, reference, capture);
+        ok &= run_prompt_warm_ranking(gpu, cpu, capture);
+        ok &= run_prompt_warm_decode_heat(gpu, cpu, capture);
+        ok &= run_profile_persistence(gpu, cpu, capture);
+        ok &= run_prompt_cache_lending(gpu, cpu, capture);
+        ok &= run_profile_swap_prior(gpu, cpu, capture);
+        free_graph(graph);
+        ggml_backend_buffer_free(static_buffer);
+        ggml_free(static_ctx);
+        ggml_quantize_free();
+        ggml_backend_free(gpu);
+        ggml_backend_free(cpu);
+        ggml_log_set(nullptr, nullptr);
+        return ok ? 0 : 1;
+    }
 
     test_graph fused_graph = make_fused_graph(
             cpu, weights, gate_weights, activations, ids);
