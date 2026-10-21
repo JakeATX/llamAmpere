@@ -686,7 +686,16 @@ static void llama_sampler_chain_apply(struct llama_sampler * smpl, llama_token_d
 
     bool is_backend = chain->is_init;
 
-    for (auto & smpl : chain->samplers) {
+    static const bool bookkeep = [] {
+        const char * e = getenv("LLAMA_BOOKKEEP_TIMING");
+        return e && atoi(e) != 0;
+    }();
+    if (bookkeep) {
+        chain->child_perf.resize(chain->samplers.size());
+    }
+
+    for (size_t i = 0; i < chain->samplers.size(); ++i) {
+        auto & smpl = chain->samplers[i];
         if (is_backend && smpl.is_backend) {
             continue;
         }
@@ -697,7 +706,12 @@ static void llama_sampler_chain_apply(struct llama_sampler * smpl, llama_token_d
             continue;
         }
 
+        const int64_t t0 = bookkeep ? ggml_time_us() : 0;
         llama_sampler_apply(smpl.ptr, cur_p);
+        if (bookkeep) {
+            chain->child_perf[i].first += ggml_time_us() - t0;
+            chain->child_perf[i].second += 1;
+        }
     }
 }
 
@@ -717,6 +731,7 @@ static struct llama_sampler * llama_sampler_chain_clone(const struct llama_sampl
     for (const auto & smpl : chain_src->samplers) {
         llama_sampler_chain_add(result, llama_sampler_clone(smpl.ptr));
     }
+    ((llama_sampler_chain *) result->ctx)->child_perf = chain_src->child_perf;
 
     return result;
 }
@@ -851,6 +866,7 @@ static void llama_sampler_chain_copy_state(const struct llama_sampler * src, str
     dst_chain->cur         = src_chain->cur;
     dst_chain->t_sample_us = src_chain->t_sample_us;
     dst_chain->n_sample    = src_chain->n_sample;
+    dst_chain->child_perf  = src_chain->child_perf;
 }
 
 static struct llama_sampler_i llama_sampler_chain_i = {
@@ -879,6 +895,7 @@ struct llama_sampler * llama_sampler_chain_init(struct llama_sampler_chain_param
             /* .cur                  = */ {},
             /* .t_sample_us          = */ 0,
             /* .n_sample             = */ 0,
+            /* .child_perf           = */ {},
         }
     );
 }
@@ -970,6 +987,7 @@ void llama_sampler_chain_add(struct llama_sampler * chain, struct llama_sampler 
         /* .is_backend = */ false,
         /* .ptr        = */ smpl,
     });
+    p->child_perf.clear();
 }
 
 struct llama_sampler * llama_sampler_chain_get(struct llama_sampler * chain, int32_t i) {
@@ -1003,6 +1021,7 @@ struct llama_sampler * llama_sampler_chain_remove(struct llama_sampler * chain, 
 
     auto * result = p->samplers[i].ptr;
     p->samplers.erase(p->samplers.begin() + i);
+    p->child_perf.clear();
 
     return result;
 }
@@ -4384,6 +4403,16 @@ uint32_t llama_sampler_get_seed(const struct llama_sampler * smpl) {
 
 // perf
 
+std::vector<llama_sampler_child_perf> llama_perf_sampler_children(const struct llama_sampler * sampler) {
+    GGML_ASSERT(sampler != nullptr && sampler->iface == &llama_sampler_chain_i);
+    const auto * chain = (const llama_sampler_chain *) sampler->ctx;
+    std::vector<llama_sampler_child_perf> result;
+    for (size_t i = 0; i < chain->child_perf.size(); ++i) {
+        result.push_back({ llama_sampler_name(chain->samplers[i].ptr), chain->child_perf[i].first, chain->child_perf[i].second });
+    }
+    return result;
+}
+
 struct llama_perf_sampler_data llama_perf_sampler(const struct llama_sampler * chain) {
     struct llama_perf_sampler_data data = {};
 
@@ -4414,6 +4443,7 @@ void llama_perf_sampler_reset(struct llama_sampler * chain) {
 
     ctx->t_sample_us = 0;
     ctx->n_sample    = 0;
+    ctx->child_perf.clear();
 }
 
 // row-block backend sampling support (defined after all sampler interface tables)

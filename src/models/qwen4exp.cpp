@@ -1051,6 +1051,11 @@ public:
 
     void set_input(const llama_ubatch * ubatch) override {
         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
+        if (store_only) {
+            GGML_ASSERT(!pool_cells && !pool_idxs && !pool_mask && !tail_idxs);
+            mctx->set_input_kpool_store(new_pool_idxs, new_pool_rep, ubatch, new_pool_pos);
+            return;
+        }
         mctx->set_input_kpool(pool_cells, pool_idxs, pool_mask, tail_idxs, nullptr, new_pool_idxs, new_pool_rep,
                               ubatch, new_pool_pos);
     }
@@ -1061,6 +1066,11 @@ public:
         const auto * idx = mctx->get_idx();
         if (idx == nullptr) {
             return false;
+        }
+
+        if (store_only) {
+            return !params.cparams.mtp_chain && params.n_outputs == 0 &&
+                k_idxs->ne[0] == params.ubatch.n_tokens && n_new == mctx->get_n_kpool_new();
         }
 
         bool res = true;
@@ -1090,6 +1100,7 @@ public:
     uint32_t n_new = 0; // padded to a stable bound, never below 1
     uint32_t n_sel = 0;
     uint32_t n_kv  = 0;
+    bool store_only = false;
 };
 
 llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build_inp_kpool(const llama_memory_hybrid_idx_context * mctx_hyb, bool store_only) {
@@ -1101,44 +1112,49 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
 
     auto inp = std::make_unique<llm_graph_input_kpool>(mctx_hyb, kpool);
 
-    inp->k_idxs     = mctx_idx->build_input_k_idxs(ctx0, ubatch);
-    inp->pool_cells = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_pool);
-    inp->pool_idxs  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool, n_pool);
-    // LLAMA_QSA_POOL_RANGE=1 (opt-in): each token's visible blocks are one run [lo, hi) of the block order, so the mask
-    // can be two numbers per token instead of a row of n_pool 0/-inf values (the CPU fill and the copy of that row cost
-    // seconds per 100K prompt). The indexer adds the same 0 or -inf, so the scores are the same bit for bit.
-    static const bool pool_range = [] { const char * e = getenv("LLAMA_QSA_POOL_RANGE"); return e && atoi(e) != 0; }();
-    inp->pool_mask  = pool_range ? ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 2, n_tokens) :
-                                   ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, n_pool, n_tokens);
-    inp->tail_idxs  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool - 1, n_tokens);
-    ggml_set_input(inp->pool_cells);
-    ggml_set_input(inp->pool_idxs);
-    ggml_set_input(inp->pool_mask);
-    ggml_set_input(inp->tail_idxs);
+    // fork: chain roots also pass store_only, but their row-readiness inputs still need every pool.
+    // Without the incremental layout, keep both allocation and fill on the original full path.
+    inp->store_only = store_only && !cparams.mtp_chain && mctx_hyb->use_kpool_store_only();
+    inp->k_idxs = mctx_idx->build_input_k_idxs(ctx0, ubatch);
+    if (!inp->store_only) {
+        inp->pool_cells = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_pool);
+        inp->pool_idxs  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool, n_pool);
+        // LLAMA_QSA_POOL_RANGE=1 (opt-in): each token's visible blocks are one run [lo, hi) of the block order, so the mask
+        // can be two numbers per token instead of a row of n_pool 0/-inf values (the CPU fill and the copy of that row cost
+        // seconds per 100K prompt). The indexer adds the same 0 or -inf, so the scores are the same bit for bit.
+        static const bool pool_range = [] { const char * e = getenv("LLAMA_QSA_POOL_RANGE"); return e && atoi(e) != 0; }();
+        inp->pool_mask  = pool_range ? ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 2, n_tokens) :
+                                       ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, n_pool, n_tokens);
+        inp->tail_idxs  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool - 1, n_tokens);
+        ggml_set_input(inp->pool_cells);
+        ggml_set_input(inp->pool_idxs);
+        ggml_set_input(inp->pool_mask);
+        ggml_set_input(inp->tail_idxs);
 
-    // set_input fills them all. Store-only has no later readers, so pin
-    // their lifetime against aliasing other inputs. A VIEW node also keeps
-    // growing leaf sizes visible to the allocator's node/source validation.
-    const auto expand_input = [&](ggml_tensor * tensor) {
-        if (store_only) {
-            ggml_set_output(tensor);
-            ggml_tensor * input = tensor;
-            tensor = ggml_view_4d(ctx0, tensor, tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3],
-                    tensor->nb[1], tensor->nb[2], tensor->nb[3], 0);
-            GGML_ASSERT(tensor->op == GGML_OP_VIEW && tensor->src[0] == input);
-            ggml_set_output(tensor);
-        }
-        ggml_build_forward_expand(gf, tensor);
-    };
-    expand_input(inp->pool_cells);
-    expand_input(inp->pool_idxs);
-    expand_input(inp->pool_mask);
-    expand_input(inp->tail_idxs);
+        // set_input fills them all. Store-only has no later readers, so pin
+        // their lifetime against aliasing other inputs. A VIEW node also keeps
+        // growing leaf sizes visible to the allocator's node/source validation.
+        const auto expand_input = [&](ggml_tensor * tensor) {
+            if (store_only) {
+                ggml_set_output(tensor);
+                ggml_tensor * input = tensor;
+                tensor = ggml_view_4d(ctx0, tensor, tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3],
+                        tensor->nb[1], tensor->nb[2], tensor->nb[3], 0);
+                GGML_ASSERT(tensor->op == GGML_OP_VIEW && tensor->src[0] == input);
+                ggml_set_output(tensor);
+            }
+            ggml_build_forward_expand(gf, tensor);
+        };
+        expand_input(inp->pool_cells);
+        expand_input(inp->pool_idxs);
+        expand_input(inp->pool_mask);
+        expand_input(inp->tail_idxs);
 
+        // the top blocks plus the tail
+        inp->n_sel = kpool*std::min<uint32_t>(n_pool, hparams.indexer_top_k / kpool) + kpool - 1;
+    }
     inp->n_kv  = mctx_idx->get_n_kv();
     inp->n_new = mctx_hyb->get_n_kpool_new();
-    // the top blocks plus the tail
-    inp->n_sel = kpool*std::min<uint32_t>(n_pool, hparams.indexer_top_k / kpool) + kpool - 1;
 
     inp->new_pool_idxs = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool, inp->n_new);
     ggml_set_input(inp->new_pool_idxs);
@@ -1147,6 +1163,7 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
     ggml_set_input(inp->new_pool_rep);
     inp->new_pool_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*inp->n_new);
     ggml_set_input(inp->new_pool_pos);
+
 
     return (llm_graph_input_kpool *) res->add_input(std::move(inp));
 }

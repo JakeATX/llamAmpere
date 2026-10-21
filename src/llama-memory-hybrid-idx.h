@@ -206,7 +206,16 @@ public:
                          ggml_tensor * sel_mask, ggml_tensor * new_pool_idxs, ggml_tensor * new_pool_rep,
                          const llama_ubatch * ubatch, ggml_tensor * new_pool_pos = nullptr) const;
 
+    // fork: no-output Qwen4exp MTP graphs need only the fresh pool writes. Requires the incremental layout.
+    bool use_kpool_store_only() const;
+    void set_input_kpool_store(ggml_tensor * new_pool_idxs, ggml_tensor * new_pool_rep,
+                               const llama_ubatch * ubatch, ggml_tensor * new_pool_pos) const;
+
 private:
+    void set_input_kpool_impl(ggml_tensor * pool_cells, ggml_tensor * pool_idxs, ggml_tensor * pool_mask, ggml_tensor * tail_idxs,
+                             ggml_tensor * sel_mask, ggml_tensor * new_pool_idxs, ggml_tensor * new_pool_rep,
+                             const llama_ubatch * ubatch, ggml_tensor * new_pool_pos, bool incremental) const;
+
     llama_memory_hybrid_idx * mem = nullptr;
 
     // streams per ubatch, read from the slot infos before ctx_idx takes them

@@ -38,6 +38,7 @@
 #include "llama.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cerrno>
 #include <cstdlib>
@@ -60,6 +61,84 @@
 //
 
 static llama_kv_cache * llama_sj_kvarn_cache(llama_memory_i * memory);
+
+// Diagnostics only: these process-wide buckets aggregate default target and MTP contexts.
+// Host times are inclusive and nested in server phases (and release includes synchronize).
+// Do not add these diagnostics together or add them to native round "other" time.
+static const bool llama_bookkeep_timing_enabled = [] {
+    const char * e = std::getenv("LLAMA_BOOKKEEP_TIMING");
+    return e && std::atoi(e) != 0;
+}();
+
+struct llama_bookkeep_context_counters {
+    std::atomic<uint64_t> sync_calls{0};
+    std::atomic<uint64_t> sync_host_us{0};
+    std::atomic<uint64_t> copy_calls{0};
+    std::atomic<uint64_t> copy_bytes{0};
+    std::atomic<uint64_t> copy_host_us{0};
+    std::atomic<uint64_t> release_calls{0};
+    std::atomic<uint64_t> release_host_us{0};
+    std::atomic<uint64_t> memory_init_layout_host_us{0};
+    std::atomic<uint64_t> graph_prepare_host_us{0};
+    std::atomic<uint64_t> set_inputs_host_us{0};
+    std::atomic<uint64_t> peer_sync_host_us{0};
+    std::atomic<uint64_t> graph_submit_host_us{0};
+    std::atomic<uint64_t> graph_rebuild_calls{0};
+    std::atomic<uint64_t> graph_reuse_calls{0};
+    std::array<std::atomic<uint64_t>, 10> backend_submit{};
+};
+
+static_assert(std::atomic<uint64_t>::is_always_lock_free, "bookkeeping counters must be lock-free");
+static llama_bookkeep_context_counters llama_bookkeep_context_totals[2];
+
+static llama_bookkeep_context_counters * llama_bookkeep_context_bucket(llama_context_type type) {
+    if (!llama_bookkeep_timing_enabled) {
+        return nullptr;
+    }
+    return &llama_bookkeep_context_totals[type == LLAMA_CONTEXT_TYPE_MTP ? 1 : 0];
+}
+
+struct llama_bookkeep_context_timer {
+    std::atomic<uint64_t> * calls;
+    std::atomic<uint64_t> * host_us;
+    const int64_t started;
+
+    llama_bookkeep_context_timer(std::atomic<uint64_t> * calls, std::atomic<uint64_t> * host_us) :
+        calls(calls), host_us(host_us), started(calls ? ggml_time_us() : 0) {}
+
+    ~llama_bookkeep_context_timer() {
+        if (calls) {
+            host_us->fetch_add(uint64_t(ggml_time_us() - started), std::memory_order_relaxed);
+            calls->fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+};
+
+// One active stage at a time; changing stages closes the old interval. Keeping this timer
+// outside build_graph lets retries remain in graph preparation without overlapping stages.
+struct llama_bookkeep_stage_timer {
+    std::atomic<uint64_t> * host_us;
+    int64_t started;
+
+    explicit llama_bookkeep_stage_timer(std::atomic<uint64_t> * host_us) :
+        host_us(host_us), started(host_us ? ggml_time_us() : 0) {}
+
+    void next(std::atomic<uint64_t> * next_host_us) {
+        if (host_us == next_host_us) {
+            return;
+        }
+        const int64_t now = ggml_time_us();
+        if (host_us) {
+            host_us->fetch_add(uint64_t(now - started), std::memory_order_relaxed);
+        }
+        host_us = next_host_us;
+        started = now;
+    }
+
+    ~llama_bookkeep_stage_timer() {
+        next(nullptr);
+    }
+};
 
 // Verify that every Hadamard-folded weight consumed by the graph receives its
 // activation-side transform, and every latent lookup table gets the inverse.
@@ -2210,6 +2289,8 @@ void llama_context::sched_reserve() {
 }
 
 void llama_context::synchronize() {
+    auto * perf = llama_bookkeep_context_bucket(cparams.ctx_type);
+    const llama_bookkeep_context_timer timer(perf ? &perf->sync_calls : nullptr, perf ? &perf->sync_host_us : nullptr);
     if (!sched) {
         return;
     }
@@ -2646,6 +2727,8 @@ float * llama_context::get_embeddings_nextn() {
 }
 
 bool llama_context::copy_embeddings_nextn(float * dst, int32_t first, int32_t count) {
+    auto * perf = llama_bookkeep_context_bucket(cparams.ctx_type);
+    const llama_bookkeep_context_timer timer(perf ? &perf->copy_calls : nullptr, perf ? &perf->copy_host_us : nullptr);
     const size_t width = model.hparams.n_embd_out();
     if (cparams.embeddings_nextn_masked || first < 0 || count < 0 || !width || !embd_nextn.data ||
             (count && !dst) || (size_t) first > embd_nextn.size / width ||
@@ -2674,6 +2757,9 @@ bool llama_context::copy_embeddings_nextn(float * dst, int32_t first, int32_t co
         } else {
             memcpy(dst, src, bytes);
         }
+        if (perf) {
+            perf->copy_bytes.fetch_add(bytes, std::memory_order_relaxed);
+        }
     }
     return true;
 }
@@ -2687,6 +2773,9 @@ bool llama_context::release_embeddings_nextn(int32_t first, int32_t count) {
         LLAMA_LOG_ERROR("%s: invalid unmasked output range\n", __func__);
         return false;
     }
+    // Count only the validated file-backed reclaim path, not disabled/invalid early returns.
+    auto * perf = llama_bookkeep_context_bucket(cparams.ctx_type);
+    const llama_bookkeep_context_timer timer(perf ? &perf->release_calls : nullptr, perf ? &perf->release_host_us : nullptr);
     synchronize();
     output_reorder();
     try {
@@ -2866,6 +2955,28 @@ size_t llama_context::get_sampled_probs_count(int32_t idx) {
         LLAMA_LOG_ERROR("%s: invalid backend sampled probs count id %d, reason: %s\n", __func__, idx, err.what());
         return 0;
     }
+}
+
+llama_sampler_output llama_context::get_sampler_output_ith(int32_t idx) {
+    llama_sampler_output result;
+    result.token = get_sampled_token_ith(idx);
+    result.probs = get_sampled_probs_ith(idx);
+    result.logits = get_sampled_logits_ith(idx);
+    result.candidates = get_sampled_candidates_ith(idx);
+    if (result.probs) {
+        result.probs_count = static_cast<uint32_t>(get_sampled_probs_count(idx));
+    }
+    if (result.logits) {
+        result.logits_count = static_cast<uint32_t>(get_sampled_logits_count(idx));
+    }
+    if (result.probs || result.logits) {
+        result.candidates_count = static_cast<uint32_t>(get_sampled_candidates_count(idx));
+    }
+    if (result.token == LLAMA_TOKEN_NULL && !result.probs && !result.logits) {
+        result.raw_logits = get_logits_ith(idx);
+        result.raw_logits_count = result.raw_logits ? model.vocab.n_tokens() : 0;
+    }
+    return result;
 }
 
 void llama_context::attach_threadpool(ggml_threadpool_t threadpool, ggml_threadpool_t threadpool_batch) {
@@ -3832,6 +3943,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
                                                  llm_graph_type           gtype,
                                                  llama_memory_context_i * mctx,
                                                  ggml_status &            ret) {
+    auto * bookkeep_perf = llama_bookkeep_context_bucket(cparams.ctx_type);
+    llama_bookkeep_stage_timer bookkeep_stage(bookkeep_perf ? &bookkeep_perf->memory_init_layout_host_us : nullptr);
+
     // [B1] the layer-major prefill applied every ubatch up front and seeks between their saved views
     if (mctx && !b1_cur.active && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
@@ -3887,6 +4001,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
     g_decode_host_us.mark("scratch2");
 
 build_graph:
+    bookkeep_stage.next(bookkeep_perf ? &bookkeep_perf->graph_prepare_host_us : nullptr);
     auto * res = get_gf_res_prev();
     auto * gf  = res->get_gf();
 
@@ -3907,7 +4022,13 @@ build_graph:
         }
 
         n_reused++;
+        if (bookkeep_perf) {
+            bookkeep_perf->graph_reuse_calls.fetch_add(1, std::memory_order_relaxed);
+        }
     } else {
+        if (bookkeep_perf) {
+            bookkeep_perf->graph_rebuild_calls.fetch_add(1, std::memory_order_relaxed);
+        }
         gf_res_prev_active = nullptr;
         res->reset();
 
@@ -3971,6 +4092,7 @@ build_graph:
         }
     }
 
+    bookkeep_stage.next(bookkeep_perf ? &bookkeep_perf->set_inputs_host_us : nullptr);
     // set the input data for the input tensors
     {
         //const auto t_start_us = ggml_time_us();
@@ -3994,14 +4116,35 @@ build_graph:
     }
 
     g_decode_host_us.mark("inputs");
+    bookkeep_stage.next(bookkeep_perf ? &bookkeep_perf->peer_sync_host_us : nullptr);
     if (compute_is_shared() && compute_peer->sched) {
         // the peer's last graph may still be running on its own stream over the shared buffers
         ggml_backend_sched_synchronize(compute_peer->sched.get());
     }
     g_decode_host_us.mark("peersync");
 
+    bookkeep_stage.next(bookkeep_perf ? &bookkeep_perf->graph_submit_host_us : nullptr);
+    // One bounded diagnostic snapshot, never enabled in timing claims. Scheduling
+    // assignment is inspected after allocation; no callback or extra device fence.
+    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && n_outputs == 0 && ubatch.n_tokens <= 8 &&
+            getenv("LLAMA_BOOKKEEP_SPLIT_DUMP") && std::atoi(getenv("LLAMA_BOOKKEEP_SPLIT_DUMP")) != 0) {
+        static std::atomic_flag dumped = ATOMIC_FLAG_INIT;
+        if (!dumped.test_and_set(std::memory_order_relaxed)) {
+            fprintf(stderr, "BOOKKEEP_GRAPH nodes=%d tokens=%u outputs=%d\n", ggml_graph_n_nodes(gf), ubatch.n_tokens, n_outputs);
+            for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+                auto * node = ggml_graph_node(gf, i);
+                if (node->op == GGML_OP_VIEW || node->op == GGML_OP_RESHAPE ||
+                        node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE) { continue; }
+                auto * backend = ggml_backend_sched_get_tensor_backend(sched.get(), node);
+                fprintf(stderr, "BOOKKEEP_GRAPH node=%d op=%s name=%s backend=%s shape=%lld,%lld,%lld,%lld\n",
+                        i, ggml_op_desc(node), node->name, backend ? ggml_backend_name(backend) : "none",
+                        (long long) node->ne[0], (long long) node->ne[1], (long long) node->ne[2], (long long) node->ne[3]);
+            }
+        }
+    }
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     g_decode_host_us.mark("compute");
+    bookkeep_stage.next(nullptr);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -4583,6 +4726,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     mtp_scratch_prepare(n_outputs_all == 0);
     g_decode_host_us.mark("scratch");
 
+    auto * bookkeep_perf = llama_bookkeep_context_bucket(cparams.ctx_type);
+    llama_bookkeep_stage_timer bookkeep_memory(bookkeep_perf ? &bookkeep_perf->memory_init_layout_host_us : nullptr);
     bool did_optimize = false;
 
     // handle any pending shifts/copies
@@ -4637,6 +4782,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         break;
     }
+    bookkeep_memory.next(nullptr);
 
     g_decode_host_us.mark("initbatch");
     // reserve output buffer
@@ -4657,7 +4803,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     if (b1_mode == 0 && (b1_ffn_scratch_active || b1_layer_scratch_active) && turn_ubatch > sched_reserve_tokens) {
         // Eligibility and lending can fail after the memory context was prepared.
         // No views were applied on that path; rebuild them at the safe normal size.
-        mctx = memory->init_batch(*balloc, sched_reserve_tokens, output_all);
+        {
+            llama_bookkeep_stage_timer bookkeep_fallback(bookkeep_perf ? &bookkeep_perf->memory_init_layout_host_us : nullptr);
+            mctx = memory->init_batch(*balloc, sched_reserve_tokens, output_all);
+        }
         if (!mctx || mctx->get_status() != LLAMA_MEMORY_STATUS_SUCCESS) {
             LLAMA_LOG_ERROR("%s: cannot prepare normal chunks after packed B1 fallback\n", __func__);
             return -2;
@@ -6681,7 +6830,21 @@ ggml_status llama_context::graph_compute(ggml_cgraph * gf, bool batched) {
 
     copy_experts.reset();
 
+    auto * perf = llama_bookkeep_context_bucket(cparams.ctx_type);
+    const auto snapshot = [&]() -> std::array<uint64_t, 10> {
+        const auto p = ggml_backend_sched_get_bookkeep_perf(sched.get());
+        return { p.session_host_us, p.transition_host_us, p.input_copy_host_us,
+                 p.user_input_sync_host_us, p.cpu_compute_host_us, p.gpu_compute_host_us,
+                 p.other_compute_host_us, p.cpu_split_calls, p.gpu_split_calls, p.other_split_calls };
+    };
+    const auto before = perf ? snapshot() : std::array<uint64_t, 10>{};
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
+    if (perf) {
+        const auto after = snapshot();
+        for (size_t i = 0; i < before.size(); ++i) {
+            perf->backend_submit[i].fetch_add(after[i] - before[i], std::memory_order_relaxed);
+        }
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }
@@ -8856,6 +9019,37 @@ uint32_t llama_get_sampled_probs_count_ith(llama_context * ctx, int32_t i) {
     ctx->synchronize();
 
     return static_cast<uint32_t>(ctx->get_sampled_probs_count(i));
+}
+
+llama_sampler_output llama_get_sampler_output_ith(llama_context * ctx, int32_t idx) {
+    ctx->synchronize();
+
+    return ctx->get_sampler_output_ith(idx);
+}
+
+llama_bookkeep_context_perf llama_perf_bookkeep_context(const llama_context * ctx) {
+    llama_bookkeep_context_perf result;
+    auto * perf = ctx ? llama_bookkeep_context_bucket(ctx->get_cparams().ctx_type) : nullptr;
+    if (perf) {
+        result.sync_calls      = perf->sync_calls.load(std::memory_order_relaxed);
+        result.sync_host_us    = perf->sync_host_us.load(std::memory_order_relaxed);
+        result.copy_calls      = perf->copy_calls.load(std::memory_order_relaxed);
+        result.copy_bytes      = perf->copy_bytes.load(std::memory_order_relaxed);
+        result.copy_host_us    = perf->copy_host_us.load(std::memory_order_relaxed);
+        result.release_calls   = perf->release_calls.load(std::memory_order_relaxed);
+        result.release_host_us = perf->release_host_us.load(std::memory_order_relaxed);
+        result.memory_init_layout_host_us = perf->memory_init_layout_host_us.load(std::memory_order_relaxed);
+        result.graph_prepare_host_us      = perf->graph_prepare_host_us.load(std::memory_order_relaxed);
+        result.set_inputs_host_us         = perf->set_inputs_host_us.load(std::memory_order_relaxed);
+        result.peer_sync_host_us          = perf->peer_sync_host_us.load(std::memory_order_relaxed);
+        result.graph_submit_host_us       = perf->graph_submit_host_us.load(std::memory_order_relaxed);
+        result.graph_rebuild_calls        = perf->graph_rebuild_calls.load(std::memory_order_relaxed);
+        result.graph_reuse_calls          = perf->graph_reuse_calls.load(std::memory_order_relaxed);
+        for (size_t i = 0; i < perf->backend_submit.size(); ++i) {
+            result.backend_submit[i] = perf->backend_submit[i].load(std::memory_order_relaxed);
+        }
+    }
+    return result;
 }
 
 struct ggml_cgraph * llama_graph_reserve(struct llama_context * ctx,
