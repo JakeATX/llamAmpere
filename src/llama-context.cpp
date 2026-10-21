@@ -3421,7 +3421,8 @@ bool llama_context::mtp_handoff_init() {
     ggml_backend_dev_get_props(model.dev_output(), &props);
     mtp_hidden.ring = !mtp_hidden.enabled && props.type != GGML_BACKEND_DEVICE_TYPE_CPU && props.caps.events &&
         (model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN4EXP) &&
-        model.hparams.n_layer_nextn == 1 && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT &&
+        // the helper head may live in its own GGUF (n_layer_nextn 0 here); the helper checks the row width per call
+        model.hparams.n_layer_nextn <= 1 && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT &&
         model.n_devices() <= 1 && model.split_mode() != LLAMA_SPLIT_MODE_TENSOR;
     LLAMA_LOG_WARN("%s: LLAMA_MTP_B1_HANDOFF=1: per-ubatch device handoff %s (staged %d, cpu %d, events %d, arch ok %d, nextn %u, type %d, devices %d)\n",
             __func__, mtp_hidden.ring ? "on" : "off", (int) mtp_hidden.enabled, (int) (props.type == GGML_BACKEND_DEVICE_TYPE_CPU),
