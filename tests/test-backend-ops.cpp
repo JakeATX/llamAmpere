@@ -13529,6 +13529,28 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(type_a,    GGML_TYPE_F32, 16,  8, 16*256, { 1,  1}, {1, 1}));
     }
 
+    // Complete and partial row blocks in dense MMVQ and indexed expert decode.
+    for (ggml_type type_a : { GGML_TYPE_IQ4_XS, GGML_TYPE_Q5_0, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0,
+                             GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_IQ3_S }) {
+        for (int64_t m : { 31, 32, 33 }) {
+            for (int64_t n : { 1, 2, 3, 4, 5 }) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, m, n, 4096, { 1, 1 }, { 1, 1 }));
+            }
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, m, 1, 4096));
+            test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, GGML_TYPE_F32, 4, 2, false, m, 1, 4096, 3));
+        }
+    }
+
+    for (ggml_type type_a : { GGML_TYPE_Q5_0, GGML_TYPE_Q8_0 }) {
+        for (int64_t rows : { 31, 32, 33 }) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, rows, 1, 256));
+            for (bool use_id : { false, true }) {
+                test_cases.emplace_back(new test_mul_mat_vec_fusion(type_a, GGML_GLU_OP_SWIGLU, 1, rows, 256,
+                    use_id, 4, 2, false, true, true, false, { 1, 1 }));
+            }
+        }
+    }
+
     // Multi-column MMVQ coverage for the Q4_K weight-reuse path and a Q5_K control.
     for (ggml_type type_a : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K }) {
         for (int n = 1; n <= 8; ++n) {
