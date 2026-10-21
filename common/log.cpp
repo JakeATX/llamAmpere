@@ -551,6 +551,15 @@ void common_log_default_callback(enum ggml_log_level level, const char * text, v
     // swap is needed; per-scope policy diagnostics remain at trace verbosity.
     if (level == GGML_LOG_LEVEL_INFO && strncmp(text, "[moe-cache] ", 12) == 0) {
         const char * message = text + 12;
+        if (strncmp(message, "CUDA", 4) == 0) {
+            const char * suffix = message + 4;
+            while (*suffix >= '0' && *suffix <= '9') {
+                ++suffix;
+            }
+            if (suffix != message + 4 && *suffix == ' ') {
+                message = suffix + 1;
+            }
+        }
         static std::atomic<bool> reported_swap{false};
         const bool summary = strncmp(message, "whole swap initial:", 19) == 0 ||
                              strncmp(message, "global profile same-session replan:", 35) == 0 ||
