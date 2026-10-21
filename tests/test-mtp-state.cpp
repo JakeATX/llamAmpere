@@ -86,6 +86,8 @@ static uint64_t check_teacher_batch(const llama_batch_ext & batch, size_t width,
         observe(row, width * sizeof(float));
     }
     return digest;
+}
+
 static void embedding_input_u64(std::vector<uint8_t> & bytes, uint64_t value) {
     for (int j = 0; j < 8; ++j) { bytes.push_back(uint8_t(value >> (8*j))); }
 }

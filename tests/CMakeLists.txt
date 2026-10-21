@@ -219,6 +219,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-mtp-state.cpp)
     llama_build(test-mtp-q5-head.cpp)
     llama_build(test-mtp-qsa-compact.cpp)
+    target_include_directories(test-mtp-qsa-compact PRIVATE ${PROJECT_SOURCE_DIR}/src)
     llama_test(test-mtp-state NAME test-prompt-tail-chunks ARGS --tail-chunks)
 
     set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
