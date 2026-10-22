@@ -2103,7 +2103,7 @@ std::unique_ptr<llama_moe_arena> llama_model_loader::load_moe_arena(llama_progre
         llama_moe_arena_parallel_load(copies, [](size_t done, void * u) {
             auto * p = (progress_state *) u;
             return !p->cb || p->cb(float(p->done0 + done) / p->size_data, p->ud);
-        }, &ps, 7ull << 30, stats);
+        }, &ps, 5ull << 30, stats);
         for (const auto & p : order) {
             auto * t = p.t;
             const size_t bytes = t->nb[2];
@@ -2141,8 +2141,12 @@ std::unique_ptr<llama_moe_arena> llama_model_loader::load_moe_arena(llama_progre
             arena->pin();
             pin_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - late_start).count();
         }
+        if (llama_moe_arena::available_memory() < (5ull << 30)) {
+            throw std::runtime_error("expert arena pinning left less than 5 GiB MemAvailable");
+        }
         if (llama_moe_arena::available_memory() < (7ull << 30)) {
-            throw std::runtime_error("expert arena pinning left less than 7 GiB MemAvailable");
+            LLAMA_LOG_WARN("%s: RAM target missed: %.2f GiB MemAvailable after pinning (target 7 GiB, stop below 5 GiB)\n", __func__,
+                    llama_moe_arena::available_memory() / double(GiB));
         }
         LLAMA_LOG_INFO("%s: %.2f GiB pinned (%s, registration took %.2f s), load+pin %.2f s, gate/up/down grouped by expert, original weight blocks preserved\n",
                 __func__, total / double(GiB), pin_early ? "registered beside the reads" : "registered after the reads", pin_seconds,
@@ -2204,8 +2208,8 @@ std::unique_ptr<llama_moe_arena> llama_model_loader::load_moe_arena(llama_progre
                     posix_fadvise(files.at(w.idx)->file_id(), first, count, POSIX_FADV_DONTNEED);
 #endif
 #endif
-                    if (llama_moe_arena::available_memory() < (7ull << 30)) {
-                        throw std::runtime_error("expert arena stopped: less than 7 GiB MemAvailable");
+                    if (llama_moe_arena::available_memory() < (5ull << 30)) {
+                        throw std::runtime_error("expert arena stopped: less than 5 GiB MemAvailable");
                     }
                 }
             }
@@ -2227,8 +2231,12 @@ std::unique_ptr<llama_moe_arena> llama_model_loader::load_moe_arena(llama_progre
                 (unsigned long long) llama_moe_arena_checksum(arena->data, total), total);
     }
     arena->pin();
+    if (llama_moe_arena::available_memory() < (5ull << 30)) {
+        throw std::runtime_error("expert arena pinning left less than 5 GiB MemAvailable");
+    }
     if (llama_moe_arena::available_memory() < (7ull << 30)) {
-        throw std::runtime_error("expert arena pinning left less than 7 GiB MemAvailable");
+        LLAMA_LOG_WARN("%s: RAM target missed: %.2f GiB MemAvailable after pinning (target 7 GiB, stop below 5 GiB)\n", __func__,
+                llama_moe_arena::available_memory() / double(GiB));
     }
     LLAMA_LOG_INFO("%s: %.2f GiB pinned, gate/up/down grouped by expert, original weight blocks preserved\n", __func__, total / double(GiB));
     return arena;
