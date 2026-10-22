@@ -114,6 +114,7 @@ struct moe_cs_plan_dev {
     unsigned long long counter;            // last job number issued
     unsigned ticket;
     unsigned long long stat_experts, stat_routes, stat_layers;
+    unsigned long long stat_wait_ns, stat_joins;  // card time spent waiting for the host in the join
 };
 static bool g_cs_on = false;
 static moe_cs_job * g_cs_job_h = nullptr;
@@ -231,11 +232,12 @@ static void moe_missjoin_log(const char * when) {
             (void) cudaGetLastError();
         }
         MOE_CACHE_LOG("[moe-cache] cpu split %s: planned_layers=%llu published_layers=%llu cpu_experts=%llu cpu_routes=%llu "
-                "host_jobs=%llu host_experts=%llu host_routes=%llu host_busy_ms=%.1f (phases ms %.1f/%.1f/%.1f/%.1f) host_null_src=%llu card_timeouts=%llu\n",
+                "host_jobs=%llu host_experts=%llu host_routes=%llu host_busy_ms=%.1f (phases ms %.1f/%.1f/%.1f/%.1f) host_null_src=%llu card_timeouts=%llu card_joins=%llu card_wait_us_per_join=%.1f\n",
                 when, plan.stat_layers, g_cs_layers_published.load(std::memory_order_relaxed), plan.stat_experts,
                 plan.stat_routes, host[0], host[1], host[2], host[3] / 1e6, host[5] / 1e6, host[6] / 1e6, host[7] / 1e6,
                 host[8] / 1e6, host[4],
-                g_cs_job_h ? (unsigned long long) g_cs_job_h->gpu_timeouts : 0ull);
+                g_cs_job_h ? (unsigned long long) g_cs_job_h->gpu_timeouts : 0ull, plan.stat_joins,
+                plan.stat_joins ? plan.stat_wait_ns / 1e3 / plan.stat_joins : 0.0);
     }
 }
 
@@ -8889,7 +8891,7 @@ static __global__ void __launch_bounds__(256) moe_hf_plan_fast_kernel(const moe_
         if (mroutes) { atomicAdd(&s_n[2], mroutes); }
     }
     __syncthreads();
-    if (args.cs) {
+    if (args.cs && s_nk[0] && s_nk[1] && s_nk[2]) {
         // fork STRATAGAP: hand the host CPU the experts missing in all three projections, fewest routes first
         // (the CPU pays per route, the link per expert), while that lowers max(CPU time, link time).
         for (int i = tid; i < n_routes; i += blockDim.x) {
@@ -8948,6 +8950,14 @@ static __global__ void __launch_bounds__(256) moe_hf_plan_fast_kernel(const moe_
             plan->stat_routes += (unsigned long long) nr;
         }
         __syncthreads();
+    } else if (args.cs && tid == 0) {
+        args.cs->n_exp = 0;
+        args.cs->n_route = 0;
+        args.cs->seq = 0;
+        args.cs->stat_layers += 1;
+    }
+    if (args.cs) {
+        // mask for the miss passes (and no staging for CPU experts)
         for (int i = tid; i < n_routes; i += blockDim.x) {
             const int e = s_e[i];
             if (e < 0 || e >= n_expert) { continue; }
@@ -9110,7 +9120,7 @@ static __device__ __forceinline__ unsigned long long moe_cs_now_ns() {
 
 // fork STRATAGAP: after the down projection's miss pass, waits for the host job and writes the CPU's down rows
 // into the projection output (those routes were skipped by both card passes). One block per possible CPU route.
-static __global__ void moe_cs_join_kernel(const moe_cs_plan_dev * plan, moe_cs_job * job, const float * out_h,
+static __global__ void moe_cs_join_kernel(moe_cs_plan_dev * plan, moe_cs_job * job, const float * out_h,
         size_t out_stride, char * dst, size_t nb1, size_t nb2, int n_ids, int n_out) {
     const unsigned long long seq = plan->seq;
     const int n_route = plan->n_route;
@@ -9125,6 +9135,10 @@ static __global__ void moe_cs_join_kernel(const moe_cs_plan_dev * plan, moe_cs_j
                 if (blockIdx.x == 0) { job->gpu_timeouts = job->gpu_timeouts + 1; }
                 break;
             }
+        }
+        if (blockIdx.x == 0) {
+            plan->stat_wait_ns += moe_cs_now_ns() - t0;
+            plan->stat_joins += 1;
         }
         __threadfence_system();
     }

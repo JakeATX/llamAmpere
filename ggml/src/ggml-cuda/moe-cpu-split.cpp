@@ -417,20 +417,61 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
     s.rows_down = env_int("GGML_MOE_CPU_SPLIT_ROWS_DOWN", 64, 1, 8192);
     s.spin_ms = env_int("GGML_MOE_CPU_SPLIT_SPIN_MS", 250, 0, 600000);
     for (int p = 0; p < 4; ++p) { s.next[p].store(0); s.fin[p].store(0); }
-    // One thread per physical core except the first (the OS, the desktop and llama's own thread live there).
+    // One thread per physical core, never an SMT sibling, never core 0 (the OS and the desktop) and never the
+    // core of the thread that drives the card: a spinning pool thread sharing a core with it is time-sliced in
+    // scheduler ticks (the first build measured 6 ms per job that way). GGML_CPU_EXPERT_PIN=1 pins llama's main
+    // thread to the second physical core, and so does any single-core affinity of the calling thread; both are
+    // skipped. Threads take the highest cores first, away from ggml's own pinned workers (cores 1.. upward).
     std::vector<int> cores = core_leaders();
-    const int hw_cores = cores.empty() ? (int) std::max(2u, std::thread::hardware_concurrency() / 2) : (int) cores.size();
-    s.threads = env_int("GGML_MOE_CPU_SPLIT_THREADS", std::max(1, hw_cores - 1), 1, 64);
-    const bool pin = env_int("GGML_MOE_CPU_SPLIT_PIN", 1, 0, 1) != 0 && !cores.empty();
-    auto cpu_of = [&](int i) { return pin ? cores[(size_t) (i + 1) % cores.size()] : -1; };
+    std::vector<int> avail;
+    std::string skipped = "0";
+    if (!cores.empty()) {
+        std::vector<char> skip(cores.size(), 0);
+        skip[0] = 1;
+        const char * ep = getenv("GGML_CPU_EXPERT_PIN");
+        if (ep && strcmp(ep, "1") == 0 && cores.size() > 2) { skip[1] = 1; }
+#if defined(__linux__)
+        cpu_set_t mine;
+        if (pthread_getaffinity_np(pthread_self(), sizeof(mine), &mine) == 0 && CPU_COUNT(&mine) <= 2) {
+            // pinned caller: skip the physical core of each CPU it may run on
+            for (int c = 0; c < CPU_SETSIZE; ++c) {
+                if (!CPU_ISSET(c, &mine)) { continue; }
+                int core = -1, pkg = 0;
+                const std::string base = "/sys/devices/system/cpu/cpu" + std::to_string(c) + "/topology/";
+                if (FILE * f = fopen((base + "core_id").c_str(), "r")) { if (fscanf(f, "%d", &core) != 1) { core = -1; } fclose(f); }
+                if (FILE * f = fopen((base + "physical_package_id").c_str(), "r")) { if (fscanf(f, "%d", &pkg) != 1) { pkg = 0; } fclose(f); }
+                for (size_t i = 0; i < cores.size(); ++i) {
+                    int ci = -1, pi = 0;
+                    const std::string bi = "/sys/devices/system/cpu/cpu" + std::to_string(cores[i]) + "/topology/";
+                    if (FILE * f = fopen((bi + "core_id").c_str(), "r")) { if (fscanf(f, "%d", &ci) != 1) { ci = -1; } fclose(f); }
+                    if (FILE * f = fopen((bi + "physical_package_id").c_str(), "r")) { if (fscanf(f, "%d", &pi) != 1) { pi = 0; } fclose(f); }
+                    if (ci == core && pi == pkg) { skip[i] = 1; }
+                }
+            }
+        }
+#endif
+        skipped.clear();
+        for (size_t i = cores.size(); i-- > 0;) {
+            if (!skip[i]) { avail.push_back(cores[i]); }
+        }
+        for (size_t i = 0; i < cores.size(); ++i) {
+            if (skip[i]) { skipped += (skipped.empty() ? "" : ",") + std::to_string(cores[i]); }
+        }
+    }
+    const int hw_free = !avail.empty() ? (int) avail.size() : (int) std::max(1u, std::thread::hardware_concurrency() / 2 - 1);
+    s.threads = env_int("GGML_MOE_CPU_SPLIT_THREADS", hw_free, 1, 64);
+    const bool pin = env_int("GGML_MOE_CPU_SPLIT_PIN", 1, 0, 1) != 0 && !avail.empty();
+    auto cpu_of = [&](int i) { return pin ? avail[(size_t) i % avail.size()] : -1; };
     s.running = true;
     s.workers.emplace_back(leader_main, &s, cpu_of(0));
     for (int i = 1; i < s.threads; ++i) {
         s.workers.emplace_back(worker_main, &s, i, cpu_of(i));
     }
     for (auto & t : s.workers) { t.detach(); }
-    fprintf(stderr, "[moe-cpu-split] pool: %d threads%s, spin %d ms, rows up/gate %d down %d\n", s.threads,
-            pin ? " pinned to one per core from core 1" : "", s.spin_ms, s.rows_ug, s.rows_down);
+    std::string where;
+    for (int i = 0; pin && i < s.threads; ++i) { where += (i ? "," : "") + std::to_string(cpu_of(i)); }
+    fprintf(stderr, "[moe-cpu-split] pool: %d threads, %s%s (skipped cores at cpus %s), spin %d ms, rows up/gate %d down %d\n",
+            s.threads, pin ? "pinned to cpus " : "unpinned", where.c_str(), skipped.c_str(), s.spin_ms, s.rows_ug, s.rows_down);
     return true;
 }
 
@@ -542,6 +583,8 @@ bool moe_cs_probe(double * route_ns, double * fixed_ns) {
         }
         return best;
     };
+    const double t0 = run(0);   // empty jobs: the host-side handshake alone
+    for (int p = 0; p < 4; ++p) { s.phase_ns[p] = 0; }
     const double t1 = run(1);
     unsigned long long ph1[4];
     for (int p = 0; p < 4; ++p) { ph1[p] = s.phase_ns[p] / 24; s.phase_ns[p] = 0; }
@@ -555,9 +598,9 @@ bool moe_cs_probe(double * route_ns, double * fixed_ns) {
     *route_ns = per;
     *fixed_ns = std::max(0.0, t1 - per);
     // the probe's jobs count as work in the statistics; clear them
-    s.st_jobs = 0; s.st_experts = 0; s.st_routes = 0; s.st_busy_ns = 0;
-    fprintf(stderr, "[moe-cpu-split] probe on layer %d: 1 expert %.1f us, 4 experts %.1f us -> %.1f us per (expert, route) + %.1f us per job\n",
-            layer, t1 / 1000.0, t4 / 1000.0, per / 1000.0, *fixed_ns / 1000.0);
+    s.st_jobs = 0; s.st_experts = 0; s.st_routes = 0; s.st_busy_ns = 0; s.st_null = 0;
+    fprintf(stderr, "[moe-cpu-split] probe on layer %d: empty job %.1f us, 1 expert %.1f us, 4 experts %.1f us -> %.1f us per (expert, route) + %.1f us per job\n",
+            layer, t0 / 1000.0, t1 / 1000.0, t4 / 1000.0, per / 1000.0, *fixed_ns / 1000.0);
     return true;
 }
 
