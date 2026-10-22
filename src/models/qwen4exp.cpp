@@ -2334,7 +2334,15 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
     {
         ggml_tensor * ple = model.per_layer_tok_embd;
 
-        const bool prefetch = model.can_prefetch.count(ple);
+        // [RTPORT] LLAMA_PLE_PREFETCH_MIN_ROWS=N (default 0 = always): skip the page prefetch for calls gathering fewer
+        // than N rows. A check or guess batch gathers 16 rows per token, one madvise(MADV_WILLNEED) system call each
+        // (~250 us per 5-token check on resident pages, card idle meanwhile). The prefetch is only advice to the
+        // kernel: the gather reads the same bytes either way.
+        static const size_t min_rows = [] {
+            const char * v = getenv("LLAMA_PLE_PREFETCH_MIN_ROWS");
+            return v ? (size_t) std::max(0, atoi(v)) : (size_t) 0;
+        }();
+        const bool prefetch = model.can_prefetch.count(ple) && idx.size() >= min_rows;
         // [PLEPF] the context already reads this call's pages ahead: wait for this ubatch's instead
         const bool covered = pf && pf->consume((uint32_t) n_tokens, idx.data(), idx.size());
         if (prefetch && !covered) {
