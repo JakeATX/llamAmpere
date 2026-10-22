@@ -4228,6 +4228,13 @@ static int ggml_cpu_try_fuse_ops(
 
     struct ggml_tensor * node = cgraph->nodes[node_n];
 
+    // Fused helpers call the op bodies directly, so they would miss ggml_compute_forward's empty-tensor skip.
+    // A zero-token expert matmul (a ubatch with no output rows, e.g. llama-perplexity's unscored first half)
+    // then tripped the mul_mat_id dst stride assert (nb2 <= nb3 with ne2 == 0).
+    if (ggml_is_empty(node)) {
+        return 0;
+    }
+
     if (node->op == GGML_OP_MUL_MAT_ID) {
         const int fused = ggml_cpu_try_fuse_moe_cache(cgraph, node_n, params);
         if (fused > 0) {
