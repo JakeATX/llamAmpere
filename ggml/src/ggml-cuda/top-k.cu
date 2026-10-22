@@ -447,6 +447,114 @@ static __global__ void __launch_bounds__(BLOCK) topk_select_rows(const float * _
     }
 }
 
+// [ROUNDFIX] same output as topk_select_rows (the k-th largest key by three digit passes, then every index above it
+// and the lowest-index ties, in index order), faster for one wide row (the QSA pool select runs one row of n_ctx/4):
+//  - 1024 threads, and lanes of a warp that hit the same bin add once (__match_any_sync), so the shared histogram
+//    is not serialized on the few bins the leading digits of similar scores fall into;
+//  - the final pass gives each warp one contiguous segment: count, one block scan, write with warp ballots. Index
+//    order is kept because segments are in warp order. GGML_CUDA_TOPK_SELECT_FAST=1 (needs the select path above).
+template <int BLOCK>
+static __global__ void __launch_bounds__(BLOCK) topk_select_rows_fast(const float * __restrict__ src, int * __restrict__ dst,
+                                                                      const int ncols, const int k) {
+    constexpr int BPT = TOPK_SEL_BINS / BLOCK;
+    static_assert(BPT >= 1 && TOPK_SEL_BINS % BLOCK == 0, "bad block");
+    __shared__ int hist[TOPK_SEL_BINS];
+    __shared__ int s_warp[BLOCK/32];
+    __shared__ int s_digit;
+    __shared__ int s_rank;
+
+    const int     tid  = threadIdx.x;
+    const int     lane = tid & 31;
+    const float * row  = src + (size_t) blockIdx.x * ncols;
+    int *         out  = dst + (size_t) blockIdx.x * k;
+
+    uint32_t prefix = 0;
+    uint32_t pmask  = 0;
+    int      rank   = k;
+
+#pragma unroll 1
+    for (int pass = 0; pass < 3; ++pass) {
+        const int      shift = pass == 0 ? 21 : (pass == 1 ? 10 : 0);
+        const uint32_t dmask = pass == 2 ? 0x3FFu : 0x7FFu;
+        for (int i = tid; i < TOPK_SEL_BINS; i += BLOCK) {
+            hist[i] = 0;
+        }
+        __syncthreads();
+        for (int base = 0; base < ncols; base += BLOCK) {
+            const int      c     = base + tid;
+            const uint32_t key   = c < ncols ? topk_sel_key(row[c]) : 0u;
+            const bool     valid = c < ncols && (key & pmask) == prefix;
+            const uint32_t bin   = valid ? (key >> shift) & dmask : 0xFFFFFFFFu;
+            const uint32_t peers = __match_any_sync(0xFFFFFFFFu, bin);
+            if (valid && lane == __ffs(peers) - 1) {
+                atomicAdd(&hist[bin], __popc(peers));
+            }
+        }
+        __syncthreads();
+
+        int own = 0;
+#pragma unroll
+        for (int j = 0; j < BPT; ++j) {
+            own += hist[TOPK_SEL_BINS - 1 - BPT*tid - j];
+        }
+        int total;
+        int above = topk_sel_scan<BLOCK>(own, s_warp, &total);
+#pragma unroll
+        for (int j = 0; j < BPT; ++j) {
+            const int b = TOPK_SEL_BINS - 1 - BPT*tid - j;
+            const int h = hist[b];
+            if (above < rank && above + h >= rank) {
+                s_digit = b;
+                s_rank  = rank - above;
+            }
+            above += h;
+        }
+        __syncthreads();
+        prefix |= (uint32_t) s_digit << shift;
+        pmask  |= dmask << shift;
+        rank    = s_rank;
+        __syncthreads();
+    }
+
+    // each warp owns one contiguous segment and reads it 32 columns at a time (coalesced); lanes find their place
+    // inside the warp with a ballot, warps with one block scan of the per-warp counts
+    const int n_gt_want = k - rank;
+    const int warp      = tid >> 5;
+    const int seg       = (((ncols + BLOCK/32 - 1) / (BLOCK/32)) + 31) & ~31;
+    const int c0        = min(ncols, warp*seg);
+    const int c1        = min(ncols, c0 + seg);
+    const unsigned lt   = (1u << lane) - 1u;
+    int n_gt = 0;
+    int n_eq = 0;
+    for (int c = c0 + lane; c - lane < c1; c += 32) {
+        const uint32_t key = c < c1 ? topk_sel_key(row[c]) : 0u;
+        n_gt += __popc(__ballot_sync(0xFFFFFFFFu, c < c1 && key > prefix));
+        n_eq += __popc(__ballot_sync(0xFFFFFFFFu, c < c1 && key == prefix));
+    }
+    // the scan wants one value per thread: lane 0 carries the warp count
+    int total;
+    int gt_off = topk_sel_scan<BLOCK>(lane == 0 ? n_gt : 0, s_warp, &total);
+    int eq_off = topk_sel_scan<BLOCK>(lane == 0 ? n_eq : 0, s_warp, &total);
+    gt_off = __shfl_sync(0xFFFFFFFFu, gt_off, 0);
+    eq_off = __shfl_sync(0xFFFFFFFFu, eq_off, 0);
+    for (int c = c0 + lane; c - lane < c1 && (n_gt > 0 || eq_off < rank); c += 32) {
+        const uint32_t key = c < c1 ? topk_sel_key(row[c]) : 0u;
+        const unsigned bg  = __ballot_sync(0xFFFFFFFFu, c < c1 && key > prefix);
+        const unsigned be  = __ballot_sync(0xFFFFFFFFu, c < c1 && key == prefix);
+        if (c < c1 && key > prefix) {
+            out[gt_off + __popc(bg & lt)] = c;
+        } else if (c < c1 && key == prefix) {
+            const int e = eq_off + __popc(be & lt);
+            if (e < rank) {
+                out[n_gt_want + e] = c;
+            }
+        }
+        gt_off += __popc(bg);
+        n_gt   -= __popc(bg);
+        eq_off += __popc(be);
+    }
+}
+
 static __device__ __forceinline__ unsigned long long topk_sel_mix(unsigned long long x) {
     x += 0x9e3779b97f4a7c15ull;
     x  = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ull;
@@ -564,7 +672,15 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     }();
     if (select_mode > 0 && ncols > 1024 && k >= 64 && k <= ncols && nrows <= INT_MAX &&
             (select_mode == 3 || !ggml_cuda_top_k_tiled_fits(ncols, k))) {
-        topk_select_rows<TOPK_SEL_BLOCK><<<nrows, TOPK_SEL_BLOCK, 0, stream>>>(src0_d, dst_d, ncols, k);
+        static const bool select_fast = [] {
+            const char * value = getenv("GGML_CUDA_TOPK_SELECT_FAST");
+            return value != nullptr && atoi(value) != 0;
+        }();
+        if (select_fast) {
+            topk_select_rows_fast<1024><<<nrows, 1024, 0, stream>>>(src0_d, dst_d, ncols, k);
+        } else {
+            topk_select_rows<TOPK_SEL_BLOCK><<<nrows, TOPK_SEL_BLOCK, 0, stream>>>(src0_d, dst_d, ncols, k);
+        }
         CUDA_CHECK(cudaGetLastError());
         if (select_mode == 2) {
             static unsigned long long n_calls = 0, n_diff_total = 0, n_rows_total = 0;
