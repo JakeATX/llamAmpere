@@ -9206,6 +9206,275 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
+// [VSHX] GGML_CUDA_SHEXP_SIDE=1 (default off): the shared expert of a MoE layer runs on a second stream while the
+// router, the routed experts and the hit-first miss copies run on the main one. Strata runs its shared expert on a
+// side stream the same way (verify.cpp, the shared-expert side launch).
+//  - graph_optimize moves the shared expert's own nodes (the nodes only the "ffn_shexp-<il>" tensor depends on) up
+//    to just after their input, and keeps them allocated until their first outside reader, so nothing the main
+//    stream allocates while they run can be placed over them.
+//  - graph_compute forks the second stream at the first moved node and joins it right after the layer's
+//    "ffn_moe_out-<il>" (or at the first outside reader). Only for small batches (<= 16 rows); larger ones run the
+//    moved nodes in order on the main stream.
+// Same kernels on the same inputs in the same order within each stream: the output is bit-identical.
+static bool ggml_cuda_shexp_side_enabled() {
+    static const bool on = [] { const char * e = getenv("GGML_CUDA_SHEXP_SIDE"); return e != nullptr && atoi(e) != 0; }();
+    return on;
+}
+static bool ggml_cuda_shexp_side_debug() {
+    static const bool on = [] { const char * e = getenv("GGML_CUDA_SHEXP_SIDE_DEBUG"); return e != nullptr && atoi(e) != 0; }();
+    return on;
+}
+
+struct ggml_cuda_shexp_chain {
+    std::vector<int> nodes;       // graph indices, ascending; the last one is the ffn_shexp tensor
+    int insert_at = -1;           // first index after every node the chain reads from outside
+    int first_use = -1;           // first node outside the chain that reads the chain's output
+    std::vector<const ggml_tensor *> ext;  // the graph nodes the chain reads from outside
+};
+
+static void ggml_cuda_shexp_uses(const ggml_cgraph * g, std::unordered_map<const ggml_tensor *, int> & idx,
+                                 std::unordered_map<const ggml_tensor *, int> & n_use) {
+    idx.clear();
+    n_use.clear();
+    for (int i = 0; i < g->n_nodes; ++i) {
+        const ggml_tensor * t = g->nodes[i];
+        idx[t] = i;
+        if (t->op == GGML_OP_NONE) {
+            continue;  // the scheduler's allocation-dependency nodes (and graph_optimize's own) read nothing
+        }
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            if (t->src[s]) {
+                n_use[t->src[s]]++;
+            }
+        }
+    }
+}
+
+// the chain of node d (the ffn_shexp tensor): d and every earlier node whose readers are all in the chain
+static bool ggml_cuda_shexp_chain_find(const ggml_cgraph * g, int d, const std::unordered_map<const ggml_tensor *, int> & idx,
+                                       const std::unordered_map<const ggml_tensor *, int> & n_use, ggml_cuda_shexp_chain & c) {
+    c = ggml_cuda_shexp_chain();
+    const ggml_tensor * D = g->nodes[d];
+    if ((D->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_cuda_is_view_or_noop(D) || D->view_src != nullptr) {
+        return false;
+    }
+    std::unordered_map<const ggml_tensor *, int> inner;  // reads from inside the chain
+    std::unordered_set<const ggml_tensor *> in_chain;
+    const auto take = [&](const ggml_tensor * t) {
+        in_chain.insert(t);
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            if (t->src[s]) {
+                inner[t->src[s]]++;
+            }
+        }
+    };
+    std::vector<int> rev = { d };
+    take(D);
+    for (int k = d - 1; k >= 0 && k >= d - 64; --k) {
+        const ggml_tensor * t = g->nodes[k];
+        const auto it = inner.find(t);
+        if (it == inner.end()) {
+            continue;
+        }
+        const auto u = n_use.find(t);
+        if (u == n_use.end() || u->second != it->second || (t->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            continue;  // read outside the chain too: an input of the chain, not part of it
+        }
+        if (t->view_src != nullptr && !ggml_cuda_is_view_or_noop(t)) {
+            return false;  // writes in place into another tensor
+        }
+        rev.push_back(k);
+        take(t);
+    }
+    c.nodes.assign(rev.rbegin(), rev.rend());
+    bool has_mm = false;
+    for (const int k : c.nodes) {
+        const ggml_tensor * t = g->nodes[k];
+        has_mm = has_mm || t->op == GGML_OP_MUL_MAT;
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            const ggml_tensor * src = t->src[s];
+            if (src == nullptr || in_chain.count(src)) {
+                continue;
+            }
+            for (const ggml_tensor * x : { src, (const ggml_tensor *) src->view_src }) {
+                if (x == nullptr) {
+                    continue;
+                }
+                const auto xi = idx.find(x);
+                if (xi != idx.end()) {
+                    c.insert_at = std::max(c.insert_at, xi->second + 1);
+                    if (std::find(c.ext.begin(), c.ext.end(), x) == c.ext.end()) {
+                        c.ext.push_back(x);
+                    }
+                }
+            }
+        }
+    }
+    if (!has_mm || c.insert_at < 0) {
+        return false;
+    }
+    for (int k = d + 1; k < g->n_nodes && c.first_use < 0; ++k) {
+        const ggml_tensor * t = g->nodes[k];
+        if (t->op == GGML_OP_NONE) {
+            continue;
+        }
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            if (t->src[s] == D || (t->src[s] && t->src[s]->view_src == D)) {
+                c.first_use = k;
+                break;
+            }
+        }
+    }
+    if (c.first_use < 0) {
+        return false;
+    }
+    // a node the chain now runs ahead of must not write in place into what the chain reads
+    for (int k = c.insert_at; k < d; ++k) {
+        const ggml_tensor * t = g->nodes[k];
+        if (in_chain.count(t) || ggml_cuda_is_view_or_noop(t) || t->view_src == nullptr) {
+            continue;
+        }
+        if (std::find(c.ext.begin(), c.ext.end(), t->view_src) != c.ext.end()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool ggml_cuda_shexp_is_down(const ggml_tensor * t) {
+    return t->op != GGML_OP_NONE && strncmp(t->name, "ffn_shexp-", 10) == 0;
+}
+
+// graph_optimize: move every shared-expert chain up to its insert point and extend its lifetime (see [VSHX] above)
+static void ggml_cuda_shexp_side_optimize(ggml_cgraph * g, ggml_backend_graph_optimize_params * params) {
+    std::unordered_map<const ggml_tensor *, int> idx, n_use;
+    ggml_cuda_shexp_uses(g, idx, n_use);
+    int n_moved = 0, n_found = 0;
+    for (int d = 0; d < g->n_nodes; ++d) {
+        if (!ggml_cuda_shexp_is_down(g->nodes[d])) {
+            continue;
+        }
+        ggml_cuda_shexp_chain c;
+        if (!ggml_cuda_shexp_chain_find(g, d, idx, n_use, c)) {
+            if (ggml_cuda_shexp_side_debug()) {
+                GGML_LOG_WARN("[shexp side] %s: no movable chain\n", g->nodes[d]->name);
+            }
+            continue;
+        }
+        ++n_found;
+        ggml_tensor * until = g->nodes[c.first_use];
+        std::vector<ggml_tensor *> members;
+        for (const int j : c.nodes) {
+            members.push_back(g->nodes[j]);
+        }
+        if (c.insert_at < c.nodes.front()) {
+            // stable move: [insert_at, d] becomes chain nodes then the others, each in their old order
+            std::vector<ggml_tensor *> chain, rest;
+            size_t ci = 0;
+            for (int k = c.insert_at; k <= d; ++k) {
+                if (ci < c.nodes.size() && c.nodes[ci] == k) {
+                    chain.push_back(g->nodes[k]);
+                    ++ci;
+                } else {
+                    rest.push_back(g->nodes[k]);
+                }
+            }
+            int k = c.insert_at;
+            for (ggml_tensor * t : chain) { g->nodes[k++] = t; }
+            for (ggml_tensor * t : rest)  { g->nodes[k++] = t; }
+            for (int j = c.insert_at; j <= d; ++j) {
+                idx[g->nodes[j]] = j;
+            }
+            ++n_moved;
+            if (ggml_cuda_shexp_side_debug() && n_moved == 1) {
+                std::string ops;
+                for (int j = std::max(0, c.insert_at - 3); j < std::min(g->n_nodes, c.insert_at + (int) chain.size() + 4); ++j) {
+                    ops += j == c.insert_at ? " [" : " ";
+                    ops += ggml_op_desc(g->nodes[j]);
+                    ops += "(";
+                    ops += g->nodes[j]->name;
+                    ops += j == c.insert_at + (int) chain.size() - 1 ? ")]" : ")";
+                }
+                GGML_LOG_WARN("[shexp side] moved %zu nodes of %s to %d:%s\n", chain.size(), g->nodes[d]->name, c.insert_at, ops.c_str());
+            }
+        }
+        // keep the chain's nodes and inputs allocated until the first outside reader
+        for (ggml_tensor * t : members) {
+            params->add_alloc_dep(params->user_data, t, until);
+        }
+        for (const ggml_tensor * x : c.ext) {
+            params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(x), until);
+        }
+    }
+    if (ggml_cuda_shexp_side_debug()) {
+        static int n_log = 0;
+        if (n_log++ < 4) {
+            GGML_LOG_WARN("[shexp side] graph of %d nodes: %d chains, %d moved\n", g->n_nodes, n_found, n_moved);
+        }
+    }
+}
+
+struct ggml_cuda_shexp_side_run {
+    int begin, end;   // chain nodes, contiguous [begin, end]
+    int join_at;      // the main stream waits for the side stream before node join_at
+    int first_use;
+};
+
+// graph_compute: the chains in their final (moved) place, for batches the side stream applies to
+static void ggml_cuda_shexp_side_plan(const ggml_cgraph * g, std::vector<ggml_cuda_shexp_side_run> & runs) {
+    runs.clear();
+    bool any = false;
+    for (int d = 0; d < g->n_nodes && !any; ++d) {
+        any = ggml_cuda_shexp_is_down(g->nodes[d]);
+    }
+    if (!any) {
+        return;
+    }
+    std::unordered_map<const ggml_tensor *, int> idx, n_use;
+    ggml_cuda_shexp_uses(g, idx, n_use);
+    int n_refused = 0;
+    for (int d = 0; d < g->n_nodes; ++d) {
+        const ggml_tensor * D = g->nodes[d];
+        if (!ggml_cuda_shexp_is_down(D)) {
+            continue;
+        }
+        ggml_cuda_shexp_chain c;
+        if (D->ne[1] > 16 || !ggml_cuda_shexp_chain_find(g, d, idx, n_use, c) ||
+                c.nodes.back() - c.nodes.front() + 1 != (int) c.nodes.size() || c.insert_at != c.nodes.front() ||
+                (!runs.empty() && runs.back().first_use >= c.nodes.front())) {
+            ++n_refused;
+            continue;
+        }
+        ggml_cuda_shexp_side_run r = { c.nodes.front(), d, c.first_use, c.first_use };
+        // join after the routed experts' output of the same layer, if it comes before the first reader
+        const char * il = D->name + 10;
+        char want[GGML_MAX_NAME];
+        snprintf(want, sizeof(want), "ffn_moe_out-%s", il);
+        for (int k = c.first_use - 1; k > d; --k) {
+            if (strcmp(g->nodes[k]->name, want) == 0) {
+                r.join_at = k + 1;
+                break;
+            }
+        }
+        runs.push_back(r);
+    }
+    if (ggml_cuda_shexp_side_debug()) {
+        static int n_log = 0;
+        if (n_log++ < 4) {
+            GGML_LOG_WARN("[shexp side] compute: %zu side runs, %d refused%s\n", runs.size(), n_refused,
+                          runs.empty() ? "" : (runs[0].join_at < runs[0].first_use ? ", join after ffn_moe_out" : ", join at first reader"));
+        }
+    }
+}
+
+static cudaEvent_t ggml_cuda_shexp_side_event(int device, int which) {
+    static cudaEvent_t ev[GGML_CUDA_MAX_DEVICES][2] = {};
+    if (ev[device][which] == nullptr) {
+        CUDA_CHECK(cudaEventCreateWithFlags(&ev[device][which], cudaEventDisableTiming));
+    }
+    return ev[device][which];
+}
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, uint64_t graph_key) {
     bool graph_evaluated_or_captured = false;
 
@@ -9331,6 +9600,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 ggml_cuda_conv_ring_plan(cuda_ctx, cgraph, conv_ring_skip);
                 ggml_cuda_lid_gather_plan(cuda_ctx, cgraph, lid_gather_skip);
             }
+            // [VSHX] shared-expert chains that run on the side stream (ggml_cuda_shexp_side_plan)
+            std::vector<ggml_cuda_shexp_side_run> shexp_runs;
+            if (ggml_cuda_shexp_side_enabled() && !should_launch_concurrent_events && stream_ctx.concurrent_events.empty() &&
+                    cuda_ctx->curr_stream_no == 0) {
+                ggml_cuda_shexp_side_plan(cgraph, shexp_runs);
+            }
+            size_t shexp_next  = 0;
+            int    shexp_state = 0;  // 0: main stream, 1: launching a chain on the side stream, 2: waiting to join
+            const ggml_cuda_shexp_side_run * shexp_cur = nullptr;
 
             g_hc_pre_xn_pending.clear();
             ggml_cuda_autofuse_plan * autofuse = ggml_cuda_autofuse_enabled() && !ggml_cuda_fusion_disabled() && stream_ctx.concurrent_events.empty() ?
@@ -9365,6 +9643,30 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     if (is_concurrent_event_active) {
                         cuda_ctx->curr_stream_no = concurrent_event->stream_mapping[node];
                         GGML_LOG_DEBUG("Setting stream no to %d for node %s\n", cuda_ctx->curr_stream_no, node->name);
+                    }
+                }
+
+                if (!shexp_runs.empty()) {
+                    const int dev = cuda_ctx->device;
+                    if (shexp_state == 1 && i > shexp_cur->end) {
+                        // the previous launch covered [prev_i, i - 1]: it must not reach past the chain
+                        GGML_ASSERT(i - 1 == shexp_cur->end && "GGML_CUDA_SHEXP_SIDE: a fused launch crossed the end of a shared-expert chain");
+                        CUDA_CHECK(cudaEventRecord(ggml_cuda_shexp_side_event(dev, 1), cuda_ctx->stream(dev, 1)));
+                        cuda_ctx->curr_stream_no = 0;
+                        shexp_state = 2;
+                    }
+                    if (shexp_state == 2 && i >= shexp_cur->join_at) {
+                        GGML_ASSERT(i - 1 < shexp_cur->first_use && "GGML_CUDA_SHEXP_SIDE: the shared-expert output was read before the join");
+                        CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), ggml_cuda_shexp_side_event(dev, 1), 0));
+                        shexp_state = 0;
+                    }
+                    if (shexp_state == 0 && shexp_next < shexp_runs.size() && i >= shexp_runs[shexp_next].begin) {
+                        shexp_cur = &shexp_runs[shexp_next++];
+                        GGML_ASSERT(i == shexp_cur->begin && "GGML_CUDA_SHEXP_SIDE: a fused launch crossed the start of a shared-expert chain");
+                        CUDA_CHECK(cudaEventRecord(ggml_cuda_shexp_side_event(dev, 0), cuda_ctx->stream()));
+                        CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(dev, 1), ggml_cuda_shexp_side_event(dev, 0), 0));
+                        cuda_ctx->curr_stream_no = 1;
+                        shexp_state = 1;
                     }
                 }
 
@@ -9460,6 +9762,16 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
                }
+            }
+            // [VSHX] a chain or a join still open at the end of the graph
+            if (shexp_state != 0) {
+                const int dev = cuda_ctx->device;
+                if (shexp_state == 1) {
+                    CUDA_CHECK(cudaEventRecord(ggml_cuda_shexp_side_event(dev, 1), cuda_ctx->stream(dev, 1)));
+                    cuda_ctx->curr_stream_no = 0;
+                }
+                CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), ggml_cuda_shexp_side_event(dev, 1), 0));
+                shexp_state = 0;
             }
             // [HCPN] every queued hc_pre must have run: its xn was never written
             GGML_ASSERT(g_hc_pre_xn_pending.empty() && "GGML_CUDA_HC_PRE_XN: a queued hc_pre was not reached");
@@ -9677,6 +9989,12 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             }
         }
     };
+
+    // [VSHX] shared expert on the side stream: move its chains up (ahead of the fusion matchers, which then see the
+    // final order); not combined with the generic concurrent streams of GGML_CUDA_GRAPH_OPT
+    if (ggml_cuda_shexp_side_enabled() && !(getenv("GGML_CUDA_GRAPH_OPT") && atoi(getenv("GGML_CUDA_GRAPH_OPT")) == 1)) {
+        ggml_cuda_shexp_side_optimize(cgraph, params);
+    }
 
     if (!disable_fusion) {
         // add alloc deps for performance positive fusions. This may increase the overall compute buffer size.
