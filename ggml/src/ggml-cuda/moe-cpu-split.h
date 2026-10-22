@@ -50,4 +50,8 @@ bool moe_cs_bench(int layer, const int * experts, int n_list, int n_exp, int rep
         double phase_ns[4]);
 // Statistics: [0] jobs, [1] experts, [2] routes, [3] busy ns, [4] null-source errors, [5..8] ns per phase.
 void moe_cs_stats(unsigned long long out[9]);
+// Tests: the pool's IQ row kernel (moe-iq-rows.h) for `type` and nt = 1..4 tokens on rows [r0, r1): out[t][r - r0].
+// y[t] are Q8_K rows. False when the build or the type has none.
+bool moe_cs_iq_rows(int type, int nt, const void * w, size_t row_bytes, int64_t r0, int64_t r1, int64_t n_in,
+        const void * const * y, float * const * out, int prefetch);
 int moe_cs_threads();

@@ -15,6 +15,7 @@
 #define GGML_COMMON_DECL_CPP
 #define GGML_COMMON_IMPL_CPP   // the IQ grids, for the AVX-512 dot loops below
 #include "../ggml-common.h"
+#include "moe-iq-rows.h"
 
 #include <algorithm>
 #include <atomic>
@@ -372,6 +373,9 @@ struct role_math {
     ggml_type vec_type = GGML_TYPE_COUNT;
     ggml_from_float_t quant = nullptr;
     size_t vec_bytes = 0;       // bytes of one quantized input row
+#if defined(MOE_IQ_ROWS)
+    moe_iq::rows_fn rows[5] = {};   // GGML_MOE_CPU_SPLIT_ROWS: row kernel for 1..4 tokens (IQ up/gate types)
+#endif
 };
 
 struct layer_math {
@@ -410,6 +414,8 @@ struct pool_state {
     size_t aux_stride = 0;     // floats per route in hq_aux: n/32 block scales, then n/64 offsets
     std::vector<float> hq_aux;
     int rows_ug = 16, rows_down = 64;
+    bool iq_rows = false;      // GGML_MOE_CPU_SPLIT_ROWS: moe-iq-rows.h kernels, each chunk decoded once per expert
+    int iq_pf = 0;             // GGML_MOE_CPU_SPLIT_PF: prefetch distance of those kernels in bytes (0 = off)
 
     alignas(64) std::atomic<unsigned long long> gen{0};
     alignas(64) std::atomic<int> next[4];
@@ -473,6 +479,43 @@ void run_item(pool_state & s, int phase, int item) {
         const int64_t r0 = (int64_t) (item % blocks) * s.rows_ug, r1 = std::min<int64_t>(r0 + s.rows_ug, up.r.n_out);
         const int e = s.expert[i];
         const size_t xg = L.shared_input ? 0 : (size_t) MOE_CS_MAX_ROUTES;
+#if defined(MOE_IQ_ROWS)
+        if (up.rows[1] && gate.rows[1]) {
+            // every chunk decoded once for up to 4 of the expert's tokens; same bits as the vec_dot loop below
+            const char * wu = role_row(s, up, e, 0);
+            const char * wg = role_row(s, gate, e, 0);
+            const int nb = (int) (up.r.n_in / QK_K);
+            for (int q0 = s.first[i]; q0 < s.first[i + 1]; q0 += 4) {
+                const int nt = std::min(4, s.first[i + 1] - q0);
+                const block_q8_K * yu[4];
+                const block_q8_K * yg[4];
+                for (int t = 0; t < nt; ++t) {
+                    yu[t] = (const block_q8_K *) (s.xq.data() + (size_t) (q0 + t) * s.xq_stride);
+                    yg[t] = (const block_q8_K *) (s.xq.data() + (xg + q0 + t) * s.xq_stride);
+                }
+                for (int64_t a = r0; a < r1; a += 16) {
+                    const int64_t b = std::min<int64_t>(a + 16, r1);
+                    float ub[4][16], gb[4][16];
+                    float * uo[4] = { ub[0], ub[1], ub[2], ub[3] };
+                    float * go[4] = { gb[0], gb[1], gb[2], gb[3] };
+                    if (wu && wg) {
+                        up.rows[nt](wu, up.r.row_bytes, a, b, nb, yu, uo, s.iq_pf);
+                        gate.rows[nt](wg, gate.r.row_bytes, a, b, nb, yg, go, s.iq_pf);
+                    } else {
+                        for (int t = 0; t < nt; ++t) { for (int k = 0; k < 16; ++k) { ub[t][k] = 0.0f; gb[t][k] = 0.0f; } }
+                    }
+                    for (int t = 0; t < nt; ++t) {
+                        for (int64_t row = a; row < b; ++row) {
+                            const float u = ub[t][row - a], g = gb[t][row - a];
+                            s.hidden[(size_t) (q0 + t) * s.max_ff + row] = g / (1.0f + expf(-g)) * u;
+                        }
+                    }
+                }
+            }
+            if (!wu || !wg) { s.st_null.fetch_add(1, std::memory_order_relaxed); }
+            return;
+        }
+#endif
         for (int64_t row = r0; row < r1; ++row) {
             const char * wu = role_row(s, up, e, row);
             const char * wg = role_row(s, gate, e, row);
@@ -715,6 +758,10 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
     s.hq_aux.assign(MOE_CS_MAX_ROUTES * s.aux_stride, 0.0f);
     s.rows_ug = env_int("GGML_MOE_CPU_SPLIT_ROWS_UG", 16, 1, 4096);
     s.rows_down = env_int("GGML_MOE_CPU_SPLIT_ROWS_DOWN", 64, 1, 8192);
+#if defined(MOE_IQ_ROWS)
+    s.iq_rows = env_int("GGML_MOE_CPU_SPLIT_ROWS", 0, 0, 1) != 0;
+    s.iq_pf = env_int("GGML_MOE_CPU_SPLIT_PF", 0, 0, 1 << 16);
+#endif
     s.spin_ms = env_int("GGML_MOE_CPU_SPLIT_SPIN_MS", 250, 0, 600000);
     s.spin_us = env_int("GGML_MOE_CPU_SPLIT_SPIN_US", s.spin_ms * 1000, 0, 600000000);
     s.nap_us = env_int("GGML_MOE_CPU_SPLIT_NAP_US", 1000, 1, 100000);
@@ -798,6 +845,7 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
     fprintf(stderr, "[moe-cpu-split] pool: %d threads, %s%s (skipped cores at cpus %s), spin %d us, nap %d us, rows up/gate %d down %d%s%s%s\n",
             s.threads, pin ? "pinned to cpus " : "unpinned", where.c_str(), skipped.c_str(), s.spin_us, s.nap_us, s.rows_ug, s.rows_down,
             s.q2_fast ? ", Q2_0 down fast path" : "", smt ? ", SMT siblings" : "", s.avx512 ? ", AVX-512 VNNI IQ dots" : "");
+    if (s.iq_rows) { fprintf(stderr, "[moe-cpu-split] IQ up/gate row kernels (each chunk decoded once per expert), prefetch %d B\n", s.iq_pf); }
     return true;
 }
 
@@ -832,6 +880,11 @@ bool moe_cs_register_layer(int layer, const moe_cs_role roles[3]) {
         if (s.avx512 && t == GGML_TYPE_IQ3_XXS) { m.dot = dot_iq3_xxs_q8_K_512; }
 #endif
         m.vec_type = tr->vec_dot_type;
+#if defined(MOE_IQ_ROWS)
+        for (int nt = 1; nt <= 4; ++nt) {
+            m.rows[nt] = s.iq_rows && !s.avx512 && k < 2 && m.vec_type == GGML_TYPE_Q8_K ? moe_iq::get(m.r.type, nt) : nullptr;
+        }
+#endif
         const auto * vt = ggml_get_type_traits_cpu(m.vec_type);
         m.quant = vt ? vt->from_float : nullptr;
         ok = m.quant && m.r.n_in % ggml_blck_size(m.vec_type) == 0 &&
@@ -976,4 +1029,17 @@ void moe_cs_stats(unsigned long long out[9]) {
     out[2] = s.st_routes.load();
     out[3] = s.st_busy_ns.load();
     out[4] = s.st_null.load();
+}
+
+bool moe_cs_iq_rows(int type, int nt, const void * w, size_t row_bytes, int64_t r0, int64_t r1, int64_t n_in,
+        const void * const * y, float * const * out, int prefetch) {
+#if defined(MOE_IQ_ROWS)
+    const moe_iq::rows_fn f = moe_iq::get(type, nt);
+    if (!f || n_in % QK_K != 0) { return false; }
+    f((const char *) w, row_bytes, r0, r1, (int) (n_in / QK_K), (const block_q8_K * const *) y, out, prefetch);
+    return true;
+#else
+    (void) type; (void) nt; (void) w; (void) row_bytes; (void) r0; (void) r1; (void) n_in; (void) y; (void) out; (void) prefetch;
+    return false;
+#endif
 }
