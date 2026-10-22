@@ -7991,10 +7991,10 @@ static int ggml_cuda_try_fuse_gdn_gates(ggml_backend_cuda_context & ctx, ggml_cg
 }
 
 // [SHEXPGATE] MUL_MAT(w[K], y[K,T]) SIGMOID MUL(x, gate) ADD(other, gated), the shared-expert gate of the
-// Qwen3-Next style FFN, as one kernel (ggml_cuda_shexp_gate in hc-fused.cu). Opt-in: GGML_CUDA_SHEXP_GATE=1;
+// Qwen3-Next style FFN, as one kernel (ggml_cuda_shexp_gate in hc-fused.cu). On by default since 2026-10-22 (KLD inside noise, +4.4% Taichi); GGML_CUDA_SHEXP_GATE=0 turns it off;
 // GGML_CUDA_SHEXP_GATE_DEBUG=1 logs refusals at the ffn_gate_inp_shexp matmuls and the first fused layer.
 static int ggml_cuda_try_fuse_shexp_gate(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
-    static const bool enabled = [] { const char * e = getenv("GGML_CUDA_SHEXP_GATE"); return e != nullptr && atoi(e) != 0; }();
+    static const bool enabled = [] { const char * e = getenv("GGML_CUDA_SHEXP_GATE"); return e == nullptr || atoi(e) != 0; }();
     static const bool dbg     = [] { const char * e = getenv("GGML_CUDA_SHEXP_GATE_DEBUG"); return e != nullptr && atoi(e) != 0; }();
     if (!enabled) {
         return -1;
