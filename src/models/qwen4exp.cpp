@@ -361,7 +361,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
             return true;
         };
         const int64_t R = w_down->ne[1];
-        bool ok = hc_fused && nt >= 1 && nt <= 8 && hc == 4 && n_embd % 512 == 0 && R % 64 == 0 &&
+        // [B1] the FFN phases copy the injection weights to b1_ffn->inject and combine them in another graph,
+        // which expects the raw product
+        bool ok = hc_fused && !hc_fused_blocked && nt >= 1 && nt <= 8 && hc == 4 && n_embd % 512 == 0 && R % 64 == 0 &&
             x->type == GGML_TYPE_F32 && ggml_is_contiguous(x) && x->ne[0] == n_embd && x->ne[1] == hc &&
             w_norm->type == GGML_TYPE_F32 && ggml_is_contiguous(w_norm) && ggml_nelements(w_norm) == hc_dim &&
             plain_bf16(lo_mm, w_down, xn) && plain_bf16(gate, w_up, lo);
@@ -452,9 +454,22 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
     const int64_t nt = residual->ne[2];
 
     // 2*sigmoid centres the scatter weights on 1, so a zero injection is a plain residual add
-    // ([HCFUSED] the ggml_dsv4_hc_down injection segment already holds the activated weights)
+    // ([HCFUSED] the ggml_dsv4_hc_down injection segment already holds the activated weights; it may reach here
+    // through the last layer's crop to the output rows, so look through row gathers and views, not only the view)
+    const auto activated = [](const ggml_tensor * t) {
+        while (t) {
+            if (t->op == GGML_OP_DSV4_HC_DOWN) {
+                return true;
+            }
+            if (t->op != GGML_OP_VIEW && t->op != GGML_OP_RESHAPE && t->op != GGML_OP_GET_ROWS && t->op != GGML_OP_CONT) {
+                return false;
+            }
+            t = t->src[0];
+        }
+        return false;
+    };
     ggml_tensor * w = inject;
-    if (!(inject->view_src && inject->view_src->op == GGML_OP_DSV4_HC_DOWN)) {
+    if (!activated(inject)) {
         w = ggml_sigmoid(ctx0, ggml_scale(ctx0, inject, 1.0f / (float) hc));
         w = ggml_scale(ctx0, w, 2.0f);
     }
@@ -513,6 +528,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     const int64_t hc = hparams.dsv4_hc_mult;
     const auto * b1_ffn = params.b1_ffn;
     const int b1_ffn_phase = params.b1_ffn_phase;
+    hc_fused_blocked = b1_ffn != nullptr && b1_ffn_phase != 0;
 
     GGML_ASSERT(hparams.n_embd_head_v() == hparams.n_embd_head_k());
 

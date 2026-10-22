@@ -2553,6 +2553,9 @@ struct llama_model_qwen4exp : public llama_model_base {
         graph(const llama_model & model, const llm_graph_params & params, no_build) :
             llm_build_delta_net_base(params), model(model) {}
 
+        // [HCFUSED] keep the unfused mix (B1 FFN phases hand the raw injection product to another graph)
+        bool hc_fused_blocked = false;
+
         // HC replaces every layer norm: residual is [n_embd, hc, n_tokens]
         ggml_tensor * build_hc_mix(
                     ggml_tensor * x,
