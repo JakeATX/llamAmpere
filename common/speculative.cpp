@@ -1539,6 +1539,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             SPC_WRN("%s", "chained MTP is not supported for this model; using sequential MTP\n");
         }
 
+        // the draft takes the rows of an image only with an M-RoPE draft (the only one tested); LLAMA_MTP_IMAGE_ROWS=0 skips the images
+        image_pos.assign(n_seq, -1);
+        {
+            const char * env = getenv("LLAMA_MTP_IMAGE_ROWS");
+            const enum llama_rope_type rope = llama_model_rope_type(llama_get_model(ctx_dft));
+            image_rows = (!env || atoi(env) != 0) && !is_mem_shared && !chain_heads &&
+                (rope == LLAMA_ROPE_TYPE_MROPE || rope == LLAMA_ROPE_TYPE_IMROPE);
+            SPC_TRC("- image rows=%d\n", (int) image_rows);
+        }
+
         // offload draft sampling to the backend (chained drafting outputs several
         // rows per sequence, which backend sampling does not support)
         backend_chains.assign(n_seq, nullptr);
@@ -1886,13 +1896,24 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
     }
 
+    // An image batch has embeddings and no token ids. The draft gets its rows as an embedding batch of the hidden states of the
+    // target (the target keeps one nextn row per token), which carry the image.
+    bool               image_rows = false;
+    std::vector<float> img_h;
+
+    // [per-seq] position of the image whose rows the last process() call added, -1 after any other batch: an image that
+    // arrives in several batches has one position, and the next batch must not trim the rows of the one before
+    std::vector<llama_pos> image_pos;
+
     bool process(const llama_batch & batch_in) override {
         if (batch_in.n_tokens <= 0) {
             return true;
         }
 
-        // TODO: how to make it work with vision tokens?
-        if (batch_in.token == nullptr || batch_in.embd != nullptr) {
+        const bool is_image = image_rows && batch_in.token == nullptr && batch_in.embd != nullptr && batch_in.n_tokens <= batch_capacity;
+
+        // any other embedding batch is skipped
+        if (!is_image && (batch_in.token == nullptr || batch_in.embd != nullptr)) {
             return true;
         }
 
@@ -1942,6 +1963,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 // draft, so overlap here means an unidentified stale-state producer.
                 // Log it: a silently firing trim leaves no forensic signal.
                 const llama_pos pos_max_pre = llama_memory_seq_pos_max(mem_dft, seq_id);
+                if (is_image && image_pos[seq_id] == pos_min_in && pos_max_pre == pos_min_in) {
+                    continue; // the next part of the same image
+                }
                 if (pos_max_pre >= pos_min_in) {
                     SPC_WRN("stale draft KV for seq %d at process: pos_max %d >= batch start %d, trimming\n",
                             (int) seq_id, (int) pos_max_pre, (int) pos_min_in);
@@ -1968,7 +1992,28 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
         const int32_t defer_cap = defer_capacity();
-        if (!is_mem_shared && defer_enabled && n_tokens <= defer_cap) {
+        if (is_image) {
+            // row k is paired with the hidden state of row k - 1 (the first one with the carry), at the positions of the image: an
+            // embedding batch may have several rows at one position
+            if (!flush_deferred()) {
+                return false;
+            }
+            img_h.resize((size_t) n_tokens * n_embd);
+            const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+            std::memcpy(img_h.data() + n_embd, h_tgt, row_bytes * (n_tokens - 1));
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (i_batch_beg[seq_id] >= 0) {
+                    std::memcpy(img_h.data() + (size_t) i_batch_beg[seq_id] * n_embd, pending_h[seq_id].data(), row_bytes);
+                }
+            }
+            llama_batch rows = batch_in;
+            rows.embd = img_h.data();
+            const int32_t rc = llama_decode(ctx_dft, rows);
+            if (rc != 0) {
+                SPC_ERR("llama_decode(ctx_dft) of the image rows failed rc=%d (pos=%d)\n", (int) rc, (int) batch_in.pos[0]);
+                return false;
+            }
+        } else if (!is_mem_shared && defer_enabled && n_tokens <= defer_cap) {
             // defer the catch-up rows; the first draft decode absorbs them, which saves
             // one eval per round. Flush first if rows from an undrafted round remain.
             if (!defer.tok.empty() && (int32_t) defer.tok.size() + n_tokens > defer_cap) {
@@ -2081,6 +2126,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             std::memcpy(pending_h[seq_id].data(),
                     verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
+        }
+
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            if (i_batch_beg[seq_id] >= 0) {
+                image_pos[seq_id] = is_image ? batch_in.pos[i_batch_beg[seq_id]] : -1;
+            }
         }
 
         return true;
@@ -4218,8 +4269,12 @@ struct spec_batch_view {
         const bool has_tok  = cb.has_token();
         const bool has_embd = cb.has_embd();
 
+        // an embedding batch of an M-RoPE model carries every position section, one section after the other as llama_decode reads
+        // them (the first n entries stay the first section); a token batch carries one position per token
+        const int32_t n_pos = has_embd ? std::max<int32_t>(1, cb.n_pos) : 1;
+
         token.resize(has_tok ? n : 0);
-        pos.resize(n);
+        pos.resize((size_t) n * n_pos);
         n_seq_id.resize(n);
         logits.resize(n);
         seq_id.resize(n);
@@ -4244,7 +4299,9 @@ struct spec_batch_view {
             if (has_embd && t.embd.data != nullptr) {
                 std::memcpy(embd.data() + (size_t) i * n_embd, t.embd.data, t.embd.n_embd * sizeof(float));
             }
-            pos[i]      = t.pos[0];
+            for (int32_t j = 0; j < n_pos; ++j) {
+                pos[(size_t) j * n + i] = t.pos[j];
+            }
             logits[i]   = t.output ? 1 : 0;
             n_seq_id[i] = 1 + (int32_t) t.seq_ids_extra.size();
             seq_id[i]   = seq_flat.data() + o;
