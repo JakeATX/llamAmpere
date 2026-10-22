@@ -62,7 +62,7 @@ from conversion.qwen import Qwen3_5TextModel
 
 FTYPES = {"q8_0": gguf.LlamaFileType.MOSTLY_Q8_0, "f16": gguf.LlamaFileType.MOSTLY_F16,
           "bf16": gguf.LlamaFileType.MOSTLY_BF16, "f32": gguf.LlamaFileType.ALL_F32}
-EXL3_TYPES = {b: getattr(gguf.GGMLQuantizationType, f"EXL3_{b}") for b in range(2, 9)}
+EXL3_TYPES = {b: getattr(gguf.GGMLQuantizationType, f"EXL3_{b}") for b in range(1, 9)}
 HAD = 128   # Hadamard block on both sides; permutations must be block-constant at this size
 TILE = 16
 

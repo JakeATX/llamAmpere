@@ -789,6 +789,14 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_q6_cr,
         .from_float_ref           = (ggml_from_float_t) quantize_row_q6_cr_ref,
     },
+    [GGML_TYPE_EXL3_1] = {
+        .type_name                = "exl3_1",
+        .blck_size                = 256,
+        .type_size                = 32 * 1,
+        .is_quantized             = true,
+        .to_float                 = NULL, // not row-addressable: ggml_exl3_dequantize_row_group
+        .from_float_ref           = NULL,
+    },
     [GGML_TYPE_EXL3_2] = {
         .type_name                = "exl3_2",
         .blck_size                = 256,
@@ -1518,6 +1526,9 @@ bool ggml_is_quantized(enum ggml_type type) {
 }
 
 int ggml_exl3_bits(enum ggml_type type) {
+    if (type == GGML_TYPE_EXL3_1) {
+        return 1;
+    }
     return (type >= GGML_TYPE_EXL3_2 && type <= GGML_TYPE_EXL3_8) ? 2 + (int) (type - GGML_TYPE_EXL3_2) : 0;
 }
 

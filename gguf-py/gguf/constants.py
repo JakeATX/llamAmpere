@@ -5998,6 +5998,7 @@ class GGMLQuantizationType(IntEnum):
     EXL3_6  = 55
     EXL3_7  = 56
     EXL3_8  = 57
+    EXL3_1  = 60
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -6236,6 +6237,7 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.EXL3_6:  (256, 32 * 6),
     GGMLQuantizationType.EXL3_7:  (256, 32 * 7),
     GGMLQuantizationType.EXL3_8:  (256, 32 * 8),
+    GGMLQuantizationType.EXL3_1:  (256, 32 * 1),
 }
 
 

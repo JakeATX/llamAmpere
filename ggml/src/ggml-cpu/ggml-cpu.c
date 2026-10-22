@@ -353,6 +353,12 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .vec_dot_type             = GGML_TYPE_F32,
         .nrows                    = 1,
     },
+    [GGML_TYPE_EXL3_1] = {
+        .from_float               = NULL,
+        .vec_dot                  = NULL, // whole-tensor path: ggml_compute_forward_mul_mat_exl3
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
     [GGML_TYPE_EXL3_2] = {
         .from_float               = NULL,
         .vec_dot                  = NULL, // whole-tensor path: ggml_compute_forward_mul_mat_exl3

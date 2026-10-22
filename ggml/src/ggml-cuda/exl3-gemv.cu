@@ -1116,6 +1116,7 @@ static void exl3_gemv_dec_launch_wm(const exl3_gemv_args & a, cudaStream_t strea
 template <int T>
 static void exl3_gemv_dec_launch(const exl3_gemv_args & a, const int bits, cudaStream_t stream) {
     switch (bits) {
+        case 1: exl3_gemv_dec_launch_bt<1, T, false>(a, stream); break;
         case 2: exl3_gemv_dec_launch_wm<2, T>(a, stream); break;
         case 3: exl3_gemv_dec_launch_wm<3, T>(a, stream); break;
         case 4: exl3_gemv_dec_launch_wm<4, T>(a, stream); break;
@@ -1136,6 +1137,7 @@ static void exl3_gemv_launch(const exl3_gemv_args & a, const int bits, cudaStrea
         }
     }
     switch (bits) {
+        case 1: exl3_gemv_launch_bt<1, T, FUSED>(a, stream); break;
         case 2: exl3_gemv_launch_bt<2, T, FUSED>(a, stream); break;
         case 3:
             if constexpr (exl3_gemv_weight_major_ok<T, FUSED>()) {

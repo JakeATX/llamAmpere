@@ -5994,7 +5994,7 @@ static inline float ggml_exl3_mul1_decode(uint32_t code) {
 }
 
 void ggml_exl3_dequantize_row_group(const void * GGML_RESTRICT data, int64_t K, int64_t N, int bits, int64_t g, float * GGML_RESTRICT y) {
-    assert(bits >= 2 && bits <= 8 && K % 16 == 0 && N % 16 == 0 && g >= 0 && 16*g < N);
+    assert(bits >= 1 && bits <= 8 && K % 16 == 0 && N % 16 == 0 && g >= 0 && 16*g < N);
     const int64_t kt = K / 16;
     const int64_t nt = N / 16;
     const int nw = 8 * bits;        // uint32 words per 16x16 tile
