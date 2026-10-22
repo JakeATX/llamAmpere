@@ -5162,14 +5162,15 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
     // fork: n_tokens contains only the incoming rows after prompt-cache reuse.
     uint32_t rows = 512;
     // fork VRAMFIT: LLAMA_DECODE_SCRATCH_ROWS=N (1..512) sizes writing-phase scratch to N rows instead of 512.
-    // Writing batches (verify windows, helper chains) and the return to writing use N; any larger batch grows
-    // back to the normal rows through the usual borrow from the expert cache. 0 or unset keeps 512.
+    // Only the explicit return to writing (n_tokens == 0, after every allocation exists) shrinks to N; writing
+    // batches of at most N rows then keep it, and any larger batch grows back to the normal rows through the
+    // usual borrow from the expert cache. Startup warmup batches never shrink it. 0 or unset keeps 512.
     static const uint32_t decode_rows = [] {
         const char * text = getenv("LLAMA_DECODE_SCRATCH_ROWS");
         const long value = text && text[0] ? strtol(text, nullptr, 10) : 0;
         return value > 0 && value <= 512 ? (uint32_t) value : 0u;
     }();
-    if (decode_rows && n_tokens <= decode_rows) {
+    if (decode_rows && (n_tokens == 0 || (sched_reserve_tokens <= decode_rows && n_tokens <= decode_rows))) {
         rows = decode_rows;
     }
     if (alone && n_tokens > 512 && cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT &&
