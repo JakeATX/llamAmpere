@@ -44,6 +44,10 @@ bool moe_cs_layer_ok(int layer);
 // Times host jobs on a registered layer (the pool must be idle: no card job in flight). Fills the cost of one
 // (expert, route) pair and the fixed cost of a job, in nanoseconds. False when no layer is registered.
 bool moe_cs_probe(double * route_ns, double * fixed_ns);
+// Bench (tests only, pool idle): runs `reps` host jobs of `n_exp` experts (one route each) on `layer`, taking the
+// experts in turn from `experts[0..n_list)`. Fills the mean ns per job and the mean ns per phase.
+bool moe_cs_bench(int layer, const int * experts, int n_list, int n_exp, int reps, double * ns_per_job,
+        double phase_ns[4]);
 // Statistics: [0] jobs, [1] experts, [2] routes, [3] busy ns, [4] null-source errors, [5..8] ns per phase.
 void moe_cs_stats(unsigned long long out[9]);
 int moe_cs_threads();

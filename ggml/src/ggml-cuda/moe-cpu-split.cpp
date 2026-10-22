@@ -616,6 +616,37 @@ bool moe_cs_probe(double * route_ns, double * fixed_ns) {
     return true;
 }
 
+bool moe_cs_bench(int layer, const int * experts, int n_list, int n_exp, int reps, double * ns_per_job,
+        double phase_ns[4]) {
+    pool_state & s = P();
+    {
+        std::lock_guard<std::mutex> lock(s.mu);
+        if (!s.running || layer < 0 || layer >= (int) s.layers.size() || !s.layers[layer].ok) { return false; }
+    }
+    if (n_exp < 0 || n_exp > MOE_CS_MAX_EXPERTS || n_exp > MOE_CS_MAX_ROUTES || n_list < 1 || reps < 1) { return false; }
+    for (int p = 0; p < 4; ++p) { s.phase_ns[p] = 0; }
+    double total = 0.0;
+    for (int rep = 0; rep < reps; ++rep) {
+        s.job->layer = layer;
+        s.job->n_exp = n_exp;
+        for (int i = 0; i < n_exp; ++i) {
+            s.job->expert[i] = experts[((size_t) rep * n_exp + i) % (size_t) n_list];
+            s.job->first[i] = i;
+        }
+        s.job->first[n_exp] = n_exp;
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        const unsigned long long want = s.local_seq.load() + 1;
+        const auto t0 = clk::now();
+        s.local_seq.store(want, std::memory_order_release);
+        while (s.local_done.load(std::memory_order_acquire) != want) { cpu_relax(); }
+        total += (double) std::chrono::duration_cast<std::chrono::nanoseconds>(clk::now() - t0).count();
+    }
+    *ns_per_job = total / reps;
+    for (int p = 0; p < 4; ++p) { phase_ns[p] = (double) s.phase_ns[p] / reps; s.phase_ns[p] = 0; }
+    s.st_jobs = 0; s.st_experts = 0; s.st_routes = 0; s.st_busy_ns = 0; s.st_null = 0;
+    return true;
+}
+
 void moe_cs_stats(unsigned long long out[9]) {
     pool_state & s = P();
     for (int p = 0; p < 4; ++p) { out[5 + p] = s.phase_ns[p]; }
