@@ -1421,6 +1421,12 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
         if (params.speculative.draft.depth_policy == "cdepth" && !adaptive_mtp) {
             throw std::invalid_argument("error: --spec-depth-policy cdepth needs --spec-type draft-mtp-adaptive");
         }
+        const bool any_mtp = adaptive_mtp || std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+        if (any_mtp && !params.sampling.spec_lossy_explicit) {
+            params.sampling.spec_lossy = true;
+            LOG_INF("FYI: mode-biased MTP (--spec-lossy beat) is on by default with MTP drafting; it can change wording slightly with no measured accuracy loss. "
+                    "To turn it off: --spec-lossy exact\n");
+        }
 
         params.lr.init();
     } catch (const std::invalid_argument & ex) {
@@ -5008,12 +5014,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_SAMPLING"));
     add_opt(common_arg(
         {"--spec-lossy"}, "exact|beat",
-        "lossy MTP acceptance: exact is lossless (default); beat keeps a rejected draft if p(draft) >= p(residual replacement), excluding EOG and stop tokens",
+        "MTP acceptance: exact is lossless; beat (mode-biased MTP) keeps a rejected draft if p(draft) >= p(residual replacement), excluding EOG and stop tokens "
+        "(default: beat with --spec-type draft-mtp or draft-mtp-adaptive, otherwise exact)",
         [](common_params & params, const std::string & value) {
             if (value != "exact" && value != "beat") {
                 throw std::invalid_argument("--spec-lossy must be exact or beat");
             }
             params.sampling.spec_lossy = value == "beat";
+            params.sampling.spec_lossy_explicit = true;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_LOSSY"));
     add_opt(common_arg(
