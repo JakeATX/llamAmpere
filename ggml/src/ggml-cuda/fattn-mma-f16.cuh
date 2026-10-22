@@ -3387,6 +3387,17 @@ static inline int ggml_cuda_fa_sparse_g16() {
     return value;
 }
 
+// [G16MINQ] the G16 tiles only pay for prompt-sized batches; a 5-8 row check step ran 8% slower with them.
+// GGML_CUDA_FA_SPARSE_G16_MINQ=<n> (default 32): fewest query rows that may take the G16 tile. 5 = the old gate.
+static inline int ggml_cuda_fa_sparse_g16_minq() {
+    static const int value = [] {
+        const char * env = getenv("GGML_CUDA_FA_SPARSE_G16_MINQ");
+        const int v = env ? atoi(env) : 32;
+        return v >= 5 ? v : 32;
+    }();
+    return value;
+}
+
 // [G16] one stderr line per call site the first time the G16 tile is taken (shows the gate and arms really ran it)
 static inline void ggml_cuda_fa_sparse_g16_note(const char * site, const int g16) {
     static bool noted = false;

@@ -2600,7 +2600,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
     if constexpr (DKQ == 256 && DV == 256) {
         const int g16 = ggml_cuda_fa_sparse_g16();
         if (g16 != 0 && use_gqa_opt && gqa_ratio > 8 && gqa_ratio <= 16 && GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE &&
-                Q->ne[1] > 4 && ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst, g16, 16)) {
+                Q->ne[1] >= ggml_cuda_fa_sparse_g16_minq() && ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst, g16, 16)) {
             ggml_cuda_fa_sparse_g16_note("switch_ncols2", g16);
             if (g16 == 4) {
                 ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 4, 16>(ctx, dst, preserve_cand);
