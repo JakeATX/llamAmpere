@@ -5085,7 +5085,8 @@ struct test_dsv4_hc_mix : public test_case {
     static bool env_on(const char * name) {
         const char * e = getenv(name);
         // HC_POST_NORM and HC_PRE_XN are on by default (e565cf9fe); =0 turns them off
-        if (strcmp(name, "GGML_CUDA_HC_POST_NORM") == 0 || strcmp(name, "GGML_CUDA_HC_PRE_XN") == 0) {
+        if (strcmp(name, "GGML_CUDA_HC_POST_NORM") == 0 || strcmp(name, "GGML_CUDA_HC_PRE_XN") == 0 ||
+                strcmp(name, "GGML_CUDA_HC_GATE_PRE") == 0 || strcmp(name, "GGML_CUDA_HC_POST_CPY") == 0) {
             return e == nullptr || atoi(e) != 0;
         }
         return e != nullptr && atoi(e) != 0;
@@ -5168,8 +5169,8 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
 
     // [HCPC] GGML_CUDA_HC_POST_CPY=1 writes the identity-comb hc_post straight into the CPY destination
     const char * required_fusion() override {
-        const char * e = getenv("GGML_CUDA_HC_POST_CPY");
-        return identity && cpy_mode != 0 && e != nullptr && atoi(e) != 0 ? "hc_post_cpy" : nullptr;
+        const char * e = getenv("GGML_CUDA_HC_POST_CPY"); // on by default, =0 turns it off
+        return identity && cpy_mode != 0 && (e == nullptr || atoi(e) != 0) ? "hc_post_cpy" : nullptr;
     }
 
     test_dsv4_hc_post(int64_t n_embd = 31, int64_t n_tokens = 17, bool identity = false, bool gated = false, int cpy_mode = 0)
@@ -5339,7 +5340,8 @@ struct test_hc_post_norm : public test_case {
     static bool env_on(const char * name) {
         const char * e = getenv(name);
         // HC_POST_NORM and HC_PRE_XN are on by default (e565cf9fe); =0 turns them off
-        if (strcmp(name, "GGML_CUDA_HC_POST_NORM") == 0 || strcmp(name, "GGML_CUDA_HC_PRE_XN") == 0) {
+        if (strcmp(name, "GGML_CUDA_HC_POST_NORM") == 0 || strcmp(name, "GGML_CUDA_HC_PRE_XN") == 0 ||
+                strcmp(name, "GGML_CUDA_HC_GATE_PRE") == 0 || strcmp(name, "GGML_CUDA_HC_POST_CPY") == 0) {
             return e == nullptr || atoi(e) != 0;
         }
         return e != nullptr && atoi(e) != 0;
@@ -6922,8 +6924,8 @@ struct test_conv_ring : public test_case {
         return u == nullptr || atoi(u) != 0;
     }
     static bool conv_ring_prefill_on() {
-        const char * e = getenv("GGML_CUDA_CONV_RING_PREFILL");
-        return e != nullptr && atoi(e) != 0;
+        const char * e = getenv("GGML_CUDA_CONV_RING_PREFILL"); // on by default, =0 turns it off
+        return e == nullptr || atoi(e) != 0;
     }
     // decode widths (n_t <= 8) fold under GGML_VL_SF_CONVRING (the CONT3 window form also needs [CRP]); prefill
     // widths fold under GGML_CUDA_CONV_RING_PREFILL alone

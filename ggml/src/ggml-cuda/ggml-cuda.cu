@@ -5864,7 +5864,7 @@ static bool ggml_cuda_conv_ring_prefill_enabled() {
     }
     static const bool enabled = [] {
         const char * e = getenv("GGML_CUDA_CONV_RING_PREFILL");
-        return e != nullptr && atoi(e) != 0;
+        return e == nullptr || atoi(e) != 0; // PFMERGE: on by default, =0 turns it off
     }();
     return enabled;
 }
@@ -7552,7 +7552,7 @@ static int ggml_cuda_fuse_hc_norm(ggml_backend_cuda_context & ctx, const ggml_cg
 static bool ggml_cuda_hc_post_cpy_enabled() {
     static const bool enabled = [] {
         const char * e = getenv("GGML_CUDA_HC_POST_CPY");
-        return e != nullptr && atoi(e) != 0;
+        return e == nullptr || atoi(e) != 0; // PFMERGE: on by default, =0 turns it off
     }();
     return enabled;
 }
@@ -7608,7 +7608,7 @@ static int ggml_cuda_fuse_hc_post_cpy(ggml_backend_cuda_context & ctx, const ggm
 static bool ggml_cuda_hc_gate_pre_enabled() {
     static const bool enabled = [] {
         const char * e = getenv("GGML_CUDA_HC_GATE_PRE");
-        return e != nullptr && atoi(e) != 0;
+        return e == nullptr || atoi(e) != 0; // PFMERGE: on by default, =0 turns it off
     }();
     return enabled;
 }
