@@ -341,13 +341,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     ggml_tensor * gate = build_lora_mm(w_up, lo);
     cb(gate, "hc_gate", il);
 
-    // [HCFUSED] LLAMA_HC_FUSED=1 (opt-in): at 1..8 tokens run the whole mix as two ops, ggml_dsv4_hc_down (norm folded
+    // [HCFUSED] LLAMA_HC_FUSED (default on 2026-10-22: verify -3.5..-5.4%/round on 3 trios, KLD inside ub4 noise; 0 = off): at 1..8 tokens run the whole mix as two ops, ggml_dsv4_hc_down (norm folded
     // into one split-K pass over W_down and W_inject, then silu and the 2*sigmoid scatter weights) and ggml_dsv4_hc_up
     // (W_up, sigmoid gate and the mean over the streams). Only plain BF16 matmuls on xn / lo qualify (no LoRA, Hadamard
     // fold, scale tensor or precision policy). The activations stay f32 where the unfused small-batch mul_mat_f rounds
     // them to BF16, so the output moves by rounding only. The unfused nodes above are left unreferenced.
     {
-        static const bool hc_fused = [] { const char * e = getenv("LLAMA_HC_FUSED"); return e && atoi(e) != 0; }();
+        static const bool hc_fused = [] { const char * e = getenv("LLAMA_HC_FUSED"); return !e || atoi(e) != 0; }();
         const auto plain_bf16 = [](const ggml_tensor * t, const ggml_tensor * w, const ggml_tensor * src) {
             if (t->op != GGML_OP_MUL_MAT || t->src[0] != w || t->src[1] != src || w->type != GGML_TYPE_BF16 ||
                     t->src[2] != nullptr || t->src[3] != nullptr) {
