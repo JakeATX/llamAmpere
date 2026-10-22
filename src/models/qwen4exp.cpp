@@ -2385,10 +2385,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
         // takes any source strides, so the bytes are the same) instead of making it contiguous first. That is
         // one launch less per slot, and it is the CPY(VIEW(concat)) form the CUDA conv ring fusion
         // (ggml_cuda_conv_ring_match_at) recognizes, so the concat and every window copy fold into the
-        // ssm_conv launch. Default off.
+        // ssm_conv launch. Default on (byte-identical tokens, 100K verify -1.2/-1.4 ms at w3/w4); LLAMA_CONV_NOCONT=0 turns it off.
         static const bool no_cont = [] {
             const char * e = getenv("LLAMA_CONV_NOCONT");
-            return e != nullptr && atoi(e) != 0;
+            return e == nullptr || atoi(e) != 0;
         }();
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, no_cont ? tail : ggml_cont(ctx0, tail), dst));
     }

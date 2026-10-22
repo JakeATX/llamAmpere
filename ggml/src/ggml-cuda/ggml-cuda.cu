@@ -7698,7 +7698,7 @@ static const char * ggml_cuda_gdn_gates_parse(const ggml_cgraph * cgraph, int i,
 }
 
 static int ggml_cuda_try_fuse_gdn_gates(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
-    static const bool enabled = [] { const char * e = getenv("GGML_CUDA_GDN_GATES"); return e != nullptr && atoi(e) != 0; }();
+    static const bool enabled = [] { const char * e = getenv("GGML_CUDA_GDN_GATES"); return e == nullptr || atoi(e) != 0; }(); // default on (bitwise); =0 off
     static const bool dbg     = [] { const char * e = getenv("GGML_CUDA_GDN_GATES_DEBUG"); return e != nullptr && atoi(e) != 0; }();
     if (!enabled) {
         return -1;
