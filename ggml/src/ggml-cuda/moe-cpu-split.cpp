@@ -9,6 +9,7 @@
 #include "moe-cpu-split.h"
 #include "ggml.h"
 #include "ggml-cpu.h"
+#define GGML_COMMON_DECL_CPP
 #include "../ggml-common.h"
 
 #include <algorithm>
@@ -475,9 +476,10 @@ bool moe_cs_probe(double * route_ns, double * fixed_ns) {
     }
     if (layer < 0) { return false; }
     const layer_math & L = s.layers[layer];
-    // Experts with a host source; the probe reads real weights.
+    // Experts with a host source; the probe reads real weights. Enough of them (64 x ~2 MB) that the rotation
+    // below reads from memory, not from the last-level cache, as a decode's missed experts do.
     std::vector<int> experts;
-    for (int e = 0; e < (int) L.role[0].r.n_expert && experts.size() < 8; ++e) {
+    for (int e = 0; e < (int) L.role[0].r.n_expert && experts.size() < 64; ++e) {
         bool all = true;
         for (int k = 0; k < 3; ++k) { all = all && __atomic_load_n(&L.role[k].r.src[e], __ATOMIC_ACQUIRE) != nullptr; }
         if (all) { experts.push_back(e); }
@@ -494,7 +496,10 @@ bool moe_cs_probe(double * route_ns, double * fixed_ns) {
         for (int rep = 0; rep < 24; ++rep) {
             s.job->layer = layer;
             s.job->n_exp = n_exp;
-            for (int i = 0; i < n_exp; ++i) { s.job->expert[i] = experts[(size_t) (i + rep) % experts.size()]; s.job->first[i] = i; }
+            for (int i = 0; i < n_exp; ++i) {
+                s.job->expert[i] = experts[((size_t) rep * n_exp + i) % experts.size()];
+                s.job->first[i] = i;
+            }
             s.job->first[n_exp] = n_exp;
             std::atomic_thread_fence(std::memory_order_seq_cst);
             const unsigned long long want = s.local_seq.load() + 1;
