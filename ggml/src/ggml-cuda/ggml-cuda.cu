@@ -4769,7 +4769,7 @@ static bool ggml_cuda_graph_check_compability_fast(ggml_cgraph * cgraph) {
 
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
     // 2 = run both and count calls where they disagree (logged every 4,096 calls and on every disagreement)
-    static const int fast = [] { const char * e = getenv("GGML_CUDA_COMPAT_FAST"); return e ? atoi(e) : 0; }();
+    static const int fast = [] { const char * e = getenv("GGML_CUDA_COMPAT_FAST"); return e ? atoi(e) : 1; }();
     if (fast == 2) {
         static std::atomic<uint64_t> n_calls{0};
         static std::atomic<uint64_t> n_diff{0};
@@ -5437,7 +5437,7 @@ static void ggml_cuda_gdn_state_read_finish(ggml_backend_cuda_context * cuda_ctx
 static bool ggml_cuda_lid_gather_enabled() {
     static const bool enabled = [] {
         const char * e = getenv("GGML_CUDA_LID_GATHER");
-        return e != nullptr && atoi(e) != 0;
+        return e == nullptr || atoi(e) != 0;
     }();
     return enabled;
 }

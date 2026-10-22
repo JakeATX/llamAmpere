@@ -1481,7 +1481,7 @@ static __global__ void flash_attn_mask_to_live_tiles(
 static bool ggml_cuda_fattn_skip_dead_enabled() {
     static const bool on = [] {
         const char * e = getenv("GGML_CUDA_FA_SKIP_DEAD");
-        return e != nullptr && atoi(e) != 0;
+        return e == nullptr || atoi(e) != 0;
     }();
     return on;
 }

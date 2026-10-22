@@ -674,7 +674,7 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
             (select_mode == 3 || !ggml_cuda_top_k_tiled_fits(ncols, k))) {
         static const bool select_fast = [] {
             const char * value = getenv("GGML_CUDA_TOPK_SELECT_FAST");
-            return value != nullptr && atoi(value) != 0;
+            return value == nullptr || atoi(value) != 0;
         }();
         if (select_fast) {
             topk_select_rows_fast<1024><<<nrows, 1024, 0, stream>>>(src0_d, dst_d, ncols, k);
