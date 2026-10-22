@@ -468,7 +468,6 @@ static __global__ void lightning_indexer_kernel_vec(
     constexpr int K_VECS_PER_WARP = K_VECS_PER_BLOCK / WARPS_PER_BLOCK;
     constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * WARP_SIZE;
 
-    const int i_batch  = blockIdx.y;
     const int i_stream = blockIdx.z;
     const int i_warp   = threadIdx.y;
     const int i_lane   = threadIdx.x;
@@ -477,9 +476,6 @@ static __global__ void lightning_indexer_kernel_vec(
     // each warp processes K_VECS_PER_WARP K vectors
     const int start_kv_block = blockIdx.x * K_VECS_PER_BLOCK;
     const int start_kv = start_kv_block + i_warp * K_VECS_PER_WARP;
-
-    const char  * q_base = (const char  *)                 Q + i_batch*nbq2 + i_stream*nbq3;
-    const float * w_base = (const float *) ((const char *) W + i_batch*nbw1 + i_stream*nbw3);
 
     // phase 1 - load (and dequantize if needed) K to registers
 
@@ -512,6 +508,12 @@ static __global__ void lightning_indexer_kernel_vec(
             }
         }
     }
+
+    // fork: a grid with fewer y blocks than tokens (GGML_CUDA_LID_MULTI) scores several tokens per block from the keys
+    // already in registers; each token keeps the same per-key add order, so its scores are bit-identical
+    for (int i_batch = blockIdx.y; i_batch < n_batch; i_batch += gridDim.y) {
+    const char  * q_base = (const char  *)                 Q + i_batch*nbq2 + i_stream*nbq3;
+    const float * w_base = (const float *) ((const char *) W + i_batch*nbw1 + i_stream*nbw3);
 
     float score_k[K_VECS_PER_WARP] = { 0.0f };
 
@@ -593,6 +595,8 @@ static __global__ void lightning_indexer_kernel_vec(
             float * dst_base = (float *) ((char *) dst + i_batch*nb1 + i_stream*nb3);
             dst_base[i_kv] = lightning_indexer_add_mask(dst_shared[tid], lightning_indexer_mask(m_base, i_kv, mrange));
         }
+    }
+    __syncthreads(); // dst_shared is rewritten by the next token
     }
 }
 
@@ -1179,38 +1183,79 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
         dim3 block(32, WARPS_PER_BLOCK);
         int num_kv_blocks = (n_kv + (K_VECS_PER_BLOCK) - 1) / (K_VECS_PER_BLOCK);
-        dim3 grid(num_kv_blocks, n_batch, n_stream);
+        // fork: GGML_CUDA_LID_MULTI=1 reads each key once for all of the (2-7) verify tokens instead of once per token;
+        // =2 also runs the one-token-per-block grid first and counts outputs whose bits differ
+        static const int lid_multi = [] {
+            const char * value = getenv("GGML_CUDA_LID_MULTI");
+            return value != nullptr ? atoi(value) : 0;
+        }();
+        const bool multi = lid_multi > 0 && n_batch > 1;
+        ggml_cuda_pool_alloc<char> lid_ref(ctx.pool());
+        if (multi && lid_multi == 2) {
+            lid_ref.alloc(ggml_nbytes(dst));
+        }
+        float * const dst_out = dst_d;
 
-        // [ROUNDFIX] the GET_ROWS that gathered the pooled keys into src[1] (F16 rows widened to F32) was skipped
-        // by the graph evaluator (ggml_cuda_lid_gather_plan): read the F16 cache rows directly. Widening F16 to F32
-        // is exact and the F16 path does the same float arithmetic as the F32 path, so the scores are bit-identical.
-        for (auto & e : ctx.lid_gathers) {
-            if (e.lid == dst) {
-                GGML_ASSERT(!e.used && n_stream == 1);
-                e.used = true;
-                lightning_indexer_kernel_vec<WARPS_PER_BLOCK, K_VECS_PER_BLOCK, 128, 4, GGML_TYPE_F16>
-                    <<<grid, block, 0, ctx.stream()>>>(
-                    q_d, e.base, w_d, m_d, dst_d,
-                    n_stream, n_batch, n_kv,
-                    nb1, nb2, nb3,
-                    nbq1, nbq2, nbq3,
-                    0, e.row_stride, 0,
-                    nbw1, nbw2, nbw3,
-                    nbm1, nbm2, nbm3,
-                    nem3, mrange, e.rows);
-                return;
+        for (int pass = lid_ref.get() != nullptr ? 0 : 1; pass < 2; ++pass) {
+            float * const out = pass == 0 ? (float *) lid_ref.get() : dst_out;
+            const dim3 grid(num_kv_blocks, pass == 1 && multi ? 1 : n_batch, n_stream);
+            bool launched = false;
+
+            // [ROUNDFIX] the GET_ROWS that gathered the pooled keys into src[1] (F16 rows widened to F32) was skipped
+            // by the graph evaluator (ggml_cuda_lid_gather_plan): read the F16 cache rows directly. Widening F16 to F32
+            // is exact and the F16 path does the same float arithmetic as the F32 path, so the scores are bit-identical.
+            for (auto & e : ctx.lid_gathers) {
+                if (e.lid == dst) {
+                    if (pass == 1) {
+                        GGML_ASSERT(!e.used && n_stream == 1);
+                        e.used = true;
+                    }
+                    lightning_indexer_kernel_vec<WARPS_PER_BLOCK, K_VECS_PER_BLOCK, 128, 4, GGML_TYPE_F16>
+                        <<<grid, block, 0, ctx.stream()>>>(
+                        q_d, e.base, w_d, m_d, out,
+                        n_stream, n_batch, n_kv,
+                        nb1, nb2, nb3,
+                        nbq1, nbq2, nbq3,
+                        0, e.row_stride, 0,
+                        nbw1, nbw2, nbw3,
+                        nbm1, nbm2, nbm3,
+                        nem3, mrange, e.rows);
+                    launched = true;
+                    break;
+                }
+            }
+
+            if (!launched) {
+                float * dst_d = out;
+                LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_F16)
+                LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_Q4_0)
+                LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_Q4_1)
+                LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_Q5_0)
+                LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_Q5_1)
+                LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_Q8_0)
+                LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_BF16)
+                LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_F32)
+                GGML_ABORT("fatal error");
             }
         }
 
-        LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_F16)
-        LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_Q4_0)
-        LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_Q4_1)
-        LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_Q5_0)
-        LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_Q5_1)
-        LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_Q8_0)
-        LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_BF16)
-        LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_F32)
-        GGML_ABORT("fatal error");
+        if (lid_ref.get() != nullptr) {
+            ggml_cuda_pool_alloc<unsigned long long> n_diff(ctx.pool(), 1);
+            CUDA_CHECK(cudaMemsetAsync(n_diff.get(), 0, sizeof(unsigned long long), ctx.stream()));
+            lightning_indexer_compare<<<512, 256, 0, ctx.stream()>>>(lid_ref.get(), (const char *) dst_out, n_kv, n_batch, n_stream, nb1, nb3, n_diff.get());
+            unsigned long long h_diff = 0;
+            CUDA_CHECK(cudaMemcpyAsync(&h_diff, n_diff.get(), sizeof(h_diff), cudaMemcpyDeviceToHost, ctx.stream()));
+            CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+            static unsigned long long n_calls = 0;
+            n_calls++;
+            if (h_diff != 0 || (n_calls & (n_calls - 1)) == 0) {
+                ggml_log_internal(h_diff != 0 ? GGML_LOG_LEVEL_WARN : GGML_LOG_LEVEL_INFO,
+                    "%s: LID_MULTI check call %llu (n_batch %d n_kv %d): %llu differing outputs\n",
+                    __func__, n_calls, n_batch, n_kv, h_diff);
+            }
+            GGML_ASSERT(h_diff == 0);
+        }
+        return;
     } else {
         GGML_ABORT("fatal error");
     }

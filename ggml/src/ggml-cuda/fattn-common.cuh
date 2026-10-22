@@ -1740,6 +1740,10 @@ static __global__ void flash_attn_combine_results(
     dst[tid] = VKQ_numerator / VKQ_denominator;
 }
 
+// fork: device pointer to one KV bound (multiple of FATTN_KQ_STRIDE) for a single-query-tile, single-sequence launch
+// that neither scans its mask nor uses sparse indices; set by the SJ compact path around its f16 attention call.
+inline thread_local const int * ggml_cuda_fattn_kv_max_override = nullptr;
+
 template <int DV, int ncols1, int ncols2, bool compact_q5g6 = false>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
@@ -1933,6 +1937,13 @@ void launch_fattn(
         CUDA_CHECK(cudaGetLastError());
     }
 
+    const int * kv_max_ptr = KV_max.ptr;
+    if (ggml_cuda_fattn_kv_max_override != nullptr) {
+        GGML_ASSERT(!use_sparse && !scan_mask && !is_sj_kvarn && ntiles_x == 1 && Q->ne[3] == 1 && mask && mask->ne[3] == 1);
+        GGML_ASSERT(K->ne[1] % FATTN_KQ_STRIDE == 0 && FATTN_KQ_STRIDE % nbatch_fa == 0);
+        kv_max_ptr = ggml_cuda_fattn_kv_max_override;
+    }
+
     // [ROUNDFIX] dead-tile bits for the compressed-KV MMA kernel (passed in the SJ-KVaRN descriptor slot).
     if (skip_dead_tiles && mask && !use_sparse && !is_sj_kvarn && stream_k && !need_f16_K && !need_f16_V &&
             K->type != GGML_TYPE_F16 && warp_size == 32) {
@@ -2096,7 +2107,7 @@ void launch_fattn(
         V_data,
         mask ? ((const char *) mask->data) : nullptr,
         sinks ? ((const char *) sinks->data) : nullptr,
-        KV_max.ptr,
+        kv_max_ptr,
         output_partial ? partial_dst : (!stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data),
         output_partial ? partial_meta : dst_tmp_meta.ptr,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,

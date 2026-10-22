@@ -12,76 +12,118 @@
 namespace {
 
 // fork: keep the union in original position order; the n_kv_max contract bounds its fixed graph-safe storage.
-static __global__ void fattn_sj_compact_indices(
-        const half * mask, const int pitch, const int queries, const int positions,
-        int32_t * indices, const int capacity) {
-    constexpr int values_per_lane = 8;
+// Two phases over 2048-position chunks so the whole card scans the mask (one block per chunk) instead of one block
+// walking all positions: phase 1 counts the live positions of each chunk, phase 2 turns the chunk counts into offsets
+// and writes the ordered position list plus the -1 padding. Both phases use the same liveness test, so the list is the
+// exact union of the finite mask entries of every query row.
+constexpr int FATTN_SJ_COMPACT_CHUNK = 256*8;
+
+static __device__ __forceinline__ uint32_t fattn_sj_compact_live_ballot(
+        const half * mask, const int pitch, const int queries, const int positions, const int p) {
+    bool live = false;
+    if (p < positions) {
+        for (int q = 0; q < queries; ++q) {
+            live |= __half2float(mask[size_t(q)*pitch + p]) != -INFINITY;
+        }
+    }
+    return __ballot_sync(0xFFFFFFFF, live);
+}
+
+static __global__ void fattn_sj_compact_count(
+        const half * mask, const int pitch, const int queries, const int positions, int32_t * chunk_counts) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int nwarps = 256/warp_size;
+    __shared__ int warp_counts[nwarps];
     const int tid = threadIdx.x;
     const int warp = tid/warp_size;
     const int lane = tid%warp_size;
-    __shared__ int offsets[nwarps];
-    __shared__ int total;
-    __shared__ int chunk;
-    if (tid == 0) {
-        total = 0;
+    const int p0 = blockIdx.x*FATTN_SJ_COMPACT_CHUNK;
+    int count = 0;
+#pragma unroll
+    for (int item = 0; item < 8; ++item) {
+        const int p = p0 + (warp*8 + item)*warp_size + lane;
+        count += __popc(fattn_sj_compact_live_ballot(mask, pitch, queries, positions, p));
+    }
+    if (lane == 0) {
+        warp_counts[warp] = count;
     }
     __syncthreads();
-    for (int p0 = 0; p0 < positions; p0 += 256*values_per_lane) {
-        uint32_t selected[values_per_lane];
-        int count = 0;
-#pragma unroll
-        for (int item = 0; item < values_per_lane; ++item) {
-            const int p = p0 + (warp*values_per_lane + item)*warp_size + lane;
-            bool live = false;
-            if (p < positions) {
-                for (int q = 0; q < queries; ++q) {
-                    live |= __half2float(mask[size_t(q)*pitch + p]) != -INFINITY;
-                }
-            }
-            selected[item] = __ballot_sync(0xFFFFFFFF, live);
-            count += __popc(selected[item]);
+    if (tid == 0) {
+        int total = 0;
+        for (int w = 0; w < nwarps; ++w) {
+            total += warp_counts[w];
         }
-        if (lane == 0) {
-            offsets[warp] = count;
-        }
-        __syncthreads();
-        if (tid == 0) {
-            int prefix = 0;
-            for (int w = 0; w < nwarps; ++w) {
-                const int count_w = offsets[w];
-                offsets[w] = prefix;
-                prefix += count_w;
-            }
-            chunk = prefix;
-        }
-        __syncthreads();
-        const uint32_t earlier = lane == 0 ? 0 : (uint32_t(1) << lane) - 1;
-        int item_prefix = 0;
-#pragma unroll
-        for (int item = 0; item < values_per_lane; ++item) {
-            const int dst = total + offsets[warp] + item_prefix + __popc(selected[item] & earlier);
-            if ((selected[item] & (uint32_t(1) << lane)) && dst < capacity) {
-                indices[dst] = p0 + (warp*values_per_lane + item)*warp_size + lane;
-            }
-            item_prefix += __popc(selected[item]);
-        }
-        __syncthreads();
-        if (tid == 0) {
-            total += chunk;
-        }
-        __syncthreads();
+        chunk_counts[blockIdx.x] = total;
     }
+}
+
+static __global__ void fattn_sj_compact_indices(
+        const half * mask, const int pitch, const int queries, const int positions,
+        const int32_t * chunk_counts, const int n_chunks, int32_t * indices, int32_t * total_out, const int capacity) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps = 256/warp_size;
+    __shared__ int warp_offsets[nwarps];
+    __shared__ int before, total;
+    const int tid = threadIdx.x;
+    const int warp = tid/warp_size;
+    const int lane = tid%warp_size;
+    if (tid == 0) {
+        int sum_before = 0, sum_all = 0;
+        for (int c = 0; c < n_chunks; ++c) {
+            sum_all += chunk_counts[c];
+            sum_before += c < blockIdx.x ? chunk_counts[c] : 0;
+        }
+        before = sum_before;
+        total = sum_all;
+    }
+    __syncthreads();
     if (total > capacity) {
-        if (tid == 0) {
+        if (tid == 0 && blockIdx.x == 0) {
             printf("SJ compact: mask union %d exceeds n_kv_max bound %d\n", total, capacity);
             __trap();
         }
         return;
     }
-    for (int i = total + tid; i < capacity; i += 256) {
+    const int p0 = blockIdx.x*FATTN_SJ_COMPACT_CHUNK;
+    uint32_t selected[8];
+    int count = 0;
+#pragma unroll
+    for (int item = 0; item < 8; ++item) {
+        const int p = p0 + (warp*8 + item)*warp_size + lane;
+        selected[item] = fattn_sj_compact_live_ballot(mask, pitch, queries, positions, p);
+        count += __popc(selected[item]);
+    }
+    if (lane == 0) {
+        warp_offsets[warp] = count;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        int prefix = 0;
+        for (int w = 0; w < nwarps; ++w) {
+            const int count_w = warp_offsets[w];
+            warp_offsets[w] = prefix;
+            prefix += count_w;
+        }
+    }
+    __syncthreads();
+    const uint32_t earlier = lane == 0 ? 0 : (uint32_t(1) << lane) - 1;
+    int item_prefix = 0;
+#pragma unroll
+    for (int item = 0; item < 8; ++item) {
+        const int dst = before + warp_offsets[warp] + item_prefix + __popc(selected[item] & earlier);
+        if (selected[item] & (uint32_t(1) << lane)) {
+            indices[dst] = p0 + (warp*8 + item)*warp_size + lane;
+        }
+        item_prefix += __popc(selected[item]);
+    }
+    // -1 padding after the last live position, spread over all blocks
+    for (int i = total + blockIdx.x*256 + tid; i < capacity; i += gridDim.x*256) {
         indices[i] = -1;
+    }
+    if (blockIdx.x == 0 && tid == 0) {
+        // [0] live count, [1] the attended row bound: live count padded to whole 256-row strides, at least one stride
+        total_out[0] = total;
+        total_out[1] = max(256, int(GGML_PAD(total, 256)));
     }
 }
 
@@ -105,10 +147,11 @@ static __device__ __forceinline__ half fattn_sj_compact_code(
 static __global__ void fattn_sj_compact_gather(
         const char * K, const char * V, const char * body, const int32_t * desc,
         const size_t k_row_stride, const size_t k_head_stride, const size_t v_row_stride, const size_t v_head_stride,
-        const int32_t * indices, half2 * k_out, half2 * v_out, const int capacity) {
+        const int32_t * indices, const int32_t * live_count, half2 * k_out, half2 * v_out, const int capacity) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     const int row_out = blockIdx.x*blockDim.y + threadIdx.y;
-    if (row_out >= capacity) {
+    // rows at and past live_count[1] lie beyond the device KV bound handed to the attention kernel, which never loads them
+    if (row_out >= capacity || row_out >= live_count[1]) {
         return;
     }
     const int p = indices[row_out];
@@ -282,15 +325,22 @@ bool ggml_cuda_flash_attn_ext_sj_kvarn_compact(ggml_backend_cuda_context & ctx, 
         run_reference(ctx, dst);
         CUDA_CHECK(cudaMemcpyAsync(reference.ptr, dst->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, ctx.stream()));
     }
-    fattn_sj_compact_indices<<<1, 256, 0, ctx.stream()>>>(
-        (const half *) mask->data, int(mask->nb[1]/sizeof(half)), queries, int(positions), indices.ptr, capacity);
+    const int n_chunks = int((positions + FATTN_SJ_COMPACT_CHUNK - 1)/FATTN_SJ_COMPACT_CHUNK);
+    ggml_cuda_pool_alloc<int32_t> chunk_counts(ctx.pool(), n_chunks);
+    ggml_cuda_pool_alloc<int32_t> live_count(ctx.pool(), 2);
+    fattn_sj_compact_count<<<n_chunks, 256, 0, ctx.stream()>>>(
+        (const half *) mask->data, int(mask->nb[1]/sizeof(half)), queries, int(positions), chunk_counts.ptr);
+    CUDA_CHECK(cudaGetLastError());
+    fattn_sj_compact_indices<<<n_chunks, 256, 0, ctx.stream()>>>(
+        (const half *) mask->data, int(mask->nb[1]/sizeof(half)), queries, int(positions),
+        chunk_counts.ptr, n_chunks, indices.ptr, live_count.ptr, capacity);
     CUDA_CHECK(cudaGetLastError());
     fattn_sj_compact_mask<<<(capacity*queries + 255)/256, 256, 0, ctx.stream()>>>(
         (const half *) mask->data, int(mask->nb[1]/sizeof(half)), indices.ptr, compact_mask.ptr, capacity, queries);
     CUDA_CHECK(cudaGetLastError());
     fattn_sj_compact_gather<<<dim3((capacity + 3)/4, 2), dim3(32, 4), 0, ctx.stream()>>>(
         (const char *) K->data, (const char *) V->data, ggml_cuda_qsa_resident_body(dst->src[5]), (const int32_t *) dst->src[6]->data,
-        K->nb[1], K->nb[2], V->nb[1], V->nb[2], indices.ptr, (half2 *) kv.ptr, (half2 *) (kv.ptr + elements), capacity);
+        K->nb[1], K->nb[2], V->nb[1], V->nb[2], indices.ptr, live_count.ptr, (half2 *) kv.ptr, (half2 *) (kv.ptr + elements), capacity);
     CUDA_CHECK(cudaGetLastError());
     if (mode == 2) {
         fattn_sj_compact_gather_check<<<dim3(capacity, 2), dim3(32, 4), 16*128*sizeof(half2), ctx.stream()>>>(
@@ -330,6 +380,8 @@ bool ggml_cuda_flash_attn_ext_sj_kvarn_compact(ggml_backend_cuda_context & ctx, 
     for (int i : {4, 5, 6, 7}) {
         ggml_set_op_params_i32(&out, i, 0);
     }
+    // one query tile and one sequence: the kernel stops at live_count[1] instead of walking the whole capacity
+    ggml_cuda_fattn_kv_max_override = live_count.ptr + 1;
     if (queries == 1) {
         ggml_cuda_flash_attn_ext_mma_f16_case<256, 256, 1, 8>(ctx, &out, false);
     } else if (queries == 4) {
@@ -337,6 +389,7 @@ bool ggml_cuda_flash_attn_ext_sj_kvarn_compact(ggml_backend_cuda_context & ctx, 
     } else {
         ggml_cuda_flash_attn_ext_mma_f16_case<256, 256, 8, 8>(ctx, &out, false);
     }
+    ggml_cuda_fattn_kv_max_override = nullptr;
     if (mode == 2) {
         fattn_sj_compact_compare<<<1, 256, 0, ctx.stream()>>>(reference.ptr, (const float *) dst->data, int(ggml_nelements(dst)));
         CUDA_CHECK(cudaGetLastError());
