@@ -2070,17 +2070,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 continue;
             }
 
-            const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
-            verify_h_rows[seq_id] = n_rows;
-            verify_h[seq_id].resize((size_t) n_rows * n_embd);
+            // accept() reads the row of the last accepted token of a verification batch (a few rows); of a longer batch, such as
+            // a prompt, only the last row is ever read, so only that one is kept
+            const int32_t n_rows  = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+            const int32_t n_keep  = n_rows <= std::max<int32_t>(defer_max, this->params.n_max + 1) ? n_rows : 1;
+            const int32_t i_first = i_batch_end[seq_id] - n_keep + 1;
+            verify_h_rows[seq_id] = n_keep;
+            verify_h[seq_id].resize((size_t) n_keep * n_embd);
 
-            for (int32_t i = 0; i < n_rows; ++i) {
-                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
+            for (int32_t i = 0; i < n_keep; ++i) {
+                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_first + i);
                 std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
             }
 
             std::memcpy(pending_h[seq_id].data(),
-                    verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
+                    verify_h[seq_id].data() + (size_t) (n_keep - 1) * n_embd, row_bytes);
         }
 
         return true;
