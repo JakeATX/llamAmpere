@@ -6,6 +6,9 @@
 // after the last one (a decode keeps them hot) and sleep after that, so a long prompt or an idle server costs
 // no CPU. The dot products are ggml's own CPU kernels (their AVX2 versions on the Zen 3 build), except Q2_0, whose
 // CPU kernel is scalar: it gets its own AVX2 loop below.
+#if defined(__linux__)
+#include <sys/prctl.h>
+#endif
 #include "moe-cpu-split.h"
 #include "ggml.h"
 #include "ggml-cpu.h"
@@ -125,6 +128,8 @@ struct pool_state {
     std::vector<layer_math> layers;
     int threads = 1;
     int spin_ms = 250;
+    int spin_us = 250000;   // spin window after the last job (GGML_MOE_CPU_SPLIT_SPIN_US, default SPIN_MS x 1000)
+    int nap_us = 1000;      // longest leader nap once the window has passed (GGML_MOE_CPU_SPLIT_NAP_US)
     std::vector<std::thread> workers;
 
     // per-job state, written by thread 0 before `gen` moves
@@ -302,7 +307,7 @@ void worker_main(pool_state * sp, int idx, int cpu) {
     pin_thread(cpu);
     unsigned long long seen = 0;
     for (;;) {
-        auto spin_until = clk::now() + std::chrono::milliseconds(s.spin_ms);
+        auto spin_until = clk::now() + std::chrono::microseconds(s.spin_us);
         unsigned long long g;
         int polls = 0;
         while ((g = s.gen.load(std::memory_order_acquire)) == seen) {
@@ -327,11 +332,14 @@ void worker_main(pool_state * sp, int idx, int cpu) {
 void leader_main(pool_state * sp, int cpu) {
     pool_state & s = *sp;
     pin_thread(cpu);
+#if defined(__linux__)
+    (void) prctl(PR_SET_TIMERSLACK, 1000UL, 0, 0, 0);   // naps end within ~1 us of the asked time, not +50 us
+#endif
     unsigned long long last_seq = s.job->seq;
     unsigned long long last_local = 0;
     unsigned long long n = 0;
-    auto spin_until = clk::now() + std::chrono::milliseconds(s.spin_ms);
-    int idle_us = 20;
+    auto spin_until = clk::now() + std::chrono::microseconds(s.spin_us);
+    int idle_us = std::min(20, s.nap_us);
     for (;;) {
         const unsigned long long seq = s.job->seq;
         const unsigned long long local = s.local_seq.load(std::memory_order_acquire);
@@ -343,11 +351,11 @@ void leader_main(pool_state * sp, int cpu) {
                 // Idle (prompt reading, between requests): back off to 1 ms naps so an idle pool costs almost no
                 // CPU; the first layer after a long idle waits at most that long, then the spin window resumes.
                 sleep_us(idle_us);
-                idle_us = std::min(1000, idle_us * 2);
+                idle_us = std::min(s.nap_us, idle_us * 2);
             }
             continue;
         }
-        idle_us = 20;
+        idle_us = std::min(20, s.nap_us);
         std::atomic_thread_fence(std::memory_order_acquire);
         const auto t0 = clk::now();
         const int layer = s.job->layer;
@@ -393,7 +401,7 @@ void leader_main(pool_state * sp, int cpu) {
             last_local = local;
             s.local_done.store(local, std::memory_order_release);
         }
-        spin_until = clk::now() + std::chrono::milliseconds(s.spin_ms);
+        spin_until = clk::now() + std::chrono::microseconds(s.spin_us);
     }
 }
 
@@ -418,6 +426,8 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
     s.rows_ug = env_int("GGML_MOE_CPU_SPLIT_ROWS_UG", 16, 1, 4096);
     s.rows_down = env_int("GGML_MOE_CPU_SPLIT_ROWS_DOWN", 64, 1, 8192);
     s.spin_ms = env_int("GGML_MOE_CPU_SPLIT_SPIN_MS", 250, 0, 600000);
+    s.spin_us = env_int("GGML_MOE_CPU_SPLIT_SPIN_US", s.spin_ms * 1000, 0, 600000000);
+    s.nap_us = env_int("GGML_MOE_CPU_SPLIT_NAP_US", 1000, 1, 100000);
     for (int p = 0; p < 4; ++p) { s.next[p].store(0); s.fin[p].store(0); }
     // One thread per physical core, never an SMT sibling, never core 0 (the OS and the desktop) and never the
     // core of the thread that drives the card: a spinning pool thread sharing a core with it is time-sliced in
@@ -472,8 +482,8 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
     for (auto & t : s.workers) { t.detach(); }
     std::string where;
     for (int i = 0; pin && i < s.threads; ++i) { where += (i ? "," : "") + std::to_string(cpu_of(i)); }
-    fprintf(stderr, "[moe-cpu-split] pool: %d threads, %s%s (skipped cores at cpus %s), spin %d ms, rows up/gate %d down %d\n",
-            s.threads, pin ? "pinned to cpus " : "unpinned", where.c_str(), skipped.c_str(), s.spin_ms, s.rows_ug, s.rows_down);
+    fprintf(stderr, "[moe-cpu-split] pool: %d threads, %s%s (skipped cores at cpus %s), spin %d us, nap %d us, rows up/gate %d down %d\n",
+            s.threads, pin ? "pinned to cpus " : "unpinned", where.c_str(), skipped.c_str(), s.spin_us, s.nap_us, s.rows_ug, s.rows_down);
     return true;
 }
 
