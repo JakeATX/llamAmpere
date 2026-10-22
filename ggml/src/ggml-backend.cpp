@@ -3032,7 +3032,7 @@ static thread_local ggml_sched_pf_clock * t_pf = nullptr;
 static bool ggml_sched_upload_kernel_enabled() {
     static const bool on = [] {
         const char * e = getenv("GGML_SCHED_UPLOAD_KERNEL");
-        return e != nullptr && atoi(e) != 0;  // default off until timed
+        return e == nullptr || atoi(e) != 0;  // default on (POSTFIX trio 73.25 / 76.92 / 73.80 tok/s, identical words); 0 turns it off
     }();
     return on;
 }
