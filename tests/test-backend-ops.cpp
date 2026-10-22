@@ -5084,6 +5084,10 @@ struct test_dsv4_hc_mix : public test_case {
 
     static bool env_on(const char * name) {
         const char * e = getenv(name);
+        // HC_POST_NORM and HC_PRE_XN are on by default (e565cf9fe); =0 turns them off
+        if (strcmp(name, "GGML_CUDA_HC_POST_NORM") == 0 || strcmp(name, "GGML_CUDA_HC_PRE_XN") == 0) {
+            return e == nullptr || atoi(e) != 0;
+        }
         return e != nullptr && atoi(e) != 0;
     }
     // [HCGP] taken from 64 tokens up; with live_x and HC_PRE_XN the fused kernel takes the xn rebuild
@@ -5334,6 +5338,10 @@ struct test_hc_post_norm : public test_case {
 
     static bool env_on(const char * name) {
         const char * e = getenv(name);
+        // HC_POST_NORM and HC_PRE_XN are on by default (e565cf9fe); =0 turns them off
+        if (strcmp(name, "GGML_CUDA_HC_POST_NORM") == 0 || strcmp(name, "GGML_CUDA_HC_PRE_XN") == 0) {
+            return e == nullptr || atoi(e) != 0;
+        }
         return e != nullptr && atoi(e) != 0;
     }
 
