@@ -341,6 +341,52 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     ggml_tensor * gate = build_lora_mm(w_up, lo);
     cb(gate, "hc_gate", il);
 
+    // [HCFUSED] LLAMA_HC_FUSED=1 (opt-in): at 1..8 tokens run the whole mix as two ops, ggml_dsv4_hc_down (norm folded
+    // into one split-K pass over W_down and W_inject, then silu and the 2*sigmoid scatter weights) and ggml_dsv4_hc_up
+    // (W_up, sigmoid gate and the mean over the streams). Only plain BF16 matmuls on xn / lo qualify (no LoRA, Hadamard
+    // fold, scale tensor or precision policy). The activations stay f32 where the unfused small-batch mul_mat_f rounds
+    // them to BF16, so the output moves by rounding only. The unfused nodes above are left unreferenced.
+    {
+        static const bool hc_fused = [] { const char * e = getenv("LLAMA_HC_FUSED"); return e && atoi(e) != 0; }();
+        const auto plain_bf16 = [](const ggml_tensor * t, const ggml_tensor * w, const ggml_tensor * src) {
+            if (t->op != GGML_OP_MUL_MAT || t->src[0] != w || t->src[1] != src || w->type != GGML_TYPE_BF16 ||
+                    t->src[2] != nullptr || t->src[3] != nullptr) {
+                return false;
+            }
+            for (int i = 0; i < 4; ++i) {
+                if (t->op_params[i] != 0) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        const int64_t R = w_down->ne[1];
+        bool ok = hc_fused && nt >= 1 && nt <= 8 && hc == 4 && n_embd % 512 == 0 && R % 64 == 0 &&
+            x->type == GGML_TYPE_F32 && ggml_is_contiguous(x) && x->ne[0] == n_embd && x->ne[1] == hc &&
+            w_norm->type == GGML_TYPE_F32 && ggml_is_contiguous(w_norm) && ggml_nelements(w_norm) == hc_dim &&
+            plain_bf16(lo_mm, w_down, xn) && plain_bf16(gate, w_up, lo);
+        ggml_tensor * inj_mm = nullptr;
+        if (ok && inject) {
+            inj_mm = build_lora_mm(w_inject, xn);
+            ok = plain_bf16(inj_mm, w_inject, xn);
+        }
+        if (ok) {
+            ggml_tensor * x3 = ggml_reshape_3d(ctx0, x, n_embd, hc, nt);
+            ggml_tensor * wn = ggml_reshape_2d(ctx0, w_norm, n_embd, hc);
+            ggml_tensor * dn = ggml_dsv4_hc_down(ctx0, x3, wn, w_down, inject ? w_inject : nullptr,
+                    hparams.f_norm_rms_eps, 1.0f / (float) hc, 1.0f / (float) hc);
+            cb(dn, "hc_fused_down", il);
+            if (inject) {
+                // already 2*sigmoid(inject/hc): build_hc_combine sees the HC_DOWN view and skips its activation
+                *inject = ggml_view_2d(ctx0, dn, hc, nt, hc*sizeof(float), R*nt*sizeof(float));
+                cb(*inject, "hc_inject", il);
+            }
+            ggml_tensor * mixed = ggml_dsv4_hc_up(ctx0, x3, wn, dn, w_up, 1.0f / (float) hc);
+            cb(mixed, "hc_mixed", il);
+            return mixed;
+        }
+    }
+
     ggml_tensor * mixed = nullptr;
     if (cparams.fused_dsv4_hc_pre && il >= 0) {
         // sigmoid gate and mean over the streams in one op
@@ -406,8 +452,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
     const int64_t nt = residual->ne[2];
 
     // 2*sigmoid centres the scatter weights on 1, so a zero injection is a plain residual add
-    ggml_tensor * w = ggml_sigmoid(ctx0, ggml_scale(ctx0, inject, 1.0f / (float) hc));
-    w = ggml_scale(ctx0, w, 2.0f);
+    // ([HCFUSED] the ggml_dsv4_hc_down injection segment already holds the activated weights)
+    ggml_tensor * w = inject;
+    if (!(inject->view_src && inject->view_src->op == GGML_OP_DSV4_HC_DOWN)) {
+        w = ggml_sigmoid(ctx0, ggml_scale(ctx0, inject, 1.0f / (float) hc));
+        w = ggml_scale(ctx0, w, 2.0f);
+    }
 
     ggml_tensor * cur = nullptr;
     if (cparams.fused_dsv4_hc_post && il >= 0) {
@@ -2027,7 +2077,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     ggml_tensor * conv_input = build_conv_state_at(inp, conv_states_all, qkv_mixed,
             conv_kernel_size - 1, conv_channels, il);
 
-    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+    // [GDNGETTER] LLAMA_GDN_STATE_GETTER=1: gather the ubatch states with their own GET_ROWS(cache, s_copy_main)
+    // instead of a view of the one combined gather, so that GET_ROWS has the gdn as its only reader and the CUDA
+    // #87 plan (gdn reads the cache rows in place) can take it. Same rows, same bytes; default off.
+    static const bool gdn_getter = [] { const char * e = getenv("LLAMA_GDN_STATE_GETTER"); return e != nullptr && atoi(e) != 0; }();
+    ggml_tensor * state = gdn_getter ?
+        build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs,
+                 [](ggml_context * ctx, ggml_tensor * states, ggml_tensor * ids) { return ggml_get_rows(ctx, states, ids); }) :
+        build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
     state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
     cb(state, "state_predelta", il);
 
@@ -2324,7 +2381,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
                 conv_states_all->nb[1],
                 (slot * mem_size + kv_head) * row_size);
 
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
+        // [CONVNOCONT] LLAMA_CONV_NOCONT=1 copies the strided window straight into the cache row (the copy
+        // takes any source strides, so the bytes are the same) instead of making it contiguous first. That is
+        // one launch less per slot, and it is the CPY(VIEW(concat)) form the CUDA conv ring fusion
+        // (ggml_cuda_conv_ring_match_at) recognizes, so the concat and every window copy fold into the
+        // ssm_conv launch. Default on (byte-identical tokens, 100K verify -1.2/-1.4 ms at w3/w4); LLAMA_CONV_NOCONT=0 turns it off.
+        static const bool no_cont = [] {
+            const char * e = getenv("LLAMA_CONV_NOCONT");
+            return e == nullptr || atoi(e) != 0;
+        }();
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, no_cont ? tail : ggml_cont(ctx0, tail), dst));
     }
 
     snapshot_shift_write(ctx0, gf, inp, conv_states_all, row_total, ubatch.n_seq_tokens, kv_head, mem_size, older);

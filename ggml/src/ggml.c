@@ -1327,6 +1327,8 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_COMB",
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
+    "DSV4_HC_DOWN",
+    "DSV4_HC_UP",
 
     "UNARY",
 
@@ -1344,7 +1346,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1444,6 +1446,8 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_comb(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
+    "dsv4_hc_down(x, w_norm, w_down, w_inject)",
+    "dsv4_hc_up(x, w_norm, down, w_up)",
 
     "unary(x)",
 
@@ -1461,7 +1465,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -7158,6 +7162,96 @@ struct ggml_tensor * ggml_dsv4_hc_post(
     result->src[1] = residual;
     result->src[2] = post;
     result->src[3] = comb;
+
+    return result;
+}
+
+// ggml_dsv4_hc_down / ggml_dsv4_hc_up
+
+struct ggml_tensor * ggml_dsv4_hc_down(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * w_norm,
+        struct ggml_tensor  * w_down,
+        struct ggml_tensor  * w_inject,
+        float                 eps,
+        float                 lo_scale,
+        float                 inj_scale) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(w_norm->type == GGML_TYPE_F32);
+    GGML_ASSERT(w_down->type == GGML_TYPE_BF16);
+
+    const int64_t n_embd = x->ne[0];
+    const int64_t hc     = x->ne[1];
+    const int64_t T      = x->ne[2];
+    const int64_t R      = w_down->ne[1];
+
+    GGML_ASSERT(x->ne[3] == 1);
+    GGML_ASSERT(ggml_is_contiguous(x));
+    GGML_ASSERT(w_norm->ne[0] == n_embd && w_norm->ne[1] == hc && w_norm->ne[2] == 1 && w_norm->ne[3] == 1);
+    GGML_ASSERT(ggml_is_contiguous(w_norm));
+    GGML_ASSERT(w_down->ne[0] == hc*n_embd && w_down->ne[2] == 1 && w_down->ne[3] == 1);
+    GGML_ASSERT(w_down->nb[0] == ggml_type_size(GGML_TYPE_BF16));
+
+    int32_t hc_inj = 0;
+    if (w_inject) {
+        GGML_ASSERT(w_inject->type == GGML_TYPE_BF16);
+        GGML_ASSERT(w_inject->ne[0] == hc*n_embd && w_inject->ne[1] == hc && w_inject->ne[2] == 1 && w_inject->ne[3] == 1);
+        GGML_ASSERT(w_inject->nb[0] == ggml_type_size(GGML_TYPE_BF16));
+        hc_inj = (int32_t) hc;
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (R + hc_inj + hc)*T);
+
+    ggml_set_op_params_f32(result, 0, eps);
+    ggml_set_op_params_i32(result, 1, hc_inj);
+    ggml_set_op_params_f32(result, 2, lo_scale);
+    ggml_set_op_params_f32(result, 3, inj_scale);
+
+    result->op     = GGML_OP_DSV4_HC_DOWN;
+    result->src[0] = x;
+    result->src[1] = w_norm;
+    result->src[2] = w_down;
+    result->src[3] = w_inject;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_dsv4_hc_up(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * w_norm,
+        struct ggml_tensor  * down,
+        struct ggml_tensor  * w_up,
+        float                 out_scale) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(w_norm->type == GGML_TYPE_F32);
+    GGML_ASSERT(down->type == GGML_TYPE_F32 && down->op == GGML_OP_DSV4_HC_DOWN);
+    GGML_ASSERT(w_up->type == GGML_TYPE_BF16);
+
+    const int64_t n_embd = x->ne[0];
+    const int64_t hc     = x->ne[1];
+    const int64_t T      = x->ne[2];
+    const int64_t R      = w_up->ne[0];
+    const int32_t hc_inj = ggml_get_op_params_i32(down, 1);
+
+    GGML_ASSERT(ggml_is_contiguous(x));
+    GGML_ASSERT(w_norm->ne[0] == n_embd && w_norm->ne[1] == hc);
+    GGML_ASSERT(down->src[0] == x && down->src[1] == w_norm);
+    GGML_ASSERT(down->ne[0] == (R + hc_inj + hc)*T);
+    GGML_ASSERT(w_up->ne[1] == hc*n_embd && w_up->ne[2] == 1 && w_up->ne[3] == 1);
+    GGML_ASSERT(w_up->nb[0] == ggml_type_size(GGML_TYPE_BF16));
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, T);
+
+    ggml_set_op_params_f32(result, 0, out_scale);
+    ggml_set_op_params_i32(result, 1, hc_inj);
+
+    result->op     = GGML_OP_DSV4_HC_UP;
+    result->src[0] = x;
+    result->src[1] = w_norm;
+    result->src[2] = down;
+    result->src[3] = w_up;
 
     return result;
 }

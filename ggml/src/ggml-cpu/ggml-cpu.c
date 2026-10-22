@@ -2838,6 +2838,14 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_dsv4_hc_post(params, tensor);
             } break;
+        case GGML_OP_DSV4_HC_DOWN:
+            {
+                ggml_compute_forward_dsv4_hc_down(params, tensor);
+            } break;
+        case GGML_OP_DSV4_HC_UP:
+            {
+                ggml_compute_forward_dsv4_hc_up(params, tensor);
+            } break;
         case GGML_OP_MAP_CUSTOM1:
             {
                 ggml_compute_forward_map_custom1(params, tensor);
@@ -3023,6 +3031,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_DSV4_HC_COMB:
         case GGML_OP_DSV4_HC_PRE:
         case GGML_OP_DSV4_HC_POST:
+        case GGML_OP_DSV4_HC_DOWN:
+        case GGML_OP_DSV4_HC_UP:
             {
                 n_tasks = n_threads;
             } break;
@@ -4217,6 +4227,13 @@ static int ggml_cpu_try_fuse_ops(
     }
 
     struct ggml_tensor * node = cgraph->nodes[node_n];
+
+    // Fused helpers call the op bodies directly, so they would miss ggml_compute_forward's empty-tensor skip.
+    // A zero-token expert matmul (a ubatch with no output rows, e.g. llama-perplexity's unscored first half)
+    // then tripped the mul_mat_id dst stride assert (nb2 <= nb3 with ne2 == 0).
+    if (ggml_is_empty(node)) {
+        return 0;
+    }
 
     if (node->op == GGML_OP_MUL_MAT_ID) {
         const int fused = ggml_cpu_try_fuse_moe_cache(cgraph, node_n, params);
