@@ -43,6 +43,6 @@ bool moe_cs_layer_ok(int layer);
 // Times host jobs on a registered layer (the pool must be idle: no card job in flight). Fills the cost of one
 // (expert, route) pair and the fixed cost of a job, in nanoseconds. False when no layer is registered.
 bool moe_cs_probe(double * route_ns, double * fixed_ns);
-// Statistics: [0] jobs, [1] experts, [2] routes, [3] busy ns, [4] null-source errors.
-void moe_cs_stats(unsigned long long out[5]);
+// Statistics: [0] jobs, [1] experts, [2] routes, [3] busy ns, [4] null-source errors, [5..8] ns per phase.
+void moe_cs_stats(unsigned long long out[9]);
 int moe_cs_threads();

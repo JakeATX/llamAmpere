@@ -147,6 +147,7 @@ struct pool_state {
     std::condition_variable sleep_cv;
 
     std::atomic<unsigned long long> st_jobs{0}, st_experts{0}, st_routes{0}, st_busy_ns{0}, st_null{0};
+    unsigned long long phase_ns[4] = {};   // thread 0's time through each phase (barrier included), summed
     // host-posted jobs (the probe) use this instead of the mapped seq
     std::atomic<unsigned long long> local_seq{0}, local_done{0};
 };
@@ -233,8 +234,9 @@ void run_item(pool_state & s, int phase, int item) {
 
 // Every thread runs all four phases of job number `n` (1-based); the fin counters only grow, so a thread that is
 // late to notice a finished phase never misses it.
-void run_job_phases(pool_state & s, unsigned long long n) {
+void run_job_phases(pool_state & s, unsigned long long n, bool lead = false) {
     const unsigned long long target = n * (unsigned long long) s.threads;
+    auto t = clk::now();
     for (int p = 0; p < 4; ++p) {
         const int total = items_of(s, p);
         for (int it = s.next[p].fetch_add(1, std::memory_order_relaxed); it < total;
@@ -244,6 +246,14 @@ void run_job_phases(pool_state & s, unsigned long long n) {
         s.fin[p].fetch_add(1, std::memory_order_acq_rel);
         if (p < 3) {
             while (s.fin[p].load(std::memory_order_acquire) < target) { cpu_relax(); }
+        }
+        if (lead) {
+            if (p == 3) {
+                while (s.fin[3].load(std::memory_order_acquire) < target) { cpu_relax(); }
+            }
+            const auto now = clk::now();
+            s.phase_ns[p] += (unsigned long long) std::chrono::duration_cast<std::chrono::nanoseconds>(now - t).count();
+            t = now;
         }
     }
 }
@@ -321,6 +331,7 @@ void leader_main(pool_state * sp, int cpu) {
     unsigned long long last_local = 0;
     unsigned long long n = 0;
     auto spin_until = clk::now() + std::chrono::milliseconds(s.spin_ms);
+    int idle_us = 20;
     for (;;) {
         const unsigned long long seq = s.job->seq;
         const unsigned long long local = s.local_seq.load(std::memory_order_acquire);
@@ -329,10 +340,14 @@ void leader_main(pool_state * sp, int cpu) {
             if (clk::now() < spin_until) {
                 for (int i = 0; i < 64; ++i) { cpu_relax(); }
             } else {
-                sleep_us(20);
+                // Idle (prompt reading, between requests): back off to 1 ms naps so an idle pool costs almost no
+                // CPU; the first layer after a long idle waits at most that long, then the spin window resumes.
+                sleep_us(idle_us);
+                idle_us = std::min(1000, idle_us * 2);
             }
             continue;
         }
+        idle_us = 20;
         std::atomic_thread_fence(std::memory_order_acquire);
         const auto t0 = clk::now();
         const int layer = s.job->layer;
@@ -357,7 +372,7 @@ void leader_main(pool_state * sp, int cpu) {
                 std::lock_guard<std::mutex> lk(s.sleep_mu);
                 s.sleep_cv.notify_all();
             }
-            run_job_phases(s, n);
+            run_job_phases(s, n, true);
             const unsigned long long target = n * (unsigned long long) s.threads;
             while (s.fin[3].load(std::memory_order_acquire) < target) { cpu_relax(); }
             s.st_experts.fetch_add((unsigned) s.n_exp, std::memory_order_relaxed);
@@ -491,6 +506,22 @@ bool moe_cs_probe(double * route_ns, double * fixed_ns) {
             x[(size_t) q * s.x_stride + i] = 0.02f * (float) (((q * 131 + i * 7919) % 101) - 50);
         }
     }
+    auto post = [&](int e0, int n_exp) {
+        s.job->layer = layer;
+        s.job->n_exp = n_exp;
+        for (int i = 0; i < n_exp; ++i) {
+            s.job->expert[i] = experts[((size_t) e0 + i) % experts.size()];
+            s.job->first[i] = i;
+        }
+        s.job->first[n_exp] = n_exp;
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        const unsigned long long want = s.local_seq.load() + 1;
+        s.local_seq.store(want, std::memory_order_release);
+        while (s.local_done.load(std::memory_order_acquire) != want) { cpu_relax(); }
+    };
+    // Touch every probe expert once first (page faults on first touch of mapped weights are not the steady cost).
+    for (size_t e = 0; e < experts.size(); e += 4) { post((int) e, 4); }
+    for (int p = 0; p < 4; ++p) { s.phase_ns[p] = 0; }
     auto run = [&](int n_exp) {
         double best = 1e30;
         for (int rep = 0; rep < 24; ++rep) {
@@ -512,7 +543,14 @@ bool moe_cs_probe(double * route_ns, double * fixed_ns) {
         return best;
     };
     const double t1 = run(1);
+    unsigned long long ph1[4];
+    for (int p = 0; p < 4; ++p) { ph1[p] = s.phase_ns[p] / 24; s.phase_ns[p] = 0; }
     const double t4 = run(4);
+    unsigned long long ph4[4];
+    for (int p = 0; p < 4; ++p) { ph4[p] = s.phase_ns[p] / 24; s.phase_ns[p] = 0; }
+    fprintf(stderr, "[moe-cpu-split] probe phases (mean us, quantize x / up+gate / quantize hidden / down): "
+            "1 expert %.1f %.1f %.1f %.1f, 4 experts %.1f %.1f %.1f %.1f\n",
+            ph1[0] / 1e3, ph1[1] / 1e3, ph1[2] / 1e3, ph1[3] / 1e3, ph4[0] / 1e3, ph4[1] / 1e3, ph4[2] / 1e3, ph4[3] / 1e3);
     const double per = std::max(1000.0, (t4 - t1) / 3.0);
     *route_ns = per;
     *fixed_ns = std::max(0.0, t1 - per);
@@ -523,8 +561,9 @@ bool moe_cs_probe(double * route_ns, double * fixed_ns) {
     return true;
 }
 
-void moe_cs_stats(unsigned long long out[5]) {
+void moe_cs_stats(unsigned long long out[9]) {
     pool_state & s = P();
+    for (int p = 0; p < 4; ++p) { out[5 + p] = s.phase_ns[p]; }
     out[0] = s.st_jobs.load();
     out[1] = s.st_experts.load();
     out[2] = s.st_routes.load();

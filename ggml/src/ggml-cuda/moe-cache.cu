@@ -225,15 +225,16 @@ static void moe_missjoin_log(const char * when) {
     }
     if (g_cs_on && g_cs_plan) {
         moe_cs_plan_dev plan{};
-        unsigned long long host[5] = {};
+        unsigned long long host[9] = {};
         moe_cs_stats(host);
         if (cudaMemcpy(&plan, g_cs_plan, sizeof(plan), cudaMemcpyDeviceToHost) != cudaSuccess) {
             (void) cudaGetLastError();
         }
         MOE_CACHE_LOG("[moe-cache] cpu split %s: planned_layers=%llu published_layers=%llu cpu_experts=%llu cpu_routes=%llu "
-                "host_jobs=%llu host_experts=%llu host_routes=%llu host_busy_ms=%.1f host_null_src=%llu card_timeouts=%llu\n",
+                "host_jobs=%llu host_experts=%llu host_routes=%llu host_busy_ms=%.1f (phases ms %.1f/%.1f/%.1f/%.1f) host_null_src=%llu card_timeouts=%llu\n",
                 when, plan.stat_layers, g_cs_layers_published.load(std::memory_order_relaxed), plan.stat_experts,
-                plan.stat_routes, host[0], host[1], host[2], host[3] / 1e6, host[4],
+                plan.stat_routes, host[0], host[1], host[2], host[3] / 1e6, host[5] / 1e6, host[6] / 1e6, host[7] / 1e6,
+                host[8] / 1e6, host[4],
                 g_cs_job_h ? (unsigned long long) g_cs_job_h->gpu_timeouts : 0ull);
     }
 }
