@@ -17168,7 +17168,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(257, 24, 3, 60, 300, true, true, GGML_TYPE_TQ6_0, 128, true));
     // fork: compact main-model attention, with a wrapped ring, sparse union, finite mask bias and padded tail.
-    for (int64_t n_q : {1, 4, 5}) {
+    for (int64_t n_q : {1, 2, 3, 4, 5}) {
         for (int mask_mode : {1, 2}) {
             test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 2, 69, 257, false, false,
                 GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_F32, 4, 4, 0, 0, mask_mode, 0, 512));
@@ -17179,7 +17179,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(5, 24, 2, 69, 257, false, false,
         GGML_TYPE_F16, 128, true, GGML_TYPE_F32, 4, 4, 1, 0, 2, 0, 512));
     // 100K-like compact case: 792 groups, the real QSA bound (2,051 cells per row), many 2048-position scan chunks
-    for (int64_t n_q : {4, 5}) {
+    for (int64_t n_q : {2, 4, 5}) {
         test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 2, 792, 1024, false, true,
             GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_F32, 4, 4, 0, 0, 2, 0, 2051));
     }

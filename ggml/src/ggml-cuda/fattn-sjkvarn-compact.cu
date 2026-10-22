@@ -147,11 +147,12 @@ static __device__ __forceinline__ half fattn_sj_compact_code(
 static __global__ void fattn_sj_compact_gather(
         const char * K, const char * V, const char * body, const int32_t * desc,
         const size_t k_row_stride, const size_t k_head_stride, const size_t v_row_stride, const size_t v_head_stride,
-        const int32_t * indices, const int32_t * live_count, half2 * k_out, half2 * v_out, const int capacity) {
+        const int32_t * indices, half2 * k_out, half2 * v_out, const int capacity) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     const int row_out = blockIdx.x*blockDim.y + threadIdx.y;
-    // rows at and past live_count[1] lie beyond the device KV bound handed to the attention kernel, which never loads them
-    if (row_out >= capacity || row_out >= live_count[1]) {
+    // rows past the live union still get finite zeros: a stream-K block whose KV range starts beyond the device KV
+    // bound runs its first tile anyway (the kernel's last iteration is unconditional), and 0*garbage could be NaN
+    if (row_out >= capacity) {
         return;
     }
     const int p = indices[row_out];
@@ -301,7 +302,7 @@ bool ggml_cuda_flash_attn_ext_sj_kvarn_compact(ggml_backend_cuda_context & ctx, 
     if (cc != 860 || !ampere_mma_available(cc) || max_bias != 0.0f || dst->src[5] == nullptr || dst->src[6] == nullptr ||
             ggml_get_op_params_i32(dst, 5) != ((4 << 8) | 4) || ggml_get_op_params_i32(dst, 7) != GGML_TYPE_F32 ||
             ggml_cuda_fattn_sj_kvarn_rot(dst) || Q->type != GGML_TYPE_F32 || Q->ne[0] != 256 || Q->nb[0] != sizeof(float) ||
-            (Q->ne[1] != 1 && Q->ne[1] != 4 && Q->ne[1] != 5) || Q->ne[2] != 24 || Q->ne[3] != 1 ||
+            Q->ne[1] < 1 || Q->ne[1] > 5 || Q->ne[2] != 24 || Q->ne[3] != 1 ||
             K->ne[0] != 256 || V->ne[0] != 256 || K->ne[2] != 2 || V->ne[2] != 2 || K->ne[3] != 1 || V->ne[3] != 1 ||
             (K->type != GGML_TYPE_F16 && K->type != GGML_TYPE_Q8_0 && K->type != GGML_TYPE_TQ6_0) || V->type != K->type ||
             dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) || mask == nullptr || mask->type != GGML_TYPE_F16 ||
@@ -340,7 +341,7 @@ bool ggml_cuda_flash_attn_ext_sj_kvarn_compact(ggml_backend_cuda_context & ctx, 
     CUDA_CHECK(cudaGetLastError());
     fattn_sj_compact_gather<<<dim3((capacity + 3)/4, 2), dim3(32, 4), 0, ctx.stream()>>>(
         (const char *) K->data, (const char *) V->data, ggml_cuda_qsa_resident_body(dst->src[5]), (const int32_t *) dst->src[6]->data,
-        K->nb[1], K->nb[2], V->nb[1], V->nb[2], indices.ptr, live_count.ptr, (half2 *) kv.ptr, (half2 *) (kv.ptr + elements), capacity);
+        K->nb[1], K->nb[2], V->nb[1], V->nb[2], indices.ptr, (half2 *) kv.ptr, (half2 *) (kv.ptr + elements), capacity);
     CUDA_CHECK(cudaGetLastError());
     if (mode == 2) {
         fattn_sj_compact_gather_check<<<dim3(capacity, 2), dim3(32, 4), 16*128*sizeof(half2), ctx.stream()>>>(
@@ -384,7 +385,7 @@ bool ggml_cuda_flash_attn_ext_sj_kvarn_compact(ggml_backend_cuda_context & ctx, 
     ggml_cuda_fattn_kv_max_override = live_count.ptr + 1;
     if (queries == 1) {
         ggml_cuda_flash_attn_ext_mma_f16_case<256, 256, 1, 8>(ctx, &out, false);
-    } else if (queries == 4) {
+    } else if (queries <= 4) { // 2-4 verify rows share one 4-row query tile
         ggml_cuda_flash_attn_ext_mma_f16_case<256, 256, 4, 8>(ctx, &out, false);
     } else {
         ggml_cuda_flash_attn_ext_mma_f16_case<256, 256, 8, 8>(ctx, &out, false);
