@@ -637,6 +637,11 @@ private:
 
     llm_graph_result * gf_res_prev_active = nullptr;
     uint64_t           gf_res_prev_epoch  = 0; // ggml_backend_sched_get_alloc_epoch when gf_res_prev_active was allocated
+    // fork ROUNDPREP (LLAMA_MTP_PLAN_SLOTS=1): the helper keeps its catch-up graph (slot 0) and its guess-step graph
+    // (slot 1) allocated in two scheduler plans, so the first guess step of a round reuses last round's graph
+    std::array<llm_graph_result *, 2> plan_res    = {};
+    std::array<uint64_t, 2>           plan_epoch  = {};
+    std::array<uint64_t, 2>           plan_serial = {};
     uint64_t           backend_buf_exp_epoch = 0; // ggml_backend_sched_get_alloc_epoch when backend_buf_exp_size was taken
 
     // [B1] layer-major prefill (LLAMA_B1=1, opt-in; see llama-b1.h). Declared after the backends so it is

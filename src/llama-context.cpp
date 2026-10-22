@@ -4656,6 +4656,31 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
 
 build_graph:
     bookkeep_stage.next(bookkeep_perf ? &bookkeep_perf->graph_prepare_host_us : nullptr);
+    // fork ROUNDPREP: LLAMA_MTP_PLAN_SLOTS=1 (default off) gives the helper's two graph kinds their own scheduler plan.
+    // Every site that makes the allocated graph stale sets gf_res_prev_active to null, so a null here drops both
+    // slots; a slot is reused only when nothing was split into its plan since (serial) and the buffers are unchanged
+    // (epoch), plus the usual can_reuse check below.
+    static const bool plan_slots_env = [] {
+        const char * v = getenv("LLAMA_MTP_PLAN_SLOTS");
+        return v != nullptr && strcmp(v, "1") == 0;
+    }();
+    int plan_slot = -1;
+    if (plan_slots_env && cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && !graph_reuse_disable && !b1_cur.active &&
+            !cparams.pipeline_parallel) {
+        if (gf_res_prev_active == nullptr) {
+            plan_res.fill(nullptr);
+        }
+        const int want = n_outputs > 0 ? 1 : 0;
+        if (ggml_backend_sched_plan_select(sched.get(), want)) {
+            plan_slot = want;
+            const bool valid = plan_res[want] != nullptr &&
+                    plan_serial[want] == ggml_backend_sched_get_plan_serial(sched.get());
+            gf_res_prev_active = valid ? plan_res[want] : nullptr;
+            gf_res_prev_epoch  = valid ? plan_epoch[want] : 0;
+        } else {
+            plan_res.fill(nullptr);
+        }
+    }
     auto * res = get_gf_res_prev();
     auto * gf  = res->get_gf();
 
@@ -4734,6 +4759,11 @@ build_graph:
         // [B1] a layer-range graph is never reused: its carry, KV views and expert slots change every call
         gf_res_prev_active = b1_cur.active ? nullptr : res;
         gf_res_prev_epoch  = ggml_backend_sched_get_alloc_epoch(sched.get());
+        if (plan_slot >= 0) {
+            plan_res[plan_slot]    = res;
+            plan_epoch[plan_slot]  = gf_res_prev_epoch;
+            plan_serial[plan_slot] = ggml_backend_sched_get_plan_serial(sched.get());
+        }
         if (vf_cur) {
             vf_cur->rebuilds++;
         }

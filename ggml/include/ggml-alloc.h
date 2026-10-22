@@ -84,6 +84,8 @@ GGML_API bool ggml_gallocr_set_buffers(ggml_gallocr_t galloc, int buffer_id, ggm
 // Incremented when a recipient grows this (donor) allocator's buffers: graphs it allocated before are stale and must be
 // allocated again (ggml_gallocr_alloc_graph) before they are computed.
 GGML_API uint64_t ggml_gallocr_get_epoch(ggml_gallocr_t galloc);
+// fork ROUNDPREP: also increment the epoch whenever the allocator replaces one of its own buffers (default off)
+GGML_API void ggml_gallocr_set_epoch_on_realloc(ggml_gallocr_t galloc, bool enable);
 
 // Utils
 // Create a buffer and allocate all the tensors in a ggml_context

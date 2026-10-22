@@ -1347,6 +1347,44 @@ struct ggml_backend_sched {
 
     // calloc initializes these; scheduler execution and snapshots are externally serialized.
     struct ggml_backend_sched_bookkeep_perf bookkeep;
+
+    // fork ROUNDPREP plan slots (ggml_backend_sched_plan_select): the per-graph split plan of the slot that is not
+    // current, swapped in and out whole; NULL until a second slot is first selected
+    size_t graph_size_cfg;
+    int    plan_cur;
+    struct ggml_backend_sched_plan * plan_spare;
+    uint64_t plan_gen; // bumped when the allocator is replaced, so an old plan's epoch can never match again
+    uint64_t split_serial; // per plan: changes on every split of a graph into the current plan
+};
+
+// fork ROUNDPREP: everything ggml_backend_sched_split_graph and alloc_splits write for one graph. Two plans let a caller
+// alternate between two allocated graphs (the MTP helper's catch-up and its guess step) without splitting and
+// allocating again; both live in the same compute buffer, so only one may run at a time and each one's inputs are set
+// before every compute (llama does both).
+struct ggml_backend_sched_plan {
+    bool is_reset;
+    bool is_alloc;
+    struct ggml_hash_set  hash_set;
+    int                 * hv_tensor_backend_ids;
+    struct ggml_tensor ** hv_tensor_copies;
+    int * node_backend_ids;
+    int * leaf_backend_ids;
+    int * prev_node_backend_ids;
+    int * prev_leaf_backend_ids;
+    struct ggml_cgraph graph;
+    struct ggml_backend_sched_split * splits;
+    int n_splits;
+    int splits_capacity;
+    struct ggml_tensor ** graph_inputs;
+    int n_graph_inputs;
+    int graph_inputs_capacity;
+    struct ggml_context * ctx;
+    char * context_buffer;
+    size_t context_buffer_size;
+    bool moe_cache_device_graph;
+    int debug_graph_size;
+    int debug_prev_graph_size;
+    uint64_t split_serial;
 };
 
 static bool ggml_backend_bookkeep_enabled() {
@@ -2386,6 +2424,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     sched->n_splits = 0;
     sched->n_graph_inputs = 0;
     sched->is_reset = false;
+    // fork ROUNDPREP: unique across plans, so a plan's serial can never come back to a value recorded for another graph
+    static std::atomic<uint64_t> g_split_serial{0};
+    sched->split_serial = ++g_split_serial;
 
     struct ggml_init_params params = {
         /* .mem_size =   */ sched->context_buffer_size,
@@ -3484,6 +3525,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     sched->n_backends = n_backends;
     sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
+    sched->graph_size_cfg = graph_size;
 
     // initialize hash table
     // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)
@@ -3647,6 +3689,12 @@ bool ggml_backend_sched_reset_compute(ggml_backend_sched_t sched) {
     ggml_backend_sched_reset(sched);
     ggml_gallocr_free(sched->galloc);
     sched->galloc = replacement;
+    sched->plan_gen++;
+    if (sched->plan_spare) {
+        // the spare plan's tensors point into the freed allocator's buffers
+        sched->plan_spare->is_alloc = false;
+        ggml_gallocr_set_epoch_on_realloc(sched->galloc, true);
+    }
     sched->moe_cache_device_graph = false;
     sched->n_splits = 0;
     sched->debug_prev_graph_size = 0;
@@ -3757,6 +3805,26 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     free(sched->context_buffer);
     free(sched->graph.nodes);
     free(sched->graph.leafs);
+    if (sched->plan_spare) {
+        struct ggml_backend_sched_plan * p = sched->plan_spare;
+        ggml_free(p->ctx);
+        ggml_hash_set_free(&p->hash_set);
+        for (int i = 0; i < p->splits_capacity; i++) {
+            free(p->splits[i].inputs);
+        }
+        free(p->splits);
+        free(p->graph_inputs);
+        free(p->hv_tensor_backend_ids);
+        free(p->hv_tensor_copies);
+        free(p->node_backend_ids);
+        free(p->leaf_backend_ids);
+        free(p->prev_node_backend_ids);
+        free(p->prev_leaf_backend_ids);
+        free(p->context_buffer);
+        free(p->graph.nodes);
+        free(p->graph.leafs);
+        free(p);
+    }
     free(sched);
 }
 
@@ -3957,7 +4025,91 @@ bool ggml_backend_sched_set_buffers(ggml_backend_sched_t sched, ggml_backend_t b
 
 uint64_t ggml_backend_sched_get_alloc_epoch(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
-    return ggml_gallocr_get_epoch(sched->galloc);
+    return ggml_gallocr_get_epoch(sched->galloc) + (sched->plan_gen << 40);
+}
+
+// fork ROUNDPREP: create the second plan, empty (the first ggml_backend_sched_reset after it is swapped in clears it)
+static struct ggml_backend_sched_plan * ggml_backend_sched_plan_new(ggml_backend_sched_t sched) {
+    struct ggml_backend_sched_plan * p = (struct ggml_backend_sched_plan *) calloc(1, sizeof(struct ggml_backend_sched_plan));
+    if (!p) {
+        return NULL;
+    }
+    const size_t graph_size = sched->graph_size_cfg;
+    p->hash_set = ggml_hash_set_new(graph_size);
+    p->hv_tensor_backend_ids = (int *) malloc(p->hash_set.size * sizeof(p->hv_tensor_backend_ids[0]));
+    p->hv_tensor_copies      = (ggml_tensor **) malloc(p->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
+    const size_t nodes_size = graph_size + graph_size*GGML_SCHED_MAX_SPLIT_INPUTS*2;
+    p->node_backend_ids      = (int *) calloc(nodes_size, sizeof(p->node_backend_ids[0]));
+    p->leaf_backend_ids      = (int *) calloc(nodes_size, sizeof(p->leaf_backend_ids[0]));
+    p->prev_node_backend_ids = (int *) calloc(nodes_size, sizeof(p->prev_node_backend_ids[0]));
+    p->prev_leaf_backend_ids = (int *) calloc(nodes_size, sizeof(p->prev_leaf_backend_ids[0]));
+    p->context_buffer_size = sched->context_buffer_size;
+    p->context_buffer = (char *) malloc(p->context_buffer_size);
+    p->splits_capacity = 16;
+    p->splits = (ggml_backend_sched_split *) calloc(p->splits_capacity, sizeof(p->splits[0]));
+    p->graph_inputs_capacity = GGML_SCHED_MAX_SPLIT_INPUTS;
+    p->graph_inputs = (struct ggml_tensor **) calloc(p->graph_inputs_capacity, sizeof(struct ggml_tensor *));
+    GGML_ASSERT(p->hv_tensor_backend_ids && p->hv_tensor_copies && p->node_backend_ids && p->leaf_backend_ids &&
+            p->prev_node_backend_ids && p->prev_leaf_backend_ids && p->context_buffer && p->splits && p->graph_inputs);
+    p->is_reset = false;
+    p->is_alloc = false;
+    return p;
+}
+
+#define GGML_SCHED_PLAN_SWAP(field) std::swap(sched->field, p->field)
+
+bool ggml_backend_sched_plan_select(ggml_backend_sched_t sched, int slot) {
+    GGML_ASSERT(sched);
+    if (slot < 0 || slot > 1) {
+        return false;
+    }
+    if (slot == sched->plan_cur) {
+        return true;
+    }
+    // one graph copy only, and no expert-stream ring placement (its items are per split plan)
+    if (sched->n_copies != 1 || (sched->xs && sched->xs->enabled)) {
+        return false;
+    }
+    if (!sched->plan_spare) {
+        sched->plan_spare = ggml_backend_sched_plan_new(sched);
+        if (!sched->plan_spare) {
+            return false;
+        }
+        ggml_gallocr_set_epoch_on_realloc(sched->galloc, true);
+    }
+    struct ggml_backend_sched_plan * p = sched->plan_spare;
+    GGML_SCHED_PLAN_SWAP(is_reset);
+    GGML_SCHED_PLAN_SWAP(is_alloc);
+    GGML_SCHED_PLAN_SWAP(hash_set);
+    GGML_SCHED_PLAN_SWAP(hv_tensor_backend_ids);
+    GGML_SCHED_PLAN_SWAP(hv_tensor_copies);
+    GGML_SCHED_PLAN_SWAP(node_backend_ids);
+    GGML_SCHED_PLAN_SWAP(leaf_backend_ids);
+    GGML_SCHED_PLAN_SWAP(prev_node_backend_ids);
+    GGML_SCHED_PLAN_SWAP(prev_leaf_backend_ids);
+    GGML_SCHED_PLAN_SWAP(graph);
+    GGML_SCHED_PLAN_SWAP(splits);
+    GGML_SCHED_PLAN_SWAP(n_splits);
+    GGML_SCHED_PLAN_SWAP(splits_capacity);
+    GGML_SCHED_PLAN_SWAP(graph_inputs);
+    GGML_SCHED_PLAN_SWAP(n_graph_inputs);
+    GGML_SCHED_PLAN_SWAP(graph_inputs_capacity);
+    GGML_SCHED_PLAN_SWAP(ctx);
+    GGML_SCHED_PLAN_SWAP(context_buffer);
+    GGML_SCHED_PLAN_SWAP(context_buffer_size);
+    GGML_SCHED_PLAN_SWAP(moe_cache_device_graph);
+    GGML_SCHED_PLAN_SWAP(debug_graph_size);
+    GGML_SCHED_PLAN_SWAP(debug_prev_graph_size);
+    GGML_SCHED_PLAN_SWAP(split_serial);
+    sched->plan_cur = slot;
+    return true;
+}
+
+#undef GGML_SCHED_PLAN_SWAP
+
+uint64_t ggml_backend_sched_get_plan_serial(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    return sched->split_serial;
 }
 
 size_t ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend) {
