@@ -1498,6 +1498,33 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     if (llama_model_moe_arena_size(model) && !std::getenv("GGML_CUDA_MOE_CACHE_RESERVE_MB")) {
         common_set_env("GGML_CUDA_MOE_CACHE_RESERVE_MB", "2560");
     }
+    // Two or more server slots: every extra slot needs card memory after the
+    // expert cache has filled the card (prompt scratch, handoff staging and
+    // temporary pools sized per sequence). With reserve 1024 the two-user smoke
+    // peaked at 23,682 MiB whole-card, 130 MiB over the 23,552 cap, while one
+    // user peaks at 23,397. So the reserve grows by LLAMA_MOE_CACHE_SLOT_RESERVE_MB
+    // (default 256, 0 = off) for each slot past the first. One slot: unchanged.
+    static bool slot_reserve_applied = false;
+    if (llama_model_moe_arena_size(model) && params.n_parallel > 1 && !slot_reserve_applied) {
+        slot_reserve_applied = true;
+        long long slot_mb = 256;
+        if (const char * text = std::getenv("LLAMA_MOE_CACHE_SLOT_RESERVE_MB")) {
+            char * end = nullptr;
+            const long long parsed = std::strtoll(text, &end, 10);
+            if (end != text && *end == '\0' && parsed >= 0 && parsed <= 8192) {
+                slot_mb = parsed;
+            }
+        }
+        const char * reserve_text = std::getenv("GGML_CUDA_MOE_CACHE_RESERVE_MB");
+        char * end = nullptr;
+        const long long reserve_mb = reserve_text ? std::strtoll(reserve_text, &end, 10) : -1;
+        if (slot_mb > 0 && reserve_text && end != reserve_text && *end == '\0' && reserve_mb >= 0) {
+            const long long total_mb = reserve_mb + slot_mb * (long long) (params.n_parallel - 1);
+            common_set_env("GGML_CUDA_MOE_CACHE_RESERVE_MB", std::to_string(total_mb));
+            COM_INF("MoE cache: %d slots, reserve %lld MiB + %lld MiB per extra slot = %lld MiB\n",
+                params.n_parallel, reserve_mb, slot_mb, total_mb);
+        }
+    }
     if (llama_model_moe_arena_size(model) && !std::getenv("GGML_CUDA_MOE_CACHE_MIN_EXPERT_KB")) {
         common_set_env("GGML_CUDA_MOE_CACHE_MIN_EXPERT_KB", "1");
     }
