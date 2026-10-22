@@ -684,11 +684,15 @@ struct spec_adapt_ctrl {
 // post = the rest of the pass (sampling of non-speculative slots, prompt bookkeeping, token output). Printed and
 // reset with the slot timings.
 struct server_host_phase_clock {
-    enum phase { OUTSIDE, PREP, DRAFT, CKPT, BATCH, VERIFY, SAMPLE, POST, N_PHASE };
+    // [POSTFIX] POST is split further: POST_PRE (verify end -> catch-up: metrics, in-call checkpoints), CATCHUP (the
+    // helper catch-up call), POST_MID (catch-up end -> verify sampling), ACCEPT_KV (accept bookkeeping + KV trim),
+    // OUTPUT (token output), POST (the rest of the pass). The printed post is their sum.
+    enum phase { OUTSIDE, PREP, DRAFT, CKPT, BATCH, VERIFY, SAMPLE, POST_PRE, CATCHUP, POST_MID, ACCEPT_KV, OUTPUT, POST, N_PHASE };
 
     const bool on = common_speculative_host_phases_enabled();
     int64_t    t_last = 0;
     uint64_t   us[N_PHASE] = {};
+    uint64_t   mx[N_PHASE] = {};  // [POSTFIX] longest single charge, to tell one-off pass costs from per-round ones
     uint64_t   n_pass = 0;
 
     // charge the time since the previous mark to phase p
@@ -699,6 +703,7 @@ struct server_host_phase_clock {
         const int64_t t = ggml_time_us();
         if (t_last > 0) {
             us[p] += (uint64_t) (t - t_last);
+            mx[p] = std::max(mx[p], (uint64_t) (t - t_last));
         }
         t_last = t;
     }
@@ -706,6 +711,9 @@ struct server_host_phase_clock {
     void reset() {
         for (auto & u : us) {
             u = 0;
+        }
+        for (auto & m : mx) {
+            m = 0;
         }
         n_pass = 0;
     }
@@ -1561,7 +1569,12 @@ struct server_slot {
                         " host phases (LLAMA_HOST_PHASES) ms/round over %" PRIu64 " rounds, %" PRIu64 " passes: outside %.3f, prep %.3f, draft %.3f, ckpt %.3f, batch %.3f, verify %.3f, sample %.3f, post %.3f\n",
                         rounds, g_host_phases.n_pass,
                         u[hp::OUTSIDE] / 1000.0 / r, u[hp::PREP] / 1000.0 / r, u[hp::DRAFT] / 1000.0 / r, u[hp::CKPT] / 1000.0 / r,
-                        u[hp::BATCH] / 1000.0 / r, u[hp::VERIFY] / 1000.0 / r, u[hp::SAMPLE] / 1000.0 / r, u[hp::POST] / 1000.0 / r);
+                        u[hp::BATCH] / 1000.0 / r, u[hp::VERIFY] / 1000.0 / r, u[hp::SAMPLE] / 1000.0 / r,
+                        (u[hp::POST_PRE] + u[hp::CATCHUP] + u[hp::POST_MID] + u[hp::ACCEPT_KV] + u[hp::OUTPUT] + u[hp::POST]) / 1000.0 / r);
+                SLT_INF(*this, " post split ms/round: verify-end->catch-up %.3f, catch-up %.3f, catch-up->sample %.3f, accept+kv %.3f, output %.3f, pass tail %.3f (longest single: catch-up %.3f, pass tail %.3f, verify %.3f ms)\n",
+                        u[hp::POST_PRE] / 1000.0 / r, u[hp::CATCHUP] / 1000.0 / r, u[hp::POST_MID] / 1000.0 / r,
+                        u[hp::ACCEPT_KV] / 1000.0 / r, u[hp::OUTPUT] / 1000.0 / r, u[hp::POST] / 1000.0 / r,
+                        g_host_phases.mx[hp::CATCHUP] / 1000.0, g_host_phases.mx[hp::POST] / 1000.0, g_host_phases.mx[hp::VERIFY] / 1000.0);
                 if (dp.n_calls > 0) {
                     const double st = dp.n_steps > 0 ? (double) dp.n_steps : 1.0;
                     SLT_INF(*this,
@@ -6650,6 +6663,7 @@ private:
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
         if (spec) {
             for (auto & slot : slots) { slot.spec_clock.mark(server_bookkeep_clock::POST); }
+            g_host_phases.mark(server_host_phase_clock::POST_PRE);
             bool ok = true;
             queue_tasks.yield_to_queue([&]() {
                 for (auto & slot : slots) { slot.spec_clock.mark(server_bookkeep_clock::CATCHUP_QUEUE); }
@@ -6667,6 +6681,7 @@ private:
                 throw std::runtime_error("failed to process speculative batch");
             }
             for (auto & slot : slots) { slot.spec_clock.mark(server_bookkeep_clock::CATCHUP_QUEUE); }
+            g_host_phases.mark(server_host_phase_clock::CATCHUP);
         }
 
         // fork: finish draft catch-up before returning scratch to the response cache.
@@ -6863,7 +6878,7 @@ private:
 
             // verify and try to accept the draft
             {
-                g_host_phases.mark(server_host_phase_clock::POST);
+                g_host_phases.mark(server_host_phase_clock::POST_MID);
                 slot.spec_clock.mark(server_bookkeep_clock::POST);
                 // fork: a sampler snapshot is used only when this round can require checkpoint replay.
                 const bool may_replay = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
@@ -7019,6 +7034,7 @@ private:
                 slot.sj_kvarn_accepted_end = slot.prompt.tokens.pos_next();
             }
             slot.spec_clock.mark(server_bookkeep_clock::KV);
+            g_host_phases.mark(server_host_phase_clock::ACCEPT_KV);
 
             for (size_t i = 0; i < ids.size(); ++i) {
                 completion_token_output result;
@@ -7043,6 +7059,7 @@ private:
             slot.print_timings_tg();
 
             slot.spec_clock.mark(server_bookkeep_clock::OUTPUT);
+            g_host_phases.mark(server_host_phase_clock::OUTPUT);
 
             SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) n_accepted, (int) n_draft, slot.prompt.n_tokens());
         });

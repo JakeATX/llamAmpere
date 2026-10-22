@@ -2994,7 +2994,84 @@ static bool ggml_backend_sched_is_host_weight(const struct ggml_tensor * t) {
         ggml_backend_buffer_is_host(t->buffer);
 }
 
+// [POSTFIX diag] LLAMA_POSTFIX_TIMING=1: host time of every scheduler input copy split into the wait for the split
+// backend (sync), the wait for the source backend and the copy itself, summed per input name. Clock reads only.
+static bool ggml_sched_pf_timing() {
+    static const bool on = getenv("LLAMA_POSTFIX_TIMING") != nullptr && atoi(getenv("LLAMA_POSTFIX_TIMING")) != 0;
+    return on;
+}
+struct ggml_sched_pf_entry { std::string name; size_t bytes = 0; uint64_t n = 0; int64_t wait_dst = 0, wait_src = 0, copy = 0; bool user = false; };
+struct ggml_sched_pf_clock {
+    std::vector<ggml_sched_pf_entry> e;
+    uint64_t n_total = 0;
+    int64_t t = 0;
+    int idx = -1;
+    void begin(const ggml_tensor * in) {
+        idx = -1;
+        for (size_t i = 0; i < e.size(); ++i) { if (e[i].name == in->name) { idx = (int) i; break; } }
+        if (idx < 0) { e.push_back({}); idx = (int) e.size() - 1; e[idx].name = in->name; }
+        e[idx].bytes = ggml_nbytes(in); e[idx].user = (in->flags & GGML_TENSOR_FLAG_INPUT) != 0; e[idx].n++;
+        t = ggml_time_us();
+    }
+    void lap(int64_t ggml_sched_pf_entry::* f) { const int64_t now = ggml_time_us(); e[idx].*f += now - t; t = now; }
+    void end() {
+        lap(&ggml_sched_pf_entry::copy);
+        if (++n_total % 4096 != 0) { return; }
+        std::string line;
+        for (const auto & x : e) {
+            char buf[256];
+            snprintf(buf, sizeof(buf), " [%s %zuB%s n %llu: wait_dst %.3f wait_src %.3f copy %.3f ms/call]", x.name.c_str(), x.bytes, x.user ? " user" : "",
+                    (unsigned long long) x.n, x.wait_dst / 1e3 / x.n, x.wait_src / 1e3 / x.n, x.copy / 1e3 / x.n);
+            line += buf;
+        }
+        GGML_LOG_INFO("postfix sched input copies (LLAMA_POSTFIX_TIMING) %llu copies:%s\n", (unsigned long long) n_total, line.c_str());
+    }
+};
+static thread_local ggml_sched_pf_clock * t_pf = nullptr;
+
+static bool ggml_sched_upload_kernel_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_SCHED_UPLOAD_KERNEL");
+        return e != nullptr && atoi(e) != 0;  // default off until timed
+    }();
+    return on;
+}
+using ggml_sched_upload_fn_t = bool (*)(ggml_backend_t, const void *, ggml_tensor *, size_t);
+static ggml_sched_upload_fn_t ggml_sched_upload_fn(ggml_backend_t backend) {
+    static std::mutex mu;
+    static std::vector<std::pair<ggml_backend_reg_t, ggml_sched_upload_fn_t>> cache;
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    if (!reg) {
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(mu);
+    for (const auto & c : cache) {
+        if (c.first == reg) {
+            return c.second;
+        }
+    }
+    auto fn = (ggml_sched_upload_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_upload_host_small");
+    cache.emplace_back(reg, fn);
+    return fn;
+}
+
+static void ggml_backend_sched_copy_input_impl(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input);
 static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input) {
+    if (!ggml_sched_pf_timing()) {
+        ggml_backend_sched_copy_input_impl(sched, split, input);
+        return;
+    }
+    static thread_local ggml_sched_pf_clock clk;
+    t_pf = &clk;
+    clk.begin(input);
+    ggml_backend_sched_copy_input_impl(sched, split, input);
+    clk.end();
+    t_pf = nullptr;
+}
+#define PF_LAP(f) do { if (t_pf) { t_pf->lap(&ggml_sched_pf_entry::f); } } while (0)
+
+static void ggml_backend_sched_copy_input_impl(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input) {
     auto * perf = ggml_backend_bookkeep_enabled() ? &sched->bookkeep : nullptr;
     const ggml_backend_bookkeep_timer copy_timer(perf ? &perf->input_copy_host_us : nullptr);
     const int split_backend_id = split->backend_id;
@@ -3010,6 +3087,25 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
         return;
     }
 
+    // [POSTFIX] GGML_SCHED_UPLOAD_KERNEL=1: a small host-resident input (a user input or a CPU split's output) is
+    // snapshotted into the split backend's staging memory and copied on that backend's stream (CUDA:
+    // ggml_backend_cuda_upload_host_small). Stream order replaces the host waits below, and the copy does not queue
+    // behind a large copy-engine transfer. Same bytes as the plain copy.
+    if (ggml_sched_upload_kernel_enabled() && input_backend != NULL &&
+            ggml_backend_dev_type(ggml_backend_get_device(input_backend)) == GGML_BACKEND_DEVICE_TYPE_CPU &&
+            input->buffer != NULL && ggml_backend_buffer_is_host(input->buffer) && input->data != NULL &&
+            !ggml_backend_sched_is_host_weight(input) && ggml_are_same_layout(input, input_cpy)) {
+        const ggml_sched_upload_fn_t upload = ggml_sched_upload_fn(split_backend);
+        if (upload) {
+            if (!(input->flags & GGML_TENSOR_FLAG_INPUT)) {
+                ggml_backend_synchronize(input_backend);  // the producing CPU split must be finished
+            }
+            if (upload(split_backend, input->data, input_cpy, ggml_nbytes(input))) {
+                return;
+            }
+        }
+    }
+
     if (input->flags & GGML_TENSOR_FLAG_INPUT) {
         // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
         {
@@ -3020,6 +3116,7 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
                 ggml_backend_synchronize(split_backend);
             }
         }
+        PF_LAP(wait_dst);
         ggml_backend_tensor_copy(input, input_cpy);
         return;
     }
@@ -3030,6 +3127,7 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
     } else {
         ggml_backend_synchronize(split_backend);
     }
+    PF_LAP(wait_dst);
 
     if (sched->callback_copy != NULL && ggml_backend_sched_is_host_weight(input) &&
         sched->callback_copy(split_backend, input, input_cpy, &split->graph, sched->callback_copy_user_data)) {
@@ -3047,14 +3145,17 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
         ggml_backend_synchronize(input_backend);
+        PF_LAP(wait_src);
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
         } else {
             ggml_backend_synchronize(split_backend);
         }
+        PF_LAP(wait_dst);
         ggml_backend_tensor_copy(input, input_cpy);
     }
 }
+#undef PF_LAP
 
 
 // [VFLOOR] GGML_SCHED_VF_TIMING=1: host time per scheduler phase and per split of small-batch graphs

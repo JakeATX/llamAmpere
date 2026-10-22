@@ -4674,6 +4674,111 @@ static bool ggml_backend_cuda_scratch_preflight(ggml_backend_t backend, const gg
         ggml_cuda_borrowed_plan_fits(*static_cast<ggml_backend_cuda_context *>(backend->context), graph);
 }
 
+// [POSTFIX] small host -> card scheduler input copies through a mapped pinned staging ring and a copy kernel on the
+// backend stream (ggml-backend.cpp asks for this through the proc address "ggml_backend_cuda_upload_host_small").
+// The plain path is a cudaMemcpyAsync on the per-thread stream followed by cudaStreamSynchronize. That DMA copy
+// queues behind any large host -> card copy already in flight: the MoE cache swap issues ~100 MB right after every
+// check, so the helper's first input after a check waited ~2 ms on the host. A kernel that reads the mapped staging
+// memory does not wait for that copy queue, and the host does not wait at all (the copy is ordered on the stream).
+// The copied bytes are the same. Staging slots are reused only after their copy kernel finished (one event per slot).
+struct ggml_cuda_upload_ring {
+    static constexpr size_t RING_BYTES = 8u << 20;
+    std::mutex mu;
+    char * host = nullptr;
+    char * dev  = nullptr;
+    size_t head = 0;
+    bool   failed = false;
+    struct pending { size_t beg, end; cudaEvent_t ev; };
+    std::vector<pending>     inflight;  // oldest first
+    std::vector<cudaEvent_t> spare;
+};
+
+static __global__ void k_cuda_upload_copy(const char * __restrict__ src, char * __restrict__ dst, size_t n) {
+    const size_t stride = (size_t) gridDim.x * blockDim.x;
+    const size_t i0 = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if ((((uintptr_t) dst) & 15) == 0) {  // src is 256-byte aligned
+        const size_t n16 = n / 16;
+        for (size_t i = i0; i < n16; i += stride) {
+            ((uint4 *) dst)[i] = ((const uint4 *) src)[i];
+        }
+        for (size_t i = n16 * 16 + i0; i < n; i += stride) {
+            dst[i] = src[i];
+        }
+    } else {
+        for (size_t i = i0; i < n; i += stride) {
+            dst[i] = src[i];
+        }
+    }
+}
+
+static bool ggml_backend_cuda_upload_host_small(ggml_backend_t backend, const void * src, ggml_tensor * dst, size_t size) {
+    if (!backend || !ggml_backend_is_cuda(backend) || !src || !dst || !dst->data || size == 0 ||
+            size > ggml_cuda_upload_ring::RING_BYTES / 8) {
+        return false;
+    }
+    auto * ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
+    if (ctx->scratch_borrowed) {
+        return false;
+    }
+    static ggml_cuda_upload_ring rings[GGML_CUDA_MAX_DEVICES];
+    auto & r = rings[ctx->device];
+    std::lock_guard<std::mutex> lock(r.mu);
+    if (r.failed) {
+        return false;
+    }
+    ggml_cuda_set_device(ctx->device);
+    if (!r.host) {
+        if (cudaHostAlloc((void **) &r.host, ggml_cuda_upload_ring::RING_BYTES, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+                cudaHostGetDevicePointer((void **) &r.dev, r.host, 0) != cudaSuccess) {
+            (void) cudaGetLastError();
+            r.failed = true;
+            GGML_LOG_WARN("%s: no mapped staging ring; small uploads use the copy engine\n", __func__);
+            return false;
+        }
+    }
+    const size_t need = GGML_PAD(size, 256);
+    if (r.head + need > ggml_cuda_upload_ring::RING_BYTES) {
+        r.head = 0;
+    }
+    const size_t beg = r.head, end = beg + need;
+    // retire finished copies; wait only for one that still reads the bytes about to be overwritten
+    size_t n_done = 0;
+    for (; n_done < r.inflight.size(); ++n_done) {
+        const auto & p = r.inflight[n_done];
+        const bool overlap = p.beg < end && beg < p.end;
+        if (overlap) {
+            CUDA_CHECK(cudaEventSynchronize(p.ev));
+        } else if (cudaEventQuery(p.ev) != cudaSuccess) {
+            (void) cudaGetLastError();
+            break;
+        }
+        r.spare.push_back(p.ev);
+    }
+    r.inflight.erase(r.inflight.begin(), r.inflight.begin() + n_done);
+    for (const auto & p : r.inflight) {  // a still-running copy further back must not overlap either
+        if (p.beg < end && beg < p.end) {
+            CUDA_CHECK(cudaEventSynchronize(p.ev));
+        }
+    }
+    cudaEvent_t ev = nullptr;
+    if (!r.spare.empty()) {
+        ev = r.spare.back();
+        r.spare.pop_back();
+    } else {
+        CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
+    }
+    memcpy(r.host + beg, src, size);
+    cudaStream_t stream = ctx->stream();
+    const int threads = 256;
+    const int blocks  = (int) std::min<size_t>(256, std::max<size_t>(1, (size + 16 * threads - 1) / (16 * threads)));
+    k_cuda_upload_copy<<<blocks, threads, 0, stream>>>(r.dev + beg, (char *) dst->data, size);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaEventRecord(ev, stream));
+    r.inflight.push_back({ beg, end, ev });
+    r.head = end;
+    return true;
+}
+
 static bool ggml_backend_cuda_set_scratch_buffers(ggml_backend_t backend, ggml_backend_buffer_t * buffers, int n_buffers) {
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA) || CUBLAS_VER_MAJOR < 11 || (CUBLAS_VER_MAJOR == 11 && CUBLAS_VER_MINOR < 2)
     GGML_UNUSED_VARS(backend, buffers, n_buffers);
@@ -11276,6 +11381,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_set_scratch_buffers") == 0) {
         return (void *) ggml_backend_cuda_set_scratch_buffers;
+    }
+    if (strcmp(name, "ggml_backend_cuda_upload_host_small") == 0) {
+        return (void *) ggml_backend_cuda_upload_host_small;
     }
     if (strcmp(name, "ggml_backend_cuda_scratch_preflight") == 0) {
         return (void *) ggml_backend_cuda_scratch_preflight;
