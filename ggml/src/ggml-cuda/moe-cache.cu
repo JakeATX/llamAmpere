@@ -970,11 +970,11 @@ static bool moe_cache_env_i64(
 }
 
 // Physical free-memory floor kept by the device-table and missjoin-retain
-// checks after the expert pools are filled. The default 1 GiB made every
+// checks after the expert pools are filled. The old fixed 1 GiB made every
 // reserve at or below ~1 GiB fall back to legacy host routing (VRAMFIT,
-// 2026-10-22). GGML_CUDA_MOE_CACHE_FREE_FLOOR_MB lowers it so a smaller
-// reserve can give the cache more card memory; the reserve itself still
-// decides how much stays free.
+// 2026-10-22). The default is now 512 MiB so a 1,024 MiB reserve keeps the
+// device tables; the reserve itself still decides how much stays free.
+// GGML_CUDA_MOE_CACHE_FREE_FLOOR_MB overrides it (1024 = old behavior).
 static size_t moe_cache_physical_free_floor() {
     static const size_t floor = [] {
         int64_t value = 0;
@@ -982,7 +982,7 @@ static size_t moe_cache_physical_free_floor() {
             MOE_CACHE_LOG("[moe-cache] physical free floor override: %lld MiB\n", (long long) value);
             return (size_t) value << 20;
         }
-        return (size_t) 1 << 30;
+        return (size_t) 512 << 20;
     }();
     return floor;
 }
