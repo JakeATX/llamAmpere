@@ -8582,6 +8582,131 @@ static __global__ void moe_hf_plan_kernel(const moe_hf_plan_args args, const int
     }
 }
 
+// [VPLAN] GGML_MOE_HF_PLAN_FAST=1 (default off): the same plan with fewer dependent global-memory round trips.
+// moe_hf_plan_kernel waits on memory about a dozen times in a row (per-projection flag loads, the 1536-entry
+// address table copied one load at a time, the stats summed by one thread); this one loads every route's three
+// resident flags and addresses at once, ranks the staged experts in shared memory, and fills the address table
+// with the loads batched ahead of the stores. It writes the same nstage, src, eff and stats values, so every
+// later kernel reads exactly what it read before. Small batches only (<= MOE_HF_FAST_MAX_ROUTES routes,
+// <= MOE_HF_FAST_MAX_EXPERT experts); anything larger takes moe_hf_plan_kernel.
+#define MOE_HF_FAST_MAX_ROUTES 256
+#define MOE_HF_FAST_MAX_EXPERT 1024
+
+static bool moe_hf_plan_fast_enabled() {
+    static const bool on = [] { const char * v = getenv("GGML_MOE_HF_PLAN_FAST"); return v && atoi(v) != 0; }();
+    return on;
+}
+
+static __global__ void __launch_bounds__(256) moe_hf_plan_fast_kernel(const moe_hf_plan_args args, const int32_t * ids,
+        int n_ids, int n_routes, int ids_stride, int n_expert, int slots, unsigned aligned_mask, unsigned long long * counts) {
+    __shared__ int s_e[MOE_HF_FAST_MAX_ROUTES];
+    __shared__ unsigned char s_flag[3][MOE_HF_FAST_MAX_ROUTES];
+    __shared__ const void * s_src[3][MOE_HF_FAST_MAX_ROUTES];
+    __shared__ short s_slot[3][MOE_HF_FAST_MAX_EXPERT];  // expert -> staging slot, -1 when not staged
+    __shared__ int s_total[3];
+    __shared__ unsigned s_n[3];  // distinct experts, distinct misses, miss routes (all three projections)
+    const int tid = threadIdx.x;
+    for (int i = tid; i < n_routes; i += blockDim.x) {
+        s_e[i] = ids[(i / n_ids) * ids_stride + i % n_ids];
+    }
+    for (int j = tid; j < 3 * n_expert; j += blockDim.x) {
+        s_slot[j / n_expert][j % n_expert] = -1;
+    }
+    if (tid < 3) {
+        s_total[tid] = 0;
+        s_n[tid] = 0;
+    }
+    __syncthreads();
+    // bit0 distinct, bit1 miss, bit2 stageable (as in moe_hf_plan_kernel)
+    for (int i = tid; i < n_routes; i += blockDim.x) {
+        const int e = s_e[i];
+        const bool valid = e >= 0 && e < n_expert;
+        uint8_t hot[3] = { 1, 1, 1 };
+        const void * src[3] = { nullptr, nullptr, nullptr };
+        if (valid) {
+#pragma unroll
+            for (int k = 0; k < 3; ++k) {
+                hot[k] = args.hot[k][e];
+                src[k] = args.table[k][e];
+            }
+        }
+        bool first = valid;
+        for (int j = 0; j < i && first; ++j) {
+            first = s_e[j] != e;
+        }
+        unsigned dmiss = 0, mroutes = 0;
+#pragma unroll
+        for (int k = 0; k < 3; ++k) {
+            unsigned char f = 0;
+            if (first) {
+                f |= 1;
+                if (!hot[k]) {
+                    f |= 2;
+                    if ((aligned_mask >> k & 1u) && ((uintptr_t) src[k] & 15) == 0) { f |= 4; }
+                }
+            }
+            s_flag[k][i] = f;
+            s_src[k][i] = src[k];
+            dmiss += (f & 3) == 3;
+            mroutes += valid && !hot[k];
+        }
+        if (first) { atomicAdd(&s_n[0], 1u); }
+        if (dmiss) { atomicAdd(&s_n[1], dmiss); }
+        if (mroutes) { atomicAdd(&s_n[2], mroutes); }
+    }
+    __syncthreads();
+    // staging slots in route order, as in moe_hf_plan_kernel
+    for (int i = tid; i < n_routes; i += blockDim.x) {
+#pragma unroll
+        for (int k = 0; k < 3; ++k) {
+            if (s_flag[k][i] == 7) {
+                int rank = 0;
+                for (int j = 0; j < i; ++j) { rank += s_flag[k][j] == 7; }
+                atomicAdd(&s_total[k], 1);
+                if (rank < slots) {
+                    s_slot[k][s_e[i]] = (short) rank;
+                    args.src[k][rank] = s_src[k][i];
+                }
+            }
+        }
+    }
+    __syncthreads();
+    if (tid < 3) {
+        args.nstage[tid] = min(s_total[tid], slots);
+    }
+    // effective addresses: the resident table, with staged experts pointing at their scratch slot; loads first
+    constexpr int U = 8;
+    const int total = 3 * n_expert;
+    for (int base = 0; base < total; base += U * blockDim.x) {
+        const void * v[U];
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            const int j = base + u * blockDim.x + tid;
+            v[u] = j < total ? args.table[j / n_expert][j % n_expert] : nullptr;
+        }
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            const int j = base + u * blockDim.x + tid;
+            if (j < total) {
+                const int k = j / n_expert, e = j % n_expert;
+                const int r = s_slot[k][e];
+                args.eff[k][e] = r >= 0 ? (const void *) (args.scratch + ((size_t) k * slots + r) * args.stride) : v[u];
+            }
+        }
+    }
+    if (tid == 0 && counts) {
+        unsigned long long staged = 0;
+        for (int k = 0; k < 3; ++k) { staged += min(s_total[k], slots); }
+        const unsigned long long dmiss = s_n[1];
+        atomicAdd(counts + 0, 3ULL);
+        atomicAdd(counts + 1, 3ULL * s_n[0]);
+        atomicAdd(counts + 2, dmiss);
+        atomicAdd(counts + 3, staged);
+        atomicAdd(counts + 4, (unsigned long long) s_n[2]);
+        atomicAdd(counts + 5, dmiss - staged);
+    }
+}
+
 // Copies the experts the plan listed for one projection into its scratch slots.
 static __global__ void moe_hf_copy_kernel(const void * const * src, const int * nstage, char * scratch,
         size_t stride, size_t copy_bytes) {
@@ -8683,8 +8808,13 @@ static bool moe_hf_begin(ggml_backend_cuda_context & ctx, moe_cache_session & se
     args.scratch = g_hf_scratch;
     args.stride = g_hf_stride;
     const int n_expert = (int) group[0]->desc.n_expert;
-    moe_hf_plan_kernel<<<1, 256, 0, g_hf_side>>>(args, (const int32_t *) ids->data, (int) ids->ne[0], routes,
-            (int)(ids->nb[1] / sizeof(int32_t)), n_expert, slots, aligned, g_missjoin_counts);
+    if (moe_hf_plan_fast_enabled() && routes <= MOE_HF_FAST_MAX_ROUTES && n_expert <= MOE_HF_FAST_MAX_EXPERT) {
+        moe_hf_plan_fast_kernel<<<1, 256, 0, g_hf_side>>>(args, (const int32_t *) ids->data, (int) ids->ne[0], routes,
+                (int)(ids->nb[1] / sizeof(int32_t)), n_expert, slots, aligned, g_missjoin_counts);
+    } else {
+        moe_hf_plan_kernel<<<1, 256, 0, g_hf_side>>>(args, (const int32_t *) ids->data, (int) ids->ne[0], routes,
+                (int)(ids->nb[1] / sizeof(int32_t)), n_expert, slots, aligned, g_missjoin_counts);
+    }
     CUDA_CHECK(cudaGetLastError());
     std::array<int8_t, 3> order = session.hf_order[table.mj_layer];
     if (order[0] < 0) { order = {0, 1, 2}; }
