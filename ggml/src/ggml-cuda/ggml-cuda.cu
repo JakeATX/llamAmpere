@@ -9885,7 +9885,52 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, ui
 }
 #endif // USE_CUDA_GRAPH
 
+// [RTPORT diag] GGML_CUDA_SMALL_GRAPH_STATS=1: for graphs of at most 1000 nodes (the MTP helper's steps and catch-up),
+// how each compute ran - replayed CUDA graph, captured, eager because a node is not capturable, eager while warming
+// up after a property change, or graphs off - and the host time of the call, per node count. Clock reads only.
+static bool ggml_cuda_small_graph_stats_on() {
+    static const bool v = [] { const char * e = getenv("GGML_CUDA_SMALL_GRAPH_STATS"); return e && atoi(e) != 0; }();
+    return v;
+}
+static void ggml_cuda_small_graph_stats_add(const ggml_cgraph * cgraph, int kind, int64_t us) {
+    struct entry { uint64_t n[5] = {}; int64_t us = 0; };
+    static std::map<int, entry> by_nodes;
+    static uint64_t total = 0;
+    auto & e = by_nodes[cgraph->n_nodes];
+    e.n[kind]++;
+    e.us += us;
+    if (++total % 2048 != 0) {
+        return;
+    }
+    std::string line;
+    for (const auto & kv : by_nodes) {
+        const auto & x = kv.second;
+        const uint64_t calls = x.n[0] + x.n[1] + x.n[2] + x.n[3] + x.n[4];
+        if (calls < 64) {
+            continue;
+        }
+        char buf[192];
+        snprintf(buf, sizeof(buf), " [%d nodes: %llu calls, replay %llu capture %llu eager-incompat %llu eager-warmup %llu off %llu, host %.3f ms/call]",
+                kv.first, (unsigned long long) calls, (unsigned long long) x.n[0], (unsigned long long) x.n[1],
+                (unsigned long long) x.n[2], (unsigned long long) x.n[3], (unsigned long long) x.n[4], x.us / 1e3 / calls);
+        line += buf;
+    }
+    GGML_LOG_INFO("cuda small graphs (GGML_CUDA_SMALL_GRAPH_STATS) %llu calls:%s\n", (unsigned long long) total, line.c_str());
+}
+
+static enum ggml_status ggml_backend_cuda_graph_compute_impl(ggml_backend_t backend, ggml_cgraph * cgraph, int * sg_kind);
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+    if (!ggml_cuda_small_graph_stats_on() || cgraph->n_nodes > 1000) {
+        return ggml_backend_cuda_graph_compute_impl(backend, cgraph, nullptr);
+    }
+    int kind = 4;
+    const int64_t t0 = ggml_time_us();
+    const enum ggml_status st = ggml_backend_cuda_graph_compute_impl(backend, cgraph, &kind);
+    ggml_cuda_small_graph_stats_add(cgraph, kind, ggml_time_us() - t0);
+    return st;
+}
+
+static enum ggml_status ggml_backend_cuda_graph_compute_impl(ggml_backend_t backend, ggml_cgraph * cgraph, int * sg_kind) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
@@ -9913,6 +9958,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             const int64_t vf_t0 = ggml_cuda_vf_timing() ? ggml_time_us() : 0;
             const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
             const int64_t vf_t1 = vf_t0 ? ggml_time_us() : 0;
+            if (sg_kind) { *sg_kind = graph_compatible ? 3 : 2; }
             if (vf_t0) {
                 ggml_cuda_vf_timing_add(cgraph, 0, vf_t1 - vf_t0);
             }
@@ -9947,6 +9993,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 #endif // USE_CUDA_GRAPH
 
+    if (sg_kind && use_cuda_graph) { *sg_kind = cuda_graph_update_required ? 1 : 0; }
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
         {
