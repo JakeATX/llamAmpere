@@ -63,11 +63,15 @@ llama_memory_recurrent::llama_memory_recurrent(
         this->rs_ring = n_rs_seq > 0 && !this->gdn_replay && arch_ok && !env_off;
         const char * env_rows = getenv("LLAMA_RS_RING_ROWS");
         this->rs_ring_rows_all = this->rs_ring && env_rows != nullptr && strcmp(env_rows, "1") == 0;
+        const char * env_skip = getenv("LLAMA_RS_SHIFT_SKIP");
+        this->rs_shift_skip = n_rs_seq > 0 && !this->rs_ring && !this->gdn_replay &&
+                              env_skip != nullptr && strcmp(env_skip, "0") != 0;
         if (n_rs_seq > 0) {
             // one line so A/B cells can confirm the rollback layout from the server log
-            LLAMA_LOG_INFO("%s: rollback layout = %s (n_rs_seq %u%s%s)\n", __func__,
+            LLAMA_LOG_INFO("%s: rollback layout = %s (n_rs_seq %u%s%s%s)\n", __func__,
                     this->rs_ring ? (this->rs_ring_rows_all ? "ring, set_rows for every ubatch" : "ring") : "shift",
-                    n_rs_seq, env_off ? ", LLAMA_RS_RING=0" : "", this->gdn_replay ? ", gdn_replay" : "");
+                    n_rs_seq, env_off ? ", LLAMA_RS_RING=0" : "", this->gdn_replay ? ", gdn_replay" : "",
+                    this->rs_shift_skip ? ", LLAMA_RS_SHIFT_SKIP: no shift, rollback <= n - 1" : "");
         }
     }
     rs_base.assign(mem_size, 0);
@@ -333,6 +337,11 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                     rs_valid[seq_id] = have - (uint32_t) rollback;
                     cell.pos = p0 - 1;
                     return true;
+                }
+                if (rs_shift_skip) {
+                    // [VSHIFT] say so: a refused rollback costs a re-read of the prompt, never wrong words
+                    LLAMA_LOG_WARN("%s: [VSHIFT] rollback of %d refused for seq %d (have %u)\n", __func__,
+                            (int) rollback, seq_id, have);
                 }
                 return false;
             }
@@ -941,6 +950,10 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             if (n_rs_seq != 0 && (size_t) seq_id < rs_valid.size()) {
                 const uint64_t grown = (uint64_t) rs_valid[seq_id] + n_seq_tokens;
                 rs_valid[seq_id] = grown > n_rs_seq ? n_rs_seq : (uint32_t) grown;
+                // [VSHIFT] without the shift only the groups this ubatch wrote (0..n-1) are real
+                if (rs_shift_skip && n_seq_tokens <= n_rs_seq) {
+                    rs_valid[seq_id] = n_seq_tokens - 1;
+                }
             }
         }
     }
@@ -1932,7 +1945,7 @@ uint32_t llama_memory_recurrent_context::get_n_rs_seq() const {
 }
 
 uint32_t llama_memory_recurrent_context::get_snap_shift() const {
-    if (mem->n_rs_seq == 0 || is_full || mem->rs_ring) {
+    if (mem->n_rs_seq == 0 || is_full || mem->rs_ring || mem->rs_shift_skip) {
         return 0;
     }
     const llama_ubatch & ubatch = get_ubatch();

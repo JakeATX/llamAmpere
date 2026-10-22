@@ -101,6 +101,11 @@ public:
     // LLAMA_RS_RING_ROWS=1: write ring snapshots with set_rows even when the ubatch fills the ring
     // (the first v0.4 form; A/B only, see get_n_written)
     bool rs_ring_rows_all = false;
+    // [VSHIFT] LLAMA_RS_SHIFT_SKIP=1 (shift layout only, default off): a ubatch of n < K tokens does not move the
+    // older snapshot groups back by n (snapshot_shift_gather/_write, one 3 MiB state copy per GDN layer and check).
+    // Groups n..K-1 then hold stale history, so rs_valid is set to n - 1 (the groups this ubatch wrote) and a
+    // deeper seq_rm is refused. A speculative check never rolls back its first row, so it never needs them.
+    bool rs_shift_skip = false;
 
     // per data cell (index = cell whose planes hold the data, i.e. cells[i].src0): plane of
     // rollback group 0. Set when a ubatch writes the cell, 0 for rs_z, restored or cleared cells.
