@@ -256,6 +256,101 @@ static void ssm_conv_ring_f32_cuda(const ggml_cuda_conv_ring_args & args, const 
     }
 }
 
+// [CRP] GGML_CUDA_CONV_RING_PREFILL=1: the conv ring for prefill widths (n_t > GGML_CUDA_CONV_RING_MAX_T). Same plan,
+// same checks: the CONCAT and window nodes are not launched, the conv input is read from the CONCAT operands (kept
+// state columns, then the new rows through their transpose view: for a [C, T] activation each warp reads 32
+// consecutive channels of one token, coalesced). The conv arithmetic is ssm_conv_long_token_f32's term for term
+// (sumf = 0, += x[i+j]*w[j] for j = 0..3, += bias, SILU), so the output bytes match the unfused path; the windows
+// (n_keep columns each, at most GGML_CUDA_CONV_RING_MAX_WIN) are bit copies written by the token-tile-0 blocks, each
+// thread for its own channel and in graph order. The windows never overlap the operands (checked by the plan), so
+// the blocks still reading them are not affected.
+template <bool apply_silu, int TT>
+static __global__ void ssm_conv_ring_prefill_f32(const ggml_cuda_conv_ring_args args, const float * __restrict__ w_ptr,
+                                                 const int w_nb1, const float * __restrict__ bias,
+                                                 float * __restrict__ dst, const int dst_nb1, const int dst_nb2,
+                                                 const int64_t n_t) {
+    constexpr int d_conv = 4;
+    constexpr int n_keep = d_conv - 1;
+
+    const int     tid = threadIdx.x;
+    const int     s   = blockIdx.x;
+    const int64_t c   = (int64_t) blockIdx.y * blockDim.x + tid;
+    const int64_t t0  = (int64_t) blockIdx.z * TT;
+
+    const float * xs = (const float *) ((const char *) args.state + s * args.state_nb2 + c * args.state_nb1);
+    const char  * xn = (const char *) args.x + s * args.x_nb2 + c * args.x_nb1;
+    // conv input column q: the kept state for q < n_keep, then new row q - n_keep
+    const auto in = [&](const int64_t q) -> float {
+        return q < n_keep ? xs[q] : *(const float *) (xn + (q - n_keep) * args.x_nb0);
+    };
+
+    if (blockIdx.z == 0) {
+#pragma unroll
+        for (int k = 0; k < GGML_CUDA_CONV_RING_MAX_WIN; ++k) {
+            if (k < args.n_win) {
+                const ggml_cuda_conv_ring_window & win = args.win[k];
+                const int64_t row = win.rows != nullptr ? (int64_t) win.rows[s] : (int64_t) s;
+                float * out = win.dst + row * win.row_stride + c * n_keep;
+#pragma unroll
+                for (int j = 0; j < n_keep; ++j) {
+                    out[j] = in((int64_t) win.s_idx + j);
+                }
+            }
+        }
+    }
+
+    float w[d_conv];
+    const int stride_w = w_nb1 / sizeof(float);
+#pragma unroll
+    for (int j = 0; j < d_conv; ++j) {
+        w[j] = w_ptr[c * stride_w + j];
+    }
+    const float b = bias != nullptr ? bias[c] : 0.0f;
+
+    float * y = (float *) ((char *) dst + s * dst_nb2) + c;
+    const int64_t stride_y = dst_nb1 / sizeof(float);
+
+    if (t0 + TT <= n_t) {
+        float x[TT + n_keep];
+#pragma unroll
+        for (int q = 0; q < TT + n_keep; ++q) {
+            x[q] = in(t0 + q);
+        }
+#pragma unroll
+        for (int i = 0; i < TT; ++i) {
+            float sumf = 0.0f;
+#pragma unroll
+            for (int j = 0; j < d_conv; ++j) {
+                sumf += x[i + j] * w[j];
+            }
+            sumf += b;
+            y[(t0 + i) * stride_y] = apply_silu ? ggml_cuda_op_silu_single(sumf) : sumf;
+        }
+    } else {
+        for (int64_t t = t0; t < n_t; ++t) {
+            float sumf = 0.0f;
+#pragma unroll
+            for (int j = 0; j < d_conv; ++j) {
+                sumf += in(t + j) * w[j];
+            }
+            sumf += b;
+            y[t * stride_y] = apply_silu ? ggml_cuda_op_silu_single(sumf) : sumf;
+        }
+    }
+}
+
+template <bool apply_silu>
+static void ssm_conv_ring_prefill_f32_cuda(const ggml_cuda_conv_ring_args & args, const float * w, const int w_nb1,
+                                           const float * bias, float * dst, const int dst_nb1, const int dst_nb2,
+                                           const int64_t nr, const int64_t n_t, const int64_t n_s, cudaStream_t stream) {
+    const int threads = 128;
+    constexpr int TT = 32;
+    GGML_ASSERT(nr % threads == 0);
+    const dim3 blocks(n_s, nr / threads, (n_t + TT - 1) / TT);
+    ssm_conv_ring_prefill_f32<apply_silu, TT><<<blocks, threads, 0, stream>>>(args, w, w_nb1, bias, dst, dst_nb1, dst_nb2, n_t);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * bias_add_node, ggml_tensor * silu_dst) {
     const struct ggml_tensor * src0 = dst->src[0];  // conv_x
     const struct ggml_tensor * src1 = dst->src[1];  // conv1d.weight
@@ -300,8 +395,15 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
         if (e.conv != dst) {
             continue;
         }
-        GGML_ASSERT(nc == 4 && n_t >= 1 && n_t <= GGML_CUDA_CONV_RING_MAX_T && out->nb[0] == sizeof(float));
-        if (fuse_silu) {
+        GGML_ASSERT(nc == 4 && n_t >= 1 && out->nb[0] == sizeof(float));
+        if (n_t > GGML_CUDA_CONV_RING_MAX_T) {
+            // [CRP] prefill width
+            if (fuse_silu) {
+                ssm_conv_ring_prefill_f32_cuda<true>(e.args, src1_d, src1->nb[1], bias_d, dst_d, out->nb[1], out->nb[2], nr, n_t, n_s, stream);
+            } else {
+                ssm_conv_ring_prefill_f32_cuda<false>(e.args, src1_d, src1->nb[1], bias_d, dst_d, out->nb[1], out->nb[2], nr, n_t, n_s, stream);
+            }
+        } else if (fuse_silu) {
             ssm_conv_ring_f32_cuda<true>(e.args, src1_d, src1->nb[1], bias_d, dst_d, out->nb[1], out->nb[2], nr, n_t, n_s, stream);
         } else {
             ssm_conv_ring_f32_cuda<false>(e.args, src1_d, src1->nb[1], bias_d, dst_d, out->nb[1], out->nb[2], nr, n_t, n_s, stream);

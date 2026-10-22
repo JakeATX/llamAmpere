@@ -3,7 +3,8 @@
 
 void ggml_cuda_op_dsv4_hc_comb(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
-void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+// [HCPC] out != nullptr: the result goes to out (same shape, f32), dst is not written (GGML_CUDA_HC_POST_CPY)
+void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * out = nullptr);
 
 // [HCPN] GGML_CUDA_HC_POST_NORM / GGML_CUDA_HC_PRE_XN (opt-in, matched in ggml-cuda.cu).
 // One pass over each row of the next hyper-connection norm: post (nullable) is an identity-comb DSV4_HC_POST whose

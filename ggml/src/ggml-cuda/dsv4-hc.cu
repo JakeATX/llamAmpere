@@ -273,7 +273,8 @@ void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             scale);
 }
 
-void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * out) {
+    // [HCPC] out != nullptr: write the result into out (same shape, f32) instead of dst; dst is not written
     const ggml_tensor * x        = dst->src[0];
     const ggml_tensor * residual = dst->src[1];
     const ggml_tensor * post     = dst->src[2];
@@ -288,7 +289,12 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     GGML_TENSOR_LOCALS(size_t, nbx, x,        nb);
     GGML_TENSOR_LOCALS(size_t, nbr, residual, nb);
     GGML_TENSOR_LOCALS(size_t, nbp, post,     nb);
-    GGML_TENSOR_LOCALS(size_t, nbd, dst,      nb);
+    if (out != nullptr) {
+        GGML_ASSERT(out->type == GGML_TYPE_F32);
+        GGML_ASSERT(out->ne[0] == dst->ne[0] && out->ne[1] == dst->ne[1] && out->ne[2] == dst->ne[2] && out->ne[3] == dst->ne[3]);
+    }
+    const ggml_tensor * o = out != nullptr ? out : dst;
+    GGML_TENSOR_LOCALS(size_t, nbd, o,        nb);
 
     const size_t nbc0 = comb ? comb->nb[0] : 0;
     const size_t nbc1 = comb ? comb->nb[1] : 0;
@@ -307,7 +313,7 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     auto kernel = comb ? dsv4_hc_post_f32<true> : dsv4_hc_post_f32<false>;
     ggml_cuda_kernel_launch(kernel, launch_params,
             (const float *) x->data, (const float *) residual->data,
-            (const float *) post->data, comb ? (const float *) comb->data : nullptr, (float *) dst->data,
+            (const float *) post->data, comb ? (const float *) comb->data : nullptr, (float *) o->data,
             n_embd, hc, n_tokens,
             nbx0 / sizeof(float), nbx1 / sizeof(float),
             nbr0 / sizeof(float), nbr1 / sizeof(float), nbr2 / sizeof(float),

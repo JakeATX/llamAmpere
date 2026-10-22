@@ -16,6 +16,7 @@
 #include "ggml-cuda/argsort.cuh"
 #include "ggml-cuda/binbcast.cuh"
 #include "ggml-cuda/clamp.cuh"
+#include "ggml-cuda/hc-gate-pre.cuh"
 #include "ggml-cuda/col2im-1d.cuh"
 #include "ggml-cuda/concat.cuh"
 #include "ggml-cuda/conv-transpose-1d.cuh"
@@ -5853,6 +5854,25 @@ static bool ggml_cuda_conv_ring_enabled() {
     return enabled;
 }
 
+// [CRP] GGML_CUDA_CONV_RING_PREFILL=1 (opt-in): the same plan for prefill widths (n_t > GGML_CUDA_CONV_RING_MAX_T),
+// launched as ssm_conv_ring_prefill_f32 (ssm-conv.cu, same per-term arithmetic as the long-token kernel: the output
+// bytes match); independent of GGML_VL_SF_CONVRING, which keeps the decode widths. Also accepts the CONT(window VIEW)
+// -> CPY(cache view) window form (qwen4exp build_conv_state_at).
+static bool ggml_cuda_conv_ring_prefill_enabled() {
+    if (ggml_cuda_nemotron_ssm_enabled()) {
+        return false;
+    }
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_CUDA_CONV_RING_PREFILL");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return enabled;
+}
+
+static bool ggml_cuda_conv_ring_any_enabled() {
+    return ggml_cuda_conv_ring_enabled() || ggml_cuda_conv_ring_prefill_enabled();
+}
+
 struct ggml_cuda_conv_ring_match {
     int                 concat_idx = -1;
     int                 last_idx   = -1; // last node of the ssm_conv launch (SILU, or ADD+SILU when fused)
@@ -5893,8 +5913,8 @@ static bool ggml_cuda_conv_ring_match_at(const ggml_cgraph * cgraph, int conv_id
     if (d_conv != 4) {
         return refuse("d_conv");
     }
-    if (n_t < 1 || n_t > GGML_CUDA_CONV_RING_MAX_T) {
-        return refuse("width");  // prefill ubatches: the unfused nodes
+    if (n_t < 1 || (n_t <= GGML_CUDA_CONV_RING_MAX_T ? !ggml_cuda_conv_ring_enabled() : !ggml_cuda_conv_ring_prefill_enabled())) {
+        return refuse("width");  // prefill ubatches without [CRP]: the unfused nodes
     }
     // [#110 SF fold 2] Bound the byte strides passed as int to the conv kernels before multiplying dimensions.
     const int64_t max_bytes     = std::numeric_limits<int>::max();
@@ -5959,6 +5979,7 @@ static bool ggml_cuda_conv_ring_match_at(const ggml_cgraph * cgraph, int conv_id
     m.between.clear();
     m.skip.push_back(m.concat_idx);
     std::vector<std::pair<const ggml_tensor *, int>> conts; // CONT waiting for its SET_ROWS, window column
+    std::vector<std::pair<const ggml_tensor *, int>> conts3; // [CRP] [n_keep, ch, n_s] CONT waiting for its CPY
     for (int j = m.concat_idx + 1; j < conv_idx; ++j) {
         const ggml_tensor * n = cgraph->nodes[j];
         if (n->op == GGML_OP_VIEW && n->view_src == concat) {
@@ -5972,6 +5993,35 @@ static bool ggml_cuda_conv_ring_match_at(const ggml_cgraph * cgraph, int conv_id
             continue;
         }
         const int col = n->op == GGML_OP_CPY || n->op == GGML_OP_CONT ? window_col(n->src[0]) : -1;
+        if (n->op == GGML_OP_CONT && col >= 0 && ggml_cuda_conv_ring_prefill_enabled() &&
+            n->ne[0] == n_keep && n->ne[1] == ch && n->ne[2] == n_s && n->ne[3] == 1) {
+            // [CRP] the window in its own [n_keep, ch, n_s] layout, copied whole into the cache row by one CPY
+            if (n->type != GGML_TYPE_F32 || !ggml_is_contiguous(n) || (n->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+                ggml_cuda_gdn_state_read_uses(cgraph, n) != 1) {
+                return refuse("window cont3 layout");
+            }
+            conts3.push_back({ n, col });
+            m.skip.push_back(j);
+            continue;
+        }
+        if (n->op == GGML_OP_CPY && !conts3.empty()) {
+            auto it = std::find_if(conts3.begin(), conts3.end(), [n](const auto & p) { return p.first == n->src[0]; });
+            if (it != conts3.end()) {
+                const ggml_tensor * d = n->src[1];
+                if (d->type != GGML_TYPE_F32 || d->ne[0] != row_count || d->ne[1] != n_s || d->ne[2] != 1 ||
+                    d->ne[3] != 1 || d->nb[0] != sizeof(float) || d->nb[1] < row_count * sizeof(float) ||
+                    d->nb[1] % sizeof(float) != 0 || !sink(n)) {
+                    return refuse("window cont3 copy layout");
+                }
+                if (m.n_win == GGML_CUDA_CONV_RING_MAX_WIN) {
+                    return refuse("too many windows");
+                }
+                m.win[m.n_win++] = { d, nullptr, it->second };
+                conts3.erase(it);
+                m.skip.push_back(j);
+                continue;
+            }
+        }
         if (n->op == GGML_OP_CPY && col >= 0) {
             const ggml_tensor * d = n->src[1];
             if (d->type != GGML_TYPE_F32 || d->ne[0] != row_count || d->ne[1] != n_s || d->ne[2] != 1 ||
@@ -6021,6 +6071,9 @@ static bool ggml_cuda_conv_ring_match_at(const ggml_cgraph * cgraph, int conv_id
     }
     if (!conts.empty()) {
         return refuse("window cont without its set_rows");
+    }
+    if (!conts3.empty()) {
+        return refuse("window cont3 without its cpy");
     }
     // every reader of the concat is accounted for: the windows (each consumed above) and the ssm_conv
     if (ggml_cuda_gdn_state_read_uses(cgraph, concat) != n_views + 1 || n_views != m.n_win) {
@@ -6116,7 +6169,7 @@ static void ggml_cuda_conv_ring_plan(ggml_backend_cuda_context * cuda_ctx, const
     skip.clear();
 
     static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
-    if (disable_fusion || !ggml_cuda_conv_ring_enabled()) {
+    if (disable_fusion || !ggml_cuda_conv_ring_any_enabled()) {
         return;
     }
 
@@ -6135,7 +6188,20 @@ static void ggml_cuda_conv_ring_plan(ggml_backend_cuda_context * cuda_ctx, const
                     GGML_LOG_WARN("[conv ring] %s refused: %s (n_t %lld)\n", conv->name, m.why, (long long) conv->ne[1]);
                 }
             }
+            static bool logged_refuse = false;
+            if (!logged_refuse && ggml_cuda_conv_ring_prefill_enabled() && conv->ne[1] > GGML_CUDA_CONV_RING_MAX_T) {
+                logged_refuse = true;
+                GGML_LOG_INFO("%s: GGML_CUDA_CONV_RING_PREFILL: %s refused (%s)\n", __func__, conv->name, m.why ? m.why : "?");
+            }
             continue;
+        }
+        if (conv->ne[1] > GGML_CUDA_CONV_RING_MAX_T) {
+            static bool logged = false;
+            if (!logged) {
+                logged = true;
+                GGML_LOG_INFO("%s: GGML_CUDA_CONV_RING_PREFILL: %s reads its concat operands (%d windows, %zu nodes skipped)\n",
+                        __func__, conv->name, m.n_win, m.skip.size());
+            }
         }
         {
             static const bool dbg = getenv("GGML_CUDA_CONV_RING_DEBUG") != nullptr && atoi(getenv("GGML_CUDA_CONV_RING_DEBUG")) != 0;
@@ -7474,6 +7540,193 @@ static int ggml_cuda_fuse_hc_norm(ggml_backend_cuda_context & ctx, const ggml_cg
     return (cpy != nullptr ? c : n + 1) - i;
 }
 
+// [HCPC] GGML_CUDA_HC_POST_CPY=1 (opt-in): DSV4_HC_POST (identity comb) immediately followed by a CPY of its whole
+// output into another f32 tensor of the same shape. This is Flash-Next's layer-major (B1) prefill handing the hidden
+// state to the next layer range: the last hc_combine of a layer graph is copied into b1_carry. The hc_post kernel
+// writes straight into the CPY destination and the copy (read 503 MB, write 503 MB at a 12,288-token ubatch) does not
+// run. The CPY must be HC_POST's only consumer and HC_POST must not be a graph output (ggml_can_fuse_subgraph), so
+// nothing else ever reads the skipped buffer. Same kernel, same arithmetic: bit-identical. The destination may be the
+// residual input itself (phase-3 combine into b1_carry) only when the layouts match exactly: without comb each output
+// element reads only the same element of the residual, from the same thread, before writing it. Disjoint from
+// HC_POST_NORM (hc_post -> RMS_NORM) and HC_POST_DOWN (hc_post -> HC_DOWN): each matches a different next node.
+static bool ggml_cuda_hc_post_cpy_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_CUDA_HC_POST_CPY");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return enabled;
+}
+
+static std::atomic<int64_t> g_hc_post_cpy_count{0};
+
+static int ggml_cuda_fuse_hc_post_cpy(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+    if (!ggml_cuda_hc_post_cpy_enabled() || i + 1 >= cgraph->n_nodes) {
+        return -1;
+    }
+    ggml_tensor * post = cgraph->nodes[i];
+    ggml_tensor * cpy  = cgraph->nodes[i + 1];
+    if (post->op != GGML_OP_DSV4_HC_POST || post->src[3] != nullptr || post->type != GGML_TYPE_F32 ||
+        cpy->op != GGML_OP_CPY || cpy->src[0] != post || cpy->type != GGML_TYPE_F32 || cpy->buffer == nullptr ||
+        !ggml_are_same_shape(cpy, post) || !ggml_is_contiguous(cpy) || !ggml_is_contiguous(post)) {
+        return -1;
+    }
+    if (!ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_DSV4_HC_POST, GGML_OP_CPY }, { i + 1 })) {
+        return -1;
+    }
+    const ggml_tensor * x        = post->src[0];
+    const ggml_tensor * residual = post->src[1];
+    const ggml_tensor * w        = post->src[2];
+    if (ggml_cuda_overlaps(cpy, x) || ggml_cuda_overlaps(cpy, w)) {
+        return -1;
+    }
+    if (ggml_cuda_overlaps(cpy, residual)) {
+        const bool same_layout = residual->data == cpy->data && residual->type == GGML_TYPE_F32 &&
+            ggml_are_same_shape(residual, cpy) && ggml_are_same_stride(residual, cpy);
+        if (!same_layout) {
+            return -1;
+        }
+    }
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        GGML_LOG_INFO("%s: GGML_CUDA_HC_POST_CPY: hc_post+cpy fused (%s -> %s)\n", __func__, post->name, cpy->name);
+    }
+    ggml_cuda_op_dsv4_hc_post(ctx, post, cpy);
+    g_hc_post_cpy_count++;
+    return 1;
+}
+
+// [HCGP] GGML_CUDA_HC_GATE_PRE=1 (opt-in): the hyper-connection mixer's gate GEMM (MUL_MAT of a BF16 [K, hc*n_embd]
+// weight by f32 lo) and the gated DSV4_HC_PRE that reads it run as one kernel (hc-gate-pre.cu): the f32 gate
+// (503 MB at a 12,288-token ubatch) is never written or read back. Taken only when, in this graph, every use of the
+// MUL_MAT output (counted against the graph's use counts, which include other backend splits) is a contiguous
+// RESHAPE/VIEW alias at offset 0 or src[1] of that one HC_PRE; the nodes between them run nothing (views); the gate is
+// not a graph output; from 64 tokens up. When GGML_CUDA_HC_PRE_XN queued this HC_PRE (its norm wrote no f32 xn), the
+// fused kernel takes over that queue entry and rebuilds xn from the norm input as dsv4_hc_pre_xn_f32 does; if it
+// cannot index those inputs it declines, and the queued HC_PRE_XN launch runs at the HC_PRE node as before.
+// Valid-math: only the order of the f32 accumulation over K differs from cuBLAS. Returns the extra nodes consumed, or -1.
+static bool ggml_cuda_hc_gate_pre_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_CUDA_HC_GATE_PRE");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return enabled;
+}
+
+// fusions taken (all contexts; test-backend-ops reads the advance through ggml_backend_cuda_fusion_count)
+static std::atomic<int64_t> g_hc_gate_pre_count{0};
+static std::atomic<int64_t> g_hc_gate_pre_xn_count{0};
+
+static int ggml_cuda_fuse_hc_gate_pre(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+    if (!ggml_cuda_hc_gate_pre_enabled() || !ctx.stream_context().concurrent_events.empty()) {
+        return -1;
+    }
+    const ggml_tensor * mm = cgraph->nodes[i];
+    if (mm->op != GGML_OP_MUL_MAT || mm->src[0]->type != GGML_TYPE_BF16 || mm->src[1]->type != GGML_TYPE_F32 ||
+        mm->type != GGML_TYPE_F32 || mm->ne[1] < 64 || (mm->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+        ggml_get_op_params_i32(mm, 1) != 0 || mm->src[0]->buffer == nullptr || !ggml_backend_buffer_is_cuda(mm->src[0]->buffer)) {
+        return -1;
+    }
+    std::vector<const ggml_tensor *> alias     = { mm };
+    std::vector<int>                 alias_use = { 0 };
+    const auto alias_of = [&](const ggml_tensor * t) -> int {
+        for (size_t k = 0; k < alias.size(); ++k) {
+            if (alias[k] == t) {
+                return (int) k;
+            }
+        }
+        return -1;
+    };
+    int hc_pre_idx = -1;
+    for (int j = i + 1; j < cgraph->n_nodes && j < i + 16; ++j) {
+        const ggml_tensor * node = cgraph->nodes[j];
+        int n_alias_src = 0;
+        for (int k = 0; k < GGML_MAX_SRC; ++k) {
+            const int a = node->src[k] ? alias_of(node->src[k]) : -1;
+            if (a >= 0) {
+                alias_use[a]++;
+                n_alias_src++;
+            }
+        }
+        if (n_alias_src == 0) {
+            if (ggml_op_is_empty(node->op)) {
+                continue;
+            }
+            return -1;
+        }
+        if ((node->op == GGML_OP_RESHAPE || node->op == GGML_OP_VIEW) && n_alias_src == 1 && node->view_src == mm &&
+            node->view_offs == 0 && ggml_is_contiguous(node) && ggml_nelements(node) == ggml_nelements(mm) &&
+            !(node->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            alias.push_back(node);
+            alias_use.push_back(0);
+            continue;
+        }
+        if (node->op == GGML_OP_DSV4_HC_PRE && n_alias_src == 1 && node->src[1] != nullptr && alias_of(node->src[1]) >= 0 &&
+            ggml_get_op_params_i32(node, 1) != 0 && ggml_is_contiguous(node->src[1]) && node->src[0] != nullptr &&
+            ggml_are_same_shape(node->src[0], node->src[1])) {
+            hc_pre_idx = j;
+        }
+        break;
+    }
+    if (hc_pre_idx < 0) {
+        return -1;
+    }
+    for (size_t k = 0; k < alias.size(); ++k) {
+        if (alias_use[k] != ggml_cuda_graph_use_count(cgraph, alias[k])) {
+            return -1;
+        }
+    }
+    ggml_tensor * hc_pre = cgraph->nodes[hc_pre_idx];
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if (!ggml_cuda_hc_gate_pre_supported(mm, hc_pre, cc)) {
+        static bool logged_reject = false;
+        if (!logged_reject) {
+            logged_reject = true;
+            GGML_LOG_INFO("%s: GGML_CUDA_HC_GATE_PRE: %s -> %s matched but unsupported shape/layout\n", __func__, mm->name, hc_pre->name);
+        }
+        return -1;
+    }
+    // [HCPN] an HC_PRE_XN entry for this HC_PRE: its xn was never written, rebuild it from the norm input
+    int xn_rec = -1;
+    for (size_t k = 0; k < g_hc_pre_xn_pending.size(); ++k) {
+        if (g_hc_pre_xn_pending[k].hc_pre == hc_pre) {
+            xn_rec = (int) k;
+            break;
+        }
+    }
+    const ggml_tensor * xr    = nullptr;
+    const float       * rs    = nullptr;
+    const ggml_tensor * gamma = nullptr;
+    if (xn_rec >= 0) {
+        const ggml_cuda_hc_pre_xn_rec rec = g_hc_pre_xn_pending[xn_rec];
+        if (!ggml_cuda_hc_gate_pre_xn_supported(rec.x, rec.gamma, hc_pre)) {
+            static bool logged_xn = false;
+            if (!logged_xn) {
+                logged_xn = true;
+                GGML_LOG_INFO("%s: GGML_CUDA_HC_GATE_PRE: %s has an HC_PRE_XN rebuild it cannot index; left to HC_PRE_XN\n", __func__, hc_pre->name);
+            }
+            return -1;
+        }
+        xr    = rec.x;
+        rs    = rec.row_scale;
+        gamma = rec.gamma;
+        g_hc_pre_xn_pending.erase(g_hc_pre_xn_pending.begin() + xn_rec);
+    }
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        GGML_LOG_INFO("%s: GGML_CUDA_HC_GATE_PRE: %s + %s fused (%d extra nodes, %s xn)\n", __func__, mm->name, hc_pre->name,
+                hc_pre_idx - i, xr ? "rebuilt (HC_PRE_XN)" : "f32");
+    }
+    ggml_cuda_op_hc_gate_pre(ctx, mm, hc_pre, xr, rs, gamma);
+    g_hc_gate_pre_count++;
+    if (xr != nullptr) {
+        g_hc_gate_pre_xn_count++;
+        g_hc_pre_xn_count++; // the HC_PRE_XN rebuild still happened, inside the fused kernel
+    }
+    return hc_pre_idx - i;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 // nodes [i, i+4] = RMS_NORM, MUL, RMS_NORM, MUL, CONCAT(dim 0) over a single row, with the two
 // MULs as the concat's only consumers of the norms. Returns the extra node count consumed, or -1.
@@ -8414,6 +8667,22 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         const int n_hc = ggml_cuda_fuse_hc_norm(*cuda_ctx, cgraph, i);
         if (n_hc >= 0) {
             return n_hc;
+        }
+    }
+
+    // [HCPC] the last hc_post of a B1 layer graph writes straight into the b1_carry copy
+    if (node->op == GGML_OP_DSV4_HC_POST) {
+        const int n_hpc = ggml_cuda_fuse_hc_post_cpy(*cuda_ctx, cgraph, i);
+        if (n_hpc >= 0) {
+            return n_hpc;
+        }
+    }
+
+    // [HCGP] the mixer's gate GEMM + its gated hc_pre
+    if (node->op == GGML_OP_MUL_MAT) {
+        const int n_hgp = ggml_cuda_fuse_hc_gate_pre(*cuda_ctx, cgraph, i);
+        if (n_hgp >= 0) {
+            return n_hgp;
         }
     }
 
@@ -10278,7 +10547,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
 
     // [#110] a planned ssm_conv reads the CONCAT operands and the window row indices at its own position: keep them
     // allocated until its last fused node (the eval-time plan re-checks with pointers and falls back otherwise)
-    if (!disable_fusion && ggml_cuda_conv_ring_enabled()) {
+    if (!disable_fusion && ggml_cuda_conv_ring_any_enabled()) {
         ggml_cuda_conv_ring_match m;
         for (int i = 0; i < cgraph->n_nodes; ++i) {
             if (cgraph->nodes[i]->op != GGML_OP_SSM_CONV || !ggml_cuda_conv_ring_match_at(cgraph, i, m)) {
@@ -11636,6 +11905,15 @@ int64_t ggml_backend_cuda_fusion_count(ggml_backend_t backend, const char * name
     }
     if (strcmp(name, "hc_pre_xn") == 0) {
         return g_hc_pre_xn_count.load();
+    }
+    if (strcmp(name, "hc_post_cpy") == 0) {
+        return g_hc_post_cpy_count.load();
+    }
+    if (strcmp(name, "hc_gate_pre") == 0) {
+        return g_hc_gate_pre_count.load();
+    }
+    if (strcmp(name, "hc_gate_pre_xn") == 0) {
+        return g_hc_gate_pre_xn_count.load();
     }
     return -1;
 }

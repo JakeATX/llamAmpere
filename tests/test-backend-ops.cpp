@@ -5060,11 +5060,95 @@ struct test_dsv4_hc_pre : public test_dsv4_hc {
     }
 };
 
+// [HCGP] Flash-Next's whole hyper-connection mixer: xn = rms_norm(x) * gamma, cast once to BF16 for the down matmul,
+// lo = silu(down / hc), gate = up(lo) with a BF16 up weight, then the gated HC_PRE. With GGML_CUDA_HC_GATE_PRE=1 the
+// CUDA backend runs the gate matmul and HC_PRE as one kernel. live_x: x is read again after the HC_PRE (the next
+// hc_post's residual, as in the model), so GGML_CUDA_HC_PRE_XN=1 applies and the fused kernel rebuilds xn from x.
+struct test_dsv4_hc_mix : public test_case {
+    const int64_t n_embd;
+    const int64_t n_hc;
+    const int64_t n_lr;
+    const int64_t n_tokens;
+    const bool    live_x;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DSV4_HC_PRE";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR6(n_embd, n_hc, n_lr, n_tokens, live_x, std::string("mix_chain"));
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    static bool env_on(const char * name) {
+        const char * e = getenv(name);
+        return e != nullptr && atoi(e) != 0;
+    }
+    // [HCGP] taken from 64 tokens up; with live_x and HC_PRE_XN the fused kernel takes the xn rebuild
+    bool gate_pre_on() const { return env_on("GGML_CUDA_HC_GATE_PRE") && n_tokens >= 64; }
+    bool xn_on() const { return live_x && env_on("GGML_CUDA_HC_PRE_XN"); }
+    const char * required_fusion() override {
+        if (gate_pre_on()) {
+            return xn_on() ? "hc_gate_pre_xn" : "hc_gate_pre";
+        }
+        return xn_on() ? "hc_pre_xn" : nullptr;
+    }
+    const char * forbidden_fusion() override { return gate_pre_on() ? nullptr : "hc_gate_pre"; }
+
+    test_dsv4_hc_mix(int64_t n_embd = 2560, int64_t n_hc = 4, int64_t n_lr = 320, int64_t n_tokens = 300, bool live_x = false)
+        : n_embd(n_embd), n_hc(n_hc), n_lr(n_lr), n_tokens(n_tokens), live_x(live_x) {}
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            const std::string name = ggml_get_name(t);
+            if (name == "w_down") {
+                init_tensor_uniform(t, -2.0f / sqrtf((float) (n_embd * n_hc)), 2.0f / sqrtf((float) (n_embd * n_hc)));
+            } else if (name == "w_up") {
+                init_tensor_uniform(t, -4.0f / sqrtf((float) n_lr), 4.0f / sqrtf((float) n_lr));
+            } else if (name == "gamma") {
+                init_tensor_uniform(t, 0.5f, 1.5f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_hc, n_tokens);
+        ggml_set_name(x, "x");
+        ggml_tensor * gamma = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_hc);
+        ggml_set_name(gamma, "gamma");
+        ggml_tensor * w_down = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, n_embd*n_hc, n_lr);
+        ggml_set_name(w_down, "w_down");
+        ggml_tensor * w_up = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, n_lr, n_embd*n_hc);
+        ggml_set_name(w_up, "w_up");
+
+        ggml_tensor * xn = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), gamma);
+        xn = ggml_reshape_2d(ctx, xn, n_embd*n_hc, n_tokens);
+        ggml_tensor * xb = ggml_cast(ctx, xn, GGML_TYPE_BF16);
+        ggml_tensor * lo = ggml_silu(ctx, ggml_scale(ctx, ggml_mul_mat(ctx, w_down, xb), 1.0f/n_hc));
+        ggml_tensor * gate = ggml_mul_mat(ctx, w_up, lo);
+        ggml_tensor * out = ggml_dsv4_hc_pre_gated(ctx, ggml_reshape_3d(ctx, xn, n_embd, n_hc, n_tokens),
+                ggml_reshape_3d(ctx, gate, n_embd, n_hc, n_tokens), 1.0f/n_hc);
+        if (live_x) {
+            ggml_set_name(out, "mixed");
+            ggml_tensor * pw = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_hc, n_tokens);
+            ggml_set_name(pw, "pw");
+            out = ggml_dsv4_hc_post(ctx, out, x, ggml_scale(ctx, ggml_sigmoid(ctx, pw), 2.0f), nullptr);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_dsv4_hc_post : public test_dsv4_hc {
     const int64_t n_embd;
     const int64_t n_tokens;
     const bool    identity;
     const bool    gated;
+    const int     cpy_mode; // [HCPC] 0: none, 1: CPY into a separate f32 tensor, 2: CPY back into the residual
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -5072,14 +5156,20 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
     }
 
     std::string vars() override {
-        return VARS_TO_STR4(n_embd, n_tokens, identity, gated);
+        return VARS_TO_STR5(n_embd, n_tokens, identity, gated, cpy_mode);
     }
 
     // gated: post = 2*sigmoid(post/hc), as qwen4exp builds it, so backends can fuse the chain
-    bool run_whole_graph() override { return gated; }
+    bool run_whole_graph() override { return gated || cpy_mode != 0; }
 
-    test_dsv4_hc_post(int64_t n_embd = 31, int64_t n_tokens = 17, bool identity = false, bool gated = false)
-        : n_embd(n_embd), n_tokens(n_tokens), identity(identity), gated(gated) {}
+    // [HCPC] GGML_CUDA_HC_POST_CPY=1 writes the identity-comb hc_post straight into the CPY destination
+    const char * required_fusion() override {
+        const char * e = getenv("GGML_CUDA_HC_POST_CPY");
+        return identity && cpy_mode != 0 && e != nullptr && atoi(e) != 0 ? "hc_post_cpy" : nullptr;
+    }
+
+    test_dsv4_hc_post(int64_t n_embd = 31, int64_t n_tokens = 17, bool identity = false, bool gated = false, int cpy_mode = 0)
+        : n_embd(n_embd), n_tokens(n_tokens), identity(identity), gated(gated), cpy_mode(cpy_mode) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
@@ -5103,6 +5193,15 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
 
         out = ggml_dsv4_hc_post(ctx, x, residual, post, comb);
         ggml_set_name(out, "out");
+        if (cpy_mode == 1) {
+            ggml_tensor * carry = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+            ggml_set_name(carry, "carry");
+            out = ggml_cpy(ctx, out, carry);
+            ggml_set_name(out, "out_cpy");
+        } else if (cpy_mode == 2) {
+            out = ggml_cpy(ctx, out, residual);
+            ggml_set_name(out, "out_cpy_inplace");
+        }
         return out;
     }
 };
@@ -6620,7 +6719,9 @@ struct test_shexp_gate : public test_case {
 };
 
 struct test_conv_ring : public test_case {
-    enum window_mode { WM_RING = 0, WM_STATIC = 1 };
+    // WM_CONT3: CPY(CONT(window [3, ch, n_s]), cache view [3*ch, n_s]) per slot, as qwen4exp build_conv_state_at emits
+    // it (slot 0 at column n_t); folded only with GGML_CUDA_CONV_RING_PREFILL=1 ([CRP])
+    enum window_mode { WM_RING = 0, WM_STATIC = 1, WM_CONT3 = 2 };
     enum guard_mode { GM_NONE = 0, GM_PADDED_INPUT, GM_EXTRA_READER, GM_CACHE_BIAS, GM_SHIFTED_WINDOWS };
 
     const int64_t channels;
@@ -6630,7 +6731,7 @@ struct test_conv_ring : public test_case {
     const int     wmode;               // window_mode
     const int64_t rollback;            // GET_ROWS reads cache plane `rollback` (the conv_rollback view)
     const std::vector<int32_t> src_rows;  // s_copy: row of that plane each sequence reads
-    const std::vector<int32_t> dst_rows;  // WM_RING: cache row per (window, sequence), window-major; WM_STATIC: { kv_head }
+    const std::vector<int32_t> dst_rows;  // WM_RING: cache row per (window, sequence), window-major; WM_STATIC/WM_CONT3: { kv_head }
     const bool    reader_between;      // a GET_ROWS of the cache between the windows and the ssm_conv (must refuse)
     const bool    expect_fusion;
     const int     guard;
@@ -6686,6 +6787,15 @@ struct test_conv_ring : public test_case {
                 win = ggml_cont_2d(ctx, win, row_count, n_s);
                 ggml_build_forward_expand(gf, ggml_set_rows(ctx, states2d, win, rows[j]));
             }
+        } else if (wmode == WM_CONT3) {
+            const int64_t kv_head = dst_rows[0];
+            for (int64_t slot = 0; slot < nw; ++slot) {
+                const int64_t s_idx = n_t - slot;
+                ggml_tensor * tail = ggml_view_3d(ctx, conv_input, d_conv - 1, channels, n_s,
+                                                  conv_input->nb[1], conv_input->nb[2], ggml_row_size(GGML_TYPE_F32, s_idx));
+                ggml_tensor * upd = ggml_view_2d(ctx, all, row_count, n_s, all->nb[1], (slot * mem_size + kv_head) * row_size);
+                ggml_build_forward_expand(gf, ggml_cpy(ctx, ggml_cont(ctx, tail), upd));
+            }
         } else {
             const int64_t kv_head = dst_rows[0];
             for (int64_t t = K - nw + 1; t <= K; ++t) {
@@ -6731,6 +6841,7 @@ struct test_conv_ring : public test_case {
         const int64_t nw        = n_written();
         GGML_ASSERT((int64_t) src_rows.size() == n_s);
         GGML_ASSERT(wmode == WM_RING ? (int64_t) dst_rows.size() == nw * n_s : dst_rows.size() == 1);
+        GGML_ASSERT(wmode != WM_CONT3 || nw <= 8);
 
         check_nodes.clear();
 
@@ -6802,8 +6913,20 @@ struct test_conv_ring : public test_case {
         const char * u = getenv("GGML_VL_SF");
         return u == nullptr || atoi(u) != 0;
     }
-    const char * required_fusion() override { return expect_fusion && conv_ring_on() ? "conv_ring" : nullptr; }
-    const char * forbidden_fusion() override { return expect_fusion && conv_ring_on() ? nullptr : "conv_ring"; }
+    static bool conv_ring_prefill_on() {
+        const char * e = getenv("GGML_CUDA_CONV_RING_PREFILL");
+        return e != nullptr && atoi(e) != 0;
+    }
+    // decode widths (n_t <= 8) fold under GGML_VL_SF_CONVRING (the CONT3 window form also needs [CRP]); prefill
+    // widths fold under GGML_CUDA_CONV_RING_PREFILL alone
+    bool fusion_on() const {
+        if (n_t > 8) {
+            return conv_ring_prefill_on();
+        }
+        return conv_ring_on() && (wmode != WM_CONT3 || conv_ring_prefill_on());
+    }
+    const char * required_fusion() override { return expect_fusion && fusion_on() ? "conv_ring" : nullptr; }
+    const char * forbidden_fusion() override { return expect_fusion && fusion_on() ? nullptr : "conv_ring"; }
 
     // the diff nodes are exactly zero on the reference backend: any nonzero (or NaN) element on the tested one
     // is a value mismatch between the fused and the unfused path and counts as an error
@@ -14621,6 +14744,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_shexp_gate(1000, 777, 3, true));
     test_cases.emplace_back(new test_dsv4_hc_post(2560, 21, true, true));
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, false, true));
+    // [HCPC] hc_post + CPY into a separate tensor (1) or back into the residual (2)
+    for (int cm : {1, 2}) {
+        test_cases.emplace_back(new test_dsv4_hc_post(31, 17, true, true, cm));
+        test_cases.emplace_back(new test_dsv4_hc_post(2560, 21, true, true, cm));
+        test_cases.emplace_back(new test_dsv4_hc_post(2560, 21, true, false, cm));
+        test_cases.emplace_back(new test_dsv4_hc_post(31, 17, false, false, cm));
+    }
+    // [HCGP] the mixer chain, f32 xn and (live_x) the HC_PRE_XN rebuild; fuses from 64 tokens up, not at 63
+    for (bool live_x : { false, true }) {
+        test_cases.emplace_back(new test_dsv4_hc_mix(2560, 4, 320, 300, live_x));
+        test_cases.emplace_back(new test_dsv4_hc_mix(2560, 4, 320, 129, live_x));
+        test_cases.emplace_back(new test_dsv4_hc_mix(2560, 4, 320, 64,  live_x));
+        test_cases.emplace_back(new test_dsv4_hc_mix(2560, 4, 320, 63,  live_x));
+        test_cases.emplace_back(new test_dsv4_hc_mix(512,  4, 64,  200, live_x));
+    }
     // [HCPN] the Flash-Next hyper-connection step, with and without the BF16 copy, the hc_post or the ADD as norm input,
     // both norm block sizes and a width over the fused kernel's 4096 columns
     for (int64_t n_embd : { 2560, 768 }) {
@@ -17885,9 +18023,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         // widest ubatch (8 windows at K 8), K 1 (n_rs_seq 0: one window at column n_t)
         test_cases.emplace_back(new t(256, 8, 1, 8, t::WM_STATIC, 0, { 1 }, { 1 }));
         test_cases.emplace_back(new t(256, 1, 1, 1, t::WM_STATIC, 0, { 1 }, { 1 }));
-        // guards: a cache reader between the windows and the ssm_conv, and a 9-token ubatch, must refuse
+        // guards: a cache reader between the windows and the ssm_conv must refuse; a 9-token ubatch folds only
+        // under GGML_CUDA_CONV_RING_PREFILL=1 ([CRP], prefill kernel)
         test_cases.emplace_back(new t(256, 1, 1, 5, t::WM_RING, 0, { 1 }, { 5 }, true, false));
-        test_cases.emplace_back(new t(256, 9, 1, 5, t::WM_STATIC, 0, { 1 }, { 1 }, false, false));
+        test_cases.emplace_back(new t(256, 9, 1, 5, t::WM_STATIC, 0, { 1 }, { 1 }));
+        // [CRP] prefill widths in the qwen4exp window form: production channels with a token tail (2061 = 64*32+13),
+        // a full 12288-token ubatch, two sequences, 8 windows (K 8), rollback source plane, a tiny tail, the static
+        // form at prefill width, a decode-width CONT3 (needs both switches), and a reader between (must refuse)
+        test_cases.emplace_back(new t(10240, 2061, 1, 5, t::WM_CONT3, 0, { 1 }, { 1 }));
+        test_cases.emplace_back(new t(256, 12288, 1, 5, t::WM_CONT3, 0, { 1 }, { 1 }));
+        test_cases.emplace_back(new t(256, 100, 2, 5, t::WM_CONT3, 0, { 3, 2 }, { 2 }));
+        test_cases.emplace_back(new t(256, 40, 1, 8, t::WM_CONT3, 0, { 1 }, { 1 }));
+        test_cases.emplace_back(new t(256, 50, 1, 5, t::WM_CONT3, 2, { 1 }, { 1 }));
+        test_cases.emplace_back(new t(128, 33, 1, 5, t::WM_CONT3, 0, { 0 }, { 0 }));
+        test_cases.emplace_back(new t(256, 100, 1, 5, t::WM_STATIC, 0, { 1 }, { 1 }));
+        test_cases.emplace_back(new t(256, 3, 1, 5, t::WM_CONT3, 0, { 1 }, { 1 }));
+        test_cases.emplace_back(new t(256, 64, 1, 5, t::WM_CONT3, 0, { 1 }, { 1 }, true, false));
         // [#110 SF fold 2] Each scatter has unique rows, but successive windows swap sequence ownership.
         test_cases.emplace_back(new t(256, 2, 2, 5, t::WM_RING, 0, { 2, 1 }, { 5, 6, 6, 5 }, false, false));
         test_cases.emplace_back(new t(256, 1, 2, 5, t::WM_RING, 0, { 2, 1 }, { 5, 6 }));
@@ -17980,6 +18131,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     add_get_rows_narrow_cases(test_cases, true);
     add_iq4xs_k4_cases(test_cases, true);
     add_mmf_split_k_cases(test_cases, true);
+
+    // [HCGP] Flash-Next hyper-connection mixer at a 4,096- and 12,288-token ubatch (GGML_CUDA_HC_GATE_PRE A/B)
+    test_cases.emplace_back(new test_dsv4_hc_mix(2560, 4, 320, 4096));
+    test_cases.emplace_back(new test_dsv4_hc_mix(2560, 4, 320, 12288));
 
     // [VBEAT] Flash-Next dense shapes at verify widths (GGML_TEST_VBEAT_DENSE=1): MMVQ vs MMQ per type
     if (getenv("GGML_TEST_VBEAT_DENSE") != nullptr) {
