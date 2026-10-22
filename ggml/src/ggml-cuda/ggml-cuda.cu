@@ -9473,6 +9473,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             ggml_cuda_gdn_state_read_finish(cuda_ctx);
             ggml_cuda_lid_gather_finish(cuda_ctx);
             ggml_cuda_conv_ring_finish(cuda_ctx);
+            ggml_cuda_moe_cache_hf_graph_end(*cuda_ctx);
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
             if (ggml_cuda_moe_table_prefetch_enabled()) {
                 // The table copy branch rejoins here, before cudaStreamEndCapture.

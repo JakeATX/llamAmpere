@@ -16,6 +16,7 @@ bool ggml_cuda_moe_cache_prefetch_async_active(void) { return false; }
 void ggml_cuda_moe_cache_device_predict(ggml_backend_cuda_context &, const ggml_tensor *) {}
 void ggml_cuda_moe_cache_table_graph_begin(ggml_backend_cuda_context &, bool) {}
 void ggml_cuda_moe_cache_table_graph_end(ggml_backend_cuda_context &) {}
+void ggml_cuda_moe_cache_hf_graph_end(ggml_backend_cuda_context &) {}
 
 static void moe_cache_register_stub(const void * owner) {
     (void) owner;
@@ -97,6 +98,8 @@ static size_t g_hf_stride = 0;
 static int64_t g_hf_experts = 0;
 static int g_hf_slots = 0;
 static std::atomic<unsigned long long> g_hf_layers{0};
+// fork PARFIX: graphs that ended with a layer's side copies still unjoined (see ggml_cuda_moe_cache_hf_graph_end).
+static std::atomic<unsigned long long> g_hf_graph_end_joins{0};
 
 // fork PREFETCHFIX: asynchronous look-ahead prefetch (GGML_MOE_PREFETCH_ASYNC=1 copies,
 // =2 predicts and measures accuracy only). The graph writes each prediction into a ring in
@@ -191,7 +194,8 @@ static void moe_missjoin_log(const char * when) {
                 when, c[8], c[9]);
     }
     if (const unsigned long long hf = g_hf_layers.load(std::memory_order_relaxed)) {
-        MOE_CACHE_LOG("[moe-cache] missjoin hit-first %s: hf_layers=%llu\n", when, hf);
+        MOE_CACHE_LOG("[moe-cache] missjoin hit-first %s: hf_layers=%llu graph_end_joins=%llu\n", when, hf,
+                g_hf_graph_end_joins.load(std::memory_order_relaxed));
     }
 }
 
@@ -8630,9 +8634,16 @@ static bool moe_hf_begin(ggml_backend_cuda_context & ctx, moe_cache_session & se
     if (routes < 1 || routes > MOE_MISSJOIN_MAX_ROUTES || ids->ne[2] != 1) {
         return false;
     }
+    // fork PARFIX: the layer takes this path only when all three projections fit the card's table path for this
+    // many tokens (the same limit moe_cache_device_op_fits applies per weight type: on Ampere IQ3_S stops at 6,
+    // IQ3_XXS/IQ2_S at 7, the rest at 8). With --parallel 2 a 6-8 token verify batch could otherwise start a layer
+    // whose down (or gate) projection then runs on the CPU, leaving that projection's side copy unjoined across
+    // the graph split. One sequence (<= 5 tokens) always fits every type, so this never declines there.
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
     for (int j = 0; j < 3; ++j) {
         if (!ggml_cuda_moe_table_mmv_filtered_supported((ggml_type) group[j]->desc.type) || group[j]->staging_device ||
-                group[j]->desc.n_expert != group[0]->desc.n_expert) {
+                group[j]->desc.n_expert != group[0]->desc.n_expert ||
+                ids->ne[1] > get_mmvq_mmid_max_batch((ggml_type) group[j]->desc.type, cc)) {
             return false;
         }
     }
@@ -8699,6 +8710,31 @@ static const void * const * moe_hf_wait(ggml_backend_cuda_context & ctx, moe_cac
     CUDA_CHECK(cudaStreamWaitEvent(ctx.stream(), g_hf_done[k], 0));
     session.mj_pending &= ~(1u << k);
     return g_hf_eff + (size_t) k * g_hf_experts;
+}
+
+// fork PARFIX: called at the end of every eager or captured evaluation of a CUDA graph (one scheduler split),
+// before cudaStreamEndCapture. A layer whose projections did not all take the miss-join path (for example one
+// projection fell back to another path) leaves side-stream copies whose events nothing in this graph joins.
+// Joining them here keeps a capture closed (no unjoined side work) and keeps any later cudaStreamWaitEvent from
+// waiting on an event recorded by another graph or capture, which fails with "invalid argument". Nothing is
+// pending when every layer consumed its three projections, the normal case, and then this does nothing.
+void ggml_cuda_moe_cache_hf_graph_end(ggml_backend_cuda_context & ctx) {
+    if (g_session_suppressed || g_session_stack.empty() || !g_session_stack.back().active) return;
+    auto & session = *g_session_stack.back().active;
+    if (!session.mj_pending || session.devices.size() != 1 || session.devices[0]->logical != ctx.device) return;
+    cudaEvent_t * done = moe_missjoin_hitfirst_enabled() ? g_hf_done : g_mj_done;
+    for (int j = 0; j < 3; ++j) {
+        if ((session.mj_pending >> j & 1u) && done[j]) {
+            CUDA_CHECK(cudaStreamWaitEvent(ctx.stream(), done[j], 0));
+        }
+    }
+    session.mj_pending = 0;
+    session.mj_group = -1;
+    session.mj_ids = nullptr;
+    session.hf_seq.clear();
+    if (g_hf_graph_end_joins.fetch_add(1, std::memory_order_relaxed) == 0) {
+        MOE_CACHE_LOG("[moe-cache] missjoin: joined side copies left pending at the end of a graph\n");
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
