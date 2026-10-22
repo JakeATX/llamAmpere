@@ -969,6 +969,24 @@ static bool moe_cache_env_i64(
     return true;
 }
 
+// Physical free-memory floor kept by the device-table and missjoin-retain
+// checks after the expert pools are filled. The default 1 GiB made every
+// reserve at or below ~1 GiB fall back to legacy host routing (VRAMFIT,
+// 2026-10-22). GGML_CUDA_MOE_CACHE_FREE_FLOOR_MB lowers it so a smaller
+// reserve can give the cache more card memory; the reserve itself still
+// decides how much stays free.
+static size_t moe_cache_physical_free_floor() {
+    static const size_t floor = [] {
+        int64_t value = 0;
+        if (moe_cache_env_i64("GGML_CUDA_MOE_CACHE_FREE_FLOOR_MB", 0, 8192, value)) {
+            MOE_CACHE_LOG("[moe-cache] physical free floor override: %lld MiB\n", (long long) value);
+            return (size_t) value << 20;
+        }
+        return (size_t) 1 << 30;
+    }();
+    return floor;
+}
+
 static int moe_cache_min_compute_capability(bool automatic) {
     int result = automatic ? moe_cache_cc_ampere : moe_cache_cc_forced_min;
     int64_t value = 0;
@@ -8265,7 +8283,7 @@ static void moe_missjoin_retained_prepare(moe_cache_session & session) {
     }
     if (bytes == 256) { return; }
     size_t free_bytes = 0, total_bytes = 0;
-    const size_t free_floor = 1ull << 30;
+    const size_t free_floor = moe_cache_physical_free_floor();
     if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess || free_bytes < bytes || free_bytes - bytes < free_floor) {
         (void) cudaGetLastError();
         MOE_CACHE_LOG("[moe-cache] missjoin retain disabled: physical free floor\n");
@@ -9979,7 +9997,7 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
         // reserve. Keep at least 1 GiB physically free on the home card so
         // its driver allocations also fit below the 23,552 MiB card limit.
         const size_t table_workspace_cap = 64u << 20;
-        const size_t physical_free_floor = 1ull << 30;
+        const size_t physical_free_floor = moe_cache_physical_free_floor();
         moe_cache_memory_view table_memory;
         const cudaError_t table_query = cudaMemGetInfo(&free_bytes, &total_bytes);
         const bool budget_query = table_query == cudaSuccess && moe_cache_memory_query(device, table_memory);
