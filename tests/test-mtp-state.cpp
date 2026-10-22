@@ -610,6 +610,126 @@ static void run_device_feedback(bool cuda) {
     printf("PASS Qwen4exp %s sequential feedback: bit-identical logits, poisoned host continuation, repeated rounds, state restore, target sidecar, position guards\n", cuda ? "GPU" : "CPU");
 }
 
+// [RTPORT] LLAMA_MTP_PIPELINE: a guess step queued before its token is known must give the same logits as the
+// ordinary feedback step, across repeated rounds, a released (cancelled) step, a rollback, and the common driver.
+static void run_mtp_pipe() {
+    prefill_env_restore prefill_env;
+    prefill_env.set(false, false, false);
+    feedback_env_restore feedback_env;
+    const std::string pipe_env = common_get_env("LLAMA_MTP_PIPELINE");
+    common_set_env("LLAMA_SPEC_DEFER_CATCHUP", "0");
+    common_set_env("LLAMA_MTP_QWEN4EXP_CHAIN", "0");
+    common_set_env("LLAMA_MTP_DEVICE_FEEDBACK", "1");
+    require(common_get_env("GGML_SCHED_UPLOAD_KERNEL") == "1", "pipe gate runs with GGML_SCHED_UPLOAD_KERNEL=1");
+    auto * device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    require(device, "pipe GPU backend is available");
+    llama_model_ptr model(make_model(false, {}, LLM_ARCH_QWEN4EXP, device));
+    const cache_config config { "pipe", GGML_TYPE_Q8_0, GGML_TYPE_Q8_0 };
+    {
+        common_set_env("LLAMA_MTP_PIPELINE", "0");
+        contexts reference(model.get(), config, 8, COMMON_SPECULATIVE_TYPE_DRAFT_MTP, 8, 1, 512);
+        require(!llama_mtp_pipe_init(reference.dft), "pipeline is opt-in");
+        common_set_env("LLAMA_MTP_PIPELINE", "1");
+        contexts pipe(model.get(), config, 8, COMMON_SPECULATIVE_TYPE_DRAFT_MTP, 8, 1, 512);
+        require(llama_mtp_pipe_init(pipe.dft), "Qwen4exp CUDA helper supports the pipeline");
+        require(llama_set_sampler(reference.dft, 0, nullptr) && llama_set_sampler(pipe.dft, 0, nullptr),
+                "detach backend samplers for full-vocabulary pipe comparison");
+        const size_t width = llama_model_n_embd_out(model.get());
+        std::vector<float> hidden(width), poison(width, 1000.0f);
+        for (size_t j = 0; j < width; ++j) {
+            hidden[j] = float((int) (j % 13) - 6) / 13.0f;
+        }
+        llama_token token = 0;
+        llama_pos pos = 0;
+        int32_t n_seq_id = 1;
+        llama_seq_id seq = 0;
+        llama_seq_id * seq_id = &seq;
+        int8_t output = 1;
+        llama_batch batch = { 1, &token, hidden.data(), &pos, &n_seq_id, &seq_id, &output };
+        auto compare = [&](const char * what) {
+            const float * expected = llama_get_logits_ith(reference.dft, 0);
+            const float * actual = llama_get_logits_ith(pipe.dft, 0);
+            require(expected && actual && std::memcmp(expected, actual, n_vocab * sizeof(float)) == 0, what);
+        };
+        llama_pos pos0 = 0;
+        for (int round = 0; round < 3; ++round) {
+            // step 0: token known up front
+            pos = pos0;
+            token = token_at(pos);
+            batch.embd = hidden.data();
+            require(llama_decode(reference.dft, batch) == 0, "reference step 0");
+            require(llama_mtp_pipe_decode(pipe.dft, batch, false, false) == 0, "pipe step 0");
+            for (int step = 1; step < 4; ++step) {
+                // queue step `step` before its token exists; read step - 1 while it waits
+                pos = pos0 + step;
+                token = 0;
+                batch.embd = poison.data();
+                require(llama_mtp_pipe_decode(pipe.dft, batch, true, true) == 0, "pipe queues the next step ahead");
+                require(llama_mtp_pipe_decode(pipe.dft, batch, true, true) == -4, "pipe refuses a second queued step");
+                compare("pipe logits are bit-identical while the next step waits on the card");
+                require(llama_mtp_pipe_step_ok(pipe.dft), "queued step did not time out");
+                const float * next = llama_get_embeddings_nextn_ith(reference.dft, 0);
+                std::copy(next, next + width, hidden.begin());
+                token = token_at(pos);
+                batch.embd = hidden.data();
+                require(llama_decode(reference.dft, batch) == 0, "reference step");
+                require(llama_mtp_pipe_supply(pipe.dft, token_at(pos)), "pipe supplies the drawn token");
+            }
+            compare("pipe last-step logits are bit-identical");
+            require(llama_mtp_pipe_step_ok(pipe.dft), "last step did not time out");
+            // queue one more step and release it unused, then roll both back past it
+            pos = pos0 + 4;
+            token = 0;
+            batch.embd = poison.data();
+            require(llama_mtp_pipe_decode(pipe.dft, batch, true, true) == 0, "pipe queues a step it will release");
+            llama_mtp_pipe_cancel(pipe.dft);
+            const llama_pos keep = pos0 + 2 + round; // accepted prefix differs per round
+            require(llama_memory_seq_rm(llama_get_memory(reference.dft), 0, keep, -1), "reference rollback");
+            require(llama_memory_seq_rm(llama_get_memory(pipe.dft), 0, keep, -1), "pipe rollback");
+            pos0 = keep;
+            const float * next = llama_get_embeddings_nextn_ith(reference.dft, 0);
+            std::copy(next, next + width, hidden.begin());
+        }
+        uint64_t n_steps = 0, n_deferred = 0, n_cancel = 0;
+        require(llama_mtp_pipe_stats(pipe.dft, &n_steps, &n_deferred, &n_cancel) && n_steps == 15 && n_deferred == 12 &&
+                n_cancel == 3, "pipe counts its steps");
+        // a queued step that never gets its token times out on the card; the context then runs unpipelined
+        pos = pos0;
+        token = token_at(pos);
+        batch.embd = hidden.data();
+        require(llama_mtp_pipe_decode(pipe.dft, batch, false, false) == 0, "pipe step before the timeout");
+        pos = pos0 + 1;
+        token = 0;
+        require(llama_mtp_pipe_decode(pipe.dft, batch, true, true) == 0, "pipe queues a step that will time out");
+        usleep(400 * 1000);
+        require(llama_mtp_pipe_supply(pipe.dft, token_at(pos)), "late token");
+        require(!llama_mtp_pipe_step_ok(pipe.dft), "timeout is reported");
+        require(llama_mtp_pipe_decode(pipe.dft, batch, true, false) == -4, "pipeline stays off after a timeout");
+        require(llama_mtp_pipe_step_ok(pipe.dft), "after a timeout the steps run unpipelined");
+    }
+    // common driver: same proposal schedule with and without the pipeline, greedy and sampled (exact p/q) drafting
+    for (const bool sampled : { false, true }) {
+        common_set_env("LLAMA_MTP_PIPELINE", "0");
+        contexts reference(model.get(), config, 16, COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE, 16, 1, 512);
+        common_set_env("LLAMA_MTP_PIPELINE", "1");
+        contexts pipe(model.get(), config, 16, COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE, 16, 1, 512);
+        require(llama_mtp_pipe_init(pipe.dft), "driver context has the pipeline");
+        prefill(reference, 0, 8, 0);
+        prefill(pipe, 0, 8, 0);
+        llama_pos reference_pos = 8, pipe_pos = 8;
+        const schedule expected = generate(reference, 0, reference_pos, 0, 12, sampled, false);
+        require_schedule(generate(pipe, 0, pipe_pos, 0, 12, sampled, false), expected,
+                sampled ? "pipe preserves sampled p/q proposals" : "pipe preserves greedy proposals");
+        uint64_t n_steps = 0, n_deferred = 0, n_cancel = 0;
+        require(llama_mtp_pipe_stats(pipe.dft, &n_steps, &n_deferred, &n_cancel) && n_deferred > 0 && n_cancel == 0,
+                "driver queued steps ahead and released none");
+        printf("pipe driver %s: %llu steps, %llu queued ahead\n", sampled ? "sampled" : "greedy",
+                (unsigned long long) n_steps, (unsigned long long) n_deferred);
+    }
+    common_set_env("LLAMA_MTP_PIPELINE", pipe_env);
+    printf("PASS Qwen4exp GPU pipelined guess steps: bit-identical logits with the next step queued, released step, rollback, timeout fallback, driver schedules\n");
+}
+
 static void run_qwen4exp_pool(bool cuda = false, bool store_only = false) {
     require((common_get_env("LLAMA_MTP_POOL_INCREMENTAL") == "1" ||
                 (!store_only && common_get_env("LLAMA_MTP_POOL_INCREMENTAL") == "0")) &&
@@ -3169,6 +3289,8 @@ int main(int argc, char ** argv) {
     const bool pin_host = argc == 2 && (std::strcmp(argv[1], "--host-pin-only") == 0 || std::strcmp(argv[1], "--host-pin-cuda-only") == 0);
     const bool cuda_sharing = argc == 2 && (std::strcmp(argv[1], "--cuda-sharing-only") == 0 || std::strcmp(argv[1], "--host-pin-cuda-only") == 0);
     const bool feedback_cuda = argc == 2 && std::strcmp(argv[1], "--device-feedback-cuda-only") == 0;
+    const bool pipe_cuda = argc == 2 && std::strcmp(argv[1], "--pipe-cuda-only") == 0;
+    if (pipe_cuda) { common_set_env("GGML_SCHED_UPLOAD_KERNEL", "1"); }
     const bool chain_cuda = argc == 2 && std::strcmp(argv[1], "--qwen4exp-chain-cuda-only") == 0;
     const bool compact_cuda = argc == 2 && std::strcmp(argv[1], "--qwen4exp-compact-cuda-only") == 0;
     const bool full_head_cuda = argc == 2 && std::strcmp(argv[1], "--qwen4exp-full-head-cuda-only") == 0;
@@ -3176,7 +3298,7 @@ int main(int argc, char ** argv) {
     if (pin_host) { common_set_env("LLAMA_MTP_PIN_BORROWED_HOST", "1"); }
     const bool pool_cuda = argc == 2 && std::strcmp(argv[1], "--qwen4exp-pool-cuda-only") == 0;
     const bool defer_math_cuda = argc == 3 && std::strcmp(argv[1], "--bookkeep-defer-math-cuda") == 0;
-    if (cuda_sharing || feedback_cuda || chain_cuda || compact_cuda || full_head_cuda || pool_store_cuda || pool_cuda ||
+    if (cuda_sharing || feedback_cuda || pipe_cuda || chain_cuda || compact_cuda || full_head_cuda || pool_store_cuda || pool_cuda ||
             defer_math_cuda) { ggml_backend_load_all(); }
     llama_backend_init();
     int failed = 0;
@@ -3214,6 +3336,11 @@ int main(int argc, char ** argv) {
         }
         if (reserve_probe) {
             run_reserve_probe(std::stoul(argv[2]), std::stoul(argv[3]), argc == 5 ? argv[4] : nullptr);
+            llama_backend_free();
+            return 0;
+        }
+        if (pipe_cuda) {
+            run_mtp_pipe();
             llama_backend_free();
             return 0;
         }

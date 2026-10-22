@@ -83,6 +83,18 @@ LLAMA_API int llama_mtp_handoff_decode(struct llama_context * draft, struct llam
 // These calls keep helper hidden rows on device; get_embeddings_nextn does not return their output.
 LLAMA_API bool llama_mtp_device_feedback_init(struct llama_context * draft);
 LLAMA_API int llama_mtp_device_feedback_decode(struct llama_context * draft, struct llama_batch batch, bool use_previous);
+// [RTPORT] LLAMA_MTP_PIPELINE=1 (needs feedback): queue a 1-row helper step whose token is published later, so the
+// next guess step is already on the card while the host samples the current one (Strata's back-to-back steps).
+// pipe_decode with defer=false publishes batch.token[0] itself; with defer=true the step waits on the card for
+// pipe_supply (or pipe_cancel). While a step waits, llama_synchronize and the output getters wait only for the step
+// before it. pipe_step_ok synchronizes and returns false when the last step timed out (its outputs are garbage).
+LLAMA_API bool llama_mtp_pipe_init(struct llama_context * draft);
+LLAMA_API int  llama_mtp_pipe_decode(struct llama_context * draft, struct llama_batch batch, bool use_previous, bool defer);
+LLAMA_API bool llama_mtp_pipe_supply(struct llama_context * draft, llama_token token);
+LLAMA_API void llama_mtp_pipe_cancel(struct llama_context * draft);
+LLAMA_API bool llama_mtp_pipe_step_ok(struct llama_context * draft);
+// steps run, steps queued ahead of their token, queued steps released unused; false if off or stopped by a timeout
+LLAMA_API bool llama_mtp_pipe_stats(struct llama_context * draft, uint64_t * n_steps, uint64_t * n_deferred, uint64_t * n_cancel);
 
 // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
 LLAMA_API struct ggml_cgraph * llama_graph_reserve(

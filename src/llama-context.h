@@ -211,6 +211,14 @@ struct llama_context {
     int mtp_device_feedback_decode(llama_batch batch, bool use_previous);
     void mtp_device_feedback_capture(ggml_tensor * hidden, const llama_ubatch & ubatch);
     void mtp_device_feedback_input(llm_graph_input_embd_h & input);
+    bool mtp_pipe_init();
+    int  mtp_pipe_decode(llama_batch batch, bool use_previous, bool defer);
+    bool mtp_pipe_supply(llama_token token);
+    void mtp_pipe_cancel();
+    bool mtp_pipe_step_ok();
+    bool mtp_pipe_stats(uint64_t * n_steps, uint64_t * n_deferred, uint64_t * n_cancel) const;
+    void mtp_pipe_input(llm_graph_input_embd_h & input);
+    void mtp_pipe_publish(uint32_t seq, llama_token token);
 
     //
     // state save/load
@@ -553,6 +561,23 @@ private:
         bool active = false;
         bool use_previous = false;
     } mtp_feedback;
+    // [RTPORT] LLAMA_MTP_PIPELINE: guess steps queued before their token is known (see llama_mtp_pipe_decode)
+    struct {
+        bool enabled = false;
+        bool active  = false;   // inside a pipe decode: the graph takes its token row from the stream
+        bool pending = false;   // the last queued step waits for its token
+        bool failed  = false;   // a step timed out; the pipeline stays off for this context
+        uint32_t seq = 0;       // sequence number of the last queued step (0 = none)
+        ggml_backend_buffer_ptr host;   // pinned: flag[2], status[2], rows[2][n_embd]
+        uint32_t * flag   = nullptr;
+        uint32_t * status = nullptr;
+        float    * rows   = nullptr;
+        int64_t n_embd = 0;
+        ggml_backend_t backend = nullptr;
+        ggml_backend_event_ptr ev[2];   // recorded after each step's output copies
+        bool (*row_wait)(ggml_backend_t, ggml_tensor *, const uint32_t *, uint32_t, const float *, uint32_t *, uint64_t) = nullptr;
+        uint64_t n_steps = 0, n_deferred = 0, n_cancel = 0;
+    } mtp_pipe;
     std::vector<ggml_backend_buffer_ptr> mtp_input_uploads;
     size_t mtp_input_upload_next = 0;
     ggml_backend_event_ptr mtp_input_upload_done;

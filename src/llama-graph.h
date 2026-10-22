@@ -184,6 +184,9 @@ public:
     ggml_tensor * embd   = nullptr; // F32 [n_embd, n_batch]
     ggml_tensor * h      = nullptr; // F32 [n_embd, n_batch]
     bool h_device = false; // fork: the context supplies hidden rows by backend copy
+    // [RTPORT] LLAMA_MTP_PIPELINE: the token embedding row as a device input, written on the stream by the
+    // context (llama_context::mtp_pipe_input) instead of a host get_rows; F32 [n_embd_inp, 1], or nullptr
+    ggml_tensor * tok_row = nullptr;
 
     const int64_t n_embd = 0;
 };
@@ -967,6 +970,9 @@ struct llm_graph_params {
     // [PLEPF] the context's PLE page prefetch (null when off); set after construction
     llama_ple_prefetch * ple_pf = nullptr;
 
+    // [RTPORT] 1-row MTP step whose token embedding row is a device input (LLAMA_MTP_PIPELINE); set after construction
+    bool mtp_tok_row = false;
+
     // true for a graph built only to reserve compute buffers (llama_context::graph_reserve): its output rows are
     // placeholders and may sit on sequences that have no backend sampler (none is attached yet at context creation)
     // set after construction, so it stays last
@@ -1038,6 +1044,10 @@ struct llm_graph_params {
         }
 
         if (b1_il0 != other.b1_il0 || b1_il1 != other.b1_il1 || b1_carry != other.b1_carry || b1_ffn != other.b1_ffn || b1_ffn_phase != other.b1_ffn_phase) {
+            return false;
+        }
+
+        if (mtp_tok_row != other.mtp_tok_row) {
             return false;
         }
 
@@ -1224,6 +1234,7 @@ struct llm_graph_context {
     const int32_t       b1_il1;   // see llm_graph_params (-1 = n_layer)
     ggml_tensor * const b1_carry; // see llm_graph_params
     llama_ple_prefetch * const ple_pf; // see llm_graph_params
+    const bool mtp_tok_row; // see llm_graph_params
 
     // [#81] logits of the compact draft head for `cur` [n_embd, n], [n_sel, n]: plain mul_mat on the activation the
     // head consumes (EXL3: x_rot = H128(suh * cur), the fused kernel's input glue built from generic ops)

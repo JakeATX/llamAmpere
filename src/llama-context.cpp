@@ -1270,6 +1270,15 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
 }
 
 llama_context::~llama_context() {
+    if (mtp_pipe.enabled) {
+        mtp_pipe_cancel();  // never leave a step waiting on the card for a token
+        if (sched) {
+            ggml_backend_sched_synchronize(sched.get());  // the pinned flag/row memory is freed before the backends
+        }
+        LLAMA_LOG_INFO("%s: MTP pipeline: %llu steps, %llu queued ahead, %llu released unused%s\n", __func__,
+                (unsigned long long) mtp_pipe.n_steps, (unsigned long long) mtp_pipe.n_deferred,
+                (unsigned long long) mtp_pipe.n_cancel, mtp_pipe.failed ? ", stopped after a timeout" : "");
+    }
     if (auto * kv = llama_sj_kvarn_cache(memory.get())) {
         kv->scratch_cancel();
     }
@@ -2420,7 +2429,14 @@ void llama_context::synchronize() {
         return;
     }
 
-    ggml_backend_sched_synchronize(sched.get());
+    if (mtp_pipe.pending) {
+        // [RTPORT] the newest step waits on the card for its token: wait only for the step before it
+        if (mtp_pipe.seq > 1) {
+            ggml_backend_event_synchronize(mtp_pipe.ev[(mtp_pipe.seq - 1) & 1].get());
+        }
+    } else {
+        ggml_backend_sched_synchronize(sched.get());
+    }
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -3569,6 +3585,9 @@ void llama_context::mtp_prefill_place(llm_graph_result & res) {
             for (auto & backend : backends) {
                 if (ggml_backend_get_device(backend.get()) == model.dev_output()) {
                     ggml_backend_sched_set_tensor_backend(sched.get(), h->h, backend.get());
+                    if (h->tok_row) {
+                        ggml_backend_sched_set_tensor_backend(sched.get(), h->tok_row, backend.get());
+                    }
                     res.mtp_device_input = true;
                     break;
                 }
@@ -4002,6 +4021,186 @@ bool llama_mtp_device_feedback_init(llama_context * draft) {
 
 int llama_mtp_device_feedback_decode(llama_context * draft, llama_batch batch, bool use_previous) {
     return draft ? draft->mtp_device_feedback_decode(batch, use_previous) : -4;
+}
+
+// [RTPORT] LLAMA_MTP_PIPELINE=1. Strata (src/core/mtp.cpp, the step loop after the round graph) queues every guess
+// step back to back and lets the host poll mapped memory. Our steps keep the host p/q draw, so each step still needs
+// the host's token; what can move off the critical path is the rest of the step's host work (batch, memory slot,
+// graph reuse, input staging, launch). A step is queued with its token row read on the card from pinned memory
+// (ggml_backend_cuda_mtp_row_wait) and the host publishes the row once it has sampled. Same f32 row as the host
+// get_rows, same graph otherwise: the outputs are bit-identical.
+bool llama_context::mtp_pipe_init() {
+    auto & pp = mtp_pipe;
+    if (pp.enabled) {
+        return true;
+    }
+    const char * value = getenv("LLAMA_MTP_PIPELINE");
+    // the step's small host inputs must reach the card in stream order (POSTFIX c1): a plain input copy waits for
+    // the stream, which here holds a kernel waiting for the host
+    const char * upload = getenv("GGML_SCHED_UPLOAD_KERNEL");
+    if (!value || strcmp(value, "1") != 0 || !upload || atoi(upload) == 0 || !mtp_feedback.rows || !mtp_feedback.backend || !model.tok_embd ||
+            !model.tok_embd->buffer || !ggml_backend_buffer_is_host(model.tok_embd->buffer) || !model.tok_embd->data ||
+            (model.tok_embd->type != GGML_TYPE_F32 && !ggml_get_type_traits(model.tok_embd->type)->to_float)) {
+        return false;
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(mtp_feedback.backend);
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    pp.row_wait = reg ? (decltype(pp.row_wait)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_mtp_row_wait") : nullptr;
+    ggml_backend_buffer_type_t buft = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+    if (!pp.row_wait || !buft) {
+        return false;
+    }
+    pp.n_embd = model.tok_embd->ne[0];
+    const size_t bytes = 256 + 2 * (size_t) pp.n_embd * sizeof(float);
+    pp.host.reset(ggml_backend_buft_alloc_buffer(buft, bytes));
+    for (auto & ev : pp.ev) {
+        ev.reset(ggml_backend_event_new(dev));
+    }
+    if (!pp.host || !pp.ev[0] || !pp.ev[1]) {
+        pp.host.reset();
+        return false;
+    }
+    auto * base = (uint8_t *) ggml_backend_buffer_get_base(pp.host.get());
+    memset(base, 0, bytes);
+    pp.flag   = (uint32_t *) base;
+    pp.status = (uint32_t *) (base + 64);
+    pp.rows   = (float *) (base + 256);
+    pp.backend = mtp_feedback.backend;
+    pp.enabled = true;
+    LLAMA_LOG_INFO("%s: pipelined MTP guess steps on (LLAMA_MTP_PIPELINE=1)\n", __func__);
+    return true;
+}
+
+void llama_context::mtp_pipe_publish(uint32_t seq, llama_token token) {
+    auto & pp = mtp_pipe;
+    const ggml_tensor * t = model.tok_embd;
+    if (token < 0 || token >= t->ne[1]) {
+        token = 0;
+    }
+    float * dst = pp.rows + (size_t) (seq & 1) * pp.n_embd;
+    const char * row = (const char *) t->data + (size_t) token * t->nb[1];
+    if (t->type == GGML_TYPE_F32) {
+        memcpy(dst, row, pp.n_embd * sizeof(float));
+    } else {
+        ggml_get_type_traits(t->type)->to_float(row, dst, pp.n_embd);
+    }
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    reinterpret_cast<std::atomic<uint32_t> *>(pp.flag + (seq & 1))->store(seq, std::memory_order_release);
+}
+
+void llama_context::mtp_pipe_input(llm_graph_input_embd_h & input) {
+    auto & pp = mtp_pipe;
+    GGML_ASSERT(pp.active && input.tok_row);
+    auto * backend = ggml_backend_sched_get_tensor_backend(sched.get(), input.tok_row);
+    GGML_ASSERT(backend == pp.backend && input.tok_row->ne[0] == pp.n_embd);
+    const uint32_t s = pp.seq;
+    // 200 ms: far above any host sampling time; reached only if the host waits on this stream behind the kernel
+    if (!pp.row_wait(backend, input.tok_row, pp.flag + (s & 1), s, pp.rows + (size_t) (s & 1) * pp.n_embd,
+                pp.status + (s & 1), 200ull * 1000 * 1000)) {
+        throw std::runtime_error("MTP pipeline: row wait launch failed");
+    }
+}
+
+int llama_context::mtp_pipe_decode(llama_batch batch, bool use_previous, bool defer) {
+    auto & pp = mtp_pipe;
+    if (!pp.enabled || pp.failed || pp.pending || batch.n_tokens != 1 || !batch.token) {
+        return -4;
+    }
+    const uint32_t s = ++pp.seq;
+    pp.status[s & 1] = 0;
+    if (!defer) {
+        mtp_pipe_publish(s, batch.token[0]);
+    }
+    pp.active = true;
+    int result;
+    try {
+        result = mtp_device_feedback_decode(batch, use_previous);
+    } catch (...) {
+        pp.active = false;
+        mtp_pipe_publish(s, batch.token[0]);  // never leave a waiting kernel on the stream
+        pp.failed = true;
+        throw;
+    }
+    pp.active = false;
+    if (result != 0) {
+        mtp_pipe_publish(s, batch.token[0]);
+        return result;
+    }
+    ggml_backend_event_record(pp.ev[s & 1].get(), pp.backend);
+    pp.pending = defer;
+    pp.n_steps++;
+    pp.n_deferred += defer ? 1 : 0;
+    return 0;
+}
+
+bool llama_context::mtp_pipe_supply(llama_token token) {
+    auto & pp = mtp_pipe;
+    if (!pp.pending) {
+        return false;
+    }
+    mtp_pipe_publish(pp.seq, token);
+    pp.pending = false;
+    return true;
+}
+
+void llama_context::mtp_pipe_cancel() {
+    auto & pp = mtp_pipe;
+    if (pp.pending) {
+        mtp_pipe_publish(pp.seq, 0);
+        pp.pending = false;
+        pp.n_cancel++;
+    }
+}
+
+bool llama_context::mtp_pipe_stats(uint64_t * n_steps, uint64_t * n_deferred, uint64_t * n_cancel) const {
+    if (n_steps)    { *n_steps    = mtp_pipe.n_steps; }
+    if (n_deferred) { *n_deferred = mtp_pipe.n_deferred; }
+    if (n_cancel)   { *n_cancel   = mtp_pipe.n_cancel; }
+    return mtp_pipe.enabled && !mtp_pipe.failed;
+}
+
+bool llama_context::mtp_pipe_step_ok() {
+    auto & pp = mtp_pipe;
+    const uint32_t s = pp.pending ? pp.seq - 1 : pp.seq;
+    if (s == 0 || pp.failed) {
+        return true;    // after a failure the steps run unpipelined
+    }
+    ggml_backend_event_synchronize(pp.ev[s & 1].get());
+    if (pp.status[s & 1] == s) {
+        LLAMA_LOG_WARN("%s: MTP pipeline step %u timed out waiting for its token; pipeline off for this context\n", __func__, s);
+        pp.failed = true;
+        return false;
+    }
+    return true;
+}
+
+bool llama_mtp_pipe_init(llama_context * draft) {
+    return draft && draft->mtp_pipe_init();
+}
+
+int llama_mtp_pipe_decode(llama_context * draft, llama_batch batch, bool use_previous, bool defer) {
+    return draft ? draft->mtp_pipe_decode(batch, use_previous, defer) : -4;
+}
+
+bool llama_mtp_pipe_supply(llama_context * draft, llama_token token) {
+    return draft && draft->mtp_pipe_supply(token);
+}
+
+void llama_mtp_pipe_cancel(llama_context * draft) {
+    if (draft) {
+        draft->mtp_pipe_cancel();
+    }
+}
+
+bool llama_mtp_pipe_step_ok(llama_context * draft) {
+    return !draft || draft->mtp_pipe_step_ok();
+}
+
+bool llama_mtp_pipe_stats(llama_context * draft, uint64_t * n_steps, uint64_t * n_deferred, uint64_t * n_cancel) {
+    if (!draft) {
+        return false;
+    }
+    return draft->mtp_pipe_stats(n_steps, n_deferred, n_cancel);
 }
 
 void llama_context::set_nextn_layer_offset(int32_t offset) {
@@ -4454,6 +4653,13 @@ build_graph:
             for (auto & input : res->inputs) {
                 if (auto * h = dynamic_cast<llm_graph_input_embd_h *>(input.get())) {
                     mtp_device_feedback_input(*h);
+                }
+            }
+        }
+        if (mtp_pipe.active) {
+            for (auto & input : res->inputs) {
+                if (auto * h = dynamic_cast<llm_graph_input_embd_h *>(input.get())) {
+                    mtp_pipe_input(*h);
                 }
             }
         }
@@ -5859,7 +6065,11 @@ uint32_t llama_context::output_reserve(int32_t n_outputs, int32_t n_tokens) {
         std::fill(sampling.probs_count.begin(), sampling.probs_count.end(), 0);
         std::fill(sampling.candidates_count.begin(), sampling.candidates_count.end(), 0);
 
-        std::fill_n(sampling.sampled.data, sampling.sampled.size, LLAMA_TOKEN_NULL);
+        // [RTPORT] a pipelined step is queued before the host reads the previous step's outputs, which may already
+        // sit in this buffer; both steps have the same single output row, and the copy of this step overwrites it
+        if (!mtp_pipe.active) {
+            std::fill_n(sampling.sampled.data, sampling.sampled.size, LLAMA_TOKEN_NULL);
+        }
     } else {
         sampling.logits     = { nullptr, 0 };
         sampling.probs      = { nullptr, 0 };
@@ -7260,6 +7470,7 @@ llm_graph_params llama_context::graph_params(llm_graph_result *             res,
         /*.model       =*/ &model,
     };
     p.ple_pf = ple_pf.get();
+    p.mtp_tok_row = mtp_pipe.active;
     if (b1_cur.active) {
         p.b1_il0   = b1_cur.il0;
         p.b1_il1   = b1_cur.il1;

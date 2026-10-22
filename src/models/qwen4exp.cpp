@@ -1081,8 +1081,19 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     ggml_set_input(inp->h);
     ggml_set_name(inp->h, "mtp_h_input");
 
-    ggml_tensor * tok_embd = ggml_get_rows(ctx0, model.tok_embd, inp->tokens);
-    cb(tok_embd, "mtp_tok_embd", il);
+    ggml_tensor * tok_embd = nullptr;
+    if (mtp_tok_row) {
+        // [RTPORT] LLAMA_MTP_PIPELINE: the context writes this step's token row on the stream (same f32 values the
+        // host get_rows produces), so the step can be queued before its token is known
+        GGML_ASSERT(n_tokens == 1);
+        inp->tok_row = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, model.tok_embd->ne[0], 1);
+        ggml_set_input(inp->tok_row);
+        ggml_set_name(inp->tok_row, "mtp_tok_row");
+        tok_embd = inp->tok_row;
+    } else {
+        tok_embd = ggml_get_rows(ctx0, model.tok_embd, inp->tokens);
+        cb(tok_embd, "mtp_tok_embd", il);
+    }
 
     ggml_tensor * h = inp->h;
 

@@ -1596,6 +1596,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     bool prefill_device = false;
     bool handoff = false; // [PREFILLFAST] LLAMA_MTP_B1_HANDOFF=1: per-ubatch device rows from the target decode
     bool device_feedback = false;
+    bool mtp_pipe = false; // [RTPORT] LLAMA_MTP_PIPELINE=1: next guess step queued on the card before its token is drawn
 
     // One MTP draft driver, three modes (set once in the ctor):
     //   is_mem_shared (gemma4): shares the target KV, runs all heads in one graph.
@@ -1844,6 +1845,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             !same_position_draft && llama_mtp_device_feedback_init(ctx_dft);
         if (device_feedback) {
             SPC_INF("%s", "sequential MTP: helper hidden feedback stays on device (LLAMA_MTP_DEVICE_FEEDBACK)\n");
+        }
+        mtp_pipe = device_feedback && llama_mtp_pipe_init(ctx_dft);
+        if (mtp_pipe) {
+            SPC_INF("%s", "sequential MTP: next guess step queued before its token is drawn (LLAMA_MTP_PIPELINE)\n");
         }
 
         if (chain_heads) {
@@ -3203,6 +3208,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         int i = 0;
 
+        // [RTPORT] pipelined guess steps: while the card runs step i, the host already queues step i + 1 (batch,
+        // memory slot, graph reuse, inputs, launch); that step's first kernel waits on the card for the token row the
+        // host publishes right after drawing token i. Only when step i + 1 is certain to run (fixed cap this round, no
+        // confidence stop), so no card time is spent on a step that gets thrown away.
+        llama_seq_id pipe_seq = 0;
+        if (mtp_pipe) {
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (drafting[seq_id]) {
+                    pipe_seq = seq_id;
+                }
+            }
+        }
+        const bool pipe_round = mtp_pipe && n_drafting == 1 && !cdepth && !(params.p_min > 0.0f);
+        bool pipe_queued = false; // step i is already on the card (queued in the previous iteration)
+
         while (n_drafting > 0) {
             // each step decodes under a different head, i.e. a different decoder layer, and
             // KV is per layer. process() filled this layer's KV only for positions < pos0
@@ -3221,9 +3241,36 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
 
             const int64_t t_dec0 = hp.on ? ggml_time_us() : 0;
-            int ret = device_feedback ? llama_mtp_device_feedback_decode(ctx_dft, batch, i > 0) : llama_decode(ctx_dft, batch);
+            int ret = 0;
+            if (pipe_round) {
+                if (!pipe_queued) {
+                    ret = llama_mtp_pipe_decode(ctx_dft, batch, i > 0, false);
+                    if (ret == -4) {
+                        ret = llama_mtp_device_feedback_decode(ctx_dft, batch, i > 0);
+                    }
+                }
+                pipe_queued = false;
+                if (ret == 0 && i + 1 < n_cap[pipe_seq]) {
+                    // the token is a placeholder: the step reads its row from the host once drawn below
+                    common_batch_clear(batch);
+                    common_batch_add(batch, 0, dparams[pipe_seq].pos0 + i + 1, { pipe_seq }, true);
+                    pipe_queued = llama_mtp_pipe_decode(ctx_dft, batch, true, true) == 0;
+                }
+                if (ret == 0 && !llama_mtp_pipe_step_ok(ctx_dft)) {
+                    // never seen: step i waited too long for its token. Drop it and everything after it.
+                    llama_mtp_pipe_cancel(ctx_dft);
+                    llama_memory_seq_rm(llama_get_memory(ctx_dft), pipe_seq, dparams[pipe_seq].pos0 + i, -1);
+                    break;
+                }
+            } else {
+                ret = device_feedback ? llama_mtp_device_feedback_decode(ctx_dft, batch, i > 0) : llama_decode(ctx_dft, batch);
+            }
             if (ret != 0) {
                 SPC_ERR("llama_decode[%d] returned %d\n", i, ret);
+                if (pipe_queued) {
+                    llama_mtp_pipe_cancel(ctx_dft);
+                    pipe_queued = false;
+                }
                 break;
             }
             if (hp.on) {
@@ -3351,6 +3398,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
 
                 i_last[seq_id] = batch.n_tokens - 1;
+            }
+
+            if (pipe_queued) {
+                if (drafting[pipe_seq] && batch.n_tokens == 1) {
+                    llama_mtp_pipe_supply(ctx_dft, batch.token[0]);
+                } else {
+                    // stopped after all: release the queued step and drop the K/V row it writes
+                    llama_mtp_pipe_cancel(ctx_dft);
+                    llama_memory_seq_rm(llama_get_memory(ctx_dft), pipe_seq, dparams[pipe_seq].pos0 + i + 1, -1);
+                    pipe_queued = false;
+                }
             }
 
             if (batch.n_tokens == 0) {

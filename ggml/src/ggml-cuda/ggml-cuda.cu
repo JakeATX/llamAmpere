@@ -4779,6 +4779,67 @@ static bool ggml_backend_cuda_upload_host_small(ggml_backend_t backend, const vo
     return true;
 }
 
+// [RTPORT] LLAMA_MTP_PIPELINE: a guess step can be queued on the stream before its input token is known (Strata
+// launches all guess steps back to back and the host only polls mapped memory). This kernel is queued in front of
+// the step's graph: one thread polls a host-mapped sequence word until the host has published the step's token
+// embedding row, then the block copies that row into the graph's input tensor. Everything behind it on the stream
+// waits for it, so the host can queue the next step while the card still runs the current one. If the word never
+// arrives (a host-side stream sync behind this kernel would otherwise hang), the kernel gives up after timeout_ns,
+// writes zeros and stores the sequence number in *status; the caller then discards that step.
+static __device__ __forceinline__ uint64_t ggml_cuda_globaltimer_ns() {
+    uint64_t t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+}
+
+static __global__ void k_cuda_mtp_row_wait(const volatile uint32_t * flag, uint32_t want, const volatile float * src,
+        float * __restrict__ dst, int n, volatile uint32_t * status, uint64_t timeout_ns) {
+    __shared__ int ok;
+    if (threadIdx.x == 0) {
+        const uint64_t t0 = ggml_cuda_globaltimer_ns();
+        int good = 1;
+        while ((int32_t) (*flag - want) < 0) {
+            if (ggml_cuda_globaltimer_ns() - t0 > timeout_ns) {
+                good = 0;
+                break;
+            }
+            __nanosleep(256);
+        }
+        __threadfence_system();
+        if (!good) {
+            *status = want;
+        }
+        ok = good;
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        dst[i] = ok ? src[i] : 0.0f;
+    }
+}
+
+// flag/src/status are host pointers of pinned memory (mapped under unified addressing); dst is an F32 device tensor
+static bool ggml_backend_cuda_mtp_row_wait(ggml_backend_t backend, ggml_tensor * dst, const uint32_t * flag,
+        uint32_t want, const float * src, uint32_t * status, uint64_t timeout_ns) {
+    if (!backend || !ggml_backend_is_cuda(backend) || !dst || !dst->data || dst->type != GGML_TYPE_F32 ||
+            !ggml_is_contiguous(dst) || !flag || !src || !status) {
+        return false;
+    }
+    auto * ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
+    ggml_cuda_set_device(ctx->device);
+    void * d_flag = nullptr, * d_src = nullptr, * d_status = nullptr;
+    if (cudaHostGetDevicePointer(&d_flag, (void *) flag, 0) != cudaSuccess ||
+            cudaHostGetDevicePointer(&d_src, (void *) src, 0) != cudaSuccess ||
+            cudaHostGetDevicePointer(&d_status, (void *) status, 0) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    const int n = (int) ggml_nelements(dst);
+    k_cuda_mtp_row_wait<<<1, 256, 0, ctx->stream()>>>((const volatile uint32_t *) d_flag, want,
+            (const volatile float *) d_src, (float *) dst->data, n, (volatile uint32_t *) d_status, timeout_ns);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
 static bool ggml_backend_cuda_set_scratch_buffers(ggml_backend_t backend, ggml_backend_buffer_t * buffers, int n_buffers) {
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA) || CUBLAS_VER_MAJOR < 11 || (CUBLAS_VER_MAJOR == 11 && CUBLAS_VER_MINOR < 2)
     GGML_UNUSED_VARS(backend, buffers, n_buffers);
@@ -11779,6 +11840,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_upload_host_small") == 0) {
         return (void *) ggml_backend_cuda_upload_host_small;
+    }
+    if (strcmp(name, "ggml_backend_cuda_mtp_row_wait") == 0) {
+        return (void *) ggml_backend_cuda_mtp_row_wait;
     }
     if (strcmp(name, "ggml_backend_cuda_scratch_preflight") == 0) {
         return (void *) ggml_backend_cuda_scratch_preflight;

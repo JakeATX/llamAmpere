@@ -182,7 +182,10 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
     const int64_t n_tokens = ubatch->n_tokens;
 
     if (ubatch->token) {
-        ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
+        // [RTPORT] a pipelined MTP step reads its token row from tok_row; its token ids are not a graph input
+        if (!tok_row) {
+            ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
+        }
     } else {
         // note: mtmd embedding input goes through here
         GGML_ASSERT(ubatch->embd);
@@ -207,6 +210,7 @@ bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
     res &= (!params.ubatch.token) || (tokens && tokens->ne[0] == params.ubatch.n_tokens);
     res &= (!params.ubatch.embd)  || (embd   && embd->ne[1]   == params.ubatch.n_tokens);
     res &= (!params.ubatch.embd)  || (h      && h->ne[1]      == params.ubatch.n_tokens);
+    res &= (tok_row != nullptr) == params.mtp_tok_row;
 
     return res;
 }
@@ -1719,6 +1723,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     b1_il1           (params.b1_il1),
     b1_carry         (params.b1_carry),
     ple_pf           (params.ple_pf),
+    mtp_tok_row      (params.mtp_tok_row),
     cb_func          (params.cb),
     res              (params.res),
     model_ref        (params.model),
