@@ -311,7 +311,7 @@ struct common_params_sampling {
 
     // Keep a rejected non-ending draft if its target probability is at least the non-ending replacement's probability.
     bool spec_lossy = false;
-    bool spec_lossy_explicit = false; // --spec-lossy (or LLAMA_ARG_SPEC_LOSSY) was given; otherwise MTP drafting turns beat on
+    bool spec_lossy_explicit = false; // --spec-mb-mtp / --no-spec-mb-mtp (or LLAMA_ARG_SPEC_MB_MTP) was given; otherwise MTP drafting turns it on
 
     // print the parameters into a string
     std::string print() const;

@@ -1424,8 +1424,8 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
         const bool any_mtp = adaptive_mtp || std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
         if (any_mtp && !params.sampling.spec_lossy_explicit) {
             params.sampling.spec_lossy = true;
-            LOG_INF("FYI: mode-biased MTP (--spec-lossy beat) is on by default with MTP drafting; it can change wording slightly with no measured accuracy loss. "
-                    "To turn it off: --spec-lossy exact\n");
+            LOG_INF("FYI: mode-biased MTP (--spec-mb-mtp) is on by default with MTP drafting; it can change wording slightly with no measured accuracy loss. "
+                    "To turn it off: --no-spec-mb-mtp\n");
         }
 
         params.lr.init();
@@ -5013,17 +5013,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_SAMPLING"));
     add_opt(common_arg(
-        {"--spec-lossy"}, "exact|beat",
-        "MTP acceptance: exact is lossless; beat (mode-biased MTP) keeps a rejected draft if p(draft) >= p(residual replacement), excluding EOG and stop tokens "
-        "(default: beat with --spec-type draft-mtp or draft-mtp-adaptive, otherwise exact)",
-        [](common_params & params, const std::string & value) {
-            if (value != "exact" && value != "beat") {
-                throw std::invalid_argument("--spec-lossy must be exact or beat");
-            }
-            params.sampling.spec_lossy = value == "beat";
+        {"--spec-mb-mtp"},
+        {"--no-spec-mb-mtp"},
+        "mode-biased MTP: keep a rejected draft if p(draft) >= p(residual replacement), excluding EOG and stop tokens; "
+        "--no-spec-mb-mtp keeps exact (lossless) acceptance (default: on with --spec-type draft-mtp or draft-mtp-adaptive, otherwise off)",
+        [](common_params & params, bool value) {
+            params.sampling.spec_lossy = value;
             params.sampling.spec_lossy_explicit = true;
         }
-    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_LOSSY"));
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MB_MTP"));
     add_opt(common_arg(
         {"--spec-draft-device", "-devd", "--device-draft"}, "<dev1,dev2,..>",
         "comma-separated list of devices to use for offloading the draft model (none = don't offload, default: follows --device)\n"
