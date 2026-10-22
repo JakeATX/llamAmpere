@@ -4207,9 +4207,12 @@ struct vf_phase_stats {
     uint64_t us[N] = {};
     uint64_t calls = 0, rebuilds = 0;
 };
-bool vf_phases_enabled() {
-    static const bool v = [] { const char * e = getenv("LLAMA_VF_PHASES"); return e && atoi(e) != 0; }();
+int vf_phases_level() {
+    static const int v = [] { const char * e = getenv("LLAMA_VF_PHASES"); return e ? atoi(e) : 0; }();
     return v;
+}
+bool vf_phases_enabled() {
+    return vf_phases_level() != 0;
 }
 thread_local int64_t vf_t_mark = 0;
 thread_local vf_phase_stats * vf_cur = nullptr;
@@ -4253,11 +4256,13 @@ struct vf_scope {
 std::mutex vf_stats_mtx;
 std::unordered_map<const void *, vf_phase_stats> vf_stats_by_ctx;
 vf_phase_stats * vf_stats_for(const void * ctx, uint32_t n_tokens) {
-    if (!vf_phases_enabled() || n_tokens < 2 || n_tokens > 8) {
+    // [RTPORT] LLAMA_VF_PHASES=2 also times 1-row decodes (the MTP draft steps), in their own bucket per context
+    const int level = vf_phases_level();
+    if (level == 0 || n_tokens > 8 || (n_tokens < 2 && !(level >= 2 && n_tokens == 1))) {
         return nullptr;
     }
     std::lock_guard<std::mutex> lock(vf_stats_mtx);
-    return &vf_stats_by_ctx[ctx];
+    return &vf_stats_by_ctx[(const char *) ctx + (n_tokens == 1 ? 1 : 0)];
 }
 }
 
