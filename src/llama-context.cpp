@@ -862,6 +862,7 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
                 /*.flush_chunk =*/ params.sj_kvarn_flush_chunk,
                 /*.shared_pool =*/ sj_kvarn_shared_pool,
                 /*.transform   =*/ params.sj_kvarn_transform ? params.sj_kvarn_transform : "",
+                /*.draft       =*/ cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP,
             },
         };
 
