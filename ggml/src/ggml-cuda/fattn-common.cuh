@@ -1437,6 +1437,55 @@ static __global__ void flash_attn_mask_to_KV_max(
     KV_max[sequence*ne31 + jt] = KV_max_sj;
 }
 
+// [ROUNDFIX] one bit per KV tile of nbatch_fa keys: 1 if any mask row of the query tile sees a key in it.
+// Grid (words, query tiles, mask sequences); one warp per tile, 32 warps per block = one 32-bit word.
+// The rows mirror flash_attn_ext_f16_load_mask: row = (jt*token_step + r) mod n_queries.
+static __global__ void flash_attn_mask_to_live_tiles(
+        const half * __restrict__ mask, uint32_t * __restrict__ bits, const int n_kv, const int nbatch_fa,
+        const int n_words, const int mask_rows, const int token_step, const int n_queries,
+        const int64_t s31, const int64_t s33) {
+    const int word = blockIdx.x;
+    const int jt   = blockIdx.y;
+    const int seq  = blockIdx.z;
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int kb   = word*32 + warp;
+    __shared__ uint32_t word_bits;
+    if (threadIdx.x == 0) {
+        word_bits = 0;
+    }
+    __syncthreads();
+    bool live = false;
+    if ((int64_t) kb*nbatch_fa < n_kv) {
+        const half * m = mask + seq*s33;
+        for (int r = 0; r < mask_rows; ++r) {
+            const int row = (jt*token_step + r) % n_queries;
+            for (int i = lane; i < nbatch_fa; i += WARP_SIZE) {
+                const int k = kb*nbatch_fa + i;
+                if (k < n_kv && __half2float(m[row*s31 + k]) != -INFINITY) {
+                    live = true;
+                }
+            }
+        }
+    }
+    live = __any_sync(0xFFFFFFFF, live);
+    if (lane == 0 && live) {
+        atomicOr(&word_bits, 1u << warp);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        bits[(int64_t(seq)*gridDim.y + jt)*n_words + word] = word_bits;
+    }
+}
+
+static bool ggml_cuda_fattn_skip_dead_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_CUDA_FA_SKIP_DEAD");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return on;
+}
+
 void ggml_cuda_flash_attn_ext_compact_mask(
         const ggml_tensor * mask, int32_t * indices, int32_t * counts, int32_t n_queries, int32_t ncols1, int32_t n_kv_max, cudaStream_t stream);
 
@@ -1697,7 +1746,8 @@ void launch_fattn(
     const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const bool use_sparse,
     const int warp_size = WARP_SIZE,
     float * partial_dst = nullptr, float2 * partial_meta = nullptr,
-    const int parallel_blocks_override = 0, const bool async_kv_preload = false, const int sj_fill_kv_splits = 0
+    const int parallel_blocks_override = 0, const bool async_kv_preload = false, const int sj_fill_kv_splits = 0,
+    const bool skip_dead_tiles = false
 ) {
     if constexpr (compact_q5g6) {
         GGML_ASSERT(stream_k && !use_sparse && dst->src[0]->ne[1] == 5 && dst->src[0]->ne[3] == 1);
@@ -1746,6 +1796,7 @@ void launch_fattn(
     ggml_cuda_pool_alloc<half>   V_f16(pool);
 
     ggml_cuda_pool_alloc<int>    KV_max(pool);
+    ggml_cuda_pool_alloc<uint32_t> live_bits(pool); // before dst_tmp: the pool frees in reverse order
     ggml_cuda_pool_alloc<float>  dst_tmp(pool);
     ggml_cuda_pool_alloc<float2> dst_tmp_meta(pool);
 
@@ -1879,6 +1930,21 @@ void launch_fattn(
         ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_KV_max, block_dim_KV_max, 0, main_stream);
         ggml_cuda_kernel_launch(flash_attn_mask_to_KV_max<ncols1>, launch_params,
             (const half2 *) mask->data, KV_max.ptr, iter_k, s31, s33);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    // [ROUNDFIX] dead-tile bits for the compressed-KV MMA kernel (passed in the SJ-KVaRN descriptor slot).
+    if (skip_dead_tiles && mask && !use_sparse && !is_sj_kvarn && stream_k && !need_f16_K && !need_f16_V &&
+            K->type != GGML_TYPE_F16 && warp_size == 32) {
+        const int n_kv_tiles = (int) ((K->ne[1] + nbatch_fa - 1) / nbatch_fa);
+        const int n_words    = (n_kv_tiles + 31) / 32;
+        live_bits.alloc(size_t(n_words) * ntiles_x * mask->ne[3]);
+        const dim3 grid_bits(n_words, ntiles_x, mask->ne[3]);
+        ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(grid_bits, dim3(32*WARP_SIZE, 1, 1), 0, main_stream);
+        ggml_cuda_kernel_launch(flash_attn_mask_to_live_tiles, lp,
+            (const half *) mask->data, live_bits.ptr, (int) K->ne[1], nbatch_fa, n_words,
+            query_layout::mask_rows, query_layout::token_step, (int) Q->ne[1],
+            (int64_t) (mask->nb[1] / sizeof(half)), (int64_t) (mask->nb[3] / sizeof(half)));
         CUDA_CHECK(cudaGetLastError());
     }
 
@@ -2040,7 +2106,7 @@ void launch_fattn(
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
         mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
         is_sj_kvarn ? ggml_cuda_qsa_resident_body(KQV->src[5]) : nullptr,
-        is_sj_kvarn ? (const int32_t *) KQV->src[6]->data : nullptr
+        is_sj_kvarn ? (const int32_t *) KQV->src[6]->data : (const int32_t *) live_bits.ptr
     );
     CUDA_CHECK(cudaGetLastError());
 

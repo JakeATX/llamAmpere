@@ -112,7 +112,8 @@ static void ggml_cuda_flash_attn_ext_mma_turbo_case_impl(ggml_backend_cuda_conte
     // the kernel receives raw quantized KV + the true byte pitch. stream_k = true.
     launch_fattn<DV, ncols1, ncols2, compact_q5g6>
         (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa,
-         /*need_f16_K=*/false, /*need_f16_V=*/false, /*stream_k=*/true, /*use_sparse=*/false, warp_size_host);
+         /*need_f16_K=*/false, /*need_f16_V=*/false, /*stream_k=*/true, /*use_sparse=*/false, warp_size_host,
+         nullptr, nullptr, 0, false, 0, /*skip_dead_tiles=*/!early_v && ggml_cuda_fattn_skip_dead_enabled());
 }
 
 
