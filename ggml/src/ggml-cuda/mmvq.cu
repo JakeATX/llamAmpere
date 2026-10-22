@@ -1961,16 +1961,37 @@ static void mul_mat_vec_q_moe_launch(
 // member count with no stores between them, so the compiler loads and decodes each weight chunk once.
 // Per (token, row) the lane's k blocks, their order, the dot function and the shuffle reduction are those of
 // mul_mat_vec_q_moe, so every output is bitwise the same (check mode GGML_MOE_MMV_D1=check proves it in place).
-template <ggml_type type, int c_rows, int cols>
+// c_smem: the IQ2/IQ3 codebook is read from the block's shared-memory copy (same values and the same _impl dot
+// function the global-table path calls, so the result does not change).
+template <ggml_type type, int c_rows, int cols, bool c_smem>
+static __device__ __forceinline__ float moe_d1_dot(const uint32_t * grid_s, const void * vbq, const block_q8_1 * bq8,
+        const int kbx, const int iqs) {
+    if constexpr (c_smem && type == GGML_TYPE_IQ3_XXS) {
+        return vec_dot_iq3_xxs_q8_1_impl(grid_s, vbq, bq8, kbx, iqs);
+    } else if constexpr (c_smem && type == GGML_TYPE_IQ3_S) {
+        return vec_dot_iq3_s_q8_1_impl(grid_s, vbq, bq8, kbx, iqs);
+    } else if constexpr (c_smem && type == GGML_TYPE_IQ2_XXS) {
+        return vec_dot_iq2_xxs_q8_1_impl((const uint2 *) grid_s, vbq, bq8, kbx, iqs);
+    } else if constexpr (c_smem && type == GGML_TYPE_IQ2_XS) {
+        return vec_dot_iq2_xs_q8_1_impl((const uint2 *) grid_s, vbq, bq8, kbx, iqs);
+    } else if constexpr (c_smem && type == GGML_TYPE_IQ2_S) {
+        return vec_dot_iq2_s_q8_1_impl((const uint2 *) grid_s, vbq, bq8, kbx, iqs);
+    } else {
+        GGML_UNUSED(grid_s);
+        constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+        return vec_dot_q_cuda(vbq, bq8, kbx, iqs);
+    }
+}
+
+template <ggml_type type, int c_rows, int cols, bool c_smem>
 static __device__ __forceinline__ void moe_d1_rows(
         const void * vx, const block_q8_1 * const (&y)[4], float * const (&out)[4],
-        const int row0, const int nrows_x, const int blocks_per_row_x, const int stride_row_x) {
+        const int row0, const int nrows_x, const int blocks_per_row_x, const int stride_row_x, const uint32_t * grid_s) {
     constexpr int qk  = ggml_cuda_type_traits<type>::qk;
     constexpr int qi  = ggml_cuda_type_traits<type>::qi;
     constexpr int vdr = get_vdr_mmvq(type);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int blocks_per_iter = vdr * warp_size / qi;
-    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
 
     const int kbx_offset = row0*stride_row_x;
     float tmp[cols][c_rows];
@@ -1989,7 +2010,8 @@ static __device__ __forceinline__ void moe_d1_rows(
             if (row0 + i < nrows_x) {
 #pragma unroll
                 for (int c = 0; c < cols; ++c) {
-                    tmp[c][i] += vec_dot_q_cuda(vx, &y[c][kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                    tmp[c][i] += moe_d1_dot<type, c_rows, cols, c_smem>(grid_s, vx, &y[c][kby],
+                            kbx_offset + i*stride_row_x + kbx, kqs);
                 }
             }
         }
@@ -2017,7 +2039,7 @@ static __device__ __forceinline__ void moe_d1_rows(
 // first route works, so no shared memory and no block barrier are needed. Members run in token order, c_group at a
 // time. The register budget is set by the widest member count compiled in, so c_group 2 (most experts have one or
 // two routes at width 5) keeps the whole kernel inside the 80-register cap without the spills c_group 4 shows.
-template <ggml_type type, int c_warps, int c_rows, int c_group, bool route_filter>
+template <ggml_type type, int c_warps, int c_rows, int c_group, bool c_smem, bool route_filter>
 __launch_bounds__(c_warps*32, 768/(c_warps*32))
 static __global__ void mul_mat_vec_q_moe_d1(
         const void * const * table, const block_q8_1 * vy, const int32_t * ids, float * dst,
@@ -2044,6 +2066,20 @@ static __global__ void mul_mat_vec_q_moe_d1(
         if ((route_hot[me] != 0) != (route_want_hot != 0)) {
             return;
         }
+    }
+    // every early return above is the same for the whole block (all warps read the same route list)
+    constexpr bool use_smem = c_smem && ggml_cuda_mmvq_smem_grid_type(type);
+    constexpr int  smem_n   = type == GGML_TYPE_IQ3_XXS ? 256 : type == GGML_TYPE_IQ3_S ? 512 :
+                              type == GGML_TYPE_IQ2_XXS ? 512 : type == GGML_TYPE_IQ2_XS ? 1024 : 2048;
+    [[maybe_unused]] __shared__ uint32_t grid_s[use_smem ? smem_n : 1];
+    if constexpr (use_smem) {
+        const uint32_t * grid_g = type == GGML_TYPE_IQ3_XXS ? iq3xxs_grid : type == GGML_TYPE_IQ3_S ? iq3s_grid :
+                                  type == GGML_TYPE_IQ2_XXS ? (const uint32_t *) iq2xxs_grid :
+                                  type == GGML_TYPE_IQ2_XS  ? (const uint32_t *) iq2xs_grid : (const uint32_t *) iq2s_grid;
+        for (int i = threadIdx.y*32 + threadIdx.x; i < smem_n; i += c_warps*32) {
+            grid_s[i] = grid_g[i];
+        }
+        __syncthreads();
     }
     const int row0 = (blockIdx.x*c_warps + threadIdx.y)*c_rows;
     if (row0 >= nrows_x) {
@@ -2072,19 +2108,19 @@ static __global__ void mul_mat_vec_q_moe_d1(
             }
         }
         if (c_group >= 4 && n == 4) {
-            moe_d1_rows<type, c_rows, c_group >= 4 ? 4 : 1>(vx, y, out, row0, nrows_x, blocks_per_row_x, stride_row_x);
+            moe_d1_rows<type, c_rows, c_group >= 4 ? 4 : 1, use_smem>(vx, y, out, row0, nrows_x, blocks_per_row_x, stride_row_x, grid_s);
         } else if (c_group >= 3 && n == 3) {
-            moe_d1_rows<type, c_rows, c_group >= 3 ? 3 : 1>(vx, y, out, row0, nrows_x, blocks_per_row_x, stride_row_x);
+            moe_d1_rows<type, c_rows, c_group >= 3 ? 3 : 1, use_smem>(vx, y, out, row0, nrows_x, blocks_per_row_x, stride_row_x, grid_s);
         } else if (c_group >= 2 && n == 2) {
-            moe_d1_rows<type, c_rows, c_group >= 2 ? 2 : 1>(vx, y, out, row0, nrows_x, blocks_per_row_x, stride_row_x);
+            moe_d1_rows<type, c_rows, c_group >= 2 ? 2 : 1, use_smem>(vx, y, out, row0, nrows_x, blocks_per_row_x, stride_row_x, grid_s);
         } else {
-            moe_d1_rows<type, c_rows, 1>(vx, y, out, row0, nrows_x, blocks_per_row_x, stride_row_x);
+            moe_d1_rows<type, c_rows, 1, use_smem>(vx, y, out, row0, nrows_x, blocks_per_row_x, stride_row_x, grid_s);
         }
     }
     ggml_cuda_pdl_lc();
 }
 
-template <ggml_type type, int c_warps, int c_rows, int c_group>
+template <ggml_type type, int c_warps, int c_rows, int c_group, bool c_smem = false>
 static void moe_d1_launch(const void * const * table, const char * act_q8, const int32_t * ids, float * dst,
         int64_t n_in, int64_t n_out, int64_t n_ids, int64_t n_tokens, int64_t channels, int64_t ids_stride,
         const uint8_t * route_hot, int route_want_hot, cudaStream_t stream) {
@@ -2094,11 +2130,11 @@ static void moe_d1_launch(const void * const * table, const char * act_q8, const
     const ggml_cuda_kernel_launch_params params(dim3((n_out + rows_per_block - 1)/rows_per_block, n_ids*n_tokens),
             dim3(32, c_warps), 0, stream);
     if (route_hot) {
-        ggml_cuda_kernel_launch(mul_mat_vec_q_moe_d1<type, c_warps, c_rows, c_group, true>, params, table, (const block_q8_1 *) act_q8,
+        ggml_cuda_kernel_launch(mul_mat_vec_q_moe_d1<type, c_warps, c_rows, c_group, c_smem, true>, params, table, (const block_q8_1 *) act_q8,
                 ids, dst, (int) n_in, (int) n_out, stride_row_x, (int) channels, (int) channels*s11, s11,
                 (int) (n_ids*n_out), (int) n_out, (int) n_ids, (int) n_tokens, (int) ids_stride, route_hot, route_want_hot);
     } else {
-        ggml_cuda_kernel_launch(mul_mat_vec_q_moe_d1<type, c_warps, c_rows, c_group, false>, params, table, (const block_q8_1 *) act_q8,
+        ggml_cuda_kernel_launch(mul_mat_vec_q_moe_d1<type, c_warps, c_rows, c_group, c_smem, false>, params, table, (const block_q8_1 *) act_q8,
                 ids, dst, (int) n_in, (int) n_out, stride_row_x, (int) channels, (int) channels*s11, s11,
                 (int) (n_ids*n_out), (int) n_out, (int) n_ids, (int) n_tokens, (int) ids_stride, route_hot, route_want_hot);
     }
@@ -3494,7 +3530,8 @@ bool ggml_cuda_moe_table_mmv_grouped_try(ggml_backend_cuda_context & ctx,
 
 // [VBEAT D1] decode-once expert kernel; see mul_mat_vec_q_moe_d1. GGML_MOE_MMV_D1: 0 off, 1 on, check = run the
 // plain kernel too and trap on any bit difference. GGML_MOE_MMV_D1_SHAPE: warps x rows per warp (4x2, 8x2, 8x1, 4x4),
-// with a gN suffix for at most N routes per weight pass (4x2g2, 8x2g2, 8x1g2, 4x2g1; no suffix = 4).
+// with a gN suffix for at most N routes per weight pass (4x2g2, 8x2g2, 8x1g2, 4x2g1; no suffix = 4) and an s suffix
+// for the shared-memory IQ2/IQ3 codebook (4x2s, 4x2g2s, 8x2g2s; other types ignore it).
 // GGML_MOE_MMV_D1_MIN_TOKENS: narrowest batch that uses it (default 1).
 static int moe_d1_mode() {
     static const int mode = [] {
@@ -3515,8 +3552,9 @@ bool ggml_cuda_moe_table_mmv_d1_try(ggml_backend_cuda_context & ctx,
     const int mode = moe_d1_mode();
     static const int shape = [] {
         const char * e = getenv("GGML_MOE_MMV_D1_SHAPE");
-        static const char * const names[] = { "4x2", "8x2", "8x1", "4x4", "4x2g2", "8x2g2", "8x1g2", "4x2g1" };
-        for (int i = 0; e && i < 8; ++i) {
+        static const char * const names[] = { "4x2", "8x2", "8x1", "4x4", "4x2g2", "8x2g2", "8x1g2", "4x2g1",
+                                              "4x2s", "4x2g2s", "8x2g2s" };
+        for (int i = 0; e && i < 11; ++i) {
             if (strcmp(e, names[i]) == 0) {
                 return i;
             }
@@ -3558,6 +3596,9 @@ bool ggml_cuda_moe_table_mmv_d1_try(ggml_backend_cuda_context & ctx,
             case 5:  moe_d1_launch<T, 8, 2, 2>(MOE_D1_ARGS); break; \
             case 6:  moe_d1_launch<T, 8, 1, 2>(MOE_D1_ARGS); break; \
             case 7:  moe_d1_launch<T, 4, 2, 1>(MOE_D1_ARGS); break; \
+            case 8:  moe_d1_launch<T, 4, 2, 4, ggml_cuda_mmvq_smem_grid_type(T)>(MOE_D1_ARGS); break; \
+            case 9:  moe_d1_launch<T, 4, 2, 2, ggml_cuda_mmvq_smem_grid_type(T)>(MOE_D1_ARGS); break; \
+            case 10: moe_d1_launch<T, 8, 2, 2, ggml_cuda_mmvq_smem_grid_type(T)>(MOE_D1_ARGS); break; \
             default: moe_d1_launch<T, 4, 2, 4>(MOE_D1_ARGS); break; \
         } \
         break
