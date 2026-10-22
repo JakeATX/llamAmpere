@@ -23,6 +23,7 @@ struct moe_cs_job {
     int32_t expert[MOE_CS_MAX_EXPERTS];
     int32_t first[MOE_CS_MAX_EXPERTS + 1];   // routes of expert i are [first[i], first[i+1]) in x / out row order
     alignas(128) volatile unsigned long long gpu_timeouts;
+    alignas(128) volatile unsigned long long busy_ns;   // host time of the last card job, written before `done`
 };
 
 // One projection bank of one layer, as the host reads it.

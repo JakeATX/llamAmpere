@@ -381,8 +381,10 @@ void leader_main(pool_state * sp, int cpu) {
             s.st_null.fetch_add(1, std::memory_order_relaxed);
         }
         s.st_jobs.fetch_add(1, std::memory_order_relaxed);
-        s.st_busy_ns.fetch_add((unsigned long long) std::chrono::duration_cast<std::chrono::nanoseconds>(clk::now() - t0).count(),
-                std::memory_order_relaxed);
+        const unsigned long long busy =
+            (unsigned long long) std::chrono::duration_cast<std::chrono::nanoseconds>(clk::now() - t0).count();
+        s.st_busy_ns.fetch_add(busy, std::memory_order_relaxed);
+        if (card) { s.job->busy_ns = busy; }   // the card's join reads it to correct the planner's cost (ADAPT)
         std::atomic_thread_fence(std::memory_order_seq_cst);
         if (card) {
             last_seq = seq;
