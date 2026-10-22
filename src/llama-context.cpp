@@ -6388,6 +6388,7 @@ ggml_cgraph * llama_context::graph_reserve(
 
     auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
     gparams.is_reserve = true;
+    gparams.mtp_tok_row = false; // [RTPORT] a reserve inside a pipelined step sizes the ordinary graph
     if (qwen_chain && n_outputs == 0) {
         gparams.cparams.mtp_chain = false;
     }

@@ -646,10 +646,20 @@ static void run_mtp_pipe() {
         llama_seq_id * seq_id = &seq;
         int8_t output = 1;
         llama_batch batch = { 1, &token, hidden.data(), &pos, &n_seq_id, &seq_id, &output };
+        int where_round = 0, where_step = 0;
         auto compare = [&](const char * what) {
             const float * expected = llama_get_logits_ith(reference.dft, 0);
             const float * actual = llama_get_logits_ith(pipe.dft, 0);
-            require(expected && actual && std::memcmp(expected, actual, n_vocab * sizeof(float)) == 0, what);
+            require(expected && actual, what);
+            if (std::memcmp(expected, actual, n_vocab * sizeof(float)) != 0) {
+                float worst = 0.0f;
+                for (int v = 0; v < n_vocab; ++v) {
+                    worst = std::max(worst, std::fabs(expected[v] - actual[v]));
+                }
+                fprintf(stderr, "pipe mismatch round %d step %d: max |diff| %g (expected[0] %g actual[0] %g)\n",
+                        where_round, where_step, worst, expected[0], actual[0]);
+                require(false, what);
+            }
         };
         llama_pos pos0 = 0;
         for (int round = 0; round < 3; ++round) {
@@ -659,7 +669,11 @@ static void run_mtp_pipe() {
             batch.embd = hidden.data();
             require(llama_decode(reference.dft, batch) == 0, "reference step 0");
             require(llama_mtp_pipe_decode(pipe.dft, batch, false, false) == 0, "pipe step 0");
+            where_round = round;
+            where_step = -1;
+            compare("pipe step 0 logits are bit-identical (nothing queued behind it)");
             for (int step = 1; step < 4; ++step) {
+                where_step = step - 1;
                 // queue step `step` before its token exists; read step - 1 while it waits
                 pos = pos0 + step;
                 token = 0;
@@ -683,6 +697,15 @@ static void run_mtp_pipe() {
             batch.embd = poison.data();
             require(llama_mtp_pipe_decode(pipe.dft, batch, true, true) == 0, "pipe queues a step it will release");
             llama_mtp_pipe_cancel(pipe.dft);
+            // a released step still runs (token 0, previous hidden row) and writes its K/V row; the reference writes
+            // the same row so both roll back the same cells
+            {
+                const float * next = llama_get_embeddings_nextn_ith(reference.dft, 0);
+                std::copy(next, next + width, hidden.begin());
+                batch.embd = hidden.data();
+                require(llama_decode(reference.dft, batch) == 0, "reference released step");
+                compare("released step logits are bit-identical");
+            }
             const llama_pos keep = pos0 + 2 + round; // accepted prefix differs per round
             require(llama_memory_seq_rm(llama_get_memory(reference.dft), 0, keep, -1), "reference rollback");
             require(llama_memory_seq_rm(llama_get_memory(pipe.dft), 0, keep, -1), "pipe rollback");
