@@ -184,6 +184,9 @@ struct common_speculative_impl {
 
     virtual bool process(const llama_batch & batch) = 0;
 
+    // whether process() reads the embedding rows of an embedding batch (otherwise only whether it is one)
+    virtual bool needs_embd_rows() const { return false; }
+
     virtual void draft(common_speculative_draft_params_vec & dparams) = 0;
 
     virtual void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) = 0;
@@ -4217,10 +4220,12 @@ struct spec_batch_view {
     std::vector<llama_seq_id *> seq_id;
     std::vector<int8_t>         logits;
 
-    llama_batch render(const common_batch & cb) {
+    // copy_embd: copy the embedding rows; without it, embd of an embedding batch only marks it as one (it is not row data)
+    llama_batch render(const common_batch & cb, bool copy_embd) {
         const int32_t n = cb.size();
         const bool has_tok  = cb.has_token();
         const bool has_embd = cb.has_embd();
+        const bool copy     = has_embd && copy_embd;
 
         token.resize(has_tok ? n : 0);
         pos.resize(n);
@@ -4232,12 +4237,12 @@ struct spec_batch_view {
         size_t n_embd = 0;
         for (int32_t i = 0; i < n; ++i) {
             n_seq_total += 1 + cb.tokens[i].seq_ids_extra.size();
-            if (has_embd) {
+            if (copy) {
                 n_embd = std::max(n_embd, cb.tokens[i].embd.n_embd);
             }
         }
         seq_flat.resize(n_seq_total);
-        embd.resize(has_embd ? (size_t) n * n_embd : 0);
+        embd.resize(copy ? (size_t) n * n_embd : (has_embd ? 1 : 0));
 
         size_t o = 0;
         for (int32_t i = 0; i < n; ++i) {
@@ -4245,7 +4250,7 @@ struct spec_batch_view {
             if (has_tok) {
                 token[i] = t.id;
             }
-            if (has_embd && t.embd.data != nullptr) {
+            if (copy && t.embd.data != nullptr) {
                 std::memcpy(embd.data() + (size_t) i * n_embd, t.embd.data, t.embd.n_embd * sizeof(float));
             }
             pos[i]      = t.pos[0];
@@ -4279,7 +4284,11 @@ bool common_speculative_process(common_speculative * spec, const common_batch & 
     }
 
     static thread_local spec_batch_view view;
-    const llama_batch b = view.render(batch);
+    bool copy_embd = false;
+    for (const auto & impl : spec->impls) {
+        copy_embd = copy_embd || impl->needs_embd_rows();
+    }
+    const llama_batch b = view.render(batch, copy_embd);
 
     for (auto & impl : spec->impls) {
         result = result && impl->process(b);
