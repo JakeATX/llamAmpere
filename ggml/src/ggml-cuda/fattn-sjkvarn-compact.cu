@@ -284,8 +284,9 @@ bool ggml_cuda_flash_attn_ext_sj_kvarn_compact(ggml_backend_cuda_context & ctx, 
     return false;
 #else
     static const int mode = [] {
+        // Default on (VATTN2 READY 2026-10-22: KL inside same-setup yardsticks, +15% writing); 0 = off, 2 = in-op check.
         const char * value = getenv("GGML_SJKVARN_COMPACT");
-        return value && strcmp(value, "1") == 0 ? 1 : value && strcmp(value, "2") == 0 ? 2 : 0;
+        return !value || !*value ? 1 : strcmp(value, "1") == 0 ? 1 : strcmp(value, "2") == 0 ? 2 : 0;
     }();
     if (mode == 0) {
         return false;
