@@ -13,6 +13,7 @@
 #include "ggml.h"
 #include "ggml-cpu.h"
 #define GGML_COMMON_DECL_CPP
+#define GGML_COMMON_IMPL_CPP   // the IQ grids, for the AVX-512 dot loops below
 #include "../ggml-common.h"
 
 #include <algorithm>
@@ -187,6 +188,89 @@ void dot_q2_0_rows(int n, int nrows, const char * w, size_t row_bytes, const blo
 #endif
 }
 
+// AVX-512 dot loops for the IQ up/gate types (GGML_MOE_CPU_SPLIT_AVX512=1, default off; used only when the CPU has
+// AVX-512 F/BW/VNNI, checked at pool start). Same block formats and integer sums as ggml-cpu's AVX2 loops: the grid
+// lookups become one gather per 64 weights, the signs one masked subtract (the 64 sign bits are a byte mask), and
+// the products one VNNI multiply-add. Float sums group differently (valid math). Compiled with function targets, so
+// the AVX2 build carries them and never calls them on a CPU without AVX-512.
+#if defined(__x86_64__) && defined(__GNUC__)
+#define MOE_CS_AVX512 1
+#define MOE_CS_T512 __attribute__((target("avx512f,avx512bw,avx512vl,avx512vnni,f16c,bmi2")))
+
+MOE_CS_T512 void dot_iq3_s_q8_K_512(int n, float * s, size_t, const void * vx, size_t, const void * vy, size_t, int) {
+    const block_iq3_s * x = (const block_iq3_s *) vx;
+    const block_q8_K * y = (const block_q8_K *) vy;
+    const int nb = n / QK_K;
+    const __m512i lane = _mm512_set_epi32(15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0);
+    const __m512i one = _mm512_set1_epi32(1);
+    __m512 accf = _mm512_setzero_ps();
+    for (int i = 0; i < nb; ++i) {
+        const float d = _cvtsh_ss(x[i].d) * y[i].d;
+        __m512i sumi = _mm512_setzero_si512();
+        for (int ib = 0; ib < QK_K / 64; ++ib) {   // 64 weights: qs 16 indices, qh 2 bytes, signs 8 bytes
+            const int ib32 = 2 * ib;
+            const uint32_t qh = (uint32_t) x[i].qh[ib32] | ((uint32_t) x[i].qh[ib32 + 1] << 8);
+            const __m512i hi = _mm512_slli_epi32(_mm512_and_si512(_mm512_srlv_epi32(_mm512_set1_epi32((int) qh), lane), one), 8);
+            const __m512i idx = _mm512_or_si512(_mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i *) (x[i].qs + 16 * ib))), hi);
+            const __m512i g = _mm512_i32gather_epi32(idx, (const void *) iq3s_grid, 4);
+            uint64_t sg;
+            memcpy(&sg, x[i].signs + 8 * ib, 8);
+            const __m512i q8 = _mm512_loadu_si512((const void *) (y[i].qs + 64 * ib));
+            const __m512i q8s = _mm512_mask_sub_epi8(q8, (__mmask64) sg, _mm512_setzero_si512(), q8);
+            const __m512i dp = _mm512_dpbusd_epi32(_mm512_setzero_si512(), g, q8s);
+            const int ls1 = 2 * (x[i].scales[ib] & 0xf) + 1, ls2 = 2 * (x[i].scales[ib] >> 4) + 1;
+            const __m512i sc = _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_set1_epi32(ls1)), _mm256_set1_epi32(ls2), 1);
+            sumi = _mm512_add_epi32(sumi, _mm512_mullo_epi32(dp, sc));
+        }
+        accf = _mm512_fmadd_ps(_mm512_set1_ps(d), _mm512_cvtepi32_ps(sumi), accf);
+    }
+    *s = _mm512_reduce_add_ps(accf);
+}
+
+// iq2_xxs: per 32 weights two 32-bit words; the first holds four 8-weight grid indices, the second four 7-bit sign
+// fields (the eighth sign makes the count of minus signs even) and a 4-bit scale.
+MOE_CS_T512 inline uint32_t iq2_signs4(uint32_t w) {
+    const uint32_t b = _pdep_u32(w, 0x7f7f7f7fu);
+    uint32_t p = b ^ (b >> 4);
+    p ^= p >> 2;
+    p ^= p >> 1;
+    return b | ((p & 0x01010101u) << 7);
+}
+
+MOE_CS_T512 void dot_iq2_xxs_q8_K_512(int n, float * s, size_t, const void * vx, size_t, const void * vy, size_t, int) {
+    const block_iq2_xxs * x = (const block_iq2_xxs *) vx;
+    const block_q8_K * y = (const block_q8_K *) vy;
+    const int nb = n / QK_K;
+    __m512 accf = _mm512_setzero_ps();
+    for (int i = 0; i < nb; ++i) {
+        const float d = _cvtsh_ss(x[i].d) * y[i].d;
+        __m512i sumi = _mm512_setzero_si512();
+        for (int ib = 0; ib < QK_K / 64; ++ib) {
+            uint32_t a[4];
+            memcpy(a, x[i].qs + 8 * ib, 16);
+            const uint64_t ix = (uint64_t) a[0] | ((uint64_t) a[2] << 32);
+            const __m512i idx = _mm512_cvtepu8_epi64(_mm_cvtsi64_si128((long long) ix));
+            const __m512i g = _mm512_i64gather_epi64(idx, (const void *) iq2xxs_grid, 8);
+            const uint64_t sg = (uint64_t) iq2_signs4(a[1]) | ((uint64_t) iq2_signs4(a[3]) << 32);
+            const __m512i q8 = _mm512_loadu_si512((const void *) (y[i].qs + 64 * ib));
+            const __m512i q8s = _mm512_mask_sub_epi8(q8, (__mmask64) sg, _mm512_setzero_si512(), q8);
+            const __m512i dp = _mm512_dpbusd_epi32(_mm512_setzero_si512(), g, q8s);
+            const int ls1 = 2 * (int) (a[1] >> 28) + 1, ls2 = 2 * (int) (a[3] >> 28) + 1;
+            const __m512i sc = _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_set1_epi32(ls1)), _mm256_set1_epi32(ls2), 1);
+            sumi = _mm512_add_epi32(sumi, _mm512_mullo_epi32(dp, sc));
+        }
+        accf = _mm512_fmadd_ps(_mm512_set1_ps(d), _mm512_cvtepi32_ps(sumi), accf);
+    }
+    *s = 0.125f * _mm512_reduce_add_ps(accf);
+}
+
+bool cpu_has_avx512_vnni() {
+    __builtin_cpu_init();
+    return __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") &&
+           __builtin_cpu_supports("avx512vl") && __builtin_cpu_supports("avx512vnni");
+}
+#endif
+
 struct role_math {
     moe_cs_role r;
     ggml_vec_dot_t dot = nullptr;
@@ -227,6 +311,7 @@ struct pool_state {
     std::vector<float> hidden;  // [MOE_CS_MAX_ROUTES][max_ff]
     std::vector<uint8_t> hq;    // [MOE_CS_MAX_ROUTES] quantized hidden rows
     size_t hq_stride = 0;
+    bool avx512 = false;       // GGML_MOE_CPU_SPLIT_AVX512 and the CPU has AVX-512 F/BW/VL/VNNI
     bool q2_fast = false;      // GGML_MOE_CPU_SPLIT_Q2_FAST: reordered hidden rows + dot_q2_0_rows for Q2_0 down
     size_t aux_stride = 0;     // floats per route in hq_aux: n/32 block scales, then n/64 offsets
     std::vector<float> hq_aux;
@@ -529,6 +614,9 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
     s.hidden.assign((size_t) MOE_CS_MAX_ROUTES * max_ff, 0.0f);
     s.hq.assign(MOE_CS_MAX_ROUTES * s.hq_stride, 0);
     s.q2_fast = env_int("GGML_MOE_CPU_SPLIT_Q2_FAST", 0, 0, 1) != 0;
+#if defined(MOE_CS_AVX512)
+    s.avx512 = env_int("GGML_MOE_CPU_SPLIT_AVX512", 0, 0, 1) != 0 && cpu_has_avx512_vnni();
+#endif
     s.aux_stride = (size_t) max_ff / QK8_0 + (size_t) max_ff / QK2_0 + 16;
     s.hq_aux.assign(MOE_CS_MAX_ROUTES * s.aux_stride, 0.0f);
     s.rows_ug = env_int("GGML_MOE_CPU_SPLIT_ROWS_UG", 16, 1, 4096);
@@ -613,9 +701,9 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
     for (auto & t : s.workers) { t.detach(); }
     std::string where;
     for (int i = 0; pin && i < s.threads; ++i) { where += (i ? "," : "") + std::to_string(cpu_of(i)); }
-    fprintf(stderr, "[moe-cpu-split] pool: %d threads, %s%s (skipped cores at cpus %s), spin %d us, nap %d us, rows up/gate %d down %d%s%s\n",
+    fprintf(stderr, "[moe-cpu-split] pool: %d threads, %s%s (skipped cores at cpus %s), spin %d us, nap %d us, rows up/gate %d down %d%s%s%s\n",
             s.threads, pin ? "pinned to cpus " : "unpinned", where.c_str(), skipped.c_str(), s.spin_us, s.nap_us, s.rows_ug, s.rows_down,
-            s.q2_fast ? ", Q2_0 down fast path" : "", smt ? ", SMT siblings" : "");
+            s.q2_fast ? ", Q2_0 down fast path" : "", smt ? ", SMT siblings" : "", s.avx512 ? ", AVX-512 VNNI IQ dots" : "");
     return true;
 }
 
@@ -642,6 +730,10 @@ bool moe_cs_register_layer(int layer, const moe_cs_role roles[3]) {
         if (!ok) { break; }
         m.q2 = t == GGML_TYPE_Q2_0;
         m.dot = tr->vec_dot;
+#if defined(MOE_CS_AVX512)
+        if (s.avx512 && t == GGML_TYPE_IQ3_S) { m.dot = dot_iq3_s_q8_K_512; }
+        if (s.avx512 && t == GGML_TYPE_IQ2_XXS) { m.dot = dot_iq2_xxs_q8_K_512; }
+#endif
         m.vec_type = tr->vec_dot_type;
         const auto * vt = ggml_get_type_traits_cpu(m.vec_type);
         m.quant = vt ? vt->from_float : nullptr;
