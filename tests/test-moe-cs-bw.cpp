@@ -197,5 +197,5 @@ int main(int argc, char ** argv) {
     }
     printf(")\n");
     fflush(stdout);
-    _exit(0);   // pool threads never exit
+    std::_Exit(0);   // pool threads never exit
 }
