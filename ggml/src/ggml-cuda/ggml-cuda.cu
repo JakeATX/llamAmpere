@@ -5397,6 +5397,31 @@ static int32_t ggml_cuda_gdn_state_read_uses(const ggml_cgraph * cgraph, const g
     return cgraph->use_counts[pos];
 }
 
+// [VG87] GGML_CUDA_GDN_STATE_READ_EMPTY=1 (default off): build_rs gathers the ubatch states and the extra states
+// with one GET_ROWS; for a one-sequence ubatch the extra-state view and its copy have zero rows, so they read none
+// of the gather's bytes, but they count as a second reader and the plan above refused every Qwen3.5-family gdn.
+// With the switch, readers that are empty tensors do not count, and empty nodes between the gather and the gdn
+// (they write zero bytes) do not fail the overlap check.
+static bool ggml_cuda_gdn_state_read_empty_ok() {
+    static const bool on = [] { const char * e = getenv("GGML_CUDA_GDN_STATE_READ_EMPTY"); return e != nullptr && atoi(e) != 0; }();
+    return on;
+}
+
+// number of readers of G that are not empty tensors (an empty reader reads no byte of G)
+static int32_t ggml_cuda_gdn_state_read_nonempty_uses(const ggml_cgraph * cgraph, const ggml_tensor * G) {
+    int32_t n = 0;
+    for (int k = 0; k < cgraph->n_nodes; ++k) {
+        const ggml_tensor * t = cgraph->nodes[k];
+        for (int si = 0; si < GGML_MAX_SRC; ++si) {
+            if (t->src[si] == G && !ggml_is_empty(t)) {
+                n++;
+                break;
+            }
+        }
+    }
+    return n;
+}
+
 // structural match (no data pointers: also runs in graph_optimize before allocation): the GET_ROWS whose
 // output reaches gdn->src[5] and nothing else, or nullptr
 static const ggml_tensor * ggml_cuda_gdn_state_read_source(const ggml_cgraph * cgraph, const ggml_tensor * gdn) {
@@ -5431,9 +5456,12 @@ static const ggml_tensor * ggml_cuda_gdn_state_read_source(const ggml_cgraph * c
     if (s != G && s->view_src != G) {
         return nullptr;
     }
+    const int32_t G_uses = ggml_cuda_gdn_state_read_uses(cgraph, G);
+    const bool G_one_reader = G_uses == 1 ||
+        (G_uses > 1 && ggml_cuda_gdn_state_read_empty_ok() && ggml_cuda_gdn_state_read_nonempty_uses(cgraph, G) == 1);
     if (G->op != GGML_OP_GET_ROWS || G->type != GGML_TYPE_F32 || G->view_src != nullptr ||
         (G->flags & GGML_TENSOR_FLAG_OUTPUT) || (G->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
-        ggml_cuda_gdn_state_read_uses(cgraph, G) != 1 || !ggml_is_contiguous(G) ||
+        !G_one_reader || !ggml_is_contiguous(G) ||
         G->ne[0] != D || G->ne[1] != n_seqs || G->ne[2] != 1 || G->ne[3] != 1) {
         return nullptr;
     }
@@ -5544,7 +5572,8 @@ static void ggml_cuda_gdn_state_read_plan(ggml_backend_cuda_context * cuda_ctx, 
             // [GDNGETTER] an empty node (the zero-row tail gather / extra-state copy of a one-sequence ubatch)
             // writes nothing; opt-in GGML_CUDA_GDN_STATE_READ_SKIP_EMPTY=1 (default off) lets the check pass over it
             static const bool skip_empty = [] { const char * e = getenv("GGML_CUDA_GDN_STATE_READ_SKIP_EMPTY"); return e != nullptr && atoi(e) != 0; }();
-            if (ggml_cuda_is_view_or_noop(n) || (n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || (skip_empty && ggml_is_empty(n))) {
+            if (ggml_cuda_is_view_or_noop(n) || (n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+                ((skip_empty || ggml_cuda_gdn_state_read_empty_ok()) && ggml_is_empty(n))) {
                 continue;
             }
             ok = n->data != nullptr && !ggml_cuda_gdn_state_read_overlap(n, cache) &&
