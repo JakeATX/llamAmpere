@@ -190,7 +190,7 @@ static void common_sampler_topk_exact_impl(
 #if COMMON_TOPK_AVX2
     static const bool avx2 = [] {
         const char * enabled = std::getenv("LLAMA_BOOKKEEP_TOPK_AVX2");
-        return enabled && std::atoi(enabled) != 0 && __builtin_cpu_supports("avx2");
+        return (!enabled || std::atoi(enabled) != 0) && __builtin_cpu_supports("avx2");  // default on (owner 2026-10-22); 0 turns it off
     }();
 #endif
     // A block is skipped only when none of its logits beats the current heap top.
@@ -300,7 +300,7 @@ bool common_sampler_topk_exact_biased(
 static bool common_sampler_output_enabled() {
     static const bool enabled = [] {
         const char * e = getenv("LLAMA_BOOKKEEP_OUTPUT");
-        return e && atoi(e) != 0;
+        return !e || atoi(e) != 0;  // default on (owner 2026-10-22); 0 turns it off
     }();
     return enabled;
 }
@@ -706,7 +706,7 @@ struct common_sampler * common_sampler_init(
         }();
         static const bool bookkeep_sampler_env = [] {
             const char * e = getenv("LLAMA_BOOKKEEP_SAMPLER");
-            return e && atoi(e) != 0;
+            return !e || atoi(e) != 0;  // default on (owner 2026-10-22); 0 turns it off
         }();
         // LLAMA_HOSTCPU_TOPK_SKIP_EMPTY (default on): disabled samplers ("?penalties", "?dry", "?top-n-sigma", ...: their
         // apply and accept do nothing) may sit before top-k. The default sampler order puts three of them
