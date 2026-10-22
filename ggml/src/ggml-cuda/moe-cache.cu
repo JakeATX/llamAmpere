@@ -10023,7 +10023,8 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
             }
 
         }
-        if (moe_cache_mem_available() < floor ||
+        // Same rule as the preflight: the floor guards pages pinned here; no new ranges means nothing was pinned.
+        if ((!ranges.empty() && moe_cache_mem_available() < floor) ||
                 !moe_cache_cgroup_headroom(margin, registered_bytes, &peak_service_current)) {
             return fail();
         }
