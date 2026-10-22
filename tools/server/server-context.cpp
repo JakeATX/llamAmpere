@@ -716,7 +716,7 @@ static server_host_phase_clock g_host_phases;
 static bool server_bookkeep_enabled() {
     static const bool on = [] {
         const char * e = getenv("LLAMA_BOOKKEEP_SERVER");
-        return e && atoi(e) != 0;
+        return !e || atoi(e) != 0;  // default on (owner 2026-10-22); 0 turns it off
     }();
     return on;
 }

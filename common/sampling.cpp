@@ -190,7 +190,7 @@ static void common_sampler_topk_exact_impl(
 #if COMMON_TOPK_AVX2
     static const bool avx2 = [] {
         const char * enabled = std::getenv("LLAMA_BOOKKEEP_TOPK_AVX2");
-        return enabled && std::atoi(enabled) != 0 && __builtin_cpu_supports("avx2");
+        return (!enabled || std::atoi(enabled) != 0) && __builtin_cpu_supports("avx2");  // default on (owner 2026-10-22); 0 turns it off
     }();
 #endif
     // A block is skipped only when none of its logits beats the current heap top.
@@ -300,7 +300,7 @@ bool common_sampler_topk_exact_biased(
 static bool common_sampler_output_enabled() {
     static const bool enabled = [] {
         const char * e = getenv("LLAMA_BOOKKEEP_OUTPUT");
-        return e && atoi(e) != 0;
+        return !e || atoi(e) != 0;  // default on (owner 2026-10-22); 0 turns it off
     }();
     return enabled;
 }
@@ -706,14 +706,29 @@ struct common_sampler * common_sampler_init(
         }();
         static const bool bookkeep_sampler_env = [] {
             const char * e = getenv("LLAMA_BOOKKEEP_SAMPLER");
-            return e && atoi(e) != 0;
+            return !e || atoi(e) != 0;  // default on (owner 2026-10-22); 0 turns it off
+        }();
+        // LLAMA_HOSTCPU_TOPK_SKIP_EMPTY (default on): disabled samplers ("?penalties", "?dry", "?top-n-sigma", ...: their
+        // apply and accept do nothing) may sit before top-k. The default sampler order puts three of them
+        // first, which kept the fused top-k off for every plain temp/top-k/top-p request.
+        // Default on (exact: the skipped samplers do nothing); LLAMA_HOSTCPU_TOPK_SKIP_EMPTY=0 turns it off.
+        static const bool hostcpu_skip_empty_env = [] {
+            const char * e = getenv("LLAMA_HOSTCPU_TOPK_SKIP_EMPTY");
+            return e == nullptr || atoi(e) != 0;
         }();
         if (topk_fused_env && params.top_k > 0 && params.top_k <= 128) {
-            const int top_k_idx = merged_bias.empty() ? 0 : 1;
+            const int bias_idx = merged_bias.empty() ? 0 : 1;
+            int top_k_idx = bias_idx;
+            if (hostcpu_skip_empty_env) {
+                while (top_k_idx < llama_sampler_chain_n(chain) &&
+                        llama_sampler_name(llama_sampler_chain_get(chain, top_k_idx))[0] == '?') {
+                    ++top_k_idx;
+                }
+            }
             // Repeated bans are exact; other duplicate biases differ after a candidate shuffle.
-            if ((top_k_idx == 0 || bookkeep_sampler_env) && common_sampler_topk_biases_supported(merged_bias) &&
+            if ((bias_idx == 0 || bookkeep_sampler_env) && common_sampler_topk_biases_supported(merged_bias) &&
                     llama_sampler_chain_n(chain) > top_k_idx &&
-                    (top_k_idx == 0 || strcmp(llama_sampler_name(llama_sampler_chain_get(chain, 0)), "logit-bias") == 0) &&
+                    (bias_idx == 0 || strcmp(llama_sampler_name(llama_sampler_chain_get(chain, 0)), "logit-bias") == 0) &&
                     strcmp(llama_sampler_name(llama_sampler_chain_get(chain, top_k_idx)), "top-k") == 0) {
                 result->fused_top_k = params.top_k;
                 result->fused_topk_bias = std::move(merged_bias);

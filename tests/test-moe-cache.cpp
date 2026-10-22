@@ -6458,8 +6458,15 @@ static bool run_hitfirst_layer(ggml_backend_t gpu, ggml_backend_t cpu, log_captu
     const ggml_type types[] = {GGML_TYPE_Q4_0, GGML_TYPE_IQ4_XS, GGML_TYPE_Q4_K, GGML_TYPE_IQ3_S, GGML_TYPE_IQ2_XXS};
     constexpr int k_used = 8;
     constexpr int dim = 256; // square projections keep every quantization block size legal
+    // Up/gate/swiglu/down quantizes the activations twice (the CPU in 256-wide blocks, the card in 32-wide), so the
+    // CPU comparison is a sanity bound at quantization-noise level; the exact gate is the bitwise on/off comparison.
+    const double chain_tolerance = 8e-3;
     long long hf_layers_total = 0;
+    bool all_ok = true;
     for (const auto type : types) {
+        const bool ok_before_type = ok;
+        ok = true; // per type, so one failing type does not hide the others
+        double type_nmse = 0.0, type_abs = 0.0, type_rel = 0.0;
         ggml_init_params weight_params = {4 * ggml_tensor_overhead(), nullptr, true};
         ggml_context * weights_ctx = ggml_init(weight_params);
         ggml_tensor * weights[3];
@@ -6570,7 +6577,18 @@ static bool run_hitfirst_layer(ggml_backend_t gpu, ggml_backend_t cpu, log_captu
                 ok &= ggml_backend_graph_compute(gpu, graphs[1].graph) == GGML_STATUS_SUCCESS;
                 api.session_leave(session);
                 ggml_backend_tensor_get(graphs[1].out, actual.data(), 0, actual.size() * sizeof(float));
-                ok &= compare_output(expected, actual, 5e-4);
+                {
+                    double se = 0.0, sr = 0.0, max_ref = 1e-12;
+                    for (size_t q = 0; q < expected.size(); ++q) {
+                        const double d = (double) actual[q] - expected[q];
+                        se += d * d; sr += (double) expected[q] * expected[q];
+                        type_abs = std::max(type_abs, std::fabs(d));
+                        max_ref = std::max(max_ref, (double) std::fabs(expected[q]));
+                    }
+                    type_nmse = std::max(type_nmse, se / std::max(sr, 1e-12));
+                    type_rel = std::max(type_rel, type_abs / max_ref);
+                }
+                ok &= compare_output(expected, actual, chain_tolerance);
                 dump.insert(dump.end(), actual.begin(), actual.end());
                 // Same route pattern (every 18 runs) must reproduce the same bits on a replayed graph.
                 const size_t slot = (size_t)(run % 18);
@@ -6597,13 +6615,17 @@ static bool run_hitfirst_layer(ggml_backend_t gpu, ggml_backend_t cpu, log_captu
                 ggml_free(input_ctx[i]);
             }
         }
-        printf("cache-hitfirst-layer type=%s hitfirst=%d: %s\n", ggml_type_name(type), hitfirst_requested ? 1 : 0, ok ? "OK" : "FAIL");
+        printf("cache-hitfirst-layer type=%s hitfirst=%d vs-CPU: nmse=%.3e max_abs=%.3e max_rel_to_max=%.3e (limit nmse %.0e): %s\n",
+                ggml_type_name(type), hitfirst_requested ? 1 : 0, type_nmse, type_abs, type_rel, chain_tolerance, ok ? "OK" : "FAIL");
+        all_ok &= ok && ok_before_type;
+        ok = true;
         ggml_backend_buffer_free(weights_buffer);
         ggml_free(weights_ctx);
     }
     for (const char * name : {"GGML_MOE_CACHE_DEVICE", "GGML_MOE_CACHE_DEVICE_STATS", "GGML_MOE_CACHE_DEVICE_CAPTURE", "GGML_MOE_MISSJOIN"}) {
         set_env(name, nullptr);
     }
+    ok = all_ok;
     // The path must actually have been taken (and must not be when off).
     if (hitfirst_requested) {
         ok &= hf_layers_total > 0;
@@ -6611,7 +6633,7 @@ static bool run_hitfirst_layer(ggml_backend_t gpu, ggml_backend_t cpu, log_captu
         ok &= hf_layers_total == 0;
     }
     printf("cache-hitfirst-layer hf_layers=%lld\n", hf_layers_total);
-    if (dump_path && ok) {
+    if (dump_path) {
         FILE * in = fopen(dump_path, "rb");
         if (in) {
             std::vector<float> baseline(dump.size());

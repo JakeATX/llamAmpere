@@ -8203,7 +8203,7 @@ static bool moe_missjoin_overlap_enabled() {
 static bool moe_missjoin_hitfirst_enabled() {
     static const bool on = [] {
         const char * v = getenv("GGML_MOE_MISSJOIN_HITFIRST");
-        if (!v || strcmp(v, "1") != 0) {
+        if (v && strcmp(v, "0") == 0) {  // default on with MISSJOIN=stage (owner 2026-10-22); 0 turns it off
             return false;
         }
         const char * fused = getenv("GGML_MOE_CACHE_DEVICE_FUSED");

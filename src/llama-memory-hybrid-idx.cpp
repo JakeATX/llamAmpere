@@ -228,7 +228,7 @@ bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
         // fork (bookkeep): a no-op removal leaves all pooled keys valid.
         static const bool bookkeep_kv = [] {
             const char * e = getenv("LLAMA_BOOKKEEP_KV");
-            return e && strcmp(e, "1") == 0;
+            return !(e && strcmp(e, "0") == 0);  // default on (owner 2026-10-22); 0 turns it off
         }();
         const auto * positions = bookkeep_kv && seq_id >= 0 ? &mem_idx->get_cells(seq_id).seq_pos_get(seq_id) : nullptr;
         const size_t size_before = positions ? positions->size() : 0;
@@ -425,7 +425,7 @@ namespace {
 bool kpool_incremental() {
     static const bool enabled = [] {
         const char * value = std::getenv("LLAMA_MTP_POOL_INCREMENTAL");
-        return value != nullptr && std::atoi(value) != 0;
+        return value == nullptr || std::atoi(value) != 0;  // default on (owner 2026-10-22); 0 turns it off
     }();
     return enabled;
 }
@@ -996,7 +996,7 @@ uint32_t llama_memory_hybrid_idx_context::get_n_kpool_new() const {
 bool llama_memory_hybrid_idx_context::use_kpool_store_only() const {
     static const bool enabled = [] {
         const char * value = std::getenv("LLAMA_MTP_POOL_STORE_ONLY");
-        return value != nullptr && std::atoi(value) != 0;
+        return value == nullptr || std::atoi(value) != 0;  // default on (owner 2026-10-22); 0 turns it off
     }();
     return enabled && kpool_incremental();
 }

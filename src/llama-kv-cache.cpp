@@ -1362,7 +1362,7 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
         // fork (bookkeep): visit only the indexed positions in the removed range.
         static const bool bookkeep_kv = [] {
             const char * e = getenv("LLAMA_BOOKKEEP_KV");
-            return e && strcmp(e, "1") == 0;
+            return !(e && strcmp(e, "0") == 0);  // default on (owner 2026-10-22); 0 turns it off
         }();
         if (bookkeep_kv) {
             const auto & positions = cells.seq_pos_get(seq_id);
