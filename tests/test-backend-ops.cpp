@@ -16769,6 +16769,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 25000, 64, 1, 1 }, 512));
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 25000, 64, 1, 1 }, 512, true));
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 1025, 8, 1, 1 }, 1025, true));
+    // Flash-Next verify widths at 100K context (n_pool 25088, k 512): the select kernel's one-row-per-block shape
+    for (int nrows : {1, 4, 5}) {
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 25088, nrows, 1, 1 }, 512));
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 25088, nrows, 1, 1 }, 512, true));
+    }
 
     // qwen4exp QSA indexer top-k fusion (get_rows + f16 mask + top_k)
     test_cases.emplace_back(new test_topk_qsa(512,  2048,  1, 1, 1500));
@@ -18627,6 +18632,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // Flash-Next QSA selection at ub 8192: k = 512 of the pooled blocks at 50K and 100K context
     for (auto cols : {12500, 25000}) {
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, 8192, 1, 1}, 512));
+    }
+    // ... and at verify widths 1/4/5 (100K context)
+    for (auto nrows : {1, 4, 5}) {
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {25088, nrows, 1, 1}, 512));
     }
     // widths around the tiling threshold
     for (auto cols : {4096, 8192, 12288, 16384, 24576, 32768, 65536, 131072}) {

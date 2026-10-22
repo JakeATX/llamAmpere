@@ -1,6 +1,8 @@
 #include "argsort.cuh"
 #include "top-k.cuh"
 
+#include <vector>
+
 #ifdef GGML_CUDA_USE_CUB
 #    include <cub/cub.cuh>
 // DeviceTopK has a race condition before CCCL 3.4.3.
@@ -363,7 +365,11 @@ static __device__ __forceinline__ int topk_sel_scan(const int v, int * s_warp, i
     return excl;
 }
 
-template <int BLOCK>
+// fork (VBEAT): AGG = warp-aggregated histogram adds. The QSA scores of one row sit in a narrow value range, so in the
+// first digit pass most lanes of a warp hit the same few bins and their shared-memory atomics serialize. With AGG the
+// lanes that share a bin elect one lane, which adds the group's count once. The counts are integers, so the histogram,
+// the chosen k-th key and the written indices (and their order) are the same as without AGG at any block size.
+template <int BLOCK, bool AGG = false>
 static __global__ void __launch_bounds__(BLOCK) topk_select_rows(const float * __restrict__ src, int * __restrict__ dst,
                                                                  const int ncols, const int k) {
     constexpr int BPT = TOPK_SEL_BINS / BLOCK;
@@ -388,10 +394,24 @@ static __global__ void __launch_bounds__(BLOCK) topk_select_rows(const float * _
             hist[i] = 0;
         }
         __syncthreads();
-        for (int c = tid; c < ncols; c += BLOCK) {
-            const uint32_t key = topk_sel_key(row[c]);
-            if ((key & pmask) == prefix) {
-                atomicAdd(&hist[(key >> shift) & dmask], 1);
+        if constexpr (AGG) {
+            // every lane runs the same trip count, so the full-warp match below is legal
+            for (int base = 0; base < ncols; base += BLOCK) {
+                const int      c   = base + tid;
+                const uint32_t key = c < ncols ? topk_sel_key(row[c]) : 0u;
+                const bool     hit = c < ncols && (key & pmask) == prefix;
+                const uint32_t bin = hit ? (key >> shift) & dmask : 0xFFFFFFFFu;
+                const uint32_t peers = __match_any_sync(0xFFFFFFFFu, bin);
+                if (hit && (int) (__ffs(peers) - 1) == (tid & 31)) {
+                    atomicAdd(&hist[bin], __popc(peers));
+                }
+            }
+        } else {
+            for (int c = tid; c < ncols; c += BLOCK) {
+                const uint32_t key = topk_sel_key(row[c]);
+                if ((key & pmask) == prefix) {
+                    atomicAdd(&hist[(key >> shift) & dmask], 1);
+                }
             }
         }
         __syncthreads();
@@ -564,8 +584,39 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     }();
     if (select_mode > 0 && ncols > 1024 && k >= 64 && k <= ncols && nrows <= INT_MAX &&
             (select_mode == 3 || !ggml_cuda_top_k_tiled_fits(ncols, k))) {
-        topk_select_rows<TOPK_SEL_BLOCK><<<nrows, TOPK_SEL_BLOCK, 0, stream>>>(src0_d, dst_d, ncols, k);
+        // fork (VBEAT): GGML_CUDA_TOPK_SEL_FAST (default 1) = 1024 threads per row + warp-aggregated histogram adds,
+        // same indices in the same order as the 256-thread kernel; 0 = the 256-thread kernel; 2 = fast, and also run
+        // the 256-thread kernel and count differing output words (sync per call; never time it)
+        static const int sel_fast = [] {
+            const char * value = getenv("GGML_CUDA_TOPK_SEL_FAST");
+            return value != nullptr ? atoi(value) : 1;
+        }();
+        if (sel_fast > 0) {
+            topk_select_rows<1024, true><<<nrows, 1024, 0, stream>>>(src0_d, dst_d, ncols, k);
+        } else {
+            topk_select_rows<TOPK_SEL_BLOCK><<<nrows, TOPK_SEL_BLOCK, 0, stream>>>(src0_d, dst_d, ncols, k);
+        }
         CUDA_CHECK(cudaGetLastError());
+        if (sel_fast == 2) {
+            static unsigned long long n_calls = 0, n_bad_total = 0;
+            ggml_cuda_pool_alloc<int> ref(pool, nrows * k);
+            topk_select_rows<TOPK_SEL_BLOCK><<<nrows, TOPK_SEL_BLOCK, 0, stream>>>(src0_d, ref.get(), ncols, k);
+            CUDA_CHECK(cudaGetLastError());
+            std::vector<int> h_new(nrows * k), h_ref(nrows * k);
+            CUDA_CHECK(cudaMemcpyAsync(h_new.data(), dst_d, nrows * k * sizeof(int), cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaMemcpyAsync(h_ref.data(), ref.get(), nrows * k * sizeof(int), cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            unsigned long long n_bad = 0;
+            for (size_t i = 0; i < h_new.size(); ++i) {
+                n_bad += h_new[i] != h_ref[i];
+            }
+            n_calls++; n_bad_total += n_bad;
+            if (n_bad != 0 || (n_calls & (n_calls - 1)) == 0) {
+                ggml_log_internal(n_bad != 0 ? GGML_LOG_LEVEL_WARN : GGML_LOG_LEVEL_INFO,
+                    "%s: TOPK_SEL_FAST check call %llu (ncols %lld nrows %lld k %lld): %llu differing words, total %llu\n",
+                    __func__, n_calls, (long long) ncols, (long long) nrows, (long long) k, n_bad, n_bad_total);
+            }
+        }
         if (select_mode == 2) {
             static unsigned long long n_calls = 0, n_diff_total = 0, n_rows_total = 0;
             ggml_cuda_pool_alloc<int> ref(pool, nrows * k);
