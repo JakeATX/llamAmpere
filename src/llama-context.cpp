@@ -5219,6 +5219,22 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
     }();
     if (decode_rows && (n_tokens == 0 || (sched_reserve_tokens <= decode_rows && n_tokens <= decode_rows))) {
         rows = decode_rows;
+        // fork ROUNDPREP: LLAMA_MTP_SCRATCH_ROWS=N (1..16; 0 or unset = off) gives the helper (MTP guesser) a
+        // smaller writing scratch than the target's. At 16 rows the helper's attention is past the fused route's
+        // 8-row limit, so its reserve sizes the generic route, which keeps 16-bit copies of the whole helper
+        // history behind the output (216 MiB at 110,784 cells). Writing batches never exceed 8 helper rows
+        // (catch-up is at most the accepted guesses + 1), and those run the fused route at any reserve, so the
+        // kernels and the words are the same; only the scratch size changes. A larger writing batch (two users)
+        // grows back to the normal writing rows above.
+        static const uint32_t mtp_rows = [] {
+            const char * text = getenv("LLAMA_MTP_SCRATCH_ROWS");
+            const long value = text && text[0] ? strtol(text, nullptr, 10) : 0;
+            return value > 0 && value <= 16 ? (uint32_t) value : 0u;
+        }();
+        if (mtp_rows && mtp_rows < decode_rows && cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
+                (n_tokens == 0 || (sched_reserve_tokens <= mtp_rows && n_tokens <= mtp_rows))) {
+            rows = mtp_rows;
+        }
     }
     if (alone && n_tokens > 512 && cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT &&
             decode_phase == LLAMA_DECODE_PHASE_PROMPT) {
