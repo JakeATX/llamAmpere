@@ -145,7 +145,7 @@ static bool ggml_cuda_top_k_tiled(ggml_cuda_pool & pool, const float * src, int 
     ggml_cuda_pool_alloc<int>   cand_idx(pool, (size_t) nrows * ncand);
     ggml_cuda_pool_alloc<int>   order   (pool, (size_t) nrows * ncand);
 
-    static const bool tile_select = [] { const char * e = getenv("GGML_CUDA_TOPK_TILE_SELECT"); return e && atoi(e) != 0; }();
+    static const bool tile_select = [] { const char * e = getenv("GGML_CUDA_TOPK_TILE_SELECT"); return e == nullptr || atoi(e) != 0; }();
     if (tile_select && topk_tile_select_launch(src, cand_val.get(), cand_idx.get(), ncols, nrows, ntiles, k, tile, stream)) {
         // same candidates in the same order as topk_tile
     } else if (tile == TOPK_TILE_WIDE) {

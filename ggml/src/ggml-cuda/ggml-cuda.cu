@@ -7118,7 +7118,7 @@ static int ggml_cuda_fuse_norm_mul_cast(ggml_backend_cuda_context & ctx, const g
 static bool ggml_cuda_hc_post_norm_enabled() {
     static const bool enabled = [] {
         const char * e = getenv("GGML_CUDA_HC_POST_NORM");
-        return e != nullptr && atoi(e) != 0;
+        return e == nullptr || atoi(e) != 0;
     }();
     return enabled;
 }
@@ -7126,7 +7126,7 @@ static bool ggml_cuda_hc_post_norm_enabled() {
 static bool ggml_cuda_hc_pre_xn_enabled() {
     static const bool enabled = [] {
         const char * e = getenv("GGML_CUDA_HC_PRE_XN");
-        return e != nullptr && atoi(e) != 0;
+        return e == nullptr || atoi(e) != 0;
     }();
     return enabled;
 }

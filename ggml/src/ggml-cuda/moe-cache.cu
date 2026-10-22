@@ -5435,7 +5435,7 @@ static int moe_cache_warm(void * opaque, const ggml_moe_cache_tensor_desc * tens
         g_warm_rank_only = rank_only;
         const int profile_queued = moe_cache_warm(opaque, tensors, nullptr, n_tensors);
         g_warm_rank_only = false;
-        static const bool no_replan = moe_cache_env_on("GGML_MOE_CACHE_FRESH_NO_REPLAN");
+        static const bool no_replan = [] { const char * v = getenv("GGML_MOE_CACHE_FRESH_NO_REPLAN"); return v == nullptr || atoi(v) != 0; }();
         fresh_profile_plan = no_replan && !rank_only && !attempted_before && profile_queued > 0;
     }
     bool observed = false;

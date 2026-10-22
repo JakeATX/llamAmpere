@@ -69,7 +69,7 @@ void llama_moe_output::flush() {
     // disk (about 86 ms and 112.6 MiB of SSD writes per in-call checkpoint). Skipping it changes no data.
     static const bool no_msync = [] {
         const char * v = getenv("LLAMA_MOE_OUTPUT_NO_MSYNC");
-        return v && atoi(v) != 0;
+        return v == nullptr || atoi(v) != 0;
     }();
     if (dirty && !no_msync && msync(data, size, MS_SYNC) != 0) {
         throw std::runtime_error("cannot flush MoE temporary output file");
