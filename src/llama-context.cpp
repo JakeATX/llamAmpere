@@ -3273,6 +3273,22 @@ void llama_context::set_decode_phase(enum llama_decode_phase phase) {
             if (!prompt_buffers_resize(0, nullptr)) {
                 throw std::runtime_error("failed to return prompt scratch");
             }
+            // fork ROUNDPREP: LLAMA_MTP_RESERVE_EARLY=1 re-reserves the helper here, after the target's own scratch
+            // shrink detached it and before the expert cache is built below. The shared compute buffer then already
+            // holds the helper's writing-phase need (223 MiB at 16 rows against the target's 75), so the cache reserve
+            // is the free memory that stays free; without it the helper grows the shared buffer at its first guess,
+            // out of the reserve. Same graphs and buffers either way, only the order of allocation changes.
+            static const bool reserve_early = [] {
+                const char * e = getenv("LLAMA_MTP_RESERVE_EARLY");
+                return e != nullptr && e[0] == '1';
+            }();
+            if (reserve_early && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && compute_peer &&
+                    compute_peer->cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && compute_peer->sched &&
+                    compute_peer->sched_need_reserve) {
+                compute_peer->sched_reserve();
+                LLAMA_LOG_INFO("%s: helper scratch reserved before the expert cache build (%u rows)\n", __func__,
+                        compute_peer->sched_reserve_tokens);
+            }
             for (ggml_backend_t backend : backend_ptrs) {
                 auto dev = ggml_backend_get_device(backend);
                 if (!dev || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
