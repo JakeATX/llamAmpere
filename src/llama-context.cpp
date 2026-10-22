@@ -52,6 +52,9 @@
 #include <string>
 #include <unordered_map>
 #include <mutex>
+#include <condition_variable>
+#include <thread>
+#include <vector>
 
 #if defined(__GLIBC__)
 #include <malloc.h>
@@ -1266,6 +1269,108 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
     // Publish the backlink only after all throwing initialization has completed.
     if (compute_peer) {
         compute_peer->compute_peer = this;
+    }
+}
+
+// [RTPORT] early PLE page reads (LLAMA_PLE_HINT=1, opt-in). The qwen4exp per-layer n-gram table is a 27 GB lazily
+// mapped file region, so most rows a check gathers are not in memory. The check's input step asks the kernel to read
+// them (one madvise per row) and the gather then waits for the disk, with the card idle. The guess loop knows each
+// check token as soon as it draws it, so it hands the token's n-gram window here; a worker thread computes the same
+// rows set_input will and starts their reads while the helper keeps drawing. Advice only: the bytes read are the same.
+struct llama_ple_hinter {
+    const llama_model & model;
+    std::mutex mtx;
+    std::condition_variable cv;
+    std::vector<int32_t> queue;
+    bool stop = false;
+    std::thread worker;
+
+    explicit llama_ple_hinter(const llama_model & model) : model(model) {
+        worker = std::thread([this] { run(); });
+    }
+    ~llama_ple_hinter() {
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            stop = true;
+        }
+        cv.notify_one();
+        worker.join();
+    }
+    void run() {
+        std::vector<int32_t> rows;
+        for (;;) {
+            {
+                std::unique_lock<std::mutex> lk(mtx);
+                cv.wait(lk, [this] { return stop || !queue.empty(); });
+                if (stop) {
+                    return;
+                }
+                rows.swap(queue);
+                queue.clear();
+            }
+            llama_prefetch_rows(model.per_layer_tok_embd, rows.data(), rows.size());
+            rows.clear();
+        }
+    }
+    // the rows of window[n_window - 1] given its predecessors (newest last), as llm_graph_input_qwen4exp_ple does
+    void hint(const llama_token * window, int32_t n_window) {
+        const auto & hp = model.hparams;
+        const int64_t n_gram   = hp.ple_ngram_size;
+        const int64_t per_gram = hp.ple_heads_per_ngram;
+        const int64_t eos      = hp.ple_eos_token_id;
+        if (n_window < 1 || n_gram < 2 || n_gram > LLAMA_MAX_PLE_NGRAM) {
+            return;
+        }
+        int64_t ctx[LLAMA_MAX_PLE_NGRAM];
+        ctx[0] = window[n_window - 1];
+        if (ctx[0] < 0) {
+            return; // an image position: set_input stands in another token, not worth guessing
+        }
+        bool cut = false;
+        for (int64_t s = 1; s < n_gram; ++s) {
+            const llama_token t = cut || s >= n_window ? LLAMA_TOKEN_NULL : window[n_window - 1 - s];
+            cut = cut || t < 0 || t == eos;
+            ctx[s] = cut ? eos : t;
+        }
+        int32_t rows[LLAMA_MAX_PLE_HEADS];
+        int32_t n_rows = 0;
+        for (int64_t n = 2; n <= n_gram; ++n) {
+            uint64_t mixed = (uint64_t) ctx[0] * hp.ple_layer_multipliers[0];
+            for (int64_t j = 1; j < n; ++j) {
+                mixed ^= (uint64_t) ctx[j] * hp.ple_layer_multipliers[j];
+            }
+            const int64_t base = (n - 2) * per_gram;
+            for (int64_t g = 0; g < per_gram && base + g < LLAMA_MAX_PLE_HEADS; ++g) {
+                const int64_t h_i = base + g;
+                rows[n_rows++] = (int32_t) (mixed % hp.ple_head_vocab_sizes[h_i] + hp.ple_head_offsets[h_i]);
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            queue.insert(queue.end(), rows, rows + n_rows);
+        }
+        cv.notify_one();
+    }
+};
+
+void llama_ple_hint(llama_context * ctx, const llama_token * window, int32_t n_window) {
+    if (ctx) {
+        ctx->ple_hint_add(window, n_window);
+    }
+}
+
+void llama_context::ple_hint_add(const llama_token * window, int32_t n_window) {
+    if (!ple_hint_tried) {
+        ple_hint_tried = true;
+        const char * v = getenv("LLAMA_PLE_HINT");
+        if (v && atoi(v) != 0 && model.per_layer_tok_embd && model.hparams.ple_n_heads > 0 && !model.ple_cache &&
+                model.can_prefetch.count(model.per_layer_tok_embd)) {
+            ple_hint = std::make_unique<llama_ple_hinter>(model);
+            LLAMA_LOG_INFO("%s: [RTPORT] early PLE page reads on (LLAMA_PLE_HINT)\n", __func__);
+        }
+    }
+    if (ple_hint && window) {
+        ple_hint->hint(window, n_window);
     }
 }
 

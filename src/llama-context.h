@@ -22,6 +22,7 @@ class llama_batch_allocr;
 class llama_moe_cache;
 class llama_b1;
 class llama_ple_prefetch;
+struct llama_ple_hinter;
 struct llama_moe_output;
 class llama_kv_cache;
 
@@ -214,6 +215,8 @@ struct llama_context {
     bool mtp_pipe_init();
     int  mtp_pipe_decode(llama_batch batch, bool use_previous, bool defer);
     bool mtp_pipe_supply(llama_token token);
+    // [RTPORT] early PLE page reads, see llama_ple_hint()
+    void ple_hint_add(const llama_token * window, int32_t n_window);
     void mtp_pipe_cancel();
     bool mtp_pipe_step_ok();
     bool mtp_pipe_stats(uint64_t * n_steps, uint64_t * n_deferred, uint64_t * n_cancel) const;
@@ -642,6 +645,9 @@ private:
     // [PLEPF] PLE page prefetch (LLAMA_PLE_PREFETCH=<threads>, opt-in; see llama-ple-prefetch.h)
     std::unique_ptr<llama_ple_prefetch> ple_pf;
     bool ple_pf_tried = false;
+    // [RTPORT] early PLE page reads for the next check (LLAMA_PLE_HINT=1, opt-in; see llama_ple_hint)
+    std::unique_ptr<llama_ple_hinter> ple_hint;
+    bool ple_hint_tried = false;
     bool b1_env   = false; // LLAMA_B1 set
     bool b1_tried = false; // b1 construction attempted
     bool b1_ffn_scratch_active = false;

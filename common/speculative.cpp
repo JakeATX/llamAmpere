@@ -28,6 +28,37 @@
 #include <thread>
 #include <cinttypes>
 
+// [RTPORT] LLAMA_PLE_HINT=1: hand the target each token the next check will hold (with its predecessors), so the
+// pages of its per-layer n-gram rows are read while the helper keeps drawing (see llama_ple_hint)
+static void spec_ple_hint(llama_context * ctx_tgt, const common_speculative_draft_params & dp, const llama_tokens * drafted) {
+    static const bool on = [] {
+        const char * v = getenv("LLAMA_PLE_HINT");
+        return v && atoi(v) != 0;
+    }();
+    if (!on || !ctx_tgt) {
+        return;
+    }
+    constexpr int n_win = 4; // the token and three predecessors (qwen4exp uses ngram_size - 1 = 2)
+    llama_token w[n_win];
+    int n = 0;
+    // newest first, then reversed
+    if (drafted) {
+        for (size_t k = drafted->size(); k-- > 0 && n < n_win;) {
+            w[n++] = (*drafted)[k];
+        }
+    }
+    if (n < n_win) {
+        w[n++] = dp.id_last;
+    }
+    if (dp.prompt) {
+        for (size_t k = dp.prompt->size(); k-- > 0 && n < n_win;) {
+            w[n++] = (*dp.prompt)[k];
+        }
+    }
+    std::reverse(w, w + n);
+    llama_ple_hint(ctx_tgt, w, n);
+}
+
 // [#47] host phase split of the MTP draft call (LLAMA_HOST_PHASES=1), see speculative.h
 bool common_speculative_host_phases_enabled() {
     static const bool v = [] { const char * e = getenv("LLAMA_HOST_PHASES"); return e && atoi(e) != 0; }();
@@ -3174,6 +3205,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             common_batch_add(batch, dp.id_last, dp.pos0, { seq_id }, true);
             std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[seq_id].data(), row_bytes);
+            spec_ple_hint(params.ctx_tgt, dp, nullptr);
 
             i_last[seq_id] = batch.n_tokens - 1;
 
@@ -3351,6 +3383,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
 
                 result.push_back(id);
+                spec_ple_hint(params.ctx_tgt, dp, &result);
                 if (dp.conf_p1) {
                     spec_conf_push_candidates(dp, cur_p, ctx_dft, i_last[seq_id]);
                 }

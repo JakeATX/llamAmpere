@@ -93,6 +93,10 @@ LLAMA_API int  llama_mtp_pipe_decode(struct llama_context * draft, struct llama_
 LLAMA_API bool llama_mtp_pipe_supply(struct llama_context * draft, llama_token token);
 LLAMA_API void llama_mtp_pipe_cancel(struct llama_context * draft);
 LLAMA_API bool llama_mtp_pipe_step_ok(struct llama_context * draft);
+// [RTPORT] LLAMA_PLE_HINT=1 (opt-in, qwen4exp lazily mapped PLE table only, else a no-op): the next decode on this
+// target context will hold window[n_window - 1], preceded by window[0 .. n_window - 2] (newest last). Starts the page
+// reads of that token's n-gram rows on a worker thread and returns at once.
+LLAMA_API void llama_ple_hint(struct llama_context * target, const llama_token * window, int32_t n_window);
 // steps run, steps queued ahead of their token, queued steps released unused; false if off or stopped by a timeout
 LLAMA_API bool llama_mtp_pipe_stats(struct llama_context * draft, uint64_t * n_steps, uint64_t * n_deferred, uint64_t * n_cancel);
 
