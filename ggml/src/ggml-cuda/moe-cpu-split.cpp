@@ -578,6 +578,29 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
             if (skip[i]) { skipped += (skipped.empty() ? "" : ",") + std::to_string(cores[i]); }
         }
     }
+    // GGML_MOE_CPU_SPLIT_SMT=1 (default off): also use the second hardware thread of each pool core, listed after
+    // all the first threads. The grid lookups of the IQ dot loops stall on load latency, which a sibling can fill.
+    const bool smt = env_int("GGML_MOE_CPU_SPLIT_SMT", 0, 0, 1) != 0;
+#if defined(__linux__)
+    if (smt) {
+        const size_t n_lead = avail.size();
+        for (size_t i = 0; i < n_lead; ++i) {
+            const std::string fn = "/sys/devices/system/cpu/cpu" + std::to_string(avail[i]) + "/topology/thread_siblings_list";
+            FILE * f = fopen(fn.c_str(), "r");
+            if (!f) { continue; }
+            char buf[128] = {};
+            if (!fgets(buf, sizeof(buf), f)) { buf[0] = 0; }
+            fclose(f);
+            for (char * c = buf; *c;) {   // "a,b" or "a-b"
+                if (*c < '0' || *c > '9') { ++c; continue; }
+                const int lo = (int) strtol(c, &c, 10);
+                int hi = lo;
+                if (*c == '-') { ++c; hi = (int) strtol(c, &c, 10); }
+                for (int v = lo; v <= hi; ++v) { if (v != avail[i]) { avail.push_back(v); } }
+            }
+        }
+    }
+#endif
     const int hw_free = !avail.empty() ? (int) avail.size() : (int) std::max(1u, std::thread::hardware_concurrency() / 2 - 1);
     s.threads = env_int("GGML_MOE_CPU_SPLIT_THREADS", hw_free, 1, 64);
     const bool pin = env_int("GGML_MOE_CPU_SPLIT_PIN", 1, 0, 1) != 0 && !avail.empty();
@@ -590,9 +613,9 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
     for (auto & t : s.workers) { t.detach(); }
     std::string where;
     for (int i = 0; pin && i < s.threads; ++i) { where += (i ? "," : "") + std::to_string(cpu_of(i)); }
-    fprintf(stderr, "[moe-cpu-split] pool: %d threads, %s%s (skipped cores at cpus %s), spin %d us, nap %d us, rows up/gate %d down %d%s\n",
+    fprintf(stderr, "[moe-cpu-split] pool: %d threads, %s%s (skipped cores at cpus %s), spin %d us, nap %d us, rows up/gate %d down %d%s%s\n",
             s.threads, pin ? "pinned to cpus " : "unpinned", where.c_str(), skipped.c_str(), s.spin_us, s.nap_us, s.rows_ug, s.rows_down,
-            s.q2_fast ? ", Q2_0 down fast path" : "");
+            s.q2_fast ? ", Q2_0 down fast path" : "", smt ? ", SMT siblings" : "");
     return true;
 }
 
