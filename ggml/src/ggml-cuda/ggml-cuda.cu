@@ -5179,7 +5179,15 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
 
 static void ggml_cuda_graph_instantiate(ggml_cuda_graph * graph) {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11070
-    if (ggml_cuda_moe_table_prefetch_enabled()) {
+    // fork STRATAGAP: GGML_CUDA_GRAPH_NODE_PRIORITY=1 (default off) keeps the priority each kernel was captured
+    // with. Without it a replayed graph runs every node at one priority, so the hit-first expert copies (captured
+    // on the high-priority side stream) queue behind all blocks of the hit matrix-vector product they should hide
+    // under. Scheduling only: the same kernels on the same data.
+    static const bool node_prio = [] {
+        const char * v = std::getenv("GGML_CUDA_GRAPH_NODE_PRIORITY");
+        return v && std::strcmp(v, "1") == 0;
+    }();
+    if (node_prio || ggml_cuda_moe_table_prefetch_enabled()) {
         CUDA_CHECK(cudaGraphInstantiateWithFlags(&graph->instance, graph->graph,
                                                  cudaGraphInstantiateFlagUseNodePriority));
         return;
