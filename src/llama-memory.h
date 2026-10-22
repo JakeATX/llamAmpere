@@ -57,6 +57,8 @@ struct llama_sj_kvarn_config {
     // sink/ring stream), so one sequence can use nearly the whole budget; false: a full-length pool per sequence
     bool shared_pool = false;
     std::string transform;    // EXPERIMENTAL WUSH-KV transform file (empty = Hadamard)
+    // MTP draft cache: the driver skips the image tokens, so its rows can jump ahead of the last cell (find_slot, state)
+    bool draft = false;
 
     bool enabled() const { return bits_k > 0 && bits_v > 0; }
 };
