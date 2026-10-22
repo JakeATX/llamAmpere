@@ -415,6 +415,7 @@ struct pool_state {
     std::vector<float> hq_aux;
     int rows_ug = 16, rows_down = 64;
     bool iq_rows = false;      // GGML_MOE_CPU_SPLIT_ROWS: moe-iq-rows.h kernels, each chunk decoded once per expert
+    int iq_variant = -1;       // moe_iq::get variant (GGML_MOE_CPU_SPLIT_ROWS minus 1)
     int iq_pf = 0;             // GGML_MOE_CPU_SPLIT_PF: prefetch distance of those kernels in bytes (0 = off)
 
     alignas(64) std::atomic<unsigned long long> gen{0};
@@ -759,7 +760,8 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
     s.rows_ug = env_int("GGML_MOE_CPU_SPLIT_ROWS_UG", 16, 1, 4096);
     s.rows_down = env_int("GGML_MOE_CPU_SPLIT_ROWS_DOWN", 64, 1, 8192);
 #if defined(MOE_IQ_ROWS)
-    s.iq_rows = env_int("GGML_MOE_CPU_SPLIT_ROWS", 0, 0, 1) != 0;
+    s.iq_variant = env_int("GGML_MOE_CPU_SPLIT_ROWS", 0, 0, 4) - 1;   // 1..4 = on, kernel variant 0..3
+    s.iq_rows = s.iq_variant >= 0;
     s.iq_pf = env_int("GGML_MOE_CPU_SPLIT_PF", 0, 0, 1 << 16);
 #endif
     s.spin_ms = env_int("GGML_MOE_CPU_SPLIT_SPIN_MS", 250, 0, 600000);
@@ -845,7 +847,7 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
     fprintf(stderr, "[moe-cpu-split] pool: %d threads, %s%s (skipped cores at cpus %s), spin %d us, nap %d us, rows up/gate %d down %d%s%s%s\n",
             s.threads, pin ? "pinned to cpus " : "unpinned", where.c_str(), skipped.c_str(), s.spin_us, s.nap_us, s.rows_ug, s.rows_down,
             s.q2_fast ? ", Q2_0 down fast path" : "", smt ? ", SMT siblings" : "", s.avx512 ? ", AVX-512 VNNI IQ dots" : "");
-    if (s.iq_rows) { fprintf(stderr, "[moe-cpu-split] IQ up/gate row kernels (each chunk decoded once per expert), prefetch %d B\n", s.iq_pf); }
+    if (s.iq_rows) { fprintf(stderr, "[moe-cpu-split] IQ up/gate row kernels (each chunk decoded once per expert), variant %d, prefetch %d B\n", s.iq_variant, s.iq_pf); }
     return true;
 }
 
@@ -882,7 +884,7 @@ bool moe_cs_register_layer(int layer, const moe_cs_role roles[3]) {
         m.vec_type = tr->vec_dot_type;
 #if defined(MOE_IQ_ROWS)
         for (int nt = 1; nt <= 4; ++nt) {
-            m.rows[nt] = s.iq_rows && !s.avx512 && k < 2 && m.vec_type == GGML_TYPE_Q8_K ? moe_iq::get(m.r.type, nt) : nullptr;
+            m.rows[nt] = s.iq_rows && !s.avx512 && k < 2 && m.vec_type == GGML_TYPE_Q8_K ? moe_iq::get(m.r.type, nt, s.iq_variant) : nullptr;
         }
 #endif
         const auto * vt = ggml_get_type_traits_cpu(m.vec_type);
@@ -1032,14 +1034,14 @@ void moe_cs_stats(unsigned long long out[9]) {
 }
 
 bool moe_cs_iq_rows(int type, int nt, const void * w, size_t row_bytes, int64_t r0, int64_t r1, int64_t n_in,
-        const void * const * y, float * const * out, int prefetch) {
+        const void * const * y, float * const * out, int prefetch, int variant) {
 #if defined(MOE_IQ_ROWS)
-    const moe_iq::rows_fn f = moe_iq::get(type, nt);
+    const moe_iq::rows_fn f = moe_iq::get(type, nt, variant);
     if (!f || n_in % QK_K != 0) { return false; }
     f((const char *) w, row_bytes, r0, r1, (int) (n_in / QK_K), (const block_q8_K * const *) y, out, prefetch);
     return true;
 #else
-    (void) type; (void) nt; (void) w; (void) row_bytes; (void) r0; (void) r1; (void) n_in; (void) y; (void) out; (void) prefetch;
+    (void) type; (void) nt; (void) w; (void) row_bytes; (void) r0; (void) r1; (void) n_in; (void) y; (void) out; (void) prefetch; (void) variant;
     return false;
 #endif
 }

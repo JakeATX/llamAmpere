@@ -151,59 +151,108 @@ struct f_iq3_s {     // qs: 8 low index bytes per chunk; qh: the 9th index bit (
     }
 };
 
+// The same two decodes with the 4-byte grid entries joined in pairs in general registers first (two loads, a shift
+// and an or per pair), so the vector side sees four 64-bit inserts instead of eight 32-bit ones (fewer shuffle uops).
+inline uint64_t pair3(const uint32_t * grid, uint32_t a, uint32_t b) { return (uint64_t) grid[a] | ((uint64_t) grid[b] << 32); }
+
+struct f_iq3_xxs_pair : f_iq3_xxs {
+    static inline void dec(const B * x, int c, __m256i & g, __m256i & s, __m256i & sc) {
+        const uint8_t * q = x->qs + 8 * c;
+        const uint32_t w = rd32(x->qs + 64 + 4 * c);
+        g = _mm256_set_epi64x((long long) pair3(iq3xxs_grid, q[6], q[7]), (long long) pair3(iq3xxs_grid, q[4], q[5]),
+                              (long long) pair3(iq3xxs_grid, q[2], q[3]), (long long) pair3(iq3xxs_grid, q[0], q[1]));
+        s = _mm256_set_epi64x((long long) T.sign8[(w >> 21) & 127], (long long) T.sign8[(w >> 14) & 127],
+                              (long long) T.sign8[(w >> 7) & 127], (long long) T.sign8[w & 127]);
+        sc = load_sc(T.sc32[w >> 28]);
+    }
+};
+
+struct f_iq3_s_pair : f_iq3_s {
+    static inline void dec(const B * x, int c, __m256i & g, __m256i & s, __m256i & sc) {
+        const uint64_t lo = rd64(x->qs + 8 * c);
+        const uint64_t hi = _pdep_u64(x->qh[c], 0x0101010101010101ull);
+        uint32_t ix[8];
+        for (int k = 0; k < 8; ++k) { ix[k] = (uint32_t) ((lo >> (8 * k)) & 255) | (uint32_t) (((hi >> (8 * k)) & 1) << 8); }
+        g = _mm256_set_epi64x((long long) pair3(iq3s_grid, ix[6], ix[7]), (long long) pair3(iq3s_grid, ix[4], ix[5]),
+                              (long long) pair3(iq3s_grid, ix[2], ix[3]), (long long) pair3(iq3s_grid, ix[0], ix[1]));
+        s = bits_to_signs(rd32(x->signs + 4 * c));
+        sc = load_sc(T.sc32[(x->scales[c >> 1] >> (4 * (c & 1))) & 15]);
+    }
+};
+
 // rows [r0, r1) of one expert for NT tokens: out[t][r - r0]. y[t] = token t's Q8_K row. pf = prefetch distance in
 // bytes (0 = off).
-template <class F, int NT>
-void rows(const char * w, size_t row_bytes, int64_t r0, int64_t r1, int nb, const block_q8_K * const * y,
+// R rows at once for NT tokens: each chunk decoded once per row, each token's activations loaded once per chunk for
+// all R rows. Same per-row operations as R = 1.
+template <class F, int NT, int R>
+inline void tile(const char * w, size_t row_bytes, int64_t r, int64_t r0, int nb, const block_q8_K * const * y,
         float * const * out, int pf) {
-    for (int64_t r = r0; r < r1; ++r) {
-        const typename F::B * x = (const typename F::B *) (w + (size_t) r * row_bytes);
-        __m256 accf[NT];
-        for (int t = 0; t < NT; ++t) { accf[t] = _mm256_setzero_ps(); }
-        for (int i = 0; i < nb; ++i) {
-            if (pf > 0) {
-                _mm_prefetch((const char *) (x + i) + pf, _MM_HINT_T0);
-                _mm_prefetch((const char *) (x + i) + pf + 64, _MM_HINT_T0);
-            }
-            __m256i acc[NT];
-            for (int t = 0; t < NT; ++t) { acc[t] = _mm256_setzero_si256(); }
-            for (int c = 0; c < 8; ++c) {
-                __m256i g, s, sc;
-                F::dec(x + i, c, g, s, sc);
-                for (int t = 0; t < NT; ++t) {
-                    const __m256i q = _mm256_loadu_si256((const __m256i *) (y[t][i].qs + 32 * c));
-                    acc[t] = _mm256_add_epi32(acc[t], _mm256_madd_epi16(_mm256_maddubs_epi16(g, _mm256_sign_epi8(q, s)), sc));
-                }
-            }
-            const float dx = _cvtsh_ss(x[i].d);
-            for (int t = 0; t < NT; ++t) {
-                accf[t] = _mm256_fmadd_ps(_mm256_set1_ps(dx * y[t][i].d), _mm256_cvtepi32_ps(acc[t]), accf[t]);
+    const typename F::B * x[R];
+    for (int k = 0; k < R; ++k) { x[k] = (const typename F::B *) (w + (size_t) (r + k) * row_bytes); }
+    __m256 accf[R][NT];
+    for (int k = 0; k < R; ++k) { for (int t = 0; t < NT; ++t) { accf[k][t] = _mm256_setzero_ps(); } }
+    for (int i = 0; i < nb; ++i) {
+        if (pf > 0) {
+            for (int k = 0; k < R; ++k) {
+                _mm_prefetch((const char *) (x[k] + i) + pf, _MM_HINT_T0);
+                _mm_prefetch((const char *) (x[k] + i) + pf + 64, _MM_HINT_T0);
             }
         }
-        for (int t = 0; t < NT; ++t) { out[t][r - r0] = F::K * hsum(accf[t]); }
+        __m256i acc[R][NT];
+        for (int k = 0; k < R; ++k) { for (int t = 0; t < NT; ++t) { acc[k][t] = _mm256_setzero_si256(); } }
+        for (int c = 0; c < 8; ++c) {
+            __m256i q[NT];
+            for (int t = 0; t < NT; ++t) { q[t] = _mm256_loadu_si256((const __m256i *) (y[t][i].qs + 32 * c)); }
+            for (int k = 0; k < R; ++k) {
+                __m256i g, s, sc;
+                F::dec(x[k] + i, c, g, s, sc);
+                for (int t = 0; t < NT; ++t) {
+                    acc[k][t] = _mm256_add_epi32(acc[k][t], _mm256_madd_epi16(_mm256_maddubs_epi16(g, _mm256_sign_epi8(q[t], s)), sc));
+                }
+            }
+        }
+        for (int k = 0; k < R; ++k) {
+            const float dx = _cvtsh_ss(x[k][i].d);
+            for (int t = 0; t < NT; ++t) {
+                accf[k][t] = _mm256_fmadd_ps(_mm256_set1_ps(dx * y[t][i].d), _mm256_cvtepi32_ps(acc[k][t]), accf[k][t]);
+            }
+        }
     }
+    for (int k = 0; k < R; ++k) { for (int t = 0; t < NT; ++t) { out[t][r + k - r0] = F::K * hsum(accf[k][t]); } }
+}
+
+// rows [r0, r1) of one expert for NT tokens, R rows per tile
+template <class F, int NT, int R>
+void rows(const char * w, size_t row_bytes, int64_t r0, int64_t r1, int nb, const block_q8_K * const * y,
+        float * const * out, int pf) {
+    int64_t r = r0;
+    for (; r + R <= r1; r += R) { tile<F, NT, R>(w, row_bytes, r, r0, nb, y, out, pf); }
+    for (; r < r1; ++r) { tile<F, NT, 1>(w, row_bytes, r, r0, nb, y, out, pf); }
 }
 
 typedef void (*rows_fn)(const char *, size_t, int64_t, int64_t, int, const block_q8_K * const *, float * const *, int);
 
-template <class F> rows_fn pick(int nt) {
+// two_rows: one token runs two rows per tile (the activation load is shared and the two rows' work interleaves)
+template <class F> rows_fn pick(int nt, bool two_rows) {
     switch (nt) {
-        case 1: return rows<F, 1>;
-        case 2: return rows<F, 2>;
-        case 3: return rows<F, 3>;
-        case 4: return rows<F, 4>;
+        case 1: return two_rows ? rows<F, 1, 2> : rows<F, 1, 1>;
+        case 2: return rows<F, 2, 1>;
+        case 3: return rows<F, 3, 1>;
+        case 4: return rows<F, 4, 1>;
         default: return nullptr;
     }
 }
 
-// The kernel for `type` and nt tokens (1..4), or null when the type has none.
-inline rows_fn get(int type, int nt) {
+// The kernel for `type` and nt tokens (1..4), or null when the type has none. variant bit 0: IQ3 grid entries
+// joined in general registers (the _pair decodes); bit 1: two rows per tile for one token.
+inline rows_fn get(int type, int nt, int variant = 0) {
+    const bool pair = variant & 1, two = (variant & 2) != 0;
     switch (type) {
-        case GGML_TYPE_IQ2_XXS: return pick<f_iq2_xxs>(nt);
-        case GGML_TYPE_IQ2_XS:  return pick<f_iq2_xs>(nt);
-        case GGML_TYPE_IQ2_S:   return pick<f_iq2_s>(nt);
-        case GGML_TYPE_IQ3_XXS: return pick<f_iq3_xxs>(nt);
-        case GGML_TYPE_IQ3_S:   return pick<f_iq3_s>(nt);
+        case GGML_TYPE_IQ2_XXS: return pick<f_iq2_xxs>(nt, two);
+        case GGML_TYPE_IQ2_XS:  return pick<f_iq2_xs>(nt, two);
+        case GGML_TYPE_IQ2_S:   return pick<f_iq2_s>(nt, two);
+        case GGML_TYPE_IQ3_XXS: return pair ? pick<f_iq3_xxs_pair>(nt, two) : pick<f_iq3_xxs>(nt, two);
+        case GGML_TYPE_IQ3_S:   return pair ? pick<f_iq3_s_pair>(nt, two) : pick<f_iq3_s>(nt, two);
         default: return nullptr;
     }
 }

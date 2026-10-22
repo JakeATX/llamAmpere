@@ -7,8 +7,9 @@
 // (the kernels do the same integer work in the same lanes and the same float steps). Exit code 1 on any difference.
 // Speed: one pinned thread per listed cpu, each with its own `copies` experts (cold: they rotate, far more than the
 // last-level cache, as a decode's missed experts do; hot: one expert repeats). Prints us per expert projection and
-// the summed GB/s of weights read, for ggml (vec_dot once per row per token) and the row kernels with prefetch off
-// and at 2048 B.
+// the summed GB/s of weights read, for ggml (vec_dot once per row per token) and the row kernels: variants 0-3
+// (bit 0: IQ3 grid pairs in general registers, bit 1: two rows per tile for one token) without prefetch, and
+// variant 0 with prefetch 2048 B.
 #include "../ggml/src/ggml-cuda/moe-cpu-split.h"
 #include "ggml.h"
 #include "ggml-cpu.h"
@@ -57,11 +58,13 @@ int main(int argc, char ** argv) {
     const int64_t n_in = 2560, n_out = 640;
     const int NT = 4;
     const ggml_type types[] = { GGML_TYPE_IQ3_S, GGML_TYPE_IQ2_S, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ3_XXS };
-    const int pfs[] = { 0, 2048 };
+    const int NM = 6;                                   // ggml + 5 row-kernel settings
+    const int var_of[NM] = { -1, 0, 1, 2, 3, 0 };
+    const int pf_of[NM] = { 0, 0, 0, 0, 0, 2048 };
     long long bad_total = 0;
     printf("threads %zu, %d expert copies per thread\n", cpus.size(), copies);
-    printf("  %-8s nt | %-26s | %-26s | %-26s | bits differing (rows pf0 / pf2048)\n", "type", "ggml cold/hot us, GB/s",
-           "rows pf 0", "rows pf 2048");
+    printf("  %-8s nt | %-24s | %-24s | %-24s | %-24s | %-24s | %-24s | outputs with other bits\n", "type",
+           "ggml cold/hot us GB/s", "v0", "v1 pair", "v2 2-row", "v3 pair+2-row", "v0 pf2048");
     for (ggml_type type : types) {
         const auto * tr = ggml_get_type_traits_cpu(type);
         const size_t row_bytes = ggml_row_size(type, n_in);
@@ -94,7 +97,7 @@ int main(int argc, char ** argv) {
                 tr->vec_dot((int) n_in, &ref[(size_t) t * n_out + r], 0, q.data() + r * row_bytes, 0, actp[t], 0, 1);
             }
         }
-        // m = 0: ggml; m = 1, 2: row kernels with prefetch pfs[m - 1]
+        // m = 0: ggml; m >= 1: row kernel variant var_of[m], prefetch pf_of[m]
         auto run = [&](int m, const uint8_t * wp, int nt, float * const * out) {
             if (m == 0) {
                 for (int t = 0; t < nt; ++t) {
@@ -104,16 +107,16 @@ int main(int argc, char ** argv) {
                 }
                 return true;
             }
-            return moe_cs_iq_rows((int) type, nt, wp, row_bytes, 0, n_out, n_in, actp, out, pfs[m - 1]);
+            return moe_cs_iq_rows((int) type, nt, wp, row_bytes, 0, n_out, n_in, actp, out, pf_of[m], var_of[m]);
         };
         for (int nt = 1; nt <= NT; ++nt) {
             printf("  %-8s %2d |", ggml_type_name(type), nt);
-            long long bad[3] = { 0, 0, 0 };
-            for (int m = 0; m < 3; ++m) {
+            long long bad[NM] = {};
+            for (int m = 0; m < NM; ++m) {
                 std::vector<float> o((size_t) NT * n_out, -1.0f);
                 float * op[NT];
                 for (int t = 0; t < NT; ++t) { op[t] = o.data() + (size_t) t * n_out; }
-                if (!run(m, q.data(), nt, op)) { printf(" %-26s |", "no kernel"); bad[m] = -1; continue; }
+                if (!run(m, q.data(), nt, op)) { printf(" %-24s |", "no kernel"); bad[m] = -1; continue; }
                 for (int t = 0; t < nt; ++t) {
                     for (int64_t r = 0; r < n_out; ++r) {
                         bad[m] += memcmp(&op[t][r], &ref[(size_t) t * n_out + r], sizeof(float)) != 0;
@@ -146,11 +149,14 @@ int main(int argc, char ** argv) {
                     us[hot] = *std::max_element(secs.begin(), secs.end()) / reps * 1e6;
                 }
                 char buf[64];
-                snprintf(buf, sizeof(buf), "%6.1f/%6.1f %5.1f GB/s", us[0], us[1], nth * bytes / us[0] / 1e3);
-                printf(" %-26s |", buf);
+                snprintf(buf, sizeof(buf), "%6.1f/%6.1f %5.1f", us[0], us[1], nth * bytes / us[0] / 1e3);
+                printf(" %-24s |", buf);
             }
-            printf(" %lld / %lld\n", bad[1], bad[2]);
-            bad_total += std::max(0LL, bad[1]) + std::max(0LL, bad[2]) + (bad[1] < 0 || bad[2] < 0 ? 1 : 0);
+            for (int m = 1; m < NM; ++m) {
+                printf(" %lld", bad[m]);
+                bad_total += bad[m] < 0 ? 1 : bad[m];
+            }
+            printf("\n");
             fflush(stdout);
         }
         for (auto & v : ex) { for (auto * d : v) { free(d); } }
