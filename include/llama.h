@@ -956,7 +956,8 @@ extern "C" {
     LLAMA_API bool llama_sj_kvarn_prefill_cut(struct llama_context * ctx, llama_seq_id seq_id, llama_pos pos);
 
     // [#240] For a state blob saved with LLAMA_STATE_SEQ_FLAGS_SJ_EXACT: the sealed end it restores (written in its last
-    // bytes) and, in *pos_end, its position n. -1 when the blob carries no SJ-KVaRN exact section. The restore needs the
+    // bytes) and, in *pos_end, its cell count n (the position end for text; M-RoPE image tokens share a position, so
+    // the cell count is larger after an image). -1 when the blob carries no SJ-KVaRN exact section. The restore needs the
     // live cache to still hold the sealed records below that end (llama_sj_kvarn_seq_sealed_end() >= the result).
     LLAMA_API int32_t llama_sj_kvarn_ckpt_sealed_end(const uint8_t * data, size_t size, llama_pos * pos_end);
 
