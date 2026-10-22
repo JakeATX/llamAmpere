@@ -9939,6 +9939,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             }
 #endif
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+            ggml_cuda_moe_cache_cs_graph_scan(*cuda_ctx, cgraph);   // fork STRATAGAP (no-op unless GGML_MOE_CPU_SPLIT=1)
+#endif
+
             // The graph order is now final. Build one shared deadline queue
             // per KV runtime before issuing any attention work.
             const auto kv_stream_runtimes = ggml_cuda_kv_stream_prepare_graph(
