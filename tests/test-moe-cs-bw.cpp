@@ -184,6 +184,14 @@ int main(int argc, char ** argv) {
             double cns, cph[4], hns, hph[4];
             moe_cs_bench(l, all.data(), n_expert, ne, 400, &cns, cph);
             moe_cs_bench(l, all.data(), ne, ne, 400, &hns, hph);
+            if (ne == 8) {   // output check: compare this line between runs with and without a switch
+                double sum = 0.0, sabs = 0.0;
+                for (int q = 0; q < ne; ++q) {
+                    for (int64_t r = 0; r < n_embd; ++r) { const double v = out[(size_t) q * out_stride + r]; sum += v; sabs += v < 0 ? -v : v; }
+                }
+                printf("  check %s/%s: sum %.6e  sum|x| %.6e  out[0] %.6e out[777] %.6e\n", ggml_type_name(specs[l].up),
+                       ggml_type_name(specs[l].down), sum, sabs, out[0], out[777]);
+            }
             printf("  %-8s %-7s %5d | %10.1f %9.1f (%5.1f) %8.1f (%5.1f) | %10.1f %9.1f (%5.1f) %8.1f (%5.1f)\n",
                    ggml_type_name(specs[l].up), ggml_type_name(specs[l].down), ne,
                    cns / 1e3, cph[1] / 1e3, ne * ug_bytes / cph[1], cph[3] / 1e3, ne * dn_bytes / cph[3],
