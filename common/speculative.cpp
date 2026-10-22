@@ -3354,6 +3354,24 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 if (dp.conf_p1) {
                     spec_conf_push_candidates(dp, cur_p, ctx_dft, i_last[seq_id]);
                 }
+                {
+                    // [RTPORT] LLAMA_MTP_Q_DUMP=<file> (diagnostic, default off): every guess step's sampling
+                    // distribution, to measure the KL of a valid-math helper change between two same-seed runs
+                    static FILE * q_dump = [] {
+                        const char * path = getenv("LLAMA_MTP_Q_DUMP");
+                        return path && *path ? fopen(path, "w") : nullptr;
+                    }();
+                    if (q_dump) {
+                        fprintf(q_dump, "%d %d %d %d", seq_id, dp.pos0 + i, i, id);
+                        for (size_t k = 0; k < cur_p->size; ++k) {
+                            if (cur_p->data[k].p > 0.0f) {
+                                fprintf(q_dump, " %d:%.9g", cur_p->data[k].id, cur_p->data[k].p);
+                            }
+                        }
+                        fputc('\n', q_dump);
+                        fflush(q_dump);
+                    }
+                }
 
                 if (cdepth) {
                     // CDEPTH: stop before the next draft step when one more token is not expected to pay for itself.
