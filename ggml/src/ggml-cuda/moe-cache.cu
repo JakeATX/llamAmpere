@@ -9390,13 +9390,19 @@ bool ggml_cuda_moe_cache_device_compute(ggml_backend_cuda_context & ctx, ggml_te
         // Resident routes first, then the routes whose experts were just copied; together they compute
         // every route exactly once with the same kernel.
         const int64_t ids_stride = ids->nb[1] / sizeof(int32_t);
-        const bool hit_ok = ggml_cuda_moe_table_mmv_filtered(table.device, (ggml_type) table.desc.type, quantized,
+        const bool hit_ok = ggml_cuda_moe_table_mmv_d1_try(ctx, table.device, (ggml_type) table.desc.type, quantized,
+                (const int32_t *) ids->data, (float *) op->data, a->ne[0], op->ne[0], ids->ne[0], ids->ne[1], a->ne[1],
+                ids_stride, table.hot, 1) ||
+            ggml_cuda_moe_table_mmv_filtered(table.device, (ggml_type) table.desc.type, quantized,
                 (const int32_t *) ids->data, (float *) op->data, a->ne[0], op->ne[0], ids->ne[0], ids->ne[1], a->ne[1],
                 ids_stride, table.hot, 1, ctx.stream());
         GGML_ASSERT(hit_ok);
         CUDA_CHECK(cudaGetLastError());
         const void * const * eff = moe_hf_wait(ctx, session, table);
-        const bool miss_ok = ggml_cuda_moe_table_mmv_filtered(eff, (ggml_type) table.desc.type, quantized,
+        const bool miss_ok = ggml_cuda_moe_table_mmv_d1_try(ctx, eff, (ggml_type) table.desc.type, quantized,
+                (const int32_t *) ids->data, (float *) op->data, a->ne[0], op->ne[0], ids->ne[0], ids->ne[1], a->ne[1],
+                ids_stride, table.hot, 0) ||
+            ggml_cuda_moe_table_mmv_filtered(eff, (ggml_type) table.desc.type, quantized,
                 (const int32_t *) ids->data, (float *) op->data, a->ne[0], op->ne[0], ids->ne[0], ids->ne[1], a->ne[1],
                 ids_stride, table.hot, 0, ctx.stream());
         GGML_ASSERT(miss_ok);
@@ -9407,7 +9413,10 @@ bool ggml_cuda_moe_cache_device_compute(ggml_backend_cuda_context & ctx, ggml_te
     const void * const * mmv_table = moe_cache_resolve_table(ctx, session, table, ids, effective);
     if (!ggml_cuda_moe_table_mmv_grouped_try(ctx, mmv_table, nullptr, (ggml_type)table.desc.type, quantized,
             (const int32_t *)ids->data, (float *)op->data, a->ne[0], op->ne[0], ids->ne[0], ids->ne[1],
-            a->ne[1], ids->nb[1] / sizeof(int32_t))) {
+            a->ne[1], ids->nb[1] / sizeof(int32_t)) &&
+        !ggml_cuda_moe_table_mmv_d1_try(ctx, mmv_table, (ggml_type)table.desc.type, quantized,
+            (const int32_t *)ids->data, (float *)op->data, a->ne[0], op->ne[0], ids->ne[0], ids->ne[1],
+            a->ne[1], ids->nb[1] / sizeof(int32_t), nullptr, 0)) {
         ggml_cuda_moe_table_mmv(mmv_table, (ggml_type)table.desc.type, quantized,
                 (const int32_t *)ids->data, (float *)op->data,
                 a->ne[0], op->ne[0], ids->ne[0], ids->ne[1], a->ne[1], ids->nb[1] / sizeof(int32_t), ctx.stream());

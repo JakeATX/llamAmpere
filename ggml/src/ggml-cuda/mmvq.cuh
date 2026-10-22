@@ -74,6 +74,12 @@ bool ggml_cuda_moe_table_mmv_grouped_try(ggml_backend_cuda_context & ctx,
         const void * const * table, const void * const * gate_table, ggml_type type,
         const char * act_q8, const int32_t * ids, float * dst,
         int64_t n_in, int64_t n_out, int64_t n_ids, int64_t n_tokens, int64_t channels, int64_t ids_stride);
+// [VBEAT D1] decode-once expert kernel (GGML_MOE_MMV_D1); bitwise the plain table kernel. route_hot == nullptr runs
+// every route, otherwise only the routes whose residency matches route_want_hot. false launches nothing.
+bool ggml_cuda_moe_table_mmv_d1_try(ggml_backend_cuda_context & ctx,
+        const void * const * table, ggml_type type, const char * act_q8, const int32_t * ids, float * dst,
+        int64_t n_in, int64_t n_out, int64_t n_ids, int64_t n_tokens, int64_t channels, int64_t ids_stride,
+        const uint8_t * route_hot, int route_want_hot);
 // Selected-expert decode down projection and router-weighted reduction.
 bool ggml_cuda_moe_sum_type_supported(ggml_type type);
 
