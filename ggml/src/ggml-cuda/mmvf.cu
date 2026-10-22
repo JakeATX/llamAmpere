@@ -869,6 +869,24 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const
         }
     }
 
+    // [NARROWMMVF] GGML_CUDA_NARROW_MMVF=1: on NVIDIA, a narrow 2-D weight (<= 1024 rows) at 2..8 columns
+    // goes to the vector kernel instead of the tensor-core GEMM. The GEMM tiles 32 rows per block, so a
+    // 320- or 512-row weight runs on 10-16 blocks of an 84-SM card (the qwen4exp hyper-connection down
+    // projection and the MoE router: 14-28 us each at 5 columns); the vector kernel puts one block on
+    // every row. Same f32 sums, but src1 stays f32 instead of being rounded to the weight type first,
+    // so the logits move by rounding (valid math, checked with KLD). Default off.
+    {
+        static const bool narrow = [] {
+            const char * e = getenv("GGML_CUDA_NARROW_MMVF");
+            return e != nullptr && atoi(e) != 0;
+        }();
+        if (narrow && GGML_CUDA_CC_IS_NVIDIA(cc) && src0_ne[1] <= 1024 && src0_ne[2]*src0_ne[3] == 1 &&
+            ne11 <= MMVF_MAX_BATCH_SIZE &&
+            (type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16)) {
+            return true;
+        }
+    }
+
     switch (type) {
         case GGML_TYPE_F32:
             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {

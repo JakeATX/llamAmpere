@@ -11966,6 +11966,132 @@ void ggml_compute_forward_dsv4_hc_pre(
     }
 }
 
+// ggml_compute_forward_dsv4_hc_down / ggml_compute_forward_dsv4_hc_up ([HCFUSED], reference path)
+
+// r[s, t] = 1/sqrt(mean_i x[i, s, t]^2 + eps), the rms_norm scale of one stream row
+static float dsv4_hc_fused_row_scale(const ggml_tensor * x, int64_t s, int64_t t, float eps) {
+    const int64_t n_embd = x->ne[0];
+    const float * xr = (const float *) ((const char *) x->data + s*x->nb[1] + t*x->nb[2]);
+    ggml_float sum = 0.0;
+    for (int64_t i = 0; i < n_embd; ++i) {
+        sum += (ggml_float) (xr[i] * xr[i]);
+    }
+    return 1.0f / sqrtf((float) (sum / n_embd) + eps);
+}
+
+void ggml_compute_forward_dsv4_hc_down(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * x        = dst->src[0];
+    const ggml_tensor * w_norm   = dst->src[1];
+    const ggml_tensor * w_down   = dst->src[2];
+    const ggml_tensor * w_inject = dst->src[3];
+
+    const float   eps       = ggml_get_op_params_f32(dst, 0);
+    const int32_t hc_inj    = ggml_get_op_params_i32(dst, 1);
+    const float   lo_scale  = ggml_get_op_params_f32(dst, 2);
+    const float   inj_scale = ggml_get_op_params_f32(dst, 3);
+
+    const int64_t n_embd = x->ne[0];
+    const int64_t hc     = x->ne[1];
+    const int64_t T      = x->ne[2];
+    const int64_t R      = w_down->ne[1];
+    const int64_t n_rows = R + hc_inj;
+
+    GGML_ASSERT(T <= 64);
+    float r[64*8];
+    GGML_ASSERT(hc <= 8);
+    for (int64_t t = 0; t < T; ++t) {
+        for (int64_t s = 0; s < hc; ++s) {
+            r[t*hc + s] = dsv4_hc_fused_row_scale(x, s, t, eps);
+        }
+    }
+
+    float * out = (float *) dst->data;
+    if (params->ith == 0) {
+        for (int64_t t = 0; t < T; ++t) {
+            for (int64_t s = 0; s < hc; ++s) {
+                out[(R + hc_inj)*T + t*hc + s] = r[t*hc + s];
+            }
+        }
+    }
+
+    const int     nth = params->nth;
+    const int64_t dr  = (n_rows + nth - 1) / nth;
+    const int64_t k0  = dr * params->ith;
+    const int64_t k1  = MIN(k0 + dr, n_rows);
+
+    for (int64_t k = k0; k < k1; ++k) {
+        const ggml_tensor * w = k < R ? w_down : w_inject;
+        const int64_t       kr = k < R ? k : k - R;
+        const ggml_bf16_t * wr = (const ggml_bf16_t *) ((const char *) w->data + kr*w->nb[1]);
+
+        for (int64_t t = 0; t < T; ++t) {
+            float total = 0.0f;
+            for (int64_t s = 0; s < hc; ++s) {
+                const float * xr = (const float *) ((const char *) x->data + s*x->nb[1] + t*x->nb[2]);
+                const float * gr = (const float *) ((const char *) w_norm->data + s*w_norm->nb[1]);
+                float acc = 0.0f;
+                for (int64_t i = 0; i < n_embd; ++i) {
+                    acc += GGML_BF16_TO_FP32(wr[s*n_embd + i]) * (xr[i] * gr[i]);
+                }
+                total += r[t*hc + s] * acc;
+            }
+            if (k < R) {
+                const float v = lo_scale * total;
+                out[t*R + k] = v / (1.0f + expf(-v));
+            } else {
+                out[R*T + t*hc_inj + kr] = 2.0f / (1.0f + expf(-inj_scale * total));
+            }
+        }
+    }
+}
+
+void ggml_compute_forward_dsv4_hc_up(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * x      = dst->src[0];
+    const ggml_tensor * w_norm = dst->src[1];
+    const ggml_tensor * down   = dst->src[2];
+    const ggml_tensor * w_up   = dst->src[3];
+
+    const float   out_scale = ggml_get_op_params_f32(dst, 0);
+    const int32_t hc_inj    = ggml_get_op_params_i32(dst, 1);
+
+    const int64_t n_embd = x->ne[0];
+    const int64_t hc     = x->ne[1];
+    const int64_t T      = x->ne[2];
+    const int64_t R      = w_up->ne[0];
+
+    const float * act = (const float *) down->data;                   // [R, T]
+    const float * r   = (const float *) down->data + (R + hc_inj)*T;  // [hc, T]
+
+    const int     nth = params->nth;
+    const int64_t dr  = (n_embd + nth - 1) / nth;
+    const int64_t i0  = dr * params->ith;
+    const int64_t i1  = MIN(i0 + dr, n_embd);
+
+    for (int64_t t = 0; t < T; ++t) {
+        const float * at = act + t*R;
+        float * dt = (float *) ((char *) dst->data + t*dst->nb[1]);
+        for (int64_t i = i0; i < i1; ++i) {
+            float sum = 0.0f;
+            for (int64_t s = 0; s < hc; ++s) {
+                const ggml_bf16_t * wr = (const ggml_bf16_t *) ((const char *) w_up->data + (s*n_embd + i)*w_up->nb[1]);
+                float g = 0.0f;
+                for (int64_t k = 0; k < R; ++k) {
+                    g += GGML_BF16_TO_FP32(wr[k]) * at[k];
+                }
+                const float xv = *(const float *) ((const char *) x->data + i*x->nb[0] + s*x->nb[1] + t*x->nb[2]);
+                const float gv = *(const float *) ((const char *) w_norm->data + i*w_norm->nb[0] + s*w_norm->nb[1]);
+                const float xn = (xv * r[t*hc + s]) * gv;
+                sum += xn / (1.0f + expf(-g));
+            }
+            dt[i] = out_scale * sum;
+        }
+    }
+}
+
 // ggml_compute_forward_dsv4_hc_post
 
 static void ggml_compute_forward_dsv4_hc_post_f32(

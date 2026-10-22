@@ -646,6 +646,8 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_DSV4_HC_DOWN,
+        GGML_OP_DSV4_HC_UP,
 
         GGML_OP_UNARY,
 
@@ -2942,6 +2944,36 @@ extern "C" {
             struct ggml_tensor  * residual,
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
+
+    // [HCFUSED] Flash-Next hyper-connection mix in two ops (LLAMA_HC_FUSED=1 in the model, default off).
+    // Same math as rms_norm(x)*w_norm -> W_down -> scale -> silu -> W_up -> gated mean, plus the W_inject scatter
+    // weights, with the per-stream norm folded into the down pass and the gate folded into the up pass.
+    //
+    // hc_down: x [n_embd, hc, T] f32, w_norm [n_embd, hc] f32, w_down [hc*n_embd, R] bf16,
+    //          w_inject [hc*n_embd, hc] bf16 or NULL  ->  1-D f32 of (R + hc_inj + hc)*T, hc_inj = w_inject ? hc : 0
+    //   xn[s*n_embd + i, t] = x[i, s, t] * r[s, t] * w_norm[i, s],  r[s, t] = 1/sqrt(mean_i x[i, s, t]^2 + eps)
+    //   segment 0, [R, T]:      act[k, t] = silu(lo_scale * sum_j w_down[j, k] * xn[j, t])
+    //   segment 1, [hc_inj, T]: inj[h, t] = 2*sigmoid(inj_scale * sum_j w_inject[j, h] * xn[j, t])
+    //   segment 2, [hc, T]:     r[s, t]
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_down(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * w_norm,
+            struct ggml_tensor  * w_down,
+            struct ggml_tensor  * w_inject,
+            float                 eps,
+            float                 lo_scale,
+            float                 inj_scale);
+
+    // hc_up: x, w_norm as above, down = the hc_down result, w_up [R, hc*n_embd] bf16 -> [n_embd, T] f32
+    //   result[i, t] = out_scale * sum_s xn[s*n_embd + i, t] * sigmoid(sum_k w_up[k, s*n_embd + i] * act[k, t])
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_up(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * w_norm,
+            struct ggml_tensor  * down,
+            struct ggml_tensor  * w_up,
+            float                 out_scale);
 
     // custom operators
 
