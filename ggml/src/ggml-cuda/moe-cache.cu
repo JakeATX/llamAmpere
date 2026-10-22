@@ -9799,7 +9799,9 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
         const size_t available = moe_cache_mem_available();
         MOE_CACHE_LOG("[moe-cache] device preflight: hot=%zu MiB map=%zu MiB nonresident=%zu MiB ranges=%zu available=%zu MiB\n",
                 hot_bytes >> 20, pin_bytes >> 20, new_bytes >> 20, ranges.size(), available >> 20);
-        if (pin_bytes > SIZE_MAX - floor - margin || available < pin_bytes + floor + margin ||
+        // The RAM floor guards new pinning only: with no ranges there is nothing to pin, so a host just under
+        // 7 GiB free must not fall back to legacy host routing (~35% slower writing at home, 2026-10-22).
+        if (pin_bytes > SIZE_MAX - floor - margin || (!ranges.empty() && available < pin_bytes + floor + margin) ||
                 new_bytes > SIZE_MAX - margin || !moe_cache_cgroup_headroom(new_bytes + margin, retained_registered)) {
             MOE_CACHE_LOG("[moe-cache] device tables skipped: pinning would exceed RAM floor or service headroom\n");
             return fail();
