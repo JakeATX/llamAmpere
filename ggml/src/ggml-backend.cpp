@@ -3170,10 +3170,14 @@ struct ggml_sched_vf_stats {
     const char * first[MAX_SPLITS] = {};
     int n_splits = 0;
     uint64_t slow_leave = 0; double slow_leave_ms = 0;
+    bool one_row = false;
 };
+static int ggml_sched_vf_timing_level() {
+    static const int lvl = getenv("GGML_SCHED_VF_TIMING") != nullptr ? atoi(getenv("GGML_SCHED_VF_TIMING")) : 0;
+    return lvl;
+}
 static bool ggml_sched_vf_timing() {
-    static const bool on = getenv("GGML_SCHED_VF_TIMING") != nullptr && atoi(getenv("GGML_SCHED_VF_TIMING")) != 0;
-    return on;
+    return ggml_sched_vf_timing_level() != 0;
 }
 static thread_local ggml_sched_vf_stats * t_vf_cur = nullptr;
 static thread_local int64_t t_vf_mark = 0;
@@ -3197,18 +3201,22 @@ static ggml_sched_vf_stats * ggml_sched_vf_select(ggml_backend_sched_t sched) {
             }
         }
     }
-    if (total <= 1000 || !gr || gr->ne[1] > 128) {
+    // level 2 also times the small helper graphs (>100 nodes), with 1-row graphs kept in their own bucket
+    const bool small = ggml_sched_vf_timing_level() >= 2;
+    if (total <= (small ? 100 : 1000) || !gr || gr->ne[1] > 128) {
         return nullptr;
     }
+    const void * key = small && gr->ne[1] == 1 ? (const void *) ((const char *) sched + 1) : (const void *) sched;
     static std::mutex mu;
-    static std::vector<std::pair<ggml_backend_sched_t, ggml_sched_vf_stats *>> all;
+    static std::vector<std::pair<const void *, ggml_sched_vf_stats *>> all;
     std::lock_guard<std::mutex> lock(mu);
     for (auto & e : all) {
-        if (e.first == sched) {
+        if (e.first == key) {
             return e.second;
         }
     }
-    all.emplace_back(sched, new ggml_sched_vf_stats());
+    all.emplace_back(key, new ggml_sched_vf_stats());
+    all.back().second->one_row = key != (const void *) sched;
     return all.back().second;
 }
 static void ggml_sched_vf_report(ggml_backend_sched_t sched, ggml_sched_vf_stats & st) {
@@ -3218,8 +3226,8 @@ static void ggml_sched_vf_report(ggml_backend_sched_t sched, ggml_sched_vf_stats
     const double n = (double) st.calls;
     std::string line;
     char buf[256];
-    snprintf(buf, sizeof(buf), "vfloor sched (GGML_SCHED_VF_TIMING) sched %p, %llu calls, ms/call: enter %.3f devcheck %.3f xs-begin %.3f leave %.3f (calls with leave>1ms: %llu, %.1f ms each) total %.3f; splits:",
-            (void *) sched, (unsigned long long) st.calls, st.enter/n, st.devcheck/n, st.xs/n, st.leave/n,
+    snprintf(buf, sizeof(buf), "vfloor sched (GGML_SCHED_VF_TIMING) sched %p%s, %llu calls, ms/call: enter %.3f devcheck %.3f xs-begin %.3f leave %.3f (calls with leave>1ms: %llu, %.1f ms each) total %.3f; splits:",
+            (void *) sched, st.one_row ? " 1-row" : "", (unsigned long long) st.calls, st.enter/n, st.devcheck/n, st.xs/n, st.leave/n,
             (unsigned long long) st.slow_leave, st.slow_leave ? st.slow_leave_ms/st.slow_leave : 0.0, st.total/n);
     line += buf;
     for (int i = 0; i < st.n_splits && i < ggml_sched_vf_stats::MAX_SPLITS; ++i) {
