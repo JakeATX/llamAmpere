@@ -3730,12 +3730,18 @@ void llama_context::mtp_handoff_capture(ggml_tensor * hidden, const llama_ubatch
     auto & stage = mtp_hidden;
     auto * backend = ggml_backend_sched_get_tensor_backend(sched.get(), hidden);
     GGML_ASSERT(backend && ubatch.data && hidden->ne[1] == ubatch.n_tokens && ubatch.n_tokens <= cparams.n_ubatch);
+    // [SPPEAK] size the staging by the ubatches this call really runs (plus the carry row), not by -ub: a 3,073..16,383
+    // token prompt runs 2,048-row chunks while -ub can be 12,288, so the full -ub ring held 480 MiB of which 400 MiB was
+    // never touched, and it landed on top of a full MoE cache. A later, larger ubatch regrows it (rare: checkpoint cuts).
+    if (stage.rows && stage.rows->ne[1] < (int64_t) ubatch.n_tokens + 1) {
+        mtp_handoff_release();
+    }
     if (!stage.rows) {
         stage.ctx.reset(ggml_init({ggml_tensor_overhead(), nullptr, true}));
         if (!stage.ctx) {
             throw std::runtime_error("failed to create MTP handoff staging context");
         }
-        stage.rows = ggml_new_tensor_2d(stage.ctx.get(), GGML_TYPE_F32, hidden->ne[0], (int64_t) cparams.n_ubatch + 1);
+        stage.rows = ggml_new_tensor_2d(stage.ctx.get(), GGML_TYPE_F32, hidden->ne[0], (int64_t) ubatch.n_tokens + 1);
         stage.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(stage.ctx.get(), ggml_backend_get_default_buffer_type(backend)));
         if (!stage.buf) {
             throw std::runtime_error("failed to allocate MTP handoff staging buffer");
