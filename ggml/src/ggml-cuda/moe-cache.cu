@@ -8593,7 +8593,7 @@ static __global__ void moe_hf_plan_kernel(const moe_hf_plan_args args, const int
 #define MOE_HF_FAST_MAX_EXPERT 1024
 
 static bool moe_hf_plan_fast_enabled() {
-    static const bool on = [] { const char * v = getenv("GGML_MOE_HF_PLAN_FAST"); return v && atoi(v) != 0; }();
+    static const bool on = [] { const char * v = getenv("GGML_MOE_HF_PLAN_FAST"); return v == nullptr || atoi(v) != 0; }();
     return on;
 }
 

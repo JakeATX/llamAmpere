@@ -65,7 +65,7 @@ llama_memory_recurrent::llama_memory_recurrent(
         this->rs_ring_rows_all = this->rs_ring && env_rows != nullptr && strcmp(env_rows, "1") == 0;
         const char * env_skip = getenv("LLAMA_RS_SHIFT_SKIP");
         this->rs_shift_skip = n_rs_seq > 0 && !this->rs_ring && !this->gdn_replay &&
-                              env_skip != nullptr && strcmp(env_skip, "0") != 0;
+                              (env_skip == nullptr || strcmp(env_skip, "0") != 0);
         if (n_rs_seq > 0) {
             // one line so A/B cells can confirm the rollback layout from the server log
             LLAMA_LOG_INFO("%s: rollback layout = %s (n_rs_seq %u%s%s%s)\n", __func__,

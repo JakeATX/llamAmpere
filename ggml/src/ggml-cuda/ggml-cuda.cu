@@ -5403,7 +5403,7 @@ static int32_t ggml_cuda_gdn_state_read_uses(const ggml_cgraph * cgraph, const g
 // With the switch, readers that are empty tensors do not count, and empty nodes between the gather and the gdn
 // (they write zero bytes) do not fail the overlap check.
 static bool ggml_cuda_gdn_state_read_empty_ok() {
-    static const bool on = [] { const char * e = getenv("GGML_CUDA_GDN_STATE_READ_EMPTY"); return e != nullptr && atoi(e) != 0; }();
+    static const bool on = [] { const char * e = getenv("GGML_CUDA_GDN_STATE_READ_EMPTY"); return e == nullptr || atoi(e) != 0; }();
     return on;
 }
 
@@ -9246,7 +9246,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 //    moved nodes in order on the main stream.
 // Same kernels on the same inputs in the same order within each stream: the output is bit-identical.
 static bool ggml_cuda_shexp_side_enabled() {
-    static const bool on = [] { const char * e = getenv("GGML_CUDA_SHEXP_SIDE"); return e != nullptr && atoi(e) != 0; }();
+    static const bool on = [] { const char * e = getenv("GGML_CUDA_SHEXP_SIDE"); return e == nullptr || atoi(e) != 0; }();
     return on;
 }
 static bool ggml_cuda_shexp_side_debug() {
