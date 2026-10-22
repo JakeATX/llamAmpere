@@ -440,6 +440,7 @@ llama_build_and_test(test-backend-ops.cpp)
 llama_build_and_test(test-fattn-prefill-policy.cpp)
 llama_build_and_test(test-fa-skip-dead.cpp) # [ROUNDFIX] dead-tile skip bit-identity; skips without a GPU backend
 llama_build_and_test(test-topk-select-fast.cpp) # [ROUNDFIX] fast radix select bit-identity; skips without a GPU backend
+llama_build_and_test(test-lid-gather.cpp) # [ROUNDFIX] pooled-key gather read in place, bit-identity; skips without a GPU backend
 llama_build_and_test(test-mtp-vocab.cpp)
 llama_build_and_test(test-mtp-vocab-builtin.cpp ../src/llama-mtp-vocab-builtin.cpp)
 llama_build_and_test(test-gdn-replay-split.cpp)

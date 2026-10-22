@@ -4728,7 +4728,68 @@ static void ggml_cuda_vf_timing_add(const ggml_cgraph * cgraph, int phase, int64
     }
 }
 
+// [ROUNDFIX] GGML_CUDA_COMPAT_FAST=1: the same answer as ggml_cuda_graph_check_compability below, cheaper per node.
+// The plain walk asks the runtime for the current device for every node (cudaGetDevice, twice per node) and looks up a
+// KV streaming runtime for every node and source, which costs ~0.4 ms per call on a 5,000-node verify graph. Here:
+//  - the device and its compute capability are read once (nothing in the walk changes the device);
+//  - the MoE device-table check runs only for MUL_MAT_ID nodes (it returns false for every other op);
+//  - the KV streaming lookups are skipped while no streaming runtime exists (no tensor can then reference one, see
+//    the comment in ggml_cuda_graph_update_required), exactly as before otherwise.
+static bool ggml_cuda_graph_check_compability_plain(ggml_cgraph * cgraph);
+static bool ggml_cuda_graph_check_compability_fast(ggml_cgraph * cgraph) {
+    const int  device = ggml_cuda_get_device();
+    const int  cc     = ggml_cuda_info().devices[device].cc;
+    const bool device_cache_capture = ggml_cuda_moe_cache_device_capture_generation(device) != 0;
+    const bool kv_stream = g_kv_stream_runtime_count.load(std::memory_order_acquire) != 0;
+    if (kv_stream) {
+        return ggml_cuda_graph_check_compability_plain(cgraph);
+    }
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        ggml_tensor * node = cgraph->nodes[i];
+        if (node->op == GGML_OP_MUL_MAT_ID) {
+            const bool device_cache = ggml_cuda_moe_cache_device_supports(node, device);
+            if (device_cache && !device_cache_capture) {
+                return false;
+            }
+            if (ggml_cuda_is_view_or_noop(node)) {
+                continue;
+            }
+            if (!device_cache && ggml_cuda_mul_mat_id_needs_sync(node, cc)) {
+                return false;
+            }
+            continue;
+        }
+        if (node->op == GGML_OP_FLASH_ATTN_EXT && !ggml_cuda_is_view_or_noop(node) &&
+                ggml_cuda_flash_attn_ext_bounded_prefill_applies(device, node)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
+    // 2 = run both and count calls where they disagree (logged every 4,096 calls and on every disagreement)
+    static const int fast = [] { const char * e = getenv("GGML_CUDA_COMPAT_FAST"); return e ? atoi(e) : 0; }();
+    if (fast == 2) {
+        static std::atomic<uint64_t> n_calls{0};
+        static std::atomic<uint64_t> n_diff{0};
+        const bool a = ggml_cuda_graph_check_compability_plain(cgraph);
+        const bool b = ggml_cuda_graph_check_compability_fast(cgraph);
+        const uint64_t n = ++n_calls;
+        if (a != b) {
+            ++n_diff;
+            GGML_LOG_WARN("%s: GGML_CUDA_COMPAT_FAST check: plain %d fast %d (n_nodes %d)\n", __func__, a, b, cgraph->n_nodes);
+        }
+        if (a != b || n % 4096 == 0) {
+            GGML_LOG_INFO("%s: GGML_CUDA_COMPAT_FAST check: %llu calls, %llu differ\n", __func__,
+                          (unsigned long long) n, (unsigned long long) n_diff.load());
+        }
+        return a;
+    }
+    return fast ? ggml_cuda_graph_check_compability_fast(cgraph) : ggml_cuda_graph_check_compability_plain(cgraph);
+}
+
+static bool ggml_cuda_graph_check_compability_plain(ggml_cgraph * cgraph) {
 
     bool use_cuda_graph = true;
     const bool device_cache_capture = ggml_cuda_moe_cache_device_capture_generation(ggml_cuda_get_device()) != 0;
@@ -5361,6 +5422,136 @@ static void ggml_cuda_gdn_state_read_finish(ggml_backend_cuda_context * cuda_ctx
         }
     }
     cuda_ctx->gdn_state_reads.clear();
+}
+
+// [ROUNDFIX] pooled-key gather read in place (GGML_CUDA_LID_GATHER=1).
+//
+// The Qwen4exp lightning indexer scores pooled keys gathered from the F16 key cache:
+//   L = LIGHTNING_INDEXER(q, RESHAPE(GET_ROWS(view of F16 cache rows, I32 cells) -> F32 [128, n]), w, mask)
+// The GET_ROWS writes an F32 copy of every pooled key (n x 512 B) that the indexer reads once. When
+//  - the GET_ROWS result reaches L->src[1] only (one RESHAPE/VIEW hop, zero offset, no outputs on the way),
+//  - L takes the small-batch 4-head vector path (n_embd 128, n_head 4, n_batch < 8, one stream),
+//  - no node between the gather and L writes the cache rows or the cell list,
+// the gather is skipped and L reads row rows[i] of the F16 cache directly. F16 -> F32 widening is exact and the
+// vector kernel's F16 and F32 paths do the same float arithmetic, so L's scores are bit-identical.
+static bool ggml_cuda_lid_gather_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_CUDA_LID_GATHER");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return enabled;
+}
+
+static const ggml_tensor * ggml_cuda_lid_gather_source(const ggml_cgraph * cgraph, const ggml_tensor * lid) {
+    if (lid->op != GGML_OP_LIGHTNING_INDEXER || lid->type != GGML_TYPE_F32 || (lid->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+        return nullptr;
+    }
+    const ggml_tensor * q = lid->src[0];
+    const ggml_tensor * k = lid->src[1];
+    if (q == nullptr || k == nullptr || q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F32 ||
+        q->ne[0] != 128 || q->ne[1] != 4 || q->ne[2] >= 8 || q->ne[3] != 1 ||
+        k->ne[0] != 128 || k->ne[1] != 1 || k->ne[3] != 1 || k->nb[0] != sizeof(float)) {
+        return nullptr;
+    }
+    const ggml_tensor * t = k;
+    for (int hop = 0; hop < 2 && (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW); ++hop) {
+        if (t->src[0] == nullptr || t->view_src == nullptr || t->view_offs != 0 || !ggml_is_contiguous(t) ||
+            (t->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_cuda_gdn_state_read_uses(cgraph, t) != 1) {
+            return nullptr;
+        }
+        t = t->src[0];
+    }
+    const ggml_tensor * G = t;
+    if (G == k || k->view_src != G) {
+        return nullptr;
+    }
+    if (G->op != GGML_OP_GET_ROWS || G->type != GGML_TYPE_F32 || G->view_src != nullptr ||
+        (G->flags & GGML_TENSOR_FLAG_OUTPUT) || (G->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+        ggml_cuda_gdn_state_read_uses(cgraph, G) != 1 || !ggml_is_contiguous(G) ||
+        G->ne[0] != 128 || G->ne[1] != k->ne[2] || G->ne[2] != 1 || G->ne[3] != 1) {
+        return nullptr;
+    }
+    const ggml_tensor * cache = G->src[0];
+    const ggml_tensor * rows  = G->src[1];
+    if (cache == nullptr || rows == nullptr || cache->type != GGML_TYPE_F16 || rows->type != GGML_TYPE_I32 ||
+        cache->ne[0] != 128 || cache->ne[2] != 1 || cache->ne[3] != 1 ||
+        cache->nb[0] != sizeof(half) || cache->nb[1] % 16 != 0 ||
+        rows->ne[0] != G->ne[1] || rows->ne[1] != 1 || rows->ne[2] != 1 || rows->ne[3] != 1 ||
+        rows->nb[0] != sizeof(int32_t)) {
+        return nullptr;
+    }
+    return G;
+}
+
+static void ggml_cuda_lid_gather_plan(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph,
+                                      std::vector<uint8_t> & skip) {
+    cuda_ctx->lid_gathers.clear();
+    skip.clear();
+
+    static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
+    if (disable_fusion || !ggml_cuda_lid_gather_enabled()) {
+        return;
+    }
+
+    for (int li = 0; li < cgraph->n_nodes; ++li) {
+        const ggml_tensor * lid = cgraph->nodes[li];
+        if (lid->op != GGML_OP_LIGHTNING_INDEXER) {
+            continue;
+        }
+        const ggml_tensor * G = ggml_cuda_lid_gather_source(cgraph, lid);
+        if (G == nullptr) {
+            continue;
+        }
+        int ri = -1;
+        for (int j = li - 1; j >= 0; --j) {
+            if (cgraph->nodes[j] == G) {
+                ri = j;
+                break;
+            }
+        }
+        if (ri < 0 || (!skip.empty() && skip[ri])) {
+            continue;
+        }
+        const ggml_tensor * cache = G->src[0];
+        const ggml_tensor * rows  = G->src[1];
+        if (cache->data == nullptr || rows->data == nullptr || lid->data == nullptr ||
+            ((uintptr_t) cache->data) % 16 != 0) {
+            continue;
+        }
+        bool ok = true;
+        for (int j = ri + 1; j < li && ok; ++j) {
+            const ggml_tensor * n = cgraph->nodes[j];
+            if (ggml_cuda_is_view_or_noop(n) || (n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                continue;
+            }
+            ok = n->data != nullptr && !ggml_cuda_gdn_state_read_overlap(n, cache) &&
+                 !ggml_cuda_gdn_state_read_overlap(n, rows);
+        }
+        if (!ok || ggml_cuda_gdn_state_read_overlap(lid, cache) || ggml_cuda_gdn_state_read_overlap(lid, rows)) {
+            continue;
+        }
+        if (skip.empty()) {
+            skip.assign(cgraph->n_nodes, 0);
+        }
+        skip[ri] = 1;
+
+        ggml_backend_cuda_context::lid_gather_entry e;
+        e.lid        = lid;
+        e.base       = (const char *) cache->data;
+        e.rows       = (const int32_t *) rows->data;
+        e.row_stride = cache->nb[1];
+        cuda_ctx->lid_gathers.push_back(e);
+    }
+}
+
+static void ggml_cuda_lid_gather_finish(ggml_backend_cuda_context * cuda_ctx) {
+    for (const auto & e : cuda_ctx->lid_gathers) {
+        if (!e.used) {
+            GGML_ABORT("[ROUNDFIX] lightning_indexer %s skipped its pooled-key GET_ROWS but was not launched with the cache rows",
+                       e.lid->name);
+        }
+    }
+    cuda_ctx->lid_gathers.clear();
 }
 
 // [#110 SF fold 2] conv ring read in place (GGML_VL_SF_CONVRING=1, or GGML_VL_SF=1 with GGML_VL_SF_CONVRING unset).
@@ -8581,12 +8772,16 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             std::vector<uint8_t> gdn_state_read_skip;
             // [#110] CONCAT and snapshot-window nodes the conv ring ssm_conv launches replace (ggml_cuda_conv_ring_plan)
             std::vector<uint8_t> conv_ring_skip;
+            // [ROUNDFIX] pooled-key GET_ROWS nodes the lightning indexer reads in place (ggml_cuda_lid_gather_plan)
+            std::vector<uint8_t> lid_gather_skip;
             if (should_launch_concurrent_events) {
                 cuda_ctx->gdn_state_reads.clear();
                 cuda_ctx->conv_rings.clear();
+                cuda_ctx->lid_gathers.clear();
             } else {
                 ggml_cuda_gdn_state_read_plan(cuda_ctx, cgraph, gdn_state_read_skip);
                 ggml_cuda_conv_ring_plan(cuda_ctx, cgraph, conv_ring_skip);
+                ggml_cuda_lid_gather_plan(cuda_ctx, cgraph, lid_gather_skip);
             }
 
             g_hc_pre_xn_pending.clear();
@@ -8632,6 +8827,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
 
                 if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                    continue;
+                }
+
+                if (!lid_gather_skip.empty() && lid_gather_skip[i]) {
                     continue;
                 }
 
@@ -8724,6 +8923,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             }
 
             ggml_cuda_gdn_state_read_finish(cuda_ctx);
+            ggml_cuda_lid_gather_finish(cuda_ctx);
             ggml_cuda_conv_ring_finish(cuda_ctx);
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
             if (ggml_cuda_moe_table_prefetch_enabled()) {

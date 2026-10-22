@@ -1697,6 +1697,18 @@ struct ggml_backend_cuda_context {
     };
     std::vector<gdn_state_read_entry> gdn_state_reads;
 
+    // [ROUNDFIX] lightning_indexer nodes whose pooled-key GET_ROWS gather is skipped (GGML_CUDA_LID_GATHER=1):
+    // the vec launch reads key i from base + rows[i] * row_stride (F16 rows) instead of src[1].
+    // Filled by ggml_cuda_lid_gather_plan at the start of each evaluation, cleared at its end.
+    struct lid_gather_entry {
+        const ggml_tensor * lid        = nullptr;
+        const char *        base       = nullptr;
+        const int32_t *     rows       = nullptr;
+        size_t              row_stride = 0;       // bytes
+        bool                used       = false;
+    };
+    std::vector<lid_gather_entry> lid_gathers;
+
     // [#110 SF fold 2] ssm_conv nodes of the graph being evaluated that run the conv-ring kernel. Filled by
     // ggml_cuda_conv_ring_plan at the start of each evaluation, cleared at its end.
     struct conv_ring_entry {

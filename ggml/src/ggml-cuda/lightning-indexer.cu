@@ -461,7 +461,8 @@ static __global__ void lightning_indexer_kernel_vec(
         size_t nbk1, size_t nbk2, size_t nbk3,
         size_t nbw1, size_t nbw2, size_t nbw3,
         size_t nbm1, size_t nbm2, size_t nbm3,
-        int64_t nem3, bool mrange
+        int64_t nem3, bool mrange,
+        const int32_t * K_rows = nullptr // [ROUNDFIX] key i is row K_rows[i] (stride nbk2) of K, one stream only
     ) {
 
     constexpr int K_VECS_PER_WARP = K_VECS_PER_BLOCK / WARPS_PER_BLOCK;
@@ -503,7 +504,8 @@ static __global__ void lightning_indexer_kernel_vec(
         for (int k = 0; k < K_VECS_PER_WARP; ++k) {
             int i_kv = start_kv + k;
             if (i_kv < n_kv) {
-                const void * k_base = (const void *) ((const char *) K + i_kv*nbk2 + i_stream*nbk3);
+                const int64_t i_row = K_rows != nullptr ? (int64_t) K_rows[i_kv] : (int64_t) i_kv;
+                const void * k_base = (const void *) ((const char *) K + i_row*nbk2 + i_stream*nbk3);
                 dequantize_k(k_base, &k_reg_f[k], i_lane * 4);
             } else {
                 k_reg_f[k] = make_float4(0, 0, 0, 0);
@@ -1178,6 +1180,27 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
         dim3 block(32, WARPS_PER_BLOCK);
         int num_kv_blocks = (n_kv + (K_VECS_PER_BLOCK) - 1) / (K_VECS_PER_BLOCK);
         dim3 grid(num_kv_blocks, n_batch, n_stream);
+
+        // [ROUNDFIX] the GET_ROWS that gathered the pooled keys into src[1] (F16 rows widened to F32) was skipped
+        // by the graph evaluator (ggml_cuda_lid_gather_plan): read the F16 cache rows directly. Widening F16 to F32
+        // is exact and the F16 path does the same float arithmetic as the F32 path, so the scores are bit-identical.
+        for (auto & e : ctx.lid_gathers) {
+            if (e.lid == dst) {
+                GGML_ASSERT(!e.used && n_stream == 1);
+                e.used = true;
+                lightning_indexer_kernel_vec<WARPS_PER_BLOCK, K_VECS_PER_BLOCK, 128, 4, GGML_TYPE_F16>
+                    <<<grid, block, 0, ctx.stream()>>>(
+                    q_d, e.base, w_d, m_d, dst_d,
+                    n_stream, n_batch, n_kv,
+                    nb1, nb2, nb3,
+                    nbq1, nbq2, nbq3,
+                    0, e.row_stride, 0,
+                    nbw1, nbw2, nbw3,
+                    nbm1, nbm2, nbm3,
+                    nem3, mrange, e.rows);
+                return;
+            }
+        }
 
         LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_F16)
         LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_Q4_0)
