@@ -17430,7 +17430,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(257, 24, 3, 60, 300, true, true, GGML_TYPE_TQ6_0, 128, true));
     // fork: compact main-model attention, with a wrapped ring, sparse union, finite mask bias and padded tail.
-    for (int64_t n_q : {1, 4, 5}) {
+    for (int64_t n_q : {1, 2, 3, 4, 5}) {
         for (int mask_mode : {1, 2}) {
             test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 2, 69, 257, false, false,
                 GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_F32, 4, 4, 0, 0, mask_mode, 0, 512));
@@ -17440,6 +17440,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         GGML_TYPE_Q8_0, 128, true, GGML_TYPE_F32, 4, 4, 0, 1, 2, 0, 512));
     test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(5, 24, 2, 69, 257, false, false,
         GGML_TYPE_F16, 128, true, GGML_TYPE_F32, 4, 4, 1, 0, 2, 0, 512));
+    // 100K-like compact case: 792 groups, the real QSA bound (2,051 cells per row), many 2048-position scan chunks
+    for (int64_t n_q : {2, 4, 5}) {
+        test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 2, 792, 1024, false, true,
+            GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_F32, 4, 4, 0, 0, 2, 0, 2051));
+    }
     // [KVRP] tq6 ring at 1024/4096/8192 rows with the f16 sink: the cp.async-pipelined exact strips
     for (int64_t n_ring : {1024, 4096, 8192}) {
         for (int64_t n_q : {1, 4, 5, 8}) {
@@ -17927,6 +17932,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // Flash-Next indexer (4 heads, float32 keys): key and token counts off the register-blocked tile edges
     test_cases.emplace_back(new test_lightning_indexer(128, 4, 1000, 77, 1, 1, GGML_TYPE_F32));
     test_cases.emplace_back(new test_lightning_indexer(128, 4, 4133, 300, 2, 1, GGML_TYPE_F32));
+    // verify widths (GGML_CUDA_LID_MULTI scores all of them from one key read; =2 checks the bits against one token per block)
+    for (int64_t bs : {2, 4, 5}) {
+        test_cases.emplace_back(new test_lightning_indexer(128, 4, 8191, bs, 1, 1, GGML_TYPE_F32));
+        test_cases.emplace_back(new test_lightning_indexer(128, 4, 8191, bs, 1, 1, GGML_TYPE_F16));
+    }
     // the range mask: Flash-Next tile/exact/prefill (4 heads, 8+ tokens), vector (4 heads, < 8 tokens), 32/64 heads
     test_cases.emplace_back(new test_lightning_indexer_rmask(128, 4, 1000, 77, 1, 1, GGML_TYPE_F32));
     test_cases.emplace_back(new test_lightning_indexer_rmask(128, 4, 4133, 300, 2, 2, GGML_TYPE_F32));
