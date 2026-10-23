@@ -8939,12 +8939,12 @@ static bool moe_plan_count_take(moe_cache_session & session, const moe_cache_dev
     return true;
 }
 
-// fork STRATAGAP PUBPLAN: GGML_MOE_CPU_SPLIT_PUB_PLAN=1 (default off) moves the CPU job's publish (input rows to
+// fork STRATAGAP PUBPLAN: GGML_MOE_CPU_SPLIT_PUB_PLAN (default on, =0 turns it off; only matters when GGML_MOE_CPU_SPLIT=1) moves the CPU job's publish (input rows to
 // mapped host memory, then the job and its number) into the fast plan kernel, right after the CPU pick and before
 // the miss lists, staging and address table. The host starts one launch (and one wait for free SM slots) earlier;
 // the rows, the job and the order of the writes are those of moe_cs_publish_kernel, so the results are the same.
 static bool moe_cs_pub_plan_enabled() {
-    static const bool on = [] { const char * v = getenv("GGML_MOE_CPU_SPLIT_PUB_PLAN"); return v != nullptr && atoi(v) != 0; }();
+    static const bool on = [] { const char * v = getenv("GGML_MOE_CPU_SPLIT_PUB_PLAN"); return v == nullptr || atoi(v) != 0; }();
     return on;
 }
 static bool moe_hf_plan_fast_enabled() {
