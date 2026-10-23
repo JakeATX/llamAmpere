@@ -6425,8 +6425,12 @@ int llama_context::encode(const llama_batch & batch_inp) {
 }
 
 int llama_context::decode(const llama_batch & batch_inp) {
-    llama_batch_compat compat(this, batch_inp);
-    return decode(*compat.batch_ext);
+    if (!batch_compat) {
+        batch_compat = std::make_unique<llama_batch_ext>(this);
+    }
+    batch_compat->clear();
+    llama_batch_compat::init(*batch_compat, batch_inp);
+    return decode(*batch_compat);
 }
 
 ///
