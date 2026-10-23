@@ -2465,10 +2465,11 @@ static __global__ void mul_mat_vec_q_moe_hitg(
 // the up and gate sums, and up * silu(gate), have the bits of moe_hitg_rows / the plain kernels. c_kb > 0 is the
 // row's block count known at compile time: the k loop then has a fixed trip count (predicated), so the loads of all
 // its steps can be in flight together; the order of the additions does not change.
-template <ggml_type type, int c_lanes, int c_rows, int cols, int c_kb>
+template <ggml_type type, int c_lanes, int c_rows, int cols, int c_kb, bool c_smem = false>
 static __device__ __forceinline__ void moe_hitg_sw_rows(
         const void * vu, const void * vg, const block_q8_1 * const (&y)[4], float * const (&out)[4],
-        const int row0, const int nrows_x, const int blocks_per_row_x, const int stride_row_x) {
+        const int row0, const int nrows_x, const int blocks_per_row_x, const int stride_row_x,
+        const uint32_t * grid_s = nullptr) {
     constexpr int qk  = ggml_cuda_type_traits<type>::qk;
     constexpr int qi  = ggml_cuda_type_traits<type>::qi;
     constexpr int vdr = get_vdr_mmvq(type);
@@ -2508,9 +2509,9 @@ static __device__ __forceinline__ void moe_hitg_sw_rows(
                         if (row0 + i < nrows_x) {
 #pragma unroll
                             for (int c = 0; c < cols; ++c) {
-                                tu[j][c][i] += moe_d1_dot<type, c_rows, cols, false>(nullptr, vu, &y[c][kby],
+                                tu[j][c][i] += moe_d1_dot<type, c_rows, cols, c_smem>(grid_s, vu, &y[c][kby],
                                         kbx_offset + i*stride_row_x + kbx, kqs);
-                                tg[j][c][i] += moe_d1_dot<type, c_rows, cols, false>(nullptr, vg, &y[c][kby],
+                                tg[j][c][i] += moe_d1_dot<type, c_rows, cols, c_smem>(grid_s, vg, &y[c][kby],
                                         kbx_offset + i*stride_row_x + kbx, kqs);
                             }
                         }
@@ -2525,9 +2526,9 @@ static __device__ __forceinline__ void moe_hitg_sw_rows(
                     if (row0 + i < nrows_x) {
 #pragma unroll
                         for (int c = 0; c < cols; ++c) {
-                            tu[j][c][i] += moe_d1_dot<type, c_rows, cols, false>(nullptr, vu, &y[c][kby],
+                            tu[j][c][i] += moe_d1_dot<type, c_rows, cols, c_smem>(grid_s, vu, &y[c][kby],
                                     kbx_offset + i*stride_row_x + kbx, kqs);
-                            tg[j][c][i] += moe_d1_dot<type, c_rows, cols, false>(nullptr, vg, &y[c][kby],
+                            tg[j][c][i] += moe_d1_dot<type, c_rows, cols, c_smem>(grid_s, vg, &y[c][kby],
                                     kbx_offset + i*stride_row_x + kbx, kqs);
                         }
                     }
@@ -2588,7 +2589,7 @@ static __device__ __forceinline__ void moe_hitg_sw_rows(
 
 // Grid and route handling as mul_mat_vec_q_moe_hitg; a warp covers (32/c_lanes)*c_rows rows, members are taken
 // c_group (up to 4) tokens at a time for one read of the expert's rows.
-template <ggml_type type, int c_warps, int c_lanes, int c_rows, int c_group, int c_kb>
+template <ggml_type type, int c_warps, int c_lanes, int c_rows, int c_group, int c_kb, bool c_smem = false>
 __launch_bounds__(c_warps*32, 768/(c_warps*32))
 static __global__ void mul_mat_vec_q_moe_hitg_sw(
         const void * const * up_table, const void * const * gate_table, const block_q8_1 * vy, const int32_t * ids,
@@ -2613,6 +2614,21 @@ static __global__ void mul_mat_vec_q_moe_hitg_sw(
     }
     if (((m0[me] != 0) && (m1[me] != 0)) != (want != 0)) {
         return;
+    }
+    // [STRATAGAP HITGSW s] codebook copy in shared memory, as mul_mat_vec_q_moe_hitg (block-uniform point: every
+    // return above depends only on blockIdx.y)
+    constexpr bool use_smem = c_smem && ggml_cuda_mmvq_smem_grid_type(type);
+    constexpr int  smem_n   = type == GGML_TYPE_IQ3_XXS ? 256 : type == GGML_TYPE_IQ3_S ? 512 :
+                              type == GGML_TYPE_IQ2_XXS ? 512 : type == GGML_TYPE_IQ2_XS ? 1024 : 2048;
+    [[maybe_unused]] __shared__ uint32_t grid_s[use_smem ? smem_n : 1];
+    if constexpr (use_smem) {
+        const uint32_t * grid_g = type == GGML_TYPE_IQ3_XXS ? iq3xxs_grid : type == GGML_TYPE_IQ3_S ? iq3s_grid :
+                                  type == GGML_TYPE_IQ2_XXS ? (const uint32_t *) iq2xxs_grid :
+                                  type == GGML_TYPE_IQ2_XS  ? (const uint32_t *) iq2xs_grid : (const uint32_t *) iq2s_grid;
+        for (int i = threadIdx.y*32 + threadIdx.x; i < smem_n; i += c_warps*32) {
+            grid_s[i] = grid_g[i];
+        }
+        __syncthreads();
     }
     const int wrow0 = (blockIdx.x*c_warps + threadIdx.y)*rows_per_warp;
     if (wrow0 >= nrows_x) {
@@ -2643,19 +2659,19 @@ static __global__ void mul_mat_vec_q_moe_hitg_sw(
             }
         }
         if (c_group >= 4 && n == 4) {
-            moe_hitg_sw_rows<type, c_lanes, c_rows, c_group >= 4 ? 4 : 1, c_kb>(vu, vg, y, out, row0, nrows_x, blocks_per_row_x, stride_row_x);
+            moe_hitg_sw_rows<type, c_lanes, c_rows, c_group >= 4 ? 4 : 1, c_kb, use_smem>(vu, vg, y, out, row0, nrows_x, blocks_per_row_x, stride_row_x, grid_s);
         } else if (c_group >= 3 && n == 3) {
-            moe_hitg_sw_rows<type, c_lanes, c_rows, c_group >= 3 ? 3 : 1, c_kb>(vu, vg, y, out, row0, nrows_x, blocks_per_row_x, stride_row_x);
+            moe_hitg_sw_rows<type, c_lanes, c_rows, c_group >= 3 ? 3 : 1, c_kb, use_smem>(vu, vg, y, out, row0, nrows_x, blocks_per_row_x, stride_row_x, grid_s);
         } else if (c_group >= 2 && n == 2) {
-            moe_hitg_sw_rows<type, c_lanes, c_rows, c_group >= 2 ? 2 : 1, c_kb>(vu, vg, y, out, row0, nrows_x, blocks_per_row_x, stride_row_x);
+            moe_hitg_sw_rows<type, c_lanes, c_rows, c_group >= 2 ? 2 : 1, c_kb, use_smem>(vu, vg, y, out, row0, nrows_x, blocks_per_row_x, stride_row_x, grid_s);
         } else {
-            moe_hitg_sw_rows<type, c_lanes, c_rows, 1, c_kb>(vu, vg, y, out, row0, nrows_x, blocks_per_row_x, stride_row_x);
+            moe_hitg_sw_rows<type, c_lanes, c_rows, 1, c_kb, use_smem>(vu, vg, y, out, row0, nrows_x, blocks_per_row_x, stride_row_x, grid_s);
         }
     }
     ggml_cuda_pdl_lc();
 }
 
-template <ggml_type type, int c_warps, int c_lanes, int c_rows, int c_group>
+template <ggml_type type, int c_warps, int c_lanes, int c_rows, int c_group, bool c_smem = false>
 static void moe_hitg_sw_launch(const void * const * up_table, const void * const * gate_table, const char * act_q8,
         const int32_t * ids, float * dst, int64_t n_in, int64_t n_out, int64_t n_ids, int64_t n_tokens, int64_t channels,
         int64_t ids_stride, const uint8_t * m0, const uint8_t * m1, int want, cudaStream_t stream) {
@@ -2668,9 +2684,9 @@ static void moe_hitg_sw_launch(const void * const * up_table, const void * const
         stride_row_x, (int) channels, (int) channels*s11, s11, (int) (n_ids*n_out), (int) n_out, (int) n_ids, \
         (int) n_tokens, (int) ids_stride, m0, m1, want
     if (n_in == 10*ggml_cuda_type_traits<type>::qk) {   // Flash-Next gate/up: K = 2560, 10 blocks per row
-        ggml_cuda_kernel_launch(mul_mat_vec_q_moe_hitg_sw<type, c_warps, c_lanes, c_rows, c_group, 10>, params, MOE_HITG_SW_KARGS);
+        ggml_cuda_kernel_launch(mul_mat_vec_q_moe_hitg_sw<type, c_warps, c_lanes, c_rows, c_group, 10, c_smem>, params, MOE_HITG_SW_KARGS);
     } else {
-        ggml_cuda_kernel_launch(mul_mat_vec_q_moe_hitg_sw<type, c_warps, c_lanes, c_rows, c_group, 0>, params, MOE_HITG_SW_KARGS);
+        ggml_cuda_kernel_launch(mul_mat_vec_q_moe_hitg_sw<type, c_warps, c_lanes, c_rows, c_group, 0, c_smem>, params, MOE_HITG_SW_KARGS);
     }
 #undef MOE_HITG_SW_KARGS
 }
@@ -4429,7 +4445,8 @@ void ggml_cuda_moe_table_mmv_list(ggml_backend_cuda_context & ctx, const moe_mis
 // 4x2s, 8x2s, 8x1s; default 4x2). Members are taken two tokens at a time. Gate/up types of Flash-Next only.
 // Sub-warp shapes (HITGSW): swLxR[gG][wW] = L lanes per row x R rows per lane group, G tokens per weight read
 // (default 2), W warps per block (default 4): sw16x2, sw16x2g4, sw8x2, sw8x2g4, sw16x4, sw16x1g4, sw16x2w8,
-// sw16x1g4w16 (32 rows per 512-thread block), sw16x2g4w8 (32 rows per 256-thread block); auto = per type and width.
+// sw16x1g4w16 (32 rows per 512-thread block), sw16x2g4w8 (32 rows per 256-thread block), sw16x1g4s and sw16x2s
+// (shared-memory codebook); auto = per type and width.
 int ggml_cuda_moe_hit_fused_mode() {
     static const int mode = [] {
         const char * e = getenv("GGML_MOE_HIT_FUSED");
@@ -4481,6 +4498,8 @@ static void moe_hitg_dispatch(int shape, const void * const * up_table, const vo
             case 13: moe_hitg_sw_launch<T, 8, 16, 2, 2>(MOE_HITG_ARGS); break; \
             case 14: moe_hitg_sw_launch<T, 16, 16, 1, 4>(MOE_HITG_ARGS); break; \
             case 15: moe_hitg_sw_launch<T, 8, 16, 2, 4>(MOE_HITG_ARGS); break; \
+            case 16: moe_hitg_sw_launch<T, 4, 16, 1, 4, true>(MOE_HITG_ARGS); break; \
+            case 17: moe_hitg_sw_launch<T, 4, 16, 2, 2, true>(MOE_HITG_ARGS); break; \
             default: moe_hitg_launch<T, 4, 2, 2>(MOE_HITG_ARGS); break; \
         } \
         break
@@ -4617,8 +4636,8 @@ void ggml_cuda_moe_table_mmv_hitg(ggml_backend_cuda_context & ctx,
         const char * e = getenv("GGML_MOE_HIT_FUSED_SHAPE");
         static const char * const names[] = { "4x2", "8x2", "4x1", "8x1", "4x2s", "8x2s", "8x1s",
                                               "sw16x2", "sw16x2g4", "sw8x2", "sw8x2g4", "sw16x4", "sw16x1g4", "sw16x2w8",
-                                              "sw16x1g4w16", "sw16x2g4w8" };
-        for (int i = 0; e && i < 16; ++i) {
+                                              "sw16x1g4w16", "sw16x2g4w8", "sw16x1g4s", "sw16x2s" };
+        for (int i = 0; e && i < 18; ++i) {
             if (strcmp(e, names[i]) == 0) {
                 return i;
             }

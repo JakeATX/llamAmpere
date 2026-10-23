@@ -19,12 +19,12 @@ int main(int argc, char ** argv) {
     const char * tnames[] = { "iq2_xxs", "iq2_xs", "iq2_s", "iq3_xxs", "iq3_s" };
     const char * shapes[] = { "4x2", "8x2", "4x1", "8x1", "4x2s", "8x2s", "8x1s",
                               "sw16x2", "sw16x2g4", "sw8x2", "sw8x2g4", "sw16x4", "sw16x1g4", "sw16x2w8",
-                              "sw16x1g4w16", "sw16x2g4w8" };
+                              "sw16x1g4w16", "sw16x2g4w8", "sw16x1g4s", "sw16x2s" };
     const int toks[] = { 3, 4, 5 };
     bool ok = true;
     for (int ti = 0; ti < 5; ++ti) {
         for (int n_tok : toks) {
-            for (int sh = 0; sh < 16; ++sh) {
+            for (int sh = 0; sh < 18; ++sh) {
                 double us = 0, mb = 0; int n_union = 0, same = 0;
                 if (!ggml_cuda_moe_hitg_bench(types[ti], n_tok, 36, 3, reps, sh, 7u, &us, &mb, &n_union, &same)) {
                     printf("%-8s w%d %-9s unsupported\n", tnames[ti], n_tok, shapes[sh]);
