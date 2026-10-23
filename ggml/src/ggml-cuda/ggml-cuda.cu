@@ -43,6 +43,8 @@
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/mmvq-kq-tc.cuh"
+#include "ggml-cuda/mmvq-kqrows.cuh"
+#include "ggml-cuda/mmvf-rows.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
 #include "ggml-cuda/nemotron-moe.cuh"
 #include "ggml-cuda/nemotron-ssm.cuh"
@@ -3249,6 +3251,7 @@ static bool ggml_cuda_tq_mmq_supported(const ggml_tensor * src0, const int cc) {
 // quantize its activation through the MMVQ shared-quantize cache, so the two cannot drift. Checks run in dispatch order.
 enum ggml_cuda_mm_route {
     GGML_CUDA_MM_ROUTE_CUBLAS_FORCED,   // src0 padding cannot be cleared (compute-buffer view), or src1/dst not f32
+    GGML_CUDA_MM_ROUTE_FROWS,           // [FROWS] narrow F32/F16/BF16 weight at 2..8 columns, R rows per block (GGML_CUDA_FROWS=1)
     GGML_CUDA_MM_ROUTE_MMVF,
     GGML_CUDA_MM_ROUTE_MMVF_TRANSPOSED, // f32 src0 with one row: src1 is the matrix
     GGML_CUDA_MM_ROUTE_MMF,
@@ -3270,6 +3273,9 @@ static ggml_cuda_mm_route ggml_cuda_mul_mat_route(const ggml_tensor * src0, cons
 
     const int64_t ne11 = src1->ne[1];
 
+    if (ggml_cuda_frows_wants(src0, src1, dst, cc)) {
+        return GGML_CUDA_MM_ROUTE_FROWS;
+    }
     if (ggml_cuda_should_use_mmvf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11)) {
         // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
         // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
@@ -3289,6 +3295,11 @@ static ggml_cuda_mm_route ggml_cuda_mul_mat_route(const ggml_tensor * src0, cons
     // TQ weight types use the fused dp4a path (decode) or runtime q8_0 conversion + cuBLAS (prefill),
     // never mmvq/mmq (mmvq's type switch has no TQ cases and aborts).
     const bool is_tq_weight = (src0->type == GGML_TYPE_TQ4_1S || src0->type == GGML_TYPE_TQ3_1S);
+    // [KQROWS] plain 2D Q4_K/Q5_K/Q6_K products at 2..8 columns whose shape the row kernel wins (GGML_CUDA_KQ_ROWS=1)
+    if (!is_tq_weight && src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+            ggml_cuda_kqrows_wants(src0->type, cc, src0->ne[0], src0->ne[1], ne11)) {
+        return GGML_CUDA_MM_ROUTE_MMVQ;
+    }
     if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11) && !is_tq_weight) {
         return GGML_CUDA_MM_ROUTE_MMVQ;
     }
@@ -3445,6 +3456,10 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
         return;
     }
+    if (route == GGML_CUDA_MM_ROUTE_FROWS) {
+        ggml_cuda_frows_mul_mat(ctx, src0, src1, dst);
+        return;
+    }
     if (route == GGML_CUDA_MM_ROUTE_MMVF) {
         ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
         return;
@@ -3468,7 +3483,13 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // never mmvq/mmq (mmvq's type switch has no TQ cases and aborts).
     const bool is_tq_weight = (src0->type == GGML_TYPE_TQ4_1S || src0->type == GGML_TYPE_TQ3_1S);
     // [KQTC] K-quant / IQ3_S at 2..8 columns on int8 tensor cores (GGML_CUDA_KQ_TC, default off)
-    if ((route == GGML_CUDA_MM_ROUTE_MMVQ || route == GGML_CUDA_MM_ROUTE_MMQ) && ggml_cuda_mul_mat_kq_tc_try(ctx, src0, src1, dst)) {
+    // [KQROWS] a shape the row kernel's default table claims stays on the row kernel even with KQTC on: the table only
+    // claims cells where the row kernel measured faster than both the default route and KQTC (kq_table.py KQ_RIVALS)
+    const bool kqrows_claims = route == GGML_CUDA_MM_ROUTE_MMVQ &&
+        src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+        ggml_cuda_kqrows_wants(src0->type, cc, src0->ne[0], src0->ne[1], src1->ne[1]);
+    if (!kqrows_claims && (route == GGML_CUDA_MM_ROUTE_MMVQ || route == GGML_CUDA_MM_ROUTE_MMQ) &&
+            ggml_cuda_mul_mat_kq_tc_try(ctx, src0, src1, dst)) {
         return;
     }
     if (route == GGML_CUDA_MM_ROUTE_MMVQ) {
@@ -11948,6 +11969,13 @@ int64_t ggml_backend_cuda_fusion_count(ggml_backend_t backend, const char * name
     }
     if (strcmp(name, "gdn_state_read") == 0) {
         return ctx->fusion_stats.gdn_state_read;
+    }
+    if (strcmp(name, "frows") == 0) {
+        return ggml_cuda_frows_count;
+    }
+    if (strcmp(name, "kqrows") == 0) {
+        extern int64_t ggml_cuda_kqrows_count; // mmvq-kqrows.cu
+        return ggml_cuda_kqrows_count;
     }
     if (strcmp(name, "gdn_khshare") == 0) {
         extern int64_t ggml_cuda_gdn_khshare_count; // gated_delta_net.cu (#199)
