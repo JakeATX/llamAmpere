@@ -351,8 +351,10 @@ static const kqtc_config & kqtc_get_config() {
         }
         const ggml_type all[] = { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ3_S };
         if (strcmp(e, "1") == 0 || strcmp(e, "all") == 0) {
+            // "1" / "all" = the K-quants only. IQ3_S loses to MMVQ on Flash-Next (node trace aifast-t3n:
+            // 15.15 us vs 9.49 us on its main dense shape), so it is opt-in by name: GGML_CUDA_KQ_TC=q4_K,...,iq3_s.
             for (ggml_type ty : all) {
-                c.types[ty] = true;
+                c.types[ty] = ty != GGML_TYPE_IQ3_S;
             }
         } else {
             std::string s(e);
