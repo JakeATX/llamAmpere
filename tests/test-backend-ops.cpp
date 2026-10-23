@@ -7289,6 +7289,51 @@ static void add_iq4xs_k4_cases(std::vector<std::unique_ptr<test_case>> & cases, 
     }
 }
 
+// [KQROWS] K-quant row kernel at 2..8 columns (GGML_TEST_KQROWS=1 adds the cases). GGML_TEST_KQROWS_REQUIRE=1 fails a
+// case when GGML_CUDA_KQ_ROWS=1 is set but the row kernel did not run; GGML_TEST_KQROWS_HASH=1 prints a hash of the
+// CUDA output so two runs (row kernel vs MMVQ forced with GGML_MMVQ_NMAX) can be compared bit for bit under GGML_TEST_SEED.
+struct test_mul_mat_kqrows : public test_mul_mat {
+    test_mul_mat_kqrows(ggml_type type, int64_t m, int64_t n, int64_t k)
+        : test_mul_mat(type, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}) {}
+
+    std::string vars() override {
+        return test_mul_mat::vars() + ",kqrows=1";
+    }
+
+    const char * required_fusion() override {
+        const char * on      = getenv("GGML_CUDA_KQ_ROWS");
+        const char * require = getenv("GGML_TEST_KQROWS_REQUIRE");
+        return on != nullptr && atoi(on) != 0 && require != nullptr && atoi(require) != 0 && n >= 2 && n <= 8 ? "kqrows" : nullptr;
+    }
+
+    double err(const float * a, const float * b, size_t n_values) override {
+        const char * hash = getenv("GGML_TEST_KQROWS_HASH");
+        if (hash != nullptr && atoi(hash) != 0) {
+            std::lock_guard<std::mutex> guard(g_test_output_mutex);
+            printf("KQROWS_HASH %s values=%zu hash=%016" PRIx64 "\n", vars().c_str(), n_values, tbo_fnv1a(a, n_values*sizeof(float)));
+        }
+        return test_mul_mat::err(a, b, n_values);
+    }
+};
+
+static void add_kqrows_cases(std::vector<std::unique_ptr<test_case>> & cases, bool perf) {
+    if (getenv("GGML_TEST_KQROWS") == nullptr) {
+        return;
+    }
+    // Flash-Next dense K-quant shapes (rows x K): qkv 10240, q 12288, gate 6144, out/ssm_out 2560 x 6144, shexp 640,
+    // k/v 512; 641 and 257 rows exercise the partial last CTA.
+    const std::vector<std::pair<int64_t, int64_t>> shapes = perf ?
+        std::vector<std::pair<int64_t, int64_t>>{ {10240, 2560}, {12288, 2560}, {6144, 2560}, {2560, 6144}, {640, 2560}, {512, 2560} } :
+        std::vector<std::pair<int64_t, int64_t>>{ {10240, 2560}, {2560, 6144}, {640, 2560}, {641, 2560}, {257, 512}, {512, 2560} };
+    for (ggml_type type : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K }) {
+        for (const auto & mk : shapes) {
+            for (int64_t n = 2; n <= 8; ++n) {
+                cases.emplace_back(new test_mul_mat_kqrows(type, mk.first, n, mk.second));
+            }
+        }
+    }
+}
+
 // fork: opt-in cases also verify dispatch counters so a fallback cannot hide missing coverage.
 struct test_mul_mat_mmq_prefill : public test_mul_mat {
     const bool q8_exact;
@@ -14510,6 +14555,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     add_mmf_split_k_cases(test_cases, false);
     add_iq4xs_wide_cases(test_cases);
+    add_kqrows_cases(test_cases, false);
     add_parwrev_cases(test_cases, false);
     // [PARW] few-tile long-K MMQ (stream-k CTA cap): the 48-row GDN gates and small matrices at widths 9..32
     for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_Q5_0, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS}) {
@@ -18141,6 +18187,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     add_get_rows_narrow_cases(test_cases, true);
     add_iq4xs_k4_cases(test_cases, true);
     add_mmf_split_k_cases(test_cases, true);
+    add_kqrows_cases(test_cases, true);
 
     // [HCGP] Flash-Next hyper-connection mixer at a 4,096- and 12,288-token ubatch (GGML_CUDA_HC_GATE_PRE A/B)
     test_cases.emplace_back(new test_dsv4_hc_mix(2560, 4, 320, 4096));

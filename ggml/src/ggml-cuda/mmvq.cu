@@ -1,4 +1,5 @@
 #include "mmvq.cuh"
+#include "mmvq-kqrows.cuh"
 #include "convrot.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
@@ -663,7 +664,9 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
             case GGML_TYPE_Q4_K:
             case GGML_TYPE_Q5_K:
             case GGML_TYPE_Q6_K:
-                return ne11 <= 4;
+                // [KQROWS] the row kernel decodes each weight once for all columns, so MMVQ keeps the K-quants to its
+                // width ceiling when it is on (GGML_CUDA_KQ_ROWS=1, default off)
+                return ne11 <= std::max<int64_t>(4, ggml_cuda_kqrows_max_n(type));
             default:
                 return ne11 <= MMVQ_MAX_BATCH_SIZE;
         }
@@ -3176,6 +3179,17 @@ void ggml_cuda_mul_mat_vec_q(
         }
     }
 #endif
+
+    // [KQROWS] plain 2D K-quant products at 2..8 columns on the row kernel (GGML_CUDA_KQ_ROWS=1, default off)
+    {
+        const bool any_fusion = fusion_local.gate || fusion_local.x_bias || fusion_local.gate_bias ||
+                                fusion_local.x_scale || fusion_local.gate_scale || fusion_local.shared_up;
+        if (!ids && !any_fusion && !convrot && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
+                ggml_cuda_kqrows_try(src0->type, src0->data, src1_q8_1, dst_d, ne00, ne01, ncols_dst, s01,
+                    stride_col_y, stride_col_dst, ggml_cuda_info().devices[ctx.device].cc, stream)) {
+            return;
+        }
+    }
 
     mul_mat_vec_q_switch_type(
         src0->data, src0->type, src1_q8_1, ids_d, fusion_local, dst_d, ne00,
