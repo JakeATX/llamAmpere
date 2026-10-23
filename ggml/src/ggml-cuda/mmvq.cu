@@ -4429,7 +4429,7 @@ void ggml_cuda_moe_table_mmv_list(ggml_backend_cuda_context & ctx, const moe_mis
 // 4x2s, 8x2s, 8x1s; default 4x2). Members are taken two tokens at a time. Gate/up types of Flash-Next only.
 // Sub-warp shapes (HITGSW): swLxR[gG][wW] = L lanes per row x R rows per lane group, G tokens per weight read
 // (default 2), W warps per block (default 4): sw16x2, sw16x2g4, sw8x2, sw8x2g4, sw16x4, sw16x1g4, sw16x2w8,
-// sw16x1g4w16 (32 rows per 512-thread block), sw16x2g4w8 (32 rows per 256-thread block).
+// sw16x1g4w16 (32 rows per 512-thread block), sw16x2g4w8 (32 rows per 256-thread block); auto = per type and width.
 int ggml_cuda_moe_hit_fused_mode() {
     static const int mode = [] {
         const char * e = getenv("GGML_MOE_HIT_FUSED");
@@ -4623,10 +4623,13 @@ void ggml_cuda_moe_table_mmv_hitg(ggml_backend_cuda_context & ctx,
                 return i;
             }
         }
-        return 0;
+        return e && strcmp(e, "auto") == 0 ? -1 : 0;
     }();
+    // "auto": the fastest shape per weight type and width in test-moe-hitg-bench (Taichi 3090, 2026-10-23T08:00Z):
+    // sw16x1g4 everywhere except IQ3_S at 3 or fewer words, where 4x2s is. Every shape has the same bits.
+    const int use = shape >= 0 ? shape : (type == GGML_TYPE_IQ3_S && n_tokens <= 3) ? 4 : 12;
     cudaStream_t stream = ctx.stream();
-    moe_hitg_dispatch(shape, up_table, gate_table, type, act_q8, ids, dst, n_in, n_out, n_ids, n_tokens, channels,
+    moe_hitg_dispatch(use, up_table, gate_table, type, act_q8, ids, dst, n_in, n_out, n_ids, n_tokens, channels,
             ids_stride, m0, m1, want, stream);
     CUDA_CHECK(cudaGetLastError());
     if (ggml_cuda_moe_hit_fused_mode() == 2) {
