@@ -491,6 +491,14 @@ void llama_moe_arena_apply_flashnext_defaults() {
         { "GGML_CUDA_KQ_TC",                      "q4_K,q5_K,q6_K" },
         { "GGML_CUDA_KQ_TC_WARPS",                "4" },
         { "GGML_CUDA_FROWS",                      "1" },
+        // CPU expert split (fork STRATAGAP, gated 2026-10-23: 97.5 tok/s plain vs 97.4 recipe, no loops, probe < 75 us).
+        // Host threads compute the experts that are not on the card instead of copying their weights over PCIe. The
+        // text differs run to run with the split on (CPU and card kernels round differently): valid math, not exact.
+        // Set here, not in the kernel code, so only Flash-Next models get it; --no-moe-cpu-split or =0 turns it off.
+        { "GGML_MOE_CPU_SPLIT",                   "1" },
+        { "GGML_MOE_CPU_SPLIT_Q2_FAST",           "1" },
+        { "GGML_MOE_CPU_SPLIT_ROWS",              "1" },
+        { "GGML_CUDA_GRAPH_NODE_PRIORITY",        "1" },   // scheduling only: hit-first copies overlap the matrix-vector product
         // helper (MTP) memory and launch savings
         { "LLAMA_MTP_PIN_BORROWED_HOST",          "1" },
         { "LLAMA_MTP_COMPAT_REUSE",               "1" },

@@ -3276,6 +3276,12 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params &, const std::string & value) { common_set_env("GGML_MOE_CACHE_PROFILE_LOAD", value); }
     ));
     add_opt(common_arg(
+        {"--moe-cpu-split"}, {"--no-moe-cpu-split"},
+        "host CPU threads compute part of each layer's experts that are not in VRAM, instead of copying their "
+        "weights over PCIe (expert cache with hit-first only; default: on for Flash-Next models)",
+        [](common_params &, bool value) { common_set_env("GGML_MOE_CPU_SPLIT", value ? "1" : "0"); }
+    ));
+    add_opt(common_arg(
         {"--moe-cache"}, "MODE",
         "adaptively cache the hottest CPU-resident MoE experts in spare VRAM "
         "(default: auto; auto = preserve weight repacking; on = automatic budget without weight repacking; "
