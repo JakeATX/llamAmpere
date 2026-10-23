@@ -431,6 +431,7 @@ struct common_sampler {
     // target top-1 probability (request-matched distribution, after the sampler chain) of every position the last
     // sample_and_accept_n_pq call looked at; a free by-product used by the CDEPTH draft-depth policy. -1 = unknown
     std::vector<float> top1_trace;
+    int32_t first_rescue = -1; // [MBFIX] position of the last pq verify call's first mode-biased rescue (-1 = none)
 };
 
 std::string common_params_sampling::print() const {
@@ -1622,6 +1623,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_pq(struct common_sam
 
     // top-1 probability of the distribution just sampled from (cur_p holds p over the surviving candidates)
     gsmpl->top1_trace.clear();
+    gsmpl->first_rescue = -1;
     auto trace_top1 = [&]() {
         float top = -1.0f;
         if (llama_get_sampled_token_ith(ctx, idxs[std::min(gsmpl->top1_trace.size(), idxs.size() - 1)]) == LLAMA_TOKEN_NULL) {
@@ -1659,6 +1661,9 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_pq(struct common_sam
         common_sampler_pq_result res{x};
         if (have_q && cpu_p) {
             res = common_sampler_verify_pq(p, draft_q[i], draft[i], x, gsmpl->pq_rng, gsmpl->params.spec_lossy, gsmpl->pq_stats, vocab, ends);
+            if (res.rescued && gsmpl->first_rescue < 0) {
+                gsmpl->first_rescue = (int32_t) i;
+            }
             if (lg) {
                 const int64_t t0 = ggml_time_us();
                 pq_log_pos(lg, gsmpl, vocab, seq, generated + i, i, draft[i], x, p, draft_q[i], res, ends);
@@ -1689,6 +1694,10 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_pq(struct common_sam
 
 const std::vector<float> & common_sampler_get_top1_trace(const struct common_sampler * gsmpl) {
     return gsmpl->top1_trace;
+}
+
+int32_t common_sampler_get_first_rescue(const struct common_sampler * gsmpl) {
+    return gsmpl ? gsmpl->first_rescue : -1;
 }
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl) {

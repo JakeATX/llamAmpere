@@ -76,6 +76,15 @@ static bool server_mtp_gpu_verify_enabled() {
         (std::strcmp(gpu_verify, "greedy") == 0 || std::strcmp(gpu_verify, "1") == 0);
 }
 
+// [MBFIX] LLAMA_SPEC_MB_CTRL=beat: the adaptive depth controller sees beat's kept count instead of the exact-rule count
+static bool server_mb_ctrl_exact() {
+    static const bool on = [] {
+        const char * e = std::getenv("LLAMA_SPEC_MB_CTRL");
+        return !(e && std::strcmp(e, "beat") == 0);
+    }();
+    return on;
+}
+
 static bool server_mtp_gpu_verify_sampled_enabled() {
     const char * gpu_verify = std::getenv("LLAMA_MTP_GPU_VERIFY");
     return gpu_verify != nullptr && std::strcmp(gpu_verify, "1") == 0;
@@ -7097,7 +7106,14 @@ private:
                     SLT_INF(slot, "accepted %2zu/%2zu draft tokens\n", accepted.size() - 1, n_draft);
                 }
 
-                common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
+                // [MBFIX] mode-biased MTP changes which word is kept, not the work per round: the adaptive depth
+                // controller is fed the count the exact rule would have accepted (the first rescue ends that count),
+                // so beat drafts at the depths exact would. LLAMA_SPEC_MB_CTRL=beat feeds the kept count (old behavior).
+                int32_t n_ctrl = -1;
+                if (slot.task->params.sampling.spec_lossy && server_mb_ctrl_exact() && !slot.spec_draft_q.empty() && synth_probs.empty()) {
+                    n_ctrl = common_sampler_get_first_rescue(slot.smpl.get());
+                }
+                common_speculative_accept(spec.get(), slot.id, accepted.size() - 1, n_ctrl);
 
                 slot.spec_draft = std::move(accepted);
                 slot.spec_draft_q.clear();

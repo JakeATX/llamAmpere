@@ -193,6 +193,10 @@ const common_sampler_pq_stats & common_sampler_get_pq_stats(const struct common_
 // Entries 0..accepted belong to the committed tokens; later entries do not exist (the call stops at a rejection).
 const std::vector<float> & common_sampler_get_top1_trace(const struct common_sampler * gsmpl);
 
+// [MBFIX] draft position where the last common_sampler_sample_and_accept_n_pq call first kept a draft token that the
+// exact rule had rejected (mode-biased MTP rescue); -1 when it made none. The exact rule would have accepted this many.
+int32_t common_sampler_get_first_rescue(const struct common_sampler * gsmpl);
+
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 
 // force the reasoning budget sampler (if any) to begin forcing its end sequence now.

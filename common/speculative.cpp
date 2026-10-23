@@ -355,6 +355,7 @@ struct common_speculative_impl {
     int64_t t_begin_us  = 0; // total time spent in refresh of this implementation in microseconds.
     int64_t t_draft_us  = 0; // total time spent in generating drafts in this implementation in microseconds.
     int64_t t_accept_us = 0; // total time spent in accumulation of this implementation in microseconds.
+    int32_t n_accepted_ctrl = -1; // [MBFIX] cap on the accepted count the adaptive controller sees (-1 = none), set per accept call
 
     common_speculative_impl(common_speculative_type type, uint32_t n_seq, int32_t n_max) : type(type), n_seq(n_seq), n_max(n_max) {}
 
@@ -3505,7 +3506,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // bonus the controller did not ask for, and verification is sequential, so the accepted prefix within
             // the own depth is what a draft of that depth would have returned
             const int own   = n_own[seq_id] > 0 ? std::min(n_last[seq_id], n_own[seq_id]) : n_last[seq_id];
-            const int n_acc = std::min<int>(n_accepted, own);
+            int n_acc = std::min<int>(n_accepted, own);
+            if (n_accepted_ctrl >= 0) {
+                n_acc = std::min<int>(n_acc, n_accepted_ctrl); // [MBFIX] exact-rule count under mode-biased MTP
+            }
             adaptive_ctrl[seq_id].update(own, n_acc, params.n_max, params.n_min_adaptive);
             if (adaptive_ctrl[seq_id].n_cur != depth_before) {
                 SPC_DBG("adaptive draft depth seq %d: %d -> %d (n_draft=%d, n_accepted=%d)\n",
@@ -5290,7 +5294,7 @@ void common_speculative_note_target_conf(common_speculative * spec, llama_seq_id
     }
 }
 
-void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted) {
+void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted, int32_t n_accepted_ctrl) {
     common_speculative_impl * impl = spec->impl_last[seq_id];
 
     if (impl == nullptr) {
@@ -5314,7 +5318,9 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
             impl->n_acc_tokens += n_accepted;
         }
 
+        impl->n_accepted_ctrl = n_accepted_ctrl;
         impl->accept(seq_id, n_accepted, false);
+        impl->n_accepted_ctrl = -1;
         impl->n_call_accept++;
     }
 
