@@ -4361,6 +4361,13 @@ private:
         return LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | (sj_exact_ckpt() ? LLAMA_STATE_SEQ_FLAGS_SJ_EXACT : 0);
     }
 
+    bool sj_exact_ckpt_for_prompt(int64_t n_tokens, int32_t n_ubatch) const {
+        // fork: short prompts have no grid checkpoint; long prompts keep the fast grid path.
+        const char * limit = getenv("LLAMA_SJKVARN_EXACT_MAX_TOKENS");
+        const int64_t max_tokens = limit ? std::max<int64_t>(0, atoll(limit)) : n_ubatch;
+        return sj_exact_ckpt() && n_tokens <= max_tokens;
+    }
+
     // SJ-KVaRN group boundary at or below n (n when SJ-KVaRN is off)
     llama_pos sj_kvarn_group_floor(llama_pos n) const {
         if (params_base.sj_kvarn_bits_k == 0 && !params_base.speculative.draft.sj_kvarn) {
@@ -6059,8 +6066,8 @@ private:
                     // tokens before the end) on top of the grid, which stays (plain checkpoints) so that a rollback
                     // into the middle of a long prompt still finds a checkpoint
                     const bool sj_align = params_base.sj_kvarn_bits_k > 0 || params_base.speculative.draft.sj_kvarn;
-                    const bool sj_exact = sj_exact_ckpt();
                     const int64_t n_task = slot.task->n_tokens();
+                    const bool sj_exact = sj_exact_ckpt_for_prompt(n_task, n_ubatch);
                     const int64_t ckpt_call0 = slot.prompt.n_tokens();
                     const bool ckpt_mtp_ranges = common_speculative_supports_process_range(spec.get());
                     auto ckpt_target_floor = [&](int64_t q) {
