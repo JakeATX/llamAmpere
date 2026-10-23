@@ -108,6 +108,22 @@ static int moe_miss_list_mode() {
     }();
     return mode;
 }
+// fork STRATAGAP DOWNONE: GGML_MOE_DOWN_ONE=1|check. On a hit-first layer the down projection waits for its copy
+// first and then computes every route the card owns in ONE launch over the effective table (resident experts at
+// their cache address, staged ones at their copy), instead of a hit pass and a miss pass. The down copy is normally
+// done by then (it is issued with the gate/up copies at the layer's start), so this drops one launch per layer
+// without losing overlap. Each route is still computed by the same kernel with the same per-route arithmetic, so the
+// output keeps its bits. check = also run the old two passes into a copy and trap on any bit change.
+static int moe_down_one_mode() {
+    static const int mode = [] {
+        const char * e = getenv("GGML_MOE_DOWN_ONE");
+        if (!e) { return 0; }
+        return strcmp(e, "check") == 0 ? 2 : atoi(e) != 0 ? 1 : 0;
+    }();
+    return mode;
+}
+static std::atomic<unsigned long long> g_st_one{0};
+static uint8_t * g_hf_zero = nullptr;   // [g_hf_experts] zeros: the single down pass's filter when no expert is on the CPU
 static size_t g_hf_stride = 0;
 static int64_t g_hf_experts = 0;
 static int g_hf_slots = 0;
@@ -143,6 +159,8 @@ static float * g_cs_out_h = nullptr, * g_cs_out_d = nullptr;
 static size_t g_cs_x_stride = 0, g_cs_out_stride = 0;
 static moe_cs_plan_dev * g_cs_plan = nullptr;
 static uint8_t * g_cs_mask = nullptr;      // [3][g_hf_experts]: resident or on the CPU (the miss passes skip both)
+// fork STRATAGAP DOWNONE: g_cs_mask has a 4th row, [3][e] = 1 when the host computes expert e this layer (written only
+// with GGML_MOE_DOWN_ONE on); the single down pass skips exactly those.
 static float g_cs_route_ns = 0.0f, g_cs_fixed_ns = 0.0f, g_cs_ns_per_byte = 0.0f;
 static int g_cs_max_exp = 8, g_cs_max_route = 24;
 static int g_cs_adapt = 0;   // GGML_MOE_CPU_SPLIT_ADAPT=1: the join corrects the per-route cost from the host's measured job times
@@ -254,10 +272,11 @@ static void moe_missjoin_log(const char * when) {
                 g_hf_graph_end_joins.load(std::memory_order_relaxed));
     }
     if (g_st_hitg.load() || g_st_ml.load() || g_st_pc.load() || g_st_q8hit.load() || g_st_q8claim.load() ||
-            ggml_cuda_moe_down_sw_count()) {
+            ggml_cuda_moe_down_sw_count() || g_st_one.load()) {
         MOE_CACHE_LOG("[moe-cache] stratagap paths %s: hit_fused_layers=%llu miss_list_passes=%llu plan_count_layers=%llu "
-                "q8_share_hits=%llu q8_share_claims=%llu down_sw_passes=%llu (issue-time counts)\n", when, g_st_hitg.load(),
-                g_st_ml.load(), g_st_pc.load(), g_st_q8hit.load(), g_st_q8claim.load(), ggml_cuda_moe_down_sw_count());
+                "q8_share_hits=%llu q8_share_claims=%llu down_sw_passes=%llu down_one_layers=%llu (issue-time counts)\n",
+                when, g_st_hitg.load(), g_st_ml.load(), g_st_pc.load(), g_st_q8hit.load(), g_st_q8claim.load(),
+                ggml_cuda_moe_down_sw_count(), g_st_one.load());
     }
     if (g_cs_on && g_cs_plan) {
         moe_cs_plan_dev plan{};
@@ -8518,8 +8537,8 @@ static void moe_cs_prepare(moe_cache_session & session) {
         if (ok) {
             ok = cudaMalloc((void **) &g_cs_plan, sizeof(moe_cs_plan_dev)) == cudaSuccess &&
                  cudaMemset(g_cs_plan, 0, sizeof(moe_cs_plan_dev)) == cudaSuccess &&
-                 cudaMalloc((void **) &g_cs_mask, 3 * (size_t) g_hf_experts) == cudaSuccess &&
-                 cudaMemset(g_cs_mask, 1, 3 * (size_t) g_hf_experts) == cudaSuccess;
+                 cudaMalloc((void **) &g_cs_mask, 4 * (size_t) g_hf_experts) == cudaSuccess &&
+                 cudaMemset(g_cs_mask, 1, 4 * (size_t) g_hf_experts) == cudaSuccess;
         }
         ok = ok && moe_cs_start(g_cs_job_h, g_cs_x_h, g_cs_x_stride, g_cs_out_h, g_cs_out_stride, max_ff, max_embd);
         if (!ok) {
@@ -8644,7 +8663,9 @@ static void moe_missjoin_overlap_prepare(moe_cache_session & session) {
                  cudaMalloc((void **) &g_hf_src, 3 * (size_t) slots * sizeof(void *)) == cudaSuccess &&
                  cudaMalloc((void **) &g_hf_nstage, 3 * sizeof(int)) == cudaSuccess &&
                  cudaMalloc((void **) &g_hf_miss, 4 * sizeof(moe_miss_list)) == cudaSuccess &&
-                 cudaMemset(g_hf_miss, 0, 4 * sizeof(moe_miss_list)) == cudaSuccess;
+                 cudaMemset(g_hf_miss, 0, 4 * sizeof(moe_miss_list)) == cudaSuccess &&
+                 cudaMalloc((void **) &g_hf_zero, (size_t) experts) == cudaSuccess &&
+                 cudaMemset(g_hf_zero, 0, (size_t) experts) == cudaSuccess;
             if (ok) {
                 g_hf_stride = stride;
                 g_hf_experts = experts;
@@ -8766,6 +8787,7 @@ struct moe_hf_plan_args {
     // fork STRATAGAP: CPU expert split (cs null: off for this layer; only the fast plan kernel reads these)
     moe_cs_plan_dev * cs;
     uint8_t * cs_mask;            // [3][cs_mask_stride]: nonzero = the miss pass skips the expert
+    uint8_t * cs_cpu;             // fork STRATAGAP DOWNONE: [cs_mask_stride] 1 = on the CPU this layer (null: off)
     int64_t cs_mask_stride;
     float cs_route_ns, cs_fixed_ns, cs_ns_per_byte;
     int cs_adapt;
@@ -9077,6 +9099,7 @@ static __global__ void __launch_bounds__(256) moe_hf_plan_fast_kernel(const moe_
             const int e = s_e[i];
             if (e < 0 || e >= n_expert) { continue; }
             const int slot = s_cpu[e];
+            if (args.cs_cpu) { args.cs_cpu[e] = (unsigned char) (slot != 0); }
             if (slot) {
                 // the CPU computes this expert: never staged, its routes listed in route order
 #pragma unroll
@@ -9441,6 +9464,7 @@ static bool moe_hf_begin(ggml_backend_cuda_context & ctx, moe_cache_session & se
         args.cs = g_cs_plan;
         args.cs_mask = g_cs_mask;
         args.cs_mask_stride = g_hf_experts;
+        args.cs_cpu = moe_down_one_mode() != 0 ? g_cs_mask + 3 * (size_t) g_hf_experts : nullptr;
         args.cs_route_ns = g_cs_route_ns;
         args.cs_adapt = g_cs_adapt;
         args.cs_fixed_ns = g_cs_fixed_ns;
@@ -10339,18 +10363,19 @@ bool ggml_cuda_moe_cache_device_compute(ggml_backend_cuda_context & ctx, ggml_te
         // Resident routes first, then the routes whose experts were just copied; together they compute
         // every route exactly once with the same kernel.
         const int64_t ids_stride = ids->nb[1] / sizeof(int32_t);
-        const bool hit_ok = ggml_cuda_moe_table_mmv_d1_try(ctx, table.device, (ggml_type) table.desc.type, quantized,
-                (const int32_t *) ids->data, (float *) op->data, a->ne[0], op->ne[0], ids->ne[0], ids->ne[1], a->ne[1],
-                ids_stride, table.hot, 1) ||
-            ggml_cuda_moe_table_mmv_filtered(table.device, (ggml_type) table.desc.type, quantized,
-                (const int32_t *) ids->data, (float *) op->data, a->ne[0], op->ne[0], ids->ne[0], ids->ne[1], a->ne[1],
-                ids_stride, table.hot, 1, ctx.stream());
-        GGML_ASSERT(hit_ok);
-        CUDA_CHECK(cudaGetLastError());
-        const void * const * eff = moe_hf_wait(ctx, session, table);
         // fork STRATAGAP: on a CPU-split layer the miss pass also skips the experts the host computes
         const bool cs = session.cs_layer >= 0 && session.cs_layer == table.mj_layer;
         const uint8_t * miss_skip = cs ? g_cs_mask + (size_t) table.mj_kind * g_hf_experts : table.hot;
+        const void * const * eff = nullptr;
+        auto hit_pass = [&](float * out) {
+            const bool hit_ok = ggml_cuda_moe_table_mmv_d1_try(ctx, table.device, (ggml_type) table.desc.type, quantized,
+                    (const int32_t *) ids->data, out, a->ne[0], op->ne[0], ids->ne[0], ids->ne[1], a->ne[1],
+                    ids_stride, table.hot, 1) ||
+                ggml_cuda_moe_table_mmv_filtered(table.device, (ggml_type) table.desc.type, quantized,
+                    (const int32_t *) ids->data, out, a->ne[0], op->ne[0], ids->ne[0], ids->ne[1], a->ne[1],
+                    ids_stride, table.hot, 1, ctx.stream());
+            GGML_ASSERT(hit_ok);
+        };
         auto old_miss = [&](float * out) {
             const bool miss_ok = ggml_cuda_moe_table_mmv_d1_try(ctx, eff, (ggml_type) table.desc.type, quantized,
                     (const int32_t *) ids->data, out, a->ne[0], op->ne[0], ids->ne[0], ids->ne[1], a->ne[1],
@@ -10360,10 +10385,47 @@ bool ggml_cuda_moe_cache_device_compute(ggml_backend_cuda_context & ctx, ggml_te
                     ids_stride, miss_skip, 0, ctx.stream());
             GGML_ASSERT(miss_ok);
         };
-        if (!(ids->ne[2] == 1 && table.mj_kind >= 0 && table.mj_kind < 3 &&
-                moe_miss_pass_list(ctx, session, table.mj_layer, table.mj_kind, eff, nullptr, (ggml_type) table.desc.type,
-                    quantized, (float *) op->data, a->ne[0], op->ne[0], ids->ne[0], ids->ne[1], a->ne[1], old_miss))) {
-            old_miss((float *) op->data);
+        auto miss_pass = [&](float * out) {
+            if (!(ids->ne[2] == 1 && table.mj_kind >= 0 && table.mj_kind < 3 &&
+                    moe_miss_pass_list(ctx, session, table.mj_layer, table.mj_kind, eff, nullptr, (ggml_type) table.desc.type,
+                        quantized, out, a->ne[0], op->ne[0], ids->ne[0], ids->ne[1], a->ne[1], old_miss))) {
+                old_miss(out);
+            }
+        };
+        // fork STRATAGAP DOWNONE: the down projection as one pass over the effective table (see moe_down_one_mode)
+        const int one = table.mj_kind == 2 ? moe_down_one_mode() : 0;
+        if (one != 0) {
+            eff = moe_hf_wait(ctx, session, table);
+            const int64_t count = op->ne[0] * ids->ne[0] * ids->ne[1];
+            GGML_ASSERT(op->type == GGML_TYPE_F32 && ggml_is_contiguous(op) && ggml_nelements(op) == count);
+            ggml_cuda_pool_alloc<float> reference(ctx.pool());
+            if (one == 2) {
+                float * ref = reference.alloc((size_t) count);
+                CUDA_CHECK(cudaMemcpyAsync(ref, op->data, (size_t) count * sizeof(float), cudaMemcpyDeviceToDevice,
+                        ctx.stream()));
+                hit_pass(ref);
+                miss_pass(ref);
+            }
+            // every expert the card owns (CPU-split layers skip the host's experts, flagged by the plan)
+            const uint8_t * cpu = cs ? g_cs_mask + 3 * (size_t) g_hf_experts : g_hf_zero;
+            const bool one_ok = ggml_cuda_moe_table_mmv_d1_try(ctx, eff, (ggml_type) table.desc.type, quantized,
+                    (const int32_t *) ids->data, (float *) op->data, a->ne[0], op->ne[0], ids->ne[0], ids->ne[1],
+                    a->ne[1], ids_stride, cpu, 0) ||
+                ggml_cuda_moe_table_mmv_filtered(eff, (ggml_type) table.desc.type, quantized,
+                    (const int32_t *) ids->data, (float *) op->data, a->ne[0], op->ne[0], ids->ne[0], ids->ne[1],
+                    a->ne[1], ids_stride, cpu, 0, ctx.stream());
+            GGML_ASSERT(one_ok);
+            g_st_one.fetch_add(1, std::memory_order_relaxed);
+            // with CPU_SPLIT_PARTIAL the old hit pass also wrote the resident rows of the host's experts (the join
+            // overwrites them right after), so the two buffers are only comparable without it
+            if (one == 2 && !(cs && g_cs_partial)) {
+                ggml_cuda_moe_bits_check(reference.get(), (const float *) op->data, count, ctx.stream());
+            }
+        } else {
+            hit_pass((float *) op->data);
+            CUDA_CHECK(cudaGetLastError());
+            eff = moe_hf_wait(ctx, session, table);
+            miss_pass((float *) op->data);
         }
         CUDA_CHECK(cudaGetLastError());
         if (cs && table.mj_kind == 2) {
