@@ -112,6 +112,9 @@ static size_t g_hf_stride = 0;
 static int64_t g_hf_experts = 0;
 static int g_hf_slots = 0;
 static std::atomic<unsigned long long> g_hf_layers{0};
+// fork STRATAGAP: how often each new switch took its path (counted where the host issues the work, so a CUDA graph
+// counts once per capture, not per replay)
+static std::atomic<unsigned long long> g_st_hitg{0}, g_st_ml{0}, g_st_pc{0}, g_st_q8hit{0}, g_st_q8claim{0};
 // fork PARFIX: graphs that ended with a layer's side copies still unjoined (see ggml_cuda_moe_cache_hf_graph_end).
 static std::atomic<unsigned long long> g_hf_graph_end_joins{0};
 // fork STRATAGAP (GGML_MOE_CPU_SPLIT=1): the host CPU computes part of each hit-first layer's missed experts
@@ -249,6 +252,12 @@ static void moe_missjoin_log(const char * when) {
     if (const unsigned long long hf = g_hf_layers.load(std::memory_order_relaxed)) {
         MOE_CACHE_LOG("[moe-cache] missjoin hit-first %s: hf_layers=%llu graph_end_joins=%llu\n", when, hf,
                 g_hf_graph_end_joins.load(std::memory_order_relaxed));
+    }
+    if (g_st_hitg.load() || g_st_ml.load() || g_st_pc.load() || g_st_q8hit.load() || g_st_q8claim.load() ||
+            ggml_cuda_moe_down_sw_count()) {
+        MOE_CACHE_LOG("[moe-cache] stratagap paths %s: hit_fused_layers=%llu miss_list_passes=%llu plan_count_layers=%llu "
+                "q8_share_hits=%llu q8_share_claims=%llu down_sw_passes=%llu (issue-time counts)\n", when, g_st_hitg.load(),
+                g_st_ml.load(), g_st_pc.load(), g_st_q8hit.load(), g_st_q8claim.load(), ggml_cuda_moe_down_sw_count());
     }
     if (g_cs_on && g_cs_plan) {
         moe_cs_plan_dev plan{};
@@ -9329,6 +9338,7 @@ static bool moe_miss_pass_list(ggml_backend_cuda_context & ctx, const moe_cache_
     }
     ggml_cuda_moe_table_mmv_list(ctx, g_hf_miss + list, eff, gate_eff, type, quantized, dst, n_in, n_out, n_ids,
             n_tokens, channels);
+    g_st_ml.fetch_add(1, std::memory_order_relaxed);
     if (moe_miss_list_mode() == 2) {
         ggml_cuda_moe_bits_check(reference.get(), dst, count, ctx.stream());
     }
@@ -9425,6 +9435,7 @@ static bool moe_hf_begin(ggml_backend_cuda_context & ctx, moe_cache_session & se
         session.pc_layer = L;
         session.pc_ids = ids->data;
         session.pc_mask = 7u;
+        g_st_pc.fetch_add(1, std::memory_order_relaxed);
     }
     if (cs) {
         args.cs = g_cs_plan;
@@ -10264,6 +10275,7 @@ static char * moe_quantize_act(ggml_backend_cuda_context & ctx, const ggml_tenso
         }
         char * hit = ggml_cuda_q8_cache_lookup(ctx, base, type, q8_bytes, padded);
         if (hit) {
+            g_st_q8hit.fetch_add(1, std::memory_order_relaxed);
             if (mode == 2) {
                 char * ref = local.alloc(q8_bytes);
                 quantize(ref);
@@ -10273,6 +10285,7 @@ static char * moe_quantize_act(ggml_backend_cuda_context & ctx, const ggml_tenso
             return hit;
         }
         char * buf = ggml_cuda_q8_cache_claim(ctx, base, type, q8_bytes, padded);
+        g_st_q8claim.fetch_add(1, std::memory_order_relaxed);
         quantize(buf);
         return buf;
     }
@@ -10443,6 +10456,7 @@ bool ggml_cuda_moe_cache_device_fused_compute(ggml_backend_cuda_context & ctx,
                 }
                 ggml_cuda_pool_alloc<char> q8(ctx.pool());
                 char * quantized = moe_quantize_act(ctx, a, (ggml_type) up_table.desc.type, true, q8);
+                g_st_hitg.fetch_add(1, std::memory_order_relaxed);
                 // hit pass: experts resident for both projections
                 ggml_cuda_moe_table_mmv_hitg(ctx, up_table.device, gate_table.device, (ggml_type) up_table.desc.type,
                         quantized, (const int32_t *) ids->data, (float *) glu->data, a->ne[0], glu->ne[0], ids->ne[0],

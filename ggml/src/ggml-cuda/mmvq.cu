@@ -1,3 +1,4 @@
+#include <atomic>
 #include "mmvq.cuh"
 #include "convrot.cuh"
 #include "quantize.cuh"
@@ -3923,6 +3924,9 @@ static int moe_sw_mode() {
     return mode;
 }
 
+static std::atomic<unsigned long long> g_moe_sw_count{0};
+unsigned long long ggml_cuda_moe_down_sw_count() { return g_moe_sw_count.load(std::memory_order_relaxed); }
+
 bool ggml_cuda_moe_down_sw_on(ggml_type type) {
     return moe_sw_mode() != 0 && (type == GGML_TYPE_Q2_0 || type == GGML_TYPE_IQ4_NL);
 }
@@ -3956,6 +3960,7 @@ bool ggml_cuda_moe_table_mmv_d1_try(ggml_backend_cuda_context & ctx,
             n_out < 1 || n_out > INT_MAX / (n_ids*n_tokens) || ids_stride < n_ids || ids_stride > INT_MAX / n_tokens) {
         return false;
     }
+    if (sw) { g_moe_sw_count.fetch_add(1, std::memory_order_relaxed); }
     static const int sw_shape = [] {
         const char * e = getenv("GGML_MOE_DOWN_SW_SHAPE");
         static const char * const names[] = { "8x2", "16x2", "8x1", "8x2g1", "8x2w8", "16x1", "8x2g4", "4x2" };
