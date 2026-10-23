@@ -7334,6 +7334,41 @@ static void add_kqrows_cases(std::vector<std::unique_ptr<test_case>> & cases, bo
     }
 }
 
+// [FROWS] float-weight row kernel at 2..8 columns (GGML_TEST_FROWS=1 adds the cases). GGML_TEST_FROWS_REQUIRE=1 fails a
+// case when GGML_CUDA_FROWS=1 is set but the row kernel did not run.
+struct test_mul_mat_frows : public test_mul_mat {
+    test_mul_mat_frows(ggml_type type, int64_t m, int64_t n, int64_t k)
+        : test_mul_mat(type, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}) {}
+
+    std::string vars() override {
+        return test_mul_mat::vars() + ",frows=1";
+    }
+
+    const char * required_fusion() override {
+        const char * on      = getenv("GGML_CUDA_FROWS");
+        const char * require = getenv("GGML_TEST_FROWS_REQUIRE");
+        return on != nullptr && atoi(on) != 0 && require != nullptr && atoi(require) != 0 && n >= 2 && n <= 8 ? "frows" : nullptr;
+    }
+};
+
+static void add_frows_cases(std::vector<std::unique_ptr<test_case>> & cases, bool perf) {
+    if (getenv("GGML_TEST_FROWS") == nullptr) {
+        return;
+    }
+    // Flash-Next narrow float weights (rows x K): router 512 x 2560 (F32), indexer q 512 / k 128 x 2560 (BF16);
+    // 1024 = the default row limit; 513 / 100 rows leave a partial last block; K 264 leaves threads idle in the last step.
+    const std::vector<std::pair<int64_t, int64_t>> shapes = perf ?
+        std::vector<std::pair<int64_t, int64_t>>{ {512, 2560}, {128, 2560}, {1024, 2560} } :
+        std::vector<std::pair<int64_t, int64_t>>{ {512, 2560}, {128, 2560}, {513, 2560}, {100, 264}, {1024, 2560}, {7, 8} };
+    for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_BF16, GGML_TYPE_F16 }) {
+        for (const auto & mk : shapes) {
+            for (int64_t n = perf ? 4 : 2; n <= (perf ? 5 : 8); ++n) {
+                cases.emplace_back(new test_mul_mat_frows(type, mk.first, n, mk.second));
+            }
+        }
+    }
+}
+
 // fork: opt-in cases also verify dispatch counters so a fallback cannot hide missing coverage.
 struct test_mul_mat_mmq_prefill : public test_mul_mat {
     const bool q8_exact;
@@ -14556,6 +14591,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     add_mmf_split_k_cases(test_cases, false);
     add_iq4xs_wide_cases(test_cases);
     add_kqrows_cases(test_cases, false);
+    add_frows_cases(test_cases, false);
     add_parwrev_cases(test_cases, false);
     // [PARW] few-tile long-K MMQ (stream-k CTA cap): the 48-row GDN gates and small matrices at widths 9..32
     for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_Q5_0, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS}) {
@@ -18188,6 +18224,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     add_iq4xs_k4_cases(test_cases, true);
     add_mmf_split_k_cases(test_cases, true);
     add_kqrows_cases(test_cases, true);
+    add_frows_cases(test_cases, true);
 
     // [HCGP] Flash-Next hyper-connection mixer at a 4,096- and 12,288-token ubatch (GGML_CUDA_HC_GATE_PRE A/B)
     test_cases.emplace_back(new test_dsv4_hc_mix(2560, 4, 320, 4096));

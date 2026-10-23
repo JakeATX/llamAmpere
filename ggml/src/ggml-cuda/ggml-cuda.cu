@@ -44,6 +44,7 @@
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/mmvq-kq-tc.cuh"
 #include "ggml-cuda/mmvq-kqrows.cuh"
+#include "ggml-cuda/mmvf-rows.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
 #include "ggml-cuda/nemotron-moe.cuh"
 #include "ggml-cuda/nemotron-ssm.cuh"
@@ -3250,6 +3251,7 @@ static bool ggml_cuda_tq_mmq_supported(const ggml_tensor * src0, const int cc) {
 // quantize its activation through the MMVQ shared-quantize cache, so the two cannot drift. Checks run in dispatch order.
 enum ggml_cuda_mm_route {
     GGML_CUDA_MM_ROUTE_CUBLAS_FORCED,   // src0 padding cannot be cleared (compute-buffer view), or src1/dst not f32
+    GGML_CUDA_MM_ROUTE_FROWS,           // [FROWS] narrow F32/F16/BF16 weight at 2..8 columns, R rows per block (GGML_CUDA_FROWS=1)
     GGML_CUDA_MM_ROUTE_MMVF,
     GGML_CUDA_MM_ROUTE_MMVF_TRANSPOSED, // f32 src0 with one row: src1 is the matrix
     GGML_CUDA_MM_ROUTE_MMF,
@@ -3271,6 +3273,9 @@ static ggml_cuda_mm_route ggml_cuda_mul_mat_route(const ggml_tensor * src0, cons
 
     const int64_t ne11 = src1->ne[1];
 
+    if (ggml_cuda_frows_wants(src0, src1, dst, cc)) {
+        return GGML_CUDA_MM_ROUTE_FROWS;
+    }
     if (ggml_cuda_should_use_mmvf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11)) {
         // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
         // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
@@ -3449,6 +3454,10 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 
     if (route == GGML_CUDA_MM_ROUTE_CUBLAS_FORCED) {
         ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
+        return;
+    }
+    if (route == GGML_CUDA_MM_ROUTE_FROWS) {
+        ggml_cuda_frows_mul_mat(ctx, src0, src1, dst);
         return;
     }
     if (route == GGML_CUDA_MM_ROUTE_MMVF) {
@@ -11885,6 +11894,9 @@ int64_t ggml_backend_cuda_fusion_count(ggml_backend_t backend, const char * name
     }
     if (strcmp(name, "gdn_state_read") == 0) {
         return ctx->fusion_stats.gdn_state_read;
+    }
+    if (strcmp(name, "frows") == 0) {
+        return ggml_cuda_frows_count;
     }
     if (strcmp(name, "kqrows") == 0) {
         extern int64_t ggml_cuda_kqrows_count; // mmvq-kqrows.cu
