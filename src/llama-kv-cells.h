@@ -3,10 +3,12 @@
 #include "llama.h"
 #include "llama-cparams.h"
 
+#include <algorithm>
 #include <bitset>
 #include <cassert>
 #include <cstring>
 #include <limits>
+#include <iterator>
 #include <set>
 #include <vector>
 
@@ -46,11 +48,44 @@ public:
         }
 
         has_shift = false;
+        pos_identity = true;
+        pos_sorted   = true;
 
         used.clear();
 
         for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
             seq_pos[s].clear();
+        }
+    }
+
+    // fork: true while every used cell i holds position i, as for one sequence of text filled in order with suffixes
+    // removed (see pos_range())
+    bool pos_is_identity() const {
+        return pos_identity;
+    }
+
+    // fork: true while the positions never decrease along the used cells, as for one sequence filled in order with
+    // suffixes removed, also when M-RoPE image tokens share a position (see pos_range())
+    bool pos_is_sorted() const {
+        return pos_sorted;
+    }
+
+    // fork: the cells [i_beg, i_end) that can hold a position of [p0, p1) (p0 >= 0, p1 >= 0); no cell outside of them
+    // does. llama_kv_cache::seq_rm scans only these cells instead of all size() cells:
+    //  - the cells after the last used one are empty
+    //  - with pos_is_identity(), the cells [p0, p1)
+    //  - with pos_is_sorted() and no empty cell below used_max_p1(), the cells from the first one with a position >= p0
+    //    to the first one with a position >= p1
+    void pos_range(llama_pos p0, llama_pos p1, uint32_t & i_beg, uint32_t & i_end) const {
+        const uint32_t n = used_max_p1();
+        i_beg = 0;
+        i_end = n;
+        if (pos_identity) {
+            i_beg = (uint32_t) std::min<int64_t>(p0, n);
+            i_end = (uint32_t) std::min<int64_t>(p1, n);
+        } else if (pos_sorted && used.size() == n) {
+            i_beg = pos_lower_bound(p0, n);
+            i_end = pos_lower_bound(p1, n);
         }
     }
 
@@ -174,7 +209,7 @@ public:
             }
 
             if (pos[idx] != -1 && other.pos[j] == -1) {
-                used.erase(i + j);
+                used_erase(i + j);
             }
 
             if (pos[idx] != -1) {
@@ -184,9 +219,13 @@ public:
             pos[idx] = other.pos[j];
             ext[idx] = other.ext[j];
             seq[idx] = other.seq[j];
+            if (pos[idx] != -1 && pos[idx] != (llama_pos) idx) {
+                pos_identity = false;
+            }
 
             if (pos[idx] != -1) {
                 seq_pos_add(i + j);
+                pos_sorted_check(idx);
             }
 
             assert(shift[idx] == 0);
@@ -205,7 +244,7 @@ public:
             }
 
             if (pos[idx] != -1 && other.pos[j] == -1) {
-                used.erase(idx);
+                used_erase(idx);
             }
 
             if (pos[idx] != -1) {
@@ -215,9 +254,13 @@ public:
             pos[idx] = other.pos[j];
             ext[idx] = other.ext[j];
             seq[idx] = other.seq[j];
+            if (pos[idx] != -1 && pos[idx] != (llama_pos) idx) {
+                pos_identity = false;
+            }
 
             if (pos[idx] != -1) {
                 seq_pos_add(idx);
+                pos_sorted_check(idx);
             }
 
             assert(shift[idx] == 0);
@@ -236,7 +279,7 @@ public:
         ext[i].reset();
         shift[i] = 0;
 
-        used.erase(i);
+        used_erase(i);
     }
 
     // note: call only if the cell has seq_id
@@ -255,7 +298,7 @@ public:
             ext[i].reset();
             shift[i] = 0;
 
-            used.erase(i);
+            used_erase(i);
 
             return true;
         }
@@ -285,7 +328,7 @@ public:
             ext[i].reset();
             shift[i] = 0;
 
-            used.erase(i);
+            used_erase(i);
 
             return true;
         }
@@ -446,8 +489,12 @@ public:
         assert(seq[i].none());
 
         pos[i] = p;
+        if (p != (llama_pos) i) {
+            pos_identity = false;
+        }
 
         used.insert(i);
+        pos_sorted_check(i);
     }
 
     void ext_set(uint32_t i, llama_kv_cell_ext p) {
@@ -466,6 +513,8 @@ public:
 
         pos[i]   += d;
         shift[i] += d;
+        pos_identity = false;
+        pos_sorted   = false;
 
         has_shift = true;
 
@@ -474,7 +523,7 @@ public:
             pos[i] = -1;
             shift[i] = 0;
 
-            used.erase(i);
+            used_erase(i);
 
             return true;
         }
@@ -497,6 +546,8 @@ public:
 
         pos[i]   /= d;
         shift[i] += p_old - pos[i];
+        pos_identity = false;
+        pos_sorted   = false;
 
         seq_pos_add(i);
 
@@ -505,6 +556,57 @@ public:
 
 private:
     bool has_shift = false;
+    bool pos_identity = true; // fork: see pos_is_identity()
+    bool pos_sorted   = true; // fork: see pos_is_sorted()
+
+    // fork: with no used cell left both orders hold again (a cleared sequence starts over)
+    void used_erase(uint32_t i) {
+        used.erase(i);
+        if (used.empty()) {
+            pos_identity = true;
+            pos_sorted   = true;
+        }
+    }
+
+    // fork: first cell in [0, n) whose position is >= p (needs pos_sorted and the cells [0, n) all used)
+    uint32_t pos_lower_bound(llama_pos p, uint32_t n) const {
+        uint32_t lo = 0;
+        uint32_t hi = n;
+        while (lo < hi) {
+            const uint32_t mid = lo + (hi - lo)/2;
+            if (pos[mid] < p) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        return lo;
+    }
+
+    // fork: cell i was just filled and is in `used`: the order holds when its position is >= the position of the
+    // previous used cell and <= that of the next one. An append at the end, the usual case, reads only the
+    // previous one.
+    void pos_sorted_check(uint32_t i) {
+        if (!pos_sorted) {
+            return;
+        }
+        const llama_pos p = pos[i];
+        if (*used.rbegin() == i) {
+            auto prev = std::next(used.rbegin());
+            if (prev != used.rend() && pos[*prev] > p) {
+                pos_sorted = false;
+            }
+            return;
+        }
+        auto it = used.find(i);
+        if (it != used.begin() && pos[*std::prev(it)] > p) {
+            pos_sorted = false;
+        }
+        auto nx = std::next(it);
+        if (nx != used.end() && pos[*nx] < p) {
+            pos_sorted = false;
+        }
+    }
 
     // set of indices of used cells (i.e. pos[i] != -1, allowed to not have any seq_id)
     std::set<uint32_t> used;
