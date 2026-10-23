@@ -96,6 +96,18 @@ static char * g_hf_scratch = nullptr;
 static const void ** g_hf_eff = nullptr;
 static const void ** g_hf_src = nullptr;
 static int * g_hf_nstage = nullptr;
+// fork STRATAGAP MISSLIST: GGML_MOE_MISS_LIST=1|check. The plan kernel writes the miss passes' expert lists
+// (moe_miss_list, mmvq.cuh: 0 up, 1 gate, 2 down, 3 fused gate+up); a miss pass is then one launch over the
+// experts it computes instead of a grid over every route. check = also run the old pass and trap on any bit change.
+static moe_miss_list * g_hf_miss = nullptr;
+static int moe_miss_list_mode() {
+    static const int mode = [] {
+        const char * e = getenv("GGML_MOE_MISS_LIST");
+        if (!e) { return 0; }
+        return strcmp(e, "check") == 0 ? 2 : atoi(e) != 0 ? 1 : 0;
+    }();
+    return mode;
+}
 static size_t g_hf_stride = 0;
 static int64_t g_hf_experts = 0;
 static int g_hf_slots = 0;
@@ -750,6 +762,8 @@ struct moe_cache_session {
     std::vector<uint8_t> cs_registered;
     std::vector<uint8_t> cs_valid;
     int cs_layer = -1;
+    // fork STRATAGAP MISSLIST: the layer whose plan wrote the miss lists (-1: none)
+    int ml_layer = -1;
     int active_scopes = 0;
     int active_nodes = 0;
     struct active_source {
@@ -8612,7 +8626,9 @@ static void moe_missjoin_overlap_prepare(moe_cache_session & session) {
             ok = cudaMalloc((void **) &g_hf_scratch, 3 * (size_t) slots * stride) == cudaSuccess &&
                  cudaMalloc((void **) &g_hf_eff, 3 * (size_t) experts * sizeof(void *)) == cudaSuccess &&
                  cudaMalloc((void **) &g_hf_src, 3 * (size_t) slots * sizeof(void *)) == cudaSuccess &&
-                 cudaMalloc((void **) &g_hf_nstage, 3 * sizeof(int)) == cudaSuccess;
+                 cudaMalloc((void **) &g_hf_nstage, 3 * sizeof(int)) == cudaSuccess &&
+                 cudaMalloc((void **) &g_hf_miss, 4 * sizeof(moe_miss_list)) == cudaSuccess &&
+                 cudaMemset(g_hf_miss, 0, 4 * sizeof(moe_miss_list)) == cudaSuccess;
             if (ok) {
                 g_hf_stride = stride;
                 g_hf_experts = experts;
@@ -8741,6 +8757,7 @@ struct moe_hf_plan_args {
     int cs_max_exp, cs_max_route;
     int cs_partial;               // fork STRATAGAP CPU-first (see g_cs_partial)
     float cs_floor_ns, cs_link_w;
+    moe_miss_list * miss;         // fork STRATAGAP MISSLIST: [4] lists to write (null: off; fast kernel only)
 };
 
 // counts: 0 dispatches, 1 distinct experts, 2 distinct misses, 3 staged, 4 miss routes, 5 unstaged misses
@@ -8864,6 +8881,7 @@ static __global__ void __launch_bounds__(256) moe_hf_plan_fast_kernel(const moe_
     __shared__ int s_nk[3];                                   // distinct misses per projection
     __shared__ int s_ncand;
     __shared__ int s_cs_first[MOE_CS_MAX_EXPERTS + 1];
+    __shared__ int s_ml[4];                                   // fork STRATAGAP MISSLIST: entries per list
     const int tid = threadIdx.x;
     for (int i = tid; i < n_routes; i += blockDim.x) {
         s_e[i] = ids[(i / n_ids) * ids_stride + i % n_ids];
@@ -8880,6 +8898,7 @@ static __global__ void __launch_bounds__(256) moe_hf_plan_fast_kernel(const moe_
         s_nk[tid] = 0;
     }
     if (tid == 0) { s_ncand = 0; }
+    if (tid < 4) { s_ml[tid] = 0; }
     __syncthreads();
     // bit0 distinct, bit1 miss, bit2 stageable (as in moe_hf_plan_kernel)
     for (int i = tid; i < n_routes; i += blockDim.x) {
@@ -9026,6 +9045,46 @@ static __global__ void __launch_bounds__(256) moe_hf_plan_fast_kernel(const moe_
             }
         }
         __syncthreads();
+    }
+    if (args.miss) {
+        // fork STRATAGAP MISSLIST: the experts each miss pass computes (missed, not on the CPU), in first-route order,
+        // with their route masks; the same set the masked miss passes pick (cs_mask / hot)
+        for (int i = tid; i < n_routes; i += blockDim.x) {
+            if (!(s_flag[0][i] & 1)) { continue; }
+            const int e = s_e[i];
+            const bool cpu = args.cs && s_cpu[e];
+            bool need[4];
+#pragma unroll
+            for (int k = 0; k < 3; ++k) { need[k] = (s_flag[k][i] & 2) && !cpu; }
+            need[3] = need[0] || need[1];
+            if (!(need[0] || need[1] || need[2])) { continue; }
+            int rank[4] = { 0, 0, 0, 0 };
+            unsigned long long routes = 1ull << i;
+            for (int j = 0; j < i; ++j) {
+                const int ej = s_e[j];
+                if (ej == e) { routes |= 1ull << j; }
+                if (!(s_flag[0][j] & 1)) { continue; }
+                const bool cj = args.cs && s_cpu[ej];
+                const bool n0 = (s_flag[0][j] & 2) && !cj, n1 = (s_flag[1][j] & 2) && !cj;
+                rank[0] += n0;
+                rank[1] += n1;
+                rank[2] += (s_flag[2][j] & 2) && !cj;
+                rank[3] += n0 || n1;
+            }
+            for (int j = i + 1; j < n_routes; ++j) {
+                if (s_e[j] == e) { routes |= 1ull << j; }
+            }
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                if (need[k]) {
+                    args.miss[k].expert[rank[k]] = e;
+                    args.miss[k].routes[rank[k]] = routes;
+                    atomicAdd(&s_ml[k], 1);
+                }
+            }
+        }
+        __syncthreads();
+        if (tid < 4) { args.miss[tid].n = s_ml[tid]; }
     }
     // staging slots in route order, as in moe_hf_plan_kernel
     for (int i = tid; i < n_routes; i += blockDim.x) {
@@ -9212,6 +9271,31 @@ static __global__ void moe_cs_join_kernel(moe_cs_plan_dev * plan, moe_cs_job * j
 
 // True when this dispatch takes the hit-first path. Forks the layer's plan and copies on the first
 // projection of a layer; later projections only join their own event (moe_hf_wait).
+// fork STRATAGAP MISSLIST: run a miss pass from the plan's list when this layer has one; old_pass(dst) is the masked
+// pass it replaces (run as well into a copy in check mode, then the two outputs are compared bit for bit).
+template <typename F>
+static bool moe_miss_pass_list(ggml_backend_cuda_context & ctx, const moe_cache_session & session, int layer, int list,
+        const void * const * eff, const void * const * gate_eff, ggml_type type, const char * quantized, float * dst,
+        int64_t n_in, int64_t n_out, int64_t n_ids, int64_t n_tokens, int64_t channels, F && old_pass) {
+    if (session.ml_layer < 0 || session.ml_layer != layer ||
+            !ggml_cuda_moe_table_mmv_list_supported(type, gate_eff != nullptr, n_in, n_ids, n_tokens, channels)) {
+        return false;
+    }
+    const int64_t count = n_out * n_ids * n_tokens;
+    ggml_cuda_pool_alloc<float> reference(ctx.pool());
+    if (moe_miss_list_mode() == 2) {
+        float * ref = reference.alloc((size_t) count);
+        CUDA_CHECK(cudaMemcpyAsync(ref, dst, (size_t) count * sizeof(float), cudaMemcpyDeviceToDevice, ctx.stream()));
+        old_pass(ref);
+    }
+    ggml_cuda_moe_table_mmv_list(ctx, g_hf_miss + list, eff, gate_eff, type, quantized, dst, n_in, n_out, n_ids,
+            n_tokens, channels);
+    if (moe_miss_list_mode() == 2) {
+        ggml_cuda_moe_bits_check(reference.get(), dst, count, ctx.stream());
+    }
+    return true;
+}
+
 static bool moe_hf_begin(ggml_backend_cuda_context & ctx, moe_cache_session & session,
         const moe_cache_device_table & table, const ggml_tensor * a, const ggml_tensor * ids) {
     if (!moe_missjoin_hitfirst_enabled() || session.mj_groups.empty() || table.staging_device || !table.hot ||
@@ -9286,6 +9370,10 @@ static bool moe_hf_begin(ggml_backend_cuda_context & ctx, moe_cache_session & se
             (a->ne[1] == 1 || a->ne[1] == ids->ne[0]) && a->ne[2] == ids->ne[1] &&
             group[2]->desc.n_out <= (int64_t) g_cs_out_stride;
     session.cs_layer = cs ? L : -1;
+    // fork STRATAGAP MISSLIST
+    const bool ml = moe_miss_list_mode() != 0 && fast && routes <= MOE_MISS_LIST_MAX && g_hf_miss;
+    session.ml_layer = ml ? L : -1;
+    if (ml) { args.miss = g_hf_miss; }
     if (cs) {
         args.cs = g_cs_plan;
         args.cs_mask = g_cs_mask;
@@ -10151,13 +10239,20 @@ bool ggml_cuda_moe_cache_device_compute(ggml_backend_cuda_context & ctx, ggml_te
         // fork STRATAGAP: on a CPU-split layer the miss pass also skips the experts the host computes
         const bool cs = session.cs_layer >= 0 && session.cs_layer == table.mj_layer;
         const uint8_t * miss_skip = cs ? g_cs_mask + (size_t) table.mj_kind * g_hf_experts : table.hot;
-        const bool miss_ok = ggml_cuda_moe_table_mmv_d1_try(ctx, eff, (ggml_type) table.desc.type, quantized,
-                (const int32_t *) ids->data, (float *) op->data, a->ne[0], op->ne[0], ids->ne[0], ids->ne[1], a->ne[1],
-                ids_stride, miss_skip, 0) ||
-            ggml_cuda_moe_table_mmv_filtered(eff, (ggml_type) table.desc.type, quantized,
-                (const int32_t *) ids->data, (float *) op->data, a->ne[0], op->ne[0], ids->ne[0], ids->ne[1], a->ne[1],
-                ids_stride, miss_skip, 0, ctx.stream());
-        GGML_ASSERT(miss_ok);
+        auto old_miss = [&](float * out) {
+            const bool miss_ok = ggml_cuda_moe_table_mmv_d1_try(ctx, eff, (ggml_type) table.desc.type, quantized,
+                    (const int32_t *) ids->data, out, a->ne[0], op->ne[0], ids->ne[0], ids->ne[1], a->ne[1],
+                    ids_stride, miss_skip, 0) ||
+                ggml_cuda_moe_table_mmv_filtered(eff, (ggml_type) table.desc.type, quantized,
+                    (const int32_t *) ids->data, out, a->ne[0], op->ne[0], ids->ne[0], ids->ne[1], a->ne[1],
+                    ids_stride, miss_skip, 0, ctx.stream());
+            GGML_ASSERT(miss_ok);
+        };
+        if (!(ids->ne[2] == 1 && table.mj_kind >= 0 && table.mj_kind < 3 &&
+                moe_miss_pass_list(ctx, session, table.mj_layer, table.mj_kind, eff, nullptr, (ggml_type) table.desc.type,
+                    quantized, (float *) op->data, a->ne[0], op->ne[0], ids->ne[0], ids->ne[1], a->ne[1], old_miss))) {
+            old_miss((float *) op->data);
+        }
         CUDA_CHECK(cudaGetLastError());
         if (cs && table.mj_kind == 2) {
             GGML_ASSERT(op->type == GGML_TYPE_F32 && op->nb[0] == sizeof(float));
@@ -10263,9 +10358,16 @@ bool ggml_cuda_moe_cache_device_fused_compute(ggml_backend_cuda_context & ctx,
                 const bool cs = session.cs_layer >= 0 && session.cs_layer == up_table.mj_layer;
                 const uint8_t * skip_up = cs ? g_cs_mask + (size_t) up_table.mj_kind * g_hf_experts : up_table.hot;
                 const uint8_t * skip_gate = cs ? g_cs_mask + (size_t) gate_table.mj_kind * g_hf_experts : gate_table.hot;
-                ggml_cuda_moe_table_mmv_hitg(ctx, up_eff, gate_eff, (ggml_type) up_table.desc.type,
-                        quantized, (const int32_t *) ids->data, (float *) glu->data, a->ne[0], glu->ne[0], ids->ne[0],
-                        ids->ne[1], a->ne[1], ids_stride, skip_up, skip_gate, 0);
+                auto old_miss = [&](float * out) {
+                    ggml_cuda_moe_table_mmv_hitg(ctx, up_eff, gate_eff, (ggml_type) up_table.desc.type,
+                            quantized, (const int32_t *) ids->data, out, a->ne[0], glu->ne[0], ids->ne[0],
+                            ids->ne[1], a->ne[1], ids_stride, skip_up, skip_gate, 0);
+                };
+                if (!moe_miss_pass_list(ctx, session, up_table.mj_layer, 3, up_eff, gate_eff,
+                        (ggml_type) up_table.desc.type, quantized, (float *) glu->data, a->ne[0], glu->ne[0],
+                        ids->ne[0], ids->ne[1], a->ne[1], old_miss)) {
+                    old_miss((float *) glu->data);
+                }
                 CUDA_CHECK(cudaGetLastError());
                 return true;
             }

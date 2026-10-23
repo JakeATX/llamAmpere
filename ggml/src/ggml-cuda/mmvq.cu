@@ -3799,6 +3799,137 @@ bool ggml_cuda_moe_table_mmv_d1_try(ggml_backend_cuda_context & ctx,
 #endif
 }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+// [STRATAGAP MISSLIST] miss pass over the plan's compact list: grid (row tiles, slices); slice y takes list entries
+// y, y + slices, ... so a pass with nothing to do is one load per block. Per route the dot code, lane split and
+// reduction are those of the plain kernel (moe_d1_rows / moe_hitg_rows), so every output keeps its bits.
+template <ggml_type type, int c_warps, int c_rows, bool c_fused>
+__launch_bounds__(c_warps*32, 768/(c_warps*32))
+static __global__ void mul_mat_vec_q_moe_list(const moe_miss_list * list,
+        const void * const * table, const void * const * gate_table, const block_q8_1 * vy, float * dst,
+        const int ncols_x, const int nrows_x, const int stride_row_x, const int act_channels,
+        const int stride_col_y, const int stride_channel_y, const int stride_col_dst, const int stride_channel_dst,
+        const int n_ids) {
+    constexpr int qk = ggml_cuda_type_traits<type>::qk;
+    ggml_cuda_pdl_sync();
+    const int n = list->n;
+    const int row0 = (blockIdx.x*c_warps + threadIdx.y)*c_rows;
+    if ((int) blockIdx.y >= n || row0 >= nrows_x) {
+        return;
+    }
+    const int blocks_per_row_x = ncols_x / qk;
+    for (int j = blockIdx.y; j < n; j += gridDim.y) {
+        const int e = list->expert[j];
+        unsigned long long left = list->routes[j];
+        const void * vx = table[e];
+        const void * vg = c_fused ? gate_table[e] : nullptr;
+        while (left != 0) {
+            const block_q8_1 * y[4];
+            float * out[4];
+            int m = 0;
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                if (q < 2 && left != 0) {
+                    const int r = __ffsll((long long) left) - 1;
+                    left &= left - 1;
+                    const int t = r / n_ids;
+                    const int k = r - t*n_ids;
+                    y[q]   = vy + (k % act_channels)*stride_channel_y + t*stride_col_y;
+                    out[q] = dst + k*stride_channel_dst + t*stride_col_dst;
+                    ++m;
+                } else {
+                    y[q]   = vy;
+                    out[q] = dst;
+                }
+            }
+            if constexpr (c_fused) {
+                if (m == 2) {
+                    moe_hitg_rows<type, c_rows, 2, false>(vx, vg, y, out, row0, nrows_x, blocks_per_row_x, stride_row_x, nullptr);
+                } else {
+                    moe_hitg_rows<type, c_rows, 1, false>(vx, vg, y, out, row0, nrows_x, blocks_per_row_x, stride_row_x, nullptr);
+                }
+            } else {
+                if (m == 2) {
+                    moe_d1_rows<type, c_rows, 2, false>(vx, y, out, row0, nrows_x, blocks_per_row_x, stride_row_x, nullptr);
+                } else {
+                    moe_d1_rows<type, c_rows, 1, false>(vx, y, out, row0, nrows_x, blocks_per_row_x, stride_row_x, nullptr);
+                }
+            }
+        }
+    }
+    ggml_cuda_pdl_lc();
+}
+#endif
+
+void ggml_cuda_moe_bits_check(const float * reference, const float * actual, int64_t count, cudaStream_t stream) {
+    moe_grouped_check<<<(count + 255)/256, 256, 0, stream>>>((const uint32_t *) reference, (const uint32_t *) actual, (int) count);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+bool ggml_cuda_moe_table_mmv_list_supported(ggml_type type, bool fused, int64_t n_in, int64_t n_ids, int64_t n_tokens,
+        int64_t channels) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    const bool gu = type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ2_S ||
+                    type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S;
+    const bool t = gu || (!fused && (type == GGML_TYPE_Q2_0 || type == GGML_TYPE_IQ4_NL));
+    return t && n_tokens >= 1 && n_ids >= 1 && n_ids*n_tokens <= 64 && channels >= 1 && channels <= n_ids &&
+           n_in >= 1 && n_in <= INT_MAX / 2 && n_in % ggml_blck_size(type) == 0;
+#else
+    GGML_UNUSED_VARS(type, fused, n_in, n_ids, n_tokens, channels);
+    return false;
+#endif
+}
+
+void ggml_cuda_moe_table_mmv_list(ggml_backend_cuda_context & ctx, const moe_miss_list * list,
+        const void * const * table, const void * const * gate_table, ggml_type type, const char * act_q8, float * dst,
+        int64_t n_in, int64_t n_out, int64_t n_ids, int64_t n_tokens, int64_t channels) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    GGML_ASSERT(ggml_cuda_moe_table_mmv_list_supported(type, gate_table != nullptr, n_in, n_ids, n_tokens, channels));
+    static const int slices = [] {
+        const char * e = getenv("GGML_MOE_MISS_LIST_SLICES");
+        return e ? std::max(1, std::min(MOE_MISS_LIST_MAX, atoi(e))) : 4;
+    }();
+    constexpr int c_warps = 4, c_rows = 2;
+    const int s11 = (int) (GGML_PAD(n_in, MATRIX_ROW_PADDING) / QK8_1);
+    const int stride_row_x = (int) (ggml_row_size(type, n_in) / ggml_type_size(type));
+    const ggml_cuda_kernel_launch_params params(dim3((n_out + c_warps*c_rows - 1)/(c_warps*c_rows), slices),
+            dim3(32, c_warps), 0, ctx.stream());
+#define MOE_LIST_ARGS list, table, gate_table, (const block_q8_1 *) act_q8, dst, (int) n_in, (int) n_out, stride_row_x, \
+        (int) channels, (int) channels*s11, s11, (int) (n_ids*n_out), (int) n_out, (int) n_ids
+#define MOE_LIST_CASE(T) \
+    case T: \
+        if (gate_table) { \
+            ggml_cuda_kernel_launch(mul_mat_vec_q_moe_list<T, c_warps, c_rows, true>, params, MOE_LIST_ARGS); \
+        } else { \
+            ggml_cuda_kernel_launch(mul_mat_vec_q_moe_list<T, c_warps, c_rows, false>, params, MOE_LIST_ARGS); \
+        } \
+        break
+    switch (type) {
+        MOE_LIST_CASE(GGML_TYPE_IQ2_XXS);
+        MOE_LIST_CASE(GGML_TYPE_IQ2_XS);
+        MOE_LIST_CASE(GGML_TYPE_IQ2_S);
+        MOE_LIST_CASE(GGML_TYPE_IQ3_XXS);
+        MOE_LIST_CASE(GGML_TYPE_IQ3_S);
+        case GGML_TYPE_Q2_0:
+            GGML_ASSERT(!gate_table);
+            ggml_cuda_kernel_launch(mul_mat_vec_q_moe_list<GGML_TYPE_Q2_0, c_warps, c_rows, false>, params, MOE_LIST_ARGS);
+            break;
+        case GGML_TYPE_IQ4_NL:
+            GGML_ASSERT(!gate_table);
+            ggml_cuda_kernel_launch(mul_mat_vec_q_moe_list<GGML_TYPE_IQ4_NL, c_warps, c_rows, false>, params, MOE_LIST_ARGS);
+            break;
+        default: GGML_ABORT("unsupported miss-list type");
+    }
+#undef MOE_LIST_CASE
+#undef MOE_LIST_ARGS
+    CUDA_CHECK(cudaGetLastError());
+    GGML_UNUSED(n_tokens);
+#else
+    GGML_UNUSED_VARS(ctx, list, table, gate_table, type, act_q8, dst, n_in, n_out, n_ids, n_tokens, channels);
+    GGML_ABORT("miss-list kernel not built");
+#endif
+}
+
 // [STRATAGAP HITG] GGML_MOE_HIT_FUSED: 0 off, 1 on, check = also run the plain up and gate kernels and trap on any
 // bit difference. GGML_MOE_HIT_FUSED_SHAPE: warps x rows per warp, s = shared-memory codebook (4x2, 8x2, 4x1, 8x1,
 // 4x2s, 8x2s, 8x1s; default 4x2). Members are taken two tokens at a time. Gate/up types of Flash-Next only.
