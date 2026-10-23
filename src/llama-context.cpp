@@ -3299,7 +3299,7 @@ void llama_context::set_decode_phase(enum llama_decode_phase phase) {
             // not trimmed (an earlier placement kept 340 MiB of temporary storage out of the cache).
             static const bool reserve_early = [] {
                 const char * e = getenv("LLAMA_MTP_RESERVE_EARLY");
-                return e != nullptr && e[0] == '1';
+                return e == nullptr || e[0] != '0'; // default on; =0 turns it off
             }();
             if (reserve_early && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && compute_peer &&
                     compute_peer->cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && compute_peer->sched &&
@@ -4658,13 +4658,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
 
 build_graph:
     bookkeep_stage.next(bookkeep_perf ? &bookkeep_perf->graph_prepare_host_us : nullptr);
-    // fork ROUNDPREP: LLAMA_MTP_PLAN_SLOTS=1 (default off) gives the helper's two graph kinds their own scheduler plan.
+    // fork ROUNDPREP: LLAMA_MTP_PLAN_SLOTS (default on, =0 off) gives the helper's two graph kinds their own scheduler plan.
     // Every site that makes the allocated graph stale sets gf_res_prev_active to null, so a null here drops both
     // slots; a slot is reused only when nothing was split into its plan since (serial) and the buffers are unchanged
     // (epoch), plus the usual can_reuse check below.
     static const bool plan_slots_env = [] {
         const char * v = getenv("LLAMA_MTP_PLAN_SLOTS");
-        return v != nullptr && strcmp(v, "1") == 0;
+        return v == nullptr || strcmp(v, "0") != 0; // default on; =0 turns it off
     }();
     int plan_slot = -1;
     if (plan_slots_env && cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && !graph_reuse_disable && !b1_cur.active &&
@@ -5221,7 +5221,7 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
     }();
     if (decode_rows && (n_tokens == 0 || (sched_reserve_tokens <= decode_rows && n_tokens <= decode_rows))) {
         rows = decode_rows;
-        // fork ROUNDPREP: LLAMA_MTP_SCRATCH_ROWS=N (1..16; 0 or unset = off) gives the helper (MTP guesser) a
+        // fork ROUNDPREP: LLAMA_MTP_SCRATCH_ROWS=N (1..16; default 8; 0 = off) gives the helper (MTP guesser) a
         // smaller writing scratch than the target's. At 16 rows the helper's attention is past the fused route's
         // 8-row limit, so its reserve sizes the generic route, which keeps 16-bit copies of the whole helper
         // history behind the output (216 MiB at 110,784 cells). Writing batches never exceed 8 helper rows
@@ -5230,7 +5230,7 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
         // grows back to the normal writing rows above.
         static const uint32_t mtp_rows = [] {
             const char * text = getenv("LLAMA_MTP_SCRATCH_ROWS");
-            const long value = text && text[0] ? strtol(text, nullptr, 10) : 0;
+            const long value = text && text[0] ? strtol(text, nullptr, 10) : 8; // default 8; =0 turns it off
             return value > 0 && value <= 16 ? (uint32_t) value : 0u;
         }();
         if (mtp_rows && mtp_rows < decode_rows && cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
