@@ -130,7 +130,7 @@ static int g_hf_slots = 0;
 static std::atomic<unsigned long long> g_hf_layers{0};
 // fork STRATAGAP: how often each new switch took its path (counted where the host issues the work, so a CUDA graph
 // counts once per capture, not per replay)
-static std::atomic<unsigned long long> g_st_hitg{0}, g_st_ml{0}, g_st_pc{0}, g_st_q8hit{0}, g_st_q8claim{0};
+static std::atomic<unsigned long long> g_st_hitg{0}, g_st_ml{0}, g_st_pc{0}, g_st_q8hit{0}, g_st_q8claim{0}, g_st_pub_plan{0};
 // fork PARFIX: graphs that ended with a layer's side copies still unjoined (see ggml_cuda_moe_cache_hf_graph_end).
 static std::atomic<unsigned long long> g_hf_graph_end_joins{0};
 // fork STRATAGAP (GGML_MOE_CPU_SPLIT=1): the host CPU computes part of each hit-first layer's missed experts
@@ -272,11 +272,11 @@ static void moe_missjoin_log(const char * when) {
                 g_hf_graph_end_joins.load(std::memory_order_relaxed));
     }
     if (g_st_hitg.load() || g_st_ml.load() || g_st_pc.load() || g_st_q8hit.load() || g_st_q8claim.load() ||
-            ggml_cuda_moe_down_sw_count() || g_st_one.load()) {
+            ggml_cuda_moe_down_sw_count() || g_st_one.load() || g_st_pub_plan.load()) {
         MOE_CACHE_LOG("[moe-cache] stratagap paths %s: hit_fused_layers=%llu miss_list_passes=%llu plan_count_layers=%llu "
-                "q8_share_hits=%llu q8_share_claims=%llu down_sw_passes=%llu down_one_layers=%llu (issue-time counts)\n",
+                "q8_share_hits=%llu q8_share_claims=%llu down_sw_passes=%llu down_one_layers=%llu pub_plan_layers=%llu (issue-time counts)\n",
                 when, g_st_hitg.load(), g_st_ml.load(), g_st_pc.load(), g_st_q8hit.load(), g_st_q8claim.load(),
-                ggml_cuda_moe_down_sw_count(), g_st_one.load());
+                ggml_cuda_moe_down_sw_count(), g_st_one.load(), g_st_pub_plan.load());
     }
     if (g_cs_on && g_cs_plan) {
         moe_cs_plan_dev plan{};
@@ -8798,6 +8798,13 @@ struct moe_hf_plan_args {
     moe_miss_list * miss;         // fork STRATAGAP MISSLIST: [4] lists to write (null: off; fast kernel only)
     unsigned long long * pc_exp[3];   // fork STRATAGAP PLANCOUNT: per-kind expert counts (null: off; fast kernel only)
     unsigned long long * pc_route;    // [0] hot routes, [1] cold routes, [2] dispatches (may be null)
+    // fork STRATAGAP PUBPLAN: the fast plan kernel publishes the host job itself (cs_job null: the publish kernel does)
+    moe_cs_job * cs_job;
+    const char * cs_x;
+    size_t cs_nb1, cs_nb2;
+    int cs_x_per_slot, cs_n_ids, cs_n_embd, cs_layer;
+    float * cs_xh;
+    size_t cs_xh_stride;
 };
 
 // counts: 0 dispatches, 1 distinct experts, 2 distinct misses, 3 staged, 4 miss routes, 5 unstaged misses
@@ -8925,6 +8932,14 @@ static bool moe_plan_count_take(moe_cache_session & session, const moe_cache_dev
     return true;
 }
 
+// fork STRATAGAP PUBPLAN: GGML_MOE_CPU_SPLIT_PUB_PLAN=1 (default off) moves the CPU job's publish (input rows to
+// mapped host memory, then the job and its number) into the fast plan kernel, right after the CPU pick and before
+// the miss lists, staging and address table. The host starts one launch (and one wait for free SM slots) earlier;
+// the rows, the job and the order of the writes are those of moe_cs_publish_kernel, so the results are the same.
+static bool moe_cs_pub_plan_enabled() {
+    static const bool on = [] { const char * v = getenv("GGML_MOE_CPU_SPLIT_PUB_PLAN"); return v != nullptr && atoi(v) != 0; }();
+    return on;
+}
 static bool moe_hf_plan_fast_enabled() {
     static const bool on = [] { const char * v = getenv("GGML_MOE_HF_PLAN_FAST"); return v == nullptr || atoi(v) != 0; }();
     return on;
@@ -9116,6 +9131,42 @@ static __global__ void __launch_bounds__(256) moe_hf_plan_fast_kernel(const moe_
             }
         }
         __syncthreads();
+        if (args.cs_job && args.cs->n_route > 0) {
+            // fork STRATAGAP PUBPLAN: moe_cs_publish_kernel's work, by this block (plan->route and n_route were
+            // written by this block before the barrier above)
+            moe_cs_plan_dev * plan = args.cs;
+            const int n_route = plan->n_route;
+            const int n_embd = args.cs_n_embd;
+            for (int b = 0; b < n_route; ++b) {
+                const int r = plan->route[b];
+                const int t = r / args.cs_n_ids, j = r % args.cs_n_ids;
+                const float * src = (const float *) (args.cs_x + (args.cs_x_per_slot ? (size_t) j * args.cs_nb1 : 0) +
+                                                     (size_t) t * args.cs_nb2);
+                float * d = args.cs_xh + (size_t) b * args.cs_xh_stride;
+                if ((n_embd & 3) == 0 && ((uintptr_t) src & 15) == 0 && ((uintptr_t) d & 15) == 0) {
+                    for (int c = tid; c < n_embd / 4; c += blockDim.x) { ((float4 *) d)[c] = ((const float4 *) src)[c]; }
+                } else {
+                    for (int c = tid; c < n_embd; c += blockDim.x) { d[c] = src[c]; }
+                }
+            }
+            __threadfence_system();
+            __syncthreads();
+            if (tid == 0) {
+                moe_cs_job * job = args.cs_job;
+                const int n_exp = plan->n_exp;
+                job->layer = args.cs_layer;
+                job->n_exp = n_exp;
+                job->n_route = n_route;
+                for (int i = 0; i < n_exp; ++i) { job->expert[i] = plan->expert[i]; }
+                for (int i = 0; i <= n_exp; ++i) { job->first[i] = plan->first[i]; }
+                __threadfence_system();
+                const unsigned long long seq = plan->counter + 1;
+                plan->counter = seq;
+                plan->seq = seq;
+                job->seq = seq;
+                __threadfence_system();
+            }
+        }
     }
     if (args.miss) {
         // fork STRATAGAP MISSLIST: the experts each miss pass computes (missed, not on the CPU), in first-route order,
@@ -9476,6 +9527,21 @@ static bool moe_hf_begin(ggml_backend_cuda_context & ctx, moe_cache_session & se
         args.cs_floor_ns = g_cs_floor_ns;
         args.cs_link_w = g_cs_link_w;
     }
+    // fork STRATAGAP PUBPLAN
+    const bool pub_plan = cs && fast && moe_cs_pub_plan_enabled();
+    if (pub_plan) {
+        args.cs_job = g_cs_job_d;
+        args.cs_x = (const char *) a->data;
+        args.cs_nb1 = a->nb[1];
+        args.cs_nb2 = a->nb[2];
+        args.cs_x_per_slot = a->ne[1] > 1 ? 1 : 0;
+        args.cs_n_ids = (int) ids->ne[0];
+        args.cs_n_embd = (int) a->ne[0];
+        args.cs_layer = L;
+        args.cs_xh = g_cs_x_d;
+        args.cs_xh_stride = g_cs_x_stride;
+        g_st_pub_plan.fetch_add(1, std::memory_order_relaxed);
+    }
     if (fast) {
         moe_hf_plan_fast_kernel<<<1, 256, 0, g_hf_side>>>(args, (const int32_t *) ids->data, (int) ids->ne[0], routes,
                 (int)(ids->nb[1] / sizeof(int32_t)), n_expert, slots, aligned, g_missjoin_counts);
@@ -9484,10 +9550,12 @@ static bool moe_hf_begin(ggml_backend_cuda_context & ctx, moe_cache_session & se
                 (int)(ids->nb[1] / sizeof(int32_t)), n_expert, slots, aligned, g_missjoin_counts);
     }
     CUDA_CHECK(cudaGetLastError());
-    if (cs) {
+    if (cs && !pub_plan) {
         moe_cs_publish_kernel<<<g_cs_max_route, 128, 0, g_hf_side>>>(g_cs_plan, g_cs_job_d, (const char *) a->data,
                 a->nb[1], a->nb[2], a->ne[1] > 1 ? 1 : 0, (int) ids->ne[0], (int) a->ne[0], g_cs_x_d, g_cs_x_stride, L);
         CUDA_CHECK(cudaGetLastError());
+    }
+    if (cs) {
         g_cs_layers_published.fetch_add(1, std::memory_order_relaxed);
     }
     std::array<int8_t, 3> order = session.hf_order[table.mj_layer];
