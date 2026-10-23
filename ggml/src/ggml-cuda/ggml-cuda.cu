@@ -1958,6 +1958,12 @@ static bool ggml_cuda_host_weights_enabled() {
     return enabled;
 }
 
+// disables the CUDA_Host_W staging copy, for A/B tests only
+static bool ggml_cuda_host_weights_staging_disabled() {
+    static const bool disabled = getenv("GGML_CUDA_NO_HOST_WEIGHTS_STAGING") != nullptr;
+    return disabled;
+}
+
 static bool ggml_backend_buft_is_cuda_host(ggml_backend_buffer_type_t buft) {
     return buft->iface.get_name == ggml_backend_cuda_host_buffer_type_name;
 }
@@ -2743,14 +2749,8 @@ static std::vector<ggml_backend_cuda_kv_stream_runtime_t> ggml_cuda_kv_stream_pr
     return runtimes;
 }
 
-// KVarN: host weights buffer type
-//
-// Закреплённая хост-память ПОД ВЕСА, читаемая ядрами через UVA. От CUDA_Host
-// отличается только именем — и именно имя решает всё: ggml_backend_buft_is_cuda_host
-// сравнивает указатель на get_name, поэтому объявить поддержку этого типа в
-// supports_buft можно, НЕ открывая общий CUDA_Host, в котором лежат ВХОДНЫЕ
-// тензоры языковой модели. Почему это принципиально — в шапке патча
-// build-native/kvarn-mmproj-hostbuf-v2.patch.
+// CUDA_Host_W: pinned host memory for weights only, read by kernels through UVA
+// it has its own name so supports_buft can accept it without accepting CUDA_Host, which also holds model inputs: accepting CUDA_Host drops the scheduler input copy and the barrier with it
 static const char * ggml_backend_cuda_host_weights_buffer_type_name(ggml_backend_buffer_type_t buft) {
     return GGML_CUDA_NAME "_Host_W";
 
@@ -2767,18 +2767,28 @@ static size_t ggml_backend_cuda_host_weights_buffer_type_get_alignment(ggml_back
     GGML_UNUSED(buft);
 }
 
+// pad quantized rows like the CUDA buffer type, MMQ reads the last tile past ne0
+static size_t ggml_backend_cuda_host_weights_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
+    size_t size = ggml_nbytes(tensor);
+    if (ggml_is_quantized(tensor->type) && tensor->ne[0] % MATRIX_ROW_PADDING != 0) {
+        size += ggml_row_size(tensor->type, MATRIX_ROW_PADDING - tensor->ne[0] % MATRIX_ROW_PADDING);
+    }
+    return size;
+
+    GGML_UNUSED(buft);
+}
+
 static ggml_backend_buffer_t ggml_backend_cuda_host_weights_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     void * ptr = ggml_cuda_host_malloc(size);
 
     if (ptr == nullptr) {
-        // В отличие от CUDA_Host здесь НЕЛЬЗЯ подменять буфер обычным CPU-буфером:
-        // незакреплённая память с устройства не адресуется, а supports_buft уже
-        // пообещал планировщику обратное. Возвращаем отказ — вызывающая сторона
-        // (clip.cpp) вернётся к памяти устройства.
-        GGML_LOG_WARN("%s: не удалось закрепить %.2f МиБ хост-памяти под веса\n",
+        // no fallback to a CPU buffer: the device cannot read unpinned memory, the caller falls back to device memory
+        GGML_LOG_WARN("%s: failed to pin %.2f MiB of host memory for weights\n",
                 __func__, size / 1024.0 / 1024.0);
         return nullptr;
     }
+
+    memset(ptr, 0, size); // zero the quantized row padding, it must not hold NaN scales
 
     ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
     buffer->buft = buft;
@@ -2790,12 +2800,14 @@ static ggml_backend_buffer_t ggml_backend_cuda_host_weights_buffer_type_alloc_bu
 static ggml_backend_buffer_type_t ggml_backend_cuda_host_weights_buffer_type() {
     static struct ggml_backend_buffer_type ggml_backend_cuda_buffer_type_host_weights = {
         /* .iface    = */ {
-            /* .get_name         = */ ggml_backend_cuda_host_weights_buffer_type_name,
-            /* .alloc_buffer     = */ ggml_backend_cuda_host_weights_buffer_type_alloc_buffer,
-            /* .get_alignment    = */ ggml_backend_cuda_host_weights_buffer_type_get_alignment,
-            /* .get_max_size     = */ NULL, // defaults to SIZE_MAX
-            /* .get_alloc_size   = */ ggml_backend_cpu_buffer_type()->iface.get_alloc_size,
-            /* .is_host          = */ ggml_backend_cpu_buffer_type()->iface.is_host,
+            /* .get_name            = */ ggml_backend_cuda_host_weights_buffer_type_name,
+            /* .alloc_buffer        = */ ggml_backend_cuda_host_weights_buffer_type_alloc_buffer,
+            /* .alloc_buffer_n      = */ NULL,
+            /* .get_alignment       = */ ggml_backend_cuda_host_weights_buffer_type_get_alignment,
+            /* .get_max_size        = */ NULL, // defaults to SIZE_MAX
+            /* .get_alloc_size      = */ ggml_backend_cuda_host_weights_buffer_type_get_alloc_size,
+            /* .get_alloc_size_n    = */ NULL,
+            /* .is_host             = */ ggml_backend_cpu_buffer_type()->iface.is_host,
         },
         /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), 0),
         /* .context  = */ nullptr,
@@ -2804,14 +2816,7 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_host_weights_buffer_type() {
     return &ggml_backend_cuda_buffer_type_host_weights;
 }
 
-// Точка входа для tools/mtmd: при GGML_BACKEND_DL прямой вызов в ggml-cuda
-// недоступен, адрес берётся через ggml_backend_reg_get_proc_address.
-//
-// Выключателя здесь НЕТ намеренно. Тип буфера CUDA_Host_W достижим только через
-// этот адрес процедуры, то есть только из tools/mtmd/clip.cpp, а решение о
-// размещении весов проектора принимает вызывающая сторона по параметру
-// clip_context_params::host_weights (аргумент --mmproj-host-weights). Пока
-// clip.cpp не спросил, режим не влияет ни на одну точку поведения бэкенда.
+// only reachable through get_proc_address (tools/mtmd, --mmproj-host-weights), so no other tensor can land in CUDA_Host_W
 static ggml_backend_buffer_type_t ggml_backend_cuda_get_host_weights_buffer_type(void) {
     return ggml_backend_cuda_host_weights_buffer_type();
 }
@@ -2937,25 +2942,16 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     bool is_src0_cont_2 = ggml_is_contiguous_2(src0);
     bool is_src1_cont_2 = ggml_is_contiguous_2(src1);
 
-    // KVarN: ПРЕДЗАГРУЗКА ВЕСОВ ИЗ ХОСТ-ПАМЯТИ В УСТРОЙСТВО.
-    // Если src0 — веса, лежащие в закреплённой хост-памяти, гнать их в cuBLAS
-    // напрямую втрое дороже (замер: 1540 мс против 442 мс на 1024 токенах
-    // картинки): ядро читает тайлы вразброс и платит латентностью PCIe, а не
-    // полосой. Один линейный cudaMemcpyAsync во временный буфер пула снимает
-    // это целиком, а буфер живёт до конца операции — на карте одновременно
-    // лежит один вес, а не весь проектор.
-    // Условие узкое: в штатной сборке хост-резидентного src0 у CUDA-узла не
-    // бывает вовсе, supports_buft такие буферы не принимает.
+    // copy a CUDA_Host_W weight to the pool in one transfer, cuBLAS reading it in place over PCIe is ~5x slower
     const bool src0_stage_from_host =
         src0->buffer != nullptr &&
         ggml_backend_buffer_is_host(src0->buffer) &&
         ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
         ggml_is_contiguously_allocated(src0) &&
-        getenv("KVARN_NO_HOST_WEIGHT_STAGING") == nullptr;
+        !ggml_cuda_host_weights_staging_disabled();
 
     if (src0->type == compute_type && src0_stage_from_host) {
-        // Тензор размещён непрерывно, поэтому s01/s02/s03, посчитанные выше из
-        // nb, для копии остаются верными — пересчитывать нечего.
+        // contiguously allocated, so s01/s02/s03 stay valid for the copy
         src0_alloc.alloc(ggml_nelements(src0));
         CUDA_CHECK(cudaMemcpyAsync(src0_alloc.get(), src0->data, ggml_nbytes(src0),
                                    cudaMemcpyHostToDevice, main_stream));
@@ -11023,7 +11019,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                          ggml_cuda_qsa_resident_is_buft(node->buffer->buft)) &&
                         node->buffer->buft->device == expected_dev) ||
                        ((integrated || ggml_cuda_host_weights_enabled()) &&
-                        ggml_backend_buft_is_cuda_host(node->buffer->buft)));
+                        ggml_backend_buft_is_cuda_host(node->buffer->buft)) ||
+                       ggml_backend_buft_is_cuda_host_weights(node->buffer->buft));
                 for (int j = 0; j < GGML_MAX_SRC; j++) {
                     if (node->src[j] != nullptr) {
                         assert(node->src[j]->buffer);
@@ -11033,7 +11030,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                                  ggml_cuda_qsa_resident_is_buft(node->src[j]->buffer->buft)) &&
                                 node->src[j]->buffer->buft->device == expected_dev) ||
                                ((integrated || ggml_cuda_host_weights_enabled()) &&
-                                ggml_backend_buft_is_cuda_host(node->src[j]->buffer->buft)));
+                                ggml_backend_buft_is_cuda_host(node->src[j]->buffer->buft)) ||
+                               ggml_backend_buft_is_cuda_host_weights(node->src[j]->buffer->buft));
                     }
                 }
 #else

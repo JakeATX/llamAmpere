@@ -48,7 +48,7 @@ enum clip_flash_attn_type {
 
 struct clip_context_params {
     bool use_gpu;
-    // KVarN: веса проектора в закреплённой хост-памяти (см. mtmd_context_params)
+    // projector weights in pinned host memory (see mtmd_context_params)
     bool host_weights;
     ggml_backend_dev_t device;
     enum clip_flash_attn_type flash_attn_type;

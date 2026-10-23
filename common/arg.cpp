@@ -3106,8 +3106,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--mmproj-host-weights"},
         {"--no-mmproj-host-weights"},
-        string_format("KVarN: keep multimodal projector WEIGHTS in pinned host RAM, run the projector on the accelerator anyway\n"
-                      "frees VRAM for the KV cache; image encoding gets slightly slower, output is unchanged (default: %s)",
+        string_format("keep multimodal projector weights in pinned host RAM, run the projector on the GPU anyway\n"
+                      "frees the projector's VRAM; image encoding gets slower (default: %s)",
                       params.mmproj_host_weights ? "enabled" : "disabled"),
         [](common_params & params, bool value) {
             params.mmproj_host_weights = value;
