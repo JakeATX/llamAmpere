@@ -2211,7 +2211,14 @@ static bool moe_cache_table_stats_enabled() {
 
 static bool moe_cache_table_mask_enabled() {
     const char * mask = getenv("GGML_MOE_MISSJOIN_MASK");
-    return moe_cache_table_stats_enabled() || (mask && strcmp(mask, "1") == 0 && moe_missjoin_mode());
+    // [AUTOMASK] GGML_MOE_MISSJOIN_AUTOMASK=1: MISSJOIN=stage turns the resident mask on by itself (the lossless staging path
+    // needs it; without it the mode logs "inactive" and does nothing). Off by default. MISSJOIN_MASK=0 still wins.
+    static const bool automask = [] {
+        const char * v = getenv("GGML_MOE_MISSJOIN_AUTOMASK");
+        return v && strcmp(v, "1") == 0;
+    }();
+    return moe_cache_table_stats_enabled() || (mask && strcmp(mask, "1") == 0 && moe_missjoin_mode()) ||
+            (automask && moe_missjoin_mode() == 1 && !(mask && strcmp(mask, "0") == 0));
 }
 
 static bool moe_cache_table_bytes_add(size_t & total, size_t bytes) {
@@ -10169,7 +10176,7 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
             MOE_CACHE_LOG("[moe-cache] missjoin mode=%s slots=%d%s\n", moe_missjoin_mode() == 1 ? "stage" : "diag_hot",
                     moe_missjoin_slots(), moe_missjoin_mode() == 2 ? " (DIAGNOSTIC, LOSSY: misses redirected)" : "");
             if (!resident_mask) {
-                MOE_CACHE_LOG("[moe-cache] missjoin needs GGML_MOE_MISSJOIN_MASK=1 or GGML_MOE_CACHE_DEVICE_STATS=1; inactive\n");
+                MOE_CACHE_LOG("[moe-cache] missjoin needs GGML_MOE_MISSJOIN_MASK=1, GGML_MOE_MISSJOIN_AUTOMASK=1 or GGML_MOE_CACHE_DEVICE_STATS=1; inactive\n");
             }
         }
         if (mask_only) {
