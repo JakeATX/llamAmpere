@@ -4066,7 +4066,12 @@ void ggml_vec_dot_iq4_nl_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const v
             sumi1 += y[ib].qs[j+       0] * kvalues_iq4nl[x[ib].qs[j] & 0xf];
             sumi2 += y[ib].qs[j+QK4_NL/2] * kvalues_iq4nl[x[ib].qs[j] >>  4];
         }
+#if defined(__AVX2__)
+        // fork: keep ordinary and grouped tails at one rounding step.
+        sumf = fmaf(d, (float) (sumi1 + sumi2), sumf);
+#else
         sumf += d * (sumi1 + sumi2);
+#endif
     }
     *s = sumf;
 }
@@ -4221,7 +4226,7 @@ static void ggml_vec_dot_iq4_nl_grouped(int n, const block_iq4_nl * x, const voi
                 sum += decoded[j] * y->qs[j];
             }
             const float d = GGML_CPU_FP16_TO_FP32(y->d) * dx;
-            s[t] += d * sum;
+            s[t] = fmaf(d, (float) sum, s[t]);
         }
     }
 }
