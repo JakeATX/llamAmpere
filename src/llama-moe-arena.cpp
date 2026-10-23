@@ -444,3 +444,61 @@ llama_moe_arena::~llama_moe_arena() {
     if (data) { munmap(data, size); }
 #endif
 }
+
+void llama_moe_arena_apply_flashnext_defaults() {
+    // one master switch; later loads (fit pass, helper) find everything already set
+    if (const char * master = getenv("LLAMA_FLASHNEXT_DEFAULTS"); master && strcmp(master, "0") == 0) { return; }
+    static bool done = false;
+    if (done) { return; }
+    done = true;
+    struct flashnext_default { const char * name; const char * value; };
+    static const flashnext_default table[] = {
+        // expert cache on the card, filled from measured usage, missed experts copied once per layer
+        { "GGML_MOE_CACHE_DEVICE",                "1" },
+        { "GGML_MOE_CACHE_DEVICE_CAPTURE",        "1" },
+        { "GGML_MOE_CACHE_DEVICE_STATS",          "1" },   // route counts; hit-first staging stays inactive without them
+        { "GGML_MOE_CACHE_SWAP",                  "1" },
+        { "GGML_MOE_MISSJOIN",                    "stage" },
+        // startup profile knobs: ship together (PRIOR_PCT=100 without PRIOR_DECAY=1 loses hits)
+        { "GGML_MOE_CACHE_PROFILE_GLOBAL",        "1" },
+        { "GGML_MOE_CACHE_PROFILE_PRIOR_PCT",     "100" },
+        { "GGML_MOE_CACHE_PROFILE_PRIOR_DECAY",   "1" },
+        // RAM and card memory lent during the prompt
+        { "LLAMA_MOE_OUTPUT_RECLAIM",             "1" },
+        { "LLAMA_MOE_CACHE_RELEASE_PROMPT",       "1" },
+        // whole prompt read one layer at a time (prompts of 16,384 tokens or more)
+        { "LLAMA_B1",                             "1" },
+        { "LLAMA_B1_CACHE_WARM",                  "1" },
+        { "LLAMA_B1_LAYER_RESERVE",               "1" },
+        { "LLAMA_B1_MOE_CACHE_SUSPEND",           "1" },
+        // exact prompt and decode kernels
+        { "GGML_CUDA_CONCAT_TILE",                "1" },
+        { "GGML_CUDA_NORM_CAST",                  "1" },
+        { "GGML_CUDA_MMQ_ID_CAP",                 "2" },
+        { "GGML_CUDA_MMID_PAR",                   "1" },
+        { "GGML_CUDA_LID_EXACT",                  "1" },
+        { "GGML_CUDA_GET_ROWS_NARROW",            "1" },
+        { "GGML_CUDA_GDN_R16",                    "1" },
+        { "GGML_CUDA_TOPK_SELECT",                "1" },
+        { "LLAMA_HC_BF16_ONCE",                   "1" },
+        { "LLAMA_QSA_POOL_RANGE",                 "1" },
+        { "LLAMA_QSA_SEL_DIRECT",                 "1" },
+        { "LLAMA_PREFETCH_THREADS",               "8" },
+        // helper (MTP) memory and launch savings
+        { "LLAMA_MTP_PIN_BORROWED_HOST",          "1" },
+        { "LLAMA_MTP_COMPAT_REUSE",               "1" },
+        { "LLAMA_MTP_EH_BATCH",                   "1" },
+        { "LLAMA_MTP_DRAFT_COMPUTE_LEAN",         "1" },
+    };
+    int applied = 0;
+    for (const auto & entry : table) {
+        if (getenv(entry.name) != nullptr) { continue; }
+#ifdef _WIN32
+        if (_putenv_s(entry.name, entry.value) == 0) { applied++; }
+#else
+        if (setenv(entry.name, entry.value, 0) == 0) { applied++; }
+#endif
+    }
+    LLAMA_LOG_INFO("%s: Flash-Next defaults: %d switches turned on (NAME=0 turns one off; set LLAMA_FLASHNEXT_DEFAULTS=0 for none)\n",
+            __func__, applied);
+}
