@@ -199,17 +199,14 @@ static bool frows_aligned(const void * p, size_t a) {
     return (reinterpret_cast<uintptr_t>(p) % a) == 0;
 }
 
-static int frows_pick_rows(const frows_cfg & cfg, int64_t nrows, int nsm) {
+static int frows_pick_rows(const frows_cfg & cfg) {
     if (cfg.rows > 0) {
         return cfg.rows;
     }
-    // most rows per block that still leaves at least one block per SM (more rows = fewer activation re-reads)
-    for (int r : { 4, 2 }) {
-        if ((nrows + r - 1) / r >= nsm) {
-            return r;
-        }
-    }
-    return 1;
+    // 4 rows per block at every measured size (results/frows1, home 3090 Ti: 128, 512 and 1024 rows at widths 4/5,
+    // F32/F16/BF16). It beat 1 and 2 rows even at 128 rows, where 4 rows leaves only 32 blocks: fewer activation
+    // re-reads matter more than filling every SM there.
+    return 4;
 }
 
 template <typename T, int ncols, int R, int NT>
@@ -300,10 +297,9 @@ bool ggml_cuda_frows_wants(const ggml_tensor * src0, const ggml_tensor * src1, c
 
 void ggml_cuda_frows_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const frows_cfg & cfg = frows_get_cfg();
-    const int     nsm   = ggml_cuda_info().devices[ctx.device].nsm;
     const int64_t nrows = src0->ne[1];
     const int     ncols = (int) src1->ne[1];
-    const int     rows  = frows_pick_rows(cfg, nrows, nsm);
+    const int     rows  = frows_pick_rows(cfg);
     const int     nt    = cfg.nt > 0 ? cfg.nt : 128;
     const int64_t stride_row     = src0->nb[1] / ggml_type_size(src0->type);
     const int64_t stride_col_y   = src1->nb[1] / sizeof(float);

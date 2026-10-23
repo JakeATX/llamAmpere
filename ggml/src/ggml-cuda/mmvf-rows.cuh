@@ -21,8 +21,8 @@
 //
 // Env: GGML_CUDA_FROWS=1 on; GGML_CUDA_FROWS_MAX_ROWS (default 1024) widest weight it takes; GGML_CUDA_FROWS_MIN_N /
 // GGML_CUDA_FROWS_MAX_N (default 2 / 8) the widths it takes; GGML_CUDA_FROWS_R=1|2|4|8
-// and GGML_CUDA_FROWS_NT=128|256 force rows per block / threads per block (default: the most rows per block that still
-// leaves at least one block per SM, 128 threads).
+// and GGML_CUDA_FROWS_NT=128|256 force rows per block / threads per block (default: 4 rows per block, 128 threads; the
+// measured best or within 10% of it at every timed shape).
 
 bool ggml_cuda_frows_wants(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, int cc);
 

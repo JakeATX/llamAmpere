@@ -82,11 +82,13 @@ static int kqrows_table_nwarps(ggml_type type, int ncols_dst) {
 struct kqrows_cell { int8_t rows; int8_t nwarps; };
 static constexpr int KQROWS_SMALL_MAX_ROWS = 1024;
 //                                            width:   2       3       4       5       6       7       8
-// Provisional (results/perf2, KQ_RIVALS=kqtc): only where 1 row per CTA beat both today's route and KQTC by >= 3%.
+// results/perf3 (fixed load order), KQ_EMIT=1 KQ_RIVALS=kqtc: a cell is set only where that row count beat both
+// today's route and KQTC by >= 3% on every timed shape of its class (worst case: q4_K w2 -14.3%, q5_K w2 -16.8%,
+// q6_K w2 -23.7%, w3 -15.2%, w4 -12.4%). Large matrices: KQTC wins every width, so no cells.
 static const kqrows_cell kqrows_tab_small[3][7] = {
-    /* q4_K */ { {1, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0} },
+    /* q4_K */ { {2, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0} },
     /* q5_K */ { {1, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0} },
-    /* q6_K */ { {1, 0}, {1, 0}, {1, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0} },
+    /* q6_K */ { {1, 0}, {2, 0}, {2, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0} },
 };
 static const kqrows_cell kqrows_tab_large[3][7] = {
     /* q4_K */ { {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0} },
