@@ -2135,6 +2135,184 @@ static void moe_d1_launch(const void * const * table, const char * act_q8, const
             (int) (n_ids*n_out), (int) n_out, (int) n_ids, (int) n_tokens, (int) ids_stride, route_hot, route_want_hot);
 }
 
+// [STRATAGAP DOWNSW] Sub-warp rows for the expert down projection (GGML_MOE_DOWN_SW). Its rows are short (the
+// expert's hidden width), so one warp per row leaves lanes idle: IQ4_NL at 640 columns is 2 passes with 32 then 8 lanes
+// busy. Strata gives each row a few lanes (native_down_multi); this is our own code that keeps our arithmetic bit for
+// bit: each of the c_lanes lanes of a group stands in for 32/c_lanes lanes of the plain kernel ("virtual lanes"),
+// accumulates their partial sums in the same order, then runs the same xor butterfly (the steps that cross virtual
+// lanes are done in registers, the rest by shuffles within the group). Float addition is commutative, so every
+// partial sum, and therefore the output, has the same bits as moe_d1_rows / the plain kernel.
+template <ggml_type type, int c_lanes, int c_rows, int cols>
+static __device__ __forceinline__ void moe_sw_rows(
+        const void * vx, const block_q8_1 * const (&y)[4], float * const (&out)[4],
+        const int row0, const int nrows_x, const int blocks_per_row_x, const int stride_row_x) {
+    constexpr int qk  = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi  = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr = get_vdr_mmvq(type);
+    constexpr int warp_size = 32;
+    constexpr int blocks_per_iter = vdr * warp_size / qi;
+    constexpr int VL = warp_size / c_lanes;
+    static_assert(c_lanes >= 2 && c_lanes <= 32 && warp_size % c_lanes == 0 && c_rows <= c_lanes, "bad sub-warp shape");
+    const int p = threadIdx.x % c_lanes;
+    const int kbx_offset = row0*stride_row_x;
+    float tmp[VL][cols][c_rows];
+#pragma unroll
+    for (int j = 0; j < VL; ++j) {
+#pragma unroll
+        for (int c = 0; c < cols; ++c) {
+#pragma unroll
+            for (int i = 0; i < c_rows; ++i) {
+                tmp[j][c][i] = 0.0f;
+            }
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < VL; ++j) {
+        const int v = p + c_lanes*j;   // the plain kernel's lane this register set stands for
+        for (int kbx = v / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+            const int kby = kbx * (qk/QK8_1);
+            const int kqs = vdr * (v % (qi/vdr));
+#pragma unroll
+            for (int i = 0; i < c_rows; ++i) {
+                if (row0 + i < nrows_x) {
+#pragma unroll
+                    for (int c = 0; c < cols; ++c) {
+                        tmp[j][c][i] += moe_d1_dot<type, c_rows, cols, false>(nullptr, vx, &y[c][kby],
+                                kbx_offset + i*stride_row_x + kbx, kqs);
+                    }
+                }
+            }
+        }
+    }
+    // butterfly steps 16 .. c_lanes: partner lane v ^ o is virtual set j ^ (o / c_lanes) of this lane
+#pragma unroll
+    for (int o = warp_size/2; o >= c_lanes; o >>= 1) {
+        float nt[VL][cols][c_rows];
+#pragma unroll
+        for (int j = 0; j < VL; ++j) {
+#pragma unroll
+            for (int c = 0; c < cols; ++c) {
+#pragma unroll
+                for (int i = 0; i < c_rows; ++i) {
+                    nt[j][c][i] = tmp[j][c][i] + tmp[j ^ (o / c_lanes)][c][i];
+                }
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < VL; ++j) {
+#pragma unroll
+            for (int c = 0; c < cols; ++c) {
+#pragma unroll
+                for (int i = 0; i < c_rows; ++i) {
+                    tmp[j][c][i] = nt[j][c][i];
+                }
+            }
+        }
+    }
+    // steps below c_lanes stay inside the aligned group
+#pragma unroll
+    for (int o = c_lanes/2; o > 0; o >>= 1) {
+#pragma unroll
+        for (int c = 0; c < cols; ++c) {
+#pragma unroll
+            for (int i = 0; i < c_rows; ++i) {
+                tmp[0][c][i] += __shfl_xor_sync(0xffffffff, tmp[0][c][i], o, warp_size);
+            }
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < c_rows; ++i) {
+        if (p == i && row0 + i < nrows_x) {
+#pragma unroll
+            for (int c = 0; c < cols; ++c) {
+                out[c][row0 + i] = tmp[0][c][i];
+            }
+        }
+    }
+}
+
+// Grid and route grouping as mul_mat_vec_q_moe_d1; a warp covers (32/c_lanes)*c_rows rows.
+template <ggml_type type, int c_warps, int c_lanes, int c_rows, int c_group>
+__launch_bounds__(c_warps*32, 768/(c_warps*32))
+static __global__ void mul_mat_vec_q_moe_sw(
+        const void * const * table, const block_q8_1 * vy, const int32_t * ids, float * dst,
+        const int ncols_x, const int nrows_x, const int stride_row_x, const int act_channels,
+        const int stride_col_y, const int stride_channel_y, const int stride_col_dst, const int stride_channel_dst,
+        const int n_ids, const int n_tokens, const int ids_stride,
+        const uint8_t * route_hot, const int route_want_hot) {
+    constexpr int qk = ggml_cuda_type_traits<type>::qk;
+    constexpr int rows_per_warp = (32/c_lanes)*c_rows;
+    const int routes = n_ids*n_tokens;
+    const int q = blockIdx.y;
+    const int r0 = threadIdx.x;
+    const int r1 = threadIdx.x + 32;
+    ggml_cuda_pdl_sync();
+    const int e0 = r0 < routes ? ids[(r0 / n_ids)*ids_stride + r0 % n_ids] : -1;
+    const int e1 = r1 < routes ? ids[(r1 / n_ids)*ids_stride + r1 % n_ids] : -1;
+    const int me = __shfl_sync(0xffffffff, q < 32 ? e0 : e1, q & 31);
+    const uint64_t mask = (uint64_t) __ballot_sync(0xffffffff, e0 == me) |
+                          ((uint64_t) __ballot_sync(0xffffffff, e1 == me) << 32);
+    if ((mask & ((1ull << q) - 1)) != 0) {
+        return;
+    }
+    if (route_hot != nullptr && (route_hot[me] != 0) != (route_want_hot != 0)) {
+        return;
+    }
+    const int wrow0 = (blockIdx.x*c_warps + threadIdx.y)*rows_per_warp;
+    if (wrow0 >= nrows_x) {
+        return;
+    }
+    const int row0 = wrow0 + (threadIdx.x / c_lanes)*c_rows;
+    const void * vx = table[me];
+    const int blocks_per_row_x = ncols_x / qk;
+    uint64_t left = mask;
+    while (left != 0) {
+        const block_q8_1 * y[4];
+        float * out[4];
+        int n = 0;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            if (j < c_group && left != 0) {
+                const int r = __ffsll((long long) left) - 1;
+                left &= left - 1;
+                const int t = r / n_ids;
+                const int k = r - t*n_ids;
+                y[j]   = vy + (k % act_channels)*stride_channel_y + t*stride_col_y;
+                out[j] = dst + k*stride_channel_dst + t*stride_col_dst;
+                ++n;
+            } else {
+                y[j]   = vy;
+                out[j] = dst;
+            }
+        }
+        if (c_group >= 4 && n == 4) {
+            moe_sw_rows<type, c_lanes, c_rows, c_group >= 4 ? 4 : 1>(vx, y, out, row0, nrows_x, blocks_per_row_x, stride_row_x);
+        } else if (c_group >= 3 && n == 3) {
+            moe_sw_rows<type, c_lanes, c_rows, c_group >= 3 ? 3 : 1>(vx, y, out, row0, nrows_x, blocks_per_row_x, stride_row_x);
+        } else if (c_group >= 2 && n == 2) {
+            moe_sw_rows<type, c_lanes, c_rows, c_group >= 2 ? 2 : 1>(vx, y, out, row0, nrows_x, blocks_per_row_x, stride_row_x);
+        } else {
+            moe_sw_rows<type, c_lanes, c_rows, 1>(vx, y, out, row0, nrows_x, blocks_per_row_x, stride_row_x);
+        }
+    }
+    ggml_cuda_pdl_lc();
+}
+
+template <ggml_type type, int c_warps, int c_lanes, int c_rows, int c_group>
+static void moe_sw_launch(const void * const * table, const char * act_q8, const int32_t * ids, float * dst,
+        int64_t n_in, int64_t n_out, int64_t n_ids, int64_t n_tokens, int64_t channels, int64_t ids_stride,
+        const uint8_t * route_hot, int route_want_hot, cudaStream_t stream) {
+    const int s11 = (int) (GGML_PAD(n_in, MATRIX_ROW_PADDING) / QK8_1);
+    const int stride_row_x = (int) (ggml_row_size(type, n_in) / ggml_type_size(type));
+    constexpr int rows_per_block = c_warps*(32/c_lanes)*c_rows;
+    const ggml_cuda_kernel_launch_params params(dim3((n_out + rows_per_block - 1)/rows_per_block, n_ids*n_tokens),
+            dim3(32, c_warps), 0, stream);
+    ggml_cuda_kernel_launch(mul_mat_vec_q_moe_sw<type, c_warps, c_lanes, c_rows, c_group>, params, table,
+            (const block_q8_1 *) act_q8, ids, dst, (int) n_in, (int) n_out, stride_row_x, (int) channels,
+            (int) channels*s11, s11, (int) (n_ids*n_out), (int) n_out, (int) n_ids, (int) n_tokens, (int) ids_stride,
+            route_hot, route_want_hot);
+}
+
 // [STRATAGAP HITG] Fused gate + up + SwiGLU form of the decode-once kernel (GGML_MOE_HIT_FUSED). The idea of doing
 // both projections and the SwiGLU of an expert in one pass is Strata's (native_gu_swiglu_kernel); this code is our
 // own and keeps our arithmetic. Each warp computes the up and the gate rows of its expert for every member token
@@ -3718,12 +3896,32 @@ static int moe_d1_mode() {
     return mode;
 }
 
+// [STRATAGAP DOWNSW] GGML_MOE_DOWN_SW: 0 off, 1 on, check (trap on any bit difference to the plain kernel); the
+// Q2_0 / IQ4_NL expert projections (Flash-Next's down) then take mul_mat_vec_q_moe_sw, whatever GGML_MOE_MMV_D1 says.
+// GGML_MOE_DOWN_SW_SHAPE: lanes per row x rows per lane group, gN = routes per weight pass, wN = warps per block:
+// 8x2 (default: 8x2g2w4), 16x2, 8x1, 8x2g1, 8x2w8, 16x1, 8x2g4, 4x2.
+static int moe_sw_mode() {
+    static const int mode = [] {
+        const char * e = getenv("GGML_MOE_DOWN_SW");
+        if (!e) {
+            return 0;
+        }
+        return strcmp(e, "check") == 0 ? 2 : atoi(e) != 0 ? 1 : 0;
+    }();
+    return mode;
+}
+
+bool ggml_cuda_moe_down_sw_on(ggml_type type) {
+    return moe_sw_mode() != 0 && (type == GGML_TYPE_Q2_0 || type == GGML_TYPE_IQ4_NL);
+}
+
 bool ggml_cuda_moe_table_mmv_d1_try(ggml_backend_cuda_context & ctx,
         const void * const * table, ggml_type type, const char * act_q8, const int32_t * ids, float * dst,
         int64_t n_in, int64_t n_out, int64_t n_ids, int64_t n_tokens, int64_t channels, int64_t ids_stride,
         const uint8_t * route_hot, int route_want_hot) {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-    const int mode = moe_d1_mode();
+    const bool sw = ggml_cuda_moe_down_sw_on(type);
+    const int mode = sw ? moe_sw_mode() : moe_d1_mode();
     static const int shape = [] {
         const char * e = getenv("GGML_MOE_MMV_D1_SHAPE");
         static const char * const names[] = { "4x2", "8x2", "4x2g2", "8x2g2", "8x1g2", "4x2g1", "4x2s", "4x2g2s", "8x2g2s" };
@@ -3746,6 +3944,16 @@ bool ggml_cuda_moe_table_mmv_d1_try(ggml_backend_cuda_context & ctx,
             n_out < 1 || n_out > INT_MAX / (n_ids*n_tokens) || ids_stride < n_ids || ids_stride > INT_MAX / n_tokens) {
         return false;
     }
+    static const int sw_shape = [] {
+        const char * e = getenv("GGML_MOE_DOWN_SW_SHAPE");
+        static const char * const names[] = { "8x2", "16x2", "8x1", "8x2g1", "8x2w8", "16x1", "8x2g4", "4x2" };
+        for (int i = 0; e && i < 8; ++i) {
+            if (strcmp(e, names[i]) == 0) {
+                return i;
+            }
+        }
+        return 0;
+    }();
     const int64_t count = n_out*n_ids*n_tokens;
     ggml_cuda_pool_alloc<float> reference(ctx.pool());
     cudaStream_t stream = ctx.stream();
@@ -3775,7 +3983,26 @@ bool ggml_cuda_moe_table_mmv_d1_try(ggml_backend_cuda_context & ctx,
             default: moe_d1_launch<T, 4, 2, 4>(MOE_D1_ARGS); break; \
         } \
         break
-    switch (type) {
+#define MOE_SW_SHAPES(T) \
+    case T: \
+        switch (sw_shape) { \
+            case 1:  moe_sw_launch<T, 4, 16, 2, 2>(MOE_D1_ARGS); break; \
+            case 2:  moe_sw_launch<T, 4,  8, 1, 2>(MOE_D1_ARGS); break; \
+            case 3:  moe_sw_launch<T, 4,  8, 2, 1>(MOE_D1_ARGS); break; \
+            case 4:  moe_sw_launch<T, 8,  8, 2, 2>(MOE_D1_ARGS); break; \
+            case 5:  moe_sw_launch<T, 4, 16, 1, 2>(MOE_D1_ARGS); break; \
+            case 6:  moe_sw_launch<T, 4,  8, 2, 4>(MOE_D1_ARGS); break; \
+            case 7:  moe_sw_launch<T, 4,  4, 2, 2>(MOE_D1_ARGS); break; \
+            default: moe_sw_launch<T, 4,  8, 2, 2>(MOE_D1_ARGS); break; \
+        } \
+        break
+    if (sw) {
+        switch (type) {
+            MOE_SW_SHAPES(GGML_TYPE_Q2_0);
+            MOE_SW_SHAPES(GGML_TYPE_IQ4_NL);
+            default: GGML_ABORT("unsupported sub-warp MoE type");
+        }
+    } else switch (type) {
         MOE_D1_SHAPES(GGML_TYPE_Q2_0);
         MOE_D1_SHAPES(GGML_TYPE_IQ2_XXS);
         MOE_D1_SHAPES(GGML_TYPE_IQ2_XS);
@@ -3785,6 +4012,7 @@ bool ggml_cuda_moe_table_mmv_d1_try(ggml_backend_cuda_context & ctx,
         MOE_D1_SHAPES(GGML_TYPE_IQ4_NL);
         default: GGML_ABORT("unsupported decode-once MoE type");
     }
+#undef MOE_SW_SHAPES
 #undef MOE_D1_SHAPES
 #undef MOE_D1_ARGS
     if (mode == 2) {
@@ -3803,7 +4031,7 @@ bool ggml_cuda_moe_table_mmv_d1_try(ggml_backend_cuda_context & ctx,
 // [STRATAGAP MISSLIST] miss pass over the plan's compact list: grid (row tiles, slices); slice y takes list entries
 // y, y + slices, ... so a pass with nothing to do is one load per block. Per route the dot code, lane split and
 // reduction are those of the plain kernel (moe_d1_rows / moe_hitg_rows), so every output keeps its bits.
-template <ggml_type type, int c_warps, int c_rows, bool c_fused>
+template <ggml_type type, int c_warps, int c_rows, bool c_fused, int c_lanes = 32>
 __launch_bounds__(c_warps*32, 768/(c_warps*32))
 static __global__ void mul_mat_vec_q_moe_list(const moe_miss_list * list,
         const void * const * table, const void * const * gate_table, const block_q8_1 * vy, float * dst,
@@ -3813,10 +4041,11 @@ static __global__ void mul_mat_vec_q_moe_list(const moe_miss_list * list,
     constexpr int qk = ggml_cuda_type_traits<type>::qk;
     ggml_cuda_pdl_sync();
     const int n = list->n;
-    const int row0 = (blockIdx.x*c_warps + threadIdx.y)*c_rows;
-    if ((int) blockIdx.y >= n || row0 >= nrows_x) {
+    const int wrow0 = (blockIdx.x*c_warps + threadIdx.y)*((32/c_lanes)*c_rows);
+    if ((int) blockIdx.y >= n || wrow0 >= nrows_x) {
         return;
     }
+    const int row0 = wrow0 + (c_lanes < 32 ? (int) (threadIdx.x / c_lanes)*c_rows : 0);
     const int blocks_per_row_x = ncols_x / qk;
     for (int j = blockIdx.y; j < n; j += gridDim.y) {
         const int e = list->expert[j];
@@ -3847,6 +4076,12 @@ static __global__ void mul_mat_vec_q_moe_list(const moe_miss_list * list,
                     moe_hitg_rows<type, c_rows, 2, false>(vx, vg, y, out, row0, nrows_x, blocks_per_row_x, stride_row_x, nullptr);
                 } else {
                     moe_hitg_rows<type, c_rows, 1, false>(vx, vg, y, out, row0, nrows_x, blocks_per_row_x, stride_row_x, nullptr);
+                }
+            } else if constexpr (c_lanes < 32) {
+                if (m == 2) {
+                    moe_sw_rows<type, c_lanes, c_rows, 2>(vx, y, out, row0, nrows_x, blocks_per_row_x, stride_row_x);
+                } else {
+                    moe_sw_rows<type, c_lanes, c_rows, 1>(vx, y, out, row0, nrows_x, blocks_per_row_x, stride_row_x);
                 }
             } else {
                 if (m == 2) {
@@ -3894,6 +4129,8 @@ void ggml_cuda_moe_table_mmv_list(ggml_backend_cuda_context & ctx, const moe_mis
     const int stride_row_x = (int) (ggml_row_size(type, n_in) / ggml_type_size(type));
     const ggml_cuda_kernel_launch_params params(dim3((n_out + c_warps*c_rows - 1)/(c_warps*c_rows), slices),
             dim3(32, c_warps), 0, ctx.stream());
+    const ggml_cuda_kernel_launch_params params_sw(dim3((n_out + c_warps*4*c_rows - 1)/(c_warps*4*c_rows), slices),
+            dim3(32, c_warps), 0, ctx.stream());
 #define MOE_LIST_ARGS list, table, gate_table, (const block_q8_1 *) act_q8, dst, (int) n_in, (int) n_out, stride_row_x, \
         (int) channels, (int) channels*s11, s11, (int) (n_ids*n_out), (int) n_out, (int) n_ids
 #define MOE_LIST_CASE(T) \
@@ -3910,13 +4147,22 @@ void ggml_cuda_moe_table_mmv_list(ggml_backend_cuda_context & ctx, const moe_mis
         MOE_LIST_CASE(GGML_TYPE_IQ2_S);
         MOE_LIST_CASE(GGML_TYPE_IQ3_XXS);
         MOE_LIST_CASE(GGML_TYPE_IQ3_S);
+        // down types: the sub-warp rows (8 lanes x 2 rows, bit-identical) when GGML_MOE_DOWN_SW is on
         case GGML_TYPE_Q2_0:
             GGML_ASSERT(!gate_table);
-            ggml_cuda_kernel_launch(mul_mat_vec_q_moe_list<GGML_TYPE_Q2_0, c_warps, c_rows, false>, params, MOE_LIST_ARGS);
+            if (ggml_cuda_moe_down_sw_on(type)) {
+                ggml_cuda_kernel_launch(mul_mat_vec_q_moe_list<GGML_TYPE_Q2_0, c_warps, c_rows, false, 8>, params_sw, MOE_LIST_ARGS);
+            } else {
+                ggml_cuda_kernel_launch(mul_mat_vec_q_moe_list<GGML_TYPE_Q2_0, c_warps, c_rows, false>, params, MOE_LIST_ARGS);
+            }
             break;
         case GGML_TYPE_IQ4_NL:
             GGML_ASSERT(!gate_table);
-            ggml_cuda_kernel_launch(mul_mat_vec_q_moe_list<GGML_TYPE_IQ4_NL, c_warps, c_rows, false>, params, MOE_LIST_ARGS);
+            if (ggml_cuda_moe_down_sw_on(type)) {
+                ggml_cuda_kernel_launch(mul_mat_vec_q_moe_list<GGML_TYPE_IQ4_NL, c_warps, c_rows, false, 8>, params_sw, MOE_LIST_ARGS);
+            } else {
+                ggml_cuda_kernel_launch(mul_mat_vec_q_moe_list<GGML_TYPE_IQ4_NL, c_warps, c_rows, false>, params, MOE_LIST_ARGS);
+            }
             break;
         default: GGML_ABORT("unsupported miss-list type");
     }

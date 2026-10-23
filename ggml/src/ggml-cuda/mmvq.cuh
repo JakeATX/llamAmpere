@@ -89,6 +89,8 @@ struct moe_miss_list {
 void ggml_cuda_moe_table_mmv_list(ggml_backend_cuda_context & ctx, const moe_miss_list * list,
         const void * const * table, const void * const * gate_table, ggml_type type, const char * act_q8, float * dst,
         int64_t n_in, int64_t n_out, int64_t n_ids, int64_t n_tokens, int64_t channels);
+// [STRATAGAP DOWNSW] true when GGML_MOE_DOWN_SW routes this (down) type to the sub-warp rows kernel
+bool ggml_cuda_moe_down_sw_on(ggml_type type);
 // bit compare of two float buffers (traps on the first difference); for the check modes
 void ggml_cuda_moe_bits_check(const float * reference, const float * actual, int64_t count, cudaStream_t stream);
 bool ggml_cuda_moe_table_mmv_list_supported(ggml_type type, bool fused, int64_t n_in, int64_t n_ids, int64_t n_tokens,
