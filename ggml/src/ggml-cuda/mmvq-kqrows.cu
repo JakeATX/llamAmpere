@@ -74,36 +74,69 @@ static int kqrows_table_nwarps(ggml_type type, int ncols_dst) {
     return (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K) ? 4 : 2;
 }
 
-static int kqrows_default_rows(ggml_type type, int ncols_dst) {
-    GGML_UNUSED(type);
-    GGML_UNUSED(ncols_dst);
-    return 2;
+// [KQROWS] default table: rows per CTA (0 = not taken, keep the current route) and warps per CTA (0 = the MMVQ table
+// count, bit-identical to MMVQ) for each type, width 2..8 and row-count class. Small = at most 1024 rows (router,
+// hyper-connection and gate-sized products; MMVQ's 8 rows per CTA leave the card under-filled there), large = more.
+// Filled from AIFAST/ROWMMVQ kq_table.py --emit on the home 3090 Ti (350 W): a cell is set only where the row kernel
+// beat the current route at that shape.
+struct kqrows_cell { int8_t rows; int8_t nwarps; };
+static constexpr int KQROWS_SMALL_MAX_ROWS = 1024;
+//                                            width:   2       3       4       5       6       7       8
+static const kqrows_cell kqrows_tab_small[3][7] = {
+    /* q4_K */ { {2, 0}, {2, 0}, {2, 0}, {2, 0}, {2, 0}, {2, 0}, {2, 0} },
+    /* q5_K */ { {2, 0}, {2, 0}, {2, 0}, {2, 0}, {2, 0}, {2, 0}, {2, 0} },
+    /* q6_K */ { {2, 0}, {2, 0}, {2, 0}, {2, 0}, {2, 0}, {2, 0}, {2, 0} },
+};
+static const kqrows_cell kqrows_tab_large[3][7] = {
+    /* q4_K */ { {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0} },
+    /* q5_K */ { {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0} },
+    /* q6_K */ { {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0} },
+};
+
+// rows/nwarps for this product, rows 0 = not taken
+static kqrows_cell kqrows_pick(int ti, ggml_type type, int64_t nrows_x, int64_t ncols_dst) {
+    const kqrows_cfg & c = kqrows_get_cfg();
+    kqrows_cell cell = (nrows_x <= KQROWS_SMALL_MAX_ROWS ? kqrows_tab_small : kqrows_tab_large)[ti][ncols_dst - 2];
+    if (c.rows > 0) {
+        cell.rows = (int8_t) c.rows; // forced for every cell (sweeps)
+    }
+    if (cell.rows == 0) {
+        return cell;
+    }
+    if (c.nwarps > 0) {
+        cell.nwarps = (int8_t) c.nwarps;
+    } else if (cell.nwarps == 0) {
+        cell.nwarps = (int8_t) kqrows_table_nwarps(type, (int) ncols_dst);
+    }
+    return cell;
+}
+
+static bool kqrows_eligible(int ti, int cc, int64_t ncols_x, int64_t ncols_dst) {
+    const kqrows_cfg & c = kqrows_get_cfg();
+    return c.on && ti >= 0 && c.types[ti] && ncols_dst >= c.min_n && ncols_dst <= c.max_n &&
+        GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_DP4A && ncols_x % QK_K == 0;
 }
 
 } // namespace
 
-int ggml_cuda_kqrows_max_n(ggml_type type) {
-    const kqrows_cfg & c = kqrows_get_cfg();
+bool ggml_cuda_kqrows_wants(ggml_type type, int cc, int64_t ncols_x, int64_t nrows_x, int64_t ncols_dst) {
     const int ti = kqrows_type_index(type);
-    if (!c.on || ti < 0 || !c.types[ti]) {
-        return 0;
-    }
-    return c.max_n;
+    return kqrows_eligible(ti, cc, ncols_x, ncols_dst) && kqrows_pick(ti, type, nrows_x, ncols_dst).rows > 0;
 }
 
 bool ggml_cuda_kqrows_try(ggml_type type, const void * vx, const void * vy_q8_1, float * dst,
         int ncols_x, int nrows_x, int ncols_dst, int stride_row_x, int stride_col_y, int stride_col_dst,
         int cc, cudaStream_t stream) {
-    const kqrows_cfg & c = kqrows_get_cfg();
     const int ti = kqrows_type_index(type);
-    if (!c.on || ti < 0 || !c.types[ti] || ncols_dst < c.min_n || ncols_dst > c.max_n) {
+    if (!kqrows_eligible(ti, cc, ncols_x, ncols_dst)) {
         return false;
     }
-    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_DP4A || ncols_x % QK_K != 0) {
+    const kqrows_cell cell = kqrows_pick(ti, type, nrows_x, ncols_dst);
+    if (cell.rows == 0) {
         return false;
     }
-    const int rows   = c.rows   > 0 ? c.rows   : kqrows_default_rows(type, ncols_dst);
-    const int nwarps = c.nwarps > 0 ? c.nwarps : kqrows_table_nwarps(type, ncols_dst);
+    const int rows   = cell.rows;
+    const int nwarps = cell.nwarps;
     switch (type) {
         case GGML_TYPE_Q4_K:
             ggml_cuda_kqrows_launch<GGML_TYPE_Q4_K>(vx, vy_q8_1, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst, rows, nwarps, stream);

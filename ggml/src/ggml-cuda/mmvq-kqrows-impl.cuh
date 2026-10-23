@@ -200,6 +200,16 @@ static __global__ void mul_mat_vec_q_kqrows(
 
     const typename T::block * x = (const typename T::block *) vx + (int64_t) row0*stride_row_x;
 
+    // Rows past the end of the matrix (last CTA only) re-read the last row instead of branching around it: a branch
+    // between the per-row loads made nvcc issue them one row at a time (load, dot, load, dot), which ran 15-55% slower
+    // than MMVQ on 2560- and 10240-row matrices; MMVQ issues every load of a K step first. The extra rows' sums are
+    // never written, so the output is unchanged.
+    int row_off[rows];
+#pragma unroll
+    for (int i = 0; i < rows; ++i) {
+        row_off[i] = min(i, nrows_x - 1 - row0) * stride_row_x;
+    }
+
     float tmp[ncols_dst][rows] = {{0.0f}};
 
     ggml_cuda_pdl_sync();
@@ -212,15 +222,16 @@ static __global__ void mul_mat_vec_q_kqrows(
         for (int j = 0; j < ncols_dst; ++j) {
             xv[j] = T::xload(y + j*stride_col_y + kby, kqs);
         }
+        typename T::W w[rows];
 #pragma unroll
         for (int i = 0; i < rows; ++i) {
-            if (row0 + i >= nrows_x) {
-                continue;
-            }
-            const typename T::W w = T::wload(x + i*stride_row_x + kbx, kqs);
+            w[i] = T::wload(x + row_off[i] + kbx, kqs);
+        }
+#pragma unroll
+        for (int i = 0; i < rows; ++i) {
 #pragma unroll
             for (int j = 0; j < ncols_dst; ++j) {
-                tmp[j][i] += T::dot(w, xv[j]);
+                tmp[j][i] += T::dot(w[i], xv[j]);
             }
         }
     }

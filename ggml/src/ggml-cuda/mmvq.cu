@@ -664,9 +664,7 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
             case GGML_TYPE_Q4_K:
             case GGML_TYPE_Q5_K:
             case GGML_TYPE_Q6_K:
-                // [KQROWS] the row kernel decodes each weight once for all columns, so MMVQ keeps the K-quants to its
-                // width ceiling when it is on (GGML_CUDA_KQ_ROWS=1, default off)
-                return ne11 <= std::max<int64_t>(4, ggml_cuda_kqrows_max_n(type));
+                return ne11 <= 4; // [KQROWS] widths 5..8 can still reach MMVQ through ggml_cuda_kqrows_wants (route)
             default:
                 return ne11 <= MMVQ_MAX_BATCH_SIZE;
         }

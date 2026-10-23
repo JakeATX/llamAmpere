@@ -43,6 +43,7 @@
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/mmvq-kq-tc.cuh"
+#include "ggml-cuda/mmvq-kqrows.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
 #include "ggml-cuda/nemotron-moe.cuh"
 #include "ggml-cuda/nemotron-ssm.cuh"
@@ -3289,6 +3290,11 @@ static ggml_cuda_mm_route ggml_cuda_mul_mat_route(const ggml_tensor * src0, cons
     // TQ weight types use the fused dp4a path (decode) or runtime q8_0 conversion + cuBLAS (prefill),
     // never mmvq/mmq (mmvq's type switch has no TQ cases and aborts).
     const bool is_tq_weight = (src0->type == GGML_TYPE_TQ4_1S || src0->type == GGML_TYPE_TQ3_1S);
+    // [KQROWS] plain 2D Q4_K/Q5_K/Q6_K products at 2..8 columns whose shape the row kernel wins (GGML_CUDA_KQ_ROWS=1)
+    if (!is_tq_weight && src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+            ggml_cuda_kqrows_wants(src0->type, cc, src0->ne[0], src0->ne[1], ne11)) {
+        return GGML_CUDA_MM_ROUTE_MMVQ;
+    }
     if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11) && !is_tq_weight) {
         return GGML_CUDA_MM_ROUTE_MMVQ;
     }
