@@ -3483,7 +3483,13 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // never mmvq/mmq (mmvq's type switch has no TQ cases and aborts).
     const bool is_tq_weight = (src0->type == GGML_TYPE_TQ4_1S || src0->type == GGML_TYPE_TQ3_1S);
     // [KQTC] K-quant / IQ3_S at 2..8 columns on int8 tensor cores (GGML_CUDA_KQ_TC, default off)
-    if ((route == GGML_CUDA_MM_ROUTE_MMVQ || route == GGML_CUDA_MM_ROUTE_MMQ) && ggml_cuda_mul_mat_kq_tc_try(ctx, src0, src1, dst)) {
+    // [KQROWS] a shape the row kernel's default table claims stays on the row kernel even with KQTC on: the table only
+    // claims cells where the row kernel measured faster than both the default route and KQTC (kq_table.py KQ_RIVALS)
+    const bool kqrows_claims = route == GGML_CUDA_MM_ROUTE_MMVQ &&
+        src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+        ggml_cuda_kqrows_wants(src0->type, cc, src0->ne[0], src0->ne[1], src1->ne[1]);
+    if (!kqrows_claims && (route == GGML_CUDA_MM_ROUTE_MMVQ || route == GGML_CUDA_MM_ROUTE_MMQ) &&
+            ggml_cuda_mul_mat_kq_tc_try(ctx, src0, src1, dst)) {
         return;
     }
     if (route == GGML_CUDA_MM_ROUTE_MMVQ) {

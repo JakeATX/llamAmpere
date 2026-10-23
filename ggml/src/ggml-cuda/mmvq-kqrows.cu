@@ -82,10 +82,11 @@ static int kqrows_table_nwarps(ggml_type type, int ncols_dst) {
 struct kqrows_cell { int8_t rows; int8_t nwarps; };
 static constexpr int KQROWS_SMALL_MAX_ROWS = 1024;
 //                                            width:   2       3       4       5       6       7       8
+// Provisional (results/perf2, KQ_RIVALS=kqtc): only where 1 row per CTA beat both today's route and KQTC by >= 3%.
 static const kqrows_cell kqrows_tab_small[3][7] = {
-    /* q4_K */ { {2, 0}, {2, 0}, {2, 0}, {2, 0}, {2, 0}, {2, 0}, {2, 0} },
-    /* q5_K */ { {2, 0}, {2, 0}, {2, 0}, {2, 0}, {2, 0}, {2, 0}, {2, 0} },
-    /* q6_K */ { {2, 0}, {2, 0}, {2, 0}, {2, 0}, {2, 0}, {2, 0}, {2, 0} },
+    /* q4_K */ { {1, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0} },
+    /* q5_K */ { {1, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0} },
+    /* q6_K */ { {1, 0}, {1, 0}, {1, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0} },
 };
 static const kqrows_cell kqrows_tab_large[3][7] = {
     /* q4_K */ { {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0} },
