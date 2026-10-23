@@ -8,6 +8,7 @@
 // CPU kernel is scalar: it gets its own AVX2 loop below.
 #if defined(__linux__)
 #include <sys/prctl.h>
+#include <dirent.h>
 #endif
 #include "moe-cpu-split.h"
 #include "ggml.h"
@@ -921,6 +922,27 @@ bool moe_cs_layer_ok(int layer) {
     return layer >= 0 && layer < (int) s.layers.size() && s.layers[layer].ok;
 }
 
+// Run-queue wait of every thread of this process so far, in ns (/proc/self/task/*/schedstat field 2): time a thread
+// was ready to run but another task held its cpu. The probe reads it before and after its timed jobs, so CPU contention
+// from other programs on the pool's cpus shows up in every log (0 when schedstat is missing).
+static double moe_cs_runq_wait_ns() {
+    double sum = 0.0;
+    DIR * d = opendir("/proc/self/task");
+    if (!d) { return 0.0; }
+    while (dirent * e = readdir(d)) {
+        if (e->d_name[0] < '0' || e->d_name[0] > '9') { continue; }
+        char path[96];
+        snprintf(path, sizeof(path), "/proc/self/task/%s/schedstat", e->d_name);
+        FILE * f = fopen(path, "r");
+        if (!f) { continue; }
+        unsigned long long run = 0, wait = 0;
+        if (fscanf(f, "%llu %llu", &run, &wait) == 2) { sum += (double) wait; }
+        fclose(f);
+    }
+    closedir(d);
+    return sum;
+}
+
 bool moe_cs_probe(double * route_ns, double * fixed_ns) {
     pool_state & s = P();
     int layer = -1;
@@ -986,10 +1008,14 @@ bool moe_cs_probe(double * route_ns, double * fixed_ns) {
     };
     const double t0 = run(0);   // empty jobs: the host-side handshake alone
     for (int p = 0; p < 4; ++p) { s.phase_ns[p] = 0; }
+    const double q0 = moe_cs_runq_wait_ns();
+    const auto w0 = clk::now();
     const double t1 = run(1);
     unsigned long long ph1[4];
     for (int p = 0; p < 4; ++p) { ph1[p] = s.phase_ns[p] / 24; s.phase_ns[p] = 0; }
     const double t4 = run(4);
+    const double wall_ns = (double) std::chrono::duration_cast<std::chrono::nanoseconds>(clk::now() - w0).count();
+    const double stolen = wall_ns > 0 ? (moe_cs_runq_wait_ns() - q0) / (wall_ns * (double) std::max(1, s.threads)) : 0.0;
     unsigned long long ph4[4];
     for (int p = 0; p < 4; ++p) { ph4[p] = s.phase_ns[p] / 24; s.phase_ns[p] = 0; }
     fprintf(stderr, "[moe-cpu-split] probe phases (mean us, quantize x / up+gate / quantize hidden / down): "
@@ -1002,6 +1028,24 @@ bool moe_cs_probe(double * route_ns, double * fixed_ns) {
     s.st_jobs = 0; s.st_experts = 0; s.st_routes = 0; s.st_busy_ns = 0; s.st_null = 0;
     fprintf(stderr, "[moe-cpu-split] probe on layer %d: empty job %.1f us, 1 expert %.1f us, 4 experts %.1f us -> %.1f us per (expert, route) + %.1f us per job\n",
             layer, t0 / 1000.0, t1 / 1000.0, t4 / 1000.0, per / 1000.0, *fixed_ns / 1000.0);
+    // Contention check (2026-10-23): a home run with git and simulations on the pool's cpus probed 116.9 us per expert
+    // against a clean 65 us and wrote at 26.7 tok/s. Two signals, either one warns:
+    //  - share of the pool's time spent waiting for a cpu during the timed jobs (over 25% = about 1.33x slower or worse);
+    //  - GGML_MOE_CPU_SPLIT_PROBE_EXPECT_US=<clean 1-expert us for this box>: the 1-expert time is over 2x that.
+    size_t expert_bytes = 0;
+    for (int k = 0; k < 3; ++k) { expert_bytes += L.role[k].r.row_bytes * (size_t) L.role[k].r.n_out; }
+    const char * ex = getenv("GGML_MOE_CPU_SPLIT_PROBE_EXPECT_US");
+    const double expect_us = ex ? atof(ex) : 0.0;
+    fprintf(stderr, "[moe-cpu-split] probe check: %.2f MB per expert, %.1f GB/s for 1 expert, %.1f GB/s for 4; "
+            "pool waited for a cpu %.1f%% of the time%s\n", expert_bytes / 1e6, expert_bytes / std::max(1.0, t1),
+            4.0 * expert_bytes / std::max(1.0, t4), 100.0 * stolen,
+            expect_us > 0 ? "" : " (set GGML_MOE_CPU_SPLIT_PROBE_EXPECT_US for a time check)");
+    if (stolen > 0.25 || (expect_us > 0 && t1 / 1000.0 > 2.0 * expect_us)) {
+        fprintf(stderr, "[moe-cpu-split] WARN: CPU CONTENTION at load: 1 expert %.1f us (expected %s), pool waited for a cpu "
+                "%.1f%% of the time. Other programs are running on the pool's cpus; split timings from this run are not "
+                "valid.\n", t1 / 1000.0, expect_us > 0 ? (std::to_string(expect_us) + " us").c_str() : "not set",
+                100.0 * stolen);
+    }
     return true;
 }
 
