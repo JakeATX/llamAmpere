@@ -1922,6 +1922,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
         if (sj_kvarn.enabled()) {
             // SJ-KVaRN: ring rows and sealed records are addressed by cell, and a sequence only grows at its end, so the ubatch takes the cells after the last one.
             // The positions must continue the sequence: +1 per text token; M-RoPE image tokens share a position, and the token after an image jumps ahead.
+            // A draft cache never holds the image tokens (the MTP driver skips them), so its text rows may jump ahead too: any larger position.
             // A ubatch that does not continue its sequence (for example tokens of a slot the server purged after building the batch) fails the slot search (decode returns 1).
             const uint32_t c_next = cells.used_max_p1();
             llama_pos p_prev    = cells.seq_pos_max(seq_id); // -1 for an empty sequence
@@ -1932,7 +1933,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
                 const uint32_t  idx  = c_next + ii;
                 const bool      embd = !ubatch.token || (ubatch.is_mixed() && ubatch.type[i]);
                 const bool ok = pos >= 0 && idx < cells.size() && cells.is_empty(idx) &&
-                    (pos == p_prev + 1 || (prev_embd && (embd ? pos >= p_prev : pos > p_prev)));
+                    (pos == p_prev + 1 || (prev_embd && (embd ? pos >= p_prev : pos > p_prev)) || (sj_kvarn.draft && pos > p_prev));
                 if (!ok) {
                     LLAMA_LOG_WARN("%s: SJ-KVaRN cache: sequence %d: ubatch position %d does not continue the sequence (next %d)\n",
                             __func__, seq_id, pos, p_prev + 1);
@@ -4303,13 +4304,15 @@ void llama_kv_cache::state_write_sj_kvarn(llama_io_write_i & io, llama_seq_id se
     const auto & cells = v_cells[strm];
 
     // the sequence must hold exactly the cells [0, n) with positions from 0 that never decrease (position i at cell i without M-RoPE), and nothing may lie above it
+    // (a draft cache may start later and skip positions: it has no image rows)
     uint32_t n = 0;
     for (uint32_t i = 0; i < cells.size(); ++i) {
         if (cells.is_empty(i) || (seq_id != -1 && !cells.seq_has(i, seq_id))) {
             continue;
         }
         const llama_pos pos = cells.pos_get(i);
-        if (i != n || (i == 0 ? pos != 0 : pos < cells.pos_get(i - 1)) || (!has_cell_ext() && pos != (llama_pos) i)) {
+        if (i != n || (i == 0 ? (sj_kvarn.draft ? pos < 0 : pos != 0) : pos < cells.pos_get(i - 1)) ||
+                (!has_cell_ext() && !sj_kvarn.draft && pos != (llama_pos) i)) {
             throw std::runtime_error("SJ-KVaRN cache: cannot save state: the sequence does not hold a contiguous prefix [0, n)");
         }
         ++n;
@@ -4463,7 +4466,7 @@ uint32_t llama_kv_cache::state_read_sj_kvarn(llama_io_read_i & io, llama_seq_id 
         io.read(&pos,      sizeof(pos));
         io.read(&n_seq_id, sizeof(n_seq_id));
         // as saved: positions from 0 that never decrease (position i at cell i without M-RoPE)
-        if (i == 0 ? pos != 0 : (pos < poss[i - 1] || (!has_cell_ext() && pos != (llama_pos) i))) {
+        if (i == 0 ? (sj_kvarn.draft ? pos < 0 : pos != 0) : (pos < poss[i - 1] || (!has_cell_ext() && !sj_kvarn.draft && pos != (llama_pos) i))) {
             throw std::runtime_error("SJ-KVaRN cache: state cell " + std::to_string(i) + " holds position " + std::to_string(pos));
         }
         poss[i] = pos;
