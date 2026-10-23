@@ -10200,7 +10200,10 @@ bool ggml_cuda_moe_cache_device_compute(ggml_backend_cuda_context & ctx, ggml_te
 bool ggml_cuda_moe_cache_device_fused_compute(ggml_backend_cuda_context & ctx,
         ggml_tensor * up, ggml_tensor * gate, ggml_tensor * glu) {
     const char * enabled = getenv("GGML_MOE_CACHE_DEVICE_FUSED");
-    if (!enabled || strcmp(enabled, "1") != 0 || g_session_stack.empty() || !g_session_stack.back().active ||
+    const bool legacy_fused = enabled && strcmp(enabled, "1") == 0;
+    // fork STRATAGAP HITG: GGML_MOE_HIT_FUSED takes the hit-first layers through one fused gate/up/SwiGLU pass
+    const bool hitg = ggml_cuda_moe_hit_fused_mode() != 0;
+    if ((!legacy_fused && !hitg) || g_session_stack.empty() || !g_session_stack.back().active ||
             !up || !gate || !glu || glu->op != GGML_OP_GLU ||
             ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || ggml_get_op_params_i32(glu, 1) != 0 ||
             glu->src[0] != gate || glu->src[1] != up ||
@@ -10222,6 +10225,55 @@ bool ggml_cuda_moe_cache_device_fused_compute(ggml_backend_cuda_context & ctx,
     const auto & gate_table = session.device_tables.at(gate->src[0]->data);
     const ggml_tensor * a = up->src[1];
     const ggml_tensor * ids = up->src[2];
+    if (hitg) {
+        const int64_t ids_stride = ids->nb[1] / sizeof(int32_t);
+        const bool ok = !session.route_trace.host && up_table.mj_kind == 0 && gate_table.mj_kind == 1 &&
+                up_table.mj_layer >= 0 && up_table.mj_layer == gate_table.mj_layer &&
+                a->type == GGML_TYPE_F32 && ids->ne[2] == 1 &&
+                ggml_cuda_moe_table_mmv_hitg_supported((ggml_type) up_table.desc.type, a->ne[0], glu->ne[0],
+                    ids->ne[0], ids->ne[1], a->ne[1], ids_stride);
+        if (ok) {
+            moe_cache_swap_note_stream(session, ctx);
+            if (moe_hf_begin(ctx, session, up_table, a, ids)) {
+                GGML_ASSERT(moe_hf_begin(ctx, session, gate_table, a, ids));
+                session.device_dispatches.fetch_add(2, std::memory_order_relaxed);
+                if (session.device_expert_counts) {
+                    const int n = (int)(ids->ne[0] * ids->ne[1]);
+                    for (const auto * table : {&up_table, &gate_table}) {
+                        moe_cache_count_routes<<<(n + 127) / 128, 128, 0, ctx.stream()>>>(
+                                (const int32_t *)ids->data, table->hot, session.device_route_counts,
+                                session.device_expert_counts + table->count_offset, n, table->desc.n_expert,
+                                (int)ids->ne[0], (int) ids_stride);
+                    }
+                }
+                const int64_t padded = GGML_PAD(a->ne[0], MATRIX_ROW_PADDING);
+                const size_t q8_bytes = (size_t)(padded / QK8_1) * a->ne[1] * a->ne[2] * sizeof(block_q8_1);
+                ggml_cuda_pool_alloc<char> q8(ctx.pool());
+                char * quantized = q8.alloc(q8_bytes);
+                quantize_row_q8_1_cuda((const float *) a->data, nullptr, quantized, (ggml_type) up_table.desc.type,
+                        a->ne[0], a->nb[1] / sizeof(float), a->nb[2] / sizeof(float), a->nb[3] / sizeof(float),
+                        padded, a->ne[1], a->ne[2], 1, ctx.stream());
+                // hit pass: experts resident for both projections
+                ggml_cuda_moe_table_mmv_hitg(ctx, up_table.device, gate_table.device, (ggml_type) up_table.desc.type,
+                        quantized, (const int32_t *) ids->data, (float *) glu->data, a->ne[0], glu->ne[0], ids->ne[0],
+                        ids->ne[1], a->ne[1], ids_stride, up_table.hot, gate_table.hot, 1);
+                const void * const * up_eff = moe_hf_wait(ctx, session, up_table);
+                const void * const * gate_eff = moe_hf_wait(ctx, session, gate_table);
+                // miss pass: every other expert the card computes (a CPU-split layer skips the host's experts)
+                const bool cs = session.cs_layer >= 0 && session.cs_layer == up_table.mj_layer;
+                const uint8_t * skip_up = cs ? g_cs_mask + (size_t) up_table.mj_kind * g_hf_experts : up_table.hot;
+                const uint8_t * skip_gate = cs ? g_cs_mask + (size_t) gate_table.mj_kind * g_hf_experts : gate_table.hot;
+                ggml_cuda_moe_table_mmv_hitg(ctx, up_eff, gate_eff, (ggml_type) up_table.desc.type,
+                        quantized, (const int32_t *) ids->data, (float *) glu->data, a->ne[0], glu->ne[0], ids->ne[0],
+                        ids->ne[1], a->ne[1], ids_stride, skip_up, skip_gate, 0);
+                CUDA_CHECK(cudaGetLastError());
+                return true;
+            }
+        }
+        if (!legacy_fused) {
+            return false;
+        }
+    }
     session.device_dispatches.fetch_add(2, std::memory_order_relaxed);
     moe_cache_swap_note_stream(session, ctx);
     if (session.device_expert_counts) {

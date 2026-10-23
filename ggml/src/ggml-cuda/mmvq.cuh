@@ -76,6 +76,14 @@ bool ggml_cuda_moe_table_mmv_grouped_try(ggml_backend_cuda_context & ctx,
         int64_t n_in, int64_t n_out, int64_t n_ids, int64_t n_tokens, int64_t channels, int64_t ids_stride);
 // [VBEAT D1] decode-once expert kernel (GGML_MOE_MMV_D1); bitwise the plain table kernel. route_hot == nullptr runs
 // every route, otherwise only the routes whose residency matches route_want_hot. false launches nothing.
+// [STRATAGAP HITG] fused gate + up + SwiGLU expert pass (GGML_MOE_HIT_FUSED, see mmvq.cu)
+int ggml_cuda_moe_hit_fused_mode();
+bool ggml_cuda_moe_table_mmv_hitg_supported(ggml_type type, int64_t n_in, int64_t n_out, int64_t n_ids,
+        int64_t n_tokens, int64_t channels, int64_t ids_stride);
+void ggml_cuda_moe_table_mmv_hitg(ggml_backend_cuda_context & ctx,
+        const void * const * up_table, const void * const * gate_table, ggml_type type, const char * act_q8,
+        const int32_t * ids, float * dst, int64_t n_in, int64_t n_out, int64_t n_ids, int64_t n_tokens,
+        int64_t channels, int64_t ids_stride, const uint8_t * m0, const uint8_t * m1, int want);
 bool ggml_cuda_moe_table_mmv_d1_try(ggml_backend_cuda_context & ctx,
         const void * const * table, ggml_type type, const char * act_q8, const int32_t * ids, float * dst,
         int64_t n_in, int64_t n_out, int64_t n_ids, int64_t n_tokens, int64_t channels, int64_t ids_stride,
