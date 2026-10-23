@@ -484,6 +484,13 @@ void llama_moe_arena_apply_flashnext_defaults() {
         { "LLAMA_QSA_POOL_RANGE",                 "1" },
         { "LLAMA_QSA_SEL_DIRECT",                 "1" },
         { "LLAMA_PREFETCH_THREADS",               "8" },
+        // verify-step matrix kernels (STRATAGAP/AIFAST trio, 100K, split on in both arms: +6.3% words/s, every task
+        // faster at 3 and 4 words). KQ_TC: valid math (tensor-core sums), K-quants only, IQ3_S stays opt-in by name.
+        // FROWS: valid math (router rows kernel). KQ_ROWS: bit-identical to the plain kernel.
+        { "GGML_CUDA_KQ_TC",                      "q4_K,q5_K,q6_K" },
+        { "GGML_CUDA_KQ_TC_WARPS",                "4" },
+        { "GGML_CUDA_KQ_ROWS",                    "1" },
+        { "GGML_CUDA_FROWS",                      "1" },
         // helper (MTP) memory and launch savings
         { "LLAMA_MTP_PIN_BORROWED_HOST",          "1" },
         { "LLAMA_MTP_COMPAT_REUSE",               "1" },
