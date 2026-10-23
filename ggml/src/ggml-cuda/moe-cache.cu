@@ -117,6 +117,8 @@ struct moe_cs_plan_dev {
     unsigned long long stat_wait_ns, stat_joins;  // card time spent waiting for the host in the join
     float route_ns_live;                   // GGML_MOE_CPU_SPLIT_ADAPT=1: measured cost per route (0 = use the probe's)
     unsigned long long stat_adapt;         // jobs folded into route_ns_live
+    unsigned long long stat_parts;         // missed projections (expert x up/gate/down) the CPU took
+    unsigned long long stat_partial;       // CPU experts that were resident in one or two projections
 };
 static bool g_cs_on = false;
 static moe_cs_job * g_cs_job_h = nullptr;
@@ -129,6 +131,15 @@ static uint8_t * g_cs_mask = nullptr;      // [3][g_hf_experts]: resident or on 
 static float g_cs_route_ns = 0.0f, g_cs_fixed_ns = 0.0f, g_cs_ns_per_byte = 0.0f;
 static int g_cs_max_exp = 8, g_cs_max_route = 24;
 static int g_cs_adapt = 0;   // GGML_MOE_CPU_SPLIT_ADAPT=1: the join corrects the per-route cost from the host's measured job times
+// fork STRATAGAP CPU-first (GGML_MOE_CPU_SPLIT_FIRST=1 sets all three; each can be set alone):
+//  PARTIAL=1: an expert missing in only one or two projections may go to the CPU too (the CPU computes the whole
+//    expert from host RAM; the card's hit pass still computes the resident projections, whose down rows the join
+//    then overwrites, so nothing is counted twice);
+//  FLOOR_US=<us per distinct expert of the layer>: card time the hit math takes anyway. The CPU may fill it at no
+//    cost, so the planner keeps handing experts to the CPU while max(CPU, max(floor, link)) does not grow;
+//  LINK_WEIGHT=<x>: weight on the link side of the balance (>1 hands the CPU more, as Strata's 1.85 does).
+static int g_cs_partial = 0;
+static float g_cs_floor_ns = 0.0f, g_cs_link_w = 1.0f;
 static std::atomic<unsigned long long> g_cs_layers_published{0};
 
 // fork PREFETCHFIX: asynchronous look-ahead prefetch (GGML_MOE_PREFETCH_ASYNC=1 copies,
@@ -242,6 +253,9 @@ static void moe_missjoin_log(const char * when) {
                 g_cs_job_h ? (unsigned long long) g_cs_job_h->gpu_timeouts : 0ull, plan.stat_joins,
                 plan.stat_joins ? plan.stat_wait_ns / 1e3 / plan.stat_joins : 0.0, plan.stat_adapt,
                 plan.route_ns_live / 1e3);
+        MOE_CACHE_LOG("[moe-cache] cpu split share %s: cpu_parts=%llu of missed_parts=%llu (%.1f%%), partial_experts=%llu, "
+                "parts over the link=%llu\n", when, plan.stat_parts, c[2], c[2] ? 100.0 * plan.stat_parts / c[2] : 0.0,
+                plan.stat_partial, c[3]);
     }
 }
 
@@ -8525,7 +8539,13 @@ static void moe_cs_prepare(moe_cache_session & session) {
         g_cs_ns_per_byte = gbps > 0.0f ? 1.0f / gbps : 0.0f;
         g_cs_max_exp = std::max(1, std::min((int) moe_cs_env_float("GGML_MOE_CPU_SPLIT_MAX_EXPERTS", 8.0f), MOE_CS_MAX_EXPERTS));
         g_cs_max_route = std::max(1, std::min((int) moe_cs_env_float("GGML_MOE_CPU_SPLIT_MAX_ROUTES", 24.0f), MOE_CS_MAX_ROUTES));
-        g_cs_adapt = moe_cs_env_float("GGML_MOE_CPU_SPLIT_ADAPT", 0.0f) != 0.0f ? 1 : 0;
+        const bool first = moe_cs_env_float("GGML_MOE_CPU_SPLIT_FIRST", 0.0f) != 0.0f;
+        g_cs_adapt = moe_cs_env_float("GGML_MOE_CPU_SPLIT_ADAPT", first ? 1.0f : 0.0f) != 0.0f ? 1 : 0;
+        g_cs_partial = moe_cs_env_float("GGML_MOE_CPU_SPLIT_PARTIAL", first ? 1.0f : 0.0f) != 0.0f ? 1 : 0;
+        g_cs_floor_ns = std::max(0.0f, moe_cs_env_float("GGML_MOE_CPU_SPLIT_FLOOR_US", first ? 4.0f : 0.0f)) * 1000.0f;
+        g_cs_link_w = std::max(0.05f, moe_cs_env_float("GGML_MOE_CPU_SPLIT_LINK_WEIGHT", 1.0f));
+        MOE_CACHE_LOG("[moe-cache] cpu split: partial experts %s, card floor %.1f us per distinct expert, link weight %.2f\n",
+                g_cs_partial ? "on" : "off", g_cs_floor_ns / 1000.0f, g_cs_link_w);
         MOE_CACHE_LOG("[moe-cache] cpu split: probe link %.1f GB/s -> using %.1f GB/s; CPU %.1f us per (expert, route), "
                 "%.1f us per job incl. handshake; at most %d experts / %d routes per layer; per-route cost %s\n",
                 link / 1e9, gbps, g_cs_route_ns / 1000.0f, g_cs_fixed_ns / 1000.0f, g_cs_max_exp, g_cs_max_route,
@@ -8719,6 +8739,8 @@ struct moe_hf_plan_args {
     int cs_adapt;
     float cs_bytes[3];            // copy bytes of one expert per projection
     int cs_max_exp, cs_max_route;
+    int cs_partial;               // fork STRATAGAP CPU-first (see g_cs_partial)
+    float cs_floor_ns, cs_link_w;
 };
 
 // counts: 0 dispatches, 1 distinct experts, 2 distinct misses, 3 staged, 4 miss routes, 5 unstaged misses
@@ -8898,14 +8920,17 @@ static __global__ void __launch_bounds__(256) moe_hf_plan_fast_kernel(const moe_
         if (mroutes) { atomicAdd(&s_n[2], mroutes); }
     }
     __syncthreads();
-    if (args.cs && s_nk[0] && s_nk[1] && s_nk[2]) {
-        // fork STRATAGAP: hand the host CPU the experts missing in all three projections, fewest routes first
-        // (the CPU pays per route, the link per expert), while that lowers max(CPU time, link time).
+    if (args.cs && (args.cs_partial ? (s_nk[0] || s_nk[1] || s_nk[2]) : (s_nk[0] && s_nk[1] && s_nk[2]))) {
+        // fork STRATAGAP: hand the host CPU the experts missing in all three projections (with PARTIAL, in any),
+        // fewest routes first (the CPU pays per route, the link per expert; at equal routes, more missed
+        // projections first), while that does not raise max(CPU time, max(card floor, link time)).
         for (int i = tid; i < n_routes; i += blockDim.x) {
             short c = 0;
-            if ((s_flag[0][i] & 3) == 3 && (s_flag[1][i] & 3) == 3 && (s_flag[2][i] & 3) == 3) {
+            const int nm = ((s_flag[0][i] & 3) == 3) + ((s_flag[1][i] & 3) == 3) + ((s_flag[2][i] & 3) == 3);
+            if (nm == 3 || (args.cs_partial && nm > 0)) {
                 const int e = s_e[i];
                 for (int j = i; j < n_routes; ++j) { c += s_e[j] == e; }
+                c = (short) (c * 4 + (3 - nm));   // sort key; the route count is c / 4
             }
             s_cnt[i] = c;
         }
@@ -8925,30 +8950,45 @@ static __global__ void __launch_bounds__(256) moe_hf_plan_fast_kernel(const moe_
         __syncthreads();
         if (tid == 0) {
             moe_cs_plan_dev * plan = args.cs;
+            const float w = args.cs_link_w * args.cs_ns_per_byte;
             float gpu = 0.0f;
 #pragma unroll
             for (int k = 0; k < 3; ++k) { gpu += (float) s_nk[k] * args.cs_bytes[k]; }
-            gpu *= args.cs_ns_per_byte;
-            const float per_expert = (args.cs_bytes[0] + args.cs_bytes[1] + args.cs_bytes[2]) * args.cs_ns_per_byte;
+            gpu *= w;
+            const float floor_ns = args.cs_floor_ns * (float) s_n[0];
             float cpu = 0.0f;
             int ne = 0, nr = 0;
+            unsigned long long parts = 0, partial = 0;
             const float route_ns = args.cs_adapt && plan->route_ns_live > 0.0f ? plan->route_ns_live : args.cs_route_ns;
             s_cs_first[0] = 0;
             for (int r = 0; r < s_ncand && ne < args.cs_max_exp; ++r) {
                 const int i = s_order[r];
-                const int c = s_cnt[i];
+                const int c = s_cnt[i] / 4;
                 if (nr + c > args.cs_max_route) { break; }
+                float saved = 0.0f;
+                int nm = 0;
+#pragma unroll
+                for (int k = 0; k < 3; ++k) {
+                    if ((s_flag[k][i] & 3) == 3) { saved += args.cs_bytes[k]; ++nm; }
+                }
                 const float cpu2 = args.cs_fixed_ns + (float) (nr + c) * route_ns;
-                const float gpu2 = gpu - per_expert;
-                if (fmaxf(cpu2, gpu2) >= fmaxf(cpu, gpu)) { break; }
+                const float gpu2 = gpu - saved * w;
+                const float now = fmaxf(cpu, fmaxf(floor_ns, gpu));
+                const float next = fmaxf(cpu2, fmaxf(floor_ns, gpu2));
+                // without a floor, ties stop (the old rule); with one, ties inside the floor go to the CPU
+                if (floor_ns > 0.0f ? next > now : next >= now) { break; }
                 cpu = cpu2;
                 gpu = gpu2;
                 plan->expert[ne] = s_e[i];
                 s_cpu[s_e[i]] = (unsigned char) (ne + 1);
                 ++ne;
                 nr += c;
+                parts += (unsigned long long) nm;
+                partial += nm < 3;
                 s_cs_first[ne] = nr;
             }
+            plan->stat_parts += parts;
+            plan->stat_partial += partial;
             for (int j = 0; j <= ne; ++j) { plan->first[j] = s_cs_first[j]; }
             plan->n_exp = ne;
             plan->n_route = nr;
@@ -9257,6 +9297,9 @@ static bool moe_hf_begin(ggml_backend_cuda_context & ctx, moe_cache_session & se
         for (int j = 0; j < 3; ++j) { args.cs_bytes[j] = (float) moe_missjoin_copy_bytes(*group[j]); }
         args.cs_max_exp = g_cs_max_exp;
         args.cs_max_route = g_cs_max_route;
+        args.cs_partial = g_cs_partial;
+        args.cs_floor_ns = g_cs_floor_ns;
+        args.cs_link_w = g_cs_link_w;
     }
     if (fast) {
         moe_hf_plan_fast_kernel<<<1, 256, 0, g_hf_side>>>(args, (const int32_t *) ids->data, (int) ids->ne[0], routes,
