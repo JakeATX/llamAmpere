@@ -43,6 +43,8 @@
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/mmvq-kq-tc.cuh"
+#include "ggml-cuda/mmvq-kqrows.cuh"
+#include "ggml-cuda/mmvf-rows.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
 #include "ggml-cuda/nemotron-moe.cuh"
 #include "ggml-cuda/nemotron-ssm.cuh"
@@ -3249,6 +3251,7 @@ static bool ggml_cuda_tq_mmq_supported(const ggml_tensor * src0, const int cc) {
 // quantize its activation through the MMVQ shared-quantize cache, so the two cannot drift. Checks run in dispatch order.
 enum ggml_cuda_mm_route {
     GGML_CUDA_MM_ROUTE_CUBLAS_FORCED,   // src0 padding cannot be cleared (compute-buffer view), or src1/dst not f32
+    GGML_CUDA_MM_ROUTE_FROWS,           // [FROWS] narrow F32/F16/BF16 weight at 2..8 columns, R rows per block (GGML_CUDA_FROWS=1)
     GGML_CUDA_MM_ROUTE_MMVF,
     GGML_CUDA_MM_ROUTE_MMVF_TRANSPOSED, // f32 src0 with one row: src1 is the matrix
     GGML_CUDA_MM_ROUTE_MMF,
@@ -3270,6 +3273,9 @@ static ggml_cuda_mm_route ggml_cuda_mul_mat_route(const ggml_tensor * src0, cons
 
     const int64_t ne11 = src1->ne[1];
 
+    if (ggml_cuda_frows_wants(src0, src1, dst, cc)) {
+        return GGML_CUDA_MM_ROUTE_FROWS;
+    }
     if (ggml_cuda_should_use_mmvf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11)) {
         // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
         // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
@@ -3289,6 +3295,11 @@ static ggml_cuda_mm_route ggml_cuda_mul_mat_route(const ggml_tensor * src0, cons
     // TQ weight types use the fused dp4a path (decode) or runtime q8_0 conversion + cuBLAS (prefill),
     // never mmvq/mmq (mmvq's type switch has no TQ cases and aborts).
     const bool is_tq_weight = (src0->type == GGML_TYPE_TQ4_1S || src0->type == GGML_TYPE_TQ3_1S);
+    // [KQROWS] plain 2D Q4_K/Q5_K/Q6_K products at 2..8 columns whose shape the row kernel wins (GGML_CUDA_KQ_ROWS=1)
+    if (!is_tq_weight && src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+            ggml_cuda_kqrows_wants(src0->type, cc, src0->ne[0], src0->ne[1], ne11)) {
+        return GGML_CUDA_MM_ROUTE_MMVQ;
+    }
     if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11) && !is_tq_weight) {
         return GGML_CUDA_MM_ROUTE_MMVQ;
     }
@@ -3445,6 +3456,10 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
         return;
     }
+    if (route == GGML_CUDA_MM_ROUTE_FROWS) {
+        ggml_cuda_frows_mul_mat(ctx, src0, src1, dst);
+        return;
+    }
     if (route == GGML_CUDA_MM_ROUTE_MMVF) {
         ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
         return;
@@ -3468,7 +3483,13 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // never mmvq/mmq (mmvq's type switch has no TQ cases and aborts).
     const bool is_tq_weight = (src0->type == GGML_TYPE_TQ4_1S || src0->type == GGML_TYPE_TQ3_1S);
     // [KQTC] K-quant / IQ3_S at 2..8 columns on int8 tensor cores (GGML_CUDA_KQ_TC, default off)
-    if ((route == GGML_CUDA_MM_ROUTE_MMVQ || route == GGML_CUDA_MM_ROUTE_MMQ) && ggml_cuda_mul_mat_kq_tc_try(ctx, src0, src1, dst)) {
+    // [KQROWS] a shape the row kernel's default table claims stays on the row kernel even with KQTC on: the table only
+    // claims cells where the row kernel measured faster than both the default route and KQTC (kq_table.py KQ_RIVALS)
+    const bool kqrows_claims = route == GGML_CUDA_MM_ROUTE_MMVQ &&
+        src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+        ggml_cuda_kqrows_wants(src0->type, cc, src0->ne[0], src0->ne[1], src1->ne[1]);
+    if (!kqrows_claims && (route == GGML_CUDA_MM_ROUTE_MMVQ || route == GGML_CUDA_MM_ROUTE_MMQ) &&
+            ggml_cuda_mul_mat_kq_tc_try(ctx, src0, src1, dst)) {
         return;
     }
     if (route == GGML_CUDA_MM_ROUTE_MMVQ) {
@@ -5179,7 +5200,15 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
 
 static void ggml_cuda_graph_instantiate(ggml_cuda_graph * graph) {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11070
-    if (ggml_cuda_moe_table_prefetch_enabled()) {
+    // fork STRATAGAP: GGML_CUDA_GRAPH_NODE_PRIORITY=1 (default off) keeps the priority each kernel was captured
+    // with. Without it a replayed graph runs every node at one priority, so the hit-first expert copies (captured
+    // on the high-priority side stream) queue behind all blocks of the hit matrix-vector product they should hide
+    // under. Scheduling only: the same kernels on the same data.
+    static const bool node_prio = [] {
+        const char * v = std::getenv("GGML_CUDA_GRAPH_NODE_PRIORITY");
+        return v && std::strcmp(v, "1") == 0;
+    }();
+    if (node_prio || ggml_cuda_moe_table_prefetch_enabled()) {
         CUDA_CHECK(cudaGraphInstantiateWithFlags(&graph->instance, graph->graph,
                                                  cudaGraphInstantiateFlagUseNodePriority));
         return;
@@ -8616,6 +8645,70 @@ static int ggml_cuda_try_fuse_hc_post_down(ggml_backend_cuda_context & ctx, ggml
     return c - i;
 }
 
+// [STRATAGAP HCUPQ8] GGML_CUDA_HC_UP_Q8=1|check (default off): the hyper-connection mix (DSV4_HC_UP) also writes its
+// output as q8_1 into the shared-quantize cache, in the layout of its first consumer that reads through that cache
+// (an MMVQ matmul, or the routed experts of the device MoE cache, which find it with GGML_MOE_Q8_SHARE=1). Those
+// consumers then skip their own quantize launch. The q8 bytes are quantize_row_q8_1_cuda's on the same floats; check
+// mode quantizes the output again and traps on any byte difference.
+static int ggml_cuda_hc_up_q8_mode() {
+    static const int mode = [] {
+        const char * e = getenv("GGML_CUDA_HC_UP_Q8");
+        if (!e) { return 0; }
+        return strcmp(e, "check") == 0 ? 2 : atoi(e) != 0 ? 1 : 0;
+    }();
+    return mode;
+}
+
+static bool ggml_cuda_try_hc_up_q8(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, const int i) {
+    const int mode = ggml_cuda_hc_up_q8_mode();
+    ggml_tensor * dst = cgraph->nodes[i];
+    if (mode == 0 || dst->op != GGML_OP_DSV4_HC_UP || ggml_cuda_fusion_disabled() ||
+            !ggml_cuda_dsv4_hc_up_q8_supported(ctx, dst)) {
+        return false;
+    }
+    const int cc        = ggml_cuda_info().devices[ctx.device].cc;
+    const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
+    ggml_type layout = GGML_TYPE_COUNT;
+    for (int j = i + 1; j < cgraph->n_nodes && j <= i + 512 && layout == GGML_TYPE_COUNT; ++j) {
+        const ggml_tensor * node = cgraph->nodes[j];
+        if (node->op == GGML_OP_MUL_MAT && node->src[1] == dst) {
+            const ggml_tensor * w = node->src[0];
+            const bool rotated = w->type == GGML_TYPE_Q8_CR || w->type == GGML_TYPE_Q5_CR || w->type == GGML_TYPE_Q6_CR;
+            if (rotated || w->buffer == nullptr || ggml_exl3_bits(w->type) != 0 || ggml_ai4_rate(w->type) != 0 ||
+                    ggml_get_op_params_i32(node, 1) == GGML_HINT_SRC0_IS_HADAMARD ||
+                    ggml_cuda_mul_mat_route(w, dst, node, cc, warp_size) != GGML_CUDA_MM_ROUTE_MMVQ) {
+                continue;
+            }
+            layout = w->type;
+        } else if (node->op == GGML_OP_MUL_MAT_ID && node->src[1] != nullptr && node->src[1]->view_src == dst &&
+                ggml_cuda_moe_cache_device_supports(node, ctx.device)) {
+            layout = node->src[0]->type;
+        }
+    }
+    if (layout == GGML_TYPE_COUNT) {
+        return false;
+    }
+    const int64_t ne10_padded = GGML_PAD(dst->ne[0], MATRIX_ROW_PADDING);
+    if (ne10_padded != dst->ne[0]) {
+        return false;
+    }
+    const size_t q8_bytes = dst->ne[3]*dst->ne[2] * dst->ne[1]*ne10_padded * sizeof(block_q8_1)/QK8_1;
+    if (!ggml_cuda_q8_cacheable(ctx, q8_bytes)) {
+        return false;
+    }
+    char * q8 = ggml_cuda_q8_cache_claim(ctx, dst, layout, q8_bytes, ne10_padded);
+    ggml_cuda_op_dsv4_hc_up_q8(ctx, dst, q8, layout == GGML_TYPE_IQ4_XS);
+    if (mode == 2) {
+        ggml_cuda_pool_alloc<char> ref(ctx.pool(), q8_bytes);
+        quantize_row_q8_1_cuda((const float *) dst->data, nullptr, ref.get(), layout, dst->ne[0],
+                dst->nb[1] / sizeof(float), dst->nb[2] / sizeof(float), dst->nb[3] / sizeof(float),
+                ne10_padded, dst->ne[1], dst->ne[2], dst->ne[3], ctx.stream());
+        ggml_cuda_moe_bits_check((const float *) ref.get(), (const float *) q8, (int64_t) (q8_bytes / sizeof(float)),
+                ctx.stream());
+    }
+    return true;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     if (ggml_cuda_fusion_disabled()) {
@@ -9939,6 +10032,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             }
 #endif
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+            ggml_cuda_moe_cache_cs_graph_scan(*cuda_ctx, cgraph);   // fork STRATAGAP (no-op unless GGML_MOE_CPU_SPLIT=1)
+#endif
+
             // The graph order is now final. Build one shared deadline queue
             // per KV runtime before issuing any attention work.
             const auto kv_stream_runtimes = ggml_cuda_kv_stream_prepare_graph(
@@ -10053,6 +10150,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                 // [HCPN] the hc_pre whose xn the norm did not write (GGML_CUDA_HC_PRE_XN)
                 if (ggml_cuda_hc_pre_xn_launch(*cuda_ctx, node)) {
+                    continue;
+                }
+
+                // [STRATAGAP HCUPQ8] the hc mix that also writes its consumers' q8_1 activation
+                if (node->op == GGML_OP_DSV4_HC_UP && ggml_cuda_try_hc_up_q8(*cuda_ctx, cgraph, i)) {
                     continue;
                 }
 
@@ -11867,6 +11969,13 @@ int64_t ggml_backend_cuda_fusion_count(ggml_backend_t backend, const char * name
     }
     if (strcmp(name, "gdn_state_read") == 0) {
         return ctx->fusion_stats.gdn_state_read;
+    }
+    if (strcmp(name, "frows") == 0) {
+        return ggml_cuda_frows_count;
+    }
+    if (strcmp(name, "kqrows") == 0) {
+        extern int64_t ggml_cuda_kqrows_count; // mmvq-kqrows.cu
+        return ggml_cuda_kqrows_count;
     }
     if (strcmp(name, "gdn_khshare") == 0) {
         extern int64_t ggml_cuda_gdn_khshare_count; // gated_delta_net.cu (#199)

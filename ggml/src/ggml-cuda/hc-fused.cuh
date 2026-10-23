@@ -9,6 +9,10 @@ bool ggml_cuda_dsv4_hc_up_supported(const ggml_tensor * op);
 
 void ggml_cuda_op_dsv4_hc_down(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 void ggml_cuda_op_dsv4_hc_up(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+// [STRATAGAP HCUPQ8] hc_up that also writes its output as q8_1 blocks (quantize_row_q8_1_cuda's bytes, plain or
+// IQ4_XS-swizzled layout) into q8: T rows of n_embd/32 blocks
+bool ggml_cuda_dsv4_hc_up_q8_supported(const ggml_backend_cuda_context & ctx, const ggml_tensor * dst);
+void ggml_cuda_op_dsv4_hc_up_q8(ggml_backend_cuda_context & ctx, ggml_tensor * dst, void * q8, bool swizzle);
 
 // [HCPD] the identity-comb DSV4_HC_POST that produces the HC_DOWN input, computed inside the down kernel (which also
 // writes the hc_post output); bit-identical to running the two ops.

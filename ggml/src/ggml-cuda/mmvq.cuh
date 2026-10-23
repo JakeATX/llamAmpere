@@ -15,6 +15,9 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc);
 bool   ggml_cuda_q8_cacheable(const ggml_backend_cuda_context & ctx, size_t q8_bytes);
 char * ggml_cuda_q8_cache_claim(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, ggml_type type_src0,
                                 size_t q8_bytes, int64_t ne10_padded);
+// [STRATAGAP Q8SHARE] the cached buffer of (src1, layout) in this graph eval, or nullptr (no claim)
+char * ggml_cuda_q8_cache_lookup(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, ggml_type type_src0,
+                                 size_t q8_bytes, int64_t ne10_padded);
 
 // [PARW] IQ4_XS x f32 at 9..32 columns (multi-slot speculative verify) on the int8 tensor-core path; returns false
 // (caller keeps MMQ) when the shape, layout, device or GGML_CUDA_IQ4XS_WIDE=0 rules it out.
@@ -76,6 +79,35 @@ bool ggml_cuda_moe_table_mmv_grouped_try(ggml_backend_cuda_context & ctx,
         int64_t n_in, int64_t n_out, int64_t n_ids, int64_t n_tokens, int64_t channels, int64_t ids_stride);
 // [VBEAT D1] decode-once expert kernel (GGML_MOE_MMV_D1); bitwise the plain table kernel. route_hot == nullptr runs
 // every route, otherwise only the routes whose residency matches route_want_hot. false launches nothing.
+// [STRATAGAP MISSLIST] compact miss-pass work list, written by the hit-first plan kernel (moe-cache.cu): the
+// distinct experts the card computes in a miss pass and, per expert, the bit mask of its routes (route = token *
+// n_ids + rank, at most 64 routes). List 0/1/2 = up/gate/down, list 3 = fused gate+up (experts in list 0 or 1).
+#define MOE_MISS_LIST_MAX 64
+struct moe_miss_list {
+    int n;
+    int expert[MOE_MISS_LIST_MAX];
+    unsigned long long routes[MOE_MISS_LIST_MAX];
+};
+// one launch over the list: gate_table null = one projection (dst = its rows), else up * silu(gate)
+void ggml_cuda_moe_table_mmv_list(ggml_backend_cuda_context & ctx, const moe_miss_list * list,
+        const void * const * table, const void * const * gate_table, ggml_type type, const char * act_q8, float * dst,
+        int64_t n_in, int64_t n_out, int64_t n_ids, int64_t n_tokens, int64_t channels);
+// [STRATAGAP DOWNSW] true when GGML_MOE_DOWN_SW routes this (down) type to the sub-warp rows kernel
+bool ggml_cuda_moe_down_sw_on(ggml_type type);
+unsigned long long ggml_cuda_moe_down_sw_count();   // issue-time count of DOWN_SW passes
+// bit compare of two float buffers (traps on the first difference); for the check modes
+void ggml_cuda_moe_bits_check(const float * reference, const float * actual, int64_t count, cudaStream_t stream);
+bool ggml_cuda_moe_table_mmv_list_supported(ggml_type type, bool fused, int64_t n_in, int64_t n_ids, int64_t n_tokens,
+        int64_t channels);
+
+// [STRATAGAP HITG] fused gate + up + SwiGLU expert pass (GGML_MOE_HIT_FUSED, see mmvq.cu)
+int ggml_cuda_moe_hit_fused_mode();
+bool ggml_cuda_moe_table_mmv_hitg_supported(ggml_type type, int64_t n_in, int64_t n_out, int64_t n_ids,
+        int64_t n_tokens, int64_t channels, int64_t ids_stride);
+void ggml_cuda_moe_table_mmv_hitg(ggml_backend_cuda_context & ctx,
+        const void * const * up_table, const void * const * gate_table, ggml_type type, const char * act_q8,
+        const int32_t * ids, float * dst, int64_t n_in, int64_t n_out, int64_t n_ids, int64_t n_tokens,
+        int64_t channels, int64_t ids_stride, const uint8_t * m0, const uint8_t * m1, int want);
 bool ggml_cuda_moe_table_mmv_d1_try(ggml_backend_cuda_context & ctx,
         const void * const * table, ggml_type type, const char * act_q8, const int32_t * ids, float * dst,
         int64_t n_in, int64_t n_out, int64_t n_ids, int64_t n_tokens, int64_t channels, int64_t ids_stride,

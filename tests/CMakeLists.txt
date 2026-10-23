@@ -527,6 +527,16 @@ if (NOT GGML_BACKEND_DL AND GGML_CPU)
     llama_build_and_test(test-col2im-1d.cpp)
 endif()
 
+# fork STRATAGAP: host expert pool bandwidth bench (not a ctest; run by hand on the target box)
+if (NOT GGML_BACKEND_DL AND GGML_CPU AND TARGET ggml-cuda AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    llama_build(test-moe-cs-bw.cpp)
+    target_link_libraries(test-moe-cs-bw PRIVATE ggml-cuda ggml-cpu)
+    llama_build(test-moe-iq-rows.cpp)
+    target_link_libraries(test-moe-iq-rows PRIVATE ggml-cuda ggml-cpu)
+    llama_build(test-moe-hitg-bench.cpp)
+    target_link_libraries(test-moe-hitg-bench PRIVATE ggml-cuda)
+endif()
+
 # libmtmd
 set(LLAMA_TEST_NAME test-mtmd-c-api)
 llama_build_and_test(test-mtmd-c-api.c)
