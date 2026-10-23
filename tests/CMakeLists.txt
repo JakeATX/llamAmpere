@@ -533,6 +533,8 @@ if (NOT GGML_BACKEND_DL AND GGML_CPU AND TARGET ggml-cuda AND CMAKE_SYSTEM_NAME 
     target_link_libraries(test-moe-cs-bw PRIVATE ggml-cuda ggml-cpu)
     llama_build(test-moe-iq-rows.cpp)
     target_link_libraries(test-moe-iq-rows PRIVATE ggml-cuda ggml-cpu)
+    llama_build(test-moe-hitg-bench.cpp)
+    target_link_libraries(test-moe-hitg-bench PRIVATE ggml-cuda)
 endif()
 
 # libmtmd
