@@ -8624,6 +8624,70 @@ static int ggml_cuda_try_fuse_hc_post_down(ggml_backend_cuda_context & ctx, ggml
     return c - i;
 }
 
+// [STRATAGAP HCUPQ8] GGML_CUDA_HC_UP_Q8=1|check (default off): the hyper-connection mix (DSV4_HC_UP) also writes its
+// output as q8_1 into the shared-quantize cache, in the layout of its first consumer that reads through that cache
+// (an MMVQ matmul, or the routed experts of the device MoE cache, which find it with GGML_MOE_Q8_SHARE=1). Those
+// consumers then skip their own quantize launch. The q8 bytes are quantize_row_q8_1_cuda's on the same floats; check
+// mode quantizes the output again and traps on any byte difference.
+static int ggml_cuda_hc_up_q8_mode() {
+    static const int mode = [] {
+        const char * e = getenv("GGML_CUDA_HC_UP_Q8");
+        if (!e) { return 0; }
+        return strcmp(e, "check") == 0 ? 2 : atoi(e) != 0 ? 1 : 0;
+    }();
+    return mode;
+}
+
+static bool ggml_cuda_try_hc_up_q8(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, const int i) {
+    const int mode = ggml_cuda_hc_up_q8_mode();
+    ggml_tensor * dst = cgraph->nodes[i];
+    if (mode == 0 || dst->op != GGML_OP_DSV4_HC_UP || ggml_cuda_fusion_disabled() ||
+            !ggml_cuda_dsv4_hc_up_q8_supported(ctx, dst)) {
+        return false;
+    }
+    const int cc        = ggml_cuda_info().devices[ctx.device].cc;
+    const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
+    ggml_type layout = GGML_TYPE_COUNT;
+    for (int j = i + 1; j < cgraph->n_nodes && j <= i + 512 && layout == GGML_TYPE_COUNT; ++j) {
+        const ggml_tensor * node = cgraph->nodes[j];
+        if (node->op == GGML_OP_MUL_MAT && node->src[1] == dst) {
+            const ggml_tensor * w = node->src[0];
+            const bool rotated = w->type == GGML_TYPE_Q8_CR || w->type == GGML_TYPE_Q5_CR || w->type == GGML_TYPE_Q6_CR;
+            if (rotated || w->buffer == nullptr || ggml_exl3_bits(w->type) != 0 || ggml_ai4_rate(w->type) != 0 ||
+                    ggml_get_op_params_i32(node, 1) == GGML_HINT_SRC0_IS_HADAMARD ||
+                    ggml_cuda_mul_mat_route(w, dst, node, cc, warp_size) != GGML_CUDA_MM_ROUTE_MMVQ) {
+                continue;
+            }
+            layout = w->type;
+        } else if (node->op == GGML_OP_MUL_MAT_ID && node->src[1] != nullptr && node->src[1]->view_src == dst &&
+                ggml_cuda_moe_cache_device_supports(node, ctx.device)) {
+            layout = node->src[0]->type;
+        }
+    }
+    if (layout == GGML_TYPE_COUNT) {
+        return false;
+    }
+    const int64_t ne10_padded = GGML_PAD(dst->ne[0], MATRIX_ROW_PADDING);
+    if (ne10_padded != dst->ne[0]) {
+        return false;
+    }
+    const size_t q8_bytes = dst->ne[3]*dst->ne[2] * dst->ne[1]*ne10_padded * sizeof(block_q8_1)/QK8_1;
+    if (!ggml_cuda_q8_cacheable(ctx, q8_bytes)) {
+        return false;
+    }
+    char * q8 = ggml_cuda_q8_cache_claim(ctx, dst, layout, q8_bytes, ne10_padded);
+    ggml_cuda_op_dsv4_hc_up_q8(ctx, dst, q8, layout == GGML_TYPE_IQ4_XS);
+    if (mode == 2) {
+        ggml_cuda_pool_alloc<char> ref(ctx.pool(), q8_bytes);
+        quantize_row_q8_1_cuda((const float *) dst->data, nullptr, ref.get(), layout, dst->ne[0],
+                dst->nb[1] / sizeof(float), dst->nb[2] / sizeof(float), dst->nb[3] / sizeof(float),
+                ne10_padded, dst->ne[1], dst->ne[2], dst->ne[3], ctx.stream());
+        ggml_cuda_moe_bits_check((const float *) ref.get(), (const float *) q8, (int64_t) (q8_bytes / sizeof(float)),
+                ctx.stream());
+    }
+    return true;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     if (ggml_cuda_fusion_disabled()) {
@@ -10065,6 +10129,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                 // [HCPN] the hc_pre whose xn the norm did not write (GGML_CUDA_HC_PRE_XN)
                 if (ggml_cuda_hc_pre_xn_launch(*cuda_ctx, node)) {
+                    continue;
+                }
+
+                // [STRATAGAP HCUPQ8] the hc mix that also writes its consumers' q8_1 activation
+                if (node->op == GGML_OP_DSV4_HC_UP && ggml_cuda_try_hc_up_q8(*cuda_ctx, cgraph, i)) {
                     continue;
                 }
 

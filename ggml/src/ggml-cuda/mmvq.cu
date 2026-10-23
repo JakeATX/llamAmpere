@@ -3239,6 +3239,18 @@ static ggml_backend_cuda_context::q8_cache_entry * ggml_cuda_q8_cache_find(ggml_
     return nullptr;
 }
 
+// [STRATAGAP Q8SHARE] lookup only: the cached buffer of (src1, layout) in this graph eval, or nullptr
+char * ggml_cuda_q8_cache_lookup(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, ggml_type type_src0,
+                                 size_t q8_bytes, int64_t ne10_padded) {
+    ggml_backend_cuda_context::q8_cache_entry * qe = ggml_cuda_q8_cache_find(ctx, src1, type_src0, q8_bytes, ne10_padded);
+    if (qe == nullptr) {
+        return nullptr;
+    }
+    qe->last_use = ++ctx.q8_cache.tick;
+    ctx.fusion_stats.q8_cache_hits++;
+    return qe->ptr;
+}
+
 char * ggml_cuda_q8_cache_claim(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, ggml_type type_src0,
                                 size_t q8_bytes, int64_t ne10_padded) {
     auto & qc = ctx.q8_cache;

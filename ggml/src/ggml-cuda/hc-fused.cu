@@ -335,14 +335,45 @@ static __global__ void hcf_down_finish(
 // lane per loop pass); the sums are unchanged. Two CTAs per SM keep all 160 CTAs of n_embd = 2560 in one wave.
 static constexpr int HCF_UP_MAX_IT = 8;
 static constexpr int HCF_UP_PRE    = 5;
-template <int T>
+// [STRATAGAP HCUPQ8] Q = 1 (plain) or 2 (IQ4_XS swizzle): the mix output is also written as q8_1 blocks, the bytes
+// of quantize_row_q8_1_cuda on dst (see hcf_up_q8_block). The two CTAs of a 32-column block count in on cnt; the
+// second one quantizes the block from dst and resets the counter, so the counters are zero between launches.
+static constexpr int HCF_UP_CNT = 256;  // q8 blocks per counter slot: n_embd <= 8192
+static __device__ unsigned int hcf_up_arrive[HCF_CNT_SLOTS*HCF_UP_CNT];
+
+// quantize_q8_1<swizzle> for one 32-value block held one value per lane (same expressions, so the same bytes)
+template <bool swizzle_iq4>
+static __device__ __forceinline__ void hcf_up_q8_block(const float xi, block_q8_1 * y, const int iqs) {
+    float amax = fabsf(xi);
+    float sum = 0.0f;
+
+    amax = warp_reduce_max<QK8_1>(amax);
+
+    const float  d = amax / 127.0f;
+    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+
+    if constexpr (swizzle_iq4) {
+        y->qs[2*(iqs % 16) + iqs/16] = q;
+    } else {
+        y->qs[iqs] = q;
+    }
+    sum = warp_reduce_sum<QK8_1>((float) q);
+
+    if (iqs > 0) {
+        return;
+    }
+
+    y->ds = make_half2(d, d * sum);
+}
+
+template <int T, int Q = 0>
 static __global__ void __launch_bounds__(HCF_UP_WARPS*WARP_SIZE, 2)
 hcf_up_gate(
         const float * __restrict__ x, const float * __restrict__ wn,
         const float * __restrict__ act, const float * __restrict__ r,
         const char * __restrict__ wu, const int64_t su,
         const int n_embd, const int R, const float out_scale,
-        float * __restrict__ dst) {
+        float * __restrict__ dst, block_q8_1 * __restrict__ q8 = nullptr, const int cnt_off = 0) {
     extern __shared__ float act_s[];  // [T][R]
 
     const int warp = threadIdx.x / WARP_SIZE;
@@ -423,6 +454,32 @@ hcf_up_gate(
     for (int t = 0; t < T; ++t) {
         if (lane == t) {
             dst[(int64_t) t*n_embd + i] = out_scale*out[t];
+        }
+    }
+
+    if constexpr (Q != 0) {
+        // every warp is live here (the host requires n_embd % 32 == 0)
+        static_assert(32 % HCF_UP_WARPS == 0, "two or more CTAs per q8 block");
+        constexpr unsigned int n_cta = 32 / HCF_UP_WARPS;
+        __shared__ unsigned int last_s;
+        const int blk = blockIdx.x*HCF_UP_WARPS / 32;
+        __threadfence();
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            unsigned int * cnt = hcf_up_arrive + cnt_off;
+            const unsigned int old = atomicAdd(&cnt[blk], 1u);
+            last_s = old == n_cta - 1;
+            if (old == n_cta - 1) {
+                cnt[blk] = 0;
+            }
+        }
+        __syncthreads();
+        if (last_s) {
+            __threadfence();
+            if (warp < T) {
+                const float xi = __ldcg(dst + (int64_t) warp*n_embd + blk*32 + lane);
+                hcf_up_q8_block<Q == 2>(xi, q8 + (int64_t) warp*(n_embd/QK8_1) + blk, lane);
+            }
         }
     }
 }
@@ -535,8 +592,23 @@ static void hcf_down_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, 
     }
 }
 
+// [STRATAGAP HCUPQ8] counter slot of a backend context for the q8 epilogue (-1: none left)
+static int hcf_up_cnt_slot(const ggml_backend_cuda_context & ctx) {
+    static std::mutex mtx;
+    static std::unordered_map<const void *, int> slots;
+    static int next = 0;
+    std::lock_guard<std::mutex> lock(mtx);
+    const auto it = slots.find(&ctx);
+    if (it != slots.end()) {
+        return it->second;
+    }
+    const int slot = next < HCF_CNT_SLOTS ? next++ : -1;
+    slots[&ctx] = slot;
+    return slot;
+}
+
 template <int T>
-static void hcf_up_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+static void hcf_up_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, void * q8, bool swizzle) {
     const ggml_tensor * x    = dst->src[0];
     const ggml_tensor * wn   = dst->src[1];
     const ggml_tensor * down = dst->src[2];
@@ -557,9 +629,20 @@ static void hcf_up_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(smem <= 48*1024);
     GGML_UNUSED(hc);
 
-    hcf_up_gate<T><<<(n_embd + HCF_UP_WARPS - 1)/HCF_UP_WARPS, HCF_UP_WARPS*WARP_SIZE, smem, ctx.stream()>>>(
-        (const float *) x->data, (const float *) wn->data, act, r,
-        (const char *) wu->data, wu->nb[1], n_embd, R, out_scale, (float *) dst->data);
+    const dim3 grid((n_embd + HCF_UP_WARPS - 1)/HCF_UP_WARPS);
+    const dim3 block(HCF_UP_WARPS*WARP_SIZE);
+    if (q8 == nullptr) {
+        hcf_up_gate<T><<<grid, block, smem, ctx.stream()>>>(
+            (const float *) x->data, (const float *) wn->data, act, r,
+            (const char *) wu->data, wu->nb[1], n_embd, R, out_scale, (float *) dst->data);
+    } else {
+        const int slot = hcf_up_cnt_slot(ctx);
+        GGML_ASSERT(slot >= 0 && n_embd % QK8_1 == 0 && n_embd/QK8_1 <= HCF_UP_CNT);
+        auto kernel = swizzle ? hcf_up_gate<T, 2> : hcf_up_gate<T, 1>;
+        kernel<<<grid, block, smem, ctx.stream()>>>(
+            (const float *) x->data, (const float *) wn->data, act, r,
+            (const char *) wu->data, wu->nb[1], n_embd, R, out_scale, (float *) dst->data, (block_q8_1 *) q8, slot*HCF_UP_CNT);
+    }
 }
 
 #define HCF_DISPATCH(fn, T_, ...)                                   \
@@ -602,7 +685,17 @@ void ggml_cuda_op_dsv4_hc_post_down(ggml_backend_cuda_context & ctx, const ggml_
 }
 
 void ggml_cuda_op_dsv4_hc_up(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    HCF_DISPATCH(hcf_up_launch, (int) dst->src[0]->ne[2], ctx, dst);
+    HCF_DISPATCH(hcf_up_launch, (int) dst->src[0]->ne[2], ctx, dst, nullptr, false);
+}
+
+bool ggml_cuda_dsv4_hc_up_q8_supported(const ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
+    const int64_t n_embd = dst->src[0]->ne[0];
+    return n_embd % QK8_1 == 0 && n_embd/QK8_1 <= HCF_UP_CNT && hcf_up_cnt_slot(ctx) >= 0 &&
+        dst->type == GGML_TYPE_F32 && ggml_is_contiguous(dst) && ggml_nelements(dst) == n_embd*dst->src[0]->ne[2];
+}
+
+void ggml_cuda_op_dsv4_hc_up_q8(ggml_backend_cuda_context & ctx, ggml_tensor * dst, void * q8, bool swizzle) {
+    HCF_DISPATCH(hcf_up_launch, (int) dst->src[0]->ne[2], ctx, dst, q8, swizzle);
 }
 
 // [GDNGATES] Flash-Next / Qwen3-Next gated-delta-net gates in one kernel (opt-in, GGML_CUDA_GDN_GATES=1; the graph

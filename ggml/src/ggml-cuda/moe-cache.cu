@@ -10177,6 +10177,57 @@ static const void * const * moe_cache_resolve_table(ggml_backend_cuda_context & 
     return mmv_table;
 }
 
+// fork STRATAGAP Q8SHARE (GGML_MOE_Q8_SHARE=1|check, default off): the routed experts' up/gate activation goes
+// through the mmvq shared-quantize cache, keyed on the tensor the expert input views (the FFN input). The shared
+// expert's up/gate reads that same tensor, so it finds the buffer and skips its own quantize, and the gate projection
+// of an unfused layer skips its second one. It is the same quantize_row_q8_1_cuda call on the same floats, so the
+// bytes are the same; check mode quantizes again into a pool buffer and traps on any byte difference.
+static int moe_q8_share_mode() {
+    static const int mode = [] {
+        const char * e = getenv("GGML_MOE_Q8_SHARE");
+        if (!e) { return 0; }
+        return strcmp(e, "check") == 0 ? 2 : atoi(e) != 0 ? 1 : 0;
+    }();
+    return mode;
+}
+
+static char * moe_quantize_act(ggml_backend_cuda_context & ctx, const ggml_tensor * a, ggml_type type, bool share,
+        ggml_cuda_pool_alloc<char> & local) {
+    const int64_t padded = GGML_PAD(a->ne[0], MATRIX_ROW_PADDING);
+    const size_t q8_bytes = (size_t)(padded / QK8_1) * a->ne[1] * a->ne[2] * sizeof(block_q8_1);
+    auto quantize = [&](char * out) {
+        quantize_row_q8_1_cuda((const float *) a->data, nullptr, out, type,
+                a->ne[0], a->nb[1] / sizeof(float), a->nb[2] / sizeof(float), a->nb[3] / sizeof(float),
+                padded, a->ne[1], a->ne[2], 1, ctx.stream());
+    };
+    const int mode = share ? moe_q8_share_mode() : 0;
+    if (mode && a->type == GGML_TYPE_F32 && a->ne[3] == 1 && ggml_is_contiguous(a) && ggml_cuda_q8_cacheable(ctx, q8_bytes)) {
+        // key on the viewed tensor when the input is a whole-tensor reshape of it (the shared expert reads that one)
+        const ggml_tensor * base = a;
+        const ggml_tensor * v = a->view_src;
+        if (v && a->view_offs == 0 && a->data == v->data && v->type == GGML_TYPE_F32 && ggml_is_contiguous(v) &&
+                ggml_nelements(v) == ggml_nelements(a) && v->ne[0] == a->ne[0]) {
+            base = v;
+        }
+        char * hit = ggml_cuda_q8_cache_lookup(ctx, base, type, q8_bytes, padded);
+        if (hit) {
+            if (mode == 2) {
+                char * ref = local.alloc(q8_bytes);
+                quantize(ref);
+                ggml_cuda_moe_bits_check((const float *) ref, (const float *) hit, (int64_t) (q8_bytes / sizeof(float)),
+                        ctx.stream());
+            }
+            return hit;
+        }
+        char * buf = ggml_cuda_q8_cache_claim(ctx, base, type, q8_bytes, padded);
+        quantize(buf);
+        return buf;
+    }
+    char * buf = local.alloc(q8_bytes);
+    quantize(buf);
+    return buf;
+}
+
 bool ggml_cuda_moe_cache_device_compute(ggml_backend_cuda_context & ctx, ggml_tensor * op) {
     if (g_session_stack.empty() || !g_session_stack.back().active ||
             !moe_cache_device_op_fits(*g_session_stack.back().active, op, ctx.device)) {
@@ -10216,13 +10267,8 @@ bool ggml_cuda_moe_cache_device_compute(ggml_backend_cuda_context & ctx, ggml_te
                 (const int32_t *)ids->data, table.hot, session.device_route_counts,
                 session.device_expert_counts + table.count_offset, n, table.desc.n_expert, (int)ids->ne[0], (int)(ids->nb[1] / sizeof(int32_t)));
     }
-    const int64_t padded = GGML_PAD(a->ne[0], MATRIX_ROW_PADDING);
-    const size_t q8_bytes = (size_t)(padded / QK8_1) * a->ne[1] * a->ne[2] * sizeof(block_q8_1);
     ggml_cuda_pool_alloc<char> q8(ctx.pool());
-    char * quantized = q8.alloc(q8_bytes);
-    quantize_row_q8_1_cuda((const float *) a->data, nullptr, quantized, (ggml_type) table.desc.type,
-            a->ne[0], a->nb[1] / sizeof(float), a->nb[2] / sizeof(float), a->nb[3] / sizeof(float),
-            padded, a->ne[1], a->ne[2], 1, ctx.stream());
+    char * quantized = moe_quantize_act(ctx, a, (ggml_type) table.desc.type, table.mj_kind == 0 || table.mj_kind == 1, q8);
     if (hf_on) {
         // Resident routes first, then the routes whose experts were just copied; together they compute
         // every route exactly once with the same kernel.
@@ -10341,13 +10387,8 @@ bool ggml_cuda_moe_cache_device_fused_compute(ggml_backend_cuda_context & ctx,
                                 (int)ids->ne[0], (int) ids_stride);
                     }
                 }
-                const int64_t padded = GGML_PAD(a->ne[0], MATRIX_ROW_PADDING);
-                const size_t q8_bytes = (size_t)(padded / QK8_1) * a->ne[1] * a->ne[2] * sizeof(block_q8_1);
                 ggml_cuda_pool_alloc<char> q8(ctx.pool());
-                char * quantized = q8.alloc(q8_bytes);
-                quantize_row_q8_1_cuda((const float *) a->data, nullptr, quantized, (ggml_type) up_table.desc.type,
-                        a->ne[0], a->nb[1] / sizeof(float), a->nb[2] / sizeof(float), a->nb[3] / sizeof(float),
-                        padded, a->ne[1], a->ne[2], 1, ctx.stream());
+                char * quantized = moe_quantize_act(ctx, a, (ggml_type) up_table.desc.type, true, q8);
                 // hit pass: experts resident for both projections
                 ggml_cuda_moe_table_mmv_hitg(ctx, up_table.device, gate_table.device, (ggml_type) up_table.desc.type,
                         quantized, (const int32_t *) ids->data, (float *) glu->data, a->ne[0], glu->ne[0], ids->ne[0],
@@ -10387,13 +10428,8 @@ bool ggml_cuda_moe_cache_device_fused_compute(ggml_backend_cuda_context & ctx,
                     (int)ids->ne[0], (int)(ids->nb[1] / sizeof(int32_t)));
         }
     }
-    const int64_t padded = GGML_PAD(a->ne[0], MATRIX_ROW_PADDING);
-    const size_t q8_bytes = (size_t)(padded / QK8_1) * a->ne[1] * a->ne[2] * sizeof(block_q8_1);
     ggml_cuda_pool_alloc<char> q8(ctx.pool());
-    char * quantized = q8.alloc(q8_bytes);
-    quantize_row_q8_1_cuda((const float *)a->data, nullptr, quantized, (ggml_type)up_table.desc.type,
-            a->ne[0], a->nb[1] / sizeof(float), a->nb[2] / sizeof(float), a->nb[3] / sizeof(float),
-            padded, a->ne[1], a->ne[2], 1, ctx.stream());
+    char * quantized = moe_quantize_act(ctx, a, (ggml_type) up_table.desc.type, true, q8);
     // Keep both projections in allocation order; the pool releases them in reverse order.
     moe_cache_effective_table up_effective(ctx.pool());
     moe_cache_effective_table gate_effective(ctx.pool());

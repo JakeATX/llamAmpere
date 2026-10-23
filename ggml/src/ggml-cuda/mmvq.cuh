@@ -15,6 +15,9 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc);
 bool   ggml_cuda_q8_cacheable(const ggml_backend_cuda_context & ctx, size_t q8_bytes);
 char * ggml_cuda_q8_cache_claim(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, ggml_type type_src0,
                                 size_t q8_bytes, int64_t ne10_padded);
+// [STRATAGAP Q8SHARE] the cached buffer of (src1, layout) in this graph eval, or nullptr (no claim)
+char * ggml_cuda_q8_cache_lookup(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, ggml_type type_src0,
+                                 size_t q8_bytes, int64_t ne10_padded);
 
 // [PARW] IQ4_XS x f32 at 9..32 columns (multi-slot speculative verify) on the int8 tensor-core path; returns false
 // (caller keeps MMQ) when the shape, layout, device or GGML_CUDA_IQ4XS_WIDE=0 rules it out.
