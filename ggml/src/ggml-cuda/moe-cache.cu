@@ -757,6 +757,11 @@ struct moe_cache_session {
     // the copies are issued in the order the math needs them.
     std::vector<std::array<int8_t, 3>> hf_order;
     std::vector<int8_t> hf_seq;
+    // fork STRATAGAP PLANCOUNT: the layer (and ids) whose route counts the plan kernel adds; bit k = kind k's count
+    // still owed by the plan (its own count kernel is skipped).
+    int pc_layer = -1;
+    const void * pc_ids = nullptr;
+    unsigned pc_mask = 0;
     // fork STRATAGAP: layers the host can compute (registered) and whose graph has the plain up/gate -> SwiGLU ->
     // down shape (checked per graph by ggml_cuda_moe_cache_cs_graph_scan); the layer whose CPU job is in flight.
     std::vector<uint8_t> cs_registered;
@@ -3368,6 +3373,7 @@ static void moe_cache_session_leave(void * opaque) {
         active->mj_group = -1;
         active->mj_ids = nullptr;
         active->mj_pending = 0;
+        active->pc_mask = 0;
         moe_cache_calibration_on_leave(*active);
         // This is outside CUDA graph capture/replay. The opt-in aggregate
         // diagnostic is separate from the default bounded adaptation below;
@@ -8576,6 +8582,7 @@ static void moe_missjoin_overlap_prepare(moe_cache_session & session) {
     session.mj_group = -1;
     session.mj_ids = nullptr;
     session.mj_pending = 0;
+    session.pc_mask = 0;
     session.hf_order.clear();
     session.hf_seq.clear();
     const bool hitfirst = moe_missjoin_hitfirst_enabled();
@@ -8758,6 +8765,8 @@ struct moe_hf_plan_args {
     int cs_partial;               // fork STRATAGAP CPU-first (see g_cs_partial)
     float cs_floor_ns, cs_link_w;
     moe_miss_list * miss;         // fork STRATAGAP MISSLIST: [4] lists to write (null: off; fast kernel only)
+    unsigned long long * pc_exp[3];   // fork STRATAGAP PLANCOUNT: per-kind expert counts (null: off; fast kernel only)
+    unsigned long long * pc_route;    // [0] hot routes, [1] cold routes, [2] dispatches (may be null)
 };
 
 // counts: 0 dispatches, 1 distinct experts, 2 distinct misses, 3 staged, 4 miss routes, 5 unstaged misses
@@ -8861,6 +8870,30 @@ static __global__ void moe_hf_plan_kernel(const moe_hf_plan_args args, const int
 #define MOE_HF_FAST_MAX_ROUTES 256
 #define MOE_HF_FAST_MAX_EXPERT 1024
 
+// fork STRATAGAP PLANCOUNT: GGML_MOE_PLAN_COUNT=1 has the hit-first plan kernel (side stream) add the per-expert
+// and hot/cold route counts of all three projections of its layer, instead of three moe_cache_count_routes launches
+// on the main stream. Integer atomics, so the totals (and the swap policy that reads them) are the same. Default off.
+static bool moe_plan_count_enabled() {
+    static const bool on = [] { const char * v = getenv("GGML_MOE_PLAN_COUNT"); return v != nullptr && atoi(v) != 0; }();
+    return on;
+}
+
+static bool moe_plan_count_legacy_off() {
+    static const bool off = [] { const char * v = getenv("GGML_MOE_CACHE_DEVICE_FUSED"); return !(v && strcmp(v, "1") == 0); }();
+    return off;
+}
+
+// True when the plan kernel already adds this projection's counts (consumes the owed bit).
+static bool moe_plan_count_take(moe_cache_session & session, const moe_cache_device_table & table, const ggml_tensor * ids) {
+    const int k = table.mj_kind;
+    if (k < 0 || k > 2 || session.pc_layer < 0 || session.pc_layer != table.mj_layer || session.pc_ids != ids->data ||
+            !(session.pc_mask >> k & 1u)) {
+        return false;
+    }
+    session.pc_mask &= ~(1u << k);
+    return true;
+}
+
 static bool moe_hf_plan_fast_enabled() {
     static const bool on = [] { const char * v = getenv("GGML_MOE_HF_PLAN_FAST"); return v == nullptr || atoi(v) != 0; }();
     return on;
@@ -8899,6 +8932,7 @@ static __global__ void __launch_bounds__(256) moe_hf_plan_fast_kernel(const moe_
     }
     if (tid == 0) { s_ncand = 0; }
     if (tid < 4) { s_ml[tid] = 0; }
+    if (tid == 0 && args.pc_exp[0] && args.pc_route) { atomicAdd(args.pc_route + 2, 3ULL); }
     __syncthreads();
     // bit0 distinct, bit1 miss, bit2 stageable (as in moe_hf_plan_kernel)
     for (int i = tid; i < n_routes; i += blockDim.x) {
@@ -8933,6 +8967,11 @@ static __global__ void __launch_bounds__(256) moe_hf_plan_fast_kernel(const moe_
             dmiss += (f & 3) == 3;
             mroutes += valid && !hot[k];
             if (args.cs && (f & 3) == 3) { atomicAdd(&s_nk[k], 1); }
+            // fork STRATAGAP PLANCOUNT: what moe_cache_count_routes adds for this route and projection
+            if (valid && args.pc_exp[0]) {
+                atomicAdd(args.pc_exp[k] + e, 1ULL);
+                if (args.pc_route) { atomicAdd(args.pc_route + (hot[k] ? 0 : 1), 1ULL); }
+            }
         }
         if (first) { atomicAdd(&s_n[0], 1u); }
         if (dmiss) { atomicAdd(&s_n[1], dmiss); }
@@ -9374,6 +9413,19 @@ static bool moe_hf_begin(ggml_backend_cuda_context & ctx, moe_cache_session & se
     const bool ml = moe_miss_list_mode() != 0 && fast && routes <= MOE_MISS_LIST_MAX && g_hf_miss;
     session.ml_layer = ml ? L : -1;
     if (ml) { args.miss = g_hf_miss; }
+    session.pc_layer = -1;
+    session.pc_mask = 0;
+    bool pc_tp = false;   // the table-prefetch dispatch adds its own counts
+#if !defined(GGML_USE_HIP)
+    pc_tp = session.devices.empty() || session.devices[0]->table_prefetch_prepared;
+#endif
+    if (fast && !pc_tp && moe_plan_count_enabled() && moe_plan_count_legacy_off() && session.device_expert_counts) {
+        for (int j = 0; j < 3; ++j) { args.pc_exp[j] = session.device_expert_counts + group[j]->count_offset; }
+        args.pc_route = session.device_route_counts;
+        session.pc_layer = L;
+        session.pc_ids = ids->data;
+        session.pc_mask = 7u;
+    }
     if (cs) {
         args.cs = g_cs_plan;
         args.cs_mask = g_cs_mask;
@@ -9530,6 +9582,7 @@ void ggml_cuda_moe_cache_hf_graph_end(ggml_backend_cuda_context & ctx) {
         }
     }
     session.mj_pending = 0;
+    session.pc_mask = 0;
     session.mj_group = -1;
     session.mj_ids = nullptr;
     session.hf_seq.clear();
@@ -10261,7 +10314,7 @@ bool ggml_cuda_moe_cache_device_compute(ggml_backend_cuda_context & ctx, ggml_te
             table.device, table.hot, session.device_route_counts, session.device_expert_counts + table.count_offset);
     } else
 #endif
-    if (session.device_expert_counts) {
+    if (session.device_expert_counts && !moe_plan_count_take(session, table, ids)) {
         const int n = (int)(ids->ne[0] * ids->ne[1]);
         moe_cache_count_routes<<<(n + 127) / 128, 128, 0, ctx.stream()>>>(
                 (const int32_t *)ids->data, table.hot, session.device_route_counts,
@@ -10381,6 +10434,7 @@ bool ggml_cuda_moe_cache_device_fused_compute(ggml_backend_cuda_context & ctx,
                 if (session.device_expert_counts) {
                     const int n = (int)(ids->ne[0] * ids->ne[1]);
                     for (const auto * table : {&up_table, &gate_table}) {
+                        if (moe_plan_count_take(session, *table, ids)) { continue; }
                         moe_cache_count_routes<<<(n + 127) / 128, 128, 0, ctx.stream()>>>(
                                 (const int32_t *)ids->data, table->hot, session.device_route_counts,
                                 session.device_expert_counts + table->count_offset, n, table->desc.n_expert,
@@ -10422,6 +10476,7 @@ bool ggml_cuda_moe_cache_device_fused_compute(ggml_backend_cuda_context & ctx,
     if (session.device_expert_counts) {
         const int n = (int)(ids->ne[0] * ids->ne[1]);
         for (const auto * table : {&up_table, &gate_table}) {
+            if (moe_plan_count_take(session, *table, ids)) { continue; }
             moe_cache_count_routes<<<(n + 127) / 128, 128, 0, ctx.stream()>>>(
                     (const int32_t *)ids->data, table->hot, session.device_route_counts,
                     session.device_expert_counts + table->count_offset, n, table->desc.n_expert,
