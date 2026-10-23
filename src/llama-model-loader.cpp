@@ -918,6 +918,9 @@ llama_model_loader::llama_model_loader(
             llama_moe_arena::pin_supported();
         LLAMA_LOG_INFO("%s: expert arena %s: %.2f GiB experts, %.2f GiB available, 7 GiB startup headroom\n",
                 __func__, use_moe_arena ? "enabled" : "disabled", bytes / double(GiB), available / double(GiB));
+        if (use_moe_arena && llm_kv.arch == LLM_ARCH_QWEN4EXP) {
+            llama_moe_arena_apply_flashnext_defaults();
+        }
         if (arena && strcmp(arena, "on") == 0 && !roles.empty() && !use_moe_arena) {
             throw std::runtime_error("--moe-arena on cannot fit the pinned experts with 7 GiB startup headroom, or pinning is unavailable");
         }

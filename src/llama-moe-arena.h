@@ -59,6 +59,12 @@ void llama_moe_arena_parallel_load(const std::vector<llama_moe_arena_copy> & cop
 // fork (LOADFAST diagnostic): order-dependent 64-bit checksum of `bytes` at `data`, 8 threads.
 uint64_t llama_moe_arena_checksum(const void * data, size_t bytes);
 
+// fork (FNDEF): Flash-Next (arch qwen4exp) with the pinned expert arena on starts with the exact, measured-positive
+// expert-cache, prompt-reading, kernel and helper switches already on. A switch the user set (any value, including
+// 0) is never overwritten, so `NAME=0` still turns each one off. Called once, from the model loader, before any
+// of the switches is read.
+void llama_moe_arena_apply_flashnext_defaults();
+
 // fork: one physical allocation, with strided views of unchanged expert blocks.
 struct llama_moe_arena {
     static bool is_expert(const char * name);
