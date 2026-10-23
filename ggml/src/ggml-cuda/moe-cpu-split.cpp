@@ -415,7 +415,7 @@ struct pool_state {
     std::vector<float> hq_aux;
     int rows_ug = 16, rows_down = 64;
     bool iq_rows = false;      // GGML_MOE_CPU_SPLIT_ROWS: moe-iq-rows.h kernels, each chunk decoded once per expert
-    int iq_variant = -1;       // moe_iq::get variant (GGML_MOE_CPU_SPLIT_ROWS minus 1)
+    int iq_variant = -1;       // moe_iq::get variant bits (GGML_MOE_CPU_SPLIT_ROWS: 1 = best mix, 2..17 = bits + 2)
     int iq_pf = 0;             // GGML_MOE_CPU_SPLIT_PF: prefetch distance of those kernels in bytes (0 = off)
 
     alignas(64) std::atomic<unsigned long long> gen{0};
@@ -481,8 +481,18 @@ void run_item(pool_state & s, int phase, int item) {
         const int e = s.expert[i];
         const size_t xg = L.shared_input ? 0 : (size_t) MOE_CS_MAX_ROUTES;
 #if defined(MOE_IQ_ROWS)
-        if (up.rows[1] && gate.rows[1]) {
+        if (up.rows[4] && gate.rows[4]) {
             // every chunk decoded once for up to 4 of the expert's tokens; same bits as the vec_dot loop below
+            // (a type whose one-token case is left to ggml, rows[1] null, runs vec_dot row by row for that case)
+            auto proj = [&](const role_math & m, const char * w, int nt, int64_t a, int64_t b, int nb,
+                                const block_q8_K * const * y, float * const * o) {
+                if (m.rows[nt]) { m.rows[nt](w, m.r.row_bytes, a, b, nb, y, o, s.iq_pf); return; }
+                for (int t = 0; t < nt; ++t) {
+                    for (int64_t row = a; row < b; ++row) {
+                        m.dot((int) m.r.n_in, &o[t][row - a], 0, w + (size_t) row * m.r.row_bytes, 0, y[t], 0, 1);
+                    }
+                }
+            };
             const char * wu = role_row(s, up, e, 0);
             const char * wg = role_row(s, gate, e, 0);
             const int nb = (int) (up.r.n_in / QK_K);
@@ -500,8 +510,8 @@ void run_item(pool_state & s, int phase, int item) {
                     float * uo[4] = { ub[0], ub[1], ub[2], ub[3] };
                     float * go[4] = { gb[0], gb[1], gb[2], gb[3] };
                     if (wu && wg) {
-                        up.rows[nt](wu, up.r.row_bytes, a, b, nb, yu, uo, s.iq_pf);
-                        gate.rows[nt](wg, gate.r.row_bytes, a, b, nb, yg, go, s.iq_pf);
+                        proj(up, wu, nt, a, b, nb, yu, uo);
+                        proj(gate, wg, nt, a, b, nb, yg, go);
                     } else {
                         for (int t = 0; t < nt; ++t) { for (int k = 0; k < 16; ++k) { ub[t][k] = 0.0f; gb[t][k] = 0.0f; } }
                     }
@@ -760,7 +770,10 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
     s.rows_ug = env_int("GGML_MOE_CPU_SPLIT_ROWS_UG", 16, 1, 4096);
     s.rows_down = env_int("GGML_MOE_CPU_SPLIT_ROWS_DOWN", 64, 1, 8192);
 #if defined(MOE_IQ_ROWS)
-    s.iq_variant = env_int("GGML_MOE_CPU_SPLIT_ROWS", 0, 0, 4) - 1;   // 1..4 = on, kernel variant 0..3
+    {   // 1 = on with the measured best kernel mix; 2..17 = on with moe_iq::get variant bits (value - 2)
+        const int v = env_int("GGML_MOE_CPU_SPLIT_ROWS", 0, 0, 17);
+        s.iq_variant = v == 0 ? -1 : v == 1 ? moe_iq::variant_best : v - 2;
+    }
     s.iq_rows = s.iq_variant >= 0;
     s.iq_pf = env_int("GGML_MOE_CPU_SPLIT_PF", 0, 0, 1 << 16);
 #endif

@@ -243,16 +243,21 @@ template <class F> rows_fn pick(int nt, bool two_rows) {
     }
 }
 
-// The kernel for `type` and nt tokens (1..4), or null when the type has none. variant bit 0: IQ3 grid entries
-// joined in general registers (the _pair decodes); bit 1: two rows per tile for one token.
-inline rows_fn get(int type, int nt, int variant = 0) {
-    const bool pair = variant & 1, two = (variant & 2) != 0;
+// The kernel for `type` and nt tokens (1..4), or null when the type has none (or `variant` gives that case to ggml).
+// variant bits: 1 = IQ3_XXS grid entries joined in general registers (the _pair decode); 2 = two rows per tile for
+// one token; 4 = the same _pair decode for IQ3_S; 8 = one token of IQ2_S or IQ3_XXS stays on ggml's vec_dot (the
+// two types where ggml's single-token loop measured faster than ours on Zen 3 and Zen 5).
+// best = 1 | 8 (test-moe-iq-rows on the home 5800X3D and the Taichi 9900X).
+inline constexpr int variant_best = 1 | 8;
+inline rows_fn get(int type, int nt, int variant = variant_best) {
+    const bool two = (variant & 2) != 0;
+    const bool one_ggml = nt == 1 && (variant & 8) != 0;
     switch (type) {
         case GGML_TYPE_IQ2_XXS: return pick<f_iq2_xxs>(nt, two);
         case GGML_TYPE_IQ2_XS:  return pick<f_iq2_xs>(nt, two);
-        case GGML_TYPE_IQ2_S:   return pick<f_iq2_s>(nt, two);
-        case GGML_TYPE_IQ3_XXS: return pair ? pick<f_iq3_xxs_pair>(nt, two) : pick<f_iq3_xxs>(nt, two);
-        case GGML_TYPE_IQ3_S:   return pair ? pick<f_iq3_s_pair>(nt, two) : pick<f_iq3_s>(nt, two);
+        case GGML_TYPE_IQ2_S:   return one_ggml ? nullptr : pick<f_iq2_s>(nt, two);
+        case GGML_TYPE_IQ3_XXS: return one_ggml ? nullptr : (variant & 1) ? pick<f_iq3_xxs_pair>(nt, two) : pick<f_iq3_xxs>(nt, two);
+        case GGML_TYPE_IQ3_S:   return (variant & 4) ? pick<f_iq3_s_pair>(nt, two) : pick<f_iq3_s>(nt, two);
         default: return nullptr;
     }
 }
