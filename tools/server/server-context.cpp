@@ -4838,7 +4838,9 @@ private:
                         llama_tokens packed;
                         nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, nullptr, 0, &n_packed);
                         if (nread != 0) {
-                            if (mctx == nullptr && n_packed > (size_t) slot->n_ctx) {
+                            // fork: the serialized text envelope also occupies token-sized words.
+                            const size_t text_overhead = server_tokens(llama_tokens{}, false).serialize().size() / sizeof(llama_token);
+                            if (mctx == nullptr && n_packed > (size_t) slot->n_ctx + text_overhead) {
                                 throw std::runtime_error("Restored prompt does not fit in the slot context");
                             }
                             packed.resize(std::max<size_t>(1, n_packed));
