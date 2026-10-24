@@ -2,6 +2,99 @@
 #include "ssm-conv.cuh"
 #include "unary.cuh"
 
+// A block owns one complete 128-channel Q/K head (or one V segment).
+// Each channel keeps its history in registers and publishes the same snapshots
+// as the ordinary ring convolution. Only Q/K segments need a block reduction.
+template <int NT>
+static __global__ void ssm_conv_norm_f32(
+        ggml_cuda_conv_ring_args args, const float * weights, float * mixed,
+        float * q, float * k, int channels, int heads, float eps, float factor) {
+    ggml_cuda_pdl_sync();
+    const int lane = threadIdx.x;
+    const int seq = blockIdx.x;
+    const int segment = blockIdx.y;
+    const int channel = segment*128 + lane;
+    float x[3 + NT];
+    float w[4];
+    const auto * state = (const float *) ((const char *) args.state +
+            seq*args.state_nb2 + channel*args.state_nb1);
+#pragma unroll
+    for (int j = 0; j < 3; ++j) { x[j] = state[j]; }
+    const char * input = (const char *) args.x + seq*args.x_nb2 + channel*args.x_nb1;
+#pragma unroll
+    for (int t = 0; t < NT; ++t) { x[3 + t] = *(const float *) (input + t*args.x_nb0); }
+#pragma unroll
+    for (int j = 0; j < 4; ++j) { w[j] = weights[channel*4 + j]; }
+
+    // Preserve graph order, including an in-place update of the source plane.
+    for (int j = 0; j < args.n_win; ++j) {
+        const auto & win = args.win[j];
+        const int64_t row = win.rows ? win.rows[seq] : seq;
+        float * out = win.dst + row*win.row_stride + channel*3;
+#pragma unroll
+        for (int offset = 0; offset <= NT; ++offset) {
+            if (offset == win.s_idx) {
+#pragma unroll
+                for (int a = 0; a < 3; ++a) { out[a] = x[offset + a]; }
+            }
+        }
+    }
+
+    __shared__ float partial[32];
+#pragma unroll
+    for (int t = 0; t < NT; ++t) {
+        float value = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) { value += x[t + j]*w[j]; }
+        value += 0.0f; // same bias-free convolution expression as the ring path
+        value = ggml_cuda_op_silu_single(value);
+        mixed[((int64_t) seq*NT + t)*channels + channel] = value;
+        if (segment < 2*heads) {
+            // Match RMS_NORM followed by SCALE, retaining its epsilon and
+            // two multiplies instead of replacing them by a combined L2 scale.
+            const float sum = block_reduce<block_reduce_method::SUM, 128>(value*value, partial);
+            const float mean = sum/128.0f;
+            const float norm = rsqrtf(mean + eps);
+            float * out = segment < heads ? q : k;
+            out[(((int64_t) seq*NT + t)*heads + segment%heads)*128 + lane] = factor*(norm*value);
+            __syncthreads(); // every warp must finish reading partial before reuse
+        }
+    }
+    ggml_cuda_pdl_lc();
+}
+
+bool ggml_cuda_op_ssm_conv_norm(ggml_backend_cuda_context & ctx, ggml_tensor * conv,
+        ggml_tensor * mixed, ggml_tensor * q, ggml_tensor * k, float eps) {
+    for (auto & entry : ctx.conv_rings) {
+        if (entry.conv != conv) { continue; }
+        const ggml_cuda_kernel_launch_params params(
+                dim3(conv->ne[2], conv->ne[0]/128), dim3(128), 0, ctx.stream());
+        auto launch = [&](auto width) {
+            constexpr int nt = decltype(width)::value;
+            ggml_cuda_kernel_launch(ssm_conv_norm_f32<nt>, params, entry.args,
+                    (const float *) conv->src[1]->data, (float *) mixed->data,
+                    (float *) q->data, (float *) k->data, (int) conv->ne[0],
+                    (int) q->ne[1], eps, 1.0f/sqrtf(128.0f));
+        };
+        switch (conv->ne[1]) {
+            case 1: launch(std::integral_constant<int, 1>{}); break;
+            case 2: launch(std::integral_constant<int, 2>{}); break;
+            case 3: launch(std::integral_constant<int, 3>{}); break;
+            case 4: launch(std::integral_constant<int, 4>{}); break;
+            case 5: launch(std::integral_constant<int, 5>{}); break;
+            case 6: launch(std::integral_constant<int, 6>{}); break;
+            case 7: launch(std::integral_constant<int, 7>{}); break;
+            case 8: launch(std::integral_constant<int, 8>{}); break;
+            default: return false;
+        }
+        CUDA_CHECK(cudaGetLastError());
+        entry.used = true;
+        ctx.fusion_stats.conv_ring++;
+        return true;
+    }
+    return false;
+}
+
 template <bool apply_silu, size_t split_d_inner, size_t d_conv>
 static __global__ void ssm_conv_f32(const float * src0_ptr, const float * src1_ptr,
                                     const float * bias_ptr,

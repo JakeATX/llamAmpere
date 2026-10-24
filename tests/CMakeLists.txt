@@ -603,3 +603,6 @@ if (UNIX)
     add_executable(test-moe-generation-profile test-moe-generation-profile.cpp)
     llama_test(test-moe-generation-profile LABEL "main")
 endif()
+
+llama_build_and_test(test-gdn-conv-norm.cpp)
+set_tests_properties(test-gdn-conv-norm PROPERTIES SKIP_RETURN_CODE 77)

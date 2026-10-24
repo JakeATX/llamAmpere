@@ -6191,6 +6191,132 @@ static bool ggml_cuda_conv_ring_check(const ggml_cgraph * cgraph, int conv_idx, 
     return true;
 }
 
+// fork: Fold Q/K normalization into the convolution; the ring plan still owns history writes.
+static bool ggml_cuda_gdn_conv_norm_enabled() {
+    static const bool enabled = [] { const char * e = getenv("GGML_CUDA_GDN_CONV_NORM"); return e == nullptr || atoi(e) != 0; }();
+    return enabled;
+}
+
+static bool ggml_cuda_gdn_conv_norm_match(const ggml_cgraph * graph, int i, float & eps) {
+    if (!ggml_cuda_gdn_conv_norm_enabled() || i + 7 >= graph->n_nodes) {
+        return false;
+    }
+    const ggml_op ops[] = { GGML_OP_SSM_CONV, GGML_OP_UNARY, GGML_OP_VIEW, GGML_OP_RMS_NORM,
+                           GGML_OP_SCALE, GGML_OP_VIEW, GGML_OP_RMS_NORM, GGML_OP_SCALE };
+    for (int j = 0; j < 8; ++j) {
+        if (graph->nodes[i + j]->op != ops[j] || graph->nodes[i + j]->type != GGML_TYPE_F32) {
+            return false;
+        }
+        if (j != 1 && j != 4 && j != 7 &&
+            ((graph->nodes[i + j]->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_cuda_gdn_state_read_uses(graph, graph->nodes[i + j]) != 1)) {
+            return false;
+        }
+    }
+    const ggml_tensor * conv = graph->nodes[i], * mixed = graph->nodes[i + 1];
+    const int64_t ch = conv->ne[0], nt = conv->ne[1], ns = conv->ne[2];
+    if (ch < 384 || ch % 128 || nt < 1 || nt > GGML_CUDA_CONV_RING_MAX_T || ns < 1 ||
+        ch > INT_MAX/(4*nt) || ns > INT_MAX/(4*nt*ch) || conv->ne[3] != 1 ||
+        conv->src[1]->ne[0] != 4 || conv->src[1]->nb[1] != 4*sizeof(float) ||
+        !ggml_is_contiguous(conv->src[1]) || mixed->src[0] != conv ||
+        ggml_get_unary_op(mixed) != GGML_UNARY_OP_SILU || !ggml_are_same_shape(mixed, conv) ||
+        !ggml_is_contiguous(mixed)) {
+        return false;
+    }
+    const int64_t heads = graph->nodes[i + 2]->ne[1];
+    if (heads < 1 || heads > ch/256 || 256*heads >= ch) {
+        return false;
+    }
+    float first_eps = 0.0f;
+    for (int j = 0; j < 2; ++j) {
+        const ggml_tensor * view = graph->nodes[i + 2 + 3*j];
+        const ggml_tensor * norm = graph->nodes[i + 3 + 3*j];
+        const ggml_tensor * scale = graph->nodes[i + 4 + 3*j];
+        if (view->src[0] != mixed || view->view_src != mixed || view->view_offs != j*128*heads*sizeof(float) ||
+            view->ne[0] != 128 || view->ne[1] != heads || view->ne[2] != nt || view->ne[3] != ns ||
+            view->nb[0] != sizeof(float) || view->nb[1] != 128*sizeof(float) ||
+            view->nb[2] != ch*sizeof(float) || view->nb[3] != ch*nt*sizeof(float) ||
+            norm->src[0] != view || norm->view_src != nullptr || scale->src[0] != norm || !ggml_are_same_shape(norm, view) ||
+            !ggml_are_same_shape(scale, view) || !ggml_is_contiguous(scale)) {
+            return false;
+        }
+        float e, factor, bias;
+        memcpy(&e, norm->op_params, sizeof(float));
+        memcpy(&factor, scale->op_params, sizeof(float));
+        memcpy(&bias, (const float *) scale->op_params + 1, sizeof(float));
+        if (!std::isfinite(e) || e < 0.0f || factor != 1.0f/sqrtf(128.0f) || bias != 0.0f ||
+            (j && e != first_eps)) {
+            return false;
+        }
+        first_eps = e;
+    }
+    eps = first_eps;
+    return std::isfinite(eps);
+}
+
+static bool ggml_cuda_gdn_conv_norm_span(const ggml_tensor * t, uintptr_t & begin, uintptr_t & end) {
+    if (!t || !t->data) {
+        return false;
+    }
+    size_t span = ggml_type_size(t->type);
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        if (t->ne[d] < 1 || (t->nb[d] && (uint64_t) (t->ne[d] - 1) > (SIZE_MAX - span)/t->nb[d])) {
+            return false;
+        }
+        span += (t->ne[d] - 1)*t->nb[d];
+    }
+    begin = (uintptr_t) t->data;
+    if (span > UINTPTR_MAX - begin) {
+        return false;
+    }
+    end = begin + span;
+    return true;
+}
+
+static bool ggml_cuda_gdn_conv_norm_ranges(const ggml_cgraph * graph, int i, const ggml_cuda_conv_ring_match & m) {
+    std::vector<const ggml_tensor *> others = { m.concat->src[0], m.concat->src[1], graph->nodes[i]->src[1] };
+    for (int j = 0; j < m.n_win; ++j) {
+        others.push_back(m.win[j].dst);
+        if (m.win[j].rows) {
+            others.push_back(m.win[j].rows);
+        }
+    }
+    for (int j : { 1, 4, 7 }) {
+        const ggml_tensor * out = graph->nodes[i + j];
+        uintptr_t a, b;
+        if (!ggml_cuda_gdn_conv_norm_span(out, a, b)) {
+            return false;
+        }
+        for (const ggml_tensor * t : others) {
+            uintptr_t c, d;
+            if (!ggml_cuda_gdn_conv_norm_span(t, c, d) || (a < d && c < b)) {
+                return false;
+            }
+        }
+        others.push_back(out);
+    }
+    return true;
+}
+
+static bool ggml_cuda_try_gdn_conv_norm(ggml_backend_cuda_context & ctx, ggml_cgraph * graph, int i) {
+    float eps;
+    ggml_cuda_conv_ring_match m;
+    if (!ctx.stream_context().concurrent_events.empty() || !ggml_cuda_gdn_conv_norm_match(graph, i, eps) ||
+        !ggml_cuda_conv_ring_match_at(graph, i, m) || m.last_idx != i + 1 ||
+        !ggml_cuda_conv_ring_check(graph, i, m) || !ggml_cuda_gdn_conv_norm_ranges(graph, i, m)) {
+        return false;
+    }
+    if (!ggml_cuda_op_ssm_conv_norm(ctx, graph->nodes[i], graph->nodes[i + 1],
+                                       graph->nodes[i + 4], graph->nodes[i + 7], eps)) {
+        return false;
+    }
+    static bool reported = false;
+    if (!reported) {
+        reported = true;
+        GGML_LOG_INFO("[gdn-conv-norm] convolution/SiLU/QK normalization enabled\n");
+    }
+    return true;
+}
+
 // fills cuda_ctx->conv_rings and marks the nodes the planned ssm_conv launches replace
 static void ggml_cuda_conv_ring_plan(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph,
                                      std::vector<uint8_t> & skip) {
@@ -8716,6 +8842,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+    if (node->op == GGML_OP_SSM_CONV && ggml_cuda_try_gdn_conv_norm(*cuda_ctx, cgraph, i)) {
+        return 7;
+    }
     if (ggml_cuda_moe_cache_device_supports(node, cuda_ctx->device)) {
         if (cuda_ctx->stream_context().concurrent_events.empty() && i + 2 < cgraph->n_nodes) {
             ggml_tensor * glu = cgraph->nodes[i + 2];
@@ -10655,7 +10784,13 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             if (cgraph->nodes[i]->op != GGML_OP_SSM_CONV || !ggml_cuda_conv_ring_match_at(cgraph, i, m)) {
                 continue;
             }
-            ggml_tensor * until = cgraph->nodes[m.last_idx];
+            float eps;
+            const bool fused = m.last_idx == i + 1 && ggml_cuda_gdn_conv_norm_match(cgraph, i, eps);
+            ggml_tensor * until = cgraph->nodes[fused ? i + 7 : m.last_idx];
+            if (fused) {
+                params->add_alloc_dep(params->user_data, cgraph->nodes[i]->src[1], until);
+                params->add_alloc_dep(params->user_data, cgraph->nodes[i + 1], until);
+            }
             params->add_alloc_dep(params->user_data, m.concat->src[0], until);
             params->add_alloc_dep(params->user_data, m.concat->src[1], until);
             for (int k = 0; k < m.n_win; ++k) {
