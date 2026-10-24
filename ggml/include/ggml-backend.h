@@ -360,6 +360,13 @@ extern "C" {
     // Changes when a recipient scheduler grew this scheduler's compute buffers (see ggml_gallocr_get_epoch): a graph
     // allocated under an older value must go through ggml_backend_sched_alloc_graph again before it is computed
     GGML_API uint64_t                   ggml_backend_sched_get_alloc_epoch(ggml_backend_sched_t sched);
+    // fork ROUNDPREP: switch between two split/allocation plans (slot 0 or 1). A graph allocated in one slot stays
+    // allocated while the other slot is split and allocated, so a caller alternating two graphs can compute each again
+    // without ggml_backend_sched_alloc_graph, as long as the alloc epoch is unchanged. Returns false (and stays on the
+    // current slot) when the scheduler cannot keep two plans (graph copies, expert streaming).
+    GGML_API bool                       ggml_backend_sched_plan_select(ggml_backend_sched_t sched, int slot);
+    // fork ROUNDPREP: changes whenever a graph is split into the current plan (alloc_graph, reserve, size queries)
+    GGML_API uint64_t                   ggml_backend_sched_get_plan_serial(ggml_backend_sched_t sched);
 
     GGML_API void                 ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend);
     GGML_API ggml_backend_t       ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node);

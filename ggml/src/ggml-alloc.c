@@ -544,6 +544,7 @@ struct ggml_gallocr {
     ggml_backend_buffer_t * external_buffers; // [n_buffers], caller-owned
     struct ggml_gallocr * donor; // optional: adopt this allocator's buffers when they are large enough
     uint64_t epoch; // bumped when a recipient replaces this allocator's buffers (grown donor): its allocated graphs are stale
+    bool epoch_on_realloc; // fork ROUNDPREP: also bump the epoch when this allocator replaces its own buffers (plan slots)
     struct ggml_dyn_tallocr ** buf_tallocs; // [n_buffers]
     int n_buffers;
 
@@ -661,6 +662,12 @@ void ggml_gallocr_set_donor(ggml_gallocr_t galloc, ggml_gallocr_t donor) {
 
 uint64_t ggml_gallocr_get_epoch(ggml_gallocr_t galloc) {
     return galloc != NULL ? galloc->epoch : 0;
+}
+
+void ggml_gallocr_set_epoch_on_realloc(ggml_gallocr_t galloc, bool enable) {
+    if (galloc != NULL) {
+        galloc->epoch_on_realloc = enable;
+    }
 }
 
 bool ggml_gallocr_shares_buffer(ggml_gallocr_t galloc, int buffer_id) {
@@ -1120,6 +1127,10 @@ static bool ggml_gallocr_reserve_n_impl(
                 }
             }
 #endif
+            if (galloc->epoch_on_realloc) {
+                // fork ROUNDPREP: a graph kept allocated in another scheduler plan slot points into the old buffer
+                galloc->epoch++;
+            }
             ggml_vbuffer_free(galloc->buffers[i]);
             galloc->buffers[i] = NULL;
             if (galloc->donor != NULL && galloc->donor->buffers[i] != NULL && !galloc->donor->buffers[i]->borrowed) {
