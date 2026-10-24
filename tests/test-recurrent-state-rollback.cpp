@@ -1281,6 +1281,29 @@ static int test_rollback(const common_params & params, llama_model * model, uint
     return 0;
 }
 
+static bool test_single_seq_reserve(const common_params & params, llama_model * model) {
+    auto cparams = common_context_params_to_llama(params);
+    cparams.n_seq_max = 2;
+    cparams.kv_unified = false;
+    cparams.n_ctx = 256;
+    cparams.n_batch = cparams.n_ubatch = 32;
+    llama_context_ptr ctx(llama_init_from_model(model, cparams));
+    if (!ctx) { return false; }
+    auto * memory = ctx->get_memory();
+    if (!memory) { return false; }
+    // Odd token counts must not be rounded to the number of configured slots.
+    for (uint32_t rows : {1u, 3u, 9u}) {
+        auto view = memory->init_full_single_seq();
+        if (!view || !ctx->graph_reserve(rows, 1, 1, view.get())) { return false; }
+    }
+    // Narrowing a reservation must not narrow the live cache or the next full view.
+    auto full = memory->init_full();
+    if (!full || !ctx->graph_reserve(4, 2, 2, full.get()) ||
+            memory->seq_pos_max(0) >= 0 || memory->seq_pos_max(1) >= 0) { return false; }
+    fprintf(stderr, "single-sequence full-cache graph reservation PASS\n");
+    return true;
+}
+
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
@@ -1306,6 +1329,10 @@ int main(int argc, char ** argv) {
     if (!llama_model_is_recurrent(model) && !llama_model_is_hybrid(model)) {
         fprintf(stderr, "%s : skipping for non-recurrent model\n", __func__);
         return 0;
+    }
+
+    if (common_get_env("LLAMA_TEST_B1_SINGLE_SEQ_RESERVE") == "1") {
+        return test_single_seq_reserve(params, model) ? 0 : 1;
     }
 
     for (uint8_t fill : { 0, 0x3e }) {

@@ -163,6 +163,7 @@ public:
             bool embd_all) override;
 
     llama_memory_context_ptr init_full() override;
+    llama_memory_context_ptr init_full_single_seq() override;
 
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
@@ -686,7 +687,7 @@ public:
 
     // used to create a full-cache context
     llama_kv_cache_context(
-            llama_kv_cache * kv);
+            llama_kv_cache * kv, bool single_seq = false);
 
     // used to create an update context
     llama_kv_cache_context(
