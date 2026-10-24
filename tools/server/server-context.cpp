@@ -3602,7 +3602,7 @@ private:
         return true;
     }
 
-    bool process_token(completion_token_output & result, server_slot & slot) {
+    bool process_token(completion_token_output & result, server_slot & slot, bool last_in_group = true) {
         // remember which tokens were sampled - used for repetition penalties during sampling
         const std::string token_str = result.text_to_send;
         slot.sampled = result.tok;
@@ -3658,7 +3658,8 @@ private:
         }
 
         // if context shifting is disabled, make sure that we don't run out of context
-        if (!params_base.ctx_shift && slot.prompt.n_tokens() + 1 >= slot.n_ctx) {
+        // Accepted groups are already in the prompt; deliver the whole group before checking its final capacity.
+        if (last_in_group && !params_base.ctx_shift && slot.prompt.n_tokens() + 1 >= slot.n_ctx) {
             slot.truncated      = true;
             slot.stop           = STOP_TYPE_LIMIT;
             slot.has_next_token = false;
@@ -7054,7 +7055,7 @@ private:
 
                 slot.stats.n_gen += 1;
 
-                if (!process_token(result, slot)) {
+                if (!process_token(result, slot, i + 1 == ids.size())) {
                     slot.print_timings();
                     send_final_response(slot);
                     slot.release();
