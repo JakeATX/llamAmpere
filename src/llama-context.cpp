@@ -5403,36 +5403,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     } cache_capture_guard_ { b1_cache_collect };
     // Packed B1 reserves a small full-model graph and grows phase graphs on demand.
     // Its causal attention/shared-expert chunks still use the requested turn size.
-    uint32_t turn_ubatch = (b1_ffn_scratch_active || b1_layer_scratch_active) ? cparams.n_ubatch :
+    const uint32_t turn_ubatch = (b1_ffn_scratch_active || b1_layer_scratch_active) ? cparams.n_ubatch :
             (sched_reserve_tokens ? std::min(cparams.n_ubatch, sched_reserve_tokens) : cparams.n_ubatch);
-
-    // fork: split concurrent verification before graph construction, without changing drafts or prompt geometry.
-    const char * decode_chunks = getenv("LLAMA_MOE_CACHE_DECODE_CHUNKS");
-    if (tagged == LLAMA_DECODE_PHASE_GENERATION && !output_all && cparams.causal_attn &&
-            hparams.n_expert_used() > 0 && n_outputs_all == n_tokens_all && (!decode_chunks || decode_chunks[0] != '0')) {
-        const auto & batch = balloc->get_batch();
-        bool multiple = false, uncoupled = true;
-        for (int32_t i = 0; i < batch.n_tokens; ++i) {
-            uncoupled = uncoupled && batch.n_seq_id[i] == 1;
-            multiple = multiple || batch.seq_id[i][0] != batch.seq_id[0][0];
-        }
-        if (multiple && uncoupled) {
-            uint32_t n_routes = 0;
-            for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
-                n_routes = std::max(n_routes, hparams.n_expert_used(il));
-            }
-            const int capacity = ggml_backend_sched_moe_cache_decode_capacity(sched.get(), n_routes);
-            // The allocator keeps each sequence's rollback tail in one microbatch.
-            if (capacity > 0 && (uint32_t) capacity >= cparams.n_rs_seq + 2 && n_tokens_all > (uint32_t) capacity) {
-                turn_ubatch = std::min(turn_ubatch, (uint32_t) capacity);
-                if (!moe_decode_split_logged) {
-                    LLAMA_LOG_INFO("%s: cached concurrent decode: %u tokens, ubatch <= %u, experts/token = %u\n",
-                            __func__, n_tokens_all, turn_ubatch, n_routes);
-                    moe_decode_split_logged = true;
-                }
-            }
-        }
-    }
 
     if (t_compute_start_us == 0) {
         t_compute_start_us = ggml_time_us();
@@ -9640,6 +9612,15 @@ void llama_set_decode_phase(llama_context * ctx, enum llama_decode_phase phase) 
 
 void llama_set_next_decode_phase(llama_context * ctx, enum llama_decode_phase phase) {
     ctx->set_next_decode_phase(phase);
+}
+
+int32_t llama_moe_cache_decode_capacity(const llama_context * ctx) {
+    const auto & hp = ctx->get_model().hparams;
+    uint32_t routes = 0;
+    for (uint32_t il = 0; il < hp.n_layer(); ++il) {
+        routes = std::max(routes, hp.n_expert_used(il));
+    }
+    return ggml_backend_sched_moe_cache_decode_capacity(ctx->get_sched(), routes);
 }
 
 int32_t llama_n_threads(llama_context * ctx) {

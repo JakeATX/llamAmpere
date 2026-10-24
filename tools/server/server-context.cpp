@@ -1866,6 +1866,8 @@ private:
     llama_context * ctx_tgt = nullptr;
 
     server_batch batch;
+    size_t verify_budget_next = 0;
+    bool verify_budget_logged = false;
 
     llama_model   * model_dft = nullptr;
     llama_context * ctx_dft   = nullptr;
@@ -5341,14 +5343,48 @@ private:
             }
 
             generating.push_back(&slot);
+        });
 
+        std::vector<int32_t> draft_budget(slots.size(), -1);
+        const char * budget_env = std::getenv("LLAMA_MOE_CACHE_DECODE_CHUNKS");
+        const int32_t verify_capacity = generating.size() > 1 && (!budget_env || budget_env[0] != '0')
+            ? std::min(8, llama_moe_cache_decode_capacity(ctx_tgt)) : 0;
+        if (verify_capacity > 0) {
+            std::vector<int32_t> requested, retained;
+            for (auto * slot : generating) {
+                requested.push_back(std::max(0, std::min(slot->get_n_draft_max(), common_speculative_n_max(spec.get()))));
+                retained.push_back(slot->spec_draft.empty() ? -1 : (int32_t) slot->spec_draft.size());
+            }
+            const auto budget = common_speculative_row_budget(requested, retained, verify_capacity, verify_budget_next);
+            verify_budget_next = (verify_budget_next + 1) % generating.size();
+            std::vector<server_slot *> admitted;
+            for (size_t i = 0; i < generating.size(); ++i) {
+                if (spec) {
+                    common_speculative_get_draft_params(spec.get(), generating[i]->id).drafting = false;
+                }
+                if (budget[i] >= 0) {
+                    draft_budget[generating[i]->id] = budget[i];
+                    admitted.push_back(generating[i]);
+                }
+            }
+            generating = std::move(admitted);
+            if (!verify_budget_logged) {
+                SRV_INF("cached concurrent row budget: capacity = %d, slots = %zu\n", verify_capacity, generating.size());
+                verify_budget_logged = true;
+            }
+        }
+
+        iterate(generating, [&](server_slot & slot) {
             if (spec) {
                 common_speculative_get_draft_params(spec.get(), slot.id).drafting = false;
 
                 const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
                 const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
-                const int n_draft_max = slot.get_n_draft_max();
+                int n_draft_max = slot.get_n_draft_max();
+                if (draft_budget[slot.id] >= 0) {
+                    n_draft_max = std::min(n_draft_max, draft_budget[slot.id]);
+                }
 
                 if (n_draft_max > 0) {
                     GGML_ASSERT(slot.can_speculate());

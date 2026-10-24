@@ -5417,3 +5417,46 @@ void common_speculative_print_stats(const common_speculative * spec) {
                 str_perf.c_str());
     }
 }
+
+std::vector<int32_t> common_speculative_row_budget(const std::vector<int32_t> & requested,
+        const std::vector<int32_t> & retained, int32_t capacity, size_t first) {
+    GGML_ASSERT(requested.size() == retained.size());
+    std::vector<int32_t> budget(requested.size(), -1);
+    if (requested.empty()) {
+        return budget;
+    }
+    if (requested.size() == 1 || capacity <= 0) {
+        for (size_t i = 0; i < requested.size(); ++i) {
+            budget[i] = retained[i] >= 0 ? retained[i] : std::max(0, requested[i]);
+        }
+        return budget;
+    }
+    first %= requested.size();
+    // A replay made in the solo path can exceed the shared budget. Serve it alone without truncation.
+    if (retained[first] >= capacity) {
+        budget[first] = retained[first];
+        return budget;
+    }
+    int32_t left = capacity;
+    for (size_t k = 0; k < requested.size(); ++k) {
+        const size_t i = (first + k) % requested.size();
+        const int32_t rows = retained[i] >= 0 ? retained[i] : 0;
+        if (rows < left) {
+            budget[i] = rows;
+            left -= rows + 1;
+        }
+    }
+    bool progress = true;
+    while (left > 0 && progress) {
+        progress = false;
+        for (size_t k = 0; k < requested.size() && left > 0; ++k) {
+            const size_t i = (first + k) % requested.size();
+            if (budget[i] >= 0 && retained[i] < 0 && budget[i] < requested[i]) {
+                ++budget[i];
+                --left;
+                progress = true;
+            }
+        }
+    }
+    return budget;
+}

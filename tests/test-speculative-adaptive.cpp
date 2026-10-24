@@ -2,6 +2,7 @@
 #undef NDEBUG
 
 #include "speculative-adaptive.h"
+#include "speculative.h"
 
 #include <cassert>
 #include <cstdio>
@@ -207,7 +208,37 @@ static void test_floor(void) {
     assert(ctrl.n_cur == 2);
 }
 
+static void test_row_budget(void) {
+    auto plan = [](std::vector<int32_t> wants, std::vector<int32_t> retained, int cap, size_t first) {
+        return common_speculative_row_budget(wants, retained, cap, first);
+    };
+    assert(plan({4, 4}, {-1, -1}, 6, 0) == std::vector<int32_t>({2, 2}));
+    assert(plan({4, 4}, {-1, -1}, 8, 0) == std::vector<int32_t>({3, 3}));
+    assert(plan({4, 4}, {-1, -1}, 5, 0) == std::vector<int32_t>({2, 1}));
+    assert(plan({4, 4}, {-1, -1}, 5, 1) == std::vector<int32_t>({1, 2}));
+    assert(plan({0, 4}, {-1, -1}, 6, 0) == std::vector<int32_t>({0, 4}));
+    assert(plan({4, 4}, {4, -1}, 6, 0) == std::vector<int32_t>({4, 0}));
+    assert(plan({4, 4}, {4, 4}, 6, 0) == std::vector<int32_t>({4, -1}));
+    assert(plan({4, 4}, {4, 4}, 6, 1) == std::vector<int32_t>({-1, 4}));
+    assert(plan({4, 4, 4}, {-1, -1, -1}, 2, 1) == std::vector<int32_t>({-1, 0, 0}));
+    assert(plan({8}, {-1}, 6, 0) == std::vector<int32_t>({8}));
+    assert(plan({8, 8}, {8, 8}, 6, 1) == std::vector<int32_t>({-1, 8}));
+    assert(plan({8, 4}, {8, -1}, 6, 0) == std::vector<int32_t>({8, -1}));
+    assert(plan({8, 4}, {8, -1}, 6, 1) == std::vector<int32_t>({-1, 4}));
+    assert(plan({}, {}, 6, 0).empty());
+    for (int cap = 1; cap <= 8; ++cap) {
+        for (size_t first = 0; first < 4; ++first) {
+            const auto budget = plan({4, 3, 0, 2}, {-1, -1, -1, -1}, cap, first);
+            int rows = 0;
+            for (auto n : budget) { if (n >= 0) { rows += n + 1; } }
+            assert(rows <= cap && rows > 0);
+        }
+    }
+    printf("test-speculative-adaptive: row budget OK\n");
+}
+
 int main(void) {
+    test_row_budget();
     test_reset();
     test_climb();
     test_drop();
