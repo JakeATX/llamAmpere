@@ -1294,10 +1294,21 @@ static bool test_single_seq_reserve(const common_params & params, llama_model * 
     // Odd token counts must not be rounded to the number of configured slots.
     for (uint32_t rows : {1u, 3u, 9u}) {
         auto view = memory->init_full_single_seq();
+        if (dynamic_cast<llama_memory_hybrid_idx *>(memory)) {
+            const auto * idx_view = dynamic_cast<const llama_memory_hybrid_idx_context *>(view.get());
+            if (!idx_view) { return false; }
+            if (idx_view->get_idx() && (idx_view->get_n_stream() != 1 ||
+                    idx_view->get_idx()->get_n_kv() != idx_view->get_attn()->get_n_kv())) { return false; }
+        }
         if (!view || !ctx->graph_reserve(rows, 1, 1, view.get())) { return false; }
     }
     // Narrowing a reservation must not narrow the live cache or the next full view.
     auto full = memory->init_full();
+    if (dynamic_cast<llama_memory_hybrid_idx *>(memory)) {
+        const auto * idx_view = dynamic_cast<const llama_memory_hybrid_idx_context *>(full.get());
+        if (!idx_view) { return false; }
+        if (idx_view->get_idx() && idx_view->get_n_stream() != 2) { return false; }
+    }
     if (!full || !ctx->graph_reserve(4, 2, 2, full.get()) ||
             memory->seq_pos_max(0) >= 0 || memory->seq_pos_max(1) >= 0) { return false; }
     fprintf(stderr, "single-sequence full-cache graph reservation PASS\n");
