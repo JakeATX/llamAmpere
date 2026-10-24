@@ -3087,7 +3087,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     }
 
                     n_last[seq_one] = (int) result.size();
-                    if (!adaptive && dp.result->size() < (size_t) params.n_min) {
+                    if (!adaptive && dp.result->size() < (size_t) (dp.n_min >= 0 ? dp.n_min : params.n_min)) {
                         dp.result->clear();
                         dp.result_q->clear();
                         if (dp.conf_p1) {
@@ -3127,7 +3127,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 // the adaptive controller decides its own depth, so the generic n_min
                 // draft cutoff does not apply to it
-                if (!adaptive && dp.result->size() < (size_t) params.n_min) {
+                if (!adaptive && dp.result->size() < (size_t) (dp.n_min >= 0 ? dp.n_min : params.n_min)) {
                     dp.result->clear();
                     if (dp.conf_p1) {
                         spec_conf_clear(dp);
@@ -3483,7 +3483,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             // the adaptive controller decides its own depth, so the generic n_min
             // draft cutoff does not apply to it
-            if (!adaptive && dp.result->size() < (size_t) params.n_min) {
+            if (!adaptive && dp.result->size() < (size_t) (dp.n_min >= 0 ? dp.n_min : params.n_min)) {
                 dp.result->clear();
                 if (dp.conf_p1) {
                     spec_conf_clear(dp);

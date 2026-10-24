@@ -5464,6 +5464,10 @@ private:
                             /* .temp     = */ slot.task->params.sampling.temp,
                             /* .seed     = */ slot.task->params.sampling.seed,
                         };
+                        if (draft_budget[slot.id] >= 0) {
+                            common_speculative_get_draft_params(spec.get(), slot.id).n_min =
+                                std::min(params_base.speculative.draft.n_min, n_draft_req);
+                        }
 
                         if (spec_conflog_path()) {
                             slot.spec_conf_p1.clear();

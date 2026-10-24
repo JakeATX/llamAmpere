@@ -93,6 +93,9 @@ struct common_speculative_draft_params {
     std::vector<float> * conf_p2 = nullptr;
     int * conf_depth = nullptr;
 
+    // A shared verify budget can require fewer drafts than the configured minimum.
+    int32_t n_min = -1;
+
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
