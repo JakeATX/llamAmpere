@@ -5882,10 +5882,10 @@ static const char * gdn_khshare_expected(int64_t head_size, int64_t n_tokens, bo
     if (on != nullptr && atoi(on) == 0) {
         return nullptr;
     }
-    // the opt-in prompt kernels tried before it (Argon chunked, subwarp, R16) take these shapes first when switched on
+    // Chunked prefill is on by default; these prompt kernels run before the shared-key kernel.
     for (const char * pre : { "GGML_CUDA_GDN_CHUNKED", "GGML_CUDA_GDN_SUBWARP", "GGML_CUDA_GDN_R16" }) {
         const char * e = getenv(pre);
-        if (e != nullptr && atoi(e) != 0) {
+        if ((e != nullptr && atoi(e) != 0) || (e == nullptr && strcmp(pre, "GGML_CUDA_GDN_CHUNKED") == 0)) {
             return nullptr;
         }
     }
@@ -6583,6 +6583,13 @@ struct test_gated_delta_net_state_read : public test_case {
     }
     const char * required_fusion() override { return expect_fusion && !state_read_off() ? "gdn_state_read" : nullptr; }
     const char * forbidden_fusion() override { return expect_fusion ? nullptr : "gdn_state_read"; }
+
+    double max_nmse_err() override {
+        const char * chunked = getenv("GGML_CUDA_GDN_CHUNKED");
+        // Use the existing chunked output/state budget for the long recurrence.
+        return head_size == 128 && n_seq_tokens >= 64 && !kda && emit_mode == 0 &&
+               (chunked == nullptr || atoi(chunked) != 0) ? 1e-6 : test_case::max_nmse_err();
+    }
 
     void initialize_tensors(ggml_context * ctx) override {
         const bool mild_gate = n_seq_tokens >= 512 && head_size == 128 && K == 1 && !kda && emit_mode == 0;
