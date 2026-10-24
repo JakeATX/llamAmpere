@@ -5418,7 +5418,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         }
         if (multiple && uncoupled) {
             uint32_t n_routes = 0;
-            for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+            for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
                 n_routes = std::max(n_routes, hparams.n_expert_used(il));
             }
             const int capacity = ggml_backend_sched_moe_cache_decode_capacity(sched.get(), n_routes);
