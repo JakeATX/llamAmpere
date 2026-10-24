@@ -480,6 +480,7 @@ void llama_moe_arena_apply_flashnext_defaults() {
         { "GGML_CUDA_GET_ROWS_NARROW",            "1" },
         { "GGML_CUDA_GDN_R16",                    "1" },
         { "GGML_CUDA_TOPK_SELECT",                "1" },
+        { "GGML_CUDA_FA_SPARSE_G16",              "4" },
         { "LLAMA_HC_BF16_ONCE",                   "1" },
         { "LLAMA_QSA_POOL_RANGE",                 "1" },
         { "LLAMA_QSA_SEL_DIRECT",                 "1" },
