@@ -138,6 +138,9 @@ struct ggml_moe_cache_api {
     int (*device_prepare)(void * session, const struct ggml_moe_cache_tensor_desc * tensors, int n_tensors);
     int (*device_supports)(void * session, void * backend, const struct ggml_tensor * op);
 
+    // Maximum decode tokens for the active device cache; 0 when unavailable.
+    int (*decode_capacity)(void * session, int64_t n_expert_used);
+
     // Idle-turn lending only: release low-use slots, then restore capacity after prompt scratch is freed.
     size_t (*trim)(void * session, size_t bytes);
     size_t (*restore)(void * session);
@@ -164,6 +167,7 @@ GGML_API int ggml_backend_sched_moe_cache_warm(ggml_backend_sched_t sched,
         const uint64_t * const * counts, int n_tensors);
 
 GGML_API void ggml_backend_sched_moe_cache_print_stats(ggml_backend_sched_t sched);
+GGML_API int ggml_backend_sched_moe_cache_decode_capacity(ggml_backend_sched_t sched, int64_t n_expert_used);
 
 GGML_API int ggml_backend_sched_moe_cache_device_prepare(ggml_backend_sched_t sched,
         const struct ggml_moe_cache_tensor_desc * tensors, int n_tensors);

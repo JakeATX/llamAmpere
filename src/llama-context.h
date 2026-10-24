@@ -435,6 +435,7 @@ private:
 
     llama_memory_ptr memory;
     llama_moe_cache_ptr moe_cache;
+    bool moe_decode_split_logged = false;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};

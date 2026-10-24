@@ -7872,6 +7872,21 @@ static bool moe_cache_device_op_fits(const moe_cache_session & session, const gg
         ggml_get_op_params_i32(op, 3) != GGML_PREC_F32;
 }
 
+// fork: keep decode microbatches within both the host-plan and device-kernel limits.
+static int moe_cache_decode_capacity(void * opaque, int64_t n_expert_used) {
+    auto * session = (moe_cache_session *) opaque;
+    if (!session || !session->device_ready.load() || session->devices.size() != 1 ||
+            session->device_tables.empty() || n_expert_used <= 0 || n_expert_used > moe_cache_node_rows_max) {
+        return 0;
+    }
+    int capacity = std::min(session->config.max_batch, (int) (moe_cache_node_rows_max / n_expert_used));
+    const int cc = ggml_cuda_info().devices[session->devices[0]->logical].cc;
+    for (const auto & entry : session->device_tables) {
+        capacity = std::min(capacity, get_mmvq_mmid_max_batch((ggml_type) entry.second.desc.type, cc));
+    }
+    return capacity;
+}
+
 static int moe_cache_device_supports(void * opaque, void * backend, const ggml_tensor * op) {
     auto * session = (moe_cache_session *) opaque;
     auto * b = (ggml_backend_t) backend;
@@ -11260,6 +11275,7 @@ static void moe_cache_register(const void * owner) {
     api.print_stats = moe_cache_print_stats;
     api.device_prepare = moe_cache_device_prepare;
     api.device_supports = moe_cache_device_supports;
+    api.decode_capacity = moe_cache_decode_capacity;
     api.trim = moe_cache_lend;
     api.restore = moe_cache_return;
     api.prompt_resume = moe_cache_prompt_resume;
