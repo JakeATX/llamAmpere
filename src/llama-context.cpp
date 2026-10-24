@@ -2039,7 +2039,7 @@ void llama_context::detach_compute_borrower() {
     }
 }
 
-void llama_context::sched_reserve() {
+void llama_context::sched_reserve(bool suspend_prompt_cache) {
     if (!sched_need_reserve) {
         return;
     }
@@ -2130,6 +2130,12 @@ void llama_context::sched_reserve() {
     gf_res_prev_active = nullptr;
 
     if (preserve_cache) {
+        // fork: B1 will discard this cache before computing the prompt, so skip survivor refills for scratch lending.
+        if (suspend_prompt_cache && !b1_mc_suspended && ggml_backend_sched_moe_cache_suspend(sched.get())) {
+            b1_mc_suspended = true;
+            b1_cache_needs_refresh = true;
+            LLAMA_LOG_INFO("%s: [B1] expert cache suspended before scratch resize\n", __func__);
+        }
         size_t compute_bytes_before = 0;
         for (ggml_backend_t backend : backend_ptrs) {
             compute_bytes_before += ggml_backend_sched_get_buffer_size(sched.get(), backend);
@@ -2421,6 +2427,7 @@ void llama_context::sched_reserve() {
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
                                                    node_capacity, false, cparams.op_offload));
+                b1_mc_suspended = false;
                 sched_node_capacity = node_capacity;
                 sched_pipeline_parallel = false;
                 ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
@@ -5287,7 +5294,12 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
     const uint32_t previous = sched_reserve_tokens;
     sched_reserve_tokens = rows;
     sched_need_reserve = true;
-    sched_reserve();
+    const char * suspend_early = getenv("LLAMA_B1_EARLY_CACHE_SUSPEND");
+    const char * suspend_cache = getenv("LLAMA_B1_MOE_CACHE_SUSPEND");
+    const bool suspend_prompt_cache = b1 && alone && n_tokens >= 16384 &&
+        (b1_ffn_scratch_active || b1_layer_scratch_active) && suspend_early && suspend_early[0] == '1' &&
+        suspend_cache && suspend_cache[0] == '1';
+    sched_reserve(suspend_prompt_cache);
     if (rows < previous || trim_packed) {
         b1_cache_needs_refresh = true;
     }
@@ -5450,6 +5462,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     embd_seq.clear();
 
     g_decode_host_us.mark("pre");
+    struct b1_cache_guard {
+        llama_context & ctx;
+        ~b1_cache_guard() { ctx.b1_cache_resume(); }
+    } b1_cache_guard_ { *this };
     if (!prompt_buffers_resize(n_tokens_all, &batch_inp)) {
         return -2;
     }
@@ -6993,8 +7009,10 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
     // room when the experts are in RAM. Opt-in (LLAMA_B1_MOE_CACHE_SUSPEND=1): free its pool for this call when no
     // other sequence decodes from it; b1_end makes it again and it refills from decode. Off by default because the
     // refilled pool serves different experts than a pool that stayed warm, so later steps can differ in rounding.
-    b1_mc_suspended = !others && b1_ctx_env("LLAMA_B1_MOE_CACHE_SUSPEND", 0) != 0 &&
-                      b1_cache_graph_reset() && ggml_backend_sched_moe_cache_suspend(sched.get());
+    if (!b1_mc_suspended) {
+        b1_mc_suspended = !others && b1_ctx_env("LLAMA_B1_MOE_CACHE_SUSPEND", 0) != 0 &&
+                          b1_cache_graph_reset() && ggml_backend_sched_moe_cache_suspend(sched.get());
+    }
     if (b1_mc_suspended) {
         b1_cache_needs_refresh = true;
         LLAMA_LOG_WARN("%s: [B1] MoE expert cache suspended for this call\n", __func__);
