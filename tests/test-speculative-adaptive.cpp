@@ -234,6 +234,29 @@ static void test_row_budget(void) {
             assert(rows <= cap && rows > 0);
         }
     }
+    assert(common_speculative_row_budget({4, 4}, {-1, -1}, 6, 0, {{.99, .99, .99, .99}, {.1, .1, .1, .1}}) == std::vector<int32_t>({4, 0}));
+    assert(common_speculative_row_budget({4, 4}, {-1, -1}, 6, 0, {{.1}, {.99, .99, .99, .99}}) == std::vector<int32_t>({0, 4}));
+    assert(common_speculative_row_budget({4, 4}, {-1, -1}, 8, 0, {{0}, {0}}) == std::vector<int32_t>({0, 0}));
+    for (int g = 1; g <= 3; ++g) {
+        for (int a = 0; a <= 4; ++a) {
+            for (int b = 0; b <= 4; ++b) {
+                std::vector<int32_t> wishes(g, a), retained(g, -1);
+                wishes.back() = b;
+                for (int first = 0; first < g; ++first) {
+                    for (double p : {0.0, 0.5, 1.0}) {
+                        const auto rows = common_speculative_row_budget(wishes, retained, 8, first, std::vector<std::vector<double>>(g, std::vector<double>(4, p)));
+                        int total = 0;
+                        for (int i = 0; i < g; ++i) {
+                            assert(rows[i] >= 0 && rows[i] <= wishes[i]);
+                            total += 1 + rows[i];
+                        }
+                        assert(total <= 8);
+                        if (g == 1) { assert(rows == wishes); }
+                    }
+                }
+            }
+        }
+    }
     printf("test-speculative-adaptive: row budget OK\n");
 }
 

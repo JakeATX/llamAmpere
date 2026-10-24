@@ -1090,6 +1090,7 @@ struct server_slot {
     uint64_t              spec_restore_rounds   = 0;
     uint64_t              spec_restore_us       = 0;   // state load + seq_rm + sampler copy only
 
+    std::vector<double> verify_budget_accept;
     spec_adapt_ctrl       spec_adapt; // BL6a controller (inactive unless LLAMA_SPEC_ADAPT_COST=1)
 
     // fork: logging scratch only; no sampler, prompt-cache, or slot-state serialization.
@@ -1156,6 +1157,7 @@ struct server_slot {
         spec_restore_rounds = 0;
         spec_restore_us = 0;
         spec_adapt = {};
+        verify_budget_accept.clear();
 
         n_predict_max = -1;
 
@@ -5348,14 +5350,29 @@ private:
         std::vector<int32_t> draft_budget(slots.size(), -1);
         const char * budget_env = std::getenv("LLAMA_MOE_CACHE_DECODE_CHUNKS");
         const int32_t verify_capacity = generating.size() > 1 && (!budget_env || budget_env[0] != '0')
-            ? std::min(8, llama_moe_cache_decode_capacity(ctx_tgt)) : 0;
+            ? llama_moe_cache_decode_capacity(ctx_tgt) : 0;
         if (verify_capacity > 0) {
             std::vector<int32_t> requested, retained;
+            std::vector<std::vector<double>> acceptance;
             for (auto * slot : generating) {
-                requested.push_back(std::max(0, std::min(slot->get_n_draft_max(), common_speculative_n_max(spec.get()))));
+                int wish = std::max(0, std::min(slot->get_n_draft_max(), common_speculative_n_max(spec.get())));
+                if (slot->spec_draft.empty() && wish > 0) {
+                    if (spec_adapt_ctrl::enabled()) {
+                        if (!slot->spec_adapt.active()) {
+                            slot->spec_adapt.reset(common_speculative_n_max(spec.get()));
+                        }
+                        wish = std::min(wish, slot->spec_adapt.pick());
+                    }
+                    if (const int dm = spec_depth_mix::get().pick(); dm > 0) {
+                        wish = std::min(wish, dm);
+                    }
+                }
+                requested.push_back(wish);
+                slot->verify_budget_accept.resize(common_speculative_n_max(spec.get()), 0.85);
+                acceptance.push_back(slot->spec_adapt.active() ? slot->spec_adapt.p : slot->verify_budget_accept);
                 retained.push_back(slot->spec_draft.empty() ? -1 : (int32_t) slot->spec_draft.size());
             }
-            const auto budget = common_speculative_row_budget(requested, retained, verify_capacity, verify_budget_next);
+            const auto budget = common_speculative_row_budget(requested, retained, verify_capacity, verify_budget_next, acceptance);
             verify_budget_next = (verify_budget_next + 1) % generating.size();
             std::vector<server_slot *> admitted;
             for (size_t i = 0; i < generating.size(); ++i) {
@@ -5422,7 +5439,7 @@ private:
                         slot.spec_clock.mark(server_bookkeep_clock::PROMPT);
 
                         int n_draft_req = n_draft_max;
-                        if (spec_adapt_ctrl::enabled()) {
+                        if (draft_budget[slot.id] < 0 && spec_adapt_ctrl::enabled()) {
                             if (!slot.spec_adapt.active()) {
                                 slot.spec_adapt.reset(common_speculative_n_max(spec.get()));
                             }
@@ -5431,7 +5448,7 @@ private:
                                 n_draft_req = std::min(n_draft_req, d);
                             }
                         }
-                        if (const int dm = spec_depth_mix::get().pick(); dm > 0) {
+                        if (const int dm = draft_budget[slot.id] < 0 ? spec_depth_mix::get().pick() : 0; dm > 0) {
                             n_draft_req = std::min(n_draft_req, dm);
                         }
 
@@ -5543,6 +5560,11 @@ private:
         iterate(generating, [&](server_slot & slot) {
             slot.handle_last_sampled_token(batch);
         });
+
+        if (verify_capacity > 0 && batch.size() > verify_capacity && generating.size() > 1) {
+            SRV_ERR("concurrent verify row budget exceeded: %d > %d\n", batch.size(), verify_capacity);
+            GGML_ASSERT(batch.size() <= verify_capacity);
+        }
 
         // process in chunks of params.n_batch
         int32_t n_batch  = llama_n_batch(ctx_tgt);
@@ -7051,6 +7073,14 @@ private:
                 }
                 slot.t_spec_round_last = t_now;
                 slot.spec_draft_us_pending = 0;
+            }
+
+            for (size_t k = 0; k < slot.verify_budget_accept.size() && k < n_draft; ++k) {
+                if (k > n_accepted) {
+                    break;
+                }
+                const double accepted = k < n_accepted ? 1.0 : 0.0;
+                slot.verify_budget_accept[k] += 0.05 * (accepted - slot.verify_budget_accept[k]);
             }
 
             auto & n_accepted_per_pos = slot.n_accepted_per_pos;

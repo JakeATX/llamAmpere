@@ -182,4 +182,5 @@ common_speculative_init_result_ptr common_speculative_init_from_params(common_pa
 // Each admitted sequence needs one target row. Retained drafts must stay whole; -1 means a fresh draft.
 // A result of -1 defers the sequence. A zero result must skip drafting, not set draft_params.n_max to zero.
 std::vector<int32_t> common_speculative_row_budget(const std::vector<int32_t> & requested,
-        const std::vector<int32_t> & retained, int32_t capacity, size_t first);
+        const std::vector<int32_t> & retained, int32_t capacity, size_t first,
+        const std::vector<std::vector<double>> & acceptance = {});

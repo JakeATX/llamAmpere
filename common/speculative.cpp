@@ -5419,8 +5419,10 @@ void common_speculative_print_stats(const common_speculative * spec) {
 }
 
 std::vector<int32_t> common_speculative_row_budget(const std::vector<int32_t> & requested,
-        const std::vector<int32_t> & retained, int32_t capacity, size_t first) {
+        const std::vector<int32_t> & retained, int32_t capacity, size_t first,
+        const std::vector<std::vector<double>> & acceptance) {
     GGML_ASSERT(requested.size() == retained.size());
+    GGML_ASSERT(acceptance.empty() || acceptance.size() == requested.size());
     std::vector<int32_t> budget(requested.size(), -1);
     if (requested.empty()) {
         return budget;
@@ -5446,17 +5448,29 @@ std::vector<int32_t> common_speculative_row_budget(const std::vector<int32_t> & 
             left -= rows + 1;
         }
     }
-    bool progress = true;
-    while (left > 0 && progress) {
-        progress = false;
-        for (size_t k = 0; k < requested.size() && left > 0; ++k) {
+    while (left > 0) {
+        size_t best = requested.size();
+        double best_value = -1.0;
+        for (size_t k = 0; k < requested.size(); ++k) {
             const size_t i = (first + k) % requested.size();
-            if (budget[i] >= 0 && retained[i] < 0 && budget[i] < requested[i]) {
-                ++budget[i];
-                --left;
-                progress = true;
+            if (budget[i] < 0 || retained[i] >= 0 || budget[i] >= requested[i]) {
+                continue;
+            }
+            double value = 1.0;
+            for (int32_t d = 0; d <= budget[i]; ++d) {
+                const double p = !acceptance.empty() && (size_t) d < acceptance[i].size() ? acceptance[i][d] : 0.85;
+                value *= std::isfinite(p) ? std::max(0.0, std::min(1.0, p)) : 0.85;
+            }
+            if (value > best_value || (value == best_value && best < requested.size() && budget[i] < budget[best])) {
+                best = i;
+                best_value = value;
             }
         }
+        if (best == requested.size() || best_value <= 0.0) {
+            break;
+        }
+        ++budget[best];
+        --left;
     }
     return budget;
 }
