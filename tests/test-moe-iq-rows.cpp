@@ -57,7 +57,7 @@ int main(int argc, char ** argv) {
     const int copies = argc > 2 ? std::max(1, atoi(argv[2])) : 256;
     ggml_cpu_init();
     const int64_t n_in = 2560, n_out = 640;
-    const int NT = 4;
+    const int NT = 8;
     const ggml_type types[] = { GGML_TYPE_IQ3_S, GGML_TYPE_IQ2_S, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ3_XXS };
     const int NM = 7;                                   // ggml + 6 row-kernel settings
     const int var_of[NM] = { -1, 0, 1, 2, 4, 0, 1 | 8 };

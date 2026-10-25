@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -133,13 +134,13 @@ int main(int argc, char ** argv) {
     const size_t ram_mb = argc > 2 ? (size_t) atol(argv[2]) : 2048;
     FILE * output = argc > 3 ? fopen(argv[3], "wb") : nullptr;
     if (argc > 3 && !output) { perror("output file"); return 1; }
-    ram_ceiling(cpus, ram_mb << 20);
+    if (ram_mb) { ram_ceiling(cpus, ram_mb << 20); }
 
     // Part 2: the pool. The calling thread plays the card's driver thread (pinned to cpu 0, which the pool skips).
     pin_self(0);
     ggml_cpu_init();
     const int64_t n_embd = 2560, n_ff = 640;
-    const int n_expert = 128;
+    const int n_expert = argc > 3 ? std::max(4, atoi(argv[3])) : 128;
     struct layer_spec { ggml_type up, down; };
     const layer_spec specs[] = {
         { GGML_TYPE_IQ3_S,   GGML_TYPE_Q2_0 },  { GGML_TYPE_IQ2_S,   GGML_TYPE_Q2_0 },
@@ -172,6 +173,50 @@ int main(int argc, char ** argv) {
             return 1;
         }
     }
+    // Post card-shaped jobs without CUDA: repeated token IDs span different experts.
+    double warm_ns, warm_ph[4];
+    const int warm_expert = 0;
+    moe_cs_bench(0, &warm_expert, 1, 1, 1, &warm_ns, warm_ph);
+    unsigned long long seq = 0, hash = 14695981039346656037ull;
+    for (int l = 0; l < n_layers; ++l) {
+        for (int pass = 0; pass < 16; ++pass) {
+            const int nt = 1 + pass % 8;
+            job->layer = l;
+            job->n_exp = 4;
+            job->n_route = 4 * nt;
+            for (int e = 0; e < 4; ++e) {
+                job->expert[e] = e;
+                job->first[e] = e * nt;
+                for (int t = 0; t < nt; ++t) {
+                    const int q = e * nt + t;
+                    job->input_row[q] = pass < 8 ? t : q;
+                    for (int64_t r = 0; r < n_embd; ++r) {
+                        x[(size_t) q * x_stride + r] = 0.02f * (float) ((int) (((job->input_row[q] + 1) * 131 + r * 7919) % 101) - 50);
+                    }
+                }
+            }
+            job->first[4] = 4 * nt;
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            job->seq = ++seq;
+            const auto deadline = clk::now() + std::chrono::seconds(30);
+            while (job->done != seq) {
+                if (clk::now() > deadline) { fprintf(stderr, "pool parity timeout\n"); std::_Exit(1); }
+                _mm_pause();
+            }
+            std::atomic_thread_fence(std::memory_order_acquire);
+            for (int q = 0; q < 4 * nt; ++q) {
+                for (int64_t r = 0; r < n_embd; ++r) {
+                    const float v = out[(size_t) q * out_stride + r];
+                    if (!std::isfinite(v)) { fprintf(stderr, "non-finite pool output\n"); std::_Exit(1); }
+                    const unsigned char * b = (const unsigned char *) &v;
+                    for (size_t i = 0; i < sizeof(v); ++i) { hash = (hash ^ b[i]) * 1099511628211ull; }
+                }
+            }
+        }
+    }
+    printf("pool parity: 96 jobs, widths 1..8, four experts, shared and distinct inputs, output hash %016llx\n", hash);
+    fflush(stdout);
+    if (argc > 4 && strcmp(argv[4], "check") == 0) { std::_Exit(0); }
     printf("\npool: %d threads; one route per expert; 128 experts per layer rotate (cold) or the same experts repeat (hot)\n",
            moe_cs_threads());
     printf("  %-8s %-7s n_exp | cold: us/job  up+gate us (GB/s)  down us (GB/s) | hot: us/job  up+gate us (GB/s)  down us (GB/s)\n",

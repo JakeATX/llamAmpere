@@ -1,6 +1,6 @@
 #pragma once
 // fork STRATAGAP: AVX2 row kernels for the IQ up/gate weights of the host expert pool (GGML_MOE_CPU_SPLIT_ROWS=1,
-// default off). One call computes rows [r0, r1) of one expert for NT = 1..4 tokens. Each 32-weight chunk is decoded
+// default off). One call computes rows [r0, r1) of one expert for NT = 1..8 tokens. Each 32-weight chunk is decoded
 // once (grid magnitudes, sign bytes, scale vector) and then multiplied with every token's activations; ggml's
 // vec_dot decodes it again for every token.
 //
@@ -239,11 +239,15 @@ template <class F> rows_fn pick(int nt, bool two_rows) {
         case 2: return rows<F, 2, 1>;
         case 3: return rows<F, 3, 1>;
         case 4: return rows<F, 4, 1>;
+        case 5: return rows<F, 5, 1>;
+        case 6: return rows<F, 6, 1>;
+        case 7: return rows<F, 7, 1>;
+        case 8: return rows<F, 8, 1>;
         default: return nullptr;
     }
 }
 
-// The kernel for `type` and nt tokens (1..4), or null when the type has none (or `variant` gives that case to ggml).
+// The kernel for `type` and nt tokens (1..8), or null when the type has none (or `variant` gives that case to ggml).
 // variant bits: 1 = IQ3_XXS grid entries joined in general registers (the _pair decode); 2 = two rows per tile for
 // one token; 4 = the same _pair decode for IQ3_S; 8 = one token of IQ2_S or IQ3_XXS stays on ggml's vec_dot (the
 // two types where ggml's single-token loop measured faster than ours on Zen 3 and Zen 5).

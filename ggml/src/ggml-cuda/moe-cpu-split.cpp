@@ -375,7 +375,7 @@ struct role_math {
     ggml_from_float_t quant = nullptr;
     size_t vec_bytes = 0;       // bytes of one quantized input row
 #if defined(MOE_IQ_ROWS)
-    moe_iq::rows_fn rows[5] = {};   // GGML_MOE_CPU_SPLIT_ROWS: row kernel for 1..4 tokens (IQ up/gate types)
+    moe_iq::rows_fn rows[9] = {};   // IQ up/gate kernels for 1..8 tokens
 #endif
 };
 
@@ -405,6 +405,9 @@ struct pool_state {
     int n_exp = 0, n_route = 0;
     int expert[MOE_CS_MAX_EXPERTS] = {};
     int first[MOE_CS_MAX_EXPERTS + 1] = {};
+    int input_of[MOE_CS_MAX_ROUTES] = {}, inputs[MOE_CS_MAX_ROUTES] = {}, n_input = 0;
+    bool q8_reuse = false;
+    int group_tokens = 4;
     std::vector<uint8_t> xq;    // [2][MOE_CS_MAX_ROUTES] quantized input rows
     size_t xq_stride = 0;
     std::vector<float> hidden;  // [MOE_CS_MAX_ROUTES][max_ff]
@@ -445,7 +448,7 @@ pool_state & P() {
 int items_of(const pool_state & s, int phase) {
     const layer_math & L = *s.cur;
     switch (phase) {
-        case 0: return s.n_route * (L.shared_input ? 1 : 2);
+        case 0: return s.n_input * (L.shared_input ? 1 : 2);
         case 1: return s.n_exp * (int) ((L.role[0].r.n_out + s.rows_ug - 1) / s.rows_ug);
         case 2: return s.n_route;
         default: return s.n_exp * (int) ((L.role[2].r.n_out + s.rows_down - 1) / s.rows_down);
@@ -462,8 +465,8 @@ const char * role_row(pool_state & s, const role_math & m, int expert, int64_t r
 void run_item(pool_state & s, int phase, int item) {
     const layer_math & L = *s.cur;
     if (phase == 0) {
-        const int nr = s.n_route;
-        const int k = item / nr, q = item % nr;
+        const int nr = s.n_input;
+        const int k = item / nr, q = s.inputs[item % nr];
         const role_math & m = L.role[k];
         m.quant(s.x + (size_t) q * s.x_stride, s.xq.data() + ((size_t) k * MOE_CS_MAX_ROUTES + q) * s.xq_stride, m.r.n_in);
         return;
@@ -502,19 +505,20 @@ void run_item(pool_state & s, int phase, int item) {
             const char * wu = role_row(s, up, e, 0);
             const char * wg = role_row(s, gate, e, 0);
             const int nb = (int) (up.r.n_in / QK_K);
-            for (int q0 = s.first[i]; q0 < s.first[i + 1]; q0 += 4) {
-                const int nt = std::min(4, s.first[i + 1] - q0);
-                const block_q8_K * yu[4];
-                const block_q8_K * yg[4];
+            for (int q0 = s.first[i]; q0 < s.first[i + 1]; q0 += s.group_tokens) {
+                const int nt = std::min(s.group_tokens, s.first[i + 1] - q0);
+                const block_q8_K * yu[8];
+                const block_q8_K * yg[8];
                 for (int t = 0; t < nt; ++t) {
-                    yu[t] = (const block_q8_K *) (s.xq.data() + (size_t) (q0 + t) * s.xq_stride);
-                    yg[t] = (const block_q8_K *) (s.xq.data() + (xg + q0 + t) * s.xq_stride);
+                    const int q = s.input_of[q0 + t];
+                    yu[t] = (const block_q8_K *) (s.xq.data() + (size_t) q * s.xq_stride);
+                    yg[t] = (const block_q8_K *) (s.xq.data() + (xg + q) * s.xq_stride);
                 }
                 for (int64_t a = r0; a < r1; a += 16) {
                     const int64_t b = std::min<int64_t>(a + 16, r1);
-                    float ub[4][16], gb[4][16];
-                    float * uo[4] = { ub[0], ub[1], ub[2], ub[3] };
-                    float * go[4] = { gb[0], gb[1], gb[2], gb[3] };
+                    float ub[8][16], gb[8][16];
+                    float * uo[8], * go[8];
+                    for (int t = 0; t < nt; ++t) { uo[t] = ub[t]; go[t] = gb[t]; }
                     if (wu && wg) {
                         proj(up, wu, nt, a, b, nb, yu, uo);
                         proj(gate, wg, nt, a, b, nb, yg, go);
@@ -539,8 +543,9 @@ void run_item(pool_state & s, int phase, int item) {
             for (int q = s.first[i]; q < s.first[i + 1]; ++q) {
                 float u = 0.0f, g = 0.0f;
                 if (wu && wg) {
-                    const uint8_t * xu = s.xq.data() + (size_t) q * s.xq_stride;
-                    const uint8_t * xgp = s.xq.data() + (xg + q) * s.xq_stride;
+                    const int input = s.input_of[q];
+                    const uint8_t * xu = s.xq.data() + (size_t) input * s.xq_stride;
+                    const uint8_t * xgp = s.xq.data() + (xg + input) * s.xq_stride;
                     if (up.q2) { dot_q2_0_q8_0((int) up.r.n_in, &u, wu, xu); } else { up.dot((int) up.r.n_in, &u, 0, wu, 0, xu, 0, 1); }
                     if (gate.q2) { dot_q2_0_q8_0((int) gate.r.n_in, &g, wg, xgp); } else { gate.dot((int) gate.r.n_in, &g, 0, wg, 0, xgp, 0, 1); }
                 }
@@ -744,6 +749,18 @@ void leader_main(pool_state * sp, int cpu) {
             sane = s.expert[i] >= 0 && s.expert[i] < s.cur->role[0].r.n_expert;
         }
         if (s.cur && sane && s.n_exp > 0 && s.first[0] == 0) {
+            s.n_input = 0;
+            for (int q = 0; q < s.n_route; ++q) {
+                int input = q;
+                if (s.q8_reuse && card) {
+                    for (int j = 0; j < s.n_input; ++j) {
+                        const int prev = s.inputs[j];
+                        if (s.job->input_row[prev] == s.job->input_row[q]) { input = prev; break; }
+                    }
+                }
+                s.input_of[q] = input;
+                if (input == q) { s.inputs[s.n_input++] = q; }
+            }
             ++n;
             for (int p = 0; p < 4; ++p) { s.next[p].store(0, std::memory_order_relaxed); }
             s.gen.store(n, std::memory_order_seq_cst);
@@ -795,6 +812,8 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
     s.hidden.assign((size_t) MOE_CS_MAX_ROUTES * max_ff, 0.0f);
     s.hq.assign(MOE_CS_MAX_ROUTES * s.hq_stride, 0);
     s.q2_fast = env_int("GGML_MOE_CPU_SPLIT_Q2_FAST", 0, 0, 1) != 0;
+    s.q8_reuse = env_int("GGML_MOE_CPU_SPLIT_Q8_REUSE", 0, 0, 1) != 0;
+    s.group_tokens = env_int("GGML_MOE_CPU_SPLIT_REUSE8", 0, 0, 1) ? 8 : 4;
 #if defined(MOE_CS_AVX512)
     s.avx512 = env_int("GGML_MOE_CPU_SPLIT_AVX512", 0, 0, 1) != 0 && cpu_has_avx512_vnni();
 #endif
@@ -900,6 +919,7 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
     if (s.iq_rows) { fprintf(stderr, "[moe-cpu-split] IQ up/gate row kernels (each chunk decoded once per expert), variant %d, prefetch %d B\n", s.iq_variant, s.iq_pf); }
     if (s.schedule) { fprintf(stderr, "[moe-cpu-split] static quantization rows, grouped math claims\n"); }
     if (s.host_help) { fprintf(stderr, "[moe-cpu-split] waiting host drains math tiles on cpu %d\n", s.host_cpu); }
+    fprintf(stderr, "[moe-cpu-split] input Q8 reuse %s, IQ token group %d\n", s.q8_reuse ? "on" : "off", s.group_tokens);
     return true;
 }
 
@@ -957,7 +977,7 @@ bool moe_cs_register_layer(int layer, const moe_cs_role roles[3]) {
 #endif
         m.vec_type = tr->vec_dot_type;
 #if defined(MOE_IQ_ROWS)
-        for (int nt = 1; nt <= 4; ++nt) {
+        for (int nt = 1; nt <= s.group_tokens; ++nt) {
             m.rows[nt] = s.iq_rows && !s.avx512 && k < 2 && m.vec_type == GGML_TYPE_Q8_K ? moe_iq::get(m.r.type, nt, s.iq_variant) : nullptr;
         }
 #endif

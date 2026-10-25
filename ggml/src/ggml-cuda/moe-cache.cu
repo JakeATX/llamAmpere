@@ -9261,6 +9261,9 @@ static __global__ void __launch_bounds__(256) moe_hf_plan_fast_kernel(const moe_
                 job->layer = args.cs_layer;
                 job->n_exp = n_exp;
                 job->n_route = n_route;
+                for (int b = 0; b < n_route; ++b) {
+                    job->input_row[b] = args.cs_x_per_slot ? plan->route[b] : plan->route[b] / args.cs_n_ids;
+                }
                 for (int i = 0; i < n_exp; ++i) { job->expert[i] = plan->expert[i]; }
                 for (int i = 0; i <= n_exp; ++i) { job->first[i] = plan->first[i]; }
                 __threadfence_system();
@@ -9429,6 +9432,7 @@ static __global__ void moe_cs_publish_kernel(moe_cs_plan_dev * plan, moe_cs_job 
     job->layer = layer;
     job->n_exp = n_exp;
     job->n_route = n_route;
+    for (int b = 0; b < n_route; ++b) { job->input_row[b] = x_per_slot ? plan->route[b] : plan->route[b] / n_ids; }
     for (int i = 0; i < n_exp; ++i) { job->expert[i] = plan->expert[i]; }
     for (int i = 0; i <= n_exp; ++i) { job->first[i] = plan->first[i]; }
     __threadfence_system();
