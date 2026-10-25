@@ -321,5 +321,5 @@ LLAMA_API void llama_set_next_decode_phase(struct llama_context * ctx, enum llam
 LLAMA_API bool llama_parse_moe_keep_map(const char * text, int32_t n_layer, int32_t & keep_default,
                                         std::vector<int32_t> & keep_layer, std::string & error);
 
-// Maximum cached verify tokens for the active expert provider, or zero when unavailable.
+// Planned cached verify limit, available before deferred tables are initialized; zero without a provider.
 LLAMA_API int32_t llama_moe_cache_decode_capacity(const struct llama_context * ctx);

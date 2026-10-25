@@ -3668,11 +3668,13 @@ int ggml_backend_sched_moe_cache_device_prepare(ggml_backend_sched_t sched,
     return sched->moe_cache_api.device_prepare(sched->moe_cache_session, tensors, n_tensors);
 }
 
-int ggml_backend_sched_moe_cache_decode_capacity(ggml_backend_sched_t sched, int64_t n_expert_used) {
-    if (!sched || !sched->moe_cache_session || !sched->moe_cache_api.decode_capacity || n_expert_used <= 0) {
+int ggml_backend_sched_moe_cache_decode_capacity(ggml_backend_sched_t sched, int64_t n_expert_used,
+        const int32_t * types, int n_types) {
+    if (!sched || !sched->moe_cache_session || !sched->moe_cache_api.decode_capacity || n_expert_used <= 0 ||
+            !types || n_types <= 0) {
         return 0;
     }
-    return sched->moe_cache_api.decode_capacity(sched->moe_cache_session, n_expert_used);
+    return sched->moe_cache_api.decode_capacity(sched->moe_cache_session, n_expert_used, types, n_types);
 }
 
 void ggml_backend_sched_moe_cache_print_stats(ggml_backend_sched_t sched) {

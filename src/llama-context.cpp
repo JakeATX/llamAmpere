@@ -9679,12 +9679,28 @@ void llama_set_next_decode_phase(llama_context * ctx, enum llama_decode_phase ph
 }
 
 int32_t llama_moe_cache_decode_capacity(const llama_context * ctx) {
-    const auto & hp = ctx->get_model().hparams;
+    const auto & model = ctx->get_model();
+    const auto & hp = model.hparams;
     uint32_t routes = 0;
     for (uint32_t il = 0; il < hp.n_layer(); ++il) {
         routes = std::max(routes, hp.n_expert_used(il));
     }
-    return ggml_backend_sched_moe_cache_decode_capacity(ctx->get_sched(), routes);
+    if (routes == 0) {
+        return 0;
+    }
+    // Device tables are deliberately prepared only after a small decode reserves
+    // its outputs. Their absence must not disable the budget needed to reach it.
+    std::vector<int32_t> types;
+    for (const auto & entry : model.tensors_by_name) {
+        const auto * tensor = entry.second;
+        if (entry.first.find("_exps") != std::string::npos && tensor->buffer &&
+                ggml_backend_buffer_is_host(tensor->buffer) && tensor->ne[2] == hp.n_expert &&
+                ggml_moe_cache_wtype_supported(tensor->type) &&
+                std::find(types.begin(), types.end(), (int32_t) tensor->type) == types.end()) {
+            types.push_back((int32_t) tensor->type);
+        }
+    }
+    return ggml_backend_sched_moe_cache_decode_capacity(ctx->get_sched(), routes, types.data(), (int) types.size());
 }
 
 int32_t llama_n_threads(llama_context * ctx) {

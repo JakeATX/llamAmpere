@@ -7873,16 +7873,24 @@ static bool moe_cache_device_op_fits(const moe_cache_session & session, const gg
 }
 
 // fork: keep decode microbatches within both the host-plan and device-kernel limits.
-static int moe_cache_decode_capacity(void * opaque, int64_t n_expert_used) {
+static int moe_cache_decode_capacity(void * opaque, int64_t n_expert_used, const int32_t * types, int n_types) {
     auto * session = (moe_cache_session *) opaque;
-    if (!session || !session->device_ready.load() || session->devices.size() != 1 ||
-            session->device_tables.empty() || n_expert_used <= 0 || n_expert_used > moe_cache_node_rows_max) {
+    const char * enabled = getenv("GGML_MOE_CACHE_DEVICE");
+    // The first concurrent verify may exceed the eight-token prepare gate.
+    // Bound it from model types first, leaving allocation at its safe decode boundary.
+    if (!session || !enabled || strcmp(enabled, "1") != 0 || session->devices.size() != 1 ||
+            session->dormant || session->stopping || !types || n_types <= 0 ||
+            n_expert_used <= 0 || n_expert_used > moe_cache_node_rows_max ||
+            (session->device_attempted && !session->device_ready.load())) {
         return 0;
     }
     int capacity = std::min(session->config.max_batch, (int) (moe_cache_node_rows_max / n_expert_used));
     const int cc = ggml_cuda_info().devices[session->devices[0]->logical].cc;
-    for (const auto & entry : session->device_tables) {
-        capacity = std::min(capacity, get_mmvq_mmid_max_batch((ggml_type) entry.second.desc.type, cc));
+    for (int i = 0; i < n_types; ++i) {
+        if (!ggml_moe_cache_wtype_supported((ggml_type) types[i])) {
+            return 0;
+        }
+        capacity = std::min(capacity, get_mmvq_mmid_max_batch((ggml_type) types[i], cc));
     }
     return capacity;
 }
