@@ -1169,6 +1169,20 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const 
     return builder;
 }
 
+// CUDA_Host_W buffer type of the clip backend, nullptr when --mmproj-host-weights is off or the backend has none
+static ggml_backend_buffer_type_t clip_host_weights_buft(const clip_ctx & ctx_clip) {
+    if (!ctx_clip.host_weights || ctx_clip.backend == ctx_clip.backend_cpu) {
+        return nullptr;
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(ctx_clip.backend);
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    typedef ggml_backend_buffer_type_t (*host_weights_buft_fn)(void);
+    auto get_host_weights_buft = reg
+        ? (host_weights_buft_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_get_host_weights_buffer_type")
+        : nullptr;
+    return get_host_weights_buft ? get_host_weights_buft() : nullptr;
+}
+
 //
 // clip_model_loader
 //
@@ -2214,6 +2228,10 @@ struct clip_model_loader {
             throw std::runtime_error(string_format("%s: failed to init ggml context\n", __func__));
         }
 
+        // host weights count as host memory; the device keeps the largest weight for the staging copy
+        ggml_backend_buffer_type_t host_weights_buft = clip_host_weights_buft(ctx_clip);
+        ggml_backend_dev_t weights_dev = ggml_backend_get_device(ctx_clip.backend);
+
         // helper function
         std::unordered_set<std::string> loaded_tensor_names;
         auto get_tensor = [&](const std::string & name, bool required = true) {
@@ -2232,7 +2250,12 @@ struct clip_model_loader {
                 loaded_tensor_names.insert(name);
                 cur = data_tensor;
                 // add to weight memory counter
-                ctx_clip.mem_usage[ggml_backend_get_device(ctx_clip.backend)] += ggml_nbytes(cur);
+                if (host_weights_buft) {
+                    ctx_clip.mem_usage[ggml_backend_get_device(ctx_clip.backend_cpu)] += ggml_nbytes(cur);
+                    ctx_clip.mem_usage[weights_dev] = std::max(ctx_clip.mem_usage[weights_dev], ggml_nbytes(cur));
+                } else {
+                    ctx_clip.mem_usage[weights_dev] += ggml_nbytes(cur);
+                }
             }
             return cur;
         };
@@ -3717,12 +3740,7 @@ struct clip_model_loader {
             // weights in pinned host memory, compute stays on the GPU; uses CUDA_Host_W, not the shared host buft that holds model inputs
             if (ctx_clip.host_weights && ctx_clip.backend != ctx_clip.backend_cpu) {
                 ggml_backend_dev_t dev = ggml_backend_get_device(ctx_clip.backend);
-                ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
-                typedef ggml_backend_buffer_type_t (*host_weights_buft_fn)(void);
-                auto get_host_weights_buft = reg
-                    ? (host_weights_buft_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_get_host_weights_buffer_type")
-                    : nullptr;
-                ggml_backend_buffer_type_t host_buft = get_host_weights_buft ? get_host_weights_buft() : nullptr;
+                ggml_backend_buffer_type_t host_buft = host_weights_buft;
                 if (host_buft != nullptr) {
                     ggml_backend_buffer_t host_buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx_clip.ctx_data.get(), host_buft);
                     if (host_buf != nullptr) {
@@ -3741,6 +3759,12 @@ struct clip_model_loader {
             }
             if (!ctx_clip.buf) {
                 ctx_clip.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_clip.ctx_data.get(), buft));
+            }
+            // pinning failed: the weights are in device memory after all, move them back in the estimate
+            if (host_weights_buft && buft != host_weights_buft) {
+                ggml_backend_dev_t cpu_dev = ggml_backend_get_device(ctx_clip.backend_cpu);
+                ctx_clip.mem_usage[weights_dev] = ctx_clip.mem_usage[cpu_dev];
+                ctx_clip.mem_usage.erase(cpu_dev);
             }
             ggml_backend_buffer_set_usage(ctx_clip.buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
             // read the weight from file
