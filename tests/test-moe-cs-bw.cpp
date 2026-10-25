@@ -1,6 +1,6 @@
 // fork STRATAGAP: how fast the host expert pool (GGML_MOE_CPU_SPLIT) runs against what the RAM can deliver.
 //
-//   test-moe-cs-bw <cpu,cpu,...>       e.g. 11,10,9,8,7,6,5,4,3,2,1,0
+//   test-moe-cs-bw <cpu,cpu,...> [RAM MiB] [output file]
 //
 // Part 1, RAM read ceiling: threads pinned to the first 1..N cpus of the list each stream their own slice of a
 // large buffer (AVX2 loads); prints GB/s for each thread count.
@@ -131,6 +131,8 @@ int main(int argc, char ** argv) {
         if (*c == ',') { ++c; }
     }
     const size_t ram_mb = argc > 2 ? (size_t) atol(argv[2]) : 2048;
+    FILE * output = argc > 3 ? fopen(argv[3], "wb") : nullptr;
+    if (argc > 3 && !output) { perror("output file"); return 1; }
     ram_ceiling(cpus, ram_mb << 20);
 
     // Part 2: the pool. The calling thread plays the card's driver thread (pinned to cpu 0, which the pool skips).
@@ -183,7 +185,13 @@ int main(int argc, char ** argv) {
         for (int ne : { 1, 2, 3, 4, 8 }) {
             double cns, cph[4], hns, hph[4];
             moe_cs_bench(l, all.data(), n_expert, ne, 400, &cns, cph);
+            if (output && fwrite(out.data(), sizeof(float), (size_t) ne * out_stride, output) != (size_t) ne * out_stride) {
+                perror("cold output"); return 1;
+            }
             moe_cs_bench(l, all.data(), ne, ne, 400, &hns, hph);
+            if (output && fwrite(out.data(), sizeof(float), (size_t) ne * out_stride, output) != (size_t) ne * out_stride) {
+                perror("hot output"); return 1;
+            }
             if (ne == 8) {   // output check: compare this line between runs with and without a switch
                 double sum = 0.0, sabs = 0.0;
                 for (int q = 0; q < ne; ++q) {
@@ -205,5 +213,6 @@ int main(int argc, char ** argv) {
     }
     printf(")\n");
     fflush(stdout);
+    if (output && fclose(output) != 0) { perror("close output"); return 1; }
     std::_Exit(0);   // pool threads never exit
 }

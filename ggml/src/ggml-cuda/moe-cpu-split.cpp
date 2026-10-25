@@ -418,6 +418,7 @@ struct pool_state {
     bool iq_rows = false;      // GGML_MOE_CPU_SPLIT_ROWS: moe-iq-rows.h kernels, each chunk decoded once per expert
     int iq_variant = -1;       // moe_iq::get variant bits (GGML_MOE_CPU_SPLIT_ROWS: 1 = best mix, 2..17 = bits + 2)
     int iq_pf = 0;             // GGML_MOE_CPU_SPLIT_PF: prefetch distance of those kernels in bytes (0 = off)
+    bool schedule = false;    // Assign quantization rows directly and claim math tiles in small groups.
 
     alignas(64) std::atomic<unsigned long long> gen{0};
     alignas(64) std::atomic<int> next[4];
@@ -578,14 +579,25 @@ void run_item(pool_state & s, int phase, int item) {
 
 // Every thread runs all four phases of job number `n` (1-based); the fin counters only grow, so a thread that is
 // late to notice a finished phase never misses it.
-void run_job_phases(pool_state & s, unsigned long long n, bool lead = false) {
+void run_job_phases(pool_state & s, unsigned long long n, int worker, bool lead = false) {
     const unsigned long long target = n * (unsigned long long) s.threads;
     auto t = clk::now();
     for (int p = 0; p < 4; ++p) {
         const int total = items_of(s, p);
-        for (int it = s.next[p].fetch_add(1, std::memory_order_relaxed); it < total;
-                it = s.next[p].fetch_add(1, std::memory_order_relaxed)) {
-            run_item(s, p, it);
+        if (s.schedule && (p == 0 || p == 2)) {
+            // Each row has one writer. The phase barrier publishes it before any consumer runs.
+            for (int it = worker; it < total; it += s.threads) {
+                run_item(s, p, it);
+            }
+        } else {
+            // Keep at least three claims per worker, with at most four adjacent tiles per claim.
+            const int chunk = s.schedule ? std::max(1, std::min(4, total / (3 * s.threads))) : 1;
+            for (int begin = s.next[p].fetch_add(chunk, std::memory_order_relaxed); begin < total;
+                    begin = s.next[p].fetch_add(chunk, std::memory_order_relaxed)) {
+                for (int it = begin; it < std::min(begin + chunk, total); ++it) {
+                    run_item(s, p, it);
+                }
+            }
         }
         s.fin[p].fetch_add(1, std::memory_order_acq_rel);
         if (p < 3) {
@@ -662,9 +674,8 @@ void worker_main(pool_state * sp, int idx, int cpu) {
             }
         }
         seen = g;
-        run_job_phases(s, g);
+        run_job_phases(s, g, idx);
     }
-    (void) idx;
 }
 
 // Thread 0: watches the mapped job (and host-posted probe jobs), runs its share, publishes `done`.
@@ -719,7 +730,7 @@ void leader_main(pool_state * sp, int cpu) {
                 std::lock_guard<std::mutex> lk(s.sleep_mu);
                 s.sleep_cv.notify_all();
             }
-            run_job_phases(s, n, true);
+            run_job_phases(s, n, 0, true);
             const unsigned long long target = n * (unsigned long long) s.threads;
             while (s.fin[3].load(std::memory_order_acquire) < target) { cpu_relax(); }
             s.st_experts.fetch_add((unsigned) s.n_exp, std::memory_order_relaxed);
@@ -781,6 +792,7 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
     s.spin_ms = env_int("GGML_MOE_CPU_SPLIT_SPIN_MS", 250, 0, 600000);
     s.spin_us = env_int("GGML_MOE_CPU_SPLIT_SPIN_US", s.spin_ms * 1000, 0, 600000000);
     s.nap_us = env_int("GGML_MOE_CPU_SPLIT_NAP_US", 1000, 1, 100000);
+    s.schedule = env_int("GGML_MOE_CPU_SPLIT_SCHEDULE", 0, 0, 1) != 0;
     for (int p = 0; p < 4; ++p) { s.next[p].store(0); s.fin[p].store(0); }
     // One thread per physical core, never an SMT sibling, never core 0 (the OS and the desktop) and never the
     // core of the thread that drives the card: a spinning pool thread sharing a core with it is time-sliced in
@@ -862,6 +874,7 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
             s.threads, pin ? "pinned to cpus " : "unpinned", where.c_str(), skipped.c_str(), s.spin_us, s.nap_us, s.rows_ug, s.rows_down,
             s.q2_fast ? ", Q2_0 down fast path" : "", smt ? ", SMT siblings" : "", s.avx512 ? ", AVX-512 VNNI IQ dots" : "");
     if (s.iq_rows) { fprintf(stderr, "[moe-cpu-split] IQ up/gate row kernels (each chunk decoded once per expert), variant %d, prefetch %d B\n", s.iq_variant, s.iq_pf); }
+    if (s.schedule) { fprintf(stderr, "[moe-cpu-split] static quantization rows, grouped math claims\n"); }
     return true;
 }
 
