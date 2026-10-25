@@ -9,6 +9,7 @@
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/moe-cache.cuh"
+#include "ggml-cuda/moe-cpu-split.h"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
 #include "ggml-cuda/arange.cuh"
@@ -4428,7 +4429,13 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
 static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
-    CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+    if (moe_cs_help_enabled()) {
+        cudaError_t status;
+        while ((status = cudaStreamQuery(cuda_ctx->stream())) == cudaErrorNotReady) { moe_cs_help(); }
+        CUDA_CHECK(status);
+    } else {
+        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+    }
 
     GGML_UNUSED(backend);
 }

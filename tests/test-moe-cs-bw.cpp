@@ -121,7 +121,7 @@ static void make_proj(proj & p, ggml_type type, int64_t n_in, int64_t n_out, int
 
 int main(int argc, char ** argv) {
     if (argc < 2) {
-        fprintf(stderr, "usage: %s <cpu,cpu,...> [ram MiB, default 2048]\n", argv[0]);
+        fprintf(stderr, "usage: %s <cpu,cpu,...> [ram MiB, default 2048] [output file]\n", argv[0]);
         return 2;
     }
     std::vector<int> cpus;
@@ -205,6 +205,39 @@ int main(int argc, char ** argv) {
                    cns / 1e3, cph[1] / 1e3, ne * ug_bytes / cph[1], cph[3] / 1e3, ne * dn_bytes / cph[3],
                    hns / 1e3, hph[1] / 1e3, ne * ug_bytes / hph[1], hph[3] / 1e3, ne * dn_bytes / hph[3]);
         }
+    }
+    if (output) {
+        // Exercise repeated routes and the full job limits using the same publication as the card.
+        for (int l = 0; l < n_layers; ++l) {
+            for (int ne : { 1, 3, 8, 16 }) {
+                for (int nr : { 1, 2, 3, 4 }) {
+                    if (ne * nr > MOE_CS_MAX_ROUTES) { continue; }
+                    for (int rep = 0; rep < 4; ++rep) {
+                        job->layer = l;
+                        job->n_exp = ne;
+                        job->n_route = ne * nr;
+                        for (int i = 0; i < ne; ++i) {
+                            job->expert[i] = (rep * ne + i) % n_expert;
+                            job->first[i] = i * nr;
+                        }
+                        job->first[ne] = ne * nr;
+                        const auto want = job->seq + 1;
+                        std::atomic_thread_fence(std::memory_order_seq_cst);
+                        job->seq = want;
+                        while (job->done != want) { moe_cs_help(); }
+                        std::atomic_thread_fence(std::memory_order_acquire);
+                        const size_t count = (size_t) ne * nr * out_stride;
+                        if (fwrite(out.data(), sizeof(float), count, output) != count) {
+                            perror("multi-route output"); return 1;
+                        }
+                    }
+                }
+            }
+        }
+        unsigned long long stats[9];
+        moe_cs_stats(stats);
+        if (stats[4] != 0) { fprintf(stderr, "pool reported %llu invalid jobs\n", stats[4]); return 1; }
+        printf("multi-route jobs: %llu, invalid jobs: %llu\n", stats[0], stats[4]);
     }
     printf("  (projection bytes:");
     for (int l = 0; l < n_layers; ++l) {

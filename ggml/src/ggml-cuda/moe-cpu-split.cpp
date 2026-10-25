@@ -419,6 +419,10 @@ struct pool_state {
     int iq_variant = -1;       // moe_iq::get variant bits (GGML_MOE_CPU_SPLIT_ROWS: 1 = best mix, 2..17 = bits + 2)
     int iq_pf = 0;             // GGML_MOE_CPU_SPLIT_PF: prefetch distance of those kernels in bytes (0 = off)
     bool schedule = false;    // Assign quantization rows directly and claim math tiles in small groups.
+    bool host_help = false;
+    int host_cpu = -1;
+    std::atomic<int> help_phase{-1}; // -1 closed, 1/3 open, 5/7 held by a helper
+    std::atomic<unsigned long long> closed[4];
 
     alignas(64) std::atomic<unsigned long long> gen{0};
     alignas(64) std::atomic<int> next[4];
@@ -599,7 +603,24 @@ void run_job_phases(pool_state & s, unsigned long long n, int worker, bool lead 
                 }
             }
         }
-        s.fin[p].fetch_add(1, std::memory_order_acq_rel);
+        const auto finished = s.fin[p].fetch_add(1, std::memory_order_acq_rel) + 1;
+        if (s.host_help) {
+            if (finished == target) {
+                if (p == 1 || p == 3) {
+                    // Close admission and wait for an in-flight helper before publishing this phase.
+                    int open = p;
+                    while (!s.help_phase.compare_exchange_weak(open, -1, std::memory_order_acq_rel)) {
+                        open = p;
+                        cpu_relax();
+                    }
+                } else {
+                    s.help_phase.store(p + 1, std::memory_order_release);
+                }
+                s.closed[p].store(n, std::memory_order_release);
+            } else {
+                while (s.closed[p].load(std::memory_order_acquire) < n) { cpu_relax(); }
+            }
+        }
         if (p < 3) {
             while (s.fin[p].load(std::memory_order_acquire) < target) { cpu_relax(); }
         }
@@ -793,7 +814,8 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
     s.spin_us = env_int("GGML_MOE_CPU_SPLIT_SPIN_US", s.spin_ms * 1000, 0, 600000000);
     s.nap_us = env_int("GGML_MOE_CPU_SPLIT_NAP_US", 1000, 1, 100000);
     s.schedule = env_int("GGML_MOE_CPU_SPLIT_SCHEDULE", 0, 0, 1) != 0;
-    for (int p = 0; p < 4; ++p) { s.next[p].store(0); s.fin[p].store(0); }
+    s.host_help = env_int("GGML_MOE_CPU_SPLIT_HOST", 0, 0, 1) != 0;
+    for (int p = 0; p < 4; ++p) { s.next[p].store(0); s.fin[p].store(0); s.closed[p].store(0); }
     // One thread per physical core, never an SMT sibling, never core 0 (the OS and the desktop) and never the
     // core of the thread that drives the card: a spinning pool thread sharing a core with it is time-sliced in
     // scheduler ticks (the first build measured 6 ms per job that way). GGML_CPU_EXPERT_PIN=1 pins llama's main
@@ -803,10 +825,12 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
     std::vector<int> avail;
     std::string skipped = "0";
     if (!cores.empty()) {
+        // The cooperative host occupies the reserved core instead of competing with a pool worker.
+        if (s.host_help) { s.host_cpu = cores[0]; pin_thread(s.host_cpu); }
         std::vector<char> skip(cores.size(), 0);
         skip[0] = 1;
         const char * ep = getenv("GGML_CPU_EXPERT_PIN");
-        if (ep && strcmp(ep, "1") == 0 && cores.size() > 2) { skip[1] = 1; }
+        if (!s.host_help && ep && strcmp(ep, "1") == 0 && cores.size() > 2) { skip[1] = 1; }
 #if defined(__linux__)
         cpu_set_t mine;
         if (pthread_getaffinity_np(pthread_self(), sizeof(mine), &mine) == 0 && CPU_COUNT(&mine) <= 2) {
@@ -875,10 +899,33 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
             s.q2_fast ? ", Q2_0 down fast path" : "", smt ? ", SMT siblings" : "", s.avx512 ? ", AVX-512 VNNI IQ dots" : "");
     if (s.iq_rows) { fprintf(stderr, "[moe-cpu-split] IQ up/gate row kernels (each chunk decoded once per expert), variant %d, prefetch %d B\n", s.iq_variant, s.iq_pf); }
     if (s.schedule) { fprintf(stderr, "[moe-cpu-split] static quantization rows, grouped math claims\n"); }
+    if (s.host_help) { fprintf(stderr, "[moe-cpu-split] waiting host drains math tiles on cpu %d\n", s.host_cpu); }
     return true;
 }
 
 bool moe_cs_running() { return P().running; }
+
+bool moe_cs_help_enabled() { return P().running && P().host_help; }
+
+bool moe_cs_help() {
+    pool_state & s = P();
+    if (!s.running || !s.host_help) { return false; }
+#if defined(__linux__)
+    if (s.host_cpu >= 0 && sched_getcpu() != s.host_cpu) { pin_thread(s.host_cpu); }
+#endif
+    int phase = s.help_phase.load(std::memory_order_acquire);
+    if ((phase != 1 && phase != 3) ||
+        !s.help_phase.compare_exchange_strong(phase, phase + 4, std::memory_order_acq_rel)) { return false; }
+    // Ownership prevents the final pool worker from advancing the phase or replacing the job state.
+    const int total = items_of(s, phase);
+    const int chunk = s.schedule ? std::max(1, std::min(4, total / (3 * s.threads))) : 1;
+    const int begin = s.next[phase].fetch_add(chunk, std::memory_order_relaxed);
+    if (begin < total) {
+        for (int it = begin; it < std::min(begin + chunk, total); ++it) { run_item(s, phase, it); }
+    }
+    s.help_phase.store(phase, std::memory_order_release);
+    return begin < total;
+}
 
 int moe_cs_threads() { return P().threads; }
 
@@ -994,7 +1041,7 @@ bool moe_cs_probe(double * route_ns, double * fixed_ns) {
         std::atomic_thread_fence(std::memory_order_seq_cst);
         const unsigned long long want = s.local_seq.load() + 1;
         s.local_seq.store(want, std::memory_order_release);
-        while (s.local_done.load(std::memory_order_acquire) != want) { cpu_relax(); }
+        while (s.local_done.load(std::memory_order_acquire) != want) { if (!moe_cs_help()) { cpu_relax(); } }
     };
     // Touch every probe expert once first (page faults on first touch of mapped weights are not the steady cost).
     for (size_t e = 0; e < experts.size(); e += 4) { post((int) e, 4); }
@@ -1013,7 +1060,7 @@ bool moe_cs_probe(double * route_ns, double * fixed_ns) {
             const unsigned long long want = s.local_seq.load() + 1;
             const auto t0 = clk::now();
             s.local_seq.store(want, std::memory_order_release);
-            while (s.local_done.load(std::memory_order_acquire) != want) { cpu_relax(); }
+            while (s.local_done.load(std::memory_order_acquire) != want) { if (!moe_cs_help()) { cpu_relax(); } }
             const double ns = (double) std::chrono::duration_cast<std::chrono::nanoseconds>(clk::now() - t0).count();
             if (rep >= 4) { best = std::min(best, ns); }
         }
@@ -1084,7 +1131,7 @@ bool moe_cs_bench(int layer, const int * experts, int n_list, int n_exp, int rep
         const unsigned long long want = s.local_seq.load() + 1;
         const auto t0 = clk::now();
         s.local_seq.store(want, std::memory_order_release);
-        while (s.local_done.load(std::memory_order_acquire) != want) { cpu_relax(); }
+        while (s.local_done.load(std::memory_order_acquire) != want) { if (!moe_cs_help()) { cpu_relax(); } }
         total += (double) std::chrono::duration_cast<std::chrono::nanoseconds>(clk::now() - t0).count();
     }
     *ns_per_job = total / reps;

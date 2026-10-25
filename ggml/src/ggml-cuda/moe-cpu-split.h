@@ -38,6 +38,9 @@ struct moe_cs_role {
 bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * out, size_t out_stride,
         int64_t max_ff, int64_t max_embd);
 bool moe_cs_running();
+// An optional waiting host thread may drain math tiles without joining the pool's barriers.
+bool moe_cs_help_enabled();
+bool moe_cs_help();
 // Registers (or refreshes) a layer. False when the host cannot compute it (types, shapes).
 bool moe_cs_register_layer(int layer, const moe_cs_role roles[3]);
 bool moe_cs_layer_ok(int layer);
