@@ -606,6 +606,8 @@ struct moe_missjoin_retained_state;
 
 struct moe_cache_device_table {
     ggml_moe_cache_tensor_desc desc{}; // compact expert bytes
+    // Shared draft tensors can be destroyed before their target cache session.
+    std::string name;
     size_t host_stride = 0;
     const void * borrowed = nullptr; // model-owned registered arena; never unregistered here
     bool permanent_sources = false;
@@ -10984,7 +10986,9 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
                     (resident_mask && !moe_cache_table_bytes_add(arena_bytes, (size_t)d.n_expert))) {
                 return fail();
             }
-            session->device_tables.emplace(d.data, std::move(table));
+            auto & stored = session->device_tables.emplace(d.data, std::move(table)).first->second;
+            stored.name = d.name ? d.name : "";
+            stored.desc.name = d.name ? stored.name.c_str() : nullptr;
         }
         if (!moe_cache_table_bytes_add(arena_bytes, count_entries * sizeof(unsigned long long)) ||
                 (route_stats && !moe_cache_table_bytes_add(arena_bytes, 3 * sizeof(unsigned long long)))) {
