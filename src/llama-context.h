@@ -63,7 +63,7 @@ struct llama_context {
     //   - changing samplers
     //   - changing attention type
     //   - etc.
-    void sched_reserve();
+    void sched_reserve(bool suspend_prompt_cache = false);
     void detach_compute_borrower();
 
     void synchronize();
