@@ -893,7 +893,7 @@ static void moe_prefetch_finish(moe_cache_session & session, moe_prefetch_copy &
 
 static size_t moe_cache_trim_session(
         moe_cache_session & session, int physical_device);
-static void moe_cache_device_release(moe_cache_session & session, bool retain_sources = false);
+static void moe_cache_device_release(moe_cache_session & session, bool retain_sources = false, bool census = false);
 static void moe_cache_swap_step(moe_cache_session & session);
 static void moe_cache_trace_step(moe_cache_session & session);
 static void moe_cache_swap_note_stream(moe_cache_session & session, ggml_backend_cuda_context & ctx);
@@ -4782,7 +4782,7 @@ static void moe_cache_invalidate_session(
             session.idle_cv.wait(lock, [&] { return session.active_scopes == 0; });
             MOE_CACHE_LOG("[moe-cache] retained source mapping invalidated: base=%p bytes=%zu\n", d.data,
                     d.expert_size * (size_t)d.n_expert);
-            moe_cache_device_release(session);
+            moe_cache_device_release(session, false, true);
             session.device_attempted = false;
             break;
         }
@@ -7824,7 +7824,7 @@ void ggml_cuda_moe_cache_table_graph_end(ggml_backend_cuda_context & ctx) {
 #endif
 }
 
-static void moe_cache_device_release(moe_cache_session & session, bool retain_sources) {
+static void moe_cache_device_release(moe_cache_session & session, bool retain_sources, bool census) {
     moe_pf_release(&session); // fork PREFETCHFIX: tables below are about to be freed
     session.device_ready.store(false);
     if (session.device_adapt_stream) {
@@ -7854,7 +7854,7 @@ static void moe_cache_device_release(moe_cache_session & session, bool retain_so
     ggml_cuda_set_device(session.devices[0]->logical);
     // Tables can be in flight on a scheduler stream, not the legacy cache stream.
     (void) cudaDeviceSynchronize();
-    if (session.stopping && session.devices.size() == 1 && moe_cache_env_on("GGML_MOE_CACHE_RESIDENT_CENSUS")) {
+    if ((session.stopping || census) && session.devices.size() == 1 && moe_cache_env_on("GGML_MOE_CACHE_RESIDENT_CENSUS")) {
         (void) moe_cache_swap_groups(session, true);
     }
     if (session.mj_retained_arena) {
