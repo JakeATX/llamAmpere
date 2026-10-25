@@ -6948,7 +6948,7 @@ static void moe_cache_swap_free(moe_cache_session & session) {
     (void) cudaGetLastError();
 }
 
-static bool moe_cache_swap_groups(moe_cache_session & session) {
+static bool moe_cache_swap_groups(moe_cache_session & session, bool census = false) {
     auto & groups = session.swap_groups;
     groups.clear();
     for (auto & entry : session.device_tables) {
@@ -6973,20 +6973,35 @@ static bool moe_cache_swap_groups(moe_cache_session & session) {
         }
     }
     size_t partial = 0, complete = 0;
-    for (const auto & group : groups) {
+    for (size_t layer = 0; layer < groups.size(); ++layer) {
+        const auto & group = groups[layer];
         if (!group[0] && !group[1] && !group[2]) { continue; }
         if (!group[0] || !group[1] || !group[2] || group[0]->desc.n_expert != group[1]->desc.n_expert ||
                 group[0]->desc.n_expert != group[2]->desc.n_expert) { return false; }
+        const size_t previous_complete = complete, previous_partial = partial;
+        size_t resident_bytes = 0;
         for (int32_t e = 0; e < group[0]->desc.n_expert; ++e) {
             int resident = 0;
             for (auto * table : group) {
-                resident += table->permanent[e] || (table->swap_pool && table->swap_pool->map.count({table->desc.data, e}));
+                bool present = table->permanent[e];
+                if (!present && table->swap_pool) {
+                    const auto found = table->swap_pool->map.find({table->desc.data, e});
+                    present = found != table->swap_pool->map.end() && (!census ||
+                            table->swap_pool->slots[found->second].state == moe_cache_slot_state::valid);
+                }
+                resident += present;
+                if (present) { resident_bytes += table->desc.expert_size; }
             }
             partial += resident > 0 && resident < 3;
             complete += resident == 3;
         }
+        if (census) {
+            MOE_CACHE_LOG("[moe-cache] final residency: layer=%zu complete=%zu partial=%zu resident_slice_bytes=%zu\n",
+                    layer, complete - previous_complete, partial - previous_partial, resident_bytes);
+        }
     }
-    MOE_CACHE_LOG("[moe-cache] whole swap initial: complete=%zu partial=%zu layers=%zu\n", complete, partial, groups.size());
+    MOE_CACHE_LOG("[moe-cache] whole swap %s: complete=%zu partial=%zu layers=%zu\n",
+            census ? "final" : "initial", complete, partial, groups.size());
     return !groups.empty() && partial == 0;
 }
 
@@ -7837,6 +7852,9 @@ static void moe_cache_device_release(moe_cache_session & session, bool retain_so
     ggml_cuda_set_device(session.devices[0]->logical);
     // Tables can be in flight on a scheduler stream, not the legacy cache stream.
     (void) cudaDeviceSynchronize();
+    if (session.stopping && session.devices.size() == 1 && moe_cache_env_on("GGML_MOE_CACHE_RESIDENT_CENSUS")) {
+        (void) moe_cache_swap_groups(session, true);
+    }
     if (session.mj_retained_arena) {
         unsigned long long counts[7] = {};
         if (cudaMemcpy(counts, session.mj_retained_counts, sizeof(counts), cudaMemcpyDeviceToHost) == cudaSuccess) {
