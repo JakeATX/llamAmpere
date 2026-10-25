@@ -5195,6 +5195,11 @@ static bool run_device_adaptation(ggml_backend_t gpu, ggml_backend_t cpu, log_ca
     const size_t arena_log = log.find("device table arena bytes:");
     const size_t pool_log = log.find("pool[0]:");
     require((arena_log != std::string::npos && pool_log != std::string::npos && arena_log < pool_log), __LINE__);
+    const char * shared_mtp = getenv("GGML_MOE_CACHE_MTP_SHARED");
+    if (shared_mtp && strcmp(shared_mtp, "1") == 0 && arena_log != std::string::npos) {
+        const std::string arena_line = log.substr(arena_log, log.find('\n', arena_log) - arena_log);
+        require((max_field_value(arena_line, "entries=") >= 4 * (uint64_t) descriptor.n_expert), __LINE__);
+    }
     require((log.find("failure=none policy=materialized-before-expert-pools") != std::string::npos), __LINE__);
     require((log.find("policy=actual-allocator-padding") != std::string::npos), __LINE__);
     if (with_tuning) {

@@ -2351,11 +2351,10 @@ static bool moe_cache_reserve_table_arena(moe_cache_session & session, moe_cache
     if (!enabled || strcmp(enabled, "1") != 0 || session.devices.size() != 1) {
         return true;
     }
-    size_t required = 0, entries = 0;
+    size_t required = 0, entries = 0, max_count = 0;
     const bool stats = moe_cache_table_stats_enabled();
     const bool mask = moe_cache_table_mask_enabled();
-    for (const auto & entry : device.seen_tensors) {
-        const size_t count = (size_t)entry.second.n_expert;
+    auto add_table = [&](size_t count) {
         if (count > SIZE_MAX / sizeof(void *) || count > SIZE_MAX - entries ||
                 !moe_cache_table_bytes_add(required, count * sizeof(void *)) ||
                 (session.prefetch_enabled && !moe_cache_table_bytes_add(required, count * sizeof(void *))) ||
@@ -2363,6 +2362,19 @@ static bool moe_cache_reserve_table_arena(moe_cache_session & session, moe_cache
             return false;
         }
         entries += count;
+        return true;
+    };
+    for (const auto & entry : device.seen_tensors) {
+        const size_t count = (size_t)entry.second.n_expert;
+        if (!add_table(count)) { return false; }
+        max_count = std::max(max_count, count);
+    }
+    // Shared MTP adds gate/up/down tables after the target pools are built.
+    const char * shared = getenv("GGML_MOE_CACHE_MTP_SHARED");
+    if (shared && strcmp(shared, "1") == 0 && max_count) {
+        for (int role = 0; role < 3; ++role) {
+            if (!add_table(max_count)) { return false; }
+        }
     }
     if (entries > SIZE_MAX / sizeof(unsigned long long) ||
             !moe_cache_table_bytes_add(required, entries * sizeof(unsigned long long)) ||
