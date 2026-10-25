@@ -4713,6 +4713,16 @@ common_speculative_init_result::common_speculative_init_result(
                                     COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE) != params.speculative.types.end();
     GGML_ASSERT(has_draft || spec_mtp);
 
+    const char * shared_experts = getenv("GGML_MOE_CACHE_MTP_SHARED");
+    if (has_draft && spec_mtp && shared_experts && strcmp(shared_experts, "1") == 0) {
+        if (!params.tensor_buft_overrides.empty() && params.tensor_buft_overrides.back().pattern == nullptr) {
+            params.tensor_buft_overrides.pop_back();
+        }
+        params.tensor_buft_overrides.insert(params.tensor_buft_overrides.begin(), llm_ffn_exps_cpu_override());
+        params.tensor_buft_overrides.push_back({nullptr, nullptr});
+        LOG_INF("%s: MTP expert weights use host storage and the target expert cache\n", __func__);
+    }
+
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
