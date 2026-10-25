@@ -192,6 +192,12 @@ int main(int argc, char ** argv) {
     ok &= !llama_moe_arena::is_trunk_expert("blk.48.ffn_up_exps.weight", 48);
     ok &= !llama_moe_arena::is_trunk_expert("blk.0.ffn_gate.weight", 48);
     ok &= !llama_moe_arena::is_trunk_expert("blk.-1.ffn_gate_exps.weight", 48);
+    // The shared draft admits its layer as well as any trunk layers in the file.
+    ok &= llama_moe_arena::is_trunk_expert("blk.48.ffn_up_exps.weight", 49);
+    ok &= llama_moe_arena::is_trunk_expert("blk.47.ffn_up_exps.weight", 49);
+    ok &= !llama_moe_arena::is_trunk_expert("blk.49.ffn_up_exps.weight", 49);
+    ok &= !llama_moe_arena::is_trunk_expert("blk.-1.ffn_up_exps.weight", 49);
+    ok &= !llama_moe_arena::is_trunk_expert("blk.48.ffn_up.weight", 49);
     for (int role = 0; role < 3; ++role) {
         for (size_t i = 0; i < values.size(); ++i) { values[i] = 0.2f * sinf(float(i + role * 17) * 0.013f); }
         const size_t written = ggml_quantize_chunk(types[role], values.data(), packed + bank_offset,

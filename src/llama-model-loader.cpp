@@ -895,13 +895,18 @@ llama_model_loader::llama_model_loader(
         uint32_t n_layers = 0, n_nextn = 0;
         get_key(LLM_KV_BLOCK_COUNT, n_layers, false);
         get_key(LLM_KV_NEXTN_PREDICT_LAYERS, n_nextn, false);
-        moe_arena_trunk_layers = n_nextn <= n_layers ? n_layers - n_nextn : 0;
+        moe_arena_layers = n_nextn <= n_layers ? n_layers - n_nextn : 0;
+        const char * shared_mtp = getenv("GGML_MOE_CACHE_MTP_SHARED");
+        if (load_mtp && shared_mtp && strcmp(shared_mtp, "1") == 0 && n_nextn <= n_layers) {
+            // fork: give the shared drafter the same pinned expert storage as the target.
+            moe_arena_layers = n_layers;
+        }
         for (const auto & entry : weights_map) {
             const auto * t = entry.second.tensor;
             if (!llama_moe_arena::is_expert(t->name)) { continue; }
             int layer = -1;
             if (sscanf(t->name, "blk.%d.", &layer) != 1 || layer < 0 || n_nextn > n_layers) { supported = false; break; }
-            if (!llama_moe_arena::is_trunk_expert(t->name, moe_arena_trunk_layers)) { continue; }
+            if (!llama_moe_arena::is_trunk_expert(t->name, moe_arena_layers)) { continue; }
             roles[layer]++;
             if (!ggml_moe_cache_wtype_supported(t->type)) { supported = false; break; }
             if (t->ne[2] <= 1 || t->ne[3] != 1 || ggml_nbytes(t) > SIZE_MAX - bytes) {
@@ -1381,7 +1386,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             }
         }
 
-        if (use_moe_arena && llama_moe_arena::is_trunk_expert(t_meta->name, moe_arena_trunk_layers)) {
+        if (use_moe_arena && llama_moe_arena::is_trunk_expert(t_meta->name, moe_arena_layers)) {
             buft = lazy_read::buft();
         }
 
@@ -2032,7 +2037,7 @@ std::unique_ptr<llama_moe_arena> llama_model_loader::load_moe_arena(llama_progre
     for (const auto & entry : ctx_map) {
         for (auto * t = ggml_get_first_tensor(entry.second.get()); t; t = ggml_get_next_tensor(entry.second.get(), t)) {
             int layer = -1;
-            if (llama_moe_arena::is_trunk_expert(t->name, moe_arena_trunk_layers) && sscanf(t->name, "blk.%d.", &layer) == 1) {
+            if (llama_moe_arena::is_trunk_expert(t->name, moe_arena_layers) && sscanf(t->name, "blk.%d.", &layer) == 1) {
                 layers[layer].push_back(t);
             }
         }
