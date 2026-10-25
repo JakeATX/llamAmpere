@@ -479,6 +479,7 @@ void llama_moe_arena_apply_flashnext_defaults() {
         { "LLAMA_B1_CACHE_WARM",                  "1" },
         { "LLAMA_B1_LAYER_RESERVE",               "1" },
         { "LLAMA_B1_MOE_CACHE_SUSPEND",           "1" },
+        { "LLAMA_B1_EARLY_CACHE_SUSPEND",         "1" },
         // exact prompt and decode kernels
         { "GGML_CUDA_CONCAT_TILE",                "1" },
         { "GGML_CUDA_NORM_CAST",                  "1" },
