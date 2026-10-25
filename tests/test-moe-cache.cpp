@@ -7071,11 +7071,11 @@ static bool test_profile_global_plan() {
     ranked.back() = 0;
     for (size_t layer = 0; layer < 2; ++layer) {
         for (int expert = 0; expert < 4; ++expert) {
-            items.push_back({layer * 2, expert, layer, 0, layer ? 2u : 1u, scores[layer][expert]});
-            items.push_back({layer * 2 + 1, expert, layer, 1, layer ? 1u : 3u, scores[layer][expert]});
+            items.push_back({layer * 2, expert, layer, layer * 2, layer ? 2u : 1u, scores[layer][expert]});
+            items.push_back({layer * 2 + 1, expert, layer, layer * 2 + 1, layer ? 1u : 3u, scores[layer][expert]});
         }
     }
-    ranked_ok &= ggml_cuda_moe_cache_profile_plan(items, {8, 8}, 7, 1, plan);
+    ranked_ok &= ggml_cuda_moe_cache_profile_plan(items, {4, 4, 4, 4}, 7, 1, plan);
     ranked_ok &= plan.bundles == 2 && plan.selected[10] && plan.selected[0] && !plan.selected[2];
     printf("cache-profile-ranked-data: %s\n", ranked_ok ? "OK" : "FAIL");
     if (!ranked_ok) { return false; }
