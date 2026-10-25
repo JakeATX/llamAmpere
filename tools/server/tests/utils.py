@@ -243,6 +243,7 @@ class ServerProcess:
         if self.enable_ctx_shift:
             server_args.append("--context-shift")
         if self.spec_type:
+            server_args.append("--no-spec-mb-mtp")
             server_args.extend(["--spec-type", self.spec_type])
         if self.api_key:
             server_args.extend(["--api-key", self.api_key])
