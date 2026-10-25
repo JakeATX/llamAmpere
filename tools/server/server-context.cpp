@@ -6969,6 +6969,7 @@ private:
             // save the original draft size
             const size_t n_draft = slot.spec_draft.size();
             const size_t verify_width = slot.spec_smpl_after_verify ? slot.spec_verify_width : n_draft;
+            std::vector<completion_token_output> pre_sample_probs;
 
             GGML_ASSERT(n_draft > 0 || (slot.task->params.sampling.spec_lossy && slot.spec_is_replay));
 
@@ -7042,6 +7043,14 @@ private:
                     // CDEPTH history: target top-1 of the committed rows (the re-decode after a restore is not counted twice)
                     const auto & top1 = common_sampler_get_top1_trace(slot.smpl.get());
                     common_speculative_note_target_conf(spec.get(), slot.id, top1.data(), std::min(top1.size(), accepted.size()));
+                }
+                // Capture PRE probabilities while the verification rows still exist, before checkpoint replay.
+                if (slot.task->params.sampling.n_probs > 0 && !slot.task->params.post_sampling_probs) {
+                    pre_sample_probs.resize(accepted.size());
+                    for (size_t i = 0; i < accepted.size(); ++i) {
+                        pre_sample_probs[i].tok = accepted[i];
+                        populate_token_probs(slot, pre_sample_probs[i], false, params_base.special, slot.spec_i_batch[i]);
+                    }
                 }
                 slot.spec_i_batch.clear();
 
@@ -7201,7 +7210,10 @@ private:
                 result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
                 result.prob         = 1.0f; // set later
 
-                // TODO: set result.probs
+                if (!pre_sample_probs.empty()) {
+                    result.prob  = pre_sample_probs[i].prob;
+                    result.probs = std::move(pre_sample_probs[i].probs);
+                }
 
                 slot.stats.n_gen += 1;
 
