@@ -6687,7 +6687,7 @@ bool llama_context::b1_kv_scratch_bind(int32_t l0, int32_t l1, bool preflight) {
     const size_t alignment = ggml_backend_buft_get_alignment(backend_buft[gpu]);
     const uint32_t tokens = *std::max_element(b1->ubatch_sizes().begin(), b1->ubatch_sizes().end());
     const size_t max_ub = std::max_element(b1->ubatch_sizes().begin(), b1->ubatch_sizes().end()) - b1->ubatch_sizes().begin();
-    auto reserve_mctx = memory->init_full();
+    auto reserve_mctx = memory->init_full_single_seq();
     if (!reserve_mctx) { return false; }
     // fork: first try a smaller owned buffer; retry with the measured full size if chunks fragment.
     for (size_t reduction : {saving, (size_t) 0}) {
@@ -6766,7 +6766,7 @@ bool llama_context::b1_reserve_legacy_layers(const std::vector<uint32_t> & sizes
         const size_t max_ub = std::max_element(sizes.begin(), sizes.end()) - sizes.begin();
         const uint32_t tokens = sizes[max_ub];
         const uint32_t outputs = (uint32_t) std::min<int64_t>(tokens, std::max<int64_t>(1, n_outputs_all));
-        auto reserve_mctx = memory->init_full();
+        auto reserve_mctx = memory->init_full_single_seq();
         if (!reserve_mctx) { return false; }
         const int32_t final_l0 = b1->final_l0();
         b1_layer_compute_bytes.assign(model.hparams.n_layer(), 0);
@@ -9676,6 +9676,15 @@ void llama_set_decode_phase(llama_context * ctx, enum llama_decode_phase phase) 
 
 void llama_set_next_decode_phase(llama_context * ctx, enum llama_decode_phase phase) {
     ctx->set_next_decode_phase(phase);
+}
+
+int32_t llama_moe_cache_decode_capacity(const llama_context * ctx) {
+    const auto & hp = ctx->get_model().hparams;
+    uint32_t routes = 0;
+    for (uint32_t il = 0; il < hp.n_layer(); ++il) {
+        routes = std::max(routes, hp.n_expert_used(il));
+    }
+    return ggml_backend_sched_moe_cache_decode_capacity(ctx->get_sched(), routes);
 }
 
 int32_t llama_n_threads(llama_context * ctx) {

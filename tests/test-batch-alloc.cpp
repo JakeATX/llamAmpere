@@ -1347,6 +1347,39 @@ static void test_mtp_compat_reuse(testing & t) {
     });
 }
 
+static void test_cached_decode_split(testing & t) {
+    for (const auto & lengths : {std::pair<int, int>{5, 5}, {5, 3}, {1, 5}, {5, 1}}) {
+        t.test("rollback_tail_" + std::to_string(lengths.first) + "_" + std::to_string(lengths.second), [&](testing & t) {
+            batch_builder bb;
+            for (int seq = 0; seq < 2; ++seq) {
+                const int count = seq == 0 ? lengths.first : lengths.second;
+                for (int pos = 0; pos < count; ++pos) {
+                    bb.add(pos, {seq}, true);
+                }
+            }
+            llama_vocab vocab;
+            llama_batch_allocr ba(1);
+            t.assert_true(ba.init(bb.b, vocab, false));
+            std::vector<int> seen(lengths.first + lengths.second, 0);
+            std::map<llama_seq_id, int> chunks;
+            while (true) {
+                auto ub = ba.split_equal(6, false, 5);
+                if (ub.n_tokens == 0) { break; }
+                t.assert_true(ub.n_tokens <= 6);
+                for (uint32_t seq = 0; seq < ub.n_seqs; ++seq) {
+                    ++chunks[ub.seq_id[seq * ub.n_seq_tokens][0]];
+                }
+                for (auto idx : ub.data->batch_idxs) { ++seen.at(idx); }
+            }
+            for (auto count : seen) { t.assert_equal(1, count); }
+            t.assert_equal(1, chunks[0]);
+            t.assert_equal(1, chunks[1]);
+            const auto & outputs = ba.get_out_ids();
+            t.assert_equal(seen.size(), outputs.size());
+        });
+    }
+}
+
 int main(int argc, char ** argv) {
     testing t;
 
@@ -1368,6 +1401,7 @@ int main(int argc, char ** argv) {
     t.test("compat",         test_compat);
     t.test("mtp_compat_reuse", test_mtp_compat_reuse);
     t.test("split",          test_split);
+    t.test("cached_decode_split", test_cached_decode_split);
     t.test("keep_tail",      test_keep_tail);
     t.test("mrope",          test_mrope);
     t.test("mtp_embd_width", test_mtp_embd_width);

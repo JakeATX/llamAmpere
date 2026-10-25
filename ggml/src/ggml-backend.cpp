@@ -3668,6 +3668,13 @@ int ggml_backend_sched_moe_cache_device_prepare(ggml_backend_sched_t sched,
     return sched->moe_cache_api.device_prepare(sched->moe_cache_session, tensors, n_tensors);
 }
 
+int ggml_backend_sched_moe_cache_decode_capacity(ggml_backend_sched_t sched, int64_t n_expert_used) {
+    if (!sched || !sched->moe_cache_session || !sched->moe_cache_api.decode_capacity || n_expert_used <= 0) {
+        return 0;
+    }
+    return sched->moe_cache_api.decode_capacity(sched->moe_cache_session, n_expert_used);
+}
+
 void ggml_backend_sched_moe_cache_print_stats(ggml_backend_sched_t sched) {
     if (!sched || !sched->moe_cache_session || !sched->moe_cache_api.print_stats) {
         GGML_LOG_INFO("[moe-cache] phase snapshot unavailable: reason=no-provider\n");

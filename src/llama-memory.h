@@ -175,6 +175,10 @@ struct llama_memory_i {
     // simulate full cache, used for allocating worst-case compute buffers
     virtual llama_memory_context_ptr init_full() = 0;
 
+    // fork: reserve a single-sequence graph while retaining full attended length.
+    // Memory types without per-sequence streams keep their ordinary full view.
+    virtual llama_memory_context_ptr init_full_single_seq() { return init_full(); }
+
     // prepare for any pending memory updates, such as shifts, copies, etc.
     // status == LLAMA_MEMORY_STATUS_NO_UPDATE if there is nothing to update
     virtual llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) = 0;
