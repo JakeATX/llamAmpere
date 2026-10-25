@@ -2649,7 +2649,15 @@ static bool moe_cache_build_global_profile(moe_cache_session & session, moe_cach
     ggml_cuda_moe_profile_plan plan;
     int64_t density_value = 0;
     const bool density = !session.profile_ranked && moe_cache_env_i64("GGML_MOE_CACHE_PROFILE_GLOBAL_DENSITY", 0, 1, density_value) && density_value;
-    if (!ggml_cuda_moe_cache_profile_plan(items, caps, budget, moe_cache_pool_slots_min, plan, density)) { return false; }
+    int64_t ranked_limit = 0;
+    if (session.profile_ranked) {
+        moe_cache_env_i64("GGML_MOE_CACHE_PROFILE_RANKED_LIMIT", 1, INT_MAX, ranked_limit);
+    }
+    if (!ggml_cuda_moe_cache_profile_plan(items, caps, budget, moe_cache_pool_slots_min, plan, density, (size_t)ranked_limit)) { return false; }
+    if (ranked_limit) {
+        MOE_CACHE_LOG("[moe-cache] CUDA%d ranked prefix: requested=%lld fitted=%zu bytes=%zu; no lower-rank backfill\n",
+                device.physical, (long long)ranked_limit, plan.bundles, plan.bytes);
+    }
     device.profile_global_ranks.clear();
     for (size_t i = 0; i < keys.size(); ++i) { device.profile_global_ranks.emplace(keys[i], plan.ranks[i]); }
     device.profile_global_slots = plan.slots;

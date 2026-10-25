@@ -87,7 +87,7 @@ struct ggml_cuda_moe_profile_plan {
 
 static inline bool ggml_cuda_moe_cache_profile_plan(const std::vector<ggml_cuda_moe_profile_item> & items,
         const std::vector<size_t> & caps, size_t budget, size_t minimum,
-        ggml_cuda_moe_profile_plan & output, bool route_density = false) {
+        ggml_cuda_moe_profile_plan & output, bool route_density = false, size_t ranked_limit = 0) {
     if (items.empty() || caps.empty() || !minimum) {
         return false;
     }
@@ -164,16 +164,25 @@ static inline bool ggml_cuda_moe_cache_profile_plan(const std::vector<ggml_cuda_
         ++plan.bundles;
         return true;
     };
-    for (size_t index : ranked) {
-        bool needed = false;
-        for (const auto & p : bundles[index].pools) { needed = needed || plan.slots[p.first] < minimum; }
-        if (needed) { admit(index); }
-        bool complete = true;
-        for (size_t count : plan.slots) { complete = complete && count >= minimum; }
-        if (complete) { break; }
+    if (ranked_limit) {
+        // A ranked-data comparison must retain a prefix, never fill a hole with
+        // a cheaper lower-ranked expert. Prefill may temporarily fit fewer.
+        for (size_t index : ranked) {
+            if (plan.bundles == ranked_limit || !admit(index)) { break; }
+        }
+    } else {
+        for (size_t index : ranked) {
+            bool needed = false;
+            for (const auto & p : bundles[index].pools) { needed = needed || plan.slots[p.first] < minimum; }
+            if (needed) { admit(index); }
+            bool complete = true;
+            for (size_t count : plan.slots) { complete = complete && count >= minimum; }
+            if (complete) { break; }
+        }
+        for (size_t count : plan.slots) { if (count < minimum) { return false; } }
+        for (size_t index : ranked) { if (!chosen[index]) { admit(index); } }
     }
     for (size_t count : plan.slots) { if (count < minimum) { return false; } }
-    for (size_t index : ranked) { if (!chosen[index]) { admit(index); } }
     size_t rank = 0;
     for (int selected = 1; selected >= 0; --selected) {
         for (size_t index : ranked) {

@@ -7077,6 +7077,15 @@ static bool test_profile_global_plan() {
     }
     ranked_ok &= ggml_cuda_moe_cache_profile_plan(items, {4, 4, 4, 4}, 7, 1, plan);
     ranked_ok &= plan.bundles == 2 && plan.selected[10] && plan.selected[0] && !plan.selected[2];
+    ranked_ok &= ggml_cuda_moe_cache_profile_plan(items, {4, 4, 4, 4}, 28, 1, plan, false, 2);
+    ranked_ok &= plan.bundles == 2 && plan.bytes == 7 && plan.selected[10] && plan.selected[0] && !plan.selected[2];
+    // First two ranks cost 3+4: a six-byte budget cannot skip rank two and
+    // spend the remainder on a cheaper later rank. Failed output is preserved.
+    const auto prefix_slots = plan.slots;
+    ranked_ok &= !ggml_cuda_moe_cache_profile_plan(items, {4, 4, 4, 4}, 6, 1, plan, false, 2);
+    ranked_ok &= plan.slots == prefix_slots;
+    ranked_ok &= ggml_cuda_moe_cache_profile_plan(items, {4, 4, 4, 4}, 13, 1, plan, false, 8);
+    ranked_ok &= plan.bundles == 3 && plan.bytes == 10 && plan.selected[14] && !plan.selected[4];
     printf("cache-profile-ranked-data: %s\n", ranked_ok ? "OK" : "FAIL");
     if (!ranked_ok) { return false; }
     items.clear();
