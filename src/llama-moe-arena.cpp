@@ -98,8 +98,16 @@ void llama_moe_output::release(size_t offset, size_t bytes) {
     const size_t length = end - begin;
     // Boundary pages can contain live logits or neighboring activation rows.
     // Call only after the backend has completed all writes to these pages.
-    if (msync((char *) data + begin, length, MS_SYNC) != 0 ||
-            madvise((char *) data + begin, length, MADV_DONTNEED) != 0) {
+    if (msync((char *) data + begin, length, MS_SYNC) != 0) {
+        throw std::runtime_error("cannot flush completed MoE output pages");
+    }
+#if defined(__linux__) && defined(MADV_PAGEOUT)
+    // Reclaim mapped file pages before dropping PTEs; neighboring mapped pages can block fadvise eviction.
+    if (madvise((char *) data + begin, length, MADV_PAGEOUT) != 0 && errno != EINVAL && errno != ENOSYS) {
+        throw std::runtime_error("cannot reclaim completed MoE output pages");
+    }
+#endif
+    if (madvise((char *) data + begin, length, MADV_DONTNEED) != 0) {
         throw std::runtime_error("cannot release completed MoE output pages");
     }
 #ifdef __linux__

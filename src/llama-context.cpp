@@ -1229,6 +1229,10 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
                 LLAMA_LOG_INFO("%s: MTP context will share the target context's compute buffers\n", __func__);
             }
         }
+        const char * shared_experts = getenv("GGML_MOE_CACHE_MTP_SHARED");
+        if (shared_experts && strcmp(shared_experts, "1") == 0 && cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && !compute_peer) {
+            throw std::runtime_error("shared MTP experts require serialized compute on the target device");
+        }
         if (cparams.moe_cache_size > 0) {
             if (cparams.pipeline_parallel || model.n_devices() > 1) {
                 throw std::runtime_error("MoE cache does not support multiple devices");
@@ -2073,7 +2077,10 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
 
-    const bool moe_cache_eligible = llama_model_has_cacheable_moe_weights(
+    const char * shared_experts = getenv("GGML_MOE_CACHE_MTP_SHARED");
+    const bool borrow_experts = shared_experts && strcmp(shared_experts, "1") == 0 &&
+        cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && compute_peer;
+    const bool moe_cache_eligible = !borrow_experts && llama_model_has_cacheable_moe_weights(
         model, (llama_moe_cache_mode) cparams.moe_cache_mode, cparams.moe_cache_budget_mib, backend_ptrs);
     const ggml_moe_cache_mode moe_cache_mode =
         moe_cache_eligible ? (ggml_moe_cache_mode) cparams.moe_cache_mode : GGML_MOE_CACHE_MODE_OFF;
@@ -2183,6 +2190,11 @@ void llama_context::sched_reserve() {
         ggml_backend_sched_set_moe_cache(sched.get(), moe_cache_mode, cparams.moe_cache_budget_mib);
         ggml_backend_sched_moe_cache_prefetch_configure(sched.get(), cparams.moe_prefetch);
     }
+    if (borrow_experts && compute_peer->sched &&
+            !ggml_backend_sched_set_moe_cache_donor(sched.get(), compute_peer->sched.get())) {
+        throw std::runtime_error("failed to share the target expert cache with the MTP context");
+    }
+    if (borrow_experts) { LLAMA_LOG_INFO("%s: MTP experts borrow the target cache session\n", __func__); }
     sync_moe_keep();
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
     if (mtp_prefill_async || mtp_scratch_enabled) {
@@ -7430,6 +7442,26 @@ void llama_context::b1_cache_device_prepare() {
             }
             tensors.push_back({tensor->name, tensor->data, tensor->nb[2], tensor->ne[0], tensor->ne[1], tensor->ne[2], (int32_t)tensor->type});
         }
+        const char * shared_experts = getenv("GGML_MOE_CACHE_MTP_SHARED");
+        if (shared_experts && strcmp(shared_experts, "1") == 0 && compute_peer &&
+                compute_peer->cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+            for (const auto & entry : compute_peer->model.tensors_by_name) {
+                ggml_tensor * tensor = entry.second;
+                if (!tensor || entry.first.find("_exps") == std::string::npos ||
+                        !tensor->buffer || !ggml_backend_buffer_is_host(tensor->buffer) || !tensor->data ||
+                        tensor->ne[2] != compute_peer->model.hparams.n_expert || tensor->ne[3] != 1 ||
+                        !ggml_is_contiguous_2(tensor) || tensor->nb[1] != ggml_row_size(tensor->type, tensor->ne[0]) ||
+                        !ggml_moe_cache_wtype_supported(tensor->type)) {
+                    continue;
+                }
+                const auto duplicate = std::find_if(tensors.begin(), tensors.end(), [&](const ggml_moe_cache_tensor_desc & d) {
+                    return d.data == tensor->data;
+                });
+                if (duplicate == tensors.end()) {
+                    tensors.push_back({tensor->name, tensor->data, tensor->nb[2], tensor->ne[0], tensor->ne[1], tensor->ne[2], (int32_t)tensor->type});
+                }
+            }
+        }
         const int64_t started = ggml_time_us();
         const int ready = ggml_backend_sched_moe_cache_device_prepare(sched.get(), tensors.data(), (int)tensors.size());
         LLAMA_LOG_INFO("%s: deferred device expert prepare: tensors=%zu ready=%d elapsed_ms=%.3f phase=post-output-reserve-pregraph\n",
@@ -7453,6 +7485,16 @@ void llama_context::b1_end(bool failed) {
 }
 
 bool llama_context::b1_cache_graph_reset() {
+    const char * shared_experts = getenv("GGML_MOE_CACHE_MTP_SHARED");
+    if (shared_experts && strcmp(shared_experts, "1") == 0 && compute_peer &&
+            cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && !compute_peer->b1_cache_graph_reset()) {
+        return false;
+    }
+    if (shared_experts && strcmp(shared_experts, "1") == 0 && compute_peer &&
+            cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && compute_peer->sched) {
+        ggml_backend_sched_reset(compute_peer->sched.get());
+        compute_peer->sched_need_reserve = true;
+    }
     synchronize();
     // Cached CUDA graphs can retain pool addresses even after model graph metadata is discarded.
     for (ggml_backend_t backend : backend_ptrs) {

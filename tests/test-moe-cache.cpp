@@ -121,17 +121,17 @@ static void test_provider_session_leave(void * session) { (void) session; }
 static bool run_resume_lifecycle_cpu() {
     auto cpu = ggml_backend_cpu_init();
     if (!cpu) { return false; }
-    static int created, destroyed, resumed, configured, last_mode;
+    static int created, destroyed, resumed, configured, last_mode, entered, left;
     ggml_moe_cache_api api = {};
     api.owner = ggml_backend_dev_backend_reg(ggml_backend_get_device(cpu));
     const auto previous_api = ggml_moe_cache_get(api.owner);
     api.session_create = [](void * const *, int, const ggml_moe_cache_config *) -> void * {
         ++created;
-        return &created;
+        return new int(created);
     };
-    api.session_destroy = [](void *) { ++destroyed; };
-    api.session_enter = test_provider_session_enter;
-    api.session_leave = test_provider_session_leave;
+    api.session_destroy = [](void * p) { ++destroyed; delete (int *) p; };
+    api.session_enter = [](void * p) { entered = p ? *(int *) p : 0; };
+    api.session_leave = [](void * p) { left = p ? *(int *) p : 0; };
     api.prompt_resume = [](void *) { ++resumed; };
     api.prefetch_configure = [](void *, int mode) { ++configured; last_mode = mode; };
     bool ok = true;
@@ -161,6 +161,47 @@ static bool run_resume_lifecycle_cpu() {
         ggml_backend_sched_free(sched);
         ok &= destroyed == created;
     }
+    created = destroyed = entered = left = 0;
+    ggml_moe_cache_register(&api);
+    auto donor = ggml_backend_sched_new(&cpu, nullptr, 1, 32, false, true);
+    auto borrower = ggml_backend_sched_new(&cpu, nullptr, 1, 32, false, true);
+    ggml_backend_sched_set_moe_cache(borrower, GGML_MOE_CACHE_MODE_OFF, 0);
+    ok &= created == 2 && destroyed == 1;
+    ok &= ggml_backend_sched_set_moe_cache_donor(borrower, donor);
+    ok &= !ggml_backend_sched_set_moe_cache_donor(borrower, borrower);
+    ok &= !ggml_backend_sched_set_moe_cache_donor(donor, borrower);
+    ggml_init_params ip = {16 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true};
+    auto ctx = ggml_init(ip);
+    auto input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4);
+    auto output = ggml_scale(ctx, input, 2.0f);
+    ggml_set_input(input);
+    ggml_set_output(output);
+    auto graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, output);
+    auto compute = [&](int expected) {
+        entered = left = -1;
+        ggml_backend_sched_reset(borrower);
+        if (!ggml_backend_sched_alloc_graph(borrower, graph)) { return false; }
+        const float values[] = {1.0f, -2.0f, 3.0f, -4.0f};
+        ggml_backend_tensor_set(input, values, 0, sizeof(values));
+        if (ggml_backend_sched_graph_compute(borrower, graph) != GGML_STATUS_SUCCESS) { return false; }
+        float actual[4] = {};
+        ggml_backend_tensor_get(output, actual, 0, sizeof(actual));
+        bool same = entered == expected && left == expected;
+        for (int i = 0; i < 4; ++i) { same &= actual[i] == 2.0f * values[i]; }
+        return same;
+    };
+    ok &= compute(1);
+    ok &= ggml_backend_sched_moe_cache_suspend(donor);
+    ok &= compute(0);
+    ggml_backend_sched_moe_cache_resume(donor);
+    ok &= compute(3);
+    ok &= ggml_backend_sched_set_donor(borrower, nullptr);
+    ggml_backend_sched_free(donor);
+    ok &= compute(-1);
+    ggml_backend_sched_free(borrower);
+    ggml_free(ctx);
+    ok &= destroyed == created;
     ggml_moe_cache_unregister(api.owner);
     if (previous_api.owner) { ggml_moe_cache_register(&previous_api); }
     ggml_backend_free(cpu);
@@ -5154,6 +5195,11 @@ static bool run_device_adaptation(ggml_backend_t gpu, ggml_backend_t cpu, log_ca
     const size_t arena_log = log.find("device table arena bytes:");
     const size_t pool_log = log.find("pool[0]:");
     require((arena_log != std::string::npos && pool_log != std::string::npos && arena_log < pool_log), __LINE__);
+    const char * shared_mtp = getenv("GGML_MOE_CACHE_MTP_SHARED");
+    if (shared_mtp && strcmp(shared_mtp, "1") == 0 && arena_log != std::string::npos) {
+        const std::string arena_line = log.substr(arena_log, log.find('\n', arena_log) - arena_log);
+        require((max_field_value(arena_line, "entries=") >= 4 * (uint64_t) descriptor.n_expert), __LINE__);
+    }
     require((log.find("failure=none policy=materialized-before-expert-pools") != std::string::npos), __LINE__);
     require((log.find("policy=actual-allocator-padding") != std::string::npos), __LINE__);
     if (with_tuning) {

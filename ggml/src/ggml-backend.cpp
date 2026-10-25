@@ -1303,6 +1303,7 @@ struct ggml_backend_sched {
 
     struct ggml_context * ctx;
     void * moe_cache_session;
+    ggml_backend_sched_t moe_cache_donor;
     bool moe_cache_device_graph;
     // The provider table selected for this session. Copied at creation so a
     // later registration change cannot alter the session's callbacks.
@@ -2256,8 +2257,9 @@ static char causes[GGML_DEFAULT_GRAPH_SIZE*16 + GGML_SCHED_MAX_SPLITS_DEBUG*GGML
 // fork: a prepared cache keeps host expert sources out of scheduler copies.
 static bool ggml_backend_sched_moe_device_supports(ggml_backend_sched_t sched,
         const ggml_tensor * node, int backend_id) {
-    const bool supported = sched->moe_cache_session && sched->moe_cache_api.device_supports &&
-        sched->moe_cache_api.device_supports(sched->moe_cache_session,
+    auto * cache = sched->moe_cache_donor ? sched->moe_cache_donor : sched;
+    const bool supported = cache->moe_cache_session && cache->moe_cache_api.device_supports &&
+        cache->moe_cache_api.device_supports(cache->moe_cache_session,
                 sched->backends[backend_id], node);
     sched->moe_cache_device_graph |= supported;
     return supported;
@@ -3313,6 +3315,7 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
     auto * perf = ggml_backend_bookkeep_enabled() ? &sched->bookkeep : nullptr;
+    auto * cache = sched->moe_cache_donor ? sched->moe_cache_donor : sched;
 
     struct moe_cache_scope {
         void * session;
@@ -3346,10 +3349,10 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                 leave(session);
             }
         }
-    } cache_scope(sched->moe_cache_session,
-                  sched->moe_cache_api.session_enter,
-                  sched->moe_cache_api.session_leave,
-                  sched->moe_cache_api, perf,
+    } cache_scope(cache->moe_cache_session,
+                  cache->moe_cache_api.session_enter,
+                  cache->moe_cache_api.session_leave,
+                  cache->moe_cache_api, perf,
                   ggml_moe_expert_keep_policy{sched->moe_keep_default, sched->moe_keep_layer, sched->moe_keep_n_layer});
     if (t_vf_cur) { t_vf_cur->enter += ggml_sched_vf_lap(); }
 
@@ -3598,6 +3601,7 @@ void ggml_backend_sched_set_moe_cache(
         return;
     }
 
+    sched->moe_cache_donor = nullptr;
     if (sched->moe_cache_session && sched->moe_cache_api.session_destroy) {
         sched->moe_cache_api.session_destroy(sched->moe_cache_session);
     }
@@ -4001,6 +4005,7 @@ bool ggml_backend_sched_set_donor(ggml_backend_sched_t sched, ggml_backend_sched
         return false;
     }
     if (donor == NULL) {
+        sched->moe_cache_donor = nullptr;
         ggml_gallocr_set_donor(sched->galloc, NULL);
         return true;
     }
@@ -4013,6 +4018,22 @@ bool ggml_backend_sched_set_donor(ggml_backend_sched_t sched, ggml_backend_sched
         }
     }
     ggml_gallocr_set_donor(sched->galloc, donor->galloc);
+    return true;
+}
+
+bool ggml_backend_sched_set_moe_cache_donor(ggml_backend_sched_t sched, ggml_backend_sched_t donor) {
+    if (!sched || sched->moe_cache_session || (donor && (donor == sched || donor->moe_cache_donor))) {
+        return false;
+    }
+    if (donor) {
+        if (donor->n_backends != sched->n_backends) { return false; }
+        for (int i = 0; i < sched->n_backends; ++i) {
+            if (donor->bufts[i] != sched->bufts[i]) { return false; }
+        }
+    }
+    ggml_backend_sched_synchronize(sched);
+    sched->moe_cache_donor = donor;
+    ggml_backend_sched_reset(sched);
     return true;
 }
 
