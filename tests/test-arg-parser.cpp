@@ -376,6 +376,22 @@ static void test(void) {
     assert(spec_defaults.speculative.draft.n_max == 3);
     assert(spec_defaults.speculative.draft.n_min_adaptive == 3);
 
+    for (const std::string type : {"draft-mtp", "draft-mtp-adaptive"}) {
+        for (const std::string mode : {"default", "--spec-mb-mtp", "--no-spec-mb-mtp"}) {
+            argv = {"binary_name", "--spec-type", type};
+            if (mode != "default") { argv.push_back(mode); }
+            common_params mb;
+            assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), mb, LLAMA_EXAMPLE_SERVER));
+            const bool enabled = mode != "--no-spec-mb-mtp";
+            assert(mb.sampling.spec_lossy == enabled);
+            assert(mb.speculative.draft.n_max == (enabled ? 6 : 3));
+            argv.insert(argv.end(), {"--spec-draft-n-max", "4"});
+            common_params explicit_depth;
+            assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), explicit_depth, LLAMA_EXAMPLE_SERVER));
+            assert(explicit_depth.speculative.draft.n_max == 4);
+        }
+    }
+
     // MTP drafter attention window: off by default, the default context params carry no window,
     // and the cparams helper leaves them untouched when the flags are absent
     assert(spec_defaults.speculative.draft.attn_window == 0);

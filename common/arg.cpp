@@ -1415,17 +1415,19 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
         }
 
         const bool adaptive_mtp = std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE) != params.speculative.types.end();
+        const bool any_mtp = adaptive_mtp || std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+        if (any_mtp && !params.sampling.spec_lossy_explicit) {
+            params.sampling.spec_lossy = true;
+            LOG_INF("FYI: mb-MTP (mode-biased MTP) on by default with MTP; --no-spec-mb-mtp for exact sampling\n");
+        }
+        if (any_mtp && params.sampling.spec_lossy && !(params.speculative.user_set & COMMON_PARAMS_SPECULATIVE_USER_DRAFT_N_MAX)) {
+            params.speculative.draft.n_max = 6;
+        }
         if (adaptive_mtp && (params.speculative.draft.n_min_adaptive < 1 || params.speculative.draft.n_min_adaptive > params.speculative.draft.n_max)) {
             throw std::invalid_argument("error: --spec-draft-n-min-adaptive must be in [1, --spec-draft-n-max]");
         }
         if (params.speculative.draft.depth_policy == "cdepth" && !adaptive_mtp) {
             throw std::invalid_argument("error: --spec-depth-policy cdepth needs --spec-type draft-mtp-adaptive");
-        }
-        const bool any_mtp = adaptive_mtp || std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
-        if (any_mtp && !params.sampling.spec_lossy_explicit) {
-            params.sampling.spec_lossy = true;
-            LOG_INF("FYI: mode-biased MTP (--spec-mb-mtp) is on by default with MTP drafting; it can change wording slightly with no measured accuracy loss. "
-                    "To turn it off: --no-spec-mb-mtp\n");
         }
 
         params.lr.init();
@@ -5015,7 +5017,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--spec-mb-mtp"},
         {"--no-spec-mb-mtp"},
-        "mode-biased MTP: keep a rejected draft if p(draft) >= p(residual replacement), excluding EOG and stop tokens; "
+        "mb-MTP (mode-biased MTP) on by default with MTP; --no-spec-mb-mtp for exact sampling. Keep a rejected draft if p(draft) >= p(residual replacement), excluding EOG and stop tokens; "
         "--no-spec-mb-mtp keeps exact (lossless) acceptance (default: on with --spec-type draft-mtp or draft-mtp-adaptive, otherwise off)",
         [](common_params & params, bool value) {
             params.sampling.spec_lossy = value;

@@ -602,3 +602,7 @@ statistics ngram_map_k: #calls(b,g,a) = 6 1690 26, #gen drafts = 26, #acc drafts
 
 To measure the end-to-end effect of speculative decoding (throughput, latency, and draft acceptance) across diverse prompts, see the SPEED-Bench client in [tools/server/bench/speed-bench](../tools/server/bench/speed-bench/README.md).
 It runs against a running `llama-server` and can compare a baseline run against a speculative-decoding run.
+
+## Mode-biased MTP
+
+mb-MTP (mode-biased MTP) on by default with MTP; --no-spec-mb-mtp for exact sampling. It uses a default maximum draft depth of 6 when enabled. Explicit `--spec-draft-n-max` values take precedence. Use `--spec-mb-mtp` to enable it explicitly or `LLAMA_ARG_SPEC_MB_MTP=0` to opt out through the environment. Mode-biased acceptance can change output; exact output, cache identity, and KL comparisons must pass `--no-spec-mb-mtp`.
