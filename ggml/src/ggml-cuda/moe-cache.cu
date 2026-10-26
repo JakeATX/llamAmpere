@@ -2649,6 +2649,7 @@ static bool moe_cache_build_global_profile(moe_cache_session & session, moe_cach
     for (size_t p = 0; p < pending.size(); ++p) {
         if (entries[p] != pending[p]->n_entries || tensor_counts[p] != (size_t)pending[p]->n_tensors) { return false; }
     }
+    const bool whole_only = moe_cache_env_on("GGML_MOE_CACHE_WHOLE_ONLY");
     ggml_cuda_moe_profile_plan plan;
     int64_t density_value = 0;
     const bool density = !session.profile_ranked && moe_cache_env_i64("GGML_MOE_CACHE_PROFILE_GLOBAL_DENSITY", 0, 1, density_value) && density_value;
@@ -2666,7 +2667,7 @@ static bool moe_cache_build_global_profile(moe_cache_session & session, moe_cach
         device.profile_global_selected.clear();
         for (size_t i = 0; i < keys.size(); ++i) {
             device.profile_global_ranks.emplace(keys[i], plan.ranks[i]);
-            if (moe_cache_env_on("GGML_MOE_CACHE_WHOLE_ONLY") && plan.selected[i]) { device.profile_global_selected.insert(keys[i]); }
+            if (whole_only && plan.selected[i]) { device.profile_global_selected.insert(keys[i]); }
         }
         device.profile_global_slots = plan.slots;
         device.profile_global_bytes = plan.bytes;
@@ -2709,7 +2710,7 @@ static bool moe_cache_build_global_profile(moe_cache_session & session, moe_cach
                 device.physical, ggml_type_name((ggml_type)pending[p]->wtype), pending[p]->expert_size, plan.slots[p], actual);
     }
     // fork: allocator headroom can shorten a pool; keep only bundles that fit all actual pools.
-    if (moe_cache_env_on("GGML_MOE_CACHE_WHOLE_ONLY")) {
+    if (whole_only) {
         for (size_t p = 0; p < pending.size(); ++p) {
             const int pool = pending[p]->pool;
             caps[p] = pool >= 0 ? (size_t)device.pools[pool]->n_slots : 0;
