@@ -1152,20 +1152,27 @@ static void run_qwen4exp_compact_pool(bool cuda) {
     compare(6, 13);
     compare(13, 32);
     auto saved = save(compact.get(), 0);
+    auto saved_legacy = save(legacy.get(), 0);
     auto resumed = make_context(true);
+    auto resumed_legacy = make_context(false);
     require(llama_state_seq_set_data_ext(resumed.get(), saved.data(), saved.size(), 0,
                 LLAMA_STATE_SEQ_FLAGS_KEEP_LAYOUT) == saved.size(), "restore compact pool raw cache");
+    require(llama_state_seq_set_data_ext(resumed_legacy.get(), saved_legacy.data(), saved_legacy.size(), 0,
+                LLAMA_STATE_SEQ_FLAGS_KEEP_LAYOUT) == saved_legacy.size(), "restore legacy pool control cache");
     require(save(resumed.get(), 0) == saved, "compact raw cache round-trips exactly");
+    require(save(resumed_legacy.get(), 0) == saved_legacy, "legacy control cache round-trips exactly");
     const auto continuation = compare(32, 37);
     const auto restored = decode(resumed.get(), 32, 37);
+    const auto restored_legacy = decode(resumed_legacy.get(), 32, 37);
     require(continuation.size() == restored.size(), "restored compact output shape");
+    require(restored_legacy.size() == restored.size(), "restored compact and legacy output shape");
     float restore_error = 0;
     for (size_t i = 0; i < restored.size(); ++i) {
         require(std::isfinite(restored[i]), "finite compact restored logits");
         restore_error = std::max(restore_error, std::abs(continuation[i] - restored[i]));
     }
-    require(std::memcmp(continuation.data(), restored.data(), restored.size()*sizeof(float)) == 0,
-            "compact pool restored continuation bytes match");
+    require(std::memcmp(restored_legacy.data(), restored.data(), restored.size()*sizeof(float)) == 0,
+            "compact and legacy restored continuation bytes match");
     compare(37, 64);
     const auto capacity = memory(compact.get())->get_mem_idx()->get_size();
     require(capacity == memory(legacy.get())->get_mem_idx()->get_size(), "compact pool raw capacity unchanged");
