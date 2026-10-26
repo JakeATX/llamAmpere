@@ -14,7 +14,8 @@
 #include "../ggml/src/ggml-cuda/moe-cpu-split.h"
 #include "ggml.h"
 #include "ggml-cpu.h"
-#include "../ggml/src/ggml-cpu/quants.h"
+#define GGML_COMMON_DECL_CPP
+#include "../ggml/src/ggml-common.h"
 
 #include <algorithm>
 #include <atomic>
