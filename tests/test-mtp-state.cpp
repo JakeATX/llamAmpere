@@ -929,8 +929,14 @@ static void run_qwen4exp_indexer_layout(bool cuda) {
         }
         if (parallel > 1) { append(1, 137, 5, 19); }
         for (int suffix : { 1, 3, 7 }) {
+            // Shift-skip rollback retains only this ubatch's previous states.
+            append(0, pos, suffix + 1);
+            pos += suffix + 1;
             for (auto * ctx : { full.get(), compact.get() }) {
-                require(llama_memory_seq_rm(llama_get_memory(ctx), 0, pos - suffix, -1), "rollback partial indexer pool");
+                const bool removed = llama_memory_seq_rm(llama_get_memory(ctx), 0, pos - suffix, -1);
+                fprintf(stderr, "INDEXER_ROLLBACK arm=%s streams=%u pos=%d suffix=%d removed=%d\n",
+                        ctx == full.get() ? "full" : "compact", parallel, pos, suffix, removed);
+                require(removed, "rollback partial indexer pool");
             }
             append(0, pos - suffix, suffix, suffix);
         }
