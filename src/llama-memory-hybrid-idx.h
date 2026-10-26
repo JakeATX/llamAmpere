@@ -82,6 +82,7 @@ public:
     llama_kv_cache * get_mem_idx() const;   // nullptr when the model carries no indexer
 
     bool has_compact_pool() const { return compact_pool; }
+    bool has_host_raw() const { return host_raw; }
     ggml_tensor * get_pool_storage(int32_t il) const;
 
     // The model's indexer pool size.
@@ -120,6 +121,7 @@ private:
 
     // fork: raw rows remain available for arbitrary sequence edits and rollback.
     bool compact_pool = false;
+    bool host_raw = false;
     std::vector<ggml_tensor *> pool_storage;
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> pool_buffers;
 
@@ -149,6 +151,9 @@ public:
         ggml_tensor * scatter_pooled(ggml_tensor * values, ggml_tensor * idxs) const;
         ggml_tensor * gather_pooled(ggml_tensor * idxs) const;
         int64_t get_n_cells() const { return pooled->ne[1]; }
+        ggml_backend_dev_t get_pool_device() const {
+            return ggml_backend_buft_get_device(ggml_backend_buffer_get_type(pooled->buffer));
+        }
 
     private:
         friend class llama_memory_hybrid_idx_context;
@@ -203,6 +208,7 @@ public:
     // nullptr with no indexer
     const llama_kv_cache_context * get_idx() const;
     bool has_compact_pool() const { return mem && mem->has_compact_pool(); }
+    bool has_host_raw() const { return mem && mem->has_host_raw(); }
 
     // streams in the current slot info, the `ns` of get_k/get_v; 1 if unified
     uint32_t get_n_stream() const;

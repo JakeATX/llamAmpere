@@ -66,6 +66,10 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
                 model.hparams.indexer_kpool_row == 2 &&
                 (sj_kvarn.enabled() || rotating || type_k == GGML_TYPE_F16);
     }()),
+    host_raw([&] {
+        const char * value = std::getenv("LLAMA_QSA_RAW_HOST");
+        return compact_pool && value && std::atoi(value) != 0;
+    }()),
     hparams_idx(model.hparams),
     mem_idx(filter_idx == nullptr ? nullptr : [&] {
         // MQA with a single key head of indexer_head_size, as llama_kv_cache_dsa shapes its own
@@ -95,7 +99,7 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells, type = %s\n", __func__, kv_size, ggml_type_name(type_k_idx));
 
         return new llama_kv_cache(
-            model, hparams_idx, type_k_idx, type_v_idx, v_trans, offload, unified_idx,
+            model, hparams_idx, type_k_idx, type_v_idx, v_trans, offload && !host_raw, unified_idx,
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
             nullptr, filter_idx, nullptr, nullptr, "idx_");
     }()) {
@@ -110,7 +114,9 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             }
             auto * pooled = ggml_new_tensor_2d(ctx.get(), raw->type, raw->ne[0], raw->ne[1]/get_kpool() + 1);
             ggml_format_name(pooled, "idx_pool_compact_%u", il);
-            const auto buft = ggml_backend_buffer_get_type(raw->buffer);
+            // Raw F16 history may live on the host, but scored pools retain their original device.
+            const auto buft = host_raw && offload ? ggml_backend_dev_buffer_type(model.dev_layer(il)) :
+                    ggml_backend_buffer_get_type(raw->buffer);
             ggml_backend_buffer_ptr buffer(model.hparams.no_alloc ? ggml_backend_buft_alloc_buffer(buft, 0) :
                     ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
             if (!buffer) {
@@ -121,8 +127,8 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             } else {
                 ggml_backend_buffer_clear(buffer.get(), 0);
             }
-            LLAMA_LOG_INFO("%s: layer %u compact indexer pool: %lld rows, %.3f MiB (raw rows retained)\n",
-                    __func__, il, (long long) pooled->ne[1], ggml_backend_buffer_get_size(buffer.get())/1048576.0);
+            LLAMA_LOG_INFO("%s: layer %u compact indexer pool: %lld rows, %.3f MiB (raw rows retained on %s)\n",
+                    __func__, il, (long long) pooled->ne[1], ggml_backend_buffer_get_size(buffer.get())/1048576.0, host_raw ? "host" : "original backend");
             pool_storage[il] = pooled;
             pool_buffers.emplace_back(std::move(ctx), std::move(buffer));
         }

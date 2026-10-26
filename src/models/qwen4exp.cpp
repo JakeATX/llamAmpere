@@ -1610,13 +1610,31 @@ void llama_model_qwen4exp::graph::build_qsa_store(
         packed = ggml_concat(ctx0, k_raw, pzero, 0);
     }
     packed = ggml_reshape_3d(ctx0, packed, packed->ne[0], 1, n_tokens);
-    ggml_build_forward_expand(gf, mctx_idx->cpy_k(ctx0, packed, inp_kpool->k_idxs, il));
+    auto * raw_write = mctx_idx->cpy_k(ctx0, packed, inp_kpool->k_idxs, il);
+    if (mctx_hyb->has_host_raw()) {
+        // Only fresh keys cross to the host; never migrate the full original-key history.
+        ggml_backend_sched_set_tensor_backend(sched, raw_write, backend_cpu);
+    }
+    ggml_build_forward_expand(gf, raw_write);
 
     // the raw keys and the persistent pooled slots, see llama_memory_hybrid_idx::mem_idx_stale
     auto kpool_cache = mctx_hyb->get_kpool_access(ctx0, il, idx_dim);
 
     // pool only the blocks this ubatch completes or regroups
     ggml_tensor * rows = kpool_cache.gather_key_gate(ggml_reshape_1d(ctx0, inp_kpool->new_pool_idxs, kpool*n_new));
+    ggml_backend_t pool_backend = nullptr;
+    if (mctx_hyb->has_host_raw()) {
+        // Gather before transferring: only the members of new/stale pools visit the device.
+        ggml_backend_sched_set_tensor_backend(sched, rows, backend_cpu);
+        for (int b = 0; b < ggml_backend_sched_get_n_backends(sched); ++b) {
+            auto * backend = ggml_backend_sched_get_backend(sched, b);
+            if (ggml_backend_get_device(backend) == kpool_cache.get_pool_device()) {
+                pool_backend = backend;
+                break;
+            }
+        }
+        GGML_ASSERT(pool_backend);
+    }
     rows = ggml_reshape_3d(ctx0, rows, idx_dim, kpool, n_new);
 
     // mean over the members; kpool is small, so summing slices beats a transpose plus sum_rows
@@ -1624,8 +1642,14 @@ void llama_model_qwen4exp::graph::build_qsa_store(
     for (int64_t i = 0; i < kpool; ++i) {
         ggml_tensor * slice = ggml_view_2d(ctx0, rows, idx_dim, n_new, rows->nb[2], i*rows->nb[1]);
         pooled_new = pooled_new ? ggml_add(ctx0, pooled_new, slice) : ggml_cont(ctx0, slice);
+        if (pool_backend) {
+            ggml_backend_sched_set_tensor_backend(sched, pooled_new, pool_backend);
+        }
     }
     pooled_new = ggml_scale(ctx0, pooled_new, 1.0f/(float) kpool);
+    if (pool_backend) {
+        ggml_backend_sched_set_tensor_backend(sched, pooled_new, pool_backend);
+    }
     pooled_new = build_norm(pooled_new, model.layers[il].index_k_norm, nullptr, LLM_NORM_RMS, il);
 
     pooled_new = ggml_reshape_3d(ctx0, pooled_new, idx_dim, 1, n_new);

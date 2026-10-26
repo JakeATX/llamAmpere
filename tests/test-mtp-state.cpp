@@ -767,6 +767,7 @@ static void run_mtp_pipe() {
 
 // fork: exercise production pooling, attention and serialization without an evaluation callback that changes CUDA fusion.
 static void run_qwen4exp_indexer_layout(bool cuda) {
+    const bool host_requested = common_get_env("LLAMA_QSA_RAW_HOST") == "1";
     const bool trace = common_get_env("LLAMA_TEST_INDEXER_TRACE") == "1";
     struct trace_state {
         const char * arm;
@@ -832,6 +833,16 @@ static void run_qwen4exp_indexer_layout(bool cuda) {
         }
         llama_context_ptr ctx(llama_init_from_model(source ? source : model.get(), cp));
         require(ctx != nullptr, "create indexer layout target");
+        auto * mem = dynamic_cast<llama_memory_hybrid_idx *>(llama_get_memory(ctx.get()));
+        require(mem && mem->has_host_raw() == (host_requested && compact && parallel == 1),
+                "host history follows compact target eligibility");
+        if (mem->has_host_raw()) {
+            require(ggml_backend_buffer_is_host(mem->get_mem_idx()->get_k_storage(1)->buffer),
+                    "original F16 history is allocated on the host");
+            require(mem->get_pool_storage(1) &&
+                    ggml_backend_buffer_is_host(mem->get_pool_storage(1)->buffer) == !cuda,
+                    "scored pools keep their original compute backend");
+        }
         return ctx;
     };
     for (uint32_t parallel : { 1u, 2u }) {
@@ -969,8 +980,9 @@ static void run_qwen4exp_indexer_layout(bool cuda) {
         for (size_t i = 0; i < resumed_full.size(); ++i) {
             restore_error = std::max(restore_error, std::abs(expected_full[i] - resumed_full[i]));
         }
-        printf("PASS indexer layout %s streams=%u checks=%zu pools=%zu full_bytes=%zu compact_bytes=%zu baseline_restore_error=%.9g: ragged prefill, rollback, restore and exact logits\n",
-                cuda ? "GPU" : "CPU", parallel, checked, pools_checked, full_bytes, compact_bytes, restore_error);
+        printf("PASS indexer layout %s streams=%u checks=%zu pools=%zu full_bytes=%zu compact_bytes=%zu baseline_restore_error=%.9g host_raw=%d: ragged prefill, rollback, restore and exact logits\n",
+                cuda ? "GPU" : "CPU", parallel, checked, pools_checked, full_bytes, compact_bytes, restore_error,
+                host_requested && parallel == 1);
     }
 }
 
