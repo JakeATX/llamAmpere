@@ -8,6 +8,7 @@
 // --qwen4exp-compact[-cuda]-only additionally uses compact QSA and TQ5/TURBO4 helper KV.
 // --qwen4exp-pool-only checks incremental pool metadata with the differential validator enabled.
 // --qwen4exp-pool-store[-cuda]-only checks specialized KV-only pool inputs and full-graph continuation.
+// --qwen4exp-indexer-layout[-cuda]-only compares compact and full indexer storage with identical target inputs.
 // --qwen4exp-full-head[-cuda]-only checks batched full-head proposals and exact sequential suffix repair.
 // --tail-chunks checks ragged prefill and restoration; add --device CUDA0 to run that matrix on CUDA.
 
@@ -503,6 +504,7 @@ struct feedback_env_restore {
     std::string deferred = common_get_env("LLAMA_SPEC_DEFER_CATCHUP");
     std::string chain = common_get_env("LLAMA_MTP_QWEN4EXP_CHAIN");
     std::string compact = common_get_env("LLAMA_MTP_QSA_COMPACT");
+    std::string indexer_compact = common_get_env("LLAMA_QSA_POOL_COMPACT");
     std::string sampled = common_get_env("LLAMA_SPEC_CHAIN_SAMPLED");
     std::string pq = common_get_env("LLAMA_SPEC_PQ");
     std::string full_head = common_get_env("LLAMA_MTP_CHAIN_FULL_HEAD");
@@ -516,6 +518,7 @@ struct feedback_env_restore {
         common_set_env("LLAMA_SPEC_DEFER_CATCHUP", deferred);
         common_set_env("LLAMA_MTP_QWEN4EXP_CHAIN", chain);
         common_set_env("LLAMA_MTP_QSA_COMPACT", compact);
+        common_set_env("LLAMA_QSA_POOL_COMPACT", indexer_compact);
         common_set_env("LLAMA_SPEC_CHAIN_SAMPLED", sampled);
         common_set_env("LLAMA_SPEC_PQ", pq);
         common_set_env("LLAMA_MTP_CHAIN_FULL_HEAD", full_head);
@@ -751,6 +754,160 @@ static void run_mtp_pipe() {
     }
     common_set_env("LLAMA_MTP_PIPELINE", pipe_env);
     printf("PASS Qwen4exp GPU pipelined guess steps: bit-identical logits with the next step queued, released step, rollback, timeout fallback, driver schedules\n");
+}
+
+// fork: exercise production pooling, attention and serialization without an evaluation callback that changes CUDA fusion.
+static void run_qwen4exp_indexer_layout(bool cuda) {
+    prefill_env_restore prefill_env;
+    prefill_env.set(false, false, false);
+    feedback_env_restore feedback_env;
+    common_set_env("LLAMA_MTP_QSA_COMPACT", "0");
+    common_set_env("LLAMA_MTP_QWEN4EXP_CHAIN", "0");
+    auto * device = cuda ? ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU) : nullptr;
+    require(!cuda || device, "indexer layout GPU backend is available");
+    model_geometry geometry;
+    geometry.embd = geometry.head_dim = 128;
+    geometry.rope_dim = 64;
+    geometry.kpool = 4;
+    geometry.indexer_top_k = 8;
+    llama_model_ptr model(make_model(false, geometry, LLM_ARCH_QWEN4EXP, device));
+    auto make_context = [&](bool compact, uint32_t parallel, llama_model * source = nullptr) {
+        common_set_env("LLAMA_QSA_POOL_COMPACT", compact ? "1" : "0");
+        auto cp = llama_context_default_params();
+        cp.n_ctx = 4096*parallel;
+        cp.n_batch = cp.n_ubatch = 512;
+        cp.n_seq_max = parallel;
+        cp.kv_unified = false;
+        cp.n_rs_seq = 8;
+        cp.n_threads = cp.n_threads_batch = 2;
+        cp.offload_kqv = cuda;
+        cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        cp.type_k = cp.type_v = GGML_TYPE_F16;
+        cp.sj_kvarn_bits_k = cp.sj_kvarn_bits_v = 4;
+        cp.sj_kvarn_staging_type = GGML_TYPE_TQ6_0;
+        cp.sj_kvarn_sink_type = GGML_TYPE_F16;
+        cp.sj_kvarn_sink = 128;
+        cp.sj_kvarn_tail = 128;
+        cp.sj_kvarn_tail_max = 256;
+        llama_context_ptr ctx(llama_init_from_model(source ? source : model.get(), cp));
+        require(ctx != nullptr, "create indexer layout target");
+        return ctx;
+    };
+    for (uint32_t parallel : { 1u, 2u }) {
+        auto full = make_context(false, parallel);
+        auto compact = make_context(true, parallel);
+        const auto indexer_bytes = [](llama_context * ctx) {
+            auto * mem = dynamic_cast<llama_memory_hybrid_idx *>(llama_get_memory(ctx));
+            require(mem && mem->get_mem_idx(), "target has an indexer cache");
+            auto * pooled = mem->get_pool_storage(1);
+            return ggml_nbytes(mem->get_mem_idx()->get_k_storage(1)) + (pooled ? ggml_nbytes(pooled) : 0);
+        };
+        const size_t full_bytes = indexer_bytes(full.get()), compact_bytes = indexer_bytes(compact.get());
+        if (parallel == 1) {
+            require(compact_bytes < full_bytes, "compact mode actually reduces the indexer allocation");
+            llama_model_ptr probe_model(make_model(true, geometry, LLM_ARCH_QWEN4EXP, device));
+            auto probe = make_context(true, parallel, probe_model.get());
+            require(llama_get_memory(probe.get())->memory_breakdown() == llama_get_memory(compact.get())->memory_breakdown(),
+                    "no-allocation fit probe accounts for all compact pool buffers");
+        } else {
+            require(compact_bytes == full_bytes, "multiple streams use the full-layout fallback");
+        }
+        size_t checked = 0;
+        auto decode = [&](llama_context * ctx, llama_seq_id seq, llama_pos from, int count, int salt) {
+            common_batch batch(ctx);
+            for (int i = 0; i < count; ++i) {
+                batch.add(token_at(from + i + salt), from + i, seq, i == count - 1);
+            }
+            require(llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0, "decode indexer layout target");
+            const float * logits = llama_get_logits_ith(ctx, -1);
+            require(logits != nullptr, "indexer layout output exists");
+            return std::vector<float>(logits, logits + n_vocab);
+        };
+        const auto compare = [&](const std::vector<float> & a, const std::vector<float> & b) {
+            for (size_t i = 0; i < a.size(); ++i) {
+                require(std::isfinite(a[i]) && std::isfinite(b[i]), "finite indexer layout logits");
+                if (std::memcmp(&a[i], &b[i], sizeof(float)) != 0) {
+                    fprintf(stderr, "INDEXER_LAYOUT_MISMATCH check=%zu token=%zu full=%.9g compact=%.9g\n", checked, i, a[i], b[i]);
+                    require(false, "compact layout preserves target logits exactly");
+                }
+            }
+            ++checked;
+        };
+        size_t pools_checked = 0;
+        const auto compare_pools = [&](llama_context * reference, llama_context * candidate) {
+            if (parallel != 1) { return; }
+            auto * ref = dynamic_cast<llama_memory_hybrid_idx *>(llama_get_memory(reference));
+            auto * got = dynamic_cast<llama_memory_hybrid_idx *>(llama_get_memory(candidate));
+            auto * raw = ref->get_mem_idx()->get_k_storage(1);
+            auto * pooled = got->get_pool_storage(1);
+            require(pooled && pooled->type == GGML_TYPE_F16, "compact pooled keys retain F16 storage");
+            const auto & cells = ref->get_mem_idx()->get_cells(0).seq_pos_get(0);
+            const size_t row_bytes = ggml_row_size(GGML_TYPE_F16, geometry.head_dim);
+            std::vector<uint8_t> before(ggml_nbytes(raw)), after(cells.size()/geometry.kpool*row_bytes);
+            ggml_backend_tensor_get(raw, before.data(), 0, before.size());
+            if (!after.empty()) { ggml_backend_tensor_get(pooled, after.data(), 0, after.size()); }
+            size_t rank = 0;
+            for (const auto & cell : cells) {
+                if (++rank % geometry.kpool != 0) { continue; }
+                const size_t pool = rank/geometry.kpool - 1;
+                require(std::memcmp(before.data() + cell.second*raw->nb[1] + row_bytes,
+                            after.data() + pool*row_bytes, row_bytes) == 0,
+                        "compact and full pooled keys match byte for byte");
+                ++pools_checked;
+            }
+        };
+        auto append = [&](llama_seq_id seq, llama_pos from, int count, int salt = 0) {
+            compare(decode(full.get(), seq, from, count, salt), decode(compact.get(), seq, from, count, salt));
+            compare_pools(full.get(), compact.get());
+        };
+        // Ragged chunks cross partial-pool and seal boundaries with many more raw cells than pooled slots.
+        llama_pos pos = 0;
+        const int widths[] = { 257, 1, 3, 511, 5, 127, 8, 256 };
+        for (size_t i = 0; pos < 3073; ++i) {
+            const int count = std::min<int>(widths[i % 8], 3073 - pos);
+            append(0, pos, count);
+            pos += count;
+            if (parallel > 1 && i == 2) { append(1, 0, 137, 19); }
+        }
+        if (parallel > 1) { append(1, 137, 5, 19); }
+        for (int suffix : { 1, 3, 7 }) {
+            for (auto * ctx : { full.get(), compact.get() }) {
+                require(llama_memory_seq_rm(llama_get_memory(ctx), 0, pos - suffix, -1), "rollback partial indexer pool");
+            }
+            append(0, pos - suffix, suffix, suffix);
+        }
+        if (parallel > 1) {
+            for (auto * ctx : { full.get(), compact.get() }) {
+                require(llama_memory_seq_rm(llama_get_memory(ctx), 1, -1, -1), "clear second indexer stream");
+                llama_memory_seq_cp(llama_get_memory(ctx), 0, 1, -1, -1);
+            }
+            append(1, pos, 3, 31);
+        }
+        append(0, pos, 5, 7);
+        std::array<std::vector<uint8_t>, 2> states { save(full.get(), 0), save(compact.get(), 0) };
+        const auto expected_full = decode(full.get(), 0, pos + 5, 8, 11);
+        const auto expected_compact = decode(compact.get(), 0, pos + 5, 8, 11);
+        compare(expected_full, expected_compact);
+        auto restored_full = make_context(false, parallel);
+        auto restored_compact = make_context(true, parallel);
+        size_t mode = 0;
+        for (auto * ctx : { restored_full.get(), restored_compact.get() }) {
+            const auto & state = states[mode++];
+            require(llama_state_seq_set_data_ext(ctx, state.data(), state.size(), 0, LLAMA_STATE_SEQ_FLAGS_KEEP_LAYOUT) == state.size(),
+                    "restore indexer layout into a fresh context");
+            require(save(ctx, 0) == state, "indexer layout state round trip is byte exact");
+        }
+        const auto resumed_full = decode(restored_full.get(), 0, pos + 5, 8, 11);
+        const auto resumed_compact = decode(restored_compact.get(), 0, pos + 5, 8, 11);
+        compare(resumed_full, resumed_compact);
+        compare_pools(restored_full.get(), restored_compact.get());
+        float restore_error = 0;
+        for (size_t i = 0; i < resumed_full.size(); ++i) {
+            restore_error = std::max(restore_error, std::abs(expected_full[i] - resumed_full[i]));
+        }
+        printf("PASS indexer layout %s streams=%u checks=%zu pools=%zu full_bytes=%zu compact_bytes=%zu baseline_restore_error=%.9g: ragged prefill, rollback, restore and exact logits\n",
+                cuda ? "GPU" : "CPU", parallel, checked, pools_checked, full_bytes, compact_bytes, restore_error);
+    }
 }
 
 static void run_qwen4exp_pool(bool cuda = false, bool store_only = false) {
@@ -3434,11 +3591,12 @@ int main(int argc, char ** argv) {
     const bool full_head_cuda = argc == 2 && std::strcmp(argv[1], "--qwen4exp-full-head-cuda-only") == 0;
     const bool pool_store_cuda = argc == 2 && std::strcmp(argv[1], "--qwen4exp-pool-store-cuda-only") == 0;
     if (pin_host) { common_set_env("LLAMA_MTP_PIN_BORROWED_HOST", "1"); }
+    const bool indexer_layout_cuda = argc == 2 && std::strcmp(argv[1], "--qwen4exp-indexer-layout-cuda-only") == 0;
     const bool pool_cuda = argc == 2 && std::strcmp(argv[1], "--qwen4exp-pool-cuda-only") == 0;
     const bool compact_pool_cuda = argc == 2 && std::strcmp(argv[1], "--qwen4exp-compact-pool-cuda-only") == 0;
     const bool defer_math_cuda = argc == 3 && std::strcmp(argv[1], "--bookkeep-defer-math-cuda") == 0;
     if (cuda_sharing || feedback_cuda || pipe_cuda || chain_cuda || compact_cuda || full_head_cuda || pool_store_cuda || pool_cuda ||
-            defer_math_cuda || compact_pool_cuda) { ggml_backend_load_all(); }
+            defer_math_cuda || indexer_layout_cuda || compact_pool_cuda) { ggml_backend_load_all(); }
     llama_backend_init();
     int failed = 0;
     llama_model * model = nullptr;
@@ -3485,6 +3643,11 @@ int main(int argc, char ** argv) {
         }
         if (feedback_cuda || (argc == 2 && std::strcmp(argv[1], "--device-feedback-only") == 0)) {
             run_device_feedback(feedback_cuda);
+            llama_backend_free();
+            return 0;
+        }
+        if (indexer_layout_cuda || (argc == 2 && std::strcmp(argv[1], "--qwen4exp-indexer-layout-only") == 0)) {
+            run_qwen4exp_indexer_layout(indexer_layout_cuda);
             llama_backend_free();
             return 0;
         }

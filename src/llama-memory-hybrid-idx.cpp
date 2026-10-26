@@ -60,9 +60,10 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         const char * value = std::getenv("LLAMA_QSA_POOL_COMPACT");
         const bool rotating = type_k == GGML_TYPE_TURBO2_0 || type_k == GGML_TYPE_TURBO3_0 ||
                 type_k == GGML_TYPE_TURBO4_0 || type_k == GGML_TYPE_TQ5_0 || type_k == GGML_TYPE_TQ6_0;
-        return value && std::atoi(value) != 0 && filter_idx && n_seq_max == 1 &&
+        return value && std::atoi(value) != 0 && filter_idx && n_seq_max == 1 && n_swa == 0 &&
                 model.arch == LLM_ARCH_QWEN4EXP && !filter_idx(model.hparams.n_layer()) &&
-                model.hparams.indexer_kpool > 1 && model.hparams.indexer_kpool_row == 2 &&
+                model.hparams.indexer_kpool_by_order && model.hparams.indexer_kpool > 1 &&
+                model.hparams.indexer_kpool_row == 2 &&
                 (sj_kvarn.enabled() || rotating || type_k == GGML_TYPE_F16);
     }()),
     hparams_idx(model.hparams),
