@@ -12968,6 +12968,60 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
+// Compare explicit and prefix masks within each backend, including sequence broadcast and partial tiles.
+struct test_flash_attn_ext_implicit : public test_flash_attn_ext {
+    const bool random_prefix;
+
+    test_flash_attn_ext_implicit(int64_t hs, int64_t kv, int64_t nb, bool random_prefix)
+        : test_flash_attn_ext(hs, hs, 2, {2, 2}, kv, nb), random_prefix(random_prefix) {}
+
+    std::string vars() override {
+        return test_flash_attn_ext::vars() + ",implicit=1,random=" + std::to_string(random_prefix);
+    }
+
+    std::string op_desc(ggml_tensor *) override { return "FLASH_ATTN_EXT"; }
+
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = test_flash_attn_ext::build_graph(ctx);
+        ggml_tensor * mi = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, 1, nb, 1, nr23[1]);
+        ggml_set_name(mi, "mi");
+        ggml_tensor * oi = ggml_flash_attn_ext(ctx, out->src[0], out->src[1], out->src[2], mi,
+                                             1.0f/sqrtf(hsk), max_bias, logit_softcap);
+        ggml_prec_set_acc(oi, prec);
+        return ggml_concat(ctx, out, oi, 0);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        // Initialize I32 limits separately; the generic random initializer is intended for indices.
+        test_flash_attn_ext::initialize_tensors(ctx);
+        std::mt19937 gen(0x1A9C);
+        std::vector<int32_t> limits(nb*nr23[1]);
+        std::vector<ggml_fp16_t> mask(kv*limits.size(), ggml_fp32_to_fp16(-INFINITY));
+        for (size_t row = 0; row < limits.size(); ++row) {
+            limits[row] = random_prefix ? 1 + gen()%kv : std::max<int64_t>(1, kv - nb + row%nb + 1 - 3*(row/nb));
+            std::fill_n(mask.data() + row*kv, limits[row], ggml_fp32_to_fp16(0.0f));
+        }
+        ggml_backend_tensor_set(ggml_get_tensor(ctx, "m"), mask.data(), 0, mask.size()*sizeof(ggml_fp16_t));
+        ggml_backend_tensor_set(ggml_get_tensor(ctx, "mi"), limits.data(), 0, limits.size()*sizeof(int32_t));
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        const size_t row_size = 2*hsv;
+        GGML_ASSERT(n%row_size == 0);
+        for (const float * x : {a, b}) {
+            for (size_t row = 0; row < n/row_size; ++row) {
+                if (memcmp(x + row*row_size, x + row*row_size + hsv, hsv*sizeof(float)) != 0) {
+                    printf("implicit mask differs from explicit mask at row %zu ", row);
+                    return INFINITY;
+                }
+            }
+        }
+        return test_case::err(a, b, n);
+    }
+};
+
 // mask rows strided inside a wider buffer, like the in-place QSA selection mask (LLAMA_QSA_SEL_INPLACE)
 struct test_flash_attn_ext_strided_mask : public test_flash_attn_ext {
     const int64_t pad;
@@ -17175,6 +17229,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {512, 512, 1, 1}, 0, 1, 0, 1, 0, 0, 0, 0, tfrm, circular));
             test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {11, 22, 33, 44}, 1, 2, 3, 4, 5, 6, 7, 8, tfrm, circular));
             test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {11, 22, 33, 44}, 0, 2, 0, 4, 0, 6, 0, 8, tfrm, circular));
+        }
+    }
+
+    for (int hs : {128, 256}) {
+        for (int kv : {96, 1024, 1056}) {
+            for (int nb : {1, 5, 32, 65}) {
+                for (bool random_prefix : {false, true}) {
+                    test_cases.emplace_back(new test_flash_attn_ext_implicit(hs, kv, nb, random_prefix));
+                }
+            }
         }
     }
 

@@ -11917,6 +11917,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_SJKVARN_SEAL:
             return ggml_cuda_sj_kvarn_seal_supported(op);
         case GGML_OP_FLASH_ATTN_EXT:
+            if (op->src[3] && op->src[3]->type == GGML_TYPE_I32) {
+                return false;
+            }
             if (uses_streamed_kv) {
                 return ggml_cuda_kv_stream_fattn_fits(op);
             }

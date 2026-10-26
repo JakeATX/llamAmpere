@@ -5866,7 +5866,8 @@ struct ggml_tensor * ggml_flash_attn_ext(
     GGML_ASSERT(q->ne[3] == v->ne[3]);
 
     if (mask) {
-        GGML_ASSERT(mask->type == GGML_TYPE_F16);
+        GGML_ASSERT(mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_I32);
+        GGML_ASSERT(mask->type != GGML_TYPE_I32 || (mask->ne[0] == 1 && mask->ne[1] >= q->ne[1] && mask->ne[2] == 1 && max_bias == 0.0f));
         // rows may be strided (the CPU and CUDA kernels index the mask by nb[1..3])
         GGML_ASSERT(ggml_is_contiguous_rows(mask));
         //GGML_ASSERT(ggml_can_repeat_rows(mask, qk));
@@ -5876,7 +5877,7 @@ struct ggml_tensor * ggml_flash_attn_ext(
     }
 
     if (max_bias > 0.0f) {
-        GGML_ASSERT(mask);
+        GGML_ASSERT(mask && mask->type == GGML_TYPE_F16);
     }
 
     // permute(0, 2, 1, 3)

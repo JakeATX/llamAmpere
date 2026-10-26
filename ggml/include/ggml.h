@@ -2584,6 +2584,8 @@ extern "C" {
     //   n_head % ne32      == 0
     //   ne3    % ne33      == 0
     //
+    // CPU also accepts I32 [1, n_batch, 1, ne33] visible-prefix lengths: KV index < L_j is visible.
+    // Prefix masks require max_bias == 0; unsupported backends must reject the operation.
     GGML_API struct ggml_tensor * ggml_flash_attn_ext(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,

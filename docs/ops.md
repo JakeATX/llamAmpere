@@ -132,3 +132,5 @@ Legend:
 |                            TRUNC | ❌ | ❌ | ✅ | 🟡 | 🟡 | ❌ | ✅ | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ |
 |                          UPSCALE | ❌ | 🟡 | ✅ | ✅ | ❌ | ❌ | ✅ | 🟡 | ✅ | ✅ | ✅ | ❌ | ❌ |
 |                            XIELU | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ |
+
+CPU `FLASH_ATTN_EXT` also accepts an I32 mask `[1, n_query, 1, n_sequence]` of visible-prefix lengths, with `max_bias == 0`. Each query attends to KV indices below its limit. Other mask shapes continue to use F16.
