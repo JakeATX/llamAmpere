@@ -87,6 +87,7 @@ static void test_model_state(const char * path) {
     ggml_backend_load_all();
     llama_model_params mp = llama_model_default_params();
     mp.n_gpu_layers = 0;
+    mp.load_mtp = true;
     ggml_backend_dev_t devices[] = {ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU), nullptr};
     mp.devices = devices;
     auto * model = llama_model_load_from_file(path, mp);
@@ -127,6 +128,31 @@ static void test_model_state(const char * path) {
         set_p(false);
         return common_sampler_sample_and_accept_n_pq(sampler, ctx, {0,1,2,3,4}, {20,20,20,20}, qs);
     };
+    // Both verification modes use the p/q RNG, including exact rejection/residual draws.
+    for (bool lossy : {false, true}) {
+        auto request = params;
+        request.spec_lossy = lossy;
+        auto * source = common_sampler_init(model, request);
+        for (int i = 0; i < 7; ++i) { step(source); }
+        const auto consumed = common_sampler_get_pq_stats(source);
+        assert(consumed.n_extra + consumed.n_rej + consumed.n_lossy > 0);
+        auto * snapshot = common_sampler_clone(source);
+        auto * restored = common_sampler_init(model, request);
+        common_sampler_copy(source, restored);
+        assert(common_sampler_get_pq_stats(restored).n_pos == consumed.n_pos);
+        for (int i = 0; i < 64; ++i) {
+            const auto expected = step(source);
+            assert(step(snapshot) == expected && step(restored) == expected);
+            assert(common_sampler_get_pq_stats(restored).n_pos == common_sampler_get_pq_stats(source).n_pos);
+        }
+        common_sampler_reset(restored);
+        assert(common_sampler_get_pq_stats(restored).n_pos == 0);
+        auto * fresh_request = common_sampler_init(model, request);
+        for (int i = 0; i < 64; ++i) { assert(step(restored) == step(fresh_request)); }
+        common_sampler_free(source); common_sampler_free(snapshot);
+        common_sampler_free(restored); common_sampler_free(fresh_request);
+    }
+    puts("exact and mode-biased p/q clone/copy/reset request streams: PASS");
     step(s);
     auto * clone = common_sampler_clone(s);
     auto * copied = common_sampler_init(model, params);

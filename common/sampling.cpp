@@ -824,10 +824,9 @@ void common_sampler_reset(struct common_sampler * gsmpl) {
     }
 
     gsmpl->reset();
-    if (gsmpl->params.spec_lossy) {
-        gsmpl->pq_rng.seed(gsmpl->pq_seed);
-        gsmpl->pq_stats = {};
-    }
+    // Exact p/q verification also draws acceptance and residual samples from this stream.
+    gsmpl->pq_rng.seed(gsmpl->pq_seed);
+    gsmpl->pq_stats = {};
     gsmpl->pq_pending.clear();
 }
 
@@ -875,11 +874,10 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
     dst->cur_p      = src->cur_p;
     dst->cur_p.data = src->cur_p.data ? dst->cur.data() + (src->params.spec_lossy ? src->cur_p.data - src->cur.data() : 0) : nullptr;
     dst->rng        = src->rng;
-    if (src->params.spec_lossy) {
-        dst->pq_seed  = src->pq_seed;
-        dst->pq_rng   = src->pq_rng;
-        dst->pq_stats = src->pq_stats;
-    }
+    // Checkpoint replay must restore exact p/q decisions as well as mode-biased decisions.
+    dst->pq_seed  = src->pq_seed;
+    dst->pq_rng   = src->pq_rng;
+    dst->pq_stats = src->pq_stats;
     dst->pq_pending = src->pq_pending;
     dst->t_total_us = src->t_total_us;
     dst->fused_top_k = src->fused_top_k;

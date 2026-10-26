@@ -3764,6 +3764,7 @@ int main(int argc, char ** argv) {
             llama_model_saver saver(model);
             saver.add_kv_from_model();
             saver.add_tensors_from_model();
+            gguf_set_val_u32(saver.gguf_ctx, "tokenizer.ggml.eos_token_id", 2);
             // Include the MTP block in the fixture's recurrent-layer metadata.
             const bool recurrent[] = { true, false, false };
             gguf_set_arr_data(saver.gguf_ctx, saver.llm_kv(LLM_KV_ATTENTION_RECURRENT_LAYERS).c_str(), GGUF_TYPE_BOOL, recurrent, 3);
