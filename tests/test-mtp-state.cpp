@@ -144,13 +144,18 @@ static llama_batch_ext * checked_embedding_batch(common_batch & input, const std
     return result;
 }
 
-static void tensor_data(ggml_tensor * tensor, void *) {
+static void tensor_data(ggml_tensor * tensor, void * user_data) {
     std::mt19937 rng(std::hash<std::string>()(tensor->name));
     std::normal_distribution<float> dist(0.0f, 0.1f);
     require(tensor->type == GGML_TYPE_F32, "fixture tensor type");
+    const std::string name = tensor->name;
+    const bool fold_ssm_a = user_data && *static_cast<const bool *>(user_data) &&
+            name.size() >= 6 && name.compare(name.size() - 6, 6, ".ssm_a") == 0;
     std::vector<float> data(ggml_nelements(tensor));
     for (auto & value : data) {
         value = dist(rng);
+        // The converter folds -exp(A_log); positive decay makes long recurrence grow.
+        if (fold_ssm_a) { value = -std::exp(value); }
     }
     ggml_backend_tensor_set(tensor, data.data(), 0, ggml_nbytes(tensor));
 }
@@ -163,6 +168,7 @@ struct model_geometry {
     uint32_t kpool = 0;
     uint32_t indexer_top_k = 131072;
     uint32_t indexer_head_dim = 0;
+    bool fold_ssm_a = false;
     std::vector<uint32_t> rope_sections = {64, 64, 64, 64};
 };
 
@@ -214,7 +220,8 @@ static llama_model * make_model(bool no_alloc = false, const model_geometry & g 
     mp.devices = devices;
     mp.load_mtp = true;
     mp.no_alloc = no_alloc;
-    llama_model * model = llama_model_init_from_user(meta, tensor_data, nullptr, mp);
+    bool fold_ssm_a = g.fold_ssm_a;
+    llama_model * model = llama_model_init_from_user(meta, tensor_data, &fold_ssm_a, mp);
     gguf_free(meta);
     require(model != nullptr, "create fixture model");
     return model;
@@ -793,6 +800,7 @@ static void run_qwen4exp_indexer_layout(bool cuda) {
     require(!cuda || device, "indexer layout GPU backend is available");
     model_geometry geometry;
     geometry.indexer_head_dim = 128;
+    geometry.fold_ssm_a = true;
     geometry.rope_dim = 64;
     geometry.rope_sections = {11, 11, 10, 0};
     geometry.kpool = 4;
