@@ -760,6 +760,30 @@ static void run_mtp_pipe() {
 
 // fork: exercise production pooling, attention and serialization without an evaluation callback that changes CUDA fusion.
 static void run_qwen4exp_indexer_layout(bool cuda) {
+    const bool trace = common_get_env("LLAMA_TEST_INDEXER_TRACE") == "1";
+    struct trace_state {
+        const char * arm;
+        bool reported = false;
+    } full_trace { "full" }, compact_trace { "compact" };
+    const auto trace_eval = +[](ggml_tensor * tensor, bool ask, void * user) {
+        auto & state = *static_cast<trace_state *>(user);
+        if (state.reported || tensor->type != GGML_TYPE_F32 || !ggml_is_contiguous(tensor)) { return !ask; }
+        if (ask) { return true; }
+        std::vector<float> data(ggml_nelements(tensor));
+        ggml_backend_tensor_get(tensor, data.data(), 0, ggml_nbytes(tensor));
+        for (size_t i = 0; i < data.size(); ++i) {
+            // Negative infinity is intentional in attention masks; NaN/+inf is not.
+            if (std::isnan(data[i]) || data[i] == std::numeric_limits<float>::infinity()) {
+                fprintf(stderr, "INDEXER_FIRST_NONFINITE arm=%s tensor=%s op=%s element=%zu shape=%lld,%lld,%lld,%lld value=%.9g\n",
+                        state.arm, tensor->name, ggml_op_name(tensor->op), i,
+                        (long long) tensor->ne[0], (long long) tensor->ne[1],
+                        (long long) tensor->ne[2], (long long) tensor->ne[3], data[i]);
+                state.reported = true;
+                break;
+            }
+        }
+        return true;
+    };
     prefill_env_restore prefill_env;
     prefill_env.set(false, false, false);
     feedback_env_restore feedback_env;
@@ -794,6 +818,10 @@ static void run_qwen4exp_indexer_layout(bool cuda) {
         cp.sj_kvarn_sink = 128;
         cp.sj_kvarn_tail = 128;
         cp.sj_kvarn_tail_max = 256;
+        if (trace) {
+            cp.cb_eval = trace_eval;
+            cp.cb_eval_user_data = compact ? &compact_trace : &full_trace;
+        }
         llama_context_ptr ctx(llama_init_from_model(source ? source : model.get(), cp));
         require(ctx != nullptr, "create indexer layout target");
         return ctx;
@@ -821,11 +849,28 @@ static void run_qwen4exp_indexer_layout(bool cuda) {
         auto decode = [&](llama_context * ctx, llama_seq_id seq, llama_pos from, int count, int salt) {
             common_batch batch(ctx);
             for (int i = 0; i < count; ++i) {
-                batch.add(token_at(from + i + salt), from + i, seq, i == count - 1);
+                batch.add(token_at(from + i + salt), from + i, seq, trace || i == count - 1);
             }
             require(llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0, "decode indexer layout target");
             const float * logits = llama_get_logits_ith(ctx, -1);
             require(logits != nullptr, "indexer layout output exists");
+            size_t nonfinite = 0;
+            for (size_t i = 0; i < n_vocab; ++i) { nonfinite += !std::isfinite(logits[i]); }
+            if (nonfinite) {
+                fprintf(stderr, "INDEXER_NONFINITE arm=%s streams=%u seq=%d from=%d count=%d output_pos=%d bad_logits=%zu/%u trace=%d\n",
+                        ctx == full.get() ? "full" : "compact", parallel, seq, from, count,
+                        from + count - 1, nonfinite, n_vocab, trace);
+                if (trace) {
+                    for (int row = 0; row < count; ++row) {
+                        const float * output = llama_get_logits_ith(ctx, row);
+                        if (std::any_of(output, output + n_vocab, [](float v) { return !std::isfinite(v); })) {
+                            fprintf(stderr, "INDEXER_FIRST_BAD_OUTPUT arm=%s pos=%d\n",
+                                    ctx == full.get() ? "full" : "compact", from + row);
+                            break;
+                        }
+                    }
+                }
+            }
             return std::vector<float>(logits, logits + n_vocab);
         };
         const auto compare = [&](const std::vector<float> & a, const std::vector<float> & b) {
