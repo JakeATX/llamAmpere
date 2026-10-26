@@ -162,6 +162,7 @@ struct model_geometry {
     uint32_t rope_dim = n_embd;
     uint32_t kpool = 0;
     uint32_t indexer_top_k = 131072;
+    uint32_t indexer_head_dim = 0;
 };
 
 static llama_model * make_model(bool no_alloc = false, const model_geometry & g = {}, llm_arch arch = LLM_ARCH_QWEN35, ggml_backend_dev_t device = nullptr) {
@@ -191,7 +192,7 @@ static llama_model * make_model(bool no_alloc = false, const model_geometry & g 
         ms.add_kv(LLM_KV_HYPER_CONNECTION_COUNT, uint32_t(4));
         ms.add_kv(LLM_KV_HYPER_CONNECTION_LOW_RANK, uint32_t(8));
         ms.add_kv(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, uint32_t(1));
-        ms.add_kv(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, g.head_dim);
+        ms.add_kv(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, g.indexer_head_dim ? g.indexer_head_dim : g.head_dim);
         ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K, g.indexer_top_k);
         ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS, std::vector<uint32_t>(g.layers, g.kpool));
         ms.add_kv(LLM_KV_EXPERT_COUNT, uint32_t(4));
@@ -766,12 +767,14 @@ static void run_qwen4exp_indexer_layout(bool cuda) {
     auto * device = cuda ? ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU) : nullptr;
     require(!cuda || device, "indexer layout GPU backend is available");
     model_geometry geometry;
-    geometry.embd = geometry.head_dim = 128;
+    geometry.indexer_head_dim = 128;
     geometry.rope_dim = 64;
     geometry.kpool = 4;
     geometry.indexer_top_k = 8;
     llama_model_ptr model(make_model(false, geometry, LLM_ARCH_QWEN4EXP, device));
     auto make_context = [&](bool compact, uint32_t parallel, llama_model * source = nullptr) {
+        require(model->hparams.n_embd_head_k_full == 256 && model->hparams.n_embd_head_v_full == 256 &&
+                model->hparams.indexer_head_size == 128, "indexer fixture separates main and indexer head widths");
         common_set_env("LLAMA_QSA_POOL_COMPACT", compact ? "1" : "0");
         auto cp = llama_context_default_params();
         cp.n_ctx = 4096*parallel;
@@ -842,7 +845,7 @@ static void run_qwen4exp_indexer_layout(bool cuda) {
             auto * pooled = got->get_pool_storage(1);
             require(pooled && pooled->type == GGML_TYPE_F16, "compact pooled keys retain F16 storage");
             const auto & cells = ref->get_mem_idx()->get_cells(0).seq_pos_get(0);
-            const size_t row_bytes = ggml_row_size(GGML_TYPE_F16, geometry.head_dim);
+            const size_t row_bytes = ggml_row_size(GGML_TYPE_F16, geometry.indexer_head_dim);
             std::vector<uint8_t> before(ggml_nbytes(raw)), after(cells.size()/geometry.kpool*row_bytes);
             ggml_backend_tensor_get(raw, before.data(), 0, before.size());
             if (!after.empty()) { ggml_backend_tensor_get(pooled, after.data(), 0, after.size()); }
