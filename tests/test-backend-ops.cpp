@@ -12374,8 +12374,6 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
     int64_t N()        const { return B() + n_ring; }
     int64_t qpos0()    const { return N() - n_q; }
     int64_t n_kv_pad() const { return ((N() + 255) / 256) * 256; }
-    // Packed masks must also cover the physical ring passed to the generic FA constructor.
-    int64_t mask_kv_pad() const { return packed_pair ? std::max(n_kv_pad(), S + cap) : n_kv_pad(); }
     int64_t rec_bytes() const { return body_type == GGML_TYPE_TURBO4_0 ? 2*G*ggml_row_size(body_type, D) : (int64_t) ggml_sj_kvarn_rec_bytes(D, G, bits_k, bits_v); }
 
     std::string vars() override {
@@ -12490,7 +12488,9 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
         ggml_set_name(k, "k");
         ggml_tensor * v = make_ring("v_mixed_storage");
         ggml_set_name(v, "v");
-        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, mask_kv_pad(), n_q, 1, n_streams());
+        // Packed masks must also cover the physical ring passed to the generic FA constructor.
+        const int64_t mask_kv = packed_pair ? std::max(n_kv_pad(), k->ne[1]) : n_kv_pad();
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, mask_kv, n_q, 1, n_streams());
         ggml_set_name(m, "m");
         ggml_tensor * body = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, rec_bytes()*hkv*n_rec_pool());
         body->op_params[7] = body_type;
@@ -12537,7 +12537,7 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
         if (packed_pair) {
             GGML_ASSERT(rot == 0);
             ggml_tensor * m_f16 = m;
-            m = new_tensor_kq_mask_packed(ctx, mask_kv_pad(), n_q, 1, n_streams());
+            m = new_tensor_kq_mask_packed(ctx, mask_kv, n_q, 1, n_streams());
             ggml_set_name(m, "mp");
             ggml_tensor * out_p = fa(q);
             m = m_f16;
@@ -12577,21 +12577,22 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
                 values[0] = data_case == 1 ? std::numeric_limits<float>::quiet_NaN() : 70000.0f;
                 ggml_backend_tensor_set(t, values.data(), 0, values.size()*sizeof(float));
             } else if (packed_pair && (strcmp(t->name, "m") == 0 || strcmp(t->name, "mp") == 0)) {
-                std::vector<uint8_t> vis((size_t) mask_kv_pad() * n_q * n_streams());
+                const int64_t mask_kv = t->type == GGML_TYPE_F16 ? t->ne[0] : t->op_params[0];
+                std::vector<uint8_t> vis((size_t) mask_kv * n_q * n_streams());
                 for (int64_t s = 0; s < n_streams(); ++s) {
                     const int64_t Ns = ns > 0 ? N_s(s) : N();
                     for (int64_t j = 0; j < n_q; ++j) {
                         const int64_t pos = Ns - n_q + j;
-                        for (int64_t p = 0; p < mask_kv_pad(); ++p) {
+                        for (int64_t p = 0; p < mask_kv; ++p) {
                             bool visible = p <= pos && p < Ns;
                             if (row_mask && p >= S && p < B()) {
                                 visible = (p / 16 + j + s) % 3 != 0;
                             }
-                            vis[(s*n_q + j)*mask_kv_pad() + p] = visible;
+                            vis[(s*n_q + j)*mask_kv + p] = visible;
                         }
                     }
                 }
-                set_tensor_kq_mask_binary(t, vis, mask_kv_pad());
+                set_tensor_kq_mask_binary(t, vis, mask_kv);
             } else if (strcmp(t->name, "m") == 0) {
                 std::vector<ggml_fp16_t> mask((size_t) n_kv_pad() * n_q * n_streams());
                 for (int64_t s = 0; s < n_streams(); ++s) {
@@ -17988,6 +17989,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                     test_cases.emplace_back(new test_flash_attn_ext_packed(mode, 256, 256, 4, {6, 1}, kv, nb, false, 0.0f, types.first, types.second, {0, 2, 1, 3}, false));
                 }
             }
+            // The soft cap is independent of attention bias, which this fixture keeps at zero.
+            test_cases.emplace_back(new test_flash_attn_ext_packed(mode, 256, 256, 4, {6, 1}, 1024, 5, true, 10.0f, types.first, types.second, {0, 2, 1, 3}, false));
             test_cases.emplace_back(new test_flash_attn_ext_packed(mode, 256, 256, 4, {6, 2}, 1024, 7, false, 0.0f, types.first, types.second));
         }
         for (int64_t nb : {7, 1024}) {
