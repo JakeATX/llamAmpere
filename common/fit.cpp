@@ -560,8 +560,22 @@ static void common_params_fit_impl(
 
             dmds_t measured;
             try {
-                measured = common_get_device_memory_data_impl(
-                    extra->path_model, extra->mparams, extra->cparams, devs_extra, ngl_extra, nct_extra, nex_extra, log_level);
+                if (shares_compute) {
+                    // Use the same serialized target/drafter relationship as real startup. An
+                    // isolated MTP probe cannot attach the shared expert cache or compute donor.
+                    const auto data = common_get_device_memory_data_with_parent(
+                        extra->path_model, extra->mparams, extra->cparams, path_model, mparams, cparams,
+                        devs_extra, ngl_extra, nct_extra, nex_extra, log_level);
+                    measured.resize(data.size());
+                    for (size_t i = 0; i < data.size(); ++i) {
+                        measured[i].mb.model   = data[i].model;
+                        measured[i].mb.context = data[i].context;
+                        measured[i].mb.compute = data[i].compute;
+                    }
+                } else {
+                    measured = common_get_device_memory_data_impl(
+                        extra->path_model, extra->mparams, extra->cparams, devs_extra, ngl_extra, nct_extra, nex_extra, log_level);
+                }
             } catch (const std::runtime_error & e) {
                 // the extra model is optional, fit the main model alone rather than giving up
                 LOG_WRN("%s: failed to measure the memory of the extra model, fitting without it: %s\n", __func__, e.what());

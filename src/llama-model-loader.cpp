@@ -919,15 +919,18 @@ llama_model_loader::llama_model_loader(
         const size_t available = llama_moe_arena::available_memory();
         // Owner floor is 7 GiB, the same line Strata ran under at home.
         const size_t reserve = 7ull << 30;
-        use_moe_arena = supported && bytes && available > reserve && bytes <= available - reserve &&
+        // Keep host placement and defaults when pinning is unsafe. The existing mmap
+        // loader can supply the unchanged experts as reclaimable, unpinned file pages.
+        use_moe_arena = supported && bytes && llama_mmap::SUPPORTED;
+        const bool can_pin = use_moe_arena && available > reserve && bytes <= available - reserve &&
             llama_moe_arena::pin_supported();
+        if (use_moe_arena && !no_alloc) {
+            use_mmap = true; // also permits a late fallback after other startup allocations
+        }
         LLAMA_LOG_INFO("%s: expert arena %s: %.2f GiB experts, %.2f GiB available, 7 GiB startup headroom\n",
-                __func__, use_moe_arena ? "enabled" : "disabled", bytes / double(GiB), available / double(GiB));
+                __func__, can_pin ? "enabled" : "unpinned mmap fallback", bytes / double(GiB), available / double(GiB));
         if (use_moe_arena && llm_kv.arch == LLM_ARCH_QWEN4EXP) {
             llama_moe_arena_apply_flashnext_defaults();
-        }
-        if (arena && strcmp(arena, "on") == 0 && !roles.empty() && !use_moe_arena) {
-            throw std::runtime_error("--moe-arena on cannot fit the pinned experts with 7 GiB startup headroom, or pinning is unavailable");
         }
     }
 }
@@ -2058,8 +2061,12 @@ std::unique_ptr<llama_moe_arena> llama_model_loader::load_moe_arena(llama_progre
         }
     }
     const size_t available = llama_moe_arena::available_memory();
-    if (available < (7ull << 30) || total > available - (7ull << 30)) {
-        throw std::runtime_error("expert arena no longer fits with 7 GiB startup headroom");
+    if (available < (7ull << 30) || total > available - (7ull << 30) || !llama_moe_arena::pin_supported()) {
+        LLAMA_LOG_WARN("%s: %.2f GiB experts use unpinned mmap storage; %.2f GiB available, 7 GiB pinning headroom required\n",
+                __func__, total / double(GiB), available / double(GiB));
+        // No arena tensor has been allocated or reshaped yet. Normal buffer creation
+        // and load_all_data bind the original file views without faulting them all in.
+        return nullptr;
     }
     auto arena = std::make_unique<llama_moe_arena>(total);
 #ifdef __linux__

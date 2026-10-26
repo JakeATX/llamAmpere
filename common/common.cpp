@@ -1406,6 +1406,15 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
         common_params params_dft = common_base_params_to_speculative(params);
 
+        // Match common_speculative_init_result's separate-file MTP expert placement.
+        const char * shared_experts = std::getenv("GGML_MOE_CACHE_MTP_SHARED");
+        if (has_draft && spec_mtp && shared_experts && strcmp(shared_experts, "1") == 0) {
+            if (!params_dft.tensor_buft_overrides.empty() && params_dft.tensor_buft_overrides.back().pattern == nullptr) {
+                params_dft.tensor_buft_overrides.pop_back();
+            }
+            params_dft.tensor_buft_overrides.insert(params_dft.tensor_buft_overrides.begin(), llm_ffn_exps_cpu_override());
+            params_dft.tensor_buft_overrides.push_back({nullptr, nullptr});
+        }
         auto mparams_dft = common_model_params_to_llama(params_dft);
         auto cparams_dft = common_context_params_to_llama(params_dft);
         if (spec_mtp) {
@@ -1426,7 +1435,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             /*.mparams        =*/ &mparams_dft,
             /*.cparams        =*/ &cparams_dft,
             /*.shares_model   =*/ !has_draft, // an MTP context runs on the weights of the main model
-            /*.shares_compute =*/ !has_draft && spec_mtp && shared_compute,
+            /*.shares_compute =*/ spec_mtp && shared_compute,
         };
 
         const common_params_fit_status fit_status = common_fit_params(
