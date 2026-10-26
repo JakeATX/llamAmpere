@@ -7046,6 +7046,49 @@ static bool test_profile_global_plan() {
     using item = ggml_cuda_moe_profile_item;
     ggml_cuda_moe_profile_plan plan;
     std::vector<item> items;
+    std::vector<uint8_t> ranked;
+    auto append32 = [&](uint32_t value) {
+        for (int shift = 0; shift < 32; shift += 8) { ranked.push_back((uint8_t)(value >> shift)); }
+    };
+    for (uint32_t value : {UINT32_C(0x50525453), 1u, 2u, 4u, 8u, 8u,
+            65537u, 0u, 196609u, 131072u, 65536u, 1u, 196608u, 131073u}) { append32(value); }
+    std::vector<std::vector<uint64_t>> scores;
+    bool ranked_ok = ggml_cuda_moe_cache_ranked_profile(ranked.data(), ranked.size(), 2, 4, scores);
+    ranked_ok &= scores == std::vector<std::vector<uint64_t>>({{7, 4, 5, 2}, {3, 8, 1, 6}});
+    const auto saved_scores = scores;
+    ranked_ok &= !ggml_cuda_moe_cache_ranked_profile(ranked.data(), ranked.size() - 1, 2, 4, scores);
+    ranked_ok &= !ggml_cuda_moe_cache_ranked_profile(ranked.data(), ranked.size(), 3, 4, scores);
+    ranked[28] = 1; ranked[30] = 1;
+    ranked_ok &= !ggml_cuda_moe_cache_ranked_profile(ranked.data(), ranked.size(), 2, 4, scores);
+    ranked[28] = 0; ranked[30] = 0; ranked[24] = 2;
+    ranked_ok &= !ggml_cuda_moe_cache_ranked_profile(ranked.data(), ranked.size(), 2, 4, scores);
+    ranked_ok &= scores == saved_scores;
+    ranked[24] = 1;
+    for (uint32_t value : {1u, 4u, 3u, 6u, 5u, 0u, 7u, 2u}) { append32(value); }
+    ranked_ok &= ggml_cuda_moe_cache_ranked_profile(ranked.data(), ranked.size(), 2, 4, scores);
+    ranked.back() = 1;
+    ranked_ok &= !ggml_cuda_moe_cache_ranked_profile(ranked.data(), ranked.size(), 2, 4, scores);
+    ranked.back() = 0;
+    for (size_t layer = 0; layer < 2; ++layer) {
+        for (int expert = 0; expert < 4; ++expert) {
+            items.push_back({layer * 2, expert, layer, layer * 2, layer ? 2u : 1u, scores[layer][expert]});
+            items.push_back({layer * 2 + 1, expert, layer, layer * 2 + 1, layer ? 1u : 3u, scores[layer][expert]});
+        }
+    }
+    ranked_ok &= ggml_cuda_moe_cache_profile_plan(items, {4, 4, 4, 4}, 7, 1, plan);
+    ranked_ok &= plan.bundles == 2 && plan.selected[10] && plan.selected[0] && !plan.selected[2];
+    ranked_ok &= ggml_cuda_moe_cache_profile_plan(items, {4, 4, 4, 4}, 28, 1, plan, false, 2);
+    ranked_ok &= plan.bundles == 2 && plan.bytes == 7 && plan.selected[10] && plan.selected[0] && !plan.selected[2];
+    // First two ranks cost 3+4: a six-byte budget cannot skip rank two and
+    // spend the remainder on a cheaper later rank. Failed output is preserved.
+    const auto prefix_slots = plan.slots;
+    ranked_ok &= !ggml_cuda_moe_cache_profile_plan(items, {4, 4, 4, 4}, 6, 1, plan, false, 2);
+    ranked_ok &= plan.slots == prefix_slots;
+    ranked_ok &= ggml_cuda_moe_cache_profile_plan(items, {4, 4, 4, 4}, 13, 1, plan, false, 8);
+    ranked_ok &= plan.bundles == 3 && plan.bytes == 10 && plan.selected[14] && !plan.selected[4];
+    printf("cache-profile-ranked-data: %s\n", ranked_ok ? "OK" : "FAIL");
+    if (!ranked_ok) { return false; }
+    items.clear();
     for (int32_t expert = 0; expert < 8; ++expert) {
         items.push_back({0, expert, 0, 0, 1, (uint64_t)(80 - expert)});
         items.push_back({1, expert, 1, 1, 4, (uint64_t)(10 - expert)});

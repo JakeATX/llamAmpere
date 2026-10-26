@@ -37,6 +37,37 @@ static inline bool ggml_cuda_moe_cache_host_merge(uintptr_t begin, uintptr_t end
 #include <utility>
 #include <vector>
 
+// fork: ranked-pair data has no model-weight signature; validate its shape and unique pairs.
+static inline bool ggml_cuda_moe_cache_ranked_profile(const uint8_t * data, size_t bytes,
+        size_t layers, size_t experts, std::vector<std::vector<uint64_t>> & output) {
+    if (!data || bytes < 24 || !layers || layers > 4096 || !experts || experts > 4096) { return false; }
+    auto u32 = [&](size_t offset) {
+        return (uint32_t)data[offset] | (uint32_t)data[offset + 1] << 8 |
+            (uint32_t)data[offset + 2] << 16 | (uint32_t)data[offset + 3] << 24;
+    };
+    const size_t slots = layers * experts;
+    const uint32_t count = u32(20);
+    const size_t pair_bytes = 24 + (size_t)count * 4;
+    if (u32(0) != UINT32_C(0x50525453) || u32(4) != 1 || u32(8) != layers || u32(12) != experts ||
+            !count || count > u32(16) || u32(16) > slots ||
+            (bytes != pair_bytes && bytes != pair_bytes + slots * 4)) { return false; }
+    std::vector<std::vector<uint64_t>> scores(layers, std::vector<uint64_t>(experts, 0));
+    for (size_t i = 0; i < count; ++i) {
+        const uint32_t pair = u32(24 + i * 4);
+        const size_t layer = pair & 65535, expert = pair >> 16;
+        if (layer >= layers || expert >= experts || scores[layer][expert]) { return false; }
+        scores[layer][expert] = count - i;
+    }
+    if (bytes != pair_bytes) {
+        for (size_t i = 0; i < slots; ++i) {
+            const uint64_t score = scores[i / experts][i % experts];
+            if (u32(pair_bytes + i * 4) != (score ? count - score : UINT32_MAX)) { return false; }
+        }
+    }
+    output = std::move(scores);
+    return true;
+}
+
 struct ggml_cuda_moe_profile_item {
     size_t tensor;
     int32_t expert;
@@ -56,7 +87,7 @@ struct ggml_cuda_moe_profile_plan {
 
 static inline bool ggml_cuda_moe_cache_profile_plan(const std::vector<ggml_cuda_moe_profile_item> & items,
         const std::vector<size_t> & caps, size_t budget, size_t minimum,
-        ggml_cuda_moe_profile_plan & output, bool route_density = false) {
+        ggml_cuda_moe_profile_plan & output, bool route_density = false, size_t ranked_limit = 0) {
     if (items.empty() || caps.empty() || !minimum) {
         return false;
     }
@@ -133,16 +164,25 @@ static inline bool ggml_cuda_moe_cache_profile_plan(const std::vector<ggml_cuda_
         ++plan.bundles;
         return true;
     };
-    for (size_t index : ranked) {
-        bool needed = false;
-        for (const auto & p : bundles[index].pools) { needed = needed || plan.slots[p.first] < minimum; }
-        if (needed) { admit(index); }
-        bool complete = true;
-        for (size_t count : plan.slots) { complete = complete && count >= minimum; }
-        if (complete) { break; }
+    if (ranked_limit) {
+        // A ranked-data comparison must retain a prefix, never fill a hole with
+        // a cheaper lower-ranked expert. Prefill may temporarily fit fewer.
+        for (size_t index : ranked) {
+            if (plan.bundles == ranked_limit || !admit(index)) { break; }
+        }
+    } else {
+        for (size_t index : ranked) {
+            bool needed = false;
+            for (const auto & p : bundles[index].pools) { needed = needed || plan.slots[p.first] < minimum; }
+            if (needed) { admit(index); }
+            bool complete = true;
+            for (size_t count : plan.slots) { complete = complete && count >= minimum; }
+            if (complete) { break; }
+        }
+        for (size_t count : plan.slots) { if (count < minimum) { return false; } }
+        for (size_t index : ranked) { if (!chosen[index]) { admit(index); } }
     }
     for (size_t count : plan.slots) { if (count < minimum) { return false; } }
-    for (size_t index : ranked) { if (!chosen[index]) { admit(index); } }
     size_t rank = 0;
     for (int selected = 1; selected >= 0; --selected) {
         for (size_t index : ranked) {

@@ -606,6 +606,8 @@ struct moe_missjoin_retained_state;
 
 struct moe_cache_device_table {
     ggml_moe_cache_tensor_desc desc{}; // compact expert bytes
+    // Shared draft tensors can be destroyed before their target cache session.
+    std::string name;
     size_t host_stride = 0;
     const void * borrowed = nullptr; // model-owned registered arena; never unregistered here
     bool permanent_sources = false;
@@ -756,6 +758,7 @@ struct moe_cache_session {
     // Guarded by mu: startup restores must retain space for the not-yet-created helper.
     bool prompt_loaned = false;
     bool profile_load_attempted = false;
+    bool profile_ranked = false;
     std::unordered_map<moe_cache_key, uint64_t, moe_cache_key_hash> profile_counts;
     std::vector<moe_cache_profile_global_tensor> profile_global_tensors;
     bool prefetch_enabled = false;
@@ -890,7 +893,7 @@ static void moe_prefetch_finish(moe_cache_session & session, moe_prefetch_copy &
 
 static size_t moe_cache_trim_session(
         moe_cache_session & session, int physical_device);
-static void moe_cache_device_release(moe_cache_session & session, bool retain_sources = false);
+static void moe_cache_device_release(moe_cache_session & session, bool retain_sources = false, bool census = false);
 static void moe_cache_swap_step(moe_cache_session & session);
 static void moe_cache_trace_step(moe_cache_session & session);
 static void moe_cache_swap_note_stream(moe_cache_session & session, ggml_backend_cuda_context & ctx);
@@ -2647,8 +2650,16 @@ static bool moe_cache_build_global_profile(moe_cache_session & session, moe_cach
     }
     ggml_cuda_moe_profile_plan plan;
     int64_t density_value = 0;
-    const bool density = moe_cache_env_i64("GGML_MOE_CACHE_PROFILE_GLOBAL_DENSITY", 0, 1, density_value) && density_value;
-    if (!ggml_cuda_moe_cache_profile_plan(items, caps, budget, moe_cache_pool_slots_min, plan, density)) { return false; }
+    const bool density = !session.profile_ranked && moe_cache_env_i64("GGML_MOE_CACHE_PROFILE_GLOBAL_DENSITY", 0, 1, density_value) && density_value;
+    int64_t ranked_limit = 0;
+    if (session.profile_ranked) {
+        moe_cache_env_i64("GGML_MOE_CACHE_PROFILE_RANKED_LIMIT", 1, INT_MAX, ranked_limit);
+    }
+    if (!ggml_cuda_moe_cache_profile_plan(items, caps, budget, moe_cache_pool_slots_min, plan, density, (size_t)ranked_limit)) { return false; }
+    if (ranked_limit) {
+        MOE_CACHE_LOG("[moe-cache] CUDA%d ranked prefix: requested=%lld fitted=%zu bytes=%zu; no lower-rank backfill\n",
+                device.physical, (long long)ranked_limit, plan.bundles, plan.bytes);
+    }
     device.profile_global_ranks.clear();
     for (size_t i = 0; i < keys.size(); ++i) { device.profile_global_ranks.emplace(keys[i], plan.ranks[i]); }
     device.profile_global_slots = plan.slots;
@@ -4771,7 +4782,7 @@ static void moe_cache_invalidate_session(
             session.idle_cv.wait(lock, [&] { return session.active_scopes == 0; });
             MOE_CACHE_LOG("[moe-cache] retained source mapping invalidated: base=%p bytes=%zu\n", d.data,
                     d.expert_size * (size_t)d.n_expert);
-            moe_cache_device_release(session);
+            moe_cache_device_release(session, false, true);
             session.device_attempted = false;
             break;
         }
@@ -5017,12 +5028,42 @@ static uint64_t moe_cache_profile_signature(const ggml_moe_cache_tensor_desc * t
 
 static bool moe_cache_profile_load(const char * path, uint64_t signature, size_t entries,
         const ggml_moe_cache_tensor_desc * tensors, int n_tensors,
-        std::vector<std::vector<uint64_t>> & storage, std::vector<const uint64_t *> & counts) {
+        std::vector<std::vector<uint64_t>> & storage, std::vector<const uint64_t *> & counts, bool * ranked = nullptr) {
+    if (ranked) { *ranked = false; }
     std::unique_ptr<FILE, int (*)(FILE *)> file(fopen(path, "rb"), fclose);
     uint64_t header[5] = {};
     const uint64_t magic = UINT64_C(0x31464f5250454f4d); // MOEPROF1, native uint64_t format
-    if (!file || fread(header, sizeof(header), 1, file.get()) != 1 ||
-            header[0] != magic || header[1] != (uint64_t) n_tensors ||
+    if (!file) { return false; }
+    const size_t header_bytes = fread(header, 1, sizeof(header), file.get());
+    if (header_bytes < 4) { return false; }
+    if (memcmp(header, "STRP", 4) == 0) {
+        size_t layers = 0, experts = 0;
+        std::vector<int> tensor_layers;
+        for (int i = 0; i < n_tensors; ++i) {
+            int layer = -1;
+            if (!moe_cache_layer_number(tensors[i].name, layer) || layer < 0 || layer >= 4096 ||
+                    tensors[i].n_expert <= 0 || tensors[i].n_expert > 4096 ||
+                    (experts && experts != (size_t)tensors[i].n_expert)) { return false; }
+            layers = std::max(layers, (size_t)layer + 1);
+            experts = (size_t)tensors[i].n_expert;
+            tensor_layers.push_back(layer);
+        }
+        if (!layers || !experts || fseek(file.get(), 0, SEEK_END) != 0) { return false; }
+        const long length = ftell(file.get());
+        if (length < 24 || (uint64_t)length > 24 + layers * experts * 8 || fseek(file.get(), 0, SEEK_SET) != 0) { return false; }
+        std::vector<uint8_t> data((size_t)length);
+        std::vector<std::vector<uint64_t>> scores;
+        if (fread(data.data(), 1, data.size(), file.get()) != data.size() || fgetc(file.get()) != EOF || ferror(file.get()) ||
+                !ggml_cuda_moe_cache_ranked_profile(data.data(), data.size(), layers, experts, scores)) { return false; }
+        storage.resize(n_tensors);
+        counts.clear();
+        counts.reserve(n_tensors);
+        for (int i = 0; i < n_tensors; ++i) { storage[i] = scores[tensor_layers[i]]; }
+        for (const auto & tensor : storage) { counts.push_back(tensor.data()); }
+        if (ranked) { *ranked = true; }
+        return true;
+    }
+    if (header_bytes != sizeof(header) || header[0] != magic || header[1] != (uint64_t) n_tensors ||
             header[2] != entries || header[3] != signature) {
         return false;
     }
@@ -5594,16 +5635,19 @@ static int moe_cache_warm(void * opaque, const ggml_moe_cache_tensor_desc * tens
     if (path && path[0] && (loading || observed)) {
         const uint64_t signature = moe_cache_profile_signature(tensors, n_tensors);
         if (loading) {
-            if (!moe_cache_profile_load(path, signature, entries, tensors, n_tensors, loaded_storage, loaded_counts)) {
+            bool ranked = false;
+            if (!moe_cache_profile_load(path, signature, entries, tensors, n_tensors, loaded_storage, loaded_counts, &ranked)) {
                 MOE_CACHE_LOG("[moe-cache] profile rejected: %s (missing, mismatched, or corrupt)\n", path);
                 return 0;
             }
+            session->profile_ranked = ranked;
             if (!session->device_profile_path.empty()) {
                 session->device_profile_signature = signature;
                 session->device_profile_tensors.assign(tensors, tensors + n_tensors);
             }
             counts = loaded_counts.data();
-            MOE_CACHE_LOG("[moe-cache] profile loaded: %s, %zu ranked entries; sampled weight identity verified\n", path, entries);
+            MOE_CACHE_LOG("[moe-cache] profile loaded: %s, %zu entries; %s\n", path, entries,
+                    ranked ? "ranked-pair data, shape and uniqueness verified; no weight signature" : "sampled weight identity verified");
         } else {
             const bool saved = moe_cache_profile_save(path, signature, entries, tensors, counts, n_tensors);
             MOE_CACHE_LOG("[moe-cache] profile %s: %s, %zu usage counts\n", saved ? "saved" : "save failed", path, entries);
@@ -6906,7 +6950,7 @@ static void moe_cache_swap_free(moe_cache_session & session) {
     (void) cudaGetLastError();
 }
 
-static bool moe_cache_swap_groups(moe_cache_session & session) {
+static bool moe_cache_swap_groups(moe_cache_session & session, bool census = false) {
     auto & groups = session.swap_groups;
     groups.clear();
     for (auto & entry : session.device_tables) {
@@ -6931,20 +6975,35 @@ static bool moe_cache_swap_groups(moe_cache_session & session) {
         }
     }
     size_t partial = 0, complete = 0;
-    for (const auto & group : groups) {
+    for (size_t layer = 0; layer < groups.size(); ++layer) {
+        const auto & group = groups[layer];
         if (!group[0] && !group[1] && !group[2]) { continue; }
         if (!group[0] || !group[1] || !group[2] || group[0]->desc.n_expert != group[1]->desc.n_expert ||
                 group[0]->desc.n_expert != group[2]->desc.n_expert) { return false; }
+        const size_t previous_complete = complete, previous_partial = partial;
+        size_t resident_bytes = 0;
         for (int32_t e = 0; e < group[0]->desc.n_expert; ++e) {
             int resident = 0;
             for (auto * table : group) {
-                resident += table->permanent[e] || (table->swap_pool && table->swap_pool->map.count({table->desc.data, e}));
+                bool present = table->permanent[e];
+                if (!present && table->swap_pool) {
+                    const auto found = table->swap_pool->map.find({table->desc.data, e});
+                    present = found != table->swap_pool->map.end() && (!census ||
+                            table->swap_pool->slots[found->second].state == moe_cache_slot_state::valid);
+                }
+                resident += present;
+                if (present) { resident_bytes += table->desc.expert_size; }
             }
             partial += resident > 0 && resident < 3;
             complete += resident == 3;
         }
+        if (census) {
+            MOE_CACHE_LOG("[moe-cache] final residency: layer=%zu complete=%zu partial=%zu resident_slice_bytes=%zu\n",
+                    layer, complete - previous_complete, partial - previous_partial, resident_bytes);
+        }
     }
-    MOE_CACHE_LOG("[moe-cache] whole swap initial: complete=%zu partial=%zu layers=%zu\n", complete, partial, groups.size());
+    MOE_CACHE_LOG("[moe-cache] whole swap %s: complete=%zu partial=%zu layers=%zu\n",
+            census ? "final" : "initial", complete, partial, groups.size());
     return !groups.empty() && partial == 0;
 }
 
@@ -7765,7 +7824,7 @@ void ggml_cuda_moe_cache_table_graph_end(ggml_backend_cuda_context & ctx) {
 #endif
 }
 
-static void moe_cache_device_release(moe_cache_session & session, bool retain_sources) {
+static void moe_cache_device_release(moe_cache_session & session, bool retain_sources, bool census) {
     moe_pf_release(&session); // fork PREFETCHFIX: tables below are about to be freed
     session.device_ready.store(false);
     if (session.device_adapt_stream) {
@@ -7795,6 +7854,9 @@ static void moe_cache_device_release(moe_cache_session & session, bool retain_so
     ggml_cuda_set_device(session.devices[0]->logical);
     // Tables can be in flight on a scheduler stream, not the legacy cache stream.
     (void) cudaDeviceSynchronize();
+    if ((session.stopping || census) && session.devices.size() == 1 && moe_cache_env_on("GGML_MOE_CACHE_RESIDENT_CENSUS")) {
+        (void) moe_cache_swap_groups(session, true);
+    }
     if (session.mj_retained_arena) {
         unsigned long long counts[7] = {};
         if (cudaMemcpy(counts, session.mj_retained_counts, sizeof(counts), cudaMemcpyDeviceToHost) == cudaSuccess) {
@@ -10924,7 +10986,9 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
                     (resident_mask && !moe_cache_table_bytes_add(arena_bytes, (size_t)d.n_expert))) {
                 return fail();
             }
-            session->device_tables.emplace(d.data, std::move(table));
+            auto & stored = session->device_tables.emplace(d.data, std::move(table)).first->second;
+            stored.name = d.name ? d.name : "";
+            stored.desc.name = d.name ? stored.name.c_str() : nullptr;
         }
         if (!moe_cache_table_bytes_add(arena_bytes, count_entries * sizeof(unsigned long long)) ||
                 (route_stats && !moe_cache_table_bytes_add(arena_bytes, 3 * sizeof(unsigned long long)))) {
