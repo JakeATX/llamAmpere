@@ -3207,7 +3207,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor, bool
 
     const bool is_tq_weight = (src0->type == GGML_TYPE_TQ4_1S || src0->type == GGML_TYPE_TQ3_1S);
     bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear && !is_tq_weight &&
-                             ggml_exl3_bits(src0->type) == 0 && ggml_ai4_rate(src0->type) == 0 && ggml_ait_rate(src0->type) == 0 &&
+                             ggml_exl3_bits(src0->type) == 0 && ggml_ai4_rate(src0->type) == 0 && ggml_ait_rate(src0->type) == 0 && src0->type != GGML_TYPE_AIF25_U &&
                              src0->type != GGML_TYPE_Q8_CR &&
                              src0->type != GGML_TYPE_Q5_CR &&
                              src0->type != GGML_TYPE_Q6_CR &&
@@ -3499,6 +3499,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // EXL3 trellis weights: whole-tensor reconstruct + cuBLAS (M1 reference path); never mmvq/mmq/mmf
     if (ggml_exl3_bits(src0->type) != 0) {
         ggml_cuda_mul_mat_exl3(ctx, src0, src1, dst);
+        return;
+    }
+
+    if (src0->type == GGML_TYPE_AIF25_U) {
+        ggml_cuda_mul_mat_aif25(ctx, src0, src1, dst);
         return;
     }
 
@@ -7938,7 +7943,7 @@ static ggml_type ggml_cuda_add_rms_q8_consumer_type(const ggml_backend_cuda_cont
         }
         const ggml_tensor * w = node->src[0];
         const bool rotated = w->type == GGML_TYPE_Q8_CR || w->type == GGML_TYPE_Q5_CR || w->type == GGML_TYPE_Q6_CR;
-        if (rotated || w->buffer == nullptr || ggml_exl3_bits(w->type) != 0 || ggml_ai4_rate(w->type) != 0 || ggml_ait_rate(w->type) != 0 ||
+        if (rotated || w->buffer == nullptr || ggml_exl3_bits(w->type) != 0 || ggml_ai4_rate(w->type) != 0 || ggml_ait_rate(w->type) != 0 || w->type == GGML_TYPE_AIF25_U ||
                 ggml_get_op_params_i32(node, 1) == GGML_HINT_SRC0_IS_HADAMARD ||
                 ggml_cuda_mul_mat_route(w, act, node, cc, warp_size) != GGML_CUDA_MM_ROUTE_MMVQ) {
             return GGML_TYPE_COUNT;
@@ -11542,6 +11547,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 if (b->type == GGML_TYPE_F16 && a->type != GGML_TYPE_F16 &&
                     !(is_hadamard && a->type == GGML_TYPE_F32)) {
                     return false;
+                }
+                if (a->type == GGML_TYPE_AIF25_U) {
+                    const int cc = ggml_cuda_info().devices[dev_ctx->device].cc;
+                    return GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE && ggml_cuda_aif25_supported(op);
                 }
                 if (ggml_ai4_rate(a->type) != 0) {
                     return ggml_cuda_ai4_supported(op);

@@ -1,4 +1,5 @@
 #include "../ggml/src/ggml-cuda/magic2-v2.cuh"
+#include "../ggml/src/ggml-aif25.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -41,7 +42,7 @@ static __global__ void decode_check(const uint32_t * tile, int8_t * out, int cou
     out[index] = static_cast<int8_t>(q >> (8 * (n % 4)));
 }
 
-template<int B, int V, uint32_t C>
+template<int B, int V, uint32_t C, int XSH = 0>
 static void test(std::mt19937 & rng, bool perf) {
     constexpr int UB = magic2::unit_bytes<B,V>, TB = 4 * magic2::tile_words<B,V>;
     if (!perf) {
@@ -55,13 +56,19 @@ static void test(std::mt19937 & rng, bool perf) {
         CK(cudaGetLastError());
         std::vector<int8_t> q(4096 * 128);
         CK(cudaMemcpy(q.data(), dq, q.size(), cudaMemcpyDeviceToHost));
-        for (size_t i = 0; i < q.size(); ++i) require(q[i] == reference<B,V,C>(tiles.data() + i / 128 * TB, i % 128), "decoder mismatch");
+        for (size_t i = 0; i < q.size(); ++i) {
+            require(q[i] == reference<B,V,C>(tiles.data() + i / 128 * TB, i % 128), "decoder mismatch");
+            if constexpr (B == 5 && V == 2 && C == AIF25_MUL) {
+                require(q[i] == aif25_level(tiles.data() + i / 128 * TB, i % 128), "model CPU decoder mismatch");
+            }
+        }
         CK(cudaFree(dt)); CK(cudaFree(dq));
         std::printf("DECODE PASS B=%d V=%d checks=%zu\n", B, V, q.size());
     }
     const std::pair<int,int> shapes[] = {{32,128}, {640,2560}, {2560,640}};
     for (const auto shape : shapes) {
         const int M = shape.first, K = shape.second, nu = K / 128;
+        if (XSH && K % 256) continue;
         std::vector<uint8_t> w(size_t(M / 16) * nu * UB);
         for (uint8_t & v : w) v = rng();
         for (int slab = 0; slab < M / 16; ++slab) for (int u = 0; u < nu; ++u) {
@@ -70,15 +77,15 @@ static void test(std::mt19937 & rng, bool perf) {
         }
         uint8_t * dw; int8_t * dx; float * ds, * dy;
         CK(cudaMalloc(&dw, w.size())); CK(cudaMemcpy(dw, w.data(), w.size(), cudaMemcpyHostToDevice));
-        CK(cudaMalloc(&dx, 9 * K)); CK(cudaMalloc(&ds, 9 * nu * sizeof(float))); CK(cudaMalloc(&dy, 9 * M * sizeof(float)));
+        CK(cudaMalloc(&dx, 9 * K)); CK(cudaMalloc(&ds, 9 * (nu >> XSH) * sizeof(float))); CK(cudaMalloc(&dy, 9 * M * sizeof(float)));
         for (int N : {1,4,5,8,9}) {
-            std::vector<int8_t> x(N * K); std::vector<float> s(N * nu), y(N * M);
+            std::vector<int8_t> x(N * K); std::vector<float> s(N * (nu >> XSH)), y(N * M);
             for (int8_t & v : x) v = int(rng() % 255) - 127;
             for (float & v : s) v = (1 + rng() % 13) / 64.0f;
             CK(cudaMemcpy(dx, x.data(), x.size(), cudaMemcpyHostToDevice));
             CK(cudaMemcpy(ds, s.data(), s.size() * sizeof(float), cudaMemcpyHostToDevice));
             const dim3 grid(M / 16, (N + 7) / 8);
-            magic2::mmv<B,V,C><<<grid,128>>>(dw, dx, ds, dy, M, K, N);
+            magic2::mmv<B,V,C,XSH><<<grid,128>>>(dw, dx, ds, dy, M, K, N);
             CK(cudaGetLastError()); CK(cudaMemcpy(y.data(), dy, y.size() * sizeof(float), cudaMemcpyDeviceToHost));
             if (!perf) for (int n = 0; n < N; ++n) for (int m = 0; m < M; ++m) {
                 double expected = 0, magnitude = 0;
@@ -87,7 +94,7 @@ static void test(std::mt19937 & rng, bool perf) {
                     const float scale = __half2float(reinterpret_cast<const __half *>(unit)[m % 16]);
                     int dot = 0;
                     for (int k = 0; k < 128; ++k) dot += reference<B,V,C>(unit + 32 + (k / 8) * TB, (m % 16) * 8 + k % 8) * x[n * K + u * 128 + k];
-                    const double value = dot * double(scale) * s[n * nu + u];
+                    const double value = dot * double(scale) * s[n * (nu >> XSH) + (u >> XSH)];
                     expected += value; magnitude += std::abs(value);
                 }
                 require(std::isfinite(y[n*M+m]) && std::abs(y[n*M+m] - expected) <= 2e-6 * (1 + magnitude), "matrix mismatch");
@@ -96,9 +103,9 @@ static void test(std::mt19937 & rng, bool perf) {
             if (perf) {
                 // CUDA events time only the already-prepared matrix kernel.
                 cudaEvent_t start, stop; CK(cudaEventCreate(&start)); CK(cudaEventCreate(&stop));
-                for (int i = 0; i < 20; ++i) magic2::mmv<B,V,C><<<grid,128>>>(dw, dx, ds, dy, M, K, N);
+                for (int i = 0; i < 20; ++i) magic2::mmv<B,V,C,XSH><<<grid,128>>>(dw, dx, ds, dy, M, K, N);
                 CK(cudaEventRecord(start));
-                for (int i = 0; i < 1000; ++i) magic2::mmv<B,V,C><<<grid,128>>>(dw, dx, ds, dy, M, K, N);
+                for (int i = 0; i < 1000; ++i) magic2::mmv<B,V,C,XSH><<<grid,128>>>(dw, dx, ds, dy, M, K, N);
                 CK(cudaEventRecord(stop)); CK(cudaEventSynchronize(stop));
                 CK(cudaEventElapsedTime(&ms, start, stop));
                 CK(cudaEventDestroy(start)); CK(cudaEventDestroy(stop));
@@ -116,7 +123,10 @@ int main(int argc, char ** argv) {
     const bool perf = argc == 3 && std::strcmp(argv[1], "perf") == 0;
     require(argc == 1 || (perf && (std::strcmp(argv[2], "pair") == 0 || std::strcmp(argv[2], "mix") == 0)), "usage: magic2_v2 [perf pair|mix]");
     std::mt19937 rng(20261024);
-    if (!perf || std::strcmp(argv[2], "pair") == 0) test<5,2,0x87D8D12Du>(rng, perf);
+    if (!perf || std::strcmp(argv[2], "pair") == 0) {
+        test<5,2,0x87D8D12Du>(rng, perf);
+        test<5,2,0x87D8D12Du,1>(rng, perf);
+    }
     if (!perf || std::strcmp(argv[2], "mix") == 0) {
         test<2,1,0xC3CCD12Du>(rng, perf);
         test<3,1,0x87D8D12Du>(rng, perf);

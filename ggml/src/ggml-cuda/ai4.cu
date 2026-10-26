@@ -3,6 +3,8 @@
 #include "ai4.cuh"
 #include "ai4-kern.cuh"
 #include "ai4-ampere.cuh"
+#include "magic2-v2.cuh"
+#include "../ggml-aif25.h"
 #include "rpb-knobs.h"
 
 #include <algorithm>
@@ -1099,4 +1101,42 @@ void ggml_cuda_mul_mat_id_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor
         default: GGML_ABORT("not an AI+ unit type");
     }
     CUDA_CHECK(cudaGetLastError());
+}
+
+// Fractional pair path. Reuse the numerically checked pair decoder and existing
+// activation rotation; keep the fractional rate separate from integer AI+ dispatch.
+bool ggml_cuda_aif25_supported(const ggml_tensor * op) {
+    const auto * w = op->src[0]; const auto * x = op->src[1];
+    return op->op == GGML_OP_MUL_MAT && w->type == GGML_TYPE_AIF25_U &&
+        x->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+        w->ne[2] == 1 && w->ne[3] == 1 && x->ne[2] == 1 && x->ne[3] == 1 &&
+        w->ne[0] % 128 == 0 && w->ne[1] % 16 == 0 &&
+        ggml_is_contiguous(w) && ggml_is_contiguous(x) && ggml_is_contiguous(op);
+}
+
+void ggml_cuda_mul_mat_aif25(ggml_backend_cuda_context & ctx, const ggml_tensor * w,
+                            const ggml_tensor * x, ggml_tensor * dst) {
+    GGML_ASSERT(ggml_cuda_aif25_supported(dst));
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    GGML_ASSERT(GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE);
+    const int K = w->ne[0], M = w->ne[1], N = x->ne[1];
+    const int xsh = K % 256 == 0 ? 1 : 0;
+    auto stream = ctx.stream();
+    ggml_cuda_pool_alloc<int8_t> q(ctx.pool(), (size_t)N*K);
+    ggml_cuda_pool_alloc<float> scales(ctx.pool(), (size_t)N*(K >> (7+xsh)));
+    ai4_quantize_x((const float *)x->data, N, K, xsh, q.get(), scales.get(), stream);
+    // CUDA grid.y is limited to 65535; each block handles eight activation rows.
+    for (int n0 = 0; n0 < N; n0 += 8*65535) {
+        const int nr = std::min(N-n0, 8*65535);
+        const dim3 grid(M/16, (nr+7)/8);
+        const float * xs = scales.get() + (size_t)n0*(K >> (7+xsh));
+        if (xsh) {
+            magic2::mmv<5,2,AIF25_MUL,1><<<grid,128,0,stream>>>((const uint8_t *)w->data,
+                q.get()+(size_t)n0*K, xs, (float *)dst->data+(size_t)n0*M, M,K,nr);
+        } else {
+            magic2::mmv<5,2,AIF25_MUL,0><<<grid,128,0,stream>>>((const uint8_t *)w->data,
+                q.get()+(size_t)n0*K, xs, (float *)dst->data+(size_t)n0*M, M,K,nr);
+        }
+        CUDA_CHECK(cudaGetLastError());
+    }
 }

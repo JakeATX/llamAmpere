@@ -41,9 +41,10 @@ static __device__ __forceinline__ void mma(int (&c)[4], const uint32_t (&a)[4], 
 }
 
 // Rotated, quantized activations; per-token scales are indexed by 128-column unit.
-template<int B, int V, uint32_t C>
+template<int B, int V, uint32_t C, int XSH = 0>
 static __global__ void __launch_bounds__(128) mmv(const uint8_t * weights, const int8_t * x,
         const float * xs, float * y, int M, int K, int N) {
+    static_assert(XSH == 0 || XSH == 1, "activation scale covers 128 or 256 columns");
     constexpr int UW = unit_bytes<B, V> / 4, TW = tile_words<B, V>;
     __shared__ uint32_t tiles[4][UW];
     __shared__ float partial[4][8][16];
@@ -72,8 +73,8 @@ static __global__ void __launch_bounds__(128) mmv(const uint8_t * weights, const
         }
         const __half * scales = reinterpret_cast<const __half *>(tiles[warp]);
         const float d0 = __half2float(scales[row]), d1 = __half2float(scales[row + 8]);
-        const float s0 = nbase + 2 * col < N ? xs[(nbase + 2 * col) * nu + u] : 0;
-        const float s1 = nbase + 2 * col + 1 < N ? xs[(nbase + 2 * col + 1) * nu + u] : 0;
+        const float s0 = nbase + 2 * col < N ? xs[(nbase + 2 * col) * (nu >> XSH) + (u >> XSH)] : 0;
+        const float s1 = nbase + 2 * col + 1 < N ? xs[(nbase + 2 * col + 1) * (nu >> XSH) + (u >> XSH)] : 0;
         sum[0] += c[0] * d0 * s0; sum[1] += c[1] * d0 * s1;
         sum[2] += c[2] * d1 * s0; sum[3] += c[3] * d1 * s1;
         __syncwarp();
