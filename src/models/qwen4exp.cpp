@@ -1626,9 +1626,13 @@ void llama_model_qwen4exp::graph::build_qsa_store(
     if (mctx_hyb->has_host_raw()) {
         // Gather before transferring: only the members of new/stale pools visit the device.
         ggml_backend_sched_set_tensor_backend(sched, rows, backend_cpu);
+        const auto pool_buft = kpool_cache.get_pool_buffer_type();
         for (int b = 0; b < ggml_backend_sched_get_n_backends(sched); ++b) {
             auto * backend = ggml_backend_sched_get_backend(sched, b);
-            if (ggml_backend_get_device(backend) == kpool_cache.get_pool_device()) {
+            // CPU buffer types need not expose a device handle.
+            const bool same_device = ggml_backend_buft_is_host(pool_buft) ? backend == backend_cpu :
+                    ggml_backend_get_device(backend) == ggml_backend_buft_get_device(pool_buft);
+            if (same_device && ggml_backend_supports_buft(backend, pool_buft)) {
                 pool_backend = backend;
                 break;
             }

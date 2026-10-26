@@ -151,8 +151,8 @@ public:
         ggml_tensor * scatter_pooled(ggml_tensor * values, ggml_tensor * idxs) const;
         ggml_tensor * gather_pooled(ggml_tensor * idxs) const;
         int64_t get_n_cells() const { return pooled->ne[1]; }
-        ggml_backend_dev_t get_pool_device() const {
-            return ggml_backend_buft_get_device(ggml_backend_buffer_get_type(pooled->buffer));
+        ggml_backend_buffer_type_t get_pool_buffer_type() const {
+            return ggml_backend_buffer_get_type(pooled->buffer);
         }
 
     private:
