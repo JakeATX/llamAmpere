@@ -2076,6 +2076,24 @@ std::unique_ptr<llama_moe_arena> llama_model_loader::load_moe_arena(llama_progre
     if (available < reserve || total > available - reserve || !llama_moe_arena::pin_supported()) {
         LLAMA_LOG_WARN("%s: %.2f GiB experts use unpinned mmap storage; %.2f GiB available, %.2f GiB pinning headroom required\n",
                 __func__, total / double(GiB), available / double(GiB), reserve / double(GiB));
+#ifdef __linux__
+        const char * device_cache = getenv("GGML_MOE_CACHE_DEVICE");
+        if (device_cache && strcmp(device_cache, "1") == 0) {
+            // fork: CUDA can register cold expert pages in place without changing the weight file.
+            for (const auto & entry : layers) {
+                for (const auto * t : entry.second) {
+                    const auto & w = require_weight(t->name);
+                    auto & mapping = mappings.at(w.idx);
+                    const size_t bytes = ggml_nbytes(t);
+                    if (w.offs > mapping->size() || bytes > mapping->size() - w.offs) {
+                        throw std::runtime_error("expert mapping exceeds weight file");
+                    }
+                    mapping->remap_private_writable(files.at(w.idx).get(), w.offs, w.offs + bytes);
+                }
+            }
+            LLAMA_LOG_INFO("%s: fallback expert mappings are private writable; weight files unchanged\n", __func__);
+        }
+#endif
         // No arena tensor has been allocated or reshaped yet. Normal buffer creation
         // and load_all_data bind the original file views without faulting them all in.
         return nullptr;
