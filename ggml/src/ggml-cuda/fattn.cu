@@ -2596,7 +2596,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
     }
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-    // [G16] opt-in: sparse GQA 9..16 as (4,16)/(2,16) tiles instead of two (8,8) head groups
+    // [G16] sparse GQA 9..16 as (4,16)/(2,16) tiles instead of two (8,8) head groups
     if constexpr (DKQ == 256 && DV == 256) {
         const int g16 = ggml_cuda_fa_sparse_g16();
         if (g16 != 0 && use_gqa_opt && gqa_ratio > 8 && gqa_ratio <= 16 && GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE &&
