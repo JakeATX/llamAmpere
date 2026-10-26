@@ -5850,6 +5850,10 @@ struct ggml_tensor * ggml_arange(
 
 // ggml_flash_attn_ext
 
+bool ggml_flash_attn_ext_mask_packed(const struct ggml_tensor * mask) {
+    return mask != NULL && mask->type == GGML_TYPE_I32;
+}
+
 struct ggml_tensor * ggml_flash_attn_ext(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,
@@ -5866,7 +5870,7 @@ struct ggml_tensor * ggml_flash_attn_ext(
     GGML_ASSERT(q->ne[3] == v->ne[3]);
 
     if (mask) {
-        GGML_ASSERT(mask->type == GGML_TYPE_F16);
+        GGML_ASSERT(mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_I32);
         // rows may be strided (the CPU and CUDA kernels index the mask by nb[1..3])
         GGML_ASSERT(ggml_is_contiguous_rows(mask));
         //GGML_ASSERT(ggml_can_repeat_rows(mask, qk));
@@ -5876,7 +5880,7 @@ struct ggml_tensor * ggml_flash_attn_ext(
     }
 
     if (max_bias > 0.0f) {
-        GGML_ASSERT(mask);
+        GGML_ASSERT(mask && mask->type == GGML_TYPE_F16);
     }
 
     // permute(0, 2, 1, 3)
@@ -5948,12 +5952,16 @@ void ggml_flash_attn_ext_set_sj_kvarn(
         int32_t              bits_v,
         int32_t              n_kv_pad) {
     GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
-    GGML_ASSERT(a->src[3] == NULL || a->src[3]->type == GGML_TYPE_F16); // mask follows the standard FA convention
+    GGML_ASSERT(a->src[3] == NULL || a->src[3]->type == GGML_TYPE_F16 || a->src[3]->type == GGML_TYPE_I32); // standard FA mask convention (F16 or packed)
     GGML_ASSERT((a->src[1]->type == GGML_TYPE_F16 || a->src[1]->type == GGML_TYPE_Q8_0 || a->src[1]->type == GGML_TYPE_TQ6_0) && a->src[1]->type == a->src[2]->type);
     GGML_ASSERT(body->type == GGML_TYPE_I8 && ggml_is_contiguous(body));
     GGML_ASSERT(desc->type == GGML_TYPE_I32 && ggml_nelements(desc) >= GGML_SJKVARN_DESC_N_ENTRIES);
     GGML_ASSERT(bits_k >= 2 && bits_k <= 8 && bits_v >= 2 && bits_v <= 8);
     GGML_ASSERT(n_kv_pad > 0 && n_kv_pad % 64 == 0);
+    if (a->src[3]) {
+        const int64_t mask_width = a->src[3]->ne[0]*(a->src[3]->type == GGML_TYPE_I32 ? 32 : 1);
+        GGML_ASSERT(mask_width >= n_kv_pad);
+    }
 
     ggml_set_op_params_i32(a, 7, ggml_get_op_params_i32(body, 7));
     a->src[5] = body;

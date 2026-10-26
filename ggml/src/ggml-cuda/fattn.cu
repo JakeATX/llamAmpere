@@ -3909,7 +3909,8 @@ static ggml_cuda_fattn_bounded_plan ggml_cuda_fattn_bounded_prefill_plan(const i
         return p;
     }
     // one mask shared by every head (per-head masks excluded)
-    if (mask != nullptr && (mask->type != GGML_TYPE_F16 || mask->ne[0] < K->ne[1] || mask->ne[1] < Q->ne[1] ||
+    if (mask != nullptr && ((mask->type != GGML_TYPE_F16 && mask->type != GGML_TYPE_I32) ||
+            mask->ne[0]*(mask->type == GGML_TYPE_I32 ? 32 : 1) < K->ne[1] || mask->ne[1] < Q->ne[1] ||
             mask->ne[2] != 1 || mask->ne[3] != 1)) {
         return p;
     }
@@ -3976,7 +3977,18 @@ static ggml_cuda_fattn_bounded_plan ggml_cuda_fattn_bounded_prefill_plan(const i
     return p;
 }
 
+static void ggml_cuda_fattn_mask_f16_desc(const ggml_tensor * mask, ggml_tensor & m2); // [#175] below
+static bool ggml_cuda_fattn_mask_is_packed(const ggml_tensor * dst);            // [#175] below
+
 bool ggml_cuda_flash_attn_ext_bounded_prefill_applies(int device, const ggml_tensor * dst) {
+    if (dst->src[3] != nullptr && dst->src[3]->type == GGML_TYPE_I32) {
+        // [#175] packed mask: the plan of the f16-expanded node the executor runs
+        ggml_tensor m2;
+        ggml_cuda_fattn_mask_f16_desc(dst->src[3], m2);
+        ggml_tensor d2 = *dst;
+        d2.src[3] = &m2;
+        return ggml_cuda_fattn_bounded_prefill_plan(device, &d2).heads > 0;
+    }
     return ggml_cuda_fattn_bounded_prefill_plan(device, dst).heads > 0;
 }
 
@@ -4189,6 +4201,15 @@ size_t ggml_cuda_flash_attn_ext_sj_kvarn_prefill_alloc_size(int device, const gg
 
 size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * dst) {
     GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
+    if (ggml_cuda_fattn_mask_is_packed(dst)) {
+        // [#175] reserve as for the f16 mask: the routes plan the same scratch either way (the expansion is pool memory)
+        ggml_tensor m2;
+        ggml_cuda_fattn_mask_f16_desc(dst->src[3], m2);
+        ggml_tensor d2 = *dst;
+        d2.src[3] = &m2;
+        return ggml_cuda_flash_attn_ext_get_alloc_size(device, &d2);
+    }
+
 
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
@@ -4243,8 +4264,118 @@ static bool ggml_cuda_fattn_sj_kvarn_rot_in_kernel(ggml_backend_cuda_context & c
     return Q->ne[1] <= 8 && Q->ne[1] <= stream_max && Q->ne[1] < 128 && ggml_cuda_flash_attn_ext_sj_kvarn_direct_supported(dst);
 }
 
+// One-bit KQ masks are read by the MMA loaders. Other routes expand the same values into the pool.
+bool ggml_cuda_flash_attn_sj_kvarn_lowbits_tile_route(const ggml_tensor * dst); // fattn-sjkvarn-lowbits.cu
+
+static bool ggml_cuda_fattn_mask_is_packed(const ggml_tensor * dst) {
+    return dst->src[3] != nullptr && dst->src[3]->type == GGML_TYPE_I32;
+}
+
+// the KV width of the f16 mask the packed one stands for: op_params[0] of the input tensor (a row view's op_params hold
+// its offset, so read the source's), or every bit of a row when it is unset
+static int64_t ggml_cuda_fattn_mask_packed_width(const ggml_tensor * mask) {
+    const ggml_tensor * src = mask->view_src ? mask->view_src : mask;
+    const int64_t n = src->type == GGML_TYPE_I32 ? src->op_params[0] : 0;
+    return n > 0 && n <= mask->ne[0]*32 ? n : mask->ne[0]*32;
+}
+
+// an f16 mask descriptor with the expanded shape (no data): routing, support and reservation queries see the f16 node
+static void ggml_cuda_fattn_mask_f16_desc(const ggml_tensor * mask, ggml_tensor & m2) {
+    m2 = *mask;
+    m2.type  = GGML_TYPE_F16;
+    m2.ne[0] = ggml_cuda_fattn_mask_packed_width(mask);
+    m2.nb[0] = sizeof(half);
+    m2.nb[1] = m2.nb[0]*m2.ne[0];
+    m2.nb[2] = m2.nb[1]*m2.ne[1];
+    m2.nb[3] = m2.nb[2]*m2.ne[2];
+    m2.view_src  = nullptr;
+    m2.view_offs = 0;
+    m2.data      = nullptr;
+}
+
+// GGML_CUDA_MASK_PACKED_NATIVE=0: every route takes the f16 expansion (A/B of the native loader)
+static bool ggml_cuda_fattn_mask_packed_native(const ggml_tensor * dst) {
+    static const bool enabled = [] { const char * e = getenv("GGML_CUDA_MASK_PACKED_NATIVE"); return e == nullptr || atoi(e) != 0; }();
+    const ggml_tensor * mask = dst->src[3];
+    if (!enabled || mask->ne[2] != 1 || (mask->nb[1] & 3) != 0 || ggml_get_op_params_i32(dst, 4) > 0) {
+        return false;
+    }
+    // fork: the resident-body fetcher still reads F16 visibility.
+    if (dst->src[5] && dst->src[5]->buffer &&
+            ggml_cuda_qsa_resident_is_buft(ggml_backend_buffer_get_type(dst->src[5]->buffer))) {
+        return false;
+    }
+    if (dst->src[6] != nullptr) {
+        if (ggml_cuda_fattn_sj_kvarn_is_lowbits(dst)) {
+            return ggml_cuda_flash_attn_sj_kvarn_lowbits_tile_route(dst);
+        }
+        return dst->src[0]->ne[1] > 8; // the 4/4 direct decode reader still needs F16
+    }
+    ggml_tensor m2;
+    ggml_cuda_fattn_mask_f16_desc(mask, m2);
+    // The launcher's head grouping must match the expanded mask's alignment decision.
+    for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+        if ((mask->nb[i] % 16 == 0) != (m2.nb[i] % 16 == 0)) {
+            return false;
+        }
+    }
+    ggml_tensor d2 = *dst;
+    d2.src[3] = &m2;
+    const int device = ggml_cuda_get_device();
+    return ggml_cuda_flash_attn_ext_fused(nullptr, &d2, device) ||
+        ggml_cuda_get_best_fattn_kernel(device, &d2) == BEST_FATTN_KERNEL_MMA_F16;
+}
+
+static __global__ void ggml_cuda_fattn_mask_expand(
+        const char * src, half * dst, const int64_t ne0, const int64_t ne1, const int64_t ne2,
+        const size_t nb1, const size_t nb2, const size_t nb3) {
+    const int64_t i0 = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
+    if (i0 >= ne0) {
+        return;
+    }
+    const int64_t i1 = blockIdx.y;
+    const int64_t i2 = blockIdx.z % ne2;
+    const int64_t i3 = blockIdx.z / ne2;
+    const uint32_t w = ((const uint32_t *) (src + i1*nb1 + i2*nb2 + i3*nb3))[i0 >> 5];
+    dst[((i3*ne2 + i2)*ne1 + i1)*ne0 + i0] = ((w >> (i0 & 31)) & 1u) ? __float2half(0.0f) : __float2half(-INFINITY);
+}
+
+static void ggml_cuda_flash_attn_ext_mask_expanded(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+        void (*run)(ggml_backend_cuda_context & ctx, ggml_tensor * dst)) {
+    const ggml_tensor * mask = dst->src[3];
+    ggml_tensor m2;
+    ggml_cuda_fattn_mask_f16_desc(mask, m2);
+    GGML_ASSERT(m2.ne[1] <= 65535 && m2.ne[2]*m2.ne[3] <= 65535);
+    ggml_cuda_pool_alloc<half> buf(ctx.pool(), ggml_nelements(&m2));
+    m2.data = buf.ptr;
+    const dim3 blocks((m2.ne[0] + 255)/256, m2.ne[1], m2.ne[2]*m2.ne[3]);
+    ggml_cuda_fattn_mask_expand<<<blocks, 256, 0, ctx.stream()>>>((const char *) mask->data, buf.ptr,
+            m2.ne[0], m2.ne[1], m2.ne[2], mask->nb[1], mask->nb[2], mask->nb[3]);
+    CUDA_CHECK(cudaGetLastError());
+    ggml_tensor d2 = *dst;
+    d2.src[3] = &m2;
+    run(ctx, &d2);
+}
+
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+    if (ggml_cuda_fattn_mask_is_packed(dst)) {
+        const int64_t n_kv = dst->src[6] ? ggml_get_op_params_i32(dst, 6) : dst->src[1]->ne[1];
+        GGML_ASSERT(dst->src[3]->ne[0]*32 >= n_kv);
+        const bool native = ggml_cuda_fattn_mask_packed_native(dst);
+        static thread_local unsigned logged = 0;
+        const unsigned bit = 1u << ((native ? 0 : 2) + (dst->src[0]->ne[1] > 8));
+        if (!(logged & bit) && getenv("GGML_CUDA_FATTN_ALLOC_LOG")) {
+            GGML_LOG_INFO("packed mask: %s n_q=%lld n_kv=%lld\n", native ? "mask_packed_native" : "mask_packed_expand",
+                    (long long) dst->src[0]->ne[1], (long long) n_kv);
+            logged |= bit;
+        }
+        if (!native) {
+            ggml_cuda_flash_attn_ext_mask_expanded(ctx, dst, ggml_cuda_flash_attn_ext);
+            return;
+        }
+    }
+
     ggml_cuda_qsa_resident_prepare(ctx, dst);
 
     // SJ-KVaRN region-aware attention (sink/ring f16 rows + sealed 4-bit body records): dedicated MMA path.
@@ -4300,6 +4431,14 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 }
 
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
+    if (ggml_cuda_fattn_mask_is_packed(dst)) {
+        // [#175] the packed mask runs wherever its f16 expansion does (no ALiBi: ggml_flash_attn_ext asserts it)
+        ggml_tensor m2;
+        ggml_cuda_fattn_mask_f16_desc(dst->src[3], m2);
+        ggml_tensor d2 = *dst;
+        d2.src[3] = &m2;
+        return ggml_cuda_flash_attn_ext_supported(device, &d2);
+    }
     if (dst->src[6] != NULL) {
         // SJ-KVaRN region attention: only the dedicated MMA path (fattn-mma-sjkvarn.cuh) serves it
         const int cc = ggml_cuda_info().devices[device].cc;

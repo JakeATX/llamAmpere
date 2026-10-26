@@ -4246,7 +4246,138 @@ static void set_input_kq_mask_seq_prefix(const llama_kv_cells & cells, const lla
 void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
     const uint32_t n_tokens = ubatch->n_tokens;
 
+    struct mask_host_timer {
+        const ggml_tensor * dst;
+        uint32_t n_tokens;
+        int64_t start;
+        ~mask_host_timer() {
+            if (start) {
+                const int64_t end = ggml_time_us();
+                LLAMA_LOG_INFO("mask host us: start=%lld duration=%lld packed=%d kv=%lld queries=%u bytes=%zu\n",
+                    (long long) start, (long long) (end - start), dst->type == GGML_TYPE_I32,
+                    (long long) (dst->type == GGML_TYPE_I32 ? dst->op_params[0] : dst->ne[0]), n_tokens, ggml_nbytes(dst));
+            }
+        }
+    };
+    static const bool profile = std::getenv("LLAMA_KQ_MASK_PROFILE") != nullptr;
+    const mask_host_timer timer { dst, n_tokens, profile ? ggml_time_us() : 0 };
+
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+
+    if (dst->type == GGML_TYPE_I32) {
+        // [#175] one bit per KV position (bit j%32 of word j/32 set = visible).
+        // Positions past n_kv in the last word stay masked; general layouts use the F16 fallback below.
+        const int64_t n_kv = dst->op_params[0];
+        const int64_t n_w  = dst->ne[0];
+        GGML_ASSERT(n_kv > 0 && n_w == (n_kv + 31)/32);
+
+        // fork: pack the common sequence-prefix mask without an intermediate F16 allocation.
+        if (dst->ne[3] == 1 && causal_attn && swa_type == LLAMA_SWA_TYPE_NONE && !hparams.use_alibi &&
+                n_tokens > 0 && !ubatch->is_pos_2d() && kq_mask_fast_enabled()) {
+            const llama_seq_id seq_id = ubatch->seq_id[0][0];
+            const auto & cells = v_cells.at(seq_to_stream[seq_id]);
+            bool ok = n_kv <= (int64_t) cells.size();
+            for (uint32_t i = 0; ok && i < n_tokens; ++i) {
+                const llama_seq_id seq = ubatch->seq_id[i][0];
+                ok = ubatch->pos[i] >= 0 && (seq == seq_id || cells.seq_covers_used(seq));
+            }
+            if (ok && cells.seq_covers_used(seq_id)) {
+                const llama_pos * pos = cells.pos_data();
+                uint32_t * words = (uint32_t *) dst->data;
+                // A contiguous used range rules out holes. A query at the maximum position sees every used cell.
+                const int64_t n_prefix = std::min<int64_t>(n_kv, cells.used_max_p1());
+                bool ordered = cells.used_min() == 0 && cells.used_max_p1() == cells.get_used();
+                const bool all_visible = n_tokens == 1 && ubatch->pos[0] >= cells.seq_pos_max(seq_id);
+                const auto & seq_pos = cells.seq_pos_get(seq_id);
+                auto first_hidden = seq_pos.end();
+                bool clear_tail = false;
+                if (ordered && !all_visible && n_tokens <= 32) {
+                    const llama_pos min_query = *std::min_element(ubatch->pos, ubatch->pos + n_tokens);
+                    first_hidden = seq_pos.upper_bound({ min_query, UINT32_MAX });
+                    auto tail_end = first_hidden;
+                    for (uint32_t n = 0; tail_end != seq_pos.end() && n < 32; ++n) {
+                        ++tail_end;
+                    }
+                    clear_tail = tail_end == seq_pos.end();
+                }
+                // Recent queries need only clear future cells; their physical order does not matter.
+                if (ordered && !all_visible && !clear_tail) {
+                    uint32_t n_unordered = 0;
+                    for (int64_t j = 1; j < n_prefix; ++j) {
+                        n_unordered += uint32_t(pos[j - 1] > pos[j]);
+                    }
+                    ordered = n_unordered == 0;
+                }
+                if (ordered) {
+                    for (uint32_t i = 0; i < n_tokens; ++i) {
+                        const int64_t n_visible = all_visible || clear_tail ? n_prefix : std::upper_bound(pos, pos + n_prefix, ubatch->pos[i]) - pos;
+                        uint32_t * row = words + i*n_w;
+                        int64_t end = n_visible/32;
+                        std::fill(row, row + end, ~uint32_t(0));
+                        if (n_visible%32) {
+                            row[end++] = (uint32_t(1) << (n_visible%32)) - 1;
+                        }
+                        std::fill(row + end, row + n_w, uint32_t(0));
+                        if (clear_tail) {
+                            for (auto it = first_hidden; it != seq_pos.end(); ++it) {
+                                if (it->first > ubatch->pos[i] && it->second < n_prefix) {
+                                    row[it->second/32] &= ~(uint32_t(1) << (it->second%32));
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
+                for (uint32_t i = 0; i < n_tokens; ++i) {
+                    const uint32_t query_pos = (uint32_t) ubatch->pos[i];
+                    for (int64_t iw = 0; iw < n_w; ++iw) {
+                        uint32_t bits = 0;
+                        const int64_t end = std::min<int64_t>(32, n_kv - 32*iw);
+                        for (int64_t b = 0; b < end; ++b) {
+                            bits |= uint32_t((uint32_t) pos[32*iw + b] <= query_pos) << b;
+                        }
+                        words[i*n_w + iw] = bits;
+                    }
+                }
+                return;
+            }
+        }
+
+        thread_local std::vector<ggml_fp16_t> scratch;
+        const int64_t n_rows = dst->ne[1]*dst->ne[2]*dst->ne[3];
+        scratch.resize((size_t) (n_kv*n_rows));
+
+        ggml_tensor tmp = *dst;
+        tmp.type  = GGML_TYPE_F16;
+        tmp.ne[0] = n_kv;
+        tmp.nb[0] = sizeof(ggml_fp16_t);
+        tmp.nb[1] = tmp.nb[0]*tmp.ne[0];
+        tmp.nb[2] = tmp.nb[1]*tmp.ne[1];
+        tmp.nb[3] = tmp.nb[2]*tmp.ne[2];
+        tmp.data  = scratch.data();
+        set_input_kq_mask(&tmp, ubatch, causal_attn);
+
+        const ggml_fp16_t keep = ggml_fp32_to_fp16(0.0f);
+        const ggml_fp16_t drop = ggml_fp32_to_fp16(-INFINITY);
+        uint32_t * words = (uint32_t *) dst->data;
+        for (int64_t r = 0; r < n_rows; ++r) {
+            const ggml_fp16_t * row = scratch.data() + r*n_kv;
+            uint32_t          * w   = words + r*n_w;
+            for (int64_t iw = 0; iw < n_w; ++iw) {
+                const int64_t j0 = iw*32;
+                const int64_t nj = std::min<int64_t>(32, n_kv - j0);
+                uint32_t bits = 0;
+                for (int64_t b = 0; b < nj; ++b) {
+                    const ggml_fp16_t v = row[j0 + b];
+                    // the f16 mask holds 0 or -INF here (ALiBi masks never take this path)
+                    GGML_ASSERT(v == keep || v == drop);
+                    bits |= (uint32_t) (v == keep) << b;
+                }
+                w[iw] = bits;
+            }
+        }
+        return;
+    }
 
     const int64_t n_kv     = dst->ne[0];
     const int64_t n_stream = dst->ne[3]; // num streams in the current ubatch

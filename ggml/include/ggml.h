@@ -2579,11 +2579,18 @@ extern "C" {
     // mask: [n_kv,     n_batch, ne32,      ne33]
     // res:  [n_embd_v, n_head,  n_batch,   ne3 ] !! permuted !!
     //
+    // packed mask: an I32 mask of shape [ceil(n_kv/32), n_batch, ne32, ne33] holds one bit per KV position,
+    // bit (i % 32) of word i/32 of a row: 1 = visible (mask value 0), 0 = masked (-INF). It replaces the
+    // n_kv x n_batch F16 mask when the mask is binary (no ALiBi, max_bias == 0); see ggml_flash_attn_ext_mask_packed.
+    //
     // broadcast:
     //   n_head % n_head_kv == 0
     //   n_head % ne32      == 0
     //   ne3    % ne33      == 0
     //
+    // true when the mask of a FLASH_ATTN_EXT node is the one-bit packed mask (see above)
+    GGML_API bool ggml_flash_attn_ext_mask_packed(const struct ggml_tensor * mask);
+
     GGML_API struct ggml_tensor * ggml_flash_attn_ext(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,

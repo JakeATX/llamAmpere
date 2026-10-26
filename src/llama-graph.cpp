@@ -74,10 +74,21 @@ static ggml_tensor * build_attn_inp_kq_mask(
         ggml_context * ctx,
         const llama_kv_cache_context * mctx,
         const llama_ubatch & ubatch,
-        const llama_cparams & cparams) {
+        const llama_cparams & cparams,
+        bool allow_packed = false) {
     const auto n_kv     = mctx->get_n_kv();
     const auto n_tokens = ubatch.n_tokens;
     const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
+
+    if (allow_packed && cparams.kq_mask_packed && cparams.flash_attn && !cparams.training) {
+        // [#175] one-bit packed mask: 32 KV positions per I32 word (see ggml_flash_attn_ext); op_params[0] keeps n_kv
+        // for the fill and for the users that need the KV length
+        ggml_tensor * res = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, (n_kv + 31)/32, n_tokens/n_stream, 1, n_stream);
+        res->op_params[0] = (int32_t) n_kv;
+        ggml_set_input(res);
+        ggml_set_name(res, "attn_inp_kq_mask");
+        return res;
+    }
 
     // flash attention requires an f16 mask
     const auto type = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
@@ -100,7 +111,13 @@ static bool can_reuse_kq_mask(
 
     bool res = true;
 
-    res &= (kq_mask->ne[0] == n_kv);
+    if (kq_mask->type == GGML_TYPE_I32) {
+        // [#175] packed mask (the choice is fixed per context)
+        res &= (kq_mask->op_params[0] == (int32_t) n_kv);
+        res &= (kq_mask->ne[0] == (int64_t) (n_kv + 31)/32);
+    } else {
+        res &= (kq_mask->ne[0] == n_kv);
+    }
     res &= (kq_mask->ne[1] == n_tokens/n_stream);
     res &= (kq_mask->ne[2] == 1);
     res &= (kq_mask->ne[3] == n_stream);
@@ -3267,6 +3284,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             // own descriptor row (sealed end, ring state, group table) and its own attended length, exactly the
             // node a single-sequence cache builds for that stream; the outputs are concatenated stream-major
             const int64_t ns = k->ne[3];
+            const bool packed_mask = kq_mask->type == GGML_TYPE_I32;
+            const int64_t mask_width = kq_mask->ne[0]*(packed_mask ? 32 : 1);
             GGML_ASSERT(sj_kvarn_pending.n_kv_streams && (int64_t) sj_kvarn_pending.n_kv_streams->size() == ns);
             ggml_tensor * desc = sj_kvarn_pending.desc;
             GGML_ASSERT(desc->ne[1] == ns && q->ne[3] == ns && v->ne[3] == ns && kq_mask->ne[3] == ns);
@@ -3276,7 +3295,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             ggml_tensor * out = nullptr;
             for (int64_t s = 0; s < ns; ++s) {
                 const int32_t n_kv_s = (int32_t) (*sj_kvarn_pending.n_kv_streams)[s];
-                GGML_ASSERT(n_kv_s > 0 && n_kv_s % 64 == 0 && n_kv_s <= kq_mask->ne[0]);
+                GGML_ASSERT(n_kv_s > 0 && n_kv_s % 64 == 0 && n_kv_s <= mask_width);
                 ggml_tensor * q_s = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2], 1, q->nb[1], q->nb[2], q->nb[3], s*q->nb[3]);
                 ggml_tensor * k_s = ggml_view_4d(ctx0, k, k->ne[0], k->ne[1], k->ne[2], 1, k->nb[1], k->nb[2], k->nb[3], s*k->nb[3]);
                 ggml_tensor * v_s = ggml_view_4d(ctx0, v, v->ne[0], v->ne[1], v->ne[2], 1, v->nb[1], v->nb[2], v->nb[3], s*v->nb[3]);
@@ -3286,8 +3305,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                 }
                 GGML_ASSERT((int64_t) sj_kvarn_mask_s.size() == ns);
                 ggml_tensor * m_s = sj_kvarn_mask_s[s];
-                if (m_s == nullptr || m_s->ne[0] != n_kv_s) {
-                    m_s = ggml_view_4d(ctx0, kq_mask, n_kv_s, kq_mask->ne[1], kq_mask->ne[2], 1,
+                const int64_t mask_cols = packed_mask ? (n_kv_s + 31)/32 : n_kv_s;
+                if (m_s == nullptr || m_s->ne[0] != mask_cols) {
+                    m_s = ggml_view_4d(ctx0, kq_mask, mask_cols, kq_mask->ne[1], kq_mask->ne[2], 1,
                             kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], s*kq_mask->nb[3]);
                     if (!ggml_is_contiguous(m_s)) {
                         m_s = ggml_cont(ctx0, m_s);
@@ -3335,9 +3355,14 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         // SJ-KVaRN: attach the sealed record pool + region descriptor; Q/K/V are Hadamard-rotated, so un-rotate the output
         const bool is_sj_kvarn_attn = sj_kvarn_pending.body != nullptr;
         if (is_sj_kvarn_attn) {
-            GGML_ASSERT(kq_mask && kq_mask->ne[0] > 0 && kq_mask->ne[0] % 64 == 0);
+            // the attended position count: the mask width, or n_kv for the packed mask (op_params[0] of the input;
+            // a row view's op_params hold its offset, so read the source tensor's)
+            const ggml_tensor * kq_mask_src = kq_mask && kq_mask->view_src ? kq_mask->view_src : kq_mask;
+            const int64_t n_kv_pad = kq_mask && kq_mask->type == GGML_TYPE_I32 ? kq_mask_src->op_params[0] :
+                                     kq_mask ? kq_mask->ne[0] : 0;
+            GGML_ASSERT(kq_mask && n_kv_pad > 0 && n_kv_pad % 64 == 0);
             ggml_flash_attn_ext_set_sj_kvarn(cur, sj_kvarn_pending.body, sj_kvarn_pending.desc,
-                    sj_kvarn_pending.bits_k, sj_kvarn_pending.bits_v, (int32_t) kq_mask->ne[0]);
+                    sj_kvarn_pending.bits_k, sj_kvarn_pending.bits_v, (int32_t) n_kv_pad);
             const int group = sj_kvarn_pending.body->op_params[7] == GGML_TYPE_TURBO4_0 ? 128 : 256;
             const bool fused_rot = sj_kvarn_pending.fused_rot;
             ggml_tensor * wush_ao = sj_kvarn_pending.wush_ao;
@@ -3562,7 +3587,7 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
         inp->self_k_idxs = mctx_cur->build_input_k_idxs(ctx0, ubatch);
         inp->self_v_idxs = mctx_cur->build_input_v_idxs(ctx0, ubatch);
 
-        inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
+        inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams, /*allow_packed=*/true);
         inp->self_kq_mask_cnv = inp->self_kq_mask;
     }
 
@@ -3880,7 +3905,7 @@ static std::unique_ptr<llm_graph_input_attn_k> build_attn_inp_k_impl(
 
         inp->self_k_idxs = mctx_cur->build_input_k_idxs(ctx0, ubatch);
 
-        inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
+        inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams, /*allow_packed=*/true);
         inp->self_kq_mask_cnv = inp->self_kq_mask;
     }
 

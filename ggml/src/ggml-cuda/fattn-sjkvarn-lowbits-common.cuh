@@ -1892,7 +1892,8 @@ void launch_fattn(
     GGML_ASSERT(K->nb[0] == ggml_element_size(K));
     GGML_ASSERT(V->nb[0] == ggml_element_size(V));
 
-    GGML_ASSERT(!mask || mask->type == GGML_TYPE_F16);
+    GGML_ASSERT(!mask || mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_I32); // I32: [#175] packed mask
+    GGML_ASSERT(!mask || mask->type != GGML_TYPE_I32 || (!use_sparse && (mask->nb[1] & 3) == 0));
 
     // #139: the kernel rotates Q and its final outputs; the fixup / combine kernels rotate the values they finish.
     const bool rot = ggml_cuda_fattn_sj_kvarn_rot(KQV);
@@ -2072,7 +2073,7 @@ void launch_fattn(
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths.
-    if (!use_sparse && !is_sj_kvarn && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1)) {
+    if (!use_sparse && !is_sj_kvarn && mask && mask->type == GGML_TYPE_F16 && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1)) {
         const int64_t s31 = mask->nb[1] / sizeof(half2);
         const int64_t s33 = mask->nb[3] / sizeof(half2);
 
@@ -2213,7 +2214,7 @@ void launch_fattn(
         K->ne[0], n_kv, K->ne[2], K->ne[3], nb11, nb12, nb13,
         nb21, nb22, nb23,
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
-        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
+        mask ? (mask->type == GGML_TYPE_I32 ? mask->nb[1] | 1 : mask->nb[1]) : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
         is_sj_kvarn ? (const char    *) KQV->src[5]->data : nullptr,
         is_sj_kvarn ? (const int32_t *) KQV->src[6]->data : nullptr
     );

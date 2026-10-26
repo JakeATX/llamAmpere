@@ -78,7 +78,7 @@ For a smaller cache, use `-ctk sjkvarn3 -ctv sjkvarn3 --sjkvarn-body-type auto` 
 directory; the model download is 9.0 GB.
 
 ```bash
-LLAMA_MTP_DRAFT_COMPUTE_LEAN=1 ./build-sm86/bin/llama-server \
+LLAMA_KQ_MASK_PACKED=1 LLAMA_MTP_DRAFT_COMPUTE_LEAN=1 ./build-sm86/bin/llama-server \
   -hf jakeatx/ATX-Swift-1.5-Qwen3.8-27B-Uncensored-2.3bpw-MTP-GGUF \
   -hff ATX-Swift-1.5-Qwen3.8-27B-Uncensored-2.3bpw-MTP.gguf \
   -c 204800 --parallel 1 -ngl 99 -fa on -fit off -b 4096 -ub 512 \
@@ -271,3 +271,7 @@ The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-or
 - [nlohmann/json](https://github.com/nlohmann/json) - Single-header JSON library, used by various tools/examples - MIT License
 - [mackron/miniaudio](https://github.com/mackron/miniaudio) - Single-header audio format decoder, used by multimodal subsystem - Public domain
 - [sheredom/subprocess.h](https://github.com/sheredom/subprocess.h) - Single-header process launching solution for C and C++ - Public domain
+
+For v0.6 recommended configurations on cards with 12 GB or less, set `LLAMA_KQ_MASK_PACKED=1`; the global default remains off. On the frozen R10 Swift 1.5 SJ-KVaRN 3/2t recipe at 204,800 context and microbatch 512, packing saved 188 MiB with identical output and prompt-cache state. Six paired Taichi timing brackets measured generation +0.12% and prompt processing -1.59%; these historical measurements are the tradeoff, not a new speed result for the integrated build. See [v0.6 packed-mask notes](docs/llamampere-v0.6/CHANGELOG.md).
+
+Packed attention masks are opt-in with `LLAMA_KQ_MASK_PACKED=1` (default off, CPU/CUDA flash attention only). Native MMA and int8-QK mask readers use one bit per entry instead of F16. Unsupported readers, including sparse gather, resident-body fetch, and direct decode readers, expand to F16 scratch and may give back the memory saving. ALiBi, training, KV streaming, and architectures with custom mask layouts keep their existing masks.

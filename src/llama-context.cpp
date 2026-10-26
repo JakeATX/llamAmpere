@@ -771,6 +771,39 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
         }
         backends.emplace_back(backend_cpu);
 
+        // [#175] one-bit packed KQ mask (opt-in LLAMA_KQ_MASK_PACKED=1): the CUDA and CPU flash-attention kernels read
+        // the mask one bit per KV position; other backends, models that reshape or slice the mask themselves, ALiBi
+        // (non-binary mask values), KV streaming and training keep the f16 mask
+        {
+            const char * env = getenv("LLAMA_KQ_MASK_PACKED");
+            bool ok = env && atoi(env) != 0;
+            for (auto & backend : backends) {
+                ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+                ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+                const char * name = reg ? ggml_backend_reg_name(reg) : "";
+                if (strcmp(name, "CUDA") != 0 && strcmp(name, "CPU") != 0 && strcmp(name, "BLAS") != 0) {
+                    ok = false;
+                }
+            }
+            switch (model.arch) {
+                case LLM_ARCH_QWEN4EXP:
+                case LLM_ARCH_T5:
+                case LLM_ARCH_T5ENCODER:
+                case LLM_ARCH_DEEPSEEK4:
+                case LLM_ARCH_GLM5_NEXT:
+                case LLM_ARCH_MINIMAX_M3:
+                    ok = false;
+                    break;
+                default:
+                    break;
+            }
+            ok = ok && cparams.flash_attn && cparams.kv_stream_arena_mib == 0 && !model.hparams.use_alibi;
+            cparams.kq_mask_packed = ok;
+            if (env) {
+                LLAMA_LOG_INFO("%s: packed KQ mask       = %s\n", __func__, ok ? "on" : "off");
+            }
+        }
+
         // create a list of the set_n_threads functions in the backends
         for (auto & backend : backends) {
             ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());

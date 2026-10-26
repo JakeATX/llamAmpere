@@ -400,8 +400,10 @@ bool ggml_cuda_flash_attn_ext_sj_kvarn_prefill(ggml_backend_cuda_context & ctx, 
                 q.data = (char *) Q->data + q0*Q->nb[1];
                 q.ne[1] = qn;
                 ggml_tensor m = *mask;
-                m.data = (char *) mask->data + q0*mask->nb[1] + size_t(c0)*mask->nb[0];
-                m.ne[0] = cn;
+                const bool packed_mask = mask->type == GGML_TYPE_I32;
+                GGML_ASSERT(!packed_mask || c0 % 32 == 0);
+                m.data = (char *) mask->data + q0*mask->nb[1] + size_t(packed_mask ? c0/32 : c0)*mask->nb[0];
+                m.ne[0] = packed_mask ? (cn + 31)/32 : cn;
                 m.ne[1] = qn;
                 m.view_src = nullptr;
                 m.view_offs = 0;
