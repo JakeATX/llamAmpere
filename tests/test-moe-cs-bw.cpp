@@ -1,6 +1,6 @@
 // fork STRATAGAP: how fast the host expert pool (GGML_MOE_CPU_SPLIT) runs against what the RAM can deliver.
 //
-//   test-moe-cs-bw <cpu,cpu,...> [RAM MiB] [output file]
+//   test-moe-cs-bw <cpu,cpu,...> [RAM MiB] [experts] [check|time] [output file]
 //
 // Part 1, RAM read ceiling: threads pinned to the first 1..N cpus of the list each stream their own slice of a
 // large buffer (AVX2 loads); prints GB/s for each thread count.
@@ -122,7 +122,7 @@ static void make_proj(proj & p, ggml_type type, int64_t n_in, int64_t n_out, int
 
 int main(int argc, char ** argv) {
     if (argc < 2) {
-        fprintf(stderr, "usage: %s <cpu,cpu,...> [ram MiB, default 2048] [output file]\n", argv[0]);
+        fprintf(stderr, "usage: %s <cpu,cpu,...> [ram MiB, default 2048] [experts, default 128] [check|time] [output file]\n", argv[0]);
         return 2;
     }
     std::vector<int> cpus;
@@ -132,8 +132,8 @@ int main(int argc, char ** argv) {
         if (*c == ',') { ++c; }
     }
     const size_t ram_mb = argc > 2 ? (size_t) atol(argv[2]) : 2048;
-    FILE * output = argc > 3 ? fopen(argv[3], "wb") : nullptr;
-    if (argc > 3 && !output) { perror("output file"); return 1; }
+    FILE * output = argc > 5 ? fopen(argv[5], "wb") : nullptr;
+    if (argc > 5 && !output) { perror("output file"); return 1; }
     if (ram_mb) { ram_ceiling(cpus, ram_mb << 20); }
 
     // Part 2: the pool. The calling thread plays the card's driver thread (pinned to cpu 0, which the pool skips).
