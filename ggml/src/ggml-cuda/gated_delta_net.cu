@@ -1629,7 +1629,7 @@ static void gated_delta_net_dispatch(
         float scale, int64_t state_slot_stride, int K, const int32_t * slot_rows,
         int ingr_w, int64_t ingr_region, const ggml_cuda_gated_delta_net_state_src state_src, ggml_cuda_pool * pool, cudaStream_t stream) {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-    // [PREFILLFAST] GGML_CUDA_GDN_CHUNKED=1: Argon chunked tensor-core prompt kernel (valid math, not bit-identical);
+    // Chunked tensor-core prompt kernel, enabled by default (valid math, not bit-identical);
     // returns false (falls through to the kernels below) when the shape, arch or state type does not apply
     // BF16 cache rounding amplifies small chunked-state differences; retain the precise path.
     if (!kda && pool != nullptr && !std::is_same_v<state_t, nv_bfloat16>) {

@@ -11,7 +11,7 @@
 // [PREFILLFAST] Argon chunked tensor-core GDN prompt kernel, ported from bl/gdn-tc-argon-fix b6aa8e51c
 // (code unchanged; macros renamed GDN_TC_* -> GDNA_* and wrapped in a namespace so it builds beside
 // the #112 GGML_CUDA_GDN_TC kernel). Included by gated_delta_net.cu after gdn_store_state.
-// OPT-IN here: GGML_CUDA_GDN_CHUNKED=1 turns it on (default off in this branch).
+// Enabled for supported prompt shapes by default; GGML_CUDA_GDN_CHUNKED=0 disables it.
 namespace gdn_argon {
 
 #define GDNA_S_V             128
@@ -1069,9 +1069,9 @@ gdn_tc_carry_kernel(
 
 static bool ggml_cuda_gdn_chunked_enabled() {
     static const bool on = [] {
-        // [PREFILLFAST] opt-in on this branch (upstream bl/main-gdn-chunked defaults it on): GGML_CUDA_GDN_CHUNKED=1
+        // Keep the sequential fallback available for comparison and unsupported shapes.
         const char * s = getenv("GGML_CUDA_GDN_CHUNKED");
-        return s != nullptr && atoi(s) != 0;
+        return s == nullptr || atoi(s) != 0;
     }();
     return on;
 }
