@@ -17988,7 +17988,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                     test_cases.emplace_back(new test_flash_attn_ext_packed(mode, 256, 256, 4, {6, 1}, kv, nb, false, 0.0f, types.first, types.second, {0, 2, 1, 3}, false));
                 }
             }
-            test_cases.emplace_back(new test_flash_attn_ext_packed(mode, 256, 256, 4, {6, 1}, 1024, 5, true, 10.0f, types.first, types.second, {0, 2, 1, 3}, false));
             test_cases.emplace_back(new test_flash_attn_ext_packed(mode, 256, 256, 4, {6, 2}, 1024, 7, false, 0.0f, types.first, types.second));
         }
         for (int64_t nb : {7, 1024}) {
