@@ -9121,9 +9121,12 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             memset(VKQ32, 0, DV*sizeof(float));
         }
 
-        const bool mask_imp = mask && mask->type == GGML_TYPE_I32;
-        const ggml_fp16_t * mp = mask && !mask_imp ? (ggml_fp16_t *)((char *) mask->data + iq1*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]) : NULL;
-        const int32_t mlim = mask_imp ? *(const int32_t *)((const char *) mask->data + iq1*mask->nb[1] + (iq3%mask->ne[3])*mask->nb[3]) : 0;
+        const bool mask_imp = mask && mask->type == GGML_TYPE_I64;
+        const bool mask_packed = ggml_flash_attn_ext_mask_packed(mask);
+        const char * m_row = mask ? (const char *) mask->data + iq1*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3] : NULL;
+        const ggml_fp16_t * mp = mask && !mask_imp && !mask_packed ? (const ggml_fp16_t *) m_row : NULL;
+        const uint32_t * mw = mask_packed ? (const uint32_t *) m_row : NULL;
+        const int64_t mlim = mask_imp ? *(const int64_t *) m_row : 0;
 
         // k indices
         const int ik3 = iq3 / rk3;
@@ -9141,7 +9144,9 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         // ref: https://arxiv.org/pdf/2112.05682.pdf
 
         for (int64_t ic = ic_start; ic < ic_end; ++ic) {
-            const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : mask_imp ? slope*(ic < mlim ? 0.0f : -INFINITY) : 0.0f;
+            const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) :
+                             mw ? slope*((mw[ic >> 5] >> (ic & 31)) & 1 ? 0.0f : -INFINITY) :
+                             mask_imp ? slope*(ic < mlim ? 0.0f : -INFINITY) : 0.0f;
             if (mv == -INFINITY) {
                 continue;
             }
@@ -9404,11 +9409,16 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
             if (mask) {
                 bool can_skip = true;
                 for (int tq = 0; tq < tile_rows; tq++) {
-                    const bool mask_imp = mask->type == GGML_TYPE_I32;
-                    const ggml_fp16_t * mp_row = mask_imp ? NULL : (const ggml_fp16_t *)((const char *) mask->data + (iq1 + tq)*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]);
-                    const int32_t mlim = mask_imp ? *(const int32_t *)((const char *) mask->data + (iq1 + tq)*mask->nb[1] + (iq3%mask->ne[3])*mask->nb[3]) : 0;
+                    const char * m_row = (const char *) mask->data + (iq1 + tq)*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3];
+                    const ggml_fp16_t * mp_row = (const ggml_fp16_t *) m_row;
+                    const uint32_t * mw_row = (const uint32_t *) m_row;
+                    const bool mask_packed = ggml_flash_attn_ext_mask_packed(mask);
+                    const bool mask_imp = mask->type == GGML_TYPE_I64;
+                    const int64_t mlim = mask_imp ? *(const int64_t *) m_row : 0;
                     for (int tk = 0; tk < kv_tile; tk++) {
-                        mask32[tq * KV_TILE_SZ + tk] = slope * (mask_imp ? (ic + tk < mlim ? 0.0f : -INFINITY) : GGML_CPU_FP16_TO_FP32(mp_row[ic + tk]));
+                        const int64_t i = ic + tk;
+                        mask32[tq * KV_TILE_SZ + tk] = slope * (mask_packed ? ((mw_row[i >> 5] >> (i & 31)) & 1 ? 0.0f : -INFINITY) :
+                                                                              mask_imp ? (i < mlim ? 0.0f : -INFINITY) : GGML_CPU_FP16_TO_FP32(mp_row[i]));
                         if (mask32[tq * KV_TILE_SZ + tk] != -INFINITY) {
                             can_skip = false;
                         }
@@ -9774,7 +9784,7 @@ static void ggml_compute_forward_flash_attn_ext_sj_kvarn(
     const int32_t N = dd[GGML_SJKVARN_DESC_N], qpos0 = dd[GGML_SJKVARN_DESC_QPOS0], G = dd[GGML_SJKVARN_DESC_G];
     const int32_t D = dd[GGML_SJKVARN_DESC_D], hkv = dd[GGML_SJKVARN_DESC_HKV];
     const size_t rec_bytes = (size_t) dd[GGML_SJKVARN_DESC_RECBYTES];
-    GGML_ASSERT(mask == NULL || (mask->type == GGML_TYPE_F16 && mask->ne[0] >= N));
+    GGML_ASSERT(mask == NULL || (mask->type == GGML_TYPE_F16 && mask->ne[0] >= N) || (mask->type == GGML_TYPE_I32 && mask->ne[0]*32 >= N));
 
     const int32_t bits = ggml_get_op_params_i32(dst, 5);
     const int bits_k = bits >> 8, bits_v = bits & 0xff;
@@ -9835,7 +9845,10 @@ static void ggml_compute_forward_flash_attn_ext_sj_kvarn(
             pq = qrot.data();
         }
         // mask rows follow the standard flash_attn_ext convention: [n_kv, n_q(padded), ne2 % mask->ne[2], ne3 % mask->ne[3]]
-        const ggml_fp16_t * mp = mask ? (const ggml_fp16_t *) ((const char *) mask->data + iq1*mask->nb[1]
+        const bool mask_packed = mask && mask->type == GGML_TYPE_I32; // packed mask (see ggml.h)
+        const ggml_fp16_t * mp = mask && !mask_packed ? (const ggml_fp16_t *) ((const char *) mask->data + iq1*mask->nb[1]
+                                         + (iq2 % mask->ne[2])*mask->nb[2]) : NULL;
+        const uint32_t    * mw = mask_packed ? (const uint32_t *) ((const char *) mask->data + iq1*mask->nb[1]
                                          + (iq2 % mask->ne[2])*mask->nb[2]) : NULL;
 
         float M = -INFINITY, Ssum = 0.0f;
@@ -9844,7 +9857,7 @@ static void ggml_compute_forward_flash_attn_ext_sj_kvarn(
         // without a mask the reference is causal by position; with one the mask decides (llama supplies one)
         const int32_t p_end = mask ? N : std::min(N, qpos + 1);
         for (int32_t p = 0; p < p_end; ++p) {
-            const float mv = mp ? GGML_CPU_FP16_TO_FP32(mp[p]) : 0.0f;
+            const float mv = mp ? GGML_CPU_FP16_TO_FP32(mp[p]) : mw ? ((mw[p >> 5] >> (p & 31)) & 1 ? 0.0f : -INFINITY) : 0.0f;
             if (mv == -INFINITY) {
                 continue;
             }
@@ -9921,6 +9934,10 @@ static void ggml_compute_forward_flash_attn_ext_sj_kvarn(
 void ggml_compute_forward_flash_attn_ext(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
+    if (dst->src[3] && dst->src[3]->type == GGML_TYPE_I32) {
+        const int64_t n_kv = dst->src[6] ? ggml_get_op_params_i32(dst, 6) : dst->src[1]->ne[1];
+        GGML_ASSERT(dst->src[3]->ne[0]*32 >= n_kv);
+    }
     if (dst->src[6] != NULL) {
         ggml_compute_forward_flash_attn_ext_sj_kvarn(params, dst);
         return;

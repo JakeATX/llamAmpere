@@ -1384,7 +1384,7 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
 template <int ncols1>
 __launch_bounds__(FATTN_KQ_STRIDE/2, 1)
 static __global__ void flash_attn_mask_to_KV_max(
-        const half2 * mask_ptr, int * KV_max_ptr, const int ne30, const int64_t s31, const int64_t s33) {
+        const half2 * mask_ptr, int * KV_max_ptr, const int ne30, const int64_t s31, const int64_t s33, const bool packed) {
     const half2 * GGML_CUDA_RESTRICT mask   = mask_ptr;
     int         * GGML_CUDA_RESTRICT KV_max = KV_max_ptr;
 
@@ -1407,8 +1407,14 @@ static __global__ void flash_attn_mask_to_KV_max(
 
 #pragma unroll
         for (int j = 0; j < ncols1; ++j) {
-            const float2 tmp = __half22float2(mask[j*s31 + KV_max_sj/2 + tid]);
-            all_inf = all_inf && int(isinf(tmp.x)) && int(isinf(tmp.y));
+            if (packed) {
+                const uint32_t * row = (const uint32_t *) (mask + j*s31);
+                const int k = KV_max_sj + 2*tid;
+                all_inf = all_inf && ((row[k >> 5] >> (k & 31)) & 3u) == 0;
+            } else {
+                const float2 tmp = __half22float2(mask[j*s31 + KV_max_sj/2 + tid]);
+                all_inf = all_inf && int(isinf(tmp.x)) && int(isinf(tmp.y));
+            }
         }
 
         all_inf = warp_reduce_all(all_inf);
@@ -1443,7 +1449,7 @@ static __global__ void flash_attn_mask_to_KV_max(
 static __global__ void flash_attn_mask_to_live_tiles(
         const half * __restrict__ mask, uint32_t * __restrict__ bits, const int n_kv, const int nbatch_fa,
         const int n_words, const int mask_rows, const int token_step, const int n_queries,
-        const int64_t s31, const int64_t s33) {
+        const int64_t s31, const int64_t s33, const bool packed) {
     const int word = blockIdx.x;
     const int jt   = blockIdx.y;
     const int seq  = blockIdx.z;
@@ -1462,7 +1468,9 @@ static __global__ void flash_attn_mask_to_live_tiles(
             const int row = (jt*token_step + r) % n_queries;
             for (int i = lane; i < nbatch_fa; i += WARP_SIZE) {
                 const int k = kb*nbatch_fa + i;
-                if (k < n_kv && __half2float(m[row*s31 + k]) != -INFINITY) {
+                const half * mr = m + row*s31;
+                if (k < n_kv && (packed ? ((((const uint32_t *) mr)[k >> 5] >> (k & 31)) & 1u) != 0 :
+                        __half2float(mr[k]) != -INFINITY)) {
                     live = true;
                 }
             }
@@ -1784,7 +1792,8 @@ void launch_fattn(
     GGML_ASSERT(K->nb[0] == ggml_element_size(K));
     GGML_ASSERT(V->nb[0] == ggml_element_size(V));
 
-    GGML_ASSERT(!mask || mask->type == GGML_TYPE_F16);
+    GGML_ASSERT(!mask || mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_I32);
+    GGML_ASSERT(!mask || mask->type != GGML_TYPE_I32 || (!use_sparse && (mask->nb[1] & 3) == 0));
 
     ggml_cuda_pool & pool = ctx.pool();
     cudaStream_t main_stream = ctx.stream();
@@ -1933,7 +1942,7 @@ void launch_fattn(
         KV_max.alloc(ne_KV_max);
         ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_KV_max, block_dim_KV_max, 0, main_stream);
         ggml_cuda_kernel_launch(flash_attn_mask_to_KV_max<ncols1>, launch_params,
-            (const half2 *) mask->data, KV_max.ptr, iter_k, s31, s33);
+            (const half2 *) mask->data, KV_max.ptr, iter_k, s31, s33, mask->type == GGML_TYPE_I32);
         CUDA_CHECK(cudaGetLastError());
     }
 
@@ -1955,7 +1964,7 @@ void launch_fattn(
         ggml_cuda_kernel_launch(flash_attn_mask_to_live_tiles, lp,
             (const half *) mask->data, live_bits.ptr, (int) K->ne[1], nbatch_fa, n_words,
             query_layout::mask_rows, query_layout::token_step, (int) Q->ne[1],
-            (int64_t) (mask->nb[1] / sizeof(half)), (int64_t) (mask->nb[3] / sizeof(half)));
+            (int64_t) (mask->nb[1] / sizeof(half)), (int64_t) (mask->nb[3] / sizeof(half)), mask->type == GGML_TYPE_I32);
         CUDA_CHECK(cudaGetLastError());
     }
 
@@ -2115,7 +2124,7 @@ void launch_fattn(
         K->ne[0], n_kv, K->ne[2], K->ne[3], nb11, nb12, nb13,
         nb21, nb22, nb23,
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
-        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
+        mask ? (mask->type == GGML_TYPE_I32 ? mask->nb[1] | 1 : mask->nb[1]) : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
         is_sj_kvarn ? ggml_cuda_qsa_resident_body(KQV->src[5]) : nullptr,
         is_sj_kvarn ? (const int32_t *) KQV->src[6]->data : (const int32_t *) live_bits.ptr
     );

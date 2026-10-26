@@ -194,7 +194,9 @@ static bool i8qk_applies_impl(int cc, const ggml_tensor * dst, const bool f16_kv
                : (!i8qk_kv_type_ok(K) || !i8qk_kv_type_ok(V))) {
         return false;
     }
-    if (mask != nullptr && (mask->type != GGML_TYPE_F16 || mask->nb[0] != sizeof(half) || mask->ne[0] < K->ne[1] || mask->ne[1] < Q->ne[1] ||
+    if (mask != nullptr && ((mask->type != GGML_TYPE_F16 && mask->type != GGML_TYPE_I32) ||
+            mask->nb[0] != (mask->type == GGML_TYPE_I32 ? sizeof(uint32_t) : sizeof(half)) ||
+            mask->ne[0]*(mask->type == GGML_TYPE_I32 ? 32 : 1) < K->ne[1] || mask->ne[1] < Q->ne[1] ||
             mask->ne[2] != 1 || mask->ne[3] != 1 || mask->nb[1] % 4 != 0 || (uintptr_t) mask->data % 4 != 0)) {
         return false;
     }
@@ -238,7 +240,7 @@ bool ggml_cuda_fattn_i8qk_sj_kvarn_wanted(int cc, const ggml_tensor * dst) {
     memcpy(&softcap,  (const float *) dst->op_params + 2, sizeof(float));
     return Q->type == GGML_TYPE_F32 && Q->ne[0] == 256 && Q->ne[1] >= ggml_cuda_fattn_i8qk_min_q() &&
            dst->src[4] == nullptr && max_bias == 0.0f && softcap == 0.0f &&
-           (mask == nullptr || (mask->type == GGML_TYPE_F16 && mask->ne[2] == 1 && mask->ne[3] == 1));
+           (mask == nullptr || ((mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_I32) && mask->ne[2] == 1 && mask->ne[3] == 1));
 #endif
 }
 
@@ -551,6 +553,16 @@ static __global__ void i8qk_k_codebook(const char * __restrict__ K, const int64_
     }
 }
 
+// A negative row stride tags packed words; positive strides retain the f16 reader.
+static __device__ __forceinline__ float2 i8qk_mask_pair(const half * mask, const int64_t stride, const int q, const int k) {
+    if (stride < 0) {
+        const uint32_t * row = (const uint32_t *) mask + int64_t(q)*(-stride);
+        const uint32_t bits = row[k >> 5] >> (k & 31);
+        return make_float2((bits & 1u) ? 0.0f : -INFINITY, (bits & 2u) ? 0.0f : -INFINITY);
+    }
+    return __half22float2(*(const half2 *) (mask + int64_t(q)*stride + k));
+}
+
 // Per (query tile, KV tile) mask class: 0 = every visible element -inf (skip), 1 = all 0 (no mask), 2 = mixed.
 // grid (n_ktiles, n_qtiles), block 256.
 static __global__ void i8qk_tile_flags(const half * __restrict__ mask, const int64_t s1, const int n_q,
@@ -564,7 +576,7 @@ static __global__ void i8qk_tile_flags(const half * __restrict__ mask, const int
         const int c2  = i % (I8QK_BN/2);
         const int q   = qt*I8QK_BM + row;
         if (q < n_q) {
-            const float2 m = __half22float2(((const half2 *) (mask + q*s1 + kt*I8QK_BN))[c2]);
+            const float2 m = i8qk_mask_pair(mask, s1, q, kt*I8QK_BN + 2*c2);
             all_ninf &= (isinf(m.x) && m.x < 0.0f) && (isinf(m.y) && m.y < 0.0f);
             all_zero &= m.x == 0.0f && m.y == 0.0f;
         }
@@ -893,12 +905,12 @@ static __global__ void i8qk_flash_attn(
             const int col = nt*8 + 2*t;
             if (flag == 2) {
                 if (qa < n_q) {
-                    const float2 mk = __half22float2(*(const half2 *) (mask + qa*mask_s1 + (int64_t) j*I8QK_BN + col));
+                    const float2 mk = i8qk_mask_pair(mask, mask_s1, qa, j*I8QK_BN + col);
                     Sf[nt][0] += mk.x*1.4426950408889634f;
                     Sf[nt][1] += mk.y*1.4426950408889634f;
                 }
                 if (qb < n_q) {
-                    const float2 mk = __half22float2(*(const half2 *) (mask + qb*mask_s1 + (int64_t) j*I8QK_BN + col));
+                    const float2 mk = i8qk_mask_pair(mask, mask_s1, qb, j*I8QK_BN + col);
                     Sf[nt][2] += mk.x*1.4426950408889634f;
                     Sf[nt][3] += mk.y*1.4426950408889634f;
                 }
@@ -1040,7 +1052,8 @@ static void i8qk_launch_attn(const ggml_tensor * dst, const char * Qp, const int
     }
     i8qk_flash_attn<D, PV16, NS, Q2L, KBF><<<dim3(n_qtiles, heads*gqa), i8qk_nthreads, nbytes, stream>>>(
         Qp, Q->nb[1], Q->nb[2], Kq, ksc, Vp, v_nb1, v_nb2,
-        mask ? (const half *) mask->data : nullptr, mask ? (int64_t) (mask->nb[1]/sizeof(half)) : 0,
+        mask ? (const half *) mask->data : nullptr,
+        mask ? (mask->type == GGML_TYPE_I32 ? -int64_t(mask->nb[1]/sizeof(uint32_t)) : int64_t(mask->nb[1]/sizeof(half))) : 0,
         flags, n_ktiles, dstp, (int64_t) (dst->nb[1]/sizeof(float)), (int64_t) (dst->nb[2]/sizeof(float)),
         n_q, n_kv, gqa, scale_log2, kmean, blk_tiles, nblk);
     CUDA_CHECK(cudaGetLastError());
@@ -1173,7 +1186,8 @@ static void ggml_cuda_flash_attn_ext_i8qk_impl(ggml_backend_cuda_context & ctx, 
 
     // 5. mask classes per (query tile, KV tile)
     if (mask != nullptr) {
-        i8qk_tile_flags<<<dim3(n_ktiles, n_qtiles), 256, 0, stream>>>((const half *) mask->data, mask->nb[1]/sizeof(half),
+        const int64_t mask_stride = mask->type == GGML_TYPE_I32 ? -int64_t(mask->nb[1]/sizeof(uint32_t)) : int64_t(mask->nb[1]/sizeof(half));
+        i8qk_tile_flags<<<dim3(n_ktiles, n_qtiles), 256, 0, stream>>>((const half *) mask->data, mask_stride,
                                                                      n_q, flags.ptr);
         CUDA_CHECK(cudaGetLastError());
     } else {

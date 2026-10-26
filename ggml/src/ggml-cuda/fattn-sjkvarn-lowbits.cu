@@ -248,6 +248,16 @@ static void ggml_cuda_lowbits_case_rot(ggml_backend_cuda_context & ctx, ggml_ten
     }
 }
 
+// [#175] true when ggml_cuda_lowbits_case sends this node to the tile build (ggml_cuda_lowbits_prefill_case), whose mask
+// loader reads the packed I32 mask natively; the width kernel takes the f16 expansion in fattn.cu. Mirrors the branches above.
+bool ggml_cuda_flash_attn_sj_kvarn_lowbits_tile_route(const ggml_tensor * dst) {
+    const int bits = ggml_get_op_params_i32(dst,5);
+    if (bits == ((4 << 8) | 4) || ggml_get_op_params_i32(dst,7) == GGML_TYPE_I16) {
+        return true;
+    }
+    return !(dst->src[0]->ne[1] <= 8 && !sj_kvarn_lowbits_no_direct());
+}
+
 void ggml_cuda_flash_attn_sj_kvarn_lowbits(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     switch (ggml_get_op_params_i32(dst,5)) {
         case (4 << 8) | 3: ggml_cuda_lowbits_case_rot<4,3>(ctx,dst); break;

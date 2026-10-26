@@ -62,6 +62,7 @@ struct llama_cparams {
     bool pipeline_parallel;
     bool training;           // set by llama_opt_init()
 
+    bool kq_mask_packed = false; // fork: opt-in binary attention masks
     uint32_t kv_stream_arena_mib;
     size_t moe_cache_size;
 

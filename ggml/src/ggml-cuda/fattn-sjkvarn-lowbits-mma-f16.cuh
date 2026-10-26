@@ -1373,6 +1373,147 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_mask(
         const int stride_mask, const int k_VKQ_0, const int i_sup, const int j0, const uint3 ne01,
         const int32_t * const __restrict__ indices) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    if (stride_mask < 0) {
+        // [#175] packed mask: -stride_mask I32 words per row, bit k%32 of word k/32 set = visible (0), clear = -inf.
+        // The values match the f16 mask element for element; the stores are synchronous, the caller's barrier publishes them.
+        const uint32_t * __restrict__ words = (const uint32_t *) mask_h;
+        const int64_t stride_w = -stride_mask;
+        if constexpr (!use_sparse && nbatch_fa % 8 == 0 &&
+                (nbatch_fa % (8*warp_size) == 0 || (8*warp_size) % nbatch_fa == 0)) {
+            if ((k_VKQ_0 & 7) == 0) {
+                constexpr int cols_per_warp = nbatch_fa < 8*warp_size ? 8*warp_size/nbatch_fa : 1;
+#pragma unroll
+                for (int j1 = 0; j1 < ncols1; j1 += nwarps*cols_per_warp) {
+                    const int j_sram = j1 + threadIdx.y*cols_per_warp + threadIdx.x/(warp_size/cols_per_warp);
+                    if (j_sram >= ncols1) {
+                        break;
+                    }
+                    const int j_vram = fastmodulo(j0 + j_sram, ne01);
+                    const uint32_t * __restrict__ row = words + int64_t(j_vram)*stride_w;
+#pragma unroll
+                    for (int i0 = 0; i0 < nbatch_fa; i0 += 8*warp_size) {
+                        const int i = i0 + 8*(threadIdx.x % (warp_size/cols_per_warp));
+                        uint32_t values[4] = {};
+                        if (!oob_check || i < i_sup) {
+                            const int k = k_VKQ_0 + i;
+                            const uint32_t bits = row[k >> 5] >> (k & 31);
+#pragma unroll
+                            for (int pair = 0; pair < 4; ++pair) {
+                                if (!oob_check || i + 2*pair < i_sup) {
+                                    values[pair] = ((bits & (1u << (2*pair))) ? 0u : 0xfc00u) |
+                                                  ((bits & (2u << (2*pair))) ? 0u : 0xfc000000u);
+                                    if (oob_check && i + 2*pair + 1 >= i_sup) {
+                                        values[pair] &= 0xffffu;
+                                    }
+                                }
+                            }
+                        }
+                        // Match the f16 loader's 16-byte shared-store granularity without an expansion buffer.
+                        ((uint4 *) tile_mask)[j_sram*((nbatch_fa + 8)/8) + i/8] =
+                            make_uint4(values[0], values[1], values[2], values[3]);
+                    }
+                }
+                return;
+            }
+        }
+        if constexpr (!use_sparse && nbatch_fa % 4 == 0 &&
+                (nbatch_fa % (4*warp_size) == 0 || (4*warp_size) % nbatch_fa == 0)) {
+            if ((k_VKQ_0 & 3) == 0) {
+                constexpr int cols_per_warp = nbatch_fa < 4*warp_size ? 4*warp_size/nbatch_fa : 1;
+#pragma unroll
+                for (int j1 = 0; j1 < ncols1; j1 += nwarps*cols_per_warp) {
+                    const int j_sram = j1 + threadIdx.y*cols_per_warp + threadIdx.x/(warp_size/cols_per_warp);
+                    if (j_sram >= ncols1) {
+                        break;
+                    }
+                    const int j_vram = fastmodulo(j0 + j_sram, ne01);
+                    const uint32_t * __restrict__ row = words + int64_t(j_vram)*stride_w;
+#pragma unroll
+                    for (int i0 = 0; i0 < nbatch_fa; i0 += 4*warp_size) {
+                        const int i = i0 + 4*(threadIdx.x % (warp_size/cols_per_warp));
+                        uint2 values = make_uint2(0, 0);
+                        if (!oob_check || i < i_sup) {
+                            const int k = k_VKQ_0 + i;
+                            const uint32_t bits = row[k >> 5] >> (k & 31);
+                            values.x = ((bits & 1u) ? 0u : 0xfc00u) | ((bits & 2u) ? 0u : 0xfc000000u);
+                            if (!oob_check || i + 2 < i_sup) {
+                                values.y = ((bits & 4u) ? 0u : 0xfc00u) | ((bits & 8u) ? 0u : 0xfc000000u);
+                            }
+                            if (oob_check && i + 1 >= i_sup) {
+                                values.x &= 0xffffu;
+                            }
+                            if (oob_check && i + 3 >= i_sup) {
+                                values.y &= 0xffffu;
+                            }
+                        }
+                        // fork: four adjacent bits share one word load and one aligned shared store.
+                        ((uint2 *) tile_mask)[j_sram*((nbatch_fa + 8)/4) + i/4] = values;
+                    }
+                }
+                return;
+            }
+        }
+        if constexpr (!use_sparse && nbatch_fa % 2 == 0 &&
+                (nbatch_fa % (2*warp_size) == 0 || (2*warp_size) % nbatch_fa == 0)) {
+            constexpr int cols_per_warp = nbatch_fa < 2*warp_size ? 2*warp_size/nbatch_fa : 1;
+#pragma unroll
+            for (int j1 = 0; j1 < ncols1; j1 += nwarps*cols_per_warp) {
+                const int j_sram = j1 + threadIdx.y*cols_per_warp + threadIdx.x/(warp_size/cols_per_warp);
+                if (j_sram >= ncols1) {
+                    break;
+                }
+                const int j_vram = fastmodulo(j0 + j_sram, ne01);
+                const uint32_t * __restrict__ row = words + int64_t(j_vram)*stride_w;
+#pragma unroll
+                for (int i0 = 0; i0 < nbatch_fa; i0 += 2*warp_size) {
+                    const int i = i0 + 2*(threadIdx.x % (warp_size/cols_per_warp));
+                    // Bounds-checked kernels also use this path for their full tiles. Padded lanes stay zero.
+                    uint32_t pair = 0;
+                    if (!oob_check || i < i_sup) {
+                        const int k = k_VKQ_0 + i;
+                        const uint32_t bits = row[k >> 5] >> (k & 31);
+                        pair = ((bits & 1u) ? 0u : 0xfc00u) | ((bits & 2u) ? 0u : 0xfc000000u);
+                        if (oob_check && i + 1 >= i_sup) {
+                            pair &= 0xffffu;
+                        }
+                    }
+                    ((uint32_t *) tile_mask)[j_sram*((nbatch_fa + 8)/2) + i/2] = pair;
+                }
+            }
+            return;
+        }
+#pragma unroll
+        for (int j1 = 0; j1 < ncols1; j1 += nwarps) {
+            const int j_sram = j1 + threadIdx.y;
+            const int j_vram = fastmodulo(j0 + j_sram, ne01);
+
+            if (j1 + nwarps > ncols1 && j_sram >= ncols1) {
+                break;
+            }
+
+            const uint32_t * __restrict__ row = words + int64_t(j_vram)*stride_w;
+#pragma unroll
+            for (int i0 = 0; i0 < nbatch_fa; i0 += warp_size) {
+                const int i = i0 + threadIdx.x;
+                if (nbatch_fa % warp_size != 0 && i >= nbatch_fa) {
+                    break;
+                }
+                half v;
+                if constexpr (use_sparse) {
+                    const int32_t index = i < i_sup ? indices[k_VKQ_0 + i] : -1;
+                    v = index >= 0 && ((row[index >> 5] >> (index & 31)) & 1u) ? half(0.0f) : half(-INFINITY);
+                } else if constexpr (oob_check) {
+                    const int k = k_VKQ_0 + i;
+                    v = i < i_sup ? (((row[k >> 5] >> (k & 31)) & 1u) ? half(0.0f) : half(-INFINITY)) : half(0.0f);
+                } else {
+                    const int k = k_VKQ_0 + i;
+                    v = ((row[k >> 5] >> (k & 31)) & 1u) ? half(0.0f) : half(-INFINITY);
+                }
+                tile_mask[j_sram*(nbatch_fa + 8) + i] = v;
+            }
+        }
+        return;
+    }
     if constexpr (use_cp_async) {
         static_assert(nbatch_fa <= 8*warp_size && nbatch_fa % 8 == 0, "bad nbatch_fa");
         static_assert(!oob_check, "OOB check incompatible with cp_async");
@@ -3149,7 +3290,8 @@ static __global__ void flash_attn_ext_f16(
     const int stride_Q1   = nb01 / sizeof(float2);
     const int stride_Q2   = nb02 / sizeof(float2);
     const int stride_K    = is_turbo_kv ? nb11 : nb11 / sizeof(half2);
-    const int stride_mask = nb31 / sizeof(half);
+    // [#175] an odd nb31 marks the packed I32 mask (an f16 row stride is even): stride_mask < 0 = -(words per row)
+    const int stride_mask = (nb31 & 1) ? -(nb31 >> 2) : nb31 / int(sizeof(half));
 
     const int stride_V = V_is_K_view ? stride_K : (is_turbo_kv ? nb21 : nb21 / sizeof(half2));
 
