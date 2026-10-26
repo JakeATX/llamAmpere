@@ -2046,6 +2046,7 @@ std::unique_ptr<llama_moe_arena> llama_model_loader::load_moe_arena(llama_progre
         }
     }
     size_t total = 0;
+    size_t largest_layer = 0;
     for (auto & entry : layers) {
         auto & ts = entry.second;
         if (ts.size() != 3) { throw std::runtime_error("expert arena requires gate/up/down triples"); }
@@ -2053,17 +2054,28 @@ std::unique_ptr<llama_moe_arena> llama_model_loader::load_moe_arena(llama_progre
             auto role = [](const char * n) { return strstr(n, "gate") ? 0 : strstr(n, "up") ? 1 : 2; };
             return role(a->name) < role(b->name);
         });
+        size_t layer_bytes = 0;
         for (auto * t : ts) {
             if (!ggml_is_contiguous(t) || t->ne[2] != ts[0]->ne[2] || ggml_nbytes(t) > SIZE_MAX - total) {
                 throw std::runtime_error("unsupported expert arena layout");
             }
             total += ggml_nbytes(t);
+            layer_bytes += ggml_nbytes(t);
         }
+        largest_layer = std::max(largest_layer, layer_bytes);
+    }
+    size_t reserve = 7ull << 30;
+    const char * shared_mtp = getenv("GGML_MOE_CACHE_MTP_SHARED");
+    if (shared_mtp && strcmp(shared_mtp, "1") == 0) {
+        // fork: Keep one expert layer and the device mapper's 2 GiB margin available after full-arena pinning.
+        const size_t mapping_margin = 2ull << 30;
+        if (largest_layer > SIZE_MAX - reserve - mapping_margin) { return nullptr; }
+        reserve += largest_layer + mapping_margin;
     }
     const size_t available = llama_moe_arena::available_memory();
-    if (available < (7ull << 30) || total > available - (7ull << 30) || !llama_moe_arena::pin_supported()) {
-        LLAMA_LOG_WARN("%s: %.2f GiB experts use unpinned mmap storage; %.2f GiB available, 7 GiB pinning headroom required\n",
-                __func__, total / double(GiB), available / double(GiB));
+    if (available < reserve || total > available - reserve || !llama_moe_arena::pin_supported()) {
+        LLAMA_LOG_WARN("%s: %.2f GiB experts use unpinned mmap storage; %.2f GiB available, %.2f GiB pinning headroom required\n",
+                __func__, total / double(GiB), available / double(GiB), reserve / double(GiB));
         // No arena tensor has been allocated or reshaped yet. Normal buffer creation
         // and load_all_data bind the original file views without faulting them all in.
         return nullptr;
