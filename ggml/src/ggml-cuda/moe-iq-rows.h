@@ -266,5 +266,76 @@ inline rows_fn get(int type, int nt, int variant = variant_best) {
     }
 }
 
+#if defined(__x86_64__) && defined(__GNUC__)
+#define MOE_IQ_ROWS_512 1
+#define MOE_IQ_T512 __attribute__((target("avx512f,avx512bw,avx512vl,avx512vnni,f16c,bmi2")))
+
+// Join two decoded chunks; every token shares the weight decode and wide integer multiply.
+template <class F, int NT>
+MOE_IQ_T512 void rows512(const char * w, size_t row_bytes, int64_t r0, int64_t r1, int nb,
+        const block_q8_K * const * y, float * const * out, int pf) {
+    for (int64_t r = r0; r < r1; ++r) {
+        const auto * x = (const typename F::B *) (w + (size_t) r * row_bytes);
+        __m512 accf[NT];
+        for (int t = 0; t < NT; ++t) { accf[t] = _mm512_setzero_ps(); }
+        for (int i = 0; i < nb; ++i) {
+            if (pf > 0) {
+                _mm_prefetch((const char *) (x + i) + pf, _MM_HINT_T0);
+                _mm_prefetch((const char *) (x + i) + pf + 64, _MM_HINT_T0);
+            }
+            __m512i acc[NT];
+            for (int t = 0; t < NT; ++t) { acc[t] = _mm512_setzero_si512(); }
+            for (int c = 0; c < 8; c += 2) {
+                __m256i g0, s0, sc0, g1, s1, sc1;
+                F::dec(x + i, c, g0, s0, sc0);
+                F::dec(x + i, c + 1, g1, s1, sc1);
+                const __m512i g = _mm512_inserti64x4(_mm512_castsi256_si512(g0), g1, 1);
+                // Each scale covers at least 16 weights; select one scale per four-weight VNNI lane.
+                const __m256i sc_lo = _mm256_madd_epi16(sc0, _mm256_set1_epi32(1));
+                const __m256i sc_hi = _mm256_madd_epi16(sc1, _mm256_set1_epi32(1));
+                const __m512i sc = _mm512_inserti64x4(_mm512_castsi256_si512(sc_lo), sc_hi, 1);
+                for (int t = 0; t < NT; ++t) {
+                    const __m256i q0 = _mm256_sign_epi8(_mm256_loadu_si256((const __m256i *) (y[t][i].qs + 32 * c)), s0);
+                    const __m256i q1 = _mm256_sign_epi8(_mm256_loadu_si256((const __m256i *) (y[t][i].qs + 32 * c + 32)), s1);
+                    const __m512i q = _mm512_inserti64x4(_mm512_castsi256_si512(q0), q1, 1);
+                    const __m512i dot = _mm512_dpbusd_epi32(_mm512_setzero_si512(), g, q);
+                    acc[t] = _mm512_add_epi32(acc[t], _mm512_mullo_epi32(dot, sc));
+                }
+            }
+            const float dx = _cvtsh_ss(x[i].d);
+            for (int t = 0; t < NT; ++t) {
+                accf[t] = _mm512_fmadd_ps(_mm512_set1_ps(dx * y[t][i].d), _mm512_cvtepi32_ps(acc[t]), accf[t]);
+            }
+        }
+        for (int t = 0; t < NT; ++t) { out[t][r - r0] = F::K * _mm512_reduce_add_ps(accf[t]); }
+    }
+}
+
+template <class F> rows_fn pick512(int nt) {
+    switch (nt) {
+        case 1: return rows512<F, 1>;
+        case 2: return rows512<F, 2>;
+        case 3: return rows512<F, 3>;
+        case 4: return rows512<F, 4>;
+        case 5: return rows512<F, 5>;
+        case 6: return rows512<F, 6>;
+        case 7: return rows512<F, 7>;
+        case 8: return rows512<F, 8>;
+        default: return nullptr;
+    }
+}
+
+inline rows_fn get512(int type, int nt) {
+    switch (type) {
+        case GGML_TYPE_IQ2_XXS: return pick512<f_iq2_xxs>(nt);
+        case GGML_TYPE_IQ2_XS:  return pick512<f_iq2_xs>(nt);
+        case GGML_TYPE_IQ2_S:   return pick512<f_iq2_s>(nt);
+        case GGML_TYPE_IQ3_XXS: return pick512<f_iq3_xxs_pair>(nt);
+        case GGML_TYPE_IQ3_S:   return pick512<f_iq3_s>(nt);
+        default: return nullptr;
+    }
+}
+#endif
+
 } // namespace moe_iq
 #endif

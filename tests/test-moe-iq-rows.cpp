@@ -3,7 +3,7 @@
 //
 //   test-moe-iq-rows <cpu,cpu,...> [copies, default 256]
 //
-// Parity: for every IQ up/gate type and nt = 1..4 tokens, every output must have the same bits as ggml's vec_dot
+// Parity: for every IQ up/gate type and nt = 1..8 tokens, every output must have the same bits as ggml's vec_dot
 // (the kernels do the same integer work in the same lanes and the same float steps). Exit code 1 on any difference.
 // Speed: one pinned thread per listed cpu, each with its own `copies` experts (cold: they rotate, far more than the
 // last-level cache, as a decode's missed experts do; hot: one expert repeats). Prints us per expert projection and
@@ -14,10 +14,12 @@
 #include "../ggml/src/ggml-cuda/moe-cpu-split.h"
 #include "ggml.h"
 #include "ggml-cpu.h"
+#include "../ggml/src/ggml-cpu/quants.h"
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -59,13 +61,14 @@ int main(int argc, char ** argv) {
     const int64_t n_in = 2560, n_out = 640;
     const int NT = 8;
     const ggml_type types[] = { GGML_TYPE_IQ3_S, GGML_TYPE_IQ2_S, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ3_XXS };
-    const int NM = 7;                                   // ggml + 6 row-kernel settings
-    const int var_of[NM] = { -1, 0, 1, 2, 4, 0, 1 | 8 };
-    const int pf_of[NM] = { 0, 0, 0, 0, 0, 2048, 0 };
+    const int NM = 9;                                   // ggml, six AVX2 settings, two AVX-512 settings
+    const int var_of[NM] = { -1, 0, 1, 2, 4, 0, 1 | 8, 0, 0 };
+    const int pf_of[NM] = { 0, 0, 0, 0, 0, 2048, 0, 0, 2048 };
+    const bool check_only = argc > 3 && strcmp(argv[3], "check") == 0;
     long long bad_total = 0;
     printf("threads %zu, %d expert copies per thread\n", cpus.size(), copies);
-    printf("  %-8s nt | %-24s | %-24s | %-24s | %-24s | %-24s | %-24s | %-24s | outputs with other bits\n", "type",
-           "ggml cold/hot us GB/s", "v0", "v1 iq3_xxs pair", "v2 2-row", "v4 iq3_s pair", "v0 pf2048", "best (ROWS=1)");
+    printf("  %-8s nt | %-24s | %-24s | %-24s | %-24s | %-24s | %-24s | %-24s | %-24s | %-24s | parity failures\n", "type",
+           "ggml cold/hot us GB/s", "v0", "v1 iq3_xxs pair", "v2 2-row", "v4 iq3_s pair", "v0 pf2048", "best (ROWS=1)", "AVX-512", "AVX-512 pf2048");
     for (ggml_type type : types) {
         const auto * tr = ggml_get_type_traits_cpu(type);
         const size_t row_bytes = ggml_row_size(type, n_in);
@@ -80,6 +83,10 @@ int main(int argc, char ** argv) {
             std::vector<float> x(n_in);
             for (auto & v : x) { v = frand(); }
             ggml_get_type_traits_cpu(tr->vec_dot_type)->from_float(x.data(), act.data() + t * act_bytes, n_in);
+            if (t == NT - 1) {
+                auto * blocks = (block_q8_K *) (act.data() + t * act_bytes);
+                for (int b = 0; b < n_in / QK_K; ++b) { blocks[b].qs[0] = -128; blocks[b].qs[31] = 127; }
+            }
         }
         const void * actp[NT];
         for (int t = 0; t < NT; ++t) { actp[t] = act.data() + t * act_bytes; }
@@ -103,7 +110,7 @@ int main(int argc, char ** argv) {
         bool on_ggml[NM][NT + 1];
         for (int m = 0; m < NM; ++m) {
             for (int nt = 1; nt <= NT; ++nt) {   // zero rows: only asks whether the variant has a kernel for this case
-                on_ggml[m][nt] = m == 0 || !moe_cs_iq_rows((int) type, nt, q.data(), row_bytes, 0, 0, n_in, actp, nullptr, 0, var_of[m]);
+                on_ggml[m][nt] = m == 0 || !moe_cs_iq_rows((int) type, nt, q.data(), row_bytes, 0, 0, n_in, actp, nullptr, 0, var_of[m], m >= 7);
             }
         }
         auto run = [&](int m, const uint8_t * wp, int nt, float * const * out) {
@@ -115,21 +122,25 @@ int main(int argc, char ** argv) {
                 }
                 return true;
             }
-            return moe_cs_iq_rows((int) type, nt, wp, row_bytes, 0, n_out, n_in, actp, out, pf_of[m], var_of[m]);
+            return moe_cs_iq_rows((int) type, nt, wp, row_bytes, 0, n_out, n_in, actp, out, pf_of[m], var_of[m], m >= 7);
         };
         for (int nt = 1; nt <= NT; ++nt) {
             printf("  %-8s %2d |", ggml_type_name(type), nt);
             long long bad[NM] = {};
             for (int m = 0; m < NM; ++m) {
+                if (m >= 7 && on_ggml[m][nt]) { printf(" %-24s |", "AVX-512 unavailable"); continue; }
                 std::vector<float> o((size_t) NT * n_out, -1.0f);
                 float * op[NT];
                 for (int t = 0; t < NT; ++t) { op[t] = o.data() + (size_t) t * n_out; }
                 if (!run(m, q.data(), nt, op)) { printf(" %-24s |", "no kernel"); bad[m] = -1; continue; }
                 for (int t = 0; t < nt; ++t) {
                     for (int64_t r = 0; r < n_out; ++r) {
-                        bad[m] += memcmp(&op[t][r], &ref[(size_t) t * n_out + r], sizeof(float)) != 0;
+                        const float got = op[t][r], expected = ref[(size_t) t * n_out + r];
+                        bad[m] += m >= 7 ? (!std::isfinite(got) || fabsf(got - expected) > 1e-5f + 2e-5f * fabsf(expected))
+                                         : memcmp(&got, &expected, sizeof(float)) != 0;
                     }
                 }
+                if (check_only) { printf(" %6lld differences       |", bad[m]); continue; }
                 double us[2];
                 for (int hot = 0; hot < 2; ++hot) {
                     const int reps = hot ? 200 : copies;
@@ -171,6 +182,6 @@ int main(int argc, char ** argv) {
     }
     printf("  (us per expert projection of %lld x %lld; GB/s = cold weight bytes read by all threads)\n",
            (long long) n_out, (long long) n_in);
-    printf("parity: %s (%lld outputs differ from ggml's bits)\n", bad_total == 0 ? "PASS" : "FAIL", bad_total);
+    printf("parity: %s (%lld outputs fail byte/AVX-512 numeric parity)\n", bad_total == 0 ? "PASS" : "FAIL", bad_total);
     return bad_total == 0 ? 0 : 1;
 }

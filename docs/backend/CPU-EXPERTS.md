@@ -19,11 +19,20 @@ The grouped kernels retain the existing integer accumulation lanes, block scales
 
 ## CUDA host split executor
 
-The Flash-Next CPU split uses its own pool rather than MUL_MAT_ID. The REUSE, SCHEDULE, and Q8_REUSE controls above do not select its kernels. Its existing ROWS control already reuses IQ weights for four tokens, and it already shares gate/up input conversion and schedules row tasks across experts. PIN can indirectly change which physical cores it reserves.
+The Flash-Next CPU split uses its own pool rather than MUL_MAT_ID. The REUSE, SCHEDULE, and Q8_REUSE controls above do not select its kernels. Its existing ROWS control already reuses IQ weights for four tokens, and it already shares gate/up input conversion and schedules row tasks across experts. The split pool reserves the physical core of its caller and pins that caller so it cannot migrate onto a pool core.
 
-Two additional split controls are off by default:
+Flash-Next enables two split reuse controls by default:
 
 - `GGML_MOE_CPU_SPLIT_Q8_REUSE=1`: quantize each distinct input row once per layer job, sharing that image across routed experts. Both device publishers supply input IDs; per-slot inputs keep distinct IDs. Hidden inputs remain separate per route.
-- `GGML_MOE_CPU_SPLIT_REUSE8=1`: with `GGML_MOE_CPU_SPLIT_ROWS=1`, group up to eight tokens per IQ up/gate weight decode instead of four. AVX-512 single-token dispatch still takes precedence when requested.
+- `GGML_MOE_CPU_SPLIT_REUSE8=1`: with `GGML_MOE_CPU_SPLIT_ROWS=1`, group up to eight tokens per IQ up/gate weight decode instead of four. AVX-512 VNNI and AVX2 both retain token grouping.
 
-`test-moe-cs-bw 0 0 4 check` runs 96 CPU-only pool jobs at widths one through eight with shared and distinct inputs, and prints a hash of every output byte. Compare the four combinations of these controls from one binary. `test-moe-iq-rows 0 1` checks the grouped kernels against the stock dots through width eight. Run CPU tests on the build rental, not on an inference host. These checks are not model throughput qualification.
+`test-moe-cs-bw 0 0 4 check` runs 96 CPU-only pool jobs at widths one through eight with shared and distinct inputs, and prints a hash of every output byte. Compare the four combinations of these controls from one binary. `test-moe-iq-rows 0 1 check` checks the grouped kernels against the stock dots through width eight. Run CPU tests on the build rental, not on an inference host. These checks are not model throughput qualification.
+
+Default CPU split settings (CPUCMP):
+- `GGML_MOE_CPU_SPLIT_PF=2048`: prefetch IQ weights 2048 bytes ahead; `0` disables it.
+- `GGML_MOE_CPU_SPLIT_MAX_THREADS=1`: use every physical core except the caller's actual core, including core 0 when available. The pool logs its CPU list. `0` restores the previous core reservation. THREADS still overrides the count; SMT remains opt-in pending measurements.
+- `GGML_MOE_CPU_SPLIT_AVX512=1`: grouped IQ VNNI on capable CPUs; AVX2 fallback elsewhere. Float reductions can round differently.
+- `GGML_MOE_CPU_SPLIT_REUSE8=1` and `GGML_MOE_CPU_SPLIT_Q8_REUSE=1`: eight-token weight reuse and shared input conversion.
+- `GGML_MOE_CPU_SPLIT_DOWN_REUSE=1`: grouped IQ4_NL down using the existing CPU kernel, plus grouped Q8_K IQ down where supported.
+
+The full-model all-off control sets PF, MAX_THREADS, AVX512, REUSE8, Q8_REUSE, and DOWN_REUSE to zero while leaving the CPU split, Q2_FAST, and ROWS enabled in both arms. These defaults implement the owner order; performance gates remain required before any speed claim.

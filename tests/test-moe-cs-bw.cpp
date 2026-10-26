@@ -177,6 +177,8 @@ int main(int argc, char ** argv) {
     double warm_ns, warm_ph[4];
     const int warm_expert = 0;
     moe_cs_bench(0, &warm_expert, 1, 1, 1, &warm_ns, warm_ph);
+    const bool check = argc > 4 && strcmp(argv[4], "check") == 0;
+    double max_error = 0.0;
     unsigned long long seq = 0, hash = 14695981039346656037ull;
     for (int l = 0; l < n_layers; ++l) {
         for (int pass = 0; pass < 16; ++pass) {
@@ -204,6 +206,40 @@ int main(int argc, char ** argv) {
                 _mm_pause();
             }
             std::atomic_thread_fence(std::memory_order_acquire);
+            if (check) {
+                const auto * ug = ggml_get_type_traits_cpu(specs[l].up);
+                const auto * dn = ggml_get_type_traits_cpu(specs[l].down);
+                std::vector<uint8_t> xq(ggml_row_size(ug->vec_dot_type, n_embd));
+                std::vector<uint8_t> hq(ggml_row_size(dn->vec_dot_type, n_ff));
+                std::vector<float> hidden(n_ff);
+                for (int q = 0; q < 4 * nt; ++q) {
+                    const int expert = q / nt;
+                    ggml_get_type_traits_cpu(ug->vec_dot_type)->from_float(x.data() + (size_t) q * x_stride, xq.data(), n_embd);
+                    for (int64_t row = 0; row < n_ff; ++row) {
+                        float u, g;
+                        ug->vec_dot((int) n_embd, &u, 0, P[3*l].expert[expert] + row * P[3*l].row_bytes, 0, xq.data(), 0, 1);
+                        ug->vec_dot((int) n_embd, &g, 0, P[3*l+1].expert[expert] + row * P[3*l+1].row_bytes, 0, xq.data(), 0, 1);
+                        hidden[row] = g / (1.0f + expf(-g)) * u;
+                    }
+                    ggml_get_type_traits_cpu(dn->vec_dot_type)->from_float(hidden.data(), hq.data(), n_ff);
+                    double err2 = 0.0, ref2 = 0.0;
+                    for (int64_t row = 0; row < n_embd; ++row) {
+                        float ref;
+                        dn->vec_dot((int) n_ff, &ref, 0, P[3*l+2].expert[expert] + row * P[3*l+2].row_bytes, 0, hq.data(), 0, 1);
+                        const float got = out[(size_t) q * out_stride + row];
+                        const double err = (double) got - ref;
+                        err2 += err * err;
+                        ref2 += (double) ref * ref;
+                    }
+                    const double relative = sqrt(err2 / std::max(ref2, 1e-30));
+                    max_error = std::max(max_error, relative);
+                    // A changed gate reduction can move hidden activation quantization across a boundary.
+                    if (!std::isfinite(relative) || relative > 0.005) {
+                        fprintf(stderr, "pool reference FAIL layer=%d width=%d route=%d relative=%g\n", l, nt, q, relative);
+                        std::_Exit(1);
+                    }
+                }
+            }
             for (int q = 0; q < 4 * nt; ++q) {
                 for (int64_t r = 0; r < n_embd; ++r) {
                     const float v = out[(size_t) q * out_stride + r];
@@ -216,7 +252,7 @@ int main(int argc, char ** argv) {
     }
     printf("pool parity: 96 jobs, widths 1..8, four experts, shared and distinct inputs, output hash %016llx\n", hash);
     fflush(stdout);
-    if (argc > 4 && strcmp(argv[4], "check") == 0) { std::_Exit(0); }
+    if (check) { printf("pool reference PASS: max relative L2 error %.9g\n", max_error); fflush(stdout); std::_Exit(0); }
     printf("\npool: %d threads; one route per expert; 128 experts per layer rotate (cold) or the same experts repeat (hot)\n",
            moe_cs_threads());
     printf("  %-8s %-7s n_exp | cold: us/job  up+gate us (GB/s)  down us (GB/s) | hot: us/job  up+gate us (GB/s)  down us (GB/s)\n",

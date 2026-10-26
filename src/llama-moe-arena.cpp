@@ -508,6 +508,12 @@ void llama_moe_arena_apply_flashnext_defaults() {
         { "GGML_MOE_CPU_SPLIT",                   "1" },
         { "GGML_MOE_CPU_SPLIT_Q2_FAST",           "1" },
         { "GGML_MOE_CPU_SPLIT_ROWS",              "1" },
+        { "GGML_MOE_CPU_SPLIT_PF",                "2048" },
+        { "GGML_MOE_CPU_SPLIT_MAX_THREADS",       "1" },
+        { "GGML_MOE_CPU_SPLIT_AVX512",            "1" },
+        { "GGML_MOE_CPU_SPLIT_REUSE8",            "1" },
+        { "GGML_MOE_CPU_SPLIT_Q8_REUSE",           "1" },
+        { "GGML_MOE_CPU_SPLIT_DOWN_REUSE",         "1" },
         { "GGML_CUDA_GRAPH_NODE_PRIORITY",        "1" },   // scheduling only: hit-first copies overlap the matrix-vector product
         // fork: short prompts need a checkpoint before the restore-grid boundary for prefix reuse.
         { "LLAMA_SJKVARN_EXACT_CKPT",              "1" },

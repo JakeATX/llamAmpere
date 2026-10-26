@@ -17,6 +17,7 @@
 #define GGML_COMMON_IMPL_CPP   // the IQ grids, for the AVX-512 dot loops below
 #include "../ggml-common.h"
 #include "moe-iq-rows.h"
+#include "../ggml-cpu/quants.h"
 
 #include <algorithm>
 #include <atomic>
@@ -407,6 +408,7 @@ struct pool_state {
     int first[MOE_CS_MAX_EXPERTS + 1] = {};
     int input_of[MOE_CS_MAX_ROUTES] = {}, inputs[MOE_CS_MAX_ROUTES] = {}, n_input = 0;
     bool q8_reuse = false;
+    bool down_reuse = false;
     int group_tokens = 4;
     std::vector<uint8_t> xq;    // [2][MOE_CS_MAX_ROUTES] quantized input rows
     size_t xq_stride = 0;
@@ -491,8 +493,7 @@ void run_item(pool_state & s, int phase, int item) {
         const size_t xg = L.shared_input ? 0 : (size_t) MOE_CS_MAX_ROUTES;
 #if defined(MOE_IQ_ROWS)
         if (up.rows[4] && gate.rows[4]) {
-            // every chunk decoded once for up to 4 of the expert's tokens; same bits as the vec_dot loop below
-            // (a type whose one-token case is left to ggml, rows[1] null, runs vec_dot row by row for that case)
+            // Decode once for each token group; AVX-512 uses a different valid float reduction order.
             auto proj = [&](const role_math & m, const char * w, int nt, int64_t a, int64_t b, int nb,
                                 const block_q8_K * const * y, float * const * o) {
                 if (m.rows[nt]) { m.rows[nt](w, m.r.row_bytes, a, b, nb, y, o, s.iq_pf); return; }
@@ -570,6 +571,48 @@ void run_item(pool_state & s, int phase, int item) {
                     (const block_q8_0 *) (s.hq.data() + (size_t) q * s.hq_stride), aux, aux + down.r.n_in / QK8_0, o);
         }
         if (!w) { s.st_null.fetch_add(1, std::memory_order_relaxed); }
+        return;
+    }
+#if defined(MOE_IQ_ROWS)
+    if (s.down_reuse && down.rows[4]) {
+        const char * w = role_row(s, down, e, 0);
+        for (int q0 = s.first[i]; q0 < s.first[i + 1]; q0 += s.group_tokens) {
+            const int nt = std::min(s.group_tokens, s.first[i + 1] - q0);
+            const block_q8_K * y[8];
+            float * o[8];
+            for (int t = 0; t < nt; ++t) {
+                y[t] = (const block_q8_K *) (s.hq.data() + (size_t) (q0 + t) * s.hq_stride);
+                o[t] = s.out + (size_t) (q0 + t) * s.out_stride + r0;
+            }
+            if (w && down.rows[nt]) { down.rows[nt](w, down.r.row_bytes, r0, r1, (int) (down.r.n_in / QK_K), y, o, s.iq_pf); }
+            else {
+                for (int t = 0; t < nt; ++t) {
+                    for (int64_t row = r0; row < r1; ++row) {
+                        o[t][row - r0] = 0.0f;
+                        if (w) { down.dot((int) down.r.n_in, &o[t][row - r0], 0, w + (size_t) row * down.r.row_bytes, 0, y[t], 0, 1); }
+                    }
+                }
+            }
+        }
+        if (!w) { s.st_null.fetch_add(1, std::memory_order_relaxed); }
+        return;
+    }
+#endif
+    if (s.down_reuse && down.r.type == GGML_TYPE_IQ4_NL) {
+        for (int q0 = s.first[i]; q0 < s.first[i + 1]; q0 += s.group_tokens) {
+            const int nt = std::min(s.group_tokens, s.first[i + 1] - q0);
+            const void * y[8];
+            for (int t = 0; t < nt; ++t) { y[t] = s.hq.data() + (size_t) (q0 + t) * s.hq_stride; }
+            for (int64_t row = r0; row < r1; ++row) {
+                const char * w = role_row(s, down, e, row);
+                float v[8] = {};
+                if (w && !ggml_vec_dot_iq_grouped(GGML_TYPE_IQ4_NL, (int) down.r.n_in, w, y, v, nt)) {
+                    for (int t = 0; t < nt; ++t) { down.dot((int) down.r.n_in, &v[t], 0, w, 0, y[t], 0, 1); }
+                }
+                for (int t = 0; t < nt; ++t) { s.out[(size_t) (q0 + t) * s.out_stride + row] = v[t]; }
+                if (!w) { s.st_null.fetch_add(1, std::memory_order_relaxed); }
+            }
+        }
         return;
     }
     for (int64_t row = r0; row < r1; ++row) {
@@ -812,10 +855,11 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
     s.hidden.assign((size_t) MOE_CS_MAX_ROUTES * max_ff, 0.0f);
     s.hq.assign(MOE_CS_MAX_ROUTES * s.hq_stride, 0);
     s.q2_fast = env_int("GGML_MOE_CPU_SPLIT_Q2_FAST", 0, 0, 1) != 0;
-    s.q8_reuse = env_int("GGML_MOE_CPU_SPLIT_Q8_REUSE", 0, 0, 1) != 0;
-    s.group_tokens = env_int("GGML_MOE_CPU_SPLIT_REUSE8", 0, 0, 1) ? 8 : 4;
+    s.q8_reuse = env_int("GGML_MOE_CPU_SPLIT_Q8_REUSE", 1, 0, 1) != 0;
+    s.down_reuse = env_int("GGML_MOE_CPU_SPLIT_DOWN_REUSE", 1, 0, 1) != 0;
+    s.group_tokens = env_int("GGML_MOE_CPU_SPLIT_REUSE8", 1, 0, 1) ? 8 : 4;
 #if defined(MOE_CS_AVX512)
-    s.avx512 = env_int("GGML_MOE_CPU_SPLIT_AVX512", 0, 0, 1) != 0 && cpu_has_avx512_vnni();
+    s.avx512 = env_int("GGML_MOE_CPU_SPLIT_AVX512", 1, 0, 1) != 0 && cpu_has_avx512_vnni();
 #endif
     s.aux_stride = (size_t) max_ff / QK8_0 + (size_t) max_ff / QK2_0 + 16;
     s.hq_aux.assign(MOE_CS_MAX_ROUTES * s.aux_stride, 0.0f);
@@ -827,7 +871,7 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
         s.iq_variant = v == 0 ? -1 : v == 1 ? moe_iq::variant_best : v - 2;
     }
     s.iq_rows = s.iq_variant >= 0;
-    s.iq_pf = env_int("GGML_MOE_CPU_SPLIT_PF", 0, 0, 1 << 16);
+    s.iq_pf = env_int("GGML_MOE_CPU_SPLIT_PF", 2048, 0, 1 << 16);
 #endif
     s.spin_ms = env_int("GGML_MOE_CPU_SPLIT_SPIN_MS", 250, 0, 600000);
     s.spin_us = env_int("GGML_MOE_CPU_SPLIT_SPIN_US", s.spin_ms * 1000, 0, 600000000);
@@ -835,6 +879,11 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
     s.schedule = env_int("GGML_MOE_CPU_SPLIT_SCHEDULE", 0, 0, 1) != 0;
     s.host_help = env_int("GGML_MOE_CPU_SPLIT_HOST", 0, 0, 1) != 0;
     for (int p = 0; p < 4; ++p) { s.next[p].store(0); s.fin[p].store(0); s.closed[p].store(0); }
+    // Reserve the caller's actual core and keep the card-driving thread on it.
+    const bool max_threads = env_int("GGML_MOE_CPU_SPLIT_MAX_THREADS", 1, 0, 1) != 0;
+#if defined(__linux__)
+    if (max_threads) { pin_thread(sched_getcpu()); }
+#endif
     // One thread per physical core, never an SMT sibling, never core 0 (the OS and the desktop) and never the
     // core of the thread that drives the card: a spinning pool thread sharing a core with it is time-sliced in
     // scheduler ticks (the first build measured 6 ms per job that way). GGML_CPU_EXPERT_PIN=1 pins llama's main
@@ -842,14 +891,14 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
     // skipped. Threads take the highest cores first, away from ggml's own pinned workers (cores 1.. upward).
     std::vector<int> cores = core_leaders();
     std::vector<int> avail;
-    std::string skipped = "0";
+    std::string skipped;
     if (!cores.empty()) {
         // The cooperative host occupies the reserved core instead of competing with a pool worker.
         if (s.host_help) { s.host_cpu = cores[0]; pin_thread(s.host_cpu); }
         std::vector<char> skip(cores.size(), 0);
-        skip[0] = 1;
+        if (!max_threads) { skip[0] = 1; }
         const char * ep = getenv("GGML_CPU_EXPERT_PIN");
-        if (!s.host_help && ep && strcmp(ep, "1") == 0 && cores.size() > 2) { skip[1] = 1; }
+        if (!s.host_help && !max_threads && ep && strcmp(ep, "1") == 0 && cores.size() > 2) { skip[1] = 1; }
 #if defined(__linux__)
         cpu_set_t mine;
         if (pthread_getaffinity_np(pthread_self(), sizeof(mine), &mine) == 0 && CPU_COUNT(&mine) <= 2) {
@@ -915,11 +964,11 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
     for (int i = 0; pin && i < s.threads; ++i) { where += (i ? "," : "") + std::to_string(cpu_of(i)); }
     fprintf(stderr, "[moe-cpu-split] pool: %d threads, %s%s (skipped cores at cpus %s), spin %d us, nap %d us, rows up/gate %d down %d%s%s%s\n",
             s.threads, pin ? "pinned to cpus " : "unpinned", where.c_str(), skipped.c_str(), s.spin_us, s.nap_us, s.rows_ug, s.rows_down,
-            s.q2_fast ? ", Q2_0 down fast path" : "", smt ? ", SMT siblings" : "", s.avx512 ? ", AVX-512 VNNI IQ dots" : "");
+            s.q2_fast ? ", Q2_0 down fast path" : "", smt ? ", SMT siblings" : "", s.avx512 ? ", grouped AVX-512 VNNI IQ" : "");
     if (s.iq_rows) { fprintf(stderr, "[moe-cpu-split] IQ up/gate row kernels (each chunk decoded once per expert), variant %d, prefetch %d B\n", s.iq_variant, s.iq_pf); }
     if (s.schedule) { fprintf(stderr, "[moe-cpu-split] static quantization rows, grouped math claims\n"); }
     if (s.host_help) { fprintf(stderr, "[moe-cpu-split] waiting host drains math tiles on cpu %d\n", s.host_cpu); }
-    fprintf(stderr, "[moe-cpu-split] input Q8 reuse %s, IQ token group %d\n", s.q8_reuse ? "on" : "off", s.group_tokens);
+    fprintf(stderr, "[moe-cpu-split] input Q8 reuse %s, IQ token group %d, IQ4_NL down reuse %s\n", s.q8_reuse ? "on" : "off", s.group_tokens, s.down_reuse ? "on" : "off");
     return true;
 }
 
@@ -978,7 +1027,12 @@ bool moe_cs_register_layer(int layer, const moe_cs_role roles[3]) {
         m.vec_type = tr->vec_dot_type;
 #if defined(MOE_IQ_ROWS)
         for (int nt = 1; nt <= s.group_tokens; ++nt) {
-            m.rows[nt] = s.iq_rows && !s.avx512 && k < 2 && m.vec_type == GGML_TYPE_Q8_K ? moe_iq::get(m.r.type, nt, s.iq_variant) : nullptr;
+            if (s.iq_rows && m.vec_type == GGML_TYPE_Q8_K) {
+                m.rows[nt] = moe_iq::get(m.r.type, nt, s.iq_variant);
+#if defined(MOE_IQ_ROWS_512)
+                if (s.avx512) { m.rows[nt] = moe_iq::get512(m.r.type, nt); }
+#endif
+            }
         }
 #endif
         const auto * vt = ggml_get_type_traits_cpu(m.vec_type);
@@ -1171,14 +1225,21 @@ void moe_cs_stats(unsigned long long out[9]) {
 }
 
 bool moe_cs_iq_rows(int type, int nt, const void * w, size_t row_bytes, int64_t r0, int64_t r1, int64_t n_in,
-        const void * const * y, float * const * out, int prefetch, int variant) {
+        const void * const * y, float * const * out, int prefetch, int variant, bool wide) {
 #if defined(MOE_IQ_ROWS)
-    const moe_iq::rows_fn f = moe_iq::get(type, nt, variant);
+    moe_iq::rows_fn f = moe_iq::get(type, nt, variant);
+    if (wide) {
+#if defined(MOE_IQ_ROWS_512)
+        f = cpu_has_avx512_vnni() ? moe_iq::get512(type, nt) : nullptr;
+#else
+        f = nullptr;
+#endif
+    }
     if (!f || n_in % QK_K != 0) { return false; }
     f((const char *) w, row_bytes, r0, r1, (int) (n_in / QK_K), (const block_q8_K * const *) y, out, prefetch);
     return true;
 #else
-    (void) type; (void) nt; (void) w; (void) row_bytes; (void) r0; (void) r1; (void) n_in; (void) y; (void) out; (void) prefetch; (void) variant;
+    (void) type; (void) nt; (void) w; (void) row_bytes; (void) r0; (void) r1; (void) n_in; (void) y; (void) out; (void) prefetch; (void) variant; (void) wide;
     return false;
 #endif
 }
