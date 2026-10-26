@@ -133,4 +133,4 @@ Legend:
 |                          UPSCALE | ❌ | 🟡 | ✅ | ✅ | ❌ | ❌ | ✅ | 🟡 | ✅ | ✅ | ✅ | ❌ | ❌ |
 |                            XIELU | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ |
 
-CPU `FLASH_ATTN_EXT` also accepts an I64 mask `[1, n_query, 1, n_sequence]` of visible-prefix lengths, with `max_bias == 0`. Each query attends to KV indices below its limit. Other mask shapes continue to use F16.
+CPU `FLASH_ATTN_EXT` also accepts an I64 mask `[1, n_query, 1, n_sequence]` of visible-prefix lengths, with `max_bias == 0`. Each query attends to KV indices below its limit. CUDA supports this prefix mask on the ordinary F16-KV MMA route; vector, SJ-KVaRN, selected, streamed and sparse routes remain unsupported. Other mask shapes continue to use F16.

@@ -1546,6 +1546,17 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_mask(
         const int stride_mask, const int k_VKQ_0, const int i_sup, const int j0, const uint3 ne01,
         const int32_t * const __restrict__ indices) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    if (stride_mask == INT_MIN) {
+        const int64_t * limits = (const int64_t *) mask_h;
+        for (int j = threadIdx.y; j < ncols1; j += nwarps) {
+            const int row = fastmodulo(j0 + j, ne01);
+            const int64_t limit = limits[row];
+            for (int i = threadIdx.x; i < nbatch_fa; i += warp_size) {
+                tile_mask[j*(nbatch_fa + 8) + i] = half((!oob_check || i < i_sup) && k_VKQ_0 + i >= limit ? -INFINITY : 0.0f);
+            }
+        }
+        return;
+    }
     if (stride_mask < 0) {
         // [#175] packed mask: -stride_mask I32 words per row, bit k%32 of word k/32 set = visible (0), clear = -inf.
         // The values match the f16 mask element for element; the stores are synchronous, the caller's barrier publishes them.
@@ -3650,8 +3661,8 @@ static __global__ void flash_attn_ext_f16(
     const int stride_Q1   = nb01 / sizeof(float2);
     const int stride_Q2   = nb02 / sizeof(float2);
     const int stride_K    = is_turbo_kv ? nb11 : nb11 / sizeof(half2);
-    // An odd row byte stride marks an I32 mask; negative stride counts words.
-    const int stride_mask = (nb31 & 1) ? -(nb31 >> 2) : nb31 / int(sizeof(half));
+    // INT_MIN marks contiguous I64 prefixes; an odd byte stride marks I32 packed words.
+    const int stride_mask = nb31 == INT_MIN ? INT_MIN : (nb31 & 1) ? -(nb31 >> 2) : nb31 / int(sizeof(half));
 
     const int stride_V = V_is_K_view ? stride_K : (is_turbo_kv ? nb21 : nb21 / sizeof(half2));
 

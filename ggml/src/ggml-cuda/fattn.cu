@@ -2565,7 +2565,9 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
             continue;
         }
         for (size_t i = 1; i < GGML_MAX_DIMS; ++i) {
-            if (t->nb[i] % 16 != 0) {
+            const size_t stride = t == mask && t->type == GGML_TYPE_I64 ?
+                sizeof(half)*K->ne[1]*(i > 1 ? mask->ne[1] : 1)*(i > 2 ? mask->ne[2] : 1) : t->nb[i];
+            if (stride % 16 != 0) {
                 use_gqa_opt = false;
                 break;
             }
@@ -4357,8 +4359,39 @@ static void ggml_cuda_flash_attn_ext_mask_expanded(ggml_backend_cuda_context & c
     run(ctx, &d2);
 }
 
+// Prefix masks initially use the ordinary F16-KV MMA route only. Other routes stay unsupported until ported.
+static bool ggml_cuda_fattn_prefix_supported(int device, const ggml_tensor * dst) {
+    const ggml_tensor * mask = dst->src[3];
+    if (mask->ne[0] != 1 || mask->ne[2] != 1 || !ggml_is_contiguous(mask) ||
+            dst->src[5] || dst->src[6] || ggml_get_op_params_i32(dst, 4) > 0 ||
+            dst->src[1]->type != GGML_TYPE_F16 || dst->src[2]->type != GGML_TYPE_F16) {
+        return false;
+    }
+    float max_bias;
+    memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(max_bias));
+    if (max_bias != 0.0f) {
+        return false;
+    }
+    ggml_tensor m = *mask;
+    m.type = GGML_TYPE_F16;
+    m.ne[0] = dst->src[1]->ne[1];
+    m.nb[0] = sizeof(half);
+    for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+        m.nb[i] = m.nb[i - 1]*m.ne[i - 1];
+    }
+    ggml_tensor d = *dst;
+    d.src[3] = &m;
+    return !ggml_cuda_flash_attn_ext_fused(nullptr, &d, device) &&
+        ggml_cuda_get_best_fattn_kernel(device, &d) == BEST_FATTN_KERNEL_MMA_F16;
+}
+
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+    if (dst->src[3] && dst->src[3]->type == GGML_TYPE_I64) {
+        GGML_ASSERT(ggml_cuda_fattn_prefix_supported(ctx.device, dst));
+        ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
+        return;
+    }
     if (ggml_cuda_fattn_mask_is_packed(dst)) {
         const int64_t n_kv = dst->src[6] ? ggml_get_op_params_i32(dst, 6) : dst->src[1]->ne[1];
         GGML_ASSERT(dst->src[3]->ne[0]*32 >= n_kv);
@@ -4431,6 +4464,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 }
 
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
+    if (dst->src[3] && dst->src[3]->type == GGML_TYPE_I64) {
+        return ggml_cuda_fattn_prefix_supported(device, dst);
+    }
     if (ggml_cuda_fattn_mask_is_packed(dst)) {
         // [#175] the packed mask runs wherever its f16 expansion does (no ALiBi: ggml_flash_attn_ext asserts it)
         ggml_tensor m2;
