@@ -7152,6 +7152,21 @@ static bool test_profile_global_plan() {
     ok &= plan.bytes == 3 && plan.selected == std::vector<uint8_t>({1, 1, 1, 0});
     ok &= ggml_cuda_moe_cache_profile_plan(items, {4}, 3, 1, plan, true);
     ok &= plan.bytes == 1 && plan.selected == std::vector<uint8_t>({0, 0, 0, 1}) && plan.ranks[3] == 0;
+    // Allocator-rounded pools must still select whole bundles, leaving unusable tails free.
+    items.clear();
+    for (int32_t expert = 0; expert < 8; ++expert) {
+        items.push_back({0, expert, 0, 0, 1, (uint64_t)(8 - expert)});
+        items.push_back({1, expert, 0, 0, 1, (uint64_t)(8 - expert)});
+        items.push_back({2, expert, 0, 1, 4, (uint64_t)(8 - expert)});
+    }
+    ok &= ggml_cuda_moe_cache_profile_plan(items, {16, 8}, 47, 1, plan);
+    ok &= plan.bundles == 7 && plan.bytes == 42 && plan.slots == std::vector<size_t>({14, 7});
+    ok &= ggml_cuda_moe_cache_profile_plan(items, {14, 6}, 47, 1, plan);
+    ok &= plan.bundles == 6 && plan.bytes == 36 && plan.slots == std::vector<size_t>({12, 6});
+    for (size_t i = 0; i < items.size(); i += 3) {
+        ok &= plan.selected[i] == plan.selected[i + 1] && plan.selected[i] == plan.selected[i + 2];
+        ok &= (plan.selected[i] != 0) == (i < 18);
+    }
     printf("cache-profile-global-plan: %s\n", ok ? "OK" : "FAIL");
     return ok;
 }

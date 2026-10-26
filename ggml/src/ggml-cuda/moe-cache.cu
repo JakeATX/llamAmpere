@@ -513,6 +513,7 @@ struct moe_cache_device {
     std::vector<moe_cache_shape> shapes;
     std::unordered_map<moe_cache_key, size_t, moe_cache_key_hash> profile_global_ranks;
     std::vector<size_t> profile_global_slots;
+    std::unordered_set<moe_cache_key, moe_cache_key_hash> profile_global_selected;
     size_t profile_global_bytes = 0;
     std::unordered_map<const void *, moe_cache_seen_tensor> seen_tensors;
     std::unordered_map<const void *, size_t> host_strides;
@@ -2660,10 +2661,17 @@ static bool moe_cache_build_global_profile(moe_cache_session & session, moe_cach
         MOE_CACHE_LOG("[moe-cache] CUDA%d ranked prefix: requested=%lld fitted=%zu bytes=%zu; no lower-rank backfill\n",
                 device.physical, (long long)ranked_limit, plan.bundles, plan.bytes);
     }
-    device.profile_global_ranks.clear();
-    for (size_t i = 0; i < keys.size(); ++i) { device.profile_global_ranks.emplace(keys[i], plan.ranks[i]); }
-    device.profile_global_slots = plan.slots;
-    device.profile_global_bytes = plan.bytes;
+    auto publish_plan = [&]() {
+        device.profile_global_ranks.clear();
+        device.profile_global_selected.clear();
+        for (size_t i = 0; i < keys.size(); ++i) {
+            device.profile_global_ranks.emplace(keys[i], plan.ranks[i]);
+            if (moe_cache_env_on("GGML_MOE_CACHE_WHOLE_ONLY") && plan.selected[i]) { device.profile_global_selected.insert(keys[i]); }
+        }
+        device.profile_global_slots = plan.slots;
+        device.profile_global_bytes = plan.bytes;
+    };
+    publish_plan();
     MOE_CACHE_LOG("[moe-cache] CUDA%d global profile plan: budget=%zu selected_bytes=%zu slack=%zu bundles=%zu slices=%zu minimum_slots=%d; %s, selected bundles first\n",
             device.physical, budget, plan.bytes, budget - plan.bytes, plan.bundles,
             (size_t)std::count(plan.selected.begin(), plan.selected.end(), (uint8_t)1), moe_cache_pool_slots_min,
@@ -2699,6 +2707,16 @@ static bool moe_cache_build_global_profile(moe_cache_session & session, moe_cach
         const int actual = pool >= 0 ? device.pools[pool]->n_slots : 0;
         MOE_CACHE_LOG("[moe-cache] CUDA%d global profile capacity: type=%s expert_bytes=%zu planned_slots=%zu actual_slots=%d\n",
                 device.physical, ggml_type_name((ggml_type)pending[p]->wtype), pending[p]->expert_size, plan.slots[p], actual);
+    }
+    // fork: allocator headroom can shorten a pool; keep only bundles that fit all actual pools.
+    if (moe_cache_env_on("GGML_MOE_CACHE_WHOLE_ONLY")) {
+        for (size_t p = 0; p < pending.size(); ++p) {
+            const int pool = pending[p]->pool;
+            caps[p] = pool >= 0 ? (size_t)device.pools[pool]->n_slots : 0;
+        }
+        if (!ggml_cuda_moe_cache_profile_plan(items, caps, budget, moe_cache_pool_slots_min,
+                plan, density, (size_t)ranked_limit)) { return false; }
+        publish_plan();
     }
     return true;
 }
@@ -4794,6 +4812,7 @@ static void moe_cache_invalidate_session(
             for (const auto & device : session.devices) {
                 device->profile_global_ranks.clear();
                 device->profile_global_slots.clear();
+                device->profile_global_selected.clear();
                 device->profile_global_bytes = 0;
             }
             break;
@@ -5656,7 +5675,8 @@ static int moe_cache_warm(void * opaque, const ggml_moe_cache_tensor_desc * tens
         return 0;
     }
     int64_t global_flag = 0;
-    if (loading && moe_cache_env_i64("GGML_MOE_CACHE_PROFILE_GLOBAL", 0, 1, global_flag) && global_flag == 1) {
+    const bool whole_only = moe_cache_env_on("GGML_MOE_CACHE_WHOLE_ONLY");
+    if (loading && (whole_only || (moe_cache_env_i64("GGML_MOE_CACHE_PROFILE_GLOBAL", 0, 1, global_flag) && global_flag == 1))) {
         std::lock_guard<std::mutex> lock(session->mu);
         session->profile_global_tensors.clear();
         session->profile_global_tensors.reserve(n_tensors);
@@ -5713,13 +5733,33 @@ static int moe_cache_warm(void * opaque, const ggml_moe_cache_tensor_desc * tens
         }
     }
     std::unordered_map<moe_cache_key, size_t, moe_cache_key_hash> global_ranks;
+    std::unordered_set<moe_cache_key, moe_cache_key_hash> selected;
     {
         std::lock_guard<std::mutex> lock(session->mu);
         for (const auto & device : session->devices) {
             global_ranks.insert(device->profile_global_ranks.begin(), device->profile_global_ranks.end());
+            if (whole_only) {
+                selected.insert(device->profile_global_selected.begin(), device->profile_global_selected.end());
+                for (const auto & pool : device->pools) {
+                    for (int i = 0; i < pool->n_slots; ++i) {
+                        const auto & slot = pool->slots[i];
+                        if (!session->device_frozen && !slot.readers && slot.state == moe_cache_slot_state::valid &&
+                                !device->profile_global_selected.count(slot.key)) {
+                            moe_cache_slot_reset(*pool, i, true);
+                        }
+                    }
+                }
+            }
         }
     }
     const bool global_profile = global_ranks.size() == entries;
+    if (whole_only && (!global_profile || selected.empty())) {
+        MOE_CACHE_LOG("[moe-cache] whole-only warm refused: a complete global profile plan is required\n");
+        return 0;
+    }
+    if (whole_only) {
+        MOE_CACHE_LOG("[moe-cache] whole-only warm: selected_slices=%zu; no partial backfill\n", selected.size());
+    }
     if (global_profile) {
         MOE_CACHE_LOG("[moe-cache] global profile warm: pure saved-profile bundle order overrides prompt counts and PROFILE_BLEND_PCT; pool plan preserved\n");
     }
@@ -5753,6 +5793,7 @@ static int moe_cache_warm(void * opaque, const ggml_moe_cache_tensor_desc * tens
                 session->profile_counts[key] = counts[i][e];
             }
             if (global_profile) {
+                if (whole_only && !selected.count(key)) { continue; }
                 const auto prior = session->profile_counts.find(key);
                 ranked.push_back({i, e, prior == session->profile_counts.end() ? 0 : prior->second, true, 0, false});
                 continue;
@@ -6617,6 +6658,7 @@ static bool moe_cache_device_fallback(moe_cache_session & session,
 // boundary synchronization protects all captured table/slab references; no
 // allocation they point at is replaced, and no layer waits for host routing.
 static void moe_cache_device_adapt(moe_cache_session & session) {
+    if (moe_cache_env_on("GGML_MOE_CACHE_WHOLE_ONLY")) { return; }
     if (!session.device_expert_counts || session.devices.size() != 1 ||
             session.active_scopes || session.active_nodes) {
         return;
@@ -7028,6 +7070,11 @@ static bool moe_cache_swap_init(moe_cache_session & session) {
         return false;
     }
     if (session.swap_whole && !moe_cache_swap_groups(session)) {
+        if (moe_cache_env_on("GGML_MOE_CACHE_WHOLE_ONLY")) {
+            MOE_CACHE_LOG("[moe-cache] whole-only swaps disabled: incomplete projections, names or resident bundles\n");
+            moe_cache_swap_free(session);
+            return false;
+        }
         MOE_CACHE_LOG("[moe-cache] whole swap refused: incomplete projections, names or resident bundles; using slice policy\n");
         session.swap_whole = false;
         session.swap_groups.clear();
@@ -10836,7 +10883,8 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
         if (moe_cache_env_i64("GGML_MOE_CACHE_SWAP_HYST_PCT", 0, 1000, adaptation_value)) { session->swap_hyst = (float)adaptation_value / 100.0f; }
         if (moe_cache_env_i64("GGML_MOE_CACHE_SWAP_MARGIN", 0, 100000, adaptation_value)) { session->swap_margin = (float)adaptation_value; }
         if (moe_cache_env_i64("GGML_MOE_CACHE_SWAP_MARGIN_MILLI", 0, 100000000, adaptation_value)) { session->swap_margin = (float) adaptation_value / 1000.0f; }
-        session->swap_whole = moe_cache_env_i64("GGML_MOE_CACHE_SWAP_WHOLE", 0, 1, adaptation_value) && adaptation_value;
+        session->swap_whole = moe_cache_env_on("GGML_MOE_CACHE_WHOLE_ONLY") ||
+            (moe_cache_env_i64("GGML_MOE_CACHE_SWAP_WHOLE", 0, 1, adaptation_value) && adaptation_value);
         session->swap_layer = moe_cache_env_i64("GGML_MOE_CACHE_SWAP_LAYER", 0, 1, adaptation_value) && adaptation_value;
         session->swap_decay_after = moe_cache_env_i64("GGML_MOE_CACHE_SWAP_DECAY_AFTER", 0, 1, adaptation_value) && adaptation_value;
         MOE_CACHE_LOG("[moe-cache] swap modes: whole=%d layer=%d decay_after=%d\n", session->swap_whole, session->swap_layer, session->swap_decay_after);
@@ -11311,6 +11359,10 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
                     session->device_profile_slices.push_back({table.count_offset, (size_t) tensors[i].n_expert});
                 }
             }
+        }
+        if (moe_cache_env_on("GGML_MOE_CACHE_WHOLE_ONLY") && !moe_cache_swap_groups(*session, true)) {
+            MOE_CACHE_LOG("[moe-cache] whole-only device tables refused: resident bundles are incomplete\n");
+            return fail();
         }
         session->device_capture_generation = g_moe_cache_capture_generation.fetch_add(1, std::memory_order_relaxed);
         GGML_ASSERT(session->device_capture_generation != 0);
