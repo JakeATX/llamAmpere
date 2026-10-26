@@ -1630,14 +1630,14 @@ std::vector<llama_token_data> get_token_probabilities(llama_context * ctx, int i
             max_l = std::max(max_l, t.logit);
         }
     }
-    float cum_sum = 0.0f;
+    double cum_sum = 0.0;
     for (auto & t : cur) {
         float p = expf(t.logit - max_l);
         t.p = p;
         cum_sum += p;
     }
     for (auto & t : cur) {
-        t.p /= cum_sum;
+        t.p = static_cast<float>(t.p / cum_sum);
     }
 
     return cur;
