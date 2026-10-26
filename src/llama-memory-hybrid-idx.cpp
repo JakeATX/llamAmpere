@@ -1029,6 +1029,7 @@ void llama_memory_hybrid_idx_context::kpool_build_state(const llama_ubatch & uba
     st.n_new_g = std::max({st.n_new, 1u, std::min({bound, kpool_pad(st.n_pool_real) - 1, n_pool_max})});
     if (mem->has_compact_pool()) {
         // Keep one dead row beyond the dense pools; never scatter padding over a live pool.
+        GGML_ASSERT(st.n_new <= st.n_pool_real && st.n_pool_real <= n_pool_max);
         st.n_new_g = std::min(st.n_new_g, st.n_new + n_pool_max - st.n_pool_real + 1);
     }
     std::sort(st.new_pools.begin(), st.new_pools.end());
@@ -1074,8 +1075,13 @@ void llama_memory_hybrid_idx_context::compact_pool_inputs(ggml_tensor * pool_cel
     }
     const auto & st = kpool_cur();
     const uint32_t capacity = mem->get_mem_idx()->get_size()/mem->get_kpool() + 1;
+    GGML_ASSERT(st.n_new <= st.n_pool_real && st.n_new <= st.n_new_g);
     GGML_ASSERT(st.n_pool_real < capacity && st.n_new_g - st.n_new <= capacity - st.n_pool_real);
+    GGML_ASSERT(new_pool_rep->type == GGML_TYPE_I64 && ggml_is_contiguous(new_pool_rep));
+    GGML_ASSERT(new_pool_rep->ne[0] == st.n_new_g && ggml_backend_buffer_is_host(new_pool_rep->buffer));
     if (pool_cells) {
+        GGML_ASSERT(pool_cells->type == GGML_TYPE_I32 && ggml_is_contiguous(pool_cells));
+        GGML_ASSERT(pool_cells->ne[0] > st.n_pool_real && ggml_backend_buffer_is_host(pool_cells->buffer));
         auto * cells = (int32_t *) pool_cells->data;
         for (uint32_t i = 0; i < pool_cells->ne[0]; ++i) {
             cells[i] = std::min(i, st.n_pool_real);
@@ -1085,6 +1091,7 @@ void llama_memory_hybrid_idx_context::compact_pool_inputs(ggml_tensor * pool_cel
     uint32_t out = 0;
     if (st.sparse_marks) {
         for (uint32_t pi : st.new_pools) {
+            GGML_ASSERT(out < st.n_new && pi < st.n_pool_real);
             reps[out++] = pi;
         }
     } else {

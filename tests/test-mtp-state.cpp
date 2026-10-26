@@ -1137,7 +1137,8 @@ static void run_qwen4exp_compact_pool(bool cuda) {
             exact += std::memcmp(&expected[i], &actual[i], sizeof(float)) == 0;
         }
         rows += to - from;
-        require(max_error < 1e-4f, "compact and legacy pool output parity");
+        require(std::memcmp(expected.data(), actual.data(), expected.size()*sizeof(float)) == 0,
+                "compact and legacy pool output bytes match");
         const auto * raw = memory(compact.get())->get_mem_idx()->get_k_storage(0);
         require(raw->ne[0] == geometry.head_dim, "compact pool retains one exact raw row per token");
         return actual;
@@ -1163,15 +1164,19 @@ static void run_qwen4exp_compact_pool(bool cuda) {
         require(std::isfinite(restored[i]), "finite compact restored logits");
         restore_error = std::max(restore_error, std::abs(continuation[i] - restored[i]));
     }
-    require(restore_error < 1e-4f, "compact pool restored continuation parity");
+    require(std::memcmp(continuation.data(), restored.data(), restored.size()*sizeof(float)) == 0,
+            "compact pool restored continuation bytes match");
     compare(37, 64);
-    compare(64, 96);
-    compare(96, 128);
+    const auto capacity = memory(compact.get())->get_mem_idx()->get_size();
+    require(capacity == memory(legacy.get())->get_mem_idx()->get_size(), "compact pool raw capacity unchanged");
+    for (uint32_t pos = 64; pos < capacity; pos += 32) {
+        compare(pos, std::min(pos + 32, capacity));
+    }
     for (auto * ctx : {legacy.get(), compact.get()}) {
         require(llama_memory_seq_rm(llama_get_memory(ctx), 0, 5, 11), "compact pool interior removal");
     }
     // Regroup every retained suffix pool without assuming contiguous physical cells.
-    compare(128, 129);
+    compare(capacity, capacity + 1);
     common_set_env("LLAMA_QSA_POOL_COMPACT", old_env);
     printf("PASS compact pool %s rows=%zu exact_values=%zu max_logit_error=%.9g restore_error=%.9g cache_bytes=%zu->%zu\n",
             cuda ? "GPU" : "CPU", rows, exact, max_error, restore_error, legacy_bytes, compact_bytes);
@@ -3423,9 +3428,10 @@ int main(int argc, char ** argv) {
     const bool pool_store_cuda = argc == 2 && std::strcmp(argv[1], "--qwen4exp-pool-store-cuda-only") == 0;
     if (pin_host) { common_set_env("LLAMA_MTP_PIN_BORROWED_HOST", "1"); }
     const bool pool_cuda = argc == 2 && std::strcmp(argv[1], "--qwen4exp-pool-cuda-only") == 0;
+    const bool compact_pool_cuda = argc == 2 && std::strcmp(argv[1], "--qwen4exp-compact-pool-cuda-only") == 0;
     const bool defer_math_cuda = argc == 3 && std::strcmp(argv[1], "--bookkeep-defer-math-cuda") == 0;
     if (cuda_sharing || feedback_cuda || pipe_cuda || chain_cuda || compact_cuda || full_head_cuda || pool_store_cuda || pool_cuda ||
-            defer_math_cuda) { ggml_backend_load_all(); }
+            defer_math_cuda || compact_pool_cuda) { ggml_backend_load_all(); }
     llama_backend_init();
     int failed = 0;
     llama_model * model = nullptr;
