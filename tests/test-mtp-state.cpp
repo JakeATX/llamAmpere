@@ -1074,6 +1074,109 @@ static void run_qwen4exp_pool(bool cuda = false, bool store_only = false) {
             cuda ? "GPU" : "CPU", store_only ? " store-only" : "", store_decodes);
 }
 
+static void run_qwen4exp_compact_pool(bool cuda) {
+    auto * device = cuda ? ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU) : nullptr;
+    require(!cuda || device, "compact pool GPU backend is available");
+    model_geometry geometry;
+    geometry.kpool = 4;
+    geometry.indexer_top_k = 8;
+    geometry.attention_interval = 1;
+    llama_model_ptr model(make_model(false, geometry, LLM_ARCH_QWEN4EXP, device));
+    const std::string old_env = common_get_env("LLAMA_QSA_POOL_COMPACT");
+    auto make_context = [&](bool compact, uint32_t sequences = 1, bool draft = false) {
+        common_set_env("LLAMA_QSA_POOL_COMPACT", compact ? "1" : "0");
+        auto cp = llama_context_default_params();
+        cp.ctx_type = draft ? LLAMA_CONTEXT_TYPE_MTP : LLAMA_CONTEXT_TYPE_DEFAULT;
+        cp.n_ctx = 128;
+        cp.n_batch = cp.n_ubatch = 32;
+        cp.n_seq_max = sequences;
+        cp.kv_unified = true;
+        cp.n_threads = cp.n_threads_batch = 2;
+        cp.offload_kqv = cuda;
+        cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        cp.type_k = cp.type_v = GGML_TYPE_F16;
+        llama_context_ptr ctx(llama_init_from_model(model.get(), cp));
+        require(ctx != nullptr, "create compact pool context");
+        auto * mem = dynamic_cast<llama_memory_hybrid_idx *>(llama_get_memory(ctx.get()));
+        require(mem && mem->has_compact_pool() == (compact && sequences == 1 && !draft),
+                "compact pool only changes the supported single-sequence target");
+        return ctx;
+    };
+    auto legacy = make_context(false);
+    auto compact = make_context(true);
+    auto fallback = make_context(true, 2);
+    auto draft = make_context(true, 1, true);
+    auto memory = [](llama_context * ctx) {
+        return dynamic_cast<llama_memory_hybrid_idx *>(llama_get_memory(ctx));
+    };
+    size_t legacy_bytes = 0, compact_bytes = 0;
+    for (const auto & entry : memory(legacy.get())->memory_breakdown()) { legacy_bytes += entry.second; }
+    for (const auto & entry : memory(compact.get())->memory_breakdown()) { compact_bytes += entry.second; }
+    require(compact_bytes < legacy_bytes, "compact pool reduces allocated cache bytes");
+    size_t rows = 0, exact = 0;
+    float max_error = 0;
+    auto decode = [&](llama_context * ctx, llama_pos from, llama_pos to) {
+        common_batch batch(ctx);
+        for (llama_pos pos = from; pos < to; ++pos) { batch.add(token_at(pos), pos, 0, true); }
+        require(llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0, "decode compact pool target");
+        std::vector<float> output;
+        for (llama_pos pos = from; pos < to; ++pos) {
+            const auto * logits = llama_get_logits_ith(ctx, pos - from);
+            require(logits != nullptr, "compact pool output row exists");
+            output.insert(output.end(), logits, logits + n_vocab);
+        }
+        return output;
+    };
+    auto compare = [&](llama_pos from, llama_pos to) {
+        const auto expected = decode(legacy.get(), from, to);
+        const auto actual = decode(compact.get(), from, to);
+        require(expected.size() == actual.size(), "compact pool output shape");
+        for (size_t i = 0; i < expected.size(); ++i) {
+            require(std::isfinite(actual[i]) && std::isfinite(expected[i]), "finite compact pool logits");
+            max_error = std::max(max_error, std::abs(expected[i] - actual[i]));
+            exact += std::memcmp(&expected[i], &actual[i], sizeof(float)) == 0;
+        }
+        rows += to - from;
+        require(max_error < 1e-4f, "compact and legacy pool output parity");
+        const auto * raw = memory(compact.get())->get_mem_idx()->get_k_storage(0);
+        require(raw->ne[0] == geometry.head_dim, "compact pool retains one exact raw row per token");
+        return actual;
+    };
+    compare(0, 3);
+    compare(3, 8);
+    compare(8, 17);
+    for (auto * ctx : {legacy.get(), compact.get()}) {
+        require(llama_memory_seq_rm(llama_get_memory(ctx), 0, 6, -1), "compact pool suffix rollback");
+    }
+    compare(6, 13);
+    compare(13, 32);
+    auto saved = save(compact.get(), 0);
+    auto resumed = make_context(true);
+    require(llama_state_seq_set_data_ext(resumed.get(), saved.data(), saved.size(), 0,
+                LLAMA_STATE_SEQ_FLAGS_KEEP_LAYOUT) == saved.size(), "restore compact pool raw cache");
+    require(save(resumed.get(), 0) == saved, "compact raw cache round-trips exactly");
+    const auto continuation = compare(32, 37);
+    const auto restored = decode(resumed.get(), 32, 37);
+    require(continuation.size() == restored.size(), "restored compact output shape");
+    float restore_error = 0;
+    for (size_t i = 0; i < restored.size(); ++i) {
+        require(std::isfinite(restored[i]), "finite compact restored logits");
+        restore_error = std::max(restore_error, std::abs(continuation[i] - restored[i]));
+    }
+    require(restore_error < 1e-4f, "compact pool restored continuation parity");
+    compare(37, 64);
+    compare(64, 96);
+    compare(96, 128);
+    for (auto * ctx : {legacy.get(), compact.get()}) {
+        require(llama_memory_seq_rm(llama_get_memory(ctx), 0, 5, 11), "compact pool interior removal");
+    }
+    // Regroup every retained suffix pool without assuming contiguous physical cells.
+    compare(128, 129);
+    common_set_env("LLAMA_QSA_POOL_COMPACT", old_env);
+    printf("PASS compact pool %s rows=%zu exact_values=%zu max_logit_error=%.9g restore_error=%.9g cache_bytes=%zu->%zu\n",
+            cuda ? "GPU" : "CPU", rows, exact, max_error, restore_error, legacy_bytes, compact_bytes);
+}
+
 static void run_qwen4exp_chain(bool cuda, bool compact = false) {
     prefill_env_restore prefill_env;
     prefill_env.set(false, false, false);
@@ -3369,6 +3472,12 @@ int main(int argc, char ** argv) {
         }
         if (feedback_cuda || (argc == 2 && std::strcmp(argv[1], "--device-feedback-only") == 0)) {
             run_device_feedback(feedback_cuda);
+            llama_backend_free();
+            return 0;
+        }
+        if (argc == 2 && (std::strcmp(argv[1], "--qwen4exp-compact-pool-only") == 0 ||
+                std::strcmp(argv[1], "--qwen4exp-compact-pool-cuda-only") == 0)) {
+            run_qwen4exp_compact_pool(std::strcmp(argv[1], "--qwen4exp-compact-pool-cuda-only") == 0);
             llama_backend_free();
             return 0;
         }

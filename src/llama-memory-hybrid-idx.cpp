@@ -56,13 +56,22 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         n_seq_max, n_rs_seq, gdn_replay_req, offload, unified,
         filter_attn, filter_recr,
         0, nullptr, 0, sj_kvarn),
+    compact_pool([&] {
+        const char * value = std::getenv("LLAMA_QSA_POOL_COMPACT");
+        const bool rotating = type_k == GGML_TYPE_TURBO2_0 || type_k == GGML_TYPE_TURBO3_0 ||
+                type_k == GGML_TYPE_TURBO4_0 || type_k == GGML_TYPE_TQ5_0 || type_k == GGML_TYPE_TQ6_0;
+        return value && std::atoi(value) != 0 && filter_idx && n_seq_max == 1 &&
+                model.arch == LLM_ARCH_QWEN4EXP && !filter_idx(model.hparams.n_layer()) &&
+                model.hparams.indexer_kpool > 1 && model.hparams.indexer_kpool_row == 2 &&
+                (sj_kvarn.enabled() || rotating || type_k == GGML_TYPE_F16);
+    }()),
     hparams_idx(model.hparams),
     mem_idx(filter_idx == nullptr ? nullptr : [&] {
         // MQA with a single key head of indexer_head_size, as llama_kv_cache_dsa shapes its own
         std::fill(hparams_idx.n_head_kv_arr.begin(), hparams_idx.n_head_kv_arr.end(), 1);
         // a k-pool indexer caches its per-token rows and the pooled key side by side
         // (glm5-next: key | gate | pooled, qwen4exp: key | pooled)
-        hparams_idx.n_embd_head_k_full = model.hparams.indexer_head_size * (model.hparams.indexer_kpool > 0 ? model.hparams.indexer_kpool_row : 1);
+        hparams_idx.n_embd_head_k_full = model.hparams.indexer_head_size * (model.hparams.indexer_kpool > 0 && !compact_pool ? model.hparams.indexer_kpool_row : 1);
 
         // the cached indexer keys are raw, rotation happens after pooling at read time, so a
         // K-shift must not rotate them while the stream copies in the same update still apply
@@ -88,7 +97,36 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             model, hparams_idx, type_k_idx, type_v_idx, v_trans, offload, unified_idx,
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
             nullptr, filter_idx, nullptr, nullptr, "idx_");
-    }()) {}
+    }()) {
+    if (compact_pool) {
+        pool_storage.resize(model.hparams.n_layer_all, nullptr);
+        for (uint32_t il : mem_idx->get_layer_ids()) {
+            auto * raw = mem_idx->get_k_storage(il);
+            GGML_ASSERT(raw->type == GGML_TYPE_F16 && raw->ne[2] == 1);
+            ggml_context_ptr ctx(ggml_init({ ggml_tensor_overhead(), nullptr, true }));
+            if (!ctx) {
+                throw std::runtime_error("failed to create compact indexer pool context");
+            }
+            auto * pooled = ggml_new_tensor_2d(ctx.get(), raw->type, raw->ne[0], raw->ne[1]/get_kpool() + 1);
+            ggml_format_name(pooled, "idx_pool_compact_%u", il);
+            const auto buft = ggml_backend_buffer_get_type(raw->buffer);
+            ggml_backend_buffer_ptr buffer(model.hparams.no_alloc ? ggml_backend_buft_alloc_buffer(buft, 0) :
+                    ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
+            if (!buffer) {
+                throw std::runtime_error("failed to allocate compact indexer pool buffer");
+            }
+            if (model.hparams.no_alloc) {
+                pooled->buffer = buffer.get();
+            } else {
+                ggml_backend_buffer_clear(buffer.get(), 0);
+            }
+            LLAMA_LOG_INFO("%s: layer %u compact indexer pool: %lld rows, %.3f MiB (raw rows retained)\n",
+                    __func__, il, (long long) pooled->ne[1], ggml_backend_buffer_get_size(buffer.get())/1048576.0);
+            pool_storage[il] = pooled;
+            pool_buffers.emplace_back(std::move(ctx), std::move(buffer));
+        }
+    }
+}
 
 llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     // note: repeats llama_memory_hybrid::init_batch, as the indexer needs the attention slot infos that the base context hides
@@ -185,6 +223,11 @@ void llama_memory_hybrid_idx::clear(bool data) {
 
     if (mem_idx) {
         mem_idx->clear(data);
+        if (data) {
+            for (auto & entry : pool_buffers) {
+                ggml_backend_buffer_clear(entry.second.get(), 0);
+            }
+        }
         mem_idx_stale_set(-1, 0);
     }
 }
@@ -298,6 +341,11 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_idx::memory_bre
         }
     }
 
+    for (const auto & entry : pool_buffers) {
+        const auto buft = ggml_backend_buffer_get_type(entry.second.get());
+        mb[buft] += hparams_idx.no_alloc ? ggml_backend_alloc_ctx_tensors_from_buft_size(entry.first.get(), buft) :
+                ggml_backend_buffer_get_size(entry.second.get());
+    }
     return mb;
 }
 
@@ -369,6 +417,10 @@ void llama_memory_hybrid_idx::state_drop(llama_seq_id seq_id) {
 
 llama_kv_cache * llama_memory_hybrid_idx::get_mem_idx() const {
     return mem_idx.get();
+}
+
+ggml_tensor * llama_memory_hybrid_idx::get_pool_storage(int32_t il) const {
+    return compact_pool ? pool_storage.at(il) : nullptr;
 }
 
 //
@@ -771,7 +823,13 @@ uint32_t llama_memory_hybrid_idx_context::get_n_stream() const {
     return ns_ubatch[i_cur];
 }
 
-llama_memory_hybrid_idx_context::kpool_access::kpool_access(ggml_context * ctx, ggml_tensor * k, int64_t n_embd) : ctx(ctx) {
+llama_memory_hybrid_idx_context::kpool_access::kpool_access(ggml_context * ctx, ggml_tensor * k, int64_t n_embd, ggml_tensor * compact) : ctx(ctx) {
+    if (compact) {
+        GGML_ASSERT(k->ne[0] == n_embd && k->ne[2] == 1);
+        key_gate = ggml_view_2d(ctx, k, n_embd, k->ne[1], k->nb[1], 0);
+        pooled = compact;
+        return;
+    }
     // rows are the per-token part (glm5-next: key | gate, qwen4exp: key), then the pooled key
     const int64_t n_tok = k->ne[0] - n_embd;
     GGML_ASSERT(n_tok > 0 && n_tok % n_embd == 0);
@@ -800,7 +858,7 @@ llama_memory_hybrid_idx_context::kpool_access llama_memory_hybrid_idx_context::g
         ggml_context * ctx, int32_t il, int64_t n_embd) const {
     GGML_ASSERT(mem != nullptr && mem->get_mem_idx() != nullptr);
 
-    return kpool_access(ctx, mem->get_mem_idx()->get_k_storage(il), n_embd);
+    return kpool_access(ctx, mem->get_mem_idx()->get_k_storage(il), n_embd, mem->get_pool_storage(il));
 }
 
 // k-pool DSA indexer (glm5-next, qwen4exp QSA)
@@ -969,6 +1027,10 @@ void llama_memory_hybrid_idx_context::kpool_build_state(const llama_ubatch & uba
     const uint32_t n_pool_max = kv_size / kpool * idx->get_n_seq_max();
     const uint32_t bound = ubatch.n_tokens/kpool + ubatch.n_seqs_unq;
     st.n_new_g = std::max({st.n_new, 1u, std::min({bound, kpool_pad(st.n_pool_real) - 1, n_pool_max})});
+    if (mem->has_compact_pool()) {
+        // Keep one dead row beyond the dense pools; never scatter padding over a live pool.
+        st.n_new_g = std::min(st.n_new_g, st.n_new + n_pool_max - st.n_pool_real + 1);
+    }
     std::sort(st.new_pools.begin(), st.new_pools.end());
     if (validate_marks) {
         std::vector<uint32_t> expected;
@@ -1003,6 +1065,39 @@ bool llama_memory_hybrid_idx_context::use_kpool_store_only() const {
         return value == nullptr || std::atoi(value) != 0;  // default on (owner 2026-10-22); 0 turns it off
     }();
     return enabled && kpool_incremental();
+}
+
+// fork: compact slots follow sequence pool order, independent of physical raw-cell placement.
+void llama_memory_hybrid_idx_context::compact_pool_inputs(ggml_tensor * pool_cells, ggml_tensor * new_pool_rep) const {
+    if (!mem->has_compact_pool()) {
+        return;
+    }
+    const auto & st = kpool_cur();
+    const uint32_t capacity = mem->get_mem_idx()->get_size()/mem->get_kpool() + 1;
+    GGML_ASSERT(st.n_pool_real < capacity && st.n_new_g - st.n_new <= capacity - st.n_pool_real);
+    if (pool_cells) {
+        auto * cells = (int32_t *) pool_cells->data;
+        for (uint32_t i = 0; i < pool_cells->ne[0]; ++i) {
+            cells[i] = std::min(i, st.n_pool_real);
+        }
+    }
+    auto * reps = (int64_t *) new_pool_rep->data;
+    uint32_t out = 0;
+    if (st.sparse_marks) {
+        for (uint32_t pi : st.new_pools) {
+            reps[out++] = pi;
+        }
+    } else {
+        for (uint32_t pi = 0; pi < st.n_pool_real; ++pi) {
+            if (st.is_new[pi] == st.generation) {
+                reps[out++] = pi;
+            }
+        }
+    }
+    GGML_ASSERT(out == st.n_new);
+    for (; out < st.n_new_g; ++out) {
+        reps[out] = st.n_pool_real + out - st.n_new;
+    }
 }
 
 // fork: a KV-only helper graph reads no historic pool maps, visibility masks or tails. Fill only the new pool
@@ -1107,6 +1202,8 @@ void llama_memory_hybrid_idx_context::set_input_kpool_store(ggml_tensor * new_po
         }
         nrep[i_new] = pad_cell;
     }
+
+    compact_pool_inputs(nullptr, new_pool_rep);
 
     if (validate) {
         const char * names[] = { "new_pool_idxs", "new_pool_rep", "new_pool_pos" };
@@ -1454,4 +1551,5 @@ void llama_memory_hybrid_idx_context::set_input_kpool_impl(ggml_tensor * pool_ce
             }
         }
     }
+    compact_pool_inputs(pool_cells, new_pool_rep);
 }

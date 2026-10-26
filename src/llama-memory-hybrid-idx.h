@@ -81,6 +81,9 @@ public:
 
     llama_kv_cache * get_mem_idx() const;   // nullptr when the model carries no indexer
 
+    bool has_compact_pool() const { return compact_pool; }
+    ggml_tensor * get_pool_storage(int32_t il) const;
+
     // The model's indexer pool size.
     uint32_t get_kpool() const { return hparams_idx.indexer_kpool; }
 
@@ -115,6 +118,11 @@ private:
     // seq_id < 0 drops the whole context, as the caches themselves do on a failed restore
     void state_drop(llama_seq_id seq_id);
 
+    // fork: raw rows remain available for arbitrary sequence edits and rollback.
+    bool compact_pool = false;
+    std::vector<ggml_tensor *> pool_storage;
+    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> pool_buffers;
+
     // the indexer cache holds one key head per layer, so it needs its own hparams:
     // llama_kv_cache keeps a reference to what it is given
     llama_hparams hparams_idx;
@@ -140,12 +148,12 @@ public:
         ggml_tensor * gather_key_gate(ggml_tensor * idxs) const;
         ggml_tensor * scatter_pooled(ggml_tensor * values, ggml_tensor * idxs) const;
         ggml_tensor * gather_pooled(ggml_tensor * idxs) const;
-        int64_t get_n_cells() const { return key_gate->ne[1]; }
+        int64_t get_n_cells() const { return pooled->ne[1]; }
 
     private:
         friend class llama_memory_hybrid_idx_context;
 
-        kpool_access(ggml_context * ctx, ggml_tensor * k, int64_t n_embd);
+        kpool_access(ggml_context * ctx, ggml_tensor * k, int64_t n_embd, ggml_tensor * compact = nullptr);
 
         ggml_context * ctx;
         ggml_tensor  * key_gate;
@@ -194,6 +202,7 @@ public:
 
     // nullptr with no indexer
     const llama_kv_cache_context * get_idx() const;
+    bool has_compact_pool() const { return mem && mem->has_compact_pool(); }
 
     // streams in the current slot info, the `ns` of get_k/get_v; 1 if unified
     uint32_t get_n_stream() const;
@@ -214,6 +223,8 @@ public:
                                const llama_ubatch * ubatch, ggml_tensor * new_pool_pos) const;
 
 private:
+    void compact_pool_inputs(ggml_tensor * pool_cells, ggml_tensor * new_pool_rep) const;
+
     void set_input_kpool_impl(ggml_tensor * pool_cells, ggml_tensor * pool_idxs, ggml_tensor * pool_mask, ggml_tensor * tail_idxs,
                              ggml_tensor * sel_mask, ggml_tensor * new_pool_idxs, ggml_tensor * new_pool_rep,
                              const llama_ubatch * ubatch, ggml_tensor * new_pool_pos, bool incremental) const;
