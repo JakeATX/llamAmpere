@@ -163,6 +163,7 @@ struct model_geometry {
     uint32_t kpool = 0;
     uint32_t indexer_top_k = 131072;
     uint32_t indexer_head_dim = 0;
+    std::vector<uint32_t> rope_sections = {64, 64, 64, 64};
 };
 
 static llama_model * make_model(bool no_alloc = false, const model_geometry & g = {}, llm_arch arch = LLM_ARCH_QWEN35, ggml_backend_dev_t device = nullptr) {
@@ -181,7 +182,7 @@ static llama_model * make_model(bool no_alloc = false, const model_geometry & g 
     ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH, g.head_dim);
     ms.add_kv(LLM_KV_ROPE_DIMENSION_COUNT, g.rope_dim);
     ms.add_kv(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, 1e-5f);
-    ms.add_kv(LLM_KV_ROPE_DIMENSION_SECTIONS, std::vector<uint32_t>({64, 64, 64, 64}));
+    ms.add_kv(LLM_KV_ROPE_DIMENSION_SECTIONS, g.rope_sections);
     ms.add_kv(LLM_KV_FULL_ATTENTION_INTERVAL, g.attention_interval);
     ms.add_kv(LLM_KV_SSM_CONV_KERNEL, uint32_t(4));
     ms.add_kv(LLM_KV_SSM_INNER_SIZE, g.ssm_inner);
@@ -769,6 +770,7 @@ static void run_qwen4exp_indexer_layout(bool cuda) {
     model_geometry geometry;
     geometry.indexer_head_dim = 128;
     geometry.rope_dim = 64;
+    geometry.rope_sections = {11, 11, 10, 0};
     geometry.kpool = 4;
     geometry.indexer_top_k = 8;
     llama_model_ptr model(make_model(false, geometry, LLM_ARCH_QWEN4EXP, device));
