@@ -2315,7 +2315,66 @@ size_t quantize_q1_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, 
     return nrow * row_size;
 }
 
+// Opt-in Q2_0 scale search (GGML_Q2_0_SEARCH=1). Same block format and kernels as the default encoder.
+// The default sets d = absmax, so the +2 level is never used and the importance matrix is ignored.
+// The search picks, per 64-weight block, the scale with the lowest importance-weighted squared error:
+// both signs of d (a negative d mirrors the grid to {+1,0,-1,-2}), 33 trial scales over [0.3, 1.0] x absmax,
+// two least-squares rescale passes per trial, then codes are recomputed against the stored fp16 scale.
+static void quantize_block_q2_0_search(const float * GGML_RESTRICT x, const float * GGML_RESTRICT w, block_q2_0 * GGML_RESTRICT y) {
+    const int qk = QK2_0;
+    float amax = 0.0f;
+    for (int j = 0; j < qk; ++j) { const float a = fabsf(x[j]); if (a > amax) amax = a; }
+    float best_e = INFINITY, best_d = 0.0f;
+    for (int s = 0; s < 2 && amax > 0.0f; ++s) {
+        const float sign = s == 0 ? 1.0f : -1.0f;
+        for (int t = 0; t < 33; ++t) {
+            float d = sign * amax * (0.3f + 0.7f * (float)t / 32.0f);
+            int q[QK2_0];
+            for (int it = 0; it < 3; ++it) {
+                const float id = d != 0.0f ? 1.0f / d : 0.0f;
+                for (int j = 0; j < qk; ++j) {
+                    int v = (int)nearbyintf(x[j] * id);
+                    q[j] = v < -1 ? -1 : (v > 2 ? 2 : v);
+                }
+                if (it == 2) break;
+                double num = 0.0, den = 0.0;
+                for (int j = 0; j < qk; ++j) { const float wj = w ? w[j] : 1.0f; num += wj * x[j] * q[j]; den += wj * q[j] * q[j]; }
+                if (den > 0.0) d = (float)(num / den);
+            }
+            double e = 0.0;
+            for (int j = 0; j < qk; ++j) { const float wj = w ? w[j] : 1.0f; const float r = q[j] * d - x[j]; e += wj * r * r; }
+            if (e < best_e) { best_e = (float)e; best_d = d; }
+        }
+    }
+    y->d = GGML_FP32_TO_FP16(best_d);
+    const float d = GGML_FP16_TO_FP32(y->d);
+    const float id = d != 0.0f ? 1.0f / d : 0.0f;
+    memset(y->qs, 0, sizeof(y->qs));
+    for (int j = 0; j < qk; ++j) {
+        int v = (int)nearbyintf(x[j] * id);
+        v = v < -1 ? -1 : (v > 2 ? 2 : v);
+        y->qs[j / 4] |= (uint8_t)((v + 1) << ((j % 4) * 2));
+    }
+}
+
+static int q2_0_search_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) { const char * e = getenv("GGML_Q2_0_SEARCH"); cached = (e && atoi(e) != 0) ? 1 : 0; }
+    return cached;
+}
+
 size_t quantize_q2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    if (q2_0_search_enabled()) {
+        GGML_ASSERT(n_per_row % QK2_0 == 0);
+        block_q2_0 * y = (block_q2_0 *)dst;
+        const int64_t nb = n_per_row / QK2_0;
+        for (int64_t row = 0; row < nrow; ++row) {
+            for (int64_t i = 0; i < nb; ++i) {
+                quantize_block_q2_0_search(src + row*n_per_row + i*QK2_0, quant_weights ? quant_weights + i*QK2_0 : NULL, y + row*nb + i);
+            }
+        }
+        return nrow * ggml_row_size(GGML_TYPE_Q2_0, n_per_row);
+    }
     if (!quant_weights) {
         quantize_row_q2_0_ref(src, dst, (int64_t)nrow*n_per_row);
         return nrow * ggml_row_size(GGML_TYPE_Q2_0, n_per_row);
