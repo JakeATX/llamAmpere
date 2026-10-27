@@ -5734,19 +5734,23 @@ static int moe_cache_warm(void * opaque, const ggml_moe_cache_tensor_desc * tens
     }
     int64_t global_flag = 0;
     const bool whole_only = moe_cache_whole_only();
-    if (loading && (whole_only || (moe_cache_env_i64("GGML_MOE_CACHE_PROFILE_GLOBAL", 0, 1, global_flag) && global_flag == 1))) {
+    if (whole_only || (loading && moe_cache_env_i64("GGML_MOE_CACHE_PROFILE_GLOBAL", 0, 1, global_flag) && global_flag == 1)) {
         std::lock_guard<std::mutex> lock(session->mu);
-        session->profile_global_tensors.clear();
-        session->profile_global_tensors.reserve(n_tensors);
-        for (int i = 0; i < n_tensors; ++i) {
-            moe_cache_profile_global_tensor tensor;
-            tensor.name = tensors[i].name;
-            tensor.data = tensors[i].data;
-            tensor.expert_size = ggml_row_size((ggml_type)tensors[i].type, tensors[i].n_in) * (size_t)tensors[i].n_out;
-            tensor.host_stride = tensors[i].expert_size;
-            tensor.wtype = tensors[i].type;
-            tensor.counts.assign(counts[i], counts[i] + tensors[i].n_expert);
-            session->profile_global_tensors.push_back(std::move(tensor));
+        // A first live-count warm has no saved profile to load. Plan complete bundles
+        // from its descriptors too, but preserve an already loaded profile's ranks.
+        if (loading || session->profile_global_tensors.empty()) {
+            session->profile_global_tensors.clear();
+            session->profile_global_tensors.reserve(n_tensors);
+            for (int i = 0; i < n_tensors; ++i) {
+                moe_cache_profile_global_tensor tensor;
+                tensor.name = tensors[i].name;
+                tensor.data = tensors[i].data;
+                tensor.expert_size = ggml_row_size((ggml_type)tensors[i].type, tensors[i].n_in) * (size_t)tensors[i].n_out;
+                tensor.host_stride = tensors[i].expert_size;
+                tensor.wtype = tensors[i].type;
+                tensor.counts.assign(counts[i], counts[i] + tensors[i].n_expert);
+                session->profile_global_tensors.push_back(std::move(tensor));
+            }
         }
     }
     const auto start = std::chrono::steady_clock::now();
