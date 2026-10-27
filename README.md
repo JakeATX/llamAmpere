@@ -6,8 +6,9 @@
   its replacement, so more drafted tokens survive and draft depth 6 pays off. The output leans slightly toward the
   model's most likely tokens (0.009 KL per token at depth 6 on Swift 1.5); `--no-spec-mb-mtp` gives exact sampling.
 - **Faster prompt reading on Swift 1.5 27B** (+5.3% at 100K) from a new GDN-layer kernel, same output.
-- **AI+ model files** (our 4-bit weight format for Ampere and newer) run in v0.6; a Swift 1.5 AI+ file is coming to
-  Hugging Face.
+- **AI+ model files** (our 4-bit weight format for Ampere and newer) run in v0.6. Swift 1.5 27B AI+ 4.2 bpw:
+  [jakeatx/ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M-GGUF](https://huggingface.co/jakeatx/ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M-GGUF)
+  (file `ATX-Swift-1.5-Qwen3.8-27B-Uncensored-AIplus-4.2bpw.gguf`).
 - **Qwen3.8 Flash-Next:** expert cache on the card with the rest of the experts in RAM, a fast whole-prompt read, and
   `--kv-gpu-tokens N` to keep only part of the KV cache on the card. Launch command and numbers: coming soon in the
   release notes.
@@ -15,7 +16,7 @@
 - Swift 1.5 v0.6 vs v0.5 speed table and gates: [release notes](docs/llamampere-v0.6/RELEASE_NOTES.md).
 
 **Build and run (v0.6, one RTX 3090 / 3090 Ti, 262,144-token context).** Needs Linux, an NVIDIA card with 24 GB, the
-CUDA toolkit (tested with 12.4), CMake, git and a C++ compiler. The model download is 15.6 GB.
+CUDA toolkit (tested with 12.4), CMake, git and a C++ compiler. The model download is 14.2 GB.
 
 ```bash
 git clone -b v0.6 https://github.com/JakeATX/llamAmpere.git
@@ -25,12 +26,12 @@ cmake -S . -B build-sm86 -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_
 cmake --build build-sm86 -j8 --target llama-server
 ./build-sm86/bin/llama-server \
   --hf-repo jakeatx/ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M-GGUF \
-  --hf-file ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M.gguf -c 262144 \
+  --hf-file ATX-Swift-1.5-Qwen3.8-27B-Uncensored-AIplus-4.2bpw.gguf -c 262144 \
   -ngl 99 -fa on -ctk sjkvarn4 -ctv sjkvarn4 -b 4096 -ub 1024 --parallel 1 \
   --spec-type draft-mtp --spec-draft-n-max 6 --spec-draft-p-min 0
 ```
 
-The server listens on http://127.0.0.1:8080 (OpenAI-compatible API). Add `--no-spec-mb-mtp` for exact drafting.
+`ATX-Swift-1.5-Qwen3.8-27B-Uncensored-AIplus-4.2bpw.gguf` is the Swift 1.5 27B AI+ file (4.16 bits per weight, 14.2 GB download; needs v0.6 or newer). To use the IQ4_XS-M file instead (15.6 GB), change `--hf-file` to `ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M.gguf`. The server listens on http://127.0.0.1:8080 (OpenAI-compatible API). Add `--no-spec-mb-mtp` for exact drafting.
 
 ---
 

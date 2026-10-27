@@ -27,7 +27,7 @@ answer, temperature 1.0, writing speed in tokens per second. G = 0.4 coding + 0.
 ## Run it (Swift 1.5 27B, one RTX 3090 / 3090 Ti, 262,144-token context)
 
 Needs Linux, an NVIDIA card with 24 GB, the CUDA toolkit (tested with 12.4), CMake, git and a C++ compiler. The model
-download is 15.6 GB.
+download is 14.2 GB.
 
 ```bash
 git clone -b v0.6 https://github.com/JakeATX/llamAmpere.git
@@ -37,10 +37,12 @@ cmake -S . -B build-sm86 -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_
 cmake --build build-sm86 -j8 --target llama-server
 ./build-sm86/bin/llama-server \
   --hf-repo jakeatx/ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M-GGUF \
-  --hf-file ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M.gguf -c 262144 \
+  --hf-file ATX-Swift-1.5-Qwen3.8-27B-Uncensored-AIplus-4.2bpw.gguf -c 262144 \
   -ngl 99 -fa on -ctk sjkvarn4 -ctv sjkvarn4 -b 4096 -ub 1024 --parallel 1 \
   --spec-type draft-mtp --spec-draft-n-max 6 --spec-draft-p-min 0
 ```
+
+`ATX-Swift-1.5-Qwen3.8-27B-Uncensored-AIplus-4.2bpw.gguf` is the Swift 1.5 27B AI+ file (4.16 bits per weight, 14.2 GB download; needs v0.6 or newer). To use the IQ4_XS-M file instead (15.6 GB), change `--hf-file` to `ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M.gguf`.
 
 The server listens on http://127.0.0.1:8080 (OpenAI-compatible API). The drafter uses the built-in 65,536-token
 vocabulary shortlist. For exact (lossless) drafting add `--no-spec-mb-mtp`. The v0.5 commands in the README still work.
@@ -68,7 +70,10 @@ per second (+5.3%, two back-to-back pairs) with the same written text.
 ### AI+ model files
 
 AI+ is our weight format for Ampere and newer cards (4-bit, also 2- and 3-bit rates), with its own decode kernels.
-v0.6 can run AI+ files. A Swift 1.5 AI+ 4-bit file will be posted on Hugging Face; the README will link it.
+v0.6 can run AI+ files. Swift 1.5 27B in AI+ (4.16 bits per weight, 14.2 GB) is on Hugging Face as
+`ATX-Swift-1.5-Qwen3.8-27B-Uncensored-AIplus-4.2bpw.gguf` in
+[jakeatx/ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M-GGUF](https://huggingface.co/jakeatx/ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M-GGUF).
+Older llamAmpere versions and mainline llama.cpp cannot load AI+ files.
 
 ### Qwen3.8 Flash-Next
 
