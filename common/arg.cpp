@@ -2907,16 +2907,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_SJKVARN_FLUSH_CHUNK"));
     add_opt(common_arg(
-        {"--kv-resident"}, "N",
-        "QSA layers with SJ-KVaRN: keep N KV cells on device and sealed body blocks in pinned RAM; "
-        "0 = disabled, default: 32768",
+        {"--kv-gpu-tokens"}, "N",
+        "QSA layers with SJ-KVaRN: number of KV cells kept in GPU memory; older cells are sealed into pinned RAM and "
+        "fetched on demand; 0 = keep every cell on the GPU (default: 32768)",
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("resident KV cell count must be nonnegative");
             }
-            params.kv_resident = (uint32_t) value;
+            params.kv_gpu_tokens = (uint32_t) value;
         }
-    ).set_env("LLAMA_ARG_KV_RESIDENT"));
+    ).set_env("LLAMA_ARG_KV_GPU_TOKENS"));
     add_opt(common_arg(
         {"--sjkvarn-transform"}, "FILE|URL",
         "SJ-KVaRN cache: per-layer, per-KV-head K/V transform file (SJWU format, calibrated for one model) applied in place "

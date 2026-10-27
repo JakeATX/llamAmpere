@@ -494,14 +494,14 @@ void llama_moe_arena_apply_flashnext_defaults() {
         { "LLAMA_QSA_POOL_RANGE",                 "1" },
         { "LLAMA_QSA_SEL_DIRECT",                 "1" },
         { "LLAMA_PREFETCH_THREADS",               "8" },
-        // verify-step matrix kernels (STRATAGAP/AIFAST trio, 100K, split on in both arms: +6.3% words/s, every task
+        // verify-step matrix kernels (MOEGAP/AIFAST trio, 100K, split on in both arms: +6.3% words/s, every task
         // faster at 3 and 4 words). KQ_TC: valid math (tensor-core sums), K-quants only, IQ3_S stays opt-in by name.
         // FROWS: valid math (router rows kernel).
         // KQ_ROWS is exact but has no in-model number (never ran at width 5), so it stays opt-in.
         { "GGML_CUDA_KQ_TC",                      "q4_K,q5_K,q6_K" },
         { "GGML_CUDA_KQ_TC_WARPS",                "4" },
         { "GGML_CUDA_FROWS",                      "1" },
-        // CPU expert split (fork STRATAGAP, gated 2026-10-23: 97.5 tok/s plain vs 97.4 recipe, no loops, probe < 75 us).
+        // CPU expert split (fork MOEGAP, gated 2026-10-23: 97.5 tok/s plain vs 97.4 recipe, no loops, probe < 75 us).
         // Host threads compute the experts that are not on the card instead of copying their weights over PCIe. The
         // text differs run to run with the split on (CPU and card kernels round differently): valid math, not exact.
         // Set here, not in the kernel code, so only Flash-Next models get it; --no-moe-cpu-split or =0 turns it off.

@@ -1429,7 +1429,7 @@ struct ggml_backend_bookkeep_timer {
 // Env: GGML_SCHED_XSTREAM=1 enables; _MIB ring size (default: the largest two consecutive layers); _MIN_TOKENS (1024);
 // _CHUNK_MIB staging chunk (16); _STAGES staging chunks (4); _THREADS memcpy threads (4); _WILLNEED readahead distance
 // in weights (0 = off); _DEBUG=1 prints counters when the scheduler is freed.
-// [FNSTRATA] _PIN_MIB=N copies up to N MiB of the streamed host weights, once, when the first ring is placed, into
+// [FNPORT] _PIN_MIB=N copies up to N MiB of the streamed host weights, once, when the first ring is placed, into
 // page-locked anonymous memory (transparent huge pages where the kernel allows, locked with the device's host-register
 // call; the mapped model file itself cannot be locked read-only on every driver), and points those weight tensors at the
 // copies. Those weights then go to the ring in one direct copy each, with no staging memcpy, and stay resident; CPU ops

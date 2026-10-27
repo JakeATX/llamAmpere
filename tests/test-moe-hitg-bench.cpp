@@ -1,4 +1,4 @@
-// fork STRATAGAP: kernel-only timing of the fused hit gate/up/SwiGLU pass (GGML_MOE_HIT_FUSED) for every shape of
+// fork MOEGAP: kernel-only timing of the fused hit gate/up/SwiGLU pass (GGML_MOE_HIT_FUSED) for every shape of
 // GGML_MOE_HIT_FUSED_SHAPE, on Flash-Next expert sizes (2560 x 640, 10 experts per token), so shapes can be
 // compared in seconds instead of 100K-token runs. Run only through the card queue.
 //

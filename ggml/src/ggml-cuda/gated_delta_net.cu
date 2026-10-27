@@ -494,15 +494,20 @@ gated_delta_net_cuda_ilp(const float * q,
     }
 }
 
-// [FNSTRATA] GGML_CUDA_GDN_R16=1 (opt-in; S_v 128, f32/bf16/f16 state, final state or K snapshot slots): the same math as the kernels
-// above in a layout with far fewer warp shuffles. Above, a column sum is a per-lane partial over 4 rows (rows r*32 + lane,
-// r = 0..3, in order) followed by a butterfly over the 32 lanes at offsets 16, 8, 4, 2, 1. Here one thread holds the rows
-// of the four lanes j, j+8, j+16, j+24 (rows j + 8n, n = 0..15) of C columns, adds the offset-16 and offset-8 pairs in
-// registers and shuffles only at offsets 4, 2, 1, inside its 8-lane group; one shuffle serves the 4 groups of a warp.
-// IEEE addition is commutative, so every partial, every pair and every total is the same float, bit for bit. k and q of a
-// token are staged in shared memory one token ahead, permuted so that a thread reads its 16 rows with four 128-bit loads.
-// GGML_CUDA_GDN_R16=2 also runs the default kernel into scratch buffers and counts differing output and state words
-// (synchronizes; testing only). GGML_CUDA_GDN_R16_COLS (2 or 4, default 2) and _WARPS (1, 2 or 4 per block, default 2).
+// [FNPORT] GGML_CUDA_GDN_R16=1 (opt-in; S_v 128, f32/bf16/f16 state, final state or K snapshot slots): same math as the
+// kernels above, laid out to need fewer warp shuffles.
+// The kernels above sum a state column in two steps: each lane adds its 4 rows (rows r*32 + lane, r = 0..3, in that order),
+// then a 5-level xor butterfly (16, 8, 4, 2, 1) combines the 32 lane totals.
+// This kernel changes who owns which rows. A thread loads the rows of four of those lanes (j, j+8, j+16, j+24), i.e.
+// rows j + 8n for n = 0..15, for C columns. The two xor-16 and xor-8 butterfly levels then combine registers of the
+// same thread, so only the xor-4, xor-2 and xor-1 levels stay as shuffles, and they run inside groups of 8 lanes; a
+// single shuffle instruction serves the 4 groups of the warp at once.
+// Every float that appears is the same as before, bit for bit, because each add combines the same two operands and
+// IEEE addition does not depend on operand order. q and k of the next token are staged in shared memory ahead of time
+// in a permuted order, so each thread fetches its 16 rows with four 128-bit loads.
+// GGML_CUDA_GDN_R16=2 additionally runs the default kernel into scratch buffers and counts the output and state words
+// that differ (it synchronizes; testing only). GGML_CUDA_GDN_R16_COLS (2 or 4, default 2) and GGML_CUDA_GDN_R16_WARPS
+// (1, 2 or 4 per block, default 2) set the shape.
 template <int C, int NW, bool keep_rs_t, typename state_t>
 __global__ void __launch_bounds__(32*NW)
 gated_delta_net_cuda_r16(const float * q,
@@ -1240,17 +1245,17 @@ static bool launch_gated_delta_net_r16(
 }
 
 // [#199] key-head-shared token-serial recurrence (multi-token prefill). On by default in v0.6; GGML_CUDA_GDN_KHSHARE=0 turns it off.
-// The R = H / neqk1 value heads h = kh + i*neqk1 (i < R) read the same q/k (key head kh, see iq1 in
-// the kernels above). One thread keeps a quarter of one state column for all R of those heads, so
-// every q/k value it reads is used R times, and a column is reduced by 4 lanes (2 shuffles) instead
-// of 32 (5 shuffles). q/k/v/g/beta for KHS_TT tokens at a time are staged in shared memory with
-// cp.async, double-buffered, so there are 2 block barriers per KHS_TT tokens.
+// The R = H / neqk1 value heads h = kh + i*neqk1 (i < R) of one key head kh read identical q and k (see iq1 in the
+// kernels above). Here one thread owns a quarter of a state column for all R of those heads, so each q/k value it
+// loads is used R times, and a column is reduced across 4 lanes (2 shuffles) instead of 32 lanes (5 shuffles).
+// q, k, v, g and beta for KHS_TT tokens are staged in shared memory with cp.async into two alternating buffers, which
+// costs 2 block barriers per KHS_TT tokens.
 //
-// Bit-identical to gated_delta_net_cuda / gated_delta_net_cuda_ilp: those keep column rows
-// l + 32r in lane l. Here lane j (0..3) of a column holds the rows of the original lanes
-// l = j + 4m (m < 8), i.e. rows j + 4m + 32r. Each per-l partial is the same fma chain over r, the
-// xor-16/8/4 butterfly levels of warp_reduce_sum pair l with l^16, l^8, l^4 = m^4, m^2, m^1 and are
-// folded in registers with the same pairing, and the last two levels (xor 2, xor 1) are shuffles.
+// The results are bit-identical to gated_delta_net_cuda and gated_delta_net_cuda_ilp. Those put the rows l + 32r of a
+// column on lane l. This kernel gives lane j (0..3) the rows of the original lanes l = j + 4m (m < 8), which are rows
+// j + 4m + 32r. Per original lane l the partial is still the same fma chain over r. The xor-16, xor-8 and xor-4 levels
+// of warp_reduce_sum join l with l^16, l^8 and l^4, i.e. m with m^4, m^2 and m^1, so they are replayed in registers in
+// that pairing, and only the xor-2 and xor-1 levels remain as shuffles.
 #define KHS_TT  8                 // tokens per staged tile
 #define KHS_PAD 36                // floats per j block of a staged q/k vector (32 + 4: conflict-free LDS.128)
 #define KHS_VEC (4 * KHS_PAD)     // floats per staged q or k vector

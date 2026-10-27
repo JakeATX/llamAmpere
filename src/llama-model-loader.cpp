@@ -917,7 +917,7 @@ llama_model_loader::llama_model_loader(
         }
         for (const auto & role : roles) { supported = supported && role.second == 3; }
         const size_t available = llama_moe_arena::available_memory();
-        // Owner floor is 7 GiB, the same line Strata ran under at home.
+        // Owner floor is 7 GiB.
         const size_t reserve = 7ull << 30;
         // Keep host placement and defaults when pinning is unsafe. The existing mmap
         // loader can supply the unchanged experts as reclaimable, unpinned file pages.

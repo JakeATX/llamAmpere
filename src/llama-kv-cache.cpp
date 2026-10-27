@@ -933,11 +933,11 @@ llama_kv_cache::llama_kv_cache(
                 ggml_backend_dev_type(model.dev_layer(il)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
                 if (n_stream != 1 || D != 256 || layer_new.sj_kvarn_bits_k != 4 || layer_new.sj_kvarn_bits_v != 4 ||
                     layer_new.sj_kvarn_body_type != GGML_TYPE_F32) {
-                    throw std::runtime_error("--kv-resident requires single-stream scalar SJ-KVaRN 4/4 with 256-channel QSA heads");
+                    throw std::runtime_error("--kv-gpu-tokens requires single-stream scalar SJ-KVaRN 4/4 with 256-channel QSA heads");
                 }
                 const uint32_t exact_cells = sj_kvarn.sink + std::max(sj_kvarn.tail, sj_kvarn.tail_max);
                 if (sj_kvarn.resident_cells < exact_cells + sj_kvarn.group) {
-                    throw std::runtime_error(format("--kv-resident must be at least %u cells for this sink and tail", exact_cells + sj_kvarn.group));
+                    throw std::runtime_error(format("--kv-gpu-tokens must be at least %u cells for this sink and tail", exact_cells + sj_kvarn.group));
                 }
                 auto * dev = model.dev_layer(il);
                 using resident_type_fn = ggml_backend_buffer_type_t (*)(ggml_backend_dev_t, size_t, uint32_t);
@@ -953,7 +953,7 @@ llama_kv_cache::llama_kv_cache(
                 }
                 auto * resident_buft = get_type ? get_type(dev, rb*hparams.n_head_kv(il), resident_groups) : nullptr;
                 if (!resident_buft) {
-                    throw std::runtime_error("--kv-resident requires the CUDA QSA resident backend");
+                    throw std::runtime_error("--kv-gpu-tokens requires the CUDA QSA resident backend");
                 }
                 body_ctx = ctx_for_buft(resident_buft);
                 const size_t groups_card = std::min(resident_groups, sj_kvarn_n_groups);
