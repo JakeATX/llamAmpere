@@ -4065,7 +4065,7 @@ static bool run_profile_persistence(ggml_backend_t gpu, ggml_backend_t cpu, log_
         const char * old_whole = getenv("GGML_MOE_CACHE_WHOLE_ONLY");
         const bool had_whole = old_whole != nullptr;
         const std::string saved_whole = old_whole ? old_whole : "";
-        constexpr int64_t n_in = 1024, n_out = 32, n_expert = 128;
+        constexpr int64_t n_in = 1024, n_out = 16, n_expert = 256;
         const ggml_type types[] = {GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0};
         const char * names[] = {"blk.5.ffn_gate_exps.weight", "blk.5.ffn_up_exps.weight", "blk.5.ffn_down_exps.weight"};
         std::vector<uint8_t> storage[3];
@@ -4115,6 +4115,55 @@ static bool run_profile_persistence(ggml_backend_t gpu, ggml_backend_t cpu, log_
             transition_ok &= log.find("whole-only warm refused:") == std::string::npos;
         }
         if (reader) { api.session_destroy(reader); }
+#ifdef GGML_CUDA
+        // A compute allocation made during the prompt loan is outside the cache
+        // grant. Rebuild must use physical headroom, without starving a late pool.
+        const char * old_reserve = getenv("GGML_CUDA_MOE_CACHE_RESERVE_MB");
+        const bool had_reserve = old_reserve != nullptr;
+        const std::string saved_reserve = old_reserve ? old_reserve : "";
+        size_t free_bytes = 0, total_bytes = 0;
+        transition_ok &= cudaMemGetInfo(&free_bytes, &total_bytes) == cudaSuccess;
+        transition_ok &= free_bytes > (64u << 20);
+        const std::string reserve = std::to_string(free_bytes > (64u << 20) ? (free_bytes >> 20) - 48 : 0);
+        set_env("GGML_CUDA_MOE_CACHE_RESERVE_MB", reserve.c_str());
+        reader = create_direct_session(gpu, cpu);
+        bool pressure_ok = reader != nullptr;
+        ggml_backend_buffer_t scratch = nullptr;
+        if (reader) {
+            capture.clear();
+            pressure_ok &= api.warm(reader, whole_desc, nullptr, 3) > 0;
+            pressure_ok &= api.trim(reader, 1u << 20) >= 1u << 20;
+            scratch = ggml_backend_alloc_buffer(gpu, 41u << 20);
+            pressure_ok &= scratch != nullptr;
+            if (scratch) {
+                api.restore(reader);
+                pressure_ok &= api.warm(reader, whole_desc, whole_counts, 3) >= 0;
+                api.session_enter(reader);
+                for (int32_t e = 0; e < 64; ++e) {
+                    for (const auto & desc : whole_desc) {
+                        pressure_ok &= direct_plan_one(desc.name, desc.data, desc.expert_size,
+                                n_in, n_out, desc.type, n_expert, e) == 1;
+                    }
+                }
+                api.session_leave(reader);
+            }
+            api.session_destroy(reader);
+        }
+        if (scratch) { ggml_backend_buffer_free(scratch); }
+        const std::string pressure_log = capture.get();
+        const std::string physical_prefix = "whole-only physical plan: budget=";
+        const auto physical_at = pressure_log.rfind(physical_prefix);
+        pressure_ok &= physical_at != std::string::npos;
+        if (physical_at != std::string::npos) {
+            pressure_ok &= strtoull(pressure_log.c_str() + physical_at + physical_prefix.size(), nullptr, 10) < (8u << 20);
+        }
+        pressure_ok &= pressure_log.find("whole-only plan refused:") == std::string::npos;
+        pressure_ok &= pressure_log.find("whole-only warm refused:") == std::string::npos;
+        printf("cache-profile-whole-pressure: %s\n", pressure_ok ? "OK" : "FAIL");
+        if (!pressure_ok) { fprintf(stderr, "%s", pressure_log.c_str()); }
+        transition_ok &= pressure_ok;
+        set_env("GGML_CUDA_MOE_CACHE_RESERVE_MB", had_reserve ? saved_reserve.c_str() : nullptr);
+#endif
         printf("cache-profile-whole-return: %s\n", transition_ok ? "OK" : "FAIL");
         if (!transition_ok) { fprintf(stderr, "%s", capture.get().c_str()); }
         ok &= transition_ok;

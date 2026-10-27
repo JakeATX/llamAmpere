@@ -2698,9 +2698,39 @@ static bool moe_cache_build_global_profile(moe_cache_session & session, moe_cach
             }
         }
     }
+    if (whole_only) {
+        // A logical grant can outlive allocations made by the prompt/drafter.
+        // Query after releasing old slabs; never count their payload twice.
+        budget = std::min(budget, moe_cache_allocation_headroom(device, "whole profile rebuild", budget));
+        if (!ggml_cuda_moe_cache_profile_plan(items, caps, budget, moe_cache_pool_slots_min,
+                plan, density, (size_t)ranked_limit)) {
+            MOE_CACHE_LOG("[moe-cache] CUDA%d whole-only plan refused: live headroom cannot hold the minimum complete plan\n", device.physical);
+            return true;
+        }
+        // Establish every pool's minimum before optional growth. Actual CUDA
+        // slab rounding must not let earlier pools starve the final type.
+        for (size_t p = 0; p < pending.size(); ++p) {
+            if (resize) {
+                if (!moe_cache_resize_pool(device, *device.pools[pending[p]->pool], moe_cache_pool_slots_min)) { return true; }
+            } else {
+                moe_cache_allocate_pool(session, device, *pending[p], moe_cache_pool_slots_min * pending[p]->expert_size);
+            }
+            const int pool = pending[p]->pool;
+            if (pool < 0 || device.pools[pool]->n_slots < moe_cache_pool_slots_min) {
+                MOE_CACHE_LOG("[moe-cache] CUDA%d whole-only plan refused: live allocation cannot hold every pool minimum\n", device.physical);
+                return true;
+            }
+        }
+        const size_t room = moe_cache_allocation_headroom(device, "whole profile growth", budget);
+        budget = std::min(budget, device.allocated_bytes + room);
+        if (!ggml_cuda_moe_cache_profile_plan(items, caps, budget, moe_cache_pool_slots_min,
+                plan, density, (size_t)ranked_limit)) { return true; }
+        MOE_CACHE_LOG("[moe-cache] CUDA%d whole-only physical plan: budget=%zu minimum_pool_bytes=%zu bundles=%zu\n",
+                device.physical, budget, device.allocated_bytes, plan.bundles);
+    }
     for (size_t p = 0; p < pending.size(); ++p) {
         const size_t requested = plan.slots[p] * pending[p]->expert_size;
-        if (resize) {
+        if (resize || whole_only) {
             auto & pool = *device.pools[pending[p]->pool];
             if ((size_t)pool.n_slots < plan.slots[p]) {
                 const size_t current = (size_t)pool.n_slots * pool.expert_size;
