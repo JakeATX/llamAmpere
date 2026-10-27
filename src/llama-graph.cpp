@@ -2575,6 +2575,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
 
+    // warmup routes every expert (n_expert_used == n_expert): too many for the bank's filler slots, so it
+    // runs on the cold bank alone, which holds every expert
+    if (moe_hot.hot_map != nullptr && moe_hot.down->ne[2] < 2*n_expert_used) {
+        moe_hot = {};
+    }
     if (moe_hot.hot_map != nullptr) {
         // split the selected experts between the hot bank and the cold bank; each bank runs on all
         // n_expert_used columns with the weights of the other bank's experts set to zero
@@ -2598,7 +2603,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // get distinct filler slots that the token does not use: one-hot the token's hot slots over the
         // bank, then take the n_expert_used least-used bank slots (argsort puts the used ones last)
         const int64_t n_hot = hot.down->ne[2];
-        GGML_ASSERT(n_hot >= 2*n_expert_used && "hot expert bank needs at least 2*n_expert_used experts"); // enough unused slots for any token
         ggml_tensor * bank_pos = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, ggml_arange(ctx0, 0.0f, (float) n_hot, 1.0f), n_hot, 1, 1),
                 n_hot, n_expert_used, n_tokens, 1);
         ggml_tensor * onehot = ggml_step(ctx0, ggml_scale_bias(ctx0, ggml_abs(ctx0, ggml_sub(ctx0, bank_pos, slot)), -1.0f, 0.5f)); // [n_hot, n_expert_used, n_tokens]
