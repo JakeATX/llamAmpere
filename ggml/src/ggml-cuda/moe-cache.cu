@@ -6506,6 +6506,87 @@ static size_t moe_cache_mem_available() {
 #endif
 }
 
+#if defined(__linux__)
+// Hosts without a cgroup v2 hierarchy (Docker on cgroup v1, older distributions) used to fail the headroom check and
+// silently lose the device route tables. v1: the memory controller's limit minus its usage, with the kernel's
+// "no limit" value (a huge number) meaning unlimited. No limit anywhere: nothing to charge against, like bare metal
+// (the caller still checks MemAvailable and the RAM floor).
+static bool moe_cache_cgroup_v1_headroom(size_t extra, size_t registered, uint64_t * peak_current) {
+    std::string path;
+    FILE * f = fopen("/proc/self/cgroup", "r");
+    char line[4096];
+    while (f && fgets(line, sizeof(line), f)) {
+        // "<id>:<controllers>:<path>", the memory controller is listed among the comma-separated controllers
+        const char * c1 = strchr(line, ':');
+        const char * c2 = c1 ? strchr(c1 + 1, ':') : nullptr;
+        if (!c2) {
+            continue;
+        }
+        const std::string controllers(c1 + 1, c2);
+        const std::string list = "," + controllers + ",";
+        if (list.find(",memory,") != std::string::npos) {
+            path = c2 + 1;
+            if (!path.empty() && path.back() == '\n') {
+                path.pop_back();
+            }
+            break;
+        }
+    }
+    if (f) {
+        fclose(f);
+    }
+    auto read = [](const std::string & file, uint64_t & value) {
+        FILE * input = fopen(file.c_str(), "r");
+        char text[64] = {};
+        const bool ok = input && fgets(text, sizeof(text), input);
+        if (input) {
+            fclose(input);
+        }
+        if (!ok) {
+            return false;
+        }
+        char * end = nullptr;
+        errno = 0;
+        value = strtoull(text, &end, 10);
+        return errno == 0 && end != text;
+    };
+    // a container usually sees its own group as the controller root; try the reported path, then the mount itself
+    const std::string roots[2] = { "/sys/fs/cgroup/memory" + path, "/sys/fs/cgroup/memory" };
+    for (const auto & root : roots) {
+        uint64_t limit = 0, usage = 0;
+        if (!read(root + "/memory.limit_in_bytes", limit) || !read(root + "/memory.usage_in_bytes", usage)) {
+            continue;
+        }
+        if (limit >= (1ull << 60)) {
+            break; // unlimited
+        }
+        uint64_t file = 0, inactive = 0, shmem = 0, dirty = 0, writeback = 0;
+        if (FILE * stat = fopen((root + "/memory.stat").c_str(), "r")) {
+            char name[128];
+            unsigned long long value;
+            while (fscanf(stat, "%127s %llu", name, &value) == 2) {
+                if (strcmp(name, "total_cache") == 0) { file = value; }
+                else if (strcmp(name, "total_inactive_file") == 0) { inactive = value; }
+                else if (strcmp(name, "total_shmem") == 0) { shmem = value; }
+                else if (strcmp(name, "total_dirty") == 0) { dirty = value; }
+                else if (strcmp(name, "total_writeback") == 0) { writeback = value; }
+            }
+            fclose(stat);
+        }
+        const uint64_t credit = ggml_cuda_moe_cache_host_file_credit(file, inactive, shmem, dirty, writeback, registered);
+        const uint64_t charged = usage - std::min(usage, credit);
+        if (peak_current) {
+            *peak_current = std::max(*peak_current, usage);
+        }
+        MOE_CACHE_LOG("[moe-cache] host service budget source: cgroup v1 limit minus usage (usage=%llu limit=%llu clean_file_credit=%llu extra=%zu path=%s)\n",
+                (unsigned long long) usage, (unsigned long long) limit, (unsigned long long) credit, extra, root.c_str());
+        return charged <= limit && extra <= limit - charged;
+    }
+    MOE_CACHE_LOG("[moe-cache] host service budget source: no cgroup memory limit, MemAvailable only (extra=%zu)\n", extra);
+    return true;
+}
+#endif
+
 static bool moe_cache_cgroup_headroom(size_t extra, size_t registered = 0, uint64_t * peak_current = nullptr) {
 #if defined(__linux__)
     FILE * f = fopen("/proc/self/cgroup", "r");
@@ -6524,7 +6605,7 @@ static bool moe_cache_cgroup_headroom(size_t extra, size_t registered = 0, uint6
         fclose(f);
     }
     if (path.empty()) {
-        return false;
+        return moe_cache_cgroup_v1_headroom(extra, registered, peak_current);
     }
     auto read = [&](const char * name, uint64_t & value) {
         FILE * input = fopen((path + name).c_str(), "r");
