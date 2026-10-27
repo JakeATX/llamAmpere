@@ -2986,9 +2986,6 @@ bool llama_context::copy_embeddings_nextn(float * dst, int32_t first, int32_t co
         } else {
             memcpy(dst, src, bytes);
         }
-        if (perf) {
-            perf->copy_bytes.fetch_add(bytes, std::memory_order_relaxed);
-        }
     }
     return true;
 }
