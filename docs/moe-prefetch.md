@@ -58,3 +58,7 @@ fused device dispatch.
 2,080 fixed int32 token IDs and `FN_GOLDEN_LOGITS` to an output path. It
 writes 32 full-vocabulary logit rows and checks an exact saved-state round
 trip. Model and full-protocol performance acceptance are separate gates.
+
+## Run-to-run variation with expert offload
+
+When some experts run on the CPU and others on the GPU, the two do the same math but round slightly differently, because they add numbers in a different order and at different precision. Which experts are on the GPU at a given moment depends on what the expert cache holds, and that depends on earlier requests and on the timing of background swaps. As a result, the same prompt and seed can produce slightly different text from one run to the next. The output is still correct, and this is normal for expert offload in any mixture-of-experts engine. If you need bit-for-bit repeatability, keep every expert on the GPU or every expert on the CPU.

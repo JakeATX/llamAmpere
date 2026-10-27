@@ -11,6 +11,8 @@ read-only at eval time: entries are never evicted or changed.
 At temperature 0 the output is the same, byte for byte, as without the cache: the stored state ends exactly where a
 normal prefill of that prompt would pause between two batches, and the server continues from there the same way.
 
+Exception: if the model runs with experts split between the CPU and GPU (expert offload or `--moe-cache`), which experts sit on the GPU can change from run to run, and the CPU and GPU round slightly differently, so even temperature 0 text can differ between runs, with or without the cache. See "Run-to-run variation with expert offload" in `../../docs/backend/MOE-CACHE.md`.
+
 ## Recipe
 
 1. Write your prompts as JSONL, one request per line, exactly as your eval sends them. Anything that changes the

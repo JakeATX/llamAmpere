@@ -318,3 +318,7 @@ An `off` versus `on` comparison without `--repack off` includes the intended rep
 - Unloading a dynamic backend while a scheduler or cache session created by it is still alive is unsupported. Destroy those objects before unloading the backend module.
 - Generic operation offload can bypass the cache if `GGML_OP_OFFLOAD_MIN_BATCH` is set low enough to offload decode nodes.
 - Performance depends strongly on model shape, quantization, CPU memory bandwidth, PCIe link, CUDA device, spare VRAM, and routing locality.
+
+## Run-to-run variation with expert offload
+
+When some experts run on the CPU and others on the GPU, the two do the same math but round slightly differently, because they add numbers in a different order and at different precision. Which experts are on the GPU at a given moment depends on what the expert cache holds, and that depends on earlier requests and on the timing of background swaps. As a result, the same prompt and seed can produce slightly different text from one run to the next. The output is still correct, and this is normal for expert offload in any mixture-of-experts engine. If you need bit-for-bit repeatability, keep every expert on the GPU or every expert on the CPU.

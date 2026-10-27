@@ -35,6 +35,7 @@ saved prompt loads the saved state from disk and only reads the rest. Loading is
 
 - **Same output.** At temperature 0 the text is byte-for-byte the same as without the cache. The saved state ends
   exactly where a normal prefill would pause between two batches, and the server continues from there in the same way.
+  Exception: if the model runs with experts split between the CPU and GPU (expert offload or `--moe-cache`), which experts sit on the GPU can change from run to run, and the CPU and GPU round slightly differently, so even temperature 0 text can differ between runs, with or without the cache. See "Run-to-run variation with expert offload" in `docs/backend/MOE-CACHE.md`.
 - **Shared documents are stored once.** When several prompts ask different questions about the same long document,
   the tool stores the document once. Each prompt then reads only its own question.
 - **Longest match.** The server picks the longest saved prompt that the request starts with.
