@@ -36,16 +36,6 @@
 
 struct common_sampler;
 
-// Diagnostic intervals overlap: fused_topk_us is inside prepare_us. Disabled
-// unless LLAMA_BOOKKEEP_TIMING is set; neither counter changes sampler state.
-struct common_sampler_prep_perf {
-    uint64_t prepare_calls = 0;
-    int64_t prepare_us = 0;
-    uint64_t fused_topk_calls = 0;
-    int64_t fused_topk_us = 0;
-};
-common_sampler_prep_perf common_sampler_get_prep_perf(const struct common_sampler * gsmpl);
-
 // llama_sampler API overloads
 
 // note: can mutate params in some cases
@@ -175,9 +165,6 @@ struct common_sampler_pq_result {
 common_sampler_pq_result common_sampler_verify_pq(const llama_token_data_array & p, const std::vector<llama_token_data> & q,
         llama_token draft, llama_token target, std::mt19937 & rng, bool beat, common_sampler_pq_stats & stats,
         const llama_vocab * vocab = nullptr, const std::function<bool(llama_token)> & is_stop = {});
-
-// Log only tokens actually processed by the server, including the stop token. No work when logging is disabled.
-void common_sampler_pq_commit(common_sampler * gsmpl, int32_t seq, int64_t at, llama_token token, bool eog = false);
 
 // true when the chain samples on the CPU at temperature > 0 without grammar, reasoning budget or mirostat
 bool common_sampler_pq_supported(const struct common_sampler * gsmpl);

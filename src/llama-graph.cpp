@@ -1611,41 +1611,9 @@ void llm_graph_result::reset() {
     gf = ggml_new_graph_custom(ctx_compute.get(), max_nodes, false);
 }
 
-// [RTPORT] LLAMA_INPUT_TIMING=1 (diagnostic, default off): host time of each graph input's set_input, summed by
-// input type and graph size, printed every 512 calls per graph size class.
 void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
-    static const bool timing = [] { const char * v = getenv("LLAMA_INPUT_TIMING"); return v && atoi(v) != 0; }();
-    if (!timing) {
-        for (auto & input : inputs) {
-            input->set_input(ubatch);
-        }
-        return;
-    }
-    struct acc { std::map<std::string, std::pair<double, uint64_t>> by; uint64_t calls = 0; };
-    static std::mutex mu;
-    static std::map<uint32_t, acc> stats;  // keyed by ubatch rows (1 = helper step, 2-8 = check)
-    std::vector<std::pair<std::string, double>> local;
     for (auto & input : inputs) {
-        const int64_t t0 = ggml_time_us();
         input->set_input(ubatch);
-        local.emplace_back(typeid(*input).name(), (double) (ggml_time_us() - t0));
-    }
-    std::lock_guard<std::mutex> lock(mu);
-    const uint32_t key = (ubatch ? ubatch->n_tokens : 0) * 1000u + (uint32_t) inputs.size();
-    acc & a = stats[key];
-    for (auto & [name, us] : local) {
-        auto & e = a.by[name];
-        e.first += us; e.second++;
-    }
-    if (++a.calls % 512 == 0) {
-        std::string line;
-        for (auto & [name, e] : a.by) {
-            char buf[256];
-            snprintf(buf, sizeof(buf), " %s %.1f", name.c_str(), e.first / a.calls);
-            line += buf;
-        }
-        LLAMA_LOG_INFO("input timing (LLAMA_INPUT_TIMING) rows %u inputs %u, %llu calls, us/call:%s\n",
-                       key / 1000u, key % 1000u, (unsigned long long) a.calls, line.c_str());
     }
 }
 

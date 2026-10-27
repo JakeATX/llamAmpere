@@ -3121,11 +3121,6 @@ static void mul_mat_vec_q_switch_ncols_dst(
                 nsamples_x == 1 && nsamples_dst == 1 &&
                 !fusion.gate && !fusion.x_bias && !fusion.gate_bias && !fusion.x_scale && !fusion.gate_scale &&
                 !fusion.shared_up && !fusion.shared_gate && !fusion.shared_dst) {
-            const char * audit = getenv("GGML_CUDA_MTP_Q5_HEAD_AUDIT");
-            if (audit && strcmp(audit, "1") == 0) {
-                GGML_LOG_INFO("mtp_q5_head_dispatch rows=%d k=%d cols=%d stride=%d\n",
-                        nrows_x, ncols_x, ncols_dst, stride_row_x);
-            }
             const dim3 blocks(((uint32_t) nrows_x + 3) / 4);
             const dim3 threads(warp_size, 4);
             const ggml_cuda_kernel_launch_params launch(blocks, threads, 0, stream);
@@ -3765,11 +3760,6 @@ void ggml_cuda_mul_mat_vec_q(
             ggml_cuda_info().devices[ctx.device].cc == 860) {
         const char * env = getenv("GGML_CUDA_MTP_Q5_BATCH_HEAD");
         if (env && strcmp(env, "1") == 0) {
-            const char * audit = getenv("GGML_CUDA_MTP_Q5_BATCH_HEAD_AUDIT");
-            if (audit && strcmp(audit, "1") == 0) {
-                GGML_LOG_INFO("mtp_q5_batch_head_dispatch rows=%lld k=%lld cols=%lld name=%s\n",
-                        (long long) ne01, (long long) ne00, (long long) ne11, dst->name);
-            }
             if (ne11 == 3) {
                 mul_mat_vec_q5_K_batch_head_launch<3>(src0->data, (const block_q8_1 *) src1_q8_1, dst_d, ne01, stream);
             } else {
@@ -4472,7 +4462,7 @@ bool ggml_cuda_moe_table_mmv_hitg_supported(ggml_type type, int64_t n_in, int64_
 }
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-// shape index as GGML_MOE_HIT_FUSED_SHAPE's name list (0 = default 4x2); shared by the op and the bench below
+// shape index as GGML_MOE_HIT_FUSED_SHAPE's name list (0 = default 4x2); used by the op below
 static void moe_hitg_dispatch(int shape, const void * const * up_table, const void * const * gate_table, ggml_type type,
         const char * act_q8, const int32_t * ids, float * dst, int64_t n_in, int64_t n_out, int64_t n_ids,
         int64_t n_tokens, int64_t channels, int64_t ids_stride, const uint8_t * m0, const uint8_t * m1, int want,
@@ -4515,115 +4505,6 @@ static void moe_hitg_dispatch(int shape, const void * const * up_table, const vo
 
 #endif
 
-// [MOEGAP HITGBENCH] Kernel-only timing of the fused hit pass for tests/test-moe-hitg-bench (not used by the
-// server). Flash-Next shape: K = 2560, 640 rows, 10 experts per token. n_pool experts are drawn from per token (the
-// union is what one launch reads), n_sets copies of the weights are cycled so each launch reads cold memory as a
-// decode layer does. Weights and activations are random with small scales. Returns the mean us per launch and the MB
-// one launch reads; *same = 1 when this shape's output has the bits of shape 0.
-extern "C" bool ggml_cuda_moe_hitg_bench(int type_i, int n_tokens, int n_pool, int n_sets, int reps, int shape,
-        unsigned seed, double * us, double * mb, int * n_union, int * same) {
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-    const ggml_type type = (ggml_type) type_i;
-    const int64_t n_in = 2560, n_out = 640, n_ids = 10;
-    if (!ggml_cuda_moe_table_mmv_hitg_supported(type, n_in, n_out, n_ids, n_tokens, 1, n_ids) || n_pool < n_ids ||
-            n_pool > 512 || n_sets < 1 || reps < 1) {
-        return false;
-    }
-    const size_t mat = (size_t) n_out * ggml_row_size(type, n_in);
-    const size_t blk = ggml_type_size(type);
-    uint64_t st = seed*2654435761ull + 12345;
-    auto rnd = [&st]() { st = st*6364136223846793005ull + 1442695040888963407ull; return (uint32_t) (st >> 33); };
-    std::vector<uint8_t> h(mat);
-    std::vector<char *> w((size_t) n_sets*n_pool*2);
-    for (auto & p : w) {
-        CUDA_CHECK(cudaMalloc((void **) &p, mat));
-        for (size_t b = 0; b < mat; ++b) { h[b] = (uint8_t) rnd(); }
-        for (size_t b = 0; b + blk <= mat; b += blk) {   // every IQ block starts with its f16 scale d
-            const ggml_half d = __float2half(0.002f + 0.002f*(rnd() % 8)/8.0f);
-            memcpy(&h[b], &d, sizeof(d));
-        }
-        CUDA_CHECK(cudaMemcpy(p, h.data(), mat, cudaMemcpyHostToDevice));
-    }
-    std::vector<const void *> tab((size_t) n_sets*2*512, nullptr);
-    for (int s_ = 0; s_ < n_sets; ++s_) {
-        for (int e = 0; e < n_pool; ++e) {
-            tab[((size_t) s_*2 + 0)*512 + e] = w[((size_t) s_*n_pool + e)*2 + 0];
-            tab[((size_t) s_*2 + 1)*512 + e] = w[((size_t) s_*n_pool + e)*2 + 1];
-        }
-    }
-    const void ** d_tab;
-    CUDA_CHECK(cudaMalloc((void **) &d_tab, tab.size()*sizeof(void *)));
-    CUDA_CHECK(cudaMemcpy(d_tab, tab.data(), tab.size()*sizeof(void *), cudaMemcpyHostToDevice));
-    const int s11 = (int) (n_in / QK8_1);
-    std::vector<block_q8_1> y((size_t) n_tokens*s11);
-    for (auto & b : y) {
-        for (int j = 0; j < QK8_1; ++j) { b.qs[j] = (int8_t) (rnd() % 255 - 127); }
-        b.ds = make_half2(__float2half(0.02f), __float2half(0.0f));
-    }
-    std::vector<int32_t> ids((size_t) n_tokens*n_ids);
-    std::vector<int> used(n_pool, 0);
-    for (int t = 0; t < n_tokens; ++t) {
-        for (int k = 0; k < n_ids; ++k) {
-            int e;
-            bool dup;
-            do {
-                e = (int) (rnd() % n_pool);
-                dup = false;
-                for (int j = 0; j < k; ++j) { dup = dup || ids[t*n_ids + j] == e; }
-            } while (dup);
-            ids[t*n_ids + k] = e;
-            used[e] = 1;
-        }
-    }
-    *n_union = 0;
-    for (int e = 0; e < n_pool; ++e) { *n_union += used[e]; }
-    *mb = 2.0 * mat * *n_union / 1e6;
-    block_q8_1 * d_y; int32_t * d_ids; uint8_t * d_m; float * d_dst; float * d_ref;
-    const size_t n_dst = (size_t) n_tokens*n_ids*n_out;
-    CUDA_CHECK(cudaMalloc((void **) &d_y, y.size()*sizeof(block_q8_1)));
-    CUDA_CHECK(cudaMalloc((void **) &d_ids, ids.size()*sizeof(int32_t)));
-    CUDA_CHECK(cudaMalloc((void **) &d_m, 512));
-    CUDA_CHECK(cudaMalloc((void **) &d_dst, n_dst*sizeof(float)));
-    CUDA_CHECK(cudaMalloc((void **) &d_ref, n_dst*sizeof(float)));
-    CUDA_CHECK(cudaMemcpy(d_y, y.data(), y.size()*sizeof(block_q8_1), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_ids, ids.data(), ids.size()*sizeof(int32_t), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemset(d_m, 1, 512));
-    cudaStream_t stream;
-    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-    auto run = [&](int sh, int set, float * out) {
-        moe_hitg_dispatch(sh, d_tab + (size_t) set*2*512 + 0, d_tab + (size_t) set*2*512 + 512, type,
-                (const char *) d_y, d_ids, out, n_in, n_out, n_ids, n_tokens, 1, n_ids, d_m, d_m, 1, stream);
-    };
-    CUDA_CHECK(cudaMemsetAsync(d_ref, 0, n_dst*sizeof(float), stream));
-    CUDA_CHECK(cudaMemsetAsync(d_dst, 0, n_dst*sizeof(float), stream));
-    run(0, 0, d_ref);
-    run(shape, 0, d_dst);
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    std::vector<float> a(n_dst), b(n_dst);
-    CUDA_CHECK(cudaMemcpy(a.data(), d_ref, n_dst*sizeof(float), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(b.data(), d_dst, n_dst*sizeof(float), cudaMemcpyDeviceToHost));
-    *same = memcmp(a.data(), b.data(), n_dst*sizeof(float)) == 0;
-    for (int i = 0; i < 3*n_sets; ++i) { run(shape, i % n_sets, d_dst); }
-    cudaEvent_t e0, e1;
-    CUDA_CHECK(cudaEventCreate(&e0));
-    CUDA_CHECK(cudaEventCreate(&e1));
-    CUDA_CHECK(cudaEventRecord(e0, stream));
-    for (int i = 0; i < reps; ++i) { run(shape, i % n_sets, d_dst); }
-    CUDA_CHECK(cudaEventRecord(e1, stream));
-    CUDA_CHECK(cudaEventSynchronize(e1));
-    float ms = 0.0f;
-    CUDA_CHECK(cudaEventElapsedTime(&ms, e0, e1));
-    *us = 1000.0 * ms / reps;
-    cudaEventDestroy(e0); cudaEventDestroy(e1); cudaStreamDestroy(stream);
-    cudaFree(d_y); cudaFree(d_ids); cudaFree(d_m); cudaFree(d_dst); cudaFree(d_ref); cudaFree(d_tab);
-    for (auto p : w) { cudaFree(p); }
-    return true;
-#else
-    GGML_UNUSED_VARS(type_i, n_tokens, n_pool, n_sets, reps, shape, seed, us, mb, n_union, same);
-    return false;
-#endif
-}
-
 void ggml_cuda_moe_table_mmv_hitg(ggml_backend_cuda_context & ctx,
         const void * const * up_table, const void * const * gate_table, ggml_type type, const char * act_q8,
         const int32_t * ids, float * dst, int64_t n_in, int64_t n_out, int64_t n_ids, int64_t n_tokens,
@@ -4642,7 +4523,7 @@ void ggml_cuda_moe_table_mmv_hitg(ggml_backend_cuda_context & ctx,
         }
         return e && strcmp(e, "auto") == 0 ? -1 : 0;
     }();
-    // "auto": the fastest shape per weight type and width in test-moe-hitg-bench (Taichi 3090, 2026-10-23T08:00Z):
+    // "auto": the fastest shape per weight type and width (RTX 3090):
     // sw16x1g4 everywhere except IQ3_S at 3 or fewer words, where 4x2s is. Every shape has the same bits.
     const int use = shape >= 0 ? shape : (type == GGML_TYPE_IQ3_S && n_tokens <= 3) ? 4 : 12;
     cudaStream_t stream = ctx.stream();

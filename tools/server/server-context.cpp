@@ -90,33 +90,6 @@ static bool server_mtp_gpu_verify_sampled_enabled() {
     return gpu_verify != nullptr && std::strcmp(gpu_verify, "1") == 0;
 }
 
-// fork: no confidence work or file access unless the path is nonempty.
-static const char * spec_conflog_path() {
-    static const char * path = std::getenv("LLAMA_SPEC_CONFLOG");
-    return path != nullptr && path[0] != '\0' ? path : nullptr;
-}
-
-static float spec_conflog_row_p1(llama_context * ctx, int32_t idx) {
-    const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
-    // Backend verification can omit raw logits. Never scan its short candidate buffer.
-    if (llama_get_sampled_token_ith(ctx, idx) != LLAMA_TOKEN_NULL) {
-        return NAN;
-    }
-    const float * row = llama_get_logits_ith(ctx, idx);
-    if (row == nullptr || n_vocab <= 0) {
-        return NAN;
-    }
-    const float m = *std::max_element(row, row + n_vocab);
-    if (!std::isfinite(m)) {
-        return NAN;
-    }
-    double sum = 0.0;
-    for (int32_t i = 0; i < n_vocab; ++i) {
-        sum += std::exp((double) row[i] - (double) m);
-    }
-    return sum > 0.0 && std::isfinite(sum) ? (float) (1.0 / sum) : NAN;
-}
-
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
             (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED && params.pooling_type != LLAMA_POOLING_TYPE_NONE)) {
@@ -685,51 +658,6 @@ struct spec_adapt_ctrl {
     }
 };
 
-// [#47] LLAMA_HOST_PHASES=1: the wall time of every update_slots pass split into host phases, process-wide (a
-// single-slot measurement tool; with several slots the passes are shared). outside = between passes (task queue,
-// HTTP), prep = slot checks and draft parameters, draft = the draft call (split further by
-// common_speculative_host_phases), ckpt = speculative checkpoints, batch = batch assembly up to llama_decode,
-// verify = llama_decode + sync, sample = the verify sampler call (sampling over the target logits + accept logic),
-// post = the rest of the pass (sampling of non-speculative slots, prompt bookkeeping, token output). Printed and
-// reset with the slot timings.
-struct server_host_phase_clock {
-    // [POSTFIX] POST is split further: POST_PRE (verify end -> catch-up: metrics, in-call checkpoints), CATCHUP (the
-    // helper catch-up call), POST_MID (catch-up end -> verify sampling), ACCEPT_KV (accept bookkeeping + KV trim),
-    // OUTPUT (token output), POST (the rest of the pass). The printed post is their sum.
-    enum phase { OUTSIDE, PREP, DRAFT, CKPT, BATCH, VERIFY, SAMPLE, POST_PRE, CATCHUP, POST_MID, ACCEPT_KV, OUTPUT, POST, N_PHASE };
-
-    const bool on = common_speculative_host_phases_enabled();
-    int64_t    t_last = 0;
-    uint64_t   us[N_PHASE] = {};
-    uint64_t   mx[N_PHASE] = {};  // [POSTFIX] longest single charge, to tell one-off pass costs from per-round ones
-    uint64_t   n_pass = 0;
-
-    // charge the time since the previous mark to phase p
-    void mark(phase p) {
-        if (!on) {
-            return;
-        }
-        const int64_t t = ggml_time_us();
-        if (t_last > 0) {
-            us[p] += (uint64_t) (t - t_last);
-            mx[p] = std::max(mx[p], (uint64_t) (t - t_last));
-        }
-        t_last = t;
-    }
-
-    void reset() {
-        for (auto & u : us) {
-            u = 0;
-        }
-        for (auto & m : mx) {
-            m = 0;
-        }
-        n_pass = 0;
-    }
-};
-
-static server_host_phase_clock g_host_phases;
-
 static bool server_bookkeep_enabled() {
     static const bool on = [] {
         const char * e = getenv("LLAMA_BOOKKEEP_SERVER");
@@ -737,132 +665,6 @@ static bool server_bookkeep_enabled() {
     }();
     return on;
 }
-
-struct server_bookkeep_clock {
-    enum phase { OUTSIDE, PREP, PROMPT, DRAFT, CKPT, BATCH, VERIFY, CATCHUP, CATCHUP_QUEUE, POST, CLONE, SAMPLE, ACCEPT, KV, OUTPUT, N_PHASE };
-    using times = std::array<uint64_t, N_PHASE>;
-    using context_times = std::array<std::array<uint64_t, 24>, 2>;
-
-    static bool enabled() {
-        static const bool on = [] {
-            const char * e = getenv("LLAMA_BOOKKEEP_TIMING");
-            return e && atoi(e) != 0;
-        }();
-        return on;
-    }
-
-    int64_t last = 0;
-    times pending = {};
-    std::vector<times> by_width;
-    std::array<const llama_context *, 2> contexts = {};
-    context_times cursor = {}, pending_context = {};
-    std::vector<context_times> by_width_context;
-    uint64_t checkpoint_saves = 0, checkpoint_loads = 0;
-
-    void checkpoint(bool save) {
-        if (enabled() && last != 0) {
-            (save ? checkpoint_saves : checkpoint_loads) += 1;
-        }
-    }
-
-    context_times context_snapshot() const {
-        context_times result = {};
-        for (size_t c = 0; c < contexts.size(); ++c) {
-            const auto p = llama_perf_bookkeep_context(contexts[c]);
-            result[c] = { p.sync_calls, p.sync_host_us, p.copy_calls, p.copy_bytes,
-                          p.copy_host_us, p.release_calls, p.release_host_us,
-                          p.memory_init_layout_host_us, p.graph_prepare_host_us,
-                          p.set_inputs_host_us, p.peer_sync_host_us, p.graph_submit_host_us,
-                          p.graph_rebuild_calls, p.graph_reuse_calls };
-            for (size_t i = 0; i < 10; ++i) { result[c][14 + i] = p.backend_submit[i]; }
-        }
-        return result;
-    }
-
-    void mark(phase p, int64_t now = 0) {
-        if (!enabled() || last == 0) {
-            return;
-        }
-        if (now == 0) {
-            now = ggml_time_us();
-        }
-        pending[p] += now - last;
-        last = now;
-        const auto next = context_snapshot();
-        if (p != DRAFT && p != VERIFY) {
-            for (size_t c = 0; c < cursor.size(); ++c) {
-                for (size_t i = 0; i < cursor[c].size(); ++i) {
-                    pending_context[c][i] += next[c][i] - cursor[c][i];
-                }
-            }
-        }
-        cursor = next;
-    }
-
-    void start(int64_t now) {
-        if (enabled()) {
-            last = now;
-            pending = {};
-            cursor = context_snapshot();
-            pending_context = {};
-        }
-    }
-
-    void finish(size_t width, int64_t now) {
-        if (!enabled()) {
-            return;
-        }
-        if (last != 0) {
-            mark(ACCEPT, now);
-            if (by_width.size() <= width) {
-                by_width.resize(width + 1);
-                by_width_context.resize(width + 1);
-            }
-            for (int p = 0; p < N_PHASE; ++p) {
-                by_width[width][p] += pending[p];
-            }
-            for (size_t c = 0; c < cursor.size(); ++c) {
-                for (size_t i = 0; i < cursor[c].size(); ++i) {
-                    by_width_context[width][c][i] += pending_context[c][i];
-                }
-            }
-        }
-        start(now);
-    }
-
-    std::string summary(size_t width, uint64_t rounds, int64_t other_us) const {
-        static const char * names[] = { "outside", "prep", "prompt_copy", "draft", "draft_trim_ckpt", "batch", "verify", "catchup", "catchup_queue", "post", "sampler_clone", "sample", "accept", "prompt_kv", "output" };
-        std::string result;
-        int64_t measured = 0;
-        for (int p = 0; p < N_PHASE; ++p) {
-            if (p == DRAFT || p == VERIFY) {
-                continue;
-            }
-            measured += by_width[width][p];
-            result += string_format("%s%s %.4f", result.empty() ? "" : ", ", names[p], by_width[width][p] / (1000.0 * rounds));
-        }
-        result += string_format(", remainder %.4f", (other_us - measured) / (1000.0 * rounds));
-        return result;
-    }
-
-    std::string context_summary(size_t width, size_t c, uint64_t rounds) const {
-        const auto & p = by_width_context[width][c];
-        return string_format("sync %.3f calls/round %.4f ms/round, nextn_copy %.3f calls/round %.0f bytes/round %.4f ms/round, reclaim %.3f calls/round %.4f ms/round",
-                p[0] / double(rounds), p[1] / (1000.0 * rounds), p[2] / double(rounds),
-                p[3] / double(rounds), p[4] / (1000.0 * rounds), p[5] / double(rounds), p[6] / (1000.0 * rounds));
-    }
-
-    std::string context_detail_summary(size_t width, size_t c, uint64_t rounds) const {
-        const auto & p = by_width_context[width][c];
-        return string_format("memory_init_layout %.4f ms/round, graph_prepare %.4f ms/round, set_inputs %.4f ms/round, peer_sync %.4f ms/round, graph_submit %.4f ms/round, graph_rebuild %.3f calls/round, graph_reuse %.3f calls/round, backend_session %.4f ms/round, backend_transition %.4f ms/round, backend_input_copy %.4f ms/round, backend_user_input_sync_nested %.4f ms/round, backend_cpu_compute %.4f ms/round, backend_gpu_submit %.4f ms/round, backend_other_compute %.4f ms/round, backend_cpu_splits %.3f calls/round, backend_gpu_splits %.3f calls/round, backend_other_splits %.3f calls/round",
-                p[7] / (1000.0 * rounds), p[8] / (1000.0 * rounds), p[9] / (1000.0 * rounds),
-                p[10] / (1000.0 * rounds), p[11] / (1000.0 * rounds),
-                p[12] / double(rounds), p[13] / double(rounds),
-                p[14] / (1000.0 * rounds), p[15] / (1000.0 * rounds), p[16] / (1000.0 * rounds),
-                p[17] / (1000.0 * rounds), p[18] / (1000.0 * rounds), p[19] / (1000.0 * rounds), p[20] / (1000.0 * rounds),
-                p[21] / double(rounds), p[22] / double(rounds), p[23] / double(rounds));
-    }
-};
 
 struct server_slot {
     int id;
@@ -1095,7 +897,6 @@ struct server_slot {
     int64_t               spec_draft_us_pending = 0;
     std::vector<uint64_t> spec_draft_us_by_w;
     std::vector<uint64_t> spec_verify_us_by_w;
-    server_bookkeep_clock spec_clock;
     // rounds that ended in a checkpoint restore (partial acceptance the context cannot roll back in place):
     // their verify decode, the state load and the replay decode of the accepted tokens are not bucketed
     // above, they land in the next bucketed round's "other". Counted here so that cost stays visible.
@@ -1104,14 +905,6 @@ struct server_slot {
 
     std::vector<double> verify_budget_accept;
     spec_adapt_ctrl       spec_adapt; // BL6a controller (inactive unless LLAMA_SPEC_ADAPT_COST=1)
-
-    // fork: logging scratch only; no sampler, prompt-cache, or slot-state serialization.
-    std::vector<float> spec_conf_p1;
-    std::vector<float> spec_conf_p2;
-    int               spec_conf_depth = 0;
-    int64_t           spec_conf_start = 0;
-    llama_pos         spec_conf_pos = 0;
-    json              spec_conf_pending;
 
     std::function<void(int /* id_slot */)>   callback_on_release;
     std::function<void(const server_slot &)> callback_on_reset; // called before reset()
@@ -1142,13 +935,6 @@ struct server_slot {
             spec_draft_q.clear();
             spec_i_batch.clear();
             spec_ckpt.clear();
-            if (spec_conflog_path()) {
-                spec_conf_p1.clear();
-                spec_conf_p2.clear();
-                spec_conf_depth = 0;
-                spec_conf_start = 0;
-                spec_conf_pending = nullptr;
-            }
         }
         generated_tokens.clear();
         generated_token_probs.clear();
@@ -1168,7 +954,6 @@ struct server_slot {
         spec_draft_us_pending = 0;
         spec_draft_us_by_w.clear();
         spec_verify_us_by_w.clear();
-        spec_clock = {};
         spec_restore_rounds = 0;
         spec_restore_us = 0;
         spec_adapt = {};
@@ -1535,34 +1320,6 @@ struct server_slot {
                 }
                 SLT_INF(*this,
                         " round cost by draft width = (%s)\n", per_width.c_str());
-                for (size_t w = 0; w < spec_clock.by_width.size(); ++w) {
-                    if (w < spec_rounds_by_w.size() && spec_rounds_by_w[w] > 0) {
-                        const int64_t other = (int64_t) spec_round_us_by_w[w] - spec_draft_us_by_w[w] - spec_verify_us_by_w[w];
-                        SLT_INF(*this, " bookkeeping w%zu: %" PRIu64 " rounds, ms/round: %s\n", w, spec_rounds_by_w[w], spec_clock.summary(w, spec_rounds_by_w[w], other).c_str());
-                        for (size_t c = 0; c < spec_clock.contexts.size(); ++c) {
-                            SLT_INF(*this, " bookkeeping nested w%zu %s outside draft/verify: %s\n", w,
-                                    c == 0 ? "target" : "draft", spec_clock.context_summary(w, c, spec_rounds_by_w[w]).c_str());
-                            SLT_INF(*this, " bookkeeping nested detail w%zu %s outside draft/verify: %s\n", w,
-                                    c == 0 ? "target" : "draft", spec_clock.context_detail_summary(w, c, spec_rounds_by_w[w]).c_str());
-                        }
-                    }
-                }
-                if (server_bookkeep_clock::enabled()) {
-                    SLT_INF(*this, " bookkeeping generation checkpoint calls: saves %" PRIu64 ", loads %" PRIu64 "\n",
-                            spec_clock.checkpoint_saves, spec_clock.checkpoint_loads);
-                    uint64_t rounds = 0;
-                    for (uint64_t r : spec_rounds_by_w) {
-                        rounds += r;
-                    }
-                    for (const auto & p : llama_perf_sampler_children(common_sampler_get(smpl.get()))) {
-                        SLT_INF(*this, " sampler detail %s: %" PRIu64 " calls, %.3f ms total, %.4f ms/round\n", p.name, p.calls, p.time_us / 1000.0, p.time_us / (1000.0 * rounds));
-                    }
-                    const auto prep = common_sampler_get_prep_perf(smpl.get());
-                    SLT_INF(*this, " sampler detail candidate-prepare(inclusive): %" PRIu64 " calls, %.3f ms total, %.4f ms/round\n",
-                            prep.prepare_calls, prep.prepare_us / 1000.0, prep.prepare_us / (1000.0 * rounds));
-                    SLT_INF(*this, " sampler detail fused-topk-select(nested): %" PRIu64 " calls, %.3f ms total, %.4f ms/round\n",
-                            prep.fused_topk_calls, prep.fused_topk_us / 1000.0, prep.fused_topk_us / (1000.0 * rounds));
-                }
             }
             if (spec_restore_rounds > 0) {
                 SLT_INF(*this,
@@ -1572,37 +1329,6 @@ struct server_slot {
             if (spec_adapt.active()) {
                 SLT_INF(*this, " adaptive depth (BL6a) = %s\n", spec_adapt.summary().c_str());
             }
-            if (g_host_phases.on) {
-                // [#47] per verify round of this slot (single-slot runs), since the previous print
-                uint64_t rounds = 0;
-                for (uint64_t r : spec_rounds_by_w) {
-                    rounds += r;
-                }
-                const double r = rounds > 0 ? (double) rounds : 1.0;
-                const auto & u = g_host_phases.us;
-                using hp = server_host_phase_clock;
-                const common_speculative_host_phases dp = common_speculative_host_phases_take();
-                SLT_INF(*this,
-                        " host phases (LLAMA_HOST_PHASES) ms/round over %" PRIu64 " rounds, %" PRIu64 " passes: outside %.3f, prep %.3f, draft %.3f, ckpt %.3f, batch %.3f, verify %.3f, sample %.3f, post %.3f\n",
-                        rounds, g_host_phases.n_pass,
-                        u[hp::OUTSIDE] / 1000.0 / r, u[hp::PREP] / 1000.0 / r, u[hp::DRAFT] / 1000.0 / r, u[hp::CKPT] / 1000.0 / r,
-                        u[hp::BATCH] / 1000.0 / r, u[hp::VERIFY] / 1000.0 / r, u[hp::SAMPLE] / 1000.0 / r,
-                        (u[hp::POST_PRE] + u[hp::CATCHUP] + u[hp::POST_MID] + u[hp::ACCEPT_KV] + u[hp::OUTPUT] + u[hp::POST]) / 1000.0 / r);
-                SLT_INF(*this, " post split ms/round: verify-end->catch-up %.3f, catch-up %.3f, catch-up->sample %.3f, accept+kv %.3f, output %.3f, pass tail %.3f (longest single: catch-up %.3f, pass tail %.3f, verify %.3f ms)\n",
-                        u[hp::POST_PRE] / 1000.0 / r, u[hp::CATCHUP] / 1000.0 / r, u[hp::POST_MID] / 1000.0 / r,
-                        u[hp::ACCEPT_KV] / 1000.0 / r, u[hp::OUTPUT] / 1000.0 / r, u[hp::POST] / 1000.0 / r,
-                        g_host_phases.mx[hp::CATCHUP] / 1000.0, g_host_phases.mx[hp::POST] / 1000.0, g_host_phases.mx[hp::VERIFY] / 1000.0);
-                if (dp.n_calls > 0) {
-                    const double st = dp.n_steps > 0 ? (double) dp.n_steps : 1.0;
-                    SLT_INF(*this,
-                            " draft split: %" PRIu64 " calls, %.2f steps/call; ms/step: decode call %.3f, gpu wait %.3f, sample %.3f; rest %.3f ms/call\n",
-                            dp.n_calls, (double) dp.n_steps / (double) dp.n_calls,
-                            dp.decode_us / 1000.0 / st, dp.sync_us / 1000.0 / st, dp.sample_us / 1000.0 / st,
-                            dp.rest_us / 1000.0 / (double) dp.n_calls);
-                }
-                g_host_phases.reset();
-            }
-
             if (smpl) {
                 const auto & pq = common_sampler_get_pq_stats(smpl.get());
                 if (pq.n_pos > 0) {
@@ -1939,12 +1665,6 @@ private:
 
     bool sleeping = false;
 
-    // fork: append-only confidence log, serialized across slots.
-    FILE *     conflog_fp     = nullptr;
-    std::mutex conflog_mu;
-    bool       conflog_failed = false;
-    uint32_t   conflog_lines  = 0;
-
     int64_t t_last_load_progress_ms = 0;
 
     // stall detector (--slot-stall-timeout): the main loop records the progress of each busy slot around
@@ -2227,108 +1947,7 @@ private:
         prompt_cache->flush_to_disk();
     }
 
-    FILE * spec_conflog_open() {
-        const char * path = spec_conflog_path();
-        if (path == nullptr) {
-            return nullptr; // LLAMA_SPEC_CONFLOG_UNSET_NO_FILE
-        }
-        if (!conflog_fp && !conflog_failed) {
-            conflog_fp = std::fopen(path, "a");
-            if (!conflog_fp) {
-                conflog_failed = true;
-                SRV_ERR("LLAMA_SPEC_CONFLOG: failed to open '%s'\n", path);
-                return nullptr;
-            }
-            std::setvbuf(conflog_fp, nullptr, _IOFBF, 64 * 1024);
-            json header = {
-                {"event", "header"}, {"model", params_base.model.path},
-                {"n_max", params_base.speculative.draft.n_max},
-                {"n_min_adaptive", params_base.speculative.draft.n_min_adaptive},
-                {"spec_type", json::array()},
-            };
-            std::vector<std::string> types;
-            for (auto t : params_base.speculative.types) {
-                types.push_back(common_speculative_type_to_str(t));
-            }
-            header["spec_type"] = types;
-            spec_conflog_line(header);
-        }
-        return conflog_fp;
-    }
-
-    void spec_conflog_line(const json & record) {
-        const std::string line = record.dump() + "\n";
-        if (std::fwrite(line.data(), 1, line.size(), conflog_fp) != line.size() ||
-                (++conflog_lines % 64 == 0 && std::fflush(conflog_fp) != 0)) {
-            SRV_ERR("%s", "LLAMA_SPEC_CONFLOG: write failed\n");
-            conflog_failed = true;
-            std::fclose(conflog_fp);
-            conflog_fp = nullptr;
-        }
-    }
-
-    static json spec_conflog_farray(const std::vector<float> & src, size_t n) {
-        json a = json::array();
-        for (size_t i = 0; i < n; ++i) {
-            if (i < src.size() && std::isfinite(src[i])) {
-                a.push_back(src[i]);
-            } else {
-                a.push_back(nullptr);
-            }
-        }
-        return a;
-    }
-
-    void spec_conflog_capture(server_slot & slot, size_t n_draft, size_t n_accepted, int32_t off) {
-        std::vector<float> target_p1;
-        for (int32_t row : slot.spec_i_batch) {
-            target_p1.push_back(spec_conflog_row_p1(slot.ctx_tgt, row - off));
-        }
-        if (slot.spec_is_replay) {
-            if (!slot.spec_conf_pending.is_null()) {
-                slot.spec_conf_pending["committed_p1"] = spec_conflog_farray(target_p1, n_accepted + 1);
-            }
-            return;
-        }
-        slot.spec_conf_pending = {
-            {"slot", slot.id}, {"request", slot.task->id}, {"n_past", slot.spec_conf_pos},
-            {"depth", slot.spec_conf_depth > 0 ? slot.spec_conf_depth : (int) n_draft},
-            {"drafted", n_draft}, {"accepted", n_accepted},
-            {"draft_p1", spec_conflog_farray(slot.spec_conf_p1, n_draft)},
-            {"draft_p2", spec_conflog_farray(slot.spec_conf_p2, n_draft)},
-            {"target_p1", spec_conflog_farray(target_p1, target_p1.size())},
-            // request-matched (after the sampler chain) target top-1 of the committed rows: the free on-device feature
-            {"target_ps1", spec_conflog_farray(common_sampler_get_top1_trace(slot.smpl.get()),
-                                               common_sampler_get_top1_trace(slot.smpl.get()).size())},
-        };
-    }
-
-    void spec_conflog_write(server_slot & slot, size_t n_emitted) {
-        if (slot.spec_conf_pending.is_null()) {
-            return;
-        }
-        slot.spec_conf_pending["emitted"] = n_emitted;
-        slot.spec_conf_pending["t_round_ms"] = (ggml_time_us() - slot.spec_conf_start) / 1000.0;
-        std::lock_guard<std::mutex> lock(conflog_mu);
-        if (spec_conflog_open()) {
-            spec_conflog_line(slot.spec_conf_pending);
-        }
-        slot.spec_conf_pending = nullptr;
-    }
-
-    void spec_conflog_close() {
-        if (conflog_fp) {
-            std::lock_guard<std::mutex> lock(conflog_mu);
-            if (std::fclose(conflog_fp) != 0) {
-                SRV_ERR("%s", "LLAMA_SPEC_CONFLOG: close failed\n");
-            }
-            conflog_fp = nullptr;
-        }
-    }
-
     void destroy() {
-        spec_conflog_close();
-
         spec.reset();
         spec_init.reset();
 
@@ -3551,9 +3170,8 @@ private:
 
             llama_sampler * speculative_sampler = nullptr;
             bool speculative_sampled = false;
-            // Confidence logging needs the raw verify logits that backend sampling can omit.
             // Beat needs the target probabilities and the residual draw on the CPU.
-            if (slot.can_speculate() && !task.params.sampling.spec_lossy && server_mtp_gpu_verify_enabled() && !spec_conflog_path()) {
+            if (slot.can_speculate() && !task.params.sampling.spec_lossy && server_mtp_gpu_verify_enabled()) {
                 speculative_sampler = common_sampler_get_greedy_backend(slot.smpl.get(), model_tgt);
                 if (!speculative_sampler && server_mtp_gpu_verify_sampled_enabled()) {
                     speculative_sampler = common_sampler_get_backend_verify(slot.smpl.get());
@@ -5090,21 +4708,6 @@ private:
         if (ctx_dft) {
             llama_set_decode_phase(ctx_dft, LLAMA_DECODE_PHASE_AUTOMATIC);
         }
-        // [#47] the time since the previous pass ended is "outside"; whatever this pass does after its last mark is "post"
-        g_host_phases.mark(server_host_phase_clock::OUTSIDE);
-        for (auto & slot : slots) { slot.spec_clock.mark(server_bookkeep_clock::OUTSIDE); }
-        g_host_phases.n_pass += g_host_phases.on ? 1 : 0;
-        // once every slot is idle the wait for the next request is not a pass gap: drop it
-        struct host_phase_pass_end {
-            std::vector<server_slot> & slots;
-            ~host_phase_pass_end() {
-                for (auto & slot : slots) { slot.spec_clock.mark(server_bookkeep_clock::POST); }
-                g_host_phases.mark(server_host_phase_clock::POST);
-                if (std::none_of(slots.begin(), slots.end(), [](const server_slot & s) { return s.is_processing(); })) {
-                    g_host_phases.t_last = 0;
-                }
-            }
-        } host_phase_pass_end_ { slots };
 
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
@@ -5446,10 +5049,8 @@ private:
                         }
                         if (use_ckpt_dft) {
                             slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                            slot.spec_clock.checkpoint(true);
                         }
 
-                        slot.spec_clock.mark(server_bookkeep_clock::PREP);
                         // fork: pure text already has the contiguous prompt the drafter needs.
                         const llama_tokens * spec_prompt;
                         if (server_bookkeep_enabled() && !slot.prompt.tokens.has_mtmd) {
@@ -5458,7 +5059,6 @@ private:
                             slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
                             spec_prompt = &slot.spec_prompt;
                         }
-                        slot.spec_clock.mark(server_bookkeep_clock::PROMPT);
 
                         int n_draft_req = n_draft_max;
                         if (draft_budget[slot.id] < 0 && spec_adapt_ctrl::enabled()) {
@@ -5491,27 +5091,12 @@ private:
                                 std::min(params_base.speculative.draft.n_min, n_draft_req);
                         }
 
-                        if (spec_conflog_path()) {
-                            slot.spec_conf_p1.clear();
-                            slot.spec_conf_p2.clear();
-                            slot.spec_conf_pending = nullptr;
-                            slot.spec_conf_depth = 0;
-                            slot.spec_conf_pos = slot.prompt.tokens.pos_next();
-                            slot.spec_conf_start = ggml_time_us();
-                            auto & dp = common_speculative_get_draft_params(spec.get(), slot.id);
-                            dp.conf_p1 = &slot.spec_conf_p1;
-                            dp.conf_p2 = &slot.spec_conf_p2;
-                            dp.conf_depth = &slot.spec_conf_depth;
-                        }
-
                         drafting.push_back(&slot);
                     }
                 }
             }
         });
 
-        g_host_phases.mark(server_host_phase_clock::PREP);
-        for (auto & slot : slots) { slot.spec_clock.mark(server_bookkeep_clock::PREP); }
 
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
@@ -5525,8 +5110,6 @@ private:
             }
         }
 
-        g_host_phases.mark(server_host_phase_clock::DRAFT);
-        for (auto & slot : slots) { slot.spec_clock.mark(server_bookkeep_clock::DRAFT); }
 
         // make checkpoints if needed
         iterate(drafting, [&](server_slot & slot) {
@@ -5544,7 +5127,6 @@ private:
                     if (slot.task->params.sampling.spec_lossy) {
                         common_speculative_set_state(spec.get(), slot.id, ckpt.data_spec);
                     }
-                    slot.spec_clock.checkpoint(false);
                 }
 
                 if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, ckpt.pos_max + 1, -1)) {
@@ -5564,7 +5146,6 @@ private:
                     //const int64_t t_start = ggml_time_us();
 
                     ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                    slot.spec_clock.checkpoint(true);
 
                     //const int64_t t_total = ggml_time_us() - t_start;
                     //printf("checkpoint total: %f ms\n", t_total / 1000.0);
@@ -5577,13 +5158,10 @@ private:
 
                 if (use_ckpt_dft) {
                     ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                    slot.spec_clock.checkpoint(true);
                 }
             }
         });
 
-        g_host_phases.mark(server_host_phase_clock::CKPT);
-        for (auto & slot : slots) { slot.spec_clock.mark(server_bookkeep_clock::CKPT); }
 
         // update the batch with the sampled/drafted tokens
         iterate(generating, [&](server_slot & slot) {
@@ -6594,8 +6172,6 @@ private:
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
         {
-            g_host_phases.mark(server_host_phase_clock::BATCH);
-            for (auto & slot : slots) { slot.spec_clock.mark(server_bookkeep_clock::BATCH); }
             const int64_t t_decode_start = ggml_time_us();
             queue_tasks.yield_to_queue([&]() {
                 // #217 trunk keep is lossy, so it may run only when every row is a sampled
@@ -6621,8 +6197,6 @@ private:
                 }
             });
             t_decode_pass += ggml_time_us() - t_decode_start;
-            g_host_phases.mark(server_host_phase_clock::VERIFY);
-            for (auto & slot : slots) { slot.spec_clock.mark(server_bookkeep_clock::VERIFY); }
         }
         if (handoff_on) {
             llama_set_ubatch_rows_callback(ctx_tgt, nullptr, nullptr);
@@ -6756,16 +6330,12 @@ private:
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
         if (spec) {
-            for (auto & slot : slots) { slot.spec_clock.mark(server_bookkeep_clock::POST); }
-            g_host_phases.mark(server_host_phase_clock::POST_PRE);
             bool ok = true;
             queue_tasks.yield_to_queue([&]() {
-                for (auto & slot : slots) { slot.spec_clock.mark(server_bookkeep_clock::CATCHUP_QUEUE); }
                 const int32_t from = std::max(spec_processed, handoff.done);
                 ok = (spec_ranges || handoff_on)
                     ? common_speculative_process_range(spec.get(), batch.view, from, batch.view.size() - from)
                     : common_speculative_process(spec.get(), batch.view);
-                for (auto & slot : slots) { slot.spec_clock.mark(server_bookkeep_clock::CATCHUP); }
             });
 
             if (!ok) {
@@ -6774,8 +6344,6 @@ private:
                 // TODO: handle error
                 throw std::runtime_error("failed to process speculative batch");
             }
-            for (auto & slot : slots) { slot.spec_clock.mark(server_bookkeep_clock::CATCHUP_QUEUE); }
-            g_host_phases.mark(server_host_phase_clock::CATCHUP);
         }
 
         // fork: finish draft catch-up before returning scratch to the response cache.
@@ -6924,8 +6492,6 @@ private:
             // drafters that only draft on a match (n-gram) would have the plain steps in between folded into
             // "round cost by draft width"
             slot.t_spec_round_last = t_now;
-            slot.spec_clock.contexts = { ctx_tgt, ctx_dft };
-            slot.spec_clock.start(t_now);
 
             slot.stats.n_gen += 1;
 
@@ -6946,7 +6512,6 @@ private:
                 populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
             }
 
-            common_sampler_pq_commit(slot.smpl.get(), slot.id, slot.stats.n_gen - 1, id, llama_vocab_is_eog(vocab, id));
             if (!process_token(result, slot)) {
                 // release slot because of stop condition
                 slot.print_timings();
@@ -6975,13 +6540,10 @@ private:
 
             // verify and try to accept the draft
             {
-                g_host_phases.mark(server_host_phase_clock::POST_MID);
-                slot.spec_clock.mark(server_bookkeep_clock::POST);
                 // fork: a sampler snapshot is used only when this round can require checkpoint replay.
                 const bool may_replay = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
                     (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_draft > llama_n_rs_seq(ctx_tgt));
                 common_sampler_ptr smpl_save(!server_bookkeep_enabled() || may_replay ? common_sampler_clone(slot.smpl.get()) : nullptr);
-                slot.spec_clock.mark(server_bookkeep_clock::CLONE);
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 GGML_ASSERT(slot.spec_draft_q.empty() || (slot.spec_draft_q.size() == slot.spec_draft.size()));
@@ -7031,14 +6593,8 @@ private:
                             : common_sampler_sample_and_accept_n_pq(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch,
                                     slot.spec_draft, slot.spec_draft_q, false, slot.spec_is_replay, slot.id, slot.stats.n_gen, is_stop));
                 }
-                g_host_phases.mark(server_host_phase_clock::SAMPLE); // includes the sampler clone above
-                slot.spec_clock.mark(server_bookkeep_clock::SAMPLE);
 
                 GGML_ASSERT(accepted.size() >= 1);
-                // Preserve the original verify rows across a checkpoint replay.
-                if (spec_conflog_path()) {
-                    spec_conflog_capture(slot, n_draft, accepted.size() - 1, off);
-                }
                 if (!slot.spec_is_replay && params_base.speculative.draft.depth_policy == "cdepth") {
                     // CDEPTH history: target top-1 of the committed rows (the re-decode after a restore is not counted twice)
                     const auto & top1 = common_sampler_get_top1_trace(slot.smpl.get());
@@ -7087,11 +6643,9 @@ private:
                         const int64_t t_restore0 = ggml_time_us();
 
                         ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                        slot.spec_clock.checkpoint(false);
 
                         if (slot.ctx_dft) {
                             ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                            slot.spec_clock.checkpoint(false);
                         }
 
                         if (slot.task->params.sampling.spec_lossy) {
@@ -7146,7 +6700,6 @@ private:
                 // round cost by draft width: the interval between consecutive accept events on this slot covers
                 // the draft, the verify decode and the sampling of one round (the first round has no interval).
                 const int64_t t_now = ggml_time_us();
-                slot.spec_clock.finish(n_draft, t_now);
                 if (slot.t_spec_round_last > 0) {
                     const size_t w = verify_width;
                     if (slot.spec_rounds_by_w.size() <= w) {
@@ -7185,10 +6738,6 @@ private:
                 n_accepted_per_pos[i]++;
             }
 
-            if (spec_conflog_path()) {
-                spec_conflog_write(slot, ids.size());
-            }
-
             // add accepted tokens to the prompt
             slot.prompt.tokens.keep_first(slot.prompt.n_tokens() - n_draft);
             slot.prompt.tokens.insert({ids.begin(), ids.end() - 1});
@@ -7200,8 +6749,6 @@ private:
             if (llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id) + 1 == slot.prompt.tokens.pos_next()) {
                 slot.sj_kvarn_accepted_end = slot.prompt.tokens.pos_next();
             }
-            slot.spec_clock.mark(server_bookkeep_clock::KV);
-            g_host_phases.mark(server_host_phase_clock::ACCEPT_KV);
 
             for (size_t i = 0; i < ids.size(); ++i) {
                 completion_token_output result;
@@ -7217,7 +6764,6 @@ private:
 
                 slot.stats.n_gen += 1;
 
-                common_sampler_pq_commit(slot.smpl.get(), slot.id, slot.stats.n_gen - 1, ids[i], llama_vocab_is_eog(vocab, ids[i]));
                 if (!process_token(result, slot, i + 1 == ids.size())) {
                     slot.print_timings();
                     send_final_response(slot);
@@ -7229,8 +6775,6 @@ private:
 
             slot.print_timings_tg();
 
-            slot.spec_clock.mark(server_bookkeep_clock::OUTPUT);
-            g_host_phases.mark(server_host_phase_clock::OUTPUT);
 
             SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) n_accepted, (int) n_draft, slot.prompt.n_tokens());
         });

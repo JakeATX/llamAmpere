@@ -306,26 +306,6 @@ static bool common_sampler_output_enabled() {
     return enabled;
 }
 
-static bool common_sampler_bookkeep_timing() {
-    static const bool enabled = [] {
-        const char * e = getenv("LLAMA_BOOKKEEP_TIMING");
-        return e && atoi(e) != 0;
-    }();
-    return enabled;
-}
-
-struct pq_record {
-    int64_t at;
-    llama_token token;
-    double kl;
-    double lr;
-    bool rescued;
-    llama_token y;
-    double py;
-    bool ey;
-    bool eo;
-};
-
 struct common_sampler {
     common_params_sampling params;
 
@@ -350,9 +330,6 @@ struct common_sampler {
     }
 
     void set_logits(struct llama_context * ctx, int idx, const llama_sampler_output * output = nullptr) {
-        const bool timing = common_sampler_bookkeep_timing();
-        const auto prepare_timer = common_time_meas(prep_perf.prepare_us, !timing);
-        if (timing) { ++prep_perf.prepare_calls; }
         const float *       sampled_probs  = output ? output->probs      : llama_get_sampled_probs_ith     (ctx, idx);
         const float *       sampled_logits = output ? output->logits     : llama_get_sampled_logits_ith    (ctx, idx);
         const llama_token * sampled_ids    = output ? output->candidates : llama_get_sampled_candidates_ith(ctx, idx);
@@ -378,8 +355,6 @@ struct common_sampler {
             const auto * logits = output ? output->raw_logits : llama_get_logits_ith(ctx, idx);
             GGML_ASSERT(logits != nullptr);
             if (fused_top_k > 0 && fused_top_k < n_vocab && grmr == nullptr && rbudget == nullptr) {
-                const auto select_timer = common_time_meas(prep_perf.fused_topk_us, !timing);
-                if (timing) { ++prep_perf.fused_topk_calls; }
                 bool fused;
                 if (fused_topk_bias.empty()) {
                     common_sampler_topk_exact(logits, n_vocab, fused_top_k, cur);
@@ -408,7 +383,6 @@ struct common_sampler {
 
     // Status of the most recent sample, refreshed before the p/q acceptance check.
     bool sampled_backend = false;
-    common_sampler_prep_perf prep_perf;
 
 
     common_time_meas tm() {
@@ -426,7 +400,6 @@ struct common_sampler {
     uint32_t pq_seed = 0x9e3779b9u;
     std::mt19937 pq_rng{pq_seed};
     common_sampler_pq_stats pq_stats = {};
-    std::vector<pq_record> pq_pending = {};
 
     // target top-1 probability (request-matched distribution, after the sampler chain) of every position the last
     // sample_and_accept_n_pq call looked at; a free by-product used by the CDEPTH draft-depth policy. -1 = unknown
@@ -827,7 +800,6 @@ void common_sampler_reset(struct common_sampler * gsmpl) {
     // Exact p/q verification also draws acceptance and residual samples from this stream.
     gsmpl->pq_rng.seed(gsmpl->pq_seed);
     gsmpl->pq_stats = {};
-    gsmpl->pq_pending.clear();
 }
 
 struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
@@ -844,12 +816,10 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
     if (gsmpl->params.spec_lossy) {
         result->cur_p.data = gsmpl->cur_p.data ? result->cur.data() + (gsmpl->cur_p.data - gsmpl->cur.data()) : nullptr;
     }
-    result->pq_pending = gsmpl->pq_pending;
     result->t_total_us = gsmpl->t_total_us;
     result->fused_top_k = gsmpl->fused_top_k;
     result->fused_topk_bias = gsmpl->fused_topk_bias;
     result->sampled_backend = gsmpl->sampled_backend;
-    result->prep_perf = gsmpl->prep_perf;
     result->pq_seed    = gsmpl->pq_seed;
     result->pq_rng     = gsmpl->pq_rng;   // a restored clone must replay the same accept decisions
     result->pq_stats   = gsmpl->pq_stats;
@@ -878,16 +848,10 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
     dst->pq_seed  = src->pq_seed;
     dst->pq_rng   = src->pq_rng;
     dst->pq_stats = src->pq_stats;
-    dst->pq_pending = src->pq_pending;
     dst->t_total_us = src->t_total_us;
     dst->fused_top_k = src->fused_top_k;
     dst->fused_topk_bias = src->fused_topk_bias;
     dst->sampled_backend = src->sampled_backend;
-    dst->prep_perf = src->prep_perf;
-}
-
-common_sampler_prep_perf common_sampler_get_prep_perf(const common_sampler * gsmpl) {
-    return gsmpl ? gsmpl->prep_perf : common_sampler_prep_perf{};
 }
 
 void common_perf_print(const struct llama_context * ctx, const struct common_sampler * gsmpl) {
@@ -1489,123 +1453,6 @@ common_sampler_pq_result common_sampler_verify_pq(const llama_token_data_array &
     return res;
 }
 
-// V2 keeps the old P prefix and appends tagged fields. Only actual positions are logged; no shadow sampling.
-struct pq_logger {
-    FILE * f = nullptr;
-    std::mutex mutex;
-    uint64_t round = 0;
-    pq_logger() {
-        const char * path = getenv("LLAMA_SPEC_PQ_LOG");
-        if (path && *path) {
-            f = fopen(path, "a");
-            if (f) {
-                setvbuf(f, nullptr, _IOFBF, 1 << 20);
-                fprintf(f, "V\t2\n");
-            }
-        }
-    }
-    ~pq_logger() {
-        if (f) {
-            fclose(f);
-        }
-    }
-};
-
-static pq_logger * pq_log_get() {
-    static pq_logger lg;
-    return lg.f ? &lg : nullptr;
-}
-
-static void pq_log_pos(pq_logger * lg, common_sampler * gsmpl, const llama_vocab * vocab, int32_t seq, int64_t at,
-        size_t j, llama_token d, llama_token x, const llama_token_data_array & p, const std::vector<llama_token_data> & q,
-        const common_sampler_pq_result & res, const std::function<bool(llama_token)> & is_stop) {
-    auto p_of = [&](llama_token id) -> double { return prob_of(p.data, p.size, id); };
-    auto q_of = [&](llama_token id) -> double { return prob_of(q.data(), q.size(), id); };
-    double total = 0.0, p_top = 0.0, entropy = 0.0;
-    for (size_t k = 0; k < p.size; ++k) {
-        const double pk = p.data[k].p;
-        total += std::max(0.0, pk - q_of(p.data[k].id));
-        p_top = std::max(p_top, pk);
-        if (pk > 0.0) {
-            entropy -= pk * std::log(pk);
-        }
-    }
-    std::vector<double> law(p.size);
-    for (size_t k = 0; k < p.size; ++k) {
-        law[k] = p.data[k].p;
-    }
-    const auto ends = [&](llama_token id) {
-        return llama_vocab_is_eog(vocab, id) || (is_stop && is_stop(id));
-    };
-    // Do not move probability mass to or from an answer boundary.
-    if (total > 0.0) {
-        for (const auto & a : q) {
-            const double pa = p_of(a.id), excess = std::max(0.0, (double) a.p - pa);
-            if (excess == 0.0 || ends(a.id)) {
-                continue;
-            }
-            for (size_t k = 0; k < p.size; ++k) {
-                const auto & y = p.data[k];
-                if (pa < y.p || ends(y.id)) {
-                    continue;
-                }
-                const double moved = excess * std::max(0.0, (double) y.p - q_of(y.id)) / total;
-                law[k] -= moved;
-                for (size_t z = 0; z < p.size; ++z) {
-                    if (p.data[z].id == a.id) {
-                        law[z] += moved;
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    double kl = 0.0, lr = 0.0;
-    for (size_t k = 0; k < p.size; ++k) {
-        if (law[k] > 0.0 && p.data[k].p > 0.0) {
-            const double log_ratio = std::log(law[k] / p.data[k].p);
-            kl += law[k] * log_ratio;
-            if (p.data[k].id == res.id) {
-                lr = log_ratio;
-            }
-        }
-    }
-    const bool ey = res.replacement != LLAMA_TOKEN_NULL && ends(res.replacement);
-    const bool eo = ends(res.id);
-    gsmpl->pq_pending.push_back({at, res.id, gsmpl->params.spec_lossy ? kl : 0.0,
-            gsmpl->params.spec_lossy ? lr : 0.0, res.rescued, res.replacement, res.p_replacement, ey, eo});
-    const char outcome = x == d ? 'M' : (res.rescued ? 'L' : (res.accepted ? 'E' : 'R'));
-    fprintf(lg->f, "P\t%llu\t%zu\t%d\t%.9g\t%.9g\t%.9g\t%.9g\t%c\t%zu",
-            (unsigned long long) lg->round, j, d, p_of(d), q_of(d), p_top, entropy, outcome, q.size());
-    for (const auto & c : q) {
-        fprintf(lg->f, "\t%d:%.9g:%.9g", c.id, c.p, p_of(c.id));
-    }
-    fprintf(lg->f, "\ty=%d\tpy=%.9g\tout=%d\tkl=%.12g\tlr=%.12g\tey=%d\teo=%d\tseq=%d\tat=%lld\tp=",
-            res.replacement, res.p_replacement, res.id, kl, lr, ey, eo, seq, (long long) at);
-    for (size_t k = 0; k < p.size; ++k) {
-        fprintf(lg->f, "%s%d:%.9g", k ? "," : "", p.data[k].id, p.data[k].p);
-    }
-    fputc('\n', lg->f);
-}
-
-void common_sampler_pq_commit(common_sampler * gsmpl, int32_t seq, int64_t at, llama_token token, bool eog) {
-    auto * lg = pq_log_get();
-    if (!lg) {
-        return;
-    }
-    std::lock_guard<std::mutex> lock(lg->mutex);
-    pq_record row{at, token, 0.0, 0.0, false, LLAMA_TOKEN_NULL, -1.0, false, eog};
-    for (const auto & r : gsmpl->pq_pending) {
-        if (r.at == at && r.token == token) {
-            row = r;
-            break;
-        }
-    }
-    fprintf(lg->f, "C\tseq=%d\tat=%lld\ttoken=%d\tkl=%.12g\tlr=%.12g\trescued=%d\ty=%d\tpy=%.9g\tey=%d\teo=%d\n",
-            seq, (long long) at, token, row.kl, row.lr, row.rescued, row.y, row.py, row.ey, row.eo);
-    fflush(lg->f);
-}
-
 std::vector<llama_token> common_sampler_sample_and_accept_n_pq(struct common_sampler * gsmpl, struct llama_context * ctx,
         const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q,
         bool grammar_first, bool replay, int32_t seq, int64_t generated,
@@ -1631,16 +1478,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_pq(struct common_sam
         }
         gsmpl->top1_trace.push_back(top);
     };
-    auto * lg = pq_log_get();
-    std::unique_lock<std::mutex> lock;
-    const int64_t log_start = lg ? ggml_time_us() : 0;
-    int64_t log_us = 0;
-    if (lg) {
-        lock = std::unique_lock<std::mutex>(lg->mutex);
-        gsmpl->pq_pending.clear();
-        fprintf(lg->f, "R\t%llu\t%zu\tseq=%d\tat=%lld\n", (unsigned long long) ++lg->round,
-                draft.size(), seq, (long long) generated);
-    }
+    GGML_UNUSED_VARS(seq, generated);
     size_t i = 0;
     for (; i < draft.size(); ++i) {
         // x ~ p, the target chain's own draw; it also leaves cur_p holding p over the surviving candidates
@@ -1662,11 +1500,6 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_pq(struct common_sam
             if (res.rescued && gsmpl->first_rescue < 0) {
                 gsmpl->first_rescue = (int32_t) i;
             }
-            if (lg) {
-                const int64_t t0 = ggml_time_us();
-                pq_log_pos(lg, gsmpl, vocab, seq, generated + i, i, draft[i], x, p, draft_q[i], res, ends);
-                log_us += ggml_time_us() - t0;
-            }
         } else {
             // id-match for this and the remaining positions
             res.accepted = x == draft[i];
@@ -1683,9 +1516,6 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_pq(struct common_sam
         trace_top1();
         common_sampler_accept(gsmpl, id, true);
         result.push_back(id);
-    }
-    if (lg) {
-        fprintf(lg->f, "D\t%llu\tlog_us=%lld\tverify_us=%lld\n", (unsigned long long) lg->round, (long long) log_us, (long long) (ggml_time_us() - log_start));
     }
     return result;
 }

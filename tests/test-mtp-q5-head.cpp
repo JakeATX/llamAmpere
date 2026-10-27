@@ -137,11 +137,9 @@ static bool run_case(ggml_backend_t backend, const head_case & c) {
     for (int pattern = 0; pattern < 5; ++pattern) {
         fill_activation(activation, rng, pattern);
         ggml_backend_tensor_set(input, activation.data(), 0, ggml_nbytes(input));
-        set_env("GGML_CUDA_MTP_Q5_HEAD_AUDIT", "1");
         compute(backend, graph, false);
         ggml_backend_tensor_get(out, original.data(), 0, ggml_nbytes(out));
         compute(backend, graph, true);
-        set_env("GGML_CUDA_MTP_Q5_HEAD_AUDIT", "0");
         ggml_backend_tensor_get(out, candidate.data(), 0, ggml_nbytes(out));
 
         size_t mismatches = 0;
@@ -293,10 +291,8 @@ static bool run_batched_case(ggml_backend_t backend, int64_t rows) {
         set_env("GGML_CUDA_MTP_Q5_BATCH_HEAD", "0");
         compute_reference(max_cols, &reference_all);
         set_env("GGML_CUDA_MTP_Q5_BATCH_HEAD", "1");
-        set_env("GGML_CUDA_MTP_Q5_BATCH_HEAD_AUDIT", "1");
         std::vector<float> singleton_on(reference_all.size());
         compute_reference(max_cols, &singleton_on);
-        set_env("GGML_CUDA_MTP_Q5_BATCH_HEAD_AUDIT", "0");
         ok = compare_batched_vectors(reference_all, singleton_on, rows, max_cols, pattern, "batched_singleton_fallback") && ok;
         for (int64_t cols : { 3, 4 }) {
             head_graph & graph = cols == 3 ? graph_three : graph_four;
@@ -309,9 +305,7 @@ static bool run_batched_case(ggml_backend_t backend, int64_t rows) {
             ggml_backend_tensor_get(graph.out, candidate.data(), 0, ggml_nbytes(graph.out));
             ok = compare_batched_vectors(reference, candidate, rows, cols, pattern, "batched_default_comparison") && ok;
             set_env("GGML_CUDA_MTP_Q5_BATCH_HEAD", "1");
-            set_env("GGML_CUDA_MTP_Q5_BATCH_HEAD_AUDIT", "1");
             compute(backend, graph.graph, false);
-            set_env("GGML_CUDA_MTP_Q5_BATCH_HEAD_AUDIT", "0");
             ggml_backend_tensor_get(graph.out, candidate.data(), 0, ggml_nbytes(graph.out));
             ok = compare_batched_vectors(reference, candidate, rows, cols, pattern, "batched_comparison") && ok;
 
@@ -350,9 +344,7 @@ static bool run_batched_case(ggml_backend_t backend, int64_t rows) {
                     std::vector<float> fallback_off(candidate.size());
                     ggml_backend_tensor_get(graph.out, fallback_off.data(), 0, ggml_nbytes(graph.out));
                     set_env("GGML_CUDA_MTP_Q5_BATCH_HEAD", "1");
-                    set_env("GGML_CUDA_MTP_Q5_BATCH_HEAD_AUDIT", "1");
                     compute(backend, graph.graph, false);
-                    set_env("GGML_CUDA_MTP_Q5_BATCH_HEAD_AUDIT", "0");
                     ggml_backend_tensor_get(graph.out, candidate.data(), 0, ggml_nbytes(graph.out));
                     ok = compare_batched_vectors(fallback_off, candidate, rows, cols, pattern, fallback_labels[test]) && ok;
                 }
@@ -366,9 +358,7 @@ static bool run_batched_case(ggml_backend_t backend, int64_t rows) {
             compute(backend, graph_two.graph, false);
             ggml_backend_tensor_get(graph_two.out, fallback_off.data(), 0, ggml_nbytes(graph_two.out));
             set_env("GGML_CUDA_MTP_Q5_BATCH_HEAD", "1");
-            set_env("GGML_CUDA_MTP_Q5_BATCH_HEAD_AUDIT", "1");
             compute(backend, graph_two.graph, false);
-            set_env("GGML_CUDA_MTP_Q5_BATCH_HEAD_AUDIT", "0");
             ggml_backend_tensor_get(graph_two.out, fallback_on.data(), 0, ggml_nbytes(graph_two.out));
             ok = compare_batched_vectors(fallback_off, fallback_on, rows, 2, pattern, "batched_width2_fallback") && ok;
         }
@@ -395,13 +385,10 @@ int main(int argc, char ** argv) {
         set_env("GGML_CUDA_SM86_EXACT_REUSE", "0");
         set_env("GGML_CUDA_QC4_NW1", "0");
         set_env("GGML_CUDA_MTP_Q5_HEAD", "0");
-        set_env("GGML_CUDA_MTP_Q5_HEAD_AUDIT", "0");
         set_env("GGML_CUDA_MTP_Q5_BATCH_HEAD", "1");
-        set_env("GGML_CUDA_MTP_Q5_BATCH_HEAD_AUDIT", "0");
         set_env("GGML_CUDA_MMVQ_THIN", "0");
         set_env("GGML_MMVQ_NMAX", "q5_K=4");
         printf("batched_flags EXACT_REUSE=0 QC4_NW1=0 MTP_Q5_HEAD=0 MTP_Q5_BATCH_HEAD=1 MMVQ_THIN=0 MMVQ_NMAX=q5_K=4\n");
-        printf("batched_dispatch_evidence=mtp_q5_batch_head_dispatch expected_launches=30; fallback cases must not emit this marker\n");
     }
     ggml_backend_load_all();
     ggml_backend_dev_t device = nullptr;

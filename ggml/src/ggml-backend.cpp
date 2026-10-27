@@ -1346,9 +1346,6 @@ struct ggml_backend_sched {
     int debug_graph_size;
     int debug_prev_graph_size;
 
-    // calloc initializes these; scheduler execution and snapshots are externally serialized.
-    struct ggml_backend_sched_bookkeep_perf bookkeep;
-
     // fork ROUNDPREP plan slots (ggml_backend_sched_plan_select): the per-graph split plan of the slot that is not
     // current, swapped in and out whole; NULL until a second slot is first selected
     size_t graph_size_cfg;
@@ -1388,23 +1385,6 @@ struct ggml_backend_sched_plan {
     uint64_t split_serial;
 };
 
-static bool ggml_backend_bookkeep_enabled() {
-    static const bool enabled = [] {
-        const char * value = getenv("LLAMA_BOOKKEEP_TIMING");
-        return value && atoi(value) != 0;
-    }();
-    return enabled;
-}
-
-struct ggml_backend_bookkeep_timer {
-    uint64_t * total;
-    int64_t start;
-    explicit ggml_backend_bookkeep_timer(uint64_t * total) : total(total), start(total ? ggml_time_us() : 0) {}
-    ~ggml_backend_bookkeep_timer() {
-        if (total) { *total += uint64_t(ggml_time_us() - start); }
-    }
-};
-
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
 #define tensor_backend_id(tensor) sched->hv_tensor_backend_ids[hash_id(tensor)]
 #define tensor_id_copy(id, backend_id, copy_id) sched->hv_tensor_copies[(id) * sched->n_backends * sched->n_copies + (backend_id) * sched->n_copies + (copy_id)]
@@ -1428,7 +1408,7 @@ struct ggml_backend_bookkeep_timer {
 // path (id readback + routed-only copies), into the same ring places.
 // Env: GGML_SCHED_XSTREAM=1 enables; _MIB ring size (default: the largest two consecutive layers); _MIN_TOKENS (1024);
 // _CHUNK_MIB staging chunk (16); _STAGES staging chunks (4); _THREADS memcpy threads (4); _WILLNEED readahead distance
-// in weights (0 = off); _DEBUG=1 prints counters when the scheduler is freed.
+// in weights (0 = off).
 // [FNPORT] _PIN_MIB=N copies up to N MiB of the streamed host weights, once, when the first ring is placed, into
 // page-locked anonymous memory (transparent huge pages where the kernel allows, locked with the device's host-register
 // call; the mapped model file itself cannot be locked read-only on every driver), and points those weight tensors at the
@@ -1466,7 +1446,6 @@ struct ggml_sched_xs_pool {
 struct ggml_sched_xstream {
     // config
     bool    enabled    = false;
-    bool    debug      = false;
     size_t  env_bytes  = 0;
     int64_t min_tokens = 1024;
     size_t  chunk      = 16u << 20;
@@ -1511,12 +1490,6 @@ struct ggml_sched_xstream {
     bool quit = false;
     std::thread streamer;
     ggml_sched_xs_pool pool;
-
-    // counters
-    uint64_t n_graphs = 0;
-    uint64_t bytes = 0;
-    uint64_t bytes_direct = 0;
-    double t_memcpy = 0, t_stage_wait = 0, t_space_wait = 0, t_compute_wait = 0;
 };
 
 // page-locked weight copies, shared by every scheduler of the process (several contexts can stream one model's
@@ -1547,7 +1520,6 @@ static size_t ggml_sched_xs_env(const char * name, size_t def) {
 static struct ggml_sched_xstream * ggml_sched_xs_new(void) {
     auto * x = new ggml_sched_xstream;
     x->enabled    = ggml_sched_xs_env("GGML_SCHED_XSTREAM", 0) != 0;
-    x->debug      = ggml_sched_xs_env("GGML_SCHED_XSTREAM_DEBUG", 0) != 0;
     x->env_bytes  = ggml_sched_xs_env("GGML_SCHED_XSTREAM_MIB", 0) << 20;
     x->min_tokens = (int64_t) ggml_sched_xs_env("GGML_SCHED_XSTREAM_MIN_TOKENS", 1024);
     x->chunk      = std::max<size_t>(1, ggml_sched_xs_env("GGML_SCHED_XSTREAM_CHUNK_MIB", 16)) << 20;
@@ -1648,7 +1620,6 @@ static void ggml_sched_xs_stream_graph(struct ggml_sched_xstream * x) {
         }
 
         // the matmuls that used this place must have been queued; then the copy stream waits for them on the device
-        const auto t0 = clk::now();
         size_t k = 0;
         for (size_t j = 0; j < live.size(); j++) {
             const live_t lv = live[j];
@@ -1667,34 +1638,25 @@ static void ggml_sched_xs_stream_graph(struct ggml_sched_xstream * x) {
         }
         live.resize(k);
         live.push_back({ it.off, it.size, i });
-        const auto t1 = clk::now();
-        x->t_space_wait += ggml_sched_xs_secs(t0, t1);
 
         const uint8_t * src = (const uint8_t *) it.input->data;
         const size_t nbytes = ggml_nbytes(it.input);
         if (it.pinned) {
             // page-locked source: one direct copy, no staging
             ggml_backend_tensor_set_async(x->copy_backend, it.cpy, src, 0, nbytes);
-            x->bytes_direct += nbytes;
         }
         for (size_t off = 0; !it.pinned && off < nbytes; off += x->chunk) {
             const size_t len = std::min(x->chunk, nbytes - off);
             const size_t s = x->stage_next++ % (size_t) x->n_stages;
             uint8_t * buf = x->stage_base + s * x->chunk;
-            const auto a = clk::now();
             if (x->stage_used[s]) {
                 ggml_backend_event_synchronize(x->ev_stage[s]);
             }
-            const auto b = clk::now();
             ggml_sched_xs_memcpy(&x->pool, buf, src + off, len);
-            const auto c = clk::now();
             ggml_backend_tensor_set_async(x->copy_backend, it.cpy, buf, off, len);
             ggml_backend_event_record(x->ev_stage[s], x->copy_backend);
             x->stage_used[s] = 1;
-            x->t_stage_wait += ggml_sched_xs_secs(a, b);
-            x->t_memcpy     += ggml_sched_xs_secs(b, c);
         }
-        x->bytes += nbytes;
         ggml_backend_event_record(x->ev_ready[i], x->copy_backend);
         {
             std::lock_guard<std::mutex> lk(x->m);
@@ -1761,13 +1723,6 @@ static void ggml_sched_xs_free(struct ggml_sched_xstream * x) {
         t.join();
     }
     ggml_sched_xs_sync(x);
-    if (x->debug && x->n_graphs > 0) {
-        const uint64_t staged = x->bytes - x->bytes_direct;
-        fprintf(stderr, "expert stream: %llu graphs, ring %.1f MiB, streamed %.1f GiB (%.1f GiB direct from page-locked copies), "
-            "memcpy %.2f s (%.1f GB/s), staging wait %.2f s, ring-place wait %.2f s, compute wait %.2f s\n",
-            (unsigned long long) x->n_graphs, x->ring_size/1048576.0, x->bytes/1073741824.0, x->bytes_direct/1073741824.0,
-            x->t_memcpy, x->t_memcpy > 0 ? staged/1e9/x->t_memcpy : 0.0, x->t_stage_wait, x->t_space_wait, x->t_compute_wait);
-    }
     if (!x->pins.empty()) {
         std::lock_guard<std::mutex> lk(ggml_sched_xs_pin_m);
         for (struct ggml_tensor * t : x->pins) {
@@ -2117,7 +2072,6 @@ static void ggml_sched_xs_begin(ggml_backend_sched_t sched) {
     }
     x->cv.notify_all();
     x->active = true;
-    x->n_graphs++;
 }
 
 // compute thread: is input_cpy of split_id streamed? if so, make the split's stream wait for it
@@ -2130,12 +2084,10 @@ static bool ggml_sched_xs_use(ggml_backend_sched_t sched, int split_id, struct g
     if (i < 0 || x->items[i].cpy != input_cpy) {
         return false;
     }
-    const auto t0 = std::chrono::steady_clock::now();
     {
         std::unique_lock<std::mutex> lk(x->m);
         x->cv.wait(lk, [&] { return x->issued[i] != 0; });
     }
-    x->t_compute_wait += ggml_sched_xs_secs(t0, std::chrono::steady_clock::now());
     ggml_backend_event_wait(backend, x->ev_ready[i]);
     return true;
 }
@@ -3037,41 +2989,6 @@ static bool ggml_backend_sched_is_host_weight(const struct ggml_tensor * t) {
         ggml_backend_buffer_is_host(t->buffer);
 }
 
-// [POSTFIX diag] LLAMA_POSTFIX_TIMING=1: host time of every scheduler input copy split into the wait for the split
-// backend (sync), the wait for the source backend and the copy itself, summed per input name. Clock reads only.
-static bool ggml_sched_pf_timing() {
-    static const bool on = getenv("LLAMA_POSTFIX_TIMING") != nullptr && atoi(getenv("LLAMA_POSTFIX_TIMING")) != 0;
-    return on;
-}
-struct ggml_sched_pf_entry { std::string name; size_t bytes = 0; uint64_t n = 0; int64_t wait_dst = 0, wait_src = 0, copy = 0; bool user = false; };
-struct ggml_sched_pf_clock {
-    std::vector<ggml_sched_pf_entry> e;
-    uint64_t n_total = 0;
-    int64_t t = 0;
-    int idx = -1;
-    void begin(const ggml_tensor * in) {
-        idx = -1;
-        for (size_t i = 0; i < e.size(); ++i) { if (e[i].name == in->name) { idx = (int) i; break; } }
-        if (idx < 0) { e.push_back({}); idx = (int) e.size() - 1; e[idx].name = in->name; }
-        e[idx].bytes = ggml_nbytes(in); e[idx].user = (in->flags & GGML_TENSOR_FLAG_INPUT) != 0; e[idx].n++;
-        t = ggml_time_us();
-    }
-    void lap(int64_t ggml_sched_pf_entry::* f) { const int64_t now = ggml_time_us(); e[idx].*f += now - t; t = now; }
-    void end() {
-        lap(&ggml_sched_pf_entry::copy);
-        if (++n_total % 4096 != 0) { return; }
-        std::string line;
-        for (const auto & x : e) {
-            char buf[256];
-            snprintf(buf, sizeof(buf), " [%s %zuB%s n %llu: wait_dst %.3f wait_src %.3f copy %.3f ms/call]", x.name.c_str(), x.bytes, x.user ? " user" : "",
-                    (unsigned long long) x.n, x.wait_dst / 1e3 / x.n, x.wait_src / 1e3 / x.n, x.copy / 1e3 / x.n);
-            line += buf;
-        }
-        GGML_LOG_INFO("postfix sched input copies (LLAMA_POSTFIX_TIMING) %llu copies:%s\n", (unsigned long long) n_total, line.c_str());
-    }
-};
-static thread_local ggml_sched_pf_clock * t_pf = nullptr;
-
 static bool ggml_sched_upload_kernel_enabled() {
     static const bool on = [] {
         const char * e = getenv("GGML_SCHED_UPLOAD_KERNEL");
@@ -3099,24 +3016,7 @@ static ggml_sched_upload_fn_t ggml_sched_upload_fn(ggml_backend_t backend) {
     return fn;
 }
 
-static void ggml_backend_sched_copy_input_impl(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input);
 static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input) {
-    if (!ggml_sched_pf_timing()) {
-        ggml_backend_sched_copy_input_impl(sched, split, input);
-        return;
-    }
-    static thread_local ggml_sched_pf_clock clk;
-    t_pf = &clk;
-    clk.begin(input);
-    ggml_backend_sched_copy_input_impl(sched, split, input);
-    clk.end();
-    t_pf = nullptr;
-}
-#define PF_LAP(f) do { if (t_pf) { t_pf->lap(&ggml_sched_pf_entry::f); } } while (0)
-
-static void ggml_backend_sched_copy_input_impl(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input) {
-    auto * perf = ggml_backend_bookkeep_enabled() ? &sched->bookkeep : nullptr;
-    const ggml_backend_bookkeep_timer copy_timer(perf ? &perf->input_copy_host_us : nullptr);
     const int split_backend_id = split->backend_id;
     ggml_backend_t split_backend = sched->backends[split_backend_id];
     ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, input);
@@ -3151,15 +3051,11 @@ static void ggml_backend_sched_copy_input_impl(ggml_backend_sched_t sched, struc
 
     if (input->flags & GGML_TENSOR_FLAG_INPUT) {
         // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
-        {
-            const ggml_backend_bookkeep_timer sync_timer(perf ? &perf->user_input_sync_host_us : nullptr);
-            if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
-            } else {
-                ggml_backend_synchronize(split_backend);
-            }
+        if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+            ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+        } else {
+            ggml_backend_synchronize(split_backend);
         }
-        PF_LAP(wait_dst);
         ggml_backend_tensor_copy(input, input_cpy);
         return;
     }
@@ -3170,7 +3066,6 @@ static void ggml_backend_sched_copy_input_impl(ggml_backend_sched_t sched, struc
     } else {
         ggml_backend_synchronize(split_backend);
     }
-    PF_LAP(wait_dst);
 
     if (sched->callback_copy != NULL && ggml_backend_sched_is_host_weight(input) &&
         sched->callback_copy(split_backend, input, input_cpy, &split->graph, sched->callback_copy_user_data)) {
@@ -3188,150 +3083,33 @@ static void ggml_backend_sched_copy_input_impl(ggml_backend_sched_t sched, struc
     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
         ggml_backend_synchronize(input_backend);
-        PF_LAP(wait_src);
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
         } else {
             ggml_backend_synchronize(split_backend);
         }
-        PF_LAP(wait_dst);
         ggml_backend_tensor_copy(input, input_cpy);
     }
 }
-#undef PF_LAP
 
-
-// [VFLOOR] GGML_SCHED_VF_TIMING=1: host time per scheduler phase and per split of small-batch graphs
-// (>1000 nodes, first GET_ROWS gathers <= 128 rows, i.e. decode/verify calls). Clock reads only.
-struct ggml_sched_vf_stats {
-    static constexpr int MAX_SPLITS = 16;
-    uint64_t calls = 0;
-    double enter = 0, devcheck = 0, xs = 0, leave = 0, total = 0;
-    double copy[MAX_SPLITS] = {}, comp[MAX_SPLITS] = {};
-    int    nodes[MAX_SPLITS] = {};
-    const char * name[MAX_SPLITS] = {};
-    const char * first[MAX_SPLITS] = {};
-    int n_splits = 0;
-    uint64_t slow_leave = 0; double slow_leave_ms = 0;
-    bool one_row = false;
-};
-static int ggml_sched_vf_timing_level() {
-    static const int lvl = getenv("GGML_SCHED_VF_TIMING") != nullptr ? atoi(getenv("GGML_SCHED_VF_TIMING")) : 0;
-    return lvl;
-}
-static bool ggml_sched_vf_timing() {
-    return ggml_sched_vf_timing_level() != 0;
-}
-static thread_local ggml_sched_vf_stats * t_vf_cur = nullptr;
-static thread_local int64_t t_vf_mark = 0;
-static inline double ggml_sched_vf_lap() {
-    const int64_t now = ggml_time_us();
-    const double d = (now - t_vf_mark) / 1000.0;
-    t_vf_mark = now;
-    return d;
-}
-static ggml_sched_vf_stats * ggml_sched_vf_select(ggml_backend_sched_t sched) {
-    if (!ggml_sched_vf_timing()) {
-        return nullptr;
-    }
-    int total = 0;
-    const ggml_tensor * gr = nullptr;
-    for (int i = 0; i < sched->n_splits; ++i) {
-        total += sched->splits[i].graph.n_nodes;
-        for (int j = 0; !gr && j < sched->splits[i].graph.n_nodes; ++j) {
-            if (sched->splits[i].graph.nodes[j]->op == GGML_OP_GET_ROWS) {
-                gr = sched->splits[i].graph.nodes[j];
-            }
-        }
-    }
-    // level 2 also times the small helper graphs (>100 nodes), with 1-row graphs kept in their own bucket
-    const bool small = ggml_sched_vf_timing_level() >= 2;
-    if (total <= (small ? 100 : 1000) || !gr || gr->ne[1] > 128) {
-        return nullptr;
-    }
-    const void * key = small && gr->ne[1] == 1 ? (const void *) ((const char *) sched + 1) : (const void *) sched;
-    static std::mutex mu;
-    static std::vector<std::pair<const void *, ggml_sched_vf_stats *>> all;
-    std::lock_guard<std::mutex> lock(mu);
-    for (auto & e : all) {
-        if (e.first == key) {
-            return e.second;
-        }
-    }
-    all.emplace_back(key, new ggml_sched_vf_stats());
-    all.back().second->one_row = key != (const void *) sched;
-    return all.back().second;
-}
-static void ggml_sched_vf_report(ggml_backend_sched_t sched, ggml_sched_vf_stats & st) {
-    if (st.calls % 128 != 0) {
-        return;
-    }
-    const double n = (double) st.calls;
-    std::string line;
-    char buf[256];
-    snprintf(buf, sizeof(buf), "vfloor sched (GGML_SCHED_VF_TIMING) sched %p%s, %llu calls, ms/call: enter %.3f devcheck %.3f xs-begin %.3f leave %.3f (calls with leave>1ms: %llu, %.1f ms each) total %.3f; splits:",
-            (void *) sched, st.one_row ? " 1-row" : "", (unsigned long long) st.calls, st.enter/n, st.devcheck/n, st.xs/n, st.leave/n,
-            (unsigned long long) st.slow_leave, st.slow_leave ? st.slow_leave_ms/st.slow_leave : 0.0, st.total/n);
-    line += buf;
-    for (int i = 0; i < st.n_splits && i < ggml_sched_vf_stats::MAX_SPLITS; ++i) {
-        snprintf(buf, sizeof(buf), " [%d %s %d nodes from %.24s: copy %.3f compute %.3f]", i, st.name[i] ? st.name[i] : "?",
-                st.nodes[i], st.first[i] ? st.first[i] : "", st.copy[i]/n, st.comp[i]/n);
-        line += buf;
-    }
-    GGML_LOG_INFO("%s\n", line.c_str());
-}
-
-static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sched_t sched);
 
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
-    ggml_sched_vf_stats * vf = ggml_sched_vf_select(sched);
-    if (!vf) {
-        return ggml_backend_sched_compute_splits_impl(sched);
-    }
-    const int64_t t0 = ggml_time_us();
-    t_vf_cur = vf;
-    t_vf_mark = t0;
-    const enum ggml_status st = ggml_backend_sched_compute_splits_impl(sched);
-    const double leave = ggml_sched_vf_lap();   // the moe-cache scope destructor ran after the last mark
-    t_vf_cur = nullptr;
-    vf->leave += leave;
-    if (leave > 1.0) {
-        vf->slow_leave++;
-        vf->slow_leave_ms += leave;
-    }
-    vf->total += (ggml_time_us() - t0) / 1000.0;
-    vf->n_splits = sched->n_splits;
-    for (int i = 0; i < sched->n_splits && i < ggml_sched_vf_stats::MAX_SPLITS; ++i) {
-        vf->nodes[i] = sched->splits[i].graph.n_nodes;
-        vf->name[i] = ggml_backend_name(sched->backends[sched->splits[i].backend_id]);
-        vf->first[i] = sched->splits[i].graph.n_nodes > 0 ? sched->splits[i].graph.nodes[0]->name : "";
-    }
-    vf->calls++;
-    ggml_sched_vf_report(sched, *vf);
-    return st;
-}
-
-static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
-    auto * perf = ggml_backend_bookkeep_enabled() ? &sched->bookkeep : nullptr;
     auto * cache = sched->moe_cache_donor ? sched->moe_cache_donor : sched;
 
     struct moe_cache_scope {
         void * session;
         void (*leave)(void *);
         ggml_moe_cache_api previous_active;
-        ggml_backend_sched_bookkeep_perf * perf;
         ggml_moe_expert_keep_policy previous_keep;
 
         explicit moe_cache_scope(void * session, void (*enter)(void *),
                                  void (*leave_fn)(void *),
                                  const ggml_moe_cache_api & active_api,
-                                 ggml_backend_sched_bookkeep_perf * perf,
                                  const ggml_moe_expert_keep_policy & keep)
-            : session(session), leave(leave_fn), previous_active(t_moe_cache_active), perf(perf),
+            : session(session), leave(leave_fn), previous_active(t_moe_cache_active),
               previous_keep(t_moe_expert_keep) {
-            const ggml_backend_bookkeep_timer timer(perf ? &perf->session_host_us : nullptr);
             t_moe_cache_active = active_api;
             t_moe_expert_keep = keep;
             if (enter && leave) {
@@ -3342,7 +3120,6 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
         }
 
         ~moe_cache_scope() {
-            const ggml_backend_bookkeep_timer timer(perf ? &perf->session_host_us : nullptr);
             t_moe_cache_active = previous_active;
             t_moe_expert_keep = previous_keep;
             if (leave) {
@@ -3352,9 +3129,8 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
     } cache_scope(cache->moe_cache_session,
                   cache->moe_cache_api.session_enter,
                   cache->moe_cache_api.session_leave,
-                  cache->moe_cache_api, perf,
+                  cache->moe_cache_api,
                   ggml_moe_expert_keep_policy{sched->moe_keep_default, sched->moe_keep_layer, sched->moe_keep_n_layer});
-    if (t_vf_cur) { t_vf_cur->enter += ggml_sched_vf_lap(); }
 
     if (sched->moe_cache_device_graph) {
         for (int i = 0; i < sched->n_splits; ++i) {
@@ -3371,11 +3147,9 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
         }
     }
 
-    if (t_vf_cur) { t_vf_cur->devcheck += ggml_sched_vf_lap(); }
     int prev_backend_id = -1;
 
     ggml_sched_xs_begin(sched);
-    if (t_vf_cur) { t_vf_cur->xs += ggml_sched_vf_lap(); }
     struct xs_scope {
         ggml_backend_sched_t sched;
         ~xs_scope() { ggml_sched_xs_end(sched); }
@@ -3389,7 +3163,6 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
         if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
-            const ggml_backend_bookkeep_timer timer(perf ? &perf->transition_host_us : nullptr);
             if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
                 ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
             } else {
@@ -3413,24 +3186,8 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                 ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
             }
         }
-        if (t_vf_cur && split_id < ggml_sched_vf_stats::MAX_SPLITS) { t_vf_cur->copy[split_id] += ggml_sched_vf_lap(); }
 
         {
-            uint64_t * compute_us = nullptr;
-            if (perf) {
-                const auto device_type = ggml_backend_dev_type(ggml_backend_get_device(split_backend));
-                if (device_type == GGML_BACKEND_DEVICE_TYPE_CPU) {
-                    compute_us = &perf->cpu_compute_host_us;
-                    ++perf->cpu_split_calls;
-                } else if (device_type == GGML_BACKEND_DEVICE_TYPE_GPU || device_type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
-                    compute_us = &perf->gpu_compute_host_us;
-                    ++perf->gpu_split_calls;
-                } else {
-                    compute_us = &perf->other_compute_host_us;
-                    ++perf->other_split_calls;
-                }
-            }
-            const ggml_backend_bookkeep_timer compute_timer(compute_us);
             if (!sched->callback_eval) {
                 enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
                 if (ec != GGML_STATUS_SUCCESS) {
@@ -3472,7 +3229,6 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
         }
 
         ggml_sched_xs_consumed(sched, split_id, split_backend);
-        if (t_vf_cur && split_id < ggml_sched_vf_stats::MAX_SPLITS) { t_vf_cur->comp[split_id] += ggml_sched_vf_lap(); }
 
         // record the event of this split
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
@@ -3924,11 +3680,6 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
     }
 
     return ggml_backend_sched_compute_splits(sched);
-}
-
-struct ggml_backend_sched_bookkeep_perf ggml_backend_sched_get_bookkeep_perf(ggml_backend_sched_t sched) {
-    GGML_ASSERT(sched);
-    return sched->bookkeep;
 }
 
 void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {

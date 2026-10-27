@@ -125,8 +125,6 @@ struct ggml_dyn_tallocr {
     int n_chunk_limits;
     struct tallocr_chunk * chunks[GGML_VBUFFER_MAX_CHUNKS];
     int n_chunks;
-    // fork: Opt-in allocation logs expose reserve liveness without backend execution.
-    bool trace;
 
 #ifdef GGML_ALLOCATOR_DEBUG
     struct {
@@ -306,10 +304,6 @@ static struct buffer_address ggml_dyn_tallocr_alloc(struct ggml_dyn_tallocr * al
 #endif
 
     chunk->max_size = MAX(chunk->max_size, addr.offset + size);
-    if (alloc->trace) {
-        GGML_LOG_INFO("GGML_ALLOCATOR_TRACE alloc allocator=%p chunk=%d offset=%zu bytes=%zu logical=%zu end=%zu hwm=%zu tensor=%s\n",
-                (void *) alloc, addr.chunk, addr.offset, size, ggml_nbytes(tensor), addr.offset + size, chunk->max_size, tensor->name);
-    }
 
     return addr;
 
@@ -317,12 +311,8 @@ static struct buffer_address ggml_dyn_tallocr_alloc(struct ggml_dyn_tallocr * al
 }
 
 // this is a very naive implementation, but for our case the number of free blocks should be very small
-static void ggml_dyn_tallocr_free_bytes(struct ggml_dyn_tallocr * alloc, struct buffer_address addr, size_t size, const char * name) {
+static void ggml_dyn_tallocr_free_bytes(struct ggml_dyn_tallocr * alloc, struct buffer_address addr, size_t size) {
     size = aligned_offset(NULL, size, alloc->alignment);
-    if (alloc->trace) {
-        GGML_LOG_INFO("GGML_ALLOCATOR_TRACE free allocator=%p chunk=%d offset=%zu bytes=%zu end=%zu tensor=%s\n",
-                (void *) alloc, addr.chunk, addr.offset, size, addr.offset + size, name);
-    }
 
     struct tallocr_chunk * chunk = alloc->chunks[addr.chunk];
 
@@ -362,9 +352,6 @@ static void ggml_dyn_tallocr_free_bytes(struct ggml_dyn_tallocr * alloc, struct 
 }
 
 static void ggml_dyn_tallocr_reset(struct ggml_dyn_tallocr * alloc) {
-    if (alloc->trace) {
-        GGML_LOG_INFO("GGML_ALLOCATOR_TRACE reset allocator=%p\n", (void *) alloc);
-    }
     for (int i = 0; i < GGML_VBUFFER_MAX_CHUNKS; i++) {
         free(alloc->chunks[i]);
         alloc->chunks[i] = NULL;
@@ -387,7 +374,6 @@ static void ggml_dyn_tallocr_reset(struct ggml_dyn_tallocr * alloc) {
 
 static struct ggml_dyn_tallocr * ggml_dyn_tallocr_new(size_t alignment, size_t max_buffer_size) {
     struct ggml_dyn_tallocr * alloc = (struct ggml_dyn_tallocr *)malloc(sizeof(struct ggml_dyn_tallocr));
-    const char * trace = getenv("GGML_ALLOCATOR_TRACE");
 
     *alloc = (struct ggml_dyn_tallocr) {
         /*.alignment      = */ alignment,
@@ -396,7 +382,6 @@ static struct ggml_dyn_tallocr * ggml_dyn_tallocr_new(size_t alignment, size_t m
         /*.n_chunk_limits = */ 0,
         /*.chunks         = */ {NULL},
         /*.n_chunks       = */ 0,
-        /*.trace          = */ trace != NULL && strcmp(trace, "1") == 0,
 #ifdef GGML_ALLOCATOR_DEBUG
         /*.allocated_tensors = */ {{0}},
 #endif
@@ -796,7 +781,7 @@ static void ggml_gallocr_free_extra_space(ggml_gallocr_t galloc, struct ggml_ten
         p_addr.offset += node_size;
         size_t extra_size = parent_size - node_size;
         AT_PRINTF("freeing extra %zu bytes from parent %s for %s\n", extra_size, parent->name, node->name);
-        ggml_dyn_tallocr_free_bytes(p_alloc, p_addr, extra_size, parent->name);
+        ggml_dyn_tallocr_free_bytes(p_alloc, p_addr, extra_size);
     }
 }
 
@@ -887,7 +872,7 @@ static void ggml_gallocr_free_node(ggml_gallocr_t galloc, struct ggml_tensor * n
     remove_allocated_tensor(alloc, hn->addr, node);
 #endif
 
-    ggml_dyn_tallocr_free_bytes(alloc, hn->addr, size, node->name);
+    ggml_dyn_tallocr_free_bytes(alloc, hn->addr, size);
     hn->allocated = false;
 }
 

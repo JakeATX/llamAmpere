@@ -4396,13 +4396,6 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         const int64_t n_kv = dst->src[6] ? ggml_get_op_params_i32(dst, 6) : dst->src[1]->ne[1];
         GGML_ASSERT(dst->src[3]->ne[0]*32 >= n_kv);
         const bool native = ggml_cuda_fattn_mask_packed_native(dst);
-        static thread_local unsigned logged = 0;
-        const unsigned bit = 1u << ((native ? 0 : 2) + (dst->src[0]->ne[1] > 8));
-        if (!(logged & bit) && getenv("GGML_CUDA_FATTN_ALLOC_LOG")) {
-            GGML_LOG_INFO("packed mask: %s n_q=%lld n_kv=%lld\n", native ? "mask_packed_native" : "mask_packed_expand",
-                    (long long) dst->src[0]->ne[1], (long long) n_kv);
-            logged |= bit;
-        }
         if (!native) {
             ggml_cuda_flash_attn_ext_mask_expanded(ctx, dst, ggml_cuda_flash_attn_ext);
             return;

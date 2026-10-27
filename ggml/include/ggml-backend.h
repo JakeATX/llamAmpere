@@ -379,22 +379,6 @@ extern "C" {
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
 
-    // Opt-in host diagnostics (LLAMA_BOOKKEEP_TIMING). Input-sync time is nested in
-    // input-copy time; compute time measures submission and any host waits, not GPU events.
-    // Read only when the scheduler is not being used by another thread.
-    struct ggml_backend_sched_bookkeep_perf {
-        uint64_t session_host_us;
-        uint64_t transition_host_us;
-        uint64_t input_copy_host_us;
-        uint64_t user_input_sync_host_us;
-        uint64_t cpu_compute_host_us;
-        uint64_t gpu_compute_host_us;
-        uint64_t other_compute_host_us;
-        uint64_t cpu_split_calls;
-        uint64_t gpu_split_calls;
-        uint64_t other_split_calls;
-    };
-    GGML_API struct ggml_backend_sched_bookkeep_perf ggml_backend_sched_get_bookkeep_perf(ggml_backend_sched_t sched);
     GGML_API void                 ggml_backend_sched_synchronize(ggml_backend_sched_t sched);
 
     // Reset all assignments and allocators - must be called before changing the node backends or allocating a new graph.

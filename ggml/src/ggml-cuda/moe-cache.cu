@@ -632,24 +632,7 @@ struct moe_cache_device_table {
     // fork PREFETCHFIX: the same, filled only when asynchronous prefetch is on.
     int pf_layer = -1;
     int pf_kind = -1;
-    int route_trace_layer = -1;
     int tp_layer = -1, tp_kind = -1;
-};
-
-struct moe_route_record {
-    uint32_t round, layer, n_used, n_tokens;
-    int32_t ids[128];
-    uint32_t hot[3][16];
-};
-static_assert(sizeof(moe_route_record) == 720, "route trace ABI");
-
-struct moe_route_trace {
-    static constexpr unsigned capacity = 262144;
-    moe_route_record * host = nullptr;
-    moe_route_record * device = nullptr;
-    unsigned * counters = nullptr;
-    std::vector<std::array<const uint8_t *, 3>> hot;
-    std::vector<std::array<uint64_t, 3>> bytes;
 };
 
 // fork CACHEHIT: one queued table write, applied on the compute stream by a tiny kernel.
@@ -750,12 +733,6 @@ struct moe_cache_session {
     double swap_host_ms_total = 0.0;
     std::chrono::steady_clock::time_point swap_issue_time;
     double swap_land_ms_total = 0.0;
-    // fork CACHEHIT diagnostic trace (GGML_MOE_CACHE_TRACE=path): per-scope count deltas.
-    FILE * trace_file = nullptr;
-    bool trace_header = false;
-    std::vector<unsigned long long> trace_prev;
-    std::vector<unsigned long long> trace_now;
-    uint64_t trace_scopes = 0;
     // Guarded by mu: startup restores must retain space for the not-yet-created helper.
     bool prompt_loaned = false;
     bool profile_load_attempted = false;
@@ -775,7 +752,6 @@ struct moe_cache_session {
     // Host-source mappings survive table/slab reranks, until source invalidation.
     std::unordered_map<const void *, ggml_moe_cache_tensor_desc> mapped_sources;
     std::unordered_map<const void *, moe_cache_device_table> device_tables;
-    moe_route_trace route_trace;
     // fork (missjoin overlap): per-layer up/gate/down tables and the group staged last.
     std::vector<std::array<const moe_cache_device_table *, 3>> mj_groups;
     int mj_group = -1;
@@ -894,9 +870,8 @@ static void moe_prefetch_finish(moe_cache_session & session, moe_prefetch_copy &
 
 static size_t moe_cache_trim_session(
         moe_cache_session & session, int physical_device);
-static void moe_cache_device_release(moe_cache_session & session, bool retain_sources = false, bool census = false);
+static void moe_cache_device_release(moe_cache_session & session, bool retain_sources = false);
 static void moe_cache_swap_step(moe_cache_session & session);
-static void moe_cache_trace_step(moe_cache_session & session);
 static void moe_cache_swap_note_stream(moe_cache_session & session, ggml_backend_cuda_context & ctx);
 static void moe_cache_device_adapt(moe_cache_session & session);
 
@@ -3537,9 +3512,6 @@ static void moe_cache_session_leave(void * opaque) {
         if (active->active_scopes > 0) {
             active->active_scopes--;
         }
-        if (active->active_scopes == 0 && active->active_nodes == 0 && active->device_ready.load()) {
-            moe_cache_trace_step(*active);
-        }
         if (active->active_scopes == 0 && active->active_nodes == 0 && active->device_ready.load() && active->swap_enabled) {
             moe_cache_swap_step(*active);
         } else if (active->active_scopes == 0 && active->active_nodes == 0 &&
@@ -4858,7 +4830,7 @@ static void moe_cache_invalidate_session(
             session.idle_cv.wait(lock, [&] { return session.active_scopes == 0; });
             MOE_CACHE_LOG("[moe-cache] retained source mapping invalidated: base=%p bytes=%zu\n", d.data,
                     d.expert_size * (size_t)d.n_expert);
-            moe_cache_device_release(session, false, true);
+            moe_cache_device_release(session, false);
             session.device_attempted = false;
             break;
         }
@@ -7686,151 +7658,6 @@ static void moe_cache_swap_release(moe_cache_session & session) {
     session.swap_broken = false;
 }
 
-// fork CACHEHIT diagnostic: synchronous per-scope route-count deltas for the
-// offline policy simulator. Never use in timed runs.
-static void moe_cache_trace_step(moe_cache_session & session) {
-    const char * path = getenv("GGML_MOE_CACHE_TRACE");
-    if (!path || !path[0] || !session.device_expert_counts || session.devices.size() != 1) {
-        return;
-    }
-    auto & device = *session.devices[0];
-    if (!session.trace_file) {
-        session.trace_file = fopen(path, "wb");
-        if (!session.trace_file) {
-            return;
-        }
-    }
-    FILE * f = session.trace_file;
-    const size_t n = session.device_previous_counts.size();
-    if (!session.trace_header) {
-        session.trace_header = true;
-        session.trace_prev.assign(n, 0);
-        const uint32_t magic = 0x3143524d; // "MRC1"
-        const uint32_t n_tables = (uint32_t)session.device_tables.size();
-        fwrite(&magic, 4, 1, f);
-        fwrite(&n_tables, 4, 1, f);
-        for (auto & entry : session.device_tables) {
-            const auto & t = entry.second;
-            const uint32_t len = (uint32_t)strlen(t.desc.name);
-            const uint64_t off = t.count_offset, size = t.desc.expert_size;
-            const uint32_t ne = (uint32_t)t.desc.n_expert;
-            const int32_t type = t.desc.type;
-            int32_t pool_index = -1;
-            for (size_t p = 0; p < device.pools.size(); ++p) {
-                if (device.pools[p]->slab && device.pools[p]->expert_size == t.desc.expert_size && device.pools[p]->wtype == t.desc.type) {
-                    pool_index = (int32_t)p;
-                    break;
-                }
-            }
-            fwrite(&len, 4, 1, f);
-            fwrite(t.desc.name, 1, len, f);
-            fwrite(&off, 8, 1, f);
-            fwrite(&ne, 4, 1, f);
-            fwrite(&size, 8, 1, f);
-            fwrite(&type, 4, 1, f);
-            fwrite(&pool_index, 4, 1, f);
-            std::vector<uint8_t> state(ne, 0);
-            for (uint32_t e = 0; e < ne; ++e) {
-                state[e] = t.permanent[e] ? 2 : (t.addresses[e] != t.fallback[e] ? 1 : 0);
-            }
-            fwrite(state.data(), 1, ne, f);
-        }
-        const uint32_t n_pools = (uint32_t)device.pools.size();
-        fwrite(&n_pools, 4, 1, f);
-        for (const auto & p : device.pools) {
-            const int32_t type = p->wtype;
-            const uint64_t size = p->expert_size;
-            const uint32_t slots = (uint32_t)p->n_slots, free_slots = (uint32_t)p->free_slots.size();
-            fwrite(&type, 4, 1, f);
-            fwrite(&size, 8, 1, f);
-            fwrite(&slots, 4, 1, f);
-            fwrite(&free_slots, 4, 1, f);
-        }
-    }
-    session.trace_now.resize(n);
-    ggml_cuda_set_device(device.logical);
-    if (cudaDeviceSynchronize() != cudaSuccess ||
-            cudaMemcpy(session.trace_now.data(), session.device_expert_counts, n * sizeof(unsigned long long),
-                cudaMemcpyDeviceToHost) != cudaSuccess) {
-        (void) cudaGetLastError();
-        return;
-    }
-    std::vector<uint32_t> rec;
-    for (size_t i = 0; i < n; ++i) {
-        const unsigned long long d = session.trace_now[i] - session.trace_prev[i];
-        if (d) {
-            rec.push_back((uint32_t)i);
-            rec.push_back((uint32_t)std::min<unsigned long long>(d, UINT32_MAX));
-        }
-    }
-    session.trace_prev.swap(session.trace_now);
-    const uint64_t scope = ++session.trace_scopes;
-    const uint32_t n_rec = (uint32_t)(rec.size() / 2);
-    fwrite(&scope, 8, 1, f);
-    fwrite(&n_rec, 4, 1, f);
-    fwrite(rec.data(), 4, rec.size(), f);
-    fflush(f);
-}
-
-static void moe_route_trace_release(moe_cache_session & session) {
-    auto & trace = session.route_trace;
-    if (!trace.host) { return; }
-    unsigned counters[2] = {};
-    CUDA_CHECK(cudaMemcpy(counters, trace.counters, sizeof(counters), cudaMemcpyDeviceToHost));
-    const uint32_t records = std::min(counters[0], trace.capacity);
-    const uint32_t header[] = {0x32525052, 2, sizeof(moe_route_record), records,
-        counters[0] - records, (uint32_t) trace.hot.size(), 512};
-    FILE * f = fopen(getenv("GGML_MOE_TABLE_ROUTE_TRACE"), "ab");
-    if (!f || fwrite(header, sizeof(header), 1, f) != 1 ||
-            fwrite(trace.bytes.data(), sizeof(trace.bytes[0]), trace.bytes.size(), f) != trace.bytes.size() ||
-            fwrite(trace.host, sizeof(moe_route_record), records, f) != records) {
-        GGML_ABORT("device route trace write failed");
-    }
-    fclose(f);
-    MOE_CACHE_LOG("[moe-route-trace] records=%u rounds=%u overflow=%u; diagnostic only\n",
-        records, counters[1], counters[0] - records);
-    CUDA_CHECK(cudaFreeHost(trace.host));
-    CUDA_CHECK(cudaFree(trace.counters));
-    trace = {};
-}
-
-static void moe_route_trace_prepare(moe_cache_session & session) {
-    if (!getenv("GGML_MOE_TABLE_ROUTE_TRACE")) { return; }
-#if defined(GGML_USE_HIP)
-    GGML_ABORT("packed route trace requires CUDA warp32");
-#endif
-    auto & trace = session.route_trace;
-    GGML_ASSERT(!trace.host);
-    for (auto & entry : session.device_tables) {
-        auto & t = entry.second;
-        int layer = -1, parsed = 0;
-        char kind[16] = {};
-        if (!t.desc.name || sscanf(t.desc.name, "blk.%d.ffn_%15[a-z]_exps%n", &layer, kind, &parsed) != 2 ||
-                parsed <= 0 || (t.desc.name[parsed] != '\0' && strcmp(t.desc.name + parsed, ".weight") != 0) ||
-                layer < 0 || layer >= 128) {
-            GGML_ABORT("route trace requires named expert tables");
-        }
-        const int k = strcmp(kind, "up") == 0 ? 0 : strcmp(kind, "gate") == 0 ? 1 : strcmp(kind, "down") == 0 ? 2 : -1;
-        GGML_ASSERT(k >= 0 && t.desc.n_expert == 512 && t.hot);
-        if ((size_t) layer >= trace.hot.size()) {
-            trace.hot.resize(layer + 1, {});
-            trace.bytes.resize(layer + 1, {});
-        }
-        GGML_ASSERT(!trace.hot[layer][k]);
-        trace.hot[layer][k] = t.hot;
-        trace.bytes[layer][k] = (size_t) t.desc.n_out * ggml_row_size((ggml_type) t.desc.type, t.desc.n_in);
-        if (k == 0) { t.route_trace_layer = layer; }
-    }
-    for (const auto & group : trace.hot) {
-        GGML_ASSERT(group[0] && group[1] && group[2]);
-    }
-    CUDA_CHECK(cudaHostAlloc((void **) &trace.host, trace.capacity * sizeof(moe_route_record), cudaHostAllocMapped));
-    CUDA_CHECK(cudaHostGetDevicePointer((void **) &trace.device, trace.host, 0));
-    CUDA_CHECK(cudaMalloc((void **) &trace.counters, 2 * sizeof(unsigned)));
-    CUDA_CHECK(cudaMemset(trace.counters, 0, 2 * sizeof(unsigned)));
-}
-
-
 static void moe_table_prefetch_release(moe_cache_session & session) {
 #if !defined(GGML_USE_HIP)
     for (auto & device : session.devices) {
@@ -7933,7 +7760,7 @@ void ggml_cuda_moe_cache_table_graph_end(ggml_backend_cuda_context & ctx) {
 #endif
 }
 
-static void moe_cache_device_release(moe_cache_session & session, bool retain_sources, bool census) {
+static void moe_cache_device_release(moe_cache_session & session, bool retain_sources) {
     moe_pf_release(&session); // fork PREFETCHFIX: tables below are about to be freed
     session.device_ready.store(false);
     if (session.device_adapt_stream) {
@@ -7963,9 +7790,6 @@ static void moe_cache_device_release(moe_cache_session & session, bool retain_so
     ggml_cuda_set_device(session.devices[0]->logical);
     // Tables can be in flight on a scheduler stream, not the legacy cache stream.
     (void) cudaDeviceSynchronize();
-    if ((session.stopping || census) && session.devices.size() == 1 && moe_cache_env_on("GGML_MOE_CACHE_RESIDENT_CENSUS")) {
-        (void) moe_cache_swap_groups(session, true);
-    }
     if (session.mj_retained_arena) {
         unsigned long long counts[7] = {};
         if (cudaMemcpy(counts, session.mj_retained_counts, sizeof(counts), cudaMemcpyDeviceToHost) == cudaSuccess) {
@@ -7978,14 +7802,7 @@ static void moe_cache_device_release(moe_cache_session & session, bool retain_so
     }
     session.mj_retained_stream = nullptr;
     session.mj_retained_stream_set = false;
-    moe_route_trace_release(session);
     moe_cache_swap_release(session);
-    if (session.trace_file) {
-        const uint64_t marker = UINT64_MAX;
-        fwrite(&marker, 8, 1, session.trace_file);
-        fflush(session.trace_file);
-        session.trace_header = false;
-    }
     unsigned long long counts[3] = {};
     if (session.device_route_counts) {
         if (cudaMemcpy(counts, session.device_route_counts, sizeof(counts), cudaMemcpyDeviceToHost) == cudaSuccess) {
@@ -8110,38 +7927,6 @@ bool ggml_cuda_moe_cache_device_supports(const ggml_tensor * op, int logical) {
 }
 
 // Per-expert counters remain on the card between bounded idle boundaries.
-static __global__ void moe_route_trace_kernel(const int32_t * ids, int n_used, int n_tokens, int stride,
-        int layer, const uint8_t * up, const uint8_t * gate, const uint8_t * down,
-        moe_route_record * records, unsigned * counters) {
-    __shared__ unsigned index, round;
-    if (threadIdx.x == 0) {
-        index = atomicAdd(counters, 1u);
-        round = layer == 0 ? atomicAdd(counters + 1, 1u) + 1 : counters[1];
-    }
-    __syncthreads();
-    if (index >= moe_route_trace::capacity) { return; }
-    auto & record = records[index];
-    if (threadIdx.x == 0) {
-        record.round = round;
-        record.layer = layer;
-        record.n_used = n_used;
-        record.n_tokens = n_tokens;
-    }
-    for (int i = threadIdx.x; i < 128; i += blockDim.x) {
-        record.ids[i] = i < n_used * n_tokens ? ids[(i / n_used) * stride + i % n_used] : -1;
-    }
-    for (int i = threadIdx.x; i < 512; i += blockDim.x) {
-        const uint32_t up_mask = __ballot_sync(0xffffffff, up[i] != 0);
-        const uint32_t gate_mask = __ballot_sync(0xffffffff, gate[i] != 0);
-        const uint32_t down_mask = __ballot_sync(0xffffffff, down[i] != 0);
-        if (threadIdx.x % 32 == 0) {
-            record.hot[0][i / 32] = up_mask;
-            record.hot[1][i / 32] = gate_mask;
-            record.hot[2][i / 32] = down_mask;
-        }
-    }
-}
-
 static __global__ void moe_cache_count_routes(const int32_t * ids, const uint8_t * hot,
         unsigned long long * counts, unsigned long long * expert_counts, int n, int experts, int n_ids, int ids_stride) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -10617,15 +10402,6 @@ bool ggml_cuda_moe_cache_device_compute(ggml_backend_cuda_context & ctx, ggml_te
     // fork (missjoin hit-first): the first projection of a layer starts the layer's miss copies right here,
     // before this dispatch's own work, so the link is busy while the resident math runs.
     const bool hf_on = moe_hf_begin(ctx, session, table, a, ids);
-    if (session.route_trace.host && table.route_trace_layer >= 0) {
-        GGML_ASSERT(ids->ne[0] * ids->ne[1] <= 128);
-        const int layer = table.route_trace_layer;
-        const auto & hot = session.route_trace.hot[layer];
-        moe_route_trace_kernel<<<1, 256, 0, ctx.stream()>>>((const int32_t *) ids->data,
-            (int) ids->ne[0], (int) ids->ne[1], (int) (ids->nb[1] / sizeof(int32_t)), layer,
-            hot[0], hot[1], hot[2], session.route_trace.device, session.route_trace.counters);
-        CUDA_CHECK(cudaGetLastError());
-    }
 #if !defined(GGML_USE_HIP)
     auto & tp_device = *session.devices[0];
     const bool table_prefetch = tp_device.table_prefetch_prepared;
@@ -10781,7 +10557,7 @@ bool ggml_cuda_moe_cache_device_fused_compute(ggml_backend_cuda_context & ctx,
     const ggml_tensor * ids = up->src[2];
     if (hitg) {
         const int64_t ids_stride = ids->nb[1] / sizeof(int32_t);
-        const bool ok = !session.route_trace.host && up_table.mj_kind == 0 && gate_table.mj_kind == 1 &&
+        const bool ok = up_table.mj_kind == 0 && gate_table.mj_kind == 1 &&
                 up_table.mj_layer >= 0 && up_table.mj_layer == gate_table.mj_layer &&
                 a->type == GGML_TYPE_F32 && ids->ne[2] == 1 &&
                 ggml_cuda_moe_table_mmv_hitg_supported((ggml_type) up_table.desc.type, a->ne[0], glu->ne[0],
@@ -11403,7 +11179,6 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
         moe_missjoin_overlap_prepare(*session);
         moe_missjoin_retained_prepare(*session);
         moe_pf_prepare(*session);
-        moe_route_trace_prepare(*session);
         moe_table_prefetch_prepare(*session);
         session->mapped_sources.clear();
         for (int i = 0; i < n_tensors; ++i) { session->mapped_sources.emplace(tensors[i].data, tensors[i]); }

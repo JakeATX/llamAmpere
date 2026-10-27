@@ -50,9 +50,6 @@ Shutdown statistics count unique useful projection bytes, actual copied bytes
 (including canceled partial copies), served routes and copy launches. The
 reported kernel span excludes FIFO waits and is not copy-engine busy time.
 
-`GGML_MOE_TABLE_ROUTE_TRACE=/absolute/path` enables a separate diagnostic capture
-of actual device routes and hot masks (`RPR2`) plus position-aware prompt route
-readbacks (`PRT2`). It issues no prefetch copies and must be disabled for timing.
 Full model/output, SJ-KVaRN save/restore and CUDA operator gates remain required;
 compilation or replay alone does not qualify the runtime.
 

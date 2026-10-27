@@ -2212,10 +2212,6 @@ std::unique_ptr<llama_moe_arena> llama_model_loader::load_moe_arena(llama_progre
                 __func__, total / double(GiB), stats.seconds, total / double(GiB) / std::max(stats.seconds, 1e-9), stats.threads,
                 stats.chunk >> 20, stats.direct ? "direct (page cache bypassed)" : "buffered (pages dropped after use)",
                 stats.bytes_read / double(GiB), llama_moe_arena::available_memory() / double(GiB));
-        if (const char * h = getenv("LLAMA_MOE_ARENA_HASH"); h && atoi(h) != 0) {
-            LLAMA_LOG_INFO("%s: [LOADFAST] arena checksum %016llx over %zu bytes\n", __func__,
-                    (unsigned long long) llama_moe_arena_checksum(arena->data, total), total);
-        }
         if (pin_early) {
             pinner.t.join();
             if (pin_result.load() != 1) { throw std::runtime_error("expert arena CUDA host registration failed"); }
@@ -2308,10 +2304,6 @@ std::unique_ptr<llama_moe_arena> llama_model_loader::load_moe_arena(llama_progre
         base += stride * (size_t) ts[0]->ne[2];
         LLAMA_LOG_INFO("%s: layer %d copied, %.2f GiB MemAvailable\n", __func__, entry.first,
                 llama_moe_arena::available_memory() / double(GiB));
-    }
-    if (const char * h = getenv("LLAMA_MOE_ARENA_HASH"); h && atoi(h) != 0) {
-        LLAMA_LOG_INFO("%s: [LOADFAST] arena checksum %016llx over %zu bytes\n", __func__,
-                (unsigned long long) llama_moe_arena_checksum(arena->data, total), total);
     }
     arena->pin();
     if (llama_moe_arena::available_memory() < (5ull << 30)) {

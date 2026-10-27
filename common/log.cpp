@@ -572,11 +572,6 @@ void common_log_default_callback(enum ggml_log_level level, const char * text, v
         if (summary || swap) {
             verbosity = LOG_LEVEL_INFO;
         }
-    } else if (level == GGML_LOG_LEVEL_INFO &&
-               strncmp(text, "mtp_q5_batch_head_dispatch ", 27) == 0) {
-        // The backend already checked the helper dispatch and its AUDIT opt-in.
-        // Keep that emitted witness visible without enabling backend trace logs.
-        verbosity = LOG_LEVEL_INFO;
     }
     if (verbosity <= common_log_verbosity_thold) {
         common_log_add(common_log_main(), level, "%s", text);

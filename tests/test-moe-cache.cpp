@@ -4335,7 +4335,7 @@ static bool run_profile_swap_prior(ggml_backend_t gpu, ggml_backend_t cpu, log_c
                     "GGML_MOE_CACHE_PROFILE_GLOBAL", "GGML_MOE_CACHE_PROFILE_PRIOR_PCT",
                     "GGML_MOE_CACHE_PROFILE_PRIOR_DECAY", "GGML_MOE_CACHE_SWAP",
                     "GGML_MOE_CACHE_SWAP_INTERVAL", "GGML_MOE_CACHE_SWAP_DECAY_PCT",
-                    "GGML_MOE_CACHE_SWAP_MARGIN", "GGML_MOE_CACHE_TRACE"}) {
+                    "GGML_MOE_CACHE_SWAP_MARGIN"}) {
                 const char * value = getenv(name);
                 entries.push_back({name, value != nullptr, value ? value : ""});
             }
@@ -4354,7 +4354,6 @@ static bool run_profile_swap_prior(ggml_backend_t gpu, ggml_backend_t cpu, log_c
     set_env("GGML_MOE_CACHE_DEVICE", nullptr);
     set_env("GGML_MOE_CACHE_DEVICE_STATS", nullptr);
     set_env("GGML_MOE_CACHE_SWAP", nullptr);
-    set_env("GGML_MOE_CACHE_TRACE", nullptr);
     const std::string pattern = std::string(directory) + "/moe-swap-profile-XXXXXX";
     std::vector<char> filename(pattern.begin(), pattern.end());
     filename.push_back('\0');
@@ -4509,7 +4508,7 @@ static bool run_swap_whole(ggml_backend_t gpu, ggml_backend_t cpu, log_capture &
                     "GGML_MOE_CACHE_SWAP_LAYER", "GGML_MOE_CACHE_SWAP_MAX", "GGML_MOE_CACHE_SWAP_MB",
                     "GGML_MOE_CACHE_SWAP_INTERVAL", "GGML_MOE_CACHE_SWAP_DECAY_PCT",
                     "GGML_MOE_CACHE_SWAP_DECAY_AFTER", "GGML_MOE_CACHE_SWAP_HYST_PCT",
-                    "GGML_MOE_CACHE_SWAP_MARGIN_MILLI", "GGML_MOE_CACHE_TRACE"}) {
+                    "GGML_MOE_CACHE_SWAP_MARGIN_MILLI"}) {
                 const char * value = getenv(name);
                 entries.push_back({name, value != nullptr, value ? value : ""});
             }
@@ -4520,7 +4519,7 @@ static bool run_swap_whole(ggml_backend_t gpu, ggml_backend_t cpu, log_capture &
     set_env("GGML_CUDA_MOE_CACHE_BUDGET_MB", "48");
     for (const char * name : {"GGML_MOE_CACHE_PROFILE_LOAD", "GGML_MOE_CACHE_PROFILE_GLOBAL",
             "GGML_MOE_CACHE_PROFILE_PRIOR_PCT", "GGML_MOE_CACHE_DEVICE", "GGML_MOE_CACHE_SWAP",
-            "GGML_MOE_CACHE_DEVICE_CAPTURE", "GGML_MOE_CACHE_TRACE"}) { set_env(name, nullptr); }
+            "GGML_MOE_CACHE_DEVICE_CAPTURE"}) { set_env(name, nullptr); }
     std::string pattern = std::string(directory) + "/moe-whole-XXXXXX";
     std::vector<char> filename(pattern.begin(), pattern.end());
     filename.push_back('\0');

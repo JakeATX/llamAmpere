@@ -1162,23 +1162,16 @@ bool moe_cs_probe(double * route_ns, double * fixed_ns) {
     s.st_jobs = 0; s.st_experts = 0; s.st_routes = 0; s.st_busy_ns = 0; s.st_null = 0;
     fprintf(stderr, "[moe-cpu-split] probe on layer %d: empty job %.1f us, 1 expert %.1f us, 4 experts %.1f us -> %.1f us per (expert, route) + %.1f us per job\n",
             layer, t0 / 1000.0, t1 / 1000.0, t4 / 1000.0, per / 1000.0, *fixed_ns / 1000.0);
-    // Contention check (2026-10-23): a home run with git and simulations on the pool's cpus probed 116.9 us per expert
-    // against a clean 65 us and wrote at 26.7 tok/s. Two signals, either one warns:
-    //  - share of the pool's time spent waiting for a cpu during the timed jobs (over 25% = about 1.33x slower or worse);
-    //  - GGML_MOE_CPU_SPLIT_PROBE_EXPECT_US=<clean 1-expert us for this box>: the 1-expert time is over 2x that.
+    // Contention check: warns when the pool spent over 25% of the timed jobs waiting for a cpu (about 1.33x slower or worse).
     size_t expert_bytes = 0;
     for (int k = 0; k < 3; ++k) { expert_bytes += L.role[k].r.row_bytes * (size_t) L.role[k].r.n_out; }
-    const char * ex = getenv("GGML_MOE_CPU_SPLIT_PROBE_EXPECT_US");
-    const double expect_us = ex ? atof(ex) : 0.0;
     fprintf(stderr, "[moe-cpu-split] probe check: %.2f MB per expert, %.1f GB/s for 1 expert, %.1f GB/s for 4; "
-            "pool waited for a cpu %.1f%% of the time%s\n", expert_bytes / 1e6, expert_bytes / std::max(1.0, t1),
-            4.0 * expert_bytes / std::max(1.0, t4), 100.0 * stolen,
-            expect_us > 0 ? "" : " (set GGML_MOE_CPU_SPLIT_PROBE_EXPECT_US for a time check)");
-    if (stolen > 0.25 || (expect_us > 0 && t1 / 1000.0 > 2.0 * expect_us)) {
-        fprintf(stderr, "[moe-cpu-split] WARN: CPU CONTENTION at load: 1 expert %.1f us (expected %s), pool waited for a cpu "
+            "pool waited for a cpu %.1f%% of the time\n", expert_bytes / 1e6, expert_bytes / std::max(1.0, t1),
+            4.0 * expert_bytes / std::max(1.0, t4), 100.0 * stolen);
+    if (stolen > 0.25) {
+        fprintf(stderr, "[moe-cpu-split] WARN: CPU CONTENTION at load: 1 expert %.1f us, pool waited for a cpu "
                 "%.1f%% of the time. Other programs are running on the pool's cpus; split timings from this run are not "
-                "valid.\n", t1 / 1000.0, expect_us > 0 ? (std::to_string(expect_us) + " us").c_str() : "not set",
-                100.0 * stolen);
+                "valid.\n", t1 / 1000.0, 100.0 * stolen);
     }
     return true;
 }

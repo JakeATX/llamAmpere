@@ -4262,22 +4262,6 @@ static void set_input_kq_mask_seq_prefix(const llama_kv_cells & cells, const lla
 void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
     const uint32_t n_tokens = ubatch->n_tokens;
 
-    struct mask_host_timer {
-        const ggml_tensor * dst;
-        uint32_t n_tokens;
-        int64_t start;
-        ~mask_host_timer() {
-            if (start) {
-                const int64_t end = ggml_time_us();
-                LLAMA_LOG_INFO("mask host us: start=%lld duration=%lld packed=%d kv=%lld queries=%u bytes=%zu\n",
-                    (long long) start, (long long) (end - start), dst->type == GGML_TYPE_I32,
-                    (long long) (dst->type == GGML_TYPE_I32 ? dst->op_params[0] : dst->ne[0]), n_tokens, ggml_nbytes(dst));
-            }
-        }
-    };
-    static const bool profile = std::getenv("LLAMA_KQ_MASK_PROFILE") != nullptr;
-    const mask_host_timer timer { dst, n_tokens, profile ? ggml_time_us() : 0 };
-
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
 
     if (dst->type == GGML_TYPE_I32) {

@@ -88,11 +88,6 @@ struct common_speculative_draft_params {
     float    temp = 1.0f;
     uint32_t seed = LLAMA_DEFAULT_SEED;
 
-    // fork: optional per-round confidence output, aligned with result; null unless logging is enabled.
-    std::vector<float> * conf_p1 = nullptr;
-    std::vector<float> * conf_p2 = nullptr;
-    int * conf_depth = nullptr;
-
     // A shared verify budget can require fewer drafts than the configured minimum.
     int32_t n_min = -1;
 
@@ -137,24 +132,6 @@ bool common_speculative_restore_state(common_speculative * spec, llama_seq_id se
 
 // print statistics about the speculative decoding
 void common_speculative_print_stats(const common_speculative * spec);
-
-// [#47] LLAMA_HOST_PHASES=1: host-side split of the MTP draft call, process-wide. decode = llama_decode calls (graph
-// build + launch), sync = the wait for the draft GPU work (an explicit llama_synchronize after each decode, only
-// while enabled), sample = common_sampler_sample + common_sampler_accept on the draft logits, rest = everything
-// else inside the draft call (batch rebuild, hidden-row copies, KV trims, candidate bookkeeping).
-struct common_speculative_host_phases {
-    uint64_t n_calls   = 0;
-    uint64_t n_steps   = 0; // draft decodes
-    uint64_t decode_us = 0;
-    uint64_t sync_us   = 0;
-    uint64_t sample_us = 0;
-    uint64_t rest_us   = 0;
-};
-
-bool common_speculative_host_phases_enabled();
-
-// returns the totals since the previous call and resets them
-common_speculative_host_phases common_speculative_host_phases_take();
 
 struct common_speculative_deleter {
     void operator()(common_speculative * s) { common_speculative_free(s); }

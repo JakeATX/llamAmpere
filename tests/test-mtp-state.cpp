@@ -768,30 +768,6 @@ static void run_mtp_pipe() {
 // fork: exercise production pooling, attention and serialization without an evaluation callback that changes CUDA fusion.
 static void run_qwen4exp_indexer_layout(bool cuda) {
     const bool host_requested = common_get_env("LLAMA_QSA_RAW_HOST") == "1";
-    const bool trace = common_get_env("LLAMA_TEST_INDEXER_TRACE") == "1";
-    struct trace_state {
-        const char * arm;
-        bool reported = false;
-    } full_trace { "full" }, compact_trace { "compact" };
-    const auto trace_eval = +[](ggml_tensor * tensor, bool ask, void * user) {
-        auto & state = *static_cast<trace_state *>(user);
-        if (state.reported || tensor->type != GGML_TYPE_F32 || !ggml_is_contiguous(tensor)) { return !ask; }
-        if (ask) { return true; }
-        std::vector<float> data(ggml_nelements(tensor));
-        ggml_backend_tensor_get(tensor, data.data(), 0, ggml_nbytes(tensor));
-        for (size_t i = 0; i < data.size(); ++i) {
-            // Negative infinity is intentional in attention masks; NaN/+inf is not.
-            if (std::isnan(data[i]) || data[i] == std::numeric_limits<float>::infinity()) {
-                fprintf(stderr, "INDEXER_FIRST_NONFINITE arm=%s tensor=%s op=%s element=%zu shape=%lld,%lld,%lld,%lld value=%.9g\n",
-                        state.arm, tensor->name, ggml_op_name(tensor->op), i,
-                        (long long) tensor->ne[0], (long long) tensor->ne[1],
-                        (long long) tensor->ne[2], (long long) tensor->ne[3], data[i]);
-                state.reported = true;
-                break;
-            }
-        }
-        return true;
-    };
     prefill_env_restore prefill_env;
     prefill_env.set(false, false, false);
     feedback_env_restore feedback_env;
@@ -827,10 +803,6 @@ static void run_qwen4exp_indexer_layout(bool cuda) {
         cp.sj_kvarn_sink = 128;
         cp.sj_kvarn_tail = 128;
         cp.sj_kvarn_tail_max = 256;
-        if (trace) {
-            cp.cb_eval = trace_eval;
-            cp.cb_eval_user_data = compact ? &compact_trace : &full_trace;
-        }
         llama_context_ptr ctx(llama_init_from_model(source ? source : model.get(), cp));
         require(ctx != nullptr, "create indexer layout target");
         auto * mem = dynamic_cast<llama_memory_hybrid_idx *>(llama_get_memory(ctx.get()));
@@ -868,7 +840,7 @@ static void run_qwen4exp_indexer_layout(bool cuda) {
         auto decode = [&](llama_context * ctx, llama_seq_id seq, llama_pos from, int count, int salt) {
             common_batch batch(ctx);
             for (int i = 0; i < count; ++i) {
-                batch.add(token_at(from + i + salt), from + i, seq, trace || i == count - 1);
+                batch.add(token_at(from + i + salt), from + i, seq, i == count - 1);
             }
             require(llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0, "decode indexer layout target");
             const float * logits = llama_get_logits_ith(ctx, -1);
@@ -876,19 +848,9 @@ static void run_qwen4exp_indexer_layout(bool cuda) {
             size_t nonfinite = 0;
             for (size_t i = 0; i < n_vocab; ++i) { nonfinite += !std::isfinite(logits[i]); }
             if (nonfinite) {
-                fprintf(stderr, "INDEXER_NONFINITE arm=%s streams=%u seq=%d from=%d count=%d output_pos=%d bad_logits=%zu/%u trace=%d\n",
+                fprintf(stderr, "INDEXER_NONFINITE arm=%s streams=%u seq=%d from=%d count=%d output_pos=%d bad_logits=%zu/%u\n",
                         ctx == full.get() ? "full" : "compact", parallel, seq, from, count,
-                        from + count - 1, nonfinite, n_vocab, trace);
-                if (trace) {
-                    for (int row = 0; row < count; ++row) {
-                        const float * output = llama_get_logits_ith(ctx, row);
-                        if (std::any_of(output, output + n_vocab, [](float v) { return !std::isfinite(v); })) {
-                            fprintf(stderr, "INDEXER_FIRST_BAD_OUTPUT arm=%s pos=%d\n",
-                                    ctx == full.get() ? "full" : "compact", from + row);
-                            break;
-                        }
-                    }
-                }
+                        from + count - 1, nonfinite, n_vocab);
             }
             return std::vector<float>(logits, logits + n_vocab);
         };
@@ -1088,8 +1050,6 @@ static void run_qwen4exp_pool(bool cuda = false, bool store_only = false) {
         return std::vector<float>(logits, logits + (to - from)*n_vocab);
     };
     auto original = make_context();
-    const int64_t timing_started = ggml_time_us();
-    const auto timing_before = llama_perf_bookkeep_context(original.get());
     // A logits-producing helper uses the generic full graph under the same static env settings.
     llama_context_ptr reference = store_only ? make_context() : llama_context_ptr();
     auto append = [&](llama_seq_id seq, llama_pos from, llama_pos to, bool want_logits) {
@@ -1273,33 +1233,6 @@ static void run_qwen4exp_pool(bool cuda = false, bool store_only = false) {
     require(!large_reference || (large_actual.size() == large_expected.size() &&
                 std::memcmp(large_actual.data(), large_expected.data(), large_actual.size()*sizeof(float)) == 0),
             "sparse hash prefill preserves subsequent full-graph logits exactly");
-    const char * timing = std::getenv("LLAMA_BOOKKEEP_TIMING");
-    if (timing && std::atoi(timing) != 0) {
-        const auto after = llama_perf_bookkeep_context(original.get());
-        const uint64_t detail_us =
-            after.memory_init_layout_host_us - timing_before.memory_init_layout_host_us +
-            after.graph_prepare_host_us - timing_before.graph_prepare_host_us +
-            after.set_inputs_host_us - timing_before.set_inputs_host_us +
-            after.peer_sync_host_us - timing_before.peer_sync_host_us +
-            after.graph_submit_host_us - timing_before.graph_submit_host_us;
-        require(after.graph_rebuild_calls + after.graph_reuse_calls >
-                timing_before.graph_rebuild_calls + timing_before.graph_reuse_calls,
-                "catch-up detail counts graph preparation attempts");
-        require(detail_us > 0 && detail_us <= uint64_t(ggml_time_us() - timing_started + 10),
-                "catch-up detail stages are active and do not overlap");
-        uint64_t backend_us = 0;
-        for (size_t i : { 0u, 1u, 2u, 4u, 5u, 6u }) {
-            require(after.backend_submit[i] >= timing_before.backend_submit[i], "backend counters are monotonic");
-            backend_us += after.backend_submit[i] - timing_before.backend_submit[i];
-        }
-        require(backend_us > 0 && backend_us <= uint64_t(ggml_time_us() - timing_started + 10),
-                "backend host intervals are active and do not overlap");
-        require(after.backend_submit[3] - timing_before.backend_submit[3] <=
-                after.backend_submit[2] - timing_before.backend_submit[2],
-                "user-input synchronization is nested in input copies");
-        require(after.backend_submit[cuda ? 8 : 7] > timing_before.backend_submit[cuda ? 8 : 7],
-                "backend counters execute the selected CPU or CUDA provider");
-    }
     printf("DRAFTRW_POOL digest=%016llx\n", (unsigned long long) digest);
     printf("DRAFTRW_POOL_RESTORE rows=%zu exact_rows=%zu top1_equal=%zu kld_mean=%.17g kld_max=%.17g max_logit_error=%.17g\n",
             restore_rows, restore_exact_rows, restore_top1_equal, restore_kld_sum/restore_rows, restore_kld_max, restore_max_error);
@@ -2335,9 +2268,7 @@ static void run_qwen4exp_defer_math(bool cuda = false, const char * model_path =
     };
     auto reference = make_context();
     auto merged = make_context();
-    const auto backend_before = llama_perf_bookkeep_context(reference.get());
     uint64_t teacher_digest[2] = { UINT64_C(14695981039346656037), UINT64_C(14695981039346656037) };
-    std::array<std::array<std::array<uint64_t, 11>, 9>, 2> backend_cells{};
     const size_t width = llama_model_n_embd_out(model.get());
     auto decode = [&](llama_context * ctx, llama_pos from, int count, bool output) {
         common_batch batch(ctx);
@@ -2357,15 +2288,8 @@ static void run_qwen4exp_defer_math(bool cuda = false, const char * model_path =
         const int index = ctx == reference.get() ? 0 : 1;
         require(ctx == reference.get() || ctx == merged.get(), "known teacher context");
         teacher_digest[index] = check_teacher_batch(*rendered, width, teacher_digest[index]);
-        const auto before = llama_perf_bookkeep_context(ctx);
         require(llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, rendered) == 0, "defer arithmetic decode");
-        const auto after = llama_perf_bookkeep_context(ctx);
         require(count > 0 && count <= 8, "bounded teacher batch width");
-        auto & cell = backend_cells[output][count];
-        ++cell[0];
-        for (size_t i = 0; i < 10; ++i) {
-            cell[i + 1] += after.backend_submit[i] - before.backend_submit[i];
-        }
         if (!output) {
             llama_synchronize(ctx);
             return std::vector<float>();
@@ -2429,26 +2353,6 @@ static void run_qwen4exp_defer_math(bool cuda = false, const char * model_path =
     printf("BOOKKEEP_DEFER_MATH architecture=qwen4exp backend=%s dtype=%s kv=%s rows=%zu exact_rows=%zu exact_states=%zu/12 vocab=%d top1_equal=%zu/24 mean_kld=%.17g max_kld=%.17g max_logit_error=%.17g teacher=deterministic_synthetic quality_review_required=1\n",
             cuda ? "CUDA" : "CPU", model_path ? "GGUF" : "F32", f16_kv ? "F16" : "TQ5_0/TURBO4_0",
             rows, exact_rows, exact_states, vocab_size, same_top1, sum_kld/rows, max_kld, max_logit_error);
-    const auto backend_after = llama_perf_bookkeep_context(reference.get());
-    static const char * names[] = { "session_us", "transition_us", "input_copy_us", "user_input_sync_nested_us",
-        "cpu_compute_us", "gpu_submit_us", "other_compute_us", "cpu_splits", "gpu_splits", "other_splits" };
-    printf("BOOKKEEP_DEFER_BACKEND");
-    for (size_t i = 0; i < 10; ++i) {
-        printf(" %s=%llu", names[i], (unsigned long long) (backend_after.backend_submit[i] - backend_before.backend_submit[i]));
-    }
-    printf("\n");
-    for (size_t output = 0; output < backend_cells.size(); ++output) {
-        for (size_t count = 1; count < backend_cells[output].size(); ++count) {
-            const auto & cell = backend_cells[output][count];
-            if (cell[0] == 0) { continue; }
-            printf("BOOKKEEP_DEFER_BACKEND_CELL output=%zu width=%zu calls=%llu", output, count,
-                    (unsigned long long) cell[0]);
-            for (size_t i = 0; i < 10; ++i) {
-                printf(" %s=%llu", names[i], (unsigned long long) cell[i + 1]);
-            }
-            printf("\n");
-        }
-    }
 }
 
 static void run_case(llama_model * model, const cache_config & config, bool deferred) {
@@ -2929,14 +2833,6 @@ static void run_common_sampler(llama_model * model) {
     const auto & stats = common_sampler_get_pq_stats(sampler.get());
     require(stats.n_pos == 3 && stats.n_match == 1 && stats.n_extra == 1 && stats.n_rej == 1,
             "all three deterministic p/q outcomes exercised");
-    const char * timing = std::getenv("LLAMA_BOOKKEEP_TIMING");
-    if (timing && std::atoi(timing) != 0) {
-        const auto perf = common_sampler_get_prep_perf(sampler.get());
-        require(perf.prepare_calls > 0 && perf.prepare_us >= perf.fused_topk_us,
-                "candidate preparation timer includes fused selection");
-        const bool fused = common_get_env("LLAMA_BOOKKEEP_SAMPLER") == "1";
-        require((perf.fused_topk_calls > 0) == fused, "fused selection timer follows the actual path");
-    }
     printf("BOOKKEEP_SAMPLER digest=%016llx pq_pos=%zu match=%zu extra=%zu reject=%zu\n",
             (unsigned long long) digest, stats.n_pos, stats.n_match, stats.n_extra, stats.n_rej);
 }

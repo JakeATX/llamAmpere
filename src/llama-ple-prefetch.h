@@ -40,7 +40,7 @@ public:
     bool start(const llama_batch_ext & batch, llama_pos pos0);
 
     // the next ubatch of this call (n_tokens, in call order) is about to gather: waits until its pages are read and lets
-    // the readers move on. idx = the rows the graph input computed (compared with the guess when LLAMA_PLE_PF_CHECK=1).
+    // the readers move on. idx = the rows the graph input computed.
     // Returns true when the ubatch was covered, so the caller skips its own madvise.
     bool consume(uint32_t n_tokens, const int32_t * idx, size_t n_idx);
 
@@ -60,7 +60,6 @@ private:
     // configuration
     int      n_threads = 0;
     bool     use_pread = true;
-    bool     check     = false;
     uint32_t n_min     = 256;
     uint32_t n_ubatch  = 0;
     uint64_t n_ahead   = 0;      // tokens read ahead of the gather
@@ -102,6 +101,4 @@ private:
     int64_t t_wait_us  = 0;
     int     n_ubatch_c = 0;
     int     n_ubatch_u = 0; // consume() calls that fell outside the call (not covered)
-    int64_t n_checked  = 0;
-    int64_t n_mismatch = 0;
 };

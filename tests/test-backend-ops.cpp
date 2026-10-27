@@ -18853,41 +18853,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
-    // [PARW] Swift 1.5 (Qwen3.8-27B IQ4_XS-M) projection shapes (m = N out, k = K in) at the batched-verify widths
-    // N x (depth+1): GGML_PARW_BENCH=1 every type/shape, =head adds the Q6_K output head, =<type> one type only
-    if (const char * pb = getenv("GGML_PARW_BENCH"); pb != nullptr) {
-        const std::string sel = pb;
-        const std::array<std::array<int64_t, 2>, 7> body = {{
-            {17408, 5120}, {5120, 17408}, {10240, 5120}, {6144, 5120}, {5120, 6144}, {12288, 5120}, {1024, 5120}}};
-        std::vector<int64_t> widths = {1, 2, 3, 4, 5, 6, 8, 9, 10, 12, 15, 16, 18, 20, 24};
-        if (const char * pw = getenv("GGML_PARW_WIDTHS"); pw != nullptr) {
-            widths.clear();
-            std::stringstream ss(pw);
-            for (std::string w; std::getline(ss, w, ',');) {
-                widths.push_back(std::stoll(w));
-            }
-        }
-        for (int64_t n : widths) {
-            for (ggml_type type_a : {GGML_TYPE_IQ4_XS, GGML_TYPE_Q5_0, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}) {
-                if (sel != "1" && sel != "head" && sel != ggml_type_name(type_a)) {
-                    continue;
-                }
-                for (const auto & mk : body) {
-                    if ((type_a == GGML_TYPE_Q6_K || type_a == GGML_TYPE_Q8_0) && mk[0] != 1024) {
-                        continue; // Swift: Q6_K / Q8_0 only on attn_k / attn_v
-                    }
-                    test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, mk[0], n, mk[1], {1, 1}, {1, 1}));
-                }
-                if (type_a == GGML_TYPE_Q8_0) {
-                    test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 48, n, 5120, {1, 1}, {1, 1})); // ssm_alpha/beta
-                }
-            }
-            if (sel == "1" || sel == "head") {
-                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 248320, n, 5120, {1, 1}, {1, 1}));
-            }
-        }
-    }
-
     // Q4_K multi-column mat-vec
     for (int64_t m : {4096, 6144, 6272, 14336}) {
         for (int bs : {1, 2, 3, 4, 8}) {

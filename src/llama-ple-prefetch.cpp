@@ -75,7 +75,6 @@ std::unique_ptr<llama_ple_prefetch> llama_ple_prefetch::create(const llama_model
     pf->model     = &model;
     pf->ple       = t;
     pf->n_threads = (int) std::min<int64_t>(n_thr, 512);
-    pf->check     = ple_pf_env("LLAMA_PLE_PF_CHECK", 0) != 0;
     pf->n_min     = (uint32_t) std::max<int64_t>(1, ple_pf_env("LLAMA_PLE_PF_MIN", 256));
     pf->n_ahead   = (uint64_t) std::max<int64_t>(0, ple_pf_env("LLAMA_PLE_PF_AHEAD", 2*(int64_t) n_ubatch));
     pf->n_ubatch  = n_ubatch;
@@ -104,8 +103,8 @@ std::unique_ptr<llama_ple_prefetch> llama_ple_prefetch::create(const llama_model
     pf->use_pread = false;
 #endif
 
-    LLAMA_LOG_WARN("%s: [PLEPF] PLE prefetch on: %d threads, %s, calls of %u+ tokens, %" PRIu64 " tokens ahead%s\n", __func__,
-            pf->n_threads, pf->use_pread ? "pread" : "page faults", pf->n_min, pf->n_ahead, pf->check ? ", checking the guesses" : "");
+    LLAMA_LOG_WARN("%s: [PLEPF] PLE prefetch on: %d threads, %s, calls of %u+ tokens, %" PRIu64 " tokens ahead\n", __func__,
+            pf->n_threads, pf->use_pread ? "pread" : "page faults", pf->n_min, pf->n_ahead);
     return pf;
 }
 
@@ -155,8 +154,6 @@ bool llama_ple_prefetch::start(const llama_batch_ext & batch, llama_pos pos0) {
     t_wait_us = 0;
     n_ubatch_c = 0;
     n_ubatch_u = 0;
-    n_checked  = 0;
-    n_mismatch = 0;
     t_build_us = 0;
     t_last_read_us = 0;
     t_start_us = ggml_time_us();
@@ -368,16 +365,8 @@ bool llama_ple_prefetch::consume(uint32_t n_tokens, const int32_t * idx, size_t 
     t_wait_us += ggml_time_us() - tw;
     ++n_ubatch_c;
 
-    const int64_t n_heads = model->hparams.ple_n_heads;
-    if (check && idx && n_idx == (size_t) n_tokens*n_heads) {
-        for (size_t k = 0; k < n_idx; ++k) {
-            const int32_t g = pred[(size_t) t0*n_heads + k];
-            if (g >= 0) {
-                ++n_checked;
-                n_mismatch += g != idx[k];
-            }
-        }
-    }
+    GGML_UNUSED(idx);
+    GGML_UNUSED(n_idx);
     return true;
 }
 
@@ -400,11 +389,7 @@ void llama_ple_prefetch::stop() {
             "%d ubatches waited %.1f ms in all%s", __func__, toks.size(), pages.size(), pages.size()*4096.0/1048576.0,
             t_build_us.load()/1e3, n_read.load(), t_last_read_us.load()/1e3, n_ubatch_c, t_wait_us/1e3,
             n_ubatch_u ? " (some ubatches fell outside the call)" : "");
-    if (check) {
-        LLAMA_LOG_CONT(", check: %" PRId64 " of %" PRId64 " guessed rows differ\n", n_mismatch, n_checked);
-    } else {
-        LLAMA_LOG_CONT("\n");
-    }
+    LLAMA_LOG_CONT("\n");
 
     toks.clear();
     pred.clear();

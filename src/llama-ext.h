@@ -27,39 +27,6 @@ struct llama_sampler_output {
 // Synchronizes this context once. Raw logits are returned only when CPU sampling needs them.
 LLAMA_API llama_sampler_output llama_get_sampler_output_ith(struct llama_context * ctx, int32_t idx);
 
-// Optional LLAMA_BOOKKEEP_TIMING diagnostics, aggregated for all contexts of ctx's type
-// (default target or MTP), for the life of this process. Disabled/null ctx returns zeros.
-// Take before/after snapshots and subtract; concurrent reads are not a coherent transaction.
-// Host times are inclusive diagnostics nested in phase/native round times; do not sum them.
-// Copy time excludes its public wrapper's synchronize; release includes its nested synchronize.
-// Copy calls include invalid/empty requests; bytes count completed copies only. Release calls
-// include only validated file-backed reclaim attempts, excluding disabled/invalid early returns.
-struct llama_bookkeep_context_perf {
-    uint64_t sync_calls = 0;
-    uint64_t sync_host_us = 0;
-    uint64_t copy_calls = 0;
-    uint64_t copy_bytes = 0;
-    uint64_t copy_host_us = 0;
-    uint64_t release_calls = 0;
-    uint64_t release_host_us = 0;
-    // The five detail intervals are disjoint within process_ubatch; sync/copy/release above
-    // can overlap them. Memory includes decode's memory_update/init_batch and the ubatch's
-    // apply/layout/maintenance before graph preparation. Graph preparation includes retries;
-    // rebuild/reuse calls count attempts. Submission includes any backend input-copy waits,
-    // not the complete asynchronous GPU execution. These fields do not partition all decode.
-    uint64_t memory_init_layout_host_us = 0;
-    uint64_t graph_prepare_host_us = 0;
-    uint64_t set_inputs_host_us = 0;
-    uint64_t peer_sync_host_us = 0;
-    uint64_t graph_submit_host_us = 0;
-    uint64_t graph_rebuild_calls = 0;
-    uint64_t graph_reuse_calls = 0;
-    // session, transition, input-copy, nested user-input-sync, CPU/GPU/other
-    // compute host time (us), then CPU/GPU/other split counts.
-    uint64_t backend_submit[10] = {};
-};
-LLAMA_API llama_bookkeep_context_perf llama_perf_bookkeep_context(const struct llama_context * ctx);
-
 // fork: Opt-in logical-batch MTP hidden staging. Returns -4 when the ordinary input path is required.
 LLAMA_API bool llama_mtp_prefill_init(struct llama_context * target);
 LLAMA_API void llama_mtp_prefill_reset(struct llama_context * target, llama_seq_id seq);
@@ -299,13 +266,6 @@ LLAMA_API bool llama_sampler_chain_is_backend(const struct llama_sampler * sampl
 // supports_rows, and (for a chain) every sampler was offloaded by backend_init: safe for multi-row sampling
 LLAMA_API bool llama_sampler_backend_rows_ready(const struct llama_sampler * sampler);
 
-// fork: optional CPU sampler detail, enabled by LLAMA_BOOKKEEP_TIMING.
-struct llama_sampler_child_perf {
-    const char * name;
-    int64_t time_us;
-    uint64_t calls;
-};
-LLAMA_API std::vector<llama_sampler_child_perf> llama_perf_sampler_children(const struct llama_sampler * sampler);
 // One-shot tag for the next llama_decode() on ctx. The call reads it on entry and
 // resets it to LLAMA_DECODE_PHASE_UNKNOWN when it returns, including on error.
 // UNKNOWN (0, same value as LLAMA_DECODE_PHASE_AUTOMATIC) means no tag. Encoder

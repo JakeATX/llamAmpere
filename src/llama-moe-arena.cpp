@@ -281,31 +281,6 @@ void llama_moe_arena_parallel_load(const std::vector<llama_moe_arena_copy> & cop
 #endif
 }
 
-uint64_t llama_moe_arena_checksum(const void * data, size_t bytes) {
-    // FNV-style mix over 8-byte words per 64 MiB piece, pieces combined in order
-    const size_t piece = (size_t) 64 << 20;
-    const size_t n = (bytes + piece - 1) / piece;
-    std::vector<uint64_t> part(n, 0);
-    std::atomic<size_t> next{0};
-    auto worker = [&]() {
-        for (size_t k = next++; k < n; k = next++) {
-            const size_t a = k * piece, len = std::min(piece, bytes - a);
-            const unsigned char * p = (const unsigned char *) data + a;
-            uint64_t h = 1469598103934665603ull ^ k;
-            size_t i = 0;
-            for (; i + 8 <= len; i += 8) { uint64_t w; memcpy(&w, p + i, 8); h = (h ^ w) * 1099511628211ull; }
-            for (; i < len; ++i) { h = (h ^ p[i]) * 1099511628211ull; }
-            part[k] = h;
-        }
-    };
-    std::vector<std::thread> pool;
-    for (int i = 0; i < 8; ++i) { pool.emplace_back(worker); }
-    for (auto & t : pool) { t.join(); }
-    uint64_t h = 0;
-    for (uint64_t v : part) { h = (h ^ v) * 1099511628211ull + 0x9e3779b97f4a7c15ull; }
-    return h;
-}
-
 bool llama_moe_arena::is_expert(const char * name) {
     const char * suffixes[] = { ".ffn_gate_exps.weight", ".ffn_up_exps.weight", ".ffn_down_exps.weight" };
     const size_t length = strlen(name);
