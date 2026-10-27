@@ -2617,11 +2617,21 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         GGML_ASSERT(down_exps == nullptr || down_exps->ne[2] == n_expert);
         ggml_tensor * cold_ids = selected_experts;
 
+        static const int hot_dbg = getenv("GGML_MOE_HOT_DBG") ? atoi(getenv("GGML_MOE_HOT_DBG")) : 0;
         moe_weights_override = w_hot;
-        ggml_tensor * out_hot = build_moe_ffn(cur, gate_inp, nullptr,
+        ggml_tensor * out_hot = hot_dbg == 1 ?
+            build_moe_ffn(cur, gate_inp, nullptr,
+                up_exps, up_exps_b, gate_exps, gate_exps_b, down_exps, down_exps_b, exp_probs_b,
+                n_expert, n_expert_used, type_op, norm_w, w_scale, gating_op, il,
+                logits, gate_up_exps, gate_up_exps_b, up_exps_s, gate_exps_s, down_exps_s, selected_experts) :
+            build_moe_ffn(cur, gate_inp, nullptr,
                 hot.up, nullptr, hot.gate, nullptr, hot.down, nullptr, exp_probs_b,
                 n_expert, n_expert_used, type_op, norm_w, w_scale, gating_op, il,
                 logits, nullptr, nullptr, nullptr, nullptr, nullptr, hot_ids);
+        if (hot_dbg == 2) {
+            out_hot = ggml_scale(ctx0, out_hot, 0.0f);
+            w_cold  = weights;
+        }
         moe_weights_override = w_cold;
         ggml_tensor * out_cold = build_moe_ffn(cur, gate_inp, nullptr,
                 up_exps, up_exps_b, gate_exps, gate_exps_b, down_exps, down_exps_b, exp_probs_b,
