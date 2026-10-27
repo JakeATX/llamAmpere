@@ -3834,6 +3834,122 @@ static bool run_prompt_warm_decode_heat(ggml_backend_t gpu, ggml_backend_t cpu, 
     return ok;
 }
 
+#if defined(__linux__)
+// Exercise the whole-bundle contract independently of retired slice policies.
+static bool run_profile_whole_return(ggml_backend_t gpu, ggml_backend_t cpu,
+        log_capture & capture, const std::string & path) {
+    const auto & api = active_api();
+    if (!api.warm || !api.trim || !api.restore) { return false; }
+    const char * old_whole = getenv("GGML_MOE_CACHE_WHOLE_ONLY");
+    const bool had_whole = old_whole != nullptr;
+    const std::string saved_whole = old_whole ? old_whole : "";
+    constexpr int64_t n_in = 1024, n_out = 16, n_expert = 256;
+    const ggml_type types[] = {GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0};
+    const char * names[] = {"blk.5.ffn_gate_exps.weight", "blk.5.ffn_up_exps.weight", "blk.5.ffn_down_exps.weight"};
+    std::vector<uint8_t> storage[3];
+    ggml_moe_cache_tensor_desc whole_desc[3];
+    std::vector<uint64_t> whole_usage(n_expert);
+    for (size_t e = 0; e < whole_usage.size(); ++e) { whole_usage[e] = n_expert - e; }
+    const uint64_t * whole_counts[] = {whole_usage.data(), whole_usage.data(), whole_usage.data()};
+    for (size_t k = 0; k < 3; ++k) {
+        const size_t bytes = ggml_row_size(types[k], n_in) * n_out;
+        storage[k].resize(bytes * n_expert);
+        whole_desc[k] = {names[k], storage[k].data(), bytes, n_in, n_out, n_expert, types[k]};
+    }
+    set_env("GGML_MOE_CACHE_PROFILE_LOAD", nullptr);
+    set_env("GGML_MOE_CACHE_PROFILE_SAVE", path.c_str());
+    set_env("GGML_MOE_CACHE_PROFILE_GLOBAL", nullptr);
+    set_env("GGML_MOE_CACHE_WHOLE_ONLY", "0");
+    void * writer = create_direct_session(gpu, cpu);
+    bool transition_ok = writer != nullptr && api.restore;
+    if (writer) {
+        transition_ok &= api.warm(writer, whole_desc, whole_counts, 3) > 0;
+        api.session_destroy(writer);
+    }
+    set_env("GGML_MOE_CACHE_PROFILE_LOAD", path.c_str());
+    set_env("GGML_MOE_CACHE_PROFILE_SAVE", nullptr);
+    set_env("GGML_MOE_CACHE_WHOLE_ONLY", "1");
+    void * reader = create_direct_session(gpu, cpu);
+    transition_ok &= reader != nullptr;
+    if (reader && api.restore) {
+        capture.clear();
+        transition_ok &= api.warm(reader, whole_desc, nullptr, 3) > 0;
+        for (int pass = 0; pass < 2; ++pass) {
+            transition_ok &= api.trim(reader, 1u << 20) >= 1u << 20;
+            api.restore(reader);
+            transition_ok &= api.warm(reader, whole_desc, whole_counts, 3) >= 0;
+            api.session_enter(reader);
+            for (int32_t e = 0; e < 64; ++e) {
+                for (const auto & desc : whole_desc) {
+                    transition_ok &= direct_plan_one(desc.name, desc.data, desc.expert_size,
+                            n_in, n_out, desc.type, n_expert, e) == 1;
+                }
+            }
+            api.session_leave(reader);
+        }
+        const std::string log = capture.get();
+        transition_ok &= log.find("whole-only plan reconciled:") != std::string::npos;
+        transition_ok &= log.find("whole-only plan refused:") == std::string::npos;
+        transition_ok &= log.find("whole-only warm refused:") == std::string::npos;
+    }
+    if (reader) { api.session_destroy(reader); }
+#ifdef GGML_CUDA
+    // A compute allocation made during the prompt loan is outside the cache
+    // grant. Rebuild must use physical headroom, without starving a late pool.
+    const char * old_reserve = getenv("GGML_CUDA_MOE_CACHE_RESERVE_MB");
+    const bool had_reserve = old_reserve != nullptr;
+    const std::string saved_reserve = old_reserve ? old_reserve : "";
+    size_t free_bytes = 0, total_bytes = 0;
+    transition_ok &= cudaMemGetInfo(&free_bytes, &total_bytes) == cudaSuccess;
+    transition_ok &= free_bytes > (64u << 20);
+    const std::string reserve = std::to_string(free_bytes > (64u << 20) ? (free_bytes >> 20) - 48 : 0);
+    set_env("GGML_CUDA_MOE_CACHE_RESERVE_MB", reserve.c_str());
+    reader = create_direct_session(gpu, cpu);
+    bool pressure_ok = reader != nullptr;
+    ggml_backend_buffer_t scratch = nullptr;
+    if (reader) {
+        capture.clear();
+        pressure_ok &= api.warm(reader, whole_desc, nullptr, 3) > 0;
+        pressure_ok &= api.trim(reader, 1u << 20) >= 1u << 20;
+        scratch = ggml_backend_alloc_buffer(gpu, 41u << 20);
+        pressure_ok &= scratch != nullptr;
+        if (scratch) {
+            api.restore(reader);
+            pressure_ok &= api.warm(reader, whole_desc, whole_counts, 3) >= 0;
+            api.session_enter(reader);
+            for (int32_t e = 0; e < 64; ++e) {
+                for (const auto & desc : whole_desc) {
+                    pressure_ok &= direct_plan_one(desc.name, desc.data, desc.expert_size,
+                            n_in, n_out, desc.type, n_expert, e) == 1;
+                }
+            }
+            api.session_leave(reader);
+        }
+        api.session_destroy(reader);
+    }
+    if (scratch) { ggml_backend_buffer_free(scratch); }
+    const std::string pressure_log = capture.get();
+    const std::string physical_prefix = "whole-only physical plan: budget=";
+    const auto physical_at = pressure_log.rfind(physical_prefix);
+    pressure_ok &= physical_at != std::string::npos;
+    if (physical_at != std::string::npos) {
+        pressure_ok &= strtoull(pressure_log.c_str() + physical_at + physical_prefix.size(), nullptr, 10) < (8u << 20);
+    }
+    pressure_ok &= pressure_log.find("whole-only plan refused:") == std::string::npos;
+    pressure_ok &= pressure_log.find("whole-only warm refused:") == std::string::npos;
+    printf("cache-profile-whole-pressure: %s\n", pressure_ok ? "OK" : "FAIL");
+    if (!pressure_ok) { fprintf(stderr, "%s", pressure_log.c_str()); }
+    transition_ok &= pressure_ok;
+    set_env("GGML_CUDA_MOE_CACHE_RESERVE_MB", had_reserve ? saved_reserve.c_str() : nullptr);
+#endif
+    printf("cache-profile-whole-return: %s\n", transition_ok ? "OK" : "FAIL");
+    if (!transition_ok) { fprintf(stderr, "%s", capture.get().c_str()); }
+    set_env("GGML_MOE_CACHE_WHOLE_ONLY", had_whole ? saved_whole.c_str() : nullptr);
+    return transition_ok;
+}
+
+#endif
+
 static bool run_profile_persistence(ggml_backend_t gpu, ggml_backend_t cpu, log_capture & capture) {
 #if defined(__linux__)
     const char * directory = getenv("GGML_MOE_CACHE_TEST_TMPDIR");
@@ -4060,116 +4176,8 @@ static bool run_profile_persistence(ggml_backend_t gpu, ggml_backend_t cpu, log_
         printf("cache-profile-arena global=%d: %s\n", (int)global, arena_ok ? "OK" : "FAIL");
         ok &= arena_ok;
     }
-    // Whole bundles must survive prompt lending and two same-session pool rebuilds.
-    {
-        const char * old_whole = getenv("GGML_MOE_CACHE_WHOLE_ONLY");
-        const bool had_whole = old_whole != nullptr;
-        const std::string saved_whole = old_whole ? old_whole : "";
-        constexpr int64_t n_in = 1024, n_out = 16, n_expert = 256;
-        const ggml_type types[] = {GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0};
-        const char * names[] = {"blk.5.ffn_gate_exps.weight", "blk.5.ffn_up_exps.weight", "blk.5.ffn_down_exps.weight"};
-        std::vector<uint8_t> storage[3];
-        ggml_moe_cache_tensor_desc whole_desc[3];
-        std::vector<uint64_t> whole_usage(n_expert);
-        for (size_t e = 0; e < whole_usage.size(); ++e) { whole_usage[e] = n_expert - e; }
-        const uint64_t * whole_counts[] = {whole_usage.data(), whole_usage.data(), whole_usage.data()};
-        for (size_t k = 0; k < 3; ++k) {
-            const size_t bytes = ggml_row_size(types[k], n_in) * n_out;
-            storage[k].resize(bytes * n_expert);
-            whole_desc[k] = {names[k], storage[k].data(), bytes, n_in, n_out, n_expert, types[k]};
-        }
-        set_env("GGML_MOE_CACHE_PROFILE_LOAD", nullptr);
-        set_env("GGML_MOE_CACHE_PROFILE_SAVE", path.c_str());
-        set_env("GGML_MOE_CACHE_PROFILE_GLOBAL", nullptr);
-        set_env("GGML_MOE_CACHE_WHOLE_ONLY", "0");
-        void * writer = create_direct_session(gpu, cpu);
-        bool transition_ok = writer != nullptr && api.restore;
-        if (writer) {
-            transition_ok &= api.warm(writer, whole_desc, whole_counts, 3) > 0;
-            api.session_destroy(writer);
-        }
-        set_env("GGML_MOE_CACHE_PROFILE_LOAD", path.c_str());
-        set_env("GGML_MOE_CACHE_PROFILE_SAVE", nullptr);
-        set_env("GGML_MOE_CACHE_WHOLE_ONLY", "1");
-        reader = create_direct_session(gpu, cpu);
-        transition_ok &= reader != nullptr;
-        if (reader && api.restore) {
-            capture.clear();
-            transition_ok &= api.warm(reader, whole_desc, nullptr, 3) > 0;
-            for (int pass = 0; pass < 2; ++pass) {
-                transition_ok &= api.trim(reader, 1u << 20) >= 1u << 20;
-                api.restore(reader);
-                transition_ok &= api.warm(reader, whole_desc, whole_counts, 3) >= 0;
-                api.session_enter(reader);
-                for (int32_t e = 0; e < 64; ++e) {
-                    for (const auto & desc : whole_desc) {
-                        transition_ok &= direct_plan_one(desc.name, desc.data, desc.expert_size,
-                                n_in, n_out, desc.type, n_expert, e) == 1;
-                    }
-                }
-                api.session_leave(reader);
-            }
-            const std::string log = capture.get();
-            transition_ok &= log.find("whole-only plan reconciled:") != std::string::npos;
-            transition_ok &= log.find("whole-only plan refused:") == std::string::npos;
-            transition_ok &= log.find("whole-only warm refused:") == std::string::npos;
-        }
-        if (reader) { api.session_destroy(reader); }
-#ifdef GGML_CUDA
-        // A compute allocation made during the prompt loan is outside the cache
-        // grant. Rebuild must use physical headroom, without starving a late pool.
-        const char * old_reserve = getenv("GGML_CUDA_MOE_CACHE_RESERVE_MB");
-        const bool had_reserve = old_reserve != nullptr;
-        const std::string saved_reserve = old_reserve ? old_reserve : "";
-        size_t free_bytes = 0, total_bytes = 0;
-        transition_ok &= cudaMemGetInfo(&free_bytes, &total_bytes) == cudaSuccess;
-        transition_ok &= free_bytes > (64u << 20);
-        const std::string reserve = std::to_string(free_bytes > (64u << 20) ? (free_bytes >> 20) - 48 : 0);
-        set_env("GGML_CUDA_MOE_CACHE_RESERVE_MB", reserve.c_str());
-        reader = create_direct_session(gpu, cpu);
-        bool pressure_ok = reader != nullptr;
-        ggml_backend_buffer_t scratch = nullptr;
-        if (reader) {
-            capture.clear();
-            pressure_ok &= api.warm(reader, whole_desc, nullptr, 3) > 0;
-            pressure_ok &= api.trim(reader, 1u << 20) >= 1u << 20;
-            scratch = ggml_backend_alloc_buffer(gpu, 41u << 20);
-            pressure_ok &= scratch != nullptr;
-            if (scratch) {
-                api.restore(reader);
-                pressure_ok &= api.warm(reader, whole_desc, whole_counts, 3) >= 0;
-                api.session_enter(reader);
-                for (int32_t e = 0; e < 64; ++e) {
-                    for (const auto & desc : whole_desc) {
-                        pressure_ok &= direct_plan_one(desc.name, desc.data, desc.expert_size,
-                                n_in, n_out, desc.type, n_expert, e) == 1;
-                    }
-                }
-                api.session_leave(reader);
-            }
-            api.session_destroy(reader);
-        }
-        if (scratch) { ggml_backend_buffer_free(scratch); }
-        const std::string pressure_log = capture.get();
-        const std::string physical_prefix = "whole-only physical plan: budget=";
-        const auto physical_at = pressure_log.rfind(physical_prefix);
-        pressure_ok &= physical_at != std::string::npos;
-        if (physical_at != std::string::npos) {
-            pressure_ok &= strtoull(pressure_log.c_str() + physical_at + physical_prefix.size(), nullptr, 10) < (8u << 20);
-        }
-        pressure_ok &= pressure_log.find("whole-only plan refused:") == std::string::npos;
-        pressure_ok &= pressure_log.find("whole-only warm refused:") == std::string::npos;
-        printf("cache-profile-whole-pressure: %s\n", pressure_ok ? "OK" : "FAIL");
-        if (!pressure_ok) { fprintf(stderr, "%s", pressure_log.c_str()); }
-        transition_ok &= pressure_ok;
-        set_env("GGML_CUDA_MOE_CACHE_RESERVE_MB", had_reserve ? saved_reserve.c_str() : nullptr);
-#endif
-        printf("cache-profile-whole-return: %s\n", transition_ok ? "OK" : "FAIL");
-        if (!transition_ok) { fprintf(stderr, "%s", capture.get().c_str()); }
-        ok &= transition_ok;
-        ok &= write_file(original);
-        set_env("GGML_MOE_CACHE_WHOLE_ONLY", had_whole ? saved_whole.c_str() : nullptr);
-    }
+    ok &= run_profile_whole_return(gpu, cpu, capture, path);
+    ok &= write_file(original);
     set_env("GGML_MOE_CACHE_PROFILE_GLOBAL", nullptr);
     auto rejected = [&](const ggml_moe_cache_tensor_desc & candidate) {
         void * session = create_direct_session(gpu, cpu);
@@ -4625,7 +4633,10 @@ static bool run_swap_whole(ggml_backend_t gpu, ggml_backend_t cpu, log_capture &
         bool case_ok = scheduler != nullptr;
         if (case_ok) {
             case_ok &= ggml_backend_sched_moe_cache_warm(scheduler, desc, count_ptrs, tensors) >= 0;
-            case_ok &= ggml_backend_sched_moe_cache_device_prepare(scheduler, desc, tensors) == 1;
+            // An unknown role is rejected before device publication under the
+            // mandatory whole policy; still execute its exact host fallback.
+            const int prepared = ggml_backend_sched_moe_cache_device_prepare(scheduler, desc, tensors);
+            case_ok &= prepared == (mode == 5 ? 0 : 1);
             case_ok &= ggml_backend_sched_alloc_graph(scheduler, graph);
             for (int round = 0; round < 12 && case_ok; ++round) {
                 case_ok &= ggml_backend_sched_graph_compute(scheduler, graph) == GGML_STATUS_SUCCESS;
@@ -4634,7 +4645,7 @@ static bool run_swap_whole(ggml_backend_t gpu, ggml_backend_t cpu, log_capture &
                     ggml_backend_tensor_get(outputs[t], actual.data(), 0, actual.size() * sizeof(float));
                     case_ok &= compare_output(expected[t], actual, 5e-4);
                     if (mode == 0 && round == 0) { control[t] = actual; }
-                    else { case_ok &= actual == control[t]; }
+                    else if (mode != 5) { case_ok &= actual == control[t]; }
                 }
                 case_ok &= cudaDeviceSynchronize() == cudaSuccess;
             }
@@ -4649,7 +4660,11 @@ static bool run_swap_whole(ggml_backend_t gpu, ggml_backend_t cpu, log_capture &
             case_ok &= log.find("partial=0") != std::string::npos;
             case_ok &= log.find("whole swap refused:") == std::string::npos;
         }
-        if (mode == 5) { case_ok &= log.find("whole swap refused:") != std::string::npos; }
+        if (mode == 5) {
+            case_ok &= log.find("whole-only device tables refused:") != std::string::npos;
+            case_ok &= log.find("device tables active:") == std::string::npos;
+            case_ok &= swaps <= 0;
+        }
         if (mode == 1 && !incompatible) {
             case_ok &= max_field_value(log, "evictions=") >= 3;
             case_ok &= max_field_value(log, "hits=") > max_field_value(log, "misses=");
@@ -7441,6 +7456,33 @@ int main(int argc, char ** argv) {
         ggml_backend_free(cpu);
         return !provider_is_cuda ? 77 : ok ? 0 : 1;
     }
+#if defined(__linux__)
+    if (argc == 2 && strcmp(argv[1], "--profile-whole-only") == 0) {
+        const char * directory = getenv("GGML_MOE_CACHE_TEST_TMPDIR");
+        bool ok = provider_is_cuda && directory;
+        std::string path;
+        if (ok) {
+            configure_cache(nullptr);
+            set_env("GGML_CUDA_MOE_CACHE_BUDGET_MB", "8");
+            set_env("GGML_CUDA_MOE_CACHE_THROTTLE", "8");
+            std::string pattern = std::string(directory) + "/moe-whole-return-XXXXXX";
+            std::vector<char> filename(pattern.begin(), pattern.end());
+            filename.push_back('\0');
+            const int fd = mkstemp(filename.data());
+            ok = fd >= 0;
+            if (ok) {
+                close(fd);
+                path = filename.data();
+                ok = run_profile_whole_return(gpu, cpu, capture, path);
+                remove(path.c_str());
+                remove((path + ".tmp").c_str());
+            }
+        }
+        ggml_backend_free(gpu);
+        ggml_backend_free(cpu);
+        return !provider_is_cuda ? 77 : ok ? 0 : 1;
+    }
+#endif
     if (argc == 2 && strcmp(argv[1], "--swap-whole-only") == 0) {
         bool ok = provider_is_cuda && run_swap_whole(gpu, cpu, capture);
         if (ok) { ok &= run_swap_whole(gpu, cpu, capture, true); }
