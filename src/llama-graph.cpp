@@ -2583,7 +2583,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         GGML_ASSERT(res->get_b1_ffn() == nullptr && "hot expert bank does not support the layer-major prompt path");
         GGML_ASSERT(!weight_before_ffn);
 
-        ggml_tensor * slot = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, hot.hot_map, 1, n_expert), selected_experts); // [1, n_expert_used, n_tokens]
+        // the maps hold one row per expert; look them up with the flattened expert ids
+        ggml_tensor * sel_flat = ggml_reshape_2d(ctx0, ggml_cont(ctx0, selected_experts), n_expert_used*n_tokens, 1);
+        ggml_tensor * slot = ggml_reshape_3d(ctx0,
+                ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, hot.hot_map, 1, n_expert), sel_flat), 1, n_expert_used, n_tokens);
         cb(slot, "ffn_moe_hot_slot", il);
         ggml_tensor * mask  = ggml_step(ctx0, ggml_scale_bias(ctx0, slot, 1.0f, 0.5f)); // 1 = hot, 0 = cold
         ggml_tensor * w_hot  = ggml_mul(ctx0, weights, mask);
@@ -2595,7 +2598,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(hot_ids, "ffn_moe_hot_ids", il);
         ggml_tensor * cold_ids = selected_experts;
         if (hot.cold_map != nullptr) {
-            ggml_tensor * cid = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, hot.cold_map, 1, n_expert), selected_experts);
+            ggml_tensor * cid = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, hot.cold_map, 1, n_expert), sel_flat);
             cold_ids = ggml_cast(ctx0, ggml_reshape_2d(ctx0, cid, n_expert_used, n_tokens), GGML_TYPE_I32);
             cb(cold_ids, "ffn_moe_cold_ids", il);
         }
