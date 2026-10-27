@@ -1276,7 +1276,6 @@ struct llm_graph_context {
         ggml_tensor * gate     = nullptr;
         ggml_tensor * down     = nullptr;
         ggml_tensor * hot_map  = nullptr; // F32 [n_expert]: hot slot or -1
-        ggml_tensor * cold_map = nullptr; // F32 [n_expert]: cold-bank id per expert (optional)
     };
     mutable moe_hot_bank  moe_hot;
     mutable ggml_tensor * moe_weights_override = nullptr;

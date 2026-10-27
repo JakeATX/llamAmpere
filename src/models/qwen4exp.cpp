@@ -2243,7 +2243,6 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
         moe_hot.gate     = model.layers[il].ffn_gate_exps_hot;
         moe_hot.down     = model.layers[il].ffn_down_exps_hot;
         moe_hot.hot_map  = model.layers[il].ffn_exps_hot_map;
-        moe_hot.cold_map = model.layers[il].ffn_exps_cold_map;
     }
 
     ggml_tensor * moe_out =
