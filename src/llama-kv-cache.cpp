@@ -945,7 +945,7 @@ llama_kv_cache::llama_kv_cache(
                     ggml_backend_dev_backend_reg(dev), "ggml_backend_cuda_qsa_resident_buffer_type"));
                 const uint32_t resident_groups = (sj_kvarn.resident_cells - exact_cells)/sj_kvarn.group;
                 const char * clock_env = getenv("GGML_CUDA_QSA_RESIDENT_CLOCK");
-                const bool clock = clock_env && atoi(clock_env) != 0;
+                const bool clock = !clock_env || atoi(clock_env) != 0;
                 if (clock && (sj_kvarn.group != 128 || (hparams.indexer_top_k > 0 &&
                     (hparams.dsv4_compress_ratios[il] != 4 || sj_kvarn.sink % 4 ||
                     uint64_t(resident_groups)*(sj_kvarn.group/4) < 8*((uint64_t(hparams.indexer_top_k) + 3)/4 + 1))))) {

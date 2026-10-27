@@ -158,7 +158,7 @@ static bool qsa_resident_host(ggml_backend_buffer_type_t) { return false; }
 
 ggml_backend_buffer_type_t ggml_backend_cuda_qsa_resident_buffer_type(ggml_backend_dev_t dev, size_t stride, uint32_t slots) {
     const char * clock = getenv("GGML_CUDA_QSA_RESIDENT_CLOCK");
-    if (clock && atoi(clock) != 0) return ggml_backend_cuda_qsa_clock_buffer_type(dev, stride, slots);
+    if (!clock || atoi(clock) != 0) return ggml_backend_cuda_qsa_clock_buffer_type(dev, stride, slots);
     if (!dev || !stride || stride % 4 || !slots || stride > std::numeric_limits<size_t>::max()/slots) {
         return nullptr;
     }

@@ -2015,7 +2015,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
     ggml_tensor * sel_ids = nullptr;
     ggml_tensor * union_ids = nullptr;
     const char * clock = getenv("GGML_CUDA_QSA_RESIDENT_CLOCK");
-    const bool use_union = clock && atoi(clock) != 0 && qsa && inp->self_sj_kvarn_desc != nullptr &&
+    const bool use_union = (!clock || atoi(clock) != 0) && qsa && inp->self_sj_kvarn_desc != nullptr &&
             cparams.flash_attn && n_tokens <= 8 && ubatch.n_seqs == 1;
     ggml_tensor * sel = qsa ? build_qsa_sel(mctx_hyb, inp_kpool, cur, inp_pos, inp->get_kq_mask(),
             use_compact ? &sel_ids : nullptr, use_union ? &union_ids : nullptr, sections, il) : nullptr;
