@@ -3363,6 +3363,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             const int64_t n_kv_pad = kq_mask && kq_mask->type == GGML_TYPE_I32 ? kq_mask_src->op_params[0] :
                                      kq_mask ? kq_mask->ne[0] : 0;
             GGML_ASSERT(kq_mask && n_kv_pad > 0 && n_kv_pad % 64 == 0);
+            cur->src[7] = sj_kvarn_pending.selected;
             ggml_flash_attn_ext_set_sj_kvarn(cur, sj_kvarn_pending.body, sj_kvarn_pending.desc,
                     sj_kvarn_pending.bits_k, sj_kvarn_pending.bits_v, (int32_t) n_kv_pad);
             const int group = sj_kvarn_pending.body->op_params[7] == GGML_TYPE_TURBO4_0 ? 128 : 256;

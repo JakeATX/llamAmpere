@@ -800,4 +800,5 @@ void ggml_cuda_sj_kvarn_seal(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
         (const char *) k->data, (const char *) v->data, (uint8_t *) dst->data,
         p.n_groups_max > 0 ? (const int32_t *) desc->data : nullptr, p);
     CUDA_CHECK(cudaGetLastError());
+    ggml_cuda_qsa_clock_refresh(ctx, dst);
 }

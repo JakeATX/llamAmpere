@@ -1259,6 +1259,7 @@ struct llm_graph_context {
     mutable struct {
         ggml_tensor * body = nullptr; // seal output (view of the layer's record pool)
         ggml_tensor * desc = nullptr;
+        ggml_tensor * selected = nullptr; // QSA candidate positions; invalid slots lie outside the mask
         int32_t bits_k = 0;
         int32_t bits_v = 0;
         bool fused_rot = false; // Q/output rotation inside the FA node (ggml_sj_kvarn_fused_rot_enabled)

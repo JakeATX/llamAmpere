@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common.cuh"
+#include "qsa-resident-clock.cuh"
 
 struct ggml_cuda_qsa_resident_map {
     const char * host;

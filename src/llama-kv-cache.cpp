@@ -944,15 +944,31 @@ llama_kv_cache::llama_kv_cache(
                 auto * get_type = reinterpret_cast<resident_type_fn>(ggml_backend_reg_get_proc_address(
                     ggml_backend_dev_backend_reg(dev), "ggml_backend_cuda_qsa_resident_buffer_type"));
                 const uint32_t resident_groups = (sj_kvarn.resident_cells - exact_cells)/sj_kvarn.group;
+                const char * clock_env = getenv("GGML_CUDA_QSA_RESIDENT_CLOCK");
+                const bool clock = clock_env && atoi(clock_env) != 0;
+                if (clock && (sj_kvarn.group != 128 || (hparams.indexer_top_k > 0 &&
+                    (hparams.dsv4_compress_ratios[il] != 4 || sj_kvarn.sink % 4 ||
+                    uint64_t(resident_groups)*(sj_kvarn.group/4) < 8*((uint64_t(hparams.indexer_top_k) + 3)/4 + 1))))) {
+                    throw std::runtime_error("CLOCK resident KV requires G128, four-cell QSA pools, and enough pages for eight selections");
+                }
                 auto * resident_buft = get_type ? get_type(dev, rb*hparams.n_head_kv(il), resident_groups) : nullptr;
                 if (!resident_buft) {
                     throw std::runtime_error("--kv-resident requires the CUDA QSA resident backend");
                 }
                 body_ctx = ctx_for_buft(resident_buft);
                 const size_t groups_card = std::min(resident_groups, sj_kvarn_n_groups);
-                const size_t bytes_freed = (sj_kvarn_n_groups - groups_card)*rb*hparams.n_head_kv(il);
-                LLAMA_LOG_INFO("%s: QSA layer %u: %zu resident body groups plus %u staging rows, %.2f MiB pinned body, %.2f MiB VRAM freed for expert cache\n",
-                    __func__, il, groups_card, kv_rows, (double) sj_kvarn_n_groups*rb*hparams.n_head_kv(il)/(1024*1024), (double) bytes_freed/(1024*1024));
+                if (clock) {
+                    const size_t pages_card = groups_card*(sj_kvarn.group/4);
+                    const size_t resident_bytes = pages_card*(hparams.n_head_kv(il)*1048 + 5*sizeof(int32_t)) +
+                        sj_kvarn_n_groups*(hparams.n_head_kv(il)*1536 + (sj_kvarn.group/4)*sizeof(int32_t)) + 256;
+                    const double bytes_freed = double(sj_kvarn_n_groups*rb*hparams.n_head_kv(il)) - resident_bytes;
+                    LLAMA_LOG_INFO("%s: QSA layer %u: %zu four-cell CLOCK pages plus %u staging rows, %.2f MiB pinned body, %.2f MiB VRAM freed for expert cache\n",
+                        __func__, il, pages_card, kv_rows, (double) sj_kvarn_n_groups*rb*hparams.n_head_kv(il)/(1024*1024), bytes_freed/(1024*1024));
+                } else {
+                    const size_t bytes_freed = (sj_kvarn_n_groups - groups_card)*rb*hparams.n_head_kv(il);
+                    LLAMA_LOG_INFO("%s: QSA layer %u: %zu resident body groups plus %u staging rows, %.2f MiB pinned body, %.2f MiB VRAM freed for expert cache\n",
+                        __func__, il, groups_card, kv_rows, (double) sj_kvarn_n_groups*rb*hparams.n_head_kv(il)/(1024*1024), (double) bytes_freed/(1024*1024));
+                }
             }
             body = ggml_new_tensor_1d(body_ctx, GGML_TYPE_I8, (int64_t) rb * hparams.n_head_kv(il) * sj_kvarn_n_groups);
             body->op_params[7] = layer_new.sj_kvarn_body_type;

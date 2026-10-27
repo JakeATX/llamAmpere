@@ -1723,6 +1723,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
         ggml_tensor *                           inp_pos,
         ggml_tensor *                           kq_mask,
         ggml_tensor **                          sel_ids,
+        ggml_tensor **                          union_ids,
         int *                                   sections,
         int                                     il) {
     const int64_t n_tokens = cur->ne[1];
@@ -1873,6 +1874,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     ggml_tensor * idx_f = ggml_cast(ctx0, sel_idx, GGML_TYPE_F32);
     idx_f   = ggml_add(ctx0, ggml_mul(ctx0, ggml_sub(ctx0, idx_f, dump), live), dump);
     sel_idx = ggml_cast(ctx0, idx_f, GGML_TYPE_I32);
+    if (union_ids) {
+        *union_ids = sel_idx;
+    }
     if (sel_inplace) {
         ggml_build_forward_expand(gf, sel_idx);
     }
@@ -1899,6 +1903,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         ggml_tensor *             v_cur,
         ggml_tensor *             sel,
         ggml_tensor *             sel_ids,
+        ggml_tensor *             union_ids,
         int64_t                   n_sel,
         float                     kq_scale,
         int                       il) {
@@ -1937,6 +1942,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
 
     if (sj) {
         build_attn_sj_kvarn_pend(inp, sj_fused, il);
+        sj_kvarn_pending.selected = union_ids;
     }
 
     // the selection mask already carries the causal mask
@@ -2007,8 +2013,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
         use_compact = eligible(inp->mctx->get_k(ctx0, il)) && eligible(inp->mctx->get_v(ctx0, il));
     }
     ggml_tensor * sel_ids = nullptr;
+    ggml_tensor * union_ids = nullptr;
+    const char * clock = getenv("GGML_CUDA_QSA_RESIDENT_CLOCK");
+    const bool use_union = clock && atoi(clock) != 0 && qsa && inp->self_sj_kvarn_desc != nullptr &&
+            cparams.flash_attn && n_tokens <= 8 && ubatch.n_seqs == 1;
     ggml_tensor * sel = qsa ? build_qsa_sel(mctx_hyb, inp_kpool, cur, inp_pos, inp->get_kq_mask(),
-            use_compact ? &sel_ids : nullptr, sections, il) : nullptr;
+            use_compact ? &sel_ids : nullptr, use_union ? &union_ids : nullptr, sections, il) : nullptr;
 
     // Qwen3Next uses a single Q projection that outputs query + gate
     ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s); // [ (n_embd_head * 2) * n_head, n_tokens ]
@@ -2061,7 +2071,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
     if (sel) {
-        cur = build_attn_qsa(inp, Qcur, Kcur, Vcur, sel, sel_ids, inp_kpool->n_sel, kq_scale, il);
+        cur = build_attn_qsa(inp, Qcur, Kcur, Vcur, sel, sel_ids, union_ids, inp_kpool->n_sel, kq_scale, il);
     } else {
         cur = build_attn(inp,
                     nullptr, nullptr, nullptr,

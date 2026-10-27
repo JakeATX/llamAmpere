@@ -4418,6 +4418,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             ggml_cuda_flash_attn_ext_sj_kvarn_rot_unfused(ctx, dst, ggml_cuda_flash_attn_ext);
             return;
         }
+        ggml_cuda_qsa_clock_prepare(ctx, dst);
         // 4/4 token-axis trellis4 body (I16 under an explicit nonzero GGML_SJKVARN_TRELLIS_TOKENS; the low-bit token-axis default does not apply to 4/4): the low-bit tile loader
         if (ggml_get_op_params_i32(dst,5) != ((4 << 8) | 4) || (ggml_get_op_params_i32(dst,7) == GGML_TYPE_I16 && ggml_sj_kvarn::trellis3::tokens4())) {
             ggml_cuda_flash_attn_sj_kvarn_lowbits(ctx,dst);

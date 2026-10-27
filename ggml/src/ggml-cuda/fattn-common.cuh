@@ -72,6 +72,8 @@ struct fattn_sj_kvarn_ctx {
     int body_type;
     const char * resident = nullptr;
     const int32_t * resident_tags = nullptr;
+    const ggml_cuda_qsa_clock_map * resident_map = nullptr;
+    int resident_head = 0;
     uint32_t resident_slots = 0;
     int rec_stride;      // n_head_kv * rec_bytes
     const int32_t * table; // paged pool (multi-sequence cache): group g sits at record table[g]; nullptr = identity
@@ -80,7 +82,7 @@ struct fattn_sj_kvarn_ctx {
 
 static __device__ __forceinline__ const char * fattn_sj_kvarn_rec(const fattn_sj_kvarn_ctx & kv, const int g) {
     const int record = kv.table ? kv.table[g] : g;
-    if (kv.resident_slots) {
+    if (kv.resident_tags) {
         const uint32_t slot = record % kv.resident_slots;
         if (kv.resident_tags[slot] == record) {
             return kv.resident + (size_t) slot*kv.rec_stride;
@@ -116,7 +118,13 @@ static __device__ __forceinline__ fattn_sj_kvarn_ctx fattn_sj_kvarn_make_ctx(
     c.sink_head_delta_v = (int64_t) z_KV*((int64_t) D*sizeof(half) - (int64_t) v_head_stride);
     c.rec_stride = desc[GGML_SJKVARN_DESC_HKV] * rec_bytes;
     c.table      = desc[GGML_SJKVARN_DESC_TABLE] ? desc + GGML_SJKVARN_DESC_N_ENTRIES : nullptr;
-    if (reinterpret_cast<uintptr_t>(body) & 1) {
+    if ((reinterpret_cast<uintptr_t>(body) & 3) == 3) {
+        const auto * map = reinterpret_cast<const ggml_cuda_qsa_clock_map *>(reinterpret_cast<uintptr_t>(body) & ~uintptr_t(3));
+        c.resident_map = map;
+        c.resident_head = z_KV;
+        c.resident_slots = map->slots;
+        body = map->host;
+    } else if (reinterpret_cast<uintptr_t>(body) & 1) {
         const auto * map = reinterpret_cast<const ggml_cuda_qsa_resident_map *>(reinterpret_cast<uintptr_t>(body) & ~uintptr_t(1));
         c.resident = map->card + (size_t) z_KV*rec_bytes;
         c.resident_tags = map->tags;

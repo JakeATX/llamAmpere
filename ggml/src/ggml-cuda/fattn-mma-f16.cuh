@@ -6,6 +6,7 @@
 #include "fattn-common.cuh"
 #include "fattn-mma-config.h"
 #include "fattn-query-layout.cuh"
+#include "../ggml-sjkvarn.h"
 
 using namespace ggml_cuda_mma;
 
@@ -551,6 +552,36 @@ static __device__ __forceinline__ void turbo_store_h2(half2 * const __restrict__
     }
 }
 
+// fork: four-cell resident pages hold token-major nibbles and the codec's original half scales.
+template <bool is_v>
+static __device__ __forceinline__ half2 fattn_sj_resident_pair(
+        const fattn_sj_kvarn_ctx & kv, const int record, const int token, const int pair) {
+    const auto & m = *kv.resident_map;
+    const int page = record*(m.group/4) + token/4;
+    const int slot = m.table[page];
+    // Unselected rows in an MMA tile are masked. They must still produce finite values.
+    if (slot < 0) return make_half2(0.0f, 0.0f);
+    const char * row = m.card + (size_t(slot)*m.heads + kv.resident_head)*GGML_QSA_PAGE_HEAD_BYTES;
+    const char * meta = m.meta + (size_t(record)*m.heads + kv.resident_head)*GGML_QSA_META_HEAD_BYTES;
+    const int t = token%4, d = 2*pair;
+    const uint8_t packed = reinterpret_cast<const uint8_t *>(row)[(is_v ? 512 : 0) + t*128 + pair];
+    const half2 code = __floats2half2_rn(packed & 15, packed >> 4);
+    if constexpr (is_v) {
+        const half2 scale = __half2half2(reinterpret_cast<const half *>(row + 1032)[t]);
+        const half2 zero = __half2half2(reinterpret_cast<const half *>(row + 1040)[t]);
+        const half2 ch = __halves2half2(
+            reinterpret_cast<const half *>(meta + 1024)[ggml_sj_kvarn::v_ch_idx(d, 256, 128, 4)],
+            reinterpret_cast<const half *>(meta + 1024)[ggml_sj_kvarn::v_ch_idx(d + 1, 256, 128, 4)]);
+        return __hmul2(__hfma2(code, scale, zero), ch);
+    } else {
+        const int kd = ggml_sj_kvarn::k_ch_idx(d, 256, 128, 4);
+        const half2 scale = reinterpret_cast<const half2 *>(meta)[kd/2];
+        const half2 zero = reinterpret_cast<const half2 *>(meta + 512)[kd/2];
+        const half2 tok = __half2half2(reinterpret_cast<const half *>(row + 1024)[t]);
+        return __hmul2(__hfma2(code, scale, zero), tok);
+    }
+}
+
 // Same map as turbo_store_h2 for the loaders that decode four half2 at a time. c must be a
 // multiple of 4, so the 16 bytes sit in one chunk and the swizzle XOR only moves the chunk.
 template<int stride_tile, bool swz>
@@ -626,6 +657,17 @@ static __device__ __forceinline__ void flash_attn_ext_sj_kvarn_load_tile(
 
     const int lane = threadIdx.x;
     const int wg   = threadIdx.y;
+    if (kv.resident_map && kv.resident_map->ctl[3]) {
+        const int record = (rec - kv.body)/kv.rec_stride;
+        for (int i = wg*warp_size + lane; i < nbatch_fa*D2; i += nthreads) {
+            const int row = i/D2, pair = i%D2;
+            const half2 value = oob_check && row >= i_sup ? make_half2(0.0f, 0.0f) :
+                fattn_sj_resident_pair<is_V>(kv, record, t0 + row, pair);
+            turbo_store_h2<stride_tile, swz>(tile_KV, row, pair, value);
+        }
+        return;
+    }
+
     if (kv.body_type == GGML_TYPE_TURBO4_0) {
         constexpr int blocks_per_row = D/QK_TURBO4;
         const block_turbo4_0 * payload = (const block_turbo4_0 *) rec + (is_V ? kv.G*blocks_per_row : 0);

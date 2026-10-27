@@ -33,14 +33,14 @@ static const char * qsa_resident_name(ggml_backend_buffer_type_t buft) {
 }
 
 bool ggml_cuda_qsa_resident_is_buft(ggml_backend_buffer_type_t buft) {
-    return buft && buft->iface.get_name == qsa_resident_name;
+    return buft && (buft->iface.get_name == qsa_resident_name || ggml_cuda_qsa_clock_is_buft(buft));
 }
 
 static qsa_resident_tensor * qsa_resident_entry(const ggml_tensor * tensor) {
     while (tensor->view_src) {
         tensor = tensor->view_src;
     }
-    return tensor->buffer && ggml_cuda_qsa_resident_is_buft(tensor->buffer->buft) ?
+    return tensor->buffer && tensor->buffer->buft->iface.get_name == qsa_resident_name ?
         static_cast<qsa_resident_tensor *>(tensor->extra) : nullptr;
 }
 
@@ -157,6 +157,8 @@ static size_t qsa_resident_alignment(ggml_backend_buffer_type_t) { return 256; }
 static bool qsa_resident_host(ggml_backend_buffer_type_t) { return false; }
 
 ggml_backend_buffer_type_t ggml_backend_cuda_qsa_resident_buffer_type(ggml_backend_dev_t dev, size_t stride, uint32_t slots) {
+    const char * clock = getenv("GGML_CUDA_QSA_RESIDENT_CLOCK");
+    if (clock && atoi(clock) != 0) return ggml_backend_cuda_qsa_clock_buffer_type(dev, stride, slots);
     if (!dev || !stride || stride % 4 || !slots || stride > std::numeric_limits<size_t>::max()/slots) {
         return nullptr;
     }
@@ -183,12 +185,16 @@ ggml_backend_buffer_type_t ggml_backend_cuda_qsa_resident_buffer_type(ggml_backe
 }
 
 size_t ggml_backend_cuda_qsa_resident_device_bytes(ggml_backend_buffer_type_t buft, const ggml_tensor * body) {
+    if (ggml_cuda_qsa_clock_is_buft(buft)) return ggml_backend_cuda_qsa_clock_device_bytes(buft, body);
     const auto * t = static_cast<const qsa_resident_type *>(buft->context);
     const size_t slots = std::min<size_t>(t->slots, ggml_nbytes(body)/t->stride);
     return slots*(t->stride + sizeof(int32_t)) + sizeof(ggml_cuda_qsa_resident_map);
 }
 
 const char * ggml_cuda_qsa_resident_body(const ggml_tensor * body) {
+    const ggml_tensor * root = body;
+    while (root->view_src) root = root->view_src;
+    if (root->buffer && ggml_cuda_qsa_clock_is_buft(root->buffer->buft)) return ggml_cuda_qsa_clock_body(body);
     auto * entry = qsa_resident_entry(body);
     // Body records are aligned; the low bit identifies a device-side split map.
     return entry ? reinterpret_cast<const char *>(reinterpret_cast<uintptr_t>(entry->device_map) | 1) :

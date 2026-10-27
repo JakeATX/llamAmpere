@@ -171,6 +171,14 @@ static __global__ void fattn_sj_compact_gather(
         const int group = (p - kv.S)/kv.G;
         const int token = (p - kv.S)%kv.G;
         const char * rec = fattn_sj_kvarn_rec(kv, group);
+        if (kv.resident_map && kv.resident_map->ctl[3]) {
+            const int record = (rec - kv.body)/kv.rec_stride;
+            for (int pair = threadIdx.x; pair < 128; pair += warp_size) {
+                k_out[out + pair] = fattn_sj_resident_pair<false>(kv, record, token, pair);
+                v_out[out + pair] = fattn_sj_resident_pair<true>(kv, record, token, pair);
+            }
+            return;
+        }
         const half2 ktok = __half2half2(__ldg((const half *) (rec + kv.k_tok) + token));
         const half2 vs = __half2half2(__ldg((const half *) (rec + kv.v_scale) + token));
         const half2 vz = __half2half2(__ldg((const half *) (rec + kv.v_zero) + token));
