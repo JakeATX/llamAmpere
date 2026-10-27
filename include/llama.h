@@ -421,6 +421,7 @@ extern "C" {
         enum llama_moe_cache_mode moe_cache_mode; // runtime MoE expert cache mode
         int32_t moe_prefetch;                     // experimental: 0 off, -1 auto, 1..3 future layers
         size_t moe_cache_budget_mib;               // 0 uses the provider's available-memory budget
+        int32_t moe_skip_tail;                     // LOSSY: 0 off; 1..9 = leave out a non-resident expert that every token of a single-sequence decode window ranks at this position or later [EXPERIMENTAL]
         size_t moe_cache_size; // device cache in bytes for the experts kept in host memory, 0 = disabled [EXPERIMENTAL]
 
         // Expert keep policy for CPU-held MoE experts (#215/#217) [EXPERIMENTAL]

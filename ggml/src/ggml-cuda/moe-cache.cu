@@ -124,6 +124,12 @@ static int moe_down_one_mode() {
 }
 static std::atomic<unsigned long long> g_st_one{0};
 static uint8_t * g_hf_zero = nullptr;   // [g_hf_experts] zeros: the single down pass's filter when no expert is on the CPU
+// --moe-skip-tail (LOSSY route-rank cutoff), hit-first layers only. Per layer the side stream writes
+// [0..2][g_hf_experts] = resident in that projection OR left out, and [3][g_hf_experts] = left out, before the plan;
+// the plan and the miss passes then treat a left-out expert as if resident (no copy, no CPU work, no miss math) and
+// a zero kernel writes its output rows. Counters: [0] tensor-expert rows left out, [1] layer windows, [2] experts.
+static uint8_t * g_tail_mask = nullptr;
+static unsigned long long * g_tail_counts = nullptr;
 static size_t g_hf_stride = 0;
 static int64_t g_hf_experts = 0;
 static int g_hf_slots = 0;
@@ -669,6 +675,11 @@ struct moe_cache_session {
     std::atomic<bool> batch_bypass_announced{false};
     std::atomic<bool> row_bypass_announced{false};
     uint64_t device_capture_generation = 0;
+    // --moe-skip-tail cutoff for the current window (0 = exact; guarded by mu, read at graph build time) and the
+    // missed tensor-expert rows the host path left out because of it
+    int skip_tail = 0;
+    uint64_t tail_skipped_rows = 0;
+    int tail_layer = -1;   // hit-first layer whose cutoff masks are live (-1 none); compute thread only
     std::atomic<uint64_t> device_captures{0};
     std::atomic<uint64_t> device_replays{0};
     unsigned long long * device_expert_counts = nullptr;
@@ -3229,6 +3240,10 @@ static void moe_cache_session_destroy(void * opaque) {
     if (!session) {
         return;
     }
+    if (session->tail_skipped_rows > 0) {
+        MOE_CACHE_LOG("[moe-cache] skip-tail (host path): %llu missed tensor-expert rows left out\n",
+                (unsigned long long) session->tail_skipped_rows);
+    }
 
     {
         std::unique_lock<std::mutex> lock(session->mu);
@@ -4061,6 +4076,22 @@ static int moe_cache_plan(
             continue;
         }
 
+        // --moe-skip-tail: a missed expert that no token of the window ranks in the head is left out, with no fill.
+        if (session.skip_tail > 0 &&
+                ggml_moe_cache_tail_rank_ok(ids, n_ids, (int) node->n_tokens, index, session.skip_tail)) {
+            const auto found = pool.map.find(moe_cache_key{node->host_base, expert});
+            const bool cached = found != pool.map.end() && pool.slots[found->second].state == moe_cache_slot_state::valid;
+            const size_t stride = moe_cache_host_stride(device, node->host_base, node->expert_size);
+            const bool resident = moe_resident_lookup_device(
+                    (const char *) node->host_base + (size_t) expert * stride, node->expert_size, device.logical);
+            if (!cached && !resident) {
+                slot_indices[index] = GGML_MOE_CACHE_SKIP;
+                session.tail_skipped_rows++;
+                device.misses++;
+                continue;
+            }
+        }
+
         const int slot_index = moe_cache_lookup_or_queue_locked(
                 session, device, pool, node->pool_index,
                 node->host_base, expert, node->expert_size,
@@ -4530,6 +4561,10 @@ static void * moe_cache_fused_begin(
 
     moe_cache_session * session = g_session_stack.back().active;
     if (!session || session->stopping || session->dormant) {
+        return nullptr;
+    }
+    if (session->skip_tail > 0) {
+        // the unfused plan applies the --moe-skip-tail cutoff
         return nullptr;
     }
     moe_cache_log_configuration(*session);
@@ -7895,6 +7930,13 @@ static void moe_cache_device_release(moe_cache_session & session, bool retain_so
     session.mj_retained_stream = nullptr;
     session.mj_retained_stream_set = false;
     moe_cache_swap_release(session);
+    if (g_tail_counts) {
+        unsigned long long tail[3] = {};
+        if (cudaMemcpy(tail, g_tail_counts, sizeof(tail), cudaMemcpyDeviceToHost) == cudaSuccess && tail[1] > 0) {
+            MOE_CACHE_LOG("[moe-cache] skip-tail: %llu missed tensor-expert rows left out (%llu experts) over %llu layer windows (process total)\n",
+                    tail[0], tail[2], tail[1]);
+        }
+    }
     unsigned long long counts[3] = {};
     if (session.device_route_counts) {
         if (cudaMemcpy(counts, session.device_route_counts, sizeof(counts), cudaMemcpyDeviceToHost) == cudaSuccess) {
@@ -8755,7 +8797,11 @@ static void moe_missjoin_overlap_prepare(moe_cache_session & session) {
                  cudaMalloc((void **) &g_hf_miss, 4 * sizeof(moe_miss_list)) == cudaSuccess &&
                  cudaMemset(g_hf_miss, 0, 4 * sizeof(moe_miss_list)) == cudaSuccess &&
                  cudaMalloc((void **) &g_hf_zero, (size_t) experts) == cudaSuccess &&
-                 cudaMemset(g_hf_zero, 0, (size_t) experts) == cudaSuccess;
+                 cudaMemset(g_hf_zero, 0, (size_t) experts) == cudaSuccess &&
+                 cudaMalloc((void **) &g_tail_mask, 4 * (size_t) experts) == cudaSuccess &&
+                 cudaMemset(g_tail_mask, 0, 4 * (size_t) experts) == cudaSuccess &&
+                 cudaMalloc((void **) &g_tail_counts, 3 * sizeof(unsigned long long)) == cudaSuccess &&
+                 cudaMemset(g_tail_counts, 0, 3 * sizeof(unsigned long long)) == cudaSuccess;
             if (ok) {
                 g_hf_stride = stride;
                 g_hf_experts = experts;
@@ -9513,6 +9559,92 @@ static bool moe_miss_pass_list(ggml_backend_cuda_context & ctx, const moe_cache_
     return true;
 }
 
+// --moe-skip-tail: decide once per layer which routed experts are left out. An expert is left out when it is resident
+// in none of the three projections and no token of the window ranks it below `rank` (ids rows are in descending
+// router score order). Writes the masks described at g_tail_mask; one block.
+#define MOE_TAIL_MAX_EXPERT 1024
+static __global__ void __launch_bounds__(256) moe_tail_prep_kernel(const uint8_t * hot0, const uint8_t * hot1,
+        const uint8_t * hot2, const int32_t * ids, int n_ids, int n_routes, int ids_stride, int n_expert, int rank,
+        uint8_t * out, int64_t out_stride, unsigned long long * counts) {
+    __shared__ unsigned char s_routed[MOE_TAIL_MAX_EXPERT];
+    __shared__ unsigned char s_head[MOE_TAIL_MAX_EXPERT];
+    __shared__ unsigned s_rows, s_experts;
+    const int tid = threadIdx.x;
+    for (int e = tid; e < n_expert; e += blockDim.x) {
+        s_routed[e] = 0;
+        s_head[e] = 0;
+    }
+    if (tid == 0) {
+        s_rows = 0;
+        s_experts = 0;
+    }
+    __syncthreads();
+    for (int i = tid; i < n_routes; i += blockDim.x) {
+        const int slot = i % n_ids;
+        const int e = ids[(i / n_ids) * ids_stride + slot];
+        if (e >= 0 && e < n_expert) {
+            s_routed[e] = 1;
+            if (slot < rank) {
+                s_head[e] = 1;
+            }
+        }
+    }
+    __syncthreads();
+    for (int e = tid; e < n_expert; e += blockDim.x) {
+        const uint8_t h0 = hot0[e], h1 = hot1[e], h2 = hot2[e];
+        const uint8_t skip = s_routed[e] && !s_head[e] && !h0 && !h1 && !h2;
+        out[e] = h0 | skip;
+        out[out_stride + e] = h1 | skip;
+        out[2 * out_stride + e] = h2 | skip;
+        out[3 * out_stride + e] = skip;
+        if (skip) {
+            atomicAdd(&s_experts, 1u);
+        }
+    }
+    __syncthreads();
+    for (int i = tid; i < n_routes; i += blockDim.x) {
+        const int e = ids[(i / n_ids) * ids_stride + i % n_ids];
+        if (e >= 0 && e < n_expert && s_routed[e] && !s_head[e] && !hot0[e] && !hot1[e] && !hot2[e]) {
+            atomicAdd(&s_rows, 1u);
+        }
+    }
+    __syncthreads();
+    if (tid == 0 && counts) {
+        atomicAdd(counts + 0, 3ULL * s_rows);
+        atomicAdd(counts + 1, 1ULL);
+        atomicAdd(counts + 2, (unsigned long long) s_experts);
+    }
+}
+
+// Writes zero output rows for the routes whose expert the cutoff left out (skip[e] != 0). One block per route.
+static __global__ void moe_tail_zero_kernel(const uint8_t * skip, const int32_t * ids, int n_ids, int ids_stride,
+        int n_expert, char * out, size_t nb1, size_t nb2, int n_out) {
+    const int route = blockIdx.x;
+    const int token = route / n_ids, slot = route % n_ids;
+    const int e = ids[token * ids_stride + slot];
+    if (e < 0 || e >= n_expert || !skip[e]) {
+        return;
+    }
+    float * row = (float *) (out + (size_t) token * nb2 + (size_t) slot * nb1);
+    for (int i = threadIdx.x; i < n_out; i += blockDim.x) {
+        row[i] = 0.0f;
+    }
+}
+
+// True when the --moe-skip-tail masks of this projection's layer are live (written by this layer's moe_hf_begin).
+static bool moe_tail_active(const moe_cache_session & session, const moe_cache_device_table & table) {
+    return session.tail_layer >= 0 && session.tail_layer == table.mj_layer;
+}
+
+static void moe_tail_zero(ggml_backend_cuda_context & ctx, const ggml_tensor * ids, int n_expert, ggml_tensor * out) {
+    GGML_ASSERT(out->type == GGML_TYPE_F32 && out->nb[0] == sizeof(float));
+    const int routes = (int) (ids->ne[0] * ids->ne[1]);
+    moe_tail_zero_kernel<<<routes, 128, 0, ctx.stream()>>>(g_tail_mask + 3 * (size_t) g_hf_experts,
+            (const int32_t *) ids->data, (int) ids->ne[0], (int) (ids->nb[1] / sizeof(int32_t)), n_expert,
+            (char *) out->data, out->nb[1], out->nb[2], (int) out->ne[0]);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 static bool moe_hf_begin(ggml_backend_cuda_context & ctx, moe_cache_session & session,
         const moe_cache_device_table & table, const ggml_tensor * a, const ggml_tensor * ids) {
     if (!moe_missjoin_hitfirst_enabled() || session.mj_groups.empty() || table.staging_device || !table.hot ||
@@ -9578,6 +9710,19 @@ static bool moe_hf_begin(ggml_backend_cuda_context & ctx, moe_cache_session & se
     args.scratch = g_hf_scratch;
     args.stride = g_hf_stride;
     const int n_expert = (int) group[0]->desc.n_expert;
+    // --moe-skip-tail: the cutoff masks go first on the side stream; the plan then sees left-out experts as resident.
+    const bool tail = session.skip_tail > 0 && g_tail_mask && n_expert <= MOE_TAIL_MAX_EXPERT &&
+            n_expert <= g_hf_experts && session.skip_tail < (int) ids->ne[0];
+    session.tail_layer = tail ? table.mj_layer : -1;
+    if (tail) {
+        moe_tail_prep_kernel<<<1, 256, 0, g_hf_side>>>(group[0]->hot, group[1]->hot, group[2]->hot,
+                (const int32_t *) ids->data, (int) ids->ne[0], routes, (int) (ids->nb[1] / sizeof(int32_t)), n_expert,
+                session.skip_tail, g_tail_mask, g_hf_experts, g_tail_counts);
+        CUDA_CHECK(cudaGetLastError());
+        for (int j = 0; j < 3; ++j) {
+            args.hot[j] = g_tail_mask + (size_t) j * g_hf_experts;
+        }
+    }
     const bool fast = moe_hf_plan_fast_enabled() && routes <= MOE_HF_FAST_MAX_ROUTES && n_expert <= MOE_HF_FAST_MAX_EXPERT;
     // fork MOEGAP: CPU split for this layer (decided here, at capture time; the plan picks the experts)
     const int L = table.mj_layer;
@@ -10518,7 +10663,11 @@ bool ggml_cuda_moe_cache_device_compute(ggml_backend_cuda_context & ctx, ggml_te
         const int64_t ids_stride = ids->nb[1] / sizeof(int32_t);
         // fork MOEGAP: on a CPU-split layer the miss pass also skips the experts the host computes
         const bool cs = session.cs_layer >= 0 && session.cs_layer == table.mj_layer;
-        const uint8_t * miss_skip = cs ? g_cs_mask + (size_t) table.mj_kind * g_hf_experts : table.hot;
+        // --moe-skip-tail: outside CPU-split layers the miss pass skips the left-out experts through the cutoff
+        // masks (a CPU-split plan already folded them into g_cs_mask)
+        const bool tail = moe_tail_active(session, table);
+        const uint8_t * miss_skip = cs ? g_cs_mask + (size_t) table.mj_kind * g_hf_experts :
+                tail ? g_tail_mask + (size_t) table.mj_kind * g_hf_experts : table.hot;
         const void * const * eff = nullptr;
         auto hit_pass = [&](float * out) {
             const bool hit_ok = ggml_cuda_moe_table_mmv_d1_try(ctx, table.device, (ggml_type) table.desc.type, quantized,
@@ -10545,8 +10694,8 @@ bool ggml_cuda_moe_cache_device_compute(ggml_backend_cuda_context & ctx, ggml_te
                 old_miss(out);
             }
         };
-        // fork MOEGAP DOWNONE: the down projection as one pass over the effective table (see moe_down_one_mode)
-        const int one = table.mj_kind == 2 ? moe_down_one_mode() : 0;
+        // The down projection uses one pass only when no tail rows need zeroing.
+        const int one = table.mj_kind == 2 && !tail ? moe_down_one_mode() : 0;
         if (one != 0) {
             eff = moe_hf_wait(ctx, session, table);
             const int64_t count = op->ne[0] * ids->ne[0] * ids->ne[1];
@@ -10579,6 +10728,9 @@ bool ggml_cuda_moe_cache_device_compute(ggml_backend_cuda_context & ctx, ggml_te
             CUDA_CHECK(cudaGetLastError());
             eff = moe_hf_wait(ctx, session, table);
             miss_pass((float *) op->data);
+            if (tail) {
+                moe_tail_zero(ctx, ids, (int) table.desc.n_expert, op);
+            }
         }
         CUDA_CHECK(cudaGetLastError());
         if (cs && table.mj_kind == 2) {
@@ -10680,8 +10832,11 @@ bool ggml_cuda_moe_cache_device_fused_compute(ggml_backend_cuda_context & ctx,
                 const void * const * gate_eff = moe_hf_wait(ctx, session, gate_table);
                 // miss pass: every other expert the card computes (a CPU-split layer skips the host's experts)
                 const bool cs = session.cs_layer >= 0 && session.cs_layer == up_table.mj_layer;
-                const uint8_t * skip_up = cs ? g_cs_mask + (size_t) up_table.mj_kind * g_hf_experts : up_table.hot;
-                const uint8_t * skip_gate = cs ? g_cs_mask + (size_t) gate_table.mj_kind * g_hf_experts : gate_table.hot;
+                const bool tail = moe_tail_active(session, up_table);
+                const uint8_t * skip_up = cs ? g_cs_mask + (size_t) up_table.mj_kind * g_hf_experts :
+                        tail ? g_tail_mask + (size_t) up_table.mj_kind * g_hf_experts : up_table.hot;
+                const uint8_t * skip_gate = cs ? g_cs_mask + (size_t) gate_table.mj_kind * g_hf_experts :
+                        tail ? g_tail_mask + (size_t) gate_table.mj_kind * g_hf_experts : gate_table.hot;
                 auto old_miss = [&](float * out) {
                     ggml_cuda_moe_table_mmv_hitg(ctx, up_eff, gate_eff, (ggml_type) up_table.desc.type,
                             quantized, (const int32_t *) ids->data, out, a->ne[0], glu->ne[0], ids->ne[0],
@@ -10693,6 +10848,9 @@ bool ggml_cuda_moe_cache_device_fused_compute(ggml_backend_cuda_context & ctx,
                     old_miss((float *) glu->data);
                 }
                 CUDA_CHECK(cudaGetLastError());
+                if (tail) {
+                    moe_tail_zero(ctx, ids, (int) up_table.desc.n_expert, glu);
+                }
                 return true;
             }
         }
@@ -11311,6 +11469,22 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
 #endif
 }
 
+static void moe_cache_set_skip_tail(void * opaque, int rank) {
+    auto * session = (moe_cache_session *) opaque;
+    if (!session || rank < 0 || rank > 9) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(session->mu);
+    if (session->skip_tail == rank) {
+        return;
+    }
+    session->skip_tail = rank;
+    if (session->device_ready.load()) {
+        // The rank decides which kernels a graph contains; never replay a graph built under the other policy.
+        session->device_capture_generation = g_moe_cache_capture_generation.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
 static void moe_cache_register(const void * owner) {
     g_moe_cache_owner = owner;
     ggml_moe_cache_api api = {};
@@ -11349,6 +11523,7 @@ static void moe_cache_register(const void * owner) {
     api.restore = moe_cache_return;
     api.prompt_resume = moe_cache_prompt_resume;
     api.resident = moe_cache_resident;
+    api.set_skip_tail = moe_cache_set_skip_tail;
     ggml_moe_cache_register(&api);
 }
 

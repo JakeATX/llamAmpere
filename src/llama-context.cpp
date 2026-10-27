@@ -371,6 +371,16 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
     cparams.moe_prefetch = params.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT ? params.moe_prefetch : 0;
     cparams.moe_cache_mode       = params.moe_cache_mode;
     cparams.moe_cache_budget_mib = params.moe_cache_budget_mib;
+    if (params.moe_skip_tail < 0 || params.moe_skip_tail > 9) {
+        throw std::invalid_argument("moe_skip_tail must be 0..9");
+    }
+    // Only the main model's context uses it; drafter and other context types stay exact.
+    cparams.moe_skip_tail = params.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT ? params.moe_skip_tail : 0;
+    if (cparams.moe_skip_tail > 0) {
+        LLAMA_LOG_WARN("%s: --moe-skip-tail %d (LOSSY: non-resident experts ranked >= %d by every token of a decode window are left out, "
+                "weights not renormalized); %s\n", __func__, cparams.moe_skip_tail, cparams.moe_skip_tail,
+                params.n_seq_max == 1 ? "single-sequence decode windows only" : "inactive with more than one sequence");
+    }
     cparams.yarn_ext_factor      = params.yarn_ext_factor >= 0.0f ? params.yarn_ext_factor : hparams.yarn_ext_factor;
     cparams.yarn_attn_factor     = params.yarn_attn_factor >= 0.0f ? params.yarn_attn_factor : hparams.yarn_attn_factor;
     cparams.yarn_beta_fast       = params.yarn_beta_fast >= 0.0f ? params.yarn_beta_fast : hparams.yarn_beta_fast;
@@ -4672,6 +4682,13 @@ build_graph:
         ggml_backend_sched_synchronize(compute_peer->sched.get());
     }
 
+    if (cparams.moe_skip_tail > 0) {
+        // Lossy expert skipping only in one sequence's decode or verify window (every token an output, at most
+        // 8 tokens); prompt processing and windows that mix requests stay exact. The scheduler only acts on a change.
+        const bool decode_window = cparams.n_seq_max == 1 && !cparams.embeddings &&
+                ubatch.n_tokens <= 8 && n_outputs == (int32_t) ubatch.n_tokens;
+        ggml_backend_sched_moe_cache_set_skip_tail(sched.get(), decode_window ? cparams.moe_skip_tail : 0);
+    }
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
@@ -9077,6 +9094,7 @@ llama_context_params llama_context_default_params() {
         /*.moe_cache_mode              =*/ LLAMA_MOE_CACHE_MODE_UNSPECIFIED,
         /*.moe_prefetch                =*/ 0,
         /*.moe_cache_budget_mib        =*/ 0,
+        /*.moe_skip_tail               =*/ 0,
         /*.moe_cache_size              =*/ 0,
         /*.moe_draft_keep              =*/ -1,
         /*.moe_keep_map                =*/ nullptr,

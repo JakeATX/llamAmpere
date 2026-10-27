@@ -3359,6 +3359,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_KEEP_MAP"));
     add_opt(common_arg(
+        {"--moe-skip-tail"}, "N",
+        "LOSSY, changes answers: in a single-sequence decode or verify window, leave out an expert that is not "
+        "resident in VRAM when every token in the window ranks it at route position N or later (zero-based). "
+        "Resident experts are always computed and the remaining router weights are not renormalized. "
+        "Prompt processing is never affected. 0 = off, 1..9 = lossy (default: 0)",
+        [](common_params & params, int value) {
+            if (value < 0 || value > 9) {
+                throw std::invalid_argument("--moe-skip-tail must be in [0, 9]");
+            }
+            params.moe_cache.skip_tail = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_SKIP_TAIL"));
+    add_opt(common_arg(
         {"--moe-cache-mib"}, "N",
         "GPU cache size in MiB for the MoE experts kept in the CPU (default: 0, disabled)",
         [](common_params & params, int value) {

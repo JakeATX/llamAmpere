@@ -1318,6 +1318,9 @@ struct ggml_backend_sched {
     // expert keep policy (#215/#217), owned copy; keep_default -1 and n_layer 0 = off
     int32_t   moe_keep_default;
     int32_t * moe_keep_layer;
+    // --moe-skip-tail value last handed to moe_skip_tail_session (0 = exact)
+    int       moe_skip_tail;
+    void *    moe_skip_tail_session;
     int32_t   moe_keep_n_layer;
 
     ggml_backend_sched_eval_callback callback_eval;
@@ -3350,6 +3353,21 @@ int ggml_backend_sched_moe_cache_status(ggml_backend_sched_t sched, size_t * all
     return sched->moe_cache_api.session_status(sched->moe_cache_session, allocated_bytes);
 }
 
+void ggml_backend_sched_moe_cache_set_skip_tail(ggml_backend_sched_t sched, int rank) {
+    GGML_ASSERT(rank >= 0 && rank <= 9);
+    if (!sched || !sched->moe_cache_session || !sched->moe_cache_api.set_skip_tail) {
+        return;
+    }
+    if (sched->moe_skip_tail == rank && sched->moe_skip_tail_session == sched->moe_cache_session) {
+        return;
+    }
+    // The previous graph may still read the old policy's tables.
+    ggml_backend_sched_synchronize(sched);
+    sched->moe_cache_api.set_skip_tail(sched->moe_cache_session, rank);
+    sched->moe_skip_tail = rank;
+    sched->moe_skip_tail_session = sched->moe_cache_session;
+}
+
 void ggml_backend_sched_set_moe_cache(
         ggml_backend_sched_t sched, enum ggml_moe_cache_mode mode, size_t budget_mib) {
     GGML_ASSERT(sched);
@@ -3360,6 +3378,7 @@ void ggml_backend_sched_set_moe_cache(
     sched->moe_cache_donor = nullptr;
     if (sched->moe_cache_session && sched->moe_cache_api.session_destroy) {
         sched->moe_cache_api.session_destroy(sched->moe_cache_session);
+        sched->moe_skip_tail_session = nullptr;
     }
     sched->moe_cache_session = nullptr;
     sched->moe_cache_api = ggml_moe_cache_api{};
@@ -3497,6 +3516,7 @@ bool ggml_backend_sched_moe_cache_suspend(ggml_backend_sched_t sched) {
     }
     ggml_backend_sched_synchronize(sched);
     sched->moe_cache_api.session_destroy(sched->moe_cache_session);
+    sched->moe_skip_tail_session = nullptr;
     sched->moe_cache_session   = nullptr;
     sched->moe_cache_suspended = true;
     sched->moe_cache_device_graph = false;
@@ -3548,6 +3568,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     sched->moe_keep_layer = nullptr;
     if (sched->moe_cache_session && sched->moe_cache_api.session_destroy) {
         sched->moe_cache_api.session_destroy(sched->moe_cache_session);
+        sched->moe_skip_tail_session = nullptr;
         sched->moe_cache_session = NULL;
     }
     for (int b = 0; b < sched->n_backends; b++) {
