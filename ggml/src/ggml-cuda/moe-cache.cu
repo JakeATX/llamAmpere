@@ -6634,7 +6634,8 @@ static bool moe_cache_cgroup_headroom(size_t extra, size_t registered = 0, uint6
         }
         uint64_t current = 0, limit = 0;
         if (!read("/memory.current", current) || !read("/memory.max", limit)) {
-            return false;
+            // a "0::/" line whose group has no v2 files here (containers that mount a v1 memory controller): use v1 / no-limit rules
+            return moe_cache_cgroup_v1_headroom(extra, registered, peak_current);
         }
         if (limit != UINT64_MAX) {
             uint64_t file = 0, inactive = 0, shmem = 0, dirty = 0, writeback = 0;
