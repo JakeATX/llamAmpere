@@ -4060,6 +4060,67 @@ static bool run_profile_persistence(ggml_backend_t gpu, ggml_backend_t cpu, log_
         printf("cache-profile-arena global=%d: %s\n", (int)global, arena_ok ? "OK" : "FAIL");
         ok &= arena_ok;
     }
+    // Whole bundles must survive prompt lending and two same-session pool rebuilds.
+    {
+        const char * old_whole = getenv("GGML_MOE_CACHE_WHOLE_ONLY");
+        const bool had_whole = old_whole != nullptr;
+        const std::string saved_whole = old_whole ? old_whole : "";
+        constexpr int64_t n_in = 1024, n_out = 32, n_expert = 128;
+        const ggml_type types[] = {GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0};
+        const char * names[] = {"blk.5.ffn_gate_exps.weight", "blk.5.ffn_up_exps.weight", "blk.5.ffn_down_exps.weight"};
+        std::vector<uint8_t> storage[3];
+        ggml_moe_cache_tensor_desc whole_desc[3];
+        std::vector<uint64_t> whole_usage(n_expert);
+        for (size_t e = 0; e < whole_usage.size(); ++e) { whole_usage[e] = n_expert - e; }
+        const uint64_t * whole_counts[] = {whole_usage.data(), whole_usage.data(), whole_usage.data()};
+        for (size_t k = 0; k < 3; ++k) {
+            const size_t bytes = ggml_row_size(types[k], n_in) * n_out;
+            storage[k].resize(bytes * n_expert);
+            whole_desc[k] = {names[k], storage[k].data(), bytes, n_in, n_out, n_expert, types[k]};
+        }
+        set_env("GGML_MOE_CACHE_PROFILE_LOAD", nullptr);
+        set_env("GGML_MOE_CACHE_PROFILE_SAVE", path.c_str());
+        set_env("GGML_MOE_CACHE_PROFILE_GLOBAL", nullptr);
+        set_env("GGML_MOE_CACHE_WHOLE_ONLY", "0");
+        void * writer = create_direct_session(gpu, cpu);
+        bool transition_ok = writer != nullptr && api.restore;
+        if (writer) {
+            transition_ok &= api.warm(writer, whole_desc, whole_counts, 3) > 0;
+            api.session_destroy(writer);
+        }
+        set_env("GGML_MOE_CACHE_PROFILE_LOAD", path.c_str());
+        set_env("GGML_MOE_CACHE_PROFILE_SAVE", nullptr);
+        set_env("GGML_MOE_CACHE_WHOLE_ONLY", "1");
+        reader = create_direct_session(gpu, cpu);
+        transition_ok &= reader != nullptr;
+        if (reader && api.restore) {
+            capture.clear();
+            transition_ok &= api.warm(reader, whole_desc, nullptr, 3) > 0;
+            for (int pass = 0; pass < 2; ++pass) {
+                transition_ok &= api.trim(reader, 1u << 20) >= 1u << 20;
+                api.restore(reader);
+                transition_ok &= api.warm(reader, whole_desc, whole_counts, 3) >= 0;
+                api.session_enter(reader);
+                for (int32_t e = 0; e < 64; ++e) {
+                    for (const auto & desc : whole_desc) {
+                        transition_ok &= direct_plan_one(desc.name, desc.data, desc.expert_size,
+                                n_in, n_out, desc.type, n_expert, e) == 1;
+                    }
+                }
+                api.session_leave(reader);
+            }
+            const std::string log = capture.get();
+            transition_ok &= log.find("whole-only plan reconciled:") != std::string::npos;
+            transition_ok &= log.find("whole-only plan refused:") == std::string::npos;
+            transition_ok &= log.find("whole-only warm refused:") == std::string::npos;
+        }
+        if (reader) { api.session_destroy(reader); }
+        printf("cache-profile-whole-return: %s\n", transition_ok ? "OK" : "FAIL");
+        if (!transition_ok) { fprintf(stderr, "%s", capture.get().c_str()); }
+        ok &= transition_ok;
+        ok &= write_file(original);
+        set_env("GGML_MOE_CACHE_WHOLE_ONLY", had_whole ? saved_whole.c_str() : nullptr);
+    }
     set_env("GGML_MOE_CACHE_PROFILE_GLOBAL", nullptr);
     auto rejected = [&](const ggml_moe_cache_tensor_desc & candidate) {
         void * session = create_direct_session(gpu, cpu);

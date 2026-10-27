@@ -2672,18 +2672,26 @@ static bool moe_cache_build_global_profile(moe_cache_session & session, moe_cach
         device.profile_global_slots = plan.slots;
         device.profile_global_bytes = plan.bytes;
     };
-    publish_plan();
+    if (whole_only) {
+        device.profile_global_ranks.clear();
+        device.profile_global_selected.clear();
+        device.profile_global_slots.clear();
+        device.profile_global_bytes = 0;
+    } else {
+        publish_plan();
+    }
     MOE_CACHE_LOG("[moe-cache] CUDA%d global profile plan: budget=%zu selected_bytes=%zu slack=%zu bundles=%zu slices=%zu minimum_slots=%d; %s, selected bundles first\n",
             device.physical, budget, plan.bytes, budget - plan.bytes, plan.bundles,
             (size_t)std::count(plan.selected.begin(), plan.selected.end(), (uint8_t)1), moe_cache_pool_slots_min,
             density ? "logical route count per real byte" : "raw bytes-weighted use");
     if (resize) {
-        // Shrink every donor first; growth must never add a transient second grant.
+        // Whole plans must release every old slab before allocator-rounded replacement.
+        // Keeping recipient slabs alive can leave a donor below its minimum capacity.
         for (size_t p = 0; p < pending.size(); ++p) {
             const int pool = pending[p]->pool;
             if (pool < 0 || (size_t)pool >= device.pools.size()) { return false; }
-            if ((size_t)device.pools[pool]->n_slots > plan.slots[p]) {
-                if (!moe_cache_resize_pool(device, *device.pools[pool], (int)plan.slots[p])) {
+            if (whole_only || (size_t)device.pools[pool]->n_slots > plan.slots[p]) {
+                if (!moe_cache_resize_pool(device, *device.pools[pool], whole_only ? 0 : (int)plan.slots[p])) {
                     MOE_CACHE_LOG("[moe-cache] CUDA%d global profile replan stopped: donor pool resize failed; no recipient growth\n", device.physical);
                     return true;
                 }
@@ -2716,8 +2724,13 @@ static bool moe_cache_build_global_profile(moe_cache_session & session, moe_cach
             caps[p] = pool >= 0 ? (size_t)device.pools[pool]->n_slots : 0;
         }
         if (!ggml_cuda_moe_cache_profile_plan(items, caps, budget, moe_cache_pool_slots_min,
-                plan, density, (size_t)ranked_limit)) { return false; }
+                plan, density, (size_t)ranked_limit)) {
+            MOE_CACHE_LOG("[moe-cache] CUDA%d whole-only plan refused: actual pools cannot hold the minimum complete plan\n", device.physical);
+            return true;
+        }
         publish_plan();
+        MOE_CACHE_LOG("[moe-cache] CUDA%d whole-only plan reconciled: bundles=%zu slices=%zu actual_pool_bytes=%zu\n",
+                device.physical, plan.bundles, device.profile_global_selected.size(), device.allocated_bytes);
     }
     return true;
 }
