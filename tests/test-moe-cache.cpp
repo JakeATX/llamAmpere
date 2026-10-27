@@ -6645,6 +6645,10 @@ static bool run_skip_tail_layer(ggml_backend_t gpu, ggml_backend_t cpu, log_capt
     bool all_ok = true;
     std::vector<float> importance(256, 1.0f);
     constexpr int k_used = 8, dim = 256, rank = 5;
+    // 256 experts: the pool keeps at least 64 slots per bank, so a 64-expert layer would be fully resident.
+    // An 8 MiB budget holds well under 128 complete experts; routes use experts 0..5 (warm) and >= 128 (missed).
+    constexpr int64_t n_expert = 256;
+    constexpr int miss_base = 128;
     unsigned long long expected_rows_total = 0;
     long long logged_rows_total = 0;
     for (const auto type : {GGML_TYPE_Q4_0, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS}) {
@@ -6673,7 +6677,7 @@ static bool run_skip_tail_layer(ggml_backend_t gpu, ggml_backend_t cpu, log_capt
         }
         for (int tokens : {1, 4, 5}) {
             configure_cache(nullptr, "8");
-            set_env("GGML_CUDA_MOE_CACHE_BUDGET_MB", "16");
+            set_env("GGML_CUDA_MOE_CACHE_BUDGET_MB", "8");
             set_env("GGML_MOE_CACHE_DEVICE", "1");
             set_env("GGML_MOE_CACHE_DEVICE_STATS", "1");
             set_env("GGML_MOE_CACHE_DEVICE_CAPTURE", "1");
@@ -6740,7 +6744,7 @@ static bool run_skip_tail_layer(ggml_backend_t gpu, ggml_backend_t cpu, log_capt
                             case 4: e = j < rank ? (j % 6) : (t % 2 ? 30 + j : 30 + k_used - 1 - j); break; // tail misses across ranks
                             default: e = j < rank ? 12 + j : 12 + (j - rank); break;    // every tail expert is also a head expert: nothing skips
                         }
-                        routing[64 * t + j] = e;
+                        routing[64 * t + j] = e < 6 ? e : e - 6 + miss_base;
                     }
                 }
                 // rows the cutoff must leave out
@@ -6771,8 +6775,11 @@ static bool run_skip_tail_layer(ggml_backend_t gpu, ggml_backend_t cpu, log_capt
                     auto & dst = step == 0 ? exact : step == 1 ? lossy : again;
                     ggml_backend_tensor_get(graphs[1].out, dst.data(), 0, n_out * sizeof(float));
                 }
-                ok &= compare_output(expected, exact, 8e-3);
-                ok &= exact == again;
+                const bool cpu_ok = compare_output(expected, exact, 8e-3);
+                const bool repro_ok = exact == again;
+                ok &= cpu_ok && repro_ok;
+                size_t bad_skip = 0, bad_keep = 0;
+                float max_keep_diff = 0.0f;
                 for (int t = 0; t < tokens; ++t) {
                     for (int j = 0; j < k_used; ++j) {
                         const size_t base = ((size_t) t * k_used + j) * dim;
@@ -6780,12 +6787,19 @@ static bool run_skip_tail_layer(ggml_backend_t gpu, ggml_backend_t cpu, log_capt
                             const float want = skip_route[(size_t) t * k_used + j] ? 0.0f : exact[base + q];
                             if (memcmp(&lossy[base + q], &want, sizeof(float)) != 0) {
                                 ok = false;
+                                if (skip_route[(size_t) t * k_used + j]) {
+                                    ++bad_skip;
+                                } else {
+                                    ++bad_keep;
+                                    max_keep_diff = std::max(max_keep_diff, std::fabs(lossy[base + q] - want));
+                                }
                             }
                         }
                     }
                 }
                 if (!ok) {
-                    fprintf(stderr, "skip-tail layer type=%s tokens=%d pattern=%d failed\n", ggml_type_name(type), tokens, pattern);
+                    fprintf(stderr, "skip-tail layer type=%s tokens=%d pattern=%d failed: cpu=%d repro=%d bad_skip=%zu bad_keep=%zu max_keep_diff=%g\n",
+                            ggml_type_name(type), tokens, pattern, cpu_ok, repro_ok, bad_skip, bad_keep, max_keep_diff);
                     break;
                 }
             }
