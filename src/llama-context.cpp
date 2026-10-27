@@ -1140,7 +1140,7 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
                 /*.edge_bits_v =*/ params.sj_kvarn_edge_bits_v,
                 /*.edge_body_type =*/ params.sj_kvarn_edge_body_type,
                 /*.flush_chunk =*/ params.sj_kvarn_flush_chunk,
-                /*.resident_cells =*/ params.kv_resident,
+                /*.resident_cells =*/ params.kv_gpu_tokens,
                 /*.shared_pool =*/ sj_kvarn_shared_pool,
                 /*.transform   =*/ params.sj_kvarn_transform ? params.sj_kvarn_transform : "",
             },
@@ -4198,8 +4198,7 @@ int llama_mtp_device_feedback_decode(llama_context * draft, llama_batch batch, b
     return draft ? draft->mtp_device_feedback_decode(batch, use_previous) : -4;
 }
 
-// [RTPORT] LLAMA_MTP_PIPELINE=1. Strata (src/core/mtp.cpp, the step loop after the round graph) queues every guess
-// step back to back and lets the host poll mapped memory. Our steps keep the host p/q draw, so each step still needs
+// [RTPORT] LLAMA_MTP_PIPELINE=1. Our steps keep the host p/q draw, so each step still needs
 // the host's token; what can move off the critical path is the rest of the step's host work (batch, memory slot,
 // graph reuse, input staging, launch). A step is queued with its token row read on the card from pinned memory
 // (ggml_backend_cuda_mtp_row_wait) and the host publishes the row once it has sampled. Same f32 row as the host
@@ -9443,7 +9442,7 @@ llama_context_params llama_context_default_params() {
         /*.sj_kvarn_edge_bits_v           =*/ 4,
         /*.sj_kvarn_edge_body_type        =*/ GGML_TYPE_COUNT,
         /*.sj_kvarn_flush_chunk           =*/ 0,
-        /*.kv_resident                    =*/ 0,
+        /*.kv_gpu_tokens                 =*/ 0,
         /*.sj_kvarn_transform             =*/ nullptr,
         /*.embeddings                  =*/ false,
         /*.offload_kqv                 =*/ true,

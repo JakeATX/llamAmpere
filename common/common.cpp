@@ -2058,7 +2058,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.sj_kvarn_edge_bits_k = params.sj_kvarn_edge_bits_k;
     cparams.sj_kvarn_edge_bits_v = params.sj_kvarn_edge_bits_v;
     cparams.sj_kvarn_flush_chunk = params.sj_kvarn_flush_chunk;
-    cparams.kv_resident = params.kv_resident;
+    cparams.kv_gpu_tokens = params.kv_gpu_tokens;
     cparams.sj_kvarn_transform = params.sj_kvarn_transform.empty() ? nullptr : params.sj_kvarn_transform.c_str();
     cparams.type_s = params.cache_type_s;
 

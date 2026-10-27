@@ -143,7 +143,7 @@ static llama_context * make_ctx(llama_model * model, const sj_cfg & c, uint32_t 
         cp.sj_kvarn_edge_bits_v = c.edge_bits_v;
         cp.sj_kvarn_edge_body_type = c.edge_body;
         cp.sj_kvarn_transform = c.transform;
-        cp.kv_resident = c.resident;
+        cp.kv_gpu_tokens = c.resident;
     }
     llama_context * ctx = llama_init_from_model(model, cp);
     if (ctx && c.resident && !c.plain) {
