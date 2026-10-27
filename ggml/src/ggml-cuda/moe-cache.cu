@@ -1909,6 +1909,20 @@ static bool moe_cache_env_on(const char * name) {
     return value && atoi(value) != 0;
 }
 
+// Whole experts only. Partial residency (some of an expert's gate/up/down slices on the GPU, the rest on the host)
+// is removed: a partly resident expert still pays the host miss, and the measured whole-only plan held 163 more
+// complete experts at flat speed (home, 2026-10-27). GGML_MOE_CACHE_WHOLE_ONLY=0 is ignored with a warning.
+static bool moe_cache_whole_only() {
+    static const bool once = [] {
+        const char * value = getenv("GGML_MOE_CACHE_WHOLE_ONLY");
+        if (value && atoi(value) == 0) {
+            GGML_LOG_WARN("[moe-cache] GGML_MOE_CACHE_WHOLE_ONLY=0 ignored: partial expert residency was removed\n");
+        }
+        return true;
+    }();
+    return once;
+}
+
 // [PREFILLFAST] GGML_MOE_CACHE_FILL_BATCH=N (2..256): the worker takes up to N queued demand fills
 // (no look-ahead prediction) at once, copies each host source straight to its slot on the fill stream
 // and waits once for the whole batch. The single-job path copies through a pinned stage and waits per
@@ -2649,7 +2663,7 @@ static bool moe_cache_build_global_profile(moe_cache_session & session, moe_cach
     for (size_t p = 0; p < pending.size(); ++p) {
         if (entries[p] != pending[p]->n_entries || tensor_counts[p] != (size_t)pending[p]->n_tensors) { return false; }
     }
-    const bool whole_only = moe_cache_env_on("GGML_MOE_CACHE_WHOLE_ONLY");
+    const bool whole_only = moe_cache_whole_only();
     ggml_cuda_moe_profile_plan plan;
     int64_t density_value = 0;
     const bool density = !session.profile_ranked && moe_cache_env_i64("GGML_MOE_CACHE_PROFILE_GLOBAL_DENSITY", 0, 1, density_value) && density_value;
@@ -5719,7 +5733,7 @@ static int moe_cache_warm(void * opaque, const ggml_moe_cache_tensor_desc * tens
         return 0;
     }
     int64_t global_flag = 0;
-    const bool whole_only = moe_cache_env_on("GGML_MOE_CACHE_WHOLE_ONLY");
+    const bool whole_only = moe_cache_whole_only();
     if (loading && (whole_only || (moe_cache_env_i64("GGML_MOE_CACHE_PROFILE_GLOBAL", 0, 1, global_flag) && global_flag == 1))) {
         std::lock_guard<std::mutex> lock(session->mu);
         session->profile_global_tensors.clear();
@@ -6702,7 +6716,7 @@ static bool moe_cache_device_fallback(moe_cache_session & session,
 // boundary synchronization protects all captured table/slab references; no
 // allocation they point at is replaced, and no layer waits for host routing.
 static void moe_cache_device_adapt(moe_cache_session & session) {
-    if (moe_cache_env_on("GGML_MOE_CACHE_WHOLE_ONLY")) { return; }
+    if (moe_cache_whole_only()) { return; }
     if (!session.device_expert_counts || session.devices.size() != 1 ||
             session.active_scopes || session.active_nodes) {
         return;
@@ -7114,7 +7128,7 @@ static bool moe_cache_swap_init(moe_cache_session & session) {
         return false;
     }
     if (session.swap_whole && !moe_cache_swap_groups(session)) {
-        if (moe_cache_env_on("GGML_MOE_CACHE_WHOLE_ONLY")) {
+        if (moe_cache_whole_only()) {
             MOE_CACHE_LOG("[moe-cache] whole-only swaps disabled: incomplete projections, names or resident bundles\n");
             moe_cache_swap_free(session);
             return false;
@@ -10927,7 +10941,7 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
         if (moe_cache_env_i64("GGML_MOE_CACHE_SWAP_HYST_PCT", 0, 1000, adaptation_value)) { session->swap_hyst = (float)adaptation_value / 100.0f; }
         if (moe_cache_env_i64("GGML_MOE_CACHE_SWAP_MARGIN", 0, 100000, adaptation_value)) { session->swap_margin = (float)adaptation_value; }
         if (moe_cache_env_i64("GGML_MOE_CACHE_SWAP_MARGIN_MILLI", 0, 100000000, adaptation_value)) { session->swap_margin = (float) adaptation_value / 1000.0f; }
-        session->swap_whole = moe_cache_env_on("GGML_MOE_CACHE_WHOLE_ONLY") ||
+        session->swap_whole = moe_cache_whole_only() ||
             (moe_cache_env_i64("GGML_MOE_CACHE_SWAP_WHOLE", 0, 1, adaptation_value) && adaptation_value);
         session->swap_layer = moe_cache_env_i64("GGML_MOE_CACHE_SWAP_LAYER", 0, 1, adaptation_value) && adaptation_value;
         session->swap_decay_after = moe_cache_env_i64("GGML_MOE_CACHE_SWAP_DECAY_AFTER", 0, 1, adaptation_value) && adaptation_value;
@@ -11404,7 +11418,7 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
                 }
             }
         }
-        if (moe_cache_env_on("GGML_MOE_CACHE_WHOLE_ONLY") && !moe_cache_swap_groups(*session, true)) {
+        if (moe_cache_whole_only() && !moe_cache_swap_groups(*session, true)) {
             MOE_CACHE_LOG("[moe-cache] whole-only device tables refused: resident bundles are incomplete\n");
             return fail();
         }
