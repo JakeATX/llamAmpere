@@ -559,6 +559,7 @@ struct common_moe_cache_params {
     size_t budget_mib          = 0;
     bool mode_explicit         = false;
     bool fit_selected          = false;
+    int32_t skip_tail          = 0; // --moe-skip-tail: 0 off, 1..9 lossy route-rank cutoff for missed experts
 };
 
 // --cache-ram not given: pick the prompt-cache RAM budget from the host's memory at startup

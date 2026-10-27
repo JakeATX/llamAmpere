@@ -215,6 +215,23 @@ static void test(void) {
 
     printf("test-arg-parser: test invalid usage\n\n");
 
+    {
+        // --moe-skip-tail: 0..9, default 0 (exact)
+        common_params defaults;
+        assert(defaults.moe_cache.skip_tail == 0);
+        std::vector<std::string> args_skip = {"binary_name", "--moe-skip-tail", "7"};
+        common_params skip;
+        assert(common_params_parse(args_skip.size(), list_str_to_char(args_skip).data(), skip, LLAMA_EXAMPLE_SERVER));
+        assert(skip.moe_cache.skip_tail == 7);
+        assert(common_context_params_to_llama(skip).moe_skip_tail == 7);
+        for (const char * value : {"10", "-1", "x"}) {
+            args_skip = {"binary_name", "--moe-skip-tail", value};
+            common_params invalid;
+            assert(!common_params_parse(args_skip.size(), list_str_to_char(args_skip).data(), invalid, LLAMA_EXAMPLE_SERVER));
+        }
+        assert(llama_context_default_params().moe_skip_tail == 0);
+    }
+
     // missing value
     argv = {"binary_name", "-m"};
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
