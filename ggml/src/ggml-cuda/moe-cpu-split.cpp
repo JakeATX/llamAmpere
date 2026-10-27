@@ -1,4 +1,4 @@
-// fork STRATAGAP: host side of the CPU expert split (see moe-cpu-split.h).
+// fork MOEGAP: host side of the CPU expert split (see moe-cpu-split.h).
 //
 // Thread 0 of the pool watches the mapped job; when the card raises `seq`, every pool thread works through the
 // job's four phases (quantize the input rows, up + gate + SwiGLU, quantize the hidden rows, down) taking small
@@ -1222,6 +1222,15 @@ void moe_cs_stats(unsigned long long out[9]) {
     out[2] = s.st_routes.load();
     out[3] = s.st_busy_ns.load();
     out[4] = s.st_null.load();
+}
+
+bool moe_cs_iq_unpack(int type, const void * block, int c, bool joined, unsigned char * mag, signed char * sgn, int * mul) {
+#if defined(MOE_IQ_ROWS)
+    return moe_iq::unpack_slice(type, block, c, joined, (uint8_t *) mag, (int8_t *) sgn, mul);
+#else
+    (void) type; (void) block; (void) c; (void) joined; (void) mag; (void) sgn; (void) mul;
+    return false;
+#endif
 }
 
 bool moe_cs_iq_rows(int type, int nt, const void * w, size_t row_bytes, int64_t r0, int64_t r1, int64_t n_in,

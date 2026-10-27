@@ -1,5 +1,5 @@
 #pragma once
-// fork STRATAGAP (GGML_MOE_CPU_SPLIT=1, default off): the host CPU computes part of each layer's missed experts
+// fork MOEGAP (GGML_MOE_CPU_SPLIT=1, default off): the host CPU computes part of each layer's missed experts
 // while the card copies the rest over PCIe. One job per layer covers the whole expert (up, gate, SwiGLU, down), so
 // the card pays one handshake per layer instead of one per projection. The card plans the split (moe-cache.cu),
 // writes the job and the input rows into mapped host memory and raises `seq`; a pinned pool of spinning host threads
@@ -58,4 +58,8 @@ void moe_cs_stats(unsigned long long out[9]);
 // y[t] are Q8_K rows; variant as in moe_iq::get. False when the build or the type has none.
 bool moe_cs_iq_rows(int type, int nt, const void * w, size_t row_bytes, int64_t r0, int64_t r1, int64_t n_in,
         const void * const * y, float * const * out, int prefetch, int variant, bool wide = false);
+// Tests: unpack slice `c` (0..7, 32 weights) of one weight block of `type` the way the IQ row kernels do:
+// magnitudes (u8), signs (+1 / -1) and the two odd multipliers (weights 0..15, 16..31). `joined` selects the IQ3 grid
+// arm. False when the build or the type has no row kernel.
+bool moe_cs_iq_unpack(int type, const void * block, int c, bool joined, unsigned char * mag, signed char * sgn, int * mul);
 int moe_cs_threads();

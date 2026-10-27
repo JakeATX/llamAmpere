@@ -1,7 +1,11 @@
-// fork STRATAGAP: parity and speed of the host pool's IQ row kernels (moe-iq-rows.h, GGML_MOE_CPU_SPLIT_ROWS)
-// against ggml-cpu's vec_dot, on Qwen3.8 Flash-Next expert shapes (2560 in x 640 out).
+// fork MOEGAP: decode check, parity and speed of the host pool's IQ row kernels (moe-iq-rows.h,
+// GGML_MOE_CPU_SPLIT_ROWS) against ggml's own code, on Qwen3.8 Flash-Next expert shapes (2560 in x 640 out).
 //
-//   test-moe-iq-rows <cpu,cpu,...> [copies, default 256]
+//   test-moe-iq-rows <cpu,cpu,...> [copies, default 256] [check]
+//
+// Decode: for every IQ type the kernels handle (and both IQ3 grid arms), every 32-weight slice the kernels unpack
+// (magnitudes x signs x odd multiplier x block d x format factor) must equal ggml's dequantize output for those
+// weights. Exit code 1 on any difference.
 //
 // Parity: for every IQ up/gate type and nt = 1..8 tokens, every output must have the same bits as ggml's vec_dot
 // (the kernels do the same integer work in the same lanes and the same float steps). Exit code 1 on any difference.
@@ -78,6 +82,43 @@ int main(int argc, char ** argv) {
         for (auto & v : w) { v = 0.05f * frand(); }
         std::vector<uint8_t> q(bytes);
         ggml_quantize_chunk(type, w.data(), q.data(), 0, n_out, n_in, imat.data());
+        {   // decode check against ggml's dequantize
+            const auto * tt = ggml_get_type_traits(type);
+            const size_t tsz = ggml_type_size(type);
+            const float post = type == GGML_TYPE_IQ3_S ? 1.0f : type == GGML_TYPE_IQ3_XXS ? 0.25f : 0.125f;
+            std::vector<float> dq((size_t) n_in);
+            long long dec_bad = 0, dec_n = 0, dec_arms = 0;
+            for (int joined = 0; joined < 2; ++joined) {
+                const bool iq3 = type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ3_XXS;
+                if (joined && !iq3) { continue; }
+                ++dec_arms;
+                for (int64_t r = 0; r < n_out; ++r) {
+                    const uint8_t * row = q.data() + r * row_bytes;
+                    tt->to_float(row, dq.data(), n_in);
+                    for (int b = 0; b < n_in / QK_K; ++b) {
+                        const uint8_t * blk = row + (size_t) b * tsz;
+                        uint16_t dh;
+                        memcpy(&dh, blk, sizeof(dh));
+                        const float d = ggml_fp16_to_fp32(dh);
+                        for (int c = 0; c < 8; ++c) {
+                            uint8_t mag[32];
+                            int8_t sgn[32];
+                            int mul[2];
+                            if (!moe_cs_iq_unpack((int) type, blk, c, joined != 0, mag, sgn, mul)) { dec_bad += 32; continue; }
+                            for (int j = 0; j < 32; ++j) {
+                                const float got = d * post * (float) mul[j >= 16] * (float) mag[j] * (float) sgn[j];
+                                const float want = dq[(size_t) b * QK_K + (size_t) c * 32 + j];
+                                ++dec_n;
+                                dec_bad += !(fabsf(got - want) <= 1e-6f * fabsf(want) + 1e-12f);
+                            }
+                        }
+                    }
+                }
+            }
+            printf("  %-8s decode vs ggml dequantize: %lld weights, %lld arms, %lld differences\n", ggml_type_name(type), dec_n,
+                   dec_arms, dec_bad);
+            bad_total += dec_bad;
+        }
         const size_t act_bytes = ggml_row_size(tr->vec_dot_type, n_in);
         std::vector<uint8_t> act(NT * act_bytes);
         for (int t = 0; t < NT; ++t) {
