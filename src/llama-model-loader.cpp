@@ -1492,6 +1492,20 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         return nullptr;
     }
 
+    // fork: keep CUDA routers compact without changing their GGUF file layout or CPU mappings.
+    const char * router_bf16 = getenv("LLAMA_QWEN_ROUTER_BF16");
+    auto * dev = ggml_backend_buft_get_device(buft);
+    if (router_bf16 && strcmp(router_bf16, "1") == 0 && tn.arch == LLM_ARCH_QWEN4EXP &&
+            (tn.tensor == LLM_TENSOR_FFN_GATE_INP || tn.tensor == LLM_TENSOR_FFN_GATE_INP_SHEXP) &&
+            t_meta.type == GGML_TYPE_F32 && !is_lazy && dev && !ggml_backend_buft_is_host(buft) &&
+            strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "CUDA") == 0) {
+        t_meta.type = GGML_TYPE_BF16;
+        t_meta.nb[0] = ggml_type_size(t_meta.type);
+        for (size_t dim = 1; dim < GGML_MAX_DIMS; ++dim) {
+            t_meta.nb[dim] = t_meta.nb[dim - 1] * t_meta.ne[dim - 1];
+        }
+    }
+
     ggml_context * ctx = ctx_for_buft(buft);
 
     // if duplicated, check if the original tensor was allocated in the same buffer type context and avoid creating a new one
@@ -1839,6 +1853,8 @@ bool llama_model_loader::load_all_data(
         });
     }
 
+    size_t router_bf16_bytes = 0;
+    size_t router_bf16_count = 0;
     for (struct ggml_tensor * cur : tensors) {
         const auto * weight = get_weight(ggml_get_name(cur));
         if (weight == nullptr) {
@@ -1854,6 +1870,23 @@ bool llama_model_loader::load_all_data(
 
         if (arena_tensors.count(cur)) { continue; }
         size_t n_size = ggml_nbytes(cur);
+
+        if (cur->type == GGML_TYPE_BF16 && weight->tensor->type == GGML_TYPE_F32) {
+            if (!cur->data || !cur->buffer || ggml_backend_buffer_is_host(cur->buffer) ||
+                    ggml_nelements(cur) != ggml_nelements(weight->tensor)) {
+                throw std::runtime_error(format("invalid BF16 router allocation for '%s'", cur->name));
+            }
+            const size_t source_size = ggml_nbytes(weight->tensor);
+            std::vector<float> staging(use_mmap ? 0 : ggml_nelements(cur));
+            const auto * source = static_cast<const float *>(load_data_range(*weight, 0, source_size, staging.data()));
+            std::vector<ggml_bf16_t> converted(ggml_nelements(cur));
+            ggml_fp32_to_bf16_row(source, converted.data(), ggml_nelements(cur));
+            ggml_backend_tensor_set(cur, converted.data(), 0, n_size);
+            size_done += source_size;
+            router_bf16_bytes += source_size - n_size;
+            ++router_bf16_count;
+            continue;
+        }
 
         const bool from_mapping = use_mmap || lazy.has(cur);
 
@@ -1967,6 +2000,11 @@ bool llama_model_loader::load_all_data(
         }
 
         size_done += n_size;
+    }
+
+    if (router_bf16_count) {
+        LLAMA_LOG_WARN("%s: experimental BF16 router storage: %zu CUDA tensors, %.2f MiB less weight storage; arithmetic/replay qualification pending\n",
+                __func__, router_bf16_count, router_bf16_bytes / 1048576.0);
     }
 
     // free temporary resources used for async uploads

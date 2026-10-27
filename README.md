@@ -147,6 +147,8 @@ Start with [QWEN_AMPERE.md](QWEN_AMPERE.md) and the write-up in [docs/llamampere
 
 # llama.cpp
 
+Experimental Qwen3.8-Next CUDA router storage: `LLAMA_QWEN_ROUTER_BF16=1` converts F32 routed and shared-expert gates to BF16 while loading, using existing CUDA BF16 operations. The default remains F32; CPU mappings and model files stay unchanged. Weight representability does not establish identical arithmetic or prompt-cache replay; qualify quality and speed before deployment. Drafter expert sharing stays off.
+
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
 <div align="center">
