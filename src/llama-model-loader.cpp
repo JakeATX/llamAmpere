@@ -1496,7 +1496,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     const char * router_bf16 = getenv("LLAMA_QWEN_ROUTER_BF16");
     auto * dev = ggml_backend_buft_get_device(buft);
     if (router_bf16 && strcmp(router_bf16, "1") == 0 && get_arch() == LLM_ARCH_QWEN4EXP &&
-            (tn.tensor == LLM_TENSOR_FFN_GATE_INP || tn.tensor == LLM_TENSOR_FFN_GATE_INP_SHEXP) &&
+            tn.tensor == LLM_TENSOR_FFN_GATE_INP && // shared gates need F32 for CUDA fusion
             t_meta.type == GGML_TYPE_F32 && !is_lazy && dev && !ggml_backend_buft_is_host(buft) &&
             strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "CUDA") == 0) {
         t_meta.type = GGML_TYPE_BF16;
