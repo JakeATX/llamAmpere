@@ -357,6 +357,12 @@ struct llama_layer {
     struct ggml_tensor * ffn_down_exps     = nullptr;
     struct ggml_tensor * ffn_up_exps       = nullptr;
     struct ggml_tensor * ffn_gate_up_exps  = nullptr;
+    // hot experts kept in their own always-resident bank (qwen4exp; optional)
+    struct ggml_tensor * ffn_gate_exps_hot = nullptr;
+    struct ggml_tensor * ffn_up_exps_hot   = nullptr;
+    struct ggml_tensor * ffn_down_exps_hot = nullptr;
+    struct ggml_tensor * ffn_exps_hot_map  = nullptr;
+    struct ggml_tensor * ffn_exps_cold_map = nullptr;
     struct ggml_tensor * ffn_gate_inp_b    = nullptr;
     struct ggml_tensor * ffn_gate_exps_b   = nullptr;
     struct ggml_tensor * ffn_down_exps_b   = nullptr;

@@ -512,6 +512,11 @@ enum llm_tensor {
     LLM_TENSOR_FFN_GATE_EXPS,
     LLM_TENSOR_FFN_UP_EXPS,
     LLM_TENSOR_FFN_GATE_UP_EXPS,
+    LLM_TENSOR_FFN_GATE_EXPS_HOT, // always-resident hot experts (own type), see qwen4exp
+    LLM_TENSOR_FFN_UP_EXPS_HOT,
+    LLM_TENSOR_FFN_DOWN_EXPS_HOT,
+    LLM_TENSOR_FFN_EXPS_HOT_MAP,  // F32 [n_expert]: hot slot of each expert, -1 if not hot
+    LLM_TENSOR_FFN_EXPS_COLD_MAP, // F32 [n_expert]: expert id used on the cold bank (hot experts -> a cold stand-in)
     LLM_TENSOR_FFN_DOWN_SHEXP,
     LLM_TENSOR_FFN_GATE_SHEXP,
     LLM_TENSOR_FFN_UP_SHEXP,

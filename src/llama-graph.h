@@ -1269,6 +1269,17 @@ struct llm_graph_context {
     // multi-stream SJ-KVaRN: per-stream mask views cut to the stream's own n_kv are not contiguous when the ubatch
     // has more than one token row, and FA needs a contiguous mask; the contiguous copies are made once per graph
     // (the mask is shared by every layer)
+    // hot-expert bank of the next build_moe_ffn call (set by the model, consumed by the call):
+    // the selected experts are split between an always-resident hot bank and the regular (cold) bank
+    struct moe_hot_bank {
+        ggml_tensor * up       = nullptr;
+        ggml_tensor * gate     = nullptr;
+        ggml_tensor * down     = nullptr;
+        ggml_tensor * hot_map  = nullptr; // F32 [n_expert]: hot slot or -1
+        ggml_tensor * cold_map = nullptr; // F32 [n_expert]: cold-bank id per expert (optional)
+    };
+    mutable moe_hot_bank  moe_hot;
+    mutable ggml_tensor * moe_weights_override = nullptr;
     mutable ggml_tensor * sj_kvarn_mask_src = nullptr;
     mutable std::vector<ggml_tensor *> sj_kvarn_mask_s;
 

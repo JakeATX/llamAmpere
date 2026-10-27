@@ -2566,8 +2566,55 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(weights, "ffn_moe_weights_scaled", il);
     }
 
+    if (moe_weights_override != nullptr) {
+        // inner call of the hot/cold split below: the routing weights were already masked
+        weights = moe_weights_override;
+        moe_weights_override = nullptr;
+    }
+
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
+
+    if (moe_hot.hot_map != nullptr) {
+        // split the selected experts between the hot bank and the cold bank; each bank runs on all
+        // n_expert_used columns with the weights of the other bank's experts set to zero
+        const moe_hot_bank hot = moe_hot;
+        moe_hot = {};
+        GGML_ASSERT(res->get_b1_ffn() == nullptr && "hot expert bank does not support the layer-major prompt path");
+        GGML_ASSERT(!weight_before_ffn);
+
+        ggml_tensor * slot = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, hot.hot_map, 1, n_expert), selected_experts); // [1, n_expert_used, n_tokens]
+        cb(slot, "ffn_moe_hot_slot", il);
+        ggml_tensor * mask  = ggml_step(ctx0, ggml_scale_bias(ctx0, slot, 1.0f, 0.5f)); // 1 = hot, 0 = cold
+        ggml_tensor * w_hot  = ggml_mul(ctx0, weights, mask);
+        ggml_tensor * w_cold = ggml_sub(ctx0, weights, w_hot);
+        cb(w_hot,  "ffn_moe_weights_hot",  il);
+        cb(w_cold, "ffn_moe_weights_cold", il);
+
+        ggml_tensor * hot_ids = ggml_cast(ctx0, ggml_reshape_2d(ctx0, ggml_relu(ctx0, slot), n_expert_used, n_tokens), GGML_TYPE_I32);
+        cb(hot_ids, "ffn_moe_hot_ids", il);
+        ggml_tensor * cold_ids = selected_experts;
+        if (hot.cold_map != nullptr) {
+            ggml_tensor * cid = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, hot.cold_map, 1, n_expert), selected_experts);
+            cold_ids = ggml_cast(ctx0, ggml_reshape_2d(ctx0, cid, n_expert_used, n_tokens), GGML_TYPE_I32);
+            cb(cold_ids, "ffn_moe_cold_ids", il);
+        }
+
+        moe_weights_override = w_hot;
+        ggml_tensor * out_hot = build_moe_ffn(cur, gate_inp, nullptr,
+                hot.up, nullptr, hot.gate, nullptr, hot.down, nullptr, exp_probs_b,
+                n_expert, n_expert_used, type_op, norm_w, w_scale, gating_op, il,
+                logits, nullptr, nullptr, nullptr, nullptr, nullptr, hot_ids);
+        moe_weights_override = w_cold;
+        ggml_tensor * out_cold = build_moe_ffn(cur, gate_inp, nullptr,
+                up_exps, up_exps_b, gate_exps, gate_exps_b, down_exps, down_exps_b, exp_probs_b,
+                n_expert, n_expert_used, type_op, norm_w, w_scale, gating_op, il,
+                logits, gate_up_exps, gate_up_exps_b, up_exps_s, gate_exps_s, down_exps_s, cold_ids);
+        GGML_ASSERT(moe_weights_override == nullptr);
+        ggml_tensor * moe_out = ggml_add(ctx0, out_hot, out_cold);
+        cb(moe_out, "ffn_moe_out", il);
+        return moe_out;
+    }
 
     const auto * b1_ffn = res->get_b1_ffn();
     if (res->get_b1_ffn_phase() == 1 && b1_ffn) {
