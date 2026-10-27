@@ -4855,6 +4855,11 @@ void llama_kv_cache::state_mirror_cell_ext(const llama_kv_cache & source, const 
     if (!source.has_cell_ext()) {
         return;
     }
+    // an empty layout means the attention restore wrote no cells (partial-only restores of a cache without a
+    // sliding window return early), so there is nothing to mirror
+    if (slots.empty()) {
+        return;
+    }
     GGML_ASSERT(v_cells.size() == source.v_cells.size() && slots.size() == v_cells.size());
     for (const auto & slot : slots) {
         for (size_t s = 0; s < slot.n_stream(); ++s) {
