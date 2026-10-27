@@ -11,18 +11,23 @@ large mixture-of-experts model whose experts live partly in system RAM and partl
 
 ## Swift 1.5 27B: v0.6 against v0.5
 
-**Measurement in progress.** The table is filled in once the runs finish; this note will be updated without a new
-version number.
+**Partial results (one seed, 7300).** The second seed and the weighted total are still running; this table will be
+updated without a new version number.
 
 Home RTX 3090 Ti at 350 W, 100K-token prompt (real coding, agentic and RAG task histories), 5,120 written tokens per
-answer, temperature 1.0, writing speed in tokens per second. G = 0.4 coding + 0.4 agentic + 0.2 RAG.
+answer, temperature 1.0, writing speed in tokens per second (time to finish the whole request in seconds, prompt
+reading included, in brackets). G = 0.4 coding + 0.4 agentic + 0.2 RAG.
 
 | Setup | Coding | Agentic | RAG | G |
 |---|---|---|---|---|
-| v0.5 release, IQ4_XS-M, published command (tq5_0/turbo4, adaptive draft depth 3-4) | pending | pending | pending | pending |
-| v0.6, IQ4_XS-M, SJ-KVaRN 4/4, exact drafting (`--no-spec-mb-mtp`) | pending | pending | pending | pending |
-| v0.6, AI+ 4-bit, SJ-KVaRN 4/4, exact drafting | pending | pending | pending | pending |
-| v0.6, AI+ 4-bit, SJ-KVaRN 4/4, mb-MTP, draft depth 6 | pending | pending | pending | pending |
+| v0.5 release, IQ4_XS-M, published command (tq5_0/turbo4, adaptive draft depth 3-4) | 102.0 (139.9 s) | 86.9 (144.8 s) | in progress | in progress |
+| v0.6, IQ4_XS-M, SJ-KVaRN 4/4, exact drafting (`--no-spec-mb-mtp`) | 110.5 (126.2 s) | 96.3 (129.9 s) | in progress | in progress |
+| v0.6, AI+ 4.2 bpw, SJ-KVaRN 4/4, exact drafting | 105.8 (122.7 s) | 100.7 (122.1 s) | in progress | in progress |
+| v0.6, AI+ 4.2 bpw, SJ-KVaRN 4/4, mb-MTP, draft depth 6 (the command below) | 122.0 (116.6 s) | 103.8 (120.9 s) | in progress | in progress |
+
+Prompt reading at 100K: about 1,100 tokens per second on v0.5, about 1,240 with v0.6 on IQ4_XS-M and about 1,330 with
+v0.6 on AI+. Peak card memory 17,188-18,224 MiB in these runs (110,592-token context). mb-MTP changes the text slightly (see
+below), so compare it with exact drafting by time to finish, not only by writing speed.
 
 ## Run it (Swift 1.5 27B, one RTX 3090 / 3090 Ti, 262,144-token context)
 
