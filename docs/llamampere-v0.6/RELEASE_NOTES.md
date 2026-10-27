@@ -105,6 +105,9 @@ the text can differ between runs. That is expected, not a bug. Details: "Run-to-
 - **Packed attention masks** for cards with 12 GB or less (`LLAMA_KQ_MASK_PACKED=1`, off by default; see
   `docs/llamampere-v0.6/CHANGELOG.md`).
 - **Fix:** SJ-KVaRN works with image prompts on models that use M-RoPE (#39, #49).
+- **Fix:** Flash-Next with `--parallel` 2 to 4: restoring a saved prompt cache no longer stops the server with an assert.
+- **Fix:** the Flash-Next expert route tables now also turn on under cgroup v1 memory limits (many Docker hosts); before,
+  those hosts fell back to a much slower path.
 
 ## Gates run for this release
 
