@@ -84,7 +84,7 @@ LLAMA_API int llama_mtp_handoff_decode(struct llama_context * draft, struct llam
 LLAMA_API bool llama_mtp_device_feedback_init(struct llama_context * draft);
 LLAMA_API int llama_mtp_device_feedback_decode(struct llama_context * draft, struct llama_batch batch, bool use_previous);
 // [RTPORT] LLAMA_MTP_PIPELINE=1 (needs feedback): queue a 1-row helper step whose token is published later, so the
-// next guess step is already on the card while the host samples the current one (Strata's back-to-back steps).
+// next guess step is already on the card while the host samples the current one.
 // pipe_decode with defer=false publishes batch.token[0] itself; with defer=true the step waits on the card for
 // pipe_supply (or pipe_cancel). While a step waits, llama_synchronize and the output getters wait only for the step
 // before it. pipe_step_ok synchronizes and returns false when the last step timed out (its outputs are garbage).

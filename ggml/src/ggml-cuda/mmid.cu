@@ -147,7 +147,7 @@ static void launch_mm_ids_helper(
         (ids, ids_src1, ids_dst, expert_bounds, n_tokens, n_expert_used_var, nchannels_y, si1, sis1, write_inverse);
 }
 
-// [FNSTRATA] Opt-in parallel helper (GGML_CUDA_MMID_PAR=1): the same three outputs as mm_ids_helper, built by a
+// [FNPORT] Opt-in parallel helper (GGML_CUDA_MMID_PAR=1): the same three outputs as mm_ids_helper, built by a
 // counting sort instead of one warp per expert scanning every token. Tokens are cut into chunks of MMID_PAR_WARPS*32;
 // 1) every chunk counts its entries per expert, 2) one block turns the counts into expert-major, chunk-minor offsets
 // (= expert_bounds and each chunk's base inside its expert), 3) every chunk writes its entries at base + the number of

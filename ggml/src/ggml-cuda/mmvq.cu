@@ -2139,9 +2139,9 @@ static void moe_d1_launch(const void * const * table, const char * act_q8, const
             (int) (n_ids*n_out), (int) n_out, (int) n_ids, (int) n_tokens, (int) ids_stride, route_hot, route_want_hot);
 }
 
-// [STRATAGAP DOWNSW] Sub-warp rows for the expert down projection (GGML_MOE_DOWN_SW). Its rows are short (the
+// [MOEGAP DOWNSW] Sub-warp rows for the expert down projection (GGML_MOE_DOWN_SW). Its rows are short (the
 // expert's hidden width), so one warp per row leaves lanes idle: IQ4_NL at 640 columns is 2 passes with 32 then 8 lanes
-// busy. Strata gives each row a few lanes (native_down_multi); this is our own code that keeps our arithmetic bit for
+// busy. Instead of one warp per row, each row gets a few lanes; our implementation keeps our arithmetic bit for
 // bit: each of the c_lanes lanes of a group stands in for 32/c_lanes lanes of the plain kernel ("virtual lanes"),
 // accumulates their partial sums in the same order, then runs the same xor butterfly (the steps that cross virtual
 // lanes are done in registers, the rest by shuffles within the group). Float addition is commutative, so every
@@ -2317,10 +2317,9 @@ static void moe_sw_launch(const void * const * table, const char * act_q8, const
             route_hot, route_want_hot);
 }
 
-// [STRATAGAP HITG] Fused gate + up + SwiGLU form of the decode-once kernel (GGML_MOE_HIT_FUSED). The idea of doing
-// both projections and the SwiGLU of an expert in one pass is Strata's (native_gu_swiglu_kernel); this code is our
-// own and keeps our arithmetic. Each warp computes the up and the gate rows of its expert for every member token
-// from one read of the activation chunk; the up and gate sums are those of mul_mat_vec_q_moe (same lanes, same k
+// [MOEGAP HITG] Fused gate + up + SwiGLU form of the decode-once kernel (GGML_MOE_HIT_FUSED). Both
+// projections and the SwiGLU of an expert are done in one pass, with our own arithmetic. Each warp computes the up
+// and the gate rows of its expert for every member token from one read of the activation chunk; the up and gate sums are those of mul_mat_vec_q_moe (same lanes, same k
 // order, same reduction), and the output is up * silu(gate), the bits of the separate GLU kernel (silu(gate) * up).
 // One launch replaces the up and gate launches and the GLU launch of a pass.
 // Route filter: a route works in a pass when (m0[e] && m1[e]) == want, so with the residency flags of both
@@ -2458,9 +2457,8 @@ static __global__ void mul_mat_vec_q_moe_hitg(
     ggml_cuda_pdl_lc();
 }
 
-// [STRATAGAP HITGSW] Sub-warp rows for the fused gate/up/SwiGLU hit pass (GGML_MOE_HIT_FUSED_SHAPE=sw...). Our own code;
-// the idea of 16-lane gate/up rows that keep 5 dots per lane busy at K = 2560 is from Strata's native_gu_swiglu (see
-// STATUSGAP/LEARNED.md). Each of the c_lanes lanes of a group stands in for 32/c_lanes lanes of the plain kernel
+// [MOEGAP HITGSW] Sub-warp rows for the fused gate/up/SwiGLU hit pass (GGML_MOE_HIT_FUSED_SHAPE=sw...). 16-lane gate/up rows keep 5 dots per
+// lane busy at K = 2560. Each of the c_lanes lanes of a group stands in for 32/c_lanes lanes of the plain kernel
 // ("virtual lanes", as moe_sw_rows), keeps their partial sums in the same k order and runs the same xor butterfly, so
 // the up and gate sums, and up * silu(gate), have the bits of moe_hitg_rows / the plain kernels. c_kb > 0 is the
 // row's block count known at compile time: the k loop then has a fixed trip count (predicated), so the loads of all
@@ -2615,7 +2613,7 @@ static __global__ void mul_mat_vec_q_moe_hitg_sw(
     if (((m0[me] != 0) && (m1[me] != 0)) != (want != 0)) {
         return;
     }
-    // [STRATAGAP HITGSW s] codebook copy in shared memory, as mul_mat_vec_q_moe_hitg (block-uniform point: every
+    // [MOEGAP HITGSW s] codebook copy in shared memory, as mul_mat_vec_q_moe_hitg (block-uniform point: every
     // return above depends only on blockIdx.y)
     constexpr bool use_smem = c_smem && ggml_cuda_mmvq_smem_grid_type(type);
     constexpr int  smem_n   = type == GGML_TYPE_IQ3_XXS ? 256 : type == GGML_TYPE_IQ3_S ? 512 :
@@ -3476,7 +3474,7 @@ static ggml_backend_cuda_context::q8_cache_entry * ggml_cuda_q8_cache_find(ggml_
     return nullptr;
 }
 
-// [STRATAGAP Q8SHARE] lookup only: the cached buffer of (src1, layout) in this graph eval, or nullptr
+// [MOEGAP Q8SHARE] lookup only: the cached buffer of (src1, layout) in this graph eval, or nullptr
 char * ggml_cuda_q8_cache_lookup(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, ggml_type type_src0,
                                  size_t q8_bytes, int64_t ne10_padded) {
     ggml_backend_cuda_context::q8_cache_entry * qe = ggml_cuda_q8_cache_find(ctx, src1, type_src0, q8_bytes, ne10_padded);
@@ -4156,7 +4154,7 @@ static int moe_d1_mode() {
     return mode;
 }
 
-// [STRATAGAP DOWNSW] GGML_MOE_DOWN_SW: 0 off, 1 on, check (trap on any bit difference to the plain kernel); the
+// [MOEGAP DOWNSW] GGML_MOE_DOWN_SW: 0 off, 1 on, check (trap on any bit difference to the plain kernel); the
 // Q2_0 / IQ4_NL expert projections (Flash-Next's down) then take mul_mat_vec_q_moe_sw, whatever GGML_MOE_MMV_D1 says.
 // GGML_MOE_DOWN_SW_SHAPE: lanes per row x rows per lane group, gN = routes per weight pass, wN = warps per block:
 // 8x2 (default: 8x2g2w4), 16x2, 8x1, 8x2g1, 8x2w8, 16x1, 8x2g4, 4x2.
@@ -4292,7 +4290,7 @@ bool ggml_cuda_moe_table_mmv_d1_try(ggml_backend_cuda_context & ctx,
 }
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-// [STRATAGAP MISSLIST] miss pass over the plan's compact list: grid (row tiles, slices); slice y takes list entries
+// [MOEGAP MISSLIST] miss pass over the plan's compact list: grid (row tiles, slices); slice y takes list entries
 // y, y + slices, ... so a pass with nothing to do is one load per block. Per route the dot code, lane split and
 // reduction are those of the plain kernel (moe_d1_rows / moe_hitg_rows), so every output keeps its bits.
 template <ggml_type type, int c_warps, int c_rows, bool c_fused, int c_lanes = 32>
@@ -4440,7 +4438,7 @@ void ggml_cuda_moe_table_mmv_list(ggml_backend_cuda_context & ctx, const moe_mis
 #endif
 }
 
-// [STRATAGAP HITG] GGML_MOE_HIT_FUSED: 0 off, 1 on, check = also run the plain up and gate kernels and trap on any
+// [MOEGAP HITG] GGML_MOE_HIT_FUSED: 0 off, 1 on, check = also run the plain up and gate kernels and trap on any
 // bit difference. GGML_MOE_HIT_FUSED_SHAPE: warps x rows per warp, s = shared-memory codebook (4x2, 8x2, 4x1, 8x1,
 // 4x2s, 8x2s, 8x1s; default 4x2). Members are taken two tokens at a time. Gate/up types of Flash-Next only.
 // Sub-warp shapes (HITGSW): swLxR[gG][wW] = L lanes per row x R rows per lane group, G tokens per weight read
@@ -4517,7 +4515,7 @@ static void moe_hitg_dispatch(int shape, const void * const * up_table, const vo
 
 #endif
 
-// [STRATAGAP HITGBENCH] Kernel-only timing of the fused hit pass for tests/test-moe-hitg-bench (not used by the
+// [MOEGAP HITGBENCH] Kernel-only timing of the fused hit pass for tests/test-moe-hitg-bench (not used by the
 // server). Flash-Next shape: K = 2560, 640 rows, 10 experts per token. n_pool experts are drawn from per token (the
 // union is what one launch reads), n_sets copies of the weights are cycled so each launch reads cold memory as a
 // decode layer does. Weights and activations are random with small scales. Returns the mean us per launch and the MB

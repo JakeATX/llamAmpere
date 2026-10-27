@@ -96,7 +96,7 @@ static char * g_hf_scratch = nullptr;
 static const void ** g_hf_eff = nullptr;
 static const void ** g_hf_src = nullptr;
 static int * g_hf_nstage = nullptr;
-// fork STRATAGAP MISSLIST: GGML_MOE_MISS_LIST=1|check. The plan kernel writes the miss passes' expert lists
+// fork MOEGAP MISSLIST: GGML_MOE_MISS_LIST=1|check. The plan kernel writes the miss passes' expert lists
 // (moe_miss_list, mmvq.cuh: 0 up, 1 gate, 2 down, 3 fused gate+up); a miss pass is then one launch over the
 // experts it computes instead of a grid over every route. check = also run the old pass and trap on any bit change.
 static moe_miss_list * g_hf_miss = nullptr;
@@ -108,7 +108,7 @@ static int moe_miss_list_mode() {
     }();
     return mode;
 }
-// fork STRATAGAP DOWNONE: GGML_MOE_DOWN_ONE=1|check. On a hit-first layer the down projection waits for its copy
+// fork MOEGAP DOWNONE: GGML_MOE_DOWN_ONE=1|check. On a hit-first layer the down projection waits for its copy
 // first and then computes every route the card owns in ONE launch over the effective table (resident experts at
 // their cache address, staged ones at their copy), instead of a hit pass and a miss pass. The down copy is normally
 // done by then (it is issued with the gate/up copies at the layer's start), so this drops one launch per layer
@@ -128,12 +128,12 @@ static size_t g_hf_stride = 0;
 static int64_t g_hf_experts = 0;
 static int g_hf_slots = 0;
 static std::atomic<unsigned long long> g_hf_layers{0};
-// fork STRATAGAP: how often each new switch took its path (counted where the host issues the work, so a CUDA graph
+// fork MOEGAP: how often each new switch took its path (counted where the host issues the work, so a CUDA graph
 // counts once per capture, not per replay)
 static std::atomic<unsigned long long> g_st_hitg{0}, g_st_ml{0}, g_st_pc{0}, g_st_q8hit{0}, g_st_q8claim{0}, g_st_pub_plan{0};
 // fork PARFIX: graphs that ended with a layer's side copies still unjoined (see ggml_cuda_moe_cache_hf_graph_end).
 static std::atomic<unsigned long long> g_hf_graph_end_joins{0};
-// fork STRATAGAP (GGML_MOE_CPU_SPLIT=1): the host CPU computes part of each hit-first layer's missed experts
+// fork MOEGAP (GGML_MOE_CPU_SPLIT=1): the host CPU computes part of each hit-first layer's missed experts
 // (moe-cpu-split.h). The plan kernel picks the CPU experts and writes this card-side plan; the publish kernel copies
 // the input rows into mapped memory and raises the job; the down projection's join kernel adds the CPU's rows.
 struct moe_cs_plan_dev {
@@ -159,18 +159,18 @@ static float * g_cs_out_h = nullptr, * g_cs_out_d = nullptr;
 static size_t g_cs_x_stride = 0, g_cs_out_stride = 0;
 static moe_cs_plan_dev * g_cs_plan = nullptr;
 static uint8_t * g_cs_mask = nullptr;      // [3][g_hf_experts]: resident or on the CPU (the miss passes skip both)
-// fork STRATAGAP DOWNONE: g_cs_mask has a 4th row, [3][e] = 1 when the host computes expert e this layer (written only
+// fork MOEGAP DOWNONE: g_cs_mask has a 4th row, [3][e] = 1 when the host computes expert e this layer (written only
 // with GGML_MOE_DOWN_ONE on); the single down pass skips exactly those.
 static float g_cs_route_ns = 0.0f, g_cs_fixed_ns = 0.0f, g_cs_ns_per_byte = 0.0f;
 static int g_cs_max_exp = 8, g_cs_max_route = 24;
 static int g_cs_adapt = 0;   // GGML_MOE_CPU_SPLIT_ADAPT=1: the join corrects the per-route cost from the host's measured job times
-// fork STRATAGAP CPU-first (GGML_MOE_CPU_SPLIT_FIRST=1 sets all three; each can be set alone):
+// fork MOEGAP CPU-first (GGML_MOE_CPU_SPLIT_FIRST=1 sets all three; each can be set alone):
 //  PARTIAL=1: an expert missing in only one or two projections may go to the CPU too (the CPU computes the whole
 //    expert from host RAM; the card's hit pass still computes the resident projections, whose down rows the join
 //    then overwrites, so nothing is counted twice);
 //  FLOOR_US=<us per distinct expert of the layer>: card time the hit math takes anyway. The CPU may fill it at no
 //    cost, so the planner keeps handing experts to the CPU while max(CPU, max(floor, link)) does not grow;
-//  LINK_WEIGHT=<x>: weight on the link side of the balance (>1 hands the CPU more, as Strata's 1.85 does).
+//  LINK_WEIGHT=<x>: weight on the link side of the balance (>1 hands the CPU more; default 1.0).
 static int g_cs_partial = 0;
 static float g_cs_floor_ns = 0.0f, g_cs_link_w = 1.0f;
 static std::atomic<unsigned long long> g_cs_layers_published{0};
@@ -273,7 +273,7 @@ static void moe_missjoin_log(const char * when) {
     }
     if (g_st_hitg.load() || g_st_ml.load() || g_st_pc.load() || g_st_q8hit.load() || g_st_q8claim.load() ||
             ggml_cuda_moe_down_sw_count() || g_st_one.load() || g_st_pub_plan.load()) {
-        MOE_CACHE_LOG("[moe-cache] stratagap paths %s: hit_fused_layers=%llu miss_list_passes=%llu plan_count_layers=%llu "
+        MOE_CACHE_LOG("[moe-cache] path counts %s: hit_fused_layers=%llu miss_list_passes=%llu plan_count_layers=%llu "
                 "q8_share_hits=%llu q8_share_claims=%llu down_sw_passes=%llu down_one_layers=%llu pub_plan_layers=%llu (issue-time counts)\n",
                 when, g_st_hitg.load(), g_st_ml.load(), g_st_pc.load(), g_st_q8hit.load(), g_st_q8claim.load(),
                 ggml_cuda_moe_down_sw_count(), g_st_one.load(), g_st_pub_plan.load());
@@ -789,17 +789,17 @@ struct moe_cache_session {
     // the copies are issued in the order the math needs them.
     std::vector<std::array<int8_t, 3>> hf_order;
     std::vector<int8_t> hf_seq;
-    // fork STRATAGAP PLANCOUNT: the layer (and ids) whose route counts the plan kernel adds; bit k = kind k's count
+    // fork MOEGAP PLANCOUNT: the layer (and ids) whose route counts the plan kernel adds; bit k = kind k's count
     // still owed by the plan (its own count kernel is skipped).
     int pc_layer = -1;
     const void * pc_ids = nullptr;
     unsigned pc_mask = 0;
-    // fork STRATAGAP: layers the host can compute (registered) and whose graph has the plain up/gate -> SwiGLU ->
+    // fork MOEGAP: layers the host can compute (registered) and whose graph has the plain up/gate -> SwiGLU ->
     // down shape (checked per graph by ggml_cuda_moe_cache_cs_graph_scan); the layer whose CPU job is in flight.
     std::vector<uint8_t> cs_registered;
     std::vector<uint8_t> cs_valid;
     int cs_layer = -1;
-    // fork STRATAGAP MISSLIST: the layer whose plan wrote the miss lists (-1: none)
+    // fork MOEGAP MISSLIST: the layer whose plan wrote the miss lists (-1: none)
     int ml_layer = -1;
     int active_scopes = 0;
     int active_nodes = 0;
@@ -8674,7 +8674,7 @@ static bool moe_missjoin_retained_use(ggml_backend_cuda_context & ctx, moe_cache
     return session.mj_retained_stream == ctx.stream();
 }
 
-// fork STRATAGAP: GGML_MOE_CPU_SPLIT=1 turns the CPU expert split on (default off).
+// fork MOEGAP: GGML_MOE_CPU_SPLIT=1 turns the CPU expert split on (default off).
 static bool moe_cs_enabled() {
     static const bool on = [] { const char * v = getenv("GGML_MOE_CPU_SPLIT"); return v && strcmp(v, "1") == 0; }();
     return on;
@@ -8997,21 +8997,21 @@ struct moe_hf_plan_args {
     int * nstage;
     char * scratch;
     size_t stride;
-    // fork STRATAGAP: CPU expert split (cs null: off for this layer; only the fast plan kernel reads these)
+    // fork MOEGAP: CPU expert split (cs null: off for this layer; only the fast plan kernel reads these)
     moe_cs_plan_dev * cs;
     uint8_t * cs_mask;            // [3][cs_mask_stride]: nonzero = the miss pass skips the expert
-    uint8_t * cs_cpu;             // fork STRATAGAP DOWNONE: [cs_mask_stride] 1 = on the CPU this layer (null: off)
+    uint8_t * cs_cpu;             // fork MOEGAP DOWNONE: [cs_mask_stride] 1 = on the CPU this layer (null: off)
     int64_t cs_mask_stride;
     float cs_route_ns, cs_fixed_ns, cs_ns_per_byte;
     int cs_adapt;
     float cs_bytes[3];            // copy bytes of one expert per projection
     int cs_max_exp, cs_max_route;
-    int cs_partial;               // fork STRATAGAP CPU-first (see g_cs_partial)
+    int cs_partial;               // fork MOEGAP CPU-first (see g_cs_partial)
     float cs_floor_ns, cs_link_w;
-    moe_miss_list * miss;         // fork STRATAGAP MISSLIST: [4] lists to write (null: off; fast kernel only)
-    unsigned long long * pc_exp[3];   // fork STRATAGAP PLANCOUNT: per-kind expert counts (null: off; fast kernel only)
+    moe_miss_list * miss;         // fork MOEGAP MISSLIST: [4] lists to write (null: off; fast kernel only)
+    unsigned long long * pc_exp[3];   // fork MOEGAP PLANCOUNT: per-kind expert counts (null: off; fast kernel only)
     unsigned long long * pc_route;    // [0] hot routes, [1] cold routes, [2] dispatches (may be null)
-    // fork STRATAGAP PUBPLAN: the fast plan kernel publishes the host job itself (cs_job null: the publish kernel does)
+    // fork MOEGAP PUBPLAN: the fast plan kernel publishes the host job itself (cs_job null: the publish kernel does)
     moe_cs_job * cs_job;
     const char * cs_x;
     size_t cs_nb1, cs_nb2;
@@ -9121,7 +9121,7 @@ static __global__ void moe_hf_plan_kernel(const moe_hf_plan_args args, const int
 #define MOE_HF_FAST_MAX_ROUTES 256
 #define MOE_HF_FAST_MAX_EXPERT 1024
 
-// fork STRATAGAP PLANCOUNT: GGML_MOE_PLAN_COUNT=1 has the hit-first plan kernel (side stream) add the per-expert
+// fork MOEGAP PLANCOUNT: GGML_MOE_PLAN_COUNT=1 has the hit-first plan kernel (side stream) add the per-expert
 // and hot/cold route counts of all three projections of its layer, instead of three moe_cache_count_routes launches
 // on the main stream. Integer atomics, so the totals (and the swap policy that reads them) are the same. Default off.
 static bool moe_plan_count_enabled() {
@@ -9145,7 +9145,7 @@ static bool moe_plan_count_take(moe_cache_session & session, const moe_cache_dev
     return true;
 }
 
-// fork STRATAGAP PUBPLAN: GGML_MOE_CPU_SPLIT_PUB_PLAN (default on, =0 turns it off; only matters when GGML_MOE_CPU_SPLIT=1) moves the CPU job's publish (input rows to
+// fork MOEGAP PUBPLAN: GGML_MOE_CPU_SPLIT_PUB_PLAN (default on, =0 turns it off; only matters when GGML_MOE_CPU_SPLIT=1) moves the CPU job's publish (input rows to
 // mapped host memory, then the job and its number) into the fast plan kernel, right after the CPU pick and before
 // the miss lists, staging and address table. The host starts one launch (and one wait for free SM slots) earlier;
 // the rows, the job and the order of the writes are those of moe_cs_publish_kernel, so the results are the same.
@@ -9166,14 +9166,14 @@ static __global__ void __launch_bounds__(256) moe_hf_plan_fast_kernel(const moe_
     __shared__ short s_slot[3][MOE_HF_FAST_MAX_EXPERT];  // expert -> staging slot, -1 when not staged
     __shared__ int s_total[3];
     __shared__ unsigned s_n[3];  // distinct experts, distinct misses, miss routes (all three projections)
-    // fork STRATAGAP: CPU split state
+    // fork MOEGAP: CPU split state
     __shared__ unsigned char s_cpu[MOE_HF_FAST_MAX_EXPERT];   // expert -> CPU slot + 1, 0 = card
     __shared__ short s_cnt[MOE_HF_FAST_MAX_ROUTES];           // at a candidate's first route: its route count
     __shared__ short s_order[MOE_HF_FAST_MAX_ROUTES];         // candidates by (routes, first route)
     __shared__ int s_nk[3];                                   // distinct misses per projection
     __shared__ int s_ncand;
     __shared__ int s_cs_first[MOE_CS_MAX_EXPERTS + 1];
-    __shared__ int s_ml[4];                                   // fork STRATAGAP MISSLIST: entries per list
+    __shared__ int s_ml[4];                                   // fork MOEGAP MISSLIST: entries per list
     const int tid = threadIdx.x;
     for (int i = tid; i < n_routes; i += blockDim.x) {
         s_e[i] = ids[(i / n_ids) * ids_stride + i % n_ids];
@@ -9226,7 +9226,7 @@ static __global__ void __launch_bounds__(256) moe_hf_plan_fast_kernel(const moe_
             dmiss += (f & 3) == 3;
             mroutes += valid && !hot[k];
             if (args.cs && (f & 3) == 3) { atomicAdd(&s_nk[k], 1); }
-            // fork STRATAGAP PLANCOUNT: what moe_cache_count_routes adds for this route and projection
+            // fork MOEGAP PLANCOUNT: what moe_cache_count_routes adds for this route and projection
             if (valid && args.pc_exp[0]) {
                 atomicAdd(args.pc_exp[k] + e, 1ULL);
                 if (args.pc_route) { atomicAdd(args.pc_route + (hot[k] ? 0 : 1), 1ULL); }
@@ -9238,7 +9238,7 @@ static __global__ void __launch_bounds__(256) moe_hf_plan_fast_kernel(const moe_
     }
     __syncthreads();
     if (args.cs && (args.cs_partial ? (s_nk[0] || s_nk[1] || s_nk[2]) : (s_nk[0] && s_nk[1] && s_nk[2]))) {
-        // fork STRATAGAP: hand the host CPU the experts missing in all three projections (with PARTIAL, in any),
+        // fork MOEGAP: hand the host CPU the experts missing in all three projections (with PARTIAL, in any),
         // fewest routes first (the CPU pays per route, the link per expert; at equal routes, more missed
         // projections first), while that does not raise max(CPU time, max(card floor, link time)).
         for (int i = tid; i < n_routes; i += blockDim.x) {
@@ -9345,7 +9345,7 @@ static __global__ void __launch_bounds__(256) moe_hf_plan_fast_kernel(const moe_
         }
         __syncthreads();
         if (args.cs_job && args.cs->n_route > 0) {
-            // fork STRATAGAP PUBPLAN: moe_cs_publish_kernel's work, by this block (plan->route and n_route were
+            // fork MOEGAP PUBPLAN: moe_cs_publish_kernel's work, by this block (plan->route and n_route were
             // written by this block before the barrier above)
             moe_cs_plan_dev * plan = args.cs;
             const int n_route = plan->n_route;
@@ -9385,7 +9385,7 @@ static __global__ void __launch_bounds__(256) moe_hf_plan_fast_kernel(const moe_
         }
     }
     if (args.miss) {
-        // fork STRATAGAP MISSLIST: the experts each miss pass computes (missed, not on the CPU), in first-route order,
+        // fork MOEGAP MISSLIST: the experts each miss pass computes (missed, not on the CPU), in first-route order,
         // with their route masks; the same set the masked miss passes pick (cs_mask / hot)
         for (int i = tid; i < n_routes; i += blockDim.x) {
             if (!(s_flag[0][i] & 1)) { continue; }
@@ -9510,7 +9510,7 @@ static __global__ void moe_hf_copy_kernel(const void * const * src, const int * 
     }
 }
 
-// fork STRATAGAP: copies the CPU routes' input rows into mapped host memory, then (last block) the job, then
+// fork MOEGAP: copies the CPU routes' input rows into mapped host memory, then (last block) the job, then
 // raises job->seq. One block per possible CPU route; runs on the side stream right after the plan.
 static __global__ void moe_cs_publish_kernel(moe_cs_plan_dev * plan, moe_cs_job * job, const char * x, size_t nb1,
         size_t nb2, int x_per_slot, int n_ids, int n_embd, float * xh, size_t xh_stride, int layer) {
@@ -9564,7 +9564,7 @@ static __device__ __forceinline__ unsigned long long moe_cs_now_ns() {
     return t;
 }
 
-// fork STRATAGAP: after the down projection's miss pass, waits for the host job and writes the CPU's down rows
+// fork MOEGAP: after the down projection's miss pass, waits for the host job and writes the CPU's down rows
 // into the projection output (those routes were skipped by both card passes). One block per possible CPU route.
 static __global__ void moe_cs_join_kernel(moe_cs_plan_dev * plan, moe_cs_job * job, const float * out_h,
         size_t out_stride, char * dst, size_t nb1, size_t nb2, int n_ids, int n_out, float adapt_route0, float adapt_fixed) {
@@ -9610,7 +9610,7 @@ static __global__ void moe_cs_join_kernel(moe_cs_plan_dev * plan, moe_cs_job * j
 
 // True when this dispatch takes the hit-first path. Forks the layer's plan and copies on the first
 // projection of a layer; later projections only join their own event (moe_hf_wait).
-// fork STRATAGAP MISSLIST: run a miss pass from the plan's list when this layer has one; old_pass(dst) is the masked
+// fork MOEGAP MISSLIST: run a miss pass from the plan's list when this layer has one; old_pass(dst) is the masked
 // pass it replaces (run as well into a copy in check mode, then the two outputs are compared bit for bit).
 template <typename F>
 static bool moe_miss_pass_list(ggml_backend_cuda_context & ctx, const moe_cache_session & session, int layer, int list,
@@ -9702,7 +9702,7 @@ static bool moe_hf_begin(ggml_backend_cuda_context & ctx, moe_cache_session & se
     args.stride = g_hf_stride;
     const int n_expert = (int) group[0]->desc.n_expert;
     const bool fast = moe_hf_plan_fast_enabled() && routes <= MOE_HF_FAST_MAX_ROUTES && n_expert <= MOE_HF_FAST_MAX_EXPERT;
-    // fork STRATAGAP: CPU split for this layer (decided here, at capture time; the plan picks the experts)
+    // fork MOEGAP: CPU split for this layer (decided here, at capture time; the plan picks the experts)
     const int L = table.mj_layer;
     const bool cs = g_cs_on && fast && k != 2 && L < (int) session.cs_registered.size() && session.cs_registered[L] &&
             session.cs_valid[L] && a && a->type == GGML_TYPE_F32 && a->nb[0] == sizeof(float) &&
@@ -9710,7 +9710,7 @@ static bool moe_hf_begin(ggml_backend_cuda_context & ctx, moe_cache_session & se
             (a->ne[1] == 1 || a->ne[1] == ids->ne[0]) && a->ne[2] == ids->ne[1] &&
             group[2]->desc.n_out <= (int64_t) g_cs_out_stride;
     session.cs_layer = cs ? L : -1;
-    // fork STRATAGAP MISSLIST
+    // fork MOEGAP MISSLIST
     const bool ml = moe_miss_list_mode() != 0 && fast && routes <= MOE_MISS_LIST_MAX && g_hf_miss;
     session.ml_layer = ml ? L : -1;
     if (ml) { args.miss = g_hf_miss; }
@@ -9744,7 +9744,7 @@ static bool moe_hf_begin(ggml_backend_cuda_context & ctx, moe_cache_session & se
         args.cs_floor_ns = g_cs_floor_ns;
         args.cs_link_w = g_cs_link_w;
     }
-    // fork STRATAGAP PUBPLAN
+    // fork MOEGAP PUBPLAN
     const bool pub_plan = cs && fast && moe_cs_pub_plan_enabled();
     if (pub_plan) {
         args.cs_job = g_cs_job_d;
@@ -9801,7 +9801,7 @@ static const void * const * moe_hf_wait(ggml_backend_cuda_context & ctx, moe_cac
     return g_hf_eff + (size_t) k * g_hf_experts;
 }
 
-// fork STRATAGAP: checks, per layer, that the graph is the plain expert block the CPU split reproduces:
+// fork MOEGAP: checks, per layer, that the graph is the plain expert block the CPU split reproduces:
 // down = mul_mat_id(down, swiglu(mul_mat_id(gate, x, ids), mul_mat_id(up, x, ids)), ids), with up, gate and the
 // SwiGLU each read only by the next step (the CPU routes leave those rows unwritten; only down rows are joined).
 // Layers this graph does not touch keep their earlier verdict.
@@ -9886,7 +9886,7 @@ void ggml_cuda_moe_cache_hf_graph_end(ggml_backend_cuda_context & ctx) {
     auto & session = *g_session_stack.back().active;
     if (session.devices.size() != 1 || session.devices[0]->logical != ctx.device) return;
     if (session.cs_layer >= 0) {
-        // fork STRATAGAP: a CPU-split layer whose down projection never ran here; wait for the host job so the
+        // fork MOEGAP: a CPU-split layer whose down projection never ran here; wait for the host job so the
         // next layer cannot overwrite its rows. Its CPU routes have no output: that would be a wrong result.
         moe_cs_join_kernel<<<g_cs_max_route, 32, 0, ctx.stream()>>>(g_cs_plan, g_cs_job_d, g_cs_out_d, g_cs_out_stride,
                 nullptr, 0, 0, 1, 0, 0.0f, 0.0f);
@@ -10550,7 +10550,7 @@ static const void * const * moe_cache_resolve_table(ggml_backend_cuda_context & 
     return mmv_table;
 }
 
-// fork STRATAGAP Q8SHARE (GGML_MOE_Q8_SHARE=1|check, default off): the routed experts' up/gate activation goes
+// fork MOEGAP Q8SHARE (GGML_MOE_Q8_SHARE=1|check, default off): the routed experts' up/gate activation goes
 // through the mmvq shared-quantize cache, keyed on the tensor the expert input views (the FFN input). The shared
 // expert's up/gate reads that same tensor, so it finds the buffer and skips its own quantize, and the gate projection
 // of an unfused layer skips its second one. It is the same quantize_row_q8_1_cuda call on the same floats, so the
@@ -10648,7 +10648,7 @@ bool ggml_cuda_moe_cache_device_compute(ggml_backend_cuda_context & ctx, ggml_te
         // Resident routes first, then the routes whose experts were just copied; together they compute
         // every route exactly once with the same kernel.
         const int64_t ids_stride = ids->nb[1] / sizeof(int32_t);
-        // fork STRATAGAP: on a CPU-split layer the miss pass also skips the experts the host computes
+        // fork MOEGAP: on a CPU-split layer the miss pass also skips the experts the host computes
         const bool cs = session.cs_layer >= 0 && session.cs_layer == table.mj_layer;
         const uint8_t * miss_skip = cs ? g_cs_mask + (size_t) table.mj_kind * g_hf_experts : table.hot;
         const void * const * eff = nullptr;
@@ -10677,7 +10677,7 @@ bool ggml_cuda_moe_cache_device_compute(ggml_backend_cuda_context & ctx, ggml_te
                 old_miss(out);
             }
         };
-        // fork STRATAGAP DOWNONE: the down projection as one pass over the effective table (see moe_down_one_mode)
+        // fork MOEGAP DOWNONE: the down projection as one pass over the effective table (see moe_down_one_mode)
         const int one = table.mj_kind == 2 ? moe_down_one_mode() : 0;
         if (one != 0) {
             eff = moe_hf_wait(ctx, session, table);
@@ -10755,7 +10755,7 @@ bool ggml_cuda_moe_cache_device_fused_compute(ggml_backend_cuda_context & ctx,
         ggml_tensor * up, ggml_tensor * gate, ggml_tensor * glu) {
     const char * enabled = getenv("GGML_MOE_CACHE_DEVICE_FUSED");
     const bool legacy_fused = enabled && strcmp(enabled, "1") == 0;
-    // fork STRATAGAP HITG: GGML_MOE_HIT_FUSED takes the hit-first layers through one fused gate/up/SwiGLU pass
+    // fork MOEGAP HITG: GGML_MOE_HIT_FUSED takes the hit-first layers through one fused gate/up/SwiGLU pass
     const bool hitg = ggml_cuda_moe_hit_fused_mode() != 0;
     if ((!legacy_fused && !hitg) || g_session_stack.empty() || !g_session_stack.back().active ||
             !up || !gate || !glu || glu->op != GGML_OP_GLU ||

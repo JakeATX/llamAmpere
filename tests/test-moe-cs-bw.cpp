@@ -1,4 +1,4 @@
-// fork STRATAGAP: how fast the host expert pool (GGML_MOE_CPU_SPLIT) runs against what the RAM can deliver.
+// fork MOEGAP: how fast the host expert pool (GGML_MOE_CPU_SPLIT) runs against what the RAM can deliver.
 //
 //   test-moe-cs-bw <cpu,cpu,...> [RAM MiB] [experts] [check|time] [output file]
 //

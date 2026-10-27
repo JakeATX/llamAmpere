@@ -4808,8 +4808,8 @@ static bool ggml_backend_cuda_upload_host_small(ggml_backend_t backend, const vo
     return true;
 }
 
-// [RTPORT] LLAMA_MTP_PIPELINE: a guess step can be queued on the stream before its input token is known (Strata
-// launches all guess steps back to back and the host only polls mapped memory). This kernel is queued in front of
+// [RTPORT] LLAMA_MTP_PIPELINE: a guess step can be queued on the stream before its input token is known, so
+// all guess steps can be launched back to back while the host only polls mapped memory. This kernel is queued in front of
 // the step's graph: one thread polls a host-mapped sequence word until the host has published the step's token
 // embedding row, then the block copies that row into the graph's input tensor. Everything behind it on the stream
 // waits for it, so the host can queue the next step while the card still runs the current one. If the word never
@@ -5207,7 +5207,7 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
 
 static void ggml_cuda_graph_instantiate(ggml_cuda_graph * graph) {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11070
-    // fork STRATAGAP: GGML_CUDA_GRAPH_NODE_PRIORITY=1 (default off) keeps the priority each kernel was captured
+    // fork MOEGAP: GGML_CUDA_GRAPH_NODE_PRIORITY=1 (default off) keeps the priority each kernel was captured
     // with. Without it a replayed graph runs every node at one priority, so the hit-first expert copies (captured
     // on the high-priority side stream) queue behind all blocks of the hit matrix-vector product they should hide
     // under. Scheduling only: the same kernels on the same data.
@@ -8778,7 +8778,7 @@ static int ggml_cuda_try_fuse_hc_post_down(ggml_backend_cuda_context & ctx, ggml
     return c - i;
 }
 
-// [STRATAGAP HCUPQ8] GGML_CUDA_HC_UP_Q8=1|check (default off): the hyper-connection mix (DSV4_HC_UP) also writes its
+// [MOEGAP HCUPQ8] GGML_CUDA_HC_UP_Q8=1|check (default off): the hyper-connection mix (DSV4_HC_UP) also writes its
 // output as q8_1 into the shared-quantize cache, in the layout of its first consumer that reads through that cache
 // (an MMVQ matmul, or the routed experts of the device MoE cache, which find it with GGML_MOE_Q8_SHARE=1). Those
 // consumers then skip their own quantize launch. The q8 bytes are quantize_row_q8_1_cuda's on the same floats; check
@@ -9795,8 +9795,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 }
 
 // [VSHX] GGML_CUDA_SHEXP_SIDE=1 (default off): the shared expert of a MoE layer runs on a second stream while the
-// router, the routed experts and the hit-first miss copies run on the main one. Strata runs its shared expert on a
-// side stream the same way (verify.cpp, the shared-expert side launch).
+// router, the routed experts and the hit-first miss copies run on the main one.
 //  - graph_optimize moves the shared expert's own nodes (the nodes only the "ffn_shexp-<il>" tensor depends on) up
 //    to just after their input, and keeps them allocated until their first outside reader, so nothing the main
 //    stream allocates while they run can be placed over them.
@@ -10169,7 +10168,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 #endif
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-            ggml_cuda_moe_cache_cs_graph_scan(*cuda_ctx, cgraph);   // fork STRATAGAP (no-op unless GGML_MOE_CPU_SPLIT=1)
+            ggml_cuda_moe_cache_cs_graph_scan(*cuda_ctx, cgraph);   // fork MOEGAP (no-op unless GGML_MOE_CPU_SPLIT=1)
 #endif
 
             // The graph order is now final. Build one shared deadline queue
@@ -10289,7 +10288,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
-                // [STRATAGAP HCUPQ8] the hc mix that also writes its consumers' q8_1 activation
+                // [MOEGAP HCUPQ8] the hc mix that also writes its consumers' q8_1 activation
                 if (node->op == GGML_OP_DSV4_HC_UP && ggml_cuda_try_hc_up_q8(*cuda_ctx, cgraph, i)) {
                     continue;
                 }
@@ -12310,7 +12309,7 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_unregister_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_unregister_host_buffer;
     }
-    // [FNSTRATA] page-lock an existing writable host range (anonymous memory: the read-only registration of a mapped
+    // [FNPORT] page-lock an existing writable host range (anonymous memory: the read-only registration of a mapped
     // file is unsupported on some drivers) for direct copies; no env switch here: the caller's own opt-in decides (the
     // expert streamer uses it for GGML_SCHED_XSTREAM_PIN_MIB)
     if (strcmp(name, "ggml_backend_cuda_host_pin") == 0) {

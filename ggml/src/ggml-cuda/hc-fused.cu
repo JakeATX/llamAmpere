@@ -335,7 +335,7 @@ static __global__ void hcf_down_finish(
 // lane per loop pass); the sums are unchanged. Two CTAs per SM keep all 160 CTAs of n_embd = 2560 in one wave.
 static constexpr int HCF_UP_MAX_IT = 8;
 static constexpr int HCF_UP_PRE    = 5;
-// [STRATAGAP HCUPQ8] Q = 1 (plain) or 2 (IQ4_XS swizzle): the mix output is also written as q8_1 blocks, the bytes
+// [MOEGAP HCUPQ8] Q = 1 (plain) or 2 (IQ4_XS swizzle): the mix output is also written as q8_1 blocks, the bytes
 // of quantize_row_q8_1_cuda on dst (see hcf_up_q8_block). The two CTAs of a 32-column block count in on cnt; the
 // second one quantizes the block from dst and resets the counter, so the counters are zero between launches.
 static constexpr int HCF_UP_CNT = 256;  // q8 blocks per counter slot: n_embd <= 8192
@@ -592,7 +592,7 @@ static void hcf_down_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, 
     }
 }
 
-// [STRATAGAP HCUPQ8] counter slot of a backend context for the q8 epilogue (-1: none left)
+// [MOEGAP HCUPQ8] counter slot of a backend context for the q8 epilogue (-1: none left)
 static int hcf_up_cnt_slot(const ggml_backend_cuda_context & ctx) {
     static std::mutex mtx;
     static std::unordered_map<const void *, int> slots;
