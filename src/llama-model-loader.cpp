@@ -745,6 +745,42 @@ llama_model_loader::llama_model_loader(
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
     }
 
+    // LLAMA_MODEL_OVERLAY=FILE.gguf: one more GGUF whose tensors are added to the model (an always-on expert bank next
+    // to unchanged model files). Its metadata is not merged except for its own AIT format check; a tensor that the
+    // model files already hold is an error.
+    if (const char * ov = getenv("LLAMA_MODEL_OVERLAY"); ov && ov[0] && !fname.empty()) {
+        struct ggml_context * ctx = NULL;
+        struct gguf_init_params ov_params = {
+            /*.no_alloc = */ true,
+            /*.ctx      = */ &ctx,
+        };
+        gguf_context_ptr ctx_gguf { gguf_init_from_file(ov, ov_params) };
+        if (!ctx_gguf) {
+            throw std::runtime_error(format("%s: failed to load overlay GGUF %s", __func__, ov));
+        }
+        if (const char * error = llama_ait_format_error(ctx_gguf.get())) { throw std::runtime_error(error); }
+        if (files.size() >= UINT16_MAX) {
+            throw std::runtime_error("too many model files for an overlay");
+        }
+        const uint16_t idx = (uint16_t) files.size();
+        files.emplace_back(new llama_file(ov, "rb", use_direct_io));
+        contexts.emplace_back(ctx);
+        int n_added = 0;
+        size_t added_bytes = 0;
+        for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
+            std::string tensor_name = std::string(cur->name);
+            if (weights_map.find(tensor_name) != weights_map.end()) {
+                throw std::runtime_error(format("overlay %s: tensor '%s' is already in the model", ov, ggml_get_name(cur)));
+            }
+            n_elements  += ggml_nelements(cur);
+            n_bytes     += ggml_nbytes(cur);
+            added_bytes += ggml_nbytes(cur);
+            weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), idx, ctx_gguf.get(), cur));
+            ++n_added;
+        }
+        LLAMA_LOG_INFO("%s: overlay %s: %d tensors, %.2f GiB\n", __func__, ov, n_added, added_bytes/1073741824.0);
+    }
+
     n_kv      = gguf_get_n_kv(metadata);
     n_tensors = weights_map.size();
 
