@@ -133,6 +133,10 @@ gated_delta_net_cuda(const float * q,
         const float * g_t;
         float         w_t = 1.0f;
         if (t < 0) {
+            w_t = state_src.prefix_w[t + n_prefix];
+            if (w_t == 0.0f) {
+                continue;
+            }
             const float * slot = state_src.prefix + sequence * state_src.prefix_s1 +
                 (int64_t) (t + n_prefix) * state_src.prefix_ingr_w * H + h_idx * state_src.prefix_ingr_w;
             q_t    = slot;
@@ -140,7 +144,6 @@ gated_delta_net_cuda(const float * q,
             v_t    = slot + S_v;
             g_t    = slot + 2 * S_v;
             beta_t = slot + state_src.prefix_off_b;
-            w_t    = state_src.prefix_w[t + n_prefix];
         } else {
             q_t = q + iq3 * sq3 + t * sq2 + iq1 * sq1;
             k_t = k + iq3 * sq3 + t * sq2 + iq1 * sq1;
@@ -183,13 +186,16 @@ gated_delta_net_cuda(const float * q,
 #pragma unroll
             for (int r = 0; r < rows_per_lane; r++) {
                 s_shard[r]  = g_val * s_shard[r] + k_reg[r] * delta_col;
-                attn_partial += s_shard[r] * q_reg[r];
+                if (t >= 0) {
+                    attn_partial += s_shard[r] * q_reg[r];
+                }
             }
 
-            float attn_col = warp_reduce_sum<warp_size>(attn_partial);
-
-            if (lane == 0 && t >= 0) {
-                attn_data[col] = attn_col * scale;
+            if (t >= 0) {
+                float attn_col = warp_reduce_sum<warp_size>(attn_partial);
+                if (lane == 0) {
+                    attn_data[col] = attn_col * scale;
+                }
             }
         } else {
             // kv[col] = sum_i g[i] * S[i][col] * k[i]
@@ -212,13 +218,16 @@ gated_delta_net_cuda(const float * q,
             for (int r = 0; r < rows_per_lane; r++) {
                 const int i = r * warp_size + lane;
                 s_shard[r]  = expf(t < 0 ? g_t[i] * w_t : g_t[i]) * s_shard[r] + k_reg[r] * delta_col;
-                attn_partial += s_shard[r] * q_reg[r];
+                if (t >= 0) {
+                    attn_partial += s_shard[r] * q_reg[r];
+                }
             }
 
-            float attn_col = warp_reduce_sum<warp_size>(attn_partial);
-
-            if (lane == 0 && t >= 0) {
-                attn_data[col] = attn_col * scale;
+            if (t >= 0) {
+                float attn_col = warp_reduce_sum<warp_size>(attn_partial);
+                if (lane == 0) {
+                    attn_data[col] = attn_col * scale;
+                }
             }
         }
 
