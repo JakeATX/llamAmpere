@@ -817,8 +817,14 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const int64_t ingr_off_g      = 2 * S_v;
     const int64_t ingr_off_b      = ingr_mode == 1 ? 3 * S_v : 2 * S_v + g->ne[0];
 
-    ggml_tensor * s_ckpt = build_rs(inp, ckpt_all, hparams.n_embd_s(), n_seqs);
-    s_ckpt = ggml_reshape_4d(ctx0, s_ckpt, S_v, S_v, H_v, n_seqs);
+    // the rollback-independent verify graph (see below) has the checkpoint rows gathered into `s`
+    // already, through the state/checkpoint pair, and never reads s_ckpt
+    const bool replay_static = n >= K && inp->replay_w != nullptr;
+    ggml_tensor * s_ckpt = nullptr;
+    if (!replay_static) {
+        s_ckpt = build_rs(inp, ckpt_all, hparams.n_embd_s(), n_seqs);
+        s_ckpt = ggml_reshape_4d(ctx0, s_ckpt, S_v, S_v, H_v, n_seqs);
+    }
 
     // the whole ring of every sequence in the ubatch, gathered (and, after seq_cp or a cell
     // move, relocated) by the same s_copy mechanism as the state itself: [ring_row, n_seqs]
@@ -852,18 +858,18 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     uint32_t      new_first  = 0;       // this ubatch's ingredients land in slots [new_first, new_first + n_new)
     const uint32_t n_new     = std::min(n, K); // the op emits the last min(n, K) tokens
 
-    if (n >= K && inp->replay_w != nullptr) {
+    if (replay_static) {
         // rollback-independent form: one graph for every verify round (the branches below
         // depend on r, S and staleness, which cost a graph rebuild per round). Checked first:
         // m + n <= K also holds for n == K, m == 0, and that topology would be reused for
-        // m > 0. Replay all K
-        // slots with g and beta zeroed past the accepted prefix -- a token with g = 0 and
-        // beta = 0 leaves the state bit-exact (s = expf(0) * s + k * 0) -- then pick s or the
-        // replayed state with 0/1 weights, also bit-exact for finite states.
-        ggml_tensor * w     = inp->replay_w;
+        // m > 0. `s` holds the replay base, gathered from the state/checkpoint pair by
+        // s_copy_pair: the checkpoint when the logical state needs the replay, else the state
+        // row. Replay all K slots from it with g and beta zeroed by the slot mask (accepted
+        // prefix, or nothing): a token with g = 0 and beta = 0 leaves the state bit-exact
+        // (s = expf(0) * s + k * 0), so the result is the logical state either way.
+        GGML_ASSERT(inp->rs_old_src == nullptr); // else build_rs gathered s without the pair
+        ggml_tensor * w      = inp->replay_w;
         ggml_tensor * w_slot = ggml_view_4d(ctx0, w, 1, 1, K, 1, w->nb[0], w->nb[0], w->nb[0] * K, 0);
-        ggml_tensor * w_rep  = ggml_view_1d(ctx0, w, 1, (size_t) K * w->nb[0]);
-        ggml_tensor * w_s    = ggml_view_1d(ctx0, w, 1, (size_t) (K + 1) * w->nb[0]);
         auto comp = [&](int64_t ne0, int64_t off) {
             return ggml_view_4d(ctx0, ring, ne0, H_v, K, n_seqs,
                 ingr_w * ingr_elemsize, ingr_row * ingr_elemsize, ring->nb[1], (size_t) off * ingr_elemsize);
@@ -875,9 +881,14 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         ggml_tensor * v_b = comp(S_v, S_v);
         ggml_tensor * g_b = ggml_mul(ctx0, comp(kda ? S_v : 1, ingr_off_g), w_slot);
         ggml_tensor * b_b = ggml_mul(ctx0, comp(1, ingr_off_b), w_slot);
-        ggml_tensor * rep = extract_state_k1(
-            ggml_gated_delta_net(ctx0, k_b, k_b, v_b, g_b, b_b, s_ckpt, /*K=*/1, /*emit_mode=*/0), (int64_t) K);
-        base_state = ggml_add(ctx0, ggml_mul(ctx0, rep, w_rep), ggml_mul(ctx0, s, w_s));
+        base_state = extract_state_k1(
+            ggml_gated_delta_net(ctx0, k_b, k_b, v_b, g_b, b_b, s, /*K=*/1, /*emit_mode=*/0), (int64_t) K);
+        // the checkpoint rows' own bookkeeping (cleared row, extra states of moved cells), without
+        // gathering the ubatch's rows: the getter hands back an empty view
+        ggml_build_forward_expand(gf, build_rs(inp, ckpt_all, hparams.n_embd_s(), n_seqs,
+            [](ggml_context * ctx, ggml_tensor * states, ggml_tensor *) {
+                return ggml_view_2d(ctx, states, states->ne[0], 0, states->nb[1], 0);
+            }));
         ckpt_from_op = n > K;
         ckpt_new     = ckpt_from_op ? nullptr : base_state;
         keep_count   = 0;

@@ -91,9 +91,9 @@ llama_memory_recurrent::llama_memory_recurrent(
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
-            // r_l + s_l per layer always; gdn_replay adds ingr_l + s_ckpt_l,
-            // and PLE layers add p_l.
-            const uint32_t tensors_per_layer = (gdn_replay ? 4u : 2u) + (hparams.ple_conv_state() > 0 ? 1u : 0u);
+            // r_l + s_l per layer always; gdn_replay adds ingr_l + s_ckpt_l + the state/checkpoint
+            // pair they view, and PLE layers add p_l.
+            const uint32_t tensors_per_layer = (gdn_replay ? 5u : 2u) + (hparams.ple_conv_state() > 0 ? 1u : 0u);
             ggml_init_params params = {
                 /*.mem_size   =*/ size_t(tensors_per_layer*n_layer*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
@@ -152,7 +152,15 @@ llama_memory_recurrent::llama_memory_recurrent(
         // (1 + n_rs_seq)-wide K-snapshot storage this replaces moves to ingr_l below.
         const uint32_t n_rows_s = gdn_replay ? mem_size : mem_size * (1 + n_rs_seq);
         ggml_tensor * r = ggml_new_tensor_2d(ctx, type_r, hparams.n_embd_r(), n_rows_r);
-        ggml_tensor * s = ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), n_rows_s);
+        // with gdn_replay the state rows and the checkpoint rows share one tensor (s_l = plane 0,
+        // s_ckpt_l = plane 1, same bytes as two tensors): one gather can then pick either row by
+        // index, which the rollback-independent verify graph uses as its replay base
+        ggml_tensor * s_pair = gdn_replay ? ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), 2 * (int64_t) mem_size) : nullptr;
+        ggml_tensor * s = s_pair ? ggml_view_2d(ctx, s_pair, hparams.n_embd_s(), mem_size, s_pair->nb[1], 0)
+                                 : ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), n_rows_s);
+        if (s_pair) {
+            ggml_format_name(s_pair, "cache_s2_l%d", i);
+        }
         ggml_format_name(r, "cache_r_l%d", i);
         ggml_format_name(s, "cache_s_l%d", i);
         r_l[i] = r;
@@ -167,7 +175,7 @@ llama_memory_recurrent::llama_memory_recurrent(
             ingr_l[i] = ingr;
 
             // oldest-edge-of-window checkpoint to replay from -- see the field comment in the header.
-            ggml_tensor * ckpt = ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), mem_size);
+            ggml_tensor * ckpt = ggml_view_2d(ctx, s_pair, hparams.n_embd_s(), mem_size, s_pair->nb[1], (size_t) mem_size * s_pair->nb[1]);
             ggml_format_name(ckpt, "cache_s_ckpt_l%d", i);
             s_ckpt_l[i] = ckpt;
         }

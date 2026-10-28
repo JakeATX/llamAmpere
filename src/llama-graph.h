@@ -354,10 +354,14 @@ public:
     // --gdn-replay, ubatches of n >= n_rs_seq tokens (every speculative verify): the pending rollback
     // is data, not topology, so one graph serves every round. s_copy_conv = s_copy + replay_len *
     // mem_size picks the conv history group; replay_w = K slot weights (1 for the accepted prefix
-    // [0, ckpt_span - replay_len), else 0) then {need_base, 1 - need_base}. nullptr otherwise.
+    // [0, ckpt_span - replay_len) when the logical state needs the replay, else all 0). s_copy_pair
+    // gathers the replay base from the state/checkpoint pair tensor: the checkpoint row (plane 1)
+    // when the logical state needs the replay, else the state row. nullptr otherwise.
     ggml_tensor * s_copy_conv      = nullptr; // I32 [n_rs]
     ggml_tensor * s_copy_conv_main = nullptr; // I32 [n_seqs] view
-    ggml_tensor * replay_w         = nullptr; // F32 [n_rs_seq + 2]
+    ggml_tensor * s_copy_pair      = nullptr; // I32 [n_rs]
+    ggml_tensor * s_copy_pair_main = nullptr; // I32 [n_seqs] view
+    ggml_tensor * replay_w         = nullptr; // F32 [n_rs_seq]
 
     // fill every rs input (s_copy and the shift or ring tensors) from the memory context; exactly
     // once per ubatch -- both fills consume the pending rollback

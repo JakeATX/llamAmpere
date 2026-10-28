@@ -486,13 +486,21 @@ void llm_graph_input_rs::fill_s_copy(const llama_memory_recurrent_context * m) {
         const uint32_t K = m->get_n_rs_seq();
         const uint32_t r = m->get_replay_len();
         const uint32_t S = m->get_ckpt_span();
-        GGML_ASSERT(r <= S && S <= K && (int64_t) K + 2 == replay_w->ne[0]);
-        for (uint32_t j = 0; j < K; ++j) {
-            w[j] = j < S - r ? 1.0f : 0.0f;
-        }
+        GGML_ASSERT(r <= S && S <= K && (int64_t) K == replay_w->ne[0]);
+        // need_base: replay the accepted prefix from the checkpoint; else the replay base is the
+        // state row itself and every slot is masked (the replay then returns it bit-exact)
         const bool need_base = r > 0 || m->get_s_stale();
-        w[K]     = need_base ? 1.0f : 0.0f;
-        w[K + 1] = need_base ? 0.0f : 1.0f;
+        for (uint32_t j = 0; j < K; ++j) {
+            w[j] = need_base && j < S - r ? 1.0f : 0.0f;
+        }
+        if (s_copy_pair != nullptr && s_copy_pair->buffer) {
+            GGML_ASSERT(ggml_backend_buffer_is_host(s_copy_pair->buffer));
+            int32_t *     pair   = (int32_t *) s_copy_pair->data;
+            const int64_t n_main = s_copy_pair_main->ne[0];
+            for (int64_t i = 0; i < n_rs; ++i) {
+                pair[i] = (int32_t) (data[i] + (need_base && i < n_main ? (int64_t) m->get_size() : 0));
+            }
+        }
     }
 
     set_input_shift(m);
@@ -4592,7 +4600,11 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
         ggml_set_input(inp->s_copy_conv);
         ggml_set_name(inp->s_copy_conv, "rs_s_copy_conv");
         inp->s_copy_conv_main = ggml_view_1d(ctx0, inp->s_copy_conv, n_seqs, 0);
-        inp->replay_w = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, (int64_t) mctx_cur->get_n_rs_seq() + 2);
+        inp->s_copy_pair = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_rs);
+        ggml_set_input(inp->s_copy_pair);
+        ggml_set_name(inp->s_copy_pair, "rs_s_copy_pair");
+        inp->s_copy_pair_main = ggml_view_1d(ctx0, inp->s_copy_pair, n_seqs, 0);
+        inp->replay_w = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, (int64_t) mctx_cur->get_n_rs_seq());
         ggml_set_input(inp->replay_w);
         ggml_set_name(inp->replay_w, "rs_replay_w");
     }
@@ -4650,8 +4662,18 @@ ggml_tensor * llm_graph_context::build_rs(
     // a custom getter reads the states of the ubatch straight from the cache, so the gather skips the first
     // state: it still holds the n_rs - n_seqs extra states and copies no state of a single sequence ubatch
     ggml_tensor * state_copy = get_state_rows ? inp->s_copy_tail : inp->s_copy;
+    ggml_tensor * copy_main  = inp->s_copy_main;
 
-    ggml_tensor * out = build_rs(s, state_copy, inp->s_copy_main, state_size, n_seqs,
+    // --gdn-replay verify graph: the GDN state (plane 0 of the state/checkpoint pair) is gathered
+    // through s_copy_pair, so the ubatch's rows are the replay base (see llm_graph_input_rs)
+    if (inp->s_copy_pair != nullptr && older == nullptr && s->view_src != nullptr && s->view_offs == 0 &&
+            s->view_src->ne[1] == 2 * s->ne[1] && strncmp(s->view_src->name, "cache_s2_l", 10) == 0) {
+        s          = s->view_src;
+        state_copy = get_state_rows ? inp->s_copy_tail : inp->s_copy_pair;
+        copy_main  = inp->s_copy_pair_main;
+    }
+
+    ggml_tensor * out = build_rs(s, state_copy, copy_main, state_size, n_seqs,
                     kv_state->get_n_rs(), kv_state->get_head(), kv_state->get_size(), kv_state->get_rs_z(),
                     get_state_rows);
 
