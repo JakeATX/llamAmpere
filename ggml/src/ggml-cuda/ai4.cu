@@ -31,7 +31,8 @@
 //   GGML_CUDA_AI4_AMPERE_MMV_MIN_N/MAX_N   inclusive per-card tuning range within 1-64 (defaults 9/32)
 //   GGML_CUDA_AI4_AMPERE_GEMM    retired; keeps baseline prefill after measured regressions
 //   GGML_CUDA_AI4_PREFILL_V2=1  experimental rate-4 decode-once dense prefill, N >= 512 (default off)
-//   GGML_CUDA_AI23_MMVR=1    rate-2/3 decode with fixed stage offsets (default off)
+//   GGML_CUDA_AI23_MMVR=0/1  rate-2/3 decode with fixed stage offsets (default off for MUL_MAT, on for MUL_MAT_ID)
+//   GGML_CUDA_AI23_DIRECT=N  MUL_MAT_ID widths up to N (max 8) skip the routing helper (default 6)
 //   GGML_CUDA_AI23_TUNED=1   select measured rate-2/3 decode and tile defaults (default off)
 //   GGML_CUDA_AI23_MMVR_STAGES=4|8  deeper dense fixed-K four-warp weight prefetch (default 2)
 //   GGML_CUDA_AI23_MMVR_UNROLL=1|2|4|8  dense fixed-K loop unroll (tuned 8 at long K, 4 otherwise)
@@ -330,6 +331,12 @@ static bool ai4_mmvr_on() {
     static const bool v = ai4_env_int("GGML_CUDA_AI23_MMVR", nullptr, ai4_ai23_tuned() ? 1 : 0) != 0;
     return v;
 }
+// Expert stacks (MUL_MAT_ID) take mmvr by default: on a 3090 the rate-2/3 mmvr direct path is 28-42% faster than the
+// mmv-ID kernel at widths 1-6 for 640x2560 / 2560x640 experts. An explicit GGML_CUDA_AI23_MMVR still decides.
+static bool ai4_mmvr_on_id() {
+    static const bool v = getenv("GGML_CUDA_AI23_MMVR") ? ai4_mmvr_on() : true;
+    return v;
+}
 static int ai4_mmvr_cfg() {
     static const int v = [] {
         const char * e = getenv("GGML_CUDA_AI23_MMVR_CFG");
@@ -482,7 +489,7 @@ static bool ai4_mmvr_try(const uint8_t * W, const int8_t * q, const float * s, f
     if constexpr (rate != 2 && rate != 3) {
         return false;
     } else {
-        if (!ai4_mmvr_on()) {
+        if (!(ID ? ai4_mmvr_on_id() : ai4_mmvr_on())) {
             return false;
         }
         const int cfg = ai4_mmvr_cfg();
@@ -1090,10 +1097,11 @@ void ggml_cuda_mul_mat_id_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
 
     GGML_ASSERT(((uintptr_t) src1->data & 15) == 0);
-    static const int direct_max = std::min(8, ai4_env_int("GGML_CUDA_AI23_DIRECT", nullptr, ai4_ai23_tuned() ? 4 : 0));
+    // direct: one block per (slot, token) pair reads its expert id itself, no routing helper; measured to width 6
+    static const int direct_max = std::min(8, ai4_env_int("GGML_CUDA_AI23_DIRECT", nullptr, 6));
     static const bool fused_x = ai4_env_int("GGML_CUDA_AI23_FUSED_X", nullptr, 0) != 0;
     const int rate = ggml_ai4_rate(src0->type);
-    const bool direct = ai4_mmvr_on() && (rate == 2 || rate == 3) && n_tok <= direct_max;
+    const bool direct = ai4_mmvr_on_id() && (rate == 2 || rate == 3) && n_tok <= direct_max;
     const bool fused = direct && fused_x && n_tok == 1;
     const int xsh = K % 256 == 0 ? 1 : 0;
     ggml_cuda_pool_alloc<int8_t> q(ctx.pool(), (size_t) n_rows*K);
