@@ -18640,7 +18640,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         if (std::string(getenv("GGML_TEST_AIV2_PERF")) == "bank") {
             for (auto mk : std::vector<std::pair<int64_t, int64_t>>{ { 640, 2560 }, { 2560, 640 } }) {
                 const bool broadcast = mk.second == 2560;
-                for (int64_t n : { 1, 4, 5, 512, 2048, 12288 }) {
+                for (int64_t n : { 1, 2, 3, 4, 5, 6, 512, 2048, 12288 }) {
                     for (ggml_type t : { GGML_TYPE_AIT2_U, GGML_TYPE_AIT3_U }) {
                         for (int ne : { 221, 512 }) {
                             test_cases.emplace_back(new test_mul_mat_id_ai4(t, ne, 10, broadcast, mk.first, n, mk.second, false, true));
