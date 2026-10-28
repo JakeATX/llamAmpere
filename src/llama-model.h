@@ -806,6 +806,7 @@ struct llama_model {
     // so the layer-major prefill can borrow resident expert VRAM and copy the weights back from the file)
     std::unordered_map<std::string, llama_b1_file_src> b1_src;
     std::vector<int> b1_fds; // dup()ed file descriptors, closed by the destructor
+    std::vector<const void *> moe_bank_registered; // expert tensors registered with ggml_moe_bank_register
 
     // for keeping track of associated LoRA adapters
     std::unordered_set<llama_adapter_lora *> loras;
@@ -865,6 +866,7 @@ struct llama_model {
     ggml_cgraph * build_graph(const llm_graph_params & params) const;
 
     void pin_borrowed_host_tensor(ggml_tensor * tensor) const;
+    void register_moe_bank();
 
     virtual void load_stats  (llama_model_loader & ml) = 0;
     virtual void load_hparams(llama_model_loader & ml) = 0;

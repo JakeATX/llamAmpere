@@ -37,7 +37,7 @@ class common_params_fit_no_room : public std::runtime_error {
 };
 
 const char * common_moe_cache_tensor_override_pattern() {
-    return "blk\\.\\d+\\.ffn_(up|down|gate_up|gate)_(ch|)exps";
+    return "blk\\.\\d+\\.ffn_(up|down|gate_up|gate)_(ch|)exps\\.";
 }
 
 struct common_moe_cache_fit_pool {
@@ -911,7 +911,7 @@ static void common_params_fit_impl(
             case LAYER_FRACTION_MOE: {
                 static std::array<std::string, n_strings> patterns;
                 if (patterns[il].empty()) {
-                    patterns[il] = "blk\\." + std::to_string(il) + "\\.ffn_(up|down|gate_up|gate)_(ch|)exps";
+                    patterns[il] = "blk\\." + std::to_string(il) + "\\.ffn_(up|down|gate_up|gate)_(ch|)exps\\.";
                 }
                 return patterns[il].c_str();
             }

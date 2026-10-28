@@ -8808,3 +8808,117 @@ bool ggml_threadpool_params_match(const struct ggml_threadpool_params * p0, cons
     if (p0->strict_cpu != p1->strict_cpu ) return false;
     return memcmp(p0->cpumask, p1->cpumask, GGML_MAX_N_THREADS) == 0;
 }
+
+// MoE always-resident expert bank table (see ggml.h). Written only at model load, before compute.
+#define GGML_MOE_BANK_MAX_TENSORS 512
+#define GGML_MOE_BANK_MAX_EXPERTS 512
+
+struct ggml_moe_bank_entry_s {
+    const void * data;
+    int32_t      layer;
+    int32_t      n_expert;
+    bool         has_bank;
+    uint8_t      in_bank[GGML_MOE_BANK_MAX_EXPERTS];
+};
+
+static struct ggml_moe_bank_entry_s g_moe_bank[GGML_MOE_BANK_MAX_TENSORS];
+static int g_moe_bank_n = 0;
+
+void ggml_moe_bank_register(const void * weight_data, int32_t layer, int32_t n_expert, const uint8_t * in_bank) {
+    if (!weight_data || n_expert <= 0 || n_expert > GGML_MOE_BANK_MAX_EXPERTS) {
+        return;
+    }
+    struct ggml_moe_bank_entry_s * e = NULL;
+    for (int i = 0; i < g_moe_bank_n; ++i) {
+        if (g_moe_bank[i].data == weight_data) {
+            e = &g_moe_bank[i];
+            break;
+        }
+    }
+    if (!e) {
+        if (g_moe_bank_n >= GGML_MOE_BANK_MAX_TENSORS) {
+            GGML_LOG_WARN("%s: table full, tensor not registered\n", __func__);
+            return;
+        }
+        e = &g_moe_bank[g_moe_bank_n++];
+    }
+    memset(e, 0, sizeof(*e));
+    e->data     = weight_data;
+    e->layer    = layer;
+    e->n_expert = n_expert;
+    if (in_bank) {
+        for (int32_t i = 0; i < n_expert; ++i) {
+            e->in_bank[i] = in_bank[i] ? 1 : 0;
+            e->has_bank   = e->has_bank || in_bank[i];
+        }
+    }
+}
+
+void ggml_moe_bank_unregister(const void * weight_data) {
+    for (int i = 0; i < g_moe_bank_n; ++i) {
+        if (g_moe_bank[i].data == weight_data) {
+            g_moe_bank[i] = g_moe_bank[--g_moe_bank_n];
+            return;
+        }
+    }
+}
+
+const uint8_t * ggml_moe_bank_lookup(const void * weight_data) {
+    static int skip = -1;
+    if (skip < 0) {
+        const char * v = getenv("GGML_MOE_BANK_SKIP");
+        skip = !(v && strcmp(v, "0") == 0);
+    }
+    if (!skip || !weight_data) {
+        return NULL;
+    }
+    for (int i = 0; i < g_moe_bank_n; ++i) {
+        if (g_moe_bank[i].data == weight_data) {
+            return g_moe_bank[i].has_bank ? g_moe_bank[i].in_bank : NULL;
+        }
+    }
+    return NULL;
+}
+
+bool ggml_moe_bank_entry(int index, const void ** weight_data, int32_t * layer, int32_t * n_expert, const uint8_t ** in_bank) {
+    if (index < 0 || index >= g_moe_bank_n) {
+        return false;
+    }
+    const struct ggml_moe_bank_entry_s * e = &g_moe_bank[index];
+    if (weight_data) { *weight_data = e->data; }
+    if (layer)       { *layer       = e->layer; }
+    if (n_expert)    { *n_expert    = e->n_expert; }
+    if (in_bank)     { *in_bank     = e->in_bank; }
+    return true;
+}
+
+bool ggml_moe_bank_census(bool (*resident)(void * user, const void * weight_data, int32_t expert), void * user,
+        int32_t * layer_min, int32_t * layer_max, size_t * cache, size_t * bank, size_t * both) {
+    *layer_min = INT32_MAX; *layer_max = -1; *cache = 0; *bank = 0; *both = 0;
+    for (int i = 0; i < g_moe_bank_n; ++i) {
+        const int32_t layer = g_moe_bank[i].layer;
+        bool first = true; // count each layer once, at its first registered tensor
+        for (int j = 0; j < i; ++j) {
+            first = first && g_moe_bank[j].layer != layer;
+        }
+        if (!first || layer < 0) {
+            continue;
+        }
+        *layer_min = MIN(*layer_min, layer);
+        *layer_max = MAX(*layer_max, layer);
+        for (int32_t e = 0; e < g_moe_bank[i].n_expert; ++e) {
+            bool in_bank = false, complete = true;
+            for (int j = i; j < g_moe_bank_n; ++j) {
+                if (g_moe_bank[j].layer != layer) {
+                    continue;
+                }
+                in_bank  = in_bank  || (e < g_moe_bank[j].n_expert && g_moe_bank[j].in_bank[e]);
+                complete = complete && e < g_moe_bank[j].n_expert && resident(user, g_moe_bank[j].data, e);
+            }
+            *bank  += in_bank;
+            *cache += complete && !in_bank;
+            *both  += complete && in_bank;
+        }
+    }
+    return *layer_max >= 0;
+}

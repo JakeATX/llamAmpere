@@ -2032,7 +2032,9 @@ static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
 
 // Expert keep policy (#215 MTP draft, #217 lossy trunk map): bit r set = leave logical routed row r out, because its
 // route rank (r % n_ids, ids are sorted by descending router score) is >= keep for this weight's layer and the expert
-// is not resident on the device. Returns 0 when no policy is active or the node has more than 64 routed rows.
+// is not resident on the device. Also set for rows whose expert lives in the always-resident bank (ggml_moe_bank_*):
+// the bank call computes those, and this call carries them at weight exactly 0. Returns 0 when nothing applies or
+// the node has more than 64 routed rows.
 static uint64_t ggml_moe_keep_skip_mask(
         const struct ggml_moe_cache_api * api,
         const struct ggml_tensor * weight,
@@ -2042,8 +2044,10 @@ static uint64_t ggml_moe_keep_skip_mask(
     if (n_ids <= 0 || n_tokens <= 0 || n_ids > MOE_CACHE_MAX_TOPK || n_tokens > MOE_CACHE_MAX_TOPK / n_ids) {
         return 0;
     }
-    const int32_t keep = ggml_moe_cache_expert_keep(weight->name);
-    if (keep < 0 || keep >= n_ids) {
+    const int32_t   keep    = ggml_moe_cache_expert_keep(weight->name);
+    const bool      keep_on = keep >= 0 && keep < n_ids;
+    const uint8_t * in_bank = ggml_moe_bank_lookup(weight->data);
+    if (!keep_on && !in_bank) {
         return 0;
     }
     const int n_rows = (int) (n_ids*n_tokens);
@@ -2055,6 +2059,18 @@ static uint64_t ggml_moe_keep_skip_mask(
             expert_ids[token*n_ids + id] = *(const int32_t *) ((const char *) ids->data + token*ids->nb[1] + id*ids->nb[0]);
         }
     }
+    uint64_t mask = 0;
+    if (in_bank) {
+        for (int row = 0; row < n_rows; ++row) {
+            const int32_t e = expert_ids[row];
+            if (e >= 0 && e < weight->ne[2] && in_bank[e]) {
+                mask |= UINT64_C(1) << row;
+            }
+        }
+    }
+    if (!keep_on) {
+        return mask;
+    }
     if (api && api->resident && weight->data) {
         const struct ggml_moe_cache_tensor_desc desc = {
             weight->name, weight->data, weight->nb[2],
@@ -2062,7 +2078,6 @@ static uint64_t ggml_moe_keep_skip_mask(
         };
         api->resident(&desc, expert_ids, n_rows, resident);
     }
-    uint64_t mask = 0;
     for (int row = 0; row < n_rows; ++row) {
         if (row % n_ids >= keep && !resident[row]) {
             mask |= UINT64_C(1) << row;

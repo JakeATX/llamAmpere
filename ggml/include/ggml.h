@@ -3262,6 +3262,22 @@ extern "C" {
     GGML_API void                          ggml_threadpool_params_init   (struct ggml_threadpool_params * p, int n_threads);
     GGML_API bool                          ggml_threadpool_params_match  (const struct ggml_threadpool_params * p0, const struct ggml_threadpool_params * p1);
 
+    // MoE always-resident expert bank: per regular expert tensor (keyed by its data pointer), which experts are also
+    // held in an always-on-device bank. The regular call leaves those rows out and the expert cache never plans them.
+    // in_bank may be NULL (tensor registered for the resident census only). Registration happens at model load,
+    // before any compute; n_expert must be <= 512.
+    GGML_API void            ggml_moe_bank_register  (const void * weight_data, int32_t layer, int32_t n_expert, const uint8_t * in_bank);
+    GGML_API void            ggml_moe_bank_unregister(const void * weight_data);
+    // flags of a registered tensor with a bank, NULL otherwise or when GGML_MOE_BANK_SKIP=0
+    GGML_API const uint8_t * ggml_moe_bank_lookup    (const void * weight_data);
+    // enumerate every registered tensor (ignores GGML_MOE_BANK_SKIP); returns false past the end
+    GGML_API bool            ggml_moe_bank_entry     (int index, const void ** weight_data, int32_t * layer, int32_t * n_expert, const uint8_t ** in_bank);
+    // resident census over the registered layers: an expert counts once, as bank when it is in the bank, else as cache
+    // when every registered tensor of its layer has it resident (resident() decides). both = cache copies of bank
+    // experts. Returns false when nothing is registered.
+    GGML_API bool            ggml_moe_bank_census    (bool (*resident)(void * user, const void * weight_data, int32_t expert), void * user,
+                                                      int32_t * layer_min, int32_t * layer_max, size_t * cache, size_t * bank, size_t * both);
+
 #ifdef  __cplusplus
 }
 #endif

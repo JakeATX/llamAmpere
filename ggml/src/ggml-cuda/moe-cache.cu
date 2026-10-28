@@ -2581,6 +2581,12 @@ static bool moe_cache_allocate_pool(
 
 static bool moe_cache_resize_pool(moe_cache_device & device, moe_cache_pool & pool, int slots);
 
+// Always-resident expert bank (ggml_moe_bank_*): those experts are computed by the bank call, never by the cache.
+static bool moe_bank_has(const void * data, int32_t expert) {
+    const uint8_t * in_bank = ggml_moe_bank_lookup(data);
+    return in_bank && expert >= 0 && expert < 512 && in_bank[expert];
+}
+
 static bool moe_cache_build_global_profile(moe_cache_session & session, moe_cache_device & device,
         const std::vector<moe_cache_shape *> & pending, size_t budget, bool resize = false) {
     if (session.profile_global_tensors.empty() || (!resize && !device.pools.empty()) || pending.empty()) {
@@ -2630,7 +2636,9 @@ static bool moe_cache_build_global_profile(moe_cache_session & session, moe_cach
             else if (tensor.counts.size() != session.profile_global_tensors[previous_tensor].counts.size()) { return false; }
         }
         for (size_t expert = 0; expert < tensor.counts.size(); ++expert) {
-            items.push_back({i, (int32_t)expert, group, pool, tensor.expert_size, tensor.counts[expert]});
+            // a bank expert never needs a slot: count 0 so the plan gives its budget to the next regular expert
+            const uint64_t count = moe_bank_has(tensor.data, (int32_t)expert) ? 0 : tensor.counts[expert];
+            items.push_back({i, (int32_t)expert, group, pool, tensor.expert_size, count});
             keys.push_back({tensor.data, (int32_t)expert});
         }
         previous_tensor = i;
@@ -2937,6 +2945,27 @@ static int moe_cache_discover_pool(
 
     moe_cache_build_pending(session, device);
     return moe_cache_find_pool(device, expert_size, wtype);
+}
+
+// Resident census: complete experts (every projection valid in a cache slot) plus bank experts, counted once each,
+// over the registered main-model layers.
+static void moe_cache_log_census(const moe_cache_device & device) {
+    auto resident = [](void * user, const void * data, int32_t expert) -> bool {
+        for (const auto & pool : ((const moe_cache_device *) user)->pools) {
+            const auto found = pool->map.find({data, expert});
+            if (found != pool->map.end() && pool->slots[found->second].state == moe_cache_slot_state::valid &&
+                    !pool->slots[found->second].staging) {
+                return true;
+            }
+        }
+        return false;
+    };
+    int32_t first = 0, last = 0;
+    size_t cache = 0, bank = 0, both = 0;
+    if (ggml_moe_bank_census(resident, (void *) &device, &first, &last, &cache, &bank, &both)) {
+        MOE_CACHE_LOG("[moe-cache] CUDA%d resident complete experts layers %d-%d: cache %zu + bank %zu = %zu (cache copies of bank experts: %zu)\n",
+                device.physical, first, last, cache, bank, cache + bank, both);
+    }
 }
 
 static void moe_cache_log_stats(moe_cache_device & device) {
@@ -3258,6 +3287,7 @@ static void moe_cache_session_destroy(void * opaque) {
             device_ptr->collect_failures > 0) {
             moe_cache_log_stats(*device_ptr);
         }
+        moe_cache_log_census(*device_ptr);
     }
 
     moe_cache_device_release(*session);
@@ -5209,7 +5239,7 @@ static void * moe_resident_create(void * device, const ggml_moe_cache_tensor_des
         moe_cache_layer_number(t.name, layer);
         if (layer == last_layer) { continue; }
         for (int64_t e = 0; e < t.n_expert; ++e) {
-            if (!counts[i][e]) { continue; }
+            if (!counts[i][e] || moe_bank_has(t.data, (int32_t)e)) { continue; }
             ranked.push_back({(const char *)t.data + (size_t)e * t.expert_size, bytes,
                     counts[i][e] / std::max(1.0L, total) * (1 + 4.0L / (1.0L + layer)) / bytes});
         }
@@ -5981,6 +6011,9 @@ static int moe_cache_warm(void * opaque, const ggml_moe_cache_tensor_desc * tens
         if (std::chrono::steady_clock::now() >= deadline) {
             break;
         }
+        if (moe_bank_has(tensors[c.tensor].data, c.expert)) {
+            continue; // computed by the always-resident bank
+        }
         std::unique_ptr<moe_cache_node, decltype(&moe_cache_end)> node(begin(c.tensor), moe_cache_end);
         if (!node) {
             continue;
@@ -6359,7 +6392,8 @@ static void moe_cache_prefetch(void * opaque, const ggml_moe_cache_tensor_desc *
                         moe_resident_lookup_device((const char *)desc.data + (size_t)ids[rank] * source_strides[t], desc.expert_size, device.logical) != nullptr;
                     if (permanent) { continue; }
                 }
-                if (ids[rank] < 0 || ids[rank] >= desc.n_expert || !desc.data || desc.expert_size > budget) {
+                if (ids[rank] < 0 || ids[rank] >= desc.n_expert || !desc.data || desc.expert_size > budget ||
+                        moe_bank_has(desc.data, ids[rank])) {
                     continue;
                 }
                 // Only known host tensors and already allocated pools are eligible. No speculative allocation.
