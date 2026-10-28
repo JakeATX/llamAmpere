@@ -6908,17 +6908,20 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
         // fork: the plan sizes carries and slots before the layer graph is measured. When the graph then lacks VRAM,
         // plan once more leaving that deficit free: the plan lends more resident experts (refilled after the prompt)
         // instead of allocating fresh VRAM. LLAMA_B1_REPLAN=0 disables.
-        if (!reserved && b1_legacy_deficit > 0 && b1_ctx_env("LLAMA_B1_REPLAN", 1) != 0) {
-            const size_t extra = b1_legacy_deficit + ((size_t) 64 << 20);
+        // Allocation rounding can leave the re-plan a little short, so up to three re-plans add each new deficit.
+        size_t extra = 0;
+        for (int attempt = 0; attempt < 3 && !reserved && b1_legacy_deficit > 0 && b1_ctx_env("LLAMA_B1_REPLAN", 1) != 0; ++attempt) {
+            extra += b1_legacy_deficit + ((size_t) 64 << 20);
             LLAMA_LOG_WARN("%s: [B1] re-plan leaving %.1f MiB more free for the layer graph\n", __func__, extra / 1048576.0);
             b1->set_extra_keep(extra);
             const bool replanned = b1->begin(sizes, group_ub, lend_cap, final_home, nullptr, lean_legacy);
             b1->set_extra_keep(0);
-            if (replanned && b1->n_groups() == 1) {
-                b1_kv_scratch_enabled = kv_scratch_wanted;
-                b1_lend_scratch = lend_wanted;
-                reserved = b1_reserve_legacy_layers(sizes, n_outputs_all);
+            if (!replanned || b1->n_groups() != 1) {
+                break;
             }
+            b1_kv_scratch_enabled = kv_scratch_wanted;
+            b1_lend_scratch = lend_wanted;
+            reserved = b1_reserve_legacy_layers(sizes, n_outputs_all);
         }
         if (!reserved) {
             b1_kv_scratch_enabled = false; b1_lend_scratch = false;
