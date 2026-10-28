@@ -282,8 +282,14 @@ static void kqrows_launch_nw(const void * vx, const block_q8_1 * y, float * dst,
             mul_mat_vec_q_kqrows<type, ncols_dst, rows, 4><<<grid, block, 0, stream>>>(vx, y, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst);
         } break;
         case 8: {
-            const dim3 block(WARP_SIZE, 8, 1);
-            mul_mat_vec_q_kqrows<type, ncols_dst, rows, 8><<<grid, block, 0, stream>>>(vx, y, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst);
+            // tmp_shared is static: 7 warps * ncols_dst * rows * 32 floats must stay under the 48 KiB static limit
+            // (newer ptxas rejects the over-limit instances, e.g. width 7-8 at 8 rows; no table cell uses them)
+            if constexpr (7*ncols_dst*rows*WARP_SIZE*sizeof(float) <= 48*1024) {
+                const dim3 block(WARP_SIZE, 8, 1);
+                mul_mat_vec_q_kqrows<type, ncols_dst, rows, 8><<<grid, block, 0, stream>>>(vx, y, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst);
+            } else {
+                GGML_ABORT("kqrows: nwarps 8 exceeds static shared memory at this width and row count");
+            }
         } break;
         default:
             GGML_ABORT("kqrows: nwarps must be 2, 4 or 8");
