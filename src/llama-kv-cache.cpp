@@ -2593,11 +2593,11 @@ bool llama_kv_cache::get_has_shift() const {
 }
 
 ggml_type llama_kv_cache::type_k() const {
-    return layers[0].k->type;
+    return layers.empty() ? GGML_TYPE_COUNT : layers[0].k->type; // DFlash drafter context has no KV layers
 }
 
 ggml_type llama_kv_cache::type_v() const {
-    return layers[0].v->type;
+    return layers.empty() ? GGML_TYPE_COUNT : layers[0].v->type;
 }
 
 std::vector<uint32_t> llama_kv_cache::get_layer_ids() const {
