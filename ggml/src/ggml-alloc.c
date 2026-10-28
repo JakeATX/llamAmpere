@@ -1152,7 +1152,64 @@ static bool ggml_gallocr_reserve_n_impl(
                     // that reuse an allocated graph without alloc_graph (llama graph reuse) to allocate again.
                     // The old buffer is freed only when no other allocator still references it.
                     struct vbuffer * nb = ggml_vbuffer_alloc_max(galloc->bufts[i], galloc->buf_tallocs[i], db, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
-                    if (nb != NULL) {
+                    if (nb == NULL && db->refs == 1) {
+                        // no room for the old and the grown buffer at once (a nearly full card): when only the donor
+                        // holds the old buffer, release it first and allocate the grown one in its place. The
+                        // donor's graphs are stale either way (epoch bump below); its contents are scratch.
+                        const size_t old_size = ggml_vbuffer_size(db);
+                        size_t caps[GGML_VBUFFER_MAX_CHUNKS] = {0};
+                        int n_caps = 0;
+                        for (int c = 0; c < GGML_VBUFFER_MAX_CHUNKS && db->chunks[c] != NULL; c++) {
+                            caps[c] = ggml_vbuffer_chunk_size(db, c);
+                            n_caps  = c + 1;
+                        }
+                        bool donor_slot[64] = {false};
+                        GGML_ASSERT(galloc->donor->n_buffers <= 64);
+                        for (int j = 0; j < galloc->donor->n_buffers; j++) {
+                            if (galloc->donor->buffers[j] == db) {
+                                galloc->donor->buffers[j] = NULL;
+                                donor_slot[j] = true;
+                            }
+                        }
+                        galloc->donor->epoch++;
+                        ggml_vbuffer_free(db);
+                        db = NULL;
+                        nb = (struct vbuffer *) calloc(1, sizeof(struct vbuffer));
+                        if (nb != NULL) {
+                            nb->refs = 1;
+                            for (int c = 0; c < GGML_VBUFFER_MAX_CHUNKS; c++) {
+                                const size_t need = c < galloc->buf_tallocs[i]->n_chunks ? ggml_dyn_tallocr_max_size(galloc->buf_tallocs[i], c) : 0;
+                                if (c >= galloc->buf_tallocs[i]->n_chunks && c >= n_caps) {
+                                    break;
+                                }
+                                nb->chunks[c] = ggml_backend_buft_alloc_buffer(galloc->bufts[i], need > caps[c] ? need : caps[c]);
+                                if (nb->chunks[c] == NULL) {
+                                    ggml_vbuffer_free(nb);
+                                    nb = NULL;
+                                    break;
+                                }
+                                ggml_backend_buffer_set_usage(nb->chunks[c], GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+                            }
+                        }
+                        if (nb != NULL) {
+                            for (int j = 0; j < galloc->donor->n_buffers; j++) {
+                                if (donor_slot[j]) {
+                                    galloc->donor->buffers[j] = nb;
+                                    nb->refs++;
+                                }
+                            }
+                            galloc->buffers[i] = nb;
+                            GGML_LOG_INFO("%s: donor %s compute buffer too small (%.02f MiB < %.02f MiB needed): released and regrown to %.02f MiB, shared\n",
+                                __func__, ggml_backend_buft_name(galloc->bufts[i]), old_size / 1024.0 / 1024.0, new_size / 1024.0 / 1024.0,
+                                ggml_vbuffer_size(nb) / 1024.0 / 1024.0);
+                            continue;
+                        }
+                        GGML_LOG_WARN("%s: donor %s compute buffer released but the grown buffer (%.02f MiB) could not be allocated\n",
+                            __func__, ggml_backend_buft_name(galloc->bufts[i]), new_size / 1024.0 / 1024.0);
+                    }
+                    if (db == NULL) {
+                        // released above and not regrown: the private allocation below reports the failure
+                    } else if (nb != NULL) {
                         const size_t old_size = ggml_vbuffer_size(db);
                         for (int j = 0; j < galloc->donor->n_buffers; j++) {
                             if (galloc->donor->buffers[j] == db) {
