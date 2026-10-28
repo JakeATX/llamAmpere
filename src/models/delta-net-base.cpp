@@ -876,7 +876,9 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
             const char * e = getenv("LLAMA_GDN_REPLAY_FOLD"); // =0: separate K=1 replay call (A/B)
             return e == nullptr || strcmp(e, "0") != 0;
         }();
-        replay_fold = fold_env && n > K;
+        // verify widths only (n <= 2K): a prompt ubatch also takes this graph, and its main call
+        // must keep the chunked tensor-core prompt kernel, which the prefix would bypass
+        replay_fold = fold_env && n > K && n <= 2 * K;
         if (!replay_fold) {
             ggml_tensor * w      = inp->replay_w;
             ggml_tensor * w_slot = ggml_view_4d(ctx0, w, 1, 1, K, 1, w->nb[0], w->nb[0], w->nb[0] * K, 0);
