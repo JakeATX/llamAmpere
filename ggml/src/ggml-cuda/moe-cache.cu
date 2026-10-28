@@ -621,6 +621,9 @@ struct moe_cache_device_table {
     std::vector<const void *> copy_source;
     // fork CACHEHIT: 1 where the expert lives in permanent residency (never swapped).
     std::vector<uint8_t> permanent;
+    // 1 where the expert belongs to the always-resident bank: its entry points at a shared zero block
+    // (the regular call gives it weight 0) and it is marked permanent, so no miss, swap or CPU split touches it.
+    std::vector<uint8_t> bank;
     struct moe_cache_pool * swap_pool = nullptr;
     size_t count_offset = 0;
     // fork (missjoin): layer and projection (0 up, 1 gate, 2 down) parsed from the tensor name.
@@ -2585,6 +2588,26 @@ static bool moe_cache_resize_pool(moe_cache_device & device, moe_cache_pool & po
 static bool moe_bank_has(const void * data, int32_t expert) {
     const uint8_t * in_bank = ggml_moe_bank_lookup(data);
     return in_bank && expert >= 0 && expert < 512 && in_bank[expert];
+}
+
+// One zero-filled device block per card, shared by every bank expert entry of the device tables. All-zero quant
+// bytes decode to zero weights, so the regular call's weight-0 bank slots read finite zeros instead of host memory.
+// A larger request allocates a new block; the old one stays allocated because earlier tables may still use it.
+static const void * moe_bank_zero_block(int device, size_t bytes) {
+    static std::mutex mutex;
+    static std::unordered_map<int, std::pair<void *, size_t>> blocks;
+    std::lock_guard<std::mutex> guard(mutex);
+    auto & block = blocks[device];
+    if (block.first && block.second >= bytes) { return block.first; }
+    void * pointer = nullptr;
+    if (cudaMalloc(&pointer, bytes) != cudaSuccess || cudaMemset(pointer, 0, bytes) != cudaSuccess ||
+            cudaDeviceSynchronize() != cudaSuccess) {
+        if (pointer) { (void) cudaFree(pointer); }
+        (void) cudaGetLastError();
+        return nullptr;
+    }
+    block = {pointer, bytes};
+    return pointer;
 }
 
 static bool moe_cache_build_global_profile(moe_cache_session & session, moe_cache_device & device,
@@ -7166,7 +7189,7 @@ static bool moe_cache_swap_groups(moe_cache_session & session, bool census = fal
             }
         }
     }
-    size_t partial = 0, complete = 0;
+    size_t partial = 0, complete = 0, bank_complete = 0;
     for (size_t layer = 0; layer < groups.size(); ++layer) {
         const auto & group = groups[layer];
         if (!group[0] && !group[1] && !group[2]) { continue; }
@@ -7188,6 +7211,7 @@ static bool moe_cache_swap_groups(moe_cache_session & session, bool census = fal
             }
             partial += resident > 0 && resident < 3;
             complete += resident == 3;
+            bank_complete += resident == 3 && group[0]->bank[e] && group[1]->bank[e] && group[2]->bank[e];
         }
         if (census) {
             MOE_CACHE_LOG("[moe-cache] final residency: layer=%zu complete=%zu partial=%zu resident_slice_bytes=%zu\n",
@@ -7196,6 +7220,10 @@ static bool moe_cache_swap_groups(moe_cache_session & session, bool census = fal
     }
     MOE_CACHE_LOG("[moe-cache] whole swap %s: complete=%zu partial=%zu layers=%zu\n",
             census ? "final" : "initial", complete, partial, groups.size());
+    if (bank_complete) {
+        MOE_CACHE_LOG("[moe-cache] whole swap %s resident complete experts: cache %zu + bank %zu = %zu\n",
+                census ? "final" : "initial", complete - bank_complete, bank_complete, complete);
+    }
     return !groups.empty() && partial == 0;
 }
 
@@ -10905,6 +10933,19 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
         const bool mask_only = resident_mask && !route_stats;
         size_t table_bytes = route_stats ? 3 * sizeof(unsigned long long) : 0, hot_bytes = 0;
         size_t count_entries = 0, arena_bytes = 0;
+        size_t bank_zero_bytes = 0, bank_entries = 0;
+        for (int i = 0; i < n_tensors; ++i) {
+            const auto & d = tensors[i];
+            if (d.data && ggml_moe_bank_lookup(d.data) && d.n_in > 0 && d.n_out > 0) {
+                bank_zero_bytes = std::max(bank_zero_bytes, ggml_row_size((ggml_type)d.type, d.n_in) * (size_t)d.n_out);
+            }
+        }
+        ggml_cuda_set_device(device.logical);
+        const void * bank_zero = bank_zero_bytes ? moe_bank_zero_block(device.logical, bank_zero_bytes) : nullptr;
+        if (bank_zero_bytes && !bank_zero) {
+            MOE_CACHE_LOG("[moe-cache] device tables skipped: bank zero block allocation failed\n");
+            return fail();
+        }
         for (int i = 0; i < n_tensors; ++i) {
             const auto & d = tensors[i];
             // The legacy cache supports IQ1_M; the mapped pointer specialization
@@ -10942,6 +10983,7 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
             (void)cudaGetLastError();
             table.addresses.resize(d.n_expert);
             table.permanent.assign(d.n_expert, 0);
+            table.bank.assign(d.n_expert, 0);
             table.fallback.resize(d.n_expert);
             table.copy_source.resize(d.n_expert);
             table.count_offset = count_entries;
@@ -10951,6 +10993,12 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
                         expert_bytes, device.logical);
                 const void * address = permanent;
                 if (permanent) { hot_bytes += expert_bytes; table.permanent[e] = 1; }
+                if (!permanent && bank_zero && moe_bank_has(d.data, e)) {
+                    address = bank_zero;
+                    table.permanent[e] = 1;
+                    table.bank[e] = 1;
+                    ++bank_entries;
+                }
                 for (const auto & pool : device.pools) {
                     if (permanent) { break; }
                     if (pool->expert_size != expert_bytes || pool->wtype != d.type) {
@@ -11058,6 +11106,10 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
         const size_t margin = ranges.empty() ? 0 : 2ull << 30;
         const size_t floor = 7ull << 30;
         const size_t available = moe_cache_mem_available();
+        if (bank_entries) {
+            MOE_CACHE_LOG("[moe-cache] device tables: %zu bank expert entries point at a %zu KiB zero block (computed by the bank call)\n",
+                    bank_entries, bank_zero_bytes >> 10);
+        }
         MOE_CACHE_LOG("[moe-cache] device preflight: hot=%zu MiB map=%zu MiB nonresident=%zu MiB ranges=%zu available=%zu MiB\n",
                 hot_bytes >> 20, pin_bytes >> 20, new_bytes >> 20, ranges.size(), available >> 20);
         // The RAM floor guards new pinning only: with no ranges there is nothing to pin, so a host just under

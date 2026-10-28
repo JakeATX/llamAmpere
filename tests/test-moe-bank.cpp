@@ -109,6 +109,26 @@ static void test_census() {
     CHECK(!ggml_moe_bank_census(resident_fn, nullptr, &lo, &hi, &cache, &bank, &both));
 }
 
+// The card-side cache points bank expert entries at an all-zero block: every quant type that has a row decoder
+// must turn all-zero bytes into exactly zero weights (finite, so weight 0 times the result stays 0).
+static void test_zero_block() {
+    int checked = 0;
+    for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
+        const ggml_type type = (ggml_type) t;
+        const auto * traits = ggml_get_type_traits(type);
+        if (!traits || !traits->to_float || ggml_blck_size(type) <= 0 || traits->type_size == 0) { continue; }
+        const int64_t k = 256 * (int64_t) ggml_blck_size(type);
+        std::vector<uint8_t> zero(ggml_row_size(type, k), 0);
+        std::vector<float> out(k, 1.0f);
+        traits->to_float(zero.data(), out.data(), k);
+        bool ok = true;
+        for (float v : out) { ok = ok && v == 0.0f; }
+        if (!ok) { fprintf(stderr, "FAIL zero block decodes nonzero: %s\n", ggml_type_name(type)); failures++; }
+        ++checked;
+    }
+    CHECK(checked > 10);
+}
+
 int main(int argc, char ** argv) {
     const bool child_off = argc > 1 && strcmp(argv[1], "--skip-off") == 0;
     if (child_off) {
@@ -118,6 +138,7 @@ int main(int argc, char ** argv) {
     test_patterns();
     test_skip(true);
     test_census();
+    test_zero_block();
     // GGML_MOE_BANK_SKIP=0 is read once per process: check it in a child
     char cmd[4200];
     snprintf(cmd, sizeof(cmd), "GGML_MOE_BANK_SKIP=0 '%s' --skip-off", argv[0]);
