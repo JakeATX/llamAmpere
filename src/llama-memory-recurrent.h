@@ -303,6 +303,7 @@ public:
     ggml_tensor * get_r_l(int32_t il) const;
     ggml_tensor * get_s_l(int32_t il) const;
     ggml_tensor * get_ingr_l(int32_t il) const;    // nullptr unless mem->gdn_replay
+    bool          get_gdn_replay() const;            // mem->gdn_replay and not a full-state context
     ggml_tensor * get_s_ckpt_l(int32_t il) const;  // nullptr unless mem->gdn_replay
     ggml_tensor * get_p_l(int32_t il) const;
 

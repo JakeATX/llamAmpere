@@ -469,7 +469,10 @@ void snapshot_shift_gather(ggml_context * ctx0, ggml_cgraph * gf, const llm_grap
     // The view runs to the end of `all` (not just snap_shift planes): s_copy_shift entries carry
     // the rollback group offset rs_idx * mem_size, so group j may read plane plane0 + j + rs_idx.
     GGML_ASSERT(inp->s_copy_shift != nullptr);
-    const size_t rows_off = (size_t) plane0 * mem_size;
+    // replay mode's plane0 (the pending rollback) is folded into s_copy_shift (set_input_shift), so the
+    // graph does not depend on it
+    GGML_UNUSED(plane0);
+    const size_t rows_off = 0;
     GGML_ASSERT(rows_off + (size_t) inp->snap_shift * mem_size <= (size_t) all->ne[1]);
     ggml_tensor * planes = ggml_view_2d(ctx0, all, row_elems, all->ne[1] - (int64_t) rows_off, all->nb[1], rows_off * all->nb[1]);
     ggml_tensor * g = ggml_get_rows(ctx0, planes, inp->s_copy_shift);
@@ -524,7 +527,7 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
     // explicitly here.
     ggml_tensor * conv_src = conv_states_all;
 
-    const uint32_t conv_rollback = mctx_cur->get_replay_len();
+    const uint32_t conv_rollback = inp->s_copy_conv != nullptr ? 0 : mctx_cur->get_replay_len(); // else s_copy_conv carries it
     if (conv_rollback > 0) {
         GGML_ASSERT((uint32_t) conv_states_all->ne[1] >= (conv_rollback + 1) * mem_size);
         conv_src = ggml_view_2d(ctx0, conv_states_all,
@@ -533,7 +536,7 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
                 (size_t) conv_rollback * mem_size * conv_states_all->nb[1]);
     }
 
-    ggml_tensor * conv_states = build_rs(inp, conv_src, hparams.n_embd_r(), n_seqs);
+    ggml_tensor * conv_states = build_rs_conv(inp, conv_src, hparams.n_embd_r(), n_seqs);
     cb(conv_states, "conv_states", il);
 
     conv_states = ggml_reshape_3d(ctx0, conv_states, conv_kernel_size - 1, conv_channels, n_seqs);
@@ -849,7 +852,35 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     uint32_t      new_first  = 0;       // this ubatch's ingredients land in slots [new_first, new_first + n_new)
     const uint32_t n_new     = std::min(n, K); // the op emits the last min(n, K) tokens
 
-    if (m + n <= K) {
+    if (n >= K && inp->replay_w != nullptr) {
+        // rollback-independent form: one graph for every verify round (the branches below
+        // depend on r, S and staleness, which cost a graph rebuild per round). Checked first:
+        // m + n <= K also holds for n == K, m == 0, and that topology would be reused for
+        // m > 0. Replay all K
+        // slots with g and beta zeroed past the accepted prefix -- a token with g = 0 and
+        // beta = 0 leaves the state bit-exact (s = expf(0) * s + k * 0) -- then pick s or the
+        // replayed state with 0/1 weights, also bit-exact for finite states.
+        ggml_tensor * w     = inp->replay_w;
+        ggml_tensor * w_slot = ggml_view_4d(ctx0, w, 1, 1, K, 1, w->nb[0], w->nb[0], w->nb[0] * K, 0);
+        ggml_tensor * w_rep  = ggml_view_1d(ctx0, w, 1, (size_t) K * w->nb[0]);
+        ggml_tensor * w_s    = ggml_view_1d(ctx0, w, 1, (size_t) (K + 1) * w->nb[0]);
+        auto comp = [&](int64_t ne0, int64_t off) {
+            return ggml_view_4d(ctx0, ring, ne0, H_v, K, n_seqs,
+                ingr_w * ingr_elemsize, ingr_row * ingr_elemsize, ring->nb[1], (size_t) off * ingr_elemsize);
+        };
+        ggml_tensor * k_b = ggml_cont(ctx0, comp(S_v, 0));
+        ggml_tensor * v_b = ggml_cont(ctx0, comp(S_v, S_v));
+        ggml_tensor * g_b = ggml_mul(ctx0, ggml_cont(ctx0, comp(kda ? S_v : 1, ingr_off_g)), w_slot);
+        ggml_tensor * b_b = ggml_mul(ctx0, ggml_cont(ctx0, comp(1, ingr_off_b)), w_slot);
+        ggml_tensor * q_dummy = ggml_scale(ctx0, k_b, 0.0f);
+        ggml_tensor * rep = extract_state_k1(
+            ggml_gated_delta_net(ctx0, q_dummy, k_b, v_b, g_b, b_b, s_ckpt, /*K=*/1, /*emit_mode=*/0), (int64_t) K);
+        base_state = ggml_add(ctx0, ggml_mul(ctx0, rep, w_rep), ggml_mul(ctx0, s, w_s));
+        ckpt_from_op = n > K;
+        ckpt_new     = ckpt_from_op ? nullptr : base_state;
+        keep_count   = 0;
+        new_first    = 0;
+    } else if (m + n <= K) {
         if (need_base) {
             base_state = m == 0 ? s_ckpt : replay_from(s_ckpt, 0, m);
         }

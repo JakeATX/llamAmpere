@@ -1904,6 +1904,10 @@ ggml_tensor * llama_memory_recurrent_context::get_s_l(int32_t il) const {
     return mem->s_l[il];
 }
 
+bool llama_memory_recurrent_context::get_gdn_replay() const {
+    return mem->gdn_replay && !is_full;
+}
+
 ggml_tensor * llama_memory_recurrent_context::get_ingr_l(int32_t il) const {
     if (!mem->gdn_replay || il >= (int32_t) mem->ingr_l.size()) {
         return nullptr;
