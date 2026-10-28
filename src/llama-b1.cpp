@@ -475,7 +475,7 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
     const size_t keep_default = ffn_requested ? phase_scratch >> 20 : 1536;
     const size_t keep = std::max(phase_scratch, (size_t) std::max<int64_t>(0,
             b1_env_int("LLAMA_B1_KEEP_FREE_MIB", keep_default)) << 20);
-    const size_t fresh_avail = free_mem > keep ? free_mem - keep : 0;
+    const size_t fresh_avail = free_mem > keep + extra_keep ? free_mem - keep - extra_keep : 0;
 
     // page-cache budget: every pass reads the streamed experts in the same fixed order, the experts kept in RAM from
     // the mmap and the lent layers from the file. When that loop is larger than the RAM free for the page cache,

@@ -46,6 +46,9 @@ public:
 
     bool ok() const { return init_ok; }
     void set_ffn_enabled(bool enabled) { ffn_requested = enabled; }
+    // VRAM the plan must leave free beyond its keep, for scratch measured only after a plan exists (the legacy layer graph)
+    void set_extra_keep(size_t bytes) { extra_keep = bytes; }
+    size_t extra_keep = 0;
     bool ffn_enabled() const { return !ffn_views.empty(); }
     llm_b1_ffn * ffn(size_t ub);
     llm_b1_ffn * ffn_group() { return ffn_all.get(); }

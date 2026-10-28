@@ -664,6 +664,7 @@ private:
     std::vector<size_t> b1_layer_compute_bytes;
     std::vector<ggml_backend_buffer_ptr> b1_kv_views;
     ggml_backend_buffer_ptr b1_kv_owned;
+    size_t b1_legacy_deficit = 0; // VRAM the last legacy layer reservation lacked (re-plan lends that much more)
     bool b1_lend_scratch = false; // the layer graph may also use the lent, unused B1 VRAM (LLAMA_B1_LEND_SCRATCH=0 disables)
     std::vector<ggml_backend_buffer_ptr> b1_lend_views; // refilled with the lent tensors, never cleared here
     bool b1_kv_scratch_release();

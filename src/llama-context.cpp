@@ -6566,6 +6566,7 @@ bool llama_context::b1_reserve_legacy_layers(const std::vector<uint32_t> & sizes
             }
         }
     } guard { this, success };
+    b1_legacy_deficit = 0;
     try {
         synchronize();
         size_t gpu_index = backend_ptrs.size();
@@ -6644,7 +6645,7 @@ bool llama_context::b1_reserve_legacy_layers(const std::vector<uint32_t> & sizes
         }
         LLAMA_LOG_INFO("%s: [B1] legacy layer fit: range [%d,%d), compute %.2f MiB (lent spare covers %.2f MiB), free %.2f MiB, keep %.2f MiB\n",
                 __func__, worst_l0, worst_l1, maximum[gpu_index] / 1048576.0, lend_cover / 1048576.0, free / 1048576.0, keep / 1048576.0);
-        if (need > free) { return false; }
+        if (need > free) { b1_legacy_deficit = need - free; return false; }
         b1->reserve_layer_bind(worst_l0);
         b1_cur = { true, worst_l0, worst_l1, b1->carry(max_ub), nullptr, 0 };
         if ((b1_kv_scratch_enabled && b1_ctx_env("LLAMA_B1_KV_PREFLIGHT", 0) != 0) || lend_cover > 0) {
@@ -6685,7 +6686,7 @@ bool llama_context::b1_reserve_legacy_layers(const std::vector<uint32_t> & sizes
                 break;
             }
         }
-        if (free < keep) { return false; }
+        if (free < keep) { b1_legacy_deficit = keep - free; return false; }
         success = true;
         return true;
     } catch (const std::exception & e) {
@@ -6900,7 +6901,24 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
         b1_lend_scratch = peer_detached && mtp_scratch_clients.empty() && n_tokens_all <= UINT32_MAX - 512 && b1->n_groups() == 1 && b1_ctx_env("LLAMA_B1_LEND_SCRATCH", 1) != 0;
         b1_kv_prompt_cells = n_tokens_all + 512;
         b1_kv_outputs = (uint32_t) std::max<int64_t>(1, std::min<int64_t>(n_tokens_all, n_outputs_all));
-        if (b1->n_groups() != 1 || !b1_reserve_legacy_layers(sizes, n_outputs_all)) {
+        const bool kv_scratch_wanted = b1_kv_scratch_enabled, lend_wanted = b1_lend_scratch;
+        bool reserved = b1->n_groups() == 1 && b1_reserve_legacy_layers(sizes, n_outputs_all);
+        // fork: the plan sizes carries and slots before the layer graph is measured. When the graph then lacks VRAM,
+        // plan once more leaving that deficit free: the plan lends more resident experts (refilled after the prompt)
+        // instead of allocating fresh VRAM. LLAMA_B1_REPLAN=0 disables.
+        if (!reserved && b1_legacy_deficit > 0 && b1_ctx_env("LLAMA_B1_REPLAN", 1) != 0) {
+            const size_t extra = b1_legacy_deficit + ((size_t) 64 << 20);
+            LLAMA_LOG_WARN("%s: [B1] re-plan leaving %.1f MiB more free for the layer graph\n", __func__, extra / 1048576.0);
+            b1->set_extra_keep(extra);
+            const bool replanned = b1->begin(sizes, group_ub, lend_cap, final_home, nullptr, lean_legacy);
+            b1->set_extra_keep(0);
+            if (replanned && b1->n_groups() == 1) {
+                b1_kv_scratch_enabled = kv_scratch_wanted;
+                b1_lend_scratch = lend_wanted;
+                reserved = b1_reserve_legacy_layers(sizes, n_outputs_all);
+            }
+        }
+        if (!reserved) {
             b1_kv_scratch_enabled = false; b1_lend_scratch = false;
             LLAMA_LOG_WARN("%s: [B1] legacy one-pass layer reservation failed before applying prompt state\n", __func__);
             b1_end(true);
