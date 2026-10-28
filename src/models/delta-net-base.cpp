@@ -868,13 +868,15 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
             return ggml_view_4d(ctx0, ring, ne0, H_v, K, n_seqs,
                 ingr_w * ingr_elemsize, ingr_row * ingr_elemsize, ring->nb[1], (size_t) off * ingr_elemsize);
         };
-        ggml_tensor * k_b = ggml_cont(ctx0, comp(S_v, 0));
-        ggml_tensor * v_b = ggml_cont(ctx0, comp(S_v, S_v));
-        ggml_tensor * g_b = ggml_mul(ctx0, ggml_cont(ctx0, comp(kda ? S_v : 1, ingr_off_g)), w_slot);
-        ggml_tensor * b_b = ggml_mul(ctx0, ggml_cont(ctx0, comp(1, ingr_off_b)), w_slot);
-        ggml_tensor * q_dummy = ggml_scale(ctx0, k_b, 0.0f);
+        // k and v stay strided views into the ring (the op reads rows by stride; q only has to
+        // share k's strides and shapes the discarded attention output, so k doubles as q), and
+        // the masking mul writes g and beta out contiguous -- no conts, no q scale.
+        ggml_tensor * k_b = comp(S_v, 0);
+        ggml_tensor * v_b = comp(S_v, S_v);
+        ggml_tensor * g_b = ggml_mul(ctx0, comp(kda ? S_v : 1, ingr_off_g), w_slot);
+        ggml_tensor * b_b = ggml_mul(ctx0, comp(1, ingr_off_b), w_slot);
         ggml_tensor * rep = extract_state_k1(
-            ggml_gated_delta_net(ctx0, q_dummy, k_b, v_b, g_b, b_b, s_ckpt, /*K=*/1, /*emit_mode=*/0), (int64_t) K);
+            ggml_gated_delta_net(ctx0, k_b, k_b, v_b, g_b, b_b, s_ckpt, /*K=*/1, /*emit_mode=*/0), (int64_t) K);
         base_state = ggml_add(ctx0, ggml_mul(ctx0, rep, w_rep), ggml_mul(ctx0, s, w_s));
         ckpt_from_op = n > K;
         ckpt_new     = ckpt_from_op ? nullptr : base_state;
