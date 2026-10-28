@@ -186,6 +186,7 @@ llama_b1::llama_b1(const llama_model & model, ggml_backend_t backend_gpu) : mode
         L.resident = !L.tensors.empty();
         for (int ti : L.tensors) {
             L.resident = L.resident && exps[ti].resident;
+            L.res_bytes += exps[ti].resident ? exps[ti].alloc : 0;
         }
         n_res += L.resident;
     }
@@ -448,17 +449,22 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
         }
     }
 
-    // lendable resident layers, highest first; a layer still holding borrowed data is always lent
+    // lendable layers, highest first; a layer still holding borrowed data is always lent. A layer lends its
+    // VRAM-resident exps tensors only (a mixed layer, such as RAM experts plus an always-on VRAM bank, lends the bank);
+    // its RAM tensors stream from RAM as before.
     std::vector<int> forced;
     std::vector<int> order;
     for (int il = n_layer - 1; il >= 0; --il) {
         const auto & L = layers[il];
-        if (!L.resident) {
+        if (L.res_bytes == 0) {
             continue;
         }
         bool any_dirty = false;
         bool lendable  = true;
         for (int ti : L.tensors) {
+            if (!exps[ti].resident) {
+                continue;
+            }
             any_dirty = any_dirty || dirty_flag[ti];
             lendable  = lendable && exps[ti].src.fd >= 0;
         }
@@ -511,11 +517,11 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
             std::vector<int> lent = forced;
             size_t lent_bytes = 0;
             for (int il : forced) {
-                lent_bytes += layers[il].bytes;
+                lent_bytes += layers[il].res_bytes;
             }
             bool over_cap = false;
             for (size_t i = 0; i < k; ++i) {
-                lent_bytes += layers[order[i]].bytes;
+                lent_bytes += layers[order[i]].res_bytes;
                 over_cap = over_cap || lent_bytes > lend_cap;
                 lent.push_back(order[i]);
             }
@@ -528,6 +534,9 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
             for (int il : lent) {
                 for (int ti : layers[il].tensors) {
                     const auto & e = exps[ti];
+                    if (!e.resident) {
+                        continue;
+                    }
                     const size_t balign = ggml_backend_buft_get_alignment(ggml_backend_buffer_get_type(e.home_buf));
                     spans.push_back({ (char *) e.home_data, { e.home_buf, b1_align_up(e.alloc, balign) } });
                 }
@@ -611,7 +620,7 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
     for (int il : lent_sel) {
         for (int ti : layers[il].tensors) {
             auto & e = exps[ti];
-            if (verified[ti] || dirty_flag[ti]) {
+            if (!e.resident || verified[ti] || dirty_flag[ti]) {
                 continue;
             }
             const size_t n = std::min<size_t>(e.nbytes, 1u << 16);
@@ -749,6 +758,9 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
     for (int il : lent_sel) {
         lent_layer[il] = true;
         for (int ti : layers[il].tensors) {
+            if (!exps[ti].resident) {
+                continue;
+            }
             if (!dirty_flag[ti]) {
                 dirty_flag[ti] = true;
                 dirty_tensors.push_back(ti);
@@ -987,7 +999,7 @@ void llama_b1::coordinator() {
                 continue;
             }
             const placement & p = slot_place[slot*n_roles + e.role];
-            push_tensor_pieces(ps, e, &regions[p.region], p.offs, lent_layer[il]);
+            push_tensor_pieces(ps, e, &regions[p.region], p.offs, lent_layer[il] && e.resident);
         }
         const size_t pass = k / (steps.size() / grp_first.size());
         for (const auto & piece : ps) {

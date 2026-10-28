@@ -121,6 +121,7 @@ private:
         std::vector<int> tensors; // indices into exps
         bool   resident = false;  // every exps tensor of the layer is in VRAM
         size_t bytes    = 0;
+        size_t res_bytes = 0;     // the VRAM-resident exps tensors only: what lending this layer frees
     };
 
     // a contiguous VRAM range the plan may place slots and carries in
