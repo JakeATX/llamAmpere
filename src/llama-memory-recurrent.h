@@ -380,6 +380,9 @@ private:
         int32_t  rs_z = -1;
         std::vector<llama_memory_recurrent::mem_cell> cells;
         std::vector<uint32_t> rs_idx; // pending rollback group per sequence, as the normal order's ubatch sees it
+        std::vector<uint32_t> replay_len; // gdn_replay bookkeeping per sequence, as the normal order's ubatch sees it
+        std::vector<uint32_t> ckpt_span;
+        std::vector<uint8_t>  s_stale;
     };
     std::vector<b1_view> b1_views;
 };

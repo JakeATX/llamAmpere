@@ -1780,9 +1780,11 @@ bool llama_memory_recurrent_context::apply() {
 bool llama_memory_recurrent_context::b1_supported() const {
     // the shift rollback layout (n_rs_seq > 0, used by MTP drafting) replays like the plain one: every layer range
     // writes the same snapshot planes for each ubatch, and the views carry the pending rollback group (rs_idx). The
-    // ring layout and gdn_replay change per-cell state while the inputs are set (rs_base, replay_len), so they stay off.
+    // gdn_replay bookkeeping (replay_len, ckpt_span, s_stale) is consumed while the inputs are set, so each view
+    // carries the values its ubatch sees in the normal order (b1_save). The ring layout changes rs_base while the
+    // inputs are set, so it stays off.
     return status == LLAMA_MEMORY_STATUS_SUCCESS && !is_full && !ubatches.empty() &&
-           !mem->rs_ring && !mem->gdn_replay;
+           !mem->rs_ring;
 }
 
 void llama_memory_recurrent_context::b1_save() {
@@ -1813,6 +1815,39 @@ void llama_memory_recurrent_context::b1_save() {
             }
         }
     }
+    // gdn_replay: the apply loop sets no inputs, so the memory still holds the values ubatch 0 sees; a later
+    // ubatch sees them after consume_replay() of the one before it (same update as replay_split::advance)
+    if (mem->gdn_replay) {
+        if (i_next == 0) {
+            v.replay_len = mem->replay_len;
+            v.ckpt_span  = mem->ckpt_span;
+            v.s_stale    = mem->s_stale;
+        } else {
+            const auto & p  = b1_views[i_next - 1];
+            const auto & ub = ubatches[i_next - 1];
+            v.replay_len = p.replay_len;
+            v.ckpt_span  = p.ckpt_span;
+            v.s_stale    = p.s_stale;
+            uint32_t r = 0, span = 0;
+            for (uint32_t i = 0; i < ub.n_seqs_unq; ++i) {
+                const llama_seq_id seq = ub.seq_id_unq[i];
+                if (seq >= 0 && (size_t) seq < v.replay_len.size()) {
+                    r    = std::max(r,    p.replay_len[seq]);
+                    span = std::max(span, p.ckpt_span[seq]);
+                }
+            }
+            const uint32_t n_seq_tokens = ub.n_seqs > 0 ? ub.n_tokens / ub.n_seqs : 0;
+            const uint32_t span_new     = llama_memory_recurrent::replay_span_new(span, r, n_seq_tokens, mem->n_rs_seq);
+            for (uint32_t i = 0; i < ub.n_seqs_unq; ++i) {
+                const llama_seq_id seq = ub.seq_id_unq[i];
+                if (seq >= 0 && (size_t) seq < v.replay_len.size()) {
+                    v.replay_len[seq] = 0;
+                    v.ckpt_span[seq]  = span_new;
+                    v.s_stale[seq]    = 0;
+                }
+            }
+        }
+    }
 }
 
 bool llama_memory_recurrent_context::b1_seek(size_t i) {
@@ -1826,6 +1861,11 @@ bool llama_memory_recurrent_context::b1_seek(size_t i) {
     mem->rs_z  = v.rs_z;
     mem->cells = v.cells;
     mem->rs_idx = v.rs_idx;
+    if (mem->gdn_replay) {
+        mem->replay_len = v.replay_len;
+        mem->ckpt_span  = v.ckpt_span;
+        mem->s_stale    = v.s_stale;
+    }
     i_next = i;
     return true;
 }
