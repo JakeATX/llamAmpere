@@ -1706,6 +1706,34 @@ static int moe_resident_copy(void * opaque, ggml_tensor * dst, size_t offset, co
             ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)) != g_moe_cache_owner ||
             ggml_backend_buffer_is_host(dst->buffer) ||
             ggml_backend_buft_get_device(ggml_backend_buffer_get_type(dst->buffer)) != ggml_backend_get_device(backend)) { return 0; }
+    // fork AIPNEXTK BANKDROP: a range that touches dropped bank-expert bytes is uploaded around them; the dropped
+    // parts are written as zeros on the device (those experts only ever run here with routing weight 0)
+    if (host && size && size <= UINTPTR_MAX - (uintptr_t) host && backend->iface.set_tensor_async) {
+        size_t n_holes = 0;
+        const ggml_moe_bank_hole * holes = ggml_moe_bank_holes(&n_holes);
+        const uintptr_t begin = (uintptr_t) host, end = begin + size;
+        const ggml_moe_bank_hole * it = holes ? std::lower_bound(holes, holes + n_holes, begin,
+                [](const ggml_moe_bank_hole & h, uintptr_t v) { return h.end <= v; }) : nullptr;
+        if (it && it != holes + n_holes && it->begin < end) {
+            auto * ctx = (ggml_backend_cuda_context *) backend->context;
+            ggml_cuda_set_device(ctx->device);
+            uintptr_t cursor = begin;
+            for (; it != holes + n_holes && it->begin < end; ++it) {
+                const uintptr_t first = std::max(begin, it->begin), last = std::min(end, it->end);
+                if (cursor < first) {
+                    backend->iface.set_tensor_async(backend, dst, (const void *) cursor, offset + (cursor - begin), first - cursor);
+                }
+                if (cudaMemsetAsync((char *) dst->data + offset + (first - begin), 0, last - first, ctx->stream()) != cudaSuccess) {
+                    GGML_ABORT("bank expert zero upload failed");
+                }
+                cursor = last;
+            }
+            if (cursor < end) {
+                backend->iface.set_tensor_async(backend, dst, (const void *) cursor, offset + (cursor - begin), end - cursor);
+            }
+            return 1;
+        }
+    }
     const char * upload = getenv("GGML_MOE_RESIDENT_UPLOAD");
     if (upload && strcmp(upload, "1") == 0) {
         const uintptr_t begin = (uintptr_t)host;

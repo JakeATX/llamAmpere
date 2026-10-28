@@ -231,6 +231,13 @@ static inline int ggml_moe_cache_wtype_supported(int wtype) {
 }
 
 GGML_API bool ggml_moe_cache_has_residents(void);
+
+// fork AIPNEXTK BANKDROP: host byte ranges [begin, end) of always-resident bank experts whose RAM copy was dropped
+// (the bank call computes them; the regular call routes them with weight 0). Copies of such a range to a device
+// write zeros instead (ggml_moe_cache_resident_copy). Set once at model load; sorted and disjoint.
+typedef struct { uintptr_t begin; uintptr_t end; } ggml_moe_bank_hole;
+GGML_API void ggml_moe_bank_holes_set(const ggml_moe_bank_hole * holes, size_t n);
+GGML_API const ggml_moe_bank_hole * ggml_moe_bank_holes(size_t * n);
 GGML_API void ggml_moe_cache_resident_notify(bool created);
 
 // Read barriers are independent of thread-local cache suspension.

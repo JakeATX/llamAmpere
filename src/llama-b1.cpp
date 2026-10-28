@@ -1001,7 +1001,10 @@ void llama_b1::push_tensor_pieces(std::vector<piece> & ps, const exps_tensor & e
     for (size_t off = 0; off < e.nbytes;) {
         piece p;
         const bool strided = !from_file && e.home_nb2 != expert_bytes;
-        const bool permanent = !from_file && ggml_moe_cache_has_residents();
+        size_t n_holes = 0;
+        (void) ggml_moe_bank_holes(&n_holes);
+        // per-expert pieces: a resident or dropped bank expert is then one whole piece for the device-side copy
+        const bool permanent = !from_file && (ggml_moe_cache_has_residents() || n_holes > 0);
         const size_t source_off = strided ? (off / expert_bytes) * e.home_nb2 + off % expert_bytes : off;
         p.src_host = from_file ? nullptr : (const char *) e.home_data + source_off;
         p.fd       = e.src.fd;
