@@ -6467,8 +6467,10 @@ bool llama_context::b1_kv_scratch_bind(int32_t l0, int32_t l1, bool preflight) {
     }
     // fork: the lent B1 VRAM that no slot or carry uses (an always-on expert bank lends far more than two slots need)
     std::vector<ggml_backend_buffer_t> lend_set;
-    if (b1_lend_scratch) {
-        auto more = b1->spare_views((size_t) 16 << 20, 14);
+    // The final range is skipped: its real graph keeps every output row (MTP handoff), larger than the bound measure,
+    // and only an allocator-owned buffer can be released and regrown. Slivers below 512 MiB only fragment the graph.
+    if (b1_lend_scratch && l1 < (int32_t) model.hparams.n_layer()) {
+        auto more = b1->spare_views((size_t) 512 << 20, 14);
         for (auto & view : more) { lend_set.push_back(view.get()); views.push_back(std::move(view)); }
     }
     std::sort(views.begin(), views.end(), [](const ggml_backend_buffer_ptr & a, const ggml_backend_buffer_ptr & b) {
@@ -6617,7 +6619,7 @@ bool llama_context::b1_reserve_legacy_layers(const std::vector<uint32_t> & sizes
         // fork: lent, unused B1 VRAM covers most of the layer graph (see b1_kv_scratch_bind); only the owned rest needs free VRAM
         size_t lend_spare = 0;
         if (b1_lend_scratch) {
-            for (auto & view : b1->spare_views((size_t) 16 << 20, 14)) { lend_spare += ggml_backend_buffer_get_size(view.get()); }
+            for (auto & view : b1->spare_views((size_t) 512 << 20, 14)) { lend_spare += ggml_backend_buffer_get_size(view.get()); }
         }
         const size_t lend_cover = std::min(maximum[gpu_index] - maximum[gpu_index] / 8, lend_spare - lend_spare / 8);
         const size_t need = maximum[gpu_index] - lend_cover + keep;
