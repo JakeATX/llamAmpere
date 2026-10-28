@@ -778,6 +778,7 @@ llama_model_loader::llama_model_loader(
             throw std::runtime_error("too many model files for an overlay");
         }
         const uint16_t idx = (uint16_t) files.size();
+        overlay_idx = idx;
         files.emplace_back(new llama_file(ov, "rb", use_direct_io));
         contexts.emplace_back(ctx);
         int n_added = 0;
@@ -2102,6 +2103,13 @@ bool llama_model_loader::load_all_data(
                 }
             }
         }
+#ifdef __linux__
+        // fork: the overlay (an always-on VRAM expert bank) is not read again except to refill lent tensors; its file
+        // pages would only crowd the RAM expert arena. LLAMA_MODEL_OVERLAY_KEEP_CACHE=1 keeps them.
+        if (overlay_idx >= 0 && overlay_idx < (int) files.size() && !getenv("LLAMA_MODEL_OVERLAY_KEEP_CACHE")) {
+            posix_fadvise(files.at(overlay_idx)->file_id(), 0, 0, POSIX_FADV_DONTNEED);
+        }
+#endif
         if (progress_callback) {
             // Even though the model is done loading, we still honor
             // cancellation since we need to free allocations.
