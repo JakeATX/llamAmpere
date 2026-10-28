@@ -1,9 +1,19 @@
-# llamAmpere
+<div style="display: flex;">
+  <div style="flex: 1;"></div>
+  <div style="flex: 1;"></div>
+</div>
 
+<table><tr>
+    <td width="167" valign="top"><img width="167" height="250" alt="llamaAmpre_mascot_250h" src="https://github.com/user-attachments/assets/9c6dfd5f-6575-40f4-9d97-868c429631fc" /></td>
+    <td valign="top">
+<h1>llamAmpere</h1>
 llamAmpere is a fast version of llama.cpp (the open-source program that runs AI language models on your own computer),
 tuned for NVIDIA RTX 30-series "Ampere" graphics cards, especially the RTX 3090 and 3090 Ti. It runs Qwen3.8 models,
 including Qwen3.8-27B with its built-in MTP draft head (a small helper that guesses several words ahead so the model
 writes faster) and Qwen3.8 Flash-Next.
+    </td>
+  </tr>
+</table>
 
 ## What's new in v0.6
 
@@ -13,7 +23,6 @@ writes faster) and Qwen3.8 Flash-Next.
 - **Qwen3.8 Flash-Next** support: experts split between the card and RAM, with `--kv-gpu-tokens N` to keep only part of the context memory on the card.
 
 Details, speed tables and everything older: [v0.6 release notes](docs/llamampere-v0.6/RELEASE_NOTES.md).
-
 
 ## Quick start
 
