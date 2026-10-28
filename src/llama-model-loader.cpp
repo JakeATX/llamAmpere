@@ -759,6 +759,21 @@ llama_model_loader::llama_model_loader(
             throw std::runtime_error(format("%s: failed to load overlay GGUF %s", __func__, ov));
         }
         if (const char * error = llama_ait_format_error(ctx_gguf.get())) { throw std::runtime_error(error); }
+        // the overlay belongs to a model that holds the regular expert tensor of every bank tensor; any other model loaded
+        // in the same process (an MTP drafter, a draft model) does not take it
+        bool belongs = true;
+        for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur && belongs; cur = ggml_get_next_tensor(ctx, cur)) {
+            std::string base = cur->name;
+            const size_t pos = base.find("_exps_hot.");
+            if (pos != std::string::npos) {
+                base.replace(pos, strlen("_exps_hot."), "_exps.");
+                belongs = weights_map.find(base) != weights_map.end();
+            }
+        }
+        if (!belongs) {
+            LLAMA_LOG_INFO("%s: overlay %s does not belong to this model (no matching expert tensors), not loaded\n", __func__, ov);
+            ggml_free(ctx);
+        } else {
         if (files.size() >= UINT16_MAX) {
             throw std::runtime_error("too many model files for an overlay");
         }
@@ -779,6 +794,7 @@ llama_model_loader::llama_model_loader(
             ++n_added;
         }
         LLAMA_LOG_INFO("%s: overlay %s: %d tensors, %.2f GiB\n", __func__, ov, n_added, added_bytes/1073741824.0);
+        }
     }
 
     n_kv      = gguf_get_n_kv(metadata);
