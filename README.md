@@ -1,4 +1,23 @@
-> **llamAmpere v0.6**: a llama.cpp fork tuned for the RTX 3090 / 3090 Ti (Ampere, SM86), running Qwen3.8-27B with its MTP draft head, and Qwen3.8 Flash-Next with experts split between the card and RAM.
+## About llamAmpere
+llama.cpp fork tuned for single RTX 3090 / 3090Ti (Ampere, SM86), running Qwen3.8-27B with MTP draft and Qwen3.8 Flash-Next with experts split between the card and RAM.
+
+## Quick start
+
+Needs Linux, an NVIDIA card 24+ GB VRAM, CUDA toolkit (tested with 12.4), CMake, git and a C++ compiler. The model download is 14.4 GB.
+
+```cli
+git clone -b v0.6 https://github.com/JakeATX/llamAmpere.git && cd llamAmpere \
+&& cmake -S . -B build-sm86 -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 -DLLAMA_BUILD_BORINGSSL=ON \
+&& cmake --build build-sm86 -j8 --target llama-server \
+&& ./build-sm86/bin/llama-server \
+--hf-repo jakeatx/ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M-GGUF \
+--hf-file ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M.gguf -c 262144 \
+-ngl 99 -fa on -ctk sjkvarn4 -ctv sjkvarn4 -b 4096 -ub 1024 --parallel 1 \
+--spec-type draft-mtp-adaptive --spec-draft-n-min-adaptive 3 --spec-draft-n-max 5 --spec-draft-p-min 0
+```
+The server listens on http://127.0.0.1:8080 (OpenAI-compatible API). Add `--no-spec-mb-mtp` for exact drafting.
+To use the IQ4_XS-M file (15.6 GB, also runs in mainline llama.cpp) instead, use
+`--hf-repo jakeatx/ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M-GGUF --hf-file ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M.gguf`.
 
 ## What's new in v0.6
 
@@ -14,26 +33,6 @@
   release notes.
 - Nemotron 3.5 Bolt / Super, EXL3 speed-ups with the same output, and a fix for SJ-KVaRN with image prompts.
 - Swift 1.5 v0.6 vs v0.5 speed table and gates: [release notes](docs/llamampere-v0.6/RELEASE_NOTES.md).
-
-**Build and run (v0.6, one RTX 3090 / 3090 Ti, 262,144-token context).** Needs Linux, an NVIDIA card with 24 GB, the
-CUDA toolkit (tested with 12.4), CMake, git and a C++ compiler. The model download is 14.4 GB.
-
-```bash
-git clone -b v0.6 https://github.com/JakeATX/llamAmpere.git
-cd llamAmpere
-cmake -S . -B build-sm86 -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 \
-  -DLLAMA_BUILD_BORINGSSL=ON
-cmake --build build-sm86 -j8 --target llama-server
-./build-sm86/bin/llama-server \
-  --hf-repo jakeatx/qwen3.8-27b-Swift1.5-Uncensored-ATX-AI4 \
-  --hf-file qwen3.8-27b-Swift1.5-Uncensored-ATX-AI4.gguf -c 262144 \
-  -ngl 99 -fa on -ctk sjkvarn4 -ctv sjkvarn4 -b 4096 -ub 1024 --parallel 1 \
-  --spec-type draft-mtp-adaptive --spec-draft-n-min-adaptive 3 --spec-draft-n-max 5 --spec-draft-p-min 0
-```
-
-The server listens on http://127.0.0.1:8080 (OpenAI-compatible API). Add `--no-spec-mb-mtp` for exact drafting.
-To use the IQ4_XS-M file (15.6 GB, also runs in mainline llama.cpp) instead, use
-`--hf-repo jakeatx/ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M-GGUF --hf-file ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M.gguf`.
 
 ---
 
