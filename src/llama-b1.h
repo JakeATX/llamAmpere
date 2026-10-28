@@ -12,6 +12,7 @@
 
 #include "ggml.h"
 #include "ggml-backend.h"
+#include "ggml-cpp.h"
 
 #include <algorithm>
 #include <condition_variable>
@@ -103,6 +104,10 @@ public:
     bool dirty() const { return !dirty_tensors.empty(); }
 
     const llama_b1_stats & stats() const { return st; }
+
+    // views over the parts of the lent VRAM regions that no slot or carry of the current plan uses, largest first,
+    // each at least min_bytes; the layer graph may use them as compute scratch until refill() restores the lent tensors
+    std::vector<ggml_backend_buffer_ptr> spare_views(size_t min_bytes, size_t max_views) const;
 
 private:
     struct exps_tensor {

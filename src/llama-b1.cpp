@@ -306,6 +306,60 @@ llama_b1::~llama_b1() {
     }
 }
 
+std::vector<ggml_backend_buffer_ptr> llama_b1::spare_views(size_t min_bytes, size_t max_views) const {
+    struct span { ggml_backend_buffer_t buf; size_t offs; size_t size; };
+    std::vector<span> spans;
+    const size_t n_lent = regions.size() - (fresh_buf ? 1 : 0);
+    const size_t n_roles = roles.size();
+    const size_t align = buft_dev ? ggml_backend_buft_get_alignment(buft_dev) : 0;
+    if (!align || slot_place.size() != 2*n_roles || carry_place.size() != g_ub) {
+        return {};
+    }
+    for (size_t r = 0; r < n_lent; ++r) {
+        const region & rg = regions[r];
+        std::vector<std::pair<size_t, size_t>> used; // [begin, end) within the region
+        for (size_t i = 0; i < slot_place.size(); ++i) {
+            if (slot_place[i].region == (int) r) {
+                used.push_back({ slot_place[i].offs, slot_place[i].offs + role_max[i % n_roles] });
+            }
+        }
+        for (size_t j = 0; j < carry_place.size(); ++j) {
+            if (carry_place[j].region != (int) r) {
+                continue;
+            }
+            uint32_t tokens = 0;
+            for (size_t u = j; u < ub_n.size(); u += g_ub) {
+                tokens = std::max(tokens, ub_n[u]);
+            }
+            used.push_back({ carry_place[j].offs, carry_place[j].offs + (size_t) tokens * n_embd * n_hc * sizeof(float) });
+        }
+        std::sort(used.begin(), used.end());
+        used.push_back({ rg.size, rg.size });
+        const size_t base = rg.base - (char *) ggml_backend_buffer_get_base(rg.buf);
+        size_t at = 0;
+        for (const auto & u : used) {
+            const size_t begin = (base + at + align - 1) / align * align;
+            const size_t end   = (base + std::min(u.first, rg.size)) / align * align;
+            if (end > begin && end - begin >= min_bytes) {
+                spans.push_back({ rg.buf, begin, end - begin });
+            }
+            at = std::max(at, u.second);
+        }
+    }
+    std::sort(spans.begin(), spans.end(), [](const span & a, const span & b) { return a.size > b.size; });
+    if (spans.size() > max_views) {
+        spans.resize(max_views);
+    }
+    std::vector<ggml_backend_buffer_ptr> out;
+    for (const auto & sp : spans) {
+        ggml_backend_buffer_ptr v(ggml_backend_buffer_view(sp.buf, sp.offs, sp.size));
+        if (v) {
+            out.push_back(std::move(v));
+        }
+    }
+    return out;
+}
+
 void llama_b1::release_plan() {
     reserve_layer_restore();
     ffn_release();
