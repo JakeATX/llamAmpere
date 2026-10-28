@@ -1339,7 +1339,7 @@ static __host__ inline int ids_max_tiles(int n_expert, int64_t n_pairs, int bn) 
 
 static __global__ void __launch_bounds__(IDS_THREADS) ids_helper(
         const char * __restrict__ ids, int64_t ids_nb0, int64_t ids_nb1, int n_used, int n_tok, int ne11,
-        int n_expert, int bn, int max_tiles, int * __restrict__ out) {
+        int n_expert, int bn, int max_tiles, int * __restrict__ out, float * __restrict__ zero_y = nullptr, int zero_m = 0) {
     __shared__ int cnt[IDS_MAX_EXPERT];
     __shared__ int wsum[2][32];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
@@ -1436,11 +1436,26 @@ static __global__ void __launch_bounds__(IDS_THREADS) ids_helper(
             cols[k] = t*n_used + u;
         }
     }
+    // small batches: zero the dst columns of skipped pairs (id outside [0, n_expert)) here instead of in a separate launch
+    if (zero_y != nullptr) {
+        for (int64_t p = 0; p < n_pairs; ++p) {
+            const int u = (int) (p % n_used), t = (int) (p / n_used);
+            const int e = *(const int *) (ids + u*ids_nb0 + t*ids_nb1);
+            if (e < 0 || e >= n_expert) {
+                float * y = zero_y + ((int64_t) t*n_used + u)*zero_m;
+                for (int i = tid; i < zero_m; i += IDS_THREADS) {
+                    y[i] = 0.0f;
+                }
+            }
+        }
+    }
 }
 
 static idmap launch_ids_helper(const void * ids, int64_t ids_nb0, int64_t ids_nb1, int n_used, int n_tok, int ne11,
-                               int n_expert, int bn, int max_tiles, int64_t nb02, int * out, cudaStream_t stream) {
-    ids_helper<<<1, IDS_THREADS, 0, stream>>>((const char *) ids, ids_nb0, ids_nb1, n_used, n_tok, ne11, n_expert, bn, max_tiles, out);
+                               int n_expert, int bn, int max_tiles, int64_t nb02, int * out, cudaStream_t stream,
+                               float * zero_y = nullptr, int zero_m = 0) {
+    ids_helper<<<1, IDS_THREADS, 0, stream>>>((const char *) ids, ids_nb0, ids_nb1, n_used, n_tok, ne11, n_expert, bn, max_tiles, out,
+                                              zero_y, zero_m);
     const int64_t n_pairs = (int64_t) n_used*n_tok;
     idmap m;
     m.hdr   = out;

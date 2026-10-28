@@ -1647,6 +1647,21 @@ static void ggml_compute_forward_mul_mat_id_ai4(
     GGML_ASSERT(params->wsize >= (size_t) nth * 16 * K * sizeof(float));
     float * wbuf = (float *) params->wdata + (size_t) ith * 16 * K;
 
+    // pairs whose id is outside [0, n_expert) are skipped and their dst rows zeroed (an expert bank marks the slots another
+    // bank serves with -1; the CUDA backend does the same). Each thread zeroes its own slabs.
+    for (int64_t t = 0; t < n_tok; ++t) {
+        for (int64_t s = 0; s < n_ids; ++s) {
+            const int32_t e = *(const int32_t *) ((const char *) ids->data + s*ids->nb[0] + t*ids->nb[1]);
+            if (e >= 0 && e < ne02) {
+                continue;
+            }
+            float * d = (float *) ((char *) dst->data + s*nb1 + t*nb2);
+            for (int64_t g = ith; g < ng; g += nth) {
+                memset(d + g*16, 0, 16*sizeof(float));
+            }
+        }
+    }
+
     for (int64_t e = 0; e < ne02; ++e) {
         bool used = false;
         for (int64_t t = 0; t < n_tok && !used; ++t) {

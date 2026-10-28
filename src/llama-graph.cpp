@@ -2605,14 +2605,28 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // get distinct filler slots that the token does not use: one-hot the token's hot slots over the
         // bank, then take the n_expert_used least-used bank slots (argsort puts the used ones last)
         const int64_t n_hot = hot.down->ne[2];
-        ggml_tensor * bank_pos = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, ggml_arange(ctx0, 0.0f, (float) n_hot, 1.0f), n_hot, 1, 1),
-                n_hot, n_expert_used, n_tokens, 1);
-        ggml_tensor * onehot = ggml_step(ctx0, ggml_scale_bias(ctx0, ggml_abs(ctx0, ggml_sub(ctx0, bank_pos, slot)), -1.0f, 0.5f)); // [n_hot, n_expert_used, n_tokens]
-        ggml_tensor * used   = ggml_sum_rows(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, onehot, 1, 0, 2, 3)));               // [1, n_hot, n_tokens]
-        ggml_tensor * filler = ggml_argsort_top_k(ctx0, ggml_scale(ctx0, ggml_reshape_2d(ctx0, used, n_hot, n_tokens), -1.0f), n_expert_used); // [n_expert_used, n_tokens]
-        ggml_tensor * fill_f = ggml_reshape_3d(ctx0, ggml_cast(ctx0, ggml_cont(ctx0, filler), GGML_TYPE_F32), 1, n_expert_used, n_tokens);
-        ggml_tensor * hot_f  = ggml_add(ctx0, ggml_mul(ctx0, slot, mask), ggml_sub(ctx0, fill_f, ggml_mul(ctx0, fill_f, mask)));
-        ggml_tensor * hot_ids = ggml_cast(ctx0, ggml_reshape_2d(ctx0, hot_f, n_expert_used, n_tokens), GGML_TYPE_I32);
+        // AI+ banks: the masked slots get id -1, which the AI+ MUL_MAT_ID skips (zero output, CUDA and CPU), so the hot
+        // call computes only the token's hot pairs instead of n_expert_used pairs with fillers. LLAMA_MOE_HOT_FILLER=1
+        // keeps the filler slots (an A/B control; the outputs are identical because the filler weights are zero).
+        static const bool hot_filler = getenv("LLAMA_MOE_HOT_FILLER") != nullptr && atoi(getenv("LLAMA_MOE_HOT_FILLER")) != 0;
+        const bool hot_skip = !hot_filler && ggml_ai4_rate(hot.up->type) != 0 && ggml_ai4_rate(hot.gate->type) != 0 &&
+                              ggml_ai4_rate(hot.down->type) != 0 &&
+                              !(getenv("GGML_MOE_HOT_DBG") && atoi(getenv("GGML_MOE_HOT_DBG")) == 1); // dbg 1 runs the cold bank
+        ggml_tensor * hot_ids = nullptr;
+        if (hot_skip) {
+            // (slot + 1) * mask - 1: the bank slot where hot, -1 where cold
+            ggml_tensor * hot_f = ggml_scale_bias(ctx0, ggml_mul(ctx0, ggml_scale_bias(ctx0, slot, 1.0f, 1.0f), mask), 1.0f, -1.0f);
+            hot_ids = ggml_cast(ctx0, ggml_reshape_2d(ctx0, hot_f, n_expert_used, n_tokens), GGML_TYPE_I32);
+        } else {
+            ggml_tensor * bank_pos = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, ggml_arange(ctx0, 0.0f, (float) n_hot, 1.0f), n_hot, 1, 1),
+                    n_hot, n_expert_used, n_tokens, 1);
+            ggml_tensor * onehot = ggml_step(ctx0, ggml_scale_bias(ctx0, ggml_abs(ctx0, ggml_sub(ctx0, bank_pos, slot)), -1.0f, 0.5f)); // [n_hot, n_expert_used, n_tokens]
+            ggml_tensor * used   = ggml_sum_rows(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, onehot, 1, 0, 2, 3)));               // [1, n_hot, n_tokens]
+            ggml_tensor * filler = ggml_argsort_top_k(ctx0, ggml_scale(ctx0, ggml_reshape_2d(ctx0, used, n_hot, n_tokens), -1.0f), n_expert_used); // [n_expert_used, n_tokens]
+            ggml_tensor * fill_f = ggml_reshape_3d(ctx0, ggml_cast(ctx0, ggml_cont(ctx0, filler), GGML_TYPE_F32), 1, n_expert_used, n_tokens);
+            ggml_tensor * hot_f  = ggml_add(ctx0, ggml_mul(ctx0, slot, mask), ggml_sub(ctx0, fill_f, ggml_mul(ctx0, fill_f, mask)));
+            hot_ids = ggml_cast(ctx0, ggml_reshape_2d(ctx0, hot_f, n_expert_used, n_tokens), GGML_TYPE_I32);
+        }
         cb(hot_ids, "ffn_moe_hot_ids", il);
         // the cold bank keeps all n_expert experts, so the routed ids stay unique there; the hot experts
         // run with zero weight in the cold call

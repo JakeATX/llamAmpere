@@ -784,6 +784,44 @@ static bool ai4_ref_only_type(ggml_type t) {
     return false;
 }
 
+// MUL_MAT_ID over AIT2_U / AIT3_U expert stacks runs the device-routed IMMA kernels (mmv-ID / GEMM-ID) by default:
+// the reference path routes on the host (stream sync, no CUDA graphs) and runs one f32 SGEMV per (slot, token) pair,
+// which made a prompt batch over an AI+ expert bank several times slower than the IQ expert stack it replaces.
+// GGML_CUDA_AI23_ID_REF=1 restores the reference path for MUL_MAT_ID; dense MUL_MAT keeps ai4_ref_only_type.
+static bool ai4_id_ref_only_type(ggml_type t) {
+    static const bool id_ref = ai4_env_int("GGML_CUDA_AI23_ID_REF", nullptr, 0) != 0;
+    if (t == GGML_TYPE_AIT2_U || t == GGML_TYPE_AIT3_U) {
+        return id_ref && ai4_ref_only_type(t);
+    }
+    return ai4_ref_only_type(t);
+}
+
+// Pairs whose expert id is outside [0, n_expert) are skipped by the routing (an expert bank marks the slots another bank
+// serves with -1); their dst columns are written as zeros so the routing-weight product downstream stays finite.
+// grid (n_tok), block 256: one block per token checks its n_used ids and zeroes the skipped columns.
+static __global__ void __launch_bounds__(256) k_ai4_zero_skipped(const char * __restrict__ ids, int64_t nb0, int64_t nb1,
+                                                                   int n_used, int n_expert, int M, float * __restrict__ Y) {
+    const int t = blockIdx.x;
+    for (int u = 0; u < n_used; ++u) {
+        const int e = *(const int *) (ids + u*nb0 + t*nb1);
+        if (e >= 0 && e < n_expert) {
+            continue;
+        }
+        float * y = Y + ((int64_t) t*n_used + u)*M;
+        for (int i = threadIdx.x; i < M; i += blockDim.x) {
+            y[i] = 0.0f;
+        }
+    }
+}
+
+static void ai4_zero_skipped(const ggml_tensor * ids, int n_used, int n_tok, int n_expert, int M, float * Y, cudaStream_t stream) {
+    for (int t0 = 0; t0 < n_tok; t0 += 65535) {
+        const int nt = std::min(65535, n_tok - t0);
+        k_ai4_zero_skipped<<<nt, 256, 0, stream>>>((const char *) ids->data + (int64_t) t0*ids->nb[1], ids->nb[0], ids->nb[1],
+                                                   n_used, n_expert, M, Y + (int64_t) t0*n_used*M);
+    }
+}
+
 static void ai4_reconstruct_any(const void * src, float * W, int64_t K, int64_t M, cudaStream_t stream, ggml_type t) {
     GGML_ASSERT(aik_reconstruct_rate<float>(ggml_ai4_rate(t), src, W, K, M, true, stream, ggml_ai4_trellis_mul(t)));
 }
@@ -877,7 +915,7 @@ static void ai4_ref_gemm(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
 }
 
 bool ggml_cuda_ai4_id_needs_sync(int cc, ggml_type t) {
-    return ai4_ref() || ai4_ref_only_type(t) || !GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_AMPERE;
+    return ai4_ref() || ai4_id_ref_only_type(t) || !GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_AMPERE;
 }
 
 bool ggml_cuda_ai4_supported(const ggml_tensor * op) {
@@ -1014,7 +1052,12 @@ void ggml_cuda_mul_mat_id_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int64_t n_rows  = (int64_t) ne11*n_tok;
     cudaStream_t stream = ctx.stream();
 
-    if (!ai4_fast_ok(ctx) || ai4_ref_only_type(src0->type)) {
+    // skipped pairs (id outside [0, n_expert)) get zero columns; the kernels below never write them. Small batches on the
+    // routed fast path zero them inside the routing helper (no extra launch per decode step).
+    const bool ref_path = !ai4_fast_ok(ctx) || ai4_id_ref_only_type(src0->type);
+
+    if (ref_path) {
+        ai4_zero_skipped(ids, n_used, n_tok, n_expert, M, (float *) dst->data, stream);
         // reference: reconstruct each selected expert to f32, one SGEMV per (slot, token) pair (host-side routing)
         std::vector<int32_t> h((size_t) n_pairs);
         CUDA_CHECK(cudaMemcpy2DAsync(h.data(), n_used*sizeof(int32_t), ids->data, ids->nb[1], n_used*sizeof(int32_t), n_tok,
@@ -1066,6 +1109,10 @@ void ggml_cuda_mul_mat_id_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor
         }
     }
     const int max_tiles = direct ? (int) n_pairs : ai4k::ids_max_tiles(n_expert, n_pairs, bn);
+    const bool zero_in_helper = !direct && n_tok <= 8;
+    if (!zero_in_helper) {
+        ai4_zero_skipped(ids, n_used, n_tok, n_expert, M, (float *) dst->data, stream);
+    }
     GGML_ASSERT(max_tiles <= 65535);
     ggml_cuda_pool_alloc<int> routing(ctx.pool());
     ai4k::idmap idm{};
@@ -1081,7 +1128,8 @@ void ggml_cuda_mul_mat_id_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor
     } else {
         routing.alloc((size_t) ai4k::ids_helper_ints(n_expert, n_pairs, max_tiles));
         idm = ai4k::launch_ids_helper(ids->data, ids->nb[0], ids->nb[1], n_used, n_tok, ne11, n_expert, bn,
-                                    max_tiles, src0->nb[2], routing.get(), stream);
+                                    max_tiles, src0->nb[2], routing.get(), stream,
+                                    zero_in_helper ? (float *) dst->data : nullptr, M);
     }
     const uint8_t * W = (const uint8_t *) src0->data;
     float * Y = (float *) dst->data;
