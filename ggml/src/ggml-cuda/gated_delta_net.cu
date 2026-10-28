@@ -122,16 +122,36 @@ gated_delta_net_cuda(const float * q,
         s_shard[r]  = curr_state[i];
     }
 
-    for (int t = 0; t < n_tokens; t++) {
-        const float * q_t = q + iq3 * sq3 + t * sq2 + iq1 * sq1;
-        const float * k_t = k + iq3 * sq3 + t * sq2 + iq1 * sq1;
-        const float * v_t = v + sequence * sv3 + t * sv2 + h_idx * sv1;
+    // t < 0: state_src's prefix tokens, ring slots in order, g and beta scaled by the mask (a token
+    // masked to 0 leaves the state bit-exact); they write no attention output and no slot
+    const int n_prefix = emit_ingredients_t ? state_src.prefix_n : 0;
+    for (int t = -n_prefix; t < n_tokens; t++) {
+        const float * q_t;
+        const float * k_t;
+        const float * v_t;
+        const float * beta_t;
+        const float * g_t;
+        float         w_t = 1.0f;
+        if (t < 0) {
+            const float * slot = state_src.prefix + sequence * state_src.prefix_s1 +
+                (int64_t) (t + n_prefix) * state_src.prefix_ingr_w * H + h_idx * state_src.prefix_ingr_w;
+            q_t    = slot;
+            k_t    = slot;
+            v_t    = slot + S_v;
+            g_t    = slot + 2 * S_v;
+            beta_t = slot + state_src.prefix_off_b;
+            w_t    = state_src.prefix_w[t + n_prefix];
+        } else {
+            q_t = q + iq3 * sq3 + t * sq2 + iq1 * sq1;
+            k_t = k + iq3 * sq3 + t * sq2 + iq1 * sq1;
+            v_t = v + sequence * sv3 + t * sv2 + h_idx * sv1;
 
-        const int64_t gb_offset = sequence * sb3 + t * sb2 + h_idx * sb1;
-        const float * beta_t = beta + gb_offset;
-        const float * g_t    = g    + gb_offset * (KDA ? S_v : 1);
+            const int64_t gb_offset = sequence * sb3 + t * sb2 + h_idx * sb1;
+            beta_t = beta + gb_offset;
+            g_t    = g    + gb_offset * (KDA ? S_v : 1);
+        }
 
-        const float beta_val = *beta_t;
+        const float beta_val = t < 0 ? *beta_t * w_t : *beta_t;
 
         // Cache k and q in registers
         float k_reg[rows_per_lane];
@@ -144,7 +164,7 @@ gated_delta_net_cuda(const float * q,
         }
 
         if constexpr (!KDA) {
-            const float g_val = expf(*g_t);
+            const float g_val = expf(t < 0 ? *g_t * w_t : *g_t);
 
             // kv[col] = (S^T @ k)[col] = sum_i S[i][col] * k[i]
             float kv_shard = 0.0f;
@@ -168,7 +188,7 @@ gated_delta_net_cuda(const float * q,
 
             float attn_col = warp_reduce_sum<warp_size>(attn_partial);
 
-            if (lane == 0) {
+            if (lane == 0 && t >= 0) {
                 attn_data[col] = attn_col * scale;
             }
         } else {
@@ -177,7 +197,7 @@ gated_delta_net_cuda(const float * q,
 #pragma unroll
             for (int r = 0; r < rows_per_lane; r++) {
                 const int i = r * warp_size + lane;
-                kv_shard += expf(g_t[i]) * s_shard[r] * k_reg[r];
+                kv_shard += expf(t < 0 ? g_t[i] * w_t : g_t[i]) * s_shard[r] * k_reg[r];
             }
 
             float kv_col = warp_reduce_sum<warp_size>(kv_shard);
@@ -191,17 +211,20 @@ gated_delta_net_cuda(const float * q,
 #pragma unroll
             for (int r = 0; r < rows_per_lane; r++) {
                 const int i = r * warp_size + lane;
-                s_shard[r]  = expf(g_t[i]) * s_shard[r] + k_reg[r] * delta_col;
+                s_shard[r]  = expf(t < 0 ? g_t[i] * w_t : g_t[i]) * s_shard[r] + k_reg[r] * delta_col;
                 attn_partial += s_shard[r] * q_reg[r];
             }
 
             float attn_col = warp_reduce_sum<warp_size>(attn_partial);
 
-            if (lane == 0) {
+            if (lane == 0 && t >= 0) {
                 attn_data[col] = attn_col * scale;
             }
         }
 
+        if (t < 0) {
+            continue;
+        }
         attn_data += S_v * H;
 
         if constexpr (keep_rs_t) {
@@ -1821,6 +1844,31 @@ static void ggml_cuda_op_gated_delta_net_impl(
         state_type        = cache->type;
         state_slot_stride = cache->slot_stride;
         slot_rows         = cache->slot_rows;
+    }
+
+    // ggml_gated_delta_net_set_prefix: only gated_delta_net_cuda reads the prefix
+    const int n_prefix = ggml_get_op_params_i32(dst, 2);
+    if (n_prefix > 0) {
+        const ggml_tensor * ring = dst->src[6];
+        GGML_ASSERT(emit_ingr && cache == nullptr && ring != nullptr && dst->src[7] != nullptr);
+        GGML_ASSERT(ring->nb[0] == sizeof(float) && ggml_is_contiguous(dst->src[7]));
+        const int pmode = ggml_get_op_params_i32(dst, 3);
+        state_src.prefix        = (const float *) ring->data;
+        state_src.prefix_w      = (const float *) dst->src[7]->data;
+        state_src.prefix_s1     = ring->nb[1] / sizeof(float);
+        state_src.prefix_n      = n_prefix;
+        state_src.prefix_ingr_w = (int) ggml_gated_delta_net_ingr_width(S_v, src_g->ne[0], pmode);
+        state_src.prefix_off_b  = pmode == 1 ? 3 * (int) S_v : 2 * (int) S_v + (int) src_g->ne[0];
+        if (kda) {
+            launch_gated_delta_net<true, true, true, float>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
+                S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale,
+                state_slot_stride, K, slot_rows, ingr_w, ingr_region, state_src, stream);
+        } else {
+            launch_gated_delta_net<false, true, true, float>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
+                S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale,
+                state_slot_stride, K, slot_rows, ingr_w, ingr_region, state_src, stream);
+        }
+        return;
     }
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)

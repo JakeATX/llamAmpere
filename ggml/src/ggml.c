@@ -6911,6 +6911,24 @@ struct ggml_tensor * ggml_gated_delta_net(
     return result;
 }
 
+void ggml_gated_delta_net_set_prefix(
+        struct ggml_tensor * gdn,
+        struct ggml_tensor * ring,
+        struct ggml_tensor * w,
+        int32_t              ring_mode) {
+    GGML_ASSERT(gdn->op == GGML_OP_GATED_DELTA_NET && ggml_get_op_params_i32(gdn, 1) != 0);
+    GGML_ASSERT(ring->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32);
+    GGML_ASSERT(ring->nb[0] == sizeof(float) && ggml_is_contiguous(w));
+    const struct ggml_tensor * v = gdn->src[2];
+    const int64_t P = ggml_nelements(w);
+    GGML_ASSERT(P >= 1 && ring->ne[1] == v->ne[3]);
+    GGML_ASSERT(P * ggml_gated_delta_net_ingr_width(v->ne[0], gdn->src[3]->ne[0], ring_mode) * v->ne[1] <= ring->ne[0]);
+    ggml_set_op_params_i32(gdn, 2, (int32_t) P);
+    ggml_set_op_params_i32(gdn, 3, ring_mode);
+    gdn->src[6] = ring;
+    gdn->src[7] = w;
+}
+
 int64_t ggml_gated_delta_net_ingr_width(int64_t S_v, int64_t g_width, int32_t emit_mode) {
     GGML_ASSERT(emit_mode == 1 || emit_mode == 2);
     return emit_mode == 1 ? 4 * S_v : 2 * S_v + g_width + 1;

@@ -17,6 +17,15 @@ struct ggml_cuda_gated_delta_net_fused_cache {
 struct ggml_cuda_gated_delta_net_state_src {
     const int32_t * rows       = nullptr;
     int64_t         row_stride = 0;
+    // ggml_gated_delta_net_set_prefix: prefix_n masked ring tokens run ahead of the batch (read by
+    // gated_delta_net_cuda only; the op routes a prefixed call there). The ring is one row of
+    // prefix_s1 floats per sequence, slots of prefix_ingr_w floats per head, beta at prefix_off_b.
+    const float *   prefix        = nullptr;
+    const float *   prefix_w      = nullptr;
+    int64_t         prefix_s1     = 0;
+    int             prefix_n      = 0;
+    int             prefix_ingr_w = 0;
+    int             prefix_off_b  = 0;
 };
 
 void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst);

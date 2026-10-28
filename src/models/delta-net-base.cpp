@@ -857,6 +857,7 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     uint32_t      keep_count = 0;       //   are carried over into ring slots [0, keep_count)
     uint32_t      new_first  = 0;       // this ubatch's ingredients land in slots [new_first, new_first + n_new)
     const uint32_t n_new     = std::min(n, K); // the op emits the last min(n, K) tokens
+    bool          replay_fold = false;  // the replay runs as the main call's masked ring prefix
 
     if (replay_static) {
         // rollback-independent form: one graph for every verify round (the branches below
@@ -868,21 +869,31 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         // prefix, or nothing): a token with g = 0 and beta = 0 leaves the state bit-exact
         // (s = expf(0) * s + k * 0), so the result is the logical state either way.
         GGML_ASSERT(inp->rs_old_src == nullptr); // else build_rs gathered s without the pair
-        ggml_tensor * w      = inp->replay_w;
-        ggml_tensor * w_slot = ggml_view_4d(ctx0, w, 1, 1, K, 1, w->nb[0], w->nb[0], w->nb[0] * K, 0);
-        auto comp = [&](int64_t ne0, int64_t off) {
-            return ggml_view_4d(ctx0, ring, ne0, H_v, K, n_seqs,
-                ingr_w * ingr_elemsize, ingr_row * ingr_elemsize, ring->nb[1], (size_t) off * ingr_elemsize);
-        };
-        // k and v stay strided views into the ring (the op reads rows by stride; q only has to
-        // share k's strides and shapes the discarded attention output, so k doubles as q), and
-        // the masking mul writes g and beta out contiguous -- no conts, no q scale.
-        ggml_tensor * k_b = comp(S_v, 0);
-        ggml_tensor * v_b = comp(S_v, S_v);
-        ggml_tensor * g_b = ggml_mul(ctx0, comp(kda ? S_v : 1, ingr_off_g), w_slot);
-        ggml_tensor * b_b = ggml_mul(ctx0, comp(1, ingr_off_b), w_slot);
-        base_state = extract_state_k1(
-            ggml_gated_delta_net(ctx0, k_b, k_b, v_b, g_b, b_b, s, /*K=*/1, /*emit_mode=*/0), (int64_t) K);
+        // n > K (every verify round): the masked slots run inside the main call as a prefix
+        // (ggml_gated_delta_net_set_prefix below), so the base state is never materialized.
+        // n == K needs that base state as the new checkpoint, so it keeps the separate replay.
+        static const bool fold_env = [] {
+            const char * e = getenv("LLAMA_GDN_REPLAY_FOLD"); // =0: separate K=1 replay call (A/B)
+            return e == nullptr || strcmp(e, "0") != 0;
+        }();
+        replay_fold = fold_env && n > K;
+        if (!replay_fold) {
+            ggml_tensor * w      = inp->replay_w;
+            ggml_tensor * w_slot = ggml_view_4d(ctx0, w, 1, 1, K, 1, w->nb[0], w->nb[0], w->nb[0] * K, 0);
+            auto comp = [&](int64_t ne0, int64_t off) {
+                return ggml_view_4d(ctx0, ring, ne0, H_v, K, n_seqs,
+                    ingr_w * ingr_elemsize, ingr_row * ingr_elemsize, ring->nb[1], (size_t) off * ingr_elemsize);
+            };
+            // k and v stay strided views into the ring (the op reads rows by stride; q only has to
+            // share k's strides and shapes the discarded attention output, so k doubles as q), and
+            // the masking mul writes g and beta out contiguous -- no conts, no q scale.
+            ggml_tensor * k_b = comp(S_v, 0);
+            ggml_tensor * v_b = comp(S_v, S_v);
+            ggml_tensor * g_b = ggml_mul(ctx0, comp(kda ? S_v : 1, ingr_off_g), w_slot);
+            ggml_tensor * b_b = ggml_mul(ctx0, comp(1, ingr_off_b), w_slot);
+            base_state = extract_state_k1(
+                ggml_gated_delta_net(ctx0, k_b, k_b, v_b, g_b, b_b, s, /*K=*/1, /*emit_mode=*/0), (int64_t) K);
+        }
         // the checkpoint rows' own bookkeeping (cleared row, extra states of moved cells), without
         // gathering the ubatch's rows: the getter hands back an empty view
         ggml_build_forward_expand(gf, build_rs(inp, ckpt_all, hparams.n_embd_s(), n_seqs,
@@ -923,6 +934,9 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     // main call: emit_mode=1 records ingredients (+ the trailing final-state block, + the
     // before-the-window block when n > K) instead of K full snapshots.
     ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, base_state, K, ingr_mode);
+    if (replay_fold) {
+        ggml_gated_delta_net_set_prefix(gdn_out, ring, inp->replay_w, ingr_mode);
+    }
     if (n_seq_tokens > 1) {
         res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
     } else {

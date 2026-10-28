@@ -2811,6 +2811,18 @@ extern "C" {
             int64_t               K,
             int32_t               emit_mode);
 
+    // emit_mode 1 or 2 only: before its n_tokens, `gdn` runs w->ne[0] prefix tokens read from `ring`,
+    // [n_rows, n_seqs] rows of packed ingredient slots in the layout of emit_mode `ring_mode` (slot j
+    // of seq s at row s, offset j * ingr_width * H, as this op emits them), with g and beta
+    // multiplied by w[j]. A prefix token only advances the state: no attention output, no slot,
+    // and it does not count towards the checkpoint block. w[j] == 0 leaves the state bit-exact,
+    // so a masked ring prefix replays the accepted slots ahead of the batch in the same call.
+    GGML_API void ggml_gated_delta_net_set_prefix(
+            struct ggml_tensor  * gdn,
+            struct ggml_tensor  * ring,
+            struct ggml_tensor  * w,
+            int32_t               ring_mode);
+
     // ggml_gated_delta_net emit_mode 1 and 2: floats per head in one ingredient slot (g_width = g->ne[0])
     GGML_API int64_t ggml_gated_delta_net_ingr_width(int64_t S_v, int64_t g_width, int32_t emit_mode);
 
