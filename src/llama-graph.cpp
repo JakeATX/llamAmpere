@@ -2585,7 +2585,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // n_expert_used columns with the weights of the other bank's experts set to zero
         const moe_hot_bank hot = moe_hot;
         moe_hot = {};
-        GGML_ASSERT(res->get_b1_ffn() == nullptr && "hot expert bank does not support the layer-major prompt path");
+        // [B1] layer-major prompt: the routing phase runs the hot call here (the hot bank is on the card) and records
+        // the cold weights, hot slots zeroed, for the whole-prompt cold GEMMs; their zero-weight rows are skipped.
+        const bool b1_routing = res->get_b1_ffn_phase() == 1 && res->get_b1_ffn() != nullptr;
         GGML_ASSERT(!weight_before_ffn);
 
         // the maps hold one row per expert; look them up with the flattened expert ids
@@ -2619,6 +2621,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
         static const int hot_dbg = getenv("GGML_MOE_HOT_DBG") ? atoi(getenv("GGML_MOE_HOT_DBG")) : 0;
         moe_weights_override = w_hot;
+        moe_b1_bypass = b1_routing;
         ggml_tensor * out_hot = hot_dbg == 1 ?
             build_moe_ffn(cur, gate_inp, nullptr,
                 up_exps, up_exps_b, gate_exps, gate_exps_b, down_exps, down_exps_b, exp_probs_b,
@@ -2628,6 +2631,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 hot.up, nullptr, hot.gate, nullptr, hot.down, nullptr, exp_probs_b,
                 n_expert, n_expert_used, type_op, norm_w, w_scale, gating_op, il,
                 logits, nullptr, nullptr, nullptr, nullptr, nullptr, hot_ids);
+        moe_b1_bypass = false;
         if (hot_dbg == 2) {
             out_hot = ggml_scale(ctx0, out_hot, 0.0f);
             w_cold  = weights;
@@ -2638,13 +2642,17 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 n_expert, n_expert_used, type_op, norm_w, w_scale, gating_op, il,
                 logits, gate_up_exps, gate_up_exps_b, up_exps_s, gate_exps_s, down_exps_s, cold_ids);
         GGML_ASSERT(moe_weights_override == nullptr);
+        if (b1_routing) {
+            GGML_ASSERT(out_cold == nullptr);
+            return out_hot; // added to the shared expert output that seeds the whole-prompt accumulator
+        }
         ggml_tensor * moe_out = ggml_add(ctx0, out_hot, out_cold);
         cb(moe_out, "ffn_moe_out", il);
         return moe_out;
     }
 
     const auto * b1_ffn = res->get_b1_ffn();
-    if (res->get_b1_ffn_phase() == 1 && b1_ffn) {
+    if (res->get_b1_ffn_phase() == 1 && b1_ffn && !moe_b1_bypass) {
         GGML_ASSERT(selected_experts->type == GGML_TYPE_I32 && weights->type == GGML_TYPE_F32);
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, selected_experts, b1_ffn->ids));
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens), b1_ffn->weights));

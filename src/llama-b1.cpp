@@ -1322,6 +1322,8 @@ bool llama_b1::ffn_gather() {
     std::vector<float> weights(ids.size());
     ggml_backend_tensor_get(ffn_all->ids, ids.data(), 0, ids.size() * sizeof(int32_t));
     ggml_backend_tensor_get(ffn_all->weights, weights.data(), 0, weights.size() * sizeof(float));
+    const bool hot_bank = std::any_of(model.layers.begin(), model.layers.end(),
+            [](const llama_layer & layer) { return layer.ffn_exps_hot_map != nullptr; });
     ffn_all->expert_rows.assign(experts, {});
     ffn_all->expert_weights.assign(experts, {});
     for (uint32_t t = 0; t < tokens; ++t) {
@@ -1336,6 +1338,10 @@ bool llama_b1::ffn_gather() {
                 if (ids[(size_t) t * used + j] == e) {
                     return false;
                 }
+            }
+            // a hot-bank expert in the cold bank is routed with weight exactly 0 and adds nothing: skip its GEMM row
+            if (hot_bank && weights[i] == 0.0f) {
+                continue;
             }
             ffn_all->expert_rows[e].push_back((int32_t) t);
             ffn_all->expert_weights[e].push_back(weights[i]);

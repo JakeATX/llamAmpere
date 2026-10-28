@@ -1279,6 +1279,7 @@ struct llm_graph_context {
     };
     mutable moe_hot_bank  moe_hot;
     mutable ggml_tensor * moe_weights_override = nullptr;
+    mutable bool          moe_b1_bypass        = false; // [B1] hot bank call inside the routing phase: compute it now
     mutable ggml_tensor * sj_kvarn_mask_src = nullptr;
     mutable std::vector<ggml_tensor *> sj_kvarn_mask_s;
 
