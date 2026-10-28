@@ -284,12 +284,10 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, flags);
         create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, flags);
 
-        // optional always-resident hot-expert bank: n_hot experts (own tensor type) + the expert -> slot map
-        if (const ggml_tensor * hot_meta = ml.get_tensor_meta(tn(LLM_TENSOR_FFN_DOWN_EXPS_HOT, "weight", il).str().c_str())) {
-            const int64_t n_hot = hot_meta->ne[2];
-            layer.ffn_gate_exps_hot = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS_HOT, "weight", il), { n_embd, n_ff_exp, n_hot }, flags);
-            layer.ffn_up_exps_hot   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS_HOT,   "weight", il), { n_embd, n_ff_exp, n_hot }, flags);
-            layer.ffn_down_exps_hot = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS_HOT, "weight", il), { n_ff_exp, n_embd, n_hot }, flags);
+        // optional always-resident hot-expert bank: the expert -> slot map here; the n_hot experts (own tensor type)
+        // are created by load_hot() after the whole block range, so the bank is one contiguous VRAM range that B1 can
+        // lend as a few large regions instead of one small region per layer
+        if (ml.get_tensor_meta(tn(LLM_TENSOR_FFN_DOWN_EXPS_HOT, "weight", il).str().c_str())) {
             layer.ffn_exps_hot_map  = create_tensor(tn(LLM_TENSOR_FFN_EXPS_HOT_MAP,  "weight", il), { n_expert }, flags);
             layer.ffn_exps_cold_map = create_tensor(tn(LLM_TENSOR_FFN_EXPS_COLD_MAP, "weight", il), { n_expert }, flags | TENSOR_NOT_REQUIRED);
         }
@@ -300,8 +298,22 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         layer.ffn_down_shexp     = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP,     "weight", il), { n_ff_shexp, n_embd }, flags);
     };
 
+    auto load_hot = [&](int il, int flags) {
+        auto & layer = layers[il];
+        const int64_t n_ff_exp = hparams.n_ff_exp() ? hparams.n_ff_exp() : n_ff / n_expert_used;
+        if (const ggml_tensor * hot_meta = ml.get_tensor_meta(tn(LLM_TENSOR_FFN_DOWN_EXPS_HOT, "weight", il).str().c_str())) {
+            const int64_t n_hot = hot_meta->ne[2];
+            layer.ffn_gate_exps_hot = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS_HOT, "weight", il), { n_embd, n_ff_exp, n_hot }, flags);
+            layer.ffn_up_exps_hot   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS_HOT,   "weight", il), { n_embd, n_ff_exp, n_hot }, flags);
+            layer.ffn_down_exps_hot = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS_HOT, "weight", il), { n_ff_exp, n_embd, n_hot }, flags);
+        }
+    };
+
     for (int il = 0; il < n_layer; ++il) {
         load_block(il, trunk_flags);
+    }
+    for (int il = 0; il < n_layer; ++il) {
+        load_hot(il, trunk_flags);
     }
 
     // the MTP block: one full-attention QSA layer fed by [enorm(e) ; hnorm(h)_s] -> eh_proj per hc stream
