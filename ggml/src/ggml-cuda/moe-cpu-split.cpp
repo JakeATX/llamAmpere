@@ -145,7 +145,7 @@ void dot_q2_0_rows(int n, int nrows, const char * w, size_t row_bytes, const blo
     const __m256i shifts = _mm256_set_epi64x(6, 4, 2, 0);
     const __m256i m3 = _mm256_set1_epi8(3);
     const __m256i ones16 = _mm256_set1_epi16(1);
-    constexpr int rows = NT == 1 ? 4 : 2;
+    constexpr int rows = 4 / NT;
     for (int r = 0; r < nrows; r += rows) {
         const int nr = std::min(rows, nrows - r);
         __m256 acc[NT][rows];
@@ -434,6 +434,7 @@ struct pool_state {
     size_t hq_stride = 0;
     bool avx512 = false;       // GGML_MOE_CPU_SPLIT_AVX512 and the CPU has AVX-512 F/BW/VL/VNNI
     bool q2_pair = false;      // Share Q2 down weights between two routes of one expert.
+    bool q2_group4 = false;    // Share Q2 down weights between four routes of one expert.
     bool vector_silu = false;  // Use the CPU backend's vector activation in grouped up/gate tiles.
     bool q2_fast = false;      // GGML_MOE_CPU_SPLIT_Q2_FAST: reordered hidden rows + dot_q2_0_rows for Q2_0 down
     size_t aux_stride = 0;     // floats per route in hq_aux: n/32 block scales, then n/64 offsets
@@ -594,7 +595,11 @@ void run_item(pool_state & s, int phase, int item) {
             if (!w) { for (int64_t row = r0; row < r1; ++row) { o[row - r0] = 0.0f; } ++q; continue; }
             const float * aux = s.hq_aux.data() + (size_t) q * s.aux_stride;
             const auto * y = (const block_q8_0 *) (s.hq.data() + (size_t) q * s.hq_stride);
-            if (s.q2_pair && q + 1 < s.first[i + 1]) {
+            if (s.q2_group4 && q + 3 < s.first[i + 1]) {
+                dot_q2_0_rows<4>((int) down.r.n_in, (int) (r1 - r0), w, down.r.row_bytes, y, s.hq_stride,
+                        aux, aux + down.r.n_in / QK8_0, s.aux_stride, o, s.out_stride);
+                q += 4;
+            } else if (s.q2_pair && q + 1 < s.first[i + 1]) {
                 dot_q2_0_rows<2>((int) down.r.n_in, (int) (r1 - r0), w, down.r.row_bytes, y, s.hq_stride,
                         aux, aux + down.r.n_in / QK8_0, s.aux_stride, o, s.out_stride);
                 q += 2;
@@ -889,6 +894,7 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
     s.hidden.assign((size_t) MOE_CS_MAX_ROUTES * max_ff, 0.0f);
     s.hq.assign(MOE_CS_MAX_ROUTES * s.hq_stride, 0);
     s.q2_pair = env_int("GGML_MOE_CPU_SPLIT_Q2_PAIR", 0, 0, 1) != 0;
+    s.q2_group4 = env_int("GGML_MOE_CPU_SPLIT_Q2_GROUP4", 0, 0, 1) != 0;
     s.vector_silu = env_int("GGML_MOE_CPU_SPLIT_VECTOR_SILU", 0, 0, 1) != 0;
     s.q2_fast = env_int("GGML_MOE_CPU_SPLIT_Q2_FAST", 0, 0, 1) != 0;
     s.q8_reuse = env_int("GGML_MOE_CPU_SPLIT_Q8_REUSE", 1, 0, 1) != 0;
@@ -1002,6 +1008,7 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
             s.threads, pin ? "pinned to cpus " : "unpinned", where.c_str(), skipped.c_str(), s.spin_us, s.nap_us, s.rows_ug, s.rows_down,
             s.q2_fast ? ", Q2_0 down fast path" : "", smt ? ", SMT siblings" : "", s.avx512 ? ", grouped AVX-512 VNNI IQ" : "");
     if (s.q2_pair && s.q2_fast) { fprintf(stderr, "[moe-cpu-split] Q2_0 down shares weights across route pairs\n"); }
+    if (s.q2_group4 && s.q2_fast) { fprintf(stderr, "[moe-cpu-split] Q2_0 down shares weights across four-route groups\n"); }
     if (s.vector_silu && s.iq_rows) { fprintf(stderr, "[moe-cpu-split] grouped up/gate uses CPU vector SiLU\n"); }
     if (s.iq_rows) { fprintf(stderr, "[moe-cpu-split] IQ up/gate row kernels (each chunk decoded once per expert), variant %d, prefetch %d B\n", s.iq_variant, s.iq_pf); }
     if (s.schedule) { fprintf(stderr, "[moe-cpu-split] static quantization rows, grouped math claims\n"); }
