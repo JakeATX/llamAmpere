@@ -112,7 +112,7 @@ static common_sampler_pq_result verify_pq_reference(const llama_token_data_array
 static void test_verifier_identity() {
     std::mt19937 inputs(90817);
     size_t checked = 0;
-    for (int support : {1, 3, 20, 40, 64, 65, 129}) {
+    for (int support : {1, 3, 4, 5, 20, 40, 64, 65, 129}) {
         for (int shape = 0; shape < 3; ++shape) {
             std::vector<llama_token_data> p, q;
             double ps = 0.0, qs = 0.0;
