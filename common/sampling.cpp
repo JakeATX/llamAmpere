@@ -1399,9 +1399,9 @@ std::vector<double> common_sampler_pq_mode_distribution(const llama_token_data_a
     return law;
 }
 
-static common_sampler_pq_result common_sampler_verify_pq_impl(const llama_token_data_array & p, const std::vector<llama_token_data> & q,
+common_sampler_pq_result common_sampler_verify_pq(const llama_token_data_array & p, const std::vector<llama_token_data> & q,
         llama_token d, llama_token x, std::mt19937 & rng, bool beat, common_sampler_pq_stats & stats,
-        const llama_vocab * vocab, const std::function<bool(llama_token)> & is_stop, double * q_aligned) {
+        const llama_vocab * vocab, const std::function<bool(llama_token)> & is_stop) {
     auto q_of = [&](llama_token id) -> double {
         for (const auto & c : q) {
             if (c.id == id) {
@@ -1410,6 +1410,12 @@ static common_sampler_pq_result common_sampler_verify_pq_impl(const llama_token_
         }
         return 0.0;
     };
+    // Reuse draft probabilities after rejection without changing the residual sum order.
+    constexpr size_t n_local = 64;
+    double q_local[n_local];
+    std::vector<double> q_heap;
+    if (p.size > n_local) { q_heap.resize(p.size); }
+    double * q_aligned = p.size > n_local ? q_heap.data() : q_local;
     double p_d = 0.0, q_d = 0.0, sum_min = 0.0;
     for (size_t k = 0; k < p.size; ++k) {
         const auto & c = p.data[k];
@@ -1484,18 +1490,6 @@ static common_sampler_pq_result common_sampler_verify_pq_impl(const llama_token_
         stats.n_rej++;
     }
     return res;
-}
-
-common_sampler_pq_result common_sampler_verify_pq(const llama_token_data_array & p, const std::vector<llama_token_data> & q,
-        llama_token d, llama_token x, std::mt19937 & rng, bool beat, common_sampler_pq_stats & stats,
-        const llama_vocab * vocab, const std::function<bool(llama_token)> & is_stop) {
-    constexpr size_t n_local = 64;
-    if (p.size <= n_local) {
-        double q_local[n_local];
-        return common_sampler_verify_pq_impl(p, q, d, x, rng, beat, stats, vocab, is_stop, q_local);
-    }
-    std::vector<double> q_heap(p.size);
-    return common_sampler_verify_pq_impl(p, q, d, x, rng, beat, stats, vocab, is_stop, q_heap.data());
 }
 
 std::vector<llama_token> common_sampler_sample_and_accept_n_pq(struct common_sampler * gsmpl, struct llama_context * ctx,
