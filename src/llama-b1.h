@@ -215,6 +215,10 @@ private:
     // to the copy stream (no memcpy into a staging buffer, no staging event wait); direct_piece caps those pieces
     bool   direct       = false;
     size_t direct_piece = 64u << 20;
+    // fork AIPNEXTK: LLAMA_B1_BANK_STAGE=1 gathers an arena piece that touches dropped bank-expert bytes into the
+    // worker's pinned staging block (zeros for the dropped bytes) and uploads it with one copy; such pieces then span
+    // experts up to piece_bytes instead of one copy (plus one memset per hole) per expert under the stream lock
+    bool   bank_stage   = false;
     std::vector<std::vector<staging>> stg; // [worker][2]
     ggml_backend_buffer_t zero_buf = nullptr;
     char * zero_data = nullptr;

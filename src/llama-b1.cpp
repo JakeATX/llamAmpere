@@ -230,7 +230,10 @@ llama_b1::llama_b1(const llama_model & model, ggml_backend_t backend_gpu) : mode
         for (const auto & e : exps) {
             largest_role = std::max(largest_role, e.t->nb[1] * e.t->ne[1]);
         }
-        piece_bytes = std::min(piece_bytes, largest_role);
+        bank_stage   = b1_env_int("LLAMA_B1_BANK_STAGE", 0) != 0;
+        if (!bank_stage) {
+            piece_bytes = std::min(piece_bytes, largest_role);
+        }
         direct       = b1_env_int("LLAMA_B1_DIRECT", 0) != 0;
         direct_piece = (size_t) std::clamp<int64_t>(b1_env_int("LLAMA_B1_DIRECT_PIECE_MIB", 64), 1, 1024) << 20;
     }
@@ -1013,7 +1016,7 @@ void llama_b1::push_tensor_pieces(std::vector<piece> & ps, const exps_tensor & e
     // Bulk hole uploads already split cold spans from zero-filled bank bytes in resident_copy.
     // Let them span experts to avoid one worker/registry/stream-lock round trip per expert.
     // Permanent GPU spans still need expert boundaries for resident_lookup; strided sources do too.
-    const bool bulk_holes = n_holes > 0 && b1_env_int("GGML_MOE_BANK_HOLES_BULK", 0) == 1;
+    const bool bulk_holes = n_holes > 0 && (bank_stage || b1_env_int("GGML_MOE_BANK_HOLES_BULK", 0) == 1);
     const bool permanent = !from_file && (ggml_moe_cache_has_residents() || (n_holes > 0 && !bulk_holes));
     for (size_t off = 0; off < e.nbytes;) {
         piece p;
@@ -1026,7 +1029,7 @@ void llama_b1::push_tensor_pieces(std::vector<piece> & ps, const exps_tensor & e
         p.src_offs = e.src.offs + off;
         p.dst      = dst;
         p.dst_offs = dst_offs + off;
-        p.len      = std::min(direct && !from_file ? direct_piece : piece_bytes, e.nbytes - off);
+        p.len      = std::min(direct && !from_file && !bulk_holes ? direct_piece : piece_bytes, e.nbytes - off);
         if (strided || permanent) { p.len = std::min(p.len, expert_bytes - off % expert_bytes); }
         ps.push_back(p);
         off += p.len;
@@ -1110,6 +1113,33 @@ void llama_b1::coordinator() {
     }
 }
 
+static const ggml_moe_bank_hole * b1_first_hole(uintptr_t begin, const ggml_moe_bank_hole ** end) {
+    size_t n = 0;
+    const ggml_moe_bank_hole * holes = ggml_moe_bank_holes(&n);
+    *end = holes ? holes + n : nullptr;
+    return holes ? std::lower_bound(holes, holes + n, begin,
+            [](const ggml_moe_bank_hole & h, uintptr_t v) { return h.end <= v; }) : nullptr;
+}
+
+static bool b1_touches_holes(const char * src, size_t len) {
+    const ggml_moe_bank_hole * end = nullptr;
+    const ggml_moe_bank_hole * it = b1_first_hole((uintptr_t) src, &end);
+    return it && it != end && it->begin < (uintptr_t) src + len;
+}
+
+static void b1_gather_holes(char * dst, const char * src, size_t len) {
+    const uintptr_t begin = (uintptr_t) src, last = begin + len;
+    const ggml_moe_bank_hole * end = nullptr;
+    uintptr_t cursor = begin;
+    for (const ggml_moe_bank_hole * it = b1_first_hole(begin, &end); it && it != end && it->begin < last; ++it) {
+        const uintptr_t first = std::max(begin, it->begin), stop = std::min(last, it->end);
+        if (cursor < first) { memcpy(dst + (cursor - begin), (const void *) cursor, first - cursor); }
+        memset(dst + (first - begin), 0, stop - first);
+        cursor = stop;
+    }
+    if (cursor < last) { memcpy(dst + (cursor - begin), (const void *) cursor, last - cursor); }
+}
+
 void llama_b1::worker(int w) {
     int b = 0;
     while (true) {
@@ -1121,6 +1151,26 @@ void llama_b1::worker(int w) {
                 return;
             }
             p = queue[queue_head++];
+        }
+
+        if (p.src_host && bank_stage && p.len <= piece_bytes && b1_touches_holes(p.src_host, p.len)) {
+            auto & s = stg[w][b];
+            b ^= 1;
+            if (s.used) {
+                ggml_backend_event_synchronize(s.ev);
+            }
+            // read only the kept bytes (dropped ranges were released) and zero the rest, outside the stream lock
+            b1_gather_holes(s.data, p.src_host, p.len);
+            {
+                std::lock_guard<std::mutex> ls(mtx_stream);
+                ggml_backend_tensor_set_async(backend_copy, p.dst->raw, s.data, p.dst_offs, p.len);
+                ggml_backend_event_record(s.ev, backend_copy);
+                s.used = true;
+            }
+            std::lock_guard<std::mutex> lk(mtx);
+            st.bytes_h2d += p.len;
+            if (--pieces_left == 0) { cv.notify_all(); }
+            continue;
         }
 
         if (p.src_host) {
