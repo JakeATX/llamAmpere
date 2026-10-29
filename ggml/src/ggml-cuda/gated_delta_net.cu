@@ -381,6 +381,25 @@ gated_delta_net_cuda_ilp(const float * q,
 
     float s_shard[NC][rows_per_lane];
 
+    auto reduce_cols = [](float (&values)[NC]) {
+        if constexpr (emit_ingredients_t) {
+            // Interleave independent columns at each butterfly stage. Each column
+            // keeps exactly the original operand pairs and addition order.
+#pragma unroll
+            for (int offset = warp_size / 2; offset > 0; offset >>= 1) {
+#pragma unroll
+                for (int c = 0; c < NC; c++) {
+                    values[c] += __shfl_xor_sync(0xffffffff, values[c], offset, warp_size);
+                }
+            }
+        } else {
+#pragma unroll
+            for (int c = 0; c < NC; c++) {
+                values[c] = warp_reduce_sum<warp_size>(values[c]);
+            }
+        }
+    };
+
     ggml_cuda_pdl_sync();
     // [#87] see gated_delta_net_cuda: cache row rows[sequence], or src[5] at sequence * D
     curr_state += (state_src.rows != nullptr
@@ -501,16 +520,12 @@ gated_delta_net_cuda_ilp(const float * q,
                 kv_shard[c] += s_shard[c][r] * k_reg[r];
             }
         }
-        float kv_col[NC];
-#pragma unroll
-        for (int c = 0; c < NC; c++) {
-            kv_col[c] = warp_reduce_sum<warp_size>(kv_shard[c]);
-        }
+        reduce_cols(kv_shard);
 
         float attn_partial[NC];
 #pragma unroll
         for (int c = 0; c < NC; c++) {
-            const float delta_col = (v_reg[c] - g_val * kv_col[c]) * beta_val;
+            const float delta_col = (v_reg[c] - g_val * kv_shard[c]) * beta_val;
             attn_partial[c] = 0.0f;
 #pragma unroll
             for (int r = 0; r < rows_per_lane; r++) {
@@ -524,16 +539,12 @@ gated_delta_net_cuda_ilp(const float * q,
             advance_tok();
             continue;
         }
-        float attn_col[NC];
-#pragma unroll
-        for (int c = 0; c < NC; c++) {
-            attn_col[c] = warp_reduce_sum<warp_size>(attn_partial[c]);
-        }
+        reduce_cols(attn_partial);
 
         if (lane == 0) {
 #pragma unroll
             for (int c = 0; c < NC; c++) {
-                attn_data[col0 + c] = attn_col[c] * scale;
+                attn_data[col0 + c] = attn_partial[c] * scale;
             }
         }
 
