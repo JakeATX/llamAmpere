@@ -236,33 +236,47 @@ static __global__ void mul_mat_vec_q_kqrows(
         }
     }
 
-    // the MMVQ kernel's reduction: warps 1.. park their partials, warp 0 adds them in warp order, then a warp sum
-    __shared__ float tmp_shared[nwarps-1 > 0 ? nwarps-1 : 1][ncols_dst][rows][WARP_SIZE];
-    if (threadIdx.y > 0) {
+    // the MMVQ kernel's reduction: warps 1.. park their partials, warp 0 adds them in warp order, then a warp sum.
+    // At nwarps=8, rows=8, ncols_dst=7..8, staging all columns at once exceeds the 48 KiB static shared-memory cap
+    // (7*8*8*32*4 = 56 KiB), so stage at most shmem_cols columns per barrier pass.
+    constexpr int shmem_cols = ((nwarps - 1) * ncols_dst * rows * WARP_SIZE * (int) sizeof(float) > 48 * 1024) ? 4 : ncols_dst;
+    __shared__ float tmp_shared[nwarps-1 > 0 ? nwarps-1 : 1][shmem_cols][rows][WARP_SIZE];
 #pragma unroll
-        for (int j = 0; j < ncols_dst; ++j) {
+    for (int j0 = 0; j0 < ncols_dst; j0 += shmem_cols) {
+        if (j0 > 0) {
+            __syncthreads();
+        }
+        if (threadIdx.y > 0) {
 #pragma unroll
-            for (int i = 0; i < rows; ++i) {
-                tmp_shared[threadIdx.y-1][j][i][threadIdx.x] = tmp[j][i];
+            for (int j = 0; j < shmem_cols; ++j) {
+                if (j0 + j < ncols_dst) {
+#pragma unroll
+                    for (int i = 0; i < rows; ++i) {
+                        tmp_shared[threadIdx.y-1][j][i][threadIdx.x] = tmp[j0 + j][i];
+                    }
+                }
             }
         }
-    }
-    __syncthreads();
-    if (threadIdx.y > 0) {
-        return;
-    }
-
+        __syncthreads();
+        if (j0 + shmem_cols >= ncols_dst && threadIdx.y > 0) {
+            return;
+        }
+        if (threadIdx.y == 0) {
 #pragma unroll
-    for (int j = 0; j < ncols_dst; ++j) {
+            for (int j = 0; j < shmem_cols; ++j) {
+                if (j0 + j < ncols_dst) {
 #pragma unroll
-        for (int i = 0; i < rows; ++i) {
+                    for (int i = 0; i < rows; ++i) {
 #pragma unroll
-            for (int l = 0; l < nwarps-1; ++l) {
-                tmp[j][i] += tmp_shared[l][j][i][threadIdx.x];
-            }
-            tmp[j][i] = warp_reduce_sum<WARP_SIZE>(tmp[j][i]);
-            if (threadIdx.x == i && row0 + i < nrows_x) {
-                dst[j*stride_col_dst + row0 + i] = tmp[j][i];
+                        for (int l = 0; l < nwarps-1; ++l) {
+                            tmp[j0 + j][i] += tmp_shared[l][j][i][threadIdx.x];
+                        }
+                        tmp[j0 + j][i] = warp_reduce_sum<WARP_SIZE>(tmp[j0 + j][i]);
+                        if (threadIdx.x == i && row0 + i < nrows_x) {
+                            dst[(j0 + j)*stride_col_dst + row0 + i] = tmp[j0 + j][i];
+                        }
+                    }
+                }
             }
         }
     }
