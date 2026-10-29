@@ -6893,6 +6893,9 @@ static bool run_skip_tail_layer(ggml_backend_t gpu, ggml_backend_t cpu, log_capt
                             for (int j = 0; j < k_used; ++j) {
                                 const float want = drops[t * k_used + j] ? 0.0f : shares[j] * (renorm && changed ? total / kept : 1.0f);
                                 ok &= std::fabs(actual_weights[t * k_used + j] - want) < 1e-6f;
+                                if (!renorm || !changed || drops[t * k_used + j]) {
+                                    ok &= memcmp(&actual_weights[t * k_used + j], &want, sizeof(float)) == 0;
+                                }
                                 for (int q = 0; q < dim; ++q) {
                                     const size_t index = ((size_t) t * k_used + j) * dim + q;
                                     const float ref = exact[index] * want;

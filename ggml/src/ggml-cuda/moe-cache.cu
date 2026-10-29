@@ -9683,6 +9683,8 @@ static __global__ void moe_mass_kernel(const float * weights, float * out_weight
         moe_mass_record * trace, unsigned * trace_counts) {
     __shared__ unsigned char drop[80], hot[80];
     __shared__ int expert[80];
+    __shared__ float scale[8];
+    __shared__ bool rescale[8];
     const int tid = threadIdx.x;
     const int routes = width * 10;
     for (int i = tid; i < routes; i += blockDim.x) {
@@ -9709,18 +9711,23 @@ static __global__ void moe_mass_kernel(const float * weights, float * out_weight
     }
     for (int token = tid; token < width; token += blockDim.x) {
         if (mode) { ggml_moe_skipmass_select(weights + 10 * token, hot + 10 * token, 10, mode, threshold, drop + 10 * token); }
-        float total = 0.0f, kept = 0.0f;
-        bool changed = false;
-        for (int j = 0; j < 10; ++j) {
-            const int i = 10 * token + j;
-            total += weights[i]; kept += drop[i] ? 0.0f : weights[i]; changed |= drop[i] != 0;
-        }
-        for (int j = 0; j < 10; ++j) {
-            const int i = 10 * token + j;
-            out_weights[i] = drop[i] ? 0.0f : (renorm && changed && kept > 0.0f ? weights[i] * (total / kept) : weights[i]);
+        rescale[token] = false;
+        if (mode && renorm) {
+            float total = 0.0f, kept = 0.0f;
+            bool changed = false;
+            for (int j = 0; j < 10; ++j) {
+                const int i = 10 * token + j;
+                total += weights[i]; kept += drop[i] ? 0.0f : weights[i]; changed |= drop[i] != 0;
+            }
+            rescale[token] = changed && kept > 0.0f;
+            if (rescale[token]) { scale[token] = total / kept; }
         }
     }
     __syncthreads();
+    // fork: all routes can write after the per-token drop decisions are visible.
+    for (int i = tid; i < routes; i += blockDim.x) {
+        out_weights[i] = drop[i] ? 0.0f : (rescale[i / 10] ? weights[i] * scale[i / 10] : weights[i]);
+    }
     if (!mode) { return; }
     for (int e = tid; e < experts; e += blockDim.x) {
         unsigned long long rows = 0;
