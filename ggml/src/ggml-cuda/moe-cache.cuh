@@ -37,6 +37,35 @@ static inline bool ggml_cuda_moe_cache_host_merge(uintptr_t begin, uintptr_t end
 #include <utility>
 #include <vector>
 
+struct ggml_cuda_moe_pool_limit {
+    uint64_t type;
+    size_t expert_bytes;
+    size_t slots;
+};
+
+// fork: MOEPOOL1 stores little-endian (type, expert_bytes, slots) rows for every pool.
+static inline bool ggml_cuda_moe_cache_pool_plan(const uint8_t * data, size_t bytes,
+        const std::vector<ggml_cuda_moe_pool_limit> & pools, size_t minimum, std::vector<size_t> & caps) {
+    if (!data || pools.empty() || pools.size() > 4096 || !minimum || bytes != 16 + 24 * pools.size()) { return false; }
+    auto u64 = [&](size_t offset) {
+        uint64_t value = 0;
+        for (int i = 0; i < 8; ++i) { value |= (uint64_t)data[offset + i] << (8 * i); }
+        return value;
+    };
+    if (u64(0) != UINT64_C(0x314c4f4f50454f4d) || u64(8) != pools.size()) { return false; }
+    std::vector<size_t> limits(pools.size(), 0);
+    for (size_t i = 0; i < pools.size(); ++i) {
+        const uint64_t type = u64(16 + 24 * i), size = u64(24 + 24 * i), slots = u64(32 + 24 * i);
+        size_t p = 0;
+        while (p < pools.size() && (pools[p].type != type || pools[p].expert_bytes != size)) { ++p; }
+        if (p == pools.size() || limits[p] || !size || slots < minimum || slots > pools[p].slots ||
+                slots > SIZE_MAX / size) { return false; }
+        limits[p] = (size_t)slots;
+    }
+    caps = std::move(limits);
+    return true;
+}
+
 // fork: ranked-pair data has no model-weight signature; validate its shape and unique pairs.
 static inline bool ggml_cuda_moe_cache_ranked_profile(const uint8_t * data, size_t bytes,
         size_t layers, size_t experts, std::vector<std::vector<uint64_t>> & output) {

@@ -437,6 +437,7 @@ struct moe_cache_shape {
     int64_t n_tensors = 0;
     int pool = -1;
     bool finished = false;
+    size_t pool_plan_slots = SIZE_MAX;
 };
 
 // fork: loaded profile ownership is independent of temporary warm count buffers.
@@ -2495,7 +2496,7 @@ static bool moe_cache_allocate_pool(
     if (stride_blocks == 0) {
         return false;
     }
-    slot_count = std::min(slot_count, (size_t)INT_MAX / stride_blocks);
+    slot_count = std::min({slot_count, shape.pool_plan_slots, (size_t)INT_MAX / stride_blocks});
     if (slot_count > INT_MAX) {
         slot_count = INT_MAX;
     }
@@ -2624,6 +2625,23 @@ static bool moe_cache_build_global_profile(moe_cache_session & session, moe_cach
         if (!stride) { return false; }
         caps.push_back(std::min<size_t>((size_t)std::min<uint64_t>(shape->n_entries, INT_MAX), INT_MAX / stride));
     }
+    // fork: constrain the existing whole-expert planner; never raise its live memory budget.
+    const char * pool_plan = getenv("GGML_MOE_CACHE_POOL_PLAN");
+    if (pool_plan && *pool_plan) {
+        if (pending.size() > 4096) { GGML_ABORT("too many expert pools for pool plan"); }
+        std::vector<ggml_cuda_moe_pool_limit> pools;
+        for (size_t p = 0; p < pending.size(); ++p) {
+            pools.push_back({(uint64_t)pending[p]->wtype, pending[p]->expert_size, caps[p]});
+        }
+        std::unique_ptr<FILE, int (*)(FILE *)> file(fopen(pool_plan, "rb"), fclose);
+        std::vector<uint8_t> data(16 + 24 * pending.size());
+        if (!file || fread(data.data(), 1, data.size(), file.get()) != data.size() || fgetc(file.get()) != EOF ||
+                ferror(file.get()) || !ggml_cuda_moe_cache_pool_plan(data.data(), data.size(), pools, moe_cache_pool_slots_min, caps)) {
+            GGML_ABORT("invalid expert pool plan: %s", pool_plan);
+        }
+        MOE_CACHE_LOG("[moe-cache] CUDA%d pool plan loaded: %s pools=%zu\n", device.physical, pool_plan, caps.size());
+        for (size_t p = 0; p < pending.size(); ++p) { pending[p]->pool_plan_slots = caps[p]; }
+    }
     std::vector<ggml_cuda_moe_profile_item> items;
     std::vector<moe_cache_key> keys;
     size_t group = 0, previous_tensor = SIZE_MAX;
@@ -2673,6 +2691,21 @@ static bool moe_cache_build_global_profile(moe_cache_session & session, moe_cach
         device.profile_global_slots = plan.slots;
         device.profile_global_bytes = plan.bytes;
     };
+    // fork: an unchanged capacity needs new ranks, not a destructive slab rebuild.
+    if (whole_only && resize) {
+        bool same_capacity = true;
+        for (size_t p = 0; p < pending.size(); ++p) {
+            const int pool = pending[p]->pool;
+            same_capacity = same_capacity && pool >= 0 && (size_t)pool < device.pools.size() &&
+                (size_t)device.pools[pool]->n_slots == plan.slots[p];
+        }
+        if (same_capacity) {
+            publish_plan();
+            MOE_CACHE_LOG("[moe-cache] CUDA%d whole-only plan reused: bundles=%zu slices=%zu actual_pool_bytes=%zu\n",
+                    device.physical, plan.bundles, device.profile_global_selected.size(), device.allocated_bytes);
+            return true;
+        }
+    }
     if (whole_only) {
         device.profile_global_ranks.clear();
         device.profile_global_selected.clear();
@@ -2738,7 +2771,18 @@ static bool moe_cache_build_global_profile(moe_cache_session & session, moe_cach
                 const size_t other = device.allocated_bytes >= current ? device.allocated_bytes - current : 0;
                 const size_t room = other < budget ? budget - other : 0;
                 const size_t target = std::min(plan.slots[p], room / pool.expert_size);
-                if (target >= moe_cache_pool_slots_min) { moe_cache_resize_pool(device, pool, (int)target); }
+                if (target >= moe_cache_pool_slots_min) {
+                    // A rejected growth trims by payload bytes, but cudaMalloc pads in whole
+                    // chunks, so one retry can land far below the established pool. Step the
+                    // target down (never under the slots held before growth) instead.
+                    const int held = pool.n_slots;
+                    int want = (int)target;
+                    for (;;) {
+                        moe_cache_resize_pool(device, pool, want);
+                        if (pool.n_slots >= want || want <= held) { break; }
+                        want = std::max(held, want - std::max(1, want / 16));
+                    }
+                }
             }
         } else {
             moe_cache_allocate_pool(session, device, *pending[p], requested);
@@ -2752,7 +2796,7 @@ static bool moe_cache_build_global_profile(moe_cache_session & session, moe_cach
     if (whole_only) {
         for (size_t p = 0; p < pending.size(); ++p) {
             const int pool = pending[p]->pool;
-            caps[p] = pool >= 0 ? (size_t)device.pools[pool]->n_slots : 0;
+            caps[p] = pool >= 0 ? std::min(caps[p], (size_t)device.pools[pool]->n_slots) : 0;
         }
         if (!ggml_cuda_moe_cache_profile_plan(items, caps, budget, moe_cache_pool_slots_min,
                 plan, density, (size_t)ranked_limit)) {
@@ -2858,6 +2902,8 @@ static void moe_cache_build_pending(
     if (moe_cache_build_global_profile(session, device, pending, plan_budget)) {
         return;
     }
+    const char * pool_plan = getenv("GGML_MOE_CACHE_POOL_PLAN");
+    if (pool_plan && *pool_plan) { GGML_ABORT("expert pool plan requires a complete global profile plan"); }
     if (!session.profile_global_tensors.empty()) {
         MOE_CACHE_LOG("[moe-cache] CUDA%d global profile plan unavailable: tensors=%zu seen=%zu pending_shapes=%zu budget=%zu; fallback=fixed-pool-shares\n",
                 device.physical, session.profile_global_tensors.size(), device.seen_tensors.size(), pending.size(), remaining);
@@ -5359,6 +5405,12 @@ static bool moe_cache_profile_rerank(moe_cache_session & session,
 
 // Contiguous slabs cannot shrink in place. Recopy retained exact weights after freeing the old slab.
 static bool moe_cache_resize_pool(moe_cache_device & device, moe_cache_pool & pool, int slots) {
+    for (const auto & shape : device.shapes) {
+        if (shape.expert_size == pool.expert_size && shape.wtype == pool.wtype) {
+            slots = (int)std::min((size_t)slots, shape.pool_plan_slots);
+            break;
+        }
+    }
     if (slots == pool.n_slots) {
         return true;
     }
@@ -5635,7 +5687,7 @@ static size_t moe_cache_return(void * opaque) {
             const long double weight = (long double)shape.expert_size * shape.n_tensors;
             const size_t share = weights > 0 ? (size_t)((long double)remaining * weight / weights) : 0;
             const size_t blocks = pool.expert_size / ggml_type_size((ggml_type)pool.wtype);
-            const size_t max_slots = std::min<uint64_t>(shape.n_entries, INT_MAX / blocks);
+            const size_t max_slots = (size_t)std::min<uint64_t>(shape.n_entries, INT_MAX / blocks);
             const size_t target = std::min(max_slots, (size_t)pool.n_slots + share / pool.expert_size);
             const size_t before = (size_t)pool.n_slots * pool.expert_size;
             if (target > (size_t)pool.n_slots) {
@@ -5755,7 +5807,7 @@ static int moe_cache_warm(void * opaque, const ggml_moe_cache_tensor_desc * tens
         std::lock_guard<std::mutex> lock(session->mu);
         // A first live-count warm has no saved profile to load. Plan complete bundles
         // from its descriptors too, but preserve an already loaded profile's ranks.
-        if (loading || session->profile_global_tensors.empty()) {
+        if (loading || session->profile_global_tensors.empty() || (observed && session->profile_counts.empty())) {
             session->profile_global_tensors.clear();
             session->profile_global_tensors.reserve(n_tensors);
             for (int i = 0; i < n_tensors; ++i) {
@@ -5874,7 +5926,9 @@ static int moe_cache_warm(void * opaque, const ggml_moe_cache_tensor_desc * tens
             if (global_profile) {
                 if (whole_only && !selected.count(key)) { continue; }
                 const auto prior = session->profile_counts.find(key);
-                ranked.push_back({i, e, prior == session->profile_counts.end() ? 0 : prior->second, true, 0, false});
+                const uint64_t heat = session->profile_counts.empty() ? counts[i][e] :
+                    prior == session->profile_counts.end() ? 0 : prior->second;
+                ranked.push_back({i, e, heat, true, 0, false});
                 continue;
             }
             int layer = 0;
