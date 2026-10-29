@@ -431,6 +431,7 @@ struct moe_cache_shape {
     int64_t n_tensors = 0;
     int pool = -1;
     bool finished = false;
+    size_t pool_plan_slots = SIZE_MAX;
 };
 
 // fork: loaded profile ownership is independent of temporary warm count buffers.
@@ -2628,6 +2629,7 @@ static bool moe_cache_build_global_profile(moe_cache_session & session, moe_cach
             GGML_ABORT("invalid expert pool plan: %s", pool_plan);
         }
         MOE_CACHE_LOG("[moe-cache] CUDA%d pool plan loaded: %s pools=%zu\n", device.physical, pool_plan, caps.size());
+        for (size_t p = 0; p < pending.size(); ++p) { pending[p]->pool_plan_slots = caps[p]; }
     }
     std::vector<ggml_cuda_moe_profile_item> items;
     std::vector<moe_cache_key> keys;
@@ -2863,6 +2865,8 @@ static void moe_cache_build_pending(
     if (moe_cache_build_global_profile(session, device, pending, plan_budget)) {
         return;
     }
+    const char * pool_plan = getenv("GGML_MOE_CACHE_POOL_PLAN");
+    if (pool_plan && *pool_plan) { GGML_ABORT("expert pool plan requires a complete global profile plan"); }
     if (!session.profile_global_tensors.empty()) {
         MOE_CACHE_LOG("[moe-cache] CUDA%d global profile plan unavailable: tensors=%zu seen=%zu pending_shapes=%zu budget=%zu; fallback=fixed-pool-shares\n",
                 device.physical, session.profile_global_tensors.size(), device.seen_tensors.size(), pending.size(), remaining);
@@ -5616,7 +5620,7 @@ static size_t moe_cache_return(void * opaque) {
             const long double weight = (long double)shape.expert_size * shape.n_tensors;
             const size_t share = weights > 0 ? (size_t)((long double)remaining * weight / weights) : 0;
             const size_t blocks = pool.expert_size / ggml_type_size((ggml_type)pool.wtype);
-            const size_t max_slots = std::min<uint64_t>(shape.n_entries, INT_MAX / blocks);
+            const size_t max_slots = std::min(shape.pool_plan_slots, (size_t)std::min<uint64_t>(shape.n_entries, INT_MAX / blocks));
             const size_t target = std::min(max_slots, (size_t)pool.n_slots + share / pool.expert_size);
             const size_t before = (size_t)pool.n_slots * pool.expert_size;
             if (target > (size_t)pool.n_slots) {

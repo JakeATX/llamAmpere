@@ -3893,6 +3893,51 @@ static bool run_profile_whole_return(ggml_backend_t gpu, ggml_backend_t cpu,
         transition_ok &= log.find("whole-only warm refused:") == std::string::npos;
     }
     if (reader) { api.session_destroy(reader); }
+    const char * old_pool = getenv("GGML_MOE_CACHE_POOL_PLAN");
+    const bool had_pool = old_pool != nullptr;
+    const std::string saved_pool = old_pool ? old_pool : "";
+    const std::string pool_path = path + ".pool";
+    std::vector<uint8_t> pool_data;
+    for (uint64_t value : {UINT64_C(0x314c4f4f50454f4d), UINT64_C(2), (uint64_t)types[0],
+            (uint64_t)whole_desc[0].expert_size, UINT64_C(128), (uint64_t)types[2],
+            (uint64_t)whole_desc[2].expert_size, UINT64_C(64)}) {
+        for (int shift = 0; shift < 64; shift += 8) { pool_data.push_back((uint8_t)(value >> shift)); }
+    }
+    FILE * pool_file = fopen(pool_path.c_str(), "wb");
+    bool pool_ok = pool_file != nullptr;
+    if (pool_file) {
+        pool_ok &= fwrite(pool_data.data(), 1, pool_data.size(), pool_file) == pool_data.size();
+        pool_ok &= fclose(pool_file) == 0;
+    }
+    set_env("GGML_MOE_CACHE_POOL_PLAN", pool_path.c_str());
+    reader = pool_ok ? create_direct_session(gpu, cpu) : nullptr;
+    pool_ok &= reader != nullptr;
+    if (reader) {
+        capture.clear();
+        pool_ok &= api.warm(reader, whole_desc, nullptr, 3) == 192;
+        pool_ok &= capture.get().find("pool plan loaded:") != std::string::npos;
+        for (int pass = 0; pass < 2; ++pass) {
+            pool_ok &= api.trim(reader, 1u << 20) >= 1u << 20;
+            capture.clear();
+            api.restore(reader);
+            pool_ok &= max_field_value(capture.get(), "expert_slots=") == 192;
+            pool_ok &= api.warm(reader, whole_desc, whole_counts, 3) >= 0;
+            api.session_enter(reader);
+            for (const auto & desc : whole_desc) {
+                pool_ok &= direct_plan_one(desc.name, desc.data, desc.expert_size,
+                        n_in, n_out, desc.type, n_expert, 0) == 1;
+                pool_ok &= direct_plan_one(desc.name, desc.data, desc.expert_size,
+                        n_in, n_out, desc.type, n_expert, 64) == 0;
+            }
+            api.session_leave(reader);
+        }
+        api.session_destroy(reader);
+    }
+    set_env("GGML_MOE_CACHE_POOL_PLAN", had_pool ? saved_pool.c_str() : nullptr);
+    remove(pool_path.c_str());
+    printf("cache-pool-plan-return: %s\n", pool_ok ? "OK" : "FAIL");
+    if (!pool_ok) { fprintf(stderr, "%s", capture.get().c_str()); }
+    transition_ok &= pool_ok;
 #ifdef GGML_CUDA
     // A compute allocation made during the prompt loan is outside the cache
     // grant. Rebuild must use physical headroom, without starving a late pool.

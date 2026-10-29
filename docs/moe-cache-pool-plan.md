@@ -10,6 +10,6 @@ The file contains little-endian unsigned 64-bit integers:
 
 Every runtime pool must appear exactly once. The type and logical bytes per expert must match the model. Slot counts must be at least 64 and no greater than the pool's model capacity. Truncated files, extra bytes, duplicate or unknown pools, and invalid capacities stop execution. The file is checked again when the global profile is rebuilt; keep it unchanged for a run.
 
-The `pool plan loaded` log confirms that the file was accepted. The following `global profile capacity` lines report planned and actual slots. Actual allocations can be smaller under memory pressure. The same limits apply to post-prompt replanning; prompt-cache save and restore still need a runtime check on the candidate build.
+The `pool plan loaded` log confirms that the file was accepted. The following `global profile capacity` lines report planned and actual slots. Actual allocations can be smaller under memory pressure. The same limits apply to post-prompt replanning and memory returned after a prompt loan. If the global planner is unavailable, execution stops instead of falling back to unconstrained pools. Prompt-cache save and restore still need a runtime check on the candidate build.
 
 A pool plan controls capacities. It does not encode which experts are selected, change the loaded profile's ranking, freeze experts in place or establish a speed prediction. Match the ranking and adaptive policy to the simulator before comparing route counts.
