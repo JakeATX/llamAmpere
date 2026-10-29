@@ -5447,19 +5447,25 @@ static bool moe_cache_profile_rerank(moe_cache_session & session,
 static bool moe_cache_resize_prompt_pool(moe_cache_device & device, moe_cache_pool & pool, int slots) {
     ggml_cuda_set_device(device.logical);
     const int old_slots = pool.n_slots;
+    if (slots < 0 || !pool.expert_size ||
+            (size_t)std::max(slots, old_slots) > SIZE_MAX / pool.expert_size) { return false; }
     const size_t before = (size_t)old_slots * pool.expert_size;
     if (slots > old_slots) {
         const size_t headroom = moe_cache_allocation_headroom(device, "grow retained prompt pool", (size_t)(slots - old_slots) * pool.expert_size);
         slots = old_slots + (int)std::min((size_t)(slots - old_slots), headroom / pool.expert_size);
     }
+    if (slots == old_slots) { return true; }
     std::vector<int> ranked;
     for (int i = 0; i < old_slots; ++i) {
         if (pool.slots[i].state == moe_cache_slot_state::valid) { ranked.push_back(i); }
     }
-    std::stable_sort(ranked.begin(), ranked.end(), [&](int a, int b) {
-        return moe_cache_lending_uses(pool.slots[a]) > moe_cache_lending_uses(pool.slots[b]);
-    });
-    if (ranked.size() > (size_t)slots) { device.evictions += ranked.size() - slots; ranked.resize(slots); }
+    if (ranked.size() > (size_t)slots) {
+        std::stable_sort(ranked.begin(), ranked.end(), [&](int a, int b) {
+            return moe_cache_lending_uses(pool.slots[a]) > moe_cache_lending_uses(pool.slots[b]);
+        });
+        device.evictions += ranked.size() - slots;
+        ranked.resize(slots);
+    }
     std::vector<moe_cache_slot> replacement(slots);
     for (int i : ranked) { if (i < slots) { replacement[i] = pool.slots[i]; } }
     std::vector<std::pair<int, int>> moves;
