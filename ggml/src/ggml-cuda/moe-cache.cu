@@ -5445,6 +5445,7 @@ static bool moe_cache_profile_rerank(moe_cache_session & session,
 }
 
 static bool moe_cache_resize_prompt_pool(moe_cache_device & device, moe_cache_pool & pool, int slots) {
+    ggml_cuda_set_device(device.logical);
     const int old_slots = pool.n_slots;
     const size_t before = (size_t)old_slots * pool.expert_size;
     if (slots > old_slots) {

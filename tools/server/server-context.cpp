@@ -6131,6 +6131,13 @@ private:
                 }
             }
             ~ubatch_handoff() {
+                if (held_target && deferred_count) {
+                    try {
+                        llama_prompt_warm_join(held_target);
+                    } catch (const std::exception & e) {
+                        SRV_ERR("ubatch refill cleanup: %s\n", e.what());
+                    }
+                }
                 try {
                     release();
                 } catch (const std::exception & e) {
