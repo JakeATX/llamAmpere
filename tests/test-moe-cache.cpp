@@ -1,3 +1,4 @@
+#include "../ggml/src/ggml-moe-skipmass.h"
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -6614,6 +6615,27 @@ static bool run_device_fused_missjoin(ggml_backend_t gpu, ggml_backend_t cpu, lo
     return ok;
 }
 
+static bool run_skipmass_rule() {
+    const float weights[10] = {0.40f, 0.20f, 0.10f, 0.08f, 0.06f, 0.05f, 0.04f, 0.03f, 0.025f, 0.015f};
+    unsigned char hot[10] = {}, drop[10];
+    bool ok = true;
+    hot[9] = 1; // A partial resident must not be dropped.
+    ggml_moe_skipmass_select(weights, hot, 10, 1, 0.03f, drop);
+    for (int i = 0; i < 10; ++i) { ok &= drop[i] == (i == 8); } // Strict threshold.
+    ggml_moe_skipmass_select(weights, hot, 10, 2, 0.055f, drop);
+    for (int i = 0; i < 10; ++i) { ok &= drop[i] == (i == 7 || i == 8); }
+    ggml_moe_skipmass_select(weights, hot, 10, 2, 0.0f, drop);
+    for (int i = 0; i < 10; ++i) { ok &= !drop[i]; }
+    const float unsorted[4] = {0.125f, 0.5f, 0.125f, 0.25f};
+    ggml_moe_skipmass_select(unsorted, hot, 4, 2, 0.125f, drop);
+    ok &= !drop[0] && !drop[1] && drop[2] && !drop[3]; // Stable ties, not rank order.
+    const float invalid[2] = {NAN, 0.01f};
+    ggml_moe_skipmass_select(invalid, hot, 2, 1, 0.1f, drop);
+    ok &= !drop[0] && !drop[1];
+    printf("cache-skipmass-rule: %s\n", ok ? "OK" : "FAIL");
+    return ok;
+}
+
 // --moe-skip-tail: the route-rank rule on its own (host-side helper shared by the CPU path).
 static bool run_skip_tail_rank_rule() {
     bool ok = true;
@@ -6644,7 +6666,7 @@ static bool run_skip_tail_layer(ggml_backend_t gpu, ggml_backend_t cpu, log_capt
     }
     bool all_ok = true;
     std::vector<float> importance(256, 1.0f);
-    constexpr int k_used = 8, dim = 256, rank = 5;
+    constexpr int k_used = 10, dim = 256, rank = 7;
     // 256 experts: the pool keeps at least 64 slots per bank, so a 64-expert layer would be fully resident.
     // An 8 MiB budget holds well under 128 complete experts; routes use experts 0..5 (warm) and >= 128 (missed).
     constexpr int64_t n_expert = 256;
@@ -6712,6 +6734,22 @@ static bool run_skip_tail_layer(ggml_backend_t gpu, ggml_backend_t cpu, log_capt
                 ggml_build_forward_expand(graphs[i].graph, graphs[i].out);
                 graphs[i].buffer = ggml_backend_alloc_ctx_tensors(c, backends[i]);
             }
+            test_graph mass_graph;
+            ggml_init_params mp = {8 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true};
+            mass_graph.ctx = ggml_init(mp);
+            auto * router = ggml_new_tensor_3d(mass_graph.ctx, GGML_TYPE_F32, 1, k_used, tokens);
+            auto * adjusted = ggml_map_custom2(mass_graph.ctx, router, ids[1],
+                [](ggml_tensor *, const ggml_tensor *, const ggml_tensor *, int, int, void *) { GGML_ABORT("CUDA required"); }, 1, nullptr);
+            ggml_set_name(adjusted, "moe_skipmass-7");
+            mass_graph.out = ggml_mul(mass_graph.ctx, graphs[1].out, adjusted);
+            mass_graph.graph = ggml_new_graph(mass_graph.ctx);
+            ggml_build_forward_expand(mass_graph.graph, adjusted);
+            ggml_build_forward_expand(mass_graph.graph, mass_graph.out);
+            mass_graph.buffer = ggml_backend_alloc_ctx_tensors(mass_graph.ctx, gpu);
+            const float shares[10] = {0.40f, 0.20f, 0.10f, 0.08f, 0.06f, 0.05f, 0.04f, 0.03f, 0.025f, 0.015f};
+            std::vector<float> router_values((size_t) k_used * tokens);
+            for (int i = 0; i < k_used * tokens; ++i) { router_values[i] = shares[i % k_used]; }
+            ggml_backend_tensor_set(router, router_values.data(), 0, router_values.size() * sizeof(float));
             void * session = create_direct_session(gpu, cpu);
             ggml_moe_cache_tensor_desc descriptors[3];
             std::vector<uint64_t> usage[3];
@@ -6774,6 +6812,56 @@ static bool run_skip_tail_layer(ggml_backend_t gpu, ggml_backend_t cpu, log_capt
                     api.session_leave(session);
                     auto & dst = step == 0 ? exact : step == 1 ? lossy : again;
                     ggml_backend_tensor_get(graphs[1].out, dst.data(), 0, n_out * sizeof(float));
+                }
+                for (int mode : {1, 2}) {
+                    for (int renorm : {0, 1}) {
+                        set_env("GGML_MOE_SKIP_POLICY", mode == 1 ? "threshold" : "cumulative");
+                        set_env("GGML_MOE_SKIP_THRESHOLD", mode == 1 ? "0.04" : "0.08");
+                        set_env("GGML_MOE_SKIP_RENORM", renorm ? "1" : "0");
+                        api.set_skip_tail(session, rank); // Recapture for each policy.
+                        api.session_enter(session);
+                        ok &= ggml_backend_graph_compute(gpu, mass_graph.graph) == GGML_STATUS_SUCCESS;
+                        api.session_leave(session);
+                        std::vector<float> actual_weights(router_values.size()), actual(n_out);
+                        ggml_backend_tensor_get(adjusted, actual_weights.data(), 0, actual_weights.size() * sizeof(float));
+                        ggml_backend_tensor_get(mass_graph.out, actual.data(), 0, n_out * sizeof(float));
+                        std::vector<unsigned char> drops(router_values.size());
+                        for (int t = 0; t < tokens; ++t) {
+                            unsigned char hot[10];
+                            for (int j = 0; j < k_used; ++j) { hot[j] = routing[64 * t + j] < 6 ? 7 : 0; }
+                            ggml_moe_skipmass_select(shares, hot, k_used, mode, mode == 1 ? 0.04f : 0.08f, drops.data() + t * k_used);
+                            float total = 0.0f, kept = 0.0f;
+                            bool changed = false;
+                            for (int j = 0; j < k_used; ++j) {
+                                total += shares[j];
+                                if (!drops[t * k_used + j]) { kept += shares[j]; }
+                                changed |= drops[t * k_used + j] != 0;
+                            }
+                            for (int j = 0; j < k_used; ++j) {
+                                const float want = drops[t * k_used + j] ? 0.0f : shares[j] * (renorm && changed ? total / kept : 1.0f);
+                                ok &= std::fabs(actual_weights[t * k_used + j] - want) < 1e-6f;
+                                for (int q = 0; q < dim; ++q) {
+                                    const size_t index = ((size_t) t * k_used + j) * dim + q;
+                                    const float ref = exact[index] * want;
+                                    ok &= std::isfinite(actual[index]) && std::fabs(actual[index] - ref) < 1e-5f * std::max(1.0f, std::fabs(ref));
+                                }
+                            }
+                        }
+                        for (int t = 0; t < tokens; ++t) {
+                            for (int j = 0; j < k_used; ++j) {
+                                const int e = routing[64 * t + j];
+                                bool keep = e < 6;
+                                for (int t2 = 0; t2 < tokens; ++t2) {
+                                    for (int j2 = 0; j2 < k_used; ++j2) { keep |= routing[64 * t2 + j2] == e && !drops[t2 * k_used + j2]; }
+                                }
+                                if (!keep) { expected_rows += 3; }
+                            }
+                        }
+                        api.set_skip_tail(session, 0);
+                        set_env("GGML_MOE_SKIP_POLICY", nullptr);
+                        set_env("GGML_MOE_SKIP_THRESHOLD", nullptr);
+                        set_env("GGML_MOE_SKIP_RENORM", nullptr);
+                    }
                 }
                 const bool cpu_ok = compare_output(expected, exact, 8e-3);
                 const bool repro_ok = exact == again;
@@ -7557,7 +7645,7 @@ int main(int argc, char ** argv) {
         return ok ? 0 : 1;
     }
     if (argc == 2 && strcmp(argv[1], "--skip-tail-rule-only") == 0) {
-        return run_skip_tail_rank_rule() ? 0 : 1;
+        return run_skip_tail_rank_rule() && run_skipmass_rule() ? 0 : 1;
     }
     if (argc == 2 && strcmp(argv[1], "--prefetch-policy-only") == 0) {
         return 0;
