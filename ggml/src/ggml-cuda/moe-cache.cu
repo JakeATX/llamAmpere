@@ -7478,6 +7478,9 @@ static std::vector<moe_swap_pair> moe_cache_swap_whole_pairs(moe_cache_session &
     }
     std::sort(batches.begin(), batches.end(), [&](const batch & a, const batch & b) { return a.gain != b.gain ? a.gain > b.gain : order(a.candidate, b.candidate); });
     std::vector<moe_swap_pair> result;
+    if (session.swap_top_only) {
+        result.reserve(batches.size() * 3);
+    }
     for (const auto & batch : batches) {
         for (int k = 0; k < 3; ++k) {
             auto * table = groups[batch.candidate.layer][k];
