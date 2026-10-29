@@ -1695,7 +1695,7 @@ void llama_batch_compat::init(llama_batch_ext & dst, const llama_batch & batch_i
             ? (batch_inp.logits[i] != 0)
             : (i == batch_inp.n_tokens - 1);
 
-        batch_ext->tokens.push_back(t);
+        batch_ext->tokens.push_back(std::move(t));
     }
 }
 
