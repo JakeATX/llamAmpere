@@ -1511,6 +1511,7 @@ static bool ggml_cuda_fattn_skip_dead_enabled() {
 
 void ggml_cuda_flash_attn_ext_compact_mask(
         const ggml_tensor * mask, int32_t * indices, int32_t * counts, int32_t n_queries, int32_t ncols1, int32_t n_kv_max, cudaStream_t stream);
+void ggml_cuda_flash_attn_ext_set_rows_window(int64_t q0, int c0);
 bool ggml_cuda_flash_attn_ext_lists_from_rows(
         ggml_backend_cuda_context & ctx, const ggml_tensor * rows, const ggml_tensor * mask, int32_t * indices, int32_t * counts,
         int32_t n_queries, int32_t ncols1, int32_t n_kv_max, int64_t n_lists);

@@ -2482,7 +2482,7 @@ void ggml_cuda_flash_attn_ext_compact_mask(
 template <int ncols1, bool oob>
 __launch_bounds__(256, 1)
 static __global__ void flash_attn_rows_to_sparse_indices(
-        const int32_t * rows, int32_t * indices, int32_t * counts, const int n_cells, const int n_sel, const int64_t s_row,
+        const int32_t * rows, int32_t * indices, int32_t * counts, const int c0, const int n_cells, const int n_sel, const int64_t s_row,
         const int n_queries, const int n_kv_max) {
     ggml_cuda_pdl_sync();
 
@@ -2505,7 +2505,7 @@ static __global__ void flash_attn_rows_to_sparse_indices(
         }
         const int32_t * row = rows + int64_t(q0 + q)*s_row;
         for (int s = tid; s < n_sel; s += blockDim.x) {
-            const int32_t c = row[s];
+            const int32_t c = row[s] - c0;
             if (c >= 0 && c < n_cells) {
                 atomicOr(&cell_bits[c >> 5], 1u << (c & 31));
             }
@@ -2570,6 +2570,16 @@ static __global__ void flash_attn_sparse_lists_diff(
 }
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
+// the window of the selected-cell rows that the next attention call covers: a chunked caller (the SJ-KVaRN prefill KV
+// chunks) attends queries [q0, q0 + n_queries) over cells [c0, c0 + n_cells) of the node, the rows hold node cells
+static thread_local int64_t fattn_rows_q0 = 0;
+static thread_local int     fattn_rows_c0 = 0;
+
+void ggml_cuda_flash_attn_ext_set_rows_window(const int64_t q0, const int c0) {
+    fattn_rows_q0 = q0;
+    fattn_rows_c0 = c0;
+}
+
 int ggml_cuda_flash_attn_ext_direct_lists_mode() {
     static const int mode = [] { const char * e = getenv("LLAMA_QSA_DIRECT_LISTS"); return e ? atoi(e) : 0; }();
     return mode;
@@ -2586,9 +2596,10 @@ bool ggml_cuda_flash_attn_ext_lists_from_rows(
     const int mode = ggml_cuda_flash_attn_ext_direct_lists_mode();
     const int n_cells = (int) mask->ne[0];
     const size_t smem = size_t((n_cells + 31)/32)*sizeof(uint32_t);
-    if (mode <= 0 || rows == nullptr || rows->type != GGML_TYPE_I32 || rows->ne[1] != n_queries || rows->ne[2] != 1 ||
+    const int64_t q0 = fattn_rows_q0;
+    if (mode <= 0 || rows == nullptr || rows->type != GGML_TYPE_I32 || rows->ne[1] < q0 + n_queries || rows->ne[2] != 1 ||
             rows->ne[3] != 1 || mask->ne[2] != 1 || mask->ne[3] != 1 || smem > 48*1024 || rows->nb[0] != sizeof(int32_t) ||
-            (ncols1 != 2 && ncols1 != 4)) {
+            (ncols1 != 2 && ncols1 != 4 && ncols1 != 8)) {
         return false;
     }
     const int n_groups = (n_queries + ncols1 - 1)/ncols1;
@@ -2598,9 +2609,11 @@ bool ggml_cuda_flash_attn_ext_lists_from_rows(
     cudaStream_t stream = ctx.stream();
     const bool oob = n_queries % ncols1 != 0;
     const auto kernel = ncols1 == 2 ? (oob ? flash_attn_rows_to_sparse_indices<2, true> : flash_attn_rows_to_sparse_indices<2, false>) :
-                                      (oob ? flash_attn_rows_to_sparse_indices<4, true> : flash_attn_rows_to_sparse_indices<4, false>);
+                        ncols1 == 4 ? (oob ? flash_attn_rows_to_sparse_indices<4, true> : flash_attn_rows_to_sparse_indices<4, false>) :
+                                      (oob ? flash_attn_rows_to_sparse_indices<8, true> : flash_attn_rows_to_sparse_indices<8, false>);
     const ggml_cuda_kernel_launch_params launch_params(dim3(n_groups, 1, 1), dim3(256, 1, 1), smem, stream);
-    ggml_cuda_kernel_launch(kernel, launch_params, (const int32_t *) rows->data, indices, counts, n_cells, (int) rows->ne[0],
+    ggml_cuda_kernel_launch(kernel, launch_params, (const int32_t *) ((const char *) rows->data + q0*rows->nb[1]), indices, counts,
+        fattn_rows_c0, n_cells, (int) rows->ne[0],
         (int64_t) (rows->nb[1]/sizeof(int32_t)), (int) n_queries, (int) n_kv_max);
     CUDA_CHECK(cudaGetLastError());
     if (mode >= 2) {
