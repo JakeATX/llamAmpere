@@ -41,6 +41,7 @@
 //   GGML_CUDA_AI23_SMALL_SPLIT=2|4  split small-width fixed-K dense products (default off)
 //   GGML_CUDA_AI23_FUSED_X=1  quantize activations inside direct one-token expert blocks (default off)
 //   GGML_CUDA_AI23_DIRECT=1..8  skip expert grouping through this token width in MMVR (default off)
+//   GGML_CUDA_AI23_ID_BN=32|64|128  override rate-2/3 routed prompt GEMM tile width (default automatic)
 //   GGML_CUDA_AI23_DENSE_TILE=1..29  dense shared-activation tile controls for 9..64 tokens (default off)
 //                             22/23 swap quantized activation halves to avoid LDS64 bank conflicts
 //   GGML_CUDA_AI23_XPERM=1  vector activation loads for whole-row dense rate-2 kernels (default off)
@@ -994,6 +995,17 @@ static int ai4_mmvid_pairs() {
     static const int v = ai4_env_int("GGML_CUDA_AI4_MMVID_PAIRS", nullptr, 0);
     return v;
 }
+static int ai23_id_bn() {
+    static const int bn = [] {
+        const int v = ai4_env_int("GGML_CUDA_AI23_ID_BN", nullptr, 0);
+        if (v == 0 || v == 32 || v == 64 || v == 128) {
+            return v;
+        }
+        GGML_LOG_WARN("invalid GGML_CUDA_AI23_ID_BN; using automatic tile width (expected 32, 64 or 128)\n");
+        return 0;
+    }();
+    return bn;
+}
 static bool ai4_mmvid_route(int n_tok, int n_used, int n_expert, int rate) {
     if (n_tok <= 8) {
         return true;
@@ -1030,6 +1042,12 @@ static void ai4_mm_id_kernels(const uint8_t * W, const int8_t * q, const float *
             ai4k::launch_mmv<2, 6, true, LAY, XSH, true>(W, q, s, Y, M, M, 0, K, stream, idm, max_tiles);
         } else {
             ai4_launch_mmv_tuned<LAY, XSH, true>(W, q, s, Y, M, 0, K, stream, k.warps, k.minb, idm, max_tiles);
+        }
+    } else if (bn == 32) {
+        if constexpr (ai4k::lay_rate<LAY>() == 2 || ai4k::lay_rate<LAY>() == 3) {
+            ai23_launch_gemm<32, 3, 4, LAY, XSH, true>(W, q, s, Y, M, M, 0, K, stream, idm, max_tiles);
+        } else {
+            GGML_ABORT("32-column expert tiles require rate 2 or 3");
         }
     } else if (bn == 128) {
         ai23_launch_gemm<128, 3, 4, LAY, XSH, true>(W, q, s, Y, M, M, 0, K, stream, idm, max_tiles);
@@ -1110,6 +1128,10 @@ void ggml_cuda_mul_mat_id_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor
 
     // mmv-ID (n_tok <= 8) takes tiles of MMV_ID_BN pairs, so an expert repeated within a token still fits
     int bn = ai4_mmvid_route(n_tok, n_used, n_expert, ggml_ai4_rate(src0->type)) ? ai4k::MMV_ID_BN : (n_tok >= ai4_bn128_min() ? 128 : 64);
+    // fork: keep decode and sparse MMV routing unchanged; size the helper and GEMM from the same tile width.
+    if ((rate == 2 || rate == 3) && bn != ai4k::MMV_ID_BN && ai23_id_bn() != 0) {
+        bn = ai23_id_bn();
+    }
     const int sms = ai4_ampere_sms(ctx);
     if (sms && src0->type == GGML_TYPE_AIT4_U) {
         if (ai4_ampere_mmv(n_tok)) {
