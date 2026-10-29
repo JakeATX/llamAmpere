@@ -2574,7 +2574,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     // fork: explicit graph output keeps adjusted weights alive until the final expert sum.
     if ((getenv("GGML_MOE_SKIP_POLICY") || getenv("GGML_MOE_SKIP_TRACE")) &&
-            arch == LLM_ARCH_QWEN3NEXT && il < 48 && ubatch.n_seqs == 1 && n_expert_used == 10 && n_tokens <= 8) {
+            norm_w && gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX && n_expert == 512 &&
+            il < 48 && ubatch.n_seqs == 1 && n_expert_used == 10 && n_tokens > 0 && n_tokens <= 8) {
         weights = ggml_map_custom2(ctx0, weights, selected_experts, moe_skipmass_cpu, 1, nullptr);
         ggml_format_name(weights, "moe_skipmass-%d", il);
     }
