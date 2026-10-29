@@ -4136,9 +4136,10 @@ bool llama_context::mtp_pipe_init() {
     }
     const char * value = getenv("LLAMA_MTP_PIPELINE");
     // the step's small host inputs must reach the card in stream order (POSTFIX c1): a plain input copy waits for
-    // the stream, which here holds a kernel waiting for the host
+    // the stream, which here holds a kernel waiting for the host. The upload kernel is on by default in
+    // ggml-backend (unset = on), so only an explicit GGML_SCHED_UPLOAD_KERNEL=0 blocks the pipeline.
     const char * upload = getenv("GGML_SCHED_UPLOAD_KERNEL");
-    if (!value || strcmp(value, "1") != 0 || !upload || atoi(upload) == 0 || !mtp_feedback.rows || !mtp_feedback.backend || !model.tok_embd ||
+    if (!value || strcmp(value, "1") != 0 || (upload && atoi(upload) == 0) || !mtp_feedback.rows || !mtp_feedback.backend || !model.tok_embd ||
             !model.tok_embd->buffer || !ggml_backend_buffer_is_host(model.tok_embd->buffer) || !model.tok_embd->data ||
             (model.tok_embd->type != GGML_TYPE_F32 && !ggml_get_type_traits(model.tok_embd->type)->to_float)) {
         return false;
