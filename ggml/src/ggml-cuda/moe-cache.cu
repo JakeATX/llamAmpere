@@ -2620,7 +2620,7 @@ static bool moe_cache_allocate_pool(
 static bool moe_cache_resize_pool(moe_cache_device & device, moe_cache_pool & pool, int slots);
 
 // Always-resident expert bank (ggml_moe_bank_*): those experts are computed by the bank call, never by the cache.
-// fork AIPNEXTK BANKSKIP: the hit/miss passes skip the bank experts' zero-weight routes (zeroed output) instead of
+// fork AIPNEXTK BANKSKIP: the hit/miss passes write zero for bank experts' zero-weight routes instead of
 // computing them from the zero block. GGML_MOE_BANK_ZERO_SKIP=0 computes them as before.
 static bool moe_bank_skip_enabled() {
     static const bool on = [] { const char * v = getenv("GGML_MOE_BANK_ZERO_SKIP"); return v == nullptr || atoi(v) != 0; }();
@@ -10614,9 +10614,6 @@ bool ggml_cuda_moe_cache_device_compute(ggml_backend_cuda_context & ctx, ggml_te
         const bool cs = session.cs_layer >= 0 && session.cs_layer == table.mj_layer;
         const uint8_t * miss_skip = cs ? g_cs_mask + (size_t) table.mj_kind * g_hf_experts : table.hot;
         const void * const * eff = nullptr;
-        if (table.n_bank && moe_bank_skip_enabled()) {
-            CUDA_CHECK(cudaMemsetAsync(op->data, 0, ggml_nbytes(op), ctx.stream()));
-        }
         auto hit_pass = [&](float * out) {
             const bool hit_ok = ggml_cuda_moe_table_mmv_d1_try(ctx, table.device, (ggml_type) table.desc.type, quantized,
                     (const int32_t *) ids->data, out, a->ne[0], op->ne[0], ids->ne[0], ids->ne[1], a->ne[1],
@@ -10769,9 +10766,6 @@ bool ggml_cuda_moe_cache_device_fused_compute(ggml_backend_cuda_context & ctx,
                 ggml_cuda_pool_alloc<char> q8(ctx.pool());
                 char * quantized = moe_quantize_act(ctx, a, (ggml_type) up_table.desc.type, true, q8);
                 g_st_hitg.fetch_add(1, std::memory_order_relaxed);
-                if ((up_table.n_bank || gate_table.n_bank) && moe_bank_skip_enabled()) {
-                    CUDA_CHECK(cudaMemsetAsync(glu->data, 0, ggml_nbytes(glu), ctx.stream()));
-                }
                 // hit pass: experts resident for both projections
                 ggml_cuda_moe_table_mmv_hitg(ctx, up_table.device, gate_table.device, (ggml_type) up_table.desc.type,
                         quantized, (const int32_t *) ids->data, (float *) glu->data, a->ne[0], glu->ne[0], ids->ne[0],

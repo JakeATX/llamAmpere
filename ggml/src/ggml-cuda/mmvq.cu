@@ -14,7 +14,7 @@
 
 // fork AIPNEXTK BANKSKIP: the shared all-zero block that the MoE cache tables point at for the always-resident bank
 // experts (moe-cache.cu; the bank call computes those experts). The filtered hit/miss kernels return early for such
-// routes instead of multiplying zeros; the host zeroes those passes' output first. Null: off. The address is a
+// routes and write their own zeros instead of multiplying zeros. Null: off. The address is a
 // host-side value per device, passed to the kernels as an argument (a device global failed with "invalid device
 // symbol" once the expert pool held the card).
 static const void * g_moe_bank_zero_host[GGML_CUDA_MAX_DEVICES] = {};
@@ -1680,7 +1680,10 @@ static __global__ void mul_mat_vec_q_moe(
             return;
         }
         if (!shared_expert && expert_table && bank_zero && expert_table[channel_x] == bank_zero) {
-            return; // bank expert: zero output, written by the host
+            if (threadIdx.x < c_rows_per_block && uint32_t(row0 + threadIdx.x) < nrows_x) {
+                dst[channel_dst*stride_channel_dst + token_idx*stride_col_dst + row0 + threadIdx.x] = 0.0f;
+            }
+            return;
         }
     }
     // the fork MoE slot cache keeps the gate weights in a separate pool with their own slot ids;
@@ -2056,6 +2059,23 @@ static __device__ __forceinline__ void moe_d1_rows(
     }
 }
 
+// fork: skipped bank routes own the same output rows as the computed routes.
+template <int rows_per_block>
+static __device__ __forceinline__ void moe_bank_zero_routes(uint64_t mask, float * dst,
+        int nrows, int n_ids, int stride_col, int stride_channel) {
+    const int thread = threadIdx.y*blockDim.x + threadIdx.x;
+    for (int i = thread; i < rows_per_block; i += blockDim.x*blockDim.y) {
+        const int row = blockIdx.x*rows_per_block + i;
+        if (row >= nrows) { continue; }
+        uint64_t left = mask;
+        while (left) {
+            const int route = __ffsll((long long) left) - 1;
+            left &= left - 1;
+            dst[(route % n_ids)*stride_channel + (route / n_ids)*stride_col + row] = 0.0f;
+        }
+    }
+}
+
 // Grid: (row tiles, n_ids*n_tokens routes in token-major order). Every warp reads the route list itself (at most 64
 // routes, two per lane) and ballots for the routes that share this block's expert; only the block of the expert's
 // first route works, so no shared memory and no block barrier are needed. Members run in token order, c_group at a
@@ -2089,7 +2109,8 @@ static __global__ void mul_mat_vec_q_moe_d1(
             return;
         }
         if (bank_zero && table[me] == bank_zero) {
-            return; // bank expert: zero output, written by the host
+            moe_bank_zero_routes<c_warps*c_rows>(mask, dst, nrows_x, n_ids, stride_col_dst, stride_channel_dst);
+            return;
         }
     }
     // every early return above is the same for the whole block (all warps read the same route list)
@@ -2284,7 +2305,8 @@ static __global__ void mul_mat_vec_q_moe_sw(
         return;
     }
     if (route_hot != nullptr && bank_zero && table[me] == bank_zero) {
-        return; // bank expert: zero output, written by the host
+        moe_bank_zero_routes<c_warps*rows_per_warp>(mask, dst, nrows_x, n_ids, stride_col_dst, stride_channel_dst);
+        return;
     }
     const int wrow0 = (blockIdx.x*c_warps + threadIdx.y)*rows_per_warp;
     if (wrow0 >= nrows_x) {
@@ -2433,7 +2455,8 @@ static __global__ void mul_mat_vec_q_moe_hitg(
         return;
     }
     if (bank_zero && up_table[me] == bank_zero && gate_table[me] == bank_zero) {
-        return; // bank expert: zero output, written by the host
+        moe_bank_zero_routes<c_warps*c_rows>(mask, dst, nrows_x, n_ids, stride_col_dst, stride_channel_dst);
+        return;
     }
     constexpr bool use_smem = c_smem && ggml_cuda_mmvq_smem_grid_type(type);
     constexpr int  smem_n   = type == GGML_TYPE_IQ3_XXS ? 256 : type == GGML_TYPE_IQ3_S ? 512 :
@@ -2641,7 +2664,8 @@ static __global__ void mul_mat_vec_q_moe_hitg_sw(
         return;
     }
     if (bank_zero && up_table[me] == bank_zero && gate_table[me] == bank_zero) {
-        return; // bank expert: zero output, written by the host
+        moe_bank_zero_routes<c_warps*rows_per_warp>(mask, dst, nrows_x, n_ids, stride_col_dst, stride_channel_dst);
+        return;
     }
     // [MOEGAP HITGSW s] codebook copy in shared memory, as mul_mat_vec_q_moe_hitg (block-uniform point: every
     // return above depends only on blockIdx.y)
