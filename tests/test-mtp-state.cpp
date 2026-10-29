@@ -232,6 +232,7 @@ struct cache_config {
     ggml_type k, v;
     uint32_t sj_k = 0, sj_v = 0;
     ggml_type body = GGML_TYPE_F32;
+    bool sj_draft = false; // the draft cache inherits the trunk's SJ-KVaRN (--spec-draft-sjkvarn)
 };
 
 struct contexts {
@@ -277,8 +278,10 @@ struct contexts {
         if (tail_chunks) {
             cp.n_outputs_max = 8;
         }
-        cp.sj_kvarn_bits_k = cp.sj_kvarn_bits_v = 0;
-        if (config.sj_k) {
+        if (!config.sj_draft) {
+            cp.sj_kvarn_bits_k = cp.sj_kvarn_bits_v = 0;
+        }
+        if (config.sj_k && !config.sj_draft) {
             cp.type_k = COMMON_SJKVARN_MTP_DRAFT_KV[0];
             cp.type_v = COMMON_SJKVARN_MTP_DRAFT_KV[1];
         }
@@ -2403,6 +2406,64 @@ static void run_case(llama_model * model, const cache_config & config, bool defe
     printf("PASS %s: %s, fresh driver and sequence 0 -> 1, 24 matching draft rounds\n", config.name, deferred ? "deferred carry" : "batch carry");
 }
 
+// An image chunk is decoded by the target only: the MTP driver skips embedding batches. positions as mtmd builds them for M-RoPE
+static void decode_image(contexts & ctx, llama_pos p0, int nx, int ny, llama_seq_id seq) {
+    const int n = nx*ny;
+    std::vector<float> embd((size_t) n*n_embd);
+    std::mt19937 rng(1);
+    std::normal_distribution<float> dist(0.0f, 0.1f);
+    for (auto & value : embd) {
+        value = dist(rng);
+    }
+    common_batch batch(ctx.tgt);
+    for (int i = 0; i < n; ++i) {
+        const llama_pos pos[GGML_MROPE_SECTIONS] = { p0, p0 + i/nx, p0 + i%nx, 0 };
+        batch.add_embd({ embd.data() + (size_t) i*n_embd, 1, (size_t) n_embd }, pos, seq, false);
+    }
+    require(llama_process(ctx.tgt, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0, "target image decode");
+    require(common_speculative_process(ctx.spec, batch), "MTP process skips the image");
+}
+
+// The draft cache has no rows for the image, so its first text row after the image sits far ahead of its last cell (position
+// 3, then 12 here). An SJ-KVaRN draft cache (--spec-draft-sjkvarn) has to take that row, draft, save and restore. The target keeps
+// refusing a row that does not continue its sequence.
+static void run_image_gap(llama_model * model, const cache_config & sj_config, llama_pos p_img) {
+    cache_config config = sj_config;
+    config.sj_draft = true;
+    const int nx = 8, ny = 6;
+    const llama_pos p_txt = p_img + std::max(nx, ny); // the next position after an image is its larger side
+    const llama_pos prompt_end = p_txt + 200;
+
+    contexts reference(model, config);
+    prefill(reference, 0, p_img, 0);
+    decode_image(reference, p_img, nx, ny, 0);
+    prefill(reference, p_txt, prompt_end, 0);
+    const snapshot prompt = save(reference, 0);
+    common_speculative_begin(reference.spec, 0, llama_tokens(prompt_end, 0));
+    llama_pos pos_ref = prompt_end;
+    const schedule expected = generate(reference, 0, pos_ref, 0, 8);
+    require(llama_memory_seq_pos_max(llama_get_memory(reference.dft), 0) >= p_txt, "draft cache holds the text after the image");
+
+    contexts restored(model, config);
+    restore(restored, prompt, 1);
+    common_speculative_begin(restored.spec, 1, llama_tokens(prompt_end, 0));
+    llama_pos pos_got = prompt_end;
+    require_schedule(generate(restored, 1, pos_got, 0, 8), expected, "image gap: restored draft cache drafts the same tokens");
+
+    // an ordinary prompt (no image) still drafts with an SJ-KVaRN draft cache
+    contexts plain(model, config);
+    prefill(plain, 0, prompt_end, 0);
+    common_speculative_begin(plain.spec, 0, llama_tokens(prompt_end, 0));
+    llama_pos pos_plain = prompt_end;
+    generate(plain, 0, pos_plain, 0, 4);
+
+    // the target keeps its guard
+    common_batch skip(reference.tgt);
+    skip.add(token_at(pos_ref + 5), pos_ref + 5, 0, true);
+    require(llama_process(reference.tgt, LLAMA_PROCESS_TYPE_DECODE, skip.get()) != 0, "the target refuses a row that does not continue its sequence");
+    printf("PASS %s: image at %d in an SJ-KVaRN draft cache, restore, 8 matching draft rounds, target guard kept\n", config.name, (int) p_img);
+}
+
 static void run_deferred_overflow(llama_model * model, const cache_config & config) {
     contexts reference(model, config, 64);
     prefill(reference, 0, 124, 0);
@@ -3733,6 +3794,15 @@ int main(int argc, char ** argv) {
                     run_case(model, config, deferred);
                 } catch (const std::exception & error) {
                     fprintf(stderr, "FAIL %s (%s): %s\n", config.name, deferred ? "deferred" : "batch", error.what());
+                    ++failed;
+                }
+            }
+            if (config.sj_k) {
+                try {
+                    run_image_gap(model, config, 4); // text before the image
+                    run_image_gap(model, config, 0); // the image first: the first draft cell is not at position 0
+                } catch (const std::exception & error) {
+                    fprintf(stderr, "FAIL %s (image gap): %s\n", config.name, error.what());
                     ++failed;
                 }
             }

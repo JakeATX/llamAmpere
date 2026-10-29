@@ -1065,6 +1065,7 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
                 /*.resident_cells =*/ params.kv_gpu_tokens,
                 /*.shared_pool =*/ sj_kvarn_shared_pool,
                 /*.transform   =*/ params.sj_kvarn_transform ? params.sj_kvarn_transform : "",
+                /*.draft       =*/ cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP,
             },
         };
 
