@@ -42,6 +42,7 @@
 //   GGML_CUDA_AI23_FUSED_X=1  quantize activations inside direct one-token expert blocks (default off)
 //   GGML_CUDA_AI23_DIRECT=1..8  skip expert grouping through this token width in MMVR (default off)
 //   GGML_CUDA_AI23_ID_BN=32|64|128  override rate-2/3 routed prompt GEMM tile width (default automatic)
+//   GGML_CUDA_AI23_ID_STAGES=2|3  routed rate-2/3 prompt staging depth (default 3)
 //   GGML_CUDA_AI23_DENSE_TILE=1..29  dense shared-activation tile controls for 9..64 tokens (default off)
 //                             22/23 swap quantized activation halves to avoid LDS64 bank conflicts
 //   GGML_CUDA_AI23_XPERM=1  vector activation loads for whole-row dense rate-2 kernels (default off)
@@ -1019,6 +1020,26 @@ static bool ai4_mmvid_route(int n_tok, int n_used, int n_expert, int rate) {
     return (double) n_used*n_tok <= p*act;
 }
 
+template <int BN, int LAY, int XSH>
+static void ai23_launch_id_gemm(const uint8_t * W, const int8_t * q, const float * s, float * Y, int M, int K,
+                                 cudaStream_t stream, const ai4k::idmap & idm, int max_tiles) {
+    if constexpr (ai4k::lay_rate<LAY>() == 2 || ai4k::lay_rate<LAY>() == 3) {
+        static const int stages = [] {
+            const int v = ai4_env_int("GGML_CUDA_AI23_ID_STAGES", nullptr, 3);
+            if (v == 2 || v == 3) {
+                return v;
+            }
+            GGML_LOG_WARN("invalid GGML_CUDA_AI23_ID_STAGES; using 3 (expected 2 or 3)\n");
+            return 3;
+        }();
+        if (stages == 2) {
+            ai23_launch_gemm<BN, 2, 4, LAY, XSH, true>(W, q, s, Y, M, M, 0, K, stream, idm, max_tiles);
+            return;
+        }
+    }
+    ai23_launch_gemm<BN, 3, 4, LAY, XSH, true>(W, q, s, Y, M, M, 0, K, stream, idm, max_tiles);
+}
+
 template <int LAY, int XSH>
 static void ai4_mm_id_kernels(const uint8_t * W, const int8_t * q, const float * s, float * Y, int M, int K, int n_tok,
                               int n_expert, int64_t n_pairs, const ai4k::idmap & idm, int bn, int max_tiles, cudaStream_t stream, int sms) {
@@ -1045,14 +1066,14 @@ static void ai4_mm_id_kernels(const uint8_t * W, const int8_t * q, const float *
         }
     } else if (bn == 32) {
         if constexpr (ai4k::lay_rate<LAY>() == 2 || ai4k::lay_rate<LAY>() == 3) {
-            ai23_launch_gemm<32, 3, 4, LAY, XSH, true>(W, q, s, Y, M, M, 0, K, stream, idm, max_tiles);
+            ai23_launch_id_gemm<32, LAY, XSH>(W, q, s, Y, M, K, stream, idm, max_tiles);
         } else {
             GGML_ABORT("32-column expert tiles require rate 2 or 3");
         }
     } else if (bn == 128) {
-        ai23_launch_gemm<128, 3, 4, LAY, XSH, true>(W, q, s, Y, M, M, 0, K, stream, idm, max_tiles);
+        ai23_launch_id_gemm<128, LAY, XSH>(W, q, s, Y, M, K, stream, idm, max_tiles);
     } else {
-        ai23_launch_gemm<64, 3, 4, LAY, XSH, true>(W, q, s, Y, M, M, 0, K, stream, idm, max_tiles);
+        ai23_launch_id_gemm<64, LAY, XSH>(W, q, s, Y, M, K, stream, idm, max_tiles);
     }
 }
 
