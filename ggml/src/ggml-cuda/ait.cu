@@ -2,7 +2,7 @@
 // emulated activation path of the tile kernel (H256 rotation, x column scale, int8 round trip with one scale per
 // (token, slice)), then cuBLAS SGEMM in row slabs. This is the W4A8-style arithmetic of the fast kernel up to summation
 // order, so KL measured on it is the KL of the format. N <= 8 tokens take the tile-chain IMMA kernel (k_ait_mmv) unless
-// GGML_CUDA_AIT_ORDERED=0 restores the legacy unordered sum for comparison; GGML_CUDA_AIT_FUSE=0 sums the ordered slots in a second kernel.
+// GGML_CUDA_AIT_ORDERED=0 restores the legacy unordered sum for comparison; GGML_CUDA_AIT_FUSE=1 (opt-in, default 0) sums the ordered slots inside the main kernel instead of a second kernel.
 // GGML_CUDA_AIT_REF=1; GGML_CUDA_AIT_WARPS = warps per block of it (default 12),
 // GGML_CUDA_AIT_FULL = 1 (default): fully unrolled chunk loop, 0 = rolled 4 x 4 groups (Gate 2 10-23: unrolled 8-13% faster at N=1, every rate). GGML_CUDA_AIT_EXACT=1: f32 activations (no int8 round trip; the
 // A/B for the activation quantizer). GGML_CUDA_AIT_ASLICE = 512 (default) or 256: activation scale slice.
@@ -790,9 +790,9 @@ static void ait_fast_nt(ggml_backend_cuda_context & ctx, const uint8_t * W, cons
     }
     const size_t slots = (total_warps + M / 32 - 1) / (M / 32) + 2;
     ggml_cuda_pool_alloc<float> scratch(ctx.pool(id));
-    // Default ordered path: the last warp of each tile sums its slots in the main kernel, so no second launch. The tile
-    // counters follow the slots and are zeroed by k_ait_actq. GGML_CUDA_AIT_FUSE=0 or the V experiments keep the sum kernel.
-    static const bool fuse_opt = ait_env_int("GGML_CUDA_AIT_FUSE", 1) != 0;
+    // GGML_CUDA_AIT_FUSE=1 (opt-in, default 0 = second sum kernel): the last warp of each tile sums its slots in the main kernel, so no second launch. The tile
+    // counters follow the slots and are zeroed by k_ait_actq. Unset, 0 or the V experiments keep the sum kernel.
+    static const bool fuse_opt = ait_env_int("GGML_CUDA_AIT_FUSE", 0) != 0;
     const bool fuse = ordered && fuse_opt && !use_v;
     if (ordered) {
         scratch.alloc(slots * NT * (size_t) M + (fuse ? NT * (size_t) M : 0));
