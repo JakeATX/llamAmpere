@@ -5459,6 +5459,48 @@ static bool moe_cache_resize_prompt_pool(moe_cache_device & device, moe_cache_po
         slots = old_slots + (int)std::min((size_t)(slots - old_slots), headroom / pool.expert_size);
     }
     if (slots == old_slots) { return true; }
+    if (slots > old_slots) {
+        // Growth preserves every slot address and lookup key.
+        pool.slots.reserve(slots);
+        pool.free_slots.reserve(slots);
+        const size_t bytes = (size_t)slots * pool.expert_size;
+        if (!pool.prompt_slab->resize(bytes)) { return false; }
+        size_t deficit = 0;
+        if (!moe_cache_slab_preserves_reserve(device, bytes - before, "grow retained prompt pool", deficit) || deficit) {
+            pool.prompt_slab->resize(before);
+            return false;
+        }
+        pool.slots.resize(slots);
+        pool.free_slots.clear();
+        int head = -1, tail = -1;
+        for (int i = 0; i < slots; ++i) {
+            auto & slot = pool.slots[i];
+            if (slot.state != moe_cache_slot_state::valid) {
+                moe_cache_map_erase(pool, i);
+                slot = {};
+                pool.free_slots.push_back(i);
+                continue;
+            }
+            slot.prev = tail;
+            slot.next = -1;
+            slot.readers = 0;
+            if (tail >= 0) { pool.slots[tail].next = i; } else { head = i; }
+            tail = i;
+        }
+        pool.n_slots = slots;
+        pool.lru_head = head;
+        pool.lru_tail = tail;
+        pool.covers_all_entries = false;
+        for (const auto & shape : device.shapes) {
+            if (shape.expert_size == pool.expert_size && shape.wtype == pool.wtype) {
+                pool.covers_all_entries = (uint64_t)slots >= shape.n_entries;
+                break;
+            }
+        }
+        moe_cache_budget_allocation(device, bytes - before, true);
+        device.allocated_bytes += bytes - before;
+        return true;
+    }
     std::vector<int> ranked;
     for (int i = 0; i < old_slots; ++i) {
         if (pool.slots[i].state == moe_cache_slot_state::valid) { ranked.push_back(i); }
@@ -5511,13 +5553,6 @@ static bool moe_cache_resize_prompt_pool(moe_cache_device & device, moe_cache_po
     }
     const size_t bytes = (size_t)slots * pool.expert_size;
     if (!pool.prompt_slab->resize(bytes)) { return false; }
-    if (bytes > before) {
-        size_t deficit = 0;
-        if (!moe_cache_slab_preserves_reserve(device, bytes - before, "grow retained prompt pool", deficit) || deficit) {
-            pool.prompt_slab->resize(before);
-            return false;
-        }
-    }
     pool.n_slots = slots;
     pool.slots.swap(replacement);
     pool.map.swap(map);
@@ -5531,13 +5566,8 @@ static bool moe_cache_resize_prompt_pool(moe_cache_device & device, moe_cache_po
             break;
         }
     }
-    if (bytes >= before) {
-        moe_cache_budget_allocation(device, bytes - before, true);
-        device.allocated_bytes += bytes - before;
-    } else {
-        moe_cache_budget_allocation(device, before - bytes, false);
-        device.allocated_bytes -= before - bytes;
-    }
+    moe_cache_budget_allocation(device, before - bytes, false);
+    device.allocated_bytes -= before - bytes;
     return true;
 }
 
