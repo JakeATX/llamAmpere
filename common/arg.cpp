@@ -4160,7 +4160,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_TIMEOUT"));
     add_opt(common_arg(
         {"--loop-guard-reps"}, "N",
-        string_format("stop repeated output after N repeats (0 = disabled, default: %d)", params.loop_guard_reps),
+        string_format("stop repeated output after N repeats (0 = disabled, default: %d); bulk repetitive data: send loop_guard:false or start with --loop-guard-reps 0", params.loop_guard_reps),
         [](common_params & params, int value) {
             if (value < 0) { throw std::invalid_argument("loop guard repeats must be non-negative"); }
             params.loop_guard_reps = value;

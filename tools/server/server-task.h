@@ -72,7 +72,7 @@ struct task_params {
     int32_t n_cmpl    =  1; // number of completions to generate from this prompt
 
     bool    loop_guard = true;
-    int32_t loop_guard_reps = 4096;
+    int32_t loop_guard_reps = 100;
 
     int32_t n_cache_reuse = 0; // min chunk size to attempt reusing from the cache via KV shifting (0 = disabled)
 

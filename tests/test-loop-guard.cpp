@@ -58,6 +58,10 @@ int main() {
     CHECK(!other.accept(7, 100, 400));
 
     common_params base;
+    CHECK(base.loop_guard_reps == 100 && base.loop_guard_span == 400);
+    const auto defaults = server_schema::eval_llama_cmpl_schema(nullptr, base, {}, {});
+    CHECK(defaults.loop_guard && defaults.loop_guard_reps == 100);
+    CHECK(task_params{}.loop_guard_reps == 100);
     base.loop_guard_reps = 123;
     const auto params = server_schema::eval_llama_cmpl_schema(nullptr, base, {}, {{"loop_guard", false}, {"loop_guard_reps", 0}});
     CHECK(!params.loop_guard && params.loop_guard_reps == 0);

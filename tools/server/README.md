@@ -2396,8 +2396,8 @@ You may find available preferences in [settings-keys.ts](../ui/src/lib/constants
 
 ### Repeated output stopping
 
-The server checks generated tokens for back-to-back repeating units of 1 to 64 tokens. It stops when a unit reaches `--loop-guard-reps` repeats (default 4096), or the repeating stretch reaches `--loop-guard-span` tokens (default 12802) with at least four repeats. These conservative defaults preserve the repetitive code and data tested during validation. A token-only detector cannot distinguish all intentional repetition from a model loop.
+The server checks generated tokens for back-to-back repeating units of 1 to 64 tokens. It stops when a unit reaches `--loop-guard-reps` repeats (default 100), or the repeating stretch reaches `--loop-guard-span` tokens (default 400) with at least four repeats. A token-only detector cannot distinguish all intentional repetition from a model loop.
 
-Use `--loop-guard-reps 100 --loop-guard-span 400` for earlier stopping when intentional repetition is not expected. Use `--loop-guard-reps 0` to disable both rules. Requests can override the repeat count with `loop_guard_reps` or disable the guard with `loop_guard: false`. The span limit remains the server setting.
+For bulk repetitive data, send `loop_guard: false` or start with `--loop-guard-reps 0` to disable both rules. Intentional stops include 4,096-zero JSON/C arrays, 1,000 identical Markdown table rows, and base64 of a zero-filled page. Requests can override the repeat count with `loop_guard_reps`. The span limit remains the server setting.
 
 A loop stop preserves the text already generated and returns `stopped_loop: true`, `loop_period`, and `loop_repeats` in the final response and its timings. Native completions use `stop_type: "loop"` and `finish_reason: "stop"`; OpenAI completions use `finish_reason: "stop"`. The guard only sees accepted output tokens, including accepted speculative tokens, and starts fresh for each request. Prompt tokens are not counted.
