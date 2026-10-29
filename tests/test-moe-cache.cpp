@@ -4416,7 +4416,7 @@ static bool run_profile_swap_prior(ggml_backend_t gpu, ggml_backend_t cpu, log_c
     close(fd);
     set_env("GGML_MOE_CACHE_PROFILE_SAVE", filename.data());
 
-    constexpr int tensors = 3;
+    constexpr int tensors = 6;
     constexpr int64_t width = 1024, rows = 256, experts = 65;
     ggml_init_params params = {8 * ggml_tensor_overhead(), nullptr, true};
     ggml_context * ctx = ggml_init(params);
@@ -4433,10 +4433,11 @@ static bool run_profile_swap_prior(ggml_backend_t gpu, ggml_backend_t cpu, log_c
     const char * roles[] = {"up", "gate", "down"};
     for (int t = 0; t < tensors; ++t) {
         weights[t] = ggml_new_tensor_3d(ctx, GGML_TYPE_Q4_0, width, rows, experts);
-        ggml_format_name(weights[t], "blk.7.ffn_%s_exps.weight", roles[t]);
+        ggml_format_name(weights[t], "blk.%d.ffn_%s_exps.weight", 7 + t / 3, roles[t % 3]);
     }
     auto * acts = ggml_new_tensor_3d(inputs, GGML_TYPE_F32, width, 1, 1);
-    auto * ids = ggml_new_tensor_2d(inputs, GGML_TYPE_I32, 2, 1);
+    ggml_tensor * ids[] = {ggml_new_tensor_2d(inputs, GGML_TYPE_I32, 2, 1),
+        ggml_new_tensor_2d(inputs, GGML_TYPE_I32, 2, 1)};
     auto buffer = ggml_backend_alloc_ctx_tensors(ctx, cpu);
     auto input_buffer = ggml_backend_alloc_ctx_tensors(inputs, cpu);
     bool ok = buffer && input_buffer;
@@ -4465,11 +4466,14 @@ static bool run_profile_swap_prior(ggml_backend_t gpu, ggml_backend_t cpu, log_c
             cudaHostRegisterPortable | cudaHostRegisterMapped) == cudaSuccess;
     ok &= registered;
     if (!registered) { (void)cudaGetLastError(); }
-    std::vector<uint64_t> profile(experts, 0), prompt(experts, 1000);
-    profile[64] = 1000000;
-    prompt[64] = 0;
-    const uint64_t * profile_counts[] = {profile.data(), profile.data(), profile.data()};
-    const uint64_t * prompt_counts[] = {prompt.data(), prompt.data(), prompt.data()};
+    // Raw saved counts keep layer 7's experts and layer 8's expert 0 resident.
+    // Per-table normalization gives cold layer 8 expert 64 a 1/3 prior rate.
+    std::vector<uint64_t> profile[] = {std::vector<uint64_t>(experts, 1000000), std::vector<uint64_t>(experts, 0)};
+    profile[0][64] = 0;
+    profile[1][0] = 1800000;
+    profile[1][64] = 900000;
+    const uint64_t * profile_counts[tensors];
+    for (int t = 0; t < tensors; ++t) { profile_counts[t] = profile[t / 3].data(); }
     if (ok) { setup_stage = "profile session creation"; }
     void * writer = ok ? create_direct_session(gpu, cpu) : nullptr;
     ok &= writer != nullptr;
@@ -4499,11 +4503,11 @@ static bool run_profile_swap_prior(ggml_backend_t gpu, ggml_backend_t cpu, log_c
     const bool setup_ok = ok;
     std::vector<std::vector<float>> control_outputs(2 * tensors);
     for (int mode = 0; mode < 4; ++mode) {
-        const int prior_pct = mode == 0 ? 0 : mode == 3 ? 200 : 100;
-        set_env("GGML_MOE_CACHE_PROFILE_PRIOR_PCT", mode == 0 ? "0" : mode == 3 ? "200" : "100");
+        const int prior_pct = mode == 0 ? 0 : mode == 3 ? 400 : 100;
+        set_env("GGML_MOE_CACHE_PROFILE_PRIOR_PCT", mode == 0 ? "0" : mode == 3 ? "400" : "100");
         set_env("GGML_MOE_CACHE_PROFILE_PRIOR_DECAY", mode == 2 ? "1" : nullptr);
         // A nondecaying empirical score needs finite first-snapshot scaling.
-        // 200% makes its initial two routes exceed the admission margin.
+        // 400% x 1/3 x two routes exceeds the whole-bundle admission margin.
         set_env("GGML_MOE_CACHE_SWAP_DECAY_PCT", mode == 3 ? "100" : "95");
         if (!setup_ok) {
             printf("cache-profile-swap-prior pct=%d mode=%s counter_decay=%d: FAIL (setup)\n", prior_pct,
@@ -4517,21 +4521,24 @@ static bool run_profile_swap_prior(ggml_backend_t gpu, ggml_backend_t cpu, log_c
         ggml_tensor * outputs[tensors];
         bool case_ok = graph != nullptr;
         for (int t = 0; t < tensors && graph; ++t) {
-            reference[t] = make_graph(cpu, weights[t], acts, ids);
+            reference[t] = make_graph(cpu, weights[t], acts, ids[t / 3]);
             case_ok &= reference[t].buffer != nullptr;
-            outputs[t] = ggml_mul_mat_id(graph_ctx, weights[t], acts, ids);
+            outputs[t] = ggml_mul_mat_id(graph_ctx, weights[t], acts, ids[t / 3]);
             ggml_build_forward_expand(graph, outputs[t]);
         }
         ggml_backend_t backends[] = {gpu, cpu};
         auto scheduler = ggml_backend_sched_new(backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, false);
         case_ok &= scheduler != nullptr;
         if (case_ok) {
-            case_ok &= ggml_backend_sched_moe_cache_warm(scheduler, descriptors, prompt_counts, tensors) >= 0;
+            case_ok &= ggml_backend_sched_moe_cache_warm(scheduler, descriptors, profile_counts, tensors) >= 0;
             case_ok &= ggml_backend_sched_moe_cache_device_prepare(scheduler, descriptors, tensors) == 1;
             case_ok &= ggml_backend_sched_alloc_graph(scheduler, graph);
             for (int phase = 0; phase < 2 && case_ok; ++phase) {
-                const int32_t route[] = {phase == 0 ? 0 : 64, phase == 0 ? 0 : 64};
-                ggml_backend_tensor_set(ids, route, 0, sizeof(route));
+                for (int layer = 0; layer < 2; ++layer) {
+                    const int32_t expert = phase == 1 && layer == 1 ? 64 : 0;
+                    const int32_t route[] = {expert, expert};
+                    ggml_backend_tensor_set(ids[layer], route, 0, sizeof(route));
+                }
                 std::vector<float> expected[tensors], actual[tensors], first[tensors];
                 for (int t = 0; t < tensors; ++t) {
                     case_ok &= ggml_backend_graph_compute(cpu, reference[t].graph) == GGML_STATUS_SUCCESS;
@@ -4561,12 +4568,12 @@ static bool run_profile_swap_prior(ggml_backend_t gpu, ggml_backend_t cpu, log_c
         case_ok &= log.find("newly_uncovered_bytes=0") != std::string::npos;
         case_ok &= log.find("whole swap initial:") != std::string::npos && log.find("partial=0") != std::string::npos;
         case_ok &= log.find("whole-only swaps disabled:") == std::string::npos;
-        // Final teardown counters include the sole probe of the never-routed
-        // profile expert. Default cannot promote it before that first probe.
+        // Only layer 8's last probe is cold without a prior. Layer 7 stays hot.
+        // Two final routes cannot pass the no-prior admission margin of two.
         case_ok &= max_field_value(log, "dispatches=") == 17 * tensors;
-        case_ok &= max_field_value(log, "misses=") == (mode == 0 ? 2 * tensors : 0);
-        case_ok &= max_field_value(log, "hits=") == (mode == 0 ? 32 : 34) * tensors;
-        case_ok &= mode == 0 ? max_field_value(log, " swaps=") == 0 : max_field_value(log, " swaps=") >= tensors;
+        case_ok &= max_field_value(log, "misses=") == (mode == 0 ? tensors : 0);
+        case_ok &= max_field_value(log, "hits=") == (mode == 0 ? 33 : 34) * tensors;
+        case_ok &= mode == 0 ? max_field_value(log, " swaps=") == 0 : max_field_value(log, " swaps=") >= 3;
         case_ok &= mode == 0 ? log.find("swap profile prior:") == std::string::npos :
             log.find(mode == 2 ? "mode=decaying-seed" : "mode=persistent") != std::string::npos;
         printf("cache-profile-swap-prior counters pct=%d dispatches=%lld hits=%lld misses=%lld swaps=%lld\n",
