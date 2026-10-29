@@ -44,3 +44,5 @@ cmake --build build-sm86 -j8 --target llama-server
 The server listens on http://127.0.0.1:8080. Add `--no-spec-mb-mtp` for exact sampling.
 
 The measured Flash-Next configuration also needs our Q2S drafter and v2-r-pure expert profile; a public download command for those two exact assets is not supplied here. The [public main-model card](https://huggingface.co/taurusduan/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF) lists the two IQ3_XXS shards. Substituting a different drafter or profile does not reproduce the figures above.
+
+The current Flash-Next launcher is `scripts/flash-next-server.sh`: it defaults to our Q2S drafter and `profileinv/profile-decode-ship.bin` under `FLASH_NEXT_MODELS` (default `/mnt/models`). Set `LLAMA_SERVER_BIN` to the server executable and pass the main model and server arguments normally. To opt into the trace-derived v2-r-pure profile, set `FLASH_NEXT_PROFILE` to its full path. These defaults do not change the inputs used for the historical measurements above.
