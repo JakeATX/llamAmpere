@@ -18746,7 +18746,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         // GGML_TEST_AIV2_PERF=ait: only AIT2/3/4 with adjacent controls (AIT2_U, AIT4_U, EXL3 2/4 with glue)
         if (std::string(getenv("GGML_TEST_AIV2_PERF")) == "ait") {
             for (auto mk : std::vector<std::pair<int64_t, int64_t>>{ { 17408, 5120 }, { 5120, 17408 } }) {
-                for (int64_t n : { 1, 4, 5, 8 }) {
+                for (int64_t n : { 1, 2, 3, 4, 5, 8 }) {
                     for (ggml_type t : { GGML_TYPE_AIT2, GGML_TYPE_AIT2P, GGML_TYPE_AIT3, GGML_TYPE_AIT4 }) {
                         test_cases.emplace_back(new test_mul_mat_ait(t, mk.first, n, mk.second));
                     }
@@ -20139,6 +20139,24 @@ static int run_ait_check(const char * dir) {
             ggml_backend_graph_compute(be, gf);
             std::vector<float> yg((size_t) (N * M));
             ggml_backend_tensor_get(y, yg.data(), 0, yg.size() * 4);
+            if (N <= 8) {
+                const char * repeat_env = getenv("GGML_TEST_AIT_REPEAT");
+                const int repeats = repeat_env ? std::max(1, std::min(64, atoi(repeat_env))) : 8;
+                std::vector<float> again(yg.size());
+                bool identical = true;
+                for (int repeat = 1; repeat < repeats; ++repeat) {
+                    std::fill(again.begin(), again.end(), std::numeric_limits<float>::quiet_NaN());
+                    ggml_backend_tensor_set(y, again.data(), 0, again.size() * sizeof(float));
+                    if (ggml_backend_graph_compute(be, gf) != GGML_STATUS_SUCCESS) {
+                        identical = false;
+                        break;
+                    }
+                    ggml_backend_tensor_get(y, again.data(), 0, again.size() * sizeof(float));
+                    identical &= memcmp(yg.data(), again.data(), yg.size() * sizeof(float)) == 0;
+                }
+                fails += !identical;
+                printf("%s N=%lld: %d repeated outputs %s\n", nm.c_str(), (long long) N, repeats, identical ? "IDENTICAL" : "FAIL");
+            }
             if (const char * out = getenv("GGML_TEST_AIT_OUT")) {
                 const std::string file = std::string(out) + "/" + nm + "_n" + std::to_string(N) + ".f32";
                 std::ofstream dump(file, std::ios::binary);

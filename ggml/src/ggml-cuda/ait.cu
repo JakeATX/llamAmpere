@@ -2,6 +2,7 @@
 // emulated activation path of the tile kernel (H256 rotation, x column scale, int8 round trip with one scale per
 // (token, slice)), then cuBLAS SGEMM in row slabs. This is the W4A8-style arithmetic of the fast kernel up to summation
 // order, so KL measured on it is the KL of the format. N <= 8 tokens take the tile-chain IMMA kernel (k_ait_mmv) unless
+// GGML_CUDA_AIT_ORDERED=0 restores the legacy unordered sum for comparison.
 // GGML_CUDA_AIT_REF=1; GGML_CUDA_AIT_WARPS = warps per block of it (default 12),
 // GGML_CUDA_AIT_FULL = 1 (default): fully unrolled chunk loop, 0 = rolled 4 x 4 groups (Gate 2 10-23: unrolled 8-13% faster at N=1, every rate). GGML_CUDA_AIT_EXACT=1: f32 activations (no int8 round trip; the
 // A/B for the activation quantizer). GGML_CUDA_AIT_ASLICE = 512 (default) or 256: activation scale slice.
@@ -350,7 +351,7 @@ static __device__ __forceinline__ void ait_st_rel(unsigned int * p, unsigned int
 template <int KB, int NT, bool FULL, int PC = 0, int V = 0, int DEPTH = 4, bool LOW = false, bool CAP = false>
 static __global__ void __launch_bounds__(CAP ? 256 : LOW ? 384 : 512, CAP ? 4 : LOW ? 2 : 1) k_ait_mmv(const char * __restrict__ W, const int8_t * X,
         const float * SA, float * __restrict__ Y, const int M, const int K, const float * __restrict__ XF = nullptr,
-        const int l2pf = 0) {
+        const int l2pf = 0, float * __restrict__ partial = nullptr) {
     constexpr bool CO = (V & 2) != 0;
     using namespace aitk;
     constexpr int BQ = 8 * KB, GB = 16 * BQ, CS = 2048 * KB + 64, MU = 2;
@@ -529,8 +530,15 @@ static __global__ void __launch_bounds__(CAP ? 256 : LOW ? 384 : 512, CAP ? 4 : 
 #pragma unroll
             for (int u = 0; u < MU; ++u) {
                 const int m0 = t * 32 + 16 * u + g, m1 = m0 + 8;
-                if (n0 < NT)     { atomicAdd(Y + n0 * M + m0, cf[u][0]);       atomicAdd(Y + n0 * M + m1, cf[u][2]); }
-                if (n0 + 1 < NT) { atomicAdd(Y + (n0 + 1) * M + m0, cf[u][1]); atomicAdd(Y + (n0 + 1) * M + m1, cf[u][3]); }
+                if (partial) {
+                    const int first = (int) ((int64_t) t * S * W_ / items);
+                    float * out = partial + (int64_t) (w - first) * NT * M;
+                    if (n0 < NT)     { out[n0 * M + m0] = cf[u][0];       out[n0 * M + m1] = cf[u][2]; }
+                    if (n0 + 1 < NT) { out[(n0 + 1) * M + m0] = cf[u][1]; out[(n0 + 1) * M + m1] = cf[u][3]; }
+                } else {
+                    if (n0 < NT)     { atomicAdd(Y + n0 * M + m0, cf[u][0]);       atomicAdd(Y + n0 * M + m1, cf[u][2]); }
+                    if (n0 + 1 < NT) { atomicAdd(Y + (n0 + 1) * M + m0, cf[u][1]); atomicAdd(Y + (n0 + 1) * M + m1, cf[u][3]); }
+                }
                 cf[u][0] = cf[u][1] = cf[u][2] = cf[u][3] = 0.0f;
             }
             ks = 0;
@@ -538,6 +546,24 @@ static __global__ void __launch_bounds__(CAP ? 256 : LOW ? 384 : 512, CAP ? 4 : 
             xs = xb;
         }
     }
+}
+
+// Only nonempty warp ranges write scratch. Reduce them in warp order without reading unused slots.
+template <int NT>
+static __global__ void k_ait_mmv_sum(const float * partial, float * Y, int M, int S, int warps) {
+    const int tile = blockIdx.x, row = tile * 32 + (threadIdx.x & 31), token = threadIdx.x >> 5;
+    const int items = (M / 32) * S, begin = tile * S, end = begin + S;
+    const int first = (int) ((int64_t) begin * warps / items);
+    const int last = (int) (((int64_t) end * warps + items - 1) / items);
+    float sum = 0.0f;
+    for (int w = first; w < last; ++w) {
+        const int lo = (int) ((int64_t) w * items / warps);
+        const int hi = (int) ((int64_t) (w + 1) * items / warps);
+        if (lo < hi && lo < end && hi > begin) {
+            sum += partial[(int64_t) (w - first) * NT * M + token * M + row];
+        }
+    }
+    Y[token * M + row] = sum;
 }
 
 // Default-off N=1 experiment: a CTA owns all K slices of 32 output rows.
@@ -647,20 +673,20 @@ static __global__ void __launch_bounds__(32 * NW, NW == 16 ? 2 : 4) k_ait4_row_o
 
 template <int NT, bool FULL, int PC>
 static void ait_mmv_p(const dim3 grid, const dim3 block, cudaStream_t stream, const char * w, const int8_t * xq, const float * sa,
-        float * Y, int M, int K) {
+        float * Y, int M, int K, float * partial) {
     constexpr int SMEM = aitk::ptab_bytes<PC, 16>();
     static bool attr = false;
     if (!attr) {
         CUDA_CHECK(cudaFuncSetAttribute(k_ait_mmv<2, NT, FULL, PC>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM));
         attr = true;
     }
-    k_ait_mmv<2, NT, FULL, PC><<<grid, block, SMEM, stream>>>(w, xq, sa, Y, M, K);
+    k_ait_mmv<2, NT, FULL, PC><<<grid, block, SMEM, stream>>>(w, xq, sa, Y, M, K, nullptr, 0, partial);
 }
 
 // GGML_CUDA_AIT_V experiment launcher (FULL kernel; NT 1/4/5/8 only, others keep V = 0): V & 2 = cooperative fused launch
 template <int KB, int NT, int PC, int V>
 static void ait_mmv_v(const dim3 grid, const dim3 block, cudaStream_t stream, const char * w, const int8_t * xq, const float * sa,
-        float * Y, int M, int K, const float * X, int l2pf) {
+        float * Y, int M, int K, const float * X, int l2pf, float * partial) {
     constexpr int SMEM = aitk::ptab_bytes<PC, 16>();
     static bool attr = false;
     if (!attr && SMEM > 0) {
@@ -668,21 +694,21 @@ static void ait_mmv_v(const dim3 grid, const dim3 block, cudaStream_t stream, co
     }
     attr = true;
     if constexpr ((V & 2) != 0) {
-        void * args[] = { (void *) &w, (void *) &xq, (void *) &sa, (void *) &Y, (void *) &M, (void *) &K, (void *) &X, (void *) &l2pf };
+        void * args[] = { (void *) &w, (void *) &xq, (void *) &sa, (void *) &Y, (void *) &M, (void *) &K, (void *) &X, (void *) &l2pf, (void *) &partial };
         CUDA_CHECK(cudaLaunchCooperativeKernel((const void *) k_ait_mmv<KB, NT, true, PC, V>, grid, block, args, SMEM, stream));
     } else {
-        k_ait_mmv<KB, NT, true, PC, V><<<grid, block, SMEM, stream>>>(w, xq, sa, Y, M, K, X, l2pf);
+        k_ait_mmv<KB, NT, true, PC, V><<<grid, block, SMEM, stream>>>(w, xq, sa, Y, M, K, X, l2pf, partial);
     }
 }
 
 template <int NT, int V>
 static void ait_mmv_vk(const dim3 grid, const dim3 block, cudaStream_t stream, const char * w, const int8_t * xq, const float * sa,
-        float * Y, int M, int K, const float * X, int l2pf, int k, int code) {
-    if (code == 1) { ait_mmv_v<2, NT, 1, V>(grid, block, stream, w, xq, sa, Y, M, K, X, l2pf); return; }
+        float * Y, int M, int K, const float * X, int l2pf, int k, int code, float * partial) {
+    if (code == 1) { ait_mmv_v<2, NT, 1, V>(grid, block, stream, w, xq, sa, Y, M, K, X, l2pf, partial); return; }
     switch (k) {
-        case 2:  ait_mmv_v<2, NT, 0, V>(grid, block, stream, w, xq, sa, Y, M, K, X, l2pf); break;
-        case 3:  ait_mmv_v<3, NT, 0, V>(grid, block, stream, w, xq, sa, Y, M, K, X, l2pf); break;
-        default: ait_mmv_v<4, NT, 0, V>(grid, block, stream, w, xq, sa, Y, M, K, X, l2pf); break;
+        case 2:  ait_mmv_v<2, NT, 0, V>(grid, block, stream, w, xq, sa, Y, M, K, X, l2pf, partial); break;
+        case 3:  ait_mmv_v<3, NT, 0, V>(grid, block, stream, w, xq, sa, Y, M, K, X, l2pf, partial); break;
+        default: ait_mmv_v<4, NT, 0, V>(grid, block, stream, w, xq, sa, Y, M, K, X, l2pf, partial); break;
     }
 }
 
@@ -719,66 +745,84 @@ static void ait_fast_nt(ggml_backend_cuda_context & ctx, const uint8_t * W, cons
     const char * w = (const char *) W;
     static const int vexp = ait_env_int("GGML_CUDA_AIT_V", 0) & 3;
     static const int l2pf = std::max(0, std::min(32, ait_env_int("GGML_CUDA_AIT_L2PF", 0)));
+    static const int occ = ait_env_int("GGML_CUDA_AIT_OCC", 0);
+    static const int grid_factor = std::max(1, std::min(8, ait_env_int("GGML_CUDA_AIT_OCC_GRID", 4)));
+    static const bool ordered = ait_env_int("GGML_CUDA_AIT_ORDERED", 1) != 0;
+    const bool use_v = (NT == 1 || NT == 4 || NT == 5 || NT == 8) && vexp != 0 && (code != 1 || ait_plds() == 1);
+    int total_warps = nsm * warps;
+    if (!use_v && k == 4 && code == 0 && full && occ > 0) {
+        total_warps = occ >= 3 ? grid_factor * nsm * 8 : 2 * nsm * std::min(warps, 12);
+    }
+    const size_t slots = (total_warps + M / 32 - 1) / (M / 32) + 2;
+    ggml_cuda_pool_alloc<float> scratch(ctx.pool(id));
+    if (ordered) {
+        scratch.alloc(slots * NT * (size_t) M);
+    }
+    float * partial = ordered ? scratch.get() : nullptr;
+    auto finish = [&]() {
+        if (ordered) {
+            k_ait_mmv_sum<NT><<<M / 32, 32 * NT, 0, stream>>>(partial, Y, M, S, total_warps);
+        }
+        CUDA_CHECK(cudaGetLastError());
+    };
     if constexpr (NT == 1 || NT == 4 || NT == 5 || NT == 8) {
         if (vexp != 0 && (code != 1 || ait_plds() == 1)) {
             if (vexp & 2) {
-                ait_mmv_vk<NT, 3>(grid, block, stream, w, xq.get(), sa.get(), Y, M, K, X, l2pf, k, code);
+                ait_mmv_vk<NT, 3>(grid, block, stream, w, xq.get(), sa.get(), Y, M, K, X, l2pf, k, code, partial);
             } else {
                 k_ait_actq<NT><<<NT * S, 64, 0, stream>>>(X, W, xq.get(), sa.get(), Y, M, K, k);
-                ait_mmv_vk<NT, 1>(grid, block, stream, w, xq.get(), sa.get(), Y, M, K, X, l2pf, k, code);
+                ait_mmv_vk<NT, 1>(grid, block, stream, w, xq.get(), sa.get(), Y, M, K, X, l2pf, k, code, partial);
             }
-            CUDA_CHECK(cudaGetLastError());
+            finish();
             return;
         }
     }
     k_ait_actq<NT><<<NT * S, 64, 0, stream>>>(X, W, xq.get(), sa.get(), Y, M, K, k);
-    static const int occ = ait_env_int("GGML_CUDA_AIT_OCC", 0);
     if (k == 4 && code == 0 && full && occ > 0) {
         // Modes 3/4 cap registers for four 256-thread blocks per SM. Keep
         // both prefetch depths; profiles must check for local-memory spills.
         if (occ >= 3) {
-            static const int grid_factor = std::max(1, std::min(8, ait_env_int("GGML_CUDA_AIT_OCC_GRID", 4)));
             const dim3 grid_cap(grid_factor * nsm), block_cap(256);
             if (occ == 4) {
-                k_ait_mmv<4, NT, true, 0, 0, 1, true, true><<<grid_cap, block_cap, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K);
+                k_ait_mmv<4, NT, true, 0, 0, 1, true, true><<<grid_cap, block_cap, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
             } else {
-                k_ait_mmv<4, NT, true, 0, 0, 2, true, true><<<grid_cap, block_cap, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K);
+                k_ait_mmv<4, NT, true, 0, 0, 2, true, true><<<grid_cap, block_cap, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
             }
-            CUDA_CHECK(cudaGetLastError());
+            finish();
             return;
         }
         const dim3 grid_occ(2 * nsm), block_occ(32 * std::min(warps, 12));
         if (occ == 2) {
-            k_ait_mmv<4, NT, true, 0, 0, 1, true><<<grid_occ, block_occ, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K);
+            k_ait_mmv<4, NT, true, 0, 0, 1, true><<<grid_occ, block_occ, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
         } else {
-            k_ait_mmv<4, NT, true, 0, 0, 2, true><<<grid_occ, block_occ, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K);
+            k_ait_mmv<4, NT, true, 0, 0, 2, true><<<grid_occ, block_occ, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
         }
-        CUDA_CHECK(cudaGetLastError());
+        finish();
         return;
     }
     if (code == 1) {
         const int pl = ait_plds();
         if (full) {
-            if (pl == 2) { ait_mmv_p<NT, true, 2>(grid, block, stream, w, xq.get(), sa.get(), Y, M, K); }
-            else         { ait_mmv_p<NT, true, 1>(grid, block, stream, w, xq.get(), sa.get(), Y, M, K); }
+            if (pl == 2) { ait_mmv_p<NT, true, 2>(grid, block, stream, w, xq.get(), sa.get(), Y, M, K, partial); }
+            else         { ait_mmv_p<NT, true, 1>(grid, block, stream, w, xq.get(), sa.get(), Y, M, K, partial); }
         } else {
-            if (pl == 2) { ait_mmv_p<NT, false, 2>(grid, block, stream, w, xq.get(), sa.get(), Y, M, K); }
-            else         { ait_mmv_p<NT, false, 1>(grid, block, stream, w, xq.get(), sa.get(), Y, M, K); }
+            if (pl == 2) { ait_mmv_p<NT, false, 2>(grid, block, stream, w, xq.get(), sa.get(), Y, M, K, partial); }
+            else         { ait_mmv_p<NT, false, 1>(grid, block, stream, w, xq.get(), sa.get(), Y, M, K, partial); }
         }
     } else if (full) {
         switch (k) {
-            case 2:  k_ait_mmv<2, NT, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K); break;
-            case 3:  k_ait_mmv<3, NT, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K); break;
-            default: k_ait_mmv<4, NT, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K); break;
+            case 2:  k_ait_mmv<2, NT, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial); break;
+            case 3:  k_ait_mmv<3, NT, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial); break;
+            default: k_ait_mmv<4, NT, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial); break;
         }
     } else {
         switch (k) {
-            case 2:  k_ait_mmv<2, NT, false><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K); break;
-            case 3:  k_ait_mmv<3, NT, false><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K); break;
-            default: k_ait_mmv<4, NT, false><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K); break;
+            case 2:  k_ait_mmv<2, NT, false><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial); break;
+            case 3:  k_ait_mmv<3, NT, false><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial); break;
+            default: k_ait_mmv<4, NT, false><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial); break;
         }
     }
-    CUDA_CHECK(cudaGetLastError());
+    finish();
 }
 
 static bool ait_fast(ggml_backend_cuda_context & ctx, const uint8_t * W, const float * X, float * Y, int64_t T, int M, int K, int k, int code) {
