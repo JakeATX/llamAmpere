@@ -5472,7 +5472,18 @@ static bool moe_cache_resize_prompt_pool(moe_cache_device & device, moe_cache_po
         }
         while (slots > old_slots) {
             bytes = (size_t)slots * pool.expert_size;
-            if (!pool.prompt_slab->resize(bytes)) { return false; }
+            if (!pool.prompt_slab->resize(bytes)) {
+                // fork: a failed tail mapping leaves the retained prefix intact; retry a smaller physical growth.
+                const size_t chunk = pool.prompt_slab->mapped_size(1);
+                const size_t mapped = pool.prompt_slab->mapped_size();
+                const size_t wanted = pool.prompt_slab->mapped_size(bytes);
+                if (wanted <= mapped + chunk) { return false; }
+                const size_t target_bytes = mapped + (wanted - mapped) / chunk / 2 * chunk;
+                const size_t target = std::min((size_t)(slots - 1), target_bytes / pool.expert_size);
+                if (target <= (size_t)old_slots) { return false; }
+                slots = (int)target;
+                continue;
+            }
             size_t deficit = 0;
             const bool measured = moe_cache_slab_preserves_reserve(device, bytes - before, "grow retained prompt pool", deficit);
             if (measured && !deficit) { break; }
