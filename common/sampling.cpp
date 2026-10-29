@@ -1499,8 +1499,12 @@ static common_sampler_pq_result common_sampler_verify_pq_impl(const llama_token_
 common_sampler_pq_result common_sampler_verify_pq(const llama_token_data_array & p, const std::vector<llama_token_data> & q,
         llama_token d, llama_token x, std::mt19937 & rng, bool beat, common_sampler_pq_stats & stats,
         const llama_vocab * vocab, const std::function<bool(llama_token)> & is_stop) {
+    static const bool cache_q = [] {
+        const char * e = std::getenv("LLAMA_SPEC_PQ_CACHE");
+        return !e || std::atoi(e) != 0;
+    }();
     // Tiny supports cost less to scan again than to materialize a probability cache.
-    if (p.size <= 4) {
+    if (p.size <= 4 || !cache_q) {
         return beat ? common_sampler_verify_pq_impl<false, true>(p, q, d, x, rng, stats, vocab, is_stop) :
                       common_sampler_verify_pq_impl<false, false>(p, q, d, x, rng, stats, vocab, is_stop);
     }
