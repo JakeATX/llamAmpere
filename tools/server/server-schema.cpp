@@ -47,6 +47,13 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
         ->add_alias("max_tokens")
         ->set_desc("Set the maximum number of tokens to predict. When 0, no tokens will be generated but the prompt is evaluated into the cache"));
 
+    add((new field_bool("loop_guard", params.loop_guard))
+        ->set_desc("Stop generation when a short token sequence repeats for too long"));
+
+    add((new field_num("loop_guard_reps", params.loop_guard_reps))
+        ->set_hard_limits(0, INT32_MAX)
+        ->set_desc("Repeat count for loop stopping; 0 disables both repetition rules"));
+
     add((new field_num("n_indent", params.n_indent))
         ->set_hard_limits(0, INT32_MAX)
         ->set_desc("Specify the minimum line indentation for the generated text in number of whitespace characters. Useful for code completion tasks"));
@@ -536,6 +543,7 @@ task_params eval_llama_cmpl_schema(
     // Sampling parameter defaults are loaded from the global server context (but individual requests can still override them)
     params.sampling      = params_base.sampling;
     params.speculative   = params_base.speculative;
+    params.loop_guard_reps = params_base.loop_guard_reps;
     params.n_keep        = params_base.n_keep;
     params.n_predict     = params_base.n_predict;
     params.n_cache_reuse = params_base.n_cache_reuse;

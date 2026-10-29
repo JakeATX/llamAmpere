@@ -46,6 +46,7 @@ enum stop_type {
     STOP_TYPE_NONE,
     STOP_TYPE_EOS,
     STOP_TYPE_WORD,
+    STOP_TYPE_LOOP,
     STOP_TYPE_LIMIT,
 };
 
@@ -69,6 +70,9 @@ struct task_params {
     int32_t n_predict = -1; // new tokens to predict
     int32_t n_indent  =  0; // minimum line indentation for the generated text in number of whitespace characters
     int32_t n_cmpl    =  1; // number of completions to generate from this prompt
+
+    bool    loop_guard = true;
+    int32_t loop_guard_reps = 100;
 
     int32_t n_cache_reuse = 0; // min chunk size to attempt reusing from the cache via KV shifting (0 = disabled)
 

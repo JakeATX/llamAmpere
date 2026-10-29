@@ -1,6 +1,7 @@
 #include "server-context.h"
 #include "server-chat.h"
 #include "server-eval-cache.h"
+#include "server-loop-guard.h"
 #include "server-common.h"
 #include "server-decision.h"
 #include "server-http.h"
@@ -751,6 +752,7 @@ struct server_slot {
     int id_last_task = -1;
 
     stop_type stop;
+    server_loop_guard loop_guard;
 
     std::string stopping_word;
 
@@ -843,6 +845,7 @@ struct server_slot {
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
+        loop_guard = {};
         bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id, spec);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
@@ -927,6 +930,7 @@ struct server_slot {
         truncated      = false;
         prompt_checkpoint_restored = false;
         stop           = STOP_TYPE_NONE;
+        loop_guard     = {};
         stopping_word  = "";
         n_sent_text    = 0;
 
@@ -2960,6 +2964,7 @@ private:
 
         slot.prompt.tokens = server_tokens(e.tokens, false);
         slot.eval_cache_restored = true;
+        slot.loop_guard = {};
         slot.prompt.checkpoints = std::move(rec.checkpoints);
         // the restored checkpoints belong to this prompt: treat them like checkpoints this task created
         for (auto & c : slot.prompt.checkpoints) {
@@ -3223,6 +3228,7 @@ private:
         }
 
         // the per-request limit takes priority over the global one
+        slot.loop_guard = {};
         slot.n_predict_max = task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
 
         slot.sj_kvarn_accepted_end = -1;
@@ -3252,6 +3258,12 @@ private:
         slot.has_next_token = true;
 
         // check if there is incomplete UTF-8 character at the end
+        const auto & tp = slot.task->params;
+        const bool looped = tp.loop_guard && slot.loop_guard.accept(result.tok, tp.loop_guard_reps, params_base.loop_guard_span);
+        if (looped) {
+            // Flush pending text on a loop stop without an incomplete UTF-8 suffix.
+            slot.generated.truncate(validate_utf8(slot.generated.text));
+        }
         bool incomplete = validate_utf8(slot.generated.text) < slot.generated.text.size();
 
         // search stop word and delete it
@@ -3265,7 +3277,7 @@ private:
             if (stop_pos != std::string::npos) {
                 slot.generated.truncate(pos + stop_pos);
                 pos = std::min(slot.n_sent_text, slot.generated.text.size());
-            } else if (slot.has_next_token && !llama_vocab_is_eog(vocab, result.tok) ) {
+            } else if (!looped && slot.has_next_token && !llama_vocab_is_eog(vocab, result.tok) ) {
                 stop_pos = slot.find_stopping_strings(str_test, token_str.size(), false);
                 send_text = stop_pos == std::string::npos;
             }
@@ -3368,6 +3380,16 @@ private:
             slot.has_next_token = false;
 
             SLT_DBG(slot, "%s", "stopped by EOS\n");
+        }
+
+        if (looped && slot.stop != STOP_TYPE_WORD && slot.stop != STOP_TYPE_EOS) {
+            slot.stop = STOP_TYPE_LOOP;
+            slot.has_next_token = false;
+            slot.stats.stopped_loop = true;
+            slot.stats.loop_period = slot.loop_guard.period;
+            slot.stats.loop_repeats = slot.loop_guard.repeats;
+            SLT_INF(slot, "stopped loop: period = %d, repeats = %.2f, n_gen = %d\n",
+                    slot.loop_guard.period, slot.loop_guard.repeats, (int) slot.stats.n_gen);
         }
 
         SLT_DBG(slot, "n_gen = %d, n_remaining = %d, next token: %5d '%s'\n", (int) slot.stats.n_gen, slot.n_remaining(), result.tok, token_str.c_str());
@@ -4501,6 +4523,7 @@ private:
 
                         slot->prompt.clear();
                         slot->prompt.tokens = std::move(restored);
+                        slot->loop_guard = {};
                     } catch (const std::exception & err) {
                         slot->prompt_clear();
                         send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
@@ -5452,6 +5475,7 @@ private:
                                                               n_past == (int) slot.prompt.n_tokens();
                                 if (eval_cache_exact && pos_min >= pos_min_thold) {
                                     slot.prompt_checkpoint_restored = true;
+                                    slot.loop_guard = {};
                                     SLT_INF(slot, "eval cache: continuing from the restored entry at n_past = %d (pos_min = %d)\n", n_past, pos_min);
                                 } else if (pos_min >= pos_min_thold) {
                                     // search for a context checkpoint
@@ -5490,6 +5514,7 @@ private:
                                             pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                             n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
                                             slot.prompt_checkpoint_restored = true;
+                                            slot.loop_guard = {};
                                             SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
                                         } catch (const std::exception & err) {
                                             SLT_WRN(slot, "invalid context checkpoint: %s; reprocessing the prompt\n", err.what());

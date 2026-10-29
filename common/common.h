@@ -769,6 +769,8 @@ struct common_params {
     std::string cls_sep    = "\t";  // separator of classification sequences
 
     // server params
+    int32_t loop_guard_reps     = 100; // 0 disables repetition stopping
+    int32_t loop_guard_span     = 400; // stop long stretches with at least four repeats
     int32_t port                = 8080;          // server listens on this network port
     bool    reuse_port          = false;         // allow multiple sockets to bind to the same port
     int32_t timeout_read        = 3600;          // http read timeout in seconds
