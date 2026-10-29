@@ -5067,16 +5067,18 @@ static bool run_device_pageable_fallback(ggml_backend_t gpu, ggml_backend_t cpu,
     const long page_size = sysconf(_SC_PAGESIZE);
     if (page_size <= 0) { return false; }
     const size_t page = (size_t)page_size;
-    void * allocation = malloc(6 * page);
+    // 24 experts x 3 whole-only siblings fill the 64-slot minimum pool.
+    constexpr int64_t n_expert = 24;
+    void * allocation = malloc((n_expert + 2) * page);
     if (!allocation) { return false; }
     void * data = (void *)((((uintptr_t)allocation + page - 1) & ~(page - 1)) + 64);
     ggml_init_params params{ggml_tensor_overhead(), nullptr, true};
     auto * ctx = ggml_init(params);
-    auto * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_Q4_0, 256, 8, 3);
+    auto * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_Q4_0, 256, 8, n_expert);
     ggml_set_name(weights, "blk.7.ffn_up_exps.weight");
     const size_t packed_bytes = ggml_nbytes(weights);
     const size_t expert_bytes = weights->nb[2];
-    if (sparse) { weights->nb[2] = page; weights->nb[3] = 3 * page; }
+    if (sparse) { weights->nb[2] = page; weights->nb[3] = n_expert * page; }
     const size_t bytes = ggml_nbytes(weights);
     auto * buffer = ggml_backend_cpu_buffer_from_ptr(data, bytes);
     bool ok = buffer && expert_bytes + 64 < page &&
@@ -5089,7 +5091,7 @@ static bool run_device_pageable_fallback(ggml_backend_t gpu, ggml_backend_t cpu,
     };
     // CUDA knows both endpoints, but the owner ledger must reject the pageable middle.
     void * first_page = (void *)((uintptr_t)data - 64);
-    void * last_page = (char *)first_page + 2 * page;
+    void * last_page = (char *)first_page + (n_expert - 1) * page;
     const bool first_pinned = sparse && cudaHostRegister(first_page, page, cudaHostRegisterMapped) == cudaSuccess;
     const bool last_pinned = sparse && cudaHostRegister(last_page, page, cudaHostRegisterMapped) == cudaSuccess;
     ok &= !sparse || (first_pinned && last_pinned);
@@ -5099,8 +5101,8 @@ static bool run_device_pageable_fallback(ggml_backend_t gpu, ggml_backend_t cpu,
         ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
         std::vector<float> values(ggml_nelements(weights), 0.125f);
         std::vector<uint8_t> packed(packed_bytes);
-        ok &= ggml_quantize_chunk(weights->type, values.data(), packed.data(), 0, 24, 256, nullptr) == packed_bytes;
-        for (size_t e = 0; e < 3; ++e) {
+        ok &= ggml_quantize_chunk(weights->type, values.data(), packed.data(), 0, 8 * n_expert, 256, nullptr) == packed_bytes;
+        for (int64_t e = 0; e < n_expert; ++e) {
             memcpy((char *)data + e * weights->nb[2], packed.data() + e * expert_bytes, expert_bytes);
         }
         if (ok) { ok &= run_device_tables_case(gpu, cpu, weights, capture, nullptr, true); }
