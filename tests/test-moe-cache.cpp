@@ -6632,6 +6632,45 @@ static bool run_skipmass_rule() {
     const float invalid[2] = {NAN, 0.01f};
     ggml_moe_skipmass_select(invalid, hot, 2, 1, 0.1f, drop);
     ok &= !drop[0] && !drop[1];
+    // Compare the faster selector to the original sorted scan, including cutoff boundaries.
+    auto reference = [](const float * w, const unsigned char * h, int n, int mode, float t, unsigned char * d) {
+        bool chosen[10] = {};
+        float mass = 0.0f;
+        for (int i = 0; i < n; ++i) { d[i] = 0; }
+        for (int step = 0; step < n; ++step) {
+            int best = -1;
+            for (int i = n - 1; i >= 0; --i) {
+                if (!chosen[i] && !h[i] && (best < 0 || w[i] < w[best])) { best = i; }
+            }
+            if (best < 0) { break; }
+            chosen[best] = true;
+            if (mode == 1 ? w[best] < t : mass + w[best] <= t) { d[best] = 1; mass += w[best]; }
+        }
+    };
+    const float cases[][10] = {
+        {0.40f, 0.20f, 0.10f, 0.08f, 0.06f, 0.05f, 0.04f, 0.03f, 0.025f, 0.015f},
+        {0.0f, 0.125f, 0.0625f, 0.125f, 0.0f, 0.0625f, 0.25f, 0.125f, 0.125f, 0.125f},
+    };
+    unsigned char expected[10];
+    for (const auto & w : cases) {
+        for (unsigned mask = 0; mask < 1024; ++mask) {
+            for (int i = 0; i < 10; ++i) { hot[i] = mask >> i & 1u ? (unsigned char) (1 + i % 7) : 0; }
+            for (int n : {1, 4, 10}) {
+                for (int mode : {1, 2}) {
+                    for (float t : {0.0f, 0.03f, std::nextafter(0.03f, 1.0f), 0.125f, 0.25f, 0.999f}) {
+                        reference(w, hot, n, mode, t, expected);
+                        ggml_moe_skipmass_select(w, hot, n, mode, t, drop);
+                        ok &= memcmp(drop, expected, n) == 0;
+                    }
+                }
+            }
+        }
+    }
+    // Validate the whole token before dropping any earlier low-weight route.
+    const float invalid_last[2] = {0.01f, NAN};
+    hot[0] = hot[1] = 0;
+    ggml_moe_skipmass_select(invalid_last, hot, 2, 1, 0.1f, drop);
+    ok &= !drop[0] && !drop[1];
     printf("cache-skipmass-rule: %s\n", ok ? "OK" : "FAIL");
     return ok;
 }

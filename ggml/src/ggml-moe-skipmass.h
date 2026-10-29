@@ -15,6 +15,10 @@ static GGML_SKIPMASS_HD inline void ggml_moe_skipmass_select(
     for (int i = 0; i < n; ++i) {
         if (!(weights[i] >= 0.0f && weights[i] <= 1.0f)) { return; }
     }
+    if (mode == 1) {
+        for (int i = 0; i < n; ++i) { drop[i] = !hot[i] && weights[i] < threshold; }
+        return;
+    }
     for (int step = 0; step < n; ++step) {
         int best = -1;
         for (int i = n - 1; i >= 0; --i) {
@@ -22,10 +26,10 @@ static GGML_SKIPMASS_HD inline void ggml_moe_skipmass_select(
         }
         if (best < 0) { break; }
         chosen[best] = true;
-        if (mode == 1 ? weights[best] < threshold : mass + weights[best] <= threshold) {
-            drop[best] = 1;
-            mass += weights[best];
-        }
+        // Remaining weights are at least this large and cannot fit either.
+        if (!(mass + weights[best] <= threshold)) { break; }
+        drop[best] = 1;
+        mass += weights[best];
     }
 }
 #undef GGML_SKIPMASS_HD
