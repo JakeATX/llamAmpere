@@ -204,8 +204,8 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
 // PP-3 LLAMA_PP_SETUP=1: log where the layer-major setup spends its time and skip its allocator trim (the
 // "B1 prepared" trim returned ~0.1 MiB for 18 ms at 100K). Off by default; it changes no math.
 // PP-1: LLAMA_PP_OVERLAP=1 runs the generation-phase expert refill on a helper thread while the MTP helper
-// catches up on the prompt. Off by default. LLAMA_PP_OVERLAP_ROWS (64..8192, default 512) caps the helper's
-// catch-up rows while the refill owns the card, so its scratch fits in the cache reserve.
+// catches up on the final device-staged ubatch. Off by default. LLAMA_PP_OVERLAP_ROWS (64..8192, default 2048)
+// bounds catch-up scratch at the ordinary handoff width; preceding ubatches are consumed inside decode.
 static bool pp_keep_experts_on() {
     const char * e = getenv("LLAMA_PP_KEEP_EXPERTS");
     return e && strcmp(e, "1") == 0;
@@ -220,8 +220,8 @@ static bool pp_overlap_on() {
 static uint32_t pp_overlap_rows() {
     static const uint32_t rows = [] {
         const char * e = getenv("LLAMA_PP_OVERLAP_ROWS");
-        const long v = e && e[0] ? strtol(e, nullptr, 10) : 512;
-        return v >= 64 && v <= 8192 ? (uint32_t) v : 512u;
+        const long v = e && e[0] ? strtol(e, nullptr, 10) : 2048;
+        return v >= 64 && v <= 8192 ? (uint32_t) v : 2048u;
     }();
     return rows;
 }
