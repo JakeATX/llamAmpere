@@ -17,6 +17,7 @@
 #include <stdexcept>
 #include <unordered_map>
 #include <chrono>
+#include <thread>
 
 // [PFDIAG] host timing of init_batch pieces (LLAMA_DECODE_HOST_US=1, batches >= 256 tokens)
 namespace {
@@ -4236,6 +4237,16 @@ static bool kq_mask_fast_enabled() {
     return v;
 }
 
+// LLAMA_KQ_MASK_RUNS=N (default 0 = off): run-fill the sequence-prefix mask with N threads (1 = 8 threads).
+static int kq_mask_runs_threads() {
+    static const int v = [] {
+        const char * e = getenv("LLAMA_KQ_MASK_RUNS");
+        const int n = e ? atoi(e) : 0;
+        return n <= 0 ? 0 : n == 1 ? 8 : std::min(n, 64);
+    }();
+    return v;
+}
+
 template<typename T>
 static void set_input_kq_mask_seq_prefix(const llama_kv_cells & cells, const llama_ubatch * ubatch, int64_t n_kv, T * data) {
     const T mask_keep = llama_cast<T>(0.0f);
@@ -4244,6 +4255,39 @@ static void set_input_kq_mask_seq_prefix(const llama_kv_cells & cells, const lla
     const bool is_2d = ubatch->is_pos_2d();
 
     const llama_pos * pos = cells.pos_data();
+
+    // LLAMA_KQ_MASK_RUNS: with the used cells contiguous from 0 and ascending in position, row i is one run of keep
+    // (the cells up to the query position) and one run of drop, so it is written as two fills, split by rows across
+    // threads. Same values as the loop below (the 100K B1 prompt refills this mask for every attention layer).
+    const int runs = kq_mask_runs_threads();
+    if (runs > 0 && !is_2d) {
+        const int64_t n_prefix = std::min<int64_t>(n_kv, cells.used_max_p1());
+        bool ordered = cells.used_min() == 0 && cells.used_max_p1() == cells.get_used();
+        for (int64_t j = 1; ordered && j < n_prefix; ++j) {
+            ordered = pos[j - 1] <= pos[j];
+        }
+        if (ordered) {
+            const int64_t n_rows = ubatch->n_tokens;
+            auto fill_rows = [&](int64_t r0, int64_t r1) {
+                for (int64_t i = r0; i < r1; ++i) {
+                    const int64_t n_visible = std::upper_bound(pos, pos + n_prefix, ubatch->pos[i]) - pos;
+                    T * row = data + (uint64_t) n_kv*i;
+                    std::fill(row, row + n_visible, mask_keep);
+                    std::fill(row + n_visible, row + n_kv, mask_drop);
+                }
+            };
+            const int64_t n_threads = std::min<int64_t>(runs, std::max<int64_t>(1, n_rows*n_kv/(1 << 20)));
+            std::vector<std::thread> workers;
+            for (int64_t t = 1; t < n_threads; ++t) {
+                workers.emplace_back(fill_rows, n_rows*t/n_threads, n_rows*(t + 1)/n_threads);
+            }
+            fill_rows(0, n_rows/n_threads);
+            for (auto & w : workers) {
+                w.join();
+            }
+            return;
+        }
+    }
 
     for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
         const llama_pos p1 = ubatch->pos[i];
