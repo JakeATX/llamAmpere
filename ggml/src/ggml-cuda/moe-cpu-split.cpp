@@ -136,23 +136,32 @@ void q2_reorder_hidden(int n, block_q8_0 * y, float * yd, float * yc) {
     }
 }
 
-void dot_q2_0_rows(int n, int nrows, const char * w, size_t row_bytes, const block_q8_0 * y, const float * yd,
-        const float * yc, float * out) {
+template<int NT>
+void dot_q2_0_rows(int n, int nrows, const char * w, size_t row_bytes, const block_q8_0 * y, size_t y_stride,
+        const float * yd, const float * yc, size_t aux_stride, float * out, size_t out_stride) {
     const int nb = n / QK2_0;
 #if defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
     const __m256i shifts = _mm256_set_epi64x(6, 4, 2, 0);
     const __m256i m3 = _mm256_set1_epi8(3);
     const __m256i ones16 = _mm256_set1_epi16(1);
-    int r = 0;
-    for (; r < nrows; r += 4) {
-        const int nr = std::min(4, nrows - r);
-        __m256 acc[4] = { _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps() };
-        float corr[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    constexpr int rows = NT == 1 ? 4 : 2;
+    for (int r = 0; r < nrows; r += rows) {
+        const int nr = std::min(rows, nrows - r);
+        __m256 acc[NT][rows];
+        float corr[NT][rows] = {};
+        for (int t = 0; t < NT; ++t) {
+            for (int k = 0; k < rows; ++k) { acc[t][k] = _mm256_setzero_ps(); }
+        }
         for (int i = 0; i < nb; ++i) {
-            const __m256i q0 = _mm256_loadu_si256((const __m256i *) y[2 * i].qs);
-            const __m256i q1 = _mm256_loadu_si256((const __m256i *) y[2 * i + 1].qs);
-            const __m256 s0 = _mm256_set1_ps(yd[2 * i]);
-            const __m256 s1 = _mm256_set1_ps(yd[2 * i + 1]);
+            __m256i q0[NT], q1[NT];
+            __m256 s0[NT], s1[NT];
+            for (int t = 0; t < NT; ++t) {
+                const auto * yt = (const block_q8_0 *) ((const char *) y + (size_t) t * y_stride);
+                q0[t] = _mm256_loadu_si256((const __m256i *) yt[2 * i].qs);
+                q1[t] = _mm256_loadu_si256((const __m256i *) yt[2 * i + 1].qs);
+                s0[t] = _mm256_set1_ps(yd[(size_t) t * aux_stride + 2 * i]);
+                s1[t] = _mm256_set1_ps(yd[(size_t) t * aux_stride + 2 * i + 1]);
+            }
             for (int k = 0; k < nr; ++k) {
                 const block_q2_0 * x = (const block_q2_0 *) (w + (size_t) (r + k) * row_bytes) + i;
                 const float d = _cvtsh_ss(x->d);
@@ -161,32 +170,39 @@ void dot_q2_0_rows(int n, int nrows, const char * w, size_t row_bytes, const blo
                 memcpy(&c1, x->qs + 8, 8);
                 const __m256i w0 = _mm256_and_si256(_mm256_srlv_epi64(_mm256_set1_epi64x(c0), shifts), m3);
                 const __m256i w1 = _mm256_and_si256(_mm256_srlv_epi64(_mm256_set1_epi64x(c1), shifts), m3);
-                const __m256i p0 = _mm256_madd_epi16(_mm256_maddubs_epi16(w0, q0), ones16);
-                const __m256i p1 = _mm256_madd_epi16(_mm256_maddubs_epi16(w1, q1), ones16);
-                const __m256 f = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p0), s0, _mm256_mul_ps(_mm256_cvtepi32_ps(p1), s1));
-                acc[k] = _mm256_fmadd_ps(_mm256_set1_ps(d), f, acc[k]);
-                corr[k] += d * yc[i];
+                for (int t = 0; t < NT; ++t) {
+                    const __m256i p0 = _mm256_madd_epi16(_mm256_maddubs_epi16(w0, q0[t]), ones16);
+                    const __m256i p1 = _mm256_madd_epi16(_mm256_maddubs_epi16(w1, q1[t]), ones16);
+                    const __m256 f = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p0), s0[t], _mm256_mul_ps(_mm256_cvtepi32_ps(p1), s1[t]));
+                    acc[t][k] = _mm256_fmadd_ps(_mm256_set1_ps(d), f, acc[t][k]);
+                    corr[t][k] += d * yc[(size_t) t * aux_stride + i];
+                }
             }
         }
-        for (int k = 0; k < nr; ++k) { out[r + k] = hsum8(acc[k]) - corr[k]; }
+        for (int t = 0; t < NT; ++t) {
+            for (int k = 0; k < nr; ++k) { out[(size_t) t * out_stride + r + k] = hsum8(acc[t][k]) - corr[t][k]; }
+        }
     }
 #else
-    for (int r = 0; r < nrows; ++r) {
-        const block_q2_0 * x = (const block_q2_0 *) (w + (size_t) r * row_bytes);
-        float sum = 0.0f;
-        for (int i = 0; i < nb; ++i) {
-            const float d = ggml_fp16_to_fp32(x[i].d);
-            for (int k = 0; k < 2; ++k) {
-                const block_q8_0 & yb = y[2 * i + k];
-                int isum = 0;
-                for (int s = 0; s < 4; ++s) {
-                    for (int b = 0; b < 8; ++b) { isum += ((x[i].qs[8 * k + b] >> (2 * s)) & 3) * yb.qs[8 * s + b]; }
+    for (int t = 0; t < NT; ++t) {
+        const auto * yt = (const block_q8_0 *) ((const char *) y + (size_t) t * y_stride);
+        for (int r = 0; r < nrows; ++r) {
+            const block_q2_0 * x = (const block_q2_0 *) (w + (size_t) r * row_bytes);
+            float sum = 0.0f;
+            for (int i = 0; i < nb; ++i) {
+                const float d = ggml_fp16_to_fp32(x[i].d);
+                for (int k = 0; k < 2; ++k) {
+                    const block_q8_0 & yb = yt[2 * i + k];
+                    int isum = 0;
+                    for (int s = 0; s < 4; ++s) {
+                        for (int b = 0; b < 8; ++b) { isum += ((x[i].qs[8 * k + b] >> (2 * s)) & 3) * yb.qs[8 * s + b]; }
+                    }
+                    sum += d * yd[(size_t) t * aux_stride + 2 * i + k] * (float) isum;
                 }
-                sum += d * yd[2 * i + k] * (float) isum;
+                sum -= d * yc[(size_t) t * aux_stride + i];
             }
-            sum -= d * yc[i];
+            out[(size_t) t * out_stride + r] = sum;
         }
-        out[r] = sum;
     }
 #endif
 }
@@ -416,6 +432,7 @@ struct pool_state {
     std::vector<uint8_t> hq;    // [MOE_CS_MAX_ROUTES] quantized hidden rows
     size_t hq_stride = 0;
     bool avx512 = false;       // GGML_MOE_CPU_SPLIT_AVX512 and the CPU has AVX-512 F/BW/VL/VNNI
+    bool q2_pair = false;      // Share Q2 down weights between two routes of one expert.
     bool q2_fast = false;      // GGML_MOE_CPU_SPLIT_Q2_FAST: reordered hidden rows + dot_q2_0_rows for Q2_0 down
     size_t aux_stride = 0;     // floats per route in hq_aux: n/32 block scales, then n/64 offsets
     std::vector<float> hq_aux;
@@ -563,12 +580,20 @@ void run_item(pool_state & s, int phase, int item) {
     const int e = s.expert[i];
     if (s.q2_fast && down.q2) {
         const char * w = role_row(s, down, e, r0);
-        for (int q = s.first[i]; q < s.first[i + 1]; ++q) {
+        for (int q = s.first[i]; q < s.first[i + 1];) {
             float * o = s.out + (size_t) q * s.out_stride + r0;
-            if (!w) { for (int64_t row = r0; row < r1; ++row) { o[row - r0] = 0.0f; } continue; }
+            if (!w) { for (int64_t row = r0; row < r1; ++row) { o[row - r0] = 0.0f; } ++q; continue; }
             const float * aux = s.hq_aux.data() + (size_t) q * s.aux_stride;
-            dot_q2_0_rows((int) down.r.n_in, (int) (r1 - r0), w, down.r.row_bytes,
-                    (const block_q8_0 *) (s.hq.data() + (size_t) q * s.hq_stride), aux, aux + down.r.n_in / QK8_0, o);
+            const auto * y = (const block_q8_0 *) (s.hq.data() + (size_t) q * s.hq_stride);
+            if (s.q2_pair && q + 1 < s.first[i + 1]) {
+                dot_q2_0_rows<2>((int) down.r.n_in, (int) (r1 - r0), w, down.r.row_bytes, y, s.hq_stride,
+                        aux, aux + down.r.n_in / QK8_0, s.aux_stride, o, s.out_stride);
+                q += 2;
+            } else {
+                dot_q2_0_rows<1>((int) down.r.n_in, (int) (r1 - r0), w, down.r.row_bytes, y, s.hq_stride,
+                        aux, aux + down.r.n_in / QK8_0, s.aux_stride, o, s.out_stride);
+                ++q;
+            }
         }
         if (!w) { s.st_null.fetch_add(1, std::memory_order_relaxed); }
         return;
@@ -854,6 +879,7 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
     s.xq.assign(2 * MOE_CS_MAX_ROUTES * s.xq_stride, 0);
     s.hidden.assign((size_t) MOE_CS_MAX_ROUTES * max_ff, 0.0f);
     s.hq.assign(MOE_CS_MAX_ROUTES * s.hq_stride, 0);
+    s.q2_pair = env_int("GGML_MOE_CPU_SPLIT_Q2_PAIR", 0, 0, 1) != 0;
     s.q2_fast = env_int("GGML_MOE_CPU_SPLIT_Q2_FAST", 0, 0, 1) != 0;
     s.q8_reuse = env_int("GGML_MOE_CPU_SPLIT_Q8_REUSE", 1, 0, 1) != 0;
     s.down_reuse = env_int("GGML_MOE_CPU_SPLIT_DOWN_REUSE", 1, 0, 1) != 0;
@@ -965,6 +991,7 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
     fprintf(stderr, "[moe-cpu-split] pool: %d threads, %s%s (skipped cores at cpus %s), spin %d us, nap %d us, rows up/gate %d down %d%s%s%s\n",
             s.threads, pin ? "pinned to cpus " : "unpinned", where.c_str(), skipped.c_str(), s.spin_us, s.nap_us, s.rows_ug, s.rows_down,
             s.q2_fast ? ", Q2_0 down fast path" : "", smt ? ", SMT siblings" : "", s.avx512 ? ", grouped AVX-512 VNNI IQ" : "");
+    if (s.q2_pair && s.q2_fast) { fprintf(stderr, "[moe-cpu-split] Q2_0 down shares weights across route pairs\n"); }
     if (s.iq_rows) { fprintf(stderr, "[moe-cpu-split] IQ up/gate row kernels (each chunk decoded once per expert), variant %d, prefetch %d B\n", s.iq_variant, s.iq_pf); }
     if (s.schedule) { fprintf(stderr, "[moe-cpu-split] static quantization rows, grouped math claims\n"); }
     if (s.host_help) { fprintf(stderr, "[moe-cpu-split] waiting host drains math tiles on cpu %d\n", s.host_cpu); }
