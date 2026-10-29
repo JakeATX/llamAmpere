@@ -14,6 +14,8 @@
 #include "ggml-opt.h"
 
 #include <array>
+#include <atomic>
+#include <thread>
 #include <map>
 #include <vector>
 
@@ -151,6 +153,10 @@ struct llama_context {
 
     void set_n_threads(int32_t n_threads, int32_t n_threads_batch);
     void set_decode_phase(enum llama_decode_phase phase);
+    // PP-1: generation phase with the expert cache refill on a helper thread (LLAMA_PP_OVERLAP=1)
+    void set_decode_phase_async(enum llama_decode_phase phase);
+    bool prompt_warm_join();
+    bool prompt_warm_running() const { return pp_warm_thread.joinable(); }
     void set_next_decode_phase(enum llama_decode_phase phase);
 
     void set_abort_callback(bool (*abort_callback)(void * data), void * abort_callback_data);
@@ -711,6 +717,12 @@ private:
     void b1_cache_profile_load();
     void b1_cache_warm();
     void b1_cache_device_prepare();
+    // PP-1: refill thread state. pp_warm_async is set only while set_decode_phase_async() runs.
+    std::thread pp_warm_thread;
+    std::atomic<bool> pp_warm_done{false};
+    std::atomic<bool> pp_warm_failed{false};
+    bool pp_warm_async = false;
+    void pp_warm_start();
 
 public:
     // in-call checkpoints (llama_state_seq_capture_arm)

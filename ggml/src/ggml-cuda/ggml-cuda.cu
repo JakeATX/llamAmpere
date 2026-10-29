@@ -12436,6 +12436,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_cuda_pool_trim") == 0) {
         return (void *) ggml_backend_cuda_pool_trim;
     }
+    if (strcmp(name, "ggml_backend_cuda_moe_cache_fill_epoch") == 0) {
+        return (void *) ggml_cuda_moe_cache_fill_epoch;
+    }
     if (strcmp(name, "ggml_backend_cuda_reset_scratch") == 0) {
         return (void *) ggml_backend_cuda_reset_scratch;
     }

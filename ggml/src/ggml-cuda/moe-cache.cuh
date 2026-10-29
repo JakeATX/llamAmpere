@@ -198,6 +198,8 @@ static inline bool ggml_cuda_moe_cache_profile_plan(const std::vector<ggml_cuda_
 struct ggml_tensor;
 struct ggml_cgraph;
 struct ggml_backend_cuda_context;
+// PP-1: counts warms whose expert pools are fully sized (fills may still be running).
+uint64_t ggml_cuda_moe_cache_fill_epoch(void);
 // A nonzero token requires an active prepared session and opt-in capture.
 uint64_t ggml_cuda_moe_cache_device_capture_generation(int device);
 void ggml_cuda_moe_cache_device_graph_record(int device, bool captured, const ggml_cgraph * graph);

@@ -5628,6 +5628,11 @@ static size_t moe_cache_return(void * opaque) {
 // slot once in its own rank order, instead of filling all slots from the profile and replacing
 // most of them right away. Off by default.
 static thread_local bool g_warm_rank_only = false;
+static std::atomic<uint64_t> g_moe_cache_fill_epoch{0};
+
+uint64_t ggml_cuda_moe_cache_fill_epoch(void) {
+    return g_moe_cache_fill_epoch.load();
+}
 
 static int moe_cache_warm(void * opaque, const ggml_moe_cache_tensor_desc * tensors,
         const uint64_t * const * counts, int n_tensors) {
@@ -5894,6 +5899,9 @@ static int moe_cache_warm(void * opaque, const ggml_moe_cache_tensor_desc * tens
     // unchanged, but each fill it queues is taken back from the worker queue and copied here in
     // batches of async copies straight from the (pinned) source, one wait per batch, two batches
     // in flight, instead of the worker's stage memcpy + copy + wait per expert.
+    // PP-1: every pool of this warm has its final size here; only fills follow. A caller that overlaps the
+    // fills with other GPU work waits for this count to move before it allocates anything of its own.
+    g_moe_cache_fill_epoch.fetch_add(1);
     struct warm_fill { moe_cache_device * device; moe_cache_job job; char * destination; };
     struct warm_batch { std::vector<warm_fill> fills; size_t bytes = 0; cudaEvent_t done = nullptr; bool issued = false; };
     const char * warm_batch_env = getenv("GGML_MOE_CACHE_WARM_BATCH");

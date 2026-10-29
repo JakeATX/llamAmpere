@@ -273,6 +273,16 @@ LLAMA_API bool llama_sampler_backend_rows_ready(const struct llama_sampler * sam
 // The #217 trunk keep map is applied only when the tag is GENERATION.
 LLAMA_API void llama_set_next_decode_phase(struct llama_context * ctx, enum llama_decode_phase phase);
 
+// PP-1 (LLAMA_PP_OVERLAP=1, off by default): like llama_set_decode_phase(GENERATION), but the expert
+// cache refill that follows a long prompt runs on a helper thread. It returns once every cache pool has
+// its final size, so the caller can run the MTP helper's catch-up while the expert copies stream in.
+// Without the flag, or for any other phase, it is llama_set_decode_phase(). Every later decode, phase
+// change and state save/load of this context waits for the refill first; llama_prompt_warm_join()
+// waits explicitly and returns false if the refill failed.
+LLAMA_API void llama_set_decode_phase_async(struct llama_context * ctx, enum llama_decode_phase phase);
+LLAMA_API bool llama_prompt_warm_join(struct llama_context * ctx);
+LLAMA_API bool llama_prompt_overlap_enabled(void);
+
 // Expert keep map parser (#217, --moe-keep-map): "N" (every layer) or a comma list of "L:N", "A-B:N", "*:N".
 // keep_layer is empty when no explicit layer is listed; otherwise it has n_layer entries (-1 = keep every expert).
 // Returns false and sets error on bad input.

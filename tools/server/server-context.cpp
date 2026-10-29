@@ -6156,7 +6156,10 @@ private:
                 }
             }
         } handoff;
-        const bool handoff_on = spec && ctx_dft && common_speculative_handoff_enabled(spec.get()) && batch.view.size() > 3072 &&
+        // PP-1 (LLAMA_PP_OVERLAP=1): the helper catches up after the decode from the host rows, beside the
+        // generation-phase expert refill, instead of inside the decode's final layer.
+        const bool pp_overlap = spec && ctx_dft && llama_prompt_overlap_enabled();
+        const bool handoff_on = !pp_overlap && spec && ctx_dft && common_speculative_handoff_enabled(spec.get()) && batch.view.size() > 3072 &&
                 std::all_of(batch.view.tokens.begin(), batch.view.tokens.end(), [&](const auto & token) {
                     return token.seq_ids_extra.empty() && token.seq_id == batch.view.tokens.front().seq_id;
                 }) && std::any_of(slots.begin(), slots.end(), [](const server_slot & slot) {
@@ -6278,6 +6281,21 @@ private:
             metrics_post_decode(off, batch.view.size(), has_output);
         }
 
+        // PP-1: a finished prompt with nothing else running starts the target's generation phase now; its expert
+        // refill streams in while the helper catches up below, and is joined before the first sampled token.
+        bool pp_overlap_started = false;
+        if (pp_overlap && batch.view.size() > 3072 &&
+                std::any_of(slots.begin(), slots.end(), [](const server_slot & slot) {
+                    return slot.state == SLOT_STATE_DONE_PROMPT;
+                }) && std::none_of(slots.begin(), slots.end(), [](const server_slot & slot) {
+                    return slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_GENERATING;
+                })) {
+            queue_tasks.yield_to_queue([&]() {
+                llama_set_decode_phase_async(ctx_tgt, LLAMA_DECODE_PHASE_GENERATION);
+            });
+            pp_overlap_started = true;
+        }
+
         // fork: grow draft scratch only for a large prompt, then return it before generation.
         if (ctx_dft && batch.view.size() > 3072 &&
                 std::all_of(batch.view.tokens.begin(), batch.view.tokens.end(), [&](const auto & token) {
@@ -6364,7 +6382,16 @@ private:
         const bool other_work = std::any_of(slots.begin(), slots.end(), [](const server_slot & slot) {
             return slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_GENERATING;
         });
-        if (prompt_done && !other_work) {
+        if (pp_overlap_started) {
+            bool joined = true;
+            queue_tasks.yield_to_queue([&]() {
+                llama_set_decode_phase(ctx_dft, LLAMA_DECODE_PHASE_GENERATION);
+                joined = llama_prompt_warm_join(ctx_tgt);
+            });
+            if (!joined) {
+                throw std::runtime_error("expert cache refill failed");
+            }
+        } else if (prompt_done && !other_work) {
             queue_tasks.yield_to_queue([&]() {
                 if (ctx_dft) {
                     llama_set_decode_phase(ctx_dft, LLAMA_DECODE_PHASE_GENERATION);
