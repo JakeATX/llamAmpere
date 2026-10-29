@@ -1717,13 +1717,19 @@ static int moe_resident_copy(void * opaque, ggml_tensor * dst, size_t offset, co
         if (it && it != holes + n_holes && it->begin < end) {
             auto * ctx = (ggml_backend_cuda_context *) backend->context;
             ggml_cuda_set_device(ctx->device);
+            const char * bulk_env = getenv("GGML_MOE_BANK_HOLES_BULK");
+            const bool bulk = bulk_env && strcmp(bulk_env, "1") == 0;
+            // fork: overwrite cold spans on the same stream after one clear instead of clearing every hole.
+            if (bulk) {
+                CUDA_CHECK(cudaMemsetAsync((char *) dst->data + offset, 0, size, ctx->stream()));
+            }
             uintptr_t cursor = begin;
             for (; it != holes + n_holes && it->begin < end; ++it) {
                 const uintptr_t first = std::max(begin, it->begin), last = std::min(end, it->end);
                 if (cursor < first) {
                     backend->iface.set_tensor_async(backend, dst, (const void *) cursor, offset + (cursor - begin), first - cursor);
                 }
-                if (cudaMemsetAsync((char *) dst->data + offset + (first - begin), 0, last - first, ctx->stream()) != cudaSuccess) {
+                if (!bulk && cudaMemsetAsync((char *) dst->data + offset + (first - begin), 0, last - first, ctx->stream()) != cudaSuccess) {
                     GGML_ABORT("bank expert zero upload failed");
                 }
                 cursor = last;
