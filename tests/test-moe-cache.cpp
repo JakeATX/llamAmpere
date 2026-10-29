@@ -4901,7 +4901,7 @@ static bool run_prefetch_staging(ggml_backend_t gpu, ggml_backend_t cpu,
 }
 
 static bool run_device_tables_case(ggml_backend_t gpu, ggml_backend_t cpu,
-        ggml_tensor * weights, log_capture & capture, float * neighbor_output = nullptr) {
+        ggml_tensor * weights, log_capture & capture, float * neighbor_output = nullptr, bool require_staging = false) {
     if (!active_api().device_prepare || !active_api().device_supports) {
         return false;
     }
@@ -4960,7 +4960,9 @@ static bool run_device_tables_case(ggml_backend_t gpu, ggml_backend_t cpu,
             } else if (prepared) {
                 ok &= ggml_backend_sched_alloc_graph(scheduler, candidate.graph);
                 ok &= ggml_backend_sched_get_tensor_backend(scheduler, candidate.out) == gpu;
-                ok &= ggml_backend_sched_get_buffer_size(scheduler, gpu) < ggml_nbytes(weights);
+                if (!require_staging) {
+                    ok &= ggml_backend_sched_get_buffer_size(scheduler, gpu) < ggml_nbytes(weights);
+                }
                 std::vector<float> first(expected.size()), second(expected.size());
                 auto read_output = [&](std::vector<float> & output) {
                     void * destination = neighbor_output ? (void *)neighbor_output : output.data();
@@ -4987,8 +4989,12 @@ static bool run_device_tables_case(ggml_backend_t gpu, ggml_backend_t cpu,
             if (prepared) {
                 const std::string log = capture.get();
                 ok &= max_field_value(log, "dispatches=") == 3;
-                if (neighbor_output) {
+                if (neighbor_output || require_staging) {
                     ok &= log.find("mapped registration boundary copy:") != std::string::npos;
+                }
+                if (require_staging) {
+                    ok &= max_field_value(log, "new_copy_bytes=") > 0;
+                    ok &= max_field_value(log, "new_registered_bytes=") == 0;
                 }
                 if (route_mode == 0) {
                     ok &= max_field_value(log, "hits=") == 6 * tokens;
@@ -5020,6 +5026,44 @@ static bool run_device_tables_case(ggml_backend_t gpu, ggml_backend_t cpu,
             ok ? "OK" : "FAIL");
     return ok;
 }
+
+#if defined(GGML_CUDA) && defined(__linux__)
+static bool run_device_pageable_fallback(ggml_backend_t gpu, ggml_backend_t cpu, log_capture & capture) {
+    const long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) { return false; }
+    const size_t page = (size_t)page_size;
+    void * allocation = malloc(3 * page);
+    if (!allocation) { return false; }
+    void * data = (void *)((((uintptr_t)allocation + page - 1) & ~(page - 1)) + 64);
+    ggml_init_params params{ggml_tensor_overhead(), nullptr, true};
+    auto * ctx = ggml_init(params);
+    auto * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_Q4_0, 32, 8, 3);
+    ggml_set_name(weights, "blk.7.ffn_up_exps.weight");
+    const size_t bytes = ggml_nbytes(weights);
+    auto * buffer = ggml_backend_cpu_buffer_from_ptr(data, bytes);
+    bool ok = buffer && bytes + 64 < page &&
+            ggml_backend_tensor_alloc(buffer, weights, data) == GGML_STATUS_SUCCESS;
+    auto unregistered = [&]() {
+        cudaPointerAttributes attributes{};
+        const auto error = cudaPointerGetAttributes(&attributes, data);
+        (void)cudaGetLastError();
+        return error == cudaErrorInvalidValue || (error == cudaSuccess && attributes.type == cudaMemoryTypeUnregistered);
+    };
+    ok &= unregistered();
+    if (ok) {
+        ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        std::vector<float> values(ggml_nelements(weights), 0.125f);
+        ok &= ggml_quantize_chunk(weights->type, values.data(), data, 0, 24, 32, nullptr) == bytes;
+        if (ok) { ok &= run_device_tables_case(gpu, cpu, weights, capture, nullptr, true); }
+        ok &= unregistered();
+    }
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    free(allocation);
+    printf("cache-device-pageable-fallback: %s\n", ok ? "OK" : "FAIL");
+    return ok;
+}
+#endif
 
 // A full warm cache must admit a repeatedly routed miss without invalidating
 // the graph. Then route its evicted victim to verify the mapped fallback.
@@ -7431,6 +7475,12 @@ int main(int argc, char ** argv) {
         return 1;
     }
 #if defined(GGML_CUDA) && defined(__linux__)
+    if (argc == 2 && strcmp(argv[1], "--device-pageable-fallback-only") == 0) {
+        const bool ok = provider_is_cuda && run_device_pageable_fallback(gpu, cpu, capture);
+        ggml_backend_free(gpu);
+        ggml_backend_free(cpu);
+        return !provider_is_cuda ? 77 : ok ? 0 : 1;
+    }
     if (argc == 2 && strcmp(argv[1], "--host-pin-lifetime-only") == 0) {
         const bool ok = provider_is_cuda && test_host_pin_lifetime(provider_reg);
         ggml_backend_free(gpu);
@@ -7776,6 +7826,11 @@ int main(int argc, char ** argv) {
     ok &= run_optional(provider_is_cuda, "cache-device-tables", [&] {
         return run_device_tables(gpu, cpu, weights, capture);
     });
+#if defined(GGML_CUDA) && defined(__linux__)
+    ok &= run_optional(provider_is_cuda, "cache-device-pageable-fallback", [&] {
+        return run_device_pageable_fallback(gpu, cpu, capture);
+    });
+#endif
     ok &= run_optional(provider_is_cuda, "cache-device-fused", [&] {
         return run_device_fused_tables(gpu, cpu, capture);
     });
