@@ -83,4 +83,5 @@ private:
     std::vector<std::pair<size_t, size_t>> missing_ranges;
     bool (*pin_range)(void *, size_t) = nullptr;
     void (*unpin)(void *) = nullptr;
+    bool (*is_unpinned)(const void *, size_t) = nullptr;
 };

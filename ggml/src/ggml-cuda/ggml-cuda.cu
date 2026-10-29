@@ -119,6 +119,9 @@
 #include <set>
 #include <unordered_set>
 #include <vector>
+#if defined(__linux__)
+#include <unistd.h>
+#endif
 
 // Environment is a startup-only setting; runtime reserve validates malformed modes.
 static bool ggml_cuda_moe_table_prefetch_enabled() {
@@ -153,33 +156,77 @@ bool ggml_cuda_host_pin_contains(const void * ptr, size_t size) {
     return begin - range.first < range.second && size <= range.second - (begin - range.first);
 }
 
-static bool ggml_cuda_host_pin(void * ptr, size_t size) {
-    const uintptr_t begin = (uintptr_t)ptr;
+static bool ggml_cuda_host_unpinned_locked(uintptr_t begin, size_t size) {
+    uintptr_t end = begin + size;
+#if defined(__linux__)
+    // CUDA pins whole pages even when the requested byte ranges are disjoint.
+    static const long page_size = sysconf(_SC_PAGESIZE);
+    GGML_ASSERT(page_size > 0);
+    const size_t page = (size_t) page_size;
+    const size_t padding = end % page ? page - end % page : 0;
+    if (padding > UINTPTR_MAX - end) { return false; }
+    begin -= begin % page;
+    end += padding;
+#endif
+    const auto next = ggml_cuda_host_pins.lower_bound(begin);
+    return (next == ggml_cuda_host_pins.end() || next->first >= end) &&
+            (next == ggml_cuda_host_pins.begin() || std::prev(next)->second <= begin - std::prev(next)->first);
+}
+
+static bool ggml_cuda_host_is_unpinned(const void * ptr, size_t size) {
+    const uintptr_t begin = (uintptr_t) ptr;
     if (!ptr || !size || size > UINTPTR_MAX - begin) { return false; }
     std::lock_guard<std::mutex> lock(ggml_cuda_host_pin_mutex);
-    const auto next = ggml_cuda_host_pins.lower_bound(begin);
-    if ((next != ggml_cuda_host_pins.end() && next->first < begin + size) ||
-            (next != ggml_cuda_host_pins.begin() && std::prev(next)->first + std::prev(next)->second > begin)) {
-        return false;
+    return ggml_cuda_host_unpinned_locked(begin, size);
+}
+
+cudaError_t ggml_cuda_host_register(void * ptr, size_t size, unsigned int flags) {
+    const uintptr_t begin = (uintptr_t) ptr;
+    if (!ptr || !size || size > UINTPTR_MAX - begin) { return cudaErrorInvalidValue; }
+    std::lock_guard<std::mutex> lock(ggml_cuda_host_pin_mutex);
+    if (!ggml_cuda_host_unpinned_locked(begin, size)) {
+        GGML_LOG_ERROR("%s: overlapping host registration rejected\n", __func__);
+        return cudaErrorInvalidValue;
     }
     // Reserve bookkeeping before publishing a successful CUDA registration.
     try {
-        if (!ggml_cuda_host_pins.emplace(begin, size).second) { return false; }
-    } catch (...) { return false; }
-    const cudaError_t err = cudaHostRegister(ptr, size, cudaHostRegisterPortable | cudaHostRegisterMapped);
+        if (!ggml_cuda_host_pins.emplace(begin, size).second) { return cudaErrorInvalidValue; }
+    } catch (...) { return cudaErrorMemoryAllocation; }
+    const cudaError_t err = cudaHostRegister(ptr, size, flags);
+    if (err != cudaSuccess) { ggml_cuda_host_pins.erase(begin); }
+    return err;
+}
+
+static bool ggml_cuda_host_pin(void * ptr, size_t size) {
+    const cudaError_t err = ggml_cuda_host_register(ptr, size, cudaHostRegisterPortable | cudaHostRegisterMapped);
     if (err != cudaSuccess) {
-        ggml_cuda_host_pins.erase(begin);
-        (void)cudaGetLastError();
+        (void) cudaGetLastError();
         GGML_LOG_WARN("%s: failed to page-lock %.1f MiB: %s\n", __func__, size / 1048576.0, cudaGetErrorString(err));
         return false;
     }
     return true;
 }
 
-static void ggml_cuda_host_unpin(void * ptr) {
+void ggml_cuda_host_unregister(void * ptr) {
     std::lock_guard<std::mutex> lock(ggml_cuda_host_pin_mutex);
-    if (cudaHostUnregister(ptr) == cudaSuccess) { ggml_cuda_host_pins.erase((uintptr_t)ptr); }
-    else { (void)cudaGetLastError(); }
+    const auto found = ggml_cuda_host_pins.find((uintptr_t) ptr);
+    GGML_ASSERT(found != ggml_cuda_host_pins.end());
+    // Portable aliases can be read on any visible card. Drain them before unmapping.
+    int previous = 0, count = 0;
+    CUDA_CHECK(cudaGetDevice(&previous));
+    CUDA_CHECK(cudaGetDeviceCount(&count));
+    for (int device = 0; device < count; ++device) {
+        CUDA_CHECK(cudaSetDevice(device));
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
+    CUDA_CHECK(cudaSetDevice(previous));
+    // A failed unregister must stop the caller before it can release the pages.
+    CUDA_CHECK(cudaHostUnregister(ptr));
+    ggml_cuda_host_pins.erase(found);
+}
+
+static void ggml_cuda_host_unpin(void * ptr) {
+    ggml_cuda_host_unregister(ptr);
 }
 
 // Caller holds the registry lock through enqueue, excluding concurrent changes
@@ -10877,7 +10924,7 @@ bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size) {
     }
 
 #if CUDART_VERSION >= 11010 || defined(GGML_USE_MUSA) || defined(GGML_USE_HIP)
-    cudaError_t err = cudaHostRegister(buffer, size, cudaHostRegisterPortable | cudaHostRegisterReadOnly);
+    cudaError_t err = ggml_cuda_host_register(buffer, size, cudaHostRegisterPortable | cudaHostRegisterReadOnly);
     if (err != cudaSuccess) {
         // clear the error
         (void)cudaGetLastError();
@@ -10899,11 +10946,7 @@ void ggml_backend_cuda_unregister_host_buffer(void * buffer) {
         return;
     }
 
-    cudaError_t err = cudaHostUnregister(buffer);
-    if (err != cudaSuccess) {
-        // clear the error
-        (void)cudaGetLastError();
-    }
+    ggml_cuda_host_unregister(buffer);
 }
 
 
@@ -12072,6 +12115,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     // expert streamer uses it for GGML_SCHED_XSTREAM_PIN_MIB)
     if (strcmp(name, "ggml_backend_cuda_host_pin") == 0) {
         return (void *)ggml_cuda_host_pin;
+    }
+    if (strcmp(name, "ggml_backend_cuda_host_is_unpinned") == 0) {
+        return (void *) ggml_cuda_host_is_unpinned;
     }
     if (strcmp(name, "ggml_backend_cuda_host_unpin") == 0) {
         return (void *)ggml_cuda_host_unpin;

@@ -7975,7 +7975,7 @@ static void moe_cache_device_release(moe_cache_session & session, bool retain_so
     }
     ggml_cuda_set_device(session.devices[0]->logical);
     // Tables can be in flight on a scheduler stream, not the legacy cache stream.
-    (void) cudaDeviceSynchronize();
+    CUDA_CHECK(cudaDeviceSynchronize());
     if (session.mj_retained_arena) {
         unsigned long long counts[7] = {};
         if (cudaMemcpy(counts, session.mj_retained_counts, sizeof(counts), cudaMemcpyDeviceToHost) == cudaSuccess) {
@@ -8016,7 +8016,7 @@ static void moe_cache_device_release(moe_cache_session & session, bool retain_so
     if (!retain_sources) {
         for (auto & range : session.mapped_ranges) {
             if (range.registered) {
-                (void) cudaHostUnregister((void *) range.begin);
+                ggml_cuda_host_unregister((void *) range.begin);
             }
             if (range.staging) {
                 (void) cudaFreeHost(range.staging);
@@ -11119,10 +11119,11 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
         // Old kernels and tables were drained by the idle rerank; no published
         // address can observe this pruning. Unchanged cold sets copy nothing.
         size_t kept = 0, pruned_bytes = 0;
+        if (retained_ranges) { CUDA_CHECK(cudaDeviceSynchronize()); }
         for (size_t i = 0; i < retained_ranges; ++i) {
             auto & range = session->mapped_ranges[i];
             if (!retained_needed[i]) {
-                if (range.registered) { (void)cudaHostUnregister((void *)range.begin); }
+                if (range.registered) { ggml_cuda_host_unregister((void *) range.begin); }
                 if (range.staging) { (void)cudaFreeHost(range.staging); }
                 pruned_bytes += range.end - range.begin;
                 continue;
@@ -11257,7 +11258,7 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
             }
             const auto registration_start = std::chrono::steady_clock::now();
             const cudaError_t err = contained
-                ? cudaHostRegister((void *)range.begin, bytes, registration_flags)
+                ? ggml_cuda_host_register((void *)range.begin, bytes, registration_flags)
                 : cudaErrorInvalidValue;
             registration_calls += contained;
             registration_ms += std::chrono::duration<double, std::milli>(

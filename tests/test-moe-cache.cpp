@@ -7295,6 +7295,58 @@ static bool test_profile_global_plan() {
     return ok;
 }
 
+#if defined(GGML_CUDA) && defined(__linux__)
+static bool test_host_pin_lifetime(ggml_backend_reg_t reg) {
+    auto pin = (bool (*)(void *, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_host_pin");
+    auto unpin = (void (*)(void *)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_host_unpin");
+    auto unpinned = (bool (*)(const void *, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_host_is_unpinned");
+    const long page_size = sysconf(_SC_PAGESIZE);
+    if (!pin || !unpin || !unpinned || page_size <= 0) { return false; }
+    const size_t page = (size_t) page_size, bytes = 4 * page;
+    char * data = (char *) mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (data == MAP_FAILED) { return false; }
+    memset(data, 0x5a, bytes);
+    if (!pin(data, bytes)) { munmap(data, bytes); return false; }
+    bool ok = !unpinned(data, bytes) && !pin(data + page, page);
+    void * device = nullptr;
+    cudaStream_t stream = nullptr;
+    cudaEvent_t done = nullptr;
+    const bool allocated = cudaMalloc(&device, bytes) == cudaSuccess;
+    const bool streamed = cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) == cudaSuccess;
+    const bool event_created = cudaEventCreateWithFlags(&done, cudaEventDisableTiming) == cudaSuccess;
+    bool queued = allocated && streamed && event_created;
+    if (queued) {
+        queued = cudaMemcpyAsync(device, data, bytes, cudaMemcpyHostToDevice, stream) == cudaSuccess &&
+                cudaEventRecord(done, stream) == cudaSuccess;
+    }
+    unpin(data);
+    ok &= queued && cudaEventQuery(done) == cudaSuccess;
+    ok &= unpinned(data, bytes);
+    if (queued) {
+        memset(data, 0, bytes);
+        ok &= cudaMemcpy(data, device, bytes, cudaMemcpyDeviceToHost) == cudaSuccess;
+        for (size_t i = 0; i < bytes; ++i) { ok &= data[i] == 0x5a; }
+    }
+    if (event_created) { ok &= cudaEventDestroy(done) == cudaSuccess; }
+    if (streamed) { ok &= cudaStreamDestroy(stream) == cudaSuccess; }
+    if (allocated) { ok &= cudaFree(device) == cudaSuccess; }
+    const bool first = pin(data, page), last = pin(data + 3 * page, page);
+    ok &= first && last && unpinned(data + page, 2 * page);
+    if (first && last) { ok &= !pin(data, bytes); }
+    if (unpinned(data + page, 2 * page)) { ok &= madvise(data + page, 2 * page, MADV_DONTNEED) == 0; }
+    if (first) { unpin(data); }
+    if (last) { unpin(data + 3 * page); }
+    ok &= unpinned(data, bytes);
+    const bool tiny = pin(data, 1);
+    ok &= tiny && !pin(data + 1, 1);
+    if (tiny) { unpin(data); }
+    ok &= unpinned(data, bytes);
+    ok &= munmap(data, bytes) == 0;
+    printf("cache-host-pin-lifetime: %s\n", ok ? "OK" : "FAIL");
+    return ok;
+}
+#endif
+
 int main(int argc, char ** argv) {
     if (argc == 2 && strcmp(argv[1], "--profile-global-plan-only") == 0) {
         return test_profile_global_plan() ? 0 : 1;
@@ -7378,6 +7430,14 @@ int main(int argc, char ** argv) {
         }
         return 1;
     }
+#if defined(GGML_CUDA) && defined(__linux__)
+    if (argc == 2 && strcmp(argv[1], "--host-pin-lifetime-only") == 0) {
+        const bool ok = provider_is_cuda && test_host_pin_lifetime(provider_reg);
+        ggml_backend_free(gpu);
+        ggml_backend_free(cpu);
+        return !provider_is_cuda ? 77 : ok ? 0 : 1;
+    }
+#endif
     if (argc == 2 && strcmp(argv[1], "--device-missjoin-retain-lifecycle-only") == 0) {
         const bool ok = provider_is_cuda && run_device_missjoin_retain_lifecycle(gpu, cpu, capture);
         ggml_backend_free(gpu);
