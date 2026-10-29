@@ -43,6 +43,7 @@
 //   GGML_CUDA_AI23_DIRECT=1..8  skip expert grouping through this token width in MMVR (default off)
 //   GGML_CUDA_AI23_ID_BN=32|64|128  override rate-2/3 routed prompt GEMM tile width (default automatic)
 //   GGML_CUDA_AI23_ID_STAGES=2|3  routed rate-2/3 prompt staging depth (default 3)
+//   GGML_CUDA_AI23_ID_SLABS=4|8  routed rate-2/3 prompt row slabs per block (default 8)
 //   GGML_CUDA_AI23_DENSE_TILE=1..29  dense shared-activation tile controls for 9..64 tokens (default off)
 //                             22/23 swap quantized activation halves to avoid LDS64 bank conflicts
 //   GGML_CUDA_AI23_XPERM=1  vector activation loads for whole-row dense rate-2 kernels (default off)
@@ -1032,6 +1033,22 @@ static void ai23_launch_id_gemm(const uint8_t * W, const int8_t * q, const float
             GGML_LOG_WARN("invalid GGML_CUDA_AI23_ID_STAGES; using 3 (expected 2 or 3)\n");
             return 3;
         }();
+        static const int slabs = [] {
+            const int v = ai4_env_int("GGML_CUDA_AI23_ID_SLABS", nullptr, 8);
+            if (v == 4 || v == 8) {
+                return v;
+            }
+            GGML_LOG_WARN("invalid GGML_CUDA_AI23_ID_SLABS; using 8 (expected 4 or 8)\n");
+            return 8;
+        }();
+        if (slabs == 4) {
+            if (stages == 2) {
+                ai23_launch_gemm<BN, 2, 4, LAY, XSH, true, 1, 4>(W, q, s, Y, M, M, 0, K, stream, idm, max_tiles);
+            } else {
+                ai23_launch_gemm<BN, 3, 4, LAY, XSH, true, 1, 4>(W, q, s, Y, M, M, 0, K, stream, idm, max_tiles);
+            }
+            return;
+        }
         if (stages == 2) {
             ai23_launch_gemm<BN, 2, 4, LAY, XSH, true>(W, q, s, Y, M, M, 0, K, stream, idm, max_tiles);
             return;

@@ -14821,6 +14821,11 @@ static void add_ai23_cases(std::vector<std::unique_ptr<test_case>> & cases) {
 static void add_ai_bank_cases(std::vector<std::unique_ptr<test_case>> & cases) {
     // fork: one expert puts each routed GEMM tile boundary in the actual pair list, with H128/H256 and partial row tiles.
     for (ggml_type t : { GGML_TYPE_AIT2_U, GGML_TYPE_AIT3_U }) {
+        for (int m : { 48, 64, 80 }) {
+            cases.emplace_back(new test_mul_mat_id_ai4(t, 1, 1, true, m, 33, 256));
+            cases.emplace_back(new test_mul_mat_id_ai4(t, 1, 1, false, m, 33, 384));
+            cases.emplace_back(new test_mul_mat_id_ai4(t, 1, 1, false, m, 33, 384, false, false, 1));
+        }
         for (int n : { 31, 32, 33, 63, 64, 65, 127, 128, 129 }) {
             cases.emplace_back(new test_mul_mat_id_ai4(t, 1, 1, true, 144, n, 256));
             cases.emplace_back(new test_mul_mat_id_ai4(t, 1, 1, false, 144, n, 384));
