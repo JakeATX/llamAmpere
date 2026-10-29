@@ -486,6 +486,7 @@ struct pool_state {
     int iq_pf = 0;             // GGML_MOE_CPU_SPLIT_PF: prefetch distance of those kernels in bytes (0 = off)
     bool schedule = false;    // Assign quantization rows directly and claim math tiles in small groups.
     bool host_help = false;
+    bool item_barrier = false; // GGML_MOE_CPU_SPLIT_ITEM_BARRIER: phases end when their items are done, not their threads
     int host_cpu = -1;
     std::atomic<int> help_phase{-1}; // -1 closed, 1/3 open, 5/7 held by a helper
     std::atomic<unsigned long long> closed[4];
@@ -493,6 +494,9 @@ struct pool_state {
     alignas(64) std::atomic<unsigned long long> gen{0};
     alignas(64) std::atomic<int> next[4];
     alignas(64) std::atomic<unsigned long long> fin[4];
+    // item_barrier: (job number << 32) | next item / items finished, per phase
+    alignas(64) std::atomic<unsigned long long> inext[4];
+    alignas(64) std::atomic<unsigned long long> idone[4];
     alignas(64) std::atomic<int> sleepers{0};
     std::mutex sleep_mu;
     std::condition_variable sleep_cv;
@@ -767,6 +771,42 @@ void run_job_phases(pool_state & s, unsigned long long n, int worker, bool lead 
     }
 }
 
+// item_barrier: the same items as run_job_phases, but a phase ends when all of its items are finished instead of
+// when every thread has passed it, so a pool thread the OS has descheduled while it holds no item (a pool core is
+// shared with the desktop and the server's own threads) no longer stalls the job at four barriers. Claims carry the
+// job number: a thread that wakes up late in an old job can never claim an item of a newer one. Every item still
+// writes its own rows the same way, so the results are bit-identical.
+constexpr unsigned long long item_low = 0xffffffffULL;
+
+void run_job_items(pool_state & s, unsigned long long n, bool lead = false) {
+    const unsigned long long tag = (n & item_low) << 32;
+    auto t = clk::now();
+    for (int p = 0; p < 4; ++p) {
+        const unsigned long long total = (unsigned long long) items_of(s, p);
+        for (unsigned long long c = s.inext[p].load(std::memory_order_acquire);
+                (c & ~item_low) == tag && (c & item_low) < total;) {
+            if (!s.inext[p].compare_exchange_weak(c, c + 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+                continue;
+            }
+            run_item(s, p, (int) (c & item_low));
+            s.idone[p].fetch_add(1, std::memory_order_acq_rel);
+            c = s.inext[p].load(std::memory_order_acquire);
+        }
+        if (p == 3 && !lead) { return; }   // thread 0 alone waits for the last items and publishes `done`
+        for (;;) {
+            const unsigned long long d = s.idone[p].load(std::memory_order_acquire);
+            if ((d & ~item_low) != tag) { return; }   // this job ended without this thread
+            if ((d & item_low) >= total) { break; }
+            cpu_relax();
+        }
+        if (lead) {
+            const auto now = clk::now();
+            s.phase_ns[p] += (unsigned long long) std::chrono::duration_cast<std::chrono::nanoseconds>(now - t).count();
+            t = now;
+        }
+    }
+}
+
 void pin_thread(int cpu) {
 #if defined(__linux__)
     if (cpu < 0) { return; }
@@ -827,7 +867,7 @@ void worker_main(pool_state * sp, int idx, int cpu) {
             }
         }
         seen = g;
-        run_job_phases(s, g, idx);
+        if (s.item_barrier) { run_job_items(s, g); } else { run_job_phases(s, g, idx); }
     }
 }
 
@@ -889,15 +929,26 @@ void leader_main(pool_state * sp, int cpu) {
                 if (input == q) { s.inputs[s.n_input++] = q; }
             }
             ++n;
-            for (int p = 0; p < 4; ++p) { s.next[p].store(0, std::memory_order_relaxed); }
+            const unsigned long long tag = (n & item_low) << 32;
+            for (int p = 0; p < 4; ++p) {
+                s.next[p].store(0, std::memory_order_relaxed);
+                s.idone[p].store(tag, std::memory_order_relaxed);
+                s.inext[p].store(tag, std::memory_order_relaxed);
+            }
             s.gen.store(n, std::memory_order_seq_cst);
             if (s.sleepers.load(std::memory_order_seq_cst) > 0) {
                 std::lock_guard<std::mutex> lk(s.sleep_mu);
                 s.sleep_cv.notify_all();
             }
-            run_job_phases(s, n, 0, true);
-            const unsigned long long target = n * (unsigned long long) s.threads;
-            while (s.fin[3].load(std::memory_order_acquire) < target) { cpu_relax(); }
+            if (s.item_barrier) {
+                run_job_items(s, n, true);
+                // close this job's claims before the next job's state is written
+                for (int p = 0; p < 4; ++p) { s.inext[p].store(tag | item_low, std::memory_order_release); }
+            } else {
+                run_job_phases(s, n, 0, true);
+                const unsigned long long target = n * (unsigned long long) s.threads;
+                while (s.fin[3].load(std::memory_order_acquire) < target) { cpu_relax(); }
+            }
             s.st_experts.fetch_add((unsigned) s.n_exp, std::memory_order_relaxed);
             s.st_routes.fetch_add((unsigned) s.n_route, std::memory_order_relaxed);
         } else {
@@ -967,7 +1018,10 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
     s.nap_us = env_int("GGML_MOE_CPU_SPLIT_NAP_US", 1000, 1, 100000);
     s.schedule = env_int("GGML_MOE_CPU_SPLIT_SCHEDULE", 0, 0, 1) != 0;
     s.host_help = env_int("GGML_MOE_CPU_SPLIT_HOST", 0, 0, 1) != 0;
-    for (int p = 0; p < 4; ++p) { s.next[p].store(0); s.fin[p].store(0); s.closed[p].store(0); }
+    s.item_barrier = env_int("GGML_MOE_CPU_SPLIT_ITEM_BARRIER", 0, 0, 1) != 0 && !s.schedule && !s.host_help;
+    for (int p = 0; p < 4; ++p) {
+        s.next[p].store(0); s.fin[p].store(0); s.closed[p].store(0); s.inext[p].store(item_low); s.idone[p].store(0);
+    }
     // Reserve the caller's actual core and keep the card-driving thread on it.
     const bool max_threads = env_int("GGML_MOE_CPU_SPLIT_MAX_THREADS", 1, 0, 1) != 0;
 #if defined(__linux__)
@@ -1060,6 +1114,7 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
     if (s.iq_rows) { fprintf(stderr, "[moe-cpu-split] IQ up/gate row kernels (each chunk decoded once per expert), variant %d, prefetch %d B\n", s.iq_variant, s.iq_pf); }
     if (s.schedule) { fprintf(stderr, "[moe-cpu-split] static quantization rows, grouped math claims\n"); }
     if (s.host_help) { fprintf(stderr, "[moe-cpu-split] waiting host drains math tiles on cpu %d\n", s.host_cpu); }
+    if (s.item_barrier) { fprintf(stderr, "[moe-cpu-split] item barriers (a descheduled idle thread does not stall a job)\n"); }
     fprintf(stderr, "[moe-cpu-split] input Q8 reuse %s, IQ token group %d, IQ4_NL down reuse %s\n", s.q8_reuse ? "on" : "off", s.group_tokens, s.down_reuse ? "on" : "off");
     return true;
 }
