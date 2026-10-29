@@ -7169,6 +7169,40 @@ static bool test_prefetch_budget() {
 static bool test_profile_global_plan() {
     using item = ggml_cuda_moe_profile_item;
     ggml_cuda_moe_profile_plan plan;
+    std::vector<uint8_t> pool_data;
+    auto append64 = [&](uint64_t value) {
+        for (int shift = 0; shift < 64; shift += 8) { pool_data.push_back((uint8_t)(value >> shift)); }
+    };
+    for (uint64_t value : {UINT64_C(0x314c4f4f50454f4d), UINT64_C(2), UINT64_C(3), UINT64_C(4), UINT64_C(64),
+            UINT64_C(2), UINT64_C(8), UINT64_C(128)}) { append64(value); }
+    const std::vector<ggml_cuda_moe_pool_limit> pools = {{2, 8, 256}, {3, 4, 256}};
+    std::vector<size_t> caps;
+    bool pool_ok = ggml_cuda_moe_cache_pool_plan(pool_data.data(), pool_data.size(), pools, 64, caps);
+    pool_ok &= caps == std::vector<size_t>({128, 64});
+    const auto saved_caps = caps;
+    auto reject_pool = [&](std::vector<uint8_t> data) {
+        return !ggml_cuda_moe_cache_pool_plan(data.data(), data.size(), pools, 64, caps) && caps == saved_caps;
+    };
+    auto bad_pool = pool_data;
+    bad_pool[0] = 0; pool_ok &= reject_pool(bad_pool);
+    bad_pool = pool_data; bad_pool[8] = 1; pool_ok &= reject_pool(bad_pool);
+    bad_pool = pool_data; bad_pool.pop_back(); pool_ok &= reject_pool(bad_pool);
+    bad_pool = pool_data; bad_pool.push_back(0); pool_ok &= reject_pool(bad_pool);
+    bad_pool = pool_data; bad_pool[16] = 9; pool_ok &= reject_pool(bad_pool);
+    bad_pool = pool_data; bad_pool[24] = 8; pool_ok &= reject_pool(bad_pool);
+    bad_pool = pool_data; bad_pool[32] = 63; pool_ok &= reject_pool(bad_pool);
+    bad_pool = pool_data; bad_pool[33] = 2; pool_ok &= reject_pool(bad_pool);
+    bad_pool = pool_data; std::copy_n(bad_pool.begin() + 16, 24, bad_pool.begin() + 40); pool_ok &= reject_pool(bad_pool);
+    pool_ok &= !ggml_cuda_moe_cache_pool_plan(pool_data.data(), pool_data.size(), pools, 0, caps);
+    std::vector<item> constrained;
+    for (int32_t expert = 0; expert < 256; ++expert) {
+        constrained.push_back({0, expert, 0, 0, 8, (uint64_t)(256 - expert)});
+        constrained.push_back({1, expert, 0, 1, 4, (uint64_t)(256 - expert)});
+    }
+    pool_ok &= ggml_cuda_moe_cache_profile_plan(constrained, caps, 4096, 64, plan);
+    pool_ok &= plan.bundles == 64 && plan.bytes == 768 && plan.slots == std::vector<size_t>({64, 64});
+    printf("cache-pool-plan: %s\n", pool_ok ? "OK" : "FAIL");
+    if (!pool_ok) { return false; }
     std::vector<item> items;
     std::vector<uint8_t> ranked;
     auto append32 = [&](uint32_t value) {

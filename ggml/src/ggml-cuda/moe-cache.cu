@@ -2613,6 +2613,22 @@ static bool moe_cache_build_global_profile(moe_cache_session & session, moe_cach
         if (!stride) { return false; }
         caps.push_back(std::min<size_t>((size_t)std::min<uint64_t>(shape->n_entries, INT_MAX), INT_MAX / stride));
     }
+    // fork: constrain the existing whole-expert planner; never raise its live memory budget.
+    const char * pool_plan = getenv("GGML_MOE_CACHE_POOL_PLAN");
+    if (pool_plan && *pool_plan) {
+        if (pending.size() > 4096) { GGML_ABORT("too many expert pools for pool plan"); }
+        std::vector<ggml_cuda_moe_pool_limit> pools;
+        for (size_t p = 0; p < pending.size(); ++p) {
+            pools.push_back({(uint64_t)pending[p]->wtype, pending[p]->expert_size, caps[p]});
+        }
+        std::unique_ptr<FILE, int (*)(FILE *)> file(fopen(pool_plan, "rb"), fclose);
+        std::vector<uint8_t> data(16 + 24 * pending.size());
+        if (!file || fread(data.data(), 1, data.size(), file.get()) != data.size() || fgetc(file.get()) != EOF ||
+                ferror(file.get()) || !ggml_cuda_moe_cache_pool_plan(data.data(), data.size(), pools, moe_cache_pool_slots_min, caps)) {
+            GGML_ABORT("invalid expert pool plan: %s", pool_plan);
+        }
+        MOE_CACHE_LOG("[moe-cache] CUDA%d pool plan loaded: %s pools=%zu\n", device.physical, pool_plan, caps.size());
+    }
     std::vector<ggml_cuda_moe_profile_item> items;
     std::vector<moe_cache_key> keys;
     size_t group = 0, previous_tensor = SIZE_MAX;
@@ -2741,7 +2757,7 @@ static bool moe_cache_build_global_profile(moe_cache_session & session, moe_cach
     if (whole_only) {
         for (size_t p = 0; p < pending.size(); ++p) {
             const int pool = pending[p]->pool;
-            caps[p] = pool >= 0 ? (size_t)device.pools[pool]->n_slots : 0;
+            caps[p] = pool >= 0 ? std::min(caps[p], (size_t)device.pools[pool]->n_slots) : 0;
         }
         if (!ggml_cuda_moe_cache_profile_plan(items, caps, budget, moe_cache_pool_slots_min,
                 plan, density, (size_t)ranked_limit)) {
