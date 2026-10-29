@@ -1473,8 +1473,12 @@ static __global__ void __launch_bounds__(THREADS) ids_helper(
     // fork: prompt pairs use separate warps so the full block need not scan every id.
     if (zero_y != nullptr && n_tok > 8) {
         for (int64_t p = warp; p < n_pairs; p += THREADS/32) {
-            const int u = (int) (p % n_used), t = (int) (p / n_used);
-            const int e = *(const int *) (ids + u*ids_nb0 + t*ids_nb1);
+            int e = 0;
+            if (lane == 0) {
+                const int u = (int) (p % n_used), t = (int) (p / n_used);
+                e = *(const int *) (ids + u*ids_nb0 + t*ids_nb1);
+            }
+            e = __shfl_sync(0xffffffff, e, 0);
             if (e < 0 || e >= n_expert) {
                 float * y = zero_y + p*zero_m;
                 for (int i = lane; i < zero_m; i += 32) {
