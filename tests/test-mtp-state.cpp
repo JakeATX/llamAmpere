@@ -767,7 +767,8 @@ static void run_mtp_pipe() {
 
 // fork: exercise production pooling, attention and serialization without an evaluation callback that changes CUDA fusion.
 static void run_qwen4exp_indexer_layout(bool cuda) {
-    const bool host_requested = common_get_env("LLAMA_QSA_RAW_HOST") == "1";
+    const char * host_env = std::getenv("LLAMA_QSA_RAW_HOST");
+    const bool host_requested = !host_env || std::atoi(host_env) != 0;
     prefill_env_restore prefill_env;
     prefill_env.set(false, false, false);
     feedback_env_restore feedback_env;

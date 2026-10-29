@@ -1505,12 +1505,12 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     pimpl->model.reset(model);
 
     if (llama_model_moe_arena_size(model) && !std::getenv("GGML_CUDA_MOE_CACHE_RESERVE_MB")) {
-        // Flash-Next (qwen4exp) keeps 1024 MiB free (VRAMFIT: its scratch is trimmed, peak 23,397 MiB on a 24 GB card);
-        // other arena models keep the older 2560 MiB.
+        // Flash-Next keeps 928 MiB free with trimmed prompt scratch and host-backed raw indexer history.
+        // Other arena models keep 2560 MiB.
         char arch[64] = {0};
         const bool flashnext = llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch)) > 0 &&
             std::string(arch) == "qwen4exp";
-        common_set_env("GGML_CUDA_MOE_CACHE_RESERVE_MB", flashnext ? "1024" : "2560");
+        common_set_env("GGML_CUDA_MOE_CACHE_RESERVE_MB", flashnext ? "928" : "2560");
     }
     // Two or more server slots: every extra slot needs card memory after the
     // expert cache has filled the card (prompt scratch, handoff staging and

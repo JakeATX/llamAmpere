@@ -68,7 +68,7 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
     }()),
     host_raw([&] {
         const char * value = std::getenv("LLAMA_QSA_RAW_HOST");
-        return compact_pool && value && std::atoi(value) != 0;
+        return compact_pool && (!value || std::atoi(value) != 0);
     }()),
     hparams_idx(model.hparams),
     mem_idx(filter_idx == nullptr ? nullptr : [&] {

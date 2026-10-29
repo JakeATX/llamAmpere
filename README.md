@@ -8,12 +8,10 @@
 - **Faster prompt reading on Swift 1.5 27B** (+5.3% at 100K) from a new GDN-layer kernel, same output.
 - **AI+ model files** (our weight format for Ampere and newer) run in v0.6.
 - **Qwen3.8 Flash-Next:** expert cache on the card with the rest of the experts in RAM, a fast whole-prompt read, and
-  `--kv-gpu-tokens N` to keep only part of the KV cache on the card. Launch command and numbers: coming soon in the
-  release notes.
+  `--kv-gpu-tokens N` to keep only part of the KV cache on the card. See the [v0.6.1 release notes](docs/llamampere-v0.6.1/RELEASE_NOTES.md) for the latest integration measurements.
 - Nemotron 3.5 Bolt / Super, EXL3 speed-ups with the same output, and a fix for SJ-KVaRN with image prompts.
 - Swift 1.5 v0.6 vs v0.5 speed table and gates: [release notes](docs/llamampere-v0.6/RELEASE_NOTES.md).
-- **New in v0.6.1:** a crash fix. The 12 GB command (`LLAMA_KQ_MASK_PACKED=1` with SJ-KVaRN) no longer stops at
-  startup. No speed change. [Release notes](docs/llamampere-v0.6.1/RELEASE_NOTES.md).
+- **New in v0.6.1:** faster Flash-Next prompt processing and writing, a smaller BF16 router, and more room for experts through host-backed indexer history and tighter workspace budgeting. In three adjacent pairs on one RTX 3090 Ti at 350 W, a 100K coding prompt and 5,120 output tokens averaged 2,751 prompt tokens/s and 113.15 writing tokens/s, versus 2,672 and 109.65 on v0.6. These are observations from one seed, not a statistically established speed gain. The 12 GB packed-mask startup crash and Flash-Next replay after rejected drafts are also fixed. [Release notes](docs/llamampere-v0.6.1/RELEASE_NOTES.md).
 
 **Build and run (v0.6.1, one RTX 3090 / 3090 Ti, 262,144-token context).** Needs Linux, an NVIDIA card with 24 GB, the
 CUDA toolkit (tested with 12.4), CMake, git and a C++ compiler. The model download is 15.6 GB.
@@ -25,8 +23,8 @@ cmake -S . -B build-sm86 -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_
   -DLLAMA_BUILD_BORINGSSL=ON
 cmake --build build-sm86 -j8 --target llama-server
 ./build-sm86/bin/llama-server \
-  --hf-repo jakeatx/ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M-GGUF \
-  --hf-file ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M.gguf -c 262144 \
+  -hf jakeatx/ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M-GGUF \
+  -hff ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M.gguf -c 262144 \
   -ngl 99 -fa on -ctk sjkvarn4 -ctv sjkvarn4 -b 4096 -ub 1024 --parallel 1 \
   --spec-type draft-mtp-adaptive --spec-draft-n-min-adaptive 3 --spec-draft-n-max 5 --spec-draft-p-min 0
 ```
