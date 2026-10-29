@@ -468,6 +468,8 @@ struct moe_cache_prompt_slab {
         return true;
     }
     char * data() const { return (char *) address; }
+    size_t mapped_size() const { return mapped; }
+    size_t mapped_size(size_t bytes) const { return (bytes + chunk - 1) / chunk * chunk; }
     ~moe_cache_prompt_slab() {
         if (address) {
             resize(0);
@@ -478,6 +480,8 @@ struct moe_cache_prompt_slab {
     bool init(int) { return false; }
     bool resize(size_t) { return false; }
     char * data() const { return nullptr; }
+    size_t mapped_size() const { return 0; }
+    size_t mapped_size(size_t bytes) const { return bytes; }
 #endif
 };
 
@@ -5725,17 +5729,23 @@ static size_t moe_cache_lend(void * opaque, size_t bytes) {
                 return (long double)a.uses / a.bytes < (long double)b.uses / b.bytes;
             });
             std::unordered_set<int> evicted;
-            size_t selected = 0;
-            // Free slots already contain no weights; count them before evicting whole layers.
-            for (const auto & pool : device->pools) {
-                for (const auto & slot : pool->slots) {
-                    if (slot.state == moe_cache_slot_state::free) { selected += pool->expert_size; }
+            // Count unmapped chunks, including unused slots, before selecting another whole layer.
+            auto released_bytes = [&]() {
+                size_t released = 0;
+                for (const auto & pool : device->pools) {
+                    size_t kept = 0;
+                    for (const auto & slot : pool->slots) {
+                        if (slot.state != moe_cache_slot_state::valid) { continue; }
+                        const auto found = layers.find(slot.key.tensor);
+                        if (found == layers.end() || !evicted.count(found->second)) { ++kept; }
+                    }
+                    released += pool->prompt_slab->mapped_size() - pool->prompt_slab->mapped_size(kept * pool->expert_size);
                 }
-            }
+                return released;
+            };
             for (const auto & entry : ranked) {
-                if (selected >= bytes - std::min(bytes, freed)) { break; }
+                if (released_bytes() >= bytes - std::min(bytes, freed)) { break; }
                 evicted.insert(entry.layer);
-                selected += entry.bytes;
             }
             for (const auto & pool : device->pools) {
                 int kept = 0;
@@ -5746,9 +5756,9 @@ static size_t moe_cache_lend(void * opaque, size_t bytes) {
                     }
                     kept += pool->slots[i].state == moe_cache_slot_state::valid;
                 }
-                const size_t before = (size_t)pool->n_slots * pool->expert_size;
+                const size_t before = pool->prompt_slab->mapped_size();
                 if (!moe_cache_resize_pool(*device, *pool, kept)) { continue; }
-                freed += before - (size_t)pool->n_slots * pool->expert_size;
+                freed += before - pool->prompt_slab->mapped_size();
                 retained += (size_t)pool->n_slots * pool->expert_size;
             }
             MOE_CACHE_LOG("[moe-cache] prompt whole-layer loan: evicted_layers=%zu retained_bytes=%zu released_bytes=%zu ms=%.3f\n",
