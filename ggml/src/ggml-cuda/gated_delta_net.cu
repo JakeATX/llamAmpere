@@ -405,6 +405,7 @@ gated_delta_net_cuda_ilp(const float * q,
     float v_reg[NC];
     float g_raw;
     float beta_val;
+    float g_prefetched = 0.0f;
 
     auto load_tok = [&](int t, float * kr, float * qr, float * vr, float & gr, float & br) {
         const float * q_t = q_base;
@@ -443,6 +444,7 @@ gated_delta_net_cuda_ilp(const float * q,
             first_t++;
         }
         load_tok(first_t, k_reg, q_reg, v_reg, g_raw, beta_val);
+        g_prefetched = expf(g_raw);
     }
     for (int t = first_t; t < n_tokens; t++) {
         if (t < 0 && state_src.prefix_w[t + n_prefix] == 0.0f) {
@@ -453,6 +455,7 @@ gated_delta_net_cuda_ilp(const float * q,
         float vn_reg[NC];
         float gn_raw = 0.0f;
         float bn_val = 0.0f;
+        float gn_val = 0.0f;
         int next_t = t + 1;
         if constexpr (PREFETCH) {
             // A masked slot may contain NaNs. Stage the next active slot, or the first new token.
@@ -461,6 +464,7 @@ gated_delta_net_cuda_ilp(const float * q,
             }
             if (next_t < n_tokens) {
                 load_tok(next_t, kn_reg, qn_reg, vn_reg, gn_raw, bn_val);
+                gn_val = expf(gn_raw);
             }
         } else {
             load_tok(t, k_reg, q_reg, v_reg, g_raw, beta_val);
@@ -477,13 +481,15 @@ gated_delta_net_cuda_ilp(const float * q,
                     for (int c = 0; c < NC; c++) {
                         v_reg[c] = vn_reg[c];
                     }
+                    g_prefetched = gn_val;
                     g_raw    = gn_raw;
                     beta_val = bn_val;
                 }
             }
         };
 
-        const float g_val = expf(g_raw);
+        // Stage the gate exponential with its ingredients, before the current reductions.
+        const float g_val = PREFETCH ? g_prefetched : expf(g_raw);
 
         // kv[col] = sum_i S[i][col] * k[i]   (same order as the original kernel, per column)
         float kv_shard[NC];
