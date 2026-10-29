@@ -5704,20 +5704,25 @@ static size_t moe_cache_lend(void * opaque, size_t bytes) {
             bool supported = !device->pools.empty();
             for (const auto & pool : device->pools) { supported = supported && pool->prompt_slab != nullptr; }
             if (!supported) { continue; }
-            struct layer_entry { int layer; size_t bytes = 0; uint64_t uses = 0; };
+            struct layer_entry { int layer; size_t bytes = 0; uint64_t uses = 0; std::vector<size_t> slots; };
             std::unordered_map<const void *, int> layers;
             for (const auto & tensor : session->profile_global_tensors) {
                 int layer = -1;
                 if (moe_cache_layer_number(tensor.name.c_str(), layer)) { layers.emplace(tensor.data, layer); }
             }
             std::map<int, layer_entry> entries;
-            for (const auto & pool : device->pools) {
+            std::vector<size_t> kept_slots(device->pools.size(), 0);
+            for (size_t p = 0; p < device->pools.size(); ++p) {
+                const auto & pool = device->pools[p];
                 if (pool->prompt_slots < 0) { pool->prompt_slots = pool->n_slots; }
                 for (const auto & slot : pool->slots) {
                     if (slot.state != moe_cache_slot_state::valid) { continue; }
+                    ++kept_slots[p];
                     const auto found = layers.find(slot.key.tensor);
                     if (found == layers.end()) { continue; }
                     auto & entry = entries[found->second];
+                    if (entry.slots.empty()) { entry.slots.resize(device->pools.size(), 0); }
+                    ++entry.slots[p];
                     entry.layer = found->second;
                     entry.bytes += pool->expert_size;
                     entry.uses += moe_cache_lending_uses(slot);
@@ -5732,20 +5737,16 @@ static size_t moe_cache_lend(void * opaque, size_t bytes) {
             // Count unmapped chunks, including unused slots, before selecting another whole layer.
             auto released_bytes = [&]() {
                 size_t released = 0;
-                for (const auto & pool : device->pools) {
-                    size_t kept = 0;
-                    for (const auto & slot : pool->slots) {
-                        if (slot.state != moe_cache_slot_state::valid) { continue; }
-                        const auto found = layers.find(slot.key.tensor);
-                        if (found == layers.end() || !evicted.count(found->second)) { ++kept; }
-                    }
-                    released += pool->prompt_slab->mapped_size() - pool->prompt_slab->mapped_size(kept * pool->expert_size);
+                for (size_t p = 0; p < device->pools.size(); ++p) {
+                    const auto & pool = device->pools[p];
+                    released += pool->prompt_slab->mapped_size() - pool->prompt_slab->mapped_size(kept_slots[p] * pool->expert_size);
                 }
                 return released;
             };
             for (const auto & entry : ranked) {
                 if (released_bytes() >= bytes - std::min(bytes, freed)) { break; }
                 evicted.insert(entry.layer);
+                for (size_t p = 0; p < kept_slots.size(); ++p) { kept_slots[p] -= entry.slots[p]; }
             }
             for (const auto & pool : device->pools) {
                 int kept = 0;
