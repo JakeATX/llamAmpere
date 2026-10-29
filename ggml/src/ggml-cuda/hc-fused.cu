@@ -365,8 +365,8 @@ static __device__ __forceinline__ void hcf_up_q8_block(const float xi, block_q8_
     y->ds = make_half2(d, d * sum);
 }
 
-template <int T, int Q = 0>
-static __global__ void __launch_bounds__(HCF_UP_WARPS*WARP_SIZE, 2)
+template <int T, int Q = 0, int W = HCF_UP_WARPS>
+static __global__ void __launch_bounds__(W*WARP_SIZE, 32/W)
 hcf_up_gate(
         const float * __restrict__ x, const float * __restrict__ wn,
         const float * __restrict__ act, const float * __restrict__ r,
@@ -377,7 +377,7 @@ hcf_up_gate(
 
     const int warp = threadIdx.x / WARP_SIZE;
     const int lane = threadIdx.x % WARP_SIZE;
-    const int i    = blockIdx.x*HCF_UP_WARPS + warp;
+    const int i    = blockIdx.x*W + warp;
     const bool live = i < n_embd;
 
     constexpr int hc = 4;
@@ -458,10 +458,10 @@ hcf_up_gate(
 
     if constexpr (Q != 0) {
         // every warp is live here (the host requires n_embd % 32 == 0)
-        static_assert(32 % HCF_UP_WARPS == 0, "two or more CTAs per q8 block");
-        constexpr unsigned int n_cta = 32 / HCF_UP_WARPS;
+        static_assert(32 % W == 0, "two or more CTAs per q8 block");
+        constexpr unsigned int n_cta = 32 / W;
         __shared__ unsigned int last_s;
-        const int blk = blockIdx.x*HCF_UP_WARPS / 32;
+        const int blk = blockIdx.x*W / 32;
         __threadfence();
         __syncthreads();
         if (threadIdx.x == 0) {
@@ -475,9 +475,9 @@ hcf_up_gate(
         __syncthreads();
         if (last_s) {
             __threadfence();
-            if (warp < T) {
-                const float xi = __ldcg(dst + (int64_t) warp*n_embd + blk*32 + lane);
-                hcf_up_q8_block<Q == 2>(xi, q8 + (int64_t) warp*(n_embd/QK8_1) + blk, lane);
+            for (int t = warp; t < T; t += W) {
+                const float xi = __ldcg(dst + (int64_t) t*n_embd + blk*32 + lane);
+                hcf_up_q8_block<Q == 2>(xi, q8 + (int64_t) t*(n_embd/QK8_1) + blk, lane);
             }
         }
     }
@@ -638,16 +638,26 @@ static void hcf_up_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, vo
     GGML_ASSERT(smem <= 48*1024);
     GGML_UNUSED(hc);
 
-    const dim3 grid((n_embd + HCF_UP_WARPS - 1)/HCF_UP_WARPS);
-    const dim3 block(HCF_UP_WARPS*WARP_SIZE);
+    // embedding columns per CTA: 16 by default; LLAMA_HC_UP_WARPS=8|4 launches 2x|4x as many smaller CTAs (every row
+    // is still one warp with the same sums, so the result is bit-identical)
+    static const int up_w = [] {
+        const char * e = getenv("LLAMA_HC_UP_WARPS");
+        const int v = e ? atoi(e) : HCF_UP_WARPS;
+        return v == 4 || v == 8 ? v : HCF_UP_WARPS;
+    }();
+    const dim3 grid((n_embd + up_w - 1)/up_w);
+    const dim3 block(up_w*WARP_SIZE);
     if (q8 == nullptr) {
-        hcf_up_gate<T><<<grid, block, smem, ctx.stream()>>>(
+        auto kernel = up_w == 4 ? hcf_up_gate<T, 0, 4> : up_w == 8 ? hcf_up_gate<T, 0, 8> : hcf_up_gate<T, 0, HCF_UP_WARPS>;
+        kernel<<<grid, block, smem, ctx.stream()>>>(
             (const float *) x->data, (const float *) wn->data, act, r,
-            (const char *) wu->data, wu->nb[1], n_embd, R, out_scale, (float *) dst->data);
+            (const char *) wu->data, wu->nb[1], n_embd, R, out_scale, (float *) dst->data, nullptr, 0);
     } else {
         const int slot = hcf_up_cnt_slot(ctx);
         GGML_ASSERT(slot >= 0 && n_embd % QK8_1 == 0 && n_embd/QK8_1 <= HCF_UP_CNT);
-        auto kernel = swizzle ? hcf_up_gate<T, 2> : hcf_up_gate<T, 1>;
+        auto kernel = swizzle ?
+            (up_w == 4 ? hcf_up_gate<T, 2, 4> : up_w == 8 ? hcf_up_gate<T, 2, 8> : hcf_up_gate<T, 2, HCF_UP_WARPS>) :
+            (up_w == 4 ? hcf_up_gate<T, 1, 4> : up_w == 8 ? hcf_up_gate<T, 1, 8> : hcf_up_gate<T, 1, HCF_UP_WARPS>);
         kernel<<<grid, block, smem, ctx.stream()>>>(
             (const float *) x->data, (const float *) wn->data, act, r,
             (const char *) wu->data, wu->nb[1], n_embd, R, out_scale, (float *) dst->data, (block_q8_1 *) q8, slot*HCF_UP_CNT);
