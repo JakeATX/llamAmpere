@@ -19,7 +19,7 @@
 #include <unistd.h>
 #endif
 
-static constexpr int64_t PLE_PF_DEFAULT_THREADS = 0;
+static constexpr int64_t PLE_PF_DEFAULT_THREADS = 2;
 static constexpr int64_t PLE_PF_DEFAULT_MIN     = 4096;
 
 static int64_t ple_pf_env(const char * name, int64_t def) {
@@ -63,7 +63,7 @@ static bool ple_pf_resolve(const void * addr, std::string & path, uint64_t & off
 #endif
 
 std::unique_ptr<llama_ple_prefetch> llama_ple_prefetch::create(const llama_model & model, uint32_t n_ubatch) {
-    // Opt in with LLAMA_PLE_PREFETCH=N reader threads; read-ahead can churn the page cache on low-RAM hosts.
+    // fork: page-touch readers are on for long prompts; LLAMA_PLE_PREFETCH=0 disables them.
     const bool    user  = getenv("LLAMA_PLE_PREFETCH") != nullptr;
     const int64_t n_thr = ple_pf_env("LLAMA_PLE_PREFETCH", ple_pf_env("LLAMA_PLE_PF_THREADS", PLE_PF_DEFAULT_THREADS));
     if (n_thr <= 0) {
@@ -84,17 +84,15 @@ std::unique_ptr<llama_ple_prefetch> llama_ple_prefetch::create(const llama_model
     pf->n_threads = (int) std::min<int64_t>(n_thr, 512);
     // by default only long calls (a short check or catch-up batch is cheaper to fault in) and the whole call ahead
     pf->n_min     = (uint32_t) std::max<int64_t>(1, ple_pf_env("LLAMA_PLE_PF_MIN", user ? 256 : PLE_PF_DEFAULT_MIN));
-    pf->n_ahead   = (uint64_t) std::max<int64_t>(0, ple_pf_env("LLAMA_PLE_PF_AHEAD", user ? 2*(int64_t) n_ubatch : INT64_MAX/2));
+    pf->n_ahead   = (uint64_t) std::max<int64_t>(0, ple_pf_env("LLAMA_PLE_PF_AHEAD", 1000000));
     pf->n_ubatch  = n_ubatch;
     pf->row_size  = t->nb[1];
     pf->n_rows    = (uint64_t) t->ne[1];
 
     const char * mode = getenv("LLAMA_PLE_PF_MODE");
     pf->coalesce = mode && strcmp(mode, "coalesce") == 0;
-    pf->use_pread = !(mode && strcmp(mode, "fault") == 0);
-    // by default the readers only queue the reads (posix_fadvise WILLNEED): nothing is copied, so two threads keep
-    // the disk busy without taking CPU from the prompt setup; the gather waits on any page still in flight
-    pf->use_advise = pf->use_pread && (mode ? strcmp(mode, "advise") == 0 : !user);
+    pf->use_pread = mode && strcmp(mode, "fault") != 0;
+    pf->use_advise = mode && strcmp(mode, "advise") == 0;
 #if defined(__linux__)
     if (pf->use_pread) {
         std::string path;
