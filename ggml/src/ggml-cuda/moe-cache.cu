@@ -5463,12 +5463,22 @@ static bool moe_cache_resize_prompt_pool(moe_cache_device & device, moe_cache_po
         // Growth preserves every slot address and lookup key.
         pool.slots.reserve(slots);
         pool.free_slots.reserve(slots);
-        const size_t bytes = (size_t)slots * pool.expert_size;
-        if (!pool.prompt_slab->resize(bytes)) { return false; }
-        size_t deficit = 0;
-        if (!moe_cache_slab_preserves_reserve(device, bytes - before, "grow retained prompt pool", deficit) || deficit) {
+        size_t bytes = 0;
+        while (slots > old_slots) {
+            bytes = (size_t)slots * pool.expert_size;
+            if (!pool.prompt_slab->resize(bytes)) { return false; }
+            size_t deficit = 0;
+            const bool measured = moe_cache_slab_preserves_reserve(device, bytes - before, "grow retained prompt pool", deficit);
+            if (measured && !deficit) { break; }
+            const size_t mapped = pool.prompt_slab->mapped_size();
             pool.prompt_slab->resize(before);
-            return false;
+            if (!measured) { return false; }
+            // A retry must remove physical chunks, not just payload slots.
+            const size_t chunk = pool.prompt_slab->mapped_size(1);
+            const size_t allowed = (mapped - std::min(mapped, deficit)) / chunk * chunk;
+            const size_t target = std::min((size_t)(slots - 1), allowed / pool.expert_size);
+            if (target <= (size_t)old_slots) { return false; }
+            slots = (int)target;
         }
         pool.slots.resize(slots);
         pool.free_slots.clear();
