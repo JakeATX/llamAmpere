@@ -11023,7 +11023,10 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
             table.host_stride = d.expert_size;
             table.permanent_sources = moe_resident_tensor(d.data, device.logical);
             cudaPointerAttributes attributes{};
-            if (!table.permanent_sources && cudaPointerGetAttributes(&attributes, d.data) == cudaSuccess && attributes.type == cudaMemoryTypeHost) {
+            // A bank tensor can span pinned cold ranges and unregistered holes.
+            const bool bank_sources = ggml_moe_bank_lookup(d.data) != nullptr;
+            if (!table.permanent_sources && (!bank_sources || ggml_cuda_host_pin_contains(d.data, bytes)) &&
+                    cudaPointerGetAttributes(&attributes, d.data) == cudaSuccess && attributes.type == cudaMemoryTypeHost) {
                 void * alias = nullptr;
                 if (cudaHostGetDevicePointer(&alias, const_cast<void *>(d.data), 0) == cudaSuccess) {
                     table.borrowed = alias;
@@ -11068,7 +11071,8 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
                     if (!permanent) {
                         void * alias = nullptr;
                         void * last = nullptr;
-                        if (cudaHostGetDevicePointer(&alias, (void *)begin, 0) != cudaSuccess ||
+                        if (!ggml_cuda_host_pin_contains((const void *)begin, expert_bytes) ||
+                                cudaHostGetDevicePointer(&alias, (void *)begin, 0) != cudaSuccess ||
                                 cudaHostGetDevicePointer(&last, (void *)(begin + expert_bytes - 1), 0) != cudaSuccess ||
                                 (const char *)last != (const char *)alias + expert_bytes - 1) { return fail(); }
                         table.fallback[e] = alias;
@@ -11077,7 +11081,8 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
                     // Bank release leaves the cold experts pinned in separate ranges.
                     void * alias = nullptr;
                     void * last = nullptr;
-                    if (!table.borrowed && ggml_moe_bank_lookup(d.data) && !table.bank[e] &&
+                    if (!table.borrowed && bank_sources && !table.bank[e] &&
+                            ggml_cuda_host_pin_contains((const void *)begin, expert_bytes) &&
                             cudaHostGetDevicePointer(&alias, (void *)begin, 0) == cudaSuccess &&
                             cudaHostGetDevicePointer(&last, (void *)(begin + expert_bytes - 1), 0) == cudaSuccess &&
                             (const char *)last == (const char *)alias + expert_bytes - 1) {

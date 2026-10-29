@@ -143,6 +143,16 @@ static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 static std::mutex ggml_cuda_host_pin_mutex;
 static std::map<uintptr_t, size_t> ggml_cuda_host_pins;
 
+bool ggml_cuda_host_pin_contains(const void * ptr, size_t size) {
+    const uintptr_t begin = (uintptr_t) ptr;
+    if (!ptr || !size || size > UINTPTR_MAX - begin) { return false; }
+    std::lock_guard<std::mutex> lock(ggml_cuda_host_pin_mutex);
+    auto next = ggml_cuda_host_pins.upper_bound(begin);
+    if (next == ggml_cuda_host_pins.begin()) { return false; }
+    const auto & range = *std::prev(next);
+    return begin - range.first < range.second && size <= range.second - (begin - range.first);
+}
+
 static bool ggml_cuda_host_pin(void * ptr, size_t size) {
     const uintptr_t begin = (uintptr_t)ptr;
     if (!ptr || !size || size > UINTPTR_MAX - begin) { return false; }
