@@ -14847,8 +14847,9 @@ static void add_ai_bank_cases(std::vector<std::unique_ptr<test_case>> & cases) {
             }
         }
         // every id skipped in some tokens, small stacks
-        for (int n : { 1, 7, 130 }) {
+        for (int n : { 1, 7, 9, 33, 130 }) {
             cases.emplace_back(new test_mul_mat_id_ai4(t, 4, 3, false, 32, n, 256, false, false, 1));
+            cases.emplace_back(new test_mul_mat_id_ai4(t, 4, 3, true, 48, n, 384, false, false, 1));
         }
     }
 }

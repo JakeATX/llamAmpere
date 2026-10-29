@@ -1462,8 +1462,19 @@ static __global__ void __launch_bounds__(IDS_THREADS) ids_helper(
             cols[k] = t*n_used + u;
         }
     }
-    // small batches: zero the dst columns of skipped pairs (id outside [0, n_expert)) here instead of in a separate launch
-    if (zero_y != nullptr) {
+    // fork: prompt pairs use separate warps so the full block need not scan every id.
+    if (zero_y != nullptr && n_tok > 8) {
+        for (int64_t p = warp; p < n_pairs; p += IDS_THREADS/32) {
+            const int u = (int) (p % n_used), t = (int) (p / n_used);
+            const int e = *(const int *) (ids + u*ids_nb0 + t*ids_nb1);
+            if (e < 0 || e >= n_expert) {
+                float * y = zero_y + p*zero_m;
+                for (int i = lane; i < zero_m; i += 32) {
+                    y[i] = 0.0f;
+                }
+            }
+        }
+    } else if (zero_y != nullptr) {
         for (int64_t p = 0; p < n_pairs; ++p) {
             const int u = (int) (p % n_used), t = (int) (p / n_used);
             const int e = *(const int *) (ids + u*ids_nb0 + t*ids_nb1);

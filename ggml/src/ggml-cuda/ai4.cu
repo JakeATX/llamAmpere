@@ -46,6 +46,7 @@
 //   GGML_CUDA_AI23_ID_SLABS=4|8  routed rate-2/3 prompt row slabs per block (default 8)
 //   GGML_CUDA_AI23_ID_ROUTE_AGG=1  combine routed prompt counter updates within each warp (default off)
 //   GGML_CUDA_AI23_ID_FIXED_LOAD=1  unroll fixed-size routed prompt staging copies (default off)
+//   GGML_CUDA_AI23_ID_ZERO=1  zero skipped prompt columns in the routing helper (default off)
 //   GGML_CUDA_AI23_DENSE_TILE=1..29  dense shared-activation tile controls for 9..64 tokens (default off)
 //                             22/23 swap quantized activation halves to avoid LDS64 bank conflicts
 //   GGML_CUDA_AI23_XPERM=1  vector activation loads for whole-row dense rate-2 kernels (default off)
@@ -1199,7 +1200,9 @@ void ggml_cuda_mul_mat_id_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor
         }
     }
     const int max_tiles = direct ? (int) n_pairs : ai4k::ids_max_tiles(n_expert, n_pairs, bn);
-    const bool zero_in_helper = !direct && n_tok <= 8;
+    static const bool prompt_zero = ai4_env_int("GGML_CUDA_AI23_ID_ZERO", nullptr, 0) != 0;
+    const bool zero_in_helper = !direct && (n_tok <= 8 ||
+        (prompt_zero && (rate == 2 || rate == 3) && bn != ai4k::MMV_ID_BN));
     if (!zero_in_helper) {
         ai4_zero_skipped(ids, n_used, n_tok, n_expert, M, (float *) dst->data, stream);
     }
