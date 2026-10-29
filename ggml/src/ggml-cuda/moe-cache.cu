@@ -9710,16 +9710,15 @@ static __global__ void moe_mass_kernel(const float * weights, float * out_weight
         }
     }
     for (int token = tid; token < width; token += blockDim.x) {
-        if (mode) { ggml_moe_skipmass_select(weights + 10 * token, hot + 10 * token, 10, mode, threshold, drop + 10 * token); }
+        const bool changed = mode && ggml_moe_skipmass_select(weights + 10 * token, hot + 10 * token, 10, mode, threshold, drop + 10 * token);
         rescale[token] = false;
-        if (mode && renorm) {
+        if (changed && renorm) {
             float total = 0.0f, kept = 0.0f;
-            bool changed = false;
             for (int j = 0; j < 10; ++j) {
                 const int i = 10 * token + j;
-                total += weights[i]; kept += drop[i] ? 0.0f : weights[i]; changed |= drop[i] != 0;
+                total += weights[i]; kept += drop[i] ? 0.0f : weights[i];
             }
-            rescale[token] = changed && kept > 0.0f;
+            rescale[token] = kept > 0.0f;
             if (rescale[token]) { scale[token] = total / kept; }
         }
     }

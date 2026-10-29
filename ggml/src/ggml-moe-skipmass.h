@@ -6,18 +6,22 @@
 #else
 #define GGML_SKIPMASS_HD
 #endif
-static GGML_SKIPMASS_HD inline void ggml_moe_skipmass_select(
+static GGML_SKIPMASS_HD inline bool ggml_moe_skipmass_select(
         const float * weights, const unsigned char * hot, int n, int mode, float threshold, unsigned char * drop) {
-    if (n < 1 || n > 10) { return; }
+    if (n < 1 || n > 10) { return false; }
     bool chosen[10] = {};
+    bool changed = false;
     float mass = 0.0f;
     for (int i = 0; i < n; ++i) { drop[i] = 0; }
     for (int i = 0; i < n; ++i) {
-        if (!(weights[i] >= 0.0f && weights[i] <= 1.0f)) { return; }
+        if (!(weights[i] >= 0.0f && weights[i] <= 1.0f)) { return false; }
     }
     if (mode == 1) {
-        for (int i = 0; i < n; ++i) { drop[i] = !hot[i] && weights[i] < threshold; }
-        return;
+        for (int i = 0; i < n; ++i) {
+            drop[i] = !hot[i] && weights[i] < threshold;
+            changed |= drop[i] != 0;
+        }
+        return changed;
     }
     for (int step = 0; step < n; ++step) {
         int best = -1;
@@ -29,7 +33,9 @@ static GGML_SKIPMASS_HD inline void ggml_moe_skipmass_select(
         // Remaining weights are at least this large and cannot fit either.
         if (!(mass + weights[best] <= threshold)) { break; }
         drop[best] = 1;
+        changed = true;
         mass += weights[best];
     }
+    return changed;
 }
 #undef GGML_SKIPMASS_HD

@@ -6630,7 +6630,7 @@ static bool run_skipmass_rule() {
     ggml_moe_skipmass_select(unsorted, hot, 4, 2, 0.125f, drop);
     ok &= !drop[0] && !drop[1] && drop[2] && !drop[3]; // Stable ties, not rank order.
     const float invalid[2] = {NAN, 0.01f};
-    ggml_moe_skipmass_select(invalid, hot, 2, 1, 0.1f, drop);
+    ok &= !ggml_moe_skipmass_select(invalid, hot, 2, 1, 0.1f, drop);
     ok &= !drop[0] && !drop[1];
     // Compare the faster selector to the original sorted scan, including cutoff boundaries.
     auto reference = [](const float * w, const unsigned char * h, int n, int mode, float t, unsigned char * d) {
@@ -6659,8 +6659,11 @@ static bool run_skipmass_rule() {
                 for (int mode : {1, 2}) {
                     for (float t : {0.0f, 0.03f, std::nextafter(0.03f, 1.0f), 0.125f, 0.25f, 0.999f}) {
                         reference(w, hot, n, mode, t, expected);
-                        ggml_moe_skipmass_select(w, hot, n, mode, t, drop);
+                        const bool changed = ggml_moe_skipmass_select(w, hot, n, mode, t, drop);
                         ok &= memcmp(drop, expected, n) == 0;
+                        bool expected_changed = false;
+                        for (int i = 0; i < n; ++i) { expected_changed |= expected[i] != 0; }
+                        ok &= changed == expected_changed;
                     }
                 }
             }
@@ -6669,7 +6672,7 @@ static bool run_skipmass_rule() {
     // Validate the whole token before dropping any earlier low-weight route.
     const float invalid_last[2] = {0.01f, NAN};
     hot[0] = hot[1] = 0;
-    ggml_moe_skipmass_select(invalid_last, hot, 2, 1, 0.1f, drop);
+    ok &= !ggml_moe_skipmass_select(invalid_last, hot, 2, 1, 0.1f, drop);
     ok &= !drop[0] && !drop[1];
     printf("cache-skipmass-rule: %s\n", ok ? "OK" : "FAIL");
     return ok;
