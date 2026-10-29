@@ -9778,6 +9778,13 @@ bool ggml_cuda_moe_skipmass_compute(ggml_backend_cuda_context & ctx, ggml_tensor
     const float threshold = t ? strtof(t, &end) : 0.0f;
     GGML_ASSERT(!mode || (t && end != t && *end == 0 && std::isfinite(threshold) && threshold >= 0.0f && threshold < 1.0f));
     const bool active = mode && session.skip_tail > 0;
+    if (!active && !session.mass_trace) {
+        // fork: exact evaluation needs no route selection or residency reads.
+        CUDA_CHECK(cudaMemcpyAsync(op->data, op->src[0]->data, ggml_nbytes(op), cudaMemcpyDeviceToDevice, ctx.stream()));
+        session.mass_layer = -1;
+        session.mass_ids = nullptr;
+        return true;
+    }
     const char * r = getenv("GGML_MOE_SKIP_RENORM");
     const bool renorm = r && strcmp(r, "1") == 0;
     const int experts = (int) group[0]->desc.n_expert;

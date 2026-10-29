@@ -6920,6 +6920,11 @@ static bool run_skip_tail_layer(ggml_backend_t gpu, ggml_backend_t cpu, log_capt
                             }
                         }
                         api.set_skip_tail(session, 0);
+                        api.session_enter(session);
+                        ok &= ggml_backend_graph_compute(gpu, startup_graph) == GGML_STATUS_SUCCESS;
+                        api.session_leave(session);
+                        ggml_backend_tensor_get(adjusted, actual_weights.data(), 0, actual_weights.size() * sizeof(float));
+                        ok &= memcmp(actual_weights.data(), router_values.data(), actual_weights.size() * sizeof(float)) == 0;
                         set_env("GGML_MOE_SKIP_POLICY", nullptr);
                         set_env("GGML_MOE_SKIP_THRESHOLD", nullptr);
                         set_env("GGML_MOE_SKIP_RENORM", nullptr);
