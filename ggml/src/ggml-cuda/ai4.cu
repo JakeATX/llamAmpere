@@ -44,6 +44,7 @@
 //   GGML_CUDA_AI23_ID_BN=32|64|128  override rate-2/3 routed prompt GEMM tile width (default automatic)
 //   GGML_CUDA_AI23_ID_STAGES=2|3  routed rate-2/3 prompt staging depth (default 3)
 //   GGML_CUDA_AI23_ID_SLABS=4|8  routed rate-2/3 prompt row slabs per block (default 8)
+//   GGML_CUDA_AI23_ID_THREADS=256  smaller routed prompt helper for <=1024 experts (default 1024)
 //   GGML_CUDA_AI23_ID_ROUTE_AGG=1  combine routed prompt counter updates within each warp (default off)
 //   GGML_CUDA_AI23_ID_FIXED_LOAD=1  unroll fixed-size routed prompt staging copies (default off)
 //   GGML_CUDA_AI23_ID_ZERO=1  zero skipped prompt columns in the routing helper (default off)
@@ -1234,9 +1235,11 @@ void ggml_cuda_mul_mat_id_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor
         routing.alloc((size_t) ai4k::ids_helper_ints(n_expert, n_pairs, max_tiles));
         static const bool route_agg = ai4_env_int("GGML_CUDA_AI23_ID_ROUTE_AGG", nullptr, 0) != 0;
         const bool aggregate = route_agg && (rate == 2 || rate == 3) && bn != ai4k::MMV_ID_BN;
+        static const int route_threads = ai4_env_int("GGML_CUDA_AI23_ID_THREADS", nullptr, 1024);
+        const bool compact = route_threads == 256 && (rate == 2 || rate == 3) && bn != ai4k::MMV_ID_BN;
         idm = ai4k::launch_ids_helper(ids->data, ids->nb[0], ids->nb[1], n_used, n_tok, ne11, n_expert, bn,
                                     max_tiles, src0->nb[2], routing.get(), stream,
-                                    zero_in_helper ? (float *) dst->data : nullptr, M, aggregate);
+                                    zero_in_helper ? (float *) dst->data : nullptr, M, aggregate, compact);
     }
     const uint8_t * W = (const uint8_t *) src0->data;
     float * Y = (float *) dst->data;

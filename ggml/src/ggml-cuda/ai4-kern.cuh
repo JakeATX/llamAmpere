@@ -1362,11 +1362,12 @@ static __device__ __forceinline__ int ids_reserve(int * cnt, int e) {
     return atomicAdd(cnt + e, 1);
 }
 
-template <bool AGG = false>
-static __global__ void __launch_bounds__(IDS_THREADS) ids_helper(
+template <bool AGG = false, int THREADS = IDS_THREADS>
+static __global__ void __launch_bounds__(THREADS) ids_helper(
         const char * __restrict__ ids, int64_t ids_nb0, int64_t ids_nb1, int n_used, int n_tok, int ne11,
         int n_expert, int bn, int max_tiles, int * __restrict__ out, float * __restrict__ zero_y = nullptr, int zero_m = 0) {
-    __shared__ int cnt[IDS_MAX_EXPERT];
+    static_assert(THREADS == 256 || THREADS == IDS_THREADS, "routing block size");
+    __shared__ int cnt[4*THREADS];
     __shared__ int wsum[2][32];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int64_t n_pairs = (int64_t) n_used*n_tok;
@@ -1377,11 +1378,11 @@ static __global__ void __launch_bounds__(IDS_THREADS) ids_helper(
     int * cols  = rows + n_pairs;
     int * tiles = cols + n_pairs;
 
-    for (int e = tid; e < n_expert; e += IDS_THREADS) {
+    for (int e = tid; e < n_expert; e += THREADS) {
         cnt[e] = 0;
     }
     __syncthreads();
-    for (int64_t p = tid; p < n_pairs; p += IDS_THREADS) {
+    for (int64_t p = tid; p < n_pairs; p += THREADS) {
         const int u = (int) (p % n_used), t = (int) (p / n_used);
         const int e = *(const int *) (ids + u*ids_nb0 + t*ids_nb1);
         if (e >= 0 && e < n_expert) {
@@ -1414,7 +1415,9 @@ static __global__ void __launch_bounds__(IDS_THREADS) ids_helper(
     if (lane == 31) { wsum[0][warp] = ic; wsum[1][warp] = ia; wst[warp] = it; }
     __syncthreads();
     if (warp == 0) {
-        int vc = wsum[0][lane], va = wsum[1][lane], vt = wst[lane];
+        int vc = lane < THREADS/32 ? wsum[0][lane] : 0;
+        int va = lane < THREADS/32 ? wsum[1][lane] : 0;
+        int vt = lane < THREADS/32 ? wst[lane] : 0;
 #pragma unroll
         for (int m = 1; m < 32; m <<= 1) {
             const int oc = __shfl_up_sync(0xffffffff, vc, m);
@@ -1453,7 +1456,7 @@ static __global__ void __launch_bounds__(IDS_THREADS) ids_helper(
         off[n_active] = wsum[0][31];
     }
     __syncthreads();
-    for (int64_t p = tid; p < n_pairs; p += IDS_THREADS) {
+    for (int64_t p = tid; p < n_pairs; p += THREADS) {
         const int u = (int) (p % n_used), t = (int) (p / n_used);
         const int e = *(const int *) (ids + u*ids_nb0 + t*ids_nb1);
         if (e >= 0 && e < n_expert) {
@@ -1464,7 +1467,7 @@ static __global__ void __launch_bounds__(IDS_THREADS) ids_helper(
     }
     // fork: prompt pairs use separate warps so the full block need not scan every id.
     if (zero_y != nullptr && n_tok > 8) {
-        for (int64_t p = warp; p < n_pairs; p += IDS_THREADS/32) {
+        for (int64_t p = warp; p < n_pairs; p += THREADS/32) {
             const int u = (int) (p % n_used), t = (int) (p / n_used);
             const int e = *(const int *) (ids + u*ids_nb0 + t*ids_nb1);
             if (e < 0 || e >= n_expert) {
@@ -1480,7 +1483,7 @@ static __global__ void __launch_bounds__(IDS_THREADS) ids_helper(
             const int e = *(const int *) (ids + u*ids_nb0 + t*ids_nb1);
             if (e < 0 || e >= n_expert) {
                 float * y = zero_y + ((int64_t) t*n_used + u)*zero_m;
-                for (int i = tid; i < zero_m; i += IDS_THREADS) {
+                for (int i = tid; i < zero_m; i += THREADS) {
                     y[i] = 0.0f;
                 }
             }
@@ -1490,8 +1493,14 @@ static __global__ void __launch_bounds__(IDS_THREADS) ids_helper(
 
 static idmap launch_ids_helper(const void * ids, int64_t ids_nb0, int64_t ids_nb1, int n_used, int n_tok, int ne11,
                                int n_expert, int bn, int max_tiles, int64_t nb02, int * out, cudaStream_t stream,
-                               float * zero_y = nullptr, int zero_m = 0, bool aggregate = false) {
-    if (aggregate) {
+                               float * zero_y = nullptr, int zero_m = 0, bool aggregate = false, bool compact = false) {
+    if (compact && n_expert <= 4*256) {
+        if (aggregate) {
+            ids_helper<true, 256><<<1, 256, 0, stream>>>((const char *) ids, ids_nb0, ids_nb1, n_used, n_tok, ne11, n_expert, bn, max_tiles, out, zero_y, zero_m);
+        } else {
+            ids_helper<false, 256><<<1, 256, 0, stream>>>((const char *) ids, ids_nb0, ids_nb1, n_used, n_tok, ne11, n_expert, bn, max_tiles, out, zero_y, zero_m);
+        }
+    } else if (aggregate) {
         ids_helper<true><<<1, IDS_THREADS, 0, stream>>>((const char *) ids, ids_nb0, ids_nb1, n_used, n_tok, ne11, n_expert, bn, max_tiles, out,
                                                        zero_y, zero_m);
     } else {
