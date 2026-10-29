@@ -18564,6 +18564,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    // GDNREPLAY2 GGML_TEST_GDN_VERIFY_PERF=1: only one GDN verify round at n_rs_seq K = 4. Width 5 (4 drafts)
+    // folds the replay into the main call; width 4 keeps the separate replay, a K=1 call over the 4 ring slots.
+    if (getenv("GGML_TEST_GDN_VERIFY_PERF") != nullptr) {
+        for (int64_t n : {4, 5}) {
+            test_cases.emplace_back(new test_gated_delta_net_verify(n, 4, 0, -1));
+            test_cases.emplace_back(new test_gated_delta_net_verify(n, 4, 2, -1));
+        }
+        for (int64_t acc : {0, 2, 4}) {
+            test_cases.emplace_back(new test_gated_delta_net_verify(5, 4, 2, acc));
+        }
+        test_cases.emplace_back(new test_gated_delta_net_verify(4, 1, 0, -1));
+        return test_cases;
+    }
     // [AIV2] GGML_TEST_AIV2_PERF=1: only the AI+ gate-2 rival list (IQ2_XXS..IQ4_XS, today's AI+, EXL3 2/3/4 with and
     // without the Hadamard glue) at the 27B FFN shapes 17408 x 5120 and 5120 x 17408, widths 1 / 4 / 5 / 8
     if (getenv("GGML_TEST_AIV2_PERF") != nullptr) {
@@ -19378,17 +19391,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 2, 3}, {64, 16, 2, 3}, 3));
 
     add_gated_delta_net_range_cases(test_cases, true);
-
-    // GDNREPLAY2: verify round at n_rs_seq K = 4. Width 5 (4 drafts) folds the replay into the main
-    // call; width 4 keeps the separate replay, a K=1 call over the 4 masked ring slots.
-    for (int64_t n : {4, 5}) {
-        test_cases.emplace_back(new test_gated_delta_net_verify(n, 4, 0, -1));
-        test_cases.emplace_back(new test_gated_delta_net_verify(n, 4, 2, -1));
-    }
-    for (int64_t acc : {0, 2, 4}) {
-        test_cases.emplace_back(new test_gated_delta_net_verify(5, 4, 2, acc));
-    }
-    test_cases.emplace_back(new test_gated_delta_net_verify(4, 1, 0, -1));
 
     // GATED_DELTA_NET: realistic model configurations
     // TG: n_seq_tokens=1 (autoregressive)
