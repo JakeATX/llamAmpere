@@ -350,7 +350,14 @@ static __global__ void __launch_bounds__(M_SLABS*N_WARPS*32, MINB) gemm(
             for (int i = tid; i < GEMM_SLABS*CHP; i += GEMM_THREADS) load_weight(i);
         }
         // scales: per slab the unit's d[16] (32 B)
-        if (tid < GEMM_SLABS*8) {
+        if constexpr (ID && (lay_rate<LAY>() == 2 || lay_rate<LAY>() == 3)) {
+            if (tid < GEMM_SLABS*2) {
+                const int s = tid >> 1, p = tid & 1;
+                const bool ok = slab0 + s < nslab;
+                const uint8_t * src = W + (ok ? (int64_t) (slab0 + s)*sbytes + sc_off<LAY>(kc) + p*16 : 0);
+                cp_async16(st + GEMM_SLABS*CHB + s*GSC_BYTES + p*16, src, ok);
+            }
+        } else if (tid < GEMM_SLABS*8) {
             const int  s  = tid >> 3, w = tid & 7;
             const bool ok = slab0 + s < nslab;
             const uint8_t * src = W + (ok ? (int64_t) (slab0 + s)*sbytes + sc_off<LAY>(kc) + w*4 : 0);
