@@ -14,6 +14,7 @@
 #include <climits>
 #include <cmath>
 #include <cstring>
+#include <memory>
 #include <random>
 #include <mutex>
 #include <unordered_map>
@@ -1414,9 +1415,9 @@ static common_sampler_pq_result common_sampler_verify_pq_impl(const llama_token_
     // Reuse draft probabilities after rejection without changing the residual sum order.
     constexpr size_t n_local = 64;
     double q_local[cache_q ? n_local : 1];
-    std::vector<double> q_heap;
-    if (cache_q && p.size > n_local) { q_heap.resize(p.size); }
-    double * q_aligned = p.size > n_local ? q_heap.data() : q_local;
+    std::unique_ptr<double[]> q_heap;
+    if (cache_q && p.size > n_local) { q_heap.reset(new double[p.size]); }
+    double * q_aligned = p.size > n_local ? q_heap.get() : q_local;
     double p_d = 0.0, q_d = 0.0, sum_min = 0.0;
     for (size_t k = 0; k < p.size; ++k) {
         const auto & c = p.data[k];
