@@ -41,8 +41,10 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -232,6 +234,7 @@ struct cache_config {
     ggml_type k, v;
     uint32_t sj_k = 0, sj_v = 0;
     ggml_type body = GGML_TYPE_F32;
+    bool sj_draft = false; // the draft cache inherits the trunk's SJ-KVaRN (--spec-draft-sjkvarn)
 };
 
 struct contexts {
@@ -277,8 +280,10 @@ struct contexts {
         if (tail_chunks) {
             cp.n_outputs_max = 8;
         }
-        cp.sj_kvarn_bits_k = cp.sj_kvarn_bits_v = 0;
-        if (config.sj_k) {
+        if (!config.sj_draft) {
+            cp.sj_kvarn_bits_k = cp.sj_kvarn_bits_v = 0;
+        }
+        if (config.sj_k && !config.sj_draft) {
             cp.type_k = COMMON_SJKVARN_MTP_DRAFT_KV[0];
             cp.type_v = COMMON_SJKVARN_MTP_DRAFT_KV[1];
         }
@@ -2403,6 +2408,179 @@ static void run_case(llama_model * model, const cache_config & config, bool defe
     printf("PASS %s: %s, fresh driver and sequence 0 -> 1, 24 matching draft rounds\n", config.name, deferred ? "deferred carry" : "batch carry");
 }
 
+// the draft rows of an image are switched with LLAMA_MTP_IMAGE_ROWS, which a driver reads when it is created
+static void set_image_rows(bool on) {
+#ifdef _WIN32
+    _putenv_s("LLAMA_MTP_IMAGE_ROWS", on ? "1" : "0");
+#else
+    setenv("LLAMA_MTP_IMAGE_ROWS", on ? "1" : "0", 1);
+#endif
+}
+
+// back to the default (unset: the rows are off)
+static void reset_image_rows() {
+#ifdef _WIN32
+    _putenv_s("LLAMA_MTP_IMAGE_ROWS", "");
+#else
+    unsetenv("LLAMA_MTP_IMAGE_ROWS");
+#endif
+}
+
+struct image_rows_scope {
+    explicit image_rows_scope(bool on) { set_image_rows(on); }
+    ~image_rows_scope() { reset_image_rows(); }
+};
+
+// An image chunk is decoded by the target in batches of `width` rows (0: one batch), with positions as mtmd builds them for
+// M-RoPE. The MTP driver gets each batch as embeddings, unless feed is false.
+static void decode_image(contexts & ctx, llama_pos p0, int nx, int ny, llama_seq_id seq, int width = 0, bool feed = true) {
+    const int n = nx*ny;
+    std::vector<float> embd((size_t) n*n_embd);
+    std::mt19937 rng(1);
+    std::normal_distribution<float> dist(0.0f, 0.1f);
+    for (auto & value : embd) {
+        value = dist(rng);
+    }
+    const int step = width > 0 ? width : n;
+    for (int i0 = 0; i0 < n; i0 += step) {
+        const int m = std::min(step, n - i0);
+        common_batch batch(ctx.tgt);
+        for (int i = i0; i < i0 + m; ++i) {
+            const llama_pos pos[GGML_MROPE_SECTIONS] = { p0, p0 + i/nx, p0 + i%nx, 0 };
+            batch.add_embd({ embd.data() + (size_t) i*n_embd, 1, (size_t) n_embd }, pos, seq, false);
+        }
+        require(llama_process(ctx.tgt, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0, "target image decode");
+        if (feed) {
+            require(common_speculative_process(ctx.spec, batch), "MTP process of the image");
+        }
+    }
+}
+
+// Without draft rows for the image, the draft cache has no cells for it, so its first text row after the image sits far ahead of
+// its last cell (position 3, then 12 here). An SJ-KVaRN draft cache (--spec-draft-sjkvarn) has to take that row, draft, save and
+// restore. The target keeps refusing a row that does not continue its sequence.
+static void run_image_gap(llama_model * model, const cache_config & sj_config, llama_pos p_img) {
+    image_rows_scope scope(false);
+    cache_config config = sj_config;
+    config.sj_draft = true;
+    const int nx = 8, ny = 6;
+    const llama_pos p_txt = p_img + std::max(nx, ny); // the next position after an image is its larger side
+    const llama_pos prompt_end = p_txt + 200;
+
+    contexts reference(model, config);
+    prefill(reference, 0, p_img, 0);
+    decode_image(reference, p_img, nx, ny, 0);
+    prefill(reference, p_txt, prompt_end, 0);
+    const snapshot prompt = save(reference, 0);
+    common_speculative_begin(reference.spec, 0, llama_tokens(prompt_end, 0));
+    llama_pos pos_ref = prompt_end;
+    const schedule expected = generate(reference, 0, pos_ref, 0, 8);
+    require(llama_memory_seq_pos_max(llama_get_memory(reference.dft), 0) >= p_txt, "draft cache holds the text after the image");
+
+    contexts restored(model, config);
+    restore(restored, prompt, 1);
+    common_speculative_begin(restored.spec, 1, llama_tokens(prompt_end, 0));
+    llama_pos pos_got = prompt_end;
+    require_schedule(generate(restored, 1, pos_got, 0, 8), expected, "image gap: restored draft cache drafts the same tokens");
+
+    // an ordinary prompt (no image) still drafts with an SJ-KVaRN draft cache
+    contexts plain(model, config);
+    prefill(plain, 0, prompt_end, 0);
+    common_speculative_begin(plain.spec, 0, llama_tokens(prompt_end, 0));
+    llama_pos pos_plain = prompt_end;
+    generate(plain, 0, pos_plain, 0, 4);
+
+    // the target keeps its guard
+    common_batch skip(reference.tgt);
+    skip.add(token_at(pos_ref + 5), pos_ref + 5, 0, true);
+    require(llama_process(reference.tgt, LLAMA_PROCESS_TYPE_DECODE, skip.get()) != 0, "the target refuses a row that does not continue its sequence");
+    printf("PASS %s: image at %d in an SJ-KVaRN draft cache, restore, 8 matching draft rounds, target guard kept\n", config.name, (int) p_img);
+}
+
+// The draft takes the rows of an image: the hidden states of the target, row k paired with the hidden state of row k - 1 and the
+// first row with the one of the last text row, at the positions of the image. Right after the image the draft state must equal
+// the rows built by hand; without the rows the draft state is smaller, and an image in several batches keeps all its rows.
+static void run_image_rows(llama_model * model, const cache_config & base, bool sj_draft, llama_pos p_img) {
+    cache_config config = base;
+    config.sj_draft = sj_draft;
+    const int nx = 8, ny = 6;
+    const int n_img = nx*ny;
+    const llama_pos p_txt = p_img + std::max(nx, ny);
+    const llama_pos prompt_end = p_txt + 200;
+
+    auto make = [&](bool rows) {
+        image_rows_scope scope(rows);
+        return std::make_unique<contexts>(model, config);
+    };
+    auto build = [&](bool rows, int width, bool text) {
+        auto ctx = make(rows);
+        prefill(*ctx, 0, p_img, 0);
+        decode_image(*ctx, p_img, nx, ny, 0, width);
+        if (text) {
+            prefill(*ctx, p_txt, prompt_end, 0);
+        }
+        return ctx;
+    };
+
+    {
+        // by hand at a position where no text row is pending in the driver (it defers the rows of a short batch)
+        const llama_pos q = p_img == 0 ? 0 : 70;
+        auto by_hand = make(false);
+        prefill(*by_hand, 0, q, 0);
+        std::vector<float> h((size_t) n_img*n_embd, 0.0f);
+        if (q > 0) {
+            std::memcpy(h.data(), llama_get_embeddings_nextn_ith(by_hand->tgt, q - 1), n_embd*sizeof(float));
+        }
+        decode_image(*by_hand, q, nx, ny, 0, 0, false);
+        std::memcpy(h.data() + n_embd, llama_get_embeddings_nextn(by_hand->tgt), (size_t) (n_img - 1)*n_embd*sizeof(float));
+        common_batch rows(by_hand->dft);
+        for (int i = 0; i < n_img; ++i) {
+            const llama_pos pos[GGML_MROPE_SECTIONS] = { q, q + i/nx, q + i%nx, 0 };
+            rows.add_embd({ h.data() + (size_t) i*n_embd, 1, (size_t) n_embd }, pos, 0, false);
+        }
+        require(llama_process(by_hand->dft, LLAMA_PROCESS_TYPE_DECODE, rows.get()) == 0, "draft decode of the rows built by hand");
+        auto driver = make(true);
+        prefill(*driver, 0, q, 0);
+        decode_image(*driver, q, nx, ny, 0);
+        require(save(*driver, 0).dft == save(*by_hand, 0).dft, "the draft state equals the rows built by hand");
+    }
+
+    auto reference = build(true, 0, true);
+    const snapshot prompt = save(*reference, 0);
+    const size_t dft_off = save(*build(false, 0, true), 0).dft.size();
+    require(dft_off < prompt.dft.size(), "the draft cache holds the image rows");
+    {
+        // unset, the rows are off: the same draft state as with LLAMA_MTP_IMAGE_ROWS=0
+        reset_image_rows();
+        contexts plain(model, config);
+        prefill(plain, 0, p_img, 0);
+        decode_image(plain, p_img, nx, ny, 0);
+        prefill(plain, p_txt, prompt_end, 0);
+        require(save(plain, 0).dft.size() == dft_off, "the image rows are off by default");
+    }
+    // an image larger than the batch arrives in several batches with one position: the later ones must not trim the earlier rows
+    require(save(*build(true, 20, true), 0).dft.size() == prompt.dft.size(), "an image in several batches keeps all its rows");
+
+    common_speculative_begin(reference->spec, 0, llama_tokens(prompt_end, 0));
+    llama_pos pos_ref = prompt_end;
+    const schedule expected = generate(*reference, 0, pos_ref, 0, 8);
+
+    image_rows_scope scope(true);
+    contexts restored(model, config);
+    restore(restored, prompt, 1);
+    common_speculative_begin(restored.spec, 1, llama_tokens(prompt_end, 0));
+    llama_pos pos_got = prompt_end;
+    require_schedule(generate(restored, 1, pos_got, 0, 8), expected, "image rows: restored draft cache drafts the same tokens");
+
+    if (config.sj_k) { // a plain target cache takes any position
+        common_batch skip(reference->tgt);
+        skip.add(token_at(pos_ref + 5), pos_ref + 5, 0, true);
+        require(llama_process(reference->tgt, LLAMA_PROCESS_TYPE_DECODE, skip.get()) != 0, "the target refuses a row that does not continue its sequence");
+    }
+    printf("PASS %s: image rows at %d in a %s draft cache, rows built by hand, split image, restore, 8 matching draft rounds\n",
+           config.name, (int) p_img, sj_draft ? "SJ-KVaRN" : "plain");
+}
+
 static void run_deferred_overflow(llama_model * model, const cache_config & config) {
     contexts reference(model, config, 64);
     prefill(reference, 0, 124, 0);
@@ -3734,6 +3912,28 @@ int main(int argc, char ** argv) {
                 } catch (const std::exception & error) {
                     fprintf(stderr, "FAIL %s (%s): %s\n", config.name, deferred ? "deferred" : "batch", error.what());
                     ++failed;
+                }
+            }
+            if (config.sj_k) {
+                try {
+                    run_image_gap(model, config, 4); // text before the image
+                    run_image_gap(model, config, 0); // the image first: the first draft cell is not at position 0
+                } catch (const std::exception & error) {
+                    fprintf(stderr, "FAIL %s (image gap): %s\n", config.name, error.what());
+                    ++failed;
+                }
+            }
+            for (llama_pos p_img : { 4, 0 }) {
+                for (bool sj_draft : { false, true }) {
+                    if (sj_draft && !config.sj_k) {
+                        continue;
+                    }
+                    try {
+                        run_image_rows(model, config, sj_draft, p_img);
+                    } catch (const std::exception & error) {
+                        fprintf(stderr, "FAIL %s (image rows, %s draft cache, image at %d): %s\n", config.name, sj_draft ? "SJ-KVaRN" : "plain", (int) p_img, error.what());
+                        ++failed;
+                    }
                 }
             }
             try {
