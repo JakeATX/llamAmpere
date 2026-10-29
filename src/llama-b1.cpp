@@ -1008,13 +1008,17 @@ bool llama_b1::tensor_streamed(int il, const exps_tensor & e) const {
 
 void llama_b1::push_tensor_pieces(std::vector<piece> & ps, const exps_tensor & e, region * dst, size_t dst_offs, bool from_file) const {
     const size_t expert_bytes = e.t->nb[1] * e.t->ne[1];
+    size_t n_holes = 0;
+    (void) ggml_moe_bank_holes(&n_holes);
+    // Bulk hole uploads already split cold spans from zero-filled bank bytes in resident_copy.
+    // Let them span experts to avoid one worker/registry/stream-lock round trip per expert.
+    // Permanent GPU spans still need expert boundaries for resident_lookup; strided sources do too.
+    const bool bulk_holes = n_holes > 0 && b1_env_int("GGML_MOE_BANK_HOLES_BULK", 0) == 1;
+    const bool permanent = !from_file && (ggml_moe_cache_has_residents() || (n_holes > 0 && !bulk_holes));
     for (size_t off = 0; off < e.nbytes;) {
         piece p;
         const bool strided = !from_file && e.home_nb2 != expert_bytes;
-        size_t n_holes = 0;
-        (void) ggml_moe_bank_holes(&n_holes);
         // per-expert pieces: a resident or dropped bank expert is then one whole piece for the device-side copy
-        const bool permanent = !from_file && (ggml_moe_cache_has_residents() || n_holes > 0);
         const size_t source_off = strided ? (off / expert_bytes) * e.home_nb2 + off % expert_bytes : off;
         p.src_host = from_file ? nullptr : (const char *) e.home_data + source_off;
         p.fd       = e.src.fd;
