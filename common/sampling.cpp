@@ -1416,16 +1416,16 @@ common_sampler_pq_result common_sampler_verify_pq(const llama_token_data_array &
     std::vector<double> q_heap;
     if (p.size > n_local) { q_heap.resize(p.size); }
     double * q_aligned = p.size > n_local ? q_heap.data() : q_local;
-    double p_d = 0.0, sum_min = 0.0;
+    double p_d = 0.0, q_d = 0.0, sum_min = 0.0;
     for (size_t k = 0; k < p.size; ++k) {
         const auto & c = p.data[k];
+        q_aligned[k] = q_of(c.id);
         if (c.id == d) {
             p_d = c.p;
+            q_d = q_aligned[k];
         }
-        q_aligned[k] = q_of(c.id);
         sum_min += std::min((double) c.p, q_aligned[k]);
     }
-    const double q_d = q_of(d);
     stats.n_pos++;
     stats.sum_p_d += p_d;
     stats.sum_min += sum_min;
