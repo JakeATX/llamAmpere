@@ -311,8 +311,13 @@ int main(int argc, char ** argv) {
                     const float diff_ingr = max_abs(actual.data() + attn_size, expected.data() + attn_size, ns * pw * H);
                     const float diff_state = max_abs(actual.data() + attn_size + region,
                                                     expected.data() + attn_size + region, state_size);
-                    const float diff_ckpt = nt > ns ? max_abs(actual.data() + attn_size + region + state_size,
-                                                             expected.data() + attn_size + region + state_size, state_size) : 0.0f;
+                    // nt == ns: with the prefix the checkpoint block is the state after the prefix, the replay base
+                    if (actual.size() != expected.size() + (nt == ns ? state_size : 0)) {
+                        fprintf(stderr, "FAIL: prefix output size %zu, expected %zu\n", actual.size(), expected.size());
+                        return 1;
+                    }
+                    const float diff_ckpt = max_abs(actual.data() + attn_size + region + state_size,
+                        nt > ns ? expected.data() + attn_size + region + state_size : base.data(), state_size);
                     printf("[gdn-prefix] mode=%d mask=%u accepted=%lld tail=%lld K=%lld attn=%.3e ingredients=%.3e state=%.3e ckpt=%.3e\n",
                            mode, pattern, (long long) accepted, (long long) nt, (long long) ns,
                            diff_attn, diff_ingr, diff_state, diff_ckpt);

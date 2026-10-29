@@ -869,16 +869,17 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         // prefix, or nothing): a token with g = 0 and beta = 0 leaves the state bit-exact
         // (s = expf(0) * s + k * 0), so the result is the logical state either way.
         GGML_ASSERT(inp->rs_old_src == nullptr); // else build_rs gathered s without the pair
-        // n > K (every verify round): the masked slots run inside the main call as a prefix
-        // (ggml_gated_delta_net_set_prefix below), so the base state is never materialized.
-        // n == K needs that base state as the new checkpoint, so it keeps the separate replay.
+        // n >= K (every verify round, n == K when the drafter stops one short): the masked slots run
+        // inside the main call as a prefix (ggml_gated_delta_net_set_prefix below), so the base state
+        // is never materialized. n == K needs it as the new checkpoint, and with a prefix the op
+        // emits it as the checkpoint block (the state after the prefix).
         static const bool fold_env = [] {
             const char * e = getenv("LLAMA_GDN_REPLAY_FOLD"); // =0: separate K=1 replay call (A/B)
             return e == nullptr || strcmp(e, "0") != 0;
         }();
         // verify widths only (n <= 2K): a prompt ubatch also takes this graph, and its main call
         // must keep the chunked tensor-core prompt kernel, which the prefix would bypass
-        replay_fold = fold_env && n > K && n <= 2 * K;
+        replay_fold = fold_env && n >= K && n <= 2 * K;
         if (!replay_fold) {
             ggml_tensor * w      = inp->replay_w;
             ggml_tensor * w_slot = ggml_view_4d(ctx0, w, 1, 1, K, 1, w->nb[0], w->nb[0], w->nb[0] * K, 0);
@@ -902,7 +903,7 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
             [](ggml_context * ctx, ggml_tensor * states, ggml_tensor *) {
                 return ggml_view_2d(ctx, states, states->ne[0], 0, states->nb[1], 0);
             }));
-        ckpt_from_op = n > K;
+        ckpt_from_op = n > K || replay_fold;
         ckpt_new     = ckpt_from_op ? nullptr : base_state;
         keep_count   = 0;
         new_first    = 0;

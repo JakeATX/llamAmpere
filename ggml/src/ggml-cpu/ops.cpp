@@ -11552,15 +11552,17 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     // new_states (emit_mode==1): 4   * S_v * H * n_seqs * K                     floats (k,v,g,beta rows)
     // new_states (emit_mode==2): (2 * S_v + neg0 + 1) * H * n_seqs * K          floats, padded to whole rows
     // final_state (emit_mode!=0 only): S_v * S_v * H * n_seqs                   floats (fixed, not scaled by K)
-    // ckpt_state (emit_mode!=0 && n_tokens>K only): S_v * S_v * H * n_seqs      floats (state before
+    // ckpt_state (emit_mode!=0 && n_tokens>K, or ==K with a prefix): S_v*S_v*H*n_seqs floats (state before
     //   the K-token retained window starts -- free to capture, the recurrence already passes
     //   through it; lets a caller reconstruct a rollback without a second op call over the prefix)
     const int64_t attn_score_elems    = S_v * H * n_tokens * n_seqs;
     // floats per head in one slot: a full state, or the ingredient width of emit_mode 1 or 2
     const int64_t slot_w              = (emit_mode == 0) ? S_v * S_v : ggml_gated_delta_net_ingr_width(S_v, neg0, emit_mode);
     const int64_t state_size_per_snap = slot_w * H * n_seqs;
-    const bool    needs_ckpt          = (emit_mode != 0) && (n_tokens > K);
-    const int64_t t_ckpt              = n_tokens - K - 1; // token index whose post-step state to save
+    // with a prefix (ggml_gated_delta_net_set_prefix) n_tokens == K has the block too: the state after the prefix
+    const bool    needs_ckpt          = (emit_mode != 0) &&
+        (n_tokens > K || (n_tokens == K && ggml_get_op_params_i32(dst, 2) > 0));
+    const int64_t t_ckpt              = n_tokens - K - 1; // token index whose post-step state to save (-1: after the prefix)
     float * attn_out_base   = (float *)dst->data;
     float * state_out_base  = (float *)dst->data + attn_score_elems;
     float * final_state_out = emit_mode == 0 ? nullptr    // emit_mode!=0 only
@@ -11632,6 +11634,9 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
             for (int64_t j = 0; j < S_v; ++j) {
                 ggml_vec_mad_f32(S_v, &s_out[j * S_v], slot, delta[j]);
             }
+        }
+        if (needs_ckpt && t_ckpt == -1) {
+            memcpy(ckpt_state_out + (iv3 * H + iv1) * S_v * S_v, s_out, S_v * S_v * sizeof(float));
         }
 
         // attn output pointer for first token of this (head, seq)

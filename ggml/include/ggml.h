@@ -2817,6 +2817,7 @@ extern "C" {
     // multiplied by w[j]. A prefix token only advances the state: no attention output, no slot,
     // and it does not count towards the checkpoint block. w[j] == 0 leaves the state bit-exact,
     // so a masked ring prefix replays the accepted slots ahead of the batch in the same call.
+    // With n_tokens == K the output gains the checkpoint block: the state after the prefix.
     GGML_API void ggml_gated_delta_net_set_prefix(
             struct ggml_tensor  * gdn,
             struct ggml_tensor  * ring,
