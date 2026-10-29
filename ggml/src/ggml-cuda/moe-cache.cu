@@ -5459,11 +5459,17 @@ static bool moe_cache_resize_prompt_pool(moe_cache_device & device, moe_cache_po
         slots = old_slots + (int)std::min((size_t)(slots - old_slots), headroom / pool.expert_size);
     }
     if (slots == old_slots) { return true; }
-    if (slots > old_slots) {
-        // Growth preserves every slot address and lookup key.
+    const bool prefix_only = slots > old_slots || std::none_of(pool.slots.begin() + slots, pool.slots.end(),
+            [](const moe_cache_slot & slot) { return slot.state == moe_cache_slot_state::valid; });
+    if (prefix_only) {
+        // fork: growth and an empty-tail shrink preserve every live address and lookup key.
         pool.slots.reserve(slots);
         pool.free_slots.reserve(slots);
-        size_t bytes = 0;
+        size_t bytes = (size_t)slots * pool.expert_size;
+        if (slots < old_slots) {
+            if (!pool.prompt_slab->resize(bytes)) { return false; }
+            for (int i = slots; i < old_slots; ++i) { moe_cache_map_erase(pool, i); }
+        }
         while (slots > old_slots) {
             bytes = (size_t)slots * pool.expert_size;
             if (!pool.prompt_slab->resize(bytes)) { return false; }
@@ -5507,8 +5513,13 @@ static bool moe_cache_resize_prompt_pool(moe_cache_device & device, moe_cache_po
                 break;
             }
         }
-        moe_cache_budget_allocation(device, bytes - before, true);
-        device.allocated_bytes += bytes - before;
+        if (bytes >= before) {
+            moe_cache_budget_allocation(device, bytes - before, true);
+            device.allocated_bytes += bytes - before;
+        } else {
+            moe_cache_budget_allocation(device, before - bytes, false);
+            device.allocated_bytes -= before - bytes;
+        }
         return true;
     }
     std::vector<int> ranked;
