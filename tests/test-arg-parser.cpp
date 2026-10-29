@@ -401,7 +401,7 @@ static void test(void) {
             assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), mb, LLAMA_EXAMPLE_SERVER));
             const bool enabled = mode != "--no-spec-mb-mtp";
             assert(mb.sampling.spec_lossy == enabled);
-            assert(mb.speculative.draft.n_max == (enabled ? 6 : 3));
+            assert(mb.speculative.draft.n_max == (enabled ? 5 : 3));
             argv.insert(argv.end(), {"--spec-draft-n-max", "4"});
             common_params explicit_depth;
             assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), explicit_depth, LLAMA_EXAMPLE_SERVER));
