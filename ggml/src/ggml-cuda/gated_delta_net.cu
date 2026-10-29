@@ -503,6 +503,10 @@ gated_delta_net_cuda_ilp(const float * q,
                     g_prefetched = gn_val;
                     g_raw    = gn_raw;
                     beta_val = bn_val;
+                    if constexpr (emit_ingredients_t) {
+                        // fork: the next active prefix slot is already staged.
+                        t = next_t - 1;
+                    }
                 }
             }
         };
