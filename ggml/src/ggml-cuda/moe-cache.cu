@@ -2485,7 +2485,7 @@ static bool moe_cache_allocate_pool(
     if (stride_blocks == 0) {
         return false;
     }
-    slot_count = std::min(slot_count, (size_t)INT_MAX / stride_blocks);
+    slot_count = std::min({slot_count, shape.pool_plan_slots, (size_t)INT_MAX / stride_blocks});
     if (slot_count > INT_MAX) {
         slot_count = INT_MAX;
     }
@@ -5344,6 +5344,12 @@ static bool moe_cache_profile_rerank(moe_cache_session & session,
 
 // Contiguous slabs cannot shrink in place. Recopy retained exact weights after freeing the old slab.
 static bool moe_cache_resize_pool(moe_cache_device & device, moe_cache_pool & pool, int slots) {
+    for (const auto & shape : device.shapes) {
+        if (shape.expert_size == pool.expert_size && shape.wtype == pool.wtype) {
+            slots = (int)std::min((size_t)slots, shape.pool_plan_slots);
+            break;
+        }
+    }
     if (slots == pool.n_slots) {
         return true;
     }
@@ -5620,7 +5626,7 @@ static size_t moe_cache_return(void * opaque) {
             const long double weight = (long double)shape.expert_size * shape.n_tensors;
             const size_t share = weights > 0 ? (size_t)((long double)remaining * weight / weights) : 0;
             const size_t blocks = pool.expert_size / ggml_type_size((ggml_type)pool.wtype);
-            const size_t max_slots = std::min(shape.pool_plan_slots, (size_t)std::min<uint64_t>(shape.n_entries, INT_MAX / blocks));
+            const size_t max_slots = (size_t)std::min<uint64_t>(shape.n_entries, INT_MAX / blocks);
             const size_t target = std::min(max_slots, (size_t)pool.n_slots + share / pool.expert_size);
             const size_t before = (size_t)pool.n_slots * pool.expert_size;
             if (target > (size_t)pool.n_slots) {
