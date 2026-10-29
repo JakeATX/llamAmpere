@@ -5067,8 +5067,9 @@ static bool run_device_pageable_fallback(ggml_backend_t gpu, ggml_backend_t cpu,
     const long page_size = sysconf(_SC_PAGESIZE);
     if (page_size <= 0) { return false; }
     const size_t page = (size_t)page_size;
-    // 24 experts x 3 whole-only siblings fill the 64-slot minimum pool.
-    constexpr int64_t n_expert = 24;
+    // 1280 experts x 3 whole-only siblings (4.4 MB) exceed the 4 MiB cache, so
+    // non-resident experts must be mapped through the pageable fallback.
+    constexpr int64_t n_expert = 1280;
     void * allocation = malloc((n_expert + 2) * page);
     if (!allocation) { return false; }
     void * data = (void *)((((uintptr_t)allocation + page - 1) & ~(page - 1)) + 64);
