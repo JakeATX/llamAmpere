@@ -6735,7 +6735,7 @@ static bool run_skip_tail_layer(ggml_backend_t gpu, ggml_backend_t cpu, log_capt
                 graphs[i].buffer = ggml_backend_alloc_ctx_tensors(c, backends[i]);
             }
             test_graph mass_graph;
-            ggml_init_params mp = {8 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true};
+            ggml_init_params mp = {8 * ggml_tensor_overhead() + 2 * ggml_graph_overhead(), nullptr, true};
             mass_graph.ctx = ggml_init(mp);
             auto * router = ggml_new_tensor_3d(mass_graph.ctx, GGML_TYPE_F32, 1, k_used, tokens);
             auto * adjusted = ggml_map_custom2(mass_graph.ctx, router, ids[1],
@@ -6751,6 +6751,18 @@ static bool run_skip_tail_layer(ggml_backend_t gpu, ggml_backend_t cpu, log_capt
             for (int i = 0; i < k_used * tokens; ++i) { router_values[i] = shares[i % k_used]; }
             ggml_backend_tensor_set(router, router_values.data(), 0, router_values.size() * sizeof(float));
             void * session = create_direct_session(gpu, cpu);
+            // Production warmup executes this node before device_prepare; cache-off has no session at all.
+            auto * startup_graph = ggml_new_graph(mass_graph.ctx);
+            ggml_build_forward_expand(startup_graph, adjusted);
+            for (bool enter : {false, true}) {
+                if (enter && !session) { ok = false; break; }
+                if (enter) { api.session_enter(session); }
+                ok &= ggml_backend_graph_compute(gpu, startup_graph) == GGML_STATUS_SUCCESS;
+                if (enter) { api.session_leave(session); }
+                std::vector<float> unchanged(router_values.size());
+                ggml_backend_tensor_get(adjusted, unchanged.data(), 0, unchanged.size() * sizeof(float));
+                ok &= memcmp(unchanged.data(), router_values.data(), unchanged.size() * sizeof(float)) == 0;
+            }
             ggml_moe_cache_tensor_desc descriptors[3];
             std::vector<uint64_t> usage[3];
             const uint64_t * counts[3];

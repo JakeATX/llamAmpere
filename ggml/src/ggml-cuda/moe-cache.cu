@@ -9742,8 +9742,14 @@ static __global__ void moe_mass_kernel(const float * weights, float * out_weight
 
 bool ggml_cuda_moe_skipmass_compute(ggml_backend_cuda_context & ctx, ggml_tensor * op) {
     GGML_ASSERT(ggml_cuda_moe_skipmass_supports(op));
-    GGML_ASSERT(!g_session_suppressed && !g_session_stack.empty() && g_session_stack.back().active);
-    auto & session = *g_session_stack.back().active;
+    auto * active_session = !g_session_suppressed && !g_session_stack.empty() ? g_session_stack.back().active : nullptr;
+    // Warmup and cache-disabled evaluation have no device residency to consult. Keep the original weights.
+    if (!active_session || !active_session->device_ready.load(std::memory_order_acquire)) {
+        if (active_session) { active_session->mass_layer = -1; active_session->mass_ids = nullptr; }
+        CUDA_CHECK(cudaMemcpyAsync(op->data, op->src[0]->data, ggml_nbytes(op), cudaMemcpyDeviceToDevice, ctx.stream()));
+        return true;
+    }
+    auto & session = *active_session;
     const int layer = atoi(op->name + strlen("moe_skipmass-"));
     GGML_ASSERT(session.device_ready.load() && session.devices.size() == 1 && session.devices[0]->logical == ctx.device);
     GGML_ASSERT(layer < (int) session.mj_groups.size());
