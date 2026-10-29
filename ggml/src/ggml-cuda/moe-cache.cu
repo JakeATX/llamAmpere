@@ -715,6 +715,7 @@ struct moe_cache_session {
     bool swap_whole = false;
     bool swap_layer = false;
     bool swap_top_only = false;
+    bool swap_free_probe = false;
     bool swap_decay_after = false;
     std::vector<std::array<moe_cache_device_table *, 3>> swap_groups;
     int swap_interval = 1;
@@ -7433,16 +7434,29 @@ static std::vector<moe_swap_pair> moe_cache_swap_whole_pairs(moe_cache_session &
         size_t victim = 0, admitted = 0;
         for (const auto & candidate : candidates) {
             entry free_slots{0, candidate.layer, -1, {-1, -1, -1}};
-            auto next_free = free_used;
+            std::unordered_map<moe_cache_pool *, size_t> next_free;
+            if (!session.swap_free_probe) { next_free = free_used; }
             bool free = true;
             for (int k = 0; k < 3; ++k) {
                 auto * pool = groups[candidate.layer][k]->swap_pool;
-                size_t & used = next_free[pool];
+                size_t used = 0;
+                if (session.swap_free_probe) {
+                    const auto found = free_used.find(pool);
+                    if (found != free_used.end()) { used = found->second; }
+                    // fork: earlier projections can reserve slots in the same pool.
+                    for (int j = 0; j < k; ++j) { used += groups[candidate.layer][j]->swap_pool == pool; }
+                } else {
+                    used = next_free[pool]++;
+                }
                 if (used >= pool->free_slots.size()) { free = false; break; }
-                free_slots.slots[k] = pool->free_slots[pool->free_slots.size() - 1 - used++];
+                free_slots.slots[k] = pool->free_slots[pool->free_slots.size() - 1 - used];
             }
             if (free) {
-                free_used = std::move(next_free);
+                if (session.swap_free_probe) {
+                    for (int k = 0; k < 3; ++k) { ++free_used[groups[candidate.layer][k]->swap_pool]; }
+                } else {
+                    free_used = std::move(next_free);
+                }
                 batches.push_back({candidate.score, candidate, free_slots, true});
             } else {
                 if (victim == victims.size() || candidate.score <= victims[victim].score * (1.0f + session.swap_hyst) + session.swap_margin) { break; }
@@ -11157,6 +11171,7 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
             (moe_cache_env_i64("GGML_MOE_CACHE_SWAP_WHOLE", 0, 1, adaptation_value) && adaptation_value);
         session->swap_layer = moe_cache_env_i64("GGML_MOE_CACHE_SWAP_LAYER", 0, 1, adaptation_value) && adaptation_value;
         session->swap_top_only = moe_cache_env_i64("GGML_MOE_CACHE_SWAP_TOP_ONLY", 0, 1, adaptation_value) && adaptation_value;
+        session->swap_free_probe = moe_cache_env_i64("GGML_MOE_CACHE_SWAP_FREE_PROBE", 0, 1, adaptation_value) && adaptation_value;
         session->swap_decay_after = moe_cache_env_i64("GGML_MOE_CACHE_SWAP_DECAY_AFTER", 0, 1, adaptation_value) && adaptation_value;
         MOE_CACHE_LOG("[moe-cache] swap modes: whole=%d layer=%d decay_after=%d\n", session->swap_whole, session->swap_layer, session->swap_decay_after);
         MOE_CACHE_LOG("[moe-cache] swap policy: interval_scopes=%d max_swaps=%d cap_bytes=%zu decay=%.2f hyst=%.2f margin=%.1f; async publication, no device sync\n",
