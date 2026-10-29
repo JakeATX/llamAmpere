@@ -55,6 +55,7 @@ static void moe_cache_register_stub(const void * owner) {
 #include <deque>
 #include <iterator>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <type_traits>
@@ -410,10 +411,82 @@ static uint64_t moe_cache_lending_uses(const moe_cache_slot & slot) {
     return (uint64_t)slot.warm_uses + slot.uses;
 }
 
+// fork: prompt loans retain physical prefix pages instead of refilling survivors from RAM.
+static bool moe_cache_keep_prompt() {
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP)
+    const char * e = getenv("LLAMA_PP_KEEP_EXPERTS");
+    return e && strcmp(e, "1") == 0;
+#else
+    return false;
+#endif
+}
+
+struct moe_cache_prompt_slab {
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP)
+    static constexpr size_t capacity = 1ull << 35;
+    CUdeviceptr address = 0;
+    size_t mapped = 0;
+    size_t chunk = 0;
+    int physical = 0;
+
+    bool init(int logical) {
+        if (!ggml_cuda_info().devices[logical].vmm) { return false; }
+        physical = ggml_cuda_get_physical_device(logical);
+        const size_t gran = ggml_cuda_info().devices[logical].vmm_granularity;
+        if (!gran || gran > capacity) { return false; }
+        chunk = ((16u << 20) + gran - 1) / gran * gran;
+        return cuMemAddressReserve(&address, capacity, chunk, 0, 0) == CUDA_SUCCESS;
+    }
+    bool resize(size_t bytes) {
+        if (!address || bytes > capacity || bytes > SIZE_MAX - chunk + 1) { return false; }
+        const size_t wanted = (bytes + chunk - 1) / chunk * chunk;
+        const size_t before = mapped;
+        while (mapped < wanted) {
+            CUmemAllocationProp prop = {};
+            prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+            prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+            prop.location.id = physical;
+            CUmemGenericAllocationHandle handle;
+            if (cuMemCreate(&handle, chunk, &prop, 0) != CUDA_SUCCESS) { resize(before); return false; }
+            const CUresult result = cuMemMap(address + mapped, chunk, 0, handle, 0);
+            CU_CHECK(cuMemRelease(handle));
+            if (result != CUDA_SUCCESS) { resize(before); return false; }
+            CUmemAccessDesc access = {};
+            access.location = prop.location;
+            access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+            if (cuMemSetAccess(address + mapped, chunk, &access, 1) != CUDA_SUCCESS) {
+                CU_CHECK(cuMemUnmap(address + mapped, chunk));
+                resize(before);
+                return false;
+            }
+            mapped += chunk;
+        }
+        while (mapped > wanted) {
+            CU_CHECK(cuMemUnmap(address + mapped - chunk, chunk));
+            mapped -= chunk;
+        }
+        return true;
+    }
+    char * data() const { return (char *) address; }
+    ~moe_cache_prompt_slab() {
+        if (address) {
+            resize(0);
+            CU_CHECK(cuMemAddressFree(address, capacity));
+        }
+    }
+#else
+    bool init(int) { return false; }
+    bool resize(size_t) { return false; }
+    char * data() const { return nullptr; }
+#endif
+};
+
 struct moe_cache_pool {
     size_t expert_size = 0;
     int wtype = -1;
     char * slab = nullptr;
+    std::unique_ptr<moe_cache_prompt_slab> prompt_slab;
+    int prompt_slots = -1;
     int n_slots = 0;
     bool covers_all_entries = false;
 
@@ -1703,6 +1776,38 @@ static int moe_resident_copy(void * opaque, ggml_tensor * dst, size_t offset, co
             ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)) != g_moe_cache_owner ||
             ggml_backend_buffer_is_host(dst->buffer) ||
             ggml_backend_buft_get_device(ggml_backend_buffer_get_type(dst->buffer)) != ggml_backend_get_device(backend)) { return 0; }
+    if (moe_cache_keep_prompt() && host && size) {
+        auto * ctx = (ggml_backend_cuda_context *)backend->context;
+        std::lock_guard<std::mutex> registry_lock(g_registry_mu);
+        for (auto * session : g_sessions) {
+            std::lock_guard<std::mutex> lock(session->mu);
+            if (!session->prompt_loaned || session->stopping) { continue; }
+            for (const auto & device : session->devices) {
+                if (device->logical != ctx->device || device->dead.load()) { continue; }
+                for (const auto & entry : device->seen_tensors) {
+                    const uintptr_t base = (uintptr_t)entry.first;
+                    const uintptr_t begin = (uintptr_t)host;
+                    if (begin < base) { continue; }
+                    const auto host_stride = device->host_strides.find(entry.first);
+                    const size_t stride = host_stride == device->host_strides.end() ? entry.second.expert_size : host_stride->second;
+                    if (!stride) { continue; }
+                    const size_t expert = (begin - base) / stride;
+                    const size_t source_offset = (begin - base) % stride;
+                    if (expert >= (size_t)entry.second.n_expert || source_offset >= entry.second.expert_size || size > entry.second.expert_size - source_offset) { continue; }
+                    for (const auto & pool : device->pools) {
+                        if (pool->prompt_slots < 0 || pool->expert_size != entry.second.expert_size || pool->wtype != entry.second.wtype) { continue; }
+                        const auto found = pool->map.find({entry.first, (int32_t)expert});
+                        if (found == pool->map.end() || pool->slots[found->second].state != moe_cache_slot_state::valid) { continue; }
+                        // The B1 coordinator joins this copy stream before returning or resizing the loan.
+                        ggml_cuda_set_device(ctx->device);
+                        if (cudaMemcpyAsync((char *)dst->data + offset, pool->slab + (size_t)found->second * pool->expert_size + source_offset,
+                                    size, cudaMemcpyDeviceToDevice, ctx->stream()) != cudaSuccess) { GGML_ABORT("prompt resident copy failed"); }
+                        return 1;
+                    }
+                }
+            }
+        }
+    }
     const char * upload = getenv("GGML_MOE_RESIDENT_UPLOAD");
     if (upload && strcmp(upload, "1") == 0) {
         const uintptr_t begin = (uintptr_t)host;
@@ -2494,12 +2599,26 @@ static bool moe_cache_allocate_pool(
 
     ggml_cuda_set_device(device.logical);
     char * slab = nullptr;
+    std::unique_ptr<moe_cache_prompt_slab> prompt_slab;
+    if (moe_cache_keep_prompt()) {
+        prompt_slab.reset(new moe_cache_prompt_slab());
+        if (!prompt_slab->init(device.logical)) { prompt_slab.reset(); }
+    }
+    auto release_slab = [&]() {
+        if (prompt_slab) { prompt_slab->resize(0); } else { (void)cudaFree(slab); }
+        slab = nullptr;
+    };
     cudaError_t error = cudaSuccess;
     while (slot_count >= moe_cache_pool_slots_min) {
         if (moe_cache_fail(session, "slab")) {
             error = cudaErrorMemoryAllocation;
         } else {
-            error = cudaMalloc((void **)&slab, slot_count * shape.expert_size);
+            if (prompt_slab) {
+                error = prompt_slab->resize(slot_count * shape.expert_size) ? cudaSuccess : cudaErrorMemoryAllocation;
+                slab = error == cudaSuccess ? prompt_slab->data() : nullptr;
+            } else {
+                error = cudaMalloc((void **)&slab, slot_count * shape.expert_size);
+            }
         }
         if (error == cudaSuccess) {
             size_t deficit = 0;
@@ -2508,7 +2627,7 @@ static bool moe_cache_allocate_pool(
             if (measured && !deficit) {
                 break;
             }
-            (void)cudaFree(slab);
+            release_slab();
             slab = nullptr;
             if (!measured) {
                 return false;
@@ -2530,7 +2649,7 @@ static bool moe_cache_allocate_pool(
 
     std::unique_ptr<moe_cache_pool> pool(new (std::nothrow) moe_cache_pool());
     if (!pool) {
-        (void)cudaFree(slab);
+        release_slab();
         moe_cache_budget_allocation(device, allocated, false);
         return false;
     }
@@ -2547,8 +2666,9 @@ static bool moe_cache_allocate_pool(
             pool->free_slots.push_back(index);
         }
         device.pools.push_back(std::move(pool));
+        device.pools.back()->prompt_slab = std::move(prompt_slab);
     } catch (...) {
-        (void)cudaFree(slab);
+        release_slab();
         moe_cache_budget_allocation(device, allocated, false);
         return false;
     }
@@ -2557,7 +2677,8 @@ static bool moe_cache_allocate_pool(
     device.allocated_bytes += allocated;
 
     if (!moe_cache_start_worker(session, device)) {
-        (void)cudaFree(device.pools.back()->slab);
+        if (device.pools.back()->prompt_slab) { device.pools.back()->prompt_slab.reset(); }
+        else { (void)cudaFree(device.pools.back()->slab); }
         moe_cache_budget_allocation(device, allocated, false);
         device.pools.back()->slab = nullptr;
         device.pools.pop_back();
@@ -2680,15 +2801,15 @@ static bool moe_cache_build_global_profile(moe_cache_session & session, moe_cach
         for (size_t p = 0; p < pending.size(); ++p) {
             const int pool = pending[p]->pool;
             if (pool < 0 || (size_t)pool >= device.pools.size()) { return false; }
-            if (whole_only || (size_t)device.pools[pool]->n_slots > plan.slots[p]) {
-                if (!moe_cache_resize_pool(device, *device.pools[pool], whole_only ? 0 : (int)plan.slots[p])) {
+            if ((whole_only && !moe_cache_keep_prompt()) || (size_t)device.pools[pool]->n_slots > plan.slots[p]) {
+                if (!moe_cache_resize_pool(device, *device.pools[pool], whole_only && !moe_cache_keep_prompt() ? 0 : (int)plan.slots[p])) {
                     MOE_CACHE_LOG("[moe-cache] CUDA%d global profile replan stopped: donor pool resize failed; no recipient growth\n", device.physical);
                     return true;
                 }
             }
         }
     }
-    if (whole_only) {
+    if (whole_only && !(resize && moe_cache_keep_prompt())) {
         // A logical grant can outlive allocations made by the prompt/drafter.
         // Query after releasing old slabs; never count their payload twice.
         budget = std::min(budget, moe_cache_allocation_headroom(device, "whole profile rebuild", budget));
@@ -3164,7 +3285,8 @@ static void moe_cache_free_device(moe_cache_device & device) {
     }
     for (auto & pool_ptr : device.pools) {
         if (pool_ptr->slab) {
-            (void)cudaFree(pool_ptr->slab);
+            if (pool_ptr->prompt_slab) { pool_ptr->prompt_slab.reset(); }
+            else { (void)cudaFree(pool_ptr->slab); }
             moe_cache_budget_allocation(
                     device, (size_t)pool_ptr->n_slots * pool_ptr->expert_size, false);
             pool_ptr->slab = nullptr;
@@ -5322,11 +5444,94 @@ static bool moe_cache_profile_rerank(moe_cache_session & session,
     return true;
 }
 
+static bool moe_cache_resize_prompt_pool(moe_cache_device & device, moe_cache_pool & pool, int slots) {
+    const int old_slots = pool.n_slots;
+    const size_t before = (size_t)old_slots * pool.expert_size;
+    if (slots > old_slots) {
+        const size_t headroom = moe_cache_allocation_headroom(device, "grow retained prompt pool", (size_t)(slots - old_slots) * pool.expert_size);
+        slots = old_slots + (int)std::min((size_t)(slots - old_slots), headroom / pool.expert_size);
+    }
+    std::vector<int> ranked;
+    for (int i = 0; i < old_slots; ++i) {
+        if (pool.slots[i].state == moe_cache_slot_state::valid) { ranked.push_back(i); }
+    }
+    std::stable_sort(ranked.begin(), ranked.end(), [&](int a, int b) {
+        return moe_cache_lending_uses(pool.slots[a]) > moe_cache_lending_uses(pool.slots[b]);
+    });
+    if (ranked.size() > (size_t)slots) { device.evictions += ranked.size() - slots; ranked.resize(slots); }
+    std::vector<moe_cache_slot> replacement(slots);
+    for (int i : ranked) { if (i < slots) { replacement[i] = pool.slots[i]; } }
+    std::vector<std::pair<int, int>> moves;
+    moves.reserve(ranked.size());
+    int hole = 0;
+    for (int i : ranked) {
+        if (i < slots) { continue; }
+        while (hole < slots && replacement[hole].state == moe_cache_slot_state::valid) { ++hole; }
+        GGML_ASSERT(hole < slots);
+        moves.emplace_back(hole, i);
+        replacement[hole++] = pool.slots[i];
+    }
+    std::unordered_map<moe_cache_key, int, moe_cache_key_hash> map;
+    std::vector<int> free_slots;
+    map.reserve(slots);
+    free_slots.reserve(slots);
+    int head = -1, tail = -1;
+    for (int i = 0; i < slots; ++i) {
+        auto & slot = replacement[i];
+        if (slot.state != moe_cache_slot_state::valid) { free_slots.push_back(i); continue; }
+        slot.prev = tail;
+        slot.next = -1;
+        slot.readers = 0;
+        if (tail >= 0) { replacement[tail].next = i; } else { head = i; }
+        tail = i;
+        map.emplace(slot.key, i);
+    }
+    for (const auto & move : moves) {
+        if (!moe_cache_cuda_ok(device, cudaMemcpyAsync(pool.slab + (size_t)move.first * pool.expert_size,
+                pool.slab + (size_t)move.second * pool.expert_size, pool.expert_size,
+                cudaMemcpyDeviceToDevice, device.compute_stream), "prompt survivor compact", true)) { GGML_ABORT("prompt compaction failed"); }
+    }
+    if (!moves.empty() && !moe_cache_cuda_ok(device, cudaStreamSynchronize(device.compute_stream), "prompt compaction join", true)) {
+        GGML_ABORT("prompt compaction join failed");
+    }
+    const size_t bytes = (size_t)slots * pool.expert_size;
+    if (!pool.prompt_slab->resize(bytes)) { return false; }
+    if (bytes > before) {
+        size_t deficit = 0;
+        if (!moe_cache_slab_preserves_reserve(device, bytes - before, "grow retained prompt pool", deficit) || deficit) {
+            pool.prompt_slab->resize(before);
+            return false;
+        }
+    }
+    pool.n_slots = slots;
+    pool.slots.swap(replacement);
+    pool.map.swap(map);
+    pool.free_slots.swap(free_slots);
+    pool.lru_head = head;
+    pool.lru_tail = tail;
+    pool.covers_all_entries = false;
+    for (const auto & shape : device.shapes) {
+        if (shape.expert_size == pool.expert_size && shape.wtype == pool.wtype) {
+            pool.covers_all_entries = (uint64_t)slots >= shape.n_entries;
+            break;
+        }
+    }
+    if (bytes >= before) {
+        moe_cache_budget_allocation(device, bytes - before, true);
+        device.allocated_bytes += bytes - before;
+    } else {
+        moe_cache_budget_allocation(device, before - bytes, false);
+        device.allocated_bytes -= before - bytes;
+    }
+    return true;
+}
+
 // Contiguous slabs cannot shrink in place. Recopy retained exact weights after freeing the old slab.
 static bool moe_cache_resize_pool(moe_cache_device & device, moe_cache_pool & pool, int slots) {
     if (slots == pool.n_slots) {
         return true;
     }
+    if (pool.prompt_slab) { return moe_cache_resize_prompt_pool(device, pool, slots); }
     std::vector<moe_cache_slot> retained;
     for (const auto & slot : pool.slots) {
         if (slot.state == moe_cache_slot_state::valid) {
@@ -5481,6 +5686,70 @@ static size_t moe_cache_lend(void * opaque, size_t bytes) {
     if (session->active_scopes || session->active_nodes || session->stopping) {
         return 0;
     }
+    if (moe_cache_keep_prompt()) {
+        size_t freed = 0, retained = 0;
+        for (auto & device : session->devices) {
+            if (device->dead.load() || !device->queue.empty() || device->inflight) { continue; }
+            bool supported = !device->pools.empty();
+            for (const auto & pool : device->pools) { supported = supported && pool->prompt_slab != nullptr; }
+            if (!supported) { continue; }
+            struct layer_entry { int layer; size_t bytes = 0; uint64_t uses = 0; };
+            std::unordered_map<const void *, int> layers;
+            for (const auto & tensor : session->profile_global_tensors) {
+                int layer = -1;
+                if (moe_cache_layer_number(tensor.name.c_str(), layer)) { layers.emplace(tensor.data, layer); }
+            }
+            std::map<int, layer_entry> entries;
+            for (const auto & pool : device->pools) {
+                if (pool->prompt_slots < 0) { pool->prompt_slots = pool->n_slots; }
+                for (const auto & slot : pool->slots) {
+                    if (slot.state != moe_cache_slot_state::valid) { continue; }
+                    const auto found = layers.find(slot.key.tensor);
+                    if (found == layers.end()) { continue; }
+                    auto & entry = entries[found->second];
+                    entry.layer = found->second;
+                    entry.bytes += pool->expert_size;
+                    entry.uses += moe_cache_lending_uses(slot);
+                }
+            }
+            std::vector<layer_entry> ranked;
+            for (const auto & entry : entries) { ranked.push_back(entry.second); }
+            std::stable_sort(ranked.begin(), ranked.end(), [](const layer_entry & a, const layer_entry & b) {
+                return (long double)a.uses / a.bytes < (long double)b.uses / b.bytes;
+            });
+            std::unordered_set<int> evicted;
+            size_t selected = 0;
+            // Free slots already contain no weights; count them before evicting whole layers.
+            for (const auto & pool : device->pools) {
+                for (const auto & slot : pool->slots) {
+                    if (slot.state == moe_cache_slot_state::free) { selected += pool->expert_size; }
+                }
+            }
+            for (const auto & entry : ranked) {
+                if (selected >= bytes - std::min(bytes, freed)) { break; }
+                evicted.insert(entry.layer);
+                selected += entry.bytes;
+            }
+            for (const auto & pool : device->pools) {
+                int kept = 0;
+                for (int i = 0; i < pool->n_slots; ++i) {
+                    const auto found = layers.find(pool->slots[i].key.tensor);
+                    if (pool->slots[i].state == moe_cache_slot_state::valid && found != layers.end() && evicted.count(found->second)) {
+                        moe_cache_slot_reset(*pool, i, true);
+                    }
+                    kept += pool->slots[i].state == moe_cache_slot_state::valid;
+                }
+                const size_t before = (size_t)pool->n_slots * pool->expert_size;
+                if (!moe_cache_resize_pool(*device, *pool, kept)) { continue; }
+                freed += before - (size_t)pool->n_slots * pool->expert_size;
+                retained += (size_t)pool->n_slots * pool->expert_size;
+            }
+            MOE_CACHE_LOG("[moe-cache] prompt whole-layer loan: evicted_layers=%zu retained_bytes=%zu released_bytes=%zu ms=%.3f\n",
+                    evicted.size(), retained, freed, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+        }
+        if (freed) { session->prompt_loaned = true; }
+        return freed;
+    }
     struct candidate { moe_cache_pool * pool; uint64_t uses; };
     std::vector<candidate> ranked;
     std::unordered_map<moe_cache_pool *, int> targets;
@@ -5586,6 +5855,21 @@ static size_t moe_cache_return(void * opaque) {
         const size_t scratch = moe_cache_scratch_total(device->scratch_reserve) + device->table_arena_cap + moe_table_prefetch_capacity(*device);
         const size_t slab_limit = device->budget_limit > scratch ? device->budget_limit - scratch : 0;
         size_t remaining = slab_limit > device->allocated_bytes ? slab_limit - device->allocated_bytes : 0;
+        if (moe_cache_keep_prompt()) {
+            for (const auto & pool : device->pools) {
+                if (pool->prompt_slots < 0) { continue; }
+                const size_t before = (size_t)pool->n_slots * pool->expert_size;
+                const size_t target = std::min((size_t)pool->prompt_slots, (size_t)pool->n_slots + remaining / pool->expert_size);
+                if (target > (size_t)pool->n_slots) { moe_cache_resize_pool(*device, *pool, (int)target); }
+                const size_t after = (size_t)pool->n_slots * pool->expert_size;
+                restored += after - before;
+                remaining -= std::min(remaining, after - before);
+                pool->prompt_slots = -1;
+            }
+            MOE_CACHE_LOG("[moe-cache] retained prompt pools returned: restored_bytes=%zu survivor_H2D_bytes=0 ms=%.3f\n",
+                    restored, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+            continue;
+        }
         long double weights = 0;
         for (const auto & shape : device->shapes) {
             if (shape.pool >= 0 && shape.pool < (int)device->pools.size()) {

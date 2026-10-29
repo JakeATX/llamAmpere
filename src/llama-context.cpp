@@ -206,6 +206,11 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
 // PP-1: LLAMA_PP_OVERLAP=1 runs the generation-phase expert refill on a helper thread while the MTP helper
 // catches up on the prompt. Off by default. LLAMA_PP_OVERLAP_ROWS (64..8192, default 512) caps the helper's
 // catch-up rows while the refill owns the card, so its scratch fits in the cache reserve.
+static bool pp_keep_experts_on() {
+    const char * e = getenv("LLAMA_PP_KEEP_EXPERTS");
+    return e && strcmp(e, "1") == 0;
+}
+
 static bool pp_overlap_on() {
     const char * e = getenv("LLAMA_PP_OVERLAP");
     static const bool on = e && atoi(e) != 0;
@@ -2151,7 +2156,7 @@ void llama_context::sched_reserve(bool suspend_prompt_cache) {
 
     if (preserve_cache) {
         // fork: B1 will discard this cache before computing the prompt, so skip survivor refills for scratch lending.
-        if (suspend_prompt_cache && !b1_mc_suspended && ggml_backend_sched_moe_cache_suspend(sched.get())) {
+        if (suspend_prompt_cache && !pp_keep_experts_on() && !b1_mc_suspended && ggml_backend_sched_moe_cache_suspend(sched.get())) {
             b1_mc_suspended = true;
             b1_cache_needs_refresh = true;
             LLAMA_LOG_INFO("%s: [B1] expert cache suspended before scratch resize\n", __func__);
@@ -6972,7 +6977,7 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
     // other sequence decodes from it; b1_end makes it again and it refills from decode. Off by default because the
     // refilled pool serves different experts than a pool that stayed warm, so later steps can differ in rounding.
     if (!b1_mc_suspended) {
-        b1_mc_suspended = !others && b1_ctx_env("LLAMA_B1_MOE_CACHE_SUSPEND", 0) != 0 &&
+        b1_mc_suspended = !others && !pp_keep_experts_on() && b1_ctx_env("LLAMA_B1_MOE_CACHE_SUSPEND", 0) != 0 &&
                           b1_cache_graph_reset() && ggml_backend_sched_moe_cache_suspend(sched.get());
     }
     if (b1_mc_suspended) {
@@ -7040,6 +7045,13 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
                 break;
             }
         }
+    }
+    if (!planned && pp_keep_experts_on() && b1_ctx_env("LLAMA_B1_MOE_CACHE_SUSPEND", 0) != 0 &&
+            b1_cache_graph_reset() && ggml_backend_sched_moe_cache_suspend(sched.get())) {
+        b1_mc_suspended = true;
+        b1_cache_needs_refresh = true;
+        LLAMA_LOG_WARN("%s: [B1] retained experts do not fit; using full streaming\n", __func__);
+        planned = b1->begin(sizes, group_ub, lend_cap, final_home, nullptr, lean_legacy);
     }
     if (!planned) {
         return normal();
