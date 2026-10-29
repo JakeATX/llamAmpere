@@ -4615,7 +4615,7 @@ static bool run_swap_whole(ggml_backend_t gpu, ggml_backend_t cpu, log_capture &
         fprintf(stderr, "cache-swap-whole setup incompatible=%d failed at %s\n%s", incompatible, setup_stage, capture.get().c_str());
     }
     std::vector<std::array<long long, 4>> decisions;
-    const int n_modes = incompatible ? 2 : 6;
+    const int n_modes = incompatible ? 2 : 7;
     for (int run = 0; run < 8 * n_modes && ok; ++run) {
         const int variant = run / n_modes, mode = run % n_modes;
         set_env("GGML_MOE_CACHE_SWAP_TOP_ONLY", variant & 1 ? "1" : "0");
@@ -4623,7 +4623,7 @@ static bool run_swap_whole(ggml_backend_t gpu, ggml_backend_t cpu, log_capture &
         set_env("GGML_MOE_CACHE_SWAP_COLD_PRUNE", variant & 4 ? "1" : "0");
         set_env("GGML_MOE_CACHE_SWAP", mode == 0 ? "0" : "1");
         set_env("GGML_MOE_CACHE_SWAP_WHOLE", "1");
-        set_env("GGML_MOE_CACHE_SWAP_MAX", mode == 2 ? "2" : "3");
+        set_env("GGML_MOE_CACHE_SWAP_MAX", mode == 6 ? "256" : mode == 2 ? "2" : "3");
         set_env("GGML_MOE_CACHE_SWAP_MB", mode == 3 ? "1" : "2");
         set_env("GGML_MOE_CACHE_SWAP_LAYER", mode == 4 ? "1" : "0");
         desc[5].name = mode == 5 ? "blk.1.ffn_unknown_exps.weight" : weights[5]->name;
@@ -4661,7 +4661,7 @@ static bool run_swap_whole(ggml_backend_t gpu, ggml_backend_t cpu, log_capture &
         const std::string log = capture.get();
         const long long swaps = max_field_value(log, " swaps=");
         if (mode == 0) { case_ok &= swaps <= 0; }
-        else if (mode != 5) { case_ok &= mode == 1 && !incompatible ? swaps == 3 : swaps == 0; }
+        else if (mode != 5) { case_ok &= (mode == 1 || mode == 6) && !incompatible ? swaps == 3 : swaps == 0; }
         if (mode != 0 && mode != 5) {
             case_ok &= log.find("whole swap initial:") != std::string::npos;
             case_ok &= log.find("partial=0") != std::string::npos;
@@ -4672,7 +4672,7 @@ static bool run_swap_whole(ggml_backend_t gpu, ggml_backend_t cpu, log_capture &
             case_ok &= log.find("device tables active:") == std::string::npos;
             case_ok &= swaps <= 0;
         }
-        if (mode == 1 && !incompatible) {
+        if ((mode == 1 || mode == 6) && !incompatible) {
             case_ok &= max_field_value(log, "evictions=") >= 3;
             case_ok &= max_field_value(log, "hits=") > max_field_value(log, "misses=");
         }

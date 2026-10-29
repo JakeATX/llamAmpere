@@ -7435,7 +7435,9 @@ static std::vector<moe_swap_pair> moe_cache_swap_whole_pairs(moe_cache_session &
             // fork: one round admits at most this many complete experts per compatible group.
             const size_t take = (size_t) std::max(1, session.swap_max / 3);
             std::partial_sort(candidates.begin(), candidates.begin() + std::min(take, candidates.size()), candidates.end(), candidate_order);
-            std::partial_sort(victims.begin(), victims.begin() + std::min(take, victims.size()), victims.end(), victim_order);
+            // fork: each candidate consumes at most one resident victim.
+            const size_t vtake = std::min({take, candidates.size(), victims.size()});
+            if (!candidates.empty()) { std::partial_sort(victims.begin(), victims.begin() + vtake, victims.end(), victim_order); }
         } else {
             std::sort(candidates.begin(), candidates.end(), candidate_order);
             std::sort(victims.begin(), victims.end(), victim_order);
