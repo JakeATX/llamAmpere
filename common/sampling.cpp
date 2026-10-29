@@ -1449,7 +1449,8 @@ common_sampler_pq_result common_sampler_verify_pq(const llama_token_data_array &
 
     double total = 0.0;
     for (size_t k = 0; k < p.size; ++k) {
-        total += std::max(0.0, (double) p.data[k].p - q_aligned[k]);
+        q_aligned[k] = std::max(0.0, (double) p.data[k].p - q_aligned[k]);
+        total += q_aligned[k];
     }
     res.id = x;
     if (total > 0.0) {
@@ -1457,7 +1458,7 @@ common_sampler_pq_result common_sampler_verify_pq(const llama_token_data_array &
         double run = 0.0;
         for (size_t k = 0; k < p.size; ++k) {
             const auto & c = p.data[k];
-            const double mass = std::max(0.0, (double) c.p - q_aligned[k]);
+            const double mass = q_aligned[k];
             if (beat && mass <= 0.0) {
                 continue;
             }
