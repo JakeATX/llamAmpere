@@ -19,6 +19,9 @@ void ggml_cuda_moe_cache_table_graph_end(ggml_backend_cuda_context &) {}
 void ggml_cuda_moe_cache_hf_graph_end(ggml_backend_cuda_context &) {}
 void ggml_cuda_moe_cache_cs_graph_scan(ggml_backend_cuda_context &, const ggml_cgraph *) {}
 
+bool ggml_cuda_moe_skipmass_supports(const ggml_tensor *) { return false; }
+bool ggml_cuda_moe_skipmass_compute(ggml_backend_cuda_context &, ggml_tensor *) { return false; }
+
 static void moe_cache_register_stub(const void * owner) {
     (void) owner;
 }
@@ -33,6 +36,7 @@ static void moe_cache_register_stub(const void * owner) {
 #include "../ggml-backend-moe-cache.h"
 #include "../ggml-moe-prefetch.h"
 #include "../ggml-moe-generation-profile.h"
+#include "../ggml-moe-skipmass.h"
 
 #if !defined(GGML_USE_HIP)
 #include <cuda/atomic>
@@ -678,6 +682,10 @@ struct moe_cache_session {
     // --moe-skip-tail cutoff for the current window (0 = exact; guarded by mu, read at graph build time) and the
     // missed tensor-expert rows the host path left out because of it
     int skip_tail = 0;
+    int mass_layer = -1;
+    const void * mass_ids = nullptr;
+    void * mass_trace = nullptr;
+    unsigned * mass_trace_counts = nullptr;
     uint64_t tail_skipped_rows = 0;
     int tail_layer = -1;   // hit-first layer whose cutoff masks are live (-1 none); compute thread only
     std::atomic<uint64_t> device_captures{0};
@@ -4077,7 +4085,7 @@ static int moe_cache_plan(
         }
 
         // --moe-skip-tail: a missed expert that no token of the window ranks in the head is left out, with no fill.
-        if (session.skip_tail > 0 &&
+        if (session.skip_tail > 0 && (!getenv("GGML_MOE_SKIP_POLICY") || strcmp(getenv("GGML_MOE_SKIP_POLICY"), "rank") == 0) &&
                 ggml_moe_cache_tail_rank_ok(ids, n_ids, (int) node->n_tokens, index, session.skip_tail)) {
             const auto found = pool.map.find(moe_cache_key{node->host_base, expert});
             const bool cached = found != pool.map.end() && pool.slots[found->second].state == moe_cache_slot_state::valid;
@@ -7888,6 +7896,22 @@ void ggml_cuda_moe_cache_table_graph_end(ggml_backend_cuda_context & ctx) {
 }
 
 static void moe_cache_device_release(moe_cache_session & session, bool retain_sources) {
+    if (session.mass_trace) {
+        ggml_cuda_set_device(session.devices[0]->logical);
+        unsigned counts[2];
+        CUDA_CHECK(cudaMemcpy(counts, session.mass_trace_counts, sizeof(counts), cudaMemcpyDeviceToHost));
+        const size_t bytes = (size_t) std::min(counts[0], 16384u) * 736;
+        std::vector<char> rows(bytes);
+        CUDA_CHECK(cudaMemcpy(rows.data(), session.mass_trace, bytes, cudaMemcpyDeviceToHost));
+        FILE * f = fopen(getenv("GGML_MOE_SKIP_TRACE"), "ab");
+        const uint32_t header[] = {0x31574d53, 1, 736, std::min(counts[0], 16384u), counts[0] > 16384u, 16};
+        GGML_ASSERT(f && fwrite(header, sizeof(header), 1, f) == 1 && fwrite(rows.data(), 1, bytes, f) == bytes);
+        fclose(f);
+        CUDA_CHECK(cudaFree(session.mass_trace));
+        CUDA_CHECK(cudaFree(session.mass_trace_counts));
+        session.mass_trace = nullptr;
+        session.mass_trace_counts = nullptr;
+    }
     moe_pf_release(&session); // fork PREFETCHFIX: tables below are about to be freed
     session.device_ready.store(false);
     if (session.device_adapt_stream) {
@@ -9631,7 +9655,122 @@ static __global__ void moe_tail_zero_kernel(const uint8_t * skip, const int32_t 
     }
 }
 
-// True when the --moe-skip-tail masks of this projection's layer are live (written by this layer's moe_hf_begin).
+// fork: sampled router weights and residency, without host registration.
+struct moe_mass_record {
+    uint32_t round, layer, n_used, n_tokens;
+    int32_t ids[80];
+    float weights[80];
+    uint8_t hot[80];
+};
+static_assert(sizeof(moe_mass_record) == 736, "skip trace layout");
+
+bool ggml_cuda_moe_skipmass_supports(const ggml_tensor * op) {
+    int layer = -1, end = 0;
+    return op && op->op == GGML_OP_MAP_CUSTOM2 && sscanf(op->name, "moe_skipmass-%d%n", &layer, &end) == 1 &&
+        op->name[end] == 0 && layer >= 0 && layer < 48 && op->type == GGML_TYPE_F32 &&
+        op->src[0] && op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) &&
+        op->src[1] && op->src[1]->type == GGML_TYPE_I32 && op->src[1]->nb[0] == sizeof(int32_t) &&
+        op->src[1]->ne[0] == 10 && op->src[1]->ne[1] >= 1 && op->src[1]->ne[1] <= 8 &&
+        op->src[1]->ne[2] == 1 && op->src[1]->ne[3] == 1 && ggml_is_contiguous(op) &&
+        ggml_are_same_shape(op, op->src[0]) && op->ne[0] == 1 && op->ne[1] == 10 &&
+        op->ne[2] == op->src[1]->ne[1] && op->ne[3] == 1;
+}
+
+static __global__ void moe_mass_kernel(const float * weights, float * out_weights, const int32_t * ids,
+        int stride, int width, int layer, int mode, float threshold, bool renorm, int experts,
+        const uint8_t * hot0, const uint8_t * hot1, const uint8_t * hot2,
+        uint8_t * masks, int mask_stride, unsigned long long * counts,
+        moe_mass_record * trace, unsigned * trace_counts) {
+    __shared__ unsigned char drop[80], hot[80];
+    __shared__ int expert[80];
+    const int tid = threadIdx.x;
+    const int routes = width * 10;
+    for (int i = tid; i < routes; i += blockDim.x) {
+        drop[i] = 0;
+        expert[i] = ids[(i / 10) * stride + i % 10];
+        const int e = expert[i];
+        hot[i] = e >= 0 && e < experts ? (hot0[e] != 0) | ((hot1[e] != 0) << 1) | ((hot2[e] != 0) << 2) : 7;
+    }
+    __syncthreads();
+    if (trace && tid == 0) {
+        const unsigned round = layer == 0 ? ++trace_counts[1] : trace_counts[1];
+        if (round % 16 == 0) {
+            const unsigned index = trace_counts[0]++;
+            if (index < 16384) {
+                auto & rec = trace[index];
+                rec.round = round; rec.layer = layer; rec.n_used = 10; rec.n_tokens = width;
+                for (int i = 0; i < 80; ++i) {
+                    rec.ids[i] = i < routes ? expert[i] : -1;
+                    rec.weights[i] = i < routes ? weights[i] : 0.0f;
+                    rec.hot[i] = i < routes ? hot[i] : 7;
+                }
+            }
+        }
+    }
+    for (int token = tid; token < width; token += blockDim.x) {
+        if (mode) { ggml_moe_skipmass_select(weights + 10 * token, hot + 10 * token, 10, mode, threshold, drop + 10 * token); }
+        float total = 0.0f, kept = 0.0f;
+        bool changed = false;
+        for (int j = 0; j < 10; ++j) {
+            const int i = 10 * token + j;
+            total += weights[i]; kept += drop[i] ? 0.0f : weights[i]; changed |= drop[i] != 0;
+        }
+        for (int j = 0; j < 10; ++j) {
+            const int i = 10 * token + j;
+            out_weights[i] = drop[i] ? 0.0f : (renorm && changed && kept > 0.0f ? weights[i] * (total / kept) : weights[i]);
+        }
+    }
+    __syncthreads();
+    if (!mode) { return; }
+    for (int e = tid; e < experts; e += blockDim.x) {
+        bool routed = false, keep = false;
+        for (int i = 0; i < routes; ++i) {
+            if (expert[i] == e) { routed = true; keep |= !drop[i]; }
+        }
+        const bool skip = routed && !keep && !hot0[e] && !hot1[e] && !hot2[e];
+        masks[e] = hot0[e] | skip; masks[mask_stride + e] = hot1[e] | skip;
+        masks[2 * mask_stride + e] = hot2[e] | skip; masks[3 * mask_stride + e] = skip;
+        if (skip && counts) {
+            atomicAdd(counts + 2, 1ULL);
+            unsigned long long rows = 0;
+            for (int i = 0; i < routes; ++i) { rows += expert[i] == e; }
+            atomicAdd(counts, 3ULL * rows);
+        }
+    }
+    if (counts && tid == 0) { atomicAdd(counts + 1, 1ULL); }
+}
+
+bool ggml_cuda_moe_skipmass_compute(ggml_backend_cuda_context & ctx, ggml_tensor * op) {
+    GGML_ASSERT(ggml_cuda_moe_skipmass_supports(op));
+    GGML_ASSERT(!g_session_suppressed && !g_session_stack.empty() && g_session_stack.back().active);
+    auto & session = *g_session_stack.back().active;
+    const int layer = atoi(op->name + strlen("moe_skipmass-"));
+    GGML_ASSERT(session.device_ready.load() && session.devices.size() == 1 && session.devices[0]->logical == ctx.device);
+    GGML_ASSERT(layer < (int) session.mj_groups.size());
+    const auto & group = session.mj_groups[layer];
+    GGML_ASSERT(group[0] && group[1] && group[2] && g_tail_mask && moe_missjoin_hitfirst_enabled());
+    const char * policy = getenv("GGML_MOE_SKIP_POLICY");
+    const int mode = !policy || strcmp(policy, "rank") == 0 ? 0 : strcmp(policy, "threshold") == 0 ? 1 : strcmp(policy, "cumulative") == 0 ? 2 : -1;
+    GGML_ASSERT(mode >= 0);
+    const char * t = getenv("GGML_MOE_SKIP_THRESHOLD");
+    char * end = nullptr;
+    const float threshold = t ? strtof(t, &end) : 0.0f;
+    GGML_ASSERT(!mode || (t && end != t && *end == 0 && std::isfinite(threshold) && threshold >= 0.0f && threshold < 1.0f));
+    const bool active = mode && session.skip_tail > 0;
+    const char * r = getenv("GGML_MOE_SKIP_RENORM");
+    const bool renorm = r && strcmp(r, "1") == 0;
+    const int experts = (int) group[0]->desc.n_expert;
+    GGML_ASSERT(experts <= g_hf_experts && experts <= MOE_TAIL_MAX_EXPERT);
+    moe_mass_kernel<<<1, 256, 0, ctx.stream()>>>((const float *) op->src[0]->data, (float *) op->data,
+        (const int32_t *) op->src[1]->data, (int) (op->src[1]->nb[1] / sizeof(int32_t)), (int) op->ne[2],
+        layer, active ? mode : 0, threshold, renorm, experts, group[0]->hot, group[1]->hot, group[2]->hot,
+        g_tail_mask, g_hf_experts, g_tail_counts, (moe_mass_record *) session.mass_trace, session.mass_trace_counts);
+    CUDA_CHECK(cudaGetLastError());
+    session.mass_layer = active ? layer : -1;
+    session.mass_ids = op->src[1]->data;
+    return true;
+}
+
 static bool moe_tail_active(const moe_cache_session & session, const moe_cache_device_table & table) {
     return session.tail_layer >= 0 && session.tail_layer == table.mj_layer;
 }
@@ -9711,14 +9850,17 @@ static bool moe_hf_begin(ggml_backend_cuda_context & ctx, moe_cache_session & se
     args.stride = g_hf_stride;
     const int n_expert = (int) group[0]->desc.n_expert;
     // --moe-skip-tail: the cutoff masks go first on the side stream; the plan then sees left-out experts as resident.
-    const bool tail = session.skip_tail > 0 && g_tail_mask && n_expert <= MOE_TAIL_MAX_EXPERT &&
+    const bool mass = session.mass_layer == table.mj_layer && session.mass_ids == ids->data;
+    const bool tail = (mass || (session.skip_tail > 0 && (!getenv("GGML_MOE_SKIP_POLICY") || strcmp(getenv("GGML_MOE_SKIP_POLICY"), "rank") == 0))) && g_tail_mask && n_expert <= MOE_TAIL_MAX_EXPERT &&
             n_expert <= g_hf_experts && session.skip_tail < (int) ids->ne[0];
     session.tail_layer = tail ? table.mj_layer : -1;
-    if (tail) {
+    if (tail && !mass) {
         moe_tail_prep_kernel<<<1, 256, 0, g_hf_side>>>(group[0]->hot, group[1]->hot, group[2]->hot,
                 (const int32_t *) ids->data, (int) ids->ne[0], routes, (int) (ids->nb[1] / sizeof(int32_t)), n_expert,
                 session.skip_tail, g_tail_mask, g_hf_experts, g_tail_counts);
         CUDA_CHECK(cudaGetLastError());
+    }
+    if (tail) {
         for (int j = 0; j < 3; ++j) {
             args.hot[j] = g_tail_mask + (size_t) j * g_hf_experts;
         }
@@ -11453,6 +11595,11 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
         }
         session->device_capture_generation = g_moe_cache_capture_generation.fetch_add(1, std::memory_order_relaxed);
         GGML_ASSERT(session->device_capture_generation != 0);
+        if (getenv("GGML_MOE_SKIP_TRACE")) {
+            CUDA_CHECK(cudaMalloc(&session->mass_trace, 16384 * sizeof(moe_mass_record)));
+            CUDA_CHECK(cudaMalloc((void **) &session->mass_trace_counts, 2 * sizeof(unsigned)));
+            CUDA_CHECK(cudaMemset(session->mass_trace_counts, 0, 2 * sizeof(unsigned)));
+        }
         session->device_ready.store(true, std::memory_order_release);
         MOE_CACHE_LOG("[moe-cache] device tables active: %zu tensors, %zu MiB mapped existing pages, %zu KiB device tables; stable slots with boundary adaptation; no per-layer host routing or result copies\n",
                 session->device_tables.size(), (pin_bytes + retained_staging + retained_registered) >> 20, table_bytes >> 10);
