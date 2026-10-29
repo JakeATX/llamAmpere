@@ -605,7 +605,22 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_recurrent::memory_brea
     return ret;
 }
 
+bool llama_memory_recurrent::replay_static_width(uint32_t n_seq_tokens, uint32_t n_rs_seq) {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_GDN_REPLAY_STATIC"); // =0: the rollback-shaped graph (A/B)
+        return e == nullptr || strcmp(e, "0") != 0;
+    }();
+    static const bool short_on = [] {
+        const char * e = getenv("LLAMA_GDN_REPLAY_SHORT");
+        return e != nullptr && strcmp(e, "1") == 0;
+    }();
+    return on && n_rs_seq > 0 && (n_seq_tokens >= n_rs_seq || (short_on && n_seq_tokens >= 2));
+}
+
 uint32_t llama_memory_recurrent::replay_span_new(uint32_t ckpt_span, uint32_t replay_len, uint32_t n_seq_tokens, uint32_t n_rs_seq) {
+    if (n_seq_tokens < n_rs_seq && replay_static_width(n_seq_tokens, n_rs_seq)) {
+        return n_seq_tokens;
+    }
     const uint32_t m = ckpt_span - std::min(ckpt_span, replay_len);
     return std::min(m + n_seq_tokens, n_rs_seq);
 }

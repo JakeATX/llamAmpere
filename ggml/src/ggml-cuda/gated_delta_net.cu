@@ -126,8 +126,8 @@ gated_delta_net_cuda(const float * q,
     // masked to 0 leaves the state bit-exact); they write no attention output and no slot
     const int n_prefix = emit_ingredients_t ? state_src.prefix_n : 0;
     for (int t = -n_prefix; t < n_tokens; t++) {
-        if (emit_ingredients_t && t == 0 && n_prefix > 0 && n_tokens == K) {
-            // n_tokens == K with a prefix: the checkpoint block is the state after the prefix
+        if (emit_ingredients_t && t == 0 && n_prefix > 0 && n_tokens <= K) {
+            // n_tokens <= K with a prefix: the checkpoint block is the state after the prefix
             float * ckpt_slot = (state_src.ckpt_dst ? state_src.ckpt_dst : state_f + ingr_region + S_v * S_v * H * n_seqs) +
                 (sequence * H + h_idx) * S_v * S_v;
 #pragma unroll
@@ -301,7 +301,7 @@ gated_delta_net_cuda(const float * q,
             if constexpr (emit_ingredients_t) {
                 // state immediately before the K-token retained window starts, captured inline
                 // (free relative to a second op call over the same prefix) when n_tokens > K
-                // (n_tokens == K with a prefix: at the top of token 0, above).
+                // (n_tokens <= K with a prefix: at the top of token 0, above).
                 const int t_ckpt = (int) n_tokens - K - 1;
                 if (t_ckpt >= 0 && t == t_ckpt) {
                     float * ckpt_slot = (state_src.ckpt_dst ? state_src.ckpt_dst : state_f + ingr_region + S_v * S_v * H * n_seqs) +
@@ -479,8 +479,8 @@ gated_delta_net_cuda_ilp(const float * q,
         if (t < 0 && state_src.prefix_w[t + n_prefix] == 0.0f) {
             continue;
         }
-        if (emit_ingredients_t && t == 0 && n_prefix > 0 && n_tokens == K) {
-            // n_tokens == K with a prefix: the checkpoint block is the state after the prefix
+        if (emit_ingredients_t && t == 0 && n_prefix > 0 && n_tokens <= K) {
+            // n_tokens <= K with a prefix: the checkpoint block is the state after the prefix
             float * ckpt = (state_src.ckpt_dst ? state_src.ckpt_dst : (float *) state + ingr_region + S_v * S_v * H * n_seqs) +
                 (sequence * H + h_idx) * S_v * S_v;
 #pragma unroll
@@ -617,7 +617,7 @@ gated_delta_net_cuda_ilp(const float * q,
                 }
             }
             if constexpr (emit_ingredients_t) {
-                if (t == n_tokens - K - 1) {
+                if (n_tokens > K && t == n_tokens - K - 1) {
                     float * ckpt = (state_src.ckpt_dst ? state_src.ckpt_dst : (float *) state + ingr_region + S_v * S_v * H * n_seqs) +
                 (sequence * H + h_idx) * S_v * S_v;
 #pragma unroll

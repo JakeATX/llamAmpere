@@ -819,7 +819,7 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
 
     // the rollback-independent verify graph (see below) has the checkpoint rows gathered into `s`
     // already, through the state/checkpoint pair, and never reads s_ckpt
-    const bool replay_static = n >= K && inp->replay_w != nullptr;
+    const bool replay_static = inp->replay_w != nullptr; // n >= K, or a short round under LLAMA_GDN_REPLAY_SHORT=1
     ggml_tensor * s_ckpt = nullptr;
     if (!replay_static) {
         s_ckpt = build_rs(inp, ckpt_all, hparams.n_embd_s(), n_seqs);
@@ -878,8 +878,11 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
             return e == nullptr || strcmp(e, "0") != 0;
         }();
         // verify widths only (n <= 2K): a prompt ubatch also takes this graph, and its main call
-        // must keep the chunked tensor-core prompt kernel, which the prefix would bypass
-        replay_fold = fold_env && n >= K && n <= 2 * K;
+        // must keep the chunked tensor-core prompt kernel, which the prefix would bypass. A short
+        // round (n < K) re-bases the checkpoint to the start of the ubatch like n == K does: the op
+        // emits the state after the prefix as the checkpoint block and the ring keeps only the n new
+        // slots (replay_span_new returns n).
+        replay_fold = fold_env && n <= 2 * K;
         if (!replay_fold) {
             ggml_tensor * w      = inp->replay_w;
             ggml_tensor * w_slot = ggml_view_4d(ctx0, w, 1, 1, K, 1, w->nb[0], w->nb[0], w->nb[0] * K, 0);

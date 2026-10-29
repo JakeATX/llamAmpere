@@ -294,7 +294,8 @@ int main(int argc, char ** argv) {
                 base.assign(prefix.begin() + accepted * S_v * H, prefix.end());
             }
             for (int64_t nt = 1; nt <= N - P; nt++) {
-                for (int64_t ns = 1; ns <= nt; ns++) {
+                // ns > nt: a short verify round (LLAMA_GDN_REPLAY_SHORT), which also emits the checkpoint block
+                for (int64_t ns = 1; ns <= N - P; ns++) {
                     auto tail = [&](const std::vector<float> & initial, bool folded) {
                         return run_gdn(backend.get(),
                             slice(q_full, S_v * H, P, P + nt), slice(k_full, S_v * H, P, P + nt),
@@ -308,11 +309,14 @@ int main(int argc, char ** argv) {
                     const size_t region = ggml_gated_delta_net_ingr_region(S_v, 1, H, 1, ns, mode);
                     const size_t state_size = S_v * S_v * H;
                     const float diff_attn = max_abs(actual.data(), expected.data(), attn_size);
-                    const float diff_ingr = max_abs(actual.data() + attn_size, expected.data() + attn_size, ns * pw * H);
+                    // the op writes slots [ns - min(nt, ns), ns) (right-aligned); the rest of the region is not output
+                    const size_t ingr_skip = (ns - std::min(nt, ns)) * pw * H;
+                    const float diff_ingr = max_abs(actual.data() + attn_size + ingr_skip, expected.data() + attn_size + ingr_skip,
+                                                    std::min(nt, ns) * pw * H);
                     const float diff_state = max_abs(actual.data() + attn_size + region,
                                                     expected.data() + attn_size + region, state_size);
-                    // nt == ns: with the prefix the checkpoint block is the state after the prefix, the replay base
-                    if (actual.size() != expected.size() + (nt == ns ? state_size : 0)) {
+                    // nt <= ns: with the prefix the checkpoint block is the state after the prefix, the replay base
+                    if (actual.size() != expected.size() + (nt <= ns ? state_size : 0)) {
                         fprintf(stderr, "FAIL: prefix output size %zu, expected %zu\n", actual.size(), expected.size());
                         return 1;
                     }

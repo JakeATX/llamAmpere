@@ -143,8 +143,16 @@ public:
 
     // gdn_replay: the span the ring holds behind the checkpoint after a ubatch of n_seq_tokens
     // tokens per seq -- the accepted prefix (ckpt_span - replay_len) plus the new tokens, capped
-    // at the ring capacity. The graph input and replay_split::advance() both use it.
+    // at the ring capacity. The graph input and replay_split::advance() both use it. A short ubatch
+    // on the static graph (replay_static_width, n < n_rs_seq) re-bases the checkpoint to its start,
+    // so the ring then holds just its n_seq_tokens tokens.
     static uint32_t replay_span_new(uint32_t ckpt_span, uint32_t replay_len, uint32_t n_seq_tokens, uint32_t n_rs_seq);
+
+    // gdn_replay: whether a ubatch of n_seq_tokens tokens per seq takes the rollback-independent verify
+    // graph (llm_graph_input_rs::replay_w): n >= n_rs_seq (LLAMA_GDN_REPLAY_STATIC=0 turns it off), and,
+    // opt-in with LLAMA_GDN_REPLAY_SHORT=1, the short verify rounds 2 <= n < n_rs_seq of a drafter that
+    // stopped early. Graph and bookkeeping must agree, so both ask here.
+    static bool replay_static_width(uint32_t n_seq_tokens, uint32_t n_rs_seq);
 
     // [TAG_GDN_REPLAY_SPLIT] the replay subtree of a ubatch is built from one (replay_len,
     // ckpt_span, s_stale) -- see llama_memory_recurrent_context::get_replay_len() -- so seqs that

@@ -11559,10 +11559,10 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     // floats per head in one slot: a full state, or the ingredient width of emit_mode 1 or 2
     const int64_t slot_w              = (emit_mode == 0) ? S_v * S_v : ggml_gated_delta_net_ingr_width(S_v, neg0, emit_mode);
     const int64_t state_size_per_snap = slot_w * H * n_seqs;
-    // with a prefix (ggml_gated_delta_net_set_prefix) n_tokens == K has the block too: the state after the prefix
+    // with a prefix (ggml_gated_delta_net_set_prefix) n_tokens <= K has the block too: the state after the prefix
     const bool    needs_ckpt          = (emit_mode != 0) &&
-        (n_tokens > K || (n_tokens == K && ggml_get_op_params_i32(dst, 2) > 0));
-    const int64_t t_ckpt              = n_tokens - K - 1; // token index whose post-step state to save (-1: after the prefix)
+        (n_tokens > K || ggml_get_op_params_i32(dst, 2) > 0);
+    const int64_t t_ckpt              = n_tokens > K ? n_tokens - K - 1 : -1; // token index whose post-step state to save (-1: after the prefix)
     float * attn_out_base   = (float *)dst->data;
     float * state_out_base  = (float *)dst->data + attn_score_elems;
     float * final_state_out = emit_mode == 0 ? nullptr    // emit_mode!=0 only

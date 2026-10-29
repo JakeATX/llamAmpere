@@ -561,7 +561,7 @@ bool llm_graph_input_rs::replay_reusable(const llama_memory_recurrent_context * 
     ckpt_span  = S;
     s_stale    = z;
     span_new   = llama_memory_recurrent::replay_span_new(S, r, n, m->get_n_rs_seq());
-    return n >= m->get_n_rs_seq();
+    return llama_memory_recurrent::replay_static_width(n, m->get_n_rs_seq());
 }
 
 bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
@@ -4589,13 +4589,10 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
         ggml_set_input(inp->s_copy_shift);
     }
 
-    // --gdn-replay: a ubatch that fills the ring takes the rollback-independent graph (see replay_w)
-    static const bool replay_static = [] {
-        const char * e = getenv("LLAMA_GDN_REPLAY_STATIC"); // =0: the rollback-shaped graph (A/B)
-        return e == nullptr || strcmp(e, "0") != 0;
-    }();
-    if (replay_static && mctx_cur->get_gdn_replay() && n_seqs > 0 && mctx_cur->get_n_rs_seq() > 0 &&
-            ubatch.n_tokens / n_seqs >= mctx_cur->get_n_rs_seq()) {
+    // --gdn-replay: a ubatch that fills the ring (or, opt-in, a short verify round) takes the
+    // rollback-independent graph (see replay_w)
+    if (mctx_cur->get_gdn_replay() && n_seqs > 0 &&
+            llama_memory_recurrent::replay_static_width(ubatch.n_tokens / n_seqs, mctx_cur->get_n_rs_seq())) {
         inp->s_copy_conv = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_rs);
         ggml_set_input(inp->s_copy_conv);
         ggml_set_name(inp->s_copy_conv, "rs_s_copy_conv");
