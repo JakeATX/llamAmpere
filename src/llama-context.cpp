@@ -60,6 +60,9 @@
 #if defined(__GLIBC__)
 #include <malloc.h>
 #endif
+#if defined(__linux__)
+#include <sys/resource.h>
+#endif
 
 //
 // llama_context
@@ -7467,13 +7470,25 @@ bool llama_context::b1_run_prefix(llama_memory_context_i * mctx, size_t ub0, ggm
     const int32_t l_final = b1->final_l0();
     const size_t  ub1     = b1->group_end(ub0);
     const llm_graph_type gtype = ctx_type_to_graph_type(cparams.ctx_type);
+    // Opt-in host timeline: no extra device waits or changes to graph execution.
+    static const bool pp_layers = [] {
+        const char * e = getenv("LLAMA_PP_LAYERS");
+        return e && atoi(e) != 0;
+    }();
 
     status = GGML_STATUS_FAILED;
     for (int32_t l0 = 0; l0 < l_final; ) {
+        const int64_t pp_t0 = pp_layers ? ggml_time_us() : 0;
+        const int64_t pp_compute0 = b1_compute_submit_us;
+#if defined(__linux__)
+        struct rusage pp_before = {}, pp_after = {};
+        const bool pp_usage = pp_layers && getrusage(RUSAGE_SELF, &pp_before) == 0;
+#endif
         const int32_t l1 = b1->range_end(l0);
         if (!b1->layer_begin(l0) || !b1_kv_scratch_bind(l0, l1)) {
             return false;
         }
+        const int64_t pp_bound = pp_layers ? ggml_time_us() : 0;
         for (size_t u = ub0; u < ub1; ++u) {
             if (!mctx->b1_seek(u)) {
                 LLAMA_LOG_ERROR("%s: [B1] cannot seek to ubatch %zu\n", __func__, u);
@@ -7491,6 +7506,9 @@ bool llama_context::b1_run_prefix(llama_memory_context_i * mctx, size_t ub0, ggm
             const int64_t compute_us = ggml_time_us() - t_compute0;
             b1_compute_submit_us += compute_us;
             b1->pass_compute(u, compute_us);
+            if (pp_layers && l0 < 2) {
+                LLAMA_LOG_INFO("%s: [PP] layer=%d ubatch=%zu graph_host_ms=%.3f\n", __func__, l0, u, compute_us / 1000.0);
+            }
             if (home) {
                 b1->ubatch_home(l0, false);
             }
@@ -7551,6 +7569,19 @@ bool llama_context::b1_run_prefix(llama_memory_context_i * mctx, size_t ub0, ggm
         }
         b1->layer_end(l0);
         b1_memory_trim("B1 layer complete");
+        if (pp_layers) {
+            LLAMA_LOG_INFO("%s: [PP] layer=%d end=%d host_wall_ms=%.3f bind_ms=%.3f graph_host_ms=%.3f ple=%d\n",
+                    __func__, l0, l1, (ggml_time_us() - pp_t0) / 1000.0, (pp_bound - pp_t0) / 1000.0,
+                    (b1_compute_submit_us - pp_compute0) / 1000.0, (int) model.hparams.is_ple(l0));
+#if defined(__linux__)
+            if (pp_usage && getrusage(RUSAGE_SELF, &pp_after) == 0) {
+                auto ms = [](const timeval & t) { return t.tv_sec * 1000.0 + t.tv_usec / 1000.0; };
+                LLAMA_LOG_INFO("%s: [PP] layer=%d process_minflt=%ld process_majflt=%ld process_user_ms=%.3f process_sys_ms=%.3f\n",
+                        __func__, l0, pp_after.ru_minflt - pp_before.ru_minflt, pp_after.ru_majflt - pp_before.ru_majflt,
+                        ms(pp_after.ru_utime) - ms(pp_before.ru_utime), ms(pp_after.ru_stime) - ms(pp_before.ru_stime));
+            }
+#endif
+        }
         l0 = l1;
     }
 
