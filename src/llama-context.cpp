@@ -197,6 +197,35 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     throw std::runtime_error("Unsupported ctx type");
 }
 
+// PP-3 LLAMA_PP_SETUP=1: log where the layer-major setup spends its time and skip its allocator trim (the
+// "B1 prepared" trim returned ~0.1 MiB for 18 ms at 100K). Off by default; it changes no math.
+static bool pp_setup_on() {
+    const char * e = getenv("LLAMA_PP_SETUP");
+    static const bool on = e && atoi(e) != 0;
+    return on;
+}
+
+struct pp_setup_clock {
+    int64_t t0 = ggml_time_us();
+    int64_t last = t0;
+    std::string steps;
+    void mark(const char * what) {
+        if (!pp_setup_on()) {
+            return;
+        }
+        const int64_t now = ggml_time_us();
+        char buf[96];
+        snprintf(buf, sizeof(buf), " %s=%.1f", what, (now - last) / 1000.0);
+        steps += buf;
+        last = now;
+    }
+    void print(const char * fn) const {
+        if (pp_setup_on()) {
+            LLAMA_LOG_INFO("%s: [PP] setup ms:%s total=%.1f\n", fn, steps.c_str(), (last - t0) / 1000.0);
+        }
+    }
+};
+
 // fork: free allocator pages between B1 layers; live buffers remain allocated.
 static void b1_memory_trim(const char * phase) {
 #if defined(__GLIBC__)
@@ -5272,9 +5301,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         llama_context & ctx;
         ~b1_cache_guard() { ctx.b1_cache_resume(); }
     } b1_cache_guard_ { *this };
+    pp_setup_clock pp_dec;
     if (!prompt_buffers_resize(n_tokens_all, &batch_inp)) {
         return -2;
     }
+    pp_dec.mark("scratch_resize");
     b1_cache_collect = false;
     if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && n_tokens_all > 3072 &&
             (sched_reserve_tokens > 512 || b1_ffn_scratch_active || b1_layer_scratch_active)) {
@@ -5306,6 +5337,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     }
     sched_reserve();
     mtp_scratch_prepare(n_outputs_all == 0);
+    pp_dec.mark("sched_reserve");
 
     bool did_optimize = false;
 
@@ -5361,14 +5393,20 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         break;
     }
 
+    pp_dec.mark("init_batch");
     // reserve output buffer
     if (output_reserve(n_outputs_all, n_tokens_all) < n_outputs_all) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
         return -2;
     };
+    pp_dec.mark("output_reserve");
 
     // [B1] layer-major prefill: plan the call and apply every ubatch up front, or give lent experts back first
     const int b1_mode = b1_prepare(mctx.get(), batch_inp, n_tokens_all, n_outputs_all);
+    pp_dec.mark("b1_prepare");
+    if (b1_mode == 1) {
+        pp_dec.print(__func__);
+    }
     if (b1_mode < 0) {
         b1_cache_counts.clear();
         b1_cache_readbacks = 0;
@@ -6790,6 +6828,7 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
     // scheduler to copy RAM experts to the GPU, the normal path computes that layer's RAM experts on the CPU in every
     // ubatch, so B1 leaves them home (same result, one layer less to stream). Otherwise ubatch_home() matches it per ubatch.
     const bool final_home = !b1->host_rows_on_gpu(b1_final_rows(n_outputs_all, n_tokens_all));
+    pp_setup_clock pp_clock;
     // the MoE expert cache (--moe-cache) keeps the free VRAM above its reserve once it has run, which leaves B1 no
     // room when the experts are in RAM. Opt-in (LLAMA_B1_MOE_CACHE_SUSPEND=1): free its pool for this call when no
     // other sequence decodes from it; b1_end makes it again and it refills from decode. Off by default because the
@@ -6813,8 +6852,10 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
     b1_kv_scratch_enabled = false;
     const bool kv_cold = memory->seq_pos_max(seq) < 0;
 
+    pp_clock.mark("suspend");
     detach_compute_borrower();
     bool planned = b1->begin(sizes, group_ub, lend_cap, final_home, rotating ? &borrow : nullptr, lean_legacy);
+    pp_clock.mark("plan");
     if (!planned && borrow > 0) {
         synchronize();
         ggml_backend_dev_t loan_device = nullptr;
@@ -6884,7 +6925,9 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
             b1_end(true);
             return normal();
         }
+        pp_clock.mark("legacy_reserve");
         b1->start_streaming();
+        pp_clock.mark("start_streaming");
     }
 
     // apply every ubatch now, saving each memory view
@@ -6895,6 +6938,7 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
     if (sj) {
         sj->b1_sj_begin(seq);
     }
+    pp_clock.mark("sj_begin");
     size_t n_applied = 0;
     do {
         if (!mctx->apply()) {
@@ -6920,13 +6964,18 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
         return -3;
     }
 
+    pp_clock.mark("apply_views");
     b1_compute_submit_us = 0;
     b1_cache_begin();
     b1_cache_collect = b1_cache_warm_enabled && b1_cache_collect_wanted();
+    pp_clock.mark("cache_begin");
 
     LLAMA_LOG_WARN("%s: [B1] layer-major prefill of %u tokens: %zu ubatches, %zu groups of %zu, %s\n", __func__,
             n_tokens_all, sizes.size(), b1->n_groups(), b1->group_ub(), others ? "other sequences present" : "alone");
-    b1_memory_trim("B1 prepared");
+    if (!pp_setup_on()) {
+        b1_memory_trim("B1 prepared");
+    }
+    pp_clock.print(__func__);
     return 1;
 }
 
