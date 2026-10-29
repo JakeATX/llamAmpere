@@ -1024,12 +1024,24 @@ static bool ai4_mmvid_route(int n_tok, int n_used, int n_expert, int rate) {
     return (double) n_used*n_tok <= p*act;
 }
 
-// Reuse the fixed-size staging loop already used by dense kernels. The routed
-// variant changes copy instruction scheduling only; row selection and K order stay the same.
+// fork: reuse dense staging and fragment schedules without changing routed rows or K order.
 template <int BN, int STAGES, int LAY, int XSH, int SLABS = ai4k::GEMM_SLABS>
 static void ai23_launch_id_shape(const uint8_t * W, const int8_t * q, const float * s, float * Y, int M, int K,
                                   cudaStream_t stream, const ai4k::idmap & idm, int max_tiles) {
     static const bool fixed_load = ai4_env_int("GGML_CUDA_AI23_ID_FIXED_LOAD", nullptr, 0) != 0;
+    static const bool j_major = ai4_env_int("GGML_CUDA_AI23_ID_J_MAJOR", nullptr, 0) != 0;
+    if (j_major) {
+        if (fixed_load) {
+            ai23_launch_gemm<BN, STAGES, 4, LAY, XSH, true, 1, SLABS,
+                            false, 1, false, true, false, false, false, false, true>(
+                    W, q, s, Y, M, M, 0, K, stream, idm, max_tiles);
+        } else {
+            ai23_launch_gemm<BN, STAGES, 4, LAY, XSH, true, 1, SLABS,
+                            false, 1, false, true>(
+                    W, q, s, Y, M, M, 0, K, stream, idm, max_tiles);
+        }
+        return;
+    }
     if (fixed_load) {
         ai23_launch_gemm<BN, STAGES, 4, LAY, XSH, true, 1, SLABS,
                         false, 1, false, false, false, false, false, false, true>(
