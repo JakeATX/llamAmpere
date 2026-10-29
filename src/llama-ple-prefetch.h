@@ -59,12 +59,15 @@ private:
     int64_t reader();  // one reader thread, returns the time of its last read
     size_t chunks_for(uint64_t n_tok) const;
     bool   run_ready(size_t i) const; // under mtx: run i exists and may be read, or there is nothing more to read
+    double resident_fraction(const std::vector<uint64_t> & keys, uint64_t base) const;
 
     const llama_model * model = nullptr;
     const ggml_tensor * ple   = nullptr;
 
     // configuration
     int      n_threads = 0;
+    int      n_cold    = 0;      // readers once the first chunk finds the table mostly uncached (0 = never more)
+    int      n_readers = 0;      // readers of the current call
     bool     use_pread = true;
     bool     use_advise = false; // [PFGAP] file mode: ask the kernel to queue the reads instead of copying them
     bool     coalesce = false;

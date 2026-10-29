@@ -15,12 +15,14 @@
 
 #if defined(__linux__)
 #include <fcntl.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
 
 static constexpr int64_t PLE_PF_DEFAULT_THREADS = 2;
 static constexpr int64_t PLE_PF_DEFAULT_MIN     = 4096;
+static constexpr int64_t PLE_PF_DEFAULT_COLD    = 32;  // readers when the table is mostly out of the page cache
 
 static int64_t ple_pf_env(const char * name, int64_t def) {
     const char * v = getenv(name);
@@ -82,6 +84,9 @@ std::unique_ptr<llama_ple_prefetch> llama_ple_prefetch::create(const llama_model
     pf->model     = &model;
     pf->ple       = t;
     pf->n_threads = (int) std::min<int64_t>(n_thr, 512);
+    // fork: a cold table (evicted by another process, first prompt after boot) is bound by disk queue depth, not by
+    // the readers' CPU; LLAMA_PLE_PF_COLD_THREADS=0 keeps n_threads in every case
+    pf->n_cold    = (int) std::min<int64_t>(std::max<int64_t>(0, ple_pf_env("LLAMA_PLE_PF_COLD_THREADS", PLE_PF_DEFAULT_COLD)), 512);
     // by default only long calls (a short check or catch-up batch is cheaper to fault in) and the whole call ahead
     pf->n_min     = (uint32_t) std::max<int64_t>(1, ple_pf_env("LLAMA_PLE_PF_MIN", user ? 256 : PLE_PF_DEFAULT_MIN));
     pf->n_ahead   = (uint64_t) std::max<int64_t>(0, ple_pf_env("LLAMA_PLE_PF_AHEAD", 1000000));
@@ -250,9 +255,10 @@ void llama_ple_prefetch::build() {
     const int64_t eos      = hp.ple_eos_token_id;
 
     // [PFGAP] the readers start first and follow the chunks as they are published
-    std::vector<int64_t> last(n_threads, 0);
+    std::vector<int64_t> last(std::max(n_threads, n_cold), 0);
     readers.clear();
-    readers.reserve(n_threads);
+    readers.reserve(last.size());
+    n_readers = n_threads;
     for (int i = 0; i < n_threads; ++i) {
         readers.emplace_back([this, i, &last]() { last[i] = reader(); });
     }
@@ -320,6 +326,16 @@ void llama_ple_prefetch::build() {
             }
         }
         std::sort(cp.begin(), cp.end());
+        if (c == 0 && n_cold > n_threads && !cp.empty()) {
+            const double res = resident_fraction(cp, base);
+            if (res < 0.5) {
+                for (int i = n_threads; i < n_cold; ++i) {
+                    readers.emplace_back([this, i, &last]() { last[i] = reader(); });
+                }
+                n_readers = n_cold;
+                LLAMA_LOG_INFO("%s: [PLEPF] cold table (%.0f%% of sampled pages cached): %d readers\n", __func__, 100.0*res, n_cold);
+            }
+        }
         const size_t r0 = nr;
         for (size_t j = 0; j < cp.size(); ++j) {
             const uint64_t gap = coalesce ? 16 : 0;
@@ -360,6 +376,29 @@ void llama_ple_prefetch::build() {
         t_last = std::max(t_last, t);
     }
     t_last_read_us = t_last > 0 ? t_last - t_start_us : 0;
+}
+
+// share of up to 256 of the given page keys (spread over the list) that are in the page cache; 1 if unknown
+double llama_ple_prefetch::resident_fraction(const std::vector<uint64_t> & keys, uint64_t base) const {
+#if defined(__linux__)
+    // keys are file pages in pread/advise mode: the mapping keeps the file's offset within a page
+    const uintptr_t to_virt = use_pread ? (uintptr_t) ple->data - (uintptr_t) base : 0;
+    const size_t step = std::max<size_t>(1, keys.size()/256);
+    size_t n = 0, in = 0;
+    for (size_t j = 0; j < keys.size(); j += step) {
+        unsigned char v = 0;
+        if (mincore((void *) (keys[j]*4096 + to_virt), 4096, &v) != 0) {
+            return 1.0;
+        }
+        in += v & 1;
+        ++n;
+    }
+    return n ? (double) in/n : 1.0;
+#else
+    GGML_UNUSED(keys);
+    GGML_UNUSED(base);
+    return 1.0;
+#endif
 }
 
 int64_t llama_ple_prefetch::reader() {
@@ -464,9 +503,9 @@ void llama_ple_prefetch::stop() {
     hinted  = false;
 
     LLAMA_LOG_WARN("%s: [PLEPF] %zu tokens: %zu pages (%.0f MiB) in %zu reads, guessed in %.1f ms, %" PRId64 " read, last read at %.1f ms; "
-            "%d ubatches waited %.1f ms in all%s", __func__, toks.size(), n_pages_all, n_pages_all*4096.0/1048576.0,
+            "%d ubatches waited %.1f ms in all, %d readers%s", __func__, toks.size(), n_pages_all, n_pages_all*4096.0/1048576.0,
             (size_t) n_built.load(), t_build_us.load()/1e3, n_read.load(), t_last_read_us.load()/1e3, n_ubatch_c, t_wait_us/1e3,
-            n_ubatch_u ? " (some ubatches fell outside the call)" : "");
+            n_readers, n_ubatch_u ? " (some ubatches fell outside the call)" : "");
     LLAMA_LOG_CONT("\n");
 
     toks.clear();
