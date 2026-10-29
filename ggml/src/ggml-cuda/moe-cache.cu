@@ -9723,17 +9723,21 @@ static __global__ void moe_mass_kernel(const float * weights, float * out_weight
     __syncthreads();
     if (!mode) { return; }
     for (int e = tid; e < experts; e += blockDim.x) {
-        bool routed = false, keep = false;
-        for (int i = 0; i < routes; ++i) {
-            if (expert[i] == e) { routed = true; keep |= !drop[i]; }
+        unsigned long long rows = 0;
+        bool keep = false;
+        if (!(hot0[e] | hot1[e] | hot2[e])) {
+            for (int i = 0; i < routes; ++i) {
+                if (expert[i] != e) { continue; }
+                ++rows;
+                // A kept occurrence requires this expert for the whole window.
+                if (!drop[i]) { keep = true; break; }
+            }
         }
-        const bool skip = routed && !keep && !hot0[e] && !hot1[e] && !hot2[e];
+        const bool skip = rows > 0 && !keep;
         masks[e] = hot0[e] | skip; masks[mask_stride + e] = hot1[e] | skip;
         masks[2 * mask_stride + e] = hot2[e] | skip; masks[3 * mask_stride + e] = skip;
         if (skip && counts) {
             atomicAdd(counts + 2, 1ULL);
-            unsigned long long rows = 0;
-            for (int i = 0; i < routes; ++i) { rows += expert[i] == e; }
             atomicAdd(counts, 3ULL * rows);
         }
     }

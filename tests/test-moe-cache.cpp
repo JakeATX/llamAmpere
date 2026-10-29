@@ -6820,7 +6820,7 @@ static bool run_skip_tail_layer(ggml_backend_t gpu, ggml_backend_t cpu, log_capt
             const size_t n_out = (size_t) ggml_nelements(graphs[0].out);
             std::vector<float> expected(n_out), exact(n_out), lossy(n_out), again(n_out);
             unsigned long long expected_rows = 0;
-            for (int pattern = 0; pattern < 6 && prepared; ++pattern) {
+            for (int pattern = 0; pattern < 8 && prepared; ++pattern) {
                 std::vector<int32_t> routing(64 * tokens, 63);
                 for (int t = 0; t < tokens; ++t) {
                     for (int j = 0; j < k_used; ++j) {
@@ -6831,7 +6831,9 @@ static bool run_skip_tail_layer(ggml_backend_t gpu, ggml_backend_t cpu, log_capt
                             case 2: e = (j % 2) ? (j * 7 + t) % 6 : 10 + j + t; break;   // mixed
                             case 3: e = j < rank ? 40 + j : 50 + ((j + t) % 3); break;   // shared tail misses
                             case 4: e = j < rank ? (j % 6) : (t % 2 ? 30 + j : 30 + k_used - 1 - j); break; // tail misses across ranks
-                            default: e = j < rank ? 12 + j : 12 + (j - rank); break;    // every tail expert is also a head expert: nothing skips
+                            case 5: e = j < rank ? 12 + j : 12 + (j - rank); break;    // every tail expert is also a head expert: nothing skips
+                            case 6: e = 20; break;                                  // one missing expert repeats at every rank
+                            default: e = j % 3 == 0 ? 0 : 20 + t % 2; break;          // resident and missing duplicates share the window
                         }
                         routing[64 * t + j] = e < 6 ? e : e - 6 + miss_base;
                     }
