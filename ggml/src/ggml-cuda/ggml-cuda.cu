@@ -100,6 +100,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <charconv>
 #include <cinttypes>
 #include <condition_variable>
@@ -10173,6 +10174,67 @@ static cudaEvent_t ggml_cuda_shexp_side_event(int device, int which) {
     return ev[device][which];
 }
 
+// GGML_CUDA_OP_TIMES=<ms> (diagnostic, off by default): for uncaptured graphs, time each node on the main stream
+// with events and on the host, and log the slowest op kinds of every graph whose GPU time is >= <ms>.
+// Fused nodes count toward the first node of the fusion. Synchronizes once per graph.
+struct ggml_cuda_op_times {
+    std::vector<cudaEvent_t> ev;
+    std::vector<std::pair<int, int64_t>> marks; // node index, host us
+    int device = -1;
+
+    static float min_ms() {
+        static const float v = [] { const char * e = getenv("GGML_CUDA_OP_TIMES"); return e && *e ? (float) atof(e) : 0.0f; }();
+        return v;
+    }
+    void mark(int device_, cudaStream_t stream, int i) {
+        if (device != device_) {
+            for (auto e : ev) { CUDA_CHECK(cudaEventDestroy(e)); }
+            ev.clear();
+            device = device_;
+        }
+        if (marks.size() == ev.size()) {
+            cudaEvent_t e;
+            CUDA_CHECK(cudaEventCreate(&e));
+            ev.push_back(e);
+        }
+        CUDA_CHECK(cudaEventRecord(ev[marks.size()], stream));
+        marks.push_back({ i, ggml_time_us() });
+    }
+    void finish(cudaStream_t stream, const ggml_cgraph * cgraph) {
+        mark(device, stream, cgraph->n_nodes);
+        CUDA_CHECK(cudaEventSynchronize(ev[marks.size() - 1]));
+        std::map<std::string, std::pair<float, float>> by_op; // "op:name" -> gpu ms, host ms
+        float total = 0.0f;
+        for (size_t k = 0; k + 1 < marks.size(); ++k) {
+            float ms = 0.0f;
+            CUDA_CHECK(cudaEventElapsedTime(&ms, ev[k], ev[k + 1]));
+            const ggml_tensor * n = cgraph->nodes[marks[k].first];
+            std::string name = n->name;
+            const size_t dash = name.rfind('-');
+            if (dash != std::string::npos && dash + 1 < name.size() && isdigit((unsigned char) name[dash + 1])) {
+                name.resize(dash);
+            }
+            auto & acc = by_op[std::string(ggml_op_desc(n)) + ":" + name];
+            acc.first  += ms;
+            acc.second += (marks[k + 1].second - marks[k].second) / 1000.0f;
+            total += ms;
+        }
+        if (total >= min_ms() && !by_op.empty()) {
+            std::vector<std::pair<std::string, std::pair<float, float>>> v(by_op.begin(), by_op.end());
+            std::sort(v.begin(), v.end(), [](const auto & a, const auto & b) { return a.second.first > b.second.first; });
+            std::string line;
+            for (size_t k = 0; k < v.size() && k < 8; ++k) {
+                char buf[192];
+                snprintf(buf, sizeof(buf), " %s=%.2f/%.2f", v[k].first.c_str(), v[k].second.first, v[k].second.second);
+                line += buf;
+            }
+            GGML_LOG_INFO("[OPT] graph nodes=%d gpu_ms=%.2f host_ms=%.2f top(gpu/host ms):%s\n", cgraph->n_nodes, total,
+                    (marks.back().second - marks.front().second) / 1000.0f, line.c_str());
+        }
+        marks.clear();
+    }
+};
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, uint64_t graph_key) {
     bool graph_evaluated_or_captured = false;
 
@@ -10316,8 +10378,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             ggml_cuda_autofuse_plan * autofuse = ggml_cuda_autofuse_enabled() && !ggml_cuda_fusion_disabled() && stream_ctx.concurrent_events.empty() ?
                 ggml_cuda_autofuse_prepare(*cuda_ctx, cgraph) : nullptr;
 
+            static thread_local ggml_cuda_op_times op_times_state;
+            ggml_cuda_op_times * op_times = !use_cuda_graph && ggml_cuda_op_times::min_ms() > 0.0f ? &op_times_state : nullptr;
+            cudaStream_t op_times_stream = cuda_ctx->stream(cuda_ctx->device, 0);
+
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
+                if (op_times) {
+                    op_times->mark(cuda_ctx->device, op_times_stream, i);
+                }
                 if (is_concurrent_event_active) {
                     GGML_ASSERT(concurrent_event);
 
@@ -10481,6 +10550,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
                 CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), ggml_cuda_shexp_side_event(dev, 1), 0));
                 shexp_state = 0;
+            }
+            if (op_times) {
+                op_times->finish(op_times_stream, cgraph);
             }
             // [HCPN] every queued hc_pre must have run: its xn was never written
             GGML_ASSERT(g_hc_pre_xn_pending.empty() && "GGML_CUDA_HC_PRE_XN: a queued hc_pre was not reached");
