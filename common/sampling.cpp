@@ -1410,13 +1410,20 @@ common_sampler_pq_result common_sampler_verify_pq(const llama_token_data_array &
         }
         return 0.0;
     };
+    // Reuse draft probabilities after rejection without changing the residual sum order.
+    constexpr size_t n_local = 64;
+    double q_local[n_local];
+    std::vector<double> q_heap;
+    if (p.size > n_local) { q_heap.resize(p.size); }
+    double * q_aligned = p.size > n_local ? q_heap.data() : q_local;
     double p_d = 0.0, sum_min = 0.0;
     for (size_t k = 0; k < p.size; ++k) {
         const auto & c = p.data[k];
         if (c.id == d) {
             p_d = c.p;
         }
-        sum_min += std::min((double) c.p, q_of(c.id));
+        q_aligned[k] = q_of(c.id);
+        sum_min += std::min((double) c.p, q_aligned[k]);
     }
     const double q_d = q_of(d);
     stats.n_pos++;
@@ -1442,7 +1449,7 @@ common_sampler_pq_result common_sampler_verify_pq(const llama_token_data_array &
 
     double total = 0.0;
     for (size_t k = 0; k < p.size; ++k) {
-        total += std::max(0.0, (double) p.data[k].p - q_of(p.data[k].id));
+        total += std::max(0.0, (double) p.data[k].p - q_aligned[k]);
     }
     res.id = x;
     if (total > 0.0) {
@@ -1450,7 +1457,7 @@ common_sampler_pq_result common_sampler_verify_pq(const llama_token_data_array &
         double run = 0.0;
         for (size_t k = 0; k < p.size; ++k) {
             const auto & c = p.data[k];
-            const double mass = std::max(0.0, (double) c.p - q_of(c.id));
+            const double mass = std::max(0.0, (double) c.p - q_aligned[k]);
             if (beat && mass <= 0.0) {
                 continue;
             }
