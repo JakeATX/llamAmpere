@@ -2598,15 +2598,18 @@ void llama_model::drop_moe_bank_host_copies() {
             const uintptr_t data = (uintptr_t) t->data;
             if (!in_bank || data < base || data - base > arena->size || ggml_nbytes(t) > arena->size - (data - base)) { continue; }
             const size_t stride = t->nb[2];
+            // fork: interleaved expert strides include other projections, which must stay intact.
+            GGML_ASSERT(ggml_is_contiguous_2(t));
+            const size_t bytes = ggml_row_size(t->type, t->ne[0]) * (size_t) t->ne[1];
             for (int64_t e = 0; e < t->ne[2]; ++e) {
                 if (!in_bank[e]) { continue; }
                 const size_t off = (data - base) + (size_t) e * stride;
                 if (!ranges.empty() && ranges.back().first + ranges.back().second == off) {
-                    ranges.back().second += stride;
-                    holes.back().end += stride;
+                    ranges.back().second += bytes;
+                    holes.back().end += bytes;
                 } else {
-                    ranges.emplace_back(off, stride);
-                    holes.push_back({ base + off, base + off + stride });
+                    ranges.emplace_back(off, bytes);
+                    holes.push_back({ base + off, base + off + bytes });
                 }
             }
         }
