@@ -72,6 +72,8 @@ json task_params::to_json(bool only_metrics) const {
             {"adaptive_decay",            sampling.adaptive_decay},
             {"max_tokens",                n_predict},
             {"n_predict",                 n_predict}, // TODO: deduplicate?
+            {"loop_guard",                loop_guard},
+            {"loop_guard_reps",           loop_guard_reps},
             {"n_keep",                    n_keep},
             {"n_discard",                 n_discard},
             {"ignore_eos",                sampling.ignore_eos},
@@ -126,6 +128,8 @@ json task_params::to_json(bool only_metrics) const {
         {"stop",                      antiprompt},
         {"max_tokens",                n_predict},
         {"n_predict",                 n_predict}, // TODO: deduplicate?
+        {"loop_guard",                loop_guard},
+        {"loop_guard_reps",           loop_guard_reps},
         {"n_keep",                    n_keep},
         {"n_discard",                 n_discard},
         {"ignore_eos",                sampling.ignore_eos},
@@ -257,6 +261,7 @@ static inline std::string stop_type_to_str(stop_type type) {
     switch (type) {
         case STOP_TYPE_EOS:   return "eos";
         case STOP_TYPE_WORD:  return "word";
+        case STOP_TYPE_LOOP:  return "loop";
         case STOP_TYPE_LIMIT: return "limit";
         default:              return "none";
     }
@@ -324,22 +329,34 @@ std::vector<unsigned char> completion_token_output::str_to_bytes(const std::stri
 //
 json server_task_result_cmpl_final::to_json() {
     GGML_ASSERT(is_updated && "update() must be called before to_json()");
+    json res;
     switch (res_type) {
         case TASK_RESPONSE_TYPE_NONE:
-            return to_json_non_oaicompat();
+            res = to_json_non_oaicompat(); break;
         case TASK_RESPONSE_TYPE_OAI_CMPL:
-            return to_json_oaicompat();
+            res = to_json_oaicompat(); break;
         case TASK_RESPONSE_TYPE_OAI_CHAT:
-            return stream ? to_json_oaicompat_chat_stream() : to_json_oaicompat_chat();
+            res = stream ? to_json_oaicompat_chat_stream() : to_json_oaicompat_chat(); break;
         case TASK_RESPONSE_TYPE_OAI_RESP:
-            return stream ? to_json_oaicompat_resp_stream() : to_json_oaicompat_resp();
+            res = stream ? to_json_oaicompat_resp_stream() : to_json_oaicompat_resp(); break;
         case TASK_RESPONSE_TYPE_OAI_ASR:
-            return to_json_oaicompat_asr();
+            res = to_json_oaicompat_asr(); break;
         case TASK_RESPONSE_TYPE_ANTHROPIC:
-            return stream ? to_json_anthropic_stream() : to_json_anthropic();
+            res = stream ? to_json_anthropic_stream() : to_json_anthropic(); break;
         default:
             GGML_ASSERT(false && "Invalid task_response_type");
     }
+    if (stats.stopped_loop) {
+        json & final = res.is_array() ? res.back() : res;
+        json & body = final.contains("data") ? final["data"] : final;
+        body["stopped_loop"] = true;
+        if (res_type == TASK_RESPONSE_TYPE_NONE) {
+            body["finish_reason"] = "stop";
+        }
+        body["loop_period"] = stats.loop_period;
+        body["loop_repeats"] = stats.loop_repeats;
+    }
+    return res;
 }
 
 json server_task_result_cmpl_final::to_json_non_oaicompat() {
@@ -385,7 +402,7 @@ json server_task_result_cmpl_final::to_json_oaicompat() {
         };
     }
     json finish_reason = "length";
-    if (stop == STOP_TYPE_WORD || stop == STOP_TYPE_EOS) {
+    if (stop == STOP_TYPE_WORD || stop == STOP_TYPE_EOS || stop == STOP_TYPE_LOOP) {
         finish_reason = "stop";
     }
     json res = json {
@@ -425,8 +442,8 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat() {
         msg.role = "assistant";
         msg.content = content.text;
     }
-    if (stop == STOP_TYPE_WORD || stop == STOP_TYPE_EOS) {
-        finish_reason = msg.tool_calls.empty() ? "stop" : "tool_calls";
+    if (stop == STOP_TYPE_WORD || stop == STOP_TYPE_EOS || stop == STOP_TYPE_LOOP) {
+        finish_reason = stop == STOP_TYPE_LOOP || msg.tool_calls.empty() ? "stop" : "tool_calls";
     }
 
     json choice {
@@ -467,8 +484,8 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat() {
 json server_task_result_cmpl_final::to_json_oaicompat_chat_stream() {
     std::time_t t = std::time(0);
     std::string finish_reason = "length";
-    if (stop == STOP_TYPE_WORD || stop == STOP_TYPE_EOS) {
-        finish_reason = oaicompat_msg.tool_calls.empty() ? "stop" : "tool_calls";
+    if (stop == STOP_TYPE_WORD || stop == STOP_TYPE_EOS || stop == STOP_TYPE_LOOP) {
+        finish_reason = stop == STOP_TYPE_LOOP || oaicompat_msg.tool_calls.empty() ? "stop" : "tool_calls";
     }
 
     json deltas = json::array();
@@ -735,7 +752,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_asr() {
 
 json server_task_result_cmpl_final::to_json_anthropic() {
     std::string stop_reason = "max_tokens";
-    if (stop == STOP_TYPE_WORD || stop == STOP_TYPE_EOS) {
+    if (stop == STOP_TYPE_WORD || stop == STOP_TYPE_EOS || stop == STOP_TYPE_LOOP) {
         stop_reason = oaicompat_msg.tool_calls.empty() ? "end_turn" : "tool_use";
     }
 
@@ -803,7 +820,7 @@ json server_task_result_cmpl_final::to_json_anthropic_stream() {
     json events = json::array();
 
     std::string stop_reason = "max_tokens";
-    if (stop == STOP_TYPE_WORD || stop == STOP_TYPE_EOS) {
+    if (stop == STOP_TYPE_WORD || stop == STOP_TYPE_EOS || stop == STOP_TYPE_LOOP) {
         stop_reason = oaicompat_msg.tool_calls.empty() ? "end_turn" : "tool_use";
     }
 

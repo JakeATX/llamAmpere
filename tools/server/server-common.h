@@ -394,6 +394,9 @@ json format_response_rerank(
 
 // shared between server_slot and server_task_result_*
 struct server_slot_stats {
+    bool stopped_loop = false;
+    int loop_period = 0;
+    double loop_repeats = 0;
     uint64_t n_prompt_cached    = 0;
     uint64_t n_prompt_processed = 0;
     uint64_t n_gen              = 0;

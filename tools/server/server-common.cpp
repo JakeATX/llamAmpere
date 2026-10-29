@@ -96,6 +96,12 @@ json server_slot_stats::to_json() const {
         {"predicted_per_second",   n_gen_tps()},
     };
 
+    if (stopped_loop) {
+        base["stopped_loop"] = true;
+        base["loop_period"] = loop_period;
+        base["loop_repeats"] = loop_repeats;
+    }
+
     if (n_draft_tokens > 0) {
         base["draft_n"]          = n_draft_tokens;
         base["draft_n_accepted"] = n_draft_accepted;

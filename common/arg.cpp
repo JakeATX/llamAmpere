@@ -4159,6 +4159,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_TIMEOUT"));
     add_opt(common_arg(
+        {"--loop-guard-reps"}, "N",
+        string_format("stop repeated output after N repeats (0 = disabled, default: %d)", params.loop_guard_reps),
+        [](common_params & params, int value) {
+            if (value < 0) { throw std::invalid_argument("loop guard repeats must be non-negative"); }
+            params.loop_guard_reps = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--loop-guard-span"}, "N",
+        string_format("stop repeated output after N tokens with at least four repeats (default: %d)", params.loop_guard_span),
+        [](common_params & params, int value) {
+            if (value < 1) { throw std::invalid_argument("loop guard span must be positive"); }
+            params.loop_guard_span = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--sse-ping-interval"}, "N",
         string_format("server SSE ping interval in seconds (-1 = disabled, default: %d)", params.sse_ping_interval),
         [](common_params & params, int value) {
