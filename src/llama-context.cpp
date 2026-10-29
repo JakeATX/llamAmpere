@@ -4807,7 +4807,11 @@ build_graph:
                 h->h_device = mtp_hidden_source != nullptr || mtp_feedback.use_previous;
             }
         }
+        const int64_t pp_inputs_t0 = b1_cur.active ? ggml_time_us() : 0;
         res->set_inputs(&ubatch);
+        if (b1_cur.active) {
+            b1_pp_inputs_us += ggml_time_us() - pp_inputs_t0;
+        }
         if (mtp_hidden_source) {
             for (auto & input : res->inputs) {
                 if (auto * h = dynamic_cast<llm_graph_input_embd_h *>(input.get())) {
@@ -4838,7 +4842,11 @@ build_graph:
         ggml_backend_sched_synchronize(compute_peer->sched.get());
     }
 
+    const int64_t pp_submit_t0 = b1_cur.active ? ggml_time_us() : 0;
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (b1_cur.active) {
+        b1_pp_submit_us += ggml_time_us() - pp_submit_t0;
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -7492,6 +7500,7 @@ bool llama_context::b1_run_prefix(llama_memory_context_i * mctx, size_t ub0, ggm
     for (int32_t l0 = 0; l0 < l_final; ) {
         const int64_t pp_t0 = pp_layers ? ggml_time_us() : 0;
         const int64_t pp_compute0 = b1_compute_submit_us;
+        const int64_t pp_inputs0 = b1_pp_inputs_us, pp_submit0 = b1_pp_submit_us;
 #if defined(__linux__)
         struct rusage pp_before = {}, pp_after = {};
         const bool pp_usage = pp_layers && getrusage(RUSAGE_SELF, &pp_before) == 0;
@@ -7585,6 +7594,8 @@ bool llama_context::b1_run_prefix(llama_memory_context_i * mctx, size_t ub0, ggm
             LLAMA_LOG_INFO("%s: [PP] layer=%d end=%d host_wall_ms=%.3f bind_ms=%.3f graph_host_ms=%.3f ple=%d\n",
                     __func__, l0, l1, (ggml_time_us() - pp_t0) / 1000.0, (pp_bound - pp_t0) / 1000.0,
                     (b1_compute_submit_us - pp_compute0) / 1000.0, (int) model.hparams.is_ple(l0));
+            LLAMA_LOG_INFO("%s: [PP] layer=%d inputs_ms=%.3f submit_ms=%.3f\n", __func__, l0,
+                    (b1_pp_inputs_us - pp_inputs0) / 1000.0, (b1_pp_submit_us - pp_submit0) / 1000.0);
 #if defined(__linux__)
             if (pp_usage && getrusage(RUSAGE_SELF, &pp_after) == 0) {
                 auto ms = [](const timeval & t) { return t.tv_sec * 1000.0 + t.tv_usec / 1000.0; };
