@@ -9687,6 +9687,12 @@ static __global__ void moe_mass_kernel(const float * weights, float * out_weight
     __shared__ bool rescale[8];
     const int tid = threadIdx.x;
     const int routes = width * 10;
+    if (mode) {
+        for (int e = tid; e < experts; e += blockDim.x) {
+            masks[e] = hot0[e]; masks[mask_stride + e] = hot1[e];
+            masks[2 * mask_stride + e] = hot2[e]; masks[3 * mask_stride + e] = 0;
+        }
+    }
     for (int i = tid; i < routes; i += blockDim.x) {
         drop[i] = 0;
         expert[i] = ids[(i / 10) * stride + i % 10];
@@ -9728,21 +9734,20 @@ static __global__ void moe_mass_kernel(const float * weights, float * out_weight
         out_weights[i] = drop[i] ? 0.0f : (rescale[i / 10] ? weights[i] * scale[i / 10] : weights[i]);
     }
     if (!mode) { return; }
-    for (int e = tid; e < experts; e += blockDim.x) {
+    // fork: only the first dropped occurrence can omit an expert for the window.
+    for (int i = tid; i < routes; i += blockDim.x) {
+        if (hot[i] || !drop[i]) { continue; }
+        const int e = expert[i];
         unsigned long long rows = 0;
-        bool keep = false;
-        if (!(hot0[e] | hot1[e] | hot2[e])) {
-            for (int i = 0; i < routes; ++i) {
-                if (expert[i] != e) { continue; }
-                ++rows;
-                // A kept occurrence requires this expert for the whole window.
-                if (!drop[i]) { keep = true; break; }
-            }
+        bool skip = true;
+        for (int j = 0; j < routes; ++j) {
+            if (expert[j] != e) { continue; }
+            if (j < i || !drop[j]) { skip = false; break; }
+            ++rows;
         }
-        const bool skip = rows > 0 && !keep;
-        masks[e] = hot0[e] | skip; masks[mask_stride + e] = hot1[e] | skip;
-        masks[2 * mask_stride + e] = hot2[e] | skip; masks[3 * mask_stride + e] = skip;
-        if (skip && counts) {
+        if (!skip) { continue; }
+        masks[e] = masks[mask_stride + e] = masks[2 * mask_stride + e] = masks[3 * mask_stride + e] = 1;
+        if (counts) {
             atomicAdd(counts + 2, 1ULL);
             atomicAdd(counts, 3ULL * rows);
         }

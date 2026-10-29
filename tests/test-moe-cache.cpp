@@ -6739,7 +6739,8 @@ static bool run_skip_tail_layer(ggml_backend_t gpu, ggml_backend_t cpu, log_capt
                     quantized.size();
             ggml_backend_tensor_set(weights[bank], quantized.data(), 0, quantized.size());
         }
-        for (int tokens : {1, 4, 5}) {
+        for (int tokens : {1, 4, 5, 8}) {
+            if (tokens == 8 && type == GGML_TYPE_IQ3_S) { continue; } // Ampere IQ3_S tables stop at six tokens.
             configure_cache(nullptr, "8");
             set_env("GGML_CUDA_MOE_CACHE_BUDGET_MB", "8");
             set_env("GGML_MOE_CACHE_DEVICE", "1");
@@ -6823,7 +6824,7 @@ static bool run_skip_tail_layer(ggml_backend_t gpu, ggml_backend_t cpu, log_capt
             const size_t n_out = (size_t) ggml_nelements(graphs[0].out);
             std::vector<float> expected(n_out), exact(n_out), lossy(n_out), again(n_out);
             unsigned long long expected_rows = 0;
-            for (int pattern = 0; pattern < 8 && prepared; ++pattern) {
+            for (int pattern = 0; pattern < 10 && prepared; ++pattern) {
                 std::vector<int32_t> routing(64 * tokens, 63);
                 for (int t = 0; t < tokens; ++t) {
                     for (int j = 0; j < k_used; ++j) {
@@ -6836,7 +6837,9 @@ static bool run_skip_tail_layer(ggml_backend_t gpu, ggml_backend_t cpu, log_capt
                             case 4: e = j < rank ? (j % 6) : (t % 2 ? 30 + j : 30 + k_used - 1 - j); break; // tail misses across ranks
                             case 5: e = j < rank ? 12 + j : 12 + (j - rank); break;    // every tail expert is also a head expert: nothing skips
                             case 6: e = 20; break;                                  // one missing expert repeats at every rank
-                            default: e = j % 3 == 0 ? 0 : 20 + t % 2; break;          // resident and missing duplicates share the window
+                            case 7: e = j % 3 == 0 ? 0 : 20 + t % 2; break;          // resident and missing duplicates share the window
+                            case 8: e = j < rank ? j % 6 : 20; break;                // every dropped occurrence shares one expert
+                            default: e = j >= rank || (t == tokens - 1 && j == 0) ? 20 : j % 6; break; // a later kept occurrence prevents omission
                         }
                         routing[64 * t + j] = e < 6 ? e : e - 6 + miss_base;
                     }
