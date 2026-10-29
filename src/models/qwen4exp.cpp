@@ -1877,6 +1877,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     if (union_ids) {
         *union_ids = sel_idx;
     }
+    // LLAMA_QSA_DIRECT_LISTS=1 (opt-in, needs DIRECT): a live slot holds a cell < n_kv and a dead one its dump row >= n_kv,
+    // so the finite cells of the selection below are exactly the slots < n_kv; the attention node gets these rows too
+    // (src[8]) and the CUDA sparse path builds its per-tile cell lists from them without reading the mask
+    static const int direct_lists = [] { const char * e = getenv("LLAMA_QSA_DIRECT_LISTS"); return e ? atoi(e) : 0; }();
+    if (direct_lists > 0 && sel_direct && n_tokens > 1 && kq_mask->ne[2] == 1 && kq_mask->ne[3] == 1) {
+        GGML_ASSERT(fa_sel_rows == nullptr);
+        fa_sel_rows = sel_idx;
+    }
     if (sel_inplace) {
         ggml_build_forward_expand(gf, sel_idx);
     }
@@ -1969,6 +1977,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
 
     ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, mask, nullptr, nullptr, n_sel, kq_scale, il);
     cb(cur, "kqv_out", il);
+    GGML_ASSERT(fa_sel_rows == nullptr && "QSA selection rows must attach to this layer's attention node");
 
     GGML_ASSERT(sj_kvarn_pending.body == nullptr && "SJ-KVaRN cache requires the flash-attention path");
 

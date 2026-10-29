@@ -1511,6 +1511,9 @@ static bool ggml_cuda_fattn_skip_dead_enabled() {
 
 void ggml_cuda_flash_attn_ext_compact_mask(
         const ggml_tensor * mask, int32_t * indices, int32_t * counts, int32_t n_queries, int32_t ncols1, int32_t n_kv_max, cudaStream_t stream);
+bool ggml_cuda_flash_attn_ext_lists_from_rows(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * rows, const ggml_tensor * mask, int32_t * indices, int32_t * counts,
+        int32_t n_queries, int32_t ncols1, int32_t n_kv_max, int64_t n_lists);
 
 template<int D, int ncols1, int ncols2, bool compact_q5g6 = false> // D == head size
 __launch_bounds__(D, 1)
@@ -1939,7 +1942,10 @@ void launch_fattn(
         const size_t n_lists = size_t(ntiles_x) * mask->ne[3];
 
         KV_max.alloc(size_t(n_kv_max)*n_lists + n_lists);
-        ggml_cuda_flash_attn_ext_compact_mask(mask, KV_max.ptr, KV_max.ptr + size_t(n_kv_max)*n_lists, Q->ne[1], ncols1, n_kv_max, main_stream);
+        if (!ggml_cuda_flash_attn_ext_lists_from_rows(ctx, KQV->src[8], mask, KV_max.ptr, KV_max.ptr + size_t(n_kv_max)*n_lists,
+                Q->ne[1], ncols1, n_kv_max, int64_t(n_lists))) {
+            ggml_cuda_flash_attn_ext_compact_mask(mask, KV_max.ptr, KV_max.ptr + size_t(n_kv_max)*n_lists, Q->ne[1], ncols1, n_kv_max, main_stream);
+        }
     }
 
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
