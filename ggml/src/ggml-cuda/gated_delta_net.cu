@@ -1181,7 +1181,7 @@ static void launch_gated_delta_net(
     if constexpr (emit_ingredients_t && !KDA && std::is_same_v<state_t, float>) {
         static const int replay_cols = [] {
             const char * e = getenv("GGML_CUDA_GDN_REPLAY_COLS");
-            return e != nullptr && (strcmp(e, "2") == 0 || strcmp(e, "4") == 0) ? atoi(e) : 0;
+            return e != nullptr && (strcmp(e, "1") == 0 || strcmp(e, "2") == 0 || strcmp(e, "4") == 0) ? atoi(e) : 0;
         }();
         static const bool replay_prefetch = [] {
             const char * e = getenv("GGML_CUDA_GDN_REPLAY_PREFETCH");
@@ -1197,8 +1197,10 @@ static void launch_gated_delta_net(
                 state_slot_stride, K, slot_rows, state_src, stream, ingr_w, ingr_region)
             if (replay_cols == 4) {
                 if (replay_prefetch) { GDN_REPLAY_ILP(4, true); } else { GDN_REPLAY_ILP(4, false); }
-            } else {
+            } else if (replay_cols == 2) {
                 if (replay_prefetch) { GDN_REPLAY_ILP(2, true); } else { GDN_REPLAY_ILP(2, false); }
+            } else {
+                if (replay_prefetch) { GDN_REPLAY_ILP(1, true); } else { GDN_REPLAY_ILP(1, false); }
             }
 #undef GDN_REPLAY_ILP
             return;
