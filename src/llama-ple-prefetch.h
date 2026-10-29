@@ -67,10 +67,12 @@ private:
     int      n_threads = 0;
     bool     use_pread = true;
     bool     use_advise = false; // [PFGAP] file mode: ask the kernel to queue the reads instead of copying them
+    bool     coalesce = false;
     uint32_t n_min     = 256;
     uint32_t n_ubatch  = 0;
     uint64_t n_ahead   = 0;      // tokens read ahead of the gather
     static constexpr uint32_t CHUNK = 256; // tokens per completion chunk
+    size_t chunk_size = CHUNK;
 
     // where the table lives
     int      fd       = -1;

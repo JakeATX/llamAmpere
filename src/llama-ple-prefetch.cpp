@@ -90,6 +90,7 @@ std::unique_ptr<llama_ple_prefetch> llama_ple_prefetch::create(const llama_model
     pf->n_rows    = (uint64_t) t->ne[1];
 
     const char * mode = getenv("LLAMA_PLE_PF_MODE");
+    pf->coalesce = mode && strcmp(mode, "coalesce") == 0;
     pf->use_pread = !(mode && strcmp(mode, "fault") == 0);
     // by default the readers only queue the reads (posix_fadvise WILLNEED): nothing is copied, so two threads keep
     // the disk busy without taking CPU from the prompt setup; the gather waits on any page still in flight
@@ -105,6 +106,7 @@ std::unique_ptr<llama_ple_prefetch> llama_ple_prefetch::create(const llama_model
             LLAMA_LOG_WARN("%s: [PLEPF] cannot open the file behind the PLE table, reading by page faults\n", __func__);
             pf->use_pread = false;
             pf->use_advise = false;
+            pf->coalesce = false;
         } else {
             pf->file_off = off;
             // the descriptor's own readahead state: read exactly the pages asked for
@@ -114,10 +116,11 @@ std::unique_ptr<llama_ple_prefetch> llama_ple_prefetch::create(const llama_model
 #else
     pf->use_pread = false;
     pf->use_advise = false;
+    pf->coalesce = false;
 #endif
 
     LLAMA_LOG_WARN("%s: [PLEPF] PLE prefetch on: %d threads, %s, calls of %u+ tokens, %" PRIu64 " tokens ahead\n", __func__,
-            pf->n_threads, pf->use_advise ? "advise" : pf->use_pread ? "pread" : "page faults", pf->n_min, pf->n_ahead);
+            pf->n_threads, pf->coalesce ? "coalesced pread" : pf->use_advise ? "advise" : pf->use_pread ? "pread" : "page faults", pf->n_min, pf->n_ahead);
     return pf;
 }
 
@@ -195,13 +198,14 @@ void llama_ple_prefetch::begin(llama_pos pos0) {
     pos0_call = pos0;
     seq_start = pos0 == 0;
     hinted    = false;
+    chunk_size = coalesce ? std::max<size_t>(CHUNK, n) : CHUNK;
 
     // the run arrays at their upper bound (each row touches at most two pages); written front to back only
     const size_t cap = n*(size_t) model->hparams.ple_n_heads*2 + 1;
     run_key.reset(new uint64_t[cap]);
     run_len.reset(new uint32_t[cap]);
     run_chunk.reset(new uint32_t[cap]);
-    n_chunks = (n + CHUNK - 1)/CHUNK;
+    n_chunks = n/chunk_size + (n % chunk_size != 0);
     remaining.reset(new std::atomic<int64_t>[n_chunks]);
     for (size_t c = 0; c < n_chunks; ++c) {
         remaining[c].store(PLE_PF_PENDING);
@@ -228,7 +232,7 @@ void llama_ple_prefetch::begin(llama_pos pos0) {
 }
 
 size_t llama_ple_prefetch::chunks_for(uint64_t n_tok) const {
-    return (size_t) std::min<uint64_t>(n_chunks, n_tok/CHUNK + (n_tok % CHUNK != 0));
+    return (size_t) std::min<uint64_t>(n_chunks, n_tok/chunk_size + (n_tok % chunk_size != 0));
 }
 
 bool llama_ple_prefetch::run_ready(size_t i) const {
@@ -268,8 +272,8 @@ void llama_ple_prefetch::build() {
     std::vector<int64_t> ctx(n_gram);
     size_t nr = 0;
     for (size_t c = 0; c < n_chunks && !stopping.load(std::memory_order_relaxed); ++c) {
-        const int64_t i0 = (int64_t) c*CHUNK;
-        const int64_t i1 = std::min<int64_t>(n, i0 + CHUNK);
+        const int64_t i0 = (int64_t) (c*chunk_size);
+        const int64_t i1 = i0 + (int64_t) std::min<size_t>(n - i0, chunk_size);
         for (int64_t i = i0; i < i1; ++i) {
             ctx[0] = toks[i];
             int64_t known = 0;
@@ -299,7 +303,7 @@ void llama_ple_prefetch::build() {
             }
         }
 
-        // the chunk's pages not read for an earlier chunk, sorted, then merged into runs of consecutive pages
+        // fork: cold reads can span small holes to avoid one disk request per scattered page.
         cp.clear();
         for (int64_t i = i0; i < i1; ++i) {
             for (int64_t h = 0; h < n_heads; ++h) {
@@ -320,8 +324,9 @@ void llama_ple_prefetch::build() {
         std::sort(cp.begin(), cp.end());
         const size_t r0 = nr;
         for (size_t j = 0; j < cp.size(); ++j) {
-            if (nr > r0 && cp[j] == run_key[nr - 1] + run_len[nr - 1] && run_len[nr - 1] < RUN_MAX) {
-                ++run_len[nr - 1];
+            const uint64_t gap = coalesce ? 16 : 0;
+            if (nr > r0 && cp[j] <= run_key[nr - 1] + run_len[nr - 1] + gap && cp[j] - run_key[nr - 1] < RUN_MAX) {
+                run_len[nr - 1] = (uint32_t) (cp[j] - run_key[nr - 1] + 1);
             } else {
                 run_key[nr] = cp[j];
                 run_len[nr] = 1;
@@ -418,7 +423,7 @@ bool llama_ple_prefetch::consume(uint32_t n_tokens, const int32_t * idx, size_t 
     }
     cv_work.notify_all();
 
-    const size_t c0 = (size_t) (t0/CHUNK), c1 = (size_t) ((t1 - 1)/CHUNK);
+    const size_t c0 = (size_t) (t0/chunk_size), c1 = (size_t) ((t1 - 1)/chunk_size);
     {
         std::unique_lock<std::mutex> lk(mtx);
         cv_done.wait(lk, [&]() {
