@@ -148,9 +148,12 @@ void q2_reorder_hidden(int n, block_q8_0 * y, float * yd, float * yc, bool shuff
         {
             int8_t t[QK8_0];
             for (int s = 0; s < 4; ++s) {
-                for (int b = 0; b < 8; ++b) { t[8 * s + b] = y[i].qs[4 * b + s]; }
+                for (int b = 0; b < 8; ++b) {
+                    const int8_t q = y[i].qs[4 * b + s];
+                    t[8 * s + b] = q;
+                    sum += q;
+                }
             }
-            for (int j = 0; j < QK8_0; ++j) { sum += t[j]; }
             memcpy(y[i].qs, t, QK8_0);
         }
         yd[i] = ggml_fp16_to_fp32(y[i].d);
