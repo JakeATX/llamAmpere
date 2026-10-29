@@ -431,7 +431,7 @@ struct moe_cache_prompt_slab {
 
     bool init(int logical) {
         if (!ggml_cuda_info().devices[logical].vmm) { return false; }
-        physical = ggml_cuda_get_physical_device(logical);
+        physical = ggml_cuda_info().devices[logical].physical_device;
         const size_t gran = ggml_cuda_info().devices[logical].vmm_granularity;
         if (!gran || gran > capacity) { return false; }
         chunk = ((16u << 20) + gran - 1) / gran * gran;
