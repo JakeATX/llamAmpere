@@ -714,6 +714,7 @@ struct moe_cache_session {
     bool swap_broken = false;
     bool swap_whole = false;
     bool swap_layer = false;
+    bool swap_top_only = false;
     bool swap_decay_after = false;
     std::vector<std::array<moe_cache_device_table *, 3>> swap_groups;
     int swap_interval = 1;
@@ -7418,8 +7419,17 @@ static std::vector<moe_swap_pair> moe_cache_swap_whole_pairs(moe_cache_session &
             }
         }
         n_cands += candidates.size();
-        std::sort(candidates.begin(), candidates.end(), [&](const entry & a, const entry & b) { return a.score != b.score ? a.score > b.score : order(a, b); });
-        std::sort(victims.begin(), victims.end(), [&](const entry & a, const entry & b) { return a.score != b.score ? a.score < b.score : order(a, b); });
+        auto candidate_order = [&](const entry & a, const entry & b) { return a.score != b.score ? a.score > b.score : order(a, b); };
+        auto victim_order = [&](const entry & a, const entry & b) { return a.score != b.score ? a.score < b.score : order(a, b); };
+        if (session.swap_top_only) {
+            // fork: one round admits at most this many complete experts per compatible group.
+            const size_t take = (size_t) std::max(1, session.swap_max / 3);
+            std::partial_sort(candidates.begin(), candidates.begin() + std::min(take, candidates.size()), candidates.end(), candidate_order);
+            std::partial_sort(victims.begin(), victims.begin() + std::min(take, victims.size()), victims.end(), victim_order);
+        } else {
+            std::sort(candidates.begin(), candidates.end(), candidate_order);
+            std::sort(victims.begin(), victims.end(), victim_order);
+        }
         size_t victim = 0, admitted = 0;
         for (const auto & candidate : candidates) {
             entry free_slots{0, candidate.layer, -1, {-1, -1, -1}};
@@ -11146,6 +11156,7 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
         session->swap_whole = moe_cache_whole_only() ||
             (moe_cache_env_i64("GGML_MOE_CACHE_SWAP_WHOLE", 0, 1, adaptation_value) && adaptation_value);
         session->swap_layer = moe_cache_env_i64("GGML_MOE_CACHE_SWAP_LAYER", 0, 1, adaptation_value) && adaptation_value;
+        session->swap_top_only = moe_cache_env_i64("GGML_MOE_CACHE_SWAP_TOP_ONLY", 0, 1, adaptation_value) && adaptation_value;
         session->swap_decay_after = moe_cache_env_i64("GGML_MOE_CACHE_SWAP_DECAY_AFTER", 0, 1, adaptation_value) && adaptation_value;
         MOE_CACHE_LOG("[moe-cache] swap modes: whole=%d layer=%d decay_after=%d\n", session->swap_whole, session->swap_layer, session->swap_decay_after);
         MOE_CACHE_LOG("[moe-cache] swap policy: interval_scopes=%d max_swaps=%d cap_bytes=%zu decay=%.2f hyst=%.2f margin=%.1f; async publication, no device sync\n",
