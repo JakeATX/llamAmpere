@@ -124,14 +124,30 @@ inline float hsum8(__m256 v) {
 
 void q2_reorder_hidden(int n, block_q8_0 * y, float * yd, float * yc) {
     const int nb = n / QK8_0;
+#if defined(__AVX2__)
+    const __m256i shuffle = _mm256_setr_epi8(0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15,
+            0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15);
+    const __m256i lanes = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+#endif
     for (int i = 0; i < nb; ++i) {
-        int8_t t[QK8_0];
         int sum = 0;
+#if defined(__AVX2__)
+        const __m256i q = _mm256_loadu_si256((const __m256i *) y[i].qs);
+        const __m256i reordered = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(q, shuffle), lanes);
+        _mm256_storeu_si256((__m256i *) y[i].qs, reordered);
+        const __m256i sums = _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_set1_epi8(1), q), _mm256_set1_epi16(1));
+        __m128i total = _mm_add_epi32(_mm256_castsi256_si128(sums), _mm256_extracti128_si256(sums, 1));
+        total = _mm_hadd_epi32(total, total);
+        total = _mm_hadd_epi32(total, total);
+        sum = _mm_cvtsi128_si32(total);
+#else
+        int8_t t[QK8_0];
         for (int s = 0; s < 4; ++s) {
             for (int b = 0; b < 8; ++b) { t[8 * s + b] = y[i].qs[4 * b + s]; }
         }
         for (int j = 0; j < QK8_0; ++j) { sum += t[j]; }
         memcpy(y[i].qs, t, QK8_0);
+#endif
         yd[i] = ggml_fp16_to_fp32(y[i].d);
         if (i & 1) { yc[i / 2] += yd[i] * (float) sum; } else { yc[i / 2] = yd[i] * (float) sum; }
     }
