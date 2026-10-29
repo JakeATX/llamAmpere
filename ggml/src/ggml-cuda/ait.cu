@@ -224,7 +224,7 @@ static __global__ void __launch_bounds__(64) k_ait_actq(const float * __restrict
         const uint32_t lo = (uint8_t) (int8_t) __float2int_rn(v[2 * q] * id), hi = (uint8_t) (int8_t) __float2int_rn(v[2 * q + 1] * id);
         *reinterpret_cast<uint16_t *>(dst + 8 * q) = (uint16_t) (lo | (hi << 8));
     }
-    for (int i = blockIdx.x * 64 + threadIdx.x; i < NT * M; i += gridDim.x * 64) {
+    for (int i = blockIdx.x * 64 + threadIdx.x; Y && i < NT * M; i += gridDim.x * 64) {
         Y[i] = 0.0f;
     }
 }
@@ -437,7 +437,7 @@ static __global__ void __launch_bounds__(CAP ? 256 : LOW ? 384 : 512, CAP ? 4 : 
                 }
             }
         }
-        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < NT * M; i += gridDim.x * blockDim.x) {
+        for (int i = blockIdx.x * blockDim.x + threadIdx.x; !partial && i < NT * M; i += gridDim.x * blockDim.x) {
             Y[i] = 0.0f;
         }
         __syncthreads();
@@ -770,14 +770,14 @@ static void ait_fast_nt(ggml_backend_cuda_context & ctx, const uint8_t * W, cons
             if (vexp & 2) {
                 ait_mmv_vk<NT, 3>(grid, block, stream, w, xq.get(), sa.get(), Y, M, K, X, l2pf, k, code, partial);
             } else {
-                k_ait_actq<NT><<<NT * S, 64, 0, stream>>>(X, W, xq.get(), sa.get(), Y, M, K, k);
+                k_ait_actq<NT><<<NT * S, 64, 0, stream>>>(X, W, xq.get(), sa.get(), ordered ? nullptr : Y, M, K, k);
                 ait_mmv_vk<NT, 1>(grid, block, stream, w, xq.get(), sa.get(), Y, M, K, X, l2pf, k, code, partial);
             }
             finish();
             return;
         }
     }
-    k_ait_actq<NT><<<NT * S, 64, 0, stream>>>(X, W, xq.get(), sa.get(), Y, M, K, k);
+    k_ait_actq<NT><<<NT * S, 64, 0, stream>>>(X, W, xq.get(), sa.get(), ordered ? nullptr : Y, M, K, k);
     if (k == 4 && code == 0 && full && occ > 0) {
         // Modes 3/4 cap registers for four 256-thread blocks per SM. Keep
         // both prefetch depths; profiles must check for local-memory spills.
