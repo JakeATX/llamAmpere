@@ -2680,6 +2680,21 @@ static bool moe_cache_build_global_profile(moe_cache_session & session, moe_cach
         device.profile_global_slots = plan.slots;
         device.profile_global_bytes = plan.bytes;
     };
+    // fork: an unchanged capacity needs new ranks, not a destructive slab rebuild.
+    if (whole_only && resize) {
+        bool same_capacity = true;
+        for (size_t p = 0; p < pending.size(); ++p) {
+            const int pool = pending[p]->pool;
+            same_capacity = same_capacity && pool >= 0 && (size_t)pool < device.pools.size() &&
+                (size_t)device.pools[pool]->n_slots == plan.slots[p];
+        }
+        if (same_capacity) {
+            publish_plan();
+            MOE_CACHE_LOG("[moe-cache] CUDA%d whole-only plan reused: bundles=%zu slices=%zu actual_pool_bytes=%zu\n",
+                    device.physical, plan.bundles, device.profile_global_selected.size(), device.allocated_bytes);
+            return true;
+        }
+    }
     if (whole_only) {
         device.profile_global_ranks.clear();
         device.profile_global_selected.clear();
@@ -5746,7 +5761,7 @@ static int moe_cache_warm(void * opaque, const ggml_moe_cache_tensor_desc * tens
         std::lock_guard<std::mutex> lock(session->mu);
         // A first live-count warm has no saved profile to load. Plan complete bundles
         // from its descriptors too, but preserve an already loaded profile's ranks.
-        if (loading || session->profile_global_tensors.empty()) {
+        if (loading || session->profile_global_tensors.empty() || (observed && session->profile_counts.empty())) {
             session->profile_global_tensors.clear();
             session->profile_global_tensors.reserve(n_tensors);
             for (int i = 0; i < n_tensors; ++i) {
@@ -5865,7 +5880,9 @@ static int moe_cache_warm(void * opaque, const ggml_moe_cache_tensor_desc * tens
             if (global_profile) {
                 if (whole_only && !selected.count(key)) { continue; }
                 const auto prior = session->profile_counts.find(key);
-                ranked.push_back({i, e, prior == session->profile_counts.end() ? 0 : prior->second, true, 0, false});
+                const uint64_t heat = session->profile_counts.empty() ? counts[i][e] :
+                    prior == session->profile_counts.end() ? 0 : prior->second;
+                ranked.push_back({i, e, heat, true, 0, false});
                 continue;
             }
             int layer = 0;

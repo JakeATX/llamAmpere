@@ -13,3 +13,5 @@ Every runtime pool must appear exactly once. The type and logical bytes per expe
 The `pool plan loaded` log confirms that the file was accepted. The following `global profile capacity` lines report planned and actual slots. Actual allocations can be smaller under memory pressure. Pool allocation and resize enforce the limits, including post-prompt replanning and memory returned after a prompt loan. If the global planner is unavailable, execution stops instead of falling back to unconstrained pools. Prompt-cache save and restore still need a runtime check on the candidate build.
 
 A pool plan controls capacities. It does not encode which experts are selected, change the loaded profile's ranking, freeze experts in place or establish a speed prediction. Match the ranking and adaptive policy to the simulator before comparing route counts.
+
+Repeated warm calls reuse slabs when every planned pool capacity is unchanged. Sessions without a loaded profile update the whole-expert plan from the latest nonzero prompt counts; saved-profile sessions retain their profile order. Prompt lending uses those counts to choose survivors.
