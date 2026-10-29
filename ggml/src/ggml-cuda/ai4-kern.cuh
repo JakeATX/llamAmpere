@@ -1344,6 +1344,25 @@ static __host__ inline int ids_max_tiles(int n_expert, int64_t n_pairs, int bn) 
     return bn > 0 ? (int) (std::min<int64_t>(n_expert, n_pairs) + n_pairs/bn) : 0;
 }
 
+template <bool AGG>
+static __device__ __forceinline__ int ids_reserve(int * cnt, int e) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 && !defined(GGML_USE_HIP)
+    if constexpr (AGG) {
+        const unsigned peers = __match_any_sync(__activemask(), e);
+        const int lane = threadIdx.x & 31;
+        const int leader = __ffs(peers) - 1;
+        int base = 0;
+        if (lane == leader) {
+            base = atomicAdd(cnt + e, __popc(peers));
+        }
+        base = __shfl_sync(peers, base, leader);
+        return base + __popc(peers & ((1u << lane) - 1));
+    }
+#endif
+    return atomicAdd(cnt + e, 1);
+}
+
+template <bool AGG = false>
 static __global__ void __launch_bounds__(IDS_THREADS) ids_helper(
         const char * __restrict__ ids, int64_t ids_nb0, int64_t ids_nb1, int n_used, int n_tok, int ne11,
         int n_expert, int bn, int max_tiles, int * __restrict__ out, float * __restrict__ zero_y = nullptr, int zero_m = 0) {
@@ -1366,7 +1385,7 @@ static __global__ void __launch_bounds__(IDS_THREADS) ids_helper(
         const int u = (int) (p % n_used), t = (int) (p / n_used);
         const int e = *(const int *) (ids + u*ids_nb0 + t*ids_nb1);
         if (e >= 0 && e < n_expert) {
-            atomicAdd(&cnt[e], 1);
+            ids_reserve<AGG>(cnt, e);
         }
     }
     __syncthreads();
@@ -1438,7 +1457,7 @@ static __global__ void __launch_bounds__(IDS_THREADS) ids_helper(
         const int u = (int) (p % n_used), t = (int) (p / n_used);
         const int e = *(const int *) (ids + u*ids_nb0 + t*ids_nb1);
         if (e >= 0 && e < n_expert) {
-            const int k = atomicAdd(&cnt[e], 1);
+            const int k = ids_reserve<AGG>(cnt, e);
             rows[k] = t*ne11 + u % ne11;
             cols[k] = t*n_used + u;
         }
@@ -1460,9 +1479,14 @@ static __global__ void __launch_bounds__(IDS_THREADS) ids_helper(
 
 static idmap launch_ids_helper(const void * ids, int64_t ids_nb0, int64_t ids_nb1, int n_used, int n_tok, int ne11,
                                int n_expert, int bn, int max_tiles, int64_t nb02, int * out, cudaStream_t stream,
-                               float * zero_y = nullptr, int zero_m = 0) {
-    ids_helper<<<1, IDS_THREADS, 0, stream>>>((const char *) ids, ids_nb0, ids_nb1, n_used, n_tok, ne11, n_expert, bn, max_tiles, out,
-                                              zero_y, zero_m);
+                               float * zero_y = nullptr, int zero_m = 0, bool aggregate = false) {
+    if (aggregate) {
+        ids_helper<true><<<1, IDS_THREADS, 0, stream>>>((const char *) ids, ids_nb0, ids_nb1, n_used, n_tok, ne11, n_expert, bn, max_tiles, out,
+                                                       zero_y, zero_m);
+    } else {
+        ids_helper<false><<<1, IDS_THREADS, 0, stream>>>((const char *) ids, ids_nb0, ids_nb1, n_used, n_tok, ne11, n_expert, bn, max_tiles, out,
+                                                        zero_y, zero_m);
+    }
     const int64_t n_pairs = (int64_t) n_used*n_tok;
     idmap m;
     m.hdr   = out;
