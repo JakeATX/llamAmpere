@@ -2760,7 +2760,18 @@ static bool moe_cache_build_global_profile(moe_cache_session & session, moe_cach
                 const size_t other = device.allocated_bytes >= current ? device.allocated_bytes - current : 0;
                 const size_t room = other < budget ? budget - other : 0;
                 const size_t target = std::min(plan.slots[p], room / pool.expert_size);
-                if (target >= moe_cache_pool_slots_min) { moe_cache_resize_pool(device, pool, (int)target); }
+                if (target >= moe_cache_pool_slots_min) {
+                    // A rejected growth trims by payload bytes, but cudaMalloc pads in whole
+                    // chunks, so one retry can land far below the established pool. Step the
+                    // target down (never under the slots held before growth) instead.
+                    const int held = pool.n_slots;
+                    int want = (int)target;
+                    for (;;) {
+                        moe_cache_resize_pool(device, pool, want);
+                        if (pool.n_slots >= want || want <= held) { break; }
+                        want = std::max(held, want - std::max(1, want / 16));
+                    }
+                }
             }
         } else {
             moe_cache_allocate_pool(session, device, *pending[p], requested);
