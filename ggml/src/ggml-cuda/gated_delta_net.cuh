@@ -26,6 +26,10 @@ struct ggml_cuda_gated_delta_net_state_src {
     int             prefix_n      = 0;
     int             prefix_ingr_w = 0;
     int             prefix_off_b  = 0;
+    // [GDNDIRECT] prefixed calls only: store the final-state / checkpoint block here (sequence s,
+    // head h at (s * H + h) * S_v * S_v) instead of in the op output; nullptr keeps the op output
+    float *         final_dst     = nullptr;
+    float *         ckpt_dst      = nullptr;
 };
 
 void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst);

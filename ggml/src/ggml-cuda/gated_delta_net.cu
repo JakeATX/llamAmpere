@@ -128,7 +128,8 @@ gated_delta_net_cuda(const float * q,
     for (int t = -n_prefix; t < n_tokens; t++) {
         if (emit_ingredients_t && t == 0 && n_prefix > 0 && n_tokens == K) {
             // n_tokens == K with a prefix: the checkpoint block is the state after the prefix
-            float * ckpt_slot = state_f + ingr_region + S_v * S_v * H * n_seqs + (sequence * H + h_idx) * S_v * S_v;
+            float * ckpt_slot = (state_src.ckpt_dst ? state_src.ckpt_dst : state_f + ingr_region + S_v * S_v * H * n_seqs) +
+                (sequence * H + h_idx) * S_v * S_v;
 #pragma unroll
             for (int r = 0; r < rows_per_lane; r++) {
                 ckpt_slot[col * S_v + r * warp_size + lane] = s_shard[r];
@@ -303,8 +304,8 @@ gated_delta_net_cuda(const float * q,
                 // (n_tokens == K with a prefix: at the top of token 0, above).
                 const int t_ckpt = (int) n_tokens - K - 1;
                 if (t_ckpt >= 0 && t == t_ckpt) {
-                    float * ckpt_slot = state_f + ingr_region +
-                                         S_v * S_v * H * n_seqs + (sequence * H + h_idx) * S_v * S_v;
+                    float * ckpt_slot = (state_src.ckpt_dst ? state_src.ckpt_dst : state_f + ingr_region + S_v * S_v * H * n_seqs) +
+                                         (sequence * H + h_idx) * S_v * S_v;
 #pragma unroll
                     for (int r = 0; r < rows_per_lane; r++) {
                         const int i = r * warp_size + lane;
@@ -318,7 +319,7 @@ gated_delta_net_cuda(const float * q,
     if constexpr (emit_ingredients_t) {
         // fixed, once-per-call cost (not scaled by K): the true final state, for use as the next
         // decode's optimistic base state / this decode's own checkpoint update.
-        float * final_slot = state_f + ingr_region + (sequence * H + h_idx) * S_v * S_v;
+        float * final_slot = (state_src.final_dst ? state_src.final_dst : state_f + ingr_region) + (sequence * H + h_idx) * S_v * S_v;
 #pragma unroll
         for (int r = 0; r < rows_per_lane; r++) {
             const int i = r * warp_size + lane;
@@ -480,7 +481,8 @@ gated_delta_net_cuda_ilp(const float * q,
         }
         if (emit_ingredients_t && t == 0 && n_prefix > 0 && n_tokens == K) {
             // n_tokens == K with a prefix: the checkpoint block is the state after the prefix
-            float * ckpt = (float *) state + ingr_region + S_v * S_v * H * n_seqs + (sequence * H + h_idx) * S_v * S_v;
+            float * ckpt = (state_src.ckpt_dst ? state_src.ckpt_dst : (float *) state + ingr_region + S_v * S_v * H * n_seqs) +
+                (sequence * H + h_idx) * S_v * S_v;
 #pragma unroll
             for (int c = 0; c < NC; c++) {
 #pragma unroll
@@ -616,7 +618,8 @@ gated_delta_net_cuda_ilp(const float * q,
             }
             if constexpr (emit_ingredients_t) {
                 if (t == n_tokens - K - 1) {
-                    float * ckpt = (float *) state + ingr_region + S_v * S_v * H * n_seqs + (sequence * H + h_idx) * S_v * S_v;
+                    float * ckpt = (state_src.ckpt_dst ? state_src.ckpt_dst : (float *) state + ingr_region + S_v * S_v * H * n_seqs) +
+                (sequence * H + h_idx) * S_v * S_v;
 #pragma unroll
                     for (int c = 0; c < NC; c++) {
 #pragma unroll
@@ -631,13 +634,21 @@ gated_delta_net_cuda_ilp(const float * q,
         advance_tok();
     }
 
-    if constexpr (!keep_rs_t || emit_ingredients_t) {
-        const int64_t final_e = emit_ingredients_t ? ingr_region + (sequence * H + h_idx) * S_v * S_v : state_out_e;
+    if constexpr (emit_ingredients_t) {
+        float * fin = (state_src.final_dst ? state_src.final_dst : (float *) state + ingr_region) + (sequence * H + h_idx) * S_v * S_v;
 #pragma unroll
         for (int c = 0; c < NC; c++) {
 #pragma unroll
             for (int r = 0; r < rows_per_lane; r++) {
-                gdn_store_state<state_t, warp_size>(state, final_e + (col0 + c) * S_v + r * warp_size + lane, s_shard[c][r]);
+                fin[(col0 + c) * S_v + r * warp_size + lane] = s_shard[c][r];
+            }
+        }
+    } else if constexpr (!keep_rs_t) {
+#pragma unroll
+        for (int c = 0; c < NC; c++) {
+#pragma unroll
+            for (int r = 0; r < rows_per_lane; r++) {
+                gdn_store_state<state_t, warp_size>(state, state_out_e + (col0 + c) * S_v + r * warp_size + lane, s_shard[c][r]);
             }
         }
     }
@@ -2013,6 +2024,16 @@ static void ggml_cuda_op_gated_delta_net_impl(
         state_src.prefix_n      = n_prefix;
         state_src.prefix_ingr_w = (int) ggml_gated_delta_net_ingr_width(S_v, src_g->ne[0], pmode);
         state_src.prefix_off_b  = pmode == 1 ? 3 * (int) S_v : 2 * (int) S_v + (int) src_g->ne[0];
+        // [GDNDIRECT] the evaluator skipped this call's final-state / checkpoint cpy: store them in the cache
+        for (auto & e : ctx.gdn_replay_directs) {
+            if (e.gdn == dst) {
+                GGML_ASSERT(!e.used && n_seqs == 1);
+                state_src.final_dst = e.final_dst;
+                state_src.ckpt_dst  = e.ckpt_dst;
+                e.used              = true;
+                break;
+            }
+        }
         if (kda) {
             launch_gated_delta_net<true, true, true, float>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale,

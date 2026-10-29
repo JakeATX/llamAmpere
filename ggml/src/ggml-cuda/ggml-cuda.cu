@@ -5720,6 +5720,134 @@ static void ggml_cuda_gdn_state_read_finish(ggml_backend_cuda_context * cuda_ctx
     cuda_ctx->gdn_state_reads.clear();
 }
 
+// [GDNDIRECT] GGML_CUDA_GDN_REPLAY_DIRECT=1 (opt-in): a prefixed gated_delta_net (--gdn-replay's folded verify call)
+// emits its final state and the next round's checkpoint as trailing blocks of its own output, and two F32 cpys move
+// them into the recurrent cache (delta-net-base.cpp). With the switch the launch stores both blocks in the cache rows
+// itself and the cpys are skipped: same floats, same rows, two launches and 4 x D floats of traffic fewer per layer.
+// Correct only while, checked per evaluation with data pointers:
+//  - one sequence (with n_seqs > 1 an input row read in place can be another sequence's output row; see [#87]);
+//  - the block's only reader is the cpy (through at most one RESHAPE), nothing else views those bytes of the gdn;
+//  - the cpy writes a contiguous F32 [D] range, and no node between the gdn and the cpy reads or writes that range
+//    (it would see, or overwrite, the value the cpy has not written yet in the unfused order).
+// An in-place input row equal to an output row is safe: each thread reads its state elements before it stores the
+// same elements (the [#87] argument).
+static bool ggml_cuda_gdn_replay_direct_enabled() {
+    static const bool on = [] { const char * e = getenv("GGML_CUDA_GDN_REPLAY_DIRECT"); return e != nullptr && atoi(e) != 0; }();
+    return on;
+}
+
+// the cpy that moves bytes [off, off + D floats) of gdn into the cache, or -1; refuses any other reader of that range
+static int ggml_cuda_gdn_replay_direct_cpy(const ggml_cgraph * cgraph, int gi, size_t off, int64_t D) {
+    const ggml_tensor * gdn = cgraph->nodes[gi];
+    const size_t end = off + D * sizeof(float);
+    int ci = -1;
+    for (int k = gi + 1; k < cgraph->n_nodes; ++k) {
+        const ggml_tensor * n = cgraph->nodes[k];
+        // a VIEW/RESHAPE of gdn reads only its own bytes; it may be the block itself (one hop towards the cpy)
+        const bool is_view = (n->op == GGML_OP_VIEW || n->op == GGML_OP_RESHAPE) && n->view_src == gdn;
+        for (int si = 0; si < GGML_MAX_SRC; ++si) {
+            const ggml_tensor * src = n->src[si];
+            if (src == nullptr || (src != gdn && src->view_src != gdn)) {
+                continue;
+            }
+            const ggml_tensor * r = is_view ? n : src; // whose bytes of gdn are read
+            const size_t s0 = r == gdn ? 0 : r->view_offs;
+            const size_t s1 = s0 + ggml_nbytes(r);
+            if (s1 <= off || end <= s0) {
+                continue;
+            }
+            if (is_view) {
+                if (si == 0 && n->view_offs == off && ggml_nelements(n) == D && ggml_is_contiguous(n) &&
+                    !(n->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                    continue;
+                }
+                return -1;
+            }
+            const bool cpy = n->op == GGML_OP_CPY && si == 0 && src != gdn && src->view_offs == off &&
+                ggml_nelements(src) == D && ggml_is_contiguous(src) && !(n->flags & GGML_TENSOR_FLAG_OUTPUT);
+            if (!cpy || ci >= 0) {
+                return -1;
+            }
+            ci = k;
+        }
+    }
+    if (ci < 0) {
+        return -1;
+    }
+    const ggml_tensor * dst = cgraph->nodes[ci]->src[1];
+    if (dst->type != GGML_TYPE_F32 || dst->data == nullptr || !ggml_is_contiguous(dst) || ggml_nelements(dst) != D) {
+        return -1;
+    }
+    for (int j = gi + 1; j < ci; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(n) || (n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || ggml_is_empty(n)) {
+            continue;
+        }
+        if (n->data == nullptr || ggml_cuda_gdn_state_read_overlap(n, dst)) {
+            return -1;
+        }
+        for (int si = 0; si < GGML_MAX_SRC; ++si) {
+            if (n->src[si] != nullptr && (n->src[si]->data == nullptr || ggml_cuda_gdn_state_read_overlap(n->src[si], dst))) {
+                return -1;
+            }
+        }
+    }
+    return ci;
+}
+
+// fills cuda_ctx->gdn_replay_directs and marks the cpy nodes the evaluation skips (in `skip`, sized like the graph)
+static void ggml_cuda_gdn_replay_direct_plan(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph,
+                                             std::vector<uint8_t> & skip) {
+    cuda_ctx->gdn_replay_directs.clear();
+    static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
+    if (disable_fusion || !ggml_cuda_gdn_replay_direct_enabled()) {
+        return;
+    }
+    for (int gi = 0; gi < cgraph->n_nodes; ++gi) {
+        const ggml_tensor * gdn = cgraph->nodes[gi];
+        if (gdn->op != GGML_OP_GATED_DELTA_NET || gdn->type != GGML_TYPE_F32 || gdn->data == nullptr ||
+            (gdn->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_get_op_params_i32(gdn, 1) == 0 || ggml_get_op_params_i32(gdn, 2) <= 0) {
+            continue;
+        }
+        const ggml_tensor * v = gdn->src[2];
+        const int64_t S_v = v->ne[0], H = v->ne[1], n_tokens = v->ne[2], n_seqs = v->ne[3];
+        if (n_seqs != 1) {
+            continue;
+        }
+        const int64_t D       = S_v * S_v * H;
+        const int64_t K       = ggml_get_op_params_i32(gdn, 0);
+        const int64_t region  = ggml_gated_delta_net_ingr_region(S_v, gdn->src[3]->ne[0], H, n_seqs, K, ggml_get_op_params_i32(gdn, 1));
+        const size_t  fin_off = (S_v * H * n_tokens * n_seqs + region) * sizeof(float);
+        const int fi = ggml_cuda_gdn_replay_direct_cpy(cgraph, gi, fin_off, D);
+        if (fi < 0) {
+            continue;
+        }
+        const int ci = ggml_cuda_gdn_replay_direct_cpy(cgraph, gi, fin_off + D * sizeof(float), D);
+        if (skip.empty()) {
+            skip.assign(cgraph->n_nodes, 0);
+        }
+        ggml_backend_cuda_context::gdn_replay_direct_entry e;
+        e.gdn       = gdn;
+        e.final_dst = (float *) cgraph->nodes[fi]->src[1]->data;
+        skip[fi]    = 1;
+        if (ci >= 0) {
+            e.ckpt_dst = (float *) cgraph->nodes[ci]->src[1]->data;
+            skip[ci]   = 1;
+        }
+        cuda_ctx->gdn_replay_directs.push_back(e);
+    }
+}
+
+// every planned gdn must have stored its blocks: a skipped cpy whose gdn did not would leave the cache stale
+static void ggml_cuda_gdn_replay_direct_finish(ggml_backend_cuda_context * cuda_ctx) {
+    for (const auto & e : cuda_ctx->gdn_replay_directs) {
+        if (!e.used) {
+            GGML_ABORT("[GDNDIRECT] gated_delta_net %s skipped its state cpy but was not launched with the cache rows", e.gdn->name);
+        }
+    }
+    cuda_ctx->gdn_replay_directs.clear();
+}
+
 // [ROUNDFIX] pooled-key gather read in place (GGML_CUDA_LID_GATHER=1).
 //
 // The Qwen4exp lightning indexer scores pooled keys gathered from the F16 key cache:
@@ -10049,12 +10177,16 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             std::vector<uint8_t> conv_ring_skip;
             // [ROUNDFIX] pooled-key GET_ROWS nodes the lightning indexer reads in place (ggml_cuda_lid_gather_plan)
             std::vector<uint8_t> lid_gather_skip;
+            // [GDNDIRECT] final-state / checkpoint cpys the prefixed gated_delta_net launches replace
+            std::vector<uint8_t> gdn_direct_skip;
             if (should_launch_concurrent_events) {
+                cuda_ctx->gdn_replay_directs.clear();
                 cuda_ctx->gdn_state_reads.clear();
                 cuda_ctx->conv_rings.clear();
                 cuda_ctx->lid_gathers.clear();
             } else {
                 ggml_cuda_gdn_state_read_plan(cuda_ctx, cgraph, gdn_state_read_skip);
+                ggml_cuda_gdn_replay_direct_plan(cuda_ctx, cgraph, gdn_direct_skip);
                 ggml_cuda_conv_ring_plan(cuda_ctx, cgraph, conv_ring_skip);
                 ggml_cuda_lid_gather_plan(cuda_ctx, cgraph, lid_gather_skip);
             }
@@ -10143,6 +10275,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
 
                 if (!gdn_state_read_skip.empty() && gdn_state_read_skip[i]) {
+                    continue;
+                }
+
+                if (!gdn_direct_skip.empty() && gdn_direct_skip[i]) {
                     continue;
                 }
 
@@ -10248,6 +10384,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             }
 
             ggml_cuda_gdn_state_read_finish(cuda_ctx);
+            ggml_cuda_gdn_replay_direct_finish(cuda_ctx);
             ggml_cuda_lid_gather_finish(cuda_ctx);
             ggml_cuda_conv_ring_finish(cuda_ctx);
             ggml_cuda_moe_cache_hf_graph_end(*cuda_ctx);
