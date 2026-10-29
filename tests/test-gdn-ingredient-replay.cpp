@@ -7,7 +7,7 @@
  * have produced at that position -- without needing q or a full S_v x S_v state
  * snapshot for every retained step.
  *
- * Scenario: N=6 total tokens, a checkpoint taken after c=2 tokens, and a "draft"
+ * Scenario: N=8 total tokens, a checkpoint taken after c=2 tokens, and a "draft"
  * of r-c=3 more tokens (positions 2,3,4) that need to be replayed on top of the
  * checkpoint to reach the state after r=5 tokens. This mirrors the real usage:
  * checkpoint = last accepted position, replay = tokens between the checkpoint
@@ -127,7 +127,7 @@ int main(int argc, char ** argv) {
     const bool cuda = argc == 2 && strcmp(argv[1], "--cuda") == 0;
     const int64_t S_v = 128;
     const int64_t H   = 4;
-    const int64_t N   = 6; // total tokens
+    const int64_t N   = 8; // total tokens
     const int64_t c   = 2; // checkpoint position (tokens accepted so far)
     const int64_t r   = 5; // rollback target (ground truth: state after r tokens)
 

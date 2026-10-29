@@ -360,7 +360,7 @@ gated_delta_net_cuda_ilp(const float * q,
                          int           ingr_w,
                          int64_t       ingr_region,
                          const ggml_cuda_gated_delta_net_state_src state_src) {
-    static_assert(!emit_ingredients_t || (!PREFETCH && keep_rs_t && std::is_same_v<state_t, float>), "ingredient replay uses F32 without prefetch");
+    static_assert(!emit_ingredients_t || (keep_rs_t && std::is_same_v<state_t, float>), "ingredient replay uses F32");
     const uint32_t h_idx    = blockIdx.x;
     const uint32_t sequence = blockIdx.y;
     const int      lane     = threadIdx.x;
@@ -436,12 +436,15 @@ gated_delta_net_cuda_ilp(const float * q,
         }
     };
 
-    if constexpr (PREFETCH) {
-        load_tok(0, k_reg, q_reg, v_reg, g_raw, beta_val);
-    }
-
     const int n_prefix = emit_ingredients_t ? state_src.prefix_n : 0;
-    for (int t = -n_prefix; t < n_tokens; t++) {
+    int first_t = -n_prefix;
+    if constexpr (PREFETCH) {
+        while (first_t < 0 && state_src.prefix_w[first_t + n_prefix] == 0.0f) {
+            first_t++;
+        }
+        load_tok(first_t, k_reg, q_reg, v_reg, g_raw, beta_val);
+    }
+    for (int t = first_t; t < n_tokens; t++) {
         if (t < 0 && state_src.prefix_w[t + n_prefix] == 0.0f) {
             continue;
         }
@@ -450,13 +453,35 @@ gated_delta_net_cuda_ilp(const float * q,
         float vn_reg[NC];
         float gn_raw = 0.0f;
         float bn_val = 0.0f;
+        int next_t = t + 1;
         if constexpr (PREFETCH) {
-            if (t + 1 < n_tokens) {
-                load_tok(t + 1, kn_reg, qn_reg, vn_reg, gn_raw, bn_val);
+            // A masked slot may contain NaNs. Stage the next active slot, or the first new token.
+            while (next_t < 0 && state_src.prefix_w[next_t + n_prefix] == 0.0f) {
+                next_t++;
+            }
+            if (next_t < n_tokens) {
+                load_tok(next_t, kn_reg, qn_reg, vn_reg, gn_raw, bn_val);
             }
         } else {
             load_tok(t, k_reg, q_reg, v_reg, g_raw, beta_val);
         }
+        auto advance_tok = [&] {
+            if constexpr (PREFETCH) {
+                if (next_t < n_tokens) {
+#pragma unroll
+                    for (int r = 0; r < rows_per_lane; r++) {
+                        k_reg[r] = kn_reg[r];
+                        q_reg[r] = qn_reg[r];
+                    }
+#pragma unroll
+                    for (int c = 0; c < NC; c++) {
+                        v_reg[c] = vn_reg[c];
+                    }
+                    g_raw    = gn_raw;
+                    beta_val = bn_val;
+                }
+            }
+        };
 
         const float g_val = expf(g_raw);
 
@@ -490,6 +515,7 @@ gated_delta_net_cuda_ilp(const float * q,
             }
         }
         if (t < 0) {
+            advance_tok();
             continue;
         }
         float attn_col[NC];
@@ -561,21 +587,7 @@ gated_delta_net_cuda_ilp(const float * q,
             }
         }
 
-        if constexpr (PREFETCH) {
-            if (t + 1 < n_tokens) {
-#pragma unroll
-                for (int r = 0; r < rows_per_lane; r++) {
-                    k_reg[r] = kn_reg[r];
-                    q_reg[r] = qn_reg[r];
-                }
-#pragma unroll
-                for (int c = 0; c < NC; c++) {
-                    v_reg[c] = vn_reg[c];
-                }
-                g_raw    = gn_raw;
-                beta_val = bn_val;
-            }
-        }
+        advance_tok();
     }
 
     if constexpr (!keep_rs_t || emit_ingredients_t) {
@@ -1154,18 +1166,22 @@ static void launch_gated_delta_net(
             const char * e = getenv("GGML_CUDA_GDN_REPLAY_COLS");
             return e != nullptr && (strcmp(e, "2") == 0 || strcmp(e, "4") == 0) ? atoi(e) : 0;
         }();
+        static const bool replay_prefetch = [] {
+            const char * e = getenv("GGML_CUDA_GDN_REPLAY_PREFETCH");
+            return e != nullptr && atoi(e) != 0;
+        }();
         const auto & dev = ggml_cuda_info().devices[ggml_cuda_get_device()];
         if (replay_cols != 0 && S_v == 128 && dev.warp_size == 32 &&
                 dev.cc >= GGML_CUDA_CC_AMPERE && dev.cc < GGML_CUDA_CC_ADA_LOVELACE) {
-#define GDN_REPLAY_ILP(NC_) \
-            launch_gated_delta_net_ilp_inst<true, NC_, false, float, true>( \
+#define GDN_REPLAY_ILP(NC_, PF_) \
+            launch_gated_delta_net_ilp_inst<true, NC_, PF_, float, true>( \
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens, n_seqs, \
                 sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale, \
                 state_slot_stride, K, slot_rows, state_src, stream, ingr_w, ingr_region)
             if (replay_cols == 4) {
-                GDN_REPLAY_ILP(4);
+                if (replay_prefetch) { GDN_REPLAY_ILP(4, true); } else { GDN_REPLAY_ILP(4, false); }
             } else {
-                GDN_REPLAY_ILP(2);
+                if (replay_prefetch) { GDN_REPLAY_ILP(2, true); } else { GDN_REPLAY_ILP(2, false); }
             }
 #undef GDN_REPLAY_ILP
             return;
