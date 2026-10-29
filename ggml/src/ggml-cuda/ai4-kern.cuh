@@ -1340,8 +1340,13 @@ static __host__ __device__ inline int64_t ids_helper_ints(int n_expert, int64_t 
     return 2 + n_expert + (n_expert + 1) + 2*n_pairs + 2*(int64_t) max_tiles;
 }
 
-static __host__ inline int ids_max_tiles(int n_expert, int64_t n_pairs, int bn) {
-    return bn > 0 ? (int) (std::min<int64_t>(n_expert, n_pairs) + n_pairs/bn) : 0;
+static __host__ inline int ids_max_tiles(int n_expert, int64_t n_pairs, int bn, bool tight = false) {
+    if (bn <= 0) {
+        return 0;
+    }
+    const int64_t active = std::min<int64_t>(n_expert, n_pairs);
+    // fork: each active expert consumes one pair before another full tile can be added.
+    return (int) (active + (tight ? n_pairs - active : n_pairs)/bn);
 }
 
 template <bool AGG>

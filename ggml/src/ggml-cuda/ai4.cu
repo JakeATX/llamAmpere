@@ -45,6 +45,7 @@
 //   GGML_CUDA_AI23_ID_STAGES=2|3  routed rate-2/3 prompt staging depth (default 3)
 //   GGML_CUDA_AI23_ID_SLABS=4|8  routed rate-2/3 prompt row slabs per block (default 8)
 //   GGML_CUDA_AI23_ID_THREADS=256  smaller routed prompt helper for <=1024 experts (default 1024)
+//   GGML_CUDA_AI23_ID_TIGHT_GRID=1  bound routed prompt tiles after each active expert's first pair (default off)
 //   GGML_CUDA_AI23_ID_ROUTE_AGG=1  combine routed prompt counter updates within each warp (default off)
 //   GGML_CUDA_AI23_ID_FIXED_LOAD=1  unroll fixed-size routed prompt staging copies (default off)
 //   GGML_CUDA_AI23_ID_ZERO=1  zero skipped prompt columns in the routing helper (default off)
@@ -1212,7 +1213,9 @@ void ggml_cuda_mul_mat_id_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor
             bn = ai4_ampere_bn(n_tok);
         }
     }
-    const int max_tiles = direct ? (int) n_pairs : ai4k::ids_max_tiles(n_expert, n_pairs, bn);
+    static const bool tight_grid = ai4_env_int("GGML_CUDA_AI23_ID_TIGHT_GRID", nullptr, 0) != 0;
+    const bool tight = tight_grid && (rate == 2 || rate == 3) && bn != ai4k::MMV_ID_BN;
+    const int max_tiles = direct ? (int) n_pairs : ai4k::ids_max_tiles(n_expert, n_pairs, bn, tight);
     static const bool prompt_zero = ai4_env_int("GGML_CUDA_AI23_ID_ZERO", nullptr, 0) != 0;
     const bool zero_in_helper = !direct && (n_tok <= 8 ||
         (prompt_zero && (rate == 2 || rate == 3) && bn != ai4k::MMV_ID_BN));
