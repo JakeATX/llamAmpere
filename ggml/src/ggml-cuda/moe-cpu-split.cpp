@@ -122,32 +122,37 @@ inline float hsum8(__m256 v) {
 }
 #endif
 
-void q2_reorder_hidden(int n, block_q8_0 * y, float * yd, float * yc) {
+void q2_reorder_hidden(int n, block_q8_0 * y, float * yd, float * yc, bool shuffle_bytes) {
     const int nb = n / QK8_0;
 #if defined(__AVX2__)
     const __m256i shuffle = _mm256_setr_epi8(0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15,
             0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15);
     const __m256i lanes = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+#else
+    (void) shuffle_bytes;
 #endif
     for (int i = 0; i < nb; ++i) {
         int sum = 0;
 #if defined(__AVX2__)
-        const __m256i q = _mm256_loadu_si256((const __m256i *) y[i].qs);
-        const __m256i reordered = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(q, shuffle), lanes);
-        _mm256_storeu_si256((__m256i *) y[i].qs, reordered);
-        const __m256i sums = _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_set1_epi8(1), q), _mm256_set1_epi16(1));
-        __m128i total = _mm_add_epi32(_mm256_castsi256_si128(sums), _mm256_extracti128_si256(sums, 1));
-        total = _mm_hadd_epi32(total, total);
-        total = _mm_hadd_epi32(total, total);
-        sum = _mm_cvtsi128_si32(total);
-#else
-        int8_t t[QK8_0];
-        for (int s = 0; s < 4; ++s) {
-            for (int b = 0; b < 8; ++b) { t[8 * s + b] = y[i].qs[4 * b + s]; }
-        }
-        for (int j = 0; j < QK8_0; ++j) { sum += t[j]; }
-        memcpy(y[i].qs, t, QK8_0);
+        if (shuffle_bytes) {
+            const __m256i q = _mm256_loadu_si256((const __m256i *) y[i].qs);
+            const __m256i reordered = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(q, shuffle), lanes);
+            _mm256_storeu_si256((__m256i *) y[i].qs, reordered);
+            const __m256i sums = _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_set1_epi8(1), q), _mm256_set1_epi16(1));
+            __m128i total = _mm_add_epi32(_mm256_castsi256_si128(sums), _mm256_extracti128_si256(sums, 1));
+            total = _mm_hadd_epi32(total, total);
+            total = _mm_hadd_epi32(total, total);
+            sum = _mm_cvtsi128_si32(total);
+        } else
 #endif
+        {
+            int8_t t[QK8_0];
+            for (int s = 0; s < 4; ++s) {
+                for (int b = 0; b < 8; ++b) { t[8 * s + b] = y[i].qs[4 * b + s]; }
+            }
+            for (int j = 0; j < QK8_0; ++j) { sum += t[j]; }
+            memcpy(y[i].qs, t, QK8_0);
+        }
         yd[i] = ggml_fp16_to_fp32(y[i].d);
         if (i & 1) { yc[i / 2] += yd[i] * (float) sum; } else { yc[i / 2] = yd[i] * (float) sum; }
     }
@@ -453,6 +458,7 @@ struct pool_state {
     bool q2_group4 = false;    // Share Q2 down weights between up to four routes of one expert.
     bool vector_silu = false;  // Use the CPU backend's vector activation in grouped up/gate tiles.
     bool q2_fast = false;      // GGML_MOE_CPU_SPLIT_Q2_FAST: reordered hidden rows + dot_q2_0_rows for Q2_0 down
+    bool q2_shuffle = false;   // Use AVX2 to reorder hidden bytes, with the same integer sums.
     size_t aux_stride = 0;     // floats per route in hq_aux: n/32 block scales, then n/64 offsets
     std::vector<float> hq_aux;
     int rows_ug = 16, rows_down = 64;
@@ -515,7 +521,7 @@ void run_item(pool_state & s, int phase, int item) {
         if (s.q2_fast && m.q2) {
             float * aux = s.hq_aux.data() + (size_t) item * s.aux_stride;
             q2_reorder_hidden((int) m.r.n_in, (block_q8_0 *) (s.hq.data() + (size_t) item * s.hq_stride), aux,
-                    aux + m.r.n_in / QK8_0);
+                    aux + m.r.n_in / QK8_0, s.q2_shuffle);
         }
         return;
     }
@@ -917,6 +923,7 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
     s.q2_group4 = env_int("GGML_MOE_CPU_SPLIT_Q2_GROUP4", 0, 0, 1) != 0;
     s.vector_silu = env_int("GGML_MOE_CPU_SPLIT_VECTOR_SILU", 0, 0, 1) != 0;
     s.q2_fast = env_int("GGML_MOE_CPU_SPLIT_Q2_FAST", 0, 0, 1) != 0;
+    s.q2_shuffle = env_int("GGML_MOE_CPU_SPLIT_Q2_SHUFFLE", 0, 0, 1) != 0;
     s.q8_reuse = env_int("GGML_MOE_CPU_SPLIT_Q8_REUSE", 1, 0, 1) != 0;
     s.down_reuse = env_int("GGML_MOE_CPU_SPLIT_DOWN_REUSE", 1, 0, 1) != 0;
     s.group_tokens = env_int("GGML_MOE_CPU_SPLIT_REUSE8", 1, 0, 1) ? 8 : 4;
