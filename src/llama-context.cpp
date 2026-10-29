@@ -2218,7 +2218,7 @@ void llama_context::sched_reserve(bool suspend_prompt_cache) {
     if (borrow_experts) { LLAMA_LOG_INFO("%s: MTP experts borrow the target cache session\n", __func__); }
     sync_moe_keep();
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
-    if (mtp_prefill_async || mtp_scratch_enabled) {
+    if (mtp_prefill_async || mtp_scratch_enabled || llama_kq_mask_device_enabled()) {
         ggml_backend_sched_set_input_copy_callback(sched.get(), sched_copy_mtp_inputs, this);
     }
 
@@ -2465,7 +2465,7 @@ void llama_context::sched_reserve(bool suspend_prompt_cache) {
                 sched_node_capacity = node_capacity;
                 sched_pipeline_parallel = false;
                 ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
-                if (mtp_prefill_async || mtp_scratch_enabled) {
+                if (mtp_prefill_async || mtp_scratch_enabled || llama_kq_mask_device_enabled()) {
                     ggml_backend_sched_set_input_copy_callback(sched.get(), sched_copy_mtp_inputs, this);
                 }
                 ggml_backend_sched_set_moe_cache(sched.get(), moe_cache_mode, cparams.moe_cache_budget_mib);
@@ -7697,6 +7697,24 @@ ggml_status llama_context::graph_compute(ggml_cgraph * gf, bool batched) {
 
 bool llama_context::sched_copy_mtp_inputs(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, void * user_data) {
     auto * lctx = static_cast<llama_context *>(user_data);
+
+    // [PPIMPL] LLAMA_KQ_MASK_DEVICE: a deferred sequence-prefix mask is filled on the card from its row counts, in
+    // stream order (no host wait, no mask copy). Otherwise its host buffer is filled now and the normal copy follows.
+    if (llama_kq_mask_device_enabled() && src->type == GGML_TYPE_F16) {
+        thread_local std::vector<int32_t> n_visible;
+        int64_t n_kv = 0;
+        if (llama_kq_mask_deferred_get(src, n_visible, &n_kv)) {
+            using fill_fn = bool (*)(ggml_backend_t, ggml_tensor *, const int32_t *, int64_t, int64_t);
+            auto * dev  = ggml_backend_get_device(backend);
+            auto   fill = dev ? (fill_fn) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev),
+                    "ggml_backend_cuda_fill_prefix_mask") : nullptr;
+            if (fill && ggml_nbytes(dst) == ggml_nbytes(src) && fill(backend, dst, n_visible.data(), (int64_t) n_visible.size(), n_kv)) {
+                return true;
+            }
+            llama_kq_mask_deferred_fill_host(src);
+            return false;
+        }
+    }
 
     // fork: Retain each MTP input snapshot until the logical catch-up batch completes.
     if (((lctx->mtp_prefill_async && lctx->mtp_hidden_source) || lctx->mtp_scratch_active) &&

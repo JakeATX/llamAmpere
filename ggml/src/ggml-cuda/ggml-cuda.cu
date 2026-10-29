@@ -4874,6 +4874,77 @@ static bool ggml_backend_cuda_upload_host_small(ggml_backend_t backend, const vo
     return true;
 }
 
+// [PPIMPL] LLAMA_KQ_MASK_DEVICE: the host only computes how many leading cells each query row sees (the used cells are
+// contiguous and in position order); this fills the f16 mask on the card from those counts: 0 for the first count cells
+// of the row, -INF for the rest. Same values as the host fill, without the host wait and the ~0.3 GB copy per ubatch.
+// The counts go through a small mapped pinned ring; a slot is reused only after the fill that read it has finished.
+static __global__ void k_cuda_fill_prefix_mask(half * __restrict__ dst, const int32_t * __restrict__ n_visible,
+                                               int64_t n_kv, int64_t n_rows) {
+    const int64_t row = blockIdx.x;
+    if (row >= n_rows) {
+        return;
+    }
+    const int64_t c  = n_visible[row];
+    const int64_t nv = c < 0 ? 0 : c > n_kv ? n_kv : c;
+    half * r = dst + row*n_kv;
+    const __half_raw keep = { 0x0000 }, drop = { 0xFC00 };
+    for (int64_t j = threadIdx.x; j < n_kv; j += blockDim.x) {
+        r[j] = j < nv ? half(keep) : half(drop);
+    }
+}
+
+static bool ggml_backend_cuda_fill_prefix_mask(ggml_backend_t backend, ggml_tensor * dst, const int32_t * n_visible,
+                                               int64_t n_rows, int64_t n_kv) {
+    constexpr int    N_SLOTS    = 4;
+    constexpr size_t SLOT_BYTES = 256u << 10;
+    if (!backend || !ggml_backend_is_cuda(backend) || !dst || !dst->data || dst->type != GGML_TYPE_F16 ||
+            !ggml_is_contiguous(dst) || dst->ne[0] != n_kv || n_rows <= 0 ||
+            n_rows != dst->ne[1]*dst->ne[2]*dst->ne[3] || (size_t) n_rows*sizeof(int32_t) > SLOT_BYTES) {
+        return false;
+    }
+    auto * ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
+    if (ctx->scratch_borrowed) {
+        return false;
+    }
+    struct ring {
+        std::mutex  mu;
+        bool        failed = false;
+        char      * host = nullptr;
+        char      * dev  = nullptr;
+        cudaEvent_t ev[N_SLOTS] = {};
+        int         next = 0;
+    };
+    static ring rings[GGML_CUDA_MAX_DEVICES];
+    auto & r = rings[ctx->device];
+    std::lock_guard<std::mutex> lock(r.mu);
+    if (r.failed) {
+        return false;
+    }
+    ggml_cuda_set_device(ctx->device);
+    if (!r.host) {
+        if (cudaHostAlloc((void **) &r.host, N_SLOTS*SLOT_BYTES, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+                cudaHostGetDevicePointer((void **) &r.dev, r.host, 0) != cudaSuccess) {
+            (void) cudaGetLastError();
+            r.failed = true;
+            GGML_LOG_WARN("%s: no mapped count ring; the mask is filled on the host\n", __func__);
+            return false;
+        }
+        for (auto & e : r.ev) {
+            CUDA_CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+        }
+    }
+    const int slot = r.next;
+    r.next = (r.next + 1) % N_SLOTS;
+    CUDA_CHECK(cudaEventSynchronize(r.ev[slot]));  // the fill that read this slot N_SLOTS uploads ago
+    memcpy(r.host + slot*SLOT_BYTES, n_visible, (size_t) n_rows*sizeof(int32_t));
+    cudaStream_t stream = ctx->stream();
+    k_cuda_fill_prefix_mask<<<(unsigned) n_rows, 256, 0, stream>>>((half *) dst->data,
+            (const int32_t *) (r.dev + slot*SLOT_BYTES), n_kv, n_rows);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaEventRecord(r.ev[slot], stream));
+    return true;
+}
+
 // [RTPORT] LLAMA_MTP_PIPELINE: a guess step can be queued on the stream before its input token is known, so
 // all guess steps can be launched back to back while the host only polls mapped memory. This kernel is queued in front of
 // the step's graph: one thread polls a host-mapped sequence word until the host has published the step's token
@@ -12522,6 +12593,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_upload_host_small") == 0) {
         return (void *) ggml_backend_cuda_upload_host_small;
+    }
+    if (strcmp(name, "ggml_backend_cuda_fill_prefix_mask") == 0) {
+        return (void *) ggml_backend_cuda_fill_prefix_mask;
     }
     if (strcmp(name, "ggml_backend_cuda_mtp_row_wait") == 0) {
         return (void *) ggml_backend_cuda_mtp_row_wait;
