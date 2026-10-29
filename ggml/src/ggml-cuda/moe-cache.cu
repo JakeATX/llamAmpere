@@ -5497,10 +5497,14 @@ static bool moe_cache_resize_prompt_pool(moe_cache_device & device, moe_cache_po
         tail = i;
         map.emplace(slot.key, i);
     }
-    for (const auto & move : moves) {
-        if (!moe_cache_cuda_ok(device, cudaMemcpyAsync(pool.slab + (size_t)move.first * pool.expert_size,
-                pool.slab + (size_t)move.second * pool.expert_size, pool.expert_size,
+    for (size_t i = 0; i < moves.size();) {
+        size_t end = i + 1;
+        while (end < moves.size() && moves[end].first == moves[i].first + (int)(end - i) &&
+                moves[end].second == moves[i].second + (int)(end - i)) { ++end; }
+        if (!moe_cache_cuda_ok(device, cudaMemcpyAsync(pool.slab + (size_t)moves[i].first * pool.expert_size,
+                pool.slab + (size_t)moves[i].second * pool.expert_size, (end - i) * pool.expert_size,
                 cudaMemcpyDeviceToDevice, device.compute_stream), "prompt survivor compact", true)) { GGML_ABORT("prompt compaction failed"); }
+        i = end;
     }
     if (!moves.empty() && !moe_cache_cuda_ok(device, cudaStreamSynchronize(device.compute_stream), "prompt compaction join", true)) {
         GGML_ABORT("prompt compaction join failed");
