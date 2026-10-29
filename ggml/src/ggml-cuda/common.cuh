@@ -1704,6 +1704,7 @@ struct ggml_backend_cuda_context {
         const ggml_tensor * gdn       = nullptr;
         float *             final_dst = nullptr;
         float *             ckpt_dst  = nullptr; // nullptr: the checkpoint block stays in the op output
+        float *             ingr_dst  = nullptr; // the K new ingredient slots (ring row); nullptr: op output
         bool                used      = false;
     };
     std::vector<gdn_replay_direct_entry> gdn_replay_directs;

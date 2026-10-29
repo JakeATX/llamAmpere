@@ -5724,6 +5724,7 @@ static void ggml_cuda_gdn_state_read_finish(ggml_backend_cuda_context * cuda_ctx
 // emits its final state and the next round's checkpoint as trailing blocks of its own output, and two F32 cpys move
 // them into the recurrent cache (delta-net-base.cpp). With the switch the launch stores both blocks in the cache rows
 // itself and the cpys are skipped: same floats, same rows, two launches and 4 x D floats of traffic fewer per layer.
+// The K new ingredient slots go to the ring row the same way (a third cpy skipped).
 // Correct only while, checked per evaluation with data pointers:
 //  - one sequence (with n_seqs > 1 an input row read in place can be another sequence's output row; see [#87]);
 //  - the block's only reader is the cpy (through at most one RESHAPE), nothing else views those bytes of the gdn;
@@ -5823,6 +5824,17 @@ static void ggml_cuda_gdn_replay_direct_plan(ggml_backend_cuda_context * cuda_ct
             continue;
         }
         const int ci = ggml_cuda_gdn_replay_direct_cpy(cgraph, gi, fin_off + D * sizeof(float), D);
+        // the K new ingredient slots, right after the attention output, -> the ring row (one cpy of all K slots,
+        // n_tokens >= K; the layouts match for one sequence). The launch reads every src while it stores them,
+        // so none may share bytes with the ring row (the prefix reads the gathered ring copy, src 6).
+        const int64_t ingr_n = K * ggml_gated_delta_net_ingr_width(S_v, gdn->src[3]->ne[0], ggml_get_op_params_i32(gdn, 1)) * H;
+        int ii = n_tokens >= K ? ggml_cuda_gdn_replay_direct_cpy(cgraph, gi, S_v * H * n_tokens * sizeof(float), ingr_n) : -1;
+        for (int si = 0; ii >= 0 && si < GGML_MAX_SRC; ++si) {
+            const ggml_tensor * src = gdn->src[si];
+            if (src != nullptr && (src->data == nullptr || ggml_cuda_gdn_state_read_overlap(src, cgraph->nodes[ii]->src[1]))) {
+                ii = -1;
+            }
+        }
         if (skip.empty()) {
             skip.assign(cgraph->n_nodes, 0);
         }
@@ -5834,13 +5846,18 @@ static void ggml_cuda_gdn_replay_direct_plan(ggml_backend_cuda_context * cuda_ct
             e.ckpt_dst = (float *) cgraph->nodes[ci]->src[1]->data;
             skip[ci]   = 1;
         }
+        if (ii >= 0) {
+            e.ingr_dst = (float *) cgraph->nodes[ii]->src[1]->data;
+            skip[ii]   = 1;
+        }
         cuda_ctx->gdn_replay_directs.push_back(e);
     }
     static bool logged = false;
     if (!logged && !cuda_ctx->gdn_replay_directs.empty()) {
         logged = true;
-        GGML_LOG_INFO("[GDNDIRECT] %zu gated_delta_net calls store final state%s in the cache\n",
-            cuda_ctx->gdn_replay_directs.size(), cuda_ctx->gdn_replay_directs[0].ckpt_dst ? " and checkpoint" : "");
+        GGML_LOG_INFO("[GDNDIRECT] %zu gated_delta_net calls store final state%s%s in the cache\n",
+            cuda_ctx->gdn_replay_directs.size(), cuda_ctx->gdn_replay_directs[0].ckpt_dst ? " and checkpoint" : "",
+            cuda_ctx->gdn_replay_directs[0].ingr_dst ? " and ingredient slots" : "");
     }
 }
 

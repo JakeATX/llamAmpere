@@ -30,6 +30,9 @@ struct ggml_cuda_gated_delta_net_state_src {
     // head h at (s * H + h) * S_v * S_v) instead of in the op output; nullptr keeps the op output
     float *         final_dst     = nullptr;
     float *         ckpt_dst      = nullptr;
+    // [GDNDIRECT] and the K ingredient slots here (the ring row: slot j, head h at (j * H + h) * ingr_w),
+    // only when the call emits all K slots for one sequence; nullptr keeps the op output
+    float *         ingr_dst      = nullptr;
 };
 
 void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
