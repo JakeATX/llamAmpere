@@ -83,6 +83,38 @@ static void test_laws() {
     puts("400K-draw exact and beat laws, counters, zero/absent support: PASS");
 }
 
+static void test_mode_distribution() {
+    auto p = probs({.50f, .30f, .20f}), q = probs({.75f, .10f, .15f});
+    llama_token_data_array arr{p.data(), p.size(), 0, false};
+    auto law = common_sampler_pq_mode_distribution(arr, q);
+    for (size_t k = 0; k < law.size(); ++k) { assert(std::abs(law[k] - q[k].p) < 1e-6); }
+    // Both sides of the ending veto must preserve the exact law for this single excess token.
+    for (int ending : {0, 1, 2}) {
+        const auto stop = [ending](llama_token id) { return id == ending; };
+        law = common_sampler_pq_mode_distribution(arr, q, stop);
+        std::mt19937 draws(391), rng(729);
+        std::discrete_distribution<int> pd({.5, .3, .2}), qd({.75, .1, .15});
+        int counts[3] = {}; common_sampler_pq_stats stats;
+        for (int i = 0; i < 100000; ++i) {
+            const int d = qd(draws), x = pd(draws);
+            counts[common_sampler_verify_pq(arr, q, d, x, rng, true, stats, nullptr, stop).id]++;
+        }
+        double sum = 0.0;
+        for (int k = 0; k < 3; ++k) {
+            assert(law[k] >= 0.0 && std::abs(counts[k]/100000.0 - law[k]) < .006);
+            sum += law[k];
+        }
+        assert(std::abs(sum - 1.0) < 1e-6);
+    }
+    // Equal probabilities rescue; missing q support and zero p support are valid.
+    p = probs({.5f, .5f, 0.f}); q = probs({.75f, 0.f, .25f}); arr.data = p.data();
+    law = common_sampler_pq_mode_distribution(arr, q);
+    assert(std::abs(law[0] - .75) < 1e-6 && std::abs(law[1] - .25) < 1e-6 && law[2] == 0.0);
+    q = p; law = common_sampler_pq_mode_distribution(arr, q);
+    for (size_t k = 0; k < law.size(); ++k) { assert(law[k] == p[k].p); }
+    puts("mode-biased local law, ending veto, ties, missing/zero support: PASS");
+}
+
 static void test_model_state(const char * path) {
     ggml_backend_load_all();
     llama_model_params mp = llama_model_default_params();
@@ -271,7 +303,7 @@ static void bench() {
 }
 
 int main(int argc, char ** argv) {
-    test_identity_and_ties(); test_laws();
+    test_identity_and_ties(); test_laws(); test_mode_distribution();
     if (argc == 2) { test_model_state(argv[1]); }
     bench();
     puts("test-spec-beat: PASS");
