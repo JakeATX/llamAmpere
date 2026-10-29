@@ -434,7 +434,7 @@ struct pool_state {
     size_t hq_stride = 0;
     bool avx512 = false;       // GGML_MOE_CPU_SPLIT_AVX512 and the CPU has AVX-512 F/BW/VL/VNNI
     bool q2_pair = false;      // Share Q2 down weights between two routes of one expert.
-    bool q2_group4 = false;    // Share Q2 down weights between four routes of one expert.
+    bool q2_group4 = false;    // Share Q2 down weights between up to four routes of one expert.
     bool vector_silu = false;  // Use the CPU backend's vector activation in grouped up/gate tiles.
     bool q2_fast = false;      // GGML_MOE_CPU_SPLIT_Q2_FAST: reordered hidden rows + dot_q2_0_rows for Q2_0 down
     size_t aux_stride = 0;     // floats per route in hq_aux: n/32 block scales, then n/64 offsets
@@ -599,6 +599,10 @@ void run_item(pool_state & s, int phase, int item) {
                 dot_q2_0_rows<4>((int) down.r.n_in, (int) (r1 - r0), w, down.r.row_bytes, y, s.hq_stride,
                         aux, aux + down.r.n_in / QK8_0, s.aux_stride, o, s.out_stride);
                 q += 4;
+            } else if (s.q2_group4 && q + 2 < s.first[i + 1]) {
+                dot_q2_0_rows<3>((int) down.r.n_in, (int) (r1 - r0), w, down.r.row_bytes, y, s.hq_stride,
+                        aux, aux + down.r.n_in / QK8_0, s.aux_stride, o, s.out_stride);
+                q += 3;
             } else if (s.q2_pair && q + 1 < s.first[i + 1]) {
                 dot_q2_0_rows<2>((int) down.r.n_in, (int) (r1 - r0), w, down.r.row_bytes, y, s.hq_stride,
                         aux, aux + down.r.n_in / QK8_0, s.aux_stride, o, s.out_stride);
@@ -1008,7 +1012,7 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
             s.threads, pin ? "pinned to cpus " : "unpinned", where.c_str(), skipped.c_str(), s.spin_us, s.nap_us, s.rows_ug, s.rows_down,
             s.q2_fast ? ", Q2_0 down fast path" : "", smt ? ", SMT siblings" : "", s.avx512 ? ", grouped AVX-512 VNNI IQ" : "");
     if (s.q2_pair && s.q2_fast) { fprintf(stderr, "[moe-cpu-split] Q2_0 down shares weights across route pairs\n"); }
-    if (s.q2_group4 && s.q2_fast) { fprintf(stderr, "[moe-cpu-split] Q2_0 down shares weights across four-route groups\n"); }
+    if (s.q2_group4 && s.q2_fast) { fprintf(stderr, "[moe-cpu-split] Q2_0 down shares weights across three/four-route groups\n"); }
     if (s.vector_silu && s.iq_rows) { fprintf(stderr, "[moe-cpu-split] grouped up/gate uses CPU vector SiLU\n"); }
     if (s.iq_rows) { fprintf(stderr, "[moe-cpu-split] IQ up/gate row kernels (each chunk decoded once per expert), variant %d, prefetch %d B\n", s.iq_variant, s.iq_pf); }
     if (s.schedule) { fprintf(stderr, "[moe-cpu-split] static quantization rows, grouped math claims\n"); }
