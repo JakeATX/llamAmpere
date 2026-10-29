@@ -807,6 +807,31 @@ void run_job_items(pool_state & s, unsigned long long n, bool lead = false) {
     }
 }
 
+// item_barrier + host help: the waiting host claims one item of the open phase of the current job, the same
+// tagged claim the pool uses, so it needs no admission handshake: thread 0 cannot finish (or replace) the job
+// until this item is counted, and a claim against a closed or newer job fails. Same items, same rows.
+bool help_items(pool_state & s) {
+    const unsigned long long n = s.gen.load(std::memory_order_acquire);
+    if (n == 0) { return false; }
+    const unsigned long long tag = (n & item_low) << 32;
+    for (int p = 0; p < 4; ++p) {
+        if (p > 0) {
+            const unsigned long long d = s.idone[p - 1].load(std::memory_order_acquire);
+            if ((d & ~item_low) != tag || (d & item_low) < (unsigned long long) items_of(s, p - 1)) { return false; }
+        }
+        const unsigned long long total = (unsigned long long) items_of(s, p);
+        for (unsigned long long c = s.inext[p].load(std::memory_order_acquire);
+                (c & ~item_low) == tag && (c & item_low) < total;) {
+            if (s.inext[p].compare_exchange_weak(c, c + 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+                run_item(s, p, (int) (c & item_low));
+                s.idone[p].fetch_add(1, std::memory_order_acq_rel);
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 void pin_thread(int cpu) {
 #if defined(__linux__)
     if (cpu < 0) { return; }
@@ -1018,7 +1043,7 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
     s.nap_us = env_int("GGML_MOE_CPU_SPLIT_NAP_US", 1000, 1, 100000);
     s.schedule = env_int("GGML_MOE_CPU_SPLIT_SCHEDULE", 0, 0, 1) != 0;
     s.host_help = env_int("GGML_MOE_CPU_SPLIT_HOST", 0, 0, 1) != 0;
-    s.item_barrier = env_int("GGML_MOE_CPU_SPLIT_ITEM_BARRIER", 0, 0, 1) != 0 && !s.schedule && !s.host_help;
+    s.item_barrier = env_int("GGML_MOE_CPU_SPLIT_ITEM_BARRIER", 0, 0, 1) != 0 && !s.schedule;
     for (int p = 0; p < 4; ++p) {
         s.next[p].store(0); s.fin[p].store(0); s.closed[p].store(0); s.inext[p].store(item_low); s.idone[p].store(0);
     }
@@ -1129,6 +1154,7 @@ bool moe_cs_help() {
 #if defined(__linux__)
     if (s.host_cpu >= 0 && sched_getcpu() != s.host_cpu) { pin_thread(s.host_cpu); }
 #endif
+    if (s.item_barrier) { return help_items(s); }
     int phase = s.help_phase.load(std::memory_order_acquire);
     if ((phase != 1 && phase != 3) ||
         !s.help_phase.compare_exchange_strong(phase, phase + 4, std::memory_order_acq_rel)) { return false; }
