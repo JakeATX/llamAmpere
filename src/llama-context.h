@@ -501,7 +501,7 @@ private:
     // reuse the batch_allocr to avoid unnecessary memory allocations
     std::unique_ptr<llama_batch_allocr> balloc;
 
-    // Opt-in MTP catch-up translation storage, at most128MiB hidden payload.
+    // MTP catch-up translation storage (LLAMA_MTP_COMPAT_REUSE, default on), at most 128 MiB hidden payload.
     // Independent from ubatch/output memory; decode's allocr copies its contents.
     std::unique_ptr<llama_batch_ext> mtp_compat_reuse;
 

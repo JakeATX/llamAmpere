@@ -9990,7 +9990,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
 int llama_context::decode(const llama_batch & batch_inp) {
     static const bool reuse_enabled = [] {
         const char * value = std::getenv("LLAMA_MTP_COMPAT_REUSE");
-        return value && std::strcmp(value, "1") == 0;
+        return !(value && std::strcmp(value, "0") == 0); // default on; 0 turns it off
     }();
     if (reuse_enabled && cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
             !cparams.training && !cparams.embeddings && !cparams.mtp_chain && !ple_pf &&
