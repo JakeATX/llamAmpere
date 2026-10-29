@@ -2369,7 +2369,8 @@ void llama_context::sched_reserve(bool suspend_prompt_cache) {
             size_t free = 0, total = 0;
             ggml_backend_dev_memory(dev, &free, &total);
             const size_t card_limit = (size_t) 23552 << 20;
-            const size_t headroom = std::max<size_t>(256u << 20, total > card_limit ? total - card_limit + (64u << 20) : 0);
+            // fork: graph sizing excludes CUDA kernel temporaries during cached-prompt turns.
+            const size_t headroom = std::max<size_t>(512u << 20, total > card_limit ? total - card_limit + (512u << 20) : 0);
             const size_t need = required[i] + headroom;
             trim += need > free ? need - free : 0;
         }
