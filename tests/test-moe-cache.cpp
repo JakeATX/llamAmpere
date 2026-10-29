@@ -4507,7 +4507,7 @@ static bool run_swap_whole(ggml_backend_t gpu, ggml_backend_t cpu, log_capture &
                     "GGML_MOE_CACHE_DEVICE", "GGML_MOE_CACHE_DEVICE_STATS", "GGML_MOE_CACHE_DEVICE_CAPTURE",
                     "GGML_MOE_CACHE_PROFILE_SAVE", "GGML_MOE_CACHE_PROFILE_LOAD", "GGML_MOE_CACHE_PROFILE_GLOBAL",
                     "GGML_MOE_CACHE_PROFILE_PRIOR_PCT", "GGML_MOE_CACHE_SWAP", "GGML_MOE_CACHE_SWAP_WHOLE",
-                    "GGML_MOE_CACHE_SWAP_TOP_ONLY", "GGML_MOE_CACHE_SWAP_FREE_PROBE", "GGML_MOE_CACHE_SWAP_LAYER", "GGML_MOE_CACHE_SWAP_MAX", "GGML_MOE_CACHE_SWAP_MB",
+                    "GGML_MOE_CACHE_SWAP_TOP_ONLY", "GGML_MOE_CACHE_SWAP_FREE_PROBE", "GGML_MOE_CACHE_SWAP_COLD_PRUNE", "GGML_MOE_CACHE_SWAP_LAYER", "GGML_MOE_CACHE_SWAP_MAX", "GGML_MOE_CACHE_SWAP_MB",
                     "GGML_MOE_CACHE_SWAP_INTERVAL", "GGML_MOE_CACHE_SWAP_DECAY_PCT",
                     "GGML_MOE_CACHE_SWAP_DECAY_AFTER", "GGML_MOE_CACHE_SWAP_HYST_PCT",
                     "GGML_MOE_CACHE_SWAP_MARGIN_MILLI"}) {
@@ -4614,12 +4614,13 @@ static bool run_swap_whole(ggml_backend_t gpu, ggml_backend_t cpu, log_capture &
     if (!ok) {
         fprintf(stderr, "cache-swap-whole setup incompatible=%d failed at %s\n%s", incompatible, setup_stage, capture.get().c_str());
     }
-    std::vector<std::array<long long, 3>> decisions;
+    std::vector<std::array<long long, 4>> decisions;
     const int n_modes = incompatible ? 2 : 6;
-    for (int run = 0; run < 4 * n_modes && ok; ++run) {
+    for (int run = 0; run < 8 * n_modes && ok; ++run) {
         const int variant = run / n_modes, mode = run % n_modes;
         set_env("GGML_MOE_CACHE_SWAP_TOP_ONLY", variant & 1 ? "1" : "0");
         set_env("GGML_MOE_CACHE_SWAP_FREE_PROBE", variant & 2 ? "1" : "0");
+        set_env("GGML_MOE_CACHE_SWAP_COLD_PRUNE", variant & 4 ? "1" : "0");
         set_env("GGML_MOE_CACHE_SWAP", mode == 0 ? "0" : "1");
         set_env("GGML_MOE_CACHE_SWAP_WHOLE", "1");
         set_env("GGML_MOE_CACHE_SWAP_MAX", mode == 2 ? "2" : "3");
@@ -4675,10 +4676,10 @@ static bool run_swap_whole(ggml_backend_t gpu, ggml_backend_t cpu, log_capture &
             case_ok &= max_field_value(log, "evictions=") >= 3;
             case_ok &= max_field_value(log, "hits=") > max_field_value(log, "misses=");
         }
-        const std::array<long long, 3> decision = {swaps, max_field_value(log, "evictions="), max_field_value(log, "pairs=")};
+        const std::array<long long, 4> decision = {swaps, max_field_value(log, "evictions="), max_field_value(log, "pairs="), max_field_value(log, "candidates=")};
         if (variant == 0) { decisions.push_back(decision); }
         else { case_ok &= decision == decisions[mode]; }
-        printf("cache-swap-whole incompatible=%d mode=%d top_only=%d free_probe=%d: %s\n", incompatible, mode, variant & 1, (variant >> 1) & 1, case_ok ? "OK" : "FAIL");
+        printf("cache-swap-whole incompatible=%d mode=%d top_only=%d free_probe=%d cold_prune=%d: %s\n", incompatible, mode, variant & 1, (variant >> 1) & 1, (variant >> 2) & 1, case_ok ? "OK" : "FAIL");
         if (!case_ok) { fprintf(stderr, "%s", log.c_str()); }
         ok &= case_ok;
         ggml_free(graph_ctx);
