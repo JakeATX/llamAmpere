@@ -4909,6 +4909,36 @@ static bool run_device_tables_case(ggml_backend_t gpu, ggml_backend_t cpu,
         return false;
     }
     bool ok = true;
+    // Whole-expert residency builds device tables only for complete up/gate/down
+    // layers, so describe two same-shape siblings next to the tested tensor.
+    int layer = -1;
+    const char * suffix = strchr(weights->name + 4, '.');
+    ok &= sscanf(weights->name, "blk.%d.", &layer) == 1 && suffix != nullptr;
+    std::string sibling_names[2];
+    int n_siblings = 0;
+    for (const char * kind : {"ffn_up_exps.weight", "ffn_gate_exps.weight", "ffn_down_exps.weight"}) {
+        if (ok && strcmp(suffix + 1, kind) != 0 && n_siblings < 2) {
+            sibling_names[n_siblings++] = "blk." + std::to_string(layer) + "." + kind;
+        }
+    }
+    ok &= n_siblings == 2;
+    ggml_init_params sibling_params = {2 * ggml_tensor_overhead(), nullptr, true};
+    ggml_context * sibling_ctx = ggml_init(sibling_params);
+    ggml_tensor * siblings[2];
+    for (int i = 0; i < 2; ++i) {
+        siblings[i] = ggml_new_tensor_3d(sibling_ctx, weights->type, weights->ne[0], weights->ne[1], weights->ne[2]);
+        ggml_set_name(siblings[i], sibling_names[i].c_str());
+    }
+    ggml_backend_buffer_t sibling_buffer = ggml_backend_alloc_ctx_tensors(sibling_ctx, cpu);
+    ok &= sibling_buffer != nullptr;
+    if (ok) {
+        ggml_backend_buffer_set_usage(sibling_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        for (ggml_tensor * sibling : siblings) {
+            for (int64_t e = 0; e < weights->ne[2]; ++e) {
+                memcpy((char *)sibling->data + e * sibling->nb[2], (const char *)weights->data + e * weights->nb[2], sibling->nb[2]);
+            }
+        }
+    }
     for (int route_mode : {0, 1, 2}) {
     for (int tokens : {1, 4}) {
         for (int channels : {1, 2}) {
@@ -4942,13 +4972,17 @@ static bool run_device_tables_case(ggml_backend_t gpu, ggml_backend_t cpu,
             ggml_backend_t backends[] = {gpu, cpu};
             ggml_backend_sched_t scheduler = ggml_backend_sched_new(backends, nullptr, 2,
                     GGML_DEFAULT_GRAPH_SIZE, false, false);
-            const ggml_moe_cache_tensor_desc descriptor = {weights->name, weights->data,
-                weights->nb[2], weights->ne[0], weights->ne[1], weights->ne[2], (int32_t) weights->type};
+            ggml_tensor * described[] = {weights, siblings[0], siblings[1]};
+            ggml_moe_cache_tensor_desc descriptors[3];
+            for (int i = 0; i < 3; ++i) {
+                const ggml_tensor * t = described[i];
+                descriptors[i] = {t->name, t->data, t->nb[2], t->ne[0], t->ne[1], t->ne[2], (int32_t) t->type};
+            }
             std::vector<uint64_t> usage(weights->ne[2], 0);
             usage[0] = 100;
-            const uint64_t * counts[] = {usage.data()};
-            ok &= ggml_backend_sched_moe_cache_warm(scheduler, &descriptor, counts, 1) == 1;
-            const bool prepared = ggml_backend_sched_moe_cache_device_prepare(scheduler, &descriptor, 1) == 1;
+            const uint64_t * counts[] = {usage.data(), usage.data(), usage.data()};
+            ok &= sibling_buffer && ggml_backend_sched_moe_cache_warm(scheduler, descriptors, counts, 3) > 0;
+            const bool prepared = sibling_buffer && ggml_backend_sched_moe_cache_device_prepare(scheduler, descriptors, 3) == 1;
             ok &= prepared != unsupported;
             if (unsupported) {
                 // A failed opt-in must leave CPU scheduling and the legacy
@@ -4999,16 +5033,10 @@ static bool run_device_tables_case(ggml_backend_t gpu, ggml_backend_t cpu,
                     ok &= max_field_value(log, "new_copy_bytes=") > 0;
                     ok &= max_field_value(log, "new_registered_bytes=") == 0;
                 }
-                if (route_mode == 0) {
-                    ok &= max_field_value(log, "hits=") == 6 * tokens;
-                    ok &= max_field_value(log, "misses=") == 0;
-                } else if (route_mode == 1) {
-                    ok &= max_field_value(log, "hits=") == 0;
-                    ok &= max_field_value(log, "misses=") == 6 * tokens;
-                } else {
-                    ok &= max_field_value(log, "hits=") > 0;
-                    ok &= max_field_value(log, "misses=") > 0;
-                }
+                // Whole-only warm admits complete experts hottest first (expert 0) until
+                // the budget is full, so only all-expert-0 routing must hit everywhere.
+                ok &= max_field_value(log, "hits=") + max_field_value(log, "misses=") == 6 * tokens;
+                ok &= route_mode != 0 || max_field_value(log, "misses=") == 0;
             }
             ggml_backend_buffer_free(candidate.buffer);
             ggml_free(candidate.ctx);
@@ -5022,6 +5050,10 @@ static bool run_device_tables_case(ggml_backend_t gpu, ggml_backend_t cpu,
         }
     }
     }
+    if (sibling_buffer) {
+        ggml_backend_buffer_free(sibling_buffer);
+    }
+    ggml_free(sibling_ctx);
     set_env("GGML_MOE_CACHE_DEVICE", nullptr);
     set_env("GGML_MOE_CACHE_DEVICE_STATS", nullptr);
     printf("cache-device-tables type=%s mode=%s: %s\n", ggml_type_name(weights->type),
@@ -5040,7 +5072,7 @@ static bool run_device_pageable_fallback(ggml_backend_t gpu, ggml_backend_t cpu,
     void * data = (void *)((((uintptr_t)allocation + page - 1) & ~(page - 1)) + 64);
     ggml_init_params params{ggml_tensor_overhead(), nullptr, true};
     auto * ctx = ggml_init(params);
-    auto * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_Q4_0, 32, 8, 3);
+    auto * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_Q4_0, 256, 8, 3);
     ggml_set_name(weights, "blk.7.ffn_up_exps.weight");
     const size_t packed_bytes = ggml_nbytes(weights);
     const size_t expert_bytes = weights->nb[2];
@@ -5067,7 +5099,7 @@ static bool run_device_pageable_fallback(ggml_backend_t gpu, ggml_backend_t cpu,
         ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
         std::vector<float> values(ggml_nelements(weights), 0.125f);
         std::vector<uint8_t> packed(packed_bytes);
-        ok &= ggml_quantize_chunk(weights->type, values.data(), packed.data(), 0, 24, 32, nullptr) == packed_bytes;
+        ok &= ggml_quantize_chunk(weights->type, values.data(), packed.data(), 0, 24, 256, nullptr) == packed_bytes;
         for (size_t e = 0; e < 3; ++e) {
             memcpy((char *)data + e * weights->nb[2], packed.data() + e * expert_bytes, expert_bytes);
         }
