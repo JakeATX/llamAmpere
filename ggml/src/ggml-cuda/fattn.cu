@@ -2660,10 +2660,21 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
     const int ncols1_gather = (ncols1 > 1 && ncols2 == 16 && K->ne[0] == 256) ? 8 : ncols1;
     const int64_t n_gather = (ncols1_gather == 1 ? std::min<int64_t>(Q->ne[1], 64/ncols2) : ncols1_gather) * (int64_t) n_kv_max;
 
+    // GGML_CUDA_FA_SPARSE_MIN_KV=<cells>: prompt batches (>= 256 queries) gather once the cache holds that many cells
+    // (never under 2x the selected cells). The default rule needs 2x the union bound of a whole tile (32768 cells for
+    // 8 queries x 2048), which leaves the first two 12288-row ubatches of a 100K prompt on the dense kernel: measured
+    // 33 and ~92 ms per attention layer vs ~22 ms gathered. Same mask, so only the summation order changes.
+    static const int64_t min_kv_env = [] {
+        const char * value = getenv("GGML_CUDA_FA_SPARSE_MIN_KV");
+        return value ? std::max<int64_t>(0, atoll(value)) : 0;
+    }();
+    const int64_t min_kv = min_kv_env > 0 && Q->ne[1] >= 256 ?
+        std::max<int64_t>(min_kv_env, 2*(int64_t) n_kv_max) : std::max<int64_t>(4096, 2*n_gather);
+
     return GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) &&
         mask != nullptr && n_kv_max > 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
         mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1 &&
-        K->ne[1] >= std::max<int64_t>(4096, 2*n_gather);
+        K->ne[1] >= min_kv;
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 }
 
