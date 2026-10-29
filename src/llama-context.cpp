@@ -7491,10 +7491,12 @@ bool llama_context::b1_run_prefix(llama_memory_context_i * mctx, size_t ub0, ggm
     const size_t  ub1     = b1->group_end(ub0);
     const llm_graph_type gtype = ctx_type_to_graph_type(cparams.ctx_type);
     // Opt-in host timeline: no extra device waits or changes to graph execution.
-    static const bool pp_layers = [] {
+    // 2 = also print every ubatch of every layer (1 prints ubatches of layers 0-1 only).
+    static const int pp_level = [] {
         const char * e = getenv("LLAMA_PP_LAYERS");
-        return e && atoi(e) != 0;
+        return e ? atoi(e) : 0;
     }();
+    static const bool pp_layers = pp_level != 0;
 
     status = GGML_STATUS_FAILED;
     for (int32_t l0 = 0; l0 < l_final; ) {
@@ -7523,12 +7525,14 @@ bool llama_context::b1_run_prefix(llama_memory_context_i * mctx, size_t ub0, ggm
                 b1->ubatch_home(l0, true);
             }
             const int64_t t_compute0 = ggml_time_us();
+            const int64_t u_inputs0 = b1_pp_inputs_us, u_submit0 = b1_pp_submit_us;
             const auto * res = process_ubatch(mctx->get_ubatch(), gtype, mctx, status);
             const int64_t compute_us = ggml_time_us() - t_compute0;
             b1_compute_submit_us += compute_us;
             b1->pass_compute(u, compute_us);
-            if (pp_layers && l0 < 2) {
-                LLAMA_LOG_INFO("%s: [PP] layer=%d ubatch=%zu graph_host_ms=%.3f\n", __func__, l0, u, compute_us / 1000.0);
+            if (pp_level >= 2 || (pp_layers && l0 < 2)) {
+                LLAMA_LOG_INFO("%s: [PP] layer=%d ubatch=%zu graph_host_ms=%.3f inputs_ms=%.3f submit_ms=%.3f\n", __func__, l0, u,
+                        compute_us / 1000.0, (b1_pp_inputs_us - u_inputs0) / 1000.0, (b1_pp_submit_us - u_submit0) / 1000.0);
             }
             if (home) {
                 b1->ubatch_home(l0, false);
