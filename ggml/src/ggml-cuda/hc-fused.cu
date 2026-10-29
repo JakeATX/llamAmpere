@@ -27,8 +27,7 @@
 
 static constexpr int HCF_CHUNK      = 512;  // columns per split-K chunk; n_embd must be a multiple
 static constexpr int HCF_DOWN_WARPS = 8;
-static constexpr int HCF_DOWN_ROWS  = 4;    // rows per warp
-static constexpr int HCF_DOWN_RPB   = HCF_DOWN_WARPS*HCF_DOWN_ROWS;
+static constexpr int HCF_DOWN_ROWS_DEF = 4;  // rows per warp (default; LLAMA_HC_DOWN_ROWS=1|2 gives more, smaller CTAs)
 static constexpr int HCF_UP_WARPS   = 16;   // embedding columns per CTA
 static constexpr int HCF_MAX_T      = 8;
 
@@ -76,7 +75,7 @@ static __device__ __forceinline__ float4 hcf_post_val4(const hcf_post_fold & pf,
 // ssq [row block][n_chunks][T]    partial sums of x^2 (only row block 0 when cnt == nullptr)
 // cnt != nullptr: the last CTA to finish a row block (over all chunks) also runs the finish for its 32 rows
 // (same sums in the same order as hcf_down_finish, so the result is bit-identical to the two-kernel path).
-template <int T, bool FOLD>
+template <int T, bool FOLD, int HCF_DOWN_ROWS>
 static __global__ void __launch_bounds__(HCF_DOWN_WARPS*WARP_SIZE)
 hcf_down_partial(
         const float * __restrict__ x, const float * __restrict__ wn,
@@ -100,7 +99,7 @@ hcf_down_partial(
     // each lane covers 4 columns in each of 4 groups of 128 (8-byte loads, a 256-byte span per warp per group);
     // the weight loads go out first so their DRAM latency overlaps the activation staging below
     constexpr int NG = HCF_CHUNK/128;
-    const int k_base = blockIdx.x*HCF_DOWN_RPB + warp*HCF_DOWN_ROWS;
+    const int k_base = blockIdx.x*(HCF_DOWN_WARPS*HCF_DOWN_ROWS) + warp*HCF_DOWN_ROWS;
 
     uint2 w[HCF_DOWN_ROWS][NG];
 #pragma unroll
@@ -248,8 +247,8 @@ hcf_down_partial(
     }
     __syncthreads();
 
-    for (int o = threadIdx.x; o < HCF_DOWN_RPB*T; o += blockDim.x) {
-        const int k = blockIdx.x*HCF_DOWN_RPB + o / T;
+    for (int o = threadIdx.x; o < (HCF_DOWN_WARPS*HCF_DOWN_ROWS)*T; o += blockDim.x) {
+        const int k = blockIdx.x*(HCF_DOWN_WARPS*HCF_DOWN_ROWS) + o / T;
         const int t = o % T;
         if (k >= n_rows) {
             continue;
@@ -552,7 +551,15 @@ static void hcf_down_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, 
     const int R        = (int) wd->ne[1];
     const int n_rows   = R + hc_inj;
     const int n_chunks = hc_dim/HCF_CHUNK;
-    const int n_rb     = (n_rows + HCF_DOWN_RPB - 1)/HCF_DOWN_RPB;
+    // rows per warp: 4 by default; LLAMA_HC_DOWN_ROWS=2|1 launches 2x|4x as many CTAs (the same per-row sums in the
+    // same order, so the result is bit-identical). The counter slots hold 64 row blocks, so a larger count falls back.
+    static const int rows_env = [] {
+        const char * e = getenv("LLAMA_HC_DOWN_ROWS");
+        const int v = e ? atoi(e) : HCF_DOWN_ROWS_DEF;
+        return v == 1 || v == 2 ? v : HCF_DOWN_ROWS_DEF;
+    }();
+    const int rows_pw = (n_rows + HCF_DOWN_WARPS*rows_env - 1)/(HCF_DOWN_WARPS*rows_env) <= HCF_CNT_RB ? rows_env : HCF_DOWN_ROWS_DEF;
+    const int n_rb     = (n_rows + HCF_DOWN_WARPS*rows_pw - 1)/(HCF_DOWN_WARPS*rows_pw);
 
     GGML_ASSERT(((uintptr_t) x->data) % 16 == 0 && ((uintptr_t) wn->data) % 16 == 0);
     GGML_ASSERT(hc == 4);
@@ -577,7 +584,9 @@ static void hcf_down_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, 
         pf.sp1  = hpost->src[2]->nb[1]/sizeof(float);
         GGML_ASSERT(pf.h == x->data);
     }
-    auto kernel = hpost != nullptr ? hcf_down_partial<T, true> : hcf_down_partial<T, false>;
+    auto kernel = hpost != nullptr ?
+        (rows_pw == 1 ? hcf_down_partial<T, true, 1> : rows_pw == 2 ? hcf_down_partial<T, true, 2> : hcf_down_partial<T, true, HCF_DOWN_ROWS_DEF>) :
+        (rows_pw == 1 ? hcf_down_partial<T, false, 1> : rows_pw == 2 ? hcf_down_partial<T, false, 2> : hcf_down_partial<T, false, HCF_DOWN_ROWS_DEF>);
     kernel<<<grid, HCF_DOWN_WARPS*WARP_SIZE, 0, stream>>>(
         (const float *) x->data, (const float *) wn->data,
         (const char *) wd->data, wd->nb[1],
