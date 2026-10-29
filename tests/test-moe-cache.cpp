@@ -4661,7 +4661,8 @@ static bool run_swap_whole(ggml_backend_t gpu, ggml_backend_t cpu, log_capture &
         const std::string log = capture.get();
         const long long swaps = max_field_value(log, " swaps=");
         if (mode == 0) { case_ok &= swaps <= 0; }
-        else if (mode != 5) { case_ok &= (mode == 1 || mode == 6) && !incompatible ? swaps == 3 : swaps == 0; }
+        // Layer 1 routes two cold experts (32, 31): both get admitted whole, 3 projections each.
+        else if (mode != 5) { case_ok &= (mode == 1 || mode == 6) && !incompatible ? swaps == 6 : swaps == 0; }
         if (mode != 0 && mode != 5) {
             case_ok &= log.find("whole swap initial:") != std::string::npos;
             case_ok &= log.find("partial=0") != std::string::npos;
