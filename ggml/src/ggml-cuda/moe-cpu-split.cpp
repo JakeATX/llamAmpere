@@ -18,6 +18,7 @@
 #include "../ggml-common.h"
 #include "moe-iq-rows.h"
 #include "../ggml-cpu/quants.h"
+#include "../ggml-cpu/vec.h"
 
 #include <algorithm>
 #include <atomic>
@@ -433,6 +434,7 @@ struct pool_state {
     size_t hq_stride = 0;
     bool avx512 = false;       // GGML_MOE_CPU_SPLIT_AVX512 and the CPU has AVX-512 F/BW/VL/VNNI
     bool q2_pair = false;      // Share Q2 down weights between two routes of one expert.
+    bool vector_silu = false;  // Use the CPU backend's vector activation in grouped up/gate tiles.
     bool q2_fast = false;      // GGML_MOE_CPU_SPLIT_Q2_FAST: reordered hidden rows + dot_q2_0_rows for Q2_0 down
     size_t aux_stride = 0;     // floats per route in hq_aux: n/32 block scales, then n/64 offsets
     std::vector<float> hq_aux;
@@ -544,9 +546,16 @@ void run_item(pool_state & s, int phase, int item) {
                         for (int t = 0; t < nt; ++t) { for (int k = 0; k < 16; ++k) { ub[t][k] = 0.0f; gb[t][k] = 0.0f; } }
                     }
                     for (int t = 0; t < nt; ++t) {
+                        float * h = s.hidden.data() + (size_t) (q0 + t) * s.max_ff + a;
+                        if (s.vector_silu) {
+                            // fork: same SiLU function as the CPU backend, with its vector rounding.
+                            ggml_vec_silu_f32((int) (b - a), h, gb[t]);
+                            for (int k = 0; k < b - a; ++k) { h[k] *= ub[t][k]; }
+                            continue;
+                        }
                         for (int64_t row = a; row < b; ++row) {
                             const float u = ub[t][row - a], g = gb[t][row - a];
-                            s.hidden[(size_t) (q0 + t) * s.max_ff + row] = g / (1.0f + expf(-g)) * u;
+                            h[row - a] = g / (1.0f + expf(-g)) * u;
                         }
                     }
                 }
@@ -880,6 +889,7 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
     s.hidden.assign((size_t) MOE_CS_MAX_ROUTES * max_ff, 0.0f);
     s.hq.assign(MOE_CS_MAX_ROUTES * s.hq_stride, 0);
     s.q2_pair = env_int("GGML_MOE_CPU_SPLIT_Q2_PAIR", 0, 0, 1) != 0;
+    s.vector_silu = env_int("GGML_MOE_CPU_SPLIT_VECTOR_SILU", 0, 0, 1) != 0;
     s.q2_fast = env_int("GGML_MOE_CPU_SPLIT_Q2_FAST", 0, 0, 1) != 0;
     s.q8_reuse = env_int("GGML_MOE_CPU_SPLIT_Q8_REUSE", 1, 0, 1) != 0;
     s.down_reuse = env_int("GGML_MOE_CPU_SPLIT_DOWN_REUSE", 1, 0, 1) != 0;
@@ -992,6 +1002,7 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
             s.threads, pin ? "pinned to cpus " : "unpinned", where.c_str(), skipped.c_str(), s.spin_us, s.nap_us, s.rows_ug, s.rows_down,
             s.q2_fast ? ", Q2_0 down fast path" : "", smt ? ", SMT siblings" : "", s.avx512 ? ", grouped AVX-512 VNNI IQ" : "");
     if (s.q2_pair && s.q2_fast) { fprintf(stderr, "[moe-cpu-split] Q2_0 down shares weights across route pairs\n"); }
+    if (s.vector_silu && s.iq_rows) { fprintf(stderr, "[moe-cpu-split] grouped up/gate uses CPU vector SiLU\n"); }
     if (s.iq_rows) { fprintf(stderr, "[moe-cpu-split] IQ up/gate row kernels (each chunk decoded once per expert), variant %d, prefetch %d B\n", s.iq_variant, s.iq_pf); }
     if (s.schedule) { fprintf(stderr, "[moe-cpu-split] static quantization rows, grouped math claims\n"); }
     if (s.host_help) { fprintf(stderr, "[moe-cpu-split] waiting host drains math tiles on cpu %d\n", s.host_cpu); }
