@@ -163,7 +163,7 @@ void q2_reorder_hidden(int n, block_q8_0 * y, float * yd, float * yc, bool shuff
 
 template<int NT>
 void dot_q2_0_rows(int n, int nrows, const char * w, size_t row_bytes, const block_q8_0 * y, size_t y_stride,
-        const float * yd, const float * yc, size_t aux_stride, float * out, size_t out_stride) {
+        const float * yd, const float * yc, size_t aux_stride, float * out, size_t out_stride, int ahead) {
     const int nb = n / QK2_0;
 #if defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
     const __m256i shifts = _mm256_set_epi64x(6, 4, 2, 0);
@@ -189,6 +189,10 @@ void dot_q2_0_rows(int n, int nrows, const char * w, size_t row_bytes, const blo
             }
             for (int k = 0; k < nr; ++k) {
                 const block_q2_0 * x = (const block_q2_0 *) (w + (size_t) (r + k) * row_bytes) + i;
+                if (ahead > 0 && i + ahead < nb && (i & 3) == 0) {
+                    _mm_prefetch((const char *) (x + ahead), _MM_HINT_T0);
+                    _mm_prefetch((const char *) (x + ahead + 1) - 1, _MM_HINT_T0);
+                }
                 const float d = _cvtsh_ss(x->d);
                 long long c0, c1;
                 memcpy(&c0, x->qs, 8);
@@ -209,6 +213,7 @@ void dot_q2_0_rows(int n, int nrows, const char * w, size_t row_bytes, const blo
         }
     }
 #else
+    (void) ahead;
     for (int t = 0; t < NT; ++t) {
         const auto * yt = (const block_q8_0 *) ((const char *) y + (size_t) t * y_stride);
         for (int r = 0; r < nrows; ++r) {
@@ -462,6 +467,7 @@ struct pool_state {
     bool vector_silu = false;  // Use the CPU backend's vector activation in grouped up/gate tiles.
     bool q2_fast = false;      // GGML_MOE_CPU_SPLIT_Q2_FAST: reordered hidden rows + dot_q2_0_rows for Q2_0 down
     bool q2_shuffle = false;   // Use AVX2 to reorder hidden bytes, with the same integer sums.
+    int q2_pf = 0;             // Q2 down prefetch distance in weight blocks; zero disables it.
     size_t aux_stride = 0;     // floats per route in hq_aux: n/32 block scales, then n/64 offsets
     std::vector<float> hq_aux;
     int rows_ug = 16, rows_down = 64;
@@ -622,19 +628,19 @@ void run_item(pool_state & s, int phase, int item) {
             const auto * y = (const block_q8_0 *) (s.hq.data() + (size_t) q * s.hq_stride);
             if (s.q2_group4 && q + 3 < s.first[i + 1]) {
                 dot_q2_0_rows<4>((int) down.r.n_in, (int) (r1 - r0), w, down.r.row_bytes, y, s.hq_stride,
-                        aux, aux + down.r.n_in / QK8_0, s.aux_stride, o, s.out_stride);
+                        aux, aux + down.r.n_in / QK8_0, s.aux_stride, o, s.out_stride, s.q2_pf);
                 q += 4;
             } else if (s.q2_group4 && q + 2 < s.first[i + 1]) {
                 dot_q2_0_rows<3>((int) down.r.n_in, (int) (r1 - r0), w, down.r.row_bytes, y, s.hq_stride,
-                        aux, aux + down.r.n_in / QK8_0, s.aux_stride, o, s.out_stride);
+                        aux, aux + down.r.n_in / QK8_0, s.aux_stride, o, s.out_stride, s.q2_pf);
                 q += 3;
             } else if (s.q2_pair && q + 1 < s.first[i + 1]) {
                 dot_q2_0_rows<2>((int) down.r.n_in, (int) (r1 - r0), w, down.r.row_bytes, y, s.hq_stride,
-                        aux, aux + down.r.n_in / QK8_0, s.aux_stride, o, s.out_stride);
+                        aux, aux + down.r.n_in / QK8_0, s.aux_stride, o, s.out_stride, s.q2_pf);
                 q += 2;
             } else {
                 dot_q2_0_rows<1>((int) down.r.n_in, (int) (r1 - r0), w, down.r.row_bytes, y, s.hq_stride,
-                        aux, aux + down.r.n_in / QK8_0, s.aux_stride, o, s.out_stride);
+                        aux, aux + down.r.n_in / QK8_0, s.aux_stride, o, s.out_stride, s.q2_pf);
                 ++q;
             }
         }
@@ -927,6 +933,7 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
     s.vector_silu = env_int("GGML_MOE_CPU_SPLIT_VECTOR_SILU", 0, 0, 1) != 0;
     s.q2_fast = env_int("GGML_MOE_CPU_SPLIT_Q2_FAST", 0, 0, 1) != 0;
     s.q2_shuffle = env_int("GGML_MOE_CPU_SPLIT_Q2_SHUFFLE", 0, 0, 1) != 0;
+    s.q2_pf = env_int("GGML_MOE_CPU_SPLIT_Q2_PF", 0, 0, 64);
     s.q8_reuse = env_int("GGML_MOE_CPU_SPLIT_Q8_REUSE", 1, 0, 1) != 0;
     s.down_reuse = env_int("GGML_MOE_CPU_SPLIT_DOWN_REUSE", 1, 0, 1) != 0;
     s.group_tokens = env_int("GGML_MOE_CPU_SPLIT_REUSE8", 1, 0, 1) ? 8 : 4;
