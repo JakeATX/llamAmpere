@@ -45,6 +45,7 @@
 //   GGML_CUDA_AI23_ID_STAGES=2|3  routed rate-2/3 prompt staging depth (default 3)
 //   GGML_CUDA_AI23_ID_SLABS=4|8  routed rate-2/3 prompt row slabs per block (default 8)
 //   GGML_CUDA_AI23_ID_ROUTE_AGG=1  combine routed prompt counter updates within each warp (default off)
+//   GGML_CUDA_AI23_ID_FIXED_LOAD=1  unroll fixed-size routed prompt staging copies (default off)
 //   GGML_CUDA_AI23_DENSE_TILE=1..29  dense shared-activation tile controls for 9..64 tokens (default off)
 //                             22/23 swap quantized activation halves to avoid LDS64 bank conflicts
 //   GGML_CUDA_AI23_XPERM=1  vector activation loads for whole-row dense rate-2 kernels (default off)
@@ -1022,6 +1023,22 @@ static bool ai4_mmvid_route(int n_tok, int n_used, int n_expert, int rate) {
     return (double) n_used*n_tok <= p*act;
 }
 
+// Reuse the fixed-size staging loop already used by dense kernels. The routed
+// variant changes copy instruction scheduling only; row selection and K order stay the same.
+template <int BN, int STAGES, int LAY, int XSH, int SLABS = ai4k::GEMM_SLABS>
+static void ai23_launch_id_shape(const uint8_t * W, const int8_t * q, const float * s, float * Y, int M, int K,
+                                  cudaStream_t stream, const ai4k::idmap & idm, int max_tiles) {
+    static const bool fixed_load = ai4_env_int("GGML_CUDA_AI23_ID_FIXED_LOAD", nullptr, 0) != 0;
+    if (fixed_load) {
+        ai23_launch_gemm<BN, STAGES, 4, LAY, XSH, true, 1, SLABS,
+                        false, 1, false, false, false, false, false, false, true>(
+                W, q, s, Y, M, M, 0, K, stream, idm, max_tiles);
+    } else {
+        ai23_launch_gemm<BN, STAGES, 4, LAY, XSH, true, 1, SLABS>(
+                W, q, s, Y, M, M, 0, K, stream, idm, max_tiles);
+    }
+}
+
 template <int BN, int LAY, int XSH>
 static void ai23_launch_id_gemm(const uint8_t * W, const int8_t * q, const float * s, float * Y, int M, int K,
                                  cudaStream_t stream, const ai4k::idmap & idm, int max_tiles) {
@@ -1044,18 +1061,22 @@ static void ai23_launch_id_gemm(const uint8_t * W, const int8_t * q, const float
         }();
         if (slabs == 4) {
             if (stages == 2) {
-                ai23_launch_gemm<BN, 2, 4, LAY, XSH, true, 1, 4>(W, q, s, Y, M, M, 0, K, stream, idm, max_tiles);
+                ai23_launch_id_shape<BN, 2, LAY, XSH, 4>(W, q, s, Y, M, K, stream, idm, max_tiles);
             } else {
-                ai23_launch_gemm<BN, 3, 4, LAY, XSH, true, 1, 4>(W, q, s, Y, M, M, 0, K, stream, idm, max_tiles);
+                ai23_launch_id_shape<BN, 3, LAY, XSH, 4>(W, q, s, Y, M, K, stream, idm, max_tiles);
             }
             return;
         }
         if (stages == 2) {
-            ai23_launch_gemm<BN, 2, 4, LAY, XSH, true>(W, q, s, Y, M, M, 0, K, stream, idm, max_tiles);
+            ai23_launch_id_shape<BN, 2, LAY, XSH>(W, q, s, Y, M, K, stream, idm, max_tiles);
             return;
         }
     }
-    ai23_launch_gemm<BN, 3, 4, LAY, XSH, true>(W, q, s, Y, M, M, 0, K, stream, idm, max_tiles);
+    if constexpr (ai4k::lay_rate<LAY>() == 2 || ai4k::lay_rate<LAY>() == 3) {
+        ai23_launch_id_shape<BN, 3, LAY, XSH>(W, q, s, Y, M, K, stream, idm, max_tiles);
+    } else {
+        ai23_launch_gemm<BN, 3, 4, LAY, XSH, true>(W, q, s, Y, M, M, 0, K, stream, idm, max_tiles);
+    }
 }
 
 template <int LAY, int XSH>
