@@ -1400,9 +1400,9 @@ std::vector<double> common_sampler_pq_mode_distribution(const llama_token_data_a
     return law;
 }
 
-template<bool cache_q>
+template<bool cache_q, bool beat>
 static common_sampler_pq_result common_sampler_verify_pq_impl(const llama_token_data_array & p, const std::vector<llama_token_data> & q,
-        llama_token d, llama_token x, std::mt19937 & rng, bool beat, common_sampler_pq_stats & stats,
+        llama_token d, llama_token x, std::mt19937 & rng, common_sampler_pq_stats & stats,
         const llama_vocab * vocab, const std::function<bool(llama_token)> & is_stop) {
     auto q_of = [&](llama_token id) -> double {
         for (const auto & c : q) {
@@ -1501,9 +1501,11 @@ common_sampler_pq_result common_sampler_verify_pq(const llama_token_data_array &
         const llama_vocab * vocab, const std::function<bool(llama_token)> & is_stop) {
     // Tiny supports cost less to scan again than to materialize a probability cache.
     if (p.size <= 4) {
-        return common_sampler_verify_pq_impl<false>(p, q, d, x, rng, beat, stats, vocab, is_stop);
+        return beat ? common_sampler_verify_pq_impl<false, true>(p, q, d, x, rng, stats, vocab, is_stop) :
+                      common_sampler_verify_pq_impl<false, false>(p, q, d, x, rng, stats, vocab, is_stop);
     }
-    return common_sampler_verify_pq_impl<true>(p, q, d, x, rng, beat, stats, vocab, is_stop);
+    return beat ? common_sampler_verify_pq_impl<true, true>(p, q, d, x, rng, stats, vocab, is_stop) :
+                  common_sampler_verify_pq_impl<true, false>(p, q, d, x, rng, stats, vocab, is_stop);
 }
 
 std::vector<llama_token> common_sampler_sample_and_accept_n_pq(struct common_sampler * gsmpl, struct llama_context * ctx,
