@@ -421,6 +421,9 @@ static bool moe_cache_keep_prompt() {
 #endif
 }
 
+// time spent mapping/unmapping prompt slab chunks, reported by the loan and return log lines
+static std::atomic<int64_t> g_prompt_slab_us{0};
+
 struct moe_cache_prompt_slab {
 #if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP)
     static constexpr size_t capacity = 1ull << 35;
@@ -441,31 +444,47 @@ struct moe_cache_prompt_slab {
         if (!address || bytes > capacity || bytes > SIZE_MAX - chunk + 1) { return false; }
         const size_t wanted = (bytes + chunk - 1) / chunk * chunk;
         const size_t before = mapped;
+        const int64_t t0 = ggml_time_us();
+        // GGML_MOE_CACHE_VMM_BATCH=1: one access call (and one unmap) over the whole changed range instead of one
+        // per 16 MiB chunk; same chunks, same addresses
+        const bool batch = vmm_batch();
+        CUmemAccessDesc access = {};
+        access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        access.location.id = physical;
+        access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
         while (mapped < wanted) {
             CUmemAllocationProp prop = {};
             prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
-            prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-            prop.location.id = physical;
+            prop.location = access.location;
             CUmemGenericAllocationHandle handle;
             if (cuMemCreate(&handle, chunk, &prop, 0) != CUDA_SUCCESS) { resize(before); return false; }
             const CUresult result = cuMemMap(address + mapped, chunk, 0, handle, 0);
             CU_CHECK(cuMemRelease(handle));
             if (result != CUDA_SUCCESS) { resize(before); return false; }
-            CUmemAccessDesc access = {};
-            access.location = prop.location;
-            access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-            if (cuMemSetAccess(address + mapped, chunk, &access, 1) != CUDA_SUCCESS) {
+            if (!batch && cuMemSetAccess(address + mapped, chunk, &access, 1) != CUDA_SUCCESS) {
                 CU_CHECK(cuMemUnmap(address + mapped, chunk));
                 resize(before);
                 return false;
             }
             mapped += chunk;
         }
+        if (batch && mapped > before && cuMemSetAccess(address + before, mapped - before, &access, 1) != CUDA_SUCCESS) {
+            resize(before);
+            return false;
+        }
+        if (batch && mapped > wanted && cuMemUnmap(address + wanted, mapped - wanted) == CUDA_SUCCESS) {
+            mapped = wanted;
+        }
         while (mapped > wanted) {
             CU_CHECK(cuMemUnmap(address + mapped - chunk, chunk));
             mapped -= chunk;
         }
+        g_prompt_slab_us.fetch_add(ggml_time_us() - t0);
         return true;
+    }
+    static bool vmm_batch() {
+        static const bool on = [] { const char * e = getenv("GGML_MOE_CACHE_VMM_BATCH"); return e && atoi(e) != 0; }();
+        return on;
     }
     char * data() const { return (char *) address; }
     size_t mapped_size() const { return mapped; }
@@ -5755,6 +5774,7 @@ static size_t moe_cache_lend(void * opaque, size_t bytes) {
         return 0;
     }
     const auto start = std::chrono::steady_clock::now();
+    const int64_t slab_us0 = g_prompt_slab_us.load();
     if (!moe_cache_profile_rerank(*session, start + std::chrono::seconds(30))) {
         return 0;
     }
@@ -5828,8 +5848,9 @@ static size_t moe_cache_lend(void * opaque, size_t bytes) {
                 freed += before - pool->prompt_slab->mapped_size();
                 retained += (size_t)pool->n_slots * pool->expert_size;
             }
-            MOE_CACHE_LOG("[moe-cache] prompt whole-layer loan: evicted_layers=%zu retained_bytes=%zu released_bytes=%zu ms=%.3f\n",
-                    evicted.size(), retained, freed, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+            MOE_CACHE_LOG("[moe-cache] prompt whole-layer loan: evicted_layers=%zu retained_bytes=%zu released_bytes=%zu ms=%.3f vmm_ms=%.3f\n",
+                    evicted.size(), retained, freed, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(),
+                    (g_prompt_slab_us.load() - slab_us0) / 1000.0);
         }
         if (freed) { session->prompt_loaned = true; }
         return freed;
@@ -5891,9 +5912,11 @@ static size_t moe_cache_return(void * opaque) {
         return 0;
     }
     const auto start = std::chrono::steady_clock::now();
+    const int64_t slab_us0 = g_prompt_slab_us.load();
     if (!moe_cache_profile_rerank(*session, start + std::chrono::seconds(30))) {
         return 0;
     }
+    const auto rerank_end = std::chrono::steady_clock::now();
     std::unique_lock<std::mutex> lock(session->mu);
     if (session->active_scopes || session->active_nodes || session->stopping) {
         return 0;
@@ -5950,8 +5973,9 @@ static size_t moe_cache_return(void * opaque) {
                 remaining -= std::min(remaining, after - before);
                 pool->prompt_slots = -1;
             }
-            MOE_CACHE_LOG("[moe-cache] retained prompt pools returned: restored_bytes=%zu survivor_H2D_bytes=0 ms=%.3f\n",
-                    restored, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+            MOE_CACHE_LOG("[moe-cache] retained prompt pools returned: restored_bytes=%zu survivor_H2D_bytes=0 ms=%.3f rerank_ms=%.3f vmm_ms=%.3f\n",
+                    restored, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(),
+                    std::chrono::duration<double, std::milli>(rerank_end - start).count(), (g_prompt_slab_us.load() - slab_us0) / 1000.0);
             continue;
         }
         long double weights = 0;
