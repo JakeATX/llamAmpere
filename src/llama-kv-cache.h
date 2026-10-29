@@ -653,6 +653,9 @@ private:
 
     void state_clear(llama_seq_id seq_id, uint32_t strm, const slot_info & sinfo);
 
+    // fork: the cells [i_beg, i_end) of stream s that seq_rm() scans for the positions [p0, p1) (p0 >= 0, p1 >= 0)
+    void seq_rm_cells(uint32_t s, llama_pos p0, llama_pos p1, uint32_t & i_beg, uint32_t & i_end) const;
+
     // SJ-KVaRN truncation into the sealed body (see the comment above sj_kvarn_truncate_body in llama-kv-cache.cpp)
     uint32_t sj_kvarn_floor_g(uint32_t pos) const;
     // [#197] the sealed-end schedule: B after one more ubatch starting in the grid cell at G (or at pos0 without grid)

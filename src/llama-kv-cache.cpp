@@ -1404,9 +1404,9 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
                 }
             }
         } else {
-            // fork: SJ-KVaRN positions never decrease along the cells, so only the cells [cell_of(p0), cell_of(p1)) can match
-            const uint32_t i_beg = sj_kvarn.enabled() ? sj_kvarn_cell_of(seq_to_stream[seq_id], p0) : 0;
-            const uint32_t i_end = sj_kvarn.enabled() ? sj_kvarn_cell_of(seq_to_stream[seq_id], p1) : cells.size();
+            uint32_t i_beg = 0;
+            uint32_t i_end = 0;
+            seq_rm_cells(seq_to_stream[seq_id], p0, p1, i_beg, i_end);
             for (uint32_t i = i_beg; i < i_end; ++i) {
                 if (!cells.pos_in(i, p0, p1)) {
                     continue;
@@ -1432,8 +1432,9 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 
             uint32_t new_head = cells.size();
 
-            const uint32_t i_beg = sj_kvarn.enabled() ? sj_kvarn_cell_of(s, p0) : 0; // fork: SJ-KVaRN, see above
-            const uint32_t i_end = sj_kvarn.enabled() ? sj_kvarn_cell_of(s, p1) : cells.size();
+            uint32_t i_beg = 0;
+            uint32_t i_end = 0;
+            seq_rm_cells(s, p0, p1, i_beg, i_end);
             for (uint32_t i = i_beg; i < i_end; ++i) {
                 if (!cells.pos_in(i, p0, p1)) {
                     continue;
@@ -1454,6 +1455,17 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     }
 
     return true;
+}
+
+void llama_kv_cache::seq_rm_cells(uint32_t s, llama_pos p0, llama_pos p1, uint32_t & i_beg, uint32_t & i_end) const {
+    // fork: SJ-KVaRN positions never decrease along the cells, so only the cells [cell_of(p0), cell_of(p1)) can match
+    if (sj_kvarn.enabled()) {
+        i_beg = sj_kvarn_cell_of(s, p0);
+        i_end = sj_kvarn_cell_of(s, p1);
+        return;
+    }
+
+    v_cells[s].pos_range(p0, p1, i_beg, i_end);
 }
 
 void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
