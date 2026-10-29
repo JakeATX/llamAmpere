@@ -9850,7 +9850,9 @@ static bool moe_hf_begin(ggml_backend_cuda_context & ctx, moe_cache_session & se
     args.stride = g_hf_stride;
     const int n_expert = (int) group[0]->desc.n_expert;
     // --moe-skip-tail: the cutoff masks go first on the side stream; the plan then sees left-out experts as resident.
-    const bool mass = session.mass_layer == table.mj_layer && session.mass_ids == ids->data;
+    const char * mass_policy = getenv("GGML_MOE_SKIP_POLICY");
+    const bool mass = session.skip_tail > 0 && mass_policy && strcmp(mass_policy, "rank") != 0 &&
+            session.mass_layer == table.mj_layer && session.mass_ids == ids->data;
     const bool tail = (mass || (session.skip_tail > 0 && (!getenv("GGML_MOE_SKIP_POLICY") || strcmp(getenv("GGML_MOE_SKIP_POLICY"), "rank") == 0))) && g_tail_mask && n_expert <= MOE_TAIL_MAX_EXPERT &&
             n_expert <= g_hf_experts && session.skip_tail < (int) ids->ne[0];
     session.tail_layer = tail ? table.mj_layer : -1;
