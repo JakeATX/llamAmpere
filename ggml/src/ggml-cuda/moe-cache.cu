@@ -2621,9 +2621,9 @@ static bool moe_cache_resize_pool(moe_cache_device & device, moe_cache_pool & po
 
 // Always-resident expert bank (ggml_moe_bank_*): those experts are computed by the bank call, never by the cache.
 // fork AIPNEXTK BANKSKIP: the hit/miss passes skip the bank experts' zero-weight routes (zeroed output) instead of
-// computing them from the zero block. GGML_MOE_BANK_SKIP=0 computes them as before.
+// computing them from the zero block. GGML_MOE_BANK_ZERO_SKIP=0 computes them as before.
 static bool moe_bank_skip_enabled() {
-    static const bool on = [] { const char * v = getenv("GGML_MOE_BANK_SKIP"); return v == nullptr || atoi(v) != 0; }();
+    static const bool on = [] { const char * v = getenv("GGML_MOE_BANK_ZERO_SKIP"); return v == nullptr || atoi(v) != 0; }();
     return on;
 }
 
@@ -11074,10 +11074,22 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
                         table.fallback[e] = alias;
                     }
                 } else {
-                    table.fallback[e] = table.borrowed ? (const char *)table.borrowed + (size_t)e * table.host_stride :
-                        mappings.find(begin, expert_bytes, &source_range);
+                    // Bank release leaves the cold experts pinned in separate ranges.
+                    void * alias = nullptr;
+                    void * last = nullptr;
+                    if (!table.borrowed && ggml_moe_bank_lookup(d.data) && !table.bank[e] &&
+                            cudaHostGetDevicePointer(&alias, (void *)begin, 0) == cudaSuccess &&
+                            cudaHostGetDevicePointer(&last, (void *)(begin + expert_bytes - 1), 0) == cudaSuccess &&
+                            (const char *)last == (const char *)alias + expert_bytes - 1) {
+                        table.fallback[e] = alias;
+                        table.copy_source[e] = (const void *)begin;
+                    } else {
+                        table.fallback[e] = table.borrowed ? (const char *)table.borrowed + (size_t)e * table.host_stride :
+                            mappings.find(begin, expert_bytes, &source_range);
+                    }
+                    (void)cudaGetLastError();
                 }
-                if (!table.permanent_sources && !table.borrowed && !address && table.fallback[e]) { retained_needed[source_range] = 1; }
+                if (!table.permanent_sources && !table.borrowed && !table.copy_source[e] && !address && table.fallback[e]) { retained_needed[source_range] = 1; }
                 if (!address && !table.fallback[e]) {
                     pending_ranges.push_back({begin & ~(page - 1),
                             (begin + expert_bytes + page - 1) & ~(page - 1), nullptr, nullptr, false});
@@ -11354,12 +11366,13 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
             for (size_t e = 0; e < table.addresses.size(); ++e) {
                 const uintptr_t host = (uintptr_t)table.desc.data + e * table.host_stride;
                 size_t source_range = 0;
-                if (!table.permanent_sources) {
+                const bool borrowed_expert = table.copy_source[e] != nullptr;
+                if (!table.permanent_sources && !borrowed_expert) {
                     table.fallback[e] = table.borrowed ? (const char *)table.borrowed + e * table.host_stride :
                         mappings.find(host, table.desc.expert_size, &source_range);
                 }
-                table.copy_source[e] = table.borrowed || (table.permanent_sources && table.fallback[e]) ? (const void *)host : nullptr;
-                if (table.fallback[e] && !table.borrowed && !table.permanent_sources) {
+                table.copy_source[e] = borrowed_expert || table.borrowed || (table.permanent_sources && table.fallback[e]) ? (const void *)host : nullptr;
+                if (table.fallback[e] && !borrowed_expert && !table.borrowed && !table.permanent_sources) {
                     // find() proved complete containment in this descriptor-bound
                     // retained range. Never use its CUDA alias as a host pointer.
                     const auto & range = session->mapped_ranges[source_range];
