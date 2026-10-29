@@ -254,14 +254,28 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    // Masked slots may be stale; neither backend may read them into the recurrence.
+    // Masked slots may be stale; test holes as well as accepted prefixes.
     for (int mode : {1, 2}) {
         const int64_t P = 4;
         const int64_t pw = ggml_gated_delta_net_ingr_width(S_v, 1, mode);
-        for (int64_t accepted = 0; accepted <= P; accepted++) {
+        for (unsigned pattern = 0; pattern < (1u << P); pattern++) {
             std::vector<float> ring(P * H * pw, NAN), mask(P, 0.0f);
-            for (int64_t t = 0; t < accepted; t++) {
+            std::vector<float> qp, kp, vp, gp, bp;
+            int64_t accepted = 0;
+            for (int64_t t = 0; t < P; t++) {
+                if ((pattern & (1u << t)) == 0) {
+                    continue;
+                }
+                accepted++;
                 mask[t] = 1.0f;
+                auto append = [&](std::vector<float> & dst, const std::vector<float> & src, int64_t width) {
+                    dst.insert(dst.end(), src.begin() + t * width, src.begin() + (t + 1) * width);
+                };
+                append(qp, q_full, S_v * H);
+                append(kp, k_full, S_v * H);
+                append(vp, v_full, S_v * H);
+                append(gp, g_full, H);
+                append(bp, beta_full, H);
                 for (int64_t h = 0; h < H; h++) {
                     float * slot = ring.data() + (t * H + h) * pw;
                     const float * src = out_ingr.data() + attn_N + t * snap_size + h * 4 * S_v;
@@ -276,27 +290,36 @@ int main(int argc, char ** argv) {
             }
             std::vector<float> base = s0;
             if (accepted > 0) {
-                auto prefix = run_gdn(backend.get(),
-                    slice(q_full, S_v * H, 0, accepted), slice(k_full, S_v * H, 0, accepted),
-                    slice(v_full, S_v * H, 0, accepted), slice(g_full, H, 0, accepted),
-                    slice(beta_full, H, 0, accepted), s0, S_v, H, accepted, 1, 0);
+                auto prefix = run_gdn(backend.get(), qp, kp, vp, gp, bp, s0, S_v, H, accepted, 1, 0);
                 base.assign(prefix.begin() + accepted * S_v * H, prefix.end());
             }
-            auto tail = [&](const std::vector<float> & initial, bool folded) {
-                return run_gdn(backend.get(),
-                    slice(q_full, S_v * H, P, N), slice(k_full, S_v * H, P, N), slice(v_full, S_v * H, P, N),
-                    slice(g_full, H, P, N), slice(beta_full, H, P, N), initial, S_v, H, N - P, 2, mode,
-                    folded ? ring : std::vector<float>{}, folded ? mask : std::vector<float>{});
-            };
-            auto expected = tail(base, false);
-            auto actual = tail(s0, true);
-            const size_t offset = (N - P) * S_v * H + ggml_gated_delta_net_ingr_region(S_v, 1, H, 1, 2, mode);
-            const float diff_attn = max_abs(actual.data(), expected.data(), (N - P) * S_v * H);
-            const float diff_state = max_abs(actual.data() + offset, expected.data() + offset, S_v * S_v * H);
-            printf("[gdn-prefix] mode=%d accepted=%lld masked_nan=%lld attn=%.3e state=%.3e\n",
-                   mode, (long long) accepted, (long long) (P - accepted), diff_attn, diff_state);
-            if (diff_attn > 1e-4f || diff_state > 1e-4f) {
-                return 1;
+            for (int64_t nt = 1; nt <= N - P; nt++) {
+                for (int64_t ns = 1; ns <= nt; ns++) {
+                    auto tail = [&](const std::vector<float> & initial, bool folded) {
+                        return run_gdn(backend.get(),
+                            slice(q_full, S_v * H, P, P + nt), slice(k_full, S_v * H, P, P + nt),
+                            slice(v_full, S_v * H, P, P + nt), slice(g_full, H, P, P + nt),
+                            slice(beta_full, H, P, P + nt), initial, S_v, H, nt, ns, mode,
+                            folded ? ring : std::vector<float>{}, folded ? mask : std::vector<float>{});
+                    };
+                    auto expected = tail(base, false);
+                    auto actual = tail(s0, true);
+                    const size_t attn_size = nt * S_v * H;
+                    const size_t region = ggml_gated_delta_net_ingr_region(S_v, 1, H, 1, ns, mode);
+                    const size_t state_size = S_v * S_v * H;
+                    const float diff_attn = max_abs(actual.data(), expected.data(), attn_size);
+                    const float diff_ingr = max_abs(actual.data() + attn_size, expected.data() + attn_size, ns * pw * H);
+                    const float diff_state = max_abs(actual.data() + attn_size + region,
+                                                    expected.data() + attn_size + region, state_size);
+                    const float diff_ckpt = nt > ns ? max_abs(actual.data() + attn_size + region + state_size,
+                                                             expected.data() + attn_size + region + state_size, state_size) : 0.0f;
+                    printf("[gdn-prefix] mode=%d mask=%u accepted=%lld tail=%lld K=%lld attn=%.3e ingredients=%.3e state=%.3e ckpt=%.3e\n",
+                           mode, pattern, (long long) accepted, (long long) nt, (long long) ns,
+                           diff_attn, diff_ingr, diff_state, diff_ckpt);
+                    if (diff_attn != 0.0f || diff_ingr != 0.0f || diff_state != 0.0f || diff_ckpt != 0.0f) {
+                        return 1;
+                    }
+                }
             }
         }
     }
