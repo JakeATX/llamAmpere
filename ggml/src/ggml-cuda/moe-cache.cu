@@ -10869,12 +10869,13 @@ private:
 };
 
 #if defined(__linux__) && CUDART_VERSION >= 11010 && !defined(GGML_USE_HIP)
-static void * moe_cache_host_alias(const void * source, size_t bytes, bool require_registration) {
+static void * moe_cache_host_alias(const void * source, size_t bytes) {
     const uintptr_t begin = (uintptr_t)source;
     if (!source || !bytes || bytes > UINTPTR_MAX - begin ||
-            (require_registration && !ggml_cuda_host_pin_contains(source, bytes))) {
+            !ggml_cuda_host_pin_contains(source, bytes)) {
         return nullptr;
     }
+    // Endpoint attributes alone cannot exclude an unregistered interior hole.
     const void * last = (const void *)(begin + bytes - 1);
     cudaPointerAttributes first_attributes{}, last_attributes{};
     void * alias = nullptr;
@@ -11043,7 +11044,7 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
             // A bank tensor can span pinned cold ranges and unregistered holes.
             const bool bank_sources = ggml_moe_bank_lookup(d.data) != nullptr;
             if (!table.permanent_sources) {
-                table.borrowed = moe_cache_host_alias(d.data, bytes, bank_sources);
+                table.borrowed = moe_cache_host_alias(d.data, bytes);
             }
             (void)cudaGetLastError();
             table.addresses.resize(d.n_expert);
@@ -11082,7 +11083,7 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
                 size_t source_range = 0;
                 if (table.permanent_sources) {
                     if (!permanent) {
-                        void * alias = moe_cache_host_alias((const void *)begin, expert_bytes, true);
+                        void * alias = moe_cache_host_alias((const void *)begin, expert_bytes);
                         if (!alias) { return fail(); }
                         table.fallback[e] = alias;
                     }
@@ -11090,7 +11091,7 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
                     // Bank release leaves the cold experts pinned in separate ranges.
                     void * alias = nullptr;
                     if (!table.borrowed && bank_sources && !table.bank[e] &&
-                            (alias = moe_cache_host_alias((const void *)begin, expert_bytes, true))) {
+                            (alias = moe_cache_host_alias((const void *)begin, expert_bytes))) {
                         table.fallback[e] = alias;
                         table.copy_source[e] = (const void *)begin;
                     } else {

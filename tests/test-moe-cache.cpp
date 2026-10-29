@@ -4387,8 +4387,10 @@ static bool run_profile_swap_prior(ggml_backend_t gpu, ggml_backend_t cpu, log_c
         ggml_backend_tensor_set(acts, values.data(), 0, width * sizeof(float));
     }
     // Swap victims need exact mapped fallback sources, including initially hot experts.
-    const bool registered = ok && cudaHostRegister(weights->data, ggml_nbytes(weights),
-            cudaHostRegisterPortable | cudaHostRegisterMapped) == cudaSuccess;
+    auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(gpu));
+    auto pin = (bool (*)(void *, size_t))ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_host_pin");
+    auto unpin = (void (*)(void *))ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_host_unpin");
+    const bool registered = ok && pin && unpin && pin(weights->data, ggml_nbytes(weights));
     ok &= registered;
     if (!registered) { (void)cudaGetLastError(); }
     const ggml_moe_cache_tensor_desc descriptor = {weights->name, weights->data,
@@ -4468,7 +4470,7 @@ static bool run_profile_swap_prior(ggml_backend_t gpu, ggml_backend_t cpu, log_c
         free_graph(candidate);
         free_graph(reference);
     }
-    if (registered) { ok &= cudaHostUnregister(weights->data) == cudaSuccess; }
+    if (registered) { unpin(weights->data); }
     ggml_backend_buffer_free(input_buffer);
     ggml_backend_buffer_free(buffer);
     ggml_free(inputs);
@@ -4565,14 +4567,15 @@ static bool run_swap_whole(ggml_backend_t gpu, ggml_backend_t cpu, log_capture &
         ggml_backend_tensor_set(ids[t], routes, 0, sizeof(routes));
         desc[t] = {weights[t]->name, weights[t]->data, weights[t]->nb[2], n_in, n_out, experts, GGML_TYPE_Q4_0};
     }
+    auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(gpu));
+    auto pin = (bool (*)(void *, size_t))ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_host_pin");
+    auto unpin = (void (*)(void *))ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_host_unpin");
     if (ok) {
         setup_stage = "CUDA host registration";
-        const cudaError_t error = cudaHostRegister(ggml_backend_buffer_get_base(buffer), ggml_backend_buffer_get_size(buffer),
-                cudaHostRegisterPortable | cudaHostRegisterMapped);
-        registered = error == cudaSuccess;
+        registered = pin && unpin && pin(ggml_backend_buffer_get_base(buffer), ggml_backend_buffer_get_size(buffer));
         ok &= registered;
         if (!registered) {
-            fprintf(stderr, "cache-swap-whole: host registration failed: %s\n", cudaGetErrorString(error));
+            fprintf(stderr, "cache-swap-whole: tracked host registration failed\n");
             (void) cudaGetLastError();
         }
     }
@@ -4673,7 +4676,7 @@ static bool run_swap_whole(ggml_backend_t gpu, ggml_backend_t cpu, log_capture &
         ok &= case_ok;
         ggml_free(graph_ctx);
     }
-    if (registered) { ok &= cudaHostUnregister(ggml_backend_buffer_get_base(buffer)) == cudaSuccess; }
+    if (registered) { unpin(ggml_backend_buffer_get_base(buffer)); }
     if (buffer) { ggml_backend_buffer_free(buffer); }
     ggml_free(ctx);
     unlink(filename.data());
@@ -5028,39 +5031,59 @@ static bool run_device_tables_case(ggml_backend_t gpu, ggml_backend_t cpu,
 }
 
 #if defined(GGML_CUDA) && defined(__linux__)
-static bool run_device_pageable_fallback(ggml_backend_t gpu, ggml_backend_t cpu, log_capture & capture) {
+static bool run_device_pageable_fallback(ggml_backend_t gpu, ggml_backend_t cpu, log_capture & capture, bool sparse = false) {
     const long page_size = sysconf(_SC_PAGESIZE);
     if (page_size <= 0) { return false; }
     const size_t page = (size_t)page_size;
-    void * allocation = malloc(3 * page);
+    void * allocation = malloc(6 * page);
     if (!allocation) { return false; }
     void * data = (void *)((((uintptr_t)allocation + page - 1) & ~(page - 1)) + 64);
     ggml_init_params params{ggml_tensor_overhead(), nullptr, true};
     auto * ctx = ggml_init(params);
     auto * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_Q4_0, 32, 8, 3);
     ggml_set_name(weights, "blk.7.ffn_up_exps.weight");
+    const size_t packed_bytes = ggml_nbytes(weights);
+    const size_t expert_bytes = weights->nb[2];
+    if (sparse) { weights->nb[2] = page; weights->nb[3] = 3 * page; }
     const size_t bytes = ggml_nbytes(weights);
     auto * buffer = ggml_backend_cpu_buffer_from_ptr(data, bytes);
-    bool ok = buffer && bytes + 64 < page &&
+    bool ok = buffer && expert_bytes + 64 < page &&
             ggml_backend_tensor_alloc(buffer, weights, data) == GGML_STATUS_SUCCESS;
     auto unregistered = [&]() {
         cudaPointerAttributes attributes{};
-        const auto error = cudaPointerGetAttributes(&attributes, data);
+        const auto error = cudaPointerGetAttributes(&attributes, (char *)data + (sparse ? page : 0));
         (void)cudaGetLastError();
         return error == cudaErrorInvalidValue || (error == cudaSuccess && attributes.type == cudaMemoryTypeUnregistered);
     };
+    // CUDA knows both endpoints, but the owner ledger must reject the pageable middle.
+    void * first_page = (void *)((uintptr_t)data - 64);
+    void * last_page = (char *)first_page + 2 * page;
+    const bool first_pinned = sparse && cudaHostRegister(first_page, page, cudaHostRegisterMapped) == cudaSuccess;
+    const bool last_pinned = sparse && cudaHostRegister(last_page, page, cudaHostRegisterMapped) == cudaSuccess;
+    ok &= !sparse || (first_pinned && last_pinned);
+    (void)cudaGetLastError();
     ok &= unregistered();
     if (ok) {
         ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
         std::vector<float> values(ggml_nelements(weights), 0.125f);
-        ok &= ggml_quantize_chunk(weights->type, values.data(), data, 0, 24, 32, nullptr) == bytes;
+        std::vector<uint8_t> packed(packed_bytes);
+        ok &= ggml_quantize_chunk(weights->type, values.data(), packed.data(), 0, 24, 32, nullptr) == packed_bytes;
+        for (size_t e = 0; e < 3; ++e) {
+            memcpy((char *)data + e * weights->nb[2], packed.data() + e * expert_bytes, expert_bytes);
+        }
         if (ok) { ok &= run_device_tables_case(gpu, cpu, weights, capture, nullptr, true); }
         ok &= unregistered();
     }
     ggml_backend_buffer_free(buffer);
     ggml_free(ctx);
-    free(allocation);
-    printf("cache-device-pageable-fallback: %s\n", ok ? "OK" : "FAIL");
+    bool released = !(first_pinned || last_pinned) || cudaDeviceSynchronize() == cudaSuccess;
+    if (released) {
+        if (first_pinned) { released &= cudaHostUnregister(first_page) == cudaSuccess; }
+        if (last_pinned) { released &= cudaHostUnregister(last_page) == cudaSuccess; }
+    }
+    ok &= released;
+    if (released) { free(allocation); }
+    printf("cache-device-pageable-fallback%s: %s\n", sparse ? "-sparse" : "", ok ? "OK" : "FAIL");
     return ok;
 }
 #endif
@@ -7163,8 +7186,10 @@ static bool run_arena_stride(ggml_backend_t gpu, ggml_backend_t cpu,
     ok &= run_prompt_warm(gpu, cpu, weights, graph, reference, capture);
     ok &= run_scenario("cache-arena-stride", nullptr, gpu, cpu, graph, reference, capture);
 #ifdef GGML_CUDA
-    const bool registered = cudaHostRegister(arena, arena_size,
-            cudaHostRegisterPortable | cudaHostRegisterMapped) == cudaSuccess;
+    auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(gpu));
+    auto pin = (bool (*)(void *, size_t))ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_host_pin");
+    auto unpin = (void (*)(void *))ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_host_unpin");
+    const bool registered = pin && unpin && pin(arena, arena_size);
     ok &= registered;
     if (registered) {
         ok &= run_device_tables_case(gpu, cpu, weights, capture);
@@ -7178,7 +7203,7 @@ static bool run_arena_stride(ggml_backend_t gpu, ggml_backend_t cpu,
         // Cache/table teardown must leave the model-owned registration alive.
         ok &= cudaHostGetFlags(&flags, arena) == cudaSuccess;
         ok &= capture.get().find("new_copy_bytes=0 new_registered_bytes=0") != std::string::npos;
-        ok &= cudaHostUnregister(arena) == cudaSuccess;
+        unpin(arena);
     }
 #endif
     for (int64_t e = 0; e < weights->ne[2]; ++e) {
@@ -7476,7 +7501,7 @@ int main(int argc, char ** argv) {
     }
 #if defined(GGML_CUDA) && defined(__linux__)
     if (argc == 2 && strcmp(argv[1], "--device-pageable-fallback-only") == 0) {
-        const bool ok = provider_is_cuda && run_device_pageable_fallback(gpu, cpu, capture);
+        const bool ok = provider_is_cuda && run_device_pageable_fallback(gpu, cpu, capture) && run_device_pageable_fallback(gpu, cpu, capture, true);
         ggml_backend_free(gpu);
         ggml_backend_free(cpu);
         return !provider_is_cuda ? 77 : ok ? 0 : 1;
@@ -7828,7 +7853,7 @@ int main(int argc, char ** argv) {
     });
 #if defined(GGML_CUDA) && defined(__linux__)
     ok &= run_optional(provider_is_cuda, "cache-device-pageable-fallback", [&] {
-        return run_device_pageable_fallback(gpu, cpu, capture);
+        return run_device_pageable_fallback(gpu, cpu, capture) && run_device_pageable_fallback(gpu, cpu, capture, true);
     });
 #endif
     ok &= run_optional(provider_is_cuda, "cache-device-fused", [&] {
