@@ -175,6 +175,11 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_pq(struct common_sam
 
 const common_sampler_pq_stats & common_sampler_get_pq_stats(const struct common_sampler * gsmpl);
 
+// Marginal token law of mode-biased p/q verification at one fixed prefix. Output follows p's
+// order; p and q must be normalized. This is a local sampler diagnostic, not sequence KL.
+std::vector<double> common_sampler_pq_mode_distribution(const llama_token_data_array & p,
+        const std::vector<llama_token_data> & q, const std::function<bool(llama_token)> & is_stop = {});
+
 // top-1 probability of the target distribution at each position the last common_sampler_sample_and_accept_n_pq
 // call sampled from (request-matched, after the sampler chain; -1 where the chain sampled on the backend).
 // Entries 0..accepted belong to the committed tokens; later entries do not exist (the call stops at a rejection).

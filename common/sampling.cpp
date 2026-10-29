@@ -14,6 +14,7 @@
 #include <climits>
 #include <cmath>
 #include <cstring>
+#include <memory>
 #include <random>
 #include <mutex>
 #include <unordered_map>
@@ -1368,8 +1369,40 @@ const common_sampler_pq_stats & common_sampler_get_pq_stats(const struct common_
     return gsmpl->pq_stats;
 }
 
-common_sampler_pq_result common_sampler_verify_pq(const llama_token_data_array & p, const std::vector<llama_token_data> & q,
-        llama_token d, llama_token x, std::mt19937 & rng, bool beat, common_sampler_pq_stats & stats,
+std::vector<double> common_sampler_pq_mode_distribution(const llama_token_data_array & p,
+        const std::vector<llama_token_data> & q, const std::function<bool(llama_token)> & is_stop) {
+    std::vector<double> law(p.size), residual(p.size), excess(p.size);
+    double total = 0.0;
+    for (size_t k = 0; k < p.size; ++k) {
+        double qk = 0.0;
+        for (const auto & c : q) {
+            if (c.id == p.data[k].id) { qk = c.p; break; }
+        }
+        law[k] = p.data[k].p;
+        residual[k] = std::max(0.0, law[k] - qk);
+        excess[k] = std::max(0.0, qk - law[k]);
+        total += residual[k];
+    }
+    if (total <= 0.0) { return law; }
+    // Exact verification emits p. Rescue redirects each rejected-draft/replacement pair's
+    // joint mass, excess[d] * residual[y] / total, from y to d when p(d) >= p(y).
+    // Drafts outside p have p(d)=0 and cannot beat a positive residual replacement.
+    for (size_t d = 0; d < p.size; ++d) {
+        if (excess[d] <= 0.0 || (is_stop && is_stop(p.data[d].id))) { continue; }
+        for (size_t y = 0; y < p.size; ++y) {
+            if (residual[y] <= 0.0 || p.data[d].p < p.data[y].p ||
+                    (is_stop && is_stop(p.data[y].id))) { continue; }
+            const double moved = excess[d] * residual[y] / total;
+            law[d] += moved;
+            law[y] -= moved;
+        }
+    }
+    return law;
+}
+
+template<bool cache_q, bool beat>
+static common_sampler_pq_result common_sampler_verify_pq_impl(const llama_token_data_array & p, const std::vector<llama_token_data> & q,
+        llama_token d, llama_token x, std::mt19937 & rng, common_sampler_pq_stats & stats,
         const llama_vocab * vocab, const std::function<bool(llama_token)> & is_stop) {
     auto q_of = [&](llama_token id) -> double {
         for (const auto & c : q) {
@@ -1379,15 +1412,23 @@ common_sampler_pq_result common_sampler_verify_pq(const llama_token_data_array &
         }
         return 0.0;
     };
-    double p_d = 0.0, sum_min = 0.0;
+    // Reuse draft probabilities after rejection without changing the residual sum order.
+    constexpr size_t n_local = 64;
+    double q_local[cache_q ? n_local : 1];
+    std::unique_ptr<double[]> q_heap;
+    if (cache_q && p.size > n_local) { q_heap.reset(new double[p.size]); }
+    double * q_aligned = p.size > n_local ? q_heap.get() : q_local;
+    double p_d = 0.0, q_d = 0.0, sum_min = 0.0;
     for (size_t k = 0; k < p.size; ++k) {
         const auto & c = p.data[k];
+        const double qk = q_of(c.id);
+        if (cache_q) { q_aligned[k] = qk; }
         if (c.id == d) {
             p_d = c.p;
+            q_d = qk;
         }
-        sum_min += std::min((double) c.p, q_of(c.id));
+        sum_min += std::min((double) c.p, qk);
     }
-    const double q_d = q_of(d);
     stats.n_pos++;
     stats.sum_p_d += p_d;
     stats.sum_min += sum_min;
@@ -1411,7 +1452,9 @@ common_sampler_pq_result common_sampler_verify_pq(const llama_token_data_array &
 
     double total = 0.0;
     for (size_t k = 0; k < p.size; ++k) {
-        total += std::max(0.0, (double) p.data[k].p - q_of(p.data[k].id));
+        const double mass = std::max(0.0, (double) p.data[k].p - (cache_q ? q_aligned[k] : q_of(p.data[k].id)));
+        if (cache_q) { q_aligned[k] = mass; }
+        total += mass;
     }
     res.id = x;
     if (total > 0.0) {
@@ -1419,7 +1462,7 @@ common_sampler_pq_result common_sampler_verify_pq(const llama_token_data_array &
         double run = 0.0;
         for (size_t k = 0; k < p.size; ++k) {
             const auto & c = p.data[k];
-            const double mass = std::max(0.0, (double) c.p - q_of(c.id));
+            const double mass = cache_q ? q_aligned[k] : std::max(0.0, (double) c.p - q_of(c.id));
             if (beat && mass <= 0.0) {
                 continue;
             }
@@ -1451,6 +1494,22 @@ common_sampler_pq_result common_sampler_verify_pq(const llama_token_data_array &
         stats.n_rej++;
     }
     return res;
+}
+
+common_sampler_pq_result common_sampler_verify_pq(const llama_token_data_array & p, const std::vector<llama_token_data> & q,
+        llama_token d, llama_token x, std::mt19937 & rng, bool beat, common_sampler_pq_stats & stats,
+        const llama_vocab * vocab, const std::function<bool(llama_token)> & is_stop) {
+    static const bool cache_q = [] {
+        const char * e = std::getenv("LLAMA_SPEC_PQ_CACHE");
+        return !e || std::atoi(e) != 0;
+    }();
+    // Tiny supports cost less to scan again than to materialize a probability cache.
+    if (p.size <= 4 || !cache_q) {
+        return beat ? common_sampler_verify_pq_impl<false, true>(p, q, d, x, rng, stats, vocab, is_stop) :
+                      common_sampler_verify_pq_impl<false, false>(p, q, d, x, rng, stats, vocab, is_stop);
+    }
+    return beat ? common_sampler_verify_pq_impl<true, true>(p, q, d, x, rng, stats, vocab, is_stop) :
+                  common_sampler_verify_pq_impl<true, false>(p, q, d, x, rng, stats, vocab, is_stop);
 }
 
 std::vector<llama_token> common_sampler_sample_and_accept_n_pq(struct common_sampler * gsmpl, struct llama_context * ctx,
@@ -1496,6 +1555,25 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_pq(struct common_sam
         const auto ends = [&](llama_token id) { return is_stop && is_stop(id, result); };
         common_sampler_pq_result res{x};
         if (have_q && cpu_p) {
+            // Explicit quality-only opt-in. Never draw RNG values or alter sampler state.
+            // Compare local sampled-token laws, not unchanged model logits; mb-MTP acts after logits.
+            static const int audit_limit = []() {
+                const char * e = std::getenv("LLAMA_SPEC_MB_KL");
+                return e ? std::max(0, std::min(512, std::atoi(e))) : 0;
+            }();
+            if (gsmpl->params.spec_lossy && gsmpl->pq_stats.n_pos < audit_limit) {
+                const auto stop = [&](llama_token id) { return llama_vocab_is_eog(vocab, id) || ends(id); };
+                const auto law = common_sampler_pq_mode_distribution(p, draft_q[i], stop);
+                double forward = 0.0, reverse = 0.0, mass = 0.0;
+                for (size_t k = 0; k < p.size; ++k) {
+                    const double pk = p.data[k].p, sk = std::max(0.0, law[k]);
+                    mass += sk;
+                    if (pk > 0.0) { forward += sk > 0.0 ? pk * std::log(pk/sk) : INFINITY; }
+                    if (sk > 0.0) { reverse += pk > 0.0 ? sk * std::log(sk/pk) : INFINITY; }
+                }
+                LOG_INF("mb-mtp local-law: seq=%d generated=%lld draft_pos=%zu p_to_mb=%.12g mb_to_p=%.12g mass=%.12g\n",
+                        seq, (long long) generated, i, forward, reverse, mass);
+            }
             res = common_sampler_verify_pq(p, draft_q[i], draft[i], x, gsmpl->pq_rng, gsmpl->params.spec_lossy, gsmpl->pq_stats, vocab, ends);
             if (res.rescued && gsmpl->first_rescue < 0) {
                 gsmpl->first_rescue = (int32_t) i;

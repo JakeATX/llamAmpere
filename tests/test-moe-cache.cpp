@@ -6614,6 +6614,235 @@ static bool run_device_fused_missjoin(ggml_backend_t gpu, ggml_backend_t cpu, lo
     return ok;
 }
 
+// --moe-skip-tail: the route-rank rule on its own (host-side helper shared by the CPU path).
+static bool run_skip_tail_rank_rule() {
+    bool ok = true;
+    // two tokens, top-4: expert 9 sits at positions 3 and 2, expert 5 at 0, expert 7 only at 3
+    const int32_t ids[8] = {5, 1, 2, 9,   4, 6, 9, 7};
+    ok &= !ggml_moe_cache_tail_rank_ok(ids, 8, 2, 0, 3);   // rank 0 is head
+    ok &= !ggml_moe_cache_tail_rank_ok(ids, 8, 2, 3, 3);   // 9: token 1 ranks it 2 < 3
+    ok &= ggml_moe_cache_tail_rank_ok(ids, 8, 2, 3, 2);    // 9: best rank 2 >= 2
+    ok &= ggml_moe_cache_tail_rank_ok(ids, 8, 2, 7, 3);    // 7: rank 3 only
+    ok &= !ggml_moe_cache_tail_rank_ok(ids, 8, 2, 7, 0);   // 0 = off
+    ok &= !ggml_moe_cache_tail_rank_ok(ids, 8, 2, 7, 4);   // rank >= top_k never skips
+    ok &= !ggml_moe_cache_tail_rank_ok(ids, 8, 3, 7, 3);   // malformed shape
+    ok &= !ggml_moe_cache_tail_rank_ok(nullptr, 8, 2, 7, 3);
+    printf("cache-skip-tail-rank-rule: %s\n", ok ? "OK" : "FAIL");
+    return ok;
+}
+
+// --moe-skip-tail on the hit-first device path: a full up/gate/swiglu/down layer, experts 0..5 resident. Each route
+// pattern runs exact (rank 0), then with the cutoff, then exact again, so every rank change recaptures the graph.
+// Under the cutoff a route whose expert is missed and ranked >= R by every token must be exactly zero, and every
+// other route must be bit-identical to the exact run (same kernels, same bytes). The exact runs must match the CPU
+// at quantization-noise level and must reproduce themselves after the cutoff was on.
+static bool run_skip_tail_layer(ggml_backend_t gpu, ggml_backend_t cpu, log_capture & capture) {
+    const auto api = active_api();
+    if (!api.set_skip_tail || !api.warm || !api.device_prepare) {
+        printf("cache-skip-tail-layer: FAIL (provider has no set_skip_tail)\n");
+        return false;
+    }
+    bool all_ok = true;
+    std::vector<float> importance(256, 1.0f);
+    constexpr int k_used = 8, dim = 256, rank = 5;
+    // 256 experts: the pool keeps at least 64 slots per bank, so a 64-expert layer would be fully resident.
+    // An 8 MiB budget holds well under 128 complete experts; routes use experts 0..5 (warm) and >= 128 (missed).
+    constexpr int64_t n_expert = 256;
+    constexpr int miss_base = 128;
+    unsigned long long expected_rows_total = 0;
+    long long logged_rows_total = 0;
+    for (const auto type : {GGML_TYPE_Q4_0, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS}) {
+        bool ok = true;
+        ggml_init_params weight_params = {4 * ggml_tensor_overhead(), nullptr, true};
+        ggml_context * weights_ctx = ggml_init(weight_params);
+        ggml_tensor * weights[3];
+        const char * names[3] = {"blk.7.ffn_up_exps.weight", "blk.7.ffn_gate_exps.weight", "blk.7.ffn_down_exps.weight"};
+        for (int bank = 0; bank < 3; ++bank) {
+            weights[bank] = ggml_new_tensor_3d(weights_ctx, type, dim, dim, n_expert);
+            ggml_set_name(weights[bank], names[bank]);
+        }
+        ggml_backend_buffer_t weights_buffer = ggml_backend_alloc_ctx_tensors(weights_ctx, cpu);
+        ggml_backend_buffer_set_usage(weights_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        std::vector<float> values((size_t) dim * dim * n_expert);
+        for (int bank = 0; bank < 3; ++bank) {
+            for (size_t i = 0; i < values.size(); ++i) {
+                values[i] = 0.15f * std::sin((float)(i % 997) * (0.017f + bank * 0.013f)) +
+                            0.05f * std::cos((float)(i % 431) * (0.031f + bank * 0.007f));
+            }
+            std::vector<uint8_t> quantized(ggml_nbytes(weights[bank]));
+            const float * imatrix = ggml_quantize_requires_imatrix(type) ? importance.data() : nullptr;
+            ok &= ggml_quantize_chunk(type, values.data(), quantized.data(), 0, (int64_t) dim * n_expert, dim, imatrix) ==
+                    quantized.size();
+            ggml_backend_tensor_set(weights[bank], quantized.data(), 0, quantized.size());
+        }
+        for (int tokens : {1, 4, 5}) {
+            configure_cache(nullptr, "8");
+            set_env("GGML_CUDA_MOE_CACHE_BUDGET_MB", "8");
+            set_env("GGML_MOE_CACHE_DEVICE", "1");
+            set_env("GGML_MOE_CACHE_DEVICE_STATS", "1");
+            set_env("GGML_MOE_CACHE_DEVICE_CAPTURE", "1");
+            set_env("GGML_MOE_MISSJOIN", "stage");
+            capture.clear();
+            ggml_init_params params = {12 * ggml_tensor_overhead(), nullptr, true};
+            ggml_context * input_ctx[] = {ggml_init(params), ggml_init(params)};
+            ggml_backend_t backends[] = {cpu, gpu};
+            ggml_tensor * acts[2], * storage[2], * ids[2];
+            ggml_backend_buffer_t buffers[2];
+            std::vector<float> activations((size_t) dim * tokens);
+            for (size_t i = 0; i < activations.size(); ++i) {
+                activations[i] = 0.2f * std::cos((float)i * 0.019f);
+            }
+            for (int i = 0; i < 2; ++i) {
+                acts[i] = ggml_new_tensor_3d(input_ctx[i], GGML_TYPE_F32, dim, 1, tokens);
+                storage[i] = ggml_new_tensor_2d(input_ctx[i], GGML_TYPE_I32, 64, tokens);
+                ids[i] = ggml_view_2d(input_ctx[i], storage[i], k_used, tokens, storage[i]->nb[1], 0);
+                buffers[i] = ggml_backend_alloc_ctx_tensors(input_ctx[i], backends[i]);
+                ggml_backend_tensor_set(acts[i], activations.data(), 0, activations.size() * sizeof(float));
+            }
+            test_graph graphs[2];
+            for (int i = 0; i < 2; ++i) {
+                ggml_init_params gp = {24 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true};
+                graphs[i].ctx = ggml_init(gp);
+                ggml_context * c = graphs[i].ctx;
+                ggml_tensor * up = ggml_mul_mat_id(c, weights[0], acts[i], ids[i]);
+                ggml_tensor * gate = ggml_mul_mat_id(c, weights[1], acts[i], ids[i]);
+                ggml_tensor * mid = ggml_swiglu_split(c, gate, up);
+                graphs[i].out = ggml_mul_mat_id(c, weights[2], mid, ids[i]);
+                graphs[i].graph = ggml_new_graph(c);
+                ggml_build_forward_expand(graphs[i].graph, graphs[i].out);
+                graphs[i].buffer = ggml_backend_alloc_ctx_tensors(c, backends[i]);
+            }
+            void * session = create_direct_session(gpu, cpu);
+            ggml_moe_cache_tensor_desc descriptors[3];
+            std::vector<uint64_t> usage[3];
+            const uint64_t * counts[3];
+            for (int i = 0; i < 3; ++i) {
+                auto * w = weights[i];
+                descriptors[i] = {w->name, w->data, w->nb[2], dim, dim, n_expert, (int32_t) type};
+                usage[i].assign(n_expert, 0);
+                for (int e = 0; e < 6; ++e) {
+                    usage[i][e] = 100; // experts 0..5 resident, everything else misses
+                }
+                counts[i] = usage[i].data();
+            }
+            const bool prepared = session && api.warm(session, descriptors, counts, 3) > 0 &&
+                    api.device_prepare(session, descriptors, 3) == 1;
+            ok &= prepared;
+            const size_t n_out = (size_t) ggml_nelements(graphs[0].out);
+            std::vector<float> expected(n_out), exact(n_out), lossy(n_out), again(n_out);
+            unsigned long long expected_rows = 0;
+            for (int pattern = 0; pattern < 6 && prepared; ++pattern) {
+                std::vector<int32_t> routing(64 * tokens, 63);
+                for (int t = 0; t < tokens; ++t) {
+                    for (int j = 0; j < k_used; ++j) {
+                        int e;
+                        switch (pattern) {
+                            case 0: e = (j + t) % 6; break;                              // all resident: nothing skips
+                            case 1: e = 20 + ((j * 3 + t * 5) % 40); break;              // all missed
+                            case 2: e = (j % 2) ? (j * 7 + t) % 6 : 10 + j + t; break;   // mixed
+                            case 3: e = j < rank ? 40 + j : 50 + ((j + t) % 3); break;   // shared tail misses
+                            case 4: e = j < rank ? (j % 6) : (t % 2 ? 30 + j : 30 + k_used - 1 - j); break; // tail misses across ranks
+                            default: e = j < rank ? 12 + j : 12 + (j - rank); break;    // every tail expert is also a head expert: nothing skips
+                        }
+                        routing[64 * t + j] = e < 6 ? e : e - 6 + miss_base;
+                    }
+                }
+                // rows the cutoff must leave out
+                std::vector<uint8_t> skip_route((size_t) tokens * k_used, 0);
+                for (int t = 0; t < tokens; ++t) {
+                    for (int j = 0; j < k_used; ++j) {
+                        const int e = routing[64 * t + j];
+                        bool head = e < 6; // resident experts are always computed
+                        for (int t2 = 0; t2 < tokens && !head; ++t2) {
+                            for (int j2 = 0; j2 < rank; ++j2) {
+                                head |= routing[64 * t2 + j2] == e;
+                            }
+                        }
+                        skip_route[(size_t) t * k_used + j] = !head;
+                        expected_rows += head ? 0 : 3;
+                    }
+                }
+                for (int i = 0; i < 2; ++i) {
+                    ggml_backend_tensor_set(storage[i], routing.data(), 0, routing.size() * sizeof(int32_t));
+                }
+                ok &= ggml_backend_graph_compute(cpu, graphs[0].graph) == GGML_STATUS_SUCCESS;
+                ggml_backend_tensor_get(graphs[0].out, expected.data(), 0, n_out * sizeof(float));
+                for (int step = 0; step < 3; ++step) {
+                    api.set_skip_tail(session, step == 1 ? rank : 0);
+                    api.session_enter(session);
+                    ok &= ggml_backend_graph_compute(gpu, graphs[1].graph) == GGML_STATUS_SUCCESS;
+                    api.session_leave(session);
+                    auto & dst = step == 0 ? exact : step == 1 ? lossy : again;
+                    ggml_backend_tensor_get(graphs[1].out, dst.data(), 0, n_out * sizeof(float));
+                }
+                const bool cpu_ok = compare_output(expected, exact, 8e-3);
+                const bool repro_ok = exact == again;
+                ok &= cpu_ok && repro_ok;
+                size_t bad_skip = 0, bad_keep = 0;
+                float max_keep_diff = 0.0f;
+                for (int t = 0; t < tokens; ++t) {
+                    for (int j = 0; j < k_used; ++j) {
+                        const size_t base = ((size_t) t * k_used + j) * dim;
+                        for (int q = 0; q < dim; ++q) {
+                            const float want = skip_route[(size_t) t * k_used + j] ? 0.0f : exact[base + q];
+                            if (memcmp(&lossy[base + q], &want, sizeof(float)) != 0) {
+                                ok = false;
+                                if (skip_route[(size_t) t * k_used + j]) {
+                                    ++bad_skip;
+                                } else {
+                                    ++bad_keep;
+                                    max_keep_diff = std::max(max_keep_diff, std::fabs(lossy[base + q] - want));
+                                }
+                            }
+                        }
+                    }
+                }
+                if (!ok) {
+                    fprintf(stderr, "skip-tail layer type=%s tokens=%d pattern=%d failed: cpu=%d repro=%d bad_skip=%zu bad_keep=%zu max_keep_diff=%g\n",
+                            ggml_type_name(type), tokens, pattern, cpu_ok, repro_ok, bad_skip, bad_keep, max_keep_diff);
+                    break;
+                }
+            }
+            if (session) {
+                api.session_destroy(session);
+            }
+            const std::string log = capture.get();
+            long long logged = -1;
+            const size_t pos = log.rfind("[moe-cache] skip-tail: ");
+            if (pos != std::string::npos) {
+                logged = atoll(log.c_str() + pos + strlen("[moe-cache] skip-tail: "));
+            }
+            // The device counter is a process total, so compare the growth of this shape.
+            const long long grown = logged - logged_rows_total;
+            ok &= expected_rows == 0 ? (logged < 0 || grown == 0) : grown == (long long) expected_rows;
+            ok &= log.find("missjoin hit-first: on") != std::string::npos;
+            if (logged >= 0) {
+                logged_rows_total = logged;
+            }
+            expected_rows_total += expected_rows;
+            if (!ok) {
+                fprintf(stderr, "skip-tail layer type=%s tokens=%d expected_rows=%llu logged=%lld\n%s",
+                        ggml_type_name(type), tokens, expected_rows, logged, log.c_str());
+            }
+            for (int i = 0; i < 2; ++i) {
+                free_graph(graphs[i]);
+                ggml_backend_buffer_free(buffers[i]);
+                ggml_free(input_ctx[i]);
+            }
+        }
+        printf("cache-skip-tail-layer type=%s rank=%d: %s\n", ggml_type_name(type), rank, ok ? "OK" : "FAIL");
+        all_ok &= ok;
+        ggml_backend_buffer_free(weights_buffer);
+        ggml_free(weights_ctx);
+    }
+    for (const char * name : {"GGML_MOE_CACHE_DEVICE", "GGML_MOE_CACHE_DEVICE_STATS", "GGML_MOE_CACHE_DEVICE_CAPTURE", "GGML_MOE_MISSJOIN"}) {
+        set_env(name, nullptr);
+    }
+    all_ok &= expected_rows_total > 0;
+    printf("cache-skip-tail-layer: rows left out=%llu: %s\n", expected_rows_total, all_ok ? "OK" : "FAIL");
+    return all_ok;
+}
+
 // fork VFIXMISS: a full up/gate/swiglu/down layer with mixed resident and missed experts, replayed
 // with changing routes. The CPU result must match within rounding, replays of one graph must be
 // bit-identical to the first run, and (via GGML_MOE_CACHE_TEST_HF_DUMP) a run with
@@ -7327,6 +7556,9 @@ int main(int argc, char ** argv) {
         if (cpu) { ggml_backend_free(cpu); }
         return ok ? 0 : 1;
     }
+    if (argc == 2 && strcmp(argv[1], "--skip-tail-rule-only") == 0) {
+        return run_skip_tail_rank_rule() ? 0 : 1;
+    }
     if (argc == 2 && strcmp(argv[1], "--prefetch-policy-only") == 0) {
         return 0;
     }
@@ -7439,6 +7671,12 @@ int main(int argc, char ** argv) {
         ok &= capture.get().find("publish_async=1") != std::string::npos;
         ok &= provider_is_cuda && run_device_adaptation_starvation(gpu, cpu, capture);
         set_env("GGML_MOE_CACHE_DEVICE_PUBLISH_ASYNC", previous ? saved.c_str() : nullptr);
+        ggml_backend_free(gpu);
+        ggml_backend_free(cpu);
+        return !provider_is_cuda ? 77 : ok ? 0 : 1;
+    }
+    if (argc == 2 && strcmp(argv[1], "--skip-tail-only") == 0) {
+        const bool ok = provider_is_cuda && run_skip_tail_rank_rule() && run_skip_tail_layer(gpu, cpu, capture);
         ggml_backend_free(gpu);
         ggml_backend_free(cpu);
         return !provider_is_cuda ? 77 : ok ? 0 : 1;
@@ -7721,6 +7959,9 @@ int main(int argc, char ** argv) {
     });
     ok &= run_optional(provider_is_cuda, "cache-hitfirst-layer", [&] {
         return run_hitfirst_layer(gpu, cpu, capture);
+    });
+    ok &= run_optional(provider_is_cuda, "cache-skip-tail-layer", [&] {
+        return run_skip_tail_rank_rule() && run_skip_tail_layer(gpu, cpu, capture);
     });
     ok &= run_optional(provider_is_cuda, "cache-device-host-budget", [&] {
         return run_device_host_budget();

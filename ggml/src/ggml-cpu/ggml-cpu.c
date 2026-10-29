@@ -2246,6 +2246,12 @@ static void ggml_compute_forward_mul_mat_id_impl(
                     continue;
                 }
 
+                if (moe_cache_node && moe_cache_slot_idx[logical_row] == GGML_MOE_CACHE_SKIP) {
+                    // route-rank cutoff (--moe-skip-tail): a missed tail expert contributes a zero row
+                    memset((char *) dst->data + iid1*nb2 + id*nb1, 0, ne0*sizeof(float));
+                    continue;
+                }
+
                 if (moe_cache_node && moe_cache_slot_idx[iid1*n_ids + id] >= 0) {
                     const int64_t i11 = id % ne11;
                     moe_cache_compact[moe_cache_n_hits] = moe_cache_slot_idx[iid1*n_ids + id];
