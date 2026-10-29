@@ -5836,6 +5836,12 @@ static void ggml_cuda_gdn_replay_direct_plan(ggml_backend_cuda_context * cuda_ct
         }
         cuda_ctx->gdn_replay_directs.push_back(e);
     }
+    static bool logged = false;
+    if (!logged && !cuda_ctx->gdn_replay_directs.empty()) {
+        logged = true;
+        GGML_LOG_INFO("[GDNDIRECT] %zu gated_delta_net calls store final state%s in the cache\n",
+            cuda_ctx->gdn_replay_directs.size(), cuda_ctx->gdn_replay_directs[0].ckpt_dst ? " and checkpoint" : "");
+    }
 }
 
 // every planned gdn must have stored its blocks: a skipped cpy whose gdn did not would leave the cache stale
