@@ -36,24 +36,31 @@ static size_t b1_borrow_deficit(size_t required, size_t keep, size_t free_mem) {
     return scratch_shortfall > SIZE_MAX - keep_shortfall ? SIZE_MAX : scratch_shortfall + keep_shortfall;
 }
 
-static bool b1_read_file(int fd, void * dst, size_t offs, size_t len) {
+static bool b1_read_file(int fd, void * dst, size_t offs, size_t len, size_t alignment = 1, void * scratch = nullptr) {
 #ifndef _WIN32
-    char * p = (char *) dst;
-    while (len > 0) {
-        const ssize_t n = pread(fd, p, len, (off_t) offs);
+    char * p = (char *) (scratch ? scratch : dst);
+    const size_t skip = offs % alignment;
+    const size_t needed = skip + len;
+    const size_t read_size = b1_align_up(needed, alignment);
+    offs -= skip;
+    size_t got = 0;
+    while (got < read_size) {
+        const ssize_t n = pread(fd, p + got, read_size - got, (off_t) (offs + got));
         if (n < 0 && errno == EINTR) {
             continue;
         }
         if (n <= 0) {
-            return false;
+            break;
         }
-        p    += n;
-        offs += (size_t) n;
-        len  -= (size_t) n;
+        got += (size_t) n;
+        // A final direct read may include padding beyond EOF.
+        if (got >= needed) { break; }
     }
+    if (got < needed) { return false; }
+    if (p + skip != dst) { memmove(dst, p + skip, len); }
     return true;
 #else
-    GGML_UNUSED_VARS(fd, dst, offs, len);
+    GGML_UNUSED_VARS(fd, dst, offs, len, alignment, scratch);
     return false;
 #endif
 }
@@ -228,17 +235,19 @@ llama_b1::llama_b1(const llama_model & model, ggml_backend_t backend_gpu) : mode
         direct_piece = (size_t) std::clamp<int64_t>(b1_env_int("LLAMA_B1_DIRECT_PIECE_MIB", 64), 1, 1024) << 20;
     }
 
+    size_t staging_alignment = 1;
+    for (const auto & e : exps) { staging_alignment = std::max(staging_alignment, e.src.alignment); }
     stg.resize(n_workers);
     for (auto & w : stg) {
         w.resize(2);
         for (auto & s : w) {
-            s.buf = ggml_backend_buft_alloc_buffer(buft_host, piece_bytes);
+            s.buf = ggml_backend_buft_alloc_buffer(buft_host, piece_bytes + 3 * staging_alignment);
             s.ev  = ggml_backend_event_new(dev);
             if (s.buf == nullptr || s.ev == nullptr) {
                 LLAMA_LOG_WARN("%s: [B1] cannot allocate the pinned staging buffers, B1 is off\n", __func__);
                 return;
             }
-            s.data = (char *) ggml_backend_buffer_get_base(s.buf);
+            s.data = (char *) b1_align_up((uintptr_t) ggml_backend_buffer_get_base(s.buf), staging_alignment);
         }
     }
 
@@ -681,7 +690,8 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
             std::vector<uint8_t> a(n);
             std::vector<uint8_t> b(n);
             ggml_backend_tensor_get(e.t, a.data(), e.nbytes - n, n);
-            if (!b1_read_file(e.src.fd, b.data(), e.src.offs + e.nbytes - n, n) || memcmp(a.data(), b.data(), n) != 0) {
+            if (stg[0][0].used) { ggml_backend_event_synchronize(stg[0][0].ev); }
+            if (!b1_read_file(e.src.fd, b.data(), e.src.offs + e.nbytes - n, n, e.src.alignment, stg[0][0].data) || memcmp(a.data(), b.data(), n) != 0) {
                 LLAMA_LOG_WARN("%s: [B1] %s: VRAM bytes differ from the file, it cannot be lent; using the normal prefill\n",
                         __func__, ggml_get_name(e.t));
                 return false;
@@ -1008,6 +1018,7 @@ void llama_b1::push_tensor_pieces(std::vector<piece> & ps, const exps_tensor & e
         const size_t source_off = strided ? (off / expert_bytes) * e.home_nb2 + off % expert_bytes : off;
         p.src_host = from_file ? nullptr : (const char *) e.home_data + source_off;
         p.fd       = e.src.fd;
+        p.alignment = e.src.alignment;
         p.src_offs = e.src.offs + off;
         p.dst      = dst;
         p.dst_offs = dst_offs + off;
@@ -1142,7 +1153,7 @@ void llama_b1::worker(int w) {
             ggml_moe_cache_host_restore(p.src_host, p.len);
             memcpy(s.data, p.src_host, p.len);
         } else {
-            ok = p.fd >= 0 && b1_read_file(p.fd, s.data, p.src_offs, p.len);
+            ok = p.fd >= 0 && b1_read_file(p.fd, s.data, p.src_offs, p.len, p.alignment);
         }
 
         if (ok) {

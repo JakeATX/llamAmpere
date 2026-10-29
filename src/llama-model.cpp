@@ -2349,7 +2349,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 b1_fds.push_back(fd);
                 it = fd_of.emplace(w.idx, fd).first;
             }
-            b1_src[name] = { it->second, w.offs };
+            b1_src[name] = { it->second, w.offs, ml.files.at(w.idx)->read_alignment() };
         }
 #endif
     }

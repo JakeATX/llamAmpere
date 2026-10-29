@@ -664,6 +664,7 @@ struct llama_prec_policy {
 struct llama_b1_file_src {
     int    fd   = -1;
     size_t offs = 0;
+    size_t alignment = 1;
 };
 
 struct llama_model {

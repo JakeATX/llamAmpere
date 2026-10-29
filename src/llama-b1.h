@@ -201,6 +201,7 @@ private:
     };
     struct piece {
         const char * src_host = nullptr; // memcpy source, or null for pread
+        size_t alignment = 1;
         int          fd       = -1;
         size_t       src_offs = 0;
         region *     dst      = nullptr;
