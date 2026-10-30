@@ -125,7 +125,7 @@ static __global__ void __launch_bounds__(256) hcf_down_row_owner(
         const float * __restrict__ xn, const char * __restrict__ wd, const int64_t sd,
         const char * __restrict__ wi, const int64_t si, const int R, const int n_rows, const int n_embd,
         const float lo_scale, const float inj_scale, float * __restrict__ dst) {
-    const int lane = threadIdx.x & 31, row = blockIdx.x*8 + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31, row = blockIdx.x*(blockDim.x/32) + (threadIdx.x >> 5);
     if (row >= n_rows) {
         return;
     }
@@ -963,12 +963,17 @@ static void hcf_down_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, 
         const char * e = getenv("LLAMA_HC_DOWN_ROW_OWNER");
         return e && atoi(e) == 1;
     }();
+    // Four row warps fill more SMs without changing each row's sums.
+    static const int row_warps = [] {
+        const char * e = getenv("LLAMA_HC_DOWN_ROW_WARPS");
+        return e && atoi(e) == 4 ? 4 : 8;
+    }();
     if (row_owner && slot >= 0 && n_embd % 256 == 0) {
         ggml_cuda_pool_alloc<float> xn(ctx.pool(), (size_t) T*hc_dim);
         auto stage = [&](auto fold) {
             constexpr bool F = decltype(fold)::value;
             static const bool reported = [=] {
-                fprintf(stderr, "[hc-down-row-owner] T=%d rows=%d embd=%d folded=%d\n", T, n_rows, n_embd, F);
+                fprintf(stderr, "[hc-down-row-owner] T=%d rows=%d embd=%d folded=%d warps=%d\n", T, n_rows, n_embd, F, row_warps);
                 return true;
             }();
             GGML_UNUSED(reported);
@@ -980,7 +985,7 @@ static void hcf_down_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, 
         } else {
             stage(std::false_type{});
         }
-        hcf_down_row_owner<T><<<(n_rows + 7)/8, 256, 0, stream>>>(xn.get(),
+        hcf_down_row_owner<T><<<(n_rows + row_warps - 1)/row_warps, 32*row_warps, 0, stream>>>(xn.get(),
                 (const char *) wd->data, wd->nb[1], wi ? (const char *) wi->data : nullptr, wi ? wi->nb[1] : 0,
                 R, n_rows, n_embd, lo_scale, inj_scale, (float *) dst->data);
         return;

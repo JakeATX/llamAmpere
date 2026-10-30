@@ -15144,6 +15144,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // Full-row owners cover ranks beyond the striped path's bound and mostly inactive row warps.
     test_cases.emplace_back(new test_dsv4_hc_down_owner(512, 512, 3, false));
     test_cases.emplace_back(new test_dsv4_hc_down_owner(2560, 1, 4, true));
+    // Row-owner blocks cover exact four/eight-row ends and a trailing ninth row.
+    for (int64_t rank : {4, 8, 9}) {
+        test_cases.emplace_back(new test_dsv4_hc_down_owner(512, rank, 3, false));
+    }
     // [HCFUSED] real Flash-Next shapes, every token count the kernels specialize, with and without the injection rows
     for (int64_t nt = 1; nt <= 8; ++nt) {
         test_cases.emplace_back(new test_dsv4_hc_fused(2560, 320, nt, true,  true, 1));
