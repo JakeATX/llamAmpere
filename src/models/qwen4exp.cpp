@@ -2337,10 +2337,12 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override {
         mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx)->get_attn();
-        return rows->ne[0] == (int64_t) model.hparams.ple_n_heads * params.ubatch.n_tokens;
+        const int64_t n = (int64_t) model.hparams.ple_n_heads * params.ubatch.n_tokens;
+        return emb_in ? emb_in->ne[1] == n : rows->ne[0] == n;
     }
 
     ggml_tensor * rows = nullptr;   // I32 [ple_n_heads * n_tokens]
+    ggml_tensor * emb_in = nullptr; // fork LLAMA_PLE_DECODE: F32 [row elements, ple_n_heads * n_tokens], replaces rows
 
     const llama_model & model;
 
@@ -2445,6 +2447,11 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
         if (prefetch && !covered) {
             llama_prefetch_rows(ple, idx.data(), idx.size());
         }
+    }
+
+    if (emb_in) {
+        pf->gather((uint32_t) n_tokens, idx.data(), idx.size(), emb_in);
+        return;
     }
 
     ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
@@ -2558,14 +2565,23 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
     auto ple_inp = std::make_unique<llm_graph_input_qwen4exp_ple>(model, mctx_hyb->get_attn());
     ple_inp->pf = ple_pf;
 
-    ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
-    ggml_set_input(ple_inp->rows);
-    ggml_tensor * rows = ple_inp->rows;
-    res->add_input(std::move(ple_inp));
-
-    // gather then flatten the heads: get_rows lays the head dimension out slowest, as the reference does
     ggml_tensor * table = model.ple_cache ? model.ple_cache->tensor : model.per_layer_tok_embd;
-    ggml_tensor * emb = ggml_get_rows(ctx0, table, rows);
+    ggml_tensor * emb = nullptr;
+    // fork LLAMA_PLE_DECODE=1: prompt ubatches take rows the context decoded ahead on the host (same values)
+    if (ple_pf && ple_pf->decode_enabled() && !model.ple_cache && (uint32_t) n_tokens >= ple_pf->decode_min()) {
+        ple_inp->emb_in = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, table->ne[0], n_heads * n_tokens);
+        ggml_set_input(ple_inp->emb_in);
+        emb = ple_inp->emb_in;
+        res->add_input(std::move(ple_inp));
+    } else {
+        ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
+        ggml_set_input(ple_inp->rows);
+        ggml_tensor * rows = ple_inp->rows;
+        res->add_input(std::move(ple_inp));
+
+        // gather then flatten the heads: get_rows lays the head dimension out slowest, as the reference does
+        emb = ggml_get_rows(ctx0, table, rows);
+    }
     emb = ggml_reshape_2d(ctx0, emb, hparams.ple_head_dim * n_heads, n_tokens);
     cb(emb, "ple_embd", -1);
 

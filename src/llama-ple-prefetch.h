@@ -55,6 +55,15 @@ public:
     // the decode call ends: stop the readers and log the totals
     void stop();
 
+    // fork: LLAMA_PLE_DECODE=1 (opt-in, prompt ubatches of at least LLAMA_PLE_DECODE_MIN tokens): the graph takes the
+    // gathered rows as an F32 input instead of get_rows on the mapped table. Host threads decode the next ubatch of the
+    // call while the card runs this one and keep the rows until that ubatch takes them, so a page evicted after its
+    // read costs no wait on the card's critical path. Same to_float as the CPU get_rows, so the same bits.
+    bool     decode_enabled() const { return decode_on; }
+    uint32_t decode_min() const { return n_decode_min; }
+    // called after consume(): writes the rows idx (n_idx of them) to dst, F32 [row elements, n_idx]
+    void gather(uint32_t n_tokens, const int32_t * idx, size_t n_idx, ggml_tensor * dst);
+
 private:
     llama_ple_prefetch() = default;
 
@@ -66,6 +75,19 @@ private:
     double resident_fraction(const std::vector<uint64_t> & keys, uint64_t base) const;
     void   verify_rows(const int32_t * idx, size_t n_idx); // fork: re-queue pages evicted after their read
     void   test_drop_rows(const int32_t * idx, size_t n_idx); // fork: test only, page out N% of the ubatch's rows
+    void   decode_into(const int32_t * idx, size_t n_idx, float * dst) const; // fork: rows to F32 on n_decode threads
+    void   decode_join();
+
+    // fork: LLAMA_PLE_DECODE state. dec_t0 = call offset of the ubatch in dec_rows/dec_data (UINT64_MAX: none)
+    bool     decode_on    = false;
+    int      n_decode     = 16;
+    uint32_t n_decode_min = 1024;
+    uint64_t dec_t0       = UINT64_MAX;
+    std::vector<int32_t> dec_rows;
+    std::vector<float>   dec_data;
+    std::thread          dec_thread;
+    int      n_dec_hit = 0, n_dec_miss = 0;
+    int64_t  t_dec_wait_us = 0;
 
     const llama_model * model = nullptr;
     const ggml_tensor * ple   = nullptr;

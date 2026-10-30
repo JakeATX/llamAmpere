@@ -144,6 +144,10 @@ std::unique_ptr<llama_ple_prefetch> llama_ple_prefetch::create(const llama_model
     pf->verify    = ple_pf_env("LLAMA_PLE_PF_VERIFY", 0) > 0;
     pf->verify_sync = ple_pf_env("LLAMA_PLE_PF_VERIFY", 0) >= 2;
     pf->test_drop   = (int) std::min<int64_t>(ple_pf_env("LLAMA_PLE_PF_TEST_DROP", 0), 100);
+    // fork: the startup-profile cache remaps rows to its own table, which this decode does not read
+    pf->decode_on    = ple_pf_env("LLAMA_PLE_DECODE", 0) > 0 && !model.ple_cache;
+    pf->n_decode     = (int) std::min<int64_t>(std::max<int64_t>(1, ple_pf_env("LLAMA_PLE_DECODE_THREADS", 16)), 256);
+    pf->n_decode_min = (uint32_t) std::min<int64_t>(std::max<int64_t>(1, ple_pf_env("LLAMA_PLE_DECODE_MIN", 1024)), UINT32_MAX);
     pf->n_ubatch  = n_ubatch;
     pf->row_size  = t->nb[1];
     pf->n_rows    = (uint64_t) t->ne[1];
@@ -832,6 +836,8 @@ void llama_ple_prefetch::verify_rows(const int32_t * idx, size_t n_idx) {
 }
 
 void llama_ple_prefetch::stop() {
+    decode_join(); // the decode thread reads toks
+    dec_t0 = UINT64_MAX;
     if (!running) {
         return;
     }
@@ -854,6 +860,12 @@ void llama_ple_prefetch::stop() {
     if (test_drop > 0) {
         LLAMA_LOG_CONT("; test drop: %" PRId64 " rows paged out", n_test_dropped);
     }
+    if (decode_on) {
+        LLAMA_LOG_CONT("; decode: %d ubatches taken ahead, %d decoded in place, %.1f ms waited",
+                n_dec_hit, n_dec_miss, t_dec_wait_us/1e3);
+        n_dec_hit = n_dec_miss = 0;
+        t_dec_wait_us = 0;
+    }
     if (verify) {
         LLAMA_LOG_CONT("; verify: %" PRId64 " pages evicted before their gather in %d ubatches, %s in %.1f ms",
                 n_verify_missing, n_verify_ubatch, verify_sync ? "read back" : "re-queued", t_verify_us/1e3);
@@ -867,4 +879,91 @@ void llama_ple_prefetch::stop() {
     remaining.reset();
     n_chunks = 0;
     n_built  = 0;
+}
+
+// fork: LLAMA_PLE_DECODE. Rows to F32 with the type's to_float (what the CPU get_rows calls for this table), split
+// over n_decode threads so their page faults overlap.
+void llama_ple_prefetch::decode_into(const int32_t * idx, size_t n_idx, float * dst) const {
+    const int64_t ne0  = ple->ne[0];
+    const size_t  nb1  = ple->nb[1];
+    const char *  base = (const char *) ple->data;
+    const ggml_to_float_t to_float = ple->type == GGML_TYPE_F32 ? nullptr : ggml_get_type_traits(ple->type)->to_float;
+    GGML_ASSERT(ple->type == GGML_TYPE_F32 || to_float);
+    auto work = [&](size_t i0, size_t i1) {
+        for (size_t i = i0; i < i1; ++i) {
+            const int32_t r = idx[i];
+            GGML_ASSERT(r >= 0 && (uint64_t) r < n_rows);
+            const char * src = base + (size_t) r*nb1;
+            float * out = dst + i*ne0;
+            if (to_float) {
+                to_float(src, out, ne0);
+            } else {
+                memcpy(out, src, ne0*sizeof(float));
+            }
+        }
+    };
+    const size_t nt = std::min<size_t>((size_t) n_decode, std::max<size_t>(1, n_idx/1024));
+    if (nt <= 1) {
+        work(0, n_idx);
+        return;
+    }
+    std::vector<std::thread> th;
+    th.reserve(nt - 1);
+    const size_t step = (n_idx + nt - 1)/nt;
+    for (size_t t = 1; t < nt; ++t) {
+        const size_t i0 = std::min(n_idx, t*step), i1 = std::min(n_idx, i0 + step);
+        th.emplace_back(work, i0, i1);
+    }
+    work(0, std::min(n_idx, step));
+    for (auto & t : th) {
+        t.join();
+    }
+}
+
+void llama_ple_prefetch::decode_join() {
+    if (dec_thread.joinable()) {
+        dec_thread.join();
+    }
+}
+
+void llama_ple_prefetch::gather(uint32_t n_tokens, const int32_t * idx, size_t n_idx, ggml_tensor * dst) {
+    const int64_t ne0 = ple->ne[0];
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 && ggml_nelements(dst) == (int64_t) n_idx*ne0);
+    const int64_t tg = ggml_time_us();
+    decode_join();
+    // consume() already counted this ubatch, so it starts at consumed - n_tokens
+    const bool hit = running && consumed >= n_tokens && dec_t0 == consumed - n_tokens && dec_rows.size() == n_idx &&
+            memcmp(dec_rows.data(), idx, n_idx*sizeof(int32_t)) == 0;
+    if (!hit) {
+        if (dec_data.size() < n_idx*ne0) {
+            dec_data.resize(n_idx*ne0);
+        }
+        decode_into(idx, n_idx, dec_data.data());
+    }
+    hit ? ++n_dec_hit : ++n_dec_miss;
+    t_dec_wait_us += ggml_time_us() - tg;
+    ggml_backend_tensor_set(dst, dec_data.data(), 0, n_idx*ne0*sizeof(float)); // synchronous: the buffer is free after
+    dec_t0 = UINT64_MAX;
+
+    // the next ubatch of the call, assumed the same size (a different one is decoded in place)
+    const auto & hp = model->hparams;
+    const uint64_t n_prev = (uint64_t) hp.ple_ngram_size - 1, a = consumed;
+    if (!running || a < n_prev || a >= toks.size()) {
+        return;
+    }
+    const uint64_t n = std::min<uint64_t>(n_tokens, toks.size() - a);
+    dec_thread = std::thread([this, a, n, n_prev, ne0]() {
+        const auto & hp = model->hparams;
+        const uint64_t nh = hp.ple_n_heads;
+        dec_rows.resize(n*nh);
+        // inside the call every predecessor is a call token, oldest first as the graph input takes them
+        for (uint64_t i = 0; i < n; ++i) {
+            llama_ple_hash_rows(hp, toks[a + i], toks.data() + a + i - n_prev, dec_rows.data() + i*nh);
+        }
+        if (dec_data.size() < n*nh*ne0) {
+            dec_data.resize(n*nh*ne0);
+        }
+        decode_into(dec_rows.data(), dec_rows.size(), dec_data.data());
+        dec_t0 = a;
+    });
 }
