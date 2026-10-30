@@ -779,10 +779,12 @@ llama_model_loader::llama_model_loader(
         }
         const uint16_t idx = (uint16_t) files.size();
         overlay_idx = idx;
-        bool overlay_direct = use_direct_io;
+        // LLAMA_MODEL_OVERLAY_DIRECT=1 opts in to O_DIRECT overlay reads (UNSAFE on the home PC, rental only); the
+        // reads then go through a plain malloc bounce buffer, never straight into pinned or registered memory
+        bool overlay_direct = false;
 #ifdef __linux__
         const char * direct = getenv("LLAMA_MODEL_OVERLAY_DIRECT");
-        overlay_direct = !direct || atoi(direct) != 0;
+        overlay_direct = direct && atoi(direct) != 0;
 #endif
         files.emplace_back(new llama_file(ov, "rb", overlay_direct));
         if (files.back()->has_direct_io()) {
@@ -2056,6 +2058,20 @@ bool llama_model_loader::load_all_data(
                     size_t bytes_read = 0;
                     size_t data_read = 0;  // Actual tensor data copied (excluding padding)
 
+                    // overlay O_DIRECT reads land in a plain (never pinned or registered) bounce buffer, then memcpy
+                    struct bounce_deleter { void operator()(void * p) const { free(p); } };
+                    std::unique_ptr<void, bounce_deleter> bounce;
+                    if (direct_overlay) {
+                        void * raw = nullptr;
+#ifndef _WIN32
+                        if (posix_memalign(&raw, alignment, chunk_size) != 0) { raw = nullptr; }
+#endif
+                        if (!raw) {
+                            throw std::runtime_error("cannot allocate the overlay direct-read bounce buffer");
+                        }
+                        bounce.reset(raw);
+                    }
+
                     while (bytes_read < read_end - read_start) {
                         size_t read_size = std::min<size_t>(chunk_size, read_end - read_start - bytes_read);
 
@@ -2066,7 +2082,12 @@ bool llama_model_loader::load_all_data(
                         ggml_backend_event_synchronize(events[buffer_idx]);
 
                         // Read aligned chunk from file
-                        file->read_raw_unsafe(reinterpret_cast<void *>(ptr_dest_aligned), read_size);
+                        if (direct_overlay) {
+                            file->read_raw_unsafe(bounce.get(), read_size);
+                            memcpy(reinterpret_cast<void *>(ptr_dest_aligned), bounce.get(), read_size);
+                        } else {
+                            file->read_raw_unsafe(reinterpret_cast<void *>(ptr_dest_aligned), read_size);
+                        }
                         if (direct_overlay && !file->has_direct_io()) {
                             throw std::runtime_error("bank direct read fell back to buffered I/O");
                         }

@@ -38,10 +38,27 @@ static size_t b1_borrow_deficit(size_t required, size_t keep, size_t free_mem) {
 
 static bool b1_read_file(int fd, void * dst, size_t offs, size_t len, size_t alignment = 1, void * scratch = nullptr) {
 #ifndef _WIN32
-    char * p = (char *) (scratch ? scratch : dst);
     const size_t skip = offs % alignment;
     const size_t needed = skip + len;
     const size_t read_size = b1_align_up(needed, alignment);
+    // alignment > 1 means an O_DIRECT descriptor: its reads must never land in pinned or cudaHostRegister'ed pages
+    // (UVM in HMM mode can panic the PC), so they go to a plain per-thread malloc bounce buffer and are copied out
+    struct bounce_t { void * p = nullptr; size_t n = 0; ~bounce_t() { free(p); } };
+    thread_local bounce_t bounce;
+    char * p = (char *) (scratch ? scratch : dst);
+    if (alignment > 1) {
+        if (bounce.n < read_size) {
+            free(bounce.p);
+            bounce.p = nullptr;
+            bounce.n = 0;
+            if (posix_memalign(&bounce.p, alignment, read_size) != 0 || !bounce.p) {
+                bounce.p = nullptr;
+                return false;
+            }
+            bounce.n = read_size;
+        }
+        p = (char *) bounce.p;
+    }
     offs -= skip;
     size_t got = 0;
     while (got < read_size) {
@@ -57,7 +74,7 @@ static bool b1_read_file(int fd, void * dst, size_t offs, size_t len, size_t ali
         if (got >= needed) { break; }
     }
     if (got < needed) { return false; }
-    if (p + skip != dst) { memmove(dst, p + skip, len); }
+    if (p + skip != dst) { memcpy(dst, p + skip, len); }
     return true;
 #else
     GGML_UNUSED_VARS(fd, dst, offs, len, alignment, scratch);
