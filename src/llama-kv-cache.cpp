@@ -3694,6 +3694,11 @@ bool llama_kv_cache::b1_sj_seal(llama_context * lctx, int32_t il0, int32_t il1) 
         }
     }
     bool synced = false;
+    // LLAMA_SJ_SEAL_ASYNC=1 (opt-in): when the seal runs on one of the scheduler's own backends it is queued on the
+    // same stream as the slices, which already orders it after the previous slice's ring writes and before the next
+    // slice's reads; so the prompt seal neither drains the scheduler nor waits for its own kernel, and the host goes
+    // on building the next graph while the card works. Other backends keep the synchronous path.
+    static const bool seal_async = [] { const char * e = getenv("LLAMA_SJ_SEAL_ASYNC"); return e && atoi(e) != 0; }();
     for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
         const auto & layer = layers[ikv];
         if ((int32_t) layer.il < il0 || (int32_t) layer.il >= hi) {
@@ -3723,7 +3728,17 @@ bool llama_kv_cache::b1_sj_seal(llama_context * lctx, int32_t il0, int32_t il1) 
             if (!job.buffer) { LLAMA_LOG_ERROR("%s: seal buffer allocation failed\n", __func__); return false; }
             job.graph = gf;
         }
-        if (!synced) {
+        bool async = false;
+        if (seal_async) {
+            ggml_backend_sched_t sched = lctx->get_sched();
+            for (int b = 0; b < ggml_backend_sched_get_n_backends(sched); ++b) {
+                if (ggml_backend_sched_get_backend(sched, b) == job.backend) {
+                    async = ggml_backend_dev_type(ggml_backend_get_device(job.backend)) != GGML_BACKEND_DEVICE_TYPE_CPU;
+                    break;
+                }
+            }
+        }
+        if (!synced && !async) {
             // this layer's ring rows were written by the previous slice, which may still be computing
             ggml_backend_sched_synchronize(lctx->get_sched());
             synced = true;
@@ -3744,10 +3759,20 @@ bool llama_kv_cache::b1_sj_seal(llama_context * lctx, int32_t il0, int32_t il1) 
             d[GGML_SJKVARN_DESC_TYPE_V]    = layers[0].v->type;
             d[GGML_SJKVARN_DESC_RECBYTES]  = sj_kvarn_rec_bytes[tier];
             d[GGML_SJKVARN_DESC_BODY_TYPE] = tier == 1 ? sj_kvarn.edge_body_type : sj_kvarn.body_type;
-            ggml_backend_tensor_set(job.desc[0], d.data(), 0, d.size()*sizeof(int32_t));
-            if (ggml_backend_graph_compute(job.backend, job.graph) != GGML_STATUS_SUCCESS) {
-                LLAMA_LOG_ERROR("%s: seal of layer %d failed\n", __func__, layer.il);
-                return false;
+            if (async) {
+                // the stream copy reads d before returning (pageable source), and the next chunk's copy of the same
+                // descriptor is queued behind this chunk's kernel
+                ggml_backend_tensor_set_async(job.backend, job.desc[0], d.data(), 0, d.size()*sizeof(int32_t));
+                if (ggml_backend_graph_compute_async(job.backend, job.graph) != GGML_STATUS_SUCCESS) {
+                    LLAMA_LOG_ERROR("%s: seal of layer %d failed\n", __func__, layer.il);
+                    return false;
+                }
+            } else {
+                ggml_backend_tensor_set(job.desc[0], d.data(), 0, d.size()*sizeof(int32_t));
+                if (ggml_backend_graph_compute(job.backend, job.graph) != GGML_STATUS_SUCCESS) {
+                    LLAMA_LOG_ERROR("%s: seal of layer %d failed\n", __func__, layer.il);
+                    return false;
+                }
             }
             old = end;
         }
