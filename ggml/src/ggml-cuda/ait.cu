@@ -20,6 +20,7 @@
 // GGML_CUDA_AIT4_NEIGHBOR_EARLY_X=1 reads activations before the neighbor group's decode.
 // GGML_CUDA_AIT4_NEIGHBOR_BOUNDS=1 gives the neighbor kernel a 384-thread compile bound.
 // GGML_CUDA_AIT4_NEIGHBOR_RING1=1 keeps one weight group live in the neighbor path.
+// GGML_CUDA_AIT4_NEIGHBOR_UNROLL2=1 unrolls two four-group steps in the neighbor path.
 // GGML_CUDA_AIT4_RING2=1 keeps two AIT4 weight groups live with the base register budget (OCC=0, NEIGHBOR=0).
 // GGML_CUDA_AIT4_RING1=1 keeps one AIT4 weight group live and takes precedence over RING2.
 // GGML_CUDA_AIT4_TAIL=1 refills the four-group weight ring after each group's IMMA work.
@@ -395,7 +396,7 @@ static __global__ void __launch_bounds__(CAP ? 256 : LOW || BOUNDS ? 384 : 512, 
         const int l2pf = 0, float * __restrict__ partial = nullptr) {
     static_assert(!NEIGHBOR || (KB == 4 && FULL && PC == 0 && V == 0), "neighbor path requires plain full AIT4");
     static_assert(!TAIL || (KB == 4 && FULL && PC == 0 && V == 0 && !PACK), "tail refill requires plain full AIT4");
-    static_assert(!UNROLL2 || (KB == 4 && FULL && PC == 0 && V == 0 && DEPTH == 4 && !LOW && !CAP && !PACK && !NEIGHBOR && !TAIL), "two-step unroll requires plain full AIT4");
+    static_assert(!UNROLL2 || (KB == 4 && FULL && PC == 0 && V == 0 && DEPTH == 4 && !LOW && !CAP && !PACK && !TAIL), "two-step unroll requires plain full AIT4");
     static_assert(!EARLY_X || (KB == 4 && FULL && PC == 0 && V == 0 && DEPTH == 4 && !LOW && !CAP && !PACK && !TAIL && !UNROLL2), "early activation requires plain full AIT4");
     static_assert(!BOUNDS || (KB == 4 && FULL && PC == 0 && V == 0 && DEPTH == 4 && !LOW && !CAP && !PACK && !TAIL && !UNROLL2 && !EARLY_X), "thread bound requires plain full AIT4");
     constexpr bool CO = (V & 2) != 0;
@@ -538,10 +539,10 @@ static __global__ void __launch_bounds__(CAP ? 256 : LOW || BOUNDS ? 384 : 512, 
         if constexpr (UNROLL2) {
 #pragma unroll 2
             for (int G4 = 0; G4 < 16; G4 += 4) {
-                ait_group<KB, NT, 0>(buf, G4 + 0, G4 + 4 < 16 || more, gp, off, r, xs, live, c);
-                ait_group<KB, NT, 1>(buf, G4 + 1, G4 + 5 < 16 || more, gp, off, r, xs, live, c);
-                ait_group<KB, NT, 2>(buf, G4 + 2, G4 + 6 < 16 || more, gp, off, r, xs, live, c);
-                ait_group<KB, NT, 3>(buf, G4 + 3, G4 + 7 < 16 || more, gp, off, r, xs, live, c);
+                ait_group<KB, NT, 0, PC, CO, DEPTH, PACK, false, NEIGHBOR>(buf, G4 + 0, G4 + 4 < 16 || more, gp, off, r, xs, live, c);
+                ait_group<KB, NT, 1, PC, CO, DEPTH, PACK, false, NEIGHBOR>(buf, G4 + 1, G4 + 5 < 16 || more, gp, off, r, xs, live, c);
+                ait_group<KB, NT, 2, PC, CO, DEPTH, PACK, false, NEIGHBOR>(buf, G4 + 2, G4 + 6 < 16 || more, gp, off, r, xs, live, c);
+                ait_group<KB, NT, 3, PC, CO, DEPTH, PACK, false, NEIGHBOR>(buf, G4 + 3, G4 + 7 < 16 || more, gp, off, r, xs, live, c);
             }
         } else if constexpr (FULL) {
 #pragma unroll
@@ -870,6 +871,7 @@ static void ait_fast_nt(ggml_backend_cuda_context & ctx, const uint8_t * W, cons
         static const bool neighbor4_tail = ait_env_int("GGML_CUDA_AIT4_NEIGHBOR_TAIL", 0) == 1;
         static const bool neighbor4_early_x = ait_env_int("GGML_CUDA_AIT4_NEIGHBOR_EARLY_X", 0) == 1;
         static const bool neighbor4_bounds = ait_env_int("GGML_CUDA_AIT4_NEIGHBOR_BOUNDS", 0) == 1;
+        static const bool neighbor4_unroll2 = ait_env_int("GGML_CUDA_AIT4_NEIGHBOR_UNROLL2", 0) == 1;
         if (neighbor4_pack) {
             k_ait_mmv<4, NT, true, 0, 0, 4, false, false, true, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
         } else if (neighbor4_ring2) {
@@ -882,6 +884,8 @@ static void ait_fast_nt(ggml_backend_cuda_context & ctx, const uint8_t * W, cons
             k_ait_mmv<4, NT, true, 0, 0, 4, false, false, false, true, false, false, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
         } else if (neighbor4_bounds) {
             k_ait_mmv<4, NT, true, 0, 0, 4, false, false, false, true, false, false, false, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
+        } else if (neighbor4_unroll2) {
+            k_ait_mmv<4, NT, true, 0, 0, 4, false, false, false, true, false, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
         } else {
             k_ait_mmv<4, NT, true, 0, 0, 4, false, false, false, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
         }
