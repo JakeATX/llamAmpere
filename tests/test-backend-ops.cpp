@@ -20121,12 +20121,15 @@ static int run_ait_check(const char * dir) {
         if (!fb.read((char *) packed.data(), packed.size()) || !fw.read((char *) wref.data(), wref.size() * 4)) {
             fprintf(stderr, "%s: cannot read %s.{bin,w}\n", nm.c_str(), pb.c_str()); return 1;
         }
-        // Repeat whole chunks, including paired row scales; K0/512 and both target slice counts are even.
+        // Vary source rows across slice pairs to expose row-tile aliasing; keep global column scales in place.
         for (int64_t rt = 0; rt < M / 32; ++rt) {
             for (int64_t ks = 0; ks < K / 512; ++ks) {
-                const size_t src = ((rt % (M0 / 32)) * (K0 / 512) + ks % (K0 / 512)) * cb;
+                const int64_t src_rt = (rt + (rt / (M0 / 32)) * (ks / 2 + 1)) % (M0 / 32);
+                const size_t src = (src_rt * (K0 / 512) + ks % (K0 / 512)) * cb;
+                const size_t cols = ((rt % (M0 / 32)) * (K0 / 512) + ks % (K0 / 512)) * cb;
                 const size_t dst = (rt * (K / 512) + ks) * cb;
                 memcpy(buf.data() + dst, packed.data() + src, cb);
+                memcpy(buf.data() + dst + AIT_TRELLIS_BYTES(k) + 32, packed.data() + cols + AIT_TRELLIS_BYTES(k) + 32, 32);
             }
         }
         // (1) host decode vs Python
@@ -20136,7 +20139,8 @@ static int run_ait_check(const char * dir) {
         for (int64_t m = 0; m < M; ++m) {
             for (int64_t c = 0; c < K; ++c) {
                 const float w = ait_weight_rot_c(buf.data(), K, k, code, m, c);
-                const double r = wref[(m % M0) * K0 + c % K0];
+                const int64_t src_rt = (m / 32 + (m / M0) * (c / 1024 + 1)) % (M0 / 32);
+                const double r = wref[(src_rt * 32 + m % 32) * K0 + c % K0];
                 maxrel = std::max(maxrel, std::fabs(w - r) / std::max(1e-30, std::fabs(r)));
                 wl[m * K + c] = (double) ait_weight_level_c(buf.data(), K, k, code, m, c) * ait_row_scale(buf.data(), K, k, m, c) / 64.0;
             }
