@@ -1068,6 +1068,21 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
         }
     }
 #endif
+    // GGML_MOE_CPU_SPLIT_CPULIST="11,10,9,..." (default unset): use exactly these cpus, in this order, instead of the
+    // derived list. Used to test pool placement (which L3 group, whether the desktop core is in the pool).
+#if defined(__linux__)
+    if (const char * cl = getenv("GGML_MOE_CPU_SPLIT_CPULIST")) {
+        std::vector<int> forced;
+        for (const char * c = cl; *c;) {
+            if (*c < '0' || *c > '9') { ++c; continue; }
+            char * end = nullptr;
+            const long v = strtol(c, &end, 10);
+            c = end;
+            if (v >= 0 && v < CPU_SETSIZE) { forced.push_back((int) v); }
+        }
+        if (!forced.empty()) { avail = forced; skipped = "forced by GGML_MOE_CPU_SPLIT_CPULIST"; }
+    }
+#endif
     const int hw_free = !avail.empty() ? (int) avail.size() : (int) std::max(1u, std::thread::hardware_concurrency() / 2 - 1);
     s.threads = env_int("GGML_MOE_CPU_SPLIT_THREADS", hw_free, 1, 64);
     const bool pin = env_int("GGML_MOE_CPU_SPLIT_PIN", 1, 0, 1) != 0 && !avail.empty();
