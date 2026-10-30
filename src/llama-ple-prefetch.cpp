@@ -298,7 +298,7 @@ void llama_ple_prefetch::build() {
     const uint64_t base  = use_pread ? file_off : (uint64_t) (uintptr_t) ple->data;
     const uint64_t key0  = base / 4096;
     const uint64_t nkeys = (base + n_rows*row_size + 4095)/4096 - key0 + 1;
-    std::vector<uint8_t> seen(nkeys, 0);
+    std::vector<uint64_t> seen(nkeys/64 + (nkeys % 64 != 0), 0);
     std::vector<uint64_t> cp;   // the new pages of one chunk
     cp.reserve((size_t) CHUNK*n_heads*2);
 
@@ -339,8 +339,11 @@ void llama_ple_prefetch::build() {
                     const uint64_t b = base + (uint64_t) r*row_size;
                     const uint64_t k0 = b/4096, k1 = (b + row_size - 1)/4096;
                     for (uint64_t page = k0; page <= k1; ++page) {
-                        if (!seen[page - key0]) {
-                            seen[page - key0] = 1;
+                        const uint64_t index = page - key0;
+                        const uint64_t bit = UINT64_C(1) << (index % 64);
+                        uint64_t & word = seen[index/64];
+                        if (!(word & bit)) {
+                            word |= bit;
                             cp.push_back(page);
                         }
                     }
