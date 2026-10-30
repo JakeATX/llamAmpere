@@ -20098,11 +20098,17 @@ static int run_ait_check(const char * dir) {
     const int64_t M0 = 1024, K0 = 2048;
     const int64_t M = !shape ? M0 : strcmp(shape, "up") == 0 ? 17408 : 5120;
     const int64_t K = !shape ? K0 : strcmp(shape, "up") == 0 ? 5120 : 17408;
+    const char * shape_type = getenv("GGML_TEST_AIT_SHAPE_TYPE");
+    if (shape_type && (!shape || (strcmp(shape_type, "ait3") != 0 && strcmp(shape_type, "ait4") != 0))) {
+        fprintf(stderr, "ait: shape type requires up/down and ait3 or ait4\n");
+        return 1;
+    }
+    const int shape_vi = shape_type && strcmp(shape_type, "ait4") == 0 ? 2 : 1;
     int fails = 0;
     std::mt19937 rng(1234);
     std::uniform_real_distribution<float> ux(-1.0f, 1.0f);
     // variants: ait2, ait3, ait4 (1MAD), ait2p (pair table, k = 2 bytes)
-    for (int vi = shape ? 1 : 0; vi < (shape ? 2 : 4); ++vi) {
+    for (int vi = shape ? shape_vi : 0; vi < (shape ? shape_vi + 1 : 4); ++vi) {
         const int k = vi < 3 ? vi + 2 : 2, code = vi < 3 ? 0 : 1;
         const ggml_type ty = code == 1 ? GGML_TYPE_AIT2P : (ggml_type) (GGML_TYPE_AIT2 + (k - 2));
         const std::string nm = std::string(ggml_type_name(ty));
