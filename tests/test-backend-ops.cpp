@@ -5387,11 +5387,15 @@ struct test_dsv4_hc_down_owner : public test_dsv4_hc_fused {
                     init_tensor_uniform(t, 0.0f, 0.0f);
                 } else if (x_known && strcmp(name, "x") == 0) {
                     for (int64_t row = 0; row < 4*n_tokens; ++row) {
-                        const std::vector<float> values(n_embd, float(row + 1)/16.0f);
+                        const float sign = row % 2 == 0 ? 1.0f : -1.0f;
+                        const std::vector<float> values(n_embd, sign*float(row + 1)/16.0f);
                         ggml_backend_tensor_set(t, values.data(), row*n_embd*sizeof(float), values.size()*sizeof(float));
                     }
                 } else if (x_known && strcmp(name, "w_norm") == 0) {
-                    init_tensor_uniform(t, 1.0f, 1.0f);
+                    for (int64_t stream = 0; stream < 4; ++stream) {
+                        const std::vector<float> values(n_embd, float(stream + 1));
+                        ggml_backend_tensor_set(t, values.data(), stream*n_embd*sizeof(float), values.size()*sizeof(float));
+                    }
                 } else if (x_known && (strcmp(name, "w_down") == 0 || strcmp(name, "w_inject") == 0)) {
                     const float sign = strcmp(name, "w_down") == 0 ? 1.0f : -1.0f;
                     for (int64_t row = 0; row < t->ne[1]; ++row) {
@@ -5445,8 +5449,9 @@ struct test_dsv4_hc_down_owner : public test_dsv4_hc_fused {
                 const size_t token = index/(act ? R : 4), row = index%(act ? R : 4);
                 double sum = 0.0;
                 for (size_t stream = 0; stream < 4; ++stream) {
-                    const double value = double(4*token + stream + 1)/16.0;
-                    sum += value/std::sqrt(value*value + 1e-6);
+                    const double sign = stream % 2 == 0 ? 1.0 : -1.0;
+                    const double value = sign*double(4*token + stream + 1)/16.0;
+                    sum += double(stream + 1)*value/std::sqrt(value*value + 1e-6);
                 }
                 const double weight = ggml_bf16_to_fp32(ggml_fp32_to_bf16(float(row + 1)/(8*n_embd)));
                 const double z = 0.25*n_embd*weight*sum;
