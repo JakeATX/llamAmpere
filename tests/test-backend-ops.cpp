@@ -15081,6 +15081,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_dsv4_hc_fused(512, 512, nt, true, true, 1));
     }
     test_cases.emplace_back(new test_dsv4_hc_fused(512, 64, 1, true, false, 16));
+    // Odd widths and row tails cross warp boundaries in the fused finish.
+    for (int64_t nt : { 3, 5, 7 }) {
+        test_cases.emplace_back(new test_dsv4_hc_fused(512, 192, nt, false, true, 2));
+        test_cases.emplace_back(new test_dsv4_hc_fused(512, 192, nt, true, true, 2));
+    }
     // [GDNGATES] Flash-Next linear-attention gates at every token count the kernel specializes, both graph orders
     for (int64_t nt = 1; nt <= 8; ++nt) {
         test_cases.emplace_back(new test_gdn_gates(2560, 48, nt, true));

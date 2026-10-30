@@ -23,6 +23,7 @@
 
 #include <cstdlib>
 #include <mutex>
+#include <type_traits>
 #include <unordered_map>
 
 static constexpr int HCF_CHUNK      = 512;  // columns per split-K chunk; n_embd must be a multiple
@@ -75,7 +76,7 @@ static __device__ __forceinline__ float4 hcf_post_val4(const hcf_post_fold & pf,
 // ssq [row block][n_chunks][T]    partial sums of x^2 (only row block 0 when cnt == nullptr)
 // cnt != nullptr: the last CTA to finish a row block (over all chunks) also runs the finish for its 32 rows
 // (same sums in the same order as hcf_down_finish, so the result is bit-identical to the two-kernel path).
-template <int T, bool FOLD, int HCF_DOWN_ROWS>
+template <int T, bool FOLD, int HCF_DOWN_ROWS, bool WARP_FINISH = false>
 static __global__ void __launch_bounds__(HCF_DOWN_WARPS*WARP_SIZE)
 hcf_down_partial(
         const float * __restrict__ x, const float * __restrict__ wn,
@@ -232,25 +233,50 @@ hcf_down_partial(
     constexpr int hc = 4;
     const int cps = n_embd/HCF_CHUNK;  // chunks per stream
     const float * ssq_rb = ssq + (int64_t) blockIdx.x*n_chunks*T;
-    if (threadIdx.x < hc*T) {
-        const int s = threadIdx.x / T;
-        const int t = threadIdx.x % T;
-        float sq = 0.0f;
-        for (int cc = 0; cc < cps; ++cc) {
-            sq += __ldcg(ssq_rb + (s*cps + cc)*T + t);
+    float r_warp[hc] = {};
+    if constexpr (WARP_FINISH) {
+#pragma unroll
+        for (int s = 0; s < hc; ++s) {
+            if (lane < T) {
+                float sq = 0.0f;
+                for (int cc = 0; cc < cps; ++cc) {
+                    sq += __ldcg(ssq_rb + (s*cps + cc)*T + lane);
+                }
+                r_warp[s] = rsqrtf(sq/n_embd + eps);
+                if (blockIdx.x == 0 && warp == 0) {
+                    dst[n_rows*T + lane*hc + s] = r_warp[s];
+                }
+            }
         }
-        const float rv = rsqrtf(sq/n_embd + eps);
-        rr[s][t] = rv;
-        if (blockIdx.x == 0) {
-            dst[n_rows*T + t*hc + s] = rv;
+    } else {
+        if (threadIdx.x < hc*T) {
+            const int s = threadIdx.x / T;
+            const int t = threadIdx.x % T;
+            float sq = 0.0f;
+            for (int cc = 0; cc < cps; ++cc) {
+                sq += __ldcg(ssq_rb + (s*cps + cc)*T + t);
+            }
+            const float rv = rsqrtf(sq/n_embd + eps);
+            rr[s][t] = rv;
+            if (blockIdx.x == 0) {
+                dst[n_rows*T + t*hc + s] = rv;
+            }
         }
+        __syncthreads();
     }
-    __syncthreads();
 
-    for (int o = threadIdx.x; o < (HCF_DOWN_WARPS*HCF_DOWN_ROWS)*T; o += blockDim.x) {
+    for (int base = 0; base < (HCF_DOWN_WARPS*HCF_DOWN_ROWS)*T; base += blockDim.x) {
+        const int o = base + threadIdx.x;
         const int k = blockIdx.x*(HCF_DOWN_WARPS*HCF_DOWN_ROWS) + o / T;
         const int t = o % T;
-        if (k >= n_rows) {
+        float r_token[hc];
+        if constexpr (WARP_FINISH) {
+#pragma unroll
+            for (int s = 0; s < hc; ++s) {
+                r_token[s] = __shfl_sync(0xffffffff, r_warp[s], t, WARP_SIZE);
+            }
+        }
+        if (o >= (HCF_DOWN_WARPS*HCF_DOWN_ROWS)*T || k >= n_rows) {
             continue;
         }
         float v = 0.0f;
@@ -261,7 +287,11 @@ hcf_down_partial(
             for (int cc = 0; cc < cps; ++cc) {
                 part += __ldcg(P + ((int64_t) (s*cps + cc)*n_rows + k)*T + t);
             }
-            v += rr[s][t] * part;
+            if constexpr (WARP_FINISH) {
+                v += r_token[s] * part;
+            } else {
+                v += rr[s][t] * part;
+            }
         }
         if (k < R) {
             const float a = lo_scale*v;
@@ -558,6 +588,10 @@ static void hcf_down_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, 
         const int v = e ? atoi(e) : HCF_DOWN_ROWS_DEF;
         return v == 1 || v == 2 ? v : HCF_DOWN_ROWS_DEF;
     }();
+    static const bool warp_finish = [] {
+        const char * e = getenv("LLAMA_HC_DOWN_WARP_FINISH");
+        return e && atoi(e) == 1;
+    }();
     const int rows_pw = (n_rows + HCF_DOWN_WARPS*rows_env - 1)/(HCF_DOWN_WARPS*rows_env) <= HCF_CNT_RB ? rows_env : HCF_DOWN_ROWS_DEF;
     const int n_rb     = (n_rows + HCF_DOWN_WARPS*rows_pw - 1)/(HCF_DOWN_WARPS*rows_pw);
 
@@ -584,15 +618,23 @@ static void hcf_down_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, 
         pf.sp1  = hpost->src[2]->nb[1]/sizeof(float);
         GGML_ASSERT(pf.h == x->data);
     }
-    auto kernel = hpost != nullptr ?
-        (rows_pw == 1 ? hcf_down_partial<T, true, 1> : rows_pw == 2 ? hcf_down_partial<T, true, 2> : hcf_down_partial<T, true, HCF_DOWN_ROWS_DEF>) :
-        (rows_pw == 1 ? hcf_down_partial<T, false, 1> : rows_pw == 2 ? hcf_down_partial<T, false, 2> : hcf_down_partial<T, false, HCF_DOWN_ROWS_DEF>);
-    kernel<<<grid, HCF_DOWN_WARPS*WARP_SIZE, 0, stream>>>(
-        (const float *) x->data, (const float *) wn->data,
-        (const char *) wd->data, wd->nb[1],
-        wi ? (const char *) wi->data : nullptr, wi ? wi->nb[1] : 0,
-        R, n_rows, hc_dim, P.get(), ssq.get(),
-        cnt_off, n_embd, eps, lo_scale, inj_scale, (float *) dst->data, pf);
+    auto launch = [&](auto finish) {
+        constexpr bool WF = decltype(finish)::value;
+        auto kernel = hpost != nullptr ?
+            (rows_pw == 1 ? hcf_down_partial<T, true, 1, WF> : rows_pw == 2 ? hcf_down_partial<T, true, 2, WF> : hcf_down_partial<T, true, HCF_DOWN_ROWS_DEF, WF>) :
+            (rows_pw == 1 ? hcf_down_partial<T, false, 1, WF> : rows_pw == 2 ? hcf_down_partial<T, false, 2, WF> : hcf_down_partial<T, false, HCF_DOWN_ROWS_DEF, WF>);
+        kernel<<<grid, HCF_DOWN_WARPS*WARP_SIZE, 0, stream>>>(
+            (const float *) x->data, (const float *) wn->data,
+            (const char *) wd->data, wd->nb[1],
+            wi ? (const char *) wi->data : nullptr, wi ? wi->nb[1] : 0,
+            R, n_rows, hc_dim, P.get(), ssq.get(),
+            cnt_off, n_embd, eps, lo_scale, inj_scale, (float *) dst->data, pf);
+    };
+    if (warp_finish) {
+        launch(std::true_type{});
+    } else {
+        launch(std::false_type{});
+    }
 
     if (cnt_off < 0) {
         const int n_out = (n_rows + hc)*T;
