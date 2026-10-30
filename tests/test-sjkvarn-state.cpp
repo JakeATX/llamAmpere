@@ -33,6 +33,7 @@
 #include "../src/llama-arch.h"
 #include "../src/llama-model-saver.h"
 #include "../src/llama-model.h"
+#include "../src/llama-ple-prefetch.h"
 
 #include <cmath>
 #include <cstdio>
@@ -42,6 +43,10 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+#if defined(__linux__)
+#include <sys/mman.h>
+#endif
 
 static const uint32_t n_vocab = 128, n_embd = 512, n_layer = 4;
 
@@ -1061,7 +1066,74 @@ static void deferred_mask_capacity_case() {
     printf("OK: 64 pending masks preserved, 65th falls back, all host mask bytes exact\n");
 }
 
+static void ple_cold_recheck_case() {
+#if defined(__linux__)
+    ggml_context * ctx = ggml_init({ 1024*1024, nullptr, true });
+    require(ctx != nullptr, "prefetch test context");
+    const size_t size = 4*4096;
+    void * pages = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    require(pages != MAP_FAILED, "prefetch test pages");
+    auto * table = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1024, 4);
+    table->data = pages;
+    table->buffer = ggml_backend_cpu_buffer_from_ptr(pages, size);
+    require(table->buffer != nullptr, "prefetch host buffer");
+    llama_model model(llama_model_default_params());
+    model.arch = LLM_ARCH_QWEN4EXP;
+    model.per_layer_tok_embd = table;
+    model.can_prefetch.insert(table);
+    model.hparams.ple_n_heads = 1;
+    model.hparams.ple_ngram_size = 2;
+    model.hparams.ple_heads_per_ngram = 1;
+    model.hparams.ple_eos_token_id = 3;
+    model.hparams.ple_layer_multipliers.fill(0);
+    model.hparams.ple_layer_multipliers[0] = 1;
+    model.hparams.ple_head_vocab_sizes[0] = 4;
+    model.hparams.ple_head_offsets[0] = 0;
+    std::vector<llama_token> tokens(512, 0);
+    std::fill(tokens.begin() + 256, tokens.end(), 1);
+    setenv("LLAMA_PLE_PREFETCH", "1", 1);
+    setenv("LLAMA_PLE_PF_MIN", "1", 1);
+    setenv("LLAMA_PLE_PF_MODE", "fault", 1);
+    setenv("LLAMA_PLE_PF_AHEAD", "1000000", 1);
+    for (int mode = 0; mode < 3; ++mode) {
+        require(madvise(pages, size, MADV_DONTNEED) == 0, "reset anonymous page residency");
+        *(volatile char *) pages = 0;
+        setenv("LLAMA_PLE_PF_RECHECK", mode == 0 ? "0" : "1", 1);
+        setenv("LLAMA_PLE_PF_COLD_THREADS", mode == 2 ? "0" : "2", 1);
+        std::atomic<int> boosts{0};
+        llama_log_set([](ggml_log_level, const char * text, void * data) {
+            if (strstr(text, "[PLEPF] cold table")) {
+                static_cast<std::atomic<int> *>(data)->fetch_add(1);
+            }
+        }, &boosts);
+        auto pf = llama_ple_prefetch::create(model, 256);
+        require(pf != nullptr, "create page-touch prefetch");
+        pf->hint(tokens.data(), tokens.size(), 0);
+        require(pf->consume(tokens.size(), nullptr, 0), "consume cached prefix and cold suffix");
+        pf->stop();
+        llama_log_set(nullptr, nullptr);
+        require(boosts.load() == (mode == 1 ? 1 : 0), "late cold pages need reader boost only with recheck enabled");
+    }
+    ggml_backend_buffer_free(table->buffer);
+    ggml_free(ctx);
+    munmap(pages, size);
+    printf("OK: cached first chunk, cold second chunk, recheck boost and cold-reader opt-out\n");
+#else
+    printf("SKIP: page residency test needs Linux\n");
+#endif
+}
+
 int main(int argc, char ** argv) {
+    if (argc > 1 && strcmp(argv[1], "--ple-cold-recheck") == 0) {
+        try {
+            ple_cold_recheck_case();
+            return 0;
+        } catch (const std::exception & e) {
+            llama_log_set(nullptr, nullptr);
+            fprintf(stderr, "prefetch recheck: FAIL: %s\n", e.what());
+            return 1;
+        }
+    }
     if (argc > 1 && strcmp(argv[1], "--mask-capacity") == 0) {
         try {
             deferred_mask_capacity_case();

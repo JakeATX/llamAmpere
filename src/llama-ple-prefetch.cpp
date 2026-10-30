@@ -87,6 +87,7 @@ std::unique_ptr<llama_ple_prefetch> llama_ple_prefetch::create(const llama_model
     // fork: a cold table (evicted by another process, first prompt after boot) is bound by disk queue depth, not by
     // the readers' CPU; LLAMA_PLE_PF_COLD_THREADS=0 keeps n_threads in every case
     pf->n_cold    = (int) std::min<int64_t>(std::max<int64_t>(0, ple_pf_env("LLAMA_PLE_PF_COLD_THREADS", PLE_PF_DEFAULT_COLD)), 512);
+    pf->n_recheck = (uint32_t) std::min<int64_t>(std::max<int64_t>(0, ple_pf_env("LLAMA_PLE_PF_RECHECK", 0)), UINT32_MAX);
     // by default only long calls (a short check or catch-up batch is cheaper to fault in) and the whole call ahead
     pf->n_min     = (uint32_t) std::max<int64_t>(1, ple_pf_env("LLAMA_PLE_PF_MIN", user ? 256 : PLE_PF_DEFAULT_MIN));
     pf->n_ahead   = (uint64_t) std::max<int64_t>(0, ple_pf_env("LLAMA_PLE_PF_AHEAD", 1000000));
@@ -326,14 +327,16 @@ void llama_ple_prefetch::build() {
             }
         }
         std::sort(cp.begin(), cp.end());
-        if (c == 0 && n_cold > n_threads && !cp.empty()) {
+        // fork: a hot shared prefix can hide cold pages in the rest of the call.
+        const bool sample = c == 0 || (n_recheck > 0 && c % n_recheck == 0);
+        if (sample && n_readers == n_threads && n_cold > n_threads && !cp.empty()) {
             const double res = resident_fraction(cp, base);
             if (res < 0.5) {
                 for (int i = n_threads; i < n_cold; ++i) {
                     readers.emplace_back([this, i, &last]() { last[i] = reader(); });
                 }
                 n_readers = n_cold;
-                LLAMA_LOG_INFO("%s: [PLEPF] cold table (%.0f%% of sampled pages cached): %d readers\n", __func__, 100.0*res, n_cold);
+                LLAMA_LOG_INFO("%s: [PLEPF] cold table (%.0f%% of sampled pages cached): %d readers at chunk %zu\n", __func__, 100.0*res, n_cold, c);
             }
         }
         const size_t r0 = nr;

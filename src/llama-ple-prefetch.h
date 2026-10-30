@@ -66,8 +66,9 @@ private:
 
     // configuration
     int      n_threads = 0;
-    int      n_cold    = 0;      // readers once the first chunk finds the table mostly uncached (0 = never more)
+    int      n_cold    = 0;      // readers once a sample finds the table mostly uncached (0 = never more)
     int      n_readers = 0;      // readers of the current call
+    uint32_t n_recheck = 0;      // chunks between later residency samples (0 = first chunk only)
     bool     use_pread = true;
     bool     use_advise = false; // [PFGAP] file mode: ask the kernel to queue the reads instead of copying them
     bool     coalesce = false;
