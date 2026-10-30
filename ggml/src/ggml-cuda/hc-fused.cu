@@ -856,6 +856,8 @@ hcf_up_gate(
 static bool hcf_common_supported(const ggml_tensor * x, const ggml_tensor * wn) {
     return x->type == GGML_TYPE_F32 && wn->type == GGML_TYPE_F32 &&
         ggml_is_contiguous(x) && ggml_is_contiguous(wn) &&
+        x->view_offs % 16 == 0 && wn->view_offs % 16 == 0 &&
+        ((uintptr_t) x->data) % 16 == 0 && ((uintptr_t) wn->data) % 16 == 0 &&
         x->ne[1] == 4 && x->ne[2] >= 1 && x->ne[2] <= HCF_MAX_T && x->ne[3] == 1 &&
         x->ne[0] % HCF_CHUNK == 0;
 }
