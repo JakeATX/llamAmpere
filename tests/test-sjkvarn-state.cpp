@@ -995,6 +995,25 @@ static void scratch_views_case(llama_model * model, sj_cfg cfg) {
 static void deferred_mask_capacity_case() {
     ggml_context * ctx = ggml_init({ 1024*1024, nullptr, false });
     require(ctx != nullptr, "mask test context");
+    auto * valid = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 8, 3);
+    auto * wrong_type = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 8, 3);
+    auto * padded = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 10, 3);
+    auto * strided = ggml_view_2d(ctx, padded, 8, 3, 10*sizeof(ggml_fp16_t), 0);
+    ggml_tensor no_data = *valid;
+    no_data.data = nullptr;
+    require(!llama_kq_mask_deferred_set(nullptr, 8, { 0, 3, 8 }), "null mask refused");
+    require(!llama_kq_mask_deferred_set(&no_data, 8, { 0, 3, 8 }), "unallocated mask refused");
+    require(!llama_kq_mask_deferred_set(wrong_type, 8, { 0, 3, 8 }), "non-f16 mask refused");
+    require(!llama_kq_mask_deferred_set(strided, 8, { 0, 3, 8 }), "strided mask refused");
+    require(!llama_kq_mask_deferred_set(valid, 0, { 0, 0, 0 }), "zero width refused");
+    require(!llama_kq_mask_deferred_set(valid, 7, { 0, 3, 7 }), "wrong width refused");
+    require(!llama_kq_mask_deferred_set(valid, 8, { 0, 8 }), "missing row count refused");
+    require(!llama_kq_mask_deferred_set(valid, 8, { 0, 3, 8, 8 }), "extra row count refused");
+    require(!llama_kq_mask_deferred_set(valid, 8, { -1, 3, 8 }), "negative visible count refused");
+    require(!llama_kq_mask_deferred_set(valid, 8, { 0, 3, 9 }), "oversized visible count refused");
+    std::vector<int32_t> refused_counts;
+    int64_t refused_width = 0;
+    require(!llama_kq_mask_deferred_get(valid, refused_counts, &refused_width), "refused counts leave no record");
     std::vector<ggml_tensor *> masks;
     for (int i = 0; i < 65; ++i) {
         auto * mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 8, 3);
@@ -1019,6 +1038,7 @@ static void deferred_mask_capacity_case() {
     int64_t n_kv = 0;
     require(!llama_kq_mask_deferred_get(masks.back(), counts, &n_kv), "refused mask uses normal host fill");
     ggml_free(ctx);
+    printf("OK: invalid deferred masks refused without using pending slots\n");
     printf("OK: 64 pending masks preserved, 65th falls back, all host mask bytes exact\n");
 }
 

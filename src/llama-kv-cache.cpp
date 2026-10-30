@@ -4294,6 +4294,15 @@ kq_mask_deferred * kq_mask_deferred_find(const ggml_tensor * t) {
 } // namespace
 
 bool llama_kq_mask_deferred_set(const ggml_tensor * t, int64_t n_kv, std::vector<int32_t> && n_visible) {
+    if (!t || !t->data || t->type != GGML_TYPE_F16 || n_kv <= 0 || t->ne[0] != n_kv ||
+            !ggml_is_contiguous(t) || ggml_nrows(t) != (int64_t) n_visible.size()) {
+        return false;
+    }
+    for (int32_t count : n_visible) {
+        if (count < 0 || count > n_kv) {
+            return false;
+        }
+    }
     std::lock_guard<std::mutex> lock(g_kq_deferred_mu);
     // Keep pending masks until their copies run. A full list falls back to the host fill.
     if (g_kq_deferred.size() >= 64) {
