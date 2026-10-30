@@ -2630,8 +2630,23 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
     cb(gate, "ple_gate", il);
 
     // [n_embd, 1, T] value broadcast across the hc streams, scaled by the gate
-    ggml_tensor * v3 = ggml_reshape_3d(ctx0, value, n_embd, 1, n_tokens);
-    v3 = ggml_repeat_4d(ctx0, v3, n_embd, hc, n_tokens, 1);
+    // LLAMA_PLE_GATE_BCAST=1 (opt-in): read the value through a stride-0 view over the hc axis instead of
+    // materializing the [n_embd, hc, T] repeat (~0.5 GB written and read back per 12,288-token ubatch). The mul
+    // sees the same value for every stream, so the same products and the same bits.
+    static const bool gate_bcast = [] {
+        const char * e = getenv("LLAMA_PLE_GATE_BCAST");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    ggml_tensor * v3 = nullptr;
+    if (gate_bcast && ggml_is_contiguous(value)) {
+        // created at [n_embd, 1, T] (the view size check needs the extent to fit), then the hc axis is widened with
+        // stride 0; ggml_nbytes of the result still equals the value's
+        v3 = ggml_view_4d(ctx0, value, n_embd, 1, n_tokens, 1, value->nb[1], value->nb[1], value->nb[1] * n_tokens, 0);
+        v3->ne[1] = hc;
+        v3->nb[1] = 0;
+    } else {
+        v3 = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, value, n_embd, 1, n_tokens), n_embd, hc, n_tokens, 1);
+    }
 
     ggml_tensor * gated = ggml_mul(ctx0, v3, gate);
     cb(gated, "ple_gated_value", il);
