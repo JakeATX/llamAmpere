@@ -143,7 +143,12 @@ void ggml_moe_cache_host_restore(const void * data, size_t size) {
 }
 
 bool ggml_moe_cache_resident_copy(ggml_backend_t backend, struct ggml_tensor * dst, size_t offset, const void * host, size_t size) {
-    if (!ggml_moe_cache_has_residents()) { return false; }
+    // fork: prompt loans retain runtime slots without a permanent resident allocation.
+    static const bool keep_prompt = [] {
+        const char * e = getenv("LLAMA_PP_KEEP_EXPERTS");
+        return e && strcmp(e, "1") == 0;
+    }();
+    if (!keep_prompt && !ggml_moe_cache_has_residents()) { return false; }
     std::lock_guard<std::mutex> lock(g_moe_cache_registry_mu);
     for (const auto & api : g_moe_cache_providers) {
         if (api.resident_copy && api.resident_copy(backend, dst, offset, host, size)) { return true; }

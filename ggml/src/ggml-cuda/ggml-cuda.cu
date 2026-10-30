@@ -100,6 +100,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <charconv>
 #include <cinttypes>
 #include <condition_variable>
@@ -4871,6 +4872,77 @@ static bool ggml_backend_cuda_upload_host_small(ggml_backend_t backend, const vo
     CUDA_CHECK(cudaEventRecord(ev, stream));
     r.inflight.push_back({ beg, end, ev });
     r.head = end;
+    return true;
+}
+
+// [PPIMPL] LLAMA_KQ_MASK_DEVICE: the host only computes how many leading cells each query row sees (the used cells are
+// contiguous and in position order); this fills the f16 mask on the card from those counts: 0 for the first count cells
+// of the row, -INF for the rest. Same values as the host fill, without the host wait and the ~0.3 GB copy per ubatch.
+// The counts go through a small mapped pinned ring; a slot is reused only after the fill that read it has finished.
+static __global__ void k_cuda_fill_prefix_mask(half * __restrict__ dst, const int32_t * __restrict__ n_visible,
+                                               int64_t n_kv, int64_t n_rows) {
+    const int64_t row = blockIdx.x;
+    if (row >= n_rows) {
+        return;
+    }
+    const int64_t c  = n_visible[row];
+    const int64_t nv = c < 0 ? 0 : c > n_kv ? n_kv : c;
+    half * r = dst + row*n_kv;
+    const __half_raw keep = { 0x0000 }, drop = { 0xFC00 };
+    for (int64_t j = threadIdx.x; j < n_kv; j += blockDim.x) {
+        r[j] = j < nv ? half(keep) : half(drop);
+    }
+}
+
+static bool ggml_backend_cuda_fill_prefix_mask(ggml_backend_t backend, ggml_tensor * dst, const int32_t * n_visible,
+                                               int64_t n_rows, int64_t n_kv) {
+    constexpr int    N_SLOTS    = 4;
+    constexpr size_t SLOT_BYTES = 256u << 10;
+    if (!backend || !ggml_backend_is_cuda(backend) || !dst || !dst->data || dst->type != GGML_TYPE_F16 ||
+            !ggml_is_contiguous(dst) || dst->ne[0] != n_kv || n_rows <= 0 ||
+            n_rows != dst->ne[1]*dst->ne[2]*dst->ne[3] || (size_t) n_rows*sizeof(int32_t) > SLOT_BYTES) {
+        return false;
+    }
+    auto * ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
+    if (ctx->scratch_borrowed) {
+        return false;
+    }
+    struct ring {
+        std::mutex  mu;
+        bool        failed = false;
+        char      * host = nullptr;
+        char      * dev  = nullptr;
+        cudaEvent_t ev[N_SLOTS] = {};
+        int         next = 0;
+    };
+    static ring rings[GGML_CUDA_MAX_DEVICES];
+    auto & r = rings[ctx->device];
+    std::lock_guard<std::mutex> lock(r.mu);
+    if (r.failed) {
+        return false;
+    }
+    ggml_cuda_set_device(ctx->device);
+    if (!r.host) {
+        if (cudaHostAlloc((void **) &r.host, N_SLOTS*SLOT_BYTES, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+                cudaHostGetDevicePointer((void **) &r.dev, r.host, 0) != cudaSuccess) {
+            (void) cudaGetLastError();
+            r.failed = true;
+            GGML_LOG_WARN("%s: no mapped count ring; the mask is filled on the host\n", __func__);
+            return false;
+        }
+        for (auto & e : r.ev) {
+            CUDA_CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+        }
+    }
+    const int slot = r.next;
+    r.next = (r.next + 1) % N_SLOTS;
+    CUDA_CHECK(cudaEventSynchronize(r.ev[slot]));  // the fill that read this slot N_SLOTS uploads ago
+    memcpy(r.host + slot*SLOT_BYTES, n_visible, (size_t) n_rows*sizeof(int32_t));
+    cudaStream_t stream = ctx->stream();
+    k_cuda_fill_prefix_mask<<<(unsigned) n_rows, 256, 0, stream>>>((half *) dst->data,
+            (const int32_t *) (r.dev + slot*SLOT_BYTES), n_kv, n_rows);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaEventRecord(r.ev[slot], stream));
     return true;
 }
 
@@ -10325,6 +10397,67 @@ static cudaEvent_t ggml_cuda_shexp_side_event(int device, int which) {
     return ev[device][which];
 }
 
+// GGML_CUDA_OP_TIMES=<ms> (diagnostic, off by default): for uncaptured graphs, time each node on the main stream
+// with events and on the host, and log the slowest op kinds of every graph whose GPU time is >= <ms>.
+// Fused nodes count toward the first node of the fusion. Synchronizes once per graph.
+struct ggml_cuda_op_times {
+    std::vector<cudaEvent_t> ev;
+    std::vector<std::pair<int, int64_t>> marks; // node index, host us
+    int device = -1;
+
+    static float min_ms() {
+        static const float v = [] { const char * e = getenv("GGML_CUDA_OP_TIMES"); return e && *e ? (float) atof(e) : 0.0f; }();
+        return v;
+    }
+    void mark(int device_, cudaStream_t stream, int i) {
+        if (device != device_) {
+            for (auto e : ev) { CUDA_CHECK(cudaEventDestroy(e)); }
+            ev.clear();
+            device = device_;
+        }
+        if (marks.size() == ev.size()) {
+            cudaEvent_t e;
+            CUDA_CHECK(cudaEventCreate(&e));
+            ev.push_back(e);
+        }
+        CUDA_CHECK(cudaEventRecord(ev[marks.size()], stream));
+        marks.push_back({ i, ggml_time_us() });
+    }
+    void finish(cudaStream_t stream, const ggml_cgraph * cgraph) {
+        mark(device, stream, cgraph->n_nodes);
+        CUDA_CHECK(cudaEventSynchronize(ev[marks.size() - 1]));
+        std::map<std::string, std::pair<float, float>> by_op; // "op:name" -> gpu ms, host ms
+        float total = 0.0f;
+        for (size_t k = 0; k + 1 < marks.size(); ++k) {
+            float ms = 0.0f;
+            CUDA_CHECK(cudaEventElapsedTime(&ms, ev[k], ev[k + 1]));
+            const ggml_tensor * n = cgraph->nodes[marks[k].first];
+            std::string name = n->name;
+            const size_t dash = name.rfind('-');
+            if (dash != std::string::npos && dash + 1 < name.size() && isdigit((unsigned char) name[dash + 1])) {
+                name.resize(dash);
+            }
+            auto & acc = by_op[std::string(ggml_op_desc(n)) + ":" + name];
+            acc.first  += ms;
+            acc.second += (marks[k + 1].second - marks[k].second) / 1000.0f;
+            total += ms;
+        }
+        if (total >= min_ms() && !by_op.empty()) {
+            std::vector<std::pair<std::string, std::pair<float, float>>> v(by_op.begin(), by_op.end());
+            std::sort(v.begin(), v.end(), [](const auto & a, const auto & b) { return a.second.first > b.second.first; });
+            std::string line;
+            for (size_t k = 0; k < v.size() && k < 8; ++k) {
+                char buf[192];
+                snprintf(buf, sizeof(buf), " %s=%.2f/%.2f", v[k].first.c_str(), v[k].second.first, v[k].second.second);
+                line += buf;
+            }
+            GGML_LOG_INFO("[OPT] graph nodes=%d gpu_ms=%.2f host_ms=%.2f top(gpu/host ms):%s\n", cgraph->n_nodes, total,
+                    (marks.back().second - marks.front().second) / 1000.0f, line.c_str());
+        }
+        marks.clear();
+    }
+};
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, uint64_t graph_key) {
     bool graph_evaluated_or_captured = false;
 
@@ -10472,8 +10605,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             ggml_cuda_autofuse_plan * autofuse = ggml_cuda_autofuse_enabled() && !ggml_cuda_fusion_disabled() && stream_ctx.concurrent_events.empty() ?
                 ggml_cuda_autofuse_prepare(*cuda_ctx, cgraph) : nullptr;
 
+            static thread_local ggml_cuda_op_times op_times_state;
+            ggml_cuda_op_times * op_times = !use_cuda_graph && ggml_cuda_op_times::min_ms() > 0.0f ? &op_times_state : nullptr;
+            cudaStream_t op_times_stream = cuda_ctx->stream(cuda_ctx->device, 0);
+
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
+                if (op_times) {
+                    op_times->mark(cuda_ctx->device, op_times_stream, i);
+                }
                 if (is_concurrent_event_active) {
                     GGML_ASSERT(concurrent_event);
 
@@ -10641,6 +10781,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
                 CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), ggml_cuda_shexp_side_event(dev, 1), 0));
                 shexp_state = 0;
+            }
+            if (op_times) {
+                op_times->finish(op_times_stream, cgraph);
             }
             // [HCPN] every queued hc_pre must have run: its xn was never written
             GGML_ASSERT(g_hc_pre_xn_pending.empty() && "GGML_CUDA_HC_PRE_XN: a queued hc_pre was not reached");
@@ -12603,6 +12746,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_cuda_pool_trim") == 0) {
         return (void *) ggml_backend_cuda_pool_trim;
     }
+    if (strcmp(name, "ggml_backend_cuda_moe_cache_fill_epoch") == 0) {
+        return (void *) ggml_cuda_moe_cache_fill_epoch;
+    }
     if (strcmp(name, "ggml_backend_cuda_reset_scratch") == 0) {
         return (void *) ggml_backend_cuda_reset_scratch;
     }
@@ -12614,6 +12760,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_upload_host_small") == 0) {
         return (void *) ggml_backend_cuda_upload_host_small;
+    }
+    if (strcmp(name, "ggml_backend_cuda_fill_prefix_mask") == 0) {
+        return (void *) ggml_backend_cuda_fill_prefix_mask;
     }
     if (strcmp(name, "ggml_backend_cuda_mtp_row_wait") == 0) {
         return (void *) ggml_backend_cuda_mtp_row_wait;

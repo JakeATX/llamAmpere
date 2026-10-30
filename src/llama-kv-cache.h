@@ -48,6 +48,11 @@ ggml_type llama_kv_cache_turbo_layer_adaptive_type_v(
 static constexpr uint32_t LLAMA_SJ_KVARN_CKPT_MAGIC     = 0x4b434a53u; // "SJCK"
 static constexpr uint32_t LLAMA_SJ_KVARN_CKPT_END_MAGIC = 0x45434a53u; // "SJCE"
 
+// [PPIMPL] LLAMA_KQ_MASK_DEVICE: deferred sequence-prefix masks (llama-kv-cache.cpp)
+bool llama_kq_mask_device_enabled();
+bool llama_kq_mask_deferred_get(const ggml_tensor * t, std::vector<int32_t> & n_visible, int64_t * n_kv);
+void llama_kq_mask_deferred_fill_host(const ggml_tensor * t);
+
 class llama_kv_cache : public llama_memory_i {
 public:
     struct stream_copy_info {

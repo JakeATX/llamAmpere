@@ -2475,6 +2475,170 @@ void ggml_cuda_flash_attn_ext_compact_mask(
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+// LLAMA_QSA_DIRECT_LISTS: the same per-tile lists as flash_attn_mask_to_sparse_indices, built from the selected-cell rows
+// (src[8], cells >= n_cells are dead) instead of the n_kv-wide mask: the tile's cells are set in a shared bitmap, then
+// written in ascending order and cut at n_kv_max, which is the order and the cut of the mask scan.
+template <int ncols1, bool oob>
+__launch_bounds__(256, 1)
+static __global__ void flash_attn_rows_to_sparse_indices(
+        const int32_t * rows, int32_t * indices, int32_t * counts, const int c0, const int n_cells, const int n_sel, const int64_t s_row,
+        const int n_queries, const int n_kv_max) {
+    ggml_cuda_pdl_sync();
+
+    extern __shared__ uint32_t cell_bits[];
+    __shared__ int warp_sums[256/WARP_SIZE];
+    const int tid     = threadIdx.x;
+    const int group   = blockIdx.x;
+    const int n_words = (n_cells + 31)/32;
+    int32_t * out = indices + int64_t(group)*n_kv_max;
+
+    for (int w = tid; w < n_words; w += blockDim.x) {
+        cell_bits[w] = 0;
+    }
+    __syncthreads();
+    const int q0 = group*ncols1;
+#pragma unroll
+    for (int q = 0; q < ncols1; ++q) {
+        if (oob && q0 + q >= n_queries) {
+            break;
+        }
+        const int32_t * row = rows + int64_t(q0 + q)*s_row;
+        for (int s = tid; s < n_sel; s += blockDim.x) {
+            const int32_t c = row[s] - c0;
+            if (c >= 0 && c < n_cells) {
+                atomicOr(&cell_bits[c >> 5], 1u << (c & 31));
+            }
+        }
+    }
+    __syncthreads();
+
+    // each thread owns a contiguous run of words; an exclusive scan of the run counts gives its first output slot
+    const int per_thread = (n_words + blockDim.x - 1)/blockDim.x;
+    const int w0 = min(tid*per_thread, n_words);
+    const int w1 = min(w0 + per_thread, n_words);
+    int run = 0;
+    for (int w = w0; w < w1; ++w) {
+        run += __popc(cell_bits[w]);
+    }
+    const int lane = tid % WARP_SIZE;
+    const int warp = tid / WARP_SIZE;
+    int incl = run;
+#pragma unroll
+    for (int off = 1; off < WARP_SIZE; off *= 2) {
+        const int v = __shfl_up_sync(0xFFFFFFFF, incl, off);
+        incl += lane >= off ? v : 0;
+    }
+    if (lane == WARP_SIZE - 1) {
+        warp_sums[warp] = incl;
+    }
+    __syncthreads();
+    int base = incl - run;
+    int total = 0;
+    for (int iw = 0; iw < (int) (blockDim.x/WARP_SIZE); ++iw) {
+        base  += iw < warp ? warp_sums[iw] : 0;
+        total += warp_sums[iw];
+    }
+    for (int w = w0; w < w1 && base < n_kv_max; ++w) {
+        uint32_t b = cell_bits[w];
+        while (b != 0 && base < n_kv_max) {
+            const int bit = __ffs(b) - 1;
+            b &= b - 1;
+            out[base++] = w*32 + bit;
+        }
+    }
+    const int count = min(total, n_kv_max);
+    for (int i = count + tid; i < n_kv_max; i += blockDim.x) {
+        out[i] = -1;
+    }
+    if (tid == 0) {
+        counts[group] = count;
+    }
+    __syncthreads();
+    ggml_cuda_pdl_lc();
+}
+
+static __global__ void flash_attn_sparse_lists_diff(
+        const int32_t * a, const int32_t * b, const int64_t n, unsigned long long * n_diff) {
+    unsigned long long d = 0;
+    for (int64_t i = int64_t(blockIdx.x)*blockDim.x + threadIdx.x; i < n; i += int64_t(gridDim.x)*blockDim.x) {
+        d += a[i] != b[i];
+    }
+    if (d) {
+        atomicAdd(n_diff, d);
+    }
+}
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+
+// the window of the selected-cell rows that the next attention call covers: a chunked caller (the SJ-KVaRN prefill KV
+// chunks) attends queries [q0, q0 + n_queries) over cells [c0, c0 + n_cells) of the node, the rows hold node cells
+static thread_local int64_t fattn_rows_q0 = 0;
+static thread_local int     fattn_rows_c0 = 0;
+
+void ggml_cuda_flash_attn_ext_set_rows_window(const int64_t q0, const int c0) {
+    fattn_rows_q0 = q0;
+    fattn_rows_c0 = c0;
+}
+
+int ggml_cuda_flash_attn_ext_direct_lists_mode() {
+    static const int mode = [] { const char * e = getenv("LLAMA_QSA_DIRECT_LISTS"); return e ? atoi(e) : 0; }();
+    return mode;
+}
+
+// false: the caller scans the mask. Mode 2 also scans and logs how many list entries and counts differ (synchronizes).
+bool ggml_cuda_flash_attn_ext_lists_from_rows(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * rows, const ggml_tensor * mask, int32_t * indices, int32_t * counts,
+        int32_t n_queries, int32_t ncols1, int32_t n_kv_max, int64_t n_lists) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED_VARS(ctx, rows, mask, indices, counts, n_queries, ncols1, n_kv_max, n_lists);
+    return false;
+#else
+    const int mode = ggml_cuda_flash_attn_ext_direct_lists_mode();
+    const int n_cells = (int) mask->ne[0];
+    const size_t smem = size_t((n_cells + 31)/32)*sizeof(uint32_t);
+    const int64_t q0 = fattn_rows_q0;
+    if (mode <= 0 || rows == nullptr || rows->type != GGML_TYPE_I32 || rows->ne[1] < q0 + n_queries || rows->ne[2] != 1 ||
+            rows->ne[3] != 1 || mask->ne[2] != 1 || mask->ne[3] != 1 || smem > 48*1024 || rows->nb[0] != sizeof(int32_t) ||
+            (ncols1 != 2 && ncols1 != 4 && ncols1 != 8)) {
+        return false;
+    }
+    const int n_groups = (n_queries + ncols1 - 1)/ncols1;
+    if (n_lists != n_groups) {
+        return false; // query tiles are not ncols1 tokens (compact Q5/G6): keep the mask scan's layout
+    }
+    cudaStream_t stream = ctx.stream();
+    const bool oob = n_queries % ncols1 != 0;
+    const auto kernel = ncols1 == 2 ? (oob ? flash_attn_rows_to_sparse_indices<2, true> : flash_attn_rows_to_sparse_indices<2, false>) :
+                        ncols1 == 4 ? (oob ? flash_attn_rows_to_sparse_indices<4, true> : flash_attn_rows_to_sparse_indices<4, false>) :
+                                      (oob ? flash_attn_rows_to_sparse_indices<8, true> : flash_attn_rows_to_sparse_indices<8, false>);
+    const ggml_cuda_kernel_launch_params launch_params(dim3(n_groups, 1, 1), dim3(256, 1, 1), smem, stream);
+    ggml_cuda_kernel_launch(kernel, launch_params, (const int32_t *) ((const char *) rows->data + q0*rows->nb[1]), indices, counts,
+        fattn_rows_c0, n_cells, (int) rows->ne[0],
+        (int64_t) (rows->nb[1]/sizeof(int32_t)), (int) n_queries, (int) n_kv_max);
+    CUDA_CHECK(cudaGetLastError());
+    if (mode >= 2) {
+        const int64_t n_list = int64_t(n_groups)*n_kv_max;
+        ggml_cuda_pool_alloc<int32_t> ref(ctx.pool(), n_list + n_groups);
+        ggml_cuda_pool_alloc<unsigned long long> n_diff(ctx.pool(), 1);
+        ggml_cuda_flash_attn_ext_compact_mask(mask, ref.get(), ref.get() + n_list, n_queries, ncols1, n_kv_max, stream);
+        CUDA_CHECK(cudaMemsetAsync(n_diff.get(), 0, sizeof(unsigned long long), stream));
+        flash_attn_sparse_lists_diff<<<256, 256, 0, stream>>>(indices, ref.get(), n_list, n_diff.get());
+        flash_attn_sparse_lists_diff<<<1, 256, 0, stream>>>(counts, ref.get() + n_list, n_groups, n_diff.get());
+        unsigned long long diff = 0;
+        CUDA_CHECK(cudaMemcpyAsync(&diff, n_diff.get(), sizeof(diff), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        static unsigned long long calls = 0, bad = 0;
+        ++calls;
+        bad += diff != 0;
+        if (diff != 0 || calls <= 4 || calls % 64 == 0) {
+            GGML_LOG_INFO("[QSA lists] call %llu: n_queries %d n_cells %d n_kv_max %d: %llu entries differ from the mask scan (%llu bad calls)\n",
+                calls, n_queries, n_cells, n_kv_max, diff, bad);
+        }
+    }
+    return true;
+#endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+}
+
 bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_tensor * dst, const int ncols1, const int ncols2) {
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
     GGML_UNUSED_VARS(cc, dst, ncols1, ncols2);
@@ -2496,10 +2660,21 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
     const int ncols1_gather = (ncols1 > 1 && ncols2 == 16 && K->ne[0] == 256) ? 8 : ncols1;
     const int64_t n_gather = (ncols1_gather == 1 ? std::min<int64_t>(Q->ne[1], 64/ncols2) : ncols1_gather) * (int64_t) n_kv_max;
 
+    // GGML_CUDA_FA_SPARSE_MIN_KV=<cells>: prompt batches (>= 256 queries) gather once the cache holds that many cells
+    // (never under 2x the selected cells). The default rule needs 2x the union bound of a whole tile (32768 cells for
+    // 8 queries x 2048), which leaves the first two 12288-row ubatches of a 100K prompt on the dense kernel: measured
+    // 33 and ~92 ms per attention layer vs ~22 ms gathered. Same mask, so only the summation order changes.
+    static const int64_t min_kv_env = [] {
+        const char * value = getenv("GGML_CUDA_FA_SPARSE_MIN_KV");
+        return value ? std::max<int64_t>(0, atoll(value)) : 0;
+    }();
+    const int64_t min_kv = min_kv_env > 0 && Q->ne[1] >= 256 ?
+        std::max<int64_t>(min_kv_env, 2*(int64_t) n_kv_max) : std::max<int64_t>(4096, 2*n_gather);
+
     return GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) &&
         mask != nullptr && n_kv_max > 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
         mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1 &&
-        K->ne[1] >= std::max<int64_t>(4096, 2*n_gather);
+        K->ne[1] >= min_kv;
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 }
 

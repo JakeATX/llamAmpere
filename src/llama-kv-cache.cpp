@@ -17,6 +17,8 @@
 #include <stdexcept>
 #include <unordered_map>
 #include <chrono>
+#include <thread>
+#include <mutex>
 
 // [PFDIAG] host timing of init_batch pieces (LLAMA_DECODE_HOST_US=1, batches >= 256 tokens)
 namespace {
@@ -4236,6 +4238,107 @@ static bool kq_mask_fast_enabled() {
     return v;
 }
 
+// LLAMA_KQ_MASK_RUNS=N (default 0 = off): run-fill the sequence-prefix mask with N threads (1 = 8 threads).
+static int kq_mask_runs_threads() {
+    static const int v = [] {
+        const char * e = getenv("LLAMA_KQ_MASK_RUNS");
+        const int n = e ? atoi(e) : 0;
+        return n <= 0 ? 0 : n == 1 ? 8 : std::min(n, 64);
+    }();
+    return v;
+}
+
+// [PPIMPL] LLAMA_KQ_MASK_DEVICE=1 (default off): for an f16 sequence-prefix mask whose used cells are contiguous from 0
+// and ascending in position, record only the visible-cell count of each row; the scheduler's input copy then fills the
+// mask on the card (llama_context::sched_copy_mtp_inputs -> ggml_backend_cuda_fill_prefix_mask). If that copy is not
+// taken, the host buffer is filled from the counts before the normal copy. Same values either way.
+bool llama_kq_mask_device_enabled() {
+    static const bool v = [] {
+        const char * e = getenv("LLAMA_KQ_MASK_DEVICE");
+        return e && atoi(e) != 0;
+    }();
+    return v;
+}
+
+namespace {
+struct kq_mask_deferred {
+    const ggml_tensor *  t;
+    void *               data;
+    int64_t              n_kv;
+    std::vector<int32_t> n_visible;
+    bool                 host_filled;
+};
+std::mutex                    g_kq_deferred_mu;
+std::vector<kq_mask_deferred> g_kq_deferred;
+
+void kq_mask_deferred_drop(const ggml_tensor * t) {
+    std::lock_guard<std::mutex> lock(g_kq_deferred_mu);
+    for (size_t i = 0; i < g_kq_deferred.size(); ++i) {
+        if (g_kq_deferred[i].t == t || g_kq_deferred[i].data == t->data) {
+            g_kq_deferred[i] = std::move(g_kq_deferred.back());
+            g_kq_deferred.pop_back();
+            --i;
+        }
+    }
+}
+
+kq_mask_deferred * kq_mask_deferred_find(const ggml_tensor * t) {
+    for (auto & d : g_kq_deferred) {
+        if (d.t == t && d.data == t->data && t->type == GGML_TYPE_F16 && t->ne[0] == d.n_kv &&
+                t->ne[1]*t->ne[2]*t->ne[3] == (int64_t) d.n_visible.size()) {
+            return &d;
+        }
+    }
+    return nullptr;
+}
+} // namespace
+
+bool llama_kq_mask_deferred_get(const ggml_tensor * t, std::vector<int32_t> & n_visible, int64_t * n_kv) {
+    std::lock_guard<std::mutex> lock(g_kq_deferred_mu);
+    const auto * d = kq_mask_deferred_find(t);
+    if (!d || d->host_filled) {
+        return false;
+    }
+    n_visible = d->n_visible;  // a copy: another context may replace the record after the lock is released
+    *n_kv     = d->n_kv;
+    return true;
+}
+
+void llama_kq_mask_deferred_fill_host(const ggml_tensor * t) {
+    std::lock_guard<std::mutex> lock(g_kq_deferred_mu);
+    auto * d = kq_mask_deferred_find(t);
+    if (!d || d->host_filled) {
+        return;
+    }
+    const ggml_fp16_t keep = ggml_fp32_to_fp16(0.0f), drop = ggml_fp32_to_fp16(-INFINITY);
+    for (size_t i = 0; i < d->n_visible.size(); ++i) {
+        ggml_fp16_t * row = (ggml_fp16_t *) d->data + (uint64_t) d->n_kv*i;
+        std::fill(row, row + d->n_visible[i], keep);
+        std::fill(row + d->n_visible[i], row + d->n_kv, drop);
+    }
+    d->host_filled = true;
+}
+
+// the visible-cell count of each row, if the used cells are contiguous from 0 and ascending in position (no M-RoPE)
+static bool kq_mask_seq_prefix_counts(const llama_kv_cells & cells, const llama_ubatch * ubatch, int64_t n_kv,
+                                      std::vector<int32_t> & out) {
+    if (ubatch->is_pos_2d() || cells.used_min() != 0 || cells.used_max_p1() != cells.get_used()) {
+        return false;
+    }
+    const llama_pos * pos = cells.pos_data();
+    const int64_t n_prefix = std::min<int64_t>(n_kv, cells.used_max_p1());
+    for (int64_t j = 1; j < n_prefix; ++j) {
+        if (pos[j - 1] > pos[j]) {
+            return false;
+        }
+    }
+    out.resize(ubatch->n_tokens);
+    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+        out[i] = (int32_t) (std::upper_bound(pos, pos + n_prefix, ubatch->pos[i]) - pos);
+    }
+    return true;
+}
+
 template<typename T>
 static void set_input_kq_mask_seq_prefix(const llama_kv_cells & cells, const llama_ubatch * ubatch, int64_t n_kv, T * data) {
     const T mask_keep = llama_cast<T>(0.0f);
@@ -4244,6 +4347,39 @@ static void set_input_kq_mask_seq_prefix(const llama_kv_cells & cells, const lla
     const bool is_2d = ubatch->is_pos_2d();
 
     const llama_pos * pos = cells.pos_data();
+
+    // LLAMA_KQ_MASK_RUNS: with the used cells contiguous from 0 and ascending in position, row i is one run of keep
+    // (the cells up to the query position) and one run of drop, so it is written as two fills, split by rows across
+    // threads. Same values as the loop below (the 100K B1 prompt refills this mask for every attention layer).
+    const int runs = kq_mask_runs_threads();
+    if (runs > 0 && !is_2d) {
+        const int64_t n_prefix = std::min<int64_t>(n_kv, cells.used_max_p1());
+        bool ordered = cells.used_min() == 0 && cells.used_max_p1() == cells.get_used();
+        for (int64_t j = 1; ordered && j < n_prefix; ++j) {
+            ordered = pos[j - 1] <= pos[j];
+        }
+        if (ordered) {
+            const int64_t n_rows = ubatch->n_tokens;
+            auto fill_rows = [&](int64_t r0, int64_t r1) {
+                for (int64_t i = r0; i < r1; ++i) {
+                    const int64_t n_visible = std::upper_bound(pos, pos + n_prefix, ubatch->pos[i]) - pos;
+                    T * row = data + (uint64_t) n_kv*i;
+                    std::fill(row, row + n_visible, mask_keep);
+                    std::fill(row + n_visible, row + n_kv, mask_drop);
+                }
+            };
+            const int64_t n_threads = std::min<int64_t>(runs, std::max<int64_t>(1, n_rows*n_kv/(1 << 20)));
+            std::vector<std::thread> workers;
+            for (int64_t t = 1; t < n_threads; ++t) {
+                workers.emplace_back(fill_rows, n_rows*t/n_threads, n_rows*(t + 1)/n_threads);
+            }
+            fill_rows(0, n_rows/n_threads);
+            for (auto & w : workers) {
+                w.join();
+            }
+            return;
+        }
+    }
 
     for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
         const llama_pos p1 = ubatch->pos[i];
@@ -4272,6 +4408,10 @@ static void set_input_kq_mask_seq_prefix(const llama_kv_cells & cells, const lla
 
 void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
     const uint32_t n_tokens = ubatch->n_tokens;
+
+    if (llama_kq_mask_device_enabled()) {
+        kq_mask_deferred_drop(dst);  // a previous deferred fill of this tensor is stale now
+    }
 
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
 
@@ -4416,6 +4556,18 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
             ok = ubatch->pos[i] >= 0 && (s == seq_id || cells.seq_covers_used(s));
         }
         if (ok && cells.seq_covers_used(seq_id)) {
+            if (dst->type == GGML_TYPE_F16 && llama_kq_mask_device_enabled() && dst->ne[1] == (int64_t) n_tokens &&
+                    ggml_is_contiguous(dst)) {
+                std::vector<int32_t> counts;
+                if (kq_mask_seq_prefix_counts(cells, ubatch, n_kv, counts)) {
+                    std::lock_guard<std::mutex> lock(g_kq_deferred_mu);
+                    if (g_kq_deferred.size() >= 64) {
+                        g_kq_deferred.erase(g_kq_deferred.begin());
+                    }
+                    g_kq_deferred.push_back({ dst, dst->data, n_kv, std::move(counts), false });
+                    return;
+                }
+            }
             if (dst->type == GGML_TYPE_F16) {
                 set_input_kq_mask_seq_prefix<ggml_fp16_t>(cells, ubatch, n_kv, (ggml_fp16_t *) dst->data);
             } else {

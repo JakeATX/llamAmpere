@@ -937,7 +937,7 @@ void llama_b1::push_tensor_pieces(std::vector<piece> & ps, const exps_tensor & e
     for (size_t off = 0; off < e.nbytes;) {
         piece p;
         const bool strided = !from_file && e.home_nb2 != expert_bytes;
-        const bool permanent = !from_file && ggml_moe_cache_has_residents();
+        const bool permanent = !from_file && (ggml_moe_cache_has_residents() || b1_env_int("LLAMA_PP_KEEP_EXPERTS", 0) != 0);
         const size_t source_off = strided ? (off / expert_bytes) * e.home_nb2 + off % expert_bytes : off;
         p.src_host = from_file ? nullptr : (const char *) e.home_data + source_off;
         p.fd       = e.src.fd;

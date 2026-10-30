@@ -41,6 +41,7 @@
 #include <atomic>
 #include <cctype>
 #include <cerrno>
+#include <chrono>
 #include <cstdlib>
 
 #include <cinttypes>
@@ -58,6 +59,9 @@
 
 #if defined(__GLIBC__)
 #include <malloc.h>
+#endif
+#if defined(__linux__)
+#include <sys/resource.h>
 #endif
 
 //
@@ -196,6 +200,61 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     }
     throw std::runtime_error("Unsupported ctx type");
 }
+
+// PP-3 LLAMA_PP_SETUP=1: log where the layer-major setup spends its time and skip its allocator trim (the
+// "B1 prepared" trim returned ~0.1 MiB for 18 ms at 100K). Off by default; it changes no math.
+// PP-1: LLAMA_PP_OVERLAP=1 runs the generation-phase expert refill on a helper thread while the MTP helper
+// catches up on the final device-staged ubatch. Off by default. LLAMA_PP_OVERLAP_ROWS (64..8192, default 2048)
+// bounds catch-up scratch at the ordinary handoff width; preceding ubatches are consumed inside decode.
+static bool pp_keep_experts_on() {
+    const char * e = getenv("LLAMA_PP_KEEP_EXPERTS");
+    return e && strcmp(e, "1") == 0;
+}
+
+static bool pp_overlap_on() {
+    const char * e = getenv("LLAMA_PP_OVERLAP");
+    static const bool on = e && atoi(e) != 0;
+    return on;
+}
+
+static uint32_t pp_overlap_rows() {
+    static const uint32_t rows = [] {
+        const char * e = getenv("LLAMA_PP_OVERLAP_ROWS");
+        const long v = e && e[0] ? strtol(e, nullptr, 10) : 2048;
+        return v >= 64 && v <= 8192 ? (uint32_t) v : 2048u;
+    }();
+    return rows;
+}
+
+// set from the refill start until the explicit join: the helper keeps the capped rows for the whole catch-up
+static std::atomic<bool> g_pp_overlap_prompt{false};
+
+static bool pp_setup_on() {
+    const char * e = getenv("LLAMA_PP_SETUP");
+    static const bool on = e && atoi(e) != 0;
+    return on;
+}
+
+struct pp_setup_clock {
+    int64_t t0 = ggml_time_us();
+    int64_t last = t0;
+    std::string steps;
+    void mark(const char * what) {
+        if (!pp_setup_on()) {
+            return;
+        }
+        const int64_t now = ggml_time_us();
+        char buf[96];
+        snprintf(buf, sizeof(buf), " %s=%.1f", what, (now - last) / 1000.0);
+        steps += buf;
+        last = now;
+    }
+    void print(const char * fn) const {
+        if (pp_setup_on()) {
+            LLAMA_LOG_INFO("%s: [PP] setup ms:%s total=%.1f\n", fn, steps.c_str(), (last - t0) / 1000.0);
+        }
+    }
+};
 
 // fork: free allocator pages between B1 layers; live buffers remain allocated.
 static void b1_memory_trim(const char * phase) {
@@ -1344,6 +1403,10 @@ void llama_context::ple_hint_add(const llama_token * window, int32_t n_window) {
 }
 
 llama_context::~llama_context() {
+    if (pp_warm_thread.joinable()) {
+        pp_warm_thread.join();
+        g_pp_overlap_prompt = false;
+    }
     if (mtp_pipe.enabled) {
         mtp_pipe_cancel();  // never leave a step waiting on the card for a token
         if (sched) {
@@ -2103,7 +2166,7 @@ void llama_context::sched_reserve(bool suspend_prompt_cache) {
 
     if (preserve_cache) {
         // fork: B1 will discard this cache before computing the prompt, so skip survivor refills for scratch lending.
-        if (suspend_prompt_cache && !b1_mc_suspended && ggml_backend_sched_moe_cache_suspend(sched.get())) {
+        if (suspend_prompt_cache && !pp_keep_experts_on() && !b1_mc_suspended && ggml_backend_sched_moe_cache_suspend(sched.get())) {
             b1_mc_suspended = true;
             b1_cache_needs_refresh = true;
             LLAMA_LOG_INFO("%s: [B1] expert cache suspended before scratch resize\n", __func__);
@@ -2165,7 +2228,7 @@ void llama_context::sched_reserve(bool suspend_prompt_cache) {
     if (borrow_experts) { LLAMA_LOG_INFO("%s: MTP experts borrow the target cache session\n", __func__); }
     sync_moe_keep();
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
-    if (mtp_prefill_async || mtp_scratch_enabled) {
+    if (mtp_prefill_async || mtp_scratch_enabled || llama_kq_mask_device_enabled()) {
         ggml_backend_sched_set_input_copy_callback(sched.get(), sched_copy_mtp_inputs, this);
     }
 
@@ -2412,7 +2475,7 @@ void llama_context::sched_reserve(bool suspend_prompt_cache) {
                 sched_node_capacity = node_capacity;
                 sched_pipeline_parallel = false;
                 ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
-                if (mtp_prefill_async || mtp_scratch_enabled) {
+                if (mtp_prefill_async || mtp_scratch_enabled || llama_kq_mask_device_enabled()) {
                     ggml_backend_sched_set_input_copy_callback(sched.get(), sched_copy_mtp_inputs, this);
                 }
                 ggml_backend_sched_set_moe_cache(sched.get(), moe_cache_mode, cparams.moe_cache_budget_mib);
@@ -3241,6 +3304,9 @@ void llama_context::set_n_threads(int32_t n_threads, int32_t n_threads_batch) {
 }
 
 void llama_context::set_decode_phase(enum llama_decode_phase phase) {
+    if (!pp_warm_async && !prompt_warm_join()) {
+        throw std::runtime_error("expert cache refill failed");
+    }
     if (phase == LLAMA_DECODE_PHASE_GENERATION) {
         const char * rotate = getenv("LLAMA_MOE_CACHE_RELEASE_PROMPT");
         if (rotate && rotate[0] == '1') {
@@ -3287,7 +3353,11 @@ void llama_context::set_decode_phase(enum llama_decode_phase phase) {
                         compute_peer->sched_reserve_tokens);
             }
             if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT) {
-                b1_cache_warm();
+                if (pp_warm_async) {
+                    pp_warm_start();
+                } else {
+                    b1_cache_warm();
+                }
             } else if (b1_cache_needs_refresh) {
                 // Restore resets scheduler metadata, including rewritten source copies.
                 // A prior graph must be rebuilt before that arena is reused.
@@ -3302,7 +3372,7 @@ void llama_context::set_decode_phase(enum llama_decode_phase phase) {
             }
         }
     }
-    if (phase == LLAMA_DECODE_PHASE_GENERATION) {
+    if (phase == LLAMA_DECODE_PHASE_GENERATION && !prompt_warm_running()) {
         b1_cache_profile_load();
     }
     switch (phase) {
@@ -3313,6 +3383,102 @@ void llama_context::set_decode_phase(enum llama_decode_phase phase) {
             return;
     }
     decode_phase = LLAMA_DECODE_PHASE_AUTOMATIC;
+}
+
+void llama_context::set_decode_phase_async(enum llama_decode_phase phase) {
+    if (phase != LLAMA_DECODE_PHASE_GENERATION || !pp_overlap_on() || cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT) {
+        set_decode_phase(phase);
+        return;
+    }
+    if (!prompt_warm_join()) {
+        throw std::runtime_error("expert cache refill failed");
+    }
+    pp_warm_async = true;
+    try {
+        set_decode_phase(phase);
+    } catch (...) {
+        pp_warm_async = false;
+        throw;
+    }
+    pp_warm_async = false;
+}
+
+// PP-1: start the refill on a helper thread and return once its pools have their final size (the CUDA cache
+// bumps a counter there; only expert copies follow). From then on the caller may allocate its own scratch
+// out of the reserve beside the copies. Without that counter the refill runs here, as before.
+void llama_context::pp_warm_start() {
+    using epoch_fn = uint64_t (*)(void);
+    epoch_fn epoch = nullptr;
+    for (ggml_backend_t backend : backend_ptrs) {
+        auto * dev = ggml_backend_get_device(backend);
+        if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            epoch = (epoch_fn) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev),
+                    "ggml_backend_cuda_moe_cache_fill_epoch");
+            break;
+        }
+    }
+    if (!epoch) {
+        b1_cache_warm();
+        b1_cache_profile_load();
+        return;
+    }
+    const uint64_t before = epoch();
+    const int64_t t0 = ggml_time_us();
+    pp_warm_done = false;
+    pp_warm_failed = false;
+    g_pp_overlap_prompt = true;
+    pp_warm_thread = std::thread([this]() {
+        try {
+            b1_cache_warm();
+            b1_cache_profile_load();
+        } catch (...) {
+            pp_warm_failed = true;
+        }
+        pp_warm_done = true;
+    });
+    while (!pp_warm_done.load() && epoch() == before) {
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
+    LLAMA_LOG_INFO("%s: [PP] expert refill continues beside the helper (pools sized after %.1f ms%s)\n", __func__,
+            (ggml_time_us() - t0) / 1000.0, pp_warm_done.load() ? ", refill already done" : "");
+}
+
+bool llama_context::prompt_warm_join() {
+    if (!pp_warm_thread.joinable() || pp_warm_thread.get_id() == std::this_thread::get_id()) {
+        return true;
+    }
+    const int64_t t0 = ggml_time_us();
+    pp_warm_thread.join();
+    const bool ok = !pp_warm_failed.load();
+    LLAMA_LOG_INFO("%s: [PP] waited %.1f ms for the expert refill%s\n", __func__, (ggml_time_us() - t0) / 1000.0,
+            ok ? "" : " (failed)");
+    // The helper's catch-up grew the shared compute buffer past the target's writing need. Once the helper is
+    // back in writing, rebuild both writing reserves so generation runs with the same buffers as before.
+    if (ok && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && compute_peer && compute_peer->sched &&
+            compute_peer->cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
+            compute_peer->decode_phase != LLAMA_DECODE_PHASE_PROMPT) {
+        sched_need_reserve = true;
+        sched_reserve();
+        for (ggml_backend_t backend : backend_ptrs) {
+            auto * dev = ggml_backend_get_device(backend);
+            if (!dev || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+                continue;
+            }
+            using trim_fn = size_t (*)(ggml_backend_t);
+            using reset_fn = bool (*)(ggml_backend_t);
+            auto trim = (trim_fn) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), "ggml_backend_cuda_pool_trim");
+            auto reset = (reset_fn) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), "ggml_backend_cuda_graph_reset");
+            if (trim && reset && reset(backend)) {
+                LLAMA_LOG_INFO("%s: [PP] returned %.2f MiB of helper catch-up temporary storage\n", __func__,
+                        trim(backend) / 1048576.0);
+            }
+        }
+        if (compute_peer->sched_need_reserve) {
+            compute_peer->sched_reserve();
+        }
+    }
+    g_pp_overlap_prompt = false;
+    return ok;
 }
 
 void llama_context::set_next_decode_phase(enum llama_decode_phase phase) {
@@ -4652,7 +4818,11 @@ build_graph:
                 h->h_device = mtp_hidden_source != nullptr || mtp_feedback.use_previous;
             }
         }
+        const int64_t pp_inputs_t0 = b1_cur.active ? ggml_time_us() : 0;
         res->set_inputs(&ubatch);
+        if (b1_cur.active) {
+            b1_pp_inputs_us += ggml_time_us() - pp_inputs_t0;
+        }
         if (mtp_hidden_source) {
             for (auto & input : res->inputs) {
                 if (auto * h = dynamic_cast<llm_graph_input_embd_h *>(input.get())) {
@@ -4690,7 +4860,11 @@ build_graph:
                 ubatch.n_tokens <= 8 && n_outputs == (int32_t) ubatch.n_tokens;
         ggml_backend_sched_moe_cache_set_skip_tail(sched.get(), decode_window ? cparams.moe_skip_tail : 0);
     }
+    const int64_t pp_submit_t0 = b1_cur.active ? ggml_time_us() : 0;
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (b1_cur.active) {
+        b1_pp_submit_us += ggml_time_us() - pp_submit_t0;
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -5081,6 +5255,9 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
             decode_phase == LLAMA_DECODE_PHASE_PROMPT) {
         // fork: a large parent prompt submits bounded draft handoff pieces.
         rows = std::min(cparams.n_ubatch, std::max(n_tokens, sched_reserve_tokens));
+        if (g_pp_overlap_prompt.load()) {
+            rows = std::min(rows, pp_overlap_rows()); // PP-1: the refill owns the rest of the card
+        }
     } else if (alone && n_tokens > 3072) {
         rows = n_tokens < 16384 ? std::min(2048u, n_tokens) : std::min(cparams.n_ubatch, n_tokens);
     }
@@ -5145,6 +5322,9 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {
+    if (!prompt_warm_join()) {
+        return -2;
+    }
     // one-shot tag: read on entry, clear on every return, including the encode fallback and errors
     const enum llama_decode_phase tagged =
             (next_decode_phase == LLAMA_DECODE_PHASE_PROMPT || next_decode_phase == LLAMA_DECODE_PHASE_GENERATION)
@@ -5290,9 +5470,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         llama_context & ctx;
         ~b1_cache_guard() { ctx.b1_cache_resume(); }
     } b1_cache_guard_ { *this };
+    pp_setup_clock pp_dec;
     if (!prompt_buffers_resize(n_tokens_all, &batch_inp)) {
         return -2;
     }
+    pp_dec.mark("scratch_resize");
     b1_cache_collect = false;
     if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && n_tokens_all > 3072 &&
             (sched_reserve_tokens > 512 || b1_ffn_scratch_active || b1_layer_scratch_active)) {
@@ -5324,6 +5506,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     }
     sched_reserve();
     mtp_scratch_prepare(n_outputs_all == 0);
+    pp_dec.mark("sched_reserve");
 
     bool did_optimize = false;
 
@@ -5379,14 +5562,20 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         break;
     }
 
+    pp_dec.mark("init_batch");
     // reserve output buffer
     if (output_reserve(n_outputs_all, n_tokens_all) < n_outputs_all) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
         return -2;
     };
+    pp_dec.mark("output_reserve");
 
     // [B1] layer-major prefill: plan the call and apply every ubatch up front, or give lent experts back first
     const int b1_mode = b1_prepare(mctx.get(), batch_inp, n_tokens_all, n_outputs_all);
+    pp_dec.mark("b1_prepare");
+    if (b1_mode == 1) {
+        pp_dec.print(__func__);
+    }
     if (b1_mode < 0) {
         b1_cache_counts.clear();
         b1_cache_readbacks = 0;
@@ -6808,12 +6997,13 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
     // scheduler to copy RAM experts to the GPU, the normal path computes that layer's RAM experts on the CPU in every
     // ubatch, so B1 leaves them home (same result, one layer less to stream). Otherwise ubatch_home() matches it per ubatch.
     const bool final_home = !b1->host_rows_on_gpu(b1_final_rows(n_outputs_all, n_tokens_all));
+    pp_setup_clock pp_clock;
     // the MoE expert cache (--moe-cache) keeps the free VRAM above its reserve once it has run, which leaves B1 no
     // room when the experts are in RAM. Opt-in (LLAMA_B1_MOE_CACHE_SUSPEND=1): free its pool for this call when no
     // other sequence decodes from it; b1_end makes it again and it refills from decode. Off by default because the
     // refilled pool serves different experts than a pool that stayed warm, so later steps can differ in rounding.
     if (!b1_mc_suspended) {
-        b1_mc_suspended = !others && b1_ctx_env("LLAMA_B1_MOE_CACHE_SUSPEND", 0) != 0 &&
+        b1_mc_suspended = !others && !pp_keep_experts_on() && b1_ctx_env("LLAMA_B1_MOE_CACHE_SUSPEND", 0) != 0 &&
                           b1_cache_graph_reset() && ggml_backend_sched_moe_cache_suspend(sched.get());
     }
     if (b1_mc_suspended) {
@@ -6831,8 +7021,10 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
     b1_kv_scratch_enabled = false;
     const bool kv_cold = memory->seq_pos_max(seq) < 0;
 
+    pp_clock.mark("suspend");
     detach_compute_borrower();
     bool planned = b1->begin(sizes, group_ub, lend_cap, final_home, rotating ? &borrow : nullptr, lean_legacy);
+    pp_clock.mark("plan");
     if (!planned && borrow > 0) {
         synchronize();
         ggml_backend_dev_t loan_device = nullptr;
@@ -6880,6 +7072,13 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
             }
         }
     }
+    if (!planned && pp_keep_experts_on() && b1_ctx_env("LLAMA_B1_MOE_CACHE_SUSPEND", 0) != 0 &&
+            b1_cache_graph_reset() && ggml_backend_sched_moe_cache_suspend(sched.get())) {
+        b1_mc_suspended = true;
+        b1_cache_needs_refresh = true;
+        LLAMA_LOG_WARN("%s: [B1] retained experts do not fit; using full streaming\n", __func__);
+        planned = b1->begin(sizes, group_ub, lend_cap, final_home, nullptr, lean_legacy);
+    }
     if (!planned) {
         return normal();
     }
@@ -6902,7 +7101,9 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
             b1_end(true);
             return normal();
         }
+        pp_clock.mark("legacy_reserve");
         b1->start_streaming();
+        pp_clock.mark("start_streaming");
     }
 
     // apply every ubatch now, saving each memory view
@@ -6913,6 +7114,7 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
     if (sj) {
         sj->b1_sj_begin(seq);
     }
+    pp_clock.mark("sj_begin");
     size_t n_applied = 0;
     do {
         if (!mctx->apply()) {
@@ -6938,13 +7140,18 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
         return -3;
     }
 
+    pp_clock.mark("apply_views");
     b1_compute_submit_us = 0;
     b1_cache_begin();
     b1_cache_collect = b1_cache_warm_enabled && b1_cache_collect_wanted();
+    pp_clock.mark("cache_begin");
 
     LLAMA_LOG_WARN("%s: [B1] layer-major prefill of %u tokens: %zu ubatches, %zu groups of %zu, %s\n", __func__,
             n_tokens_all, sizes.size(), b1->n_groups(), b1->group_ub(), others ? "other sequences present" : "alone");
-    b1_memory_trim("B1 prepared");
+    if (!pp_setup_on()) {
+        b1_memory_trim("B1 prepared");
+    }
+    pp_clock.print(__func__);
     return 1;
 }
 
@@ -7301,13 +7508,28 @@ bool llama_context::b1_run_prefix(llama_memory_context_i * mctx, size_t ub0, ggm
     const int32_t l_final = b1->final_l0();
     const size_t  ub1     = b1->group_end(ub0);
     const llm_graph_type gtype = ctx_type_to_graph_type(cparams.ctx_type);
+    // Opt-in host timeline: no extra device waits or changes to graph execution.
+    // 2 = also print every ubatch of every layer (1 prints ubatches of layers 0-1 only).
+    static const int pp_level = [] {
+        const char * e = getenv("LLAMA_PP_LAYERS");
+        return e ? atoi(e) : 0;
+    }();
+    static const bool pp_layers = pp_level != 0;
 
     status = GGML_STATUS_FAILED;
     for (int32_t l0 = 0; l0 < l_final; ) {
+        const int64_t pp_t0 = pp_layers ? ggml_time_us() : 0;
+        const int64_t pp_compute0 = b1_compute_submit_us;
+        const int64_t pp_inputs0 = b1_pp_inputs_us, pp_submit0 = b1_pp_submit_us;
+#if defined(__linux__)
+        struct rusage pp_before = {}, pp_after = {};
+        const bool pp_usage = pp_layers && getrusage(RUSAGE_SELF, &pp_before) == 0;
+#endif
         const int32_t l1 = b1->range_end(l0);
         if (!b1->layer_begin(l0) || !b1_kv_scratch_bind(l0, l1)) {
             return false;
         }
+        const int64_t pp_bound = pp_layers ? ggml_time_us() : 0;
         for (size_t u = ub0; u < ub1; ++u) {
             if (!mctx->b1_seek(u)) {
                 LLAMA_LOG_ERROR("%s: [B1] cannot seek to ubatch %zu\n", __func__, u);
@@ -7321,10 +7543,15 @@ bool llama_context::b1_run_prefix(llama_memory_context_i * mctx, size_t ub0, ggm
                 b1->ubatch_home(l0, true);
             }
             const int64_t t_compute0 = ggml_time_us();
+            const int64_t u_inputs0 = b1_pp_inputs_us, u_submit0 = b1_pp_submit_us;
             const auto * res = process_ubatch(mctx->get_ubatch(), gtype, mctx, status);
             const int64_t compute_us = ggml_time_us() - t_compute0;
             b1_compute_submit_us += compute_us;
             b1->pass_compute(u, compute_us);
+            if (pp_level >= 2 || (pp_layers && l0 < 2)) {
+                LLAMA_LOG_INFO("%s: [PP] layer=%d ubatch=%zu graph_host_ms=%.3f inputs_ms=%.3f submit_ms=%.3f\n", __func__, l0, u,
+                        compute_us / 1000.0, (b1_pp_inputs_us - u_inputs0) / 1000.0, (b1_pp_submit_us - u_submit0) / 1000.0);
+            }
             if (home) {
                 b1->ubatch_home(l0, false);
             }
@@ -7385,6 +7612,21 @@ bool llama_context::b1_run_prefix(llama_memory_context_i * mctx, size_t ub0, ggm
         }
         b1->layer_end(l0);
         b1_memory_trim("B1 layer complete");
+        if (pp_layers) {
+            LLAMA_LOG_INFO("%s: [PP] layer=%d end=%d host_wall_ms=%.3f bind_ms=%.3f graph_host_ms=%.3f ple=%d\n",
+                    __func__, l0, l1, (ggml_time_us() - pp_t0) / 1000.0, (pp_bound - pp_t0) / 1000.0,
+                    (b1_compute_submit_us - pp_compute0) / 1000.0, (int) model.hparams.is_ple(l0));
+            LLAMA_LOG_INFO("%s: [PP] layer=%d inputs_ms=%.3f submit_ms=%.3f\n", __func__, l0,
+                    (b1_pp_inputs_us - pp_inputs0) / 1000.0, (b1_pp_submit_us - pp_submit0) / 1000.0);
+#if defined(__linux__)
+            if (pp_usage && getrusage(RUSAGE_SELF, &pp_after) == 0) {
+                auto ms = [](const timeval & t) { return t.tv_sec * 1000.0 + t.tv_usec / 1000.0; };
+                LLAMA_LOG_INFO("%s: [PP] layer=%d process_minflt=%ld process_majflt=%ld process_user_ms=%.3f process_sys_ms=%.3f\n",
+                        __func__, l0, pp_after.ru_minflt - pp_before.ru_minflt, pp_after.ru_majflt - pp_before.ru_majflt,
+                        ms(pp_after.ru_utime) - ms(pp_before.ru_utime), ms(pp_after.ru_stime) - ms(pp_before.ru_stime));
+            }
+#endif
+        }
         l0 = l1;
     }
 
@@ -7473,6 +7715,24 @@ ggml_status llama_context::graph_compute(ggml_cgraph * gf, bool batched) {
 
 bool llama_context::sched_copy_mtp_inputs(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, void * user_data) {
     auto * lctx = static_cast<llama_context *>(user_data);
+
+    // [PPIMPL] LLAMA_KQ_MASK_DEVICE: a deferred sequence-prefix mask is filled on the card from its row counts, in
+    // stream order (no host wait, no mask copy). Otherwise its host buffer is filled now and the normal copy follows.
+    if (llama_kq_mask_device_enabled() && src->type == GGML_TYPE_F16) {
+        thread_local std::vector<int32_t> n_visible;
+        int64_t n_kv = 0;
+        if (llama_kq_mask_deferred_get(src, n_visible, &n_kv)) {
+            using fill_fn = bool (*)(ggml_backend_t, ggml_tensor *, const int32_t *, int64_t, int64_t);
+            auto * dev  = ggml_backend_get_device(backend);
+            auto   fill = dev ? (fill_fn) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev),
+                    "ggml_backend_cuda_fill_prefix_mask") : nullptr;
+            if (fill && ggml_nbytes(dst) == ggml_nbytes(src) && fill(backend, dst, n_visible.data(), (int64_t) n_visible.size(), n_kv)) {
+                return true;
+            }
+            llama_kq_mask_deferred_fill_host(src);
+            return false;
+        }
+    }
 
     // fork: Retain each MTP input snapshot until the logical catch-up batch completes.
     if (((lctx->mtp_prefill_async && lctx->mtp_hidden_source) || lctx->mtp_scratch_active) &&
@@ -8703,6 +8963,9 @@ size_t llama_context::state_write_data(llama_io_write_i & io) {
 }
 
 size_t llama_context::state_read_data(llama_io_read_i & io) {
+    if (!prompt_warm_join()) { // PP-1: a restore never runs beside the expert refill
+        throw std::runtime_error("expert cache refill failed");
+    }
     mtp_feedback.valid = false;
     std::fill(mtp_hidden.carry_pos.begin(), mtp_hidden.carry_pos.end(), -2);
     mtp_hidden.captured.clear();
@@ -8741,6 +9004,9 @@ size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id s
 }
 
 size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    if (!prompt_warm_join()) { // PP-1: a restore never runs beside the expert refill
+        throw std::runtime_error("expert cache refill failed");
+    }
     mtp_feedback.valid = false;
     if (seq_id >= 0 && (size_t) seq_id < mtp_hidden.carry_pos.size()) {
         mtp_hidden.carry_pos[seq_id] = -2;
@@ -9447,6 +9713,18 @@ void llama_set_decode_phase(llama_context * ctx, enum llama_decode_phase phase) 
 
 void llama_set_next_decode_phase(llama_context * ctx, enum llama_decode_phase phase) {
     ctx->set_next_decode_phase(phase);
+}
+
+void llama_set_decode_phase_async(llama_context * ctx, enum llama_decode_phase phase) {
+    ctx->set_decode_phase_async(phase);
+}
+
+bool llama_prompt_warm_join(llama_context * ctx) {
+    return ctx ? ctx->prompt_warm_join() : true;
+}
+
+bool llama_prompt_overlap_enabled(void) {
+    return pp_overlap_on();
 }
 
 int32_t llama_moe_cache_decode_capacity(const llama_context * ctx) {

@@ -6171,6 +6171,29 @@ private:
             int32_t done = 0;
             bool failed = false;
             bool phase_set = false;
+            bool defer_last = false;
+            int32_t deferred_count = 0;
+            llama_context * held_target = nullptr;
+            void release() {
+                if (held_target) {
+                    llama_set_ubatch_rows_callback(held_target, nullptr, nullptr);
+                    held_target = nullptr;
+                }
+            }
+            ~ubatch_handoff() {
+                if (held_target && deferred_count) {
+                    try {
+                        llama_prompt_warm_join(held_target);
+                    } catch (const std::exception & e) {
+                        SRV_ERR("ubatch refill cleanup: %s\n", e.what());
+                    }
+                }
+                try {
+                    release();
+                } catch (const std::exception & e) {
+                    SRV_ERR("ubatch handoff cleanup: %s\n", e.what());
+                }
+            }
             std::vector<int32_t> spot_end;
             std::vector<std::vector<uint8_t>> spot_state;
             std::vector<bool> spot_have;
@@ -6181,6 +6204,11 @@ private:
                 }
                 if (first != h->done) {
                     h->failed = true;
+                    return;
+                }
+                // fork: keep only the last ubatch in the device ring beside the refill.
+                if (h->defer_last && first + count == h->view->size()) {
+                    h->deferred_count = count;
                     return;
                 }
                 try {
@@ -6206,6 +6234,8 @@ private:
                 }
             }
         } handoff;
+        // PP-1: defer only the final device handoff until the refill starts.
+        const bool pp_overlap = spec && ctx_dft && llama_prompt_overlap_enabled();
         const bool handoff_on = spec && ctx_dft && common_speculative_handoff_enabled(spec.get()) && batch.view.size() > 3072 &&
                 std::all_of(batch.view.tokens.begin(), batch.view.tokens.end(), [&](const auto & token) {
                     return token.seq_ids_extra.empty() && token.seq_id == batch.view.tokens.front().seq_id;
@@ -6219,6 +6249,9 @@ private:
             handoff.ctx_dft = ctx_dft;
             handoff.view = &batch.view;
             handoff.seq = batch.view.tokens.front().seq_id;
+            handoff.defer_last = pp_overlap;
+            // The callback keeps device handoff readiness live until the deferred range is consumed.
+            handoff.held_target = ctx_tgt;
             if (ckpt_armed) {
                 for (const auto spot : batch.ckpt_spots) {
                     handoff.spot_end.push_back(spot - batch.view.tokens.front().pos[0]);
@@ -6260,12 +6293,17 @@ private:
             t_decode_pass += ggml_time_us() - t_decode_start;
         }
         if (handoff_on) {
-            llama_set_ubatch_rows_callback(ctx_tgt, nullptr, nullptr);
+            if (!handoff.deferred_count || ret != 0) {
+                handoff.release();
+            }
             if (handoff.failed || (ret != 0 && handoff.done > 0)) {
                 SRV_ERR("ubatch handoff failed (done = %d, ret = %d)\n", handoff.done, ret);
                 throw std::runtime_error("MTP ubatch handoff failed");
             }
             SRV_WRN("ubatch handoff: helper caught up %d of %d rows during the decode\n", handoff.done, batch.view.size());
+            if (handoff.deferred_count) {
+                SRV_WRN("[PP] deferred final device handoff: first %d, rows %d\n", handoff.done, handoff.deferred_count);
+            }
         }
 
         if (ckpt_armed && ret != 0) {
@@ -6328,6 +6366,22 @@ private:
             metrics_post_decode(off, batch.view.size(), has_output);
         }
 
+        // PP-1: a finished prompt with nothing else running starts the target's generation phase now; its expert
+        // refill streams in while the helper catches up below, and is joined before the first sampled token.
+        bool pp_overlap_started = false;
+        if (pp_overlap && handoff.deferred_count > 0 &&
+                std::any_of(slots.begin(), slots.end(), [](const server_slot & slot) {
+                    return slot.state == SLOT_STATE_DONE_PROMPT;
+                }) && std::none_of(slots.begin(), slots.end(), [](const server_slot & slot) {
+                    return slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_GENERATING;
+                })) {
+            queue_tasks.yield_to_queue([&]() {
+                llama_set_decode_phase_async(ctx_tgt, LLAMA_DECODE_PHASE_GENERATION);
+            });
+            pp_overlap_started = true;
+        }
+
+        const int64_t t_deferred_start = handoff.deferred_count ? ggml_time_us() : 0;
         // fork: grow draft scratch only for a large prompt, then return it before generation.
         if (ctx_dft && batch.view.size() > 3072 &&
                 std::all_of(batch.view.tokens.begin(), batch.view.tokens.end(), [&](const auto & token) {
@@ -6407,6 +6461,10 @@ private:
             }
         }
 
+        if (t_deferred_start) {
+            SRV_WRN("[PP] final device catch-up: %d rows, %.3f ms\n", handoff.deferred_count,
+                    (ggml_time_us() - t_deferred_start) / 1000.0);
+        }
         // fork: finish draft catch-up before returning scratch to the response cache.
         const bool prompt_done = std::any_of(slots.begin(), slots.end(), [](const server_slot & slot) {
             return slot.state == SLOT_STATE_DONE_PROMPT;
@@ -6414,7 +6472,18 @@ private:
         const bool other_work = std::any_of(slots.begin(), slots.end(), [](const server_slot & slot) {
             return slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_GENERATING;
         });
-        if (prompt_done && !other_work) {
+        if (pp_overlap_started) {
+            bool joined = true;
+            queue_tasks.yield_to_queue([&]() {
+                llama_set_decode_phase(ctx_dft, LLAMA_DECODE_PHASE_GENERATION);
+                joined = llama_prompt_warm_join(ctx_tgt);
+            });
+            if (!joined) {
+                throw std::runtime_error("expert cache refill failed");
+            }
+        } else if (prompt_done && !other_work) {
+            // The deferred range was consumed above, even if the refill stayed synchronous.
+            handoff.release();
             queue_tasks.yield_to_queue([&]() {
                 if (ctx_dft) {
                     llama_set_decode_phase(ctx_dft, LLAMA_DECODE_PHASE_GENERATION);
@@ -6422,6 +6491,7 @@ private:
                 llama_set_decode_phase(ctx_tgt, LLAMA_DECODE_PHASE_GENERATION);
             });
         }
+        handoff.release();
 
         // handle `n_cmpl > 1` tasks - when the main prompt is processed, activate all child tasks too
         for (auto & slot : slots) {
