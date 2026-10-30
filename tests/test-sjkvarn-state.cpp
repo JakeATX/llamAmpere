@@ -1019,6 +1019,27 @@ static void deferred_mask_capacity_case() {
     std::vector<int32_t> refused_counts;
     int64_t refused_width = 0;
     require(!llama_kq_mask_deferred_get(valid, refused_counts, &refused_width), "refused counts leave no record");
+    require(!llama_kq_mask_deferred_get(nullptr, refused_counts, &refused_width), "null mask lookup refused");
+    llama_kq_mask_deferred_fill_host(nullptr);
+    require(llama_kq_mask_deferred_set(valid, 8, { 0, 3, 8 }), "register mask before layout change");
+    auto * valid_data = static_cast<ggml_fp16_t *>(valid->data);
+    std::fill(valid_data, valid_data + 24, ggml_fp32_to_fp16(1.0f));
+    valid->nb[1] += sizeof(ggml_fp16_t);
+    require(!llama_kq_mask_deferred_get(valid, refused_counts, &refused_width), "changed mask layout refused");
+    llama_kq_mask_deferred_fill_host(valid);
+    for (int i = 0; i < 24; ++i) {
+        require(valid_data[i] == ggml_fp32_to_fp16(1.0f), "changed layout must not write host bytes");
+    }
+    valid->nb[1] -= sizeof(ggml_fp16_t);
+    require(llama_kq_mask_deferred_get(valid, refused_counts, &refused_width), "layout refusal keeps pending record");
+    require(refused_width == 8 && refused_counts == std::vector<int32_t>({ 0, 3, 8 }), "layout refusal keeps row counts");
+    llama_kq_mask_deferred_fill_host(valid);
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 8; ++c) {
+            require(valid_data[r*8 + c] == ggml_fp32_to_fp16(c < refused_counts[r] ? 0.0f : -INFINITY), "restored layout mask bytes");
+        }
+    }
+    printf("OK: changed deferred mask layout refused without host writes or lost counts\n");
     std::vector<ggml_tensor *> masks;
     for (int i = 0; i < 65; ++i) {
         auto * mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 8, 3);
@@ -1077,8 +1098,9 @@ static void ple_cold_recheck_case() {
     table->data = pages;
     table->buffer = ggml_backend_cpu_buffer_from_ptr(pages, size);
     require(table->buffer != nullptr, "prefetch host buffer");
-    llama_model model(llama_model_default_params());
-    model.arch = LLM_ARCH_QWEN4EXP;
+    llama_model_ptr model_owner(llama_model_create(LLM_ARCH_QWEN4EXP, llama_model_default_params()));
+    require(model_owner != nullptr, "prefetch test model");
+    auto & model = *model_owner;
     model.per_layer_tok_embd = table;
     model.can_prefetch.insert(table);
     model.hparams.ple_n_heads = 1;
@@ -1102,7 +1124,7 @@ static void ple_cold_recheck_case() {
         setenv("LLAMA_PLE_PF_COLD_THREADS", mode == 2 ? "0" : "2", 1);
         std::atomic<int> boosts{0};
         llama_log_set([](ggml_log_level, const char * text, void * data) {
-            if (strstr(text, "[PLEPF] cold table")) {
+            if (strstr(text, "[PLEPF] cold table") && strstr(text, "readers at chunk 1")) {
                 static_cast<std::atomic<int> *>(data)->fetch_add(1);
             }
         }, &boosts);

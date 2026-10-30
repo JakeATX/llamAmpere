@@ -4282,9 +4282,12 @@ void kq_mask_deferred_drop(const ggml_tensor * t) {
 }
 
 kq_mask_deferred * kq_mask_deferred_find(const ggml_tensor * t) {
+    if (!t || !t->data || t->type != GGML_TYPE_F16 || !ggml_is_contiguous(t)) {
+        return nullptr;
+    }
     for (auto & d : g_kq_deferred) {
-        if (d.t == t && d.data == t->data && t->type == GGML_TYPE_F16 && t->ne[0] == d.n_kv &&
-                t->ne[1]*t->ne[2]*t->ne[3] == (int64_t) d.n_visible.size()) {
+        if (d.t == t && d.data == t->data && t->ne[0] == d.n_kv &&
+                ggml_nrows(t) == (int64_t) d.n_visible.size()) {
             return &d;
         }
     }
