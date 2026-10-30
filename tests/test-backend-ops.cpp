@@ -20136,6 +20136,8 @@ static int run_ait_check(const char * dir) {
             for (auto & v : x) { v = ux(rng); }
             ggml_backend_tensor_set(a, buf.data(), 0, buf.size());
             ggml_backend_tensor_set(b, x.data(), 0, x.size() * 4);
+            std::vector<float> yg((size_t) (N * M), std::numeric_limits<float>::quiet_NaN());
+            ggml_backend_tensor_set(y, yg.data(), 0, yg.size() * sizeof(float));
             if (ggml_backend_graph_compute(be, gf) != GGML_STATUS_SUCCESS) {
                 fprintf(stderr, "%s N=%lld: initial graph compute FAIL\n", nm.c_str(), (long long) N);
                 ++fails;
@@ -20143,7 +20145,6 @@ static int run_ait_check(const char * dir) {
                 ggml_free(ctx);
                 continue;
             }
-            std::vector<float> yg((size_t) (N * M));
             ggml_backend_tensor_get(y, yg.data(), 0, yg.size() * 4);
             if (N <= 8) {
                 const char * repeat_env = getenv("GGML_TEST_AIT_REPEAT");
@@ -20154,6 +20155,7 @@ static int run_ait_check(const char * dir) {
                     std::fill(again.begin(), again.end(), std::numeric_limits<float>::quiet_NaN());
                     ggml_backend_tensor_set(y, again.data(), 0, again.size() * sizeof(float));
                     if (ggml_backend_graph_compute(be, gf) != GGML_STATUS_SUCCESS) {
+                        fprintf(stderr, "%s N=%lld: repeat %d graph compute FAIL\n", nm.c_str(), (long long) N, repeat);
                         identical = false;
                         break;
                     }
