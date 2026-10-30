@@ -2923,10 +2923,16 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // Use the per-layer n_expert_used (not the ubatch one) so the graph stays
     // bounded during warmup. ref: https://github.com/ggml-org/llama.cpp/pull/14753
     const uint32_t n_expert_used_il = hparams.n_expert_used(il);
+    static const bool small_reduce = [] {
+        const char * value = getenv("LLAMA_MOE_SMALL_REDUCE");
+        return value && atoi(value) != 0;
+    }();
+    // Small verify batches avoid one add launch per expert. Keep warmup's wider routing unchanged.
+    const bool reduce_verify = small_reduce && n_tokens <= 8 && n_expert_used_il == n_expert_used;
     ggml_tensor * moe_out;
     if (n_expert_used_il == 1) {
         moe_out = ggml_cont(ctx0, ggml_view_2d(ctx0, experts, n_embd, n_tokens, experts->nb[2], 0));
-    } else if (n_tokens == 1) {
+    } else if (n_tokens == 1 || reduce_verify) {
         ggml_tensor * experts_pe = ggml_cont(ctx0, ggml_permute(ctx0, experts, 1, 0, 2, 3));
         ggml_tensor * summed     = ggml_sum_rows(ctx0, experts_pe); // [1, n_embd, 1]
         moe_out = ggml_reshape_2d(ctx0, summed, n_embd, n_tokens);

@@ -129,6 +129,45 @@ static void test_zero_block() {
     CHECK(checked > 10);
 }
 
+static void test_small_expert_reduce() {
+    for (int nt : { 1, 2, 3, 4, 5, 8 }) {
+        for (int used : { 2, 7, 10 }) {
+            ggml_init_params ip = { 16u << 20, nullptr, false };
+            ggml_context * ctx = ggml_init(ip);
+            const int rows = 2560;
+            ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, rows, used, nt);
+            float * data = (float *) x->data;
+            for (int t = 0; t < nt; ++t) {
+                for (int e = 0; e < used; ++e) {
+                    for (int r = 0; r < rows; ++r) {
+                        // Distinct tokens/rows expose a wrong permute; masked columns model bank holes.
+                        data[(t*used + e)*rows + r] = (t + e) % 3 == 0 ? 0.0f :
+                            ((r*13 + e*17 + t*29) % 101 - 50)*0.013f;
+                    }
+                }
+            }
+            ggml_tensor * out = ggml_reshape_2d(ctx,
+                ggml_sum_rows(ctx, ggml_cont(ctx, ggml_permute(ctx, x, 1, 0, 2, 3))), rows, nt);
+            ggml_cgraph * gf = ggml_new_graph(ctx);
+            ggml_build_forward_expand(gf, out);
+            CHECK(ggml_graph_compute_with_ctx(ctx, gf, 2) == GGML_STATUS_SUCCESS);
+            for (int t = 0; t < nt; ++t) {
+                for (int r = 0; r < rows; ++r) {
+                    double expected = 0.0, scale = 0.0;
+                    for (int e = 0; e < used; ++e) {
+                        const float v = data[(t*used + e)*rows + r];
+                        expected += v;
+                        scale += std::abs(v);
+                    }
+                    const float got = ((float *) out->data)[t*rows + r];
+                    CHECK(std::isfinite(got) && std::abs(got - expected) <= 2e-6*(1.0 + scale));
+                }
+            }
+            ggml_free(ctx);
+        }
+    }
+}
+
 int main(int argc, char ** argv) {
     const bool child_off = argc > 1 && strcmp(argv[1], "--skip-off") == 0;
     if (child_off) {
@@ -139,6 +178,7 @@ int main(int argc, char ** argv) {
     test_skip(true);
     test_census();
     test_zero_block();
+    test_small_expert_reduce();
     // GGML_MOE_BANK_SKIP=0 is read once per process: check it in a child
     char cmd[4200];
     snprintf(cmd, sizeof(cmd), "GGML_MOE_BANK_SKIP=0 '%s' --skip-off", argv[0]);
