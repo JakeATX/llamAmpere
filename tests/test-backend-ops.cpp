@@ -11893,6 +11893,61 @@ struct test_moe_reduce : public test_case {
     }
 };
 
+struct test_moe_bank_mixed : public test_case {
+    const ggml_type bank_type, base_type;
+    const int width, mode, channels;
+    const bool extra_reader, reduce;
+    test_moe_bank_mixed(ggml_type bank_type, ggml_type base_type, int width, int mode, int channels,
+            bool extra_reader = false, bool reduce = false) :
+        bank_type(bank_type), base_type(base_type), width(width), mode(mode), channels(channels),
+        extra_reader(extra_reader), reduce(reduce) {}
+    std::string vars() override { return VARS_TO_STR7(bank_type, base_type, width, mode, channels, extra_reader, reduce); }
+    std::string op_desc(ggml_tensor *) override { return "MOE_BANK_MIXED"; }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
+    const char * required_fusion() override {
+        return !extra_reader && getenv("LLAMA_MOE_BANK_MIXED") && atoi(getenv("LLAMA_MOE_BANK_MIXED")) ? "moe_bank_mixed" : nullptr;
+    }
+    const char * forbidden_fusion() override { return extra_reader ? "moe_bank_mixed" : nullptr; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * hw = ggml_new_tensor_3d(ctx, bank_type, 256, 32, 4);
+        ggml_tensor * cw = ggml_new_tensor_3d(ctx, base_type, 256, 32, 4);
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 256, channels, width);
+        ggml_tensor * hi = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 4, width);
+        ggml_tensor * ci = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 4, width);
+        ggml_set_name(hi, "mixed_bank_ids"); ggml_set_name(ci, "mixed_base_ids");
+        ggml_tensor * mask = ggml_reshape_3d(ctx,
+                ggml_step(ctx, ggml_scale_bias(ctx, ggml_cast(ctx, hi, GGML_TYPE_F32), -1.0f, -0.5f)), 1, 4, width);
+        ggml_build_forward_expand(gf, mask);
+        ggml_tensor * h = ggml_mul_mat_id(ctx, hw, x, hi);
+        ggml_tensor * c = ggml_mul_mat_id(ctx, cw, x, ci);
+        ggml_tensor * out = ggml_add(ctx, h, ggml_mul(ctx, c, mask));
+        if (reduce) {
+            ggml_tensor * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, 4, width);
+            out = ggml_reshape_2d(ctx, ggml_sum_rows(ctx,
+                    ggml_cont(ctx, ggml_permute(ctx, ggml_mul(ctx, out, weights), 1, 0, 2, 3))), 32, width);
+        }
+        return extra_reader ? ggml_add(ctx, out, h) : out;
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32 && t->op == GGML_OP_NONE) {
+                const bool bank = strcmp(t->name, "mixed_bank_ids") == 0;
+                std::vector<int32_t> values(4*width);
+                for (int j = 0; j < 4*width; ++j) {
+                    const bool hot = mode == 1 || (mode == 2 && (j%3) != 0);
+                    values[j] = bank ? (hot ? (j*3 + j/4)%4 : -1) : (j + j/4)%4;
+                }
+                ggml_backend_tensor_set(t, values.data(), 0, values.size()*sizeof(int32_t));
+            } else if (is_ai4_family(t->type)) {
+                init_tensor_ai4_random(t);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 struct test_moe_bank_joint_reduce : public test_case {
     const int64_t n_embd, n_tokens;
     const int mask_mode;
@@ -18844,6 +18899,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                     test_cases.emplace_back(new test_topk_moe({32, 9, 1, 1}, 8, with_norm, bias_probs, gate, scale_w));
                 }
             }
+        }
+    }
+
+    for (ggml_type bank : { GGML_TYPE_AIT2_U, GGML_TYPE_AIT3_U }) {
+        for (ggml_type base : { GGML_TYPE_Q4_0, GGML_TYPE_Q2_K, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ3_S }) {
+            for (int width : { 1, 4, 8 }) {
+                for (int mode : { 0, 1, 2 }) {
+                    for (int channels : { 1, 4 }) {
+                        test_cases.emplace_back(new test_moe_bank_mixed(bank, base, width, mode, channels));
+                    }
+                }
+            }
+        }
+    }
+    test_cases.emplace_back(new test_moe_bank_mixed(GGML_TYPE_AIT2_U, GGML_TYPE_IQ2_XS, 4, 2, 4, true));
+    for (int width : { 1, 4, 8 }) {
+        for (ggml_type bank : { GGML_TYPE_AIT2_U, GGML_TYPE_AIT3_U }) {
+            test_cases.emplace_back(new test_moe_bank_mixed(bank, GGML_TYPE_IQ2_XS, width, 2, 4, false, true));
         }
     }
 

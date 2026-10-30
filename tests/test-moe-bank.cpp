@@ -168,6 +168,72 @@ static void test_small_expert_reduce() {
     }
 }
 
+static void test_mixed_ffn() {
+    for (ggml_type bank_type : { GGML_TYPE_AIT2_U, GGML_TYPE_AIT3_U }) {
+        for (int width : { 1, 4, 8 }) {
+            for (int mode : { 0, 1, 2 }) {
+                ggml_context * ctx = ggml_init({ 32u << 20, nullptr, false });
+                CHECK(ctx != nullptr);
+                if (!ctx) { return; }
+                ggml_tensor * hw[3], * cw[3];
+                for (int p = 0; p < 3; ++p) {
+                    hw[p] = ggml_new_tensor_3d(ctx, bank_type, 256, 256, 4);
+                    cw[p] = ggml_new_tensor_3d(ctx, GGML_TYPE_Q4_0, 256, 256, 4);
+                    const int unit = bank_type == GGML_TYPE_AIT2_U ? 544 : 800;
+                    auto * bytes = (uint8_t *) hw[p]->data;
+                    for (size_t i = 0; i < ggml_nbytes(hw[p]); ++i) { bytes[i] = (uint8_t) ((i*73 + i/7 + p*31)%256); }
+                    for (size_t i = 0; i < ggml_nbytes(hw[p]); i += unit) {
+                        auto * scales = (ggml_fp16_t *) (bytes + i);
+                        for (int r = 0; r < 16; ++r) { scales[r] = ggml_fp32_to_fp16(0.0005f*(1 + (r + p)%5)); }
+                    }
+                    std::vector<float> values(ggml_nelements(cw[p]));
+                    for (size_t i = 0; i < values.size(); ++i) { values[i] = 0.001f*((int)((i*37 + p*13)%101) - 50); }
+                    ggml_quantize_chunk(GGML_TYPE_Q4_0, values.data(), cw[p]->data, 0, 256*4, 256, nullptr);
+                }
+                ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 256, 1, width);
+                ggml_tensor * hi = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 4, width);
+                ggml_tensor * ci = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 4, width);
+                ggml_tensor * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, 4, width);
+                for (int i = 0; i < width*256; ++i) { ((float *) x->data)[i] = 0.01f*((i*17)%61 - 30); }
+                for (int j = 0; j < width*4; ++j) {
+                    const bool bank = mode == 1 || (mode == 2 && j%3 != 0);
+                    ((int32_t *) hi->data)[j] = bank ? (j*3 + j/4)%4 : -1;
+                    ((int32_t *) ci->data)[j] = (j + j/4)%4;
+                    ((float *) weights->data)[j] = 0.125f + 0.03125f*(j%7);
+                }
+                ggml_tensor * cold = ggml_reshape_3d(ctx,
+                        ggml_step(ctx, ggml_scale_bias(ctx, ggml_cast(ctx, hi, GGML_TYPE_F32), -1.0f, -0.5f)), 1, 4, width);
+                auto reduce = [&](ggml_tensor * e, ggml_tensor * w) {
+                    return ggml_sum_rows(ctx, ggml_cont(ctx, ggml_permute(ctx, ggml_mul(ctx, e, w), 1, 0, 2, 3)));
+                };
+                auto branch = [&](ggml_tensor ** w, ggml_tensor * ids) {
+                    ggml_tensor * up = ggml_mul_mat_id(ctx, w[0], x, ids);
+                    ggml_tensor * gate = ggml_mul_mat_id(ctx, w[1], x, ids);
+                    return ggml_mul_mat_id(ctx, w[2], ggml_swiglu_split(ctx, gate, up), ids);
+                };
+                ggml_tensor * wh = ggml_sub(ctx, weights, ggml_mul(ctx, weights, cold));
+                ggml_tensor * old = ggml_add(ctx, reduce(branch(hw, hi), wh), reduce(branch(cw, ci), ggml_mul(ctx, weights, cold)));
+                auto mixed_mm = [&](int p, ggml_tensor * in) {
+                    return ggml_add(ctx, ggml_mul_mat_id(ctx, hw[p], in, hi),
+                            ggml_mul(ctx, ggml_mul_mat_id(ctx, cw[p], in, ci), cold));
+                };
+                ggml_tensor * up = mixed_mm(0, x), * gate = mixed_mm(1, x);
+                ggml_tensor * mixed = reduce(mixed_mm(2, ggml_swiglu_split(ctx, gate, up)), weights);
+                ggml_cgraph * gf = ggml_new_graph(ctx);
+                ggml_build_forward_expand(gf, old);
+                ggml_build_forward_expand(gf, mixed);
+                CHECK(ggml_graph_compute_with_ctx(ctx, gf, 2) == GGML_STATUS_SUCCESS);
+                for (int i = 0; i < width*256; ++i) {
+                    const float a = ((const float *) old->data)[i], b = ((const float *) mixed->data)[i];
+                    CHECK(std::isfinite(a) && std::isfinite(b) && std::abs(a - b) <= 1e-5f*(1 + std::abs(a)));
+                }
+                ggml_free(ctx);
+            }
+        }
+    }
+    printf("mixed FFN: 18 two-call reference comparisons\n");
+}
+
 int main(int argc, char ** argv) {
     const bool child_off = argc > 1 && strcmp(argv[1], "--skip-off") == 0;
     if (child_off) {
@@ -179,6 +245,7 @@ int main(int argc, char ** argv) {
     test_census();
     test_zero_block();
     test_small_expert_reduce();
+    test_mixed_ffn();
     // GGML_MOE_BANK_SKIP=0 is read once per process: check it in a child
     char cmd[4200];
     snprintf(cmd, sizeof(cmd), "GGML_MOE_BANK_SKIP=0 '%s' --skip-off", argv[0]);

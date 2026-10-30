@@ -1,4 +1,5 @@
 #include "moe-cache.cuh"
+#include "ai4-mm.cuh"
 
 #if defined(GGML_USE_MUSA)
 
@@ -11,6 +12,7 @@ uint64_t ggml_cuda_moe_cache_device_capture_generation(int) { return 0; }
 void ggml_cuda_moe_cache_device_graph_record(int, bool, const ggml_cgraph *) {}
 bool ggml_cuda_moe_cache_device_supports(const ggml_tensor *, int) { return false; }
 bool ggml_cuda_moe_cache_device_compute(ggml_backend_cuda_context &, ggml_tensor *) { return false; }
+bool ggml_cuda_moe_cache_mixed_compute(ggml_backend_cuda_context &, const ggml_tensor *, ggml_tensor *, ggml_tensor *) { return false; }
 bool ggml_cuda_moe_cache_device_fused_compute(ggml_backend_cuda_context &, ggml_tensor *, ggml_tensor *, ggml_tensor *) { return false; }
 bool ggml_cuda_moe_cache_prefetch_async_active(void) { return false; }
 void ggml_cuda_moe_cache_device_predict(ggml_backend_cuda_context &, const ggml_tensor *) {}
@@ -10902,7 +10904,7 @@ void ggml_cuda_moe_cache_cs_graph_scan(ggml_backend_cuda_context & ctx, const gg
     };
     std::vector<int8_t> seen(session.cs_valid.size(), 0), good(session.cs_valid.size(), 0);
     std::vector<const ggml_tensor *> watch;   // up, gate, glu of the candidate layers
-    std::vector<int> watch_layer;
+    std::vector<int> watch_layer, watch_uses;
     for (int n = 0; n < n_nodes; ++n) {
         const ggml_tensor * d = ggml_graph_node(const_cast<ggml_cgraph *>(cgraph), n);
         const auto * td = table_of(d);
@@ -10915,6 +10917,11 @@ void ggml_cuda_moe_cache_cs_graph_scan(ggml_backend_cuda_context & ctx, const gg
                 ggml_get_op_params_i32(g, 1) == 0 && g->src[0] && g->src[1] && g->type == GGML_TYPE_F32;
         const ggml_tensor * gate = ok ? g->src[0] : nullptr;
         const ggml_tensor * up = ok ? g->src[1] : nullptr;
+        const ggml_tensor * gate_out = gate, * up_out = up;
+        const ggml_tensor * mixed_gate = ggml_cuda_moe_mixed_base(gate);
+        const ggml_tensor * mixed_up = ggml_cuda_moe_mixed_base(up);
+        const bool mixed = mixed_gate && mixed_up;
+        if (mixed) { gate = mixed_gate; up = mixed_up; }
         const auto * tg = table_of(gate);
         const auto * tu = table_of(up);
         ok = ok && tg && tu && tg->mj_layer == L && tu->mj_layer == L && tg->mj_kind == 1 && tu->mj_kind == 0 &&
@@ -10922,9 +10929,9 @@ void ggml_cuda_moe_cache_cs_graph_scan(ggml_backend_cuda_context & ctx, const gg
                 ggml_are_same_shape(up, gate) && ggml_are_same_shape(up, g) && ggml_is_contiguous(g);
         if (ok) {
             good[L] = 1;
-            watch.push_back(up); watch_layer.push_back(L);
-            watch.push_back(gate); watch_layer.push_back(L);
-            watch.push_back(g); watch_layer.push_back(L);
+            watch.push_back(up_out); watch_layer.push_back(L); watch_uses.push_back(1);
+            watch.push_back(gate_out); watch_layer.push_back(L); watch_uses.push_back(1);
+            watch.push_back(g); watch_layer.push_back(L); watch_uses.push_back(mixed ? 2 : 1);
         }
     }
     if (!watch.empty()) {
@@ -10945,7 +10952,7 @@ void ggml_cuda_moe_cache_cs_graph_scan(ggml_backend_cuda_context & ctx, const gg
             }
         }
         for (size_t w = 0; w < watch.size(); ++w) {
-            if (uses[w] != 1) { good[watch_layer[w]] = 0; }
+            if (uses[w] != watch_uses[w]) { good[watch_layer[w]] = 0; }
         }
     }
     size_t valid = 0;
@@ -11688,7 +11695,7 @@ static char * moe_quantize_act(ggml_backend_cuda_context & ctx, const ggml_tenso
     return buf;
 }
 
-bool ggml_cuda_moe_cache_device_compute(ggml_backend_cuda_context & ctx, ggml_tensor * op) {
+static bool moe_cache_device_compute(ggml_backend_cuda_context & ctx, ggml_tensor * op, const ggml_tensor * bank) {
     if (g_session_stack.empty() || !g_session_stack.back().active ||
             !moe_cache_device_op_fits(*g_session_stack.back().active, op, ctx.device)) {
         return false;
@@ -11759,7 +11766,12 @@ bool ggml_cuda_moe_cache_device_compute(ggml_backend_cuda_context & ctx, ggml_te
         };
         // The down projection uses one pass only when no tail rows need zeroing.
         const int one = table.mj_kind == 2 && !tail ? moe_down_one_mode() : 0;
-        if (one != 0) {
+        if (bank) {
+            eff = moe_hf_wait(ctx, session, table);
+            ggml_cuda_mul_mat_id_mixed(ctx, bank, op, op, quantized, eff,
+                    cs ? g_cs_mask + (size_t) table.mj_kind*g_hf_experts :
+                    tail ? g_tail_mask + (size_t) table.mj_kind*g_hf_experts : nullptr, table.hot);
+        } else if (one != 0) {
             eff = moe_hf_wait(ctx, session, table);
             const int64_t count = op->ne[0] * ids->ne[0] * ids->ne[1];
             GGML_ASSERT(op->type == GGML_TYPE_F32 && ggml_is_contiguous(op) && ggml_nelements(op) == count);
@@ -11808,7 +11820,9 @@ bool ggml_cuda_moe_cache_device_compute(ggml_backend_cuda_context & ctx, ggml_te
     }
     moe_cache_effective_table effective(ctx.pool());
     const void * const * mmv_table = moe_cache_resolve_table(ctx, session, table, ids, effective);
-    if (!ggml_cuda_moe_table_mmv_grouped_try(ctx, mmv_table, nullptr, (ggml_type)table.desc.type, quantized,
+    if (bank) {
+        ggml_cuda_mul_mat_id_mixed(ctx, bank, op, op, quantized, mmv_table);
+    } else if (!ggml_cuda_moe_table_mmv_grouped_try(ctx, mmv_table, nullptr, (ggml_type)table.desc.type, quantized,
             (const int32_t *)ids->data, (float *)op->data, a->ne[0], op->ne[0], ids->ne[0], ids->ne[1],
             a->ne[1], ids->nb[1] / sizeof(int32_t)) &&
         !ggml_cuda_moe_table_mmv_d1_try(ctx, mmv_table, (ggml_type)table.desc.type, quantized,
@@ -11831,6 +11845,20 @@ bool ggml_cuda_moe_cache_device_compute(ggml_backend_cuda_context & ctx, ggml_te
         }
     }
     return true;
+}
+
+bool ggml_cuda_moe_cache_device_compute(ggml_backend_cuda_context & ctx, ggml_tensor * op) {
+    return moe_cache_device_compute(ctx, op, nullptr);
+}
+
+bool ggml_cuda_moe_cache_mixed_compute(ggml_backend_cuda_context & ctx, const ggml_tensor * bank,
+        ggml_tensor * base, ggml_tensor * dst) {
+    if (!ggml_cuda_moe_mixed_supported(bank, base)) {
+        return false;
+    }
+    ggml_tensor output = *base;
+    output.data = dst->data;
+    return moe_cache_device_compute(ctx, &output, bank);
 }
 
 // fork: one activation quantization and one MMV retain both exact expert projections.

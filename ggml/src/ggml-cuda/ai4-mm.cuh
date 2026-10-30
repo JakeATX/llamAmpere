@@ -15,3 +15,9 @@ void ggml_cuda_mul_mat_id_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor
 
 // true when ggml_cuda_mul_mat_id_ai4 would take the host-routed reference path (GGML_CUDA_AI4_REF=1 or pre-Ampere)
 bool ggml_cuda_ai4_id_needs_sync(int cc, ggml_type t);
+
+bool ggml_cuda_moe_mixed_supported(const ggml_tensor * bank, const ggml_tensor * base);
+const ggml_tensor * ggml_cuda_moe_mixed_base(const ggml_tensor * joined);
+void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tensor * bank,
+        const ggml_tensor * base, ggml_tensor * dst, const char * act_q8 = nullptr,
+        const void * const * table = nullptr, const uint8_t * skip = nullptr, const uint8_t * resident = nullptr);

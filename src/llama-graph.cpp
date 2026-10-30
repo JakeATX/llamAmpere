@@ -2682,6 +2682,44 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             hot_ids = ggml_cast(ctx0, ggml_reshape_2d(ctx0, hot_f, n_expert_used, n_tokens), GGML_TYPE_I32);
         }
         cb(hot_ids, "ffn_moe_hot_ids", il);
+        static const bool mixed_enabled = [] {
+            const char * value = getenv("LLAMA_MOE_BANK_MIXED");
+            return value && atoi(value) != 0;
+        }();
+        if (mixed_enabled && hot_skip && !b1_routing && n_tokens <= 8 &&
+                !(getenv("GGML_MOE_HOT_DBG") && atoi(getenv("GGML_MOE_HOT_DBG")) != 0) &&
+                type_op == LLM_FFN_SILU && il >= 0 && hparams.swiglu_clamp_exp[il] <= 1e-6f &&
+                loras->empty() && (!hadamard_rotations || hadamard_rotations->empty()) &&
+                up_exps && gate_exps && down_exps && !gate_up_exps &&
+                !up_exps_b && !gate_exps_b && !down_exps_b &&
+                !up_exps_s && !gate_exps_s && !down_exps_s &&
+                (hot.up->type == GGML_TYPE_AIT2_U || hot.up->type == GGML_TYPE_AIT3_U) &&
+                (hot.gate->type == GGML_TYPE_AIT2_U || hot.gate->type == GGML_TYPE_AIT3_U) &&
+                (hot.down->type == GGML_TYPE_AIT2_U || hot.down->type == GGML_TYPE_AIT3_U)) {
+            ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, nullptr, il);
+            // fork: slot-cache IDs have a different domain from the bank map; retain the old path there.
+            if (!slots) {
+                ggml_tensor * cold_mask = ggml_reshape_3d(ctx0,
+                        ggml_step(ctx0, ggml_scale_bias(ctx0, ggml_cast(ctx0, hot_ids, GGML_TYPE_F32), -1.0f, -0.5f)),
+                        1, n_expert_used, n_tokens);
+                ggml_build_forward_expand(gf, cold_mask);
+                auto mixed_mm = [&](ggml_tensor * hw, ggml_tensor * cw, ggml_tensor * x) {
+                    ggml_tensor * h = ggml_mul_mat_id(ctx0, hw, x, hot_ids);
+                    ggml_tensor * c = ggml_mul_mat_id(ctx0, cw, x, selected_experts);
+                    return ggml_add(ctx0, h, ggml_mul(ctx0, c, cold_mask));
+                };
+                ggml_tensor * x = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
+                ggml_tensor * up = mixed_mm(hot.up, up_exps, x);
+                ggml_tensor * gate = mixed_mm(hot.gate, gate_exps, x);
+                x = ggml_swiglu_split(ctx0, gate, up);
+                ggml_tensor * experts = mixed_mm(hot.down, down_exps, x);
+                ggml_tensor * weighted = ggml_mul(ctx0, experts, weights);
+                ggml_tensor * sum = ggml_sum_rows(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, weighted, 1, 0, 2, 3)));
+                ggml_tensor * out = ggml_reshape_2d(ctx0, sum, n_embd, n_tokens);
+                cb(out, "ffn_moe_out", il);
+                return out;
+            }
+        }
         // the cold bank keeps all n_expert experts, so the routed ids stay unique there; the hot experts
         // run with zero weight in the cold call
         GGML_ASSERT(down_exps == nullptr || down_exps->ne[2] == n_expert);

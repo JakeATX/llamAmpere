@@ -6918,6 +6918,20 @@ struct ggml_cuda_moe_bank_joint_match {
     ggml_tensor * dst = nullptr;
 };
 
+static bool ggml_cuda_match_moe_bank_mixed(const ggml_cgraph * graph, int i) {
+    static const bool enabled = [] {
+        const char * value = getenv("LLAMA_MOE_BANK_MIXED");
+        return value && atoi(value) != 0;
+    }();
+    if (!enabled || i + 4 > graph->n_nodes) { return false; }
+    const ggml_op ops[] = { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_MUL, GGML_OP_ADD };
+    const int output = i + 3;
+    if (!ggml_can_fuse_subgraph(graph, i, 4, ops, &output, 1)) { return false; }
+    const ggml_tensor * h = graph->nodes[i], * c = graph->nodes[i + 1];
+    const ggml_tensor * mul = graph->nodes[i + 2], * add = graph->nodes[output];
+    return add->src[0] == h && add->src[1] == mul && mul->src[0] == c && ggml_cuda_moe_mixed_base(add) == c;
+}
+
 static bool ggml_cuda_match_moe_bank_joint(const ggml_cgraph * graph, int i, ggml_cuda_moe_bank_joint_match & m) {
     static const bool enabled = [] {
         const char * value = getenv("LLAMA_MOE_BANK_JOINT_REDUCE");
@@ -7045,6 +7059,32 @@ static bool ggml_cuda_match_moe_weighted_reduction(
     const int64_t n_tokens      = weighted->ne[2] * weighted->ne[3];
     if (n_expert_used < 2 || n_expert_used > MOE_WEIGHTED_REDUCTION_MAX_EXPERTS) {
         return false;
+    }
+
+    // The mixed expert graph reduces one slab through the portable transpose/sum form.
+    static const bool mixed_enabled = getenv("LLAMA_MOE_BANK_MIXED") && atoi(getenv("LLAMA_MOE_BANK_MIXED"));
+    if (mixed_enabled && mul_count == 1 && ggml_cuda_moe_mixed_base(experts) && node_idx + 5 <= cgraph->n_nodes) {
+        const ggml_op ops[] = { GGML_OP_MUL, GGML_OP_PERMUTE, GGML_OP_CONT, GGML_OP_SUM_ROWS, GGML_OP_RESHAPE };
+        const int output_idx = node_idx + 4;
+        const ggml_tensor * perm = cgraph->nodes[node_idx + 1], * cont = cgraph->nodes[node_idx + 2];
+        const ggml_tensor * sum = cgraph->nodes[node_idx + 3];
+        ggml_tensor * dst = cgraph->nodes[output_idx];
+        bool axes = true;
+        for (int axis = 0; axis < 4; ++axis) {
+            axes &= ggml_get_op_params_i32(perm, axis) == (axis < 2 ? 1 - axis : axis);
+        }
+        if (ggml_can_fuse_subgraph(cgraph, node_idx, 5, ops, &output_idx, 1) && axes &&
+                weighted->ne[3] == 1 && perm->src[0] == weighted && cont->src[0] == perm &&
+                sum->src[0] == cont && dst->src[0] == sum &&
+                perm->type == GGML_TYPE_F32 && cont->type == GGML_TYPE_F32 && sum->type == GGML_TYPE_F32 &&
+                dst->type == GGML_TYPE_F32 && ggml_is_contiguous(cont) && ggml_is_contiguous(dst) &&
+                ggml_are_same_shape(perm, cont) && perm->ne[0] == n_expert_used &&
+                perm->ne[1] == weighted->ne[0] && perm->ne[2] == n_tokens && perm->ne[3] == 1 &&
+                sum->ne[0] == 1 && sum->ne[1] == weighted->ne[0] && sum->ne[2] == n_tokens && sum->ne[3] == 1 &&
+                dst->ne[0] == weighted->ne[0] && dst->ne[1] == n_tokens && dst->ne[2] == 1 && dst->ne[3] == 1) {
+            match.experts = experts; match.weights = weights; match.dst = dst; match.node_count = 5;
+            return true;
+        }
     }
 
     const int node_count = 2 * n_expert_used + mul_count - 1;
@@ -9415,6 +9455,23 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     if (node->op == GGML_OP_MUL_MAT_ID) {
+        const int output = i + 3;
+        if (cuda_ctx->stream_context().concurrent_events.empty() && ggml_cuda_match_moe_bank_mixed(cgraph, i) &&
+                GGML_CUDA_CC_IS_NVIDIA(ggml_cuda_info().devices[cuda_ctx->device].cc) &&
+                ggml_cuda_info().devices[cuda_ctx->device].cc >= GGML_CUDA_CC_AMPERE &&
+                !ggml_cuda_ai4_id_needs_sync(ggml_cuda_info().devices[cuda_ctx->device].cc, node->src[0]->type) &&
+                ggml_cuda_check_fusion_memory_ranges(cgraph, i, 4, &output, 1)) {
+            ggml_tensor * base = cgraph->nodes[i + 1], * dst = cgraph->nodes[output];
+            if (ggml_cuda_moe_cache_mixed_compute(*cuda_ctx, node, base, dst)) {
+                cuda_ctx->fusion_stats.moe_bank_mixed++;
+                return 3;
+            }
+            if (ggml_backend_buffer_is_cuda(base->src[0]->buffer)) {
+                ggml_cuda_mul_mat_id_mixed(*cuda_ctx, node, base, dst);
+                cuda_ctx->fusion_stats.moe_bank_mixed++;
+                return 3;
+            }
+        }
         const int n_skip = ggml_cuda_fuse_nemotron_moe(*cuda_ctx, cgraph, i);
         if (n_skip >= 0) {
             cuda_ctx->fusion_stats.nemotron_moe++;
@@ -11201,6 +11258,16 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             }
         }
         for (int i = 0; i < cgraph->n_nodes; ++i) {
+            if (ggml_cuda_match_moe_bank_mixed(cgraph, i)) {
+                for (int k : { i, i + 1 }) {
+                    for (int s = 0; s < 3; ++s) {
+                        params->add_alloc_dep(params->user_data, cgraph->nodes[k]->src[s], cgraph->nodes[i + 3]);
+                    }
+                }
+                params->add_alloc_dep(params->user_data, cgraph->nodes[i + 2]->src[1], cgraph->nodes[i + 3]);
+                i += 3;
+                continue;
+            }
             ggml_cuda_moe_bank_joint_match joint;
             if (ggml_cuda_match_moe_bank_joint(cgraph, i, joint)) {
                 for (const ggml_tensor * src : { joint.hot, joint.cold, joint.hot_weights, joint.cold_weights }) {
@@ -12702,6 +12769,9 @@ int64_t ggml_backend_cuda_fusion_count(ggml_backend_t backend, const char * name
     }
     if (strcmp(name, "nemotron_moe") == 0) {
         return ctx->fusion_stats.nemotron_moe;
+    }
+    if (strcmp(name, "moe_bank_mixed") == 0) {
+        return ctx->fusion_stats.moe_bank_mixed;
     }
     if (strcmp(name, "add_rms") == 0) {
         return ctx->fusion_stats.add_rms;

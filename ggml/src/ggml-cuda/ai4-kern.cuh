@@ -943,7 +943,7 @@ template <int LAY, int WARPS>
 constexpr __host__ __device__ int64_t mmvr_soff(int c) { return (int64_t) c*WARPS*u_bytes<LAY>(); }
 
 template <int LAY, int XSH, bool ID, int KT, int STAGES = 2, int WARPS = 4, int MINB = 6, bool DIRECT = false, bool FUSED_X = false, int SPLITS = 1, int LOOP_UNROLL = 1, bool SINGLE_N = false>
-static __global__ void __launch_bounds__(WARPS*32, MINB) mmvr(
+static __device__ __forceinline__ void mmvr_body(
         const uint8_t * __restrict__ W, const int8_t * __restrict__ Xq, const float * __restrict__ Xs,
         float * __restrict__ Y, int64_t ldy, int M, int N, int Kr, const idmap idm) {
     static_assert(!SINGLE_N || !ID || DIRECT, "single-column dense or direct scope");
@@ -1212,6 +1212,13 @@ static __global__ void __launch_bounds__(WARPS*32, MINB) mmvr(
         }
     }
     (void) M;
+}
+
+template <int LAY, int XSH, bool ID, int KT, int STAGES = 2, int WARPS = 4, int MINB = 6, bool DIRECT = false, bool FUSED_X = false, int SPLITS = 1, int LOOP_UNROLL = 1, bool SINGLE_N = false>
+static __global__ void __launch_bounds__(WARPS*32, MINB) mmvr(
+        const uint8_t * W, const int8_t * Xq, const float * Xs,
+        float * Y, int64_t ldy, int M, int N, int K, const idmap idm) {
+    mmvr_body<LAY, XSH, ID, KT, STAGES, WARPS, MINB, DIRECT, FUSED_X, SPLITS, LOOP_UNROLL, SINGLE_N>(W, Xq, Xs, Y, ldy, M, N, K, idm);
 }
 
 template <int LAY, int XSH, bool ID, int KT, int STAGES = 2, int WARPS = 4, int MINB = 6, bool DIRECT = false, bool FUSED_X = false, int SPLITS = 1, int LOOP_UNROLL = 1, bool SINGLE_N = false>
