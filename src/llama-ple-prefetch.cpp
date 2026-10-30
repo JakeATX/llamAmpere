@@ -619,9 +619,15 @@ int64_t llama_ple_prefetch::reader() {
         {
             char sink = 0;
             for (uint64_t o = 0; o < len; o += 4096) {
+                if (bounded_window && stopping.load(std::memory_order_relaxed)) {
+                    break;
+                }
                 sink ^= *(const volatile char *) (uintptr_t) (off + o);
             }
             GGML_UNUSED(sink);
+            if (bounded_window && stopping.load(std::memory_order_relaxed)) {
+                break;
+            }
         }
         pages_read += run_len[i];
         done_chunk = run_chunk[i];
