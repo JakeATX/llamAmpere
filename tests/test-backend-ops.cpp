@@ -8469,13 +8469,33 @@ struct test_mul_mat_id : public test_case {
 struct test_mul_mat_id_ai4 : public test_mul_mat_id {
     const bool dup;
     const bool initialize_all;
+    // skip = 1: about a third of the (slot, token) ids are -1 and some are n_mats (outside the stack), as an expert bank
+    // marks the slots another bank serves; those dst columns must come back as zeros
+    const int skip;
 
     test_mul_mat_id_ai4(ggml_type type_a, int n_mats, int n_used, bool b, int64_t m, int64_t n, int64_t k,
-                       bool dup = false, bool initialize_all = false)
-        : test_mul_mat_id(type_a, GGML_TYPE_F32, n_mats, n_used, b, m, n, k), dup(dup), initialize_all(initialize_all) {}
+                       bool dup = false, bool initialize_all = false, int skip = 0)
+        : test_mul_mat_id(type_a, GGML_TYPE_F32, n_mats, n_used, b, m, n, k), dup(dup), initialize_all(initialize_all),
+          skip(skip) {}
 
     std::string vars() override {
-        return test_mul_mat_id::vars() + (dup ? ",dup=1" : "") + (initialize_all ? ",all_experts=1" : "");
+        return test_mul_mat_id::vars() + (dup ? ",dup=1" : "") + (initialize_all ? ",all_experts=1" : "") +
+               (skip ? ",skip=" + std::to_string(skip) : "");
+    }
+
+    void apply_skip(std::vector<int32_t> & v, int64_t ne0, int64_t ne1) const {
+        if (!skip) {
+            return;
+        }
+        for (int64_t r = 0; r < ne1; ++r) {
+            for (int64_t i = 0; i < ne0; ++i) {
+                if ((r*7 + i) % 3 == 0) {
+                    v[r*ne0 + i] = -1;
+                } else if ((r + 3*i) % 11 == 0) {
+                    v[r*ne0 + i] = n_mats;
+                }
+            }
+        }
     }
 
     void initialize_tensors(ggml_context * ctx) override {
@@ -8494,9 +8514,16 @@ struct test_mul_mat_id_ai4 : public test_mul_mat_id {
                     }
                     ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
                 }
+                if (skip) {
+                    apply_skip(v, t->ne[0], t->ne[1]);
+                    ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+                }
                 for (int64_t r = 0; r < t->ne[1]; ++r) {
                     for (int64_t i = 0; i < n_used; ++i) {
-                        used[v[r * t->ne[0] + i]] = true;
+                        const int32_t e = v[r * t->ne[0] + i];
+                        if (e >= 0 && e < n_mats) {
+                            used[e] = true;
+                        }
                     }
                 }
             }
@@ -8514,6 +8541,16 @@ struct test_mul_mat_id_ai4 : public test_mul_mat_id {
     // Performance callers initialize every expert before drawing new routing ids.
     void reinit_perf_iter(ggml_context * ctx) override {
         init_mul_mat_id_ids(ctx, n_mats);
+        if (skip) {
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                if (t->type == GGML_TYPE_I32 && !ggml_is_view_op(t->op)) {
+                    std::vector<int32_t> v(ggml_nelements(t));
+                    ggml_backend_tensor_get(t, v.data(), 0, ggml_nbytes(t));
+                    apply_skip(v, t->ne[0], t->ne[1]);
+                    ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+                }
+            }
+        }
     }
 };
 
@@ -14974,6 +15011,62 @@ static void add_ai23_cases(std::vector<std::unique_ptr<test_case>> & cases) {
     }
 }
 
+// AI+ expert bank (Flash-Next hot bank) MUL_MAT_ID: every AI+ unit type at the expert shapes (gate/up 640 x 2560 with a
+// broadcast src1, down 2560 x 640 H128), a 221-expert stack, top 10, decode / MTP-verify widths 1-8 and prompt widths,
+// with and without skipped (-1 / out-of-stack) ids. The prompt widths run the GEMM-ID kernels (BN64 / BN128).
+static void add_ai_bank_cases(std::vector<std::unique_ptr<test_case>> & cases) {
+    // fork: full expert coverage at prompt tile boundaries, with skipped-pair reductions.
+    for (ggml_type t : { GGML_TYPE_AIT2_U, GGML_TYPE_AIT3_U }) {
+        for (int experts : { 3, 33, 221 }) {
+            for (int n : { 65, 129 }) {
+                cases.emplace_back(new test_mul_mat_id_ai4(t, experts, experts, true, 16, n, 256));
+                cases.emplace_back(new test_mul_mat_id_ai4(t, experts, experts, true, 16, n, 256, false, false, 1));
+            }
+        }
+    }
+    // fork: smaller helper capacity and fallback, with row and token tails.
+    for (ggml_type t : { GGML_TYPE_AIT2_U, GGML_TYPE_AIT3_U }) {
+        for (int experts : { 1023, 1024, 1025 }) {
+            cases.emplace_back(new test_mul_mat_id_ai4(t, experts, experts, true, 16, 9, 128, false, false, 1));
+            cases.emplace_back(new test_mul_mat_id_ai4(t, experts, 3, true, 48, 33, 256, false, false, 1));
+            cases.emplace_back(new test_mul_mat_id_ai4(t, experts, 3, false, 48, 33, 384, true, false, 1));
+        }
+    }
+    // fork: repeated routing ids cross warp and helper-block tails, including skipped lanes.
+    for (ggml_type t : { GGML_TYPE_AIT2_U, GGML_TYPE_AIT3_U }) {
+        for (int n : { 31, 32, 33, 1023, 1024, 1025 }) {
+            cases.emplace_back(new test_mul_mat_id_ai4(t, 4, 3, false, 80, n, 384, true, false, 1));
+            cases.emplace_back(new test_mul_mat_id_ai4(t, 4, 3, true, 64, n, 256, true));
+        }
+    }
+    // fork: one expert puts each routed GEMM tile boundary in the actual pair list, with H128/H256 and partial row tiles.
+    for (ggml_type t : { GGML_TYPE_AIT2_U, GGML_TYPE_AIT3_U }) {
+        for (int m : { 48, 64, 80 }) {
+            cases.emplace_back(new test_mul_mat_id_ai4(t, 1, 1, true, m, 33, 256));
+            cases.emplace_back(new test_mul_mat_id_ai4(t, 1, 1, false, m, 33, 384));
+            cases.emplace_back(new test_mul_mat_id_ai4(t, 1, 1, false, m, 33, 384, false, false, 1));
+        }
+        for (int n : { 31, 32, 33, 63, 64, 65, 127, 128, 129 }) {
+            cases.emplace_back(new test_mul_mat_id_ai4(t, 1, 1, true, 144, n, 256));
+            cases.emplace_back(new test_mul_mat_id_ai4(t, 1, 1, false, 144, n, 384));
+            cases.emplace_back(new test_mul_mat_id_ai4(t, 1, 1, false, 144, n, 384, false, false, 1));
+        }
+    }
+    for (ggml_type t : { GGML_TYPE_AIT2_U, GGML_TYPE_AIT3_U, GGML_TYPE_AIT4_U, GGML_TYPE_AIT5_U }) {
+        for (int skip : { 0, 1 }) {
+            for (int n : { 1, 2, 3, 4, 5, 6, 8, 9, 16, 64, 512, 1500 }) {
+                cases.emplace_back(new test_mul_mat_id_ai4(t, 221, 10, true,  640,  n, 2560, false, false, skip));
+                cases.emplace_back(new test_mul_mat_id_ai4(t, 221, 10, false, 2560, n, 640,  false, false, skip));
+            }
+        }
+        // every id skipped in some tokens, small stacks
+        for (int n : { 1, 7, 9, 33, 130 }) {
+            cases.emplace_back(new test_mul_mat_id_ai4(t, 4, 3, false, 32, n, 256, false, false, 1));
+            cases.emplace_back(new test_mul_mat_id_ai4(t, 4, 3, true, 48, n, 384, false, false, 1));
+        }
+    }
+}
+
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
 // [PFGAP-U3] Flash-Next dense prompt matmul shapes {output, input} at 1024 / 12288 tokens
 static void add_fn_dense_cases(std::vector<std::unique_ptr<test_case>> & test_cases) {
@@ -15049,6 +15142,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     add_ai23_cases(test_cases);
+    add_ai_bank_cases(test_cases);
     // Public AI+ layouts: decode, GEMM, H128 tails, and routed expert reads.
     for (ggml_type type : {GGML_TYPE_AIT5_U, GGML_TYPE_AIT2_U, GGML_TYPE_AIT3_U, GGML_TYPE_AIT4_U}) {
         for (int64_t n : {1, 9, 512}) {
@@ -18832,6 +18926,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             }
             return test_cases;
         }
+        // GGML_TEST_AIV2_PERF=bank: the Flash-Next expert bank at decode and prompt widths. AI+ AIT2_U / AIT3_U on a
+        // 221-expert stack (the bank's per-layer size) and on 512 experts, top 10, against the 3XS expert types on 512
+        // experts (IQ3_XXS gate/up, Q2_0 down: K 640 does not take 256-blocks). Same routed pairs per call.
+        if (std::string(getenv("GGML_TEST_AIV2_PERF")) == "bank") {
+            for (auto mk : std::vector<std::pair<int64_t, int64_t>>{ { 640, 2560 }, { 2560, 640 } }) {
+                const bool broadcast = mk.second == 2560;
+                for (int64_t n : { 1, 2, 3, 4, 5, 6, 512, 2048, 12288 }) {
+                    for (ggml_type t : { GGML_TYPE_AIT2_U, GGML_TYPE_AIT3_U }) {
+                        for (int ne : { 221, 512 }) {
+                            test_cases.emplace_back(new test_mul_mat_id_ai4(t, ne, 10, broadcast, mk.first, n, mk.second, false, true));
+                        }
+                    }
+                    for (ggml_type t : { GGML_TYPE_IQ3_XXS, GGML_TYPE_Q2_0 }) {
+                        if (mk.second % ggml_blck_size(t) != 0) { continue; }
+                        test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 512, 10, broadcast, mk.first, n, mk.second));
+                    }
+                }
+            }
+            return test_cases;
+        }
         // GGML_TEST_AIV2_PERF=pp: prompt widths 512 / 1024 (the AIT batch kernel vs the IQ/AI+/EXL3 batch paths)
         if (std::string(getenv("GGML_TEST_AIV2_PERF")) == "pp") {
             for (auto mk : std::vector<std::pair<int64_t, int64_t>>{ { 17408, 5120 }, { 5120, 17408 } }) {
@@ -20260,6 +20374,13 @@ static int run_ait_check(const char * dir) {
 }
 
 int main(int argc, char ** argv) {
+    // the expert-bank MUL_MAT_ID cases pass skipped (-1 / out-of-stack) ids without loading a bank model; the CUDA
+    // backend zeroes their outputs only when told to (or when a hot-bank model is loaded)
+#ifdef _WIN32
+    if (!getenv("GGML_CUDA_AI_ID_SKIP_ZERO")) { _putenv_s("GGML_CUDA_AI_ID_SKIP_ZERO", "1"); }
+#else
+    setenv("GGML_CUDA_AI_ID_SKIP_ZERO", "1", 0);
+#endif
     if (const char * ad = getenv("GGML_TEST_AIT_DIR")) {
         return run_ait_check(ad);
     }

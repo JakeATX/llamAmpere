@@ -36,24 +36,31 @@ static size_t b1_borrow_deficit(size_t required, size_t keep, size_t free_mem) {
     return scratch_shortfall > SIZE_MAX - keep_shortfall ? SIZE_MAX : scratch_shortfall + keep_shortfall;
 }
 
-static bool b1_read_file(int fd, void * dst, size_t offs, size_t len) {
+static bool b1_read_file(int fd, void * dst, size_t offs, size_t len, size_t alignment = 1, void * scratch = nullptr) {
 #ifndef _WIN32
-    char * p = (char *) dst;
-    while (len > 0) {
-        const ssize_t n = pread(fd, p, len, (off_t) offs);
+    char * p = (char *) (scratch ? scratch : dst);
+    const size_t skip = offs % alignment;
+    const size_t needed = skip + len;
+    const size_t read_size = b1_align_up(needed, alignment);
+    offs -= skip;
+    size_t got = 0;
+    while (got < read_size) {
+        const ssize_t n = pread(fd, p + got, read_size - got, (off_t) (offs + got));
         if (n < 0 && errno == EINTR) {
             continue;
         }
         if (n <= 0) {
-            return false;
+            break;
         }
-        p    += n;
-        offs += (size_t) n;
-        len  -= (size_t) n;
+        got += (size_t) n;
+        // A final direct read may include padding beyond EOF.
+        if (got >= needed) { break; }
     }
+    if (got < needed) { return false; }
+    if (p + skip != dst) { memmove(dst, p + skip, len); }
     return true;
 #else
-    GGML_UNUSED_VARS(fd, dst, offs, len);
+    GGML_UNUSED_VARS(fd, dst, offs, len, alignment, scratch);
     return false;
 #endif
 }
@@ -186,6 +193,7 @@ llama_b1::llama_b1(const llama_model & model, ggml_backend_t backend_gpu) : mode
         L.resident = !L.tensors.empty();
         for (int ti : L.tensors) {
             L.resident = L.resident && exps[ti].resident;
+            L.res_bytes += exps[ti].resident ? exps[ti].alloc : 0;
         }
         n_res += L.resident;
     }
@@ -222,22 +230,27 @@ llama_b1::llama_b1(const llama_model & model, ggml_backend_t backend_gpu) : mode
         for (const auto & e : exps) {
             largest_role = std::max(largest_role, e.t->nb[1] * e.t->ne[1]);
         }
-        piece_bytes = std::min(piece_bytes, largest_role);
+        bank_stage   = b1_env_int("LLAMA_B1_BANK_STAGE", 0) != 0;
+        if (!bank_stage) {
+            piece_bytes = std::min(piece_bytes, largest_role);
+        }
         direct       = b1_env_int("LLAMA_B1_DIRECT", 0) != 0;
         direct_piece = (size_t) std::clamp<int64_t>(b1_env_int("LLAMA_B1_DIRECT_PIECE_MIB", 64), 1, 1024) << 20;
     }
 
+    size_t staging_alignment = 1;
+    for (const auto & e : exps) { staging_alignment = std::max(staging_alignment, e.src.alignment); }
     stg.resize(n_workers);
     for (auto & w : stg) {
         w.resize(2);
         for (auto & s : w) {
-            s.buf = ggml_backend_buft_alloc_buffer(buft_host, piece_bytes);
+            s.buf = ggml_backend_buft_alloc_buffer(buft_host, piece_bytes + 3 * staging_alignment);
             s.ev  = ggml_backend_event_new(dev);
             if (s.buf == nullptr || s.ev == nullptr) {
                 LLAMA_LOG_WARN("%s: [B1] cannot allocate the pinned staging buffers, B1 is off\n", __func__);
                 return;
             }
-            s.data = (char *) ggml_backend_buffer_get_base(s.buf);
+            s.data = (char *) b1_align_up((uintptr_t) ggml_backend_buffer_get_base(s.buf), staging_alignment);
         }
     }
 
@@ -303,6 +316,60 @@ llama_b1::~llama_b1() {
     if (backend_copy) {
         ggml_backend_free(backend_copy);
     }
+}
+
+std::vector<ggml_backend_buffer_ptr> llama_b1::spare_views(size_t min_bytes, size_t max_views) const {
+    struct span { ggml_backend_buffer_t buf; size_t offs; size_t size; };
+    std::vector<span> spans;
+    const size_t n_lent = regions.size() - (fresh_buf ? 1 : 0);
+    const size_t n_roles = roles.size();
+    const size_t align = buft_dev ? ggml_backend_buft_get_alignment(buft_dev) : 0;
+    if (!align || slot_place.size() != 2*n_roles || carry_place.size() != g_ub) {
+        return {};
+    }
+    for (size_t r = 0; r < n_lent; ++r) {
+        const region & rg = regions[r];
+        std::vector<std::pair<size_t, size_t>> used; // [begin, end) within the region
+        for (size_t i = 0; i < slot_place.size(); ++i) {
+            if (slot_place[i].region == (int) r) {
+                used.push_back({ slot_place[i].offs, slot_place[i].offs + role_max[i % n_roles] });
+            }
+        }
+        for (size_t j = 0; j < carry_place.size(); ++j) {
+            if (carry_place[j].region != (int) r) {
+                continue;
+            }
+            uint32_t tokens = 0;
+            for (size_t u = j; u < ub_n.size(); u += g_ub) {
+                tokens = std::max(tokens, ub_n[u]);
+            }
+            used.push_back({ carry_place[j].offs, carry_place[j].offs + (size_t) tokens * n_embd * n_hc * sizeof(float) });
+        }
+        std::sort(used.begin(), used.end());
+        used.push_back({ rg.size, rg.size });
+        const size_t base = rg.base - (char *) ggml_backend_buffer_get_base(rg.buf);
+        size_t at = 0;
+        for (const auto & u : used) {
+            const size_t begin = (base + at + align - 1) / align * align;
+            const size_t end   = (base + std::min(u.first, rg.size)) / align * align;
+            if (end > begin && end - begin >= min_bytes) {
+                spans.push_back({ rg.buf, begin, end - begin });
+            }
+            at = std::max(at, u.second);
+        }
+    }
+    std::sort(spans.begin(), spans.end(), [](const span & a, const span & b) { return a.size > b.size; });
+    if (spans.size() > max_views) {
+        spans.resize(max_views);
+    }
+    std::vector<ggml_backend_buffer_ptr> out;
+    for (const auto & sp : spans) {
+        ggml_backend_buffer_ptr v(ggml_backend_buffer_view(sp.buf, sp.offs, sp.size));
+        if (v) {
+            out.push_back(std::move(v));
+        }
+    }
+    return out;
 }
 
 void llama_b1::release_plan() {
@@ -420,7 +487,7 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
     const size_t keep_default = ffn_requested ? phase_scratch >> 20 : 1536;
     const size_t keep = std::max(phase_scratch, (size_t) std::max<int64_t>(0,
             b1_env_int("LLAMA_B1_KEEP_FREE_MIB", keep_default)) << 20);
-    const size_t fresh_avail = free_mem > keep ? free_mem - keep : 0;
+    const size_t fresh_avail = free_mem > keep + extra_keep ? free_mem - keep - extra_keep : 0;
 
     // page-cache budget: every pass reads the streamed experts in the same fixed order, the experts kept in RAM from
     // the mmap and the lent layers from the file. When that loop is larger than the RAM free for the page cache,
@@ -448,17 +515,25 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
         }
     }
 
-    // lendable resident layers, highest first; a layer still holding borrowed data is always lent
+    // lendable layers, highest first; a layer still holding borrowed data is always lent. A layer lends its
+    // VRAM-resident exps tensors only (a mixed layer, such as RAM experts plus an always-on VRAM bank, lends the bank);
+    // its RAM tensors stream from RAM as before.
+    // Mixed layers lend only with an expert bank loaded or LLAMA_B1_LEND_MIXED=1; otherwise only fully resident
+    // layers lend, as before.
+    const bool lend_mixed = ggml_moe_bank_any() || b1_env_int("LLAMA_B1_LEND_MIXED", 0) != 0;
     std::vector<int> forced;
     std::vector<int> order;
     for (int il = n_layer - 1; il >= 0; --il) {
         const auto & L = layers[il];
-        if (!L.resident) {
+        if (L.res_bytes == 0 || (!L.resident && !lend_mixed)) {
             continue;
         }
         bool any_dirty = false;
         bool lendable  = true;
         for (int ti : L.tensors) {
+            if (!exps[ti].resident) {
+                continue;
+            }
             any_dirty = any_dirty || dirty_flag[ti];
             lendable  = lendable && exps[ti].src.fd >= 0;
         }
@@ -511,11 +586,11 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
             std::vector<int> lent = forced;
             size_t lent_bytes = 0;
             for (int il : forced) {
-                lent_bytes += layers[il].bytes;
+                lent_bytes += layers[il].res_bytes;
             }
             bool over_cap = false;
             for (size_t i = 0; i < k; ++i) {
-                lent_bytes += layers[order[i]].bytes;
+                lent_bytes += layers[order[i]].res_bytes;
                 over_cap = over_cap || lent_bytes > lend_cap;
                 lent.push_back(order[i]);
             }
@@ -528,6 +603,9 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
             for (int il : lent) {
                 for (int ti : layers[il].tensors) {
                     const auto & e = exps[ti];
+                    if (!e.resident) {
+                        continue;
+                    }
                     const size_t balign = ggml_backend_buft_get_alignment(ggml_backend_buffer_get_type(e.home_buf));
                     spans.push_back({ (char *) e.home_data, { e.home_buf, b1_align_up(e.alloc, balign) } });
                 }
@@ -611,14 +689,15 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
     for (int il : lent_sel) {
         for (int ti : layers[il].tensors) {
             auto & e = exps[ti];
-            if (verified[ti] || dirty_flag[ti]) {
+            if (!e.resident || verified[ti] || dirty_flag[ti]) {
                 continue;
             }
             const size_t n = std::min<size_t>(e.nbytes, 1u << 16);
             std::vector<uint8_t> a(n);
             std::vector<uint8_t> b(n);
             ggml_backend_tensor_get(e.t, a.data(), e.nbytes - n, n);
-            if (!b1_read_file(e.src.fd, b.data(), e.src.offs + e.nbytes - n, n) || memcmp(a.data(), b.data(), n) != 0) {
+            if (stg[0][0].used) { ggml_backend_event_synchronize(stg[0][0].ev); }
+            if (!b1_read_file(e.src.fd, b.data(), e.src.offs + e.nbytes - n, n, e.src.alignment, stg[0][0].data) || memcmp(a.data(), b.data(), n) != 0) {
                 LLAMA_LOG_WARN("%s: [B1] %s: VRAM bytes differ from the file, it cannot be lent; using the normal prefill\n",
                         __func__, ggml_get_name(e.t));
                 return false;
@@ -749,6 +828,9 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
     for (int il : lent_sel) {
         lent_layer[il] = true;
         for (int ti : layers[il].tensors) {
+            if (!exps[ti].resident) {
+                continue;
+            }
             if (!dirty_flag[ti]) {
                 dirty_flag[ti] = true;
                 dirty_tensors.push_back(ti);
@@ -934,17 +1016,26 @@ bool llama_b1::tensor_streamed(int il, const exps_tensor & e) const {
 
 void llama_b1::push_tensor_pieces(std::vector<piece> & ps, const exps_tensor & e, region * dst, size_t dst_offs, bool from_file) const {
     const size_t expert_bytes = e.t->nb[1] * e.t->ne[1];
+    size_t n_holes = 0;
+    (void) ggml_moe_bank_holes(&n_holes);
+    // Bulk hole uploads already split cold spans from zero-filled bank bytes in resident_copy.
+    // Let them span experts to avoid one worker/registry/stream-lock round trip per expert.
+    // Permanent GPU spans still need expert boundaries for resident_lookup; strided sources do too.
+    const bool bulk_holes = n_holes > 0 && (bank_stage || b1_env_int("GGML_MOE_BANK_HOLES_BULK", 0) == 1);
+    const bool permanent = !from_file && (ggml_moe_cache_has_residents() || (n_holes > 0 && !bulk_holes) ||
+            b1_env_int("LLAMA_PP_KEEP_EXPERTS", 0) != 0);
     for (size_t off = 0; off < e.nbytes;) {
         piece p;
         const bool strided = !from_file && e.home_nb2 != expert_bytes;
-        const bool permanent = !from_file && (ggml_moe_cache_has_residents() || b1_env_int("LLAMA_PP_KEEP_EXPERTS", 0) != 0);
+        // per-expert pieces: a resident or dropped bank expert is then one whole piece for the device-side copy
         const size_t source_off = strided ? (off / expert_bytes) * e.home_nb2 + off % expert_bytes : off;
         p.src_host = from_file ? nullptr : (const char *) e.home_data + source_off;
         p.fd       = e.src.fd;
+        p.alignment = e.src.alignment;
         p.src_offs = e.src.offs + off;
         p.dst      = dst;
         p.dst_offs = dst_offs + off;
-        p.len      = std::min(direct && !from_file ? direct_piece : piece_bytes, e.nbytes - off);
+        p.len      = std::min(direct && !from_file && !bulk_holes ? direct_piece : piece_bytes, e.nbytes - off);
         if (strided || permanent) { p.len = std::min(p.len, expert_bytes - off % expert_bytes); }
         ps.push_back(p);
         off += p.len;
@@ -989,7 +1080,7 @@ void llama_b1::coordinator() {
                 continue;
             }
             const placement & p = slot_place[slot*n_roles + e.role];
-            push_tensor_pieces(ps, e, &regions[p.region], p.offs, lent_layer[il]);
+            push_tensor_pieces(ps, e, &regions[p.region], p.offs, lent_layer[il] && e.resident);
         }
         const size_t pass = k / (steps.size() / grp_first.size());
         for (const auto & piece : ps) {
@@ -1028,6 +1119,33 @@ void llama_b1::coordinator() {
     }
 }
 
+static const ggml_moe_bank_hole * b1_first_hole(uintptr_t begin, const ggml_moe_bank_hole ** end) {
+    size_t n = 0;
+    const ggml_moe_bank_hole * holes = ggml_moe_bank_holes(&n);
+    *end = holes ? holes + n : nullptr;
+    return holes ? std::lower_bound(holes, holes + n, begin,
+            [](const ggml_moe_bank_hole & h, uintptr_t v) { return h.end <= v; }) : nullptr;
+}
+
+static bool b1_touches_holes(const char * src, size_t len) {
+    const ggml_moe_bank_hole * end = nullptr;
+    const ggml_moe_bank_hole * it = b1_first_hole((uintptr_t) src, &end);
+    return it && it != end && it->begin < (uintptr_t) src + len;
+}
+
+static void b1_gather_holes(char * dst, const char * src, size_t len) {
+    const uintptr_t begin = (uintptr_t) src, last = begin + len;
+    const ggml_moe_bank_hole * end = nullptr;
+    uintptr_t cursor = begin;
+    for (const ggml_moe_bank_hole * it = b1_first_hole(begin, &end); it && it != end && it->begin < last; ++it) {
+        const uintptr_t first = std::max(begin, it->begin), stop = std::min(last, it->end);
+        if (cursor < first) { memcpy(dst + (cursor - begin), (const void *) cursor, first - cursor); }
+        memset(dst + (first - begin), 0, stop - first);
+        cursor = stop;
+    }
+    if (cursor < last) { memcpy(dst + (cursor - begin), (const void *) cursor, last - cursor); }
+}
+
 void llama_b1::worker(int w) {
     int b = 0;
     while (true) {
@@ -1039,6 +1157,26 @@ void llama_b1::worker(int w) {
                 return;
             }
             p = queue[queue_head++];
+        }
+
+        if (p.src_host && bank_stage && p.len <= piece_bytes && b1_touches_holes(p.src_host, p.len)) {
+            auto & s = stg[w][b];
+            b ^= 1;
+            if (s.used) {
+                ggml_backend_event_synchronize(s.ev);
+            }
+            // read only the kept bytes (dropped ranges were released) and zero the rest, outside the stream lock
+            b1_gather_holes(s.data, p.src_host, p.len);
+            {
+                std::lock_guard<std::mutex> ls(mtx_stream);
+                ggml_backend_tensor_set_async(backend_copy, p.dst->raw, s.data, p.dst_offs, p.len);
+                ggml_backend_event_record(s.ev, backend_copy);
+                s.used = true;
+            }
+            std::lock_guard<std::mutex> lk(mtx);
+            st.bytes_h2d += p.len;
+            if (--pieces_left == 0) { cv.notify_all(); }
+            continue;
         }
 
         if (p.src_host) {
@@ -1075,7 +1213,7 @@ void llama_b1::worker(int w) {
             ggml_moe_cache_host_restore(p.src_host, p.len);
             memcpy(s.data, p.src_host, p.len);
         } else {
-            ok = p.fd >= 0 && b1_read_file(p.fd, s.data, p.src_offs, p.len);
+            ok = p.fd >= 0 && b1_read_file(p.fd, s.data, p.src_offs, p.len, p.alignment);
         }
 
         if (ok) {
@@ -1324,6 +1462,8 @@ bool llama_b1::ffn_gather() {
     std::vector<float> weights(ids.size());
     ggml_backend_tensor_get(ffn_all->ids, ids.data(), 0, ids.size() * sizeof(int32_t));
     ggml_backend_tensor_get(ffn_all->weights, weights.data(), 0, weights.size() * sizeof(float));
+    const bool hot_bank = std::any_of(model.layers.begin(), model.layers.end(),
+            [](const llama_layer & layer) { return layer.ffn_exps_hot_map != nullptr; });
     ffn_all->expert_rows.assign(experts, {});
     ffn_all->expert_weights.assign(experts, {});
     for (uint32_t t = 0; t < tokens; ++t) {
@@ -1338,6 +1478,10 @@ bool llama_b1::ffn_gather() {
                 if (ids[(size_t) t * used + j] == e) {
                     return false;
                 }
+            }
+            // a hot-bank expert in the cold bank is routed with weight exactly 0 and adds nothing: skip its GEMM row
+            if (hot_bank && weights[i] == 0.0f) {
+                continue;
             }
             ffn_all->expert_rows[e].push_back((int32_t) t);
             ffn_all->expert_weights[e].push_back(weights[i]);

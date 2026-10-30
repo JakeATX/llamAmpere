@@ -1251,6 +1251,9 @@ const ggml_cuda_device_info & ggml_cuda_info();
 
 void ggml_cuda_set_device(int device);
 int ggml_cuda_get_device();
+bool ggml_cuda_host_pin_contains(const void * ptr, size_t size);
+cudaError_t ggml_cuda_host_register(void * ptr, size_t size, unsigned int flags);
+void ggml_cuda_host_unregister(void * ptr);
 
 // raw device allocation, honors GGML_CUDA_ENABLE_UNIFIED_MEMORY. free with cudaFree
 cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device);

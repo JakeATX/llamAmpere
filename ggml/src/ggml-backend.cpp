@@ -142,13 +142,26 @@ void ggml_moe_cache_host_restore(const void * data, size_t size) {
     }
 }
 
+static std::vector<ggml_moe_bank_hole> g_moe_bank_holes;
+
+void ggml_moe_bank_holes_set(const ggml_moe_bank_hole * holes, size_t n) {
+    g_moe_bank_holes.assign(holes, holes + n);
+    std::sort(g_moe_bank_holes.begin(), g_moe_bank_holes.end(),
+            [](const ggml_moe_bank_hole & a, const ggml_moe_bank_hole & b) { return a.begin < b.begin; });
+}
+
+const ggml_moe_bank_hole * ggml_moe_bank_holes(size_t * n) {
+    *n = g_moe_bank_holes.size();
+    return g_moe_bank_holes.empty() ? nullptr : g_moe_bank_holes.data();
+}
+
 bool ggml_moe_cache_resident_copy(ggml_backend_t backend, struct ggml_tensor * dst, size_t offset, const void * host, size_t size) {
     // fork: prompt loans retain runtime slots without a permanent resident allocation.
     static const bool keep_prompt = [] {
         const char * e = getenv("LLAMA_PP_KEEP_EXPERTS");
         return e && strcmp(e, "1") == 0;
     }();
-    if (!keep_prompt && !ggml_moe_cache_has_residents()) { return false; }
+    if (!keep_prompt && !ggml_moe_cache_has_residents() && g_moe_bank_holes.empty()) { return false; }
     std::lock_guard<std::mutex> lock(g_moe_cache_registry_mu);
     for (const auto & api : g_moe_cache_providers) {
         if (api.resident_copy && api.resident_copy(backend, dst, offset, host, size)) { return true; }

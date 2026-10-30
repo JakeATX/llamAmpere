@@ -357,6 +357,12 @@ struct llama_layer {
     struct ggml_tensor * ffn_down_exps     = nullptr;
     struct ggml_tensor * ffn_up_exps       = nullptr;
     struct ggml_tensor * ffn_gate_up_exps  = nullptr;
+    // hot experts kept in their own always-resident bank (qwen4exp; optional)
+    struct ggml_tensor * ffn_gate_exps_hot = nullptr;
+    struct ggml_tensor * ffn_up_exps_hot   = nullptr;
+    struct ggml_tensor * ffn_down_exps_hot = nullptr;
+    struct ggml_tensor * ffn_exps_hot_map  = nullptr;
+    struct ggml_tensor * ffn_exps_cold_map = nullptr;
     struct ggml_tensor * ffn_gate_inp_b    = nullptr;
     struct ggml_tensor * ffn_gate_exps_b   = nullptr;
     struct ggml_tensor * ffn_down_exps_b   = nullptr;
@@ -658,6 +664,7 @@ struct llama_prec_policy {
 struct llama_b1_file_src {
     int    fd   = -1;
     size_t offs = 0;
+    size_t alignment = 1;
 };
 
 struct llama_model {
@@ -800,6 +807,7 @@ struct llama_model {
     // so the layer-major prefill can borrow resident expert VRAM and copy the weights back from the file)
     std::unordered_map<std::string, llama_b1_file_src> b1_src;
     std::vector<int> b1_fds; // dup()ed file descriptors, closed by the destructor
+    std::vector<const void *> moe_bank_registered; // expert tensors registered with ggml_moe_bank_register
 
     // for keeping track of associated LoRA adapters
     std::unordered_set<llama_adapter_lora *> loras;
@@ -859,6 +867,8 @@ struct llama_model {
     ggml_cgraph * build_graph(const llm_graph_params & params) const;
 
     void pin_borrowed_host_tensor(ggml_tensor * tensor) const;
+    void register_moe_bank();
+    void drop_moe_bank_host_copies();
 
     virtual void load_stats  (llama_model_loader & ml) = 0;
     virtual void load_hparams(llama_model_loader & ml) = 0;

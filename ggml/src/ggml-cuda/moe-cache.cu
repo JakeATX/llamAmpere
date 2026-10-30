@@ -729,6 +729,10 @@ struct moe_cache_device_table {
     std::vector<const void *> copy_source;
     // fork CACHEHIT: 1 where the expert lives in permanent residency (never swapped).
     std::vector<uint8_t> permanent;
+    // 1 where the expert belongs to the always-resident bank: its entry points at a shared zero block
+    // (the regular call gives it weight 0) and it is marked permanent, so no miss, swap or CPU split touches it.
+    std::vector<uint8_t> bank;
+    int n_bank = 0; // fork AIPNEXTK BANKSKIP: bank entries in this table
     struct moe_cache_pool * swap_pool = nullptr;
     size_t count_offset = 0;
     // fork (missjoin): layer and projection (0 up, 1 gate, 2 down) parsed from the tensor name.
@@ -1855,6 +1859,40 @@ static int moe_resident_copy(void * opaque, ggml_tensor * dst, size_t offset, co
             }
         }
     }
+    // fork AIPNEXTK BANKDROP: a range that touches dropped bank-expert bytes is uploaded around them; the dropped
+    // parts are written as zeros on the device (those experts only ever run here with routing weight 0)
+    if (host && size && size <= UINTPTR_MAX - (uintptr_t) host && backend->iface.set_tensor_async) {
+        size_t n_holes = 0;
+        const ggml_moe_bank_hole * holes = ggml_moe_bank_holes(&n_holes);
+        const uintptr_t begin = (uintptr_t) host, end = begin + size;
+        const ggml_moe_bank_hole * it = holes ? std::lower_bound(holes, holes + n_holes, begin,
+                [](const ggml_moe_bank_hole & h, uintptr_t v) { return h.end <= v; }) : nullptr;
+        if (it && it != holes + n_holes && it->begin < end) {
+            auto * ctx = (ggml_backend_cuda_context *) backend->context;
+            ggml_cuda_set_device(ctx->device);
+            const char * bulk_env = getenv("GGML_MOE_BANK_HOLES_BULK");
+            const bool bulk = bulk_env && strcmp(bulk_env, "1") == 0;
+            // fork: overwrite cold spans on the same stream after one clear instead of clearing every hole.
+            if (bulk) {
+                CUDA_CHECK(cudaMemsetAsync((char *) dst->data + offset, 0, size, ctx->stream()));
+            }
+            uintptr_t cursor = begin;
+            for (; it != holes + n_holes && it->begin < end; ++it) {
+                const uintptr_t first = std::max(begin, it->begin), last = std::min(end, it->end);
+                if (cursor < first) {
+                    backend->iface.set_tensor_async(backend, dst, (const void *) cursor, offset + (cursor - begin), first - cursor);
+                }
+                if (!bulk && cudaMemsetAsync((char *) dst->data + offset + (first - begin), 0, last - first, ctx->stream()) != cudaSuccess) {
+                    GGML_ABORT("bank expert zero upload failed");
+                }
+                cursor = last;
+            }
+            if (cursor < end) {
+                backend->iface.set_tensor_async(backend, dst, (const void *) cursor, offset + (cursor - begin), end - cursor);
+            }
+            return 1;
+        }
+    }
     const char * upload = getenv("GGML_MOE_RESIDENT_UPLOAD");
     if (upload && strcmp(upload, "1") == 0) {
         const uintptr_t begin = (uintptr_t)host;
@@ -2750,6 +2788,39 @@ static bool moe_cache_allocate_pool(
 
 static bool moe_cache_resize_pool(moe_cache_device & device, moe_cache_pool & pool, int slots);
 
+// Always-resident expert bank (ggml_moe_bank_*): those experts are computed by the bank call, never by the cache.
+// fork AIPNEXTK BANKSKIP: the hit/miss passes write zero for bank experts' zero-weight routes instead of
+// computing them from the zero block. GGML_MOE_BANK_ZERO_SKIP=0 computes them as before.
+static bool moe_bank_skip_enabled() {
+    static const bool on = [] { const char * v = getenv("GGML_MOE_BANK_ZERO_SKIP"); return v == nullptr || atoi(v) != 0; }();
+    return on;
+}
+
+static bool moe_bank_has(const void * data, int32_t expert) {
+    const uint8_t * in_bank = ggml_moe_bank_lookup(data);
+    return in_bank && expert >= 0 && expert < 512 && in_bank[expert];
+}
+
+// One zero-filled device block per card, shared by every bank expert entry of the device tables. All-zero quant
+// bytes decode to zero weights, so the regular call's weight-0 bank slots read finite zeros instead of host memory.
+// A larger request allocates a new block; the old one stays allocated because earlier tables may still use it.
+static const void * moe_bank_zero_block(int device, size_t bytes) {
+    static std::mutex mutex;
+    static std::unordered_map<int, std::pair<void *, size_t>> blocks;
+    std::lock_guard<std::mutex> guard(mutex);
+    auto & block = blocks[device];
+    if (block.first && block.second >= bytes) { return block.first; }
+    void * pointer = nullptr;
+    if (cudaMalloc(&pointer, bytes) != cudaSuccess || cudaMemset(pointer, 0, bytes) != cudaSuccess ||
+            cudaDeviceSynchronize() != cudaSuccess) {
+        if (pointer) { (void) cudaFree(pointer); }
+        (void) cudaGetLastError();
+        return nullptr;
+    }
+    block = {pointer, bytes};
+    return pointer;
+}
+
 static bool moe_cache_build_global_profile(moe_cache_session & session, moe_cache_device & device,
         const std::vector<moe_cache_shape *> & pending, size_t budget, bool resize = false) {
     if (session.profile_global_tensors.empty() || (!resize && !device.pools.empty()) || pending.empty()) {
@@ -2816,7 +2887,9 @@ static bool moe_cache_build_global_profile(moe_cache_session & session, moe_cach
             else if (tensor.counts.size() != session.profile_global_tensors[previous_tensor].counts.size()) { return false; }
         }
         for (size_t expert = 0; expert < tensor.counts.size(); ++expert) {
-            items.push_back({i, (int32_t)expert, group, pool, tensor.expert_size, tensor.counts[expert]});
+            // a bank expert never needs a slot: count 0 so the plan gives its budget to the next regular expert
+            const uint64_t count = moe_bank_has(tensor.data, (int32_t)expert) ? 0 : tensor.counts[expert];
+            items.push_back({i, (int32_t)expert, group, pool, tensor.expert_size, count});
             keys.push_back({tensor.data, (int32_t)expert});
         }
         previous_tensor = i;
@@ -3158,6 +3231,30 @@ static int moe_cache_discover_pool(
     return moe_cache_find_pool(device, expert_size, wtype);
 }
 
+// Resident census: complete experts (every projection valid in a cache slot) plus bank experts, counted once each,
+// over the registered main-model layers.
+static void moe_cache_log_census(const moe_cache_device & device) {
+    auto resident = [](void * user, const void * data, int32_t expert) -> bool {
+        for (const auto & pool : ((const moe_cache_device *) user)->pools) {
+            const auto found = pool->map.find({data, expert});
+            if (found != pool->map.end() && pool->slots[found->second].state == moe_cache_slot_state::valid &&
+                    !pool->slots[found->second].staging) {
+                return true;
+            }
+        }
+        return false;
+    };
+    if (!ggml_moe_bank_any() && !getenv("GGML_MOE_CACHE_CENSUS")) {
+        return; // default runs keep the integ-r2 log; GGML_MOE_CACHE_CENSUS=1 prints it without a bank
+    }
+    int32_t first = 0, last = 0;
+    size_t cache = 0, bank = 0, both = 0;
+    if (ggml_moe_bank_census(resident, (void *) &device, &first, &last, &cache, &bank, &both)) {
+        MOE_CACHE_LOG("[moe-cache] CUDA%d resident complete experts layers %d-%d: cache %zu + bank %zu = %zu (cache copies of bank experts: %zu)\n",
+                device.physical, first, last, cache, bank, cache + bank, both);
+    }
+}
+
 static void moe_cache_log_stats(moe_cache_device & device) {
     size_t used = 0;
     size_t slots = 0;
@@ -3491,6 +3588,7 @@ static void moe_cache_session_destroy(void * opaque) {
             device_ptr->collect_failures > 0) {
             moe_cache_log_stats(*device_ptr);
         }
+        moe_cache_log_census(*device_ptr);
     }
 
     moe_cache_device_release(*session);
@@ -5462,7 +5560,7 @@ static void * moe_resident_create(void * device, const ggml_moe_cache_tensor_des
         moe_cache_layer_number(t.name, layer);
         if (layer == last_layer) { continue; }
         for (int64_t e = 0; e < t.n_expert; ++e) {
-            if (!counts[i][e]) { continue; }
+            if (!counts[i][e] || moe_bank_has(t.data, (int32_t)e)) { continue; }
             ranked.push_back({(const char *)t.data + (size_t)e * t.expert_size, bytes,
                     counts[i][e] / std::max(1.0L, total) * (1 + 4.0L / (1.0L + layer)) / bytes});
         }
@@ -6500,6 +6598,9 @@ static int moe_cache_warm(void * opaque, const ggml_moe_cache_tensor_desc * tens
         if (std::chrono::steady_clock::now() >= deadline) {
             break;
         }
+        if (moe_bank_has(tensors[c.tensor].data, c.expert)) {
+            continue; // computed by the always-resident bank
+        }
         std::unique_ptr<moe_cache_node, decltype(&moe_cache_end)> node(begin(c.tensor), moe_cache_end);
         if (!node) {
             continue;
@@ -6878,7 +6979,8 @@ static void moe_cache_prefetch(void * opaque, const ggml_moe_cache_tensor_desc *
                         moe_resident_lookup_device((const char *)desc.data + (size_t)ids[rank] * source_strides[t], desc.expert_size, device.logical) != nullptr;
                     if (permanent) { continue; }
                 }
-                if (ids[rank] < 0 || ids[rank] >= desc.n_expert || !desc.data || desc.expert_size > budget) {
+                if (ids[rank] < 0 || ids[rank] >= desc.n_expert || !desc.data || desc.expert_size > budget ||
+                        moe_bank_has(desc.data, ids[rank])) {
                     continue;
                 }
                 // Only known host tensors and already allocated pools are eligible. No speculative allocation.
@@ -7651,7 +7753,7 @@ static bool moe_cache_swap_groups(moe_cache_session & session, bool census = fal
             }
         }
     }
-    size_t partial = 0, complete = 0;
+    size_t partial = 0, complete = 0, bank_complete = 0;
     for (size_t layer = 0; layer < groups.size(); ++layer) {
         const auto & group = groups[layer];
         if (!group[0] && !group[1] && !group[2]) { continue; }
@@ -7673,6 +7775,7 @@ static bool moe_cache_swap_groups(moe_cache_session & session, bool census = fal
             }
             partial += resident > 0 && resident < 3;
             complete += resident == 3;
+            bank_complete += resident == 3 && group[0]->bank[e] && group[1]->bank[e] && group[2]->bank[e];
         }
         if (census) {
             MOE_CACHE_LOG("[moe-cache] final residency: layer=%zu complete=%zu partial=%zu resident_slice_bytes=%zu\n",
@@ -7681,6 +7784,10 @@ static bool moe_cache_swap_groups(moe_cache_session & session, bool census = fal
     }
     MOE_CACHE_LOG("[moe-cache] whole swap %s: complete=%zu partial=%zu layers=%zu\n",
             census ? "final" : "initial", complete, partial, groups.size());
+    if (bank_complete) {
+        MOE_CACHE_LOG("[moe-cache] whole swap %s resident complete experts: cache %zu + bank %zu = %zu\n",
+                census ? "final" : "initial", complete - bank_complete, bank_complete, complete);
+    }
     return !groups.empty() && partial == 0;
 }
 
@@ -8441,7 +8548,7 @@ static void moe_cache_device_release(moe_cache_session & session, bool retain_so
     }
     ggml_cuda_set_device(session.devices[0]->logical);
     // Tables can be in flight on a scheduler stream, not the legacy cache stream.
-    (void) cudaDeviceSynchronize();
+    CUDA_CHECK(cudaDeviceSynchronize());
     if (session.mj_retained_arena) {
         unsigned long long counts[7] = {};
         if (cudaMemcpy(counts, session.mj_retained_counts, sizeof(counts), cudaMemcpyDeviceToHost) == cudaSuccess) {
@@ -8489,7 +8596,7 @@ static void moe_cache_device_release(moe_cache_session & session, bool retain_so
     if (!retain_sources) {
         for (auto & range : session.mapped_ranges) {
             if (range.registered) {
-                (void) cudaHostUnregister((void *) range.begin);
+                ggml_cuda_host_unregister((void *) range.begin);
             }
             if (range.staging) {
                 (void) cudaFreeHost(range.staging);
@@ -11581,6 +11688,60 @@ private:
     std::vector<size_t> order, prefix;
 };
 
+#if defined(__linux__) && CUDART_VERSION >= 11010 && !defined(GGML_USE_HIP)
+// GGML_MOE_CACHE_STRICT_ALIAS=1 (opt-in; always on for expert-bank tensors): a device alias of host expert bytes needs
+// the whole range inside one tracked pinned registration plus mapped endpoints. Off (the integ-r2 behavior): whole
+// tensors borrow when their first byte is mapped host memory, and resident experts check both endpoints.
+static bool moe_cache_strict_alias() {
+    static const bool on = [] { const char * e = getenv("GGML_MOE_CACHE_STRICT_ALIAS"); return e && atoi(e) != 0; }();
+    return on;
+}
+
+static void * moe_cache_host_alias_legacy(const void * source, size_t bytes, bool whole_tensor) {
+    void * alias = nullptr;
+    if (whole_tensor) {
+        cudaPointerAttributes attributes{};
+        if (cudaPointerGetAttributes(&attributes, source) == cudaSuccess && attributes.type == cudaMemoryTypeHost &&
+                cudaHostGetDevicePointer(&alias, const_cast<void *>(source), 0) == cudaSuccess) {
+            return alias;
+        }
+        (void)cudaGetLastError();
+        return nullptr;
+    }
+    void * last = nullptr;
+    if (cudaHostGetDevicePointer(&alias, const_cast<void *>(source), 0) != cudaSuccess ||
+            cudaHostGetDevicePointer(&last, (void *)((uintptr_t)source + bytes - 1), 0) != cudaSuccess ||
+            (const char *)last != (const char *)alias + bytes - 1) {
+        (void)cudaGetLastError();
+        return nullptr;
+    }
+    return alias;
+}
+
+static void * moe_cache_host_alias(const void * source, size_t bytes) {
+    const uintptr_t begin = (uintptr_t)source;
+    if (!source || !bytes || bytes > UINTPTR_MAX - begin ||
+            !ggml_cuda_host_pin_contains(source, bytes)) {
+        return nullptr;
+    }
+    // Endpoint attributes alone cannot exclude an unregistered interior hole.
+    const void * last = (const void *)(begin + bytes - 1);
+    cudaPointerAttributes first_attributes{}, last_attributes{};
+    void * alias = nullptr;
+    void * last_alias = nullptr;
+    const bool mapped = cudaPointerGetAttributes(&first_attributes, source) == cudaSuccess &&
+            first_attributes.type == cudaMemoryTypeHost &&
+            cudaPointerGetAttributes(&last_attributes, last) == cudaSuccess &&
+            last_attributes.type == cudaMemoryTypeHost &&
+            cudaHostGetDevicePointer(&alias, const_cast<void *>(source), 0) == cudaSuccess &&
+            cudaHostGetDevicePointer(&last_alias, const_cast<void *>(last), 0) == cudaSuccess &&
+            alias && bytes - 1 <= UINTPTR_MAX - (uintptr_t)alias &&
+            (uintptr_t)last_alias == (uintptr_t)alias + bytes - 1;
+    (void)cudaGetLastError();
+    return mapped ? alias : nullptr;
+}
+#endif
+
 static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_desc * tensors, int n_tensors) {
 #if defined(__linux__) && CUDART_VERSION >= 11010 && !defined(GGML_USE_HIP)
     auto * session = (moe_cache_session *) opaque;
@@ -11691,6 +11852,20 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
         const bool mask_only = resident_mask && !route_stats;
         size_t table_bytes = route_stats ? 3 * sizeof(unsigned long long) : 0, hot_bytes = 0;
         size_t count_entries = 0, arena_bytes = 0;
+        size_t bank_zero_bytes = 0, bank_entries = 0;
+        for (int i = 0; i < n_tensors; ++i) {
+            const auto & d = tensors[i];
+            if (d.data && ggml_moe_bank_lookup(d.data) && d.n_in > 0 && d.n_out > 0) {
+                bank_zero_bytes = std::max(bank_zero_bytes, ggml_row_size((ggml_type)d.type, d.n_in) * (size_t)d.n_out);
+            }
+        }
+        ggml_cuda_set_device(device.logical);
+        const void * bank_zero = bank_zero_bytes ? moe_bank_zero_block(device.logical, bank_zero_bytes) : nullptr;
+        ggml_cuda_moe_set_bank_zero(moe_bank_skip_enabled() ? bank_zero : nullptr);
+        if (bank_zero_bytes && !bank_zero) {
+            MOE_CACHE_LOG("[moe-cache] device tables skipped: bank zero block allocation failed\n");
+            return fail();
+        }
         for (int i = 0; i < n_tensors; ++i) {
             const auto & d = tensors[i];
             // The legacy cache supports IQ1_M; the mapped pointer specialization
@@ -11718,16 +11893,16 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
             table.desc.expert_size = expert_bytes;
             table.host_stride = d.expert_size;
             table.permanent_sources = moe_resident_tensor(d.data, device.logical);
-            cudaPointerAttributes attributes{};
-            if (!table.permanent_sources && cudaPointerGetAttributes(&attributes, d.data) == cudaSuccess && attributes.type == cudaMemoryTypeHost) {
-                void * alias = nullptr;
-                if (cudaHostGetDevicePointer(&alias, const_cast<void *>(d.data), 0) == cudaSuccess) {
-                    table.borrowed = alias;
-                }
+            // A bank tensor can span pinned cold ranges and unregistered holes.
+            const bool bank_sources = ggml_moe_bank_lookup(d.data) != nullptr;
+            if (!table.permanent_sources) {
+                table.borrowed = bank_sources || moe_cache_strict_alias() ? moe_cache_host_alias(d.data, bytes) :
+                    moe_cache_host_alias_legacy(d.data, bytes, true);
             }
             (void)cudaGetLastError();
             table.addresses.resize(d.n_expert);
             table.permanent.assign(d.n_expert, 0);
+            table.bank.assign(d.n_expert, 0);
             table.fallback.resize(d.n_expert);
             table.copy_source.resize(d.n_expert);
             table.count_offset = count_entries;
@@ -11737,6 +11912,13 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
                         expert_bytes, device.logical);
                 const void * address = permanent;
                 if (permanent) { hot_bytes += expert_bytes; table.permanent[e] = 1; }
+                if (!permanent && bank_zero && moe_bank_has(d.data, e)) {
+                    address = bank_zero;
+                    table.permanent[e] = 1;
+                    table.bank[e] = 1;
+                    ++table.n_bank;
+                    ++bank_entries;
+                }
                 for (const auto & pool : device.pools) {
                     if (permanent) { break; }
                     if (pool->expert_size != expert_bytes || pool->wtype != d.type) {
@@ -11754,18 +11936,26 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
                 size_t source_range = 0;
                 if (table.permanent_sources) {
                     if (!permanent) {
-                        void * alias = nullptr;
-                        void * last = nullptr;
-                        if (cudaHostGetDevicePointer(&alias, (void *)begin, 0) != cudaSuccess ||
-                                cudaHostGetDevicePointer(&last, (void *)(begin + expert_bytes - 1), 0) != cudaSuccess ||
-                                (const char *)last != (const char *)alias + expert_bytes - 1) { return fail(); }
+                        void * alias = bank_sources || moe_cache_strict_alias() ?
+                            moe_cache_host_alias((const void *)begin, expert_bytes) :
+                            moe_cache_host_alias_legacy((const void *)begin, expert_bytes, false);
+                        if (!alias) { return fail(); }
                         table.fallback[e] = alias;
                     }
                 } else {
-                    table.fallback[e] = table.borrowed ? (const char *)table.borrowed + (size_t)e * table.host_stride :
-                        mappings.find(begin, expert_bytes, &source_range);
+                    // Bank release leaves the cold experts pinned in separate ranges.
+                    void * alias = nullptr;
+                    if (!table.borrowed && bank_sources && !table.bank[e] &&
+                            (alias = moe_cache_host_alias((const void *)begin, expert_bytes))) {
+                        table.fallback[e] = alias;
+                        table.copy_source[e] = (const void *)begin;
+                    } else {
+                        table.fallback[e] = table.borrowed ? (const char *)table.borrowed + (size_t)e * table.host_stride :
+                            mappings.find(begin, expert_bytes, &source_range);
+                    }
+                    (void)cudaGetLastError();
                 }
-                if (!table.permanent_sources && !table.borrowed && !address && table.fallback[e]) { retained_needed[source_range] = 1; }
+                if (!table.permanent_sources && !table.borrowed && !table.copy_source[e] && !address && table.fallback[e]) { retained_needed[source_range] = 1; }
                 if (!address && !table.fallback[e]) {
                     pending_ranges.push_back({begin & ~(page - 1),
                             (begin + expert_bytes + page - 1) & ~(page - 1), nullptr, nullptr, false});
@@ -11790,10 +11980,11 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
         // Old kernels and tables were drained by the idle rerank; no published
         // address can observe this pruning. Unchanged cold sets copy nothing.
         size_t kept = 0, pruned_bytes = 0;
+        if (retained_ranges) { CUDA_CHECK(cudaDeviceSynchronize()); }
         for (size_t i = 0; i < retained_ranges; ++i) {
             auto & range = session->mapped_ranges[i];
             if (!retained_needed[i]) {
-                if (range.registered) { (void)cudaHostUnregister((void *)range.begin); }
+                if (range.registered) { ggml_cuda_host_unregister((void *) range.begin); }
                 if (range.staging) { (void)cudaFreeHost(range.staging); }
                 pruned_bytes += range.end - range.begin;
                 continue;
@@ -11844,6 +12035,10 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
         const size_t margin = ranges.empty() ? 0 : 2ull << 30;
         const size_t floor = 7ull << 30;
         const size_t available = moe_cache_mem_available();
+        if (bank_entries) {
+            MOE_CACHE_LOG("[moe-cache] device tables: %zu bank expert entries point at a %zu KiB zero block (computed by the bank call)\n",
+                    bank_entries, bank_zero_bytes >> 10);
+        }
         MOE_CACHE_LOG("[moe-cache] device preflight: hot=%zu MiB map=%zu MiB nonresident=%zu MiB ranges=%zu available=%zu MiB\n",
                 hot_bytes >> 20, pin_bytes >> 20, new_bytes >> 20, ranges.size(), available >> 20);
         // The RAM floor guards new pinning only: with no ranges there is nothing to pin, so a host just under
@@ -11924,7 +12119,7 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
             }
             const auto registration_start = std::chrono::steady_clock::now();
             const cudaError_t err = contained
-                ? cudaHostRegister((void *)range.begin, bytes, registration_flags)
+                ? ggml_cuda_host_register((void *)range.begin, bytes, registration_flags)
                 : cudaErrorInvalidValue;
             registration_calls += contained;
             registration_ms += std::chrono::duration<double, std::milli>(
@@ -12038,12 +12233,13 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
             for (size_t e = 0; e < table.addresses.size(); ++e) {
                 const uintptr_t host = (uintptr_t)table.desc.data + e * table.host_stride;
                 size_t source_range = 0;
-                if (!table.permanent_sources) {
+                const bool borrowed_expert = table.copy_source[e] != nullptr;
+                if (!table.permanent_sources && !borrowed_expert) {
                     table.fallback[e] = table.borrowed ? (const char *)table.borrowed + e * table.host_stride :
                         mappings.find(host, table.desc.expert_size, &source_range);
                 }
-                table.copy_source[e] = table.borrowed || (table.permanent_sources && table.fallback[e]) ? (const void *)host : nullptr;
-                if (table.fallback[e] && !table.borrowed && !table.permanent_sources) {
+                table.copy_source[e] = borrowed_expert || table.borrowed || (table.permanent_sources && table.fallback[e]) ? (const void *)host : nullptr;
+                if (table.fallback[e] && !borrowed_expert && !table.borrowed && !table.permanent_sources) {
                     // find() proved complete containment in this descriptor-bound
                     // retained range. Never use its CUDA alias as a host pointer.
                     const auto & range = session->mapped_ranges[source_range];

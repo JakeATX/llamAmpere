@@ -12,6 +12,7 @@
 
 #include "ggml.h"
 #include "ggml-backend.h"
+#include "ggml-cpp.h"
 
 #include <algorithm>
 #include <condition_variable>
@@ -45,6 +46,9 @@ public:
 
     bool ok() const { return init_ok; }
     void set_ffn_enabled(bool enabled) { ffn_requested = enabled; }
+    // VRAM the plan must leave free beyond its keep, for scratch measured only after a plan exists (the legacy layer graph)
+    void set_extra_keep(size_t bytes) { extra_keep = bytes; }
+    size_t extra_keep = 0;
     bool ffn_enabled() const { return !ffn_views.empty(); }
     llm_b1_ffn * ffn(size_t ub);
     llm_b1_ffn * ffn_group() { return ffn_all.get(); }
@@ -104,6 +108,10 @@ public:
 
     const llama_b1_stats & stats() const { return st; }
 
+    // views over the parts of the lent VRAM regions that no slot or carry of the current plan uses, largest first,
+    // each at least min_bytes; the layer graph may use them as compute scratch until refill() restores the lent tensors
+    std::vector<ggml_backend_buffer_ptr> spare_views(size_t min_bytes, size_t max_views) const;
+
 private:
     struct exps_tensor {
         ggml_tensor *         t       = nullptr;
@@ -121,6 +129,7 @@ private:
         std::vector<int> tensors; // indices into exps
         bool   resident = false;  // every exps tensor of the layer is in VRAM
         size_t bytes    = 0;
+        size_t res_bytes = 0;     // the VRAM-resident exps tensors only: what lending this layer frees
     };
 
     // a contiguous VRAM range the plan may place slots and carries in
@@ -192,6 +201,7 @@ private:
     };
     struct piece {
         const char * src_host = nullptr; // memcpy source, or null for pread
+        size_t alignment = 1;
         int          fd       = -1;
         size_t       src_offs = 0;
         region *     dst      = nullptr;
@@ -205,6 +215,10 @@ private:
     // to the copy stream (no memcpy into a staging buffer, no staging event wait); direct_piece caps those pieces
     bool   direct       = false;
     size_t direct_piece = 64u << 20;
+    // fork AIPNEXTK: LLAMA_B1_BANK_STAGE=1 gathers an arena piece that touches dropped bank-expert bytes into the
+    // worker's pinned staging block (zeros for the dropped bytes) and uploads it with one copy; such pieces then span
+    // experts up to piece_bytes instead of one copy (plus one memset per hole) per expert under the stream lock
+    bool   bank_stage   = false;
     std::vector<std::vector<staging>> stg; // [worker][2]
     ggml_backend_buffer_t zero_buf = nullptr;
     char * zero_data = nullptr;

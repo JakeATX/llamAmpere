@@ -2442,7 +2442,12 @@ void llama_context::sched_reserve(bool suspend_prompt_cache) {
             size_t free = 0, total = 0;
             ggml_backend_dev_memory(dev, &free, &total);
             const size_t card_limit = (size_t) 23552 << 20;
-            const size_t headroom = std::max<size_t>(256u << 20, total > card_limit ? total - card_limit + (64u << 20) : 0);
+            // fork: LLAMA_PROMPT_TEMP_HEADROOM=1 (opt-in) leaves 512 MiB for CUDA kernel temporaries during
+            // cached-prompt turns, which graph sizing does not see (default 256 MiB / +64 MiB over the card cap)
+            static const bool big_headroom = [] { const char * e = getenv("LLAMA_PROMPT_TEMP_HEADROOM"); return e && atoi(e) != 0; }();
+            const size_t headroom_min = big_headroom ? (512u << 20) : (256u << 20);
+            const size_t headroom_pad = big_headroom ? (512u << 20) : (64u << 20);
+            const size_t headroom = std::max<size_t>(headroom_min, total > card_limit ? total - card_limit + headroom_pad : 0);
             size_t handoff_growth = 0;
             if (mtp_hidden.ring && ubatch_rows_cb && dev == model.dev_output()) {
                 // Handoff storage is allocated after this reserve, outside the compute graph.
@@ -5614,7 +5619,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     auto b1_fail = [&](ggml_status st) -> int {
         b1_cur = {};
         if (!b1_kv_scratch_release()) { throw std::runtime_error("cannot return B1 KV scratch"); }
-        b1_kv_scratch_enabled = false;
+        b1_kv_scratch_enabled = false; b1_lend_scratch = false;
         b1_end(true);
         b1_cache_counts.clear();
         b1_cache_readbacks = 0;
@@ -5973,7 +5978,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     if (b1_mode == 1) {
         GGML_ASSERT(b1_i == b1->n_ub());
         if (!b1_kv_scratch_release()) { return b1_fail(GGML_STATUS_FAILED); }
-        b1_kv_scratch_enabled = false;
+        b1_kv_scratch_enabled = false; b1_lend_scratch = false;
         b1_end(false);
         LLAMA_LOG_INFO("%s: [B1] graph compute calls host wall %.3f ms (includes routing readbacks; overlaps expert copies)\n",
                 __func__, b1_compute_submit_us / 1000.0);
@@ -6628,6 +6633,7 @@ static int64_t b1_ctx_env(const char * name, int64_t def) {
 bool llama_context::b1_kv_scratch_release() {
     if (!b1_kv_backend) {
         b1_kv_views.clear();
+        b1_lend_views.clear();
         b1_kv_owned.reset();
         return true;
     }
@@ -6645,6 +6651,7 @@ bool llama_context::b1_kv_scratch_release() {
     // Every view still covers empty storage at this synchronized layer boundary.
     for (auto & view : b1_kv_views) { ggml_backend_buffer_clear(view.get(), 0); }
     b1_kv_views.clear();
+    b1_lend_views.clear();
     b1_kv_owned.reset();
     b1_kv_backend = nullptr;
     for (size_t i = 0; i < backend_ptrs.size(); ++i) {
@@ -6655,7 +6662,7 @@ bool llama_context::b1_kv_scratch_release() {
 }
 
 bool llama_context::b1_kv_scratch_bind(int32_t l0, int32_t l1, bool preflight) {
-    if (!b1_kv_scratch_enabled) { return true; }
+    if (!b1_kv_scratch_enabled && !b1_lend_scratch) { return true; }
     if (!b1_kv_scratch_release()) { return false; }
     size_t gpu = backend_ptrs.size();
     for (size_t i = 0; i < backend_ptrs.size(); ++i) {
@@ -6663,14 +6670,24 @@ bool llama_context::b1_kv_scratch_bind(int32_t l0, int32_t l1, bool preflight) {
         if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) { gpu = i; }
     }
     if (gpu == backend_ptrs.size() || (size_t) l0 >= b1_layer_compute_bytes.size()) { return false; }
-    auto * kv = llama_sj_kvarn_cache(memory.get());
-    if (!kv) { return true; }
-    auto views = kv->b1_scratch_views(backend_buft[gpu], l1, b1_kv_prompt_cells);
-    if (auto * hybrid = dynamic_cast<llama_memory_hybrid_idx *>(memory.get())) {
-        if (auto * idx = hybrid->get_mem_idx()) {
-            auto more = idx->b1_scratch_views(backend_buft[gpu], l1, b1_kv_prompt_cells);
-            for (auto & view : more) { views.push_back(std::move(view)); }
+    std::vector<ggml_backend_buffer_ptr> views;
+    auto * kv = b1_kv_scratch_enabled ? llama_sj_kvarn_cache(memory.get()) : nullptr;
+    if (kv) {
+        views = kv->b1_scratch_views(backend_buft[gpu], l1, b1_kv_prompt_cells);
+        if (auto * hybrid = dynamic_cast<llama_memory_hybrid_idx *>(memory.get())) {
+            if (auto * idx = hybrid->get_mem_idx()) {
+                auto more = idx->b1_scratch_views(backend_buft[gpu], l1, b1_kv_prompt_cells);
+                for (auto & view : more) { views.push_back(std::move(view)); }
+            }
         }
+    }
+    // fork: the lent B1 VRAM that no slot or carry uses (an always-on expert bank lends far more than two slots need)
+    std::vector<ggml_backend_buffer_t> lend_set;
+    // The final range is skipped: its real graph keeps every output row (MTP handoff), larger than the bound measure,
+    // and only an allocator-owned buffer can be released and regrown. Slivers below 512 MiB only fragment the graph.
+    if (b1_lend_scratch && l1 < (int32_t) model.hparams.n_layer()) {
+        auto more = b1->spare_views((size_t) 512 << 20, 14);
+        for (auto & view : more) { lend_set.push_back(view.get()); views.push_back(std::move(view)); }
     }
     std::sort(views.begin(), views.end(), [](const ggml_backend_buffer_ptr & a, const ggml_backend_buffer_ptr & b) {
         return ggml_backend_buffer_get_size(a.get()) > ggml_backend_buffer_get_size(b.get());
@@ -6692,13 +6709,19 @@ bool llama_context::b1_kv_scratch_bind(int32_t l0, int32_t l1, bool preflight) {
     if (!b1_kv_scratch_release()) { return false; }
     const size_t need = b1_layer_compute_bytes[l0];
     const size_t saving = std::min(need / 4, borrowed / 2);
+    size_t lend_borrowed = 0;
+    for (auto & view : views) {
+        if (std::find(lend_set.begin(), lend_set.end(), view.get()) != lend_set.end()) { lend_borrowed += ggml_backend_buffer_get_size(view.get()); }
+    }
+    // lent views take most of the layer graph; the owned buffer keeps 1/8 of it for tensors that do not pack
+    const size_t lend_saving = std::min(need - need / 8, lend_borrowed - lend_borrowed / 8);
     const size_t alignment = ggml_backend_buft_get_alignment(backend_buft[gpu]);
     const uint32_t tokens = *std::max_element(b1->ubatch_sizes().begin(), b1->ubatch_sizes().end());
     const size_t max_ub = std::max_element(b1->ubatch_sizes().begin(), b1->ubatch_sizes().end()) - b1->ubatch_sizes().begin();
     auto reserve_mctx = memory->init_full_single_seq();
     if (!reserve_mctx) { return false; }
     // fork: first try a smaller owned buffer; retry with the measured full size if chunks fragment.
-    for (size_t reduction : {saving, (size_t) 0}) {
+    for (size_t reduction : {std::max(saving, lend_saving), saving, (size_t) 0}) {
         if (!b1_kv_scratch_release()) { return false; }
         const size_t bytes = GGML_PAD(need - reduction + alignment, alignment);
         b1_kv_backend = backend_ptrs[gpu];
@@ -6721,7 +6744,10 @@ bool llama_context::b1_kv_scratch_bind(int32_t l0, int32_t l1, bool preflight) {
         gf_res_reserve->reset();
         ggml_backend_sched_reset(sched.get());
         if (graph) {
-            b1_kv_views = std::move(views);
+            for (auto & view : views) {
+                const bool lent = std::find(lend_set.begin(), lend_set.end(), view.get()) != lend_set.end();
+                (lent ? b1_lend_views : b1_kv_views).push_back(std::move(view));
+            }
             guard.keep = true;
             for (size_t i = 0; i < backend_ptrs.size(); ++i) {
                 backend_buf_exp_size[i] = ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]);
@@ -6729,8 +6755,8 @@ bool llama_context::b1_kv_scratch_bind(int32_t l0, int32_t l1, bool preflight) {
             backend_buf_exp_epoch = ggml_backend_sched_get_alloc_epoch(sched.get());
             size_t free = 0, total = 0;
             ggml_backend_dev_memory(ggml_backend_get_device(b1_kv_backend), &free, &total);
-            LLAMA_LOG_INFO("%s: [B1] empty KV %srange [%d,%d): borrowed_capacity_bytes=%zu owned_bytes=%zu measured_bytes=%zu owned_reduction_bytes=%zu chunks=%zu prompt_limit=%u free_bytes=%zu total_bytes=%zu\n",
-                    __func__, preflight ? "preflight " : "", l0, l1, borrowed, bytes, need, need > bytes ? need - bytes : 0, b1_kv_views.size(), b1_kv_prompt_cells, free, total);
+            LLAMA_LOG_INFO("%s: [B1] empty KV %srange [%d,%d): borrowed_capacity_bytes=%zu lent_capacity_bytes=%zu owned_bytes=%zu measured_bytes=%zu owned_reduction_bytes=%zu chunks=%zu prompt_limit=%u free_bytes=%zu total_bytes=%zu\n",
+                    __func__, preflight ? "preflight " : "", l0, l1, borrowed, lend_borrowed, bytes, need, need > bytes ? need - bytes : 0, b1_kv_views.size() + b1_lend_views.size(), b1_kv_prompt_cells, free, total);
             return true;
         }
     }
@@ -6753,11 +6779,12 @@ bool llama_context::b1_reserve_legacy_layers(const std::vector<uint32_t> & sizes
             ctx->gf_res_prev_active = nullptr;
             ggml_backend_sched_reset(ctx->sched.get());
             if (!success) {
-                ctx->b1_kv_scratch_enabled = false;
+                ctx->b1_kv_scratch_enabled = false; ctx->b1_lend_scratch = false;
                 ggml_backend_sched_reset_compute(ctx->sched.get());
             }
         }
     } guard { this, success };
+    b1_legacy_deficit = 0;
     try {
         synchronize();
         size_t gpu_index = backend_ptrs.size();
@@ -6805,7 +6832,13 @@ bool llama_context::b1_reserve_legacy_layers(const std::vector<uint32_t> & sizes
         const size_t keep = std::max<size_t>(
                 (size_t) std::max<int64_t>(1536, b1_ctx_env("LLAMA_B1_KEEP_FREE_MIB", 1536)) << 20,
                 total > card_limit ? total - card_limit + (64u << 20) : 0);
-        const size_t need = maximum[gpu_index] + keep;
+        // fork: lent, unused B1 VRAM covers most of the layer graph (see b1_kv_scratch_bind); only the owned rest needs free VRAM
+        size_t lend_spare = 0;
+        if (b1_lend_scratch) {
+            for (auto & view : b1->spare_views((size_t) 512 << 20, 14)) { lend_spare += ggml_backend_buffer_get_size(view.get()); }
+        }
+        const size_t lend_cover = std::min(maximum[gpu_index] - maximum[gpu_index] / 8, lend_spare - lend_spare / 8);
+        const size_t need = maximum[gpu_index] - lend_cover + keep;
         // The layer graph needs a second loan after carries/expert slots are
         // allocated. Re-probe physical free after each trim; a logical slot shrink
         // may need another bounded trim to cross the physical allocation boundary.
@@ -6828,12 +6861,12 @@ bool llama_context::b1_reserve_legacy_layers(const std::vector<uint32_t> & sizes
                 break;
             }
         }
-        LLAMA_LOG_INFO("%s: [B1] legacy layer fit: range [%d,%d), compute %.2f MiB, free %.2f MiB, keep %.2f MiB\n",
-                __func__, worst_l0, worst_l1, maximum[gpu_index] / 1048576.0, free / 1048576.0, keep / 1048576.0);
-        if (need > free) { return false; }
+        LLAMA_LOG_INFO("%s: [B1] legacy layer fit: range [%d,%d), compute %.2f MiB (lent spare covers %.2f MiB), free %.2f MiB, keep %.2f MiB\n",
+                __func__, worst_l0, worst_l1, maximum[gpu_index] / 1048576.0, lend_cover / 1048576.0, free / 1048576.0, keep / 1048576.0);
+        if (need > free) { b1_legacy_deficit = need - free; return false; }
         b1->reserve_layer_bind(worst_l0);
         b1_cur = { true, worst_l0, worst_l1, b1->carry(max_ub), nullptr, 0 };
-        if (b1_kv_scratch_enabled && b1_ctx_env("LLAMA_B1_KV_PREFLIGHT", 0) != 0) {
+        if ((b1_kv_scratch_enabled && b1_ctx_env("LLAMA_B1_KV_PREFLIGHT", 0) != 0) || lend_cover > 0) {
             if (!b1_kv_scratch_bind(worst_l0, worst_l1, true)) { return false; }
         }
         // No offered views means that the ordinary physical preflight is still required.
@@ -6871,7 +6904,7 @@ bool llama_context::b1_reserve_legacy_layers(const std::vector<uint32_t> & sizes
                 break;
             }
         }
-        if (free < keep) { return false; }
+        if (free < keep) { b1_legacy_deficit = keep - free; return false; }
         success = true;
         return true;
     } catch (const std::exception & e) {
@@ -7018,7 +7051,7 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
         model.hparams.n_embd <= 65536 && model.hparams.n_expert <= 4096 && model.hparams.n_expert_used() <= 128;
     b1->set_ffn_enabled(packed_ffn);
     const bool lean_legacy = b1_layer_scratch_active && !packed_ffn;
-    b1_kv_scratch_enabled = false;
+    b1_kv_scratch_enabled = false; b1_lend_scratch = false;
     const bool kv_cold = memory->seq_pos_max(seq) < 0;
 
     pp_clock.mark("suspend");
@@ -7093,10 +7126,31 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
              !compute_peer->mtp_prefill_async && !compute_peer->mtp_scratch_active &&
              compute_peer->sched_need_reserve);
         b1_kv_scratch_enabled = kv_cold && peer_detached && mtp_scratch_clients.empty() && n_tokens_all <= UINT32_MAX - 512 && b1->n_groups() == 1 && b1_ctx_env("LLAMA_B1_KV_SCRATCH", 0) != 0;
+        b1_lend_scratch = peer_detached && mtp_scratch_clients.empty() && n_tokens_all <= UINT32_MAX - 512 && b1->n_groups() == 1 && b1_ctx_env("LLAMA_B1_LEND_SCRATCH", 0) != 0;
         b1_kv_prompt_cells = n_tokens_all + 512;
         b1_kv_outputs = (uint32_t) std::max<int64_t>(1, std::min<int64_t>(n_tokens_all, n_outputs_all));
-        if (b1->n_groups() != 1 || !b1_reserve_legacy_layers(sizes, n_outputs_all)) {
-            b1_kv_scratch_enabled = false;
+        const bool kv_scratch_wanted = b1_kv_scratch_enabled, lend_wanted = b1_lend_scratch;
+        bool reserved = b1->n_groups() == 1 && b1_reserve_legacy_layers(sizes, n_outputs_all);
+        // fork: the plan sizes carries and slots before the layer graph is measured. When the graph then lacks VRAM,
+        // plan once more leaving that deficit free: the plan lends more resident experts (refilled after the prompt)
+        // instead of allocating fresh VRAM. Opt-in: LLAMA_B1_REPLAN=1.
+        // Allocation rounding can leave the re-plan a little short, so up to three re-plans add each new deficit.
+        size_t extra = 0;
+        for (int attempt = 0; attempt < 3 && !reserved && b1_legacy_deficit > 0 && b1_ctx_env("LLAMA_B1_REPLAN", 0) != 0; ++attempt) {
+            extra += b1_legacy_deficit + ((size_t) 64 << 20);
+            LLAMA_LOG_WARN("%s: [B1] re-plan leaving %.1f MiB more free for the layer graph\n", __func__, extra / 1048576.0);
+            b1->set_extra_keep(extra);
+            const bool replanned = b1->begin(sizes, group_ub, lend_cap, final_home, nullptr, lean_legacy);
+            b1->set_extra_keep(0);
+            if (!replanned || b1->n_groups() != 1) {
+                break;
+            }
+            b1_kv_scratch_enabled = kv_scratch_wanted;
+            b1_lend_scratch = lend_wanted;
+            reserved = b1_reserve_legacy_layers(sizes, n_outputs_all);
+        }
+        if (!reserved) {
+            b1_kv_scratch_enabled = false; b1_lend_scratch = false;
             LLAMA_LOG_WARN("%s: [B1] legacy one-pass layer reservation failed before applying prompt state\n", __func__);
             b1_end(true);
             return normal();

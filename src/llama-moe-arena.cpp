@@ -339,7 +339,8 @@ void llama_moe_arena::pin() {
     auto * reg = arena_cuda_reg();
     pin_range = (bool (*)(void *, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_host_pin");
     unpin = (void (*)(void *)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_host_unpin");
-    if (!pin_ranges.empty() || !pin_range || !unpin || !pin_range(data, size)) {
+    is_unpinned = (bool (*)(const void *, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_host_is_unpinned");
+    if (!pin_ranges.empty() || !pin_range || !unpin || !is_unpinned || !pin_range(data, size)) {
         throw std::runtime_error("expert arena CUDA host registration failed");
     }
     pin_ranges.emplace_back(0, size);
@@ -387,6 +388,7 @@ size_t llama_moe_arena::discard(const std::vector<std::pair<size_t, size_t>> & r
     pin_ranges.reserve(cold.size() + holes.size());
     // The GPU owner must preserve every covered byte before this transition.
     unpin(data);
+    GGML_ASSERT(is_unpinned(data, size));
     pin_ranges.clear();
     for (const auto & range : cold) {
         if (!pin_range((char *) data + range.first, range.second)) {
@@ -399,6 +401,7 @@ size_t llama_moe_arena::discard(const std::vector<std::pair<size_t, size_t>> & r
     }
     missing_ranges = std::move(holes);
     for (const auto & range : missing_ranges) {
+        GGML_ASSERT(is_unpinned((char *) data + range.first, range.second));
         if (madvise((char *) data + range.first, range.second, MADV_DONTNEED) != 0) {
             throw std::runtime_error("cannot discard GPU-backed arena pages");
         }
@@ -411,18 +414,27 @@ size_t llama_moe_arena::discard(const std::vector<std::pair<size_t, size_t>> & r
 }
 
 void llama_moe_arena::pin_restored() {
-    for (const auto & range : missing_ranges) {
-        if (!pin_range((char *) data + range.first, range.second)) {
-            throw std::runtime_error("cannot pin restored arena pages");
+    const size_t original = pin_ranges.size();
+    pin_ranges.reserve(original + missing_ranges.size());
+    try {
+        for (const auto & range : missing_ranges) {
+            if (!pin_range((char *) data + range.first, range.second)) {
+                throw std::runtime_error("cannot pin restored arena pages");
+            }
+            pin_ranges.push_back(range);
         }
-        pin_ranges.push_back(range);
+    } catch (...) {
+        for (size_t i = original; i < pin_ranges.size(); ++i) { unpin((char *) data + pin_ranges[i].first); }
+        pin_ranges.resize(original);
+        throw;
     }
     missing_ranges.clear();
 }
 
 llama_moe_arena::~llama_moe_arena() {
-    buffer.reset();
     for (const auto & range : pin_ranges) { unpin((char *) data + range.first); }
+    GGML_ASSERT(!is_unpinned || is_unpinned(data, size));
+    buffer.reset();
 #ifndef _WIN32
     if (data) { munmap(data, size); }
 #endif

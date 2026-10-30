@@ -2614,19 +2614,113 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(weights, "ffn_moe_weights_scaled", il);
     }
 
-    // fork: explicit graph output keeps adjusted weights alive until the final expert sum.
-    if ((getenv("GGML_MOE_SKIP_POLICY") || getenv("GGML_MOE_SKIP_TRACE")) &&
+    if (moe_weights_override != nullptr) {
+        // inner call of the hot/cold split below: the routing weights were already masked
+        weights = moe_weights_override;
+        moe_weights_override = nullptr;
+    } else if ((getenv("GGML_MOE_SKIP_POLICY") || getenv("GGML_MOE_SKIP_TRACE")) &&
             norm_w && gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX && n_expert == 512 &&
             il < 48 && ubatch.n_seqs == 1 && n_expert_used == 10 && n_tokens > 0 && n_tokens <= 8) {
         weights = ggml_map_custom2(ctx0, weights, selected_experts, moe_skipmass_cpu, 1, nullptr);
+        // fork: explicit graph output keeps adjusted weights alive until the final expert sum.
         ggml_format_name(weights, "moe_skipmass-%d", il);
     }
 
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
 
+    // warmup routes every expert (n_expert_used == n_expert): too many for the bank's filler slots, so it
+    // runs on the cold bank alone, which holds every expert
+    if (moe_hot.hot_map != nullptr && moe_hot.down->ne[2] < 2*n_expert_used) {
+        moe_hot = {};
+    }
+    if (moe_hot.hot_map != nullptr) {
+        // split the selected experts between the hot bank and the cold bank; each bank runs on all
+        // n_expert_used columns with the weights of the other bank's experts set to zero
+        const moe_hot_bank hot = moe_hot;
+        moe_hot = {};
+        // [B1] layer-major prompt: the routing phase runs the hot call here (the hot bank is on the card) and records
+        // the cold weights, hot slots zeroed, for the whole-prompt cold GEMMs; their zero-weight rows are skipped.
+        const bool b1_routing = res->get_b1_ffn_phase() == 1 && res->get_b1_ffn() != nullptr;
+        GGML_ASSERT(!weight_before_ffn);
+
+        // the maps hold one row per expert; look them up with the flattened expert ids
+        ggml_tensor * sel_flat = ggml_reshape_2d(ctx0, ggml_cont(ctx0, selected_experts), n_expert_used*n_tokens, 1);
+        ggml_tensor * slot = ggml_reshape_3d(ctx0,
+                ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, hot.hot_map, 1, n_expert), sel_flat), 1, n_expert_used, n_tokens);
+        cb(slot, "ffn_moe_hot_slot", il);
+        ggml_tensor * mask  = ggml_step(ctx0, ggml_scale_bias(ctx0, slot, 1.0f, 0.5f)); // 1 = hot, 0 = cold
+        ggml_tensor * w_hot  = ggml_mul(ctx0, weights, mask);
+        ggml_tensor * w_cold = ggml_sub(ctx0, weights, w_hot);
+        cb(w_hot,  "ffn_moe_weights_hot",  il);
+        cb(w_cold, "ffn_moe_weights_cold", il);
+
+        // mul_mat_id needs every expert at most once per token, so the masked (cold) slots of the hot call
+        // get distinct filler slots that the token does not use: one-hot the token's hot slots over the
+        // bank, then take the n_expert_used least-used bank slots (argsort puts the used ones last)
+        const int64_t n_hot = hot.down->ne[2];
+        // AI+ banks: the masked slots get id -1, which the AI+ MUL_MAT_ID skips (zero output, CUDA and CPU), so the hot
+        // call computes only the token's hot pairs instead of n_expert_used pairs with fillers. LLAMA_MOE_HOT_FILLER=1
+        // keeps the filler slots (an A/B control; the outputs are identical because the filler weights are zero).
+        static const bool hot_filler = getenv("LLAMA_MOE_HOT_FILLER") != nullptr && atoi(getenv("LLAMA_MOE_HOT_FILLER")) != 0;
+        const bool hot_skip = !hot_filler && ggml_ai4_rate(hot.up->type) != 0 && ggml_ai4_rate(hot.gate->type) != 0 &&
+                              ggml_ai4_rate(hot.down->type) != 0 &&
+                              !(getenv("GGML_MOE_HOT_DBG") && atoi(getenv("GGML_MOE_HOT_DBG")) == 1); // dbg 1 runs the cold bank
+        ggml_tensor * hot_ids = nullptr;
+        if (hot_skip) {
+            // (slot + 1) * mask - 1: the bank slot where hot, -1 where cold
+            ggml_tensor * hot_f = ggml_scale_bias(ctx0, ggml_mul(ctx0, ggml_scale_bias(ctx0, slot, 1.0f, 1.0f), mask), 1.0f, -1.0f);
+            hot_ids = ggml_cast(ctx0, ggml_reshape_2d(ctx0, hot_f, n_expert_used, n_tokens), GGML_TYPE_I32);
+        } else {
+            ggml_tensor * bank_pos = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, ggml_arange(ctx0, 0.0f, (float) n_hot, 1.0f), n_hot, 1, 1),
+                    n_hot, n_expert_used, n_tokens, 1);
+            ggml_tensor * onehot = ggml_step(ctx0, ggml_scale_bias(ctx0, ggml_abs(ctx0, ggml_sub(ctx0, bank_pos, slot)), -1.0f, 0.5f)); // [n_hot, n_expert_used, n_tokens]
+            ggml_tensor * used   = ggml_sum_rows(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, onehot, 1, 0, 2, 3)));               // [1, n_hot, n_tokens]
+            ggml_tensor * filler = ggml_argsort_top_k(ctx0, ggml_scale(ctx0, ggml_reshape_2d(ctx0, used, n_hot, n_tokens), -1.0f), n_expert_used); // [n_expert_used, n_tokens]
+            ggml_tensor * fill_f = ggml_reshape_3d(ctx0, ggml_cast(ctx0, ggml_cont(ctx0, filler), GGML_TYPE_F32), 1, n_expert_used, n_tokens);
+            ggml_tensor * hot_f  = ggml_add(ctx0, ggml_mul(ctx0, slot, mask), ggml_sub(ctx0, fill_f, ggml_mul(ctx0, fill_f, mask)));
+            hot_ids = ggml_cast(ctx0, ggml_reshape_2d(ctx0, hot_f, n_expert_used, n_tokens), GGML_TYPE_I32);
+        }
+        cb(hot_ids, "ffn_moe_hot_ids", il);
+        // the cold bank keeps all n_expert experts, so the routed ids stay unique there; the hot experts
+        // run with zero weight in the cold call
+        GGML_ASSERT(down_exps == nullptr || down_exps->ne[2] == n_expert);
+        ggml_tensor * cold_ids = selected_experts;
+
+        static const int hot_dbg = getenv("GGML_MOE_HOT_DBG") ? atoi(getenv("GGML_MOE_HOT_DBG")) : 0;
+        moe_weights_override = w_hot;
+        moe_b1_bypass = b1_routing;
+        ggml_tensor * out_hot = hot_dbg == 1 ?
+            build_moe_ffn(cur, gate_inp, nullptr,
+                up_exps, up_exps_b, gate_exps, gate_exps_b, down_exps, down_exps_b, exp_probs_b,
+                n_expert, n_expert_used, type_op, norm_w, w_scale, gating_op, il,
+                logits, gate_up_exps, gate_up_exps_b, up_exps_s, gate_exps_s, down_exps_s, selected_experts) :
+            build_moe_ffn(cur, gate_inp, nullptr,
+                hot.up, nullptr, hot.gate, nullptr, hot.down, nullptr, exp_probs_b,
+                n_expert, n_expert_used, type_op, norm_w, w_scale, gating_op, il,
+                logits, nullptr, nullptr, nullptr, nullptr, nullptr, hot_ids);
+        moe_b1_bypass = false;
+        if (hot_dbg == 2) {
+            out_hot = ggml_scale(ctx0, out_hot, 0.0f);
+            w_cold  = weights;
+        }
+        moe_weights_override = w_cold;
+        ggml_tensor * out_cold = build_moe_ffn(cur, gate_inp, nullptr,
+                up_exps, up_exps_b, gate_exps, gate_exps_b, down_exps, down_exps_b, exp_probs_b,
+                n_expert, n_expert_used, type_op, norm_w, w_scale, gating_op, il,
+                logits, gate_up_exps, gate_up_exps_b, up_exps_s, gate_exps_s, down_exps_s, cold_ids);
+        GGML_ASSERT(moe_weights_override == nullptr);
+        if (b1_routing) {
+            GGML_ASSERT(out_cold == nullptr);
+            return out_hot; // added to the shared expert output that seeds the whole-prompt accumulator
+        }
+        ggml_tensor * moe_out = ggml_add(ctx0, out_hot, out_cold);
+        cb(moe_out, "ffn_moe_out", il);
+        return moe_out;
+    }
+
     const auto * b1_ffn = res->get_b1_ffn();
-    if (res->get_b1_ffn_phase() == 1 && b1_ffn) {
+    if (res->get_b1_ffn_phase() == 1 && b1_ffn && !moe_b1_bypass) {
         GGML_ASSERT(selected_experts->type == GGML_TYPE_I32 && weights->type == GGML_TYPE_F32);
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, selected_experts, b1_ffn->ids));
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens), b1_ffn->weights));

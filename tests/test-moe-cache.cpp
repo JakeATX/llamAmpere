@@ -4464,8 +4464,10 @@ static bool run_profile_swap_prior(ggml_backend_t gpu, ggml_backend_t cpu, log_c
     }
     // Swap victims need exact mapped fallback sources, including initially hot experts.
     if (ok) { setup_stage = "CUDA host registration"; }
-    const bool registered = ok && cudaHostRegister(ggml_backend_buffer_get_base(buffer), ggml_backend_buffer_get_size(buffer),
-            cudaHostRegisterPortable | cudaHostRegisterMapped) == cudaSuccess;
+    auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(gpu));
+    auto pin = (bool (*)(void *, size_t))ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_host_pin");
+    auto unpin = (void (*)(void *))ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_host_unpin");
+    const bool registered = ok && pin && unpin && pin(ggml_backend_buffer_get_base(buffer), ggml_backend_buffer_get_size(buffer));
     ok &= registered;
     if (!registered) { (void)cudaGetLastError(); }
     // Raw saved counts keep layer 7's experts and layer 8's expert 0 resident.
@@ -4588,7 +4590,7 @@ static bool run_profile_swap_prior(ggml_backend_t gpu, ggml_backend_t cpu, log_c
         for (auto & r : reference) { free_graph(r); }
         ggml_free(graph_ctx);
     }
-    if (registered) { ok &= cudaHostUnregister(ggml_backend_buffer_get_base(buffer)) == cudaSuccess; }
+    if (registered) { unpin(ggml_backend_buffer_get_base(buffer)); }
     ggml_backend_buffer_free(input_buffer);
     ggml_backend_buffer_free(buffer);
     ggml_free(inputs);
@@ -4686,14 +4688,15 @@ static bool run_swap_whole(ggml_backend_t gpu, ggml_backend_t cpu, log_capture &
         ggml_backend_tensor_set(ids[t], routes, 0, sizeof(routes));
         desc[t] = {weights[t]->name, weights[t]->data, weights[t]->nb[2], n_in, n_out, experts, GGML_TYPE_Q4_0};
     }
+    auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(gpu));
+    auto pin = (bool (*)(void *, size_t))ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_host_pin");
+    auto unpin = (void (*)(void *))ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_host_unpin");
     if (ok) {
         setup_stage = "CUDA host registration";
-        const cudaError_t error = cudaHostRegister(ggml_backend_buffer_get_base(buffer), ggml_backend_buffer_get_size(buffer),
-                cudaHostRegisterPortable | cudaHostRegisterMapped);
-        registered = error == cudaSuccess;
+        registered = pin && unpin && pin(ggml_backend_buffer_get_base(buffer), ggml_backend_buffer_get_size(buffer));
         ok &= registered;
         if (!registered) {
-            fprintf(stderr, "cache-swap-whole: host registration failed: %s\n", cudaGetErrorString(error));
+            fprintf(stderr, "cache-swap-whole: tracked host registration failed\n");
             (void) cudaGetLastError();
         }
     }
@@ -4804,7 +4807,7 @@ static bool run_swap_whole(ggml_backend_t gpu, ggml_backend_t cpu, log_capture &
         ok &= case_ok;
         ggml_free(graph_ctx);
     }
-    if (registered) { ok &= cudaHostUnregister(ggml_backend_buffer_get_base(buffer)) == cudaSuccess; }
+    if (registered) { unpin(ggml_backend_buffer_get_base(buffer)); }
     if (buffer) { ggml_backend_buffer_free(buffer); }
     ggml_free(ctx);
     unlink(filename.data());
@@ -5032,11 +5035,41 @@ static bool run_prefetch_staging(ggml_backend_t gpu, ggml_backend_t cpu,
 }
 
 static bool run_device_tables_case(ggml_backend_t gpu, ggml_backend_t cpu,
-        ggml_tensor * weights, log_capture & capture, float * neighbor_output = nullptr) {
+        ggml_tensor * weights, log_capture & capture, float * neighbor_output = nullptr, bool require_staging = false) {
     if (!active_api().device_prepare || !active_api().device_supports) {
         return false;
     }
     bool ok = true;
+    // Whole-expert residency builds device tables only for complete up/gate/down
+    // layers, so describe two same-shape siblings next to the tested tensor.
+    int layer = -1;
+    const char * suffix = strchr(weights->name + 4, '.');
+    ok &= sscanf(weights->name, "blk.%d.", &layer) == 1 && suffix != nullptr;
+    std::string sibling_names[2];
+    int n_siblings = 0;
+    for (const char * kind : {"ffn_up_exps.weight", "ffn_gate_exps.weight", "ffn_down_exps.weight"}) {
+        if (ok && strcmp(suffix + 1, kind) != 0 && n_siblings < 2) {
+            sibling_names[n_siblings++] = "blk." + std::to_string(layer) + "." + kind;
+        }
+    }
+    ok &= n_siblings == 2;
+    ggml_init_params sibling_params = {2 * ggml_tensor_overhead(), nullptr, true};
+    ggml_context * sibling_ctx = ggml_init(sibling_params);
+    ggml_tensor * siblings[2];
+    for (int i = 0; i < 2; ++i) {
+        siblings[i] = ggml_new_tensor_3d(sibling_ctx, weights->type, weights->ne[0], weights->ne[1], weights->ne[2]);
+        ggml_set_name(siblings[i], sibling_names[i].c_str());
+    }
+    ggml_backend_buffer_t sibling_buffer = ggml_backend_alloc_ctx_tensors(sibling_ctx, cpu);
+    ok &= sibling_buffer != nullptr;
+    if (ok) {
+        ggml_backend_buffer_set_usage(sibling_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        for (ggml_tensor * sibling : siblings) {
+            for (int64_t e = 0; e < weights->ne[2]; ++e) {
+                memcpy((char *)sibling->data + e * sibling->nb[2], (const char *)weights->data + e * weights->nb[2], sibling->nb[2]);
+            }
+        }
+    }
     for (int route_mode : {0, 1, 2}) {
     for (int tokens : {1, 4}) {
         for (int channels : {1, 2}) {
@@ -5070,13 +5103,17 @@ static bool run_device_tables_case(ggml_backend_t gpu, ggml_backend_t cpu,
             ggml_backend_t backends[] = {gpu, cpu};
             ggml_backend_sched_t scheduler = ggml_backend_sched_new(backends, nullptr, 2,
                     GGML_DEFAULT_GRAPH_SIZE, false, false);
-            const ggml_moe_cache_tensor_desc descriptor = {weights->name, weights->data,
-                weights->nb[2], weights->ne[0], weights->ne[1], weights->ne[2], (int32_t) weights->type};
+            ggml_tensor * described[] = {weights, siblings[0], siblings[1]};
+            ggml_moe_cache_tensor_desc descriptors[3];
+            for (int i = 0; i < 3; ++i) {
+                const ggml_tensor * t = described[i];
+                descriptors[i] = {t->name, t->data, t->nb[2], t->ne[0], t->ne[1], t->ne[2], (int32_t) t->type};
+            }
             std::vector<uint64_t> usage(weights->ne[2], 0);
             usage[0] = 100;
-            const uint64_t * counts[] = {usage.data()};
-            ok &= ggml_backend_sched_moe_cache_warm(scheduler, &descriptor, counts, 1) == 1;
-            const bool prepared = ggml_backend_sched_moe_cache_device_prepare(scheduler, &descriptor, 1) == 1;
+            const uint64_t * counts[] = {usage.data(), usage.data(), usage.data()};
+            ok &= sibling_buffer && ggml_backend_sched_moe_cache_warm(scheduler, descriptors, counts, 3) > 0;
+            const bool prepared = sibling_buffer && ggml_backend_sched_moe_cache_device_prepare(scheduler, descriptors, 3) == 1;
             ok &= prepared != unsupported;
             if (unsupported) {
                 // A failed opt-in must leave CPU scheduling and the legacy
@@ -5091,7 +5128,9 @@ static bool run_device_tables_case(ggml_backend_t gpu, ggml_backend_t cpu,
             } else if (prepared) {
                 ok &= ggml_backend_sched_alloc_graph(scheduler, candidate.graph);
                 ok &= ggml_backend_sched_get_tensor_backend(scheduler, candidate.out) == gpu;
-                ok &= ggml_backend_sched_get_buffer_size(scheduler, gpu) < ggml_nbytes(weights);
+                if (!require_staging) {
+                    ok &= ggml_backend_sched_get_buffer_size(scheduler, gpu) < ggml_nbytes(weights);
+                }
                 std::vector<float> first(expected.size()), second(expected.size());
                 auto read_output = [&](std::vector<float> & output) {
                     void * destination = neighbor_output ? (void *)neighbor_output : output.data();
@@ -5118,19 +5157,17 @@ static bool run_device_tables_case(ggml_backend_t gpu, ggml_backend_t cpu,
             if (prepared) {
                 const std::string log = capture.get();
                 ok &= max_field_value(log, "dispatches=") == 3;
-                if (neighbor_output) {
+                if (neighbor_output || require_staging) {
                     ok &= log.find("mapped registration boundary copy:") != std::string::npos;
                 }
-                if (route_mode == 0) {
-                    ok &= max_field_value(log, "hits=") == 6 * tokens;
-                    ok &= max_field_value(log, "misses=") == 0;
-                } else if (route_mode == 1) {
-                    ok &= max_field_value(log, "hits=") == 0;
-                    ok &= max_field_value(log, "misses=") == 6 * tokens;
-                } else {
-                    ok &= max_field_value(log, "hits=") > 0;
-                    ok &= max_field_value(log, "misses=") > 0;
+                if (require_staging) {
+                    ok &= max_field_value(log, "new_copy_bytes=") > 0;
+                    ok &= max_field_value(log, "new_registered_bytes=") == 0;
                 }
+                // Whole-only warm admits complete experts hottest first (expert 0) until
+                // the budget is full, so only all-expert-0 routing must hit everywhere.
+                ok &= max_field_value(log, "hits=") + max_field_value(log, "misses=") == 6 * tokens;
+                ok &= route_mode != 0 || max_field_value(log, "misses=") == 0;
             }
             ggml_backend_buffer_free(candidate.buffer);
             ggml_free(candidate.ctx);
@@ -5144,6 +5181,10 @@ static bool run_device_tables_case(ggml_backend_t gpu, ggml_backend_t cpu,
         }
     }
     }
+    if (sibling_buffer) {
+        ggml_backend_buffer_free(sibling_buffer);
+    }
+    ggml_free(sibling_ctx);
     set_env("GGML_MOE_CACHE_DEVICE", nullptr);
     set_env("GGML_MOE_CACHE_DEVICE_STATS", nullptr);
     printf("cache-device-tables type=%s mode=%s: %s\n", ggml_type_name(weights->type),
@@ -5151,6 +5192,67 @@ static bool run_device_tables_case(ggml_backend_t gpu, ggml_backend_t cpu,
             ok ? "OK" : "FAIL");
     return ok;
 }
+
+#if defined(GGML_CUDA) && defined(__linux__)
+static bool run_device_pageable_fallback(ggml_backend_t gpu, ggml_backend_t cpu, log_capture & capture, bool sparse = false) {
+    const long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) { return false; }
+    const size_t page = (size_t)page_size;
+    // 1280 experts x 3 whole-only siblings (4.4 MB) exceed the 4 MiB cache, so
+    // non-resident experts must be mapped through the pageable fallback.
+    constexpr int64_t n_expert = 1280;
+    void * allocation = malloc((n_expert + 2) * page);
+    if (!allocation) { return false; }
+    void * data = (void *)((((uintptr_t)allocation + page - 1) & ~(page - 1)) + 64);
+    ggml_init_params params{ggml_tensor_overhead(), nullptr, true};
+    auto * ctx = ggml_init(params);
+    auto * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_Q4_0, 256, 8, n_expert);
+    ggml_set_name(weights, "blk.7.ffn_up_exps.weight");
+    const size_t packed_bytes = ggml_nbytes(weights);
+    const size_t expert_bytes = weights->nb[2];
+    if (sparse) { weights->nb[2] = page; weights->nb[3] = n_expert * page; }
+    const size_t bytes = ggml_nbytes(weights);
+    auto * buffer = ggml_backend_cpu_buffer_from_ptr(data, bytes);
+    bool ok = buffer && expert_bytes + 64 < page &&
+            ggml_backend_tensor_alloc(buffer, weights, data) == GGML_STATUS_SUCCESS;
+    auto unregistered = [&]() {
+        cudaPointerAttributes attributes{};
+        const auto error = cudaPointerGetAttributes(&attributes, (char *)data + (sparse ? page : 0));
+        (void)cudaGetLastError();
+        return error == cudaErrorInvalidValue || (error == cudaSuccess && attributes.type == cudaMemoryTypeUnregistered);
+    };
+    // CUDA knows both endpoints, but the owner ledger must reject the pageable middle.
+    void * first_page = (void *)((uintptr_t)data - 64);
+    void * last_page = (char *)first_page + (n_expert - 1) * page;
+    const bool first_pinned = sparse && cudaHostRegister(first_page, page, cudaHostRegisterMapped) == cudaSuccess;
+    const bool last_pinned = sparse && cudaHostRegister(last_page, page, cudaHostRegisterMapped) == cudaSuccess;
+    ok &= !sparse || (first_pinned && last_pinned);
+    (void)cudaGetLastError();
+    ok &= unregistered();
+    if (ok) {
+        ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        std::vector<float> values(ggml_nelements(weights), 0.125f);
+        std::vector<uint8_t> packed(packed_bytes);
+        ok &= ggml_quantize_chunk(weights->type, values.data(), packed.data(), 0, 8 * n_expert, 256, nullptr) == packed_bytes;
+        for (int64_t e = 0; e < n_expert; ++e) {
+            memcpy((char *)data + e * weights->nb[2], packed.data() + e * expert_bytes, expert_bytes);
+        }
+        if (ok) { ok &= run_device_tables_case(gpu, cpu, weights, capture, nullptr, true); }
+        ok &= unregistered();
+    }
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    bool released = !(first_pinned || last_pinned) || cudaDeviceSynchronize() == cudaSuccess;
+    if (released) {
+        if (first_pinned) { released &= cudaHostUnregister(first_page) == cudaSuccess; }
+        if (last_pinned) { released &= cudaHostUnregister(last_page) == cudaSuccess; }
+    }
+    ok &= released;
+    if (released) { free(allocation); }
+    printf("cache-device-pageable-fallback%s: %s\n", sparse ? "-sparse" : "", ok ? "OK" : "FAIL");
+    return ok;
+}
+#endif
 
 // A full warm cache must admit a repeatedly routed miss without invalidating
 // the graph. Then route its evicted victim to verify the mapped fallback.
@@ -7633,8 +7735,10 @@ static bool run_arena_stride(ggml_backend_t gpu, ggml_backend_t cpu,
     ok &= run_prompt_warm(gpu, cpu, weights, graph, reference, capture);
     ok &= run_scenario("cache-arena-stride", nullptr, gpu, cpu, graph, reference, capture);
 #ifdef GGML_CUDA
-    const bool registered = cudaHostRegister(arena, arena_size,
-            cudaHostRegisterPortable | cudaHostRegisterMapped) == cudaSuccess;
+    auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(gpu));
+    auto pin = (bool (*)(void *, size_t))ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_host_pin");
+    auto unpin = (void (*)(void *))ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_host_unpin");
+    const bool registered = pin && unpin && pin(arena, arena_size);
     ok &= registered;
     if (registered) {
         ok &= run_device_tables_case(gpu, cpu, weights, capture);
@@ -7648,7 +7752,7 @@ static bool run_arena_stride(ggml_backend_t gpu, ggml_backend_t cpu,
         // Cache/table teardown must leave the model-owned registration alive.
         ok &= cudaHostGetFlags(&flags, arena) == cudaSuccess;
         ok &= capture.get().find("new_copy_bytes=0 new_registered_bytes=0") != std::string::npos;
-        ok &= cudaHostUnregister(arena) == cudaSuccess;
+        unpin(arena);
     }
 #endif
     for (int64_t e = 0; e < weights->ne[2]; ++e) {
@@ -7843,6 +7947,58 @@ static bool test_profile_global_plan() {
     return ok;
 }
 
+#if defined(GGML_CUDA) && defined(__linux__)
+static bool test_host_pin_lifetime(ggml_backend_reg_t reg) {
+    auto pin = (bool (*)(void *, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_host_pin");
+    auto unpin = (void (*)(void *)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_host_unpin");
+    auto unpinned = (bool (*)(const void *, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_host_is_unpinned");
+    const long page_size = sysconf(_SC_PAGESIZE);
+    if (!pin || !unpin || !unpinned || page_size <= 0) { return false; }
+    const size_t page = (size_t) page_size, bytes = 4 * page;
+    char * data = (char *) mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (data == MAP_FAILED) { return false; }
+    memset(data, 0x5a, bytes);
+    if (!pin(data, bytes)) { munmap(data, bytes); return false; }
+    bool ok = !unpinned(data, bytes) && !pin(data + page, page);
+    void * device = nullptr;
+    cudaStream_t stream = nullptr;
+    cudaEvent_t done = nullptr;
+    const bool allocated = cudaMalloc(&device, bytes) == cudaSuccess;
+    const bool streamed = cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) == cudaSuccess;
+    const bool event_created = cudaEventCreateWithFlags(&done, cudaEventDisableTiming) == cudaSuccess;
+    bool queued = allocated && streamed && event_created;
+    if (queued) {
+        queued = cudaMemcpyAsync(device, data, bytes, cudaMemcpyHostToDevice, stream) == cudaSuccess &&
+                cudaEventRecord(done, stream) == cudaSuccess;
+    }
+    unpin(data);
+    ok &= queued && cudaEventQuery(done) == cudaSuccess;
+    ok &= unpinned(data, bytes);
+    if (queued) {
+        memset(data, 0, bytes);
+        ok &= cudaMemcpy(data, device, bytes, cudaMemcpyDeviceToHost) == cudaSuccess;
+        for (size_t i = 0; i < bytes; ++i) { ok &= data[i] == 0x5a; }
+    }
+    if (event_created) { ok &= cudaEventDestroy(done) == cudaSuccess; }
+    if (streamed) { ok &= cudaStreamDestroy(stream) == cudaSuccess; }
+    if (allocated) { ok &= cudaFree(device) == cudaSuccess; }
+    const bool first = pin(data, page), last = pin(data + 3 * page, page);
+    ok &= first && last && unpinned(data + page, 2 * page);
+    if (first && last) { ok &= !pin(data, bytes); }
+    if (unpinned(data + page, 2 * page)) { ok &= madvise(data + page, 2 * page, MADV_DONTNEED) == 0; }
+    if (first) { unpin(data); }
+    if (last) { unpin(data + 3 * page); }
+    ok &= unpinned(data, bytes);
+    const bool tiny = pin(data, 1);
+    ok &= tiny && !pin(data + 1, 1);
+    if (tiny) { unpin(data); }
+    ok &= unpinned(data, bytes);
+    ok &= munmap(data, bytes) == 0;
+    printf("cache-host-pin-lifetime: %s\n", ok ? "OK" : "FAIL");
+    return ok;
+}
+#endif
+
 int main(int argc, char ** argv) {
     // The ALLOCSIM fixtures expect the opt-in plan refresh and growth step-down (engine default off).
     if (!getenv("GGML_MOE_CACHE_PLAN_REFRESH")) { set_env("GGML_MOE_CACHE_PLAN_REFRESH", "1"); }
@@ -7932,6 +8088,20 @@ int main(int argc, char ** argv) {
         }
         return 1;
     }
+#if defined(GGML_CUDA) && defined(__linux__)
+    if (argc == 2 && strcmp(argv[1], "--device-pageable-fallback-only") == 0) {
+        const bool ok = provider_is_cuda && run_device_pageable_fallback(gpu, cpu, capture) && run_device_pageable_fallback(gpu, cpu, capture, true);
+        ggml_backend_free(gpu);
+        ggml_backend_free(cpu);
+        return !provider_is_cuda ? 77 : ok ? 0 : 1;
+    }
+    if (argc == 2 && strcmp(argv[1], "--host-pin-lifetime-only") == 0) {
+        const bool ok = provider_is_cuda && test_host_pin_lifetime(provider_reg);
+        ggml_backend_free(gpu);
+        ggml_backend_free(cpu);
+        return !provider_is_cuda ? 77 : ok ? 0 : 1;
+    }
+#endif
     if (argc == 2 && strcmp(argv[1], "--device-missjoin-retain-lifecycle-only") == 0) {
         const bool ok = provider_is_cuda && run_device_missjoin_retain_lifecycle(gpu, cpu, capture);
         ggml_backend_free(gpu);
@@ -8276,6 +8446,11 @@ int main(int argc, char ** argv) {
     ok &= run_optional(provider_is_cuda, "cache-device-tables", [&] {
         return run_device_tables(gpu, cpu, weights, capture);
     });
+#if defined(GGML_CUDA) && defined(__linux__)
+    ok &= run_optional(provider_is_cuda, "cache-device-pageable-fallback", [&] {
+        return run_device_pageable_fallback(gpu, cpu, capture) && run_device_pageable_fallback(gpu, cpu, capture, true);
+    });
+#endif
     ok &= run_optional(provider_is_cuda, "cache-device-fused", [&] {
         return run_device_fused_tables(gpu, cpu, capture);
     });
