@@ -864,6 +864,7 @@ static bool hcf_common_supported(const ggml_tensor * x, const ggml_tensor * wn) 
 
 static bool hcf_weight_ok(const ggml_tensor * w) {
     return w->type == GGML_TYPE_BF16 && w->nb[0] == 2 && w->nb[1] % 16 == 0 &&
+        w->view_offs % 16 == 0 &&
         ((uintptr_t) w->data) % 16 == 0;
 }
 

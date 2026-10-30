@@ -5369,20 +5369,31 @@ struct test_dsv4_hc_alignment : public test_dsv4_hc_fused {
     const int x_offset;
     const int norm_offset;
     const bool up;
+    const int weight_input;
+    const int weight_offset;
 
-    test_dsv4_hc_alignment(int x_offset, int norm_offset, bool up)
-        : test_dsv4_hc_fused(512, 64, 1), x_offset(x_offset), norm_offset(norm_offset), up(up) {}
+    test_dsv4_hc_alignment(int x_offset, int norm_offset, bool up, int weight_input = -1, int weight_offset = 0)
+        : test_dsv4_hc_fused(512, 64, 1), x_offset(x_offset), norm_offset(norm_offset), up(up), weight_input(weight_input), weight_offset(weight_offset) {}
 
     std::string op_desc(ggml_tensor *) override { return "HC_ALIGNMENT"; }
-    std::string vars() override { return VARS_TO_STR3(x_offset, norm_offset, up); }
+    std::string vars() override {
+        return VARS_TO_STR3(x_offset, norm_offset, up) + (weight_input < 0 ? "" : "," + VARS_TO_STR2(weight_input, weight_offset));
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto weight = [&](int64_t cols, int64_t rows, int input) {
+            if (weight_input != input) {
+                return ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, cols, rows);
+            }
+            ggml_tensor * base = ggml_new_tensor_1d(ctx, GGML_TYPE_BF16, cols*rows + weight_offset/sizeof(ggml_bf16_t));
+            return ggml_view_2d(ctx, base, cols, rows, cols*sizeof(ggml_bf16_t), weight_offset);
+        };
         ggml_tensor * x_base = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4*n_embd + x_offset/sizeof(float));
         ggml_tensor * norm_base = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4*n_embd + norm_offset/sizeof(float));
         ggml_tensor * x = ggml_view_3d(ctx, x_base, n_embd, 4, 1, n_embd*sizeof(float), 4*n_embd*sizeof(float), x_offset);
         ggml_tensor * wn = ggml_view_2d(ctx, norm_base, n_embd, 4, n_embd*sizeof(float), norm_offset);
-        ggml_tensor * wd = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, 4*n_embd, R);
-        ggml_tensor * wi = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, 4*n_embd, 4);
+        ggml_tensor * wd = weight(4*n_embd, R, 0);
+        ggml_tensor * wi = weight(4*n_embd, 4, 1);
         ggml_set_name(wn, "w_norm");
         ggml_set_name(wd, "w_down");
         ggml_set_name(wi, "w_inject");
@@ -5390,7 +5401,7 @@ struct test_dsv4_hc_alignment : public test_dsv4_hc_fused {
         if (!up) {
             return down;
         }
-        ggml_tensor * wu = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, R, 4*n_embd);
+        ggml_tensor * wu = weight(R, 4*n_embd, 2);
         ggml_set_name(wu, "w_up");
         return ggml_dsv4_hc_up(ctx, x, wn, down, wu, 0.25f);
     }
@@ -15289,6 +15300,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             for (bool up : {false, true}) {
                 test_cases.emplace_back(new test_dsv4_hc_alignment(x_offset, norm_offset, up));
             }
+        }
+    }
+    for (int weight_input : {0, 1, 2}) {
+        for (int weight_offset : {0, 2, 8, 16}) {
+            test_cases.emplace_back(new test_dsv4_hc_alignment(0, 0, weight_input == 2, weight_input, weight_offset));
         }
     }
     // [HCFUSED] real Flash-Next shapes, every token count the kernels specialize, with and without the injection rows
