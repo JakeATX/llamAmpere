@@ -19,6 +19,7 @@
 // GGML_CUDA_AIT4_RING1=1 keeps one AIT4 weight group live and takes precedence over RING2.
 // GGML_CUDA_AIT4_TAIL=1 refills the four-group weight ring after each group's IMMA work.
 // GGML_CUDA_AIT4_PACK=1 packs each AIT4 MMA tile at the base register budget and four-group ring.
+// GGML_CUDA_AIT4_UNROLL2=1 unrolls two four-group steps instead of all four steps.
 #include "ait.cuh"
 #include "ait-mm.cuh"
 #include "ai4.cuh"
@@ -373,12 +374,13 @@ static __device__ __forceinline__ void ait_st_rel(unsigned int * p, unsigned int
 // item's end, not prefetched); bit 1 = fused activation prep: the kernel itself does k_ait_actq's work (one warp per (token,
 // 512-K slice)) and zeroes Y, behind a grid barrier (cooperative launch, 1 CTA per SM); the weight ring and l2pf lines
 // (prefetch.global.L2, 128 B per lane each) are issued before the barrier; activations are then read with ld.global.cg.
-template <int KB, int NT, bool FULL, int PC = 0, int V = 0, int DEPTH = 4, bool LOW = false, bool CAP = false, bool PACK = LOW, bool NEIGHBOR = false, bool TAIL = false>
+template <int KB, int NT, bool FULL, int PC = 0, int V = 0, int DEPTH = 4, bool LOW = false, bool CAP = false, bool PACK = LOW, bool NEIGHBOR = false, bool TAIL = false, bool UNROLL2 = false>
 static __global__ void __launch_bounds__(CAP ? 256 : LOW ? 384 : 512, CAP ? 4 : LOW ? 2 : 1) k_ait_mmv(const char * __restrict__ W, const int8_t * X,
         const float * SA, float * __restrict__ Y, const int M, const int K, const float * __restrict__ XF = nullptr,
         const int l2pf = 0, float * __restrict__ partial = nullptr) {
     static_assert(!NEIGHBOR || (KB == 4 && FULL && PC == 0 && V == 0), "neighbor path requires plain full AIT4");
     static_assert(!TAIL || (KB == 4 && FULL && PC == 0 && V == 0 && !PACK && !NEIGHBOR), "tail refill requires plain full AIT4");
+    static_assert(!UNROLL2 || (KB == 4 && FULL && PC == 0 && V == 0 && DEPTH == 4 && !LOW && !CAP && !PACK && !NEIGHBOR && !TAIL), "two-step unroll requires plain full AIT4");
     constexpr bool CO = (V & 2) != 0;
     using namespace aitk;
     constexpr int BQ = 8 * KB, GB = 16 * BQ, CS = 2048 * KB + 64, MU = 2;
@@ -516,7 +518,15 @@ static __global__ void __launch_bounds__(CAP ? 256 : LOW ? 384 : 512, CAP ? 4 : 
                 rp[u] = (uint32_t) __ldg(sb + g) | ((uint32_t) __ldg(sb + g + 8) << 16);
             }
         }
-        if constexpr (FULL) {
+        if constexpr (UNROLL2) {
+#pragma unroll 2
+            for (int G4 = 0; G4 < 16; G4 += 4) {
+                ait_group<KB, NT, 0>(buf, G4 + 0, G4 + 4 < 16 || more, gp, off, r, xs, live, c);
+                ait_group<KB, NT, 1>(buf, G4 + 1, G4 + 5 < 16 || more, gp, off, r, xs, live, c);
+                ait_group<KB, NT, 2>(buf, G4 + 2, G4 + 6 < 16 || more, gp, off, r, xs, live, c);
+                ait_group<KB, NT, 3>(buf, G4 + 3, G4 + 7 < 16 || more, gp, off, r, xs, live, c);
+            }
+        } else if constexpr (FULL) {
 #pragma unroll
             for (int G4 = 0; G4 < 16; G4 += 4) {
                 ait_group<KB, NT, 0 % DEPTH, PC, CO, DEPTH, PACK, false, NEIGHBOR, TAIL>(buf, G4 + 0, G4 + DEPTH < 16 || more, gp, off, r, xs, live, c, tsm, lo);
@@ -805,6 +815,12 @@ static void ait_fast_nt(ggml_backend_cuda_context & ctx, const uint8_t * W, cons
         }
     }
     k_ait_actq<NT><<<NT * S, 64, 0, stream>>>(X, W, xq.get(), sa.get(), ordered ? nullptr : Y, M, K, k);
+    static const bool unroll4_two = ait_env_int("GGML_CUDA_AIT4_UNROLL2", 0) == 1;
+    if (unroll4_two && k == 4 && code == 0 && full && warps <= 12 && occ == 0) {
+        k_ait_mmv<4, NT, true, 0, 0, 4, false, false, false, false, false, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
+        finish();
+        return;
+    }
     static const bool pack4 = ait_env_int("GGML_CUDA_AIT4_PACK", 0) == 1;
     if (pack4 && k == 4 && code == 0 && full && warps <= 12 && occ == 0) {
         k_ait_mmv<4, NT, true, 0, 0, 4, false, false, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
