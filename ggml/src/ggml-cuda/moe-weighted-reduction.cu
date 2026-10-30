@@ -159,4 +159,12 @@ void ggml_cuda_op_moe_bank_joint_reduction(ggml_backend_cuda_context & ctx,
         (const float *) hot->data, (const float *) cold->data, (const float *) hot_weights->data,
         (const float *) cold_weights->data, (float *) dst->data, hot->ne[0], (int) hot->ne[1]);
     CUDA_CHECK(cudaGetLastError());
+    static const bool trace = [] {
+        const char * value = getenv("GGML_CUDA_MOE_BANK_JOINT_TRACE");
+        return value && atoi(value) != 0;
+    }();
+    if (trace) {
+        GGML_LOG_INFO("[moe-bank-joint] launch n_embd=%lld n_used=%lld n_tokens=%lld\n",
+                (long long) hot->ne[0], (long long) hot->ne[1], (long long) hot->ne[2]);
+    }
 }
