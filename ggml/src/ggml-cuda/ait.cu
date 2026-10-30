@@ -534,16 +534,18 @@ static __global__ void __launch_bounds__(CAP ? 256 : LOW || BOUNDS ? 384 : 512, 
             if (n0 + 1 < NT) { s1 = CO ? __ldcg(SA + (n0 + 1) * S + ks) : __ldg(SA + (n0 + 1) * S + ks); }
             // Adjacent K slices use the same row scales; a warp may start on the odd slice.
             if (!NEIGHBOR || V != 5 || it == i0 || (ks & 1) == 0) {
+                if constexpr (NEIGHBOR && V == 5) {
+                    const unsigned short * sb = (const unsigned short *) (gp - (ks & 1) * CS + 2048 * KB);
+                    const int row = g + ((q & 1) << 3);
+                    // Pack both row tiles so one shuffle supplies their peer scales.
+                    const uint32_t rows = (uint32_t) __ldg(sb + row) | ((uint32_t) __ldg(sb + CS / 2 + row) << 16);
+                    const uint32_t peer = __shfl_xor_sync(0xffffffffu, rows, 1);
+                    rp[0] = __byte_perm(rows, peer, (q & 1) ? 0x1054 : 0x5410);
+                    rp[1] = __byte_perm(rows, peer, (q & 1) ? 0x3276 : 0x7632);
+                } else {
 #pragma unroll
-                for (int u = 0; u < MU; ++u) {
-                    // gp already points to slice (t, ks); both members share the even slice's scales.
-                    const char * side = NEIGHBOR && V == 5 ? gp + (u - (ks & 1)) * CS : W + ((int64_t) t * S + (ks & ~1) + u) * CS;
-                    const unsigned short * sb = (const unsigned short *) (side + 2048 * KB);
-                    if constexpr (NEIGHBOR && V == 5) {
-                        const uint32_t row = __ldg(sb + g + ((q & 1) << 3));
-                        const uint32_t peer = __shfl_xor_sync(0xffffffffu, row, 1);
-                        rp[u] = __byte_perm(row, peer, (q & 1) ? 0x1054 : 0x5410);
-                    } else {
+                    for (int u = 0; u < MU; ++u) {
+                        const unsigned short * sb = (const unsigned short *) (W + ((int64_t) t * S + (ks & ~1) + u) * CS + 2048 * KB);
                         rp[u] = (uint32_t) __ldg(sb + g) | ((uint32_t) __ldg(sb + g + 8) << 16);
                     }
                 }
