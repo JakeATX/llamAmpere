@@ -2485,38 +2485,29 @@ private:
             params_base.cache_ram_mib = 0;
         }
 
-        if (params_base.cache_ram_mib != 0) {
-            int32_t cache_ram_mib = params_base.cache_ram_mib;
-            if (cache_ram_mib == COMMON_CACHE_RAM_AUTO) {
-                // no --cache-ram: size the RAM tier from the host's total memory, clamped to half of what is free
-                uint64_t total_host = 0, avail_host = 0;
-                common_host_memory(total_host, avail_host);
-                std::string why;
-                cache_ram_mib = common_prompt_cache_ram_auto_mib(total_host, avail_host, why);
-                if (llama_model_moe_arena_size(model_tgt) > 0) {
-                    const uint64_t reserve = 11ull << 30;
-                    const uint64_t spare = avail_host > reserve ? avail_host - reserve : 0;
-                    cache_ram_mib = (int32_t)std::min<uint64_t>(cache_ram_mib, spare >> 20);
-                    why += ", expert arena keeps 11 GiB host headroom";
-                }
-                SRV_INF("prompt cache RAM tier: %d MiB (auto: %s; set --cache-ram N to override, 0 disables the prompt cache)\n",
-                        cache_ram_mib, why.c_str());
-            } else if (cache_ram_mib < 0) {
-                // "no limit" must still be bounded by the machine: every cached prompt is a full copy of a
-                // sequence's KV state in host memory (14 GiB for a 220k-token f16 cache on a 27B model),
-                // and an unbounded cache swaps the box to death long before it helps anyone.
-                // Take half of what the host has free when the server starts.
-                size_t free_host = 0, total_host = 0;
-                if (auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) {
-                    ggml_backend_dev_memory(cpu_dev, &free_host, &total_host);
-                }
-                cache_ram_mib = free_host > 0 ? (int32_t) std::min<size_t>(free_host / 2 / (1024*1024), INT32_MAX) : 8192;
-                SRV_INF("prompt cache is enabled with no explicit limit, bounding it to %d MiB (half of the %.1f GiB of free host memory)\n",
-                        cache_ram_mib, free_host / (1024.0*1024.0*1024.0));
-            } else {
-                SRV_INF("prompt cache is enabled, size limit: %d MiB\n", cache_ram_mib);
+        int32_t cache_ram_mib = params_base.cache_ram_mib;
+        if (cache_ram_mib != 0) {
+            // Snapshot after the target/draft contexts, speculative state and batch
+            // have loaded. Existing bank/staging RAM is already debited here.
+            uint64_t total_host = 0, avail_host = 0;
+            common_host_memory(total_host, avail_host);
+            std::string why;
+            cache_ram_mib = common_fit_prompt_cache_ram_mib(total_host, avail_host,
+                    cache_ram_mib, params_base.fit_params, why);
+            if (!params_base.fit_params && params_base.cache_ram_mib == COMMON_CACHE_RAM_AUTO &&
+                    llama_model_moe_arena_size(model_tgt) > 0) {
+                const uint64_t reserve = 11ull << 30;
+                const uint64_t spare = avail_host > reserve ? avail_host - reserve : 0;
+                cache_ram_mib = (int32_t) std::min<uint64_t>(cache_ram_mib, spare >> 20);
+                why += ", expert arena keeps 11 GiB host headroom";
             }
+            SRV_INF("prompt cache RAM tier: %d MiB (%s; set --cache-ram N to override, 0 disables it)\n",
+                    cache_ram_mib, why.c_str());
+        }
 
+        // server_prompt_cache(0) means unlimited internally, so never construct
+        // it when RAM fit disables this optional cache.
+        if (cache_ram_mib > 0) {
             prompt_cache = std::make_unique<server_prompt_cache>(cache_ram_mib, n_ctx);
 
             prompt_cache->ram_ckpt_keep = (size_t) params_base.cache_ram_ckpt;
@@ -2550,7 +2541,7 @@ private:
                 SRV_INF("%s", "prompt cache disk tier is disabled\n");
             }
         } else {
-            SRV_INF("%s", "prompt cache is disabled (--cache-ram 0)\n");
+            SRV_INF("%s", "prompt cache is disabled (explicit setting or RAM fit)\n");
         }
 
         // [EVALFLAG] eval cache: a folder of pre-built prompt states; a folder built for other settings is refused

@@ -58,6 +58,33 @@ common_fit_ram_result common_fit_ram_plan(uint64_t available,
     return result;
 }
 
+int32_t common_fit_prompt_cache_ram_mib(uint64_t total, uint64_t available,
+        int32_t requested_mib, bool fit, std::string & why) {
+    constexpr uint64_t MiB = 1ull << 20;
+    if (requested_mib != COMMON_CACHE_RAM_AUTO) {
+        // -1 explicitly requests half the free host memory, not unlimited RAM.
+        const int32_t resolved = requested_mib < 0 ?
+            (int32_t) std::min<uint64_t>(available / (2 * MiB), INT32_MAX) : requested_mib;
+        why = requested_mib < 0 ? "explicit half of available RAM" : "explicit cache limit";
+        if (fit && (available < (5ull << 30) || uint64_t(resolved) * MiB > available - (5ull << 30))) {
+            why += "; cannot leave 5 GiB free with this explicit setting";
+        }
+        return resolved;
+    }
+    const int32_t tier = common_prompt_cache_ram_auto_mib(total, available, why);
+    if (!fit) {
+        return tier;
+    }
+    std::array<common_fit_ram_request, COMMON_FIT_RAM_COUNT> requests = {};
+    requests[COMMON_FIT_RAM_PROMPT].bytes = uint64_t(tier) * MiB;
+    const auto plan = common_fit_ram_plan(available, requests);
+    const int32_t resolved = (int32_t) (plan.bytes[COMMON_FIT_RAM_PROMPT] / MiB);
+    why += (resolved < tier || !plan.floor_met) ?
+        "; prompt cache reduced to leave 5 GiB free and retain the RAM fit reserve" :
+        "; within the RAM fit budget after model and context allocations";
+    return resolved;
+}
+
 size_t common_fit_vram_floor(bool display_attached) {
     return (display_attached ? 800u : 300u) * size_t(1024 * 1024);
 }

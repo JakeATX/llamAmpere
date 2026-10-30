@@ -1037,6 +1037,7 @@ bool common_host_memory(uint64_t & total, uint64_t & available) {
     available = total;
 #else
     std::ifstream f("/proc/meminfo");
+    bool available_read = false;
     std::string   key;
     uint64_t      value = 0;
     std::string   unit;
@@ -1045,6 +1046,7 @@ bool common_host_memory(uint64_t & total, uint64_t & available) {
             total = value * 1024;
         } else if (key == "MemAvailable:") {
             available = value * 1024;
+            available_read = true;
         }
     }
     if (total == 0) {
@@ -1054,8 +1056,8 @@ bool common_host_memory(uint64_t & total, uint64_t & available) {
             total = (uint64_t) pages * (uint64_t) psize;
         }
     }
-    if (available == 0) {
-        available = total;
+    if (!available_read) {
+        return false; // unknown free RAM: callers must not budget from MemTotal
     }
 #endif
     return total > 0;

@@ -1,5 +1,6 @@
 #include "fit.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 
@@ -31,7 +32,9 @@ static void test_ram_fit() {
         }
         expect(plan.floor_met && plan.floor == 5 * GiB, "all host sizes retain the five GiB floor");
         expect(sum <= available - 5 * GiB, "optional consumers leave five GiB free");
-        expect(sum <= plan.automatic_budget, "allocations stay within the shared automatic budget");
+        const uint64_t expected_budget = ((available / MiB - 5120) * 4 / 5) * MiB;
+        expect(plan.automatic_budget == expected_budget, "reported budget keeps independently calculated twenty percent reserve");
+        expect(sum <= expected_budget, "automatic allocations keep independently calculated twenty percent reserve");
         expect(plan.bytes[COMMON_FIT_RAM_PROMPT] > previous_prompt, "cache defaults grow with available host RAM");
         expect(plan.bytes[COMMON_FIT_RAM_EXPERTS] > plan.bytes[COMMON_FIT_RAM_PROMPT], "expert storage gets priority");
         previous_prompt = plan.bytes[COMMON_FIT_RAM_PROMPT];
@@ -41,6 +44,13 @@ static void test_ram_fit() {
     requests[COMMON_FIT_RAM_PROMPT] = {123 * MiB, true};
     requests[COMMON_FIT_RAM_EXPERTS].bytes = 0;
     const auto explicit_plan = common_fit_ram_plan(16 * GiB, requests);
+    const uint64_t explicit_budget = ((16 * 1024 - 5120 - 123) * 4ull / 5) * MiB;
+    uint64_t explicit_auto = 0;
+    for (size_t i = 0; i < explicit_plan.bytes.size(); ++i) {
+        if (i != COMMON_FIT_RAM_PROMPT) { explicit_auto += explicit_plan.bytes[i]; }
+    }
+    expect(explicit_plan.automatic_budget == explicit_budget && explicit_auto <= explicit_budget,
+            "explicit bytes are debited before independently calculated eighty percent budget");
     expect(explicit_plan.bytes[COMMON_FIT_RAM_PROMPT] == 123 * MiB, "explicit prompt limit wins exactly");
     expect(explicit_plan.bytes[COMMON_FIT_RAM_EXPERTS] == 0, "unused expert bank stays off");
     expect(explicit_plan.bytes[COMMON_FIT_RAM_STAGING] > explicit_plan.bytes[COMMON_FIT_RAM_PREFETCH], "unused first-priority quota goes to staging");
@@ -57,6 +67,8 @@ static void test_ram_fit() {
     const auto too_large = common_fit_ram_plan(16 * GiB, requests);
     expect(!too_large.floor_met && too_large.automatic_budget == 0, "unsafe explicit demand cannot claim a safe fit");
     expect(too_large.bytes[COMMON_FIT_RAM_PROMPT] == 12 * GiB, "unsafe explicit demand is reported unchanged");
+    const auto odd = common_fit_ram_plan(5 * GiB + 11 * MiB + 999, {});
+    expect(odd.automatic_budget == 8 * MiB, "fractional MiB and fifths round down before budgeting");
     const auto large = common_fit_ram_plan(UINT64_MAX, requests);
     uint64_t left = UINT64_MAX - large.floor;
     for (uint64_t bytes : large.bytes) {
@@ -67,8 +79,37 @@ static void test_ram_fit() {
     expect(common_fit_vram_floor(true) == 800 * MiB, "display VRAM floor is 800 MiB");
 }
 
+static void test_ram_prompt_fit() {
+    constexpr uint64_t GiB = 1ull << 30;
+    std::string why;
+    for (uint64_t host_gib : {16, 32, 64, 128}) {
+        const uint64_t available = (host_gib - 6) * GiB;
+        const int32_t actual = common_fit_prompt_cache_ram_mib(host_gib * GiB, available, -2, true, why);
+        const uint64_t budget_mib = (available / (1ull << 20) - 5120) * 4 / 5;
+        const int32_t tier = host_gib == 16 ? 4096 : host_gib == 32 ? 8192 : host_gib == 64 ? 12288 : 20480;
+        // Only prompt cache is pending here: earlier allocated bank/staging are
+        // already in MemAvailable, and their unused quotas flow down to prompt.
+        const uint64_t prompt_quota = budget_mib * 50 / 100 + budget_mib * 10 / 100 +
+                                      budget_mib * 10 / 100 + budget_mib * 20 / 100;
+        expect(actual == (int32_t) std::min<uint64_t>(tier, prompt_quota), "startup prompt size follows shared budget after model/context use");
+        expect(available - (uint64_t(actual) << 20) >= 5 * GiB, "startup prompt preserves five GiB floor");
+    }
+    expect(common_fit_prompt_cache_ram_mib(16 * GiB, 5 * GiB, -2, true, why) == 0,
+            "startup disables automatic prompt cache at RAM floor");
+    expect(common_fit_prompt_cache_ram_mib(0, 0, -2, true, why) == 0, "unknown available RAM disables automatic prompt cache under fit");
+    expect(why.find("5 GiB") != std::string::npos, "low-RAM log explains prompt cache reduction and floor");
+    expect(common_fit_prompt_cache_ram_mib(16 * GiB, 4 * GiB, 123, true, why) == 123,
+            "explicit prompt limit wins even when RAM floor cannot be met");
+    expect(why.find("cannot") != std::string::npos, "unsafe explicit prompt limit reports infeasible floor");
+    expect(common_fit_prompt_cache_ram_mib(16 * GiB, 8 * GiB, 0, true, why) == 0, "explicit cache disable wins");
+    expect(common_fit_prompt_cache_ram_mib(16 * GiB, 8 * GiB, -1, true, why) == 4096, "explicit half-free setting keeps its meaning");
+    expect(common_fit_prompt_cache_ram_mib(16 * GiB, 6 * GiB, -2, false, why) == 3072,
+            "fit off keeps prior tier and half-available clamp");
+}
+
 int main() {
     test_ram_fit();
+    test_ram_prompt_fit();
     constexpr size_t MiB = 1024*1024;
 
     // Qwen3.5 27B MTP draft with f16 KV, 4 sequences, unified KV: one nextn layer of 4 KV heads x 256 dims,
