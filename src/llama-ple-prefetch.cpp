@@ -236,7 +236,7 @@ void llama_ple_prefetch::begin(llama_pos pos0) {
     seq_start = pos0 == 0;
     hinted    = false;
     // fork: use ubatch chunks so the coalesced read-ahead gate can advance with the gather.
-    chunk_size = coalesce ? std::max<size_t>(CHUNK, coalesce_window ? n_ubatch : n) : CHUNK;
+    chunk_size = coalesce_window ? std::max<size_t>(1, n_ubatch) : coalesce ? std::max<size_t>(CHUNK, n) : CHUNK;
 
     // A row can start within a page and can span more than two pages.
     const uint64_t pages_per_row = 1 + (row_size - 1)/4096 + ((row_size - 1)%4096 != 0);

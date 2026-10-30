@@ -1088,23 +1088,30 @@ static void deferred_mask_capacity_case() {
     printf("OK: 64 pending masks preserved, 65th falls back, all host mask bytes exact\n");
 }
 
-static void ple_hash_pages_case(bool windowed = false, bool bounded = false, bool coalesced = false) {
+static void ple_hash_pages_case(bool windowed = false, bool bounded = false, bool coalesced = false, size_t coalesce_chunk = 384) {
 #if defined(__linux__)
     for (uint32_t n_gram : { 4, 8 }) {
         for (llama_pos pos0 : { 0, 23 }) {
             const uint32_t per_gram = 2, vocab = coalesced ? 4093 : 1021, eos = 997;
             const uint32_t n_heads = (n_gram - 1)*per_gram, n_rows = n_heads*vocab;
-            const size_t chunk = coalesced ? 384 : 256;
+            const size_t chunk = coalesced ? coalesce_chunk : 256;
             const size_t n_tokens = 3*chunk + 17, size = (size_t) n_rows*4096;
-            char path[] = "/tmp/llama-ple-window-XXXXXX";
-            std::unique_ptr<char, void(*)(char *)> cleanup(coalesced ? path : nullptr, [](char * p) { unlink(p); });
+            const char * tmp_dir = getenv("TMPDIR");
+            std::string path = std::string(tmp_dir ? tmp_dir : ".") + "/llama-ple-window-XXXXXX";
+            std::unique_ptr<char, void(*)(char *)> cleanup(coalesced ? &path[0] : nullptr, [](char * p) { unlink(p); });
             std::unique_ptr<FILE, int(*)(FILE *)> file(nullptr, fclose);
             if (coalesced) {
-                const int fd = mkstemp(path);
+                const int fd = mkstemp(&path[0]);
                 require(fd >= 0, "coalesced page file");
                 file.reset(fdopen(fd, "w+"));
                 if (!file) { close(fd); }
                 require(file != nullptr && ftruncate(fd, size) == 0, "coalesced page file size");
+                // Sparse tmpfs reads do not populate the page cache; use real pages and require a cold start.
+                const std::vector<char> data(4096, 0x5a);
+                for (size_t off = 0; off < size; off += data.size()) {
+                    require(pwrite(fd, data.data(), data.size(), off) == (ssize_t) data.size(), "coalesced page file contents");
+                }
+                require(fsync(fd) == 0 && posix_fadvise(fd, 0, size, POSIX_FADV_DONTNEED) == 0, "coalesced page file flushed and evicted");
             }
             void * pages = mmap(nullptr, size, PROT_READ | PROT_WRITE,
                     coalesced ? MAP_SHARED : MAP_PRIVATE | MAP_ANONYMOUS, coalesced ? fileno(file.get()) : -1, 0);
@@ -1137,6 +1144,12 @@ static void ple_hash_pages_case(bool windowed = false, bool bounded = false, boo
                 tokens[i] = i % 127 == 0 ? eos : i % 131 == 0 ? LLAMA_TOKEN_NULL : (i*179 + i*i*13) % eos;
             }
             std::vector<unsigned char> expected(n_rows, 0), resident(n_rows);
+            if (coalesced) {
+                require(mincore(pages, size, resident.data()) == 0, "initial coalesced page residency");
+                for (unsigned char page : resident) {
+                    require(!(page & 1), "coalesced page file must start cold; set TMPDIR to a disk filesystem");
+                }
+            }
             std::vector<size_t> first_chunk(n_rows, n_tokens);
             for (size_t i = 0; i < n_tokens; ++i) {
                 for (uint32_t g = 2; g <= n_gram; ++g) {
@@ -1197,7 +1210,7 @@ static void ple_hash_pages_case(bool windowed = false, bool bounded = false, boo
                     "prefetch ubatch cap limits the effective token window");
             require(!coalesced || startup.find("coalesced pread") != std::string::npos, "file-backed coalescing active");
             pf->hint(tokens.data(), tokens.size(), pos0);
-            const size_t consume_size = windowed ? 113 : 256;
+            const size_t consume_size = coalesced ? std::min<size_t>(113, chunk) : windowed ? 113 : 256;
             size_t future_checks = 0;
             for (size_t i = 0; i < n_tokens; i += consume_size) {
                 const size_t count = std::min(consume_size, n_tokens - i);
@@ -1426,7 +1439,10 @@ static void ple_cold_recheck_case() {
 int main(int argc, char ** argv) {
     if (argc > 1 && strcmp(argv[1], "--ple-coalesce-window") == 0) {
         try {
-            ple_hash_pages_case(true, true, true);
+            for (size_t chunk : { 384, 128, 1 }) {
+                ple_hash_pages_case(true, true, true, chunk);
+            }
+            printf("OK: coalesced windows cover 1, 128 and 384 token ubatches\n");
             return 0;
         } catch (const std::exception & e) {
             fprintf(stderr, "prefetch coalesced window: FAIL: %s\n", e.what());
