@@ -365,7 +365,7 @@ static __device__ __forceinline__ void hcf_up_q8_block(const float xi, block_q8_
     y->ds = make_half2(d, d * sum);
 }
 
-template <int T, int Q = 0, int W = HCF_UP_WARPS>
+template <int T, int Q = 0, int W = HCF_UP_WARPS, int PRE = HCF_UP_PRE>
 static __global__ void __launch_bounds__(W*WARP_SIZE, 32/W)
 hcf_up_gate(
         const float * __restrict__ x, const float * __restrict__ wn,
@@ -388,9 +388,9 @@ hcf_up_gate(
     const uint4 * rp = (const uint4 * ) (wu + (int64_t) j*su);
     const int n_it = R/64;  // uint4 (8 values) per lane per pass, 8 lanes per row
 
-    uint4 wv[HCF_UP_PRE];
+    uint4 wv[PRE];
 #pragma unroll
-    for (int it = 0; it < HCF_UP_PRE; ++it) {
+    for (int it = 0; it < PRE; ++it) {
         wv[it] = (live && it < n_it) ? rp[it*8 + l8] : make_uint4(0, 0, 0, 0);
     }
     float xn[T];
@@ -424,7 +424,7 @@ hcf_up_gate(
             break;
         }
         const int    u  = it*8 + l8;
-        const uint4  q  = it < HCF_UP_PRE ? wv[it < HCF_UP_PRE ? it : 0] : rp[u];
+        const uint4  q  = it < PRE ? wv[it < PRE ? it : 0] : rp[u];
         const float  w0 = hcf_bf16_lo(q.x), w1 = hcf_bf16_hi(q.x), w2 = hcf_bf16_lo(q.y), w3 = hcf_bf16_hi(q.y);
         const float  w4 = hcf_bf16_lo(q.z), w5 = hcf_bf16_hi(q.z), w6 = hcf_bf16_lo(q.w), w7 = hcf_bf16_hi(q.w);
 #pragma unroll
@@ -616,8 +616,8 @@ static int hcf_up_cnt_slot(const ggml_backend_cuda_context & ctx) {
     return slot;
 }
 
-template <int T>
-static void hcf_up_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, void * q8, bool swizzle) {
+template <int T, int PRE>
+static void hcf_up_launch_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst, void * q8, bool swizzle) {
     const ggml_tensor * x    = dst->src[0];
     const ggml_tensor * wn   = dst->src[1];
     const ggml_tensor * down = dst->src[2];
@@ -648,7 +648,7 @@ static void hcf_up_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, vo
     const dim3 grid((n_embd + up_w - 1)/up_w);
     const dim3 block(up_w*WARP_SIZE);
     if (q8 == nullptr) {
-        auto kernel = up_w == 4 ? hcf_up_gate<T, 0, 4> : up_w == 8 ? hcf_up_gate<T, 0, 8> : hcf_up_gate<T, 0, HCF_UP_WARPS>;
+        auto kernel = up_w == 4 ? hcf_up_gate<T, 0, 4, PRE> : up_w == 8 ? hcf_up_gate<T, 0, 8, PRE> : hcf_up_gate<T, 0, HCF_UP_WARPS, PRE>;
         kernel<<<grid, block, smem, ctx.stream()>>>(
             (const float *) x->data, (const float *) wn->data, act, r,
             (const char *) wu->data, wu->nb[1], n_embd, R, out_scale, (float *) dst->data, nullptr, 0);
@@ -656,11 +656,25 @@ static void hcf_up_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, vo
         const int slot = hcf_up_cnt_slot(ctx);
         GGML_ASSERT(slot >= 0 && n_embd % QK8_1 == 0 && n_embd/QK8_1 <= HCF_UP_CNT);
         auto kernel = swizzle ?
-            (up_w == 4 ? hcf_up_gate<T, 2, 4> : up_w == 8 ? hcf_up_gate<T, 2, 8> : hcf_up_gate<T, 2, HCF_UP_WARPS>) :
-            (up_w == 4 ? hcf_up_gate<T, 1, 4> : up_w == 8 ? hcf_up_gate<T, 1, 8> : hcf_up_gate<T, 1, HCF_UP_WARPS>);
+            (up_w == 4 ? hcf_up_gate<T, 2, 4, PRE> : up_w == 8 ? hcf_up_gate<T, 2, 8, PRE> : hcf_up_gate<T, 2, HCF_UP_WARPS, PRE>) :
+            (up_w == 4 ? hcf_up_gate<T, 1, 4, PRE> : up_w == 8 ? hcf_up_gate<T, 1, 8, PRE> : hcf_up_gate<T, 1, HCF_UP_WARPS, PRE>);
         kernel<<<grid, block, smem, ctx.stream()>>>(
             (const float *) x->data, (const float *) wn->data, act, r,
             (const char *) wu->data, wu->nb[1], n_embd, R, out_scale, (float *) dst->data, (block_q8_1 *) q8, slot*HCF_UP_CNT);
+    }
+}
+
+template <int T>
+static void hcf_up_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, void * q8, bool swizzle) {
+    // Fewer early weight loads use fewer registers; the dot products keep their order.
+    static const bool preload_two = [] {
+        const char * e = getenv("LLAMA_HC_UP_PRELOAD");
+        return e != nullptr && atoi(e) == 2;
+    }();
+    if (preload_two) {
+        hcf_up_launch_impl<T, 2>(ctx, dst, q8, swizzle);
+    } else {
+        hcf_up_launch_impl<T, HCF_UP_PRE>(ctx, dst, q8, swizzle);
     }
 }
 

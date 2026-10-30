@@ -1411,6 +1411,7 @@ struct test_case {
     virtual int graph_replays() { return 1; }
     virtual bool verify_backend_result(ggml_backend_t backend) { GGML_UNUSED(backend); return true; }
     virtual bool perf_whole_graph() { return false; }
+    virtual size_t max_tensors() { return 128; }
     virtual std::vector<ggml_tensor *> fusion_test_nodes() { return {}; }
     // Name of a backend fusion counter (see ggml_backend_cuda_fusion_count) that must advance while
     // the graph runs on the tested backend. Backends without the counter are not checked.
@@ -1510,7 +1511,7 @@ struct test_case {
         mode = MODE_TEST;
 
         ggml_init_params params = {
-            /* .mem_size = */ ggml_tensor_overhead()*128 + ggml_graph_overhead(),
+            /* .mem_size = */ ggml_tensor_overhead()*max_tensors() + ggml_graph_overhead(),
             /* .mem_base = */ NULL,
             /* .no_alloc = */ true,
         };
@@ -1783,7 +1784,7 @@ struct test_case {
         static const size_t graph_nodes = 8192;
 
         ggml_init_params params = {
-            /* .mem_size = */ ggml_tensor_overhead()*128 + ggml_graph_overhead_custom(graph_nodes, false),
+            /* .mem_size = */ ggml_tensor_overhead()*max_tensors() + ggml_graph_overhead_custom(graph_nodes, false),
             /* .mem_base = */ NULL,
             /* .no_alloc = */ true,
         };
@@ -1945,7 +1946,7 @@ struct test_case {
         static const size_t graph_nodes = 8192;
 
         ggml_init_params params = {
-            /* .mem_size = */ ggml_tensor_overhead()*128 + ggml_graph_overhead_custom(graph_nodes, false),
+            /* .mem_size = */ ggml_tensor_overhead()*max_tensors() + ggml_graph_overhead_custom(graph_nodes, false),
             /* .mem_base = */ NULL,
             /* .no_alloc = */ true,
         };
@@ -1979,7 +1980,7 @@ struct test_case {
         const std::vector<float> expect = grad_expect();
 
         ggml_init_params params = {
-            /* .mem_size = */ ggml_tensor_overhead()*128 + 2*ggml_graph_overhead_custom(GGML_DEFAULT_GRAPH_SIZE, true),
+            /* .mem_size = */ ggml_tensor_overhead()*max_tensors() + 2*ggml_graph_overhead_custom(GGML_DEFAULT_GRAPH_SIZE, true),
             /* .mem_base = */ NULL,
             /* .no_alloc = */ true,
         };
@@ -5273,6 +5274,17 @@ struct test_dsv4_hc_fused : public test_case {
 
     std::string vars() override {
         return VARS_TO_STR6(n_embd, R, n_tokens, inject, fused, n_layers);
+    }
+
+    size_t max_tensors() override { return std::max<size_t>(128, 32*n_layers + 16); }
+
+    double err(const float * a, const float * b, size_t n) override {
+        const char * hash = getenv("GGML_TEST_HCF_HASH");
+        if (hash != nullptr && atoi(hash) != 0) {
+            std::lock_guard<std::mutex> guard(g_test_output_mutex);
+            printf("HCF_HASH %s values=%zu hash=%016" PRIx64 "\n", vars().c_str(), n, tbo_fnv1a(a, n*sizeof(float)));
+        }
+        return test_case::err(a, b, n);
     }
 
     bool run_whole_graph() override { return n_layers > 1 || !fused; }
@@ -15064,6 +15076,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_dsv4_hc_fused(2560, 320, nt, true, true, 2));
     }
     test_cases.emplace_back(new test_dsv4_hc_fused(512, 64, 3, true, true, 2));
+    // Cover late weight loads above both preload lengths and a chained graph above 128 tensors.
+    for (int64_t nt : { 1, 4, 5, 8 }) {
+        test_cases.emplace_back(new test_dsv4_hc_fused(512, 512, nt, true, true, 1));
+    }
+    test_cases.emplace_back(new test_dsv4_hc_fused(512, 64, 1, true, false, 16));
     // [GDNGATES] Flash-Next linear-attention gates at every token count the kernel specializes, both graph orders
     for (int64_t nt = 1; nt <= 8; ++nt) {
         test_cases.emplace_back(new test_gdn_gates(2560, 48, nt, true));
