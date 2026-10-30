@@ -467,6 +467,36 @@ def test_n_probs():
             assert "bytes" in prob and type(prob["bytes"]) == list
 
 
+@pytest.mark.parametrize("post_sampling_probs", [False, True])
+def test_n_probs_incomplete_utf8(post_sampling_probs):
+    global server
+    server.start()
+    tokenized = server.make_request("POST", "/tokenize", data={
+        "content": "\U0010ffff",
+        "with_pieces": True,
+    })
+    assert tokenized.status_code == 200
+    token = next(t for t in tokenized.body["tokens"]
+                 if isinstance(t["piece"], list) and 0xC2 <= t["piece"][0] <= 0xF4)
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "Hello",
+        "n_predict": 1,
+        "n_probs": 10,
+        "return_tokens": True,
+        "temperature": 0.0,
+        "logit_bias": [[token["id"], 1000]],
+        "post_sampling_probs": post_sampling_probs,
+        "backend_sampling": False,
+    })
+    assert res.status_code == 200
+    assert res.body["tokens"] == [token["id"]]
+    assert res.body["timings"]["predicted_n"] == 1
+    assert len(res.body["completion_probabilities"]) == 1
+    row = res.body["completion_probabilities"][0]
+    assert row["id"] == token["id"] and row["bytes"] == token["piece"]
+    assert len(row["top_probs" if post_sampling_probs else "top_logprobs"]) == 10
+
+
 def test_n_probs_stream():
     global server
     server.start()

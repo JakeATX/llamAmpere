@@ -3326,6 +3326,8 @@ private:
         }
 
         if (incomplete) {
+            // Probabilities belong to the token even while its text is pending.
+            slot.add_token(result);
             // Send the token ID now; its text waits for a complete character.
             if (slot.task->params.stream) {
                 result.text_to_send.clear();
