@@ -12,6 +12,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
+#include <stdexcept>
 
 #if defined(__linux__)
 #include <fcntl.h>
@@ -73,7 +75,8 @@ std::unique_ptr<llama_ple_prefetch> llama_ple_prefetch::create(const llama_model
     }
     const ggml_tensor * t = model.per_layer_tok_embd;
     if (model.arch != LLM_ARCH_QWEN4EXP || !t || !model.can_prefetch.count(t) || !t->data || !t->buffer ||
-            !ggml_backend_buffer_is_host(t->buffer) || model.hparams.ple_n_heads == 0 || model.hparams.ple_ngram_size < 2) {
+            !ggml_backend_buffer_is_host(t->buffer) || t->nb[1] == 0 || t->ne[1] <= 0 ||
+            model.hparams.ple_n_heads == 0 || model.hparams.ple_ngram_size < 2) {
         if (user) {
             LLAMA_LOG_WARN("%s: [PLEPF] LLAMA_PLE_PREFETCH is set but this model has no lazily mapped qwen4exp PLE table, off\n", __func__);
         }
@@ -204,8 +207,14 @@ void llama_ple_prefetch::begin(llama_pos pos0) {
     hinted    = false;
     chunk_size = coalesce ? std::max<size_t>(CHUNK, n) : CHUNK;
 
-    // the run arrays at their upper bound (each row touches at most two pages); written front to back only
-    const size_t cap = n*(size_t) model->hparams.ple_n_heads*2 + 1;
+    // A row can start within a page and can span more than two pages.
+    const uint64_t pages_per_row = 1 + (row_size - 1)/4096 + ((row_size - 1)%4096 != 0);
+    const size_t max_runs = std::numeric_limits<size_t>::max()/sizeof(uint64_t) - 1;
+    const size_t n_heads = model->hparams.ple_n_heads;
+    if (pages_per_row > max_runs || n > max_runs/n_heads || n*n_heads > max_runs/pages_per_row) {
+        throw std::length_error("PLE prefetch page count exceeds array size");
+    }
+    const size_t cap = n*n_heads*(size_t) pages_per_row + 1;
     run_key.reset(new uint64_t[cap]);
     run_len.reset(new uint32_t[cap]);
     run_chunk.reset(new uint32_t[cap]);

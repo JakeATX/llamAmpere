@@ -1087,6 +1087,62 @@ static void deferred_mask_capacity_case() {
     printf("OK: 64 pending masks preserved, 65th falls back, all host mask bytes exact\n");
 }
 
+static void ple_wide_rows_case() {
+#if defined(__linux__)
+    for (int width : { 2048, 4096 }) {
+        const size_t n_tokens = 128;
+        const size_t size = n_tokens*width*sizeof(float) + 4096;
+        void * pages = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        require(pages != MAP_FAILED, "wide prefetch pages");
+        ggml_context * ctx = ggml_init({ 1024*1024, nullptr, true });
+        require(ctx != nullptr, "wide prefetch context");
+        auto * table = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, n_tokens);
+        table->data = static_cast<char *>(pages) + 128;
+        table->buffer = ggml_backend_cpu_buffer_from_ptr(pages, size);
+        require(table->buffer != nullptr, "wide prefetch host buffer");
+        llama_model_ptr model(llama_model_create(LLM_ARCH_QWEN4EXP, llama_model_default_params()));
+        require(model != nullptr, "wide prefetch model");
+        model->per_layer_tok_embd = table;
+        model->can_prefetch.insert(table);
+        model->hparams.ple_n_heads = 1;
+        model->hparams.ple_ngram_size = 2;
+        model->hparams.ple_heads_per_ngram = 1;
+        model->hparams.ple_eos_token_id = n_tokens - 1;
+        model->hparams.ple_layer_multipliers.fill(0);
+        model->hparams.ple_layer_multipliers[0] = 1;
+        model->hparams.ple_head_vocab_sizes[0] = n_tokens;
+        model->hparams.ple_head_offsets[0] = 0;
+        std::vector<llama_token> tokens(n_tokens);
+        for (size_t i = 0; i < n_tokens; ++i) {
+            tokens[i] = i;
+        }
+        setenv("LLAMA_PLE_PREFETCH", "1", 1);
+        setenv("LLAMA_PLE_PF_MIN", "1", 1);
+        setenv("LLAMA_PLE_PF_MODE", "fault", 1);
+        setenv("LLAMA_PLE_PF_AHEAD", "1000000", 1);
+        setenv("LLAMA_PLE_PF_COLD_THREADS", "0", 1);
+        auto pf = llama_ple_prefetch::create(*model, n_tokens);
+        require(pf != nullptr, "wide row page prefetch created");
+        pf->hint(tokens.data(), tokens.size(), 0);
+        require(pf->consume(n_tokens, nullptr, 0), "wide row pages consumed");
+        pf->stop();
+        std::vector<unsigned char> resident(size/4096);
+        require(mincore(pages, size, resident.data()) == 0, "wide row page residency");
+        for (unsigned char page : resident) {
+            require((page & 1) != 0, "every wide row page was read");
+        }
+        pf.reset();
+        model.reset();
+        ggml_backend_buffer_free(table->buffer);
+        ggml_free(ctx);
+        munmap(pages, size);
+    }
+    printf("OK: unaligned 8KiB and 16KiB prefetch rows cover every page\n");
+#else
+    printf("SKIP: wide prefetch page test needs Linux\n");
+#endif
+}
+
 static void ple_cold_recheck_case() {
 #if defined(__linux__)
     ggml_context * ctx = ggml_init({ 1024*1024, nullptr, true });
@@ -1146,6 +1202,15 @@ static void ple_cold_recheck_case() {
 }
 
 int main(int argc, char ** argv) {
+    if (argc > 1 && strcmp(argv[1], "--ple-wide-rows") == 0) {
+        try {
+            ple_wide_rows_case();
+            return 0;
+        } catch (const std::exception & e) {
+            fprintf(stderr, "prefetch wide rows: FAIL: %s\n", e.what());
+            return 1;
+        }
+    }
     if (argc > 1 && strcmp(argv[1], "--ple-cold-recheck") == 0) {
         try {
             ple_cold_recheck_case();
