@@ -492,6 +492,7 @@ struct pool_state {
     int iq_variant = -1;       // moe_iq::get variant bits (GGML_MOE_CPU_SPLIT_ROWS: 1 = best mix, 2..17 = bits + 2)
     int iq_pf = 0;             // GGML_MOE_CPU_SPLIT_PF: prefetch distance of those kernels in bytes (0 = off)
     bool schedule = false;    // Assign quantization rows directly and claim math tiles in small groups.
+    int waitpf = 0;           // GGML_MOE_CPU_SPLIT_WAITPF: KiB of its first tile a worker prefetches while it waits at a phase barrier (0 = off)
     bool host_help = false;
     int host_cpu = -1;
     std::atomic<int> help_phase{-1}; // -1 closed, 1/3 open, 5/7 held by a helper
@@ -739,6 +740,39 @@ void run_item(pool_state & s, int phase, int item) {
     }
 }
 
+// waitpf: with the first tile of the up/gate and down phases handed out by worker number, a worker that finishes
+// early at the previous barrier already knows which weight rows it reads next and pulls them toward its cache
+// while the slower workers finish, instead of spinning on a pause instruction.
+struct pf_cursor {
+    const char * base[2] = {nullptr, nullptr};
+    size_t len = 0, at = 0;
+};
+
+pf_cursor pf_tile(pool_state & s, int phase, int item) {
+    pf_cursor c;
+    if (!s.waitpf || (phase != 1 && phase != 3) || item >= items_of(s, phase)) { return c; }
+    const layer_math & L = *s.cur;
+    const bool ug = phase == 1;
+    const role_math & m = L.role[ug ? 0 : 2];
+    const int rows = ug ? s.rows_ug : s.rows_down;
+    const int blocks = (int) ((m.r.n_out + rows - 1) / rows);
+    const int64_t r0 = (int64_t) (item % blocks) * rows;
+    const int e = s.expert[item / blocks];
+    c.len = std::min<size_t>((size_t) std::min<int64_t>(rows, m.r.n_out - r0) * m.r.row_bytes, (size_t) s.waitpf * 1024);
+    c.base[0] = role_row(s, m, e, r0);
+    if (ug) { c.base[1] = role_row(s, L.role[1], e, r0); }
+    return c;
+}
+
+// Issues up to four lines of the tile (alternating up and gate); false once the tile is covered.
+bool pf_step(pf_cursor & c) {
+    for (int k = 0; k < 4 && c.at < c.len; ++k) {
+        for (int j = 0; j < 2; ++j) { if (c.base[j]) { __builtin_prefetch(c.base[j] + c.at, 0, 3); } }
+        c.at += 64;
+    }
+    return c.at < c.len;
+}
+
 // Every thread runs all four phases of job number `n` (1-based); the fin counters only grow, so a thread that is
 // late to notice a finished phase never misses it.
 void run_job_phases(pool_state & s, unsigned long long n, int worker, bool lead = false) {
@@ -750,6 +784,7 @@ void run_job_phases(pool_state & s, unsigned long long n, int worker, bool lead 
         if (!lead) { W->lag_ns += (unsigned long long) std::max<long long>(0, ns_of(t) - s.job_t0_ns.load(std::memory_order_relaxed)); }
     }
     auto tw = t;
+    pf_cursor pf;
     for (int p = 0; p < 4; ++p) {
         const int total = items_of(s, p);
         if (s.schedule && (p == 0 || p == 2)) {
@@ -758,6 +793,7 @@ void run_job_phases(pool_state & s, unsigned long long n, int worker, bool lead 
                 run_item(s, p, it);
             }
         } else {
+            if (s.waitpf && (p == 1 || p == 3) && worker < total) { run_item(s, p, worker); }
             // Keep at least three claims per worker, with at most four adjacent tiles per claim.
             const int chunk = s.schedule ? std::max(1, std::min(4, total / (3 * s.threads))) : 1;
             for (int begin = s.next[p].fetch_add(chunk, std::memory_order_relaxed); begin < total;
@@ -791,7 +827,10 @@ void run_job_phases(pool_state & s, unsigned long long n, int worker, bool lead 
             }
         }
         if (p < 3) {
-            while (s.fin[p].load(std::memory_order_acquire) < target) { cpu_relax(); }
+            if (s.waitpf && p < 2) { pf = pf_tile(s, p == 0 ? 1 : 3, worker); }   // phase 2 keeps the down-tile cursor
+            while (s.fin[p].load(std::memory_order_acquire) < target) {
+                if (!(s.waitpf && pf_step(pf))) { cpu_relax(); }
+            }
         }
         if (lead && p == 3) {
             while (s.fin[3].load(std::memory_order_acquire) < target) { cpu_relax(); }
@@ -933,7 +972,7 @@ void leader_main(pool_state * sp, int cpu) {
                 if (input == q) { s.inputs[s.n_input++] = q; }
             }
             ++n;
-            for (int p = 0; p < 4; ++p) { s.next[p].store(0, std::memory_order_relaxed); }
+            for (int p = 0; p < 4; ++p) { s.next[p].store(s.waitpf && (p == 1 || p == 3) ? s.threads : 0, std::memory_order_relaxed); }
             if (s.wstats) { s.job_t0_ns.store(ns_of(clk::now()), std::memory_order_relaxed); }
             s.gen.store(n, std::memory_order_seq_cst);
             if (s.sleepers.load(std::memory_order_seq_cst) > 0) {
@@ -1014,6 +1053,7 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
     s.schedule = env_int("GGML_MOE_CPU_SPLIT_SCHEDULE", 0, 0, 1) != 0;
     s.host_help = env_int("GGML_MOE_CPU_SPLIT_HOST", 0, 0, 1) != 0;
     s.wstats = env_int("GGML_MOE_CPU_SPLIT_WSTATS", 0, 0, 1) != 0;
+    s.waitpf = env_int("GGML_MOE_CPU_SPLIT_WAITPF", 0, 0, 1024);
     for (int p = 0; p < 4; ++p) { s.next[p].store(0); s.fin[p].store(0); s.closed[p].store(0); }
     // Reserve the caller's actual core and keep the card-driving thread on it.
     const bool max_threads = env_int("GGML_MOE_CPU_SPLIT_MAX_THREADS", 1, 0, 1) != 0;
