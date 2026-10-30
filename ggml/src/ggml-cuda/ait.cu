@@ -861,8 +861,11 @@ static void ait_fast_nt(ggml_backend_cuda_context & ctx, const uint8_t * W, cons
     static const bool neighbor4 = ait_env_int("GGML_CUDA_AIT4_NEIGHBOR", 0) == 1;
     if (neighbor4 && k == 4 && code == 0 && full && warps <= 12 && occ == 0) {
         static const bool neighbor4_pack = ait_env_int("GGML_CUDA_AIT4_NEIGHBOR_PACK", 0) == 1;
+        static const bool neighbor4_ring2 = ait_env_int("GGML_CUDA_AIT4_NEIGHBOR_RING2", 0) == 1;
         if (neighbor4_pack) {
             k_ait_mmv<4, NT, true, 0, 0, 4, false, false, true, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
+        } else if (neighbor4_ring2) {
+            k_ait_mmv<4, NT, true, 0, 0, 2, false, false, false, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
         } else {
             k_ait_mmv<4, NT, true, 0, 0, 4, false, false, false, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
         }
