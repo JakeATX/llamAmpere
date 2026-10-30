@@ -76,7 +76,7 @@ static __device__ __forceinline__ float4 hcf_post_val4(const hcf_post_fold & pf,
 // ssq [row block][n_chunks][T]    partial sums of x^2 (only row block 0 when cnt == nullptr)
 // cnt != nullptr: the last CTA to finish a row block (over all chunks) also runs the finish for its 32 rows
 // (same sums in the same order as hcf_down_finish, so the result is bit-identical to the two-kernel path).
-template <int T, bool FOLD, int HCF_DOWN_ROWS, bool WARP_FINISH = false>
+template <int T, bool FOLD, int HCF_DOWN_ROWS, bool WARP_FINISH = false, bool LATE_WEIGHTS = false>
 static __global__ void __launch_bounds__(HCF_DOWN_WARPS*WARP_SIZE)
 hcf_down_partial(
         const float * __restrict__ x, const float * __restrict__ wn,
@@ -102,7 +102,8 @@ hcf_down_partial(
     constexpr int NG = HCF_CHUNK/128;
     const int k_base = blockIdx.x*(HCF_DOWN_WARPS*HCF_DOWN_ROWS) + warp*HCF_DOWN_ROWS;
 
-    uint2 w[HCF_DOWN_ROWS][NG];
+    constexpr int NP = LATE_WEIGHTS ? 1 : NG;
+    uint2 w[HCF_DOWN_ROWS][NP];
 #pragma unroll
     for (int q = 0; q < HCF_DOWN_ROWS; ++q) {
         const int k = k_base + q;
@@ -110,12 +111,12 @@ hcf_down_partial(
             const char * row = k < R ? wd + (int64_t) k*sd : wi + (int64_t) (k - R)*si;
             const uint2 * rp = (const uint2 *) (row + (int64_t) j0*2);
 #pragma unroll
-            for (int g = 0; g < NG; ++g) {
+            for (int g = 0; g < NP; ++g) {
                 w[q][g] = rp[g*WARP_SIZE + lane];
             }
         } else {
 #pragma unroll
-            for (int g = 0; g < NG; ++g) {
+            for (int g = 0; g < NP; ++g) {
                 w[q][g] = make_uint2(0, 0);
             }
         }
@@ -177,10 +178,22 @@ hcf_down_partial(
         float wf[HCF_DOWN_ROWS][4];
 #pragma unroll
         for (int q = 0; q < HCF_DOWN_ROWS; ++q) {
-            wf[q][0] = hcf_bf16_lo(w[q][g].x);
-            wf[q][1] = hcf_bf16_hi(w[q][g].x);
-            wf[q][2] = hcf_bf16_lo(w[q][g].y);
-            wf[q][3] = hcf_bf16_hi(w[q][g].y);
+            uint2 v;
+            if constexpr (LATE_WEIGHTS) {
+                v = w[q][0];
+                if (g > 0 && k_base + q < n_rows) {
+                    const int k = k_base + q;
+                    const char * row = k < R ? wd + (int64_t) k*sd : wi + (int64_t) (k - R)*si;
+                    const uint2 * rp = (const uint2 *) (row + (int64_t) j0*2);
+                    v = rp[g*WARP_SIZE + lane];
+                }
+            } else {
+                v = w[q][g];
+            }
+            wf[q][0] = hcf_bf16_lo(v.x);
+            wf[q][1] = hcf_bf16_hi(v.x);
+            wf[q][2] = hcf_bf16_lo(v.y);
+            wf[q][3] = hcf_bf16_hi(v.y);
         }
 #pragma unroll
         for (int t = 0; t < T; ++t) {
@@ -592,6 +605,11 @@ static void hcf_down_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, 
         const char * e = getenv("LLAMA_HC_DOWN_WARP_FINISH");
         return e && atoi(e) == 1;
     }();
+    // Keep one weight group live across activation staging; fetch the rest at use.
+    static const bool late_weights = [] {
+        const char * e = getenv("LLAMA_HC_DOWN_LATE_WEIGHTS");
+        return e && atoi(e) == 1;
+    }();
     const int rows_pw = (n_rows + HCF_DOWN_WARPS*rows_env - 1)/(HCF_DOWN_WARPS*rows_env) <= HCF_CNT_RB ? rows_env : HCF_DOWN_ROWS_DEF;
     const int n_rb     = (n_rows + HCF_DOWN_WARPS*rows_pw - 1)/(HCF_DOWN_WARPS*rows_pw);
 
@@ -618,11 +636,12 @@ static void hcf_down_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, 
         pf.sp1  = hpost->src[2]->nb[1]/sizeof(float);
         GGML_ASSERT(pf.h == x->data);
     }
-    auto launch = [&](auto finish) {
+    auto launch = [&](auto finish, auto late) {
         constexpr bool WF = decltype(finish)::value;
+        constexpr bool LW = decltype(late)::value;
         auto kernel = hpost != nullptr ?
-            (rows_pw == 1 ? hcf_down_partial<T, true, 1, WF> : rows_pw == 2 ? hcf_down_partial<T, true, 2, WF> : hcf_down_partial<T, true, HCF_DOWN_ROWS_DEF, WF>) :
-            (rows_pw == 1 ? hcf_down_partial<T, false, 1, WF> : rows_pw == 2 ? hcf_down_partial<T, false, 2, WF> : hcf_down_partial<T, false, HCF_DOWN_ROWS_DEF, WF>);
+            (rows_pw == 1 ? hcf_down_partial<T, true, 1, WF, LW> : rows_pw == 2 ? hcf_down_partial<T, true, 2, WF, LW> : hcf_down_partial<T, true, HCF_DOWN_ROWS_DEF, WF, LW>) :
+            (rows_pw == 1 ? hcf_down_partial<T, false, 1, WF, LW> : rows_pw == 2 ? hcf_down_partial<T, false, 2, WF, LW> : hcf_down_partial<T, false, HCF_DOWN_ROWS_DEF, WF, LW>);
         kernel<<<grid, HCF_DOWN_WARPS*WARP_SIZE, 0, stream>>>(
             (const float *) x->data, (const float *) wn->data,
             (const char *) wd->data, wd->nb[1],
@@ -630,10 +649,18 @@ static void hcf_down_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, 
             R, n_rows, hc_dim, P.get(), ssq.get(),
             cnt_off, n_embd, eps, lo_scale, inj_scale, (float *) dst->data, pf);
     };
-    if (warp_finish) {
-        launch(std::true_type{});
+    if (late_weights) {
+        if (warp_finish) {
+            launch(std::true_type{}, std::true_type{});
+        } else {
+            launch(std::false_type{}, std::true_type{});
+        }
     } else {
-        launch(std::false_type{});
+        if (warp_finish) {
+            launch(std::true_type{}, std::false_type{});
+        } else {
+            launch(std::false_type{}, std::false_type{});
+        }
     }
 
     if (cnt_off < 0) {
