@@ -1087,7 +1087,7 @@ static void deferred_mask_capacity_case() {
     printf("OK: 64 pending masks preserved, 65th falls back, all host mask bytes exact\n");
 }
 
-static void ple_hash_pages_case(bool windowed = false) {
+static void ple_hash_pages_case(bool windowed = false, bool bounded = false) {
 #if defined(__linux__)
     for (uint32_t n_gram : { 4, 8 }) {
         for (llama_pos pos0 : { 0, 23 }) {
@@ -1151,18 +1151,29 @@ static void ple_hash_pages_case(bool windowed = false) {
             setenv("LLAMA_PLE_PREFETCH", "2", 1);
             setenv("LLAMA_PLE_PF_MIN", "1", 1);
             setenv("LLAMA_PLE_PF_MODE", "fault", 1);
-            setenv("LLAMA_PLE_PF_AHEAD", windowed ? "0" : "1000000", 1);
+            setenv("LLAMA_PLE_PF_AHEAD", windowed && !bounded ? "0" : "1000000", 1);
+            setenv("LLAMA_PLE_PF_WINDOW_UBATCHES", bounded ? "1" : "0", 1);
             setenv("LLAMA_PLE_PF_COLD_THREADS", "0", 1);
+            std::string startup;
+            llama_log_set([](ggml_log_level, const char * text, void * data) {
+                *static_cast<std::string *>(data) += text;
+            }, &startup);
             auto pf = llama_ple_prefetch::create(*model, windowed ? 1 : 256);
+            llama_log_set(nullptr, nullptr);
             require(pf != nullptr, "hash page prefetch created");
+            require(!bounded || startup.find(", 1 tokens ahead\n") != std::string::npos,
+                    "prefetch ubatch cap limits the effective token window");
             pf->hint(tokens.data(), tokens.size(), pos0);
             const size_t consume_size = windowed ? 113 : 256;
             for (size_t i = 0; i < n_tokens; i += consume_size) {
                 const size_t count = std::min(consume_size, n_tokens - i);
                 require(pf->consume(count, nullptr, 0), "hash page chunk consumed");
                 require(mincore(pages, size, resident.data()) == 0, "consumed chunk residency");
+                const size_t allowed = (i + count + (bounded ? 1 : 0) + 255)/256;
                 for (size_t r = 0; r < n_rows; ++r) {
                     require(first_chunk[r] > (i + count - 1)/256 || (resident[r] & 1), "consume waits for every page of its chunks");
+                    require(!windowed || first_chunk[r] < allowed || !(resident[r] & 1),
+                            "pages beyond the bounded window stay untouched");
                 }
             }
             std::string summary;
@@ -1195,6 +1206,9 @@ static void ple_hash_pages_case(bool windowed = false) {
     if (windowed) {
         printf("OK: batched page readers preserve exact pages and totals across short windows and a partial final batch\n");
         printf("OK: every consumed chunk has all required pages before stop joins readers\n");
+    }
+    if (bounded) {
+        printf("OK: ubatch read-ahead cap preserves ready pages and leaves future pages untouched\n");
     }
 #else
     printf("SKIP: hash page test needs Linux\n");
@@ -1374,6 +1388,9 @@ int main(int argc, char ** argv) {
     if (argc > 1 && (strcmp(argv[1], "--ple-hash-pages") == 0 || strcmp(argv[1], "--ple-batch-pages") == 0)) {
         try {
             ple_hash_pages_case(strcmp(argv[1], "--ple-batch-pages") == 0);
+            if (strcmp(argv[1], "--ple-batch-pages") == 0) {
+                ple_hash_pages_case(true, true);
+            }
             return 0;
         } catch (const std::exception & e) {
             fprintf(stderr, "prefetch hash pages: FAIL: %s\n", e.what());

@@ -117,6 +117,12 @@ std::unique_ptr<llama_ple_prefetch> llama_ple_prefetch::create(const llama_model
     pf->n_min     = (uint32_t) std::min<int64_t>(UINT32_MAX,
             std::max<int64_t>(1, ple_pf_env("LLAMA_PLE_PF_MIN", user ? 256 : PLE_PF_DEFAULT_MIN)));
     pf->n_ahead   = (uint64_t) std::max<int64_t>(0, ple_pf_env("LLAMA_PLE_PF_AHEAD", 1000000));
+    // fork: cap read-ahead in ubatches; zero keeps the existing token-based setting.
+    const int64_t window = ple_pf_env("LLAMA_PLE_PF_WINDOW_UBATCHES", 0);
+    if (window > 0) {
+        const uint64_t cap = (uint64_t) std::min<int64_t>(window, 64)*(uint64_t) n_ubatch;
+        pf->n_ahead = std::min(pf->n_ahead, cap);
+    }
     pf->n_ubatch  = n_ubatch;
     pf->row_size  = t->nb[1];
     pf->n_rows    = (uint64_t) t->ne[1];
