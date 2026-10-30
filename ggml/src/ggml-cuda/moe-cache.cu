@@ -8568,6 +8568,9 @@ static void moe_cache_swap_step(moe_cache_session & session) {
             return;
         }
     }
+    if (session.swap_broken) {
+        return;
+    }
     // A ready plan is applied one scope later; an unfinished worker never stalls decode.
     if (session.swap_decision.valid() && session.swap_decision.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
         try {
@@ -8578,6 +8581,9 @@ static void moe_cache_swap_step(moe_cache_session & session) {
             session.swap_broken = true;
             return;
         }
+    }
+    if (session.swap_broken) {
+        return;
     }
     // 2) Decide from the counters read back at an earlier scope.
     if (session.swap_counts_pending && session.swap_inflight.empty() && !session.swap_decision.valid()) {
@@ -8607,6 +8613,9 @@ static void moe_cache_swap_step(moe_cache_session & session) {
                 (void) cudaGetLastError();
             }
         }
+    }
+    if (session.swap_broken) {
+        return;
     }
     // 3) Read back this scope's counters for the next decision (async, compute stream).
     if (!session.swap_counts_pending && scope % (uint64_t)session.swap_interval == 0) {
