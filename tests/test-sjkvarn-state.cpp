@@ -1089,7 +1089,7 @@ static void deferred_mask_capacity_case() {
     printf("OK: 64 pending masks preserved, 65th falls back, all host mask bytes exact\n");
 }
 
-static void ple_hash_pages_case(bool windowed = false, bool bounded = false, bool coalesced = false, size_t ubatch_size = 384, bool populate = false, size_t table_offset = 0) {
+static void ple_hash_pages_case(bool windowed = false, bool bounded = false, bool coalesced = false, size_t ubatch_size = 384, int populate = 0, size_t table_offset = 0) {
 #if defined(__linux__)
     for (uint32_t n_gram : { 4, 8 }) {
         for (llama_pos pos0 : { 0, 23 }) {
@@ -1241,7 +1241,7 @@ static void ple_hash_pages_case(bool windowed = false, bool bounded = false, boo
             setenv("LLAMA_PLE_PF_AHEAD", coalesced || (windowed && !bounded) ? "0" : "1000000", 1);
             setenv("LLAMA_PLE_PF_WINDOW_UBATCHES", bounded ? "1" : "0", 1);
             setenv("LLAMA_PLE_PF_COLD_THREADS", "0", 1);
-            setenv("LLAMA_PLE_PF_POPULATE", populate ? "1" : "0", 1);
+            setenv("LLAMA_PLE_PF_POPULATE", std::to_string(populate).c_str(), 1);
             std::string startup;
             llama_log_set([](ggml_log_level, const char * text, void * data) {
                 *static_cast<std::string *>(data) += text;
@@ -1293,6 +1293,12 @@ static void ple_hash_pages_case(bool windowed = false, bool bounded = false, boo
             long long pages_read = -1;
             require(read_at && sscanf(read_at, " ms, %lld read", &pages_read) == 1, "prefetch page total logged");
             require(pages_read == (long long) (coalesced ? expected_reads : n_expected), "every requested page counted after readers join");
+            if (populate == 2) {
+                const char * mapped_at = strstr(summary.c_str(), "; bulk mapped runs=");
+                long long mapped_runs = 0;
+                require(mapped_at && sscanf(mapped_at, "; bulk mapped runs=%lld", &mapped_runs) == 1 && mapped_runs > 0,
+                        "bulk mapped-page path completed at least one run");
+            }
             if (bounded) {
                 // Stop a partial window, then reuse the same prefetcher for a fresh call.
                 for (int retry = 0; retry < 2; ++retry) {
@@ -1517,6 +1523,20 @@ static void ple_cold_recheck_case() {
 }
 
 int main(int argc, char ** argv) {
+    if (argc > 1 && strcmp(argv[1], "--ple-populate-bulk") == 0) {
+        try {
+            for (size_t offset : { 0, 64, 4092 }) {
+                for (size_t chunk : { 384, 128, 1 }) {
+                    ple_hash_pages_case(true, true, true, chunk, 2, offset);
+                }
+            }
+            printf("OK: bulk mapped-page population preserves exact bounded pages, PTEs, totals and EOF fallback\n");
+            return 0;
+        } catch (const std::exception & e) {
+            fprintf(stderr, "prefetch bulk populate pages: FAIL: %s\n", e.what());
+            return 1;
+        }
+    }
     if (argc > 1 && strcmp(argv[1], "--ple-populate-unaligned") == 0) {
         try {
             for (size_t offset : { 64, 4092 }) {

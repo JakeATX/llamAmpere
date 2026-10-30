@@ -148,7 +148,8 @@ std::unique_ptr<llama_ple_prefetch> llama_ple_prefetch::create(const llama_model
     pf->bounded_window = window > 0;
     pf->use_pread = mode && strcmp(mode, "fault") != 0;
     pf->use_advise = mode && strcmp(mode, "advise") == 0;
-    pf->populate = ple_pf_env("LLAMA_PLE_PF_POPULATE", 0) > 0;
+    const int64_t populate = ple_pf_env("LLAMA_PLE_PF_POPULATE", 0);
+    pf->populate = populate == 2 ? 2 : populate > 0;
 #if defined(__linux__)
     if (pf->use_pread) {
         std::string path;
@@ -285,6 +286,7 @@ void llama_ple_prefetch::begin(llama_pos pos0) {
     n_built   = 0;
     allowed_chunks = chunks_for((uint64_t) n_ubatch + n_ahead);
     n_read    = 0;
+    n_map_runs = 0;
     n_pages_all = 0;
     consumed  = 0;
     t_wait_us = 0;
@@ -486,6 +488,7 @@ int64_t llama_ple_prefetch::reader() {
     size_t buf_size = 0;
     int64_t t_last = 0;
     int64_t pages_read = 0;
+    int64_t mapped_runs = 0;
     size_t next = 0, end = 0, ready_end = 0;
     size_t done_chunk = 0;
     int64_t done_runs = 0;
@@ -566,7 +569,17 @@ int64_t llama_ple_prefetch::reader() {
                 // File reads fill the page cache, but the gather also needs mapped page-table entries.
                 const uint64_t first = std::max(off, file_off) - file_off;
                 const uint64_t limit = std::min(off + len, file_off + n_rows*row_size) - file_off;
-                for (uint64_t rel = first; rel < limit && !stopping.load(std::memory_order_relaxed);
+                bool mapped = false;
+#if defined(MADV_POPULATE_READ)
+                if (populate == 2 && first < limit && !stopping.load(std::memory_order_relaxed)) {
+                    const uintptr_t addr = (uintptr_t) ple->data + first;
+                    const uintptr_t page = addr - addr%4096;
+                    mapped = madvise((void *) page, (size_t) (addr - page + limit - first), MADV_POPULATE_READ) == 0;
+                    mapped_runs += mapped;
+                }
+#endif
+                // fork: unsupported kernels and failed bulk requests keep the page-touch fallback.
+                for (uint64_t rel = first; !mapped && rel < limit && !stopping.load(std::memory_order_relaxed);
                         rel += 4096 - ((uintptr_t) ple->data + rel)%4096) {
                     (void) *(const volatile char *) ((const char *) ple->data + rel);
                 }
@@ -592,6 +605,7 @@ int64_t llama_ple_prefetch::reader() {
     }
     flush_done();
     n_read.fetch_add(pages_read, std::memory_order_relaxed);
+    n_map_runs.fetch_add(mapped_runs, std::memory_order_relaxed);
     return t_last;
 }
 
@@ -659,9 +673,9 @@ void llama_ple_prefetch::stop() {
     hinted  = false;
 
     LLAMA_LOG_WARN("%s: [PLEPF] %zu tokens: %zu pages (%.0f MiB) in %zu reads, guessed in %.1f ms, %" PRId64 " read, last read at %.1f ms; "
-            "%d ubatches waited %.1f ms in all, %d readers%s", __func__, toks.size(), n_pages_all, n_pages_all*4096.0/1048576.0,
+            "%d ubatches waited %.1f ms in all, %d readers%s; bulk mapped runs=%" PRId64, __func__, toks.size(), n_pages_all, n_pages_all*4096.0/1048576.0,
             (size_t) n_built.load(), t_build_us.load()/1e3, n_read.load(), t_last_read_us.load()/1e3, n_ubatch_c, t_wait_us/1e3,
-            n_readers, n_ubatch_u ? " (some ubatches fell outside the call)" : "");
+            n_readers, n_ubatch_u ? " (some ubatches fell outside the call)" : "", n_map_runs.load());
     LLAMA_LOG_CONT("\n");
 
     toks.clear();
