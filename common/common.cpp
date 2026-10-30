@@ -2078,6 +2078,20 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     }
     cparams.moe_cache_budget_mib = params.moe_cache.budget_mib;
     cparams.moe_skip_tail = params.moe_cache.skip_tail;
+    if (params.moe_cache.skip_budget > 0.0f) {
+        // the engine reads the drop policy from the environment at graph build time
+        const std::string policy = common_get_env("GGML_MOE_SKIP_POLICY");
+        if (!policy.empty() && policy != "cumulative") {
+            throw std::invalid_argument("--moe-skip-budget conflicts with GGML_MOE_SKIP_POLICY=" + policy);
+        }
+        char budget[32];
+        snprintf(budget, sizeof(budget), "%.6g", params.moe_cache.skip_budget);
+        common_set_env("GGML_MOE_SKIP_POLICY", "cumulative");
+        common_set_env("GGML_MOE_SKIP_THRESHOLD", budget);
+        if (cparams.moe_skip_tail == 0) {
+            cparams.moe_skip_tail = 7;
+        }
+    }
     cparams.moe_prefetch = params.moe_prefetch;
 
     cparams.moe_cache_size = params.moe_cache_size;

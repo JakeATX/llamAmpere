@@ -3372,6 +3372,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_SKIP_TAIL"));
     add_opt(common_arg(
+        {"--moe-skip-budget"}, "F",
+        "LOSSY, changes answers: in a single-sequence decode or verify window, leave out the lightest experts that are "
+        "not resident in VRAM while their summed router weight stays at or below F; resident experts are always "
+        "computed and the remaining weights are not renormalized. Prompt processing is never affected. Turns on "
+        "--moe-skip-tail 7 when that is off. 0 = off, max 0.25 (default: 0)",
+        [](common_params & params, const std::string & value) {
+            char * end = nullptr;
+            const float budget = std::strtof(value.c_str(), &end);
+            if (end == value.c_str() || *end != 0 || !std::isfinite(budget) || budget < 0.0f || budget > 0.25f) {
+                throw std::invalid_argument("--moe-skip-budget must be a number in [0, 0.25]");
+            }
+            params.moe_cache.skip_budget = budget;
+        }
+    ).set_env("LLAMA_ARG_MOE_SKIP_BUDGET"));
+    add_opt(common_arg(
         {"--moe-cache-mib"}, "N",
         "GPU cache size in MiB for the MoE experts kept in the CPU (default: 0, disabled)",
         [](common_params & params, int value) {

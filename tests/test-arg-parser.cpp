@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cmath>
 #include <limits>
+#include <stdexcept>
 #include <string>
 #include <vector>
 #include <sstream>
@@ -230,6 +231,39 @@ static void test(void) {
             assert(!common_params_parse(args_skip.size(), list_str_to_char(args_skip).data(), invalid, LLAMA_EXAMPLE_SERVER));
         }
         assert(llama_context_default_params().moe_skip_tail == 0);
+    }
+
+    {
+        // --moe-skip-budget: (0, 0.25], default 0; sets the cumulative drop policy and turns on skip-tail 7
+        common_params defaults;
+        assert(defaults.moe_cache.skip_budget == 0.0f);
+        unsetenv("GGML_MOE_SKIP_POLICY");
+        unsetenv("GGML_MOE_SKIP_THRESHOLD");
+        assert(common_context_params_to_llama(defaults).moe_skip_tail == 0);
+        assert(getenv("GGML_MOE_SKIP_POLICY") == nullptr);
+        std::vector<std::string> args_budget = {"binary_name", "--moe-skip-budget", "0.2"};
+        common_params budget;
+        assert(common_params_parse(args_budget.size(), list_str_to_char(args_budget).data(), budget, LLAMA_EXAMPLE_SERVER));
+        assert(budget.moe_cache.skip_budget == 0.2f);
+        assert(common_context_params_to_llama(budget).moe_skip_tail == 7);
+        assert(std::string(getenv("GGML_MOE_SKIP_POLICY")) == "cumulative");
+        assert(std::string(getenv("GGML_MOE_SKIP_THRESHOLD")) == "0.2");
+        args_budget = {"binary_name", "--moe-skip-budget", "0.15", "--moe-skip-tail", "8"};
+        common_params with_tail;
+        assert(common_params_parse(args_budget.size(), list_str_to_char(args_budget).data(), with_tail, LLAMA_EXAMPLE_SERVER));
+        assert(common_context_params_to_llama(with_tail).moe_skip_tail == 8);
+        assert(std::string(getenv("GGML_MOE_SKIP_THRESHOLD")) == "0.15");
+        setenv("GGML_MOE_SKIP_POLICY", "threshold", 1);
+        bool threw = false;
+        try { common_context_params_to_llama(budget); } catch (const std::invalid_argument &) { threw = true; }
+        assert(threw);
+        unsetenv("GGML_MOE_SKIP_POLICY");
+        unsetenv("GGML_MOE_SKIP_THRESHOLD");
+        for (const char * value : {"0.3", "-0.1", "x", "0.2x", "nan"}) {
+            args_budget = {"binary_name", "--moe-skip-budget", value};
+            common_params invalid;
+            assert(!common_params_parse(args_budget.size(), list_str_to_char(args_budget).data(), invalid, LLAMA_EXAMPLE_SERVER));
+        }
     }
 
     // missing value
