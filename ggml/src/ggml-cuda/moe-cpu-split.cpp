@@ -432,6 +432,23 @@ struct layer_math {
     bool shared_input = false;  // up and gate quantize their input the same way
 };
 
+// Scratch rows that several workers write side by side. A std::vector base is only 16-byte aligned, so with the
+// 64-byte row strides below every tile boundary would still split a cache line between two workers (the line then
+// bounces between their cores, across both CCDs). `align` (GGML_MOE_CPU_SPLIT_ALIGN) starts the data on a line.
+template <typename T>
+struct scratch_buf {
+    std::vector<T> v;
+    T * p = nullptr;
+    void assign(size_t n, T val, bool align) {
+        v.assign(n + (align ? 64 / sizeof(T) : 0), val);
+        p = v.data();
+        if (align) { while ((uintptr_t) p % 64) { ++p; } }
+    }
+    T * data() { return p; }
+    const T * data() const { return p; }
+    T & operator[](size_t i) { return p[i]; }
+};
+
 struct pool_state {
     std::mutex mu;              // registration and start
     bool running = false;
@@ -456,10 +473,10 @@ struct pool_state {
     bool q8_reuse = false;
     bool down_reuse = false;
     int group_tokens = 4;
-    std::vector<uint8_t> xq;    // [2][MOE_CS_MAX_ROUTES] quantized input rows
+    scratch_buf<uint8_t> xq;    // [2][MOE_CS_MAX_ROUTES] quantized input rows
     size_t xq_stride = 0;
-    std::vector<float> hidden;  // [MOE_CS_MAX_ROUTES][max_ff]
-    std::vector<uint8_t> hq;    // [MOE_CS_MAX_ROUTES] quantized hidden rows
+    scratch_buf<float> hidden;  // [MOE_CS_MAX_ROUTES][max_ff]
+    scratch_buf<uint8_t> hq;    // [MOE_CS_MAX_ROUTES] quantized hidden rows
     size_t hq_stride = 0;
     bool avx512 = false;       // GGML_MOE_CPU_SPLIT_AVX512 and the CPU has AVX-512 F/BW/VL/VNNI
     bool q2_pair = false;      // Share Q2 down weights between two routes of one expert.
@@ -469,7 +486,7 @@ struct pool_state {
     bool q2_shuffle = false;   // Use AVX2 to reorder hidden bytes, with the same integer sums.
     int q2_pf = 0;             // Q2 down prefetch distance in weight blocks; zero disables it.
     size_t aux_stride = 0;     // floats per route in hq_aux: n/32 block scales, then n/64 offsets
-    std::vector<float> hq_aux;
+    scratch_buf<float> hq_aux;
     int rows_ug = 16, rows_down = 64;
     bool iq_rows = false;      // GGML_MOE_CPU_SPLIT_ROWS: moe-iq-rows.h kernels, each chunk decoded once per expert
     int iq_variant = -1;       // moe_iq::get variant bits (GGML_MOE_CPU_SPLIT_ROWS: 1 = best mix, 2..17 = bits + 2)
@@ -963,9 +980,10 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
     // Quantized rows are never larger than the f32 rows they come from.
     s.xq_stride = GGML_PAD((size_t) max_embd * sizeof(float), 64);
     s.hq_stride = GGML_PAD((size_t) max_ff * sizeof(float), 64);
-    s.xq.assign(2 * MOE_CS_MAX_ROUTES * s.xq_stride, 0);
-    s.hidden.assign((size_t) MOE_CS_MAX_ROUTES * max_ff, 0.0f);
-    s.hq.assign(MOE_CS_MAX_ROUTES * s.hq_stride, 0);
+    const bool align = env_int("GGML_MOE_CPU_SPLIT_ALIGN", 0, 0, 1) != 0;
+    s.xq.assign(2 * MOE_CS_MAX_ROUTES * s.xq_stride, 0, align);
+    s.hidden.assign((size_t) MOE_CS_MAX_ROUTES * max_ff, 0.0f, align);
+    s.hq.assign(MOE_CS_MAX_ROUTES * s.hq_stride, 0, align);
     s.q2_pair = env_int("GGML_MOE_CPU_SPLIT_Q2_PAIR", 0, 0, 1) != 0;
     s.q2_group4 = env_int("GGML_MOE_CPU_SPLIT_Q2_GROUP4", 0, 0, 1) != 0;
     s.vector_silu = env_int("GGML_MOE_CPU_SPLIT_VECTOR_SILU", 0, 0, 1) != 0;
@@ -979,7 +997,7 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
     s.avx512 = env_int("GGML_MOE_CPU_SPLIT_AVX512", 1, 0, 1) != 0 && cpu_has_avx512_vnni();
 #endif
     s.aux_stride = (size_t) max_ff / QK8_0 + (size_t) max_ff / QK2_0 + 16;
-    s.hq_aux.assign(MOE_CS_MAX_ROUTES * s.aux_stride, 0.0f);
+    s.hq_aux.assign(MOE_CS_MAX_ROUTES * s.aux_stride, 0.0f, align);
     s.rows_ug = env_int("GGML_MOE_CPU_SPLIT_ROWS_UG", 16, 1, 4096);
     s.rows_down = env_int("GGML_MOE_CPU_SPLIT_ROWS_DOWN", 64, 1, 8192);
 #if defined(MOE_IQ_ROWS)
@@ -1098,6 +1116,7 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
     fprintf(stderr, "[moe-cpu-split] pool: %d threads, %s%s (skipped cores at cpus %s), spin %d us, nap %d us, rows up/gate %d down %d%s%s%s\n",
             s.threads, pin ? "pinned to cpus " : "unpinned", where.c_str(), skipped.c_str(), s.spin_us, s.nap_us, s.rows_ug, s.rows_down,
             s.q2_fast ? ", Q2_0 down fast path" : "", smt ? ", SMT siblings" : "", s.avx512 ? ", grouped AVX-512 VNNI IQ" : "");
+    if (align) { fprintf(stderr, "[moe-cpu-split] scratch rows start on 64-byte lines (GGML_MOE_CPU_SPLIT_ALIGN)\n"); }
     if (s.q2_pair && s.q2_fast) { fprintf(stderr, "[moe-cpu-split] Q2_0 down shares weights across route pairs\n"); }
     if (s.q2_group4 && s.q2_fast) { fprintf(stderr, "[moe-cpu-split] Q2_0 down shares weights across three/four-route groups\n"); }
     if (s.vector_silu && s.iq_rows) { fprintf(stderr, "[moe-cpu-split] grouped up/gate uses CPU vector SiLU\n"); }
