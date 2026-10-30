@@ -139,6 +139,7 @@ std::unique_ptr<llama_ple_prefetch> llama_ple_prefetch::create(const llama_model
         const uint64_t cap = (uint64_t) std::min<int64_t>(window, 64)*(uint64_t) n_ubatch;
         pf->n_ahead = std::min(pf->n_ahead, cap);
     }
+    pf->verify    = ple_pf_env("LLAMA_PLE_PF_VERIFY", 0) > 0;
     pf->n_ubatch  = n_ubatch;
     pf->row_size  = t->nb[1];
     pf->n_rows    = (uint64_t) t->ne[1];
@@ -304,6 +305,9 @@ void llama_ple_prefetch::begin(llama_pos pos0) {
     n_read    = 0;
     n_map_runs = 0;
     n_direct_runs = 0;
+    n_verify_missing = 0;
+    n_verify_ubatch  = 0;
+    t_verify_us      = 0;
     n_pages_all = 0;
     consumed  = 0;
     t_wait_us = 0;
@@ -706,9 +710,61 @@ bool llama_ple_prefetch::consume(uint32_t n_tokens, const int32_t * idx, size_t 
     t_wait_us += ggml_time_us() - tw;
     ++n_ubatch_c;
 
+    if (verify && idx && n_idx) {
+        verify_rows(idx, n_idx);
+    }
+    return true;
+}
+
+// fork: a page read early in a long call can be evicted again before its ubatch gathers (the readers dedup pages over
+// the whole call, so a later ubatch never asks for it twice). One mincore over the table finds this ubatch's evicted
+// pages; they are queued as asynchronous reads (MADV_WILLNEED) before the gather faults on them one by one.
+void llama_ple_prefetch::verify_rows(const int32_t * idx, size_t n_idx) {
+#if defined(__linux__)
+    const int64_t tv = ggml_time_us();
+    const uintptr_t tb = (uintptr_t) ple->data, pb = tb - tb%4096;
+    const uint64_t span = (tb - pb) + n_rows*row_size;
+    const size_t np = (size_t) (span/4096 + (span % 4096 != 0));
+    if (verify_map.size() < np) {
+        verify_map.resize(np);
+    }
+    if (mincore((void *) pb, (size_t) span, verify_map.data()) != 0) {
+        LLAMA_LOG_WARN("%s: [PLEPF] mincore failed (%s), page verification off\n", __func__, strerror(errno));
+        verify = false;
+        return;
+    }
+    verify_pages.clear();
+    for (size_t i = 0; i < n_idx; ++i) {
+        const int32_t r = idx[i];
+        if (r < 0 || (uint64_t) r >= n_rows) {
+            continue;
+        }
+        const uint64_t off = (tb - pb) + (uint64_t) r*row_size;
+        for (uint64_t k = off/4096; k <= (off + row_size - 1)/4096; ++k) {
+            if (!(verify_map[k] & 1)) {
+                verify_map[k] |= 1; // listed once
+                verify_pages.push_back(k);
+            }
+        }
+    }
+    if (!verify_pages.empty()) {
+        std::sort(verify_pages.begin(), verify_pages.end());
+        for (size_t j = 0; j < verify_pages.size();) {
+            size_t e = j + 1;
+            while (e < verify_pages.size() && verify_pages[e] == verify_pages[e - 1] + 1) {
+                ++e;
+            }
+            madvise((void *) (pb + verify_pages[j]*4096), (e - j)*4096, MADV_WILLNEED);
+            j = e;
+        }
+        n_verify_missing += (int64_t) verify_pages.size();
+        ++n_verify_ubatch;
+    }
+    t_verify_us += ggml_time_us() - tv;
+#else
     GGML_UNUSED(idx);
     GGML_UNUSED(n_idx);
-    return true;
+#endif
 }
 
 void llama_ple_prefetch::stop() {
@@ -731,6 +787,10 @@ void llama_ple_prefetch::stop() {
             "%d ubatches waited %.1f ms in all, %d readers%s; bulk mapped runs=%" PRId64 "; direct mapped runs=%" PRId64, __func__, toks.size(), n_pages_all, n_pages_all*4096.0/1048576.0,
             (size_t) n_built.load(), t_build_us.load()/1e3, n_read.load(), t_last_read_us.load()/1e3, n_ubatch_c, t_wait_us/1e3,
             n_readers, n_ubatch_u ? " (some ubatches fell outside the call)" : "", n_map_runs.load(), n_direct_runs.load());
+    if (verify) {
+        LLAMA_LOG_CONT("; verify: %" PRId64 " pages evicted before their gather in %d ubatches, re-queued in %.1f ms",
+                n_verify_missing, n_verify_ubatch, t_verify_us/1e3);
+    }
     LLAMA_LOG_CONT("\n");
 
     toks.clear();

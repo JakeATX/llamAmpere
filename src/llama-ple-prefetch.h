@@ -64,6 +64,7 @@ private:
     size_t chunks_for(uint64_t n_tok) const;
     bool   run_ready(size_t i) const; // under mtx: run i exists and may be read, or there is nothing more to read
     double resident_fraction(const std::vector<uint64_t> & keys, uint64_t base) const;
+    void   verify_rows(const int32_t * idx, size_t n_idx); // fork: re-queue pages evicted after their read
 
     const llama_model * model = nullptr;
     const ggml_tensor * ple   = nullptr;
@@ -79,6 +80,12 @@ private:
     bool     use_advise = false; // [PFGAP] file mode: ask the kernel to queue the reads instead of copying them
     bool     coalesce = false;
     bool     bounded_window = false;
+    bool     verify = false;     // fork: LLAMA_PLE_PF_VERIFY=1 checks each consumed ubatch's pages are still cached
+    std::vector<unsigned char> verify_map;   // mincore result over the whole table (one byte per page)
+    std::vector<uint64_t>      verify_pages; // pages of the ubatch found evicted
+    int64_t  n_verify_missing = 0;           // pages of the call found evicted at consume time
+    int     n_verify_ubatch  = 0;            // ubatches with at least one evicted page
+    int64_t  t_verify_us      = 0;
     uint32_t n_min     = 256;
     uint32_t n_ubatch  = 0;
     uint64_t n_ahead   = 0;      // tokens read ahead of the gather
