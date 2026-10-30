@@ -551,7 +551,7 @@ static __global__ void __launch_bounds__(CAP ? 256 : LOW ? 384 : 512, CAP ? 4 : 
 
 // Only nonempty warp ranges write scratch. Reduce them in warp order without reading unused slots.
 template <int NT, bool CURSOR>
-static __global__ void k_ait_mmv_sum(const float * partial, float * Y, int M, int S, int warps, int step, uint32_t tail) {
+static __global__ void k_ait_mmv_sum(const float * __restrict__ partial, float * __restrict__ Y, int M, int S, int warps, int step, uint32_t tail) {
     const int tile = blockIdx.x, row = tile * 32 + (threadIdx.x & 31), token = threadIdx.x >> 5;
     const int items = (M / 32) * S, begin = tile * S, end = begin + S;
     const int first = (int) ((int64_t) begin * warps / items);
