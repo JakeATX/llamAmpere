@@ -15208,6 +15208,15 @@ static void add_ai23_cases(std::vector<std::unique_ptr<test_case>> & cases) {
 // broadcast src1, down 2560 x 640 H128), a 221-expert stack, top 10, decode / MTP-verify widths 1-8 and prompt widths,
 // with and without skipped (-1 / out-of-stack) ids. The prompt widths run the GEMM-ID kernels (BN64 / BN128).
 static void add_ai_bank_cases(std::vector<std::unique_ptr<test_case>> & cases) {
+    // fork: direct verification tiles, including duplicate and skipped expert slots.
+    for (ggml_type t : { GGML_TYPE_AIT2_U, GGML_TYPE_AIT3_U }) {
+        for (int n : { 1, 2, 3, 4, 5, 6, 7, 8 }) {
+            for (bool dup : { false, true }) {
+                cases.emplace_back(new test_mul_mat_id_ai4(t, 4, 3, true, 32, n, 2560, dup, false, 1));
+                cases.emplace_back(new test_mul_mat_id_ai4(t, 4, 3, false, 48, n, 640, dup, false, 1));
+            }
+        }
+    }
     // fork: full expert coverage at prompt tile boundaries, with skipped-pair reductions.
     for (ggml_type t : { GGML_TYPE_AIT2_U, GGML_TYPE_AIT3_U }) {
         for (int experts : { 3, 33, 221 }) {

@@ -61,6 +61,7 @@ struct idmap {
     int64_t direct_nb0 = 0, direct_nb1 = 0;
     int direct_n_used = 0, direct_ne11 = 0, direct_n_expert = 0;
     const float * direct_x = nullptr;
+    bool direct_zero = false;
 };
 
 using rq4::cp_async16;
@@ -973,6 +974,10 @@ static __global__ void __launch_bounds__(WARPS*32, MINB) mmvr(
         const int tok = blockIdx.z;
         const int e = *(const int *) (idm.direct_ids + u*idm.direct_nb0 + tok*idm.direct_nb1);
         if (e < 0 || e >= idm.direct_n_expert) {
+            if (idm.direct_zero && threadIdx.x < 16) {
+                const int64_t col = (int64_t) tok*idm.direct_n_used + u;
+                Y[col*ldy + slab*16 + threadIdx.x] = 0.0f;
+            }
             return;
         }
         W += (int64_t) e*idm.nb02;
@@ -1168,20 +1173,22 @@ static __global__ void __launch_bounds__(WARPS*32, MINB) mmvr(
     }
     cp_async_wait<0>();
 
-    __shared__ float red[WARPS - 1][SINGLE_N ? 2 : 4][32];
-    if (warp > 0) {
+    constexpr bool compact = SINGLE_N && DIRECT;
+    __shared__ float red[WARPS - 1][SINGLE_N ? 2 : 4][compact ? 8 : 32];
+    const int red_lane = compact ? g : lane;
+    if (warp > 0 && (!compact || t == 0)) {
 #pragma unroll
         for (int i = 0; i < (SINGLE_N ? 2 : 4); ++i) {
-            red[warp - 1][i][lane] = acc[SINGLE_N ? 2*i : i];
+            red[warp - 1][i][red_lane] = acc[SINGLE_N ? 2*i : i];
         }
     }
     __syncthreads();
-    if (warp == 0) {
+    if (warp == 0 && (!compact || t == 0)) {
 #pragma unroll
         for (int w = 0; w < WARPS - 1; ++w) {
 #pragma unroll
             for (int i = 0; i < (SINGLE_N ? 2 : 4); ++i) {
-                acc[SINGLE_N ? 2*i : i] += red[w][i][lane];
+                acc[SINGLE_N ? 2*i : i] += red[w][i][red_lane];
             }
         }
         const int r = slab*16 + g;
