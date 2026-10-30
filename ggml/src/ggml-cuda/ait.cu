@@ -21,7 +21,7 @@
 // GGML_CUDA_AIT4_NEIGHBOR_BOUNDS=1 gives the neighbor kernel a 384-thread compile bound.
 // GGML_CUDA_AIT4_NEIGHBOR_RING1=1 keeps one weight group live in the neighbor path.
 // GGML_CUDA_AIT4_NEIGHBOR_UNROLL2=1 unrolls two four-group steps in the neighbor path.
-// GGML_CUDA_AIT4_NEIGHBOR_OCC=1 requests two 384-thread blocks per SM without tile packing.
+// GGML_CUDA_AIT4_NEIGHBOR_OCC=1 launches two register-capped blocks per SM without tile packing.
 // GGML_CUDA_AIT4_RING2=1 keeps two AIT4 weight groups live with the base register budget (OCC=0, NEIGHBOR=0).
 // GGML_CUDA_AIT4_RING1=1 keeps one AIT4 weight group live and takes precedence over RING2.
 // GGML_CUDA_AIT4_TAIL=1 refills the four-group weight ring after each group's IMMA work.
@@ -802,6 +802,7 @@ static void ait_fast_nt(ggml_backend_cuda_context & ctx, const uint8_t * W, cons
     static const int vexp = ait_env_int("GGML_CUDA_AIT_V", 0) & 3;
     static const int l2pf = std::max(0, std::min(32, ait_env_int("GGML_CUDA_AIT_L2PF", 0)));
     static const int occ = ait_env_int("GGML_CUDA_AIT_OCC", 0);
+    static const bool neighbor4_occ = ait_env_int("GGML_CUDA_AIT4_NEIGHBOR_OCC", 0) == 1;
     static const int grid_factor = std::max(1, std::min(8, ait_env_int("GGML_CUDA_AIT_OCC_GRID", 4)));
     static const bool ordered = ait_env_int("GGML_CUDA_AIT_ORDERED", 1) != 0;
     const bool use_v = (NT == 1 || NT == 4 || NT == 5 || NT == 8) && vexp != 0 && (code != 1 || ait_plds() == 1);
@@ -809,7 +810,10 @@ static void ait_fast_nt(ggml_backend_cuda_context & ctx, const uint8_t * W, cons
     if (!use_v && k == 4 && code == 0 && full && occ > 0) {
         total_warps = occ >= 3 ? grid_factor * nsm * 8 : 2 * nsm * std::min(warps, 12);
     }
-    const size_t slots = (total_warps + M / 32 - 1) / (M / 32) + 2;
+    const bool reserve_neighbor_occ = !use_v && k == 4 && code == 0 && full && warps <= 12 && occ == 0 &&
+        neighbor4_occ && ait_env_int("GGML_CUDA_AIT4_NEIGHBOR", 0) == 1;
+    const int scratch_warps = reserve_neighbor_occ ? 2 * total_warps : total_warps;
+    const size_t slots = (scratch_warps + M / 32 - 1) / (M / 32) + 2;
     ggml_cuda_pool_alloc<float> scratch(ctx.pool(id));
     if (ordered) {
         scratch.alloc(slots * NT * (size_t) M);
@@ -873,7 +877,6 @@ static void ait_fast_nt(ggml_backend_cuda_context & ctx, const uint8_t * W, cons
         static const bool neighbor4_early_x = ait_env_int("GGML_CUDA_AIT4_NEIGHBOR_EARLY_X", 0) == 1;
         static const bool neighbor4_bounds = ait_env_int("GGML_CUDA_AIT4_NEIGHBOR_BOUNDS", 0) == 1;
         static const bool neighbor4_unroll2 = ait_env_int("GGML_CUDA_AIT4_NEIGHBOR_UNROLL2", 0) == 1;
-        static const bool neighbor4_occ = ait_env_int("GGML_CUDA_AIT4_NEIGHBOR_OCC", 0) == 1;
         if (neighbor4_pack) {
             k_ait_mmv<4, NT, true, 0, 0, 4, false, false, true, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
         } else if (neighbor4_ring2) {
@@ -889,7 +892,9 @@ static void ait_fast_nt(ggml_backend_cuda_context & ctx, const uint8_t * W, cons
         } else if (neighbor4_unroll2) {
             k_ait_mmv<4, NT, true, 0, 0, 4, false, false, false, true, false, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
         } else if (neighbor4_occ) {
-            k_ait_mmv<4, NT, true, 0, 0, 4, true, false, false, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
+            const dim3 grid_occ(2 * nsm);
+            total_warps = 2 * nsm * warps;
+            k_ait_mmv<4, NT, true, 0, 0, 4, true, false, false, true><<<grid_occ, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
         } else {
             k_ait_mmv<4, NT, true, 0, 0, 4, false, false, false, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
         }
