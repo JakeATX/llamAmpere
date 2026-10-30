@@ -433,6 +433,9 @@ int64_t llama_ple_prefetch::reader() {
     size_t done_chunk = 0;
     int64_t done_runs = 0;
     auto flush_done = [&]() {
+        if (done_runs > 0) {
+            t_last = ggml_time_us();
+        }
         if (done_runs > 0 && remaining[done_chunk].fetch_sub(done_runs) == done_runs) {
             std::lock_guard<std::mutex> lk(mtx);
             cv_done.notify_all();
@@ -479,7 +482,6 @@ int64_t llama_ple_prefetch::reader() {
         } else {
             pages_read += run_len[i];
         }
-        t_last = ggml_time_us();
         done_chunk = run_chunk[i];
         ++done_runs;
         if (next == end) {
