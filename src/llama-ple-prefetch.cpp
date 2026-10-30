@@ -166,6 +166,20 @@ std::unique_ptr<llama_ple_prefetch> llama_ple_prefetch::create(const llama_model
             pf->file_off = off;
             // the descriptor's own readahead state: read exactly the pages asked for
             posix_fadvise(pf->fd, 0, 0, POSIX_FADV_RANDOM);
+#if defined(MADV_POPULATE_READ)
+            if (pf->populate == 3) {
+                // The mapping has separate read-around state from the pread descriptor.
+                const uintptr_t page = table_base - table_base%4096;
+                const uint64_t bytes = pf->n_rows*pf->row_size;
+                if (bytes > SIZE_MAX - (table_base - page) ||
+                        madvise((void *) page, (size_t) bytes + table_base - page, MADV_RANDOM) != 0) {
+                    pf->populate = 1;
+                    LLAMA_LOG_WARN("%s: [PLEPF] cannot bound mapped read-around, using pread plus page touches\n", __func__);
+                } else {
+                    LLAMA_LOG_WARN("%s: [PLEPF] direct mapped reads use random-access mapping\n", __func__);
+                }
+            }
+#endif
         }
     }
 #else
