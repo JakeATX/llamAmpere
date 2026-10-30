@@ -316,11 +316,9 @@ void llama_ple_prefetch::build() {
                 ctx[s] = cut ? eos : t;
                 known  = s;
             }
+            uint64_t mixed = (uint64_t) ctx[0] * hp.ple_layer_multipliers[0];
             for (int64_t g = 2; g <= n_gram && g - 1 <= known; ++g) {
-                uint64_t mixed = (uint64_t) ctx[0] * hp.ple_layer_multipliers[0];
-                for (int64_t j = 1; j < g; ++j) {
-                    mixed ^= (uint64_t) ctx[j] * hp.ple_layer_multipliers[j];
-                }
+                mixed ^= (uint64_t) ctx[g - 1] * hp.ple_layer_multipliers[g - 1];
                 const int64_t hb = (g - 2) * per_gram;
                 for (int64_t k = 0; k < per_gram; ++k) {
                     const int64_t h = hb + k;

@@ -1087,6 +1087,96 @@ static void deferred_mask_capacity_case() {
     printf("OK: 64 pending masks preserved, 65th falls back, all host mask bytes exact\n");
 }
 
+static void ple_hash_pages_case() {
+#if defined(__linux__)
+    for (uint32_t n_gram : { 4, 8 }) {
+        for (llama_pos pos0 : { 0, 23 }) {
+            const uint32_t per_gram = 2, vocab = 1021, eos = 997;
+            const uint32_t n_heads = (n_gram - 1)*per_gram, n_rows = n_heads*vocab;
+            const size_t n_tokens = 3*256 + 17, size = (size_t) n_rows*4096;
+            void * pages = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            require(pages != MAP_FAILED, "hash page mapping");
+            require(madvise(pages, size, MADV_NOHUGEPAGE) == 0, "hash pages stay separate");
+            ggml_context * ctx = ggml_init({ 1024*1024, nullptr, true });
+            require(ctx != nullptr, "hash page context");
+            auto * table = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1024, n_rows);
+            table->data = pages;
+            table->buffer = ggml_backend_cpu_buffer_from_ptr(pages, size);
+            require(table->buffer != nullptr, "hash page buffer");
+            llama_model_ptr model(llama_model_create(LLM_ARCH_QWEN4EXP, llama_model_default_params()));
+            require(model != nullptr, "hash page model");
+            model->per_layer_tok_embd = table;
+            model->can_prefetch.insert(table);
+            auto & hp = model->hparams;
+            hp.ple_ngram_size = n_gram;
+            hp.ple_n_heads = n_heads;
+            hp.ple_heads_per_ngram = per_gram;
+            hp.ple_eos_token_id = eos;
+            for (uint32_t j = 0; j < n_gram; ++j) {
+                hp.ple_layer_multipliers[j] = UINT64_C(0x9e3779b97f4a7c15) + j*UINT64_C(0xd1b54a32d192ed03);
+            }
+            for (uint32_t h = 0; h < n_heads; ++h) {
+                hp.ple_head_offsets[h] = h*vocab;
+                hp.ple_head_vocab_sizes[h] = vocab - h;
+            }
+            std::vector<llama_token> tokens(n_tokens);
+            for (size_t i = 0; i < n_tokens; ++i) {
+                tokens[i] = i % 127 == 0 ? eos : i % 131 == 0 ? LLAMA_TOKEN_NULL : (i*179 + i*i*13) % eos;
+            }
+            std::vector<unsigned char> expected(n_rows, 0), resident(n_rows);
+            for (size_t i = 0; i < n_tokens; ++i) {
+                for (uint32_t g = 2; g <= n_gram; ++g) {
+                    uint64_t mixed = (uint64_t) tokens[i]*hp.ple_layer_multipliers[0];
+                    bool cut = false, known = true;
+                    for (uint32_t j = 1; j < g; ++j) {
+                        if (!cut && i < j && pos0 != 0) {
+                            known = false;
+                            break;
+                        }
+                        const llama_token t = cut || i < j ? (llama_token) eos : tokens[i - j];
+                        cut = cut || t < 0 || t == (llama_token) eos;
+                        mixed ^= (uint64_t) (cut ? (llama_token) eos : t)*hp.ple_layer_multipliers[j];
+                    }
+                    if (known) {
+                        for (uint32_t k = 0; k < per_gram; ++k) {
+                            const uint32_t h = (g - 2)*per_gram + k;
+                            expected[hp.ple_head_offsets[h] + mixed % hp.ple_head_vocab_sizes[h]] = 1;
+                        }
+                    }
+                }
+            }
+            setenv("LLAMA_PLE_PREFETCH", "2", 1);
+            setenv("LLAMA_PLE_PF_MIN", "1", 1);
+            setenv("LLAMA_PLE_PF_MODE", "fault", 1);
+            setenv("LLAMA_PLE_PF_AHEAD", "1000000", 1);
+            setenv("LLAMA_PLE_PF_COLD_THREADS", "0", 1);
+            auto pf = llama_ple_prefetch::create(*model, 256);
+            require(pf != nullptr, "hash page prefetch created");
+            pf->hint(tokens.data(), tokens.size(), pos0);
+            for (size_t i = 0; i < n_tokens; i += 256) {
+                require(pf->consume(std::min<size_t>(256, n_tokens - i), nullptr, 0), "hash page chunk consumed");
+            }
+            pf->stop();
+            require(mincore(pages, size, resident.data()) == 0, "hash page residency");
+            size_t n_expected = 0;
+            for (size_t r = 0; r < n_rows; ++r) {
+                require((resident[r] & 1) == expected[r], "hash page set matches independent full hash");
+                n_expected += expected[r];
+            }
+            require(n_expected > 0 && n_expected < n_rows, "hash test checks touched and untouched pages");
+            pf.reset();
+            model.reset();
+            ggml_backend_buffer_free(table->buffer);
+            ggml_free(ctx);
+            munmap(pages, size);
+        }
+    }
+    printf("OK: incremental 4/8-gram hashes match exact page sets across heads, EOS and call offsets\n");
+#else
+    printf("SKIP: hash page test needs Linux\n");
+#endif
+}
+
 static void ple_wide_rows_case() {
 #if defined(__linux__)
     for (int width : { 2048, 4096 }) {
@@ -1231,6 +1321,15 @@ static void ple_cold_recheck_case() {
 }
 
 int main(int argc, char ** argv) {
+    if (argc > 1 && strcmp(argv[1], "--ple-hash-pages") == 0) {
+        try {
+            ple_hash_pages_case();
+            return 0;
+        } catch (const std::exception & e) {
+            fprintf(stderr, "prefetch hash pages: FAIL: %s\n", e.what());
+            return 1;
+        }
+    }
     if (argc > 1 && strcmp(argv[1], "--ple-wide-rows") == 0) {
         try {
             ple_wide_rows_case();
