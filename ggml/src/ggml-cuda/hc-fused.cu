@@ -938,28 +938,6 @@ static void hcf_down_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, 
     const int hc_dim   = hc*n_embd;
     const int R        = (int) wd->ne[1];
     const int n_rows   = R + hc_inj;
-    // rows per warp: 4 by default; LLAMA_HC_DOWN_ROWS=2|1 launches 2x|4x as many CTAs (the same per-row sums in the
-    // same order, so the result is bit-identical). The counter slots hold 64 row blocks, so a larger count falls back.
-    static const int rows_env = [] {
-        const char * e = getenv("LLAMA_HC_DOWN_ROWS");
-        const int v = e ? atoi(e) : HCF_DOWN_ROWS_DEF;
-        return v == 1 || v == 2 ? v : HCF_DOWN_ROWS_DEF;
-    }();
-    static const bool warp_finish = [] {
-        const char * e = getenv("LLAMA_HC_DOWN_WARP_FINISH");
-        return e && atoi(e) == 1;
-    }();
-    // Keep one weight group live across activation staging; fetch the rest at use.
-    static const bool late_weights = [] {
-        const char * e = getenv("LLAMA_HC_DOWN_LATE_WEIGHTS");
-        return e && atoi(e) == 1;
-    }();
-    static const int warps_env = [] {
-        const char * e = getenv("LLAMA_HC_DOWN_WARPS");
-        return e && atoi(e) == 4 ? 4 : HCF_DOWN_WARPS_DEF;
-    }();
-    const int down_w = warps_env;
-
     GGML_ASSERT(((uintptr_t) x->data) % 16 == 0 && ((uintptr_t) wn->data) % 16 == 0);
     GGML_ASSERT(hc == 4);
 
@@ -1027,6 +1005,28 @@ static void hcf_down_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, 
         }
         return;
     }
+    // rows per warp: 4 by default; LLAMA_HC_DOWN_ROWS=2|1 launches 2x|4x as many CTAs (the same per-row sums in the
+    // same order, so the result is bit-identical). The counter slots hold 64 row blocks, so a larger count falls back.
+    static const int rows_env = [] {
+        const char * e = getenv("LLAMA_HC_DOWN_ROWS");
+        const int v = e ? atoi(e) : HCF_DOWN_ROWS_DEF;
+        return v == 1 || v == 2 ? v : HCF_DOWN_ROWS_DEF;
+    }();
+    static const bool warp_finish = [] {
+        const char * e = getenv("LLAMA_HC_DOWN_WARP_FINISH");
+        return e && atoi(e) == 1;
+    }();
+    // Keep one weight group live across activation staging; fetch the rest at use.
+    static const bool late_weights = [] {
+        const char * e = getenv("LLAMA_HC_DOWN_LATE_WEIGHTS");
+        return e && atoi(e) == 1;
+    }();
+    static const int warps_env = [] {
+        const char * e = getenv("LLAMA_HC_DOWN_WARPS");
+        return e && atoi(e) == 4 ? 4 : HCF_DOWN_WARPS_DEF;
+    }();
+    const int down_w = warps_env;
+
     const int n_chunks = hc_dim/HCF_CHUNK;
     const int rows_pw = (n_rows + down_w*rows_env - 1)/(down_w*rows_env) <= HCF_CNT_RB ? rows_env : HCF_DOWN_ROWS_DEF;
     const int n_rb     = (n_rows + down_w*rows_pw - 1)/(down_w*rows_pw);
