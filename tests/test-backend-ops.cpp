@@ -5368,19 +5368,26 @@ struct test_dsv4_hc_fused : public test_case {
 struct test_dsv4_hc_down_owner : public test_dsv4_hc_fused {
     const bool norm_zero;
     const bool x_zero;
+    const int zero_stream;
 
-    test_dsv4_hc_down_owner(int64_t embd, int64_t rank, int64_t tokens, bool injection, bool norm_zero = false, bool x_zero = false)
-        : test_dsv4_hc_fused(embd, rank, tokens, injection), norm_zero(norm_zero), x_zero(x_zero) {}
+    test_dsv4_hc_down_owner(int64_t embd, int64_t rank, int64_t tokens, bool injection, bool norm_zero = false, bool x_zero = false, int zero_stream = -1)
+        : test_dsv4_hc_fused(embd, rank, tokens, injection), norm_zero(norm_zero), x_zero(x_zero), zero_stream(zero_stream) {}
 
-    std::string vars() override { return test_dsv4_hc_fused::vars() + "," + VARS_TO_STR2(norm_zero, x_zero); }
+    std::string vars() override { return test_dsv4_hc_fused::vars() + "," + VARS_TO_STR3(norm_zero, x_zero, zero_stream); }
 
     void initialize_tensors(ggml_context * ctx) override {
         test_dsv4_hc_fused::initialize_tensors(ctx);
-        if (norm_zero || x_zero) {
+        GGML_ASSERT(zero_stream >= -1 && zero_stream < 4);
+        if (norm_zero || x_zero || zero_stream >= 0) {
             for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
                 const char * name = ggml_get_name(t);
                 if ((norm_zero && strcmp(name, "w_norm") == 0) || (x_zero && strcmp(name, "x") == 0)) {
                     init_tensor_uniform(t, 0.0f, 0.0f);
+                } else if (zero_stream >= 0 && strcmp(name, "x") == 0) {
+                    const std::vector<float> zeros(n_embd, 0.0f);
+                    for (int64_t it = 0; it < n_tokens; ++it) {
+                        ggml_backend_tensor_set(t, zeros.data(), (it*4 + zero_stream)*n_embd*sizeof(float), zeros.size()*sizeof(float));
+                    }
                 }
             }
         }
@@ -5404,7 +5411,7 @@ struct test_dsv4_hc_down_owner : public test_dsv4_hc_fused {
                     return INFINITY;
                 }
             }
-            if (x_zero && i >= n - 4*n_tokens) {
+            if (i >= n - 4*n_tokens && (x_zero || (zero_stream >= 0 && (i - (n - 4*n_tokens)) % 4 == size_t(zero_stream)))) {
                 // eps is 1e-6, so a zero stream has an RMS scale of 1000.
                 if (std::abs(double(a[i]) - 1000.0) > 2e-3 || std::abs(double(b[i]) - 1000.0) > 2e-3) {
                     return INFINITY;
@@ -15186,6 +15193,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_down_owner(1024, 3, 7, true, true));
     // Zero streams exercise the epsilon term with every row-owner token accumulator.
     test_cases.emplace_back(new test_dsv4_hc_down_owner(1024, 4, 8, true, false, true));
+    // A single zero stream checks RMS output order among nonzero streams and tokens.
+    test_cases.emplace_back(new test_dsv4_hc_down_owner(1024, 6, 5, true, false, false, 3));
     // [HCFUSED] real Flash-Next shapes, every token count the kernels specialize, with and without the injection rows
     for (int64_t nt = 1; nt <= 8; ++nt) {
         test_cases.emplace_back(new test_dsv4_hc_fused(2560, 320, nt, true,  true, 1));
