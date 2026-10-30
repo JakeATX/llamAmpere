@@ -86,7 +86,7 @@ std::unique_ptr<llama_ple_prefetch> llama_ple_prefetch::create(const llama_model
     // fork: page-touch readers are on for long prompts; LLAMA_PLE_PREFETCH=0 disables them.
     const bool    user  = getenv("LLAMA_PLE_PREFETCH") != nullptr;
     const int64_t n_thr = ple_pf_env("LLAMA_PLE_PREFETCH", ple_pf_env("LLAMA_PLE_PF_THREADS", PLE_PF_DEFAULT_THREADS));
-    if (n_thr <= 0) {
+    if (n_thr <= 0 || n_ubatch == 0) {
         return nullptr;
     }
     const ggml_tensor * t = model.per_layer_tok_embd;

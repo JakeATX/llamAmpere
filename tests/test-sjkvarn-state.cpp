@@ -1427,6 +1427,7 @@ static void ple_wide_rows_case() {
         setenv("LLAMA_PLE_PF_AHEAD", "1000000", 1);
         setenv("LLAMA_PLE_PF_COLD_THREADS", "0", 1);
         auto & hp = model->hparams;
+        require(!llama_ple_prefetch::create(*model, 0), "prefetch refuses a zero-token ubatch before starting readers");
         hp.ple_ngram_size = hp.ple_layer_multipliers.size() + 1;
         require(!llama_ple_prefetch::create(*model, n_tokens), "prefetch refuses excess ngram width");
         hp.ple_ngram_size = 2;
