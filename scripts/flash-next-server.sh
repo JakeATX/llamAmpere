@@ -3,6 +3,11 @@ set -euo pipefail
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 source "$repo/data/moe/flash-next.env"
 server=${LLAMA_SERVER_BIN:-$repo/build/bin/llama-server}
+exact=()
+if [[ ${1-} == --exact ]]; then
+    exact=(--moe-skip-tail 0 --moe-skip-budget 0 --moe-skip-rank-floor 0 --no-spec-mb-mtp)
+    shift
+fi
 depth=()
 # a depth in the caller's own arguments wins outright
 if [[ -n $FLASH_NEXT_DRAFT_MAX && " $* " != *" --spec-draft-n-"* ]]; then
@@ -10,4 +15,6 @@ if [[ -n $FLASH_NEXT_DRAFT_MAX && " $* " != *" --spec-draft-n-"* ]]; then
     # --spec-type adds to the list, so only pick adaptive MTP when the caller names no type
     [[ " $* " == *" --spec-type"* ]] || depth=(--spec-type draft-mtp-adaptive "${depth[@]}")
 fi
-exec "$server" -md "$LLAMA_ARG_MODEL_DRAFT" --moe-profile "$GGML_MOE_CACHE_PROFILE_LOAD" "${depth[@]}" "$@"
+exec "$server" -md "$LLAMA_ARG_MODEL_DRAFT" --moe-profile "$GGML_MOE_CACHE_PROFILE_LOAD" \
+    -ctk sjkvarn4 -ctv sjkvarn4 --moe-skip-tail 7 --moe-skip-budget 0.15 --moe-skip-rank-floor 5 \
+    "${depth[@]}" "$@" "${exact[@]}"

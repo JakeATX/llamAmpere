@@ -2078,8 +2078,8 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     }
     cparams.moe_cache_budget_mib = params.moe_cache.budget_mib;
     cparams.moe_skip_tail = params.moe_cache.skip_tail;
-    if (params.moe_cache.skip_rank_floor) {
-        common_set_env("GGML_MOE_SKIP_RANK_FLOOR", "5");
+    if (params.moe_cache.skip_rank_floor >= 0) {
+        common_set_env("GGML_MOE_SKIP_RANK_FLOOR", std::to_string(params.moe_cache.skip_rank_floor));
     }
     if (params.moe_cache.skip_budget > 0.0f) {
         // the engine reads the drop policy from the environment at graph build time
@@ -2091,7 +2091,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
         snprintf(budget, sizeof(budget), "%.6g", params.moe_cache.skip_budget);
         common_set_env("GGML_MOE_SKIP_POLICY", "cumulative");
         common_set_env("GGML_MOE_SKIP_THRESHOLD", budget);
-        if (cparams.moe_skip_tail == 0) {
+        if (cparams.moe_skip_tail == 0 && !params.moe_cache.skip_tail_explicit) {
             cparams.moe_skip_tail = 7;
         }
     }

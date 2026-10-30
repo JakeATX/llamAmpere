@@ -3369,6 +3369,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 throw std::invalid_argument("--moe-skip-tail must be in [0, 9]");
             }
             params.moe_cache.skip_tail = value;
+            params.moe_cache.skip_tail_explicit = true;
         }
     ).set_env("LLAMA_ARG_MOE_SKIP_TAIL"));
     add_opt(common_arg(
@@ -3387,11 +3388,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_SKIP_BUDGET"));
     add_opt(common_arg(
-        {"--moe-skip-rank-floor"},
-        "Protect the top five ranked experts when using a cumulative --moe-skip-budget (default: off). "
-        "GGML_MOE_SKIP_RANK_FLOOR=N selects a different floor, 0..10; this flag sets it to 5",
-        [](common_params & params) { params.moe_cache.skip_rank_floor = true; }
-    ));
+        {"--moe-skip-rank-floor"}, "N",
+        "Protect the first N ranked experts when using a cumulative --moe-skip-budget (0..10, default: 0)",
+        [](common_params & params, int value) {
+            if (value < 0 || value > 10) {
+                throw std::invalid_argument("--moe-skip-rank-floor must be in [0, 10]");
+            }
+            params.moe_cache.skip_rank_floor = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_SKIP_RANK_FLOOR"));
     add_opt(common_arg(
         {"--moe-cache-mib"}, "N",
         "GPU cache size in MiB for the MoE experts kept in the CPU (default: 0, disabled)",

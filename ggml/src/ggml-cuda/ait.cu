@@ -996,7 +996,7 @@ static void ait_fast_nt(ggml_backend_cuda_context & ctx, const uint8_t * W, cons
     const size_t cta_smem = cta ? (size_t) warps * 2 * (NT * 33 + 2) * sizeof(float) : 0;
     if (cta_log) {
         // one line per distinct shape, so a run shows whether GGML_CUDA_AIT_CTA engaged or fell back to the ordered slots
-        static std::set<std::tuple<int, int, int, int>> seen;
+        static thread_local std::set<std::tuple<int, int, int, int>> seen;
         if (seen.insert(std::make_tuple(M, K, (int) NT, (int) cta)).second) {
             fprintf(stderr, "[ait-cta] M=%d K=%d N=%d code=%d k=%d: %s\n", M, K, (int) NT, code, k, cta ? "CTA sum" : "ordered slots (not eligible)");
         }
