@@ -15236,8 +15236,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_down_owner(512, 512, 3, false));
     test_cases.emplace_back(new test_dsv4_hc_down_owner(2560, 1, 4, true));
     // Cross the legacy 64-block limit with and without injection rows.
-    test_cases.emplace_back(new test_dsv4_hc_down_owner(256, 2049, 1, false));
-    test_cases.emplace_back(new test_dsv4_hc_down_owner(256, 2045, 2, true));
+    test_cases.emplace_back(new test_dsv4_hc_down_owner(512, 2049, 1, false));
+    test_cases.emplace_back(new test_dsv4_hc_down_owner(512, 2045, 2, true));
     // Row-owner blocks cover exact four/eight-row ends and a trailing ninth row.
     for (int64_t rank : {4, 8, 9}) {
         test_cases.emplace_back(new test_dsv4_hc_down_owner(512, rank, 3, false));
@@ -15252,7 +15252,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // A single zero stream checks RMS output order among nonzero streams and tokens.
     test_cases.emplace_back(new test_dsv4_hc_down_owner(1024, 6, 5, true, false, false, 3));
     test_cases.emplace_back(new test_dsv4_hc_down_owner(512, 9, 7, true, false, false, -1, true));
-    test_cases.emplace_back(new test_dsv4_hc_down_owner(256, 9, 8, true, false, false, -1, true));
+    test_cases.emplace_back(new test_dsv4_hc_down_owner(512, 9, 8, true, false, false, -1, true));
     // [HCFUSED] real Flash-Next shapes, every token count the kernels specialize, with and without the injection rows
     for (int64_t nt = 1; nt <= 8; ++nt) {
         test_cases.emplace_back(new test_dsv4_hc_fused(2560, 320, nt, true,  true, 1));
