@@ -550,14 +550,14 @@ static __global__ void __launch_bounds__(CAP ? 256 : LOW ? 384 : 512, CAP ? 4 : 
 }
 
 // Only nonempty warp ranges write scratch. Reduce them in warp order without reading unused slots.
-template <int NT>
-static __global__ void k_ait_mmv_sum(const float * partial, float * Y, int M, int S, int warps, bool cursor) {
+template <int NT, bool CURSOR>
+static __global__ void k_ait_mmv_sum(const float * partial, float * Y, int M, int S, int warps) {
     const int tile = blockIdx.x, row = tile * 32 + (threadIdx.x & 31), token = threadIdx.x >> 5;
     const int items = (M / 32) * S, begin = tile * S, end = begin + S;
     const int first = (int) ((int64_t) begin * warps / items);
     const int last = (int) (((int64_t) end * warps + items - 1) / items);
     float sum = 0.0f;
-    if (cursor) {
+    if constexpr (CURSOR) {
         const int step = items / warps;
         const uint32_t warp_count = (uint32_t) warps, tail = (uint32_t) (items % warps);
         const int64_t start = (int64_t) first * items;
@@ -786,7 +786,11 @@ static void ait_fast_nt(ggml_backend_cuda_context & ctx, const uint8_t * W, cons
     float * partial = ordered ? scratch.get() : nullptr;
     auto finish = [&]() {
         if (ordered) {
-            k_ait_mmv_sum<NT><<<M / 32, 32 * NT, 0, stream>>>(partial, Y, M, S, total_warps, sum_cursor);
+            if (sum_cursor) {
+                k_ait_mmv_sum<NT, true><<<M / 32, 32 * NT, 0, stream>>>(partial, Y, M, S, total_warps);
+            } else {
+                k_ait_mmv_sum<NT, false><<<M / 32, 32 * NT, 0, stream>>>(partial, Y, M, S, total_warps);
+            }
         }
         CUDA_CHECK(cudaGetLastError());
     };
