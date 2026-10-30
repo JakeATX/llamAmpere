@@ -7919,7 +7919,8 @@ static void moe_cache_swap_commit(moe_cache_session & session, bool ok, bool pub
     }
     auto & device = *session.devices[0];
     std::vector<moe_swap_write> writes;
-    writes.reserve(session.swap_inflight.size() * 2);
+    // Reserve address, staging address and hot flag writes before slot changes.
+    writes.reserve(session.swap_inflight.size() * 3);
     for (const auto & fill : session.swap_inflight) {
         auto & pool = *fill.pool;
         auto & slot = pool.slots[fill.index];
