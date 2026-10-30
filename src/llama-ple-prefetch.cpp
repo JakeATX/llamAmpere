@@ -478,8 +478,28 @@ int64_t llama_ple_prefetch::reader() {
         if (use_advise) {
             posix_fadvise(fd, (off_t) off, (off_t) len, POSIX_FADV_WILLNEED);
         } else if (use_pread) {
-            if (pread(fd, buf.data(), (size_t) len, (off_t) off) < 0) {
-                // a failed read only costs the gather a fault
+            // fork: finish short reads, but do not require padding past the table's last byte.
+            const size_t need = (size_t) std::min(len, file_off + n_rows*row_size - off);
+            size_t done = 0;
+            while (done < need && !stopping.load()) {
+                const ssize_t got = pread(fd, buf.data() + done, need - done, (off_t) (off + done));
+                if (got < 0 && errno == EINTR) {
+                    continue;
+                }
+                if (got <= 0) {
+                    break;
+                }
+                done += (size_t) got;
+            }
+            if (done != need) {
+                // fork: leave an incomplete run uncounted and let the gather use its normal path.
+                {
+                    std::lock_guard<std::mutex> lk(mtx);
+                    stopping = true;
+                }
+                cv_work.notify_all();
+                cv_done.notify_all();
+                break;
             }
         } else
 #endif

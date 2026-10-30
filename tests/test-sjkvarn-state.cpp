@@ -1096,8 +1096,11 @@ static void ple_hash_pages_case(bool windowed = false, bool bounded = false, boo
             const uint32_t per_gram = 2, vocab = coalesced ? 4093 : 1021, eos = 997;
             const uint32_t n_heads = (n_gram - 1)*per_gram, n_rows = n_heads*vocab;
             const size_t ubatch = coalesced || bounded ? ubatch_size : windowed ? 1 : 256;
-            const size_t chunk = coalesced ? ubatch : bounded ? std::min<size_t>(256, ubatch) : 256;
+            size_t chunk = coalesced ? ubatch : bounded ? std::min<size_t>(256, ubatch) : 256;
             const size_t n_tokens = 3*chunk + 17, size = (size_t) n_rows*4096;
+            if (coalesced && !bounded) {
+                chunk = std::max<size_t>(256, n_tokens);
+            }
             const char * tmp_dir = getenv("TMPDIR");
             std::string path = std::string(tmp_dir ? tmp_dir : ".") + "/llama-ple-window-XXXXXX";
             std::unique_ptr<char, void(*)(char *)> cleanup(coalesced ? &path[0] : nullptr, [](char * p) { unlink(p); });
@@ -1250,6 +1253,23 @@ static void ple_hash_pages_case(bool windowed = false, bool bounded = false, boo
             long long pages_read = -1;
             require(read_at && sscanf(read_at, " ms, %lld read", &pages_read) == 1, "prefetch page total logged");
             require(pages_read == (long long) (coalesced ? expected_reads : n_expected), "every requested page counted after readers join");
+            if (coalesced) {
+                require(ftruncate(fileno(file.get()), 0) == 0, "truncate prefetch file after successful reads");
+                pf->hint(tokens.data(), tokens.size(), pos0);
+                require(!pf->consume(tokens.size(), nullptr, 0), "incomplete file reads fall back without marking chunks ready");
+                summary.clear();
+                llama_log_set([](ggml_log_level, const char * text, void * data) {
+                    if (strstr(text, "[PLEPF]") && strstr(text, " tokens: ")) {
+                        *static_cast<std::string *>(data) = text;
+                    }
+                }, &summary);
+                pf->stop();
+                llama_log_set(nullptr, nullptr);
+                const char * failed_read_at = strstr(summary.c_str(), " ms, ");
+                long long failed_pages = -1;
+                require(failed_read_at && sscanf(failed_read_at, " ms, %lld read", &failed_pages) == 1 && failed_pages == 0,
+                        "incomplete file reads do not count successful pages");
+            }
             pf.reset();
             model.reset();
             ggml_backend_buffer_free(table->buffer);
@@ -1267,6 +1287,7 @@ static void ple_hash_pages_case(bool windowed = false, bool bounded = false, boo
     }
     if (coalesced) {
         printf("OK: file-backed coalescing obeys ubatch windows, exact run pages and read totals\n");
+        printf("OK: truncated prefetch reads fall back without completed chunks or page counts\n");
     }
 #else
     printf("SKIP: hash page test needs Linux\n");
@@ -1443,6 +1464,15 @@ static void ple_cold_recheck_case() {
 }
 
 int main(int argc, char ** argv) {
+    if (argc > 1 && strcmp(argv[1], "--ple-read-failure") == 0) {
+        try {
+            ple_hash_pages_case(false, false, true);
+            return 0;
+        } catch (const std::exception & e) {
+            fprintf(stderr, "prefetch read failure: FAIL: %s\n", e.what());
+            return 1;
+        }
+    }
     if (argc > 1 && strcmp(argv[1], "--ple-coalesce-window") == 0) {
         try {
             for (size_t chunk : { 384, 128, 1 }) {
