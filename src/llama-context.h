@@ -756,6 +756,7 @@ public:
 
     int32_t capture_arm(llama_seq_id seq_id, const llama_pos * n_tokens, int32_t n);
     int32_t capture_min_tail() const;
+    size_t  capture_size() const { return ckpt_size_hint.load(std::memory_order_acquire); }
     bool    capture_select(int32_t k, llama_pos * pos_min, llama_pos * pos_max);
 
 private:
@@ -763,6 +764,7 @@ private:
     bool                      ckpt_armed = false; // set by capture_arm, consumed by the next decode
     int32_t                   ckpt_sel   = -1;
     std::vector<ckpt_capture> ckpt_caps;
+    std::atomic<size_t>       ckpt_size_hint{0}; // largest laid-out capture blob, read by other threads
 
     // the recurrent memory whose PARTIAL_ONLY state the captures copy, nullptr when unsupported
     const llama_memory_recurrent * capture_mem() const;

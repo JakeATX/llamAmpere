@@ -4643,6 +4643,15 @@ bool llama_context::set_adapter_cvec(const float * data, size_t len, int32_t n_e
     return res;
 }
 
+// LLAMA_PP_LAYERS=3: host time of the process_ubatch phases outside set_inputs/graph_compute (memory seal, scheduler
+// reset, graph build, graph alloc; "pre" = KV stream adapt, MTP scratch and graph params in between), summed per B1
+// layer and printed after the layer's "[PP] ... end=" line
+static int64_t pp_phase_us[5] = {};
+static bool pp_phase_on() {
+    static const bool on = [] { const char * e = getenv("LLAMA_PP_LAYERS"); return e && atoi(e) >= 3; }();
+    return on;
+}
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch,
                                                  llm_graph_type           gtype,
                                                  llama_memory_context_i * mctx,
@@ -4655,10 +4664,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
     }
 
     // [B1] a layer slice seals its own layers for its ubatch (the bookkeeping was advanced when it was applied)
+    const bool pp_phase = b1_cur.active && pp_phase_on();
+    int64_t pp_t = pp_phase ? ggml_time_us() : 0;
+    auto pp_mark = [&](int i) {
+        if (pp_phase) { const int64_t t = ggml_time_us(); pp_phase_us[i] += t - pp_t; pp_t = t; }
+    };
     if (b1_cur.active ? (b1_cur.ffn_phase <= 1 && !b1_seal_sj_kvarn(b1_cur.il0, b1_cur.il1)) : !maintain_sj_kvarn()) {
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
+    pp_mark(0);
 
     // Consume feedback from the previous completed decode before building the
     // next graph. Repartition itself synchronizes only when hysteresis selects
@@ -4750,7 +4765,9 @@ build_graph:
         gf_res_prev_active = nullptr;
         res->reset();
 
+        pp_mark(1);
         ggml_backend_sched_reset(sched.get());
+        pp_mark(2);
         // fork PREFETCHFIX: the asynchronous prefetch reads its predictions on the device, so it
         // needs no per-node host callback (which would split graphs and disable CUDA graphs).
         static const bool prefetch_async = [] {
@@ -4764,6 +4781,7 @@ build_graph:
         //const auto t_start_us = ggml_time_us();
 
         gf = model.build_graph(gparams);
+        pp_mark(3);
 
         if (gf && (!model.hadamard_rotations.empty() || !model.hadamard_inverses.empty())) {
             llama_verify_hadamard_graph(gf, model.hadamard_rotations, model.hadamard_inverses);
@@ -4792,6 +4810,7 @@ build_graph:
             return nullptr;
         }
 
+        pp_mark(4);
         // [B1] a layer-range graph is never reused: its carry, KV views and expert slots change every call
         gf_res_prev_active = b1_cur.active ? nullptr : res;
         gf_res_prev_epoch  = ggml_backend_sched_get_alloc_epoch(sched.get());
@@ -7672,6 +7691,12 @@ bool llama_context::b1_run_prefix(llama_memory_context_i * mctx, size_t ub0, ggm
                     (b1_compute_submit_us - pp_compute0) / 1000.0, (int) model.hparams.is_ple(l0));
             LLAMA_LOG_INFO("%s: [PP] layer=%d inputs_ms=%.3f submit_ms=%.3f\n", __func__, l0,
                     (b1_pp_inputs_us - pp_inputs0) / 1000.0, (b1_pp_submit_us - pp_submit0) / 1000.0);
+            if (pp_phase_on()) {
+                LLAMA_LOG_INFO("%s: [PP] layer=%d seal_ms=%.3f pre_ms=%.3f sched_reset_ms=%.3f build_ms=%.3f alloc_ms=%.3f\n", __func__,
+                        l0, pp_phase_us[0] / 1000.0, pp_phase_us[1] / 1000.0, pp_phase_us[2] / 1000.0, pp_phase_us[3] / 1000.0,
+                        pp_phase_us[4] / 1000.0);
+                for (auto & us : pp_phase_us) { us = 0; }
+            }
 #if defined(__linux__)
             if (pp_usage && getrusage(RUSAGE_SELF, &pp_after) == 0) {
                 auto ms = [](const timeval & t) { return t.tv_sec * 1000.0 + t.tv_usec / 1000.0; };
@@ -8635,6 +8660,7 @@ int32_t llama_context::capture_arm(llama_seq_id seq_id, const llama_pos * n_toke
     ckpt_sel   = -1;
     ckpt_armed = false;
     ckpt_seq   = -1;
+    ckpt_size_hint.store(0, std::memory_order_release);
     if (n <= 0) {
         return 0;
     }
@@ -8736,6 +8762,9 @@ void llama_context::capture_ubatch(const llama_ubatch & ubatch, int32_t il0, int
                                 __func__, c.n_tokens, bytes/1048576.0);
                     } else {
                         c.blob.resize(bytes);
+                    }
+                    if (bytes > ckpt_size_hint.load(std::memory_order_relaxed)) {
+                        ckpt_size_hint.store(bytes, std::memory_order_release);
                     }
                 }
                 llama_io_write_layout io(c.blob_data(), c.blob_size(), c.writes, c.laid_out, c.blob_file != nullptr);
@@ -10258,6 +10287,10 @@ int32_t llama_state_seq_capture_arm(llama_context * ctx, llama_seq_id seq_id, co
 
 int32_t llama_state_seq_capture_min_tail(llama_context * ctx) {
     return ctx->capture_min_tail();
+}
+
+size_t llama_state_seq_capture_size(llama_context * ctx) {
+    return ctx->capture_size();
 }
 
 bool llama_state_seq_capture_select(llama_context * ctx, int32_t k, llama_pos * pos_min, llama_pos * pos_max) {

@@ -3487,7 +3487,11 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             // the attended position count: the mask width, or n_kv for the packed mask (op_params[0] of the input;
             // a row view's op_params hold its offset, so read the source tensor's)
             const ggml_tensor * kq_mask_src = kq_mask && kq_mask->view_src ? kq_mask->view_src : kq_mask;
-            const int64_t n_kv_pad = kq_mask && kq_mask->type == GGML_TYPE_I32 ? kq_mask_src->op_params[0] :
+            // (a packed mask built in the graph, LLAMA_QSA_ROWS_MASK, has no n_kv there: every bit of a row counts)
+            const int64_t n_kv_packed = kq_mask && kq_mask->type == GGML_TYPE_I32 && kq_mask_src->op == GGML_OP_NONE ?
+                                        kq_mask_src->op_params[0] : 0;
+            const int64_t n_kv_pad = kq_mask && kq_mask->type == GGML_TYPE_I32 ?
+                                     (n_kv_packed > 0 ? n_kv_packed : kq_mask->ne[0]*32) :
                                      kq_mask ? kq_mask->ne[0] : 0;
             GGML_ASSERT(kq_mask && n_kv_pad > 0 && n_kv_pad % 64 == 0);
             cur->src[7] = sj_kvarn_pending.selected;

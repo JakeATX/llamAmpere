@@ -3193,9 +3193,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         // copy the input tensors to the split backend
         // the weights in host memory are copied last, so that the copy callback can read the other inputs of the split
+        // GGML_CUDA_HOST_BLOCK_MS=<ms> (diagnostic): name each input copy whose host call takes >= <ms>
+        static const float host_block_ms = [] { const char * e = getenv("GGML_CUDA_HOST_BLOCK_MS"); return e && *e ? (float) atof(e) : 0.0f; }();
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             if (!ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
+                const int64_t t0 = host_block_ms > 0.0f ? ggml_time_us() : 0;
                 ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
+                if (host_block_ms > 0.0f && (ggml_time_us() - t0) / 1000.0f >= host_block_ms) {
+                    GGML_LOG_INFO("[HOSTBLOCK] input split=%d %s (%s) bytes=%zu ms=%.2f\n", split_id, split->inputs[input_id]->name,
+                            ggml_backend_name(split_backend), ggml_nbytes(split->inputs[input_id]), (ggml_time_us() - t0) / 1000.0f);
+                }
             }
         }
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {

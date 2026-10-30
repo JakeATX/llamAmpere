@@ -1878,19 +1878,6 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
         return mask;
     }
 
-    // In place, the selection is a row-strided view of mask_all: keep the stride a multiple of 16 bytes for FA.
-    // Compact attention above never constructs these history-wide mask buffers.
-    const int64_t n_row = sel_inplace ? GGML_PAD(n_kv + n_sel, 64) : n_kv + n_sel;
-    ggml_tensor * mask_all = ggml_new_tensor_4d(ctx0, kq_mask->type, n_row, 1, 1, 1);
-    mask_all = ggml_fill(ctx0, mask_all, -INFINITY);
-    mask_all = ggml_repeat_4d(ctx0, mask_all, n_row, n_tokens, 1, 1);
-    mask_all = ggml_reshape_3d(ctx0, mask_all, 1, n_row, n_tokens);
-
-    ggml_tensor * zeros = ggml_new_tensor_4d(ctx0, kq_mask->type, n_sel, 1, 1, 1);
-    zeros = ggml_fill(ctx0, zeros, 0.0f);
-    zeros = ggml_repeat_4d(ctx0, zeros, n_sel, n_tokens, 1, 1);
-    zeros = ggml_reshape_3d(ctx0, zeros, 1, n_sel, n_tokens);
-
     // dump rows n_kv + slot as a cumulative sum: the meta backend cannot split an arange, which has no source
     ggml_tensor * dump  = ggml_scale_bias(ctx0, ggml_cumsum(ctx0, ggml_fill(ctx0, live, 1.0f)), 1.0f, (float) (n_kv - 1));
     ggml_tensor * idx_f = ggml_cast(ctx0, sel_idx, GGML_TYPE_F32);
@@ -1903,13 +1890,38 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     // so the finite cells of the selection below are exactly the slots < n_kv; the attention node gets these rows too
     // (src[8]) and the CUDA sparse path builds its per-tile cell lists from them without reading the mask
     static const int direct_lists = [] { const char * e = getenv("LLAMA_QSA_DIRECT_LISTS"); return e ? atoi(e) : 0; }();
-    if (direct_lists > 0 && sel_direct && n_tokens > 1 && kq_mask->ne[2] == 1 && kq_mask->ne[3] == 1) {
+    const bool use_rows = direct_lists > 0 && sel_direct && n_tokens > 1 && kq_mask->ne[2] == 1 && kq_mask->ne[3] == 1;
+    if (use_rows) {
         GGML_ASSERT(fa_sel_rows == nullptr);
         fa_sel_rows = sel_idx;
     }
     if (sel_inplace) {
         ggml_build_forward_expand(gf, sel_idx);
     }
+
+    // LLAMA_QSA_ROWS_MASK=1 (opt-in, needs DIRECT_LISTS + DIRECT): with the rows on the attention node, a prompt batch gets
+    // a zero-filled one-bit mask (n_kv/32 I32 words per token, ~0.15 GB at 100K x 12288) instead of the f16 selection
+    // (~2.4 GB filled, repeated and scattered every attention ubatch); the CUDA attention node sets the bit of each row
+    // cell < n_kv before any route reads the mask (ggml_cuda_flash_attn_ext_rows_mask): the same visible cells
+    static const bool rows_mask = [] { const char * e = getenv("LLAMA_QSA_ROWS_MASK"); return e && atoi(e) != 0; }();
+    if (rows_mask && use_rows && n_kv % 128 == 0 && kq_mask->ne[0] == n_kv && kq_mask->ne[1] == n_tokens) {
+        ggml_tensor * bits = ggml_fill_inplace(ctx0, ggml_new_tensor_4d(ctx0, GGML_TYPE_I32, n_kv/32, n_tokens, 1, 1), 0.0f);
+        cb(bits, "indexer_sel_bits", il);
+        return bits;
+    }
+
+    // In place, the selection is a row-strided view of mask_all: keep the stride a multiple of 16 bytes for FA.
+    // Compact attention above never constructs these history-wide mask buffers.
+    const int64_t n_row = sel_inplace ? GGML_PAD(n_kv + n_sel, 64) : n_kv + n_sel;
+    ggml_tensor * mask_all = ggml_new_tensor_4d(ctx0, kq_mask->type, n_row, 1, 1, 1);
+    mask_all = ggml_fill(ctx0, mask_all, -INFINITY);
+    mask_all = ggml_repeat_4d(ctx0, mask_all, n_row, n_tokens, 1, 1);
+    mask_all = ggml_reshape_3d(ctx0, mask_all, 1, n_row, n_tokens);
+
+    ggml_tensor * zeros = ggml_new_tensor_4d(ctx0, kq_mask->type, n_sel, 1, 1, 1);
+    zeros = ggml_fill(ctx0, zeros, 0.0f);
+    zeros = ggml_repeat_4d(ctx0, zeros, n_sel, n_tokens, 1, 1);
+    zeros = ggml_reshape_3d(ctx0, zeros, 1, n_sel, n_tokens);
 
     ggml_tensor * sel = ggml_set_rows(ctx0, mask_all, zeros, ggml_reshape_3d(ctx0, sel_idx, n_sel, n_tokens, 1));
 
@@ -1979,7 +1991,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     ggml_tensor * kq_mask = inp->get_kq_mask();
     // an in-place selection is a row-strided view that already has the mask shape
     GGML_ASSERT(sel_ids || ggml_is_contiguous(sel) || ggml_are_same_shape(sel, kq_mask));
-    ggml_tensor * mask = sel_ids ? sel : ggml_is_contiguous(sel) ?
+    // LLAMA_QSA_ROWS_MASK: a packed I32 selection is already [n_kv/32, n_tokens]
+    ggml_tensor * mask = sel_ids || sel->type == GGML_TYPE_I32 ? sel : ggml_is_contiguous(sel) ?
             ggml_reshape_4d(ctx0, sel, kq_mask->ne[0], kq_mask->ne[1], kq_mask->ne[2], kq_mask->ne[3]) : sel;
     cb(mask, "kq_mask_qsa", il);
 
@@ -2366,10 +2379,12 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override {
         mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx)->get_attn();
-        return rows->ne[0] == (int64_t) model.hparams.ple_n_heads * params.ubatch.n_tokens;
+        const int64_t n = (int64_t) model.hparams.ple_n_heads * params.ubatch.n_tokens;
+        return emb_in ? emb_in->ne[1] == n : rows->ne[0] == n;
     }
 
     ggml_tensor * rows = nullptr;   // I32 [ple_n_heads * n_tokens]
+    ggml_tensor * emb_in = nullptr; // fork LLAMA_PLE_DECODE: F32 [row elements, ple_n_heads * n_tokens], replaces rows
 
     const llama_model & model;
 
@@ -2416,7 +2431,16 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
     // predecessors come from the KV cells (ext.tok); apply_ubatch() already stored this ubatch, so its own tokens count too
     mctx->get_prev_tokens(*ubatch, n_prev, prev);
 
+    // fork: reuse each unsigned hash prefix; keep the original path until exact-row gates pass.
+    static const bool hash_prefix = [] {
+        const char * v = getenv("LLAMA_PLE_HASH_PREFIX");
+        return v && atoi(v) != 0;
+    }();
     for (int64_t i = 0; i < n_tokens; ++i) {
+        if (hash_prefix) {
+            llama_ple_hash_rows(hparams, tok_of(i), prev.data() + i*n_prev, idx.data() + i*n_heads);
+            continue;
+        }
         // an EOS in the window resets everything at or before it
         // a missing predecessor (before the sequence start, or no cached cell) reads as EOS
         // the EOS of the token itself does not cut its own context, as in the reference
@@ -2467,6 +2491,11 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
         }
     }
 
+    if (emb_in) {
+        pf->gather((uint32_t) n_tokens, idx.data(), idx.size(), emb_in);
+        return;
+    }
+
     ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
 }
 
@@ -2478,7 +2507,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
         ggml_tensor *        x,
         int64_t              state_cols,
         int64_t              channels,
-        int                  il) {
+        int                  il,
+        bool                 chan_major) {
     const auto * mctx_cur = inp->mctx;
 
     const auto kv_head = mctx_cur->get_head();
@@ -2509,7 +2539,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
     ggml_tensor * state = ggml_reshape_3d(ctx0, rows, state_cols, channels, n_seqs);
     cb(state, "conv_state_at", il);
 
-    ggml_tensor * conv_input = ggml_concat(ctx0, state, ggml_transpose(ctx0, x), 0);
+    // chan_major: x is [channels, T, n_seqs] and the result stays channel-major ([channels, state_cols + T, n_seqs]),
+    // so only the small history is transposed instead of every new column; the cache rows keep their layout
+    ggml_tensor * conv_input = chan_major
+        ? ggml_concat(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, state, 1, 0, 2, 3)), x, 1)
+        : ggml_concat(ctx0, state, ggml_transpose(ctx0, x), 0);
 
     // [TAG_RECURRENT_ROLLBACK_SPLITS] keep the last state_cols columns once per rollback slot,
     // slot s ending s tokens earlier so a rollback of s tokens reads a history that never saw them
@@ -2531,9 +2565,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
     }
 
     for (int64_t slot = 0; slot < n_written; ++slot) {
-        const int64_t s_idx = conv_input->ne[0] - state_cols - slot; // = n_seq_tokens - slot >= 1
+        const int64_t s_idx = conv_input->ne[chan_major ? 1 : 0] - state_cols - slot; // = n_seq_tokens - slot >= 1
 
-        ggml_tensor * tail = ggml_view_3d(ctx0, conv_input,
+        ggml_tensor * tail = chan_major
+            ? ggml_permute(ctx0, ggml_view_3d(ctx0, conv_input,
+                    channels, state_cols, n_seqs,
+                    conv_input->nb[1], conv_input->nb[2],
+                    s_idx * conv_input->nb[1]), 1, 0, 2, 3)
+            : ggml_view_3d(ctx0, conv_input,
                 state_cols, channels, n_seqs,
                 conv_input->nb[1], conv_input->nb[2],
                 ggml_row_size(conv_input->type, s_idx));
@@ -2568,14 +2607,23 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
     auto ple_inp = std::make_unique<llm_graph_input_qwen4exp_ple>(model, mctx_hyb->get_attn());
     ple_inp->pf = ple_pf;
 
-    ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
-    ggml_set_input(ple_inp->rows);
-    ggml_tensor * rows = ple_inp->rows;
-    res->add_input(std::move(ple_inp));
-
-    // gather then flatten the heads: get_rows lays the head dimension out slowest, as the reference does
     ggml_tensor * table = model.ple_cache ? model.ple_cache->tensor : model.per_layer_tok_embd;
-    ggml_tensor * emb = ggml_get_rows(ctx0, table, rows);
+    ggml_tensor * emb = nullptr;
+    // fork LLAMA_PLE_DECODE=1: prompt ubatches take rows the context decoded ahead on the host (same values)
+    if (ple_pf && ple_pf->decode_enabled() && !model.ple_cache && (uint32_t) n_tokens >= ple_pf->decode_min()) {
+        ple_inp->emb_in = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, table->ne[0], n_heads * n_tokens);
+        ggml_set_input(ple_inp->emb_in);
+        emb = ple_inp->emb_in;
+        res->add_input(std::move(ple_inp));
+    } else {
+        ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
+        ggml_set_input(ple_inp->rows);
+        ggml_tensor * rows = ple_inp->rows;
+        res->add_input(std::move(ple_inp));
+
+        // gather then flatten the heads: get_rows lays the head dimension out slowest, as the reference does
+        emb = ggml_get_rows(ctx0, table, rows);
+    }
     emb = ggml_reshape_2d(ctx0, emb, hparams.ple_head_dim * n_heads, n_tokens);
     cb(emb, "ple_embd", -1);
 
@@ -2611,8 +2659,23 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
     cb(gate, "ple_gate", il);
 
     // [n_embd, 1, T] value broadcast across the hc streams, scaled by the gate
-    ggml_tensor * v3 = ggml_reshape_3d(ctx0, value, n_embd, 1, n_tokens);
-    v3 = ggml_repeat_4d(ctx0, v3, n_embd, hc, n_tokens, 1);
+    // LLAMA_PLE_GATE_BCAST=1 (opt-in): read the value through a stride-0 view over the hc axis instead of
+    // materializing the [n_embd, hc, T] repeat (~0.5 GB written and read back per 12,288-token ubatch). The mul
+    // sees the same value for every stream, so the same products and the same bits.
+    static const bool gate_bcast = [] {
+        const char * e = getenv("LLAMA_PLE_GATE_BCAST");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    ggml_tensor * v3 = nullptr;
+    if (gate_bcast && ggml_is_contiguous(value)) {
+        // created at [n_embd, 1, T] (the view size check needs the extent to fit), then the hc axis is widened with
+        // stride 0; ggml_nbytes of the result still equals the value's
+        v3 = ggml_view_4d(ctx0, value, n_embd, 1, n_tokens, 1, value->nb[1], value->nb[1], value->nb[1] * n_tokens, 0);
+        v3->ne[1] = hc;
+        v3->nb[1] = 0;
+    } else {
+        v3 = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, value, n_embd, 1, n_tokens), n_embd, hc, n_tokens, 1);
+    }
 
     ggml_tensor * gated = ggml_mul(ctx0, v3, gate);
     cb(gated, "ple_gated_value", il);
@@ -2634,17 +2697,59 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
     const int64_t n_seqs       = ubatch.n_seqs;
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
 
-    // [hist + n_seq_tokens, hc_dim, n_seqs], tokens on ne[0]
+    // LLAMA_PLE_CONV_CM=1 (opt-in): keep the padded input channel-major, [hc_dim, hist + n_seq_tokens, n_seqs], so
+    // each tap is a plain column-offset view instead of a transposed copy of the whole ubatch (4 per ubatch, the
+    // first ~13 ms at 12,288 tokens). Same products in the same order, so the same bits.
+    static const bool conv_cm = [] {
+        const char * e = getenv("LLAMA_PLE_CONV_CM");
+        return e != nullptr && atoi(e) != 0;
+    }();
+
+    // LLAMA_PLE_CONV_SSM=1 (opt-in, overrides LLAMA_PLE_CONV_CM): the dilated conv is one ssm_conv over the
+    // token-major padded input with a (kern-1)*dil+1 wide kernel that is zero between the taps (tap k sits at
+    // column k*dil), so the 4 shifted transposed copies, 4 muls, 3 adds and the final cont become one launch
+    // (CUDA fuses the silu). Same taps; the sum gains exact zero terms and may use FMA, so valid-math, not same bits.
+    static const bool conv_ssm = [] {
+        const char * e = getenv("LLAMA_PLE_CONV_SSM");
+        return e != nullptr && atoi(e) != 0;
+    }();
+
+    // default: [hist + n_seq_tokens, hc_dim, n_seqs], tokens on ne[0]
     ggml_tensor * padded = build_conv_state_at(inp, inp->mctx->get_p_l(il),
             ggml_reshape_3d(ctx0, normalized, hc_dim, n_seq_tokens, n_seqs),
-            hist, hc_dim, il);
+            hist, hc_dim, il, conv_cm && !conv_ssm);
+
+    if (conv_ssm) {
+        ggml_tensor * w = model.layers[il].ple_conv1d;  // [kern, hc_dim]
+        w = w->type == GGML_TYPE_F32 ? w : ggml_cast(ctx0, w, GGML_TYPE_F32);
+        // dil-1 zero columns between taps: 0 * w keeps the shape and is exactly zero for finite weights
+        ggml_tensor * gap = dil > 1
+            ? ggml_scale(ctx0, ggml_cont(ctx0, ggml_view_2d(ctx0, w, dil - 1, hc_dim, w->nb[1], 0)), 0.0f)
+            : nullptr;
+        ggml_tensor * wide = nullptr;
+        for (int64_t k = 0; k < kern; ++k) {
+            ggml_tensor * col = ggml_view_2d(ctx0, w, 1, hc_dim, w->nb[1], k * w->nb[0]);
+            wide = wide ? ggml_concat(ctx0, gap ? ggml_concat(ctx0, wide, gap, 0) : wide, col, 0) : col;
+        }
+        wide = ggml_cont(ctx0, wide);  // [hist + 1, hc_dim]
+        GGML_ASSERT(wide->ne[0] == hist + 1);
+
+        ggml_tensor * conv_out = ggml_silu(ctx0, ggml_ssm_conv(ctx0, padded, wide));  // [hc_dim, n_seq_tokens, n_seqs]
+        conv_out = ggml_reshape_3d(ctx0, conv_out, n_embd, hc, n_tokens);
+        cb(conv_out, "ple_conv_out", il);
+
+        return ggml_add(ctx0, hidden, ggml_add(ctx0, gated, conv_out));
+    }
 
     ggml_tensor * conv_out = nullptr;
     for (int64_t k = 0; k < kern; ++k) {
         // tap k reads (kern-1-k)*dilation positions back
         const int64_t start = hist - (kern - 1 - k) * dil;
 
-        ggml_tensor * shifted = ggml_cont(ctx0,
+        ggml_tensor * shifted = conv_cm
+            ? ggml_view_3d(ctx0, padded, hc_dim, n_seq_tokens, n_seqs,
+                    padded->nb[1], padded->nb[2], start * padded->nb[1])
+            : ggml_cont(ctx0,
                 ggml_transpose(ctx0,
                         ggml_view_3d(ctx0, padded, n_seq_tokens, hc_dim, n_seqs,
                                 padded->nb[1], padded->nb[2],

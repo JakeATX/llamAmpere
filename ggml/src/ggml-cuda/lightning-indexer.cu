@@ -841,22 +841,68 @@ static __global__ void lightning_indexer_kernel_tile(
 static __global__ void __launch_bounds__(256, 2) lightning_indexer_kernel_exact(
         const float * Q, const char * K, const float * W, const half * M, float * dst,
         int64_t n_batch, int64_t n_kv, size_t nb1, size_t nb3, size_t nbq1, size_t nbq2, size_t nbq3,
-        size_t nbk2, size_t nbk3, size_t nbw1, size_t nbw3, size_t nbm1, size_t nbm3, int64_t nem3, bool mrange) {
+        size_t nbk2, size_t nbk3, size_t nbw1, size_t nbw3, size_t nbm1, size_t nbm3, int64_t nem3, bool mrange,
+        bool skip_dead, int swizzle) {
     constexpr int N_HEAD = 4;
     constexpr int N_EMBD = 128;
-
-    // rows of q_s are query rows (token-major, head-minor), rows of k_s are keys; both stored element-major
-    __shared__ __align__(16) float q_s[LIX_CHUNK][LIX_LD];
-    __shared__ __align__(16) float k_s[LIX_CHUNK][LIX_LD];
-    __shared__ float w_s[LIX_TOKENS][N_HEAD];
 
     const int tid = threadIdx.x;
     const int tx  = tid % 16; // keys 4*tx..4*tx+3 and 64+4*tx..64+4*tx+3
     const int ty  = tid / 16; // tokens 2*ty and 2*ty+1, query rows 8*ty..8*ty+7
 
-    const int64_t start_kv    = (int64_t) blockIdx.x * LIX_KEYS;
-    const int64_t start_batch = (int64_t) blockIdx.y * LIX_TOKENS;
+    int kv_tile    = blockIdx.x;
+    int batch_tile = blockIdx.y;
+    // fork (opt-in GGML_CUDA_LID_SWIZZLE=<G>): blocks run in groups of G key tiles x every token tile, key tile fastest,
+    // so a group's keys stay in L2 while the queries stream once per group (default order re-reads every key tile from
+    // DRAM once per 32 tokens when the keys exceed L2). Each block computes the same outputs: same bits.
+    if (swizzle > 0) {
+        const int n_kv_tiles  = gridDim.x;
+        const int group_size  = min(swizzle, n_kv_tiles);
+        const int64_t n_group = int64_t(group_size) * gridDim.y;
+        const int64_t lin     = blockIdx.x + int64_t(blockIdx.y) * gridDim.x;
+        const int group       = lin / n_group;
+        const int64_t within  = lin % n_group;
+        const int g_kv        = min(group_size, n_kv_tiles - group * group_size);
+        kv_tile    = group * group_size + within % g_kv;
+        batch_tile = within / g_kv;
+    }
+
+    const int64_t start_kv    = (int64_t) kv_tile * LIX_KEYS;
+    const int64_t start_batch = (int64_t) batch_tile * LIX_TOKENS;
     const int     stream      = blockIdx.z;
+
+    // fork (opt-in GGML_CUDA_LID_SKIP_DEAD=1, range masks only): a key tile outside every token's visible range [lo, hi)
+    // only ever writes -inf (the mask add returns -inf whatever the score), so it writes that without the products.
+    if (skip_dead && mrange) {
+        bool live = false;
+        if (tid < LIX_TOKENS && start_batch + tid < n_batch) {
+            const int * r = (const int *) ((const char *) M + (start_batch + tid)*nbm1 + (stream % nem3)*nbm3);
+            live = r[0] < r[1] && r[0] < start_kv + LIX_KEYS && r[1] > start_kv;
+        }
+        if (!__syncthreads_or(live)) {
+#pragma unroll
+            for (int t = 0; t < 2; ++t) {
+                const int64_t i_batch = start_batch + 2*ty + t;
+                if (i_batch >= n_batch) {
+                    continue;
+                }
+                float * dst_base = (float *) ((char *) dst + i_batch*nb1 + stream*nb3);
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const int64_t i_kv = start_kv + (j < 4 ? 4*tx + j : 64 + 4*tx + j - 4);
+                    if (i_kv < n_kv) {
+                        dst_base[i_kv] = -INFINITY;
+                    }
+                }
+            }
+            return;
+        }
+    }
+
+    // rows of q_s are query rows (token-major, head-minor), rows of k_s are keys; both stored element-major
+    __shared__ __align__(16) float q_s[LIX_CHUNK][LIX_LD];
+    __shared__ __align__(16) float k_s[LIX_CHUNK][LIX_LD];
+    __shared__ float w_s[LIX_TOKENS][N_HEAD];
 
     if (tid < LIX_TOKENS * N_HEAD) {
         const int64_t t = start_batch + tid / N_HEAD;
@@ -1135,6 +1181,20 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
             const char * value = getenv("GGML_CUDA_LID_EXACT");
             return value != nullptr ? atoi(value) : 0;
         }();
+        static const bool skip_dead = [] {
+            const char * value = getenv("GGML_CUDA_LID_SKIP_DEAD");
+            return value != nullptr && value[0] == '1';
+        }();
+        static const int swizzle = [] {
+            const char * value = getenv("GGML_CUDA_LID_SWIZZLE");
+            if (value == nullptr) {
+                return 0;
+            }
+            char * end = nullptr;
+            const long parsed = strtol(value, &end, 10);
+            return end != value && *end == '\0' && parsed > 0
+                ? int(std::min(parsed, long(std::numeric_limits<int>::max()))) : 0;
+        }();
         if (exact_mode > 0 && k->type == GGML_TYPE_F32 && GGML_CUDA_CC_IS_NVIDIA(cc)) {
             ggml_cuda_pool_alloc<char> ref(ctx.pool());
             if (exact_mode == 2) {
@@ -1147,7 +1207,7 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
             const dim3 grid_x((n_kv + LIX_KEYS - 1) / LIX_KEYS, (n_batch + LIX_TOKENS - 1) / LIX_TOKENS, n_stream);
             lightning_indexer_kernel_exact<<<grid_x, 256, 0, ctx.stream()>>>(
                 q_d, k_d, w_d, m_d, dst_d, n_batch, n_kv, nb1, nb3, nbq1, nbq2, nbq3,
-                nbk2, nbk3, nbw1, nbw3, nbm1, nbm3, nem3, mrange);
+                nbk2, nbk3, nbw1, nbw3, nbm1, nbm3, nem3, mrange, skip_dead, swizzle);
             if (exact_mode == 2) {
                 static unsigned long long n_calls = 0, n_diff_total = 0, n_out_total = 0;
                 ggml_cuda_pool_alloc<unsigned long long> n_diff(ctx.pool(), 1);

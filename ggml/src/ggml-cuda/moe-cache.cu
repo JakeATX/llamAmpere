@@ -6504,7 +6504,14 @@ static int moe_cache_warm(void * opaque, const ggml_moe_cache_tensor_desc * tens
     struct warm_fill { moe_cache_device * device; moe_cache_job job; char * destination; };
     struct warm_batch { std::vector<warm_fill> fills; size_t bytes = 0; cudaEvent_t done = nullptr; bool issued = false; };
     const char * warm_batch_env = getenv("GGML_MOE_CACHE_WARM_BATCH");
-    const bool batch_warm = loading && warm_batch_env && atoi(warm_batch_env) != 0;
+    // [PPWARM] GGML_MOE_CACHE_WARM_BATCH=2 also batches the post-prompt warm (B1 return), which otherwise
+    // goes through the worker's per-expert stage copy and wait inside prompt time. Off by default.
+    const int warm_batch_mode = warm_batch_env ? atoi(warm_batch_env) : 0;
+    const bool batch_warm = loading ? warm_batch_mode != 0 : warm_batch_mode >= 2;
+    // [PPWARM] GGML_MOE_CACHE_PROMPT_WARM_CAP=N: queue at most N hottest fills in the post-prompt warm;
+    // the remaining free slots are left to decode-time admission. Test knob, off (0) by default.
+    static const int64_t prompt_warm_cap = [] { const char * v = getenv("GGML_MOE_CACHE_PROMPT_WARM_CAP"); return v ? std::max<int64_t>(0, atoll(v)) : 0; }();
+    bool warm_capped = false;
     const size_t batch_bytes_max = (size_t) 256 << 20;
     std::vector<std::pair<moe_cache_device *, cudaStream_t>> warm_streams;
     warm_batch batches[2];
@@ -6601,6 +6608,10 @@ static int moe_cache_warm(void * opaque, const ggml_moe_cache_tensor_desc * tens
         if (moe_bank_has(tensors[c.tensor].data, c.expert)) {
             continue; // computed by the always-resident bank
         }
+        if (!loading && prompt_warm_cap > 0 && queued >= prompt_warm_cap) {
+            warm_capped = true;
+            break;
+        }
         std::unique_ptr<moe_cache_node, decltype(&moe_cache_end)> node(begin(c.tensor), moe_cache_end);
         if (!node) {
             continue;
@@ -6683,8 +6694,8 @@ static int moe_cache_warm(void * opaque, const ggml_moe_cache_tensor_desc * tens
         warm_wait(batches[1]);
         for (auto & b : batches) { if (b.done) { (void) cudaEventDestroy(b.done); } }
         for (const auto & s : warm_streams) { if (s.second) { (void) cudaStreamDestroy(s.second); } }
-        MOE_CACHE_LOG("[moe-cache] [LOADFAST] profile warm batched: %zu copies in %zu batches (direct from host source, one wait per batch)\n",
-                batch_copies, batch_count);
+        MOE_CACHE_LOG("[moe-cache] [LOADFAST] %s warm batched: %zu copies in %zu batches (direct from host source, one wait per batch)\n",
+                loading ? "profile" : "prompt", batch_copies, batch_count);
     }
     {
         std::unique_lock<std::mutex> lock(session->mu);
@@ -6699,6 +6710,9 @@ static int moe_cache_warm(void * opaque, const ggml_moe_cache_tensor_desc * tens
     }
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
     MOE_CACHE_LOG("[moe-cache] %s warm: %d queued of %zu touched entries, %.3f ms; decode lookup counters unchanged\n", loading ? "profile" : "prompt", queued, ranked.size(), ms);
+    if (warm_capped) {
+        MOE_CACHE_LOG("[moe-cache] [PPWARM] prompt warm capped at %lld fills (GGML_MOE_CACHE_PROMPT_WARM_CAP)\n", (long long) prompt_warm_cap);
+    }
     return queued;
 }
 

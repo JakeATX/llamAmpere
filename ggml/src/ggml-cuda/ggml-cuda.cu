@@ -4356,6 +4356,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             // different head_dim still gets a runtime attached but can't use
             // the streamed kernel - fall back to plain attention instead of
             // asserting inside ggml_cuda_kv_stream_fattn.
+            ggml_cuda_flash_attn_ext_rows_mask(ctx, dst);
             if ((ggml_cuda_kv_stream_runtime_from_tensor(dst->src[1]) != nullptr ||
                     ggml_cuda_kv_stream_runtime_from_tensor(dst->src[2]) != nullptr) &&
                     ggml_cuda_kv_stream_fattn_fits(dst)) {
@@ -10461,6 +10462,8 @@ static cudaEvent_t ggml_cuda_shexp_side_event(int device, int which) {
 // GGML_CUDA_OP_TIMES=<ms> (diagnostic, off by default): for uncaptured graphs, time each node on the main stream
 // with events and on the host, and log the slowest op kinds of every graph whose GPU time is >= <ms>.
 // Fused nodes count toward the first node of the fusion. Synchronizes once per graph.
+// GGML_CUDA_OP_TIMES_TOP=<n> lists the n slowest op kinds instead of 8; GGML_CUDA_OP_TIMES_NODES=<n> logs only
+// graphs with exactly n nodes (e.g. the PLE layer's graph), so a long list stays readable.
 struct ggml_cuda_op_times {
     std::vector<cudaEvent_t> ev;
     std::vector<std::pair<int, int64_t>> marks; // node index, host us
@@ -10468,6 +10471,14 @@ struct ggml_cuda_op_times {
 
     static float min_ms() {
         static const float v = [] { const char * e = getenv("GGML_CUDA_OP_TIMES"); return e && *e ? (float) atof(e) : 0.0f; }();
+        return v;
+    }
+    static size_t top_n() {
+        static const size_t v = [] { const char * e = getenv("GGML_CUDA_OP_TIMES_TOP"); return e && atoi(e) > 0 ? (size_t) atoi(e) : (size_t) 8; }();
+        return v;
+    }
+    static int only_nodes() {
+        static const int v = [] { const char * e = getenv("GGML_CUDA_OP_TIMES_NODES"); return e ? atoi(e) : 0; }();
         return v;
     }
     void mark(int device_, cudaStream_t stream, int i) {
@@ -10503,11 +10514,11 @@ struct ggml_cuda_op_times {
             acc.second += (marks[k + 1].second - marks[k].second) / 1000.0f;
             total += ms;
         }
-        if (total >= min_ms() && !by_op.empty()) {
+        if (total >= min_ms() && !by_op.empty() && (only_nodes() <= 0 || only_nodes() == cgraph->n_nodes)) {
             std::vector<std::pair<std::string, std::pair<float, float>>> v(by_op.begin(), by_op.end());
             std::sort(v.begin(), v.end(), [](const auto & a, const auto & b) { return a.second.first > b.second.first; });
             std::string line;
-            for (size_t k = 0; k < v.size() && k < 8; ++k) {
+            for (size_t k = 0; k < v.size() && k < top_n(); ++k) {
                 char buf[192];
                 snprintf(buf, sizeof(buf), " %s=%.2f/%.2f", v[k].first.c_str(), v[k].second.first, v[k].second.second);
                 line += buf;
@@ -10516,6 +10527,32 @@ struct ggml_cuda_op_times {
                     (marks.back().second - marks.front().second) / 1000.0f, line.c_str());
         }
         marks.clear();
+    }
+};
+
+// GGML_CUDA_HOST_BLOCK_MS=<ms> (diagnostic, off by default, adds no synchronization): log every node launch and
+// every graph-end hook whose host call takes >= <ms>, i.e. the op that makes the host wait inside graph compute.
+struct ggml_cuda_host_block_timer {
+    static float min_ms() {
+        static const float v = [] { const char * e = getenv("GGML_CUDA_HOST_BLOCK_MS"); return e && *e ? (float) atof(e) : 0.0f; }();
+        return v;
+    }
+    int64_t t0 = 0;
+    void begin() {
+        if (min_ms() > 0.0f) {
+            t0 = ggml_time_us();
+        }
+    }
+    void end(const char * what, const ggml_tensor * node) {
+        if (min_ms() <= 0.0f) {
+            return;
+        }
+        const float ms = (ggml_time_us() - t0) / 1000.0f;
+        if (ms >= min_ms()) {
+            GGML_LOG_INFO("[HOSTBLOCK] %s %s (%s) ne=[%lld,%lld,%lld] ms=%.2f\n", what, node ? node->name : "-",
+                    node ? ggml_op_desc(node) : "-", node ? (long long) node->ne[0] : 0LL,
+                    node ? (long long) node->ne[1] : 0LL, node ? (long long) node->ne[2] : 0LL, ms);
+        }
     }
 };
 
@@ -10669,6 +10706,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             static thread_local ggml_cuda_op_times op_times_state;
             ggml_cuda_op_times * op_times = !use_cuda_graph && ggml_cuda_op_times::min_ms() > 0.0f ? &op_times_state : nullptr;
             cudaStream_t op_times_stream = cuda_ctx->stream(cuda_ctx->device, 0);
+            ggml_cuda_host_block_timer host_block;
 
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
@@ -10818,7 +10856,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 GGML_UNUSED(integrated);
 #endif  // NDEBUG
 
+                host_block.begin();
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                host_block.end("node", node);
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
@@ -10851,15 +10891,25 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             if (autofuse) {
                 ggml_cuda_autofuse_report(*cuda_ctx, *autofuse);
             }
+            host_block.begin();
             for (auto * runtime : kv_stream_runtimes) {
                 ggml_cuda_kv_stream_graph_end(runtime->transfer_ring, cuda_ctx->stream());
             }
+            host_block.end("kv_stream_graph_end", nullptr);
 
+            host_block.begin();
             ggml_cuda_gdn_state_read_finish(cuda_ctx);
             ggml_cuda_gdn_replay_direct_finish(cuda_ctx);
+            host_block.end("gdn_state_read_finish", nullptr);
+            host_block.begin();
             ggml_cuda_lid_gather_finish(cuda_ctx);
+            host_block.end("lid_gather_finish", nullptr);
+            host_block.begin();
             ggml_cuda_conv_ring_finish(cuda_ctx);
+            host_block.end("conv_ring_finish", nullptr);
+            host_block.begin();
             ggml_cuda_moe_cache_hf_graph_end(*cuda_ctx);
+            host_block.end("moe_cache_hf_graph_end", nullptr);
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
             if (ggml_cuda_moe_table_prefetch_enabled()) {
                 // The table copy branch rejoins here, before cudaStreamEndCapture.
@@ -12377,7 +12427,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return true;
         case GGML_OP_FILL:
             return op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16 ||
-                (op->type == GGML_TYPE_Q8_0 && ggml_is_contiguous(op));
+                op->type == GGML_TYPE_I32 || (op->type == GGML_TYPE_Q8_0 && ggml_is_contiguous(op));
         case GGML_OP_LIGHTNING_INDEXER:
             return ggml_cuda_lightning_indexer_supported(dev_ctx->device, op);
 

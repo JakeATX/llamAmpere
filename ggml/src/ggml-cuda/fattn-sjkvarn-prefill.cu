@@ -16,7 +16,7 @@ static __global__ void fattn_sj_kvarn_expand_prefill(
         const size_t k_row_stride, const size_t k_head_stride,
         const size_t v_row_stride, const size_t v_head_stride,
         half2 * K_out, half2 * V_out, const int n_out, const int p_begin, const int head_first, const bool skip_body,
-        const char * mask, const size_t mask_pitch, const int mask_queries) {
+        const char * mask, const size_t mask_pitch, const int mask_queries, const bool mask_packed) {
     constexpr int D2 = 128;
     constexpr int rows = 16;
     extern __shared__ half2 tile[];
@@ -34,7 +34,11 @@ static __global__ void fattn_sj_kvarn_expand_prefill(
             bool visible = false;
             for (int q0 = 0; q0 < mask_queries; q0 += 16) {
                 const int q = q0 + tid/rows;
-                const bool live = q < mask_queries && __half2float(reinterpret_cast<const half *>(mask + q*mask_pitch)[p0 + tid%rows]) > -INFINITY;
+                const int p = p0 + tid%rows;
+                // [#175] packed: bit p%32 of I32 word p/32 set = visible
+                const bool live = q < mask_queries && (mask_packed ?
+                    ((reinterpret_cast<const uint32_t *>(mask + q*mask_pitch)[p >> 5] >> (p & 31)) & 1u) != 0 :
+                    __half2float(reinterpret_cast<const half *>(mask + q*mask_pitch)[p]) > -INFINITY);
                 if (__syncthreads_or(live)) {
                     visible = true;
                     break;
@@ -372,7 +376,7 @@ bool ggml_cuda_flash_attn_ext_sj_kvarn_prefill(ggml_backend_cuda_context & ctx, 
                 K->nb[1], K->nb[2], V->nb[1], V->nb[2],
                 (half2 *) K_chunk, (half2 *) (K_chunk + elements), cn, c0, 0, true,
                 dst->src[3] && dst->src[3]->ne[2] == 1 && dst->src[3]->ne[3] == 1 ? (const char *) dst->src[3]->data : nullptr,
-                dst->src[3] ? dst->src[3]->nb[1] : 0, Q->ne[1]);
+                dst->src[3] ? dst->src[3]->nb[1] : 0, Q->ne[1], dst->src[3] && dst->src[3]->type == GGML_TYPE_I32);
             CUDA_CHECK(cudaGetLastError());
             ggml_cuda_sj_kvarn_trellis_expand_body(ggml_get_op_params_i32(dst, 5), ggml_cuda_qsa_resident_body(dst->src[5]),
                 (const int32_t *) dst->src[6]->data, K->nb[2], V->nb[2],
@@ -452,7 +456,7 @@ bool ggml_cuda_flash_attn_ext_sj_kvarn_prefill(ggml_backend_cuda_context & ctx, 
             // Match the full-body path: zeroing resident-only masked tiles changes
             // that mean and therefore the quantization of visible keys.
             !plan.i8qk && dst->src[3] && dst->src[3]->ne[2] == 1 && dst->src[3]->ne[3] == 1 ? (const char *) dst->src[3]->data : nullptr,
-            dst->src[3] ? dst->src[3]->nb[1] : 0, Q->ne[1]);
+            dst->src[3] ? dst->src[3]->nb[1] : 0, Q->ne[1], dst->src[3] && dst->src[3]->type == GGML_TYPE_I32);
         CUDA_CHECK(cudaGetLastError());
         if (trellis) {
             ggml_cuda_sj_kvarn_trellis_expand_body(ggml_get_op_params_i32(dst, 5), ggml_cuda_qsa_resident_body(dst->src[5]),
