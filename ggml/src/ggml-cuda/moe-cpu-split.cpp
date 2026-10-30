@@ -489,6 +489,10 @@ struct pool_state {
     bool item_barrier = false; // GGML_MOE_CPU_SPLIT_ITEM_BARRIER: phases end when their items are done, not their threads
     bool own_xq = false;       // GGML_MOE_CPU_SPLIT_OWN_XQ (with ITEM_BARRIER): every thread quantizes the inputs itself
     std::vector<uint8_t> xq_own;   // [threads][2][MOE_CS_MAX_ROUTES] private copies of xq
+    bool flow = false;         // GGML_MOE_CPU_SPLIT_FLOW (with ITEM_BARRIER): per-expert dependencies replace barriers 1 and 2
+    std::atomic<int> ug_left[MOE_CS_MAX_EXPERTS];   // flow: up + gate tiles of expert i not yet finished
+    std::atomic<int> hq_left[MOE_CS_MAX_EXPERTS];   // flow: hidden rows of expert i not yet quantized
+    int expert_of[MOE_CS_MAX_ROUTES] = {};          // flow: expert index of each route
     size_t xq_own_stride = 0;
     int host_cpu = -1;
     std::atomic<int> help_phase{-1}; // -1 closed, 1/3 open, 5/7 held by a helper
@@ -784,11 +788,50 @@ void run_job_phases(pool_state & s, unsigned long long n, int worker, bool lead 
 // copy (same function, same bytes) and goes straight to up + gate: no thread waits on another before its first tile.
 constexpr unsigned long long item_low = 0xffffffffULL;
 
+// flow: phases 1-3 become one list of items in the same order (all up + gate tiles, then the hidden rows, then the
+// down tiles, each expert-major) claimed from inext[1] and counted in idone[1]. Instead of waiting for the whole
+// phase before it, a hidden row waits only for its own expert's up + gate tiles and a down tile only for its own
+// expert's hidden rows. Those items sit earlier in the list, so they are already claimed and running: nobody waits
+// on unclaimed work, and threads that finish early go on with other experts. Same items, same rows: bit-identical.
+void run_flow_items(pool_state & s, unsigned long long tag, uint8_t * mine, bool lead, clk::time_point t) {
+    const unsigned long long n1 = (unsigned long long) items_of(s, 1), n2 = (unsigned long long) items_of(s, 2);
+    const unsigned long long total = n1 + n2 + (unsigned long long) items_of(s, 3);
+    const int ug_blocks = (int) (n1 / (unsigned long long) s.n_exp);
+    const int down_blocks = (int) ((total - n1 - n2) / (unsigned long long) s.n_exp);
+    for (unsigned long long c = s.inext[1].load(std::memory_order_acquire);
+            (c & ~item_low) == tag && (c & item_low) < total;) {
+        if (!s.inext[1].compare_exchange_weak(c, c + 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+            continue;
+        }
+        const unsigned long long k = c & item_low;
+        if (k < n1) {
+            const int i = (int) k / ug_blocks;
+            run_item(s, 1, (int) k, mine);
+            s.ug_left[i].fetch_sub(1, std::memory_order_acq_rel);
+        } else if (k < n1 + n2) {
+            const int q = (int) (k - n1), i = s.expert_of[q];
+            while (s.ug_left[i].load(std::memory_order_acquire) > 0) { cpu_relax(); }
+            run_item(s, 2, q);
+            s.hq_left[i].fetch_sub(1, std::memory_order_acq_rel);
+        } else {
+            const int item = (int) (k - n1 - n2), i = item / down_blocks;
+            while (s.hq_left[i].load(std::memory_order_acquire) > 0) { cpu_relax(); }
+            run_item(s, 3, item);
+        }
+        s.idone[1].fetch_add(1, std::memory_order_acq_rel);
+        c = s.inext[1].load(std::memory_order_acquire);
+    }
+    if (!lead) { return; }   // thread 0 alone waits for the last items and publishes `done`
+    while ((s.idone[1].load(std::memory_order_acquire) & item_low) < total) { cpu_relax(); }
+    s.phase_ns[1] += (unsigned long long) std::chrono::duration_cast<std::chrono::nanoseconds>(clk::now() - t).count();
+}
+
 void run_job_items(pool_state & s, unsigned long long n, int worker, bool lead = false) {
     const unsigned long long tag = (n & item_low) << 32;
     uint8_t * const mine = s.own_xq ? s.xq_own.data() + (size_t) worker * s.xq_own_stride : nullptr;
     auto t = clk::now();
     for (int p = 0; p < 4; ++p) {
+        if (p == 1 && s.flow) { run_flow_items(s, tag, mine, lead, t); return; }
         const unsigned long long total = (unsigned long long) items_of(s, p);
         if (p == 0 && mine) {
             for (unsigned long long it = 0; it < total; ++it) {
@@ -833,7 +876,8 @@ bool help_items(pool_state & s) {
     const unsigned long long n = s.gen.load(std::memory_order_acquire);
     if (n == 0) { return false; }
     const unsigned long long tag = (n & item_low) << 32;
-    for (int p = s.own_xq ? 2 : 0; p < 4; ++p) {   // own_xq: the host has no input copy, so it helps hidden + down only
+    // own_xq: the host has no input copy, so it helps hidden + down only; flow: it helps the input rows only
+    for (int p = s.own_xq ? 2 : 0; p < (s.flow ? 1 : 4); ++p) {
         if (p > 0) {
             const unsigned long long d = s.idone[p - 1].load(std::memory_order_acquire);
             if ((d & ~item_low) != tag || (d & item_low) < (unsigned long long) items_of(s, p - 1)) { return false; }
@@ -974,6 +1018,14 @@ void leader_main(pool_state * sp, int cpu) {
             }
             ++n;
             const unsigned long long tag = (n & item_low) << 32;
+            if (s.flow) {
+                const int ug_blocks = items_of(s, 1) / s.n_exp;
+                for (int i = 0; i < s.n_exp; ++i) {
+                    s.ug_left[i].store(ug_blocks, std::memory_order_relaxed);
+                    s.hq_left[i].store(s.first[i + 1] - s.first[i], std::memory_order_relaxed);
+                    for (int q = s.first[i]; q < s.first[i + 1]; ++q) { s.expert_of[q] = i; }
+                }
+            }
             for (int p = 0; p < 4; ++p) {
                 s.next[p].store(0, std::memory_order_relaxed);
                 s.idone[p].store(tag, std::memory_order_relaxed);
@@ -1143,6 +1195,7 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
     const int hw_free = !avail.empty() ? (int) avail.size() : (int) std::max(1u, std::thread::hardware_concurrency() / 2 - 1);
     s.threads = env_int("GGML_MOE_CPU_SPLIT_THREADS", hw_free, 1, 64);
     s.own_xq = s.item_barrier && env_int("GGML_MOE_CPU_SPLIT_OWN_XQ", 0, 0, 1) != 0;
+    s.flow = s.item_barrier && env_int("GGML_MOE_CPU_SPLIT_FLOW", 0, 0, 1) != 0;
     if (s.own_xq) {
         s.xq_own_stride = 2 * MOE_CS_MAX_ROUTES * s.xq_stride;
         s.xq_own.assign((size_t) s.threads * s.xq_own_stride, 0);
@@ -1166,7 +1219,7 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
     if (s.iq_rows) { fprintf(stderr, "[moe-cpu-split] IQ up/gate row kernels (each chunk decoded once per expert), variant %d, prefetch %d B\n", s.iq_variant, s.iq_pf); }
     if (s.schedule) { fprintf(stderr, "[moe-cpu-split] static quantization rows, grouped math claims\n"); }
     if (s.host_help) { fprintf(stderr, "[moe-cpu-split] waiting host drains math tiles on cpu %d\n", s.host_cpu); }
-    if (s.item_barrier) { fprintf(stderr, "[moe-cpu-split] item barriers (a descheduled idle thread does not stall a job)%s\n", s.own_xq ? ", private input rows per thread" : ""); }
+    if (s.item_barrier) { fprintf(stderr, "[moe-cpu-split] item barriers (a descheduled idle thread does not stall a job)%s%s\n", s.own_xq ? ", private input rows per thread" : "", s.flow ? ", per-expert flow (no phase barriers after the inputs)" : ""); }
     fprintf(stderr, "[moe-cpu-split] input Q8 reuse %s, IQ token group %d, IQ4_NL down reuse %s\n", s.q8_reuse ? "on" : "off", s.group_tokens, s.down_reuse ? "on" : "off");
     return true;
 }
