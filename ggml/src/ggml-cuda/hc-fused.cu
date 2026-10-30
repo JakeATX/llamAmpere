@@ -880,11 +880,15 @@ bool ggml_cuda_dsv4_hc_up_supported(const ggml_tensor * op) {
         wu->ne[0] <= 64*HCF_UP_MAX_IT;
 }
 
+static bool hcf_fused_finish_enabled() {
+    static const bool fuse = [] { const char * e = getenv("GGML_CUDA_HC_FUSED_FINISH"); return !e || atoi(e) != 0; }();
+    return fuse;
+}
+
 // [HCFUSED v2] arrival-counter slot for this backend context (-1: none left, or GGML_CUDA_HC_FUSED_FINISH=0,
 // which keeps the separate finish kernel)
 static int hcf_cnt_slot(const ggml_backend_cuda_context & ctx) {
-    static const bool fuse = [] { const char * e = getenv("GGML_CUDA_HC_FUSED_FINISH"); return !e || atoi(e) != 0; }();
-    if (!fuse) {
+    if (!hcf_fused_finish_enabled()) {
         return -1;
     }
     static std::mutex mtx;
@@ -964,8 +968,6 @@ static void hcf_down_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, 
 
     cudaStream_t stream = ctx.stream();
 
-    const int slot    = n_rb <= HCF_CNT_RB ? hcf_cnt_slot(ctx) : -1;
-    const int cnt_off = slot >= 0 ? slot*HCF_CNT_RB : -1;
     hcf_post_fold pf = {};
     if (hpost != nullptr) {
         pf.blk  = (const float *) hpost->src[0]->data;
@@ -990,7 +992,8 @@ static void hcf_down_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, 
         const char * e = getenv("LLAMA_HC_DOWN_ROW_LOOKAHEAD");
         return e && atoi(e) == 1;
     }();
-    if (row_owner && slot >= 0 && n_embd % 256 == 0) {
+    // Full rows do not use arrival counters or consume a counter slot.
+    if (row_owner && hcf_fused_finish_enabled() && n_embd % 256 == 0) {
         ggml_cuda_pool_alloc<float> xn(ctx.pool(), (size_t) T*hc_dim);
         auto stage = [&](auto fold) {
             constexpr bool F = decltype(fold)::value;
@@ -1027,6 +1030,8 @@ static void hcf_down_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, 
         }
         return;
     }
+    const int slot    = n_rb <= HCF_CNT_RB ? hcf_cnt_slot(ctx) : -1;
+    const int cnt_off = slot >= 0 ? slot*HCF_CNT_RB : -1;
     static const bool owner = [] {
         const char * e = getenv("LLAMA_HC_DOWN_OWNER");
         return e && atoi(e) == 1;
