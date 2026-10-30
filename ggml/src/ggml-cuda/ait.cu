@@ -529,6 +529,7 @@ static __global__ void __launch_bounds__(CAP ? 256 : LOW || BOUNDS ? 384 : 512, 
             c[u][0] = c[u][1] = c[u][2] = c[u][3] = 0;
         }
         float s0 = 0.0f, s1 = 0.0f;
+        float sr[MU][4];
         if constexpr ((V & 1) != 0) {
             // row scales of rows 32t + 16u + g (+8) for K block ks / 2: chunk (t, 2 (ks / 2) + u), slots g and g + 8
             if (n0 < NT)     { s0 = CO ? __ldcg(SA + n0 * S + ks) : __ldg(SA + n0 * S + ks); }
@@ -555,6 +556,13 @@ static __global__ void __launch_bounds__(CAP ? 256 : LOW || BOUNDS ? 384 : 512, 
                         rp[u] = (uint32_t) __ldg(sb + g) | ((uint32_t) __ldg(sb + g + 8) << 16);
                     }
                 }
+            }
+        }
+        if constexpr (NEIGHBOR && V == 5) {
+#pragma unroll
+            for (int u = 0; u < MU; ++u) {
+                sr[u][0] = s0 * rs[u][0]; sr[u][1] = s1 * rs[u][0];
+                sr[u][2] = s0 * rs[u][1]; sr[u][3] = s1 * rs[u][1];
             }
         }
         if constexpr (UNROLL2) {
@@ -595,10 +603,15 @@ static __global__ void __launch_bounds__(CAP ? 256 : LOW || BOUNDS ? 384 : 512, 
         }
 #pragma unroll
         for (int u = 0; u < MU; ++u) {
-            const float r0 = NEIGHBOR && V == 5 ? rs[u][0] : __half2float(__ushort_as_half((unsigned short) (rp[u] & 0xFFFFu)));
-            const float r1 = NEIGHBOR && V == 5 ? rs[u][1] : __half2float(__ushort_as_half((unsigned short) (rp[u] >> 16)));
-            cf[u][0] += s0 * r0 * (float) c[u][0]; cf[u][1] += s1 * r0 * (float) c[u][1];
-            cf[u][2] += s0 * r1 * (float) c[u][2]; cf[u][3] += s1 * r1 * (float) c[u][3];
+            if constexpr (NEIGHBOR && V == 5) {
+                cf[u][0] += sr[u][0] * (float) c[u][0]; cf[u][1] += sr[u][1] * (float) c[u][1];
+                cf[u][2] += sr[u][2] * (float) c[u][2]; cf[u][3] += sr[u][3] * (float) c[u][3];
+            } else {
+                const float r0 = __half2float(__ushort_as_half((unsigned short) (rp[u] & 0xFFFFu)));
+                const float r1 = __half2float(__ushort_as_half((unsigned short) (rp[u] >> 16)));
+                cf[u][0] += s0 * r0 * (float) c[u][0]; cf[u][1] += s1 * r0 * (float) c[u][1];
+                cf[u][2] += s0 * r1 * (float) c[u][2]; cf[u][3] += s1 * r1 * (float) c[u][3];
+            }
         }
         xs += 16 * NT * 32;
         ++ks;
