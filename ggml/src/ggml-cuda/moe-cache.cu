@@ -133,6 +133,8 @@ static uint8_t * g_hf_zero = nullptr;   // [g_hf_experts] zeros: the single down
 // the plan and the miss passes then treat a left-out expert as if resident (no copy, no CPU work, no miss math) and
 // a zero kernel writes its output rows. Counters: [0] tensor-expert rows left out, [1] layer windows, [2] experts.
 static uint8_t * g_tail_mask = nullptr;
+// [0] rows [1] layer windows [2] experts left out [3..13] tokens by left-out routes (0..10)
+#define MOE_TAIL_COUNTS 14
 static unsigned long long * g_tail_counts = nullptr;
 static size_t g_hf_stride = 0;
 static int64_t g_hf_experts = 0;
@@ -7955,10 +7957,12 @@ static void moe_cache_device_release(moe_cache_session & session, bool retain_so
     session.mj_retained_stream_set = false;
     moe_cache_swap_release(session);
     if (g_tail_counts) {
-        unsigned long long tail[3] = {};
+        unsigned long long tail[MOE_TAIL_COUNTS] = {};
         if (cudaMemcpy(tail, g_tail_counts, sizeof(tail), cudaMemcpyDeviceToHost) == cudaSuccess && tail[1] > 0) {
             MOE_CACHE_LOG("[moe-cache] skip-tail: %llu missed tensor-expert rows left out (%llu experts) over %llu layer windows (process total)\n",
                     tail[0], tail[2], tail[1]);
+            MOE_CACHE_LOG("[moe-cache] skip-tail: token-layers by routes left out 0..10: %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu\n",
+                    tail[3], tail[4], tail[5], tail[6], tail[7], tail[8], tail[9], tail[10], tail[11], tail[12], tail[13]);
         }
     }
     unsigned long long counts[3] = {};
@@ -8824,8 +8828,8 @@ static void moe_missjoin_overlap_prepare(moe_cache_session & session) {
                  cudaMemset(g_hf_zero, 0, (size_t) experts) == cudaSuccess &&
                  cudaMalloc((void **) &g_tail_mask, 4 * (size_t) experts) == cudaSuccess &&
                  cudaMemset(g_tail_mask, 0, 4 * (size_t) experts) == cudaSuccess &&
-                 cudaMalloc((void **) &g_tail_counts, 3 * sizeof(unsigned long long)) == cudaSuccess &&
-                 cudaMemset(g_tail_counts, 0, 3 * sizeof(unsigned long long)) == cudaSuccess;
+                 cudaMalloc((void **) &g_tail_counts, MOE_TAIL_COUNTS * sizeof(unsigned long long)) == cudaSuccess &&
+                 cudaMemset(g_tail_counts, 0, MOE_TAIL_COUNTS * sizeof(unsigned long long)) == cudaSuccess;
             if (ok) {
                 g_hf_stride = stride;
                 g_hf_experts = experts;
@@ -9632,6 +9636,14 @@ static __global__ void __launch_bounds__(256) moe_tail_prep_kernel(const uint8_t
             atomicAdd(&s_rows, 1u);
         }
     }
+    for (int token = tid; counts && n_ids <= 10 && token < n_routes / n_ids; token += blockDim.x) {
+        int left = 0;
+        for (int j = 0; j < n_ids; ++j) {
+            const int e = ids[token * ids_stride + j];
+            left += e >= 0 && e < n_expert && s_routed[e] && !s_head[e] && !hot0[e] && !hot1[e] && !hot2[e];
+        }
+        atomicAdd(counts + 3 + left, 1ULL);
+    }
     __syncthreads();
     if (tid == 0 && counts) {
         atomicAdd(counts + 0, 3ULL * s_rows);
@@ -9734,6 +9746,11 @@ static __global__ void moe_mass_kernel(const float * weights, float * out_weight
         out_weights[i] = drop[i] ? 0.0f : (rescale[i / 10] ? weights[i] * scale[i / 10] : weights[i]);
     }
     if (!mode) { return; }
+    for (int token = tid; counts && token < width; token += blockDim.x) {
+        int left = 0;
+        for (int j = 0; j < 10; ++j) { left += drop[10 * token + j]; }
+        atomicAdd(counts + 3 + left, 1ULL);
+    }
     // fork: only the first dropped occurrence can omit an expert for the window.
     for (int i = tid; i < routes; i += blockDim.x) {
         if (hot[i] || !drop[i]) { continue; }
