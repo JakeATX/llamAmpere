@@ -255,6 +255,12 @@ llama_b1::llama_b1(const llama_model & model, ggml_backend_t backend_gpu) : mode
         direct_piece = (size_t) std::clamp<int64_t>(b1_env_int("LLAMA_B1_DIRECT_PIECE_MIB", 64), 1, 1024) << 20;
     }
 
+    // fork: allow larger staging pieces even when arena expert roles are small.
+    const int64_t stage_mib = b1_env_int("LLAMA_B1_STAGE_MIB", 0);
+    if (stage_mib > 0) {
+        piece_bytes = (size_t) std::clamp<int64_t>(stage_mib, 1, 16) << 20;
+    }
+
     size_t staging_alignment = 1;
     for (const auto & e : exps) { staging_alignment = std::max(staging_alignment, e.src.alignment); }
     stg.resize(n_workers);
