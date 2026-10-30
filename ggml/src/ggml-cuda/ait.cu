@@ -16,6 +16,7 @@
 // GGML_CUDA_AIT3_RING1=1 keeps one AIT3 weight group live; it takes precedence over RING2 and PACK.
 // GGML_CUDA_AIT4_NEIGHBOR=1 loads one weight vector per lane and shuffles its neighbor instead of loading it twice.
 // GGML_CUDA_AIT4_RING2=1 keeps two AIT4 weight groups live with the base register budget (OCC=0, NEIGHBOR=0).
+// GGML_CUDA_AIT4_RING1=1 keeps one AIT4 weight group live and takes precedence over RING2.
 #include "ait.cuh"
 #include "ait-mm.cuh"
 #include "ai4.cuh"
@@ -796,6 +797,12 @@ static void ait_fast_nt(ggml_backend_cuda_context & ctx, const uint8_t * W, cons
     static const bool neighbor4 = ait_env_int("GGML_CUDA_AIT4_NEIGHBOR", 0) == 1;
     if (neighbor4 && k == 4 && code == 0 && full && warps <= 12 && occ == 0) {
         k_ait_mmv<4, NT, true, 0, 0, 4, false, false, false, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
+        finish();
+        return;
+    }
+    static const bool ring4_one = ait_env_int("GGML_CUDA_AIT4_RING1", 0) == 1;
+    if (ring4_one && k == 4 && code == 0 && full && warps <= 12 && occ == 0) {
+        k_ait_mmv<4, NT, true, 0, 0, 1><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
         finish();
         return;
     }
