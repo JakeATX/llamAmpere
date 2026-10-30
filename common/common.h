@@ -561,6 +561,7 @@ struct common_moe_cache_params {
     bool fit_selected          = false;
     int32_t skip_tail          = 0; // --moe-skip-tail: 0 off, 1..9 lossy route-rank cutoff for missed experts
     float   skip_budget        = 0.0f; // --moe-skip-budget: 0 off, (0, 0.25] lossy summed-weight budget for missed experts
+    bool    skip_rank_floor    = false; // --moe-skip-rank-floor: protect the first five routes in cumulative mode
 };
 
 // --cache-ram not given: pick the prompt-cache RAM budget from the host's memory at startup

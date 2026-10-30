@@ -2078,6 +2078,9 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     }
     cparams.moe_cache_budget_mib = params.moe_cache.budget_mib;
     cparams.moe_skip_tail = params.moe_cache.skip_tail;
+    if (params.moe_cache.skip_rank_floor) {
+        common_set_env("GGML_MOE_SKIP_RANK_FLOOR", "5");
+    }
     if (params.moe_cache.skip_budget > 0.0f) {
         // the engine reads the drop policy from the environment at graph build time
         const std::string policy = common_get_env("GGML_MOE_SKIP_POLICY");

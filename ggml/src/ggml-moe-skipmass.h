@@ -10,8 +10,9 @@ static GGML_SKIPMASS_HD inline bool ggml_moe_skipmass_budget_valid(int mode, flo
     return (mode == 1 || mode == 2) && threshold >= 0.0f && threshold < 1.0f && (mode != 2 || threshold <= 0.25f);
 }
 static GGML_SKIPMASS_HD inline bool ggml_moe_skipmass_select(
-        const float * weights, const unsigned char * hot, int n, int mode, float threshold, unsigned char * drop) {
-    if (n < 1 || n > 10) { return false; }
+        const float * weights, const unsigned char * hot, int n, int mode, float threshold, unsigned char * drop,
+        int rank_floor = 0) {
+    if (n < 1 || n > 10 || rank_floor < 0 || rank_floor > 10) { return false; }
     bool chosen[10] = {};
     bool changed = false;
     float mass = 0.0f;
@@ -30,7 +31,7 @@ static GGML_SKIPMASS_HD inline bool ggml_moe_skipmass_select(
     for (int step = 0; step < n; ++step) {
         int best = -1;
         for (int i = n - 1; i >= 0; --i) {
-            if (!chosen[i] && !hot[i] && (best < 0 || weights[i] < weights[best])) { best = i; }
+            if (i >= rank_floor && !chosen[i] && !hot[i] && (best < 0 || weights[i] < weights[best])) { best = i; }
         }
         if (best < 0) { break; }
         chosen[best] = true;
