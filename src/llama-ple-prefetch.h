@@ -111,7 +111,7 @@ private:
     bool     coalesce = false;
     bool     bounded_window = false;
     bool     verify = false;     // fork: LLAMA_PLE_PF_VERIFY=1 checks each consumed ubatch's pages are still cached
-    std::vector<unsigned char> verify_map;   // mincore result over the whole table (one byte per page)
+    std::vector<unsigned char> verify_map;   // mincore result over one page cluster (one byte per page)
     std::vector<uint64_t>      verify_pages; // pages of the ubatch found evicted
     bool     verify_sync = false; // fork: LLAMA_PLE_PF_VERIFY=2 reads the evicted pages back before the gather
     std::vector<std::pair<uint64_t, size_t>> verify_runs; // (first page, page count) of the evicted pages

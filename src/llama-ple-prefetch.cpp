@@ -756,38 +756,57 @@ void llama_ple_prefetch::test_drop_rows(const int32_t * idx, size_t n_idx) {
 }
 
 // fork: a page read early in a long call can be evicted again before its ubatch gathers (the readers dedup pages over
-// the whole call, so a later ubatch never asks for it twice). One mincore over the table finds this ubatch's evicted
-// pages; they are queued as asynchronous reads (MADV_WILLNEED) before the gather faults on them one by one.
+// the whole call, so a later ubatch never asks for it twice). This ubatch's pages are listed, sorted and checked with
+// mincore over short clusters only (a whole-table mincore per ubatch cost ~350 ms on a large table, verify-r123); the
+// evicted ones are queued as asynchronous reads (MADV_WILLNEED) or read back (VERIFY=2) before the gather faults on them.
 void llama_ple_prefetch::verify_rows(const int32_t * idx, size_t n_idx) {
 #if defined(__linux__)
     const int64_t tv = ggml_time_us();
     const uintptr_t tb = (uintptr_t) ple->data, pb = tb - tb%4096;
-    const uint64_t span = (tb - pb) + n_rows*row_size;
-    const size_t np = (size_t) (span/4096 + (span % 4096 != 0));
-    if (verify_map.size() < np) {
-        verify_map.resize(np);
-    }
-    if (mincore((void *) pb, (size_t) span, verify_map.data()) != 0) {
-        LLAMA_LOG_WARN("%s: [PLEPF] mincore failed (%s), page verification off\n", __func__, strerror(errno));
-        verify = false;
-        return;
-    }
-    verify_pages.clear();
+    verify_runs.clear();
     for (size_t i = 0; i < n_idx; ++i) {
         const int32_t r = idx[i];
         if (r < 0 || (uint64_t) r >= n_rows) {
             continue;
         }
         const uint64_t off = (tb - pb) + (uint64_t) r*row_size;
-        for (uint64_t k = off/4096; k <= (off + row_size - 1)/4096; ++k) {
-            if (!(verify_map[k] & 1)) {
-                verify_map[k] |= 1; // listed once
-                verify_pages.push_back(k);
-            }
+        const uint64_t k0 = off/4096, k1 = (off + row_size - 1)/4096;
+        verify_runs.emplace_back(k0, (size_t) (k1 - k0 + 1));
+    }
+    std::sort(verify_runs.begin(), verify_runs.end());
+    // clusters: runs whose gap is <= 32 pages share one mincore call
+    constexpr uint64_t GAP = 32;
+    verify_pages.clear();
+    for (size_t j = 0; j < verify_runs.size();) {
+        const uint64_t c0 = verify_runs[j].first;
+        uint64_t c1 = c0 + verify_runs[j].second; // exclusive
+        size_t e = j + 1;
+        while (e < verify_runs.size() && verify_runs[e].first <= c1 + GAP) {
+            c1 = std::max<uint64_t>(c1, verify_runs[e].first + verify_runs[e].second);
+            ++e;
         }
+        if (verify_map.size() < c1 - c0) {
+            verify_map.resize(c1 - c0);
+        }
+        if (mincore((void *) (pb + c0*4096), (size_t) (c1 - c0)*4096, verify_map.data()) != 0) {
+            LLAMA_LOG_WARN("%s: [PLEPF] mincore failed (%s), page verification off\n", __func__, strerror(errno));
+            verify = false;
+            verify_runs.clear();
+            return;
+        }
+        uint64_t nk = c0; // first page not yet listed (runs are sorted by first page and may overlap)
+        for (size_t q = j; q < e; ++q) {
+            const uint64_t end = verify_runs[q].first + verify_runs[q].second;
+            for (uint64_t k = std::max(verify_runs[q].first, nk); k < end; ++k) {
+                if (!(verify_map[k - c0] & 1)) {
+                    verify_pages.push_back(k);
+                }
+            }
+            nk = std::max(nk, end);
+        }
+        j = e;
     }
     if (!verify_pages.empty()) {
-        std::sort(verify_pages.begin(), verify_pages.end());
         verify_runs.clear();
         for (size_t j = 0; j < verify_pages.size();) {
             size_t e = j + 1;
