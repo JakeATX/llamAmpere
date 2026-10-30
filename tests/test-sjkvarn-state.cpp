@@ -1121,6 +1121,33 @@ static void ple_wide_rows_case() {
         setenv("LLAMA_PLE_PF_MODE", "fault", 1);
         setenv("LLAMA_PLE_PF_AHEAD", "1000000", 1);
         setenv("LLAMA_PLE_PF_COLD_THREADS", "0", 1);
+        auto & hp = model->hparams;
+        hp.ple_ngram_size = hp.ple_layer_multipliers.size() + 1;
+        require(!llama_ple_prefetch::create(*model, n_tokens), "prefetch refuses excess ngram width");
+        hp.ple_ngram_size = 2;
+        hp.ple_n_heads = hp.ple_head_vocab_sizes.size() + 1;
+        hp.ple_heads_per_ngram = hp.ple_n_heads;
+        require(!llama_ple_prefetch::create(*model, n_tokens), "prefetch refuses excess heads");
+        hp.ple_n_heads = 1;
+        hp.ple_heads_per_ngram = 0;
+        require(!llama_ple_prefetch::create(*model, n_tokens), "prefetch refuses zero heads per ngram");
+        hp.ple_heads_per_ngram = 2;
+        require(!llama_ple_prefetch::create(*model, n_tokens), "prefetch refuses mismatched head count");
+        hp.ple_heads_per_ngram = UINT32_MAX;
+        hp.ple_ngram_size = 3;
+        require(!llama_ple_prefetch::create(*model, n_tokens), "prefetch checks head product without wrapping");
+        hp.ple_ngram_size = 2;
+        hp.ple_heads_per_ngram = 1;
+        hp.ple_head_vocab_sizes[0] = 0;
+        require(!llama_ple_prefetch::create(*model, n_tokens), "prefetch refuses zero vocab size");
+        hp.ple_head_vocab_sizes[0] = n_tokens;
+        hp.ple_head_offsets[0] = 1;
+        require(!llama_ple_prefetch::create(*model, n_tokens), "prefetch refuses rows past table end");
+        hp.ple_head_offsets[0] = UINT32_MAX;
+        hp.ple_head_vocab_sizes[0] = UINT32_MAX;
+        require(!llama_ple_prefetch::create(*model, n_tokens), "prefetch checks row end without wrapping");
+        hp.ple_head_offsets[0] = 0;
+        hp.ple_head_vocab_sizes[0] = n_tokens;
         auto pf = llama_ple_prefetch::create(*model, n_tokens);
         require(pf != nullptr, "wide row page prefetch created");
         pf->hint(tokens.data(), tokens.size(), 0);
@@ -1137,6 +1164,7 @@ static void ple_wide_rows_case() {
         ggml_free(ctx);
         munmap(pages, size);
     }
+    printf("OK: invalid prefetch ngram heads and row ranges refused\n");
     printf("OK: unaligned 8KiB and 16KiB prefetch rows cover every page\n");
 #else
     printf("SKIP: wide prefetch page test needs Linux\n");

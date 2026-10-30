@@ -83,6 +83,18 @@ std::unique_ptr<llama_ple_prefetch> llama_ple_prefetch::create(const llama_model
         return nullptr;
     }
 
+    const auto & hp = model.hparams;
+    if (hp.ple_ngram_size > hp.ple_layer_multipliers.size() || hp.ple_n_heads > hp.ple_head_vocab_sizes.size() ||
+            hp.ple_heads_per_ngram == 0 || (uint64_t) (hp.ple_ngram_size - 1)*hp.ple_heads_per_ngram != hp.ple_n_heads) {
+        return nullptr;
+    }
+    for (uint32_t h = 0; h < hp.ple_n_heads; ++h) {
+        const uint64_t end = (uint64_t) hp.ple_head_offsets[h] + hp.ple_head_vocab_sizes[h];
+        if (hp.ple_head_vocab_sizes[h] == 0 || end > (uint64_t) t->ne[1] || end > (uint64_t) INT32_MAX + 1) {
+            return nullptr;
+        }
+    }
+
     std::unique_ptr<llama_ple_prefetch> pf(new llama_ple_prefetch());
     pf->model     = &model;
     pf->ple       = t;
