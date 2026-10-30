@@ -8425,6 +8425,12 @@ bool ggml_cuda_moe_cache_swap_async_test() {
     int keys[3] = {};
     for (bool whole : {false, true}) {
         for (bool prior : {false, true}) {
+            auto check = [&](bool pass, const char * step, int round = -1) {
+                if (!pass) {
+                    fprintf(stderr, "cache-swap-async whole=%d prior=%d round=%d: %s failed\n", whole, prior, round, step);
+                    ok = false;
+                }
+            };
             moe_cache_session seed;
             seed.devices.emplace_back(new moe_cache_device(0, 0));
             seed.devices[0]->pools.emplace_back(new moe_cache_pool);
@@ -8491,28 +8497,36 @@ bool ggml_cuda_moe_cache_swap_async_test() {
                 // A later scope can change live counts; the captured inputs stay fixed.
                 auto actual = async->swap_decision.get();
                 async->device_previous_counts[0] -= 17;
-                ok &= moe_cache_swap_take_plan(*async, actual);
-                ok &= expected.pairs.size() == actual.pairs.size() && expected.candidates == actual.candidates;
-                ok &= sync->swap_prev == async->swap_prev && sync->swap_score == async->swap_score;
-                ok &= sync->swap_profile_seed == async->swap_profile_seed && sync->swap_profile_table_ema == async->swap_profile_table_ema;
+                check(moe_cache_swap_take_plan(*async, actual), "take plan", round);
+                check(expected.pairs.size() == actual.pairs.size() && expected.candidates == actual.candidates, "pair count", round);
+                check(sync->swap_prev == async->swap_prev && sync->swap_score == async->swap_score, "scores", round);
+                check(sync->swap_profile_seed == async->swap_profile_seed && sync->swap_profile_table_ema == async->swap_profile_table_ema, "prior", round);
                 for (size_t i = 0; i < std::min(expected.pairs.size(), actual.pairs.size()); ++i) {
                     const auto & a = expected.pairs[i]; const auto & b = actual.pairs[i];
-                    ok &= a.table->desc.data == b.table->desc.data && a.expert == b.expert &&
-                        a.slot == b.slot && a.free == b.free && a.gain == b.gain;
+                    check(a.table->desc.data == b.table->desc.data && a.expert == b.expert &&
+                        a.slot == b.slot && a.free == b.free && a.gain == b.gain, "pair", round);
                 }
                 swaps += expected.pairs.size();
                 for (const auto & p : actual.pairs) { p.free ? ++free_swaps : ++evictions; }
                 apply(expected); apply(actual);
             }
-            ok &= swaps > 0 && free_swaps > 0 && evictions > 0;
-            async->device_previous_counts[4] += 10000;
+            check(swaps > 0 && free_swaps > 0 && evictions > 0, "free and victim coverage");
+            // Pick a missing expert; a large count on a resident cannot produce a stale pair.
+            int missing = 0;
+            while (missing < 5 && async->devices[0]->pools[0]->map.count({&keys[0], missing})) { ++missing; }
+            check(missing < 5, "missing expert");
+            if (missing == 5) { continue; }
+            for (int k = 0; k < (whole ? 3 : 1); ++k) {
+                check(!async->devices[0]->pools[0]->map.count({&keys[k], missing}), "missing projection");
+                async->device_previous_counts[k * 6 + missing] += 10000;
+            }
             async->swap_snapshot = moe_cache_swap_snapshot(*async, std::move(async->swap_snapshot));
             auto stale = moe_cache_swap_run_plan(*async->swap_snapshot);
-            ok &= !stale.pairs.empty();
+            check(!stale.pairs.empty(), "stale pair coverage");
             for (auto & slot : async->devices[0]->pools[0]->slots) { ++slot.generation; }
-            async->device_previous_counts[4] += 10000;
-            ok &= !moe_cache_swap_take_plan(*async, stale) && stale.pairs.empty();
-            ok &= async->swap_prev[4] + 10000 == async->device_previous_counts[4];
+            async->device_previous_counts[missing] += 10000;
+            check(!moe_cache_swap_take_plan(*async, stale) && stale.pairs.empty(), "stale rejection");
+            check(async->swap_prev[missing] + 10000 == async->device_previous_counts[missing], "stale counts");
         }
     }
     return ok;
