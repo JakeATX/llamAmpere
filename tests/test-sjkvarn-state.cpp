@@ -1089,7 +1089,7 @@ static void deferred_mask_capacity_case() {
     printf("OK: 64 pending masks preserved, 65th falls back, all host mask bytes exact\n");
 }
 
-static void ple_hash_pages_case(bool windowed = false, bool bounded = false, bool coalesced = false, size_t ubatch_size = 384, int populate = 0, size_t table_offset = 0) {
+static void ple_hash_pages_case(bool windowed = false, bool bounded = false, bool coalesced = false, size_t ubatch_size = 384, int populate = 0, size_t table_offset = 0, bool file_fault = false) {
 #if defined(__linux__)
     for (uint32_t n_gram : { 4, 8 }) {
         for (llama_pos pos0 : { 0, 23 }) {
@@ -1104,9 +1104,10 @@ static void ple_hash_pages_case(bool windowed = false, bool bounded = false, boo
             }
             const char * tmp_dir = getenv("TMPDIR");
             std::string path = std::string(tmp_dir ? tmp_dir : ".") + "/llama-ple-window-XXXXXX";
-            std::unique_ptr<char, void(*)(char *)> cleanup(coalesced ? &path[0] : nullptr, [](char * p) { unlink(p); });
+            const bool file_backed = coalesced || file_fault;
+            std::unique_ptr<char, void(*)(char *)> cleanup(file_backed ? &path[0] : nullptr, [](char * p) { unlink(p); });
             std::unique_ptr<FILE, int(*)(FILE *)> file(nullptr, fclose);
-            if (coalesced) {
+            if (file_backed) {
                 const int fd = mkstemp(&path[0]);
                 require(fd >= 0, "coalesced page file");
                 file.reset(fdopen(fd, "w+"));
@@ -1120,10 +1121,10 @@ static void ple_hash_pages_case(bool windowed = false, bool bounded = false, boo
                 require(fsync(fd) == 0 && posix_fadvise(fd, 0, size, POSIX_FADV_DONTNEED) == 0, "coalesced page file flushed and evicted");
             }
             void * pages = mmap(nullptr, size, PROT_READ | PROT_WRITE,
-                    coalesced ? MAP_SHARED : MAP_PRIVATE | MAP_ANONYMOUS, coalesced ? fileno(file.get()) : -1, 0);
+                    file_backed ? MAP_SHARED : MAP_PRIVATE | MAP_ANONYMOUS, file_backed ? fileno(file.get()) : -1, 0);
             require(pages != MAP_FAILED, "hash page mapping");
             require(madvise(pages, size, MADV_NOHUGEPAGE) == 0, "hash pages stay separate");
-            if (populate) {
+            if (populate || bounded) {
                 require(madvise(pages, size, MADV_SEQUENTIAL) == 0, "mapped population starts with read-around enabled");
             }
             std::unique_ptr<FILE, int(*)(FILE *)> pagemap(populate ? fopen("/proc/self/pagemap", "rb") : nullptr, fclose);
@@ -1165,7 +1166,7 @@ static void ple_hash_pages_case(bool windowed = false, bool bounded = false, boo
                 tokens[i] = i % 127 == 0 ? eos : i % 131 == 0 ? LLAMA_TOKEN_NULL : (i*179 + i*i*13) % eos;
             }
             std::vector<unsigned char> expected(n_pages, 0), resident(n_pages);
-            if (coalesced) {
+            if (file_backed) {
                 require(mincore(pages, size, resident.data()) == 0, "initial coalesced page residency");
                 for (unsigned char page : resident) {
                     require(!(page & 1), "coalesced page file must start cold; set TMPDIR to a disk filesystem");
@@ -1258,6 +1259,22 @@ static void ple_hash_pages_case(bool windowed = false, bool bounded = false, boo
             require(!coalesced || startup.find("coalesced pread") != std::string::npos, "file-backed coalescing active");
             require(!populate || startup.find("mapped reads use random-access mapping") != std::string::npos,
                     "mapped population disables mmap read-around before reading cold pages");
+            if (bounded) {
+                std::unique_ptr<FILE, int(*)(FILE *)> smaps(fopen("/proc/self/smaps", "r"), fclose);
+                require(smaps != nullptr, "read bounded mapping advice");
+                char line[4096];
+                bool inside = false, random = false;
+                while (fgets(line, sizeof(line), smaps.get())) {
+                    unsigned long long first = 0, last = 0;
+                    if (sscanf(line, "%llx-%llx", &first, &last) == 2) {
+                        inside = (uintptr_t) table->data >= first && (uintptr_t) table->data < last;
+                    } else if (inside && strncmp(line, "VmFlags:", 8) == 0) {
+                        random = strstr(line, " rr ") && !strstr(line, " sr ");
+                        break;
+                    }
+                }
+                require(random, "bounded prefetch disables mapped read-around for fault and pread-only readers");
+            }
             pf->hint(tokens.data(), tokens.size(), pos0);
             const size_t consume_size = coalesced || bounded ? std::min<size_t>(113, ubatch) : windowed ? 113 : 256;
             size_t future_checks = 0;
@@ -1625,8 +1642,10 @@ int main(int argc, char ** argv) {
             if (strcmp(argv[1], "--ple-batch-pages") == 0) {
                 for (size_t ubatch : { 384, 128, 1 }) {
                     ple_hash_pages_case(true, true, false, ubatch);
+                    ple_hash_pages_case(true, true, false, ubatch, 0, 0, true);
                 }
                 printf("OK: fault windows cover 1, 128 and 384 token ubatches without whole-chunk overreads\n");
+                printf("OK: disk-backed fault windows keep future pages cold with mapped read-around disabled\n");
             }
             return 0;
         } catch (const std::exception & e) {
