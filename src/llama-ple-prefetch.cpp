@@ -114,7 +114,8 @@ std::unique_ptr<llama_ple_prefetch> llama_ple_prefetch::create(const llama_model
     pf->n_cold    = (int) std::min<int64_t>(std::max<int64_t>(0, ple_pf_env("LLAMA_PLE_PF_COLD_THREADS", PLE_PF_DEFAULT_COLD)), 512);
     pf->n_recheck = (uint32_t) std::min<int64_t>(std::max<int64_t>(0, ple_pf_env("LLAMA_PLE_PF_RECHECK", 0)), UINT32_MAX);
     // by default only long calls (a short check or catch-up batch is cheaper to fault in) and the whole call ahead
-    pf->n_min     = (uint32_t) std::max<int64_t>(1, ple_pf_env("LLAMA_PLE_PF_MIN", user ? 256 : PLE_PF_DEFAULT_MIN));
+    pf->n_min     = (uint32_t) std::min<int64_t>(UINT32_MAX,
+            std::max<int64_t>(1, ple_pf_env("LLAMA_PLE_PF_MIN", user ? 256 : PLE_PF_DEFAULT_MIN)));
     pf->n_ahead   = (uint64_t) std::max<int64_t>(0, ple_pf_env("LLAMA_PLE_PF_AHEAD", 1000000));
     pf->n_ubatch  = n_ubatch;
     pf->row_size  = t->nb[1];

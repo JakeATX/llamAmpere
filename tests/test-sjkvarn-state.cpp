@@ -1279,6 +1279,14 @@ static void ple_wide_rows_case() {
         table->data = static_cast<char *>(pages) + 4096;
         require(llama_ple_prefetch::create(*model, n_tokens) != nullptr, "prefetch accepts row span ending at host buffer end");
         table->data = static_cast<char *>(pages) + 128;
+        for (const char * minimum : { "4294967296", "4294967297", "9223372036854775807" }) {
+            setenv("LLAMA_PLE_PF_MIN", minimum, 1);
+            auto short_call = llama_ple_prefetch::create(*model, n_tokens);
+            require(short_call != nullptr, "prefetch with large minimum created");
+            short_call->hint(tokens.data(), tokens.size(), 0);
+            require(!short_call->consume(n_tokens, nullptr, 0), "prefetch minimum does not wrap into a short call");
+        }
+        setenv("LLAMA_PLE_PF_MIN", "1", 1);
         auto pf = llama_ple_prefetch::create(*model, n_tokens);
         require(pf != nullptr, "wide row page prefetch created");
         pf->hint(tokens.data(), tokens.size(), 0);
@@ -1297,6 +1305,7 @@ static void ple_wide_rows_case() {
     }
     printf("OK: invalid prefetch ngram heads and row ranges refused\n");
     printf("OK: prefetch row spans stay within host buffer without overflow\n");
+    printf("OK: large prefetch minimum does not wrap into short calls\n");
     printf("OK: unaligned 8KiB and 16KiB prefetch rows cover every page\n");
 #else
     printf("SKIP: wide prefetch page test needs Linux\n");
