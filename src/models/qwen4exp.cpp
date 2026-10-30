@@ -2623,10 +2623,41 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
         return e != nullptr && atoi(e) != 0;
     }();
 
+    // LLAMA_PLE_CONV_SSM=1 (opt-in, overrides LLAMA_PLE_CONV_CM): the dilated conv is one ssm_conv over the
+    // token-major padded input with a (kern-1)*dil+1 wide kernel that is zero between the taps (tap k sits at
+    // column k*dil), so the 4 shifted transposed copies, 4 muls, 3 adds and the final cont become one launch
+    // (CUDA fuses the silu). Same taps; the sum gains exact zero terms and may use FMA, so valid-math, not same bits.
+    static const bool conv_ssm = [] {
+        const char * e = getenv("LLAMA_PLE_CONV_SSM");
+        return e != nullptr && atoi(e) != 0;
+    }();
+
     // default: [hist + n_seq_tokens, hc_dim, n_seqs], tokens on ne[0]
     ggml_tensor * padded = build_conv_state_at(inp, inp->mctx->get_p_l(il),
             ggml_reshape_3d(ctx0, normalized, hc_dim, n_seq_tokens, n_seqs),
-            hist, hc_dim, il, conv_cm);
+            hist, hc_dim, il, conv_cm && !conv_ssm);
+
+    if (conv_ssm) {
+        ggml_tensor * w = model.layers[il].ple_conv1d;  // [kern, hc_dim]
+        w = w->type == GGML_TYPE_F32 ? w : ggml_cast(ctx0, w, GGML_TYPE_F32);
+        // dil-1 zero columns between taps: 0 * w keeps the shape and is exactly zero for finite weights
+        ggml_tensor * gap = dil > 1
+            ? ggml_scale(ctx0, ggml_cont(ctx0, ggml_view_2d(ctx0, w, dil - 1, hc_dim, w->nb[1], 0)), 0.0f)
+            : nullptr;
+        ggml_tensor * wide = nullptr;
+        for (int64_t k = 0; k < kern; ++k) {
+            ggml_tensor * col = ggml_view_2d(ctx0, w, 1, hc_dim, w->nb[1], k * w->nb[0]);
+            wide = wide ? ggml_concat(ctx0, gap ? ggml_concat(ctx0, wide, gap, 0) : wide, col, 0) : col;
+        }
+        wide = ggml_cont(ctx0, wide);  // [hist + 1, hc_dim]
+        GGML_ASSERT(wide->ne[0] == hist + 1);
+
+        ggml_tensor * conv_out = ggml_silu(ctx0, ggml_ssm_conv(ctx0, padded, wide));  // [hc_dim, n_seq_tokens, n_seqs]
+        conv_out = ggml_reshape_3d(ctx0, conv_out, n_embd, hc, n_tokens);
+        cb(conv_out, "ple_conv_out", il);
+
+        return ggml_add(ctx0, hidden, ggml_add(ctx0, gated, conv_out));
+    }
 
     ggml_tensor * conv_out = nullptr;
     for (int64_t k = 0; k < kern; ++k) {
