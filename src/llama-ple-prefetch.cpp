@@ -480,7 +480,7 @@ double llama_ple_prefetch::resident_fraction(const std::vector<uint64_t> & keys,
 }
 
 int64_t llama_ple_prefetch::reader() {
-    std::vector<char> buf(use_pread && !use_advise ? (size_t) RUN_MAX*4096 : 0);
+    std::vector<char> buf;
     int64_t t_last = 0;
     int64_t pages_read = 0;
     size_t next = 0, end = 0;
@@ -521,6 +521,9 @@ int64_t llama_ple_prefetch::reader() {
         } else if (use_pread) {
             // fork: finish short reads, but do not require padding past the table's last byte.
             const size_t need = (size_t) std::min(len, file_off + n_rows*row_size - off);
+            if (buf.size() < need) {
+                buf.resize(need);
+            }
             size_t done = 0;
             while (done < need && !stopping.load()) {
                 const ssize_t got = pread(fd, buf.data() + done, need - done, (off_t) (off + done));
