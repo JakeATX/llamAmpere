@@ -45,6 +45,7 @@
 #include <vector>
 
 #if defined(__linux__)
+#include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
