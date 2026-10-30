@@ -570,7 +570,8 @@ static __global__ void k_ait_mmv_sum(const float * partial, float * Y, int M, in
             if (carry >= warps) {
                 carry -= warps;
             }
-            if (lo < hi && lo < end && hi > begin) {
+            // w < ceil(end * warps / items) implies lo < end.
+            if (lo < hi && hi > begin) {
                 sum += partial[partial_offset];
             }
             partial_offset += partial_stride;
