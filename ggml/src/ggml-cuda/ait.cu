@@ -536,7 +536,9 @@ static __global__ void __launch_bounds__(CAP ? 256 : LOW || BOUNDS ? 384 : 512, 
             if (!NEIGHBOR || V != 5 || it == i0 || (ks & 1) == 0) {
 #pragma unroll
                 for (int u = 0; u < MU; ++u) {
-                    const unsigned short * sb = (const unsigned short *) (W + ((int64_t) t * S + (ks & ~1) + u) * CS + 2048 * KB);
+                    // gp already points to slice (t, ks); both members share the even slice's scales.
+                    const char * side = NEIGHBOR && V == 5 ? gp + (u - (ks & 1)) * CS : W + ((int64_t) t * S + (ks & ~1) + u) * CS;
+                    const unsigned short * sb = (const unsigned short *) (side + 2048 * KB);
                     if constexpr (NEIGHBOR && V == 5) {
                         const uint32_t row = __ldg(sb + g + ((q & 1) << 3));
                         const uint32_t peer = __shfl_xor_sync(0xffffffffu, row, 1);
