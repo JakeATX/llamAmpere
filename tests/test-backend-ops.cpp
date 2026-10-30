@@ -5399,11 +5399,12 @@ struct test_dsv4_hc_down_owner : public test_dsv4_hc_fused {
                 } else if (x_known && (strcmp(name, "w_down") == 0 || strcmp(name, "w_inject") == 0)) {
                     const float sign = strcmp(name, "w_down") == 0 ? 1.0f : -1.0f;
                     for (int64_t row = 0; row < t->ne[1]; ++row) {
+                        const float row_sign = row % 2 == 0 ? sign : -sign;
                         std::vector<ggml_bf16_t> values(4*n_embd);
                         for (int64_t col = 0; col < 4*n_embd; ++col) {
                             const int64_t stream = col/n_embd;
                             const int64_t tile = (col%n_embd)/8;
-                            values[col] = ggml_fp32_to_bf16(sign*float((row + 1)*(stream + 1)*(1 + tile%3))/(8*n_embd));
+                            values[col] = ggml_fp32_to_bf16(row_sign*float((row + 1)*(stream + 1)*(1 + tile%3))/(64*n_embd));
                         }
                         ggml_backend_tensor_set(t, values.data(), row*t->nb[1], values.size()*sizeof(ggml_bf16_t));
                     }
@@ -5458,11 +5459,11 @@ struct test_dsv4_hc_down_owner : public test_dsv4_hc_fused {
                     const double value = sign*double(4*token + stream + 1)/16.0;
                     double weights = 0.0;
                     for (int64_t col = 0; col < n_embd; ++col) {
-                        weights += ggml_bf16_to_fp32(ggml_fp32_to_bf16(float((row + 1)*(stream + 1)*(1 + (col/8)%3))/(8*n_embd)));
+                        weights += ggml_bf16_to_fp32(ggml_fp32_to_bf16(float((row + 1)*(stream + 1)*(1 + (col/8)%3))/(64*n_embd)));
                     }
                     sum += weights*double(stream + 1)*value/std::sqrt(value*value + 1e-6);
                 }
-                const double z = 0.25*sum;
+                const double z = (row % 2 == 0 ? 0.25 : -0.25)*sum;
                 const double expected = act ? z/(1.0 + std::exp(-z)) : 2.0/(1.0 + std::exp(z));
                 if (std::abs(double(a[i]) - expected) > 1e-5 || std::abs(double(b[i]) - expected) > 1e-5) {
                     return INFINITY;
