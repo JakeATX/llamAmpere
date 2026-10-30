@@ -4294,6 +4294,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             // different head_dim still gets a runtime attached but can't use
             // the streamed kernel - fall back to plain attention instead of
             // asserting inside ggml_cuda_kv_stream_fattn.
+            ggml_cuda_flash_attn_ext_rows_mask(ctx, dst);
             if ((ggml_cuda_kv_stream_runtime_from_tensor(dst->src[1]) != nullptr ||
                     ggml_cuda_kv_stream_runtime_from_tensor(dst->src[2]) != nullptr) &&
                     ggml_cuda_kv_stream_fattn_fits(dst)) {
@@ -12192,7 +12193,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return true;
         case GGML_OP_FILL:
             return op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16 ||
-                (op->type == GGML_TYPE_Q8_0 && ggml_is_contiguous(op));
+                op->type == GGML_TYPE_I32 || (op->type == GGML_TYPE_Q8_0 && ggml_is_contiguous(op));
         case GGML_OP_LIGHTNING_INDEXER:
             return ggml_cuda_lightning_indexer_supported(dev_ctx->device, op);
 

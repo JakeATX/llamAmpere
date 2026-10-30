@@ -1856,19 +1856,6 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
         return mask;
     }
 
-    // In place, the selection is a row-strided view of mask_all: keep the stride a multiple of 16 bytes for FA.
-    // Compact attention above never constructs these history-wide mask buffers.
-    const int64_t n_row = sel_inplace ? GGML_PAD(n_kv + n_sel, 64) : n_kv + n_sel;
-    ggml_tensor * mask_all = ggml_new_tensor_4d(ctx0, kq_mask->type, n_row, 1, 1, 1);
-    mask_all = ggml_fill(ctx0, mask_all, -INFINITY);
-    mask_all = ggml_repeat_4d(ctx0, mask_all, n_row, n_tokens, 1, 1);
-    mask_all = ggml_reshape_3d(ctx0, mask_all, 1, n_row, n_tokens);
-
-    ggml_tensor * zeros = ggml_new_tensor_4d(ctx0, kq_mask->type, n_sel, 1, 1, 1);
-    zeros = ggml_fill(ctx0, zeros, 0.0f);
-    zeros = ggml_repeat_4d(ctx0, zeros, n_sel, n_tokens, 1, 1);
-    zeros = ggml_reshape_3d(ctx0, zeros, 1, n_sel, n_tokens);
-
     // dump rows n_kv + slot as a cumulative sum: the meta backend cannot split an arange, which has no source
     ggml_tensor * dump  = ggml_scale_bias(ctx0, ggml_cumsum(ctx0, ggml_fill(ctx0, live, 1.0f)), 1.0f, (float) (n_kv - 1));
     ggml_tensor * idx_f = ggml_cast(ctx0, sel_idx, GGML_TYPE_F32);
@@ -1881,13 +1868,38 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     // so the finite cells of the selection below are exactly the slots < n_kv; the attention node gets these rows too
     // (src[8]) and the CUDA sparse path builds its per-tile cell lists from them without reading the mask
     static const int direct_lists = [] { const char * e = getenv("LLAMA_QSA_DIRECT_LISTS"); return e ? atoi(e) : 0; }();
-    if (direct_lists > 0 && sel_direct && n_tokens > 1 && kq_mask->ne[2] == 1 && kq_mask->ne[3] == 1) {
+    const bool use_rows = direct_lists > 0 && sel_direct && n_tokens > 1 && kq_mask->ne[2] == 1 && kq_mask->ne[3] == 1;
+    if (use_rows) {
         GGML_ASSERT(fa_sel_rows == nullptr);
         fa_sel_rows = sel_idx;
     }
     if (sel_inplace) {
         ggml_build_forward_expand(gf, sel_idx);
     }
+
+    // LLAMA_QSA_ROWS_MASK=1 (opt-in, needs DIRECT_LISTS + DIRECT): with the rows on the attention node, a prompt batch gets
+    // a zero-filled one-bit mask (n_kv/32 I32 words per token, ~0.15 GB at 100K x 12288) instead of the f16 selection
+    // (~2.4 GB filled, repeated and scattered every attention ubatch); the CUDA attention node sets the bit of each row
+    // cell < n_kv before any route reads the mask (ggml_cuda_flash_attn_ext_rows_mask): the same visible cells
+    static const bool rows_mask = [] { const char * e = getenv("LLAMA_QSA_ROWS_MASK"); return e && atoi(e) != 0; }();
+    if (rows_mask && use_rows && n_kv % 128 == 0 && kq_mask->ne[0] == n_kv && kq_mask->ne[1] == n_tokens) {
+        ggml_tensor * bits = ggml_fill_inplace(ctx0, ggml_new_tensor_4d(ctx0, GGML_TYPE_I32, n_kv/32, n_tokens, 1, 1), 0.0f);
+        cb(bits, "indexer_sel_bits", il);
+        return bits;
+    }
+
+    // In place, the selection is a row-strided view of mask_all: keep the stride a multiple of 16 bytes for FA.
+    // Compact attention above never constructs these history-wide mask buffers.
+    const int64_t n_row = sel_inplace ? GGML_PAD(n_kv + n_sel, 64) : n_kv + n_sel;
+    ggml_tensor * mask_all = ggml_new_tensor_4d(ctx0, kq_mask->type, n_row, 1, 1, 1);
+    mask_all = ggml_fill(ctx0, mask_all, -INFINITY);
+    mask_all = ggml_repeat_4d(ctx0, mask_all, n_row, n_tokens, 1, 1);
+    mask_all = ggml_reshape_3d(ctx0, mask_all, 1, n_row, n_tokens);
+
+    ggml_tensor * zeros = ggml_new_tensor_4d(ctx0, kq_mask->type, n_sel, 1, 1, 1);
+    zeros = ggml_fill(ctx0, zeros, 0.0f);
+    zeros = ggml_repeat_4d(ctx0, zeros, n_sel, n_tokens, 1, 1);
+    zeros = ggml_reshape_3d(ctx0, zeros, 1, n_sel, n_tokens);
 
     ggml_tensor * sel = ggml_set_rows(ctx0, mask_all, zeros, ggml_reshape_3d(ctx0, sel_idx, n_sel, n_tokens, 1));
 
@@ -1957,7 +1969,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     ggml_tensor * kq_mask = inp->get_kq_mask();
     // an in-place selection is a row-strided view that already has the mask shape
     GGML_ASSERT(sel_ids || ggml_is_contiguous(sel) || ggml_are_same_shape(sel, kq_mask));
-    ggml_tensor * mask = sel_ids ? sel : ggml_is_contiguous(sel) ?
+    // LLAMA_QSA_ROWS_MASK: a packed I32 selection is already [n_kv/32, n_tokens]
+    ggml_tensor * mask = sel_ids || sel->type == GGML_TYPE_I32 ? sel : ggml_is_contiguous(sel) ?
             ggml_reshape_4d(ctx0, sel, kq_mask->ne[0], kq_mask->ne[1], kq_mask->ne[2], kq_mask->ne[3]) : sel;
     cb(mask, "kq_mask_qsa", il);
 
