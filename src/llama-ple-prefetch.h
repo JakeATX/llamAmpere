@@ -86,7 +86,6 @@ private:
 
     // the current call
     std::vector<int32_t> toks;   // token ids of the call
-    std::vector<int32_t> pred;   // guessed rows, n_heads per token, -1 = unknown predecessor
     // [PFGAP] runs of consecutive pages, one read each, in chunk order (published chunk by chunk as build() goes)
     static constexpr uint32_t RUN_MAX = 256; // pages per run (1 MiB)
     std::unique_ptr<uint64_t[]> run_key;   // first page key (file page for pread/advise, virtual page for fault)

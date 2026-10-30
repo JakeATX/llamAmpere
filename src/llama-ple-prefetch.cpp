@@ -294,12 +294,12 @@ void llama_ple_prefetch::build() {
 
     // the rows, as llm_graph_input_qwen4exp_ple::set_input computes them; a predecessor before the call is unknown,
     // unless the call starts the sequence (then it reads as EOS)
-    pred.assign((size_t) (n*n_heads), -1);
     std::vector<int64_t> ctx(n_gram);
     size_t nr = 0;
     for (size_t c = 0; c < n_chunks && !stopping.load(std::memory_order_relaxed); ++c) {
         const int64_t i0 = (int64_t) (c*chunk_size);
         const int64_t i1 = i0 + (int64_t) std::min<size_t>(n - i0, chunk_size);
+        cp.clear();
         for (int64_t i = i0; i < i1; ++i) {
             ctx[0] = toks[i];
             int64_t known = 0;
@@ -324,25 +324,17 @@ void llama_ple_prefetch::build() {
                 const int64_t hb = (g - 2) * per_gram;
                 for (int64_t k = 0; k < per_gram; ++k) {
                     const int64_t h = hb + k;
-                    pred[(size_t) (i*n_heads + h)] = (int32_t) (mixed % hp.ple_head_vocab_sizes[h] + hp.ple_head_offsets[h]);
-                }
-            }
-        }
-
-        // fork: cold reads can span small holes to avoid one disk request per scattered page.
-        cp.clear();
-        for (int64_t i = i0; i < i1; ++i) {
-            for (int64_t h = 0; h < n_heads; ++h) {
-                const int32_t r = pred[(size_t) (i*n_heads + h)];
-                if (r < 0 || (uint64_t) r >= n_rows) {
-                    continue;
-                }
-                const uint64_t b = base + (uint64_t) r*row_size;
-                const uint64_t k0 = b/4096, k1 = (b + row_size - 1)/4096;
-                for (uint64_t k = k0; k <= k1; ++k) {
-                    if (!seen[k - key0]) {
-                        seen[k - key0] = 1;
-                        cp.push_back(k);
+                    const int32_t r = (int32_t) (mixed % hp.ple_head_vocab_sizes[h] + hp.ple_head_offsets[h]);
+                    if (r < 0 || (uint64_t) r >= n_rows) {
+                        continue;
+                    }
+                    const uint64_t b = base + (uint64_t) r*row_size;
+                    const uint64_t k0 = b/4096, k1 = (b + row_size - 1)/4096;
+                    for (uint64_t page = k0; page <= k1; ++page) {
+                        if (!seen[page - key0]) {
+                            seen[page - key0] = 1;
+                            cp.push_back(page);
+                        }
                     }
                 }
             }
@@ -533,8 +525,6 @@ void llama_ple_prefetch::stop() {
     LLAMA_LOG_CONT("\n");
 
     toks.clear();
-    pred.clear();
-    pred.shrink_to_fit();
     run_key.reset();
     run_len.reset();
     run_chunk.reset();

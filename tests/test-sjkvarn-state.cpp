@@ -1090,10 +1090,11 @@ static void deferred_mask_capacity_case() {
 static void ple_wide_rows_case() {
 #if defined(__linux__)
     for (int width : { 2048, 4096 }) {
-        const size_t n_tokens = 128;
+        const size_t n_tokens = 3*256 + 17;
         const size_t size = n_tokens*width*sizeof(float) + 4096;
         void * pages = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         require(pages != MAP_FAILED, "wide prefetch pages");
+        require(madvise(pages, size, MADV_NOHUGEPAGE) == 0, "wide prefetch uses separate pages");
         ggml_context * ctx = ggml_init({ 1024*1024, nullptr, true });
         require(ctx != nullptr, "wide prefetch context");
         auto * table = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, n_tokens);
