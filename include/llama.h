@@ -1150,6 +1150,10 @@ extern "C" {
     // After the decode: true when capture k is complete. It then sets pos_min/pos_max to the memory's range at that
     // spot, and until llama_state_seq_capture_select(ctx, -1, ...) llama_state_seq_get_size_ext/get_data_ext with
     // LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY return the captured state instead of the live one.
+    // Byte size of the largest capture laid out so far by the armed decode (0 until the first one is laid out, reset
+    // by llama_state_seq_capture_arm). Safe to call from another thread while the decode runs.
+    LLAMA_API size_t llama_state_seq_capture_size(struct llama_context * ctx);
+
     LLAMA_API bool llama_state_seq_capture_select(
             struct llama_context * ctx,
                          int32_t   k,

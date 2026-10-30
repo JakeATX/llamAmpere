@@ -38,6 +38,7 @@ extern "C" {
 #include <condition_variable>
 #include <exception>
 #include <future>
+#include <atomic>
 #include <memory>
 #include <limits>
 #include <filesystem>
@@ -6102,6 +6103,12 @@ private:
         // in-call checkpoints are armed only for the whole batch in one view; a retry with a smaller view drops them
         bool ckpt_armed = false;
         std::future<std::vector<std::vector<uint8_t>>> ckpt_pf;
+        // set when the decode returns (or on any exit) so the prefault helper stops waiting for a capture size
+        auto ckpt_pf_stop = std::make_shared<std::atomic<bool>>(false);
+        struct pf_stop_guard {
+            std::shared_ptr<std::atomic<bool>> f;
+            ~pf_stop_guard() { f->store(true); }
+        } ckpt_pf_guard{ckpt_pf_stop};
         if (batch.ckpt_slot >= 0) {
             if (off == 0 && batch.view.size() == batch.size() &&
                     llama_state_seq_capture_arm(ctx_tgt, batch.ckpt_slot, batch.ckpt_spots.data(), (int32_t) batch.ckpt_spots.size()) == 0) {
@@ -6113,15 +6120,22 @@ private:
                     return e != nullptr && atoi(e) != 0;
                 }();
                 if (ckpt_prefault) {
+                    // the state before the decode is near empty, so size the buffers from the first capture the
+                    // decode lays out (layer-major prefill lays it out in the first layer, long before the end)
                     const size_t n_pf = batch.ckpt_spots.size();
-                    // 1/16 headroom: the captured state may be a little larger than the state before the decode
-                    size_t sz_pf = llama_state_seq_get_size_ext(ctx_tgt, batch.ckpt_slot, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                    sz_pf += sz_pf / 16;
-                    if (sz_pf > 0) {
-                        ckpt_pf = std::async(std::launch::async, [n_pf, sz_pf]() {
-                            return std::vector<std::vector<uint8_t>>(n_pf, std::vector<uint8_t>(sz_pf));
-                        });
-                    }
+                    llama_context * pf_ctx = ctx_tgt;
+                    ckpt_pf = std::async(std::launch::async, [n_pf, pf_ctx, ckpt_pf_stop]() {
+                        size_t sz = 0;
+                        while ((sz = llama_state_seq_capture_size(pf_ctx)) == 0 && !ckpt_pf_stop->load()) {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                        }
+                        if (sz == 0) {
+                            return std::vector<std::vector<uint8_t>>();
+                        }
+                        // 1/64 headroom for a later spot laid out a little larger; update_tgt accepts up to 1/8 waste
+                        sz += sz / 64;
+                        return std::vector<std::vector<uint8_t>>(n_pf, std::vector<uint8_t>(sz));
+                    });
                 }
             } else {
                 SRV_WRN("dropping %zu in-call checkpoint(s): the batch is decoded in parts\n", batch.ckpt_spots.size());
@@ -6375,6 +6389,7 @@ private:
             }
             std::vector<std::vector<uint8_t>> pf_bufs;
             if (ckpt_pf.valid()) {
+                ckpt_pf_stop->store(true);
                 const int64_t t_pf_us = ggml_time_us();
                 pf_bufs = ckpt_pf.get();
                 SRV_INF("[CKPT_PF] %zu prefaulted buffer(s) of %zu bytes, wait %.2f ms\n", pf_bufs.size(),

@@ -8587,6 +8587,7 @@ int32_t llama_context::capture_arm(llama_seq_id seq_id, const llama_pos * n_toke
     ckpt_sel   = -1;
     ckpt_armed = false;
     ckpt_seq   = -1;
+    ckpt_size_hint.store(0, std::memory_order_release);
     if (n <= 0) {
         return 0;
     }
@@ -8688,6 +8689,9 @@ void llama_context::capture_ubatch(const llama_ubatch & ubatch, int32_t il0, int
                                 __func__, c.n_tokens, bytes/1048576.0);
                     } else {
                         c.blob.resize(bytes);
+                    }
+                    if (bytes > ckpt_size_hint.load(std::memory_order_relaxed)) {
+                        ckpt_size_hint.store(bytes, std::memory_order_release);
                     }
                 }
                 llama_io_write_layout io(c.blob_data(), c.blob_size(), c.writes, c.laid_out, c.blob_file != nullptr);
@@ -10203,6 +10207,10 @@ int32_t llama_state_seq_capture_arm(llama_context * ctx, llama_seq_id seq_id, co
 
 int32_t llama_state_seq_capture_min_tail(llama_context * ctx) {
     return ctx->capture_min_tail();
+}
+
+size_t llama_state_seq_capture_size(llama_context * ctx) {
+    return ctx->capture_size();
 }
 
 bool llama_state_seq_capture_select(llama_context * ctx, int32_t k, llama_pos * pos_min, llama_pos * pos_max) {
