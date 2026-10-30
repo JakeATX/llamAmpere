@@ -22,6 +22,7 @@
 // GGML_CUDA_AIT4_NEIGHBOR_RING1=1 keeps one weight group live in the neighbor path.
 // GGML_CUDA_AIT4_NEIGHBOR_UNROLL2=1 unrolls two four-group steps in the neighbor path.
 // GGML_CUDA_AIT4_NEIGHBOR_OCC=1 launches two register-capped blocks per SM without tile packing.
+// GGML_CUDA_AIT4_NEIGHBOR_SCALES=1 reads scales early; =2 shares row scales between adjacent lanes.
 // GGML_CUDA_AIT4_RING2=1 keeps two AIT4 weight groups live with the base register budget (OCC=0, NEIGHBOR=0).
 // GGML_CUDA_AIT4_RING1=1 keeps one AIT4 weight group live and takes precedence over RING2.
 // GGML_CUDA_AIT4_TAIL=1 refills the four-group weight ring after each group's IMMA work.
@@ -395,7 +396,7 @@ template <int KB, int NT, bool FULL, int PC = 0, int V = 0, int DEPTH = 4, bool 
 static __global__ void __launch_bounds__(CAP ? 256 : LOW || BOUNDS ? 384 : 512, CAP ? 4 : LOW ? 2 : 1) k_ait_mmv(const char * __restrict__ W, const int8_t * X,
         const float * SA, float * __restrict__ Y, const int M, const int K, const float * __restrict__ XF = nullptr,
         const int l2pf = 0, float * __restrict__ partial = nullptr) {
-    static_assert(!NEIGHBOR || (KB == 4 && FULL && PC == 0 && (V == 0 || V == 1)), "neighbor path requires plain full AIT4");
+    static_assert(!NEIGHBOR || (KB == 4 && FULL && PC == 0 && (V == 0 || V == 1 || V == 5)), "neighbor path requires plain full AIT4");
     static_assert(!TAIL || (KB == 4 && FULL && PC == 0 && V == 0 && !PACK), "tail refill requires plain full AIT4");
     static_assert(!UNROLL2 || (KB == 4 && FULL && PC == 0 && V == 0 && DEPTH == 4 && !LOW && !CAP && !PACK && !TAIL), "two-step unroll requires plain full AIT4");
     static_assert(!EARLY_X || (KB == 4 && FULL && PC == 0 && V == 0 && DEPTH == 4 && !LOW && !CAP && !PACK && !TAIL && !UNROLL2), "early activation requires plain full AIT4");
@@ -534,7 +535,13 @@ static __global__ void __launch_bounds__(CAP ? 256 : LOW || BOUNDS ? 384 : 512, 
 #pragma unroll
             for (int u = 0; u < MU; ++u) {
                 const unsigned short * sb = (const unsigned short *) (W + ((int64_t) t * S + (ks & ~1) + u) * CS + 2048 * KB);
-                rp[u] = (uint32_t) __ldg(sb + g) | ((uint32_t) __ldg(sb + g + 8) << 16);
+                if constexpr (NEIGHBOR && V == 5) {
+                    const uint32_t row = __ldg(sb + g + ((q & 1) << 3));
+                    const uint32_t peer = __shfl_xor_sync(0xffffffffu, row, 1);
+                    rp[u] = (q & 1) ? peer | (row << 16) : row | (peer << 16);
+                } else {
+                    rp[u] = (uint32_t) __ldg(sb + g) | ((uint32_t) __ldg(sb + g + 8) << 16);
+                }
             }
         }
         if constexpr (UNROLL2) {
@@ -877,7 +884,7 @@ static void ait_fast_nt(ggml_backend_cuda_context & ctx, const uint8_t * W, cons
         static const bool neighbor4_early_x = ait_env_int("GGML_CUDA_AIT4_NEIGHBOR_EARLY_X", 0) == 1;
         static const bool neighbor4_bounds = ait_env_int("GGML_CUDA_AIT4_NEIGHBOR_BOUNDS", 0) == 1;
         static const bool neighbor4_unroll2 = ait_env_int("GGML_CUDA_AIT4_NEIGHBOR_UNROLL2", 0) == 1;
-        static const bool neighbor4_scales = ait_env_int("GGML_CUDA_AIT4_NEIGHBOR_SCALES", 0) == 1;
+        static const int neighbor4_scales = ait_env_int("GGML_CUDA_AIT4_NEIGHBOR_SCALES", 0);
         if (neighbor4_pack) {
             k_ait_mmv<4, NT, true, 0, 0, 4, false, false, true, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
         } else if (neighbor4_ring2) {
@@ -892,8 +899,10 @@ static void ait_fast_nt(ggml_backend_cuda_context & ctx, const uint8_t * W, cons
             k_ait_mmv<4, NT, true, 0, 0, 4, false, false, false, true, false, false, false, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
         } else if (neighbor4_unroll2) {
             k_ait_mmv<4, NT, true, 0, 0, 4, false, false, false, true, false, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
-        } else if (neighbor4_scales) {
+        } else if (neighbor4_scales == 1) {
             k_ait_mmv<4, NT, true, 0, 1, 4, false, false, false, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
+        } else if (neighbor4_scales == 2) {
+            k_ait_mmv<4, NT, true, 0, 5, 4, false, false, false, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
         } else if (neighbor4_occ) {
             const dim3 grid_occ(2 * nsm);
             total_warps = 2 * nsm * warps;
