@@ -129,6 +129,7 @@ std::unique_ptr<llama_ple_prefetch> llama_ple_prefetch::create(const llama_model
 
     const char * mode = getenv("LLAMA_PLE_PF_MODE");
     pf->coalesce = mode && strcmp(mode, "coalesce") == 0;
+    pf->coalesce_window = pf->coalesce && window > 0;
     pf->use_pread = mode && strcmp(mode, "fault") != 0;
     pf->use_advise = mode && strcmp(mode, "advise") == 0;
 #if defined(__linux__)
@@ -234,7 +235,8 @@ void llama_ple_prefetch::begin(llama_pos pos0) {
     pos0_call = pos0;
     seq_start = pos0 == 0;
     hinted    = false;
-    chunk_size = coalesce ? std::max<size_t>(CHUNK, n) : CHUNK;
+    // fork: use ubatch chunks so the coalesced read-ahead gate can advance with the gather.
+    chunk_size = coalesce ? std::max<size_t>(CHUNK, coalesce_window ? n_ubatch : n) : CHUNK;
 
     // A row can start within a page and can span more than two pages.
     const uint64_t pages_per_row = 1 + (row_size - 1)/4096 + ((row_size - 1)%4096 != 0);
