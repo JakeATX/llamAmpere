@@ -405,14 +405,22 @@ void llama_ple_prefetch::build() {
                     }
                     const uint64_t b = base + (uint64_t) r*row_size;
                     const uint64_t k0 = b/4096, k1 = (b + row_size - 1)/4096;
-                    for (uint64_t page = k0; page <= k1; ++page) {
+                    for (uint64_t page = k0; page <= k1;) {
                         const uint64_t index = page - key0;
-                        const uint64_t bit = UINT64_C(1) << (index % 64);
+                        const uint64_t end = std::min(k1 - key0, index | UINT64_C(63));
+                        const uint64_t mask = (UINT64_MAX << (index % 64)) & (UINT64_MAX >> (63 - end % 64));
                         uint64_t & word = seen[index/64];
-                        if (!(word & bit)) {
-                            word |= bit;
-                            cp.push_back(page);
+                        const uint64_t fresh = mask & ~word;
+                        word |= mask;
+                        // fork: skip duplicate row spans before walking their individual pages.
+                        if (fresh) {
+                            for (uint64_t j = index; j <= end; ++j) {
+                                if (fresh & (UINT64_C(1) << (j % 64))) {
+                                    cp.push_back(key0 + j);
+                                }
+                            }
                         }
+                        page = key0 + end + 1;
                     }
                 }
             }
