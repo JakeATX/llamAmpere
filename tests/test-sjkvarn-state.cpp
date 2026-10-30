@@ -1123,8 +1123,8 @@ static void ple_hash_pages_case(bool windowed = false, bool bounded = false, boo
                     coalesced ? MAP_SHARED : MAP_PRIVATE | MAP_ANONYMOUS, coalesced ? fileno(file.get()) : -1, 0);
             require(pages != MAP_FAILED, "hash page mapping");
             require(madvise(pages, size, MADV_NOHUGEPAGE) == 0, "hash pages stay separate");
-            if (populate == 3) {
-                require(madvise(pages, size, MADV_SEQUENTIAL) == 0, "direct mapping starts with read-around enabled");
+            if (populate) {
+                require(madvise(pages, size, MADV_SEQUENTIAL) == 0, "mapped population starts with read-around enabled");
             }
             std::unique_ptr<FILE, int(*)(FILE *)> pagemap(populate ? fopen("/proc/self/pagemap", "rb") : nullptr, fclose);
             std::vector<uint64_t> ptes(populate ? n_pages : 0);
@@ -1256,8 +1256,8 @@ static void ple_hash_pages_case(bool windowed = false, bool bounded = false, boo
             require(!bounded || startup.find(ahead_log) != std::string::npos,
                     "prefetch ubatch cap limits the effective token window");
             require(!coalesced || startup.find("coalesced pread") != std::string::npos, "file-backed coalescing active");
-            require(populate != 3 || startup.find("direct mapped reads use random-access mapping") != std::string::npos,
-                    "direct mapping disables mmap read-around before reading cold pages");
+            require(!populate || startup.find("mapped reads use random-access mapping") != std::string::npos,
+                    "mapped population disables mmap read-around before reading cold pages");
             pf->hint(tokens.data(), tokens.size(), pos0);
             const size_t consume_size = coalesced || bounded ? std::min<size_t>(113, ubatch) : windowed ? 113 : 256;
             size_t future_checks = 0;
