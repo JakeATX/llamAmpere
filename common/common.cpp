@@ -1348,6 +1348,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     pimpl(new impl{}) {
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
+    bool verify_compact_fit_safe = false;
 
     // --n-cpu-moe auto (#224): let the fit place the layers (whole layers on the GPU front to back, the routed experts
     // of the remaining layers in the CPU) instead of the user's -ngl, and without the MoE-cache placement candidate,
@@ -1447,6 +1448,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.fit_params_min_ctx,
             has_draft || spec_mtp ? &extra : nullptr,
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+        verify_compact_fit_safe = common_fit_verify_compact_safe(fit_status, params.fit_params_target);
         if (fit_status == COMMON_PARAMS_FIT_STATUS_ERROR) {
             throw std::runtime_error(
                 "failed to fit parameters to device memory (hard error); retry with -fit off");
@@ -1481,6 +1483,12 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             COM_INF("--n-cpu-moe auto: fitted -ngl %d (-1 = all layers), %d of those layers keep (part of) their FFN/experts in the CPU\n",
                 mparams.n_gpu_layers, n_cpu_layers);
         }
+    }
+
+    if (!verify_compact_fit_safe) {
+        // fork: a smaller requested margin or an unproven fit cannot enable compact verification.
+        common_set_env("GGML_CUDA_AI23_VERIFY_COMPACT", "0");
+        COM_INF("%s", "AI+ compact verification off: fit must guarantee at least 300 MiB of free device memory\n");
     }
 
     if (params.moe_cache.mode_explicit || params.moe_cache.fit_selected) {

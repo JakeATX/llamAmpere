@@ -2951,7 +2951,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     const uint32_t n_expert_used_il = hparams.n_expert_used(il);
     static const bool small_reduce = [] {
         const char * value = getenv("LLAMA_MOE_SMALL_REDUCE");
-        return value && atoi(value) != 0;
+        return !value || atoi(value) != 0;
     }();
     // Small verify batches avoid one add launch per expert. Keep warmup's wider routing unchanged.
     const bool reduce_verify = small_reduce && n_tokens <= 8 && n_expert_used_il == n_expert_used;

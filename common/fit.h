@@ -59,6 +59,9 @@ enum common_params_fit_status {
     COMMON_PARAMS_FIT_STATUS_NO_ROOM = 3, // no allocation can fit, even with every layer's weights in system memory
 };
 
+// fork: require a proven fit with at least 300 MiB left on every device.
+bool common_fit_verify_compact_safe(common_params_fit_status status, const std::vector<size_t> & margins);
+
 // a second model that shares the devices of the main model, e.g. a draft model
 //   - its context follows the context of the main model, so its memory is measured again whenever that context changes
 //   - shares_model tells the fit that the weights are already counted in the main model, as for an MTP context

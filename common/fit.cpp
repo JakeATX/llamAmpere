@@ -503,6 +503,18 @@ common_fit_extra_memory common_fit_extra_memory_at(
     return ret;
 }
 
+bool common_fit_verify_compact_safe(common_params_fit_status status, const std::vector<size_t> & margins) {
+    if (status != COMMON_PARAMS_FIT_STATUS_SUCCESS || margins.empty()) {
+        return false;
+    }
+    for (size_t margin : margins) {
+        if (margin < 300u * 1024 * 1024) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static void common_params_fit_impl(
         const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,

@@ -17,4 +17,8 @@ The AI+ decode correction adds eligible warp partials in a fixed order inside ea
 
 AI+ buffer retention, new replay kernels, int8 verify, register RMS, and unqualified CPU split experiments are not enabled by this release configuration.
 
+Small verification batches now use one expert-sum reduction by default; set `LLAMA_MOE_SMALL_REDUCE=0` to use the previous add chain. Direct AI+ verification uses compact partial sums and writes skipped outputs in the same kernel by default. Set `GGML_CUDA_AI23_VERIFY_COMPACT=0` to disable it. The server also disables compact verification when the memory fit fails, is disabled, or requests less than 300 MiB of free memory on any device. This uses the fit's minimum guaranteed margin, so a smaller requested margin disables compact even if the actual free space is larger. Both reductions use valid floating-point math and can change rounding and generated text.
+
+The bank/cache joint reduction is included with `LLAMA_MOE_BANK_JOINT_REDUCE=1`, but remains off pending its CUDA check. Bank staging and streamed-copy checks are included; pageable bank retention still requires `LLAMA_B1_KEEP_BANK_RAM=1`.
+
 Mapped expert sources require a complete tracked host registration; endpoint-only borrowing is removed. Table rebuilds reuse session-owned mappings through their normal retention accounting so pruning cannot drop a borrowed source registration. `GGML_MOE_CACHE_STRICT_ALIAS=0` no longer weakens this check.

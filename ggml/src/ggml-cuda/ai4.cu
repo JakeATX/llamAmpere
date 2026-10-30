@@ -1211,7 +1211,7 @@ void ggml_cuda_mul_mat_id_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int rate = ggml_ai4_rate(src0->type);
     const bool direct = ai4_mmvr_on_id() && (rate == 2 || rate == 3) && n_tok <= direct_max;
     // fork: one output column per direct block; zero skipped slots in that same kernel.
-    static const bool verify_compact = ai4_env_int("GGML_CUDA_AI23_VERIFY_COMPACT", nullptr, 0) != 0;
+    const bool verify_compact = ai4_env_int("GGML_CUDA_AI23_VERIFY_COMPACT", nullptr, 1) != 0;
     const bool direct_zero = direct && verify_compact;
     const bool fused = direct && fused_x && n_tok == 1;
     const int xsh = K % 256 == 0 ? 1 : 0;
