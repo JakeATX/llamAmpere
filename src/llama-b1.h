@@ -123,6 +123,7 @@ private:
         void *                home_data = nullptr;
         bool                  resident  = false; // home is VRAM
         llama_b1_file_src     src;
+        std::vector<char>     kept; // pageable bytes; never registered with the GPU
     };
 
     struct layer_info {
@@ -201,6 +202,7 @@ private:
     };
     struct piece {
         const char * src_host = nullptr; // memcpy source, or null for pread
+        const char * src_kept = nullptr; // pageable source, always copied through staging
         size_t alignment = 1;
         int          fd       = -1;
         size_t       src_offs = 0;

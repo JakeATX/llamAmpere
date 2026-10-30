@@ -723,6 +723,42 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
         }
     }
 
+    // fork: keep lent weights across plans; never lend our only live copy to scratch.
+    if (b1_env_int("LLAMA_B1_KEEP_BANK_RAM", 1)) {
+        size_t kept_bytes = 0;
+        for (int il : lent_sel) {
+            for (int ti : layers[il].tensors) {
+                auto & e = exps[ti];
+                if (!e.resident || !e.kept.empty()) {
+                    continue;
+                }
+                const int64_t available = b1_ram_available();
+                constexpr int64_t reserve = 16LL << 30;
+                if (available < reserve || e.nbytes > (uint64_t) (available - reserve)) {
+                    LLAMA_LOG_WARN("%s: [B1] RAM reserve prevents keeping %s; using file reads\n", __func__, ggml_get_name(e.t));
+                    continue;
+                }
+                try {
+                    e.kept.resize(e.nbytes);
+                } catch (const std::bad_alloc &) {
+                    LLAMA_LOG_WARN("%s: [B1] cannot keep %s in RAM; using file reads\n", __func__, ggml_get_name(e.t));
+                    continue;
+                }
+                // Dirty homes hold scratch, so recover their immutable bytes from the file.
+                if (dirty_flag[ti]) {
+                    if (!b1_read_file(e.src.fd, e.kept.data(), e.src.offs, e.nbytes, e.src.alignment)) {
+                        std::vector<char>().swap(e.kept);
+                        return false;
+                    }
+                } else {
+                    ggml_backend_tensor_get(e.t, e.kept.data(), 0, e.nbytes);
+                }
+                kept_bytes += e.nbytes;
+            }
+        }
+        LLAMA_LOG_INFO("%s: [B1] kept %.2f GiB of lent weights in pageable RAM\n", __func__, kept_bytes/1073741824.0);
+    }
+
     if (fresh_sel > 0) {
         fresh_buf = ggml_backend_buft_alloc_buffer(buft_dev, fresh_sel);
         if (fresh_buf == nullptr) {
@@ -1047,6 +1083,7 @@ void llama_b1::push_tensor_pieces(std::vector<piece> & ps, const exps_tensor & e
         // per-expert pieces: a resident or dropped bank expert is then one whole piece for the device-side copy
         const size_t source_off = strided ? (off / expert_bytes) * e.home_nb2 + off % expert_bytes : off;
         p.src_host = from_file ? nullptr : (const char *) e.home_data + source_off;
+        p.src_kept = from_file && !e.kept.empty() ? e.kept.data() + off : nullptr;
         p.fd       = e.src.fd;
         p.alignment = e.src.alignment;
         p.src_offs = e.src.offs + off;
@@ -1226,7 +1263,9 @@ void llama_b1::worker(int w) {
         }
 
         bool ok = true;
-        if (p.src_host) {
+        if (p.src_kept) {
+            memcpy(s.data, p.src_kept, p.len);
+        } else if (p.src_host) {
             ggml_moe_cache_host_restore(p.src_host, p.len);
             memcpy(s.data, p.src_host, p.len);
         } else {
