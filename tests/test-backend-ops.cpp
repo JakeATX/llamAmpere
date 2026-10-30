@@ -15148,6 +15148,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t rank : {4, 8, 9}) {
         test_cases.emplace_back(new test_dsv4_hc_down_owner(512, rank, 3, false));
     }
+    // Longer row loops cover guarded lookahead at the final weight tile.
+    test_cases.emplace_back(new test_dsv4_hc_down_owner(2048, 31, 2, true));
+    test_cases.emplace_back(new test_dsv4_hc_down_owner(4096, 9, 8, false));
     // [HCFUSED] real Flash-Next shapes, every token count the kernels specialize, with and without the injection rows
     for (int64_t nt = 1; nt <= 8; ++nt) {
         test_cases.emplace_back(new test_dsv4_hc_fused(2560, 320, nt, true,  true, 1));

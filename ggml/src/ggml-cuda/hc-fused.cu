@@ -120,7 +120,7 @@ static __global__ void __launch_bounds__(256) hcf_row_owner_stage(
     }
 }
 
-template <int T>
+template <int T, bool LOOKAHEAD = false>
 static __global__ void __launch_bounds__(256) hcf_down_row_owner(
         const float * __restrict__ xn, const char * __restrict__ wd, const int64_t sd,
         const char * __restrict__ wi, const int64_t si, const int R, const int n_rows, const int n_embd,
@@ -135,8 +135,17 @@ static __global__ void __launch_bounds__(256) hcf_down_row_owner(
 #pragma unroll
     for (int s = 0; s < 4; ++s) {
         float acc[T] = {};
+        uint4 next = {};
+        if constexpr (LOOKAHEAD) {
+            next = __ldg((const uint4 *) wr + (s*n_embd + lane*8)/8);
+        }
         for (int j = lane*8; j < n_embd; j += 256) {
-            const uint4 pk = __ldg((const uint4 *) wr + (s*n_embd + j)/8);
+            const uint4 pk = LOOKAHEAD ? next : __ldg((const uint4 *) wr + (s*n_embd + j)/8);
+            if constexpr (LOOKAHEAD) {
+                if (j + 256 < n_embd) {
+                    next = __ldg((const uint4 *) wr + (s*n_embd + j + 256)/8);
+                }
+            }
             const uint32_t p[4] = { pk.x, pk.y, pk.z, pk.w };
 #pragma unroll
             for (int t = 0; t < T; ++t) {
@@ -968,12 +977,16 @@ static void hcf_down_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, 
         const char * e = getenv("LLAMA_HC_DOWN_ROW_WARPS");
         return e && atoi(e) == 4 ? 4 : 8;
     }();
+    static const bool row_lookahead = [] {
+        const char * e = getenv("LLAMA_HC_DOWN_ROW_LOOKAHEAD");
+        return e && atoi(e) == 1;
+    }();
     if (row_owner && slot >= 0 && n_embd % 256 == 0) {
         ggml_cuda_pool_alloc<float> xn(ctx.pool(), (size_t) T*hc_dim);
         auto stage = [&](auto fold) {
             constexpr bool F = decltype(fold)::value;
             static const bool reported = [=] {
-                fprintf(stderr, "[hc-down-row-owner] T=%d rows=%d embd=%d folded=%d warps=%d\n", T, n_rows, n_embd, F, row_warps);
+                fprintf(stderr, "[hc-down-row-owner] T=%d rows=%d embd=%d folded=%d warps=%d lookahead=%d\n", T, n_rows, n_embd, F, row_warps, row_lookahead);
                 return true;
             }();
             GGML_UNUSED(reported);
@@ -985,9 +998,17 @@ static void hcf_down_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, 
         } else {
             stage(std::false_type{});
         }
-        hcf_down_row_owner<T><<<(n_rows + row_warps - 1)/row_warps, 32*row_warps, 0, stream>>>(xn.get(),
-                (const char *) wd->data, wd->nb[1], wi ? (const char *) wi->data : nullptr, wi ? wi->nb[1] : 0,
-                R, n_rows, n_embd, lo_scale, inj_scale, (float *) dst->data);
+        auto rows = [&](auto lookahead) {
+            constexpr bool L = decltype(lookahead)::value;
+            hcf_down_row_owner<T, L><<<(n_rows + row_warps - 1)/row_warps, 32*row_warps, 0, stream>>>(xn.get(),
+                    (const char *) wd->data, wd->nb[1], wi ? (const char *) wi->data : nullptr, wi ? wi->nb[1] : 0,
+                    R, n_rows, n_embd, lo_scale, inj_scale, (float *) dst->data);
+        };
+        if (row_lookahead) {
+            rows(std::true_type{});
+        } else {
+            rows(std::false_type{});
+        }
         return;
     }
     static const bool owner = [] {
