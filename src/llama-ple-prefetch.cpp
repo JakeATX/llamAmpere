@@ -486,7 +486,7 @@ int64_t llama_ple_prefetch::reader() {
     size_t buf_size = 0;
     int64_t t_last = 0;
     int64_t pages_read = 0;
-    size_t next = 0, end = 0;
+    size_t next = 0, end = 0, ready_end = 0;
     size_t done_chunk = 0;
     int64_t done_runs = 0;
     auto flush_done = [&]() {
@@ -505,14 +505,26 @@ int64_t llama_ple_prefetch::reader() {
             end = next + batch_runs;
         }
         const size_t i = next++;
-        if (!run_ready(i)) {
+        if (i >= ready_end && !run_ready(i)) {
             // fork: release completed chunks before waiting for the consumer to advance the window.
             flush_done();
             std::unique_lock<std::mutex> lk(mtx);
             cv_work.wait(lk, [&]() { return run_ready(i); });
         }
-        if (stopping.load() || i >= n_built.load()) {
+        if (stopping.load()) {
             break;
+        }
+        if (i >= ready_end) {
+            const size_t published = n_built.load();
+            if (i >= published) {
+                break;
+            }
+            ready_end = i + 1;
+            // fork: published runs and allowed chunks only grow, so a ready batch stays ready.
+            const size_t claim_end = std::min(end, published);
+            if (batch_runs > 1 && run_chunk[claim_end - 1] < allowed_chunks.load()) {
+                ready_end = claim_end;
+            }
         }
         if (done_runs > 0 && done_chunk != run_chunk[i]) {
             flush_done();
