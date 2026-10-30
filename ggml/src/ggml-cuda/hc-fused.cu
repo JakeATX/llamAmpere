@@ -1215,6 +1215,7 @@ static void hcf_up_launch_impl(ggml_backend_cuda_context & ctx, ggml_tensor * ds
             (const float *) x->data, (const float *) wn->data, act, r,
             (const char *) wu->data, wu->nb[1], n_embd, R, out_scale, (float *) dst->data, (block_q8_1 *) q8, slot*HCF_UP_CNT);
     }
+    CUDA_CHECK(cudaGetLastError());
 }
 
 template <int T>
