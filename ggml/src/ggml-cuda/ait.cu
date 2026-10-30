@@ -12,6 +12,7 @@
 // GGML_CUDA_AIT_OCC = 0 (default), 1 or 2: AIT4 low-register experiment with a two-group or one-group prefetch ring.
 // Modes 3/4 cap registers; GGML_CUDA_AIT_OCC_GRID sets their blocks per SM (1..8, default 4).
 // GGML_CUDA_AIT3_PACK: 1 packs each AIT3 row tile with a tight register cap; 2 keeps the base register budget.
+// GGML_CUDA_AIT3_RING2=1 keeps two AIT3 weight groups live with the base register budget.
 #include "ait.cuh"
 #include "ait-mm.cuh"
 #include "ai4.cuh"
@@ -779,6 +780,12 @@ static void ait_fast_nt(ggml_backend_cuda_context & ctx, const uint8_t * W, cons
         }
     }
     k_ait_actq<NT><<<NT * S, 64, 0, stream>>>(X, W, xq.get(), sa.get(), ordered ? nullptr : Y, M, K, k);
+    static const bool ring2 = ait_env_int("GGML_CUDA_AIT3_RING2", 0) == 1;
+    if (ring2 && k == 3 && code == 0 && full && warps <= 12) {
+        k_ait_mmv<3, NT, true, 0, 0, 2><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
+        finish();
+        return;
+    }
     static const int pack3 = ait_env_int("GGML_CUDA_AIT3_PACK", 0);
     if ((pack3 == 1 || pack3 == 2) && k == 3 && code == 0 && full && warps <= 12) {
         if (pack3 == 2) {
