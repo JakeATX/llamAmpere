@@ -390,6 +390,23 @@ std::vector<ggml_backend_buffer_ptr> llama_b1::spare_views(size_t min_bytes, siz
 }
 
 void llama_b1::release_plan() {
+    GGML_ASSERT(workers.empty() && !coord.joinable());
+    size_t kept_bytes = 0;
+    size_t freed_bytes = 0;
+    for (size_t ti = 0; ti < exps.size(); ++ti) {
+        auto & kept = exps[ti].kept;
+        if (kept.empty()) {
+            continue;
+        }
+        GGML_ASSERT(ti < dirty_flag.size());
+        if (!dirty_flag[ti]) {
+            // fork: joined workers no longer read this pageable copy; VRAM holds the weights.
+            freed_bytes += kept.size();
+            std::vector<char>().swap(kept);
+        }
+        kept_bytes += kept.size();
+    }
+    LLAMA_LOG_INFO("%s: [B1] bank RAM: released %zu bytes, retained %zu bytes for lent homes\n", __func__, freed_bytes, kept_bytes);
     reserve_layer_restore();
     ffn_release();
     if (fresh_buf) {
@@ -723,7 +740,7 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
         }
     }
 
-    // fork: keep lent weights across plans; never lend our only live copy to scratch.
+    // fork: keep lent weights until refill; never lend our only live copy to scratch.
     if (b1_env_int("LLAMA_B1_KEEP_BANK_RAM", 1)) {
         size_t kept_bytes = 0;
         for (int il : lent_sel) {
@@ -748,6 +765,7 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
                 if (dirty_flag[ti]) {
                     if (!b1_read_file(e.src.fd, e.kept.data(), e.src.offs, e.nbytes, e.src.alignment)) {
                         std::vector<char>().swap(e.kept);
+                        release_plan();
                         return false;
                     }
                 } else {
@@ -763,6 +781,7 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
         fresh_buf = ggml_backend_buft_alloc_buffer(buft_dev, fresh_sel);
         if (fresh_buf == nullptr) {
             LLAMA_LOG_WARN("%s: [B1] cannot allocate %.1f MiB of VRAM; using the normal prefill\n", __func__, fresh_sel/1048576.0);
+            release_plan();
             return false;
         }
         ggml_backend_buffer_set_usage(fresh_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
