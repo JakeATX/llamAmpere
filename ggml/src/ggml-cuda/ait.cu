@@ -17,6 +17,7 @@
 // GGML_CUDA_AIT4_NEIGHBOR=1 loads one weight vector per lane and shuffles its neighbor instead of loading it twice.
 // GGML_CUDA_AIT4_NEIGHBOR_PACK=1 packs one MMA tile at a time in the neighbor path.
 // GGML_CUDA_AIT4_NEIGHBOR_TAIL=1 refills the neighbor ring after its IMMA work.
+// GGML_CUDA_AIT4_NEIGHBOR_EARLY_X=1 reads activations before the neighbor group's decode.
 // GGML_CUDA_AIT4_RING2=1 keeps two AIT4 weight groups live with the base register budget (OCC=0, NEIGHBOR=0).
 // GGML_CUDA_AIT4_RING1=1 keeps one AIT4 weight group live and takes precedence over RING2.
 // GGML_CUDA_AIT4_TAIL=1 refills the four-group weight ring after each group's IMMA work.
@@ -262,7 +263,7 @@ template <int KB, int NT, int Gi, int PC = 0, bool CO = false, int DEPTH = 4, bo
 static __device__ __forceinline__ void ait_group(uint4 (&buf)[DEPTH][2], const int G, const bool pf, const char * gp, const int (&off)[2],
         const int r, const char * xs, const bool live, int (&c)[2][4], const char * tsm = nullptr, const uint32_t lo = 0) {
     static_assert(!TAIL || (KB == 4 && PC == 0 && !CO && !LOW && !SHARED_X), "tail refill requires plain AIT4");
-    static_assert(!EARLY_X || (KB == 4 && PC == 0 && !CO && !LOW && !SHARED_X && !NEIGHBOR && !TAIL), "early activation requires plain AIT4");
+    static_assert(!EARLY_X || (KB == 4 && PC == 0 && !CO && !LOW && !SHARED_X && !TAIL), "early activation requires plain AIT4");
     using namespace aitk;
     constexpr int GB = 128 * KB;
     constexpr bool ONE = 7 * KB + 16 <= 32;
@@ -393,7 +394,7 @@ static __global__ void __launch_bounds__(CAP ? 256 : LOW || BOUNDS ? 384 : 512, 
     static_assert(!NEIGHBOR || (KB == 4 && FULL && PC == 0 && V == 0), "neighbor path requires plain full AIT4");
     static_assert(!TAIL || (KB == 4 && FULL && PC == 0 && V == 0 && !PACK), "tail refill requires plain full AIT4");
     static_assert(!UNROLL2 || (KB == 4 && FULL && PC == 0 && V == 0 && DEPTH == 4 && !LOW && !CAP && !PACK && !NEIGHBOR && !TAIL), "two-step unroll requires plain full AIT4");
-    static_assert(!EARLY_X || (KB == 4 && FULL && PC == 0 && V == 0 && DEPTH == 4 && !LOW && !CAP && !PACK && !NEIGHBOR && !TAIL && !UNROLL2), "early activation requires plain full AIT4");
+    static_assert(!EARLY_X || (KB == 4 && FULL && PC == 0 && V == 0 && DEPTH == 4 && !LOW && !CAP && !PACK && !TAIL && !UNROLL2), "early activation requires plain full AIT4");
     static_assert(!BOUNDS || (KB == 4 && FULL && PC == 0 && V == 0 && DEPTH == 4 && !LOW && !CAP && !PACK && !NEIGHBOR && !TAIL && !UNROLL2 && !EARLY_X), "thread bound requires plain full AIT4");
     constexpr bool CO = (V & 2) != 0;
     using namespace aitk;
@@ -864,12 +865,15 @@ static void ait_fast_nt(ggml_backend_cuda_context & ctx, const uint8_t * W, cons
         static const bool neighbor4_pack = ait_env_int("GGML_CUDA_AIT4_NEIGHBOR_PACK", 0) == 1;
         static const bool neighbor4_ring2 = ait_env_int("GGML_CUDA_AIT4_NEIGHBOR_RING2", 0) == 1;
         static const bool neighbor4_tail = ait_env_int("GGML_CUDA_AIT4_NEIGHBOR_TAIL", 0) == 1;
+        static const bool neighbor4_early_x = ait_env_int("GGML_CUDA_AIT4_NEIGHBOR_EARLY_X", 0) == 1;
         if (neighbor4_pack) {
             k_ait_mmv<4, NT, true, 0, 0, 4, false, false, true, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
         } else if (neighbor4_ring2) {
             k_ait_mmv<4, NT, true, 0, 0, 2, false, false, false, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
         } else if (neighbor4_tail) {
             k_ait_mmv<4, NT, true, 0, 0, 4, false, false, false, true, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
+        } else if (neighbor4_early_x) {
+            k_ait_mmv<4, NT, true, 0, 0, 4, false, false, false, true, false, false, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
         } else {
             k_ait_mmv<4, NT, true, 0, 0, 4, false, false, false, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
         }
