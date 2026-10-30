@@ -86,7 +86,7 @@ static __device__ __forceinline__ float hcf_owner_sum(float v) {
 
 // Four stripes own eight BF16 values per lane in each 256-column tile. Keep the four stream sums separate
 // until their RMS scales are known. The last stripe finishes its row block with coalesced partial reads.
-template <int T, bool FOLD>
+template <int T, bool FOLD, bool LOOKAHEAD = false>
 static __global__ void __launch_bounds__(128) hcf_down_owner(
         const float * __restrict__ x, const float * __restrict__ wn,
         const char * __restrict__ wd, const int64_t sd, const char * __restrict__ wi, const int64_t si,
@@ -142,8 +142,21 @@ static __global__ void __launch_bounds__(128) hcf_down_owner(
 #pragma unroll
         for (int s = 0; s < 4; ++s) {
             float acc[T] = {};
-            for (int q = s*(n_embd/256); q < (s + 1)*(n_embd/256); ++q) {
-                const uint4 pk = __ldg((const uint4 *) wr + q*32 + owner);
+            const int first = s*(n_embd/256), end = (s + 1)*(n_embd/256);
+            uint4 next;
+            if constexpr (LOOKAHEAD) {
+                next = __ldg((const uint4 *) wr + first*32 + owner);
+            }
+            for (int q = first; q < end; ++q) {
+                uint4 pk;
+                if constexpr (LOOKAHEAD) {
+                    pk = next;
+                    if (q + 1 < end) {
+                        next = __ldg((const uint4 *) wr + (q + 1)*32 + owner);
+                    }
+                } else {
+                    pk = __ldg((const uint4 *) wr + q*32 + owner);
+                }
                 const uint32_t p[4] = { pk.x, pk.y, pk.z, pk.w };
 #pragma unroll
                 for (int t = 0; t < T; ++t) {
@@ -799,6 +812,10 @@ static void hcf_down_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, 
         const char * e = getenv("LLAMA_HC_DOWN_OWNER");
         return e && atoi(e) == 1;
     }();
+    static const bool owner_lookahead = [] {
+        const char * e = getenv("LLAMA_HC_DOWN_OWNER_LOOKAHEAD");
+        return e && atoi(e) == 1;
+    }();
     const int owner_rb = (n_rows + HCF_OWNER_ROWS - 1)/HCF_OWNER_ROWS;
     const size_t owner_smem = (size_t) T*n_embd*sizeof(float);
     const size_t owner_static = (5*T*4 + 1)*sizeof(float);
@@ -808,20 +825,30 @@ static void hcf_down_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, 
     const int owner_slot = owner && slot >= 0 && n_rows <= HCF_OWNER_MAX_ROWS && n_embd % 256 == 0 &&
             owner_smem <= owner_limit ? hcf_owner_cnt_slot(ctx) : -1;
     if (owner_slot >= 0) {
-        auto kernel = hpost != nullptr ? hcf_down_owner<T, true> : hcf_down_owner<T, false>;
+        auto kernel = hpost != nullptr ?
+                (owner_lookahead ? hcf_down_owner<T, true, true> : hcf_down_owner<T, true>) :
+                (owner_lookahead ? hcf_down_owner<T, false, true> : hcf_down_owner<T, false>);
+        auto set_limit = [&](auto fold) {
+            constexpr bool F = decltype(fold)::value;
+            if (owner_lookahead) {
+                auto k = hcf_down_owner<T, F, true>;
+                CUDA_SET_SHARED_MEMORY_LIMIT(k, owner_limit);
+            } else {
+                auto k = hcf_down_owner<T, F>;
+                CUDA_SET_SHARED_MEMORY_LIMIT(k, owner_limit);
+            }
+            static const bool reported = [=] {
+                fprintf(stderr, "[hc-down-owner] T=%d rows=%d embd=%d smem=%zu folded=%d lookahead=%d\n",
+                        T, n_rows, n_embd, owner_smem, F, owner_lookahead);
+                return true;
+            }();
+            GGML_UNUSED(reported);
+        };
         if (hpost != nullptr) {
-            auto folded_kernel = hcf_down_owner<T, true>;
-            CUDA_SET_SHARED_MEMORY_LIMIT(folded_kernel, owner_limit);
+            set_limit(std::true_type{});
         } else {
-            auto plain_kernel = hcf_down_owner<T, false>;
-            CUDA_SET_SHARED_MEMORY_LIMIT(plain_kernel, owner_limit);
+            set_limit(std::false_type{});
         }
-        static const bool reported = [=] {
-            fprintf(stderr, "[hc-down-owner] T=%d rows=%d embd=%d smem=%zu folded=%d\n",
-                    T, n_rows, n_embd, owner_smem, hpost != nullptr);
-            return true;
-        }();
-        GGML_UNUSED(reported);
         ggml_cuda_pool_alloc<float> partial(ctx.pool(), (size_t) 4*T*n_rows*32);
         ggml_cuda_pool_alloc<float> sq(ctx.pool(), (size_t) owner_rb*4*T*4);
         kernel<<<dim3(owner_rb, 4), 128, owner_smem, stream>>>(
