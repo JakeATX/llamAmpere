@@ -1065,6 +1065,9 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
         if (s.host_help) { s.host_cpu = cores[0]; pin_thread(s.host_cpu); }
         std::vector<char> skip(cores.size(), 0);
         if (!max_threads) { skip[0] = 1; }
+        // GGML_MOE_CPU_SPLIT_CORE0=0 keeps the pool off core 0 even with MAX_THREADS: the card queue fences every
+        // other process onto core 0 during a timed run, and a pool thread there stalls the layer when it is preempted.
+        if (env_int("GGML_MOE_CPU_SPLIT_CORE0", 1, 0, 1) == 0 && cores.size() > 2) { skip[0] = 1; }
         const char * ep = getenv("GGML_CPU_EXPERT_PIN");
         if (!s.host_help && !max_threads && ep && strcmp(ep, "1") == 0 && cores.size() > 2) { skip[1] = 1; }
 #if defined(__linux__)
