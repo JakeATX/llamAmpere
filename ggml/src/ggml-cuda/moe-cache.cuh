@@ -250,3 +250,7 @@ void ggml_cuda_moe_cache_table_graph_begin(ggml_backend_cuda_context & ctx, bool
 void ggml_cuda_moe_cache_table_graph_end(ggml_backend_cuda_context & ctx);
 #endif
 #endif
+
+// Opt-in weight policies, represented by an explicit custom graph node.
+bool ggml_cuda_moe_skipmass_supports(const ggml_tensor * op);
+bool ggml_cuda_moe_skipmass_compute(ggml_backend_cuda_context & ctx, ggml_tensor * op);

@@ -2401,6 +2401,12 @@ ggml_tensor * llm_graph_context::build_ffn(
     return cur;
 }
 
+// fork: CPU fallback is exact; lossy weight policies require device residency tables.
+static void moe_skipmass_cpu(ggml_tensor * dst, const ggml_tensor * a, const ggml_tensor *, int ith, int, void *) {
+    GGML_ASSERT(!getenv("GGML_MOE_SKIP_POLICY") || strcmp(getenv("GGML_MOE_SKIP_POLICY"), "rank") == 0);
+    if (ith == 0) { memcpy(dst->data, a->data, ggml_nbytes(a)); }
+}
+
 ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * cur,
          ggml_tensor * gate_inp,
@@ -2606,6 +2612,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (w_scale != 0.0f && w_scale != 1.0f) {
         weights = ggml_scale(ctx0, weights, w_scale);
         cb(weights, "ffn_moe_weights_scaled", il);
+    }
+
+    // fork: explicit graph output keeps adjusted weights alive until the final expert sum.
+    if ((getenv("GGML_MOE_SKIP_POLICY") || getenv("GGML_MOE_SKIP_TRACE")) &&
+            norm_w && gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX && n_expert == 512 &&
+            il < 48 && ubatch.n_seqs == 1 && n_expert_used == 10 && n_tokens > 0 && n_tokens <= 8) {
+        weights = ggml_map_custom2(ctx0, weights, selected_experts, moe_skipmass_cpu, 1, nullptr);
+        ggml_format_name(weights, "moe_skipmass-%d", il);
     }
 
     //call early so that topk-moe can be used

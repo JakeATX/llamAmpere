@@ -3929,6 +3929,7 @@ static bool ggml_cuda_kv_stream_staged_set_rows_range(
 }
 
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
+    if (ggml_cuda_moe_skipmass_supports(dst)) { return ggml_cuda_moe_skipmass_compute(ctx, dst); }
     switch (dst->op) {
         case GGML_OP_ARGMAX:
             ggml_cuda_argmax(ctx, dst);
@@ -11049,6 +11050,11 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     ggml_cuda_stream_context & stream_context = cuda_ctx->stream_context();
     stream_context.reset();
 
+    // fork: weight decisions publish the layer masks before its first projection.
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        if (ggml_cuda_moe_skipmass_supports(cgraph->nodes[i])) { return; }
+    }
+
     if (!use_cuda_graph) {
         return;
     }
@@ -11565,6 +11571,7 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_host_buffer_type(
 // TODO: move these functions here
 static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
+    if (ggml_cuda_moe_skipmass_supports(op)) { return true; }
     if (ggml_cuda_moe_cache_device_supports(op, dev_ctx->device)) {
         return true;
     }
