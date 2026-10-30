@@ -494,6 +494,7 @@ struct pool_state {
     bool schedule = false;    // Assign quantization rows directly and claim math tiles in small groups.
     int waitpf = 0;           // GGML_MOE_CPU_SPLIT_WAITPF: KiB of its first tile a worker prefetches while it waits at a phase barrier (0 = off)
     bool host_help = false;
+    bool expjob = false;      // GGML_MOE_CPU_SPLIT_EXPJOB=1: one worker runs a whole expert (up/gate, SiLU, down) per claim, no phase barriers inside a job
     int host_cpu = -1;
     std::atomic<int> help_phase{-1}; // -1 closed, 1/3 open, 5/7 held by a helper
     std::atomic<unsigned long long> closed[4];
@@ -787,7 +788,20 @@ void run_job_phases(pool_state & s, unsigned long long n, int worker, bool lead 
     pf_cursor pf;
     for (int p = 0; p < 4; ++p) {
         const int total = items_of(s, p);
-        if (s.schedule && (p == 0 || p == 2)) {
+        if (s.expjob && p >= 1) {
+            // Fused phase: claim whole experts. Each expert's tiles are the same items the phased path runs, in the same
+            // per-row order, so the output is unchanged; phases 2 and 3 only pass the (already satisfied) barriers.
+            if (p == 1) {
+                for (int i = s.next[1].fetch_add(1, std::memory_order_relaxed); i < s.n_exp;
+                        i = s.next[1].fetch_add(1, std::memory_order_relaxed)) {
+                    const int bu = total / s.n_exp;
+                    for (int b = 0; b < bu; ++b) { run_item(s, 1, i * bu + b); }
+                    for (int q = s.first[i]; q < s.first[i + 1]; ++q) { run_item(s, 2, q); }
+                    const int bd = items_of(s, 3) / s.n_exp;
+                    for (int b = 0; b < bd; ++b) { run_item(s, 3, i * bd + b); }
+                }
+            }
+        } else if (s.schedule && (p == 0 || p == 2)) {
             // Each row has one writer. The phase barrier publishes it before any consumer runs.
             for (int it = worker; it < total; it += s.threads) {
                 run_item(s, p, it);
@@ -1054,6 +1068,8 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
     s.host_help = env_int("GGML_MOE_CPU_SPLIT_HOST", 0, 0, 1) != 0;
     s.wstats = env_int("GGML_MOE_CPU_SPLIT_WSTATS", 0, 0, 1) != 0;
     s.waitpf = env_int("GGML_MOE_CPU_SPLIT_WAITPF", 0, 0, 1024);
+    s.expjob = env_int("GGML_MOE_CPU_SPLIT_EXPJOB", 0, 0, 1) != 0;
+    if (s.expjob) { s.host_help = false; s.waitpf = 0; }
     for (int p = 0; p < 4; ++p) { s.next[p].store(0); s.fin[p].store(0); s.closed[p].store(0); }
     // Reserve the caller's actual core and keep the card-driving thread on it.
     const bool max_threads = env_int("GGML_MOE_CPU_SPLIT_MAX_THREADS", 1, 0, 1) != 0;
@@ -1161,6 +1177,7 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
     if (s.q2_group4 && s.q2_fast) { fprintf(stderr, "[moe-cpu-split] Q2_0 down shares weights across three/four-route groups\n"); }
     if (s.vector_silu && s.iq_rows) { fprintf(stderr, "[moe-cpu-split] grouped up/gate uses CPU vector SiLU\n"); }
     if (s.iq_rows) { fprintf(stderr, "[moe-cpu-split] IQ up/gate row kernels (each chunk decoded once per expert), variant %d, prefetch %d B\n", s.iq_variant, s.iq_pf); }
+    if (s.expjob) { fprintf(stderr, "[moe-cpu-split] one worker per whole expert (GGML_MOE_CPU_SPLIT_EXPJOB)\n"); }
     if (s.schedule) { fprintf(stderr, "[moe-cpu-split] static quantization rows, grouped math claims\n"); }
     if (s.host_help) { fprintf(stderr, "[moe-cpu-split] waiting host drains math tiles on cpu %d\n", s.host_cpu); }
     fprintf(stderr, "[moe-cpu-split] input Q8 reuse %s, IQ token group %d, IQ4_NL down reuse %s\n", s.q8_reuse ? "on" : "off", s.group_tokens, s.down_reuse ? "on" : "off");
