@@ -7120,7 +7120,7 @@ static bool run_skip_tail_layer(ggml_backend_t gpu, ggml_backend_t cpu, log_capt
                     for (int renorm : {0, 1}) {
                       for (int floor : {0, 5, 10}) {
                         set_env("GGML_MOE_SKIP_POLICY", mode == 1 ? "threshold" : "cumulative");
-                        set_env("GGML_MOE_SKIP_THRESHOLD", mode == 1 ? "0.04" : "0.08");
+                        set_env("GGML_MOE_SKIP_THRESHOLD", mode == 1 ? "0.04" : "0.25");
                         set_env("GGML_MOE_SKIP_RENORM", renorm ? "1" : "0");
                         const std::string floor_text = std::to_string(floor);
                         set_env("GGML_MOE_SKIP_RANK_FLOOR", floor_text.c_str());
@@ -7135,7 +7135,7 @@ static bool run_skip_tail_layer(ggml_backend_t gpu, ggml_backend_t cpu, log_capt
                         for (int t = 0; t < tokens; ++t) {
                             unsigned char hot[10];
                             for (int j = 0; j < k_used; ++j) { hot[j] = routing[64 * t + j] < 6 ? 7 : 0; }
-                            ggml_moe_skipmass_select(shares, hot, k_used, mode, mode == 1 ? 0.04f : 0.08f, drops.data() + t * k_used, floor);
+                            ggml_moe_skipmass_select(shares, hot, k_used, mode, mode == 1 ? 0.04f : 0.25f, drops.data() + t * k_used, floor);
                             float total = 0.0f, kept = 0.0f;
                             bool changed = false;
                             for (int j = 0; j < k_used; ++j) {
