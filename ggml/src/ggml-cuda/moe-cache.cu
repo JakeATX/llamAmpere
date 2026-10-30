@@ -8446,7 +8446,7 @@ bool ggml_cuda_moe_cache_swap_async_test() {
                 table.desc.expert_size = 64; table.desc.type = GGML_TYPE_Q4_0;
                 table.desc.n_in = 16; table.desc.n_out = 8;
                 table.count_offset = k * 6; table.swap_pool = &pool;
-                table.permanent.assign(6, 0); table.fallback.assign(6, &keys[k]);
+                table.permanent.assign(6, 0); table.permanent[5] = 1; table.fallback.assign(6, &keys[k]);
                 group[k] = &table;
                 for (int e = 0; e < 2; ++e) {
                     const int index = k * 2 + e;
@@ -8458,7 +8458,7 @@ bool ggml_cuda_moe_cache_swap_async_test() {
             seed.swap_groups.push_back(group);
             auto sync = moe_cache_swap_snapshot(seed);
             auto async = moe_cache_swap_snapshot(seed);
-            size_t swaps = 0;
+            size_t swaps = 0, free_swaps = 0, evictions = 0;
             auto apply = [](const moe_swap_decision & result) {
                 for (const auto & p : result.pairs) {
                     auto & slot = p.pool->slots[p.slot];
@@ -8480,9 +8480,17 @@ bool ggml_cuda_moe_cache_swap_async_test() {
                 auto expected = moe_cache_swap_run_plan(*sync);
                 async->swap_snapshot = moe_cache_swap_snapshot(*async, std::move(async->swap_snapshot));
                 auto * copy = async->swap_snapshot.get();
-                async->swap_decision = std::async(std::launch::async, [copy] { return moe_cache_swap_run_plan(*copy); });
-                // Publish at the next scope with the same inputs, independent of worker timing.
+                std::promise<void> begin;
+                auto ready = begin.get_future();
+                async->swap_decision = std::async(std::launch::async, [copy, ready = std::move(ready)]() mutable {
+                    ready.wait(); return moe_cache_swap_run_plan(*copy);
+                });
+                ok &= async->swap_decision.wait_for(std::chrono::seconds(0)) == std::future_status::timeout;
+                async->device_previous_counts[0] += 17;
+                begin.set_value();
+                // A later scope can change live counts; the captured inputs stay fixed.
                 auto actual = async->swap_decision.get();
+                async->device_previous_counts[0] -= 17;
                 ok &= moe_cache_swap_take_plan(*async, actual);
                 ok &= expected.pairs.size() == actual.pairs.size() && expected.candidates == actual.candidates;
                 ok &= sync->swap_prev == async->swap_prev && sync->swap_score == async->swap_score;
@@ -8493,9 +8501,10 @@ bool ggml_cuda_moe_cache_swap_async_test() {
                         a.slot == b.slot && a.free == b.free && a.gain == b.gain;
                 }
                 swaps += expected.pairs.size();
+                for (const auto & p : actual.pairs) { p.free ? ++free_swaps : ++evictions; }
                 apply(expected); apply(actual);
             }
-            ok &= swaps > 0;
+            ok &= swaps > 0 && free_swaps > 0 && evictions > 0;
             async->device_previous_counts[4] += 10000;
             async->swap_snapshot = moe_cache_swap_snapshot(*async, std::move(async->swap_snapshot));
             auto stale = moe_cache_swap_run_plan(*async->swap_snapshot);

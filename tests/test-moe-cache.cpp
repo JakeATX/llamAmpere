@@ -8003,7 +8003,7 @@ int main(int argc, char ** argv) {
     // The ALLOCSIM fixtures expect the opt-in plan refresh and growth step-down (engine default off).
     if (!getenv("GGML_MOE_CACHE_PLAN_REFRESH")) { set_env("GGML_MOE_CACHE_PLAN_REFRESH", "1"); }
     if (!getenv("GGML_MOE_CACHE_GROW_STEPDOWN")) { set_env("GGML_MOE_CACHE_GROW_STEPDOWN", "1"); }
-#if defined(GGML_CUDA) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#if defined(GGML_CUDA) && !defined(GGML_BACKEND_DL) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     if (argc == 2 && strcmp(argv[1], "--swap-async-cpu-only") == 0) {
         const bool ok = ggml_cuda_moe_cache_swap_async_test();
         printf("cache-swap-async snapshot/sequence/stale: %s\n", ok ? "OK" : "FAIL");
