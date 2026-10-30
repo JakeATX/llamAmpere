@@ -71,6 +71,149 @@ static __device__ __forceinline__ float4 hcf_post_val4(const hcf_post_fold & pf,
                        hcf_post_val(bv.z, pv, rv.z), hcf_post_val(bv.w, pv, rv.w));
 }
 
+static constexpr int HCF_OWNER_ROWS = 16;
+static constexpr int HCF_OWNER_MAX_ROWS = 336;
+static constexpr int HCF_OWNER_RB = HCF_OWNER_MAX_ROWS/HCF_OWNER_ROWS;
+static __device__ unsigned int hcf_owner_arrive[HCF_CNT_SLOTS*HCF_OWNER_RB];
+
+static __device__ __forceinline__ float hcf_owner_sum(float v) {
+#pragma unroll
+    for (int d = 16; d; d >>= 1) {
+        v = __fadd_rn(v, __shfl_xor_sync(0xffffffffu, v, d));
+    }
+    return v;
+}
+
+// Four stripes own eight BF16 values per lane in each 256-column tile. Keep the four stream sums separate
+// until their RMS scales are known. The last stripe finishes its row block with coalesced partial reads.
+template <int T, bool FOLD>
+static __global__ void __launch_bounds__(128) hcf_down_owner(
+        const float * __restrict__ x, const float * __restrict__ wn,
+        const char * __restrict__ wd, const int64_t sd, const char * __restrict__ wi, const int64_t si,
+        const int R, const int n_rows, const int n_embd, const float eps, const float lo_scale, const float inj_scale,
+        float * __restrict__ partial, float * __restrict__ ssq, const int cnt_off,
+        float * __restrict__ dst, const hcf_post_fold pf) {
+    extern __shared__ __align__(16) float sh[];
+    __shared__ float sq_w[4][T][4];
+    __shared__ float rr[T][4];
+    __shared__ int last;
+    const int hc_dim = 4*n_embd, slice = hc_dim/4;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int local = tid & 7, stripe = blockIdx.y, owner = stripe*8 + local;
+    const int row = blockIdx.x*HCF_OWNER_ROWS + tid/8;
+    float sq[T][4] = {};
+    for (int i = tid; i < T*(slice/4); i += 128) {
+        const int t = i/(slice/4), j = (i % (slice/4))*4;
+        const int src = (j/64)*256 + stripe*64 + j%64;
+        const int s = src/n_embd;
+        float4 xv;
+        if constexpr (FOLD) {
+            xv = hcf_post_val4(pf, t, s, src - s*n_embd, src, hc_dim);
+            if (blockIdx.x == 0) {
+                *(float4 *) (pf.h + (int64_t) t*hc_dim + src) = xv;
+            }
+        } else {
+            xv = *(const float4 *) (x + (int64_t) t*hc_dim + src);
+        }
+        const float4 gv = *(const float4 *) (wn + src);
+        sq[t][s] += xv.x*xv.x + xv.y*xv.y + xv.z*xv.z + xv.w*xv.w;
+        *(float4 *) (sh + t*slice + j) = make_float4(xv.x*gv.x, xv.y*gv.y, xv.z*gv.z, xv.w*gv.w);
+    }
+#pragma unroll
+    for (int t = 0; t < T; ++t) {
+#pragma unroll
+        for (int s = 0; s < 4; ++s) {
+            const float v = hcf_owner_sum(sq[t][s]);
+            if (lane == 0) {
+                sq_w[warp][t][s] = v;
+            }
+        }
+    }
+    __syncthreads();
+    if (tid < T*4) {
+        float v = 0.0f;
+        for (int w = 0; w < 4; ++w) {
+            v += sq_w[w][tid/4][tid%4];
+        }
+        ssq[(((int64_t) blockIdx.x*4 + stripe)*T + tid/4)*4 + tid%4] = v;
+    }
+    if (row < n_rows) {
+        const char * wr = row < R ? wd + (int64_t) row*sd : wi + (int64_t) (row - R)*si;
+#pragma unroll
+        for (int s = 0; s < 4; ++s) {
+            float acc[T] = {};
+            for (int q = s*(n_embd/256); q < (s + 1)*(n_embd/256); ++q) {
+                const uint4 pk = __ldg((const uint4 *) wr + q*32 + owner);
+                const uint32_t p[4] = { pk.x, pk.y, pk.z, pk.w };
+#pragma unroll
+                for (int t = 0; t < T; ++t) {
+                    const float * xv = sh + t*slice + q*64 + local*8;
+                    float v = 0.0f;
+#pragma unroll
+                    for (int k = 0; k < 4; ++k) {
+                        v = __fmaf_rn(hcf_bf16_lo(p[k]), xv[2*k], v);
+                        v = __fmaf_rn(hcf_bf16_hi(p[k]), xv[2*k + 1], v);
+                    }
+                    acc[t] = __fadd_rn(acc[t], v);
+                }
+            }
+#pragma unroll
+            for (int t = 0; t < T; ++t) {
+                partial[(((int64_t) s*T + t)*n_rows + row)*32 + owner] = acc[t];
+            }
+        }
+    }
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) {
+        last = atomicAdd(hcf_owner_arrive + cnt_off + blockIdx.x, 1u) == 3u;
+    }
+    __syncthreads();
+    if (!last) {
+        return;
+    }
+    __threadfence();
+    if (tid < T*4) {
+        float v = 0.0f;
+        for (int st = 0; st < 4; ++st) {
+            v += __ldcg(ssq + (((int64_t) blockIdx.x*4 + st)*T + tid/4)*4 + tid%4);
+        }
+        const float r = rsqrtf(v/n_embd + eps);
+        rr[tid/4][tid%4] = r;
+        if (blockIdx.x == 0) {
+            dst[n_rows*T + tid] = r;
+        }
+    }
+    __syncthreads();
+    for (int ri = warp; ri < HCF_OWNER_ROWS; ri += 4) {
+        const int r = blockIdx.x*HCF_OWNER_ROWS + ri;
+        if (r >= n_rows) {
+            continue;
+        }
+#pragma unroll
+        for (int t = 0; t < T; ++t) {
+            float v = 0.0f;
+#pragma unroll
+            for (int s = 0; s < 4; ++s) {
+                const float p = __ldcg(partial + (((int64_t) s*T + t)*n_rows + r)*32 + lane);
+                v += rr[t][s]*hcf_owner_sum(p);
+            }
+            if (lane == 0) {
+                if (r < R) {
+                    const float a = lo_scale*v;
+                    dst[t*R + r] = a/(1.0f + expf(-a));
+                } else {
+                    dst[R*T + t*(n_rows - R) + r - R] = 2.0f/(1.0f + expf(-inj_scale*v));
+                }
+            }
+        }
+    }
+    __syncthreads();
+    if (tid == 0) {
+        atomicExch(hcf_owner_arrive + cnt_off + blockIdx.x, 0u);
+    }
+}
+
 // grid (ceil(n_rows/32), n_chunks), block 256
 // P   [n_chunks][n_rows][T]       partial dot products (without r)
 // ssq [row block][n_chunks][T]    partial sums of x^2 (only row block 0 when cnt == nullptr)
@@ -578,6 +721,20 @@ static int hcf_cnt_slot(const ggml_backend_cuda_context & ctx) {
     return slot;
 }
 
+static int hcf_owner_cnt_slot(const ggml_backend_cuda_context & ctx) {
+    static std::mutex mtx;
+    static std::unordered_map<const void *, int> slots;
+    static int next = 0;
+    std::lock_guard<std::mutex> lock(mtx);
+    const auto it = slots.find(&ctx);
+    if (it != slots.end()) {
+        return it->second;
+    }
+    const int slot = next < HCF_CNT_SLOTS ? next++ : -1;
+    slots[&ctx] = slot;
+    return slot;
+}
+
 template <int T>
 static void hcf_down_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_tensor * hpost) {
     const ggml_tensor * x  = dst->src[0];
@@ -627,11 +784,6 @@ static void hcf_down_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, 
 
     const int slot    = n_rb <= HCF_CNT_RB ? hcf_cnt_slot(ctx) : -1;
     const int cnt_off = slot >= 0 ? slot*HCF_CNT_RB : -1;
-
-    ggml_cuda_pool_alloc<float> P(ctx.pool(), (size_t) n_chunks*n_rows*T);
-    ggml_cuda_pool_alloc<float> ssq(ctx.pool(), (size_t) (cnt_off >= 0 ? n_rb : 1)*n_chunks*T);
-
-    const dim3 grid(n_rb, n_chunks, 1);
     hcf_post_fold pf = {};
     if (hpost != nullptr) {
         pf.blk  = (const float *) hpost->src[0]->data;
@@ -643,6 +795,45 @@ static void hcf_down_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, 
         pf.sp1  = hpost->src[2]->nb[1]/sizeof(float);
         GGML_ASSERT(pf.h == x->data);
     }
+    static const bool owner = [] {
+        const char * e = getenv("LLAMA_HC_DOWN_OWNER");
+        return e && atoi(e) == 1;
+    }();
+    const int owner_rb = (n_rows + HCF_OWNER_ROWS - 1)/HCF_OWNER_ROWS;
+    const size_t owner_smem = (size_t) T*n_embd*sizeof(float);
+    const size_t owner_static = (5*T*4 + 1)*sizeof(float);
+    const size_t owner_limit = std::min<size_t>(81920, ggml_cuda_info().devices[ctx.device].smpbo > owner_static ?
+            ggml_cuda_info().devices[ctx.device].smpbo - owner_static : 0);
+    // A disabled fused finish or exhausted slot table keeps the original two-kernel fallback.
+    const int owner_slot = owner && slot >= 0 && n_rows <= HCF_OWNER_MAX_ROWS && n_embd % 256 == 0 &&
+            owner_smem <= owner_limit ? hcf_owner_cnt_slot(ctx) : -1;
+    if (owner_slot >= 0) {
+        auto kernel = hpost != nullptr ? hcf_down_owner<T, true> : hcf_down_owner<T, false>;
+        if (hpost != nullptr) {
+            auto folded_kernel = hcf_down_owner<T, true>;
+            CUDA_SET_SHARED_MEMORY_LIMIT(folded_kernel, owner_limit);
+        } else {
+            auto plain_kernel = hcf_down_owner<T, false>;
+            CUDA_SET_SHARED_MEMORY_LIMIT(plain_kernel, owner_limit);
+        }
+        static const bool reported = [=] {
+            fprintf(stderr, "[hc-down-owner] T=%d rows=%d embd=%d smem=%zu folded=%d\n",
+                    T, n_rows, n_embd, owner_smem, hpost != nullptr);
+            return true;
+        }();
+        GGML_UNUSED(reported);
+        ggml_cuda_pool_alloc<float> partial(ctx.pool(), (size_t) 4*T*n_rows*32);
+        ggml_cuda_pool_alloc<float> sq(ctx.pool(), (size_t) owner_rb*4*T*4);
+        kernel<<<dim3(owner_rb, 4), 128, owner_smem, stream>>>(
+            (const float *) x->data, (const float *) wn->data,
+            (const char *) wd->data, wd->nb[1], wi ? (const char *) wi->data : nullptr, wi ? wi->nb[1] : 0,
+            R, n_rows, n_embd, eps, lo_scale, inj_scale, partial.get(), sq.get(), owner_slot*HCF_OWNER_RB,
+            (float *) dst->data, pf);
+        return;
+    }
+    ggml_cuda_pool_alloc<float> P(ctx.pool(), (size_t) n_chunks*n_rows*T);
+    ggml_cuda_pool_alloc<float> ssq(ctx.pool(), (size_t) (cnt_off >= 0 ? n_rb : 1)*n_chunks*T);
+    const dim3 grid(n_rb, n_chunks, 1);
     auto launch = [&](auto finish, auto late, auto warps) {
         constexpr bool WF = decltype(finish)::value;
         constexpr bool LW = decltype(late)::value;

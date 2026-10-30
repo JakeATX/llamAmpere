@@ -5364,6 +5364,54 @@ struct test_dsv4_hc_fused : public test_case {
 };
 
 
+// Direct down outputs expose the activation, injection and RMS scale errors before the up kernel can mask them.
+struct test_dsv4_hc_down_owner : public test_dsv4_hc_fused {
+    test_dsv4_hc_down_owner(int64_t embd, int64_t rank, int64_t tokens, bool injection)
+        : test_dsv4_hc_fused(embd, rank, tokens, injection) {}
+
+    std::string op_desc(ggml_tensor *) override { return "HC_DOWN_OWNER"; }
+    bool run_whole_graph() override { return true; }
+    double max_err() override { return 1.0; }
+    double max_err(ggml_backend_t) override { return max_err(); }
+
+    double err(const float * a, const float * b, size_t n) override {
+        GGML_ASSERT(n == size_t((R + (inject ? 4 : 0) + 4)*n_tokens));
+        double worst = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            if (!std::isfinite(a[i]) || !std::isfinite(b[i])) {
+                return INFINITY;
+            }
+            const double tol = i < n - 4*n_tokens ? 1e-5 : 2e-6*std::abs(double(b[i]));
+            worst = std::max(worst, std::abs(double(a[i]) - b[i])/tol);
+        }
+        const char * dir = getenv("GGML_TEST_HCF_DOWN_DUMP");
+        if (dir != nullptr) {
+            const std::string path = std::string(dir) + "/" + std::to_string(n_embd) + "-" +
+                    std::to_string(R) + "-" + std::to_string(n_tokens) + "-" + std::to_string(inject) + ".bin";
+            FILE * f = fopen(path.c_str(), "wb");
+            GGML_ASSERT(f != nullptr);
+            GGML_ASSERT(fwrite(a, sizeof(float), n, f) == n);
+            GGML_ASSERT(fclose(f) == 0);
+        }
+        printf("HC_DOWN_PARITY %s scaled_max_error=%.9g\n", vars().c_str(), worst);
+        return worst;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, 4, n_tokens);
+        ggml_tensor * wn = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, 4);
+        ggml_tensor * wd = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, 4*n_embd, R);
+        ggml_tensor * wi = inject ? ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, 4*n_embd, 4) : nullptr;
+        ggml_set_name(x, "x");
+        ggml_set_name(wn, "w_norm");
+        ggml_set_name(wd, "w_down");
+        if (wi) {
+            ggml_set_name(wi, "w_inject");
+        }
+        return ggml_dsv4_hc_down(ctx, x, wn, wd, wi, 1e-6f, 0.25f, 0.25f);
+    }
+};
+
 // [HCPN] One Flash-Next hyper-connection step as qwen4exp builds it: H = identity-comb hc_post (post_in) or an ADD (as
 // after a PLE block), xn = rms_norm(H) * gamma, its BF16 copy feeding both BF16 matmuls (cast, LLAMA_HC_BF16_ONCE),
 // the low-rank gate, the gated hc_pre and the next hc_post. GGML_CUDA_HC_POST_NORM=1 and GGML_CUDA_HC_PRE_XN=1 fuse
@@ -15063,6 +15111,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, true));
     test_cases.emplace_back(new test_dsv4_hc_post(4096, 21, true));
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, true, true));
+    for (int64_t nt = 1; nt <= 8; ++nt) {
+        for (bool injection : { false, true }) {
+            test_cases.emplace_back(new test_dsv4_hc_down_owner(2560, 320, nt, injection));
+        }
+    }
+    // The owner bound and its fallback, small stream widths, and partial row blocks.
+    for (int64_t rank : { 64, 332, 333 }) {
+        test_cases.emplace_back(new test_dsv4_hc_down_owner(512, rank, 5, true));
+    }
     // [HCFUSED] real Flash-Next shapes, every token count the kernels specialize, with and without the injection rows
     for (int64_t nt = 1; nt <= 8; ++nt) {
         test_cases.emplace_back(new test_dsv4_hc_fused(2560, 320, nt, true,  true, 1));
