@@ -1293,11 +1293,17 @@ static void ple_hash_pages_case(bool windowed = false, bool bounded = false, boo
             long long pages_read = -1;
             require(read_at && sscanf(read_at, " ms, %lld read", &pages_read) == 1, "prefetch page total logged");
             require(pages_read == (long long) (coalesced ? expected_reads : n_expected), "every requested page counted after readers join");
-            if (populate == 2) {
+            if (populate == 2 || populate == 3) {
                 const char * mapped_at = strstr(summary.c_str(), "; bulk mapped runs=");
                 long long mapped_runs = 0;
                 require(mapped_at && sscanf(mapped_at, "; bulk mapped runs=%lld", &mapped_runs) == 1 && mapped_runs > 0,
                         "bulk mapped-page path completed at least one run");
+            }
+            if (populate == 3) {
+                const char * direct_at = strstr(summary.c_str(), "; direct mapped runs=");
+                long long direct_runs = 0;
+                require(direct_at && sscanf(direct_at, "; direct mapped runs=%lld", &direct_runs) == 1 && direct_runs > 0,
+                        "direct mapped-page path bypassed scratch reads for at least one run");
             }
             if (bounded) {
                 // Stop a partial window, then reuse the same prefetcher for a fresh call.
@@ -1308,6 +1314,16 @@ static void ple_hash_pages_case(bool windowed = false, bool bounded = false, boo
                 }
             }
             if (coalesced) {
+                if (populate == 3) {
+                    size_t last_page = 0;
+                    for (size_t page = 0; page < n_pages; ++page) {
+                        if (first_read[page] < n_tokens) { last_page = page; }
+                    }
+                    require(ftruncate(fileno(file.get()), last_page*4096 + 1) == 0, "truncate within the last requested page");
+                    pf->hint(tokens.data(), tokens.size(), pos0);
+                    require(!pf->consume(tokens.size(), nullptr, 0), "direct mapping refuses an incomplete final requested page");
+                    pf->stop();
+                }
                 require(ftruncate(fileno(file.get()), 0) == 0, "truncate prefetch file after successful reads");
                 pf->hint(tokens.data(), tokens.size(), pos0);
                 require(!pf->consume(tokens.size(), nullptr, 0), "incomplete file reads fall back without marking chunks ready");
@@ -1523,6 +1539,20 @@ static void ple_cold_recheck_case() {
 }
 
 int main(int argc, char ** argv) {
+    if (argc > 1 && strcmp(argv[1], "--ple-populate-direct") == 0) {
+        try {
+            for (size_t offset : { 0, 64, 4092 }) {
+                for (size_t chunk : { 384, 128, 1 }) {
+                    ple_hash_pages_case(true, true, true, chunk, 3, offset);
+                }
+            }
+            printf("OK: direct mapped-page population bypasses scratch reads with exact pages, PTEs and partial-EOF fallback\n");
+            return 0;
+        } catch (const std::exception & e) {
+            fprintf(stderr, "prefetch direct populate pages: FAIL: %s\n", e.what());
+            return 1;
+        }
+    }
     if (argc > 1 && strcmp(argv[1], "--ple-populate-bulk") == 0) {
         try {
             for (size_t offset : { 0, 64, 4092 }) {

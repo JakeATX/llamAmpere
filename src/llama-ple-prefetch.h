@@ -75,7 +75,7 @@ private:
     size_t   batch_runs = 1;     // runs claimed per shared cursor update
     uint32_t n_recheck = 0;      // chunks between later residency samples (0 = first chunk only)
     bool     use_pread = true;
-    int      populate = 0;      // 1: touch pages after file reads; 2: try bulk page-table population
+    int      populate = 0;      // 1: touch after reads; 2: bulk after reads; 3: try bulk without scratch reads
     bool     use_advise = false; // [PFGAP] file mode: ask the kernel to queue the reads instead of copying them
     bool     coalesce = false;
     bool     bounded_window = false;
@@ -116,6 +116,7 @@ private:
     std::atomic<size_t>      cursor{0};
     std::atomic<int64_t>     n_read{0};
     std::atomic<int64_t>     n_map_runs{0};
+    std::atomic<int64_t>     n_direct_runs{0};
     bool                     running = false;
     uint64_t                 consumed = 0; // tokens consumed in this call
     bool                     seq_start = false; // the call starts its sequence
