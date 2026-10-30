@@ -179,15 +179,16 @@ int main(int argc, char ** argv) {
     test_census();
     test_zero_block();
     test_small_expert_reduce();
-    const size_t margin = 300u * 1024 * 1024;
-    CHECK(common_fit_verify_compact_safe(COMMON_PARAMS_FIT_STATUS_SUCCESS, { margin }));
-    CHECK(common_fit_verify_compact_safe(COMMON_PARAMS_FIT_STATUS_SUCCESS, { margin, 2 * margin }));
-    CHECK(!common_fit_verify_compact_safe(COMMON_PARAMS_FIT_STATUS_SUCCESS, { margin - 1 }));
-    CHECK(!common_fit_verify_compact_safe(COMMON_PARAMS_FIT_STATUS_SUCCESS, { 2 * margin, margin - 1 }));
-    CHECK(!common_fit_verify_compact_safe(COMMON_PARAMS_FIT_STATUS_SUCCESS, {}));
-    for (auto status : { COMMON_PARAMS_FIT_STATUS_FAILURE, COMMON_PARAMS_FIT_STATUS_ERROR, COMMON_PARAMS_FIT_STATUS_NO_ROOM }) {
-        CHECK(!common_fit_verify_compact_safe(status, { 2 * margin }));
-    }
+    const int64_t margin = 300 * 1024 * 1024;
+    CHECK(common_fit_verify_compact_safe(true, { margin }, { margin }));
+    CHECK(common_fit_verify_compact_safe(true, { margin, 2 * margin }, { margin, margin }));
+    CHECK(!common_fit_verify_compact_safe(true, { margin - 1 }, { margin }));
+    CHECK(!common_fit_verify_compact_safe(true, { 2 * margin, margin - 1 }, { margin, margin }));
+    CHECK(!common_fit_verify_compact_safe(true, { -1 }, { margin }));
+    CHECK(!common_fit_verify_compact_safe(true, { 2 * margin }, { margin - 1 }));
+    CHECK(!common_fit_verify_compact_safe(true, {}, {}));
+    CHECK(!common_fit_verify_compact_safe(true, { margin }, { margin, margin }));
+    CHECK(!common_fit_verify_compact_safe(false, { 2 * margin }, { margin }));
     // GGML_MOE_BANK_SKIP=0 is read once per process: check it in a child
     char cmd[4200];
     snprintf(cmd, sizeof(cmd), "GGML_MOE_BANK_SKIP=0 '%s' --skip-off", argv[0]);

@@ -60,7 +60,7 @@ enum common_params_fit_status {
 };
 
 // fork: require a proven fit with at least 300 MiB left on every device.
-bool common_fit_verify_compact_safe(common_params_fit_status status, const std::vector<size_t> & margins);
+bool common_fit_verify_compact_safe(bool complete, const std::vector<int64_t> & headroom, const std::vector<int64_t> & margins);
 
 // a second model that shares the devices of the main model, e.g. a draft model
 //   - its context follows the context of the main model, so its memory is measured again whenever that context changes
@@ -109,7 +109,8 @@ common_params_fit_status common_fit_params(
                              size_t * margins,               // margins of memory to leave per device in bytes
                            uint32_t   n_ctx_min,             // minimum context size to set when trying to reduce memory use
       const common_fit_extra_model * extra,                  // model to fit alongside the main one, nullptr if there is none
-                     ggml_log_level   log_level);            // minimum log level to print during fitting, lower levels go to debug log
+                     ggml_log_level   log_level,             // minimum log level to print during fitting, lower levels go to debug log
+                               bool * margins_verified = nullptr);
 
 // print estimated memory to stdout
 void common_fit_print(

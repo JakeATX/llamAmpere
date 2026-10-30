@@ -100,7 +100,9 @@ common_arg & common_arg::set_excludes(std::initializer_list<enum llama_example> 
 }
 
 common_arg & common_arg::set_env(const char * env) {
-    help = help + "\n(env: " + env + ")";
+    if (!help.empty()) {
+        help = help + "\n(env: " + env + ")";
+    }
     this->env = env;
     return *this;
 }

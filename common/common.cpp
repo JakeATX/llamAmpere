@@ -1447,8 +1447,8 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.fit_params_target.data(),
             params.fit_params_min_ctx,
             has_draft || spec_mtp ? &extra : nullptr,
-            params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
-        verify_compact_fit_safe = common_fit_verify_compact_safe(fit_status, params.fit_params_target);
+            params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR,
+            &verify_compact_fit_safe);
         if (fit_status == COMMON_PARAMS_FIT_STATUS_ERROR) {
             throw std::runtime_error(
                 "failed to fit parameters to device memory (hard error); retry with -fit off");

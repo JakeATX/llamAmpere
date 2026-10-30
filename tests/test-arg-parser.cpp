@@ -5,6 +5,7 @@
 #include "speculative.h"
 #include "spec-defaults.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cmath>
 #include <limits>
@@ -144,6 +145,18 @@ static void test(void) {
 #endif
 
     printf("test-arg-parser: make sure there is no duplicated arguments in any examples\n\n");
+    {
+        const auto ctx = common_params_parser_init(params, LLAMA_EXAMPLE_SERVER);
+        bool found = false;
+        for (const auto & opt : ctx.options) {
+            if (std::find(opt.args.begin(), opt.args.end(), std::string("--moe-skip-tail")) != opt.args.end()) {
+                assert(opt.help.empty());
+                assert(opt.env && std::string(opt.env) == "LLAMA_ARG_MOE_SKIP_TAIL");
+                found = true;
+            }
+        }
+        assert(found);
+    }
     for (int ex = 0; ex < LLAMA_EXAMPLE_COUNT; ex++) {
         try {
             auto ctx_arg = common_params_parser_init(params, (enum llama_example)ex);

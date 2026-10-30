@@ -503,12 +503,12 @@ common_fit_extra_memory common_fit_extra_memory_at(
     return ret;
 }
 
-bool common_fit_verify_compact_safe(common_params_fit_status status, const std::vector<size_t> & margins) {
-    if (status != COMMON_PARAMS_FIT_STATUS_SUCCESS || margins.empty()) {
+bool common_fit_verify_compact_safe(bool complete, const std::vector<int64_t> & headroom, const std::vector<int64_t> & margins) {
+    if (!complete || headroom.empty() || headroom.size() != margins.size()) {
         return false;
     }
-    for (size_t margin : margins) {
-        if (margin < 300u * 1024 * 1024) {
+    for (size_t i = 0; i < margins.size(); i++) {
+        if (margins[i] < 300 * 1024 * 1024 || headroom[i] < margins[i]) {
             return false;
         }
     }
@@ -519,7 +519,7 @@ static void common_params_fit_impl(
         const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
         common_moe_cache_params * moe_cache, size_t * margins_s, uint32_t n_ctx_min,
-        const common_fit_extra_model * extra, enum ggml_log_level log_level) {
+        const common_fit_extra_model * extra, enum ggml_log_level log_level, bool * margins_verified) {
     if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR) {
         throw common_params_fit_exception("llama_params_fit is not implemented for SPLIT_MODE_TENSOR, abort");
     }
@@ -544,6 +544,7 @@ static void common_params_fit_impl(
 
     dmds_t   dmds_extra;       // memory of the extra model, laid out on the devices of the main model
     uint32_t n_ctx_extra = 0;  // context that memory was measured at
+    bool extra_complete = true;
 
     // the extra model competes for the same memory as the main model, add it to every measurement
     // its memory is measured again whenever the context it follows changes: both its KV cache and its compute graph
@@ -591,6 +592,7 @@ static void common_params_fit_impl(
             } catch (const std::runtime_error & e) {
                 // the extra model is optional, fit the main model alone rather than giving up
                 LOG_WRN("%s: failed to measure the memory of the extra model, fitting without it: %s\n", __func__, e.what());
+                extra_complete = false;
                 dmds_extra = dmds_t(devs.size() + 1);
                 n_ctx_extra = n_ctx_measure;
                 return;
@@ -599,13 +601,18 @@ static void common_params_fit_impl(
             dmds_extra = dmds_t(devs.size() + 1);
             dmds_extra.back().mb = measured.back().mb;
             for (size_t je = 0; je < devs_extra.size(); je++) {
+                bool found = false;
                 for (size_t id = 0; id < devs.size(); id++) {
                     if (devs_extra[je] == devs[id]) {
+                        found = true;
                         dmds_extra[id].mb.model   += measured[je].mb.model;
                         dmds_extra[id].mb.context += measured[je].mb.context;
                         dmds_extra[id].mb.compute += measured[je].mb.compute;
                         break;
                     }
+                }
+                if (!found) {
+                    extra_complete = false;
                 }
             }
             if (extra->shares_model) {
@@ -630,6 +637,40 @@ static void common_params_fit_impl(
             dmds[id].mb.model   += mem.model;
             dmds[id].mb.context += mem.context;
             dmds[id].mb.compute += mem.compute;
+        }
+    };
+
+    auto verify_final_fit = [&] {
+        if (!margins_verified) {
+            return;
+        }
+        try {
+            std::vector<llama_moe_tensor_info> final_tensors;
+            const auto expected_devs = devs;
+            dmds_t final_memory = common_get_device_memory_data_impl(
+                path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level, &final_tensors);
+            if (devs.empty() || devs != expected_devs || final_memory.size() != devs.size() + 1) {
+                return;
+            }
+            // Probe the drafter again against the final target placement, even at the same context size.
+            dmds_extra.clear();
+            add_extra_memory(final_memory);
+            std::vector<int64_t> headroom;
+            std::vector<int64_t> targets;
+            for (size_t id = 0; id < devs.size(); id++) {
+                headroom.push_back(final_memory[id].free - int64_t(final_memory[id].mb.total()));
+                targets.push_back(margins_s[id]);
+            }
+            if (!common_fit_verify_compact_safe(extra_complete, headroom, targets)) {
+                return;
+            }
+            if (moe_cache && moe_cache->mode != COMMON_MOE_CACHE_MODE_OFF && !final_tensors.empty() &&
+                !common_moe_cache_evaluate_fit(moe_cache, final_tensors, devs, final_memory, targets).feasible) {
+                return;
+            }
+            *margins_verified = true;
+        } catch (const std::runtime_error & e) {
+            LOG_WRN("%s: cannot verify final memory margins: %s\n", __func__, e.what());
         }
     };
 
@@ -708,6 +749,7 @@ static void common_params_fit_impl(
         if (sum_projected_free >= margins[0]) {
             LOG_TRC("%s: will leave %" PRId64 " >= %" PRId64 " MiB of system memory, no changes needed\n",
                 __func__, sum_projected_free/MiB, margins[0]/MiB);
+            verify_final_fit();
             return;
         }
     } else {
@@ -739,6 +781,7 @@ static void common_params_fit_impl(
                 LOG_TRC("%s: will leave %" PRId64 " >= %" PRId64 " MiB of free device memory, no changes needed\n",
                     __func__, projected_free_per_device[0]/MiB, margins[0]/MiB);
                 log_stock_fit();
+                verify_final_fit();
                 return;
             }
         } else {
@@ -752,6 +795,7 @@ static void common_params_fit_impl(
             if (!changes_needed) {
                 LOG_TRC("%s: targets for free memory can be met on all devices, no changes needed\n", __func__);
                 log_stock_fit();
+                verify_final_fit();
                 return;
             }
         }
@@ -838,6 +882,7 @@ static void common_params_fit_impl(
                                     __func__, n_ctx_prev, deficit/MiB, cparams->n_ctx);
                             }
                             LOG_TRC("%s: entire model can be fit by reducing context\n", __func__);
+                            verify_final_fit();
                             return;
                         }
                         LOG_TRC("%s: entire model should be fit across devices by reducing context\n", __func__);
@@ -1218,6 +1263,7 @@ static void common_params_fit_impl(
 
     if (hp_nex == 0 || global_surplus_cpu_moe <= 0) {
         set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
+        verify_final_fit();
         return;
     }
 
@@ -1537,6 +1583,7 @@ static void common_params_fit_impl(
                                 __func__, device.physical_device, (int64_t)(device.cache_bytes / MiB),
                                 (int64_t)(best_cache_fit.minimum_device_bytes / MiB));
                     }
+                    verify_final_fit();
                     return;
                 }
                 LOG_INF("%s: MoE cache soft mode kept stock placement (partial eviction could not fit cache pools)\n",
@@ -1566,6 +1613,7 @@ static void common_params_fit_impl(
                             __func__, device.physical_device, (int64_t)(device.cache_bytes / MiB),
                             (int64_t)(cache_fit.minimum_device_bytes / MiB));
                 }
+                verify_final_fit();
                 return;
             }
             LOG_INF("%s: MoE cache fit kept stock placement: %s\n", __func__, cache_fit.reason.c_str());
@@ -1573,6 +1621,7 @@ static void common_params_fit_impl(
     }
 
     set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
+    verify_final_fit();
 }
 
 enum common_params_fit_status common_fit_params(
@@ -1585,11 +1634,14 @@ enum common_params_fit_status common_fit_params(
         size_t * margins,
         uint32_t n_ctx_min,
         const common_fit_extra_model * extra,
-        ggml_log_level log_level) {
+        ggml_log_level log_level, bool * margins_verified) {
     const int64_t t0_us = llama_time_us();
+    if (margins_verified) {
+        *margins_verified = false;
+    }
     common_params_fit_status status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
     try {
-            common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, moe_cache, margins, n_ctx_min, extra, log_level);
+        common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, moe_cache, margins, n_ctx_min, extra, log_level, margins_verified);
         LOG_TRC("%s: successfully fit params to free device memory\n", __func__);
     } catch (const common_params_fit_no_room & e) {
         LOG_ERR("%s: no placement fits in device memory: %s\n", __func__, e.what());
