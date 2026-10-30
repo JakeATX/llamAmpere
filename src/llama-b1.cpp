@@ -1368,6 +1368,46 @@ bool llama_b1::layer_begin(int il) {
     ggml_backend_event_wait(backend_gpu, ev_ready[slot]);
 
     const size_t n_roles = roles.size();
+    // fork: untimed copy checks cover pieces that span bank holes and expert boundaries.
+    if (b1_env_int("LLAMA_B1_CHECK_COPY", 0)) {
+        ggml_backend_event_synchronize(ev_ready[slot]);
+        std::vector<uint8_t> actual(1u << 20), expected(actual.size());
+        size_t checked = 0;
+        for (int ti : layers[il].tensors) {
+            const auto & e = exps[ti];
+            if (!tensor_streamed(il, e)) { continue; }
+            if (e.src.fd < 0) {
+                LLAMA_LOG_ERROR("%s: [B1] copy check needs file bytes for %s\n", __func__, ggml_get_name(e.t));
+                return false;
+            }
+            const placement & p = slot_place[slot*n_roles + e.role];
+            const size_t expert_bytes = e.t->nb[1] * e.t->ne[1];
+            for (size_t off = 0; off < e.nbytes;) {
+                const size_t n = std::min({actual.size(), e.nbytes - off, expert_bytes - off % expert_bytes});
+                if (!b1_read_file(e.src.fd, expected.data(), e.src.offs + off, n, e.src.alignment)) {
+                    LLAMA_LOG_ERROR("%s: [B1] copy check cannot read %s at %zu\n", __func__, ggml_get_name(e.t), off);
+                    return false;
+                }
+                if (!e.resident) {
+                    const uintptr_t begin = (uintptr_t) e.home_data + (off / expert_bytes)*e.home_nb2 + off % expert_bytes;
+                    const uintptr_t last = begin + n;
+                    const ggml_moe_bank_hole * end = nullptr;
+                    for (const auto * h = b1_first_hole(begin, &end); h && h != end && h->begin < last; ++h) {
+                        const uintptr_t first = std::max(begin, h->begin), stop = std::min(last, h->end);
+                        memset(expected.data() + (first - begin), 0, stop - first);
+                    }
+                }
+                ggml_backend_tensor_get(regions[p.region].raw, actual.data(), p.offs + off, n);
+                if (memcmp(actual.data(), expected.data(), n) != 0) {
+                    LLAMA_LOG_ERROR("%s: [B1] copy check mismatch: %s offset=%zu bytes=%zu\n", __func__, ggml_get_name(e.t), off, n);
+                    return false;
+                }
+                off += n;
+                checked += n;
+            }
+        }
+        LLAMA_LOG_WARN("%s: [B1] copy check PASS: layer=%d step=%zu bytes=%zu piece_bytes=%zu\n", __func__, il, k, checked, piece_bytes);
+    }
     for (int ti : layers[il].tensors) {
         auto & e = exps[ti];
         if (!tensor_streamed(il, e)) {
