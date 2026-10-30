@@ -11,6 +11,7 @@
 // l and l + 16 share a copy), 2: u16 entries, one copy per bank (64 KB, conflict-free, two more ALU ops per address).
 // GGML_CUDA_AIT_OCC = 0 (default), 1 or 2: AIT4 low-register experiment with a two-group or one-group prefetch ring.
 // Modes 3/4 cap registers; GGML_CUDA_AIT_OCC_GRID sets their blocks per SM (1..8, default 4).
+// GGML_CUDA_AIT3_PACK=1 packs each AIT3 row tile before decoding the next, with the same warp ranges and sum order.
 #include "ait.cuh"
 #include "ait-mm.cuh"
 #include "ai4.cuh"
@@ -278,7 +279,7 @@ static __device__ __forceinline__ void ait_group(uint4 (&buf)[DEPTH][2], const i
         return;
     }
     if constexpr (LOW) {
-        static_assert(KB == 4 && PC == 0, "low-register path requires AIT4");
+        static_assert((KB == 3 || KB == 4) && PC == 0, "low-register path requires AIT3 or AIT4");
         uint32_t a[4], f[4];
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
@@ -778,6 +779,12 @@ static void ait_fast_nt(ggml_backend_cuda_context & ctx, const uint8_t * W, cons
         }
     }
     k_ait_actq<NT><<<NT * S, 64, 0, stream>>>(X, W, xq.get(), sa.get(), ordered ? nullptr : Y, M, K, k);
+    static const bool pack3 = ait_env_int("GGML_CUDA_AIT3_PACK", 0) != 0;
+    if (pack3 && k == 3 && code == 0 && full && warps <= 12) {
+        k_ait_mmv<3, NT, true, 0, 0, 4, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
+        finish();
+        return;
+    }
     if (k == 4 && code == 0 && full && occ > 0) {
         // Modes 3/4 cap registers for four 256-thread blocks per SM. Keep
         // both prefetch depths; profiles must check for local-memory spills.
