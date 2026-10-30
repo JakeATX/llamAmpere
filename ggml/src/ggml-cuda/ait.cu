@@ -18,6 +18,7 @@
 // GGML_CUDA_AIT4_RING2=1 keeps two AIT4 weight groups live with the base register budget (OCC=0, NEIGHBOR=0).
 // GGML_CUDA_AIT4_RING1=1 keeps one AIT4 weight group live and takes precedence over RING2.
 // GGML_CUDA_AIT4_TAIL=1 refills the four-group weight ring after each group's IMMA work.
+// GGML_CUDA_AIT4_PACK=1 packs each AIT4 MMA tile at the base register budget and four-group ring.
 #include "ait.cuh"
 #include "ait-mm.cuh"
 #include "ai4.cuh"
@@ -804,6 +805,12 @@ static void ait_fast_nt(ggml_backend_cuda_context & ctx, const uint8_t * W, cons
         }
     }
     k_ait_actq<NT><<<NT * S, 64, 0, stream>>>(X, W, xq.get(), sa.get(), ordered ? nullptr : Y, M, K, k);
+    static const bool pack4 = ait_env_int("GGML_CUDA_AIT4_PACK", 0) == 1;
+    if (pack4 && k == 4 && code == 0 && full && warps <= 12 && occ == 0) {
+        k_ait_mmv<4, NT, true, 0, 0, 4, false, false, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
+        finish();
+        return;
+    }
     static const bool tail4 = ait_env_int("GGML_CUDA_AIT4_TAIL", 0) == 1;
     if (tail4 && k == 4 && code == 0 && full && warps <= 12 && occ == 0) {
         k_ait_mmv<4, NT, true, 0, 0, 4, false, false, false, false, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
