@@ -8364,7 +8364,21 @@ static std::unique_ptr<moe_cache_session> moe_cache_swap_snapshot(const moe_cach
     cloned.resize(source.size());
     std::unordered_map<const moe_cache_pool *, moe_cache_pool *> pools;
     for (size_t i = 0; i < source.size(); ++i) {
-        *cloned[i] = *source[i];
+        // The planner snapshot never owns card memory: copy the slot table, leave prompt_slab empty.
+        moe_cache_pool & dst = *cloned[i];
+        const moe_cache_pool & src = *source[i];
+        dst.expert_size = src.expert_size;
+        dst.wtype = src.wtype;
+        dst.slab = src.slab;
+        dst.prompt_slab.reset();
+        dst.prompt_slots = src.prompt_slots;
+        dst.n_slots = src.n_slots;
+        dst.covers_all_entries = src.covers_all_entries;
+        dst.slots = src.slots;
+        dst.free_slots = src.free_slots;
+        dst.map = src.map;
+        dst.lru_head = src.lru_head;
+        dst.lru_tail = src.lru_tail;
         pools[source[i].get()] = cloned[i].get();
     }
     copy->device_tables = session.device_tables;
