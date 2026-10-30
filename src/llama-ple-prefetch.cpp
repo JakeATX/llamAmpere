@@ -158,7 +158,9 @@ std::unique_ptr<llama_ple_prefetch> llama_ple_prefetch::create(const llama_model
     pf->bounded_window = window > 0;
     pf->use_pread = mode && strcmp(mode, "fault") != 0;
     pf->use_advise = mode && strcmp(mode, "advise") == 0;
-    const int64_t populate = ple_pf_env("LLAMA_PLE_PF_POPULATE", 0);
+    // fork: pread readers also map the pages they read (same-box screens r104/r116 faster, identity r114 PASS);
+    // LLAMA_PLE_PF_POPULATE=0 keeps pread-only
+    const int64_t populate = ple_pf_env("LLAMA_PLE_PF_POPULATE", pf->use_pread ? 1 : 0);
     pf->populate = populate == 2 || populate == 3 ? (int) populate : populate > 0;
 #if defined(__linux__)
     if (pf->use_pread) {
