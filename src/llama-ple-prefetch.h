@@ -75,6 +75,7 @@ private:
     size_t   batch_runs = 1;     // runs claimed per shared cursor update
     uint32_t n_recheck = 0;      // chunks between later residency samples (0 = first chunk only)
     bool     use_pread = true;
+    bool     populate = false;  // touch mapped pages after complete file reads
     bool     use_advise = false; // [PFGAP] file mode: ask the kernel to queue the reads instead of copying them
     bool     coalesce = false;
     bool     bounded_window = false;

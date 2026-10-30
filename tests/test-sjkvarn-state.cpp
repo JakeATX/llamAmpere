@@ -1089,7 +1089,7 @@ static void deferred_mask_capacity_case() {
     printf("OK: 64 pending masks preserved, 65th falls back, all host mask bytes exact\n");
 }
 
-static void ple_hash_pages_case(bool windowed = false, bool bounded = false, bool coalesced = false, size_t ubatch_size = 384) {
+static void ple_hash_pages_case(bool windowed = false, bool bounded = false, bool coalesced = false, size_t ubatch_size = 384, bool populate = false) {
 #if defined(__linux__)
     for (uint32_t n_gram : { 4, 8 }) {
         for (llama_pos pos0 : { 0, 23 }) {
@@ -1122,6 +1122,18 @@ static void ple_hash_pages_case(bool windowed = false, bool bounded = false, boo
                     coalesced ? MAP_SHARED : MAP_PRIVATE | MAP_ANONYMOUS, coalesced ? fileno(file.get()) : -1, 0);
             require(pages != MAP_FAILED, "hash page mapping");
             require(madvise(pages, size, MADV_NOHUGEPAGE) == 0, "hash pages stay separate");
+            std::unique_ptr<FILE, int(*)(FILE *)> pagemap(populate ? fopen("/proc/self/pagemap", "rb") : nullptr, fclose);
+            std::vector<uint64_t> ptes(populate ? n_rows : 0);
+            auto read_ptes = [&]() {
+                require(pagemap != nullptr && pread(fileno(pagemap.get()), ptes.data(), ptes.size()*sizeof(uint64_t),
+                        ((uintptr_t) pages/4096)*sizeof(uint64_t)) == (ssize_t) (ptes.size()*sizeof(uint64_t)), "read mapped page presence bits");
+            };
+            if (populate) {
+                read_ptes();
+                for (uint64_t pte : ptes) {
+                    require(!(pte & (UINT64_C(1) << 63)), "mapped pages start without page-table entries");
+                }
+            }
             ggml_context * ctx = ggml_init({ 1024*1024, nullptr, true });
             require(ctx != nullptr, "hash page context");
             auto * table = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1024, n_rows);
@@ -1226,6 +1238,7 @@ static void ple_hash_pages_case(bool windowed = false, bool bounded = false, boo
             setenv("LLAMA_PLE_PF_AHEAD", coalesced || (windowed && !bounded) ? "0" : "1000000", 1);
             setenv("LLAMA_PLE_PF_WINDOW_UBATCHES", bounded ? "1" : "0", 1);
             setenv("LLAMA_PLE_PF_COLD_THREADS", "0", 1);
+            setenv("LLAMA_PLE_PF_POPULATE", populate ? "1" : "0", 1);
             std::string startup;
             llama_log_set([](ggml_log_level, const char * text, void * data) {
                 *static_cast<std::string *>(data) += text;
@@ -1244,11 +1257,14 @@ static void ple_hash_pages_case(bool windowed = false, bool bounded = false, boo
                 const size_t count = std::min(consume_size, n_tokens - i);
                 require(pf->consume(count, nullptr, 0), "hash page chunk consumed");
                 require(mincore(pages, size, resident.data()) == 0, "consumed chunk residency");
+                if (populate) { read_ptes(); }
                 const size_t read_end = std::max(ubatch, i + count) + (bounded && !coalesced ? ubatch : 0);
                 const size_t allowed = (read_end + chunk - 1)/chunk;
                 for (size_t r = 0; r < n_rows; ++r) {
                     future_checks += expected[r] && first_read[r] >= allowed;
                     require(first_chunk[r] > (i + count - 1)/chunk || (resident[r] & 1), "consume waits for every page of its chunks");
+                    require(!populate || first_chunk[r] > (i + count - 1)/chunk || (ptes[r] & (UINT64_C(1) << 63)),
+                            "coalesced pread populates every consumed mapped page");
                     require(!windowed || first_read[r] < allowed || !(resident[r] & 1),
                             "pages beyond the bounded window stay untouched");
                 }
@@ -1319,6 +1335,9 @@ static void ple_hash_pages_case(bool windowed = false, bool bounded = false, boo
     if (coalesced) {
         printf("OK: file-backed coalescing obeys ubatch windows, exact run pages and read totals\n");
         printf("OK: truncated prefetch reads fall back without completed chunks or page counts\n");
+    }
+    if (populate) {
+        printf("OK: consumed coalesced pages have mapped page-table entries before stop\n");
     }
 #else
     printf("SKIP: hash page test needs Linux\n");
@@ -1495,6 +1514,17 @@ static void ple_cold_recheck_case() {
 }
 
 int main(int argc, char ** argv) {
+    if (argc > 1 && strcmp(argv[1], "--ple-populate-pages") == 0) {
+        try {
+            for (size_t chunk : { 384, 128, 1 }) {
+                ple_hash_pages_case(true, true, true, chunk, true);
+            }
+            return 0;
+        } catch (const std::exception & e) {
+            fprintf(stderr, "prefetch populate pages: FAIL: %s\n", e.what());
+            return 1;
+        }
+    }
     if (argc > 1 && strcmp(argv[1], "--ple-read-failure") == 0) {
         try {
             ple_hash_pages_case(false, false, true);

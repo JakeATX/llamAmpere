@@ -148,6 +148,7 @@ std::unique_ptr<llama_ple_prefetch> llama_ple_prefetch::create(const llama_model
     pf->bounded_window = window > 0;
     pf->use_pread = mode && strcmp(mode, "fault") != 0;
     pf->use_advise = mode && strcmp(mode, "advise") == 0;
+    pf->populate = ple_pf_env("LLAMA_PLE_PF_POPULATE", 0) > 0;
 #if defined(__linux__)
     if (pf->use_pread) {
         std::string path;
@@ -547,6 +548,16 @@ int64_t llama_ple_prefetch::reader() {
                 cv_work.notify_all();
                 cv_done.notify_all();
                 break;
+            }
+            if (populate) {
+                // File reads fill the page cache, but the gather also needs mapped page-table entries.
+                for (uint64_t o = 0; o < len && !stopping.load(std::memory_order_relaxed); o += 4096) {
+                    const uint64_t rel = std::max(off + o, file_off) - file_off;
+                    (void) *(const volatile char *) ((const char *) ple->data + rel);
+                }
+                if (stopping.load()) {
+                    break;
+                }
             }
         } else
 #endif
