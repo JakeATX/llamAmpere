@@ -113,7 +113,7 @@ static __global__ void __launch_bounds__(256) hcf_row_owner_stage(
     }
     __syncthreads();
     if (warp == 0) {
-        const float total = hcf_owner_sum(lane < 8 ? sums[lane] : 0.0f);
+        const float total = hcf_owner_sum<8>(lane < 8 ? sums[lane] : 0.0f);
         if (lane == 0) {
             dst[n_rows*n_tokens + 4*t + s] = rsqrtf(total/n_embd + eps);
         }
