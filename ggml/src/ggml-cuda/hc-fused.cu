@@ -131,25 +131,28 @@ static __global__ void __launch_bounds__(256) hcf_down_row_owner(
     }
     const char * wr = row < R ? wd + (int64_t) row*sd : wi + (int64_t) (row - R)*si;
     const int hc_dim = 4*n_embd;
+    const int n_vec = n_embd/8;
     float out[T] = {};
 #pragma unroll
     for (int s = 0; s < 4; ++s) {
+        const uint4 * weights = (const uint4 *) wr + s*n_vec;
         float acc[T] = {};
         uint4 next = {};
         if constexpr (LOOKAHEAD) {
-            next = __ldg((const uint4 *) wr + (s*n_embd + lane*8)/8);
+            next = __ldg(weights + lane);
         }
-        for (int j = lane*8; j < n_embd; j += 256) {
-            const uint4 pk = LOOKAHEAD ? next : __ldg((const uint4 *) wr + (s*n_embd + j)/8);
+        for (int q = lane; q < n_vec; q += 32) {
+            const uint4 pk = LOOKAHEAD ? next : __ldg(weights + q);
             if constexpr (LOOKAHEAD) {
-                if (j + 256 < n_embd) {
-                    next = __ldg((const uint4 *) wr + (s*n_embd + j + 256)/8);
+                if (q + 32 < n_vec) {
+                    next = __ldg(weights + q + 32);
                 }
             }
             const float w[8] = {
                 hcf_bf16_lo(pk.x), hcf_bf16_hi(pk.x), hcf_bf16_lo(pk.y), hcf_bf16_hi(pk.y),
                 hcf_bf16_lo(pk.z), hcf_bf16_hi(pk.z), hcf_bf16_lo(pk.w), hcf_bf16_hi(pk.w),
             };
+            const int j = 8*q;
 #pragma unroll
             for (int t = 0; t < T; ++t) {
                 const float * src = xn + (int64_t) t*hc_dim + s*n_embd + j;
