@@ -1411,6 +1411,7 @@ struct test_case {
     virtual int graph_replays() { return 1; }
     virtual bool verify_backend_result(ggml_backend_t backend) { GGML_UNUSED(backend); return true; }
     virtual bool perf_whole_graph() { return false; }
+    virtual size_t max_tensors() { return 128; }
     virtual std::vector<ggml_tensor *> fusion_test_nodes() { return {}; }
     // Name of a backend fusion counter (see ggml_backend_cuda_fusion_count) that must advance while
     // the graph runs on the tested backend. Backends without the counter are not checked.
@@ -1508,9 +1509,10 @@ struct test_case {
                        const char *   op_names_filter,
                        printer *      output_printer) {
         mode = MODE_TEST;
+        sentinels.clear();
 
         ggml_init_params params = {
-            /* .mem_size = */ ggml_tensor_overhead()*128 + ggml_graph_overhead(),
+            /* .mem_size = */ ggml_tensor_overhead()*max_tensors() + ggml_graph_overhead(),
             /* .mem_base = */ NULL,
             /* .no_alloc = */ true,
         };
@@ -1783,7 +1785,7 @@ struct test_case {
         static const size_t graph_nodes = 8192;
 
         ggml_init_params params = {
-            /* .mem_size = */ ggml_tensor_overhead()*128 + ggml_graph_overhead_custom(graph_nodes, false),
+            /* .mem_size = */ ggml_tensor_overhead()*max_tensors() + ggml_graph_overhead_custom(graph_nodes, false),
             /* .mem_base = */ NULL,
             /* .no_alloc = */ true,
         };
@@ -1945,7 +1947,7 @@ struct test_case {
         static const size_t graph_nodes = 8192;
 
         ggml_init_params params = {
-            /* .mem_size = */ ggml_tensor_overhead()*128 + ggml_graph_overhead_custom(graph_nodes, false),
+            /* .mem_size = */ ggml_tensor_overhead()*max_tensors() + ggml_graph_overhead_custom(graph_nodes, false),
             /* .mem_base = */ NULL,
             /* .no_alloc = */ true,
         };
@@ -1979,7 +1981,7 @@ struct test_case {
         const std::vector<float> expect = grad_expect();
 
         ggml_init_params params = {
-            /* .mem_size = */ ggml_tensor_overhead()*128 + 2*ggml_graph_overhead_custom(GGML_DEFAULT_GRAPH_SIZE, true),
+            /* .mem_size = */ ggml_tensor_overhead()*max_tensors() + 2*ggml_graph_overhead_custom(GGML_DEFAULT_GRAPH_SIZE, true),
             /* .mem_base = */ NULL,
             /* .no_alloc = */ true,
         };
@@ -5332,6 +5334,17 @@ struct test_dsv4_hc_fused : public test_case {
         return VARS_TO_STR6(n_embd, R, n_tokens, inject, fused, n_layers);
     }
 
+    size_t max_tensors() override { return std::max<size_t>(128, 32*n_layers + 16); }
+
+    double err(const float * a, const float * b, size_t n) override {
+        const char * hash = getenv("GGML_TEST_HCF_HASH");
+        if (hash != nullptr && atoi(hash) != 0) {
+            std::lock_guard<std::mutex> guard(g_test_output_mutex);
+            printf("HCF_HASH %s values=%zu hash=%016" PRIx64 "\n", vars().c_str(), n, tbo_fnv1a(a, n*sizeof(float)));
+        }
+        return test_case::err(a, b, n);
+    }
+
     bool run_whole_graph() override { return n_layers > 1 || !fused; }
     bool perf_whole_graph() override { return true; }
     double max_nmse_err() override { return fused ? 1e-7 : 5e-4; }
@@ -5408,6 +5421,186 @@ struct test_dsv4_hc_fused : public test_case {
     }
 };
 
+
+struct test_dsv4_hc_alignment : public test_dsv4_hc_fused {
+    const int x_offset;
+    const int norm_offset;
+    const bool up;
+    const int weight_input;
+    const int weight_offset;
+
+    test_dsv4_hc_alignment(int x_offset, int norm_offset, bool up, int weight_input = -1, int weight_offset = 0)
+        : test_dsv4_hc_fused(512, 64, 1), x_offset(x_offset), norm_offset(norm_offset), up(up), weight_input(weight_input), weight_offset(weight_offset) {}
+
+    std::string op_desc(ggml_tensor *) override { return "HC_ALIGNMENT"; }
+    std::string vars() override {
+        return VARS_TO_STR3(x_offset, norm_offset, up) + (weight_input < 0 ? "" : "," + VARS_TO_STR2(weight_input, weight_offset));
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto weight = [&](int64_t cols, int64_t rows, int input) {
+            if (weight_input != input) {
+                return ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, cols, rows);
+            }
+            ggml_tensor * base = ggml_new_tensor_1d(ctx, GGML_TYPE_BF16, cols*rows + weight_offset/sizeof(ggml_bf16_t));
+            return ggml_view_2d(ctx, base, cols, rows, cols*sizeof(ggml_bf16_t), weight_offset);
+        };
+        ggml_tensor * x_base = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4*n_embd + x_offset/sizeof(float));
+        ggml_tensor * norm_base = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4*n_embd + norm_offset/sizeof(float));
+        ggml_tensor * x = ggml_view_3d(ctx, x_base, n_embd, 4, 1, n_embd*sizeof(float), 4*n_embd*sizeof(float), x_offset);
+        ggml_tensor * wn = ggml_view_2d(ctx, norm_base, n_embd, 4, n_embd*sizeof(float), norm_offset);
+        ggml_tensor * wd = weight(4*n_embd, R, 0);
+        ggml_tensor * wi = weight(4*n_embd, 4, 1);
+        ggml_set_name(wn, "w_norm");
+        ggml_set_name(wd, "w_down");
+        ggml_set_name(wi, "w_inject");
+        ggml_tensor * down = ggml_dsv4_hc_down(ctx, x, wn, wd, wi, 1e-6f, 0.25f, 0.25f);
+        if (!up) {
+            return down;
+        }
+        ggml_tensor * wu = weight(R, 4*n_embd, 2);
+        ggml_set_name(wu, "w_up");
+        return ggml_dsv4_hc_up(ctx, x, wn, down, wu, 0.25f);
+    }
+};
+
+// Direct down outputs expose the activation, injection and RMS scale errors before the up kernel can mask them.
+struct test_dsv4_hc_down_owner : public test_dsv4_hc_fused {
+    const bool norm_zero;
+    const bool x_zero;
+    const int zero_stream;
+    const bool x_known;
+
+    test_dsv4_hc_down_owner(int64_t embd, int64_t rank, int64_t tokens, bool injection, bool norm_zero = false, bool x_zero = false, int zero_stream = -1, bool x_known = false)
+        : test_dsv4_hc_fused(embd, rank, tokens, injection), norm_zero(norm_zero), x_zero(x_zero), zero_stream(zero_stream), x_known(x_known) {}
+
+    std::string vars() override { return test_dsv4_hc_fused::vars() + "," + VARS_TO_STR4(norm_zero, x_zero, zero_stream, x_known); }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_dsv4_hc_fused::initialize_tensors(ctx);
+        GGML_ASSERT(zero_stream >= -1 && zero_stream < 4);
+        GGML_ASSERT(!x_known || (!norm_zero && !x_zero && zero_stream == -1));
+        if (norm_zero || x_zero || zero_stream >= 0 || x_known) {
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                const char * name = ggml_get_name(t);
+                if ((norm_zero && strcmp(name, "w_norm") == 0) || (x_zero && strcmp(name, "x") == 0)) {
+                    init_tensor_uniform(t, 0.0f, 0.0f);
+                } else if (x_known && strcmp(name, "x") == 0) {
+                    for (int64_t row = 0; row < 4*n_tokens; ++row) {
+                        const float sign = row % 2 == 0 ? 1.0f : -1.0f;
+                        const std::vector<float> values(n_embd, sign*float(row + 1)/16.0f);
+                        ggml_backend_tensor_set(t, values.data(), row*n_embd*sizeof(float), values.size()*sizeof(float));
+                    }
+                } else if (x_known && strcmp(name, "w_norm") == 0) {
+                    for (int64_t stream = 0; stream < 4; ++stream) {
+                        const std::vector<float> values(n_embd, float(stream + 1));
+                        ggml_backend_tensor_set(t, values.data(), stream*n_embd*sizeof(float), values.size()*sizeof(float));
+                    }
+                } else if (x_known && (strcmp(name, "w_down") == 0 || strcmp(name, "w_inject") == 0)) {
+                    const float sign = strcmp(name, "w_down") == 0 ? 1.0f : -1.0f;
+                    for (int64_t row = 0; row < t->ne[1]; ++row) {
+                        const float row_sign = row % 2 == 0 ? sign : -sign;
+                        std::vector<ggml_bf16_t> values(4*n_embd);
+                        for (int64_t col = 0; col < 4*n_embd; ++col) {
+                            const int64_t stream = col/n_embd;
+                            const int64_t tile = (col%n_embd)/8;
+                            values[col] = ggml_fp32_to_bf16(row_sign*float((row + 1)*(stream + 1)*(1 + tile%3))/(64*n_embd));
+                        }
+                        ggml_backend_tensor_set(t, values.data(), row*t->nb[1], values.size()*sizeof(ggml_bf16_t));
+                    }
+                } else if (zero_stream >= 0 && strcmp(name, "x") == 0) {
+                    const std::vector<float> zeros(n_embd, 0.0f);
+                    for (int64_t it = 0; it < n_tokens; ++it) {
+                        ggml_backend_tensor_set(t, zeros.data(), (it*4 + zero_stream)*n_embd*sizeof(float), zeros.size()*sizeof(float));
+                    }
+                }
+            }
+        }
+    }
+
+    std::string op_desc(ggml_tensor *) override { return "HC_DOWN_OWNER"; }
+    bool run_whole_graph() override { return true; }
+    double max_err() override { return 1.0; }
+    double max_err(ggml_backend_t) override { return max_err(); }
+
+    double err(const float * a, const float * b, size_t n) override {
+        GGML_ASSERT(n == size_t((R + (inject ? 4 : 0) + 4)*n_tokens));
+        double worst = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            if (!std::isfinite(a[i]) || !std::isfinite(b[i])) {
+                return INFINITY;
+            }
+            if ((norm_zero || x_zero) && i < n - 4*n_tokens) {
+                const float expected = i < size_t(R*n_tokens) ? 0.0f : 1.0f;
+                if (a[i] != expected || b[i] != expected) {
+                    return INFINITY;
+                }
+            }
+            if (i >= n - 4*n_tokens && (x_zero || (zero_stream >= 0 && (i - (n - 4*n_tokens)) % 4 == size_t(zero_stream)))) {
+                // eps is 1e-6, so a zero stream has an RMS scale of 1000.
+                if (std::abs(double(a[i]) - 1000.0) > 2e-3 || std::abs(double(b[i]) - 1000.0) > 2e-3) {
+                    return INFINITY;
+                }
+            }
+            if (x_known && i >= n - 4*n_tokens) {
+                const double value = double(i - (n - 4*n_tokens) + 1)/16.0;
+                const double expected = 1.0/std::sqrt(value*value + 1e-6);
+                if (std::abs(double(a[i]) - expected) > 2e-6*expected || std::abs(double(b[i]) - expected) > 2e-6*expected) {
+                    return INFINITY;
+                }
+            }
+            if (x_known && i < n - 4*n_tokens) {
+                const bool act = i < size_t(R*n_tokens);
+                const size_t index = act ? i : i - R*n_tokens;
+                const size_t token = index/(act ? R : 4), row = index%(act ? R : 4);
+                double sum = 0.0;
+                for (size_t stream = 0; stream < 4; ++stream) {
+                    const double sign = stream % 2 == 0 ? 1.0 : -1.0;
+                    const double value = sign*double(4*token + stream + 1)/16.0;
+                    double weights = 0.0;
+                    for (int64_t col = 0; col < n_embd; ++col) {
+                        weights += ggml_bf16_to_fp32(ggml_fp32_to_bf16(float((row + 1)*(stream + 1)*(1 + (col/8)%3))/(64*n_embd)));
+                    }
+                    sum += weights*double(stream + 1)*value/std::sqrt(value*value + 1e-6);
+                }
+                const double z = (row % 2 == 0 ? 0.25 : -0.25)*sum;
+                const double expected = act ? z/(1.0 + std::exp(-z)) : 2.0/(1.0 + std::exp(z));
+                if (std::abs(double(a[i]) - expected) > 1e-5 || std::abs(double(b[i]) - expected) > 1e-5) {
+                    return INFINITY;
+                }
+            }
+            const double tol = i < n - 4*n_tokens ? 1e-5 : 2e-6*std::abs(double(b[i]));
+            const double diff = std::abs(double(a[i]) - b[i]);
+            const double scaled = tol > 0.0 ? diff/tol : (diff == 0.0 ? 0.0 : INFINITY);
+            worst = std::max(worst, scaled);
+        }
+        const char * dir = getenv("GGML_TEST_HCF_DOWN_DUMP");
+        if (dir != nullptr) {
+            const std::string path = std::string(dir) + "/" + std::to_string(n_embd) + "-" +
+                    std::to_string(R) + "-" + std::to_string(n_tokens) + "-" + std::to_string(inject) + ".bin";
+            FILE * f = fopen(path.c_str(), "wb");
+            GGML_ASSERT(f != nullptr);
+            GGML_ASSERT(fwrite(a, sizeof(float), n, f) == n);
+            GGML_ASSERT(fclose(f) == 0);
+        }
+        printf("HC_DOWN_PARITY %s scaled_max_error=%.9g\n", vars().c_str(), worst);
+        return worst;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, 4, n_tokens);
+        ggml_tensor * wn = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, 4);
+        ggml_tensor * wd = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, 4*n_embd, R);
+        ggml_tensor * wi = inject ? ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, 4*n_embd, 4) : nullptr;
+        ggml_set_name(x, "x");
+        ggml_set_name(wn, "w_norm");
+        ggml_set_name(wd, "w_down");
+        if (wi) {
+            ggml_set_name(wi, "w_inject");
+        }
+        return ggml_dsv4_hc_down(ctx, x, wn, wd, wi, 1e-6f, 0.25f, 0.25f);
+    }
+};
 
 // [HCPN] One Flash-Next hyper-connection step as qwen4exp builds it: H = identity-comb hc_post (post_in) or an ADD (as
 // after a PLE block), xn = rms_norm(H) * gamma, its BF16 copy feeding both BF16 matmuls (cast, LLAMA_HC_BF16_ONCE),
@@ -15361,6 +15554,69 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, true));
     test_cases.emplace_back(new test_dsv4_hc_post(4096, 21, true));
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, true, true));
+    for (int64_t nt = 1; nt <= 8; ++nt) {
+        for (bool injection : { false, true }) {
+            test_cases.emplace_back(new test_dsv4_hc_down_owner(2560, 320, nt, injection));
+        }
+    }
+    // The owner bound and its fallback, small stream widths, and partial row blocks.
+    for (int64_t rank : { 64, 332, 333 }) {
+        test_cases.emplace_back(new test_dsv4_hc_down_owner(512, rank, 5, true));
+    }
+    // Short streams exercise the last lookahead tile; short ranks leave most owners inactive.
+    test_cases.emplace_back(new test_dsv4_hc_down_owner(512, 1, 1, true));
+    test_cases.emplace_back(new test_dsv4_hc_down_owner(512, 1, 8, false));
+    test_cases.emplace_back(new test_dsv4_hc_down_owner(1024, 16, 2, false));
+    // Incomplete warps must keep each eight-lane row group whole when packing partials.
+    test_cases.emplace_back(new test_dsv4_hc_down_owner(512, 13, 3, true));
+    test_cases.emplace_back(new test_dsv4_hc_down_owner(512, 27, 4, true));
+    test_cases.emplace_back(new test_dsv4_hc_down_owner(512, 28, 8, false));
+    // Packed finish groups must mask the last one, two or three rows of a warp.
+    for (int64_t rank : {5, 6, 7}) {
+        test_cases.emplace_back(new test_dsv4_hc_down_owner(512, rank, 5, false));
+    }
+    // Non-power-of-two stream widths cover every tile with both stripe counts.
+    test_cases.emplace_back(new test_dsv4_hc_down_owner(1024, 17, 4, true));
+    test_cases.emplace_back(new test_dsv4_hc_down_owner(1536, 31, 8, false));
+    // Short supported streams leave most staging lanes idle with either stripe count.
+    test_cases.emplace_back(new test_dsv4_hc_down_owner(512, 1, 1, false));
+    test_cases.emplace_back(new test_dsv4_hc_down_owner(512, 13, 8, true));
+    // Non-power-of-two stream widths cover each static staging path's loop tail.
+    test_cases.emplace_back(new test_dsv4_hc_down_owner(1536, 17, 3, true));
+    test_cases.emplace_back(new test_dsv4_hc_down_owner(3584, 28, 7, false));
+    // Full-row owners cover ranks beyond the striped path's bound and mostly inactive row warps.
+    test_cases.emplace_back(new test_dsv4_hc_down_owner(512, 512, 3, false));
+    test_cases.emplace_back(new test_dsv4_hc_down_owner(2560, 1, 4, true));
+    // Cross the legacy 64-block limit with and without injection rows.
+    test_cases.emplace_back(new test_dsv4_hc_down_owner(512, 2049, 1, false));
+    test_cases.emplace_back(new test_dsv4_hc_down_owner(512, 2045, 2, true));
+    // Row-owner blocks cover exact four/eight-row ends and a trailing ninth row.
+    for (int64_t rank : {4, 8, 9}) {
+        test_cases.emplace_back(new test_dsv4_hc_down_owner(512, rank, 3, false));
+    }
+    // Longer row loops cover guarded lookahead at the final weight tile.
+    test_cases.emplace_back(new test_dsv4_hc_down_owner(2048, 31, 2, true));
+    test_cases.emplace_back(new test_dsv4_hc_down_owner(4096, 9, 8, false));
+    // Zero weighted inputs give exact zero activations and unit injection gates.
+    test_cases.emplace_back(new test_dsv4_hc_down_owner(1024, 3, 7, true, true));
+    // Zero streams exercise the epsilon term with every row-owner token accumulator.
+    test_cases.emplace_back(new test_dsv4_hc_down_owner(1024, 4, 8, true, false, true));
+    // A single zero stream checks RMS output order among nonzero streams and tokens.
+    test_cases.emplace_back(new test_dsv4_hc_down_owner(1024, 6, 5, true, false, false, 3));
+    test_cases.emplace_back(new test_dsv4_hc_down_owner(512, 9, 7, true, false, false, -1, true));
+    test_cases.emplace_back(new test_dsv4_hc_down_owner(512, 9, 8, true, false, false, -1, true));
+    for (int x_offset : {0, 4, 8, 12, 16}) {
+        for (int norm_offset : {0, 4, 8, 12, 16}) {
+            for (bool up : {false, true}) {
+                test_cases.emplace_back(new test_dsv4_hc_alignment(x_offset, norm_offset, up));
+            }
+        }
+    }
+    for (int weight_input : {0, 1, 2}) {
+        for (int weight_offset : {0, 2, 8, 16}) {
+            test_cases.emplace_back(new test_dsv4_hc_alignment(0, 0, weight_input == 2, weight_input, weight_offset));
+        }
+    }
     // [HCFUSED] real Flash-Next shapes, every token count the kernels specialize, with and without the injection rows
     for (int64_t nt = 1; nt <= 8; ++nt) {
         test_cases.emplace_back(new test_dsv4_hc_fused(2560, 320, nt, true,  true, 1));
@@ -15374,6 +15630,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_dsv4_hc_fused(2560, 320, nt, true, true, 2));
     }
     test_cases.emplace_back(new test_dsv4_hc_fused(512, 64, 3, true, true, 2));
+    // Cover late weight loads above both preload lengths and a chained graph above 128 tensors.
+    for (int64_t nt : { 1, 4, 5, 8 }) {
+        test_cases.emplace_back(new test_dsv4_hc_fused(512, 512, nt, true, true, 1));
+    }
+    test_cases.emplace_back(new test_dsv4_hc_fused(512, 64, 1, true, false, 16));
+    // Odd widths and row tails cross warp boundaries in the fused finish.
+    for (int64_t nt : { 3, 5, 7 }) {
+        test_cases.emplace_back(new test_dsv4_hc_fused(512, 192, nt, false, true, 2));
+        test_cases.emplace_back(new test_dsv4_hc_fused(512, 192, nt, true, true, 2));
+    }
+    // Two split-K chunks per stream, with injection rows beyond the low-rank rows.
+    for (int64_t nt : { 1, 4, 8 }) {
+        test_cases.emplace_back(new test_dsv4_hc_fused(1024, 128, nt, true, true, 2));
+    }
+    // A four-warp down CTA must stage norms for tokens beyond warp 3 and finish its row tail.
+    for (int64_t nt : { 3, 5, 8 }) {
+        test_cases.emplace_back(new test_dsv4_hc_fused(1024, 64, nt, true, true, 3));
+    }
     // [GDNGATES] Flash-Next linear-attention gates at every token count the kernel specializes, both graph orders
     for (int64_t nt = 1; nt <= 8; ++nt) {
         test_cases.emplace_back(new test_gdn_gates(2560, 48, nt, true));
@@ -19026,6 +19300,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     // [HCFUSED] 16 chained Flash-Next mixes (+ identity-comb hc_post), fused vs the unfused graph, at verify widths
     for (int64_t nt : { 1, 4, 5, 8 }) {
+        test_cases.emplace_back(new test_dsv4_hc_down_owner(2560, 320, nt, true));
         test_cases.emplace_back(new test_dsv4_hc_fused(2560, 320, nt, true, true,  16));
         test_cases.emplace_back(new test_dsv4_hc_fused(2560, 320, nt, true, false, 16));
     }
@@ -20030,7 +20305,30 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
             }
         };
 
-        if (parallel_workers <= 1) {
+        const char * hc_contexts = getenv("GGML_TEST_HCF_CONTEXTS");
+        if (hc_contexts != nullptr) {
+            if (strcmp(hc_contexts, "18") != 0 || parallel_workers != 1 || op_names_filter == nullptr ||
+                    strcmp(op_names_filter, "HC_DOWN_OWNER") != 0) {
+                fprintf(stderr, "GGML_TEST_HCF_CONTEXTS=18 requires HC_DOWN_OWNER and -j 1\n");
+                return false;
+            }
+            // Keep contexts alive so their addresses cannot reuse a legacy counter slot.
+            std::vector<ggml_backend_ptr> contexts;
+            for (int i = 0; i < 18; ++i) {
+                contexts.emplace_back(ggml_backend_dev_init(dev, nullptr));
+                if (!contexts.back()) {
+                    return false;
+                }
+                const size_t before = tests_run.load();
+                test_idx.store(0);
+                fprintf(stderr, "[hc-down-context] begin=%d\n", i);
+                run_tests(contexts.back().get(), backend_cpu.get());
+                if (tests_run.load() == before) {
+                    return false;
+                }
+                fprintf(stderr, "[hc-down-context] end=%d\n", i);
+            }
+        } else if (parallel_workers <= 1) {
             // Reuse the outer backend / backend_cpu so we don't pay an
             // extra CPU backend init.
             run_tests(backend, backend_cpu.get());

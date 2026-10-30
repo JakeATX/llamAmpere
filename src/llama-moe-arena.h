@@ -74,11 +74,13 @@ struct llama_moe_arena {
     void pin();
     size_t discard(const std::vector<std::pair<size_t, size_t>> & ranges);
     void pin_restored();
+    void report_thp() const;
 
     void * data = nullptr;
     size_t size = 0;
     ggml_backend_buffer_ptr buffer;
 private:
+    bool thp_requested = false;
     std::vector<std::pair<size_t, size_t>> pin_ranges;
     std::vector<std::pair<size_t, size_t>> missing_ranges;
     bool (*pin_range)(void *, size_t) = nullptr;

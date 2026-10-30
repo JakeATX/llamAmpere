@@ -442,6 +442,23 @@ struct layer_math {
     bool shared_input = false;  // up and gate quantize their input the same way
 };
 
+// Scratch rows that several workers write side by side. A std::vector base is only 16-byte aligned, so with the
+// 64-byte row strides below every tile boundary would still split a cache line between two workers (the line then
+// bounces between their cores, across both CCDs). `align` (GGML_MOE_CPU_SPLIT_ALIGN) starts the data on a line.
+template <typename T>
+struct scratch_buf {
+    std::vector<T> v;
+    T * p = nullptr;
+    void assign(size_t n, T val, bool align) {
+        v.assign(n + (align ? 64 / sizeof(T) : 0), val);
+        p = v.data();
+        if (align) { while ((uintptr_t) p % 64) { ++p; } }
+    }
+    T * data() { return p; }
+    const T * data() const { return p; }
+    T & operator[](size_t i) { return p[i]; }
+};
+
 struct pool_state {
     std::mutex mu;              // registration and start
     bool running = false;
@@ -466,10 +483,10 @@ struct pool_state {
     bool q8_reuse = false;
     bool down_reuse = false;
     int group_tokens = 4;
-    std::vector<uint8_t> xq;    // [2][MOE_CS_MAX_ROUTES] quantized input rows
+    scratch_buf<uint8_t> xq;    // [2][MOE_CS_MAX_ROUTES] quantized input rows
     size_t xq_stride = 0;
-    std::vector<float> hidden;  // [MOE_CS_MAX_ROUTES][max_ff]
-    std::vector<uint8_t> hq;    // [MOE_CS_MAX_ROUTES] quantized hidden rows
+    scratch_buf<float> hidden;  // [MOE_CS_MAX_ROUTES][max_ff]
+    scratch_buf<uint8_t> hq;    // [MOE_CS_MAX_ROUTES] quantized hidden rows
     size_t hq_stride = 0;
     bool avx512 = false;       // GGML_MOE_CPU_SPLIT_AVX512 and the CPU has AVX-512 F/BW/VL/VNNI
     bool q2_pair = false;      // Share Q2 down weights between two routes of one expert.
@@ -479,12 +496,13 @@ struct pool_state {
     bool q2_shuffle = false;   // Use AVX2 to reorder hidden bytes, with the same integer sums.
     int q2_pf = 0;             // Q2 down prefetch distance in weight blocks; zero disables it.
     size_t aux_stride = 0;     // floats per route in hq_aux: n/32 block scales, then n/64 offsets
-    std::vector<float> hq_aux;
+    scratch_buf<float> hq_aux;
     int rows_ug = 16, rows_down = 64;
     bool iq_rows = false;      // GGML_MOE_CPU_SPLIT_ROWS: moe-iq-rows.h kernels, each chunk decoded once per expert
     int iq_variant = -1;       // moe_iq::get variant bits (GGML_MOE_CPU_SPLIT_ROWS: 1 = best mix, 2..17 = bits + 2)
     int iq_pf = 0;             // GGML_MOE_CPU_SPLIT_PF: prefetch distance of those kernels in bytes (0 = off)
     bool schedule = false;    // Assign quantization rows directly and claim math tiles in small groups.
+    int waitpf = 0;           // GGML_MOE_CPU_SPLIT_WAITPF: KiB of its first tile a worker prefetches while it waits at a phase barrier (0 = off)
     bool host_help = false;
     bool item_barrier = false; // GGML_MOE_CPU_SPLIT_ITEM_BARRIER: phases end when their items are done, not their threads
     bool own_xq = false;       // GGML_MOE_CPU_SPLIT_OWN_XQ (with ITEM_BARRIER): every thread quantizes the inputs itself
@@ -494,6 +512,7 @@ struct pool_state {
     std::atomic<int> hq_left[MOE_CS_MAX_EXPERTS];   // flow: hidden rows of expert i not yet quantized
     int expert_of[MOE_CS_MAX_ROUTES] = {};          // flow: expert index of each route
     size_t xq_own_stride = 0;
+    bool expjob = false;      // GGML_MOE_CPU_SPLIT_EXPJOB=1: one worker runs a whole expert (up/gate, SiLU, down) per claim, no phase barriers inside a job
     int host_cpu = -1;
     std::atomic<int> help_phase{-1}; // -1 closed, 1/3 open, 5/7 held by a helper
     std::atomic<unsigned long long> closed[4];
@@ -510,6 +529,12 @@ struct pool_state {
 
     std::atomic<unsigned long long> st_jobs{0}, st_experts{0}, st_routes{0}, st_busy_ns{0}, st_null{0};
     unsigned long long phase_ns[4] = {};   // thread 0's time through each phase (barrier included), summed
+    // GGML_MOE_CPU_SPLIT_WSTATS=1 (default off): per worker, time spent claiming and running tiles and time spent waiting at
+    // the end-of-phase barrier, plus how late the worker joined a job. Tells a slow or late core from a slow kernel.
+    struct alignas(64) wstat_t { unsigned long long jobs = 0, lag_ns = 0, work_ns[4] = {}, wait_ns[4] = {}; int cpu = -1; };
+    bool wstats = false;
+    wstat_t wst[64];
+    std::atomic<long long> job_t0_ns{0};   // leader's clock when the job was published
     // host-posted jobs (the probe) use this instead of the mapped seq
     std::atomic<unsigned long long> local_seq{0}, local_done{0};
 };
@@ -517,6 +542,19 @@ struct pool_state {
 pool_state & P() {
     static pool_state * p = new pool_state();   // never destroyed: threads may still spin at exit
     return *p;
+}
+
+// Clears the per-worker counters (the probe's jobs are not production work).
+void wst_clear(pool_state & s) {
+    for (auto & w : s.wst) {
+        const int cpu = w.cpu;
+        w = pool_state::wstat_t();
+        w.cpu = cpu;
+    }
+}
+
+inline long long ns_of(clk::time_point t) {
+    return (long long) std::chrono::duration_cast<std::chrono::nanoseconds>(t.time_since_epoch()).count();
 }
 
 int items_of(const pool_state & s, int phase) {
@@ -725,19 +763,73 @@ void run_item(pool_state & s, int phase, int item, uint8_t * xq_mine = nullptr) 
     }
 }
 
+// waitpf: with the first tile of the up/gate and down phases handed out by worker number, a worker that finishes
+// early at the previous barrier already knows which weight rows it reads next and pulls them toward its cache
+// while the slower workers finish, instead of spinning on a pause instruction.
+struct pf_cursor {
+    const char * base[2] = {nullptr, nullptr};
+    size_t len = 0, at = 0;
+};
+
+pf_cursor pf_tile(pool_state & s, int phase, int item) {
+    pf_cursor c;
+    if (!s.waitpf || (phase != 1 && phase != 3) || item >= items_of(s, phase)) { return c; }
+    const layer_math & L = *s.cur;
+    const bool ug = phase == 1;
+    const role_math & m = L.role[ug ? 0 : 2];
+    const int rows = ug ? s.rows_ug : s.rows_down;
+    const int blocks = (int) ((m.r.n_out + rows - 1) / rows);
+    const int64_t r0 = (int64_t) (item % blocks) * rows;
+    const int e = s.expert[item / blocks];
+    c.len = std::min<size_t>((size_t) std::min<int64_t>(rows, m.r.n_out - r0) * m.r.row_bytes, (size_t) s.waitpf * 1024);
+    c.base[0] = role_row(s, m, e, r0);
+    if (ug) { c.base[1] = role_row(s, L.role[1], e, r0); }
+    return c;
+}
+
+// Issues up to four lines of the tile (alternating up and gate); false once the tile is covered.
+bool pf_step(pf_cursor & c) {
+    for (int k = 0; k < 4 && c.at < c.len; ++k) {
+        for (int j = 0; j < 2; ++j) { if (c.base[j]) { __builtin_prefetch(c.base[j] + c.at, 0, 3); } }
+        c.at += 64;
+    }
+    return c.at < c.len;
+}
+
 // Every thread runs all four phases of job number `n` (1-based); the fin counters only grow, so a thread that is
 // late to notice a finished phase never misses it.
 void run_job_phases(pool_state & s, unsigned long long n, int worker, bool lead = false) {
     const unsigned long long target = n * (unsigned long long) s.threads;
     auto t = clk::now();
+    pool_state::wstat_t * W = s.wstats && worker < 64 ? &s.wst[worker] : nullptr;
+    if (W) {
+        ++W->jobs;
+        if (!lead) { W->lag_ns += (unsigned long long) std::max<long long>(0, ns_of(t) - s.job_t0_ns.load(std::memory_order_relaxed)); }
+    }
+    auto tw = t;
+    pf_cursor pf;
     for (int p = 0; p < 4; ++p) {
         const int total = items_of(s, p);
-        if (s.schedule && (p == 0 || p == 2)) {
+        if (s.expjob && p >= 1) {
+            // Fused phase: claim whole experts. Each expert's tiles are the same items the phased path runs, in the same
+            // per-row order, so the output is unchanged; phases 2 and 3 only pass the (already satisfied) barriers.
+            if (p == 1) {
+                for (int i = s.next[1].fetch_add(1, std::memory_order_relaxed); i < s.n_exp;
+                        i = s.next[1].fetch_add(1, std::memory_order_relaxed)) {
+                    const int bu = total / s.n_exp;
+                    for (int b = 0; b < bu; ++b) { run_item(s, 1, i * bu + b); }
+                    for (int q = s.first[i]; q < s.first[i + 1]; ++q) { run_item(s, 2, q); }
+                    const int bd = items_of(s, 3) / s.n_exp;
+                    for (int b = 0; b < bd; ++b) { run_item(s, 3, i * bd + b); }
+                }
+            }
+        } else if (s.schedule && (p == 0 || p == 2)) {
             // Each row has one writer. The phase barrier publishes it before any consumer runs.
             for (int it = worker; it < total; it += s.threads) {
                 run_item(s, p, it);
             }
         } else {
+            if (s.waitpf && (p == 1 || p == 3) && worker < total) { run_item(s, p, worker); }
             // Keep at least three claims per worker, with at most four adjacent tiles per claim.
             const int chunk = s.schedule ? std::max(1, std::min(4, total / (3 * s.threads))) : 1;
             for (int begin = s.next[p].fetch_add(chunk, std::memory_order_relaxed); begin < total;
@@ -748,6 +840,11 @@ void run_job_phases(pool_state & s, unsigned long long n, int worker, bool lead 
             }
         }
         const auto finished = s.fin[p].fetch_add(1, std::memory_order_acq_rel) + 1;
+        if (W) {
+            const auto t1 = clk::now();
+            W->work_ns[p] += (unsigned long long) std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - tw).count();
+            tw = t1;
+        }
         if (s.host_help) {
             if (finished == target) {
                 if (p == 1 || p == 3) {
@@ -766,12 +863,20 @@ void run_job_phases(pool_state & s, unsigned long long n, int worker, bool lead 
             }
         }
         if (p < 3) {
-            while (s.fin[p].load(std::memory_order_acquire) < target) { cpu_relax(); }
+            if (s.waitpf && p < 2) { pf = pf_tile(s, p == 0 ? 1 : 3, worker); }   // phase 2 keeps the down-tile cursor
+            while (s.fin[p].load(std::memory_order_acquire) < target) {
+                if (!(s.waitpf && pf_step(pf))) { cpu_relax(); }
+            }
+        }
+        if (lead && p == 3) {
+            while (s.fin[3].load(std::memory_order_acquire) < target) { cpu_relax(); }
+        }
+        if (W) {
+            const auto t2 = clk::now();
+            W->wait_ns[p] += (unsigned long long) std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - tw).count();
+            tw = t2;
         }
         if (lead) {
-            if (p == 3) {
-                while (s.fin[3].load(std::memory_order_acquire) < target) { cpu_relax(); }
-            }
             const auto now = clk::now();
             s.phase_ns[p] += (unsigned long long) std::chrono::duration_cast<std::chrono::nanoseconds>(now - t).count();
             t = now;
@@ -937,6 +1042,7 @@ void sleep_us(int us) {
 void worker_main(pool_state * sp, int idx, int cpu) {
     pool_state & s = *sp;
     pin_thread(cpu);
+    if (idx < 64) { s.wst[idx].cpu = cpu; }
     unsigned long long seen = 0;
     for (;;) {
         auto spin_until = clk::now() + std::chrono::microseconds(s.spin_us);
@@ -963,6 +1069,7 @@ void worker_main(pool_state * sp, int idx, int cpu) {
 void leader_main(pool_state * sp, int cpu) {
     pool_state & s = *sp;
     pin_thread(cpu);
+    s.wst[0].cpu = cpu;
 #if defined(__linux__)
     (void) prctl(PR_SET_TIMERSLACK, 1000UL, 0, 0, 0);   // naps end within ~1 us of the asked time, not +50 us
 #endif
@@ -1027,10 +1134,11 @@ void leader_main(pool_state * sp, int cpu) {
                 }
             }
             for (int p = 0; p < 4; ++p) {
-                s.next[p].store(0, std::memory_order_relaxed);
+                s.next[p].store(s.waitpf && (p == 1 || p == 3) ? s.threads : 0, std::memory_order_relaxed);
                 s.idone[p].store(tag, std::memory_order_relaxed);
                 s.inext[p].store(tag, std::memory_order_relaxed);
             }
+            if (s.wstats) { s.job_t0_ns.store(ns_of(clk::now()), std::memory_order_relaxed); }
             s.gen.store(n, std::memory_order_seq_cst);
             if (s.sleepers.load(std::memory_order_seq_cst) > 0) {
                 std::lock_guard<std::mutex> lk(s.sleep_mu);
@@ -1082,9 +1190,10 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
     // Quantized rows are never larger than the f32 rows they come from.
     s.xq_stride = GGML_PAD((size_t) max_embd * sizeof(float), 64);
     s.hq_stride = GGML_PAD((size_t) max_ff * sizeof(float), 64);
-    s.xq.assign(2 * MOE_CS_MAX_ROUTES * s.xq_stride, 0);
-    s.hidden.assign((size_t) MOE_CS_MAX_ROUTES * max_ff, 0.0f);
-    s.hq.assign(MOE_CS_MAX_ROUTES * s.hq_stride, 0);
+    const bool align = env_int("GGML_MOE_CPU_SPLIT_ALIGN", 0, 0, 1) != 0;
+    s.xq.assign(2 * MOE_CS_MAX_ROUTES * s.xq_stride, 0, align);
+    s.hidden.assign((size_t) MOE_CS_MAX_ROUTES * max_ff, 0.0f, align);
+    s.hq.assign(MOE_CS_MAX_ROUTES * s.hq_stride, 0, align);
     s.q2_pair = env_int("GGML_MOE_CPU_SPLIT_Q2_PAIR", 0, 0, 1) != 0;
     s.q2_group4 = env_int("GGML_MOE_CPU_SPLIT_Q2_GROUP4", 0, 0, 1) != 0;
     s.vector_silu = env_int("GGML_MOE_CPU_SPLIT_VECTOR_SILU", 0, 0, 1) != 0;
@@ -1098,7 +1207,7 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
     s.avx512 = env_int("GGML_MOE_CPU_SPLIT_AVX512", 1, 0, 1) != 0 && cpu_has_avx512_vnni();
 #endif
     s.aux_stride = (size_t) max_ff / QK8_0 + (size_t) max_ff / QK2_0 + 16;
-    s.hq_aux.assign(MOE_CS_MAX_ROUTES * s.aux_stride, 0.0f);
+    s.hq_aux.assign(MOE_CS_MAX_ROUTES * s.aux_stride, 0.0f, align);
     s.rows_ug = env_int("GGML_MOE_CPU_SPLIT_ROWS_UG", 16, 1, 4096);
     s.rows_down = env_int("GGML_MOE_CPU_SPLIT_ROWS_DOWN", 64, 1, 8192);
 #if defined(MOE_IQ_ROWS)
@@ -1115,6 +1224,12 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
     s.schedule = env_int("GGML_MOE_CPU_SPLIT_SCHEDULE", 0, 0, 1) != 0;
     s.host_help = env_int("GGML_MOE_CPU_SPLIT_HOST", 0, 0, 1) != 0;
     s.item_barrier = env_int("GGML_MOE_CPU_SPLIT_ITEM_BARRIER", 0, 0, 1) != 0 && !s.schedule;
+    s.wstats = env_int("GGML_MOE_CPU_SPLIT_WSTATS", 0, 0, 1) != 0;
+    s.waitpf = env_int("GGML_MOE_CPU_SPLIT_WAITPF", 0, 0, 1024);
+    s.expjob = env_int("GGML_MOE_CPU_SPLIT_EXPJOB", 0, 0, 1) != 0;
+    // ITEM_BARRIER and WAITPF/EXPJOB were built separately and schedule the same work counters differently: run one at a time.
+    if (s.item_barrier) { s.waitpf = 0; s.expjob = false; }
+    if (s.expjob) { s.host_help = false; s.waitpf = 0; }
     for (int p = 0; p < 4; ++p) {
         s.next[p].store(0); s.fin[p].store(0); s.closed[p].store(0); s.inext[p].store(item_low); s.idone[p].store(0);
     }
@@ -1192,6 +1307,21 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
         }
     }
 #endif
+    // GGML_MOE_CPU_SPLIT_CPULIST="11,10,9,..." (default unset): use exactly these cpus, in this order, instead of the
+    // derived list. Used to test pool placement (which L3 group, whether the desktop core is in the pool).
+#if defined(__linux__)
+    if (const char * cl = getenv("GGML_MOE_CPU_SPLIT_CPULIST")) {
+        std::vector<int> forced;
+        for (const char * c = cl; *c;) {
+            if (*c < '0' || *c > '9') { ++c; continue; }
+            char * end = nullptr;
+            const long v = strtol(c, &end, 10);
+            c = end;
+            if (v >= 0 && v < CPU_SETSIZE) { forced.push_back((int) v); }
+        }
+        if (!forced.empty()) { avail = forced; skipped = "forced by GGML_MOE_CPU_SPLIT_CPULIST"; }
+    }
+#endif
     const int hw_free = !avail.empty() ? (int) avail.size() : (int) std::max(1u, std::thread::hardware_concurrency() / 2 - 1);
     s.threads = env_int("GGML_MOE_CPU_SPLIT_THREADS", hw_free, 1, 64);
     s.own_xq = s.item_barrier && env_int("GGML_MOE_CPU_SPLIT_OWN_XQ", 0, 0, 1) != 0;
@@ -1213,10 +1343,12 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
     fprintf(stderr, "[moe-cpu-split] pool: %d threads, %s%s (skipped cores at cpus %s), spin %d us, nap %d us, rows up/gate %d down %d%s%s%s\n",
             s.threads, pin ? "pinned to cpus " : "unpinned", where.c_str(), skipped.c_str(), s.spin_us, s.nap_us, s.rows_ug, s.rows_down,
             s.q2_fast ? ", Q2_0 down fast path" : "", smt ? ", SMT siblings" : "", s.avx512 ? ", grouped AVX-512 VNNI IQ" : "");
+    if (align) { fprintf(stderr, "[moe-cpu-split] scratch rows start on 64-byte lines (GGML_MOE_CPU_SPLIT_ALIGN)\n"); }
     if (s.q2_pair && s.q2_fast) { fprintf(stderr, "[moe-cpu-split] Q2_0 down shares weights across route pairs\n"); }
     if (s.q2_group4 && s.q2_fast) { fprintf(stderr, "[moe-cpu-split] Q2_0 down shares weights across three/four-route groups\n"); }
     if (s.vector_silu && s.iq_rows) { fprintf(stderr, "[moe-cpu-split] grouped up/gate uses CPU vector SiLU\n"); }
     if (s.iq_rows) { fprintf(stderr, "[moe-cpu-split] IQ up/gate row kernels (each chunk decoded once per expert), variant %d, prefetch %d B\n", s.iq_variant, s.iq_pf); }
+    if (s.expjob) { fprintf(stderr, "[moe-cpu-split] one worker per whole expert (GGML_MOE_CPU_SPLIT_EXPJOB)\n"); }
     if (s.schedule) { fprintf(stderr, "[moe-cpu-split] static quantization rows, grouped math claims\n"); }
     if (s.host_help) { fprintf(stderr, "[moe-cpu-split] waiting host drains math tiles on cpu %d\n", s.host_cpu); }
     if (s.item_barrier) { fprintf(stderr, "[moe-cpu-split] item barriers (a descheduled idle thread does not stall a job)%s%s\n", s.own_xq ? ", private input rows per thread" : "", s.flow ? ", per-expert flow (no phase barriers after the inputs)" : ""); }
@@ -1417,6 +1549,7 @@ bool moe_cs_probe(double * route_ns, double * fixed_ns) {
     *fixed_ns = std::max(0.0, t1 - per);
     // the probe's jobs count as work in the statistics; clear them
     s.st_jobs = 0; s.st_experts = 0; s.st_routes = 0; s.st_busy_ns = 0; s.st_null = 0;
+    wst_clear(s);
     fprintf(stderr, "[moe-cpu-split] probe on layer %d: empty job %.1f us, 1 expert %.1f us, 4 experts %.1f us -> %.1f us per (expert, route) + %.1f us per job\n",
             layer, t0 / 1000.0, t1 / 1000.0, t4 / 1000.0, per / 1000.0, *fixed_ns / 1000.0);
     // Contention check: warns when the pool spent over 25% of the timed jobs waiting for a cpu (about 1.33x slower or worse).
@@ -1461,7 +1594,23 @@ bool moe_cs_bench(int layer, const int * experts, int n_list, int n_exp, int rep
     *ns_per_job = total / reps;
     for (int p = 0; p < 4; ++p) { phase_ns[p] = (double) s.phase_ns[p] / reps; s.phase_ns[p] = 0; }
     s.st_jobs = 0; s.st_experts = 0; s.st_routes = 0; s.st_busy_ns = 0; s.st_null = 0;
+    wst_clear(s);
     return true;
+}
+
+void moe_cs_wstats_report(const char * when) {
+    pool_state & s = P();
+    if (!s.wstats) { return; }
+    static const char * const names[4] = {"quantize", "up+gate", "silu", "down"};
+    for (int i = 0; i < s.threads && i < 64; ++i) {
+        const pool_state::wstat_t & w = s.wst[i];
+        const double j = (double) std::max(1ull, w.jobs);
+        fprintf(stderr, "[moe-cpu-split] wstats %s worker %d cpu %d jobs %llu join-lag %.2f us/job", when, i, w.cpu, w.jobs, w.lag_ns / j / 1e3);
+        for (int p = 0; p < 4; ++p) {
+            fprintf(stderr, " | %s work %.1f wait %.1f", names[p], w.work_ns[p] / j / 1e3, w.wait_ns[p] / j / 1e3);
+        }
+        fprintf(stderr, " us/job\n");
+    }
 }
 
 void moe_cs_stats(unsigned long long out[9]) {

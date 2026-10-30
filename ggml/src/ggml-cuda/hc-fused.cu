@@ -23,10 +23,11 @@
 
 #include <cstdlib>
 #include <mutex>
+#include <type_traits>
 #include <unordered_map>
 
 static constexpr int HCF_CHUNK      = 512;  // columns per split-K chunk; n_embd must be a multiple
-static constexpr int HCF_DOWN_WARPS = 8;
+static constexpr int HCF_DOWN_WARPS_DEF = 8;
 static constexpr int HCF_DOWN_ROWS_DEF = 4;  // rows per warp (default; LLAMA_HC_DOWN_ROWS=1|2 gives more, smaller CTAs)
 static constexpr int HCF_UP_WARPS   = 16;   // embedding columns per CTA
 static constexpr int HCF_MAX_T      = 8;
@@ -70,12 +71,337 @@ static __device__ __forceinline__ float4 hcf_post_val4(const hcf_post_fold & pf,
                        hcf_post_val(bv.z, pv, rv.z), hcf_post_val(bv.w, pv, rv.w));
 }
 
+static constexpr int HCF_OWNER_ROWS = 16;
+static constexpr int HCF_OWNER_MAX_ROWS = 336;
+static constexpr int HCF_OWNER_RB = HCF_OWNER_MAX_ROWS/HCF_OWNER_ROWS;
+static __device__ unsigned int hcf_owner_arrive[HCF_CNT_SLOTS*HCF_OWNER_RB];
+
+template <int WIDTH = 32>
+static __device__ __forceinline__ float hcf_owner_sum(float v, const unsigned mask = 0xffffffffu) {
+#pragma unroll
+    for (int d = WIDTH/2; d; d >>= 1) {
+        v = __fadd_rn(v, __shfl_xor_sync(mask, v, d, WIDTH));
+    }
+    return v;
+}
+
+// Stage each weighted stream once. The row kernel applies its RMS scale after the dot product.
+template <bool FOLD>
+static __global__ void __launch_bounds__(256) hcf_row_owner_stage(
+        const float * __restrict__ x, const float * __restrict__ wn, const int n_embd, const int n_rows,
+        const int n_tokens, const float eps, float * __restrict__ xn, float * __restrict__ dst, const hcf_post_fold pf) {
+    __shared__ float sums[8];
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int s = blockIdx.x, t = blockIdx.y, hc_dim = 4*n_embd;
+    float sq = 0.0f;
+    for (int j = tid*4; j < n_embd; j += 256*4) {
+        const int src = s*n_embd + j;
+        float4 xv;
+        if constexpr (FOLD) {
+            xv = hcf_post_val4(pf, t, s, j, src, hc_dim);
+            *(float4 *) (pf.h + (int64_t) t*hc_dim + src) = xv;
+        } else {
+            xv = *(const float4 *) (x + (int64_t) t*hc_dim + src);
+        }
+        const float4 gv = *(const float4 *) (wn + src);
+        sq += xv.x*xv.x + xv.y*xv.y + xv.z*xv.z + xv.w*xv.w;
+        *(float4 *) (xn + (int64_t) t*hc_dim + src) = make_float4(xv.x*gv.x, xv.y*gv.y, xv.z*gv.z, xv.w*gv.w);
+    }
+    const float v = hcf_owner_sum(sq);
+    if (lane == 0) {
+        sums[warp] = v;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        const float total = hcf_owner_sum<8>(lane < 8 ? sums[lane] : 0.0f);
+        if (lane == 0) {
+            dst[n_rows*n_tokens + 4*t + s] = rsqrtf(total/n_embd + eps);
+        }
+    }
+}
+
+template <int T, bool LOOKAHEAD = false>
+static __global__ void __launch_bounds__(256) hcf_down_row_owner(
+        const float * __restrict__ xn, const char * __restrict__ wd, const int64_t sd,
+        const char * __restrict__ wi, const int64_t si, const int R, const int n_rows, const int n_embd,
+        const float lo_scale, const float inj_scale, float * __restrict__ dst) {
+    const int lane = threadIdx.x & 31, row = blockIdx.x*(blockDim.x/32) + (threadIdx.x >> 5);
+    if (row >= n_rows) {
+        return;
+    }
+    const char * wr = row < R ? wd + (int64_t) row*sd : wi + (int64_t) (row - R)*si;
+    const int hc_dim = 4*n_embd;
+    const int n_vec = n_embd/8;
+    float out[T] = {};
+#pragma unroll
+    for (int s = 0; s < 4; ++s) {
+        const uint4 * weights = (const uint4 *) wr + s*n_vec;
+        float acc[T] = {};
+        uint4 next = {};
+        if constexpr (LOOKAHEAD) {
+            next = __ldg(weights + lane);
+        }
+        for (int q = lane; q < n_vec; q += 32) {
+            const uint4 pk = LOOKAHEAD ? next : __ldg(weights + q);
+            if constexpr (LOOKAHEAD) {
+                if (q + 32 < n_vec) {
+                    next = __ldg(weights + q + 32);
+                }
+            }
+            const float w[8] = {
+                hcf_bf16_lo(pk.x), hcf_bf16_hi(pk.x), hcf_bf16_lo(pk.y), hcf_bf16_hi(pk.y),
+                hcf_bf16_lo(pk.z), hcf_bf16_hi(pk.z), hcf_bf16_lo(pk.w), hcf_bf16_hi(pk.w),
+            };
+            const int j = 8*q;
+#pragma unroll
+            for (int t = 0; t < T; ++t) {
+                const float * src = xn + (int64_t) t*hc_dim + s*n_embd + j;
+                const float4 a = __ldg((const float4 *) src);
+                const float4 b = __ldg((const float4 *) (src + 4));
+                const float v[8] = { a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w };
+                float dot = 0.0f;
+#pragma unroll
+                for (int k = 0; k < 8; ++k) {
+                    dot = __fmaf_rn(w[k], v[k], dot);
+                }
+                acc[t] = __fadd_rn(acc[t], dot);
+            }
+        }
+#pragma unroll
+        for (int t = 0; t < T; ++t) {
+            const float dot = hcf_owner_sum(acc[t]);
+            if (lane == 0) {
+                // RMS scales share the allocation with outputs written by this kernel.
+                out[t] += dst[n_rows*T + 4*t + s]*dot;
+            }
+        }
+    }
+    if (lane == 0) {
+#pragma unroll
+        for (int t = 0; t < T; ++t) {
+            if (row < R) {
+                const float a = lo_scale*out[t];
+                dst[t*R + row] = a/(1.0f + expf(-a));
+            } else {
+                dst[R*T + t*(n_rows - R) + row - R] = 2.0f/(1.0f + expf(-inj_scale*out[t]));
+            }
+        }
+    }
+}
+
+// Stripes split each 256-column tile. Keep the four stream sums separate
+// until their RMS scales are known. The last stripe finishes its row block with coalesced partial reads.
+template <int T, bool FOLD, bool LOOKAHEAD = false, bool PACK = false, int STRIPES = 4, bool STREAM_STAGE = false>
+static __global__ void __launch_bounds__(128) hcf_down_owner(
+        const float * __restrict__ x, const float * __restrict__ wn,
+        const char * __restrict__ wd, const int64_t sd, const char * __restrict__ wi, const int64_t si,
+        const int R, const int n_rows, const int n_embd, const float eps, const float lo_scale, const float inj_scale,
+        float * __restrict__ partial, float * __restrict__ ssq, const int cnt_off,
+        float * __restrict__ dst, const hcf_post_fold pf, const bool finish8) {
+    extern __shared__ __align__(16) float sh[];
+    __shared__ float sq_w[4][T][4];
+    __shared__ float rr[T][4];
+    __shared__ int last;
+    static_assert(STRIPES == 4 || STRIPES == 8, "unsupported stripe count");
+    constexpr int VALUES = 32/STRIPES, TILE = 256/STRIPES, OWNERS = 8*STRIPES;
+    using packed_t = std::conditional_t<STRIPES == 4, uint4, uint2>;
+    const int hc_dim = 4*n_embd, slice = hc_dim/STRIPES;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int local = tid & 7, stripe = blockIdx.y, owner = stripe*8 + local;
+    const int row = blockIdx.x*HCF_OWNER_ROWS + tid/8;
+    // Keep the indexed legacy scratch array out of the streamed kernel's frame.
+    if constexpr (STREAM_STAGE) {
+        const int stream_slice = n_embd/STRIPES;
+#pragma unroll
+        for (int t = 0; t < T; ++t) {
+#pragma unroll
+            for (int s = 0; s < 4; ++s) {
+                float sq = 0.0f;
+                for (int j = tid*4; j < stream_slice; j += 128*4) {
+                    const int src = s*n_embd + (j/TILE)*256 + stripe*TILE + j%TILE;
+                    float4 xv;
+                    if constexpr (FOLD) {
+                        xv = hcf_post_val4(pf, t, s, src - s*n_embd, src, hc_dim);
+                        if (blockIdx.x == 0) {
+                            *(float4 *) (pf.h + (int64_t) t*hc_dim + src) = xv;
+                        }
+                    } else {
+                        xv = *(const float4 *) (x + (int64_t) t*hc_dim + src);
+                    }
+                    const float4 gv = *(const float4 *) (wn + src);
+                    sq += xv.x*xv.x + xv.y*xv.y + xv.z*xv.z + xv.w*xv.w;
+                    *(float4 *) (sh + t*slice + s*stream_slice + j) = make_float4(xv.x*gv.x, xv.y*gv.y, xv.z*gv.z, xv.w*gv.w);
+                }
+                const float v = hcf_owner_sum(sq);
+                if (lane == 0) {
+                    sq_w[warp][t][s] = v;
+                }
+            }
+        }
+    } else {
+        float sq[T][4] = {};
+        for (int i = tid; i < T*(slice/4); i += 128) {
+            const int t = i/(slice/4), j = (i % (slice/4))*4;
+            const int src = (j/TILE)*256 + stripe*TILE + j%TILE;
+            const int s = src/n_embd;
+            float4 xv;
+            if constexpr (FOLD) {
+                xv = hcf_post_val4(pf, t, s, src - s*n_embd, src, hc_dim);
+                if (blockIdx.x == 0) {
+                    *(float4 *) (pf.h + (int64_t) t*hc_dim + src) = xv;
+                }
+            } else {
+                xv = *(const float4 *) (x + (int64_t) t*hc_dim + src);
+            }
+            const float4 gv = *(const float4 *) (wn + src);
+            sq[t][s] += xv.x*xv.x + xv.y*xv.y + xv.z*xv.z + xv.w*xv.w;
+            *(float4 *) (sh + t*slice + j) = make_float4(xv.x*gv.x, xv.y*gv.y, xv.z*gv.z, xv.w*gv.w);
+        }
+#pragma unroll
+        for (int t = 0; t < T; ++t) {
+#pragma unroll
+            for (int s = 0; s < 4; ++s) {
+                const float v = hcf_owner_sum(sq[t][s]);
+                if (lane == 0) {
+                    sq_w[warp][t][s] = v;
+                }
+            }
+        }
+    }
+    __syncthreads();
+    if (tid < T*4) {
+        float v = 0.0f;
+        for (int w = 0; w < 4; ++w) {
+            v += sq_w[w][tid/4][tid%4];
+        }
+        ssq[(((int64_t) blockIdx.x*STRIPES + stripe)*T + tid/4)*4 + tid%4] = v;
+    }
+    const unsigned mask = PACK ? __ballot_sync(0xffffffffu, row < n_rows) : 0;
+    if (row < n_rows) {
+        const char * wr = row < R ? wd + (int64_t) row*sd : wi + (int64_t) (row - R)*si;
+#pragma unroll
+        for (int s = 0; s < 4; ++s) {
+            float acc[T] = {};
+            const int first = s*(n_embd/256), end = (s + 1)*(n_embd/256);
+            packed_t next;
+            if constexpr (LOOKAHEAD) {
+                next = __ldg((const packed_t *) wr + first*OWNERS + owner);
+            }
+            for (int q = first; q < end; ++q) {
+                packed_t pk;
+                if constexpr (LOOKAHEAD) {
+                    pk = next;
+                    if (q + 1 < end) {
+                        next = __ldg((const packed_t *) wr + (q + 1)*OWNERS + owner);
+                    }
+                } else {
+                    pk = __ldg((const packed_t *) wr + q*OWNERS + owner);
+                }
+                uint32_t p[4] = { pk.x, pk.y, 0, 0 };
+                if constexpr (STRIPES == 4) {
+                    p[2] = pk.z;
+                    p[3] = pk.w;
+                }
+#pragma unroll
+                for (int t = 0; t < T; ++t) {
+                    const float * xv = sh + t*slice + q*TILE + local*VALUES;
+                    float v = 0.0f;
+#pragma unroll
+                    for (int k = 0; k < VALUES/2; ++k) {
+                        v = __fmaf_rn(hcf_bf16_lo(p[k]), xv[2*k], v);
+                        v = __fmaf_rn(hcf_bf16_hi(p[k]), xv[2*k + 1], v);
+                    }
+                    acc[t] = __fadd_rn(acc[t], v);
+                }
+            }
+#pragma unroll
+            for (int t = 0; t < T; ++t) {
+                if constexpr (PACK) {
+                    float v = acc[t];
+#pragma unroll
+                    for (int d = 4; d; d >>= 1) {
+                        v = __fadd_rn(v, __shfl_xor_sync(mask, v, d, 8));
+                    }
+                    if (local == 0) {
+                        partial[(((int64_t) s*T + t)*n_rows + row)*STRIPES + stripe] = v;
+                    }
+                } else {
+                    partial[(((int64_t) s*T + t)*n_rows + row)*OWNERS + owner] = acc[t];
+                }
+            }
+        }
+    }
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) {
+        last = atomicAdd(hcf_owner_arrive + cnt_off + blockIdx.x, 1u) == STRIPES - 1;
+    }
+    __syncthreads();
+    if (!last) {
+        return;
+    }
+    __threadfence();
+    if (tid < T*4) {
+        float v = 0.0f;
+        for (int st = 0; st < STRIPES; ++st) {
+            v += __ldcg(ssq + (((int64_t) blockIdx.x*STRIPES + st)*T + tid/4)*4 + tid%4);
+        }
+        const float r = rsqrtf(v/n_embd + eps);
+        rr[tid/4][tid%4] = r;
+        if (blockIdx.x == 0) {
+            dst[n_rows*T + tid] = r;
+        }
+    }
+    __syncthreads();
+    const bool finish_pack = PACK && finish8;
+    const int rows_pw = finish_pack ? 4 : 1;
+    const int out_lane = finish_pack ? lane % 8 : lane;
+    // Packed rows use at most eight values; all 16 rows can finish in one pass.
+    for (int base = warp*rows_pw; base < HCF_OWNER_ROWS; base += 4*rows_pw) {
+        const int r = blockIdx.x*HCF_OWNER_ROWS + base + (finish_pack ? lane/8 : 0);
+        const unsigned out_mask = finish_pack ? __ballot_sync(0xffffffffu, r < n_rows) : 0xffffffffu;
+        if (r >= n_rows) {
+            continue;
+        }
+#pragma unroll
+        for (int t = 0; t < T; ++t) {
+            float v = 0.0f;
+#pragma unroll
+            for (int s = 0; s < 4; ++s) {
+                float p;
+                if constexpr (PACK) {
+                    p = out_lane < STRIPES ? __ldcg(partial + (((int64_t) s*T + t)*n_rows + r)*STRIPES + out_lane) : 0.0f;
+                } else {
+                    const float * src = partial + (((int64_t) s*T + t)*n_rows + r)*OWNERS;
+                    p = __ldcg(src + lane);
+                    if constexpr (STRIPES == 8) {
+                        p = __fadd_rn(p, __ldcg(src + lane + 32));
+                    }
+                }
+                v += rr[t][s]*(finish_pack ? hcf_owner_sum<8>(p, out_mask) : hcf_owner_sum(p));
+            }
+            if (out_lane == 0) {
+                if (r < R) {
+                    const float a = lo_scale*v;
+                    dst[t*R + r] = a/(1.0f + expf(-a));
+                } else {
+                    dst[R*T + t*(n_rows - R) + r - R] = 2.0f/(1.0f + expf(-inj_scale*v));
+                }
+            }
+        }
+    }
+    __syncthreads();
+    if (tid == 0) {
+        atomicExch(hcf_owner_arrive + cnt_off + blockIdx.x, 0u);
+    }
+}
+
 // grid (ceil(n_rows/32), n_chunks), block 256
 // P   [n_chunks][n_rows][T]       partial dot products (without r)
 // ssq [row block][n_chunks][T]    partial sums of x^2 (only row block 0 when cnt == nullptr)
 // cnt != nullptr: the last CTA to finish a row block (over all chunks) also runs the finish for its 32 rows
 // (same sums in the same order as hcf_down_finish, so the result is bit-identical to the two-kernel path).
-template <int T, bool FOLD, int HCF_DOWN_ROWS>
+template <int T, bool FOLD, int HCF_DOWN_ROWS, bool WARP_FINISH = false, bool LATE_WEIGHTS = false, int HCF_DOWN_WARPS = HCF_DOWN_WARPS_DEF>
 static __global__ void __launch_bounds__(HCF_DOWN_WARPS*WARP_SIZE)
 hcf_down_partial(
         const float * __restrict__ x, const float * __restrict__ wn,
@@ -101,7 +427,8 @@ hcf_down_partial(
     constexpr int NG = HCF_CHUNK/128;
     const int k_base = blockIdx.x*(HCF_DOWN_WARPS*HCF_DOWN_ROWS) + warp*HCF_DOWN_ROWS;
 
-    uint2 w[HCF_DOWN_ROWS][NG];
+    constexpr int NP = LATE_WEIGHTS ? 1 : NG;
+    uint2 w[HCF_DOWN_ROWS][NP];
 #pragma unroll
     for (int q = 0; q < HCF_DOWN_ROWS; ++q) {
         const int k = k_base + q;
@@ -109,12 +436,12 @@ hcf_down_partial(
             const char * row = k < R ? wd + (int64_t) k*sd : wi + (int64_t) (k - R)*si;
             const uint2 * rp = (const uint2 *) (row + (int64_t) j0*2);
 #pragma unroll
-            for (int g = 0; g < NG; ++g) {
+            for (int g = 0; g < NP; ++g) {
                 w[q][g] = rp[g*WARP_SIZE + lane];
             }
         } else {
 #pragma unroll
-            for (int g = 0; g < NG; ++g) {
+            for (int g = 0; g < NP; ++g) {
                 w[q][g] = make_uint2(0, 0);
             }
         }
@@ -140,23 +467,25 @@ hcf_down_partial(
         xs[t][e] = make_float4(xv.x*gv.x, xv.y*gv.y, xv.z*gv.z, xv.w*gv.w);
     }
 
-    if ((fuse_finish || blockIdx.x == 0) && warp < T) {
-        const float4 * xr = (const float4 *) (x + (int64_t) warp*hc_dim + j0);
-        float s = 0.0f;
+    if (fuse_finish || blockIdx.x == 0) {
+        for (int t = warp; t < T; t += HCF_DOWN_WARPS) {
+            const float4 * xr = (const float4 *) (x + (int64_t) t*hc_dim + j0);
+            float s = 0.0f;
 #pragma unroll
-        for (int it = 0; it < HCF_CHUNK/4/WARP_SIZE; ++it) {
-            float4 v;
-            if constexpr (FOLD) {
-                const int e = it*WARP_SIZE + lane;
-                v = hcf_post_val4(pf, warp, s_c, i0_c + 4*e, j0 + 4*e, hc_dim);
-            } else {
-                v = xr[it*WARP_SIZE + lane];
+            for (int it = 0; it < HCF_CHUNK/4/WARP_SIZE; ++it) {
+                float4 v;
+                if constexpr (FOLD) {
+                    const int e = it*WARP_SIZE + lane;
+                    v = hcf_post_val4(pf, t, s_c, i0_c + 4*e, j0 + 4*e, hc_dim);
+                } else {
+                    v = xr[it*WARP_SIZE + lane];
+                }
+                s += v.x*v.x + v.y*v.y + v.z*v.z + v.w*v.w;
             }
-            s += v.x*v.x + v.y*v.y + v.z*v.z + v.w*v.w;
-        }
-        s = warp_reduce_sum(s);
-        if (lane == 0) {
-            ssq[((int64_t) blockIdx.x*n_chunks + c)*T + warp] = s;
+            s = warp_reduce_sum(s);
+            if (lane == 0) {
+                ssq[((int64_t) blockIdx.x*n_chunks + c)*T + t] = s;
+            }
         }
     }
 
@@ -176,10 +505,22 @@ hcf_down_partial(
         float wf[HCF_DOWN_ROWS][4];
 #pragma unroll
         for (int q = 0; q < HCF_DOWN_ROWS; ++q) {
-            wf[q][0] = hcf_bf16_lo(w[q][g].x);
-            wf[q][1] = hcf_bf16_hi(w[q][g].x);
-            wf[q][2] = hcf_bf16_lo(w[q][g].y);
-            wf[q][3] = hcf_bf16_hi(w[q][g].y);
+            uint2 v;
+            if constexpr (LATE_WEIGHTS) {
+                v = w[q][0];
+                if (g > 0 && k_base + q < n_rows) {
+                    const int k = k_base + q;
+                    const char * row = k < R ? wd + (int64_t) k*sd : wi + (int64_t) (k - R)*si;
+                    const uint2 * rp = (const uint2 *) (row + (int64_t) j0*2);
+                    v = rp[g*WARP_SIZE + lane];
+                }
+            } else {
+                v = w[q][g];
+            }
+            wf[q][0] = hcf_bf16_lo(v.x);
+            wf[q][1] = hcf_bf16_hi(v.x);
+            wf[q][2] = hcf_bf16_lo(v.y);
+            wf[q][3] = hcf_bf16_hi(v.y);
         }
 #pragma unroll
         for (int t = 0; t < T; ++t) {
@@ -232,25 +573,50 @@ hcf_down_partial(
     constexpr int hc = 4;
     const int cps = n_embd/HCF_CHUNK;  // chunks per stream
     const float * ssq_rb = ssq + (int64_t) blockIdx.x*n_chunks*T;
-    if (threadIdx.x < hc*T) {
-        const int s = threadIdx.x / T;
-        const int t = threadIdx.x % T;
-        float sq = 0.0f;
-        for (int cc = 0; cc < cps; ++cc) {
-            sq += __ldcg(ssq_rb + (s*cps + cc)*T + t);
+    float r_warp[hc] = {};
+    if constexpr (WARP_FINISH) {
+#pragma unroll
+        for (int s = 0; s < hc; ++s) {
+            if (lane < T) {
+                float sq = 0.0f;
+                for (int cc = 0; cc < cps; ++cc) {
+                    sq += __ldcg(ssq_rb + (s*cps + cc)*T + lane);
+                }
+                r_warp[s] = rsqrtf(sq/n_embd + eps);
+                if (blockIdx.x == 0 && warp == 0) {
+                    dst[n_rows*T + lane*hc + s] = r_warp[s];
+                }
+            }
         }
-        const float rv = rsqrtf(sq/n_embd + eps);
-        rr[s][t] = rv;
-        if (blockIdx.x == 0) {
-            dst[n_rows*T + t*hc + s] = rv;
+    } else {
+        if (threadIdx.x < hc*T) {
+            const int s = threadIdx.x / T;
+            const int t = threadIdx.x % T;
+            float sq = 0.0f;
+            for (int cc = 0; cc < cps; ++cc) {
+                sq += __ldcg(ssq_rb + (s*cps + cc)*T + t);
+            }
+            const float rv = rsqrtf(sq/n_embd + eps);
+            rr[s][t] = rv;
+            if (blockIdx.x == 0) {
+                dst[n_rows*T + t*hc + s] = rv;
+            }
         }
+        __syncthreads();
     }
-    __syncthreads();
 
-    for (int o = threadIdx.x; o < (HCF_DOWN_WARPS*HCF_DOWN_ROWS)*T; o += blockDim.x) {
+    for (int base = 0; base < (HCF_DOWN_WARPS*HCF_DOWN_ROWS)*T; base += blockDim.x) {
+        const int o = base + threadIdx.x;
         const int k = blockIdx.x*(HCF_DOWN_WARPS*HCF_DOWN_ROWS) + o / T;
         const int t = o % T;
-        if (k >= n_rows) {
+        float r_token[hc];
+        if constexpr (WARP_FINISH) {
+#pragma unroll
+            for (int s = 0; s < hc; ++s) {
+                r_token[s] = __shfl_sync(0xffffffff, r_warp[s], t, WARP_SIZE);
+            }
+        }
+        if (o >= (HCF_DOWN_WARPS*HCF_DOWN_ROWS)*T || k >= n_rows) {
             continue;
         }
         float v = 0.0f;
@@ -261,7 +627,11 @@ hcf_down_partial(
             for (int cc = 0; cc < cps; ++cc) {
                 part += __ldcg(P + ((int64_t) (s*cps + cc)*n_rows + k)*T + t);
             }
-            v += rr[s][t] * part;
+            if constexpr (WARP_FINISH) {
+                v += r_token[s] * part;
+            } else {
+                v += rr[s][t] * part;
+            }
         }
         if (k < R) {
             const float a = lo_scale*v;
@@ -365,7 +735,7 @@ static __device__ __forceinline__ void hcf_up_q8_block(const float xi, block_q8_
     y->ds = make_half2(d, d * sum);
 }
 
-template <int T, int Q = 0, int W = HCF_UP_WARPS>
+template <int T, int Q = 0, int W = HCF_UP_WARPS, int PRE = HCF_UP_PRE>
 static __global__ void __launch_bounds__(W*WARP_SIZE, 32/W)
 hcf_up_gate(
         const float * __restrict__ x, const float * __restrict__ wn,
@@ -388,9 +758,9 @@ hcf_up_gate(
     const uint4 * rp = (const uint4 * ) (wu + (int64_t) j*su);
     const int n_it = R/64;  // uint4 (8 values) per lane per pass, 8 lanes per row
 
-    uint4 wv[HCF_UP_PRE];
+    uint4 wv[PRE];
 #pragma unroll
-    for (int it = 0; it < HCF_UP_PRE; ++it) {
+    for (int it = 0; it < PRE; ++it) {
         wv[it] = (live && it < n_it) ? rp[it*8 + l8] : make_uint4(0, 0, 0, 0);
     }
     float xn[T];
@@ -424,7 +794,7 @@ hcf_up_gate(
             break;
         }
         const int    u  = it*8 + l8;
-        const uint4  q  = it < HCF_UP_PRE ? wv[it < HCF_UP_PRE ? it : 0] : rp[u];
+        const uint4  q  = it < PRE ? wv[it < PRE ? it : 0] : rp[u];
         const float  w0 = hcf_bf16_lo(q.x), w1 = hcf_bf16_hi(q.x), w2 = hcf_bf16_lo(q.y), w3 = hcf_bf16_hi(q.y);
         const float  w4 = hcf_bf16_lo(q.z), w5 = hcf_bf16_hi(q.z), w6 = hcf_bf16_lo(q.w), w7 = hcf_bf16_hi(q.w);
 #pragma unroll
@@ -486,12 +856,15 @@ hcf_up_gate(
 static bool hcf_common_supported(const ggml_tensor * x, const ggml_tensor * wn) {
     return x->type == GGML_TYPE_F32 && wn->type == GGML_TYPE_F32 &&
         ggml_is_contiguous(x) && ggml_is_contiguous(wn) &&
+        x->view_offs % 16 == 0 && wn->view_offs % 16 == 0 &&
+        ((uintptr_t) x->data) % 16 == 0 && ((uintptr_t) wn->data) % 16 == 0 &&
         x->ne[1] == 4 && x->ne[2] >= 1 && x->ne[2] <= HCF_MAX_T && x->ne[3] == 1 &&
         x->ne[0] % HCF_CHUNK == 0;
 }
 
 static bool hcf_weight_ok(const ggml_tensor * w) {
     return w->type == GGML_TYPE_BF16 && w->nb[0] == 2 && w->nb[1] % 16 == 0 &&
+        w->view_offs % 16 == 0 &&
         ((uintptr_t) w->data) % 16 == 0;
 }
 
@@ -510,11 +883,15 @@ bool ggml_cuda_dsv4_hc_up_supported(const ggml_tensor * op) {
         wu->ne[0] <= 64*HCF_UP_MAX_IT;
 }
 
+static bool hcf_fused_finish_enabled() {
+    static const bool fuse = [] { const char * e = getenv("GGML_CUDA_HC_FUSED_FINISH"); return !e || atoi(e) != 0; }();
+    return fuse;
+}
+
 // [HCFUSED v2] arrival-counter slot for this backend context (-1: none left, or GGML_CUDA_HC_FUSED_FINISH=0,
 // which keeps the separate finish kernel)
 static int hcf_cnt_slot(const ggml_backend_cuda_context & ctx) {
-    static const bool fuse = [] { const char * e = getenv("GGML_CUDA_HC_FUSED_FINISH"); return !e || atoi(e) != 0; }();
-    if (!fuse) {
+    if (!hcf_fused_finish_enabled()) {
         return -1;
     }
     static std::mutex mtx;
@@ -529,6 +906,20 @@ static int hcf_cnt_slot(const ggml_backend_cuda_context & ctx) {
     if (next < HCF_CNT_SLOTS) {
         slot = next++;
     }
+    slots[&ctx] = slot;
+    return slot;
+}
+
+static int hcf_owner_cnt_slot(const ggml_backend_cuda_context & ctx) {
+    static std::mutex mtx;
+    static std::unordered_map<const void *, int> slots;
+    static int next = 0;
+    std::lock_guard<std::mutex> lock(mtx);
+    const auto it = slots.find(&ctx);
+    if (it != slots.end()) {
+        return it->second;
+    }
+    const int slot = next < HCF_CNT_SLOTS ? next++ : -1;
     slots[&ctx] = slot;
     return slot;
 }
@@ -550,29 +941,11 @@ static void hcf_down_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, 
     const int hc_dim   = hc*n_embd;
     const int R        = (int) wd->ne[1];
     const int n_rows   = R + hc_inj;
-    const int n_chunks = hc_dim/HCF_CHUNK;
-    // rows per warp: 4 by default; LLAMA_HC_DOWN_ROWS=2|1 launches 2x|4x as many CTAs (the same per-row sums in the
-    // same order, so the result is bit-identical). The counter slots hold 64 row blocks, so a larger count falls back.
-    static const int rows_env = [] {
-        const char * e = getenv("LLAMA_HC_DOWN_ROWS");
-        const int v = e ? atoi(e) : HCF_DOWN_ROWS_DEF;
-        return v == 1 || v == 2 ? v : HCF_DOWN_ROWS_DEF;
-    }();
-    const int rows_pw = (n_rows + HCF_DOWN_WARPS*rows_env - 1)/(HCF_DOWN_WARPS*rows_env) <= HCF_CNT_RB ? rows_env : HCF_DOWN_ROWS_DEF;
-    const int n_rb     = (n_rows + HCF_DOWN_WARPS*rows_pw - 1)/(HCF_DOWN_WARPS*rows_pw);
-
     GGML_ASSERT(((uintptr_t) x->data) % 16 == 0 && ((uintptr_t) wn->data) % 16 == 0);
     GGML_ASSERT(hc == 4);
 
     cudaStream_t stream = ctx.stream();
 
-    const int slot    = n_rb <= HCF_CNT_RB ? hcf_cnt_slot(ctx) : -1;
-    const int cnt_off = slot >= 0 ? slot*HCF_CNT_RB : -1;
-
-    ggml_cuda_pool_alloc<float> P(ctx.pool(), (size_t) n_chunks*n_rows*T);
-    ggml_cuda_pool_alloc<float> ssq(ctx.pool(), (size_t) (cnt_off >= 0 ? n_rb : 1)*n_chunks*T);
-
-    const dim3 grid(n_rb, n_chunks, 1);
     hcf_post_fold pf = {};
     if (hpost != nullptr) {
         pf.blk  = (const float *) hpost->src[0]->data;
@@ -584,20 +957,203 @@ static void hcf_down_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, 
         pf.sp1  = hpost->src[2]->nb[1]/sizeof(float);
         GGML_ASSERT(pf.h == x->data);
     }
-    auto kernel = hpost != nullptr ?
-        (rows_pw == 1 ? hcf_down_partial<T, true, 1> : rows_pw == 2 ? hcf_down_partial<T, true, 2> : hcf_down_partial<T, true, HCF_DOWN_ROWS_DEF>) :
-        (rows_pw == 1 ? hcf_down_partial<T, false, 1> : rows_pw == 2 ? hcf_down_partial<T, false, 2> : hcf_down_partial<T, false, HCF_DOWN_ROWS_DEF>);
-    kernel<<<grid, HCF_DOWN_WARPS*WARP_SIZE, 0, stream>>>(
-        (const float *) x->data, (const float *) wn->data,
-        (const char *) wd->data, wd->nb[1],
-        wi ? (const char *) wi->data : nullptr, wi ? wi->nb[1] : 0,
-        R, n_rows, hc_dim, P.get(), ssq.get(),
-        cnt_off, n_embd, eps, lo_scale, inj_scale, (float *) dst->data, pf);
+    static const bool row_owner = [] {
+        const char * e = getenv("LLAMA_HC_DOWN_ROW_OWNER");
+        return e && atoi(e) == 1;
+    }();
+    // Full rows do not use arrival counters or consume a counter slot.
+    if (row_owner && hcf_fused_finish_enabled() && n_embd % 256 == 0) {
+        // Four row warps fill more SMs without changing each row's sums.
+        static const int row_warps = [] {
+            const char * e = getenv("LLAMA_HC_DOWN_ROW_WARPS");
+            return e && atoi(e) == 4 ? 4 : 8;
+        }();
+        static const bool row_lookahead = [] {
+            const char * e = getenv("LLAMA_HC_DOWN_ROW_LOOKAHEAD");
+            return e && atoi(e) == 1;
+        }();
+        ggml_cuda_pool_alloc<float> xn(ctx.pool(), (size_t) T*hc_dim);
+        auto stage = [&](auto fold) {
+            constexpr bool F = decltype(fold)::value;
+            static const bool reported = [=] {
+                fprintf(stderr, "[hc-down-row-owner] T=%d rows=%d embd=%d folded=%d warps=%d lookahead=%d\n", T, n_rows, n_embd, F, row_warps, row_lookahead);
+                return true;
+            }();
+            GGML_UNUSED(reported);
+            hcf_row_owner_stage<F><<<dim3(4, T), 256, 0, stream>>>((const float *) x->data, (const float *) wn->data,
+                    n_embd, n_rows, T, eps, xn.get(), (float *) dst->data, pf);
+            CUDA_CHECK(cudaGetLastError());
+        };
+        if (hpost != nullptr) {
+            stage(std::true_type{});
+        } else {
+            stage(std::false_type{});
+        }
+        auto rows = [&](auto lookahead) {
+            constexpr bool L = decltype(lookahead)::value;
+            hcf_down_row_owner<T, L><<<(n_rows + row_warps - 1)/row_warps, 32*row_warps, 0, stream>>>(xn.get(),
+                    (const char *) wd->data, wd->nb[1], wi ? (const char *) wi->data : nullptr, wi ? wi->nb[1] : 0,
+                    R, n_rows, n_embd, lo_scale, inj_scale, (float *) dst->data);
+            CUDA_CHECK(cudaGetLastError());
+        };
+        if (row_lookahead) {
+            rows(std::true_type{});
+        } else {
+            rows(std::false_type{});
+        }
+        static const bool dump_test = getenv("GGML_TEST_HCF_DOWN_DUMP") != nullptr;
+        if (dump_test) {
+            fprintf(stderr, "[hc-down-row-case] embd=%d rank=%d T=%d inj=%d folded=%d warps=%d lookahead=%d\n",
+                    n_embd, R, T, hc_inj != 0, hpost != nullptr, row_warps, row_lookahead);
+        }
+        return;
+    }
+    // rows per warp: 4 by default; LLAMA_HC_DOWN_ROWS=2|1 launches 2x|4x as many CTAs (the same per-row sums in the
+    // same order, so the result is bit-identical). The counter slots hold 64 row blocks, so a larger count falls back.
+    static const int rows_env = [] {
+        const char * e = getenv("LLAMA_HC_DOWN_ROWS");
+        const int v = e ? atoi(e) : HCF_DOWN_ROWS_DEF;
+        return v == 1 || v == 2 ? v : HCF_DOWN_ROWS_DEF;
+    }();
+    static const bool warp_finish = [] {
+        const char * e = getenv("LLAMA_HC_DOWN_WARP_FINISH");
+        return e && atoi(e) == 1;
+    }();
+    // Keep one weight group live across activation staging; fetch the rest at use.
+    static const bool late_weights = [] {
+        const char * e = getenv("LLAMA_HC_DOWN_LATE_WEIGHTS");
+        return e && atoi(e) == 1;
+    }();
+    static const int warps_env = [] {
+        const char * e = getenv("LLAMA_HC_DOWN_WARPS");
+        return e && atoi(e) == 4 ? 4 : HCF_DOWN_WARPS_DEF;
+    }();
+    const int down_w = warps_env;
+
+    const int n_chunks = hc_dim/HCF_CHUNK;
+    const int rows_pw = (n_rows + down_w*rows_env - 1)/(down_w*rows_env) <= HCF_CNT_RB ? rows_env : HCF_DOWN_ROWS_DEF;
+    const int n_rb     = (n_rows + down_w*rows_pw - 1)/(down_w*rows_pw);
+    const int slot    = n_rb <= HCF_CNT_RB ? hcf_cnt_slot(ctx) : -1;
+    const int cnt_off = slot >= 0 ? slot*HCF_CNT_RB : -1;
+    static const bool owner = [] {
+        const char * e = getenv("LLAMA_HC_DOWN_OWNER");
+        return e && atoi(e) == 1;
+    }();
+    if (owner && slot >= 0 && n_rows <= HCF_OWNER_MAX_ROWS && n_embd % 256 == 0) {
+        static const bool owner_lookahead = [] {
+            const char * e = getenv("LLAMA_HC_DOWN_OWNER_LOOKAHEAD");
+            return e && atoi(e) == 1;
+        }();
+        static const bool owner_pack = [] {
+            const char * e = getenv("LLAMA_HC_DOWN_OWNER_PACK");
+            return e && atoi(e) == 1;
+        }();
+        static const bool owner_finish8 = [] {
+            const char * e = getenv("LLAMA_HC_DOWN_OWNER_FINISH8");
+            return e && atoi(e) == 1;
+        }();
+        static const int owner_stripes = [] {
+            const char * e = getenv("LLAMA_HC_DOWN_OWNER_STRIPES");
+            return e && atoi(e) == 8 ? 8 : 4;
+        }();
+        static const bool owner_stream_stage = [] {
+            const char * e = getenv("LLAMA_HC_DOWN_OWNER_STREAM_STAGE");
+            return e && atoi(e) == 1;
+        }();
+        const int owner_rb = (n_rows + HCF_OWNER_ROWS - 1)/HCF_OWNER_ROWS;
+        const size_t owner_smem = (size_t) T*n_embd*sizeof(float)*4/owner_stripes;
+        const size_t owner_static = (5*T*4 + 1)*sizeof(float);
+        const size_t owner_limit = std::min<size_t>(81920, ggml_cuda_info().devices[ctx.device].smpbo > owner_static ?
+                ggml_cuda_info().devices[ctx.device].smpbo - owner_static : 0);
+        // A disabled fused finish or exhausted slot table keeps the original two-kernel fallback.
+        const int owner_slot = owner_smem <= owner_limit ? hcf_owner_cnt_slot(ctx) : -1;
+        if (owner_slot >= 0) {
+            auto select = [&](auto fold, auto lookahead, auto pack, auto stripes, auto stage) {
+                constexpr bool F = decltype(fold)::value;
+                constexpr bool L = decltype(lookahead)::value;
+                constexpr bool P = decltype(pack)::value;
+                constexpr int S = decltype(stripes)::value;
+                constexpr bool SS = decltype(stage)::value;
+                auto k = hcf_down_owner<T, F, L, P, S, SS>;
+                CUDA_SET_SHARED_MEMORY_LIMIT(k, owner_limit);
+                static const bool reported = [=] {
+                    fprintf(stderr, "[hc-down-owner] T=%d rows=%d embd=%d smem=%zu folded=%d lookahead=%d pack=%d finish8=%d stripes=%d stream_stage=%d\n",
+                            T, n_rows, n_embd, owner_smem, F, L, P, P && owner_finish8, S, SS);
+                    return true;
+                }();
+                GGML_UNUSED(reported);
+                return k;
+            };
+            auto select_stage = [&](auto fold, auto lookahead, auto pack, auto stripes) {
+                return owner_stream_stage ? select(fold, lookahead, pack, stripes, std::true_type{}) :
+                        select(fold, lookahead, pack, stripes, std::false_type{});
+            };
+            auto select_stripes = [&](auto fold, auto lookahead, auto pack) {
+                return owner_stripes == 8 ? select_stage(fold, lookahead, pack, std::integral_constant<int, 8>{}) :
+                        select_stage(fold, lookahead, pack, std::integral_constant<int, 4>{});
+            };
+            auto select_pack = [&](auto fold, auto lookahead) {
+                return owner_pack ? select_stripes(fold, lookahead, std::true_type{}) : select_stripes(fold, lookahead, std::false_type{});
+            };
+            auto kernel = hpost != nullptr ?
+                    (owner_lookahead ? select_pack(std::true_type{}, std::true_type{}) : select_pack(std::true_type{}, std::false_type{})) :
+                    (owner_lookahead ? select_pack(std::false_type{}, std::true_type{}) : select_pack(std::false_type{}, std::false_type{}));
+            // Sum each eight-lane row group before the global store to cut the partial count by eight.
+            ggml_cuda_pool_alloc<float> partial(ctx.pool(), (size_t) 4*T*n_rows*owner_stripes*(owner_pack ? 1 : 8));
+            ggml_cuda_pool_alloc<float> sq(ctx.pool(), (size_t) owner_rb*owner_stripes*T*4);
+            kernel<<<dim3(owner_rb, owner_stripes), 128, owner_smem, stream>>>(
+                (const float *) x->data, (const float *) wn->data,
+                (const char *) wd->data, wd->nb[1], wi ? (const char *) wi->data : nullptr, wi ? wi->nb[1] : 0,
+                R, n_rows, n_embd, eps, lo_scale, inj_scale, partial.get(), sq.get(), owner_slot*HCF_OWNER_RB,
+                (float *) dst->data, pf, owner_finish8);
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
+    }
+    ggml_cuda_pool_alloc<float> P(ctx.pool(), (size_t) n_chunks*n_rows*T);
+    ggml_cuda_pool_alloc<float> ssq(ctx.pool(), (size_t) (cnt_off >= 0 ? n_rb : 1)*n_chunks*T);
+    const dim3 grid(n_rb, n_chunks, 1);
+    auto launch = [&](auto finish, auto late, auto warps) {
+        constexpr bool WF = decltype(finish)::value;
+        constexpr bool LW = decltype(late)::value;
+        constexpr int NW = decltype(warps)::value;
+        auto kernel = hpost != nullptr ?
+            (rows_pw == 1 ? hcf_down_partial<T, true, 1, WF, LW, NW> : rows_pw == 2 ? hcf_down_partial<T, true, 2, WF, LW, NW> : hcf_down_partial<T, true, HCF_DOWN_ROWS_DEF, WF, LW, NW>) :
+            (rows_pw == 1 ? hcf_down_partial<T, false, 1, WF, LW, NW> : rows_pw == 2 ? hcf_down_partial<T, false, 2, WF, LW, NW> : hcf_down_partial<T, false, HCF_DOWN_ROWS_DEF, WF, LW, NW>);
+        kernel<<<grid, NW*WARP_SIZE, 0, stream>>>(
+            (const float *) x->data, (const float *) wn->data,
+            (const char *) wd->data, wd->nb[1],
+            wi ? (const char *) wi->data : nullptr, wi ? wi->nb[1] : 0,
+            R, n_rows, hc_dim, P.get(), ssq.get(),
+            cnt_off, n_embd, eps, lo_scale, inj_scale, (float *) dst->data, pf);
+        CUDA_CHECK(cudaGetLastError());
+    };
+    auto launch_warps = [&](auto finish, auto late) {
+        if (down_w == 4) {
+            launch(finish, late, std::integral_constant<int, 4>{});
+        } else {
+            launch(finish, late, std::integral_constant<int, HCF_DOWN_WARPS_DEF>{});
+        }
+    };
+    if (late_weights) {
+        if (warp_finish) {
+            launch_warps(std::true_type{}, std::true_type{});
+        } else {
+            launch_warps(std::false_type{}, std::true_type{});
+        }
+    } else {
+        if (warp_finish) {
+            launch_warps(std::true_type{}, std::false_type{});
+        } else {
+            launch_warps(std::false_type{}, std::false_type{});
+        }
+    }
 
     if (cnt_off < 0) {
         const int n_out = (n_rows + hc)*T;
         hcf_down_finish<<<(n_out + 255)/256, 256, 0, stream>>>(
             P.get(), ssq.get(), T, R, hc_inj, hc, n_embd, eps, lo_scale, inj_scale, (float *) dst->data);
+        CUDA_CHECK(cudaGetLastError());
     }
 }
 
@@ -616,8 +1172,8 @@ static int hcf_up_cnt_slot(const ggml_backend_cuda_context & ctx) {
     return slot;
 }
 
-template <int T>
-static void hcf_up_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, void * q8, bool swizzle) {
+template <int T, int PRE>
+static void hcf_up_launch_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst, void * q8, bool swizzle) {
     const ggml_tensor * x    = dst->src[0];
     const ggml_tensor * wn   = dst->src[1];
     const ggml_tensor * down = dst->src[2];
@@ -648,7 +1204,7 @@ static void hcf_up_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, vo
     const dim3 grid((n_embd + up_w - 1)/up_w);
     const dim3 block(up_w*WARP_SIZE);
     if (q8 == nullptr) {
-        auto kernel = up_w == 4 ? hcf_up_gate<T, 0, 4> : up_w == 8 ? hcf_up_gate<T, 0, 8> : hcf_up_gate<T, 0, HCF_UP_WARPS>;
+        auto kernel = up_w == 4 ? hcf_up_gate<T, 0, 4, PRE> : up_w == 8 ? hcf_up_gate<T, 0, 8, PRE> : hcf_up_gate<T, 0, HCF_UP_WARPS, PRE>;
         kernel<<<grid, block, smem, ctx.stream()>>>(
             (const float *) x->data, (const float *) wn->data, act, r,
             (const char *) wu->data, wu->nb[1], n_embd, R, out_scale, (float *) dst->data, nullptr, 0);
@@ -656,11 +1212,26 @@ static void hcf_up_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, vo
         const int slot = hcf_up_cnt_slot(ctx);
         GGML_ASSERT(slot >= 0 && n_embd % QK8_1 == 0 && n_embd/QK8_1 <= HCF_UP_CNT);
         auto kernel = swizzle ?
-            (up_w == 4 ? hcf_up_gate<T, 2, 4> : up_w == 8 ? hcf_up_gate<T, 2, 8> : hcf_up_gate<T, 2, HCF_UP_WARPS>) :
-            (up_w == 4 ? hcf_up_gate<T, 1, 4> : up_w == 8 ? hcf_up_gate<T, 1, 8> : hcf_up_gate<T, 1, HCF_UP_WARPS>);
+            (up_w == 4 ? hcf_up_gate<T, 2, 4, PRE> : up_w == 8 ? hcf_up_gate<T, 2, 8, PRE> : hcf_up_gate<T, 2, HCF_UP_WARPS, PRE>) :
+            (up_w == 4 ? hcf_up_gate<T, 1, 4, PRE> : up_w == 8 ? hcf_up_gate<T, 1, 8, PRE> : hcf_up_gate<T, 1, HCF_UP_WARPS, PRE>);
         kernel<<<grid, block, smem, ctx.stream()>>>(
             (const float *) x->data, (const float *) wn->data, act, r,
             (const char *) wu->data, wu->nb[1], n_embd, R, out_scale, (float *) dst->data, (block_q8_1 *) q8, slot*HCF_UP_CNT);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+template <int T>
+static void hcf_up_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, void * q8, bool swizzle) {
+    // Fewer early weight loads use fewer registers; the dot products keep their order.
+    static const bool preload_two = [] {
+        const char * e = getenv("LLAMA_HC_UP_PRELOAD");
+        return e != nullptr && atoi(e) == 2;
+    }();
+    if (preload_two) {
+        hcf_up_launch_impl<T, 2>(ctx, dst, q8, swizzle);
+    } else {
+        hcf_up_launch_impl<T, HCF_UP_PRE>(ctx, dst, q8, swizzle);
     }
 }
 
