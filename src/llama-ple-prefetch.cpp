@@ -99,6 +99,7 @@ std::unique_ptr<llama_ple_prefetch> llama_ple_prefetch::create(const llama_model
     pf->model     = &model;
     pf->ple       = t;
     pf->n_threads = (int) std::min<int64_t>(n_thr, 512);
+    pf->batch_runs = (size_t) std::min<int64_t>(64, std::max<int64_t>(1, ple_pf_env("LLAMA_PLE_PF_BATCH_RUNS", 1)));
     // fork: a cold table (evicted by another process, first prompt after boot) is bound by disk queue depth, not by
     // the readers' CPU; LLAMA_PLE_PF_COLD_THREADS=0 keeps n_threads in every case
     pf->n_cold    = (int) std::min<int64_t>(std::max<int64_t>(0, ple_pf_env("LLAMA_PLE_PF_COLD_THREADS", PLE_PF_DEFAULT_COLD)), 512);
@@ -418,8 +419,14 @@ double llama_ple_prefetch::resident_fraction(const std::vector<uint64_t> & keys,
 int64_t llama_ple_prefetch::reader() {
     std::vector<char> buf(use_pread && !use_advise ? (size_t) RUN_MAX*4096 : 0);
     int64_t t_last = 0;
+    int64_t pages_read = 0;
+    size_t next = 0, end = 0;
     for (;;) {
-        const size_t i = cursor.fetch_add(1);
+        if (next == end) {
+            next = cursor.fetch_add(batch_runs);
+            end = next + batch_runs;
+        }
+        const size_t i = next++;
         if (!run_ready(i)) {
             std::unique_lock<std::mutex> lk(mtx);
             cv_work.wait(lk, [&]() { return run_ready(i); });
@@ -444,12 +451,19 @@ int64_t llama_ple_prefetch::reader() {
             }
             GGML_UNUSED(sink);
         }
-        n_read.fetch_add(run_len[i], std::memory_order_relaxed);
+        if (batch_runs == 1) {
+            n_read.fetch_add(run_len[i], std::memory_order_relaxed);
+        } else {
+            pages_read += run_len[i];
+        }
         t_last = ggml_time_us();
         if (remaining[run_chunk[i]].fetch_sub(1) == 1) {
             std::lock_guard<std::mutex> lk(mtx);
             cv_done.notify_all();
         }
+    }
+    if (batch_runs > 1) {
+        n_read.fetch_add(pages_read, std::memory_order_relaxed);
     }
     return t_last;
 }

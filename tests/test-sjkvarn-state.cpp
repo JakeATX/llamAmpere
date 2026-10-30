@@ -1087,7 +1087,7 @@ static void deferred_mask_capacity_case() {
     printf("OK: 64 pending masks preserved, 65th falls back, all host mask bytes exact\n");
 }
 
-static void ple_hash_pages_case() {
+static void ple_hash_pages_case(bool windowed = false) {
 #if defined(__linux__)
     for (uint32_t n_gram : { 4, 8 }) {
         for (llama_pos pos0 : { 0, 23 }) {
@@ -1148,15 +1148,23 @@ static void ple_hash_pages_case() {
             setenv("LLAMA_PLE_PREFETCH", "2", 1);
             setenv("LLAMA_PLE_PF_MIN", "1", 1);
             setenv("LLAMA_PLE_PF_MODE", "fault", 1);
-            setenv("LLAMA_PLE_PF_AHEAD", "1000000", 1);
+            setenv("LLAMA_PLE_PF_AHEAD", windowed ? "0" : "1000000", 1);
             setenv("LLAMA_PLE_PF_COLD_THREADS", "0", 1);
-            auto pf = llama_ple_prefetch::create(*model, 256);
+            auto pf = llama_ple_prefetch::create(*model, windowed ? 1 : 256);
             require(pf != nullptr, "hash page prefetch created");
             pf->hint(tokens.data(), tokens.size(), pos0);
-            for (size_t i = 0; i < n_tokens; i += 256) {
-                require(pf->consume(std::min<size_t>(256, n_tokens - i), nullptr, 0), "hash page chunk consumed");
+            const size_t consume_size = windowed ? 113 : 256;
+            for (size_t i = 0; i < n_tokens; i += consume_size) {
+                require(pf->consume(std::min(consume_size, n_tokens - i), nullptr, 0), "hash page chunk consumed");
             }
+            std::string summary;
+            llama_log_set([](ggml_log_level, const char * text, void * data) {
+                if (strstr(text, "[PLEPF]") && strstr(text, " tokens: ")) {
+                    *static_cast<std::string *>(data) = text;
+                }
+            }, &summary);
             pf->stop();
+            llama_log_set(nullptr, nullptr);
             require(mincore(pages, size, resident.data()) == 0, "hash page residency");
             size_t n_expected = 0;
             for (size_t r = 0; r < n_rows; ++r) {
@@ -1164,6 +1172,10 @@ static void ple_hash_pages_case() {
                 n_expected += expected[r];
             }
             require(n_expected > 0 && n_expected < n_rows, "hash test checks touched and untouched pages");
+            const char * read_at = strstr(summary.c_str(), " ms, ");
+            long long pages_read = -1;
+            require(read_at && sscanf(read_at, " ms, %lld read", &pages_read) == 1, "prefetch page total logged");
+            require(pages_read == (long long) n_expected, "every unique page counted once after readers join");
             pf.reset();
             model.reset();
             ggml_backend_buffer_free(table->buffer);
@@ -1172,6 +1184,9 @@ static void ple_hash_pages_case() {
         }
     }
     printf("OK: incremental 4/8-gram hashes match exact page sets across heads, EOS and call offsets\n");
+    if (windowed) {
+        printf("OK: batched page readers preserve exact pages and totals across short windows and a partial final batch\n");
+    }
 #else
     printf("SKIP: hash page test needs Linux\n");
 #endif
@@ -1321,9 +1336,9 @@ static void ple_cold_recheck_case() {
 }
 
 int main(int argc, char ** argv) {
-    if (argc > 1 && strcmp(argv[1], "--ple-hash-pages") == 0) {
+    if (argc > 1 && (strcmp(argv[1], "--ple-hash-pages") == 0 || strcmp(argv[1], "--ple-batch-pages") == 0)) {
         try {
-            ple_hash_pages_case();
+            ple_hash_pages_case(strcmp(argv[1], "--ple-batch-pages") == 0);
             return 0;
         } catch (const std::exception & e) {
             fprintf(stderr, "prefetch hash pages: FAIL: %s\n", e.what());
