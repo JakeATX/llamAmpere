@@ -83,6 +83,8 @@ private:
     bool     verify = false;     // fork: LLAMA_PLE_PF_VERIFY=1 checks each consumed ubatch's pages are still cached
     std::vector<unsigned char> verify_map;   // mincore result over the whole table (one byte per page)
     std::vector<uint64_t>      verify_pages; // pages of the ubatch found evicted
+    bool     verify_sync = false; // fork: LLAMA_PLE_PF_VERIFY=2 reads the evicted pages back before the gather
+    std::vector<std::pair<uint64_t, size_t>> verify_runs; // (first page, page count) of the evicted pages
     int64_t  n_verify_missing = 0;           // pages of the call found evicted at consume time
     int     n_verify_ubatch  = 0;            // ubatches with at least one evicted page
     int64_t  t_verify_us      = 0;

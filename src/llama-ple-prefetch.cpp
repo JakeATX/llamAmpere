@@ -7,6 +7,7 @@
 #include "ggml-backend.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cinttypes>
 #include <cstdio>
@@ -14,6 +15,7 @@
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <thread>
 
 #if defined(__linux__)
 #include <fcntl.h>
@@ -140,6 +142,7 @@ std::unique_ptr<llama_ple_prefetch> llama_ple_prefetch::create(const llama_model
         pf->n_ahead = std::min(pf->n_ahead, cap);
     }
     pf->verify    = ple_pf_env("LLAMA_PLE_PF_VERIFY", 0) > 0;
+    pf->verify_sync = ple_pf_env("LLAMA_PLE_PF_VERIFY", 0) >= 2;
     pf->n_ubatch  = n_ubatch;
     pf->row_size  = t->nb[1];
     pf->n_rows    = (uint64_t) t->ne[1];
@@ -749,13 +752,48 @@ void llama_ple_prefetch::verify_rows(const int32_t * idx, size_t n_idx) {
     }
     if (!verify_pages.empty()) {
         std::sort(verify_pages.begin(), verify_pages.end());
+        verify_runs.clear();
         for (size_t j = 0; j < verify_pages.size();) {
             size_t e = j + 1;
             while (e < verify_pages.size() && verify_pages[e] == verify_pages[e - 1] + 1) {
                 ++e;
             }
-            madvise((void *) (pb + verify_pages[j]*4096), (e - j)*4096, MADV_WILLNEED);
+            if (verify_sync) {
+                verify_runs.emplace_back(verify_pages[j], e - j);
+            } else {
+                madvise((void *) (pb + verify_pages[j]*4096), (e - j)*4096, MADV_WILLNEED);
+            }
             j = e;
+        }
+        if (verify_sync) {
+            // VERIFY=2: read the evicted pages back now on several threads, so the gather does not fault them in one
+            // at a time. Same bytes either way; only the moment they are read changes.
+            const size_t n_runs = verify_runs.size();
+            const size_t n_thr  = std::min<size_t>(n_runs, (size_t) std::max({1, n_threads, n_cold}));
+            std::atomic<size_t> next{0};
+            auto work = [&]() {
+                for (size_t r; (r = next.fetch_add(1, std::memory_order_relaxed)) < n_runs;) {
+                    const uintptr_t a = pb + verify_runs[r].first*4096;
+                    const size_t    n = verify_runs[r].second*4096;
+                    // the first and last listed pages may extend past the table; clip the touch to its bytes
+                    const uintptr_t lo = std::max(a, tb), hi = std::min<uintptr_t>(a + n, tb + n_rows*row_size);
+                    bool done = false;
+#if defined(MADV_POPULATE_READ)
+                    done = madvise((void *) a, n, MADV_POPULATE_READ) == 0;
+#endif
+                    for (uintptr_t q = lo; !done && q < hi; q = (q - q%4096) + 4096) {
+                        (void) *(volatile const unsigned char *) q;
+                    }
+                }
+            };
+            std::vector<std::thread> thr;
+            for (size_t t = 1; t < n_thr; ++t) {
+                thr.emplace_back(work);
+            }
+            work();
+            for (auto & t : thr) {
+                t.join();
+            }
         }
         n_verify_missing += (int64_t) verify_pages.size();
         ++n_verify_ubatch;
@@ -788,8 +826,8 @@ void llama_ple_prefetch::stop() {
             (size_t) n_built.load(), t_build_us.load()/1e3, n_read.load(), t_last_read_us.load()/1e3, n_ubatch_c, t_wait_us/1e3,
             n_readers, n_ubatch_u ? " (some ubatches fell outside the call)" : "", n_map_runs.load(), n_direct_runs.load());
     if (verify) {
-        LLAMA_LOG_CONT("; verify: %" PRId64 " pages evicted before their gather in %d ubatches, re-queued in %.1f ms",
-                n_verify_missing, n_verify_ubatch, t_verify_us/1e3);
+        LLAMA_LOG_CONT("; verify: %" PRId64 " pages evicted before their gather in %d ubatches, %s in %.1f ms",
+                n_verify_missing, n_verify_ubatch, verify_sync ? "read back" : "re-queued", t_verify_us/1e3);
     }
     LLAMA_LOG_CONT("\n");
 
