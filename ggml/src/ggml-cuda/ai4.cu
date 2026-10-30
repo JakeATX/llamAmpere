@@ -391,7 +391,7 @@ static void ai23_launch_mmvr(const uint8_t * W, const int8_t * q, const float * 
     }
     if constexpr (ID && DIRECT && !SINGLE_N) {
         static const bool single_id = ai4_env_int("GGML_CUDA_AI23_MMVR_SINGLE_ID", nullptr, 0) != 0;
-        if (single_id) {
+        if (single_id || idm.direct_zero) {
             ai23_launch_mmvr<LAY, XSH, ID, KT, STAGES, WARPS, MINB, DIRECT, FUSED_X, true>(W, q, s, Y, ldy, M, N, K, stream, idm, max_tiles);
             return;
         }
@@ -1210,6 +1210,9 @@ void ggml_cuda_mul_mat_id_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor
     static const bool fused_x = ai4_env_int("GGML_CUDA_AI23_FUSED_X", nullptr, 0) != 0;
     const int rate = ggml_ai4_rate(src0->type);
     const bool direct = ai4_mmvr_on_id() && (rate == 2 || rate == 3) && n_tok <= direct_max;
+    // fork: one output column per direct block; zero skipped slots in that same kernel.
+    static const bool verify_compact = ai4_env_int("GGML_CUDA_AI23_VERIFY_COMPACT", nullptr, 0) != 0;
+    const bool direct_zero = direct && verify_compact;
     const bool fused = direct && fused_x && n_tok == 1;
     const int xsh = K % 256 == 0 ? 1 : 0;
     ggml_cuda_pool_alloc<int8_t> q(ctx.pool(), (size_t) n_rows*K);
@@ -1234,7 +1237,7 @@ void ggml_cuda_mul_mat_id_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor
     static const bool prompt_zero = ai4_env_int("GGML_CUDA_AI23_ID_ZERO", nullptr, 0) != 0;
     const bool zero_in_helper = !direct && (n_tok <= 8 ||
         (prompt_zero && (rate == 2 || rate == 3) && bn != ai4k::MMV_ID_BN));
-    if (!zero_in_helper) {
+    if (!zero_in_helper && !direct_zero) {
         ai4_zero_skipped(ids, n_used, n_tok, n_expert, M, (float *) dst->data, stream);
     }
     GGML_ASSERT(max_tiles <= 65535);
@@ -1249,6 +1252,7 @@ void ggml_cuda_mul_mat_id_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor
         idm.direct_ne11 = ne11;
         idm.direct_n_expert = n_expert;
         idm.direct_x = fused ? (const float *) src1->data : nullptr;
+        idm.direct_zero = direct_zero;
     } else {
         routing.alloc((size_t) ai4k::ids_helper_ints(n_expert, n_pairs, max_tiles));
         static const bool route_agg = ai4_env_int("GGML_CUDA_AI23_ID_ROUTE_AGG", nullptr, 0) != 0;
