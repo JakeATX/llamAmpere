@@ -7678,6 +7678,9 @@ static bool test_profile_global_plan() {
 }
 
 int main(int argc, char ** argv) {
+    // The ALLOCSIM fixtures expect the opt-in plan refresh and growth step-down (engine default off).
+    if (!getenv("GGML_MOE_CACHE_PLAN_REFRESH")) { set_env("GGML_MOE_CACHE_PLAN_REFRESH", "1"); }
+    if (!getenv("GGML_MOE_CACHE_GROW_STEPDOWN")) { set_env("GGML_MOE_CACHE_GROW_STEPDOWN", "1"); }
     if (argc == 2 && strcmp(argv[1], "--profile-global-plan-only") == 0) {
         return test_profile_global_plan() ? 0 : 1;
     }

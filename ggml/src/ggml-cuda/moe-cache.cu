@@ -2692,7 +2692,9 @@ static bool moe_cache_build_global_profile(moe_cache_session & session, moe_cach
         device.profile_global_bytes = plan.bytes;
     };
     // fork: an unchanged capacity needs new ranks, not a destructive slab rebuild.
-    if (whole_only && resize) {
+    // [ALLOCSIM] opt-in: GGML_MOE_CACHE_PLAN_REFRESH=1 (default off keeps the slab rebuild).
+    static const bool plan_refresh = moe_cache_env_on("GGML_MOE_CACHE_PLAN_REFRESH");
+    if (plan_refresh && whole_only && resize) {
         bool same_capacity = true;
         for (size_t p = 0; p < pending.size(); ++p) {
             const int pool = pending[p]->pool;
@@ -2771,8 +2773,11 @@ static bool moe_cache_build_global_profile(moe_cache_session & session, moe_cach
                 const size_t other = device.allocated_bytes >= current ? device.allocated_bytes - current : 0;
                 const size_t room = other < budget ? budget - other : 0;
                 const size_t target = std::min(plan.slots[p], room / pool.expert_size);
-                if (target >= moe_cache_pool_slots_min) {
-                    // A rejected growth trims by payload bytes, but cudaMalloc pads in whole
+                static const bool grow_stepdown = moe_cache_env_on("GGML_MOE_CACHE_GROW_STEPDOWN");
+                if (target >= moe_cache_pool_slots_min && !grow_stepdown) {
+                    moe_cache_resize_pool(device, pool, (int)target);
+                } else if (target >= moe_cache_pool_slots_min) {
+                    // [ALLOCSIM] opt-in GGML_MOE_CACHE_GROW_STEPDOWN=1. A rejected growth trims by payload bytes, but cudaMalloc pads in whole
                     // chunks, so one retry can land far below the established pool. Step the
                     // target down (never under the slots held before growth) instead.
                     const int held = pool.n_slots;
@@ -5807,7 +5812,9 @@ static int moe_cache_warm(void * opaque, const ggml_moe_cache_tensor_desc * tens
         std::lock_guard<std::mutex> lock(session->mu);
         // A first live-count warm has no saved profile to load. Plan complete bundles
         // from its descriptors too, but preserve an already loaded profile's ranks.
-        if (loading || session->profile_global_tensors.empty() || (observed && session->profile_counts.empty())) {
+        // [ALLOCSIM] GGML_MOE_CACHE_PLAN_REFRESH=1 also replans prompt-only (no saved profile) sessions from live counts.
+        static const bool plan_refresh = moe_cache_env_on("GGML_MOE_CACHE_PLAN_REFRESH");
+        if (loading || session->profile_global_tensors.empty() || (plan_refresh && observed && session->profile_counts.empty())) {
             session->profile_global_tensors.clear();
             session->profile_global_tensors.reserve(n_tensors);
             for (int i = 0; i < n_tensors; ++i) {
@@ -5926,7 +5933,8 @@ static int moe_cache_warm(void * opaque, const ggml_moe_cache_tensor_desc * tens
             if (global_profile) {
                 if (whole_only && !selected.count(key)) { continue; }
                 const auto prior = session->profile_counts.find(key);
-                const uint64_t heat = session->profile_counts.empty() ? counts[i][e] :
+                static const bool plan_refresh = moe_cache_env_on("GGML_MOE_CACHE_PLAN_REFRESH");
+                const uint64_t heat = (plan_refresh && session->profile_counts.empty()) ? counts[i][e] :
                     prior == session->profile_counts.end() ? 0 : prior->second;
                 ranked.push_back({i, e, heat, true, 0, false});
                 continue;
