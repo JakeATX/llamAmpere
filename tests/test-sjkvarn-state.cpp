@@ -1089,7 +1089,7 @@ static void deferred_mask_capacity_case() {
     printf("OK: 64 pending masks preserved, 65th falls back, all host mask bytes exact\n");
 }
 
-static void ple_hash_pages_case(bool windowed = false, bool bounded = false, bool coalesced = false, size_t ubatch_size = 384, bool populate = false) {
+static void ple_hash_pages_case(bool windowed = false, bool bounded = false, bool coalesced = false, size_t ubatch_size = 384, bool populate = false, size_t table_offset = 0) {
 #if defined(__linux__)
     for (uint32_t n_gram : { 4, 8 }) {
         for (llama_pos pos0 : { 0, 23 }) {
@@ -1097,7 +1097,8 @@ static void ple_hash_pages_case(bool windowed = false, bool bounded = false, boo
             const uint32_t n_heads = (n_gram - 1)*per_gram, n_rows = n_heads*vocab;
             const size_t ubatch = coalesced || bounded ? ubatch_size : windowed ? 1 : 256;
             size_t chunk = coalesced ? ubatch : bounded ? std::min<size_t>(256, ubatch) : 256;
-            const size_t n_tokens = 3*chunk + 17, size = (size_t) n_rows*4096;
+            const size_t n_tokens = 3*chunk + 17, n_pages = n_rows + (table_offset != 0), size = n_pages*4096;
+            require(table_offset < 4096 && (coalesced || table_offset == 0), "hash page table offset");
             if (coalesced && !bounded) {
                 chunk = std::max<size_t>(256, n_tokens);
             }
@@ -1123,7 +1124,7 @@ static void ple_hash_pages_case(bool windowed = false, bool bounded = false, boo
             require(pages != MAP_FAILED, "hash page mapping");
             require(madvise(pages, size, MADV_NOHUGEPAGE) == 0, "hash pages stay separate");
             std::unique_ptr<FILE, int(*)(FILE *)> pagemap(populate ? fopen("/proc/self/pagemap", "rb") : nullptr, fclose);
-            std::vector<uint64_t> ptes(populate ? n_rows : 0);
+            std::vector<uint64_t> ptes(populate ? n_pages : 0);
             auto read_ptes = [&]() {
                 require(pagemap != nullptr && pread(fileno(pagemap.get()), ptes.data(), ptes.size()*sizeof(uint64_t),
                         ((uintptr_t) pages/4096)*sizeof(uint64_t)) == (ssize_t) (ptes.size()*sizeof(uint64_t)), "read mapped page presence bits");
@@ -1137,7 +1138,7 @@ static void ple_hash_pages_case(bool windowed = false, bool bounded = false, boo
             ggml_context * ctx = ggml_init({ 1024*1024, nullptr, true });
             require(ctx != nullptr, "hash page context");
             auto * table = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1024, n_rows);
-            table->data = pages;
+            table->data = (char *) pages + table_offset;
             table->buffer = ggml_backend_cpu_buffer_from_ptr(pages, size);
             require(table->buffer != nullptr, "hash page buffer");
             llama_model_ptr model(llama_model_create(LLM_ARCH_QWEN4EXP, llama_model_default_params()));
@@ -1160,14 +1161,14 @@ static void ple_hash_pages_case(bool windowed = false, bool bounded = false, boo
             for (size_t i = 0; i < n_tokens; ++i) {
                 tokens[i] = i % 127 == 0 ? eos : i % 131 == 0 ? LLAMA_TOKEN_NULL : (i*179 + i*i*13) % eos;
             }
-            std::vector<unsigned char> expected(n_rows, 0), resident(n_rows);
+            std::vector<unsigned char> expected(n_pages, 0), resident(n_pages);
             if (coalesced) {
                 require(mincore(pages, size, resident.data()) == 0, "initial coalesced page residency");
                 for (unsigned char page : resident) {
                     require(!(page & 1), "coalesced page file must start cold; set TMPDIR to a disk filesystem");
                 }
             }
-            std::vector<size_t> first_chunk(n_rows, n_tokens);
+            std::vector<size_t> first_chunk(n_pages, n_tokens);
             for (size_t i = 0; i < n_tokens; ++i) {
                 std::vector<llama_token> history(n_gram - 1);
                 for (uint32_t s = 1; s < n_gram; ++s) {
@@ -1206,8 +1207,10 @@ static void ple_hash_pages_case(bool windowed = false, bool bounded = false, boo
                         for (uint32_t k = 0; k < per_gram; ++k) {
                             const uint32_t h = (g - 2)*per_gram + k;
                             const size_t row = hp.ple_head_offsets[h] + mixed % hp.ple_head_vocab_sizes[h];
-                            expected[row] = 1;
-                            first_chunk[row] = std::min(first_chunk[row], i/chunk);
+                            for (size_t page = row; page <= row + (table_offset != 0); ++page) {
+                                expected[page] = 1;
+                                first_chunk[page] = std::min(first_chunk[page], i/chunk);
+                            }
                         }
                     }
                 }
@@ -1220,7 +1223,7 @@ static void ple_hash_pages_case(bool windowed = false, bool bounded = false, boo
                 const size_t gap = bounded ? 0 : 16;
                 for (size_t c = 0; c < (n_tokens + chunk - 1)/chunk; ++c) {
                     size_t start = 0, end = 0;
-                    for (size_t r = 0; r < n_rows; ++r) {
+                    for (size_t r = 0; r < n_pages; ++r) {
                         if (first_chunk[r] != c) { continue; }
                         if (end == 0 || r > end + gap || r - start >= 256) {
                             start = r;
@@ -1260,7 +1263,7 @@ static void ple_hash_pages_case(bool windowed = false, bool bounded = false, boo
                 if (populate) { read_ptes(); }
                 const size_t read_end = std::max(ubatch, i + count) + (bounded && !coalesced ? ubatch : 0);
                 const size_t allowed = (read_end + chunk - 1)/chunk;
-                for (size_t r = 0; r < n_rows; ++r) {
+                for (size_t r = 0; r < n_pages; ++r) {
                     future_checks += expected[r] && first_read[r] >= allowed;
                     require(first_chunk[r] > (i + count - 1)/chunk || (resident[r] & 1), "consume waits for every page of its chunks");
                     require(!populate || first_chunk[r] > (i + count - 1)/chunk || (ptes[r] & (UINT64_C(1) << 63)),
@@ -1280,11 +1283,11 @@ static void ple_hash_pages_case(bool windowed = false, bool bounded = false, boo
             llama_log_set(nullptr, nullptr);
             require(mincore(pages, size, resident.data()) == 0, "hash page residency");
             size_t n_expected = 0;
-            for (size_t r = 0; r < n_rows; ++r) {
+            for (size_t r = 0; r < n_pages; ++r) {
                 require((resident[r] & 1) == (coalesced ? first_read[r] < n_tokens : expected[r]), "hash page set matches independent full hash");
                 n_expected += expected[r];
             }
-            require(n_expected > 0 && n_expected < n_rows, "hash test checks touched and untouched pages");
+            require(n_expected > 0 && n_expected < n_pages, "hash test checks touched and untouched pages");
             require(!coalesced || !bounded || expected_reads == n_expected, "bounded coalescing reads each requested page once without gaps");
             const char * read_at = strstr(summary.c_str(), " ms, ");
             long long pages_read = -1;
@@ -1514,6 +1517,20 @@ static void ple_cold_recheck_case() {
 }
 
 int main(int argc, char ** argv) {
+    if (argc > 1 && strcmp(argv[1], "--ple-populate-unaligned") == 0) {
+        try {
+            for (size_t offset : { 64, 4092 }) {
+                for (size_t chunk : { 384, 128, 1 }) {
+                    ple_hash_pages_case(true, true, true, chunk, true, offset);
+                }
+            }
+            printf("OK: unaligned PLE tables populate exact mapped pages within bounded windows\n");
+            return 0;
+        } catch (const std::exception & e) {
+            fprintf(stderr, "prefetch unaligned populate pages: FAIL: %s\n", e.what());
+            return 1;
+        }
+    }
     if (argc > 1 && strcmp(argv[1], "--ple-populate-pages") == 0) {
         try {
             for (size_t chunk : { 384, 128, 1 }) {

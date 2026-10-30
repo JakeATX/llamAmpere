@@ -564,8 +564,10 @@ int64_t llama_ple_prefetch::reader() {
             }
             if (populate) {
                 // File reads fill the page cache, but the gather also needs mapped page-table entries.
-                for (uint64_t o = 0; o < len && !stopping.load(std::memory_order_relaxed); o += 4096) {
-                    const uint64_t rel = std::max(off + o, file_off) - file_off;
+                const uint64_t first = std::max(off, file_off) - file_off;
+                const uint64_t limit = std::min(off + len, file_off + n_rows*row_size) - file_off;
+                for (uint64_t rel = first; rel < limit && !stopping.load(std::memory_order_relaxed);
+                        rel += 4096 - ((uintptr_t) ple->data + rel)%4096) {
                     (void) *(const volatile char *) ((const char *) ple->data + rel);
                 }
                 if (stopping.load()) {
