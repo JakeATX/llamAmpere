@@ -515,6 +515,7 @@ static __global__ void __launch_bounds__(CAP ? 256 : LOW || BOUNDS ? 384 : 512, 
     const char * xs = xb + ks * (16 * NT * 32);
     float cf[MU][4];
     uint32_t rp[MU];
+    float rs[MU][2];
 #pragma unroll
     for (int u = 0; u < MU; ++u) {
         cf[u][0] = cf[u][1] = cf[u][2] = cf[u][3] = 0.0f;
@@ -542,6 +543,11 @@ static __global__ void __launch_bounds__(CAP ? 256 : LOW || BOUNDS ? 384 : 512, 
                     const uint32_t peer = __shfl_xor_sync(0xffffffffu, rows, 1);
                     rp[0] = __byte_perm(rows, peer, (q & 1) ? 0x1054 : 0x5410);
                     rp[1] = __byte_perm(rows, peer, (q & 1) ? 0x3276 : 0x7632);
+#pragma unroll
+                    for (int u = 0; u < MU; ++u) {
+                        rs[u][0] = __half2float(__ushort_as_half((unsigned short) (rp[u] & 0xFFFFu)));
+                        rs[u][1] = __half2float(__ushort_as_half((unsigned short) (rp[u] >> 16)));
+                    }
                 } else {
 #pragma unroll
                     for (int u = 0; u < MU; ++u) {
@@ -589,8 +595,8 @@ static __global__ void __launch_bounds__(CAP ? 256 : LOW || BOUNDS ? 384 : 512, 
         }
 #pragma unroll
         for (int u = 0; u < MU; ++u) {
-            const float r0 = __half2float(__ushort_as_half((unsigned short) (rp[u] & 0xFFFFu)));
-            const float r1 = __half2float(__ushort_as_half((unsigned short) (rp[u] >> 16)));
+            const float r0 = NEIGHBOR && V == 5 ? rs[u][0] : __half2float(__ushort_as_half((unsigned short) (rp[u] & 0xFFFFu)));
+            const float r1 = NEIGHBOR && V == 5 ? rs[u][1] : __half2float(__ushort_as_half((unsigned short) (rp[u] >> 16)));
             cf[u][0] += s0 * r0 * (float) c[u][0]; cf[u][1] += s1 * r0 * (float) c[u][1];
             cf[u][2] += s0 * r1 * (float) c[u][2]; cf[u][3] += s1 * r1 * (float) c[u][3];
         }
