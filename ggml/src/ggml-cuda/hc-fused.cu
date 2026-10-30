@@ -1036,75 +1036,76 @@ static void hcf_down_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, 
         const char * e = getenv("LLAMA_HC_DOWN_OWNER");
         return e && atoi(e) == 1;
     }();
-    static const bool owner_lookahead = [] {
-        const char * e = getenv("LLAMA_HC_DOWN_OWNER_LOOKAHEAD");
-        return e && atoi(e) == 1;
-    }();
-    static const bool owner_pack = [] {
-        const char * e = getenv("LLAMA_HC_DOWN_OWNER_PACK");
-        return e && atoi(e) == 1;
-    }();
-    static const bool owner_finish8 = [] {
-        const char * e = getenv("LLAMA_HC_DOWN_OWNER_FINISH8");
-        return e && atoi(e) == 1;
-    }();
-    static const int owner_stripes = [] {
-        const char * e = getenv("LLAMA_HC_DOWN_OWNER_STRIPES");
-        return e && atoi(e) == 8 ? 8 : 4;
-    }();
-    static const bool owner_stream_stage = [] {
-        const char * e = getenv("LLAMA_HC_DOWN_OWNER_STREAM_STAGE");
-        return e && atoi(e) == 1;
-    }();
-    const int owner_rb = (n_rows + HCF_OWNER_ROWS - 1)/HCF_OWNER_ROWS;
-    const size_t owner_smem = (size_t) T*n_embd*sizeof(float)*4/owner_stripes;
-    const size_t owner_static = (5*T*4 + 1)*sizeof(float);
-    const size_t owner_limit = std::min<size_t>(81920, ggml_cuda_info().devices[ctx.device].smpbo > owner_static ?
-            ggml_cuda_info().devices[ctx.device].smpbo - owner_static : 0);
-    // A disabled fused finish or exhausted slot table keeps the original two-kernel fallback.
-    const int owner_slot = owner && slot >= 0 && n_rows <= HCF_OWNER_MAX_ROWS && n_embd % 256 == 0 &&
-            owner_smem <= owner_limit ? hcf_owner_cnt_slot(ctx) : -1;
-    if (owner_slot >= 0) {
-        auto select = [&](auto fold, auto lookahead, auto pack, auto stripes, auto stage) {
-            constexpr bool F = decltype(fold)::value;
-            constexpr bool L = decltype(lookahead)::value;
-            constexpr bool P = decltype(pack)::value;
-            constexpr int S = decltype(stripes)::value;
-            constexpr bool SS = decltype(stage)::value;
-            auto k = hcf_down_owner<T, F, L, P, S, SS>;
-            CUDA_SET_SHARED_MEMORY_LIMIT(k, owner_limit);
-            static const bool reported = [=] {
-                fprintf(stderr, "[hc-down-owner] T=%d rows=%d embd=%d smem=%zu folded=%d lookahead=%d pack=%d finish8=%d stripes=%d stream_stage=%d\n",
-                        T, n_rows, n_embd, owner_smem, F, L, P, P && owner_finish8, S, SS);
-                return true;
-            }();
-            GGML_UNUSED(reported);
-            return k;
-        };
-        auto select_stage = [&](auto fold, auto lookahead, auto pack, auto stripes) {
-            return owner_stream_stage ? select(fold, lookahead, pack, stripes, std::true_type{}) :
-                    select(fold, lookahead, pack, stripes, std::false_type{});
-        };
-        auto select_stripes = [&](auto fold, auto lookahead, auto pack) {
-            return owner_stripes == 8 ? select_stage(fold, lookahead, pack, std::integral_constant<int, 8>{}) :
-                    select_stage(fold, lookahead, pack, std::integral_constant<int, 4>{});
-        };
-        auto select_pack = [&](auto fold, auto lookahead) {
-            return owner_pack ? select_stripes(fold, lookahead, std::true_type{}) : select_stripes(fold, lookahead, std::false_type{});
-        };
-        auto kernel = hpost != nullptr ?
-                (owner_lookahead ? select_pack(std::true_type{}, std::true_type{}) : select_pack(std::true_type{}, std::false_type{})) :
-                (owner_lookahead ? select_pack(std::false_type{}, std::true_type{}) : select_pack(std::false_type{}, std::false_type{}));
-        // Sum each eight-lane row group before the global store to cut the partial count by eight.
-        ggml_cuda_pool_alloc<float> partial(ctx.pool(), (size_t) 4*T*n_rows*owner_stripes*(owner_pack ? 1 : 8));
-        ggml_cuda_pool_alloc<float> sq(ctx.pool(), (size_t) owner_rb*owner_stripes*T*4);
-        kernel<<<dim3(owner_rb, owner_stripes), 128, owner_smem, stream>>>(
-            (const float *) x->data, (const float *) wn->data,
-            (const char *) wd->data, wd->nb[1], wi ? (const char *) wi->data : nullptr, wi ? wi->nb[1] : 0,
-            R, n_rows, n_embd, eps, lo_scale, inj_scale, partial.get(), sq.get(), owner_slot*HCF_OWNER_RB,
-            (float *) dst->data, pf, owner_finish8);
-        CUDA_CHECK(cudaGetLastError());
-        return;
+    if (owner && slot >= 0 && n_rows <= HCF_OWNER_MAX_ROWS && n_embd % 256 == 0) {
+        static const bool owner_lookahead = [] {
+            const char * e = getenv("LLAMA_HC_DOWN_OWNER_LOOKAHEAD");
+            return e && atoi(e) == 1;
+        }();
+        static const bool owner_pack = [] {
+            const char * e = getenv("LLAMA_HC_DOWN_OWNER_PACK");
+            return e && atoi(e) == 1;
+        }();
+        static const bool owner_finish8 = [] {
+            const char * e = getenv("LLAMA_HC_DOWN_OWNER_FINISH8");
+            return e && atoi(e) == 1;
+        }();
+        static const int owner_stripes = [] {
+            const char * e = getenv("LLAMA_HC_DOWN_OWNER_STRIPES");
+            return e && atoi(e) == 8 ? 8 : 4;
+        }();
+        static const bool owner_stream_stage = [] {
+            const char * e = getenv("LLAMA_HC_DOWN_OWNER_STREAM_STAGE");
+            return e && atoi(e) == 1;
+        }();
+        const int owner_rb = (n_rows + HCF_OWNER_ROWS - 1)/HCF_OWNER_ROWS;
+        const size_t owner_smem = (size_t) T*n_embd*sizeof(float)*4/owner_stripes;
+        const size_t owner_static = (5*T*4 + 1)*sizeof(float);
+        const size_t owner_limit = std::min<size_t>(81920, ggml_cuda_info().devices[ctx.device].smpbo > owner_static ?
+                ggml_cuda_info().devices[ctx.device].smpbo - owner_static : 0);
+        // A disabled fused finish or exhausted slot table keeps the original two-kernel fallback.
+        const int owner_slot = owner_smem <= owner_limit ? hcf_owner_cnt_slot(ctx) : -1;
+        if (owner_slot >= 0) {
+            auto select = [&](auto fold, auto lookahead, auto pack, auto stripes, auto stage) {
+                constexpr bool F = decltype(fold)::value;
+                constexpr bool L = decltype(lookahead)::value;
+                constexpr bool P = decltype(pack)::value;
+                constexpr int S = decltype(stripes)::value;
+                constexpr bool SS = decltype(stage)::value;
+                auto k = hcf_down_owner<T, F, L, P, S, SS>;
+                CUDA_SET_SHARED_MEMORY_LIMIT(k, owner_limit);
+                static const bool reported = [=] {
+                    fprintf(stderr, "[hc-down-owner] T=%d rows=%d embd=%d smem=%zu folded=%d lookahead=%d pack=%d finish8=%d stripes=%d stream_stage=%d\n",
+                            T, n_rows, n_embd, owner_smem, F, L, P, P && owner_finish8, S, SS);
+                    return true;
+                }();
+                GGML_UNUSED(reported);
+                return k;
+            };
+            auto select_stage = [&](auto fold, auto lookahead, auto pack, auto stripes) {
+                return owner_stream_stage ? select(fold, lookahead, pack, stripes, std::true_type{}) :
+                        select(fold, lookahead, pack, stripes, std::false_type{});
+            };
+            auto select_stripes = [&](auto fold, auto lookahead, auto pack) {
+                return owner_stripes == 8 ? select_stage(fold, lookahead, pack, std::integral_constant<int, 8>{}) :
+                        select_stage(fold, lookahead, pack, std::integral_constant<int, 4>{});
+            };
+            auto select_pack = [&](auto fold, auto lookahead) {
+                return owner_pack ? select_stripes(fold, lookahead, std::true_type{}) : select_stripes(fold, lookahead, std::false_type{});
+            };
+            auto kernel = hpost != nullptr ?
+                    (owner_lookahead ? select_pack(std::true_type{}, std::true_type{}) : select_pack(std::true_type{}, std::false_type{})) :
+                    (owner_lookahead ? select_pack(std::false_type{}, std::true_type{}) : select_pack(std::false_type{}, std::false_type{}));
+            // Sum each eight-lane row group before the global store to cut the partial count by eight.
+            ggml_cuda_pool_alloc<float> partial(ctx.pool(), (size_t) 4*T*n_rows*owner_stripes*(owner_pack ? 1 : 8));
+            ggml_cuda_pool_alloc<float> sq(ctx.pool(), (size_t) owner_rb*owner_stripes*T*4);
+            kernel<<<dim3(owner_rb, owner_stripes), 128, owner_smem, stream>>>(
+                (const float *) x->data, (const float *) wn->data,
+                (const char *) wd->data, wd->nb[1], wi ? (const char *) wi->data : nullptr, wi ? wi->nb[1] : 0,
+                R, n_rows, n_embd, eps, lo_scale, inj_scale, partial.get(), sq.get(), owner_slot*HCF_OWNER_RB,
+                (float *) dst->data, pf, owner_finish8);
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
     }
     ggml_cuda_pool_alloc<float> P(ctx.pool(), (size_t) n_chunks*n_rows*T);
     ggml_cuda_pool_alloc<float> ssq(ctx.pool(), (size_t) (cnt_off >= 0 ? n_rb : 1)*n_chunks*T);
