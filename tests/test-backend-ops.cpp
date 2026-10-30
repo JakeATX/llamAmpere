@@ -1509,6 +1509,7 @@ struct test_case {
                        const char *   op_names_filter,
                        printer *      output_printer) {
         mode = MODE_TEST;
+        sentinels.clear();
 
         ggml_init_params params = {
             /* .mem_size = */ ggml_tensor_overhead()*max_tensors() + ggml_graph_overhead(),
