@@ -391,8 +391,9 @@ std::vector<ggml_backend_buffer_ptr> llama_b1::spare_views(size_t min_bytes, siz
 
 void llama_b1::release_plan() {
     GGML_ASSERT(workers.empty() && !coord.joinable());
-    // fork: retain pageable weights across plans unless release is explicitly enabled.
-    const bool release_kept = b1_env_int("LLAMA_B1_RELEASE_BANK_RAM", 0) != 0;
+    // fork: only an explicit keep request may retain clean pageable bank weights.
+    const bool release_kept = !b1_env_int("LLAMA_B1_KEEP_BANK_RAM", 0) ||
+                              b1_env_int("LLAMA_B1_RELEASE_BANK_RAM", 0) != 0;
     size_t kept_bytes = 0;
     size_t freed_bytes = 0;
     for (size_t ti = 0; ti < exps.size(); ++ti) {
@@ -742,8 +743,8 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
         }
     }
 
-    // fork: keep lent weights across plans; never lend our only live copy to scratch.
-    if (b1_env_int("LLAMA_B1_KEEP_BANK_RAM", 1)) {
+    // fork: opt in to pageable bank copies; the default uses the file and bounded staging.
+    if (b1_env_int("LLAMA_B1_KEEP_BANK_RAM", 0)) {
         size_t kept_bytes = 0;
         for (int il : lent_sel) {
             for (int ti : layers[il].tensors) {
