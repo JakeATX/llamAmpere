@@ -2229,6 +2229,7 @@ std::unique_ptr<llama_moe_arena> llama_model_loader::load_moe_arena(llama_progre
             LLAMA_LOG_WARN("%s: RAM target missed: %.2f GiB MemAvailable after pinning (target 7 GiB, stop below 5 GiB)\n", __func__,
                     llama_moe_arena::available_memory() / double(GiB));
         }
+        arena->report_thp();
         LLAMA_LOG_INFO("%s: %.2f GiB pinned (%s, registration took %.2f s), load+pin %.2f s, gate/up/down grouped by expert, original weight blocks preserved\n",
                 __func__, total / double(GiB), pin_early ? "registered beside the reads" : "registered after the reads", pin_seconds,
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - pin_start).count());
@@ -2315,6 +2316,7 @@ std::unique_ptr<llama_moe_arena> llama_model_loader::load_moe_arena(llama_progre
         LLAMA_LOG_WARN("%s: RAM target missed: %.2f GiB MemAvailable after pinning (target 7 GiB, stop below 5 GiB)\n", __func__,
                 llama_moe_arena::available_memory() / double(GiB));
     }
+    arena->report_thp();
     LLAMA_LOG_INFO("%s: %.2f GiB pinned, gate/up/down grouped by expert, original weight blocks preserved\n", __func__, total / double(GiB));
     return arena;
 }
