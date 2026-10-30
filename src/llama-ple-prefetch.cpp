@@ -337,6 +337,10 @@ void llama_ple_prefetch::build() {
         const int64_t i1 = i0 + (int64_t) std::min<size_t>(n - i0, chunk_size);
         cp.clear();
         for (int64_t i = i0; i < i1; ++i) {
+            // fork: a large coalesced ubatch must not delay stop() until every row is hashed.
+            if (bounded_window && (i - i0) % 64 == 0 && stopping.load(std::memory_order_relaxed)) {
+                break;
+            }
             uint64_t mixed = (uint64_t) toks[i] * hp.ple_layer_multipliers[0];
             bool cut = false;
             for (int64_t s = 1; s < n_gram; ++s) {
@@ -369,6 +373,9 @@ void llama_ple_prefetch::build() {
                     }
                 }
             }
+        }
+        if (bounded_window && stopping.load(std::memory_order_relaxed)) {
+            break;
         }
         std::sort(cp.begin(), cp.end());
         // fork: a hot shared prefix can hide cold pages in the rest of the call.
