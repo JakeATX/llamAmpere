@@ -93,7 +93,7 @@ static __global__ void __launch_bounds__(128) hcf_down_owner(
         const char * __restrict__ wd, const int64_t sd, const char * __restrict__ wi, const int64_t si,
         const int R, const int n_rows, const int n_embd, const float eps, const float lo_scale, const float inj_scale,
         float * __restrict__ partial, float * __restrict__ ssq, const int cnt_off,
-        float * __restrict__ dst, const hcf_post_fold pf, const bool finish8) {
+        float * __restrict__ dst, const hcf_post_fold pf, const bool finish8, const bool stream_stage) {
     extern __shared__ __align__(16) float sh[];
     __shared__ float sq_w[4][T][4];
     __shared__ float rr[T][4];
@@ -105,31 +105,61 @@ static __global__ void __launch_bounds__(128) hcf_down_owner(
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int local = tid & 7, stripe = blockIdx.y, owner = stripe*8 + local;
     const int row = blockIdx.x*HCF_OWNER_ROWS + tid/8;
-    float sq[T][4] = {};
-    for (int i = tid; i < T*(slice/4); i += 128) {
-        const int t = i/(slice/4), j = (i % (slice/4))*4;
-        const int src = (j/TILE)*256 + stripe*TILE + j%TILE;
-        const int s = src/n_embd;
-        float4 xv;
-        if constexpr (FOLD) {
-            xv = hcf_post_val4(pf, t, s, src - s*n_embd, src, hc_dim);
-            if (blockIdx.x == 0) {
-                *(float4 *) (pf.h + (int64_t) t*hc_dim + src) = xv;
+    if (stream_stage) {
+        const int stream_slice = n_embd/STRIPES;
+#pragma unroll
+        for (int t = 0; t < T; ++t) {
+#pragma unroll
+            for (int s = 0; s < 4; ++s) {
+                float sq = 0.0f;
+                for (int j = tid*4; j < stream_slice; j += 128*4) {
+                    const int src = s*n_embd + (j/TILE)*256 + stripe*TILE + j%TILE;
+                    float4 xv;
+                    if constexpr (FOLD) {
+                        xv = hcf_post_val4(pf, t, s, src - s*n_embd, src, hc_dim);
+                        if (blockIdx.x == 0) {
+                            *(float4 *) (pf.h + (int64_t) t*hc_dim + src) = xv;
+                        }
+                    } else {
+                        xv = *(const float4 *) (x + (int64_t) t*hc_dim + src);
+                    }
+                    const float4 gv = *(const float4 *) (wn + src);
+                    sq += xv.x*xv.x + xv.y*xv.y + xv.z*xv.z + xv.w*xv.w;
+                    *(float4 *) (sh + t*slice + s*stream_slice + j) = make_float4(xv.x*gv.x, xv.y*gv.y, xv.z*gv.z, xv.w*gv.w);
+                }
+                const float v = hcf_owner_sum(sq);
+                if (lane == 0) {
+                    sq_w[warp][t][s] = v;
+                }
             }
-        } else {
-            xv = *(const float4 *) (x + (int64_t) t*hc_dim + src);
         }
-        const float4 gv = *(const float4 *) (wn + src);
-        sq[t][s] += xv.x*xv.x + xv.y*xv.y + xv.z*xv.z + xv.w*xv.w;
-        *(float4 *) (sh + t*slice + j) = make_float4(xv.x*gv.x, xv.y*gv.y, xv.z*gv.z, xv.w*gv.w);
-    }
+    } else {
+        float sq[T][4] = {};
+        for (int i = tid; i < T*(slice/4); i += 128) {
+            const int t = i/(slice/4), j = (i % (slice/4))*4;
+            const int src = (j/TILE)*256 + stripe*TILE + j%TILE;
+            const int s = src/n_embd;
+            float4 xv;
+            if constexpr (FOLD) {
+                xv = hcf_post_val4(pf, t, s, src - s*n_embd, src, hc_dim);
+                if (blockIdx.x == 0) {
+                    *(float4 *) (pf.h + (int64_t) t*hc_dim + src) = xv;
+                }
+            } else {
+                xv = *(const float4 *) (x + (int64_t) t*hc_dim + src);
+            }
+            const float4 gv = *(const float4 *) (wn + src);
+            sq[t][s] += xv.x*xv.x + xv.y*xv.y + xv.z*xv.z + xv.w*xv.w;
+            *(float4 *) (sh + t*slice + j) = make_float4(xv.x*gv.x, xv.y*gv.y, xv.z*gv.z, xv.w*gv.w);
+        }
 #pragma unroll
-    for (int t = 0; t < T; ++t) {
+        for (int t = 0; t < T; ++t) {
 #pragma unroll
-        for (int s = 0; s < 4; ++s) {
-            const float v = hcf_owner_sum(sq[t][s]);
-            if (lane == 0) {
-                sq_w[warp][t][s] = v;
+            for (int s = 0; s < 4; ++s) {
+                const float v = hcf_owner_sum(sq[t][s]);
+                if (lane == 0) {
+                    sq_w[warp][t][s] = v;
+                }
             }
         }
     }
@@ -862,6 +892,10 @@ static void hcf_down_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, 
         const char * e = getenv("LLAMA_HC_DOWN_OWNER_STRIPES");
         return e && atoi(e) == 8 ? 8 : 4;
     }();
+    static const bool owner_stream_stage = [] {
+        const char * e = getenv("LLAMA_HC_DOWN_OWNER_STREAM_STAGE");
+        return e && atoi(e) == 1;
+    }();
     const int owner_rb = (n_rows + HCF_OWNER_ROWS - 1)/HCF_OWNER_ROWS;
     const size_t owner_smem = (size_t) T*n_embd*sizeof(float)*4/owner_stripes;
     const size_t owner_static = (5*T*4 + 1)*sizeof(float);
@@ -879,8 +913,8 @@ static void hcf_down_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, 
             auto k = hcf_down_owner<T, F, L, P, S>;
             CUDA_SET_SHARED_MEMORY_LIMIT(k, owner_limit);
             static const bool reported = [=] {
-                fprintf(stderr, "[hc-down-owner] T=%d rows=%d embd=%d smem=%zu folded=%d lookahead=%d pack=%d finish8=%d stripes=%d\n",
-                        T, n_rows, n_embd, owner_smem, F, L, P, P && owner_finish8, S);
+                fprintf(stderr, "[hc-down-owner] T=%d rows=%d embd=%d smem=%zu folded=%d lookahead=%d pack=%d finish8=%d stripes=%d stream_stage=%d\n",
+                        T, n_rows, n_embd, owner_smem, F, L, P, P && owner_finish8, S, owner_stream_stage);
                 return true;
             }();
             GGML_UNUSED(reported);
@@ -903,7 +937,7 @@ static void hcf_down_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, 
             (const float *) x->data, (const float *) wn->data,
             (const char *) wd->data, wd->nb[1], wi ? (const char *) wi->data : nullptr, wi ? wi->nb[1] : 0,
             R, n_rows, n_embd, eps, lo_scale, inj_scale, partial.get(), sq.get(), owner_slot*HCF_OWNER_RB,
-            (float *) dst->data, pf, owner_finish8);
+            (float *) dst->data, pf, owner_finish8, owner_stream_stage);
         return;
     }
     ggml_cuda_pool_alloc<float> P(ctx.pool(), (size_t) n_chunks*n_rows*T);

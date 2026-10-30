@@ -15135,6 +15135,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // Non-power-of-two stream widths cover every tile with both stripe counts.
     test_cases.emplace_back(new test_dsv4_hc_down_owner(768, 17, 4, true));
     test_cases.emplace_back(new test_dsv4_hc_down_owner(1536, 31, 8, false));
+    // A single tile per stream leaves most staging lanes idle with either stripe count.
+    test_cases.emplace_back(new test_dsv4_hc_down_owner(256, 1, 1, false));
+    test_cases.emplace_back(new test_dsv4_hc_down_owner(256, 13, 8, true));
     // [HCFUSED] real Flash-Next shapes, every token count the kernels specialize, with and without the injection rows
     for (int64_t nt = 1; nt <= 8; ++nt) {
         test_cases.emplace_back(new test_dsv4_hc_fused(2560, 320, nt, true,  true, 1));
