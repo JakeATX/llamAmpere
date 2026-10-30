@@ -992,7 +992,46 @@ static void scratch_views_case(llama_model * model, sj_cfg cfg) {
     require(cache_of(multi.get())->b1_scratch_views(buft, 0, 512).empty(), "multiple streams refuse borrowing");
 }
 
+static void deferred_mask_capacity_case() {
+    ggml_context * ctx = ggml_init({ 1024*1024, nullptr, false });
+    require(ctx != nullptr, "mask test context");
+    std::vector<ggml_tensor *> masks;
+    for (int i = 0; i < 65; ++i) {
+        auto * mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 8, 3);
+        masks.push_back(mask);
+        require(llama_kq_mask_deferred_set(mask, 8, { 0, 3, 8 }) == (i < 64), "full list must refuse a new deferred mask");
+    }
+    for (int i = 0; i < 64; ++i) {
+        std::vector<int32_t> counts;
+        int64_t n_kv = 0;
+        require(llama_kq_mask_deferred_get(masks[i], counts, &n_kv), "pending mask must survive capacity pressure");
+        require(n_kv == 8 && counts == std::vector<int32_t>({ 0, 3, 8 }), "pending counts preserved");
+        llama_kq_mask_deferred_fill_host(masks[i]);
+        const auto * data = static_cast<const ggml_fp16_t *>(masks[i]->data);
+        for (int r = 0; r < 3; ++r) {
+            for (int c = 0; c < 8; ++c) {
+                require(data[r*8 + c] == ggml_fp32_to_fp16(c < counts[r] ? 0.0f : -INFINITY), "host fallback mask bytes");
+            }
+        }
+        require(!llama_kq_mask_deferred_get(masks[i], counts, &n_kv), "filled mask uses normal host copy");
+    }
+    std::vector<int32_t> counts;
+    int64_t n_kv = 0;
+    require(!llama_kq_mask_deferred_get(masks.back(), counts, &n_kv), "refused mask uses normal host fill");
+    ggml_free(ctx);
+    printf("OK: 64 pending masks preserved, 65th falls back, all host mask bytes exact\n");
+}
+
 int main(int argc, char ** argv) {
+    if (argc > 1 && strcmp(argv[1], "--mask-capacity") == 0) {
+        try {
+            deferred_mask_capacity_case();
+            return 0;
+        } catch (const std::exception & e) {
+            fprintf(stderr, "mask capacity: FAIL: %s\n", e.what());
+            return 1;
+        }
+    }
     const bool scratch_views = argc > 1 && strcmp(argv[1], "--scratch-views") == 0;
     const bool resident = argc > 1 && strcmp(argv[1], "--resident") == 0;
     const bool scalar_only = argc > 1 && strcmp(argv[1], "--scalar-only") == 0;

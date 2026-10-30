@@ -4293,6 +4293,16 @@ kq_mask_deferred * kq_mask_deferred_find(const ggml_tensor * t) {
 }
 } // namespace
 
+bool llama_kq_mask_deferred_set(const ggml_tensor * t, int64_t n_kv, std::vector<int32_t> && n_visible) {
+    std::lock_guard<std::mutex> lock(g_kq_deferred_mu);
+    // Keep pending masks until their copies run. A full list falls back to the host fill.
+    if (g_kq_deferred.size() >= 64) {
+        return false;
+    }
+    g_kq_deferred.push_back({ t, t->data, n_kv, std::move(n_visible), false });
+    return true;
+}
+
 bool llama_kq_mask_deferred_get(const ggml_tensor * t, std::vector<int32_t> & n_visible, int64_t * n_kv) {
     std::lock_guard<std::mutex> lock(g_kq_deferred_mu);
     const auto * d = kq_mask_deferred_find(t);
@@ -4559,12 +4569,8 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
             if (dst->type == GGML_TYPE_F16 && llama_kq_mask_device_enabled() && dst->ne[1] == (int64_t) n_tokens &&
                     ggml_is_contiguous(dst)) {
                 std::vector<int32_t> counts;
-                if (kq_mask_seq_prefix_counts(cells, ubatch, n_kv, counts)) {
-                    std::lock_guard<std::mutex> lock(g_kq_deferred_mu);
-                    if (g_kq_deferred.size() >= 64) {
-                        g_kq_deferred.erase(g_kq_deferred.begin());
-                    }
-                    g_kq_deferred.push_back({ dst, dst->data, n_kv, std::move(counts), false });
+                if (kq_mask_seq_prefix_counts(cells, ubatch, n_kv, counts) &&
+                        llama_kq_mask_deferred_set(dst, n_kv, std::move(counts))) {
                     return;
                 }
             }
