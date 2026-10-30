@@ -19873,7 +19873,30 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
             }
         };
 
-        if (parallel_workers <= 1) {
+        const char * hc_contexts = getenv("GGML_TEST_HCF_CONTEXTS");
+        if (hc_contexts != nullptr) {
+            if (strcmp(hc_contexts, "18") != 0 || parallel_workers != 1 || op_names_filter == nullptr ||
+                    strcmp(op_names_filter, "HC_DOWN_OWNER") != 0) {
+                fprintf(stderr, "GGML_TEST_HCF_CONTEXTS=18 requires HC_DOWN_OWNER and -j 1\n");
+                return false;
+            }
+            // Keep contexts alive so their addresses cannot reuse a legacy counter slot.
+            std::vector<ggml_backend_ptr> contexts;
+            for (int i = 0; i < 18; ++i) {
+                contexts.emplace_back(ggml_backend_dev_init(dev, nullptr));
+                if (!contexts.back()) {
+                    return false;
+                }
+                const size_t before = tests_run.load();
+                test_idx.store(0);
+                fprintf(stderr, "[hc-down-context] begin=%d\n", i);
+                run_tests(contexts.back().get(), backend_cpu.get());
+                if (tests_run.load() == before) {
+                    return false;
+                }
+                fprintf(stderr, "[hc-down-context] end=%d\n", i);
+            }
+        } else if (parallel_workers <= 1) {
             // Reuse the outer backend / backend_cpu so we don't pay an
             // extra CPU backend init.
             run_tests(backend, backend_cpu.get());
