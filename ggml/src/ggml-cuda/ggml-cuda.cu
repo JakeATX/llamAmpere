@@ -6208,7 +6208,8 @@ static bool ggml_cuda_gdn_conv_norm_enabled() {
     return enabled;
 }
 
-static bool ggml_cuda_gdn_conv_norm_match(const ggml_cgraph * graph, int i, float & eps) {
+// any_width: match the pattern at every ubatch width, not only the widths the kernel takes (the alloc-dep planner)
+static bool ggml_cuda_gdn_conv_norm_match(const ggml_cgraph * graph, int i, float & eps, bool any_width = false) {
     if (!ggml_cuda_gdn_conv_norm_enabled() || i + 7 >= graph->n_nodes) {
         return false;
     }
@@ -6225,7 +6226,7 @@ static bool ggml_cuda_gdn_conv_norm_match(const ggml_cgraph * graph, int i, floa
     }
     const ggml_tensor * conv = graph->nodes[i], * mixed = graph->nodes[i + 1];
     const int64_t ch = conv->ne[0], nt = conv->ne[1], ns = conv->ne[2];
-    if (ch < 384 || ch % 128 || nt < 1 || nt > GGML_CUDA_CONV_RING_MAX_T || ns < 1 ||
+    if (ch < 384 || ch % 128 || nt < 1 || (!any_width && nt > GGML_CUDA_CONV_RING_MAX_T) || ns < 1 ||
         ch > INT_MAX/(4*nt) || ns > INT_MAX/(4*nt*ch) || conv->ne[3] != 1 ||
         conv->src[1]->ne[0] != 4 || conv->src[1]->nb[1] != 4*sizeof(float) ||
         !ggml_is_contiguous(conv->src[1]) || mixed->src[0] != conv ||
@@ -10851,8 +10852,13 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             if (cgraph->nodes[i]->op != GGML_OP_SSM_CONV || !ggml_cuda_conv_ring_match_at(cgraph, i, m)) {
                 continue;
             }
+            // the dep's position must not depend on the ubatch width: the scheduler places each dep right after its
+            // `until`, and ggml-alloc compares a graph to the reserved one node by node, so a decode or draft-verify
+            // graph whose deps sit at i+7 while the reserved prefill graph has them at m.last_idx fails that compare
+            // and reallocates; on a pipelined multi-GPU split the re-reserve keeps only the current sizes, so every
+            // later prefill ubatch (its KQ mask one ubatch wider) reallocates again, each with a full sync
             float eps;
-            const bool fused = m.last_idx == i + 1 && ggml_cuda_gdn_conv_norm_match(cgraph, i, eps);
+            const bool fused = m.last_idx == i + 1 && ggml_cuda_gdn_conv_norm_match(cgraph, i, eps, /*any_width =*/ true);
             ggml_tensor * until = cgraph->nodes[fused ? i + 7 : m.last_idx];
             if (fused) {
                 params->add_alloc_dep(params->user_data, cgraph->nodes[i]->src[1], until);
