@@ -4248,14 +4248,14 @@ static int kq_mask_runs_threads() {
     return v;
 }
 
-// [PPIMPL] LLAMA_KQ_MASK_DEVICE=1 (default off): for an f16 sequence-prefix mask whose used cells are contiguous from 0
+// [PPIMPL] LLAMA_KQ_MASK_DEVICE (default on, =0 turns it off): for an f16 sequence-prefix mask whose used cells are contiguous from 0
 // and ascending in position, record only the visible-cell count of each row; the scheduler's input copy then fills the
 // mask on the card (llama_context::sched_copy_mtp_inputs -> ggml_backend_cuda_fill_prefix_mask). If that copy is not
 // taken, the host buffer is filled from the counts before the normal copy. Same values either way.
 bool llama_kq_mask_device_enabled() {
     static const bool v = [] {
         const char * e = getenv("LLAMA_KQ_MASK_DEVICE");
-        return e && atoi(e) != 0;
+        return !e || atoi(e) != 0;
     }();
     return v;
 }
