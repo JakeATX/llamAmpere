@@ -6864,6 +6864,15 @@ static bool run_skipmass_rule() {
     const float invalid[2] = {NAN, 0.01f};
     ok &= !ggml_moe_skipmass_select(invalid, hot, 2, 1, 0.1f, drop);
     ok &= !drop[0] && !drop[1];
+    ok &= ggml_moe_skipmass_budget_valid(2, 0.25f);
+    ok &= !ggml_moe_skipmass_budget_valid(2, std::nextafter(0.25f, 1.0f));
+    ok &= !ggml_moe_skipmass_budget_valid(2, NAN);
+    ok &= !ggml_moe_skipmass_budget_valid(2, -0.01f);
+    ok &= ggml_moe_skipmass_budget_valid(1, 0.999f);
+    const float concentrated[10] = {0.5f, 0.25f, 0.03125f, 0.03125f, 0.03125f, 0.03125f, 0.03125f, 0.03125f, 0.03125f, 0.03125f};
+    memset(hot, 0, sizeof(hot));
+    ggml_moe_skipmass_select(concentrated, hot, 10, 2, 0.25f, drop);
+    for (int i = 0; i < 10; ++i) { ok &= drop[i] == (i >= 2); }
     // Compare the faster selector to the original sorted scan, including cutoff boundaries.
     auto reference = [](const float * w, const unsigned char * h, int n, int mode, float t, unsigned char * d) {
         bool chosen[10] = {};
@@ -6890,6 +6899,7 @@ static bool run_skipmass_rule() {
             for (int n : {1, 4, 10}) {
                 for (int mode : {1, 2}) {
                     for (float t : {0.0f, 0.03f, std::nextafter(0.03f, 1.0f), 0.125f, 0.25f, 0.999f}) {
+                        if (mode == 2 && t > 0.25f) { continue; }
                         reference(w, hot, n, mode, t, expected);
                         const bool changed = ggml_moe_skipmass_select(w, hot, n, mode, t, drop);
                         ok &= memcmp(drop, expected, n) == 0;

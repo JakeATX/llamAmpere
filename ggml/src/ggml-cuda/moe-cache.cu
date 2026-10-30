@@ -10653,7 +10653,7 @@ bool ggml_cuda_moe_skipmass_compute(ggml_backend_cuda_context & ctx, ggml_tensor
     const char * t = getenv("GGML_MOE_SKIP_THRESHOLD");
     char * end = nullptr;
     const float threshold = t ? strtof(t, &end) : 0.0f;
-    GGML_ASSERT(!mode || (t && end != t && *end == 0 && std::isfinite(threshold) && threshold >= 0.0f && threshold < 1.0f));
+    GGML_ASSERT(!mode || (t && end != t && *end == 0 && ggml_moe_skipmass_budget_valid(mode, threshold)));
     const bool active = mode && session.skip_tail > 0;
     if (!active && !session.mass_trace) {
         // fork: exact evaluation needs no route selection or residency reads.
