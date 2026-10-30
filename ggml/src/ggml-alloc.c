@@ -1103,6 +1103,37 @@ static bool ggml_gallocr_reserve_n_impl(
             }
         }
         if (realloc) {
+            // GGML_ALLOC_REALLOC_LOG=1 (diagnostic): one line per compute buffer reallocation with its host time; a
+            // buffer that grows every prompt ubatch frees and re-allocates device memory each time.
+            // GGML_ALLOC_GROW_PCT=N (opt-in, 1..100): a buffer that already existed is re-allocated N% larger than the
+            // graph needs, so a size that creeps up with KV depth reallocates a few times instead of every ubatch.
+            // Not applied to borrowed (lent) chunks or donor-shared buffers; on allocation failure the exact size is used.
+            static int  realloc_log = -1;
+            static long grow_pct    = -1;
+            if (realloc_log < 0) {
+                const char * e = getenv("GGML_ALLOC_REALLOC_LOG");
+                realloc_log = e && *e ? atoi(e) : 0;
+                e = getenv("GGML_ALLOC_GROW_PCT");
+                const long v = e && *e ? strtol(e, NULL, 10) : 0;
+                grow_pct = v < 0 ? 0 : (v > 100 ? 100 : v);
+            }
+            const size_t old_total = galloc->buffers[i] ? ggml_vbuffer_size(galloc->buffers[i]) : 0;
+            const int64_t realloc_t0 = realloc_log ? ggml_time_us() : 0;
+            size_t exact_max[GGML_VBUFFER_MAX_CHUNKS] = {0};
+            bool grown = false;
+            if (grow_pct > 0 && old_total > 0 && galloc->donor == NULL && galloc->buf_tallocs[i]->n_chunk_limits == 0) {
+                struct ggml_dyn_tallocr * t = galloc->buf_tallocs[i];
+                for (int c = 0; c < t->n_chunks; c++) {
+                    const size_t m = t->chunks[c]->max_size;
+                    exact_max[c] = m;
+                    size_t extra = m / 100 * (size_t) grow_pct;
+                    if (extra > t->max_chunk_size - m) {
+                        extra = m < t->max_chunk_size ? t->max_chunk_size - m : 0;
+                    }
+                    t->chunks[c]->max_size = m + (extra / t->alignment) * t->alignment;
+                }
+                grown = true;
+            }
 #ifndef NDEBUG
             {
                 size_t cur_size = galloc->buffers[i] ? ggml_vbuffer_size(galloc->buffers[i]) : 0;
@@ -1174,10 +1205,25 @@ static bool ggml_gallocr_reserve_n_impl(
             }
             if (galloc->buffers[i] == NULL) {
                 galloc->buffers[i] = ggml_vbuffer_alloc(galloc->bufts[i], galloc->buf_tallocs[i], GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+                if (galloc->buffers[i] == NULL && grown) {
+                    struct ggml_dyn_tallocr * t = galloc->buf_tallocs[i];
+                    for (int c = 0; c < t->n_chunks; c++) {
+                        t->chunks[c]->max_size = exact_max[c];
+                    }
+                    grown = false;
+                    galloc->buffers[i] = ggml_vbuffer_alloc(galloc->bufts[i], galloc->buf_tallocs[i], GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+                }
                 if (galloc->buffers[i] == NULL) {
                     GGML_LOG_ERROR("%s: failed to allocate %s buffer of size %zu\n", __func__, ggml_backend_buft_name(galloc->bufts[i]), new_size);
                     return false;
                 }
+            }
+            if (realloc_log) {
+                static int n_realloc = 0;
+                GGML_LOG_INFO("[ALLOC] realloc #%d buft=%s %.2f -> %.2f MiB (need %.2f MiB%s) ms=%.3f\n", ++n_realloc,
+                    ggml_backend_buft_name(galloc->bufts[i]), old_total / 1024.0 / 1024.0,
+                    ggml_vbuffer_size(galloc->buffers[i]) / 1024.0 / 1024.0, new_size / 1024.0 / 1024.0,
+                    grown ? ", grown" : "", (ggml_time_us() - realloc_t0) / 1000.0);
             }
         }
     }
