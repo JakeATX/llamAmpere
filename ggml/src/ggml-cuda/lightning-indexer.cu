@@ -842,7 +842,7 @@ static __global__ void __launch_bounds__(256, 2) lightning_indexer_kernel_exact(
         const float * Q, const char * K, const float * W, const half * M, float * dst,
         int64_t n_batch, int64_t n_kv, size_t nb1, size_t nb3, size_t nbq1, size_t nbq2, size_t nbq3,
         size_t nbk2, size_t nbk3, size_t nbw1, size_t nbw3, size_t nbm1, size_t nbm3, int64_t nem3, bool mrange,
-        bool skip_dead) {
+        bool skip_dead, int swizzle) {
     constexpr int N_HEAD = 4;
     constexpr int N_EMBD = 128;
 
@@ -850,8 +850,24 @@ static __global__ void __launch_bounds__(256, 2) lightning_indexer_kernel_exact(
     const int tx  = tid % 16; // keys 4*tx..4*tx+3 and 64+4*tx..64+4*tx+3
     const int ty  = tid / 16; // tokens 2*ty and 2*ty+1, query rows 8*ty..8*ty+7
 
-    const int64_t start_kv    = (int64_t) blockIdx.x * LIX_KEYS;
-    const int64_t start_batch = (int64_t) blockIdx.y * LIX_TOKENS;
+    int kv_tile    = blockIdx.x;
+    int batch_tile = blockIdx.y;
+    // fork (opt-in GGML_CUDA_LID_SWIZZLE=<G>): blocks run in groups of G key tiles x every token tile, key tile fastest,
+    // so a group's keys stay in L2 while the queries stream once per group (default order re-reads every key tile from
+    // DRAM once per 32 tokens when the keys exceed L2). Each block computes the same outputs: same bits.
+    if (swizzle > 0) {
+        const int n_kv_tiles = gridDim.x;
+        const int n_b_tiles  = gridDim.y;
+        const int lin        = blockIdx.x + blockIdx.y * gridDim.x;
+        const int group      = lin / (swizzle * n_b_tiles);
+        const int within     = lin - group * (swizzle * n_b_tiles);
+        const int g_kv       = min(swizzle, n_kv_tiles - group * swizzle);
+        kv_tile    = group * swizzle + within % g_kv;
+        batch_tile = within / g_kv;
+    }
+
+    const int64_t start_kv    = (int64_t) kv_tile * LIX_KEYS;
+    const int64_t start_batch = (int64_t) batch_tile * LIX_TOKENS;
     const int     stream      = blockIdx.z;
 
     // fork (opt-in GGML_CUDA_LID_SKIP_DEAD=1, range masks only): a key tile outside every token's visible range [lo, hi)
@@ -1168,6 +1184,10 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
             const char * value = getenv("GGML_CUDA_LID_SKIP_DEAD");
             return value != nullptr && value[0] == '1';
         }();
+        static const int swizzle = [] {
+            const char * value = getenv("GGML_CUDA_LID_SWIZZLE");
+            return value != nullptr && atoi(value) > 0 ? atoi(value) : 0;
+        }();
         if (exact_mode > 0 && k->type == GGML_TYPE_F32 && GGML_CUDA_CC_IS_NVIDIA(cc)) {
             ggml_cuda_pool_alloc<char> ref(ctx.pool());
             if (exact_mode == 2) {
@@ -1180,7 +1200,7 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
             const dim3 grid_x((n_kv + LIX_KEYS - 1) / LIX_KEYS, (n_batch + LIX_TOKENS - 1) / LIX_TOKENS, n_stream);
             lightning_indexer_kernel_exact<<<grid_x, 256, 0, ctx.stream()>>>(
                 q_d, k_d, w_d, m_d, dst_d, n_batch, n_kv, nb1, nb3, nbq1, nbq2, nbq3,
-                nbk2, nbk3, nbw1, nbw3, nbm1, nbm3, nem3, mrange, skip_dead);
+                nbk2, nbk3, nbw1, nbw3, nbm1, nbm3, nem3, mrange, skip_dead, swizzle);
             if (exact_mode == 2) {
                 static unsigned long long n_calls = 0, n_diff_total = 0, n_out_total = 0;
                 ggml_cuda_pool_alloc<unsigned long long> n_diff(ctx.pool(), 1);
