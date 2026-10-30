@@ -591,8 +591,9 @@ int64_t llama_ple_prefetch::reader() {
 #endif
             if (!mapped && buf_size < need) {
                 // fork: pread overwrites this scratch; do not clear or copy its old bytes.
-                buf.reset(new char[need]);
-                buf_size = need;
+                const size_t cap = std::max(need, std::min((size_t) RUN_MAX*4096, buf_size*2));
+                buf.reset(new char[cap]);
+                buf_size = cap;
             }
             size_t done = mapped ? need : 0;
             while (done < need && !stopping.load()) {
