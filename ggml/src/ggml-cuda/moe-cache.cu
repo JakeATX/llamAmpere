@@ -59,6 +59,7 @@ static void moe_cache_register_stub(const void * owner) {
 #include <cstring>
 #include <deque>
 #include <iterator>
+#include <future>
 #include <limits>
 #include <map>
 #include <memory>
@@ -765,6 +766,21 @@ struct moe_swap_fill {
     char * destination;
 };
 
+struct moe_swap_pair {
+    float gain;
+    moe_cache_pool * pool;
+    int slot;
+    bool free;
+    moe_cache_device_table * table;
+    int32_t expert;
+};
+
+struct moe_swap_decision {
+    std::vector<moe_swap_pair> pairs;
+    size_t candidates = 0;
+    double ms = 0;
+};
+
 struct moe_cache_session {
     uint64_t phase_stats_id = 0;
     moe_cache_config config;
@@ -840,6 +856,9 @@ struct moe_cache_session {
     cudaEvent_t swap_join_event[4] = {};
     unsigned long long * swap_counts_host = nullptr;
     bool swap_counts_pending = false;
+    std::unique_ptr<moe_cache_session> swap_snapshot;
+    std::future<moe_swap_decision> swap_decision;
+    double swap_async_ms_total = 0;
     moe_swap_write * swap_writes_host[2] = {};
     cudaEvent_t swap_writes_event[2] = {};
     int swap_writes_cap = 0;
@@ -7916,7 +7935,8 @@ static void moe_cache_swap_commit(moe_cache_session & session, bool ok, bool pub
     }
     auto & device = *session.devices[0];
     std::vector<moe_swap_write> writes;
-    writes.reserve(session.swap_inflight.size() * 2);
+    // Reserve address, staging address and hot flag writes before slot changes.
+    writes.reserve(session.swap_inflight.size() * 3);
     for (const auto & fill : session.swap_inflight) {
         auto & pool = *fill.pool;
         auto & slot = pool.slots[fill.index];
@@ -7947,15 +7967,6 @@ static void moe_cache_swap_commit(moe_cache_session & session, bool ok, bool pub
         session.swap_broken = true;
     }
 }
-
-struct moe_swap_pair {
-    float gain;
-    moe_cache_pool * pool;
-    int slot;
-    bool free;
-    moe_cache_device_table * table;
-    int32_t expert;
-};
 
 static std::vector<moe_swap_pair> moe_cache_swap_whole_pairs(moe_cache_session & session, size_t & n_cands) {
     struct entry { float score; size_t layer; int32_t expert; std::array<int, 3> slots; };
@@ -8076,9 +8087,8 @@ static std::vector<moe_swap_pair> moe_cache_swap_whole_pairs(moe_cache_session &
     return result;
 }
 
-static void moe_cache_swap_decide(moe_cache_session & session) {
+static std::vector<moe_swap_pair> moe_cache_swap_plan(moe_cache_session & session, size_t & n_cands) {
     auto & device = *session.devices[0];
-    const auto start = std::chrono::steady_clock::now();
     const size_t n = session.swap_prev.size();
     const unsigned long long * counts = session.swap_counts_host;
     const float decay = session.swap_decay_after ? 1.0f : session.swap_decay;
@@ -8124,7 +8134,7 @@ static void moe_cache_swap_decide(moe_cache_session & session) {
     struct vict { float score; int slot; };
     using pair = moe_swap_pair;
     std::unordered_map<moe_cache_pool *, std::vector<cand>> cands;
-    size_t n_cands = 0;
+    n_cands = 0;
     if (!session.swap_whole) {
         for (auto & entry : session.device_tables) {
             auto & table = entry.second;
@@ -8203,6 +8213,14 @@ static void moe_cache_swap_decide(moe_cache_session & session) {
         for (auto & score : session.swap_profile_seed) { score *= session.swap_decay; }
         for (auto & entry : session.swap_profile_table_ema) { entry.second *= session.swap_decay; }
     }
+    return pairs;
+}
+
+static void moe_cache_swap_apply_decision(moe_cache_session & session, const std::vector<moe_swap_pair> & pairs,
+        size_t n_cands, double plan_ms) {
+    auto & device = *session.devices[0];
+    const auto start = std::chrono::steady_clock::now();
+    const size_t limit = (size_t) session.swap_max;
     std::vector<moe_swap_write> writes;
     writes.reserve(limit * 3);
     session.swap_inflight.reserve(limit);
@@ -8284,7 +8302,7 @@ static void moe_cache_swap_decide(moe_cache_session & session) {
             bytes += pool.expert_size;
         }
     }
-    const double host_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    const double host_ms = plan_ms + std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
     session.swap_updates++;
     session.swap_host_ms_total += host_ms;
     if (session.swap_inflight.empty()) {
@@ -8333,6 +8351,218 @@ static void moe_cache_swap_decide(moe_cache_session & session) {
     }
 }
 
+// The worker owns this host snapshot; it never reads live slots or calls CUDA.
+static std::unique_ptr<moe_cache_session> moe_cache_swap_snapshot(const moe_cache_session & session,
+        std::unique_ptr<moe_cache_session> copy = {}) {
+    if (!copy) { copy.reset(new moe_cache_session); }
+    copy->swap_whole = session.swap_whole;
+    copy->swap_layer = session.swap_layer;
+    copy->swap_decay_after = session.swap_decay_after;
+    copy->swap_max = session.swap_max;
+    copy->swap_decay = session.swap_decay;
+    copy->swap_hyst = session.swap_hyst;
+    copy->swap_margin = session.swap_margin;
+    copy->swap_profile_strength = session.swap_profile_strength;
+    copy->swap_profile_decay = session.swap_profile_decay;
+    copy->swap_prev = session.swap_prev;
+    copy->swap_score = session.swap_score;
+    copy->swap_observed_score = session.swap_observed_score;
+    copy->swap_profile_rate = session.swap_profile_rate;
+    copy->swap_profile_seed = session.swap_profile_seed;
+    copy->swap_profile_table_ema = session.swap_profile_table_ema;
+    copy->swap_profile_calibrated_tables = session.swap_profile_calibrated_tables;
+    copy->device_previous_counts.assign(session.swap_counts_host, session.swap_counts_host + session.swap_prev.size());
+    copy->swap_counts_host = copy->device_previous_counts.data();
+    if (copy->devices.empty()) { copy->devices.emplace_back(new moe_cache_device(0, 0)); }
+    auto & cloned = copy->devices[0]->pools;
+    const auto & source = session.devices[0]->pools;
+    while (cloned.size() < source.size()) { cloned.emplace_back(new moe_cache_pool); }
+    cloned.resize(source.size());
+    std::unordered_map<const moe_cache_pool *, moe_cache_pool *> pools;
+    for (size_t i = 0; i < source.size(); ++i) {
+        // The planner snapshot never owns card memory: copy the slot table, leave prompt_slab empty.
+        moe_cache_pool & dst = *cloned[i];
+        const moe_cache_pool & src = *source[i];
+        dst.expert_size = src.expert_size;
+        dst.wtype = src.wtype;
+        dst.slab = src.slab;
+        dst.prompt_slab.reset();
+        dst.prompt_slots = src.prompt_slots;
+        dst.n_slots = src.n_slots;
+        dst.covers_all_entries = src.covers_all_entries;
+        dst.slots = src.slots;
+        dst.free_slots = src.free_slots;
+        dst.map = src.map;
+        dst.lru_head = src.lru_head;
+        dst.lru_tail = src.lru_tail;
+        pools[source[i].get()] = cloned[i].get();
+    }
+    copy->device_tables = session.device_tables;
+    for (auto & entry : copy->device_tables) {
+        if (entry.second.swap_pool) { entry.second.swap_pool = pools.at(entry.second.swap_pool); }
+    }
+    copy->swap_groups = session.swap_groups;
+    for (auto & group : copy->swap_groups) {
+        for (auto & table : group) {
+            if (table) { table = &copy->device_tables.at(table->desc.data); }
+        }
+    }
+    return copy;
+}
+
+static moe_swap_decision moe_cache_swap_run_plan(moe_cache_session & session) {
+    const auto start = std::chrono::steady_clock::now();
+    moe_swap_decision result;
+    result.pairs = moe_cache_swap_plan(session, result.candidates);
+    result.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    return result;
+}
+
+static bool moe_cache_swap_take_plan(moe_cache_session & session, moe_swap_decision & result) {
+    auto & copy = *session.swap_snapshot;
+    bool valid = true;
+    for (auto & pair : result.pairs) {
+        auto * saved_pool = pair.pool;
+        const auto & saved_slot = saved_pool->slots[pair.slot];
+        pair.table = &session.device_tables.at(pair.table->desc.data);
+        size_t pool = 0;
+        while (copy.devices[0]->pools.at(pool).get() != saved_pool) { ++pool; }
+        pair.pool = session.devices[0]->pools.at(pool).get();
+        const auto & slot = pair.pool->slots.at(pair.slot);
+        valid &= slot.generation == saved_slot.generation && slot.key == saved_slot.key &&
+            slot.state == saved_slot.state && !slot.readers && !slot.staging &&
+            !pair.pool->map.count({pair.table->desc.data, pair.expert});
+    }
+    session.swap_prev.swap(copy.swap_prev);
+    session.swap_score.swap(copy.swap_score);
+    session.swap_observed_score.swap(copy.swap_observed_score);
+    session.swap_profile_seed.swap(copy.swap_profile_seed);
+    session.swap_profile_table_ema.swap(copy.swap_profile_table_ema);
+    session.swap_profile_calibrated_tables.swap(copy.swap_profile_calibrated_tables);
+    session.swap_async_ms_total += result.ms;
+    if (!valid) { result.pairs.clear(); }
+    return valid;
+}
+
+static void moe_cache_swap_finish_plan(moe_cache_session & session) {
+    auto result = session.swap_decision.get();
+    moe_cache_swap_take_plan(session, result);
+    moe_cache_swap_apply_decision(session, result.pairs, result.candidates, 0);
+}
+
+// Runs the real planner and snapshot path without a CUDA context or model weights.
+bool ggml_cuda_moe_cache_swap_async_test() {
+    bool ok = true;
+    int keys[3] = {};
+    for (bool whole : {false, true}) {
+        for (bool prior : {false, true}) {
+            auto check = [&](bool pass, const char * step, int round = -1) {
+                if (!pass) {
+                    fprintf(stderr, "cache-swap-async whole=%d prior=%d round=%d: %s failed\n", whole, prior, round, step);
+                    ok = false;
+                }
+            };
+            moe_cache_session seed;
+            seed.devices.emplace_back(new moe_cache_device(0, 0));
+            seed.devices[0]->pools.emplace_back(new moe_cache_pool);
+            auto & pool = *seed.devices[0]->pools[0];
+            pool.expert_size = 64; pool.wtype = GGML_TYPE_Q4_0; pool.n_slots = 9;
+            pool.slots.resize(9); pool.free_slots = {6, 7, 8};
+            seed.swap_whole = whole; seed.swap_max = 6; seed.swap_margin = 0;
+            seed.swap_decay_after = prior; seed.swap_profile_strength = prior ? 1 : 0;
+            seed.swap_profile_decay = prior;
+            seed.swap_prev.assign(18, 0); seed.swap_score.assign(18, 0);
+            seed.swap_observed_score.assign(18, 0); seed.swap_profile_seed.assign(18, 0);
+            seed.swap_profile_rate.assign(18, 1.0f / 6);
+            seed.device_previous_counts.assign(18, 0);
+            seed.swap_counts_host = seed.device_previous_counts.data();
+            std::array<moe_cache_device_table *, 3> group;
+            for (int k = 0; k < 3; ++k) {
+                auto & table = seed.device_tables[&keys[k]];
+                table.desc.data = &keys[k]; table.desc.n_expert = 6;
+                table.desc.expert_size = 64; table.desc.type = GGML_TYPE_Q4_0;
+                table.desc.n_in = 16; table.desc.n_out = 8;
+                table.count_offset = k * 6; table.swap_pool = &pool;
+                table.permanent.assign(6, 0); table.permanent[5] = 1; table.fallback.assign(6, &keys[k]);
+                group[k] = &table;
+                for (int e = 0; e < 2; ++e) {
+                    const int index = k * 2 + e;
+                    pool.slots[index].key = {&keys[k], e};
+                    pool.slots[index].state = moe_cache_slot_state::valid;
+                    pool.map[pool.slots[index].key] = index;
+                }
+            }
+            seed.swap_groups.push_back(group);
+            auto sync = moe_cache_swap_snapshot(seed);
+            auto async = moe_cache_swap_snapshot(seed);
+            size_t swaps = 0, free_swaps = 0, evictions = 0;
+            auto apply = [](const moe_swap_decision & result) {
+                for (const auto & p : result.pairs) {
+                    auto & slot = p.pool->slots[p.slot];
+                    if (p.free) {
+                        auto & free = p.pool->free_slots;
+                        free.erase(std::find(free.begin(), free.end(), p.slot));
+                    } else { p.pool->map.erase(slot.key); }
+                    slot.key = {p.table->desc.data, p.expert};
+                    slot.state = moe_cache_slot_state::valid; ++slot.generation;
+                    p.pool->map[slot.key] = p.slot;
+                }
+            };
+            for (int round = 0; round < 16; ++round) {
+                for (int k = 0; k < 3; ++k) {
+                    const size_t index = k * 6 + (round + 2) % 6;
+                    sync->device_previous_counts[index] += 100 + round;
+                    async->device_previous_counts[index] += 100 + round;
+                }
+                auto expected = moe_cache_swap_run_plan(*sync);
+                async->swap_snapshot = moe_cache_swap_snapshot(*async, std::move(async->swap_snapshot));
+                auto * copy = async->swap_snapshot.get();
+                std::promise<void> begin;
+                auto ready = begin.get_future();
+                async->swap_decision = std::async(std::launch::async, [copy, ready = std::move(ready)]() mutable {
+                    ready.wait(); return moe_cache_swap_run_plan(*copy);
+                });
+                ok &= async->swap_decision.wait_for(std::chrono::seconds(0)) == std::future_status::timeout;
+                async->device_previous_counts[0] += 17;
+                begin.set_value();
+                // A later scope can change live counts; the captured inputs stay fixed.
+                auto actual = async->swap_decision.get();
+                async->device_previous_counts[0] -= 17;
+                check(moe_cache_swap_take_plan(*async, actual), "take plan", round);
+                check(expected.pairs.size() == actual.pairs.size() && expected.candidates == actual.candidates, "pair count", round);
+                check(sync->swap_prev == async->swap_prev && sync->swap_score == async->swap_score, "scores", round);
+                check(sync->swap_profile_seed == async->swap_profile_seed && sync->swap_profile_table_ema == async->swap_profile_table_ema, "prior", round);
+                for (size_t i = 0; i < std::min(expected.pairs.size(), actual.pairs.size()); ++i) {
+                    const auto & a = expected.pairs[i]; const auto & b = actual.pairs[i];
+                    check(a.table->desc.data == b.table->desc.data && a.expert == b.expert &&
+                        a.slot == b.slot && a.free == b.free && a.gain == b.gain, "pair", round);
+                }
+                swaps += expected.pairs.size();
+                for (const auto & p : actual.pairs) { p.free ? ++free_swaps : ++evictions; }
+                apply(expected); apply(actual);
+            }
+            check(swaps > 0 && free_swaps > 0 && evictions > 0, "free and victim coverage");
+            // Pick a missing expert; a large count on a resident cannot produce a stale pair.
+            int missing = 0;
+            while (missing < 5 && async->devices[0]->pools[0]->map.count({&keys[0], missing})) { ++missing; }
+            check(missing < 5, "missing expert");
+            if (missing == 5) { continue; }
+            for (int k = 0; k < (whole ? 3 : 1); ++k) {
+                check(!async->devices[0]->pools[0]->map.count({&keys[k], missing}), "missing projection");
+                async->device_previous_counts[k * 6 + missing] += 10000;
+            }
+            async->swap_snapshot = moe_cache_swap_snapshot(*async, std::move(async->swap_snapshot));
+            auto stale = moe_cache_swap_run_plan(*async->swap_snapshot);
+            check(!stale.pairs.empty(), "stale pair coverage");
+            for (auto & slot : async->devices[0]->pools[0]->slots) { ++slot.generation; }
+            async->device_previous_counts[missing] += 10000;
+            check(!moe_cache_swap_take_plan(*async, stale) && stale.pairs.empty(), "stale rejection");
+            check(async->swap_prev[missing] + 10000 == async->device_previous_counts[missing], "stale counts");
+        }
+    }
+    return ok;
+}
+
 // Called with mu held after the last scope left; never waits for the card.
 static void moe_cache_swap_step(moe_cache_session & session) {
     if (!session.device_expert_counts || session.devices.size() != 1 || session.swap_broken ||
@@ -8369,17 +8599,54 @@ static void moe_cache_swap_step(moe_cache_session & session) {
             return;
         }
     }
+    if (session.swap_broken) {
+        return;
+    }
+    // A ready plan is applied one scope later; an unfinished worker never stalls decode.
+    if (session.swap_decision.valid() && session.swap_decision.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+        try {
+            moe_cache_swap_finish_plan(session);
+        } catch (const std::exception & error) {
+            MOE_CACHE_LOG("[moe-cache] async swap plan failed: %s; stopping swaps\n", error.what());
+            session.swap_snapshot.reset();
+            session.swap_broken = true;
+            return;
+        }
+    }
+    if (session.swap_broken) {
+        return;
+    }
     // 2) Decide from the counters read back at an earlier scope.
-    if (session.swap_counts_pending && session.swap_inflight.empty()) {
+    if (session.swap_counts_pending && session.swap_inflight.empty() && !session.swap_decision.valid()) {
         const cudaError_t q = cudaEventQuery(session.swap_counts_event);
         if (q != cudaErrorNotReady) {
             session.swap_counts_pending = false;
             if (q == cudaSuccess) {
-                moe_cache_swap_decide(session);
+                static const bool async = getenv("GGML_MOE_SWAP_ASYNC") && atoi(getenv("GGML_MOE_SWAP_ASYNC")) != 0;
+                if (async) {
+                    try {
+                        const auto start = std::chrono::steady_clock::now();
+                        session.swap_snapshot = moe_cache_swap_snapshot(session, std::move(session.swap_snapshot));
+                        auto * copy = session.swap_snapshot.get();
+                        session.swap_decision = std::async(std::launch::async, [copy] { return moe_cache_swap_run_plan(*copy); });
+                        session.swap_host_ms_total += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+                    } catch (const std::exception & error) {
+                        MOE_CACHE_LOG("[moe-cache] async swap launch failed: %s; stopping swaps\n", error.what());
+                        session.swap_snapshot.reset();
+                        session.swap_broken = true;
+                        return;
+                    }
+                } else {
+                    auto result = moe_cache_swap_run_plan(session);
+                    moe_cache_swap_apply_decision(session, result.pairs, result.candidates, result.ms);
+                }
             } else {
                 (void) cudaGetLastError();
             }
         }
+    }
+    if (session.swap_broken) {
+        return;
     }
     // 3) Read back this scope's counters for the next decision (async, compute stream).
     if (!session.swap_counts_pending && scope % (uint64_t)session.swap_interval == 0) {
@@ -8396,11 +8663,16 @@ static void moe_cache_swap_step(moe_cache_session & session) {
 
 // Called by device release after its full device sync.
 static void moe_cache_swap_release(moe_cache_session & session) {
+    if (session.swap_decision.valid()) {
+        session.swap_decision.wait();
+        session.swap_decision = {};
+    }
+    session.swap_snapshot.reset();
     if (session.swap_updates || session.swap_commits) {
-        MOE_CACHE_LOG("[moe-cache] swap totals: updates=%llu swaps=%llu bytes=%llu commits=%llu host_ms_total=%.3f land_ms_total=%.3f scopes=%llu\n",
+        MOE_CACHE_LOG("[moe-cache] swap totals: updates=%llu swaps=%llu bytes=%llu commits=%llu host_ms_total=%.3f land_ms_total=%.3f scopes=%llu async_plan_ms_total=%.3f\n",
                 (unsigned long long)session.swap_updates, (unsigned long long)session.swap_total,
                 (unsigned long long)session.swap_bytes_total, (unsigned long long)session.swap_commits,
-                session.swap_host_ms_total, session.swap_land_ms_total, (unsigned long long)session.swap_scopes);
+                session.swap_host_ms_total, session.swap_land_ms_total, (unsigned long long)session.swap_scopes, session.swap_async_ms_total);
     }
     moe_cache_swap_commit(session, true, false);
     moe_cache_swap_free(session);
