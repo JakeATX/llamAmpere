@@ -85,9 +85,9 @@ static __device__ __forceinline__ float hcf_owner_sum(float v, const unsigned ma
     return v;
 }
 
-// Four stripes own eight BF16 values per lane in each 256-column tile. Keep the four stream sums separate
+// Stripes split each 256-column tile. Keep the four stream sums separate
 // until their RMS scales are known. The last stripe finishes its row block with coalesced partial reads.
-template <int T, bool FOLD, bool LOOKAHEAD = false, bool PACK = false>
+template <int T, bool FOLD, bool LOOKAHEAD = false, bool PACK = false, int STRIPES = 4>
 static __global__ void __launch_bounds__(128) hcf_down_owner(
         const float * __restrict__ x, const float * __restrict__ wn,
         const char * __restrict__ wd, const int64_t sd, const char * __restrict__ wi, const int64_t si,
@@ -98,14 +98,17 @@ static __global__ void __launch_bounds__(128) hcf_down_owner(
     __shared__ float sq_w[4][T][4];
     __shared__ float rr[T][4];
     __shared__ int last;
-    const int hc_dim = 4*n_embd, slice = hc_dim/4;
+    static_assert(STRIPES == 4 || STRIPES == 8, "unsupported stripe count");
+    constexpr int VALUES = 32/STRIPES, TILE = 256/STRIPES, OWNERS = 8*STRIPES;
+    using packed_t = std::conditional_t<STRIPES == 4, uint4, uint2>;
+    const int hc_dim = 4*n_embd, slice = hc_dim/STRIPES;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int local = tid & 7, stripe = blockIdx.y, owner = stripe*8 + local;
     const int row = blockIdx.x*HCF_OWNER_ROWS + tid/8;
     float sq[T][4] = {};
     for (int i = tid; i < T*(slice/4); i += 128) {
         const int t = i/(slice/4), j = (i % (slice/4))*4;
-        const int src = (j/64)*256 + stripe*64 + j%64;
+        const int src = (j/TILE)*256 + stripe*TILE + j%TILE;
         const int s = src/n_embd;
         float4 xv;
         if constexpr (FOLD) {
@@ -136,7 +139,7 @@ static __global__ void __launch_bounds__(128) hcf_down_owner(
         for (int w = 0; w < 4; ++w) {
             v += sq_w[w][tid/4][tid%4];
         }
-        ssq[(((int64_t) blockIdx.x*4 + stripe)*T + tid/4)*4 + tid%4] = v;
+        ssq[(((int64_t) blockIdx.x*STRIPES + stripe)*T + tid/4)*4 + tid%4] = v;
     }
     const unsigned mask = PACK ? __ballot_sync(0xffffffffu, row < n_rows) : 0;
     if (row < n_rows) {
@@ -145,27 +148,31 @@ static __global__ void __launch_bounds__(128) hcf_down_owner(
         for (int s = 0; s < 4; ++s) {
             float acc[T] = {};
             const int first = s*(n_embd/256), end = (s + 1)*(n_embd/256);
-            uint4 next;
+            packed_t next;
             if constexpr (LOOKAHEAD) {
-                next = __ldg((const uint4 *) wr + first*32 + owner);
+                next = __ldg((const packed_t *) wr + first*OWNERS + owner);
             }
             for (int q = first; q < end; ++q) {
-                uint4 pk;
+                packed_t pk;
                 if constexpr (LOOKAHEAD) {
                     pk = next;
                     if (q + 1 < end) {
-                        next = __ldg((const uint4 *) wr + (q + 1)*32 + owner);
+                        next = __ldg((const packed_t *) wr + (q + 1)*OWNERS + owner);
                     }
                 } else {
-                    pk = __ldg((const uint4 *) wr + q*32 + owner);
+                    pk = __ldg((const packed_t *) wr + q*OWNERS + owner);
                 }
-                const uint32_t p[4] = { pk.x, pk.y, pk.z, pk.w };
+                uint32_t p[4] = { pk.x, pk.y, 0, 0 };
+                if constexpr (STRIPES == 4) {
+                    p[2] = pk.z;
+                    p[3] = pk.w;
+                }
 #pragma unroll
                 for (int t = 0; t < T; ++t) {
-                    const float * xv = sh + t*slice + q*64 + local*8;
+                    const float * xv = sh + t*slice + q*TILE + local*VALUES;
                     float v = 0.0f;
 #pragma unroll
-                    for (int k = 0; k < 4; ++k) {
+                    for (int k = 0; k < VALUES/2; ++k) {
                         v = __fmaf_rn(hcf_bf16_lo(p[k]), xv[2*k], v);
                         v = __fmaf_rn(hcf_bf16_hi(p[k]), xv[2*k + 1], v);
                     }
@@ -181,10 +188,10 @@ static __global__ void __launch_bounds__(128) hcf_down_owner(
                         v = __fadd_rn(v, __shfl_xor_sync(mask, v, d, 8));
                     }
                     if (local == 0) {
-                        partial[(((int64_t) s*T + t)*n_rows + row)*4 + stripe] = v;
+                        partial[(((int64_t) s*T + t)*n_rows + row)*STRIPES + stripe] = v;
                     }
                 } else {
-                    partial[(((int64_t) s*T + t)*n_rows + row)*32 + owner] = acc[t];
+                    partial[(((int64_t) s*T + t)*n_rows + row)*OWNERS + owner] = acc[t];
                 }
             }
         }
@@ -192,7 +199,7 @@ static __global__ void __launch_bounds__(128) hcf_down_owner(
     __threadfence();
     __syncthreads();
     if (tid == 0) {
-        last = atomicAdd(hcf_owner_arrive + cnt_off + blockIdx.x, 1u) == 3u;
+        last = atomicAdd(hcf_owner_arrive + cnt_off + blockIdx.x, 1u) == STRIPES - 1;
     }
     __syncthreads();
     if (!last) {
@@ -201,8 +208,8 @@ static __global__ void __launch_bounds__(128) hcf_down_owner(
     __threadfence();
     if (tid < T*4) {
         float v = 0.0f;
-        for (int st = 0; st < 4; ++st) {
-            v += __ldcg(ssq + (((int64_t) blockIdx.x*4 + st)*T + tid/4)*4 + tid%4);
+        for (int st = 0; st < STRIPES; ++st) {
+            v += __ldcg(ssq + (((int64_t) blockIdx.x*STRIPES + st)*T + tid/4)*4 + tid%4);
         }
         const float r = rsqrtf(v/n_embd + eps);
         rr[tid/4][tid%4] = r;
@@ -214,7 +221,7 @@ static __global__ void __launch_bounds__(128) hcf_down_owner(
     const bool finish_pack = PACK && finish8;
     const int rows_pw = finish_pack ? 4 : 1;
     const int out_lane = finish_pack ? lane % 8 : lane;
-    // Packed rows use four values plus four zero lanes; all 16 rows can finish in one pass.
+    // Packed rows use at most eight values; all 16 rows can finish in one pass.
     for (int base = warp*rows_pw; base < HCF_OWNER_ROWS; base += 4*rows_pw) {
         const int r = blockIdx.x*HCF_OWNER_ROWS + base + (finish_pack ? lane/8 : 0);
         const unsigned out_mask = finish_pack ? __ballot_sync(0xffffffffu, r < n_rows) : 0xffffffffu;
@@ -228,9 +235,13 @@ static __global__ void __launch_bounds__(128) hcf_down_owner(
             for (int s = 0; s < 4; ++s) {
                 float p;
                 if constexpr (PACK) {
-                    p = out_lane < 4 ? __ldcg(partial + (((int64_t) s*T + t)*n_rows + r)*4 + out_lane) : 0.0f;
+                    p = out_lane < STRIPES ? __ldcg(partial + (((int64_t) s*T + t)*n_rows + r)*STRIPES + out_lane) : 0.0f;
                 } else {
-                    p = __ldcg(partial + (((int64_t) s*T + t)*n_rows + r)*32 + lane);
+                    const float * src = partial + (((int64_t) s*T + t)*n_rows + r)*OWNERS;
+                    p = __ldcg(src + lane);
+                    if constexpr (STRIPES == 8) {
+                        p = __fadd_rn(p, __ldcg(src + lane + 32));
+                    }
                 }
                 v += rr[t][s]*(finish_pack ? hcf_owner_sum<8>(p, out_mask) : hcf_owner_sum(p));
             }
@@ -847,8 +858,12 @@ static void hcf_down_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, 
         const char * e = getenv("LLAMA_HC_DOWN_OWNER_FINISH8");
         return e && atoi(e) == 1;
     }();
+    static const int owner_stripes = [] {
+        const char * e = getenv("LLAMA_HC_DOWN_OWNER_STRIPES");
+        return e && atoi(e) == 8 ? 8 : 4;
+    }();
     const int owner_rb = (n_rows + HCF_OWNER_ROWS - 1)/HCF_OWNER_ROWS;
-    const size_t owner_smem = (size_t) T*n_embd*sizeof(float);
+    const size_t owner_smem = (size_t) T*n_embd*sizeof(float)*4/owner_stripes;
     const size_t owner_static = (5*T*4 + 1)*sizeof(float);
     const size_t owner_limit = std::min<size_t>(81920, ggml_cuda_info().devices[ctx.device].smpbo > owner_static ?
             ggml_cuda_info().devices[ctx.device].smpbo - owner_static : 0);
@@ -856,30 +871,35 @@ static void hcf_down_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, 
     const int owner_slot = owner && slot >= 0 && n_rows <= HCF_OWNER_MAX_ROWS && n_embd % 256 == 0 &&
             owner_smem <= owner_limit ? hcf_owner_cnt_slot(ctx) : -1;
     if (owner_slot >= 0) {
-        auto select = [&](auto fold, auto lookahead, auto pack) {
+        auto select = [&](auto fold, auto lookahead, auto pack, auto stripes) {
             constexpr bool F = decltype(fold)::value;
             constexpr bool L = decltype(lookahead)::value;
             constexpr bool P = decltype(pack)::value;
-            auto k = hcf_down_owner<T, F, L, P>;
+            constexpr int S = decltype(stripes)::value;
+            auto k = hcf_down_owner<T, F, L, P, S>;
             CUDA_SET_SHARED_MEMORY_LIMIT(k, owner_limit);
             static const bool reported = [=] {
-                fprintf(stderr, "[hc-down-owner] T=%d rows=%d embd=%d smem=%zu folded=%d lookahead=%d pack=%d finish8=%d\n",
-                        T, n_rows, n_embd, owner_smem, F, L, P, P && owner_finish8);
+                fprintf(stderr, "[hc-down-owner] T=%d rows=%d embd=%d smem=%zu folded=%d lookahead=%d pack=%d finish8=%d stripes=%d\n",
+                        T, n_rows, n_embd, owner_smem, F, L, P, P && owner_finish8, S);
                 return true;
             }();
             GGML_UNUSED(reported);
             return k;
         };
+        auto select_stripes = [&](auto fold, auto lookahead, auto pack) {
+            return owner_stripes == 8 ? select(fold, lookahead, pack, std::integral_constant<int, 8>{}) :
+                    select(fold, lookahead, pack, std::integral_constant<int, 4>{});
+        };
         auto select_pack = [&](auto fold, auto lookahead) {
-            return owner_pack ? select(fold, lookahead, std::true_type{}) : select(fold, lookahead, std::false_type{});
+            return owner_pack ? select_stripes(fold, lookahead, std::true_type{}) : select_stripes(fold, lookahead, std::false_type{});
         };
         auto kernel = hpost != nullptr ?
                 (owner_lookahead ? select_pack(std::true_type{}, std::true_type{}) : select_pack(std::true_type{}, std::false_type{})) :
                 (owner_lookahead ? select_pack(std::false_type{}, std::true_type{}) : select_pack(std::false_type{}, std::false_type{}));
         // Sum each eight-lane row group before the global store to cut the partial count by eight.
-        ggml_cuda_pool_alloc<float> partial(ctx.pool(), (size_t) 4*T*n_rows*(owner_pack ? 4 : 32));
-        ggml_cuda_pool_alloc<float> sq(ctx.pool(), (size_t) owner_rb*4*T*4);
-        kernel<<<dim3(owner_rb, 4), 128, owner_smem, stream>>>(
+        ggml_cuda_pool_alloc<float> partial(ctx.pool(), (size_t) 4*T*n_rows*owner_stripes*(owner_pack ? 1 : 8));
+        ggml_cuda_pool_alloc<float> sq(ctx.pool(), (size_t) owner_rb*owner_stripes*T*4);
+        kernel<<<dim3(owner_rb, owner_stripes), 128, owner_smem, stream>>>(
             (const float *) x->data, (const float *) wn->data,
             (const char *) wd->data, wd->nb[1], wi ? (const char *) wi->data : nullptr, wi ? wi->nb[1] : 0,
             R, n_rows, n_embd, eps, lo_scale, inj_scale, partial.get(), sq.get(), owner_slot*HCF_OWNER_RB,

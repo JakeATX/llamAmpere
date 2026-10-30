@@ -15132,6 +15132,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t rank : {5, 6, 7}) {
         test_cases.emplace_back(new test_dsv4_hc_down_owner(512, rank, 5, false));
     }
+    // Non-power-of-two stream widths cover every tile with both stripe counts.
+    test_cases.emplace_back(new test_dsv4_hc_down_owner(768, 17, 4, true));
+    test_cases.emplace_back(new test_dsv4_hc_down_owner(1536, 31, 8, false));
     // [HCFUSED] real Flash-Next shapes, every token count the kernels specialize, with and without the injection rows
     for (int64_t nt = 1; nt <= 8; ++nt) {
         test_cases.emplace_back(new test_dsv4_hc_fused(2560, 320, nt, true,  true, 1));
