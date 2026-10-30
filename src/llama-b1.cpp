@@ -954,6 +954,18 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
             free_mem/1048576.0, ram_avail < 0 ? -1.0 : ram_avail/1048576.0, ram_cap < 0 ? -1.0 : ram_cap/1048576.0,
             layer_streamed(n_layer - 1) ? "streamed" : "not streamed");
 
+    if (b1_env_int("LLAMA_B1_CHECK_COPY", 0)) {
+        // The untimed checker must cover the whole plan, not just one positive read.
+        for (size_t k = 0; k < steps.size(); ++k) {
+            const int il = steps[k].il;
+            size_t bytes = 0;
+            for (int ti : layers[il].tensors) {
+                if (tensor_streamed(il, exps[ti])) { bytes += exps[ti].nbytes; }
+            }
+            LLAMA_LOG_WARN("%s: [B1] copy expected: layer=%d step=%zu bytes=%zu\n", __func__, il, k, bytes);
+        }
+    }
+
     pass_start_us.assign(n_grp, 0);
     pass_wall_us.assign(n_grp, 0);
     pass_compute_us.assign(n_grp, 0);
