@@ -308,16 +308,14 @@ void llama_ple_prefetch::build() {
 
     // the rows, as llm_graph_input_qwen4exp_ple::set_input computes them; a predecessor before the call is unknown,
     // unless the call starts the sequence (then it reads as EOS)
-    std::vector<int64_t> ctx(n_gram);
     size_t nr = 0;
     for (size_t c = 0; c < n_chunks && !stopping.load(std::memory_order_relaxed); ++c) {
         const int64_t i0 = (int64_t) (c*chunk_size);
         const int64_t i1 = i0 + (int64_t) std::min<size_t>(n - i0, chunk_size);
         cp.clear();
         for (int64_t i = i0; i < i1; ++i) {
-            ctx[0] = toks[i];
-            int64_t known = 0;
-            bool    cut   = false;
+            uint64_t mixed = (uint64_t) toks[i] * hp.ple_layer_multipliers[0];
+            bool cut = false;
             for (int64_t s = 1; s < n_gram; ++s) {
                 if (!cut && i - s < 0) {
                     if (!seq_start) {
@@ -327,13 +325,8 @@ void llama_ple_prefetch::build() {
                 }
                 const int64_t t = cut ? -1 : toks[i - s];
                 cut = cut || t < 0 || t == eos;
-                ctx[s] = cut ? eos : t;
-                known  = s;
-            }
-            uint64_t mixed = (uint64_t) ctx[0] * hp.ple_layer_multipliers[0];
-            for (int64_t g = 2; g <= n_gram && g - 1 <= known; ++g) {
-                mixed ^= (uint64_t) ctx[g - 1] * hp.ple_layer_multipliers[g - 1];
-                const int64_t hb = (g - 2) * per_gram;
+                mixed ^= (uint64_t) (cut ? eos : t) * hp.ple_layer_multipliers[s];
+                const int64_t hb = (s - 1) * per_gram;
                 for (int64_t k = 0; k < per_gram; ++k) {
                     const int64_t h = hb + k;
                     const int32_t r = (int32_t) (mixed % hp.ple_head_vocab_sizes[h] + hp.ple_head_offsets[h]);
