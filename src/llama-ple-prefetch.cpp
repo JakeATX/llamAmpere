@@ -321,7 +321,18 @@ void llama_ple_prefetch::build() {
     // the rows, as llm_graph_input_qwen4exp_ple::set_input computes them; a predecessor before the call is unknown,
     // unless the call starts the sequence (then it reads as EOS)
     size_t nr = 0;
+    int64_t t_window_us = 0;
     for (size_t c = 0; c < n_chunks && !stopping.load(std::memory_order_relaxed); ++c) {
+        // fork: bound hashing, sorting and cold-page samples to the same window as the readers.
+        if (bounded_window && c >= allowed_chunks.load()) {
+            const int64_t tw = ggml_time_us();
+            std::unique_lock<std::mutex> lk(mtx);
+            cv_work.wait(lk, [&]() { return stopping.load() || c < allowed_chunks.load(); });
+            t_window_us += ggml_time_us() - tw;
+            if (stopping.load()) {
+                break;
+            }
+        }
         const int64_t i0 = (int64_t) (c*chunk_size);
         const int64_t i1 = i0 + (int64_t) std::min<size_t>(n - i0, chunk_size);
         cp.clear();
@@ -396,7 +407,7 @@ void llama_ple_prefetch::build() {
             cv_done.notify_all();
         }
     }
-    t_build_us = ggml_time_us() - t_start_us;
+    t_build_us = ggml_time_us() - t_start_us - t_window_us;
     {
         std::lock_guard<std::mutex> lk(mtx);
         built = true;

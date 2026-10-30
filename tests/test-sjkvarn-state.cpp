@@ -1253,6 +1253,14 @@ static void ple_hash_pages_case(bool windowed = false, bool bounded = false, boo
             long long pages_read = -1;
             require(read_at && sscanf(read_at, " ms, %lld read", &pages_read) == 1, "prefetch page total logged");
             require(pages_read == (long long) (coalesced ? expected_reads : n_expected), "every requested page counted after readers join");
+            if (bounded) {
+                // Stop a partial window, then reuse the same prefetcher for a fresh call.
+                for (int retry = 0; retry < 2; ++retry) {
+                    pf->hint(tokens.data(), tokens.size(), pos0);
+                    require(pf->consume(1, nullptr, 0), "bounded prefetch restarts after a partial-window stop");
+                    pf->stop();
+                }
+            }
             if (coalesced) {
                 require(ftruncate(fileno(file.get()), 0) == 0, "truncate prefetch file after successful reads");
                 pf->hint(tokens.data(), tokens.size(), pos0);
@@ -1284,6 +1292,7 @@ static void ple_hash_pages_case(bool windowed = false, bool bounded = false, boo
     }
     if (bounded) {
         printf("OK: ubatch read-ahead cap preserves ready pages and leaves future pages untouched\n");
+        printf("OK: bounded producer stops and restarts after partial-window consumes\n");
     }
     if (coalesced) {
         printf("OK: file-backed coalescing obeys ubatch windows, exact run pages and read totals\n");
