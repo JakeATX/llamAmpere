@@ -15128,6 +15128,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_down_owner(512, 13, 3, true));
     test_cases.emplace_back(new test_dsv4_hc_down_owner(512, 27, 4, true));
     test_cases.emplace_back(new test_dsv4_hc_down_owner(512, 28, 8, false));
+    // Packed finish groups must mask the last one, two or three rows of a warp.
+    for (int64_t rank : {5, 6, 7}) {
+        test_cases.emplace_back(new test_dsv4_hc_down_owner(512, rank, 5, false));
+    }
     // [HCFUSED] real Flash-Next shapes, every token count the kernels specialize, with and without the injection rows
     for (int64_t nt = 1; nt <= 8; ++nt) {
         test_cases.emplace_back(new test_dsv4_hc_fused(2560, 320, nt, true,  true, 1));

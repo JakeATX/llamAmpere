@@ -76,10 +76,11 @@ static constexpr int HCF_OWNER_MAX_ROWS = 336;
 static constexpr int HCF_OWNER_RB = HCF_OWNER_MAX_ROWS/HCF_OWNER_ROWS;
 static __device__ unsigned int hcf_owner_arrive[HCF_CNT_SLOTS*HCF_OWNER_RB];
 
-static __device__ __forceinline__ float hcf_owner_sum(float v) {
+template <int WIDTH = 32>
+static __device__ __forceinline__ float hcf_owner_sum(float v, const unsigned mask = 0xffffffffu) {
 #pragma unroll
-    for (int d = 16; d; d >>= 1) {
-        v = __fadd_rn(v, __shfl_xor_sync(0xffffffffu, v, d));
+    for (int d = WIDTH/2; d; d >>= 1) {
+        v = __fadd_rn(v, __shfl_xor_sync(mask, v, d, WIDTH));
     }
     return v;
 }
@@ -92,7 +93,7 @@ static __global__ void __launch_bounds__(128) hcf_down_owner(
         const char * __restrict__ wd, const int64_t sd, const char * __restrict__ wi, const int64_t si,
         const int R, const int n_rows, const int n_embd, const float eps, const float lo_scale, const float inj_scale,
         float * __restrict__ partial, float * __restrict__ ssq, const int cnt_off,
-        float * __restrict__ dst, const hcf_post_fold pf) {
+        float * __restrict__ dst, const hcf_post_fold pf, const bool finish8) {
     extern __shared__ __align__(16) float sh[];
     __shared__ float sq_w[4][T][4];
     __shared__ float rr[T][4];
@@ -210,8 +211,13 @@ static __global__ void __launch_bounds__(128) hcf_down_owner(
         }
     }
     __syncthreads();
-    for (int ri = warp; ri < HCF_OWNER_ROWS; ri += 4) {
-        const int r = blockIdx.x*HCF_OWNER_ROWS + ri;
+    const bool finish_pack = PACK && finish8;
+    const int rows_pw = finish_pack ? 4 : 1;
+    const int out_lane = finish_pack ? lane % 8 : lane;
+    // Packed rows use four values plus four zero lanes; all 16 rows can finish in one pass.
+    for (int base = warp*rows_pw; base < HCF_OWNER_ROWS; base += 4*rows_pw) {
+        const int r = blockIdx.x*HCF_OWNER_ROWS + base + (finish_pack ? lane/8 : 0);
+        const unsigned out_mask = finish_pack ? __ballot_sync(0xffffffffu, r < n_rows) : 0xffffffffu;
         if (r >= n_rows) {
             continue;
         }
@@ -222,13 +228,13 @@ static __global__ void __launch_bounds__(128) hcf_down_owner(
             for (int s = 0; s < 4; ++s) {
                 float p;
                 if constexpr (PACK) {
-                    p = lane < 4 ? __ldcg(partial + (((int64_t) s*T + t)*n_rows + r)*4 + lane) : 0.0f;
+                    p = out_lane < 4 ? __ldcg(partial + (((int64_t) s*T + t)*n_rows + r)*4 + out_lane) : 0.0f;
                 } else {
                     p = __ldcg(partial + (((int64_t) s*T + t)*n_rows + r)*32 + lane);
                 }
-                v += rr[t][s]*hcf_owner_sum(p);
+                v += rr[t][s]*(finish_pack ? hcf_owner_sum<8>(p, out_mask) : hcf_owner_sum(p));
             }
-            if (lane == 0) {
+            if (out_lane == 0) {
                 if (r < R) {
                     const float a = lo_scale*v;
                     dst[t*R + r] = a/(1.0f + expf(-a));
@@ -837,6 +843,10 @@ static void hcf_down_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, 
         const char * e = getenv("LLAMA_HC_DOWN_OWNER_PACK");
         return e && atoi(e) == 1;
     }();
+    static const bool owner_finish8 = [] {
+        const char * e = getenv("LLAMA_HC_DOWN_OWNER_FINISH8");
+        return e && atoi(e) == 1;
+    }();
     const int owner_rb = (n_rows + HCF_OWNER_ROWS - 1)/HCF_OWNER_ROWS;
     const size_t owner_smem = (size_t) T*n_embd*sizeof(float);
     const size_t owner_static = (5*T*4 + 1)*sizeof(float);
@@ -853,8 +863,8 @@ static void hcf_down_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, 
             auto k = hcf_down_owner<T, F, L, P>;
             CUDA_SET_SHARED_MEMORY_LIMIT(k, owner_limit);
             static const bool reported = [=] {
-                fprintf(stderr, "[hc-down-owner] T=%d rows=%d embd=%d smem=%zu folded=%d lookahead=%d pack=%d\n",
-                        T, n_rows, n_embd, owner_smem, F, L, P);
+                fprintf(stderr, "[hc-down-owner] T=%d rows=%d embd=%d smem=%zu folded=%d lookahead=%d pack=%d finish8=%d\n",
+                        T, n_rows, n_embd, owner_smem, F, L, P, P && owner_finish8);
                 return true;
             }();
             GGML_UNUSED(reported);
@@ -873,7 +883,7 @@ static void hcf_down_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, 
             (const float *) x->data, (const float *) wn->data,
             (const char *) wd->data, wd->nb[1], wi ? (const char *) wi->data : nullptr, wi ? wi->nb[1] : 0,
             R, n_rows, n_embd, eps, lo_scale, inj_scale, partial.get(), sq.get(), owner_slot*HCF_OWNER_RB,
-            (float *) dst->data, pf);
+            (float *) dst->data, pf, owner_finish8);
         return;
     }
     ggml_cuda_pool_alloc<float> P(ctx.pool(), (size_t) n_chunks*n_rows*T);
