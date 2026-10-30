@@ -806,6 +806,7 @@ struct moe_cache_session {
     // GGML_MOE_SKIP_POLICY/_THRESHOLD/_RENORM, read once per window in set_skip_tail (mode 0 rank, 1 threshold,
     // 2 cumulative, -1 invalid) so the per-expert plan never calls getenv
     int skip_mode = 0;
+    int skip_rank_floor = 0;
     float skip_threshold = 0.0f;
     bool skip_renorm = false;
     bool skip_logged = false;
@@ -10556,7 +10557,7 @@ bool ggml_cuda_moe_skipmass_supports(const ggml_tensor * op) {
 }
 
 static __global__ void moe_mass_kernel(const float * weights, float * out_weights, const int32_t * ids,
-        int stride, int width, int layer, int mode, float threshold, bool renorm, int experts,
+        int stride, int width, int layer, int mode, float threshold, bool renorm, int rank_floor, int experts,
         const uint8_t * hot0, const uint8_t * hot1, const uint8_t * hot2,
         uint8_t * masks, int mask_stride, unsigned long long * counts,
         moe_mass_record * trace, unsigned * trace_counts) {
@@ -10595,7 +10596,7 @@ static __global__ void moe_mass_kernel(const float * weights, float * out_weight
         }
     }
     for (int token = tid; token < width; token += blockDim.x) {
-        const bool changed = mode && ggml_moe_skipmass_select(weights + 10 * token, hot + 10 * token, 10, mode, threshold, drop + 10 * token);
+        const bool changed = mode && ggml_moe_skipmass_select(weights + 10 * token, hot + 10 * token, 10, mode, threshold, drop + 10 * token, rank_floor);
         rescale[token] = false;
         if (changed && renorm) {
             float total = 0.0f, kept = 0.0f;
@@ -10671,7 +10672,7 @@ bool ggml_cuda_moe_skipmass_compute(ggml_backend_cuda_context & ctx, ggml_tensor
     GGML_ASSERT(experts <= g_hf_experts && experts <= MOE_TAIL_MAX_EXPERT);
     moe_mass_kernel<<<1, 256, 0, ctx.stream()>>>((const float *) op->src[0]->data, (float *) op->data,
         (const int32_t *) op->src[1]->data, (int) (op->src[1]->nb[1] / sizeof(int32_t)), (int) op->ne[2],
-        layer, active ? mode : 0, threshold, renorm, experts, group[0]->hot, group[1]->hot, group[2]->hot,
+        layer, active ? mode : 0, threshold, renorm, session.skip_rank_floor, experts, group[0]->hot, group[1]->hot, group[2]->hot,
         g_tail_mask, g_hf_experts, g_tail_counts, (moe_mass_record *) session.mass_trace, session.mass_trace_counts);
     CUDA_CHECK(cudaGetLastError());
     session.mass_layer = active ? layer : -1;
@@ -12642,17 +12643,25 @@ static void moe_cache_set_skip_tail(void * opaque, int rank) {
     }
     const char * r = getenv("GGML_MOE_SKIP_RENORM");
     const bool renorm = r && strcmp(r, "1") == 0;
+    const char * f = getenv("GGML_MOE_SKIP_RANK_FLOOR");
+    char * floor_end = nullptr;
+    const long floor_value = mode == 2 && f ? strtol(f, &floor_end, 10) : 0;
+    if (mode == 2 && f && !(floor_end != f && *floor_end == 0 && floor_value >= 0 && floor_value <= 10)) {
+        mode = -1;
+    }
+    const int rank_floor = mode == 2 ? (int) floor_value : 0;
     std::lock_guard<std::mutex> lock(session->mu);
-    const bool policy_changed = session->skip_mode != mode || session->skip_threshold != threshold || session->skip_renorm != renorm;
+    const bool policy_changed = session->skip_mode != mode || session->skip_threshold != threshold || session->skip_renorm != renorm || session->skip_rank_floor != rank_floor;
     if (policy_changed) {
         session->skip_logged = false;
     }
     session->skip_mode = mode;
+    session->skip_rank_floor = rank_floor;
     session->skip_threshold = threshold;
     session->skip_renorm = renorm;
     if (rank > 0 && !session->skip_logged) {
         static const char * names[] = {"invalid", "rank", "threshold", "cumulative"};
-        MOE_CACHE_LOG("[moe-skip] policy=%s tail=%d threshold=%g renorm=%d\n", names[mode + 1], rank, threshold, renorm ? 1 : 0);
+        MOE_CACHE_LOG("[moe-skip] policy=%s tail=%d threshold=%g renorm=%d rank_floor=%d\n", names[mode + 1], rank, threshold, renorm ? 1 : 0, rank_floor);
         session->skip_logged = true;
     }
     if (session->skip_tail == rank && !policy_changed) {

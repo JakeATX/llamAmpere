@@ -6874,14 +6874,14 @@ static bool run_skipmass_rule() {
     ggml_moe_skipmass_select(concentrated, hot, 10, 2, 0.25f, drop);
     for (int i = 0; i < 10; ++i) { ok &= drop[i] == (i >= 2); }
     // Compare the faster selector to the original sorted scan, including cutoff boundaries.
-    auto reference = [](const float * w, const unsigned char * h, int n, int mode, float t, unsigned char * d) {
+    auto reference = [](const float * w, const unsigned char * h, int n, int mode, float t, unsigned char * d, int floor) {
         bool chosen[10] = {};
         float mass = 0.0f;
         for (int i = 0; i < n; ++i) { d[i] = 0; }
         for (int step = 0; step < n; ++step) {
             int best = -1;
             for (int i = n - 1; i >= 0; --i) {
-                if (!chosen[i] && !h[i] && (best < 0 || w[i] < w[best])) { best = i; }
+                if ((mode != 2 || i >= floor) && !chosen[i] && !h[i] && (best < 0 || w[i] < w[best])) { best = i; }
             }
             if (best < 0) { break; }
             chosen[best] = true;
@@ -6900,12 +6900,14 @@ static bool run_skipmass_rule() {
                 for (int mode : {1, 2}) {
                     for (float t : {0.0f, 0.03f, std::nextafter(0.03f, 1.0f), 0.125f, 0.25f, 0.999f}) {
                         if (mode == 2 && t > 0.25f) { continue; }
-                        reference(w, hot, n, mode, t, expected);
-                        const bool changed = ggml_moe_skipmass_select(w, hot, n, mode, t, drop);
+                      for (int floor : {0, 1, 5, 10}) {
+                        reference(w, hot, n, mode, t, expected, floor);
+                        const bool changed = ggml_moe_skipmass_select(w, hot, n, mode, t, drop, floor);
                         ok &= memcmp(drop, expected, n) == 0;
                         bool expected_changed = false;
                         for (int i = 0; i < n; ++i) { expected_changed |= expected[i] != 0; }
                         ok &= changed == expected_changed;
+                      }
                     }
                 }
             }
@@ -7116,9 +7118,12 @@ static bool run_skip_tail_layer(ggml_backend_t gpu, ggml_backend_t cpu, log_capt
                 }
                 for (int mode : {1, 2}) {
                     for (int renorm : {0, 1}) {
+                      for (int floor : {0, 5, 10}) {
                         set_env("GGML_MOE_SKIP_POLICY", mode == 1 ? "threshold" : "cumulative");
                         set_env("GGML_MOE_SKIP_THRESHOLD", mode == 1 ? "0.04" : "0.08");
                         set_env("GGML_MOE_SKIP_RENORM", renorm ? "1" : "0");
+                        const std::string floor_text = std::to_string(floor);
+                        set_env("GGML_MOE_SKIP_RANK_FLOOR", floor_text.c_str());
                         api.set_skip_tail(session, rank); // Recapture for each policy.
                         api.session_enter(session);
                         ok &= ggml_backend_graph_compute(gpu, mass_graph.graph) == GGML_STATUS_SUCCESS;
@@ -7130,7 +7135,7 @@ static bool run_skip_tail_layer(ggml_backend_t gpu, ggml_backend_t cpu, log_capt
                         for (int t = 0; t < tokens; ++t) {
                             unsigned char hot[10];
                             for (int j = 0; j < k_used; ++j) { hot[j] = routing[64 * t + j] < 6 ? 7 : 0; }
-                            ggml_moe_skipmass_select(shares, hot, k_used, mode, mode == 1 ? 0.04f : 0.08f, drops.data() + t * k_used);
+                            ggml_moe_skipmass_select(shares, hot, k_used, mode, mode == 1 ? 0.04f : 0.08f, drops.data() + t * k_used, floor);
                             float total = 0.0f, kept = 0.0f;
                             bool changed = false;
                             for (int j = 0; j < k_used; ++j) {
@@ -7170,6 +7175,8 @@ static bool run_skip_tail_layer(ggml_backend_t gpu, ggml_backend_t cpu, log_capt
                         set_env("GGML_MOE_SKIP_POLICY", nullptr);
                         set_env("GGML_MOE_SKIP_THRESHOLD", nullptr);
                         set_env("GGML_MOE_SKIP_RENORM", nullptr);
+                        set_env("GGML_MOE_SKIP_RANK_FLOOR", nullptr);
+                      }
                     }
                 }
                 const bool cpu_ok = compare_output(expected, exact, 8e-3);
