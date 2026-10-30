@@ -31,6 +31,22 @@ static int64_t ple_pf_env(const char * name, int64_t def) {
     return v && *v ? (int64_t) atoll(v) : def;
 }
 
+void llama_ple_hash_rows(const llama_hparams & hp, llama_token token, const llama_token * prev, int32_t * rows) {
+    const uint32_t n_prev = hp.ple_ngram_size - 1;
+    uint64_t mixed = (uint64_t) token * hp.ple_layer_multipliers[0];
+    bool cut = false;
+    for (uint32_t s = 1; s <= n_prev; ++s) {
+        const llama_token t = cut ? LLAMA_TOKEN_NULL : prev[n_prev - s];
+        cut = cut || t < 0 || t == (llama_token) hp.ple_eos_token_id;
+        mixed ^= (uint64_t) (cut ? (int64_t) hp.ple_eos_token_id : t) * hp.ple_layer_multipliers[s];
+        const uint32_t base = (s - 1) * hp.ple_heads_per_ngram;
+        for (uint32_t g = 0; g < hp.ple_heads_per_ngram; ++g) {
+            const uint32_t h = base + g;
+            rows[h] = (int32_t) (mixed % hp.ple_head_vocab_sizes[h] + hp.ple_head_offsets[h]);
+        }
+    }
+}
+
 #if defined(__linux__)
 // the file and offset behind a mapped address, from /proc/self/maps
 static bool ple_pf_resolve(const void * addr, std::string & path, uint64_t & off) {

@@ -2387,7 +2387,16 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
     // predecessors come from the KV cells (ext.tok); apply_ubatch() already stored this ubatch, so its own tokens count too
     mctx->get_prev_tokens(*ubatch, n_prev, prev);
 
+    // fork: reuse each unsigned hash prefix; keep the original path until exact-row gates pass.
+    static const bool hash_prefix = [] {
+        const char * v = getenv("LLAMA_PLE_HASH_PREFIX");
+        return v && atoi(v) != 0;
+    }();
     for (int64_t i = 0; i < n_tokens; ++i) {
+        if (hash_prefix) {
+            llama_ple_hash_rows(hparams, tok_of(i), prev.data() + i*n_prev, idx.data() + i*n_heads);
+            continue;
+        }
         // an EOS in the window resets everything at or before it
         // a missing predecessor (before the sequence start, or no cached cell) reads as EOS
         // the EOS of the token itself does not cut its own context, as in the reference

@@ -1157,6 +1157,27 @@ static void ple_hash_pages_case(bool windowed = false, bool bounded = false, boo
             }
             std::vector<size_t> first_chunk(n_rows, n_tokens);
             for (size_t i = 0; i < n_tokens; ++i) {
+                std::vector<llama_token> history(n_gram - 1);
+                for (uint32_t s = 1; s < n_gram; ++s) {
+                    history[n_gram - 1 - s] = i < s ? LLAMA_TOKEN_NULL : tokens[i - s];
+                }
+                std::vector<int32_t> rows(n_heads);
+                llama_ple_hash_rows(hp, tokens[i], history.data(), rows.data());
+                // Independent old graph formula: restart the hash for each ngram width.
+                for (uint32_t g = 2; g <= n_gram; ++g) {
+                    uint64_t mixed = (uint64_t) tokens[i]*hp.ple_layer_multipliers[0];
+                    bool cut = false;
+                    for (uint32_t s = 1; s < g; ++s) {
+                        const llama_token t = history[n_gram - 1 - s];
+                        cut = cut || t < 0 || t == (llama_token) eos;
+                        mixed ^= (uint64_t) (cut ? (llama_token) eos : t)*hp.ple_layer_multipliers[s];
+                    }
+                    for (uint32_t k = 0; k < per_gram; ++k) {
+                        const uint32_t h = (g - 2)*per_gram + k;
+                        require(rows[h] == (int32_t) (hp.ple_head_offsets[h] + mixed % hp.ple_head_vocab_sizes[h]),
+                                "incremental graph hash matches every old row index");
+                    }
+                }
                 for (uint32_t g = 2; g <= n_gram; ++g) {
                     uint64_t mixed = (uint64_t) tokens[i]*hp.ple_layer_multipliers[0];
                     bool cut = false, known = true;
@@ -1286,6 +1307,7 @@ static void ple_hash_pages_case(bool windowed = false, bool bounded = false, boo
         }
     }
     printf("OK: incremental 4/8-gram hashes match exact page sets across heads, EOS and call offsets\n");
+    printf("OK: incremental graph hashes match every original row index with EOS and missing history\n");
     if (windowed) {
         printf("OK: batched page readers preserve exact pages and totals across short windows and a partial final batch\n");
         printf("OK: every consumed chunk has all required pages before stop joins readers\n");

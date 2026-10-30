@@ -24,8 +24,12 @@
 #include "llama.h"
 
 struct llama_model;
+struct llama_hparams;
 struct llama_batch_ext;
 struct ggml_tensor;
+
+// prev holds ngram_size - 1 tokens, oldest first; missing tokens use LLAMA_TOKEN_NULL.
+void llama_ple_hash_rows(const llama_hparams & hp, llama_token token, const llama_token * prev, int32_t * rows);
 
 class llama_ple_prefetch {
 public:
