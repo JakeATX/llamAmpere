@@ -993,6 +993,7 @@ static void hcf_down_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, 
             GGML_UNUSED(reported);
             hcf_row_owner_stage<F><<<dim3(4, T), 256, 0, stream>>>((const float *) x->data, (const float *) wn->data,
                     n_embd, n_rows, T, eps, xn.get(), (float *) dst->data, pf);
+            CUDA_CHECK(cudaGetLastError());
         };
         if (hpost != nullptr) {
             stage(std::true_type{});
@@ -1004,6 +1005,7 @@ static void hcf_down_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, 
             hcf_down_row_owner<T, L><<<(n_rows + row_warps - 1)/row_warps, 32*row_warps, 0, stream>>>(xn.get(),
                     (const char *) wd->data, wd->nb[1], wi ? (const char *) wi->data : nullptr, wi ? wi->nb[1] : 0,
                     R, n_rows, n_embd, lo_scale, inj_scale, (float *) dst->data);
+            CUDA_CHECK(cudaGetLastError());
         };
         if (row_lookahead) {
             rows(std::true_type{});
