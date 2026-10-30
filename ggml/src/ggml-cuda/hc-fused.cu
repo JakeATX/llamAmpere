@@ -27,7 +27,7 @@
 #include <unordered_map>
 
 static constexpr int HCF_CHUNK      = 512;  // columns per split-K chunk; n_embd must be a multiple
-static constexpr int HCF_DOWN_WARPS = 8;
+static constexpr int HCF_DOWN_WARPS_DEF = 8;
 static constexpr int HCF_DOWN_ROWS_DEF = 4;  // rows per warp (default; LLAMA_HC_DOWN_ROWS=1|2 gives more, smaller CTAs)
 static constexpr int HCF_UP_WARPS   = 16;   // embedding columns per CTA
 static constexpr int HCF_MAX_T      = 8;
@@ -76,7 +76,7 @@ static __device__ __forceinline__ float4 hcf_post_val4(const hcf_post_fold & pf,
 // ssq [row block][n_chunks][T]    partial sums of x^2 (only row block 0 when cnt == nullptr)
 // cnt != nullptr: the last CTA to finish a row block (over all chunks) also runs the finish for its 32 rows
 // (same sums in the same order as hcf_down_finish, so the result is bit-identical to the two-kernel path).
-template <int T, bool FOLD, int HCF_DOWN_ROWS, bool WARP_FINISH = false, bool LATE_WEIGHTS = false>
+template <int T, bool FOLD, int HCF_DOWN_ROWS, bool WARP_FINISH = false, bool LATE_WEIGHTS = false, int HCF_DOWN_WARPS = HCF_DOWN_WARPS_DEF>
 static __global__ void __launch_bounds__(HCF_DOWN_WARPS*WARP_SIZE)
 hcf_down_partial(
         const float * __restrict__ x, const float * __restrict__ wn,
@@ -142,23 +142,25 @@ hcf_down_partial(
         xs[t][e] = make_float4(xv.x*gv.x, xv.y*gv.y, xv.z*gv.z, xv.w*gv.w);
     }
 
-    if ((fuse_finish || blockIdx.x == 0) && warp < T) {
-        const float4 * xr = (const float4 *) (x + (int64_t) warp*hc_dim + j0);
-        float s = 0.0f;
+    if (fuse_finish || blockIdx.x == 0) {
+        for (int t = warp; t < T; t += HCF_DOWN_WARPS) {
+            const float4 * xr = (const float4 *) (x + (int64_t) t*hc_dim + j0);
+            float s = 0.0f;
 #pragma unroll
-        for (int it = 0; it < HCF_CHUNK/4/WARP_SIZE; ++it) {
-            float4 v;
-            if constexpr (FOLD) {
-                const int e = it*WARP_SIZE + lane;
-                v = hcf_post_val4(pf, warp, s_c, i0_c + 4*e, j0 + 4*e, hc_dim);
-            } else {
-                v = xr[it*WARP_SIZE + lane];
+            for (int it = 0; it < HCF_CHUNK/4/WARP_SIZE; ++it) {
+                float4 v;
+                if constexpr (FOLD) {
+                    const int e = it*WARP_SIZE + lane;
+                    v = hcf_post_val4(pf, t, s_c, i0_c + 4*e, j0 + 4*e, hc_dim);
+                } else {
+                    v = xr[it*WARP_SIZE + lane];
+                }
+                s += v.x*v.x + v.y*v.y + v.z*v.z + v.w*v.w;
             }
-            s += v.x*v.x + v.y*v.y + v.z*v.z + v.w*v.w;
-        }
-        s = warp_reduce_sum(s);
-        if (lane == 0) {
-            ssq[((int64_t) blockIdx.x*n_chunks + c)*T + warp] = s;
+            s = warp_reduce_sum(s);
+            if (lane == 0) {
+                ssq[((int64_t) blockIdx.x*n_chunks + c)*T + t] = s;
+            }
         }
     }
 
@@ -610,8 +612,13 @@ static void hcf_down_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, 
         const char * e = getenv("LLAMA_HC_DOWN_LATE_WEIGHTS");
         return e && atoi(e) == 1;
     }();
-    const int rows_pw = (n_rows + HCF_DOWN_WARPS*rows_env - 1)/(HCF_DOWN_WARPS*rows_env) <= HCF_CNT_RB ? rows_env : HCF_DOWN_ROWS_DEF;
-    const int n_rb     = (n_rows + HCF_DOWN_WARPS*rows_pw - 1)/(HCF_DOWN_WARPS*rows_pw);
+    static const int warps_env = [] {
+        const char * e = getenv("LLAMA_HC_DOWN_WARPS");
+        return e && atoi(e) == 4 ? 4 : HCF_DOWN_WARPS_DEF;
+    }();
+    const int down_w = warps_env;
+    const int rows_pw = (n_rows + down_w*rows_env - 1)/(down_w*rows_env) <= HCF_CNT_RB ? rows_env : HCF_DOWN_ROWS_DEF;
+    const int n_rb     = (n_rows + down_w*rows_pw - 1)/(down_w*rows_pw);
 
     GGML_ASSERT(((uintptr_t) x->data) % 16 == 0 && ((uintptr_t) wn->data) % 16 == 0);
     GGML_ASSERT(hc == 4);
@@ -636,30 +643,38 @@ static void hcf_down_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, 
         pf.sp1  = hpost->src[2]->nb[1]/sizeof(float);
         GGML_ASSERT(pf.h == x->data);
     }
-    auto launch = [&](auto finish, auto late) {
+    auto launch = [&](auto finish, auto late, auto warps) {
         constexpr bool WF = decltype(finish)::value;
         constexpr bool LW = decltype(late)::value;
+        constexpr int NW = decltype(warps)::value;
         auto kernel = hpost != nullptr ?
-            (rows_pw == 1 ? hcf_down_partial<T, true, 1, WF, LW> : rows_pw == 2 ? hcf_down_partial<T, true, 2, WF, LW> : hcf_down_partial<T, true, HCF_DOWN_ROWS_DEF, WF, LW>) :
-            (rows_pw == 1 ? hcf_down_partial<T, false, 1, WF, LW> : rows_pw == 2 ? hcf_down_partial<T, false, 2, WF, LW> : hcf_down_partial<T, false, HCF_DOWN_ROWS_DEF, WF, LW>);
-        kernel<<<grid, HCF_DOWN_WARPS*WARP_SIZE, 0, stream>>>(
+            (rows_pw == 1 ? hcf_down_partial<T, true, 1, WF, LW, NW> : rows_pw == 2 ? hcf_down_partial<T, true, 2, WF, LW, NW> : hcf_down_partial<T, true, HCF_DOWN_ROWS_DEF, WF, LW, NW>) :
+            (rows_pw == 1 ? hcf_down_partial<T, false, 1, WF, LW, NW> : rows_pw == 2 ? hcf_down_partial<T, false, 2, WF, LW, NW> : hcf_down_partial<T, false, HCF_DOWN_ROWS_DEF, WF, LW, NW>);
+        kernel<<<grid, NW*WARP_SIZE, 0, stream>>>(
             (const float *) x->data, (const float *) wn->data,
             (const char *) wd->data, wd->nb[1],
             wi ? (const char *) wi->data : nullptr, wi ? wi->nb[1] : 0,
             R, n_rows, hc_dim, P.get(), ssq.get(),
             cnt_off, n_embd, eps, lo_scale, inj_scale, (float *) dst->data, pf);
     };
+    auto launch_warps = [&](auto finish, auto late) {
+        if (down_w == 4) {
+            launch(finish, late, std::integral_constant<int, 4>{});
+        } else {
+            launch(finish, late, std::integral_constant<int, HCF_DOWN_WARPS_DEF>{});
+        }
+    };
     if (late_weights) {
         if (warp_finish) {
-            launch(std::true_type{}, std::true_type{});
+            launch_warps(std::true_type{}, std::true_type{});
         } else {
-            launch(std::false_type{}, std::true_type{});
+            launch_warps(std::false_type{}, std::true_type{});
         }
     } else {
         if (warp_finish) {
-            launch(std::true_type{}, std::false_type{});
+            launch_warps(std::true_type{}, std::false_type{});
         } else {
-            launch(std::false_type{}, std::false_type{});
+            launch_warps(std::false_type{}, std::false_type{});
         }
     }
 

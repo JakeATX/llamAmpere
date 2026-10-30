@@ -15090,6 +15090,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t nt : { 1, 4, 8 }) {
         test_cases.emplace_back(new test_dsv4_hc_fused(1024, 128, nt, true, true, 2));
     }
+    // A four-warp down CTA must stage norms for tokens beyond warp 3 and finish its row tail.
+    for (int64_t nt : { 3, 5, 8 }) {
+        test_cases.emplace_back(new test_dsv4_hc_fused(1024, 64, nt, true, true, 3));
+    }
     // [GDNGATES] Flash-Next linear-attention gates at every token count the kernel specializes, both graph orders
     for (int64_t nt = 1; nt <= 8; ++nt) {
         test_cases.emplace_back(new test_gdn_gates(2560, 48, nt, true));
