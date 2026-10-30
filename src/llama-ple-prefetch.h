@@ -65,6 +65,7 @@ private:
     bool   run_ready(size_t i) const; // under mtx: run i exists and may be read, or there is nothing more to read
     double resident_fraction(const std::vector<uint64_t> & keys, uint64_t base) const;
     void   verify_rows(const int32_t * idx, size_t n_idx); // fork: re-queue pages evicted after their read
+    void   test_drop_rows(const int32_t * idx, size_t n_idx); // fork: test only, page out N% of the ubatch's rows
 
     const llama_model * model = nullptr;
     const ggml_tensor * ple   = nullptr;
@@ -88,6 +89,8 @@ private:
     int64_t  n_verify_missing = 0;           // pages of the call found evicted at consume time
     int     n_verify_ubatch  = 0;            // ubatches with at least one evicted page
     int64_t  t_verify_us      = 0;
+    int      test_drop        = 0;           // fork: LLAMA_PLE_PF_TEST_DROP percent of rows paged out (test only)
+    int64_t  n_test_dropped   = 0;
     uint32_t n_min     = 256;
     uint32_t n_ubatch  = 0;
     uint64_t n_ahead   = 0;      // tokens read ahead of the gather

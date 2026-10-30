@@ -143,6 +143,7 @@ std::unique_ptr<llama_ple_prefetch> llama_ple_prefetch::create(const llama_model
     }
     pf->verify    = ple_pf_env("LLAMA_PLE_PF_VERIFY", 0) > 0;
     pf->verify_sync = ple_pf_env("LLAMA_PLE_PF_VERIFY", 0) >= 2;
+    pf->test_drop   = (int) std::min<int64_t>(ple_pf_env("LLAMA_PLE_PF_TEST_DROP", 0), 100);
     pf->n_ubatch  = n_ubatch;
     pf->row_size  = t->nb[1];
     pf->n_rows    = (uint64_t) t->ne[1];
@@ -309,6 +310,7 @@ void llama_ple_prefetch::begin(llama_pos pos0) {
     n_map_runs = 0;
     n_direct_runs = 0;
     n_verify_missing = 0;
+    n_test_dropped   = 0;
     n_verify_ubatch  = 0;
     t_verify_us      = 0;
     n_pages_all = 0;
@@ -713,10 +715,34 @@ bool llama_ple_prefetch::consume(uint32_t n_tokens, const int32_t * idx, size_t 
     t_wait_us += ggml_time_us() - tw;
     ++n_ubatch_c;
 
+    if (test_drop > 0 && idx && n_idx) {
+        test_drop_rows(idx, n_idx);
+    }
     if (verify && idx && n_idx) {
         verify_rows(idx, n_idx);
     }
     return true;
+}
+
+// fork: test only. LLAMA_PLE_PF_TEST_DROP=N pushes the pages of a fixed N% of this ubatch's rows out of the page cache
+// after their prefetch read, which is what memory pressure does on a small-RAM host. Lets the VERIFY paths be timed on
+// a large-RAM box. MADV_PAGEOUT reclaims clean file pages mapped only by this process.
+void llama_ple_prefetch::test_drop_rows(const int32_t * idx, size_t n_idx) {
+#if defined(__linux__) && defined(MADV_PAGEOUT)
+    const uintptr_t tb = (uintptr_t) ple->data;
+    for (size_t i = 0; i < n_idx; ++i) {
+        const int32_t r = idx[i];
+        if (r < 0 || (uint64_t) r >= n_rows || ((uint32_t) r*2654435761u) % 100 >= (uint32_t) test_drop) {
+            continue;
+        }
+        const uintptr_t a = tb + (uint64_t) r*row_size, a0 = a - a%4096;
+        if (madvise((void *) a0, (size_t) (a + row_size - a0), MADV_PAGEOUT) == 0) {
+            ++n_test_dropped;
+        }
+    }
+#else
+    GGML_UNUSED(idx); GGML_UNUSED(n_idx);
+#endif
 }
 
 // fork: a page read early in a long call can be evicted again before its ubatch gathers (the readers dedup pages over
@@ -825,6 +851,9 @@ void llama_ple_prefetch::stop() {
             "%d ubatches waited %.1f ms in all, %d readers%s; bulk mapped runs=%" PRId64 "; direct mapped runs=%" PRId64, __func__, toks.size(), n_pages_all, n_pages_all*4096.0/1048576.0,
             (size_t) n_built.load(), t_build_us.load()/1e3, n_read.load(), t_last_read_us.load()/1e3, n_ubatch_c, t_wait_us/1e3,
             n_readers, n_ubatch_u ? " (some ubatches fell outside the call)" : "", n_map_runs.load(), n_direct_runs.load());
+    if (test_drop > 0) {
+        LLAMA_LOG_CONT("; test drop: %" PRId64 " rows paged out", n_test_dropped);
+    }
     if (verify) {
         LLAMA_LOG_CONT("; verify: %" PRId64 " pages evicted before their gather in %d ubatches, %s in %.1f ms",
                 n_verify_missing, n_verify_ubatch, verify_sync ? "read back" : "re-queued", t_verify_us/1e3);
