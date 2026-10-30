@@ -147,6 +147,7 @@ std::unique_ptr<llama_ple_prefetch> llama_ple_prefetch::create(const llama_model
     // fork: the startup-profile cache remaps rows to its own table, which this decode does not read
     pf->decode_on    = ple_pf_env("LLAMA_PLE_DECODE", 0) > 0 && !model.ple_cache;
     pf->n_decode     = (int) std::min<int64_t>(std::max<int64_t>(1, ple_pf_env("LLAMA_PLE_DECODE_THREADS", 16)), 256);
+    pf->dec_pinned   = ple_pf_env("LLAMA_PLE_DECODE_PINNED", 1) > 0;
     pf->n_decode_min = (uint32_t) std::min<int64_t>(std::max<int64_t>(1, ple_pf_env("LLAMA_PLE_DECODE_MIN", 1024)), UINT32_MAX);
     pf->n_ubatch  = n_ubatch;
     pf->row_size  = t->nb[1];
@@ -206,6 +207,9 @@ std::unique_ptr<llama_ple_prefetch> llama_ple_prefetch::create(const llama_model
 
 llama_ple_prefetch::~llama_ple_prefetch() {
     stop();
+    if (dec_pin) {
+        ggml_backend_buffer_free(dec_pin);
+    }
 #if defined(__linux__)
     if (fd >= 0) {
         close(fd);
@@ -935,14 +939,11 @@ void llama_ple_prefetch::gather(uint32_t n_tokens, const int32_t * idx, size_t n
     const bool hit = running && consumed >= n_tokens && dec_t0 == consumed - n_tokens && dec_rows.size() == n_idx &&
             memcmp(dec_rows.data(), idx, n_idx*sizeof(int32_t)) == 0;
     if (!hit) {
-        if (dec_data.size() < n_idx*ne0) {
-            dec_data.resize(n_idx*ne0);
-        }
-        decode_into(idx, n_idx, dec_data.data());
+        decode_into(idx, n_idx, decode_buf(n_idx*ne0, dst));
     }
     hit ? ++n_dec_hit : ++n_dec_miss;
     t_dec_wait_us += ggml_time_us() - tg;
-    ggml_backend_tensor_set(dst, dec_data.data(), 0, n_idx*ne0*sizeof(float)); // synchronous: the buffer is free after
+    ggml_backend_tensor_set(dst, dec_ptr, 0, n_idx*ne0*sizeof(float)); // synchronous: the buffer is free after
     dec_t0 = UINT64_MAX;
 
     // the next ubatch of the call, assumed the same size (a different one is decoded in place)
@@ -952,7 +953,8 @@ void llama_ple_prefetch::gather(uint32_t n_tokens, const int32_t * idx, size_t n
         return;
     }
     const uint64_t n = std::min<uint64_t>(n_tokens, toks.size() - a);
-    dec_thread = std::thread([this, a, n, n_prev, ne0]() {
+    float * out = decode_buf(n*hp.ple_n_heads*ne0, dst); // sized here: the thread must not reallocate
+    dec_thread = std::thread([this, a, n, n_prev, out]() {
         const auto & hp = model->hparams;
         const uint64_t nh = hp.ple_n_heads;
         dec_rows.resize(n*nh);
@@ -960,10 +962,35 @@ void llama_ple_prefetch::gather(uint32_t n_tokens, const int32_t * idx, size_t n
         for (uint64_t i = 0; i < n; ++i) {
             llama_ple_hash_rows(hp, toks[a + i], toks.data() + a + i - n_prev, dec_rows.data() + i*nh);
         }
-        if (dec_data.size() < n*nh*ne0) {
-            dec_data.resize(n*nh*ne0);
-        }
-        decode_into(dec_rows.data(), dec_rows.size(), dec_data.data());
+        decode_into(dec_rows.data(), dec_rows.size(), out);
         dec_t0 = a;
     });
+}
+
+float * llama_ple_prefetch::decode_buf(size_t n, const ggml_tensor * dst) {
+    if (dec_ptr && n <= dec_cap) {
+        return dec_ptr;
+    }
+    if (dec_pin) {
+        ggml_backend_buffer_free(dec_pin);
+        dec_pin = nullptr;
+    }
+    ggml_backend_buffer_type_t buft = nullptr;
+    if (dec_pinned && dst->buffer && !ggml_backend_buffer_is_host(dst->buffer)) {
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(dst->buffer));
+        buft = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+    }
+    if (buft) {
+        dec_pin = ggml_backend_buft_alloc_buffer(buft, n*sizeof(float));
+    }
+    if (dec_pin) {
+        std::vector<float>().swap(dec_data);
+        dec_ptr = (float *) ggml_backend_buffer_get_base(dec_pin);
+    } else {
+        dec_pinned = false; // pageable from here on
+        dec_data.resize(n);
+        dec_ptr = dec_data.data();
+    }
+    dec_cap = n;
+    return dec_ptr;
 }

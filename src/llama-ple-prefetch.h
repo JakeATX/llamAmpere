@@ -85,6 +85,13 @@ private:
     uint64_t dec_t0       = UINT64_MAX;
     std::vector<int32_t> dec_rows;
     std::vector<float>   dec_data;
+    // fork: LLAMA_PLE_DECODE_PINNED (default 1 with decode): rows land in page-locked host memory of the input's
+    // device, so the upload is a direct DMA instead of a staged pageable copy. dec_ptr is dec_pin or dec_data.
+    bool                  dec_pinned = true;
+    ggml_backend_buffer_t dec_pin    = nullptr;
+    size_t                dec_cap    = 0; // floats
+    float *               dec_ptr    = nullptr;
+    float * decode_buf(size_t n, const ggml_tensor * dst); // main thread only, decode thread joined
     std::thread          dec_thread;
     int      n_dec_hit = 0, n_dec_miss = 0;
     int64_t  t_dec_wait_us = 0;
