@@ -803,6 +803,12 @@ struct moe_cache_session {
     // --moe-skip-tail cutoff for the current window (0 = exact; guarded by mu, read at graph build time) and the
     // missed tensor-expert rows the host path left out because of it
     int skip_tail = 0;
+    // GGML_MOE_SKIP_POLICY/_THRESHOLD/_RENORM, read once per window in set_skip_tail (mode 0 rank, 1 threshold,
+    // 2 cumulative, -1 invalid) so the per-expert plan never calls getenv
+    int skip_mode = 0;
+    float skip_threshold = 0.0f;
+    bool skip_renorm = false;
+    bool skip_logged = false;
     int mass_layer = -1;
     const void * mass_ids = nullptr;
     void * mass_trace = nullptr;
@@ -4405,7 +4411,7 @@ static int moe_cache_plan(
         }
 
         // --moe-skip-tail: a missed expert that no token of the window ranks in the head is left out, with no fill.
-        if (session.skip_tail > 0 && (!getenv("GGML_MOE_SKIP_POLICY") || strcmp(getenv("GGML_MOE_SKIP_POLICY"), "rank") == 0) &&
+        if (session.skip_tail > 0 && session.skip_mode == 0 &&
                 ggml_moe_cache_tail_rank_ok(ids, n_ids, (int) node->n_tokens, index, session.skip_tail)) {
             const auto found = pool.map.find(moe_cache_key{node->host_base, expert});
             const bool cached = found != pool.map.end() && pool.slots[found->second].state == moe_cache_slot_state::valid;
@@ -10648,13 +10654,10 @@ bool ggml_cuda_moe_skipmass_compute(ggml_backend_cuda_context & ctx, ggml_tensor
     GGML_ASSERT(layer < (int) session.mj_groups.size());
     const auto & group = session.mj_groups[layer];
     GGML_ASSERT(group[0] && group[1] && group[2] && g_tail_mask && moe_missjoin_hitfirst_enabled());
-    const char * policy = getenv("GGML_MOE_SKIP_POLICY");
-    const int mode = !policy || strcmp(policy, "rank") == 0 ? 0 : strcmp(policy, "threshold") == 0 ? 1 : strcmp(policy, "cumulative") == 0 ? 2 : -1;
+    const int mode = session.skip_mode;
     GGML_ASSERT(mode >= 0);
-    const char * t = getenv("GGML_MOE_SKIP_THRESHOLD");
-    char * end = nullptr;
-    const float threshold = t ? strtof(t, &end) : 0.0f;
-    GGML_ASSERT(!mode || (t && end != t && *end == 0 && ggml_moe_skipmass_budget_valid(mode, threshold)));
+    const float threshold = session.skip_threshold;
+    GGML_ASSERT(!mode || ggml_moe_skipmass_budget_valid(mode, threshold));
     const bool active = mode && session.skip_tail > 0;
     if (!active && !session.mass_trace) {
         // fork: exact evaluation needs no route selection or residency reads.
@@ -10663,8 +10666,7 @@ bool ggml_cuda_moe_skipmass_compute(ggml_backend_cuda_context & ctx, ggml_tensor
         session.mass_ids = nullptr;
         return true;
     }
-    const char * r = getenv("GGML_MOE_SKIP_RENORM");
-    const bool renorm = r && strcmp(r, "1") == 0;
+    const bool renorm = session.skip_renorm;
     const int experts = (int) group[0]->desc.n_expert;
     GGML_ASSERT(experts <= g_hf_experts && experts <= MOE_TAIL_MAX_EXPERT);
     moe_mass_kernel<<<1, 256, 0, ctx.stream()>>>((const float *) op->src[0]->data, (float *) op->data,
@@ -10757,10 +10759,9 @@ static bool moe_hf_begin(ggml_backend_cuda_context & ctx, moe_cache_session & se
     args.stride = g_hf_stride;
     const int n_expert = (int) group[0]->desc.n_expert;
     // --moe-skip-tail: the cutoff masks go first on the side stream; the plan then sees left-out experts as resident.
-    const char * mass_policy = getenv("GGML_MOE_SKIP_POLICY");
-    const bool mass = session.skip_tail > 0 && mass_policy && strcmp(mass_policy, "rank") != 0 &&
+    const bool mass = session.skip_tail > 0 && session.skip_mode != 0 &&
             session.mass_layer == table.mj_layer && session.mass_ids == ids->data;
-    const bool tail = (mass || (session.skip_tail > 0 && (!getenv("GGML_MOE_SKIP_POLICY") || strcmp(getenv("GGML_MOE_SKIP_POLICY"), "rank") == 0))) && g_tail_mask && n_expert <= MOE_TAIL_MAX_EXPERT &&
+    const bool tail = (mass || (session.skip_tail > 0 && session.skip_mode == 0)) && g_tail_mask && n_expert <= MOE_TAIL_MAX_EXPERT &&
             n_expert <= g_hf_experts && session.skip_tail < (int) ids->ne[0];
     session.tail_layer = tail ? table.mj_layer : -1;
     if (tail && !mass) {
@@ -12631,8 +12632,30 @@ static void moe_cache_set_skip_tail(void * opaque, int rank) {
     if (!session || rank < 0 || rank > 9) {
         return;
     }
+    const char * policy = getenv("GGML_MOE_SKIP_POLICY");
+    int mode = !policy || strcmp(policy, "rank") == 0 ? 0 : strcmp(policy, "threshold") == 0 ? 1 : strcmp(policy, "cumulative") == 0 ? 2 : -1;
+    const char * t = getenv("GGML_MOE_SKIP_THRESHOLD");
+    char * end = nullptr;
+    const float threshold = mode > 0 && t ? strtof(t, &end) : 0.0f;
+    if (mode > 0 && !(t && end != t && *end == 0 && std::isfinite(threshold) && ggml_moe_skipmass_budget_valid(mode, threshold))) {
+        mode = -1; // asserted where the drop kernel would use it
+    }
+    const char * r = getenv("GGML_MOE_SKIP_RENORM");
+    const bool renorm = r && strcmp(r, "1") == 0;
     std::lock_guard<std::mutex> lock(session->mu);
-    if (session->skip_tail == rank) {
+    const bool policy_changed = session->skip_mode != mode || session->skip_threshold != threshold || session->skip_renorm != renorm;
+    if (policy_changed) {
+        session->skip_logged = false;
+    }
+    session->skip_mode = mode;
+    session->skip_threshold = threshold;
+    session->skip_renorm = renorm;
+    if (rank > 0 && !session->skip_logged) {
+        static const char * names[] = {"invalid", "rank", "threshold", "cumulative"};
+        MOE_CACHE_LOG("[moe-skip] policy=%s tail=%d threshold=%g renorm=%d\n", names[mode + 1], rank, threshold, renorm ? 1 : 0);
+        session->skip_logged = true;
+    }
+    if (session->skip_tail == rank && !policy_changed) {
         return;
     }
     session->skip_tail = rank;
