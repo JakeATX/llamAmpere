@@ -146,7 +146,10 @@ static __global__ void __launch_bounds__(256) hcf_down_row_owner(
                     next = __ldg((const uint4 *) wr + (s*n_embd + j + 256)/8);
                 }
             }
-            const uint32_t p[4] = { pk.x, pk.y, pk.z, pk.w };
+            const float w[8] = {
+                hcf_bf16_lo(pk.x), hcf_bf16_hi(pk.x), hcf_bf16_lo(pk.y), hcf_bf16_hi(pk.y),
+                hcf_bf16_lo(pk.z), hcf_bf16_hi(pk.z), hcf_bf16_lo(pk.w), hcf_bf16_hi(pk.w),
+            };
 #pragma unroll
             for (int t = 0; t < T; ++t) {
                 const float * src = xn + (int64_t) t*hc_dim + s*n_embd + j;
@@ -155,9 +158,8 @@ static __global__ void __launch_bounds__(256) hcf_down_row_owner(
                 const float v[8] = { a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w };
                 float dot = 0.0f;
 #pragma unroll
-                for (int k = 0; k < 4; ++k) {
-                    dot = __fmaf_rn(hcf_bf16_lo(p[k]), v[2*k], dot);
-                    dot = __fmaf_rn(hcf_bf16_hi(p[k]), v[2*k + 1], dot);
+                for (int k = 0; k < 8; ++k) {
+                    dot = __fmaf_rn(w[k], v[k], dot);
                 }
                 acc[t] = __fadd_rn(acc[t], dot);
             }
