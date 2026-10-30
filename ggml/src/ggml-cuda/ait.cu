@@ -11,7 +11,7 @@
 // l and l + 16 share a copy), 2: u16 entries, one copy per bank (64 KB, conflict-free, two more ALU ops per address).
 // GGML_CUDA_AIT_OCC = 0 (default), 1 or 2: AIT4 low-register experiment with a two-group or one-group prefetch ring.
 // Modes 3/4 cap registers; GGML_CUDA_AIT_OCC_GRID sets their blocks per SM (1..8, default 4).
-// GGML_CUDA_AIT3_PACK=1 packs each AIT3 row tile before decoding the next, with the same warp ranges and sum order.
+// GGML_CUDA_AIT3_PACK: 1 packs each AIT3 row tile with a tight register cap; 2 keeps the base register budget.
 #include "ait.cuh"
 #include "ait-mm.cuh"
 #include "ai4.cuh"
@@ -349,7 +349,7 @@ static __device__ __forceinline__ void ait_st_rel(unsigned int * p, unsigned int
 // item's end, not prefetched); bit 1 = fused activation prep: the kernel itself does k_ait_actq's work (one warp per (token,
 // 512-K slice)) and zeroes Y, behind a grid barrier (cooperative launch, 1 CTA per SM); the weight ring and l2pf lines
 // (prefetch.global.L2, 128 B per lane each) are issued before the barrier; activations are then read with ld.global.cg.
-template <int KB, int NT, bool FULL, int PC = 0, int V = 0, int DEPTH = 4, bool LOW = false, bool CAP = false>
+template <int KB, int NT, bool FULL, int PC = 0, int V = 0, int DEPTH = 4, bool LOW = false, bool CAP = false, bool PACK = LOW>
 static __global__ void __launch_bounds__(CAP ? 256 : LOW ? 384 : 512, CAP ? 4 : LOW ? 2 : 1) k_ait_mmv(const char * __restrict__ W, const int8_t * X,
         const float * SA, float * __restrict__ Y, const int M, const int K, const float * __restrict__ XF = nullptr,
         const int l2pf = 0, float * __restrict__ partial = nullptr) {
@@ -493,10 +493,10 @@ static __global__ void __launch_bounds__(CAP ? 256 : LOW ? 384 : 512, CAP ? 4 : 
         if constexpr (FULL) {
 #pragma unroll
             for (int G4 = 0; G4 < 16; G4 += 4) {
-                ait_group<KB, NT, 0 % DEPTH, PC, CO, DEPTH, LOW>(buf, G4 + 0, G4 + DEPTH < 16 || more, gp, off, r, xs, live, c, tsm, lo);
-                ait_group<KB, NT, 1 % DEPTH, PC, CO, DEPTH, LOW>(buf, G4 + 1, G4 + DEPTH + 1 < 16 || more, gp, off, r, xs, live, c, tsm, lo);
-                ait_group<KB, NT, 2 % DEPTH, PC, CO, DEPTH, LOW>(buf, G4 + 2, G4 + DEPTH + 2 < 16 || more, gp, off, r, xs, live, c, tsm, lo);
-                ait_group<KB, NT, 3 % DEPTH, PC, CO, DEPTH, LOW>(buf, G4 + 3, G4 + DEPTH + 3 < 16 || more, gp, off, r, xs, live, c, tsm, lo);
+                ait_group<KB, NT, 0 % DEPTH, PC, CO, DEPTH, PACK>(buf, G4 + 0, G4 + DEPTH < 16 || more, gp, off, r, xs, live, c, tsm, lo);
+                ait_group<KB, NT, 1 % DEPTH, PC, CO, DEPTH, PACK>(buf, G4 + 1, G4 + DEPTH + 1 < 16 || more, gp, off, r, xs, live, c, tsm, lo);
+                ait_group<KB, NT, 2 % DEPTH, PC, CO, DEPTH, PACK>(buf, G4 + 2, G4 + DEPTH + 2 < 16 || more, gp, off, r, xs, live, c, tsm, lo);
+                ait_group<KB, NT, 3 % DEPTH, PC, CO, DEPTH, PACK>(buf, G4 + 3, G4 + DEPTH + 3 < 16 || more, gp, off, r, xs, live, c, tsm, lo);
             }
         } else {
 #pragma unroll 1
@@ -779,9 +779,13 @@ static void ait_fast_nt(ggml_backend_cuda_context & ctx, const uint8_t * W, cons
         }
     }
     k_ait_actq<NT><<<NT * S, 64, 0, stream>>>(X, W, xq.get(), sa.get(), ordered ? nullptr : Y, M, K, k);
-    static const bool pack3 = ait_env_int("GGML_CUDA_AIT3_PACK", 0) != 0;
-    if (pack3 && k == 3 && code == 0 && full && warps <= 12) {
-        k_ait_mmv<3, NT, true, 0, 0, 4, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
+    static const int pack3 = ait_env_int("GGML_CUDA_AIT3_PACK", 0);
+    if ((pack3 == 1 || pack3 == 2) && k == 3 && code == 0 && full && warps <= 12) {
+        if (pack3 == 2) {
+            k_ait_mmv<3, NT, true, 0, 0, 4, false, false, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
+        } else {
+            k_ait_mmv<3, NT, true, 0, 0, 4, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
+        }
         finish();
         return;
     }
