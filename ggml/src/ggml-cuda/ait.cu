@@ -20,6 +20,7 @@
 // GGML_CUDA_AIT4_TAIL=1 refills the four-group weight ring after each group's IMMA work.
 // GGML_CUDA_AIT4_PACK=1 packs each AIT4 MMA tile at the base register budget and four-group ring.
 // GGML_CUDA_AIT4_UNROLL2=1 unrolls two four-group steps instead of all four steps.
+// GGML_CUDA_AIT4_EARLY_X=1 loads each activation vector before decoding its weight group.
 #include "ait.cuh"
 #include "ait-mm.cuh"
 #include "ai4.cuh"
@@ -254,10 +255,11 @@ static __device__ __forceinline__ void ait_group_mma(int * c, const uint32_t (&a
 }
 
 // One group decodes four tiles and refills its ring slot before IMMA, or after IMMA with TAIL.
-template <int KB, int NT, int Gi, int PC = 0, bool CO = false, int DEPTH = 4, bool LOW = false, bool SHARED_X = false, bool NEIGHBOR = false, bool TAIL = false>
+template <int KB, int NT, int Gi, int PC = 0, bool CO = false, int DEPTH = 4, bool LOW = false, bool SHARED_X = false, bool NEIGHBOR = false, bool TAIL = false, bool EARLY_X = false>
 static __device__ __forceinline__ void ait_group(uint4 (&buf)[DEPTH][2], const int G, const bool pf, const char * gp, const int (&off)[2],
         const int r, const char * xs, const bool live, int (&c)[2][4], const char * tsm = nullptr, const uint32_t lo = 0) {
     static_assert(!TAIL || (KB == 4 && PC == 0 && !CO && !LOW && !SHARED_X && !NEIGHBOR), "tail refill requires plain AIT4");
+    static_assert(!EARLY_X || (KB == 4 && PC == 0 && !CO && !LOW && !SHARED_X && !NEIGHBOR && !TAIL), "early activation requires plain AIT4");
     using namespace aitk;
     constexpr int GB = 128 * KB;
     constexpr bool ONE = 7 * KB + 16 <= 32;
@@ -317,6 +319,12 @@ static __device__ __forceinline__ void ait_group(uint4 (&buf)[DEPTH][2], const i
         ait_group_mma<KB, 1>(c[1], a, f, b);
         return;
     }
+    uint2 b = make_uint2(0, 0);
+    if constexpr (EARLY_X) {
+        if (NT == 8 || live) {
+            b = __ldg((const uint2 *) (xs + G * NT * 32));
+        }
+    }
     uint32_t Lv[4][8];
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
@@ -329,9 +337,10 @@ static __device__ __forceinline__ void ait_group(uint4 (&buf)[DEPTH][2], const i
         Lv[i][0] = st1<KB, 0>(A, F1); Lv[i][1] = st1<KB, 1>(A, F1); Lv[i][2] = st1<KB, 2>(A, F1); Lv[i][3] = st1<KB, 3>(A, F1);
         Lv[i][4] = st1<KB, 4>(A, F1); Lv[i][5] = st1<KB, 5>(A, F1); Lv[i][6] = st1<KB, 6>(A, F1); Lv[i][7] = st1<KB, 7>(A, F1);
     }
-    uint2 b = make_uint2(0, 0);
-    if (NT == 8 || live) {
-        b = CO ? __ldcg((const uint2 *) (xs + G * NT * 32)) : __ldg((const uint2 *) (xs + G * NT * 32));
+    if constexpr (!EARLY_X) {
+        if (NT == 8 || live) {
+            b = CO ? __ldcg((const uint2 *) (xs + G * NT * 32)) : __ldg((const uint2 *) (xs + G * NT * 32));
+        }
     }
 #pragma unroll
     for (int u = 0; u < 2; ++u) {
@@ -374,13 +383,14 @@ static __device__ __forceinline__ void ait_st_rel(unsigned int * p, unsigned int
 // item's end, not prefetched); bit 1 = fused activation prep: the kernel itself does k_ait_actq's work (one warp per (token,
 // 512-K slice)) and zeroes Y, behind a grid barrier (cooperative launch, 1 CTA per SM); the weight ring and l2pf lines
 // (prefetch.global.L2, 128 B per lane each) are issued before the barrier; activations are then read with ld.global.cg.
-template <int KB, int NT, bool FULL, int PC = 0, int V = 0, int DEPTH = 4, bool LOW = false, bool CAP = false, bool PACK = LOW, bool NEIGHBOR = false, bool TAIL = false, bool UNROLL2 = false>
+template <int KB, int NT, bool FULL, int PC = 0, int V = 0, int DEPTH = 4, bool LOW = false, bool CAP = false, bool PACK = LOW, bool NEIGHBOR = false, bool TAIL = false, bool UNROLL2 = false, bool EARLY_X = false>
 static __global__ void __launch_bounds__(CAP ? 256 : LOW ? 384 : 512, CAP ? 4 : LOW ? 2 : 1) k_ait_mmv(const char * __restrict__ W, const int8_t * X,
         const float * SA, float * __restrict__ Y, const int M, const int K, const float * __restrict__ XF = nullptr,
         const int l2pf = 0, float * __restrict__ partial = nullptr) {
     static_assert(!NEIGHBOR || (KB == 4 && FULL && PC == 0 && V == 0), "neighbor path requires plain full AIT4");
     static_assert(!TAIL || (KB == 4 && FULL && PC == 0 && V == 0 && !PACK && !NEIGHBOR), "tail refill requires plain full AIT4");
     static_assert(!UNROLL2 || (KB == 4 && FULL && PC == 0 && V == 0 && DEPTH == 4 && !LOW && !CAP && !PACK && !NEIGHBOR && !TAIL), "two-step unroll requires plain full AIT4");
+    static_assert(!EARLY_X || (KB == 4 && FULL && PC == 0 && V == 0 && DEPTH == 4 && !LOW && !CAP && !PACK && !NEIGHBOR && !TAIL && !UNROLL2), "early activation requires plain full AIT4");
     constexpr bool CO = (V & 2) != 0;
     using namespace aitk;
     constexpr int BQ = 8 * KB, GB = 16 * BQ, CS = 2048 * KB + 64, MU = 2;
@@ -529,10 +539,10 @@ static __global__ void __launch_bounds__(CAP ? 256 : LOW ? 384 : 512, CAP ? 4 : 
         } else if constexpr (FULL) {
 #pragma unroll
             for (int G4 = 0; G4 < 16; G4 += 4) {
-                ait_group<KB, NT, 0 % DEPTH, PC, CO, DEPTH, PACK, false, NEIGHBOR, TAIL>(buf, G4 + 0, G4 + DEPTH < 16 || more, gp, off, r, xs, live, c, tsm, lo);
-                ait_group<KB, NT, 1 % DEPTH, PC, CO, DEPTH, PACK, false, NEIGHBOR, TAIL>(buf, G4 + 1, G4 + DEPTH + 1 < 16 || more, gp, off, r, xs, live, c, tsm, lo);
-                ait_group<KB, NT, 2 % DEPTH, PC, CO, DEPTH, PACK, false, NEIGHBOR, TAIL>(buf, G4 + 2, G4 + DEPTH + 2 < 16 || more, gp, off, r, xs, live, c, tsm, lo);
-                ait_group<KB, NT, 3 % DEPTH, PC, CO, DEPTH, PACK, false, NEIGHBOR, TAIL>(buf, G4 + 3, G4 + DEPTH + 3 < 16 || more, gp, off, r, xs, live, c, tsm, lo);
+                ait_group<KB, NT, 0 % DEPTH, PC, CO, DEPTH, PACK, false, NEIGHBOR, TAIL, EARLY_X>(buf, G4 + 0, G4 + DEPTH < 16 || more, gp, off, r, xs, live, c, tsm, lo);
+                ait_group<KB, NT, 1 % DEPTH, PC, CO, DEPTH, PACK, false, NEIGHBOR, TAIL, EARLY_X>(buf, G4 + 1, G4 + DEPTH + 1 < 16 || more, gp, off, r, xs, live, c, tsm, lo);
+                ait_group<KB, NT, 2 % DEPTH, PC, CO, DEPTH, PACK, false, NEIGHBOR, TAIL, EARLY_X>(buf, G4 + 2, G4 + DEPTH + 2 < 16 || more, gp, off, r, xs, live, c, tsm, lo);
+                ait_group<KB, NT, 3 % DEPTH, PC, CO, DEPTH, PACK, false, NEIGHBOR, TAIL, EARLY_X>(buf, G4 + 3, G4 + DEPTH + 3 < 16 || more, gp, off, r, xs, live, c, tsm, lo);
             }
         } else {
 #pragma unroll 1
@@ -815,6 +825,12 @@ static void ait_fast_nt(ggml_backend_cuda_context & ctx, const uint8_t * W, cons
         }
     }
     k_ait_actq<NT><<<NT * S, 64, 0, stream>>>(X, W, xq.get(), sa.get(), ordered ? nullptr : Y, M, K, k);
+    static const bool early4_x = ait_env_int("GGML_CUDA_AIT4_EARLY_X", 0) == 1;
+    if (early4_x && k == 4 && code == 0 && full && warps <= 12 && occ == 0) {
+        k_ait_mmv<4, NT, true, 0, 0, 4, false, false, false, false, false, false, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
+        finish();
+        return;
+    }
     static const bool unroll4_two = ait_env_int("GGML_CUDA_AIT4_UNROLL2", 0) == 1;
     if (unroll4_two && k == 4 && code == 0 && full && warps <= 12 && occ == 0) {
         k_ait_mmv<4, NT, true, 0, 0, 4, false, false, false, false, false, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
