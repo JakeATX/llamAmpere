@@ -1111,6 +1111,7 @@ static void hcf_down_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, 
             wi ? (const char *) wi->data : nullptr, wi ? wi->nb[1] : 0,
             R, n_rows, hc_dim, P.get(), ssq.get(),
             cnt_off, n_embd, eps, lo_scale, inj_scale, (float *) dst->data, pf);
+        CUDA_CHECK(cudaGetLastError());
     };
     auto launch_warps = [&](auto finish, auto late) {
         if (down_w == 4) {
@@ -1137,6 +1138,7 @@ static void hcf_down_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, 
         const int n_out = (n_rows + hc)*T;
         hcf_down_finish<<<(n_out + 255)/256, 256, 0, stream>>>(
             P.get(), ssq.get(), T, R, hc_inj, hc, n_embd, eps, lo_scale, inj_scale, (float *) dst->data);
+        CUDA_CHECK(cudaGetLastError());
     }
 }
 
