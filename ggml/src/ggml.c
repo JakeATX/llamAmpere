@@ -6885,9 +6885,9 @@ struct ggml_tensor * ggml_gated_delta_net(
     // emit_mode == 1: K ingredient sets (k, v, g, beta), each width S_v -> K * 4 rows per snap,
     //                 plus one trailing full [S_v, S_v, H] final-state block (S_v rows, not
     //                 scaled by K) so the true end-of-batch state is always available, plus (only
-    //                 when n_tokens > K) one further such block: the state immediately before the
-    //                 K-token retained window starts, free to capture since the recurrence already
-    //                 passes through it en route to the final state.
+    //                 when n_tokens > K, or n_tokens <= K with ggml_gated_delta_net_set_prefix) one
+    //                 further such block: the state immediately before the K-token retained window
+    //                 starts, free to capture since the recurrence already passes through it.
     // emit_mode == 2: compact slots (g and beta stored once per head), padded to whole rows.
     const bool    needs_ckpt  = emit_mode != 0 && n_tokens > K;
     const int64_t state_rows  = emit_mode == 0
@@ -6909,6 +6909,32 @@ struct ggml_tensor * ggml_gated_delta_net(
     result->src[5] = state;
 
     return result;
+}
+
+void ggml_gated_delta_net_set_prefix(
+        struct ggml_tensor * gdn,
+        struct ggml_tensor * ring,
+        struct ggml_tensor * w,
+        int32_t              ring_mode) {
+    GGML_ASSERT(gdn->op == GGML_OP_GATED_DELTA_NET && ggml_get_op_params_i32(gdn, 1) != 0);
+    GGML_ASSERT(ring->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32);
+    GGML_ASSERT(ring->nb[0] == sizeof(float) && ggml_is_contiguous(w));
+    const struct ggml_tensor * v = gdn->src[2];
+    const int64_t P = ggml_nelements(w);
+    GGML_ASSERT(P >= 1 && ring->ne[1] == v->ne[3]);
+    GGML_ASSERT(P * ggml_gated_delta_net_ingr_width(v->ne[0], gdn->src[3]->ne[0], ring_mode) * v->ne[1] <= ring->ne[0]);
+    // n_tokens <= K: the state after the prefix is the checkpoint, so the output gains the trailing block that
+    // n_tokens > K always has (set before allocation, so only the shape changes)
+    if (v->ne[2] <= ggml_get_op_params_i32(gdn, 0) && ggml_get_op_params_i32(gdn, 2) == 0) {
+        GGML_ASSERT(gdn->data == NULL && gdn->buffer == NULL && gdn->view_src == NULL);
+        gdn->ne[1] += v->ne[0] * v->ne[3];
+        gdn->nb[2]  = gdn->nb[1] * gdn->ne[1];
+        gdn->nb[3]  = gdn->nb[2] * gdn->ne[2];
+    }
+    ggml_set_op_params_i32(gdn, 2, (int32_t) P);
+    ggml_set_op_params_i32(gdn, 3, ring_mode);
+    gdn->src[6] = ring;
+    gdn->src[7] = w;
 }
 
 int64_t ggml_gated_delta_net_ingr_width(int64_t S_v, int64_t g_width, int32_t emit_mode) {

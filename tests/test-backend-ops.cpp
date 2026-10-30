@@ -6368,6 +6368,48 @@ struct test_gated_delta_net_range : public test_gated_delta_net {
     }
 };
 
+// GDNREPLAY2: one verify round of the 27B / Flash-Next GDN layer (16 key heads x 3, d=128), as the
+// default (emit_mode 0, K snapshots) or --gdn-replay (emit_mode 2 ingredients, plus the folded
+// masked ring prefix with `accepted` live slots when accepted >= 0) graph runs it. Perf mode only.
+struct test_gated_delta_net_verify : public test_gated_delta_net {
+    const int64_t accepted; // -1: no prefix
+
+    test_gated_delta_net_verify(int64_t tokens, int64_t K, int32_t emit, int64_t accepted)
+        : test_gated_delta_net(GGML_TYPE_F32, 16, 128, tokens, 1, 3, false, false, K, emit), accepted(accepted) {}
+
+    std::string vars() override {
+        return test_gated_delta_net::vars() + ",accepted=" + std::to_string(accepted);
+    }
+
+    std::string op_desc(ggml_tensor *) override { return "GATED_DELTA_NET_VERIFY"; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = test_gated_delta_net::build_graph(ctx);
+        if (accepted >= 0) {
+            const int64_t H = head_count * v_repeat;
+            ggml_tensor * ring = ggml_new_tensor_2d(ctx, type, K * H * ggml_gated_delta_net_ingr_width(head_size, 1, emit_mode), 1);
+            ggml_tensor * w    = ggml_new_tensor_1d(ctx, type, K);
+            ggml_set_name(ring, "ring");
+            ggml_set_name(w, "w");
+            ggml_gated_delta_net_set_prefix(out, ring, w, emit_mode);
+        }
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_gated_delta_net::initialize_tensors(ctx);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "ring") == 0) {
+                init_tensor_uniform(t, -0.05f, 0.0f);
+            } else if (strcmp(t->name, "w") == 0) {
+                std::vector<float> w(K, 0.0f);
+                std::fill(w.begin(), w.begin() + std::min(accepted, K), 1.0f);
+                ggml_backend_tensor_set(t, w.data(), 0, ggml_nbytes(t));
+            }
+        }
+    }
+};
+
 static void add_gated_delta_net_range_cases(std::vector<std::unique_ptr<test_case>> & cases, bool perf) {
     if (!perf) {
         for (int emit : {0, 1, 2}) {
@@ -18719,6 +18761,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_rms_norm_gate({128, 16, 12288}, 1, true));
         test_cases.emplace_back(new test_rms_norm_gate({128, 48, 12288}, 2, false));
         test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_BF16, {2560, 12288, 1, 1}));
+        return test_cases;
+    }
+    // GDNREPLAY2 GGML_TEST_GDN_VERIFY_PERF=1: only one GDN verify round at n_rs_seq K = 4. Width 5 (4 drafts)
+    // folds the replay into the main call; width 4 keeps the separate replay, a K=1 call over the 4 ring slots.
+    if (getenv("GGML_TEST_GDN_VERIFY_PERF") != nullptr) {
+        for (int64_t n : {4, 5}) {
+            test_cases.emplace_back(new test_gated_delta_net_verify(n, 4, 0, -1));
+            test_cases.emplace_back(new test_gated_delta_net_verify(n, 4, 2, -1));
+        }
+        for (int64_t acc : {0, 2, 4}) {
+            test_cases.emplace_back(new test_gated_delta_net_verify(5, 4, 2, acc));
+        }
+        test_cases.emplace_back(new test_gated_delta_net_verify(4, 1, 0, -1));
         return test_cases;
     }
     // [AIV2] GGML_TEST_AIV2_PERF=1: only the AI+ gate-2 rival list (IQ2_XXS..IQ4_XS, today's AI+, EXL3 2/3/4 with and

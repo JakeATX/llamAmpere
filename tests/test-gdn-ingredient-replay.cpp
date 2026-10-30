@@ -7,7 +7,7 @@
  * have produced at that position -- without needing q or a full S_v x S_v state
  * snapshot for every retained step.
  *
- * Scenario: N=6 total tokens, a checkpoint taken after c=2 tokens, and a "draft"
+ * Scenario: N=8 total tokens, a checkpoint taken after c=2 tokens, and a "draft"
  * of r-c=3 more tokens (positions 2,3,4) that need to be replayed on top of the
  * checkpoint to reach the state after r=5 tokens. This mirrors the real usage:
  * checkpoint = last accepted position, replay = tokens between the checkpoint
@@ -47,7 +47,12 @@ struct ggml_backend_buffer_ptr {
 
 static float max_abs(const float * a, const float * b, size_t n) {
     float m = 0;
-    for (size_t i = 0; i < n; i++) m = std::max(m, fabsf(a[i] - b[i]));
+    for (size_t i = 0; i < n; i++) {
+        if (!std::isfinite(a[i]) || !std::isfinite(b[i])) {
+            return INFINITY;
+        }
+        m = std::max(m, fabsf(a[i] - b[i]));
+    }
     return m;
 }
 
@@ -65,7 +70,8 @@ static std::vector<float> run_gdn(
         ggml_backend_t backend,
         const std::vector<float> & q, const std::vector<float> & k, const std::vector<float> & v,
         const std::vector<float> & g, const std::vector<float> & beta, const std::vector<float> & state,
-        int64_t S_v, int64_t H, int64_t n_tokens, int64_t K, int32_t emit_mode) {
+        int64_t S_v, int64_t H, int64_t n_tokens, int64_t K, int32_t emit_mode,
+        const std::vector<float> & ring = {}, const std::vector<float> & mask = {}) {
     ggml_init_params iparams = { /*.mem_size=*/ 1024 * 1024, /*.mem_buffer=*/ nullptr, /*.no_alloc=*/ true };
     ggml_context * ctx = ggml_init(iparams);
 
@@ -78,6 +84,13 @@ static std::vector<float> run_gdn(
 
     ggml_cgraph * gf = ggml_new_graph(ctx);
     ggml_tensor * out = ggml_gated_delta_net(ctx, tq, tk, tv, tg, tbeta, tstate, K, emit_mode);
+    ggml_tensor * tring = nullptr;
+    ggml_tensor * tmask = nullptr;
+    if (!mask.empty()) {
+        tring = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ring.size(), 1);
+        tmask = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, mask.size());
+        ggml_gated_delta_net_set_prefix(out, tring, tmask, emit_mode);
+    }
     ggml_build_forward_expand(gf, out);
 
     // allocate AFTER the graph (including its output tensor) is fully built, so `out` gets
@@ -92,6 +105,10 @@ static std::vector<float> run_gdn(
     ggml_backend_tensor_set(tg,     g.data(),     0, g.size()     * sizeof(float));
     ggml_backend_tensor_set(tbeta,  beta.data(),  0, beta.size()  * sizeof(float));
     ggml_backend_tensor_set(tstate, state.data(), 0, state.size() * sizeof(float));
+    if (tring) {
+        ggml_backend_tensor_set(tring, ring.data(), 0, ring.size() * sizeof(float));
+        ggml_backend_tensor_set(tmask, mask.data(), 0, mask.size() * sizeof(float));
+    }
 
     if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "FAIL: gated_delta_net graph compute failed\n");
@@ -106,17 +123,19 @@ static std::vector<float> run_gdn(
     return result;
 }
 
-int main() {
-    const int64_t S_v = 16;
+int main(int argc, char ** argv) {
+    const bool cuda = argc == 2 && strcmp(argv[1], "--cuda") == 0;
+    const int64_t S_v = 128;
     const int64_t H   = 4;
-    const int64_t N   = 6; // total tokens
+    const int64_t N   = 8; // total tokens
     const int64_t c   = 2; // checkpoint position (tokens accepted so far)
     const int64_t r   = 5; // rollback target (ground truth: state after r tokens)
 
     ggml_backend_ptr backend;
-    backend.ptr = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    ggml_backend_load_all();
+    backend.ptr = ggml_backend_init_by_type(cuda ? GGML_BACKEND_DEVICE_TYPE_GPU : GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
     if (!backend.get()) {
-        fprintf(stderr, "FAIL: could not init CPU backend\n");
+        fprintf(stderr, "FAIL: could not init %s backend\n", cuda ? "GPU" : "CPU");
         return 1;
     }
 
@@ -124,7 +143,7 @@ int main() {
     std::vector<float> q_full(S_v * H * N), k_full(S_v * H * N), v_full(S_v * H * N);
     std::vector<float> g_full(H * N), beta_full(H * N);
     for (auto & x : q_full) x = rnd(-1.0f, 1.0f);
-    for (auto & x : k_full) x = rnd(-1.0f, 1.0f);
+    for (auto & x : k_full) x = rnd(-1.0f, 1.0f) / sqrtf(S_v);
     for (auto & x : v_full) x = rnd(-0.3f, 5.0f);
     for (auto & x : g_full) x = rnd(-5.0f, -1e-4f);   // gate is exp(g), g < 0 like real usage
     for (auto & x : beta_full) x = rnd(0.0f, 1.0f);
@@ -235,6 +254,84 @@ int main() {
         return 1;
     }
 
-    printf("OK: ingredient replay reconstructs the ground-truth full-snapshot state\n");
+    // Masked slots may be stale; test holes as well as accepted prefixes.
+    for (int mode : {1, 2}) {
+        const int64_t P = 4;
+        const int64_t pw = ggml_gated_delta_net_ingr_width(S_v, 1, mode);
+        for (unsigned pattern = 0; pattern < (1u << P); pattern++) {
+            std::vector<float> ring(P * H * pw, NAN), mask(P, 0.0f);
+            std::vector<float> qp, kp, vp, gp, bp;
+            int64_t accepted = 0;
+            for (int64_t t = 0; t < P; t++) {
+                if ((pattern & (1u << t)) == 0) {
+                    continue;
+                }
+                accepted++;
+                mask[t] = 1.0f;
+                auto append = [&](std::vector<float> & dst, const std::vector<float> & src, int64_t width) {
+                    dst.insert(dst.end(), src.begin() + t * width, src.begin() + (t + 1) * width);
+                };
+                append(qp, q_full, S_v * H);
+                append(kp, k_full, S_v * H);
+                append(vp, v_full, S_v * H);
+                append(gp, g_full, H);
+                append(bp, beta_full, H);
+                for (int64_t h = 0; h < H; h++) {
+                    float * slot = ring.data() + (t * H + h) * pw;
+                    const float * src = out_ingr.data() + attn_N + t * snap_size + h * 4 * S_v;
+                    std::copy(src, src + 2 * S_v, slot);
+                    if (mode == 1) {
+                        std::copy(src + 2 * S_v, src + 4 * S_v, slot + 2 * S_v);
+                    } else {
+                        slot[2 * S_v] = src[2 * S_v];
+                        slot[2 * S_v + 1] = src[3 * S_v];
+                    }
+                }
+            }
+            std::vector<float> base = s0;
+            if (accepted > 0) {
+                auto prefix = run_gdn(backend.get(), qp, kp, vp, gp, bp, s0, S_v, H, accepted, 1, 0);
+                base.assign(prefix.begin() + accepted * S_v * H, prefix.end());
+            }
+            for (int64_t nt = 1; nt <= N - P; nt++) {
+                // ns > nt: a short verify round (LLAMA_GDN_REPLAY_SHORT), which also emits the checkpoint block
+                for (int64_t ns = 1; ns <= N - P; ns++) {
+                    auto tail = [&](const std::vector<float> & initial, bool folded) {
+                        return run_gdn(backend.get(),
+                            slice(q_full, S_v * H, P, P + nt), slice(k_full, S_v * H, P, P + nt),
+                            slice(v_full, S_v * H, P, P + nt), slice(g_full, H, P, P + nt),
+                            slice(beta_full, H, P, P + nt), initial, S_v, H, nt, ns, mode,
+                            folded ? ring : std::vector<float>{}, folded ? mask : std::vector<float>{});
+                    };
+                    auto expected = tail(base, false);
+                    auto actual = tail(s0, true);
+                    const size_t attn_size = nt * S_v * H;
+                    const size_t region = ggml_gated_delta_net_ingr_region(S_v, 1, H, 1, ns, mode);
+                    const size_t state_size = S_v * S_v * H;
+                    const float diff_attn = max_abs(actual.data(), expected.data(), attn_size);
+                    // the op writes slots [ns - min(nt, ns), ns) (right-aligned); the rest of the region is not output
+                    const size_t ingr_skip = (ns - std::min(nt, ns)) * pw * H;
+                    const float diff_ingr = max_abs(actual.data() + attn_size + ingr_skip, expected.data() + attn_size + ingr_skip,
+                                                    std::min(nt, ns) * pw * H);
+                    const float diff_state = max_abs(actual.data() + attn_size + region,
+                                                    expected.data() + attn_size + region, state_size);
+                    // nt <= ns: with the prefix the checkpoint block is the state after the prefix, the replay base
+                    if (actual.size() != expected.size() + (nt <= ns ? state_size : 0)) {
+                        fprintf(stderr, "FAIL: prefix output size %zu, expected %zu\n", actual.size(), expected.size());
+                        return 1;
+                    }
+                    const float diff_ckpt = max_abs(actual.data() + attn_size + region + state_size,
+                        nt > ns ? expected.data() + attn_size + region + state_size : base.data(), state_size);
+                    printf("[gdn-prefix] mode=%d mask=%u accepted=%lld tail=%lld K=%lld attn=%.3e ingredients=%.3e state=%.3e ckpt=%.3e\n",
+                           mode, pattern, (long long) accepted, (long long) nt, (long long) ns,
+                           diff_attn, diff_ingr, diff_state, diff_ckpt);
+                    if (diff_attn != 0.0f || diff_ingr != 0.0f || diff_state != 0.0f || diff_ckpt != 0.0f) {
+                        return 1;
+                    }
+                }
+            }
+        }
+    }
+    printf("OK: ingredient replay and masked prefix match the explicit recurrence\n");
     return 0;
 }

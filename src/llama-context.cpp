@@ -8302,14 +8302,15 @@ class llama_io_write_layout : public llama_io_write_i {
 
 const llama_memory_recurrent * llama_context::capture_mem() const {
     // PARTIAL_ONLY is exactly the recurrent state for these memories (the hybrid ones skip their attention cache and
-    // indexer); a replay ring travels in an extra section the copy does not keep
+    // indexer); under gdn_replay the checkpoint state and the ingredient ring rows travel in the replay section, and
+    // capture_ubatch copies them per layer like the conv and state rows
     const llama_memory_recurrent * mem_recr = nullptr;
     if (const auto * hyb = dynamic_cast<const llama_memory_hybrid *>(memory.get())) {
         mem_recr = hyb->get_mem_recr();
     } else {
         mem_recr = dynamic_cast<const llama_memory_recurrent *>(memory.get());
     }
-    if (mem_recr == nullptr || mem_recr->gdn_replay) {
+    if (mem_recr == nullptr) {
         return nullptr;
     }
     return mem_recr;
@@ -8444,6 +8445,12 @@ void llama_context::capture_ubatch(const llama_ubatch & ubatch, int32_t il0, int
             c.pos_min  = memory->seq_pos_min(ckpt_seq);
             c.pos_max  = memory->seq_pos_max(ckpt_seq);
             c.layer_done.assign(n_layer, 1);
+            // gdn_replay: the checkpoint state and the ingredient ring of a layer are that layer's rows too
+            auto layer_tensor = [&](const ggml_tensor * t, int32_t il) {
+                return t != nullptr && (t == mem_recr->r_l[il] || t == mem_recr->s_l[il] || t == mem_recr->p_l[il] ||
+                    (il < (int32_t) mem_recr->s_ckpt_l.size() && t == mem_recr->s_ckpt_l[il]) ||
+                    (il < (int32_t) mem_recr->ingr_l.size()   && t == mem_recr->ingr_l[il]));
+            };
             for (int32_t il = 0; il < n_layer; ++il) {
                 if (mem_recr->r_l[il] || mem_recr->s_l[il] || mem_recr->p_l[il]) {
                     c.layer_done[il] = 0;
@@ -8451,7 +8458,7 @@ void llama_context::capture_ubatch(const llama_ubatch & ubatch, int32_t il0, int
             }
             for (auto & w : c.writes) {
                 for (int32_t il = 0; il < n_layer && w.il < 0; ++il) {
-                    if (w.t == mem_recr->r_l[il] || w.t == mem_recr->s_l[il] || w.t == mem_recr->p_l[il]) {
+                    if (layer_tensor(w.t, il)) {
                         w.il = il;
                     }
                 }

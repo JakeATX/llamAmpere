@@ -351,9 +351,25 @@ public:
     ggml_tensor * rs_old_src = nullptr; // I32 [n_older]: older-group rows to carry for seqs whose data moves cells
     ggml_tensor * rs_old_dst = nullptr; // I32 [n_older]
 
+    // --gdn-replay, ubatches of n >= n_rs_seq tokens (every speculative verify): the pending rollback
+    // is data, not topology, so one graph serves every round. s_copy_conv = s_copy + replay_len *
+    // mem_size picks the conv history group; replay_w = K slot weights (1 for the accepted prefix
+    // [0, ckpt_span - replay_len) when the logical state needs the replay, else all 0). s_copy_pair
+    // gathers the replay base from the state/checkpoint pair tensor: the checkpoint row (plane 1)
+    // when the logical state needs the replay, else the state row. nullptr otherwise.
+    ggml_tensor * s_copy_conv      = nullptr; // I32 [n_rs]
+    ggml_tensor * s_copy_conv_main = nullptr; // I32 [n_seqs] view
+    ggml_tensor * s_copy_pair      = nullptr; // I32 [n_rs]
+    ggml_tensor * s_copy_pair_main = nullptr; // I32 [n_seqs] view
+    ggml_tensor * replay_w         = nullptr; // F32 [n_rs_seq]
+
     // fill every rs input (s_copy and the shift or ring tensors) from the memory context; exactly
     // once per ubatch -- both fills consume the pending rollback
     void fill_s_copy(const llama_memory_recurrent_context * m);
+
+    // can_reuse's replay check: the replay fields must match unless replay_w makes them data (then
+    // they and span_new are refreshed from the new context)
+    bool replay_reusable(const llama_memory_recurrent_context * m, const llama_ubatch & ubatch);
 };
 
 class llm_graph_input_cross_embd : public llm_graph_input_i {
@@ -1639,6 +1655,14 @@ struct llm_graph_context {
                 int32_t   state_size,
                 int32_t   n_seqs,
             const llm_graph_get_rows_fn & get_state_rows = nullptr) const;
+
+    // the conv history gather: build_rs, except that under --gdn-replay's static verify graph the rows
+    // come from the pending rollback's group (inp->s_copy_conv)
+    ggml_tensor * build_rs_conv(
+            llm_graph_input_rs * inp,
+            ggml_tensor * s,
+                int32_t   state_size,
+                int32_t   n_seqs) const;
 
     ggml_tensor * build_rwkv_token_shift_load(
         llm_graph_input_rs * inp,

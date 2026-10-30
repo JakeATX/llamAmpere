@@ -2457,14 +2457,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
         // replay mode keeps rs_idx at 0 and records the pending rollback as replay_len, so the history
         // group is picked here, as build_conv_state does: group 0 would still hold the rejected draft tokens.
         ggml_tensor * conv_src = conv_states_all;
-        const uint32_t conv_rollback = mctx_cur->get_replay_len();
+        const uint32_t conv_rollback = inp->s_copy_conv != nullptr ? 0 : mctx_cur->get_replay_len(); // else s_copy_conv carries it
         if (conv_rollback > 0) {
             const uint32_t n_cells = mctx_cur->get_size();
             GGML_ASSERT((uint32_t) conv_states_all->ne[1] >= (conv_rollback + 1) * n_cells);
             conv_src = ggml_view_2d(ctx0, conv_states_all, row_total, n_cells, conv_states_all->nb[1],
                     (size_t) conv_rollback * n_cells * conv_states_all->nb[1]);
         }
-        it = rs_rows.emplace(conv_states_all, build_rs(inp, conv_src, row_total, n_seqs)).first;
+        it = rs_rows.emplace(conv_states_all, build_rs_conv(inp, conv_src, row_total, n_seqs)).first;
     }
     ggml_tensor * rows = it->second;
 

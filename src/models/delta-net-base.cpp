@@ -469,7 +469,10 @@ void snapshot_shift_gather(ggml_context * ctx0, ggml_cgraph * gf, const llm_grap
     // The view runs to the end of `all` (not just snap_shift planes): s_copy_shift entries carry
     // the rollback group offset rs_idx * mem_size, so group j may read plane plane0 + j + rs_idx.
     GGML_ASSERT(inp->s_copy_shift != nullptr);
-    const size_t rows_off = (size_t) plane0 * mem_size;
+    // replay mode's plane0 (the pending rollback) is folded into s_copy_shift (set_input_shift), so the
+    // graph does not depend on it
+    GGML_UNUSED(plane0);
+    const size_t rows_off = 0;
     GGML_ASSERT(rows_off + (size_t) inp->snap_shift * mem_size <= (size_t) all->ne[1]);
     ggml_tensor * planes = ggml_view_2d(ctx0, all, row_elems, all->ne[1] - (int64_t) rows_off, all->nb[1], rows_off * all->nb[1]);
     ggml_tensor * g = ggml_get_rows(ctx0, planes, inp->s_copy_shift);
@@ -524,7 +527,7 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
     // explicitly here.
     ggml_tensor * conv_src = conv_states_all;
 
-    const uint32_t conv_rollback = mctx_cur->get_replay_len();
+    const uint32_t conv_rollback = inp->s_copy_conv != nullptr ? 0 : mctx_cur->get_replay_len(); // else s_copy_conv carries it
     if (conv_rollback > 0) {
         GGML_ASSERT((uint32_t) conv_states_all->ne[1] >= (conv_rollback + 1) * mem_size);
         conv_src = ggml_view_2d(ctx0, conv_states_all,
@@ -533,7 +536,7 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
                 (size_t) conv_rollback * mem_size * conv_states_all->nb[1]);
     }
 
-    ggml_tensor * conv_states = build_rs(inp, conv_src, hparams.n_embd_r(), n_seqs);
+    ggml_tensor * conv_states = build_rs_conv(inp, conv_src, hparams.n_embd_r(), n_seqs);
     cb(conv_states, "conv_states", il);
 
     conv_states = ggml_reshape_3d(ctx0, conv_states, conv_kernel_size - 1, conv_channels, n_seqs);
@@ -814,8 +817,14 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const int64_t ingr_off_g      = 2 * S_v;
     const int64_t ingr_off_b      = ingr_mode == 1 ? 3 * S_v : 2 * S_v + g->ne[0];
 
-    ggml_tensor * s_ckpt = build_rs(inp, ckpt_all, hparams.n_embd_s(), n_seqs);
-    s_ckpt = ggml_reshape_4d(ctx0, s_ckpt, S_v, S_v, H_v, n_seqs);
+    // the rollback-independent verify graph (see below) has the checkpoint rows gathered into `s`
+    // already, through the state/checkpoint pair, and never reads s_ckpt
+    const bool replay_static = inp->replay_w != nullptr; // n >= K, or a short round under LLAMA_GDN_REPLAY_SHORT=1
+    ggml_tensor * s_ckpt = nullptr;
+    if (!replay_static) {
+        s_ckpt = build_rs(inp, ckpt_all, hparams.n_embd_s(), n_seqs);
+        s_ckpt = ggml_reshape_4d(ctx0, s_ckpt, S_v, S_v, H_v, n_seqs);
+    }
 
     // the whole ring of every sequence in the ubatch, gathered (and, after seq_cp or a cell
     // move, relocated) by the same s_copy mechanism as the state itself: [ring_row, n_seqs]
@@ -848,8 +857,60 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     uint32_t      keep_count = 0;       //   are carried over into ring slots [0, keep_count)
     uint32_t      new_first  = 0;       // this ubatch's ingredients land in slots [new_first, new_first + n_new)
     const uint32_t n_new     = std::min(n, K); // the op emits the last min(n, K) tokens
+    bool          replay_fold = false;  // the replay runs as the main call's masked ring prefix
 
-    if (m + n <= K) {
+    if (replay_static) {
+        // rollback-independent form: one graph for every verify round (the branches below
+        // depend on r, S and staleness, which cost a graph rebuild per round). Checked first:
+        // m + n <= K also holds for n == K, m == 0, and that topology would be reused for
+        // m > 0. `s` holds the replay base, gathered from the state/checkpoint pair by
+        // s_copy_pair: the checkpoint when the logical state needs the replay, else the state
+        // row. Replay all K slots from it with g and beta zeroed by the slot mask (accepted
+        // prefix, or nothing): a token with g = 0 and beta = 0 leaves the state bit-exact
+        // (s = expf(0) * s + k * 0), so the result is the logical state either way.
+        GGML_ASSERT(inp->rs_old_src == nullptr); // else build_rs gathered s without the pair
+        // n >= K (every verify round, n == K when the drafter stops one short): the masked slots run
+        // inside the main call as a prefix (ggml_gated_delta_net_set_prefix below), so the base state
+        // is never materialized. n == K needs it as the new checkpoint, and with a prefix the op
+        // emits it as the checkpoint block (the state after the prefix).
+        static const bool fold_env = [] {
+            const char * e = getenv("LLAMA_GDN_REPLAY_FOLD"); // =0: separate K=1 replay call (A/B)
+            return e == nullptr || strcmp(e, "0") != 0;
+        }();
+        // verify widths only (n <= 2K): a prompt ubatch also takes this graph, and its main call
+        // must keep the chunked tensor-core prompt kernel, which the prefix would bypass. A short
+        // round (n < K) re-bases the checkpoint to the start of the ubatch like n == K does: the op
+        // emits the state after the prefix as the checkpoint block and the ring keeps only the n new
+        // slots (replay_span_new returns n).
+        replay_fold = fold_env && n <= 2 * K;
+        if (!replay_fold) {
+            ggml_tensor * w      = inp->replay_w;
+            ggml_tensor * w_slot = ggml_view_4d(ctx0, w, 1, 1, K, 1, w->nb[0], w->nb[0], w->nb[0] * K, 0);
+            auto comp = [&](int64_t ne0, int64_t off) {
+                return ggml_view_4d(ctx0, ring, ne0, H_v, K, n_seqs,
+                    ingr_w * ingr_elemsize, ingr_row * ingr_elemsize, ring->nb[1], (size_t) off * ingr_elemsize);
+            };
+            // k and v stay strided views into the ring (the op reads rows by stride; q only has to
+            // share k's strides and shapes the discarded attention output, so k doubles as q), and
+            // the masking mul writes g and beta out contiguous -- no conts, no q scale.
+            ggml_tensor * k_b = comp(S_v, 0);
+            ggml_tensor * v_b = comp(S_v, S_v);
+            ggml_tensor * g_b = ggml_mul(ctx0, comp(kda ? S_v : 1, ingr_off_g), w_slot);
+            ggml_tensor * b_b = ggml_mul(ctx0, comp(1, ingr_off_b), w_slot);
+            base_state = extract_state_k1(
+                ggml_gated_delta_net(ctx0, k_b, k_b, v_b, g_b, b_b, s, /*K=*/1, /*emit_mode=*/0), (int64_t) K);
+        }
+        // the checkpoint rows' own bookkeeping (cleared row, extra states of moved cells), without
+        // gathering the ubatch's rows: the getter hands back an empty view
+        ggml_build_forward_expand(gf, build_rs(inp, ckpt_all, hparams.n_embd_s(), n_seqs,
+            [](ggml_context * ctx, ggml_tensor * states, ggml_tensor *) {
+                return ggml_view_2d(ctx, states, states->ne[0], 0, states->nb[1], 0);
+            }));
+        ckpt_from_op = n > K || replay_fold;
+        ckpt_new     = ckpt_from_op ? nullptr : base_state;
+        keep_count   = 0;
+        new_first    = 0;
+    } else if (m + n <= K) {
         if (need_base) {
             base_state = m == 0 ? s_ckpt : replay_from(s_ckpt, 0, m);
         }
@@ -879,6 +940,9 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     // main call: emit_mode=1 records ingredients (+ the trailing final-state block, + the
     // before-the-window block when n > K) instead of K full snapshots.
     ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, base_state, K, ingr_mode);
+    if (replay_fold) {
+        ggml_gated_delta_net_set_prefix(gdn_out, ring, inp->replay_w, ingr_mode);
+    }
     if (n_seq_tokens > 1) {
         res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
     } else {

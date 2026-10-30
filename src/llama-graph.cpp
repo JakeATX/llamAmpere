@@ -472,6 +472,37 @@ void llm_graph_input_rs::fill_s_copy(const llama_memory_recurrent_context * m) {
         data[i] = m->s_copy((int) i);
     }
 
+    if (s_copy_conv != nullptr && s_copy_conv->buffer) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(s_copy_conv->buffer));
+        int32_t *     conv = (int32_t *) s_copy_conv->data;
+        const int64_t off  = (int64_t) m->get_replay_len() * m->get_size();
+        for (int64_t i = 0; i < n_rs; ++i) {
+            conv[i] = (int32_t) (data[i] + off);
+        }
+    }
+    if (replay_w != nullptr && replay_w->buffer) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(replay_w->buffer));
+        float *        w = (float *) replay_w->data;
+        const uint32_t K = m->get_n_rs_seq();
+        const uint32_t r = m->get_replay_len();
+        const uint32_t S = m->get_ckpt_span();
+        GGML_ASSERT(r <= S && S <= K && (int64_t) K == replay_w->ne[0]);
+        // need_base: replay the accepted prefix from the checkpoint; else the replay base is the
+        // state row itself and every slot is masked (the replay then returns it bit-exact)
+        const bool need_base = r > 0 || m->get_s_stale();
+        for (uint32_t j = 0; j < K; ++j) {
+            w[j] = need_base && j < S - r ? 1.0f : 0.0f;
+        }
+        if (s_copy_pair != nullptr && s_copy_pair->buffer) {
+            GGML_ASSERT(ggml_backend_buffer_is_host(s_copy_pair->buffer));
+            int32_t *     pair   = (int32_t *) s_copy_pair->data;
+            const int64_t n_main = s_copy_pair_main->ne[0];
+            for (int64_t i = 0; i < n_rs; ++i) {
+                pair[i] = (int32_t) (data[i] + (need_base && i < n_main ? (int64_t) m->get_size() : 0));
+            }
+        }
+    }
+
     set_input_shift(m);
 }
 
@@ -499,6 +530,8 @@ void llm_graph_input_rs::set_input_shift(const llama_memory_recurrent_context * 
     // write puts back what is there. Those planes stay stale and uncredited: rs_valid after the ubatch is
     // at most rs_valid - r_s + n <= n + K - 1 - r_s. In replay mode s_copy carries no rollback group
     // (rs_idx stays 0, plane0 = replay_len) and the lanes agree, so every lane moves snap_shift groups.
+    // replay mode reads the pending rollback's plane through the indices (the gather's view starts at plane 0)
+    const int64_t plane0 = m->get_gdn_replay() ? (int64_t) m->get_replay_len() * mem_size : 0;
     const int64_t n_seqs = s_copy_shift->ne[0] / snap_shift;
     for (int64_t s = 0; s < n_seqs; ++s) {
         uint32_t n_move = snap_shift;
@@ -509,10 +542,26 @@ void llm_graph_input_rs::set_input_shift(const llama_memory_recurrent_context * 
         }
         for (uint32_t j = 0; j < snap_shift; ++j) {
             data[j * n_seqs + s] = j < n_move
-                ? (int32_t) (j * (int64_t) mem_size + main[s])
+                ? (int32_t) (plane0 + j * (int64_t) mem_size + main[s])
                 : (int32_t) ((int64_t) (n + j) * mem_size + head + s);
         }
     }
+}
+
+bool llm_graph_input_rs::replay_reusable(const llama_memory_recurrent_context * m, const llama_ubatch & ubatch) {
+    const uint32_t r = m->get_replay_len();
+    const uint32_t S = m->get_ckpt_span();
+    const bool     z = m->get_s_stale();
+    if (replay_w == nullptr) {
+        return replay_len == r && ckpt_span == S && s_stale == z;
+    }
+    // same graph for every pending rollback; set_input() hands the new span back to the memory
+    const uint32_t n = ubatch.n_seqs > 0 ? ubatch.n_tokens / ubatch.n_seqs : 0;
+    replay_len = r;
+    ckpt_span  = S;
+    s_stale    = z;
+    span_new   = llama_memory_recurrent::replay_span_new(S, r, n, m->get_n_rs_seq());
+    return llama_memory_recurrent::replay_static_width(n, m->get_n_rs_seq());
 }
 
 bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
@@ -530,10 +579,9 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
     res &= rs_z == mctx->get_rs_z();
 
     // DRC phase 2: a nonzero (or changed) replay length needs a differently-shaped extra
-    // reconstruction node in the graph, so it can't be satisfied by reusing existing topology.
-    res &= replay_len == mctx->get_replay_len();
-    res &= ckpt_span  == mctx->get_ckpt_span();
-    res &= s_stale    == mctx->get_s_stale();
+    // reconstruction node in the graph, so it can't be satisfied by reusing existing topology --
+    // except in the static verify graph (replay_w), where it is data.
+    res &= replay_reusable(mctx, params.ubatch);
     res &= snap_shift == mctx->get_snap_shift();
     res &= n_written  == mctx->get_n_written();
     res &= n_older    == mctx->get_n_older();
@@ -1346,9 +1394,7 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
     // DRC phase 2: same guard as llm_graph_input_rs::can_reuse -- a changed replay length means a
     // differently-shaped reconstruction subtree, which reused topology cannot express.
-    res &= inp_rs->replay_len == mctx->get_recr()->get_replay_len();
-    res &= inp_rs->ckpt_span  == mctx->get_recr()->get_ckpt_span();
-    res &= inp_rs->s_stale    == mctx->get_recr()->get_s_stale();
+    res &= inp_rs->replay_reusable(mctx->get_recr(), params.ubatch);
     res &= inp_rs->snap_shift == mctx->get_recr()->get_snap_shift();
     res &= inp_rs->n_written  == mctx->get_recr()->get_n_written();
     res &= inp_rs->n_older    == mctx->get_recr()->get_n_older();
@@ -1389,9 +1435,7 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
 
     // DRC phase 2: same guard as llm_graph_input_rs::can_reuse -- a changed replay length means a
     // differently-shaped reconstruction subtree, which reused topology cannot express.
-    res &= inp_rs->replay_len == mctx->get_recr()->get_replay_len();
-    res &= inp_rs->ckpt_span  == mctx->get_recr()->get_ckpt_span();
-    res &= inp_rs->s_stale    == mctx->get_recr()->get_s_stale();
+    res &= inp_rs->replay_reusable(mctx->get_recr(), params.ubatch);
     res &= inp_rs->snap_shift == mctx->get_recr()->get_snap_shift();
     res &= inp_rs->n_written  == mctx->get_recr()->get_n_written();
     res &= inp_rs->n_older    == mctx->get_recr()->get_n_older();
@@ -1477,9 +1521,7 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
 
     // DRC phase 2: same guard as llm_graph_input_rs::can_reuse -- a changed replay length means a
     // differently-shaped reconstruction subtree, which reused topology cannot express.
-    res &= inp_rs->replay_len == mctx->get_recr()->get_replay_len();
-    res &= inp_rs->ckpt_span  == mctx->get_recr()->get_ckpt_span();
-    res &= inp_rs->s_stale    == mctx->get_recr()->get_s_stale();
+    res &= inp_rs->replay_reusable(mctx->get_recr(), params.ubatch);
     res &= inp_rs->snap_shift == mctx->get_recr()->get_snap_shift();
     res &= inp_rs->n_written  == mctx->get_recr()->get_n_written();
     res &= inp_rs->n_older    == mctx->get_recr()->get_n_older();
@@ -4547,6 +4589,23 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
         ggml_set_input(inp->s_copy_shift);
     }
 
+    // --gdn-replay: a ubatch that fills the ring (or, opt-in, a short verify round) takes the
+    // rollback-independent graph (see replay_w)
+    if (mctx_cur->get_gdn_replay() && n_seqs > 0 &&
+            llama_memory_recurrent::replay_static_width(ubatch.n_tokens / n_seqs, mctx_cur->get_n_rs_seq())) {
+        inp->s_copy_conv = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_rs);
+        ggml_set_input(inp->s_copy_conv);
+        ggml_set_name(inp->s_copy_conv, "rs_s_copy_conv");
+        inp->s_copy_conv_main = ggml_view_1d(ctx0, inp->s_copy_conv, n_seqs, 0);
+        inp->s_copy_pair = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_rs);
+        ggml_set_input(inp->s_copy_pair);
+        ggml_set_name(inp->s_copy_pair, "rs_s_copy_pair");
+        inp->s_copy_pair_main = ggml_view_1d(ctx0, inp->s_copy_pair, n_seqs, 0);
+        inp->replay_w = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, (int64_t) mctx_cur->get_n_rs_seq());
+        ggml_set_input(inp->replay_w);
+        ggml_set_name(inp->replay_w, "rs_replay_w");
+    }
+
     // [TAG_RECURRENT_ROLLBACK_RING]
     inp->n_written = mctx_cur->get_n_written();
     inp->n_older   = mctx_cur->get_n_older();
@@ -4600,8 +4659,18 @@ ggml_tensor * llm_graph_context::build_rs(
     // a custom getter reads the states of the ubatch straight from the cache, so the gather skips the first
     // state: it still holds the n_rs - n_seqs extra states and copies no state of a single sequence ubatch
     ggml_tensor * state_copy = get_state_rows ? inp->s_copy_tail : inp->s_copy;
+    ggml_tensor * copy_main  = inp->s_copy_main;
 
-    ggml_tensor * out = build_rs(s, state_copy, inp->s_copy_main, state_size, n_seqs,
+    // --gdn-replay verify graph: the GDN state (plane 0 of the state/checkpoint pair) is gathered
+    // through s_copy_pair, so the ubatch's rows are the replay base (see llm_graph_input_rs)
+    if (inp->s_copy_pair != nullptr && older == nullptr && s->view_src != nullptr && s->view_offs == 0 &&
+            s->view_src->ne[1] == 2 * s->ne[1] && strncmp(s->view_src->name, "cache_s2_l", 10) == 0) {
+        s          = s->view_src;
+        state_copy = get_state_rows ? inp->s_copy_tail : inp->s_copy_pair;
+        copy_main  = inp->s_copy_pair_main;
+    }
+
+    ggml_tensor * out = build_rs(s, state_copy, copy_main, state_size, n_seqs,
                     kv_state->get_n_rs(), kv_state->get_head(), kv_state->get_size(), kv_state->get_rs_z(),
                     get_state_rows);
 
@@ -4610,6 +4679,19 @@ ggml_tensor * llm_graph_context::build_rs(
     }
 
     return out;
+}
+
+ggml_tensor * llm_graph_context::build_rs_conv(
+        llm_graph_input_rs * inp,
+        ggml_tensor * s,
+            int32_t   state_size,
+            int32_t   n_seqs) const {
+    if (inp->s_copy_conv == nullptr) {
+        return build_rs(inp, s, state_size, n_seqs);
+    }
+    const auto * kv_state = inp->mctx;
+    return build_rs(s, inp->s_copy_conv, inp->s_copy_conv_main, state_size, n_seqs,
+                    kv_state->get_n_rs(), kv_state->get_head(), kv_state->get_size(), kv_state->get_rs_z());
 }
 
 ggml_tensor * llm_graph_context::build_rwkv_token_shift_load(

@@ -1697,6 +1697,18 @@ struct ggml_backend_cuda_context {
     };
     std::vector<gdn_state_read_entry> gdn_state_reads;
 
+    // [GDNDIRECT] prefixed (folded replay) gated_delta_net nodes whose final-state / checkpoint block cpy into
+    // the recurrent cache is skipped: the launch stores those blocks at final_dst / ckpt_dst (one sequence,
+    // D-float rows). Filled by ggml_cuda_gdn_replay_direct_plan, checked and cleared at the end of each evaluation.
+    struct gdn_replay_direct_entry {
+        const ggml_tensor * gdn       = nullptr;
+        float *             final_dst = nullptr;
+        float *             ckpt_dst  = nullptr; // nullptr: the checkpoint block stays in the op output
+        float *             ingr_dst  = nullptr; // the K new ingredient slots (ring row); nullptr: op output
+        bool                used      = false;
+    };
+    std::vector<gdn_replay_direct_entry> gdn_replay_directs;
+
     // [ROUNDFIX] lightning_indexer nodes whose pooled-key GET_ROWS gather is skipped (GGML_CUDA_LID_GATHER=1):
     // the vec launch reads key i from base + rows[i] * row_stride (F16 rows) instead of src[1].
     // Filled by ggml_cuda_lid_gather_plan at the start of each evaluation, cleared at its end.
