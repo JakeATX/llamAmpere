@@ -1,5 +1,6 @@
 #include "binbcast.cuh"
 #include "convert.cuh"
+#include <algorithm>
 #include <cstdint>
 #include <utility>
 
@@ -435,7 +436,37 @@ static void ggml_cuda_op_bin_bcast(
     }
 }
 
+// GGML_CUDA_REPEAT_ROW=1 (opt-in): a single contiguous row repeated over a contiguous dst of the same type is a plain
+// byte copy, done with 16-byte stores instead of the per-element broadcast math (the 100K prompt's -inf selection mask
+// is one f16 row repeated over every token: ~2.4 GB per attention ubatch); same bytes
+static __global__ void repeat_row_16(const int4 * __restrict__ src, int4 * __restrict__ dst, const int64_t n, const int64_t row) {
+    for (int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x*blockDim.x) {
+        dst[i] = src[i % row];
+    }
+}
+
+static bool ggml_cuda_repeat_row(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    static const bool on = [] { const char * e = getenv("GGML_CUDA_REPEAT_ROW"); return e && atoi(e) != 0; }();
+    const ggml_tensor * src = dst->src[0];
+    if (!on || src->type != dst->type || src->ne[0] != dst->ne[0] || ggml_nrows(src) != 1 ||
+            !ggml_is_contiguous(src) || !ggml_is_contiguous(dst)) {
+        return false;
+    }
+    const size_t row = ggml_row_size(src->type, src->ne[0]);
+    if (row % 16 != 0 || (uintptr_t) src->data % 16 != 0 || (uintptr_t) dst->data % 16 != 0) {
+        return false;
+    }
+    const int64_t n   = (int64_t) (ggml_nbytes(dst) / 16);
+    const int64_t nb  = std::min<int64_t>((n + 255) / 256, (int64_t) ggml_cuda_info().devices[ctx.device].nsm * 32);
+    repeat_row_16<<<(unsigned) std::max<int64_t>(nb, 1), 256, 0, ctx.stream()>>>(
+            (const int4 *) src->data, (int4 *) dst->data, n, (int64_t) (row / 16));
+    return true;
+}
+
 void ggml_cuda_op_repeat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if (ggml_cuda_repeat_row(ctx, dst)) {
+        return;
+    }
     ggml_cuda_op_bin_bcast<bin_bcast_cuda<op_repeat, 0>>(dst, dst->src[0], dst, nullptr, dst->src[0]->data, dst->data, ctx.stream());
 }
 
