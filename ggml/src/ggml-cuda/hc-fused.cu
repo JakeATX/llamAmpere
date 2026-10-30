@@ -958,17 +958,17 @@ static void hcf_down_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, 
         const char * e = getenv("LLAMA_HC_DOWN_ROW_OWNER");
         return e && atoi(e) == 1;
     }();
-    // Four row warps fill more SMs without changing each row's sums.
-    static const int row_warps = [] {
-        const char * e = getenv("LLAMA_HC_DOWN_ROW_WARPS");
-        return e && atoi(e) == 4 ? 4 : 8;
-    }();
-    static const bool row_lookahead = [] {
-        const char * e = getenv("LLAMA_HC_DOWN_ROW_LOOKAHEAD");
-        return e && atoi(e) == 1;
-    }();
     // Full rows do not use arrival counters or consume a counter slot.
     if (row_owner && hcf_fused_finish_enabled() && n_embd % 256 == 0) {
+        // Four row warps fill more SMs without changing each row's sums.
+        static const int row_warps = [] {
+            const char * e = getenv("LLAMA_HC_DOWN_ROW_WARPS");
+            return e && atoi(e) == 4 ? 4 : 8;
+        }();
+        static const bool row_lookahead = [] {
+            const char * e = getenv("LLAMA_HC_DOWN_ROW_LOOKAHEAD");
+            return e && atoi(e) == 1;
+        }();
         ggml_cuda_pool_alloc<float> xn(ctx.pool(), (size_t) T*hc_dim);
         auto stage = [&](auto fold) {
             constexpr bool F = decltype(fold)::value;
