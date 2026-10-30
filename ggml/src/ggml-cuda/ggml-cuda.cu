@@ -10306,6 +10306,32 @@ struct ggml_cuda_op_times {
     }
 };
 
+// GGML_CUDA_HOST_BLOCK_MS=<ms> (diagnostic, off by default, adds no synchronization): log every node launch and
+// every graph-end hook whose host call takes >= <ms>, i.e. the op that makes the host wait inside graph compute.
+struct ggml_cuda_host_block_timer {
+    static float min_ms() {
+        static const float v = [] { const char * e = getenv("GGML_CUDA_HOST_BLOCK_MS"); return e && *e ? (float) atof(e) : 0.0f; }();
+        return v;
+    }
+    int64_t t0 = 0;
+    void begin() {
+        if (min_ms() > 0.0f) {
+            t0 = ggml_time_us();
+        }
+    }
+    void end(const char * what, const ggml_tensor * node) {
+        if (min_ms() <= 0.0f) {
+            return;
+        }
+        const float ms = (ggml_time_us() - t0) / 1000.0f;
+        if (ms >= min_ms()) {
+            GGML_LOG_INFO("[HOSTBLOCK] %s %s (%s) ne=[%lld,%lld,%lld] ms=%.2f\n", what, node ? node->name : "-",
+                    node ? ggml_op_desc(node) : "-", node ? (long long) node->ne[0] : 0LL,
+                    node ? (long long) node->ne[1] : 0LL, node ? (long long) node->ne[2] : 0LL, ms);
+        }
+    }
+};
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, uint64_t graph_key) {
     bool graph_evaluated_or_captured = false;
 
@@ -10452,6 +10478,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             static thread_local ggml_cuda_op_times op_times_state;
             ggml_cuda_op_times * op_times = !use_cuda_graph && ggml_cuda_op_times::min_ms() > 0.0f ? &op_times_state : nullptr;
             cudaStream_t op_times_stream = cuda_ctx->stream(cuda_ctx->device, 0);
+            ggml_cuda_host_block_timer host_block;
 
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
@@ -10597,7 +10624,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 GGML_UNUSED(integrated);
 #endif  // NDEBUG
 
+                host_block.begin();
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                host_block.end("node", node);
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
@@ -10630,14 +10659,24 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             if (autofuse) {
                 ggml_cuda_autofuse_report(*cuda_ctx, *autofuse);
             }
+            host_block.begin();
             for (auto * runtime : kv_stream_runtimes) {
                 ggml_cuda_kv_stream_graph_end(runtime->transfer_ring, cuda_ctx->stream());
             }
+            host_block.end("kv_stream_graph_end", nullptr);
 
+            host_block.begin();
             ggml_cuda_gdn_state_read_finish(cuda_ctx);
+            host_block.end("gdn_state_read_finish", nullptr);
+            host_block.begin();
             ggml_cuda_lid_gather_finish(cuda_ctx);
+            host_block.end("lid_gather_finish", nullptr);
+            host_block.begin();
             ggml_cuda_conv_ring_finish(cuda_ctx);
+            host_block.end("conv_ring_finish", nullptr);
+            host_block.begin();
             ggml_cuda_moe_cache_hf_graph_end(*cuda_ctx);
+            host_block.end("moe_cache_hf_graph_end", nullptr);
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
             if (ggml_cuda_moe_table_prefetch_enabled()) {
                 // The table copy branch rejoins here, before cudaStreamEndCapture.
