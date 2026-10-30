@@ -557,11 +557,7 @@ int64_t llama_ple_prefetch::reader() {
             }
             GGML_UNUSED(sink);
         }
-        if (batch_runs == 1) {
-            n_read.fetch_add(run_len[i], std::memory_order_relaxed);
-        } else {
-            pages_read += run_len[i];
-        }
+        pages_read += run_len[i];
         done_chunk = run_chunk[i];
         ++done_runs;
         if (next == end) {
@@ -569,9 +565,7 @@ int64_t llama_ple_prefetch::reader() {
         }
     }
     flush_done();
-    if (batch_runs > 1) {
-        n_read.fetch_add(pages_read, std::memory_order_relaxed);
-    }
+    n_read.fetch_add(pages_read, std::memory_order_relaxed);
     return t_last;
 }
 
