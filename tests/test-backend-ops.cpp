@@ -20568,7 +20568,8 @@ static int run_ait_check(const char * dir) {
         return 1;
     }
     const int64_t M0 = 1024, K0 = 2048;
-    const int64_t M = !shape ? M0 : strcmp(shape, "up") == 0 ? 17408 : 5120;
+    const int mrep = getenv("GGML_TEST_AIT_MREP") ? std::max(1, std::min(64, atoi(getenv("GGML_TEST_AIT_MREP")))) : 1;
+    const int64_t M = !shape ? M0 * mrep : strcmp(shape, "up") == 0 ? 17408 : 5120;
     const int64_t K = !shape ? K0 : strcmp(shape, "up") == 0 ? 5120 : 17408;
     const char * shape_type = getenv("GGML_TEST_AIT_SHAPE_TYPE");
     if (shape_type && (!shape || (strcmp(shape_type, "ait3") != 0 && strcmp(shape_type, "ait4") != 0))) {
