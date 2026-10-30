@@ -28,7 +28,7 @@ static constexpr int64_t PLE_PF_DEFAULT_COLD    = 32;  // readers when the table
 
 static int64_t ple_pf_env(const char * name, int64_t def) {
     const char * v = getenv(name);
-    return v && *v ? (int64_t) atoll(v) : def;
+    return v && *v ? (int64_t) strtoll(v, nullptr, 10) : def;
 }
 
 void llama_ple_hash_rows(const llama_hparams & hp, llama_token token, const llama_token * prev, int32_t * rows) {
