@@ -592,14 +592,15 @@ bool llama_ple_prefetch::consume(uint32_t n_tokens, const int32_t * idx, size_t 
         ++n_ubatch_u;
         return false;
     }
-    {
-        std::lock_guard<std::mutex> lk(mtx);
-        const size_t a = chunks_for(t1 + n_ahead);
-        if (a > allowed_chunks.load()) {
+    const size_t a = chunks_for(t1 + n_ahead);
+    // fork: partial consumes within the same window need no reader or producer wake-up.
+    if (a > allowed_chunks.load()) {
+        {
+            std::lock_guard<std::mutex> lk(mtx);
             allowed_chunks.store(a);
         }
+        cv_work.notify_all();
     }
-    cv_work.notify_all();
 
     const size_t c0 = (size_t) (t0/chunk_size), c1 = (size_t) ((t1 - 1)/chunk_size);
     {
