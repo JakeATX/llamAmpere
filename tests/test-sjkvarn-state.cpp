@@ -1124,6 +1124,7 @@ static void ple_hash_pages_case(bool windowed = false) {
                 tokens[i] = i % 127 == 0 ? eos : i % 131 == 0 ? LLAMA_TOKEN_NULL : (i*179 + i*i*13) % eos;
             }
             std::vector<unsigned char> expected(n_rows, 0), resident(n_rows);
+            std::vector<size_t> first_chunk(n_rows, n_tokens);
             for (size_t i = 0; i < n_tokens; ++i) {
                 for (uint32_t g = 2; g <= n_gram; ++g) {
                     uint64_t mixed = (uint64_t) tokens[i]*hp.ple_layer_multipliers[0];
@@ -1140,7 +1141,9 @@ static void ple_hash_pages_case(bool windowed = false) {
                     if (known) {
                         for (uint32_t k = 0; k < per_gram; ++k) {
                             const uint32_t h = (g - 2)*per_gram + k;
-                            expected[hp.ple_head_offsets[h] + mixed % hp.ple_head_vocab_sizes[h]] = 1;
+                            const size_t row = hp.ple_head_offsets[h] + mixed % hp.ple_head_vocab_sizes[h];
+                            expected[row] = 1;
+                            first_chunk[row] = std::min(first_chunk[row], i/256);
                         }
                     }
                 }
@@ -1155,7 +1158,12 @@ static void ple_hash_pages_case(bool windowed = false) {
             pf->hint(tokens.data(), tokens.size(), pos0);
             const size_t consume_size = windowed ? 113 : 256;
             for (size_t i = 0; i < n_tokens; i += consume_size) {
-                require(pf->consume(std::min(consume_size, n_tokens - i), nullptr, 0), "hash page chunk consumed");
+                const size_t count = std::min(consume_size, n_tokens - i);
+                require(pf->consume(count, nullptr, 0), "hash page chunk consumed");
+                require(mincore(pages, size, resident.data()) == 0, "consumed chunk residency");
+                for (size_t r = 0; r < n_rows; ++r) {
+                    require(first_chunk[r] > (i + count - 1)/256 || (resident[r] & 1), "consume waits for every page of its chunks");
+                }
             }
             std::string summary;
             llama_log_set([](ggml_log_level, const char * text, void * data) {
@@ -1186,6 +1194,7 @@ static void ple_hash_pages_case(bool windowed = false) {
     printf("OK: incremental 4/8-gram hashes match exact page sets across heads, EOS and call offsets\n");
     if (windowed) {
         printf("OK: batched page readers preserve exact pages and totals across short windows and a partial final batch\n");
+        printf("OK: every consumed chunk has all required pages before stop joins readers\n");
     }
 #else
     printf("SKIP: hash page test needs Linux\n");

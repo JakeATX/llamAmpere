@@ -421,6 +421,15 @@ int64_t llama_ple_prefetch::reader() {
     int64_t t_last = 0;
     int64_t pages_read = 0;
     size_t next = 0, end = 0;
+    size_t done_chunk = 0;
+    int64_t done_runs = 0;
+    auto flush_done = [&]() {
+        if (done_runs > 0 && remaining[done_chunk].fetch_sub(done_runs) == done_runs) {
+            std::lock_guard<std::mutex> lk(mtx);
+            cv_done.notify_all();
+        }
+        done_runs = 0;
+    };
     for (;;) {
         if (next == end) {
             next = cursor.fetch_add(batch_runs);
@@ -428,11 +437,16 @@ int64_t llama_ple_prefetch::reader() {
         }
         const size_t i = next++;
         if (!run_ready(i)) {
+            // fork: release completed chunks before waiting for the consumer to advance the window.
+            flush_done();
             std::unique_lock<std::mutex> lk(mtx);
             cv_work.wait(lk, [&]() { return run_ready(i); });
         }
         if (stopping.load() || i >= n_built.load()) {
             break;
+        }
+        if (done_runs > 0 && done_chunk != run_chunk[i]) {
+            flush_done();
         }
         const uint64_t off = run_key[i]*4096, len = (uint64_t) run_len[i]*4096;
 #if defined(__linux__)
@@ -457,11 +471,13 @@ int64_t llama_ple_prefetch::reader() {
             pages_read += run_len[i];
         }
         t_last = ggml_time_us();
-        if (remaining[run_chunk[i]].fetch_sub(1) == 1) {
-            std::lock_guard<std::mutex> lk(mtx);
-            cv_done.notify_all();
+        done_chunk = run_chunk[i];
+        ++done_runs;
+        if (next == end) {
+            flush_done();
         }
     }
+    flush_done();
     if (batch_runs > 1) {
         n_read.fetch_add(pages_read, std::memory_order_relaxed);
     }
