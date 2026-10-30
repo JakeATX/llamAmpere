@@ -297,6 +297,7 @@ static void moe_missjoin_log(const char * when) {
         MOE_CACHE_LOG("[moe-cache] cpu split share %s: cpu_parts=%llu of missed_parts=%llu (%.1f%%), partial_experts=%llu, "
                 "parts over the link=%llu\n", when, plan.stat_parts, c[2], c[2] ? 100.0 * plan.stat_parts / c[2] : 0.0,
                 plan.stat_partial, c[3]);
+        moe_cs_wstats_report(when);
     }
 }
 

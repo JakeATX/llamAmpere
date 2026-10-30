@@ -489,6 +489,12 @@ struct pool_state {
 
     std::atomic<unsigned long long> st_jobs{0}, st_experts{0}, st_routes{0}, st_busy_ns{0}, st_null{0};
     unsigned long long phase_ns[4] = {};   // thread 0's time through each phase (barrier included), summed
+    // GGML_MOE_CPU_SPLIT_WSTATS=1 (default off): per worker, time spent claiming and running tiles and time spent waiting at
+    // the end-of-phase barrier, plus how late the worker joined a job. Tells a slow or late core from a slow kernel.
+    struct alignas(64) wstat_t { unsigned long long jobs = 0, lag_ns = 0, work_ns[4] = {}, wait_ns[4] = {}; int cpu = -1; };
+    bool wstats = false;
+    wstat_t wst[64];
+    std::atomic<long long> job_t0_ns{0};   // leader's clock when the job was published
     // host-posted jobs (the probe) use this instead of the mapped seq
     std::atomic<unsigned long long> local_seq{0}, local_done{0};
 };
@@ -496,6 +502,19 @@ struct pool_state {
 pool_state & P() {
     static pool_state * p = new pool_state();   // never destroyed: threads may still spin at exit
     return *p;
+}
+
+// Clears the per-worker counters (the probe's jobs are not production work).
+void wst_clear(pool_state & s) {
+    for (auto & w : s.wst) {
+        const int cpu = w.cpu;
+        w = pool_state::wstat_t();
+        w.cpu = cpu;
+    }
+}
+
+inline long long ns_of(clk::time_point t) {
+    return (long long) std::chrono::duration_cast<std::chrono::nanoseconds>(t.time_since_epoch()).count();
 }
 
 int items_of(const pool_state & s, int phase) {
@@ -708,6 +727,12 @@ void run_item(pool_state & s, int phase, int item) {
 void run_job_phases(pool_state & s, unsigned long long n, int worker, bool lead = false) {
     const unsigned long long target = n * (unsigned long long) s.threads;
     auto t = clk::now();
+    pool_state::wstat_t * W = s.wstats && worker < 64 ? &s.wst[worker] : nullptr;
+    if (W) {
+        ++W->jobs;
+        if (!lead) { W->lag_ns += (unsigned long long) std::max<long long>(0, ns_of(t) - s.job_t0_ns.load(std::memory_order_relaxed)); }
+    }
+    auto tw = t;
     for (int p = 0; p < 4; ++p) {
         const int total = items_of(s, p);
         if (s.schedule && (p == 0 || p == 2)) {
@@ -726,6 +751,11 @@ void run_job_phases(pool_state & s, unsigned long long n, int worker, bool lead 
             }
         }
         const auto finished = s.fin[p].fetch_add(1, std::memory_order_acq_rel) + 1;
+        if (W) {
+            const auto t1 = clk::now();
+            W->work_ns[p] += (unsigned long long) std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - tw).count();
+            tw = t1;
+        }
         if (s.host_help) {
             if (finished == target) {
                 if (p == 1 || p == 3) {
@@ -746,10 +776,15 @@ void run_job_phases(pool_state & s, unsigned long long n, int worker, bool lead 
         if (p < 3) {
             while (s.fin[p].load(std::memory_order_acquire) < target) { cpu_relax(); }
         }
+        if (lead && p == 3) {
+            while (s.fin[3].load(std::memory_order_acquire) < target) { cpu_relax(); }
+        }
+        if (W) {
+            const auto t2 = clk::now();
+            W->wait_ns[p] += (unsigned long long) std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - tw).count();
+            tw = t2;
+        }
         if (lead) {
-            if (p == 3) {
-                while (s.fin[3].load(std::memory_order_acquire) < target) { cpu_relax(); }
-            }
             const auto now = clk::now();
             s.phase_ns[p] += (unsigned long long) std::chrono::duration_cast<std::chrono::nanoseconds>(now - t).count();
             t = now;
@@ -799,6 +834,7 @@ void sleep_us(int us) {
 void worker_main(pool_state * sp, int idx, int cpu) {
     pool_state & s = *sp;
     pin_thread(cpu);
+    if (idx < 64) { s.wst[idx].cpu = cpu; }
     unsigned long long seen = 0;
     for (;;) {
         auto spin_until = clk::now() + std::chrono::microseconds(s.spin_us);
@@ -825,6 +861,7 @@ void worker_main(pool_state * sp, int idx, int cpu) {
 void leader_main(pool_state * sp, int cpu) {
     pool_state & s = *sp;
     pin_thread(cpu);
+    s.wst[0].cpu = cpu;
 #if defined(__linux__)
     (void) prctl(PR_SET_TIMERSLACK, 1000UL, 0, 0, 0);   // naps end within ~1 us of the asked time, not +50 us
 #endif
@@ -880,6 +917,7 @@ void leader_main(pool_state * sp, int cpu) {
             }
             ++n;
             for (int p = 0; p < 4; ++p) { s.next[p].store(0, std::memory_order_relaxed); }
+            if (s.wstats) { s.job_t0_ns.store(ns_of(clk::now()), std::memory_order_relaxed); }
             s.gen.store(n, std::memory_order_seq_cst);
             if (s.sleepers.load(std::memory_order_seq_cst) > 0) {
                 std::lock_guard<std::mutex> lk(s.sleep_mu);
@@ -957,6 +995,7 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
     s.nap_us = env_int("GGML_MOE_CPU_SPLIT_NAP_US", 1000, 1, 100000);
     s.schedule = env_int("GGML_MOE_CPU_SPLIT_SCHEDULE", 0, 0, 1) != 0;
     s.host_help = env_int("GGML_MOE_CPU_SPLIT_HOST", 0, 0, 1) != 0;
+    s.wstats = env_int("GGML_MOE_CPU_SPLIT_WSTATS", 0, 0, 1) != 0;
     for (int p = 0; p < 4; ++p) { s.next[p].store(0); s.fin[p].store(0); s.closed[p].store(0); }
     // Reserve the caller's actual core and keep the card-driving thread on it.
     const bool max_threads = env_int("GGML_MOE_CPU_SPLIT_MAX_THREADS", 1, 0, 1) != 0;
@@ -1242,6 +1281,7 @@ bool moe_cs_probe(double * route_ns, double * fixed_ns) {
     *fixed_ns = std::max(0.0, t1 - per);
     // the probe's jobs count as work in the statistics; clear them
     s.st_jobs = 0; s.st_experts = 0; s.st_routes = 0; s.st_busy_ns = 0; s.st_null = 0;
+    wst_clear(s);
     fprintf(stderr, "[moe-cpu-split] probe on layer %d: empty job %.1f us, 1 expert %.1f us, 4 experts %.1f us -> %.1f us per (expert, route) + %.1f us per job\n",
             layer, t0 / 1000.0, t1 / 1000.0, t4 / 1000.0, per / 1000.0, *fixed_ns / 1000.0);
     // Contention check: warns when the pool spent over 25% of the timed jobs waiting for a cpu (about 1.33x slower or worse).
@@ -1286,7 +1326,23 @@ bool moe_cs_bench(int layer, const int * experts, int n_list, int n_exp, int rep
     *ns_per_job = total / reps;
     for (int p = 0; p < 4; ++p) { phase_ns[p] = (double) s.phase_ns[p] / reps; s.phase_ns[p] = 0; }
     s.st_jobs = 0; s.st_experts = 0; s.st_routes = 0; s.st_busy_ns = 0; s.st_null = 0;
+    wst_clear(s);
     return true;
+}
+
+void moe_cs_wstats_report(const char * when) {
+    pool_state & s = P();
+    if (!s.wstats) { return; }
+    static const char * const names[4] = {"quantize", "up+gate", "silu", "down"};
+    for (int i = 0; i < s.threads && i < 64; ++i) {
+        const pool_state::wstat_t & w = s.wst[i];
+        const double j = (double) std::max(1ull, w.jobs);
+        fprintf(stderr, "[moe-cpu-split] wstats %s worker %d cpu %d jobs %llu join-lag %.2f us/job", when, i, w.cpu, w.jobs, w.lag_ns / j / 1e3);
+        for (int p = 0; p < 4; ++p) {
+            fprintf(stderr, " | %s work %.1f wait %.1f", names[p], w.work_ns[p] / j / 1e3, w.wait_ns[p] / j / 1e3);
+        }
+        fprintf(stderr, " us/job\n");
+    }
 }
 
 void moe_cs_stats(unsigned long long out[9]) {
