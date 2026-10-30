@@ -1089,13 +1089,14 @@ static void deferred_mask_capacity_case() {
     printf("OK: 64 pending masks preserved, 65th falls back, all host mask bytes exact\n");
 }
 
-static void ple_hash_pages_case(bool windowed = false, bool bounded = false, bool coalesced = false, size_t coalesce_chunk = 384) {
+static void ple_hash_pages_case(bool windowed = false, bool bounded = false, bool coalesced = false, size_t ubatch_size = 384) {
 #if defined(__linux__)
     for (uint32_t n_gram : { 4, 8 }) {
         for (llama_pos pos0 : { 0, 23 }) {
             const uint32_t per_gram = 2, vocab = coalesced ? 4093 : 1021, eos = 997;
             const uint32_t n_heads = (n_gram - 1)*per_gram, n_rows = n_heads*vocab;
-            const size_t chunk = coalesced ? coalesce_chunk : 256;
+            const size_t ubatch = coalesced || bounded ? ubatch_size : windowed ? 1 : 256;
+            const size_t chunk = coalesced ? ubatch : bounded ? std::min<size_t>(256, ubatch) : 256;
             const size_t n_tokens = 3*chunk + 17, size = (size_t) n_rows*4096;
             const char * tmp_dir = getenv("TMPDIR");
             std::string path = std::string(tmp_dir ? tmp_dir : ".") + "/llama-ple-window-XXXXXX";
@@ -1204,20 +1205,22 @@ static void ple_hash_pages_case(bool windowed = false, bool bounded = false, boo
             llama_log_set([](ggml_log_level, const char * text, void * data) {
                 *static_cast<std::string *>(data) += text;
             }, &startup);
-            auto pf = llama_ple_prefetch::create(*model, coalesced ? chunk : windowed ? 1 : 256);
+            auto pf = llama_ple_prefetch::create(*model, ubatch);
             llama_log_set(nullptr, nullptr);
             require(pf != nullptr, "hash page prefetch created");
-            require(!bounded || startup.find(coalesced ? ", 0 tokens ahead\n" : ", 1 tokens ahead\n") != std::string::npos,
+            const std::string ahead_log = ", " + std::to_string(coalesced ? 0 : ubatch) + " tokens ahead\n";
+            require(!bounded || startup.find(ahead_log) != std::string::npos,
                     "prefetch ubatch cap limits the effective token window");
             require(!coalesced || startup.find("coalesced pread") != std::string::npos, "file-backed coalescing active");
             pf->hint(tokens.data(), tokens.size(), pos0);
-            const size_t consume_size = coalesced ? std::min<size_t>(113, chunk) : windowed ? 113 : 256;
+            const size_t consume_size = coalesced || bounded ? std::min<size_t>(113, ubatch) : windowed ? 113 : 256;
             size_t future_checks = 0;
             for (size_t i = 0; i < n_tokens; i += consume_size) {
                 const size_t count = std::min(consume_size, n_tokens - i);
                 require(pf->consume(count, nullptr, 0), "hash page chunk consumed");
                 require(mincore(pages, size, resident.data()) == 0, "consumed chunk residency");
-                const size_t allowed = (i + count + (bounded && !coalesced ? 1 : 0) + chunk - 1)/chunk;
+                const size_t read_end = std::max(ubatch, i + count) + (bounded && !coalesced ? ubatch : 0);
+                const size_t allowed = (read_end + chunk - 1)/chunk;
                 for (size_t r = 0; r < n_rows; ++r) {
                     future_checks += expected[r] && first_read[r] >= allowed;
                     require(first_chunk[r] > (i + count - 1)/chunk || (resident[r] & 1), "consume waits for every page of its chunks");
@@ -1454,7 +1457,10 @@ int main(int argc, char ** argv) {
         try {
             ple_hash_pages_case(strcmp(argv[1], "--ple-batch-pages") == 0);
             if (strcmp(argv[1], "--ple-batch-pages") == 0) {
-                ple_hash_pages_case(true, true);
+                for (size_t ubatch : { 384, 128, 1 }) {
+                    ple_hash_pages_case(true, true, false, ubatch);
+                }
+                printf("OK: fault windows cover 1, 128 and 384 token ubatches without whole-chunk overreads\n");
             }
             return 0;
         } catch (const std::exception & e) {

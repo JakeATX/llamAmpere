@@ -73,7 +73,7 @@ private:
     bool     use_pread = true;
     bool     use_advise = false; // [PFGAP] file mode: ask the kernel to queue the reads instead of copying them
     bool     coalesce = false;
-    bool     coalesce_window = false;
+    bool     bounded_window = false;
     uint32_t n_min     = 256;
     uint32_t n_ubatch  = 0;
     uint64_t n_ahead   = 0;      // tokens read ahead of the gather
