@@ -514,6 +514,7 @@ static __global__ void __launch_bounds__(CAP ? 256 : LOW || BOUNDS ? 384 : 512, 
     int t = i0 / S, ks = i0 - t * S;
     const char * xs = xb + ks * (16 * NT * 32);
     float cf[MU][4];
+    uint32_t rp[MU];
 #pragma unroll
     for (int u = 0; u < MU; ++u) {
         cf[u][0] = cf[u][1] = cf[u][2] = cf[u][3] = 0.0f;
@@ -527,20 +528,22 @@ static __global__ void __launch_bounds__(CAP ? 256 : LOW || BOUNDS ? 384 : 512, 
             c[u][0] = c[u][1] = c[u][2] = c[u][3] = 0;
         }
         float s0 = 0.0f, s1 = 0.0f;
-        uint32_t rp[MU];
         if constexpr ((V & 1) != 0) {
             // row scales of rows 32t + 16u + g (+8) for K block ks / 2: chunk (t, 2 (ks / 2) + u), slots g and g + 8
             if (n0 < NT)     { s0 = CO ? __ldcg(SA + n0 * S + ks) : __ldg(SA + n0 * S + ks); }
             if (n0 + 1 < NT) { s1 = CO ? __ldcg(SA + (n0 + 1) * S + ks) : __ldg(SA + (n0 + 1) * S + ks); }
+            // Adjacent K slices use the same row scales; a warp may start on the odd slice.
+            if (!NEIGHBOR || V != 5 || it == i0 || (ks & 1) == 0) {
 #pragma unroll
-            for (int u = 0; u < MU; ++u) {
-                const unsigned short * sb = (const unsigned short *) (W + ((int64_t) t * S + (ks & ~1) + u) * CS + 2048 * KB);
-                if constexpr (NEIGHBOR && V == 5) {
-                    const uint32_t row = __ldg(sb + g + ((q & 1) << 3));
-                    const uint32_t peer = __shfl_xor_sync(0xffffffffu, row, 1);
-                    rp[u] = __byte_perm(row, peer, (q & 1) ? 0x1054 : 0x5410);
-                } else {
-                    rp[u] = (uint32_t) __ldg(sb + g) | ((uint32_t) __ldg(sb + g + 8) << 16);
+                for (int u = 0; u < MU; ++u) {
+                    const unsigned short * sb = (const unsigned short *) (W + ((int64_t) t * S + (ks & ~1) + u) * CS + 2048 * KB);
+                    if constexpr (NEIGHBOR && V == 5) {
+                        const uint32_t row = __ldg(sb + g + ((q & 1) << 3));
+                        const uint32_t peer = __shfl_xor_sync(0xffffffffu, row, 1);
+                        rp[u] = __byte_perm(row, peer, (q & 1) ? 0x1054 : 0x5410);
+                    } else {
+                        rp[u] = (uint32_t) __ldg(sb + g) | ((uint32_t) __ldg(sb + g + 8) << 16);
+                    }
                 }
             }
         }
