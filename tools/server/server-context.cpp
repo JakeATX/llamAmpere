@@ -37,6 +37,7 @@ extern "C" {
 #include <cinttypes>
 #include <condition_variable>
 #include <exception>
+#include <future>
 #include <memory>
 #include <limits>
 #include <filesystem>
@@ -6100,10 +6101,28 @@ private:
 
         // in-call checkpoints are armed only for the whole batch in one view; a retry with a smaller view drops them
         bool ckpt_armed = false;
+        std::future<std::vector<std::vector<uint8_t>>> ckpt_pf;
         if (batch.ckpt_slot >= 0) {
             if (off == 0 && batch.view.size() == batch.size() &&
                     llama_state_seq_capture_arm(ctx_tgt, batch.ckpt_slot, batch.ckpt_spots.data(), (int32_t) batch.ckpt_spots.size()) == 0) {
                 ckpt_armed = true;
+                // LLAMA_CKPT_PREFAULT=1: a fresh checkpoint buffer costs ~80 ms of page faults and zero fill on the
+                // main thread after the decode; fault the buffers in on a helper thread while the decode runs
+                static const bool ckpt_prefault = [] {
+                    const char * e = getenv("LLAMA_CKPT_PREFAULT");
+                    return e != nullptr && atoi(e) != 0;
+                }();
+                if (ckpt_prefault) {
+                    const size_t n_pf = batch.ckpt_spots.size();
+                    // 1/16 headroom: the captured state may be a little larger than the state before the decode
+                    size_t sz_pf = llama_state_seq_get_size_ext(ctx_tgt, batch.ckpt_slot, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    sz_pf += sz_pf / 16;
+                    if (sz_pf > 0) {
+                        ckpt_pf = std::async(std::launch::async, [n_pf, sz_pf]() {
+                            return std::vector<std::vector<uint8_t>>(n_pf, std::vector<uint8_t>(sz_pf));
+                        });
+                    }
+                }
             } else {
                 SRV_WRN("dropping %zu in-call checkpoint(s): the batch is decoded in parts\n", batch.ckpt_spots.size());
                 batch.ckpt_slot = -1;
@@ -6354,6 +6373,13 @@ private:
                     cslot = &s;
                 }
             }
+            std::vector<std::vector<uint8_t>> pf_bufs;
+            if (ckpt_pf.valid()) {
+                const int64_t t_pf_us = ggml_time_us();
+                pf_bufs = ckpt_pf.get();
+                SRV_INF("[CKPT_PF] %zu prefaulted buffer(s) of %zu bytes, wait %.2f ms\n", pf_bufs.size(),
+                        pf_bufs.empty() ? (size_t) 0 : pf_bufs.front().size(), (ggml_time_us() - t_pf_us) / 1000.0);
+            }
             for (size_t k = 0; k < batch.ckpt_spots.size() && cslot && cslot->task; ++k) {
                 llama_pos p_min = -1;
                 llama_pos p_max = -1;
@@ -6379,6 +6405,11 @@ private:
                         throw std::runtime_error("failed to process speculative checkpoint range");
                     }
                     spec_processed = end;
+                }
+                if (cslot->ckpt_spare.empty() && !pf_bufs.empty()) {
+                    // a size mismatch falls back to a fresh buffer inside update_tgt
+                    cslot->ckpt_spare = std::move(pf_bufs.back());
+                    pf_bufs.pop_back();
                 }
                 create_checkpoint_at(*cslot, batch.ckpt_spots[k], p_min, p_max, /*exact=*/ false); // [#240] in-call spots are seal-grid spots: plain
                 if (spot_handed && !cslot->prompt.checkpoints.empty()) {
