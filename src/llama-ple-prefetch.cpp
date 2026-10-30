@@ -236,7 +236,11 @@ void llama_ple_prefetch::begin(llama_pos pos0) {
     if (pages_per_row > max_runs || n > max_runs/n_heads || n*n_heads > max_runs/pages_per_row) {
         throw std::length_error("PLE prefetch page count exceeds array size");
     }
-    const size_t cap = n*n_heads*(size_t) pages_per_row + 1;
+    // fork: global page dedup means the run count cannot exceed the table's page span.
+    // The extra page covers an unaligned table start in both fault and file-read modes.
+    const uint64_t table_bytes = n_rows*row_size;
+    const uint64_t table_pages = table_bytes/4096 + (table_bytes % 4096 != 0) + 1;
+    const size_t cap = std::min(n*n_heads*(size_t) pages_per_row, (size_t) table_pages) + 1;
     run_key.reset(new uint64_t[cap]);
     run_len.reset(new uint32_t[cap]);
     run_chunk.reset(new uint32_t[cap]);
