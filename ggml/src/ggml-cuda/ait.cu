@@ -561,24 +561,24 @@ static __global__ void k_ait_mmv_sum(const float * partial, float * Y, int M, in
         const int step = items / warps;
         const uint32_t warp_count = (uint32_t) warps, tail = (uint32_t) (items % warps);
         const int64_t start = (int64_t) first * items;
-        int lo = (int) (start / warps);
+        int hi = (int) (start / warps);
         // carry + tail <= 2 * (warps - 1) < 2^32 for positive int warps.
-        uint32_t carry = (uint32_t) (start - (int64_t) lo * warps);
+        uint32_t carry = (uint32_t) (start - (int64_t) hi * warps);
+        const bool nonempty_step = step != 0;
         const int64_t partial_stride = (int64_t) NT * M;
         int64_t partial_offset = (int64_t) token * M + row;
         for (int w = first; w < last; ++w) {
             carry += tail;
             const bool wrap = carry >= warp_count;
-            const int hi = lo + step + wrap;
+            hi += step + wrap;
             if (wrap) {
                 carry -= warp_count;
             }
-            // w < ceil(end * warps / items) implies lo < end.
-            if (lo < hi && hi > begin) {
+            // The range is nonempty iff step > 0 or the remainder wraps.
+            if ((nonempty_step || wrap) && hi > begin) {
                 sum += partial[partial_offset];
             }
             partial_offset += partial_stride;
-            lo = hi;
         }
     } else {
         for (int w = first; w < last; ++w) {
