@@ -332,7 +332,14 @@ void llama_ple_prefetch::build() {
     const uint64_t nkeys = (base + n_rows*row_size + 4095)/4096 - key0 + 1;
     std::vector<uint64_t> seen(nkeys/64 + (nkeys % 64 != 0), 0);
     std::vector<uint64_t> cp;   // the new pages of one chunk
-    cp.reserve((size_t) CHUNK*n_heads*2);
+    if (bounded_window) {
+        // fork: reserve for this window's rows once, not for a fixed 256-token fault chunk.
+        const uint64_t pages_per_row = 1 + (row_size - 1)/4096 + ((row_size - 1)%4096 != 0);
+        const uint64_t chunk_pages = std::min<uint64_t>(n, chunk_size)*n_heads*pages_per_row;
+        cp.reserve((size_t) std::min(nkeys, chunk_pages));
+    } else {
+        cp.reserve((size_t) CHUNK*n_heads*2);
+    }
 
     // the rows, as llm_graph_input_qwen4exp_ple::set_input computes them; a predecessor before the call is unknown,
     // unless the call starts the sequence (then it reads as EOS)
