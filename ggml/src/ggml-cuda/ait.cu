@@ -3,6 +3,7 @@
 // (token, slice)), then cuBLAS SGEMM in row slabs. This is the W4A8-style arithmetic of the fast kernel up to summation
 // order, so KL measured on it is the KL of the format. N <= 8 tokens take the tile-chain IMMA kernel (k_ait_mmv) unless
 // GGML_CUDA_AIT_ORDERED=0 restores the legacy unordered sum for comparison.
+// GGML_CUDA_AIT_SUM_CURSOR=1 advances ordered-sum bounds without per-partial division (default off).
 // GGML_CUDA_AIT_REF=1; GGML_CUDA_AIT_WARPS = warps per block of it (default 12),
 // GGML_CUDA_AIT_FULL = 1 (default): fully unrolled chunk loop, 0 = rolled 4 x 4 groups (Gate 2 10-23: unrolled 8-13% faster at N=1, every rate). GGML_CUDA_AIT_EXACT=1: f32 activations (no int8 round trip; the
 // A/B for the activation quantizer). GGML_CUDA_AIT_ASLICE = 512 (default) or 256: activation scale slice.
@@ -550,17 +551,35 @@ static __global__ void __launch_bounds__(CAP ? 256 : LOW ? 384 : 512, CAP ? 4 : 
 
 // Only nonempty warp ranges write scratch. Reduce them in warp order without reading unused slots.
 template <int NT>
-static __global__ void k_ait_mmv_sum(const float * partial, float * Y, int M, int S, int warps) {
+static __global__ void k_ait_mmv_sum(const float * partial, float * Y, int M, int S, int warps, bool cursor) {
     const int tile = blockIdx.x, row = tile * 32 + (threadIdx.x & 31), token = threadIdx.x >> 5;
     const int items = (M / 32) * S, begin = tile * S, end = begin + S;
     const int first = (int) ((int64_t) begin * warps / items);
     const int last = (int) (((int64_t) end * warps + items - 1) / items);
     float sum = 0.0f;
-    for (int w = first; w < last; ++w) {
-        const int lo = (int) ((int64_t) w * items / warps);
-        const int hi = (int) ((int64_t) (w + 1) * items / warps);
-        if (lo < hi && lo < end && hi > begin) {
-            sum += partial[(int64_t) (w - first) * NT * M + token * M + row];
+    if (cursor) {
+        const int step = items / warps, tail = items % warps;
+        const int64_t start = (int64_t) first * items;
+        int lo = (int) (start / warps);
+        int64_t carry = start - (int64_t) lo * warps;
+        for (int w = first; w < last; ++w) {
+            carry += tail;
+            const int hi = lo + step + (carry >= warps);
+            if (carry >= warps) {
+                carry -= warps;
+            }
+            if (lo < hi && lo < end && hi > begin) {
+                sum += partial[(int64_t) (w - first) * NT * M + token * M + row];
+            }
+            lo = hi;
+        }
+    } else {
+        for (int w = first; w < last; ++w) {
+            const int lo = (int) ((int64_t) w * items / warps);
+            const int hi = (int) ((int64_t) (w + 1) * items / warps);
+            if (lo < hi && lo < end && hi > begin) {
+                sum += partial[(int64_t) (w - first) * NT * M + token * M + row];
+            }
         }
     }
     Y[token * M + row] = sum;
@@ -748,6 +767,7 @@ static void ait_fast_nt(ggml_backend_cuda_context & ctx, const uint8_t * W, cons
     static const int occ = ait_env_int("GGML_CUDA_AIT_OCC", 0);
     static const int grid_factor = std::max(1, std::min(8, ait_env_int("GGML_CUDA_AIT_OCC_GRID", 4)));
     static const bool ordered = ait_env_int("GGML_CUDA_AIT_ORDERED", 1) != 0;
+    static const bool sum_cursor = ait_env_int("GGML_CUDA_AIT_SUM_CURSOR", 0) != 0;
     const bool use_v = (NT == 1 || NT == 4 || NT == 5 || NT == 8) && vexp != 0 && (code != 1 || ait_plds() == 1);
     int total_warps = nsm * warps;
     if (!use_v && k == 4 && code == 0 && full && occ > 0) {
@@ -761,7 +781,7 @@ static void ait_fast_nt(ggml_backend_cuda_context & ctx, const uint8_t * W, cons
     float * partial = ordered ? scratch.get() : nullptr;
     auto finish = [&]() {
         if (ordered) {
-            k_ait_mmv_sum<NT><<<M / 32, 32 * NT, 0, stream>>>(partial, Y, M, S, total_warps);
+            k_ait_mmv_sum<NT><<<M / 32, 32 * NT, 0, stream>>>(partial, Y, M, S, total_warps, sum_cursor);
         }
         CUDA_CHECK(cudaGetLastError());
     };
