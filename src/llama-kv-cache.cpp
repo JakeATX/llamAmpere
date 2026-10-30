@@ -4266,7 +4266,6 @@ struct kq_mask_deferred {
     void *               data;
     int64_t              n_kv;
     std::vector<int32_t> n_visible;
-    bool                 host_filled;
 };
 std::mutex                    g_kq_deferred_mu;
 std::vector<kq_mask_deferred> g_kq_deferred;
@@ -4308,14 +4307,14 @@ bool llama_kq_mask_deferred_set(const ggml_tensor * t, int64_t n_kv, std::vector
     if (g_kq_deferred.size() >= 64) {
         return false;
     }
-    g_kq_deferred.push_back({ t, t->data, n_kv, std::move(n_visible), false });
+    g_kq_deferred.push_back({ t, t->data, n_kv, std::move(n_visible) });
     return true;
 }
 
 bool llama_kq_mask_deferred_get(const ggml_tensor * t, std::vector<int32_t> & n_visible, int64_t * n_kv) {
     std::lock_guard<std::mutex> lock(g_kq_deferred_mu);
     const auto * d = kq_mask_deferred_find(t);
-    if (!d || d->host_filled) {
+    if (!d) {
         return false;
     }
     n_visible = d->n_visible;  // a copy: another context may replace the record after the lock is released
@@ -4326,7 +4325,7 @@ bool llama_kq_mask_deferred_get(const ggml_tensor * t, std::vector<int32_t> & n_
 void llama_kq_mask_deferred_fill_host(const ggml_tensor * t) {
     std::lock_guard<std::mutex> lock(g_kq_deferred_mu);
     auto * d = kq_mask_deferred_find(t);
-    if (!d || d->host_filled) {
+    if (!d) {
         return;
     }
     const ggml_fp16_t keep = ggml_fp32_to_fp16(0.0f), drop = ggml_fp32_to_fp16(-INFINITY);
@@ -4335,7 +4334,12 @@ void llama_kq_mask_deferred_fill_host(const ggml_tensor * t) {
         std::fill(row, row + d->n_visible[i], keep);
         std::fill(row + d->n_visible[i], row + d->n_kv, drop);
     }
-    d->host_filled = true;
+    // The host bytes now serve all later copies; keep slots only for pending fills.
+    const size_t index = d - g_kq_deferred.data();
+    if (index + 1 != g_kq_deferred.size()) {
+        g_kq_deferred[index] = std::move(g_kq_deferred.back());
+    }
+    g_kq_deferred.pop_back();
 }
 
 // the visible-cell count of each row, if the used cells are contiguous from 0 and ascending in position (no M-RoPE)

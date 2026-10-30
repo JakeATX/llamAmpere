@@ -1037,7 +1037,26 @@ static void deferred_mask_capacity_case() {
     std::vector<int32_t> counts;
     int64_t n_kv = 0;
     require(!llama_kq_mask_deferred_get(masks.back(), counts, &n_kv), "refused mask uses normal host fill");
+    for (int pass = 0; pass < 2; ++pass) {
+        for (int i = 0; i < 65; ++i) {
+            require(llama_kq_mask_deferred_set(masks[i], 8, { 8, 1, 0 }) == (i < 64), "host-filled masks free their slots");
+        }
+        for (int i = 0; i < 64; ++i) {
+            require(llama_kq_mask_deferred_get(masks[i], counts, &n_kv), "reused slot has new counts");
+            require(n_kv == 8 && counts == std::vector<int32_t>({ 8, 1, 0 }), "old counts do not survive reuse");
+            llama_kq_mask_deferred_fill_host(masks[i]);
+            llama_kq_mask_deferred_fill_host(masks[i]);
+            const auto * data = static_cast<const ggml_fp16_t *>(masks[i]->data);
+            for (int r = 0; r < 3; ++r) {
+                for (int c = 0; c < 8; ++c) {
+                    require(data[r*8 + c] == ggml_fp32_to_fp16(c < counts[r] ? 0.0f : -INFINITY), "reused host mask bytes");
+                }
+            }
+            require(!llama_kq_mask_deferred_get(masks[i], counts, &n_kv), "completed fill retires its slot");
+        }
+    }
     ggml_free(ctx);
+    printf("OK: host-filled mask slots reused twice with exact bytes\n");
     printf("OK: invalid deferred masks refused without using pending slots\n");
     printf("OK: 64 pending masks preserved, 65th falls back, all host mask bytes exact\n");
 }
