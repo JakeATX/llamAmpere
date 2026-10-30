@@ -538,7 +538,7 @@ static __global__ void __launch_bounds__(CAP ? 256 : LOW || BOUNDS ? 384 : 512, 
                 if constexpr (NEIGHBOR && V == 5) {
                     const uint32_t row = __ldg(sb + g + ((q & 1) << 3));
                     const uint32_t peer = __shfl_xor_sync(0xffffffffu, row, 1);
-                    rp[u] = (q & 1) ? peer | (row << 16) : row | (peer << 16);
+                    rp[u] = __byte_perm(row, peer, (q & 1) ? 0x1054 : 0x5410);
                 } else {
                     rp[u] = (uint32_t) __ldg(sb + g) | ((uint32_t) __ldg(sb + g + 8) << 16);
                 }
