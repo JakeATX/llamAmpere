@@ -1393,8 +1393,8 @@ static void ple_hash_pages_case(bool windowed = false, bool bounded = false, boo
 
 static void ple_wide_rows_case() {
 #if defined(__linux__)
-    for (int width : { 2048, 4096 }) {
-        const size_t n_tokens = 3*256 + 17;
+    for (int width : { 2048, 4096, 65536 }) {
+        const size_t n_tokens = width == 65536 ? 65 : 3*256 + 17;
         const size_t size = n_tokens*width*sizeof(float) + 4096;
         void * pages = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         require(pages != MAP_FAILED, "wide prefetch pages");
@@ -1497,6 +1497,7 @@ static void ple_wide_rows_case() {
     printf("OK: prefetch row spans stay within host buffer without overflow\n");
     printf("OK: large prefetch minimum does not wrap into short calls\n");
     printf("OK: unaligned 8KiB and 16KiB prefetch rows cover every page\n");
+    printf("OK: unaligned 256KiB rows cover full bitmap words and both boundary pages\n");
 #else
     printf("SKIP: wide prefetch page test needs Linux\n");
 #endif
