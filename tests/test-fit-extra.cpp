@@ -12,7 +12,63 @@ static void expect(bool condition, const char * message) {
     }
 }
 
+static void test_ram_fit() {
+    constexpr uint64_t GiB = 1ull << 30;
+    constexpr uint64_t MiB = 1ull << 20;
+    std::array<common_fit_ram_request, COMMON_FIT_RAM_COUNT> requests;
+    for (auto & request : requests) {
+        request.bytes = UINT64_MAX;
+    }
+    uint64_t previous_prompt = 0;
+    for (const uint64_t host_gib : {16, 32, 64, 128}) {
+        // Fake a mapped model and context that already use six GiB.
+        const uint64_t available = (host_gib - 6) * GiB;
+        const auto plan = common_fit_ram_plan(available, requests);
+        uint64_t sum = 0;
+        for (uint64_t bytes : plan.bytes) {
+            expect(bytes <= available - sum, "RAM plan cannot overflow available memory");
+            sum += bytes;
+        }
+        expect(plan.floor_met && plan.floor == 5 * GiB, "all host sizes retain the five GiB floor");
+        expect(sum <= available - 5 * GiB, "optional consumers leave five GiB free");
+        expect(sum <= plan.automatic_budget, "allocations stay within the shared automatic budget");
+        expect(plan.bytes[COMMON_FIT_RAM_PROMPT] > previous_prompt, "cache defaults grow with available host RAM");
+        expect(plan.bytes[COMMON_FIT_RAM_EXPERTS] > plan.bytes[COMMON_FIT_RAM_PROMPT], "expert storage gets priority");
+        previous_prompt = plan.bytes[COMMON_FIT_RAM_PROMPT];
+        std::printf("RAM fit fake %llu GiB host: available=%llu MiB optional=%llu MiB floor=5120 MiB\n",
+                (unsigned long long) host_gib, (unsigned long long) (available / MiB), (unsigned long long) (sum / MiB));
+    }
+    requests[COMMON_FIT_RAM_PROMPT] = {123 * MiB, true};
+    requests[COMMON_FIT_RAM_EXPERTS].bytes = 0;
+    const auto explicit_plan = common_fit_ram_plan(16 * GiB, requests);
+    expect(explicit_plan.bytes[COMMON_FIT_RAM_PROMPT] == 123 * MiB, "explicit prompt limit wins exactly");
+    expect(explicit_plan.bytes[COMMON_FIT_RAM_EXPERTS] == 0, "unused expert bank stays off");
+    expect(explicit_plan.bytes[COMMON_FIT_RAM_STAGING] > explicit_plan.bytes[COMMON_FIT_RAM_PREFETCH], "unused first-priority quota goes to staging");
+    requests[COMMON_FIT_RAM_PROMPT] = {0, true};
+    expect(common_fit_ram_plan(16 * GiB, requests).bytes[COMMON_FIT_RAM_PROMPT] == 0, "explicit disable wins");
+    for (const uint64_t available : std::array<uint64_t, 3>{0, 4 * GiB, 5 * GiB}) {
+        const auto plan = common_fit_ram_plan(available, requests);
+        expect(plan.automatic_budget == 0, "no automatic allocations at or below the floor");
+        for (uint64_t bytes : plan.bytes) {
+            expect(bytes == 0, "optional pieces turn off when there is no safe RAM");
+        }
+    }
+    requests[COMMON_FIT_RAM_PROMPT] = {12 * GiB, true};
+    const auto too_large = common_fit_ram_plan(16 * GiB, requests);
+    expect(!too_large.floor_met && too_large.automatic_budget == 0, "unsafe explicit demand cannot claim a safe fit");
+    expect(too_large.bytes[COMMON_FIT_RAM_PROMPT] == 12 * GiB, "unsafe explicit demand is reported unchanged");
+    const auto large = common_fit_ram_plan(UINT64_MAX, requests);
+    uint64_t left = UINT64_MAX - large.floor;
+    for (uint64_t bytes : large.bytes) {
+        expect(bytes <= left, "large-memory arithmetic does not wrap");
+        left -= bytes;
+    }
+    expect(common_fit_vram_floor(false) == 300 * MiB, "headless VRAM floor is 300 MiB");
+    expect(common_fit_vram_floor(true) == 800 * MiB, "display VRAM floor is 800 MiB");
+}
+
 int main() {
+    test_ram_fit();
     constexpr size_t MiB = 1024*1024;
 
     // Qwen3.5 27B MTP draft with f16 KV, 4 sequences, unified KV: one nextn layer of 4 KV heads x 256 dims,

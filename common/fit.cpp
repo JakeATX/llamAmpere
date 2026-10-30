@@ -17,6 +17,51 @@
 #include <string>
 #include <vector>
 
+common_fit_ram_result common_fit_ram_plan(uint64_t available,
+        const std::array<common_fit_ram_request, COMMON_FIT_RAM_COUNT> & requests) {
+    constexpr uint64_t MiB = 1ull << 20;
+    static const unsigned shares[COMMON_FIT_RAM_COUNT] = {50, 10, 10, 20, 5, 5};
+    common_fit_ram_result result;
+    result.available = available;
+    result.floor_met = available >= result.floor;
+    uint64_t spare = result.floor_met ? available - result.floor : 0;
+    for (size_t i = 0; i < requests.size(); ++i) {
+        if (!requests[i].explicit_size) {
+            continue;
+        }
+        result.bytes[i] = requests[i].bytes;
+        if (requests[i].bytes > spare) {
+            result.floor_met = false;
+            spare = 0;
+        } else {
+            spare -= requests[i].bytes;
+        }
+    }
+    if (!result.floor_met) {
+        return result;
+    }
+
+    // Keep a fifth of the spare RAM for later allocations. Work in MiB to avoid overflow.
+    const uint64_t spare_mib = spare / MiB;
+    const uint64_t budget_mib = (spare_mib / 5) * 4 + (spare_mib % 5) * 4 / 5;
+    result.automatic_budget = budget_mib * MiB;
+    uint64_t carry_mib = 0;
+    for (size_t i = 0; i < requests.size(); ++i) {
+        const uint64_t quota_mib = (budget_mib / 100) * shares[i] + (budget_mib % 100) * shares[i] / 100;
+        carry_mib += quota_mib;
+        if (!requests[i].explicit_size) {
+            const uint64_t assigned_mib = std::min(carry_mib, requests[i].bytes / MiB);
+            result.bytes[i] = assigned_mib * MiB;
+            carry_mib -= assigned_mib;
+        }
+    }
+    return result;
+}
+
+size_t common_fit_vram_floor(bool display_attached) {
+    return (display_attached ? 800u : 300u) * size_t(1024 * 1024);
+}
+
 // this enum is only used in llama_params_fit_impl but needs to be defined outside of it to fix a Windows compilation issue
 // enum to identify part of a layer for distributing its tensors:
 enum common_layer_fraction_t {

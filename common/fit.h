@@ -3,9 +3,39 @@
 #include "ggml.h"
 #include "llama.h"
 
+#include <array>
 #include <cstdint>
 #include <string>
 #include <vector>
+
+// fork: optional host memory, planned after required model/context allocations.
+enum common_fit_ram_consumer {
+    COMMON_FIT_RAM_EXPERTS,
+    COMMON_FIT_RAM_STAGING,
+    COMMON_FIT_RAM_PREFETCH,
+    COMMON_FIT_RAM_PROMPT,
+    COMMON_FIT_RAM_NGRAM,
+    COMMON_FIT_RAM_EVAL,
+    COMMON_FIT_RAM_COUNT,
+};
+
+struct common_fit_ram_request {
+    uint64_t bytes = 0; // zero keeps an unused consumer off
+    bool explicit_size = false;
+};
+
+struct common_fit_ram_result {
+    bool floor_met = false;
+    uint64_t available = 0;
+    uint64_t floor = 5ull << 30;
+    uint64_t automatic_budget = 0;
+    std::array<uint64_t, COMMON_FIT_RAM_COUNT> bytes = {};
+};
+
+common_fit_ram_result common_fit_ram_plan(uint64_t available,
+        const std::array<common_fit_ram_request, COMMON_FIT_RAM_COUNT> & requests);
+
+size_t common_fit_vram_floor(bool display_attached);
 
 struct common_moe_cache_params;
 
