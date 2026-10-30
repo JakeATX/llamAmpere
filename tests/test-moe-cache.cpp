@@ -6963,9 +6963,12 @@ static bool run_skip_tail_layer(ggml_backend_t gpu, ggml_backend_t cpu, log_capt
             }
             const std::string log = capture.get();
             long long logged = -1;
-            const size_t pos = log.rfind("[moe-cache] skip-tail: ");
-            if (pos != std::string::npos) {
-                logged = atoll(log.c_str() + pos + strlen("[moe-cache] skip-tail: "));
+            const size_t end = log.rfind(" missed tensor-expert rows left out (");
+            if (end != std::string::npos) {
+                const size_t pos = log.rfind("[moe-cache] skip-tail: ", end);
+                if (pos != std::string::npos) {
+                    logged = atoll(log.c_str() + pos + strlen("[moe-cache] skip-tail: "));
+                }
             }
             // The device counter is a process total, so compare the growth of this shape.
             const long long grown = logged - logged_rows_total;
