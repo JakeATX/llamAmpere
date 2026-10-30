@@ -5365,6 +5365,37 @@ struct test_dsv4_hc_fused : public test_case {
 };
 
 
+struct test_dsv4_hc_alignment : public test_dsv4_hc_fused {
+    const int x_offset;
+    const int norm_offset;
+    const bool up;
+
+    test_dsv4_hc_alignment(int x_offset, int norm_offset, bool up)
+        : test_dsv4_hc_fused(512, 64, 1), x_offset(x_offset), norm_offset(norm_offset), up(up) {}
+
+    std::string op_desc(ggml_tensor *) override { return "HC_ALIGNMENT"; }
+    std::string vars() override { return VARS_TO_STR3(x_offset, norm_offset, up); }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x_base = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4*n_embd + x_offset/sizeof(float));
+        ggml_tensor * norm_base = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4*n_embd + norm_offset/sizeof(float));
+        ggml_tensor * x = ggml_view_3d(ctx, x_base, n_embd, 4, 1, n_embd*sizeof(float), 4*n_embd*sizeof(float), x_offset);
+        ggml_tensor * wn = ggml_view_2d(ctx, norm_base, n_embd, 4, n_embd*sizeof(float), norm_offset);
+        ggml_tensor * wd = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, 4*n_embd, R);
+        ggml_tensor * wi = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, 4*n_embd, 4);
+        ggml_set_name(wn, "w_norm");
+        ggml_set_name(wd, "w_down");
+        ggml_set_name(wi, "w_inject");
+        ggml_tensor * down = ggml_dsv4_hc_down(ctx, x, wn, wd, wi, 1e-6f, 0.25f, 0.25f);
+        if (!up) {
+            return down;
+        }
+        ggml_tensor * wu = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, R, 4*n_embd);
+        ggml_set_name(wu, "w_up");
+        return ggml_dsv4_hc_up(ctx, x, wn, down, wu, 0.25f);
+    }
+};
+
 // Direct down outputs expose the activation, injection and RMS scale errors before the up kernel can mask them.
 struct test_dsv4_hc_down_owner : public test_dsv4_hc_fused {
     const bool norm_zero;
@@ -15253,6 +15284,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_down_owner(1024, 6, 5, true, false, false, 3));
     test_cases.emplace_back(new test_dsv4_hc_down_owner(512, 9, 7, true, false, false, -1, true));
     test_cases.emplace_back(new test_dsv4_hc_down_owner(512, 9, 8, true, false, false, -1, true));
+    for (int x_offset : {0, 4, 8, 12, 16}) {
+        for (int norm_offset : {0, 4, 8, 12, 16}) {
+            for (bool up : {false, true}) {
+                test_cases.emplace_back(new test_dsv4_hc_alignment(x_offset, norm_offset, up));
+            }
+        }
+    }
     // [HCFUSED] real Flash-Next shapes, every token count the kernels specialize, with and without the injection rows
     for (int64_t nt = 1; nt <= 8; ++nt) {
         test_cases.emplace_back(new test_dsv4_hc_fused(2560, 320, nt, true,  true, 1));
