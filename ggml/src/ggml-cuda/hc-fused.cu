@@ -164,7 +164,8 @@ static __global__ void __launch_bounds__(256) hcf_down_row_owner(
         }
 #pragma unroll
         for (int t = 0; t < T; ++t) {
-            out[t] += __ldg(dst + n_rows*T + 4*t + s)*hcf_owner_sum(acc[t]);
+            // RMS scales share the allocation with outputs written by this kernel.
+            out[t] += dst[n_rows*T + 4*t + s]*hcf_owner_sum(acc[t]);
         }
     }
     if (lane == 0) {

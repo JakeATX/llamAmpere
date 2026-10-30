@@ -5366,8 +5366,23 @@ struct test_dsv4_hc_fused : public test_case {
 
 // Direct down outputs expose the activation, injection and RMS scale errors before the up kernel can mask them.
 struct test_dsv4_hc_down_owner : public test_dsv4_hc_fused {
-    test_dsv4_hc_down_owner(int64_t embd, int64_t rank, int64_t tokens, bool injection)
-        : test_dsv4_hc_fused(embd, rank, tokens, injection) {}
+    const bool norm_zero;
+
+    test_dsv4_hc_down_owner(int64_t embd, int64_t rank, int64_t tokens, bool injection, bool norm_zero = false)
+        : test_dsv4_hc_fused(embd, rank, tokens, injection), norm_zero(norm_zero) {}
+
+    std::string vars() override { return test_dsv4_hc_fused::vars() + "," + VARS_TO_STR1(norm_zero); }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_dsv4_hc_fused::initialize_tensors(ctx);
+        if (norm_zero) {
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                if (strcmp(ggml_get_name(t), "w_norm") == 0) {
+                    init_tensor_uniform(t, 0.0f, 0.0f);
+                }
+            }
+        }
+    }
 
     std::string op_desc(ggml_tensor *) override { return "HC_DOWN_OWNER"; }
     bool run_whole_graph() override { return true; }
@@ -5380,6 +5395,12 @@ struct test_dsv4_hc_down_owner : public test_dsv4_hc_fused {
         for (size_t i = 0; i < n; ++i) {
             if (!std::isfinite(a[i]) || !std::isfinite(b[i])) {
                 return INFINITY;
+            }
+            if (norm_zero && i < n - 4*n_tokens) {
+                const float expected = i < size_t(R*n_tokens) ? 0.0f : 1.0f;
+                if (a[i] != expected || b[i] != expected) {
+                    return INFINITY;
+                }
             }
             const double tol = i < n - 4*n_tokens ? 1e-5 : 2e-6*std::abs(double(b[i]));
             const double diff = std::abs(double(a[i]) - b[i]);
@@ -15153,6 +15174,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // Longer row loops cover guarded lookahead at the final weight tile.
     test_cases.emplace_back(new test_dsv4_hc_down_owner(2048, 31, 2, true));
     test_cases.emplace_back(new test_dsv4_hc_down_owner(4096, 9, 8, false));
+    // Zero weighted inputs give exact zero activations and unit injection gates.
+    test_cases.emplace_back(new test_dsv4_hc_down_owner(1024, 3, 7, true, true));
     // [HCFUSED] real Flash-Next shapes, every token count the kernels specialize, with and without the injection rows
     for (int64_t nt = 1; nt <= 8; ++nt) {
         test_cases.emplace_back(new test_dsv4_hc_fused(2560, 320, nt, true,  true, 1));
