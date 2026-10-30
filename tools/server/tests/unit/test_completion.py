@@ -494,7 +494,12 @@ def test_n_probs_incomplete_utf8(post_sampling_probs):
     assert len(res.body["completion_probabilities"]) == 1
     row = res.body["completion_probabilities"][0]
     assert row["id"] == token["id"] and row["bytes"] == token["piece"]
-    assert len(row["top_probs" if post_sampling_probs else "top_logprobs"]) == 10
+    if post_sampling_probs:
+        assert len(row["top_probs"]) == 1
+        assert row["top_probs"][0]["id"] == token["id"]
+        assert row["top_probs"][0]["prob"] == pytest.approx(1.0)
+    else:
+        assert len(row["top_logprobs"]) == 10
 
 
 def test_n_probs_stream():
