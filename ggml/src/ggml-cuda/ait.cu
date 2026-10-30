@@ -12,6 +12,25 @@
 // l and l + 16 share a copy), 2: u16 entries, one copy per bank (64 KB, conflict-free, two more ALU ops per address).
 // GGML_CUDA_AIT_OCC = 0 (default), 1 or 2: AIT4 low-register experiment with a two-group or one-group prefetch ring.
 // Modes 3/4 cap registers; GGML_CUDA_AIT_OCC_GRID sets their blocks per SM (1..8, default 4).
+// GGML_CUDA_AIT3_PACK: 1 packs each AIT3 row tile with a tight register cap; 2 keeps the base register budget.
+// GGML_CUDA_AIT3_RING2=1 keeps two AIT3 weight groups live with the base register budget.
+// GGML_CUDA_AIT3_RING1=1 keeps one AIT3 weight group live; it takes precedence over RING2 and PACK.
+// GGML_CUDA_AIT4_NEIGHBOR=1 loads one weight vector per lane and shuffles its neighbor instead of loading it twice.
+// GGML_CUDA_AIT4_NEIGHBOR_PACK=1 packs one MMA tile at a time in the neighbor path.
+// GGML_CUDA_AIT4_NEIGHBOR_TAIL=1 refills the neighbor ring after its IMMA work.
+// GGML_CUDA_AIT4_NEIGHBOR_EARLY_X=1 reads activations before the neighbor group's decode.
+// GGML_CUDA_AIT4_NEIGHBOR_BOUNDS=1 gives the neighbor kernel a 384-thread compile bound.
+// GGML_CUDA_AIT4_NEIGHBOR_RING1=1 keeps one weight group live in the neighbor path.
+// GGML_CUDA_AIT4_NEIGHBOR_UNROLL2=1 unrolls two four-group steps in the neighbor path.
+// GGML_CUDA_AIT4_NEIGHBOR_OCC=1 launches two register-capped blocks per SM without tile packing.
+// GGML_CUDA_AIT4_NEIGHBOR_SCALES=1 reads scales early; =2 shares row scales between adjacent lanes.
+// GGML_CUDA_AIT4_RING2=1 keeps two AIT4 weight groups live with the base register budget (OCC=0, NEIGHBOR=0).
+// GGML_CUDA_AIT4_RING1=1 keeps one AIT4 weight group live and takes precedence over RING2.
+// GGML_CUDA_AIT4_TAIL=1 refills the four-group weight ring after each group's IMMA work.
+// GGML_CUDA_AIT4_PACK=1 packs each AIT4 MMA tile at the base register budget and four-group ring.
+// GGML_CUDA_AIT4_UNROLL2=1 unrolls two four-group steps instead of all four steps.
+// GGML_CUDA_AIT4_EARLY_X=1 loads each activation vector before decoding its weight group.
+// GGML_CUDA_AIT4_BOUNDS=1 sets the plain decode thread bound to 384 for a larger register budget.
 #include "ait.cuh"
 #include "ait-mm.cuh"
 #include "ai4.cuh"
@@ -245,19 +264,30 @@ static __device__ __forceinline__ void ait_group_mma(int * c, const uint32_t (&a
     mma_s8(c, p[0], p[1], p[2], p[3], b.x, b.y);
 }
 
-// One group decodes four tiles and advances its prefetch-ring slot before the two IMMA operations.
-template <int KB, int NT, int Gi, int PC = 0, bool CO = false, int DEPTH = 4, bool LOW = false, bool SHARED_X = false>
+// One group decodes four tiles and refills its ring slot before IMMA, or after IMMA with TAIL.
+template <int KB, int NT, int Gi, int PC = 0, bool CO = false, int DEPTH = 4, bool LOW = false, bool SHARED_X = false, bool NEIGHBOR = false, bool TAIL = false, bool EARLY_X = false>
 static __device__ __forceinline__ void ait_group(uint4 (&buf)[DEPTH][2], const int G, const bool pf, const char * gp, const int (&off)[2],
         const int r, const char * xs, const bool live, int (&c)[2][4], const char * tsm = nullptr, const uint32_t lo = 0) {
+    static_assert(!TAIL || (KB == 4 && PC == 0 && !CO && !LOW && !SHARED_X), "tail refill requires plain AIT4");
+    static_assert(!EARLY_X || (KB == 4 && PC == 0 && !CO && !LOW && !SHARED_X && !TAIL), "early activation requires plain AIT4");
     using namespace aitk;
     constexpr int GB = 128 * KB;
     constexpr bool ONE = 7 * KB + 16 <= 32;
-    const uint4 cur0 = buf[Gi][0], cur1 = buf[Gi][1];
-    if (pf) {
+    const uint4 cur0 = buf[Gi][0];
+    uint4 cur1;
+    if constexpr (NEIGHBOR) {
+        static_assert(KB == 4 && PC == 0, "neighbor vectors require one 16-byte vector per lane");
+        const int src = (threadIdx.x + 1) & 31;
+        cur1 = make_uint4(__shfl_sync(0xffffffffu, cur0.x, src), __shfl_sync(0xffffffffu, cur0.y, src),
+                         __shfl_sync(0xffffffffu, cur0.z, src), __shfl_sync(0xffffffffu, cur0.w, src));
+    } else {
+        cur1 = buf[Gi][1];
+    }
+    if (pf && !TAIL) {
         // groups past this chunk continue in the next one, after its 64 side bytes
         const char * p = gp + (G + DEPTH) * GB + (G + DEPTH >= 16 ? 64 : 0);
         buf[Gi][0] = ldw16(p + off[0]);
-        buf[Gi][1] = ldw16(p + off[1]);
+        if constexpr (!NEIGHBOR) { buf[Gi][1] = ldw16(p + off[1]); }
     }
     if constexpr (PC != 0) {
         static_assert(KB == 2, "AIT2P is k = 2");
@@ -279,7 +309,7 @@ static __device__ __forceinline__ void ait_group(uint4 (&buf)[DEPTH][2], const i
         return;
     }
     if constexpr (LOW) {
-        static_assert(KB == 4 && PC == 0, "low-register path requires AIT4");
+        static_assert((KB == 3 || KB == 4) && PC == 0, "low-register path requires AIT3 or AIT4");
         uint32_t a[4], f[4];
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
@@ -299,6 +329,12 @@ static __device__ __forceinline__ void ait_group(uint4 (&buf)[DEPTH][2], const i
         ait_group_mma<KB, 1>(c[1], a, f, b);
         return;
     }
+    uint2 b = make_uint2(0, 0);
+    if constexpr (EARLY_X) {
+        if (NT == 8 || live) {
+            b = __ldg((const uint2 *) (xs + G * NT * 32));
+        }
+    }
     uint32_t Lv[4][8];
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
@@ -311,9 +347,10 @@ static __device__ __forceinline__ void ait_group(uint4 (&buf)[DEPTH][2], const i
         Lv[i][0] = st1<KB, 0>(A, F1); Lv[i][1] = st1<KB, 1>(A, F1); Lv[i][2] = st1<KB, 2>(A, F1); Lv[i][3] = st1<KB, 3>(A, F1);
         Lv[i][4] = st1<KB, 4>(A, F1); Lv[i][5] = st1<KB, 5>(A, F1); Lv[i][6] = st1<KB, 6>(A, F1); Lv[i][7] = st1<KB, 7>(A, F1);
     }
-    uint2 b = make_uint2(0, 0);
-    if (NT == 8 || live) {
-        b = CO ? __ldcg((const uint2 *) (xs + G * NT * 32)) : __ldg((const uint2 *) (xs + G * NT * 32));
+    if constexpr (!EARLY_X) {
+        if (NT == 8 || live) {
+            b = CO ? __ldcg((const uint2 *) (xs + G * NT * 32)) : __ldg((const uint2 *) (xs + G * NT * 32));
+        }
     }
 #pragma unroll
     for (int u = 0; u < 2; ++u) {
@@ -327,6 +364,13 @@ static __device__ __forceinline__ void ait_group(uint4 (&buf)[DEPTH][2], const i
             }
         }
         mma_s8(c[u], a[0], a[1], a[2], a[3], b.x, b.y);
+    }
+    if constexpr (TAIL) {
+        if (pf) {
+            const char * p = gp + (G + DEPTH) * GB + (G + DEPTH >= 16 ? 64 : 0);
+            buf[Gi][0] = ldw16(p + off[0]);
+            if constexpr (!NEIGHBOR) { buf[Gi][1] = ldw16(p + off[1]); }
+        }
     }
 }
 
@@ -377,10 +421,15 @@ static __device__ __forceinline__ void ait_tile_sum(const float * partial, float
 // item's end, not prefetched); bit 1 = fused activation prep: the kernel itself does k_ait_actq's work (one warp per (token,
 // 512-K slice)) and zeroes Y, behind a grid barrier (cooperative launch, 1 CTA per SM); the weight ring and l2pf lines
 // (prefetch.global.L2, 128 B per lane each) are issued before the barrier; activations are then read with ld.global.cg.
-template <int KB, int NT, bool FULL, int PC = 0, int V = 0, int DEPTH = 4, bool LOW = false, bool CAP = false>
-static __global__ void __launch_bounds__(CAP ? 256 : LOW ? 384 : 512, CAP ? 4 : LOW ? 2 : 1) k_ait_mmv(const char * __restrict__ W, const int8_t * X,
+template <int KB, int NT, bool FULL, int PC = 0, int V = 0, int DEPTH = 4, bool LOW = false, bool CAP = false, bool PACK = LOW, bool NEIGHBOR = false, bool TAIL = false, bool UNROLL2 = false, bool EARLY_X = false, bool BOUNDS = false>
+static __global__ void __launch_bounds__(CAP ? 256 : LOW || BOUNDS ? 384 : 512, CAP ? 4 : LOW ? 2 : 1) k_ait_mmv(const char * __restrict__ W, const int8_t * X,
         const float * SA, float * __restrict__ Y, const int M, const int K, const float * __restrict__ XF = nullptr,
         const int l2pf = 0, float * __restrict__ partial = nullptr, unsigned int * tcnt = nullptr) {
+    static_assert(!NEIGHBOR || (KB == 4 && FULL && PC == 0 && (V == 0 || V == 1 || V == 5)), "neighbor path requires plain full AIT4");
+    static_assert(!TAIL || (KB == 4 && FULL && PC == 0 && V == 0 && !PACK), "tail refill requires plain full AIT4");
+    static_assert(!UNROLL2 || (KB == 4 && FULL && PC == 0 && V == 0 && DEPTH == 4 && !LOW && !CAP && !PACK && !TAIL), "two-step unroll requires plain full AIT4");
+    static_assert(!EARLY_X || (KB == 4 && FULL && PC == 0 && V == 0 && DEPTH == 4 && !LOW && !CAP && !PACK && !TAIL && !UNROLL2), "early activation requires plain full AIT4");
+    static_assert(!BOUNDS || (KB == 4 && FULL && PC == 0 && V == 0 && DEPTH == 4 && !LOW && !CAP && !PACK && !TAIL && !UNROLL2 && !EARLY_X), "thread bound requires plain full AIT4");
     constexpr bool CO = (V & 2) != 0;
     using namespace aitk;
     constexpr int BQ = 8 * KB, GB = 16 * BQ, CS = 2048 * KB + 64, MU = 2;
@@ -404,7 +453,7 @@ static __global__ void __launch_bounds__(CAP ? 256 : LOW ? 384 : 512, CAP ? 4 : 
 #pragma unroll
         for (int d = 0; d < DEPTH; ++d) {
             buf[d][0] = ldw16(gp + d * GB + off[0]);
-            buf[d][1] = ldw16(gp + d * GB + off[1]);
+            if constexpr (!NEIGHBOR) { buf[d][1] = ldw16(gp + d * GB + off[1]); }
         }
     }
     if constexpr (CO) {
@@ -494,6 +543,8 @@ static __global__ void __launch_bounds__(CAP ? 256 : LOW ? 384 : 512, CAP ? 4 : 
     int t = i0 / S, ks = i0 - t * S;
     const char * xs = xb + ks * (16 * NT * 32);
     float cf[MU][4];
+    uint32_t rp[MU];
+    float rs[MU][2];
 #pragma unroll
     for (int u = 0; u < MU; ++u) {
         cf[u][0] = cf[u][1] = cf[u][2] = cf[u][3] = 0.0f;
@@ -507,24 +558,57 @@ static __global__ void __launch_bounds__(CAP ? 256 : LOW ? 384 : 512, CAP ? 4 : 
             c[u][0] = c[u][1] = c[u][2] = c[u][3] = 0;
         }
         float s0 = 0.0f, s1 = 0.0f;
-        uint32_t rp[MU];
+        float sr[MU][4];
         if constexpr ((V & 1) != 0) {
             // row scales of rows 32t + 16u + g (+8) for K block ks / 2: chunk (t, 2 (ks / 2) + u), slots g and g + 8
             if (n0 < NT)     { s0 = CO ? __ldcg(SA + n0 * S + ks) : __ldg(SA + n0 * S + ks); }
             if (n0 + 1 < NT) { s1 = CO ? __ldcg(SA + (n0 + 1) * S + ks) : __ldg(SA + (n0 + 1) * S + ks); }
+            // Adjacent K slices use the same row scales; a warp may start on the odd slice.
+            if (!NEIGHBOR || V != 5 || it == i0 || (ks & 1) == 0) {
+                if constexpr (NEIGHBOR && V == 5) {
+                    const unsigned short * sb = (const unsigned short *) (gp - (ks & 1) * CS + 2048 * KB);
+                    const int row = g + ((q & 1) << 3);
+                    // Pack both row tiles so one shuffle supplies their peer scales.
+                    const uint32_t rows = (uint32_t) __ldg(sb + row) | ((uint32_t) __ldg(sb + CS / 2 + row) << 16);
+                    const uint32_t peer = __shfl_xor_sync(0xffffffffu, rows, 1);
+                    rp[0] = __byte_perm(rows, peer, (q & 1) ? 0x1054 : 0x5410);
+                    rp[1] = __byte_perm(rows, peer, (q & 1) ? 0x3276 : 0x7632);
 #pragma unroll
-            for (int u = 0; u < MU; ++u) {
-                const unsigned short * sb = (const unsigned short *) (W + ((int64_t) t * S + (ks & ~1) + u) * CS + 2048 * KB);
-                rp[u] = (uint32_t) __ldg(sb + g) | ((uint32_t) __ldg(sb + g + 8) << 16);
+                    for (int u = 0; u < MU; ++u) {
+                        rs[u][0] = __half2float(__ushort_as_half((unsigned short) (rp[u] & 0xFFFFu)));
+                        rs[u][1] = __half2float(__ushort_as_half((unsigned short) (rp[u] >> 16)));
+                    }
+                } else {
+#pragma unroll
+                    for (int u = 0; u < MU; ++u) {
+                        const unsigned short * sb = (const unsigned short *) (W + ((int64_t) t * S + (ks & ~1) + u) * CS + 2048 * KB);
+                        rp[u] = (uint32_t) __ldg(sb + g) | ((uint32_t) __ldg(sb + g + 8) << 16);
+                    }
+                }
             }
         }
-        if constexpr (FULL) {
+        if constexpr (NEIGHBOR && V == 5) {
+#pragma unroll
+            for (int u = 0; u < MU; ++u) {
+                sr[u][0] = s0 * rs[u][0]; sr[u][1] = s1 * rs[u][0];
+                sr[u][2] = s0 * rs[u][1]; sr[u][3] = s1 * rs[u][1];
+            }
+        }
+        if constexpr (UNROLL2) {
+#pragma unroll 2
+            for (int G4 = 0; G4 < 16; G4 += 4) {
+                ait_group<KB, NT, 0, PC, CO, DEPTH, PACK, false, NEIGHBOR>(buf, G4 + 0, G4 + 4 < 16 || more, gp, off, r, xs, live, c);
+                ait_group<KB, NT, 1, PC, CO, DEPTH, PACK, false, NEIGHBOR>(buf, G4 + 1, G4 + 5 < 16 || more, gp, off, r, xs, live, c);
+                ait_group<KB, NT, 2, PC, CO, DEPTH, PACK, false, NEIGHBOR>(buf, G4 + 2, G4 + 6 < 16 || more, gp, off, r, xs, live, c);
+                ait_group<KB, NT, 3, PC, CO, DEPTH, PACK, false, NEIGHBOR>(buf, G4 + 3, G4 + 7 < 16 || more, gp, off, r, xs, live, c);
+            }
+        } else if constexpr (FULL) {
 #pragma unroll
             for (int G4 = 0; G4 < 16; G4 += 4) {
-                ait_group<KB, NT, 0 % DEPTH, PC, CO, DEPTH, LOW>(buf, G4 + 0, G4 + DEPTH < 16 || more, gp, off, r, xs, live, c, tsm, lo);
-                ait_group<KB, NT, 1 % DEPTH, PC, CO, DEPTH, LOW>(buf, G4 + 1, G4 + DEPTH + 1 < 16 || more, gp, off, r, xs, live, c, tsm, lo);
-                ait_group<KB, NT, 2 % DEPTH, PC, CO, DEPTH, LOW>(buf, G4 + 2, G4 + DEPTH + 2 < 16 || more, gp, off, r, xs, live, c, tsm, lo);
-                ait_group<KB, NT, 3 % DEPTH, PC, CO, DEPTH, LOW>(buf, G4 + 3, G4 + DEPTH + 3 < 16 || more, gp, off, r, xs, live, c, tsm, lo);
+                ait_group<KB, NT, 0 % DEPTH, PC, CO, DEPTH, PACK, false, NEIGHBOR, TAIL, EARLY_X>(buf, G4 + 0, G4 + DEPTH < 16 || more, gp, off, r, xs, live, c, tsm, lo);
+                ait_group<KB, NT, 1 % DEPTH, PC, CO, DEPTH, PACK, false, NEIGHBOR, TAIL, EARLY_X>(buf, G4 + 1, G4 + DEPTH + 1 < 16 || more, gp, off, r, xs, live, c, tsm, lo);
+                ait_group<KB, NT, 2 % DEPTH, PC, CO, DEPTH, PACK, false, NEIGHBOR, TAIL, EARLY_X>(buf, G4 + 2, G4 + DEPTH + 2 < 16 || more, gp, off, r, xs, live, c, tsm, lo);
+                ait_group<KB, NT, 3 % DEPTH, PC, CO, DEPTH, PACK, false, NEIGHBOR, TAIL, EARLY_X>(buf, G4 + 3, G4 + DEPTH + 3 < 16 || more, gp, off, r, xs, live, c, tsm, lo);
             }
         } else {
 #pragma unroll 1
@@ -548,10 +632,15 @@ static __global__ void __launch_bounds__(CAP ? 256 : LOW ? 384 : 512, CAP ? 4 : 
         }
 #pragma unroll
         for (int u = 0; u < MU; ++u) {
-            const float r0 = __half2float(__ushort_as_half((unsigned short) (rp[u] & 0xFFFFu)));
-            const float r1 = __half2float(__ushort_as_half((unsigned short) (rp[u] >> 16)));
-            cf[u][0] += s0 * r0 * (float) c[u][0]; cf[u][1] += s1 * r0 * (float) c[u][1];
-            cf[u][2] += s0 * r1 * (float) c[u][2]; cf[u][3] += s1 * r1 * (float) c[u][3];
+            if constexpr (NEIGHBOR && V == 5) {
+                cf[u][0] += sr[u][0] * (float) c[u][0]; cf[u][1] += sr[u][1] * (float) c[u][1];
+                cf[u][2] += sr[u][2] * (float) c[u][2]; cf[u][3] += sr[u][3] * (float) c[u][3];
+            } else {
+                const float r0 = __half2float(__ushort_as_half((unsigned short) (rp[u] & 0xFFFFu)));
+                const float r1 = __half2float(__ushort_as_half((unsigned short) (rp[u] >> 16)));
+                cf[u][0] += s0 * r0 * (float) c[u][0]; cf[u][1] += s1 * r0 * (float) c[u][1];
+                cf[u][2] += s0 * r1 * (float) c[u][2]; cf[u][3] += s1 * r1 * (float) c[u][3];
+            }
         }
         xs += 16 * NT * 32;
         ++ks;
@@ -812,6 +901,7 @@ static void ait_fast_nt(ggml_backend_cuda_context & ctx, const uint8_t * W, cons
     static const int vexp = ait_env_int("GGML_CUDA_AIT_V", 0) & 3;
     static const int l2pf = std::max(0, std::min(32, ait_env_int("GGML_CUDA_AIT_L2PF", 0)));
     static const int occ = ait_env_int("GGML_CUDA_AIT_OCC", 0);
+    static const bool neighbor4_occ = ait_env_int("GGML_CUDA_AIT4_NEIGHBOR_OCC", 0) == 1;
     static const int grid_factor = std::max(1, std::min(8, ait_env_int("GGML_CUDA_AIT_OCC_GRID", 4)));
     static const bool ordered = ait_env_int("GGML_CUDA_AIT_ORDERED", 1) != 0;
     static const bool sum_cursor = ait_env_int("GGML_CUDA_AIT_SUM_CURSOR", 0) != 0;
@@ -820,12 +910,24 @@ static void ait_fast_nt(ggml_backend_cuda_context & ctx, const uint8_t * W, cons
     if (!use_v && k == 4 && code == 0 && full && occ > 0) {
         total_warps = occ >= 3 ? grid_factor * nsm * 8 : 2 * nsm * std::min(warps, 12);
     }
-    const size_t slots = (total_warps + M / 32 - 1) / (M / 32) + 2;
+    const bool reserve_neighbor_occ = !use_v && k == 4 && code == 0 && full && warps <= 12 && occ == 0 &&
+        neighbor4_occ && ait_env_int("GGML_CUDA_AIT4_NEIGHBOR", 0) == 1;
+    const int scratch_warps = reserve_neighbor_occ ? 2 * total_warps : total_warps;
+    const size_t slots = (scratch_warps + M / 32 - 1) / (M / 32) + 2;
     ggml_cuda_pool_alloc<float> scratch(ctx.pool(id));
     // GGML_CUDA_AIT_FUSE=1 (opt-in, default 0 = second sum kernel): the last warp of each tile sums its slots in the main kernel, so no second launch. The tile
     // counters follow the slots and are zeroed by k_ait_actq. Unset, 0 or the V experiments keep the sum kernel.
     static const bool fuse_opt = ait_env_int("GGML_CUDA_AIT_FUSE", 0) != 0;
-    const bool fuse = ordered && fuse_opt && !use_v;
+    // The opt-in AIT3/AIT4 kernel experiments below launch without tile counters, so they keep the second sum kernel.
+    static const bool ait_kernel_exp = [] {
+        static const char * const names[] = { "GGML_CUDA_AIT4_BOUNDS", "GGML_CUDA_AIT4_EARLY_X", "GGML_CUDA_AIT4_UNROLL2",
+            "GGML_CUDA_AIT4_PACK", "GGML_CUDA_AIT4_TAIL", "GGML_CUDA_AIT4_NEIGHBOR", "GGML_CUDA_AIT4_RING1", "GGML_CUDA_AIT4_RING2",
+            "GGML_CUDA_AIT3_RING1", "GGML_CUDA_AIT3_RING2" };
+        for (const char * n : names) { if (ait_env_int(n, 0) == 1) { return true; } }
+        const int p3 = ait_env_int("GGML_CUDA_AIT3_PACK", 0);
+        return p3 == 1 || p3 == 2;
+    }();
+    const bool fuse = ordered && fuse_opt && !use_v && !ait_kernel_exp;
     if (ordered) {
         scratch.alloc(slots * NT * (size_t) M + (fuse ? NT * (size_t) M : 0));
     }
@@ -857,6 +959,108 @@ static void ait_fast_nt(ggml_backend_cuda_context & ctx, const uint8_t * W, cons
         }
     }
     k_ait_actq<NT><<<NT * S, 64, 0, stream>>>(X, W, xq.get(), sa.get(), actq_zero, M, K, k);
+    static const bool bounds4 = ait_env_int("GGML_CUDA_AIT4_BOUNDS", 0) == 1;
+    if (bounds4 && k == 4 && code == 0 && full && warps <= 12 && occ == 0) {
+        k_ait_mmv<4, NT, true, 0, 0, 4, false, false, false, false, false, false, false, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
+        finish();
+        return;
+    }
+    static const bool early4_x = ait_env_int("GGML_CUDA_AIT4_EARLY_X", 0) == 1;
+    if (early4_x && k == 4 && code == 0 && full && warps <= 12 && occ == 0) {
+        k_ait_mmv<4, NT, true, 0, 0, 4, false, false, false, false, false, false, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
+        finish();
+        return;
+    }
+    static const bool unroll4_two = ait_env_int("GGML_CUDA_AIT4_UNROLL2", 0) == 1;
+    if (unroll4_two && k == 4 && code == 0 && full && warps <= 12 && occ == 0) {
+        k_ait_mmv<4, NT, true, 0, 0, 4, false, false, false, false, false, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
+        finish();
+        return;
+    }
+    static const bool pack4 = ait_env_int("GGML_CUDA_AIT4_PACK", 0) == 1;
+    if (pack4 && k == 4 && code == 0 && full && warps <= 12 && occ == 0) {
+        k_ait_mmv<4, NT, true, 0, 0, 4, false, false, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
+        finish();
+        return;
+    }
+    static const bool tail4 = ait_env_int("GGML_CUDA_AIT4_TAIL", 0) == 1;
+    if (tail4 && k == 4 && code == 0 && full && warps <= 12 && occ == 0) {
+        k_ait_mmv<4, NT, true, 0, 0, 4, false, false, false, false, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
+        finish();
+        return;
+    }
+    static const bool neighbor4 = ait_env_int("GGML_CUDA_AIT4_NEIGHBOR", 0) == 1;
+    if (neighbor4 && k == 4 && code == 0 && full && warps <= 12 && occ == 0) {
+        static const bool neighbor4_pack = ait_env_int("GGML_CUDA_AIT4_NEIGHBOR_PACK", 0) == 1;
+        static const bool neighbor4_ring2 = ait_env_int("GGML_CUDA_AIT4_NEIGHBOR_RING2", 0) == 1;
+        static const bool neighbor4_ring1 = ait_env_int("GGML_CUDA_AIT4_NEIGHBOR_RING1", 0) == 1;
+        static const bool neighbor4_tail = ait_env_int("GGML_CUDA_AIT4_NEIGHBOR_TAIL", 0) == 1;
+        static const bool neighbor4_early_x = ait_env_int("GGML_CUDA_AIT4_NEIGHBOR_EARLY_X", 0) == 1;
+        static const bool neighbor4_bounds = ait_env_int("GGML_CUDA_AIT4_NEIGHBOR_BOUNDS", 0) == 1;
+        static const bool neighbor4_unroll2 = ait_env_int("GGML_CUDA_AIT4_NEIGHBOR_UNROLL2", 0) == 1;
+        static const int neighbor4_scales = ait_env_int("GGML_CUDA_AIT4_NEIGHBOR_SCALES", 0);
+        if (neighbor4_pack) {
+            k_ait_mmv<4, NT, true, 0, 0, 4, false, false, true, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
+        } else if (neighbor4_ring2) {
+            k_ait_mmv<4, NT, true, 0, 0, 2, false, false, false, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
+        } else if (neighbor4_ring1) {
+            k_ait_mmv<4, NT, true, 0, 0, 1, false, false, false, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
+        } else if (neighbor4_tail) {
+            k_ait_mmv<4, NT, true, 0, 0, 4, false, false, false, true, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
+        } else if (neighbor4_early_x) {
+            k_ait_mmv<4, NT, true, 0, 0, 4, false, false, false, true, false, false, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
+        } else if (neighbor4_bounds) {
+            k_ait_mmv<4, NT, true, 0, 0, 4, false, false, false, true, false, false, false, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
+        } else if (neighbor4_unroll2) {
+            k_ait_mmv<4, NT, true, 0, 0, 4, false, false, false, true, false, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
+        } else if (neighbor4_scales == 1) {
+            k_ait_mmv<4, NT, true, 0, 1, 4, false, false, false, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
+        } else if (neighbor4_scales == 2) {
+            k_ait_mmv<4, NT, true, 0, 5, 4, false, false, false, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
+        } else if (neighbor4_occ) {
+            const dim3 grid_occ(2 * nsm);
+            total_warps = 2 * nsm * warps;
+            k_ait_mmv<4, NT, true, 0, 0, 4, true, false, false, true><<<grid_occ, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
+        } else {
+            k_ait_mmv<4, NT, true, 0, 0, 4, false, false, false, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
+        }
+        finish();
+        return;
+    }
+    static const bool ring4_one = ait_env_int("GGML_CUDA_AIT4_RING1", 0) == 1;
+    if (ring4_one && k == 4 && code == 0 && full && warps <= 12 && occ == 0) {
+        k_ait_mmv<4, NT, true, 0, 0, 1><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
+        finish();
+        return;
+    }
+    static const bool ring4 = ait_env_int("GGML_CUDA_AIT4_RING2", 0) == 1;
+    if (ring4 && k == 4 && code == 0 && full && warps <= 12 && occ == 0) {
+        k_ait_mmv<4, NT, true, 0, 0, 2><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
+        finish();
+        return;
+    }
+    static const bool ring1 = ait_env_int("GGML_CUDA_AIT3_RING1", 0) == 1;
+    if (ring1 && k == 3 && code == 0 && full && warps <= 12) {
+        k_ait_mmv<3, NT, true, 0, 0, 1><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
+        finish();
+        return;
+    }
+    static const bool ring2 = ait_env_int("GGML_CUDA_AIT3_RING2", 0) == 1;
+    if (ring2 && k == 3 && code == 0 && full && warps <= 12) {
+        k_ait_mmv<3, NT, true, 0, 0, 2><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
+        finish();
+        return;
+    }
+    static const int pack3 = ait_env_int("GGML_CUDA_AIT3_PACK", 0);
+    if ((pack3 == 1 || pack3 == 2) && k == 3 && code == 0 && full && warps <= 12) {
+        if (pack3 == 2) {
+            k_ait_mmv<3, NT, true, 0, 0, 4, false, false, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
+        } else {
+            k_ait_mmv<3, NT, true, 0, 0, 4, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
+        }
+        finish();
+        return;
+    }
     if (k == 4 && code == 0 && full && occ > 0) {
         // Modes 3/4 cap registers for four 256-thread blocks per SM. Keep
         // both prefetch depths; profiles must check for local-memory spills.
