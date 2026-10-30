@@ -1181,11 +1181,12 @@ static void ple_hash_pages_case(bool windowed = false, bool bounded = false, boo
             std::vector<size_t> first_read = first_chunk;
             size_t expected_reads = 0;
             if (coalesced) {
+                const size_t gap = bounded ? 0 : 16;
                 for (size_t c = 0; c < (n_tokens + chunk - 1)/chunk; ++c) {
                     size_t start = 0, end = 0;
                     for (size_t r = 0; r < n_rows; ++r) {
                         if (first_chunk[r] != c) { continue; }
-                        if (end == 0 || r > end + 16 || r - start >= 256) {
+                        if (end == 0 || r > end + gap || r - start >= 256) {
                             start = r;
                             end = r;
                         }
@@ -1244,6 +1245,7 @@ static void ple_hash_pages_case(bool windowed = false, bool bounded = false, boo
                 n_expected += expected[r];
             }
             require(n_expected > 0 && n_expected < n_rows, "hash test checks touched and untouched pages");
+            require(!coalesced || !bounded || expected_reads == n_expected, "bounded coalescing reads each requested page once without gaps");
             const char * read_at = strstr(summary.c_str(), " ms, ");
             long long pages_read = -1;
             require(read_at && sscanf(read_at, " ms, %lld read", &pages_read) == 1, "prefetch page total logged");
@@ -1447,6 +1449,7 @@ int main(int argc, char ** argv) {
                 ple_hash_pages_case(true, true, true, chunk);
             }
             printf("OK: coalesced windows cover 1, 128 and 384 token ubatches\n");
+            printf("OK: bounded coalescing reads only requested pages without gap padding or rereads\n");
             return 0;
         } catch (const std::exception & e) {
             fprintf(stderr, "prefetch coalesced window: FAIL: %s\n", e.what());

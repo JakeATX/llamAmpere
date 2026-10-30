@@ -374,7 +374,8 @@ void llama_ple_prefetch::build() {
         }
         const size_t r0 = nr;
         for (size_t j = 0; j < cp.size(); ++j) {
-            const uint64_t gap = coalesce ? 16 : 0;
+            // fork: bounded windows must not pull unused or already-read pages into the cache.
+            const uint64_t gap = coalesce && !bounded_window ? 16 : 0;
             if (nr > r0 && cp[j] <= run_key[nr - 1] + run_len[nr - 1] + gap && cp[j] - run_key[nr - 1] < RUN_MAX) {
                 run_len[nr - 1] = (uint32_t) (cp[j] - run_key[nr - 1] + 1);
             } else {
