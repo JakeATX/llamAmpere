@@ -1811,6 +1811,9 @@ bool llama_model_loader::load_all_data(
     std::vector<ggml_backend_event_t> events;
     std::vector<void *> host_ptrs;
     size_t buffer_idx = 0; // buffer to use for async loads
+    struct dio_bounce_deleter { void operator()(void * p) const { free(p); } };
+    std::unique_ptr<void, dio_bounce_deleter> dio_bounce; // plain bounce for O_DIRECT reads (never pinned)
+    size_t dio_bounce_align = 0;
     ggml_backend_t upload_backend = [&](const char * func) -> ggml_backend_t {
         const bool direct_overlay = overlay_idx >= 0 && files.at(overlay_idx)->has_direct_io();
         if ((use_mmap && !direct_overlay) || check_tensors) {
@@ -2058,18 +2061,20 @@ bool llama_model_loader::load_all_data(
                     size_t bytes_read = 0;
                     size_t data_read = 0;  // Actual tensor data copied (excluding padding)
 
-                    // overlay O_DIRECT reads land in a plain (never pinned or registered) bounce buffer, then memcpy
-                    struct bounce_deleter { void operator()(void * p) const { free(p); } };
-                    std::unique_ptr<void, bounce_deleter> bounce;
-                    if (direct_overlay) {
+                    // safety: O_DIRECT reads (--load-mode dio, a direct overlay) land in one plain, never pinned or
+                    // registered, aligned bounce buffer of LLAMA_DIRECT_IO_BUFFER_SIZE, reused for every chunk, then memcpy
+                    const bool direct_read = file->has_direct_io();
+                    if (direct_read && (!dio_bounce || dio_bounce_align < alignment)) {
                         void * raw = nullptr;
+                        const size_t bounce_align = std::max<size_t>(alignment, 4096);
 #ifndef _WIN32
-                        if (posix_memalign(&raw, alignment, chunk_size) != 0) { raw = nullptr; }
+                        if (posix_memalign(&raw, bounce_align, LLAMA_DIRECT_IO_BUFFER_SIZE) != 0) { raw = nullptr; }
 #endif
                         if (!raw) {
-                            throw std::runtime_error("cannot allocate the overlay direct-read bounce buffer");
+                            throw std::runtime_error("cannot allocate the direct-read bounce buffer");
                         }
-                        bounce.reset(raw);
+                        dio_bounce.reset(raw);
+                        dio_bounce_align = bounce_align;
                     }
 
                     while (bytes_read < read_end - read_start) {
@@ -2082,9 +2087,9 @@ bool llama_model_loader::load_all_data(
                         ggml_backend_event_synchronize(events[buffer_idx]);
 
                         // Read aligned chunk from file
-                        if (direct_overlay) {
-                            file->read_raw_unsafe(bounce.get(), read_size);
-                            memcpy(reinterpret_cast<void *>(ptr_dest_aligned), bounce.get(), read_size);
+                        if (direct_read) {
+                            file->read_raw_bounced(reinterpret_cast<void *>(ptr_dest_aligned), read_size,
+                                                   dio_bounce.get(), LLAMA_DIRECT_IO_BUFFER_SIZE);
                         } else {
                             file->read_raw_unsafe(reinterpret_cast<void *>(ptr_dest_aligned), read_size);
                         }

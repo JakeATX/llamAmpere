@@ -32,6 +32,7 @@ struct llama_file {
     void read_raw(void * ptr, size_t len);
     void read_raw_unsafe(void * ptr, size_t len);
     void read_aligned_chunk(void * dest, size_t size);
+    void read_raw_bounced(void * dst, size_t len, void * bounce, size_t bounce_size); // O_DIRECT-safe read into pinned dst
     uint32_t read_u32();
 
     void write_raw(const void * ptr, size_t len) const;

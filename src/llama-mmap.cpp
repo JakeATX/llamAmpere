@@ -449,6 +449,19 @@ void llama_file::read_raw_unsafe(void * ptr, size_t len) { pimpl->read_raw(ptr, 
 void llama_file::read_raw_unsafe(void * ptr, size_t len) { pimpl->read_raw_unsafe(ptr, len); }
 #endif
 
+// Safety: an O_DIRECT read must never land in pinned or cudaHostRegister'ed pages (UVM in HMM mode can panic the
+// machine). Reads len bytes at the current position into the plain bounce buffer in chunks of at most bounce_size,
+// copying each chunk to dst. For a direct-I/O file, len, bounce_size and the bounce address must be aligned to
+// read_alignment(); dst may be any memory, pinned included.
+void llama_file::read_raw_bounced(void * dst, size_t len, void * bounce, size_t bounce_size) {
+    for (size_t done = 0; done < len; ) {
+        const size_t n = std::min(bounce_size, len - done);
+        read_raw_unsafe(bounce, n);
+        memcpy((char *) dst + done, bounce, n);
+        done += n;
+    }
+}
+
 uint32_t llama_file::read_u32() { return pimpl->read_u32(); }
 
 void llama_file::write_raw(const void * ptr, size_t len) const { pimpl->write_raw(ptr, len); }

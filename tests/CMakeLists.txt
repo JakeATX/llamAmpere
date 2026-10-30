@@ -610,6 +610,14 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
     llama_test(test-moe-arena LABEL "main;cpu")
 endif()
 
+if (UNIX AND NOT LLAMA_USE_SYSTEM_GGML)
+    # safety: --load-mode dio reads through a plain bounce buffer and gives the same bytes as mmap
+    add_executable(test-dio-bounce test-dio-bounce.cpp)
+    target_link_libraries(test-dio-bounce PRIVATE llama ggml-base)
+    llama_test(test-dio-bounce LABEL "main;cpu")
+    set_tests_properties(test-dio-bounce PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+
 if (UNIX)
     add_executable(test-moe-generation-profile test-moe-generation-profile.cpp)
     llama_test(test-moe-generation-profile LABEL "main")
