@@ -83,6 +83,15 @@ std::unique_ptr<llama_ple_prefetch> llama_ple_prefetch::create(const llama_model
         return nullptr;
     }
 
+    const uintptr_t buffer_base = (uintptr_t) ggml_backend_buffer_get_base(t->buffer);
+    const uintptr_t table_base  = (uintptr_t) t->data;
+    const size_t buffer_size = ggml_backend_buffer_get_size(t->buffer);
+    // fork: check the full row span before readers form page addresses.
+    if (!buffer_base || table_base < buffer_base || table_base - buffer_base > buffer_size ||
+            (uint64_t) t->ne[1] > (buffer_size - (table_base - buffer_base))/t->nb[1]) {
+        return nullptr;
+    }
+
     const auto & hp = model.hparams;
     if (hp.ple_ngram_size > hp.ple_layer_multipliers.size() || hp.ple_n_heads > hp.ple_head_vocab_sizes.size() ||
             hp.ple_heads_per_ngram == 0 || (uint64_t) (hp.ple_ngram_size - 1)*hp.ple_heads_per_ngram != hp.ple_n_heads) {

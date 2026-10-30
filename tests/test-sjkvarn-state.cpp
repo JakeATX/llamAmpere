@@ -1263,6 +1263,22 @@ static void ple_wide_rows_case() {
         require(!llama_ple_prefetch::create(*model, n_tokens), "prefetch checks row end without wrapping");
         hp.ple_head_offsets[0] = 0;
         hp.ple_head_vocab_sizes[0] = n_tokens;
+        const size_t row_size = table->nb[1];
+        table->nb[1] = SIZE_MAX;
+        require(!llama_ple_prefetch::create(*model, n_tokens), "prefetch refuses row stride past host buffer");
+        table->nb[1] = row_size;
+        table->ne[1] = INT64_MAX;
+        require(!llama_ple_prefetch::create(*model, n_tokens), "prefetch refuses row span overflow");
+        table->ne[1] = n_tokens;
+        table->data = (void *) ((uintptr_t) pages - 1);
+        require(!llama_ple_prefetch::create(*model, n_tokens), "prefetch refuses table before host buffer");
+        table->data = static_cast<char *>(pages) + size;
+        require(!llama_ple_prefetch::create(*model, n_tokens), "prefetch refuses table at host buffer end");
+        table->data = static_cast<char *>(pages) + 4097;
+        require(!llama_ple_prefetch::create(*model, n_tokens), "prefetch refuses row span one byte past host buffer");
+        table->data = static_cast<char *>(pages) + 4096;
+        require(llama_ple_prefetch::create(*model, n_tokens) != nullptr, "prefetch accepts row span ending at host buffer end");
+        table->data = static_cast<char *>(pages) + 128;
         auto pf = llama_ple_prefetch::create(*model, n_tokens);
         require(pf != nullptr, "wide row page prefetch created");
         pf->hint(tokens.data(), tokens.size(), 0);
@@ -1280,6 +1296,7 @@ static void ple_wide_rows_case() {
         munmap(pages, size);
     }
     printf("OK: invalid prefetch ngram heads and row ranges refused\n");
+    printf("OK: prefetch row spans stay within host buffer without overflow\n");
     printf("OK: unaligned 8KiB and 16KiB prefetch rows cover every page\n");
 #else
     printf("SKIP: wide prefetch page test needs Linux\n");
