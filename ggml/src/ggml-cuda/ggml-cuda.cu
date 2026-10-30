@@ -10249,6 +10249,8 @@ static cudaEvent_t ggml_cuda_shexp_side_event(int device, int which) {
 // GGML_CUDA_OP_TIMES=<ms> (diagnostic, off by default): for uncaptured graphs, time each node on the main stream
 // with events and on the host, and log the slowest op kinds of every graph whose GPU time is >= <ms>.
 // Fused nodes count toward the first node of the fusion. Synchronizes once per graph.
+// GGML_CUDA_OP_TIMES_TOP=<n> lists the n slowest op kinds instead of 8; GGML_CUDA_OP_TIMES_NODES=<n> logs only
+// graphs with exactly n nodes (e.g. the PLE layer's graph), so a long list stays readable.
 struct ggml_cuda_op_times {
     std::vector<cudaEvent_t> ev;
     std::vector<std::pair<int, int64_t>> marks; // node index, host us
@@ -10256,6 +10258,14 @@ struct ggml_cuda_op_times {
 
     static float min_ms() {
         static const float v = [] { const char * e = getenv("GGML_CUDA_OP_TIMES"); return e && *e ? (float) atof(e) : 0.0f; }();
+        return v;
+    }
+    static size_t top_n() {
+        static const size_t v = [] { const char * e = getenv("GGML_CUDA_OP_TIMES_TOP"); return e && atoi(e) > 0 ? (size_t) atoi(e) : (size_t) 8; }();
+        return v;
+    }
+    static int only_nodes() {
+        static const int v = [] { const char * e = getenv("GGML_CUDA_OP_TIMES_NODES"); return e ? atoi(e) : 0; }();
         return v;
     }
     void mark(int device_, cudaStream_t stream, int i) {
@@ -10291,11 +10301,11 @@ struct ggml_cuda_op_times {
             acc.second += (marks[k + 1].second - marks[k].second) / 1000.0f;
             total += ms;
         }
-        if (total >= min_ms() && !by_op.empty()) {
+        if (total >= min_ms() && !by_op.empty() && (only_nodes() <= 0 || only_nodes() == cgraph->n_nodes)) {
             std::vector<std::pair<std::string, std::pair<float, float>>> v(by_op.begin(), by_op.end());
             std::sort(v.begin(), v.end(), [](const auto & a, const auto & b) { return a.second.first > b.second.first; });
             std::string line;
-            for (size_t k = 0; k < v.size() && k < 8; ++k) {
+            for (size_t k = 0; k < v.size() && k < top_n(); ++k) {
                 char buf[192];
                 snprintf(buf, sizeof(buf), " %s=%.2f/%.2f", v[k].first.c_str(), v[k].second.first, v[k].second.second);
                 line += buf;
