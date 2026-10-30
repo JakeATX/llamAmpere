@@ -19,6 +19,7 @@
 // GGML_CUDA_AIT4_NEIGHBOR_TAIL=1 refills the neighbor ring after its IMMA work.
 // GGML_CUDA_AIT4_NEIGHBOR_EARLY_X=1 reads activations before the neighbor group's decode.
 // GGML_CUDA_AIT4_NEIGHBOR_BOUNDS=1 gives the neighbor kernel a 384-thread compile bound.
+// GGML_CUDA_AIT4_NEIGHBOR_RING1=1 keeps one weight group live in the neighbor path.
 // GGML_CUDA_AIT4_RING2=1 keeps two AIT4 weight groups live with the base register budget (OCC=0, NEIGHBOR=0).
 // GGML_CUDA_AIT4_RING1=1 keeps one AIT4 weight group live and takes precedence over RING2.
 // GGML_CUDA_AIT4_TAIL=1 refills the four-group weight ring after each group's IMMA work.
@@ -865,6 +866,7 @@ static void ait_fast_nt(ggml_backend_cuda_context & ctx, const uint8_t * W, cons
     if (neighbor4 && k == 4 && code == 0 && full && warps <= 12 && occ == 0) {
         static const bool neighbor4_pack = ait_env_int("GGML_CUDA_AIT4_NEIGHBOR_PACK", 0) == 1;
         static const bool neighbor4_ring2 = ait_env_int("GGML_CUDA_AIT4_NEIGHBOR_RING2", 0) == 1;
+        static const bool neighbor4_ring1 = ait_env_int("GGML_CUDA_AIT4_NEIGHBOR_RING1", 0) == 1;
         static const bool neighbor4_tail = ait_env_int("GGML_CUDA_AIT4_NEIGHBOR_TAIL", 0) == 1;
         static const bool neighbor4_early_x = ait_env_int("GGML_CUDA_AIT4_NEIGHBOR_EARLY_X", 0) == 1;
         static const bool neighbor4_bounds = ait_env_int("GGML_CUDA_AIT4_NEIGHBOR_BOUNDS", 0) == 1;
@@ -872,6 +874,8 @@ static void ait_fast_nt(ggml_backend_cuda_context & ctx, const uint8_t * W, cons
             k_ait_mmv<4, NT, true, 0, 0, 4, false, false, true, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
         } else if (neighbor4_ring2) {
             k_ait_mmv<4, NT, true, 0, 0, 2, false, false, false, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
+        } else if (neighbor4_ring1) {
+            k_ait_mmv<4, NT, true, 0, 0, 1, false, false, false, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
         } else if (neighbor4_tail) {
             k_ait_mmv<4, NT, true, 0, 0, 4, false, false, false, true, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
         } else if (neighbor4_early_x) {
