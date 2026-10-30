@@ -20136,7 +20136,13 @@ static int run_ait_check(const char * dir) {
             for (auto & v : x) { v = ux(rng); }
             ggml_backend_tensor_set(a, buf.data(), 0, buf.size());
             ggml_backend_tensor_set(b, x.data(), 0, x.size() * 4);
-            ggml_backend_graph_compute(be, gf);
+            if (ggml_backend_graph_compute(be, gf) != GGML_STATUS_SUCCESS) {
+                fprintf(stderr, "%s N=%lld: initial graph compute FAIL\n", nm.c_str(), (long long) N);
+                ++fails;
+                ggml_backend_buffer_free(bb);
+                ggml_free(ctx);
+                continue;
+            }
             std::vector<float> yg((size_t) (N * M));
             ggml_backend_tensor_get(y, yg.data(), 0, yg.size() * 4);
             if (N <= 8) {
