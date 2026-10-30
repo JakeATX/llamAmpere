@@ -5203,6 +5203,10 @@ static bool run_device_pageable_fallback(ggml_backend_t gpu, ggml_backend_t cpu,
     constexpr int64_t n_expert = 1280;
     void * allocation = malloc((n_expert + 2) * page);
     if (!allocation) { return false; }
+    const char * strict_alias = getenv("GGML_MOE_CACHE_STRICT_ALIAS");
+    const std::string saved_strict_alias = strict_alias ? strict_alias : "";
+    // A former opt-out must not restore endpoint-only checks on sparse registrations.
+    set_env("GGML_MOE_CACHE_STRICT_ALIAS", "0");
     void * data = (void *)((((uintptr_t)allocation + page - 1) & ~(page - 1)) + 64);
     ggml_init_params params{ggml_tensor_overhead(), nullptr, true};
     auto * ctx = ggml_init(params);
@@ -5249,6 +5253,7 @@ static bool run_device_pageable_fallback(ggml_backend_t gpu, ggml_backend_t cpu,
     }
     ok &= released;
     if (released) { free(allocation); }
+    set_env("GGML_MOE_CACHE_STRICT_ALIAS", strict_alias ? saved_strict_alias.c_str() : nullptr);
     printf("cache-device-pageable-fallback%s: %s\n", sparse ? "-sparse" : "", ok ? "OK" : "FAIL");
     return ok;
 }

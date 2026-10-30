@@ -11995,35 +11995,6 @@ private:
 };
 
 #if defined(__linux__) && CUDART_VERSION >= 11010 && !defined(GGML_USE_HIP)
-// GGML_MOE_CACHE_STRICT_ALIAS=1 (opt-in; always on for expert-bank tensors): a device alias of host expert bytes needs
-// the whole range inside one tracked pinned registration plus mapped endpoints. Off (the integ-r2 behavior): whole
-// tensors borrow when their first byte is mapped host memory, and resident experts check both endpoints.
-static bool moe_cache_strict_alias() {
-    static const bool on = [] { const char * e = getenv("GGML_MOE_CACHE_STRICT_ALIAS"); return e && atoi(e) != 0; }();
-    return on;
-}
-
-static void * moe_cache_host_alias_legacy(const void * source, size_t bytes, bool whole_tensor) {
-    void * alias = nullptr;
-    if (whole_tensor) {
-        cudaPointerAttributes attributes{};
-        if (cudaPointerGetAttributes(&attributes, source) == cudaSuccess && attributes.type == cudaMemoryTypeHost &&
-                cudaHostGetDevicePointer(&alias, const_cast<void *>(source), 0) == cudaSuccess) {
-            return alias;
-        }
-        (void)cudaGetLastError();
-        return nullptr;
-    }
-    void * last = nullptr;
-    if (cudaHostGetDevicePointer(&alias, const_cast<void *>(source), 0) != cudaSuccess ||
-            cudaHostGetDevicePointer(&last, (void *)((uintptr_t)source + bytes - 1), 0) != cudaSuccess ||
-            (const char *)last != (const char *)alias + bytes - 1) {
-        (void)cudaGetLastError();
-        return nullptr;
-    }
-    return alias;
-}
-
 static void * moe_cache_host_alias(const void * source, size_t bytes) {
     const uintptr_t begin = (uintptr_t)source;
     if (!source || !bytes || bytes > UINTPTR_MAX - begin ||
@@ -12201,9 +12172,9 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
             table.permanent_sources = moe_resident_tensor(d.data, device.logical);
             // A bank tensor can span pinned cold ranges and unregistered holes.
             const bool bank_sources = ggml_moe_bank_lookup(d.data) != nullptr;
-            if (!table.permanent_sources) {
-                table.borrowed = bank_sources || moe_cache_strict_alias() ? moe_cache_host_alias(d.data, bytes) :
-                    moe_cache_host_alias_legacy(d.data, bytes, true);
+            // fork: session-owned registrations must pass through retained_needed before pruning.
+            if (!table.permanent_sources && !mappings.find(base, bytes)) {
+                table.borrowed = moe_cache_host_alias(d.data, bytes);
             }
             (void)cudaGetLastError();
             table.addresses.resize(d.n_expert);
@@ -12242,16 +12213,14 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
                 size_t source_range = 0;
                 if (table.permanent_sources) {
                     if (!permanent) {
-                        void * alias = bank_sources || moe_cache_strict_alias() ?
-                            moe_cache_host_alias((const void *)begin, expert_bytes) :
-                            moe_cache_host_alias_legacy((const void *)begin, expert_bytes, false);
+                        void * alias = moe_cache_host_alias((const void *)begin, expert_bytes);
                         if (!alias) { return fail(); }
                         table.fallback[e] = alias;
                     }
                 } else {
                     // Bank release leaves the cold experts pinned in separate ranges.
                     void * alias = nullptr;
-                    if (!table.borrowed && bank_sources && !table.bank[e] &&
+                    if (!table.borrowed && bank_sources && !table.bank[e] && !mappings.find(begin, expert_bytes) &&
                             (alias = moe_cache_host_alias((const void *)begin, expert_bytes))) {
                         table.fallback[e] = alias;
                         table.copy_source[e] = (const void *)begin;
