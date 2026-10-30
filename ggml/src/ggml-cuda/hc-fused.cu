@@ -87,13 +87,13 @@ static __device__ __forceinline__ float hcf_owner_sum(float v, const unsigned ma
 
 // Stripes split each 256-column tile. Keep the four stream sums separate
 // until their RMS scales are known. The last stripe finishes its row block with coalesced partial reads.
-template <int T, bool FOLD, bool LOOKAHEAD = false, bool PACK = false, int STRIPES = 4>
+template <int T, bool FOLD, bool LOOKAHEAD = false, bool PACK = false, int STRIPES = 4, bool STREAM_STAGE = false>
 static __global__ void __launch_bounds__(128) hcf_down_owner(
         const float * __restrict__ x, const float * __restrict__ wn,
         const char * __restrict__ wd, const int64_t sd, const char * __restrict__ wi, const int64_t si,
         const int R, const int n_rows, const int n_embd, const float eps, const float lo_scale, const float inj_scale,
         float * __restrict__ partial, float * __restrict__ ssq, const int cnt_off,
-        float * __restrict__ dst, const hcf_post_fold pf, const bool finish8, const bool stream_stage) {
+        float * __restrict__ dst, const hcf_post_fold pf, const bool finish8) {
     extern __shared__ __align__(16) float sh[];
     __shared__ float sq_w[4][T][4];
     __shared__ float rr[T][4];
@@ -105,7 +105,8 @@ static __global__ void __launch_bounds__(128) hcf_down_owner(
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int local = tid & 7, stripe = blockIdx.y, owner = stripe*8 + local;
     const int row = blockIdx.x*HCF_OWNER_ROWS + tid/8;
-    if (stream_stage) {
+    // Keep the indexed legacy scratch array out of the streamed kernel's frame.
+    if constexpr (STREAM_STAGE) {
         const int stream_slice = n_embd/STRIPES;
 #pragma unroll
         for (int t = 0; t < T; ++t) {
@@ -905,24 +906,29 @@ static void hcf_down_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, 
     const int owner_slot = owner && slot >= 0 && n_rows <= HCF_OWNER_MAX_ROWS && n_embd % 256 == 0 &&
             owner_smem <= owner_limit ? hcf_owner_cnt_slot(ctx) : -1;
     if (owner_slot >= 0) {
-        auto select = [&](auto fold, auto lookahead, auto pack, auto stripes) {
+        auto select = [&](auto fold, auto lookahead, auto pack, auto stripes, auto stage) {
             constexpr bool F = decltype(fold)::value;
             constexpr bool L = decltype(lookahead)::value;
             constexpr bool P = decltype(pack)::value;
             constexpr int S = decltype(stripes)::value;
-            auto k = hcf_down_owner<T, F, L, P, S>;
+            constexpr bool SS = decltype(stage)::value;
+            auto k = hcf_down_owner<T, F, L, P, S, SS>;
             CUDA_SET_SHARED_MEMORY_LIMIT(k, owner_limit);
             static const bool reported = [=] {
                 fprintf(stderr, "[hc-down-owner] T=%d rows=%d embd=%d smem=%zu folded=%d lookahead=%d pack=%d finish8=%d stripes=%d stream_stage=%d\n",
-                        T, n_rows, n_embd, owner_smem, F, L, P, P && owner_finish8, S, owner_stream_stage);
+                        T, n_rows, n_embd, owner_smem, F, L, P, P && owner_finish8, S, SS);
                 return true;
             }();
             GGML_UNUSED(reported);
             return k;
         };
+        auto select_stage = [&](auto fold, auto lookahead, auto pack, auto stripes) {
+            return owner_stream_stage ? select(fold, lookahead, pack, stripes, std::true_type{}) :
+                    select(fold, lookahead, pack, stripes, std::false_type{});
+        };
         auto select_stripes = [&](auto fold, auto lookahead, auto pack) {
-            return owner_stripes == 8 ? select(fold, lookahead, pack, std::integral_constant<int, 8>{}) :
-                    select(fold, lookahead, pack, std::integral_constant<int, 4>{});
+            return owner_stripes == 8 ? select_stage(fold, lookahead, pack, std::integral_constant<int, 8>{}) :
+                    select_stage(fold, lookahead, pack, std::integral_constant<int, 4>{});
         };
         auto select_pack = [&](auto fold, auto lookahead) {
             return owner_pack ? select_stripes(fold, lookahead, std::true_type{}) : select_stripes(fold, lookahead, std::false_type{});
@@ -937,7 +943,7 @@ static void hcf_down_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, 
             (const float *) x->data, (const float *) wn->data,
             (const char *) wd->data, wd->nb[1], wi ? (const char *) wi->data : nullptr, wi ? wi->nb[1] : 0,
             R, n_rows, n_embd, eps, lo_scale, inj_scale, partial.get(), sq.get(), owner_slot*HCF_OWNER_RB,
-            (float *) dst->data, pf, owner_finish8, owner_stream_stage);
+            (float *) dst->data, pf, owner_finish8);
         return;
     }
     ggml_cuda_pool_alloc<float> P(ctx.pool(), (size_t) n_chunks*n_rows*T);
