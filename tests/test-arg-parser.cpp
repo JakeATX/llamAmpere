@@ -234,7 +234,7 @@ static void test(void) {
     }
 
     {
-        // --moe-skip-budget: (0, 0.25], default 0; sets the cumulative drop policy and turns on skip-tail 7
+        // A weight budget enables mass selection without a rank cutoff.
         common_params defaults;
         assert(defaults.moe_cache.skip_budget == 0.0f);
         assert(!defaults.moe_cache.skip_rank_floor);
@@ -242,26 +242,38 @@ static void test(void) {
         unsetenv("GGML_MOE_SKIP_POLICY");
         unsetenv("GGML_MOE_SKIP_THRESHOLD");
         assert(common_context_params_to_llama(defaults).moe_skip_tail == 0);
+        assert(!common_context_params_to_llama(defaults).moe_skip_mass);
         assert(getenv("GGML_MOE_SKIP_POLICY") == nullptr);
         assert(getenv("GGML_MOE_SKIP_RANK_FLOOR") == nullptr);
         std::vector<std::string> args_budget = {"binary_name", "--moe-skip-budget", "0.2"};
         common_params budget;
         assert(common_params_parse(args_budget.size(), list_str_to_char(args_budget).data(), budget, LLAMA_EXAMPLE_SERVER));
         assert(budget.moe_cache.skip_budget == 0.2f);
-        assert(common_context_params_to_llama(budget).moe_skip_tail == 7);
+        assert(common_context_params_to_llama(budget).moe_skip_tail == 0);
+        assert(common_context_params_to_llama(budget).moe_skip_mass);
         assert(std::string(getenv("GGML_MOE_SKIP_POLICY")) == "cumulative");
         assert(std::string(getenv("GGML_MOE_SKIP_THRESHOLD")) == "0.2");
         args_budget = {"binary_name", "--moe-skip-budget", "0.15", "--moe-skip-tail", "8"};
         common_params with_tail;
         assert(common_params_parse(args_budget.size(), list_str_to_char(args_budget).data(), with_tail, LLAMA_EXAMPLE_SERVER));
         assert(common_context_params_to_llama(with_tail).moe_skip_tail == 8);
+        assert(common_context_params_to_llama(with_tail).moe_skip_mass);
         assert(std::string(getenv("GGML_MOE_SKIP_THRESHOLD")) == "0.15");
         args_budget = {"binary_name", "--moe-skip-budget", "0.2", "--moe-skip-rank-floor"};
         common_params floor;
         assert(common_params_parse(args_budget.size(), list_str_to_char(args_budget).data(), floor, LLAMA_EXAMPLE_SERVER));
         assert(floor.moe_cache.skip_rank_floor);
-        assert(common_context_params_to_llama(floor).moe_skip_tail == 7);
+        assert(common_context_params_to_llama(floor).moe_skip_tail == 0);
+        assert(common_context_params_to_llama(floor).moe_skip_mass);
         assert(std::string(getenv("GGML_MOE_SKIP_RANK_FLOOR")) == "5");
+        for (bool tail_first : {false, true}) {
+            args_budget = tail_first ? std::vector<std::string>{"binary_name", "--moe-skip-tail", "0", "--moe-skip-budget", "0.15"}
+                                     : std::vector<std::string>{"binary_name", "--moe-skip-budget", "0.15", "--moe-skip-tail", "0"};
+            common_params mass_only;
+            assert(common_params_parse(args_budget.size(), list_str_to_char(args_budget).data(), mass_only, LLAMA_EXAMPLE_SERVER));
+            const auto ctx = common_context_params_to_llama(mass_only);
+            assert(ctx.moe_skip_tail == 0 && ctx.moe_skip_mass);
+        }
         unsetenv("GGML_MOE_SKIP_RANK_FLOOR");
         setenv("GGML_MOE_SKIP_POLICY", "threshold", 1);
         bool threw = false;

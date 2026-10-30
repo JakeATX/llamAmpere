@@ -435,6 +435,7 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
     }
     // Only the main model's context uses it; drafter and other context types stay exact.
     cparams.moe_skip_tail = params.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT ? params.moe_skip_tail : 0;
+    cparams.moe_skip_mass = params.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && params.moe_skip_mass;
     if (cparams.moe_skip_tail > 0) {
         LLAMA_LOG_WARN("%s: --moe-skip-tail %d (LOSSY: non-resident experts ranked >= %d by every token of a decode window are left out, "
                 "weights not renormalized); %s\n", __func__, cparams.moe_skip_tail, cparams.moe_skip_tail,
@@ -4877,12 +4878,13 @@ build_graph:
         ggml_backend_sched_synchronize(compute_peer->sched.get());
     }
 
-    if (cparams.moe_skip_tail > 0) {
+    if (cparams.moe_skip_tail > 0 || cparams.moe_skip_mass) {
         // Lossy expert skipping only in one sequence's decode or verify window (every token an output, at most
         // 8 tokens); prompt processing and windows that mix requests stay exact. The scheduler only acts on a change.
         const bool decode_window = cparams.n_seq_max == 1 && !cparams.embeddings &&
                 ubatch.n_tokens <= 8 && n_outputs == (int32_t) ubatch.n_tokens;
-        ggml_backend_sched_moe_cache_set_skip_tail(sched.get(), decode_window ? cparams.moe_skip_tail : 0);
+        ggml_backend_sched_moe_cache_set_skip_tail(sched.get(), decode_window ? cparams.moe_skip_tail : 0,
+                decode_window && cparams.moe_skip_mass);
     }
     const int64_t pp_submit_t0 = b1_cur.active ? ggml_time_us() : 0;
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
@@ -9452,6 +9454,7 @@ llama_context_params llama_context_default_params() {
         /*.moe_prefetch                =*/ 0,
         /*.moe_cache_budget_mib        =*/ 0,
         /*.moe_skip_tail               =*/ 0,
+        /*.moe_skip_mass               =*/ false,
         /*.moe_cache_size              =*/ 0,
         /*.moe_draft_keep              =*/ -1,
         /*.moe_keep_map                =*/ nullptr,

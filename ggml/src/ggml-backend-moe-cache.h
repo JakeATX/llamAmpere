@@ -162,8 +162,9 @@ struct ggml_moe_cache_api {
 
     // LOSSY route-rank cutoff for the session's decode windows (--moe-skip-tail). 0 = exact. With rank R > 0, an
     // expert that is not resident on the device and that no token of the window ranks below R is left out: its
-    // output rows are zero and its weights are never read. NULL means the provider cannot skip (always exact).
-    void (*set_skip_tail)(void * session, int rank);
+    // output rows are zero and its weights are never read. mass independently enables the environment-selected
+    // weight-budget policy; rank 0 and mass false keep the window exact. NULL means always exact.
+    void (*set_skip_tail)(void * session, int rank, bool mass);
 };
 
 // plan() slot index for a row the route-rank cutoff left out: the caller writes a zero row and does no work.
@@ -187,8 +188,8 @@ static inline bool ggml_moe_cache_tail_rank_ok(const int32_t * ids, int n_ids, i
     return true;
 }
 
-// Sets the cutoff of the scheduler's expert cache session; synchronizes only when the value or the session changes.
-GGML_API void ggml_backend_sched_moe_cache_set_skip_tail(ggml_backend_sched_t sched, int rank);
+// Sets the rank cutoff and weight-budget enable; synchronizes only when either value or the session changes.
+GGML_API void ggml_backend_sched_moe_cache_set_skip_tail(ggml_backend_sched_t sched, int rank, bool mass);
 
 GGML_API void ggml_backend_sched_moe_cache_prefetch_configure(ggml_backend_sched_t sched, int mode);
 GGML_API int ggml_backend_sched_moe_cache_warm(ggml_backend_sched_t sched,

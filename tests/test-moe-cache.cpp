@@ -7109,7 +7109,7 @@ static bool run_skip_tail_layer(ggml_backend_t gpu, ggml_backend_t cpu, log_capt
                 ok &= ggml_backend_graph_compute(cpu, graphs[0].graph) == GGML_STATUS_SUCCESS;
                 ggml_backend_tensor_get(graphs[0].out, expected.data(), 0, n_out * sizeof(float));
                 for (int step = 0; step < 3; ++step) {
-                    api.set_skip_tail(session, step == 1 ? rank : 0);
+                    api.set_skip_tail(session, step == 1 ? rank : 0, false);
                     api.session_enter(session);
                     ok &= ggml_backend_graph_compute(gpu, graphs[1].graph) == GGML_STATUS_SUCCESS;
                     api.session_leave(session);
@@ -7119,12 +7119,13 @@ static bool run_skip_tail_layer(ggml_backend_t gpu, ggml_backend_t cpu, log_capt
                 for (int mode : {1, 2}) {
                     for (int renorm : {0, 1}) {
                       for (int floor : {0, 5, 10}) {
+                       for (int tail_rank : {0, rank}) {
                         set_env("GGML_MOE_SKIP_POLICY", mode == 1 ? "threshold" : "cumulative");
                         set_env("GGML_MOE_SKIP_THRESHOLD", mode == 1 ? "0.04" : "0.25");
                         set_env("GGML_MOE_SKIP_RENORM", renorm ? "1" : "0");
                         const std::string floor_text = std::to_string(floor);
                         set_env("GGML_MOE_SKIP_RANK_FLOOR", floor_text.c_str());
-                        api.set_skip_tail(session, rank); // Recapture for each policy.
+                        api.set_skip_tail(session, tail_rank, tail_rank == 0); // Explicit mass and legacy rank activation.
                         api.session_enter(session);
                         ok &= ggml_backend_graph_compute(gpu, mass_graph.graph) == GGML_STATUS_SUCCESS;
                         api.session_leave(session);
@@ -7166,7 +7167,7 @@ static bool run_skip_tail_layer(ggml_backend_t gpu, ggml_backend_t cpu, log_capt
                                 if (!keep) { expected_rows += 3; }
                             }
                         }
-                        api.set_skip_tail(session, 0);
+                        api.set_skip_tail(session, 0, false);
                         api.session_enter(session);
                         ok &= ggml_backend_graph_compute(gpu, startup_graph) == GGML_STATUS_SUCCESS;
                         api.session_leave(session);
@@ -7176,6 +7177,7 @@ static bool run_skip_tail_layer(ggml_backend_t gpu, ggml_backend_t cpu, log_capt
                         set_env("GGML_MOE_SKIP_THRESHOLD", nullptr);
                         set_env("GGML_MOE_SKIP_RENORM", nullptr);
                         set_env("GGML_MOE_SKIP_RANK_FLOOR", nullptr);
+                       }
                       }
                     }
                 }

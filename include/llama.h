@@ -422,6 +422,7 @@ extern "C" {
         int32_t moe_prefetch;                     // experimental: 0 off, -1 auto, 1..3 future layers
         size_t moe_cache_budget_mib;               // 0 uses the provider's available-memory budget
         int32_t moe_skip_tail;                     // LOSSY: 0 off; 1..9 = leave out a non-resident expert that every token of a single-sequence decode window ranks at this position or later [EXPERIMENTAL]
+        bool moe_skip_mass;                        // LOSSY: enable the configured weight-budget policy independently of route rank
         size_t moe_cache_size; // device cache in bytes for the experts kept in host memory, 0 = disabled [EXPERIMENTAL]
 
         // Expert keep policy for CPU-held MoE experts (#215/#217) [EXPERIMENTAL]

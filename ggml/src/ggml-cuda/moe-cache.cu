@@ -803,6 +803,7 @@ struct moe_cache_session {
     // --moe-skip-tail cutoff for the current window (0 = exact; guarded by mu, read at graph build time) and the
     // missed tensor-expert rows the host path left out because of it
     int skip_tail = 0;
+    bool skip_mass = false;
     // GGML_MOE_SKIP_POLICY/_THRESHOLD/_RENORM, read once per window in set_skip_tail (mode 0 rank, 1 threshold,
     // 2 cumulative, -1 invalid) so the per-expert plan never calls getenv
     int skip_mode = 0;
@@ -4898,7 +4899,7 @@ static void * moe_cache_fused_begin(
     if (!session || session->stopping || session->dormant) {
         return nullptr;
     }
-    if (session->skip_tail > 0) {
+    if (session->skip_tail > 0 || session->skip_mass) {
         // the unfused plan applies the --moe-skip-tail cutoff
         return nullptr;
     }
@@ -10659,7 +10660,7 @@ bool ggml_cuda_moe_skipmass_compute(ggml_backend_cuda_context & ctx, ggml_tensor
     GGML_ASSERT(mode >= 0);
     const float threshold = session.skip_threshold;
     GGML_ASSERT(!mode || ggml_moe_skipmass_budget_valid(mode, threshold));
-    const bool active = mode && session.skip_tail > 0;
+    const bool active = mode && session.skip_mass;
     if (!active && !session.mass_trace) {
         // fork: exact evaluation needs no route selection or residency reads.
         CUDA_CHECK(cudaMemcpyAsync(op->data, op->src[0]->data, ggml_nbytes(op), cudaMemcpyDeviceToDevice, ctx.stream()));
@@ -10760,10 +10761,10 @@ static bool moe_hf_begin(ggml_backend_cuda_context & ctx, moe_cache_session & se
     args.stride = g_hf_stride;
     const int n_expert = (int) group[0]->desc.n_expert;
     // --moe-skip-tail: the cutoff masks go first on the side stream; the plan then sees left-out experts as resident.
-    const bool mass = session.skip_tail > 0 && session.skip_mode != 0 &&
+    const bool mass = session.skip_mass && session.skip_mode != 0 &&
             session.mass_layer == table.mj_layer && session.mass_ids == ids->data;
     const bool tail = (mass || (session.skip_tail > 0 && session.skip_mode == 0)) && g_tail_mask && n_expert <= MOE_TAIL_MAX_EXPERT &&
-            n_expert <= g_hf_experts && session.skip_tail < (int) ids->ne[0];
+            n_expert <= g_hf_experts && (mass || session.skip_tail < (int) ids->ne[0]);
     session.tail_layer = tail ? table.mj_layer : -1;
     if (tail && !mass) {
         moe_tail_prep_kernel<<<1, 256, 0, g_hf_side>>>(group[0]->hot, group[1]->hot, group[2]->hot,
@@ -12628,7 +12629,7 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
 #endif
 }
 
-static void moe_cache_set_skip_tail(void * opaque, int rank) {
+static void moe_cache_set_skip_tail(void * opaque, int rank, bool mass) {
     auto * session = (moe_cache_session *) opaque;
     if (!session || rank < 0 || rank > 9) {
         return;
@@ -12650,16 +12651,19 @@ static void moe_cache_set_skip_tail(void * opaque, int rank) {
         mode = -1;
     }
     const int rank_floor = mode == 2 ? (int) floor_value : 0;
+    // A positive legacy rank still enables an environment-selected mass policy.
+    mass = mode != 0 && (mass || rank > 0);
     std::lock_guard<std::mutex> lock(session->mu);
-    const bool policy_changed = session->skip_mode != mode || session->skip_threshold != threshold || session->skip_renorm != renorm || session->skip_rank_floor != rank_floor;
+    const bool policy_changed = session->skip_mass != mass || session->skip_mode != mode || session->skip_threshold != threshold || session->skip_renorm != renorm || session->skip_rank_floor != rank_floor;
     if (policy_changed) {
         session->skip_logged = false;
     }
     session->skip_mode = mode;
+    session->skip_mass = mass;
     session->skip_rank_floor = rank_floor;
     session->skip_threshold = threshold;
     session->skip_renorm = renorm;
-    if (rank > 0 && !session->skip_logged) {
+    if ((rank > 0 || mass) && !session->skip_logged) {
         static const char * names[] = {"invalid", "rank", "threshold", "cumulative"};
         MOE_CACHE_LOG("[moe-skip] policy=%s tail=%d threshold=%g renorm=%d rank_floor=%d\n", names[mode + 1], rank, threshold, renorm ? 1 : 0, rank_floor);
         session->skip_logged = true;

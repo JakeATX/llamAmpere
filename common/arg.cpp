@@ -3375,8 +3375,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--moe-skip-budget"}, "F",
         "LOSSY, changes answers: in a single-sequence decode or verify window, leave out the lightest experts that are "
         "not resident in VRAM while their summed router weight stays at or below F; resident experts are always "
-        "computed and the remaining weights are not renormalized. Prompt processing is never affected. Turns on "
-        "--moe-skip-tail 7 when that is off. 0 = off, max 0.25 (default: 0)",
+        "computed and the remaining weights are not renormalized. Prompt processing is never affected. Independent "
+        "of --moe-skip-tail. 0 = off, max 0.25 (default: 0)",
         [](common_params & params, const std::string & value) {
             char * end = nullptr;
             const float budget = std::strtof(value.c_str(), &end);
