@@ -33,6 +33,8 @@
 // GGML_CUDA_AIT4_EARLY_X=1 loads each activation vector before decoding its weight group.
 // GGML_CUDA_AIT4_BOUNDS=1 sets the plain decode thread bound to 384 for a larger register budget.
 #include "ait.cuh"
+#include <set>
+#include <tuple>
 #include "ait-mm.cuh"
 #include "ai4.cuh"
 #include "ggml.h"
@@ -973,6 +975,13 @@ static void ait_fast_nt(ggml_backend_cuda_context & ctx, const uint8_t * W, cons
     static const bool cta_opt = ait_env_int("GGML_CUDA_AIT_CTA", 0) != 0;
     const bool cta = ordered && cta_opt && !fuse && !use_v && occ == 0 && code == 0 && full && !ait_kernel_exp && ait_cta_ok(M, K, nsm, warps);
     const size_t cta_smem = cta ? (size_t) warps * 2 * (NT * 33 + 2) * sizeof(float) : 0;
+    if (cta_opt) {
+        // one line per distinct shape, so a run shows whether GGML_CUDA_AIT_CTA engaged or fell back to the ordered slots
+        static std::set<std::tuple<int, int, int, int>> seen;
+        if (seen.insert(std::make_tuple(M, K, (int) NT, (int) cta)).second) {
+            fprintf(stderr, "[ait-cta] M=%d K=%d N=%d code=%d k=%d: %s\n", M, K, (int) NT, code, k, cta ? "CTA sum" : "ordered slots (not eligible)");
+        }
+    }
     if (ordered && !cta) {
         scratch.alloc(slots * NT * (size_t) M + (fuse ? NT * (size_t) M : 0));
     }
