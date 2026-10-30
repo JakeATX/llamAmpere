@@ -948,8 +948,13 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
                 }
 
                 // arg with single value
-                check_arg(i);
-                std::string val = argv[++i];
+                std::string val;
+                if (opt.value_optional_default && (i + 1 == argc || argv[i + 1][0] == '-')) {
+                    val = opt.value_optional_default;
+                } else {
+                    check_arg(i);
+                    val = argv[++i];
+                }
                 if (opt.handler_int) {
                     opt.handler_int(params, std::stoi(val));
                     continue;
@@ -1076,7 +1081,7 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
 static void common_params_print_usage(common_params_context & ctx_arg) {
     auto print_options = [](std::vector<common_arg *> & options) {
         for (common_arg * opt : options) {
-            printf("%s", opt->to_string().c_str());
+            if (!opt->help.empty()) { printf("%s", opt->to_string().c_str()); }
         }
     };
 
@@ -1138,6 +1143,7 @@ static void common_params_print_completion(common_params_context & ctx_arg) {
     printf("    opts=\"");
     auto print_options = [](const std::vector<common_arg *> & options) {
         for (const common_arg * opt : options) {
+            if (opt->help.empty()) { continue; }
             for (const char * arg : opt->args) {
                 printf("%s ", arg);
             }
@@ -1342,8 +1348,12 @@ bool common_params_to_map(int argc, char ** argv, llama_example ex, std::map<com
         }
         if (opt.value_hint != nullptr) {
             // arg with single value
-            check_arg(i);
-            val = argv[++i];
+            if (opt.value_optional_default && (i + 1 == argc || argv[i + 1][0] == '-')) {
+                val = opt.value_optional_default;
+            } else {
+                check_arg(i);
+                val = argv[++i];
+            }
         }
         if (opt.value_hint_2 != nullptr) {
             // TODO: support arg with 2 values
@@ -1400,6 +1410,13 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
         if (!common_params_parse_ex(argc, argv, ctx_arg)) {
             ctx_arg.params = params_org;
             return false;
+        }
+        // Detailed settings win over the preset in either argument order.
+        if (params.moe_cache.skip_preset >= 0) {
+            const bool on = params.moe_cache.skip_preset != 0;
+            if (!params.moe_cache.skip_budget_explicit) { params.moe_cache.skip_budget = on ? 0.15f : 0.0f; }
+            if (params.moe_cache.skip_rank_floor < 0) { params.moe_cache.skip_rank_floor = on ? 5 : 0; }
+            if (!on || !params.moe_cache.skip_tail_explicit) { params.moe_cache.skip_tail = 0; }
         }
         if (ctx_arg.params.usage) {
             common_params_print_usage(ctx_arg);
@@ -3358,12 +3375,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.moe_keep_map = value;
         }
     ).set_env("LLAMA_ARG_MOE_KEEP_MAP"));
+    common_arg skip_preset(
+        {"--moe-skip"}, "[on|off]",
+        "LOSSY: skip the lightest experts that are not in VRAM (recommended settings). "
+        "Bare flag: budget 0.15, rank floor 5; off disables skipping. Detailed flags override the preset.",
+        [](common_params & params, const std::string & value) {
+            if (value != "on" && value != "off") {
+                throw std::invalid_argument("--moe-skip expects on or off");
+            }
+            params.moe_cache.skip_preset = value == "on" ? 1 : 0;
+        });
+    skip_preset.value_optional_default = "on";
+    add_opt(skip_preset.set_env("LLAMA_ARG_MOE_SKIP"));
     add_opt(common_arg(
-        {"--moe-skip-tail"}, "N",
-        "LOSSY, changes answers: in a single-sequence decode or verify window, leave out an expert that is not "
-        "resident in VRAM when every token in the window ranks it at route position N or later (zero-based). "
-        "Resident experts are always computed and the remaining router weights are not renormalized. "
-        "Prompt processing is never affected. 0 = off, 1..9 = lossy (default: 0)",
+        {"--moe-skip-tail"}, "N", "", // legacy scripts only; deliberately absent from help
         [](common_params & params, int value) {
             if (value < 0 || value > 9) {
                 throw std::invalid_argument("--moe-skip-tail must be in [0, 9]");
@@ -3376,8 +3401,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--moe-skip-budget"}, "F",
         "LOSSY, changes answers: in a single-sequence decode or verify window, leave out the lightest experts that are "
         "not resident in VRAM while their summed router weight stays at or below F; resident experts are always "
-        "computed and the remaining weights are not renormalized. Prompt processing is never affected. Turns on "
-        "--moe-skip-tail 7 when that is off. 0 = off, max 0.25 (default: 0)",
+        "computed and the remaining weights are not renormalized. Prompt processing is never affected. "
+        "0 = off, max 0.25 (default: 0)",
         [](common_params & params, const std::string & value) {
             char * end = nullptr;
             const float budget = std::strtof(value.c_str(), &end);
@@ -3385,6 +3410,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 throw std::invalid_argument("--moe-skip-budget must be a number in [0, 0.25]");
             }
             params.moe_cache.skip_budget = budget;
+            params.moe_cache.skip_budget_explicit = true;
         }
     ).set_env("LLAMA_ARG_MOE_SKIP_BUDGET"));
     add_opt(common_arg(

@@ -1338,6 +1338,7 @@ struct ggml_backend_sched {
     int32_t * moe_keep_layer;
     // --moe-skip-tail value last handed to moe_skip_tail_session (0 = exact)
     int       moe_skip_tail;
+    bool      moe_skip_mass;
     void *    moe_skip_tail_session;
     int32_t   moe_keep_n_layer;
 
@@ -3378,18 +3379,19 @@ int ggml_backend_sched_moe_cache_status(ggml_backend_sched_t sched, size_t * all
     return sched->moe_cache_api.session_status(sched->moe_cache_session, allocated_bytes);
 }
 
-void ggml_backend_sched_moe_cache_set_skip_tail(ggml_backend_sched_t sched, int rank) {
+void ggml_backend_sched_moe_cache_set_skip_tail(ggml_backend_sched_t sched, int rank, bool mass) {
     GGML_ASSERT(rank >= 0 && rank <= 9);
     if (!sched || !sched->moe_cache_session || !sched->moe_cache_api.set_skip_tail) {
         return;
     }
-    if (sched->moe_skip_tail == rank && sched->moe_skip_tail_session == sched->moe_cache_session) {
+    if (sched->moe_skip_tail == rank && sched->moe_skip_mass == mass && sched->moe_skip_tail_session == sched->moe_cache_session) {
         return;
     }
     // The previous graph may still read the old policy's tables.
     ggml_backend_sched_synchronize(sched);
-    sched->moe_cache_api.set_skip_tail(sched->moe_cache_session, rank);
+    sched->moe_cache_api.set_skip_tail(sched->moe_cache_session, rank, mass);
     sched->moe_skip_tail = rank;
+    sched->moe_skip_mass = mass;
     sched->moe_skip_tail_session = sched->moe_cache_session;
 }
 

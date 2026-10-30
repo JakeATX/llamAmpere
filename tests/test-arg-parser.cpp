@@ -234,7 +234,7 @@ static void test(void) {
     }
 
     {
-        // --moe-skip-budget: (0, 0.25], default 0; sets the cumulative drop policy and turns on skip-tail 7
+        // The budget has its own enable; no implicit route-rank cutoff.
         common_params defaults;
         assert(defaults.moe_cache.skip_budget == 0.0f);
         assert(defaults.moe_cache.skip_rank_floor == -1);
@@ -242,13 +242,15 @@ static void test(void) {
         unsetenv("GGML_MOE_SKIP_POLICY");
         unsetenv("GGML_MOE_SKIP_THRESHOLD");
         assert(common_context_params_to_llama(defaults).moe_skip_tail == 0);
+        assert(!common_context_params_to_llama(defaults).moe_skip_mass);
         assert(getenv("GGML_MOE_SKIP_POLICY") == nullptr);
         assert(getenv("GGML_MOE_SKIP_RANK_FLOOR") == nullptr);
         std::vector<std::string> args_budget = {"binary_name", "--moe-skip-budget", "0.2"};
         common_params budget;
         assert(common_params_parse(args_budget.size(), list_str_to_char(args_budget).data(), budget, LLAMA_EXAMPLE_SERVER));
         assert(budget.moe_cache.skip_budget == 0.2f);
-        assert(common_context_params_to_llama(budget).moe_skip_tail == 7);
+        assert(common_context_params_to_llama(budget).moe_skip_tail == 0);
+        assert(common_context_params_to_llama(budget).moe_skip_mass);
         assert(std::string(getenv("GGML_MOE_SKIP_POLICY")) == "cumulative");
         assert(std::string(getenv("GGML_MOE_SKIP_THRESHOLD")) == "0.2");
         args_budget = {"binary_name", "--moe-skip-budget", "0.15", "--moe-skip-tail", "8"};
@@ -261,7 +263,8 @@ static void test(void) {
             common_params floor;
             assert(common_params_parse(args_budget.size(), list_str_to_char(args_budget).data(), floor, LLAMA_EXAMPLE_SERVER));
             assert(floor.moe_cache.skip_rank_floor == std::stoi(value));
-            assert(common_context_params_to_llama(floor).moe_skip_tail == 7);
+            assert(common_context_params_to_llama(floor).moe_skip_tail == 0);
+            assert(common_context_params_to_llama(floor).moe_skip_mass);
             assert(std::string(getenv("GGML_MOE_SKIP_RANK_FLOOR")) == value);
         }
         for (const char * value : {"-1", "11", "x"}) {
@@ -275,6 +278,7 @@ static void test(void) {
             common_params exact;
             assert(common_params_parse(args_budget.size(), list_str_to_char(args_budget).data(), exact, LLAMA_EXAMPLE_SERVER));
             assert(common_context_params_to_llama(exact).moe_skip_tail == 0);
+            assert(common_context_params_to_llama(exact).moe_skip_mass);
         }
         unsetenv("GGML_MOE_SKIP_RANK_FLOOR");
         setenv("GGML_MOE_SKIP_POLICY", "threshold", 1);
@@ -288,6 +292,61 @@ static void test(void) {
             common_params invalid;
             assert(!common_params_parse(args_budget.size(), list_str_to_char(args_budget).data(), invalid, LLAMA_EXAMPLE_SERVER));
         }
+    }
+
+    {
+        auto parse_skip = [&](std::vector<std::string> args) {
+            common_params parsed;
+            assert(common_params_parse(args.size(), list_str_to_char(args).data(), parsed, LLAMA_EXAMPLE_SERVER));
+            return parsed;
+        };
+        auto preset = parse_skip({"binary_name", "--moe-skip"});
+        assert(preset.moe_cache.skip_tail == 0);
+        assert(preset.moe_cache.skip_budget == 0.15f && preset.moe_cache.skip_rank_floor == 5);
+        assert(common_context_params_to_llama(preset).moe_skip_mass);
+        // Omitted value must not eat the next option; mapping is used by presets too.
+        auto next = parse_skip({"binary_name", "--moe-skip", "--ctx-size", "4096"});
+        assert(next.n_ctx == 4096 && next.moe_cache.skip_budget == 0.15f);
+        std::vector<std::string> args = {"binary_name", "--moe-skip", "--ctx-size", "4096"};
+        std::map<common_arg, std::string> mapped;
+        assert(common_params_to_map(args.size(), list_str_to_char(args).data(), LLAMA_EXAMPLE_SERVER, mapped));
+        for (const auto & entry : mapped) {
+            if (std::string(entry.first.args.front()) == "--moe-skip") { assert(entry.second == "on"); }
+        }
+        for (const char * name : {"--moe-skip-budget", "--moe-skip-rank-floor", "--moe-skip-tail"}) {
+            const std::string value = std::string(name) == "--moe-skip-budget" ? "0.1" : "8";
+            for (bool first : {false, true}) {
+                auto overridden = parse_skip(first ? std::vector<std::string>{"binary_name", name, value, "--moe-skip"}
+                                                   : std::vector<std::string>{"binary_name", "--moe-skip", name, value});
+                assert(overridden.moe_cache.skip_budget == (std::string(name) == "--moe-skip-budget" ? 0.1f : 0.15f));
+                assert(overridden.moe_cache.skip_rank_floor == (std::string(name) == "--moe-skip-rank-floor" ? 8 : 5));
+                assert(overridden.moe_cache.skip_tail == (std::string(name) == "--moe-skip-tail" ? 8 : 0));
+            }
+        }
+        // An explicit zero budget overrides the preset too.
+        for (bool first : {false, true}) {
+            auto zero = parse_skip(first ? std::vector<std::string>{"binary_name", "--moe-skip-budget", "0", "--moe-skip"}
+                                         : std::vector<std::string>{"binary_name", "--moe-skip", "--moe-skip-budget", "0"});
+            assert(!common_context_params_to_llama(zero).moe_skip_mass);
+        }
+        auto off = parse_skip({"binary_name", "--moe-skip", "off"});
+        assert(off.moe_cache.skip_budget == 0 && off.moe_cache.skip_rank_floor == 0);
+        assert(!common_context_params_to_llama(off).moe_skip_mass && off.moe_cache.skip_tail == 0);
+        auto legacy_off = parse_skip({"binary_name", "--moe-skip-tail", "7", "--moe-skip", "off"});
+        assert(legacy_off.moe_cache.skip_tail == 0);
+        setenv("LLAMA_ARG_MOE_SKIP", "on", 1);
+        assert(parse_skip({"binary_name"}).moe_cache.skip_budget == 0.15f);
+        assert(parse_skip({"binary_name", "--moe-skip", "off"}).moe_cache.skip_budget == 0);
+        setenv("LLAMA_ARG_MOE_SKIP", "off", 1);
+        assert(parse_skip({"binary_name"}).moe_cache.skip_budget == 0);
+        assert(parse_skip({"binary_name", "--moe-skip"}).moe_cache.skip_budget == 0.15f);
+        unsetenv("LLAMA_ARG_MOE_SKIP");
+        args = {"binary_name", "--moe-skip", "bad"};
+        common_params invalid;
+        assert(!common_params_parse(args.size(), list_str_to_char(args).data(), invalid, LLAMA_EXAMPLE_SERVER));
+        unsetenv("GGML_MOE_SKIP_POLICY");
+        unsetenv("GGML_MOE_SKIP_THRESHOLD");
+        unsetenv("GGML_MOE_SKIP_RANK_FLOOR");
     }
 
     // missing value

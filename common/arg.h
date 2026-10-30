@@ -26,6 +26,7 @@ struct common_arg {
     std::vector<const char *> args_neg;  // for negated args like --no-xxx
     const char * value_hint   = nullptr; // help text or example for arg value
     const char * value_hint_2 = nullptr; // for second arg value
+    const char * value_optional_default = nullptr; // omitted single value, when the next word is an option
     const char * env          = nullptr;
     std::string help;
     bool is_sampling = false; // is current arg a sampling param?
