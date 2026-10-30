@@ -1393,9 +1393,9 @@ static void ple_hash_pages_case(bool windowed = false, bool bounded = false, boo
 
 static void ple_wide_rows_case() {
 #if defined(__linux__)
-    for (int width : { 2048, 4096, 65536 }) {
-        const size_t n_tokens = width == 65536 ? 65 : 3*256 + 17;
-        const size_t size = n_tokens*width*sizeof(float) + 4096;
+    for (int width : { 2048, 4096, 65536, 65793 }) {
+        const size_t n_tokens = width >= 65536 ? 65 : 3*256 + 17;
+        const size_t size = ((n_tokens*width*sizeof(float) + 128 + 4095)/4096)*4096;
         void * pages = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         require(pages != MAP_FAILED, "wide prefetch pages");
         require(madvise(pages, size, MADV_NOHUGEPAGE) == 0, "wide prefetch uses separate pages");
@@ -1454,6 +1454,7 @@ static void ple_wide_rows_case() {
         hp.ple_head_offsets[0] = 0;
         hp.ple_head_vocab_sizes[0] = n_tokens;
         const size_t row_size = table->nb[1];
+        const size_t end_offset = size - n_tokens*row_size;
         table->nb[1] = SIZE_MAX;
         require(!llama_ple_prefetch::create(*model, n_tokens), "prefetch refuses row stride past host buffer");
         table->nb[1] = row_size;
@@ -1464,9 +1465,9 @@ static void ple_wide_rows_case() {
         require(!llama_ple_prefetch::create(*model, n_tokens), "prefetch refuses table before host buffer");
         table->data = static_cast<char *>(pages) + size;
         require(!llama_ple_prefetch::create(*model, n_tokens), "prefetch refuses table at host buffer end");
-        table->data = static_cast<char *>(pages) + 4097;
+        table->data = static_cast<char *>(pages) + end_offset + 1;
         require(!llama_ple_prefetch::create(*model, n_tokens), "prefetch refuses row span one byte past host buffer");
-        table->data = static_cast<char *>(pages) + 4096;
+        table->data = static_cast<char *>(pages) + end_offset;
         require(llama_ple_prefetch::create(*model, n_tokens) != nullptr, "prefetch accepts row span ending at host buffer end");
         table->data = static_cast<char *>(pages) + 128;
         for (const char * minimum : { "4294967296", "4294967297", "9223372036854775807" }) {
@@ -1498,6 +1499,7 @@ static void ple_wide_rows_case() {
     printf("OK: large prefetch minimum does not wrap into short calls\n");
     printf("OK: unaligned 8KiB and 16KiB prefetch rows cover every page\n");
     printf("OK: unaligned 256KiB rows cover full bitmap words and both boundary pages\n");
+    printf("OK: ragged wide rows cover mid-word starts and shared boundary pages\n");
 #else
     printf("SKIP: wide prefetch page test needs Linux\n");
 #endif

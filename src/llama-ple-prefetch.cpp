@@ -410,9 +410,16 @@ void llama_ple_prefetch::build() {
                         const uint64_t end = std::min(k1 - key0, index | UINT64_C(63));
                         const uint64_t mask = (UINT64_MAX << (index % 64)) & (UINT64_MAX >> (63 - end % 64));
                         uint64_t & word = seen[index/64];
-                        const uint64_t fresh = mask & ~word;
+                        uint64_t fresh = mask & ~word;
                         word |= mask;
                         // fork: skip duplicate row spans before walking their individual pages.
+#if defined(__GNUC__) || defined(__clang__)
+                        while (fresh) {
+                            const uint64_t bit = (uint64_t) __builtin_ctzll(fresh);
+                            cp.push_back(key0 + (index & ~UINT64_C(63)) + bit);
+                            fresh &= fresh - 1;
+                        }
+#else
                         if (fresh) {
                             for (uint64_t j = index; j <= end; ++j) {
                                 if (fresh & (UINT64_C(1) << (j % 64))) {
@@ -420,6 +427,7 @@ void llama_ple_prefetch::build() {
                                 }
                             }
                         }
+#endif
                         page = key0 + end + 1;
                     }
                 }
