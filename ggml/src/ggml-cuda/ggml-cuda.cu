@@ -6910,6 +6910,67 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
 // 31 nodes, so k <= 15; larger values use the per-operation path.
 static constexpr int MOE_WEIGHTED_REDUCTION_MAX_EXPERTS = 15;
 
+struct ggml_cuda_moe_bank_joint_match {
+    const ggml_tensor * hot = nullptr;
+    const ggml_tensor * cold = nullptr;
+    const ggml_tensor * hot_weights = nullptr;
+    const ggml_tensor * cold_weights = nullptr;
+    ggml_tensor * dst = nullptr;
+};
+
+static bool ggml_cuda_match_moe_bank_joint(const ggml_cgraph * graph, int i, ggml_cuda_moe_bank_joint_match & m) {
+    static const bool enabled = [] {
+        const char * value = getenv("LLAMA_MOE_BANK_JOINT_REDUCE");
+        return value && atoi(value) != 0;
+    }();
+    if (!enabled || i + 7 > graph->n_nodes) {
+        return false;
+    }
+    const ggml_op ops[] = { GGML_OP_MUL, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_PERMUTE, GGML_OP_CONT, GGML_OP_SUM_ROWS, GGML_OP_RESHAPE };
+    const int output = i + 6;
+    if (!ggml_can_fuse_subgraph(graph, i, 7, ops, &output, 1)) {
+        return false;
+    }
+    for (int j = i; j <= output; ++j) {
+        if (graph->nodes[j]->type != GGML_TYPE_F32) {
+            return false;
+        }
+    }
+    const ggml_tensor * h = graph->nodes[i], * c = graph->nodes[i + 1], * add = graph->nodes[i + 2];
+    const ggml_tensor * perm = graph->nodes[i + 3], * cont = graph->nodes[i + 4], * sum = graph->nodes[i + 5];
+    ggml_tensor * dst = graph->nodes[output];
+    if (add->src[0] != h || add->src[1] != c || perm->src[0] != add || cont->src[0] != perm || sum->src[0] != cont || dst->src[0] != sum ||
+            h->ne[1] < 1 || h->ne[1] > 15 || h->ne[2] < 1 || h->ne[2] > 8 || h->ne[3] != 1 || !ggml_are_same_shape(h, c)) {
+        return false;
+    }
+    if (!ggml_are_same_shape(add, h) || !ggml_is_contiguous(h) || !ggml_is_contiguous(c) ||
+            !ggml_is_contiguous(add) || !ggml_is_contiguous(cont) || !ggml_are_same_shape(perm, cont) ||
+            perm->ne[0] != h->ne[1] || perm->ne[1] != h->ne[0] || perm->ne[2] != h->ne[2] || perm->ne[3] != 1 ||
+            sum->ne[0] != 1 || sum->ne[1] != h->ne[0] || sum->ne[2] != h->ne[2] || sum->ne[3] != 1) {
+        return false;
+    }
+    for (int axis = 0; axis < 4; ++axis) {
+        if (ggml_get_op_params_i32(perm, axis) != (axis < 2 ? 1 - axis : axis)) {
+            return false;
+        }
+    }
+    for (const ggml_tensor * mul : { h, c }) {
+        const ggml_tensor * e = mul->src[0], * w = mul->src[1];
+        if (!e || !w || e->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 ||
+                !ggml_is_contiguous(e) || !ggml_is_contiguous(w) || !ggml_are_same_shape(e, h) ||
+                w->ne[0] != 1 || w->ne[1] != h->ne[1] || w->ne[2] != h->ne[2] || w->ne[3] != 1) {
+            return false;
+        }
+    }
+    if (dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) || dst->ne[0] != h->ne[0] ||
+            dst->ne[1] != h->ne[2] || dst->ne[2] != 1 || dst->ne[3] != 1) {
+        return false;
+    }
+    m.hot = h->src[0]; m.hot_weights = h->src[1];
+    m.cold = c->src[0]; m.cold_weights = c->src[1]; m.dst = dst;
+    return true;
+}
+
 struct ggml_cuda_moe_weighted_reduction_match {
     const ggml_tensor * experts      = nullptr;
     const ggml_tensor * expert_scale = nullptr;
@@ -9381,6 +9442,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    if (node->op == GGML_OP_MUL && cuda_ctx->stream_context().concurrent_events.empty()) {
+        ggml_cuda_moe_bank_joint_match match;
+        const int output = i + 6;
+        if (ggml_cuda_match_moe_bank_joint(cgraph, i, match) &&
+                ggml_cuda_check_fusion_memory_ranges(cgraph, i, 7, &output, 1)) {
+            ggml_cuda_op_moe_bank_joint_reduction(*cuda_ctx, match.hot, match.cold, match.hot_weights, match.cold_weights, match.dst);
+            return 6;
+        }
+    }
+
     if (node->op == GGML_OP_MUL) {
         ggml_cuda_moe_weighted_reduction_match match;
         if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
@@ -11130,6 +11201,14 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             }
         }
         for (int i = 0; i < cgraph->n_nodes; ++i) {
+            ggml_cuda_moe_bank_joint_match joint;
+            if (ggml_cuda_match_moe_bank_joint(cgraph, i, joint)) {
+                for (const ggml_tensor * src : { joint.hot, joint.cold, joint.hot_weights, joint.cold_weights }) {
+                    params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(src), joint.dst);
+                }
+                i += 6;
+                continue;
+            }
             ggml_cuda_moe_weighted_reduction_match match;
             if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
                 params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.experts), match.dst);
