@@ -856,13 +856,14 @@ static __global__ void __launch_bounds__(256, 2) lightning_indexer_kernel_exact(
     // so a group's keys stay in L2 while the queries stream once per group (default order re-reads every key tile from
     // DRAM once per 32 tokens when the keys exceed L2). Each block computes the same outputs: same bits.
     if (swizzle > 0) {
-        const int n_kv_tiles = gridDim.x;
-        const int n_b_tiles  = gridDim.y;
-        const int lin        = blockIdx.x + blockIdx.y * gridDim.x;
-        const int group      = lin / (swizzle * n_b_tiles);
-        const int within     = lin - group * (swizzle * n_b_tiles);
-        const int g_kv       = min(swizzle, n_kv_tiles - group * swizzle);
-        kv_tile    = group * swizzle + within % g_kv;
+        const int n_kv_tiles  = gridDim.x;
+        const int group_size  = min(swizzle, n_kv_tiles);
+        const int64_t n_group = int64_t(group_size) * gridDim.y;
+        const int64_t lin     = blockIdx.x + int64_t(blockIdx.y) * gridDim.x;
+        const int group       = lin / n_group;
+        const int64_t within  = lin % n_group;
+        const int g_kv        = min(group_size, n_kv_tiles - group * group_size);
+        kv_tile    = group * group_size + within % g_kv;
         batch_tile = within / g_kv;
     }
 
@@ -1186,7 +1187,13 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
         }();
         static const int swizzle = [] {
             const char * value = getenv("GGML_CUDA_LID_SWIZZLE");
-            return value != nullptr && atoi(value) > 0 ? atoi(value) : 0;
+            if (value == nullptr) {
+                return 0;
+            }
+            char * end = nullptr;
+            const long parsed = strtol(value, &end, 10);
+            return end != value && *end == '\0' && parsed > 0
+                ? int(std::min(parsed, long(std::numeric_limits<int>::max()))) : 0;
         }();
         if (exact_mode > 0 && k->type == GGML_TYPE_F32 && GGML_CUDA_CC_IS_NVIDIA(cc)) {
             ggml_cuda_pool_alloc<char> ref(ctx.pool());

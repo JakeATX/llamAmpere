@@ -18638,6 +18638,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 #endif
 
     // lightning_indexer
+    // Ragged key/query tiles, including a partial final swizzle group and broadcast masks.
+    for (int64_t kv : { 385, 2177 }) {
+        test_cases.emplace_back(new test_lightning_indexer(128, 4, kv, 97, 2, 1, GGML_TYPE_F32));
+        test_cases.emplace_back(new test_lightning_indexer_rmask(128, 4, kv, 97, 2, 2, GGML_TYPE_F32));
+    }
     for (bool large_q : { false, true }) {
         for (bool zero_weight : { false, true }) {
             for (bool strided : { false, true }) {
