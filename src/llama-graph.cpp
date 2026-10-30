@@ -2704,8 +2704,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                         1, n_expert_used, n_tokens);
                 ggml_build_forward_expand(gf, cold_mask);
                 auto mixed_mm = [&](ggml_tensor * hw, ggml_tensor * cw, ggml_tensor * x) {
-                    ggml_tensor * h = ggml_mul_mat_id(ctx0, hw, x, hot_ids);
-                    ggml_tensor * c = ggml_mul_mat_id(ctx0, cw, x, selected_experts);
+                    ggml_tensor * h = build_lora_mm_id(hw, x, hot_ids);
+                    ggml_tensor * c = build_lora_mm_id(cw, x, selected_experts);
                     return ggml_add(ctx0, h, ggml_mul(ctx0, c, cold_mask));
                 };
                 ggml_tensor * x = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
