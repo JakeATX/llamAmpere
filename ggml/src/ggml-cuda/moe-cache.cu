@@ -39,6 +39,7 @@ static void moe_cache_register_stub(const void * owner) {
 #include "moe-table-state.cuh"
 #endif
 #include "moe-cpu-split.h"
+#include "moe-hf-copy.cuh"
 
 #include <algorithm>
 #include <array>
@@ -9461,40 +9462,6 @@ static __global__ void __launch_bounds__(256) moe_hf_plan_fast_kernel(const moe_
     }
 }
 
-// Copies the experts the plan listed for one projection into its scratch slots.
-static __global__ void moe_hf_copy_kernel(const void * const * src, const int * nstage, char * scratch,
-        size_t stride, size_t copy_bytes) {
-    const int n_stage = *nstage;
-    if (n_stage == 0) {
-        return;
-    }
-    const size_t chunks = copy_bytes / 16;
-    const size_t total = chunks * (size_t) n_stage;
-    const size_t step = (size_t) gridDim.x * blockDim.x;
-    size_t c = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
-    // Four loads in flight per thread before the stores keep the link busy.
-    for (; c + 3 * step < total; c += 4 * step) {
-        int4 v[4];
-        size_t r[4], o[4];
-#pragma unroll
-        for (int k = 0; k < 4; ++k) {
-            const size_t ck = c + k * step;
-            r[k] = ck / chunks;
-            o[k] = ck - r[k] * chunks;
-            v[k] = __ldcs((const int4 *) src[r[k]] + o[k]);
-        }
-#pragma unroll
-        for (int k = 0; k < 4; ++k) {
-            ((int4 *) (scratch + r[k] * stride))[o[k]] = v[k];
-        }
-    }
-    for (; c < total; c += step) {
-        const size_t r = c / chunks;
-        const size_t o = c - r * chunks;
-        ((int4 *) (scratch + r * stride))[o] = __ldcs((const int4 *) src[r] + o);
-    }
-}
-
 // fork MOEGAP: copies the CPU routes' input rows into mapped host memory, then (last block) the job, then
 // raises job->seq. One block per possible CPU route; runs on the side stream right after the plan.
 static __global__ void moe_cs_publish_kernel(moe_cs_plan_dev * plan, moe_cs_job * job, const char * x, size_t nb1,
@@ -9861,10 +9828,19 @@ static bool moe_hf_begin(ggml_backend_cuda_context & ctx, moe_cache_session & se
     }
     std::array<int8_t, 3> order = session.hf_order[table.mj_layer];
     if (order[0] < 0) { order = {0, 1, 2}; }
+    static const bool copy_rows = [] {
+        const char * v = getenv("GGML_MOE_MISSJOIN_HF_COPY_ROWS");
+        return v && atoi(v) != 0;
+    }();
     for (int idx = 0; idx < 3; ++idx) {
         const int j = order[idx];
-        moe_hf_copy_kernel<<<moe_hf_blocks(), 256, 0, g_hf_side>>>(args.src[j], g_hf_nstage + j,
-                g_hf_scratch + (size_t) j * slots * g_hf_stride, g_hf_stride, moe_missjoin_copy_bytes(*group[j]));
+        if (copy_rows) {
+            moe_hf_copy_kernel<true><<<moe_hf_blocks(), 256, 0, g_hf_side>>>(args.src[j], g_hf_nstage + j,
+                    g_hf_scratch + (size_t) j * slots * g_hf_stride, g_hf_stride, moe_missjoin_copy_bytes(*group[j]));
+        } else {
+            moe_hf_copy_kernel<false><<<moe_hf_blocks(), 256, 0, g_hf_side>>>(args.src[j], g_hf_nstage + j,
+                    g_hf_scratch + (size_t) j * slots * g_hf_stride, g_hf_stride, moe_missjoin_copy_bytes(*group[j]));
+        }
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaEventRecord(g_hf_done[j], g_hf_side));
     }

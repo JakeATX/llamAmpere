@@ -900,6 +900,11 @@ struct server_slot {
     int64_t               spec_draft_us_pending = 0;
     std::vector<uint64_t> spec_draft_us_by_w;
     std::vector<uint64_t> spec_verify_us_by_w;
+    // LLAMA_SPEC_OTHER_SPLIT=1: splits "other" into the sampler call, the bookkeeping up to the accounting line,
+    // and the rest (token emit, slot loop, next batch build); the sum of the first two is printed per round
+    uint64_t              spec_sample_us = 0;
+    uint64_t              spec_pre_us = 0;
+    int64_t               spec_sample_end_us = 0;
     // rounds that ended in a checkpoint restore (partial acceptance the context cannot roll back in place):
     // their verify decode, the state load and the replay decode of the accepted tokens are not bucketed
     // above, they land in the next bucketed round's "other". Counted here so that cost stays visible.
@@ -958,6 +963,9 @@ struct server_slot {
         spec_draft_us_pending = 0;
         spec_draft_us_by_w.clear();
         spec_verify_us_by_w.clear();
+        spec_sample_us = 0;
+        spec_pre_us = 0;
+        spec_sample_end_us = 0;
         spec_restore_rounds = 0;
         spec_restore_us = 0;
         spec_adapt = {};
@@ -1324,6 +1332,23 @@ struct server_slot {
                 }
                 SLT_INF(*this,
                         " round cost by draft width = (%s)\n", per_width.c_str());
+                static const bool other_split = getenv("LLAMA_SPEC_OTHER_SPLIT") != nullptr && strcmp(getenv("LLAMA_SPEC_OTHER_SPLIT"), "0") != 0;
+                uint64_t n_rounds = 0;
+                uint64_t us_round = 0, us_draft = 0, us_verify = 0;
+                for (size_t w = 0; w < spec_rounds_by_w.size(); ++w) {
+                    n_rounds += spec_rounds_by_w[w];
+                    us_round += spec_round_us_by_w[w];
+                    us_draft += w < spec_draft_us_by_w.size() ? spec_draft_us_by_w[w] : 0;
+                    us_verify += w < spec_verify_us_by_w.size() ? spec_verify_us_by_w[w] : 0;
+                }
+                if (other_split && n_rounds > 0) {
+                    const double n = (double) n_rounds;
+                    const double other = (double) (us_round - us_draft - us_verify) / 1000.0 / n;
+                    const double sample = (double) spec_sample_us / 1000.0 / n;
+                    const double pre = (double) spec_pre_us / 1000.0 / n;
+                    SLT_INF(*this, " round other split = (other %.3f ms/round: sampler %.3f, bookkeeping to accounting %.3f, emit+loop+batch %.3f)\n",
+                            other, sample, pre, other - sample - pre);
+                }
             }
             if (spec_restore_rounds > 0) {
                 SLT_INF(*this,
@@ -6614,6 +6639,7 @@ private:
                     return false;
                 };
                 llama_tokens accepted;
+                const int64_t t_sample0 = ggml_time_us();
                 if (slot.spec_smpl_after_verify) {
                     accepted = slot.spec_draft;
                     accepted.push_back(slot.spec_replay_token);
@@ -6630,6 +6656,8 @@ private:
                                     slot.spec_draft, slot.spec_draft_q, false, slot.spec_is_replay, slot.id, slot.stats.n_gen, is_stop));
                 }
 
+                slot.spec_sample_end_us = ggml_time_us();
+                slot.spec_sample_us += (uint64_t) (slot.spec_sample_end_us - t_sample0);
                 GGML_ASSERT(accepted.size() >= 1);
                 if (!slot.spec_is_replay && params_base.speculative.draft.depth_policy == "cdepth") {
                     // CDEPTH history: target top-1 of the committed rows (the re-decode after a restore is not counted twice)
@@ -6750,6 +6778,9 @@ private:
                     slot.spec_committed_by_w[w] += (uint64_t) ids.size();
                     slot.spec_draft_us_by_w[w]  += (uint64_t) slot.spec_draft_us_pending;
                     slot.spec_verify_us_by_w[w] += (uint64_t) t_decode_pass;
+                    if (slot.spec_sample_end_us > 0) {
+                        slot.spec_pre_us += (uint64_t) (t_now - slot.spec_sample_end_us);
+                    }
                 }
                 if (slot.spec_adapt.active()) {
                     slot.spec_adapt.observe((int) verify_width, (int) n_accepted, slot.t_spec_round_last > 0 ? t_now - slot.t_spec_round_last : 0);

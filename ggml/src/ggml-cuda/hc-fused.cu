@@ -27,8 +27,7 @@
 
 static constexpr int HCF_CHUNK      = 512;  // columns per split-K chunk; n_embd must be a multiple
 static constexpr int HCF_DOWN_WARPS = 8;
-static constexpr int HCF_DOWN_ROWS  = 4;    // rows per warp
-static constexpr int HCF_DOWN_RPB   = HCF_DOWN_WARPS*HCF_DOWN_ROWS;
+static constexpr int HCF_DOWN_ROWS_DEF = 4;  // rows per warp (default; LLAMA_HC_DOWN_ROWS=1|2 gives more, smaller CTAs)
 static constexpr int HCF_UP_WARPS   = 16;   // embedding columns per CTA
 static constexpr int HCF_MAX_T      = 8;
 
@@ -76,7 +75,7 @@ static __device__ __forceinline__ float4 hcf_post_val4(const hcf_post_fold & pf,
 // ssq [row block][n_chunks][T]    partial sums of x^2 (only row block 0 when cnt == nullptr)
 // cnt != nullptr: the last CTA to finish a row block (over all chunks) also runs the finish for its 32 rows
 // (same sums in the same order as hcf_down_finish, so the result is bit-identical to the two-kernel path).
-template <int T, bool FOLD>
+template <int T, bool FOLD, int HCF_DOWN_ROWS>
 static __global__ void __launch_bounds__(HCF_DOWN_WARPS*WARP_SIZE)
 hcf_down_partial(
         const float * __restrict__ x, const float * __restrict__ wn,
@@ -100,7 +99,7 @@ hcf_down_partial(
     // each lane covers 4 columns in each of 4 groups of 128 (8-byte loads, a 256-byte span per warp per group);
     // the weight loads go out first so their DRAM latency overlaps the activation staging below
     constexpr int NG = HCF_CHUNK/128;
-    const int k_base = blockIdx.x*HCF_DOWN_RPB + warp*HCF_DOWN_ROWS;
+    const int k_base = blockIdx.x*(HCF_DOWN_WARPS*HCF_DOWN_ROWS) + warp*HCF_DOWN_ROWS;
 
     uint2 w[HCF_DOWN_ROWS][NG];
 #pragma unroll
@@ -248,8 +247,8 @@ hcf_down_partial(
     }
     __syncthreads();
 
-    for (int o = threadIdx.x; o < HCF_DOWN_RPB*T; o += blockDim.x) {
-        const int k = blockIdx.x*HCF_DOWN_RPB + o / T;
+    for (int o = threadIdx.x; o < (HCF_DOWN_WARPS*HCF_DOWN_ROWS)*T; o += blockDim.x) {
+        const int k = blockIdx.x*(HCF_DOWN_WARPS*HCF_DOWN_ROWS) + o / T;
         const int t = o % T;
         if (k >= n_rows) {
             continue;
@@ -366,8 +365,8 @@ static __device__ __forceinline__ void hcf_up_q8_block(const float xi, block_q8_
     y->ds = make_half2(d, d * sum);
 }
 
-template <int T, int Q = 0>
-static __global__ void __launch_bounds__(HCF_UP_WARPS*WARP_SIZE, 2)
+template <int T, int Q = 0, int W = HCF_UP_WARPS>
+static __global__ void __launch_bounds__(W*WARP_SIZE, 32/W)
 hcf_up_gate(
         const float * __restrict__ x, const float * __restrict__ wn,
         const float * __restrict__ act, const float * __restrict__ r,
@@ -378,7 +377,7 @@ hcf_up_gate(
 
     const int warp = threadIdx.x / WARP_SIZE;
     const int lane = threadIdx.x % WARP_SIZE;
-    const int i    = blockIdx.x*HCF_UP_WARPS + warp;
+    const int i    = blockIdx.x*W + warp;
     const bool live = i < n_embd;
 
     constexpr int hc = 4;
@@ -459,10 +458,10 @@ hcf_up_gate(
 
     if constexpr (Q != 0) {
         // every warp is live here (the host requires n_embd % 32 == 0)
-        static_assert(32 % HCF_UP_WARPS == 0, "two or more CTAs per q8 block");
-        constexpr unsigned int n_cta = 32 / HCF_UP_WARPS;
+        static_assert(32 % W == 0, "two or more CTAs per q8 block");
+        constexpr unsigned int n_cta = 32 / W;
         __shared__ unsigned int last_s;
-        const int blk = blockIdx.x*HCF_UP_WARPS / 32;
+        const int blk = blockIdx.x*W / 32;
         __threadfence();
         __syncthreads();
         if (threadIdx.x == 0) {
@@ -476,9 +475,9 @@ hcf_up_gate(
         __syncthreads();
         if (last_s) {
             __threadfence();
-            if (warp < T) {
-                const float xi = __ldcg(dst + (int64_t) warp*n_embd + blk*32 + lane);
-                hcf_up_q8_block<Q == 2>(xi, q8 + (int64_t) warp*(n_embd/QK8_1) + blk, lane);
+            for (int t = warp; t < T; t += W) {
+                const float xi = __ldcg(dst + (int64_t) t*n_embd + blk*32 + lane);
+                hcf_up_q8_block<Q == 2>(xi, q8 + (int64_t) t*(n_embd/QK8_1) + blk, lane);
             }
         }
     }
@@ -552,7 +551,15 @@ static void hcf_down_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, 
     const int R        = (int) wd->ne[1];
     const int n_rows   = R + hc_inj;
     const int n_chunks = hc_dim/HCF_CHUNK;
-    const int n_rb     = (n_rows + HCF_DOWN_RPB - 1)/HCF_DOWN_RPB;
+    // rows per warp: 4 by default; LLAMA_HC_DOWN_ROWS=2|1 launches 2x|4x as many CTAs (the same per-row sums in the
+    // same order, so the result is bit-identical). The counter slots hold 64 row blocks, so a larger count falls back.
+    static const int rows_env = [] {
+        const char * e = getenv("LLAMA_HC_DOWN_ROWS");
+        const int v = e ? atoi(e) : HCF_DOWN_ROWS_DEF;
+        return v == 1 || v == 2 ? v : HCF_DOWN_ROWS_DEF;
+    }();
+    const int rows_pw = (n_rows + HCF_DOWN_WARPS*rows_env - 1)/(HCF_DOWN_WARPS*rows_env) <= HCF_CNT_RB ? rows_env : HCF_DOWN_ROWS_DEF;
+    const int n_rb     = (n_rows + HCF_DOWN_WARPS*rows_pw - 1)/(HCF_DOWN_WARPS*rows_pw);
 
     GGML_ASSERT(((uintptr_t) x->data) % 16 == 0 && ((uintptr_t) wn->data) % 16 == 0);
     GGML_ASSERT(hc == 4);
@@ -577,7 +584,9 @@ static void hcf_down_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, 
         pf.sp1  = hpost->src[2]->nb[1]/sizeof(float);
         GGML_ASSERT(pf.h == x->data);
     }
-    auto kernel = hpost != nullptr ? hcf_down_partial<T, true> : hcf_down_partial<T, false>;
+    auto kernel = hpost != nullptr ?
+        (rows_pw == 1 ? hcf_down_partial<T, true, 1> : rows_pw == 2 ? hcf_down_partial<T, true, 2> : hcf_down_partial<T, true, HCF_DOWN_ROWS_DEF>) :
+        (rows_pw == 1 ? hcf_down_partial<T, false, 1> : rows_pw == 2 ? hcf_down_partial<T, false, 2> : hcf_down_partial<T, false, HCF_DOWN_ROWS_DEF>);
     kernel<<<grid, HCF_DOWN_WARPS*WARP_SIZE, 0, stream>>>(
         (const float *) x->data, (const float *) wn->data,
         (const char *) wd->data, wd->nb[1],
@@ -629,16 +638,26 @@ static void hcf_up_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, vo
     GGML_ASSERT(smem <= 48*1024);
     GGML_UNUSED(hc);
 
-    const dim3 grid((n_embd + HCF_UP_WARPS - 1)/HCF_UP_WARPS);
-    const dim3 block(HCF_UP_WARPS*WARP_SIZE);
+    // embedding columns per CTA: 16 by default; LLAMA_HC_UP_WARPS=8|4 launches 2x|4x as many smaller CTAs (every row
+    // is still one warp with the same sums, so the result is bit-identical)
+    static const int up_w = [] {
+        const char * e = getenv("LLAMA_HC_UP_WARPS");
+        const int v = e ? atoi(e) : HCF_UP_WARPS;
+        return v == 4 || v == 8 ? v : HCF_UP_WARPS;
+    }();
+    const dim3 grid((n_embd + up_w - 1)/up_w);
+    const dim3 block(up_w*WARP_SIZE);
     if (q8 == nullptr) {
-        hcf_up_gate<T><<<grid, block, smem, ctx.stream()>>>(
+        auto kernel = up_w == 4 ? hcf_up_gate<T, 0, 4> : up_w == 8 ? hcf_up_gate<T, 0, 8> : hcf_up_gate<T, 0, HCF_UP_WARPS>;
+        kernel<<<grid, block, smem, ctx.stream()>>>(
             (const float *) x->data, (const float *) wn->data, act, r,
-            (const char *) wu->data, wu->nb[1], n_embd, R, out_scale, (float *) dst->data);
+            (const char *) wu->data, wu->nb[1], n_embd, R, out_scale, (float *) dst->data, nullptr, 0);
     } else {
         const int slot = hcf_up_cnt_slot(ctx);
         GGML_ASSERT(slot >= 0 && n_embd % QK8_1 == 0 && n_embd/QK8_1 <= HCF_UP_CNT);
-        auto kernel = swizzle ? hcf_up_gate<T, 2> : hcf_up_gate<T, 1>;
+        auto kernel = swizzle ?
+            (up_w == 4 ? hcf_up_gate<T, 2, 4> : up_w == 8 ? hcf_up_gate<T, 2, 8> : hcf_up_gate<T, 2, HCF_UP_WARPS>) :
+            (up_w == 4 ? hcf_up_gate<T, 1, 4> : up_w == 8 ? hcf_up_gate<T, 1, 8> : hcf_up_gate<T, 1, HCF_UP_WARPS>);
         kernel<<<grid, block, smem, ctx.stream()>>>(
             (const float *) x->data, (const float *) wn->data, act, r,
             (const char *) wu->data, wu->nb[1], n_embd, R, out_scale, (float *) dst->data, (block_q8_1 *) q8, slot*HCF_UP_CNT);
