@@ -11893,6 +11893,53 @@ struct test_moe_reduce : public test_case {
     }
 };
 
+struct test_moe_bank_joint_reduce : public test_case {
+    const int64_t n_embd, n_tokens;
+    const int mask_mode;
+    const bool extra_reader, strided;
+    test_moe_bank_joint_reduce(int64_t n_embd, int64_t n_tokens, int mask_mode, bool extra_reader = false, bool strided = false) :
+        n_embd(n_embd), n_tokens(n_tokens), mask_mode(mask_mode), extra_reader(extra_reader), strided(strided) {}
+    std::string vars() override { return VARS_TO_STR5(n_embd, n_tokens, mask_mode, extra_reader, strided); }
+    std::string op_desc(ggml_tensor *) override { return "MOE_BANK_JOINT_REDUCE"; }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 1e-6; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * hot = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd + strided, 10, n_tokens);
+        if (strided) {
+            hot = ggml_view_3d(ctx, hot, n_embd, 10, n_tokens, hot->nb[1], hot->nb[2], 0);
+        }
+        ggml_tensor * cold = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, 10, n_tokens);
+        ggml_tensor * wh = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, 10, n_tokens);
+        ggml_tensor * wc = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, 10, n_tokens);
+        ggml_set_name(wh, "joint_hot_weights"); ggml_set_name(wc, "joint_cold_weights");
+        ggml_tensor * hw = ggml_mul(ctx, hot, wh);
+        ggml_tensor * cw = ggml_mul(ctx, cold, wc);
+        ggml_tensor * joined = ggml_add(ctx, hw, cw);
+        ggml_tensor * sum = ggml_sum_rows(ctx, ggml_cont(ctx, ggml_permute(ctx, joined, 1, 0, 2, 3)));
+        ggml_tensor * out = ggml_reshape_2d(ctx, sum, n_embd, n_tokens);
+        if (extra_reader) {
+            ggml_tensor * hs = ggml_sum_rows(ctx, ggml_cont(ctx, ggml_permute(ctx, hw, 1, 0, 2, 3)));
+            out = ggml_add(ctx, out, ggml_reshape_2d(ctx, hs, n_embd, n_tokens));
+        }
+        return out;
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            const bool hot = strcmp(t->name, "joint_hot_weights") == 0;
+            if (hot || strcmp(t->name, "joint_cold_weights") == 0) {
+                std::vector<float> values(10*n_tokens);
+                for (int64_t j = 0; j < 10*n_tokens; ++j) {
+                    const bool in_bank = mask_mode == 1 || (mask_mode == 2 && (j%3) != 0);
+                    values[j] = (mask_mode == 3 || hot == in_bank) ? 0.125f + float(j%7)*0.03125f : 0.0f;
+                }
+                ggml_backend_tensor_set(t, values.data(), 0, values.size()*sizeof(float));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // mul_mat with src1 in [0, 1]: a zero-mean src1 hides errors in the zero point or the min of a quantized src0
 struct test_mul_mat_pos : public test_mul_mat {
     using test_mul_mat::test_mul_mat;
@@ -18801,6 +18848,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // Cover the supported boundaries, common k = 8 shapes, interleaved views and adds, and k = 16 fallback.
+    for (int64_t width : { 1, 3, 4, 5, 8, 9 }) {
+        for (int mask : { 0, 1, 2, 3 }) {
+            test_cases.emplace_back(new test_moe_bank_joint_reduce(63, width, mask));
+            test_cases.emplace_back(new test_moe_bank_joint_reduce(2560, width, mask));
+        }
+    }
+    test_cases.emplace_back(new test_moe_bank_joint_reduce(2560, 4, 2, true));
+    test_cases.emplace_back(new test_moe_bank_joint_reduce(2560, 4, 2, false, true));
     test_cases.emplace_back(new test_moe_reduce(63,  2, 17));
     test_cases.emplace_back(new test_moe_reduce(2048, 8, 128));
     test_cases.emplace_back(new test_moe_reduce(2048, 8, 128, false, true));

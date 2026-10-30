@@ -123,3 +123,40 @@ void ggml_cuda_op_moe_weighted_combine(ggml_backend_cuda_context & ctx,
         (float *) dst->data, (int64_t) (dst->nb[1] / sizeof(float)), n_embd, (int) n_expert_used);
     CUDA_CHECK(cudaGetLastError());
 }
+
+static __global__ void moe_bank_joint_reduction_f32(const float * hot, const float * cold,
+        const float * hot_weights, const float * cold_weights, float * dst, int64_t n_embd, int n_used) {
+    const int64_t col = int64_t(blockIdx.y) * blockDim.x + threadIdx.x;
+    if (col >= n_embd) {
+        return;
+    }
+    const int64_t first = int64_t(blockIdx.x) * n_used;
+    float sum = __fadd_rn(__fmul_rn(hot[first*n_embd + col], hot_weights[first]),
+                         __fmul_rn(cold[first*n_embd + col], cold_weights[first]));
+    for (int e = 1; e < n_used; ++e) {
+        const int64_t row = first + e;
+        const float value = __fadd_rn(__fmul_rn(hot[row*n_embd + col], hot_weights[row]),
+                                     __fmul_rn(cold[row*n_embd + col], cold_weights[row]));
+        sum = __fadd_rn(sum, value);
+    }
+    dst[int64_t(blockIdx.x)*n_embd + col] = sum;
+}
+
+void ggml_cuda_op_moe_bank_joint_reduction(ggml_backend_cuda_context & ctx,
+        const ggml_tensor * hot, const ggml_tensor * cold,
+        const ggml_tensor * hot_weights, const ggml_tensor * cold_weights, ggml_tensor * dst) {
+    GGML_ASSERT(hot->type == GGML_TYPE_F32 && cold->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(hot_weights->type == GGML_TYPE_F32 && cold_weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(hot) && ggml_is_contiguous(cold) && ggml_are_same_shape(hot, cold));
+    GGML_ASSERT(ggml_is_contiguous(hot_weights) && ggml_is_contiguous(cold_weights) && ggml_is_contiguous(dst));
+    GGML_ASSERT(hot->ne[1] >= 1 && hot->ne[1] <= 15 && hot->ne[2] >= 1 && hot->ne[2] <= 8 && hot->ne[3] == 1);
+    GGML_ASSERT(hot_weights->ne[0] == 1 && hot_weights->ne[1] == hot->ne[1] && hot_weights->ne[2] == hot->ne[2] && hot_weights->ne[3] == 1);
+    GGML_ASSERT(ggml_are_same_shape(hot_weights, cold_weights));
+    GGML_ASSERT(dst->ne[0] == hot->ne[0] && dst->ne[1] == hot->ne[2] && dst->ne[2] == 1 && dst->ne[3] == 1);
+    constexpr int threads = 256;
+    const dim3 blocks(hot->ne[2], (hot->ne[0] + threads - 1)/threads, 1);
+    moe_bank_joint_reduction_f32<<<blocks, threads, 0, ctx.stream()>>>(
+        (const float *) hot->data, (const float *) cold->data, (const float *) hot_weights->data,
+        (const float *) cold_weights->data, (float *) dst->data, hot->ne[0], (int) hot->ne[1]);
+    CUDA_CHECK(cudaGetLastError());
+}

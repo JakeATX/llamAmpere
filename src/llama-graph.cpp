@@ -2688,6 +2688,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ggml_tensor * cold_ids = selected_experts;
 
         static const int hot_dbg = getenv("GGML_MOE_HOT_DBG") ? atoi(getenv("GGML_MOE_HOT_DBG")) : 0;
+        static const bool joint_enabled = [] {
+            const char * value = getenv("LLAMA_MOE_BANK_JOINT_REDUCE");
+            return value && atoi(value) != 0;
+        }();
+        const bool joint_reduce = joint_enabled && !b1_routing && hot_skip && hot_dbg == 0 &&
+                n_tokens <= 8 && n_expert_used == hparams.n_expert_used(il);
+        GGML_ASSERT(!moe_defer_reduce);
+        moe_defer_reduce = joint_reduce;
         moe_weights_override = w_hot;
         moe_b1_bypass = b1_routing;
         ggml_tensor * out_hot = hot_dbg == 1 ?
@@ -2710,6 +2718,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 n_expert, n_expert_used, type_op, norm_w, w_scale, gating_op, il,
                 logits, gate_up_exps, gate_up_exps_b, up_exps_s, gate_exps_s, down_exps_s, cold_ids);
         GGML_ASSERT(moe_weights_override == nullptr);
+        moe_defer_reduce = false;
+        if (joint_reduce) {
+            // fork: keep both expert slabs live until one weighted reduction consumes them.
+            ggml_build_forward_expand(gf, out_hot);
+            ggml_build_forward_expand(gf, out_cold);
+            ggml_tensor * hot_weighted = ggml_mul(ctx0, out_hot, w_hot);
+            ggml_tensor * cold_weighted = ggml_mul(ctx0, out_cold, w_cold);
+            ggml_tensor * joined = ggml_add(ctx0, hot_weighted, cold_weighted);
+            ggml_tensor * summed = ggml_sum_rows(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, joined, 1, 0, 2, 3)));
+            ggml_tensor * moe_out = ggml_reshape_2d(ctx0, summed, n_embd, n_tokens);
+            cb(moe_out, "ffn_moe_out", il);
+            return moe_out;
+        }
         if (b1_routing) {
             GGML_ASSERT(out_cold == nullptr);
             return out_hot; // added to the shared expert output that seeds the whole-prompt accumulator
@@ -2905,6 +2926,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (down_exps_b) {
         experts = ggml_add_id(ctx0, experts, down_exps_b, selected_experts);
         cb(experts, "ffn_moe_down_biased", il);
+    }
+
+    if (moe_defer_reduce) {
+        GGML_ASSERT(!weight_before_ffn);
+        return experts;
     }
 
     if (!weight_before_ffn) {
