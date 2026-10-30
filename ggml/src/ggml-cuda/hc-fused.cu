@@ -85,6 +85,92 @@ static __device__ __forceinline__ float hcf_owner_sum(float v, const unsigned ma
     return v;
 }
 
+// Stage each weighted stream once. The row kernel applies its RMS scale after the dot product.
+template <bool FOLD>
+static __global__ void __launch_bounds__(256) hcf_row_owner_stage(
+        const float * __restrict__ x, const float * __restrict__ wn, const int n_embd, const int n_rows,
+        const int n_tokens, const float eps, float * __restrict__ xn, float * __restrict__ dst, const hcf_post_fold pf) {
+    __shared__ float sums[8];
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int s = blockIdx.x, t = blockIdx.y, hc_dim = 4*n_embd;
+    float sq = 0.0f;
+    for (int j = tid*4; j < n_embd; j += 256*4) {
+        const int src = s*n_embd + j;
+        float4 xv;
+        if constexpr (FOLD) {
+            xv = hcf_post_val4(pf, t, s, j, src, hc_dim);
+            *(float4 *) (pf.h + (int64_t) t*hc_dim + src) = xv;
+        } else {
+            xv = *(const float4 *) (x + (int64_t) t*hc_dim + src);
+        }
+        const float4 gv = *(const float4 *) (wn + src);
+        sq += xv.x*xv.x + xv.y*xv.y + xv.z*xv.z + xv.w*xv.w;
+        *(float4 *) (xn + (int64_t) t*hc_dim + src) = make_float4(xv.x*gv.x, xv.y*gv.y, xv.z*gv.z, xv.w*gv.w);
+    }
+    const float v = hcf_owner_sum(sq);
+    if (lane == 0) {
+        sums[warp] = v;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        const float total = hcf_owner_sum(lane < 8 ? sums[lane] : 0.0f);
+        if (lane == 0) {
+            dst[n_rows*n_tokens + 4*t + s] = rsqrtf(total/n_embd + eps);
+        }
+    }
+}
+
+template <int T>
+static __global__ void __launch_bounds__(256) hcf_down_row_owner(
+        const float * __restrict__ xn, const char * __restrict__ wd, const int64_t sd,
+        const char * __restrict__ wi, const int64_t si, const int R, const int n_rows, const int n_embd,
+        const float lo_scale, const float inj_scale, float * __restrict__ dst) {
+    const int lane = threadIdx.x & 31, row = blockIdx.x*8 + (threadIdx.x >> 5);
+    if (row >= n_rows) {
+        return;
+    }
+    const char * wr = row < R ? wd + (int64_t) row*sd : wi + (int64_t) (row - R)*si;
+    const int hc_dim = 4*n_embd;
+    float out[T] = {};
+#pragma unroll
+    for (int s = 0; s < 4; ++s) {
+        float acc[T] = {};
+        for (int j = lane*8; j < n_embd; j += 256) {
+            const uint4 pk = __ldg((const uint4 *) wr + (s*n_embd + j)/8);
+            const uint32_t p[4] = { pk.x, pk.y, pk.z, pk.w };
+#pragma unroll
+            for (int t = 0; t < T; ++t) {
+                const float * src = xn + (int64_t) t*hc_dim + s*n_embd + j;
+                const float4 a = __ldg((const float4 *) src);
+                const float4 b = __ldg((const float4 *) (src + 4));
+                const float v[8] = { a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w };
+                float dot = 0.0f;
+#pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    dot = __fmaf_rn(hcf_bf16_lo(p[k]), v[2*k], dot);
+                    dot = __fmaf_rn(hcf_bf16_hi(p[k]), v[2*k + 1], dot);
+                }
+                acc[t] = __fadd_rn(acc[t], dot);
+            }
+        }
+#pragma unroll
+        for (int t = 0; t < T; ++t) {
+            out[t] += __ldg(dst + n_rows*T + 4*t + s)*hcf_owner_sum(acc[t]);
+        }
+    }
+    if (lane == 0) {
+#pragma unroll
+        for (int t = 0; t < T; ++t) {
+            if (row < R) {
+                const float a = lo_scale*out[t];
+                dst[t*R + row] = a/(1.0f + expf(-a));
+            } else {
+                dst[R*T + t*(n_rows - R) + row - R] = 2.0f/(1.0f + expf(-inj_scale*out[t]));
+            }
+        }
+    }
+}
+
 // Stripes split each 256-column tile. Keep the four stream sums separate
 // until their RMS scales are known. The last stripe finishes its row block with coalesced partial reads.
 template <int T, bool FOLD, bool LOOKAHEAD = false, bool PACK = false, int STRIPES = 4, bool STREAM_STAGE = false>
@@ -872,6 +958,32 @@ static void hcf_down_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, 
         pf.sp0  = hpost->src[2]->nb[0]/sizeof(float);
         pf.sp1  = hpost->src[2]->nb[1]/sizeof(float);
         GGML_ASSERT(pf.h == x->data);
+    }
+    static const bool row_owner = [] {
+        const char * e = getenv("LLAMA_HC_DOWN_ROW_OWNER");
+        return e && atoi(e) == 1;
+    }();
+    if (row_owner && slot >= 0 && n_embd % 256 == 0) {
+        ggml_cuda_pool_alloc<float> xn(ctx.pool(), (size_t) T*hc_dim);
+        auto stage = [&](auto fold) {
+            constexpr bool F = decltype(fold)::value;
+            static const bool reported = [=] {
+                fprintf(stderr, "[hc-down-row-owner] T=%d rows=%d embd=%d folded=%d\n", T, n_rows, n_embd, F);
+                return true;
+            }();
+            GGML_UNUSED(reported);
+            hcf_row_owner_stage<F><<<dim3(4, T), 256, 0, stream>>>((const float *) x->data, (const float *) wn->data,
+                    n_embd, n_rows, T, eps, xn.get(), (float *) dst->data, pf);
+        };
+        if (hpost != nullptr) {
+            stage(std::true_type{});
+        } else {
+            stage(std::false_type{});
+        }
+        hcf_down_row_owner<T><<<(n_rows + 7)/8, 256, 0, stream>>>(xn.get(),
+                (const char *) wd->data, wd->nb[1], wi ? (const char *) wi->data : nullptr, wi ? wi->nb[1] : 0,
+                R, n_rows, n_embd, lo_scale, inj_scale, (float *) dst->data);
+        return;
     }
     static const bool owner = [] {
         const char * e = getenv("LLAMA_HC_DOWN_OWNER");

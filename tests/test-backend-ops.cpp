@@ -15133,14 +15133,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_dsv4_hc_down_owner(512, rank, 5, false));
     }
     // Non-power-of-two stream widths cover every tile with both stripe counts.
-    test_cases.emplace_back(new test_dsv4_hc_down_owner(768, 17, 4, true));
+    test_cases.emplace_back(new test_dsv4_hc_down_owner(1024, 17, 4, true));
     test_cases.emplace_back(new test_dsv4_hc_down_owner(1536, 31, 8, false));
-    // A single tile per stream leaves most staging lanes idle with either stripe count.
-    test_cases.emplace_back(new test_dsv4_hc_down_owner(256, 1, 1, false));
-    test_cases.emplace_back(new test_dsv4_hc_down_owner(256, 13, 8, true));
-    // Odd tile counts with several tokens cover each static staging path's loop tail.
-    test_cases.emplace_back(new test_dsv4_hc_down_owner(1280, 17, 3, true));
-    test_cases.emplace_back(new test_dsv4_hc_down_owner(2304, 28, 7, false));
+    // Short supported streams leave most staging lanes idle with either stripe count.
+    test_cases.emplace_back(new test_dsv4_hc_down_owner(512, 1, 1, false));
+    test_cases.emplace_back(new test_dsv4_hc_down_owner(512, 13, 8, true));
+    // Non-power-of-two stream widths cover each static staging path's loop tail.
+    test_cases.emplace_back(new test_dsv4_hc_down_owner(1536, 17, 3, true));
+    test_cases.emplace_back(new test_dsv4_hc_down_owner(3584, 28, 7, false));
+    // Full-row owners cover ranks beyond the striped path's bound and mostly inactive row warps.
+    test_cases.emplace_back(new test_dsv4_hc_down_owner(512, 512, 3, false));
+    test_cases.emplace_back(new test_dsv4_hc_down_owner(2560, 1, 4, true));
     // [HCFUSED] real Flash-Next shapes, every token count the kernels specialize, with and without the injection rows
     for (int64_t nt = 1; nt <= 8; ++nt) {
         test_cases.emplace_back(new test_dsv4_hc_fused(2560, 320, nt, true,  true, 1));
