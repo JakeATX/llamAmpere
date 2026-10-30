@@ -562,6 +562,8 @@ static __global__ void k_ait_mmv_sum(const float * partial, float * Y, int M, in
         const int64_t start = (int64_t) first * items;
         int lo = (int) (start / warps);
         int64_t carry = start - (int64_t) lo * warps;
+        const int64_t partial_stride = (int64_t) NT * M;
+        int64_t partial_offset = (int64_t) token * M + row;
         for (int w = first; w < last; ++w) {
             carry += tail;
             const int hi = lo + step + (carry >= warps);
@@ -569,8 +571,9 @@ static __global__ void k_ait_mmv_sum(const float * partial, float * Y, int M, in
                 carry -= warps;
             }
             if (lo < hi && lo < end && hi > begin) {
-                sum += partial[(int64_t) (w - first) * NT * M + token * M + row];
+                sum += partial[partial_offset];
             }
+            partial_offset += partial_stride;
             lo = hi;
         }
     } else {
