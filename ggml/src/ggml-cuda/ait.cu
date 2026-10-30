@@ -4,7 +4,7 @@
 // order, so KL measured on it is the KL of the format. N <= 8 tokens take the tile-chain IMMA kernel (k_ait_mmv) unless
 // GGML_CUDA_AIT_ORDERED=0 restores the legacy unordered sum for comparison; GGML_CUDA_AIT_FUSE=1 (opt-in, default 0) sums the ordered slots inside the main kernel instead of a second kernel.
 // GGML_CUDA_AIT_SUM_CURSOR=1 advances ordered-sum bounds without per-partial division (default off; second sum kernel only).
-// GGML_CUDA_AIT_CTA=1 (opt-in, default 0): the CTA adds its warps' tile sums in fixed order in shared memory and issues at most two atomics per output, so no slot buffer and no second kernel (shapes that do not qualify keep the ordered slots).
+// GGML_CUDA_AIT_CTA=1 (opt-in, default 0; 2 = same sum, one warp per tile and token in the epilogue; 3 = timing diagnostic that skips the sum, wrong output): the CTA adds its warps' tile sums in fixed order in shared memory and issues at most two atomics per output, so no slot buffer and no second kernel (shapes that do not qualify keep the ordered slots).
 // GGML_CUDA_AIT_REF=1; GGML_CUDA_AIT_WARPS = warps per block of it (default 12),
 // GGML_CUDA_AIT_FULL = 1 (default): fully unrolled chunk loop, 0 = rolled 4 x 4 groups (Gate 2 10-23: unrolled 8-13% faster at N=1, every rate). GGML_CUDA_AIT_EXACT=1: f32 activations (no int8 round trip; the
 // A/B for the activation quantizer). GGML_CUDA_AIT_ASLICE = 512 (default) or 256: activation scale slice.
@@ -703,6 +703,29 @@ static __global__ void __launch_bounds__(CAP ? 256 : LOW || BOUNDS ? 384 : 512, 
         const int w0 = blockIdx.x * nw;
         const int c0 = (int) ((int64_t) w0 * items / W_), c1 = (int) ((int64_t) (w0 + nw) * items / W_);
         const int ta = c0 / S, ntl = (c1 - 1) / S - ta + 1;
+        if (det == 2) {
+            // one warp per (tile, token): lane = output row; a ballot over the warps' tile ranges names the contributing warps, added in ascending order (same bits as det 1)
+            const int ws = lane < nw ? dti[2 * lane] : 0, wc = lane < nw ? dti[2 * lane + 1] : 0;
+            for (int pr = threadIdx.x >> 5; pr < ntl * NT; pr += nw) {
+                const int tile = ta + pr / NT, n = pr % NT;
+                unsigned int m = __ballot_sync(0xffffffffu, lane < nw && tile >= ws && tile < ws + wc);
+                float sum = 0.0f;
+                while (m != 0) {
+                    const int wl = __ffs(m) - 1;
+                    m &= m - 1;
+                    sum += dfs[((wl * 2 + (tile - dti[2 * wl])) * NT + n) * 33 + lane];
+                }
+                atomicAdd(Y + (int64_t) n * M + tile * 32 + lane, sum);
+            }
+            return;
+        }
+        if (det == 3) {
+            // TIMING DIAGNOSTIC ONLY (wrong output): barrier and one atomic per output, no cross-warp sum
+            for (int e = threadIdx.x; e < ntl * NT * 32; e += blockDim.x) {
+                atomicAdd(Y + (int64_t) ((e / 32) % NT) * M + (ta + e / (NT * 32)) * 32 + (e & 31), 0.0f);
+            }
+            return;
+        }
         for (int e = threadIdx.x; e < ntl * NT * 32; e += blockDim.x) {
             const int tile = ta + e / (NT * 32), n = (e / 32) % NT, row = e & 31;
             float sum = 0.0f;
@@ -972,7 +995,8 @@ static void ait_fast_nt(ggml_backend_cuda_context & ctx, const uint8_t * W, cons
         return p3 == 1 || p3 == 2;
     }();
     const bool fuse = ordered && fuse_opt && !use_v && !ait_kernel_exp;
-    static const bool cta_opt = ait_env_int("GGML_CUDA_AIT_CTA", 0) != 0;
+    static const int cta_mode = ait_env_int("GGML_CUDA_AIT_CTA", 0);
+    static const bool cta_opt = cta_mode != 0;
     const bool cta = ordered && cta_opt && !fuse && !use_v && occ == 0 && code == 0 && full && !ait_kernel_exp && ait_cta_ok(M, K, nsm, warps);
     const size_t cta_smem = cta ? (size_t) warps * 2 * (NT * 33 + 2) * sizeof(float) : 0;
     if (cta_opt) {
@@ -1148,9 +1172,9 @@ static void ait_fast_nt(ggml_backend_cuda_context & ctx, const uint8_t * W, cons
         }
     } else if (full) {
         switch (k) {
-            case 2:  k_ait_mmv<2, NT, true><<<grid, block, cta_smem, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial, tcnt, cta); break;
-            case 3:  k_ait_mmv<3, NT, true><<<grid, block, cta_smem, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial, tcnt, cta); break;
-            default: k_ait_mmv<4, NT, true><<<grid, block, cta_smem, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial, tcnt, cta); break;
+            case 2:  k_ait_mmv<2, NT, true><<<grid, block, cta_smem, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial, tcnt, cta ? cta_mode : 0); break;
+            case 3:  k_ait_mmv<3, NT, true><<<grid, block, cta_smem, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial, tcnt, cta ? cta_mode : 0); break;
+            default: k_ait_mmv<4, NT, true><<<grid, block, cta_smem, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial, tcnt, cta ? cta_mode : 0); break;
         }
     } else {
         switch (k) {
