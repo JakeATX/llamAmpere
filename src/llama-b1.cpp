@@ -391,6 +391,8 @@ std::vector<ggml_backend_buffer_ptr> llama_b1::spare_views(size_t min_bytes, siz
 
 void llama_b1::release_plan() {
     GGML_ASSERT(workers.empty() && !coord.joinable());
+    // fork: retain pageable weights across plans unless release is explicitly enabled.
+    const bool release_kept = b1_env_int("LLAMA_B1_RELEASE_BANK_RAM", 0) != 0;
     size_t kept_bytes = 0;
     size_t freed_bytes = 0;
     for (size_t ti = 0; ti < exps.size(); ++ti) {
@@ -399,14 +401,14 @@ void llama_b1::release_plan() {
             continue;
         }
         GGML_ASSERT(ti < dirty_flag.size());
-        if (!dirty_flag[ti]) {
+        if (release_kept && !dirty_flag[ti]) {
             // fork: joined workers no longer read this pageable copy; VRAM holds the weights.
             freed_bytes += kept.size();
             std::vector<char>().swap(kept);
         }
         kept_bytes += kept.size();
     }
-    LLAMA_LOG_INFO("%s: [B1] bank RAM: released %zu bytes, retained %zu bytes for lent homes\n", __func__, freed_bytes, kept_bytes);
+    LLAMA_LOG_INFO("%s: [B1] bank RAM: released %zu bytes, retained %zu bytes\n", __func__, freed_bytes, kept_bytes);
     reserve_layer_restore();
     ffn_release();
     if (fresh_buf) {
@@ -740,7 +742,7 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
         }
     }
 
-    // fork: keep lent weights until refill; never lend our only live copy to scratch.
+    // fork: keep lent weights across plans; never lend our only live copy to scratch.
     if (b1_env_int("LLAMA_B1_KEEP_BANK_RAM", 1)) {
         size_t kept_bytes = 0;
         for (int il : lent_sel) {
