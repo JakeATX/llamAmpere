@@ -785,6 +785,7 @@ static void ait_fast_nt(ggml_backend_cuda_context & ctx, const uint8_t * W, cons
     float * partial = ordered ? scratch.get() : nullptr;
     auto finish = [&]() {
         if (ordered) {
+            CUDA_CHECK(cudaGetLastError());
             if (sum_cursor) {
                 const int items = (M / 32) * S;
                 k_ait_mmv_sum<NT, true><<<M / 32, 32 * NT, 0, stream>>>(partial, Y, M, S, total_warps, items / total_warps, (uint32_t) (items % total_warps));

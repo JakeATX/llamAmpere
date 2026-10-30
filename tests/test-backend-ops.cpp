@@ -20090,21 +20090,44 @@ static int run_ait_check(const char * dir) {
     ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
     if (!dev) { fprintf(stderr, "ait: no GPU backend\n"); return 1; }
     ggml_backend_t be = ggml_backend_dev_init(dev, nullptr);
-    const int64_t M = 1024, K = 2048;
+    const char * shape = getenv("GGML_TEST_AIT_SHAPE");
+    if (shape && strcmp(shape, "up") != 0 && strcmp(shape, "down") != 0) {
+        fprintf(stderr, "ait: expected shape up or down\n");
+        return 1;
+    }
+    const int64_t M0 = 1024, K0 = 2048;
+    const int64_t M = !shape ? M0 : strcmp(shape, "up") == 0 ? 17408 : 5120;
+    const int64_t K = !shape ? K0 : strcmp(shape, "up") == 0 ? 5120 : 17408;
+    const char * shape_type = getenv("GGML_TEST_AIT_SHAPE_TYPE");
+    if (shape_type && (!shape || (strcmp(shape_type, "ait3") != 0 && strcmp(shape_type, "ait4") != 0))) {
+        fprintf(stderr, "ait: shape type requires up/down and ait3 or ait4\n");
+        return 1;
+    }
+    const int shape_vi = shape_type && strcmp(shape_type, "ait4") == 0 ? 2 : 1;
     int fails = 0;
     std::mt19937 rng(1234);
     std::uniform_real_distribution<float> ux(-1.0f, 1.0f);
     // variants: ait2, ait3, ait4 (1MAD), ait2p (pair table, k = 2 bytes)
-    for (int vi = 0; vi < 4; ++vi) {
+    for (int vi = shape ? shape_vi : 0; vi < (shape ? shape_vi + 1 : 4); ++vi) {
         const int k = vi < 3 ? vi + 2 : 2, code = vi < 3 ? 0 : 1;
         const ggml_type ty = code == 1 ? GGML_TYPE_AIT2P : (ggml_type) (GGML_TYPE_AIT2 + (k - 2));
         const std::string nm = std::string(ggml_type_name(ty));
         const std::string pb = std::string(dir) + "/" + nm;
         std::ifstream fb(pb + ".bin", std::ios::binary), fw(pb + ".w", std::ios::binary);
-        std::vector<uint8_t> buf((size_t) (M / 32) * (K / 512) * AIT_CHUNK_BYTES(k));
-        std::vector<float> wref((size_t) (M * K));
-        if (!fb.read((char *) buf.data(), buf.size()) || !fw.read((char *) wref.data(), wref.size() * 4)) {
+        const size_t cb = AIT_CHUNK_BYTES(k);
+        std::vector<uint8_t> packed((size_t) (M0 / 32) * (K0 / 512) * cb);
+        std::vector<uint8_t> buf((size_t) (M / 32) * (K / 512) * cb);
+        std::vector<float> wref((size_t) (M0 * K0));
+        if (!fb.read((char *) packed.data(), packed.size()) || !fw.read((char *) wref.data(), wref.size() * 4)) {
             fprintf(stderr, "%s: cannot read %s.{bin,w}\n", nm.c_str(), pb.c_str()); return 1;
+        }
+        // Repeat whole chunks, including paired row scales; K0/512 and both target slice counts are even.
+        for (int64_t rt = 0; rt < M / 32; ++rt) {
+            for (int64_t ks = 0; ks < K / 512; ++ks) {
+                const size_t src = ((rt % (M0 / 32)) * (K0 / 512) + ks % (K0 / 512)) * cb;
+                const size_t dst = (rt * (K / 512) + ks) * cb;
+                memcpy(buf.data() + dst, packed.data() + src, cb);
+            }
         }
         // (1) host decode vs Python
         double maxrel = 0.0;
@@ -20113,7 +20136,7 @@ static int run_ait_check(const char * dir) {
         for (int64_t m = 0; m < M; ++m) {
             for (int64_t c = 0; c < K; ++c) {
                 const float w = ait_weight_rot_c(buf.data(), K, k, code, m, c);
-                const double r = wref[m * K + c];
+                const double r = wref[(m % M0) * K0 + c % K0];
                 maxrel = std::max(maxrel, std::fabs(w - r) / std::max(1e-30, std::fabs(r)));
                 wl[m * K + c] = (double) ait_weight_level_c(buf.data(), K, k, code, m, c) * ait_row_scale(buf.data(), K, k, m, c) / 64.0;
             }
@@ -20123,6 +20146,9 @@ static int run_ait_check(const char * dir) {
         printf("%s decode host vs python: max rel %.3g %s\n", nm.c_str(), maxrel, dec_ok ? "OK" : "FAIL");
         // (2) GPU mul_mat vs host reference
         for (int64_t N : {1, 2, 3, 4, 5, 6, 7, 8, 33, 512}) {
+            if (shape && N > 8) {
+                continue;
+            }
             ggml_init_params ip = { 4 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
             ggml_context * ctx = ggml_init(ip);
             ggml_tensor * a = ggml_new_tensor_2d(ctx, ty, K, M);
