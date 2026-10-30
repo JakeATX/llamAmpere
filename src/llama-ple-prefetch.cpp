@@ -462,7 +462,8 @@ double llama_ple_prefetch::resident_fraction(const std::vector<uint64_t> & keys,
 #if defined(__linux__)
     // keys are file pages in pread/advise mode: the mapping keeps the file's offset within a page
     const uintptr_t to_virt = use_pread ? (uintptr_t) ple->data - (uintptr_t) base : 0;
-    const size_t step = std::max<size_t>(1, keys.size()/256);
+    // fork: round up so a partial sample group cannot exceed the 256-probe budget.
+    const size_t step = std::max<size_t>(1, keys.size()/256 + (keys.size() % 256 != 0));
     size_t n = 0, in = 0;
     for (size_t j = 0; j < keys.size(); j += step) {
         unsigned char v = 0;
