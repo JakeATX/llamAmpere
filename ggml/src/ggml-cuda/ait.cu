@@ -571,9 +571,7 @@ static __global__ void k_ait_mmv_sum(const float * partial, float * Y, int M, in
             carry += tail;
             const bool wrap = carry >= warp_count;
             hi += step + wrap;
-            if (wrap) {
-                carry -= warp_count;
-            }
+            carry -= wrap ? warp_count : 0;
             // The range is nonempty iff step > 0 or the remainder wraps.
             if ((nonempty_step || wrap) && hi > begin) {
                 sum += partial[partial_offset];
