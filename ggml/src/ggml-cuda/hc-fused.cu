@@ -1009,6 +1009,11 @@ static void hcf_down_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, 
         } else {
             rows(std::false_type{});
         }
+        static const bool dump_test = getenv("GGML_TEST_HCF_DOWN_DUMP") != nullptr;
+        if (dump_test) {
+            fprintf(stderr, "[hc-down-row-case] embd=%d rank=%d T=%d inj=%d folded=%d warps=%d lookahead=%d\n",
+                    n_embd, R, T, hc_inj != 0, hpost != nullptr, row_warps, row_lookahead);
+        }
         return;
     }
     static const bool owner = [] {

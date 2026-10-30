@@ -5382,7 +5382,9 @@ struct test_dsv4_hc_down_owner : public test_dsv4_hc_fused {
                 return INFINITY;
             }
             const double tol = i < n - 4*n_tokens ? 1e-5 : 2e-6*std::abs(double(b[i]));
-            worst = std::max(worst, std::abs(double(a[i]) - b[i])/tol);
+            const double diff = std::abs(double(a[i]) - b[i]);
+            const double scaled = tol > 0.0 ? diff/tol : (diff == 0.0 ? 0.0 : INFINITY);
+            worst = std::max(worst, scaled);
         }
         const char * dir = getenv("GGML_TEST_HCF_DOWN_DUMP");
         if (dir != nullptr) {
