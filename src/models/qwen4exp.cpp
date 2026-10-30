@@ -2449,7 +2449,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
         ggml_tensor *        x,
         int64_t              state_cols,
         int64_t              channels,
-        int                  il) {
+        int                  il,
+        bool                 chan_major) {
     const auto * mctx_cur = inp->mctx;
 
     const auto kv_head = mctx_cur->get_head();
@@ -2480,7 +2481,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
     ggml_tensor * state = ggml_reshape_3d(ctx0, rows, state_cols, channels, n_seqs);
     cb(state, "conv_state_at", il);
 
-    ggml_tensor * conv_input = ggml_concat(ctx0, state, ggml_transpose(ctx0, x), 0);
+    // chan_major: x is [channels, T, n_seqs] and the result stays channel-major ([channels, state_cols + T, n_seqs]),
+    // so only the small history is transposed instead of every new column; the cache rows keep their layout
+    ggml_tensor * conv_input = chan_major
+        ? ggml_concat(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, state, 1, 0, 2, 3)), x, 1)
+        : ggml_concat(ctx0, state, ggml_transpose(ctx0, x), 0);
 
     // [TAG_RECURRENT_ROLLBACK_SPLITS] keep the last state_cols columns once per rollback slot,
     // slot s ending s tokens earlier so a rollback of s tokens reads a history that never saw them
@@ -2502,9 +2507,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
     }
 
     for (int64_t slot = 0; slot < n_written; ++slot) {
-        const int64_t s_idx = conv_input->ne[0] - state_cols - slot; // = n_seq_tokens - slot >= 1
+        const int64_t s_idx = conv_input->ne[chan_major ? 1 : 0] - state_cols - slot; // = n_seq_tokens - slot >= 1
 
-        ggml_tensor * tail = ggml_view_3d(ctx0, conv_input,
+        ggml_tensor * tail = chan_major
+            ? ggml_permute(ctx0, ggml_view_3d(ctx0, conv_input,
+                    channels, state_cols, n_seqs,
+                    conv_input->nb[1], conv_input->nb[2],
+                    s_idx * conv_input->nb[1]), 1, 0, 2, 3)
+            : ggml_view_3d(ctx0, conv_input,
                 state_cols, channels, n_seqs,
                 conv_input->nb[1], conv_input->nb[2],
                 ggml_row_size(conv_input->type, s_idx));
@@ -2605,17 +2615,28 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
     const int64_t n_seqs       = ubatch.n_seqs;
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
 
-    // [hist + n_seq_tokens, hc_dim, n_seqs], tokens on ne[0]
+    // LLAMA_PLE_CONV_CM=1 (opt-in): keep the padded input channel-major, [hc_dim, hist + n_seq_tokens, n_seqs], so
+    // each tap is a plain column-offset view instead of a transposed copy of the whole ubatch (4 per ubatch, the
+    // first ~13 ms at 12,288 tokens). Same products in the same order, so the same bits.
+    static const bool conv_cm = [] {
+        const char * e = getenv("LLAMA_PLE_CONV_CM");
+        return e != nullptr && atoi(e) != 0;
+    }();
+
+    // default: [hist + n_seq_tokens, hc_dim, n_seqs], tokens on ne[0]
     ggml_tensor * padded = build_conv_state_at(inp, inp->mctx->get_p_l(il),
             ggml_reshape_3d(ctx0, normalized, hc_dim, n_seq_tokens, n_seqs),
-            hist, hc_dim, il);
+            hist, hc_dim, il, conv_cm);
 
     ggml_tensor * conv_out = nullptr;
     for (int64_t k = 0; k < kern; ++k) {
         // tap k reads (kern-1-k)*dilation positions back
         const int64_t start = hist - (kern - 1 - k) * dil;
 
-        ggml_tensor * shifted = ggml_cont(ctx0,
+        ggml_tensor * shifted = conv_cm
+            ? ggml_view_3d(ctx0, padded, hc_dim, n_seq_tokens, n_seqs,
+                    padded->nb[1], padded->nb[2], start * padded->nb[1])
+            : ggml_cont(ctx0,
                 ggml_transpose(ctx0,
                         ggml_view_3d(ctx0, padded, n_seq_tokens, hc_dim, n_seqs,
                                 padded->nb[1], padded->nb[2],
