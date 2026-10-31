@@ -187,6 +187,88 @@ static void test_ngram_ram_load_fit() {
     fs::remove_all(dir);
 }
 
+static void test_ngram_checkpoint_load_quotas() {
+    namespace fs = std::filesystem;
+    const auto dir = fs::temp_directory_path() / ("test-ngram-checkpoint-fit-" + std::to_string(ggml_time_us()));
+    const bool created = fs::create_directory(dir);
+    expect(created, "create private lookup checkpoint quota test directory");
+    if (!created) {
+        return;
+    }
+    common_params_speculative_ngram_cache params;
+    params.lookup_cache_dynamic = (dir / "dynamic").string();
+    common_fit_ngram_cache_load_limits(5ull * 1024 * 1024 * 1024 + (64ull << 20), true, params);
+    const uint64_t max_entries = params.load_max_entries_dynamic;
+    expect(max_entries > 0 && max_entries < 4096, "checkpoint regression uses real bounded RAM plan");
+    if (max_entries == 0 || max_entries >= 4096) {
+        fs::remove_all(dir);
+        return;
+    }
+    common_ngram_cache live;
+    for (llama_token token = 0; uint64_t(token) < max_entries; ++token) {
+        live[common_ngram(&token, 1)] = {{1, 1}};
+    }
+    const common_ngram_cache_vocab_id vocab = {100000, 123};
+    std::string err;
+    expect(common_ngram_cache_save_file(live, params.lookup_cache_dynamic, vocab, err), "seed exact-quota checkpoint");
+    const llama_token token = llama_token(max_entries);
+    const common_ngram hot(&token, 1);
+    common_ngram_cache delta = {{hot, {{1, 10}}}};
+    common_ngram_cache_merge(live, delta);
+    bool from_disk = false;
+    expect(common_ngram_cache_sync_file(params.lookup_cache_dynamic, live, delta, 1000000, vocab, err, &from_disk,
+            max_entries, params.load_max_continuations_dynamic) && from_disk && delta.empty() &&
+            live.size() == max_entries && live.count(hot) && live.at(hot).at(1) == 10,
+            "first checkpoint keeps high-utility learning within automatic load quota");
+    common_ngram_cache loaded;
+    expect(common_ngram_cache_load_file(params.lookup_cache_dynamic, loaded, vocab, err,
+            max_entries, params.load_max_continuations_dynamic) == COMMON_NGRAM_CACHE_LOAD_OK && loaded == live,
+            "first checkpoint is reloadable under the same RAM plan");
+    delta = {{hot, {{1, 1}}}};
+    common_ngram_cache_merge(live, delta);
+    expect(common_ngram_cache_sync_file(params.lookup_cache_dynamic, live, delta, 1000000, vocab, err, &from_disk,
+            max_entries, params.load_max_continuations_dynamic) && from_disk && delta.empty() &&
+            live.count(hot) && live.at(hot).at(1) == 11,
+            "second checkpoint still saves new learning instead of failing LOAD_LIMIT");
+
+    // Unlimited controls reproduce the old oversized output, then the bounded reader refuses it.
+    delta = {{common_ngram(&token, 1), {{2, 3}, {3, 3}, {4, 3}}}};
+    common_ngram_cache_merge(live, delta);
+    expect(common_ngram_cache_sync_file(params.lookup_cache_dynamic, live, delta, 0, vocab, err),
+            "explicit unlimited checkpoint preserves prior behavior");
+    expect(common_ngram_cache_load_file(params.lookup_cache_dynamic, loaded, vocab, err, max_entries, max_entries) ==
+            COMMON_NGRAM_CACHE_LOAD_LIMIT, "unlimited output is a positive control for continuation overflow");
+    fs::remove(params.lookup_cache_dynamic);
+    const llama_token other_token = 0;
+    const common_ngram other(&other_token, 1);
+    live = {{hot, {{1, 2}, {2, 2}}}, {other, {{1, 1}}}};
+    expect(common_ngram_cache_save_file(live, params.lookup_cache_dynamic, vocab, err), "seed exact continuation quota");
+    delta = {{hot, {{3, 1}}}};
+    common_ngram_cache_merge(live, delta);
+    expect(common_ngram_cache_sync_file(params.lookup_cache_dynamic, live, delta, 0, vocab, err, &from_disk, 2, 3) &&
+            from_disk && delta.empty(), "checkpoint bounds continuations after merging new successors");
+    expect(common_ngram_cache_load_file(params.lookup_cache_dynamic, loaded, vocab, err, 2, 3) == COMMON_NGRAM_CACHE_LOAD_OK &&
+            loaded == live && !loaded.empty(), "continuation-limited checkpoint reloads with retained learning");
+    if (!live.empty()) {
+        delta = {{live.begin()->first, {{1, 1}}}};
+        common_ngram_cache_merge(live, delta);
+        expect(common_ngram_cache_sync_file(params.lookup_cache_dynamic, live, delta, 0, vocab, err, &from_disk, 2, 3) &&
+                from_disk && delta.empty(), "second continuation-limited checkpoint accepts an existing successor");
+        expect(common_ngram_cache_load_file(params.lookup_cache_dynamic, loaded, vocab, err, 2, 3) == COMMON_NGRAM_CACHE_LOAD_OK &&
+                loaded == live, "second continuation-limited output also reloads");
+    }
+    fs::remove(params.lookup_cache_dynamic);
+    live = {{hot, {{1, 1}}}};
+    delta = live;
+    expect(common_ngram_cache_sync_file(params.lookup_cache_dynamic, live, delta, 0, vocab, err, nullptr, 0, 0) &&
+            live.empty() && delta.empty(), "zero automatic quotas publish an empty cache instead of unlimited entries");
+    live = {{hot, {{1, 1}}}};
+    delta = live;
+    expect(common_ngram_cache_sync_file(params.lookup_cache_dynamic, live, delta, 0, vocab, err, &from_disk, 0, 0) &&
+            from_disk && live.empty() && delta.empty(), "zero-quota output stays reloadable at the next checkpoint");
+    fs::remove_all(dir);
+}
+
 static void test_ngram_stream_save() {
     namespace fs = std::filesystem;
     const auto dir = fs::temp_directory_path() / ("test-ngram-stream-fit-" + std::to_string(ggml_time_us()));
@@ -689,6 +771,7 @@ static void test_ram_prompt_fit() {
 
 int main() {
     test_ngram_ram_load_fit();
+    test_ngram_checkpoint_load_quotas();
     test_ngram_stream_save();
     test_ngram_load_limits();
     test_ngram_live_limit();

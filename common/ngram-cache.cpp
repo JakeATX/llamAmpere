@@ -892,6 +892,25 @@ bool common_ngram_cache_sync_file(
 
     common_ngram_cache_prune(merged, n_max);
 
+    // A checkpoint must fit the same quotas used to read it next time.
+    if (max_entries == 0) {
+        merged.clear();
+    } else if (uint64_t(merged.size()) > max_entries) {
+        common_ngram_cache_prune(merged, size_t(max_entries));
+    }
+    if (max_continuations != UINT64_MAX) {
+        uint64_t remaining = max_continuations;
+        for (auto it = merged.begin(); it != merged.end();) {
+            const uint64_t count = it->second.size();
+            if (count > remaining) {
+                it = merged.erase(it);
+            } else {
+                remaining -= count;
+                ++it;
+            }
+        }
+    }
+
     if (!common_ngram_cache_save_file(merged, filename, vocab_id, err)) {
         return false;
     }
