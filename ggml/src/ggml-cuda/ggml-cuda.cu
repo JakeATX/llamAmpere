@@ -7203,6 +7203,16 @@ static bool ggml_cuda_match_moe_weighted_reduction(
     return true;
 }
 
+// A banked down projection (MUL_MAT_ID at i, output i + 3) whose routed sum follows at i + 4 can write that sum
+// itself (nodes i + 4 .. i + 8), the reduction kernel's arithmetic unchanged.
+static bool ggml_cuda_match_moe_bank_down_reduce(const ggml_cgraph * graph, int i,
+        ggml_cuda_moe_weighted_reduction_match & match) {
+    return ggml_cuda_moe_mixed_reduce_enabled() && i + 8 < graph->n_nodes &&
+            ggml_cuda_match_moe_bank_mixed(graph, i) && ggml_cuda_match_moe_weighted_reduction(graph, i + 4, match) &&
+            match.bank_ids && match.node_count == 5 && match.experts == graph->nodes[i + 3] &&
+            match.dst == graph->nodes[i + 8];
+}
+
 
 static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
                                int                                       node_idx,
@@ -9487,16 +9497,33 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 !ggml_cuda_ai4_id_needs_sync(ggml_cuda_info().devices[cuda_ctx->device].cc, node->src[0]->type) &&
                 ggml_cuda_check_fusion_memory_ranges(cgraph, i, 4, &output, 1)) {
             ggml_tensor * base = cgraph->nodes[i + 1], * dst = cgraph->nodes[output];
-            if (ggml_cuda_moe_cache_mixed_compute(*cuda_ctx, node, base, dst)) {
+            // set_output(RESHAPE) also exposes its SUM_ROWS storage; the fused write produces both aliases.
+            const int red_outputs[] = { output, i + 7, i + 8 };
+            ggml_cuda_moe_weighted_reduction_match rm;
+            ggml_cuda_moe_mixed_reduce red_args;
+            const ggml_cuda_moe_mixed_reduce * red = nullptr;
+            if (ggml_cuda_match_moe_bank_down_reduce(cgraph, i, rm) &&
+                    ggml_cuda_check_fusion_memory_ranges(cgraph, i, 9, red_outputs, 3)) {
+                red_args = { rm.weights, rm.bank_ids, rm.dst };
+                red = ggml_cuda_moe_mixed_reduce_supported(dst, red_args) ? &red_args : nullptr;
+            }
+            const auto fused = [&]() {
                 cuda_ctx->fusion_stats.moe_bank_mixed++;
-                return 3;
+                if (red) {
+                    cuda_ctx->fusion_stats.moe_bank_mixed_reduce++;
+                    cuda_ctx->fusion_stats.moe_bank_down_reduce++;
+                }
+                return red ? 8 : 3;
+            };
+            if (ggml_cuda_moe_cache_mixed_compute(*cuda_ctx, node, base, dst, nullptr, nullptr, red)) {
+                return fused();
             }
             // Direct weights must retain native MMQ arithmetic above the MMVQ batch limit.
             if (ggml_backend_buffer_is_cuda(base->src[0]->buffer) &&
                     base->ne[2] <= get_mmvq_mmid_max_batch(base->src[0]->type, ggml_cuda_info().devices[cuda_ctx->device].cc)) {
-                ggml_cuda_mul_mat_id_mixed(*cuda_ctx, node, base, dst);
-                cuda_ctx->fusion_stats.moe_bank_mixed++;
-                return 3;
+                ggml_cuda_mul_mat_id_mixed(*cuda_ctx, node, base, dst, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                        nullptr, nullptr, 0, nullptr, red);
+                return fused();
             }
         }
     }
@@ -11400,12 +11427,18 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 continue;
             }
             if (ggml_cuda_match_moe_bank_mixed(cgraph, i)) {
-                for (int k : { i, i + 1 }) {
-                    for (int s = 0; s < 3; ++s) {
-                        params->add_alloc_dep(params->user_data, cgraph->nodes[k]->src[s], cgraph->nodes[i + 3]);
+                // with the routed sum fused in, the inputs are read while the sum is written, too
+                ggml_cuda_moe_weighted_reduction_match rm;
+                const bool red = ggml_cuda_match_moe_bank_down_reduce(cgraph, i, rm);
+                for (ggml_tensor * dst : { cgraph->nodes[i + 3], red ? cgraph->nodes[i + 8] : nullptr }) {
+                    if (!dst) { continue; }
+                    for (int k : { i, i + 1 }) {
+                        for (int s = 0; s < 3; ++s) {
+                            params->add_alloc_dep(params->user_data, cgraph->nodes[k]->src[s], dst);
+                        }
                     }
+                    params->add_alloc_dep(params->user_data, cgraph->nodes[i + 2]->src[1], dst);
                 }
-                params->add_alloc_dep(params->user_data, cgraph->nodes[i + 2]->src[1], cgraph->nodes[i + 3]);
                 i += 3;
                 continue;
             }
@@ -12916,6 +12949,9 @@ int64_t ggml_backend_cuda_fusion_count(ggml_backend_t backend, const char * name
     }
     if (strcmp(name, "moe_bank_mixed_reduce") == 0) {
         return ctx->fusion_stats.moe_bank_mixed_reduce;
+    }
+    if (strcmp(name, "moe_bank_down_reduce") == 0) {
+        return ctx->fusion_stats.moe_bank_down_reduce;
     }
     if (strcmp(name, "moe_bank_routing") == 0) {
         return ctx->fusion_stats.moe_bank_routing;

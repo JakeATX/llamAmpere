@@ -12,7 +12,8 @@ uint64_t ggml_cuda_moe_cache_device_capture_generation(int) { return 0; }
 void ggml_cuda_moe_cache_device_graph_record(int, bool, const ggml_cgraph *) {}
 bool ggml_cuda_moe_cache_device_supports(const ggml_tensor *, int) { return false; }
 bool ggml_cuda_moe_cache_device_compute(ggml_backend_cuda_context &, ggml_tensor *) { return false; }
-bool ggml_cuda_moe_cache_mixed_compute(ggml_backend_cuda_context &, const ggml_tensor *, ggml_tensor *, ggml_tensor *, const ggml_tensor *, ggml_tensor *) { return false; }
+bool ggml_cuda_moe_cache_mixed_compute(ggml_backend_cuda_context &, const ggml_tensor *, ggml_tensor *, ggml_tensor *, const ggml_tensor *, ggml_tensor *,
+        const ggml_cuda_moe_mixed_reduce *) { return false; }
 bool ggml_cuda_moe_cache_device_fused_compute(ggml_backend_cuda_context &, ggml_tensor *, ggml_tensor *, ggml_tensor *) { return false; }
 bool ggml_cuda_moe_cache_prefetch_async_active(void) { return false; }
 void ggml_cuda_moe_cache_device_predict(ggml_backend_cuda_context &, const ggml_tensor *) {}
@@ -33,6 +34,7 @@ static void moe_cache_register_stub(const void * owner) {
 #include "common.cuh"
 #include "mmvq.cuh"
 #include "quantize.cuh"
+#include "moe-weighted-reduction.cuh"
 #include "ggml-backend-impl.h"
 #include "ggml-cuda.h"
 #include "../ggml-backend-moe-cache.h"
@@ -11725,7 +11727,8 @@ static char * moe_quantize_act(ggml_backend_cuda_context & ctx, const ggml_tenso
 }
 
 static bool moe_cache_device_compute(ggml_backend_cuda_context & ctx, ggml_tensor * op, const ggml_tensor * bank,
-        const ggml_tensor * route_map = nullptr, ggml_tensor * route_mask = nullptr) {
+        const ggml_tensor * route_map = nullptr, ggml_tensor * route_mask = nullptr,
+        const ggml_cuda_moe_mixed_reduce * red = nullptr) {
     if (g_session_stack.empty() || !g_session_stack.back().active ||
             !moe_cache_device_op_fits(*g_session_stack.back().active, op, ctx.device)) {
         return false;
@@ -11806,14 +11809,16 @@ static bool moe_cache_device_compute(ggml_backend_cuda_context & ctx, ggml_tenso
             // fork AIPFIX: bank and resident routes run before the copy wait, as the hit pass does;
             // the resident table equals the effective one for those experts.
             const bool split = moe_mixed_hit_first();
+            // the CPU join below rewrites routes after the launch, so a CPU-split layer sums them afterwards
+            const ggml_cuda_moe_mixed_reduce * kred = cs && table.mj_kind == 2 ? nullptr : red;
             if (split) {
                 ggml_cuda_mul_mat_id_mixed(ctx, bank, op, op, quantized, table.device, nullptr, table.hot,
-                        route_map, route_mask, bank_q.get(), bank_s.get(), 1);
+                        route_map, route_mask, bank_q.get(), bank_s.get(), 1, nullptr, kred);
                 CUDA_CHECK(cudaGetLastError());
             }
             eff = moe_hf_wait(ctx, session, table);
             ggml_cuda_mul_mat_id_mixed(ctx, bank, op, op, quantized, eff, mixed_skip, table.hot, route_map, route_mask,
-                    bank_q.get(), bank_s.get(), split ? 2 : 0);
+                    bank_q.get(), bank_s.get(), split ? 2 : 0, nullptr, kred);
         } else if (one != 0) {
             eff = moe_hf_wait(ctx, session, table);
             const int64_t count = op->ne[0] * ids->ne[0] * ids->ne[1];
@@ -11861,12 +11866,16 @@ static bool moe_cache_device_compute(ggml_backend_cuda_context & ctx, ggml_tenso
             CUDA_CHECK(cudaGetLastError());
             session.cs_layer = -1;
         }
+        if (red && bank && cs && table.mj_kind == 2) {
+            ggml_cuda_op_moe_mixed_reduction(ctx, op, red->weights, red->bank_ids, red->dst);
+        }
         return true;
     }
     moe_cache_effective_table effective(ctx.pool());
     const void * const * mmv_table = moe_cache_resolve_table(ctx, session, table, ids, effective);
     if (bank) {
-        ggml_cuda_mul_mat_id_mixed(ctx, bank, op, op, quantized, mmv_table, nullptr, nullptr, route_map, route_mask);
+        ggml_cuda_mul_mat_id_mixed(ctx, bank, op, op, quantized, mmv_table, nullptr, nullptr, route_map, route_mask,
+                nullptr, nullptr, 0, nullptr, red);
     } else if (!ggml_cuda_moe_table_mmv_grouped_try(ctx, mmv_table, nullptr, (ggml_type)table.desc.type, quantized,
             (const int32_t *)ids->data, (float *)op->data, a->ne[0], op->ne[0], ids->ne[0], ids->ne[1],
             a->ne[1], ids->nb[1] / sizeof(int32_t)) &&
@@ -11897,13 +11906,14 @@ bool ggml_cuda_moe_cache_device_compute(ggml_backend_cuda_context & ctx, ggml_te
 }
 
 bool ggml_cuda_moe_cache_mixed_compute(ggml_backend_cuda_context & ctx, const ggml_tensor * bank,
-        ggml_tensor * base, ggml_tensor * dst, const ggml_tensor * route_map, ggml_tensor * route_mask) {
+        ggml_tensor * base, ggml_tensor * dst, const ggml_tensor * route_map, ggml_tensor * route_mask,
+        const ggml_cuda_moe_mixed_reduce * red) {
     if (!ggml_cuda_moe_mixed_supported(bank, base)) {
         return false;
     }
     ggml_tensor output = *base;
     output.data = dst->data;
-    return moe_cache_device_compute(ctx, &output, bank, route_map, route_mask);
+    return moe_cache_device_compute(ctx, &output, bank, route_map, route_mask, red);
 }
 
 // fork AIPFIX (GGML_MOE_BANK_MIXED_PAIR): up and gate share the activation quantizers, the copy wait and one

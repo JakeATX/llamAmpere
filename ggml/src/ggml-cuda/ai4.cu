@@ -5,6 +5,7 @@
 #include "ai4-ampere.cuh"
 #include "rpb-knobs.h"
 #include "quantize.cuh"
+#include "moe-weighted-reduction.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
 
@@ -1522,6 +1523,11 @@ struct moe_mixed_second {
     const float * glu_gate; // fused SwiGLU (glu == nullptr: none)
     const float * glu_up;
     float * glu;
+    const float * red_w;    // fused routed sum of an unpaired launch (red_dst == nullptr: none)
+    const int32_t * red_bank;
+    int64_t red_bank_stride;
+    float * red_dst;
+    bool red_tree;
 };
 
 // Fused SwiGLU tiles: a tile is the rows and routes one block coordinate stores, the same for both
@@ -1557,6 +1563,85 @@ static __device__ __forceinline__ void moe_mixed_glu(const moe_mixed_second & se
             second.glu[o] = ggml_cuda_op_silu_single(__ldcg(second.glu_gate + o)) * __ldcg(second.glu_up + o);
         }
     }
+}
+
+// Fused routed sum (unpaired launches): a block counts in once per route it stored, per (token, row tile); the block
+// that completes a token's n_used routes (in either phase launch) writes that token's tile of the sum and resets the
+// count. Same expression and order as moe_mixed_reduction_f32: products rounded alone, then serial or warp-tree
+// hot and cold buckets, then hot + cold.
+static constexpr int MOE_MIXED_RED_TILES = 4096*8;
+static __device__ unsigned int g_moe_mixed_red_count[MOE_MIXED_RED_TILES];
+
+static __device__ __forceinline__ void moe_mixed_reduce(const moe_mixed_second & second, const float * Y, int bx,
+        int rows, int M, const int * cols, int n) {
+    if (!second.red_dst) {
+        return;
+    }
+    const int n_used = gridDim.y;
+    __shared__ unsigned int done;
+    __threadfence();
+    if (threadIdx.x == 0) {
+        done = 0;
+    }
+    __syncthreads();
+    const int own = (int) blockIdx.z*n_used + blockIdx.y;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const int tok = (cols ? cols[i] : own) / n_used;
+        unsigned int * count = &g_moe_mixed_red_count[tok*gridDim.x + bx];
+        if (atomicAdd(count, 1u) == (unsigned int) n_used - 1) {
+            *count = 0;
+            atomicOr(&done, 1u << tok);
+        }
+    }
+    __syncthreads();
+    for (unsigned int m = done; m != 0; m &= m - 1) {
+        const int tok = __ffs(m) - 1;
+        const float * w = second.red_w + (int64_t) tok*n_used;
+        const int32_t * bank = second.red_bank + tok*second.red_bank_stride;
+        const float * y = Y + (int64_t) tok*n_used*M;
+        float * dst = second.red_dst + (int64_t) tok*M;
+        if (second.red_tree) {
+            const int lane = threadIdx.x & 31;
+            for (int i = threadIdx.x >> 5; i < rows; i += blockDim.x >> 5) {
+                const int r = bx*rows + i;
+                if (r >= M) {
+                    break;
+                }
+                float hot = 0.0f, cold = 0.0f;
+                if (lane < n_used) {
+                    const float value = __fmul_rn(__ldcg(y + (int64_t) lane*M + r), w[lane]);
+                    if (bank[lane] >= 0) { hot = value; }
+                    else { cold = value; }
+                }
+                hot = warp_reduce_sum(hot);
+                cold = warp_reduce_sum(cold);
+                if (lane == 0) {
+                    dst[r] = __fadd_rn(hot, cold);
+                }
+            }
+        } else {
+            for (int i = threadIdx.x; i < rows; i += blockDim.x) {
+                const int r = bx*rows + i;
+                if (r >= M) {
+                    break;
+                }
+                float hot = 0.0f, cold = 0.0f;
+                for (int e = 0; e < n_used; ++e) {
+                    const float value = __fmul_rn(__ldcg(y + (int64_t) e*M + r), w[e]);
+                    if (bank[e] >= 0) { hot = __fadd_rn(hot, value); }
+                    else { cold = __fadd_rn(cold, value); }
+                }
+                dst[r] = __fadd_rn(hot, cold);
+            }
+        }
+    }
+}
+
+// Epilogues of one block's stores: rows rows from tile bx of the routes cols[0..n) (cols == nullptr: its own route).
+static __device__ __forceinline__ void moe_mixed_done(const moe_mixed_second & second, const float * Y, int bx, int rows,
+        int M, const int * cols, int n) {
+    moe_mixed_glu(second, bx, rows, M, cols, n);
+    moe_mixed_reduce(second, Y, bx, rows, M, cols, n);
 }
 
 template <ggml_type BASE, bool IQ4_BANK, int LAY, int XSH, int KT, int WARPS, bool SINGLE_N, bool SPW, int STAGES>
@@ -1598,10 +1683,10 @@ static __global__ void __launch_bounds__(WARPS*32, 24/WARPS) moe_mixed_mmv(
                     return;
                 }
                 ai4k::mmvr_body<LAY, XSH, true, KT, STAGES, WARPS, 24/WARPS, true, false, 1, 1, false, true, true>(W, q, s, Y, M, M, 1, K, idm, &group, bx);
-                moe_mixed_glu(second, bx, 16*WARPS, M, group.cols, group.n);
+                moe_mixed_done(second, Y, bx, 16*WARPS, M, group.cols, group.n);
             } else {
                 ai4k::mmvr_body<LAY, XSH, true, KT, 2, WARPS, 24/WARPS, true, false, 1, 1, SINGLE_N, false>(W, q, s, Y, M, M, 1, K, idm, nullptr, bx);
-                moe_mixed_glu(second, bx, 16, M, nullptr, 1);
+                moe_mixed_done(second, Y, bx, 16, M, nullptr, 1);
             }
             return;
         }
@@ -1613,7 +1698,7 @@ static __global__ void __launch_bounds__(WARPS*32, 24/WARPS) moe_mixed_mmv(
         if (threadIdx.x < 16*slabs && row0 + threadIdx.x < M) {
             out[threadIdx.x] = 0.0f;
         }
-        moe_mixed_glu(second, bx, 16*slabs, M, nullptr, 1);
+        moe_mixed_done(second, Y, bx, 16*slabs, M, nullptr, 1);
         return;
     }
     const char * w = hot ? (const char *) W + (size_t) h*idm.nb02 :
@@ -1650,7 +1735,7 @@ static __global__ void __launch_bounds__(WARPS*32, 24/WARPS) moe_mixed_mmv(
             moe_mixed_base_rows<BASE, WARPS>(sw, x, sy, K);
         }
     }
-    moe_mixed_glu(second, bx, 16*slabs, M, nullptr, 1);
+    moe_mixed_done(second, Y, bx, 16*slabs, M, nullptr, 1);
 }
 
 bool ggml_cuda_moe_mixed_supported(const ggml_tensor * bank, const ggml_tensor * base) {
@@ -1700,6 +1785,24 @@ bool ggml_cuda_moe_mixed_pair_supported(const ggml_tensor * bank, const ggml_ten
             ggml_are_same_shape(cw, cw2) && ggml_are_same_stride(cw, cw2) &&
             bank2->src[1] == bank->src[1] && bank2->src[2] == bank->src[2] && base2->src[2] == base->src[2] &&
             ggml_are_same_shape(bank, bank2);
+}
+
+bool ggml_cuda_moe_mixed_reduce_enabled() {
+    static const bool v = ai4_env_int("GGML_MOE_BANK_MIXED_REDUCE", nullptr, 1) != 0;
+    return v;
+}
+
+bool ggml_cuda_moe_mixed_reduce_supported(const ggml_tensor * experts, const ggml_cuda_moe_mixed_reduce & red) {
+    const ggml_tensor * w = red.weights, * b = red.bank_ids, * d = red.dst;
+    const int64_t n_used = experts->ne[1], tokens = experts->ne[2];
+    return w && b && d && experts->type == GGML_TYPE_F32 && ggml_is_contiguous(experts) && experts->ne[3] == 1 &&
+            n_used >= 1 && n_used <= 32 && tokens >= 1 && tokens <= 8 &&
+            w->type == GGML_TYPE_F32 && ggml_is_contiguous(w) && w->ne[0] == 1 && w->ne[1] == n_used &&
+            w->ne[2] == tokens && w->ne[3] == 1 &&
+            b->type == GGML_TYPE_I32 && b->nb[0] == sizeof(int32_t) && b->nb[1] % sizeof(int32_t) == 0 &&
+            b->ne[0] == n_used && b->ne[1] == tokens && b->ne[2] == 1 && b->ne[3] == 1 &&
+            d->type == GGML_TYPE_F32 && ggml_is_contiguous(d) && ggml_nelements(d) == experts->ne[0]*tokens &&
+            d->data != experts->data && d->data != w->data && d->data != b->data;
 }
 
 bool ggml_cuda_moe_mixed_glu_enabled() {
@@ -1810,7 +1913,8 @@ void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tens
         const ggml_tensor * base, ggml_tensor * dst, const char * act_q8,
         const void * const * table, const uint8_t * skip, const uint8_t * resident,
         const ggml_tensor * route_map, ggml_tensor * route_mask,
-        const int8_t * act_ai_q, const float * act_ai_s, int phase, const ggml_cuda_moe_mixed_pair * pair) {
+        const int8_t * act_ai_q, const float * act_ai_s, int phase, const ggml_cuda_moe_mixed_pair * pair,
+        const ggml_cuda_moe_mixed_reduce * red) {
     GGML_ASSERT(ggml_cuda_moe_mixed_supported(bank, base));
     GGML_ASSERT(phase >= 0 && phase <= 2 && (phase == 0 || resident));
     GGML_ASSERT(!pair || (ggml_cuda_moe_mixed_pair_supported(bank, base, pair->bank, pair->base) &&
@@ -1877,6 +1981,15 @@ void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tens
             second.glu = (float *) pair->glu->data;
         }
     }
+    GGML_ASSERT(!red || (!pair && ggml_cuda_moe_mixed_reduce_supported(dst, *red) &&
+            (int64_t) grid.x*grid.z <= MOE_MIXED_RED_TILES));
+    if (red) {
+        second.red_w = (const float *) red->weights->data;
+        second.red_bank = (const int32_t *) red->bank_ids->data;
+        second.red_bank_stride = red->bank_ids->nb[1]/sizeof(int32_t);
+        second.red_dst = (float *) red->dst->data;
+        second.red_tree = ggml_cuda_moe_mixed_reduction_tree(dst);
+    }
     static const int trace = getenv("GGML_MOE_BANK_MIXED_TRACE") ? atoi(getenv("GGML_MOE_BANK_MIXED_TRACE")) : 0;
     const int cfg = ai4_mmvr_cfg();
     const bool iq4_hot_single = w->type == GGML_TYPE_IQ4_NL && ids->ne[1] == 1;
@@ -1937,8 +2050,8 @@ void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tens
 #undef MOE_MIXED_LAUNCH
     CUDA_CHECK(cudaGetLastError());
     if (trace) {
-        fprintf(stderr, "[moe-bank-mixed] launch K=%d M=%d routes=%lld width=%lld bank=%s base=%s table=%d routing=%d spw=%d phase=%d pair=%d glu=%d\n",
-                K, M, (long long) ids->ne[0], (long long) ids->ne[1], ggml_type_name(w->type), ggml_type_name(cw->type), table != nullptr, route_map != nullptr, spw, phase, pair != nullptr, pair && pair->glu);
+        fprintf(stderr, "[moe-bank-mixed] launch K=%d M=%d routes=%lld width=%lld bank=%s base=%s table=%d routing=%d spw=%d phase=%d pair=%d glu=%d reduce=%d\n",
+                K, M, (long long) ids->ne[0], (long long) ids->ne[1], ggml_type_name(w->type), ggml_type_name(cw->type), table != nullptr, route_map != nullptr, spw, phase, pair != nullptr, pair && pair->glu, red != nullptr);
     }
 }
 #undef MOE_MIXED_TYPES

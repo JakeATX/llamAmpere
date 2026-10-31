@@ -23,3 +23,5 @@ void ggml_cuda_op_moe_bank_joint_reduction(ggml_backend_cuda_context & ctx,
 void ggml_cuda_op_moe_mixed_reduction(ggml_backend_cuda_context & ctx,
         const ggml_tensor * experts, const ggml_tensor * weights,
         const ggml_tensor * bank_ids, ggml_tensor * dst);
+// true: each bucket is a warp tree over the routes (one token or LLAMA_MOE_SMALL_REDUCE=1); false: serial in route order
+bool ggml_cuda_moe_mixed_reduction_tree(const ggml_tensor * experts);

@@ -12201,13 +12201,18 @@ struct test_moe_bank_mixed_reduce : public test_moe_bank_mixed {
     test_moe_bank_mixed_reduce(ggml_type bank_type, int width) :
         test_moe_bank_mixed(bank_type, GGML_TYPE_IQ4_NL, width, 2, 4, false, false, 640, 2560) {}
     std::string op_desc(ggml_tensor *) override { return "MOE_BANK_MIXED_REDUCE"; }
+    // the banked down launch writes the routed sum itself unless GGML_MOE_BANK_MIXED_REDUCE=0
+    bool down_reduce() const {
+        const char * enabled = getenv("GGML_MOE_BANK_MIXED_REDUCE");
+        return (!enabled || atoi(enabled)) && direct_mmvq_width() && width <= 8;
+    }
     const char * required_fusion() override {
         const char * enabled = getenv("LLAMA_MOE_BANK_MIXED");
-        return !enabled || atoi(enabled) ? "moe_bank_mixed_reduce" : nullptr;
+        return !enabled || atoi(enabled) ? (down_reduce() ? "moe_bank_down_reduce" : "moe_bank_mixed_reduce") : nullptr;
     }
     const char * forbidden_fusion() override {
         const char * enabled = getenv("LLAMA_MOE_BANK_MIXED");
-        return enabled && !atoi(enabled) ? "moe_bank_mixed_reduce" : nullptr;
+        return enabled && !atoi(enabled) ? "moe_bank_mixed_reduce" : !down_reduce() ? "moe_bank_down_reduce" : nullptr;
     }
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * experts = test_moe_bank_mixed::build_graph(ctx);

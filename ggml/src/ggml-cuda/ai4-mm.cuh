@@ -45,9 +45,19 @@ bool ggml_cuda_moe_mixed_pair_supported(const ggml_tensor * bank, const ggml_ten
 bool ggml_cuda_moe_mixed_glu_enabled();
 // glu is the plain SwiGLU of the paired outputs dst and dst2 (either one the gate).
 bool ggml_cuda_moe_mixed_glu_supported(const ggml_tensor * dst, const ggml_tensor * dst2, const ggml_tensor * glu);
+// Routed sum written by the same (unpaired) launch: dst = the weighted hot and cold bucket sums of the
+// projection's routes, as ggml_cuda_op_moe_mixed_reduction computes them from the finished output.
+struct ggml_cuda_moe_mixed_reduce {
+    const ggml_tensor * weights;  // [1, n_used, tokens]
+    const ggml_tensor * bank_ids; // [n_used, tokens], >= 0: hot bucket
+    ggml_tensor * dst;            // [M, tokens]
+};
+// GGML_MOE_BANK_MIXED_REDUCE=0 leaves the routed sum to its own launch (default 1).
+bool ggml_cuda_moe_mixed_reduce_enabled();
+bool ggml_cuda_moe_mixed_reduce_supported(const ggml_tensor * experts, const ggml_cuda_moe_mixed_reduce & red);
 void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tensor * bank,
         const ggml_tensor * base, ggml_tensor * dst, const char * act_q8 = nullptr,
         const void * const * table = nullptr, const uint8_t * skip = nullptr, const uint8_t * resident = nullptr,
         const ggml_tensor * route_map = nullptr, ggml_tensor * route_mask = nullptr,
         const int8_t * act_ai_q = nullptr, const float * act_ai_s = nullptr, int phase = 0,
-        const ggml_cuda_moe_mixed_pair * pair = nullptr);
+        const ggml_cuda_moe_mixed_pair * pair = nullptr, const ggml_cuda_moe_mixed_reduce * red = nullptr);
