@@ -6921,7 +6921,7 @@ struct ggml_cuda_moe_bank_joint_match {
 static bool ggml_cuda_match_moe_bank_mixed(const ggml_cgraph * graph, int i) {
     static const bool enabled = [] {
         const char * value = getenv("LLAMA_MOE_BANK_MIXED");
-        return value && atoi(value) != 0;
+        return !value || atoi(value) != 0;
     }();
     if (!enabled || i + 4 > graph->n_nodes) { return false; }
     const ggml_op ops[] = { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_MUL, GGML_OP_ADD };
@@ -6991,6 +6991,7 @@ struct ggml_cuda_moe_weighted_reduction_match {
     const ggml_tensor * weights      = nullptr;
     ggml_tensor *       dst          = nullptr;
     int                 node_count   = 0;
+    const ggml_tensor * bank_ids     = nullptr;
 };
 
 static bool ggml_cuda_match_moe_weighted_reduction(
@@ -7062,7 +7063,7 @@ static bool ggml_cuda_match_moe_weighted_reduction(
     }
 
     // The mixed expert graph reduces one slab through the portable transpose/sum form.
-    static const bool mixed_enabled = getenv("LLAMA_MOE_BANK_MIXED") && atoi(getenv("LLAMA_MOE_BANK_MIXED"));
+    static const bool mixed_enabled = !getenv("LLAMA_MOE_BANK_MIXED") || atoi(getenv("LLAMA_MOE_BANK_MIXED"));
     if (mixed_enabled && mul_count == 1 && ggml_cuda_moe_mixed_base(experts) && node_idx + 5 <= cgraph->n_nodes) {
         const ggml_op ops[] = { GGML_OP_MUL, GGML_OP_PERMUTE, GGML_OP_CONT, GGML_OP_SUM_ROWS, GGML_OP_RESHAPE };
         const int output_idx = node_idx + 4;
@@ -7083,6 +7084,7 @@ static bool ggml_cuda_match_moe_weighted_reduction(
                 sum->ne[0] == 1 && sum->ne[1] == weighted->ne[0] && sum->ne[2] == n_tokens && sum->ne[3] == 1 &&
                 dst->ne[0] == weighted->ne[0] && dst->ne[1] == n_tokens && dst->ne[2] == 1 && dst->ne[3] == 1) {
             match.experts = experts; match.weights = weights; match.dst = dst; match.node_count = 5;
+            match.bank_ids = experts->src[0]->src[2];
             return true;
         }
     }
@@ -9223,7 +9225,7 @@ static __global__ void moe_combine_check(const float * actual, const float * ref
 static int ggml_cuda_try_moe_combine(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i,
         const ggml_cuda_moe_weighted_reduction_match & red) {
     ggml_cuda_moe_combine_match m;
-    if (!ctx.stream_context().concurrent_events.empty() ||
+    if (red.bank_ids || !ctx.stream_context().concurrent_events.empty() ||
             !ggml_cuda_match_moe_combine(cgraph, i + red.node_count - 1, m)) {
         return -1;
     }
@@ -9375,6 +9377,25 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (node->op == GGML_OP_SSM_CONV && ggml_cuda_try_gdn_conv_norm(*cuda_ctx, cgraph, i)) {
         return 7;
     }
+    if (node->op == GGML_OP_MUL_MAT_ID) {
+        const int output = i + 3;
+        if (cuda_ctx->stream_context().concurrent_events.empty() && ggml_cuda_match_moe_bank_mixed(cgraph, i) &&
+                GGML_CUDA_CC_IS_NVIDIA(ggml_cuda_info().devices[cuda_ctx->device].cc) &&
+                ggml_cuda_info().devices[cuda_ctx->device].cc >= GGML_CUDA_CC_AMPERE &&
+                !ggml_cuda_ai4_id_needs_sync(ggml_cuda_info().devices[cuda_ctx->device].cc, node->src[0]->type) &&
+                ggml_cuda_check_fusion_memory_ranges(cgraph, i, 4, &output, 1)) {
+            ggml_tensor * base = cgraph->nodes[i + 1], * dst = cgraph->nodes[output];
+            if (ggml_cuda_moe_cache_mixed_compute(*cuda_ctx, node, base, dst)) {
+                cuda_ctx->fusion_stats.moe_bank_mixed++;
+                return 3;
+            }
+            if (ggml_backend_buffer_is_cuda(base->src[0]->buffer)) {
+                ggml_cuda_mul_mat_id_mixed(*cuda_ctx, node, base, dst);
+                cuda_ctx->fusion_stats.moe_bank_mixed++;
+                return 3;
+            }
+        }
+    }
     if (ggml_cuda_moe_cache_device_supports(node, cuda_ctx->device)) {
         if (cuda_ctx->stream_context().concurrent_events.empty() && i + 2 < cgraph->n_nodes) {
             ggml_tensor * glu = cgraph->nodes[i + 2];
@@ -9455,23 +9476,6 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     if (node->op == GGML_OP_MUL_MAT_ID) {
-        const int output = i + 3;
-        if (cuda_ctx->stream_context().concurrent_events.empty() && ggml_cuda_match_moe_bank_mixed(cgraph, i) &&
-                GGML_CUDA_CC_IS_NVIDIA(ggml_cuda_info().devices[cuda_ctx->device].cc) &&
-                ggml_cuda_info().devices[cuda_ctx->device].cc >= GGML_CUDA_CC_AMPERE &&
-                !ggml_cuda_ai4_id_needs_sync(ggml_cuda_info().devices[cuda_ctx->device].cc, node->src[0]->type) &&
-                ggml_cuda_check_fusion_memory_ranges(cgraph, i, 4, &output, 1)) {
-            ggml_tensor * base = cgraph->nodes[i + 1], * dst = cgraph->nodes[output];
-            if (ggml_cuda_moe_cache_mixed_compute(*cuda_ctx, node, base, dst)) {
-                cuda_ctx->fusion_stats.moe_bank_mixed++;
-                return 3;
-            }
-            if (ggml_backend_buffer_is_cuda(base->src[0]->buffer)) {
-                ggml_cuda_mul_mat_id_mixed(*cuda_ctx, node, base, dst);
-                cuda_ctx->fusion_stats.moe_bank_mixed++;
-                return 3;
-            }
-        }
         const int n_skip = ggml_cuda_fuse_nemotron_moe(*cuda_ctx, cgraph, i);
         if (n_skip >= 0) {
             cuda_ctx->fusion_stats.nemotron_moe++;
@@ -9518,8 +9522,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             }
             const int output_idx = i + match.node_count - 1;
             if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, match.node_count, &output_idx, 1)) {
-                ggml_cuda_op_moe_weighted_reduction(
-                    *cuda_ctx, match.experts, match.expert_scale, match.weights, match.dst);
+                if (match.bank_ids) {
+                    ggml_cuda_op_moe_mixed_reduction(*cuda_ctx, match.experts, match.weights, match.bank_ids, match.dst);
+                } else {
+                    ggml_cuda_op_moe_weighted_reduction(
+                        *cuda_ctx, match.experts, match.expert_scale, match.weights, match.dst);
+                }
                 return match.node_count - 1;
             }
         }
@@ -11280,6 +11288,9 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
                 params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.experts), match.dst);
                 params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.weights), match.dst);
+                if (match.bank_ids) {
+                    params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.bank_ids), match.dst);
+                }
                 if (match.expert_scale != nullptr) {
                     params->add_alloc_dep(
                         params->user_data, const_cast<ggml_tensor *>(match.expert_scale), match.dst);

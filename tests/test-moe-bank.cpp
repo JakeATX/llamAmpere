@@ -168,9 +168,9 @@ static void test_small_expert_reduce() {
     }
 }
 
-static void test_mixed_ffn_shape(int n_in, int n_hidden) {
+static void test_mixed_ffn_shape(int n_in, int n_hidden, bool iq4_down = false) {
     for (ggml_type bank_type : { GGML_TYPE_AIT2_U, GGML_TYPE_AIT3_U }) {
-        for (int width : { 1, 4, 8 }) {
+        for (int width : { 1, 4, 5, 8 }) {
             for (int mode : { 0, 1, 2 }) {
                 ggml_context * ctx = ggml_init({ 64u << 20, nullptr, false });
                 CHECK(ctx != nullptr);
@@ -179,18 +179,26 @@ static void test_mixed_ffn_shape(int n_in, int n_hidden) {
                 for (int p = 0; p < 3; ++p) {
                     const int cols = p == 2 ? n_hidden : n_in;
                     const int rows = p == 2 ? n_in : n_hidden;
-                    hw[p] = ggml_new_tensor_3d(ctx, bank_type, cols, rows, 4);
-                    cw[p] = ggml_new_tensor_3d(ctx, GGML_TYPE_Q4_0, cols, rows, 4);
-                    const int unit = bank_type == GGML_TYPE_AIT2_U ? 544 : 800;
-                    auto * bytes = (uint8_t *) hw[p]->data;
-                    for (size_t i = 0; i < ggml_nbytes(hw[p]); ++i) { bytes[i] = (uint8_t) ((i*73 + i/7 + p*31)%256); }
-                    for (size_t i = 0; i < ggml_nbytes(hw[p]); i += unit) {
-                        auto * scales = (ggml_fp16_t *) (bytes + i);
-                        for (int r = 0; r < 16; ++r) { scales[r] = ggml_fp32_to_fp16(0.0005f*(1 + (r + p)%5)); }
-                    }
+                    const ggml_type hot_type = iq4_down && p == 2 ? GGML_TYPE_IQ4_NL : bank_type;
+                    const ggml_type cold_type = p == 2 ?
+                            (iq4_down ? GGML_TYPE_IQ4_NL : n_hidden == 640 ? GGML_TYPE_Q2_0 : GGML_TYPE_Q4_0) : GGML_TYPE_Q4_0;
+                    hw[p] = ggml_new_tensor_3d(ctx, hot_type, cols, rows, 4);
+                    cw[p] = ggml_new_tensor_3d(ctx, cold_type, cols, rows, 4);
                     std::vector<float> values(ggml_nelements(cw[p]));
+                    if (hot_type == GGML_TYPE_IQ4_NL) {
+                        for (size_t i = 0; i < values.size(); ++i) { values[i] = 0.001f*((int)((i*29 + p*19)%103) - 51); }
+                        ggml_quantize_chunk(hot_type, values.data(), hw[p]->data, 0, rows*4, cols, nullptr);
+                    } else {
+                        const int unit = bank_type == GGML_TYPE_AIT2_U ? 544 : 800;
+                        auto * bytes = (uint8_t *) hw[p]->data;
+                        for (size_t i = 0; i < ggml_nbytes(hw[p]); ++i) { bytes[i] = (uint8_t) ((i*73 + i/7 + p*31)%256); }
+                        for (size_t i = 0; i < ggml_nbytes(hw[p]); i += unit) {
+                            auto * scales = (ggml_fp16_t *) (bytes + i);
+                            for (int r = 0; r < 16; ++r) { scales[r] = ggml_fp32_to_fp16(0.0005f*(1 + (r + p)%5)); }
+                        }
+                    }
                     for (size_t i = 0; i < values.size(); ++i) { values[i] = 0.001f*((int)((i*37 + p*13)%101) - 50); }
-                    ggml_quantize_chunk(GGML_TYPE_Q4_0, values.data(), cw[p]->data, 0, rows*4, cols, nullptr);
+                    ggml_quantize_chunk(cold_type, values.data(), cw[p]->data, 0, rows*4, cols, nullptr);
                 }
                 ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_in, 1, width);
                 ggml_tensor * hi = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 4, width);
@@ -238,7 +246,8 @@ static void test_mixed_ffn_shape(int n_in, int n_hidden) {
 static void test_mixed_ffn() {
     test_mixed_ffn_shape(256, 256);
     test_mixed_ffn_shape(2560, 640);
-    printf("mixed FFN: 36 two-call reference comparisons\n");
+    test_mixed_ffn_shape(2560, 640, true);
+    printf("mixed FFN: 72 two-call reference comparisons\n");
 }
 
 int main(int argc, char ** argv) {

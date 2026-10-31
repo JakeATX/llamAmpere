@@ -11907,9 +11907,13 @@ struct test_moe_bank_mixed : public test_case {
     bool run_whole_graph() override { return true; }
     double max_nmse_err() override { return 5e-4; }
     const char * required_fusion() override {
-        return !extra_reader && base_type != GGML_TYPE_F32 && getenv("LLAMA_MOE_BANK_MIXED") && atoi(getenv("LLAMA_MOE_BANK_MIXED")) ? "moe_bank_mixed" : nullptr;
+        const char * enabled = getenv("LLAMA_MOE_BANK_MIXED");
+        return !extra_reader && base_type != GGML_TYPE_F32 && (!enabled || atoi(enabled)) ? "moe_bank_mixed" : nullptr;
     }
-    const char * forbidden_fusion() override { return extra_reader || base_type == GGML_TYPE_F32 ? "moe_bank_mixed" : nullptr; }
+    const char * forbidden_fusion() override {
+        const char * enabled = getenv("LLAMA_MOE_BANK_MIXED");
+        return extra_reader || base_type == GGML_TYPE_F32 || (enabled && !atoi(enabled)) ? "moe_bank_mixed" : nullptr;
+    }
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * hw = ggml_new_tensor_3d(ctx, bank_type, n_in, n_out, 4);
         ggml_tensor * cw = ggml_new_tensor_3d(ctx, base_type, n_in, n_out, 4);
@@ -11946,6 +11950,54 @@ struct test_moe_bank_mixed : public test_case {
                 init_tensor_uniform(t);
             }
         }
+    }
+};
+
+struct test_moe_bank_mixed_reduce : public test_moe_bank_mixed {
+    ggml_tensor * mixed_result = nullptr;
+    ggml_tensor * reference_result = nullptr;
+    test_moe_bank_mixed_reduce(ggml_type bank_type, int width) :
+        test_moe_bank_mixed(bank_type, GGML_TYPE_IQ4_NL, width, 2, 4, false, false, 640, 2560) {}
+    std::string op_desc(ggml_tensor *) override { return "MOE_BANK_MIXED_REDUCE"; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * experts = test_moe_bank_mixed::build_graph(ctx);
+        ggml_tensor * cold_mask = experts->src[1]->src[1];
+        ggml_tensor * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, 4, width);
+        auto sum = [&](ggml_tensor * x, ggml_tensor * w) {
+            return ggml_reshape_2d(ctx, ggml_sum_rows(ctx,
+                    ggml_cont(ctx, ggml_permute(ctx, ggml_mul(ctx, x, w), 1, 0, 2, 3))), n_out, width);
+        };
+        mixed_result = sum(experts, weights);
+        ggml_set_output(mixed_result);
+        ggml_build_forward_expand(gf, mixed_result);
+        // Keep the reference outside the mixed matcher, using the same projection output bytes.
+        ggml_tensor * copy = ggml_dup(ctx, experts);
+        ggml_tensor * cold_weights = ggml_mul(ctx, weights, cold_mask);
+        ggml_tensor * hot_weights = ggml_sub(ctx, weights, cold_weights);
+        reference_result = ggml_add(ctx, sum(copy, hot_weights), sum(copy, cold_weights));
+        ggml_set_output(reference_result);
+        return reference_result;
+    }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { mixed_result, reference_result }; }
+    bool verify_backend_result(ggml_backend_t backend) override {
+        const char * enabled = getenv("LLAMA_MOE_BANK_MIXED");
+        const char * small = getenv("LLAMA_MOE_SMALL_REDUCE");
+        const char * disabled = getenv("GGML_CUDA_DISABLE_FUSION");
+        if ((enabled && !atoi(enabled)) || (disabled && atoi(disabled)) || (width != 1 && (!small || !atoi(small)))) {
+            return true;
+        }
+        const auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        if (!reg || !ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_fusion_count")) {
+            return true;
+        }
+        std::vector<uint32_t> actual(ggml_nelements(mixed_result)), expected(actual.size());
+        ggml_backend_tensor_get(mixed_result, actual.data(), 0, actual.size()*sizeof(uint32_t));
+        ggml_backend_tensor_get(reference_result, expected.data(), 0, expected.size()*sizeof(uint32_t));
+        if (actual != expected) {
+            printf("mixed reduction differs from separate bank sums ");
+            return false;
+        }
+        return true;
     }
 };
 
@@ -18921,6 +18973,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_moe_bank_mixed(bank, GGML_TYPE_IQ2_XS, width, 2, 4, false, true));
             test_cases.emplace_back(new test_moe_bank_mixed(bank, GGML_TYPE_IQ3_XXS, width, 2, 1, false, true, 2560, 640));
             test_cases.emplace_back(new test_moe_bank_mixed(bank, GGML_TYPE_IQ4_NL, width, 2, 4, false, true, 640, 2560));
+        }
+    }
+
+    for (int width : { 1, 4, 5, 8 }) {
+        test_cases.emplace_back(new test_moe_bank_mixed(GGML_TYPE_AIT2_U, GGML_TYPE_Q2_0,
+                width, 2, 4, false, true, 640, 2560));
+        for (int mode : { 0, 1, 2 }) {
+            test_cases.emplace_back(new test_moe_bank_mixed(GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_NL,
+                    width, mode, 4, false, true, 640, 2560));
+        }
+        for (ggml_type bank : { GGML_TYPE_AIT2_U, GGML_TYPE_IQ4_NL }) {
+            test_cases.emplace_back(new test_moe_bank_mixed_reduce(bank, width));
         }
     }
 

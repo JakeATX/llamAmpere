@@ -1108,6 +1108,18 @@ static __global__ void mul_mat_vec_q(
     channel_y  = ncols_dst == 1 && ids ? fastmodulo(channel_dst, nchannels_y) : channel_dst;
     sample_dst = blockIdx.z;
 
+    if constexpr (type == GGML_TYPE_IQ4_NL) {
+        // A mixed expert bank marks zero-weight filler slots with -1. Do not
+        // form a weight pointer for those slots, and overwrite reused output.
+        if (!shared_expert && ncols_dst == 1 && ids && (int32_t) channel_x == -1) {
+            for (int row = row0 + tid; row < row0 + rows_per_cuda_block && row < (int) nrows_x;
+                    row += nwarps*warp_size) {
+                dst[sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + row] = 0.0f;
+            }
+            return;
+        }
+    }
+
     const uint32_t sample_x    = fastdiv(sample_dst, sample_ratio);
     const uint32_t sample_y    = sample_dst;
 
@@ -1672,6 +1684,14 @@ static __global__ void mul_mat_vec_q_moe(
 
     ggml_cuda_pdl_sync();
     const uint32_t channel_x = shared_expert ? 0 : ids[channel_dst + token_idx * ids_stride];
+    if constexpr (type == GGML_TYPE_IQ4_NL) {
+        if (!shared_expert && (int32_t) channel_x == -1) {
+            if (threadIdx.x < c_rows_per_block && uint32_t(row0 + threadIdx.x) < nrows_x) {
+                dst[channel_dst*stride_channel_dst + token_idx*stride_col_dst + row0 + threadIdx.x] = 0.0f;
+            }
+            return;
+        }
+    }
     if constexpr (route_filter) {
         // fork (missjoin hit-first): a pass computes only the routes whose expert residency matches
         // route_want_hot; the complementary pass computes the rest. Every route runs exactly once, in

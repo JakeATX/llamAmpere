@@ -10389,7 +10389,8 @@ static __device__ __forceinline__ unsigned long long moe_cs_now_ns() {
 // fork MOEGAP: after the down projection's miss pass, waits for the host job and writes the CPU's down rows
 // into the projection output (those routes were skipped by both card passes). One block per possible CPU route.
 static __global__ void moe_cs_join_kernel(moe_cs_plan_dev * plan, moe_cs_job * job, const float * out_h,
-        size_t out_stride, char * dst, size_t nb1, size_t nb2, int n_ids, int n_out, float adapt_route0, float adapt_fixed) {
+        size_t out_stride, char * dst, size_t nb1, size_t nb2, int n_ids, int n_out, float adapt_route0, float adapt_fixed,
+        const int32_t * bank_ids = nullptr, size_t bank_stride = 0) {
     const unsigned long long seq = plan->seq;
     const int n_route = plan->n_route;
     if (seq == 0 || (int) blockIdx.x >= n_route) {
@@ -10425,6 +10426,10 @@ static __global__ void moe_cs_join_kernel(moe_cs_plan_dev * plan, moe_cs_job * j
     }
     const int r = plan->route[blockIdx.x];
     const int t = r / n_ids, j = r % n_ids;
+    // A mixed projection already wrote bank routes in their own format.
+    if (bank_ids && bank_ids[t*bank_stride + j] >= 0) {
+        return;
+    }
     float * d = (float *) (dst + (size_t) j * nb1 + (size_t) t * nb2);
     const float * src = out_h + (size_t) blockIdx.x * out_stride;
     for (int c = threadIdx.x; c < n_out; c += blockDim.x) { d[c] = __ldcv(src + c); }
@@ -11812,7 +11817,9 @@ static bool moe_cache_device_compute(ggml_backend_cuda_context & ctx, ggml_tenso
             GGML_ASSERT(op->type == GGML_TYPE_F32 && op->nb[0] == sizeof(float));
             moe_cs_join_kernel<<<g_cs_max_route, 128, 0, ctx.stream()>>>(g_cs_plan, g_cs_job_d, g_cs_out_d,
                     g_cs_out_stride, (char *) op->data, op->nb[1], op->nb[2], (int) ids->ne[0], (int) op->ne[0],
-                    g_cs_adapt ? g_cs_route_ns : 0.0f, g_cs_fixed_ns);
+                    g_cs_adapt ? g_cs_route_ns : 0.0f, g_cs_fixed_ns,
+                    bank ? (const int32_t *) bank->src[2]->data : nullptr,
+                    bank ? bank->src[2]->nb[1]/sizeof(int32_t) : 0);
             CUDA_CHECK(cudaGetLastError());
             session.cs_layer = -1;
         }
